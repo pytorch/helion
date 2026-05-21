@@ -813,10 +813,13 @@ def _carrier_tile_index_nodes(
 
 
 def analyze_tcgen05_unary_epilogue_chain(
-    state: CodegenState,
+    state: CodegenState | None,
     value_node: torch.fx.Node,
     *,
     output_global_shape: tuple[object, ...] | None = None,
+    target_fx_nodes: set[torch.fx.Node] | None = None,
+    inner_outputs_by_graph_id: dict[int, tuple[torch.fx.Node | None, ...]]
+    | None = None,
 ) -> tuple[Tcgen05UnaryEpilogueChain, torch.fx.Node] | None:
     """Classify ``value_node``'s producer chain as a whitelisted
     epilogue rooted at a tcgen05 matmul.
@@ -876,8 +879,11 @@ def analyze_tcgen05_unary_epilogue_chain(
     classifier so an aux whose extent only happens to match the
     tile but not the global axis is rejected at classify time.
     """
-    df = state.device_function
-    target_fx_nodes = df.cute_state.matmul_fx_nodes
+    if target_fx_nodes is None:
+        if state is None:
+            return None
+        df = state.device_function
+        target_fx_nodes = df.cute_state.matmul_fx_nodes
     if not target_fx_nodes:
         return None
 
@@ -895,7 +901,10 @@ def analyze_tcgen05_unary_epilogue_chain(
     if not isinstance(cast_input, torch.fx.Node):
         return None
 
-    inner_outputs_by_graph_id = build_inner_outputs_index(state)
+    if inner_outputs_by_graph_id is None:
+        if state is None:
+            return None
+        inner_outputs_by_graph_id = build_inner_outputs_index(state)
 
     matmul_anchor = walk_carrier_to_tcgen05_matmul(
         cast_input, target_fx_nodes, inner_outputs_by_graph_id

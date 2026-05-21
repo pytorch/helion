@@ -12,6 +12,8 @@ from helion._compiler.autotuner_heuristics.cute import CuteTcgen05ClusterM2Heuri
 from helion._compiler.autotuner_heuristics.registry import AutotunerHeuristic
 from helion._compiler.autotuner_heuristics.triton import TritonSkinnyGemmHeuristic
 from helion._compiler.backend import TritonBackend
+from helion._compiler.cute.strategies import TCGEN05_PERSISTENCE_MODEL_CONFIG_KEY
+from helion._compiler.cute.strategies import Tcgen05PersistenceModel
 from helion._compiler.cute.strategies import Tcgen05Strategy
 from helion._compiler.cute.tcgen05_config import CuteTcgen05Config
 from helion._compiler.cute.tcgen05_config import Tcgen05ClusterM2SearchConstraints
@@ -21,6 +23,8 @@ from helion._compiler.cute.tcgen05_constants import (
 from helion._compiler.cute.tcgen05_constants import (
     TCGEN05_ACC_WAIT_PLACEMENT_CONFIG_KEY,
 )
+from helion._compiler.cute.tcgen05_constants import TCGEN05_AUX_LOAD_MODE_CONFIG_KEY
+from helion._compiler.cute.tcgen05_constants import TCGEN05_AUX_LOAD_MODE_TMA
 from helion._compiler.cute.tcgen05_constants import (
     TCGEN05_C_ACQUIRE_PLACEMENT_CONFIG_KEY,
 )
@@ -42,6 +46,15 @@ from helion._compiler.cute.tcgen05_constants import (
 )
 from helion._compiler.cute.tcgen05_constants import (
     TCGEN05_TWO_CTA_EDGE_K_TAIL_L2_SWIZZLE_SIZE,
+)
+from helion._compiler.cute.tcgen05_constants import (
+    TCGEN05_TWO_CTA_EDGE_K_TAIL_NARROW_BLOCK_K,
+)
+from helion._compiler.cute.tcgen05_constants import (
+    TCGEN05_TWO_CTA_EDGE_K_TAIL_NARROW_BLOCK_N,
+)
+from helion._compiler.cute.tcgen05_constants import (
+    TCGEN05_TWO_CTA_EDGE_K_TAIL_NARROW_L2_GROUPING,
 )
 from helion._compiler.cute.tcgen05_constants import (
     TCGEN05_TWO_CTA_EDGE_K_TAIL_SCHEDULER_L2_SWIZZLE_SIZE,
@@ -565,6 +578,7 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
         self,
         config: dict[str, object],
         *,
+        expected_l2_grouping: int = TCGEN05_TWO_CTA_EDGE_K_TAIL_L2_GROUPING,
         expected_l2_swizzle_size: int = TCGEN05_TWO_CTA_EDGE_K_TAIL_L2_SWIZZLE_SIZE,
     ) -> None:
         self.assertEqual(
@@ -581,7 +595,7 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
         )
         self.assertEqual(
             config["l2_groupings"],
-            [TCGEN05_TWO_CTA_EDGE_K_TAIL_L2_GROUPING],
+            [expected_l2_grouping],
         )
         self.assertEqual(
             config["tcgen05_l2_swizzle_size"],
@@ -668,6 +682,12 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
                 valid_tail,
             )
         )
+        self.assertTrue(
+            CuteTcgen05Config.cluster_m2_bk_is_valid(
+                TCGEN05_TWO_CTA_EDGE_K_TAIL_NARROW_BLOCK_K,
+                valid_tail,
+            )
+        )
         for static_k in (64, 128, 256):
             with self.subTest(static_k=static_k):
                 constraints = Tcgen05ClusterM2SearchConstraints(
@@ -731,15 +751,22 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
             torch.empty([5000], device=DEVICE, dtype=HALF_DTYPE),
             torch.empty([5000, 5000], device=DEVICE, dtype=HALF_DTYPE),
         )
-        with patch_cute_mma_support():
+        with (
+            patch_cute_mma_support(),
+            patch("torch.cuda.get_device_capability", return_value=(10, 0)),
+        ):
             bound = cute_matmul_bias_residual_gelu.bind(args)
 
         spec = bound.config_spec
         self.assertIn(CuteTcgen05ClusterM2Heuristic.name, spec.autotuner_heuristics)
+        self.assertTrue(spec.cute_tcgen05_exact_shape_aux_kernel_detected)
         constraints = spec._tcgen05_cluster_m2_search_constraints
         assert constraints is not None
         self.assertTrue(constraints.allow_edge_k_tail_family)
         self.assertIn("persistent_interleaved", spec.allowed_pid_types)
+        flat_keys = {key for key, _count, _is_sequence in spec.flat_key_layout()}
+        self.assertIn(TCGEN05_AUX_LOAD_MODE_CONFIG_KEY, flat_keys)
+        self.assertIn(TCGEN05_PERSISTENCE_MODEL_CONFIG_KEY, flat_keys)
         direct_seed = CuteTcgen05ClusterM2Heuristic.get_seed_config(
             bound.env, bound.host_function.device_ir
         ).config
@@ -749,7 +776,7 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
             for config in spec.compiler_seed_configs
             if config.config.get("tcgen05_cluster_m") == 2
         ]
-        self.assertEqual(len(raw_seeded), 2)
+        self.assertEqual(len(raw_seeded), 6)
         raw_seed = next(
             config
             for config in raw_seeded
@@ -761,6 +788,24 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
             for config in raw_seeded
             if config.get("tcgen05_strategy")
             == Tcgen05Strategy.ROLE_LOCAL_WITH_SCHEDULER.value
+            and TCGEN05_AUX_LOAD_MODE_CONFIG_KEY not in config
+        )
+        raw_aux_tma_seed = next(
+            config
+            for config in raw_seeded
+            if config.get(TCGEN05_AUX_LOAD_MODE_CONFIG_KEY) == TCGEN05_AUX_LOAD_MODE_TMA
+        )
+        raw_clc_seeds = [
+            config
+            for config in raw_seeded
+            if config.get(TCGEN05_PERSISTENCE_MODEL_CONFIG_KEY)
+            == Tcgen05PersistenceModel.CLC_PERSISTENT.value
+        ]
+        self.assertEqual(len(raw_clc_seeds), 3)
+        raw_narrow_clc_aux_tma_seed = next(
+            config
+            for config in raw_clc_seeds
+            if config["block_sizes"][1] == TCGEN05_TWO_CTA_EDGE_K_TAIL_NARROW_BLOCK_N
         )
         self.assertEqual(
             raw_seed["block_sizes"],
@@ -783,14 +828,33 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
         )
         self.assertEqual(raw_scheduler_seed["tcgen05_warp_spec_scheduler_warps"], 1)
         self.assertEqual(raw_scheduler_seed["tcgen05_warp_spec_c_input_warps"], 1)
+        self.assertEqual(
+            raw_aux_tma_seed["tcgen05_strategy"],
+            Tcgen05Strategy.ROLE_LOCAL_WITH_SCHEDULER.value,
+        )
+        self.assertEqual(raw_aux_tma_seed["tcgen05_warp_spec_scheduler_warps"], 1)
+        self.assertEqual(raw_aux_tma_seed["tcgen05_warp_spec_c_input_warps"], 1)
+        self.assertEqual(
+            raw_aux_tma_seed[TCGEN05_AUX_LOAD_MODE_CONFIG_KEY],
+            TCGEN05_AUX_LOAD_MODE_TMA,
+        )
 
         c_input_seeds = [
             config.config
             for config in spec.autotune_seed_configs()
             if config.config.get("tcgen05_warp_spec_c_input_warps") == 1
         ]
-        self.assertEqual(len(c_input_seeds), 1)
-        c_input_seed = c_input_seeds[0]
+        self.assertEqual(len(c_input_seeds), 5)
+        c_input_seed = next(
+            seed
+            for seed in c_input_seeds
+            if seed.get(TCGEN05_AUX_LOAD_MODE_CONFIG_KEY) != TCGEN05_AUX_LOAD_MODE_TMA
+        )
+        aux_tma_seed = next(
+            seed
+            for seed in c_input_seeds
+            if seed.get(TCGEN05_AUX_LOAD_MODE_CONFIG_KEY) == TCGEN05_AUX_LOAD_MODE_TMA
+        )
         self.assertEqual(
             c_input_seed["tcgen05_strategy"],
             Tcgen05Strategy.ROLE_LOCAL_WITH_SCHEDULER.value,
@@ -814,10 +878,38 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
         self.assertEqual(
             c_input_seed["indexing"], ["tensor_descriptor"] * spec.indexing.length
         )
+        self.assertEqual(aux_tma_seed["block_sizes"], c_input_seed["block_sizes"])
+        self.assertEqual(aux_tma_seed["pid_type"], c_input_seed["pid_type"])
+        self.assertEqual(
+            aux_tma_seed[TCGEN05_AUX_LOAD_MODE_CONFIG_KEY], TCGEN05_AUX_LOAD_MODE_TMA
+        )
+        self.assertEqual(
+            raw_narrow_clc_aux_tma_seed["block_sizes"],
+            [
+                TCGEN05_TWO_CTA_BLOCK_M,
+                TCGEN05_TWO_CTA_EDGE_K_TAIL_NARROW_BLOCK_N,
+                TCGEN05_TWO_CTA_EDGE_K_TAIL_NARROW_BLOCK_K,
+            ],
+        )
+        self.assertEqual(
+            raw_narrow_clc_aux_tma_seed["l2_groupings"],
+            [TCGEN05_TWO_CTA_EDGE_K_TAIL_NARROW_L2_GROUPING],
+        )
+        self.assertEqual(
+            raw_narrow_clc_aux_tma_seed[TCGEN05_AUX_LOAD_MODE_CONFIG_KEY],
+            TCGEN05_AUX_LOAD_MODE_TMA,
+        )
+        self.assertEqual(
+            {
+                seed.get(TCGEN05_AUX_LOAD_MODE_CONFIG_KEY, "simt")
+                for seed in raw_clc_seeds
+            },
+            {"simt", TCGEN05_AUX_LOAD_MODE_TMA},
+        )
 
         config_gen = spec.create_config_generation()
         seed_pairs = config_gen.seed_flat_config_pairs()
-        self.assertEqual(len(seed_pairs), 2)
+        self.assertEqual(len(seed_pairs), 6)
         normalized_seeds = [normalized.config for _flat, normalized in seed_pairs]
         normalized_seed = next(
             config
@@ -830,9 +922,111 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
             for config in normalized_seeds
             if config["tcgen05_strategy"]
             == Tcgen05Strategy.ROLE_LOCAL_WITH_SCHEDULER.value
+            and config.get(TCGEN05_AUX_LOAD_MODE_CONFIG_KEY)
+            != TCGEN05_AUX_LOAD_MODE_TMA
         )
+        normalized_aux_tma_seed = next(
+            config
+            for config in normalized_seeds
+            if config.get(TCGEN05_AUX_LOAD_MODE_CONFIG_KEY) == TCGEN05_AUX_LOAD_MODE_TMA
+        )
+        normalized_clc_seeds = [
+            config
+            for config in normalized_seeds
+            if config.get(TCGEN05_PERSISTENCE_MODEL_CONFIG_KEY)
+            == Tcgen05PersistenceModel.CLC_PERSISTENT.value
+        ]
+        self.assertEqual(len(normalized_clc_seeds), 3)
         for flat_seed, _normalized_seed in seed_pairs:
             config_gen.encode_config(flat_seed)
+        persistence_indices, _ = config_gen._key_to_flat_indices[
+            TCGEN05_PERSISTENCE_MODEL_CONFIG_KEY
+        ]
+        legacy_scheduler_seed = dict(raw_scheduler_seed)
+        legacy_scheduler_seed.pop(TCGEN05_PERSISTENCE_MODEL_CONFIG_KEY, None)
+        legacy_flat = config_gen.flatten(helion.Config(**legacy_scheduler_seed))
+        legacy_normalized = config_gen.unflatten([*legacy_flat]).config
+        self.assertEqual(
+            legacy_flat[persistence_indices[0]],
+            Tcgen05PersistenceModel.STATIC_PERSISTENT.value,
+        )
+        self.assertEqual(
+            legacy_normalized["tcgen05_strategy"],
+            Tcgen05Strategy.ROLE_LOCAL_WITH_SCHEDULER.value,
+        )
+        self.assertEqual(legacy_normalized["tcgen05_warp_spec_scheduler_warps"], 1)
+        self.assertEqual(legacy_normalized["tcgen05_warp_spec_c_input_warps"], 1)
+        self.assertEqual(
+            legacy_normalized[TCGEN05_PERSISTENCE_MODEL_CONFIG_KEY],
+            Tcgen05PersistenceModel.STATIC_PERSISTENT.value,
+        )
+        legacy_minimal_scheduler_seed = dict(raw_scheduler_seed)
+        legacy_minimal_scheduler_seed.pop("pid_type", None)
+        legacy_minimal_scheduler_seed.pop(TCGEN05_PERSISTENCE_MODEL_CONFIG_KEY, None)
+        legacy_minimal_flat = config_gen.flatten(
+            helion.Config(**legacy_minimal_scheduler_seed)
+        )
+        legacy_minimal_normalized = config_gen.unflatten([*legacy_minimal_flat]).config
+        self.assertEqual(
+            legacy_minimal_flat[persistence_indices[0]],
+            Tcgen05PersistenceModel.STATIC_PERSISTENT.value,
+        )
+        self.assertEqual(
+            legacy_minimal_normalized["tcgen05_strategy"],
+            Tcgen05Strategy.ROLE_LOCAL_WITH_SCHEDULER.value,
+        )
+        self.assertEqual(
+            legacy_minimal_normalized["pid_type"], "persistent_interleaved"
+        )
+        self.assertEqual(
+            legacy_minimal_normalized[TCGEN05_PERSISTENCE_MODEL_CONFIG_KEY],
+            Tcgen05PersistenceModel.STATIC_PERSISTENT.value,
+        )
+        invalid_pid_seed_flat = config_gen.flatten(
+            helion.Config(pid_type="not_a_valid_pid_type")
+        )
+        self.assertEqual(
+            invalid_pid_seed_flat[persistence_indices[0]],
+            Tcgen05PersistenceModel.NON_PERSISTENT.value,
+        )
+        pid_override_gen = spec.create_config_generation(
+            overrides={"pid_type": "persistent_interleaved"}
+        )
+        pid_override_config = pid_override_gen.unflatten(
+            pid_override_gen.default_flat()
+        ).config
+        self.assertEqual(pid_override_config["pid_type"], "persistent_interleaved")
+        self.assertEqual(
+            pid_override_config[TCGEN05_PERSISTENCE_MODEL_CONFIG_KEY],
+            Tcgen05PersistenceModel.STATIC_PERSISTENT.value,
+        )
+        clc_flat_seed = next(
+            flat
+            for flat, normalized in seed_pairs
+            if normalized.config.get(TCGEN05_PERSISTENCE_MODEL_CONFIG_KEY)
+            == Tcgen05PersistenceModel.CLC_PERSISTENT.value
+        )
+        pid_override_clc_config = pid_override_gen.unflatten([*clc_flat_seed]).config
+        self.assertEqual(pid_override_clc_config["pid_type"], "persistent_interleaved")
+        self.assertEqual(
+            pid_override_clc_config[TCGEN05_PERSISTENCE_MODEL_CONFIG_KEY],
+            Tcgen05PersistenceModel.CLC_PERSISTENT.value,
+        )
+        explicit_bad_override_gen = spec.create_config_generation(
+            overrides={
+                "pid_type": "persistent_interleaved",
+                TCGEN05_PERSISTENCE_MODEL_CONFIG_KEY: (
+                    Tcgen05PersistenceModel.NON_PERSISTENT.value
+                ),
+            }
+        )
+        with self.assertRaisesRegex(
+            helion.exc.InvalidConfig,
+            "contradicts pid_type='persistent_interleaved'",
+        ):
+            explicit_bad_override_gen.unflatten(
+                explicit_bad_override_gen.default_flat()
+            )
         self.assertEqual(normalized_seed["pid_type"], "persistent_interleaved")
         self.assertEqual(
             normalized_seed["block_sizes"][:3],
@@ -849,15 +1043,627 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
                 TCGEN05_TWO_CTA_EDGE_K_TAIL_SCHEDULER_L2_SWIZZLE_SIZE
             ),
         )
+        self._assert_cute_tcgen05_edge_k_tail_seed_overrides(
+            normalized_aux_tma_seed,
+            expected_l2_swizzle_size=(
+                TCGEN05_TWO_CTA_EDGE_K_TAIL_SCHEDULER_L2_SWIZZLE_SIZE
+            ),
+        )
+        self.assertEqual(
+            normalized_aux_tma_seed[TCGEN05_AUX_LOAD_MODE_CONFIG_KEY],
+            TCGEN05_AUX_LOAD_MODE_TMA,
+        )
+        normalized_narrow_clc_aux_tma_seed = next(
+            config
+            for config in normalized_clc_seeds
+            if config["block_sizes"][1] == TCGEN05_TWO_CTA_EDGE_K_TAIL_NARROW_BLOCK_N
+        )
+        self.assertEqual(
+            normalized_narrow_clc_aux_tma_seed["block_sizes"][:3],
+            [
+                TCGEN05_TWO_CTA_BLOCK_M,
+                TCGEN05_TWO_CTA_EDGE_K_TAIL_NARROW_BLOCK_N,
+                TCGEN05_TWO_CTA_EDGE_K_TAIL_NARROW_BLOCK_K,
+            ],
+        )
+        self.assertEqual(
+            normalized_narrow_clc_aux_tma_seed["l2_groupings"],
+            [TCGEN05_TWO_CTA_EDGE_K_TAIL_NARROW_L2_GROUPING],
+        )
+        self.assertEqual(
+            normalized_narrow_clc_aux_tma_seed[TCGEN05_AUX_LOAD_MODE_CONFIG_KEY],
+            TCGEN05_AUX_LOAD_MODE_TMA,
+        )
+        self.assertEqual(
+            {
+                seed.get(TCGEN05_AUX_LOAD_MODE_CONFIG_KEY, "simt")
+                for seed in normalized_clc_seeds
+            },
+            {"simt", TCGEN05_AUX_LOAD_MODE_TMA},
+        )
+        for seed in normalized_clc_seeds:
+            self.assertEqual(
+                seed["tcgen05_strategy"],
+                Tcgen05Strategy.ROLE_LOCAL_WITH_SCHEDULER.value,
+            )
+            self.assertEqual(seed["tcgen05_warp_spec_scheduler_warps"], 1)
+            self.assertEqual(seed["tcgen05_warp_spec_c_input_warps"], 1)
+            self.assertEqual(seed["tcgen05_cluster_m"], 2)
+            self.assertEqual(seed["tcgen05_cluster_n"], 1)
+            self.assertEqual(
+                seed["indexing"], ["tensor_descriptor"] * spec.indexing.length
+            )
 
-        configs = config_gen.random_population(2)
+        configs = config_gen.random_population(7)
         self.assertEqual(configs[0].config["tcgen05_cluster_m"], 1)
-        population_seed = self._assert_cute_tcgen05_cluster_m2_seeded(
-            configs,
-            expected_block_k=TCGEN05_TWO_CTA_EDGE_K_TAIL_BLOCK_K,
-            expected_indexing_length=spec.indexing.length,
+        cluster_m2_population = [
+            config.config
+            for config in configs
+            if config.config["tcgen05_cluster_m"] == 2
+        ]
+        self.assertEqual(len(cluster_m2_population), 6)
+        self.assertTrue(
+            any(
+                config["block_sizes"][1] == TCGEN05_TWO_CTA_EDGE_K_TAIL_NARROW_BLOCK_N
+                for config in cluster_m2_population
+            )
+        )
+        population_seed = next(
+            config
+            for config in cluster_m2_population
+            if config.get("tcgen05_strategy")
+            != Tcgen05Strategy.ROLE_LOCAL_WITH_SCHEDULER.value
+        )
+        self.assertEqual(
+            population_seed["block_sizes"][:3],
+            [
+                TCGEN05_TWO_CTA_BLOCK_M,
+                TCGEN05_TWO_CTA_BLOCK_N,
+                TCGEN05_TWO_CTA_EDGE_K_TAIL_BLOCK_K,
+            ],
+        )
+        self.assertEqual(population_seed["pid_type"], "persistent_interleaved")
+        self.assertEqual(population_seed["tcgen05_num_epi_warps"], 4)
+        self.assertEqual(
+            population_seed["indexing"],
+            ["tensor_descriptor"] * spec.indexing.length,
         )
         self._assert_cute_tcgen05_edge_k_tail_seed_overrides(population_seed)
+        self.assertTrue(
+            any(
+                config.get(TCGEN05_PERSISTENCE_MODEL_CONFIG_KEY)
+                == Tcgen05PersistenceModel.CLC_PERSISTENT.value
+                for config in cluster_m2_population
+            )
+        )
+
+    @onlyBackends(["cute"])
+    def test_cute_tcgen05_clc_search_normalizes_valid_and_invalid_cases(
+        self,
+    ) -> None:
+        @helion.kernel(backend="cute")
+        def cute_matmul_bias_residual_gelu(
+            x: torch.Tensor,
+            y: torch.Tensor,
+            bias: torch.Tensor,
+            residual: torch.Tensor,
+        ) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = torch.nn.functional.gelu(
+                    1.25 * acc + 0.5 * residual[tile_m, tile_n] + bias[tile_n],
+                    approximate="tanh",
+                ).to(x.dtype)
+            return out
+
+        args = (
+            torch.empty([5000, 5000], device=DEVICE, dtype=HALF_DTYPE),
+            torch.empty([5000, 5000], device=DEVICE, dtype=HALF_DTYPE),
+            torch.empty([5000], device=DEVICE, dtype=HALF_DTYPE),
+            torch.empty([5000, 5000], device=DEVICE, dtype=HALF_DTYPE),
+        )
+        with (
+            patch_cute_mma_support(),
+            patch("torch.cuda.get_device_capability", return_value=(10, 0)),
+        ):
+            bound = cute_matmul_bias_residual_gelu.bind(args)
+        with (
+            patch_cute_mma_support(),
+            patch("torch.cuda.get_device_capability", return_value=(9, 0)),
+        ):
+            sm90_bound = cute_matmul_bias_residual_gelu.bind(args)
+        self.assertIsNot(sm90_bound, bound)
+
+        valid_config: dict[str, object] = {
+            "block_sizes": [
+                TCGEN05_TWO_CTA_BLOCK_M,
+                TCGEN05_TWO_CTA_BLOCK_N,
+                TCGEN05_TWO_CTA_EDGE_K_TAIL_BLOCK_K,
+            ],
+            "indexing": ["tensor_descriptor"] * bound.config_spec.indexing.length,
+            "pid_type": "persistent_interleaved",
+            "tcgen05_cluster_m": 2,
+            "tcgen05_cluster_n": 1,
+            "tcgen05_strategy": Tcgen05Strategy.ROLE_LOCAL_WITH_SCHEDULER.value,
+            "tcgen05_warp_spec_scheduler_warps": 1,
+            "tcgen05_warp_spec_c_input_warps": 1,
+            TCGEN05_PERSISTENCE_MODEL_CONFIG_KEY: (
+                Tcgen05PersistenceModel.CLC_PERSISTENT.value
+            ),
+        }
+        bound.config_spec.normalize(valid_config, _fix_invalid=True)
+        self.assertEqual(
+            valid_config[TCGEN05_PERSISTENCE_MODEL_CONFIG_KEY],
+            Tcgen05PersistenceModel.CLC_PERSISTENT.value,
+        )
+
+        invalid_cluster_n_config = dict(valid_config)
+        invalid_cluster_n_config["tcgen05_cluster_n"] = 2
+        bound.config_spec.normalize(invalid_cluster_n_config, _fix_invalid=True)
+        self.assertEqual(
+            invalid_cluster_n_config[TCGEN05_PERSISTENCE_MODEL_CONFIG_KEY],
+            Tcgen05PersistenceModel.STATIC_PERSISTENT.value,
+        )
+        narrow_invalid_cluster_n_config = dict(valid_config)
+        narrow_invalid_cluster_n_config["block_sizes"] = [
+            TCGEN05_TWO_CTA_BLOCK_M,
+            TCGEN05_TWO_CTA_EDGE_K_TAIL_NARROW_BLOCK_N,
+            TCGEN05_TWO_CTA_EDGE_K_TAIL_BLOCK_K,
+        ]
+        narrow_invalid_cluster_n_config["tcgen05_cluster_n"] = 2
+        narrow_invalid_cluster_n_config[TCGEN05_AUX_LOAD_MODE_CONFIG_KEY] = (
+            TCGEN05_AUX_LOAD_MODE_TMA
+        )
+        bound.config_spec.normalize(narrow_invalid_cluster_n_config, _fix_invalid=True)
+        self.assertEqual(
+            narrow_invalid_cluster_n_config["block_sizes"][:3],
+            [
+                TCGEN05_TWO_CTA_BLOCK_M,
+                TCGEN05_TWO_CTA_BLOCK_N,
+                TCGEN05_TWO_CTA_EDGE_K_TAIL_BLOCK_K,
+            ],
+        )
+        self.assertEqual(
+            narrow_invalid_cluster_n_config[TCGEN05_PERSISTENCE_MODEL_CONFIG_KEY],
+            Tcgen05PersistenceModel.STATIC_PERSISTENT.value,
+        )
+        reset_config = dict(valid_config)
+        reset_config["pid_type"] = "flat"
+        bound.config_spec._cute_tcgen05_config.normalize_strategy(
+            reset_config,
+            fix_invalid=True,
+        )
+        self.assertEqual(
+            reset_config[TCGEN05_PERSISTENCE_MODEL_CONFIG_KEY],
+            Tcgen05PersistenceModel.NON_PERSISTENT.value,
+        )
+
+        sm90_config = dict(valid_config)
+        sm90_config[TCGEN05_AUX_LOAD_MODE_CONFIG_KEY] = TCGEN05_AUX_LOAD_MODE_TMA
+        sm90_bound.config_spec.normalize(sm90_config, _fix_invalid=True)
+        self.assertEqual(
+            sm90_config[TCGEN05_PERSISTENCE_MODEL_CONFIG_KEY],
+            Tcgen05PersistenceModel.STATIC_PERSISTENT.value,
+        )
+        self.assertEqual(
+            sm90_config[TCGEN05_AUX_LOAD_MODE_CONFIG_KEY],
+            TCGEN05_AUX_LOAD_MODE_TMA,
+        )
+        sm90_flat_keys = {
+            key
+            for key, _count, _is_sequence in sm90_bound.config_spec.flat_key_layout()
+        }
+        sm90_seeds = sm90_bound.config_spec.autotune_seed_configs()
+        self.assertNotIn(TCGEN05_PERSISTENCE_MODEL_CONFIG_KEY, sm90_flat_keys)
+        self.assertFalse(
+            any(
+                seed.config.get(TCGEN05_PERSISTENCE_MODEL_CONFIG_KEY)
+                == Tcgen05PersistenceModel.CLC_PERSISTENT.value
+                for seed in sm90_seeds
+            )
+        )
+
+    @onlyBackends(["cute"])
+    def test_cute_tcgen05_narrow_n_seed_requires_n_edge_at_128(self) -> None:
+        @helion.kernel(backend="cute")
+        def cute_matmul_bias_residual_gelu(
+            x: torch.Tensor,
+            y: torch.Tensor,
+            bias: torch.Tensor,
+            residual: torch.Tensor,
+        ) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = torch.nn.functional.gelu(
+                    1.25 * acc + 0.5 * residual[tile_m, tile_n] + bias[tile_n],
+                    approximate="tanh",
+                ).to(x.dtype)
+            return out
+
+        # N=4224 is an edge for block_n=256 but a full tile for block_n=128.
+        # Keep the narrow-N seed out of this family so aux-TMA never turns the
+        # validated double-output-edge + K-tail split into M-edge + K-tail.
+        args = (
+            torch.empty([5000, 5000], device=DEVICE, dtype=HALF_DTYPE),
+            torch.empty([5000, 4224], device=DEVICE, dtype=HALF_DTYPE),
+            torch.empty([4224], device=DEVICE, dtype=HALF_DTYPE),
+            torch.empty([5000, 4224], device=DEVICE, dtype=HALF_DTYPE),
+        )
+        with (
+            patch_cute_mma_support(),
+            patch("torch.cuda.get_device_capability", return_value=(10, 0)),
+        ):
+            bound = cute_matmul_bias_residual_gelu.bind(args)
+
+        spec = bound.config_spec
+        self.assertTrue(spec.cute_tcgen05_exact_shape_aux_kernel_detected)
+        seed_block_sizes = [
+            config.config.get("block_sizes") for config in spec.autotune_seed_configs()
+        ]
+        self.assertFalse(
+            any(
+                isinstance(block_sizes, list)
+                and len(block_sizes) > 1
+                and block_sizes[1] == TCGEN05_TWO_CTA_EDGE_K_TAIL_NARROW_BLOCK_N
+                for block_sizes in seed_block_sizes
+            )
+        )
+
+        narrow_config: dict[str, object] = {
+            "block_sizes": [
+                TCGEN05_TWO_CTA_BLOCK_M,
+                TCGEN05_TWO_CTA_EDGE_K_TAIL_NARROW_BLOCK_N,
+                TCGEN05_TWO_CTA_EDGE_K_TAIL_BLOCK_K,
+            ],
+            "indexing": ["tensor_descriptor"] * spec.indexing.length,
+            "pid_type": "persistent_interleaved",
+            "tcgen05_cluster_m": 2,
+            "tcgen05_cluster_n": 1,
+            "tcgen05_strategy": Tcgen05Strategy.ROLE_LOCAL_WITH_SCHEDULER.value,
+            "tcgen05_warp_spec_scheduler_warps": 1,
+            "tcgen05_warp_spec_c_input_warps": 1,
+            TCGEN05_AUX_LOAD_MODE_CONFIG_KEY: TCGEN05_AUX_LOAD_MODE_TMA,
+            TCGEN05_PERSISTENCE_MODEL_CONFIG_KEY: (
+                Tcgen05PersistenceModel.CLC_PERSISTENT.value
+            ),
+        }
+        spec.normalize(narrow_config, _fix_invalid=True)
+        self.assertEqual(
+            narrow_config["block_sizes"][:3],
+            [
+                TCGEN05_TWO_CTA_BLOCK_M,
+                TCGEN05_TWO_CTA_BLOCK_N,
+                TCGEN05_TWO_CTA_EDGE_K_TAIL_BLOCK_K,
+            ],
+        )
+        self.assertEqual(
+            narrow_config[TCGEN05_PERSISTENCE_MODEL_CONFIG_KEY],
+            Tcgen05PersistenceModel.CLC_PERSISTENT.value,
+        )
+
+    @onlyBackends(["cute"])
+    def test_cute_tcgen05_clc_force_persistent_hides_persistence_flat_axis(
+        self,
+    ) -> None:
+        @helion.kernel(backend="cute", autotune_force_persistent=True)
+        def cute_matmul_bias_residual_gelu(
+            x: torch.Tensor,
+            y: torch.Tensor,
+            bias: torch.Tensor,
+            residual: torch.Tensor,
+        ) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = torch.nn.functional.gelu(
+                    1.25 * acc + 0.5 * residual[tile_m, tile_n] + bias[tile_n],
+                    approximate="tanh",
+                ).to(x.dtype)
+            return out
+
+        args = (
+            torch.empty([5000, 5000], device=DEVICE, dtype=HALF_DTYPE),
+            torch.empty([5000, 5000], device=DEVICE, dtype=HALF_DTYPE),
+            torch.empty([5000], device=DEVICE, dtype=HALF_DTYPE),
+            torch.empty([5000, 5000], device=DEVICE, dtype=HALF_DTYPE),
+        )
+        with (
+            patch_cute_mma_support(),
+            patch("torch.cuda.get_device_capability", return_value=(10, 0)),
+        ):
+            bound = cute_matmul_bias_residual_gelu.bind(args)
+
+        spec = bound.config_spec
+        self.assertEqual(spec.allowed_pid_types, ("persistent_interleaved",))
+        flat_keys = {key for key, _count, _is_sequence in spec.flat_key_layout()}
+        self.assertNotIn(TCGEN05_PERSISTENCE_MODEL_CONFIG_KEY, flat_keys)
+        self.assertFalse(
+            any(
+                seed.config.get(TCGEN05_PERSISTENCE_MODEL_CONFIG_KEY)
+                == Tcgen05PersistenceModel.CLC_PERSISTENT.value
+                for seed in spec.autotune_seed_configs()
+            )
+        )
+
+        config_gen = spec.create_config_generation()
+        default_flat = config_gen.default_flat()
+        pid_indices, _ = config_gen._key_to_flat_indices["pid_type"]
+        self.assertEqual(default_flat[pid_indices[0]], "persistent_interleaved")
+        minimal_seed_flat = config_gen.flatten(helion.Config())
+        self.assertEqual(minimal_seed_flat[pid_indices[0]], "persistent_interleaved")
+        config = config_gen.unflatten([*default_flat])
+        # Force-persistent removes "flat" from the pid fragment, so flattening
+        # encodes persistent_interleaved. Unflatten normalization rewrites the
+        # cluster_m=1 persistent pid back to flat, which derives NON_PERSISTENT.
+        # The CLC persistence axis is hidden for this non-identity path.
+        self.assertEqual(
+            config.config["pid_type"],
+            "flat",
+        )
+        self.assertEqual(
+            config.config[TCGEN05_PERSISTENCE_MODEL_CONFIG_KEY],
+            Tcgen05PersistenceModel.NON_PERSISTENT.value,
+        )
+
+    @onlyBackends(["cute"])
+    def test_cute_tcgen05_aux_tma_seed_requires_exact_shape_aux(self) -> None:
+        @helion.kernel(backend="cute")
+        def cute_matmul_bias(
+            x: torch.Tensor,
+            y: torch.Tensor,
+            bias: torch.Tensor,
+        ) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = (acc + bias[tile_n]).to(x.dtype)
+            return out
+
+        args = (
+            torch.empty([5000, 5000], device=DEVICE, dtype=HALF_DTYPE),
+            torch.empty([5000, 5000], device=DEVICE, dtype=HALF_DTYPE),
+            torch.empty([5000], device=DEVICE, dtype=HALF_DTYPE),
+        )
+        with patch_cute_mma_support():
+            bound = cute_matmul_bias.bind(args)
+
+        spec = bound.config_spec
+        self.assertTrue(spec.cute_tcgen05_aux_kernel_detected)
+        self.assertFalse(spec.cute_tcgen05_exact_shape_aux_kernel_detected)
+        flat_keys = {key for key, _count, _is_sequence in spec.flat_key_layout()}
+        self.assertNotIn(TCGEN05_AUX_LOAD_MODE_CONFIG_KEY, flat_keys)
+        self.assertNotIn(TCGEN05_PERSISTENCE_MODEL_CONFIG_KEY, flat_keys)
+        self.assertFalse(
+            any(
+                config.config.get(TCGEN05_AUX_LOAD_MODE_CONFIG_KEY)
+                == TCGEN05_AUX_LOAD_MODE_TMA
+                for config in spec.compiler_seed_configs
+            )
+        )
+        self.assertFalse(
+            any(
+                config.config.get(TCGEN05_PERSISTENCE_MODEL_CONFIG_KEY)
+                == Tcgen05PersistenceModel.CLC_PERSISTENT.value
+                for config in spec.compiler_seed_configs
+            )
+        )
+
+    @onlyBackends(["cute"])
+    def test_cute_tcgen05_aux_tma_seed_rejects_mixed_exact_aux_dtype(self) -> None:
+        @helion.kernel(backend="cute")
+        def cute_matmul_two_residuals(
+            x: torch.Tensor,
+            y: torch.Tensor,
+            residual_bf16: torch.Tensor,
+            residual_fp32: torch.Tensor,
+        ) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = (
+                    acc + residual_bf16[tile_m, tile_n] + residual_fp32[tile_m, tile_n]
+                ).to(x.dtype)
+            return out
+
+        args = (
+            torch.empty([5000, 5000], device=DEVICE, dtype=HALF_DTYPE),
+            torch.empty([5000, 5000], device=DEVICE, dtype=HALF_DTYPE),
+            torch.empty([5000, 5000], device=DEVICE, dtype=HALF_DTYPE),
+            torch.empty([5000, 5000], device=DEVICE, dtype=torch.float32),
+        )
+        with patch_cute_mma_support():
+            bound = cute_matmul_two_residuals.bind(args)
+
+        spec = bound.config_spec
+        self.assertTrue(spec.cute_tcgen05_aux_kernel_detected)
+        self.assertFalse(spec.cute_tcgen05_exact_shape_aux_kernel_detected)
+        self.assertFalse(
+            any(
+                config.config.get(TCGEN05_AUX_LOAD_MODE_CONFIG_KEY)
+                == TCGEN05_AUX_LOAD_MODE_TMA
+                for config in spec.compiler_seed_configs
+            )
+        )
+
+    @onlyBackends(["cute"])
+    def test_cute_tcgen05_aux_tma_seed_rejects_unrelated_exact_aux_store(
+        self,
+    ) -> None:
+        @helion.kernel(backend="cute")
+        def cute_matmul_and_elementwise_store(
+            x: torch.Tensor,
+            y: torch.Tensor,
+            residual: torch.Tensor,
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            aux_out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = acc.to(x.dtype)
+                aux_out[tile_m, tile_n] = (residual[tile_m, tile_n] + 1).to(x.dtype)
+            return out, aux_out
+
+        args = (
+            torch.empty([5000, 5000], device=DEVICE, dtype=HALF_DTYPE),
+            torch.empty([5000, 5000], device=DEVICE, dtype=HALF_DTYPE),
+            torch.empty([5000, 5000], device=DEVICE, dtype=HALF_DTYPE),
+        )
+        with patch_cute_mma_support():
+            bound = cute_matmul_and_elementwise_store.bind(args)
+
+        spec = bound.config_spec
+        self.assertTrue(spec.cute_tcgen05_aux_kernel_detected)
+        self.assertFalse(spec.cute_tcgen05_exact_shape_aux_kernel_detected)
+        self.assertFalse(
+            any(
+                config.config.get(TCGEN05_AUX_LOAD_MODE_CONFIG_KEY)
+                == TCGEN05_AUX_LOAD_MODE_TMA
+                for config in spec.compiler_seed_configs
+            )
+        )
+
+    @onlyBackends(["cute"])
+    def test_cute_tcgen05_aux_tma_seed_rejects_partial_rank2_aux_load(self) -> None:
+        @helion.kernel(backend="cute")
+        def cute_matmul_partial_residual(
+            x: torch.Tensor,
+            y: torch.Tensor,
+            residual: torch.Tensor,
+        ) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = (acc + residual[tile_m, 0][:, None]).to(x.dtype)
+            return out
+
+        args = (
+            torch.empty([5000, 5000], device=DEVICE, dtype=HALF_DTYPE),
+            torch.empty([5000, 5000], device=DEVICE, dtype=HALF_DTYPE),
+            torch.empty([5000, 5000], device=DEVICE, dtype=HALF_DTYPE),
+        )
+        with patch_cute_mma_support():
+            bound = cute_matmul_partial_residual.bind(args)
+
+        spec = bound.config_spec
+        self.assertTrue(spec.cute_tcgen05_aux_kernel_detected)
+        self.assertFalse(spec.cute_tcgen05_exact_shape_aux_kernel_detected)
+        self.assertFalse(
+            any(
+                config.config.get(TCGEN05_AUX_LOAD_MODE_CONFIG_KEY)
+                == TCGEN05_AUX_LOAD_MODE_TMA
+                for config in spec.compiler_seed_configs
+            )
+        )
+
+    @onlyBackends(["cute"])
+    def test_cute_tcgen05_aux_tma_seed_rejects_scrambled_exact_aux_index(
+        self,
+    ) -> None:
+        @helion.kernel(backend="cute")
+        def cute_matmul_scrambled_residual(
+            x: torch.Tensor,
+            y: torch.Tensor,
+            residual: torch.Tensor,
+        ) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = (acc + residual[tile_n, tile_m]).to(x.dtype)
+            return out
+
+        args = (
+            torch.empty([5000, 5000], device=DEVICE, dtype=HALF_DTYPE),
+            torch.empty([5000, 5000], device=DEVICE, dtype=HALF_DTYPE),
+            torch.empty([5000, 5000], device=DEVICE, dtype=HALF_DTYPE),
+        )
+        with patch_cute_mma_support():
+            bound = cute_matmul_scrambled_residual.bind(args)
+
+        spec = bound.config_spec
+        self.assertTrue(spec.cute_tcgen05_aux_kernel_detected)
+        self.assertFalse(spec.cute_tcgen05_exact_shape_aux_kernel_detected)
+        self.assertFalse(
+            any(
+                config.config.get(TCGEN05_AUX_LOAD_MODE_CONFIG_KEY)
+                == TCGEN05_AUX_LOAD_MODE_TMA
+                for config in spec.compiler_seed_configs
+            )
+        )
+
+    @onlyBackends(["cute"])
+    def test_cute_tcgen05_aux_tma_seed_rejects_multi_store_exact_aux(self) -> None:
+        @helion.kernel(backend="cute")
+        def cute_matmul_residual_fanout(
+            x: torch.Tensor,
+            y: torch.Tensor,
+            residual_a: torch.Tensor,
+            residual_b: torch.Tensor,
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            m, k = x.size()
+            _, n = y.size()
+            out_a = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            out_b = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out_a[tile_m, tile_n] = (acc + residual_a[tile_m, tile_n]).to(x.dtype)
+                out_b[tile_m, tile_n] = (acc + residual_b[tile_m, tile_n]).to(x.dtype)
+            return out_a, out_b
+
+        args = (
+            torch.empty([5000, 5000], device=DEVICE, dtype=HALF_DTYPE),
+            torch.empty([5000, 5000], device=DEVICE, dtype=HALF_DTYPE),
+            torch.empty([5000, 5000], device=DEVICE, dtype=HALF_DTYPE),
+            torch.empty([5000, 5000], device=DEVICE, dtype=HALF_DTYPE),
+        )
+        with patch_cute_mma_support():
+            bound = cute_matmul_residual_fanout.bind(args)
+
+        spec = bound.config_spec
+        self.assertTrue(spec.cute_tcgen05_aux_kernel_detected)
+        self.assertFalse(spec.cute_tcgen05_exact_shape_aux_kernel_detected)
+        self.assertFalse(
+            any(
+                config.config.get(TCGEN05_AUX_LOAD_MODE_CONFIG_KEY)
+                == TCGEN05_AUX_LOAD_MODE_TMA
+                for config in spec.compiler_seed_configs
+            )
+        )
 
     @onlyBackends(["cute"])
     def test_cute_tcgen05_c_input_seed_respects_disable_heuristics(self) -> None:

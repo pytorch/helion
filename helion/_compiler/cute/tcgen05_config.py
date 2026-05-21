@@ -65,6 +65,8 @@ from .tcgen05_constants import TCGEN05_ACC_PRODUCER_MODES
 from .tcgen05_constants import TCGEN05_ACC_WAIT_PLACEMENT_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_ACC_WAIT_PLACEMENTS
 from .tcgen05_constants import TCGEN05_AUX_LOAD_MODE_CONFIG_KEY
+from .tcgen05_constants import TCGEN05_AUX_LOAD_MODE_SIMT
+from .tcgen05_constants import TCGEN05_AUX_LOAD_MODE_TMA
 from .tcgen05_constants import TCGEN05_AUX_LOAD_MODES
 from .tcgen05_constants import TCGEN05_C_ACQUIRE_PLACEMENT_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_C_ACQUIRE_PLACEMENTS
@@ -88,6 +90,9 @@ from .tcgen05_constants import TCGEN05_SCHED_CONSUMER_WAIT_MODES
 from .tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_M
 from .tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_N
 from .tcgen05_constants import TCGEN05_TWO_CTA_EDGE_K_TAIL_BLOCK_K
+from .tcgen05_constants import TCGEN05_TWO_CTA_EDGE_K_TAIL_NARROW_BLOCK_K
+from .tcgen05_constants import TCGEN05_TWO_CTA_EDGE_K_TAIL_NARROW_BLOCK_N
+from .tcgen05_constants import TCGEN05_TWO_CTA_EDGE_K_TAIL_NARROW_L2_GROUPING
 from .tcgen05_constants import TCGEN05_TWO_CTA_EDGE_K_TAIL_SCHEDULER_L2_SWIZZLE_SIZE
 from .tcgen05_constants import TCGEN05_TWO_CTA_MAX_K_TILES
 from .tcgen05_constants import TCGEN05_TWO_CTA_SEED_PID_TYPE
@@ -95,6 +100,8 @@ from .tcgen05_constants import tcgen05_ab_smem_bytes_per_cta
 from .tcgen05_constants import tcgen05_two_cta_edge_k_tail_seed_overrides
 
 if TYPE_CHECKING:
+    from collections.abc import Mapping
+
     from ...autotuner.block_id_sequence import BlockIdSequence
     from ...autotuner.config_fragment import BlockSizeFragment
     from ...autotuner.config_spec import ConfigSpec
@@ -162,6 +169,7 @@ class CuteTcgen05Config:
         self.config_spec = config_spec
         self.search_enabled: bool = False
         self.aux_kernel_detected: bool = False
+        self.exact_shape_aux_kernel_detected: bool = False
         self.cluster_m_search_choices: tuple[int, ...] | None = None
         self.cluster_m2_search_constraints: Tcgen05ClusterM2SearchConstraints | None = (
             None
@@ -234,7 +242,11 @@ class CuteTcgen05Config:
             return False
         if constraints.allow_edge_k_tail_family:
             return (
-                bk == TCGEN05_TWO_CTA_EDGE_K_TAIL_BLOCK_K
+                bk
+                in (
+                    TCGEN05_TWO_CTA_EDGE_K_TAIL_BLOCK_K,
+                    TCGEN05_TWO_CTA_EDGE_K_TAIL_NARROW_BLOCK_K,
+                )
                 and constraints.static_k > bk
                 and constraints.static_k % bk != 0
                 and (constraints.static_k + bk - 1) // bk <= constraints.max_k_tiles
@@ -307,6 +319,9 @@ class CuteTcgen05Config:
             TCGEN05_STRATEGY_CONFIG_KEY: (
                 Tcgen05Strategy.ROLE_LOCAL_WITH_SCHEDULER.value
             ),
+            TCGEN05_PERSISTENCE_MODEL_CONFIG_KEY: (
+                Tcgen05PersistenceModel.STATIC_PERSISTENT.value
+            ),
             TCGEN05_WARP_SPEC_SCHEDULER_WARPS_KEY: 1,
             TCGEN05_WARP_SPEC_C_INPUT_WARPS_KEY: 1,
         }
@@ -328,11 +343,84 @@ class CuteTcgen05Config:
                 ]
         return Config(**seed_config)
 
+    def _aux_tma_search_enabled(self) -> bool:
+        # The TMA aux producer is currently admitted only for the validated
+        # Target8-style edge+K-tail split: full tiles use TMA aux loads, while
+        # partial output tiles keep the existing predicated SIMT aux path.
+        constraints = self.cluster_m2_search_constraints
+        return (
+            self.exact_shape_aux_kernel_detected
+            and constraints is not None
+            and constraints.allow_edge_k_tail_family
+        )
+
+    def _aux_tma_seed_config(self, c_input_seed: Config) -> Config | None:
+        if not self._aux_tma_search_enabled():
+            return None
+        seed_config: dict[str, Any] = dict(c_input_seed.config)
+        seed_config[TCGEN05_AUX_LOAD_MODE_CONFIG_KEY] = TCGEN05_AUX_LOAD_MODE_TMA
+        return Config(**seed_config)
+
+    def _clc_persistence_seed_config(self, base_seed: Config) -> Config | None:
+        if not self._clc_persistence_search_enabled():
+            return None
+        seed_config: dict[str, Any] = dict(base_seed.config)
+        seed_config[TCGEN05_PERSISTENCE_MODEL_CONFIG_KEY] = (
+            Tcgen05PersistenceModel.CLC_PERSISTENT.value
+        )
+        return Config(**seed_config)
+
+    def _clc_aux_tma_narrow_n_seed_config(
+        self, clc_aux_tma_seed: Config
+    ) -> Config | None:
+        if not self._has_any_matmul_fact_n_edge_for_block_n(
+            TCGEN05_TWO_CTA_EDGE_K_TAIL_NARROW_BLOCK_N
+        ):
+            return None
+        bn_fragment = cast(
+            "BlockSizeFragment",
+            self.config_spec.block_sizes[1]._fragment(self.config_spec),
+        )
+        if not (
+            bn_fragment.low
+            <= TCGEN05_TWO_CTA_EDGE_K_TAIL_NARROW_BLOCK_N
+            <= bn_fragment.high
+        ):
+            return None
+        constraints = self.cluster_m2_search_constraints
+        if constraints is None or not self.cluster_m2_bk_is_valid(
+            TCGEN05_TWO_CTA_EDGE_K_TAIL_NARROW_BLOCK_K,
+            constraints,
+        ):
+            return None
+        seed_config: dict[str, Any] = dict(clc_aux_tma_seed.config)
+        seed_config["block_sizes"] = [
+            TCGEN05_TWO_CTA_BLOCK_M,
+            TCGEN05_TWO_CTA_EDGE_K_TAIL_NARROW_BLOCK_N,
+            TCGEN05_TWO_CTA_EDGE_K_TAIL_NARROW_BLOCK_K,
+        ]
+        seed_config["l2_groupings"] = [TCGEN05_TWO_CTA_EDGE_K_TAIL_NARROW_L2_GROUPING]
+        return Config(**seed_config)
+
     def autotune_seed_configs(self) -> list[Config]:
         seeds: list[Config] = []
         c_input_seed = self._c_input_seed_config()
         if c_input_seed is not None:
             seeds.append(c_input_seed)
+            clc_c_input_seed = self._clc_persistence_seed_config(c_input_seed)
+            if clc_c_input_seed is not None:
+                seeds.append(clc_c_input_seed)
+            aux_tma_seed = self._aux_tma_seed_config(c_input_seed)
+            if aux_tma_seed is not None:
+                seeds.append(aux_tma_seed)
+                clc_aux_tma_seed = self._clc_persistence_seed_config(aux_tma_seed)
+                if clc_aux_tma_seed is not None:
+                    seeds.append(clc_aux_tma_seed)
+                    clc_aux_tma_narrow_n_seed = self._clc_aux_tma_narrow_n_seed_config(
+                        clc_aux_tma_seed
+                    )
+                    if clc_aux_tma_narrow_n_seed is not None:
+                        seeds.append(clc_aux_tma_narrow_n_seed)
         return seeds
 
     def _fix_cluster_m2_search_config(self, config: dict[str, object]) -> None:
@@ -350,8 +438,13 @@ class CuteTcgen05Config:
             config["tcgen05_cluster_m"] = 1
             return
         edge_k_tail_family = constraints.allow_edge_k_tail_family
+        is_narrow_clc_aux_tma = self._is_clc_aux_tma_narrow_n_config(config)
         if edge_k_tail_family:
-            block_sizes[2] = TCGEN05_TWO_CTA_EDGE_K_TAIL_BLOCK_K
+            block_sizes[2] = (
+                TCGEN05_TWO_CTA_EDGE_K_TAIL_NARROW_BLOCK_K
+                if is_narrow_clc_aux_tma
+                else TCGEN05_TWO_CTA_EDGE_K_TAIL_BLOCK_K
+            )
         bk = block_sizes[2]
         if not isinstance(bk, int) or isinstance(bk, bool):
             config["tcgen05_cluster_m"] = 1
@@ -361,13 +454,23 @@ class CuteTcgen05Config:
             return
         config["pid_type"] = TCGEN05_TWO_CTA_SEED_PID_TYPE
         block_sizes[0] = TCGEN05_TWO_CTA_BLOCK_M
-        block_sizes[1] = TCGEN05_TWO_CTA_BLOCK_N
+        # Only the fully validated narrow-N CLC+aux-TMA seed may keep
+        # block_n=128; other candidates use the canonical block_n=256.
+        if is_narrow_clc_aux_tma:
+            block_sizes[1] = TCGEN05_TWO_CTA_EDGE_K_TAIL_NARROW_BLOCK_N
+        else:
+            block_sizes[1] = TCGEN05_TWO_CTA_BLOCK_N
         if edge_k_tail_family:
-            # This family is pinned to the measured production tuple after
-            # search projection. The placement keys remain available for
-            # non-edge diagnostic/search paths, but edge+K-tail candidates do
-            # not explore partially mutated placement variants.
+            # This family is pinned to measured production stage/pipeline
+            # values after search projection.
+            # Placement keys remain available for non-edge diagnostic/search
+            # paths, but edge+K-tail candidates do not explore partially
+            # mutated placement variants.
             config.update(tcgen05_two_cta_edge_k_tail_seed_overrides())
+            if is_narrow_clc_aux_tma:
+                config["l2_groupings"] = [
+                    TCGEN05_TWO_CTA_EDGE_K_TAIL_NARROW_L2_GROUPING
+                ]
             if self.aux_kernel_detected and self._has_any_matmul_fact_edge_tile(config):
                 self._set_aux_edge_cluster_m2_prefix(config)
 
@@ -463,6 +566,162 @@ class CuteTcgen05Config:
         if ab_stages == 3 and config.get(TCGEN05_WARP_SPEC_C_INPUT_WARPS_KEY) == 1:
             config[TCGEN05_WARP_SPEC_C_INPUT_WARPS_KEY] = 0
 
+    def _fix_aux_tma_search_config(self, config: dict[str, object]) -> None:
+        if config.get(TCGEN05_AUX_LOAD_MODE_CONFIG_KEY) != TCGEN05_AUX_LOAD_MODE_TMA:
+            return
+        if not self._aux_tma_search_enabled():
+            config[TCGEN05_AUX_LOAD_MODE_CONFIG_KEY] = TCGEN05_AUX_LOAD_MODE_SIMT
+            return
+        if not (
+            self._is_validated_cluster_m2_edge_search_candidate(config)
+            and self._is_with_scheduler_c_input_config(config)
+        ):
+            config[TCGEN05_AUX_LOAD_MODE_CONFIG_KEY] = TCGEN05_AUX_LOAD_MODE_SIMT
+
+    @staticmethod
+    def _is_with_scheduler_c_input_config(config: dict[str, object]) -> bool:
+        return (
+            config.get(TCGEN05_STRATEGY_CONFIG_KEY)
+            == Tcgen05Strategy.ROLE_LOCAL_WITH_SCHEDULER.value
+            and config.get(TCGEN05_WARP_SPEC_SCHEDULER_WARPS_KEY) == 1
+            and config.get(TCGEN05_WARP_SPEC_C_INPUT_WARPS_KEY) == 1
+        )
+
+    def _clc_persistence_search_enabled(self) -> bool:
+        """CLC search is the sm100+ slice of the aux-TMA edge+K-tail gate."""
+        if not self._aux_tma_search_enabled():
+            return False
+        capability = self.config_spec.target_device_capability
+        if capability is None:
+            return False
+        return capability[0] >= 10 and "flat" in self.allowed_pid_types
+
+    def _is_clc_aux_tma_narrow_n_config(self, config: dict[str, object]) -> bool:
+        block_sizes = config.get("block_sizes")
+        return (
+            isinstance(block_sizes, list)
+            and len(block_sizes) >= 3
+            and block_sizes[1] == TCGEN05_TWO_CTA_EDGE_K_TAIL_NARROW_BLOCK_N
+            and config.get(TCGEN05_AUX_LOAD_MODE_CONFIG_KEY)
+            == TCGEN05_AUX_LOAD_MODE_TMA
+            and config.get(TCGEN05_PERSISTENCE_MODEL_CONFIG_KEY)
+            == Tcgen05PersistenceModel.CLC_PERSISTENT.value
+            and self._is_validated_clc_persistence_search_candidate(config)
+        )
+
+    def _is_validated_clc_persistence_search_candidate(
+        self, config: dict[str, object]
+    ) -> bool:
+        if not self._clc_persistence_search_enabled():
+            return False
+        if not self._is_validated_cluster_m2_edge_search_candidate(config):
+            return False
+        if config.get("pid_type") != TCGEN05_TWO_CTA_SEED_PID_TYPE:
+            return False
+        if config.get("tcgen05_cluster_n", 1) != 1:
+            return False
+        if not self._is_with_scheduler_c_input_config(config):
+            return False
+        block_sizes = config.get("block_sizes")
+        if not isinstance(block_sizes, list) or len(block_sizes) < 3:
+            return False
+        if block_sizes[0] != TCGEN05_TWO_CTA_BLOCK_M:
+            return False
+        if block_sizes[1] not in (
+            TCGEN05_TWO_CTA_BLOCK_N,
+            TCGEN05_TWO_CTA_EDGE_K_TAIL_NARROW_BLOCK_N,
+        ):
+            return False
+        is_narrow_n = block_sizes[1] == TCGEN05_TWO_CTA_EDGE_K_TAIL_NARROW_BLOCK_N
+        if is_narrow_n:
+            if not self._has_any_matmul_fact_n_edge_for_block_n(
+                TCGEN05_TWO_CTA_EDGE_K_TAIL_NARROW_BLOCK_N
+            ):
+                return False
+            if (
+                config.get(TCGEN05_AUX_LOAD_MODE_CONFIG_KEY)
+                != TCGEN05_AUX_LOAD_MODE_TMA
+            ):
+                return False
+            if block_sizes[2] not in (
+                TCGEN05_TWO_CTA_EDGE_K_TAIL_BLOCK_K,
+                TCGEN05_TWO_CTA_EDGE_K_TAIL_NARROW_BLOCK_K,
+            ):
+                return False
+        elif block_sizes[2] != TCGEN05_TWO_CTA_EDGE_K_TAIL_BLOCK_K:
+            return False
+        if self.config_spec.supports_config_key("indexing"):
+            indexing = config.get("indexing")
+            if (
+                not isinstance(indexing, list)
+                or indexing != ["tensor_descriptor"] * self.config_spec.indexing.length
+            ):
+                return False
+        return True
+
+    def _fix_clc_persistence_search_config(self, config: dict[str, object]) -> None:
+        if (
+            config.get(TCGEN05_PERSISTENCE_MODEL_CONFIG_KEY)
+            != Tcgen05PersistenceModel.CLC_PERSISTENT.value
+        ):
+            return
+        if self._is_validated_clc_persistence_search_candidate(config):
+            return
+        config[TCGEN05_PERSISTENCE_MODEL_CONFIG_KEY] = (
+            self.persistence_model_default_from_config(config).value
+        )
+
+    def prepare_override_normalization(
+        self,
+        config: dict[str, object],
+        overrides: Mapping[str, object],
+    ) -> None:
+        if "pid_type" not in overrides:
+            return
+        if TCGEN05_PERSISTENCE_MODEL_CONFIG_KEY in overrides:
+            return
+        persistence_value = config.get(TCGEN05_PERSISTENCE_MODEL_CONFIG_KEY)
+        if persistence_value is None:
+            return
+        try:
+            persistence_model = Tcgen05PersistenceModel(persistence_value)
+        except ValueError:
+            return
+        pid_type = overrides["pid_type"]
+        if pid_type not in self.allowed_pid_types:
+            return
+        derived = derive_persistence_model_from_pid_type(pid_type)
+        compatible = persistence_model is derived or (
+            persistence_model is Tcgen05PersistenceModel.CLC_PERSISTENT
+            and derived is Tcgen05PersistenceModel.STATIC_PERSISTENT
+        )
+        if not compatible:
+            config.pop(TCGEN05_PERSISTENCE_MODEL_CONFIG_KEY, None)
+
+    def persistence_model_default_from_config(
+        self,
+        config: dict[str, object],
+    ) -> Tcgen05PersistenceModel:
+        """Derive default persistence from pid_type."""
+        pid_type = config.get("pid_type", self.allowed_pid_types[0])
+        if pid_type not in self.allowed_pid_types:
+            pid_type = self.allowed_pid_types[0]
+        return derive_persistence_model_from_pid_type(pid_type)
+
+    def flatten_missing_field_default(
+        self,
+        key: str,
+        config: dict[str, object],
+    ) -> tuple[bool, object]:
+        if key != TCGEN05_PERSISTENCE_MODEL_CONFIG_KEY:
+            return False, None
+        projected_config = {
+            config_key: [*value] if isinstance(value, list) else value
+            for config_key, value in config.items()
+        }
+        self.fix_search_config(projected_config)
+        return True, self.persistence_model_default_from_config(projected_config).value
+
     def _matmul_fact_has_edge_tile(
         self, config: dict[str, object], *, fact_index: int
     ) -> bool:
@@ -499,6 +758,20 @@ class CuteTcgen05Config:
             self._matmul_fact_has_edge_tile(config, fact_index=i)
             for i in range(len(self.config_spec.matmul_facts))
         )
+
+    def _has_any_matmul_fact_n_edge_for_block_n(self, block_n: int) -> bool:
+        for fact in self.config_spec.matmul_facts:
+            if fact.static_n is None or fact.n_block_id is None:
+                continue
+            try:
+                # Presence check: skip facts whose N block id is not registered
+                # in this config spec.
+                self.config_spec.block_sizes.block_id_to_index(fact.n_block_id)
+            except KeyError:
+                continue
+            if fact.static_n % block_n != 0:
+                return True
+        return False
 
     def _fix_aux_edge_search_config(self, config: dict[str, object]) -> None:
         if not (self.search_enabled and self.aux_kernel_detected):
@@ -710,6 +983,33 @@ class CuteTcgen05Config:
             TCGEN05_L2_SWIZZLE_SIZE_CONFIG_KEY: EnumFragment(l2_swizzle_choices),
         }
 
+    def aux_load_mode_autotune_fragments(self) -> dict[str, ConfigSpecFragment]:
+        if not self._aux_tma_search_enabled():
+            return {}
+        return {
+            TCGEN05_AUX_LOAD_MODE_CONFIG_KEY: EnumFragment(
+                (TCGEN05_AUX_LOAD_MODE_SIMT, TCGEN05_AUX_LOAD_MODE_TMA)
+            )
+        }
+
+    def persistence_model_autotune_fragments(self) -> dict[str, ConfigSpecFragment]:
+        if not self._clc_persistence_search_enabled():
+            return {}
+        default_model = derive_persistence_model_from_pid_type(
+            self.allowed_pid_types[0]
+        ).value
+        choices = tuple(
+            dict.fromkeys(
+                (
+                    default_model,
+                    Tcgen05PersistenceModel.NON_PERSISTENT.value,
+                    Tcgen05PersistenceModel.STATIC_PERSISTENT.value,
+                    Tcgen05PersistenceModel.CLC_PERSISTENT.value,
+                )
+            )
+        )
+        return {TCGEN05_PERSISTENCE_MODEL_CONFIG_KEY: EnumFragment(choices)}
+
     def strategy_autotune_fragments(self) -> dict[str, ConfigSpecFragment]:
         # Aux kernels are the only current trigger for scheduler/c_input warp
         # search. The surface is derived from aux_kernel_detected so repeated
@@ -796,11 +1096,8 @@ class CuteTcgen05Config:
         cluster_m = int(cluster_m_raw) if isinstance(cluster_m_raw, int) else 1
         cluster_n_raw = config.get("tcgen05_cluster_n", 1)
         cluster_n = int(cluster_n_raw) if isinstance(cluster_n_raw, int) else 1
-        arch_major: int | None = None
-        if torch.cuda.is_available():
-            arch_major = torch.cuda.get_device_capability(torch.cuda.current_device())[
-                0
-            ]
+        capability = self.config_spec.target_device_capability
+        arch_major = capability[0] if capability is not None else None
         errors = validate_tcgen05_strategy_invariants(
             strategy=strategy,
             persistence_model=persistence_model,
@@ -1123,6 +1420,10 @@ class CuteTcgen05Config:
         self._fix_cluster_m1_persistent_search_config(config)
         self._fix_ab_stages_three_search_config(config)
         self._fix_with_scheduler_search_config(config)
+        self._fix_aux_tma_search_config(config)
+        # CLC admission depends on the projected cluster/pid/strategy tuple
+        # above, including the scheduler/c-input warp fix-ups.
+        self._fix_clc_persistence_search_config(config)
 
     def normalize_strategy(
         self, config: dict[str, object], *, fix_invalid: bool
@@ -1173,6 +1474,13 @@ class CuteTcgen05Config:
             else:
                 config[key] = None
         self.validate_strategy_invariants(config, fix_invalid=fix_invalid)
+        if fix_invalid:
+            # Strategy validation can reset scheduler/c-input fields for
+            # inconsistent user configs. Revalidate aux-TMA after that reset so
+            # TMA aux loads do not outlive their producer warp. CLC does not
+            # need a matching second pass because the reset path never produces
+            # a CLC persistence model.
+            self._fix_aux_tma_search_config(config)
 
     def flat_fields(
         self,
@@ -1182,6 +1490,8 @@ class CuteTcgen05Config:
         }
         fields.update(self.optional_fragments(for_search=True))
         fields.update(self.strategy_autotune_fragments())
+        fields.update(self.aux_load_mode_autotune_fragments())
+        fields.update(self.persistence_model_autotune_fragments())
         if self.config_spec.supports_config_key("pid_type"):
             fields["pid_type"] = EnumFragment(self.allowed_pid_types)
         if (

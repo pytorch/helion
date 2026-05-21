@@ -5,6 +5,14 @@ from __future__ import annotations
 # K-tile threshold or broadening the tile shape.
 TCGEN05_TWO_CTA_BLOCK_M = 256
 TCGEN05_TWO_CTA_BLOCK_N = 256
+# The 5000x5000x5000 bias_residual_gelu CLC + aux-TMA scheduler family
+# measures faster with a narrower N tile while keeping the validated
+# CtaGroup.TWO M tile and K-tail shape. Autotune can admit the same
+# narrow tile for other shapes that still have an N edge at this size.
+TCGEN05_TWO_CTA_EDGE_K_TAIL_NARROW_BLOCK_N = 128
+# The narrow-N Target8 row has enough SMEM headroom at ab=2 to double the
+# K tile. B200 measurements put this ahead of the older narrow-N K=128 row.
+TCGEN05_TWO_CTA_EDGE_K_TAIL_NARROW_BLOCK_K = 256
 TCGEN05_TWO_CTA_MAX_K_TILES = 256
 # The double-output-edge + K-tail CtaGroup.TWO search family is validated
 # only for large square-ish GEMMs where persistent clustered scheduling has
@@ -26,6 +34,7 @@ TCGEN05_TWO_CTA_EDGE_K_TAIL_C_STAGES = 2
 # four-tile L2 swizzle. Keep these with the edge+K-tail stage tuple so the
 # seeded/fixed CtaGroup.TWO family starts at the measured production row.
 TCGEN05_TWO_CTA_EDGE_K_TAIL_L2_GROUPING = 2
+TCGEN05_TWO_CTA_EDGE_K_TAIL_NARROW_L2_GROUPING = 16
 TCGEN05_TWO_CTA_EDGE_K_TAIL_L2_SWIZZLE_SIZE = 4
 # The scheduler full/edge split scans the same static tile space twice. On the
 # 5000x5000x5000 bias_residual_gelu target, keeping the split path at size=1

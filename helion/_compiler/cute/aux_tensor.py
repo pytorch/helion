@@ -31,10 +31,15 @@ import torch
 
 from ...language import matmul_ops
 from ...language import memory_ops
+from ..compile_environment import CompileEnvironment
 from .cute_epilogue import _AuxiliaryTensorStep
 from .cute_epilogue import analyze_tcgen05_unary_epilogue_chain
+from .cute_fx_walk import build_inner_outputs_index_from_graphs
 
 if TYPE_CHECKING:
+    from collections.abc import Sequence
+
+    from ..device_ir import GraphInfo
     from ..generate_ast import GenerateAST
     from ..host_function import HostFunction
 
@@ -49,6 +54,15 @@ if TYPE_CHECKING:
 # patterns; keep this set in sync with ``cute_mma`` if either
 # side adds a new wrapper.
 _MMA_OPERAND_TRACE_THROUGH_TARGETS = (torch.ops.prims.convert_element_type.default,)
+# Include ``matmul_ops.dot`` because Helion's public ``hl.dot`` API lowers to
+# the same tcgen05 MMA path as the aten matmul-family calls.
+_TCGEN05_AUX_DETECTOR_MMA_TARGETS = (
+    torch.ops.aten.addmm.default,
+    torch.ops.aten.mm.default,
+    torch.ops.aten.bmm.default,
+    torch.ops.aten.baddbmm.default,
+    matmul_ops.dot,
+)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -125,17 +139,11 @@ def _store_value_pairs(
     ``args[2]`` is the value being stored — the entry point the
     chain analyzer walks upstream from.
     """
-    pairs: list[tuple[torch.fx.Node, torch.fx.Node]] = []
-    for graph_info in cg.codegen_graphs:
-        for node in graph_info.graph.nodes:
-            if node.op != "call_function" or node.target is not memory_ops.store:
-                continue
-            if len(node.args) < 3:
-                continue
-            value = node.args[2]
-            if isinstance(value, torch.fx.Node):
-                pairs.append((node, value))
-    return pairs
+    return [
+        pair
+        for graph_info in cg.codegen_graphs
+        for pair in _store_value_pairs_from_graph(graph_info.graph)
+    ]
 
 
 def _output_global_shape_from_store(
@@ -150,15 +158,8 @@ def _output_global_shape_from_store(
     so the rowvec-broadcast classifier can reject auxes whose
     extent matches the tile but not the global axis.
     """
-    if not store_node.args:
-        return None
-    tensor_arg = store_node.args[0]
-    if not isinstance(tensor_arg, torch.fx.Node):
-        return None
-    tensor_val = tensor_arg.meta.get("val")
-    if not isinstance(tensor_val, torch.Tensor):
-        return None
-    return tuple(tensor_val.shape)
+    tensor_val = _output_tensor_from_store_node(store_node)
+    return tuple(tensor_val.shape) if tensor_val is not None else None
 
 
 def _aux_descriptor_from_step(
@@ -365,46 +366,8 @@ def host_function_has_tcgen05_aux_kernel_pattern(
     if not graphs:
         return False
 
-    # MMA anchor targets: both the aten paths and the
-    # ``hl.dot`` HOP (the canonical Helion API entrypoint —
-    # the FX target is the ``dot`` Python function from
-    # ``matmul_ops`` itself; see ``backend.py`` which
-    # identifies ``hl.dot`` via
-    # ``getattr(node.target, "__name__", "") == "dot"``).
-    mma_targets = (
-        torch.ops.aten.addmm.default,
-        torch.ops.aten.mm.default,
-        torch.ops.aten.bmm.default,
-        torch.ops.aten.baddbmm.default,
-        matmul_ops.dot,
-    )
-    has_mma = False
-    operand_load_nodes: set[torch.fx.Node] = set()
-    for graph_info in graphs:
-        for node in graph_info.graph.nodes:
-            if node.op != "call_function" or node.target not in mma_targets:
-                continue
-            has_mma = True
-            # ``aten.addmm`` / ``aten.baddbmm`` /
-            # ``aten.mm`` / ``aten.bmm``: lhs and rhs are
-            # the last two positional args.
-            # ``hl.dot(mat1, mat2, acc=..., out_dtype=...)``:
-            # mat1/mat2 are the first two positional args.
-            # Both layouts collapse to "the two MMA operand
-            # nodes are positional args 0/1 or N-2/N-1
-            # depending on whether an accumulator is the
-            # first arg" — pick by checking which of the
-            # first three positional args produced data
-            # tensors. Simpler heuristic: every positional
-            # arg that is an FX node and resolves through
-            # the operand-trace to a ``memory_ops.load`` is
-            # treated as a candidate MMA operand load.
-            for arg in node.args:
-                if isinstance(arg, torch.fx.Node):
-                    load_node = _trace_to_load_through_casts(arg)
-                    if load_node is not None:
-                        operand_load_nodes.add(load_node)
-    if not has_mma:
+    mma_nodes, operand_load_nodes = _tcgen05_aux_detector_mma_facts(graphs)
+    if not mma_nodes:
         return False
     # Second pass: any ``memory_ops.load`` call whose result
     # is NOT a resolved MMA-operand load is treated as aux.
@@ -420,6 +383,160 @@ def host_function_has_tcgen05_aux_kernel_pattern(
             ):
                 return True
     return False
+
+
+def host_function_has_tcgen05_exact_shape_aux_kernel_pattern(
+    host_function: HostFunction,
+) -> bool:
+    """Return True when a tcgen05 aux pattern has a rank-2 exact-shape input.
+
+    The aux-TMA path requires the staged aux tensor to match the output dtype,
+    so this detector requires both exact output shape and matching dtype.
+    Row-vector broadcast aux inputs intentionally stay on the direct SIMT path
+    because the TMA path has no useful tile to bulk-load for them. Rank-3 and
+    other batched aux patterns are also excluded: the current aux-TMA wrapper
+    constructs a rank-2 TMA tensor for a single output tile.
+
+    This is still a pre-codegen detector. It reuses the epilogue-chain
+    analyzer so exact-shape aux loads must pass the same whitelist and index
+    checks as codegen. It then requires exactly one compatible store value,
+    and every exact-shape aux descriptor on that store must match the output
+    shape and dtype, mirroring the codegen-time TMA descriptor dtype gate.
+    Any exact-shape aux shape or dtype mismatch in an analyzed store disables
+    the detector for the whole kernel rather than trying to partially admit
+    aux-TMA.
+    """
+
+    device_ir = host_function.device_ir
+    graphs = device_ir.graphs
+    if not graphs:
+        return False
+
+    mma_nodes, _operand_load_nodes = _tcgen05_aux_detector_mma_facts(graphs)
+    if not mma_nodes:
+        return False
+
+    store_outputs: list[tuple[torch.fx.Node, torch.Tensor]] = []
+    for graph_info in graphs:
+        for store_node, store_value in _store_value_pairs_from_graph(graph_info.graph):
+            tensor_val = _output_tensor_from_store_node(store_node)
+            if tensor_val is not None:
+                store_outputs.append((store_value, tensor_val))
+    if not store_outputs:
+        return False
+
+    return _has_tma_compatible_analyzed_aux_store(
+        store_outputs,
+        inner_outputs_by_graph_id=build_inner_outputs_index_from_graphs(graphs),
+        target_fx_nodes=mma_nodes,
+    )
+
+
+def _tcgen05_aux_detector_mma_facts(
+    graphs: Sequence[GraphInfo],
+) -> tuple[set[torch.fx.Node], set[torch.fx.Node]]:
+    # MMA anchor targets: both the aten paths and the ``hl.dot`` HOP
+    # (the canonical Helion API entrypoint).
+    mma_nodes: set[torch.fx.Node] = set()
+    operand_load_nodes: set[torch.fx.Node] = set()
+    for graph_info in graphs:
+        for node in graph_info.graph.nodes:
+            if (
+                node.op != "call_function"
+                or node.target not in _TCGEN05_AUX_DETECTOR_MMA_TARGETS
+            ):
+                continue
+            mma_nodes.add(node)
+            # Treat every positional arg that resolves through the same operand
+            # trace accepted by MMA codegen as an operand load.
+            for arg in node.args:
+                if isinstance(arg, torch.fx.Node):
+                    load_node = _trace_to_load_through_casts(arg)
+                    if load_node is not None:
+                        operand_load_nodes.add(load_node)
+    return mma_nodes, operand_load_nodes
+
+
+def _store_value_pairs_from_graph(
+    graph: torch.fx.Graph,
+) -> list[tuple[torch.fx.Node, torch.fx.Node]]:
+    pairs: list[tuple[torch.fx.Node, torch.fx.Node]] = []
+    for node in graph.nodes:
+        if node.op != "call_function" or node.target is not memory_ops.store:
+            continue
+        if len(node.args) < 3:
+            continue
+        value = node.args[2]
+        if isinstance(value, torch.fx.Node):
+            pairs.append((node, value))
+    return pairs
+
+
+def _output_tensor_from_store_node(store_node: torch.fx.Node) -> torch.Tensor | None:
+    if not store_node.args:
+        return None
+    tensor_arg = store_node.args[0]
+    if not isinstance(tensor_arg, torch.fx.Node):
+        return None
+    tensor_val = tensor_arg.meta.get("val")
+    return tensor_val if isinstance(tensor_val, torch.Tensor) else None
+
+
+def _same_static_shape(lhs: torch.Tensor, rhs: torch.Tensor) -> bool:
+    if lhs.ndim != rhs.ndim:
+        return False
+    # Use the active compile environment so unbacked symbolic dimensions
+    # conservatively return false instead of raising during bind.
+    env = CompileEnvironment.current()
+    for lhs_size, rhs_size in zip(lhs.shape, rhs.shape, strict=True):
+        if not env.known_equal(lhs_size, rhs_size):
+            return False
+    return True
+
+
+def _has_tma_compatible_analyzed_aux_store(
+    store_outputs: list[tuple[torch.fx.Node, torch.Tensor]],
+    *,
+    inner_outputs_by_graph_id: dict[int, tuple[torch.fx.Node | None, ...]],
+    target_fx_nodes: set[torch.fx.Node],
+) -> bool:
+    # Dedup by store value so repeated stores of the same computed chain are
+    # treated as one aux-TMA candidate at detector time.
+    compatible_store_values: set[torch.fx.Node] = set()
+    for store_value, output in store_outputs:
+        analyzed = analyze_tcgen05_unary_epilogue_chain(
+            None,
+            store_value,
+            output_global_shape=tuple(output.shape),
+            target_fx_nodes=target_fx_nodes,
+            inner_outputs_by_graph_id=inner_outputs_by_graph_id,
+        )
+        if analyzed is None:
+            continue
+        chain, _anchor = analyzed
+        exact_steps = [
+            step for step in chain.auxiliary_tensor_steps if step.broadcast_axis is None
+        ]
+        if not exact_steps:
+            continue
+        for step in exact_steps:
+            assert step.load_node.args, "_AuxiliaryTensorStep.load_node missing args"
+            tensor_arg = step.load_node.args[0]
+            assert isinstance(tensor_arg, torch.fx.Node), (
+                "_AuxiliaryTensorStep.load_node.args[0] is not an FX node"
+            )
+            aux_tensor = tensor_arg.meta.get("val")
+            assert isinstance(aux_tensor, torch.Tensor), (
+                "_AuxiliaryTensorStep host-tensor FX node has no torch.Tensor meta"
+            )
+            if not _same_static_shape(aux_tensor, output):
+                return False
+            if aux_tensor.dtype != output.dtype:
+                return False
+        compatible_store_values.add(store_value)
+        if len(compatible_store_values) > 1:
+            return False
+    return len(compatible_store_values) == 1
 
 
 def _trace_to_load_through_casts(node: torch.fx.Node) -> torch.fx.Node | None:

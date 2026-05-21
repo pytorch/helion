@@ -21,6 +21,7 @@ from .._compat import num_compute_units
 from .._compat import supports_amd_cdna_tunables
 from .._compat import supports_maxnreg
 from .._compat import supports_tensor_descriptor
+from .._compat import target_device_capability as get_target_device_capability
 from .._compat import warps_to_threads
 from .._compiler.cute.tcgen05_config import CUTE_TCGEN05_DIAGNOSTIC_CONFIG_KEYS
 from .._compiler.cute.tcgen05_config import CUTE_TCGEN05_STRATEGY_CONFIG_KEYS
@@ -57,6 +58,8 @@ if TYPE_CHECKING:
     from .config_generation import ConfigGeneration
 
 log = logging.getLogger(__name__)
+
+_TARGET_DEVICE_CAPABILITY_UNSET = object()
 
 
 class TensorNumelConstraint(NamedTuple):
@@ -232,12 +235,6 @@ _CUTE_IMPLICIT_DEFAULT_KEYS: frozenset[str] = frozenset(
 )
 
 
-def _epilogue_subtile_autotune_arch() -> tuple[int, int] | None:
-    if not torch.cuda.is_available():
-        return None
-    return torch.cuda.get_device_capability(torch.cuda.current_device())
-
-
 # For tileir backend or AMD ROCM, eviction policies are not supported.
 # Keep this uncached: some tests patch the AMD capability helper, and caching
 # only on backend name can poison later Triton ConfigSpec construction inside
@@ -254,6 +251,9 @@ class ConfigSpec:
         *,
         backend: Backend,
         user_defined_tunables: Mapping[str, ConfigSpecFragment] | None = None,
+        target_device_capability: tuple[int, int]
+        | object
+        | None = _TARGET_DEVICE_CAPABILITY_UNSET,
     ) -> None:
         self.backend = backend
         self.backend_name = backend.name
@@ -264,6 +264,17 @@ class ConfigSpec:
         self.user_defined_tunables = (
             {} if user_defined_tunables is None else dict(user_defined_tunables)
         )
+        # Bound kernels pass an explicit target capability. Direct CuTe specs
+        # use the current CUDA device so validation still enforces arch gates.
+        if target_device_capability is _TARGET_DEVICE_CAPABILITY_UNSET:
+            self.target_device_capability: tuple[int, int] | None = (
+                get_target_device_capability() if self.backend_name == "cute" else None
+            )
+        else:
+            self.target_device_capability = cast(
+                "tuple[int, int] | None",
+                target_device_capability,
+            )
 
         self.block_sizes: BlockIdSequence[BlockSizeSpec] = BlockIdSequence()
         self.num_threads: BlockIdSequence[NumThreadsSpec] = BlockIdSequence()
@@ -359,7 +370,7 @@ class ConfigSpec:
 
     def configure_epilogue_subtile_autotune(self, args: Sequence[object]) -> None:
         self.epilogue_subtile_k_hint = self._infer_epilogue_subtile_k_hint(args)
-        arch = _epilogue_subtile_autotune_arch()
+        arch = self.target_device_capability
         if arch is None:
             self.epilogue_subtile_autotune_choices = None
             return
@@ -432,6 +443,14 @@ class ConfigSpec:
     @cute_tcgen05_aux_kernel_detected.setter
     def cute_tcgen05_aux_kernel_detected(self, value: bool) -> None:
         self._cute_tcgen05_config.aux_kernel_detected = value
+
+    @property
+    def cute_tcgen05_exact_shape_aux_kernel_detected(self) -> bool:
+        return self._cute_tcgen05_config.exact_shape_aux_kernel_detected
+
+    @cute_tcgen05_exact_shape_aux_kernel_detected.setter
+    def cute_tcgen05_exact_shape_aux_kernel_detected(self, value: bool) -> None:
+        self._cute_tcgen05_config.exact_shape_aux_kernel_detected = value
 
     @property
     def _tcgen05_cluster_m_search_choices(self) -> tuple[int, ...] | None:
@@ -1166,6 +1185,26 @@ class ConfigSpec:
             advanced_controls_files=advanced_controls_files,
             process_group_name=process_group_name,
         )
+
+    def flatten_missing_field_default(
+        self,
+        key: str,
+        config: dict[str, object],
+    ) -> tuple[bool, object]:
+        if self.backend_name == "cute":
+            return self._cute_tcgen05_config.flatten_missing_field_default(key, config)
+        return False, None
+
+    def prepare_override_normalization(
+        self,
+        config: dict[str, object],
+        overrides: Mapping[str, object],
+    ) -> None:
+        if self.backend_name == "cute":
+            self._cute_tcgen05_config.prepare_override_normalization(
+                config,
+                overrides,
+            )
 
     def default_config(self) -> helion.Config:
         config = self.flat_config(lambda x: x.default())

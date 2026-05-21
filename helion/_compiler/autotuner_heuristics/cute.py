@@ -5,6 +5,8 @@ from typing import Any
 from typing import cast
 
 from ...runtime.config import Config
+from ..cute.strategies import TCGEN05_PERSISTENCE_MODEL_CONFIG_KEY
+from ..cute.strategies import Tcgen05PersistenceModel
 from ..cute.tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_M
 from ..cute.tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_N
 from ..cute.tcgen05_constants import TCGEN05_TWO_CTA_EDGE_K_TAIL_BLOCK_K
@@ -172,6 +174,9 @@ class CuteTcgen05ClusterM2Heuristic(AutotunerHeuristic):
             "tcgen05_cluster_m": 2,
             # Matches the validated tcgen05 search restriction.
             "tcgen05_num_epi_warps": 4,
+            TCGEN05_PERSISTENCE_MODEL_CONFIG_KEY: (
+                Tcgen05PersistenceModel.STATIC_PERSISTENT.value
+            ),
         }
         if edge_k_tail_family:
             seed.update(tcgen05_two_cta_edge_k_tail_seed_overrides())
