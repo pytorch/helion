@@ -1266,9 +1266,8 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
         self.assertEqual(spec._tcgen05_num_epi_warps_search_choices, (4,))
 
     @onlyBackends(["cute"])
-    def test_cute_tcgen05_double_edge_no_divisor_disables_search(self) -> None:
-        """If no power-of-two N tile divides the static N extent, tcgen05
-        search stays disabled when M has no valid divisor either."""
+    def test_cute_tcgen05_double_edge_no_divisor_keeps_flat_search(self) -> None:
+        """Double-edge flat tcgen05 search no longer needs divisor tiles."""
 
         @helion.kernel(backend="cute")
         def cute_matmul_mma(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
@@ -1289,13 +1288,13 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
         with patch_cute_mma_support():
             bound = cute_matmul_mma.bind(args)
         spec = bound.config_spec
-        self.assertFalse(spec.cute_tcgen05_search_enabled)
-        self.assertNotIn("tcgen05_cluster_m", spec.default_config().config)
+        self.assertTrue(spec.cute_tcgen05_search_enabled)
+        self.assertEqual([x.max_size for x in spec.block_sizes], [64, 64, 16])
+        self.assertIn("tcgen05_cluster_m", spec.default_config().config)
 
     @onlyBackends(["cute"])
-    def test_cute_tcgen05_double_edge_narrowing_falls_back_to_m(self) -> None:
-        """When N has no valid power-of-two divisor, M can still narrow so
-        tcgen05 search exposes single-edge candidates."""
+    def test_cute_tcgen05_double_edge_keeps_wide_n_search(self) -> None:
+        """Double-edge search keeps N wide and caps M to flat tcgen05."""
 
         @helion.kernel(backend="cute")
         def cute_matmul_mma(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
@@ -1317,12 +1316,11 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
             bound = cute_matmul_mma.bind(args)
         spec = bound.config_spec
         self.assertTrue(spec.cute_tcgen05_search_enabled)
-        self.assertEqual([x.max_size for x in spec.block_sizes], [64, 64, 64])
+        self.assertEqual([x.max_size for x in spec.block_sizes], [128, 64, 64])
 
     @onlyBackends(["cute"])
     def test_cute_tcgen05_partial_single_edge_search_stays_enabled(self) -> None:
-        """A double-edge default tile can narrow N to a divisor and keep
-        single-edge tcgen05 candidates searchable."""
+        """A double-edge default tile keeps wide-N tcgen05 candidates searchable."""
 
         @helion.kernel(backend="cute")
         def cute_matmul_mma(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
@@ -1344,7 +1342,7 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
             bound = cute_matmul_mma.bind(args)
         spec = bound.config_spec
         self.assertTrue(spec.cute_tcgen05_search_enabled)
-        self.assertEqual([x.max_size for x in spec.block_sizes], [256, 8, 64])
+        self.assertEqual([x.max_size for x in spec.block_sizes], [128, 256, 64])
 
     def test_tcgen05_edge_tile_detection_skips_unknown_dims(self) -> None:
         config_spec = SimpleNamespace(

@@ -1097,6 +1097,86 @@ class TestCuteLowerings(unittest.TestCase):
         )
         self.assertNotIn(compound_shape, code)
 
+    def test_tcgen05_k_tail_keeps_tma_pipeline_with_scalar_fallback(self) -> None:
+        """A K-tail uses TMA for full K tiles, then scalar-fills the tail.
+
+        This pins the target-8 G2.1 fix: non-static-full K must not demote the
+        whole matmul to scalar SMEM fills. The scalar fallback starts with a
+        CTA barrier so loader warps cannot overwrite a TMA SMEM stage before
+        the prior full-tile UMMA issue has completed.
+        """
+        from helion._compiler.cute.mma_support import get_cute_mma_support
+
+        @helion.kernel(backend="cute")
+        def cute_matmul_k_tail(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = acc.to(x.dtype)
+            return out
+
+        args = (
+            torch.randn(384, 40, device=DEVICE, dtype=torch.float16),
+            torch.randn(40, 40, device=DEVICE, dtype=torch.float16),
+        )
+        runtime_supported = get_cute_mma_support().tcgen05_f16bf16
+        result: torch.Tensor | None = None
+        with patch_cute_mma_support():
+            bound = cute_matmul_k_tail.bind(args)
+            bound.env.config_spec.cute_tcgen05_search_enabled = True
+            config = helion.Config(
+                block_sizes=[128, 8, 32],
+                indexing=["pointer", "pointer", "pointer"],
+                l2_groupings=[1],
+                loop_orders=[[0, 1]],
+                num_stages=2,
+                num_warps=4,
+                pid_type="flat",
+                tcgen05_cluster_m=1,
+                tcgen05_ab_stages=2,
+                tcgen05_acc_stages=2,
+                tcgen05_c_stages=4,
+                tcgen05_l2_swizzle_size=1,
+                tcgen05_num_epi_warps=4,
+            )
+            code = bound.to_triton_code(config)
+            if runtime_supported:
+                bound.set_config(config)
+                result = bound(*args)
+
+        self.assertIn("'kind': 'tcgen05_ab_tma'", code)
+        self.assertIn("tcgen05_tma_full_tile", code)
+        self.assertIn("tcgen05_ab_pipeline.consumer_wait", code)
+        has_mixed_fallback_barriers = False
+        for node in ast.walk(ast.parse(code)):
+            if (
+                isinstance(node, ast.If)
+                and ast.unparse(node.test) == "tcgen05_tma_full_tile"
+            ):
+                fallback_src = [ast.unparse(stmt) for stmt in node.orelse]
+                fallback_body_src = ast.unparse(
+                    ast.Module(body=node.orelse, type_ignores=[])
+                )
+                if (
+                    len(fallback_src) >= 4
+                    and fallback_src[0] == "cute.arch.sync_threads()"
+                    and fallback_src[-1] == "cute.arch.sync_threads()"
+                    and "if mma_active:" in fallback_body_src
+                    and "sA_mma" in fallback_body_src
+                    and "sB_mma" in fallback_body_src
+                ):
+                    has_mixed_fallback_barriers = True
+                    break
+        self.assertTrue(has_mixed_fallback_barriers, code)
+        if runtime_supported:
+            assert result is not None
+            expected = args[0] @ args[1]
+            torch.testing.assert_close(result, expected, atol=2e-1, rtol=1e-2)
+
     def test_tcgen05_codegen_emits_setmaxregister_split(self) -> None:
         """Tcgen05 codegen emits Quack-style register reallocation: consumer
         warps (exec MMA + epilogue) call ``setmaxregister_increase(256)``;
@@ -1634,6 +1714,135 @@ class TestCuteLowerings(unittest.TestCase):
                     bound.set_config(cfg)
                     out = bound(*args)
                 expected = args[0] @ args[1]
+                torch.testing.assert_close(out, expected, atol=2e-1, rtol=1e-2)
+
+    def test_tcgen05_bk128_edge_scalar_fallback_forces_a_inter_codegen(
+        self,
+    ) -> None:
+        """Output-edge ``bk=128`` fallback uses an A layout scalar stores can fill."""
+
+        @helion.kernel(backend="cute")
+        def cute_matmul_bk128_edge_codegen(
+            x: torch.Tensor, y: torch.Tensor
+        ) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = acc.to(x.dtype)
+            return out
+
+        cases = (
+            ("partial_m", (136, 128), (128, 256)),
+            ("partial_n", (256, 128), (128, 136)),
+        )
+        for case_name, x_shape, y_shape in cases:
+            with self.subTest(case=case_name):
+                args = (
+                    torch.empty(x_shape, device=DEVICE, dtype=torch.bfloat16),
+                    torch.empty(y_shape, device=DEVICE, dtype=torch.bfloat16),
+                )
+                with patch_cute_mma_support():
+                    cute_matmul_bk128_edge_codegen._bound_kernels.clear()
+                    bound = cute_matmul_bk128_edge_codegen.bind(args)
+                    bound.env.config_spec.cute_tcgen05_search_enabled = True
+                    cfg = _make_tcgen05_persistent_config(
+                        block_sizes=[128, 128, 128],
+                        pid_type="flat",
+                    )
+                    code = bound.to_triton_code(cfg)
+
+                self.assertIn("cute.nvgpu.tcgen05.SmemLayoutAtomKind.K_INTER", code)
+                self.assertIn("'smem_swizzle_a': 0", code)
+
+    def test_tcgen05_bk128_k_tail_keeps_default_a_swizzle_runtime_correctness(
+        self,
+    ) -> None:
+        """K-only ``bk=128`` scalar fallback stays correct with default A swizzle."""
+
+        from helion._compiler.cute.mma_support import get_cute_mma_support
+
+        if not get_cute_mma_support().tcgen05_f16bf16:
+            self.skipTest("tcgen05 F16/BF16 MMA is not supported on this machine")
+
+        @helion.kernel(backend="cute")
+        def cute_matmul_bk128_k_tail(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = acc.to(x.dtype)
+            return out
+
+        torch.manual_seed(0)
+        x = torch.randn((256, 136), dtype=torch.bfloat16, device=DEVICE)
+        y = torch.randn((136, 256), dtype=torch.bfloat16, device=DEVICE)
+        cfg = _make_tcgen05_persistent_config(
+            block_sizes=[128, 128, 128],
+            pid_type="flat",
+        )
+        bound = cute_matmul_bk128_k_tail.bind((x, y))
+        code = bound.to_triton_code(cfg)
+
+        self.assertIn(
+            "cutlass.utils.blackwell_helpers.make_smem_layout_a(",
+            code,
+        )
+        self.assertNotIn("cute.nvgpu.tcgen05.SmemLayoutAtomKind.K_INTER", code)
+        self.assertNotIn("'smem_swizzle_a': 0", code)
+
+        bound.set_config(cfg)
+        out = bound(x, y)
+        expected = x @ y
+        torch.testing.assert_close(out, expected, atol=2e-1, rtol=1e-2)
+
+    def test_tcgen05_bk128_edge_scalar_fallback_runtime_correctness(self) -> None:
+        """``bk=128`` output-edge scalar fallback is correct for M and N edges."""
+
+        from helion._compiler.cute.mma_support import get_cute_mma_support
+
+        if not get_cute_mma_support().tcgen05_f16bf16:
+            self.skipTest("tcgen05 F16/BF16 MMA is not supported on this machine")
+
+        @helion.kernel(backend="cute")
+        def cute_matmul_bk128_edge_runtime(
+            x: torch.Tensor, y: torch.Tensor
+        ) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = acc.to(x.dtype)
+            return out
+
+        cases = (
+            ("partial_m", (136, 128), (128, 256)),
+            ("partial_n", (256, 128), (128, 136)),
+        )
+        for case_name, x_shape, y_shape in cases:
+            with self.subTest(case=case_name):
+                torch.manual_seed(0)
+                x = torch.randn(x_shape, dtype=torch.bfloat16, device=DEVICE)
+                y = torch.randn(y_shape, dtype=torch.bfloat16, device=DEVICE)
+                cute_matmul_bk128_edge_runtime._bound_kernels.clear()
+                bound = cute_matmul_bk128_edge_runtime.bind((x, y))
+                bound.set_config(
+                    _make_tcgen05_persistent_config(
+                        block_sizes=[128, 128, 128],
+                        pid_type="flat",
+                    )
+                )
+                out = bound(x, y)
+                expected = x @ y
                 torch.testing.assert_close(out, expected, atol=2e-1, rtol=1e-2)
 
     def test_tcgen05_l2_swizzle_size_consumed_by_codegen(self) -> None:
@@ -5004,8 +5213,44 @@ class TestCuteLowerings(unittest.TestCase):
         expected = ((x @ y).float() + residual.float()).to(x.dtype)
         torch.testing.assert_close(out, expected, atol=2e-1, rtol=1e-2)
 
-    def test_tcgen05_fused_aux_double_edge_guard(self) -> None:
-        """The SIMT-store fallback rejects configs with partial M and N tiles."""
+    def test_tcgen05_fused_aux_double_edge_runtime_correctness(self) -> None:
+        """The SIMT-store fallback handles partial M and N tiles."""
+
+        from helion._compiler.cute.mma_support import get_cute_mma_support
+
+        if not get_cute_mma_support().tcgen05_f16bf16:
+            self.skipTest("tcgen05 F16/BF16 MMA is not supported on this machine")
+
+        @helion.kernel(backend="cute")
+        def cute_matmul_residual_double_edge(
+            x: torch.Tensor, y: torch.Tensor, residual: torch.Tensor
+        ) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = (acc + residual[tile_m, tile_n]).to(x.dtype)
+            return out
+
+        x = torch.randn(136, 128, dtype=torch.bfloat16, device=DEVICE)
+        y = torch.randn(128, 136, dtype=torch.bfloat16, device=DEVICE)
+        residual = torch.randn(136, 136, dtype=torch.bfloat16, device=DEVICE)
+        bound = cute_matmul_residual_double_edge.bind((x, y, residual))
+        bound.set_config(
+            _make_tcgen05_persistent_config(
+                block_sizes=[128, 128, 64],
+                pid_type="flat",
+            )
+        )
+        out = bound(x, y, residual)
+        expected = ((x @ y).float() + residual.float()).to(x.dtype)
+        torch.testing.assert_close(out, expected, atol=2e-1, rtol=1e-2)
+
+    def test_tcgen05_fused_aux_double_edge_persistent_guard(self) -> None:
+        """Persistent tcgen05 kernels still reject tiles where both M and N are partial."""
 
         from helion._compiler.cute.mma_support import get_cute_mma_support
 
@@ -5033,11 +5278,11 @@ class TestCuteLowerings(unittest.TestCase):
             cute_matmul_residual_double_edge.bind((x, y, residual)).set_config(
                 _make_tcgen05_persistent_config(
                     block_sizes=[128, 128, 64],
-                    pid_type="flat",
+                    pid_type="persistent_interleaved",
                 )
             )
             cute_matmul_residual_double_edge(x, y, residual)
-        self.assertIn("one partial output tile axis", str(cm.exception))
+        self.assertIn("validated only for flat", str(cm.exception))
 
     def _make_relu_matmul_kernel(self):
         """Return a ``@helion.kernel(backend="cute")`` matmul-relu
@@ -12563,10 +12808,10 @@ class TestCuteTcgen05AuxPipelineCycle2a(unittest.TestCase):
             bound = kernel.bind(args)
         spec = bound.env.config_spec
         self.assertTrue(spec.cute_tcgen05_aux_kernel_detected)
-        self.assertEqual([item.max_size for item in spec.block_sizes], [256, 8, 128])
+        self.assertEqual([item.max_size for item in spec.block_sizes], [128, 256, 128])
 
         config_dict: dict[str, object] = {
-            "block_sizes": [256, 8, 128],
+            "block_sizes": [256, 256, 128],
             "indexing": [
                 "tensor_descriptor",
                 "pointer",
@@ -12598,8 +12843,15 @@ class TestCuteTcgen05AuxPipelineCycle2a(unittest.TestCase):
         self.assertEqual(config_dict["tcgen05_l2_swizzle_size"], 1)
         self.assertEqual(config_dict["l2_groupings"], [1])
         self.assertEqual(config_dict["indexing"], ["pointer"] * 5)
-        self.assertEqual(config_dict["block_sizes"], [128, 8, 64])
+        self.assertEqual(config_dict["block_sizes"], [128, 256, 128])
         self.assertNotIn("epilogue_subtile", config_dict)
+
+        ab1_config: dict[str, object] = {
+            "block_sizes": [128, 256, 64],
+            "tcgen05_ab_stages": 1,
+        }
+        spec._cute_tcgen05_config.fix_search_config(ab1_config)
+        self.assertEqual(ab1_config["tcgen05_ab_stages"], 2)
 
     def test_aux_autotune_surface_widens_for_hldot_residual_kernel(self) -> None:
         """Detector recognizes ``hl.dot`` MMA anchors in
@@ -14250,11 +14502,28 @@ class TestPerKiterTmaBuilders(unittest.TestCase):
             self._stmt_kinds(inner.body),
             ["=consumer_try_wait", "consumer_wait"],
         )
-        # Partial-tile fallback is scalar loads + sync_threads.
+        # By default, partial-tile fallback scalar-loads, then waits before
+        # UMMA consumes the scalar-filled stage.
+        self.assertEqual(
+            self._stmt_kinds(node.orelse),
+            ["If", "If", "sync_threads"],
+        )
         orelse_src = ast.unparse(ast.Module(body=node.orelse, type_ignores=[]))
         self.assertIn("smem_a", orelse_src)
         self.assertIn("smem_b", orelse_src)
         self.assertIn("cute.arch.sync_threads", orelse_src)
+
+    def test_pipeline_consumer_if_can_presync_scalar_fallback(self) -> None:
+        args = self._make_args()
+        node = _build_kloop_pipeline_consumer_if(
+            args,
+            sync_before_scalar_fallback=True,
+        )
+        self.assertIsInstance(node, ast.If)
+        self.assertEqual(
+            self._stmt_kinds(node.orelse),
+            ["sync_threads", "If", "If", "sync_threads"],
+        )
 
     def test_pipeline_consumer_if_can_drop_exec_gate_and_fallback(self) -> None:
         args = self._make_args()

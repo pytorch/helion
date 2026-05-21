@@ -450,7 +450,8 @@ class CuteTcgen05Config:
         )
         config[TCGEN05_WARP_SPEC_SCHEDULER_WARPS_KEY] = 0
         config[TCGEN05_WARP_SPEC_C_INPUT_WARPS_KEY] = 0
-        config["tcgen05_ab_stages"] = 2
+        if config.get("tcgen05_ab_stages") == 1:
+            config["tcgen05_ab_stages"] = 2
         config["tcgen05_acc_stages"] = 2
         config["tcgen05_c_stages"] = 4
         config[TCGEN05_L2_SWIZZLE_SIZE_CONFIG_KEY] = 1
@@ -482,22 +483,9 @@ class CuteTcgen05Config:
                         and fact.static_m % bm != 0
                     ):
                         block_sizes[m_idx] = 128
-            if fact.static_k is None or fact.k_block_id is None:
-                continue
-            try:
-                k_idx = self.config_spec.block_sizes.block_id_to_index(fact.k_block_id)
-            except KeyError:
-                continue
-            if k_idx >= len(block_sizes):
-                continue
-            bk = block_sizes[k_idx]
-            if (
-                isinstance(bk, int)
-                and not isinstance(bk, bool)
-                and bk > 64
-                and fact.static_k % bk != 0
-            ):
-                block_sizes[k_idx] = 64
+            # K-only bk=128 tails keep the default A SMEM atom; output-edge
+            # bk=128 fallback is handled in cute_mma by forcing A INTER.
+            # Both cases have runtime coverage in test_cute_lowerings.
 
     def _fix_cluster_m1_persistent_search_config(
         self, config: dict[str, object]
@@ -979,11 +967,11 @@ class CuteTcgen05Config:
             )
 
     def fix_search_config(self, config: dict[str, object]) -> None:
+        self._fix_aux_edge_search_config(config)
         self._fix_cluster_m2_search_config(config)
         self._fix_cluster_m1_persistent_search_config(config)
         self._fix_ab_stages_three_search_config(config)
         self._fix_with_scheduler_search_config(config)
-        self._fix_aux_edge_search_config(config)
 
     def normalize_strategy(
         self, config: dict[str, object], *, fix_invalid: bool

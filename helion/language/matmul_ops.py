@@ -323,16 +323,6 @@ def enforce_dot_requirements(lhs: torch.Tensor, rhs: torch.Tensor) -> None:
             def pow2_floor_at_least(value: int, minimum: int) -> int:
                 return 1 << (max(minimum, value).bit_length() - 1)
 
-            def pow2_divisor_at_most(
-                *, value: int, limit: int, minimum: int
-            ) -> int | None:
-                candidate = min(limit, pow2_floor_at_least(value, minimum))
-                while candidate >= minimum:
-                    if value % candidate == 0:
-                        return candidate
-                    candidate //= 2
-                return None
-
             max_tcgen05_n = min(256, pow2_floor_at_least(static_n, 8))
             max_tcgen05_m = 256 if max_tcgen05_n >= 128 and static_m >= 256 else 128
             # Larger tile_k packs more cute.gemm instructions per K loop
@@ -344,26 +334,13 @@ def enforce_dot_requirements(lhs: torch.Tensor, rhs: torch.Tensor) -> None:
             max_search_k = max_tcgen05_k
             min_search_m = 128 if max_tcgen05_m >= 256 else 64
             if static_m % max_search_m != 0 and static_n % max_search_n != 0:
-                # The tcgen05 SIMT edge epilogue is validated for one output
-                # edge axis at a time. Prefer keeping M wide and narrowing N
-                # to a power-of-two divisor; if N has no valid divisor, try
-                # the symmetric M narrowing before disabling tcgen05 search.
-                narrowed_search_n = pow2_divisor_at_most(
-                    value=static_n,
-                    limit=max_search_n,
-                    minimum=8,
-                )
-                if narrowed_search_n is not None:
-                    max_search_n = narrowed_search_n
-                else:
-                    narrowed_search_m = pow2_divisor_at_most(
-                        value=static_m,
-                        limit=max_search_m,
-                        minimum=min_search_m,
-                    )
-                    if narrowed_search_m is None:
-                        return
-                    max_search_m = narrowed_search_m
+                # Flat tcgen05 cluster_m=1 kernels now handle partial M and
+                # partial N output tiles in the SIMT edge epilogue. Keep N
+                # wide so edge-heavy shapes such as 5000x5000 do not collapse
+                # to block_n=8. M still caps at 128 because block_m=256 is
+                # validated through the cluster_m=2 CtaGroup.TWO path, which
+                # remains gated to static-full persistent kernels below.
+                max_search_m = min(max_search_m, 128)
             spec = env.config_spec
             spec.cute_tcgen05_search_enabled = True
             # Persistent pid types may re-enter autotune only if every

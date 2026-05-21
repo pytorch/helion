@@ -107,7 +107,6 @@ class _AuxStepRecord:
     aux_planned: str
     aux_epi: str
     aux_dtype: str
-    aux_copy_atom: str
     ttr_aux: str
     ttr_aux_grouped: str
     ttr_aux_subtile: str
@@ -1718,8 +1717,6 @@ def _codegen_cute_store_tcgen05_tile(
     ttr_tacc_mn = df.new_var("tcgen05_tTR_tAcc_mn")
     ttr_gc_subtile = df.new_var("tcgen05_tTR_gC_subtile")
     ttr_cc_subtile = df.new_var("tcgen05_tTR_cC_subtile")
-    pred_c = df.new_var("tcgen05_pred_C")
-    pred_c_shape = df.new_var("tcgen05_pred_C_shape")
     acc_vec = df.new_var("tcgen05_acc_vec")
     kernel_desc = df.new_var("tcgen05_kernel_desc")
     mcld = df.new_var("tcgen05_mcld")
@@ -1792,7 +1789,6 @@ def _codegen_cute_store_tcgen05_tile(
                 aux_planned=df.new_var(f"tcgen05_tCgAux_planned_{aux_idx}"),
                 aux_epi=df.new_var(f"tcgen05_tCgAux_epi_{aux_idx}"),
                 aux_dtype=aux_dtype,
-                aux_copy_atom=df.new_var(f"tcgen05_aux_copy_atom_{aux_idx}"),
                 ttr_aux=df.new_var(f"tcgen05_tTR_gAux_{aux_idx}"),
                 ttr_aux_grouped=df.new_var(f"tcgen05_tTR_gAux_grouped_{aux_idx}"),
                 ttr_aux_subtile=df.new_var(f"tcgen05_tTR_gAux_subtile_{aux_idx}"),
@@ -1899,7 +1895,7 @@ def _codegen_cute_store_tcgen05_tile(
         aux_consumer_state_name = ""
         aux_ring_smem_names = ()
 
-    def _simt_edge_predicate_source(indent: str) -> str:
+    def _simt_edge_coord_subtile_source(indent: str) -> str:
         return (
             f"{indent}{coord_tile} = cute.local_tile("
             f"cute.make_identity_tensor(({m_size}, {n_size})), "
@@ -1916,15 +1912,16 @@ def _codegen_cute_store_tcgen05_tile(
             f"cute.rank({ttr_cc}))\n"
             f"{indent}{ttr_cc_subtile} = {ttr_cc_grouped}[(None, None, None, "
             f"cutlass.Int32(_tcgen05_subtile))]\n"
-            f"{indent}{pred_c_shape} = (1, *{ttr_cc_subtile}.shape[1:])\n"
-            f"{indent}{pred_c} = cute.make_rmem_tensor({pred_c_shape}, "
-            "cutlass.Boolean)\n"
-            f"{indent}for _pred_m in range({ttr_cc_subtile}.shape[1]):\n"
-            f"{indent}    for _pred_n in range({ttr_cc_subtile}.shape[2]):\n"
-            f"{indent}        _coord = {ttr_cc_subtile}[(0, _pred_m, "
-            "_pred_n)]\n"
-            f"{indent}        {pred_c}[(0, _pred_m, _pred_n)] = "
-            f"cute.elem_less(_coord, ({m_size}, {n_size}))\n"
+        )
+
+    def _simt_edge_scalar_copy_source(indent: str, src: str, dst: str) -> str:
+        # Vector cute.copy predicates do not guard each partial-N element in double-edge tiles.
+        return (
+            _simt_edge_coord_subtile_source(indent)
+            + f"{indent}for _edge_i in range(cute.size({src}.shape)):\n"
+            f"{indent}    _coord = {ttr_cc_subtile}[_edge_i]\n"
+            f"{indent}    if cute.elem_less(_coord, ({m_size}, {n_size})):\n"
+            f"{indent}        {dst}[_edge_i] = {src}[_edge_i]\n"
         )
 
     def _aux_tile_setup_lines(
@@ -2099,11 +2096,6 @@ def _codegen_cute_store_tcgen05_tile(
                     ),
                 ]
             )
-            if not tcgen05_value.use_tma_store_epilogue:
-                lines.append(
-                    f"{rec.aux_copy_atom} = cute.make_copy_atom("
-                    f"cute.nvgpu.CopyG2ROp(), {rec.aux_dtype})"
-                )
         return lines
 
     def _aux_subtile_load_source(prelude_indent: str) -> str:
@@ -2224,9 +2216,7 @@ def _codegen_cute_store_tcgen05_tile(
                     f"cute.make_rmem_tensor({rec.ttr_aux_subtile}.shape, "
                     f"{rec.aux_dtype})\n"
                     f"{prelude_indent}    {rec.aux_rmem}.fill(0)\n"
-                    f"{_simt_edge_predicate_source(prelude_indent + '    ')}"
-                    f"{prelude_indent}    cute.copy({rec.aux_copy_atom}, "
-                    f"{rec.ttr_aux_subtile}, {rec.aux_rmem}, pred={pred_c})\n"
+                    f"{_simt_edge_scalar_copy_source(prelude_indent + '    ', rec.ttr_aux_subtile, rec.aux_rmem)}"
                     f"{prelude_indent}    {rec.aux_loaded} = "
                     f"{rec.aux_rmem}.load()\n"
                 )
@@ -2508,8 +2498,7 @@ def _codegen_cute_store_tcgen05_tile(
             f"        if {full_tile}:\n"
             f"            cute.copy({simt_atom}, {ttr_rd}, {ttr_gc_subtile})\n"
             f"        else:\n"
-            f"{_simt_edge_predicate_source('            ')}"
-            f"            cute.copy({simt_atom}, {ttr_rd}, {ttr_gc_subtile}, pred={pred_c})\n"
+            f"{_simt_edge_scalar_copy_source('            ', ttr_rd, ttr_gc_subtile)}"
             # Advance is a per-thread local state update, so it intentionally
             # stays outside elect_one; only the mbarrier release is elected.
             f"if {tcgen05_value.epi_active}:\n"
