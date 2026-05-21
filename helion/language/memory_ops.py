@@ -22,6 +22,8 @@ from .._compiler.cute.cute_epilogue import _AuxiliaryTensorStep
 from .._compiler.cute.cute_epilogue import analyze_tcgen05_unary_epilogue_chain
 from .._compiler.cute.cute_fx_walk import reach_tcgen05_matmul_anchors
 from .._compiler.cute.cutedsl_compat import emit_pipeline_advance
+from .._compiler.cute.strategies import tcgen05_default_epilogue_tile_expr
+from .._compiler.cute.strategies import tcgen05_explicit_d_store_tile_expr
 from .._compiler.cute.tcgen05_constants import (
     TCGEN05_ACC_WAIT_PLACEMENT_BEFORE_SUBTILE_LOOP,
 )
@@ -1885,6 +1887,14 @@ def _codegen_cute_store_tcgen05_tile(
     tcgen05_aux_epi_warp_count = tcgen05_value.epi_warp_count
     tcgen05_aux_epilogue_rest_mode = tcgen05_value.epilogue_rest_mode
     tcgen05_aux_use_tma_store_epilogue = tcgen05_value.use_tma_store_epilogue
+    tcgen05_explicit_store_tile_expr: str | None = None
+    if tcgen05_value.has_explicit_epilogue_tile:
+        assert tcgen05_value.explicit_epi_tile_m is not None
+        assert tcgen05_value.explicit_d_store_box_n is not None
+        tcgen05_explicit_store_tile_expr = tcgen05_explicit_d_store_tile_expr(
+            tcgen05_value.explicit_epi_tile_m,
+            tcgen05_value.explicit_d_store_box_n,
+        )
 
     # C-input warp productive-body gate (``cute_plan.md`` §7.5.3.2
     # cycle 2b producer + consumer flip). When the matmul plan has
@@ -2672,6 +2682,15 @@ def _codegen_cute_store_tcgen05_tile(
                     tcgen05_value.tma_store_atom,
                     tcgen05_value.tma_store_tensor,
                 ],
+                **(
+                    {
+                        "epi_tile_m": tcgen05_value.explicit_epi_tile_m,
+                        "epi_tile_n": tcgen05_value.explicit_epi_tile_n,
+                        "d_store_box_n": tcgen05_value.explicit_d_store_box_n,
+                    }
+                    if tcgen05_value.has_explicit_epilogue_tile
+                    else {}
+                ),
             }
         )
 
@@ -2690,6 +2709,14 @@ def _codegen_cute_store_tcgen05_tile(
     def store_common_setup(
         gmem_tensor: str, *, include_full_tile: bool
     ) -> tuple[list[str], list[str]]:
+        epi_tile_expr = tcgen05_explicit_store_tile_expr or (
+            tcgen05_default_epilogue_tile_expr(
+                tcgen05_bm,
+                tcgen05_bn,
+                target_dtype,
+                c_layout="cutlass.utils.layout.LayoutEnum.ROW_MAJOR",
+            )
+        )
         static_setup = [
             (
                 f"{kernel_desc} = type('Tcgen05KernelDesc', (), {{"
@@ -2704,15 +2731,12 @@ def _codegen_cute_store_tcgen05_tile(
                 "})()"
             ),
             (
-                # `layout_c=` / `elem_ty_c=` match the D-output dtype so the
-                # helper picks the with-source branch; the matmul-plan
-                # `tcgen05_epi_tile` and the wrapper-side TMA atom must use
-                # the same call shape (see `_make_tcgen05_layout_plan_setup`).
-                f"{epi_tile} = cutlass.utils.blackwell_helpers.compute_epilogue_tile_shape("
-                f"({tcgen05_bm}, {tcgen05_bn}), False, "
-                f"cutlass.utils.layout.LayoutEnum.ROW_MAJOR, {target_dtype}, "
-                f"layout_c=cutlass.utils.layout.LayoutEnum.ROW_MAJOR, "
-                f"elem_ty_c={target_dtype})"
+                # The fallback helper must receive the D-output dtype through
+                # ``layout_c=`` / ``elem_ty_c=`` so it selects the same
+                # with-source branch as the matmul-plan ``tcgen05_epi_tile``.
+                # The explicit path instead uses the D-store box field directly.
+                # Keep both forms in lockstep with the wrapper-side TMA atom.
+                f"{epi_tile} = {epi_tile_expr}"
             ),
         ]
         tile_setup: list[str] = []

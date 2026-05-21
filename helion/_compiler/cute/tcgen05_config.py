@@ -1253,6 +1253,12 @@ class CuteTcgen05Config:
                 Tcgen05Strategy.PURE_MATMUL_ROLE_LIFECYCLE.value,
             )
         )
+        fragments[TCGEN05_LAYOUT_STRATEGY_CONFIG_KEY] = EnumFragment(
+            (
+                Tcgen05LayoutStrategy.DEFAULT.value,
+                Tcgen05LayoutStrategy.EXPLICIT_EPI_TILE.value,
+            )
+        )
         fragments[TCGEN05_WARP_SPEC_SCHEDULER_WARPS_KEY] = EnumFragment((0, 1))
         fragments[TCGEN05_WARP_SPEC_C_INPUT_WARPS_KEY] = EnumFragment((0, 1))
         return fragments
@@ -1683,13 +1689,12 @@ class CuteTcgen05Config:
                                 f"{TCGEN05_LEGAL_SMEM_SWIZZLE_BYTES!r} "
                                 f"or None, got {value!r}"
                             )
-                elif not (type(value) is int and value >= 0):
+                elif not (type(value) is int and value > 0):
                     if fix_invalid:
                         config[key] = None
                     else:
                         raise InvalidConfig(
-                            f"{key} must be a non-negative integer or None, "
-                            f"got {value!r}"
+                            f"{key} must be a positive integer or None, got {value!r}"
                         )
             else:
                 config[key] = None

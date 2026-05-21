@@ -47,10 +47,27 @@ class CuteTcgen05StoreValue:
     # Output element dtype (cutlass type string, e.g. "cutlass.BFloat16")
     # used when computing the tcgen05 epilogue tile.
     epi_elem_dtype_str: str = ""
+    explicit_epi_tile_m: int | None = None
+    explicit_epi_tile_n: int | None = None
+    explicit_d_store_box_n: int | None = None
 
     def __post_init__(self) -> None:
         if self.pure_matmul_object is not None:
             assert self.pure_matmul_object.lifecycle_context is self.lifecycle_context
+        explicit_tile_values = (
+            self.explicit_epi_tile_m,
+            self.explicit_epi_tile_n,
+            self.explicit_d_store_box_n,
+        )
+        assert all(value is None for value in explicit_tile_values) or all(
+            value is not None for value in explicit_tile_values
+        )
+        if self.explicit_d_store_box_n is not None:
+            assert self.explicit_epi_tile_n == self.explicit_d_store_box_n
+
+    @property
+    def has_explicit_epilogue_tile(self) -> bool:
+        return self.explicit_epi_tile_m is not None
 
     @property
     def pure_matmul_role_lifecycle(self) -> bool:

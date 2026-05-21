@@ -52,6 +52,8 @@ from .strategies import is_pure_matmul_role_lifecycle_config
 from .strategies import l2_swizzle_size_from_config
 from .strategies import layout_overrides_from_config
 from .strategies import smem_swizzle_min_major_mode_bytes
+from .strategies import tcgen05_default_epilogue_tile_expr
+from .strategies import tcgen05_explicit_epilogue_tile_expr
 from .strategies import tcgen05_smem_layout_expr
 from .strategies import warp_spec_from_config
 from .tcgen05_constants import TCGEN05_AB_CONSUMER_PHASE_MODE_CONFIG_KEY
@@ -85,6 +87,7 @@ from .tcgen05_constants import TCGEN05_LARGE_BN_PROOF_PID_TYPE
 from .tcgen05_constants import TCGEN05_LARGE_BN_PROOF_PROBLEM_SHAPE
 from .tcgen05_constants import TCGEN05_SCHED_STAGE_COUNT_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_M
+from .tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_N
 from .tcgen05_constants import TCGEN05_TWO_CTA_EDGE_TMA_STORE_MAX_AB_STAGES
 from .tcgen05_lifecycle import Tcgen05LifecycleContext
 from .tcgen05_pure_matmul import Tcgen05PureMatmulObjectModel
@@ -116,6 +119,13 @@ _TRACE_THROUGH_TARGETS = {
 # reference (`gemm_sm100.py`).
 _TCGEN05_PRODUCER_REGS = 120
 _TCGEN05_CONSUMER_REGS = 256
+# 128x32 bf16 gives the validated 64 Ki-bit D-store TMA box and x32 TMEM
+# drain for the current Target1 CtaGroup.TWO diagnostic path.
+_TCGEN05_EXPLICIT_EPI_TILE_VALIDATED_SHAPE = (
+    TCGEN05_TWO_CTA_BLOCK_M // 2,
+    32,
+    32,
+)
 # Cluster-leader (cta_rank == 0) form. Used only when V-leader semantics
 # degenerate to cluster-leader -- i.e. cluster_size == V (no V-non-leader
 # CTAs), today's cluster_m=2 cluster_n=1 use_2cta=True path. Preserves the
@@ -1499,7 +1509,10 @@ def _is_persistent_pid_config(config: Mapping[str, object]) -> bool:
 
 
 def _clone_k_loop_with_body(
-    device_loop: DeviceLoopState, body: list[ast.stmt]
+    device_loop: DeviceLoopState,
+    body: list[ast.stmt],
+    *,
+    iter_expr: ast.expr | None = None,
 ) -> ast.For:
     """Clone the active K-loop header with a replacement body."""
     # Do not reuse the original target / iter AST nodes: the original loop
@@ -1510,9 +1523,10 @@ def _clone_k_loop_with_body(
         f"for {ast.unparse(device_loop.for_node.target)} in ():\n    pass"
     ).body[0]
     assert isinstance(parsed_loop, ast.For)
-    iter_expr = cast(
-        "ast.expr", expr_from_string(ast.unparse(device_loop.for_node.iter))
-    )
+    if iter_expr is None:
+        iter_expr = cast(
+            "ast.expr", expr_from_string(ast.unparse(device_loop.for_node.iter))
+        )
     return ast.copy_location(
         ast.For(
             target=parsed_loop.target,
@@ -1523,6 +1537,22 @@ def _clone_k_loop_with_body(
         ),
         device_loop.for_node,
     )
+
+
+def _tcgen05_k_loop_nounroll_iter_expr(device_loop: DeviceLoopState) -> ast.expr:
+    """Preserve the active K-loop bounds while adding CuTe no-unroll metadata."""
+    iter_expr = cast(
+        "ast.expr", expr_from_string(ast.unparse(device_loop.for_node.iter))
+    )
+    assert isinstance(iter_expr, ast.Call)
+    assert isinstance(iter_expr.func, ast.Name)
+    assert iter_expr.func.id == "range"
+    assert not any(
+        keyword.arg in ("unroll", "unroll_full") for keyword in iter_expr.keywords
+    )
+    iter_expr.func = cast("ast.expr", expr_from_string("cutlass.range"))
+    iter_expr.keywords.append(ast.keyword(arg="unroll", value=ast.Constant(value=1)))
+    return iter_expr
 
 
 def _wrap_stmt_in_if(stmt: ast.stmt, predicate_src: str) -> ast.If:
@@ -2570,6 +2600,9 @@ def _emit_mma_pipeline(
     # below when the branch is entered.
     tcgen05_smem_swizzle_a: int | None = None
     tcgen05_smem_swizzle_b: int | None = None
+    tcgen05_explicit_epi_tile_m: int | None = None
+    tcgen05_explicit_epi_tile_n: int | None = None
+    tcgen05_explicit_d_store_box_n: int | None = None
     if mma_impl == "tcgen05":
         # Use ``warp_spec.ab_load_warps`` so the strategy data model
         # stays the source of truth for warp role IDs; ``epi_warps``
@@ -2585,6 +2618,9 @@ def _emit_mma_pipeline(
         _tcgen05_layout_overrides = layout_overrides_from_config(df.config)
         tcgen05_smem_swizzle_a = _tcgen05_layout_overrides.smem_swizzle_a
         tcgen05_smem_swizzle_b = _tcgen05_layout_overrides.smem_swizzle_b
+        tcgen05_explicit_epi_tile_m = _tcgen05_layout_overrides.epi_tile_m
+        tcgen05_explicit_epi_tile_n = _tcgen05_layout_overrides.epi_tile_n
+        tcgen05_explicit_d_store_box_n = _tcgen05_layout_overrides.d_store_box_n
         if tcgen05_edge_scalar_fallback_needs_inter_smem_a:
             # The mixed TMA/scalar edge path writes logical (_row, _col)
             # coordinates into the tcgen05 A SMEM view. With bk=128,
@@ -2739,6 +2775,42 @@ def _emit_mma_pipeline(
         tcgen05_tma_store_full_tiles_only = tcgen05_tma_store_full_tiles_only_for(
             tcgen05_partial_output_tma_store
         )
+        explicit_epi_tile_requested = any(
+            value is not None
+            for value in (
+                tcgen05_explicit_epi_tile_m,
+                tcgen05_explicit_epi_tile_n,
+                tcgen05_explicit_d_store_box_n,
+            )
+        )
+        if explicit_epi_tile_requested:
+            if not (
+                tcgen05_static_full_tiles
+                and tcgen05_is_two_cta
+                and bm == TCGEN05_TWO_CTA_BLOCK_M
+                and bn == TCGEN05_TWO_CTA_BLOCK_N
+                and input_dtype == torch.bfloat16
+                and epi_elem_dtype_str == "cutlass.BFloat16"
+                and not aux_tensor_descriptors_value
+            ):
+                raise exc.BackendUnsupported(
+                    "cute",
+                    "explicit tcgen05 epilogue tile overrides are validated only "
+                    "for static-full bf16 pure matmul CtaGroup.TWO kernels",
+                )
+            if (
+                tcgen05_explicit_epi_tile_m,
+                tcgen05_explicit_epi_tile_n,
+                tcgen05_explicit_d_store_box_n,
+            ) != _TCGEN05_EXPLICIT_EPI_TILE_VALIDATED_SHAPE:
+                raise exc.BackendUnsupported(
+                    "cute",
+                    "explicit tcgen05 epilogue tile is currently validated only "
+                    "for epi_tile="
+                    f"{_TCGEN05_EXPLICIT_EPI_TILE_VALIDATED_SHAPE[:2]} "
+                    "and d_store_box_n="
+                    f"{_TCGEN05_EXPLICIT_EPI_TILE_VALIDATED_SHAPE[2]}",
+                )
         tcgen05_matmul_plan = CuteTcgen05MatmulPlan(
             bm=bm,
             bn=bn,
@@ -3052,6 +3124,8 @@ def _emit_mma_pipeline(
                 epi_elem_dtype_str=epi_elem_dtype_str,
                 smem_swizzle_a=tcgen05_smem_swizzle_a,
                 smem_swizzle_b=tcgen05_smem_swizzle_b,
+                explicit_epi_tile_m=tcgen05_explicit_epi_tile_m,
+                explicit_epi_tile_n=tcgen05_explicit_epi_tile_n,
             )
         )
         prefix.append(
@@ -4199,6 +4273,24 @@ def _emit_mma_pipeline(
         if mma_impl == "tcgen05" and tcgen05_use_tma:
             assert tcgen05_plan is not None
             assert tma_warp is not None
+            # The validated explicit two-CTA store-box family uses bk=64 to
+            # match Quack's four logical 2CTA MMA K blocks. Python ``range``
+            # lets the outer K-loop duplicate those issue sites; a CuTe range
+            # with no-unroll metadata keeps that guarded family in one loop
+            # body while normal loops keep their existing range lowering.
+            tcgen05_use_nounroll_k_loop = (
+                any(
+                    value is not None
+                    for value in (
+                        tcgen05_explicit_epi_tile_m,
+                        tcgen05_explicit_epi_tile_n,
+                        tcgen05_explicit_d_store_box_n,
+                    )
+                )
+                and tcgen05_static_full_tiles
+                and tcgen05_is_two_cta
+                and bk == 64
+            )
             tma_kloop_args = _PerKiterTmaArgs(
                 tma_pipeline=tma_pipeline,
                 tma_producer_state=tma_producer_state,
@@ -4265,7 +4357,13 @@ def _emit_mma_pipeline(
                         ]
                     )
                     producer_loop = _clone_k_loop_with_body(
-                        device_loop, producer_loop_body
+                        device_loop,
+                        producer_loop_body,
+                        iter_expr=(
+                            _tcgen05_k_loop_nounroll_iter_expr(device_loop)
+                            if tcgen05_use_nounroll_k_loop
+                            else None
+                        ),
                     )
                     producer_stmt: ast.stmt = producer_loop
                     if tcgen05_use_pure_matmul_role_lifecycle:
@@ -4354,7 +4452,15 @@ def _emit_mma_pipeline(
                                 gate_exec_warp=False,
                             )
                         )
-                    exec_loop = _clone_k_loop_with_body(device_loop, exec_loop_body)
+                    exec_loop = _clone_k_loop_with_body(
+                        device_loop,
+                        exec_loop_body,
+                        iter_expr=(
+                            _tcgen05_k_loop_nounroll_iter_expr(device_loop)
+                            if tcgen05_use_nounroll_k_loop
+                            else None
+                        ),
+                    )
                     exec_stmt: ast.stmt = exec_loop
                     if tcgen05_use_pure_matmul_role_lifecycle:
                         exec_stmt = _wrap_stmt_in_if(
@@ -4666,6 +4772,9 @@ def _emit_mma_pipeline(
                 # to enforce the kernel/store equality contract on
                 # `compute_epilogue_tile_shape`'s dtype kwargs.
                 epi_elem_dtype_str=epi_elem_dtype_str,
+                explicit_epi_tile_m=tcgen05_explicit_epi_tile_m,
+                explicit_epi_tile_n=tcgen05_explicit_epi_tile_n,
+                explicit_d_store_box_n=tcgen05_explicit_d_store_box_n,
             ),
         )
         if tcgen05_pure_matmul_object is not None:
@@ -5076,6 +5185,8 @@ def _make_tcgen05_layout_plan_setup(
     epi_elem_dtype_str: str | None = None,
     smem_swizzle_a: int | None = None,
     smem_swizzle_b: int | None = None,
+    explicit_epi_tile_m: int | None = None,
+    explicit_epi_tile_n: int | None = None,
 ) -> list[ast.AST]:
     # `compute_epilogue_tile_shape` must receive `elem_ty_d` and `elem_ty_c`
     # equal to the eventual D-output dtype so the helper takes the
@@ -5089,6 +5200,18 @@ def _make_tcgen05_layout_plan_setup(
     # is the loud-failure backstop for any mismatch.
     if epi_elem_dtype_str is None:
         epi_elem_dtype_str = input_dtype_str
+    if (explicit_epi_tile_m is None) != (explicit_epi_tile_n is None):
+        raise exc.BackendUnsupported(
+            "cute",
+            "explicit tcgen05 epilogue tile requires both tile dimensions",
+        )
+    epi_tile_expr = (
+        tcgen05_explicit_epilogue_tile_expr(explicit_epi_tile_m, explicit_epi_tile_n)
+        if explicit_epi_tile_m is not None and explicit_epi_tile_n is not None
+        else tcgen05_default_epilogue_tile_expr(
+            bm, bn, epi_elem_dtype_str, c_layout=plan.c_layout
+        )
+    )
     return [
         statement_from_string(
             f"{plan.smem_a_layout} = "
@@ -5101,12 +5224,7 @@ def _make_tcgen05_layout_plan_setup(
         statement_from_string(
             f"{plan.c_layout} = cutlass.utils.layout.LayoutEnum.ROW_MAJOR"
         ),
-        statement_from_string(
-            f"{plan.epi_tile} = cutlass.utils.blackwell_helpers.compute_epilogue_tile_shape("
-            f"({bm}, {bn}), False, {plan.c_layout}, "
-            f"{epi_elem_dtype_str}, layout_c={plan.c_layout}, "
-            f"elem_ty_c={epi_elem_dtype_str})"
-        ),
+        statement_from_string(f"{plan.epi_tile} = {epi_tile_expr}"),
         statement_from_string(
             f"{plan.tmem_load_atom} = cutlass.utils.blackwell_helpers.get_tmem_load_op("
             f"({bm}, {bn}, {bk}), {plan.c_layout}, "
