@@ -1964,22 +1964,33 @@ def _build_cute_schema_and_args(
     return tuple(schema), tuple(launch_args)
 
 
+_CUTE_DSL_ARCH_CACHE: dict[int, str] = {}
+
+
 def _ensure_cute_dsl_arch_env(args: tuple[object, ...]) -> None:
     tensor_args = [arg for arg in args if isinstance(arg, torch.Tensor)]
     if tensor_args:
         device = tensor_args[0].device
         if device.type != "cuda":
             return
-        with torch.cuda.device(device):
-            major, minor = torch.cuda.get_device_capability(device)
+        device_index = device.index if device.index is not None else 0
     elif not torch.cuda.is_available():
         return
     else:
-        major, minor = torch.cuda.get_device_capability()
-    # CUTLASS DSL distinguishes post-Hopper arch variants such as sm_90a/sm_100a,
-    # while torch.cuda.get_device_capability() only returns major/minor.
-    suffix = "a" if major >= 9 else ""
-    desired = f"sm_{major}{minor}{suffix}"
+        device_index = torch.cuda.current_device()
+    desired = _CUTE_DSL_ARCH_CACHE.get(device_index)
+    if desired is None:
+        if tensor_args:
+            with torch.cuda.device(tensor_args[0].device):
+                major, minor = torch.cuda.get_device_capability(tensor_args[0].device)
+        else:
+            major, minor = torch.cuda.get_device_capability()
+        # CUTLASS DSL distinguishes post-Hopper arch variants such as
+        # sm_90a/sm_100a, while torch.cuda.get_device_capability() only
+        # returns major/minor.
+        suffix = "a" if major >= 9 else ""
+        desired = f"sm_{major}{minor}{suffix}"
+        _CUTE_DSL_ARCH_CACHE[device_index] = desired
     if os.environ.get("CUTE_DSL_ARCH") != desired:
         os.environ["CUTE_DSL_ARCH"] = desired
 

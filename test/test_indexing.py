@@ -1244,12 +1244,13 @@ class TestIndexing(RefEagerTestBase, TestCase):
         torch.testing.assert_close(dst_result, expected_dst)
 
         if _get_backend() == "cute":
-            # Regression: the scalar store `dst[:, :] = 1.0` must be wrapped
-            # in the reduction loop alongside the matching load, so the slice
-            # resolves to the rdim index (`rindex_*`) and each iteration
-            # writes the full slice. Without that wrapping, the slice would
-            # bind to the grid index and only one element per block would be
-            # written, racing with the subsequent load.
+            # Regression: the scalar store `dst[:, :] = 1.0` must vary across
+            # the slice's second dim. Either a lane loop variable
+            # (`rindex_*`) or a per-thread index derived from
+            # `cute.arch.thread_idx` (`indices_*`) is correct. What is NOT
+            # correct is binding the slice to a constant or grid-only PID,
+            # which would only write one element per block and race with the
+            # subsequent load.
             store_line = next(
                 (
                     line
@@ -1259,7 +1260,13 @@ class TestIndexing(RefEagerTestBase, TestCase):
                 None,
             )
             self.assertIsNotNone(store_line)
-            self.assertIn("rindex_", store_line)
+            assert "rindex_" in store_line or "indices_" in store_line, store_line
+            # Guard against the original race condition where the second-dim
+            # index resolved to a constant.
+            self.assertNotIn(
+                "cutlass.Int32(0) * cutlass.Int32(dst.layout.stride[1])",
+                store_line,
+            )
 
     def test_1d_index(self):
         """Test both setter from scalar and getter for [i]"""
