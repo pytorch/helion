@@ -229,6 +229,12 @@ jobs:
           # Verify
           python -c "from torch_tpu import api; print(f'TPU device: {api.tpu_device()}')"
 
+      - name: Install Pallas interpret dependencies
+        if: matrix.alias == 'pallas-interpret'
+        run: |
+          source .venv/bin/activate
+          uv pip install 'jax==0.10.0' 'jaxlib==0.10.0' 'absl-py'
+
       - name: Install CUTLASS CuTe DSL
         if: matrix.backend == 'cute'
         run: |
@@ -310,6 +316,7 @@ jobs:
           if [[ "${{ matrix.expecttest-accept }}" == "true" ]]; then export EXPECTTEST_ACCEPT=1; fi
           if [[ "${{ matrix.ref-eager }}" == "true" ]]; then export HELION_INTERPRET=1; fi
           if [[ "${{ matrix.backend }}" == "tileir" ]]; then export ENABLE_TILE=1; fi
+          if [[ "${{ matrix.alias }}" == "pallas-interpret" ]]; then export HELION_PALLAS_INTERPRET=1; fi
           export HELION_BACKEND=${{ matrix.backend }}
           # Disable TorchTPU build cache to prevent running out of disk space.
           export TORCH_TPU_INTERNAL_TIER2_COMPILATION_CACHE=disabled
@@ -319,7 +326,7 @@ jobs:
           if [[ "${{ contains(matrix.alias, 'distributed') }}" == "true" ]]; then
             TEST_PATH="test/test_examples_dist.py"
             EXTRA_FLAGS="-rs"
-          elif [[ "${{ matrix.alias }}" == "tpu" || "$HELION_BACKEND" == "metal" ]]; then
+          elif [[ "${{ matrix.alias }}" == "tpu" || "${{ matrix.alias }}" == "pallas-interpret" || "$HELION_BACKEND" == "metal" ]]; then
             TEST_PATH="."
             EXTRA_FLAGS="--ignore=test/test_examples_dist.py"
             PARALLEL=""
@@ -338,7 +345,13 @@ jobs:
           if [[ "${{ matrix.alias }}" == *xpu* ]]; then
             export TRITON_XPU_GEN_NATIVE_CODE=1
           fi
-          pytest $PARALLEL -rf --timeout=60 --reruns=2 --timeout-method=thread $EXTRA_FLAGS $TEST_PATH | tee >(eval $SKIP_CHECK)
+          # Pallas interpret runs on CPU (no parallelism) and is much slower
+          # than TPU/Triton — bump the per-test timeout accordingly.
+          TIMEOUT=60
+          if [[ "${{ matrix.alias }}" == "pallas-interpret" ]]; then
+            TIMEOUT=300
+          fi
+          pytest $PARALLEL -rf --timeout=$TIMEOUT --reruns=2 --timeout-method=thread $EXTRA_FLAGS $TEST_PATH | tee >(eval $SKIP_CHECK)
 
   test-notebooks:
     name: test-notebooks-cu128-py3.12-pytorch-2.9-a10g
