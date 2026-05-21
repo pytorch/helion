@@ -18,6 +18,14 @@ from .. import exc
 from .._compiler.cute.strategies import tcgen05_default_epilogue_tile_expr
 from .._compiler.cute.strategies import tcgen05_explicit_d_store_tile_expr
 from .._compiler.cute.strategies import tcgen05_smem_layout_expr
+from .._compiler.cute.tcgen05_constants import TCGEN05_DIRECT_ENTRY_CLUSTER_M
+from .._compiler.cute.tcgen05_constants import (
+    TCGEN05_DIRECT_ENTRY_SHAPE_SETS_BY_BK as _DIRECT_ENTRY_SHAPE_SETS_BY_BK,
+)
+from .._compiler.cute.tcgen05_constants import (
+    TCGEN05_DIRECT_ENTRY_STAGE_TUPLES_BY_BK as _DIRECT_ENTRY_STAGE_TUPLES_BY_BK,
+)
+from .._compiler.cute.tcgen05_constants import TCGEN05_DIRECT_ENTRY_TOTAL_WORK_CLUSTERS
 from .._utils import triton_is_available
 from .config import Config as Config
 from .kernel import Kernel as Kernel
@@ -1911,11 +1919,11 @@ def _create_cute_wrapper(
     return namespace[func_name]
 
 
-_TARGET1_DIRECT_ENTRY_SHAPES = (
-    (1024, 1024),
-    (1024, 4096),
-    (1024, 4096),
-)
+# Per-``bk`` stage tuple and tensor shape sets for the TVM-FFI
+# direct-entry fast launch path. The validator imports these from
+# ``tcgen05_constants`` (see top of file) so the codegen-side
+# direct-entry source builder and the runtime-side validator cannot
+# drift out of sync.
 
 
 def _target1_direct_entry_plan(
@@ -1955,12 +1963,50 @@ def _plan_int(plan: dict[str, object], key: str) -> int:
 
 def _target1_direct_entry_arg_indices(
     plan: dict[str, object],
-) -> tuple[int, int, int]:
-    return (
+) -> tuple[int, ...]:
+    # T2 adds a 4th index for the rowvec bias tensor when the plan
+    # carries ``bias_idx``. T1/T3/T4/T5 keep the 3-index lhs/rhs/output
+    # signature.
+    indices: tuple[int, ...] = (
         _plan_int(plan, "lhs_idx"),
         _plan_int(plan, "rhs_idx"),
         _plan_int(plan, "d_idx"),
     )
+    if "bias_idx" in plan:
+        indices = (*indices, _plan_int(plan, "bias_idx"))
+    return indices
+
+
+def _direct_entry_clustered_grid_k(device: torch.device) -> tuple[int, ...]:
+    """Return the accepted ``grid[2]`` set for the clustered direct-entry launch.
+
+    The clustered grid is ``(cluster_m, cluster_n, min(total_clusters,
+    num_sms // cluster_m))`` (see the codegen at ``program_id.py``).
+    Both the unconstrained ``total_clusters`` value (when ``num_sms``
+    is large enough) and the cap ``num_sms // cluster_m`` are valid
+    runtime values; the accept set is the union for the validated
+    ``total_clusters`` envelope.
+
+    On B200 with 148 SMs and ``cluster_m=2``: T1 yields ``min(64, 74)
+    = 64``; T2/T3/T4/T5 each yield ``min(128, 74) = 74``; T6 yields
+    ``min(256, 74) = 74``. The validator derives this set from the
+    actual CUDA device so different Blackwell SKUs with a different
+    ``num_sms`` extend automatically — on a hypothetical larger SKU
+    with ``num_sms // cluster_m >= 256`` the T6 runtime ``grid[2] =
+    256`` is in the accept set because
+    ``TCGEN05_DIRECT_ENTRY_TOTAL_WORK_CLUSTERS`` includes 256.
+    """
+    if device.type != "cuda" or not torch.cuda.is_available():
+        # Fall back to the B200 set; tests that mock device access never
+        # hit launch-time validation.
+        return (64, 74)
+    sm_count = int(torch.cuda.get_device_properties(device).multi_processor_count)
+    cap = sm_count // TCGEN05_DIRECT_ENTRY_CLUSTER_M
+    accepted: set[int] = {cap}
+    accepted.update(
+        min(total, cap) for total in TCGEN05_DIRECT_ENTRY_TOTAL_WORK_CLUSTERS
+    )
+    return tuple(sorted(accepted))
 
 
 def _validate_target1_direct_entry_args(
@@ -1969,32 +2015,70 @@ def _validate_target1_direct_entry_args(
     grid: tuple[int, int, int],
     block: tuple[int, int, int],
     compile_options: str | None,
-) -> tuple[int, int, int]:
+) -> tuple[int, ...]:
     if compile_options is None or "--enable-tvm-ffi" not in compile_options.split():
         raise exc.BackendUnsupported(
             "cute",
             "tcgen05 direct entry requires --enable-tvm-ffi",
         )
-    if grid not in ((2, 1, 64), (128, 1, 1)) or block != (256, 1, 1):
+    # The clustered grid is ``(cluster_m, cluster_n, K)`` for some
+    # device/shape-dependent ``K``: Target 1 yields ``K = 64`` (matches
+    # total work clusters at the T1 shape) and Target 4 caps at
+    # ``K = num_sms // cluster_m`` (= 74 on B200). The x-linear
+    # ``(128, 1, 1)`` is the legacy generated direct-entry form used
+    # inside the compiler-emitted entry point. We pin the accepted
+    # ``grid[2]`` set to the two validated values so a runtime grid that
+    # diverges from the validated envelope is rejected loudly.
+    if block != (256, 1, 1):
         raise exc.BackendUnsupported(
             "cute",
-            f"tcgen05 direct entry requires Target1 grid/block, got {grid}/{block}",
+            f"tcgen05 direct entry requires block=(256, 1, 1), got {block}",
         )
-    if (
-        _plan_int(plan, "bm"),
-        _plan_int(plan, "bn"),
-        _plan_int(plan, "bk"),
-        _plan_int(plan, "cluster_m"),
-        _plan_int(plan, "cluster_n"),
-        _plan_int(plan, "ab_stage_count"),
-        _plan_int(plan, "c_stage_count"),
-    ) not in (
-        (256, 256, 64, 2, 1, 3, 2),
-        (256, 256, 64, 2, 1, 6, 4),
+    # A4 (cycle-2 review): the clustered ``grid[2]`` accept set is
+    # derived from the target tensor's CUDA device's SM count via
+    # ``_direct_entry_clustered_grid_k`` so different Blackwell SKUs
+    # extend automatically instead of being silently rejected by a
+    # B200-hardcoded literal.
+    first_tensor = next(
+        (a for a in args if isinstance(a, torch.Tensor)),
+        None,
+    )
+    if first_tensor is None:
+        raise exc.BackendUnsupported(
+            "cute",
+            "tcgen05 direct entry requires at least one tensor argument",
+        )
+    accepted_clustered_grid_k = _direct_entry_clustered_grid_k(first_tensor.device)
+    if not (
+        (grid[0] == 2 and grid[1] == 1 and grid[2] in accepted_clustered_grid_k)
+        or grid == (128, 1, 1)
     ):
         raise exc.BackendUnsupported(
             "cute",
-            "tcgen05 direct entry requires the validated Target1 stage tuple",
+            f"tcgen05 direct entry requires the validated cluster_m=2 "
+            f"launch geometry (clustered grid[2] in "
+            f"{accepted_clustered_grid_k!r}), got {grid}",
+        )
+    bm = _plan_int(plan, "bm")
+    bn = _plan_int(plan, "bn")
+    bk = _plan_int(plan, "bk")
+    cluster_m = _plan_int(plan, "cluster_m")
+    cluster_n = _plan_int(plan, "cluster_n")
+    ab_stage_count = _plan_int(plan, "ab_stage_count")
+    c_stage_count = _plan_int(plan, "c_stage_count")
+    if (bm, bn, cluster_m, cluster_n) != (256, 256, 2, 1):
+        raise exc.BackendUnsupported(
+            "cute",
+            "tcgen05 direct entry requires bm=bn=256 cluster_m=2 cluster_n=1, "
+            f"got bm={bm} bn={bn} cluster_m={cluster_m} cluster_n={cluster_n}",
+        )
+    if (ab_stage_count, c_stage_count) not in _DIRECT_ENTRY_STAGE_TUPLES_BY_BK.get(
+        bk, ()
+    ):
+        raise exc.BackendUnsupported(
+            "cute",
+            "tcgen05 direct entry requires a validated stage tuple, got "
+            f"bk={bk} (ab,c)=({ab_stage_count},{c_stage_count})",
         )
     if (
         plan.get("input_dtype") != "cutlass.BFloat16"
@@ -2006,12 +2090,23 @@ def _validate_target1_direct_entry_args(
         )
 
     indices = _target1_direct_entry_arg_indices(plan)
-    if indices != (0, 1, 2) or len(args) != 3:
+    # T1/T3/T4/T5 keep the 3-tensor (lhs/rhs/output) signature; T2 adds
+    # a 4th rank-1 trailing-axis bias tensor signalled by the plan's
+    # ``bias_idx`` (= ``indices[3]``).
+    has_bias = len(indices) == 4
+    if not has_bias and (indices != (0, 1, 2) or len(args) != 3):
         raise exc.BackendUnsupported(
             "cute",
             "tcgen05 direct entry currently supports exactly lhs/rhs/output args",
         )
-    for arg, expected_shape in zip(args, _TARGET1_DIRECT_ENTRY_SHAPES, strict=True):
+    if has_bias and (indices != (0, 1, 2, 3) or len(args) != 4):
+        raise exc.BackendUnsupported(
+            "cute",
+            "tcgen05 direct entry with bias requires exactly lhs/rhs/output/bias args",
+        )
+    matmul_args = args[:3]
+    arg_shapes: list[tuple[int, ...]] = []
+    for arg in matmul_args:
         if not isinstance(arg, torch.Tensor):
             raise exc.BackendUnsupported(
                 "cute",
@@ -2023,15 +2118,87 @@ def _validate_target1_direct_entry_args(
                 "cute",
                 "tcgen05 direct entry requires bf16 tensor arguments",
             )
-        if tuple(int(arg.size(dim)) for dim in range(arg.ndim)) != expected_shape:
-            raise exc.BackendUnsupported(
-                "cute",
-                "tcgen05 direct entry requires exact Target1 tensor shapes",
-            )
         if arg.ndim != 2 or int(arg.stride(1)) != 1:
             raise exc.BackendUnsupported(
                 "cute",
                 "tcgen05 direct entry requires row-major rank-2 tensors",
+            )
+        arg_shapes.append(tuple(int(arg.size(dim)) for dim in range(arg.ndim)))
+    observed_shapes = tuple(arg_shapes)
+    # B1 (cycle-3 review): each direct-entry plan carries its
+    # validated problem shape so the validator can dispatch on the
+    # exact (M, N, K) envelope baked into the plan. T4 and T5 share
+    # ``bk=128`` (and the same ``(ab,c)`` stage tuple and cluster
+    # geometry), so the bk-keyed shape-set alone cannot distinguish
+    # a T4-plan from a T5-plan — the plan-carried ``validated_shape``
+    # is what keeps them apart at the validator boundary. The legacy
+    # bk-keyed shape-set (``_DIRECT_ENTRY_SHAPE_SETS_BY_BK``) remains
+    # as defense-in-depth: the per-plan check below additionally
+    # asserts that the plan's ``validated_shape`` is one of the
+    # bk-allowed shapes (so a future plan-construction-site bug that
+    # forged an off-envelope shape into a plan still gets caught).
+    validated_shape_raw = plan.get("validated_shape")
+    if not (
+        isinstance(validated_shape_raw, (list, tuple))
+        and len(validated_shape_raw) == 3
+        and all(isinstance(v, int) for v in validated_shape_raw)
+    ):
+        raise exc.BackendUnsupported(
+            "cute",
+            f"tcgen05 direct entry plan requires validated_shape, got "
+            f"{validated_shape_raw!r}",
+        )
+    plan_m, plan_n, plan_k = (int(v) for v in validated_shape_raw)
+    bk_allowed_shapes = _DIRECT_ENTRY_SHAPE_SETS_BY_BK.get(bk, ())
+    expected_lhs = (plan_m, plan_k)
+    expected_rhs = (plan_k, plan_n)
+    expected_d = (plan_m, plan_n)
+    expected_shapes = (expected_lhs, expected_rhs, expected_d)
+    if expected_shapes not in bk_allowed_shapes:
+        raise exc.BackendUnsupported(
+            "cute",
+            f"tcgen05 direct entry plan bk={bk} carries unvalidated "
+            f"validated_shape={plan_m, plan_n, plan_k}; bk-allowed shape "
+            f"envelopes are {bk_allowed_shapes!r}",
+        )
+    if observed_shapes != expected_shapes:
+        raise exc.BackendUnsupported(
+            "cute",
+            f"tcgen05 direct entry plan validated_shape="
+            f"{plan_m, plan_n, plan_k} (bk={bk}) requires shapes "
+            f"{expected_shapes!r}, got {observed_shapes!r}",
+        )
+    if has_bias:
+        # The arity check above already required ``len(args) == 4`` when
+        # ``has_bias`` is set; pyrefly cannot narrow the tuple type
+        # across the conditional, so index the args by ``cast`` below.
+        bias_arg = cast("tuple[object, ...]", args)[3]
+        if not isinstance(bias_arg, torch.Tensor):
+            raise exc.BackendUnsupported(
+                "cute",
+                "tcgen05 direct entry bias requires a tensor argument",
+            )
+        _validate_cute_launcher_tensor(bias_arg)
+        if bias_arg.dtype is not torch.bfloat16:
+            raise exc.BackendUnsupported(
+                "cute",
+                "tcgen05 direct entry bias requires a bf16 tensor",
+            )
+        # The bias tensor for T2 is rank-1 with N elements (trailing-axis
+        # rowvec broadcast); stride must be 1 so the GMEM load uses
+        # contiguous reads. The N-extent matches the matmul's N to keep
+        # the bias broadcast aligned with the output tile columns.
+        if (
+            bias_arg.ndim != 1
+            or int(bias_arg.stride(0)) != 1
+            or int(bias_arg.size(0)) != plan_n
+        ):
+            raise exc.BackendUnsupported(
+                "cute",
+                "tcgen05 direct entry bias requires a contiguous rank-1 "
+                f"bf16 tensor of shape ({plan_n},), got shape "
+                f"{tuple(int(bias_arg.size(d)) for d in range(bias_arg.ndim))!r} "
+                f"stride {tuple(int(bias_arg.stride(d)) for d in range(bias_arg.ndim))!r}",
             )
     return indices
 
@@ -2116,7 +2283,10 @@ def _create_cute_direct_entry(
 
     wrapper_plans = _wrapper_plans_for_direct_entry(cute_kernel, direct_plan)
     body: list[str] = []
-    for index in _target1_direct_entry_arg_indices(direct_plan):
+    arg_indices = _target1_direct_entry_arg_indices(direct_plan)
+    # The lhs/rhs/output tensors are rank-2; the optional bias tensor
+    # for T2 is rank-1 and only contributes a single shape/stride pair.
+    for index in arg_indices[:3]:
         body.extend(
             (
                 f"    arg{index}_shape0 = arg{index}.shape[0]",
@@ -2125,7 +2295,18 @@ def _create_cute_direct_entry(
                 f"    arg{index}_stride1 = arg{index}.stride[1]",
             )
         )
+    has_bias = len(arg_indices) == 4
+    if has_bias:
+        bias_index = arg_indices[3]
+        body.extend(
+            (
+                f"    arg{bias_index}_shape0 = arg{bias_index}.shape[0]",
+                f"    arg{bias_index}_stride0 = arg{bias_index}.stride[0]",
+            )
+        )
     call_args = ["arg0", "arg1", "arg2"]
+    if has_bias:
+        call_args.append(f"arg{arg_indices[3]}")
     for plan in wrapper_plans:
         _append_cute_wrapper_plan(body, call_args, plan)
 
@@ -2146,10 +2327,11 @@ def _create_cute_direct_entry(
 
     kernel_name = getattr(cast("Any", cute_kernel), "__name__", "cute_kernel")
     func_name = f"_helion_cute_direct_entry_{kernel_name}_{id(cute_kernel):x}"
+    entry_params = ", ".join(f"arg{i}" for i in range(len(arg_indices)))
     source = "\n".join(
         [
             "@cute.jit",
-            f"def {func_name}(arg0, arg1, arg2) -> None:",
+            f"def {func_name}({entry_params}) -> None:",
             *body,
         ]
     )
@@ -2218,7 +2400,7 @@ class _CompiledCuteDirectEntryLauncher:
         self,
         jit_func: object,
         compile_args: tuple[object, ...],
-        runtime_arg_indices: tuple[int, int, int],
+        runtime_arg_indices: tuple[int, ...],
         compile_options: str,
     ) -> None:
         self._jit_func = jit_func
@@ -2295,9 +2477,10 @@ def _get_compiled_cute_direct_entry_launcher(
     generated_direct_entry = getattr(
         cast("Any", cute_kernel), "_helion_cute_generated_direct_entry", None
     )
-    # The compiler-emitted direct entry is exact-gated to Target1's x-linear
-    # launch. Other validated grids continue to use the runtime descriptor
-    # wrapper fallback.
+    # The compiler-emitted direct entry hard-codes an x-linear
+    # ``grid=(128,1,1)`` launch. The validator above also admits the
+    # clustered ``(2,1,64)`` form for the runtime descriptor fallback;
+    # only the x-linear launch may reuse the generated direct entry.
     if generated_direct_entry is not None and grid != (128, 1, 1):
         generated_direct_entry = None
     cache_key = (

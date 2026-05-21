@@ -89,6 +89,25 @@ from .tcgen05_constants import TCGEN05_LARGE_BN_PROOF_PID_TYPE
 from .tcgen05_constants import TCGEN05_LARGE_BN_PROOF_PROBLEM_SHAPE
 from .tcgen05_constants import TCGEN05_PURE_CLC_SCHEDULER_OBJECT_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_SCHED_STAGE_COUNT_CONFIG_KEY
+from .tcgen05_constants import TCGEN05_TARGET1_TVM_FFI_BLOCK_K
+from .tcgen05_constants import TCGEN05_TARGET2_TVM_FFI_AB_STAGES
+from .tcgen05_constants import TCGEN05_TARGET2_TVM_FFI_BLOCK_K
+from .tcgen05_constants import TCGEN05_TARGET2_TVM_FFI_C_STAGES
+from .tcgen05_constants import TCGEN05_TARGET3_TVM_FFI_AB_STAGES
+from .tcgen05_constants import TCGEN05_TARGET3_TVM_FFI_BLOCK_K
+from .tcgen05_constants import TCGEN05_TARGET3_TVM_FFI_C_STAGES
+from .tcgen05_constants import TCGEN05_TARGET4_TVM_FFI_AB_STAGES
+from .tcgen05_constants import TCGEN05_TARGET4_TVM_FFI_BLOCK_K
+from .tcgen05_constants import TCGEN05_TARGET4_TVM_FFI_C_STAGES
+from .tcgen05_constants import TCGEN05_TARGET5_TVM_FFI_AB_STAGES
+from .tcgen05_constants import TCGEN05_TARGET5_TVM_FFI_BLOCK_K
+from .tcgen05_constants import TCGEN05_TARGET5_TVM_FFI_C_STAGES
+from .tcgen05_constants import TCGEN05_TARGET6_TVM_FFI_AB_STAGES
+from .tcgen05_constants import TCGEN05_TARGET6_TVM_FFI_BLOCK_K
+from .tcgen05_constants import TCGEN05_TARGET6_TVM_FFI_C_STAGES
+from .tcgen05_constants import TCGEN05_TARGET7_TVM_FFI_AB_STAGES
+from .tcgen05_constants import TCGEN05_TARGET7_TVM_FFI_BLOCK_K
+from .tcgen05_constants import TCGEN05_TARGET7_TVM_FFI_C_STAGES
 from .tcgen05_constants import TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_M
 from .tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_N
@@ -1632,6 +1651,8 @@ def _wrap_stmt_in_if(stmt: ast.stmt, predicate_src: str) -> ast.If:
 def _trace_mma_to_single_store_value_and_dtype(
     mma_node: Node,
     graphs: list[GraphInfo],
+    *,
+    extra_trace_through: frozenset[object] = frozenset(),
 ) -> tuple[Node, torch.dtype] | None:
     """Forward-trace ``mma_node`` to exactly one consuming store.
 
@@ -1650,6 +1671,10 @@ def _trace_mma_to_single_store_value_and_dtype(
     ``GraphInfo.graph`` by identity — that's the disambiguator across
     structurally-identical subgraphs (e.g., a kernel with two distinct
     matmuls would otherwise collide on ``_graph_signature``).
+
+    ``extra_trace_through`` lets the caller broaden the set of ops the
+    walker will follow past — e.g. ``aten.relu.default`` for the
+    relu-store gate. Default behaviour is unchanged.
     """
     import operator
 
@@ -1728,6 +1753,7 @@ def _trace_mma_to_single_store_value_and_dtype(
                 or target is _tracing_ops._new_var
                 or target is operator.getitem
                 or target in _TRACE_THROUGH_TARGETS
+                or target in extra_trace_through
             ):
                 stack.append(user)
                 continue
@@ -1856,6 +1882,279 @@ def _trace_mma_to_single_identity_store_dtype(
         )
         is None
     ):
+        return None
+    dtype_arg = store_value.args[1] if len(store_value.args) > 1 else None
+    if dtype_arg != output_dtype:
+        return None
+    return output_dtype
+
+
+_RELU_STORE_EXTRA_TRACE_THROUGH = frozenset({torch.ops.aten.relu.default})
+
+
+def _trace_mma_to_single_relu_store_dtype(
+    mma_node: Node,
+    graphs: list[GraphInfo],
+) -> torch.dtype | None:
+    """Return the store dtype only for exactly one ``relu`` + cast store.
+
+    The chain accepted here is ``mma -> relu -> convert_element_type ->
+    store``: exactly one ``aten.relu.default`` between the MMA carrier and
+    the cast that feeds the store. This mirrors
+    ``_trace_mma_to_single_identity_store_dtype`` for the relu epilogue
+    so the TVM-FFI direct entry can admit Target 4 without broadening the
+    general-purpose identity-store gate. The base walker is extended with
+    ``aten.relu.default`` so the forward trace can step past relu on its
+    way from the MMA carrier to the convert-and-store node.
+    """
+    from .cute_fx_walk import build_inner_outputs_index_from_graphs
+    from .cute_fx_walk import walk_carrier_to_tcgen05_matmul
+
+    traced = _trace_mma_to_single_store_value_and_dtype(
+        mma_node,
+        graphs,
+        extra_trace_through=_RELU_STORE_EXTRA_TRACE_THROUGH,
+    )
+    if traced is None:
+        return None
+    store_value, output_dtype = traced
+    if (
+        store_value.op != "call_function"
+        or store_value.target is not torch.ops.prims.convert_element_type.default
+        or store_value.kwargs
+    ):
+        return None
+    cast_input = store_value.args[0] if store_value.args else None
+    if not isinstance(cast_input, Node):
+        return None
+    if (
+        cast_input.op != "call_function"
+        or cast_input.target is not torch.ops.aten.relu.default
+        or cast_input.kwargs
+        or len(cast_input.args) != 1
+    ):
+        return None
+    relu_input = cast_input.args[0]
+    if not isinstance(relu_input, Node):
+        return None
+    if (
+        walk_carrier_to_tcgen05_matmul(
+            relu_input,
+            {mma_node},
+            build_inner_outputs_index_from_graphs(graphs),
+        )
+        is None
+    ):
+        return None
+    dtype_arg = store_value.args[1] if len(store_value.args) > 1 else None
+    if dtype_arg != output_dtype:
+        return None
+    return output_dtype
+
+
+# T2's bias add (``aten.add.Tensor(carrier, bias_load)``) sits between
+# the MMA carrier and the convert-and-store node. The base walker stops
+# at every ``call_function`` target outside its trace-through set, so
+# the bias-store walker has to extend the set with ``aten.add.Tensor``
+# to step past the bias add and reach the cast that feeds the store.
+_BIAS_STORE_EXTRA_TRACE_THROUGH = frozenset({torch.ops.aten.add.Tensor})
+
+
+def _trace_mma_to_single_bias_store_dtype(
+    mma_node: Node,
+    graphs: list[GraphInfo],
+) -> torch.dtype | None:
+    """Return the store dtype only for exactly one ``acc + bias[n]`` + cast store.
+
+    The chain accepted here is ``mma -> aten.add.Tensor(carrier,
+    bias_load) -> convert_element_type -> store``: exactly one
+    ``aten.add.Tensor`` between the MMA carrier and the cast that feeds
+    the store, where one of the add's operands is the MMA carrier and
+    the other is a rank-1 ``helion.language.load`` against a GMEM
+    tensor with shape ``(N,)``.
+
+    Mutually exclusive with the identity and relu walkers: identity
+    rejects any binary op in the chain, and relu requires a single-arg
+    ``aten.relu.default`` rather than the two-arg add. A T6
+    (``acc + bias[n] -> relu -> convert -> store``) chain is rejected
+    because the cast feeds off a relu rather than the add. The
+    rank-1 GMEM-load operand makes this walker T2-specific even at
+    shapes where a T3 / T4 / T5 walker would otherwise admit the
+    chain.
+    """
+    from .cute_fx_walk import build_inner_outputs_index_from_graphs
+    from .cute_fx_walk import walk_carrier_to_tcgen05_matmul
+
+    traced = _trace_mma_to_single_store_value_and_dtype(
+        mma_node,
+        graphs,
+        extra_trace_through=_BIAS_STORE_EXTRA_TRACE_THROUGH,
+    )
+    if traced is None:
+        return None
+    store_value, output_dtype = traced
+    if (
+        store_value.op != "call_function"
+        or store_value.target is not torch.ops.prims.convert_element_type.default
+        or store_value.kwargs
+    ):
+        return None
+    cast_input = store_value.args[0] if store_value.args else None
+    if not isinstance(cast_input, Node):
+        return None
+    if (
+        cast_input.op != "call_function"
+        or cast_input.target is not torch.ops.aten.add.Tensor
+        or cast_input.kwargs
+        or len(cast_input.args) != 2
+    ):
+        return None
+    add_lhs, add_rhs = cast_input.args
+    if not isinstance(add_lhs, Node) or not isinstance(add_rhs, Node):
+        return None
+    inner_outputs_index = build_inner_outputs_index_from_graphs(graphs)
+
+    def _is_rank1_bias_load(node: Node) -> bool:
+        from ...language import memory_ops
+
+        if node.op != "call_function" or node.target is not memory_ops.load:
+            return False
+        host_arg = node.args[0] if node.args else None
+        if not isinstance(host_arg, Node):
+            return False
+        host_val = host_arg.meta.get("val")
+        if not isinstance(host_val, torch.Tensor):
+            return False
+        # P2: the runtime validator only admits bf16 bias tensors, so
+        # gate the codegen walker on dtype too — a non-bf16 bias
+        # kernel at T2 shape must not reach the direct-entry path (it
+        # would otherwise fail loudly at launch instead of falling
+        # back to the wrapper-dispatch route at codegen).
+        return host_val.ndim == 1 and host_val.dtype == torch.bfloat16
+
+    # Either side of the add can be the carrier (commutative); the
+    # other must be a rank-1 bias load.
+    carrier_first = walk_carrier_to_tcgen05_matmul(
+        add_lhs, {mma_node}, inner_outputs_index
+    ) is not None and _is_rank1_bias_load(add_rhs)
+    carrier_second = walk_carrier_to_tcgen05_matmul(
+        add_rhs, {mma_node}, inner_outputs_index
+    ) is not None and _is_rank1_bias_load(add_lhs)
+    if not (carrier_first or carrier_second):
+        return None
+    dtype_arg = store_value.args[1] if len(store_value.args) > 1 else None
+    if dtype_arg != output_dtype:
+        return None
+    return output_dtype
+
+
+# T6's bias_relu chain has both ``aten.add.Tensor`` (the bias add) and
+# ``aten.relu.default`` (the post-add activation) between the MMA carrier
+# and the convert-and-store node. The walker has to step past both ops to
+# reach the cast that feeds the store, so the extra trace-through set is
+# the union of T2's bias trace-through and T4's relu trace-through.
+_BIAS_RELU_STORE_EXTRA_TRACE_THROUGH = frozenset(
+    {torch.ops.aten.add.Tensor, torch.ops.aten.relu.default}
+)
+
+
+def _trace_mma_to_single_bias_relu_store_dtype(
+    mma_node: Node,
+    graphs: list[GraphInfo],
+) -> torch.dtype | None:
+    """Return the store dtype only for one ``relu(acc + bias[n])`` + cast store.
+
+    The chain accepted here is ``mma -> aten.add.Tensor(carrier,
+    bias_load) -> aten.relu.default -> convert_element_type -> store``:
+    exactly one ``aten.add.Tensor`` (with a rank-1 bf16 GMEM bias load on
+    one side and the MMA carrier on the other) followed by exactly one
+    ``aten.relu.default`` between the MMA carrier and the cast that
+    feeds the store. This mirrors
+    ``_trace_mma_to_single_bias_store_dtype`` but additionally requires
+    the relu wrapper, gating the Target 6 TVM-FFI direct-entry seed
+    without broadening the T2 (no relu) or T4 (no bias) walkers.
+
+    Mutually exclusive with the identity (no binary op), relu (no add),
+    and bias (no relu) walkers via the chain shape: T6's
+    ``cast_input`` is a relu whose input is a bias add, while the T2
+    walker requires the cast_input to be the bias add itself. T6 also
+    keeps the bf16 dtype gate on the bias load (cycle-6 P2) so a
+    non-bf16 bias kernel at T6 shape does not reach the direct-entry
+    plan and fail only at launch.
+    """
+    from .cute_fx_walk import build_inner_outputs_index_from_graphs
+    from .cute_fx_walk import walk_carrier_to_tcgen05_matmul
+
+    traced = _trace_mma_to_single_store_value_and_dtype(
+        mma_node,
+        graphs,
+        extra_trace_through=_BIAS_RELU_STORE_EXTRA_TRACE_THROUGH,
+    )
+    if traced is None:
+        return None
+    store_value, output_dtype = traced
+    if (
+        store_value.op != "call_function"
+        or store_value.target is not torch.ops.prims.convert_element_type.default
+        or store_value.kwargs
+    ):
+        return None
+    cast_input = store_value.args[0] if store_value.args else None
+    if not isinstance(cast_input, Node):
+        return None
+    # T6 requires a relu directly feeding the cast (whereas T2 has the
+    # bias add feed the cast directly without an intervening relu).
+    if (
+        cast_input.op != "call_function"
+        or cast_input.target is not torch.ops.aten.relu.default
+        or cast_input.kwargs
+        or len(cast_input.args) != 1
+    ):
+        return None
+    relu_input = cast_input.args[0]
+    if not isinstance(relu_input, Node):
+        return None
+    # The relu's input must be the bias add: ``aten.add.Tensor(carrier,
+    # bias_load)`` or the commutative variant.
+    if (
+        relu_input.op != "call_function"
+        or relu_input.target is not torch.ops.aten.add.Tensor
+        or relu_input.kwargs
+        or len(relu_input.args) != 2
+    ):
+        return None
+    add_lhs, add_rhs = relu_input.args
+    if not isinstance(add_lhs, Node) or not isinstance(add_rhs, Node):
+        return None
+    inner_outputs_index = build_inner_outputs_index_from_graphs(graphs)
+
+    def _is_rank1_bias_load(node: Node) -> bool:
+        from ...language import memory_ops
+
+        if node.op != "call_function" or node.target is not memory_ops.load:
+            return False
+        host_arg = node.args[0] if node.args else None
+        if not isinstance(host_arg, Node):
+            return False
+        host_val = host_arg.meta.get("val")
+        if not isinstance(host_val, torch.Tensor):
+            return False
+        # P2 (cycle-6): the runtime validator only admits bf16 bias
+        # tensors, so the codegen walker is gated on dtype too — a
+        # non-bf16 bias kernel at T6 shape must not reach the direct-
+        # entry path (it would otherwise fail loudly at launch instead
+        # of falling back to the wrapper-dispatch route at codegen).
+        return host_val.ndim == 1 and host_val.dtype == torch.bfloat16
+
+    # Either side of the add can be the carrier (commutative); the
+    # other must be a rank-1 bias load.
+    carrier_first = walk_carrier_to_tcgen05_matmul(
+        add_lhs, {mma_node}, inner_outputs_index
+    ) is not None and _is_rank1_bias_load(add_rhs)
+    carrier_second = walk_carrier_to_tcgen05_matmul(
+        add_rhs, {mma_node}, inner_outputs_index
+    ) is not None and _is_rank1_bias_load(add_lhs)
+    if not (carrier_first or carrier_second):
         return None
     dtype_arg = store_value.args[1] if len(store_value.args) > 1 else None
     if dtype_arg != output_dtype:
@@ -3006,6 +3305,16 @@ def _emit_mma_pipeline(
             )
         )
         tcgen05_use_flat_role_coordinates = tcgen05_requested_flat_role_coordinates
+        # T2's rowvec ``acc + bias[n]`` epilogue surfaces a single rank-1
+        # (broadcast_axis=1) aux descriptor. The aux pipeline keeps the
+        # bias on the SIMT load path (no TMA), so the explicit
+        # epilogue-tile family stays validated for the T2 envelope: the
+        # store side still uses the same TMA-store + epi-tile shape as
+        # T1/T3/T4/T5. Exact-shape rank-2 aux tensors (broadcast_axis=
+        # None) and any other broadcast shape remain rejected here.
+        aux_descriptors_compatible_with_explicit_epi_tile = all(
+            d.broadcast_axis == 1 for d in aux_tensor_descriptors_value
+        )
         if explicit_epi_tile_requested:
             if not (
                 tcgen05_static_full_tiles
@@ -3014,12 +3323,14 @@ def _emit_mma_pipeline(
                 and bn == TCGEN05_TWO_CTA_BLOCK_N
                 and input_dtype == torch.bfloat16
                 and epi_elem_dtype_str == "cutlass.BFloat16"
-                and not aux_tensor_descriptors_value
+                and aux_descriptors_compatible_with_explicit_epi_tile
             ):
                 raise exc.BackendUnsupported(
                     "cute",
                     "explicit tcgen05 epilogue tile overrides are validated only "
-                    "for static-full bf16 pure matmul CtaGroup.TWO kernels",
+                    "for static-full bf16 pure matmul CtaGroup.TWO kernels "
+                    "(rank-1 rowvec aux tensors admitted for the T2 bias "
+                    "envelope)",
                 )
             if (
                 tcgen05_explicit_epi_tile_m,
@@ -3048,10 +3359,13 @@ def _emit_mma_pipeline(
                 and tcgen05_cluster_n == 1
                 and bm == TCGEN05_TWO_CTA_BLOCK_M
                 and bn == TCGEN05_TWO_CTA_BLOCK_N
-                and bk == 64
+                # T1 validated at bk=64, T4 validated at bk=128. Both share
+                # the bm=bn=256, cluster_m=2, cluster_n=1 envelope and use
+                # the same flat-role launch shape.
+                and bk in (64, 128)
                 and input_dtype == torch.bfloat16
                 and epi_elem_dtype_str == "cutlass.BFloat16"
-                and not aux_tensor_descriptors_value
+                and aux_descriptors_compatible_with_explicit_epi_tile
                 and tcgen05_use_tma_store_epilogue
                 and tcgen05_warp_spec.scheduler_warps == 0
                 and tcgen05_warp_spec.c_input_warps == 0
@@ -3062,7 +3376,7 @@ def _emit_mma_pipeline(
                     "cute",
                     f"{TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY}=True requires "
                     "the guarded static-full bf16 pure matmul CtaGroup.TWO "
-                    "256x256x64 explicit-epilogue-tile path",
+                    "256x256 bk in {64,128} explicit-epilogue-tile path",
                 )
         tcgen05_use_pure_clc_scheduler_object = (
             tcgen05_requested_pure_clc_scheduler_object
@@ -3074,27 +3388,176 @@ def _emit_mma_pipeline(
                 if fx_node is not None
                 else None
             )
-            if not (
+            # P2 (cycle-2 review): the pure-CLC scheduler-object diagnostic
+            # is still narrow-gated to the validated T1 identity-store
+            # envelope. The TVM-FFI direct entry additionally admits the
+            # T4 (8192x1024x1024) relu-epilogue, T5 (1024x8192x1024)
+            # identity-store, T3 (2048x4096x2048) identity-store, and
+            # T2 (4096x2048x2048) rowvec bias-store envelopes at bk=128;
+            # the relu (T4) and bias (T2) fusions are handled inside the
+            # kernel body, so all the direct entry needs is to confirm
+            # the store shape/dtype matches. The two surfaces are gated
+            # separately so ``pure_clc_scheduler_object=True`` +
+            # T2/T3/T4/T5 cannot silently admit a non-T1 launch through
+            # an unvalidated CLC scheduler.
+            relu_store_dtype = (
+                _trace_mma_to_single_relu_store_dtype(fx_node, cg.codegen_graphs)
+                if fx_node is not None
+                else None
+            )
+            bias_store_dtype = (
+                _trace_mma_to_single_bias_store_dtype(fx_node, cg.codegen_graphs)
+                if fx_node is not None
+                else None
+            )
+            bias_relu_store_dtype = (
+                _trace_mma_to_single_bias_relu_store_dtype(fx_node, cg.codegen_graphs)
+                if fx_node is not None
+                else None
+            )
+            # A1 (cycle-2 second-pass review): each envelope predicate
+            # pins ``bk`` to its validated block_k so a T1-shape config
+            # with ``bk=128`` (or T3/T4/T5-shape with ``bk=64``) is
+            # rejected here at codegen instead of only at the runtime
+            # validator.
+            target1_envelope_ok = (
+                (m_size, n_size, k_total_size) == (1024, 4096, 1024)
+                and bk == TCGEN05_TARGET1_TVM_FFI_BLOCK_K
+                and (tcgen05_ab_stage_count_value, tcgen05_c_stage_count_value)
+                in ((3, 2), (6, 4))
+                and acc_expr is None
+                and identity_store_dtype == input_dtype
+            )
+            target4_envelope_ok = (
+                (m_size, n_size, k_total_size) == (8192, 1024, 1024)
+                and bk == TCGEN05_TARGET4_TVM_FFI_BLOCK_K
+                and (tcgen05_ab_stage_count_value, tcgen05_c_stage_count_value)
+                == (TCGEN05_TARGET4_TVM_FFI_AB_STAGES, TCGEN05_TARGET4_TVM_FFI_C_STAGES)
+                and acc_expr is None
+                and relu_store_dtype == input_dtype
+            )
+            # T5 (1024x8192x1024) uses identity store (no relu epilogue),
+            # matching T1's epilogue shape but at the T4 bk=128 stage
+            # tuple. The predicate is pinned to T5's shape so a T1-shape
+            # config with bk=128 is still rejected (handled by the T1
+            # predicate's bk pin), and a T4-shape config with identity
+            # store would also fall through here.
+            target5_envelope_ok = (
+                (m_size, n_size, k_total_size) == (1024, 8192, 1024)
+                and bk == TCGEN05_TARGET5_TVM_FFI_BLOCK_K
+                and (tcgen05_ab_stage_count_value, tcgen05_c_stage_count_value)
+                == (TCGEN05_TARGET5_TVM_FFI_AB_STAGES, TCGEN05_TARGET5_TVM_FFI_C_STAGES)
+                and acc_expr is None
+                and identity_store_dtype == input_dtype
+            )
+            # T3 (2048x4096x2048) uses identity store at the same bk=128
+            # (ab=3, c=2) stage tuple as T4/T5. The K=2048 problem yields
+            # ``k_tile_count = 16`` (double T4/T5's 8); this fits the
+            # ``TCGEN05_TWO_CTA_MAX_K_TILES`` cap and the (3, 2) stage
+            # tuple. The predicate is pinned to T3's shape so a T1/T5
+            # host function does not get a T3 admission and vice versa.
+            target3_envelope_ok = (
+                (m_size, n_size, k_total_size) == (2048, 4096, 2048)
+                and bk == TCGEN05_TARGET3_TVM_FFI_BLOCK_K
+                and (tcgen05_ab_stage_count_value, tcgen05_c_stage_count_value)
+                == (TCGEN05_TARGET3_TVM_FFI_AB_STAGES, TCGEN05_TARGET3_TVM_FFI_C_STAGES)
+                and acc_expr is None
+                and identity_store_dtype == input_dtype
+            )
+            # T2 (4096x2048x2048) uses a rank-1 trailing-axis (rowvec)
+            # ``acc + bias[n]`` epilogue at the same bk=128 (ab=3, c=2)
+            # stage tuple as T3/T4/T5. The bias-store walker (above)
+            # confirms exactly one ``aten.add.Tensor(carrier,
+            # bias_load)`` between the MMA carrier and the
+            # convert-and-store node and that ``bias_load`` is a rank-1
+            # GMEM load. The predicate is pinned to T2's shape so T6
+            # (8192x2048x2048 + bias_relu) does not silently get a T2
+            # admission, and so a T2-shape config with bk=64 (or a
+            # T1/T3/T4/T5 host function at the T2 shape) is rejected.
+            target2_envelope_ok = (
+                (m_size, n_size, k_total_size) == (4096, 2048, 2048)
+                and bk == TCGEN05_TARGET2_TVM_FFI_BLOCK_K
+                and (tcgen05_ab_stage_count_value, tcgen05_c_stage_count_value)
+                == (TCGEN05_TARGET2_TVM_FFI_AB_STAGES, TCGEN05_TARGET2_TVM_FFI_C_STAGES)
+                and acc_expr is None
+                and bias_store_dtype == input_dtype
+            )
+            # T6 (8192x2048x2048) composes T2's rank-1 trailing-axis
+            # (rowvec) ``acc + bias[n]`` with T4's relu activation:
+            # ``relu(acc + bias[n])``. The bias-relu walker (above)
+            # confirms exactly one ``aten.add.Tensor(carrier,
+            # bias_load)`` followed by exactly one
+            # ``aten.relu.default`` between the MMA carrier and the
+            # convert-and-store node, and that ``bias_load`` is a
+            # rank-1 bf16 GMEM load. The predicate is pinned to T6's
+            # shape so a T2 (4096x2048x2048 + bias) host function does
+            # not silently get a T6 admission, and so a T6-shape
+            # config with bk=64 (or a T1/T3/T4/T5 host function at the
+            # T6 shape) is rejected.
+            target6_envelope_ok = (
+                (m_size, n_size, k_total_size) == (8192, 2048, 2048)
+                and bk == TCGEN05_TARGET6_TVM_FFI_BLOCK_K
+                and (tcgen05_ab_stage_count_value, tcgen05_c_stage_count_value)
+                == (TCGEN05_TARGET6_TVM_FFI_AB_STAGES, TCGEN05_TARGET6_TVM_FFI_C_STAGES)
+                and acc_expr is None
+                and bias_relu_store_dtype == input_dtype
+            )
+            # T7 (2048x8192x2048) uses identity store at the same
+            # bk=128 (ab=3, c=2) stage tuple as T3/T4/T5/T6. The
+            # K=2048 problem yields ``k_tile_count = 16`` (same as
+            # T2/T3/T6); this fits the ``TCGEN05_TWO_CTA_MAX_K_TILES``
+            # cap. T7 is structurally similar to T5 (1024x8192x1024)
+            # with M and K doubled (M_tiles*N_tiles = 8*32 = 256
+            # work clusters, matching T6's 256). The identity-store
+            # gate is shared with the T1/T3/T5 seeds; the shape gate
+            # below pins it to T7 so a T1/T3/T5 host function does not
+            # get a T7 admission and vice versa.
+            target7_envelope_ok = (
+                (m_size, n_size, k_total_size) == (2048, 8192, 2048)
+                and bk == TCGEN05_TARGET7_TVM_FFI_BLOCK_K
+                and (tcgen05_ab_stage_count_value, tcgen05_c_stage_count_value)
+                == (TCGEN05_TARGET7_TVM_FFI_AB_STAGES, TCGEN05_TARGET7_TVM_FFI_C_STAGES)
+                and acc_expr is None
+                and identity_store_dtype == input_dtype
+            )
+            common_ok = (
                 tcgen05_use_flat_role_coordinates
                 and TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY in df.config
                 and df.config.get(TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY) is True
-                and (m_size, n_size, k_total_size) == (1024, 4096, 1024)
-                and (tcgen05_ab_stage_count_value, tcgen05_c_stage_count_value)
-                in ((3, 2), (6, 4))
                 and tcgen05_acc_stage_count_value == 2
-                and acc_expr is None
-                and identity_store_dtype == input_dtype
-            ):
-                requested_key = (
-                    TCGEN05_PURE_CLC_SCHEDULER_OBJECT_CONFIG_KEY
-                    if tcgen05_use_pure_clc_scheduler_object
-                    else TCGEN05_DIRECT_ENTRY_PLAN_CONFIG_KEY
+            )
+            if tcgen05_use_pure_clc_scheduler_object:
+                pure_clc_ok = common_ok and target1_envelope_ok
+                if not pure_clc_ok:
+                    raise exc.BackendUnsupported(
+                        "cute",
+                        f"{TCGEN05_PURE_CLC_SCHEDULER_OBJECT_CONFIG_KEY}=True "
+                        "requires the validated T1 identity-store "
+                        "TVM-FFI flat-role seed (pure-CLC scheduler "
+                        "object is not validated for T2 bias-store, "
+                        "T3 identity-store, T4 relu-store, T5 "
+                        "identity-store, T6 bias-relu-store, or T7 "
+                        "identity-store)",
+                    )
+            if tcgen05_use_direct_entry_plan:
+                direct_entry_ok = common_ok and (
+                    target1_envelope_ok
+                    or target4_envelope_ok
+                    or target5_envelope_ok
+                    or target3_envelope_ok
+                    or target2_envelope_ok
+                    or target6_envelope_ok
+                    or target7_envelope_ok
                 )
-                raise exc.BackendUnsupported(
-                    "cute",
-                    f"{requested_key}=True requires "
-                    "the validated Target1 AB3 TVM-FFI flat-role identity-store seed",
-                )
+                if not direct_entry_ok:
+                    raise exc.BackendUnsupported(
+                        "cute",
+                        f"{TCGEN05_DIRECT_ENTRY_PLAN_CONFIG_KEY}=True "
+                        "requires the validated T1 identity-store, T2 "
+                        "bias-store, T3 identity-store, T4 relu-store, "
+                        "T5 identity-store, T6 bias-relu-store, or T7 "
+                        "identity-store TVM-FFI flat-role seed",
+                    )
         tcgen05_scheduler_warp_count_for_plan = (
             1
             if tcgen05_use_pure_clc_scheduler_object
@@ -4006,6 +4469,15 @@ def _emit_mma_pipeline(
                 "ab_stage_count": tcgen05_ab_stage_count_value,
                 "input_dtype": input_dtype_str,
                 "acc_dtype": acc_dtype_str,
+                # B1 (cycle-3 review): plumb the validated problem
+                # shape onto the AB plan so the direct-entry plan can
+                # carry an envelope identity that the runtime
+                # validator dispatches on. T4 and T5 share ``bk=128``,
+                # so the bk-keyed shape-set alone cannot distinguish
+                # a T4 plan from a T5 plan when both are admitted.
+                "m_size": m_size,
+                "n_size": n_size,
+                "k_total_size": k_total_size,
                 "kernel_args": [tma_atom_a, tma_tensor_a, tma_atom_b, tma_tensor_b],
             }
             # ``smem_swizzle_*`` overrides are recorded only when codegen

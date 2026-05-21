@@ -5,16 +5,35 @@ from typing import Any
 
 from .strategies import tcgen05_explicit_d_store_tile_expr
 from .strategies import tcgen05_smem_layout_expr
+from .tcgen05_constants import TCGEN05_DIRECT_ENTRY_STAGE_TUPLES_BY_BK
+from .tcgen05_constants import tcgen05_direct_entry_stage_tuple_allowed
+
+__all__ = [
+    "TCGEN05_DIRECT_ENTRY_STAGE_TUPLES_BY_BK",
+    "Tcgen05DirectEntryPlan",
+    "build_target1_direct_entry_source",
+    "tcgen05_direct_entry_stage_tuple_allowed",
+]
 
 
 @dataclasses.dataclass(frozen=True)
 class Tcgen05DirectEntryPlan:
-    """Metadata for the exact Target1 direct CuTe entrypoint.
+    """Metadata for the generated direct CuTe entrypoint.
 
-    The generated module can consume this plan to emit a tensor-entry function
+    The generated module consumes this plan to emit a tensor-entry function
     that builds A/B/D TMA descriptors in generated source. The current direct
     entry still launches the generated kernel body, while non-target kernels
-    keep the scalarized wrapper fallback.
+    keep the scalarized wrapper fallback. Target 1, Target 3, Target 4, and
+    Target 5 are admitted with the (lhs, rhs, output) 3-tensor signature;
+    Target 2 adds an optional 4th tensor — the rank-1 trailing-axis bias —
+    via ``bias_name``. Other shapes/envelopes fall back to the runtime
+    descriptor path.
+
+    ``bias_name`` is ``None`` for the pure-matmul, identity-store, and
+    relu-epilogue envelopes (T1/T3/T4/T5); for T2 it is the FX-arg name
+    of the closure-lifted bias tensor, resolved to a positional
+    ``bias_idx`` by ``resolve_cute_plan_arg_positions`` (same path
+    ``lhs_name``/``rhs_name``/``d_name`` take).
     """
 
     lhs_name: str
@@ -33,9 +52,22 @@ class Tcgen05DirectEntryPlan:
     tma_store_tensor: str
     ab_kernel_args: tuple[str, str, str, str]
     d_kernel_args: tuple[str, str]
+    # B1 (cycle-3 review): the validated matmul problem shape baked
+    # into this plan. The runtime validator compares the actual
+    # tensor shapes against this triple so a T4-plan with T5-shaped
+    # tensors (or vice versa) is rejected even though they share
+    # ``bk=128`` and the same ``(ab,c)`` stage tuple.
+    validated_shape: tuple[int, int, int]
+    # Optional bias tensor name for T2's ``acc + bias[n]`` epilogue.
+    # ``None`` for T1/T3/T4/T5 (no extra rank-1 GMEM tensor in the
+    # direct-entry signature). When non-``None``,
+    # ``resolve_cute_plan_arg_positions`` turns it into a ``bias_idx``
+    # the runtime validator uses to admit the 4th tensor arg and the
+    # source builder uses to thread the bias through to the kernel.
+    bias_name: str | None = None
 
     def to_codegen_plan(self) -> dict[str, Any]:
-        return {
+        plan: dict[str, Any] = {
             "kind": "tcgen05_target1_direct_entry",
             "lhs_name": self.lhs_name,
             "rhs_name": self.rhs_name,
@@ -53,7 +85,11 @@ class Tcgen05DirectEntryPlan:
             "tma_store_tensor": self.tma_store_tensor,
             "ab_kernel_args": list(self.ab_kernel_args),
             "d_kernel_args": list(self.d_kernel_args),
+            "validated_shape": list(self.validated_shape),
         }
+        if self.bias_name is not None:
+            plan["bias_name"] = self.bias_name
+        return plan
 
 
 def _plan_int(plan: dict[str, object], key: str) -> int:
@@ -82,10 +118,27 @@ def _append_target1_ab_tma_descriptor_source(
     cluster_m = _plan_int(plan, "cluster_m")
     cluster_n = _plan_int(plan, "cluster_n")
     ab_stage_count = _plan_int(plan, "ab_stage_count")
+    c_stage_count = (
+        _plan_int(plan, "c_stage_count") if "c_stage_count" in plan else None
+    )
     input_dtype = str(plan["input_dtype"])
     acc_dtype = str(plan["acc_dtype"])
     assert cluster_m == 2 and cluster_n == 1
-    assert bm == 256 and bn == 256 and bk == 64 and ab_stage_count in (3, 6)
+    assert bm == 256 and bn == 256
+    assert bk in TCGEN05_DIRECT_ENTRY_STAGE_TUPLES_BY_BK, (
+        f"unsupported bk={bk} for tcgen05 direct entry"
+    )
+    # ``c_stage_count`` is plumbed onto the AB plan by the codegen for
+    # cross-checking with the D plan's stage tuple, but the AB descriptor
+    # itself only needs ``ab_stage_count``. Defer the (ab,c) gate to the
+    # D-descriptor caller when ``c_stage_count`` is absent.
+    if c_stage_count is not None:
+        assert tcgen05_direct_entry_stage_tuple_allowed(
+            bk=bk, ab_stage_count=ab_stage_count, c_stage_count=c_stage_count
+        ), (
+            "unsupported (ab_stage_count, c_stage_count) for tcgen05 direct entry: "
+            f"bk={bk}, (ab,c)=({ab_stage_count},{c_stage_count})"
+        )
     assert input_dtype == "cutlass.BFloat16"
     assert acc_dtype == "cutlass.Float32"
     if "smem_swizzle_a" in plan or "smem_swizzle_b" in plan:
@@ -180,7 +233,9 @@ def _append_target1_d_tma_descriptor_source(
     output_dtype = str(plan["output_dtype"])
     assert bm == 256 and bn == 256 and c_stage_count in (2, 4)
     assert (epi_tile_m, epi_tile_n, d_store_box_n) == (128, 32, 32)
-    assert output_dtype == "cutlass.BFloat16"
+    assert output_dtype == "cutlass.BFloat16", (
+        f"tcgen05 direct entry requires bf16 output, got {output_dtype}"
+    )
     tma_atom, tma_tensor = _plan_kernel_args(plan, 2)
     epi_tile = f"{tma_atom}_epi_tile"
     smem_layout = f"{tma_atom}_smem_layout"
@@ -217,13 +272,28 @@ def build_target1_direct_entry_source(
     direct_plan: dict[str, object],
     wrapper_plans: list[dict[str, object]],
 ) -> str:
-    """Build a generated Target1 tensor-entry source function.
+    """Build a generated tensor-entry source function for the fast launch path.
 
     This direct entry is compiler-emitted into the generated module instead of
-    assembled dynamically by ``helion.runtime``. It still launches the generated
-    CuTe kernel body, but descriptor construction now lives in generated code
-    beside that body and the runtime direct-entry fallback is no longer needed
-    for the validated Target1 path.
+    assembled dynamically by ``helion.runtime``. It bakes the x-linear
+    ``grid=(128, 1, 1)`` launch into the generated source — that grid is
+    only chosen by the runtime dispatch in ``runtime/__init__.py`` for the
+    Target 1 envelope, where the clustered grid is ``(2, 1, 64)`` =
+    128 work clusters total. The runtime dispatch checks ``grid !=
+    (128, 1, 1)`` and skips this compiler-emitted entry for any other
+    launch shape — including Target 4, whose runtime grid is
+    ``(2, 1, 74)`` (128 work clusters capped by ``num_sms // cluster_m
+    = 74`` on B200). Target 4 therefore takes the runtime-built direct
+    entry (``_create_cute_direct_entry``) instead, which threads the
+    actual runtime grid/block through the TVM-FFI launch.
+
+    The function still admits Target 4 stage/dtype combinations so the
+    wrapper-plan / direct-entry-plan assertions stay self-consistent
+    with the rest of the cycle-2 generalization; the function is just
+    dead at runtime for T4. Emission of this source is gated to
+    ``bk == 64`` in ``generate_ast.py`` so we do not pay the codegen
+    cost for the T4 case where the compiler-emitted entry would be
+    unused.
     """
 
     if direct_plan.get("kind") != "tcgen05_target1_direct_entry":
@@ -232,36 +302,42 @@ def build_target1_direct_entry_source(
         "tcgen05_ab_tma",
         "tcgen05_d_tma",
     ]:
-        raise AssertionError("Target1 direct entry requires A/B then D wrapper plans")
-    if (
-        _plan_int(direct_plan, "lhs_idx"),
-        _plan_int(direct_plan, "rhs_idx"),
-        _plan_int(direct_plan, "d_idx"),
-        _plan_int(direct_plan, "bm"),
-        _plan_int(direct_plan, "bn"),
-        _plan_int(direct_plan, "bk"),
-        _plan_int(direct_plan, "cluster_m"),
-        _plan_int(direct_plan, "cluster_n"),
-        _plan_int(direct_plan, "ab_stage_count"),
-        _plan_int(direct_plan, "c_stage_count"),
-    ) not in (
-        (0, 1, 2, 256, 256, 64, 2, 1, 3, 2),
-        (0, 1, 2, 256, 256, 64, 2, 1, 6, 4),
+        raise AssertionError("tcgen05 direct entry requires A/B then D wrapper plans")
+    lhs_idx = _plan_int(direct_plan, "lhs_idx")
+    rhs_idx = _plan_int(direct_plan, "rhs_idx")
+    d_idx = _plan_int(direct_plan, "d_idx")
+    bm = _plan_int(direct_plan, "bm")
+    bn = _plan_int(direct_plan, "bn")
+    bk = _plan_int(direct_plan, "bk")
+    cluster_m = _plan_int(direct_plan, "cluster_m")
+    cluster_n = _plan_int(direct_plan, "cluster_n")
+    ab_stage_count = _plan_int(direct_plan, "ab_stage_count")
+    c_stage_count = _plan_int(direct_plan, "c_stage_count")
+    if (lhs_idx, rhs_idx, d_idx) != (0, 1, 2):
+        raise AssertionError(
+            "tcgen05 direct entry currently supports exactly lhs/rhs/output args"
+        )
+    if (bm, bn, cluster_m, cluster_n) != (256, 256, 2, 1):
+        raise AssertionError(
+            "tcgen05 direct entry requires the validated bm=bn=256 "
+            "cluster_m=2 cluster_n=1 envelope"
+        )
+    if not tcgen05_direct_entry_stage_tuple_allowed(
+        bk=bk, ab_stage_count=ab_stage_count, c_stage_count=c_stage_count
     ):
-        raise AssertionError("Target1 direct entry plan does not match stage envelope")
-    if _plan_int(wrapper_plans[0], "ab_stage_count") != _plan_int(
-        direct_plan, "ab_stage_count"
-    ):
-        raise AssertionError("Target1 direct entry A/B wrapper stages are stale")
-    if _plan_int(wrapper_plans[1], "c_stage_count") != _plan_int(
-        direct_plan, "c_stage_count"
-    ):
-        raise AssertionError("Target1 direct entry D wrapper stages are stale")
+        raise AssertionError(
+            "tcgen05 direct entry plan does not match accepted "
+            f"(bk, ab, c) envelope: ({bk},{ab_stage_count},{c_stage_count})"
+        )
+    if _plan_int(wrapper_plans[0], "ab_stage_count") != ab_stage_count:
+        raise AssertionError("tcgen05 direct entry A/B wrapper stages are stale")
+    if _plan_int(wrapper_plans[1], "c_stage_count") != c_stage_count:
+        raise AssertionError("tcgen05 direct entry D wrapper stages are stale")
     if (
         direct_plan.get("input_dtype") != "cutlass.BFloat16"
         or direct_plan.get("output_dtype") != "cutlass.BFloat16"
     ):
-        raise AssertionError("Target1 direct entry requires bf16 input/output")
+        raise AssertionError("tcgen05 direct entry requires bf16 input/output")
     body: list[str] = []
     for index in (0, 1, 2):
         body.extend(
@@ -273,7 +349,11 @@ def build_target1_direct_entry_source(
             )
         )
     call_args = ["arg0", "arg1", "arg2"]
-    _append_target1_ab_tma_descriptor_source(body, call_args, wrapper_plans[0])
+    # Forward ``c_stage_count`` to the A/B descriptor helper so it can
+    # cross-check the (ab,c) tuple against the bk-keyed accept set.
+    ab_plan_with_c = dict(wrapper_plans[0])
+    ab_plan_with_c.setdefault("c_stage_count", c_stage_count)
+    _append_target1_ab_tma_descriptor_source(body, call_args, ab_plan_with_c)
     _append_target1_d_tma_descriptor_source(body, call_args, wrapper_plans[1])
     launch_args = ["grid=(128, 1, 1)", "block=(256, 1, 1)", "cluster=[2, 1, 1]"]
     if any(plan.get("use_pdl") for plan in wrapper_plans):

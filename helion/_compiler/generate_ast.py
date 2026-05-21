@@ -924,11 +924,52 @@ def generate_ast(
                 resolved_plans: list[dict[str, object]] = []
                 for plan in plans:
                     resolved = dict(plan)
-                    for key in ("lhs_name", "rhs_name", "c_name", "d_name"):
+                    # T2's bias tensor is plumbed via ``bias_name``
+                    # alongside the lhs/rhs/c/d names; the
+                    # ``key[:-5] + "_idx"`` substring rewrite turns each
+                    # one into a positional index resolved against the
+                    # device function's sorted-arg ordering so the
+                    # runtime validator and the direct-entry source
+                    # builder can identify the 4th tensor arg.
+                    for key in (
+                        "lhs_name",
+                        "rhs_name",
+                        "c_name",
+                        "d_name",
+                        "bias_name",
+                    ):
                         if key in resolved:
                             resolved[key[:-5] + "_idx"] = launcher_arg_positions[
                                 str(resolved.pop(key))
                             ]
+                    # P1: pin the T2 direct-entry ABI ordering at codegen
+                    # time. The runtime validator and the runtime-built
+                    # source builder both assume the resolved indices are
+                    # ``(0, 1, 2)`` for T1/T3/T4/T5 and ``(0, 1, 2, 3)``
+                    # for T2 (lhs, rhs, output, bias). If the device
+                    # function's sorted-arg ordering ever produces a
+                    # different layout (e.g. ``bias_idx=2, d_idx=3``),
+                    # this assertion fires at codegen instead of at
+                    # launch where the wrappers would already have been
+                    # emitted against the wrong ordering.
+                    if resolved.get("kind") == "tcgen05_target1_direct_entry":
+                        plan_indices = (
+                            resolved.get("lhs_idx"),
+                            resolved.get("rhs_idx"),
+                            resolved.get("d_idx"),
+                        )
+                        bias_idx = resolved.get("bias_idx")
+                        if bias_idx is not None:
+                            plan_indices = (*plan_indices, bias_idx)
+                            expected_indices: tuple[int, ...] = (0, 1, 2, 3)
+                        else:
+                            expected_indices = (0, 1, 2)
+                        assert plan_indices == expected_indices, (
+                            "tcgen05 direct entry requires "
+                            f"(lhs/rhs/output{'/bias' if bias_idx is not None else ''}) "
+                            f"= {expected_indices}, got {plan_indices} "
+                            f"(launcher_arg_positions={launcher_arg_positions})"
+                        )
                     resolved_plans.append(resolved)
                 return resolved_plans
 
@@ -962,7 +1003,25 @@ def generate_ast(
                     ),
                     *final_host_statements,
                 ]
-            if resolved_direct_entry_plans and resolved_wrapper_plans:
+            # A3 (cycle-2 review): the compiler-emitted direct-entry
+            # source bakes an x-linear ``grid=(128, 1, 1)`` launch that
+            # only matches the Target 1 runtime grid. The runtime
+            # dispatch in ``helion/runtime/__init__.py`` skips it for
+            # any other grid (e.g. Target 4's ``(2, 1, 74)``), so
+            # emitting it for ``bk != 64`` produces dead code. Gate
+            # emission on the validated T1 ``bk=64`` envelope; T4 and
+            # other validated direct-entry shapes fall back to the
+            # runtime-built direct entry (``_create_cute_direct_entry``).
+            direct_entry_bk = (
+                resolved_direct_entry_plans[0].get("bk")
+                if resolved_direct_entry_plans
+                else None
+            )
+            if (
+                resolved_direct_entry_plans
+                and resolved_wrapper_plans
+                and direct_entry_bk == 64
+            ):
                 generated_direct_entry_name = (
                     f"{codegen.device_function.name}_direct_entry"
                 )

@@ -40,6 +40,7 @@ from .._compiler.cute.tcgen05_constants import TCGEN05_C_STORE_MODE_CONFIG_KEY
 from .._compiler.cute.tcgen05_constants import TCGEN05_C_STORE_MODE_NORMAL
 from .._compiler.cute.tcgen05_constants import TCGEN05_C_STORE_MODE_SKIP_EPILOGUE_STORE
 from .._compiler.cute.tcgen05_constants import TCGEN05_DIRECT_ENTRY_PLAN_CONFIG_KEY
+from .._compiler.cute.tcgen05_constants import TCGEN05_DIRECT_ENTRY_STAGE_TUPLES_BY_BK
 from .._compiler.cute.tcgen05_constants import TCGEN05_EPILOGUE_LAYOUT_CONFIG_KEY
 from .._compiler.cute.tcgen05_constants import (
     TCGEN05_EPILOGUE_LAYOUT_MODULE_HELPER_ACC_T2R,
@@ -2717,6 +2718,17 @@ def _codegen_cute_store_tcgen05_tile(
                     "exactly one tcgen05 A/B TMA wrapper plan",
                 )
             ab_tma_plan = ab_tma_plans[0]
+            # A1 (cycle-2 review): the stage tuple is keyed on the
+            # plan's ``bk`` so a cross-mismatch (e.g. (3, 2) at bk=64
+            # vs at bk=128) is rejected here at codegen instead of at
+            # the runtime validator. The bk-keyed accept set lives in
+            # ``tcgen05_constants.py`` so codegen and runtime never
+            # drift.
+            ab_plan_bk = ab_tma_plan.get("bk")
+            ab_plan_stage_tuple = (
+                ab_tma_plan.get("ab_stage_count"),
+                tcgen05_value.c_stage_count,
+            )
             if not (
                 tcgen05_value.has_explicit_epilogue_tile
                 and tcgen05_value.explicit_epi_tile_m == 128
@@ -2726,16 +2738,14 @@ def _codegen_cute_store_tcgen05_tile(
                 and ab_tma_plan.get("bn") == tcgen05_value.bn
                 and ab_tma_plan.get("cluster_m") == 2
                 and ab_tma_plan.get("cluster_n") == 1
-                and (
-                    ab_tma_plan.get("ab_stage_count"),
-                    tcgen05_value.c_stage_count,
-                )
-                in ((3, 2), (6, 4))
+                and isinstance(ab_plan_bk, int)
+                and ab_plan_stage_tuple
+                in TCGEN05_DIRECT_ENTRY_STAGE_TUPLES_BY_BK.get(ab_plan_bk, ())
             ):
                 raise exc.BackendUnsupported(
                     "cute",
                     f"{TCGEN05_DIRECT_ENTRY_PLAN_CONFIG_KEY}=True requires "
-                    "the validated Target1 A/B/D TMA fact envelope",
+                    "the validated T1/T4 A/B/D TMA fact envelope",
                 )
             ab_kernel_args = tuple(
                 str(v) for v in cast("list[object]", ab_tma_plan["kernel_args"])
@@ -2751,6 +2761,35 @@ def _codegen_cute_store_tcgen05_tile(
             assert isinstance(ab_cluster_m, int)
             assert isinstance(ab_cluster_n, int)
             assert isinstance(ab_stage_count, int)
+            # B1 (cycle-3 review): the AB TMA plan carries the
+            # validated problem shape so the direct-entry plan can
+            # record it and the runtime validator can dispatch on
+            # the exact shape envelope (T4 and T5 share ``bk=128``
+            # so the bk-keyed shape-set alone is ambiguous).
+            ab_m_size = ab_tma_plan["m_size"]
+            ab_n_size = ab_tma_plan["n_size"]
+            ab_k_total_size = ab_tma_plan["k_total_size"]
+            assert isinstance(ab_m_size, int)
+            assert isinstance(ab_n_size, int)
+            assert isinstance(ab_k_total_size, int)
+            # T2's direct entry needs to thread the rank-1 trailing-axis
+            # bias tensor through the kernel call. The bias is the only
+            # rank-1 ``_AuxiliaryTensorStep`` in the epilogue chain at T2;
+            # T1/T3/T5 (identity) and T4 (relu) have no aux step. The
+            # codegen-side ``_codegen_cute_store_tcgen05_tile`` already
+            # registers the bias tensor as a kernel arg via
+            # ``placeholder_args``; we just need to record its FX name
+            # so ``resolve_cute_plan_arg_positions`` can turn it into a
+            # positional ``bias_idx`` for the runtime validator and the
+            # direct-entry source builder.
+            bias_name: str | None = None
+            rowvec_aux_records = [
+                rec for rec in aux_step_records if rec.broadcast_axis == 1
+            ]
+            if len(rowvec_aux_records) == 1 and not [
+                rec for rec in aux_step_records if rec.broadcast_axis is None
+            ]:
+                bias_name = rowvec_aux_records[0].aux_tensor_name
             state.codegen.cute_direct_entry_plans.append(
                 Tcgen05DirectEntryPlan(
                     lhs_name=str(ab_tma_plan["lhs_name"]),
@@ -2769,6 +2808,8 @@ def _codegen_cute_store_tcgen05_tile(
                     tma_store_tensor=tcgen05_value.tma_store_tensor,
                     ab_kernel_args=ab_kernel_args,
                     d_kernel_args=d_kernel_args,
+                    validated_shape=(ab_m_size, ab_n_size, ab_k_total_size),
+                    bias_name=bias_name,
                 ).to_codegen_plan()
             )
 
