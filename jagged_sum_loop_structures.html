@@ -750,116 +750,134 @@
 </div>
 
 
-<!-- ===================== Inherited building blocks ===================== -->
-<!-- Identified during line-by-line walkthrough of RPA v3 kernel.       -->
-<!-- These are the primitives the distilled design above is assembled   -->
-<!-- from. Shows the lowering is mostly composition of proven blocks,   -->
-<!-- not net-new design.                                                 -->
+<!-- ===================== Helion integration ===================== -->
+<!-- How the design above plugs into Helion. Two viable paths;       -->
+<!-- the detection trigger and launcher infrastructure are common.   -->
 
-<div class="strat-panel">
-  <div class="strat-title">Inherited building blocks (the distilled design above is their assembly)</div>
-  <div class="strat-subtitle">
-    Reusable implementation primitives from
-    <code>tpu-inference/.../ragged_paged_attention/v3/kernel.py</code>
-    that map 1:1 to the data-movement and accumulation scaffolding the
-    design needs. Identified from line-by-line walkthrough; each is
-    production-tested in RPA.
+<h2 style="font-size:16px; margin:28px 0 8px 0;">Helion integration — two viable paths</h2>
+<p style="font-size:12.5px; color:#3c4043; margin:0 0 14px 0;">
+  Detection is the same for both: a <code>hl.tile(num_rows)</code>
+  is "jagged" iff some <code>hl.jagged_tile(nnz)</code> in the same
+  Helion source references its block id. That check is a small AST or
+  IR pass — ~5-10 lines.
+  Helion's existing
+  <code>default_pallas_fori_launcher</code> in
+  <code>helion/runtime/__init__.py</code> already wires VMEM scratch,
+  DMA semaphores, SMEM routing (via <code>_smem_arg_indices</code>),
+  and <code>PrefetchScalarGridSpec</code> — the launcher half of the
+  path is built. The remaining difference between the two paths is
+  <i>where the kernel body comes from</i>.
+</p>
+
+<div class="pros-cons">
+  <div class="option-card">
+    <span class="tag tag-compiler">Path (a) — Helion-native codegen</span>
+    <h3>Teach Helion's Pallas codegen to emit the N6-N8 orchestration on jagged-detected tiles</h3>
+    <p>
+      Codegen learns: "when a <code>hl.tile</code> is referenced by
+      <code>hl.jagged_tile</code>, emit the per-seq <code>pl.loop</code>
+      body with N6 per-buffer SMEM payload bookkeeping, N7 SMEM
+      ping-pong rotation, N8 seq-boundary init/flush guards, and the
+      prologue/pipeline/epilogue shell — instead of today's standard
+      fori body."
+    </p>
+    <p>
+      <b>Pros:</b> kernel comes from Helion source verbatim; the
+      user-written compute body (the inner reduce, mean, layer-norm,
+      etc.) drops directly into the COMPUTE-SLOT inside
+      <code>compute_with_bx</code>; the autotuner sweeps
+      <code>bx_sz</code> end-to-end. Generalizes immediately to any
+      reduction kind because the scaffold is reduction-agnostic.
+    </p>
+    <p>
+      <b>Cons:</b> significant codegen work. Teach the emitter:
+      double-buffered DMA pattern, SMEM bookkeeping protocols (N6 +
+      N7), prologue/pipeline/epilogue split (N8), the
+      <code>@pl.when</code> seq-boundary guards, and the
+      <code>_async_copy</code>/<code>_fetch_*</code>/<code>_send_*</code>
+      helper structure. Several hundred lines of new codegen logic; needs
+      careful testing across jagged_sum / jagged_mean / etc. to confirm
+      the parameterization holds.
+    </p>
   </div>
 
-  <ul style="font-size: 12.5px; line-height: 1.6; margin: 0; padding-left: 22px;">
-    <li><b>Online accumulator update pattern.</b> RPA reads previous
-        VMEM-scratch state, combines with the new block's contribution,
-        writes back. RPA's flavour is FlashAttention's online softmax with
-        running <code>(m_prev, l_prev)</code> stats and rescale-by-<code>exp(m_prev − m_curr)</code>.
-        For jagged_sum it collapses to <code>acc_ref[...] += block_sum</code>
-        on an fp32 scratch buffer, initialized at each new sequence and
-        flushed at sequence end. <b>Same machinery, simpler math.</b></li>
-
-    <li><b><code>_async_copy(src, dst, sem, wait)</code> helper.</b>
-        9-line wrapper around <code>pltpu.make_async_copy</code> that takes
-        a <code>wait</code> flag. Callers write <code>start_fetch_*(...)</code>
-        (wait=False) and <code>wait_fetch_*(...)</code> (wait=True) as thin
-        one-liners. <b>Reuse verbatim.</b></li>
-
-    <li><b>Degenerate-copy semaphore wait.</b>
-        <code>_async_copy(src=dst, dst=dst, sem, wait=True)</code> waits on
-        a prior DMA's semaphore when the original copy object isn't in
-        scope (start and wait live in different closures). Hardware sees
-        the semaphore in flight and waits; the redundant self-copy is
-        collapsed because src and dst alias. <b>Canonical Pallas idiom.</b></li>
-
-    <li><b>Re-derive seq quantities inside fetch/send closures.</b>
-        Closures take <code>seq_idx</code> as a parameter and call
-        <code>_derive_iter_quantities</code> locally rather than capturing
-        seq bounds from the outer scope. Required because the closures are
-        invoked with <i>different</i> seq_idx values — current sequence
-        AND a look-ahead "next sequence to prefetch." Capturing would pin
-        the closure to the outer call's seq_idx and break double-buffered
-        prefetch.</li>
-
-    <li><b><code>broadcast_minor(scalar, shape)</code> helper.</b>
-        Broadcasts a per-row scalar across the lane (M) dim for elementwise
-        ops. Used by RPA for <code>exp(s − m_curr)</code> in softmax. For
-        jagged_sum not strictly needed (plain vector add). For jagged_mean,
-        used to broadcast the per-row divisor <code>n<sub>i</sub></code>
-        across M lanes for the final divide. <b>Lift when we extend beyond
-        plain sum.</b></li>
-
-    <li><b>Per-buffer SMEM bookkeeping for split start/wait.</b> Ping-pong
-        VMEM buffers don't carry metadata; the "what work is this buffer
-        currently holding" record lives in a tiny SMEM scratch (RPA:
-        <code>bo_ids_ref[2 × num_buffers]</code> recording <code>(seq_idx,
-        block_idx)</code> per buffer). When <code>start_send_*</code> is
-        called it writes the record; when <code>wait_send_*</code> is
-        called with only the buffer index, it reads the record back to
-        know what to wait on. A <code>@pl.when(...)</code> guard skips
-        the wait at cold start (buffer not yet used) and after a prior
-        wait disarms the guard (RPA's "set size = 0 after wait" trick).
-        For jagged_sum: <code>bo_ids_ref</code> with one
-        <code>seq_idx</code> per buffer (2 entries for double buffering)
-        is enough — the block dim is implicit because output is one row
-        per seq.</li>
-
-    <li><b>SMEM-coordinated ping-pong rotation.</b> Distinct from N6
-        (which records per-buffer <i>payload</i>) — this is about which
-        buffer slot is current. Each fetch type (bq, bkv, bo in RPA;
-        bx and bo for us) gets one i32 slot in <code>sem_ids_ref</code>
-        recording the current ping-pong index. Each iteration:
-        (a) reads the current index from SMEM at the top
-        (<code>bq_sem_idx = sem_ids_ref[0]</code>);
-        (b) computes the flipped next index via the
-        <code>get_next_*_ids</code> helper
-        (<code>next_bq_sem_idx = lax.select(bq_sem_idx == 0, 1, 0)</code>);
-        (c) when prefetching, writes the flipped index to SMEM AND starts
-        the fetch (order within the iter doesn't matter — both must
-        happen before the next iter starts);
-        (d) uses the un-flipped index for the current iter's wait and
-        compute. The next iteration inherits the flipped value through
-        SMEM, with no need to pass any state through the
-        <code>@pl.loop</code> body closure. Canonical Pallas ping-pong
-        rotation idiom.</li>
-
-    <li><b>Seq-boundary acc-init and bo-flush (vs RPA's per-bq-block).</b>
-        Structural difference, not a reusable RPA mechanism — but
-        important to call out because it determines where guards go in our
-        analog of <code>compute_with_bq</code>. In RPA, each bq block
-        produces its own output rows, so
-        <code>acc_ref[...] = 0</code> happens at the START of every bq
-        iteration (line 1301) and <code>start_send_bo(...)</code> fires
-        at the END of every bq iteration (line 1457). In
-        <b>jagged_sum, all bx blocks of one sequence accumulate into the
-        SAME one-row output</b>, so the acc init must move to the FIRST
-        bx of each seq and the bo flush must move to the LAST bx of each
-        seq. Implementation:
-        <code>@pl.when(bx_idx == 0) def init_acc(): acc_ref[...] = 0</code>
-        and
-        <code>@pl.when(bx_idx == num_bx − 1) def flush_bo(): ... start_send_bo(...)</code>.
-        Same machinery as RPA's epilogue; different guard predicates.
-        Per-iter behavior of the output-side DMA also differs: RPA fires
-        one DMA per bq block (output is jagged like input); jagged_sum
-        fires one DMA per seq (output is dense, B rows).</li>
-  </ul>
+  <div class="option-card">
+    <span class="tag tag-src">Path (b) — Template-call</span>
+    <h3>Detect → emit a call to a hand-written parameterized template</h3>
+    <p>
+      Helion compiler does the detection, then emits a call into a
+      pre-written kernel template (one per reduction family —
+      <code>jagged_sum</code>, <code>jagged_mean</code>, etc.) with the
+      right parameters: input/output tensors, <code>cu_x_lens</code>,
+      <code>bx_sz</code> (from autotuner), reduction-kind enum.
+    </p>
+    <p>
+      <b>Pros:</b> small Helion change — detect + parameterize. The
+      template is the already-written <code>kernel.py</code>, validated
+      and minimal. Faster to ship; each new reduction kind is a small
+      addition (copy the template, change the inner reduce body — ~5
+      lines). The template can also live as a maintained reference
+      against which auto-generated code from path (a) is later
+      validated.
+    </p>
+    <p>
+      <b>Cons:</b> less "compiler-y" — kernel body lives outside
+      Helion source. Per-reduction-type templates need to be
+      maintained as a small family rather than synthesized. The
+      autotuner sees only <code>bx_sz</code> (and any other knobs
+      explicitly exposed by the template), not the inner reduce
+      structure.
+    </p>
+  </div>
 </div>
 
+<h3 style="font-size:14px; margin:18px 0 6px 0;">Common pieces both paths need</h3>
+<ul style="font-size:12.5px; line-height:1.55; margin:0; padding-left:22px;">
+  <li><b>Detection</b>: scan Helion source for
+      <code>hl.jagged_tile(nnz)</code> where <code>nnz</code> derives
+      from a <code>hl.tile</code>'s block_id; that <code>hl.tile</code>
+      is the "jagged outer." Same logic for both paths.</li>
+  <li><b><code>num_scalar_prefetch</code> &gt; 0</b>: currently
+      hard-coded to <code>0</code> in
+      <code>default_pallas_fori_launcher</code> (line 1309) and
+      <code>default_pallas_pipeline_launcher</code> (line 1131). Needs to
+      be made dynamic so <code>cu_x_lens</code> (and any future
+      Strategy-3-style host-preprocessed arrays) can flow through SMEM.</li>
+  <li><b>Routing offsets to SMEM</b>: Helion already routes
+      scalar-only-accessed tensors to SMEM via
+      <code>_smem_arg_indices</code> (see
+      <code>helion/_compiler/pallas/plan_tiling.py:161</code>). Our
+      <code>cu_x_lens</code> is accessed scalar-only inside
+      <code>_derive_iter_quantities</code>, so this should auto-route
+      with no compiler change.</li>
+  <li><b>Output sizing</b>: Helion needs to know the output shape is
+      <code>(B, M)</code> — one row per seq — not
+      <code>(L, M)</code>. Falls out naturally from the source
+      kernel's <code>out[tile_b, tile_m] = ...</code> writeback
+      pattern.</li>
+</ul>
+
+<h3 style="font-size:14px; margin:18px 0 6px 0;">Recommended sequencing</h3>
+<p style="font-size:12.5px; color:#3c4043; margin:0 0 10px 0;">
+  Start with <b>Path (b)</b> to ship <code>jagged_sum</code> on TPU
+  end-to-end. Two PRs:
+</p>
+<ol style="font-size:12.5px; line-height:1.55; margin:0; padding-left:22px;">
+  <li>Helion compiler change: detect
+      <code>hl.jagged_tile</code>-referencing <code>hl.tile</code>; on
+      Pallas backend, route the lowering to a new
+      <i>ragged-fori</i> emitter that calls the template with the
+      reduce-kind picked from the source's inner expression. Make
+      <code>num_scalar_prefetch</code> dynamic in the launcher path.</li>
+  <li>Land the template (this design's <code>kernel.py</code> in
+      <code>helion/_compiler/pallas/templates/</code> or similar) and
+      add a per-kind switch for the inner reduce body.</li>
+</ol>
+<p style="font-size:12.5px; color:#3c4043; margin:10px 0 0 0;">
+  Then, once <code>jagged_sum</code> works end-to-end, evaluate
+  whether to graduate to <b>Path (a)</b> for the general case —
+  particularly worth it once we have 3+ reduction families to support
+  and the template-per-kind cost starts to add up.
+</p>
 </body>
 </html>
