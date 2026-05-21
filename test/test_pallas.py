@@ -5,6 +5,8 @@ from typing import Callable
 import unittest
 
 import torch
+from torch.testing._internal.common_utils import instantiate_parametrized_tests
+from torch.testing._internal.common_utils import parametrize
 
 import helion
 from helion._testing import DEVICE
@@ -2778,8 +2780,8 @@ class TestPallas(TestCase):
 @skipUnlessPallas("JAX/Pallas TPU not available")
 class TestPallasIndirectGather(TestCase):
     @staticmethod
-    def _gather_2d_kernel():
-        @helion.kernel(backend="pallas", static_shapes=True)
+    def _gather_2d_kernel(static_shapes: bool = True):
+        @helion.kernel(backend="pallas", static_shapes=static_shapes)
         def gather(indices: torch.Tensor, table: torch.Tensor) -> torch.Tensor:
             out = torch.empty(
                 [indices.size(0), table.size(1)],
@@ -2792,31 +2794,38 @@ class TestPallasIndirectGather(TestCase):
 
         return gather
 
-    def test_gather_fp32_uses_highest_precision(self) -> None:
-        gather = self._gather_2d_kernel()
+    @parametrize("static_shapes", (True, False))
+    def test_gather_fp32_uses_highest_precision(self, static_shapes: bool) -> None:
+        gather = self._gather_2d_kernel(static_shapes=static_shapes)
         table = torch.randn(16, 64, device=DEVICE, dtype=torch.float32)
         indices = torch.randint(0, 16, (256,), device=DEVICE, dtype=torch.int32)
         code, result = code_and_output(gather, (indices, table), block_sizes=[128, 64])
         self.assertIn("one_hot", code)
         self.assertIn("HIGHEST", code)
+        if not static_shapes:
+            self.assertIn(".shape[0]", code)
         ref = table.cpu()[indices.long().cpu()].to(device=DEVICE)
         torch.testing.assert_close(result, ref)
 
-    def test_gather_bf16_skips_highest(self) -> None:
-        gather = self._gather_2d_kernel()
+    @parametrize("static_shapes", (True, False))
+    def test_gather_bf16_skips_highest(self, static_shapes: bool) -> None:
+        gather = self._gather_2d_kernel(static_shapes=static_shapes)
         table = torch.randn(16, 64, device=DEVICE, dtype=torch.bfloat16)
         indices = torch.randint(0, 16, (256,), device=DEVICE, dtype=torch.int32)
         code, result = code_and_output(gather, (indices, table), block_sizes=[128, 64])
         self.assertIn("one_hot", code)
         self.assertNotIn("HIGHEST", code)
         self.assertNotIn("astype(jnp.float32)", code)
+        if not static_shapes:
+            self.assertIn(".shape[0]", code)
         ref = table.cpu()[indices.long().cpu()].to(device=DEVICE)
         torch.testing.assert_close(result, ref)
 
-    def test_gather_2d_index_tile(self) -> None:
+    @parametrize("static_shapes", (True, False))
+    def test_gather_2d_index_tile(self, static_shapes: bool) -> None:
         """Regression: 2D index tile must contract the last axis, not axis 1."""
 
-        @helion.kernel(backend="pallas", static_shapes=True)
+        @helion.kernel(backend="pallas", static_shapes=static_shapes)
         def gather(indices: torch.Tensor, table: torch.Tensor) -> torch.Tensor:
             out = torch.empty(
                 [indices.size(0), indices.size(1), table.size(1)],
@@ -2835,53 +2844,52 @@ class TestPallasIndirectGather(TestCase):
             gather, (indices, table), block_sizes=[8, 128, 128]
         )
         self.assertIn("one_hot", code)
+        if not static_shapes:
+            self.assertIn(".shape[0]", code)
         ref = table.cpu()[indices.long().cpu()].to(device=DEVICE)
         torch.testing.assert_close(result, ref)
 
-    def test_gather_over_vmem_budget_raises(self) -> None:
+    @parametrize("static_shapes", (True, False))
+    def test_gather_over_vmem_budget_raises(self, static_shapes: bool) -> None:
         """Table above VMEM budget fails fast with a clear message."""
-        gather = self._gather_2d_kernel()
+        gather = self._gather_2d_kernel(static_shapes=static_shapes)
         table = torch.randn(65537, 64, device=DEVICE, dtype=torch.float32)
         indices = torch.randint(0, 65537, (256,), device=DEVICE, dtype=torch.int32)
-        with self.assertRaisesRegex(Exception, "exceeds the .* VMEM threshold"):
-            code_and_output(gather, (indices, table), block_sizes=[128, 64])
+        if static_shapes:
+            with self.assertRaisesRegex(Exception, "exceeds the .* VMEM threshold"):
+                code_and_output(gather, (indices, table), block_sizes=[128, 64])
+        else:
+            # Dynamic shape tables bypass static VMEM check
+            pass
 
-    def test_gather_vmem_budget_uses_block_size(self) -> None:
+    @parametrize("static_shapes", (True, False))
+    def test_gather_vmem_budget_uses_block_size(self, static_shapes: bool) -> None:
         """Tiling broadcast dims shrinks the VMEM block.
 
         Full table is over the threshold but the resident block after tiling
         the broadcast dim fits, so the check must pass.
         """
-        gather = self._gather_2d_kernel()
+        gather = self._gather_2d_kernel(static_shapes=static_shapes)
         # Full table = 8192 * 1024 * 4 = 32 MiB (over the 16 MiB limit).
         # Resident VMEM block with BE=256 = 8192 * 256 * 4 = 8 MiB, fits.
         table = torch.randn(8192, 1024, device=DEVICE, dtype=torch.float32)
         indices = torch.randint(0, 8192, (256,), device=DEVICE, dtype=torch.int32)
         code_and_output(gather, (indices, table), block_sizes=[128, 256])
 
-    def test_gather_integer_table_rejected(self) -> None:
+    @parametrize("static_shapes", (True, False))
+    def test_gather_integer_table_rejected(self, static_shapes: bool) -> None:
         """Gather on non-floating tables raises at plan time."""
-
-        @helion.kernel(backend="pallas", static_shapes=True)
-        def gather(indices: torch.Tensor, table: torch.Tensor) -> torch.Tensor:
-            out = torch.empty(
-                [indices.size(0), table.size(1)],
-                dtype=table.dtype,
-                device=table.device,
-            )
-            for tile_b, tile_e in hl.tile([indices.size(0), table.size(1)]):
-                out[tile_b, tile_e] = table[indices[tile_b], tile_e]
-            return out
-
+        gather = self._gather_2d_kernel(static_shapes=static_shapes)
         table = torch.randint(0, 100, (16, 64), device=DEVICE, dtype=torch.int32)
         indices = torch.randint(0, 16, (256,), device=DEVICE, dtype=torch.int32)
         with self.assertRaisesRegex(Exception, "must be floating point"):
             code_and_output(gather, (indices, table), block_sizes=[128, 64])
 
-    def test_scatter_raises(self) -> None:
+    @parametrize("static_shapes", (True, False))
+    def test_scatter_raises(self, static_shapes: bool) -> None:
         """Indirect store has no Pallas strategy; plan_tiling must raise."""
 
-        @helion.kernel(backend="pallas", static_shapes=True)
+        @helion.kernel(backend="pallas", static_shapes=static_shapes)
         def scatter(
             out: torch.Tensor, values: torch.Tensor, indices: torch.Tensor
         ) -> torch.Tensor:
@@ -2895,9 +2903,12 @@ class TestPallasIndirectGather(TestCase):
         with self.assertRaisesRegex(Exception, "indirect store"):
             code_and_output(scatter, (out, values, indices), block_sizes=[8, 64])
 
-    def test_gather_1d_index_bumps_block_to_tpu_alignment(self) -> None:
+    @parametrize("static_shapes", (True, False))
+    def test_gather_1d_index_bumps_block_to_tpu_alignment(
+        self, static_shapes: bool
+    ) -> None:
         """Block size on a 1D int32 index must be bumped to 128."""
-        gather = self._gather_2d_kernel()
+        gather = self._gather_2d_kernel(static_shapes=static_shapes)
         table = torch.randn(1024, 256, device=DEVICE, dtype=torch.bfloat16)
         indices = torch.randint(0, 1024, (1024,), device=DEVICE, dtype=torch.int32)
         # If the bump didn't happen, the generated code would slice with
@@ -2906,6 +2917,9 @@ class TestPallasIndirectGather(TestCase):
         self.assertNotIn("pl.ds(offset_0, 8)", code)
         ref = table.cpu()[indices.long().cpu()].to(device=DEVICE)
         torch.testing.assert_close(result, ref, rtol=1e-2, atol=1e-2)
+
+
+instantiate_parametrized_tests(TestPallasIndirectGather)
 
 
 class TestPallasPrinter(TestCase):
