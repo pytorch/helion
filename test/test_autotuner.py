@@ -52,6 +52,8 @@ from helion.autotuner.base_search import BaseSearch
 from helion.autotuner.base_search import PopulationMember
 from helion.autotuner.benchmark_provider import LocalBenchmarkProvider
 from helion.autotuner.config_fragment import BooleanFragment
+from helion.autotuner.config_fragment import DefaultBiasedEnumFragment
+from helion.autotuner.config_fragment import DefaultBiasedIntegerFragment
 from helion.autotuner.config_fragment import EnumFragment
 from helion.autotuner.config_fragment import IntegerFragment
 from helion.autotuner.config_fragment import ListOf
@@ -1105,6 +1107,23 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
             sorted(EnumFragment(("a", "b", "c")).pattern_neighbors("b")),
             ["a", "c"],
         )
+
+    def test_default_biased_fragments_keep_non_default_neighbors(self):
+        int_fragment = DefaultBiasedIntegerFragment(
+            0,
+            4,
+            0,
+            default_probability=1.0,
+        )
+        enum_fragment = DefaultBiasedEnumFragment(
+            (None, False, True),
+            default_probability=1.0,
+        )
+
+        self.assertEqual(int_fragment.random(), 0)
+        self.assertEqual(int_fragment.pattern_neighbors(0), [1])
+        self.assertIsNone(enum_fragment.random())
+        self.assertEqual(enum_fragment.pattern_neighbors(None), [False, True])
 
     def test_pattern_search_neighbor_values_radius(self):
         # PowerOfTwoFragment: radius=2 should return 2 steps in exponent space

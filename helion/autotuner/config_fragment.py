@@ -247,6 +247,26 @@ class IntegerFragment(BaseIntegerFragment):
         return a
 
 
+class DefaultBiasedIntegerFragment(IntegerFragment):
+    """Integer fragment that samples its default value most of the time."""
+
+    def __init__(
+        self,
+        low: int,
+        high: int,
+        default_val: int | None = None,
+        *,
+        default_probability: float,
+    ) -> None:
+        super().__init__(low, high, default_val)
+        self.default_probability = default_probability
+
+    def random(self) -> int:
+        if random.random() < self.default_probability:
+            return self.default()
+        return super().random()
+
+
 @dataclasses.dataclass
 class EnumFragment(ConfigSpecFragment):
     choices: tuple[object, ...]
@@ -283,6 +303,17 @@ class EnumFragment(ConfigSpecFragment):
                 f"Valid choices: {self.choices}"
             ) from None
         return [1.0 if i == choice_idx else 0.0 for i in range(len(self.choices))]
+
+
+@dataclasses.dataclass
+class DefaultBiasedEnumFragment(EnumFragment):
+    default_probability: float
+
+    def random(self) -> object:
+        if random.random() < self.default_probability:
+            return self.default()
+        choices = [choice for choice in self.choices if choice != self.default()]
+        return random.choice(choices)
 
 
 class BooleanFragment(ConfigSpecFragment):
