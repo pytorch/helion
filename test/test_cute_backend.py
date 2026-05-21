@@ -15,9 +15,11 @@ from helion._testing import TestCase
 from helion._testing import code_and_output
 from helion._testing import onlyBackends
 import helion.language as hl
+from helion.runtime import _create_cute_direct_entry
 from helion.runtime import _cute_cluster_shape
 from helion.runtime import _cute_cluster_shape_from_wrapper_plans
 from helion.runtime import _ensure_cute_dsl_arch_env
+from helion.runtime import _get_compiled_cute_direct_entry_launcher
 from helion.runtime import _get_compiled_cute_launcher
 from helion.runtime import default_cute_launcher
 
@@ -1612,6 +1614,436 @@ class TestCuteBackend(TestCase):
             [("jit-wrapper", (1, 2, 3), "--generate-line-info")],
         )
         self.assertEqual(result, ("launched", (1, 2, 3)))
+
+    def test_cute_launcher_uses_target1_direct_entry_plan(self) -> None:
+        cute_kernel = type("DummyCuteKernel", (), {})()
+        cute_kernel._helion_cute_direct_entry_plans = [
+            {
+                "kind": "tcgen05_target1_direct_entry",
+                "lhs_idx": 0,
+                "rhs_idx": 1,
+                "d_idx": 2,
+            }
+        ]
+        x = torch.empty((1024, 1024), device=DEVICE, dtype=torch.bfloat16)
+        y = torch.empty((1024, 4096), device=DEVICE, dtype=torch.bfloat16)
+        out = torch.empty((1024, 4096), device=DEVICE, dtype=torch.bfloat16)
+        launched_args: list[tuple[object, ...]] = []
+
+        class FakeDirectLauncher:
+            def __call__(self, *args: object) -> tuple[str, tuple[object, ...]]:
+                launched_args.append(args)
+                return ("direct", args)
+
+        with (
+            patch(
+                "helion.runtime._get_compiled_cute_direct_entry_launcher",
+                return_value=FakeDirectLauncher(),
+            ) as direct_launcher,
+            patch("helion.runtime._build_cached_cute_schema_and_args") as build_schema,
+            patch("helion.runtime._get_compiled_cute_launcher") as wrapper_launcher,
+        ):
+            result = default_cute_launcher(
+                cute_kernel,
+                (2, 1, 64),
+                x,
+                y,
+                out,
+                block=(256, 1, 1),
+                cute_compile_options="--enable-tvm-ffi",
+            )
+
+        direct_launcher.assert_called_once()
+        build_schema.assert_not_called()
+        wrapper_launcher.assert_not_called()
+        self.assertEqual(launched_args, [(x, y, out)])
+        self.assertEqual(result, ("direct", (x, y, out)))
+
+    def test_cute_launcher_direct_entry_requires_tvm_ffi_option(self) -> None:
+        cute_kernel = type("DummyCuteKernel", (), {})()
+        cute_kernel._helion_cute_direct_entry_plans = [
+            {
+                "kind": "tcgen05_target1_direct_entry",
+                "lhs_idx": 0,
+                "rhs_idx": 1,
+                "d_idx": 2,
+            }
+        ]
+        x = torch.empty((1024, 1024), device=DEVICE, dtype=torch.bfloat16)
+        y = torch.empty((1024, 4096), device=DEVICE, dtype=torch.bfloat16)
+        out = torch.empty((1024, 4096), device=DEVICE, dtype=torch.bfloat16)
+
+        with self.assertRaisesRegex(
+            helion.exc.BackendUnsupported,
+            "explicit CuTe compile options",
+        ):
+            default_cute_launcher(
+                cute_kernel,
+                (2, 1, 64),
+                x,
+                y,
+                out,
+                block=(256, 1, 1),
+            )
+
+    def test_cute_direct_entry_launcher_compiles_with_fake_tensors(self) -> None:
+        cute_kernel = type("DummyCuteKernel", (), {})()
+        direct_plan: dict[str, object] = {
+            "kind": "tcgen05_target1_direct_entry",
+            "lhs_idx": 0,
+            "rhs_idx": 1,
+            "d_idx": 2,
+            "bm": 256,
+            "bn": 256,
+            "bk": 64,
+            "cluster_m": 2,
+            "cluster_n": 1,
+            "ab_stage_count": 3,
+            "c_stage_count": 2,
+            "input_dtype": "cutlass.BFloat16",
+            "output_dtype": "cutlass.BFloat16",
+        }
+        x = torch.empty((1024, 1024), device=DEVICE, dtype=torch.bfloat16)
+        y = torch.empty((1024, 4096), device=DEVICE, dtype=torch.bfloat16)
+        out = torch.empty((1024, 4096), device=DEVICE, dtype=torch.bfloat16)
+        fake_args = ("fake-x", "fake-y", "fake-out")
+        compiled_calls: list[tuple[object, tuple[object, ...], str | None]] = []
+        launched_args: list[tuple[object, ...]] = []
+
+        class FakeCompiled:
+            def __call__(self, *args: object) -> tuple[str, tuple[object, ...]]:
+                launched_args.append(args)
+                return ("direct", args)
+
+        def fake_compile(
+            jit_func: object,
+            *args: object,
+            options: str | None = None,
+        ) -> FakeCompiled:
+            compiled_calls.append((jit_func, args, options))
+            return FakeCompiled()
+
+        with (
+            patch("helion.runtime._ensure_cute_dsl_arch_env"),
+            patch(
+                "helion.runtime._create_cute_direct_entry",
+                return_value="jit-direct-entry",
+            ),
+            patch(
+                "helion.runtime._make_cute_direct_entry_fake_tensor",
+                side_effect=fake_args,
+            ),
+            patch("cutlass.cute.compile", side_effect=fake_compile),
+        ):
+            launcher = _get_compiled_cute_direct_entry_launcher(
+                cute_kernel,
+                direct_plan,
+                (x, y, out),
+                (2, 1, 64),
+                (256, 1, 1),
+                "--enable-tvm-ffi",
+            )
+            first = launcher(x, y, out)
+            second = launcher(x, y, out)
+
+        self.assertEqual(
+            compiled_calls,
+            [("jit-direct-entry", fake_args, "--enable-tvm-ffi")],
+        )
+        self.assertEqual(launched_args, [(x, y, out), (x, y, out)])
+        self.assertEqual(first, ("direct", (x, y, out)))
+        self.assertEqual(second, first)
+
+    def test_cute_direct_entry_launcher_uses_generated_entry(self) -> None:
+        cute_kernel = type("DummyCuteKernel", (), {})()
+        direct_plan: dict[str, object] = {
+            "kind": "tcgen05_target1_direct_entry",
+            "lhs_idx": 0,
+            "rhs_idx": 1,
+            "d_idx": 2,
+            "bm": 256,
+            "bn": 256,
+            "bk": 64,
+            "cluster_m": 2,
+            "cluster_n": 1,
+            "ab_stage_count": 3,
+            "c_stage_count": 2,
+            "input_dtype": "cutlass.BFloat16",
+            "output_dtype": "cutlass.BFloat16",
+        }
+        cute_kernel._helion_cute_generated_direct_entry = "generated-direct-entry"
+        x = torch.empty((1024, 1024), device=DEVICE, dtype=torch.bfloat16)
+        y = torch.empty((1024, 4096), device=DEVICE, dtype=torch.bfloat16)
+        out = torch.empty((1024, 4096), device=DEVICE, dtype=torch.bfloat16)
+        fake_args = ("fake-x", "fake-y", "fake-out")
+        compiled_calls: list[tuple[object, tuple[object, ...], str | None]] = []
+
+        class FakeCompiled:
+            def __call__(self, *args: object) -> tuple[str, tuple[object, ...]]:
+                return ("direct", args)
+
+        def fake_compile(
+            jit_func: object,
+            *args: object,
+            options: str | None = None,
+        ) -> FakeCompiled:
+            compiled_calls.append((jit_func, args, options))
+            return FakeCompiled()
+
+        with (
+            patch("helion.runtime._ensure_cute_dsl_arch_env"),
+            patch(
+                "helion.runtime._patch_cutlass_jit_shutdown_unload"
+            ) as patch_shutdown,
+            patch(
+                "helion.runtime._create_cute_direct_entry",
+                side_effect=AssertionError("runtime direct entry fallback used"),
+            ),
+            patch(
+                "helion.runtime._make_cute_direct_entry_fake_tensor",
+                side_effect=fake_args,
+            ),
+            patch("cutlass.cute.compile", side_effect=fake_compile),
+        ):
+            launcher = _get_compiled_cute_direct_entry_launcher(
+                cute_kernel,
+                direct_plan,
+                (x, y, out),
+                (128, 1, 1),
+                (256, 1, 1),
+                "--enable-tvm-ffi",
+            )
+            result = launcher(x, y, out)
+
+        patch_shutdown.assert_called_once()
+        self.assertEqual(
+            compiled_calls,
+            [("generated-direct-entry", fake_args, "--enable-tvm-ffi")],
+        )
+        self.assertEqual(result, ("direct", (x, y, out)))
+
+    def test_cute_direct_entry_cache_key_includes_cluster_shape(self) -> None:
+        cute_kernel = type("DummyCuteKernel", (), {})()
+        direct_plan: dict[str, object] = {
+            "kind": "tcgen05_target1_direct_entry",
+            "lhs_idx": 0,
+            "rhs_idx": 1,
+            "d_idx": 2,
+            "bm": 256,
+            "bn": 256,
+            "bk": 64,
+            "cluster_m": 2,
+            "cluster_n": 1,
+            "ab_stage_count": 3,
+            "c_stage_count": 2,
+            "input_dtype": "cutlass.BFloat16",
+            "output_dtype": "cutlass.BFloat16",
+        }
+        cute_kernel._helion_cute_wrapper_plans = [
+            {
+                "kind": "tcgen05_ab_tma",
+                "kernel_args": [
+                    "tma_atom_a",
+                    "tma_tensor_a",
+                    "tma_atom_b",
+                    "tma_tensor_b",
+                ],
+            },
+            {
+                "kind": "tcgen05_d_tma",
+                "kernel_args": [
+                    "tma_store_atom",
+                    "tma_store_tensor",
+                ],
+            },
+        ]
+        x = torch.empty((1024, 1024), device=DEVICE, dtype=torch.bfloat16)
+        y = torch.empty((1024, 4096), device=DEVICE, dtype=torch.bfloat16)
+        out = torch.empty((1024, 4096), device=DEVICE, dtype=torch.bfloat16)
+        fake_args = ("fake-x", "fake-y", "fake-out")
+        created: list[object] = []
+
+        def make_direct_entry(*_args: object) -> object:
+            entry = f"jit-direct-entry-{len(created)}"
+            created.append(entry)
+            return entry
+
+        with (
+            patch("helion.runtime._ensure_cute_dsl_arch_env"),
+            patch(
+                "helion.runtime._create_cute_direct_entry",
+                side_effect=make_direct_entry,
+            ),
+            patch(
+                "helion.runtime._make_cute_direct_entry_fake_tensor",
+                side_effect=fake_args * 3,
+            ),
+        ):
+            cute_kernel._helion_cute_cluster_shape = (1, 1, 1)
+            launcher_a0 = _get_compiled_cute_direct_entry_launcher(
+                cute_kernel,
+                direct_plan,
+                (x, y, out),
+                (2, 1, 64),
+                (256, 1, 1),
+                "--enable-tvm-ffi",
+            )
+            launcher_a1 = _get_compiled_cute_direct_entry_launcher(
+                cute_kernel,
+                direct_plan,
+                (x, y, out),
+                (2, 1, 64),
+                (256, 1, 1),
+                "--enable-tvm-ffi",
+            )
+            cute_kernel._helion_cute_cluster_shape = (2, 1, 1)
+            launcher_b = _get_compiled_cute_direct_entry_launcher(
+                cute_kernel,
+                direct_plan,
+                (x, y, out),
+                (2, 1, 64),
+                (256, 1, 1),
+                "--enable-tvm-ffi",
+            )
+
+        self.assertIs(launcher_a0, launcher_a1)
+        self.assertIsNot(launcher_a0, launcher_b)
+        self.assertEqual(created, ["jit-direct-entry-0", "jit-direct-entry-1"])
+
+    def test_cute_direct_entry_rejects_stale_wrapper_metadata(self) -> None:
+        direct_plan: dict[str, object] = {
+            "kind": "tcgen05_target1_direct_entry",
+            "lhs_idx": 0,
+            "rhs_idx": 1,
+            "d_idx": 2,
+            "bm": 256,
+            "bn": 256,
+            "bk": 64,
+            "cluster_m": 2,
+            "cluster_n": 1,
+            "ab_stage_count": 3,
+            "c_stage_count": 2,
+            "input_dtype": "cutlass.BFloat16",
+            "output_dtype": "cutlass.BFloat16",
+            "ab_kernel_args": [
+                "tma_atom_a",
+                "tma_tensor_a",
+                "tma_atom_b",
+                "tma_tensor_b",
+            ],
+            "d_kernel_args": [
+                "tma_store_atom",
+                "tma_store_tensor",
+            ],
+        }
+        ab_plan: dict[str, object] = {
+            "kind": "tcgen05_ab_tma",
+            "lhs_idx": 0,
+            "rhs_idx": 1,
+            "bm": 256,
+            "bn": 256,
+            "bk": 64,
+            "cluster_m": 2,
+            "cluster_n": 1,
+            "ab_stage_count": 3,
+            "input_dtype": "cutlass.BFloat16",
+            "acc_dtype": "cutlass.Float32",
+            "kernel_args": [
+                "tma_atom_a",
+                "tma_tensor_a",
+                "tma_atom_b",
+                "tma_tensor_b",
+            ],
+        }
+        d_plan: dict[str, object] = {
+            "kind": "tcgen05_d_tma",
+            "d_idx": 2,
+            "bm": 256,
+            "bn": 256,
+            "c_stage_count": 2,
+            "output_dtype": "cutlass.BFloat16",
+            "epi_tile_m": 128,
+            "epi_tile_n": 32,
+            "d_store_box_n": 32,
+            "kernel_args": [
+                "tma_store_atom",
+                "tma_store_tensor",
+            ],
+        }
+        cute_kernel = type("DummyCuteKernel", (), {})()
+        cute_kernel._helion_cute_wrapper_plans = [ab_plan, d_plan]
+
+        direct_entry = _create_cute_direct_entry(
+            cute_kernel,
+            direct_plan,
+            (2, 1, 64),
+            (256, 1, 1),
+        )
+        self.assertTrue(direct_entry.__name__.startswith("_helion_cute_direct_entry_"))
+
+        stale_index_kernel = type("DummyCuteKernel", (), {})()
+        stale_index_kernel._helion_cute_wrapper_plans = [
+            {**ab_plan, "lhs_idx": 1},
+            d_plan,
+        ]
+        with self.assertRaisesRegex(
+            helion.exc.BackendUnsupported,
+            "wrapper A/B plan mismatch for lhs_idx",
+        ):
+            _create_cute_direct_entry(
+                stale_index_kernel,
+                direct_plan,
+                (2, 1, 64),
+                (256, 1, 1),
+            )
+
+        stale_acc_kernel = type("DummyCuteKernel", (), {})()
+        stale_acc_kernel._helion_cute_wrapper_plans = [
+            {**ab_plan, "acc_dtype": "cutlass.Float16"},
+            d_plan,
+        ]
+        with self.assertRaisesRegex(
+            helion.exc.BackendUnsupported,
+            "wrapper A/B plan mismatch for acc_dtype",
+        ):
+            _create_cute_direct_entry(
+                stale_acc_kernel,
+                direct_plan,
+                (2, 1, 64),
+                (256, 1, 1),
+            )
+
+        stale_shape_kernel = type("DummyCuteKernel", (), {})()
+        stale_shape_kernel._helion_cute_wrapper_plans = [
+            ab_plan,
+            {**d_plan, "epi_tile_n": 64},
+        ]
+        with self.assertRaisesRegex(
+            helion.exc.BackendUnsupported,
+            "wrapper D plan mismatch for epi_tile_n",
+        ):
+            _create_cute_direct_entry(
+                stale_shape_kernel,
+                direct_plan,
+                (2, 1, 64),
+                (256, 1, 1),
+            )
+
+        stale_layout_kernel = type("DummyCuteKernel", (), {})()
+        stale_layout_kernel._helion_cute_wrapper_plans = [
+            {**ab_plan, "smem_swizzle_a": 8},
+            d_plan,
+        ]
+        with self.assertRaisesRegex(
+            helion.exc.BackendUnsupported,
+            "default A/B SMEM wrapper layouts",
+        ):
+            _create_cute_direct_entry(
+                stale_layout_kernel,
+                direct_plan,
+                (2, 1, 64),
+                (256, 1, 1),
+            )
 
     def test_cute_launcher_reuses_launch_args_for_stable_scalar_signature(
         self,

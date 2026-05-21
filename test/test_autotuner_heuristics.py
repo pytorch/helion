@@ -63,6 +63,7 @@ from helion._compiler.cute.tcgen05_constants import (
 )
 from helion._compiler.cute.tcgen05_constants import TCGEN05_TARGET1_TVM_FFI_AB_STAGES
 from helion._compiler.cute.tcgen05_constants import TCGEN05_TARGET1_TVM_FFI_BLOCK_K
+from helion._compiler.cute.tcgen05_constants import TCGEN05_TARGET1_TVM_FFI_C_STAGES
 from helion._compiler.cute.tcgen05_constants import TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY
 from helion._compiler.cute.tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_M
 from helion._compiler.cute.tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_N
@@ -797,6 +798,7 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
         self.assertEqual(seed["tcgen05_cluster_m"], 2)
         self.assertEqual(seed["tcgen05_cluster_n"], 1)
         self.assertEqual(seed["tcgen05_ab_stages"], TCGEN05_TARGET1_TVM_FFI_AB_STAGES)
+        self.assertEqual(seed["tcgen05_c_stages"], TCGEN05_TARGET1_TVM_FFI_C_STAGES)
         self.assertEqual(seed["tcgen05_l2_swizzle_size"], 1)
         search_ab_stages_fragment = bound.config_spec._tcgen05_optional_fragments(
             for_search=True
@@ -890,6 +892,10 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
             projected_config.config["tcgen05_ab_stages"],
             TCGEN05_TARGET1_TVM_FFI_AB_STAGES,
         )
+        self.assertEqual(
+            projected_config.config["tcgen05_c_stages"],
+            TCGEN05_TARGET1_TVM_FFI_C_STAGES,
+        )
         self.assertIs(
             projected_config.config[TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY],
             True,
@@ -941,6 +947,40 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
                 TCGEN05_TARGET1_TVM_FFI_BLOCK_K,
             ],
         )
+
+        for requested_ab_stages in (4, 5, 6):
+            with self.subTest(requested_ab_stages=requested_ab_stages):
+                non_seed_stage_config = helion.Config(
+                    block_sizes=[256, 256, 64],
+                    indexing=[
+                        "tensor_descriptor",
+                        "tensor_descriptor",
+                        "tensor_descriptor",
+                    ],
+                    pid_type="persistent_interleaved",
+                    tcgen05_cluster_m=1,
+                    tcgen05_cluster_n=1,
+                    tcgen05_ab_stages=requested_ab_stages,
+                )
+                bound.config_spec.normalize(non_seed_stage_config, _fix_invalid=True)
+                self.assertEqual(non_seed_stage_config.config["tcgen05_ab_stages"], 3)
+
+                invalid_non_seed_stage_config = helion.Config(
+                    block_sizes=[256, 256, 64],
+                    indexing=[
+                        "tensor_descriptor",
+                        "tensor_descriptor",
+                        "tensor_descriptor",
+                    ],
+                    pid_type="persistent_interleaved",
+                    tcgen05_cluster_m=1,
+                    tcgen05_cluster_n=1,
+                    tcgen05_ab_stages=requested_ab_stages,
+                )
+                with self.assertRaisesRegex(
+                    helion.exc.InvalidConfig, "validated Target1 TVM-FFI seed"
+                ):
+                    bound.config_spec.normalize(invalid_non_seed_stage_config)
 
         non_target_args = (
             torch.empty([1024, 1024], device=DEVICE, dtype=torch.bfloat16),

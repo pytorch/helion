@@ -25,6 +25,7 @@ from .ast_read_writes import dead_assignment_elimination
 from .ast_read_writes import dead_expression_elimination
 from .ast_read_writes import definitely_does_not_have_side_effects
 from .compile_environment import CompileEnvironment
+from .cute.tcgen05_direct_entry import build_target1_direct_entry_source
 from .device_function import ConstExprArg
 from .device_function import DeviceFunction
 from .helper_function import CodegenInterface
@@ -78,6 +79,7 @@ class GenerateAST(NodeVisitor, CodegenInterface):
         self.codegen_graphs = func.device_ir.build_codegen_graphs(config)
         self.host_statements: list[ast.AST] = []
         self.module_statements: list[ast.stmt] = []
+        self.cute_direct_entry_plans: list[dict[str, object]] = []
         self.cute_wrapper_plans: list[dict[str, object]] = []
         self.statements_stack: list[list[ast.AST]] = [self.host_statements]
         self.on_device = False
@@ -900,27 +902,53 @@ def generate_ast(
                 else []
             )
             final_host_statements = rng_statements + codegen.host_statements
-            if codegen.cute_wrapper_plans:
-                launcher_arg_positions: dict[str, int] = {}
-                for idx, arg in enumerate(
-                    [
-                        arg
-                        for arg in codegen.device_function.sorted_args()
-                        if not (
-                            isinstance(arg, ConstExprArg) and arg.host_str() != arg.name
-                        )
-                    ]
-                ):
-                    launcher_arg_positions[arg.name] = idx
-                resolved_wrapper_plans: list[dict[str, object]] = []
-                for plan in codegen.cute_wrapper_plans:
+            launcher_arg_positions: dict[str, int] | None = None
+
+            def resolve_cute_plan_arg_positions(
+                plans: list[dict[str, object]],
+            ) -> list[dict[str, object]]:
+                nonlocal launcher_arg_positions
+                if launcher_arg_positions is None:
+                    launcher_arg_positions = {}
+                    for idx, arg in enumerate(
+                        [
+                            arg
+                            for arg in codegen.device_function.sorted_args()
+                            if not (
+                                isinstance(arg, ConstExprArg)
+                                and arg.host_str() != arg.name
+                            )
+                        ]
+                    ):
+                        launcher_arg_positions[arg.name] = idx
+                resolved_plans: list[dict[str, object]] = []
+                for plan in plans:
                     resolved = dict(plan)
                     for key in ("lhs_name", "rhs_name", "c_name", "d_name"):
                         if key in resolved:
                             resolved[key[:-5] + "_idx"] = launcher_arg_positions[
                                 str(resolved.pop(key))
                             ]
-                    resolved_wrapper_plans.append(resolved)
+                    resolved_plans.append(resolved)
+                return resolved_plans
+
+            resolved_direct_entry_plans: list[dict[str, object]] = []
+            resolved_wrapper_plans: list[dict[str, object]] = []
+            generated_direct_entry_defs: list[ast.stmt] = []
+            if codegen.cute_direct_entry_plans:
+                resolved_direct_entry_plans = resolve_cute_plan_arg_positions(
+                    codegen.cute_direct_entry_plans
+                )
+                final_host_statements = [
+                    statement_from_string(
+                        f"{codegen.device_function.name}._helion_cute_direct_entry_plans = {resolved_direct_entry_plans!r}"
+                    ),
+                    *final_host_statements,
+                ]
+            if codegen.cute_wrapper_plans:
+                resolved_wrapper_plans = resolve_cute_plan_arg_positions(
+                    codegen.cute_wrapper_plans
+                )
                 final_host_statements = [
                     statement_from_string(
                         f"{codegen.device_function.name}._helion_cute_wrapper_plans = {resolved_wrapper_plans!r}"
@@ -931,6 +959,25 @@ def generate_ast(
                 final_host_statements = [
                     statement_from_string(
                         f"{codegen.device_function.name}._helion_cute_cluster_shape = {codegen.device_function.cute_state.cluster_shape!r}"
+                    ),
+                    *final_host_statements,
+                ]
+            if resolved_direct_entry_plans and resolved_wrapper_plans:
+                generated_direct_entry_name = (
+                    f"{codegen.device_function.name}_direct_entry"
+                )
+                generated_direct_entry_source = build_target1_direct_entry_source(
+                    function_name=generated_direct_entry_name,
+                    kernel_name=codegen.device_function.name,
+                    direct_plan=resolved_direct_entry_plans[0],
+                    wrapper_plans=resolved_wrapper_plans,
+                )
+                generated_direct_entry_defs.append(
+                    statement_from_string(generated_direct_entry_source)
+                )
+                final_host_statements = [
+                    statement_from_string(
+                        f"{codegen.device_function.name}._helion_cute_generated_direct_entry = {generated_direct_entry_name}"
                     ),
                     *final_host_statements,
                 ]
@@ -961,6 +1008,7 @@ def generate_ast(
                 *codegen.module_statements,
                 *codegen.device_function.codegen_helper_functions(),
                 *kernel_def,
+                *generated_direct_entry_defs,
                 host_def,
                 *call_def,
                 *main_def,

@@ -7,6 +7,7 @@ import logging
 import operator
 import textwrap
 from typing import TYPE_CHECKING
+from typing import cast
 
 import torch
 from torch.fx import has_side_effect
@@ -38,6 +39,7 @@ from .._compiler.cute.tcgen05_constants import TCGEN05_C_ACQUIRE_PLACEMENT_PRE_L
 from .._compiler.cute.tcgen05_constants import TCGEN05_C_STORE_MODE_CONFIG_KEY
 from .._compiler.cute.tcgen05_constants import TCGEN05_C_STORE_MODE_NORMAL
 from .._compiler.cute.tcgen05_constants import TCGEN05_C_STORE_MODE_SKIP_EPILOGUE_STORE
+from .._compiler.cute.tcgen05_constants import TCGEN05_DIRECT_ENTRY_PLAN_CONFIG_KEY
 from .._compiler.cute.tcgen05_constants import TCGEN05_EPILOGUE_LAYOUT_CONFIG_KEY
 from .._compiler.cute.tcgen05_constants import (
     TCGEN05_EPILOGUE_LAYOUT_MODULE_HELPER_ACC_T2R,
@@ -51,6 +53,7 @@ from .._compiler.cute.tcgen05_constants import (
 )
 from .._compiler.cute.tcgen05_constants import TCGEN05_EPILOGUE_LAYOUT_SPLIT_FIRST_T2R
 from .._compiler.cute.tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_N
+from .._compiler.cute.tcgen05_direct_entry import Tcgen05DirectEntryPlan
 from .._compiler.cute.tcgen05_pure_matmul import Tcgen05TmaStoreBodyCoreParams
 from .._compiler.cute.tcgen05_pure_matmul import Tcgen05TmaStorePipelineParams
 from .._compiler.cute.tcgen05_pure_matmul import Tcgen05TmaStoreSubtileLoopParams
@@ -2660,6 +2663,15 @@ def _codegen_cute_store_tcgen05_tile(
             f"({final_expr}).to({target_dtype})",
         )
 
+    tcgen05_direct_entry_requested = bool(
+        state.device_function.config.get(TCGEN05_DIRECT_ENTRY_PLAN_CONFIG_KEY, False)
+    )
+    if tcgen05_direct_entry_requested and not tcgen05_value.use_tma_store_epilogue:
+        raise exc.BackendUnsupported(
+            "cute",
+            f"{TCGEN05_DIRECT_ENTRY_PLAN_CONFIG_KEY}=True requires the tcgen05 "
+            "TMA-store epilogue facts",
+        )
     if tcgen05_value.use_tma_store_epilogue:
         df.placeholder_args.add(tensor_name)
         df.wrapper_only_params.extend(
@@ -2670,29 +2682,95 @@ def _codegen_cute_store_tcgen05_tile(
                 tcgen05_value.role_local_tile_counter,
                 increment_per_tile=not tcgen05_value.tma_store_full_tiles_only,
             )
-        state.codegen.cute_wrapper_plans.append(
-            {
-                "kind": "tcgen05_d_tma",
-                "d_name": tensor_name,
-                "bm": tcgen05_value.bm,
-                "bn": tcgen05_value.bn,
-                "c_stage_count": tcgen05_value.c_stage_count,
-                "output_dtype": target_dtype,
-                "kernel_args": [
-                    tcgen05_value.tma_store_atom,
-                    tcgen05_value.tma_store_tensor,
-                ],
-                **(
-                    {
-                        "epi_tile_m": tcgen05_value.explicit_epi_tile_m,
-                        "epi_tile_n": tcgen05_value.explicit_epi_tile_n,
-                        "d_store_box_n": tcgen05_value.explicit_d_store_box_n,
-                    }
-                    if tcgen05_value.has_explicit_epilogue_tile
-                    else {}
-                ),
-            }
-        )
+        d_tma_plan: dict[str, object] = {
+            "kind": "tcgen05_d_tma",
+            "d_name": tensor_name,
+            "bm": tcgen05_value.bm,
+            "bn": tcgen05_value.bn,
+            "c_stage_count": tcgen05_value.c_stage_count,
+            "output_dtype": target_dtype,
+            "kernel_args": [
+                tcgen05_value.tma_store_atom,
+                tcgen05_value.tma_store_tensor,
+            ],
+            **(
+                {
+                    "epi_tile_m": tcgen05_value.explicit_epi_tile_m,
+                    "epi_tile_n": tcgen05_value.explicit_epi_tile_n,
+                    "d_store_box_n": tcgen05_value.explicit_d_store_box_n,
+                }
+                if tcgen05_value.has_explicit_epilogue_tile
+                else {}
+            ),
+        }
+        state.codegen.cute_wrapper_plans.append(d_tma_plan)
+        if tcgen05_direct_entry_requested:
+            ab_tma_plans = [
+                plan
+                for plan in state.codegen.cute_wrapper_plans
+                if plan.get("kind") == "tcgen05_ab_tma"
+            ]
+            if len(ab_tma_plans) != 1:
+                raise exc.BackendUnsupported(
+                    "cute",
+                    f"{TCGEN05_DIRECT_ENTRY_PLAN_CONFIG_KEY}=True requires "
+                    "exactly one tcgen05 A/B TMA wrapper plan",
+                )
+            ab_tma_plan = ab_tma_plans[0]
+            if not (
+                tcgen05_value.has_explicit_epilogue_tile
+                and tcgen05_value.explicit_epi_tile_m == 128
+                and tcgen05_value.explicit_epi_tile_n == 32
+                and tcgen05_value.explicit_d_store_box_n == 32
+                and ab_tma_plan.get("bm") == tcgen05_value.bm
+                and ab_tma_plan.get("bn") == tcgen05_value.bn
+                and ab_tma_plan.get("cluster_m") == 2
+                and ab_tma_plan.get("cluster_n") == 1
+                and (
+                    ab_tma_plan.get("ab_stage_count"),
+                    tcgen05_value.c_stage_count,
+                )
+                in ((3, 2), (6, 4))
+            ):
+                raise exc.BackendUnsupported(
+                    "cute",
+                    f"{TCGEN05_DIRECT_ENTRY_PLAN_CONFIG_KEY}=True requires "
+                    "the validated Target1 A/B/D TMA fact envelope",
+                )
+            ab_kernel_args = tuple(
+                str(v) for v in cast("list[object]", ab_tma_plan["kernel_args"])
+            )
+            d_kernel_args = tuple(
+                str(v) for v in cast("list[object]", d_tma_plan["kernel_args"])
+            )
+            assert len(ab_kernel_args) == 4
+            assert len(d_kernel_args) == 2
+            ab_cluster_m = ab_tma_plan["cluster_m"]
+            ab_cluster_n = ab_tma_plan["cluster_n"]
+            ab_stage_count = ab_tma_plan["ab_stage_count"]
+            assert isinstance(ab_cluster_m, int)
+            assert isinstance(ab_cluster_n, int)
+            assert isinstance(ab_stage_count, int)
+            state.codegen.cute_direct_entry_plans.append(
+                Tcgen05DirectEntryPlan(
+                    lhs_name=str(ab_tma_plan["lhs_name"]),
+                    rhs_name=str(ab_tma_plan["rhs_name"]),
+                    d_name=tensor_name,
+                    bm=tcgen05_value.bm,
+                    bn=tcgen05_value.bn,
+                    bk=tcgen05_value.bk,
+                    cluster_m=ab_cluster_m,
+                    cluster_n=ab_cluster_n,
+                    ab_stage_count=ab_stage_count,
+                    c_stage_count=tcgen05_value.c_stage_count,
+                    input_dtype=str(ab_tma_plan["input_dtype"]),
+                    output_dtype=str(target_dtype),
+                    tma_store_atom=tcgen05_value.tma_store_atom,
+                    tma_store_tensor=tcgen05_value.tma_store_tensor,
+                    ab_kernel_args=ab_kernel_args,
+                    d_kernel_args=d_kernel_args,
+                ).to_codegen_plan()
+            )
 
     tcgen05_bm = tcgen05_value.bm
     tcgen05_bn = tcgen05_value.bn

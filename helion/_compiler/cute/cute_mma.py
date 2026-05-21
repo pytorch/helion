@@ -80,6 +80,7 @@ from .tcgen05_constants import TCGEN05_ACC_PRODUCER_MODE_SKIP_UMMA
 from .tcgen05_constants import TCGEN05_AUX_LOAD_MODE_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_AUX_LOAD_MODE_TMA
 from .tcgen05_constants import TCGEN05_CLUSTER_M2_ONE_CTA_ROLE_LOCAL_CONFIG_KEY
+from .tcgen05_constants import TCGEN05_DIRECT_ENTRY_PLAN_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_LARGE_BN_PROOF_BLOCK_SIZES
 from .tcgen05_constants import TCGEN05_LARGE_BN_PROOF_CLUSTER_M
@@ -2069,6 +2070,9 @@ def _emit_mma_pipeline(
     tcgen05_requested_flat_role_coordinates = bool(
         df.config.get(TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY, False)
     )
+    tcgen05_requested_direct_entry_plan = bool(
+        df.config.get(TCGEN05_DIRECT_ENTRY_PLAN_CONFIG_KEY, False)
+    )
     tcgen05_requested_pure_clc_scheduler_object = bool(
         df.config.get(TCGEN05_PURE_CLC_SCHEDULER_OBJECT_CONFIG_KEY, False)
     )
@@ -2083,6 +2087,11 @@ def _emit_mma_pipeline(
             "cute",
             f"{TCGEN05_PURE_CLC_SCHEDULER_OBJECT_CONFIG_KEY}=True requires "
             "tcgen05 MMA codegen",
+        )
+    if tcgen05_requested_direct_entry_plan and mma_impl != "tcgen05":
+        raise exc.BackendUnsupported(
+            "cute",
+            f"{TCGEN05_DIRECT_ENTRY_PLAN_CONFIG_KEY}=True requires tcgen05 MMA codegen",
         )
     tcgen05_pid_is_persistent = _is_persistent_pid_config(df.config)
     tcgen05_requested_two_cta = _tcgen05_use_2cta_instrs(
@@ -3058,7 +3067,8 @@ def _emit_mma_pipeline(
         tcgen05_use_pure_clc_scheduler_object = (
             tcgen05_requested_pure_clc_scheduler_object
         )
-        if tcgen05_use_pure_clc_scheduler_object:
+        tcgen05_use_direct_entry_plan = tcgen05_requested_direct_entry_plan
+        if tcgen05_use_pure_clc_scheduler_object or tcgen05_use_direct_entry_plan:
             identity_store_dtype = (
                 _trace_mma_to_single_identity_store_dtype(fx_node, cg.codegen_graphs)
                 if fx_node is not None
@@ -3069,15 +3079,20 @@ def _emit_mma_pipeline(
                 and TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY in df.config
                 and df.config.get(TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY) is True
                 and (m_size, n_size, k_total_size) == (1024, 4096, 1024)
-                and tcgen05_ab_stage_count_value == 3
+                and (tcgen05_ab_stage_count_value, tcgen05_c_stage_count_value)
+                in ((3, 2), (6, 4))
                 and tcgen05_acc_stage_count_value == 2
-                and tcgen05_c_stage_count_value == 2
                 and acc_expr is None
                 and identity_store_dtype == input_dtype
             ):
+                requested_key = (
+                    TCGEN05_PURE_CLC_SCHEDULER_OBJECT_CONFIG_KEY
+                    if tcgen05_use_pure_clc_scheduler_object
+                    else TCGEN05_DIRECT_ENTRY_PLAN_CONFIG_KEY
+                )
                 raise exc.BackendUnsupported(
                     "cute",
-                    f"{TCGEN05_PURE_CLC_SCHEDULER_OBJECT_CONFIG_KEY}=True requires "
+                    f"{requested_key}=True requires "
                     "the validated Target1 AB3 TVM-FFI flat-role identity-store seed",
                 )
         tcgen05_scheduler_warp_count_for_plan = (
