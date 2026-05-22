@@ -580,6 +580,7 @@ class DeviceFunction:
         # Single counter for both loads and stores for indexing assignment
         self.device_memory_op_index = 0
         self.epilogue_subtile_store_indices: dict[str, int] = {}
+        self.epilogue_subtile_atomic_indices: dict[str, int] = {}
         self.rng_seed_buffer_param_name = None
 
         # Pallas: id(fake_tensor) → [DimensionTiling], recorded during `plan_tiling`

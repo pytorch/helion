@@ -519,7 +519,10 @@ class TensorDescriptorIndexingStrategy(IndexingStrategy):
                 # Slices with steps are not supported in tensor descriptor mode
                 if k.step is not None and k.step != 1:
                     return False
-                block_size = env.allocate_reduction_dimension(size).from_config(config)
+                slice_size = compute_slice_size(k, size)
+                block_size = env.allocate_reduction_dimension(slice_size).from_config(
+                    config
+                )
                 if not valid_block_size(block_size, stride, i):
                     return False
                 assert isinstance(block_size, int)
@@ -1191,11 +1194,11 @@ class SubscriptIndexing(NamedTuple):
             elif isinstance(k, slice):
                 expand = tile_strategy.expand_str(output_size, output_idx)
                 size = fake_value.size(len(index_values))
+                start = k.start if k.start is not None else 0
 
                 # Handle slices with steps
                 if k.step is not None and k.step != 1:
                     # For strided slices, we need to generate: start + index * step
-                    start = k.start if k.start is not None else 0
                     step = k.step
                     slice_size = compute_slice_size(k, size)
 
@@ -1218,24 +1221,24 @@ class SubscriptIndexing(NamedTuple):
                     else:
                         index_values.append(f"{start}{expand}")
                 else:
-                    # Full slice or slice without step
-                    if not _is_size_one(size):
-                        rdim = env.allocate_reduction_dimension(size)
+                    slice_size = compute_slice_size(k, size)
+                    if not _is_size_one(slice_size):
+                        rdim = env.allocate_reduction_dimension(slice_size)
                         block_idx = rdim.block_id
                         if _has_active_codegen_block(state, block_idx):
                             index_var = state.codegen.index_var(block_idx)
                             mask_expr = state.codegen.mask_var(block_idx)
                         else:
                             index_var, mask_expr = _inactive_slice_index_expr(
-                                state, block_idx, size, dtype
+                                state, block_idx, slice_size, dtype
                             )
-                        index_values.append(f"({index_var}){expand}")
+                        start_expr = state.device_function.literal_expr(start)
+                        index_values.append(f"({start_expr} + ({index_var})){expand}")
                         if mask_expr is not None:
                             mask_values.setdefault(f"({mask_expr}){expand}")
                     else:
-                        index_values.append(
-                            f"{env.backend.zeros_expr('[1]', dtype)}{expand}"
-                        )
+                        start_expr = state.device_function.literal_expr(start)
+                        index_values.append(f"{start_expr}{expand}")
                 output_idx += 1
             elif isinstance(k, torch.Tensor):
                 ast_index = state.ast_args[1]
@@ -1567,15 +1570,19 @@ class BlockedSubscriptIndexing:
                         f"Strided slices not supported in block_ptr mode: {k}"
                     )
                 # Full slice or slice without step
-                if size != 1:
-                    rdim = env.allocate_reduction_dimension(size)
+                start = k.start if k.start is not None else 0
+                start_expr = state.device_function.literal_expr(start)
+                slice_size = compute_slice_size(k, size)
+                if slice_size != 1:
+                    rdim = env.allocate_reduction_dimension(slice_size)
                     if _has_active_codegen_block(state, rdim.block_id):
-                        res.offsets.append(state.codegen.offset_var(rdim.block_id))
+                        offset_var = state.codegen.offset_var(rdim.block_id)
+                        res.offsets.append(f"({start_expr} + {offset_var})")
                     else:
-                        res.offsets.append("0")
+                        res.offsets.append(start_expr)
                     res.block_shape.append(rdim.var)
                 else:
-                    res.offsets.append("0")
+                    res.offsets.append(start_expr)
                     res.block_shape.append(1)
             else:
                 raise exc.InvalidIndexingType(k)

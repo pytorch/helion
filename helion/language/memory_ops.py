@@ -191,7 +191,7 @@ def _(state: CodegenState) -> ast.AST:
         epilogue_subtile_group_id = fx_node.meta.get("epilogue_subtile_group_id")
         if epilogue_subtile_group_id is None:
             indexing_idx = device_fn.allocate_store_index()
-        elif fx_node.meta.get("epilogue_subtile_primary_store", False):
+        elif fx_node.meta.get("epilogue_subtile_primary_output", False):
             indexing_idx = device_fn.allocate_store_index()
             device_fn.epilogue_subtile_store_indices[epilogue_subtile_group_id] = (
                 indexing_idx
