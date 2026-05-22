@@ -933,7 +933,6 @@ class TestExamples(RefEagerTestBase, TestCase):
             block_sizes=[1, 64, 32],
         )
 
-    @xfailIfPallas("BlockSpec tiling failure")
     def test_concat(self):
         args = (
             torch.randn(512, 500, device=DEVICE),
