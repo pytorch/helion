@@ -936,10 +936,11 @@ class DeviceIR:
             for info in env.block_sizes
             if not info.reduction
         }
-        descriptor_output_nodes: set[torch.fx.Node] = set()
+        descriptor_output_nodes_by_graph: dict[int, set[torch.fx.Node]] = {}
         memory_op_index = 0
         atomic_op_index = 0
         for graph_info in self.graphs:
+            descriptor_output_nodes: set[torch.fx.Node] = set()
             for node in graph_info.graph.nodes:
                 if node.op != "call_function":
                     continue
@@ -959,13 +960,21 @@ class DeviceIR:
                     ):
                         descriptor_output_nodes.add(node)
                     atomic_op_index += 1
+            if descriptor_output_nodes:
+                descriptor_output_nodes_by_graph[graph_info.graph_id] = (
+                    descriptor_output_nodes
+                )
 
         for graph_info in self.graphs:
+            # Epilogue output ops can live in nested/reduction/control-flow graphs,
+            # not just roots.  The indexing configs are global across codegen_graphs:
+            # this mirrors the existing load/store/atomic counters used when
+            # registering indexing tunables and tensor-descriptor layout guards.
             apply_epilogue_subtiling(
                 graph_info.graph,
                 split_factor,
                 configured_block_sizes,
-                descriptor_output_nodes,
+                descriptor_output_nodes_by_graph.get(graph_info.graph_id, set()),
             )
 
     def __enter__(self) -> None:
