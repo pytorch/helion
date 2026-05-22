@@ -20,6 +20,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+from dataclasses import asdict
 from dataclasses import dataclass
 from dataclasses import field
 import functools
@@ -28,7 +29,9 @@ import json
 import os
 from pathlib import Path
 import signal
+import subprocess
 import sys
+import tempfile
 import time
 from typing import TYPE_CHECKING
 from typing import Any
@@ -1050,6 +1053,7 @@ def import_example(module_file: str) -> types.ModuleType:
 
 KERNEL_TIMEOUT = int(os.environ.get("HELION_BENCHMARK_KERNEL_TIMEOUT", "1200"))
 NUM_SHAPES: int | None = None  # Set from CLI; None means all shapes
+SHAPE_INDEX: int | None = None  # Set from CLI; restricts the kernel to one shape
 
 
 class _KernelTimeout(Exception):
@@ -1058,6 +1062,93 @@ class _KernelTimeout(Exception):
 
 def _alarm_handler(signum: int, frame: object) -> None:
     raise _KernelTimeout
+
+
+def _kernel_shape_count(name: str) -> int | None:
+    """Return the number of shapes for `name`, or None for baseline-less kernels.
+
+    Used by the subprocess-per-shape orchestrator to enumerate child invocations.
+    Calling the kernel's `shapes_fn` on the parent is safe — it allocates input
+    tensors but those get freed when this function returns.
+    """
+    if name not in KERNEL_MAPPINGS:
+        return None
+    _, _, baseline_fn, shapes_fn, _ = KERNEL_MAPPINGS[name][:5]
+    if baseline_fn is None or shapes_fn is None:
+        return None
+    return len(shapes_fn(NUM_SHAPES))
+
+
+def _run_one_shape_via_subprocess(name: str, shape_index: int | None) -> KernelResult:
+    """Spawn a child `run_tpu.py` invocation for one (kernel, shape) pair.
+
+    The child writes its KernelResult to a temp file via `--intermediate-result`.
+    stdout/stderr are inherited so autotune progress streams to the parent log
+    (and to GH Actions). A non-zero exit code is folded into a FAIL result so a
+    crashed shape doesn't abort the whole sweep.
+    """
+    with tempfile.NamedTemporaryFile(
+        prefix="run_tpu_result_", suffix=".json", delete=False, mode="w"
+    ) as tmp:
+        tmp_path = tmp.name
+    try:
+        cmd = [sys.executable, __file__, "--kernel", name, "--intermediate-result", tmp_path]
+        if NUM_SHAPES is not None:
+            cmd += ["--num-shapes", str(NUM_SHAPES)]
+        if shape_index is not None:
+            cmd += ["--shape-index", str(shape_index)]
+        proc = subprocess.run(cmd, env=os.environ.copy(), check=False)
+        if proc.returncode != 0 or not os.path.exists(tmp_path):
+            return KernelResult(
+                name=name,
+                passed=False,
+                error=f"Subprocess exited with code {proc.returncode}",
+            )
+        with open(tmp_path) as f:
+            payload = json.load(f)
+        shape_results = [ShapeResult(**sr) for sr in payload.get("shape_results", [])]
+        return KernelResult(
+            name=payload["name"],
+            passed=payload["passed"],
+            kernel_time_ms=payload.get("kernel_time_ms", 0.0),
+            error=payload.get("error"),
+            shape_results=shape_results,
+            accuracy_verified=payload.get("accuracy_verified", True),
+        )
+    finally:
+        if os.path.exists(tmp_path):
+            os.unlink(tmp_path)
+
+
+def _run_kernel_per_shape(name: str) -> KernelResult:
+    """Orchestrate per-shape subprocesses for one kernel, merge into one result."""
+    shape_count = _kernel_shape_count(name)
+    if shape_count is None:
+        # Baseline-less kernel (uses mod.main()): a single subprocess covers it.
+        return _run_one_shape_via_subprocess(name, shape_index=None)
+    merged_shape_results: list[ShapeResult] = []
+    all_passed = True
+    accuracy_verified = True
+    error_msg: str | None = None
+    for idx in range(shape_count):
+        print(
+            f"  [subprocess shape {idx + 1}/{shape_count}]", file=sys.stderr
+        )
+        result = _run_one_shape_via_subprocess(name, shape_index=idx)
+        if result.shape_results:
+            merged_shape_results.extend(result.shape_results)
+        if not result.passed:
+            all_passed = False
+            if result.error and not error_msg:
+                error_msg = result.error
+        accuracy_verified = accuracy_verified and result.accuracy_verified
+    return KernelResult(
+        name=name,
+        passed=all_passed,
+        error=error_msg,
+        shape_results=merged_shape_results,
+        accuracy_verified=accuracy_verified,
+    )
 
 
 def run_kernel(name: str) -> KernelResult:
@@ -1119,6 +1210,18 @@ def run_kernel_inner(name: str) -> KernelResult:
         # shape on TPU first and only then drop the unused tail, which can
         # OOM during shape construction with --num-shapes 2.
         shapes = shapes_fn(NUM_SHAPES)
+        # In subprocess-per-shape mode, the parent process spawns one child
+        # per (kernel, shape_index) so each autotune session starts on a
+        # fresh TPU device with no accumulated libtpu allocator state. The
+        # child is invoked with --shape-index=N to restrict its work.
+        if SHAPE_INDEX is not None:
+            if SHAPE_INDEX >= len(shapes):
+                return KernelResult(
+                    name=name,
+                    passed=False,
+                    error=f"--shape-index={SHAPE_INDEX} out of range (have {len(shapes)} shapes)",
+                )
+            shapes = [shapes[SHAPE_INDEX]]
         all_passed = True
         shape_results: list[ShapeResult] = []
         accuracy_verified = max_mismatch_pct is None or max_mismatch_pct < 1.0
@@ -1380,10 +1483,38 @@ def main() -> None:
         action="store_true",
         help="List available kernel names and exit",
     )
+    parser.add_argument(
+        "--shape-index",
+        type=int,
+        default=None,
+        help=(
+            "Restrict the run to this single shape index. Combined with --kernel, "
+            "runs exactly one (kernel, shape) — used by --subprocess-per-shape."
+        ),
+    )
+    parser.add_argument(
+        "--subprocess-per-shape",
+        action="store_true",
+        help=(
+            "Spawn one subprocess per (kernel, shape). Each subprocess gets a "
+            "fresh TPU device, isolating libtpu allocator state across runs. "
+            "Adds ~30-60s per subprocess for Python/JAX/torch_tpu init."
+        ),
+    )
+    parser.add_argument(
+        "--intermediate-result",
+        type=str,
+        default=None,
+        help=(
+            "Write a single KernelResult as JSON to this path (used by the "
+            "subprocess child to communicate its result back to the parent)."
+        ),
+    )
     args = parser.parse_args()
 
-    global NUM_SHAPES
+    global NUM_SHAPES, SHAPE_INDEX
     NUM_SHAPES = args.num_shapes
+    SHAPE_INDEX = args.shape_index
 
     if args.list_kernels:
         for name in KERNEL_MAPPINGS:
@@ -1419,7 +1550,10 @@ def main() -> None:
         print(f"\n{'=' * 65}", file=sys.stderr)
         print(f"Kernel: {name}", file=sys.stderr)
         print(f"{'=' * 65}", file=sys.stderr)
-        result = run_kernel(name)
+        if args.subprocess_per_shape:
+            result = _run_kernel_per_shape(name)
+        else:
+            result = run_kernel(name)
         results.append(result)
 
         status = "PASS" if result.passed else "FAIL"
@@ -1493,6 +1627,19 @@ def main() -> None:
     if args.output:
         write_results_json(args.output, results)
         print(f"Results written to {args.output}", file=sys.stderr)
+
+    if args.intermediate_result:
+        # Child-mode handoff: serialize the (single) KernelResult so the parent
+        # subprocess-per-shape orchestrator can reconstruct it. Always exactly
+        # one result when this flag is set (parent passes --kernel=<one>).
+        if len(results) != 1:
+            print(
+                f"Warning: --intermediate-result expects 1 result, got {len(results)}",
+                file=sys.stderr,
+            )
+        if results:
+            with open(args.intermediate_result, "w") as f:
+                json.dump(asdict(results[0]), f)
 
 
 if __name__ == "__main__":
