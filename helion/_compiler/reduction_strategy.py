@@ -110,13 +110,17 @@ def cute_live_reduction_threads(max_threads: int) -> int:
     return max_threads
 
 
-def _cute_vec_compatible_kernel() -> bool:
-    """Return True iff every load that feeds the reduction in the active
-    kernel is vec-eligible (no dtype-cast user).  Bf16/Fp16 inputs with a
-    ``.to(torch.float32)`` cast produce a scalar after the cast (CuTe's
-    ``Float32(vec)`` constructor degrades a vector), so the vec-load path
-    must be disabled at strategy-construction time when this pattern is
-    present.
+def _cute_vec_kernel_mode() -> str:
+    """Return ``"vec"`` when all reduction-feeding loads are vec-eligible
+    without a degrading dtype cast (i.e. fp32 -> fp32 pipeline), ``"unroll"``
+    when at least one load uses the bf16/fp16 -> fp32 cast pattern that the
+    CuTe DSL's ``Float32(vec)`` constructor would silently scalarise, or
+    ``"none"`` when there's no looped reduction at all.
+
+    ``"vec"`` lets the strategy emit a single ``cute.arch.load(..., V)`` +
+    V-fold per lane iter.  ``"unroll"`` falls back to a constexpr V-loop
+    around per-element scalar loads — the CUTLASS DSL cannot iterate the
+    elements of a bf16/fp16 vector without crashing during compile.
     """
     from .host_function import HostFunction
     from .host_function import NoCurrentFunction
@@ -124,9 +128,9 @@ def _cute_vec_compatible_kernel() -> bool:
     try:
         hf = HostFunction.current()
     except NoCurrentFunction:
-        return False
+        return "none"
     if hf._device_ir is None:
-        return False
+        return "none"
     cast_targets = {
         "convert_element_type.default",
         "convert_element_type",
@@ -136,6 +140,7 @@ def _cute_vec_compatible_kernel() -> bool:
     from ..language import memory_ops as _memory_ops
 
     load_target = _memory_ops.load
+    has_cast = False
     for graph_info in hf.device_ir.graphs:
         for node in graph_info.graph.nodes:
             if node.target is not load_target:
@@ -143,8 +148,13 @@ def _cute_vec_compatible_kernel() -> bool:
             for user in node.users:
                 target_name = getattr(user.target, "__name__", "") or ""
                 if target_name in cast_targets:
-                    return False
-    return True
+                    has_cast = True
+                    break
+            if has_cast:
+                break
+        if has_cast:
+            break
+    return "unroll" if has_cast else "vec"
 
 
 def _block_has_indexed_reduction(fn: DeviceFunction, block_index: int) -> bool:
@@ -758,6 +768,9 @@ class LoopedReductionStrategy(ReductionStrategy):
         self._cute_reduction_lane_var: str | None = None
         self._cute_reduction_lane_extent = 1
         self._cute_reduction_vec_width = 1
+        # ``"vec"`` (fp32 fast path) or ``"unroll"`` (bf16/fp16 fallback)
+        # — controls how the lane body emits each per-iter load.
+        self._cute_reduction_vec_mode = "vec"
         # Masks queued by vec loads inside the lane loop; consumed by
         # codegen_reduction to wrap the V-fold scalar.
         self._cute_pending_vec_masks: list[str] = []
@@ -794,12 +807,14 @@ class LoopedReductionStrategy(ReductionStrategy):
                 isinstance(vec_width, int)
                 and vec_width > 1
                 and self._cute_reduction_lane_extent % vec_width == 0
-                and _cute_vec_compatible_kernel()
             ):
-                self._cute_reduction_vec_width = vec_width
-                self._cute_reduction_lane_extent = (
-                    self._cute_reduction_lane_extent // vec_width
-                )
+                mode = _cute_vec_kernel_mode()
+                if mode in ("vec", "unroll"):
+                    self._cute_reduction_vec_width = vec_width
+                    self._cute_reduction_vec_mode = mode
+                    self._cute_reduction_lane_extent = (
+                        self._cute_reduction_lane_extent // vec_width
+                    )
         if env.known_multiple(
             env.block_sizes[block_index].numel, self._loop_block_size
         ):
@@ -944,8 +959,23 @@ class LoopedReductionStrategy(ReductionStrategy):
                     isinstance(n.meta.get("lowering"), ReductionLowering)
                     for n in graph.nodes
                 )
-        consume_unroll = vec > 1 and not graph_has_reduction
+        # Unroll the lane body via a constexpr V-loop when the consume sweep
+        # mixes scalars (no reduction in graph), OR when the reduce sweep is
+        # in ``"unroll"`` mode (bf16/fp16 inputs that the CuTe DSL can't
+        # safely subscript as a vector).
+        consume_unroll = vec > 1 and (
+            not graph_has_reduction or self._cute_reduction_vec_mode == "unroll"
+        )
+        # Map from (tensor_name, base_expr) -> (hoist_var, dtype) so the
+        # dispatcher can reuse one hoist per (tensor, base) pair instead of
+        # emitting a fresh vec load on every dispatcher call.
+        self._cute_lane_vec_loads: dict[tuple[str, str], tuple[str, torch.dtype]] = {}
+        # Variable name holding the per-lane-iter base index for vec hoists
+        # in ``unroll`` mode — the dispatcher uses this to compute the vec
+        # pointer offset once.
+        self._cute_lane_base_index_var: str | None = None
         vec_lane_var: str | None = None
+        base_expr: str = ""
         if reduction_lane_var is not None:
             if vec > 1:
                 # base = offset + thread_idx*V + lane*(THREADS*V)
@@ -960,8 +990,13 @@ class LoopedReductionStrategy(ReductionStrategy):
                         f"reduction_vec_lane_{block_index}",
                         dce=False,
                     )
+                    self._cute_lane_base_index_var = self.fn.new_var(
+                        f"reduction_lane_base_{block_index}",
+                        dce=False,
+                    )
+                    # index_var = base + vi  (used inside the constexpr loop)
                     inner_body[0] = statement_from_string(
-                        f"{index_var} = {base_expr} + cutlass.Int32({vec_lane_var})"
+                        f"{index_var} = {self._cute_lane_base_index_var} + cutlass.Int32({vec_lane_var})"
                     )
                 else:
                     inner_body[0] = statement_from_string(f"{index_var} = {base_expr}")
@@ -989,14 +1024,25 @@ class LoopedReductionStrategy(ReductionStrategy):
                     ).body[0],
                 )
                 vec_for.body = inner_body  # type: ignore[assignment]
-                inner_with_unroll: list[ast.AST] = [vec_for]
+                # The lane-loop body holds the per-lane base index, then any
+                # dispatcher-requested vec hoists, then the constexpr loop.
+                base_stmt = statement_from_string(
+                    f"{self._cute_lane_base_index_var} = {base_expr}"
+                )
+                lane_body: list[ast.AST] = [
+                    base_stmt,
+                    vec_for,
+                ]
                 body = [
                     _create_lane_loop(
                         reduction_lane_var,
                         self._cute_reduction_lane_extent,
-                        inner_with_unroll,
+                        lane_body,
                     )
                 ]
+                # Stash the lane body list so the dispatcher can splice
+                # hoists in (BETWEEN base_stmt and vec_for) as it runs.
+                self._cute_lane_body = lane_body
             else:
                 body = [
                     _create_lane_loop(
