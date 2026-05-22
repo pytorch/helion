@@ -77,9 +77,7 @@ def _codegen_common(
     device_fn = state.device_function
     fx_node = state.fx_node
     epilogue_subtile_group_id = (
-        None
-        if fx_node is None
-        else fx_node.meta.get("epilogue_subtile_group_id")
+        None if fx_node is None else fx_node.meta.get("epilogue_subtile_group_id")
     )
     if epilogue_subtile_group_id is None:
         indexing_idx = device_fn.atomic_op_index
