@@ -1064,19 +1064,19 @@ def _alarm_handler(signum: int, frame: object) -> None:
     raise _KernelTimeout
 
 
-def _kernel_shape_count(name: str) -> int | None:
-    """Return the number of shapes for `name`, or None for baseline-less kernels.
+def _kernel_is_baseline_less(name: str) -> bool:
+    """Whether `name` runs via `mod.main()` instead of per-shape autotune.
 
-    Used by the subprocess-per-shape orchestrator to enumerate child invocations.
-    Calling the kernel's `shapes_fn` on the parent is safe — it allocates input
-    tensors but those get freed when this function returns.
+    Cheap to evaluate — only inspects KERNEL_MAPPINGS metadata, never calls
+    `shapes_fn`. The orchestrator must NOT call shapes_fn in the parent
+    because it allocates `device=DEVICE` tensors which forces PJRT to grab
+    the TPU lock — subsequent child subprocesses then fail with `open(
+    /dev/vfio/N): Device or resource busy`.
     """
     if name not in KERNEL_MAPPINGS:
-        return None
+        return False
     _, _, baseline_fn, shapes_fn, _ = KERNEL_MAPPINGS[name][:5]
-    if baseline_fn is None or shapes_fn is None:
-        return None
-    return len(shapes_fn(NUM_SHAPES))
+    return baseline_fn is None or shapes_fn is None
 
 
 _LIBTPU_LOCKFILE = "/tmp/libtpu_lockfile"
@@ -1153,20 +1153,26 @@ def _run_one_shape_via_subprocess(name: str, shape_index: int | None) -> KernelR
 
 
 def _run_kernel_per_shape(name: str) -> KernelResult:
-    """Orchestrate per-shape subprocesses for one kernel, merge into one result."""
-    shape_count = _kernel_shape_count(name)
-    if shape_count is None:
-        # Baseline-less kernel (uses mod.main()): a single subprocess covers it.
+    """Orchestrate per-shape subprocesses for one kernel, merge into one result.
+
+    Walks shape indices 0, 1, 2, ... by spawning one child per index. Stops
+    when a child returns an error matching ``--shape-index=N out of range``.
+    Doing it this way avoids the parent calling ``shapes_fn`` (which would
+    allocate `device=DEVICE` tensors and lock the TPU for the children).
+    """
+    if _kernel_is_baseline_less(name):
         return _run_one_shape_via_subprocess(name, shape_index=None)
     merged_shape_results: list[ShapeResult] = []
     all_passed = True
     accuracy_verified = True
     error_msg: str | None = None
-    for idx in range(shape_count):
-        print(
-            f"  [subprocess shape {idx + 1}/{shape_count}]", file=sys.stderr
-        )
+    idx = 0
+    while True:
+        print(f"  [subprocess shape {idx}]", file=sys.stderr)
         result = _run_one_shape_via_subprocess(name, shape_index=idx)
+        if result.error and "out of range" in result.error:
+            # Sentinel: we've walked off the end of shapes_fn's list.
+            break
         if result.shape_results:
             merged_shape_results.extend(result.shape_results)
         if not result.passed:
@@ -1174,6 +1180,9 @@ def _run_kernel_per_shape(name: str) -> KernelResult:
             if result.error and not error_msg:
                 error_msg = result.error
         accuracy_verified = accuracy_verified and result.accuracy_verified
+        idx += 1
+        if NUM_SHAPES is not None and idx >= NUM_SHAPES:
+            break
     return KernelResult(
         name=name,
         passed=all_passed,
