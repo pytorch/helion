@@ -1815,10 +1815,41 @@ def _create_cute_wrapper(
     for i, entry in enumerate(schema_key):
         kind = entry[0]
         if kind == "tensor":
-            (_, _dtype, rank) = entry
-            assert isinstance(rank, int)
             ptr_name = f"arg{i}_ptr"
             params.append(f"{ptr_name}: cute.Pointer")
+            if len(entry) == 5:
+                # ("tensor", dtype, rank, sizes, strides) — baked layout.
+                # Wrapper plans (matmul TMA) also reference
+                # ``arg{i}_shape{d}`` / ``arg{i}_stride{d}`` names, so we
+                # bind those names to their literal values in the wrapper
+                # body before constructing the tensor.
+                (_, _dtype, rank, sizes_t, strides_t) = entry
+                assert isinstance(rank, int)
+                assert isinstance(sizes_t, tuple) and len(sizes_t) == rank
+                assert isinstance(strides_t, tuple) and len(strides_t) == rank
+                shape_literals = [repr(int(s)) for s in sizes_t]
+                stride_literals = [repr(int(s)) for s in strides_t]
+                for d, lit in enumerate(shape_literals):
+                    body.append(f"    arg{i}_shape{d} = {lit}")
+                for d, lit in enumerate(stride_literals):
+                    body.append(f"    arg{i}_stride{d} = {lit}")
+                shape_tuple = (
+                    f"({shape_literals[0]},)"
+                    if rank == 1
+                    else f"({', '.join(shape_literals)})"
+                )
+                stride_tuple = (
+                    f"({stride_literals[0]},)"
+                    if rank == 1
+                    else f"({', '.join(stride_literals)})"
+                )
+                body.append(
+                    f"    arg{i} = cute.make_tensor({ptr_name}, layout=cute.make_layout({shape_tuple}, stride={stride_tuple}))"
+                )
+                call_args.append(f"arg{i}")
+                continue
+            (_, _dtype, rank) = entry
+            assert isinstance(rank, int)
             shape_names = [f"arg{i}_shape{d}" for d in range(rank)]
             stride_names = [f"arg{i}_stride{d}" for d in range(rank)]
             params.extend(f"{name}: cutlass.Int64" for name in shape_names)
@@ -2472,18 +2503,38 @@ def _build_cute_schema_and_args(
     cute_kernel: object,
     args: tuple[object, ...],
     grid: tuple[int, int, int],
+    bake_tensor_shapes: bool = True,
 ) -> tuple[tuple[tuple[object, ...], ...], tuple[object, ...]]:
     gmem_space, make_ptr_obj, current_stream_obj = _get_cute_launcher_imports()
     make_ptr = cast("Any", make_ptr_obj)
     current_stream = cast("Any", current_stream_obj)
     constexpr_flags = _cute_kernel_param_is_constexpr(cute_kernel)
+    # Kernels that emit cute MMA ops (universal matmul fallback or tcgen05
+    # TMA wrapper plans) need runtime tensor layouts: the wrapper's
+    # ``cute.make_tensor`` feeds into ``.mark_layout_dynamic`` (TMA path) or
+    # into in-kernel arithmetic that relies on dynamic shape/stride
+    # propagation (universal MMA SMEM-load guards). Baking literal shapes
+    # silently miscompiles those paths.
+    if bake_tensor_shapes:
+        any_obj = cast("Any", cute_kernel)
+        disable_bake = bool(
+            getattr(any_obj, "_helion_cute_disable_bake_tensor_shapes", False)
+            or getattr(any_obj, "_helion_cute_wrapper_plans", None)
+        )
+        if disable_bake:
+            bake_tensor_shapes = False
     schema: list[tuple[object, ...]] = []
     launch_args: list[object] = []
     for i, arg in enumerate(args):
         if isinstance(arg, torch.Tensor):
             _validate_cute_launcher_tensor(arg)
             ndim = arg.ndim
-            schema.append(("tensor", str(arg.dtype), ndim))
+            if ndim <= 0:
+                raise exc.BackendUnsupported(
+                    "cute", "launcher requires tensor rank >= 1"
+                )
+            sizes_t = tuple(int(arg.size(d)) for d in range(ndim))
+            strides_t = tuple(int(arg.stride(d)) for d in range(ndim))
             launch_args.append(
                 make_ptr(
                     cast("Any", _torch_dtype_to_cutlass(arg.dtype)),
@@ -2492,10 +2543,21 @@ def _build_cute_schema_and_args(
                     assumed_align=16,
                 )
             )
-            sizes = arg.size()
-            strides = arg.stride()
-            launch_args.extend(int(sizes[d]) for d in range(ndim))
-            launch_args.extend(int(strides[d]) for d in range(ndim))
+            # ``cute.make_layout`` rejects a 0 in any shape dimension, so
+            # zero-sized tensors must keep the runtime-shape path.
+            if bake_tensor_shapes and all(s > 0 for s in sizes_t):
+                # Bake the shape / stride tuple into the schema key.  The
+                # generated wrapper substitutes literal Int values for each
+                # dimension, so the CuTe DSL sees a fully static tensor
+                # layout and the per-load offset arithmetic collapses to
+                # constant strides — typically a 2-3x reduction in
+                # ``smsp__inst_executed`` for reduction kernels where the
+                # inner loop is dominated by stride multiplies.
+                schema.append(("tensor", str(arg.dtype), ndim, sizes_t, strides_t))
+            else:
+                schema.append(("tensor", str(arg.dtype), ndim))
+                launch_args.extend(sizes_t)
+                launch_args.extend(strides_t)
             continue
 
         scalar_kind, scalar_value = _normalize_cute_scalar(arg)

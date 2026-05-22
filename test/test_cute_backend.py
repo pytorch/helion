@@ -912,6 +912,43 @@ class TestCuteBackend(TestCase):
         self.assertIn("ir.VectorType.get([4], cutlass.Uint16.mlir_type)", code)
         self.assertIn(".bitcast(cutlass.BFloat16)", code)
 
+    def test_two_pass_load_fusion_shape_b_wide_chunk(self) -> None:
+        """Shape B: V=1 wide-chunk reduction emits a lane loop inside the
+        outer offset loop, and the fuser caches loaded x values across the
+        reduce and consume sweeps."""
+        args = (torch.randn(2, 16384, device=DEVICE, dtype=torch.float32) + 2.0,)
+        code, out = code_and_output(
+            cute_normalize_by_sum,
+            args,
+            block_sizes=[1],
+            reduction_loop=8192,
+        )
+        (x,) = args
+        expected = x / x.sum(-1, keepdim=True)
+        torch.testing.assert_close(out, expected, rtol=1e-4, atol=1e-4)
+        # The fuser allocates a fragment and rewrites the consume sweep's
+        # load to read from the cache.
+        self.assertIn("cute.make_fragment", code)
+        self.assertIn("_fuse_cache_0", code)
+
+    def test_two_pass_load_fusion_shape_c_vec_unroll(self) -> None:
+        """Shape C: V>1 unroll mode hoists a Uint16 vec load above the
+        constexpr V-loop; the fuser recognises the vec hoist and caches
+        cache_size * V scalar slots across the two sweeps."""
+        args = (torch.randn(2, 16384, device=DEVICE, dtype=torch.bfloat16) + 2.0,)
+        code, out = code_and_output(
+            cute_normalize_by_sum_fp32_cast,
+            args,
+            block_sizes=[1],
+            reduction_loop=8192,
+            cute_vector_widths=[4],
+        )
+        (x,) = args
+        expected = (x.float() / x.float().sum(-1, keepdim=True)).to(x.dtype)
+        torch.testing.assert_close(out, expected, rtol=1e-2, atol=1e-2)
+        self.assertIn("cute.make_fragment", code)
+        self.assertIn("_fuse_cache_0", code)
+
     def test_strided_threaded_block_reduction(self) -> None:
         args = (torch.randn(4, 16, device=DEVICE, dtype=torch.float32),)
         code, out = code_and_output(cute_row_centered, args, block_sizes=[2, 8, 8])
