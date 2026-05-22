@@ -1655,13 +1655,11 @@ class TestExamples(RefEagerTestBase, TestCase):
             num_stages=3,
         )
 
-    @xfailIfPallas("BackendError on pallas")
-    @skipIfXPU("Timeout on XPU")
-    def test_gather_gemv(self):
+    def _check_gather_gemv(self, dtype: torch.dtype):
         args = (
-            torch.randn([4, 512, 512], device=DEVICE, dtype=torch.float32),
+            torch.randn([4, 512, 512], device=DEVICE, dtype=dtype),
             torch.randint(0, 4, [2], device=DEVICE, dtype=torch.int32),
-            torch.randn([512], device=DEVICE, dtype=torch.float32),
+            torch.randn([512], device=DEVICE, dtype=dtype),
         )
 
         def expected(w, idx, x):
@@ -1677,6 +1675,16 @@ class TestExamples(RefEagerTestBase, TestCase):
             num_warps=8,
             num_stages=1,
         )
+
+    # Pallas f32 succeeds under CPU emulation but fails on TPU.
+    @skipIfPallas("Pallas int32 gather coverage uses test_gather_gemv_half")
+    @skipIfXPU("Timeout on XPU")
+    def test_gather_gemv(self):
+        self._check_gather_gemv(torch.float32)
+
+    @skipIfXPU("Timeout on XPU")
+    def test_gather_gemv_half(self):
+        self._check_gather_gemv(HALF_DTYPE)
 
     @xfailIfCute("CuTe int4 GEMM example is not supported yet")
     @xfailIfPallas("int4 unpacking not supported on pallas")
