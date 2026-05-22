@@ -147,6 +147,17 @@ def cute_normalize_by_sum(x: torch.Tensor) -> torch.Tensor:
 
 
 @helion.kernel(backend="cute")
+def cute_normalize_by_sum_fp32_cast(x: torch.Tensor) -> torch.Tensor:
+    n, _m = x.size()
+    out = torch.empty_like(x)
+    for tile_n in hl.tile(n):
+        vals = x[tile_n, :].to(torch.float32)
+        row_sum = vals.sum(-1)
+        out[tile_n, :] = (vals / row_sum[:, None]).to(x.dtype)
+    return out
+
+
+@helion.kernel(backend="cute")
 def cute_row_centered(x: torch.Tensor) -> torch.Tensor:
     n, m = x.size()
     out = torch.empty_like(x)
@@ -882,6 +893,24 @@ class TestCuteBackend(TestCase):
         # base index is offset by ``thread_idx * V``.
         self.assertIn("cutlass.range_constexpr(4)", code_v4)
         self.assertIn("thread_idx()[0]) * 4", code_v4)
+
+    def test_bf16_unroll_mode_emits_uint16_vec_load_and_bitcast(self) -> None:
+        """For a bf16 reduction with an explicit fp32 cast, the 'unroll' vec
+        mode loads each V-chunk as a Uint16 vector and bitcasts each lane
+        back to bf16 via cutlass.Uint16(...).bitcast(cutlass.BFloat16)."""
+        args = (torch.randn(2, 16384, device=DEVICE, dtype=torch.bfloat16) + 2.0,)
+        code, out = code_and_output(
+            cute_normalize_by_sum_fp32_cast,
+            args,
+            block_sizes=[1],
+            reduction_loop=8192,
+            cute_vector_widths=[4],
+        )
+        (x,) = args
+        expected = (x.float() / x.float().sum(-1, keepdim=True)).to(x.dtype)
+        torch.testing.assert_close(out, expected, rtol=1e-2, atol=1e-2)
+        self.assertIn("ir.VectorType.get([4], cutlass.Uint16.mlir_type)", code)
+        self.assertIn(".bitcast(cutlass.BFloat16)", code)
 
     def test_strided_threaded_block_reduction(self) -> None:
         args = (torch.randn(4, 16, device=DEVICE, dtype=torch.float32),)
