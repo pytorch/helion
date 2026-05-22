@@ -4,10 +4,13 @@ from __future__ import annotations
 
 import dataclasses
 import math
+import multiprocessing as mp
 import os
 from pathlib import Path
+import pickle
 import random
 import signal
+import tempfile
 import time
 from types import SimpleNamespace
 from typing import TYPE_CHECKING
@@ -25,10 +28,15 @@ from helion._testing import onlyBackends
 from helion._testing import skipIfXPU
 from helion.autotuner.base_search import PopulationBasedSearch
 from helion.autotuner.base_search import PopulationMember
+from helion.autotuner.benchmark_job import BenchmarkJob
 from helion.autotuner.benchmark_provider import LocalBenchmarkProvider
+from helion.autotuner.benchmark_worker import BenchmarkSubprocessError
 from helion.autotuner.benchmark_worker import BenchmarkTimeout
 from helion.autotuner.benchmark_worker import BenchmarkWorker
 from helion.autotuner.benchmark_worker import BenchmarkWorkerDied
+from helion.autotuner.kernel_args import load_trusted_kernel_args
+from helion.autotuner.precompile_future import SerializedCompiledFunction
+from helion.autotuner.precompile_future import _run_kernel_in_subprocess_spawn
 from helion.autotuner.random_search import RandomSearch
 from helion.runtime.config import Config
 from helion.runtime.settings import Settings
@@ -59,6 +67,15 @@ class _RaiseRuntimeError:
 
 
 @dataclasses.dataclass
+class _RaiseUnpickleableLocalException:
+    def __call__(self) -> object:
+        class LocalError(Exception):
+            pass
+
+        raise LocalError("local exception")
+
+
+@dataclasses.dataclass
 class _Crash:
     def __call__(self) -> object:
         os.kill(os.getpid(), signal.SIGKILL)
@@ -74,6 +91,80 @@ class _ReturnValue:
 
 
 class TestBenchmarkWorkerFailureModes(unittest.TestCase):
+    def test_benchmark_job_can_use_wall_clock_bench(self) -> None:
+        fn = _ReturnValue(torch.empty(()))
+
+        with (
+            patch(
+                "helion.autotuner.benchmark_job._load_compiled_fn",
+                return_value=fn,
+            ) as load_fn,
+            patch(
+                "helion.autotuner.benchmark_job.load_trusted_kernel_args",
+                return_value=(),
+            ) as load_args,
+            patch("helion.autotuner.benchmark_job.do_bench") as event_bench,
+            patch(
+                "helion.autotuner.benchmark_job.do_bench_generic",
+                return_value=1.25,
+            ) as wall_clock_bench,
+        ):
+            result = BenchmarkJob(
+                fn_spec=cast("SerializedCompiledFunction", object()),
+                args_path="/tmp/args.pt",
+                use_wall_clock=True,
+            )()
+
+        self.assertEqual(result, 1.25)
+        load_fn.assert_called_once()
+        load_args.assert_called_once_with("/tmp/args.pt")
+        event_bench.assert_not_called()
+        wall_clock_bench.assert_called_once()
+
+    def test_load_trusted_kernel_args_accepts_python_objects(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "args.pt"
+            torch.save((_ReturnValue(3),), path)
+
+            load_trusted_kernel_args.cache_clear()
+            loaded = load_trusted_kernel_args(str(path))
+
+        self.assertIsInstance(loaded[0], _ReturnValue)
+        self.assertEqual(loaded[0].value, 3)
+
+    def test_spawn_precompile_loads_trusted_python_args(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            args_path = tmp_path / "args.pt"
+            result_path = tmp_path / "result.pkl"
+            torch.save((_ReturnValue(3),), args_path)
+            fn_spec = SerializedCompiledFunction(
+                function_name="call_arg",
+                source_code="def call_arg(fn):\n    return fn()\n",
+                filename="<test_spawn_precompile_loads_trusted_python_args>",
+                module_name=None,
+            )
+
+            process = mp.get_context("spawn").Process(
+                target=_run_kernel_in_subprocess_spawn,
+                args=(fn_spec, str(args_path), str(result_path), "@test"),
+            )
+            process.start()
+            try:
+                process.join(timeout=30)
+                if process.is_alive():
+                    process.kill()
+                    process.join(timeout=5)
+
+                self.assertEqual(process.exitcode, 0)
+                with result_path.open("rb") as f:
+                    result = pickle.load(f)
+                self.assertEqual(result, {"status": "ok"})
+            finally:
+                if process.is_alive():
+                    process.kill()
+                    process.join(timeout=5)
+
     def test_timeout_kills_worker(self) -> None:
         worker = BenchmarkWorker()
         try:
@@ -106,6 +197,17 @@ class TestBenchmarkWorkerFailureModes(unittest.TestCase):
             with self.assertRaises(BenchmarkWorkerDied):
                 worker.run(_Crash(), timeout=30.0)
             self.assertFalse(worker.alive())
+        finally:
+            worker.shutdown()
+
+    def test_unpickleable_worker_exception_is_serialized(self) -> None:
+        worker = BenchmarkWorker()
+        try:
+            with self.assertRaises(BenchmarkSubprocessError) as ctx:
+                worker.run(_RaiseUnpickleableLocalException(), timeout=30.0)
+            self.assertIn("unpickleable", str(ctx.exception))
+            self.assertTrue(worker.alive())
+            self.assertEqual(worker.run(_ReturnValue(7), timeout=30.0), 7)
         finally:
             worker.shutdown()
 

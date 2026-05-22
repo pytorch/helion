@@ -22,6 +22,19 @@ import zipfile
 
 RETENTION_DAYS = 365
 
+# CI alias (platform_short before any backend suffix) -> name of the
+# benchmark_dispatch input whose `default` lists the kernels that platform
+# is expected to run on the nightly cron. Stable mapping; the kernel list
+# itself is parsed from the workflow YAML so dashboard expectations track
+# whatever's currently in the workflow defaults without manual edits.
+_PLATFORM_KERNELS_INPUT = {
+    "h100": "kernels",
+    "b200": "kernels",
+    "b200_cute": "kernels_cute",
+    "mi350x": "kernels",
+    "tpu": "kernels_tpu",
+}
+
 
 def get_active_platforms(workflow_path):
     """Extract active platform aliases from the benchmark dispatch workflow."""
@@ -30,6 +43,47 @@ def get_active_platforms(workflow_path):
             return set(re.findall(r"alias:\s*(\S+)", f.read()))
     except OSError:
         return None
+
+
+def get_expected_kernels_per_platform(workflow_path):
+    """Map platform_short -> set of kernels that platform is expected to run.
+
+    Reads the per-input `default: "<csv>"` kernel lists from
+    benchmark_dispatch.yml so dashboard expectations track whatever's in
+    the workflow defaults. Used to distinguish "kernel was intentionally
+    removed from the matrix" (suppress from summary) from "kernel failed
+    to run on the latest nightly" (show as No Result / infra_missing).
+    """
+    try:
+        with open(workflow_path) as f:
+            lines = f.readlines()
+    except OSError:
+        return {}
+    # Line-by-line scan: when we see a `<indent>kernels<name>:` line, the
+    # next `<indent>default: "<csv>"` line below it is its default. Avoids
+    # a multi-line regex that CodeQL flags for catastrophic backtracking.
+    input_header = re.compile(r"^\s+(kernels\w*):\s*$")
+    input_default = re.compile(r'^\s+default:\s*"([^"]*)"\s*$')
+    input_defaults = {}
+    current = None
+    for line in lines:
+        m = input_header.match(line)
+        if m:
+            current = m.group(1)
+            continue
+        if current is None:
+            continue
+        md = input_default.match(line)
+        if md:
+            input_defaults[current] = {
+                k.strip() for k in md.group(1).split(",") if k.strip()
+            }
+            current = None
+    return {
+        plat: input_defaults[input_name]
+        for plat, input_name in _PLATFORM_KERNELS_INPUT.items()
+        if input_name in input_defaults
+    }
 
 
 def geo_mean(values):
@@ -149,7 +203,16 @@ def parse_run(run_dir, active_platforms=None):
         if not data:
             continue
 
-        platform = data[0].get("benchmark", {}).get("extra_info", {}).get("device", platform_short)
+        extra_info = data[0].get("benchmark", {}).get("extra_info", {})
+        backend = extra_info.get("backend")
+        backend_label = "CuTe" if backend == "cute" else backend
+        if backend and backend != "triton" and not platform_short.endswith(f"_{backend}"):
+            platform_short = f"{platform_short}_{backend}"
+            if active_platforms and platform_short not in active_platforms:
+                continue
+        platform = extra_info.get("device", platform_short)
+        if backend and backend != "triton":
+            platform = f"{platform} ({backend_label})"
         if platform == platform_short and platform in ("b200", "h100", "mi325x", "mi350x"):
             continue
 
@@ -208,7 +271,7 @@ def build_history_entry(run, metrics, shapes):
     }
 
 
-def build_dashboard_data(cache_dir, runs_meta, existing_data=None, active_platforms=None):
+def build_dashboard_data(cache_dir, runs_meta, existing_data=None, active_platforms=None, expected_kernels=None):
     """Aggregate benchmark data across runs into the dashboard JSON structure."""
     cutoff = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=RETENTION_DAYS)
     runs_meta_sorted = sorted(
@@ -299,6 +362,13 @@ def build_dashboard_data(cache_dir, runs_meta, existing_data=None, active_platfo
     # entry["history"] for the Compare tab but never overwrite Overview perf.
     summary = []
     for key, entry in sorted(kernel_index.items()):
+        # Suppress entries for kernels removed from the workflow's default
+        # kernel list for their platform. Without this the dashboard's
+        # "infra_missing" check would flag them as No Result indefinitely
+        # since the latest nightly will never include them.
+        expected = expected_kernels.get(entry["platform_short"]) if expected_kernels else None
+        if expected is not None and entry["kernel"] not in expected:
+            continue
         # Single pass: latest_main is the most recent nightly main entry (used
         # for failure classification); latest_data/prev_data are the most recent
         # with non-zero data (used for perf display and deltas).
@@ -431,6 +501,11 @@ def main():
     else:
         print("Warning: could not read dispatch workflow, showing all platforms")
 
+    expected_kernels = get_expected_kernels_per_platform(args.dispatch_workflow)
+    if expected_kernels:
+        for plat, kernels in sorted(expected_kernels.items()):
+            print(f"Expected kernels on {plat}: {len(kernels)} ({', '.join(sorted(kernels))})")
+
     existing = {}
     if args.existing_url:
         try:
@@ -461,7 +536,7 @@ def main():
         print(f"Downloading run {r['run_id']} ({r['sha']})...")
         download_artifacts(args.repo, r["run_id"], os.path.join(cache_dir, r["run_id"]))
 
-    data = build_dashboard_data(cache_dir, runs, existing, active_platforms)
+    data = build_dashboard_data(cache_dir, runs, existing, active_platforms, expected_kernels)
     with open(args.output, "w") as f:
         json.dump(data, f, indent=2)
 

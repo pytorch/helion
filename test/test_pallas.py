@@ -5,6 +5,8 @@ from typing import Callable
 import unittest
 
 import torch
+from torch.testing._internal.common_utils import instantiate_parametrized_tests
+from torch.testing._internal.common_utils import parametrize
 
 import helion
 from helion._testing import DEVICE
@@ -13,6 +15,8 @@ from helion._testing import code_and_output
 from helion._testing import onlyBackends
 from helion._testing import skipUnlessPallas
 from helion._testing import xfailIfPallas
+from helion._testing import xfailIfPallasInterpret
+from helion._testing import xfailIfPallasTpu
 import helion.language as hl
 
 
@@ -440,6 +444,16 @@ def pallas_chunked_add(x: torch.Tensor) -> torch.Tensor:
     return out
 
 
+@helion.kernel(backend="pallas", static_shapes=True)
+def pallas_rand_add(x: torch.Tensor, seed: int) -> torch.Tensor:
+    """Kernel that uses hl.rand to generate random values and add them to x."""
+    out = torch.empty_like(x)
+    (m,) = x.size()
+    for tile_m in hl.tile(m):
+        out[tile_m] = x[tile_m] + hl.rand([tile_m], seed=seed)
+    return out
+
+
 @onlyBackends(["triton", "pallas"])
 @skipUnlessPallas("JAX/Pallas TPU not available")
 class TestPallas(TestCase):
@@ -470,7 +484,12 @@ class TestPallas(TestCase):
             if "Ran out of memory in memory space vmem" in str(e):
                 self.fail(f"bfloat16 incorrectly threw VMEM OOM: {e}")
 
-        # Test 3: float8_e4m3fn (1 byte per element)
+    @xfailIfPallasInterpret(
+        "torch.float8_e4m3fn has no JAX dtype mapping in interpret mode; "
+        "conversion errors before the VMEM check fires"
+    )
+    def test_estimate_pallas_vmem_bytes_fp8(self) -> None:
+        """VMEM OOM at fp8 (1 byte/element)."""
         # 3 tensors * 4096 * 8192 * 1 byte * 2 (multiplier) = ~201.3MB (OOM)
         args_fp8 = (
             torch.randn(4096, 8192, device=DEVICE, dtype=torch.float32).to(
@@ -495,6 +514,68 @@ class TestPallas(TestCase):
         args = (torch.randn(4096, device=DEVICE), torch.randn(4096, device=DEVICE))
         code, result = code_and_output(add_kernel, args, block_size=512)
         torch.testing.assert_close(result, args[0] + args[1])
+
+    def test_store_slice_1d(self) -> None:
+        """Store value sliced when block_size > tensor dim (1D)."""
+
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def fill_kernel(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile in hl.tile(x.size(0)):
+                out[tile] = hl.full([tile], 1.0, dtype=x.dtype)
+            return out
+
+        x = torch.randn(1024, device=DEVICE, dtype=torch.float32)
+        code, result = code_and_output(fill_kernel, (x,), block_size=4096)
+        self.assertIn("[:1024]", code)
+        torch.testing.assert_close(result, torch.ones_like(x))
+
+    def test_store_slice_2d(self) -> None:
+        """Store value sliced on the dim where block_size > tensor dim (2D)."""
+
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def fill_2d(x: torch.Tensor) -> torch.Tensor:
+            m, n = x.size()
+            out = torch.empty_like(x)
+            for tile_m, tile_n in hl.tile([m, n]):
+                out[tile_m, tile_n] = hl.full([tile_m, tile_n], 1.0, dtype=x.dtype)
+            return out
+
+        # 100 < 128, 256 == 256 → only dim 0 needs slicing
+        x = torch.randn(100, 256, device=DEVICE, dtype=torch.float32)
+        code, result = code_and_output(fill_2d, (x,), block_size=[128, 256])
+        self.assertIn("[:100, :]", code)
+        torch.testing.assert_close(result, torch.ones_like(x))
+
+        # 100 < 128, 200 < 256 → both dims need slicing
+        x2 = torch.randn(100, 200, device=DEVICE, dtype=torch.float32)
+        code2, result2 = code_and_output(fill_2d, (x2,), block_size=[128, 256])
+        self.assertIn("[:100, :200]", code2)
+        torch.testing.assert_close(result2, torch.ones_like(x2))
+
+    def test_store_slice_skips_pl_ds_dim(self) -> None:
+        """Store value is not sliced on dimensions indexed with pl.ds()."""
+
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def fill_inner_loop(x: torch.Tensor) -> torch.Tensor:
+            m, n = x.size()
+            out = torch.empty_like(x)
+            for tile_m in hl.tile(m):
+                for tile_n in hl.tile(n):
+                    out[tile_m, tile_n] = hl.full([tile_m, tile_n], 1.0, dtype=x.dtype)
+            return out
+
+        x = torch.randn(64, 32, device=DEVICE, dtype=torch.float32)
+        code, result = code_and_output(
+            fill_inner_loop,
+            (x,),
+            block_size=[128, 64],
+            pallas_loop_type="fori_loop",
+        )
+        self.assertIn("pl.ds(", code)
+        self.assertIn("[:64, :]", code)
+        self.assertNotIn("[:64, :32]", code)
+        torch.testing.assert_close(result, torch.ones_like(x))
 
     def test_add_does_not_donate_inputs(self) -> None:
         """Verify that read-only inputs are not donated by the kernel.
@@ -1150,6 +1231,50 @@ class TestPallas(TestCase):
         ).to(device=DEVICE)
         torch.testing.assert_close(result, ref, rtol=1e-2, atol=1e-2)
 
+    def test_symnode_index_in_emit_pipeline_body(self) -> None:
+        """A SymInt expression derived from an outer tile index
+        (e.g. ``tile_h.begin // 2``, as in GQA's
+        ``h_idx // num_groups``) must be usable as an index inside an
+        inner ``hl.tile`` loop on the Pallas backend.
+        """
+
+        @helion.kernel(static_shapes=True)
+        def k(x: torch.Tensor) -> torch.Tensor:
+            H, N = x.size()
+            out = torch.empty_like(x)
+            for tile_h in hl.tile(H, block_size=1):
+                h_kv = tile_h.begin // 2
+                for tile_n in hl.tile(N):
+                    out[tile_h.begin, tile_n] = x[h_kv, tile_n]
+            return out
+
+        x = torch.randn(4, 8, dtype=torch.float32, device=DEVICE)
+        code_and_output(k, (x,))
+
+    def test_tile_index_broadcast_mask(self) -> None:
+        """Two 1D ``tile.index`` tensors must broadcast into a 2D mask via
+        ``[:, None]`` / ``[None, :]`` indexing — the natural PyTorch idiom
+        for causal / sliding-window mask construction.
+        """
+
+        @helion.kernel(static_shapes=True)
+        def k(x: torch.Tensor) -> torch.Tensor:
+            M, N = x.size()
+            out = torch.empty_like(x)
+            for tile_m in hl.tile(M):
+                for tile_n in hl.tile(N):
+                    mask = tile_m.index[:, None] >= tile_n.index[None, :]
+                    out[tile_m, tile_n] = torch.where(
+                        mask, x[tile_m, tile_n], torch.zeros_like(x[tile_m, tile_n])
+                    )
+            return out
+
+        x = torch.randn(8, 8, dtype=torch.float32, device=DEVICE)
+        _, result = code_and_output(k, (x,))
+        idx = torch.arange(8, device=DEVICE)
+        ref = torch.where(idx[:, None] >= idx[None, :], x, torch.zeros_like(x))
+        torch.testing.assert_close(result, ref)
+
     def test_emit_pipeline_loop_order(self) -> None:
         """Test emit_pipeline with loop_order reordering.
 
@@ -1193,6 +1318,7 @@ class TestPallas(TestCase):
         result = fn(x)
         torch.testing.assert_close(result, x)
 
+    @xfailIfPallasInterpret("numerical mismatch in JAX interpret mode")
     def test_scalar_access_2D_constexpr(self) -> None:
         @helion.kernel(backend="pallas", static_shapes=True, config=helion.Config())
         def fn(x: torch.Tensor) -> torch.Tensor:
@@ -1234,6 +1360,7 @@ class TestPallas(TestCase):
         expected = x.permute(0, 2, 1)
         torch.testing.assert_close(result, expected)
 
+    @xfailIfPallasInterpret("numerical mismatch in JAX interpret mode")
     def test_tile_index_with_symbolic_offset(self) -> None:
         """tile.index + tile.begin * constant should codegen valid variable names.
 
@@ -1255,6 +1382,7 @@ class TestPallas(TestCase):
         # pl.multiple_of hint should NOT be applied to offset expressions
         self.assertNotIn("pl.multiple_of(", code)
 
+    @xfailIfPallasInterpret("numerical mismatch in JAX interpret mode")
     def test_tile_index_with_symbolic_offset_emit_pipeline(self) -> None:
         """Same kernel under pallas_loop_type='emit_pipeline'.
 
@@ -1319,7 +1447,7 @@ class TestPallas(TestCase):
         expected = x + x[:, -1:]
         torch.testing.assert_close(result, expected)
 
-    @xfailIfPallas(
+    @xfailIfPallasTpu(
         "Mixed scalar write + slice needs tensor duplication into SMEM and VMEM"
     )
     def test_mixed_scalar_write_and_slice_access(self) -> None:
@@ -1412,7 +1540,7 @@ class TestPallas(TestCase):
         expected = x + 0.5
         torch.testing.assert_close(result, expected)
 
-    @xfailIfPallas("Pallas backend not correctly handling tile index with offset")
+    @xfailIfPallasTpu("Pallas TPU not correctly handling tile index with offset")
     def test_tensor_access_tile_index_offset(self) -> None:
         @helion.kernel(backend="pallas", static_shapes=True)
         def fn(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
@@ -1721,6 +1849,36 @@ class TestPallas(TestCase):
         ref = x.view(8, 8, 128).sum(1)
         torch.testing.assert_close(result, ref, rtol=1e-3, atol=1e-3)
 
+    def test_full_slice_matches_non_power_of_two_factory_dim(self) -> None:
+        """Non-pow2 full slices must match concrete factory-created dims."""
+
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def per_block_reduction(x: torch.Tensor) -> torch.Tensor:
+            m, n = x.shape
+            m_block = hl.register_block_size(x.size(0))
+            out = x.new_empty(
+                [(x.size(0) + m_block - 1) // m_block, n], dtype=torch.float32
+            )
+            for mb_cta in hl.tile(m, block_size=m_block):
+                acc = x.new_zeros([n], dtype=torch.float32)
+                for mb in hl.tile(mb_cta.begin, mb_cta.end):
+                    acc += x[mb, :].to(torch.float32).sum(0)
+                out[mb_cta.id, :] = acc
+            return out
+
+        x = torch.randn(64, 384, device=DEVICE, dtype=torch.float32)
+        _code, result = code_and_output(
+            per_block_reduction,
+            (x,),
+            block_sizes=[8, 8],
+            pallas_loop_type="fori_loop",
+        )
+        ref = x.view(8, 8, 384).sum(1)
+        torch.testing.assert_close(result, ref, rtol=1e-3, atol=1e-3)
+
+    @xfailIfPallasInterpret(
+        "JAX interpret cannot trace dynamic shapes (TypeError: JitTracer ~int32[])"
+    )
     def test_emit_pipeline_per_tensor_pipelined_mixed(self) -> None:
         """An emit_pipeline body can mix pipelined and non-pipelined tensors.
 
@@ -2369,6 +2527,7 @@ class TestPallas(TestCase):
         )
         torch.testing.assert_close(result, ref, rtol=1e-3, atol=1e-3)
 
+    @xfailIfPallasInterpret("numerical mismatch in JAX interpret mode")
     def test_dma_buffer_offset_nested_tile(self) -> None:
         """Inner loop reading outer-tiled tensor must use ':' not absolute offset."""
 
@@ -2548,12 +2707,115 @@ class TestPallas(TestCase):
             ref[i] = (x[s:e] @ y[s:e].T).sum()
         torch.testing.assert_close(result, ref, rtol=1e-2, atol=1e-2)
 
+    def test_if_branch_intermediate_outputs(self) -> None:
+        """Branch intermediates must survive in _if output list."""
+
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def if_with_intermediate(x: torch.Tensor, flag: float) -> torch.Tensor:
+            n, m = x.shape
+            block_n = hl.register_block_size(n)
+            block_m = hl.register_block_size(m)
+            out = torch.empty([n], device=x.device, dtype=torch.float32)
+            for tile_n in hl.tile(n, block_size=block_n):
+                acc = hl.zeros([tile_n, block_m], dtype=torch.float32)
+                for tile_m in hl.tile(m, block_size=block_m):
+                    v = x[tile_n, tile_m]
+                    if flag == 0.0:
+                        doubled = v * 2
+                        acc += doubled + 1
+                    else:
+                        acc += v
+                out[tile_n] = torch.sum(acc, dim=1)
+            return out
+
+        x = torch.randn(64, 64, device=DEVICE, dtype=torch.float32)
+
+        # else-branch
+        code, result = code_and_output(
+            if_with_intermediate,
+            (x, 0.5),
+            block_sizes=[1, 64],
+        )
+        self.assertIn("lax.cond", code)
+        torch.testing.assert_close(result, torch.sum(x, dim=1))
+
+        # if-branch
+        _, result = code_and_output(
+            if_with_intermediate,
+            (x, 0.0),
+            block_sizes=[1, 64],
+        )
+        torch.testing.assert_close(result, torch.sum(x * 2 + 1, dim=1))
+
+    def test_branch_nonlocal_write(self) -> None:
+        """Branch intermediates must survive in _if output list."""
+
+        @helion.kernel(backend="pallas", static_shapes=True, print_output_code=True)
+        def fn(x: torch.Tensor, flag: float, coeffs: torch.Tensor) -> torch.Tensor:
+            (n,) = x.shape
+            block_n = hl.register_block_size(n)
+            out = torch.empty([n], device=x.device, dtype=torch.float32)
+            for tile_n in hl.tile(n, block_size=block_n):
+                coeff_a = coeffs[0]
+                coeff_b = coeffs[1]
+                if flag == 1.0:
+                    coeff_a = coeffs[2]
+                    coeff_new = coeffs[3]
+                else:
+                    coeff_b = coeffs[4]
+                    coeff_new = coeffs[5]
+                out[tile_n] = x[tile_n] * coeff_a * coeff_b * coeff_new
+            return out
+
+        x = torch.ones(64, device=DEVICE, dtype=torch.float32)
+        coeffs = torch.arange(6, device=DEVICE, dtype=torch.float32)
+
+        # if-branch
+        code, result = code_and_output(
+            fn,
+            (x, 1.0, coeffs),
+            block_sizes=[64],
+        )
+        torch.testing.assert_close(result, x * coeffs[2] * coeffs[1] * coeffs[3])
+
+        # else-branch
+        code, result = code_and_output(
+            fn,
+            (x, 0.0, coeffs),
+            block_sizes=[64],
+        )
+        torch.testing.assert_close(result, x * coeffs[0] * coeffs[4] * coeffs[5])
+
+    def test_rand_add(self) -> None:
+        """Test kernel using hl.rand (RNG ops) passes _rng_seed_buffer correctly.
+
+        Regression test: the Pallas launcher previously inserted _rng_seed_buffer
+        at position -1 (before _inplace_indices), which put it between
+        _output_indices and _inplace_indices. The fix places _rng_seed_buffer
+        before both _output_indices and _inplace_indices so the Pallas runtime
+        receives arguments in the correct order.
+        """
+        x = torch.randn(1024, device=DEVICE, dtype=torch.float32)
+        _, result = code_and_output(
+            pallas_rand_add,
+            (x, 42),
+            block_sizes=[1024],
+        )
+        # Verify shape and dtype are correct
+        self.assertEqual(result.shape, x.shape)
+        self.assertEqual(result.dtype, x.dtype)
+        # The result should differ from x (random values added)
+        self.assertFalse(torch.allclose(result, x))
+        # All added random values should be in [0, 1), so result >= x and < x + 1
+        self.assertTrue(torch.all(result >= x))
+        self.assertTrue(torch.all(result < x + 1.0))
+
 
 @skipUnlessPallas("JAX/Pallas TPU not available")
 class TestPallasIndirectGather(TestCase):
     @staticmethod
-    def _gather_2d_kernel():
-        @helion.kernel(backend="pallas", static_shapes=True)
+    def _gather_2d_kernel(static_shapes: bool = True):
+        @helion.kernel(backend="pallas", static_shapes=static_shapes)
         def gather(indices: torch.Tensor, table: torch.Tensor) -> torch.Tensor:
             out = torch.empty(
                 [indices.size(0), table.size(1)],
@@ -2566,31 +2828,38 @@ class TestPallasIndirectGather(TestCase):
 
         return gather
 
-    def test_gather_fp32_uses_highest_precision(self) -> None:
-        gather = self._gather_2d_kernel()
+    @parametrize("static_shapes", (True, False))
+    def test_gather_fp32_uses_highest_precision(self, static_shapes: bool) -> None:
+        gather = self._gather_2d_kernel(static_shapes=static_shapes)
         table = torch.randn(16, 64, device=DEVICE, dtype=torch.float32)
         indices = torch.randint(0, 16, (256,), device=DEVICE, dtype=torch.int32)
         code, result = code_and_output(gather, (indices, table), block_sizes=[128, 64])
         self.assertIn("one_hot", code)
         self.assertIn("HIGHEST", code)
+        if not static_shapes:
+            self.assertIn(".shape[0]", code)
         ref = table.cpu()[indices.long().cpu()].to(device=DEVICE)
         torch.testing.assert_close(result, ref)
 
-    def test_gather_bf16_skips_highest(self) -> None:
-        gather = self._gather_2d_kernel()
+    @parametrize("static_shapes", (True, False))
+    def test_gather_bf16_skips_highest(self, static_shapes: bool) -> None:
+        gather = self._gather_2d_kernel(static_shapes=static_shapes)
         table = torch.randn(16, 64, device=DEVICE, dtype=torch.bfloat16)
         indices = torch.randint(0, 16, (256,), device=DEVICE, dtype=torch.int32)
         code, result = code_and_output(gather, (indices, table), block_sizes=[128, 64])
         self.assertIn("one_hot", code)
         self.assertNotIn("HIGHEST", code)
         self.assertNotIn("astype(jnp.float32)", code)
+        if not static_shapes:
+            self.assertIn(".shape[0]", code)
         ref = table.cpu()[indices.long().cpu()].to(device=DEVICE)
         torch.testing.assert_close(result, ref)
 
-    def test_gather_2d_index_tile(self) -> None:
+    @parametrize("static_shapes", (True, False))
+    def test_gather_2d_index_tile(self, static_shapes: bool) -> None:
         """Regression: 2D index tile must contract the last axis, not axis 1."""
 
-        @helion.kernel(backend="pallas", static_shapes=True)
+        @helion.kernel(backend="pallas", static_shapes=static_shapes)
         def gather(indices: torch.Tensor, table: torch.Tensor) -> torch.Tensor:
             out = torch.empty(
                 [indices.size(0), indices.size(1), table.size(1)],
@@ -2609,53 +2878,52 @@ class TestPallasIndirectGather(TestCase):
             gather, (indices, table), block_sizes=[8, 128, 128]
         )
         self.assertIn("one_hot", code)
+        if not static_shapes:
+            self.assertIn(".shape[0]", code)
         ref = table.cpu()[indices.long().cpu()].to(device=DEVICE)
         torch.testing.assert_close(result, ref)
 
-    def test_gather_over_vmem_budget_raises(self) -> None:
+    @parametrize("static_shapes", (True, False))
+    def test_gather_over_vmem_budget_raises(self, static_shapes: bool) -> None:
         """Table above VMEM budget fails fast with a clear message."""
-        gather = self._gather_2d_kernel()
+        gather = self._gather_2d_kernel(static_shapes=static_shapes)
         table = torch.randn(65537, 64, device=DEVICE, dtype=torch.float32)
         indices = torch.randint(0, 65537, (256,), device=DEVICE, dtype=torch.int32)
-        with self.assertRaisesRegex(Exception, "exceeds the .* VMEM threshold"):
-            code_and_output(gather, (indices, table), block_sizes=[128, 64])
+        if static_shapes:
+            with self.assertRaisesRegex(Exception, "exceeds the .* VMEM threshold"):
+                code_and_output(gather, (indices, table), block_sizes=[128, 64])
+        else:
+            # Dynamic shape tables bypass static VMEM check
+            pass
 
-    def test_gather_vmem_budget_uses_block_size(self) -> None:
+    @parametrize("static_shapes", (True, False))
+    def test_gather_vmem_budget_uses_block_size(self, static_shapes: bool) -> None:
         """Tiling broadcast dims shrinks the VMEM block.
 
         Full table is over the threshold but the resident block after tiling
         the broadcast dim fits, so the check must pass.
         """
-        gather = self._gather_2d_kernel()
+        gather = self._gather_2d_kernel(static_shapes=static_shapes)
         # Full table = 8192 * 1024 * 4 = 32 MiB (over the 16 MiB limit).
         # Resident VMEM block with BE=256 = 8192 * 256 * 4 = 8 MiB, fits.
         table = torch.randn(8192, 1024, device=DEVICE, dtype=torch.float32)
         indices = torch.randint(0, 8192, (256,), device=DEVICE, dtype=torch.int32)
         code_and_output(gather, (indices, table), block_sizes=[128, 256])
 
-    def test_gather_integer_table_rejected(self) -> None:
+    @parametrize("static_shapes", (True, False))
+    def test_gather_integer_table_rejected(self, static_shapes: bool) -> None:
         """Gather on non-floating tables raises at plan time."""
-
-        @helion.kernel(backend="pallas", static_shapes=True)
-        def gather(indices: torch.Tensor, table: torch.Tensor) -> torch.Tensor:
-            out = torch.empty(
-                [indices.size(0), table.size(1)],
-                dtype=table.dtype,
-                device=table.device,
-            )
-            for tile_b, tile_e in hl.tile([indices.size(0), table.size(1)]):
-                out[tile_b, tile_e] = table[indices[tile_b], tile_e]
-            return out
-
+        gather = self._gather_2d_kernel(static_shapes=static_shapes)
         table = torch.randint(0, 100, (16, 64), device=DEVICE, dtype=torch.int32)
         indices = torch.randint(0, 16, (256,), device=DEVICE, dtype=torch.int32)
         with self.assertRaisesRegex(Exception, "must be floating point"):
             code_and_output(gather, (indices, table), block_sizes=[128, 64])
 
-    def test_scatter_raises(self) -> None:
+    @parametrize("static_shapes", (True, False))
+    def test_scatter_raises(self, static_shapes: bool) -> None:
         """Indirect store has no Pallas strategy; plan_tiling must raise."""
 
-        @helion.kernel(backend="pallas", static_shapes=True)
+        @helion.kernel(backend="pallas", static_shapes=static_shapes)
         def scatter(
             out: torch.Tensor, values: torch.Tensor, indices: torch.Tensor
         ) -> torch.Tensor:
@@ -2669,9 +2937,12 @@ class TestPallasIndirectGather(TestCase):
         with self.assertRaisesRegex(Exception, "indirect store"):
             code_and_output(scatter, (out, values, indices), block_sizes=[8, 64])
 
-    def test_gather_1d_index_bumps_block_to_tpu_alignment(self) -> None:
+    @parametrize("static_shapes", (True, False))
+    def test_gather_1d_index_bumps_block_to_tpu_alignment(
+        self, static_shapes: bool
+    ) -> None:
         """Block size on a 1D int32 index must be bumped to 128."""
-        gather = self._gather_2d_kernel()
+        gather = self._gather_2d_kernel(static_shapes=static_shapes)
         table = torch.randn(1024, 256, device=DEVICE, dtype=torch.bfloat16)
         indices = torch.randint(0, 1024, (1024,), device=DEVICE, dtype=torch.int32)
         # If the bump didn't happen, the generated code would slice with
@@ -2680,6 +2951,27 @@ class TestPallasIndirectGather(TestCase):
         self.assertNotIn("pl.ds(offset_0, 8)", code)
         ref = table.cpu()[indices.long().cpu()].to(device=DEVICE)
         torch.testing.assert_close(result, ref, rtol=1e-2, atol=1e-2)
+
+
+instantiate_parametrized_tests(TestPallasIndirectGather)
+
+
+class TestPallasPrinter(TestCase):
+    def test_pallas_texpr_mod(self) -> None:
+        """pallas_texpr must handle Mod/PythonMod/FloorDiv (used by bh % heads)."""
+        import sympy
+        from torch.utils._sympy.functions import FloorDiv
+        from torch.utils._sympy.functions import PythonMod
+
+        from helion._compiler.device_function import pallas_texpr
+
+        x, y = sympy.symbols("x y")
+        self.assertEqual(pallas_texpr(PythonMod(x, y)), "(x % y)")
+        self.assertEqual(pallas_texpr(FloorDiv(x, y)), "(x // y)")
+        self.assertEqual(
+            pallas_texpr(FloorDiv(x, y) + PythonMod(x, y)),
+            "((x // y)) + ((x % y))",
+        )
 
 
 if __name__ == "__main__":

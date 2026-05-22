@@ -245,7 +245,11 @@ if triton_is_available():
     def _min_dot_size(
         device: torch.device, lhs: torch.dtype, rhs: torch.dtype
     ) -> tuple[int, int, int]:
-        if device.type == "tpu":
+        # Helion's Pallas backend always targets TPU's Mosaic MXU, even in
+        # interpret mode where the actual device is "cpu".
+        from .runtime.settings import _get_backend
+
+        if _get_backend() == "pallas":
             # TPU Mosaic MXU tile: (8, 128) sublane × lane.
             # pl.dot(lhs[M,K], rhs[K,N]) needs M>=8, K>=128, N>=128.
             return (8, 128, 128)
@@ -328,7 +332,9 @@ else:
     def _min_dot_size(  # type: ignore[misc]
         device: torch.device, lhs: torch.dtype, rhs: torch.dtype
     ) -> tuple[int, int, int]:
-        if device.type == "tpu":
+        from .runtime.settings import _get_backend
+
+        if _get_backend() == "pallas":
             return (8, 128, 128)
         return (16, 16, 16)
 
@@ -339,6 +345,19 @@ else:
 def supports_tensor_descriptor() -> bool:
     # call private func we can patch in testing
     return _supports_tensor_descriptor()
+
+
+def target_device_capability(
+    device: torch.device | None = None,
+) -> tuple[int, int] | None:
+    """Return CUDA compute capability, or None for non-CUDA/unavailable targets."""
+    if device is not None and device.type != "cuda":
+        return None
+    if not torch.cuda.is_available():
+        return None
+    if device is None:
+        return torch.cuda.get_device_capability(torch.cuda.current_device())
+    return torch.cuda.get_device_capability(device)
 
 
 def min_dot_size(

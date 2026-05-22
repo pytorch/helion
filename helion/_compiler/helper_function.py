@@ -3,6 +3,7 @@ from __future__ import annotations
 from abc import ABC
 from abc import abstractmethod
 import ast
+import contextlib
 import inspect
 from typing import TYPE_CHECKING
 from typing import Callable
@@ -18,7 +19,10 @@ from .ast_extension import expr_from_string
 from .ast_extension import statement_from_string
 
 if TYPE_CHECKING:
+    from collections.abc import Iterator
     import types
+
+    from torch.fx.node import Node
 
     from .device_function import DeviceFunction
     from .device_ir import HelperFunctionGraphInfo
@@ -33,6 +37,10 @@ class CodegenInterface(ABC):
     @abstractmethod
     def add_statement(self, stmt: ast.AST | str | None) -> None:
         """Add a statement to the generated code."""
+
+    @contextlib.contextmanager
+    def statement_owner_node(self, node: Node) -> Iterator[None]:
+        yield
 
     def tmpvar(self, *, dce: bool = False, prefix: str = "v") -> str:
         """Generate a temporary variable name."""

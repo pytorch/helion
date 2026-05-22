@@ -116,9 +116,17 @@ jobs:
           mkdir -p "$TEST_REPORTS_DIR"
 
           KERNELS="${{ inputs.kernels }}"
+          # "all" (or empty) -> let run_tpu.py default to every kernel in
+          # KERNEL_MAPPINGS. Single source of truth for the full kernel set
+          # lives in the Python dict; YAML doesn't need to mirror it.
+          if [[ "$KERNELS" == "all" || -z "$KERNELS" ]]; then
+            KERNEL_FLAG=()
+          else
+            KERNEL_FLAG=(--kernel "$KERNELS")
+          fi
           echo "=========================================="
           echo "TPU Benchmark"
-          echo "Kernels: $KERNELS"
+          echo "Kernels: ${KERNELS:-all}"
           echo "=========================================="
 
           # Single combined pass — same shape as benchmarks/run.py for GPU.
@@ -127,7 +135,7 @@ jobs:
           # warmup so post-autotune latency measurements are stable.
           HELION_PRINT_OUTPUT_CODE=1 HELION_MEASURE_COMPILE_TIME=1 \
             python benchmarks/run_tpu.py \
-              --kernel "$KERNELS" \
+              "${KERNEL_FLAG[@]}" \
               --num-shapes 2 \
               --output "$TEST_REPORTS_DIR/helionbench.json"
 

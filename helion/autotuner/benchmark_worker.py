@@ -53,6 +53,17 @@ def _worker_loop(connection: Connection, device: int | None) -> None:
             connection.send(result)
         except BrokenPipeError:
             return
+        except Exception:
+            if not isinstance(result, BaseException):
+                raise
+            fallback = BenchmarkSubprocessError(
+                f"worker raised unpickleable "
+                f"{type(result).__module__}.{type(result).__qualname__}: {result}"
+            )
+            try:
+                connection.send(fallback)
+            except BrokenPipeError:
+                return
 
 
 class BenchmarkSubprocessError(Exception):

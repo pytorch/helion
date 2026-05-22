@@ -389,7 +389,7 @@ def _compute_grid_and_block_sizes(
         block_size_var = state.device_function.block_size_var(block_id)
         assert block_size_var is not None
         block_size_vars.append(block_size_var)
-        block_value = env.block_sizes[block_id].from_config(state.config)
+        block_value = state.device_function.resolved_block_size(block_id)
         if block_value is not None:
             state.device_function.constexpr_arg(block_size_var, block_value)
         numel_expr = _get_loop_numel(state, i)
@@ -451,7 +451,7 @@ def _compute_pipeline_or_dma_extra_pad(
     """
     if begin_expr == "0":
         return 0
-    bs_val = env.block_sizes[bid].from_config(state.config)
+    bs_val = state.device_function.resolved_block_size(bid)
     if isinstance(bs_val, int):
         return bs_val - 1
     return 0
@@ -674,7 +674,7 @@ def _setup_inner_loop_masks(
     needs_explicit = False
     if hasattr(strategy, "_setup_mask"):
         for i, bid in enumerate(block_ids):
-            block_value = env.block_sizes[bid].from_config(state.config)
+            block_value = state.device_function.resolved_block_size(bid)
             assert isinstance(block_value, int)
             numel_expr = _get_loop_numel(state, i)
             offset_var = state.device_function.new_var(f"offset_{bid}")
@@ -1791,13 +1791,13 @@ def _compute_vmem_shapes(
                 if isinstance(block_value_sym, sympy.Integer):
                     parts.append(int(block_value_sym))
                 else:
-                    block_value = env.block_sizes[block_ids[bid_idx]].from_config(
-                        state.config
+                    block_value = state.device_function.resolved_block_size(
+                        block_ids[bid_idx]
                     )
                     assert isinstance(block_value, int)
                     parts.append(block_value)
             elif bid is not None:
-                outer_block_value = env.block_sizes[bid].from_config(state.config)
+                outer_block_value = state.device_function.resolved_block_size(bid)
                 if isinstance(outer_block_value, int):
                     parts.append(outer_block_value)
                 else:
@@ -2268,26 +2268,9 @@ def _(state: CodegenState) -> list[object]:
             state.codegen, else_graph.graph, [*else_args]
         )
 
-    assert graph_info.if_arg_names is not None
-    assert graph_info.else_arg_names is not None
-    assert graph_info.branches_outputs is not None
-
-    arg_node_name_to_ast_name = {
-        graph_info.if_arg_names[i]: if_args[i].id for i in range(len(if_args))
-    } | {graph_info.else_arg_names[i]: else_args[i].id for i in range(len(else_args))}
-
-    if_return_names = [
-        cast("ast.Name", if_outputs[o]).id
-        if isinstance(o, int)
-        else arg_node_name_to_ast_name[o]
-        for (o, _) in graph_info.branches_outputs
-    ]
-    else_return_names = [
-        cast("ast.Name", else_outputs[o]).id
-        if isinstance(o, int)
-        else arg_node_name_to_ast_name[o]
-        for (_, o) in graph_info.branches_outputs
-    ]
+    if_return_names, else_return_names = graph_info.get_branches_return_names(
+        state, if_outputs, else_outputs
+    )
 
     if_arg_ids = {arg.id for arg in if_args}
     union_args = if_args + [a for a in else_args if a.id not in if_arg_ids]
@@ -2419,7 +2402,14 @@ def _(state: CodegenState) -> list[object]:
     if_ast_node = create(ast.If, test=test, body=if_body_stmts, orelse=else_body_stmts)
     state.add_statement(if_ast_node)
 
-    return if_outputs + else_outputs
+    if_return_names, else_return_names = graph_info.get_branches_return_names(
+        state, if_outputs, else_outputs
+    )
+    return cast(
+        "list[object]",
+        [expr_from_string(n) for n in if_return_names]
+        + [expr_from_string(n) for n in else_return_names],
+    )
 
 
 # Note we can't DCE phi nodes because there may be a loop carry dependency not captured in the outer graph

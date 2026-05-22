@@ -34,6 +34,7 @@ from torch.utils._sympy.symbol import symbol_is_type
 
 from .. import exc
 from .._compat import shape_env_size_hint
+from .._compat import target_device_capability
 from .._utils import triton_is_available
 from ..language.constexpr import ConstExpr
 from .backend_registry import get_backend_class
@@ -251,6 +252,7 @@ class CompileEnvironment:
         self.debug_shape_renames: dict[sympy.Expr, sympy.Expr] = {}
         self.config_spec = ConfigSpec(
             backend=self.backend,
+            target_device_capability=target_device_capability(device),
         )
         # TODO(hinriksnaer): tracing state, not env config. move to CompilerState?
         self.kernel_tensor_sizes: dict[tuple[sympy.Expr, ...], int] = (
@@ -1385,7 +1387,11 @@ class ReductionLoopBlockSizeSource(BlockSizeSource):
             len(config.reduction_loops) <= self.reduction_loop
             or config.reduction_loops[self.reduction_loop] is None
         ):
-            return max(1, next_power_of_2(block_size_info.size_hint()))
+            size = max(1, block_size_info.size_hint())
+            # Backends override static_rdim_size to control whether the
+            # persistent-reduction extent is rounded up to a power of two
+            # (Triton/CuTe) or kept exact (Pallas).
+            return CompileEnvironment.current().backend.static_rdim_size(size)
         return config.reduction_loops[self.reduction_loop]
 
 

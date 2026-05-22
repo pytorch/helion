@@ -25,6 +25,7 @@ from .ast_read_writes import dead_assignment_elimination
 from .ast_read_writes import dead_expression_elimination
 from .ast_read_writes import definitely_does_not_have_side_effects
 from .compile_environment import CompileEnvironment
+from .cute.tcgen05_direct_entry import build_target1_direct_entry_source
 from .device_function import ConstExprArg
 from .device_function import DeviceFunction
 from .helper_function import CodegenInterface
@@ -42,6 +43,8 @@ from .variable_origin import ArgumentOrigin
 if TYPE_CHECKING:
     from collections.abc import Callable
     from collections.abc import Iterator
+
+    from torch.fx.node import Node
 
     from ..runtime import Config
     from .device_ir import GraphInfo
@@ -76,6 +79,7 @@ class GenerateAST(NodeVisitor, CodegenInterface):
         self.codegen_graphs = func.device_ir.build_codegen_graphs(config)
         self.host_statements: list[ast.AST] = []
         self.module_statements: list[ast.stmt] = []
+        self.cute_direct_entry_plans: list[dict[str, object]] = []
         self.cute_wrapper_plans: list[dict[str, object]] = []
         self.statements_stack: list[list[ast.AST]] = [self.host_statements]
         self.on_device = False
@@ -90,6 +94,7 @@ class GenerateAST(NodeVisitor, CodegenInterface):
         self.next_else_block: list[ast.AST] | None = None
         self.store_transform = store_transform
         self.load_transform = load_transform
+        self._statement_owner_fx_node: Node | None = None
 
         # Now create device function and initialize CodegenInterface
         self.device_function = DeviceFunction(
@@ -98,6 +103,10 @@ class GenerateAST(NodeVisitor, CodegenInterface):
             self,
         )
         CodegenInterface.__init__(self, self.device_function)
+
+        # Decide once which sibling for-loops need a tl.debug_barrier()
+        # to make global writes visible to subsequent reads.
+        self._compute_inter_loop_barriers()
 
     def get_graph(self, graph_id: int) -> GraphInfo:
         return self.codegen_graphs[graph_id]
@@ -117,6 +126,93 @@ class GenerateAST(NodeVisitor, CodegenInterface):
         phase_idx = self.host_function.device_ir.phase_for_root(root_id)
         return self.host_function.device_ir.phases[phase_idx].loop_dependency_checker
 
+    def _compute_inter_loop_barriers(self) -> None:
+        """Walk every codegen graph; for each pair of consecutive sibling
+        ``_for_loop`` / ``_for_loop_step`` nodes, set ``needs_barrier_before``
+        on the second loop's ``ForLoopGraphInfo`` when there is a global RAW
+        dependency.
+
+        TileIR shares Triton surface syntax but ``tl.debug_barrier()`` lowers
+        to ``ttg.barrier`` which the TileIR pass pipeline does not legalize,
+        so the analysis is a no-op there.
+        """
+        from ..language._tracing_ops import _for_loop
+        from ..language._tracing_ops import _for_loop_step
+        from .device_ir import ForLoopGraphInfo
+        from .loop_dependency_checker import (
+            needs_inter_loop_debug_barrier_for_global_raw,
+        )
+
+        env = CompileEnvironment.current()
+        if env.codegen_name != "triton" or env.backend.name == "tileir":
+            return
+
+        for graph_info in self.codegen_graphs:
+            # Pending writes accumulate across ALL prior sibling for-loops
+            # since the last emitted barrier.  When a barrier is inserted
+            # before a loop, it flushes all earlier writes, so the pending set
+            # is reset and only writes from loops AFTER the barrier need to be
+            # tracked for subsequent siblings.
+            pending_global_writes: set[str] = set()
+            for node in graph_info.graph.nodes:
+                if node.op != "call_function":
+                    continue
+                if node.target not in (_for_loop, _for_loop_step):
+                    continue
+                cur_id = node.args[0]
+                assert isinstance(cur_id, int)
+                cur_info = self.codegen_graphs[cur_id]
+                if not isinstance(cur_info, ForLoopGraphInfo):
+                    continue
+                need_barrier = needs_inter_loop_debug_barrier_for_global_raw(
+                    pending_global_writes,
+                    cur_info.host_loop_reads,
+                    global_barrier_tensor_names=self._triton_global_barrier_tensor_names,
+                )
+                cur_info.needs_barrier_before = need_barrier
+                if need_barrier:
+                    # Barrier flushes everything written before it.
+                    pending_global_writes = set()
+                # Accumulate the current loop's writes for future siblings.
+                pending_global_writes |= self._triton_global_barrier_tensor_names(
+                    cur_info.host_loop_writes
+                )
+
+    def _triton_global_barrier_tensor_names(self, names: frozenset[str]) -> set[str]:
+        """Names that may participate in cross-wavefront global (HBM) coherence.
+
+        Triton-specific: the Pallas SMEM filter is intentionally omitted here
+        because the only caller (``_compute_inter_loop_barriers``) gates on
+        Triton codegen.  The ``triton_`` prefix and the assertion below encode
+        that precondition so a future non-Triton caller fails loudly rather
+        than silently mis-classifying SMEM-only tensors as needing a global
+        barrier.
+        """
+        from .type_propagation import StackTensorType
+        from .type_propagation import TensorType
+
+        env = CompileEnvironment.current()
+        assert env.codegen_name == "triton" and env.backend.name != "tileir", (
+            "_triton_global_barrier_tensor_names called outside Triton codegen"
+        )
+
+        out: set[str] = set()
+        scratch_names = {s.name for s in self.device_function._scratch_args}
+        local_types = self.host_function.local_types
+        for name in names:
+            if name in scratch_names:
+                continue
+            if local_types is None:
+                out.add(name)
+                continue
+            ti = local_types.get(name)
+            if ti is None:
+                out.add(name)
+                continue
+            if isinstance(ti, (TensorType, StackTensorType)):
+                out.add(name)
+        return out
+
     def add_statement(self, stmt: ast.AST | str | None) -> None:
         if stmt is None:
             return
@@ -124,6 +220,23 @@ class GenerateAST(NodeVisitor, CodegenInterface):
             stmt = statement_from_string(stmt)
         self.statements_stack[-1].append(stmt)
         self._record_statement_thread_references([stmt])
+        self._record_tcgen05_owned_statement(stmt)
+
+    def _record_tcgen05_owned_statement(self, stmt: ast.AST) -> None:
+        owner_node = self._statement_owner_fx_node
+        if owner_node is None:
+            return
+        cute_state = self.device_function.cute_state
+        # The generic add_statement hook stays inert unless CuTe tcgen05
+        # lowering registered this exact FX node for ownership tracking.
+        if not cute_state.is_collective_handled_load_or_dependency_node(owner_node):
+            return
+        current_statements = self.statements_stack[-1]
+        for loop_state in reversed(self._active_loop_stack()):
+            if isinstance(loop_state, DeviceLoopState):
+                if current_statements is loop_state.inner_statements:
+                    cute_state.register_tcgen05_kloop_owned_stmts(loop_state, [stmt])
+                    return
 
     def get_rng_seed_buffer_statements(self) -> list[ast.AST]:
         from .compile_environment import CompileEnvironment
@@ -229,6 +342,15 @@ class GenerateAST(NodeVisitor, CodegenInterface):
                     seen.add(key)
         return stack
 
+    @contextlib.contextmanager
+    def statement_owner_node(self, node: Node) -> Iterator[None]:
+        prior = self._statement_owner_fx_node
+        self._statement_owner_fx_node = node
+        try:
+            yield
+        finally:
+            self._statement_owner_fx_node = prior
+
     def _record_thread_axis_sizes(self, axis_sizes: dict[int, int]) -> None:
         for axis, size in axis_sizes.items():
             if 0 <= axis < 3:
@@ -300,7 +422,12 @@ class GenerateAST(NodeVisitor, CodegenInterface):
             self.host_statements = prior
 
     @contextlib.contextmanager
-    def add_device_loop(self, device_loop: DeviceLoopState) -> Iterator[None]:
+    def add_device_loop(
+        self,
+        device_loop: DeviceLoopState,
+        *,
+        needs_barrier_before: bool = False,
+    ) -> Iterator[None]:
         with self.set_statements(device_loop.inner_statements):
             for idx in device_loop.block_ids:
                 active_loops = self.active_device_loops[idx]
@@ -314,6 +441,8 @@ class GenerateAST(NodeVisitor, CodegenInterface):
             finally:
                 for idx in device_loop.block_ids:
                     self.active_device_loops[idx].pop()
+        if needs_barrier_before:
+            self.add_statement(statement_from_string("tl.debug_barrier()"))
         self.statements_stack[-1].extend(device_loop.outer_prefix)
         self.add_statement(device_loop.for_node)
         self.statements_stack[-1].extend(device_loop.outer_suffix)
@@ -340,6 +469,10 @@ class GenerateAST(NodeVisitor, CodegenInterface):
             finally:
                 for idx in pipeline_state.block_ids:
                     self.active_device_loops[idx].pop()
+        # Flush any symnode bindings hoisted into the loop's outer_prefix
+        # (via lift_symnode) into the parent scope, so they precede the
+        # function def + pipeline call the caller is about to add.
+        self.statements_stack[-1].extend(pipeline_state.outer_prefix)
 
     @contextlib.contextmanager
     def add_fori_loop(self, fori_state: ForiLoopState) -> Iterator[None]:
@@ -361,6 +494,7 @@ class GenerateAST(NodeVisitor, CodegenInterface):
             finally:
                 for idx in fori_state.block_ids:
                     self.active_device_loops[idx].pop()
+        self.statements_stack[-1].extend(fori_state.outer_prefix)
 
     def set_active_loops(self, device_grid: DeviceLoopOrGridState) -> None:
         if isinstance(device_grid, DeviceGridState):
@@ -478,7 +612,6 @@ class GenerateAST(NodeVisitor, CodegenInterface):
                             ) from None
                         bound = fn._signature.bind(*args, **kwargs)
                         bound.apply_defaults()
-
                         from .inductor_lowering import CodegenState
 
                         state = CodegenState(
@@ -500,9 +633,8 @@ class GenerateAST(NodeVisitor, CodegenInterface):
                         with self.set_statements(wrapped_body):
                             codegen_call_with_graph(self, root, [])
                         self.statements_stack[-1].extend(grid_state.outer_prefix)
-                        if self.device_function.suppress_cute_root_lane_loops:
+                        if self.device_function.cute_state.consume_root_lane_loop_suppression():
                             self.statements_stack[-1].extend(wrapped_body)
-                            self.device_function.suppress_cute_root_lane_loops = False
                         else:
                             self.statements_stack[-1].extend(
                                 grid_state.wrap_body(wrapped_body)
@@ -589,21 +721,21 @@ class GenerateAST(NodeVisitor, CodegenInterface):
         if self.on_device:
             pass
         elif isinstance(type_info := node._type_info, TileIndexType):
-            block_info = env.block_sizes[type_info.block_id]
             return expr_from_string(
                 self.host_function.literal_expr(
-                    block_info.from_config(self.device_function.config)
+                    self.device_function.resolved_block_size(type_info.block_id)
                 )
             )
         elif isinstance(type_info, SequenceType) and all(
             isinstance(x, TileIndexType) for x in type_info.unpack()
         ):
             values = type_info.unpack()
-            # pyrefly: ignore [missing-attribute]
-            block_infos = [env.block_sizes[x.block_id] for x in values]
             return expr_from_string(
                 self.host_function.literal_expr(
-                    [x.from_config(self.device_function.config) for x in block_infos]
+                    [
+                        self.device_function.resolved_block_size(x.block_id)  # pyrefly: ignore[missing-attribute]
+                        for x in values
+                    ]
                 )
             )
         elif isinstance(fn_type_info := func_node._type_info, CallableType) and (
@@ -734,6 +866,7 @@ def generate_ast(
 
             for stmt in func.body:
                 codegen.add_statement(codegen.visit(stmt))
+            codegen.device_function.cute_state.finalize_tcgen05_pure_lifecycle_stores()
             kernel_def = codegen.device_function.codegen_function_def()
             codegen.host_dead_code_elimination()
 
@@ -769,37 +902,82 @@ def generate_ast(
                 else []
             )
             final_host_statements = rng_statements + codegen.host_statements
-            if codegen.cute_wrapper_plans:
-                launcher_arg_positions: dict[str, int] = {}
-                for idx, arg in enumerate(
-                    [
-                        arg
-                        for arg in codegen.device_function.sorted_args()
-                        if not (
-                            isinstance(arg, ConstExprArg) and arg.host_str() != arg.name
-                        )
-                    ]
-                ):
-                    launcher_arg_positions[arg.name] = idx
-                resolved_wrapper_plans: list[dict[str, object]] = []
-                for plan in codegen.cute_wrapper_plans:
+            launcher_arg_positions: dict[str, int] | None = None
+
+            def resolve_cute_plan_arg_positions(
+                plans: list[dict[str, object]],
+            ) -> list[dict[str, object]]:
+                nonlocal launcher_arg_positions
+                if launcher_arg_positions is None:
+                    launcher_arg_positions = {}
+                    for idx, arg in enumerate(
+                        [
+                            arg
+                            for arg in codegen.device_function.sorted_args()
+                            if not (
+                                isinstance(arg, ConstExprArg)
+                                and arg.host_str() != arg.name
+                            )
+                        ]
+                    ):
+                        launcher_arg_positions[arg.name] = idx
+                resolved_plans: list[dict[str, object]] = []
+                for plan in plans:
                     resolved = dict(plan)
                     for key in ("lhs_name", "rhs_name", "c_name", "d_name"):
                         if key in resolved:
                             resolved[key[:-5] + "_idx"] = launcher_arg_positions[
                                 str(resolved.pop(key))
                             ]
-                    resolved_wrapper_plans.append(resolved)
+                    resolved_plans.append(resolved)
+                return resolved_plans
+
+            resolved_direct_entry_plans: list[dict[str, object]] = []
+            resolved_wrapper_plans: list[dict[str, object]] = []
+            generated_direct_entry_defs: list[ast.stmt] = []
+            if codegen.cute_direct_entry_plans:
+                resolved_direct_entry_plans = resolve_cute_plan_arg_positions(
+                    codegen.cute_direct_entry_plans
+                )
+                final_host_statements = [
+                    statement_from_string(
+                        f"{codegen.device_function.name}._helion_cute_direct_entry_plans = {resolved_direct_entry_plans!r}"
+                    ),
+                    *final_host_statements,
+                ]
+            if codegen.cute_wrapper_plans:
+                resolved_wrapper_plans = resolve_cute_plan_arg_positions(
+                    codegen.cute_wrapper_plans
+                )
                 final_host_statements = [
                     statement_from_string(
                         f"{codegen.device_function.name}._helion_cute_wrapper_plans = {resolved_wrapper_plans!r}"
                     ),
                     *final_host_statements,
                 ]
-            if codegen.device_function.cute_cluster_shape is not None:
+            if codegen.device_function.cute_state.cluster_shape is not None:
                 final_host_statements = [
                     statement_from_string(
-                        f"{codegen.device_function.name}._helion_cute_cluster_shape = {codegen.device_function.cute_cluster_shape!r}"
+                        f"{codegen.device_function.name}._helion_cute_cluster_shape = {codegen.device_function.cute_state.cluster_shape!r}"
+                    ),
+                    *final_host_statements,
+                ]
+            if resolved_direct_entry_plans and resolved_wrapper_plans:
+                generated_direct_entry_name = (
+                    f"{codegen.device_function.name}_direct_entry"
+                )
+                generated_direct_entry_source = build_target1_direct_entry_source(
+                    function_name=generated_direct_entry_name,
+                    kernel_name=codegen.device_function.name,
+                    direct_plan=resolved_direct_entry_plans[0],
+                    wrapper_plans=resolved_wrapper_plans,
+                )
+                generated_direct_entry_defs.append(
+                    statement_from_string(generated_direct_entry_source)
+                )
+                final_host_statements = [
+                    statement_from_string(
+                        f"{codegen.device_function.name}._helion_cute_generated_direct_entry = {generated_direct_entry_name}"
                     ),
                     *final_host_statements,
                 ]
@@ -830,6 +1008,7 @@ def generate_ast(
                 *codegen.module_statements,
                 *codegen.device_function.codegen_helper_functions(),
                 *kernel_def,
+                *generated_direct_entry_defs,
                 host_def,
                 *call_def,
                 *main_def,

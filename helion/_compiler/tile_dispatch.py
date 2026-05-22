@@ -14,6 +14,7 @@ from .device_ir import ReductionLoopGraphInfo
 from .device_ir import RootGraphInfo
 from .host_function import HostFunction
 from .reduction_strategy import ReductionStrategy
+from .reduction_strategy import cute_looped_reduction_block_size
 from .tile_strategy import CompactedShape
 from .tile_strategy import DeviceLoopState
 from .tile_strategy import TileStrategy
@@ -124,10 +125,14 @@ class TileStrategyDispatch:
                     size_hint = env.size_hint(numel)
                 if reduction_loop is None:
                     if size_hint > max_threads:
-                        # Too many elements for a single warp; force looped
-                        reduction_loop = max_threads
-                elif reduction_loop > max_threads:
-                    reduction_loop = max_threads
+                        # Too many elements for a single warp; force a looped
+                        # reduction. CuTe can cover a wider chunk with either
+                        # more live lanes or per-thread scalar lanes.
+                        reduction_loop = (
+                            cute_looped_reduction_block_size(size_hint, max_threads)
+                            if env.backend.name == "cute"
+                            else max_threads
+                        )
             strategy = env.backend.create_reduction_strategy(
                 fn, block_id, reduction_loop
             )

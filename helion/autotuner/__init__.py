@@ -32,6 +32,9 @@ from .local_cache import StrictLocalAutotuneCache as StrictLocalAutotuneCache
 from .pattern_search import InitialPopulationStrategy as InitialPopulationStrategy
 from .pattern_search import PatternSearch as PatternSearch
 from .random_search import RandomSearch as RandomSearch
+from .remote_cache import RemoteAutotuneCache as RemoteAutotuneCache
+from .remote_cache import RemoteCacheBackend as RemoteCacheBackend
+from .remote_cache import StrictRemoteAutotuneCache as StrictRemoteAutotuneCache
 from .surrogate_pattern_search import LFBOPatternSearch
 from .surrogate_pattern_search import LFBOTreeSearch
 
@@ -54,6 +57,8 @@ search_algorithms: dict[str, type[BaseSearch]] = {
 cache_classes = {
     "LocalAutotuneCache": LocalAutotuneCache,
     "StrictLocalAutotuneCache": StrictLocalAutotuneCache,
+    "RemoteAutotuneCache": RemoteAutotuneCache,
+    "StrictRemoteAutotuneCache": StrictRemoteAutotuneCache,
     "AOTAutotuneCache": AOTAutotuneCache,
 }
 

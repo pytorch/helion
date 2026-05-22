@@ -36,6 +36,8 @@ from helion._testing import skipIfTileIR
 from helion._testing import skipIfXPU
 from helion._testing import xfailIfCute
 from helion._testing import xfailIfPallas
+from helion._testing import xfailIfPallasInterpret
+from helion._testing import xfailIfPallasTpu
 from helion.runtime.config import Config
 from helion.runtime.ref_mode import is_ref_mode_enabled
 
@@ -122,6 +124,67 @@ class TestExamples(RefEagerTestBase, TestCase):
             "matmul",
             args,
             args[0] @ args[1],
+        )
+
+    @xfailIfPallas(
+        "Pallas TPU clamps the N block to the lane width (128) which does"
+        " not match the test's N=96 bias dimension"
+    )
+    def test_matmul_bias_epilogue_wrapper(self):
+        from typing import Any
+        from typing import Callable
+        from typing import NamedTuple
+
+        class BiasEpilogue(NamedTuple):
+            bias: torch.Tensor
+
+            @property
+            def fn(
+                self,
+            ) -> Callable[[torch.Tensor, tuple[torch.Tensor, ...]], torch.Tensor]:
+                bias = self.bias
+
+                def epilogue(
+                    acc: torch.Tensor, tile: tuple[torch.Tensor, ...]
+                ) -> torch.Tensor:
+                    return acc + bias[tile[1]]
+
+                return epilogue
+
+            def __call__(
+                self, acc: torch.Tensor, tile: tuple[torch.Tensor, ...]
+            ) -> torch.Tensor:
+                return self.fn(acc, tile)
+
+            @property
+            def __closure__(self) -> tuple[Any, ...] | None:
+                return self.fn.__closure__
+
+        a = torch.randn([128, 64], device=DEVICE, dtype=torch.float32)
+        b = torch.randn([64, 96], device=DEVICE, dtype=torch.float32)
+        bias = torch.randn([96], device=DEVICE, dtype=torch.float32)
+
+        check_example(
+            "matmul",
+            (a, b, BiasEpilogue(bias)),
+            a @ b + bias,
+            block_sizes=[32, 32, 32],
+        )
+
+    def test_matmul_bf16_tcgen05(self):
+        """Matmul at 256^3 bf16 — fixture sized just above the cute
+        tcgen05 admission floor (M >= 64 divisible by 64) so the cute
+        autotune sub-sweep fires the ``uses_tcgen05`` codegen marker.
+        """
+        args = (
+            torch.randn([256, 256], device=DEVICE, dtype=torch.bfloat16),
+            torch.randn([256, 256], device=DEVICE, dtype=torch.bfloat16),
+        )
+        check_example(
+            "matmul",
+            args,
+            args[0] @ args[1],
+            block_sizes=[64, 64, 32],
         )
 
     @xfailIfCute("CuTe barrier-based split-K example is still unsupported")
@@ -769,10 +832,6 @@ class TestExamples(RefEagerTestBase, TestCase):
         )
 
     @skipIfTileIR("PassManager::run failed")
-    @xfailIfCute(
-        "CuTe tcgen05 MMA path does not yet emit indices/masks for the "
-        "user-level epilogue write that follows the MMA"
-    )
     def test_epilogue_subtiling_residual_gelu(self):
         m, k, n = 8192, 8192, 8192
         x = torch.randn([m, k], device=DEVICE, dtype=HALF_DTYPE)
@@ -1540,7 +1599,9 @@ class TestExamples(RefEagerTestBase, TestCase):
             num_stages=3,
         )
 
-    @xfailIfPallas("InductorLoweringError")
+    @xfailIfPallasInterpret(
+        "JAX interpret cannot trace dynamic shapes (TypeError: JitTracer ~int32[])"
+    )
     def test_jsd(self):
         args = (
             torch.randn([1024, 4096], device=DEVICE, dtype=torch.float32).log_softmax(
@@ -1566,7 +1627,9 @@ class TestExamples(RefEagerTestBase, TestCase):
             num_stages=3,
         )
 
-    @xfailIfPallas("operation not supported on TPU")
+    @xfailIfPallasInterpret(
+        "JAX interpret cannot trace dynamic shapes (TypeError: JitTracer ~int32[])"
+    )
     def test_kl_div(self):
         if _get_backend() == "cute" and "B200" in get_nvidia_gpu_model():
             pytest.xfail("CuTe KL-div example still launches out of resources on B200")
@@ -1650,34 +1713,88 @@ class TestExamples(RefEagerTestBase, TestCase):
             atol=1.0,
         )
 
-    @xfailIfCute("CuTe NVFP4 GEMM example is not supported yet")
-    @xfailIfPallas("NVFP4 is NVIDIA-specific")
+    @onlyBackends(["cute"])
+    @skipIfNotCUDA()
+    @skipIfCudaCapabilityLessThan(
+        (10, 0), reason="NVFP4 conversion instructions require Blackwell"
+    )
+    @skipIfRefEager("inline asm codegen is not available in ref eager mode")
     def test_nvfp4_gemm(self):
-        from examples.nvfp4_gemm import pack_fp4
-        from examples.nvfp4_gemm import quantize_fp4_e2m1
-        from examples.nvfp4_gemm import reference_nvfp4_matmul
+        mod = import_path(EXAMPLES_DIR / "nvfp4_gemm.py")
 
-        M, K, N = 256, 128, 256
+        M, K, N = 64, 128, 64
 
         A = torch.randn(M, K, dtype=torch.bfloat16, device=DEVICE)
         W = torch.randn(K, N, dtype=torch.bfloat16, device=DEVICE)
 
-        W_quantized = quantize_fp4_e2m1(W)
-        W_packed = pack_fp4(W_quantized)
+        W_quantized = mod.quantize_fp4_e2m1(W)
+        W_packed = mod.pack_fp4(W_quantized).view(torch.float4_e2m1fn_x2)
+        weight_scale = mod.make_fp8_scales((N, K // 16), DEVICE)
 
-        args = (A, W_packed)
-        expected = reference_nvfp4_matmul(A, W_packed)
-
-        check_example(
-            "nvfp4_gemm",
-            args,
+        result = mod.nvfp4_matmul(A, W_packed, weight_scale)
+        expected = mod.reference_nvfp4_matmul(A, W_packed, weight_scale)
+        torch.testing.assert_close(
+            result,
             expected,
-            fn_name="nvfp4_matmul",
-            block_sizes=[64, 64, 32],
-            num_warps=4,
-            num_stages=3,
-            rtol=2e-1,
             atol=1.0,
+            rtol=2e-1,
+        )
+
+        M, K, N = 128, 256, 256
+        A_packed = mod.make_random_fp4((M, K), DEVICE)
+        B_packed = mod.make_random_fp4((N, K), DEVICE)
+        B_packed_t = B_packed.T
+        scale_a = mod.make_fp8_scales((M, K // 16), DEVICE)
+        scale_b = mod.make_fp8_scales((N, K // 16), DEVICE)
+
+        result = mod.nvfp4_scaled_matmul(A_packed, B_packed_t, scale_a, scale_b)
+        expected = mod.reference_nvfp4_scaled_matmul(
+            A_packed,
+            B_packed_t,
+            scale_a,
+            scale_b,
+        )
+        torch.testing.assert_close(
+            result,
+            expected,
+            atol=1.0,
+            rtol=2e-1,
+        )
+
+    @onlyBackends(["cute"])
+    @skipIfNotCUDA()
+    @skipIfCudaCapabilityLessThan(
+        (10, 0), reason="NVFP4 conversion instructions require Blackwell"
+    )
+    @skipIfRefEager("inline asm codegen is not available in ref eager mode")
+    def test_nvfp4_gemv(self):
+        mod = import_path(EXAMPLES_DIR / "nvfp4_gemv.py")
+
+        M, K_bytes = 64, 128
+        weight = torch.randint(0, 256, (M, K_bytes), dtype=torch.uint8, device=DEVICE)
+        weight_scale = mod.make_fp8_scales((M, K_bytes // 8), DEVICE)
+
+        x_bf16 = torch.randn(K_bytes * 2, dtype=torch.bfloat16, device=DEVICE)
+        bf16_result = mod.nvfp4_gemv_bf16in(weight, x_bf16, weight_scale)
+        bf16_expected = mod.reference_nvfp4_gemv_bf16in(weight, x_bf16, weight_scale)
+        torch.testing.assert_close(
+            bf16_result,
+            bf16_expected,
+            atol=4.0,
+            rtol=2e-1,
+        )
+
+        x_packed = torch.randint(0, 256, (K_bytes,), dtype=torch.uint8, device=DEVICE)
+        x_scale = mod.make_fp8_scales((K_bytes // 8,), DEVICE)
+        fp4_result = mod.nvfp4_gemv_fp4in(weight, x_packed, weight_scale, x_scale)
+        fp4_expected = mod.reference_nvfp4_gemv_fp4in(
+            weight, x_packed, weight_scale, x_scale
+        )
+        torch.testing.assert_close(
+            fp4_result,
+            fp4_expected,
+            atol=4.0,
+            rtol=2e-1,
         )
 
     @xfailIfPallas("JAX tracer error")
@@ -1752,6 +1869,51 @@ class TestExamples(RefEagerTestBase, TestCase):
             block_sizes=[64],
         )
 
+    def test_fused_linear_jsd_fwd(self):
+        """Exercise the autograd-wrapped FusedLinearJSDFunction path
+        (FusedLinearJSDFunction.forward -> jsd_kernel per chunk).
+
+        This is the user-facing API; the existing `test_fused_linear_jsd`
+        only covers the simpler `fused_linear_jsd_kernel` JSD-only path.
+        Shape picked so chunk_size > 1 (chunked path actually runs).
+        """
+        beta = 0.5
+        ignore_index = -100
+        # Use temperature = sqrt(hidden_dim) so logits/temperature has std ~1
+        # and softmax stays in fp32 range.
+        m, n, k = 128, 512, 1024
+        temperature = float(n) ** 0.5
+
+        student_input = torch.randn([m, n], device=DEVICE, dtype=torch.float32)
+        teacher_input = torch.randn([m, n], device=DEVICE, dtype=torch.float32)
+        student_weight = torch.randn([k, n], device=DEVICE, dtype=torch.float32)
+        teacher_weight = torch.randn([k, n], device=DEVICE, dtype=torch.float32)
+
+        mod = import_path(EXAMPLES_DIR / "fused_linear_jsd.py")
+        # Pin jsd_kernel's config so we skip autotune (CI speed). Block size 16
+        # is a small safe pick across backends.
+        mod.jsd_kernel.settings.static_shapes = True
+        mod.jsd_kernel.configs = [helion.Config(block_sizes=[16])]
+        result = mod.fused_linear_jsd_fwd(
+            beta,
+            ignore_index,
+            temperature,
+            student_weight,
+            teacher_weight,
+            student_input,
+            teacher_input,
+        )
+        expected = mod.fused_linear_jsd_pytorch(
+            beta,
+            ignore_index,
+            temperature,
+            student_weight,
+            teacher_weight,
+            student_input,
+            teacher_input,
+        )
+        torch.testing.assert_close(result, expected, atol=1e-1, rtol=1e-2)
+
     @xfailIfPallas("JAX tracer error")
     @skipIfRefEager("hl.jagged_tile does not support ref mode yet")
     def test_jagged_layer_norm(self):
@@ -1819,11 +1981,11 @@ class TestExamples(RefEagerTestBase, TestCase):
     @xfailIfCute(
         "CuTe squeeze-and-excitation forward still exceeds thread-block limits"
     )
-    @skipIfRocm("Triton ROCm store-forwarding bug: stale global memory reads")
     @skipIfCudaSharedMemoryLessThan(
         131072, reason="block sizes exceed device shared memory limit"
     )
     @skipIfXPU("Squeeze-and-excitation network not supported on XPU")
+    @xfailIfPallasInterpret("numerical mismatch in JAX interpret mode")
     def test_squeeze_and_excitation_net_fwd(self):
         m, n, k = 128, 128, 128
         x = torch.randn([m, n], device=DEVICE, dtype=torch.float32)
@@ -2186,7 +2348,7 @@ class TestExamples(RefEagerTestBase, TestCase):
         )
 
     @xfailIfCute("CuTe GDN forward example still fails CUTLASS DSL codegen")
-    @xfailIfPallas("operation not supported on TPU")
+    @xfailIfPallasTpu("operation not supported on TPU")
     def test_gdn_fwd_h(self):
         """Test gated delta net forward h kernel."""
         batch = 2
@@ -2291,7 +2453,7 @@ class TestExamples(RefEagerTestBase, TestCase):
         lambda: _get_backend() == "cute",
         "CuTe Mamba2 chunk-state destabilizes later cute tests when it fails in-process",
     )
-    @xfailIfPallas(
+    @xfailIfPallasTpu(
         "dA_cumsum has mixed scalar+slice access (VMEM), but Mosaic requires 32-bit for VMEM scalar extracts"
     )
     def test_mamba2_chunk_state(self):

@@ -5,11 +5,12 @@ checked-in AOT heuristic files.  They are meant to be useful copy/paste starting
 points for common kernel patterns while also being runnable examples for people
 who want to quickly try Helion.
 
-The checked-in `sm100` heuristics are pretuned on NVIDIA B200 so these kernels
-can run immediately without online autotuning.  Treat the files as kernel
-recipes: copy the kernel and its local `_helion_aot_*` heuristic into your code,
-then retune when your target shapes or hardware differ materially from the
-included sweep.
+The checked-in heuristics let these kernels run immediately without online
+autotuning.  Heuristics ship for both NVIDIA H100 (`sm90`) and B200 (`sm100`);
+Helion picks the matching file at runtime.  Treat the files as kernel recipes:
+copy the kernel and its local `_helion_aot_*` heuristic into your code, then
+retune when your target shapes or hardware differ materially from the included
+sweep.
 
 Each kernel module has a `main()` that benchmarks against PyTorch eager.
 
@@ -20,12 +21,17 @@ pretuned_kernels/
 ├── README.md
 ├── vector_add/
 │   ├── vector_add.py                          # the kernel + main()
-│   └── _helion_aot_vector_add_cuda_sm100.py   # auto-loaded heuristic
+│   ├── _helion_aot_vector_add_cuda_sm100.py   # B200 heuristic
+│   └── _helion_aot_vector_add_cuda_sm90.py    # H100 heuristic
 ├── softmax/
 ├── layer_norm/
 ├── rms_norm/
-└── cross_entropy/
+├── cross_entropy/
+└── rope/
 ```
+
+Each kernel ships with one heuristic file per supported compute capability.
+At runtime Helion picks the file matching the current GPU.
 
 | Kernel | Shape sweep | PyTorch baseline |
 |---|---|---|
@@ -34,6 +40,7 @@ pretuned_kernels/
 | `layer_norm` | Triton tutorial `M=4096, N=512*i for i in range(2, 32)` + realistic hidden-size shapes | `F.layer_norm` |
 | `rms_norm` | TritonBench `(M=2048, H)` default + NPOT shapes + realistic LLM hidden-size and production-style shapes | `F.rms_norm` |
 | `cross_entropy` | TritonBench/Liger token-vocab sweep + realistic LLM vocabulary shapes | `F.cross_entropy` |
+| `rope` | TritonBench RoPE `(H, T)` defaults with exact shape buckets and `H8192_T2048` fallback | eager RoPE reference |
 
 ## Scope
 
@@ -60,9 +67,9 @@ python softmax.py
 
 ## Adding a heuristic for new hardware
 
-These kernels ship pretuned heuristics for `sm100` (B200).  To add another GPU,
-run the AOT autotune workflow on that hardware against the kernel — the runner
-emits a new
+These kernels ship pretuned heuristics for specific GPU architectures.  To add
+another GPU, run the AOT autotune workflow on that hardware against the kernel;
+the runner emits a new
 `_helion_aot_<kernel>_<device>_<cc>.py` next to the kernel source, which
 you commit alongside the existing one(s).  Helion picks the right one at
 runtime based on the running GPU's compute capability (with fallback to

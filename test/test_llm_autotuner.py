@@ -46,10 +46,12 @@ class TestLLMGuidedSearch(TestCase):
         search.configs_per_round = 15
         search._llm_call_times = []
         search._benchmark_times = []
-        search.model = "gpt-5-2"
+        search.model = "gpt-5.5"
         search.api_base = None
         search.api_key = None
         search.request_timeout_s = 120.0
+        search.effort_level = None
+        search.fast_mode = False
 
         # Mock config_spec with a normalize that accepts anything.
         search.config_spec = SimpleNamespace(
@@ -190,6 +192,9 @@ class TestLLMGuidedSearch(TestCase):
 
             def cleanup(self) -> None:
                 self.cleanup_called = True
+
+            def set_budget_exceeded_fn(self, fn) -> None:
+                pass
 
         args = (
             torch.randn([128, 128], device=DEVICE, dtype=torch.float16),
@@ -373,6 +378,16 @@ class TestLLMGuidedSearch(TestCase):
         self.assertEqual(dict(best), dict(round1_cfg))
         self.assertEqual(dict(search.best.config), dict(round1_cfg))
 
+    def test_initial_llm_response_propagates_failure(self):
+        """Round 0 LLM future failures are not silently swallowed."""
+        import concurrent.futures
+
+        search = self._make_mock_search()
+        future: concurrent.futures.Future[str] = concurrent.futures.Future()
+        future.set_exception(RuntimeError("simulated provider 401"))
+        with self.assertRaisesRegex(RuntimeError, "simulated provider 401"):
+            search._wait_for_initial_llm_response(future)
+
 
 class TestLLMTransport(TestCase):
     """Tests for provider selection and HTTP payload translation."""
@@ -394,16 +409,21 @@ class TestLLMTransport(TestCase):
         from helion.autotuner.llm.transport import extract_anthropic_text
         from helion.autotuner.llm.transport import extract_openai_response_text
         from helion.autotuner.llm.transport import infer_provider
+        from helion.autotuner.llm.transport import normalize_effort_level
         from helion.autotuner.llm.transport import responses_input_from_messages
         from helion.autotuner.llm.transport import split_system_messages
 
-        self.assertEqual(infer_provider("claude-haiku-4.5"), "anthropic")
-        self.assertEqual(infer_provider("gpt-5-2"), "openai_responses")
+        self.assertEqual(infer_provider("claude-opus-4-7"), "anthropic")
+        self.assertEqual(infer_provider("gpt-5.5"), "openai_responses")
         self.assertEqual(infer_provider("custom/model"), "unsupported")
         self.assertEqual(infer_provider("custom/model", "anthropic"), "anthropic")
         self.assertEqual(infer_provider("custom/model", "openai"), "openai_responses")
+        self.assertEqual(normalize_effort_level("MAX"), "max")
+        self.assertEqual(normalize_effort_level("off"), "none")
         with self.assertRaisesRegex(ValueError, "Unsupported LLM provider"):
-            infer_provider("gpt-5-2", "bogus")
+            infer_provider("gpt-5.5", "bogus")
+        with self.assertRaisesRegex(ValueError, "Unsupported LLM effort level"):
+            normalize_effort_level("bogus")
 
         self.assertEqual(
             _resolve_v1_endpoint("https://api.openai.com", "responses"),
@@ -493,7 +513,7 @@ class TestLLMTransport(TestCase):
                 "provider": "openai_responses",
                 "response_payload": self._response_payload("openai_responses"),
                 "expected_text": '{"configs": []}',
-                "model": "gpt-5-2",
+                "model": "gpt-5.5",
                 "api_base": "https://api.openai.com",
                 "expected_url": "https://api.openai.com/v1/responses",
                 "api_key": "openai-test-key",
@@ -515,7 +535,7 @@ class TestLLMTransport(TestCase):
                     "anthropic", '{"configs": [{"num_warps": 4}]}'
                 ),
                 "expected_text": '{"configs": [{"num_warps": 4}]}',
-                "model": "claude-3-5-haiku-latest",
+                "model": "claude-opus-4-7",
                 "api_base": "https://api.anthropic.com",
                 "expected_url": "https://api.anthropic.com/v1/messages",
                 "api_key": "anthropic-test-key",
@@ -573,6 +593,222 @@ class TestLLMTransport(TestCase):
                 self.assertEqual(captured["request_timeout_s"], 120.0)
                 case["request_assertions"](captured)
 
+    def test_supports_anthropic_adaptive_version_matrix(self):
+        """Adaptive-thinking detection follows per-family minimum versions."""
+        from helion.autotuner.llm.transport import _supports_anthropic_adaptive
+
+        cases = {
+            # Opus 4.5+ supports adaptive; 4.4 / 4.1 / 4 (no minor) do not.
+            "claude-opus-4-5": True,
+            "claude-opus-4-6": True,
+            "claude-opus-4-7": True,
+            "claude-opus-4-4": False,
+            "claude-opus-4-1": False,
+            "claude-opus-4": False,
+            # Sonnet only crosses the threshold at 4.6.
+            "claude-sonnet-4-6": True,
+            "claude-sonnet-4-5": False,
+            # Variants and date suffixes still match the family/version prefix.
+            "claude-opus-4-7[1m]": True,
+            "claude-opus-4-7-20260201": True,
+            # A bare date suffix (no minor) must not be parsed as minor=20250514.
+            "claude-opus-4-20250514": False,
+            # Future major / minor releases auto-recognized.
+            "claude-opus-5-0": True,
+            "claude-opus-4-99": True,
+            "claude-sonnet-5-0": True,
+            # Families without an adaptive entry stay on the legacy path.
+            "claude-haiku-4-5": False,
+            # Old-naming models (version before family) never match.
+            "claude-3-5-sonnet-20241022": False,
+            "claude-3-7-sonnet-20250219": False,
+            # Non-Anthropic / unknown model strings fall through.
+            "gpt-5.5": False,
+            "custom-model": False,
+        }
+        for model, expected in cases.items():
+            with self.subTest(model=model):
+                self.assertEqual(_supports_anthropic_adaptive(model), expected)
+
+    def test_transport_effort_level_payloads(self):
+        """Reasoning effort maps to provider-specific request payload fields."""
+        from helion.autotuner.llm.transport import call_provider
+
+        captured = {}
+        messages = [{"role": "user", "content": "suggest configs"}]
+
+        def fake_post_json(url, payload, headers, *, request_timeout_s):
+            del url, headers, request_timeout_s
+            captured["payload"] = payload
+            if "input" in payload:
+                return self._response_payload("openai_responses")
+            return self._response_payload("anthropic")
+
+        # gpt-5.5 supports the xhigh effort level, so the provider-neutral "max"
+        # maps directly to xhigh on the OpenAI side.
+        with patch(
+            "helion.autotuner.llm.transport._post_json",
+            side_effect=fake_post_json,
+        ):
+            call_provider(
+                "openai_responses",
+                model="gpt-5.5",
+                api_base="https://api.openai.com",
+                api_key="openai-test-key",
+                messages=messages,
+                max_output_tokens=512,
+                request_timeout_s=120.0,
+                effort_level="max",
+            )
+        self.assertEqual(captured["payload"]["reasoning"], {"effort": "xhigh"})
+
+        # Older OpenAI models without xhigh support fall back to "high" for the
+        # provider-neutral "max" knob.
+        captured.clear()
+        with patch(
+            "helion.autotuner.llm.transport._post_json",
+            side_effect=fake_post_json,
+        ):
+            call_provider(
+                "openai_responses",
+                model="gpt-5-2",
+                api_base="https://api.openai.com",
+                api_key="openai-test-key",
+                messages=messages,
+                max_output_tokens=512,
+                request_timeout_s=120.0,
+                effort_level="max",
+            )
+        self.assertEqual(captured["payload"]["reasoning"], {"effort": "high"})
+
+        # Modern Claude models (Opus 4.5+, Sonnet 4.6+) use adaptive thinking;
+        # the model self-picks its budget so no budget_tokens is sent. Required on
+        # Opus 4.7 where manual budget_tokens returns HTTP 400.
+        captured.clear()
+        with patch(
+            "helion.autotuner.llm.transport._post_json",
+            side_effect=fake_post_json,
+        ):
+            call_provider(
+                "anthropic",
+                model="claude-opus-4-7",
+                api_base="https://api.anthropic.com",
+                api_key="anthropic-test-key",
+                messages=messages,
+                max_output_tokens=512,
+                request_timeout_s=120.0,
+                effort_level="max",
+            )
+        self.assertEqual(captured["payload"]["thinking"], {"type": "adaptive"})
+        self.assertEqual(captured["payload"]["output_config"], {"effort": "max"})
+        # max_tokens reserves the adaptive thinking budget (24000) + visible output (512).
+        self.assertEqual(captured["payload"]["max_tokens"], 24512)
+        self.assertNotIn("temperature", captured["payload"])
+
+        # Legacy Claude models (Opus 4 / Sonnet 4.5 and earlier) still go through
+        # the manual budget_tokens path with the same low/medium/high/max table.
+        captured.clear()
+        with patch(
+            "helion.autotuner.llm.transport._post_json",
+            side_effect=fake_post_json,
+        ):
+            call_provider(
+                "anthropic",
+                model="claude-opus-4",
+                api_base="https://api.anthropic.com",
+                api_key="anthropic-test-key",
+                messages=messages,
+                max_output_tokens=512,
+                request_timeout_s=120.0,
+                effort_level="high",
+            )
+        self.assertEqual(
+            captured["payload"]["thinking"],
+            {"type": "enabled", "budget_tokens": 8192},
+        )
+        self.assertEqual(captured["payload"]["max_tokens"], 8704)
+        self.assertNotIn("output_config", captured["payload"])
+
+    def test_transport_fast_mode_payload_and_headers(self):
+        """Fast mode sets the Anthropic beta header + speed body field, and is
+        orthogonal to effort_level — both can be sent on the same request."""
+        from helion.autotuner.llm.transport import call_provider
+
+        captured = {}
+        messages = [{"role": "user", "content": "suggest configs"}]
+
+        def fake_post_json(url, payload, headers, *, request_timeout_s):
+            del url, request_timeout_s
+            captured["payload"] = payload
+            captured["headers"] = headers
+            if "input" in payload:
+                return self._response_payload("openai_responses")
+            return self._response_payload("anthropic")
+
+        # fast_mode alone on Opus 4.7: only `speed: "fast"` + beta header, no thinking.
+        with patch(
+            "helion.autotuner.llm.transport._post_json",
+            side_effect=fake_post_json,
+        ):
+            call_provider(
+                "anthropic",
+                model="claude-opus-4-7",
+                api_base="https://api.anthropic.com",
+                api_key="anthropic-test-key",
+                messages=messages,
+                max_output_tokens=512,
+                request_timeout_s=120.0,
+                fast_mode=True,
+            )
+        self.assertEqual(captured["headers"]["anthropic-beta"], "fast-mode-2026-02-01")
+        self.assertEqual(captured["payload"]["speed"], "fast")
+        self.assertNotIn("thinking", captured["payload"])
+        self.assertNotIn("temperature", captured["payload"])
+        self.assertEqual(captured["payload"]["max_tokens"], 512)
+
+        # fast_mode + effort_level=max on Opus 4.7: both speed and adaptive thinking
+        # are forwarded (the Anthropic API accepts the combination).
+        captured.clear()
+        with patch(
+            "helion.autotuner.llm.transport._post_json",
+            side_effect=fake_post_json,
+        ):
+            call_provider(
+                "anthropic",
+                model="claude-opus-4-7",
+                api_base="https://api.anthropic.com",
+                api_key="anthropic-test-key",
+                messages=messages,
+                max_output_tokens=512,
+                request_timeout_s=120.0,
+                effort_level="max",
+                fast_mode=True,
+            )
+        self.assertEqual(captured["headers"]["anthropic-beta"], "fast-mode-2026-02-01")
+        self.assertEqual(captured["payload"]["speed"], "fast")
+        self.assertEqual(captured["payload"]["thinking"], {"type": "adaptive"})
+        self.assertEqual(captured["payload"]["output_config"], {"effort": "max"})
+        self.assertNotIn("temperature", captured["payload"])
+
+        # OpenAI: fast_mode is accepted but is a no-op (no beta header, no speed field).
+        captured.clear()
+        with patch(
+            "helion.autotuner.llm.transport._post_json",
+            side_effect=fake_post_json,
+        ):
+            call_provider(
+                "openai_responses",
+                model="gpt-5.5",
+                api_base="https://api.openai.com",
+                api_key="openai-test-key",
+                messages=messages,
+                max_output_tokens=512,
+                request_timeout_s=120.0,
+                fast_mode=True,
+            )
+        self.assertNotIn("anthropic-beta", captured["headers"])
+        self.assertNotIn("speed", captured["payload"])
+
 
 class TestLLMSeededLFBOTreeSearch(TestCase):
     """Tests for the two-stage LLM-seeded hybrid autotuner."""
@@ -612,6 +848,8 @@ class TestLLMSeededLFBOTreeSearch(TestCase):
             {
                 "HELION_HYBRID_LLM_MAX_ROUNDS": "2",
                 "HELION_LLM_PROVIDER": "openai",
+                "HELION_LLM_EFFORT_LEVEL": "max",
+                "HELION_LLM_FAST_MODE": "1",
             },
             clear=False,
         ):
@@ -620,9 +858,13 @@ class TestLLMSeededLFBOTreeSearch(TestCase):
             )
         self.assertEqual(kwargs["llm_max_rounds"], 2)
         self.assertEqual(kwargs["llm_provider"], "openai")
+        self.assertEqual(kwargs["llm_effort_level"], "max")
+        self.assertTrue(kwargs["llm_fast_mode"])
 
         search = LLMSeededLFBOTreeSearch(kernel, (), **kwargs)
         self.assertEqual(search.llm_provider, "openai")
+        self.assertEqual(search.llm_effort_level, "max")
+        self.assertTrue(search.llm_fast_mode)
 
     def test_selected_by_env(self):
         """HELION_AUTOTUNER selects the hybrid autotuner and applies profile defaults."""
@@ -660,6 +902,9 @@ class TestLLMSeededLFBOTreeSearch(TestCase):
         class FakeBenchmarkProvider:
             def __init__(self, **kwargs) -> None:
                 self.kwargs = kwargs
+
+            def set_budget_exceeded_fn(self, fn) -> None:
+                pass
 
         class FakeLLMSearch:
             def __init__(self, kernel, args, **kwargs) -> None:
@@ -791,6 +1036,9 @@ class TestLLMSeededLFBOTreeSearch(TestCase):
             def cleanup(self) -> None:
                 self.cleanup_called = True
 
+            def set_budget_exceeded_fn(self, fn) -> None:
+                pass
+
         class FakeLLMSearch:
             def __init__(self, kernel, args, **kwargs) -> None:
                 self.kernel = kernel
@@ -896,6 +1144,9 @@ class TestLLMSeededLFBOTreeSearch(TestCase):
         class FakeBenchmarkProvider:
             def __init__(self, **kwargs) -> None:
                 self.kwargs = kwargs
+
+            def set_budget_exceeded_fn(self, fn) -> None:
+                pass
 
         class FailIfLLMConstructed:
             def __init__(self, *args, **kwargs) -> None:

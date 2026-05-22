@@ -1,11 +1,12 @@
-"""Internal tanh-approximation GELU op.
+"""Internal GELU ops used to keep GELU epilogues as one FX node.
 
 Not a user-facing API. The user-facing surface is
 ``torch.nn.functional.gelu(x, approximate="tanh")``; ``device_ir`` installs
 a decomposition (see ``install_gelu_decomp`` below) that maps the
 ``approximate="tanh"`` overload onto the single-FX-node
-``_gelu_tanh_approx`` op defined here. The ``approximate="none"`` path
-keeps the inductor default decomposition (the erf form).
+``_gelu_tanh_approx`` op defined here. The ``approximate="none"`` path maps
+to ``_gelu_erf`` for the same reason: the default erf formula also references
+the input multiple times.
 
 The polynomial form ``0.5 * x * (1 + tanh(x * (sqrt(2/pi) +
 sqrt(2/pi) * 0.044715 * x * x)))`` references ``x`` four times. Spelled
@@ -14,16 +15,14 @@ Helion's tcgen05 epilogue chain analyzer
 (``helion/_compiler/cute/cute_epilogue.py``) and falls back to the
 loud-failure backstop. Folding the whole expression behind a single
 op lets the chain analyzer see exactly one ``_gelu_tanh_approx`` FX
-node and splice the polynomial inline as one chain step (single
-hoisted local for ``x``, single rendered expression — register-resident
-throughout).
+node and splice the polynomial inline as one chain step against the
+already-bound carrier local.
 
 Inside the tcgen05 chain analyzer, ``_gelu_tanh_approx`` is registered
 as a ``_UnaryStep`` row in ``_ZERO_ARG_TARGETS`` keyed on the api
-wrapper itself (the FX target). The template binds ``x`` to a single
-hoisted local (``inner_ref_count = 4``) so the rendered expression
-references the input exactly once even though the polynomial has four
-occurrences of ``x``.
+wrapper itself (the FX target). The template references the carrier
+local four times in the standard polynomial; the renderer keeps that
+carrier bound before formatting the template.
 
 Backend support: ``cute`` and ``triton`` only. The ``pallas`` backend
 raises :class:`exc.BackendUnsupported` because Mosaic does not have a
@@ -64,17 +63,17 @@ if TYPE_CHECKING:
 # precision.
 GELU_TANH_APPROX_KAPPA: float = 0.7978845608028654
 GELU_TANH_APPROX_LAMBDA: float = 0.035677408136300125
+GELU_ERF_INV_SQRT2: float = 0.7071067811865476
 
 
 # Templates for backend codegen.
 #
 # The cute template uses ``{inner}`` directly so it plugs into the
 # tcgen05 chain analyzer's ``_UnaryStep.template`` slot
-# (``cute_epilogue.py`` substitutes ``{inner}`` after hoisting the
-# carrier expression to a single local). The cute-backend codegen
-# below also calls ``.format(inner=...)`` against the lifted local
-# name to share the same template across the splice site and
-# pointwise paths.
+# (``cute_epilogue.py`` substitutes ``{inner}`` with the current
+# carrier local). The cute-backend codegen below also calls
+# ``.format(inner=...)`` against the lifted local name to share the
+# same template across the splice site and pointwise paths.
 #
 # The triton template is rendered as two layers: the inner ``{x32}``
 # placeholder is fp32 (cast happens at the codegen-site for fp16 /
@@ -99,20 +98,18 @@ _GELU_TANH_APPROX_EXPR_CUTE = (
     f" ({GELU_TANH_APPROX_KAPPA!r} + {GELU_TANH_APPROX_LAMBDA!r}"
     f" * ({{inner}}) * ({{inner}})))))"
 )
+# Exact erf GELU uses a helper so fp32 TensorSSA carriers, including
+# tcgen05 epilogue fragments, can use packed f32x2 mul/fma around the
+# scalar erf while non-fp32 and odd-size TensorSSA inputs keep the
+# scalar cute.math.erf fallback.
+_GELU_ERF_EXPR_CUTE = "_cute_gelu_erf_exact_f32x2({inner})"
 _GELU_TANH_APPROX_EXPR_TRITON = (
     f"(0.5 * ({{x}}) * (1.0 + libdevice.tanh(({{x32}}) * ({GELU_TANH_APPROX_KAPPA!r}"
     f" + {GELU_TANH_APPROX_LAMBDA!r} * ({{x32}}) * ({{x32}})))))"
 )
-
-
-# Number of times the rendered cute expression substitutes ``{inner}``.
-# The polynomial references ``x`` four times: once in the leading
-# ``0.5 * x``, once in ``x * (...)`` inside tanh, and twice in
-# ``x * x``. The chain renderer (``_UnaryStep.inner_ref_count > 1``)
-# uses this count to hoist ``{inner}`` to a single local first so the
-# template references only that local — keeping rendered source O(1)
-# in the input expression size.
-GELU_TANH_APPROX_INNER_REF_COUNT: int = 4
+_GELU_ERF_EXPR_TRITON = (
+    f"(0.5 * ({{x}}) * (1.0 + libdevice.erf(({{x32}}) * {GELU_ERF_INV_SQRT2!r})))"
+)
 
 
 @_decorators.api(is_device_only=True)
@@ -132,7 +129,23 @@ def _gelu_tanh_approx(x: torch.Tensor) -> torch.Tensor:
     raise exc.NotInsideKernel
 
 
+@_decorators.api(is_device_only=True)
+def _gelu_erf(x: torch.Tensor) -> torch.Tensor:
+    """Internal exact GELU op using the erf formula.
+
+    Computes ``0.5 * x * (1 + erf(x / sqrt(2)))``. Not user-facing; invoked
+    via the ``aten.gelu.default`` decomposition installed by
+    :func:`install_gelu_decomp`.
+    """
+    raise exc.NotInsideKernel
+
+
 @_decorators.register_fake(_gelu_tanh_approx)
+def _(x: torch.Tensor) -> torch.Tensor:
+    return torch.empty_like(x)
+
+
+@_decorators.register_fake(_gelu_erf)
 def _(x: torch.Tensor) -> torch.Tensor:
     return torch.empty_like(x)
 
@@ -183,15 +196,48 @@ def _(state: CodegenState) -> ast.AST:
     return expr_from_string(expr)
 
 
+@_decorators.codegen(_gelu_erf, "triton")
+def _(state: CodegenState) -> ast.AST:
+    input_ast = state.codegen.lift(state.ast_arg(0), dce=True, prefix="gelu_erf_in")
+    proxy = state.proxy_args[0]
+    orig_dtype: torch.dtype | None = None
+    if isinstance(proxy, torch.Tensor) and proxy.dtype in (
+        torch.float16,
+        torch.bfloat16,
+    ):
+        orig_dtype = proxy.dtype
+    if orig_dtype is not None:
+        x32_local = state.codegen.lift(
+            expr_from_string(f"{input_ast.id}.to(tl.float32)"),
+            dce=True,
+            prefix="gelu_erf_fp32",
+        )
+        x32_id = x32_local.id
+    else:
+        x32_id = input_ast.id
+    expr = _GELU_ERF_EXPR_TRITON.replace("{x}", input_ast.id).replace("{x32}", x32_id)
+    if orig_dtype is not None:
+        expr = f"({expr}).to({triton_type(orig_dtype)})"
+    return expr_from_string(expr)
+
+
 @_decorators.codegen(_gelu_tanh_approx, "cute")
 def _(state: CodegenState) -> ast.AST:
     # Same lift-to-single-local rationale as the triton path: see the
-    # ``inner_ref_count`` discussion above and the docstring on
-    # :class:`Tcgen05UnaryEpilogueChain` (``cute_epilogue.py``).
+    # module docstring and :class:`Tcgen05UnaryEpilogueChain`
+    # (``cute_epilogue.py``).
     input_ast = state.codegen.lift(
         state.ast_arg(0), dce=True, prefix="gelu_tanh_approx_in"
     )
     return expr_from_string(epilogue_unary_step_template().format(inner=input_ast.id))
+
+
+@_decorators.codegen(_gelu_erf, "cute")
+def _(state: CodegenState) -> ast.AST:
+    input_ast = state.codegen.lift(state.ast_arg(0), dce=True, prefix="gelu_erf_in")
+    return expr_from_string(
+        gelu_erf_epilogue_unary_step_template().format(inner=input_ast.id)
+    )
 
 
 @_decorators.codegen(_gelu_tanh_approx, "pallas")
@@ -208,42 +254,66 @@ def _(state: CodegenState) -> ast.AST:
     )
 
 
+@_decorators.codegen(_gelu_erf, "pallas")
+def _(state: CodegenState) -> ast.AST:
+    # ``jax.nn.gelu(x, approximate=False)`` lowers via ``lax.erfc`` which is
+    # unimplemented in Pallas TPU's Mosaic lowering. Render the equivalent
+    # ``erf``-based formula directly so the chain only references the
+    # TPU-supported ``lax.erf`` primitive.
+    input_ast = state.codegen.lift(state.ast_arg(0), dce=True, prefix="gelu_erf_in")
+    expr = (
+        f"(0.5 * ({input_ast.id}) * "
+        f"(1.0 + lax.erf(({input_ast.id}) * {GELU_ERF_INV_SQRT2!r})))"
+    )
+    return expr_from_string(expr)
+
+
 @_decorators.ref(_gelu_tanh_approx)
 def _(x: torch.Tensor) -> torch.Tensor:
     return torch.nn.functional.gelu(x, approximate="tanh")
+
+
+@_decorators.ref(_gelu_erf)
+def _(x: torch.Tensor) -> torch.Tensor:
+    return torch.nn.functional.gelu(x)
 
 
 def epilogue_unary_step_template() -> str:
     """Return the cute-backend template (``{inner}``-keyed) for the
     tcgen05 epilogue chain analyzer.
 
-    The chain renderer in ``cute_epilogue.py`` substitutes ``{inner}``
-    after hoisting the carrier expression to a fresh local; the
-    template returned here is the same one the cute-backend codegen
-    in this module uses, so the two paths cannot drift apart.
+    The chain renderer in ``cute_epilogue.py`` substitutes ``{inner}`` with
+    its current carrier local; the template returned here is the same one the
+    cute-backend codegen in this module uses, so the two paths cannot drift
+    apart.
     """
     return _GELU_TANH_APPROX_EXPR_CUTE
+
+
+def gelu_erf_epilogue_unary_step_template() -> str:
+    """Return the cute-backend exact-GELU template for tcgen05 epilogues."""
+    return _GELU_ERF_EXPR_CUTE
 
 
 def install_gelu_decomp(
     decomp_table: dict[torch._ops.OpOverload, Callable[..., object]],
 ) -> None:
-    """Route ``F.gelu(x, approximate='tanh')`` through ``_gelu_tanh_approx``.
+    """Route GELU overloads through single-node internal ops.
 
     ``aten.gelu.default`` is the dispatch target for both
     ``approximate='none'`` (default, erf form) and ``approximate='tanh'``.
-    Inductor's default decomposition expands the tanh form into the
-    4-x-reference polynomial, which the cute epilogue chain analyzer
-    cannot fuse. We replace the entry with a wrapper that branches on
-    the kwarg: tanh maps to a single ``_gelu_tanh_approx`` FX node, and
-    every other approximate value falls through to the original
-    inductor decomp (or the bare aten op if none was registered).
+    Inductor's default decompositions expand both forms into expressions that
+    reference the input multiple times, which the cute epilogue chain analyzer
+    cannot fuse. We replace the entry with a wrapper that branches on the
+    kwarg and leaves unknown approximate values on the original path.
     """
     original_decomp = decomp_table[torch.ops.aten.gelu.default]
 
     def _gelu_decomp(x: torch.Tensor, *, approximate: str = "none") -> torch.Tensor:
         if approximate == "tanh":
             return _gelu_tanh_approx(x)
+        if approximate == "none":
+            return _gelu_erf(x)
         # pyrefly: ignore [bad-return]
         return original_decomp(x, approximate=approximate)
 

@@ -16,9 +16,16 @@ import torch
 import helion
 from helion import exc
 from helion._compiler.compile_environment import CompileEnvironment
+from helion._compiler.cute.tcgen05_constants import (
+    TCGEN05_SCHED_CONSUMER_WAIT_MODE_CONFIG_KEY,
+)
+from helion._compiler.cute.tcgen05_constants import (
+    TCGEN05_SCHED_CONSUMER_WAIT_MODE_WARP_LEADER,
+)
 from helion._testing import TestCase
 from helion._testing import onlyBackends
 from helion._testing import skipIfXPU
+import helion.language as hl
 
 
 def _json_safe_values() -> st.SearchStrategy[Any]:
@@ -127,6 +134,27 @@ class TestConfigAPI(TestCase):
 
         self.assertIs(helion.Config, runtime.Config)
         self.assertIs(helion.Config, helion.runtime.Config)
+
+    def test_cuda_device_capability_specializes_bound_kernel_cache_key(self) -> None:
+        @helion.kernel()
+        def device_key_kernel(device: hl.constexpr) -> None:
+            pass
+
+        device = torch.device("cuda:0")
+        with (
+            patch("torch.cuda.is_available", return_value=True),
+            patch("torch.cuda.get_device_capability", return_value=(9, 0)),
+        ):
+            sm90_key = device_key_kernel._base_specialization_key((device,))
+        with (
+            patch("torch.cuda.is_available", return_value=True),
+            patch("torch.cuda.get_device_capability", return_value=(10, 0)),
+        ):
+            sm100_key = device_key_kernel._base_specialization_key((device,))
+
+        self.assertEqual(sm90_key[-2:], ("cuda", (9, 0)))
+        self.assertEqual(sm100_key[-2:], ("cuda", (10, 0)))
+        self.assertNotEqual(sm90_key, sm100_key)
 
     def test_config_constructor_signature_contains_expected_kwargs(self) -> None:
         # Keep this list in sync with public kwargs; removal/rename should fail tests
@@ -368,6 +396,20 @@ class TestSettingsEnv(TestCase):
         )
         self.assertTrue(cute_env.config_spec.supports_config_key("num_threads"))
 
+    def test_pallas_backend_uses_exact_factory_and_static_reduction_dims(
+        self,
+    ) -> None:
+        from helion._compiler.backend import PallasBackend
+        from helion._compiler.backend import TritonBackend
+
+        triton = TritonBackend()
+        pallas = PallasBackend()
+
+        self.assertTrue(triton.pad_factory_tensors_to_power_of_2)
+        self.assertEqual(triton.static_rdim_size(384), 512)
+        self.assertFalse(pallas.pad_factory_tensors_to_power_of_2)
+        self.assertEqual(pallas.static_rdim_size(384), 384)
+
     def test_triton_rejects_num_threads_in_normalize(self) -> None:
         env = CompileEnvironment(torch.device("cpu"), helion.Settings(backend="triton"))
         with self.assertRaisesRegex(
@@ -553,6 +595,168 @@ class TestHardwareConfigSpecRanges(TestCase):
             nvidia_spec.load_eviction_policies.inner.choices,
             ("", "first", "last"),
         )
+
+
+class TestCuteTcgen05ConfigSpecSplit(TestCase):
+    @staticmethod
+    def _make_cute_tcgen05_spec():
+        from helion._compiler.backend import CuteBackend
+        from helion.autotuner.config_spec import BlockSizeSpec
+        from helion.autotuner.config_spec import ConfigSpec
+
+        spec = ConfigSpec(backend=CuteBackend())
+        spec.cute_tcgen05_search_enabled = True
+        for block_id, size_hint in enumerate((4096, 4096, 4096)):
+            spec.block_sizes.append(
+                BlockSizeSpec(
+                    block_id=block_id,
+                    size_hint=size_hint,
+                    max_size=256 if block_id < 2 else 128,
+                )
+            )
+        return spec
+
+    def test_cute_tcgen05_search_fields_and_default_flat_roundtrip(self) -> None:
+        from helion.autotuner.config_generation import ConfigGeneration
+
+        spec = self._make_cute_tcgen05_spec()
+        flat_keys = [key for key, _count, _is_sequence in spec.flat_key_layout()]
+
+        self.assertIn("tcgen05_cluster_m", flat_keys)
+        self.assertIn("tcgen05_ab_stages", flat_keys)
+        self.assertIn("tcgen05_strategy", flat_keys)
+        self.assertIn("tcgen05_warp_spec_c_input_warps", flat_keys)
+
+        gen = ConfigGeneration(spec)
+        default_flat = gen.default_flat()
+        self.assertEqual(
+            gen.flatten(gen.unflatten([*default_flat])),
+            default_flat,
+        )
+
+    def test_tcgen05_search_fields_do_not_leak_to_other_backends(self) -> None:
+        from helion._compiler.backend import MetalBackend
+        from helion._compiler.backend import PallasBackend
+        from helion._compiler.backend import TileIRBackend
+        from helion._compiler.backend import TritonBackend
+        from helion.autotuner.config_generation import ConfigGeneration
+        from helion.autotuner.config_spec import BlockSizeSpec
+        from helion.autotuner.config_spec import ConfigSpec
+
+        for backend in (
+            TritonBackend(),
+            PallasBackend(),
+            TileIRBackend(),
+            MetalBackend(),
+        ):
+            spec = ConfigSpec(backend=backend)
+            spec.cute_tcgen05_search_enabled = True
+            spec.block_sizes.append(
+                BlockSizeSpec(block_id=0, size_hint=128, max_size=128)
+            )
+            flat_keys = {key for key, _count, _is_sequence in spec.flat_key_layout()}
+            self.assertFalse(
+                any(key.startswith("tcgen05_") for key in flat_keys),
+                f"{backend.name} search surface leaked tcgen05 keys: {flat_keys}",
+            )
+            default_config = spec.default_config()
+            self.assertFalse(
+                any(key.startswith("tcgen05_") for key in default_config.config),
+                f"{backend.name} default config leaked tcgen05 keys: "
+                f"{default_config.config}",
+            )
+            gen = ConfigGeneration(spec)
+            generated_config = gen.unflatten(gen.default_flat())
+            self.assertFalse(
+                any(key.startswith("tcgen05_") for key in generated_config.config),
+                f"{backend.name} generated config leaked tcgen05 keys: "
+                f"{generated_config.config}",
+            )
+
+    def test_explicit_tcgen05_strategy_config_validation(self) -> None:
+        spec = self._make_cute_tcgen05_spec()
+
+        with self.assertRaisesRegex(
+            exc.InvalidConfig,
+            "tcgen05 strategy invariants violated",
+        ):
+            spec.normalize(
+                helion.Config(
+                    block_sizes=[128, 128, 64],
+                    tcgen05_strategy="role_local_monolithic",
+                    tcgen05_warp_spec_c_input_warps=1,
+                )
+            )
+
+        with self.assertRaises(exc.InvalidConfig):
+            spec.normalize(
+                helion.Config(
+                    block_sizes=[128, 128, 64],
+                    **{
+                        TCGEN05_SCHED_CONSUMER_WAIT_MODE_CONFIG_KEY: (
+                            TCGEN05_SCHED_CONSUMER_WAIT_MODE_WARP_LEADER
+                        )
+                    },
+                )
+            )
+
+        config = helion.Config(
+            block_sizes=[128, 128, 64],
+            tcgen05_strategy="role_local_with_scheduler",
+            tcgen05_warp_spec_scheduler_warps=1,
+            tcgen05_warp_spec_c_input_warps=1,
+        )
+        spec.normalize(config)
+        self.assertEqual(config.config["tcgen05_strategy"], "role_local_with_scheduler")
+        self.assertEqual(config.config["tcgen05_warp_spec_c_input_warps"], 1)
+
+    def test_direct_cute_config_spec_enforces_clc_arch_gate(self) -> None:
+        from helion._compiler.cute.strategies import (
+            TCGEN05_PERSISTENCE_MODEL_CONFIG_KEY,
+        )
+        from helion._compiler.cute.strategies import Tcgen05PersistenceModel
+
+        with (
+            patch("torch.cuda.is_available", return_value=True),
+            patch("torch.cuda.current_device", return_value=0),
+            patch("torch.cuda.get_device_capability", return_value=(9, 0)),
+        ):
+            spec = self._make_cute_tcgen05_spec()
+
+        with self.assertRaisesRegex(
+            exc.InvalidConfig,
+            "requires CUDA compute capability major >= 10",
+        ):
+            spec.normalize(
+                helion.Config(
+                    block_sizes=[128, 128, 64],
+                    pid_type="persistent_interleaved",
+                    tcgen05_strategy="role_local_with_scheduler",
+                    tcgen05_warp_spec_scheduler_warps=1,
+                    tcgen05_warp_spec_c_input_warps=1,
+                    **{
+                        TCGEN05_PERSISTENCE_MODEL_CONFIG_KEY: (
+                            Tcgen05PersistenceModel.CLC_PERSISTENT.value
+                        )
+                    },
+                )
+            )
+
+    def test_aux_kernel_detection_routes_strategy_search_surface(self) -> None:
+        spec = self._make_cute_tcgen05_spec()
+        tcgen05_config = spec._cute_tcgen05_config
+
+        narrow = tcgen05_config.strategy_autotune_fragments()
+        self.assertEqual(narrow["tcgen05_strategy"].choices, ("role_local_monolithic",))
+        self.assertEqual(narrow["tcgen05_warp_spec_c_input_warps"].choices, (0,))
+
+        tcgen05_config.aux_kernel_detected = True
+        widened = tcgen05_config.strategy_autotune_fragments()
+        self.assertEqual(
+            widened["tcgen05_strategy"].choices,
+            ("role_local_monolithic", "role_local_with_scheduler"),
+        )
+        self.assertEqual(widened["tcgen05_warp_spec_c_input_warps"].choices, (0, 1))
 
 
 if __name__ == "__main__":

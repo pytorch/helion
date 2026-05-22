@@ -20,6 +20,7 @@ import torch
 from .. import exc
 from .ast_extension import expr_from_string
 from .cute.tcgen05_constants import TCGEN05_CUBIN_LINEINFO_CONFIG_KEY
+from .cute.tcgen05_constants import TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY
 
 if TYPE_CHECKING:
     from torch._inductor.ops_handler import OpsHandler
@@ -83,6 +84,17 @@ class Backend(abc.ABC):
         from ..autotuner.config_generation import TRITON_MAX_TENSOR_NUMEL
 
         return TRITON_MAX_TENSOR_NUMEL
+
+    @property
+    def pad_factory_tensors_to_power_of_2(self) -> bool:
+        """Whether on-device tensor factory ops (zeros/ones/empty/full/...) should
+        have their integer dim sizes rounded up to the next power of 2.
+
+        Triton requires power-of-2 block sizes, so the default is True. Pallas
+        does not require this and the padding causes broadcast mismatches
+        against unpadded full-tensor loads.
+        """
+        return True
 
     @property
     def codegen_name(self) -> str:
@@ -189,6 +201,10 @@ class Backend(abc.ABC):
     def max_reduction_threads(self) -> int | None:
         """Maximum threads for a single warp-level reduction, or None if unlimited."""
         return None
+
+    def max_reduction_loop(self) -> int | None:
+        """Maximum user-visible loop chunk for a rolled reduction."""
+        return self.max_reduction_threads()
 
     def adjust_reduction_thread_count(
         self, requested: int, existing_strategies: list[TileStrategy]
@@ -341,6 +357,16 @@ class Backend(abc.ABC):
 
     def broadcast_to_expr(self, expr: str, shape: str) -> str:
         raise exc.BackendUnsupported(self.name, "broadcast_to")
+
+    def maybe_reshape_reduction(
+        self,
+        expr: str,
+        source_shape: Sequence[int],
+        target_shape: Sequence[int],
+        target_shape_expr: str,
+    ) -> str:
+        """Reshape a reduction result from its physical to logical shape."""
+        return self.reshape_expr(expr, target_shape_expr)
 
     def reduction_index_expr(
         self, block_size_var: str, dtype: str, block_idx: int, *, axis: int
@@ -784,6 +810,21 @@ class TritonBackend(Backend):
     def broadcast_to_expr(self, expr: str, shape: str) -> str:
         return f"tl.broadcast_to({expr}, {shape})"
 
+    def maybe_reshape_reduction(
+        self,
+        expr: str,
+        source_shape: Sequence[int],
+        target_shape: Sequence[int],
+        target_shape_expr: str,
+    ) -> str:
+        # Triton reductions over a 1D tile produce a scalar even when
+        # keepdim=True makes the logical result shape [1]. tl.reshape() only
+        # accepts block tensors here, so leave the scalar and let later ops
+        # broadcast it.
+        if not source_shape and math.prod(target_shape) == 1:
+            return expr
+        return self.reshape_expr(expr, target_shape_expr)
+
     def reduction_index_expr(
         self, block_size_var: str, dtype: str, block_idx: int, *, axis: int
     ) -> str:
@@ -800,9 +841,18 @@ class TritonBackend(Backend):
         return "triton.jit"
 
     def function_decorator_for_args(self, args: Sequence[Argument]) -> str:
+        from .compile_environment import CompileEnvironment
         from .device_function import SymbolArgument
         from .device_function import TensorSizeArg
         from .device_function import TensorStrideArg
+
+        # Default to Triton's own behavior: let Triton specialize on values and
+        # alignment.  This enables vectorized loads (constexpr 1 for inner
+        # strides, divisibility-by-16 hint for sizes) at the cost of an
+        # occasional Triton recompile when a value crosses a specialization
+        # boundary (e.g. size 1 -> 2, alignment changes).
+        if not CompileEnvironment.current().settings.triton_do_not_specialize:
+            return self.function_decorator
 
         do_not_specialize = [
             arg.name
@@ -1036,6 +1086,11 @@ _TORCH_TO_JAX_DTYPE: dict[str, str] = {
     "torch.bool": "jnp.bool_",
     "torch.complex64": "jnp.complex64",
     "torch.complex128": "jnp.complex128",
+    "torch.float8_e4m3fn": "jnp.float8_e4m3fn",
+    "torch.float8_e4m3fnuz": "jnp.float8_e4m3fnuz",
+    "torch.float8_e5m2": "jnp.float8_e5m2",
+    "torch.float8_e5m2fnuz": "jnp.float8_e5m2fnuz",
+    "torch.float8_e8m0fnu": "jnp.float8_e8m0fnu",
 }
 
 
@@ -1055,6 +1110,10 @@ class PallasBackend(Backend):
         # No compile-time element cap on Pallas; VMEM byte budget is the
         # real constraint and is enforced separately at runtime.
         return None
+
+    @property
+    def pad_factory_tensors_to_power_of_2(self) -> bool:
+        return False
 
     def max_reduction_threads(self) -> int | None:
         return None
@@ -1177,11 +1236,11 @@ class PallasBackend(Backend):
         from .device_function import TensorStrideArg
 
         if isinstance(arg, (SymbolArgument, TensorSizeArg, TensorStrideArg)):
-            from ..runtime.settings import is_pallas_interpret
+            from .compile_environment import CompileEnvironment
 
             if tensor_host_args:
                 device_expr = f"{tensor_host_args[0]}.device"
-            elif is_pallas_interpret():
+            elif CompileEnvironment.current().settings.pallas_interpret:
                 device_expr = "'cpu'"
             else:
                 device_expr = "'tpu'"
@@ -1799,11 +1858,12 @@ class PallasBackend(Backend):
                     output_only_names.append(arg.host_str())
         self._output_only_names = output_only_names
 
-        launcher_args = [*args, f"_output_indices={output_indices}"]
-        launcher_args.append(f"_inplace_indices={inplace_indices}")
-
+        launcher_args = [*args]
         if has_rng_ops:
-            launcher_args.insert(-1, "_rng_seed_buffer")
+            launcher_args.append("_rng_seed_buffer")
+        launcher_args.extend(
+            [f"_output_indices={output_indices}", f"_inplace_indices={inplace_indices}"]
+        )
 
         block_spec_info = self._compute_block_spec_info(sorted_args, config)
         if block_spec_info is not None:
@@ -1857,6 +1917,9 @@ class PallasBackend(Backend):
                     launcher_args.append(
                         f"_pipeline_arg_indices={pipeline_arg_indices!r}"
                     )
+
+        if CompileEnvironment.current().settings.pallas_interpret:
+            launcher_args.append("_pallas_interpret=True")
 
         return launcher_args
 
@@ -2529,6 +2592,12 @@ def _active_loop_block_ids(fn: DeviceFunction) -> set[int]:
     return active
 
 
+# Leave broad headroom below the G1 sweep's 3600s subprocess timeout: budget
+# checks happen between inline CuTe compile/benchmark units, then the selected
+# config still has to compile, pass correctness, and run the final benchmark.
+_CUTE_DEFAULT_AUTOTUNE_BUDGET_SECONDS = 600
+
+
 class CuteBackend(Backend):
     """CuTe DSL (CUTLASS Python DSL) code generation backend."""
 
@@ -2560,6 +2629,11 @@ class CuteBackend(Backend):
             inductor_dtype := CuteDSLOpOverrides.TORCH_TO_CUTE_DTYPE.get(dtype)
         ) is not None:
             return inductor_dtype
+        if dtype is torch.float4_e2m1fn_x2:
+            # PyTorch's shell dtype stores two E2M1 values in one byte.  CuTe
+            # does not support scalar dereference for its 4-bit type yet, so
+            # SIMT scalar loads treat the tensor as raw byte storage.
+            return "cutlass.Uint8"
         if dtype is torch.uint64:
             return "cutlass.Int64"
 
@@ -2616,7 +2690,15 @@ class CuteBackend(Backend):
         force: bool = True,
         **kwargs: object,
     ) -> Config:
-        return super().autotune(bound_kernel, args, force=force, **kwargs)
+        original_budget = bound_kernel.settings.autotune_budget_seconds
+        if bound_kernel.settings.autotune_budget_seconds is None:
+            bound_kernel.settings.autotune_budget_seconds = (
+                _CUTE_DEFAULT_AUTOTUNE_BUDGET_SECONDS
+            )
+        try:
+            return super().autotune(bound_kernel, args, force=force, **kwargs)
+        finally:
+            bound_kernel.settings.autotune_budget_seconds = original_budget
 
     @property
     def function_decorator(self) -> str:
@@ -2646,11 +2728,22 @@ class CuteBackend(Backend):
             "_default_cute_launcher": "from helion.runtime import default_cute_launcher as _default_cute_launcher",
             "_next_power_of_2": "from helion._utils import next_power_of_2 as _next_power_of_2",
             "_cute_argreduce_index": "from helion._compiler.cute.reduce_helpers import _cute_argreduce_index",
+            "_helion_tcgen05_pipeline": (
+                "from helion._compiler.cute import tcgen05_pipeline "
+                "as _helion_tcgen05_pipeline"
+            ),
+            "_cute_gelu_erf_exact_f32x2": (
+                "from helion._compiler.cute.epilogue_helpers import "
+                "gelu_erf_exact_f32x2 as _cute_gelu_erf_exact_f32x2"
+            ),
             "_cute_grouped_reduce_shared_tree": "from helion._compiler.cute.reduce_helpers import _cute_grouped_reduce_shared_tree",
             "_cute_grouped_reduce_shared_two_stage": "from helion._compiler.cute.reduce_helpers import _cute_grouped_reduce_shared_two_stage",
             "_cute_grouped_reduce_warp": "from helion._compiler.cute.reduce_helpers import _cute_grouped_reduce_warp",
             "_cute_store_shared_remote_x4": "from helion._compiler.cute.cluster_helpers import store_shared_remote_x4 as _cute_store_shared_remote_x4",
             "_cute_issue_clc_query_nomulticast": "from helion._compiler.cute.clc_helpers import issue_clc_query_nomulticast as _cute_issue_clc_query_nomulticast",
+            "_cute_inline_asm_elementwise": "from helion._compiler.cute.inline_asm_helpers import inline_asm_elementwise as _cute_inline_asm_elementwise",
+            "_cute_fp8e4m3fn_to_float32": "from helion._compiler.cute.quantized_helpers import fp8e4m3fn_to_float32 as _cute_fp8e4m3fn_to_float32",
+            "_cute_float4_e2m1fn_x2_to_float32": "from helion._compiler.cute.quantized_helpers import float4_e2m1fn_x2_to_float32 as _cute_float4_e2m1fn_x2_to_float32",
         }
 
     def program_id_expr(self, dim: int, *, index_dtype: str) -> str:
@@ -2693,7 +2786,10 @@ class CuteBackend(Backend):
             except NoCurrentFunction:
                 pass
             else:
-                if df.get_cute_tcgen05_store_value(x.id) is not None:
+                if (
+                    df.cute_state.get_tcgen05_store_value(df.variable_aliases(x.id))
+                    is not None
+                ):
                     return x
         return super().cast_ast(x, target_dtype)
 
@@ -2768,7 +2864,15 @@ class CuteBackend(Backend):
         return f"({tensor_name})[{index_expr}]"
 
     def max_reduction_threads(self) -> int | None:
-        return 32
+        return 1024
+
+    def max_reduction_loop(self) -> int | None:
+        from .reduction_strategy import cute_looped_reduction_block_size
+
+        max_threads = self.max_reduction_threads()
+        if max_threads is None:
+            return None
+        return cute_looped_reduction_block_size(2**31 - 1, max_threads)
 
     def adjust_reduction_thread_count(
         self, requested: int, existing_strategies: list[TileStrategy]
@@ -3053,8 +3157,27 @@ class CuteBackend(Backend):
 
         def launcher_args_with_compile_options(block_arg: str) -> list[str]:
             launcher_args = [block_arg]
+            compile_options: list[str] = []
             if config.get(TCGEN05_CUBIN_LINEINFO_CONFIG_KEY) is True:
-                launcher_args.append("cute_compile_options='--generate-line-info'")
+                compile_options.append("--generate-line-info")
+            if config.get(TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY) is True:
+                if (
+                    _kernel_specialized_mma_impl(
+                        device_function,
+                        config=device_function.config,
+                    )
+                    != "tcgen05"
+                ):
+                    raise exc.BackendUnsupported(
+                        "cute",
+                        f"{TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY}=True requires "
+                        "tcgen05 CuTe lowering",
+                    )
+                compile_options.append("--enable-tvm-ffi")
+            if compile_options:
+                launcher_args.append(
+                    f"cute_compile_options={' '.join(compile_options)!r}"
+                )
             return launcher_args
 
         block_size_values = {
@@ -3080,12 +3203,64 @@ class CuteBackend(Backend):
             )
         )
         offset_thread_dims = [1, 1, 1]
-        for offset_id, axis_text in re.findall(
-            r"^\s*indices_\d+ = (?:tile_)?offset_(\d+) \+ .*cute\.arch\.thread_idx\(\)\[(\d+)\]",
-            final_kernel_text,
+        # When a lane loop is active for an axis the generated index expression
+        # has the form
+        #   ``indices_<n> = tile_offset_<n> + Int32(thread_idx()[<axis>]) * <epT> + Int32(lane_<n>)``
+        # where ``<epT>`` is ``elements_per_thread`` for that axis and the
+        # outer ``for lane_<n> in range(<epT>):`` covers the residual. In
+        # that case the launch-time thread extent for the axis is
+        # ``block_size / <epT>``, not ``block_size``. Without dividing by
+        # ``<epT>`` here the launch dim ends up at ``block_size`` while the
+        # generated tile arithmetic only spans ``block_size / <epT>`` threads,
+        # which means ``thread_idx[axis] >= block_size / <epT>`` writes past
+        # the tile and triggers ``cudaErrorIllegalAddress`` mid-search. The
+        # ``cutlass.Int32(...)`` wrapper around ``thread_idx`` is closed
+        # before the ``* <epT>`` multiplier, so the closing ``)`` between
+        # ``[axis]`` and ``*`` is part of the line we have to skip over.
+        #
+        # The launch dim along ``axis`` has to serve **every** indices line
+        # that uses that axis. If two lines on the same axis emit different
+        # multipliers (e.g. one block_id with ``epT=1`` and another with
+        # ``epT=2``), the line with the larger ``thread_idx[axis]`` range
+        # is the binding one — so we compute ``block_size // epT`` *per
+        # line* and take the ``max`` across lines, rather than combining
+        # multipliers across lines and dividing once. ``re.findall`` over
+        # the optional-multiplier alternation cannot be made to populate
+        # the multiplier group reliably (the optional ``(?:...)?`` form
+        # prefers the empty match), so we scan the lines once in Python
+        # to keep the per-line ``(block_size, epT)`` pair intact.
+        # ``indices_line_re`` anchors on the
+        # ``cutlass.Int32(cute.arch.thread_idx()[<axis>])`` form the CuTe
+        # backend emits via ``lane_index_expr`` (see backend.py:2666).
+        # The trailing ``\)`` after ``\]`` is the close of the
+        # ``cutlass.Int32(...)`` wrapper around ``thread_idx``; if a
+        # future codegen path drops the wrapper, the regex will
+        # silently fail to match and the launch dim under-dimensions
+        # without a signal. ``indices_line_assert_re`` below detects
+        # the "wrapper-dropped" form so we can fail loudly instead.
+        indices_line_re = re.compile(
+            r"^\s*indices_\d+ = (?:tile_)?offset_(\d+) \+ "
+            r"[^\n]*?cute\.arch\.thread_idx\(\)\[(\d+)\]\)"
+            r"(?:\s*\*\s*(?:cutlass\.Int32\()?(\d+))?",
             flags=re.MULTILINE,
-        ):
+        )
+        # Loose form: any ``indices_<n>`` line containing ``thread_idx``
+        # under any wrapping. Used only for the wrapper-invariant
+        # assertion below — never consulted for launch-dim values.
+        indices_line_loose_re = re.compile(
+            r"^\s*indices_\d+ = (?:tile_)?offset_\d+ \+ "
+            r"[^\n]*?cute\.arch\.thread_idx\(\)",
+            flags=re.MULTILINE,
+        )
+        matched_lines = 0
+        for line_match in indices_line_re.finditer(final_kernel_text):
+            matched_lines += 1
+            offset_id = line_match.group(1)
+            axis_text = line_match.group(2)
+            multiplier_text = line_match.group(3)
             axis = int(axis_text)
+            if not (0 <= axis < len(offset_thread_dims)):
+                continue
             block_name = offset_block_sizes.get(offset_id)
             block_size = block_size_values.get(block_name or "")
             if block_size is None and block_name is not None:
@@ -3097,8 +3272,59 @@ class CuteBackend(Backend):
                     config_block_size = config.block_sizes[config_index]
                     if isinstance(config_block_size, int):
                         block_size = config_block_size
-            if block_size is not None and 0 <= axis < len(offset_thread_dims):
-                offset_thread_dims[axis] = max(offset_thread_dims[axis], block_size)
+            if block_size is None:
+                continue
+            elements_per_thread = int(multiplier_text) if multiplier_text else 1
+            if elements_per_thread <= 0:
+                # ``lane_index_expr`` only emits ``* <n>`` for ``n >= 1``;
+                # a ``* 0`` multiplier would mean the index expression is
+                # already invalid (every thread maps to offset 0), so
+                # silently falling back to ``block_size`` here would
+                # mask the very class of bug this recovery exists to
+                # catch. Surface it loudly.
+                raise AssertionError(
+                    f"launch-dim recovery: non-positive "
+                    f"elements_per_thread={elements_per_thread} for axis="
+                    f"{axis}"
+                )
+            if block_size % elements_per_thread != 0:
+                # The strategy invariant ``_thread_extent_for_axis``
+                # rejects non-divisible ``block_size / nt`` at
+                # construction, so the regex should never see a line
+                # whose ``epT`` does not divide ``block_size`` evenly.
+                # If a future codegen regression breaks that invariant,
+                # surface it loudly here rather than silently
+                # under-dimensioning the launch.
+                raise AssertionError(
+                    f"launch-dim recovery: block_size={block_size} not "
+                    f"divisible by elements_per_thread={elements_per_thread} "
+                    f"for axis={axis}"
+                )
+            line_extent = block_size // elements_per_thread
+            offset_thread_dims[axis] = max(offset_thread_dims[axis], line_extent)
+        # Wrapper-invariant assertion: when there is at least one
+        # ``indices_<n> = ... thread_idx() ...`` line and we have
+        # ``_BLOCK_SIZE_<n>`` constants to consume, the strict regex
+        # above must have matched at least one of them. A loose match
+        # without a strict match means the codegen emitted
+        # ``thread_idx[axis]`` outside the ``cutlass.Int32(...)``
+        # wrapper the strict regex anchors on; in that case the
+        # launch dim would silently fall back to ``[1, 1, 1]`` and
+        # under-dimension every kernel that uses a thread axis.
+        if (
+            offset_block_sizes
+            and indices_line_loose_re.search(final_kernel_text)
+            and matched_lines == 0
+        ):
+            raise AssertionError(
+                "launch-dim recovery: indices_<n> lines reference "
+                "cute.arch.thread_idx() but none matched the "
+                "cutlass.Int32(...)-wrapped form. The strict regex in "
+                "_launcher_block_arg is anchored on the wrapper emitted "
+                "by lane_index_expr; if the codegen producer was changed "
+                "to drop the wrapper, update the regex to match the new "
+                "form."
+            )
         dims = tuple(codegen.max_thread_block_dims)
         root_live_dims = tuple(codegen.root_thread_block_dims)
         referenced_dims = tuple(codegen.referenced_thread_block_dims)
@@ -3128,7 +3354,7 @@ class CuteBackend(Backend):
             and root_static_threads <= MAX_THREADS_PER_BLOCK
         )
         tcgen05_compact_dims = (
-            device_function.cute_block_shape if specialized_root_tcgen05 else None
+            device_function.cute_state.block_shape if specialized_root_tcgen05 else None
         )
         if referenced_dims != (1, 1, 1):
             dims = referenced_dims

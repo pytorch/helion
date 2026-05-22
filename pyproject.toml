@@ -41,9 +41,11 @@ dev = [
 # scripts/install_cute.sh in CI/dev environments.
 cute-cu12 = [
     "nvidia-cutlass-dsl==4.5.0",
+    "apache-tvm-ffi",
 ]
 cute-cu13 = [
     "nvidia-cutlass-dsl[cu13]==4.5.0",
+    "apache-tvm-ffi",
 ]
 pallas-tpu = [
     "jax[tpu]",

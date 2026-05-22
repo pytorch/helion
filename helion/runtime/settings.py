@@ -338,7 +338,15 @@ def _get_backend() -> str:
 
 
 def is_pallas_interpret() -> bool:
-    """Return True if HELION_PALLAS_INTERPRET=1 is set."""
+    """Return True if pallas_interpret is enabled.
+
+    Checks the active CompileEnvironment first (if one exists),
+    then falls back to the HELION_PALLAS_INTERPRET env var.
+    """
+    from helion._compiler.compile_environment import CompileEnvironment
+
+    if CompileEnvironment.has_current():
+        return CompileEnvironment.current().settings.pallas_interpret
     return _env_get_bool("HELION_PALLAS_INTERPRET", False)
 
 
@@ -387,7 +395,11 @@ class _Settings:
     )
     autotune_benchmark_timeout: int = dataclasses.field(
         default_factory=functools.partial(
-            _env_get_int, "HELION_AUTOTUNE_BENCHMARK_TIMEOUT", 30
+            _env_get_int,
+            "HELION_AUTOTUNE_BENCHMARK_TIMEOUT",
+            # Higher default when the first benchmark call has to absorb a
+            # heavier subprocess cold-start (slower spawn/imports, CUPTI init).
+            90 if is_fbcode() else 30,
         )
     )
     autotune_precompile: PrecompileMode = dataclasses.field(
@@ -538,6 +550,16 @@ class _Settings:
         )
     )
     autotune_config_filter: Callable[[Config], Config | None] | None = None
+    pallas_interpret: bool = dataclasses.field(
+        default_factory=functools.partial(
+            _env_get_bool, "HELION_PALLAS_INTERPRET", False
+        )
+    )
+    triton_do_not_specialize: bool = dataclasses.field(
+        default_factory=functools.partial(
+            _env_get_bool, "HELION_TRITON_DO_NOT_SPECIALIZE", False
+        )
+    )
 
 
 class Settings(_Settings):
@@ -587,7 +609,7 @@ class Settings(_Settings):
         ),
         "autotune_compile_timeout": "Timeout for Triton compilation in seconds used for autotuning. Default is 60 seconds.",
         "autotune_benchmark_subprocess": "Run the autotune benchmark phase in a long-lived spawn subprocess so a hung/slow kernel can be killed without losing autotune progress. Enabled by default. Set HELION_AUTOTUNE_BENCHMARK_SUBPROCESS=0 to disable.",
-        "autotune_benchmark_timeout": "Per-config wall-clock timeout in seconds for the subprocess benchmark phase. Only applies when autotune_benchmark_subprocess is enabled. Default 30 seconds.",
+        "autotune_benchmark_timeout": "Per-config wall-clock timeout in seconds for the subprocess benchmark phase. Only applies when autotune_benchmark_subprocess is enabled. Default 30 seconds, raised automatically on environments with a heavier subprocess cold-start.",
         "autotune_precompile": "Autotuner precompile mode: 'fork', 'spawn', or falsy/None to disable. Defaults to 'fork' on non-Windows platforms.",
         "autotune_precompile_jobs": "Maximum concurrent Triton precompile processes, default to cpu count.",
         "autotune_random_seed": "Seed used for autotuner random number generation. Defaults to HELION_AUTOTUNE_RANDOM_SEED or a time-based seed.",
@@ -612,6 +634,19 @@ class Settings(_Settings):
             "If True, set the compile timeout threshold to be smaller for Triton compilation,"
             "based on a quantile of initial compile times (with a lower bound). Lower bound and quantile "
             "are set by the effort profile. Set HELION_AUTOTUNE_ADAPTIVE_TIMEOUT=0 to disable."
+        ),
+        "pallas_interpret": (
+            "If True, run Pallas kernels in interpret mode on CPU (no TPU needed). "
+            "Defaults to HELION_PALLAS_INTERPRET env var."
+        ),
+        "triton_do_not_specialize": (
+            "If True, pass do_not_specialize for every dynamic size/stride/symbol "
+            "arg so a single Triton binary handles any value, avoiding Triton-level "
+            "recompiles when shapes cross 0/1 or alignment boundaries. Disables "
+            "Triton's value/alignment specializations and can significantly slow "
+            "memory-bound kernels (vectorized loads rely on inner stride being "
+            "specialized to constexpr 1). Only takes effect when static_shapes=False. "
+            "Set HELION_TRITON_DO_NOT_SPECIALIZE=1 to enable globally."
         ),
         "print_output_code": "If True, print the output code of the kernel to stderr.",
         "print_repro": "If True, print Helion kernel code, config, and caller code to stderr as a standalone repro script.",
@@ -676,6 +711,9 @@ class Settings(_Settings):
         "autotune_cache": (
             "The name of the autotuner cache class to use. "
             "Set HELION_AUTOTUNE_CACHE=StrictLocalAutotuneCache to enable strict caching. "
+            "Set HELION_AUTOTUNE_CACHE=RemoteAutotuneCache (or StrictRemoteAutotuneCache) "
+            "and HELION_REMOTE_CACHE_BACKEND=mypackage.module.MyBackend to enable "
+            "remote caching via a user-provided RemoteCacheBackend subclass. "
             "Defaults to 'LocalAutotuneCache'."
         ),
         "autotune_benchmark_fn": (

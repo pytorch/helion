@@ -16,6 +16,7 @@ from types import SimpleNamespace
 from typing import TYPE_CHECKING
 from typing import Callable
 from typing import Generator
+from typing import ParamSpec
 from typing import Sequence
 from typing import TypeVar
 from typing import cast
@@ -62,6 +63,7 @@ if TYPE_CHECKING:
     from .runtime.kernel import Kernel
 
 _R = TypeVar("_R")
+_P = ParamSpec("_P")
 
 
 def _strip_launcher_args(value: str) -> str:
@@ -206,6 +208,8 @@ class _OutputCapture:
 
 def is_cuda() -> bool:
     """Return True if running on CUDA (NVIDIA GPU)."""
+    if _get_backend() == "pallas":
+        return False
     return _get_triton_backend() == "cuda" and torch.cuda.is_available()
 
 
@@ -299,8 +303,29 @@ def skipIfPallas(reason: str) -> Callable[[Callable], Callable]:
 
 
 def xfailIfPallas(reason: str) -> Callable[[Callable], Callable]:
-    """Mark test as expected failure if running with pallas"""
+    """Mark test as expected failure if running with pallas (TPU or interpret mode)"""
     return xfailIfFn(lambda: _get_backend() == "pallas", reason)
+
+
+def xfailIfPallasTpu(reason: str) -> Callable[[Callable], Callable]:
+    """Mark test as expected failure only on real Pallas TPU (passes in interpret mode)."""
+    return xfailIfFn(
+        lambda: _get_backend() == "pallas" and not is_pallas_interpret(), reason
+    )
+
+
+def xfailIfPallasInterpret(reason: str) -> Callable[[Callable], Callable]:
+    """Mark test as expected failure only in Pallas interpret mode (passes on real TPU)."""
+    return xfailIfFn(
+        lambda: _get_backend() == "pallas" and is_pallas_interpret(), reason
+    )
+
+
+def skipIfPallasInterpret(reason: str) -> Callable[[Callable], Callable]:
+    """Skip test in Pallas interpret mode (e.g. tests of TPU-only behavior)."""
+    return skipIfFn(
+        lambda: _get_backend() == "pallas" and is_pallas_interpret(), reason
+    )
 
 
 def skipUnlessAMDCDNA(reason: str) -> Callable[[Callable], Callable]:
@@ -408,7 +433,7 @@ def onlyBackends(
 def skipUnlessTensorDescriptor(reason: str) -> Callable[[Callable], Callable]:
     """Skip test unless tensor descriptors are supported."""
     # Defers check to test execution time to avoid CUDA init during pytest-xdist collection.
-    return skipIfFn(lambda: not supports_tensor_descriptor(), reason)
+    return skipIfFn(lambda: not is_cuda() or not supports_tensor_descriptor(), reason)
 
 
 def skipUnlessTf32Supported(
@@ -1055,6 +1080,43 @@ def _as_tensors(result: object) -> list[torch.Tensor]:
     return [result.clone()]
 
 
+def _with_tf32_precision(fn: Callable[_P, _R]) -> Callable[_P, _R]:
+    """Run a test helper with TF32 enabled, restoring prior precision settings."""
+
+    @functools.wraps(fn)
+    def wrapper(*args: _P.args, **kwargs: _P.kwargs) -> _R:
+        orig_matmul_fp32_precision: str | None = None
+        orig_cudnn_fp32_precision: str | None = None
+        orig_float32_matmul_precision: str | None = None
+        try:
+            cudnn_conv = torch.backends.cudnn.conv  # pyrefly: ignore[missing-attribute]
+            orig_matmul_fp32_precision = cast(
+                "str", torch.backends.cuda.matmul.fp32_precision
+            )
+            orig_cudnn_fp32_precision = cast("str", cudnn_conv.fp32_precision)
+            torch.backends.cuda.matmul.fp32_precision = "tf32"
+            cudnn_conv.fp32_precision = "tf32"
+        except AttributeError:  # No cudnn available
+            orig_float32_matmul_precision = torch.get_float32_matmul_precision()
+            torch.set_float32_matmul_precision("high")  # older deprecated API
+
+        try:
+            return fn(*args, **kwargs)
+        finally:
+            if (
+                orig_matmul_fp32_precision is not None
+                and orig_cudnn_fp32_precision is not None
+            ):
+                cudnn_conv = torch.backends.cudnn.conv  # pyrefly: ignore[missing-attribute]
+                torch.backends.cuda.matmul.fp32_precision = orig_matmul_fp32_precision
+                cudnn_conv.fp32_precision = orig_cudnn_fp32_precision
+            elif orig_float32_matmul_precision is not None:
+                torch.set_float32_matmul_precision(orig_float32_matmul_precision)
+
+    return wrapper
+
+
+@_with_tf32_precision
 def run_example(
     kernel_fn: Callable[..., torch.Tensor] | Kernel | dict[str, Kernel],
     baseline_fn: Callable[..., torch.Tensor] | dict[str, Callable[..., torch.Tensor]],
@@ -1091,11 +1153,6 @@ def run_example(
     if dist.is_initialized() and process_group_name is None:
         assert dist.group.WORLD is not None
         process_group_name = dist.group.WORLD.group_name
-    try:
-        torch.backends.cuda.matmul.fp32_precision = "tf32"
-        torch.backends.cudnn.conv.fp32_precision = "tf32"  # type: ignore[reportAttributeAccessIssue]
-    except AttributeError:  # No cudnn available
-        torch.set_float32_matmul_precision("high")  # older deprecated API
 
     # Normalize to dict format
     kernels = kernel_fn if isinstance(kernel_fn, dict) else {kernel_name: kernel_fn}
@@ -1209,8 +1266,10 @@ def run_example(
     # Benchmark all functions — clone args to avoid buffer donation issues
     cloned_args = _clone_args(args, process_group_name=process_group_name)
     all_benchmarks = {**kernels, **baselines}
-    bench_fns = [functools.partial(fn, *cloned_args) for fn in all_benchmarks.values()]
-    repeat = compute_repeat(bench_fns[0])
+    benchmark_functions = [
+        functools.partial(fn, *cloned_args) for fn in all_benchmarks.values()
+    ]
+    repeat = compute_repeat(benchmark_functions[0], default_cudagraph=True)
 
     # For distributed workload, different rank may have slightly different
     # benchmarking result causing diverging `repeat` value.
@@ -1226,14 +1285,23 @@ def run_example(
 
     with profile_context:
         if interleaved:
-            # pyrefly: ignore[bad-argument-type]
-            timings = interleaved_bench(bench_fns, repeat=repeat, desc="Benchmarking")
+            timings = interleaved_bench(
+                # pyrefly: ignore[bad-argument-type]
+                benchmark_functions,
+                repeat=repeat,
+                desc="Benchmarking",
+                default_cudagraph=True,
+            )
         else:
             timings = typing.cast(
                 "list[float]",
                 [
-                    do_bench(bench_fn, process_group_name=process_group_name)
-                    for bench_fn in bench_fns
+                    do_bench(
+                        benchmark_function,
+                        process_group_name=process_group_name,
+                        default_cudagraph=True,
+                    )
+                    for benchmark_function in benchmark_functions
                 ],
             )
 

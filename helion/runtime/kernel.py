@@ -38,6 +38,7 @@ from torch.utils._pytree import tree_map_only
 from torch.utils.weak import WeakIdKeyDictionary
 
 from .. import exc
+from .._compat import target_device_capability
 from .._compile_time import measure
 from .._compiler.ast_extension import unparse
 from .._compiler.autotuner_heuristics import compiler_seed_configs
@@ -137,6 +138,23 @@ def _resolve_index_dtype(
         raise exc.InputTensorNumelExceedsIndexType(index_dtype=index_dtype)
     # pyrefly: ignore [unbound-name]
     return index_dtype
+
+
+def _device_specialization_key(
+    args: Sequence[object],
+) -> tuple[str | None, tuple[int, int] | None]:
+    """Return the recursive argument device key used by bound-kernel caching.
+
+    `_find_device` intentionally searches tensors and bare `torch.device`
+    objects inside supported containers to match binding device selection.
+    Capability splits mixed-sm cache entries. Device index remains excluded so
+    same-capability devices share bound kernels, matching prior behavior.
+    """
+    try:
+        device = _find_device(tuple(args))
+    except exc.NoTensorArgs:
+        return None, None
+    return device.type, target_device_capability(device)
 
 
 class Kernel(Generic[_R]):
@@ -278,7 +296,6 @@ class Kernel(Generic[_R]):
         _specialize_extra lookups.
         """
         result: list[Hashable] = []
-        device_type: str | None = None
         assert len(args) <= len(self._annotations)
         for value, annotation in zip(args, self._annotations, strict=False):
             if isinstance(value, ConstExpr):
@@ -286,15 +303,11 @@ class Kernel(Generic[_R]):
             elif annotation is ConstExpr:
                 result.append(value)
             else:
-                if device_type is None and isinstance(value, torch.Tensor):
-                    # NOTE: device.type doesn't distinguish device index,
-                    # so two different GPU types on the same machine will
-                    # incorrectly share a cache entry.
-                    device_type = value.device.type
                 result.append(self._specialization_key(value))
+        device_type, device_capability = _device_specialization_key(args)
         if self._key_fn is not None:
-            return (*result, device_type, self._key_fn(*args))
-        return (*result, device_type)
+            return (*result, device_type, device_capability, self._key_fn(*args))
+        return (*result, device_type, device_capability)
 
     def specialization_key(self, args: Sequence[object]) -> tuple[Hashable, ...]:
         """
@@ -495,6 +508,60 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
                 self.env.config_spec.compiler_seed_configs = compiler_seed_configs(
                     self.env, self.host_function.device_ir
                 )
+
+                # Post-compile FX-graph scan to detect kernels
+                # whose tcgen05 matmul is followed by an
+                # aux-fused store
+                # (``out[tile] = (acc + residual[tile]).to(...)``
+                # and variants — see
+                # ``host_function_has_tcgen05_aux_kernel_pattern``
+                # for the accepted shapes). When detected, the
+                # autotune surface widens to admit
+                # ``tcgen05_strategy=ROLE_LOCAL_WITH_SCHEDULER``
+                # + ``tcgen05_warp_spec_c_input_warps=1`` so the
+                # productive C-input warp lift is reachable from
+                # the normal autotune path. For pure-matmul
+                # kernels the detector returns False and the
+                # autotune surface keeps the narrow
+                # ``MONOLITHIC + c_input_warps=0`` shape so
+                # autotune cannot sample the strictly-worse
+                # inert C-input warp configuration.
+                # The exact-shape detector is narrower: it gates the
+                # ``tcgen05_aux_load_mode=tma`` seed/search axis.
+                from .._compiler.cute.aux_tensor import (
+                    host_function_has_tcgen05_aux_kernel_pattern,
+                )
+                from .._compiler.cute.aux_tensor import (
+                    host_function_has_tcgen05_exact_shape_aux_kernel_pattern,
+                )
+                from .._compiler.cute.aux_tensor import (
+                    host_function_has_tcgen05_identity_matmul_store_pattern,
+                )
+
+                self.env.config_spec.cute_tcgen05_aux_kernel_detected = (
+                    host_function_has_tcgen05_aux_kernel_pattern(self.host_function)
+                )
+                self.env.config_spec.cute_tcgen05_exact_shape_aux_kernel_detected = (
+                    host_function_has_tcgen05_exact_shape_aux_kernel_pattern(
+                        self.host_function
+                    )
+                )
+                self.env.config_spec.cute_tcgen05_identity_matmul_store_detected = (
+                    host_function_has_tcgen05_identity_matmul_store_pattern(
+                        self.host_function
+                    )
+                )
+                if self.env.config_spec.cute_tcgen05_identity_matmul_store_detected:
+                    self.env.config_spec.allow_tcgen05_target1_tvm_ffi_seed()
+                if not self.env.settings.disable_autotuner_heuristics:
+                    for seed_config in self.env.config_spec.autotune_seed_configs():
+                        if (
+                            seed_config
+                            not in self.env.config_spec.compiler_seed_configs
+                        ):
+                            self.env.config_spec.compiler_seed_configs.append(
+                                seed_config
+                            )
 
     def _apply_mark_static(self, args: tuple[object, ...]) -> None:
         """

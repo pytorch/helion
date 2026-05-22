@@ -35,16 +35,23 @@ class Tcgen05Strategy(str, enum.Enum):
       6 specialized warps (1 TMA-load + 1 MMA-exec + 4 epilogue).
       Each role-local ``while`` loop carries its own
       ``StaticPersistentTileScheduler``.
-    - ``ROLE_LOCAL_WITH_SCHEDULER``. 7 specialized warps: adds a
-      dedicated scheduler warp that publishes ``(virtual_pid,
-      tile_coord_mnkl, is_valid)`` into a per-CTA SMEM mailbox via
-      a ``PipelineAsync``. The C-input epilogue-load warp Quack
-      uses (Quack's 8th warp) is not present in cycle 33 because
-      Helion does not yet have a productive C-input warp (cycle
-      34 widens ``Tcgen05WarpSpec.c_input_warps`` to 1 to occupy
-      the slot); ``CuteTcgen05MatmulPlan.launched_warp_count``
-      rounds to 8 launched warps (one inert padding warp) so
-      warpgroup ``setmaxregister`` semantics are uniform.
+    - ``ROLE_LOCAL_WITH_SCHEDULER``. 7 specialized warps by default
+      (4 epi + 1 exec + 1 ab_load + 1 sched), or 8 specialized warps
+      when ``Tcgen05WarpSpec.c_input_warps=1`` lifts the optional
+      C-input slot. Adds a dedicated scheduler warp that publishes
+      ``(virtual_pid, tile_coord_mnkl, is_valid)`` into a per-CTA
+      SMEM mailbox via a ``PipelineAsync``. The C-input
+      epilogue-load warp Quack uses (Quack's 8th warp) became
+      reachable in cycle 34 (G3.1 first slice, ``cute_plan.md``
+      §7.5.3.2) — the validator now admits
+      ``Tcgen05WarpSpec.c_input_warps=1`` so an explicit
+      ``helion.Config(tcgen05_warp_spec_c_input_warps=1)``
+      round-trips end-to-end; the codegen body stays inert in
+      cycle 34 (the slot occupies what was previously the inert
+      padding warp, so ``launched_warp_count`` is 8 either way and
+      warpgroup ``setmaxregister`` semantics are uniform). The
+      productive TMA-prefetch body that turns the slot into a
+      C-input producer lands in a follow-up cycle.
       Validated at ``cluster_m`` ∈ {1, 2} and ``cluster_n``
       ∈ {1, 2}: each CTA in the cluster runs its own scheduler
       that publishes locally and each CTA's consumers release
@@ -56,10 +63,16 @@ class Tcgen05Strategy(str, enum.Enum):
       sched_pipeline ``cluster_size`` argument to the full
       ``cluster_m * cluster_n`` envelope so the deferred-init
       protocol participates in the cluster-wide barrier-init.
+    - ``PURE_MATMUL_ROLE_LIFECYCLE``. Experimental non-persistent,
+      static-full pure-matmul path. It emits separate TMA-producer,
+      MMA-exec, and epilogue/TMEM-free ownership while deleting the original
+      K-loop body only through exact tcgen05 statement ownership. It is
+      explicit-config only and not sampled by autotune.
     """
 
     ROLE_LOCAL_MONOLITHIC = "role_local_monolithic"
     ROLE_LOCAL_WITH_SCHEDULER = "role_local_with_scheduler"
+    PURE_MATMUL_ROLE_LIFECYCLE = "pure_matmul_role_lifecycle"
 
 
 class Tcgen05PersistenceModel(str, enum.Enum):
@@ -98,12 +111,10 @@ class Tcgen05LayoutStrategy(str, enum.Enum):
     - ``DEFAULT``: rely on CuTe helpers (``compute_epilogue_tile_shape``,
       A/B major-mode swizzle inference). The autotuner cannot override
       these.
-    - ``EXPLICIT_EPI_TILE``: user/autotune controls ``epi_tile_*`` and
-      ``smem_swizzle_*`` via ``Tcgen05LayoutOverrides``. Fields whose
-      override is ``None`` fall back to the CuTe-derived value.
-
-    G2-A only declares the enum; ``EXPLICIT_EPI_TILE`` is wired in
-    G2-E once warp-spec strategies have moved perf.
+    - ``EXPLICIT_EPI_TILE``: a fail-closed tcgen05 path where
+      ``epi_tile_*`` and ``d_store_box_n`` are explicit validated
+      fields, while ``smem_swizzle_*`` remains independently
+      overridable.
     """
 
     DEFAULT = "default"
@@ -124,12 +135,16 @@ ROLE_LOCAL_MONOLITHIC_EPI_WARPS = 4
 ROLE_LOCAL_MONOLITHIC_EPI_LOAD_WARPS = 0
 ROLE_LOCAL_MONOLITHIC_SCHEDULER_WARPS = 0
 # ``c_input_warps`` slot for the dedicated C-input / auxiliary-tensor warp
-# that drives a TMA-loaded SMEM-ring producer pipeline (G3.1-C step-2 in
-# ``cute_plan.md`` §7.5.3.2). Default 0 keeps the historical inert-padding
-# behavior under ``ROLE_LOCAL_WITH_SCHEDULER``; the validator allows the
-# value 1 only under ``ROLE_LOCAL_WITH_SCHEDULER`` once the TMA producer +
-# SMEM ring + role-local while loop land. The autotune surface stays
-# narrowed to 0 until perf is characterized.
+# that will eventually drive a TMA-loaded SMEM-ring producer pipeline
+# (G3.1-C step-2 in ``cute_plan.md`` §7.5.3.2). Default 0 keeps the
+# historical inert-padding behavior under ``ROLE_LOCAL_WITH_SCHEDULER``.
+# Cycle 34 (G3.1 first slice) widens the validator to accept the value 1
+# under ``ROLE_LOCAL_WITH_SCHEDULER`` so the foundation lift is reachable;
+# the codegen body remains inert (the warp occupies the slot that was
+# previously the inert padding under the 7-role-warp / 8-launched shape,
+# so launched-warp accounting is unchanged). The autotune surface stays
+# narrowed to 0 until the productive TMA producer body lands and perf
+# is characterized.
 ROLE_LOCAL_MONOLITHIC_C_INPUT_WARPS = 0
 # Today's role-local lowering uses a (decrease, increase) register split of
 # (120, 256). The decrease side runs on TMA-load + scheduler warps; the
@@ -161,18 +176,25 @@ class Tcgen05WarpSpec:
     - ``scheduler_warps``: 0 in ``ROLE_LOCAL_MONOLITHIC`` (each role
       runs its own scheduler), 1 in ``ROLE_LOCAL_WITH_SCHEDULER``
       (dedicated scheduler warp drives a broadcasting pipeline).
-    - ``c_input_warps``: dedicated C-input warp count. Currently
-      narrowed to ``{0}`` for both strategies (the data-model slot
-      is plumbed through normalize / round-trip but the validator
-      rejects nonzero); cycle 34 widens
-      ``ROLE_LOCAL_WITH_SCHEDULER`` to ``{0, 1}`` once the dedicated
-      TMA producer + SMEM ring + role-local while loop land
-      (``cute_plan.md`` §7.5.3.2). Setting this to 1 is intended
-      to convert the 8-warp shape's currently-inert padding warp
-      under ``ROLE_LOCAL_WITH_SCHEDULER`` into a productive
-      C-input TMA producer; ``ROLE_LOCAL_MONOLITHIC`` has no such
-      warp slot to occupy. The autotune surface stays narrowed to
-      0 until cycle 34 perf-validates the productive C-input warp.
+    - ``c_input_warps``: dedicated C-input warp count. Cycle 34
+      (G3.1 first slice, ``cute_plan.md`` §7.5.3.2) widens the
+      validator's per-strategy accept set so
+      ``ROLE_LOCAL_WITH_SCHEDULER`` admits ``{0, 1}`` — an explicit
+      ``helion.Config(tcgen05_warp_spec_c_input_warps=1)`` now
+      round-trips end-to-end and the launched-CTA warp accounting
+      recognizes the slot. ``ROLE_LOCAL_MONOLITHIC`` stays at
+      ``{0}`` (no such warp slot in the 6-warp shape).
+      Setting this to 1 under ``WITH_SCHEDULER`` reuses what was
+      previously the inert padding warp: with the 4 epi + 1 exec
+      + 1 ab_load + 1 sched + 1 c_input layout, ``role_warp_count``
+      equals 8 and ``launched_warp_count`` (warpgroup-aligned)
+      stays at 8 — no extra warp is launched. The codegen body of
+      the C-input warp remains inert in cycle 34 (a no-op slot);
+      the productive TMA-prefetch body is deferred. The autotune
+      surface stays narrowed to ``0`` in
+      ``_tcgen05_strategy_autotune_fragments`` until the productive
+      body lands and perf is characterized; only the user-config
+      validation surface accepts ``{0, 1}``.
     - ``register_split``: ``(decrease, increase)`` ``setmaxregister``
       counts. The current 6-warp shape uses ``(120, 256)``. Each
       entry's range is enforced by its per-field fragment in
@@ -228,12 +250,10 @@ class Tcgen05LayoutOverrides:
     Each field's ``None`` default means "use the value the analysis
     pass computed" (CuTe helper output, atom contract, etc.).
 
-    G2-A introduces the slot. Today only ``Tcgen05LayoutStrategy.DEFAULT``
-    is wired through codegen; ``EXPLICIT_EPI_TILE`` (G2-E) is the
-    first consumer of the override fields. Validation today checks
-    only the structural shape (types + ranges) — atom-contract checks
-    against the active problem shape happen in lowering once the
-    strategy is consumed there.
+    ``EXPLICIT_EPI_TILE`` consumes the epilogue-tile fields in
+    tcgen05 codegen. Validation here checks structural shape and
+    ranges; atom-contract checks against the active problem shape
+    happen in lowering.
 
     ``smem_swizzle_a`` / ``smem_swizzle_b`` (user-config exposure only):
         Selects the A/B operand SMEM atom kind
@@ -415,12 +435,21 @@ def tcgen05_smem_layout_expr(
 # implemented set in ``ConfigSpec._tcgen05_strategy_scalar_fragments``.
 TCGEN05_STRATEGY_CONFIG_KEY = "tcgen05_strategy"
 
+
+def is_pure_matmul_role_lifecycle_config(config: Mapping[str, object]) -> bool:
+    return (
+        config.get(TCGEN05_STRATEGY_CONFIG_KEY)
+        == Tcgen05Strategy.PURE_MATMUL_ROLE_LIFECYCLE.value
+    )
+
+
 # Persistence model. The default is *derived from* ``pid_type`` so
 # serialized configs cannot encode contradictions like
 # ``pid_type=flat`` paired with ``static_persistent``.
 TCGEN05_PERSISTENCE_MODEL_CONFIG_KEY = "tcgen05_persistence_model"
 
-# Layout strategy. Today only ``DEFAULT`` is wired through codegen.
+# Layout strategy. ``EXPLICIT_EPI_TILE`` is a guarded tcgen05 codegen
+# path for explicit D-store epilogue tile experiments.
 TCGEN05_LAYOUT_STRATEGY_CONFIG_KEY = "tcgen05_layout_strategy"
 
 # ``Tcgen05WarpSpec`` field config keys. Each field is its own knob
@@ -612,6 +641,35 @@ def layout_overrides_from_config(
     )
 
 
+def tcgen05_explicit_epilogue_tile_expr(tile_m: int, tile_n: int) -> str:
+    """Return the CuTe expression for a validated explicit epilogue tile."""
+
+    return f"(cute.make_layout({tile_m}), cute.make_layout({tile_n}))"
+
+
+def tcgen05_default_epilogue_tile_expr(
+    bm: int, bn: int, elem_dtype: str, *, c_layout: str
+) -> str:
+    """Return the CuTe helper call for the default tcgen05 epilogue tile."""
+
+    return (
+        "cutlass.utils.blackwell_helpers.compute_epilogue_tile_shape("
+        f"({bm}, {bn}), False, {c_layout}, {elem_dtype}, "
+        f"layout_c={c_layout}, elem_ty_c={elem_dtype})"
+    )
+
+
+def tcgen05_explicit_d_store_tile_expr(tile_m: int, d_store_box_n: int) -> str:
+    """Return the CuTe expression for a validated explicit D-store box.
+
+    The current validated path requires ``d_store_box_n == epi_tile_n``.
+    Keep a store-named helper so wrapper/device store code keeps using the
+    D-store contract field rather than the matmul-plan epilogue field.
+    """
+
+    return tcgen05_explicit_epilogue_tile_expr(tile_m, d_store_box_n)
+
+
 # Set of ``pid_type`` values this helper knows how to map. Kept in
 # sync with ``VALID_PID_TYPES`` in ``config_spec.py``; widening that
 # tuple without revisiting this helper is a contract drift the assert
@@ -702,6 +760,9 @@ _STRATEGY_SUPPORTED_PERSISTENCE: dict[
             Tcgen05PersistenceModel.CLC_PERSISTENT,
         }
     ),
+    Tcgen05Strategy.PURE_MATMUL_ROLE_LIFECYCLE: frozenset(
+        {Tcgen05PersistenceModel.NON_PERSISTENT}
+    ),
 }
 
 # Minimum CUDA compute capability (major version) for each persistence
@@ -719,33 +780,47 @@ _PERSISTENCE_MIN_ARCH_MAJOR: dict[Tcgen05PersistenceModel, int] = {
 _STRATEGY_REQUIRED_SCHEDULER_WARPS: dict[Tcgen05Strategy, int] = {
     Tcgen05Strategy.ROLE_LOCAL_MONOLITHIC: 0,
     Tcgen05Strategy.ROLE_LOCAL_WITH_SCHEDULER: 1,
+    Tcgen05Strategy.PURE_MATMUL_ROLE_LIFECYCLE: 0,
 }
 
 # Strategy-conditional ``c_input_warps`` accept set. Per ``cute_plan.md``
 # §7.5.3.2, only ``ROLE_LOCAL_WITH_SCHEDULER`` can host a productive
 # C-input warp (the inert padding warp under the WITH_SCHEDULER 8-warp
-# shape becomes the C-input TMA producer). ``ROLE_LOCAL_MONOLITHIC``
-# has no such warp slot — its 6-warp shape is fully populated by the
-# TMA-load + MMA-exec + 4 epi warps. Values outside the per-strategy
-# accept set are rejected so user configs cannot reach an unsupported
-# combination silently. cycle 33: validator accepts ``{0}`` for both
-# strategies; cycle 34 widens ``ROLE_LOCAL_WITH_SCHEDULER`` to ``{0, 1}``
-# once the dedicated TMA producer + SMEM ring + role-local while
-# loop land. This staging keeps the data-model slot stable for
-# config serialization round-trips while keeping user configs from
-# reaching a not-yet-implemented codegen path.
+# shape becomes the C-input TMA producer). Non-scheduler strategies keep
+# this at zero because their current 6-warp shapes are fully populated by
+# TMA-load + MMA-exec + 4 epi warps. Values outside the per-strategy accept
+# set are rejected so user configs cannot reach an unsupported combination
+# silently.
+#
+# Cycle 33: validator accepted ``{0}`` for all then-existing strategies
+# (data-model slot only). Cycle 34 (G3.1 first slice, ``cute_plan.md`` §7.5.3.2):
+# widens ``ROLE_LOCAL_WITH_SCHEDULER`` to ``{0, 1}`` so explicit
+# ``helion.Config(tcgen05_warp_spec_c_input_warps=1)`` round-trips
+# end-to-end and the launched-warp accounting recognizes the slot.
+# The codegen body of the C-input warp remains inert in cycle 34 —
+# the warp occupies what was previously the inert padding slot
+# (``launched_warp_count`` stays at 8 under WITH_SCHEDULER because
+# ``role_warp_count`` now equals 8 = 4 epi + 1 exec + 1 ab_load +
+# 1 sched + 1 c_input, exactly matching the warpgroup-aligned launch
+# envelope). Producer-side TMA prefetch body is deferred to a
+# follow-up cycle. The autotune surface stays narrowed to ``(0,)``
+# in ``_tcgen05_strategy_autotune_fragments`` until the productive
+# body lands and perf is characterized; only the user-config
+# validation surface accepts ``(0, 1)``.
 _STRATEGY_SUPPORTED_C_INPUT_WARPS: dict[Tcgen05Strategy, frozenset[int]] = {
     Tcgen05Strategy.ROLE_LOCAL_MONOLITHIC: frozenset({0}),
-    Tcgen05Strategy.ROLE_LOCAL_WITH_SCHEDULER: frozenset({0}),
+    Tcgen05Strategy.ROLE_LOCAL_WITH_SCHEDULER: frozenset({0, 1}),
+    Tcgen05Strategy.PURE_MATMUL_ROLE_LIFECYCLE: frozenset({0}),
 }
 
 # When the strategy demands warpgroup-aligned splits (every 4 warps
 # == one warpgroup, ``setmaxregister`` is warpgroup-uniform), the
-# total warp count must be a multiple of 4. ``ROLE_LOCAL_MONOLITHIC``
-# (1+1+4 = 6 role warps) and ``ROLE_LOCAL_WITH_SCHEDULER`` (1+1+4+1 =
-# 7 role warps) both rely on the launched-warp padding in
+# total warp count must be a multiple of 4. ``ROLE_LOCAL_MONOLITHIC`` and
+# ``PURE_MATMUL_ROLE_LIFECYCLE`` (1+1+4 = 6 role warps) and
+# ``ROLE_LOCAL_WITH_SCHEDULER`` (1+1+4+1 = 7 role warps) rely on
+# launched-warp padding in
 # ``CuteTcgen05MatmulPlan.launched_warp_count`` to round to a
-# multiple of 4 at the launch boundary, so neither strategy needs
+# multiple of 4 at the launch boundary, so no current strategy needs
 # this validator-level check today. The set is intentionally empty
 # but the branch below stays live: a future strategy whose role
 # count *itself* must be a multiple of 4 (e.g. when ``register_split``
@@ -769,6 +844,7 @@ _STRATEGY_REQUIRES_WARPGROUP_ALIGNED_TOTAL: frozenset[Tcgen05Strategy] = frozens
 _STRATEGY_SUPPORTED_CLUSTER_M: dict[Tcgen05Strategy, frozenset[int]] = {
     Tcgen05Strategy.ROLE_LOCAL_MONOLITHIC: frozenset({1, 2}),
     Tcgen05Strategy.ROLE_LOCAL_WITH_SCHEDULER: frozenset({1, 2}),
+    Tcgen05Strategy.PURE_MATMUL_ROLE_LIFECYCLE: frozenset({1}),
 }
 
 # Strategy-conditional cluster_n capability. cluster_n=2 is now validated
@@ -786,6 +862,7 @@ _STRATEGY_SUPPORTED_CLUSTER_M: dict[Tcgen05Strategy, frozenset[int]] = {
 _STRATEGY_SUPPORTED_CLUSTER_N: dict[Tcgen05Strategy, frozenset[int]] = {
     Tcgen05Strategy.ROLE_LOCAL_MONOLITHIC: frozenset({1, 2}),
     Tcgen05Strategy.ROLE_LOCAL_WITH_SCHEDULER: frozenset({1, 2}),
+    Tcgen05Strategy.PURE_MATMUL_ROLE_LIFECYCLE: frozenset({1}),
 }
 
 # (strategy, persistence_model)-conditional cluster_n accept set. Used to
@@ -923,11 +1000,11 @@ def validate_tcgen05_strategy_invariants(
             f"{warp_spec.scheduler_warps}"
         )
 
-    # ``c_input_warps`` accept set is per-strategy; today narrows
-    # both strategies to ``{0}`` until the dedicated TMA producer +
-    # SMEM ring + role-local while loop lands. The data-model slot
-    # is plumbed through normalize / round-trip paths so the
-    # accept set can widen without further config-shape churn.
+    # ``c_input_warps`` accept set is per-strategy; only the
+    # scheduler-backed path currently admits the optional C-input
+    # TMA producer. The data-model slot is plumbed through normalize
+    # / round-trip paths so the accept set can widen without further
+    # config-shape churn.
     supported_c_input = _STRATEGY_SUPPORTED_C_INPUT_WARPS.get(strategy, frozenset())
     if supported_c_input and warp_spec.c_input_warps not in supported_c_input:
         errors.append(
@@ -1055,5 +1132,19 @@ def validate_tcgen05_strategy_invariants(
                     f"one of {TCGEN05_LEGAL_SMEM_SWIZZLE_BYTES!r} "
                     "(swizzle bytes; 0 = no swizzle / INTER)"
                 )
+        if (
+            layout_overrides.epi_tile_m is None
+            or layout_overrides.epi_tile_n is None
+            or layout_overrides.d_store_box_n is None
+        ):
+            errors.append(
+                "tcgen05_layout_strategy='explicit_epi_tile' requires "
+                "layout_overrides.epi_tile_m, layout_overrides.epi_tile_n, "
+                "and layout_overrides.d_store_box_n"
+            )
+        elif layout_overrides.d_store_box_n != layout_overrides.epi_tile_n:
+            errors.append(
+                "layout_overrides.d_store_box_n must match layout_overrides.epi_tile_n"
+            )
 
     return errors
