@@ -275,6 +275,39 @@ TCGEN05_SCHED_STAGE_COUNTS = (1, 2)
 TCGEN05_CUBIN_LINEINFO_CONFIG_KEY = "tcgen05_cubin_lineinfo"
 TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY = "tcgen05_tvm_ffi_launch"
 
+# Per-config knob for the C-input warp's auxiliary-tensor SMEM-ring pipeline
+# stage count. Exposed as an autotune knob for ablation. Cycle-10 ablation
+# (``cute_plan.md`` §6 Target 8) measured the 3-stage variant ~2% slower
+# than the 2-stage default on T8, so the default 2 stays the autotuner's
+# measured optimum; the knob remains in the search surface so future
+# targets can re-explore. ``{2, 3}`` fit structurally on B200 — see
+# ``cute_plan.md`` for the SMEM-budget audit. The autotune gate
+# (``aux_stages_autotune_fragments`` in ``tcgen05_config.py``) admits
+# the knob only for the ``_aux_tma_search_enabled`` family so other
+# paths stay byte-identical at the default.
+TCGEN05_AUX_STAGES_CONFIG_KEY = "tcgen05_aux_stages"
+TCGEN05_AUX_STAGE_COUNT_DEFAULT = 2
+TCGEN05_AUX_STAGE_COUNT_CHOICES = (2, 3)
+
+# Cycle 15 hypothesis 2 (``cute_plan.md`` §6 Target 8): per-config
+# knob for the consumer-warp ``setmaxregister_increase`` ceiling. The
+# default (256) preserves cycle-14 baseline emission; lower values
+# cap the per-thread register budget that the consumer warps request,
+# which forces ``ptxas`` to spill rather than reserve at the full
+# 255-reg peak. The cycle-13 Deep Replan ranking flagged this as the
+# most direct lever after H1 (rmem-allocation fold) was falsified in
+# cycle 14 (NCU reg count stayed at 255). Surface: the call site is
+# ``cute_mma.py`` ``_emit_mma_pipeline`` consumer branch; the
+# autotune gate (``consumer_regs_autotune_fragments`` in
+# ``tcgen05_config.py``) admits the knob only for the
+# ``_aux_tma_search_enabled`` family (mirroring the aux_stages gate)
+# so other paths stay byte-identical at the 256 default. The
+# choices include 256 so the default-with-knob configuration matches
+# the default-without-knob emission byte-for-byte.
+TCGEN05_CONSUMER_REGS_CONFIG_KEY = "tcgen05_consumer_regs"
+TCGEN05_CONSUMER_REGS_DEFAULT = 256
+TCGEN05_CONSUMER_REGS_CHOICES = (224, 232, 240, 256)
+
 # Validated G2.2 Target1 diagnostic envelope for promoting the TVM-FFI launch
 # path into normal autotune without enabling it broadly.
 TCGEN05_TARGET1_TVM_FFI_SHAPE = (1024, 4096, 1024)

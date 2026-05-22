@@ -79,7 +79,13 @@ from .tcgen05_constants import TCGEN05_ACC_PRODUCER_MODE_NORMAL
 from .tcgen05_constants import TCGEN05_ACC_PRODUCER_MODE_SKIP_UMMA
 from .tcgen05_constants import TCGEN05_AUX_LOAD_MODE_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_AUX_LOAD_MODE_TMA
+from .tcgen05_constants import TCGEN05_AUX_STAGE_COUNT_CHOICES
+from .tcgen05_constants import TCGEN05_AUX_STAGE_COUNT_DEFAULT
+from .tcgen05_constants import TCGEN05_AUX_STAGES_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_CLUSTER_M2_ONE_CTA_ROLE_LOCAL_CONFIG_KEY
+from .tcgen05_constants import TCGEN05_CONSUMER_REGS_CHOICES
+from .tcgen05_constants import TCGEN05_CONSUMER_REGS_CONFIG_KEY
+from .tcgen05_constants import TCGEN05_CONSUMER_REGS_DEFAULT
 from .tcgen05_constants import TCGEN05_DIRECT_ENTRY_PLAN_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_LARGE_BN_PROOF_BLOCK_SIZES
@@ -140,9 +146,12 @@ _TRACE_THROUGH_TARGETS = {
 # barrier ops, so they can give back registers; consumer warps (MMA
 # exec, epilogue) need the extra budget for register-resident
 # accumulators and TMEM↔RMEM staging. Values match Quack's sm100
-# reference (`gemm_sm100.py`).
+# reference (`gemm_sm100.py`). The consumer-side ceiling is autotune-
+# searchable via ``TCGEN05_CONSUMER_REGS_CONFIG_KEY`` (cycle 15 H2);
+# the default 256 lives in ``tcgen05_constants.py`` so the codegen
+# call site reads the per-config value and emission stays byte-
+# identical at the default.
 _TCGEN05_PRODUCER_REGS = 120
-_TCGEN05_CONSUMER_REGS = 256
 # 128x32 bf16 gives the validated 64 Ki-bit D-store TMA box and x32 TMEM
 # drain for the current Target1 CtaGroup.TWO diagnostic path.
 _TCGEN05_EXPLICIT_EPI_TILE_VALIDATED_SHAPE = (
@@ -3820,6 +3829,16 @@ def _emit_mma_pipeline(
                 consumer_predicate = epi_active
             else:
                 consumer_predicate = f"{tcgen05_plan.exec_active} or {epi_active}"
+            # Cycle 15 H2 (cute_plan.md §6 Target 8): the consumer-warp
+            # register ceiling is config-driven. Default 256 preserves
+            # cycle-14 byte-identity; lower values cap ``ptxas``'s
+            # per-thread register allocation and force a spill rather
+            # than reserving at the natural 255-reg peak. The autotune
+            # gate ``consumer_regs_autotune_fragments`` admits the knob
+            # only for the T8 wide-N CLC + aux-TMA seed family (same
+            # gate as ``aux_stages``), so T1-T7 stay byte-identical at
+            # the 256 default.
+            consumer_regs_value = _tcgen05_consumer_regs_from_config(df.config)
             prefix.append(
                 statement_from_string(
                     f"if not ({consumer_predicate}):\n"
@@ -3831,7 +3850,7 @@ def _emit_mma_pipeline(
                 statement_from_string(
                     f"if {consumer_predicate}:\n"
                     f"    cute.arch.setmaxregister_increase("
-                    f"{_TCGEN05_CONSUMER_REGS})"
+                    f"{consumer_regs_value})"
                 )
             )
             prefix.append(
@@ -4249,11 +4268,15 @@ def _emit_mma_pipeline(
                         "tensor dtype to match the epilogue/output dtype",
                     )
                 tcgen05_aux_use_tma_load = tcgen05_aux_tma_requested
+                tcgen05_aux_stage_count = _tcgen05_aux_pipeline_stage_count_from_config(
+                    df.config
+                )
                 tcgen05_aux_plan = _new_tcgen05_aux_pipeline_plan(
                     df,
                     num_rings=len(c_input_aux_tensor_descriptors),
                     epi_tile_var=tcgen05_plan.epi_tile,
                     use_tma_load=tcgen05_aux_use_tma_load,
+                    stage_count=tcgen05_aux_stage_count,
                 )
                 if tcgen05_aux_use_tma_load:
                     for desc, ring, aux_dtype_str in zip(
@@ -4275,7 +4298,7 @@ def _emit_mma_pipeline(
                                 "c_name": aux_tensor_name,
                                 "bm": bm,
                                 "bn": bn,
-                                "stage_count": _TCGEN05_AUX_PIPELINE_STAGE_COUNT,
+                                "stage_count": tcgen05_aux_stage_count,
                                 "input_dtype": aux_dtype_str,
                                 "kernel_args": [tma_atom, tma_tensor],
                             }
@@ -6241,11 +6264,46 @@ def _emit_sched_pipeline_setup(
     ]
 
 
-#: Fixed stage count for the aux SMEM-ring pipeline (cycle 2 of the
-#: producer-body split, ``cute_plan.md`` §7.5.3.2). Matches the
-#: existing D-store ``c_pipeline`` 2-stage default. Future cycles
-#: may make this autotunable once the producer body lands.
-_TCGEN05_AUX_PIPELINE_STAGE_COUNT = 2
+def _tcgen05_aux_pipeline_stage_count_from_config(config: object) -> int:
+    """Return the aux-pipeline stage count for ``config``, defaulting to
+    ``TCGEN05_AUX_STAGE_COUNT_DEFAULT`` when the knob is absent.
+
+    Bad values raise via the downstream
+    ``_new_tcgen05_aux_pipeline_plan`` assert; the validator gate
+    (``_validate_int_enum_config`` in ``tcgen05_config.py``) is the
+    single source of truth that rejects out-of-range values before
+    they reach codegen, so any value seen here that fails the
+    downstream assert is a programmer bug, not user input.
+    """
+    return _tcgen05_config_int(
+        config, TCGEN05_AUX_STAGES_CONFIG_KEY, TCGEN05_AUX_STAGE_COUNT_DEFAULT
+    )
+
+
+def _tcgen05_consumer_regs_from_config(config: object) -> int:
+    """Return the consumer-warp ``setmaxregister_increase`` ceiling for
+    ``config``, defaulting to ``TCGEN05_CONSUMER_REGS_DEFAULT`` (256)
+    when the knob is absent.
+
+    Cycle 15 H2 (``cute_plan.md`` §6 Target 8). The default preserves
+    cycle-14 byte-identical emission; lower values force ``ptxas`` to
+    cap the consumer-warp per-thread register count. The validator
+    (``_validate_int_enum_config`` in ``tcgen05_config.py``) is the
+    single source of truth that rejects out-of-range values before
+    they reach codegen; values seen here that are outside
+    ``TCGEN05_CONSUMER_REGS_CHOICES`` are programmer bugs, not user
+    input, so this helper falls back to the default rather than
+    asserting (matching the ``_tcgen05_aux_pipeline_stage_count_from_config``
+    pattern). The default is included in ``CHOICES`` so the
+    default-with-knob configuration emits the same code as the
+    default-without-knob configuration.
+    """
+    value = _tcgen05_config_int(
+        config, TCGEN05_CONSUMER_REGS_CONFIG_KEY, TCGEN05_CONSUMER_REGS_DEFAULT
+    )
+    if value not in TCGEN05_CONSUMER_REGS_CHOICES:
+        return TCGEN05_CONSUMER_REGS_DEFAULT
+    return value
 
 
 def _new_tcgen05_aux_pipeline_plan(
@@ -6254,6 +6312,7 @@ def _new_tcgen05_aux_pipeline_plan(
     num_rings: int,
     epi_tile_var: str,
     use_tma_load: bool,
+    stage_count: int = TCGEN05_AUX_STAGE_COUNT_DEFAULT,
 ) -> _Tcgen05AuxPipelinePlan:
     """Allocate variable names for the C-input warp's aux-tensor
     SMEM-ring pipeline (``cute_plan.md`` §7.5.3.2).
@@ -6270,11 +6329,20 @@ def _new_tcgen05_aux_pipeline_plan(
     shape is read directly from the matmul plan by the
     producer-body codegen, so no block-shape fields are plumbed
     through the aux pipeline plan.
+
+    ``stage_count`` controls the depth of the SMEM ring. Cycle 10
+    makes this config-driven so the T8 wide-N CLC + aux-TMA seed
+    family can sample ``{2, 3}`` while every other path keeps the
+    pre-cycle-10 default of 2 (preserving T1-T7 byte-identity).
     """
     assert num_rings >= 1, (
         "aux pipeline plan requires at least one descriptor; the gate "
         "in ``_codegen_cute_mma`` should not call this with an empty "
         "descriptor tuple"
+    )
+    assert stage_count in TCGEN05_AUX_STAGE_COUNT_CHOICES, (
+        f"aux pipeline stage_count={stage_count!r} not in "
+        f"TCGEN05_AUX_STAGE_COUNT_CHOICES={TCGEN05_AUX_STAGE_COUNT_CHOICES!r}"
     )
     rings = tuple(
         _Tcgen05AuxPerDescriptorRingNames(
@@ -6299,7 +6367,7 @@ def _new_tcgen05_aux_pipeline_plan(
         consumer_state=df.new_var("tcgen05_aux_pipeline_consumer_state"),
         rings=rings,
         use_tma_load=use_tma_load,
-        stage_count=_TCGEN05_AUX_PIPELINE_STAGE_COUNT,
+        stage_count=stage_count,
         epi_tile_var=epi_tile_var,
     )
 
@@ -6319,13 +6387,13 @@ def _emit_tcgen05_aux_pipeline_setup(
 
     Per descriptor, allocates a SMEM ring sized by
     ``make_smem_layout_epi(<aux_dtype>, ROW_MAJOR, epi_tile,
-    _TCGEN05_AUX_PIPELINE_STAGE_COUNT)`` — each ring stage holds
-    ONE subtile (``epi_tile``-shaped slice) of the per-output-tile
-    aux region, not the full ``(bm, bn)`` tile. Per-subtile
-    staging keeps the SMEM ring footprint at one ``epi_tile``
-    chunk per stage rather than one ``(bm, bn)`` chunk, which is
-    essential to fit cluster_m=2 + ``tcgen05_ab_stages=3`` in the
-    228 KB B200 SMEM cap. The producer issues one cooperative
+    plan.stage_count)`` — each ring stage holds ONE subtile
+    (``epi_tile``-shaped slice) of the per-output-tile aux region,
+    not the full ``(bm, bn)`` tile. Per-subtile staging keeps the
+    SMEM ring footprint at one ``epi_tile`` chunk per stage rather
+    than one ``(bm, bn)`` chunk, which is essential to fit
+    cluster_m=2 + ``tcgen05_ab_stages=3`` in the 228 KB B200 SMEM
+    cap. The producer issues one cooperative
     ``cute.copy(GMEM_aux_subtile, SMEM_aux_ring[stage])`` *per
     subtile* (looping over the per-output-tile subtile axis),
     framed by ``producer_acquire`` / ``producer_commit`` / state
@@ -6334,7 +6402,9 @@ def _emit_tcgen05_aux_pipeline_setup(
     / lane-0 ``consumer_release`` / state advance per subtile.
     ``tile_shape_expr`` is the ``epi_tile`` variable name so the
     SMEM ring sizing matches the producer-side subtile copy
-    extent.
+    extent. ``plan.stage_count`` controls the depth — cycle 10
+    makes it config-driven so the T8 wide-N CLC + aux-TMA seed
+    family can sample ``{2, 3}``.
 
     Pipeline parameters:
 
@@ -6359,7 +6429,7 @@ def _emit_tcgen05_aux_pipeline_setup(
       spans every pipeline.
     """
     extra_args = ", defer_sync=True" if defer_sync else ""
-    stage_count = _TCGEN05_AUX_PIPELINE_STAGE_COUNT
+    stage_count = plan.stage_count
     lines: list[ast.AST] = []
     for ring, dtype_str in zip(plan.rings, descriptor_dtype_strs, strict=True):
         lines.extend(
