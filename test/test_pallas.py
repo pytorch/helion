@@ -2810,6 +2810,58 @@ class TestPallas(TestCase):
         self.assertTrue(torch.all(result >= x))
         self.assertTrue(torch.all(result < x + 1.0))
 
+    def test_broadcast_mask_size1_first_dim(self) -> None:
+        """Mask must not be applied to size-1 broadcast dims (first dim)."""
+
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def k(x: torch.Tensor, bias: torch.Tensor) -> torch.Tensor:
+            out = torch.empty(
+                [x.size(0), bias.size(0)],
+                device=x.device,
+                dtype=x.dtype,
+            )
+            for tile_m, tile_n in hl.tile(out.size()):
+                out[tile_m, tile_n] = x[tile_m, tile_n] + bias[tile_n]
+            return out
+
+        x = torch.randn(1, 10, device=DEVICE, dtype=torch.float32)
+        bias = torch.randn(10, device=DEVICE, dtype=torch.float32)
+        _, result = code_and_output(k, (x, bias), block_sizes=[16, 16])
+        expected = x + bias
+        torch.testing.assert_close(result, expected)
+
+    def test_broadcast_mask_size1_last_dim(self) -> None:
+        """Mask must not be applied to size-1 broadcast dims (last dim)."""
+
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def k(x: torch.Tensor, bias: torch.Tensor, out: torch.Tensor) -> None:
+            for tile_m, tile_n in hl.tile(out.size()):
+                out[tile_m, tile_n] = x[tile_m, tile_n] + bias[tile_n]
+
+        x = torch.randn(10, 1, device=DEVICE, dtype=torch.float32)
+        bias = torch.randn(10, device=DEVICE, dtype=torch.float32)
+        out = torch.zeros(10, 10, device=DEVICE, dtype=torch.float32)
+        code, _result = code_and_output(k, (x, bias, out), block_sizes=[16, 16])
+        expected = x + bias[None, :]
+        torch.testing.assert_close(out, expected)
+
+    def test_broadcast_mask_size1_multiple_dims(self) -> None:
+        """Mask must not be applied to size-1 broadcast dims (multiple dims)."""
+
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def k(x: torch.Tensor, bias: torch.Tensor, out: torch.Tensor) -> None:
+            for tile_0, tile_1, tile_2 in hl.tile(out.size()):
+                tmp0 = x[tile_0, tile_1, tile_2]
+                tmp1 = bias[tile_2].unsqueeze(0).unsqueeze(0)
+                out[tile_0, tile_1, tile_2] = tmp0 + tmp1.to(torch.float32)
+
+        x = torch.randn(1, 10, 1, device=DEVICE, dtype=torch.float32)
+        bias = torch.arange(10, device=DEVICE, dtype=torch.int32)
+        out = torch.zeros(1, 10, 10, device=DEVICE, dtype=torch.float32)
+        code, _result = code_and_output(k, (x, bias, out), block_sizes=[1, 16, 16])
+        expected = x + bias.float()
+        torch.testing.assert_close(out, expected)
+
 
 @skipUnlessPallas("JAX/Pallas TPU not available")
 class TestPallasIndirectGather(TestCase):
