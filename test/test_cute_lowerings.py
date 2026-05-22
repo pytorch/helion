@@ -352,6 +352,65 @@ def cute_matmul_role_local_monolithic_4096_bf16(
     return out
 
 
+@helion.kernel(backend="cute")
+def cute_matmul_role_local_monolithic_relu_bf16(
+    x: torch.Tensor, y: torch.Tensor
+) -> torch.Tensor:
+    """Target 4 envelope kernel: matmul + relu epilogue, single bf16 store."""
+    m, k = x.size()
+    _, n = y.size()
+    out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+    for tile_m, tile_n in hl.tile([m, n]):
+        acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+        for tile_k in hl.tile(k):
+            acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+        out[tile_m, tile_n] = torch.relu(acc).to(x.dtype)
+    return out
+
+
+@helion.kernel(backend="cute")
+def cute_matmul_role_local_monolithic_bias_bf16(
+    x: torch.Tensor, y: torch.Tensor, bias: torch.Tensor
+) -> torch.Tensor:
+    """Target 2 envelope kernel: matmul + ``acc + bias[n]`` epilogue.
+
+    Mirrors :func:`cute_matmul_role_local_monolithic_relu_bf16` for the
+    T2 bias-store envelope: rank-1 trailing-axis broadcast bias added to
+    the accumulator before the bf16 cast and store.
+    """
+    m, k = x.size()
+    _, n = y.size()
+    out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+    for tile_m, tile_n in hl.tile([m, n]):
+        acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+        for tile_k in hl.tile(k):
+            acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+        out[tile_m, tile_n] = (acc + bias[tile_n]).to(x.dtype)
+    return out
+
+
+@helion.kernel(backend="cute")
+def cute_matmul_role_local_monolithic_bias_relu_bf16(
+    x: torch.Tensor, y: torch.Tensor, bias: torch.Tensor
+) -> torch.Tensor:
+    """Target 6 envelope kernel: matmul + ``relu(acc + bias[n])`` epilogue.
+
+    Composition of :func:`cute_matmul_role_local_monolithic_bias_bf16`
+    (rank-1 trailing-axis broadcast bias) and
+    :func:`cute_matmul_role_local_monolithic_relu_bf16` (relu before the
+    bf16 cast and store).
+    """
+    m, k = x.size()
+    _, n = y.size()
+    out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+    for tile_m, tile_n in hl.tile([m, n]):
+        acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+        for tile_k in hl.tile(k):
+            acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+        out[tile_m, tile_n] = torch.relu(acc + bias[tile_n]).to(x.dtype)
+    return out
+
+
 class _FakeBlockSize:
     def __init__(
         self, size: int, *, block_id: int | None = None, reduction: bool = False
@@ -2674,6 +2733,12 @@ class TestCuteLowerings(unittest.TestCase):
         self.assertEqual(direct_plan["output_dtype"], "cutlass.BFloat16")
         self.assertEqual(len(cast("list[object]", direct_plan["ab_kernel_args"])), 4)
         self.assertEqual(len(cast("list[object]", direct_plan["d_kernel_args"])), 2)
+        # B1 (cycle-3 review): the direct-entry plan must carry the
+        # validated matmul problem shape so the runtime validator can
+        # dispatch on the exact (M, N, K) envelope rather than only the
+        # bk-keyed shape-set (which would be ambiguous for the T4/T5
+        # pair that shares bk=128).
+        self.assertEqual(direct_plan["validated_shape"], [1024, 4096, 1024])
 
         # The descriptor source and the legacy wrapper source must agree on
         # descriptor metadata while the kernel body still lives behind the
@@ -2946,9 +3011,1615 @@ class TestCuteLowerings(unittest.TestCase):
             bound.env.config_spec.cute_tcgen05_search_enabled = True
             with self.assertRaisesRegex(
                 exc.BackendUnsupported,
-                "identity-store",
+                # Relu-store at T1 shape is still rejected: the T1 envelope
+                # requires identity-store, and the T4 envelope requires the
+                # 8192x1024x1024 shape.
+                "T1 identity-store, T2 bias-store, T3 identity-store, T4 relu-store, T5 identity-store, T6 bias-relu-store, or T7 identity-store",
             ):
                 bound.to_triton_code(cfg)
+
+    def test_tcgen05_direct_entry_plan_admits_target4_relu_store(self) -> None:
+        """Target 4 envelope (8192x1024x1024 + relu) reaches the direct entry."""
+        args = (
+            torch.empty([8192, 1024], device=DEVICE, dtype=torch.bfloat16),
+            torch.empty([1024, 1024], device=DEVICE, dtype=torch.bfloat16),
+        )
+        cfg = _make_tcgen05_role_local_monolithic_seed_config(
+            block_sizes=[256, 256, 128],
+            l2_groupings=[2],
+            pid_type="persistent_interleaved",
+            tcgen05_cluster_m=2,
+            tcgen05_cluster_n=1,
+            tcgen05_ab_stages=3,
+            tcgen05_acc_stages=2,
+            tcgen05_c_stages=2,
+            tcgen05_num_epi_warps=4,
+            **{
+                TCGEN05_LAYOUT_STRATEGY_CONFIG_KEY: (
+                    Tcgen05LayoutStrategy.EXPLICIT_EPI_TILE.value
+                ),
+                TCGEN05_LAYOUT_OVERRIDES_EPI_TILE_M_KEY: 128,
+                TCGEN05_LAYOUT_OVERRIDES_EPI_TILE_N_KEY: 32,
+                TCGEN05_LAYOUT_OVERRIDES_D_STORE_BOX_N_KEY: 32,
+                TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY: True,
+                TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY: True,
+                TCGEN05_DIRECT_ENTRY_PLAN_CONFIG_KEY: True,
+            },
+        )
+        with patch_cute_mma_support():
+            bound = cute_matmul_role_local_monolithic_relu_bf16.bind(args)
+            bound.env.config_spec.cute_tcgen05_search_enabled = True
+            code = bound.to_triton_code(cfg)
+        # The kernel-side relu epilogue is fused inside the kernel body
+        # and the direct-entry plan is recorded so the runtime dispatch
+        # routes T4 through the TVM-FFI fast launch.
+        self.assertIn("_helion_cute_direct_entry_plans", code)
+        self.assertIn("tcgen05_target1_direct_entry", code)
+        # A3 (cycle-2 review): the compiler-emitted direct-entry source
+        # is gated on ``bk == 64``; T4 (bk=128) does NOT emit it. T4
+        # falls back to the runtime-built direct entry instead.
+        self.assertNotIn("_helion_cute_generated_direct_entry", code)
+
+    def test_tcgen05_direct_entry_plan_rejects_target4_without_relu(self) -> None:
+        """Target 4 shape with identity store is rejected (no relu chain)."""
+        args = (
+            torch.empty([8192, 1024], device=DEVICE, dtype=torch.bfloat16),
+            torch.empty([1024, 1024], device=DEVICE, dtype=torch.bfloat16),
+        )
+        cfg = _make_tcgen05_role_local_monolithic_seed_config(
+            block_sizes=[256, 256, 128],
+            l2_groupings=[2],
+            pid_type="persistent_interleaved",
+            tcgen05_cluster_m=2,
+            tcgen05_cluster_n=1,
+            tcgen05_ab_stages=3,
+            tcgen05_acc_stages=2,
+            tcgen05_c_stages=2,
+            tcgen05_num_epi_warps=4,
+            **{
+                TCGEN05_LAYOUT_STRATEGY_CONFIG_KEY: (
+                    Tcgen05LayoutStrategy.EXPLICIT_EPI_TILE.value
+                ),
+                TCGEN05_LAYOUT_OVERRIDES_EPI_TILE_M_KEY: 128,
+                TCGEN05_LAYOUT_OVERRIDES_EPI_TILE_N_KEY: 32,
+                TCGEN05_LAYOUT_OVERRIDES_D_STORE_BOX_N_KEY: 32,
+                TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY: True,
+                TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY: True,
+                TCGEN05_DIRECT_ENTRY_PLAN_CONFIG_KEY: True,
+            },
+        )
+        with patch_cute_mma_support():
+            bound = cute_matmul_role_local_monolithic_4096_bf16.bind(args)
+            bound.env.config_spec.cute_tcgen05_search_enabled = True
+            with self.assertRaisesRegex(
+                exc.BackendUnsupported,
+                "T1 identity-store, T2 bias-store, T3 identity-store, T4 relu-store, T5 identity-store, T6 bias-relu-store, or T7 identity-store",
+            ):
+                bound.to_triton_code(cfg)
+
+    def test_tcgen05_direct_entry_plan_rejects_target1_shape_with_bk128(
+        self,
+    ) -> None:
+        """A1 (cycle-2 review): T1 shape with bk=128 fails at codegen.
+
+        The envelope predicate pins each shape to its validated ``bk``, so
+        a (T1 shape) + (bk=128) cross-mismatch is rejected at codegen
+        instead of at the runtime validator.
+        """
+        args = (
+            torch.empty([1024, 1024], device=DEVICE, dtype=torch.bfloat16),
+            torch.empty([1024, 4096], device=DEVICE, dtype=torch.bfloat16),
+        )
+        cfg = _make_tcgen05_role_local_monolithic_seed_config(
+            block_sizes=[256, 256, 128],
+            l2_groupings=[1],
+            pid_type="persistent_interleaved",
+            tcgen05_cluster_m=2,
+            tcgen05_cluster_n=1,
+            tcgen05_ab_stages=3,
+            tcgen05_acc_stages=2,
+            tcgen05_c_stages=2,
+            tcgen05_num_epi_warps=4,
+            **{
+                TCGEN05_LAYOUT_STRATEGY_CONFIG_KEY: (
+                    Tcgen05LayoutStrategy.EXPLICIT_EPI_TILE.value
+                ),
+                TCGEN05_LAYOUT_OVERRIDES_EPI_TILE_M_KEY: 128,
+                TCGEN05_LAYOUT_OVERRIDES_EPI_TILE_N_KEY: 32,
+                TCGEN05_LAYOUT_OVERRIDES_D_STORE_BOX_N_KEY: 32,
+                TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY: True,
+                TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY: True,
+                TCGEN05_DIRECT_ENTRY_PLAN_CONFIG_KEY: True,
+            },
+        )
+        with patch_cute_mma_support():
+            bound = cute_matmul_role_local_monolithic_4096_bf16.bind(args)
+            bound.env.config_spec.cute_tcgen05_search_enabled = True
+            with self.assertRaisesRegex(
+                exc.BackendUnsupported,
+                "T1 identity-store, T2 bias-store, T3 identity-store, T4 relu-store, T5 identity-store, T6 bias-relu-store, or T7 identity-store",
+            ):
+                bound.to_triton_code(cfg)
+
+    def test_tcgen05_direct_entry_plan_rejects_target4_shape_with_bk64(
+        self,
+    ) -> None:
+        """A1 (cycle-2 review): T4 shape with bk=64 fails at codegen."""
+        args = (
+            torch.empty([8192, 1024], device=DEVICE, dtype=torch.bfloat16),
+            torch.empty([1024, 1024], device=DEVICE, dtype=torch.bfloat16),
+        )
+        cfg = _make_tcgen05_role_local_monolithic_seed_config(
+            block_sizes=[256, 256, 64],
+            l2_groupings=[2],
+            pid_type="persistent_interleaved",
+            tcgen05_cluster_m=2,
+            tcgen05_cluster_n=1,
+            tcgen05_ab_stages=3,
+            tcgen05_acc_stages=2,
+            tcgen05_c_stages=2,
+            tcgen05_num_epi_warps=4,
+            **{
+                TCGEN05_LAYOUT_STRATEGY_CONFIG_KEY: (
+                    Tcgen05LayoutStrategy.EXPLICIT_EPI_TILE.value
+                ),
+                TCGEN05_LAYOUT_OVERRIDES_EPI_TILE_M_KEY: 128,
+                TCGEN05_LAYOUT_OVERRIDES_EPI_TILE_N_KEY: 32,
+                TCGEN05_LAYOUT_OVERRIDES_D_STORE_BOX_N_KEY: 32,
+                TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY: True,
+                TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY: True,
+                TCGEN05_DIRECT_ENTRY_PLAN_CONFIG_KEY: True,
+            },
+        )
+        with patch_cute_mma_support():
+            bound = cute_matmul_role_local_monolithic_relu_bf16.bind(args)
+            bound.env.config_spec.cute_tcgen05_search_enabled = True
+            with self.assertRaisesRegex(
+                exc.BackendUnsupported,
+                "T1 identity-store, T2 bias-store, T3 identity-store, T4 relu-store, T5 identity-store, T6 bias-relu-store, or T7 identity-store",
+            ):
+                bound.to_triton_code(cfg)
+
+    def test_tcgen05_pure_clc_scheduler_object_rejects_target4_relu(self) -> None:
+        """Pure-CLC scheduler-object diagnostic is T1-only.
+
+        Cycle-2 review P2: the pure-CLC scheduler-object surface is
+        narrow-gated to the T1 identity-store envelope. A T4 relu-store
+        request must be rejected even if the direct-entry plan would
+        otherwise admit it.
+        """
+        args = (
+            torch.empty([8192, 1024], device=DEVICE, dtype=torch.bfloat16),
+            torch.empty([1024, 1024], device=DEVICE, dtype=torch.bfloat16),
+        )
+        cfg = _make_tcgen05_role_local_monolithic_seed_config(
+            block_sizes=[256, 256, 128],
+            l2_groupings=[2],
+            pid_type="persistent_interleaved",
+            tcgen05_cluster_m=2,
+            tcgen05_cluster_n=1,
+            tcgen05_ab_stages=3,
+            tcgen05_acc_stages=2,
+            tcgen05_c_stages=2,
+            tcgen05_num_epi_warps=4,
+            **{
+                TCGEN05_LAYOUT_STRATEGY_CONFIG_KEY: (
+                    Tcgen05LayoutStrategy.EXPLICIT_EPI_TILE.value
+                ),
+                TCGEN05_LAYOUT_OVERRIDES_EPI_TILE_M_KEY: 128,
+                TCGEN05_LAYOUT_OVERRIDES_EPI_TILE_N_KEY: 32,
+                TCGEN05_LAYOUT_OVERRIDES_D_STORE_BOX_N_KEY: 32,
+                TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY: True,
+                TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY: True,
+                TCGEN05_DIRECT_ENTRY_PLAN_CONFIG_KEY: True,
+                TCGEN05_PURE_CLC_SCHEDULER_OBJECT_CONFIG_KEY: True,
+            },
+        )
+        with patch_cute_mma_support():
+            bound = cute_matmul_role_local_monolithic_relu_bf16.bind(args)
+            bound.env.config_spec.cute_tcgen05_search_enabled = True
+            with self.assertRaisesRegex(
+                exc.BackendUnsupported,
+                "pure-CLC scheduler object is not validated",
+            ):
+                bound.to_triton_code(cfg)
+
+    def test_tcgen05_direct_entry_plan_target4_runtime_correctness(self) -> None:
+        """Compile + launch the T4 direct-entry path and compare to eager."""
+        from helion._compiler.cute.mma_support import get_cute_mma_support
+
+        if not get_cute_mma_support().tcgen05_f16bf16:
+            self.skipTest("tcgen05 F16/BF16 MMA is not supported on this machine")
+        if not torch.cuda.is_available():
+            self.skipTest("Target 4 runtime correctness requires CUDA")
+
+        torch.manual_seed(0)
+        args = (
+            torch.randn(8192, 1024, device=DEVICE, dtype=torch.bfloat16),
+            torch.randn(1024, 1024, device=DEVICE, dtype=torch.bfloat16),
+        )
+        cfg = _make_tcgen05_role_local_monolithic_seed_config(
+            block_sizes=[256, 256, 128],
+            l2_groupings=[2],
+            pid_type="persistent_interleaved",
+            tcgen05_cluster_m=2,
+            tcgen05_cluster_n=1,
+            tcgen05_ab_stages=3,
+            tcgen05_acc_stages=2,
+            tcgen05_c_stages=2,
+            tcgen05_num_epi_warps=4,
+            **{
+                TCGEN05_LAYOUT_STRATEGY_CONFIG_KEY: (
+                    Tcgen05LayoutStrategy.EXPLICIT_EPI_TILE.value
+                ),
+                TCGEN05_LAYOUT_OVERRIDES_EPI_TILE_M_KEY: 128,
+                TCGEN05_LAYOUT_OVERRIDES_EPI_TILE_N_KEY: 32,
+                TCGEN05_LAYOUT_OVERRIDES_D_STORE_BOX_N_KEY: 32,
+                TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY: True,
+                TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY: True,
+                TCGEN05_DIRECT_ENTRY_PLAN_CONFIG_KEY: True,
+            },
+        )
+        with patch_cute_mma_support():
+            bound = cute_matmul_role_local_monolithic_relu_bf16.bind(args)
+            bound.env.config_spec.cute_tcgen05_search_enabled = True
+            bound.set_config(cfg)
+            out = bound(*args)
+
+        # A5 (cycle-2 review): compare against an fp32 reference, cast to
+        # bf16 only at the end, with a tight ``atol`` so an
+        # order-of-magnitude epilogue bug (missed relu, partial
+        # accumulator, wrong cast order) would be caught. Measured max
+        # abs diff at this shape and seed is ~0.5 against a ~174 dynamic
+        # range; ``atol=0.625`` adds 25% headroom over that.
+        expected = torch.relu(args[0].float() @ args[1].float()).to(torch.bfloat16)
+        torch.testing.assert_close(out, expected, atol=0.625, rtol=1e-2)
+
+    def test_tcgen05_direct_entry_plan_admits_target5_identity_store(self) -> None:
+        """Target 5 envelope (1024x8192x1024 + identity) reaches the direct entry."""
+        args = (
+            torch.empty([1024, 1024], device=DEVICE, dtype=torch.bfloat16),
+            torch.empty([1024, 8192], device=DEVICE, dtype=torch.bfloat16),
+        )
+        cfg = _make_tcgen05_role_local_monolithic_seed_config(
+            block_sizes=[256, 256, 128],
+            l2_groupings=[2],
+            pid_type="persistent_interleaved",
+            tcgen05_cluster_m=2,
+            tcgen05_cluster_n=1,
+            tcgen05_ab_stages=3,
+            tcgen05_acc_stages=2,
+            tcgen05_c_stages=2,
+            tcgen05_num_epi_warps=4,
+            **{
+                TCGEN05_LAYOUT_STRATEGY_CONFIG_KEY: (
+                    Tcgen05LayoutStrategy.EXPLICIT_EPI_TILE.value
+                ),
+                TCGEN05_LAYOUT_OVERRIDES_EPI_TILE_M_KEY: 128,
+                TCGEN05_LAYOUT_OVERRIDES_EPI_TILE_N_KEY: 32,
+                TCGEN05_LAYOUT_OVERRIDES_D_STORE_BOX_N_KEY: 32,
+                TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY: True,
+                TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY: True,
+                TCGEN05_DIRECT_ENTRY_PLAN_CONFIG_KEY: True,
+            },
+        )
+        with patch_cute_mma_support():
+            bound = cute_matmul_role_local_monolithic_4096_bf16.bind(args)
+            bound.env.config_spec.cute_tcgen05_search_enabled = True
+            code = bound.to_triton_code(cfg)
+        # Identity-store + direct-entry plan should record the T5
+        # direct-entry plan and route through the runtime-built
+        # direct entry (compiler-emitted entry is gated to bk=64).
+        self.assertIn("_helion_cute_direct_entry_plans", code)
+        self.assertIn("tcgen05_target1_direct_entry", code)
+        self.assertNotIn("_helion_cute_generated_direct_entry", code)
+
+    def test_tcgen05_direct_entry_plan_rejects_target5_shape_with_bk64(
+        self,
+    ) -> None:
+        """T5 shape with bk=64 fails at codegen.
+
+        Mirrors the T4 ``bk=64`` cross-mismatch test. The T5 envelope
+        predicate pins ``bk`` to its validated block_k so a (T5 shape)
+        + (bk=64) cross-mismatch is rejected at codegen instead of
+        only at the runtime validator.
+        """
+        args = (
+            torch.empty([1024, 1024], device=DEVICE, dtype=torch.bfloat16),
+            torch.empty([1024, 8192], device=DEVICE, dtype=torch.bfloat16),
+        )
+        cfg = _make_tcgen05_role_local_monolithic_seed_config(
+            block_sizes=[256, 256, 64],
+            l2_groupings=[2],
+            pid_type="persistent_interleaved",
+            tcgen05_cluster_m=2,
+            tcgen05_cluster_n=1,
+            tcgen05_ab_stages=3,
+            tcgen05_acc_stages=2,
+            tcgen05_c_stages=2,
+            tcgen05_num_epi_warps=4,
+            **{
+                TCGEN05_LAYOUT_STRATEGY_CONFIG_KEY: (
+                    Tcgen05LayoutStrategy.EXPLICIT_EPI_TILE.value
+                ),
+                TCGEN05_LAYOUT_OVERRIDES_EPI_TILE_M_KEY: 128,
+                TCGEN05_LAYOUT_OVERRIDES_EPI_TILE_N_KEY: 32,
+                TCGEN05_LAYOUT_OVERRIDES_D_STORE_BOX_N_KEY: 32,
+                TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY: True,
+                TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY: True,
+                TCGEN05_DIRECT_ENTRY_PLAN_CONFIG_KEY: True,
+            },
+        )
+        with patch_cute_mma_support():
+            bound = cute_matmul_role_local_monolithic_4096_bf16.bind(args)
+            bound.env.config_spec.cute_tcgen05_search_enabled = True
+            with self.assertRaisesRegex(
+                exc.BackendUnsupported,
+                # Anchor on the full enumerated tail of the
+                # direct-entry rejection error so the test verifies (a)
+                # the rejection path was hit and (b) the listing tail
+                # is intact, without spuriously matching on a different
+                # envelope's failure path.
+                r"requires the validated T1 identity-store, T2 bias-store, "
+                r"T3 identity-store, T4 relu-store, T5 identity-store, "
+                r"T6 bias-relu-store, or T7 identity-store "
+                r"TVM-FFI flat-role seed",
+            ):
+                bound.to_triton_code(cfg)
+
+    def test_tcgen05_direct_entry_plan_rejects_target5_with_relu(self) -> None:
+        """T5 shape with relu store is rejected (T5 envelope requires identity)."""
+        args = (
+            torch.empty([1024, 1024], device=DEVICE, dtype=torch.bfloat16),
+            torch.empty([1024, 8192], device=DEVICE, dtype=torch.bfloat16),
+        )
+        cfg = _make_tcgen05_role_local_monolithic_seed_config(
+            block_sizes=[256, 256, 128],
+            l2_groupings=[2],
+            pid_type="persistent_interleaved",
+            tcgen05_cluster_m=2,
+            tcgen05_cluster_n=1,
+            tcgen05_ab_stages=3,
+            tcgen05_acc_stages=2,
+            tcgen05_c_stages=2,
+            tcgen05_num_epi_warps=4,
+            **{
+                TCGEN05_LAYOUT_STRATEGY_CONFIG_KEY: (
+                    Tcgen05LayoutStrategy.EXPLICIT_EPI_TILE.value
+                ),
+                TCGEN05_LAYOUT_OVERRIDES_EPI_TILE_M_KEY: 128,
+                TCGEN05_LAYOUT_OVERRIDES_EPI_TILE_N_KEY: 32,
+                TCGEN05_LAYOUT_OVERRIDES_D_STORE_BOX_N_KEY: 32,
+                TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY: True,
+                TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY: True,
+                TCGEN05_DIRECT_ENTRY_PLAN_CONFIG_KEY: True,
+            },
+        )
+        with patch_cute_mma_support():
+            # ``cute_matmul_role_local_monolithic_relu_bf16`` has a relu
+            # epilogue; combined with T5 shape (1024x8192x1024) the
+            # T5 envelope (identity) and T4 envelope (relu but
+            # 8192x1024x1024) both fail.
+            bound = cute_matmul_role_local_monolithic_relu_bf16.bind(args)
+            bound.env.config_spec.cute_tcgen05_search_enabled = True
+            with self.assertRaisesRegex(
+                exc.BackendUnsupported,
+                # Anchor on the full enumerated tail of the
+                # direct-entry rejection error so the test verifies (a)
+                # the rejection path was hit and (b) the listing tail
+                # is intact, without spuriously matching on a different
+                # envelope's failure path.
+                r"requires the validated T1 identity-store, T2 bias-store, "
+                r"T3 identity-store, T4 relu-store, T5 identity-store, "
+                r"T6 bias-relu-store, or T7 identity-store "
+                r"TVM-FFI flat-role seed",
+            ):
+                bound.to_triton_code(cfg)
+
+    def test_tcgen05_pure_clc_scheduler_object_rejects_target5_identity(
+        self,
+    ) -> None:
+        """Pure-CLC scheduler-object surface stays T1-only.
+
+        The pure-CLC scheduler-object diagnostic is narrow-gated to the
+        T1 identity-store envelope. T5 is also an identity store, but
+        at a different shape and bk; the pure-CLC path is not
+        validated for T5 and must reject the request.
+        """
+        args = (
+            torch.empty([1024, 1024], device=DEVICE, dtype=torch.bfloat16),
+            torch.empty([1024, 8192], device=DEVICE, dtype=torch.bfloat16),
+        )
+        cfg = _make_tcgen05_role_local_monolithic_seed_config(
+            block_sizes=[256, 256, 128],
+            l2_groupings=[2],
+            pid_type="persistent_interleaved",
+            tcgen05_cluster_m=2,
+            tcgen05_cluster_n=1,
+            tcgen05_ab_stages=3,
+            tcgen05_acc_stages=2,
+            tcgen05_c_stages=2,
+            tcgen05_num_epi_warps=4,
+            **{
+                TCGEN05_LAYOUT_STRATEGY_CONFIG_KEY: (
+                    Tcgen05LayoutStrategy.EXPLICIT_EPI_TILE.value
+                ),
+                TCGEN05_LAYOUT_OVERRIDES_EPI_TILE_M_KEY: 128,
+                TCGEN05_LAYOUT_OVERRIDES_EPI_TILE_N_KEY: 32,
+                TCGEN05_LAYOUT_OVERRIDES_D_STORE_BOX_N_KEY: 32,
+                TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY: True,
+                TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY: True,
+                TCGEN05_DIRECT_ENTRY_PLAN_CONFIG_KEY: True,
+                TCGEN05_PURE_CLC_SCHEDULER_OBJECT_CONFIG_KEY: True,
+            },
+        )
+        with patch_cute_mma_support():
+            bound = cute_matmul_role_local_monolithic_4096_bf16.bind(args)
+            bound.env.config_spec.cute_tcgen05_search_enabled = True
+            with self.assertRaisesRegex(
+                exc.BackendUnsupported,
+                "pure-CLC scheduler object is not validated",
+            ):
+                bound.to_triton_code(cfg)
+
+    def test_tcgen05_direct_entry_plan_target5_runtime_correctness(self) -> None:
+        """Compile + launch the T5 direct-entry path and compare to eager."""
+        from helion._compiler.cute.mma_support import get_cute_mma_support
+
+        if not get_cute_mma_support().tcgen05_f16bf16:
+            self.skipTest("tcgen05 F16/BF16 MMA is not supported on this machine")
+        if not torch.cuda.is_available():
+            self.skipTest("Target 5 runtime correctness requires CUDA")
+
+        torch.manual_seed(0)
+        args = (
+            torch.randn(1024, 1024, device=DEVICE, dtype=torch.bfloat16),
+            torch.randn(1024, 8192, device=DEVICE, dtype=torch.bfloat16),
+        )
+        cfg = _make_tcgen05_role_local_monolithic_seed_config(
+            block_sizes=[256, 256, 128],
+            l2_groupings=[2],
+            pid_type="persistent_interleaved",
+            tcgen05_cluster_m=2,
+            tcgen05_cluster_n=1,
+            tcgen05_ab_stages=3,
+            tcgen05_acc_stages=2,
+            tcgen05_c_stages=2,
+            tcgen05_num_epi_warps=4,
+            **{
+                TCGEN05_LAYOUT_STRATEGY_CONFIG_KEY: (
+                    Tcgen05LayoutStrategy.EXPLICIT_EPI_TILE.value
+                ),
+                TCGEN05_LAYOUT_OVERRIDES_EPI_TILE_M_KEY: 128,
+                TCGEN05_LAYOUT_OVERRIDES_EPI_TILE_N_KEY: 32,
+                TCGEN05_LAYOUT_OVERRIDES_D_STORE_BOX_N_KEY: 32,
+                TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY: True,
+                TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY: True,
+                TCGEN05_DIRECT_ENTRY_PLAN_CONFIG_KEY: True,
+            },
+        )
+        with patch_cute_mma_support():
+            bound = cute_matmul_role_local_monolithic_4096_bf16.bind(args)
+            bound.env.config_spec.cute_tcgen05_search_enabled = True
+            bound.set_config(cfg)
+            out = bound(*args)
+
+        # Identity store + bf16 → compare against an fp32 reference and
+        # cast to bf16 only at the end. The T5 dynamic range at this
+        # seed is similar to T4's (matmul accumulator magnitude scales
+        # with K which is the same), so use the same ``atol=0.625``
+        # tolerance bound to catch order-of-magnitude bugs.
+        expected = (args[0].float() @ args[1].float()).to(torch.bfloat16)
+        torch.testing.assert_close(out, expected, atol=0.625, rtol=1e-2)
+
+    def test_tcgen05_direct_entry_plan_admits_target3_identity_store(self) -> None:
+        """Target 3 envelope (2048x4096x2048 + identity) reaches the direct entry."""
+        args = (
+            torch.empty([2048, 2048], device=DEVICE, dtype=torch.bfloat16),
+            torch.empty([2048, 4096], device=DEVICE, dtype=torch.bfloat16),
+        )
+        cfg = _make_tcgen05_role_local_monolithic_seed_config(
+            block_sizes=[256, 256, 128],
+            l2_groupings=[2],
+            pid_type="persistent_interleaved",
+            tcgen05_cluster_m=2,
+            tcgen05_cluster_n=1,
+            tcgen05_ab_stages=3,
+            tcgen05_acc_stages=2,
+            tcgen05_c_stages=2,
+            tcgen05_num_epi_warps=4,
+            **{
+                TCGEN05_LAYOUT_STRATEGY_CONFIG_KEY: (
+                    Tcgen05LayoutStrategy.EXPLICIT_EPI_TILE.value
+                ),
+                TCGEN05_LAYOUT_OVERRIDES_EPI_TILE_M_KEY: 128,
+                TCGEN05_LAYOUT_OVERRIDES_EPI_TILE_N_KEY: 32,
+                TCGEN05_LAYOUT_OVERRIDES_D_STORE_BOX_N_KEY: 32,
+                TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY: True,
+                TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY: True,
+                TCGEN05_DIRECT_ENTRY_PLAN_CONFIG_KEY: True,
+            },
+        )
+        with patch_cute_mma_support():
+            bound = cute_matmul_role_local_monolithic_4096_bf16.bind(args)
+            bound.env.config_spec.cute_tcgen05_search_enabled = True
+            code = bound.to_triton_code(cfg)
+        # Identity-store + direct-entry plan should record the T3
+        # direct-entry plan and route through the runtime-built
+        # direct entry (compiler-emitted entry is gated to bk=64).
+        self.assertIn("_helion_cute_direct_entry_plans", code)
+        self.assertIn("tcgen05_target1_direct_entry", code)
+        self.assertNotIn("_helion_cute_generated_direct_entry", code)
+
+    def test_tcgen05_direct_entry_plan_rejects_target3_shape_with_bk64(
+        self,
+    ) -> None:
+        """T3 shape with bk=64 fails at codegen.
+
+        The T3 envelope predicate pins ``bk`` to its validated block_k
+        so a (T3 shape) + (bk=64) cross-mismatch is rejected at codegen
+        instead of only at the runtime validator.
+        """
+        args = (
+            torch.empty([2048, 2048], device=DEVICE, dtype=torch.bfloat16),
+            torch.empty([2048, 4096], device=DEVICE, dtype=torch.bfloat16),
+        )
+        cfg = _make_tcgen05_role_local_monolithic_seed_config(
+            block_sizes=[256, 256, 64],
+            l2_groupings=[2],
+            pid_type="persistent_interleaved",
+            tcgen05_cluster_m=2,
+            tcgen05_cluster_n=1,
+            tcgen05_ab_stages=3,
+            tcgen05_acc_stages=2,
+            tcgen05_c_stages=2,
+            tcgen05_num_epi_warps=4,
+            **{
+                TCGEN05_LAYOUT_STRATEGY_CONFIG_KEY: (
+                    Tcgen05LayoutStrategy.EXPLICIT_EPI_TILE.value
+                ),
+                TCGEN05_LAYOUT_OVERRIDES_EPI_TILE_M_KEY: 128,
+                TCGEN05_LAYOUT_OVERRIDES_EPI_TILE_N_KEY: 32,
+                TCGEN05_LAYOUT_OVERRIDES_D_STORE_BOX_N_KEY: 32,
+                TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY: True,
+                TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY: True,
+                TCGEN05_DIRECT_ENTRY_PLAN_CONFIG_KEY: True,
+            },
+        )
+        with patch_cute_mma_support():
+            bound = cute_matmul_role_local_monolithic_4096_bf16.bind(args)
+            bound.env.config_spec.cute_tcgen05_search_enabled = True
+            with self.assertRaisesRegex(
+                exc.BackendUnsupported,
+                "T3 identity-store",
+            ):
+                bound.to_triton_code(cfg)
+
+    def test_tcgen05_direct_entry_plan_rejects_target3_with_relu(self) -> None:
+        """T3 shape with relu store is rejected (T3 envelope requires identity)."""
+        args = (
+            torch.empty([2048, 2048], device=DEVICE, dtype=torch.bfloat16),
+            torch.empty([2048, 4096], device=DEVICE, dtype=torch.bfloat16),
+        )
+        cfg = _make_tcgen05_role_local_monolithic_seed_config(
+            block_sizes=[256, 256, 128],
+            l2_groupings=[2],
+            pid_type="persistent_interleaved",
+            tcgen05_cluster_m=2,
+            tcgen05_cluster_n=1,
+            tcgen05_ab_stages=3,
+            tcgen05_acc_stages=2,
+            tcgen05_c_stages=2,
+            tcgen05_num_epi_warps=4,
+            **{
+                TCGEN05_LAYOUT_STRATEGY_CONFIG_KEY: (
+                    Tcgen05LayoutStrategy.EXPLICIT_EPI_TILE.value
+                ),
+                TCGEN05_LAYOUT_OVERRIDES_EPI_TILE_M_KEY: 128,
+                TCGEN05_LAYOUT_OVERRIDES_EPI_TILE_N_KEY: 32,
+                TCGEN05_LAYOUT_OVERRIDES_D_STORE_BOX_N_KEY: 32,
+                TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY: True,
+                TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY: True,
+                TCGEN05_DIRECT_ENTRY_PLAN_CONFIG_KEY: True,
+            },
+        )
+        with patch_cute_mma_support():
+            # ``cute_matmul_role_local_monolithic_relu_bf16`` has a relu
+            # epilogue; combined with T3 shape (2048x4096x2048) both the
+            # T3 envelope (identity) and T4 envelope (relu but
+            # 8192x1024x1024) fail.
+            bound = cute_matmul_role_local_monolithic_relu_bf16.bind(args)
+            bound.env.config_spec.cute_tcgen05_search_enabled = True
+            with self.assertRaisesRegex(
+                exc.BackendUnsupported,
+                "T3 identity-store",
+            ):
+                bound.to_triton_code(cfg)
+
+    def test_tcgen05_pure_clc_scheduler_object_rejects_target3_identity(
+        self,
+    ) -> None:
+        """Pure-CLC scheduler-object surface stays T1-only.
+
+        The pure-CLC scheduler-object diagnostic is narrow-gated to the
+        T1 identity-store envelope. T3 is also an identity store, but
+        at a different shape; the pure-CLC path is not validated for T3
+        and must reject the request.
+        """
+        args = (
+            torch.empty([2048, 2048], device=DEVICE, dtype=torch.bfloat16),
+            torch.empty([2048, 4096], device=DEVICE, dtype=torch.bfloat16),
+        )
+        cfg = _make_tcgen05_role_local_monolithic_seed_config(
+            block_sizes=[256, 256, 128],
+            l2_groupings=[2],
+            pid_type="persistent_interleaved",
+            tcgen05_cluster_m=2,
+            tcgen05_cluster_n=1,
+            tcgen05_ab_stages=3,
+            tcgen05_acc_stages=2,
+            tcgen05_c_stages=2,
+            tcgen05_num_epi_warps=4,
+            **{
+                TCGEN05_LAYOUT_STRATEGY_CONFIG_KEY: (
+                    Tcgen05LayoutStrategy.EXPLICIT_EPI_TILE.value
+                ),
+                TCGEN05_LAYOUT_OVERRIDES_EPI_TILE_M_KEY: 128,
+                TCGEN05_LAYOUT_OVERRIDES_EPI_TILE_N_KEY: 32,
+                TCGEN05_LAYOUT_OVERRIDES_D_STORE_BOX_N_KEY: 32,
+                TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY: True,
+                TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY: True,
+                TCGEN05_DIRECT_ENTRY_PLAN_CONFIG_KEY: True,
+                TCGEN05_PURE_CLC_SCHEDULER_OBJECT_CONFIG_KEY: True,
+            },
+        )
+        with patch_cute_mma_support():
+            bound = cute_matmul_role_local_monolithic_4096_bf16.bind(args)
+            bound.env.config_spec.cute_tcgen05_search_enabled = True
+            with self.assertRaisesRegex(
+                exc.BackendUnsupported,
+                "pure-CLC scheduler object is not validated",
+            ):
+                bound.to_triton_code(cfg)
+
+    def test_tcgen05_direct_entry_plan_target3_runtime_correctness(self) -> None:
+        """Compile + launch the T3 direct-entry path and compare to eager."""
+        from helion._compiler.cute.mma_support import get_cute_mma_support
+
+        if not get_cute_mma_support().tcgen05_f16bf16:
+            self.skipTest("tcgen05 F16/BF16 MMA is not supported on this machine")
+        if not torch.cuda.is_available():
+            self.skipTest("Target 3 runtime correctness requires CUDA")
+
+        torch.manual_seed(0)
+        args = (
+            torch.randn(2048, 2048, device=DEVICE, dtype=torch.bfloat16),
+            torch.randn(2048, 4096, device=DEVICE, dtype=torch.bfloat16),
+        )
+        cfg = _make_tcgen05_role_local_monolithic_seed_config(
+            block_sizes=[256, 256, 128],
+            l2_groupings=[2],
+            pid_type="persistent_interleaved",
+            tcgen05_cluster_m=2,
+            tcgen05_cluster_n=1,
+            tcgen05_ab_stages=3,
+            tcgen05_acc_stages=2,
+            tcgen05_c_stages=2,
+            tcgen05_num_epi_warps=4,
+            **{
+                TCGEN05_LAYOUT_STRATEGY_CONFIG_KEY: (
+                    Tcgen05LayoutStrategy.EXPLICIT_EPI_TILE.value
+                ),
+                TCGEN05_LAYOUT_OVERRIDES_EPI_TILE_M_KEY: 128,
+                TCGEN05_LAYOUT_OVERRIDES_EPI_TILE_N_KEY: 32,
+                TCGEN05_LAYOUT_OVERRIDES_D_STORE_BOX_N_KEY: 32,
+                TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY: True,
+                TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY: True,
+                TCGEN05_DIRECT_ENTRY_PLAN_CONFIG_KEY: True,
+            },
+        )
+        with patch_cute_mma_support():
+            bound = cute_matmul_role_local_monolithic_4096_bf16.bind(args)
+            bound.env.config_spec.cute_tcgen05_search_enabled = True
+            bound.set_config(cfg)
+            out = bound(*args)
+
+        # Identity store + bf16. K=2048 (vs T4/T5's K=1024) doubles the
+        # accumulator dynamic range; bound the tolerance accordingly.
+        expected = (args[0].float() @ args[1].float()).to(torch.bfloat16)
+        torch.testing.assert_close(out, expected, atol=1.25, rtol=1e-2)
+
+    def test_tcgen05_direct_entry_plan_admits_target2_bias_store(self) -> None:
+        """Target 2 envelope (4096x2048x2048 + bias[n]) reaches the direct entry."""
+        args = (
+            torch.empty([4096, 2048], device=DEVICE, dtype=torch.bfloat16),
+            torch.empty([2048, 2048], device=DEVICE, dtype=torch.bfloat16),
+            torch.empty([2048], device=DEVICE, dtype=torch.bfloat16),
+        )
+        cfg = _make_tcgen05_role_local_monolithic_seed_config(
+            block_sizes=[256, 256, 128],
+            l2_groupings=[2],
+            pid_type="persistent_interleaved",
+            tcgen05_cluster_m=2,
+            tcgen05_cluster_n=1,
+            tcgen05_ab_stages=3,
+            tcgen05_acc_stages=2,
+            tcgen05_c_stages=2,
+            tcgen05_num_epi_warps=4,
+            **{
+                TCGEN05_LAYOUT_STRATEGY_CONFIG_KEY: (
+                    Tcgen05LayoutStrategy.EXPLICIT_EPI_TILE.value
+                ),
+                TCGEN05_LAYOUT_OVERRIDES_EPI_TILE_M_KEY: 128,
+                TCGEN05_LAYOUT_OVERRIDES_EPI_TILE_N_KEY: 32,
+                TCGEN05_LAYOUT_OVERRIDES_D_STORE_BOX_N_KEY: 32,
+                TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY: True,
+                TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY: True,
+                TCGEN05_DIRECT_ENTRY_PLAN_CONFIG_KEY: True,
+            },
+        )
+        with patch_cute_mma_support():
+            bound = cute_matmul_role_local_monolithic_bias_bf16.bind(args)
+            bound.env.config_spec.cute_tcgen05_search_enabled = True
+            code = bound.to_triton_code(cfg)
+        # Bias-store + direct-entry plan should record the T2 direct-entry
+        # plan with a positional ``bias_idx`` (resolved from the FX-arg
+        # ``bias_name`` by ``resolve_cute_plan_arg_positions``) and
+        # route through the runtime-built direct entry (the
+        # compiler-emitted entry stays gated to bk=64).
+        self.assertIn("_helion_cute_direct_entry_plans", code)
+        self.assertIn("tcgen05_target1_direct_entry", code)
+        self.assertIn("'bias_idx'", code)
+        self.assertNotIn("_helion_cute_generated_direct_entry", code)
+        # P1: pin the T2 ABI ordering at codegen time. The runtime
+        # validator and the runtime-built direct-entry source builder
+        # both rely on the resolved indices being ``(0, 1, 2, 3)`` —
+        # lhs, rhs, output, bias. Parse the emitted host attribute and
+        # check the positions directly rather than just confirming the
+        # ``'bias_idx'`` substring is present.
+        import re
+
+        plan_match = re.search(
+            r"_helion_cute_direct_entry_plans\s*=\s*(\[.*?\])\s*\n", code
+        )
+        self.assertIsNotNone(plan_match)
+        # The emitted attribute is a literal Python list of dicts so
+        # ``ast.literal_eval`` can recover the positions for inspection.
+        import ast
+
+        emitted_plans = ast.literal_eval(plan_match.group(1))
+        self.assertEqual(len(emitted_plans), 1)
+        emitted = emitted_plans[0]
+        self.assertEqual(
+            (
+                emitted["lhs_idx"],
+                emitted["rhs_idx"],
+                emitted["d_idx"],
+                emitted["bias_idx"],
+            ),
+            (0, 1, 2, 3),
+        )
+
+    def test_tcgen05_direct_entry_plan_rejects_target2_shape_with_bk64(
+        self,
+    ) -> None:
+        """T2 shape with bk=64 fails at codegen (T1's bk gate is exclusive)."""
+        args = (
+            torch.empty([4096, 2048], device=DEVICE, dtype=torch.bfloat16),
+            torch.empty([2048, 2048], device=DEVICE, dtype=torch.bfloat16),
+            torch.empty([2048], device=DEVICE, dtype=torch.bfloat16),
+        )
+        cfg = _make_tcgen05_role_local_monolithic_seed_config(
+            block_sizes=[256, 256, 64],
+            l2_groupings=[2],
+            pid_type="persistent_interleaved",
+            tcgen05_cluster_m=2,
+            tcgen05_cluster_n=1,
+            tcgen05_ab_stages=3,
+            tcgen05_acc_stages=2,
+            tcgen05_c_stages=2,
+            tcgen05_num_epi_warps=4,
+            **{
+                TCGEN05_LAYOUT_STRATEGY_CONFIG_KEY: (
+                    Tcgen05LayoutStrategy.EXPLICIT_EPI_TILE.value
+                ),
+                TCGEN05_LAYOUT_OVERRIDES_EPI_TILE_M_KEY: 128,
+                TCGEN05_LAYOUT_OVERRIDES_EPI_TILE_N_KEY: 32,
+                TCGEN05_LAYOUT_OVERRIDES_D_STORE_BOX_N_KEY: 32,
+                TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY: True,
+                TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY: True,
+                TCGEN05_DIRECT_ENTRY_PLAN_CONFIG_KEY: True,
+            },
+        )
+        with patch_cute_mma_support():
+            bound = cute_matmul_role_local_monolithic_bias_bf16.bind(args)
+            bound.env.config_spec.cute_tcgen05_search_enabled = True
+            with self.assertRaisesRegex(
+                exc.BackendUnsupported,
+                "T2 bias-store",
+            ):
+                bound.to_triton_code(cfg)
+
+    def test_tcgen05_direct_entry_plan_rejects_target2_without_bias(self) -> None:
+        """T2 shape with identity or relu store is rejected (T2 requires bias)."""
+        args = (
+            torch.empty([4096, 2048], device=DEVICE, dtype=torch.bfloat16),
+            torch.empty([2048, 2048], device=DEVICE, dtype=torch.bfloat16),
+        )
+        cfg = _make_tcgen05_role_local_monolithic_seed_config(
+            block_sizes=[256, 256, 128],
+            l2_groupings=[2],
+            pid_type="persistent_interleaved",
+            tcgen05_cluster_m=2,
+            tcgen05_cluster_n=1,
+            tcgen05_ab_stages=3,
+            tcgen05_acc_stages=2,
+            tcgen05_c_stages=2,
+            tcgen05_num_epi_warps=4,
+            **{
+                TCGEN05_LAYOUT_STRATEGY_CONFIG_KEY: (
+                    Tcgen05LayoutStrategy.EXPLICIT_EPI_TILE.value
+                ),
+                TCGEN05_LAYOUT_OVERRIDES_EPI_TILE_M_KEY: 128,
+                TCGEN05_LAYOUT_OVERRIDES_EPI_TILE_N_KEY: 32,
+                TCGEN05_LAYOUT_OVERRIDES_D_STORE_BOX_N_KEY: 32,
+                TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY: True,
+                TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY: True,
+                TCGEN05_DIRECT_ENTRY_PLAN_CONFIG_KEY: True,
+            },
+        )
+        with patch_cute_mma_support():
+            # Identity-store kernel at T2 shape: T2 envelope (bias) is
+            # rejected because there is no aten.add.Tensor in the chain;
+            # T1/T3/T5 envelopes are rejected because the shape gates
+            # are pinned to their respective (M, N, K) triples.
+            bound_identity = cute_matmul_role_local_monolithic_4096_bf16.bind(args)
+            bound_identity.env.config_spec.cute_tcgen05_search_enabled = True
+            with self.assertRaisesRegex(
+                exc.BackendUnsupported,
+                "T2 bias-store",
+            ):
+                bound_identity.to_triton_code(cfg)
+
+            # Relu-store kernel at T2 shape: T2 envelope (bias) is
+            # rejected because the chain has a relu rather than an add;
+            # T4 envelope (relu) is rejected because the shape gate is
+            # pinned to T4's (8192, 1024, 1024).
+            bound_relu = cute_matmul_role_local_monolithic_relu_bf16.bind(args)
+            bound_relu.env.config_spec.cute_tcgen05_search_enabled = True
+            with self.assertRaisesRegex(
+                exc.BackendUnsupported,
+                "T2 bias-store",
+            ):
+                bound_relu.to_triton_code(cfg)
+
+    def test_tcgen05_direct_entry_plan_rejects_target2_with_fp32_bias(
+        self,
+    ) -> None:
+        """T2 envelope is gated to bf16 bias tensors.
+
+        P2 (cycle-6 review): the runtime validator only admits bf16 bias
+        tensors, so the codegen walker
+        ``_trace_mma_to_single_bias_store_dtype`` and the host detector
+        ``host_function_has_tcgen05_bias_matmul_store_pattern`` must
+        reject non-bf16 bias loads. Otherwise an fp32 bias would reach
+        a direct-entry plan and fail only at launch.
+        """
+        args = (
+            torch.empty([4096, 2048], device=DEVICE, dtype=torch.bfloat16),
+            torch.empty([2048, 2048], device=DEVICE, dtype=torch.bfloat16),
+            # fp32 bias — same shape as the bf16 case, different dtype.
+            torch.empty([2048], device=DEVICE, dtype=torch.float32),
+        )
+        cfg = _make_tcgen05_role_local_monolithic_seed_config(
+            block_sizes=[256, 256, 128],
+            l2_groupings=[2],
+            pid_type="persistent_interleaved",
+            tcgen05_cluster_m=2,
+            tcgen05_cluster_n=1,
+            tcgen05_ab_stages=3,
+            tcgen05_acc_stages=2,
+            tcgen05_c_stages=2,
+            tcgen05_num_epi_warps=4,
+            **{
+                TCGEN05_LAYOUT_STRATEGY_CONFIG_KEY: (
+                    Tcgen05LayoutStrategy.EXPLICIT_EPI_TILE.value
+                ),
+                TCGEN05_LAYOUT_OVERRIDES_EPI_TILE_M_KEY: 128,
+                TCGEN05_LAYOUT_OVERRIDES_EPI_TILE_N_KEY: 32,
+                TCGEN05_LAYOUT_OVERRIDES_D_STORE_BOX_N_KEY: 32,
+                TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY: True,
+                TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY: True,
+                TCGEN05_DIRECT_ENTRY_PLAN_CONFIG_KEY: True,
+            },
+        )
+        with patch_cute_mma_support():
+            bound = cute_matmul_role_local_monolithic_bias_bf16.bind(args)
+            # The fp32 bias must not enable the T2 seed at the
+            # detector level — confirm at the autotune surface.
+            self.assertFalse(
+                bound.env.config_spec.cute_tcgen05_bias_matmul_store_detected
+            )
+            bound.env.config_spec.cute_tcgen05_search_enabled = True
+            # And at the codegen walker — forcing the direct-entry
+            # plan key with an fp32 bias must reject at codegen rather
+            # than emit a plan that the runtime validator would then
+            # reject at launch.
+            with self.assertRaisesRegex(
+                exc.BackendUnsupported,
+                "T2 bias-store",
+            ):
+                bound.to_triton_code(cfg)
+
+    def test_tcgen05_pure_clc_scheduler_object_rejects_target2_bias(
+        self,
+    ) -> None:
+        """Pure-CLC scheduler-object surface stays T1-only.
+
+        T2 (bias-store) is also blocked from the pure-CLC path: the
+        diagnostic is narrow-gated to the T1 identity-store envelope.
+        """
+        args = (
+            torch.empty([4096, 2048], device=DEVICE, dtype=torch.bfloat16),
+            torch.empty([2048, 2048], device=DEVICE, dtype=torch.bfloat16),
+            torch.empty([2048], device=DEVICE, dtype=torch.bfloat16),
+        )
+        cfg = _make_tcgen05_role_local_monolithic_seed_config(
+            block_sizes=[256, 256, 128],
+            l2_groupings=[2],
+            pid_type="persistent_interleaved",
+            tcgen05_cluster_m=2,
+            tcgen05_cluster_n=1,
+            tcgen05_ab_stages=3,
+            tcgen05_acc_stages=2,
+            tcgen05_c_stages=2,
+            tcgen05_num_epi_warps=4,
+            **{
+                TCGEN05_LAYOUT_STRATEGY_CONFIG_KEY: (
+                    Tcgen05LayoutStrategy.EXPLICIT_EPI_TILE.value
+                ),
+                TCGEN05_LAYOUT_OVERRIDES_EPI_TILE_M_KEY: 128,
+                TCGEN05_LAYOUT_OVERRIDES_EPI_TILE_N_KEY: 32,
+                TCGEN05_LAYOUT_OVERRIDES_D_STORE_BOX_N_KEY: 32,
+                TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY: True,
+                TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY: True,
+                TCGEN05_DIRECT_ENTRY_PLAN_CONFIG_KEY: True,
+                TCGEN05_PURE_CLC_SCHEDULER_OBJECT_CONFIG_KEY: True,
+            },
+        )
+        with patch_cute_mma_support():
+            bound = cute_matmul_role_local_monolithic_bias_bf16.bind(args)
+            bound.env.config_spec.cute_tcgen05_search_enabled = True
+            with self.assertRaisesRegex(
+                exc.BackendUnsupported,
+                "pure-CLC scheduler object is not validated",
+            ):
+                bound.to_triton_code(cfg)
+
+    def test_tcgen05_direct_entry_plan_target2_runtime_correctness(self) -> None:
+        """Compile + launch the T2 direct-entry path and compare to eager."""
+        from helion._compiler.cute.mma_support import get_cute_mma_support
+
+        if not get_cute_mma_support().tcgen05_f16bf16:
+            self.skipTest("tcgen05 F16/BF16 MMA is not supported on this machine")
+        if not torch.cuda.is_available():
+            self.skipTest("Target 2 runtime correctness requires CUDA")
+
+        torch.manual_seed(0)
+        args = (
+            torch.randn(4096, 2048, device=DEVICE, dtype=torch.bfloat16),
+            torch.randn(2048, 2048, device=DEVICE, dtype=torch.bfloat16),
+            torch.randn(2048, device=DEVICE, dtype=torch.bfloat16),
+        )
+        cfg = _make_tcgen05_role_local_monolithic_seed_config(
+            block_sizes=[256, 256, 128],
+            l2_groupings=[2],
+            pid_type="persistent_interleaved",
+            tcgen05_cluster_m=2,
+            tcgen05_cluster_n=1,
+            tcgen05_ab_stages=3,
+            tcgen05_acc_stages=2,
+            tcgen05_c_stages=2,
+            tcgen05_num_epi_warps=4,
+            **{
+                TCGEN05_LAYOUT_STRATEGY_CONFIG_KEY: (
+                    Tcgen05LayoutStrategy.EXPLICIT_EPI_TILE.value
+                ),
+                TCGEN05_LAYOUT_OVERRIDES_EPI_TILE_M_KEY: 128,
+                TCGEN05_LAYOUT_OVERRIDES_EPI_TILE_N_KEY: 32,
+                TCGEN05_LAYOUT_OVERRIDES_D_STORE_BOX_N_KEY: 32,
+                TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY: True,
+                TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY: True,
+                TCGEN05_DIRECT_ENTRY_PLAN_CONFIG_KEY: True,
+            },
+        )
+        with patch_cute_mma_support():
+            bound = cute_matmul_role_local_monolithic_bias_bf16.bind(args)
+            bound.env.config_spec.cute_tcgen05_search_enabled = True
+            bound.set_config(cfg)
+            out = bound(*args)
+
+        # T2 bias-store + bf16. K=2048 (same as T3) doubles T4/T5's
+        # K=1024 accumulator dynamic range; add the bias separately to
+        # keep the reference numerically stable.
+        expected = (args[0].float() @ args[1].float() + args[2].float()).to(
+            torch.bfloat16
+        )
+        torch.testing.assert_close(out, expected, atol=1.25, rtol=1e-2)
+
+    def test_tcgen05_direct_entry_plan_admits_target6_bias_relu_store(self) -> None:
+        """Target 6 envelope (8192x2048x2048 + bias_relu) reaches the direct entry."""
+        args = (
+            torch.empty([8192, 2048], device=DEVICE, dtype=torch.bfloat16),
+            torch.empty([2048, 2048], device=DEVICE, dtype=torch.bfloat16),
+            torch.empty([2048], device=DEVICE, dtype=torch.bfloat16),
+        )
+        cfg = _make_tcgen05_role_local_monolithic_seed_config(
+            block_sizes=[256, 256, 128],
+            l2_groupings=[2],
+            pid_type="persistent_interleaved",
+            tcgen05_cluster_m=2,
+            tcgen05_cluster_n=1,
+            tcgen05_ab_stages=3,
+            tcgen05_acc_stages=2,
+            tcgen05_c_stages=2,
+            tcgen05_num_epi_warps=4,
+            **{
+                TCGEN05_LAYOUT_STRATEGY_CONFIG_KEY: (
+                    Tcgen05LayoutStrategy.EXPLICIT_EPI_TILE.value
+                ),
+                TCGEN05_LAYOUT_OVERRIDES_EPI_TILE_M_KEY: 128,
+                TCGEN05_LAYOUT_OVERRIDES_EPI_TILE_N_KEY: 32,
+                TCGEN05_LAYOUT_OVERRIDES_D_STORE_BOX_N_KEY: 32,
+                TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY: True,
+                TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY: True,
+                TCGEN05_DIRECT_ENTRY_PLAN_CONFIG_KEY: True,
+            },
+        )
+        with patch_cute_mma_support():
+            bound = cute_matmul_role_local_monolithic_bias_relu_bf16.bind(args)
+            bound.env.config_spec.cute_tcgen05_search_enabled = True
+            code = bound.to_triton_code(cfg)
+        # Bias-relu-store + direct-entry plan should record the T6
+        # direct-entry plan with a positional ``bias_idx`` (resolved
+        # from the FX-arg ``bias_name`` by
+        # ``resolve_cute_plan_arg_positions``) and route through the
+        # runtime-built direct entry (the compiler-emitted entry stays
+        # gated to bk=64).
+        self.assertIn("_helion_cute_direct_entry_plans", code)
+        self.assertIn("tcgen05_target1_direct_entry", code)
+        self.assertIn("'bias_idx'", code)
+        self.assertNotIn("_helion_cute_generated_direct_entry", code)
+        # P1: pin the T6 ABI ordering at codegen time. The runtime
+        # validator and the runtime-built direct-entry source builder
+        # both rely on the resolved indices being ``(0, 1, 2, 3)`` —
+        # lhs, rhs, output, bias. Parse the emitted host attribute and
+        # check the positions directly rather than just confirming the
+        # ``'bias_idx'`` substring is present.
+        import re
+
+        plan_match = re.search(
+            r"_helion_cute_direct_entry_plans\s*=\s*(\[.*?\])\s*\n", code
+        )
+        self.assertIsNotNone(plan_match)
+        # The emitted attribute is a literal Python list of dicts so
+        # ``ast.literal_eval`` can recover the positions for inspection.
+        import ast
+
+        emitted_plans = ast.literal_eval(plan_match.group(1))
+        self.assertEqual(len(emitted_plans), 1)
+        emitted = emitted_plans[0]
+        self.assertEqual(
+            (
+                emitted["lhs_idx"],
+                emitted["rhs_idx"],
+                emitted["d_idx"],
+                emitted["bias_idx"],
+            ),
+            (0, 1, 2, 3),
+        )
+        # T6's validated_shape must match the (8192, 2048, 2048) gate.
+        self.assertEqual(emitted["validated_shape"], [8192, 2048, 2048])
+
+    def test_tcgen05_direct_entry_plan_rejects_target6_shape_with_bk64(
+        self,
+    ) -> None:
+        """T6 shape with bk=64 fails at codegen (T1's bk gate is exclusive)."""
+        args = (
+            torch.empty([8192, 2048], device=DEVICE, dtype=torch.bfloat16),
+            torch.empty([2048, 2048], device=DEVICE, dtype=torch.bfloat16),
+            torch.empty([2048], device=DEVICE, dtype=torch.bfloat16),
+        )
+        cfg = _make_tcgen05_role_local_monolithic_seed_config(
+            block_sizes=[256, 256, 64],
+            l2_groupings=[2],
+            pid_type="persistent_interleaved",
+            tcgen05_cluster_m=2,
+            tcgen05_cluster_n=1,
+            tcgen05_ab_stages=3,
+            tcgen05_acc_stages=2,
+            tcgen05_c_stages=2,
+            tcgen05_num_epi_warps=4,
+            **{
+                TCGEN05_LAYOUT_STRATEGY_CONFIG_KEY: (
+                    Tcgen05LayoutStrategy.EXPLICIT_EPI_TILE.value
+                ),
+                TCGEN05_LAYOUT_OVERRIDES_EPI_TILE_M_KEY: 128,
+                TCGEN05_LAYOUT_OVERRIDES_EPI_TILE_N_KEY: 32,
+                TCGEN05_LAYOUT_OVERRIDES_D_STORE_BOX_N_KEY: 32,
+                TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY: True,
+                TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY: True,
+                TCGEN05_DIRECT_ENTRY_PLAN_CONFIG_KEY: True,
+            },
+        )
+        with patch_cute_mma_support():
+            bound = cute_matmul_role_local_monolithic_bias_relu_bf16.bind(args)
+            bound.env.config_spec.cute_tcgen05_search_enabled = True
+            with self.assertRaisesRegex(
+                exc.BackendUnsupported,
+                # Anchor on the full enumerated tail of the
+                # direct-entry rejection error so the test verifies (a)
+                # the rejection path was hit and (b) the listing tail
+                # is intact, without spuriously matching on a different
+                # envelope's failure path.
+                r"requires the validated T1 identity-store, T2 bias-store, "
+                r"T3 identity-store, T4 relu-store, T5 identity-store, "
+                r"T6 bias-relu-store, or T7 identity-store "
+                r"TVM-FFI flat-role seed",
+            ):
+                bound.to_triton_code(cfg)
+
+    def test_tcgen05_direct_entry_plan_rejects_target6_without_relu(self) -> None:
+        """T6 shape with plain bias (no relu) is rejected (T6 requires relu).
+
+        The kernel at T6 shape but with a bare ``acc + bias[n]`` store
+        does not have an intervening relu, so the T6 envelope's
+        bias-relu walker rejects it. T2's bias-store walker accepts the
+        chain shape but T2's shape gate (4096x2048x2048) keeps it from
+        firing at T6's shape (8192x2048x2048). The direct-entry plan
+        gate therefore rejects this combination at codegen.
+        """
+        args = (
+            torch.empty([8192, 2048], device=DEVICE, dtype=torch.bfloat16),
+            torch.empty([2048, 2048], device=DEVICE, dtype=torch.bfloat16),
+            torch.empty([2048], device=DEVICE, dtype=torch.bfloat16),
+        )
+        cfg = _make_tcgen05_role_local_monolithic_seed_config(
+            block_sizes=[256, 256, 128],
+            l2_groupings=[2],
+            pid_type="persistent_interleaved",
+            tcgen05_cluster_m=2,
+            tcgen05_cluster_n=1,
+            tcgen05_ab_stages=3,
+            tcgen05_acc_stages=2,
+            tcgen05_c_stages=2,
+            tcgen05_num_epi_warps=4,
+            **{
+                TCGEN05_LAYOUT_STRATEGY_CONFIG_KEY: (
+                    Tcgen05LayoutStrategy.EXPLICIT_EPI_TILE.value
+                ),
+                TCGEN05_LAYOUT_OVERRIDES_EPI_TILE_M_KEY: 128,
+                TCGEN05_LAYOUT_OVERRIDES_EPI_TILE_N_KEY: 32,
+                TCGEN05_LAYOUT_OVERRIDES_D_STORE_BOX_N_KEY: 32,
+                TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY: True,
+                TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY: True,
+                TCGEN05_DIRECT_ENTRY_PLAN_CONFIG_KEY: True,
+            },
+        )
+        with patch_cute_mma_support():
+            # Bias-only (no relu) at T6 shape: T6 envelope (bias_relu)
+            # is rejected because there is no relu in the chain; T2
+            # envelope (bias) is rejected because the shape gate
+            # (4096x2048x2048) does not match T6's shape.
+            bound_bias_only = cute_matmul_role_local_monolithic_bias_bf16.bind(args)
+            bound_bias_only.env.config_spec.cute_tcgen05_search_enabled = True
+            with self.assertRaisesRegex(
+                exc.BackendUnsupported,
+                # Anchor on the full enumerated tail of the
+                # direct-entry rejection error so the test verifies (a)
+                # the rejection path was hit and (b) the listing tail
+                # is intact, without spuriously matching on a different
+                # envelope's failure path.
+                r"requires the validated T1 identity-store, T2 bias-store, "
+                r"T3 identity-store, T4 relu-store, T5 identity-store, "
+                r"T6 bias-relu-store, or T7 identity-store "
+                r"TVM-FFI flat-role seed",
+            ):
+                bound_bias_only.to_triton_code(cfg)
+
+    def test_tcgen05_direct_entry_plan_rejects_target6_with_fp32_bias(
+        self,
+    ) -> None:
+        """T6 envelope is gated to bf16 bias tensors.
+
+        Mirrors the cycle-6 P2 review for T2: the runtime validator
+        only admits bf16 bias tensors, so the codegen walker
+        ``_trace_mma_to_single_bias_relu_store_dtype`` and the host
+        detector ``host_function_has_tcgen05_bias_relu_matmul_store_pattern``
+        must reject non-bf16 bias loads. Otherwise an fp32 bias would
+        reach a direct-entry plan and fail only at launch.
+        """
+        args = (
+            torch.empty([8192, 2048], device=DEVICE, dtype=torch.bfloat16),
+            torch.empty([2048, 2048], device=DEVICE, dtype=torch.bfloat16),
+            # fp32 bias — same shape as the bf16 case, different dtype.
+            torch.empty([2048], device=DEVICE, dtype=torch.float32),
+        )
+        cfg = _make_tcgen05_role_local_monolithic_seed_config(
+            block_sizes=[256, 256, 128],
+            l2_groupings=[2],
+            pid_type="persistent_interleaved",
+            tcgen05_cluster_m=2,
+            tcgen05_cluster_n=1,
+            tcgen05_ab_stages=3,
+            tcgen05_acc_stages=2,
+            tcgen05_c_stages=2,
+            tcgen05_num_epi_warps=4,
+            **{
+                TCGEN05_LAYOUT_STRATEGY_CONFIG_KEY: (
+                    Tcgen05LayoutStrategy.EXPLICIT_EPI_TILE.value
+                ),
+                TCGEN05_LAYOUT_OVERRIDES_EPI_TILE_M_KEY: 128,
+                TCGEN05_LAYOUT_OVERRIDES_EPI_TILE_N_KEY: 32,
+                TCGEN05_LAYOUT_OVERRIDES_D_STORE_BOX_N_KEY: 32,
+                TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY: True,
+                TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY: True,
+                TCGEN05_DIRECT_ENTRY_PLAN_CONFIG_KEY: True,
+            },
+        )
+        with patch_cute_mma_support():
+            bound = cute_matmul_role_local_monolithic_bias_relu_bf16.bind(args)
+            # The fp32 bias must not enable the T6 seed at the
+            # detector level — confirm at the autotune surface.
+            self.assertFalse(
+                bound.env.config_spec.cute_tcgen05_bias_relu_matmul_store_detected
+            )
+            bound.env.config_spec.cute_tcgen05_search_enabled = True
+            # And at the codegen walker — forcing the direct-entry
+            # plan key with an fp32 bias must reject at codegen rather
+            # than emit a plan that the runtime validator would then
+            # reject at launch.
+            with self.assertRaisesRegex(
+                exc.BackendUnsupported,
+                # Anchor on the full enumerated tail of the
+                # direct-entry rejection error so the test verifies (a)
+                # the rejection path was hit and (b) the listing tail
+                # is intact, without spuriously matching on a different
+                # envelope's failure path.
+                r"requires the validated T1 identity-store, T2 bias-store, "
+                r"T3 identity-store, T4 relu-store, T5 identity-store, "
+                r"T6 bias-relu-store, or T7 identity-store "
+                r"TVM-FFI flat-role seed",
+            ):
+                bound.to_triton_code(cfg)
+
+    def test_tcgen05_pure_clc_scheduler_object_rejects_target6_bias_relu(
+        self,
+    ) -> None:
+        """Pure-CLC scheduler-object surface stays T1-only.
+
+        T6 (bias-relu-store) is also blocked from the pure-CLC path:
+        the diagnostic is narrow-gated to the T1 identity-store envelope.
+        """
+        args = (
+            torch.empty([8192, 2048], device=DEVICE, dtype=torch.bfloat16),
+            torch.empty([2048, 2048], device=DEVICE, dtype=torch.bfloat16),
+            torch.empty([2048], device=DEVICE, dtype=torch.bfloat16),
+        )
+        cfg = _make_tcgen05_role_local_monolithic_seed_config(
+            block_sizes=[256, 256, 128],
+            l2_groupings=[2],
+            pid_type="persistent_interleaved",
+            tcgen05_cluster_m=2,
+            tcgen05_cluster_n=1,
+            tcgen05_ab_stages=3,
+            tcgen05_acc_stages=2,
+            tcgen05_c_stages=2,
+            tcgen05_num_epi_warps=4,
+            **{
+                TCGEN05_LAYOUT_STRATEGY_CONFIG_KEY: (
+                    Tcgen05LayoutStrategy.EXPLICIT_EPI_TILE.value
+                ),
+                TCGEN05_LAYOUT_OVERRIDES_EPI_TILE_M_KEY: 128,
+                TCGEN05_LAYOUT_OVERRIDES_EPI_TILE_N_KEY: 32,
+                TCGEN05_LAYOUT_OVERRIDES_D_STORE_BOX_N_KEY: 32,
+                TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY: True,
+                TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY: True,
+                TCGEN05_DIRECT_ENTRY_PLAN_CONFIG_KEY: True,
+                TCGEN05_PURE_CLC_SCHEDULER_OBJECT_CONFIG_KEY: True,
+            },
+        )
+        with patch_cute_mma_support():
+            bound = cute_matmul_role_local_monolithic_bias_relu_bf16.bind(args)
+            bound.env.config_spec.cute_tcgen05_search_enabled = True
+            with self.assertRaisesRegex(
+                exc.BackendUnsupported,
+                "pure-CLC scheduler object is not validated",
+            ):
+                bound.to_triton_code(cfg)
+
+    def test_tcgen05_direct_entry_plan_target6_runtime_correctness(self) -> None:
+        """Compile + launch the T6 direct-entry path and compare to eager."""
+        from helion._compiler.cute.mma_support import get_cute_mma_support
+
+        if not get_cute_mma_support().tcgen05_f16bf16:
+            self.skipTest("tcgen05 F16/BF16 MMA is not supported on this machine")
+        if not torch.cuda.is_available():
+            self.skipTest("Target 6 runtime correctness requires CUDA")
+
+        torch.manual_seed(0)
+        args = (
+            torch.randn(8192, 2048, device=DEVICE, dtype=torch.bfloat16),
+            torch.randn(2048, 2048, device=DEVICE, dtype=torch.bfloat16),
+            torch.randn(2048, device=DEVICE, dtype=torch.bfloat16),
+        )
+        cfg = _make_tcgen05_role_local_monolithic_seed_config(
+            block_sizes=[256, 256, 128],
+            l2_groupings=[2],
+            pid_type="persistent_interleaved",
+            tcgen05_cluster_m=2,
+            tcgen05_cluster_n=1,
+            tcgen05_ab_stages=3,
+            tcgen05_acc_stages=2,
+            tcgen05_c_stages=2,
+            tcgen05_num_epi_warps=4,
+            **{
+                TCGEN05_LAYOUT_STRATEGY_CONFIG_KEY: (
+                    Tcgen05LayoutStrategy.EXPLICIT_EPI_TILE.value
+                ),
+                TCGEN05_LAYOUT_OVERRIDES_EPI_TILE_M_KEY: 128,
+                TCGEN05_LAYOUT_OVERRIDES_EPI_TILE_N_KEY: 32,
+                TCGEN05_LAYOUT_OVERRIDES_D_STORE_BOX_N_KEY: 32,
+                TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY: True,
+                TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY: True,
+                TCGEN05_DIRECT_ENTRY_PLAN_CONFIG_KEY: True,
+            },
+        )
+        with patch_cute_mma_support():
+            bound = cute_matmul_role_local_monolithic_bias_relu_bf16.bind(args)
+            bound.env.config_spec.cute_tcgen05_search_enabled = True
+            bound.set_config(cfg)
+            out = bound(*args)
+
+        # T6 bias-relu-store + bf16. The reference computes relu of the
+        # bias-added accumulator in fp32 (matching the kernel's
+        # fp32-accumulator path) and casts down.
+        expected = torch.relu(args[0].float() @ args[1].float() + args[2].float()).to(
+            torch.bfloat16
+        )
+        torch.testing.assert_close(out, expected, atol=1.25, rtol=1e-2)
+
+    def test_tcgen05_direct_entry_plan_admits_target7_identity_store(self) -> None:
+        """Target 7 envelope (2048x8192x2048 + identity) reaches the direct entry."""
+        args = (
+            torch.empty([2048, 2048], device=DEVICE, dtype=torch.bfloat16),
+            torch.empty([2048, 8192], device=DEVICE, dtype=torch.bfloat16),
+        )
+        cfg = _make_tcgen05_role_local_monolithic_seed_config(
+            block_sizes=[256, 256, 128],
+            l2_groupings=[2],
+            pid_type="persistent_interleaved",
+            tcgen05_cluster_m=2,
+            tcgen05_cluster_n=1,
+            tcgen05_ab_stages=3,
+            tcgen05_acc_stages=2,
+            tcgen05_c_stages=2,
+            tcgen05_num_epi_warps=4,
+            **{
+                TCGEN05_LAYOUT_STRATEGY_CONFIG_KEY: (
+                    Tcgen05LayoutStrategy.EXPLICIT_EPI_TILE.value
+                ),
+                TCGEN05_LAYOUT_OVERRIDES_EPI_TILE_M_KEY: 128,
+                TCGEN05_LAYOUT_OVERRIDES_EPI_TILE_N_KEY: 32,
+                TCGEN05_LAYOUT_OVERRIDES_D_STORE_BOX_N_KEY: 32,
+                TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY: True,
+                TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY: True,
+                TCGEN05_DIRECT_ENTRY_PLAN_CONFIG_KEY: True,
+            },
+        )
+        with patch_cute_mma_support():
+            bound = cute_matmul_role_local_monolithic_4096_bf16.bind(args)
+            bound.env.config_spec.cute_tcgen05_search_enabled = True
+            code = bound.to_triton_code(cfg)
+        # Identity-store + direct-entry plan should record the T7
+        # direct-entry plan and route through the runtime-built
+        # direct entry (compiler-emitted entry is gated to bk=64).
+        self.assertIn("_helion_cute_direct_entry_plans", code)
+        self.assertIn("tcgen05_target1_direct_entry", code)
+        self.assertNotIn("_helion_cute_generated_direct_entry", code)
+
+    def test_tcgen05_direct_entry_plan_rejects_target7_shape_with_bk64(
+        self,
+    ) -> None:
+        """T7 shape with bk=64 fails at codegen.
+
+        The T7 envelope predicate pins ``bk`` to its validated block_k
+        so a (T7 shape) + (bk=64) cross-mismatch is rejected at codegen
+        instead of only at the runtime validator.
+        """
+        args = (
+            torch.empty([2048, 2048], device=DEVICE, dtype=torch.bfloat16),
+            torch.empty([2048, 8192], device=DEVICE, dtype=torch.bfloat16),
+        )
+        cfg = _make_tcgen05_role_local_monolithic_seed_config(
+            block_sizes=[256, 256, 64],
+            l2_groupings=[2],
+            pid_type="persistent_interleaved",
+            tcgen05_cluster_m=2,
+            tcgen05_cluster_n=1,
+            tcgen05_ab_stages=3,
+            tcgen05_acc_stages=2,
+            tcgen05_c_stages=2,
+            tcgen05_num_epi_warps=4,
+            **{
+                TCGEN05_LAYOUT_STRATEGY_CONFIG_KEY: (
+                    Tcgen05LayoutStrategy.EXPLICIT_EPI_TILE.value
+                ),
+                TCGEN05_LAYOUT_OVERRIDES_EPI_TILE_M_KEY: 128,
+                TCGEN05_LAYOUT_OVERRIDES_EPI_TILE_N_KEY: 32,
+                TCGEN05_LAYOUT_OVERRIDES_D_STORE_BOX_N_KEY: 32,
+                TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY: True,
+                TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY: True,
+                TCGEN05_DIRECT_ENTRY_PLAN_CONFIG_KEY: True,
+            },
+        )
+        with patch_cute_mma_support():
+            bound = cute_matmul_role_local_monolithic_4096_bf16.bind(args)
+            bound.env.config_spec.cute_tcgen05_search_enabled = True
+            with self.assertRaisesRegex(
+                exc.BackendUnsupported,
+                # Anchor on the full enumerated tail of the
+                # direct-entry rejection error so the test verifies (a)
+                # the rejection path was hit and (b) the listing tail
+                # is intact, without spuriously matching on a different
+                # envelope's failure path.
+                r"requires the validated T1 identity-store, T2 bias-store, "
+                r"T3 identity-store, T4 relu-store, T5 identity-store, "
+                r"T6 bias-relu-store, or T7 identity-store "
+                r"TVM-FFI flat-role seed",
+            ):
+                bound.to_triton_code(cfg)
+
+    def test_tcgen05_direct_entry_plan_rejects_target7_with_relu(self) -> None:
+        """T7 shape with relu store is rejected (T7 envelope requires identity)."""
+        args = (
+            torch.empty([2048, 2048], device=DEVICE, dtype=torch.bfloat16),
+            torch.empty([2048, 8192], device=DEVICE, dtype=torch.bfloat16),
+        )
+        cfg = _make_tcgen05_role_local_monolithic_seed_config(
+            block_sizes=[256, 256, 128],
+            l2_groupings=[2],
+            pid_type="persistent_interleaved",
+            tcgen05_cluster_m=2,
+            tcgen05_cluster_n=1,
+            tcgen05_ab_stages=3,
+            tcgen05_acc_stages=2,
+            tcgen05_c_stages=2,
+            tcgen05_num_epi_warps=4,
+            **{
+                TCGEN05_LAYOUT_STRATEGY_CONFIG_KEY: (
+                    Tcgen05LayoutStrategy.EXPLICIT_EPI_TILE.value
+                ),
+                TCGEN05_LAYOUT_OVERRIDES_EPI_TILE_M_KEY: 128,
+                TCGEN05_LAYOUT_OVERRIDES_EPI_TILE_N_KEY: 32,
+                TCGEN05_LAYOUT_OVERRIDES_D_STORE_BOX_N_KEY: 32,
+                TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY: True,
+                TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY: True,
+                TCGEN05_DIRECT_ENTRY_PLAN_CONFIG_KEY: True,
+            },
+        )
+        with patch_cute_mma_support():
+            # ``cute_matmul_role_local_monolithic_relu_bf16`` has a relu
+            # epilogue; combined with T7 shape (2048x8192x2048) the T7
+            # envelope (identity) and T4 envelope (relu but 8192x1024x1024)
+            # both fail.
+            bound = cute_matmul_role_local_monolithic_relu_bf16.bind(args)
+            bound.env.config_spec.cute_tcgen05_search_enabled = True
+            with self.assertRaisesRegex(
+                exc.BackendUnsupported,
+                # Anchor on the full enumerated tail of the
+                # direct-entry rejection error so the test verifies (a)
+                # the rejection path was hit and (b) the listing tail
+                # is intact, without spuriously matching on a different
+                # envelope's failure path.
+                r"requires the validated T1 identity-store, T2 bias-store, "
+                r"T3 identity-store, T4 relu-store, T5 identity-store, "
+                r"T6 bias-relu-store, or T7 identity-store "
+                r"TVM-FFI flat-role seed",
+            ):
+                bound.to_triton_code(cfg)
+
+    def test_tcgen05_pure_clc_scheduler_object_rejects_target7_identity(
+        self,
+    ) -> None:
+        """Pure-CLC scheduler-object surface stays T1-only.
+
+        T7 (identity-store) is also blocked from the pure-CLC path: the
+        diagnostic is narrow-gated to the T1 identity-store envelope.
+        """
+        args = (
+            torch.empty([2048, 2048], device=DEVICE, dtype=torch.bfloat16),
+            torch.empty([2048, 8192], device=DEVICE, dtype=torch.bfloat16),
+        )
+        cfg = _make_tcgen05_role_local_monolithic_seed_config(
+            block_sizes=[256, 256, 128],
+            l2_groupings=[2],
+            pid_type="persistent_interleaved",
+            tcgen05_cluster_m=2,
+            tcgen05_cluster_n=1,
+            tcgen05_ab_stages=3,
+            tcgen05_acc_stages=2,
+            tcgen05_c_stages=2,
+            tcgen05_num_epi_warps=4,
+            **{
+                TCGEN05_LAYOUT_STRATEGY_CONFIG_KEY: (
+                    Tcgen05LayoutStrategy.EXPLICIT_EPI_TILE.value
+                ),
+                TCGEN05_LAYOUT_OVERRIDES_EPI_TILE_M_KEY: 128,
+                TCGEN05_LAYOUT_OVERRIDES_EPI_TILE_N_KEY: 32,
+                TCGEN05_LAYOUT_OVERRIDES_D_STORE_BOX_N_KEY: 32,
+                TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY: True,
+                TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY: True,
+                TCGEN05_DIRECT_ENTRY_PLAN_CONFIG_KEY: True,
+                TCGEN05_PURE_CLC_SCHEDULER_OBJECT_CONFIG_KEY: True,
+            },
+        )
+        with patch_cute_mma_support():
+            bound = cute_matmul_role_local_monolithic_4096_bf16.bind(args)
+            bound.env.config_spec.cute_tcgen05_search_enabled = True
+            with self.assertRaisesRegex(
+                exc.BackendUnsupported,
+                "pure-CLC scheduler object is not validated",
+            ):
+                bound.to_triton_code(cfg)
+
+    def test_tcgen05_direct_entry_plan_target7_runtime_correctness(self) -> None:
+        """Compile + launch the T7 direct-entry path and compare to eager."""
+        from helion._compiler.cute.mma_support import get_cute_mma_support
+
+        if not get_cute_mma_support().tcgen05_f16bf16:
+            self.skipTest("tcgen05 F16/BF16 MMA is not supported on this machine")
+        if not torch.cuda.is_available():
+            self.skipTest("Target 7 runtime correctness requires CUDA")
+
+        torch.manual_seed(0)
+        args = (
+            torch.randn(2048, 2048, device=DEVICE, dtype=torch.bfloat16),
+            torch.randn(2048, 8192, device=DEVICE, dtype=torch.bfloat16),
+        )
+        cfg = _make_tcgen05_role_local_monolithic_seed_config(
+            block_sizes=[256, 256, 128],
+            l2_groupings=[2],
+            pid_type="persistent_interleaved",
+            tcgen05_cluster_m=2,
+            tcgen05_cluster_n=1,
+            tcgen05_ab_stages=3,
+            tcgen05_acc_stages=2,
+            tcgen05_c_stages=2,
+            tcgen05_num_epi_warps=4,
+            **{
+                TCGEN05_LAYOUT_STRATEGY_CONFIG_KEY: (
+                    Tcgen05LayoutStrategy.EXPLICIT_EPI_TILE.value
+                ),
+                TCGEN05_LAYOUT_OVERRIDES_EPI_TILE_M_KEY: 128,
+                TCGEN05_LAYOUT_OVERRIDES_EPI_TILE_N_KEY: 32,
+                TCGEN05_LAYOUT_OVERRIDES_D_STORE_BOX_N_KEY: 32,
+                TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY: True,
+                TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY: True,
+                TCGEN05_DIRECT_ENTRY_PLAN_CONFIG_KEY: True,
+            },
+        )
+        with patch_cute_mma_support():
+            bound = cute_matmul_role_local_monolithic_4096_bf16.bind(args)
+            bound.env.config_spec.cute_tcgen05_search_enabled = True
+            bound.set_config(cfg)
+            out = bound(*args)
+
+        # Identity store + bf16. K=2048 (same as T3) doubles T4/T5's
+        # K=1024 accumulator dynamic range; bound the tolerance
+        # accordingly using the same atol as T3.
+        expected = (args[0].float() @ args[1].float()).to(torch.bfloat16)
+        torch.testing.assert_close(out, expected, atol=1.25, rtol=1e-2)
 
     def test_tcgen05_pure_clc_scheduler_object_builds_initial_work_tile(self) -> None:
         obj = Tcgen05PureClcSchedulerObject(
@@ -3343,12 +5014,15 @@ class TestCuteLowerings(unittest.TestCase):
                 bound.to_triton_code(cfg)
 
     def test_tcgen05_flat_role_coordinates_rejects_non_guarded_shape(self) -> None:
+        # bk=32 sits outside the validated flat-role envelope (only
+        # ``bk in (64, 128)`` is admitted today). Use a K=32 problem to
+        # keep the kernel shape valid while triggering the bk-based reject.
         args = (
-            torch.empty([256, 128], device=DEVICE, dtype=torch.bfloat16),
-            torch.empty([128, 256], device=DEVICE, dtype=torch.bfloat16),
+            torch.empty([256, 32], device=DEVICE, dtype=torch.bfloat16),
+            torch.empty([32, 256], device=DEVICE, dtype=torch.bfloat16),
         )
         cfg = _make_tcgen05_role_local_monolithic_seed_config(
-            block_sizes=[256, 256, 128],
+            block_sizes=[256, 256, 32],
             l2_groupings=[1],
             pid_type="persistent_interleaved",
             tcgen05_cluster_m=2,

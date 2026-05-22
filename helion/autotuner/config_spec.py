@@ -466,6 +466,30 @@ class ConfigSpec:
         self._cute_tcgen05_config.identity_matmul_store_detected = value
 
     @property
+    def cute_tcgen05_relu_matmul_store_detected(self) -> bool:
+        return self._cute_tcgen05_config.relu_matmul_store_detected
+
+    @cute_tcgen05_relu_matmul_store_detected.setter
+    def cute_tcgen05_relu_matmul_store_detected(self, value: bool) -> None:
+        self._cute_tcgen05_config.relu_matmul_store_detected = value
+
+    @property
+    def cute_tcgen05_bias_matmul_store_detected(self) -> bool:
+        return self._cute_tcgen05_config.bias_matmul_store_detected
+
+    @cute_tcgen05_bias_matmul_store_detected.setter
+    def cute_tcgen05_bias_matmul_store_detected(self, value: bool) -> None:
+        self._cute_tcgen05_config.bias_matmul_store_detected = value
+
+    @property
+    def cute_tcgen05_bias_relu_matmul_store_detected(self) -> bool:
+        return self._cute_tcgen05_config.bias_relu_matmul_store_detected
+
+    @cute_tcgen05_bias_relu_matmul_store_detected.setter
+    def cute_tcgen05_bias_relu_matmul_store_detected(self, value: bool) -> None:
+        self._cute_tcgen05_config.bias_relu_matmul_store_detected = value
+
+    @property
     def _tcgen05_cluster_m_search_choices(self) -> tuple[int, ...] | None:
         return self._cute_tcgen05_config.cluster_m_search_choices
 
@@ -535,6 +559,24 @@ class ConfigSpec:
 
     def allow_tcgen05_target1_tvm_ffi_seed(self) -> None:
         self._cute_tcgen05_config.allow_target1_tvm_ffi_seed()
+
+    def allow_tcgen05_target2_tvm_ffi_seed(self) -> None:
+        self._cute_tcgen05_config.allow_target2_tvm_ffi_seed()
+
+    def allow_tcgen05_target3_tvm_ffi_seed(self) -> None:
+        self._cute_tcgen05_config.allow_target3_tvm_ffi_seed()
+
+    def allow_tcgen05_target4_tvm_ffi_seed(self) -> None:
+        self._cute_tcgen05_config.allow_target4_tvm_ffi_seed()
+
+    def allow_tcgen05_target5_tvm_ffi_seed(self) -> None:
+        self._cute_tcgen05_config.allow_target5_tvm_ffi_seed()
+
+    def allow_tcgen05_target6_tvm_ffi_seed(self) -> None:
+        self._cute_tcgen05_config.allow_target6_tvm_ffi_seed()
+
+    def allow_tcgen05_target7_tvm_ffi_seed(self) -> None:
+        self._cute_tcgen05_config.allow_target7_tvm_ffi_seed()
 
     @staticmethod
     def _tcgen05_cluster_m2_bk_is_valid(
