@@ -87,7 +87,13 @@ def _load_mask_expr(
 
         if isinstance(pattern, TilePattern):
             block_id = pattern.block_id
-            if _tile_needs_mask(state, block_id, tensor, tensor_dim):
+            # Skip masking for size-1 (broadcast) dims: a single element is
+            # always valid, and applying a block-sized mask would broadcast
+            # the dim from 1 to block_size, causing shape mismatches.
+            dim_size = tensor.shape[tensor_dim]
+            if (not isinstance(dim_size, int) or dim_size > 1) and _tile_needs_mask(
+                state, block_id, tensor, tensor_dim
+            ):
                 mask_var = state.codegen.mask_var(block_id)
                 if mask_var is not None:
                     if dtype_str is None:
