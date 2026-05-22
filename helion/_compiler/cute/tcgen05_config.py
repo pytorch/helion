@@ -342,11 +342,8 @@ class CuteTcgen05Config:
             )
 
     def allow_target5_tvm_ffi_seed(self) -> None:
-        # T5 mirrors T4 (same bk, stage tuple, cluster shape) but at the
-        # transposed (1024, 8192, 1024) shape with an identity store
-        # instead of a relu store. The identity-store gate is shared with
-        # the T1 seed; the shape gate below pins it to T5 so a T1 host
-        # function (1024x4096x1024 identity) does not get a T5 seed.
+        # T5 mirrors T4 at the transposed (1024, 8192, 1024) identity-store
+        # shape; the shape fact gate distinguishes it from T1.
         if not self.identity_matmul_store_detected:
             return
         if not self._has_target5_tvm_ffi_matmul_fact():
@@ -365,13 +362,9 @@ class CuteTcgen05Config:
             )
 
     def allow_target3_tvm_ffi_seed(self) -> None:
-        # T3 reuses T4/T5's (bk=128, ab=3, c=2, cluster_m=2, cluster_n=1)
-        # envelope at the larger (2048, 4096, 2048) identity-store shape.
-        # K=2048 yields ``k_tile_count=16`` (equal to T1's 16-at-bk=64;
-        # double T4/T5's 8-at-bk=128), still well below
-        # ``TCGEN05_TWO_CTA_MAX_K_TILES``. The identity-store gate is
-        # shared with the T1/T5 seeds; the shape gate below pins it to
-        # T3 so a T1/T5 host function does not get a T3 seed.
+        # T3 reuses T4/T5's envelope at the larger (2048, 4096, 2048)
+        # identity-store shape; K=2048 -> k_tile_count=16, well below
+        # ``TCGEN05_TWO_CTA_MAX_K_TILES``. Shape fact distinguishes T1/T5.
         if not self.identity_matmul_store_detected:
             return
         if not self._has_target3_tvm_ffi_matmul_fact():
@@ -390,15 +383,9 @@ class CuteTcgen05Config:
             )
 
     def allow_target2_tvm_ffi_seed(self) -> None:
-        # T2 reuses T3/T4/T5's (bk=128, ab=3, c=2, cluster_m=2,
-        # cluster_n=1) envelope at the (4096, 2048, 2048) shape with a
-        # rank-1 trailing-axis (rowvec) bias epilogue. K=2048 yields
-        # ``k_tile_count=16`` (matches T3), still well below
-        # ``TCGEN05_TWO_CTA_MAX_K_TILES``. The bias-store gate is
-        # unique to T2 (mutually exclusive with the identity-store gate
-        # used by T1/T3/T5 and the relu-store gate used by T4); the
-        # shape gate below pins it to T2 so a T6 (8192x2048x2048 +
-        # bias_relu) host function does not get a T2 seed.
+        # T2 reuses T3/T4/T5's envelope at (4096, 2048, 2048) with a
+        # rank-1 rowvec bias epilogue. The bias-store gate is unique to
+        # T2 (mutually exclusive with identity/relu/bias_relu).
         if not self.bias_matmul_store_detected:
             return
         if not self._has_target2_tvm_ffi_matmul_fact():
@@ -417,15 +404,9 @@ class CuteTcgen05Config:
             )
 
     def allow_target6_tvm_ffi_seed(self) -> None:
-        # T6 mirrors T2's (bk=128, ab=3, c=2, cluster_m=2, cluster_n=1)
-        # envelope at the (8192, 2048, 2048) shape with a
-        # ``relu(acc + bias[n])`` (rank-1 trailing-axis bias + relu)
-        # fused epilogue. K=2048 -> ``k_tile_count=16`` (matches
-        # T2/T3), still well below ``TCGEN05_TWO_CTA_MAX_K_TILES``. The
-        # bias-relu-store gate is unique to T6 (mutually exclusive with
-        # identity for T1/T3/T5, relu for T4, and bias for T2); the
-        # shape gate below pins it to T6 so a T2 (4096x2048x2048 +
-        # bias) host function does not get a T6 seed.
+        # T6 mirrors T2's envelope at (8192, 2048, 2048) with a fused
+        # ``relu(acc + bias[n])`` epilogue. The bias-relu-store gate is
+        # unique to T6 (mutually exclusive with identity/relu/bias).
         if not self.bias_relu_matmul_store_detected:
             return
         if not self._has_target6_tvm_ffi_matmul_fact():
@@ -444,14 +425,8 @@ class CuteTcgen05Config:
             )
 
     def allow_target7_tvm_ffi_seed(self) -> None:
-        # T7 mirrors T3/T5's (bk=128, ab=3, c=2, cluster_m=2,
-        # cluster_n=1) envelope at the (2048, 8192, 2048) identity-store
-        # shape. T7 is structurally similar to T5 (1024x8192x1024) with
-        # M and K doubled; K=2048 yields ``k_tile_count=16`` (matches
-        # T2/T3/T6), still well below ``TCGEN05_TWO_CTA_MAX_K_TILES``.
-        # The identity-store gate is shared with the T1/T3/T5 seeds;
-        # the shape gate below pins it to T7 so a T1/T3/T5 host
-        # function does not get a T7 seed.
+        # T7 mirrors T3/T5's envelope at (2048, 8192, 2048) identity-store
+        # shape; shape fact distinguishes it from T1/T3/T5.
         if not self.identity_matmul_store_detected:
             return
         if not self._has_target7_tvm_ffi_matmul_fact():
@@ -901,13 +876,9 @@ class CuteTcgen05Config:
         ):
             return None
         range_count = len(self.config_spec.range_unroll_factors)
-        # ``l2_groupings=[2]`` is the T4 autotune-selected value captured
-        # in cycle 0 (see ``cute_plan.md`` §4 Target 4 row).
-        # ``_is_target4_tvm_ffi_seed_config`` recognizes a config as a T4
-        # seed match (it does not check ``l2_groupings`` directly), and
-        # then ``implicit_default_keys_to_preserve`` keeps this seed
-        # default unless the user explicitly overrides it. Don't change
-        # this without re-measuring the targeted T4 sweep.
+        # ``l2_groupings=[2]`` is the T4 autotune-selected value; keep
+        # ``_is_target4_tvm_ffi_seed_config`` matching and let
+        # ``implicit_default_keys_to_preserve`` retain it across overrides.
         seed_config: dict[str, Any] = {
             "block_sizes": [
                 TCGEN05_TWO_CTA_BLOCK_M,
@@ -984,13 +955,8 @@ class CuteTcgen05Config:
         ):
             return None
         range_count = len(self.config_spec.range_unroll_factors)
-        # T5 mirrors T4's seed knobs at the transposed M/N shape with
-        # identity store. ``l2_groupings=[2]`` is inherited from the
-        # validated T4 row pending a measured T5 sweep that could refine
-        # it. ``_is_target5_tvm_ffi_seed_config`` recognizes a config as a
-        # T5 seed match (it does not check ``l2_groupings`` directly), and
-        # ``implicit_default_keys_to_preserve`` keeps this seed default
-        # unless the user explicitly overrides it.
+        # T5 mirrors T4's seed knobs at the transposed M/N identity-store
+        # shape; ``l2_groupings=[2]`` is inherited pending a T5 sweep.
         seed_config: dict[str, Any] = {
             "block_sizes": [
                 TCGEN05_TWO_CTA_BLOCK_M,
@@ -1037,14 +1003,10 @@ class CuteTcgen05Config:
     def _target2_tvm_ffi_seed_config(self) -> Config | None:
         if not self.target2_tvm_ffi_seed_enabled:
             return None
-        # T2 has a rank-1 trailing-axis (rowvec) bias epilogue, so
-        # ``aux_kernel_detected`` is True; the SIMT-load aux pipeline
-        # for the rowvec broadcast does not require the explicit
-        # ``c_input_warp`` / aux-TMA wiring used by exact-shape rank-2
-        # auxiliary tensors. The bias-store gate (which checks for the
-        # exact ``aten.add.Tensor(carrier, bias_load)`` shape, where
-        # ``bias_load`` reads a rank-1 GMEM tensor) keeps T2 mutually
-        # exclusive with T1/T3/T5 (identity store) and T4 (relu store).
+        # T2's rowvec bias sets ``aux_kernel_detected`` True; the SIMT
+        # aux pipeline doesn't need the c_input_warp/aux-TMA wiring
+        # used by exact-shape rank-2 aux tensors. The bias-store gate
+        # keeps T2 mutually exclusive with identity/relu stores.
         if not self.bias_matmul_store_detected:
             return None
         if not self._has_target2_tvm_ffi_matmul_fact():
@@ -1056,11 +1018,7 @@ class CuteTcgen05Config:
             return None
         if len(self.config_spec.block_sizes) != 3:
             return None
-        # T2 has 4 indexing slots (lhs, rhs, output, bias) vs the 3
-        # slots used by the T1/T3/T4/T5 pure-matmul kernels; the bias
-        # tensor is a closure-lifted aux operand. Accept length 3 (no
-        # closure) or 4 (with bias closure) so the seed fires for the
-        # T2 host function.
+        # Accept indexing length 3 (no closure) or 4 (with bias closure).
         if self.config_spec.indexing.length not in (3, 4):
             return None
         if not self.cluster_m2_bk_is_valid(
@@ -1077,14 +1035,8 @@ class CuteTcgen05Config:
             return None
         range_count = len(self.config_spec.range_unroll_factors)
         # T2 mirrors T3/T4/T5's seed knobs at the (4096, 2048, 2048)
-        # bias-store shape. ``l2_groupings=[2]`` is inherited from the
-        # validated T3/T4/T5 row pending a measured T2 sweep that could
-        # refine it. ``_is_target2_tvm_ffi_seed_config`` recognizes a
-        # config as a T2 seed match (it does not check ``l2_groupings``
-        # directly), and ``implicit_default_keys_to_preserve`` keeps
-        # this seed default unless the user explicitly overrides it.
-        # The 4th indexing slot for the bias tensor takes the same
-        # ``tensor_descriptor`` strategy as the other tensors.
+        # bias-store shape; ``l2_groupings=[2]`` is inherited pending a
+        # T2 sweep. The 4th indexing slot (bias) uses ``tensor_descriptor``.
         indexing_length = self.config_spec.indexing.length
         seed_config: dict[str, Any] = {
             "block_sizes": [
@@ -1128,16 +1080,9 @@ class CuteTcgen05Config:
     def _target6_tvm_ffi_seed_config(self) -> Config | None:
         if not self.target6_tvm_ffi_seed_enabled:
             return None
-        # T6 has a rank-1 trailing-axis (rowvec) bias plus a relu
-        # activation, so ``aux_kernel_detected`` is True (same as T2);
-        # the SIMT-load aux pipeline for the rowvec broadcast does not
-        # require the explicit ``c_input_warp`` / aux-TMA wiring used
-        # by exact-shape rank-2 auxiliary tensors. The bias-relu-store
-        # gate (which checks for the exact
-        # ``aten.relu.default(aten.add.Tensor(carrier, bias_load))``
-        # chain, where ``bias_load`` reads a rank-1 bf16 GMEM tensor)
-        # keeps T6 mutually exclusive with T1/T3/T5 (identity), T4
-        # (relu without bias), and T2 (bias without relu).
+        # T6's rowvec bias + relu sets ``aux_kernel_detected`` True (same
+        # as T2). The bias-relu-store gate keeps T6 mutually exclusive
+        # with identity/relu/bias stores.
         if not self.bias_relu_matmul_store_detected:
             return None
         if not self._has_target6_tvm_ffi_matmul_fact():
@@ -1149,10 +1094,7 @@ class CuteTcgen05Config:
             return None
         if len(self.config_spec.block_sizes) != 3:
             return None
-        # T6 has 4 indexing slots (lhs, rhs, output, bias) just like T2
-        # — the bias is the closure-lifted aux operand. Accept length 3
-        # (no closure) or 4 (with bias closure) so the seed fires for
-        # the T6 host function.
+        # Accept indexing length 3 (no closure) or 4 (with bias closure).
         if self.config_spec.indexing.length not in (3, 4):
             return None
         if not self.cluster_m2_bk_is_valid(
@@ -1169,15 +1111,8 @@ class CuteTcgen05Config:
             return None
         range_count = len(self.config_spec.range_unroll_factors)
         # T6 mirrors T2/T3/T4/T5's seed knobs at the (8192, 2048, 2048)
-        # bias-relu-store shape. ``l2_groupings=[2]`` is inherited from
-        # the validated T2/T3/T4/T5 row pending a measured T6 sweep
-        # that could refine it. ``_is_target6_tvm_ffi_seed_config``
-        # recognizes a config as a T6 seed match (it does not check
-        # ``l2_groupings`` directly), and
-        # ``implicit_default_keys_to_preserve`` keeps this seed default
-        # unless the user explicitly overrides it. The 4th indexing
-        # slot for the bias tensor takes the same ``tensor_descriptor``
-        # strategy as the other tensors.
+        # bias-relu-store shape; ``l2_groupings=[2]`` is inherited pending
+        # a T6 sweep. The 4th indexing slot (bias) uses ``tensor_descriptor``.
         indexing_length = self.config_spec.indexing.length
         seed_config: dict[str, Any] = {
             "block_sizes": [
@@ -1252,12 +1187,8 @@ class CuteTcgen05Config:
             return None
         range_count = len(self.config_spec.range_unroll_factors)
         # T3 mirrors T4/T5's seed knobs at the larger 2048x4096x2048
-        # identity-store shape. ``l2_groupings=[2]`` is inherited from
-        # the validated T4/T5 row pending a measured T3 sweep that could
-        # refine it. ``_is_target3_tvm_ffi_seed_config`` recognizes a
-        # config as a T3 seed match (it does not check ``l2_groupings``
-        # directly), and ``implicit_default_keys_to_preserve`` keeps
-        # this seed default unless the user explicitly overrides it.
+        # identity-store shape; ``l2_groupings=[2]`` is inherited pending
+        # a T3 sweep.
         seed_config: dict[str, Any] = {
             "block_sizes": [
                 TCGEN05_TWO_CTA_BLOCK_M,
@@ -1335,12 +1266,8 @@ class CuteTcgen05Config:
             return None
         range_count = len(self.config_spec.range_unroll_factors)
         # T7 mirrors T3/T4/T5's seed knobs at the larger 2048x8192x2048
-        # identity-store shape. ``l2_groupings=[2]`` is inherited from
-        # the validated T3/T4/T5 row pending a measured T7 sweep that
-        # could refine it. ``_is_target7_tvm_ffi_seed_config`` recognizes
-        # a config as a T7 seed match (it does not check ``l2_groupings``
-        # directly), and ``implicit_default_keys_to_preserve`` keeps
-        # this seed default unless the user explicitly overrides it.
+        # identity-store shape; ``l2_groupings=[2]`` is inherited pending
+        # a T7 sweep.
         seed_config: dict[str, Any] = {
             "block_sizes": [
                 TCGEN05_TWO_CTA_BLOCK_M,
@@ -1731,12 +1658,7 @@ class CuteTcgen05Config:
 
     @staticmethod
     def _is_target5_tvm_ffi_seed_config(config: dict[str, object]) -> bool:
-        # T5 shares all stage/cluster/layout knobs with T4 because they
-        # only differ in the matmul shape (which is shape-fact gated
-        # separately) and the epilogue store kind. The block_sizes /
-        # stages / cluster / layout overrides are identical, so this
-        # method returns the same shape as ``_is_target4_tvm_ffi_seed_config``
-        # at the bk=128 stage tuple. T1's bk=64 still distinguishes it.
+        # T5 mirrors T4 at the bk=128 stage tuple (shape gated upstream).
         return (
             config.get(TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY) is True
             and config.get(TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY) is True
@@ -1759,15 +1681,8 @@ class CuteTcgen05Config:
 
     @staticmethod
     def _is_target2_tvm_ffi_seed_config(config: dict[str, object]) -> bool:
-        # T2 shares all stage/cluster/layout knobs with T3/T4/T5 because
-        # they only differ in matmul shape (shape-fact gated) and
-        # epilogue store kind. T2 uses ``acc + bias[n]`` (rank-1
-        # trailing-axis broadcast), distinguished from T1/T3/T5
-        # (identity) and T4 (relu) by the bias-store detector upstream.
-        # block_sizes / stages / cluster / layout overrides are identical
-        # to T3/T4/T5 at the bk=128 stage tuple; the shape gate happens
-        # upstream in ``_target2_tvm_ffi_seed_config``. T1's bk=64 still
-        # distinguishes it from T2.
+        # T2 mirrors T3/T4/T5 at the bk=128 stage tuple; the bias-store
+        # gate happens upstream in ``_target2_tvm_ffi_seed_config``.
         return (
             config.get(TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY) is True
             and config.get(TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY) is True
@@ -1790,13 +1705,8 @@ class CuteTcgen05Config:
 
     @staticmethod
     def _is_target3_tvm_ffi_seed_config(config: dict[str, object]) -> bool:
-        # T3 shares all stage/cluster/layout knobs with T4/T5 because they
-        # only differ in matmul shape (shape-fact gated) and epilogue
-        # store kind. T3 uses identity store, same as T5. block_sizes /
-        # stages / cluster / layout overrides are identical to T4/T5 at
-        # the bk=128 stage tuple; the shape gate happens upstream in
-        # ``_target3_tvm_ffi_seed_config``. T1's bk=64 still
-        # distinguishes it from T3.
+        # T3 mirrors T4/T5 at the bk=128 stage tuple; the identity-store
+        # gate happens upstream in ``_target3_tvm_ffi_seed_config``.
         return (
             config.get(TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY) is True
             and config.get(TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY) is True
@@ -1819,16 +1729,8 @@ class CuteTcgen05Config:
 
     @staticmethod
     def _is_target6_tvm_ffi_seed_config(config: dict[str, object]) -> bool:
-        # T6 shares all stage/cluster/layout knobs with T2/T3/T4/T5 because
-        # they only differ in matmul shape (shape-fact gated) and
-        # epilogue store kind. T6 uses ``relu(acc + bias[n])``,
-        # distinguished upstream from T1/T3/T5 (identity), T4 (relu
-        # without bias), and T2 (bias without relu) by the
-        # bias-relu-store detector. block_sizes / stages / cluster /
-        # layout overrides are identical to T2/T3/T4/T5 at the bk=128
-        # stage tuple; the shape gate happens upstream in
-        # ``_target6_tvm_ffi_seed_config``. T1's bk=64 still
-        # distinguishes it from T6.
+        # T6 mirrors T2/T3/T4/T5 at the bk=128 stage tuple; the
+        # bias-relu-store gate happens upstream.
         return (
             config.get(TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY) is True
             and config.get(TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY) is True
@@ -1851,15 +1753,8 @@ class CuteTcgen05Config:
 
     @staticmethod
     def _is_target7_tvm_ffi_seed_config(config: dict[str, object]) -> bool:
-        # T7 shares all stage/cluster/layout knobs with T3/T4/T5 because
-        # they only differ in matmul shape (shape-fact gated) and
-        # epilogue store kind. T7 uses identity store, same as T3/T5
-        # (and T1 at bk=64), distinguished upstream by the per-target
-        # shape gate. block_sizes / stages / cluster / layout overrides
-        # are identical to T3/T4/T5/T6 at the bk=128 stage tuple; the
-        # shape gate happens upstream in
-        # ``_target7_tvm_ffi_seed_config``. T1's bk=64 still
-        # distinguishes it from T7.
+        # T7 mirrors T3/T4/T5/T6 at the bk=128 stage tuple; the
+        # identity-store gate happens upstream.
         return (
             config.get(TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY) is True
             and config.get(TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY) is True
@@ -2355,16 +2250,10 @@ class CuteTcgen05Config:
                 fragments[TCGEN05_PURE_CLC_SCHEDULER_OBJECT_CONFIG_KEY] = (
                     BooleanFragment()
                 )
-                # Cycle-16 H3 Option B (staged): admit the pure-dynamic
-                # scheduler-object key into the validation surface so user
-                # configs that set it cleanly round-trip through normalize.
-                # The autotune search surface (``flat_fields`` -> ``optional_
-                # fragments(for_search=True)``) intentionally excludes the
-                # key because the productive codegen has not landed; an
-                # autotuner that admits the knob would lose every config
-                # that selects it to the cycle-16 BackendUnsupported gate.
-                # Cycle 17 will move this into the ``for_search`` branch
-                # once the productive emission lands.
+                # Pure-dynamic scheduler-object key is in the validation
+                # surface only — user configs that set it round-trip through
+                # normalize, but the autotune ``for_search`` surface excludes
+                # it until the productive codegen lands.
                 fragments[TCGEN05_PURE_DYNAMIC_SCHEDULER_OBJECT_CONFIG_KEY] = (
                     BooleanFragment()
                 )
@@ -2395,16 +2284,10 @@ class CuteTcgen05Config:
                 config.pop(key, None)
 
     def _fix_target1_tvm_ffi_search_config(self, config: dict[str, object]) -> None:
-        # T1, T2, T3, T4, T5, T6, and T7 share the TVM-FFI direct-entry
-        # promotion surface; prefer the seed matching the detected
-        # store family + shape so search candidates project onto the
-        # right shape envelope. Each shape gate
-        # (T1=identity@1024x4096x1024, T2=bias@4096x2048x2048,
-        # T3=identity@2048x4096x2048, T4=relu@8192x1024x1024,
-        # T5=identity@1024x8192x1024, T6=bias_relu@8192x2048x2048,
-        # T7=identity@2048x8192x2048) is mutually exclusive on the
-        # matmul fact + store kind, so at most one seed is non-``None``
-        # at a time.
+        # T1-T7 share the TVM-FFI direct-entry promotion surface; pick
+        # the seed matching the detected (shape, store) so search
+        # candidates project onto the right envelope. The shape+store
+        # gates are mutually exclusive so at most one seed is non-None.
         seed = self._target1_tvm_ffi_seed_config()
         if seed is None:
             seed = self._target2_tvm_ffi_seed_config()
@@ -2470,19 +2353,12 @@ class CuteTcgen05Config:
         }
 
     def aux_stages_autotune_fragments(self) -> dict[str, ConfigSpecFragment]:
-        """Per-config aux-pipeline stage-count knob (cycle 10 hypothesis 1
-        for Target 8 ``cute_plan.md`` §6).
+        """Per-config aux-pipeline stage-count knob.
 
-        Cycle 10 admits ``tcgen05_aux_stages`` into autotune search only
-        for the T8 wide-N CLC + aux-TMA seed family. The same gate that
-        admits the aux-TMA load mode (``_aux_tma_search_enabled``)
-        controls this knob — that gate already pins the surface to the
-        validated edge+K-tail family with ``cluster_m=2`` and the
-        c-input warp + aux-TMA combination, which is where the cycle-9
-        NCU diagnosis localized the T8 in-kernel stall budget. T1-T7
-        configs (no aux-TMA admission, no edge+K-tail family) never see
-        the knob, so their codegen stays byte-identical to pre-cycle-10
-        emission at the default of 2.
+        Admitted only under ``_aux_tma_search_enabled``, which pins the
+        surface to the validated edge+K-tail family with ``cluster_m=2``
+        and the c-input warp + aux-TMA combination. Configs outside that
+        gate never see the knob; codegen at the default of 2 is unchanged.
         """
         if not self._aux_tma_search_enabled():
             return {}
@@ -2491,33 +2367,14 @@ class CuteTcgen05Config:
         }
 
     def consumer_regs_autotune_fragments(self) -> dict[str, ConfigSpecFragment]:
-        """Per-config consumer-warp ``setmaxregister_increase`` ceiling
-        knob (cycle 15 hypothesis 2 for Target 8 ``cute_plan.md`` §6).
-
-        The cycle-13 Deep Replan flagged the consumer-warp register
-        envelope (255 regs/thread on Helion vs 199 on Quack) as the
-        dominant in-kernel structural delta on Target 8. Cycle 14
-        attempted a source-level rmem-allocation fold (H1) and the
-        NCU register count stayed at 255 — ``ptxas`` does its own
-        register allocation independent of source-level SSA names.
-        Cycle 15 attacks the same envelope through the ``ptxas``-
-        visible ``setmaxregister_increase`` ceiling instead: lowering
-        it from 256 forces ``ptxas`` to either coalesce live ranges
-        or spill, both of which can free SM occupancy headroom (the
-        cycle-9 NCU baseline measured ``warps_active=11.44%``).
+        """Per-config consumer-warp ``setmaxregister_increase`` ceiling knob.
 
         Admission mirrors ``aux_stages_autotune_fragments``: the
-        ``_aux_tma_search_enabled`` gate pins the search to the
-        validated T8 wide-N CLC + aux-TMA seed family with the
-        c-input warp + aux-TMA combination, which is exactly where
-        the register-pressure delta lives. T1-T7 configs (no aux-TMA
-        admission) never see the knob, so their codegen stays
-        byte-identical to pre-cycle-15 emission at the 256 default.
-        The default value (256) is included in
-        ``TCGEN05_CONSUMER_REGS_CHOICES`` so the default-with-knob
-        configuration emits the same code as the default-without-knob
-        configuration (zero codegen drift if the autotuner happens
-        to pick 256).
+        ``_aux_tma_search_enabled`` gate pins the search to the validated
+        wide-N CLC + aux-TMA seed family with the c-input warp + aux-TMA
+        combination. Configs outside that gate never see the knob. The
+        default value (256) is included in ``TCGEN05_CONSUMER_REGS_CHOICES``
+        so default-with-knob emits the same code as default-without-knob.
         """
         if not self._aux_tma_search_enabled():
             return {}

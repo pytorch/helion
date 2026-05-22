@@ -31,14 +31,6 @@ class LayoutTag(enum.Enum):
     IDENTITY = "identity"
 
 
-class MatmulAxisRole(enum.Enum):
-    """Semantic role of a logical matmul axis."""
-
-    M = "m"
-    N = "n"
-    K = "k"
-
-
 class MatmulExecutionKind(enum.Enum):
     """Planner-selected CuTe execution scheme for a matmul node."""
 
@@ -84,9 +76,6 @@ class CuTeGridExecutionPlan:
     scoped_block_ids: frozenset[int]
     block_axis_priority: dict[int, int]
     disable_reduction_axis_reservation_for: frozenset[int]
-
-    def applies_to_block(self, block_id: int) -> bool:
-        return block_id in self.scoped_block_ids
 
     def applies_to_any_block(self, block_ids: tuple[int, ...] | list[int]) -> bool:
         return any(block_id in self.scoped_block_ids for block_id in block_ids)
@@ -268,7 +257,3 @@ class LayoutConstraint:
     def primary_layout(self) -> ThreadLayout | None:
         """Return the node's main resolved layout for logging/debugging."""
         return self.input_layout or self.output_layout
-
-    def primary_preferred_layout(self) -> ThreadLayout | None:
-        """Return the node's main preferred layout for logging/debugging."""
-        return self.preferred_input or self.preferred_output

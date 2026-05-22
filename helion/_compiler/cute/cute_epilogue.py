@@ -756,12 +756,8 @@ def _carrier_tile_index_nodes(
             shape_arg = init.args[0] if init.args else None
             if not isinstance(shape_arg, (list, tuple)):
                 return None
-            nodes: list[torch.fx.Node] = []
-            for entry in shape_arg:
-                if not isinstance(entry, torch.fx.Node):
-                    return None
-                nodes.append(entry)
-            return tuple(nodes)
+            nodes = tuple(e for e in shape_arg if isinstance(e, torch.fx.Node))
+            return nodes if len(nodes) == len(shape_arg) else None
         if target is _tracing_ops._new_var or target is operator.getitem:
             arg = cur.args[0] if cur.args else None
             if not isinstance(arg, torch.fx.Node):

@@ -342,7 +342,6 @@ def _emit_cute_grouped_sum_reduction_shared_two_stage(
     cg: CodegenInterface,
     input_name: str,
     *,
-    value_dtype: torch.dtype,
     identity_expr: str,
     lane_var: str,
     lane_in_group_var: str,
@@ -365,7 +364,6 @@ def _emit_cute_grouped_sum_reduction_shared_tree(
     cg: CodegenInterface,
     input_name: str,
     *,
-    value_dtype: torch.dtype,
     identity_expr: str,
     lane_var: str,
     lane_in_group_var: str,
@@ -476,7 +474,6 @@ def _emit_cute_grouped_sum_reduction(
         return _emit_cute_grouped_sum_reduction_shared_two_stage(
             cg,
             input_name,
-            value_dtype=value_dtype,
             identity_expr=identity_expr,
             lane_var=lane_var,
             lane_in_group_var=lane_in_group_var,
@@ -488,7 +485,6 @@ def _emit_cute_grouped_sum_reduction(
     return _emit_cute_grouped_sum_reduction_shared_tree(
         cg,
         input_name,
-        value_dtype=value_dtype,
         identity_expr=identity_expr,
         lane_var=lane_var,
         lane_in_group_var=lane_in_group_var,
@@ -761,31 +757,20 @@ def _emit_cute_matmul(
                 zero_init = "0"
             statements_stack = getattr(cg, "statements_stack", None)
             if isinstance(statements_stack, list) and len(statements_stack) >= 2:
-                if (
-                    dot_acc_base is not None
-                    and base_acc_source is not None
-                    and capture_base_outside_lane
-                ):
-                    statements_stack[-2].append(
-                        statement_from_string(
-                            f"{dot_acc_base} = {{acc}}", acc=base_acc_source
-                        )
-                    )
-                statements_stack[-2].append(
-                    statement_from_string(f"{dot_acc} = {zero_init}")
-                )
+                emit = statements_stack[-2].append
             else:
-                if (
-                    dot_acc_base is not None
-                    and base_acc_source is not None
-                    and capture_base_outside_lane
-                ):
-                    cg.add_statement(
-                        statement_from_string(
-                            f"{dot_acc_base} = {{acc}}", acc=base_acc_source
-                        )
+                emit = cg.add_statement
+            if (
+                dot_acc_base is not None
+                and base_acc_source is not None
+                and capture_base_outside_lane
+            ):
+                emit(
+                    statement_from_string(
+                        f"{dot_acc_base} = {{acc}}", acc=base_acc_source
                     )
-                cg.add_statement(f"{dot_acc} = {zero_init}")
+                )
+            emit(statement_from_string(f"{dot_acc} = {zero_init}"))
             if (
                 dot_acc_base is not None
                 and base_acc_source is not None

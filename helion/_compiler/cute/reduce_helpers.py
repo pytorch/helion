@@ -131,6 +131,14 @@ def _cute_grouped_reduce_warp_prod(
     return selected
 
 
+_WARP_DISPATCH = {
+    "sum": _cute_grouped_reduce_warp_sum,
+    "max": _cute_grouped_reduce_warp_max,
+    "min": _cute_grouped_reduce_warp_min,
+    "prod": _cute_grouped_reduce_warp_prod,
+}
+
+
 def _cute_grouped_reduce_warp(
     input_value: cute.Numeric,
     reduction_type: str,
@@ -140,39 +148,10 @@ def _cute_grouped_reduce_warp(
     pre: int,
     group_span: int,
 ) -> cute.Numeric:
-    if reduction_type == "sum":
-        return _cute_grouped_reduce_warp_sum(
-            input_value,
-            identity,
-            lane_expr,
-            pre=pre,
-            group_span=group_span,
-        )
-    if reduction_type == "max":
-        return _cute_grouped_reduce_warp_max(
-            input_value,
-            identity,
-            lane_expr,
-            pre=pre,
-            group_span=group_span,
-        )
-    if reduction_type == "min":
-        return _cute_grouped_reduce_warp_min(
-            input_value,
-            identity,
-            lane_expr,
-            pre=pre,
-            group_span=group_span,
-        )
-    if reduction_type == "prod":
-        return _cute_grouped_reduce_warp_prod(
-            input_value,
-            identity,
-            lane_expr,
-            pre=pre,
-            group_span=group_span,
-        )
-    raise ValueError(f"unsupported CuTe reduction type: {reduction_type!r}")
+    impl = _WARP_DISPATCH.get(reduction_type)
+    if impl is None:
+        raise ValueError(f"unsupported CuTe reduction type: {reduction_type!r}")
+    return impl(input_value, identity, lane_expr, pre=pre, group_span=group_span)
 
 
 @cute.jit
@@ -363,6 +342,14 @@ def _cute_grouped_reduce_shared_two_stage_prod(
     return smem[results_base + lane_mod_pre_var]
 
 
+_TWO_STAGE_DISPATCH = {
+    "sum": _cute_grouped_reduce_shared_two_stage_sum,
+    "max": _cute_grouped_reduce_shared_two_stage_max,
+    "min": _cute_grouped_reduce_shared_two_stage_min,
+    "prod": _cute_grouped_reduce_shared_two_stage_prod,
+}
+
+
 def _cute_grouped_reduce_shared_two_stage(
     input_value: cute.Numeric,
     reduction_type: str,
@@ -375,51 +362,19 @@ def _cute_grouped_reduce_shared_two_stage(
     group_span: int,
     group_count: int,
 ) -> cute.Numeric:
-    if reduction_type == "sum":
-        return _cute_grouped_reduce_shared_two_stage_sum(
-            input_value,
-            identity,
-            lane_var,
-            lane_in_group_var,
-            lane_mod_pre_var,
-            pre=pre,
-            group_span=group_span,
-            group_count=group_count,
-        )
-    if reduction_type == "max":
-        return _cute_grouped_reduce_shared_two_stage_max(
-            input_value,
-            identity,
-            lane_var,
-            lane_in_group_var,
-            lane_mod_pre_var,
-            pre=pre,
-            group_span=group_span,
-            group_count=group_count,
-        )
-    if reduction_type == "min":
-        return _cute_grouped_reduce_shared_two_stage_min(
-            input_value,
-            identity,
-            lane_var,
-            lane_in_group_var,
-            lane_mod_pre_var,
-            pre=pre,
-            group_span=group_span,
-            group_count=group_count,
-        )
-    if reduction_type == "prod":
-        return _cute_grouped_reduce_shared_two_stage_prod(
-            input_value,
-            identity,
-            lane_var,
-            lane_in_group_var,
-            lane_mod_pre_var,
-            pre=pre,
-            group_span=group_span,
-            group_count=group_count,
-        )
-    raise ValueError(f"unsupported CuTe reduction type: {reduction_type!r}")
+    impl = _TWO_STAGE_DISPATCH.get(reduction_type)
+    if impl is None:
+        raise ValueError(f"unsupported CuTe reduction type: {reduction_type!r}")
+    return impl(
+        input_value,
+        identity,
+        lane_var,
+        lane_in_group_var,
+        lane_mod_pre_var,
+        pre=pre,
+        group_span=group_span,
+        group_count=group_count,
+    )
 
 
 @cute.jit
@@ -594,6 +549,14 @@ def _cute_grouped_reduce_shared_tree_prod(
     return smem[result_base + lane_mod_pre_var]
 
 
+_TREE_DISPATCH = {
+    "sum": _cute_grouped_reduce_shared_tree_sum,
+    "max": _cute_grouped_reduce_shared_tree_max,
+    "min": _cute_grouped_reduce_shared_tree_min,
+    "prod": _cute_grouped_reduce_shared_tree_prod,
+}
+
+
 def _cute_grouped_reduce_shared_tree(
     input_value: cute.Numeric,
     reduction_type: str,
@@ -607,55 +570,20 @@ def _cute_grouped_reduce_shared_tree(
     num_threads: int,
     group_count: int,
 ) -> cute.Numeric:
-    if reduction_type == "sum":
-        return _cute_grouped_reduce_shared_tree_sum(
-            input_value,
-            identity,
-            lane_var,
-            lane_in_group_var,
-            lane_mod_pre_var,
-            pre=pre,
-            group_span=group_span,
-            num_threads=num_threads,
-            group_count=group_count,
-        )
-    if reduction_type == "max":
-        return _cute_grouped_reduce_shared_tree_max(
-            input_value,
-            identity,
-            lane_var,
-            lane_in_group_var,
-            lane_mod_pre_var,
-            pre=pre,
-            group_span=group_span,
-            num_threads=num_threads,
-            group_count=group_count,
-        )
-    if reduction_type == "min":
-        return _cute_grouped_reduce_shared_tree_min(
-            input_value,
-            identity,
-            lane_var,
-            lane_in_group_var,
-            lane_mod_pre_var,
-            pre=pre,
-            group_span=group_span,
-            num_threads=num_threads,
-            group_count=group_count,
-        )
-    if reduction_type == "prod":
-        return _cute_grouped_reduce_shared_tree_prod(
-            input_value,
-            identity,
-            lane_var,
-            lane_in_group_var,
-            lane_mod_pre_var,
-            pre=pre,
-            group_span=group_span,
-            num_threads=num_threads,
-            group_count=group_count,
-        )
-    raise ValueError(f"unsupported CuTe reduction type: {reduction_type!r}")
+    impl = _TREE_DISPATCH.get(reduction_type)
+    if impl is None:
+        raise ValueError(f"unsupported CuTe reduction type: {reduction_type!r}")
+    return impl(
+        input_value,
+        identity,
+        lane_var,
+        lane_in_group_var,
+        lane_mod_pre_var,
+        pre=pre,
+        group_span=group_span,
+        num_threads=num_threads,
+        group_count=group_count,
+    )
 
 
 @cute.jit
@@ -730,6 +658,12 @@ def _cute_argmin_index_impl(
     return best_index
 
 
+_ARGREDUCE_DISPATCH = {
+    "argmax": _cute_argmax_index_impl,
+    "argmin": _cute_argmin_index_impl,
+}
+
+
 def _cute_argreduce_index(
     smem: cute.Tensor,
     valid_smem: cute.Tensor,
@@ -739,23 +673,10 @@ def _cute_argreduce_index(
     extent: int,
     reduction_type: str,
 ) -> cutlass.Int64:
-    if reduction_type == "argmax":
-        return _cute_argmax_index_impl(
-            smem,
-            valid_smem,
-            start_idx,
-            stride,
-            extent=extent,
-        )
-    if reduction_type == "argmin":
-        return _cute_argmin_index_impl(
-            smem,
-            valid_smem,
-            start_idx,
-            stride,
-            extent=extent,
-        )
-    raise ValueError(f"unsupported CuTe argreduce type: {reduction_type!r}")
+    impl = _ARGREDUCE_DISPATCH.get(reduction_type)
+    if impl is None:
+        raise ValueError(f"unsupported CuTe argreduce type: {reduction_type!r}")
+    return impl(smem, valid_smem, start_idx, stride, extent=extent)
 
 
 # Per-thread V-fold helpers for vectorized loads.  Used by the looped

@@ -48,6 +48,16 @@ def _cute_static_int_extent(size: object) -> int | None:
         return None
 
 
+def _cute_hinted_int(value: object) -> int | None:
+    if value is None:
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, torch.SymInt) and CompileEnvironment.has_current():
+        return CompileEnvironment.current().size_hint(value)
+    return None
+
+
 def _cute_mask_to_preserves_k_invariance(node: torch.fx.Node, k_dim: int) -> bool:
     source = node.args[0] if node.args else None
     if not isinstance(source, torch.fx.Node):
@@ -176,14 +186,9 @@ def cute_static_serial_matmul_k_extent(
             return extent
         if not CompileEnvironment.has_current():
             return None
-        env = CompileEnvironment.current()
-        if not env.settings.static_shapes:
+        if not CompileEnvironment.current().settings.static_shapes:
             return None
-        size_hint = getattr(env, "size_hint", None)
-        if not callable(size_hint):
-            return None
-        hinted_size = size_hint(size)
-        return hinted_size if isinstance(hinted_size, int) else None
+        return _cute_hinted_int(size)
 
     if lhs_node is None or rhs_node is None:
         return None
@@ -230,18 +235,6 @@ def emit_cute_serial_scalar_mm_from_loads(
             return grid_state.strategy.mask_var(block_id)
         return None
 
-    def hinted_int(value: object) -> int | None:
-        if value is None:
-            return None
-        if isinstance(value, int):
-            return value
-        size_hint = getattr(CompileEnvironment.current(), "size_hint", None)
-        if callable(size_hint):
-            hinted = size_hint(value)
-            if isinstance(hinted, int):
-                return hinted
-        return None
-
     def add_offset(index_expr: str, offset: int) -> str:
         if offset == 0:
             return index_expr
@@ -279,7 +272,9 @@ def emit_cute_serial_scalar_mm_from_loads(
     rhs_tensor, rhs_dtype = rhs_info
     rhs_val = rhs_node.meta.get("val")
     n_extent = (
-        hinted_int(rhs_val.shape[1]) if isinstance(rhs_val, torch.Tensor) else None
+        _cute_hinted_int(rhs_val.shape[1])
+        if isinstance(rhs_val, torch.Tensor)
+        else None
     )
     load_plan = analyze_direct_grouped_n_loads(
         lhs_node,
@@ -289,9 +284,6 @@ def emit_cute_serial_scalar_mm_from_loads(
     )
     if load_plan is None:
         return None
-    lhs_k_offset_int = load_plan.lhs_k_offset
-    rhs_k_offset_int = load_plan.rhs_k_offset
-    rhs_n_offset_int = load_plan.rhs_n_offset
 
     m_block_id = cute_resolve_active_block_id(ctx.cg, lhs_node.meta["val"].shape[0])
     n_block_id = cute_resolve_active_block_id(ctx.cg, rhs_node.meta["val"].shape[-1])
@@ -301,8 +293,6 @@ def emit_cute_serial_scalar_mm_from_loads(
     n_index = active_index_var(n_block_id)
     if m_index is None or n_index is None:
         return None
-    m_index_str = m_index
-    n_index_str = n_index
     m_mask = active_mask_var(m_block_id)
     n_mask = active_mask_var(n_block_id)
     reduction_dtype = out_dtype
@@ -338,15 +328,15 @@ def emit_cute_serial_scalar_mm_from_loads(
     def term_at(k_expr: str) -> ast.AST:
         lhs_value = masked_scalar_load(
             lhs_tensor,
-            m_index_str,
-            add_offset(k_expr, lhs_k_offset_int),
+            m_index,
+            add_offset(k_expr, load_plan.lhs_k_offset),
             source_dtype=lhs_dtype,
             mask_expr=m_mask,
         )
         rhs_value = masked_scalar_load(
             rhs_tensor,
-            add_offset(k_expr, rhs_k_offset_int),
-            add_offset(n_index_str, rhs_n_offset_int),
+            add_offset(k_expr, load_plan.rhs_k_offset),
+            add_offset(n_index, load_plan.rhs_n_offset),
             source_dtype=rhs_dtype,
             mask_expr=n_mask,
         )
@@ -385,18 +375,6 @@ def analyze_direct_grouped_n_loads(
             and index.step is None
         )
 
-    def hinted_int(value: object) -> int | None:
-        if value is None:
-            return None
-        if isinstance(value, int):
-            return value
-        size_hint = getattr(CompileEnvironment.current(), "size_hint", None)
-        if callable(size_hint):
-            hinted = size_hint(value)
-            if isinstance(hinted, int):
-                return hinted
-        return None
-
     def contiguous_index_offset(
         index: object,
         *,
@@ -412,19 +390,19 @@ def analyze_direct_grouped_n_loads(
             fake = index.meta.get("val")
             if not isinstance(fake, torch.Tensor) or fake.ndim != 1:
                 return None
-            extent = hinted_int(fake.shape[0])
+            extent = _cute_hinted_int(fake.shape[0])
             if extent is None:
                 return None
             if required_extent is not None and extent != required_extent:
                 return None
-            start = hinted_int(index.kwargs.get("start", 0))
+            start = _cute_hinted_int(index.kwargs.get("start", 0))
             return 0 if start is None else start
         if not isinstance(index, slice):
             return None
         if index.step not in (None, 1):
             return None
-        start = hinted_int(index.start) or 0
-        stop = hinted_int(index.stop)
+        start = _cute_hinted_int(index.start) or 0
+        stop = _cute_hinted_int(index.stop)
         if stop is None:
             return None
         if required_extent is not None and stop - start != required_extent:
@@ -460,23 +438,14 @@ def cute_outer_accumulates_result(
     fx_node: torch.fx.Node | None,
     *,
     is_acc_none: bool,
-    add_targets: tuple[object, ...] = (torch.ops.aten.add.Tensor,),
 ) -> bool:
-    return (
-        cute_outer_accumulator_node(
-            fx_node,
-            is_acc_none=is_acc_none,
-            add_targets=add_targets,
-        )
-        is not None
-    )
+    return cute_outer_accumulator_node(fx_node, is_acc_none=is_acc_none) is not None
 
 
 def cute_outer_accumulator_node(
     fx_node: torch.fx.Node | None,
     *,
     is_acc_none: bool,
-    add_targets: tuple[object, ...] = (torch.ops.aten.add.Tensor,),
 ) -> torch.fx.Node | None:
     if not is_acc_none or fx_node is None:
         return None
@@ -484,7 +453,7 @@ def cute_outer_accumulator_node(
     if len(users) != 1:
         return None
     (user,) = users
-    if user.target not in add_targets or len(user.args) < 2:
+    if user.target is not torch.ops.aten.add.Tensor or len(user.args) < 2:
         return None
     lhs, rhs = user.args[:2]
     if lhs is fx_node:
@@ -521,11 +490,11 @@ def cute_outer_accumulator_node(
             target_name = assign.targets[0].id
             value = assign.value
             if isinstance(value, ast.BinOp) and isinstance(value.op, ast.Add):
-
-                def is_target_name(expr: ast.expr) -> bool:
-                    return isinstance(expr, ast.Name) and expr.id == target_name
-
-                if is_target_name(value.left) or is_target_name(value.right):
+                operands = (value.left, value.right)
+                if any(
+                    isinstance(operand, ast.Name) and operand.id == target_name
+                    for operand in operands
+                ):
                     return other_arg
                 return None
     from ...language._tracing_ops import _new_var
@@ -552,13 +521,8 @@ def cute_outer_accumulator_dtype(
     fx_node: torch.fx.Node | None,
     *,
     is_acc_none: bool,
-    add_targets: tuple[object, ...] = (torch.ops.aten.add.Tensor,),
 ) -> torch.dtype | None:
-    outer_acc = cute_outer_accumulator_node(
-        fx_node,
-        is_acc_none=is_acc_none,
-        add_targets=add_targets,
-    )
+    outer_acc = cute_outer_accumulator_node(fx_node, is_acc_none=is_acc_none)
     if outer_acc is None:
         return None
     val = outer_acc.meta.get("val")

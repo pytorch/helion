@@ -22,7 +22,6 @@ from ..device_function import DeviceFunction
 if TYPE_CHECKING:
     import ast
 
-    from ..backend import Backend
     from ..inductor_lowering import CodegenState
     from .layout import ThreadLayout
 
@@ -105,8 +104,12 @@ def _(state: CodegenState) -> ast.AST:
         statement_from_string(f"{input_name} = {{_inp}}", _inp=input_ast)
     )
 
-    # Compute flat smem offsets using layout strides
-    thread_expr = _thread_id_expr(backend)
+    # Compute flat smem offsets using layout strides.  The thread index uses
+    # the kernel's physical thread-block dims (not the layout's 1D thread_shape)
+    # so all (x, y, z) threads get unique offsets in ND kernels.
+    dims = DeviceFunction.current().tile_strategy.thread_block_dims()
+    axis_sizes = {axis: dim for axis, dim in enumerate(dims) if dim > 1}
+    thread_expr: str = backend.thread_linear_index_expr(axis_sizes)  # type: ignore[assignment]
     src_offset = _flat_offset_expr(thread_expr, src_layout)
     dst_offset = _flat_offset_expr(thread_expr, dst_layout)
 
@@ -121,18 +124,6 @@ def _(state: CodegenState) -> ast.AST:
     state.add_statement(f"{result_var} = {smem_var}[{dst_offset}]")
 
     return expr_from_string(result_var)
-
-
-def _thread_id_expr(backend: Backend) -> str:
-    """Build the linear thread index from the kernel's physical thread block dims.
-
-    Uses the actual launched thread-block axes (not the layout's 1D thread_shape)
-    so that all (x, y, z) threads get unique shared-memory offsets in ND
-    kernels.
-    """
-    dims = DeviceFunction.current().tile_strategy.thread_block_dims()
-    axis_sizes = {axis: dim for axis, dim in enumerate(dims) if dim > 1}
-    return backend.thread_linear_index_expr(axis_sizes)  # type: ignore[return-value]
 
 
 def _flat_offset_expr(thread_expr: str, layout: ThreadLayout) -> str:

@@ -78,8 +78,6 @@ def plan_layouts(
         _insert_layout_changes(graph_info)
         _validate_layout_contracts(graph_info)
 
-    _validate_thread_budget_graphs(graphs)
-
 
 # ---------------------------------------------------------------------------
 # Step 1 — Seed constrained nodes
@@ -609,25 +607,6 @@ def _validate_layout_contracts(graph_info: GraphInfo) -> None:
                     f"{user.name} ({consumer_layout.tag.value})"
                 ),
             )
-
-
-# ---------------------------------------------------------------------------
-# Step 6 — Thread budget validation
-# ---------------------------------------------------------------------------
-
-
-def _validate_thread_budget_graphs(graphs: list[GraphInfo]) -> None:
-    """Check that all resolved layouts use <= 1024 threads.
-
-    When thread counts are symbolic, validation is deferred to launch time.
-
-    Layouts inside device/reduction loops may inherit thread counts from
-    the parent that include loop threads.  These are validated at kernel
-    launch time via the actual thread block dimensions, so we skip the
-    per-node check when the thread count exceeds the limit — it will be
-    caught by :func:`check_thread_limit` in the launcher if genuinely
-    over-budget.
-    """
 
 
 # ---------------------------------------------------------------------------

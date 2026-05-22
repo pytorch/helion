@@ -24,10 +24,6 @@ if TYPE_CHECKING:
     from ..generate_ast import GenerateAST
 
 
-def _env_arg(ctx: LoweringContext, node: Node) -> object:
-    return ctx.env[node]
-
-
 def _argreduce_extreme_literal(
     dtype: torch.dtype,
     reduction_type: str,
@@ -87,7 +83,7 @@ def _input_in_bounds_expr(
 
 
 def _argreduce_source_expr(ctx: LoweringContext, input_node: Node) -> ast.AST:
-    source = _env_arg(ctx, input_node)
+    source = ctx.env[input_node]
     if isinstance(source, CuteShapeChainView):
         resolved = resolve_cute_shape_chain_value(ctx, input_node)
         if resolved is None:
@@ -131,8 +127,7 @@ def _argreduce_scan_ready_expr(
     assert grid_state is not None
     strategy = grid_state.strategy
     lane_vars = getattr(strategy, "_lane_var_by_block", None)
-    if not isinstance(lane_vars, dict):
-        return None
+    assert isinstance(lane_vars, dict)
     lane_extents = dict(grid_state.lane_loops)
     env = CompileEnvironment.current()
     terms: list[str] = []

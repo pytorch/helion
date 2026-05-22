@@ -439,7 +439,6 @@ def tcgen05_direct_entry_stage_tuple_allowed(
 # Cluster shape baked into the cycle-2 direct entry: both T1 and T4 are
 # validated at ``cluster_m=2``, ``cluster_n=1``.
 TCGEN05_DIRECT_ENTRY_CLUSTER_M = 2
-TCGEN05_DIRECT_ENTRY_CLUSTER_N = 1
 
 # Total work-cluster counts produced by the codegen scheduler for the
 # validated direct-entry shapes. Target 1 (1024x4096x1024) yields 64
@@ -486,11 +485,10 @@ TCGEN05_PURE_CLC_SCHEDULER_OBJECT_CONFIG_KEY = "tcgen05_pure_clc_scheduler_objec
 # (see ``cute_plan.md`` §6 Target 8 cycle-13 Deep Replan). Cycle-16
 # implementation is **Option B (staged)**: the config key is admitted into
 # the autotune search surface and through the validator, but the codegen
-# path raises ``BackendUnsupported`` until the productive
-# ``Tcgen05PureDynamicSchedulerObject`` emission lands in a follow-up cycle.
-# The scheduler-object class itself (in ``tcgen05_pure_matmul.py``) is also
-# staged-only: it has the boundary type but no productive AST emission. This
-# infrastructure-only landing lets a future cycle wire the atomic-counter
+# path raises ``BackendUnsupported`` in ``cute_mma.py`` because no
+# productive AST emission has landed yet. Only the config key plus that
+# rejection path exist today; the staged scheduler-object class was
+# removed in cycle 27. A future cycle can wire the atomic-counter
 # work-tile loop without re-doing the search-surface / dispatch plumbing.
 TCGEN05_PURE_DYNAMIC_SCHEDULER_OBJECT_CONFIG_KEY = (
     "tcgen05_pure_dynamic_scheduler_object"

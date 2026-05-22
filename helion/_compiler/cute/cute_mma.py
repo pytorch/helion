@@ -124,6 +124,7 @@ from .tcgen05_pure_matmul import Tcgen05PureClcSchedulerObject
 from .tcgen05_pure_matmul import Tcgen05PureMatmulObjectModel
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
     from collections.abc import Mapping
 
     from ..aten_lowering import LoweringContext
@@ -1874,67 +1875,49 @@ def _trace_mma_to_store_dtype(
     return None
 
 
-def _trace_mma_to_single_identity_store_dtype(
+def _is_rank1_bf16_bias_load(node: Node) -> bool:
+    """``helion.language.load`` of a rank-1 bf16 GMEM tensor.
+
+    Shared by the T2 (``acc + bias[n]``) and T6 (``relu(acc + bias[n])``)
+    direct-entry walkers below. The runtime validator only admits bf16
+    bias tensors, so the codegen walker is gated on dtype too — a non-bf16
+    bias kernel at T2/T6 shape must not reach the direct-entry path (it
+    would otherwise fail loudly at launch instead of falling back to the
+    wrapper-dispatch route at codegen).
+    """
+    from ...language import memory_ops
+
+    if node.op != "call_function" or node.target is not memory_ops.load:
+        return False
+    host_arg = node.args[0] if node.args else None
+    if not isinstance(host_arg, Node):
+        return False
+    host_val = host_arg.meta.get("val")
+    if not isinstance(host_val, torch.Tensor):
+        return False
+    return host_val.ndim == 1 and host_val.dtype == torch.bfloat16
+
+
+def _trace_mma_to_single_cast_store_dtype(
     mma_node: Node,
     graphs: list[GraphInfo],
+    *,
+    extra_trace_through: frozenset[object] = frozenset(),
+    validate_cast_input: Callable[[Node, set[Node], dict], bool],
 ) -> torch.dtype | None:
-    """Return the store dtype only for exactly one identity cast store."""
-    from .cute_fx_walk import build_inner_outputs_index_from_graphs
-    from .cute_fx_walk import walk_carrier_to_tcgen05_matmul
+    """Common skeleton for the direct-entry envelope walkers.
 
-    traced = _trace_mma_to_single_store_value_and_dtype(mma_node, graphs)
-    if traced is None:
-        return None
-    store_value, output_dtype = traced
-    if (
-        store_value.op != "call_function"
-        or store_value.target is not torch.ops.prims.convert_element_type.default
-        or store_value.kwargs
-    ):
-        return None
-    cast_input = store_value.args[0] if store_value.args else None
-    if not isinstance(cast_input, Node):
-        return None
-    if (
-        walk_carrier_to_tcgen05_matmul(
-            cast_input,
-            {mma_node},
-            build_inner_outputs_index_from_graphs(graphs),
-        )
-        is None
-    ):
-        return None
-    dtype_arg = store_value.args[1] if len(store_value.args) > 1 else None
-    if dtype_arg != output_dtype:
-        return None
-    return output_dtype
-
-
-_RELU_STORE_EXTRA_TRACE_THROUGH = frozenset({torch.ops.aten.relu.default})
-
-
-def _trace_mma_to_single_relu_store_dtype(
-    mma_node: Node,
-    graphs: list[GraphInfo],
-) -> torch.dtype | None:
-    """Return the store dtype only for exactly one ``relu`` + cast store.
-
-    The chain accepted here is ``mma -> relu -> convert_element_type ->
-    store``: exactly one ``aten.relu.default`` between the MMA carrier and
-    the cast that feeds the store. This mirrors
-    ``_trace_mma_to_single_identity_store_dtype`` for the relu epilogue
-    so the TVM-FFI direct entry can admit Target 4 without broadening the
-    general-purpose identity-store gate. The base walker is extended with
-    ``aten.relu.default`` so the forward trace can step past relu on its
-    way from the MMA carrier to the convert-and-store node.
+    Traces ``mma_node`` to its single store via
+    ``_trace_mma_to_single_store_value_and_dtype``, requires a
+    ``convert_element_type.default`` cast as the store value, then defers
+    to ``validate_cast_input`` to verify the epilogue chain reaches the
+    MMA carrier. The closing dtype-arg check pins the cast's target dtype
+    to the recorded store dtype.
     """
     from .cute_fx_walk import build_inner_outputs_index_from_graphs
-    from .cute_fx_walk import walk_carrier_to_tcgen05_matmul
 
     traced = _trace_mma_to_single_store_value_and_dtype(
-        mma_node,
-        graphs,
-        extra_trace_through=_RELU_STORE_EXTRA_TRACE_THROUGH,
+        mma_node, graphs, extra_trace_through=extra_trace_through
     )
     if traced is None:
         return None
@@ -1948,23 +1931,8 @@ def _trace_mma_to_single_relu_store_dtype(
     cast_input = store_value.args[0] if store_value.args else None
     if not isinstance(cast_input, Node):
         return None
-    if (
-        cast_input.op != "call_function"
-        or cast_input.target is not torch.ops.aten.relu.default
-        or cast_input.kwargs
-        or len(cast_input.args) != 1
-    ):
-        return None
-    relu_input = cast_input.args[0]
-    if not isinstance(relu_input, Node):
-        return None
-    if (
-        walk_carrier_to_tcgen05_matmul(
-            relu_input,
-            {mma_node},
-            build_inner_outputs_index_from_graphs(graphs),
-        )
-        is None
+    if not validate_cast_input(
+        cast_input, {mma_node}, build_inner_outputs_index_from_graphs(graphs)
     ):
         return None
     dtype_arg = store_value.args[1] if len(store_value.args) > 1 else None
@@ -1973,12 +1941,82 @@ def _trace_mma_to_single_relu_store_dtype(
     return output_dtype
 
 
-# T2's bias add (``aten.add.Tensor(carrier, bias_load)``) sits between
-# the MMA carrier and the convert-and-store node. The base walker stops
-# at every ``call_function`` target outside its trace-through set, so
-# the bias-store walker has to extend the set with ``aten.add.Tensor``
-# to step past the bias add and reach the cast that feeds the store.
-_BIAS_STORE_EXTRA_TRACE_THROUGH = frozenset({torch.ops.aten.add.Tensor})
+def _trace_mma_to_single_identity_store_dtype(
+    mma_node: Node,
+    graphs: list[GraphInfo],
+) -> torch.dtype | None:
+    """Return the store dtype only for exactly one identity cast store."""
+    from .cute_fx_walk import walk_carrier_to_tcgen05_matmul
+
+    def _validate(cast_input: Node, mma_set: set[Node], idx: dict) -> bool:
+        return walk_carrier_to_tcgen05_matmul(cast_input, mma_set, idx) is not None
+
+    return _trace_mma_to_single_cast_store_dtype(
+        mma_node, graphs, validate_cast_input=_validate
+    )
+
+
+def _trace_mma_to_single_relu_store_dtype(
+    mma_node: Node,
+    graphs: list[GraphInfo],
+) -> torch.dtype | None:
+    """Return the store dtype only for exactly one ``relu`` + cast store.
+
+    The chain accepted here is ``mma -> relu -> convert_element_type ->
+    store``: exactly one ``aten.relu.default`` between the MMA carrier and
+    the cast that feeds the store. Mirrors
+    ``_trace_mma_to_single_identity_store_dtype`` for the relu epilogue so
+    the TVM-FFI direct entry can admit Target 4 without broadening the
+    general-purpose identity-store gate.
+    """
+    from .cute_fx_walk import walk_carrier_to_tcgen05_matmul
+
+    def _validate(cast_input: Node, mma_set: set[Node], idx: dict) -> bool:
+        if (
+            cast_input.op != "call_function"
+            or cast_input.target is not torch.ops.aten.relu.default
+            or cast_input.kwargs
+            or len(cast_input.args) != 1
+        ):
+            return False
+        relu_input = cast_input.args[0]
+        if not isinstance(relu_input, Node):
+            return False
+        return walk_carrier_to_tcgen05_matmul(relu_input, mma_set, idx) is not None
+
+    return _trace_mma_to_single_cast_store_dtype(
+        mma_node,
+        graphs,
+        extra_trace_through=frozenset({torch.ops.aten.relu.default}),
+        validate_cast_input=_validate,
+    )
+
+
+def _validate_bias_add_chain(
+    add_node: Node, mma_set: set[Node], inner_outputs_index: dict
+) -> bool:
+    """``aten.add.Tensor(carrier, rank-1 bf16 bias_load)`` (or commuted)."""
+    from .cute_fx_walk import walk_carrier_to_tcgen05_matmul
+
+    if (
+        add_node.op != "call_function"
+        or add_node.target is not torch.ops.aten.add.Tensor
+        or add_node.kwargs
+        or len(add_node.args) != 2
+    ):
+        return False
+    add_lhs, add_rhs = add_node.args
+    if not isinstance(add_lhs, Node) or not isinstance(add_rhs, Node):
+        return False
+    # Either side of the add can be the carrier (commutative); the other
+    # must be a rank-1 bias load.
+    carrier_first = walk_carrier_to_tcgen05_matmul(
+        add_lhs, mma_set, inner_outputs_index
+    ) is not None and _is_rank1_bf16_bias_load(add_rhs)
+    carrier_second = walk_carrier_to_tcgen05_matmul(
+        add_rhs, mma_set, inner_outputs_index
+    ) is not None and _is_rank1_bf16_bias_load(add_lhs)
+    return carrier_first or carrier_second
 
 
 def _trace_mma_to_single_bias_store_dtype(
@@ -1990,93 +2028,22 @@ def _trace_mma_to_single_bias_store_dtype(
     The chain accepted here is ``mma -> aten.add.Tensor(carrier,
     bias_load) -> convert_element_type -> store``: exactly one
     ``aten.add.Tensor`` between the MMA carrier and the cast that feeds
-    the store, where one of the add's operands is the MMA carrier and
-    the other is a rank-1 ``helion.language.load`` against a GMEM
-    tensor with shape ``(N,)``.
+    the store, where one of the add's operands is the MMA carrier and the
+    other is a rank-1 ``helion.language.load`` against a GMEM tensor with
+    shape ``(N,)``.
 
     Mutually exclusive with the identity and relu walkers: identity
     rejects any binary op in the chain, and relu requires a single-arg
     ``aten.relu.default`` rather than the two-arg add. A T6
     (``acc + bias[n] -> relu -> convert -> store``) chain is rejected
-    because the cast feeds off a relu rather than the add. The
-    rank-1 GMEM-load operand makes this walker T2-specific even at
-    shapes where a T3 / T4 / T5 walker would otherwise admit the
-    chain.
+    because the cast feeds off a relu rather than the add.
     """
-    from .cute_fx_walk import build_inner_outputs_index_from_graphs
-    from .cute_fx_walk import walk_carrier_to_tcgen05_matmul
-
-    traced = _trace_mma_to_single_store_value_and_dtype(
+    return _trace_mma_to_single_cast_store_dtype(
         mma_node,
         graphs,
-        extra_trace_through=_BIAS_STORE_EXTRA_TRACE_THROUGH,
+        extra_trace_through=frozenset({torch.ops.aten.add.Tensor}),
+        validate_cast_input=_validate_bias_add_chain,
     )
-    if traced is None:
-        return None
-    store_value, output_dtype = traced
-    if (
-        store_value.op != "call_function"
-        or store_value.target is not torch.ops.prims.convert_element_type.default
-        or store_value.kwargs
-    ):
-        return None
-    cast_input = store_value.args[0] if store_value.args else None
-    if not isinstance(cast_input, Node):
-        return None
-    if (
-        cast_input.op != "call_function"
-        or cast_input.target is not torch.ops.aten.add.Tensor
-        or cast_input.kwargs
-        or len(cast_input.args) != 2
-    ):
-        return None
-    add_lhs, add_rhs = cast_input.args
-    if not isinstance(add_lhs, Node) or not isinstance(add_rhs, Node):
-        return None
-    inner_outputs_index = build_inner_outputs_index_from_graphs(graphs)
-
-    def _is_rank1_bias_load(node: Node) -> bool:
-        from ...language import memory_ops
-
-        if node.op != "call_function" or node.target is not memory_ops.load:
-            return False
-        host_arg = node.args[0] if node.args else None
-        if not isinstance(host_arg, Node):
-            return False
-        host_val = host_arg.meta.get("val")
-        if not isinstance(host_val, torch.Tensor):
-            return False
-        # P2: the runtime validator only admits bf16 bias tensors, so
-        # gate the codegen walker on dtype too — a non-bf16 bias
-        # kernel at T2 shape must not reach the direct-entry path (it
-        # would otherwise fail loudly at launch instead of falling
-        # back to the wrapper-dispatch route at codegen).
-        return host_val.ndim == 1 and host_val.dtype == torch.bfloat16
-
-    # Either side of the add can be the carrier (commutative); the
-    # other must be a rank-1 bias load.
-    carrier_first = walk_carrier_to_tcgen05_matmul(
-        add_lhs, {mma_node}, inner_outputs_index
-    ) is not None and _is_rank1_bias_load(add_rhs)
-    carrier_second = walk_carrier_to_tcgen05_matmul(
-        add_rhs, {mma_node}, inner_outputs_index
-    ) is not None and _is_rank1_bias_load(add_lhs)
-    if not (carrier_first or carrier_second):
-        return None
-    dtype_arg = store_value.args[1] if len(store_value.args) > 1 else None
-    if dtype_arg != output_dtype:
-        return None
-    return output_dtype
-
-
-# T6's bias_relu chain has both ``aten.add.Tensor`` (the bias add) and
-# ``aten.relu.default`` (the post-add activation) between the MMA carrier
-# and the convert-and-store node. The walker has to step past both ops to
-# reach the cast that feeds the store, so the extra trace-through set is
-# the union of T2's bias trace-through and T4's relu trace-through.
-_BIAS_RELU_STORE_EXTRA_TRACE_THROUGH = frozenset(
-    {torch.ops.aten.add.Tensor, torch.ops.aten.relu.default}
-)
 
 
 def _trace_mma_to_single_bias_relu_store_dtype(
@@ -2089,98 +2056,41 @@ def _trace_mma_to_single_bias_relu_store_dtype(
     bias_load) -> aten.relu.default -> convert_element_type -> store``:
     exactly one ``aten.add.Tensor`` (with a rank-1 bf16 GMEM bias load on
     one side and the MMA carrier on the other) followed by exactly one
-    ``aten.relu.default`` between the MMA carrier and the cast that
-    feeds the store. This mirrors
-    ``_trace_mma_to_single_bias_store_dtype`` but additionally requires
-    the relu wrapper, gating the Target 6 TVM-FFI direct-entry seed
-    without broadening the T2 (no relu) or T4 (no bias) walkers.
+    ``aten.relu.default`` between the MMA carrier and the cast that feeds
+    the store. Mirrors ``_trace_mma_to_single_bias_store_dtype`` but
+    additionally requires the relu wrapper, gating the Target 6 TVM-FFI
+    direct-entry seed without broadening the T2 (no relu) or T4 (no bias)
+    walkers.
 
     Mutually exclusive with the identity (no binary op), relu (no add),
-    and bias (no relu) walkers via the chain shape: T6's
-    ``cast_input`` is a relu whose input is a bias add, while the T2
-    walker requires the cast_input to be the bias add itself. T6 also
-    keeps the bf16 dtype gate on the bias load (cycle-6 P2) so a
-    non-bf16 bias kernel at T6 shape does not reach the direct-entry
-    plan and fail only at launch.
+    and bias (no relu) walkers via the chain shape: T6's ``cast_input``
+    is a relu whose input is a bias add, while the T2 walker requires
+    the cast_input to be the bias add itself.
     """
-    from .cute_fx_walk import build_inner_outputs_index_from_graphs
-    from .cute_fx_walk import walk_carrier_to_tcgen05_matmul
 
-    traced = _trace_mma_to_single_store_value_and_dtype(
+    def _validate(cast_input: Node, mma_set: set[Node], idx: dict) -> bool:
+        # T6 requires a relu directly feeding the cast (whereas T2 has the
+        # bias add feed the cast directly without an intervening relu).
+        if (
+            cast_input.op != "call_function"
+            or cast_input.target is not torch.ops.aten.relu.default
+            or cast_input.kwargs
+            or len(cast_input.args) != 1
+        ):
+            return False
+        relu_input = cast_input.args[0]
+        if not isinstance(relu_input, Node):
+            return False
+        return _validate_bias_add_chain(relu_input, mma_set, idx)
+
+    return _trace_mma_to_single_cast_store_dtype(
         mma_node,
         graphs,
-        extra_trace_through=_BIAS_RELU_STORE_EXTRA_TRACE_THROUGH,
+        extra_trace_through=frozenset(
+            {torch.ops.aten.add.Tensor, torch.ops.aten.relu.default}
+        ),
+        validate_cast_input=_validate,
     )
-    if traced is None:
-        return None
-    store_value, output_dtype = traced
-    if (
-        store_value.op != "call_function"
-        or store_value.target is not torch.ops.prims.convert_element_type.default
-        or store_value.kwargs
-    ):
-        return None
-    cast_input = store_value.args[0] if store_value.args else None
-    if not isinstance(cast_input, Node):
-        return None
-    # T6 requires a relu directly feeding the cast (whereas T2 has the
-    # bias add feed the cast directly without an intervening relu).
-    if (
-        cast_input.op != "call_function"
-        or cast_input.target is not torch.ops.aten.relu.default
-        or cast_input.kwargs
-        or len(cast_input.args) != 1
-    ):
-        return None
-    relu_input = cast_input.args[0]
-    if not isinstance(relu_input, Node):
-        return None
-    # The relu's input must be the bias add: ``aten.add.Tensor(carrier,
-    # bias_load)`` or the commutative variant.
-    if (
-        relu_input.op != "call_function"
-        or relu_input.target is not torch.ops.aten.add.Tensor
-        or relu_input.kwargs
-        or len(relu_input.args) != 2
-    ):
-        return None
-    add_lhs, add_rhs = relu_input.args
-    if not isinstance(add_lhs, Node) or not isinstance(add_rhs, Node):
-        return None
-    inner_outputs_index = build_inner_outputs_index_from_graphs(graphs)
-
-    def _is_rank1_bias_load(node: Node) -> bool:
-        from ...language import memory_ops
-
-        if node.op != "call_function" or node.target is not memory_ops.load:
-            return False
-        host_arg = node.args[0] if node.args else None
-        if not isinstance(host_arg, Node):
-            return False
-        host_val = host_arg.meta.get("val")
-        if not isinstance(host_val, torch.Tensor):
-            return False
-        # P2 (cycle-6): the runtime validator only admits bf16 bias
-        # tensors, so the codegen walker is gated on dtype too — a
-        # non-bf16 bias kernel at T6 shape must not reach the direct-
-        # entry path (it would otherwise fail loudly at launch instead
-        # of falling back to the wrapper-dispatch route at codegen).
-        return host_val.ndim == 1 and host_val.dtype == torch.bfloat16
-
-    # Either side of the add can be the carrier (commutative); the
-    # other must be a rank-1 bias load.
-    carrier_first = walk_carrier_to_tcgen05_matmul(
-        add_lhs, {mma_node}, inner_outputs_index
-    ) is not None and _is_rank1_bias_load(add_rhs)
-    carrier_second = walk_carrier_to_tcgen05_matmul(
-        add_rhs, {mma_node}, inner_outputs_index
-    ) is not None and _is_rank1_bias_load(add_lhs)
-    if not (carrier_first or carrier_second):
-        return None
-    dtype_arg = store_value.args[1] if len(store_value.args) > 1 else None
-    if dtype_arg != output_dtype:
-        return None
-    return output_dtype
 
 
 def _emit_mma_pipeline(

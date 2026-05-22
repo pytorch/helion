@@ -40,17 +40,14 @@ def make_pipeline_state(
     # Match CUTLASS's effective ProducerConsumer behavior: it initializes with
     # producer phase state because the producer branch wins upstream too.
     if user_type in (PipelineUserType.Producer, PipelineUserType.ProducerConsumer):
-        return HelionPipelineState(
-            stages,
-            Int32(0, loc=loc, ip=ip),
-            Int32(0, loc=loc, ip=ip),
-            Int32(1, loc=loc, ip=ip),
-        )
-    if user_type is PipelineUserType.Consumer:
-        return HelionPipelineState(
-            stages,
-            Int32(0, loc=loc, ip=ip),
-            Int32(0, loc=loc, ip=ip),
-            Int32(0, loc=loc, ip=ip),
-        )
-    raise AssertionError("invalid PipelineUserType")
+        phase = 1
+    elif user_type is PipelineUserType.Consumer:
+        phase = 0
+    else:
+        raise AssertionError("invalid PipelineUserType")
+    return HelionPipelineState(
+        stages,
+        Int32(0, loc=loc, ip=ip),
+        Int32(0, loc=loc, ip=ip),
+        Int32(phase, loc=loc, ip=ip),
+    )

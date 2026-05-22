@@ -31,25 +31,6 @@ def cutedsl_has_opresultlist_fix() -> bool:
 
 
 @lru_cache(maxsize=1)
-def _tmem_allocator_init_signature() -> inspect.Signature | None:
-    """Resolve ``cutlass.utils.TmemAllocator.__init__``'s signature.
-
-    ``@dsl_user_op`` strips kwargs from the public wrapper, so we resolve the
-    underlying ``__wrapped__`` first.
-    """
-    try:
-        from cutlass.utils import TmemAllocator
-    except Exception:
-        return None
-    init = TmemAllocator.__init__
-    inner = getattr(init, "__wrapped__", init)
-    try:
-        return inspect.signature(inner)
-    except (TypeError, ValueError):
-        return None
-
-
-@lru_cache(maxsize=1)
 def cutedsl_tmem_allocator_skip_dealloc_init_kwarg() -> str | None:
     """Return the kwarg name (if any) that requests "skip dealloc-mbarrier init"
     on ``TmemAllocator``, or ``None`` if no such kwarg exists on this build.
@@ -59,10 +40,18 @@ def cutedsl_tmem_allocator_skip_dealloc_init_kwarg() -> str | None:
     pass ``True`` to skip.  The current 4.5.0 release renamed the flag to
     ``initialize_mbarrier: bool = True`` — pass ``False`` to skip.
     Helion needs to skip on the epilogue allocator (the matmul prologue
-    already initialized the barrier).
+    already initialized the barrier).  ``@dsl_user_op`` strips kwargs from
+    the public wrapper, so we resolve the underlying ``__wrapped__`` first.
     """
-    sig = _tmem_allocator_init_signature()
-    if sig is None:
+    try:
+        from cutlass.utils import TmemAllocator
+    except Exception:
+        return None
+    init = TmemAllocator.__init__
+    inner = getattr(init, "__wrapped__", init)
+    try:
+        sig = inspect.signature(inner)
+    except (TypeError, ValueError):
         return None
     if "dealloc_mbarrier_initialized" in sig.parameters:
         return "dealloc_mbarrier_initialized"

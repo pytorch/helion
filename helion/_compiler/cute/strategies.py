@@ -6,11 +6,6 @@ boolean knobs. Within a chosen strategy the autotuner explores
 structured records (``Tcgen05WarpSpec``, ``Tcgen05LayoutOverrides``).
 This file is the single source of truth for what those types look
 like and what their per-strategy invariants are.
-
-See ``cute_plan.md`` §3 (three-axis framing) and §4 (data model).
-G2-A introduces these types and wires them through ``ConfigSpec``
-without changing generated code; later G2 sub-steps consume the
-fields in codegen.
 """
 
 from __future__ import annotations
@@ -712,26 +707,6 @@ def derive_persistence_model_from_pid_type(
     return Tcgen05PersistenceModel.NON_PERSISTENT
 
 
-def _persistence_model_pid_type_compatible(
-    persistence_model: Tcgen05PersistenceModel, pid_type: object
-) -> bool:
-    """Return whether ``persistence_model`` is consistent with ``pid_type``.
-
-    ``CLC_PERSISTENT`` overlays a runtime CLC query on a
-    ``pid_type=persistent_*`` launch (the kernel still runs in
-    persistent-grid mode; CLC just replaces the static launch-grid
-    distribution with a hardware-driven canceller). So the agreement
-    is "CLC and STATIC both require ``pid_type=persistent_*``", not
-    "the persistence model derived from pid_type matches exactly".
-    """
-    derived = derive_persistence_model_from_pid_type(pid_type)
-    if persistence_model == derived:
-        return True
-    if persistence_model is Tcgen05PersistenceModel.CLC_PERSISTENT:
-        return derived is Tcgen05PersistenceModel.STATIC_PERSISTENT
-    return False
-
-
 # ---------------------------------------------------------------------------
 # Strategy-conditional cross-fragment invariants
 # ---------------------------------------------------------------------------
@@ -965,10 +940,14 @@ def validate_tcgen05_strategy_invariants(
     # ``pid_type=persistent_*`` implies ``STATIC_PERSISTENT`` (or
     # ``CLC_PERSISTENT`` when the user explicitly opts in — CLC
     # overlays the same persistent-grid launch with a runtime CLC
-    # query). ``DYNAMIC_PERSISTENT`` has no codegen path so it never
-    # agrees with any current ``pid_type`` value.
-    if not _persistence_model_pid_type_compatible(persistence_model, pid_type):
-        derived = derive_persistence_model_from_pid_type(pid_type)
+    # query, so it is compatible with the STATIC-derived pid_type).
+    # ``DYNAMIC_PERSISTENT`` has no codegen path so it never agrees
+    # with any current ``pid_type`` value.
+    derived = derive_persistence_model_from_pid_type(pid_type)
+    if persistence_model != derived and not (
+        persistence_model is Tcgen05PersistenceModel.CLC_PERSISTENT
+        and derived is Tcgen05PersistenceModel.STATIC_PERSISTENT
+    ):
         errors.append(
             f"tcgen05_persistence_model={persistence_model.value!r} "
             f"contradicts pid_type={pid_type!r} (which implies "
