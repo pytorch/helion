@@ -94,6 +94,7 @@ from .tcgen05_constants import TCGEN05_LARGE_BN_PROOF_PID_TYPE
 from .tcgen05_constants import TCGEN05_LARGE_BN_PROOF_STAGE_CONFIGS
 from .tcgen05_constants import TCGEN05_ONE_CTA_MAX_BLOCK_M
 from .tcgen05_constants import TCGEN05_PURE_CLC_SCHEDULER_OBJECT_CONFIG_KEY
+from .tcgen05_constants import TCGEN05_PURE_DYNAMIC_SCHEDULER_OBJECT_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_SCHED_CONSUMER_WAIT_MODE_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_SCHED_CONSUMER_WAIT_MODE_NORMAL
 from .tcgen05_constants import TCGEN05_SCHED_CONSUMER_WAIT_MODES
@@ -210,6 +211,7 @@ CUTE_TCGEN05_DIAGNOSTIC_CONFIG_KEYS: frozenset[str] = frozenset(
         TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY,
         TCGEN05_LARGE_BN_PROOF_CONFIG_KEY,
         TCGEN05_PURE_CLC_SCHEDULER_OBJECT_CONFIG_KEY,
+        TCGEN05_PURE_DYNAMIC_SCHEDULER_OBJECT_CONFIG_KEY,
         TCGEN05_SCHED_CONSUMER_WAIT_MODE_CONFIG_KEY,
         TCGEN05_SCHED_STAGE_COUNT_CONFIG_KEY,
         TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY,
@@ -2353,6 +2355,19 @@ class CuteTcgen05Config:
                 fragments[TCGEN05_PURE_CLC_SCHEDULER_OBJECT_CONFIG_KEY] = (
                     BooleanFragment()
                 )
+                # Cycle-16 H3 Option B (staged): admit the pure-dynamic
+                # scheduler-object key into the validation surface so user
+                # configs that set it cleanly round-trip through normalize.
+                # The autotune search surface (``flat_fields`` -> ``optional_
+                # fragments(for_search=True)``) intentionally excludes the
+                # key because the productive codegen has not landed; an
+                # autotuner that admits the knob would lose every config
+                # that selects it to the cycle-16 BackendUnsupported gate.
+                # Cycle 17 will move this into the ``for_search`` branch
+                # once the productive emission lands.
+                fragments[TCGEN05_PURE_DYNAMIC_SCHEDULER_OBJECT_CONFIG_KEY] = (
+                    BooleanFragment()
+                )
         return fragments
 
     @staticmethod
@@ -2364,6 +2379,7 @@ class CuteTcgen05Config:
             or config.get(TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY) is True
             or config.get(TCGEN05_DIRECT_ENTRY_PLAN_CONFIG_KEY) is True
             or config.get(TCGEN05_PURE_CLC_SCHEDULER_OBJECT_CONFIG_KEY) is True
+            or config.get(TCGEN05_PURE_DYNAMIC_SCHEDULER_OBJECT_CONFIG_KEY) is True
             or (seed_enabled and config.get("tcgen05_cluster_m") == 2)
             or config.get(TCGEN05_LAYOUT_STRATEGY_CONFIG_KEY)
             == Tcgen05LayoutStrategy.EXPLICIT_EPI_TILE.value
@@ -2411,6 +2427,7 @@ class CuteTcgen05Config:
             config[TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY] = False
             config[TCGEN05_DIRECT_ENTRY_PLAN_CONFIG_KEY] = False
             config[TCGEN05_PURE_CLC_SCHEDULER_OBJECT_CONFIG_KEY] = False
+            config[TCGEN05_PURE_DYNAMIC_SCHEDULER_OBJECT_CONFIG_KEY] = False
             if (
                 config.get(TCGEN05_LAYOUT_STRATEGY_CONFIG_KEY)
                 == Tcgen05LayoutStrategy.EXPLICIT_EPI_TILE.value
@@ -2428,6 +2445,9 @@ class CuteTcgen05Config:
         pure_clc_scheduler_requested = (
             config.get(TCGEN05_PURE_CLC_SCHEDULER_OBJECT_CONFIG_KEY) is True
         )
+        pure_dynamic_scheduler_requested = (
+            config.get(TCGEN05_PURE_DYNAMIC_SCHEDULER_OBJECT_CONFIG_KEY) is True
+        )
         direct_entry_requested = (
             config.get(TCGEN05_DIRECT_ENTRY_PLAN_CONFIG_KEY) is True
         )
@@ -2437,6 +2457,8 @@ class CuteTcgen05Config:
             config[TCGEN05_DIRECT_ENTRY_PLAN_CONFIG_KEY] = True
         if pure_clc_scheduler_requested:
             config[TCGEN05_PURE_CLC_SCHEDULER_OBJECT_CONFIG_KEY] = True
+        if pure_dynamic_scheduler_requested:
+            config[TCGEN05_PURE_DYNAMIC_SCHEDULER_OBJECT_CONFIG_KEY] = True
 
     def aux_load_mode_autotune_fragments(self) -> dict[str, ConfigSpecFragment]:
         if not self._aux_tma_search_enabled():
@@ -2836,6 +2858,11 @@ class CuteTcgen05Config:
         self._validate_bool_config(
             config,
             TCGEN05_PURE_CLC_SCHEDULER_OBJECT_CONFIG_KEY,
+            fix_invalid=fix_invalid,
+        )
+        self._validate_bool_config(
+            config,
+            TCGEN05_PURE_DYNAMIC_SCHEDULER_OBJECT_CONFIG_KEY,
             fix_invalid=fix_invalid,
         )
         if config.get(TCGEN05_LARGE_BN_PROOF_CONFIG_KEY) is True:

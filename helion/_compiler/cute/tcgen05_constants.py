@@ -476,6 +476,25 @@ TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY = "tcgen05_flat_role_coordinates"
 # TVM-FFI/flat-role seed. This stays explicit until forced diagnostics show
 # it can replace the selected static scheduler path.
 TCGEN05_PURE_CLC_SCHEDULER_OBJECT_CONFIG_KEY = "tcgen05_pure_clc_scheduler_object"
+# Cycle-16 H3 staged-only Target8 scheduler-object probe: parallel of the pure
+# CLC scheduler object that names a Helion-owned ``DYNAMIC_PERSISTENT`` work-
+# tile loop driven by an atomic-counter (``tile_count_semaphore`` /
+# ``atomic_add_i32`` on a global counter) instead of the CLC scheduler warp
+# + 16-bit mailbox SMEM hand-off. Quack T8's winning config uses
+# ``is_dynamic_persistent=true`` (atomic-counter advance), not CLC; this
+# config key is the user-visible surface for the cycle-16 H3 hypothesis
+# (see ``cute_plan.md`` §6 Target 8 cycle-13 Deep Replan). Cycle-16
+# implementation is **Option B (staged)**: the config key is admitted into
+# the autotune search surface and through the validator, but the codegen
+# path raises ``BackendUnsupported`` until the productive
+# ``Tcgen05PureDynamicSchedulerObject`` emission lands in a follow-up cycle.
+# The scheduler-object class itself (in ``tcgen05_pure_matmul.py``) is also
+# staged-only: it has the boundary type but no productive AST emission. This
+# infrastructure-only landing lets a future cycle wire the atomic-counter
+# work-tile loop without re-doing the search-surface / dispatch plumbing.
+TCGEN05_PURE_DYNAMIC_SCHEDULER_OBJECT_CONFIG_KEY = (
+    "tcgen05_pure_dynamic_scheduler_object"
+)
 # Diagnostic metadata-only direct-entry plan for the validated Target1
 # TVM-FFI/flat-role identity-store seed. This does not change launch behavior;
 # it records the exact A/B/D TMA facts needed by the future direct CuTe entry.
