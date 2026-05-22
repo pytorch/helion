@@ -137,6 +137,16 @@ def cute_row_sum(x: torch.Tensor) -> torch.Tensor:
 
 
 @helion.kernel(backend="cute")
+def cute_normalize_by_sum(x: torch.Tensor) -> torch.Tensor:
+    n, _m = x.size()
+    out = torch.empty_like(x)
+    for tile_n in hl.tile(n):
+        row_sum = x[tile_n, :].sum(-1)
+        out[tile_n, :] = x[tile_n, :] / row_sum[:, None]
+    return out
+
+
+@helion.kernel(backend="cute")
 def cute_row_centered(x: torch.Tensor) -> torch.Tensor:
     n, m = x.size()
     out = torch.empty_like(x)
@@ -846,6 +856,32 @@ class TestCuteBackend(TestCase):
         self.assertIn("_cute_grouped_reduce_shared_two_stage", code)
         self.assertIn("group_span=1024", code)
         self.assertIn("block=(1024, 1, 1)", code)
+
+    def test_cute_vector_widths_partitions_lane_extent(self) -> None:
+        """cute_vector_widths=[V] partitions the lane extent into
+        outer x inner=V, so the consume sweep walks each V-chunk via a
+        constexpr V-loop and the per-thread base stride becomes V."""
+        args = (torch.randn(2, 16384, device=DEVICE, dtype=torch.float32) + 2.0,)
+        code_v1, _ = code_and_output(
+            cute_normalize_by_sum,
+            args,
+            block_sizes=[1],
+            reduction_loop=8192,
+        )
+        code_v4, _ = code_and_output(
+            cute_normalize_by_sum,
+            args,
+            block_sizes=[1],
+            reduction_loop=8192,
+            cute_vector_widths=[4],
+        )
+        # V=1 baseline: no constexpr V-loop, no per-thread V-stride.
+        self.assertNotIn("cutlass.range_constexpr(4)", code_v1)
+        self.assertNotIn("thread_idx()[0]) * 4", code_v1)
+        # V=4: the consume sweep emits a constexpr V-loop and the per-thread
+        # base index is offset by ``thread_idx * V``.
+        self.assertIn("cutlass.range_constexpr(4)", code_v4)
+        self.assertIn("thread_idx()[0]) * 4", code_v4)
 
     def test_strided_threaded_block_reduction(self) -> None:
         args = (torch.randn(4, 16, device=DEVICE, dtype=torch.float32),)

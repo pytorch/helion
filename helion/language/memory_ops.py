@@ -892,6 +892,163 @@ def _cute_scalar_store_expr(
     return f"{_cute_scalar_pointer_expr(tensor_name, index_exprs)}.store({value})"
 
 
+# Maximum bytes per vector load/store transaction (LDG.128/STG.128).
+_CUTE_VECTOR_MAX_BYTES = 16
+
+# Dtype -> (cutlass scalar type name, max vector width).
+_CUTE_VECTOR_DTYPES: dict[torch.dtype, tuple[str, int]] = {
+    torch.float32: ("cutlass.Float32", _CUTE_VECTOR_MAX_BYTES // 4),
+    torch.float16: ("cutlass.Float16", _CUTE_VECTOR_MAX_BYTES // 2),
+    torch.bfloat16: ("cutlass.BFloat16", _CUTE_VECTOR_MAX_BYTES // 2),
+}
+
+
+def _cute_vector_load_expr(
+    tensor_name: str,
+    index_exprs: list[str],
+    dtype: torch.dtype,
+    *,
+    vec_width: int,
+) -> str:
+    elem_str, _ = _CUTE_VECTOR_DTYPES[dtype]
+    ptr = _cute_scalar_pointer_expr(tensor_name, index_exprs)
+    return (
+        f"cute.arch.load({ptr}, ir.VectorType.get([{vec_width}], {elem_str}.mlir_type))"
+    )
+
+
+def _cute_vector_store_expr(
+    tensor_name: str,
+    index_exprs: list[str],
+    value: str,
+    dtype: torch.dtype,
+    *,
+    vec_width: int,
+) -> str:
+    elem_str, _ = _CUTE_VECTOR_DTYPES[dtype]
+    ptr = _cute_scalar_pointer_expr(tensor_name, index_exprs)
+    return (
+        f"cute.arch.store({ptr}, {value}, "
+        f"ir.VectorType.get([{vec_width}], {elem_str}.mlir_type))"
+    )
+
+
+def _cute_vector_load_ctx(
+    state: CodegenState,
+    tensor: torch.Tensor,
+    subscript: list[object] | tuple[object, ...],
+    index_exprs: list[str],
+    extra_mask: ast.AST | None,
+) -> tuple[int, int] | None:
+    """Return (vec_width, lane_block_id) when a vector load may be emitted.
+
+    Returns None when any predicate for a 128-bit gmem load fails, in which
+    case the caller falls back to ``_cute_scalar_load_expr``.
+    """
+    from .._compiler.reduction_strategy import LoopedReductionStrategy
+
+    env = CompileEnvironment.current()
+    if env.backend.name != "cute":
+        return None
+    if extra_mask is not None:
+        return None
+    if "None" in index_exprs:
+        return None
+    if tensor.dtype not in _CUTE_VECTOR_DTYPES:
+        return None
+    # Only enable the vec path when the load's result eventually feeds a
+    # reduction op.  The consume-sweep mixes the loaded vector with scalar
+    # values (e.g. the post-reduction inverse-RMS), and broadcasting
+    # scalar->vec is not supported by the CuTe DSL today.  Also bail when
+    # the load's immediate user is a dtype cast, because the CuTe DSL's
+    # ``Float32(vec)`` constructor degrades a vector to its first element
+    # rather than broadcasting the cast across the lanes.
+    fx_node = state.fx_node
+    if fx_node is None:
+        return None
+    # Check immediate users for an early-cast pattern (``to(dtype)``).
+    for user in fx_node.users:
+        target = user.target
+        target_name = getattr(target, "__name__", "") or ""
+        if target_name in (
+            "_to_copy.default",
+            "_to_copy",
+            "convert_element_type",
+            "convert_element_type.default",
+        ):
+            return None
+    visited: set[torch.fx.Node] = set()
+    pending = list(fx_node.users.keys())
+    feeds_reduction = False
+    while pending:
+        user = pending.pop()
+        if user in visited:
+            continue
+        visited.add(user)
+        target_name = getattr(user.target, "__name__", "") or ""
+        target_qualname = getattr(user.target, "_qualname", "") or ""
+        if (
+            "reduction" in target_name
+            or "_inductor_lowering_extra" in target_name
+            or "reduction" in target_qualname
+        ):
+            feeds_reduction = True
+            break
+        pending.extend(user.users.keys())
+    if not feeds_reduction:
+        return None
+    # The innermost dim of the load must be the reduction lane axis and
+    # the tensor must be stride-1 in that dim so that consecutive lane
+    # iters fetch consecutive bytes.
+    try:
+        if int(tensor.stride(-1)) != 1:
+            return None
+    except (TypeError, ValueError):
+        return None
+    # Locate the innermost (last) non-None subscript and pull the active
+    # block_id off it.  Slices resolve to the matching tensor-dim block via
+    # the strategy that's currently active for that block.
+    inner_block_id: int | None = None
+    tensor_dim = 0
+    for idx in subscript:
+        if idx is None:
+            continue
+        if isinstance(idx, torch.SymInt):
+            bid = env.get_block_id(idx)
+            if bid is not None:
+                inner_block_id = bid
+        elif isinstance(idx, slice) and idx == slice(None):
+            if tensor_dim < tensor.ndim:
+                dim_size = tensor.shape[tensor_dim]
+                if isinstance(dim_size, (int, torch.SymInt)):
+                    for cand_bid, bs in enumerate(env.block_sizes):
+                        bs_numel = bs.numel
+                        if not isinstance(bs_numel, (int, torch.SymInt)):
+                            continue
+                        if env.known_equal(
+                            bs_numel, dim_size
+                        ) and state.codegen.active_device_loops.get(cand_bid):
+                            inner_block_id = cand_bid
+                            break
+        tensor_dim += 1
+    if inner_block_id is None:
+        return None
+    loops = state.codegen.active_device_loops.get(inner_block_id)
+    if not loops:
+        return None
+    strategy = getattr(loops[-1], "strategy", None)
+    if not isinstance(strategy, LoopedReductionStrategy):
+        return None
+    vec_width = getattr(strategy, "_cute_reduction_vec_width", 1)
+    if vec_width <= 1:
+        return None
+    if strategy._mask_var is not None:
+        return None
+    if strategy._cute_reduction_lane_extent <= 0:
+        return None
+    return vec_width, inner_block_id
+
+
 def _cute_stack_tensor_offset_expr(
     state: CodegenState,
     tensor_like: torch.Tensor,
@@ -5109,7 +5266,6 @@ def _(state: CodegenState) -> object:
         inactive_slice_expr="None",
         inactive_singleton_slice_expr="0",
     )
-    load_expr = _cute_scalar_load_expr(tensor_name, index_exprs, tensor.dtype)
     mask_expr = _cute_combined_mask(
         state,
         subscript,
@@ -5117,6 +5273,27 @@ def _(state: CodegenState) -> object:
         tensor=tensor,
         include_tensor_index_masks=False,
     )
+    vec_ctx = _cute_vector_load_ctx(state, tensor, subscript, index_exprs, extra_mask)
+    if vec_ctx is not None:
+        vec_width, vec_block_id = vec_ctx
+        load_expr = _cute_vector_load_expr(
+            tensor_name, index_exprs, tensor.dtype, vec_width=vec_width
+        )
+        # The mask is deferred to the post-fold scalar in codegen_reduction.
+        # The vec load itself is unconditional; the mask is recorded on the
+        # active LoopedReductionStrategy and applied around the folded sum.
+        from .._compiler.reduction_strategy import LoopedReductionStrategy
+
+        loops = state.codegen.active_device_loops.get(vec_block_id)
+        if loops:
+            strategy = loops[-1].strategy
+            if isinstance(strategy, LoopedReductionStrategy):
+                strategy._cute_emitted_vec_load = True
+                if mask_expr is not None:
+                    strategy._cute_pending_vec_masks.append(mask_expr)
+        mask_expr = None
+    else:
+        load_expr = _cute_scalar_load_expr(tensor_name, index_exprs, tensor.dtype)
     if tensor.dtype is torch.bool:
         load_expr = f"({load_expr} != cutlass.Uint8(0))"
         if mask_expr is None:
