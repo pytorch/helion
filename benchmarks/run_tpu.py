@@ -1079,6 +1079,30 @@ def _kernel_shape_count(name: str) -> int | None:
     return len(shapes_fn(NUM_SHAPES))
 
 
+_LIBTPU_LOCKFILE = "/tmp/libtpu_lockfile"
+
+
+def _wait_for_tpu_release(timeout_s: float = 30.0, poll_s: float = 0.25) -> None:
+    """Block until the previous subprocess fully releases the TPU.
+
+    libtpu creates `/tmp/libtpu_lockfile` while a process holds the device.
+    When the process exits the file is removed, but the underlying
+    `/dev/vfio/<chip>` iommu group can stay busy for a moment longer.
+    Without this gate, the next subprocess hits `FAILED_PRECONDITION: open(
+    /dev/vfio/N): Device or resource busy`. Polls the lockfile + adds a
+    small slack to cover the OS-level iommu release. Times out silently —
+    the caller still tries to spawn and will get a clear error if the
+    device truly stays busy.
+    """
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        if not os.path.exists(_LIBTPU_LOCKFILE):
+            break
+        time.sleep(poll_s)
+    # Small slack after lockfile clears so vfio/iommu finishes teardown.
+    time.sleep(1.0)
+
+
 def _run_one_shape_via_subprocess(name: str, shape_index: int | None) -> KernelResult:
     """Spawn a child `run_tpu.py` invocation for one (kernel, shape) pair.
 
@@ -1087,12 +1111,20 @@ def _run_one_shape_via_subprocess(name: str, shape_index: int | None) -> KernelR
     (and to GH Actions). A non-zero exit code is folded into a FAIL result so a
     crashed shape doesn't abort the whole sweep.
     """
+    _wait_for_tpu_release()
     with tempfile.NamedTemporaryFile(
         prefix="run_tpu_result_", suffix=".json", delete=False, mode="w"
     ) as tmp:
         tmp_path = tmp.name
     try:
-        cmd = [sys.executable, __file__, "--kernel", name, "--intermediate-result", tmp_path]
+        cmd = [
+            sys.executable,
+            __file__,
+            "--kernel",
+            name,
+            "--intermediate-result",
+            tmp_path,
+        ]
         if NUM_SHAPES is not None:
             cmd += ["--num-shapes", str(NUM_SHAPES)]
         if shape_index is not None:
