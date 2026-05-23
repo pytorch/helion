@@ -6,7 +6,6 @@ from .base_search import normalize_autotune_seed_configs
 from .effort_profile import RANDOM_SEARCH_DEFAULTS
 from .finite_search import FiniteSearch
 from .matmul_heuristics import matmul_heuristic_seed_configs_for_kernel
-from .matmul_heuristics import matmul_heuristics_supported_on_args
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -44,16 +43,15 @@ class RandomSearch(FiniteSearch):
             process_group_name=kernel.env.process_group_name,
         )
         seed_configs = list(normalize_autotune_seed_configs(kernel.settings))
-        if matmul_heuristics_supported_on_args(args):
-            seed_configs = [
-                *matmul_heuristic_seed_configs_for_kernel(
-                    kernel,
-                    args,
-                    config_spec=config_gen.config_spec,
-                    max_configs=1,
-                ),
-                *seed_configs,
-            ]
+        seed_configs = [
+            *matmul_heuristic_seed_configs_for_kernel(
+                kernel,
+                args,
+                config_spec=config_gen.config_spec,
+                max_configs=1,
+            ),
+            *seed_configs,
+        ]
         super().__init__(
             kernel,
             args,

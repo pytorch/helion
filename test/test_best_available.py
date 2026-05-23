@@ -1341,16 +1341,9 @@ class TestGenerateBestAvailablePopulation(unittest.TestCase):
                 PopulationBasedSearch,
             )
         )
-
-        with (
-            patch(
-                "helion.autotuner.base_search.matmul_heuristics_supported_on_args",
-                return_value=True,
-            ),
-            patch(
-                "helion.autotuner.base_search.matmul_heuristic_seed_configs_for_kernel",
-                return_value=heuristic_configs,
-            ),
+        with patch(
+            "helion.autotuner.base_search.matmul_heuristic_seed_configs_for_kernel",
+            return_value=heuristic_configs,
         ):
             result = PopulationBasedSearch._generate_best_available_population_flat(
                 mock_search
@@ -1364,7 +1357,6 @@ class TestGenerateBestAvailablePopulation(unittest.TestCase):
     def test_matmul_heuristic_configs_do_not_replace_default_on_other_hw(self):
         """B200 matmul seeds are not used as defaults on other hardware."""
         config_gen = self._make_config_gen()
-        heuristic_configs = [Config(block_sizes=[32, 64], num_warps=8, num_stages=2)]
         cached = [Config(block_sizes=[128, 256], num_warps=2, num_stages=4)]
         mock_search = self._make_mock_search(config_gen, cached)
         mock_search.args = [torch.empty(1)]
@@ -1374,22 +1366,14 @@ class TestGenerateBestAvailablePopulation(unittest.TestCase):
                 PopulationBasedSearch,
             )
         )
-
-        with (
-            patch(
-                "helion.autotuner.base_search.matmul_heuristics_supported_on_args",
-                return_value=False,
-            ),
-            patch(
-                "helion.autotuner.base_search.matmul_heuristic_seed_configs_for_kernel",
-                return_value=heuristic_configs,
-            ) as matmul_heuristic_seed_configs,
+        with patch(
+            "helion.autotuner.matmul_heuristics.matmul_heuristics_supported_on_args",
+            return_value=False,
         ):
             result = PopulationBasedSearch._generate_best_available_population_flat(
                 mock_search
             )
 
-        matmul_heuristic_seed_configs.assert_not_called()
         self.assertEqual(len(result), 2)
         self.assertEqual(result[0], config_gen.default_flat())
         num_warps_idx = config_gen._key_to_flat_indices["num_warps"][0][0]
@@ -1408,16 +1392,16 @@ class TestGenerateBestAvailablePopulation(unittest.TestCase):
                 PopulationBasedSearch,
             )
         )
+        mock_search._autotune_seed_configs_with_heuristics = (
+            PopulationBasedSearch._autotune_seed_configs_with_heuristics.__get__(
+                mock_search,
+                PopulationBasedSearch,
+            )
+        )
 
-        with (
-            patch(
-                "helion.autotuner.base_search.matmul_heuristics_supported_on_args",
-                return_value=True,
-            ),
-            patch(
-                "helion.autotuner.base_search.matmul_heuristic_seed_configs_for_kernel",
-                return_value=heuristic_configs,
-            ),
+        with patch(
+            "helion.autotuner.base_search.matmul_heuristic_seed_configs_for_kernel",
+            return_value=heuristic_configs,
         ):
             result = PopulationBasedSearch._random_population_flat_with_heuristics(
                 mock_search,

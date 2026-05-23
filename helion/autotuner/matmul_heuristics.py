@@ -43,6 +43,7 @@ MATMUL_HEURISTICS_PATH_ENV = "HELION_AUTOTUNE_MATMUL_HEURISTICS_PATH"
 _RUNTIME_HEURISTICS_PATH = (
     Path(__file__).resolve().parent / "heuristics" / "matmul_b200.json"
 )
+_SUPPORTED_DEVICE_NAME = "B200"
 
 _MATMUL_KERNEL_CLASSES = frozenset(
     {"matmul", "matmul_int4", "matmul_int16", "matmul_fp4"}
@@ -84,7 +85,7 @@ def matmul_heuristics_enabled() -> bool:
 def matmul_heuristics_supported_on_args(args: Sequence[object]) -> bool:
     device = extract_device(args)
     device_name = get_device_name(device) if device is not None else None
-    return device_name is not None and "B200" in device_name
+    return device_name is not None and _SUPPORTED_DEVICE_NAME in device_name
 
 
 @functools.cache
@@ -227,6 +228,8 @@ def _single_2d_matmul_fact(config_spec: ConfigSpec) -> MatmulFact | None:
 
 def _aspect_bucket(m: int, n: int, k: int) -> str:
     min_dim = min(m, n, k)
+    if min_dim <= 0:
+        return "unknown"
     max_dim = max(m, n, k)
     if max_dim / min_dim < 4:
         return "balanced"
@@ -410,7 +413,7 @@ def matmul_heuristic_seed_configs_for_kernel(
     config_spec: ConfigSpec,
     max_configs: int,
 ) -> list[Config]:
-    if not matmul_heuristics_enabled():
+    if not matmul_heuristics_enabled() or not matmul_heuristics_supported_on_args(args):
         return []
     kernel_class = _infer_matmul_family_class(
         kernel,
@@ -439,8 +442,6 @@ def matmul_heuristic_default_config_for_kernel(
     *,
     config_spec: ConfigSpec,
 ) -> Config | None:
-    if not matmul_heuristics_supported_on_args(args):
-        return None
     configs = matmul_heuristic_seed_configs_for_kernel(
         kernel,
         args,

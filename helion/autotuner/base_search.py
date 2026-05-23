@@ -36,7 +36,6 @@ from .benchmark_provider import _unset_fn
 from .benchmarking import interleaved_bench
 from .logger import AutotuningLogger
 from .matmul_heuristics import matmul_heuristic_seed_configs_for_kernel
-from .matmul_heuristics import matmul_heuristics_supported_on_args
 from .metrics import AutotuneMetrics
 from .metrics import _run_post_autotune_hooks
 from .precompile_future import PrecompileFuture as PrecompileFuture
@@ -733,8 +732,6 @@ class PopulationBasedSearch(BaseSearch):
         }
 
     def _heuristic_seed_configs(self, max_configs: int = 1) -> list[Config]:
-        if not matmul_heuristics_supported_on_args(self.args):
-            return []
         return matmul_heuristic_seed_configs_for_kernel(
             self.kernel,
             self.args,
