@@ -483,6 +483,14 @@ class LFBOPatternSearch(PatternSearch):
 
         # Run finishing phase to simplify the best configuration
         best = self.run_finishing_phase(self.best, self.finishing_rounds)
+
+        # Re-rank the top candidates with multiple independent rebenchmark
+        # passes to drown out per-call noise on short kernels.
+        from .base_search import final_pick_settings
+
+        passes, top_k = final_pick_settings()
+        best = self.run_final_pick_verification(best, passes=passes, top_k=top_k)
+
         return best.config
 
     def _generate_neighbors(self, base: FlatConfig) -> list[FlatConfig]:

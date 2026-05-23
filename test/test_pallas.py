@@ -1046,6 +1046,139 @@ class TestPallas(TestCase):
         # The bias block_spec_info must have None for dim 0 (not a grid index).
         self.assertIn("(None, 1)", code)
 
+    def test_pallas_autotuner_final_pick_picks_true_best_on_noisy_initial_rank(
+        self,
+    ) -> None:
+        """Final-pick verification re-ranks past noisy initial measurements.
+
+        On TPU pod-wide thermal / scheduler noise sometimes causes the
+        bf16 1024^3 autotuner to record a single-call median of ~224 us
+        for ``block_sizes=[512, 1024, 512]`` while
+        ``block_sizes=[512, 512, 512]`` records ~232 us in the same pass
+        and ~190 us when re-measured back-to-back (Deep Replan 2026-05-23,
+        plan.md §2.1 (a)). The new
+        ``PopulationBasedSearch.run_final_pick_verification`` phase
+        guards against that by re-benchmarking the top-K candidates
+        ``HELION_AUTOTUNE_FINAL_PICK_PASSES`` extra times and ranking by
+        the median of per-pass medians.
+
+        The pin asserts that when the **initial** ``perf`` of the
+        ``[512, 1024, 512]`` candidate is noisy-better but its true
+        repeated rebenchmark stays slower than ``[512, 512, 512]``, the
+        verification picks ``[512, 512, 512]``. The two block-512 configs
+        are the ones the bf16 1024^3 autotuner historically ties between
+        ([512, 512, 512] and [256, 256, 256]); the [512, 1024, 512]
+        config is the one we are explicitly steering away from.
+        """
+        from unittest.mock import patch
+
+        from helion.autotuner.base_search import PopulationBasedSearch
+        from helion.autotuner.base_search import PopulationMember
+        from helion.runtime.config import Config
+
+        # Fake measured times in ms.  "True" means the steady-state cost
+        # the kernel actually pays; "noisy initial" is the first
+        # rebenchmark median seen during search, which mis-ranks the
+        # configs.  ``[512, 1024, 512]`` shows a deceptive 0.220 ms in the
+        # initial benchmark even though every repeated probe lands above
+        # 0.232 ms; ``[512, 512, 512]`` shows a slow 0.232 ms initial but
+        # is consistently 0.190 ms when re-measured.
+        scripted_candidates = [
+            {
+                "block_sizes": [512, 1024, 512],
+                "noisy_initial_ms": 0.220,
+                "true_passes_ms": [0.232, 0.234, 0.230],
+            },
+            {
+                "block_sizes": [512, 512, 512],
+                "noisy_initial_ms": 0.232,
+                "true_passes_ms": [0.190, 0.192, 0.188],
+            },
+            {
+                "block_sizes": [256, 256, 256],
+                "noisy_initial_ms": 0.234,
+                "true_passes_ms": [0.205, 0.210, 0.208],
+            },
+            {
+                "block_sizes": [128, 128, 128],
+                "noisy_initial_ms": 0.260,
+                "true_passes_ms": [0.300, 0.305, 0.302],
+            },
+        ]
+
+        members: list[PopulationMember] = []
+        for entry in scripted_candidates:
+            config = Config(block_sizes=list(entry["block_sizes"]))
+            members.append(
+                PopulationMember(
+                    fn=lambda *a, **kw: None,
+                    perfs=[entry["noisy_initial_ms"]],
+                    flat_values=list(entry["block_sizes"]),
+                    config=config,
+                    status="ok",
+                    compile_time=0.0,
+                )
+            )
+
+        # Construct a minimal search instance without going through the
+        # full constructor (which requires a compiled kernel + arg tensors).
+        # ``log`` must itself be callable plus expose ``.debug`` /
+        # ``.warning`` like the real ``AutotuningLogger`` does, so wrap a
+        # no-op callable in a small adapter.
+        class _NoopLog:
+            def __call__(self, *_: object, **__: object) -> None:
+                return None
+
+            def debug(self, *_: object, **__: object) -> None:
+                return None
+
+            def warning(self, *_: object, **__: object) -> None:
+                return None
+
+        search = PopulationBasedSearch.__new__(PopulationBasedSearch)
+        search.population = members
+        search.best_perf_so_far = min(m.perf for m in members)
+        search.log = _NoopLog()
+
+        # Lookup of true per-pass timings keyed by config identity.  The
+        # pass counter advances per rebenchmark call so each pass sees a
+        # different scripted timing.
+        true_passes_by_id: dict[int, list[float]] = {
+            id(m): list(entry["true_passes_ms"])
+            for m, entry in zip(members, scripted_candidates, strict=True)
+        }
+
+        def fake_rebenchmark(
+            members_to_bench: list[PopulationMember], *, desc: str = ""
+        ) -> None:
+            for member in members_to_bench:
+                # Pop the next scripted timing for this member; reuse the
+                # last value if we exhaust the script.
+                queue = true_passes_by_id[id(member)]
+                timing = queue.pop(0) if queue else member.perfs[-1]
+                member.perfs.append(timing)
+                if timing < search.best_perf_so_far:
+                    search.best_perf_so_far = timing
+
+        with patch.object(search, "rebenchmark", side_effect=fake_rebenchmark):
+            initial_best = min(members, key=lambda m: m.perf)
+            self.assertEqual(
+                list(initial_best.config["block_sizes"]),
+                [512, 1024, 512],
+                "Precondition: noisy initial perf misranks 1024-bn config as best",
+            )
+            final_best = search.run_final_pick_verification(
+                initial_best, passes=3, top_k=5
+            )
+
+        self.assertIn(
+            list(final_best.config["block_sizes"]),
+            ([512, 512, 512], [256, 256, 256]),
+            "Final-pick verification must re-rank away from [512, 1024, 512] "
+            "(under-parallelised bn==N) and into the [512, 512, 512] or "
+            "[256, 256, 256] family.",
+        )
+
     def test_bmm(self) -> None:
         """Test BMM with default config — exercises size_matches fix.
 

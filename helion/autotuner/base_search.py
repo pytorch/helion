@@ -8,9 +8,11 @@ import functools
 import logging
 import math
 from math import inf
+import operator
 import os
 import random
 import re
+import statistics
 import sys
 import time
 import types
@@ -59,6 +61,30 @@ if TYPE_CHECKING:
 # rebenchmark repeat, which can amplify a single optimistic subprocess timing.
 _SUSPICIOUS_REBENCHMARK_WARMUP = 25
 _SUSPICIOUS_REBENCHMARK_REP = 100
+
+# Default to 3 independent rebenchmark passes on the top 5 candidates so the
+# ranking of close configs survives ±10-20% per-call noise on short kernels.
+# Disable by exporting ``HELION_AUTOTUNE_FINAL_PICK_PASSES=0``.
+_DEFAULT_FINAL_PICK_PASSES = 3
+_DEFAULT_FINAL_PICK_TOP_K = 5
+
+
+def final_pick_settings() -> tuple[int, int]:
+    """Read the final-pick verification knobs from the environment.
+
+    Returns ``(passes, top_k)`` for
+    :meth:`PopulationBasedSearch.run_final_pick_verification`.  Both knobs
+    accept non-negative ints; ``passes=0`` disables the phase.
+    """
+    from ..runtime.settings import _env_get_optional_int
+
+    passes = _env_get_optional_int("HELION_AUTOTUNE_FINAL_PICK_PASSES")
+    if passes is None:
+        passes = _DEFAULT_FINAL_PICK_PASSES
+    top_k = _env_get_optional_int("HELION_AUTOTUNE_FINAL_PICK_TOP_K")
+    if top_k is None:
+        top_k = _DEFAULT_FINAL_PICK_TOP_K
+    return max(0, passes), max(0, top_k)
 
 
 class _HasDeviceAndProcessGroupName(Protocol):
@@ -1202,6 +1228,140 @@ class PopulationBasedSearch(BaseSearch):
         )
         self.log(f"Finishing phase complete: final config={current.config}")
         return current
+
+    def run_final_pick_verification(
+        self,
+        best: PopulationMember,
+        passes: int,
+        top_k: int,
+    ) -> PopulationMember:
+        """Re-benchmark the top candidates multiple times to harden ranking against noise.
+
+        Adaptive autotune scoring uses one benchmark + (typically) one
+        rebenchmark per config, ranking by the *median* of a single
+        ``interleaved_bench`` call.  For very short kernels (~hundreds of us)
+        on noisy hosts, the median of even ~1000 repeats inside a single
+        ``interleaved_bench`` call can drift by 10-20 % between independent
+        invocations because of pod-wide thermal / scheduler noise.  When two
+        configurations are within that noise band the ranking can flip
+        between runs of the autotuner.
+
+        This phase takes the top-``top_k`` members of ``self.population``
+        (including ``best``) and runs ``passes`` independent rebenchmark calls
+        against each, then re-ranks by the **median of the per-pass medians**.
+        Doing the passes interleaved (one rebenchmark of all candidates per
+        pass, repeated ``passes`` times) keeps thermal / scheduling drift
+        balanced across configs so a transient slow-down on any single pass
+        does not bias one config over another.
+
+        Args:
+            best: The best configuration returned by the main search loop.
+            passes: Number of independent rebenchmark passes to run.  Use 0
+                to disable this phase.
+            top_k: Number of top members (by current perf) to verify.  The
+                returned configuration is guaranteed to be drawn from this set
+                (or ``best`` itself if no other candidate is reachable).
+
+        Returns:
+            The population member with the lowest aggregate median across
+            the verification passes.  If ``passes`` is non-positive, fewer
+            than two candidates are reachable, or no candidate's aggregate
+            median is finite, ``best`` is returned unchanged.
+        """
+        if passes <= 0 or top_k <= 1:
+            return best
+
+        # Collect the top-k candidates by current perf, always including
+        # ``best`` first so its identity is preserved when we tie-break by
+        # falling back to the input.
+        scored_population = sorted(
+            (m for m in self.population if math.isfinite(m.perf)),
+            key=performance,
+        )
+        candidates: list[PopulationMember] = []
+        seen_ids: set[int] = set()
+        for member in (best, *scored_population):
+            if id(member) in seen_ids:
+                continue
+            seen_ids.add(id(member))
+            candidates.append(member)
+            if len(candidates) >= top_k:
+                break
+
+        if len(candidates) < 2:
+            return best
+
+        # Track each pass's median per candidate so the aggregate is a
+        # median of independent medians (robust to a single bad pass).
+        per_candidate_passes: list[list[float]] = [[] for _ in candidates]
+
+        # Snapshot the current ``perfs`` length so we can recover from a
+        # failed pass and so ``rebenchmark`` keeps appending to the same
+        # populated list.
+        pre_pass_perf_lengths = [len(c.perfs) for c in candidates]
+
+        for pass_idx in range(passes):
+            desc = f"Final-pick verification {pass_idx + 1}/{passes}"
+            self.log(
+                f"Final-pick verification pass {pass_idx + 1}/{passes} on "
+                f"{len(candidates)} candidates"
+            )
+            self.rebenchmark(candidates, desc=desc)
+            # The rebenchmark appended one new timing per candidate; pull it
+            # off so the regular ``perf`` property continues to surface the
+            # last single-pass timing rather than a stale value.
+            for slot_idx, member in enumerate(candidates):
+                if len(member.perfs) > pre_pass_perf_lengths[slot_idx] + pass_idx:
+                    per_candidate_passes[slot_idx].append(
+                        member.perfs[pre_pass_perf_lengths[slot_idx] + pass_idx]
+                    )
+
+        # Aggregate by the median of per-pass medians, falling back to inf
+        # whenever a candidate produced no finite samples (a transient
+        # error in every pass).
+        aggregated: list[tuple[int, float]] = []
+        for slot_idx, samples in enumerate(per_candidate_passes):
+            finite_samples = [s for s in samples if math.isfinite(s)]
+            if not finite_samples:
+                aggregated.append((slot_idx, inf))
+                continue
+            aggregated.append((slot_idx, statistics.median(finite_samples)))
+
+        best_slot, best_agg = min(aggregated, key=operator.itemgetter(1))
+        if not math.isfinite(best_agg):
+            return best
+
+        best_member = candidates[best_slot]
+        if best_member is best:
+            self.log(
+                f"Final-pick verification confirmed best (aggregate median "
+                f"{best_agg:.4f}ms across {passes} pass(es))"
+            )
+        else:
+            original_agg_idx = next(
+                (
+                    slot_idx
+                    for slot_idx, member in enumerate(candidates)
+                    if member is best
+                ),
+                None,
+            )
+            if original_agg_idx is not None:
+                original_agg = aggregated[original_agg_idx][1]
+                self.log(
+                    f"Final-pick verification re-picked {best_member.config} "
+                    f"(aggregate median {best_agg:.4f}ms) over previous best "
+                    f"{best.config} (aggregate median {original_agg:.4f}ms)"
+                )
+            else:
+                self.log(
+                    f"Final-pick verification picked {best_member.config} "
+                    f"(aggregate median {best_agg:.4f}ms)"
+                )
+
+        if math.isfinite(best_agg) and best_agg < self.best_perf_so_far:
+            self.best_perf_so_far = best_agg
+        return best_member
 
 
 def population_statistics(population: list[PopulationMember]) -> str:
