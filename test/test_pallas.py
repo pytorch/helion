@@ -1838,6 +1838,171 @@ class TestPallas(TestCase):
             f"{helion_runtime._jaxcallable_key_cache_hits()}.",
         )
 
+    def test_pallas_call_custom_kernel_direct_hits_on_repeat_invocations(
+        self,
+    ) -> None:
+        """Cached static-shape kernel routes through direct ``call_custom_kernel``.
+
+        Deep Replan 5 2026-05-23 (§2.9 in ``plan.md``) measured that
+        bypassing the ``JaxCallable`` wrapper on the launcher cache hot
+        path saves another ~10us per call by skipping
+        ``_HelionStaticJaxCallable.__call__``'s sig comparison, the
+        ``list(args)`` allocation, and the JaxCallable method dispatch.
+        On a static-shape kernel the launcher lifts a pre-captured
+        ``_DirectCallKernel`` off the ``JaxCallable`` subclass after the
+        first call and bumps
+        ``helion.runtime._CALL_CUSTOM_KERNEL_DIRECT_HITS`` on every
+        subsequent invocation that uses the direct-dispatch path.
+
+        The test asserts the counter increments exactly ``n_repeats``
+        times across ``1 + n_repeats`` consecutive calls of the same
+        compiled callable: the first call seeds the JaxCallable's
+        internal ``output_shapes`` cache plus the ``_helion_direct_call``
+        snapshot; calls 2..N reuse them and the launcher fast path
+        bypasses ``JaxCallable.__call__`` entirely.
+        """
+        from helion import runtime as helion_runtime
+
+        # Define the kernel inside the test so the inner Helion-emitted
+        # function (and its launcher cache) is unique to this test run —
+        # no cross-test pollution from other tests that bind
+        # ``pallas_matmul_bf16``.
+
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def _matmul_direct_pin(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty(
+                [m, n],
+                device=x.device,
+                dtype=torch.promote_types(x.dtype, y.dtype),
+            )
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = acc
+            return out
+
+        torch.manual_seed(0)
+        x = torch.randn(256, 256, device=DEVICE, dtype=torch.bfloat16)
+        torch.manual_seed(1)
+        y = torch.randn(256, 256, device=DEVICE, dtype=torch.bfloat16)
+
+        bound = _matmul_direct_pin.bind((x, y))
+        config = bound.config_spec.default_config()
+        compiled_fn = bound.compile_config(config)
+
+        helion_runtime._reset_call_custom_kernel_direct_hits()
+        self.assertEqual(helion_runtime._call_custom_kernel_direct_hits(), 0)
+
+        # First call seeds the launcher cache (slow path) and primes the
+        # JaxCallable subclass's ``_helion_direct_call`` snapshot; no
+        # direct-dispatch counter bump yet.
+        result = compiled_fn(x, y)
+        expected = (x.float() @ y.float()).to(torch.bfloat16)
+        torch.testing.assert_close(result, expected, rtol=1e-2, atol=1e-2)
+        self.assertEqual(
+            helion_runtime._call_custom_kernel_direct_hits(),
+            0,
+            "First call must seed the cache, not hit the direct-dispatch path.",
+        )
+
+        # Subsequent calls share the same arg shape / dtype signature
+        # so the launcher fast path lifts the direct-call kernel off the
+        # JaxCallable subclass and routes around ``JaxCallable.__call__``
+        # entirely.
+        n_repeats = 4
+        for _ in range(n_repeats):
+            result = compiled_fn(x, y)
+            torch.testing.assert_close(result, expected, rtol=1e-2, atol=1e-2)
+
+        self.assertEqual(
+            helion_runtime._call_custom_kernel_direct_hits(),
+            n_repeats,
+            f"Repeat calls on a cached static-shape kernel must each "
+            f"route through ``tpu_torch_pallas.call_custom_kernel`` "
+            f"directly. Expected {n_repeats} hits; got "
+            f"{helion_runtime._call_custom_kernel_direct_hits()}.",
+        )
+
+    def test_pallas_call_custom_kernel_direct_matches_jaxcallable_output(
+        self,
+    ) -> None:
+        """Direct ``call_custom_kernel`` dispatch is bitwise identical to JaxCallable.
+
+        Deep Replan 5 2026-05-23 (§2.9 (d) in ``plan.md``) verified
+        bitwise-identical output between a hand-built
+        ``tpu_torch_pallas.call_custom_kernel`` invocation and the
+        ``JaxCallable`` path on a bf16 matmul.  This pin replays the
+        same correctness check inside the test suite: bind a
+        static-shape bf16 matmul, run it once (warmup → routes through
+        the slow path), then run it 3 more times (each one routes
+        through the direct-dispatch path) and compare every output to
+        the warmup output bit-for-bit (``equal=True``, not just close).
+
+        Regression hazard pinned: any future refactor that subtly
+        diverges the direct-call output from the JaxCallable output —
+        e.g. dropping ``out_tree.unflatten``, skipping the alias
+        copy-back, or passing the wrong ``donate_argnums`` — fails this
+        test.
+        """
+        from helion import runtime as helion_runtime
+
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def _matmul_direct_correctness(
+            x: torch.Tensor, y: torch.Tensor
+        ) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty(
+                [m, n],
+                device=x.device,
+                dtype=torch.promote_types(x.dtype, y.dtype),
+            )
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = acc
+            return out
+
+        torch.manual_seed(0)
+        x = torch.randn(256, 256, device=DEVICE, dtype=torch.bfloat16)
+        torch.manual_seed(1)
+        y = torch.randn(256, 256, device=DEVICE, dtype=torch.bfloat16)
+
+        bound = _matmul_direct_correctness.bind((x, y))
+        config = bound.config_spec.default_config()
+        compiled_fn = bound.compile_config(config)
+
+        helion_runtime._reset_call_custom_kernel_direct_hits()
+
+        # First call: slow path (JaxCallable wrapper).  Saves the
+        # reference output to compare against.
+        reference = compiled_fn(x, y).clone()
+        self.assertEqual(
+            helion_runtime._call_custom_kernel_direct_hits(),
+            0,
+            "First call must be the slow path (JaxCallable wrapper).",
+        )
+
+        # Subsequent calls: direct ``call_custom_kernel`` dispatch.
+        # Each output must be bitwise identical to the reference.
+        for i in range(3):
+            result = compiled_fn(x, y)
+            self.assertTrue(
+                torch.equal(result, reference),
+                f"Direct-dispatch call {i + 1} output diverged from "
+                f"the JaxCallable-path reference (max_abs_diff="
+                f"{(result.float() - reference.float()).abs().max().item()}).",
+            )
+        self.assertEqual(
+            helion_runtime._call_custom_kernel_direct_hits(),
+            3,
+            "Three repeat calls must each hit the direct-dispatch path.",
+        )
+
     def test_bmm(self) -> None:
         """Test BMM with default config — exercises size_matches fix.
 

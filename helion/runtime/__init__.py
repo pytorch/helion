@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from contextlib import suppress
 import contextvars
+from dataclasses import dataclass
 import importlib
 import inspect
 import linecache
@@ -597,6 +598,73 @@ def _reset_jaxcallable_key_cache_hits() -> None:
     _JAXCALLABLE_KEY_CACHE_HITS = 0
 
 
+# Per-call ``tpu_torch_pallas.call_custom_kernel`` direct-dispatch hits.
+# Bumps once per launcher cache hit that bypasses the ``JaxCallable``
+# wrapper (i.e. ``JaxCallable.__call__`` / ``_HelionStaticJaxCallable.__call__``
+# are not entered at all) and calls ``tpu_torch_pallas.call_custom_kernel``
+# directly using metadata captured on the first call (``kernel_name``,
+# ``kernel_key``, ``output_shapes``, ``donate_argnums``, ``out_tree``,
+# ``alias_items``).  Pin tests bump / read this counter to assert that
+# the static-shape kernel actually exercises the direct-dispatch branch
+# on repeat invocations.
+_CALL_CUSTOM_KERNEL_DIRECT_HITS = 0
+
+
+def _call_custom_kernel_direct_hits() -> int:
+    """Return the count of direct ``call_custom_kernel`` dispatch hits.
+
+    Test instrumentation: pin tests assert that a static-shape Pallas
+    kernel routes through the direct-dispatch path (skipping the
+    ``JaxCallable`` wrapper) on second-and-later calls by reading this
+    counter before / after invocations.
+    """
+    return _CALL_CUSTOM_KERNEL_DIRECT_HITS
+
+
+def _reset_call_custom_kernel_direct_hits() -> None:
+    """Reset the direct-dispatch counter (test instrumentation)."""
+    global _CALL_CUSTOM_KERNEL_DIRECT_HITS
+    _CALL_CUSTOM_KERNEL_DIRECT_HITS = 0
+
+
+@dataclass(slots=True)
+class _DirectCallKernel:
+    """Pre-captured metadata for a direct ``call_custom_kernel`` invocation.
+
+    Built lazily on the first call of a static-shape Pallas kernel (via
+    ``_HelionStaticJaxCallable.__call__``'s post-slow-path snapshot) and
+    attached to the launcher cache so subsequent calls can bypass
+    ``JaxCallable.__call__`` entirely.  The launcher hot path reads this
+    structure and calls ``tpu_torch_pallas.call_custom_kernel`` directly
+    using the captured ``(kernel_name, kernel_key, output_shapes,
+    donate_argnums)`` plus the cached ``out_tree`` for the unflatten step.
+
+    Lives only on cached launcher entries whose ``JaxCallable`` subclass
+    actually populated the direct-call metadata (i.e. ``static_shapes=True``
+    Helion kernels).  Dynamic-shape kernels, kernels whose call site
+    passes kwargs, and interpret-mode kernels never get a
+    ``_DirectCallKernel`` and the launcher falls through to the
+    JaxCallable path.
+
+    The ``call_custom_kernel`` field is a pre-bound reference to
+    ``tpu_torch_pallas.call_custom_kernel`` so the hot path can skip the
+    per-call attribute lookup.  ``sig`` is a tuple
+    ``((arg0.shape, arg0.dtype), ...)`` captured on the first call;
+    dynamic-shape kernels reusing the same launcher cache entry across
+    calls with different shapes fall back to the JaxCallable slow path
+    on a sig mismatch.
+    """
+
+    call_custom_kernel: object
+    kernel_name: str
+    kernel_key: str
+    output_shapes: object
+    donate_argnums: object
+    out_tree: object
+    alias_items: tuple[tuple[int, int], ...]
+    sig: tuple[object, ...]
+
+
 _HELION_STATIC_JAX_CALLABLE_CLASS: type | None = None
 
 
@@ -656,7 +724,7 @@ def _make_helion_static_jax_callable_class() -> type:
         See ``_make_helion_static_jax_callable_class`` for context.
         """
 
-        __slots__ = ("_helion_sig", "_helion_key_cache")
+        __slots__ = ("_helion_sig", "_helion_key_cache", "_helion_direct_call")
 
         def __init__(self, *args: object, **kwargs: object) -> None:
             super().__init__(*args, **kwargs)  # type: ignore[misc]
@@ -670,6 +738,12 @@ def _make_helion_static_jax_callable_class() -> type:
             self._helion_key_cache: (
                 tuple[str, object, object, tuple[tuple[int, int], ...]] | None
             ) = None
+            # ``_helion_direct_call`` is the pre-captured metadata used by
+            # the launcher hot path to bypass this ``__call__`` entirely.
+            # Populated on the first call (right after the slow path
+            # populates ``self.output_shapes``); read off the JaxCallable
+            # by the launcher's first-time cache build.
+            self._helion_direct_call: _DirectCallKernel | None = None
 
         def __call__(self, *args: object, **kwargs: object) -> object:
             cached = self._helion_key_cache
@@ -725,15 +799,31 @@ def _make_helion_static_jax_callable_class() -> type:
             if cached_entry is None:
                 return result
             output_shapes, out_tree = cached_entry
-            self._helion_sig = tuple(
+            sig_tuple = tuple(
                 (a.shape, a.dtype)  # type: ignore[attr-defined]
                 for a in args
             )
+            alias_items = tuple(self.input_output_aliases.items())
+            self._helion_sig = sig_tuple
             self._helion_key_cache = (
                 kernel_key,
                 output_shapes,
                 out_tree,
-                tuple(self.input_output_aliases.items()),
+                alias_items,
+            )
+            # Build the launcher-side direct-call structure so the next
+            # call can bypass this ``__call__`` entirely.  The launcher's
+            # first-time cache build reads ``self._helion_direct_call``
+            # right after the first invocation returns.
+            self._helion_direct_call = _DirectCallKernel(
+                call_custom_kernel=tpu_torch_pallas.call_custom_kernel,
+                kernel_name=self.name,
+                kernel_key=kernel_key,
+                output_shapes=output_shapes,
+                donate_argnums=self.donate_argnums,
+                out_tree=out_tree,
+                alias_items=alias_items,
+                sig=sig_tuple,
             )
             return result
 
@@ -872,6 +962,7 @@ def _pallas_invoke_and_return_fast(
     args: tuple[object, ...],
     fast_path: _LauncherFastPath,
     _orig_output_tensors: dict[int, torch.Tensor] | None,
+    direct_call: _DirectCallKernel | None = None,
 ) -> object:
     """Hot-path version of ``_pallas_invoke_and_return``.
 
@@ -883,12 +974,47 @@ def _pallas_invoke_and_return_fast(
     * Iterate the precomputed ``output_only_descriptors`` tuple instead
       of zipping over ``_output_indices`` and checking
       ``arg_to_tensor_pos`` membership per iteration.
+
+    When ``direct_call`` is provided and the per-arg shape / dtype
+    signature matches the captured one, bypass ``jax_callable`` entirely
+    and call ``tpu_torch_pallas.call_custom_kernel`` directly using the
+    captured ``(kernel_name, kernel_key, output_shapes, donate_argnums)``.
     """
     tensor_arg_indices = fast_path.tensor_arg_indices_tuple
     input_tensors = [
         cast("torch.Tensor", args[i]).contiguous() for i in tensor_arg_indices
     ]
-    results = jax_callable(*input_tensors)  # type: ignore[operator]
+    if direct_call is not None:
+        # Guard the direct-dispatch path on the per-arg shape / dtype
+        # signature.  Dynamic-shape kernels reusing the same launcher
+        # cache entry across calls with different shapes fall back to
+        # the JaxCallable slow path on a sig mismatch.
+        direct_sig: tuple[object, ...] = tuple(
+            (a.shape, a.dtype) for a in input_tensors
+        )
+        if direct_sig == direct_call.sig:
+            global _CALL_CUSTOM_KERNEL_DIRECT_HITS, _JAXCALLABLE_KEY_CACHE_HITS
+            _CALL_CUSTOM_KERNEL_DIRECT_HITS += 1
+            # The direct-dispatch path is a stricter version of the
+            # JaxCallable-subclass invocation-key elision (it skips the
+            # subclass entirely); bump the JaxCallable counter too so
+            # both pin tests stay valid signals for "the per-call
+            # invocation-key f-string build was elided".
+            _JAXCALLABLE_KEY_CACHE_HITS += 1
+            results = direct_call.call_custom_kernel(  # type: ignore[operator]
+                direct_call.kernel_name,
+                direct_call.kernel_key,
+                inputs=input_tensors,
+                output_shapes=direct_call.output_shapes,
+                donate_argnums=direct_call.donate_argnums,
+            )
+            for in_idx, out_idx in direct_call.alias_items:
+                input_tensors[in_idx].copy_(results[out_idx])
+            results = direct_call.out_tree.unflatten(results)  # type: ignore[attr-defined]
+        else:
+            results = jax_callable(*input_tensors)  # type: ignore[operator]
+    else:
+        results = jax_callable(*input_tensors)  # type: ignore[operator]
 
     output_only_count = fast_path.output_only_count
     if output_only_count == 0 and _orig_output_tensors is None:
@@ -1376,7 +1502,23 @@ def default_pallas_launcher(
             tensor_arg_indices,
             arg_to_tensor_pos,
             fast_path,
+            direct_call,
         ) = cache
+        # Lazily lift the direct-call kernel off the JaxCallable subclass
+        # once the first call has populated it.  Mutating the cache tuple
+        # in place is OK: ``_pallas_cache`` is keyed by ``grid`` and we
+        # only swap the trailing slot, not the prefix.
+        if direct_call is None:
+            direct_call = getattr(jax_callable, "_helion_direct_call", None)
+            if direct_call is not None:
+                pallas_kernel._pallas_cache = (  # pyrefly: ignore[missing-attribute]
+                    cache[0],
+                    jax_callable,
+                    tensor_arg_indices,
+                    arg_to_tensor_pos,
+                    fast_path,
+                    direct_call,
+                )
 
         _orig_output_tensors: dict[int, torch.Tensor] | None = None
         if _ds_pad_dims and fast_path.ds_pad_required is not False:
@@ -1390,7 +1532,7 @@ def default_pallas_launcher(
         # call already validated and any dtype-incompatible call after
         # would fail loudly inside ``JaxCallable.__call__``.
         return _pallas_invoke_and_return_fast(
-            jax_callable, args, fast_path, _orig_output_tensors
+            jax_callable, args, fast_path, _orig_output_tensors, direct_call
         )
 
     _orig_output_tensors = None
@@ -1497,13 +1639,17 @@ def default_pallas_launcher(
         _ds_pad_dims,
     )
     # Extend the cache tuple with the fast-path metadata.  See
-    # ``_pallas_build_callable`` for the base 4-tuple shape.
+    # ``_pallas_build_callable`` for the base 4-tuple shape.  The
+    # trailing ``None`` is the ``_DirectCallKernel`` slot; the launcher's
+    # cache-hit branch fills it in lazily once the JaxCallable subclass
+    # populates ``_helion_direct_call`` (after the first slow-path call).
     pallas_kernel._pallas_cache = (  # pyrefly: ignore[missing-attribute]
         grid,
         jax_callable,
         tensor_arg_indices,
         arg_to_tensor_pos,
         fast_path,
+        None,
     )
 
     return _pallas_invoke_and_return(
@@ -1571,7 +1717,19 @@ def default_pallas_pipeline_launcher(
             tensor_arg_indices,
             arg_to_tensor_pos,
             fast_path,
+            direct_call,
         ) = cache
+        if direct_call is None:
+            direct_call = getattr(jax_callable, "_helion_direct_call", None)
+            if direct_call is not None:
+                pallas_kernel._pallas_pipeline_cache = (  # pyrefly: ignore[missing-attribute]
+                    cache[0],
+                    jax_callable,
+                    tensor_arg_indices,
+                    arg_to_tensor_pos,
+                    fast_path,
+                    direct_call,
+                )
 
         _orig_output_tensors: dict[int, torch.Tensor] | None = None
         if _ds_pad_dims and fast_path.ds_pad_required is not False:
@@ -1582,7 +1740,7 @@ def default_pallas_pipeline_launcher(
                 fast_path.padded_output_arg_indices,
             )
         return _pallas_invoke_and_return_fast(
-            jax_callable, args, fast_path, _orig_output_tensors
+            jax_callable, args, fast_path, _orig_output_tensors, direct_call
         )
 
     _orig_output_tensors = None
@@ -1733,6 +1891,7 @@ def default_pallas_pipeline_launcher(
         tensor_arg_indices,
         arg_to_tensor_pos,
         fast_path,
+        None,
     )
 
     return _pallas_invoke_and_return(
@@ -1797,7 +1956,19 @@ def default_pallas_fori_launcher(
             tensor_arg_indices,
             arg_to_tensor_pos,
             fast_path,
+            direct_call,
         ) = cache
+        if direct_call is None:
+            direct_call = getattr(jax_callable, "_helion_direct_call", None)
+            if direct_call is not None:
+                pallas_kernel._pallas_fori_cache = (  # pyrefly: ignore[missing-attribute]
+                    cache[0],
+                    jax_callable,
+                    tensor_arg_indices,
+                    arg_to_tensor_pos,
+                    fast_path,
+                    direct_call,
+                )
 
         _orig_output_tensors: dict[int, torch.Tensor] | None = None
         if _ds_pad_dims and fast_path.ds_pad_required is not False:
@@ -1808,7 +1979,7 @@ def default_pallas_fori_launcher(
                 fast_path.padded_output_arg_indices,
             )
         return _pallas_invoke_and_return_fast(
-            jax_callable, args, fast_path, _orig_output_tensors
+            jax_callable, args, fast_path, _orig_output_tensors, direct_call
         )
 
     _orig_output_tensors = None
@@ -1957,6 +2128,7 @@ def default_pallas_fori_launcher(
         tensor_arg_indices,
         arg_to_tensor_pos,
         fast_path,
+        None,
     )
 
     return _pallas_invoke_and_return(
