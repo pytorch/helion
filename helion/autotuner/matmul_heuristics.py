@@ -8,10 +8,10 @@ B200, seeded from measured configs stored in
 additional initial-population candidates; regular autotuning still validates
 and benchmarks them before selecting a config.
 
-Shape buckets may be partial. Dimension buckets are exact interval labels, not
-cumulative predicates. Rules may also include exact dimension values for
-measured shapes. When multiple rules match, rules with more matching bucket
-fields are used first and JSON order breaks ties.
+Shape buckets may be partial. Dimension buckets in the JSON are interval
+predicates, not cumulative predicates. Rules may also include exact dimension
+values for measured shapes. When multiple rules match, rules with more matching
+bucket fields are used first and JSON order breaks ties.
 """
 
 from __future__ import annotations
@@ -42,11 +42,6 @@ _RUNTIME_HEURISTICS_PATH = (
 )
 _SUPPORTED_DEVICE_NAME = "B200"
 
-_MATMUL_BUCKET_BOUNDS = {
-    "m": [4, 8, 16, 64, 128, 256, 512, 1024, 4096],
-    "n": [64, 128, 256, 512, 1024, 4096],
-    "k": [64, 128, 256, 512, 1024, 4096, 32768],
-}
 _SHAPE_BUCKET_KEYS = frozenset(
     {
         "aspect",
@@ -108,17 +103,6 @@ def _dtype_family_from_dtype(dtype: object) -> str:
     if "float32" in dtype:
         return "fp32"
     return "other"
-
-
-def _dimension_interval_bucket(value: int | None, bounds: Sequence[int]) -> str:
-    if value is None:
-        return "unknown"
-    lower = 0
-    for upper in bounds:
-        if value <= upper:
-            return f"({lower},{upper}]"
-        lower = upper
-    return f"({bounds[-1]},inf)"
 
 
 def _matmul_shape(shapes: Sequence[tuple[int, ...]]) -> tuple[int, int, int] | None:
@@ -219,9 +203,6 @@ def _matmul_shape_bucket_from_values(
     return {
         "aspect": _aspect_bucket(m, n, k),
         "dtype": dtype_family,
-        "k_bucket": _dimension_interval_bucket(k, _MATMUL_BUCKET_BOUNDS["k"]),
-        "m_bucket": _dimension_interval_bucket(m, _MATMUL_BUCKET_BOUNDS["m"]),
-        "n_bucket": _dimension_interval_bucket(n, _MATMUL_BUCKET_BOUNDS["n"]),
         "k_value": k,
         "m_value": m,
         "n_value": n,
@@ -266,13 +247,38 @@ def _shape_bucket_matches(
     query_bucket: dict[str, object],
 ) -> bool:
     for key, value in rule_bucket.items():
-        query_value = query_bucket.get(key)
-        if isinstance(value, list):
-            if query_value not in value:
+        if key in {"k_bucket", "m_bucket", "n_bucket"}:
+            dim_value = query_bucket.get(f"{key[0]}_value")
+            intervals = value if isinstance(value, list) else [value]
+            if not any(
+                isinstance(interval, str)
+                and isinstance(dim_value, int)
+                and _interval_contains(interval, dim_value)
+                for interval in intervals
+            ):
                 return False
-        elif query_value != value:
+            continue
+        query_value = query_bucket.get(key)
+        if isinstance(value, list) and query_value not in value:
+            return False
+        if not isinstance(value, list) and query_value != value:
             return False
     return True
+
+
+def _interval_contains(interval: str, value: int) -> bool:
+    if len(interval) < 5 or interval[0] not in "([" or interval[-1] not in ")]":
+        return False
+    try:
+        lower_text, upper_text = interval[1:-1].split(",", maxsplit=1)
+        lower = float(lower_text)
+        upper = float("inf") if upper_text == "inf" else float(upper_text)
+    except ValueError:
+        return False
+
+    lower_ok = value >= lower if interval[0] == "[" else value > lower
+    upper_ok = value <= upper if interval[-1] == "]" else value < upper
+    return lower_ok and upper_ok
 
 
 def _rules_for_bucket(
