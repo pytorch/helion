@@ -196,7 +196,7 @@ VALID_KEYS: frozenset[str] = frozenset(
         *_BACKEND_STRATEGY_CONFIG_KEYS,
     ]
 )
-VALID_PALLAS_LOOP_TYPES = ("emit_pipeline", "unroll", "fori_loop")
+VALID_PALLAS_LOOP_TYPES = ("emit_pipeline", "unroll", "fori_loop", "outer_grid")
 VALID_PID_TYPES = (
     "flat",
     "xyz",
