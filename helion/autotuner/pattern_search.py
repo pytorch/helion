@@ -155,6 +155,9 @@ class PatternSearch(PopulationBasedSearch):
 
         # again with higher accuracy
         self.rebenchmark_population(self.population, desc="Verifying initial results")
+        # Snapshot compiler-seeded members so they survive the search-loop
+        # pruning into the final-pick verification candidate pool.
+        self.capture_compiler_seed_members(self.population)
         self.population.sort(key=performance)
         starting_points = []
         for member in self.population[: self.copies]:
