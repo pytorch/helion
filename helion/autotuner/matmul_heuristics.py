@@ -37,7 +37,6 @@ if TYPE_CHECKING:
     from .config_spec import MatmulFact
 
 
-MATMUL_HEURISTICS_ENV = "HELION_AUTOTUNE_MATMUL_HEURISTICS"
 _RUNTIME_HEURISTICS_PATH = (
     Path(__file__).resolve().parent / "heuristics" / "matmul_b200.json"
 )
@@ -63,7 +62,7 @@ _SHAPE_BUCKET_KEYS = frozenset(
 
 
 def matmul_heuristics_enabled() -> bool:
-    value = os.environ.get(MATMUL_HEURISTICS_ENV)
+    value = os.environ.get("HELION_AUTOTUNE_MATMUL_HEURISTICS")
     if value is None:
         return True
     return value.lower() in {"1", "true", "yes", "on"}
@@ -361,7 +360,7 @@ def matmul_heuristic_seed_configs_for_kernel(
     config_spec: ConfigSpec,
     max_configs: int,
 ) -> list[Config]:
-    if not matmul_heuristics_enabled() or not matmul_heuristics_supported_on_args(args):
+    if not matmul_heuristics_supported_on_args(args):
         return []
     kernel_class = _infer_matmul_family_class(
         kernel,
