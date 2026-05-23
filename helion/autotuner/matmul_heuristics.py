@@ -8,10 +8,10 @@ B200, seeded from measured configs stored in
 additional initial-population candidates; regular autotuning still validates
 and benchmarks them before selecting a config.
 
-Shape buckets may be partial. Dimension buckets in the JSON are interval
-predicates, not cumulative predicates. Rules may also include exact dimension
-values for measured shapes. When multiple rules match, rules with more matching
-bucket fields are used first and JSON order breaks ties.
+Rules match dtype plus M/N/K interval and exact-value predicates. Dimension
+buckets in the JSON are interval predicates, not cumulative predicates. When
+multiple rules match, rules with more matching bucket fields are used first and
+JSON order breaks ties.
 """
 
 from __future__ import annotations
@@ -44,7 +44,6 @@ _SUPPORTED_DEVICE_NAME = "B200"
 
 _SHAPE_BUCKET_KEYS = frozenset(
     {
-        "aspect",
         "dtype",
         "k_bucket",
         "m_bucket",
@@ -105,12 +104,6 @@ def _dtype_family_from_dtype(dtype: object) -> str:
     return "other"
 
 
-def _matmul_shape(shapes: Sequence[tuple[int, ...]]) -> tuple[int, int, int] | None:
-    if len(shapes) < 2 or len(shapes[0]) < 2 or len(shapes[1]) < 2:
-        return None
-    return (shapes[0][-2], shapes[1][-1], shapes[0][-1])
-
-
 def _infer_int4_matmul_class(
     kernel: _AutotunableKernel | None,
     args: Sequence[object],
@@ -134,6 +127,18 @@ def _infer_int4_matmul_class(
     return "matmul_int4" if "int4" in source else None
 
 
+def _single_2d_matmul_fact(config_spec: ConfigSpec) -> MatmulFact | None:
+    facts = config_spec.matmul_facts
+    if len(facts) != 1:
+        return None
+    fact = facts[0]
+    if fact.lhs_ndim != 2 or fact.rhs_ndim != 2:
+        return None
+    if fact.static_m is None or fact.static_n is None or fact.static_k is None:
+        return None
+    return fact
+
+
 def _infer_matmul_family_class(
     kernel: _AutotunableKernel | None,
     args: Sequence[object],
@@ -154,71 +159,28 @@ def _infer_matmul_family_class(
     return None
 
 
-def _single_2d_matmul_fact(config_spec: ConfigSpec) -> MatmulFact | None:
-    facts = config_spec.matmul_facts
-    if len(facts) != 1:
+def _shape_bucket_from_args(args: Sequence[object]) -> dict[str, object] | None:
+    shapes = _tensor_shapes(args)
+    if len(shapes) < 2 or len(shapes[0]) < 2 or len(shapes[1]) < 2:
         return None
-    fact = facts[0]
-    if fact.lhs_ndim != 2 or fact.rhs_ndim != 2:
-        return None
-    if fact.static_m is None or fact.static_n is None or fact.static_k is None:
-        return None
-    return fact
-
-
-def _aspect_bucket(m: int, n: int, k: int) -> str:
-    min_dim = min(m, n, k)
-    if min_dim <= 0:
-        return "unknown"
-    max_dim = max(m, n, k)
-    if max_dim / min_dim < 4:
-        return "balanced"
-    if m == min_dim:
-        return "skinny_m"
-    if n == min_dim:
-        return "skinny_n"
-    return "skinny_k"
-
-
-def _matmul_shape_bucket(args: Sequence[object]) -> dict[str, object] | None:
-    shape = _matmul_shape(_tensor_shapes(args))
-    if shape is None:
-        return None
-    m, n, k = shape
-    return _matmul_shape_bucket_from_values(
-        m,
-        n,
-        k,
-        dtype_family=_dtype_family(args),
-    )
-
-
-def _matmul_shape_bucket_from_values(
-    m: int,
-    n: int,
-    k: int,
-    *,
-    dtype_family: str,
-) -> dict[str, object]:
     return {
-        "aspect": _aspect_bucket(m, n, k),
-        "dtype": dtype_family,
-        "k_value": k,
-        "m_value": m,
-        "n_value": n,
+        "dtype": _dtype_family(args),
+        "m_value": shapes[0][-2],
+        "n_value": shapes[1][-1],
+        "k_value": shapes[0][-1],
     }
 
 
-def _matmul_shape_bucket_from_fact(fact: MatmulFact) -> dict[str, object]:
+def _shape_bucket_from_fact(fact: MatmulFact) -> dict[str, object]:
     assert fact.static_m is not None
     assert fact.static_n is not None
     assert fact.static_k is not None
-    return _matmul_shape_bucket_from_values(
-        fact.static_m,
-        fact.static_n,
-        fact.static_k,
-        dtype_family=_dtype_family_from_dtype(fact.lhs_dtype),
-    )
+    return {
+        "dtype": _dtype_family_from_dtype(fact.lhs_dtype),
+        "m_value": fact.static_m,
+        "n_value": fact.static_n,
+        "k_value": fact.static_k,
+    }
 
 
 @functools.cache
@@ -327,13 +289,26 @@ def matmul_heuristic_seed_configs(
     config_spec: ConfigSpec,
     max_configs: int,
     kernel_class: str = "matmul",
-    shape_bucket: dict[str, object] | None = None,
+) -> list[Config]:
+    shape_bucket = _shape_bucket_from_args(args)
+    if shape_bucket is None:
+        return []
+    return _seed_configs_for_bucket(
+        shape_bucket,
+        config_spec=config_spec,
+        max_configs=max_configs,
+        kernel_class=kernel_class,
+    )
+
+
+def _seed_configs_for_bucket(
+    shape_bucket: dict[str, object],
+    *,
+    config_spec: ConfigSpec,
+    max_configs: int,
+    kernel_class: str,
 ) -> list[Config]:
     if max_configs <= 0 or not matmul_heuristics_enabled():
-        return []
-    if shape_bucket is None:
-        shape_bucket = _matmul_shape_bucket(args)
-    if shape_bucket is None:
         return []
     rules = _rules_for_bucket(kernel_class, shape_bucket)
     if not rules:
@@ -379,13 +354,16 @@ def matmul_heuristic_seed_configs_for_kernel(
     if kernel_class == "matmul":
         fact = _single_2d_matmul_fact(config_spec)
         if fact is not None:
-            shape_bucket = _matmul_shape_bucket_from_fact(fact)
-    return matmul_heuristic_seed_configs(
-        args,
+            shape_bucket = _shape_bucket_from_fact(fact)
+    if shape_bucket is None:
+        shape_bucket = _shape_bucket_from_args(args)
+    if shape_bucket is None:
+        return []
+    return _seed_configs_for_bucket(
+        shape_bucket,
         config_spec=config_spec,
         max_configs=max_configs,
         kernel_class=kernel_class,
-        shape_bucket=shape_bucket,
     )
 
 

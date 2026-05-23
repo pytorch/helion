@@ -23,7 +23,6 @@ if TYPE_CHECKING:
     from contextlib import AbstractContextManager
 
 _SHAPE_BUCKET_KEYS = {
-    "aspect",
     "dtype",
     "k_bucket",
     "m_bucket",
@@ -32,6 +31,13 @@ _SHAPE_BUCKET_KEYS = {
     "m_value",
     "n_value",
 }
+
+
+def _fake_tensor(
+    shape: tuple[int, ...],
+    dtype: torch.dtype = torch.bfloat16,
+) -> SimpleNamespace:
+    return SimpleNamespace(shape=shape, dtype=dtype)
 
 
 def _supported_b200_device() -> AbstractContextManager[object]:
@@ -93,8 +99,8 @@ def _matmul_config_spec(
 
 def test_matmul_seeds_are_default_on_and_disableable() -> None:
     config_spec = _matmul_config_spec()
-    x = torch.empty((1024, 1024), dtype=torch.bfloat16)
-    y = torch.empty((1024, 1024), dtype=torch.bfloat16)
+    x = _fake_tensor((1024, 1024))
+    y = _fake_tensor((1024, 1024))
 
     with patch.dict(os.environ, {}, clear=True):
         assert matmul_heuristic_seed_configs(
@@ -120,8 +126,8 @@ def test_matmul_seeds_are_default_on_and_disableable() -> None:
 
 def test_matmul_heuristics_generate_valid_seed() -> None:
     config_spec = _matmul_config_spec()
-    x = torch.empty((1024, 1024), dtype=torch.bfloat16)
-    y = torch.empty((1024, 1024), dtype=torch.bfloat16)
+    x = _fake_tensor((1024, 1024))
+    y = _fake_tensor((1024, 1024))
 
     seeds = matmul_heuristic_seed_configs(
         (x, y),
@@ -176,8 +182,8 @@ def test_matmul_kernel_detection_uses_matmul_facts() -> None:
         reduction_loops=[object()],
         matmul_facts=[_matmul_fact()],
     )
-    x = torch.empty((1024, 1024), dtype=torch.bfloat16)
-    y = torch.empty((1024, 1024), dtype=torch.bfloat16)
+    x = _fake_tensor((1024, 1024))
+    y = _fake_tensor((1024, 1024))
 
     with _supported_b200_device():
         seeds = matmul_heuristic_seed_configs_for_kernel(
@@ -194,44 +200,17 @@ def test_matmul_kernel_detection_uses_matmul_facts() -> None:
 
 def test_dense_matmul_exact_ci_seed_buckets() -> None:
     cases = (
-        (
-            {
-                "aspect": "skinny_n",
-                "dtype": "fp16_bf16",
-                "k_bucket": "(512,1024]",
-                "m_bucket": "(1024,4096]",
-                "n_bucket": "(512,1024]",
-                "k_value": 1024,
-                "m_value": 4096,
-                "n_value": 1024,
-            },
-            [256, 128, 64],
-            [64],
-        ),
-        (
-            {
-                "aspect": "balanced",
-                "dtype": "fp16_bf16",
-                "k_bucket": "(1024,4096]",
-                "m_bucket": "(1024,4096]",
-                "n_bucket": "(1024,4096]",
-                "k_value": 2048,
-                "m_value": 2048,
-                "n_value": 4096,
-            },
-            [256, 256, 64],
-            [4],
-        ),
+        ((4096, 1024, 1024), [256, 128, 64], [64]),
+        ((2048, 4096, 2048), [256, 256, 64], [4]),
     )
 
     config_spec = _matmul_config_spec()
-    for shape_bucket, expected_block_sizes, expected_l2 in cases:
+    for (m, n, k), expected_block_sizes, expected_l2 in cases:
         seeds = matmul_heuristic_seed_configs(
-            (),
+            (_fake_tensor((m, k)), _fake_tensor((k, n))),
             config_spec=config_spec,
             max_configs=10,
             kernel_class="matmul",
-            shape_bucket=shape_bucket,
         )
 
         seed = dict(seeds[0])
@@ -244,8 +223,8 @@ def test_matmul_kernel_detection_skips_multiple_matmuls() -> None:
         reduction_loops=[object()],
         matmul_facts=[_matmul_fact(), _matmul_fact()],
     )
-    x = torch.empty((1024, 1024), dtype=torch.bfloat16)
-    y = torch.empty((1024, 1024), dtype=torch.bfloat16)
+    x = _fake_tensor((1024, 1024))
+    y = _fake_tensor((1024, 1024))
 
     with _supported_b200_device():
         seeds = matmul_heuristic_seed_configs_for_kernel(
@@ -260,44 +239,20 @@ def test_matmul_kernel_detection_skips_multiple_matmuls() -> None:
 
 def test_int4_matmul_exact_ci_seed_buckets() -> None:
     cases = (
-        (
-            {
-                "aspect": "skinny_m",
-                "dtype": "fp16_bf16",
-                "k_bucket": "(4096,32768]",
-                "m_bucket": "(0,4]",
-                "n_bucket": "(1024,4096]",
-                "k_value": 8192,
-                "m_value": 1,
-                "n_value": 1280,
-            },
-            [1024, 1, 16],
-            [64],
-        ),
-        (
-            {
-                "aspect": "skinny_n",
-                "dtype": "fp16_bf16",
-                "k_bucket": "(4096,32768]",
-                "m_bucket": "(4096,inf)",
-                "n_bucket": "(1024,4096]",
-                "k_value": 8192,
-                "m_value": 65536,
-                "n_value": 1280,
-            },
-            [16, 128, 256],
-            [32],
-        ),
+        ((1, 1280, 8192), [1024, 1, 16], [64]),
+        ((65536, 1280, 8192), [16, 128, 256], [32]),
     )
 
     config_spec = _matmul_config_spec()
-    for shape_bucket, expected_block_sizes, expected_l2 in cases:
+    for (m, n, k), expected_block_sizes, expected_l2 in cases:
         seeds = matmul_heuristic_seed_configs(
-            (),
+            (
+                _fake_tensor((m, k)),
+                _fake_tensor((k // 2, n), dtype=torch.int8),
+            ),
             config_spec=config_spec,
             max_configs=10,
             kernel_class="matmul_int4",
-            shape_bucket=shape_bucket,
         )
 
         seed = dict(seeds[0])
@@ -311,20 +266,13 @@ def test_int4_matmul_bad_ffn_w2_shapes_fall_back() -> None:
     for m_value in (1, 4):
         assert (
             matmul_heuristic_seed_configs(
-                (),
+                (
+                    _fake_tensor((m_value, 3584)),
+                    _fake_tensor((1792, 8192), dtype=torch.int8),
+                ),
                 config_spec=config_spec,
                 max_configs=10,
                 kernel_class="matmul_int4",
-                shape_bucket={
-                    "aspect": "skinny_m",
-                    "dtype": "fp16_bf16",
-                    "k_bucket": "(1024,4096]",
-                    "m_bucket": "(0,4]",
-                    "n_bucket": "(4096,inf)",
-                    "k_value": 3584,
-                    "m_value": m_value,
-                    "n_value": 8192,
-                },
             )
             == []
         )
@@ -332,8 +280,8 @@ def test_int4_matmul_bad_ffn_w2_shapes_fall_back() -> None:
 
 def test_matmul_heuristics_skip_non_matching_shape() -> None:
     config_spec = _matmul_config_spec()
-    x = torch.empty((128, 128), dtype=torch.bfloat16)
-    y = torch.empty((128, 128), dtype=torch.bfloat16)
+    x = _fake_tensor((128, 128))
+    y = _fake_tensor((128, 128))
 
     assert (
         matmul_heuristic_seed_configs(
