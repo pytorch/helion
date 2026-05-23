@@ -581,7 +581,7 @@ def requires_torch_version(min_version: str) -> bool:
 
 @functools.cache
 def supports_torch_compile_fusion() -> bool:
-    """Check whether this PyTorch build exposes Helion's fusion entrypoint."""
+    """Check whether this PyTorch build exposes Helion's fusion entrypoints."""
     if torch.xpu.is_available():
         return False
     if not requires_torch_version("2.11"):
@@ -595,6 +595,7 @@ def supports_torch_compile_fusion() -> bool:
         init_names = TemplateBuffer.__init__.__code__.co_names
         assert "allow_prologue_fusion" in init_names
         assert "allow_epilogue_fusion" in init_names
+        assert hasattr(TemplateBuffer, "has_aliasing_or_mutation_for_prologue_fusion")
     except (ImportError, AttributeError, AssertionError):
         return False
     return True
