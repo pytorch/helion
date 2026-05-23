@@ -21,7 +21,6 @@ import inspect
 import json
 import os
 from pathlib import Path
-import textwrap
 from typing import TYPE_CHECKING
 from typing import Any
 from typing import cast
@@ -39,19 +38,11 @@ if TYPE_CHECKING:
 
 
 MATMUL_HEURISTICS_ENV = "HELION_AUTOTUNE_MATMUL_HEURISTICS"
-MATMUL_HEURISTICS_PATH_ENV = "HELION_AUTOTUNE_MATMUL_HEURISTICS_PATH"
 _RUNTIME_HEURISTICS_PATH = (
     Path(__file__).resolve().parent / "heuristics" / "matmul_b200.json"
 )
 _SUPPORTED_DEVICE_NAME = "B200"
 
-_MATMUL_KERNEL_CLASSES = frozenset(
-    {"matmul", "matmul_int4", "matmul_int16", "matmul_fp4"}
-)
-_QUANTIZED_KERNEL_FINGERPRINTS: tuple[tuple[str, frozenset[str]], ...] = (
-    ("matmul_fp4", frozenset({"e2m1", "fp4", "nvfp4"})),
-    ("matmul_int4", frozenset({"int4", "pack_int4", "unpack_int4"})),
-)
 _MATMUL_BUCKET_BOUNDS = {
     "m": [4, 8, 16, 64, 128, 256, 512, 1024, 4096],
     "n": [64, 128, 256, 512, 1024, 4096],
@@ -64,53 +55,24 @@ _SHAPE_BUCKET_KEYS = frozenset(
         "k_bucket",
         "m_bucket",
         "n_bucket",
-        "k_value",
         "m_value",
         "n_value",
+        "k_value",
     }
 )
 
 
-def _env_flag_enabled(name: str, *, default: bool) -> bool:
-    value = os.environ.get(name)
-    if value is None:
-        return default
-    return value.lower() in {"1", "true", "yes", "on"}
-
-
 def matmul_heuristics_enabled() -> bool:
-    return _env_flag_enabled(MATMUL_HEURISTICS_ENV, default=True)
+    value = os.environ.get(MATMUL_HEURISTICS_ENV)
+    if value is None:
+        return True
+    return value.lower() in {"1", "true", "yes", "on"}
 
 
 def matmul_heuristics_supported_on_args(args: Sequence[object]) -> bool:
     device = extract_device(args)
     device_name = get_device_name(device) if device is not None else None
     return device_name is not None and _SUPPORTED_DEVICE_NAME in device_name
-
-
-@functools.cache
-def _runtime_heuristics() -> dict[str, object]:
-    path = Path(os.environ.get(MATMUL_HEURISTICS_PATH_ENV) or _RUNTIME_HEURISTICS_PATH)
-    if not path.exists():
-        return {"rules": []}
-    with path.open(encoding="utf-8") as handle:
-        data = json.load(handle)
-    return data if isinstance(data, dict) else {"rules": []}
-
-
-def _kernel_source_text(kernel: _AutotunableKernel) -> str:
-    try:
-        raw_source = inspect.getsource(cast("Any", kernel).kernel.fn)
-    except (AttributeError, OSError, TypeError):
-        return "# Source unavailable"
-
-    source_lines = textwrap.dedent(raw_source).splitlines()
-    start_idx = 0
-    while start_idx < len(source_lines) and not source_lines[
-        start_idx
-    ].lstrip().startswith("def "):
-        start_idx += 1
-    return "\n".join(source_lines[start_idx:])
 
 
 def _tensor_shapes(args: Sequence[object]) -> list[tuple[int, ...]]:
@@ -166,16 +128,12 @@ def _matmul_shape(shapes: Sequence[tuple[int, ...]]) -> tuple[int, int, int] | N
     return (shapes[0][-2], shapes[1][-1], shapes[0][-1])
 
 
-def _infer_quantized_matmul_class(
+def _infer_int4_matmul_class(
     kernel: _AutotunableKernel | None,
     args: Sequence[object],
 ) -> str | None:
     dtypes = _tensor_dtypes(args)
-    if len(dtypes) < 2:
-        return None
-    if "int16" in dtypes[1]:
-        return "matmul_int16"
-    if "int8" not in dtypes[1]:
+    if len(dtypes) < 2 or "int8" not in dtypes[1]:
         return None
 
     shapes = _tensor_shapes(args)
@@ -186,12 +144,11 @@ def _infer_quantized_matmul_class(
         return None
     if kernel is None:
         return None
-
-    source = _kernel_source_text(kernel).lower()
-    for class_name, markers in _QUANTIZED_KERNEL_FINGERPRINTS:
-        if any(marker in source for marker in markers):
-            return class_name
-    return None
+    try:
+        source = inspect.getsource(cast("Any", kernel).kernel.fn).lower()
+    except (AttributeError, OSError, TypeError):
+        return None
+    return "matmul_int4" if "int4" in source else None
 
 
 def _infer_matmul_family_class(
@@ -205,9 +162,9 @@ def _infer_matmul_family_class(
     if not isinstance(block_sizes, list) or len(block_sizes) != 3:
         return None
 
-    quantized = _infer_quantized_matmul_class(kernel, args)
-    if quantized is not None:
-        return quantized
+    int4_kernel_class = _infer_int4_matmul_class(kernel, args)
+    if int4_kernel_class is not None:
+        return int4_kernel_class
 
     if _single_2d_matmul_fact(config_spec) is not None:
         return "matmul"
@@ -286,7 +243,9 @@ def _matmul_shape_bucket_from_fact(fact: MatmulFact) -> dict[str, object]:
 
 @functools.cache
 def _heuristic_rules() -> tuple[dict[str, object], ...]:
-    raw_rules = _runtime_heuristics().get("rules", [])
+    with _RUNTIME_HEURISTICS_PATH.open(encoding="utf-8") as handle:
+        data = json.load(handle)
+    raw_rules = data.get("rules", []) if isinstance(data, dict) else []
     if not isinstance(raw_rules, list):
         return ()
     rules: list[dict[str, object]] = []
@@ -321,15 +280,15 @@ def _rules_for_bucket(
     kernel_class: str,
     shape_bucket: dict[str, object],
 ) -> list[dict[str, object]]:
-    matches: list[dict[str, object]] = []
-    for rule in _heuristic_rules():
-        if rule.get("kernel_class") != kernel_class:
-            continue
-        rule_bucket = rule.get("shape_bucket")
-        if not isinstance(rule_bucket, dict):
-            continue
-        if _shape_bucket_matches(rule_bucket, shape_bucket):
-            matches.append(rule)
+    matches = [
+        rule
+        for rule in _heuristic_rules()
+        if rule["kernel_class"] == kernel_class
+        and _shape_bucket_matches(
+            cast("dict[str, object]", rule["shape_bucket"]),
+            shape_bucket,
+        )
+    ]
     matches.sort(
         key=lambda rule: len(cast("dict[str, object]", rule["shape_bucket"])),
         reverse=True,
@@ -337,12 +296,12 @@ def _rules_for_bucket(
     return matches
 
 
-def _supported_sparse_config(
+def _materialize_config(
     raw: dict[str, object],
     *,
     config_spec: ConfigSpec,
-) -> dict[str, object]:
-    flat_fields = dict(config_spec._flat_fields())
+) -> Config:
+    flat_fields = config_spec._flat_fields()
     supported = {key: value for key, value in raw.items() if key in flat_fields}
     allowed_pid_types = config_spec.allowed_pid_types
     if (
@@ -351,15 +310,6 @@ def _supported_sparse_config(
         and supported["pid_type"] not in allowed_pid_types
     ):
         supported.pop("pid_type")
-    return supported
-
-
-def _materialize_config(
-    raw: dict[str, object],
-    *,
-    config_spec: ConfigSpec,
-) -> Config:
-    supported = _supported_sparse_config(raw, config_spec=config_spec)
     merged = dict(config_spec.default_config())
     merged.update(supported)
     config_spec.normalize(merged, _fix_invalid=True)
@@ -375,8 +325,6 @@ def matmul_heuristic_seed_configs(
     shape_bucket: dict[str, object] | None = None,
 ) -> list[Config]:
     if max_configs <= 0 or not matmul_heuristics_enabled():
-        return []
-    if kernel_class not in _MATMUL_KERNEL_CLASSES:
         return []
     if shape_bucket is None:
         shape_bucket = _matmul_shape_bucket(args)

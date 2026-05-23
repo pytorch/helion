@@ -148,9 +148,10 @@ def test_matmul_heuristic_rules_have_unique_shape_buckets() -> None:
 
     assert set(data) == {"rules"}
     assert len(keys) == len(set(keys))
-    assert {rule["kernel_class"] for rule in data["rules"]}.issubset(
-        {"matmul", "matmul_int4", "matmul_int16", "matmul_fp4"}
-    )
+    assert {rule["kernel_class"] for rule in data["rules"]} == {
+        "matmul",
+        "matmul_int4",
+    }
     for rule in data["rules"]:
         assert set(rule) == {"kernel_class", "shape_bucket", "templates"}
         assert set(rule["shape_bucket"]).issubset(_SHAPE_BUCKET_KEYS)
