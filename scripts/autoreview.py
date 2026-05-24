@@ -361,19 +361,33 @@ class ClaudeSession:
         return result
 
 
-def run_codex_review(prompt: str, log_path: Path, meta: bool) -> str:
+def run_codex_review(
+    prompt: str, log_path: Path, meta: bool, no_sandbox: bool = False
+) -> str:
     """Run codex one-shot, return the last message text. Codex only ever
-    reviews — fixes are performed by the claude session — so the sandbox is
-    always read-only regardless of how the parent script was invoked."""
+    reviews — fixes are performed by the claude session — so by default the
+    sandbox is read-only regardless of how the parent script was invoked.
+
+    ``no_sandbox=True`` is a trust-the-model escape hatch for hosts without
+    bubblewrap: it switches Codex to ``-s danger-full-access`` and passes
+    ``--dangerously-disable-linux-sandbox``, so a misbehaving model could
+    modify the repo. Use only when the host can't run the sandbox launcher.
+    """
     cmd = ["codex"]
     if meta:
         cmd.append("--dangerously-enable-internet-mode")
+    if no_sandbox:
+        # Required on hosts without bubblewrap (`sandbox launcher failed
+        # because bubblewrap is unavailable`).
+        cmd.append("--dangerously-disable-linux-sandbox")
     cmd += [
         "-c",
         f'model_reasoning_effort="{CODEX_REASONING_EFFORT}"',
         "exec",
+        # danger-full-access avoids the sandbox launcher path entirely when
+        # bubblewrap is unavailable; read-only otherwise.
         "-s",
-        "read-only",
+        "danger-full-access" if no_sandbox else "read-only",
     ]
     with tempfile.NamedTemporaryFile(suffix=".txt", delete=False) as tf:
         out_path = Path(tf.name)
@@ -473,6 +487,14 @@ def main() -> int:
         help="Skip the codex review and just run claude.",
     )
     parser.add_argument(
+        "--codex-no-sandbox",
+        action="store_true",
+        help=(
+            "Pass `--dangerously-disable-linux-sandbox` to codex. "
+            "Required on hosts without bubblewrap installed."
+        ),
+    )
+    parser.add_argument(
         "--fix",
         action="store_true",
         help="If review is not LGTM, ask claude to fix the issues.",
@@ -516,7 +538,10 @@ def main() -> int:
         jobs = {"claude review": lambda: claude.send(review_prompt)}
         if not args.no_codex:
             jobs["codex review"] = lambda: run_codex_review(
-                review_prompt, log_dir / "codex.log", args.meta
+                review_prompt,
+                log_dir / "codex.log",
+                args.meta,
+                no_sandbox=args.codex_no_sandbox,
             )
         results = run_parallel(spinner, jobs)
         claude_review = results["claude review"]
