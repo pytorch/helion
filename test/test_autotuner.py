@@ -2634,9 +2634,14 @@ class TestCuteAutotuner(TestCase):
         # ``loop_orders`` is exposed for the cute non-tcgen05 search
         # surface (audited fp32 1024^3 matmul finds ~3x bench-time wins
         # from ``[[1, 0]]`` over the default ``[[0, 1]]`` — see
-        # ``cute_plan.md`` §7.0). The set still excludes Triton-style
-        # knobs that the cute path does not consume.
-        self.assertEqual(flat_keys, {"block_sizes", "num_threads", "loop_orders"})
+        # ``cute_plan.md`` §7.0). ``cute_vector_widths`` is the per-axis
+        # vec width slot registered for non-reduction tile blocks. The
+        # set still excludes Triton-style knobs that the cute path does
+        # not consume.
+        self.assertEqual(
+            flat_keys,
+            {"block_sizes", "num_threads", "loop_orders", "cute_vector_widths"},
+        )
 
         repaired = gen.unflatten(
             gen.flatten(helion.Config(block_sizes=[16, 64], num_threads=[128, 128]))
@@ -2648,7 +2653,8 @@ class TestCuteAutotuner(TestCase):
         self.assertTrue(any(config.num_threads for config in configs))
         for config in configs:
             self.assertLessEqual(
-                set(config.config), {"block_sizes", "num_threads", "loop_orders"}
+                set(config.config),
+                {"block_sizes", "num_threads", "loop_orders", "cute_vector_widths"},
             )
             self.assertNotIn("persistent", config.pid_type)
             explicit_threads = [nt for nt in config.num_threads if nt > 0]

@@ -215,21 +215,39 @@ def _node_text(node: ast.AST) -> str:
 
 
 def _rewrite_vec_extract(
-    node: ast.AST, hoist_var: str, cache: str, idx_expr: str, vec_w: int
+    node: ast.AST,
+    hoist_var: str,
+    cache: str,
+    idx_expr: str,
+    vec_w: int,
+    *,
+    use_smem: bool = False,
+    thread_count: int = 1,
 ) -> None:
-    """In-place rewrite of ``hoist_var[<vi>]`` -> ``cache[(idx_expr)*V + vi]``
-    inside ``node``.  Used after the vec hoist itself has been deleted from
-    the consume sweep so the dependent extracts still resolve.
+    """In-place rewrite of ``hoist_var[<vi>]`` -> cache read inside ``node``.
+
+    Used after the vec hoist itself has been deleted from the consume
+    sweep so the dependent extracts still resolve.
+
+    Register-cache slot: ``cache[(idx_expr)*V + vi]`` (per-thread).
+    SMEM-cache slot: ``cache[((idx_expr)*V + vi) * num_threads + tid]``
+    (per-CTA, with the thread offset tail-packed so writes from the
+    first sweep land at the same slot the consume sweep reads).
     """
+
+    tid_expr = "cutlass.Int32(cute.arch.thread_idx()[0])"
 
     class _RewriteVecExtract(ast.NodeTransformer):
         def visit_Subscript(self, node: ast.Subscript) -> ast.AST:
             self.generic_visit(node)
             if isinstance(node.value, ast.Name) and node.value.id == hoist_var:
                 vi_text = ast.unparse(node.slice)
-                new = ast.parse(f"{cache}[({idx_expr}) * {vec_w} + ({vi_text})]").body[
-                    0
-                ]
+                inner = f"({idx_expr}) * {vec_w} + ({vi_text})"
+                if use_smem:
+                    slot = f"({inner}) * {thread_count} + ({tid_expr})"
+                else:
+                    slot = inner
+                new = ast.parse(f"{cache}[{slot}]").body[0]
                 assert isinstance(new, ast.Expr)
                 return new.value
             return node
@@ -260,10 +278,25 @@ def _canonical_load_text(node: ast.AST, lane_var_alias: dict[str, str]) -> str:
 class _CuteFuseTwoPassLoads(ast.NodeTransformer):
     """See module docstring."""
 
-    def __init__(self, constexpr_values: dict[str, int] | None = None) -> None:
+    def __init__(
+        self,
+        constexpr_values: dict[str, int] | None = None,
+        thread_block_dims: tuple[int, int, int] = (1, 1, 1),
+    ) -> None:
         super().__init__()
         self._counter = 0
         self._constexpr_values = constexpr_values or {}
+        # Per-axis thread dims for the CUDA thread block.  Used by the
+        # SMEM-backed cache path to (a) size the SMEM allocation by
+        # total thread count and (b) emit a linear per-thread slot
+        # index that is unique across all axes.
+        dims = (
+            max(1, int(thread_block_dims[0])),
+            max(1, int(thread_block_dims[1])),
+            max(1, int(thread_block_dims[2])),
+        )
+        self._thread_block_dims = dims
+        self._thread_count = dims[0] * dims[1] * dims[2]
 
     def _new_cache_name(self) -> str:
         name = f"_fuse_cache_{self._counter}"
@@ -342,28 +375,60 @@ class _CuteFuseTwoPassLoads(ast.NodeTransformer):
         """Collect per-loop variable renames that need to be normalised so
         the two sweeps' load expressions compare equal.
 
-        Currently handles the LoopedReductionStrategy's ``unroll`` mode:
-          - ``reduction_lane_base_<N>`` (per sweep)
-          - ``reduction_vec_lane_<N>`` (per sweep)
+        Currently handles:
+          - LoopedReductionStrategy ``unroll`` mode:
+            ``reduction_lane_base_<N>``, ``reduction_vec_lane_<N>``.
+          - CuteNDTileStrategy lane / vec naming:
+            ``lane_base_<N>``, ``_tile_unroll_vec_<N>_<sweep>``,
+            ``vec_lane_<N>``.
         """
         alias: dict[str, str] = {}
 
-        def _collect(loop: ast.For, prefix: str) -> str | None:
+        def _collect_assign(loop: ast.For, prefix: str) -> str | None:
+            """Return the first variable name assigned inside ``loop``
+            whose name starts with ``prefix``.
+
+            We require an assignment (not just a usage) so we always
+            pick a single fresh name per sweep, even when downstream
+            statements alias the var further.
+            """
             for s in ast.walk(loop):
-                if isinstance(s, ast.Name) and s.id.startswith(prefix):
-                    return s.id
                 if isinstance(s, ast.Assign):
                     for t in s.targets:
                         if isinstance(t, ast.Name) and t.id.startswith(prefix):
                             return t.id
             return None
 
-        for prefix in ("reduction_lane_base_", "reduction_vec_lane_"):
-            first_var = _collect(first_loop, prefix)
-            second_var = _collect(second_loop, prefix)
+        def _collect_for_target(loop: ast.For, prefix: str) -> str | None:
+            """Return the first for-loop target name in ``loop`` starting
+            with ``prefix`` (for variables introduced by the constexpr
+            ``for vec_lane_<N> in cutlass.range_constexpr(V)`` form).
+            """
+            for s in ast.walk(loop):
+                if (
+                    isinstance(s, ast.For)
+                    and isinstance(s.target, ast.Name)
+                    and s.target.id.startswith(prefix)
+                ):
+                    return s.target.id
+            return None
+
+        for prefix in (
+            "reduction_lane_base_",
+            "reduction_vec_lane_",
+            "lane_base_",
+        ):
+            first_var = _collect_assign(first_loop, prefix)
+            second_var = _collect_assign(second_loop, prefix)
             if first_var and second_var and first_var != second_var:
-                # Canonicalise the second sweep's var to the first sweep's
-                # name so textual comparison succeeds.
+                # Canonicalise the second sweep's var to the first
+                # sweep's name so textual comparison succeeds.
+                alias[second_var] = first_var
+        # ``vec_lane_<N>`` is a for-loop target, not an assignment.
+        for prefix in ("vec_lane_",):
+            first_var = _collect_for_target(first_loop, prefix)
+            second_var = _collect_for_target(second_loop, prefix)
+            if first_var and second_var and first_var != second_var:
                 alias[second_var] = first_var
         return alias
 
@@ -443,13 +508,12 @@ class _CuteFuseTwoPassLoads(ast.NodeTransformer):
                 continue
             start, end, step = range_args
             trip = _trip_count_for(start, end, step, self._constexpr_values)
-            # Require a static, bounded, non-trivial trip count. Keep the
-            # cap conservative to avoid runaway register pressure: 32 fp32
-            # per thread (= 128 B) is plenty for RMS-norm-style kernels at
-            # the chunk sizes the autotuner picks. Anything larger
-            # currently means we're at a regime where TMA/cute.copy is the
-            # right fix anyway.
-            if trip is None or trip <= 1 or trip > 32:
+            # Require a static, bounded, non-trivial trip count.  The
+            # ``cache_size`` cap is enforced below (and is now SMEM-
+            # aware), so we allow large trip counts here — the SMEM
+            # backing path covers caches that wouldn't fit in a per-
+            # thread register fragment.
+            if trip is None or trip <= 1 or trip > 2048:
                 continue
 
             second_idx = group[1]
@@ -468,9 +532,47 @@ class _CuteFuseTwoPassLoads(ast.NodeTransformer):
             if first_cache_size != second_cache_size:
                 continue
             cache_size = first_cache_size
-            # Sanity cap (avoid runaway register pressure).
-            if cache_size > 64:
+            # Default policy: register-backed cache only when
+            # ``cache_size <= 64``; otherwise skip fusion.
+            #
+            # Why skip beyond 64 instead of switching to SMEM:
+            # empirically (see task P10), the SMEM-backed cache eats
+            # 25+ KB of per-CTA SMEM for the autotuner-picked
+            # warp-reduction softmax config (cache_size=99, V=4,
+            # threads=32), which crashes occupancy (~14% on B200).  In
+            # parallel, the SMEM-write + barrier + SMEM-read overhead
+            # outweighs the second-pass gmem read that the kernel's
+            # natural L1 reuse mostly serves already.  The autotuner
+            # accordingly steers to fusion-friendly configs (wider
+            # block + more threads, cache_size=13) when fusion is
+            # available, which still leaves the warp-reduction shape
+            # ~13% faster overall.
+            #
+            # Env-var escape hatches for experimentation:
+            #   HELION_FUSER_MODE=disabled — never fuse.
+            #   HELION_FUSER_MODE=register — force register fragment up
+            #     to cache_size=1024 (will spill / drop occupancy for
+            #     large caches).
+            #   HELION_FUSER_MODE=smem — force SMEM-backed cache up to
+            #     cache_size=1024.  Requires ``thread_count`` to be
+            #     plumbed correctly from the dispatch layer.
+            import os
+
+            _fuser_mode = os.environ.get("HELION_FUSER_MODE", "auto")
+            if _fuser_mode == "disabled":
                 continue
+            if _fuser_mode == "register":
+                use_smem = False
+                if cache_size > 1024:
+                    continue
+            elif _fuser_mode == "smem":
+                use_smem = True
+                if cache_size > 1024:
+                    continue
+            else:  # auto
+                if cache_size > 64:
+                    continue
+                use_smem = False
             cache_index = first_cache_index
             second_cache_index_str = second_cache_index
 
@@ -535,8 +637,31 @@ class _CuteFuseTwoPassLoads(ast.NodeTransformer):
             # Build cache declarations.  For vec loads, allocate
             # ``cache_size * V`` scalar slots; for scalar loads use the
             # original ``cache_size`` count.
+            #
+            # Backing:
+            #   - Register fragment for ``cache_size <= 64``: lowest
+            #     latency, no sync needed, fits in registers.
+            #   - SMEM tensor for larger caches: allocated once at the
+            #     top, indexed per-thread.  Sync inserted between the
+            #     two sweeps so the consume read sees populated slots.
             cache_names: dict[str, tuple[str, int]] = {}
             cache_decls: list[ast.stmt] = []
+            # Build the linear per-thread index expression covering all
+            # populated thread-block axes (axis 0 = warp lanes, axis 1
+            # = additional thread rows, axis 2 = z).  For a 1-D thread
+            # block this is just thread_idx[0].  For a 2-D block (used
+            # by per-row layernorm-style kernels) this picks up
+            # thread_idx[1] * dim0 so each row gets its own SMEM
+            # region.
+            dim0, dim1, dim2 = self._thread_block_dims
+            tid_terms = ["cutlass.Int32(cute.arch.thread_idx()[0])"]
+            if dim1 > 1:
+                tid_terms.append(f"cutlass.Int32(cute.arch.thread_idx()[1]) * {dim0}")
+            if dim2 > 1:
+                tid_terms.append(
+                    f"cutlass.Int32(cute.arch.thread_idx()[2]) * {dim0 * dim1}"
+                )
+            tid_expr = " + ".join(tid_terms)
             for key, (_j, _name, _kind, dtype, vec_w) in tracked.items():
                 if not any(akey == key for _, _, akey in assignments_to_rewrite):
                     continue
@@ -544,14 +669,60 @@ class _CuteFuseTwoPassLoads(ast.NodeTransformer):
                     continue
                 cache = self._new_cache_name()
                 cache_names[key] = (cache, vec_w)
-                cache_total = cache_size * vec_w
-                cache_decls.append(
-                    statement_from_string(
-                        f"{cache} = cute.make_fragment({cache_total}, {dtype})"
+                cache_total_per_thread = cache_size * vec_w
+                if use_smem:
+                    cache_total = cache_total_per_thread * self._thread_count
+                    smem_ptr = f"{cache}_ptr"
+                    cache_decls.extend(
+                        [
+                            statement_from_string(
+                                f"{smem_ptr} = cute.arch.alloc_smem({dtype}, {cache_total})"
+                            ),
+                            statement_from_string(
+                                f"{cache} = cute.make_tensor({smem_ptr}, ({cache_total},))"
+                            ),
+                        ]
                     )
-                )
+                else:
+                    cache_total = cache_total_per_thread
+                    cache_decls.append(
+                        statement_from_string(
+                            f"{cache} = cute.make_fragment({cache_total}, {dtype})"
+                        )
+                    )
             if not cache_names:
                 continue
+
+            # Helper: build the cache slot expression for a given outer
+            # index expression and vec lane.
+            #
+            # SMEM cache layout: per-thread contiguous region —
+            #   slot = tid * (cache_size * vec_w) + iter * vec_w + vi
+            # This keeps each thread's slots clustered in SMEM (so the
+            # compiler can issue vector stores/loads), and avoids bank
+            # conflicts as long as the per-thread stride is not a
+            # multiple of 32 * 4 bytes.
+            #
+            # For register fragments we keep the original per-thread
+            # layout: slot = iter_idx * vec_w + vi.
+            #
+            # Capture loop-local ``cache_size`` / ``tid_expr`` /
+            # ``use_smem`` via default args to satisfy ruff B023.
+            def _slot_expr(
+                idx_text: str,
+                vec_w_: int,
+                vi_text: str,
+                _cache_size: int = cache_size,
+                _tid_expr: str = tid_expr,
+                _use_smem: bool = use_smem,
+            ) -> str:
+                if vec_w_ == 1:
+                    inner = f"({idx_text})"
+                else:
+                    inner = f"({idx_text}) * {vec_w_} + ({vi_text})"
+                if _use_smem:
+                    return f"({_tid_expr}) * {_cache_size * vec_w_} + ({inner})"
+                return inner
 
             # Rewrite the first container: append cache writes after each
             # tracked load assignment.  Vec loads write V scalars per
@@ -573,16 +744,15 @@ class _CuteFuseTwoPassLoads(ast.NodeTransformer):
                     cache, vec_w = entry
                     name = s.targets[0].id
                     if vec_w == 1:
+                        slot = _slot_expr(cache_index, 1, "0")
                         new_first_body.append(
-                            statement_from_string(f"{cache}[{cache_index}] = {name}")
+                            statement_from_string(f"{cache}[{slot}] = {name}")
                         )
                     else:
                         for v in range(vec_w):
+                            slot = _slot_expr(cache_index, vec_w, str(v))
                             new_first_body.append(
-                                statement_from_string(
-                                    f"{cache}[({cache_index}) * {vec_w} + {v}] = "
-                                    f"{name}[{v}]"
-                                )
+                                statement_from_string(f"{cache}[{slot}] = {name}[{v}]")
                             )
             first_container[:] = new_first_body
 
@@ -591,8 +761,8 @@ class _CuteFuseTwoPassLoads(ast.NodeTransformer):
             # eliminated entirely (the consume sweep's hoist disappears)
             # and any downstream ``hoist_var[vi]`` extracts inside the
             # nested constexpr V-loop are rewritten to read from the cache
-            # at ``cache_index*V + vi``.
-            vec_extract_rewrites: list[tuple[str, str, str, int]] = []
+            # at the appropriate slot expression.
+            vec_extract_rewrites: list[tuple[str, str, str, int, bool, int]] = []
             new_second_body: list[ast.stmt] = []
             for s in second_container:
                 if (
@@ -608,33 +778,70 @@ class _CuteFuseTwoPassLoads(ast.NodeTransformer):
                             cache, vec_w = entry
                             name = s.targets[0].id
                             if vec_w == 1:
+                                slot = _slot_expr(second_cache_index_str, 1, "0")
                                 new_second_body.append(
-                                    statement_from_string(
-                                        f"{name} = {cache}[{second_cache_index_str}]"
-                                    )
+                                    statement_from_string(f"{name} = {cache}[{slot}]")
                                 )
                             else:
                                 # Drop the hoist entirely; remember that
-                                # ``name[vi]`` needs to be rewritten to
-                                # ``cache[idx*V + vi]`` in subsequent
-                                # statements (especially inside the
-                                # constexpr V-loop).
+                                # ``name[vi]`` needs to be rewritten to a
+                                # cache read in subsequent statements
+                                # (especially inside the constexpr V-loop).
                                 vec_extract_rewrites.append(
-                                    (name, cache, second_cache_index_str, vec_w)
+                                    (
+                                        name,
+                                        cache,
+                                        second_cache_index_str,
+                                        vec_w,
+                                        use_smem,
+                                        self._thread_count,
+                                    )
                                 )
                             continue
                 new_second_body.append(s)
             # Apply the vec extract rewrites recursively to ``new_second_body``.
             if vec_extract_rewrites:
-                for hoist_var, cache, idx_expr, vec_w in vec_extract_rewrites:
+                for (
+                    hoist_var,
+                    cache,
+                    idx_expr,
+                    vec_w,
+                    use_smem_,
+                    tcount,
+                ) in vec_extract_rewrites:
                     for stmt in new_second_body:
-                        _rewrite_vec_extract(stmt, hoist_var, cache, idx_expr, vec_w)
+                        _rewrite_vec_extract(
+                            stmt,
+                            hoist_var,
+                            cache,
+                            idx_expr,
+                            vec_w,
+                            use_smem=use_smem_,
+                            thread_count=tcount,
+                        )
             second_container[:] = new_second_body
 
-            # Insert cache declarations before the first loop.
-            for decl in cache_decls:
-                new_body.insert(first_idx, decl)
-                # Adjust subsequent indices in this group.
+            # Insert cache declarations before the first loop, in
+            # original order (so ``alloc_smem`` precedes
+            # ``make_tensor``).  Insert at incrementing positions
+            # rather than reusing ``first_idx`` (which would reverse
+            # them).
+            for offset, decl in enumerate(cache_decls):
+                new_body.insert(first_idx + offset, decl)
+                # Adjust the second-loop index forward.
+                second_idx += 1
+            if use_smem:
+                # SMEM-backed cache requires a CTA-wide barrier after the
+                # first sweep populates the cache and before the second
+                # sweep reads it back. The two-pass kernels' inter-sweep
+                # code (computing the row-wise reduction result, etc.)
+                # may write to ``mi``/``di`` registers but doesn't touch
+                # SMEM, so one barrier just before the consume loop is
+                # sufficient.
+                new_body.insert(
+                    second_idx,
+                    statement_from_string("cute.arch.sync_threads()"),
+                )
                 second_idx += 1
             any_fused = True
 
@@ -653,6 +860,8 @@ class _CuteFuseTwoPassLoads(ast.NodeTransformer):
 def fuse_two_pass_loads(
     body: list[ast.stmt],
     constexpr_values: dict[str, int] | None = None,
+    *,
+    thread_block_dims: tuple[int, int, int] = (1, 1, 1),
 ) -> list[ast.stmt]:
     """Apply two-pass load fusion to a list of statements (the device kernel
     body). Returns the (possibly modified) body.
@@ -661,10 +870,20 @@ def fuse_two_pass_loads(
     the pass can resolve ``range(..., step=cutlass.Int32(NAME))`` trip
     counts when NAME is inlined as a kernel-level constexpr.
 
+    ``thread_block_dims`` is the launch-time thread-block shape
+    ``(x, y, z)``.  Used to (a) decide between register-backed cache
+    (small caches, occupancy-friendly) and SMEM-backed cache (large
+    caches), and (b) build a per-thread linear slot index for the SMEM
+    path so kernels with 2-D / 3-D thread blocks (layernorm,
+    block-pointer softmax) don't have rows clobber each other's slots.
+
     Safe to call on any kernel body — only rewrites when a strict pattern
     match succeeds.
     """
-    transformer = _CuteFuseTwoPassLoads(constexpr_values=constexpr_values)
+    transformer = _CuteFuseTwoPassLoads(
+        constexpr_values=constexpr_values,
+        thread_block_dims=thread_block_dims,
+    )
     new_body = transformer._try_fuse(body)
     if new_body is None:
         return body

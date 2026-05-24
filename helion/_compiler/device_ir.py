@@ -764,6 +764,42 @@ class DeviceIR:
         """
         env = CompileEnvironment.current()
         rdims = [bs for bs in env.block_sizes if bs.reduction]
+        # Register cute_vector_widths slots for non-reduction tile blocks
+        # upfront — this is for kernels like softmax_two_pass that drive
+        # their own inner tile loop over the reduction axis (no rolled
+        # reductions registered).  ``CuteNDTileStrategy`` reads these
+        # slots in ``__init__`` to wire up vec-aware lane loops; if no
+        # slots are registered, the autotuner has nothing to vary and
+        # the strategy defaults to scalar loads.  Skipped when rolled
+        # reductions are present so the reduction-dim slot stays at
+        # index 0 of ``cute_vector_widths`` (matches the
+        # ``CuteReductionTileHeuristic`` seed and user-facing API).
+        if env.backend_name == "cute" and not rdims:
+            from ..autotuner.config_spec import CuteVectorWidthSpec
+
+            already_registered = set(
+                env.config_spec.cute_vector_widths.valid_block_ids()
+            )
+            tile_blocks = [bs for bs in env.block_sizes if not bs.reduction]
+            for tile_bs in tile_blocks:
+                if tile_bs.block_id in already_registered:
+                    continue
+                # Skip blocks with unbound static size (e.g. jagged
+                # kernels' dynamic-extent tiles): ``size_hint()`` asserts
+                # the size is int/SymInt and the strategy's vec gate
+                # requires a static ``EPT % V == 0`` anyway.
+                if not isinstance(tile_bs.size, (int, torch.SymInt)):
+                    continue
+                try:
+                    size_hint_val = int(tile_bs.size_hint())
+                except (TypeError, ValueError, AttributeError, AssertionError):
+                    continue
+                env.config_spec.cute_vector_widths.append(
+                    CuteVectorWidthSpec(
+                        block_id=tile_bs.block_id,
+                        size_hint=size_hint_val,
+                    )
+                )
         if not rdims:
             return
         num_original_graphs = len(self.graphs)
