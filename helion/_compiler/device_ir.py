@@ -943,6 +943,8 @@ class DeviceIR:
         if not split_factor:
             return
 
+        from ..language import memory_ops
+        from ..language.atomic_ops import ATOMIC_OPS
         from .epilogue_subtiling import apply_epilogue_subtiling
 
         env = CompileEnvironment.current()
@@ -951,14 +953,46 @@ class DeviceIR:
             for info in env.block_sizes
             if not info.reduction
         }
+        descriptor_output_nodes_by_graph: dict[int, set[torch.fx.Node]] = {}
+        memory_op_index = 0
+        atomic_op_index = 0
+        for graph_info in self.graphs:
+            descriptor_output_nodes: set[torch.fx.Node] = set()
+            for node in graph_info.graph.nodes:
+                if node.op != "call_function":
+                    continue
+                if node.target is memory_ops.load:
+                    memory_op_index += 1
+                elif node.target is memory_ops.store:
+                    if _indexing_uses_tensor_descriptor(
+                        config.indexing,
+                        memory_op_index,
+                    ):
+                        descriptor_output_nodes.add(node)
+                    memory_op_index += 1
+                elif node.target in ATOMIC_OPS:
+                    if _indexing_uses_tensor_descriptor(
+                        config.atomic_indexing,
+                        atomic_op_index,
+                    ):
+                        descriptor_output_nodes.add(node)
+                    atomic_op_index += 1
+            if descriptor_output_nodes:
+                descriptor_output_nodes_by_graph[graph_info.graph_id] = (
+                    descriptor_output_nodes
+                )
 
         for graph_info in self.graphs:
-            if isinstance(graph_info, RootGraphInfo):
-                apply_epilogue_subtiling(
-                    graph_info.graph,
-                    split_factor,
-                    configured_block_sizes,
-                )
+            # Epilogue output ops can live in nested/reduction/control-flow graphs,
+            # not just roots.  The indexing configs are global across codegen_graphs:
+            # this mirrors the existing load/store/atomic counters used when
+            # registering indexing tunables and tensor-descriptor layout guards.
+            apply_epilogue_subtiling(
+                graph_info.graph,
+                split_factor,
+                configured_block_sizes,
+                descriptor_output_nodes_by_graph.get(graph_info.graph_id, set()),
+            )
 
     def __enter__(self) -> None:
         try:
@@ -2095,6 +2129,20 @@ def _count_device_loads_and_stores(
     )
 
 
+def _indexing_uses_tensor_descriptor(
+    indexing_config: object,
+    op_index: int,
+) -> bool:
+    if isinstance(indexing_config, str):
+        return indexing_config == "tensor_descriptor"
+    if isinstance(indexing_config, (list, tuple)):
+        return (
+            op_index < len(indexing_config)
+            and indexing_config[op_index] == "tensor_descriptor"
+        )
+    return False
+
+
 def _count_device_atomics(device_ir: DeviceIR) -> int:
     """Count the number of atomic operations in device code for autotuning."""
     from ..language import atomic_ops
@@ -2248,8 +2296,6 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
 
         has_epilogue_subtile_candidate = False
         for graph_info in device_ir.graphs:
-            if not isinstance(graph_info, RootGraphInfo):
-                continue
             if has_epilogue_subtiling_candidate(graph_info.graph):
                 has_epilogue_subtile_candidate = True
                 break

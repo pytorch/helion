@@ -854,6 +854,19 @@ class CallableType(LiteralType):
                 return ExtendedAST.current()[-1]._type_info
             assert fn._type_function is not None
             return fn._type_function(*args, **kwargs, origin=origin)
+        if self.value is slice:
+            if kwargs or not (1 <= len(args) <= 3):
+                raise exc.TypeInferenceError(
+                    "slice() expects 1 to 3 positional arguments"
+                )
+            none = LiteralType(origin, None)
+            if len(args) == 1:
+                elements = slice(none, args[0], none)
+            elif len(args) == 2:
+                elements = slice(args[0], args[1], none)
+            else:
+                elements = slice(args[0], args[1], args[2])
+            return SliceType(origin, elements)
         # TODO(jansel): add no-tracing mode
 
         def warn_wrong_device(arg: TypeInfo) -> None:
