@@ -128,6 +128,14 @@ from .tcgen05_constants import TCGEN05_TARGET7_TVM_FFI_AB_STAGES
 from .tcgen05_constants import TCGEN05_TARGET7_TVM_FFI_BLOCK_K
 from .tcgen05_constants import TCGEN05_TARGET7_TVM_FFI_C_STAGES
 from .tcgen05_constants import TCGEN05_TARGET7_TVM_FFI_SHAPE
+from .tcgen05_constants import TCGEN05_TARGET9_TVM_FFI_AB_STAGES
+from .tcgen05_constants import TCGEN05_TARGET9_TVM_FFI_BLOCK_K
+from .tcgen05_constants import TCGEN05_TARGET9_TVM_FFI_C_STAGES
+from .tcgen05_constants import TCGEN05_TARGET9_TVM_FFI_SHAPE
+from .tcgen05_constants import TCGEN05_TARGET10_TVM_FFI_AB_STAGES
+from .tcgen05_constants import TCGEN05_TARGET10_TVM_FFI_BLOCK_K
+from .tcgen05_constants import TCGEN05_TARGET10_TVM_FFI_C_STAGES
+from .tcgen05_constants import TCGEN05_TARGET10_TVM_FFI_SHAPE
 from .tcgen05_constants import TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_M
 from .tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_N
@@ -233,6 +241,11 @@ class CuteTcgen05Config:
         self.identity_matmul_store_detected: bool = False
         self.relu_matmul_store_detected: bool = False
         self.bias_matmul_store_detected: bool = False
+        # T10-only bias detection: T10 admits fp16 bias against fp16
+        # operands. Kept as a separate flag so T2/T6 — both bf16-only
+        # at the matmul-fact level — cannot accidentally enable on a
+        # fp16 bias load (cycle 42 P2 fix; cycle 40 perturbation lesson).
+        self.bias_matmul_store_fp16_detected: bool = False
         self.bias_relu_matmul_store_detected: bool = False
         self.target1_tvm_ffi_seed_enabled: bool = False
         self.target2_tvm_ffi_seed_enabled: bool = False
@@ -241,6 +254,8 @@ class CuteTcgen05Config:
         self.target5_tvm_ffi_seed_enabled: bool = False
         self.target6_tvm_ffi_seed_enabled: bool = False
         self.target7_tvm_ffi_seed_enabled: bool = False
+        self.target9_tvm_ffi_seed_enabled: bool = False
+        self.target10_tvm_ffi_seed_enabled: bool = False
         self.cluster_m_search_choices: tuple[int, ...] | None = None
         self.cluster_m2_search_constraints: Tcgen05ClusterM2SearchConstraints | None = (
             None
@@ -444,6 +459,53 @@ class CuteTcgen05Config:
                 cast("PidTypeLiteral", TCGEN05_TWO_CTA_SEED_PID_TYPE),
             )
 
+    def allow_target9_tvm_ffi_seed(self) -> None:
+        # T9 mirrors T3/T5/T7's envelope at (2048, 2048, 2048)
+        # identity-store shape; shape fact distinguishes it from T1/T3/T5/T7.
+        if not self.identity_matmul_store_detected:
+            return
+        if not self._has_target9_tvm_ffi_matmul_fact():
+            return
+        target_k = TCGEN05_TARGET9_TVM_FFI_SHAPE[2]
+        self.target9_tvm_ffi_seed_enabled = True
+        self.cluster_m2_search_constraints = Tcgen05ClusterM2SearchConstraints(
+            static_k=target_k,
+            max_k_tiles=TCGEN05_TWO_CTA_MAX_K_TILES,
+        )
+        self.cluster_m_search_choices = (1, 2)
+        if TCGEN05_TWO_CTA_SEED_PID_TYPE not in self.allowed_pid_types:
+            self.allowed_pid_types = (
+                *self.allowed_pid_types,
+                cast("PidTypeLiteral", TCGEN05_TWO_CTA_SEED_PID_TYPE),
+            )
+
+    def allow_target10_tvm_ffi_seed(self) -> None:
+        # T10 mirrors T2's bias-store envelope at (2048, 2048, 2048)
+        # with fp16-or-bf16 operands; shape + bias-store + matmul fact
+        # dtype gate distinguishes it from T2 (4096x2048x2048 bf16) and
+        # the square identity-store T9. T10 admits both the bf16
+        # bias-store flag (matches T2's host detector) and a separate
+        # fp16 bias-store flag — T2 cannot fire on fp16 because its
+        # detector is bf16-pinned.
+        if not (
+            self.bias_matmul_store_detected or self.bias_matmul_store_fp16_detected
+        ):
+            return
+        if not self._has_target10_tvm_ffi_matmul_fact():
+            return
+        target_k = TCGEN05_TARGET10_TVM_FFI_SHAPE[2]
+        self.target10_tvm_ffi_seed_enabled = True
+        self.cluster_m2_search_constraints = Tcgen05ClusterM2SearchConstraints(
+            static_k=target_k,
+            max_k_tiles=TCGEN05_TWO_CTA_MAX_K_TILES,
+        )
+        self.cluster_m_search_choices = (1, 2)
+        if TCGEN05_TWO_CTA_SEED_PID_TYPE not in self.allowed_pid_types:
+            self.allowed_pid_types = (
+                *self.allowed_pid_types,
+                cast("PidTypeLiteral", TCGEN05_TWO_CTA_SEED_PID_TYPE),
+            )
+
     @staticmethod
     def cluster_m2_bk_is_valid(
         bk: int, constraints: Tcgen05ClusterM2SearchConstraints
@@ -553,16 +615,40 @@ class CuteTcgen05Config:
                 ]
         return Config(**seed_config)
 
-    def _aux_tma_search_enabled(self) -> bool:
-        # The TMA aux producer is currently admitted only for the validated
-        # Target8-style edge+K-tail family. Exact-shape aux tensors use the
-        # aux-TMA producer on both full and partial-output tiles; non-staged
-        # aux operands remain on the direct guarded load path.
+    def _aux_tma_edge_search_enabled(self) -> bool:
+        # The TMA aux producer's original admission: the validated Target8-style
+        # double-edge + K-tail family with ``cluster_m=2``. The CLC-persistent
+        # variants and edge-perf knobs remain pinned to this slice.
         constraints = self.cluster_m2_search_constraints
         return (
             self.exact_shape_aux_kernel_detected
             and constraints is not None
             and constraints.allow_edge_k_tail_family
+        )
+
+    def _aux_tma_full_tile_search_enabled(self) -> bool:
+        # Cycle 46: also admit aux-TMA on full-tile cluster_m=2 problems
+        # (T14/T20/T25/T28 residual_add family). The codegen-side gate at
+        # ``cute_mma.py`` ``tcgen05_static_output_tiles`` already accepts
+        # full-tile shapes; only the search-space gate was excluding them.
+        # Edge-perf knobs (``_set_clc_aux_tma_edge_perf_knobs``) and
+        # CLC-persistent variants stay pinned to ``_aux_tma_edge_search_enabled``
+        # so this widening does not perturb the 5000³ T12 family.
+        constraints = self.cluster_m2_search_constraints
+        return (
+            self.exact_shape_aux_kernel_detected
+            and constraints is not None
+            and not constraints.allow_edge_k_tail_family
+        )
+
+    def _aux_tma_search_enabled(self) -> bool:
+        # The TMA aux producer is admitted on either the edge+K-tail family or
+        # the full-tile cluster_m=2 family. Exact-shape aux tensors use the
+        # aux-TMA producer on both full and partial-output tiles; non-staged
+        # aux operands remain on the direct guarded load path.
+        return (
+            self._aux_tma_edge_search_enabled()
+            or self._aux_tma_full_tile_search_enabled()
         )
 
     def _aux_tma_seed_config(self, c_input_seed: Config) -> Config | None:
@@ -768,6 +854,32 @@ class CuteTcgen05Config:
             and fact.static_k == target_k
             and fact.lhs_dtype == torch.bfloat16
             and fact.rhs_dtype == torch.bfloat16
+            for fact in self.config_spec.matmul_facts
+        )
+
+    def _has_target9_tvm_ffi_matmul_fact(self) -> bool:
+        target_m, target_n, target_k = TCGEN05_TARGET9_TVM_FFI_SHAPE
+        return any(
+            fact.static_m == target_m
+            and fact.static_n == target_n
+            and fact.static_k == target_k
+            and fact.lhs_dtype == torch.bfloat16
+            and fact.rhs_dtype == torch.bfloat16
+            for fact in self.config_spec.matmul_facts
+        )
+
+    def _has_target10_tvm_ffi_matmul_fact(self) -> bool:
+        # T10 admits fp16 and bf16 operands at the square 2048³ bias
+        # shape. ``lhs_dtype == rhs_dtype`` keeps the operand dtype
+        # pinned so the runtime validator can derive the admitted
+        # operand dtype from a single plan field.
+        target_m, target_n, target_k = TCGEN05_TARGET10_TVM_FFI_SHAPE
+        return any(
+            fact.static_m == target_m
+            and fact.static_n == target_n
+            and fact.static_k == target_k
+            and fact.lhs_dtype in (torch.bfloat16, torch.float16)
+            and fact.lhs_dtype == fact.rhs_dtype
             for fact in self.config_spec.matmul_facts
         )
 
@@ -1311,6 +1423,167 @@ class CuteTcgen05Config:
         }
         return Config(**seed_config)
 
+    def _target10_tvm_ffi_seed_config(self) -> Config | None:
+        if not self.target10_tvm_ffi_seed_enabled:
+            return None
+        # T10's rowvec bias sets ``aux_kernel_detected`` True (same as T2).
+        # The bias-store gate (bf16 or fp16 variant) keeps T10 mutually
+        # exclusive with identity/relu/bias_relu stores.
+        if not (
+            self.bias_matmul_store_detected or self.bias_matmul_store_fp16_detected
+        ):
+            return None
+        if not self._has_target10_tvm_ffi_matmul_fact():
+            return None
+        constraints = self.cluster_m2_search_constraints
+        if constraints is None or constraints.allow_edge_k_tail_family:
+            return None
+        if TCGEN05_TWO_CTA_SEED_PID_TYPE not in self.allowed_pid_types:
+            return None
+        if len(self.config_spec.block_sizes) != 3:
+            return None
+        # Accept indexing length 3 (no closure) or 4 (with bias closure).
+        if self.config_spec.indexing.length not in (3, 4):
+            return None
+        if not self.cluster_m2_bk_is_valid(
+            TCGEN05_TARGET10_TVM_FFI_BLOCK_K, constraints
+        ):
+            return None
+        if not self.ab_stages_three_fits(
+            bm=TCGEN05_TWO_CTA_BLOCK_M,
+            bn=TCGEN05_TWO_CTA_BLOCK_N,
+            bk=TCGEN05_TARGET10_TVM_FFI_BLOCK_K,
+            cluster_m=2,
+            ab_stages=TCGEN05_TARGET10_TVM_FFI_AB_STAGES,
+        ):
+            return None
+        range_count = len(self.config_spec.range_unroll_factors)
+        # Cycle-41 force-config measurements (see cycle 42 task brief):
+        # role_local_monolithic + c_input=0 + l2_groupings=[2] + ab=3
+        # measured 742.4 TF / +3.7% gap vs Quack's 770.9 TF on the T22
+        # (2048³ fp16 bias) target, closing 21pp of the previous gap.
+        # The cycle 40 alternative (ab=2 + role_local_with_sched +
+        # c_input=1 + l2_groupings=[2]) measured at HEAD level (640 TF),
+        # so we explicitly stay on monolithic + c_input=0 here.
+        indexing_length = self.config_spec.indexing.length
+        seed_config: dict[str, Any] = {
+            "block_sizes": [
+                TCGEN05_TWO_CTA_BLOCK_M,
+                TCGEN05_TWO_CTA_BLOCK_N,
+                TCGEN05_TARGET10_TVM_FFI_BLOCK_K,
+            ],
+            "indexing": ["tensor_descriptor"] * indexing_length,
+            "l2_groupings": [2],
+            "loop_orders": [[0, 1]],
+            "num_stages": 4,
+            "num_warps": 8,
+            "pid_type": TCGEN05_TWO_CTA_SEED_PID_TYPE,
+            "range_flattens": [None] * range_count,
+            "range_multi_buffers": [None] * range_count,
+            "range_num_stages": [0] * range_count,
+            "range_unroll_factors": [1] * range_count,
+            "range_warp_specializes": [None] * range_count,
+            "tcgen05_cluster_m": 2,
+            "tcgen05_cluster_n": 1,
+            "tcgen05_ab_stages": TCGEN05_TARGET10_TVM_FFI_AB_STAGES,
+            "tcgen05_acc_stages": 2,
+            "tcgen05_c_stages": TCGEN05_TARGET10_TVM_FFI_C_STAGES,
+            TCGEN05_L2_SWIZZLE_SIZE_CONFIG_KEY: 1,
+            "tcgen05_num_epi_warps": 4,
+            TCGEN05_STRATEGY_CONFIG_KEY: Tcgen05Strategy.ROLE_LOCAL_MONOLITHIC.value,
+            TCGEN05_PERSISTENCE_MODEL_CONFIG_KEY: (
+                Tcgen05PersistenceModel.STATIC_PERSISTENT.value
+            ),
+            TCGEN05_LAYOUT_STRATEGY_CONFIG_KEY: (
+                Tcgen05LayoutStrategy.EXPLICIT_EPI_TILE.value
+            ),
+            TCGEN05_LAYOUT_OVERRIDES_EPI_TILE_M_KEY: 128,
+            TCGEN05_LAYOUT_OVERRIDES_EPI_TILE_N_KEY: 32,
+            TCGEN05_LAYOUT_OVERRIDES_D_STORE_BOX_N_KEY: 32,
+            TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY: True,
+            TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY: True,
+        }
+        return Config(**seed_config)
+
+    def _target9_tvm_ffi_seed_config(self) -> Config | None:
+        if not self.target9_tvm_ffi_seed_enabled:
+            return None
+        if self.aux_kernel_detected:
+            return None
+        # T9 shares the identity-store gate with T1/T3/T5/T7 but at the
+        # T9 shape. The fact check below distinguishes T9 from T1/T3/T5/T7.
+        if not self.identity_matmul_store_detected:
+            return None
+        if not self._has_target9_tvm_ffi_matmul_fact():
+            return None
+        constraints = self.cluster_m2_search_constraints
+        if constraints is None or constraints.allow_edge_k_tail_family:
+            return None
+        if TCGEN05_TWO_CTA_SEED_PID_TYPE not in self.allowed_pid_types:
+            return None
+        if len(self.config_spec.block_sizes) != 3:
+            return None
+        if self.config_spec.indexing.length != 3:
+            return None
+        if not self.cluster_m2_bk_is_valid(
+            TCGEN05_TARGET9_TVM_FFI_BLOCK_K, constraints
+        ):
+            return None
+        if not self.ab_stages_three_fits(
+            bm=TCGEN05_TWO_CTA_BLOCK_M,
+            bn=TCGEN05_TWO_CTA_BLOCK_N,
+            bk=TCGEN05_TARGET9_TVM_FFI_BLOCK_K,
+            cluster_m=2,
+            ab_stages=TCGEN05_TARGET9_TVM_FFI_AB_STAGES,
+        ):
+            return None
+        range_count = len(self.config_spec.range_unroll_factors)
+        # T9 mirrors T3/T5/T7's seed knobs at the square 2048x2048x2048
+        # identity-store shape; ``l2_groupings=[2]`` is inherited pending
+        # a T9 sweep.
+        seed_config: dict[str, Any] = {
+            "block_sizes": [
+                TCGEN05_TWO_CTA_BLOCK_M,
+                TCGEN05_TWO_CTA_BLOCK_N,
+                TCGEN05_TARGET9_TVM_FFI_BLOCK_K,
+            ],
+            "indexing": [
+                "tensor_descriptor",
+                "tensor_descriptor",
+                "tensor_descriptor",
+            ],
+            "l2_groupings": [2],
+            "loop_orders": [[0, 1]],
+            "num_stages": 4,
+            "num_warps": 8,
+            "pid_type": TCGEN05_TWO_CTA_SEED_PID_TYPE,
+            "range_flattens": [None] * range_count,
+            "range_multi_buffers": [None] * range_count,
+            "range_num_stages": [0] * range_count,
+            "range_unroll_factors": [1] * range_count,
+            "range_warp_specializes": [None] * range_count,
+            "tcgen05_cluster_m": 2,
+            "tcgen05_cluster_n": 1,
+            "tcgen05_ab_stages": TCGEN05_TARGET9_TVM_FFI_AB_STAGES,
+            "tcgen05_acc_stages": 2,
+            "tcgen05_c_stages": TCGEN05_TARGET9_TVM_FFI_C_STAGES,
+            TCGEN05_L2_SWIZZLE_SIZE_CONFIG_KEY: 1,
+            "tcgen05_num_epi_warps": 4,
+            TCGEN05_STRATEGY_CONFIG_KEY: Tcgen05Strategy.ROLE_LOCAL_MONOLITHIC.value,
+            TCGEN05_PERSISTENCE_MODEL_CONFIG_KEY: (
+                Tcgen05PersistenceModel.STATIC_PERSISTENT.value
+            ),
+            TCGEN05_LAYOUT_STRATEGY_CONFIG_KEY: (
+                Tcgen05LayoutStrategy.EXPLICIT_EPI_TILE.value
+            ),
+            TCGEN05_LAYOUT_OVERRIDES_EPI_TILE_M_KEY: 128,
+            TCGEN05_LAYOUT_OVERRIDES_EPI_TILE_N_KEY: 32,
+            TCGEN05_LAYOUT_OVERRIDES_D_STORE_BOX_N_KEY: 32,
+            TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY: True,
+            TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY: True,
+        }
+        return Config(**seed_config)
+
     def autotune_seed_configs(self) -> list[Config]:
         seeds: list[Config] = []
         target1_tvm_ffi_seed = self._target1_tvm_ffi_seed_config()
@@ -1334,6 +1607,12 @@ class CuteTcgen05Config:
         target7_tvm_ffi_seed = self._target7_tvm_ffi_seed_config()
         if target7_tvm_ffi_seed is not None:
             seeds.append(target7_tvm_ffi_seed)
+        target9_tvm_ffi_seed = self._target9_tvm_ffi_seed_config()
+        if target9_tvm_ffi_seed is not None:
+            seeds.append(target9_tvm_ffi_seed)
+        target10_tvm_ffi_seed = self._target10_tvm_ffi_seed_config()
+        if target10_tvm_ffi_seed is not None:
+            seeds.append(target10_tvm_ffi_seed)
         c_input_seed = self._c_input_seed_config()
         if c_input_seed is not None:
             seeds.append(c_input_seed)
@@ -1514,9 +1793,16 @@ class CuteTcgen05Config:
         if not self._aux_tma_search_enabled():
             config[TCGEN05_AUX_LOAD_MODE_CONFIG_KEY] = TCGEN05_AUX_LOAD_MODE_SIMT
             return
+        # Aux-TMA is kept when the projected cluster_m=2 candidate matches either
+        # the validated edge+K-tail shape or the cycle-46 full-tile shape, and
+        # the strategy is the ROLE_LOCAL_WITH_SCHEDULER + c-input warp combo that
+        # the aux-TMA producer warp requires.
+        if not self._is_with_scheduler_c_input_config(config):
+            config[TCGEN05_AUX_LOAD_MODE_CONFIG_KEY] = TCGEN05_AUX_LOAD_MODE_SIMT
+            return
         if not (
             self._is_validated_cluster_m2_edge_search_candidate(config)
-            and self._is_with_scheduler_c_input_config(config)
+            or self._is_validated_cluster_m2_full_tile_search_candidate(config)
         ):
             config[TCGEN05_AUX_LOAD_MODE_CONFIG_KEY] = TCGEN05_AUX_LOAD_MODE_SIMT
 
@@ -1530,8 +1816,13 @@ class CuteTcgen05Config:
         )
 
     def _clc_persistence_search_enabled(self) -> bool:
-        """CLC search is the sm100+ slice of the aux-TMA edge+K-tail gate."""
-        if not self._aux_tma_search_enabled():
+        """CLC search is the sm100+ slice of the aux-TMA edge+K-tail gate.
+
+        Cycle 46 widened ``_aux_tma_search_enabled`` to also admit the full-tile
+        cluster_m=2 family, but the CLC-persistent perf knobs and validated
+        candidate shape are still scoped to ``_aux_tma_edge_search_enabled``.
+        """
+        if not self._aux_tma_edge_search_enabled():
             return False
         capability = self.config_spec.target_device_capability
         if capability is None:
@@ -1585,6 +1876,8 @@ class CuteTcgen05Config:
             or self._is_target5_tvm_ffi_seed_config(config)
             or self._is_target6_tvm_ffi_seed_config(config)
             or self._is_target7_tvm_ffi_seed_config(config)
+            or self._is_target9_tvm_ffi_seed_config(config)
+            or self._is_target10_tvm_ffi_seed_config(config)
         ):
             return {
                 "indexing",
@@ -1775,6 +2068,56 @@ class CuteTcgen05Config:
             and config.get(TCGEN05_LAYOUT_OVERRIDES_D_STORE_BOX_N_KEY) == 32
         )
 
+    @staticmethod
+    def _is_target9_tvm_ffi_seed_config(config: dict[str, object]) -> bool:
+        # T9 mirrors T3/T4/T5/T6/T7 at the bk=128 stage tuple; the
+        # identity-store gate happens upstream.
+        return (
+            config.get(TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY) is True
+            and config.get(TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY) is True
+            and config.get("block_sizes")
+            == [
+                TCGEN05_TWO_CTA_BLOCK_M,
+                TCGEN05_TWO_CTA_BLOCK_N,
+                TCGEN05_TARGET9_TVM_FFI_BLOCK_K,
+            ]
+            and config.get("tcgen05_ab_stages") == TCGEN05_TARGET9_TVM_FFI_AB_STAGES
+            and config.get("tcgen05_c_stages") == TCGEN05_TARGET9_TVM_FFI_C_STAGES
+            and config.get("tcgen05_cluster_m") == 2
+            and config.get("tcgen05_cluster_n") == 1
+            and config.get(TCGEN05_LAYOUT_STRATEGY_CONFIG_KEY)
+            == Tcgen05LayoutStrategy.EXPLICIT_EPI_TILE.value
+            and config.get(TCGEN05_LAYOUT_OVERRIDES_EPI_TILE_M_KEY) == 128
+            and config.get(TCGEN05_LAYOUT_OVERRIDES_EPI_TILE_N_KEY) == 32
+            and config.get(TCGEN05_LAYOUT_OVERRIDES_D_STORE_BOX_N_KEY) == 32
+        )
+
+    @staticmethod
+    def _is_target10_tvm_ffi_seed_config(config: dict[str, object]) -> bool:
+        # T10 mirrors T2's bias-store envelope at the bk=128 stage tuple
+        # with cycle-41's validated knobs (role_local_monolithic,
+        # l2_groupings=[2], ab=3). Shape + bias-store dtype gates happen
+        # upstream in ``_target10_tvm_ffi_seed_config``.
+        return (
+            config.get(TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY) is True
+            and config.get(TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY) is True
+            and config.get("block_sizes")
+            == [
+                TCGEN05_TWO_CTA_BLOCK_M,
+                TCGEN05_TWO_CTA_BLOCK_N,
+                TCGEN05_TARGET10_TVM_FFI_BLOCK_K,
+            ]
+            and config.get("tcgen05_ab_stages") == TCGEN05_TARGET10_TVM_FFI_AB_STAGES
+            and config.get("tcgen05_c_stages") == TCGEN05_TARGET10_TVM_FFI_C_STAGES
+            and config.get("tcgen05_cluster_m") == 2
+            and config.get("tcgen05_cluster_n") == 1
+            and config.get(TCGEN05_LAYOUT_STRATEGY_CONFIG_KEY)
+            == Tcgen05LayoutStrategy.EXPLICIT_EPI_TILE.value
+            and config.get(TCGEN05_LAYOUT_OVERRIDES_EPI_TILE_M_KEY) == 128
+            and config.get(TCGEN05_LAYOUT_OVERRIDES_EPI_TILE_N_KEY) == 32
+            and config.get(TCGEN05_LAYOUT_OVERRIDES_D_STORE_BOX_N_KEY) == 32
+        )
+
     def _validate_target1_ab_stage_envelope(
         self, config: dict[str, object], *, fix_invalid: bool
     ) -> None:
@@ -1942,6 +2285,15 @@ class CuteTcgen05Config:
         key: str,
         config: dict[str, object],
     ) -> tuple[bool, object]:
+        if key == TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY:
+            # The autotuner search surface for this key is the collapsed
+            # ``EnumFragment((True,))``; autotuner-generated configs always
+            # set it via ``default_flat()`` mutation. ``flatten`` only hits
+            # this branch on user-supplied configs that omit the key, where
+            # absence means "no FFI promotion requested" — matches the
+            # validation-view default and the special case at
+            # ``normalize_pre_pid_type``.
+            return True, False
         if key != TCGEN05_PERSISTENCE_MODEL_CONFIG_KEY:
             return False, None
         projected_config = {
@@ -2085,6 +2437,36 @@ class CuteTcgen05Config:
             return False
         return constraints.allow_edge_k_tail_family
 
+    def _is_validated_cluster_m2_full_tile_search_candidate(
+        self, config: dict[str, object]
+    ) -> bool:
+        # Cycle 46: full-tile cluster_m=2 candidate gate for aux-TMA admission.
+        # After ``_fix_cluster_m2_search_config`` projects a full-tile sample to
+        # the canonical 256x256x bk shape with ``persistent_interleaved`` pid,
+        # this returns True so aux-TMA stays during the search-time fixup.
+        # bk validity is already enforced by ``_fix_cluster_m2_search_config``;
+        # we re-check it here so a stale/unprojected config cannot slip through.
+        if config.get("tcgen05_cluster_m") != 2:
+            return False
+        constraints = self.cluster_m2_search_constraints
+        if constraints is None or constraints.allow_edge_k_tail_family:
+            return False
+        if config.get("pid_type") != TCGEN05_TWO_CTA_SEED_PID_TYPE:
+            return False
+        if config.get("tcgen05_cluster_n", 1) != 1:
+            return False
+        block_sizes = config.get("block_sizes")
+        if not isinstance(block_sizes, list) or len(block_sizes) < 3:
+            return False
+        if block_sizes[0] != TCGEN05_TWO_CTA_BLOCK_M:
+            return False
+        if block_sizes[1] != TCGEN05_TWO_CTA_BLOCK_N:
+            return False
+        bk = block_sizes[2]
+        if not isinstance(bk, int) or isinstance(bk, bool):
+            return False
+        return self.cluster_m2_bk_is_valid(bk, constraints)
+
     def _fix_cluster_m1_persistent_search_config(
         self, config: dict[str, object]
     ) -> None:
@@ -2206,6 +2588,10 @@ class CuteTcgen05Config:
             ab_stages_max = max(3, TCGEN05_TARGET6_TVM_FFI_AB_STAGES)
         elif not for_search and self._target7_tvm_ffi_seed_config() is not None:
             ab_stages_max = max(3, TCGEN05_TARGET7_TVM_FFI_AB_STAGES)
+        elif not for_search and self._target9_tvm_ffi_seed_config() is not None:
+            ab_stages_max = max(3, TCGEN05_TARGET9_TVM_FFI_AB_STAGES)
+        elif not for_search and self._target10_tvm_ffi_seed_config() is not None:
+            ab_stages_max = max(3, TCGEN05_TARGET10_TVM_FFI_AB_STAGES)
         elif not for_search:
             ab_stages_max = 3
         else:
@@ -2233,11 +2619,22 @@ class CuteTcgen05Config:
             or self._target5_tvm_ffi_seed_config() is not None
             or self._target6_tvm_ffi_seed_config() is not None
             or self._target7_tvm_ffi_seed_config() is not None
+            or self._target9_tvm_ffi_seed_config() is not None
+            or self._target10_tvm_ffi_seed_config() is not None
         ):
+            # Search collapses the FFI-launch knob to a single True
+            # choice — the runtime now always enables FFI, so the
+            # autotuner only needs to explore the True arm to keep the
+            # seeded direct-entry config family in scope. Validation
+            # keeps a Boolean surface so an absent user-config key still
+            # means "no FFI promotion requested" (default False).
+            tvm_ffi_launch_fragment: ConfigSpecFragment = (
+                EnumFragment((True,)) if for_search else BooleanFragment()
+            )
             fragments.update(
                 {
                     TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY: BooleanFragment(),
-                    TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY: BooleanFragment(),
+                    TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY: tvm_ffi_launch_fragment,
                     TCGEN05_LAYOUT_OVERRIDES_EPI_TILE_M_KEY: EnumFragment((None, 128)),
                     TCGEN05_LAYOUT_OVERRIDES_EPI_TILE_N_KEY: EnumFragment((None, 32)),
                     TCGEN05_LAYOUT_OVERRIDES_D_STORE_BOX_N_KEY: EnumFragment(
@@ -2284,10 +2681,11 @@ class CuteTcgen05Config:
                 config.pop(key, None)
 
     def _fix_target1_tvm_ffi_search_config(self, config: dict[str, object]) -> None:
-        # T1-T7 share the TVM-FFI direct-entry promotion surface; pick
-        # the seed matching the detected (shape, store) so search
-        # candidates project onto the right envelope. The shape+store
-        # gates are mutually exclusive so at most one seed is non-None.
+        # T1-T7 plus T9-T10 share the TVM-FFI direct-entry promotion
+        # surface; pick the seed matching the detected (shape, store) so
+        # search candidates project onto the right envelope. The
+        # shape+store gates are mutually exclusive so at most one seed
+        # is non-None.
         seed = self._target1_tvm_ffi_seed_config()
         if seed is None:
             seed = self._target2_tvm_ffi_seed_config()
@@ -2301,6 +2699,10 @@ class CuteTcgen05Config:
             seed = self._target6_tvm_ffi_seed_config()
         if seed is None:
             seed = self._target7_tvm_ffi_seed_config()
+        if seed is None:
+            seed = self._target9_tvm_ffi_seed_config()
+        if seed is None:
+            seed = self._target10_tvm_ffi_seed_config()
         if not self._target1_tvm_ffi_promotion_requested(
             config, seed_enabled=seed is not None
         ):
@@ -2355,12 +2757,19 @@ class CuteTcgen05Config:
     def aux_stages_autotune_fragments(self) -> dict[str, ConfigSpecFragment]:
         """Per-config aux-pipeline stage-count knob.
 
-        Admitted only under ``_aux_tma_search_enabled``, which pins the
+        Admitted only under ``_aux_tma_edge_search_enabled``, which pins the
         surface to the validated edge+K-tail family with ``cluster_m=2``
         and the c-input warp + aux-TMA combination. Configs outside that
         gate never see the knob; codegen at the default of 2 is unchanged.
+
+        Cycle 46 intentionally keeps this scoped to the edge+K-tail gate
+        even though ``_aux_tma_search_enabled`` was widened to admit the
+        full-tile cluster_m=2 family. The stage-count choices were tuned
+        on the T8/CLC edge rows; exposing them to T14/T20/T25/T28 would
+        let autotune sample stage counts on shapes they were not measured
+        on.
         """
-        if not self._aux_tma_search_enabled():
+        if not self._aux_tma_edge_search_enabled():
             return {}
         return {
             TCGEN05_AUX_STAGES_CONFIG_KEY: EnumFragment(TCGEN05_AUX_STAGE_COUNT_CHOICES)
@@ -2370,13 +2779,18 @@ class CuteTcgen05Config:
         """Per-config consumer-warp ``setmaxregister_increase`` ceiling knob.
 
         Admission mirrors ``aux_stages_autotune_fragments``: the
-        ``_aux_tma_search_enabled`` gate pins the search to the validated
-        wide-N CLC + aux-TMA seed family with the c-input warp + aux-TMA
-        combination. Configs outside that gate never see the knob. The
-        default value (256) is included in ``TCGEN05_CONSUMER_REGS_CHOICES``
-        so default-with-knob emits the same code as default-without-knob.
+        ``_aux_tma_edge_search_enabled`` gate pins the search to the
+        validated wide-N CLC + aux-TMA seed family with the c-input warp +
+        aux-TMA combination. Configs outside that gate never see the
+        knob. The default value (256) is included in
+        ``TCGEN05_CONSUMER_REGS_CHOICES`` so default-with-knob emits the
+        same code as default-without-knob.
+
+        Cycle 46 intentionally keeps this scoped to the edge+K-tail gate
+        even though ``_aux_tma_search_enabled`` was widened (see
+        ``aux_stages_autotune_fragments``).
         """
-        if not self._aux_tma_search_enabled():
+        if not self._aux_tma_edge_search_enabled():
             return {}
         return {
             TCGEN05_CONSUMER_REGS_CONFIG_KEY: EnumFragment(
@@ -2414,6 +2828,8 @@ class CuteTcgen05Config:
             or self._target5_tvm_ffi_seed_config() is not None
             or self._target6_tvm_ffi_seed_config() is not None
             or self._target7_tvm_ffi_seed_config() is not None
+            or self._target9_tvm_ffi_seed_config() is not None
+            or self._target10_tvm_ffi_seed_config() is not None
         )
         if self.aux_kernel_detected:
             strategy_choices: tuple[str, ...] = (
@@ -2582,7 +2998,15 @@ class CuteTcgen05Config:
                         key, fragment, config[key]
                     )
                 elif key in optional_search_fragments:
-                    config[key] = optional_search_fragments[key].default()
+                    if key == TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY:
+                        # An omitted user-config means "no FFI promotion
+                        # requested" — fill from the validation surface
+                        # so the non-seed envelope and promotion gates
+                        # that key off ``config.get(...) is True`` stay
+                        # consistent.
+                        config[key] = optional_fragments[key].default()
+                    else:
+                        config[key] = optional_search_fragments[key].default()
             self._clamp_l2_swizzle_size_to_shape(config)
             self._validate_target1_ab_stage_envelope(config, fix_invalid=fix_invalid)
         else:

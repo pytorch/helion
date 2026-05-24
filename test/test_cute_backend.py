@@ -1682,7 +1682,7 @@ class TestCuteBackend(TestCase):
         cute_kernel = type("DummyCuteKernel", (), {})()
         schema_key = (("tensor", 2, "float32"),)
         block = (32, 1, 1)
-        compiled_calls: list[tuple[object, tuple[object, ...]]] = []
+        compiled_calls: list[tuple[object, tuple[object, ...], str | None]] = []
         launched_args: list[tuple[object, ...]] = []
 
         class FakeCompiled:
@@ -1690,8 +1690,12 @@ class TestCuteBackend(TestCase):
                 launched_args.append(args)
                 return ("launched", args)
 
-        def fake_compile(jit_func: object, *args: object) -> FakeCompiled:
-            compiled_calls.append((jit_func, args))
+        def fake_compile(
+            jit_func: object,
+            *args: object,
+            options: str | None = None,
+        ) -> FakeCompiled:
+            compiled_calls.append((jit_func, args, options))
             return FakeCompiled()
 
         with (
@@ -1702,7 +1706,9 @@ class TestCuteBackend(TestCase):
             first = launcher(1, 2, 3)
             second = launcher(4, 5, 6)
 
-        self.assertEqual(compiled_calls, [("jit-wrapper", (1, 2, 3))])
+        self.assertEqual(
+            compiled_calls, [("jit-wrapper", (1, 2, 3), "--enable-tvm-ffi")]
+        )
         self.assertEqual(launched_args, [(1, 2, 3), (4, 5, 6)])
         self.assertEqual(first, ("launched", (1, 2, 3)))
         self.assertEqual(second, ("launched", (4, 5, 6)))
@@ -1737,9 +1743,13 @@ class TestCuteBackend(TestCase):
             )
             result = launcher(1, 2, 3)
 
+        # The runtime merges ``--enable-tvm-ffi`` into any caller-provided
+        # compile_options so the generic launcher always benefits from
+        # the FFI bridge (e.g. when the autotuner selects
+        # ``tcgen05_cubin_lineinfo=True``).
         self.assertEqual(
             compiled_calls,
-            [("jit-wrapper", (1, 2, 3), "--generate-line-info")],
+            [("jit-wrapper", (1, 2, 3), "--generate-line-info --enable-tvm-ffi")],
         )
         self.assertEqual(result, ("launched", (1, 2, 3)))
 

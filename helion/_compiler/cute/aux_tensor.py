@@ -521,16 +521,20 @@ def host_function_has_tcgen05_relu_matmul_store_pattern(
 
 def host_function_has_tcgen05_bias_matmul_store_pattern(
     host_function: HostFunction,
+    *,
+    expected_bias_dtypes: tuple[torch.dtype, ...] = (torch.bfloat16,),
 ) -> bool:
     """Return True for a single ``acc + bias[n]`` store of a tcgen05 matmul.
 
-    Gates the Target 2 TVM-FFI direct-entry seed for the rank-1
-    trailing-axis (rowvec) bias epilogue. The accepted chain shape is
+    Gates the Target 2 (bf16-only) and Target 10 (bf16/fp16) TVM-FFI
+    direct-entry seeds for the rank-1 trailing-axis (rowvec) bias
+    epilogue. The accepted chain shape is
     ``mma -> aten.add.Tensor(carrier, bias_load) -> convert -> store``
     where:
 
     * ``bias_load`` is a ``helion.language.memory_ops.load`` against a
-      rank-1 (``shape == (N,)``) GMEM tensor.
+      rank-1 (``shape == (N,)``) GMEM tensor whose dtype is one of
+      ``expected_bias_dtypes``.
     * One operand of the ``add`` is the MMA carrier reached via
       ``walk_carrier_to_tcgen05_matmul``; the other is the rank-1
       ``bias_load``.
@@ -554,7 +558,12 @@ def host_function_has_tcgen05_bias_matmul_store_pattern(
     cast_input = _single_store_cast_input(graphs)
     if cast_input is None:
         return False
-    return _bias_add_walks_to_mma_carrier(cast_input, mma_nodes, graphs)
+    return _bias_add_walks_to_mma_carrier(
+        cast_input,
+        mma_nodes,
+        graphs,
+        expected_bias_dtypes=expected_bias_dtypes,
+    )
 
 
 def host_function_has_tcgen05_bias_relu_matmul_store_pattern(
@@ -613,7 +622,13 @@ def host_function_has_tcgen05_bias_relu_matmul_store_pattern(
     relu_input = cast_input.args[0]
     if not isinstance(relu_input, torch.fx.Node):
         return False
-    return _bias_add_walks_to_mma_carrier(relu_input, mma_nodes, graphs)
+    # T6 stays pinned to bf16 (its matmul-fact gate is bf16-only).
+    return _bias_add_walks_to_mma_carrier(
+        relu_input,
+        mma_nodes,
+        graphs,
+        expected_bias_dtypes=(torch.bfloat16,),
+    )
 
 
 def _tcgen05_aux_detector_mma_facts(
@@ -694,12 +709,17 @@ def _single_store_cast_input(
     return cast_input if isinstance(cast_input, torch.fx.Node) else None
 
 
-def _is_rank1_bf16_bias_load(node: torch.fx.Node) -> bool:
-    """Return True iff ``node`` is a rank-1 bf16 ``memory_ops.load`` call.
+def _is_rank1_bias_load_of_dtype(
+    node: torch.fx.Node, expected_dtypes: tuple[torch.dtype, ...]
+) -> bool:
+    """Return True iff ``node`` is a rank-1 ``memory_ops.load`` of one of ``expected_dtypes``.
 
-    The runtime bias validator only admits bf16 bias tensors, so non-bf16
-    bias loads must not enable a bias-store direct-entry seed at the
-    host-detector level either.
+    The host-side detector is parameterized by the caller's expected
+    bias dtypes so T2/T6 stay pinned to bf16 (their matmul-fact gates
+    are bf16-only) while T10 admits ``(bf16, fp16)``. Without per-caller
+    parameterization a fp16 bias against a bf16-operand kernel would
+    silently flip ``bias_matmul_store_detected = True`` for T2/T6 too,
+    perturbing the autotune mutation pool (cycle 40 lesson).
     """
     if node.op != "call_function" or node.target is not memory_ops.load:
         return False
@@ -709,19 +729,22 @@ def _is_rank1_bf16_bias_load(node: torch.fx.Node) -> bool:
     host_val = host_arg.meta.get("val")
     if not isinstance(host_val, torch.Tensor):
         return False
-    return host_val.ndim == 1 and host_val.dtype == torch.bfloat16
+    return host_val.ndim == 1 and host_val.dtype in expected_dtypes
 
 
 def _bias_add_walks_to_mma_carrier(
     add_node: torch.fx.Node,
     mma_nodes: set[torch.fx.Node],
     graphs: Sequence[GraphInfo],
+    *,
+    expected_bias_dtypes: tuple[torch.dtype, ...],
 ) -> bool:
     """Return True iff ``add_node`` is ``aten.add.Tensor(carrier, bias_load)``.
 
     One operand of the add must walk to an MMA carrier via
     :func:`walk_carrier_to_tcgen05_matmul`; the other must satisfy
-    :func:`_is_rank1_bf16_bias_load`. Either operand may be the carrier
+    :func:`_is_rank1_bias_load_of_dtype` with the caller-supplied
+    ``expected_bias_dtypes`` set. Either operand may be the carrier
     (commutative).
     """
     if (
@@ -737,10 +760,10 @@ def _bias_add_walks_to_mma_carrier(
     inner_outputs_index = build_inner_outputs_index_from_graphs(graphs)
     carrier_first = walk_carrier_to_tcgen05_matmul(
         add_lhs, mma_nodes, inner_outputs_index
-    ) is not None and _is_rank1_bf16_bias_load(add_rhs)
+    ) is not None and _is_rank1_bias_load_of_dtype(add_rhs, expected_bias_dtypes)
     carrier_second = walk_carrier_to_tcgen05_matmul(
         add_rhs, mma_nodes, inner_outputs_index
-    ) is not None and _is_rank1_bf16_bias_load(add_lhs)
+    ) is not None and _is_rank1_bias_load_of_dtype(add_lhs, expected_bias_dtypes)
     return carrier_first or carrier_second
 
 

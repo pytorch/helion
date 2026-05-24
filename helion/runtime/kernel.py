@@ -566,38 +566,66 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
                         self.host_function
                     )
                 )
+                # T10 (cycle 42) admits fp16 bias. The default detector
+                # call above is bf16-only so T2/T6 cannot perturb their
+                # autotune mutation pool on a fp16-bias kernel; T10
+                # gates on this separate (bf16, fp16) variant instead.
+                self.env.config_spec.cute_tcgen05_bias_matmul_store_fp16_detected = (
+                    host_function_has_tcgen05_bias_matmul_store_pattern(
+                        self.host_function,
+                        expected_bias_dtypes=(torch.bfloat16, torch.float16),
+                    )
+                )
                 self.env.config_spec.cute_tcgen05_bias_relu_matmul_store_detected = (
                     host_function_has_tcgen05_bias_relu_matmul_store_pattern(
                         self.host_function
                     )
                 )
                 if self.env.config_spec.cute_tcgen05_identity_matmul_store_detected:
-                    # T1, T3, T5, and T7 all gate on identity-store
+                    # T1, T3, T5, T7, and T9 all gate on identity-store
                     # detection and write into the same cluster_m=2
                     # search constraints + pid_type allowlist. Mutual
                     # exclusion is via shape facts (T1 = 1024x4096x1024,
                     # T3 = 2048x4096x2048, T5 = 1024x8192x1024,
-                    # T7 = 2048x8192x2048) so at most one seed is
-                    # non-``None`` per host function; the values
-                    # written here must stay equal across the four
-                    # ``allow_target{1,3,5,7}_tvm_ffi_seed`` paths.
+                    # T7 = 2048x8192x2048, T9 = 2048x2048x2048) so at
+                    # most one seed is non-``None`` per host function;
+                    # the values written here must stay equal across
+                    # the five
+                    # ``allow_target{1,3,5,7,9}_tvm_ffi_seed`` paths.
                     self.env.config_spec.allow_tcgen05_target1_tvm_ffi_seed()
                     self.env.config_spec.allow_tcgen05_target3_tvm_ffi_seed()
                     self.env.config_spec.allow_tcgen05_target5_tvm_ffi_seed()
                     self.env.config_spec.allow_tcgen05_target7_tvm_ffi_seed()
+                    self.env.config_spec.allow_tcgen05_target9_tvm_ffi_seed()
                 if self.env.config_spec.cute_tcgen05_relu_matmul_store_detected:
                     self.env.config_spec.allow_tcgen05_target4_tvm_ffi_seed()
                 if self.env.config_spec.cute_tcgen05_bias_matmul_store_detected:
-                    # T2 gates on the bias-store detection (rank-1
-                    # trailing-axis ``acc + bias[n]``) and writes into the
-                    # same cluster_m=2 search constraints + pid_type
-                    # allowlist used by the T1/T3/T5 identity-store and
-                    # T4 relu-store seeds. The bias-store detector is
-                    # mutually exclusive with both identity and relu
-                    # store walkers (rejected by the chain shape), and
-                    # T2's shape gate (4096x2048x2048) keeps it
-                    # mutually exclusive on the matmul fact.
+                    # T2 gates on the bf16-only bias-store detection
+                    # (rank-1 trailing-axis ``acc + bias[n]``) and
+                    # writes into the same cluster_m=2 search
+                    # constraints + pid_type allowlist used by the
+                    # T1/T3/T5 identity-store and T4 relu-store seeds.
+                    # The bias-store detector is mutually exclusive
+                    # with identity and relu store walkers (rejected by
+                    # the chain shape), and T2's shape gate
+                    # (4096x2048x2048) keeps it mutually exclusive on
+                    # the matmul fact.
                     self.env.config_spec.allow_tcgen05_target2_tvm_ffi_seed()
+                if (
+                    self.env.config_spec.cute_tcgen05_bias_matmul_store_detected
+                    or self.env.config_spec.cute_tcgen05_bias_matmul_store_fp16_detected
+                ):
+                    # T10 (cycle 42) shares the cluster_m=2 search
+                    # constraints + pid_type allowlist with T2 but
+                    # admits fp16 bias against fp16 operands too. T2
+                    # and T10 are mutually exclusive at the matmul-fact
+                    # level: T2's shape is 4096x2048x2048 (bf16-only),
+                    # T10's shape is 2048x2048x2048 (bf16 or fp16). At
+                    # most one seed is non-``None`` for any given host
+                    # function. T10 enables on either bf16-only or the
+                    # broader (bf16, fp16) bias detection so a fp16
+                    # bias kernel still routes through T10.
+                    self.env.config_spec.allow_tcgen05_target10_tvm_ffi_seed()
                 if self.env.config_spec.cute_tcgen05_bias_relu_matmul_store_detected:
                     # T6 gates on the bias-relu-store detection
                     # (``relu(acc + bias[n])``) and writes into the

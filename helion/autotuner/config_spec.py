@@ -483,6 +483,14 @@ class ConfigSpec:
         self._cute_tcgen05_config.bias_matmul_store_detected = value
 
     @property
+    def cute_tcgen05_bias_matmul_store_fp16_detected(self) -> bool:
+        return self._cute_tcgen05_config.bias_matmul_store_fp16_detected
+
+    @cute_tcgen05_bias_matmul_store_fp16_detected.setter
+    def cute_tcgen05_bias_matmul_store_fp16_detected(self, value: bool) -> None:
+        self._cute_tcgen05_config.bias_matmul_store_fp16_detected = value
+
+    @property
     def cute_tcgen05_bias_relu_matmul_store_detected(self) -> bool:
         return self._cute_tcgen05_config.bias_relu_matmul_store_detected
 
@@ -578,6 +586,12 @@ class ConfigSpec:
 
     def allow_tcgen05_target7_tvm_ffi_seed(self) -> None:
         self._cute_tcgen05_config.allow_target7_tvm_ffi_seed()
+
+    def allow_tcgen05_target9_tvm_ffi_seed(self) -> None:
+        self._cute_tcgen05_config.allow_target9_tvm_ffi_seed()
+
+    def allow_tcgen05_target10_tvm_ffi_seed(self) -> None:
+        self._cute_tcgen05_config.allow_target10_tvm_ffi_seed()
 
     @staticmethod
     def _tcgen05_cluster_m2_bk_is_valid(

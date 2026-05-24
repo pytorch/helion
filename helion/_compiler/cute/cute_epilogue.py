@@ -176,6 +176,24 @@ _EXP_TEMPLATE = "cute.math.exp({inner})"
 _LOG_TEMPLATE = "cute.math.log({inner})"
 _SQRT_TEMPLATE = "cute.math.sqrt({inner})"
 _ERF_TEMPLATE = "cute.math.erf({inner})"
+# ``sigmoid`` and ``silu`` share the base-2 exp2 sigmoid form used by
+# inductor's cutedsl op overrides
+# (``torch/_inductor/codegen/cutedsl/cutedsl_op_overrides.py``):
+# ``1 / (1 + exp(-x)) == 1 / (1 + exp2(-x * log2(e)))``. Using
+# ``cute.math.exp2`` matches the existing pointwise sigmoid lowering and
+# keeps numerics bit-identical with the inductor path. The constant
+# ``1/ln(2)`` is spelled as a literal float so the rendered Python is
+# byte-identical across machines (same idiom as the GELU constants in
+# ``helion/language/_gelu_tanh_approx.py``).
+_LOG2_E = 1.4426950408889634
+_SIGMOID_TEMPLATE = f"(1.0 / (1.0 + cute.math.exp2(-({{inner}}) * {_LOG2_E!r})))"
+# ``silu(x) = x * sigmoid(x)``. The chain renderer always binds
+# ``{inner}`` to a fresh local before formatting, so the two
+# references to ``{inner}`` here resolve to a single SSA name (no
+# source-size blowup).
+_SILU_TEMPLATE = (
+    f"(({{inner}}) * (1.0 / (1.0 + cute.math.exp2(-({{inner}}) * {_LOG2_E!r}))))"
+)
 
 
 def _add_const_template(scalar: float) -> str:
@@ -232,6 +250,16 @@ _ZERO_ARG_TARGETS: dict[object, _UnaryStep] = {
     torch.ops.aten.log.default: _UnaryStep(op_name="log", template=_LOG_TEMPLATE),
     torch.ops.aten.sqrt.default: _UnaryStep(op_name="sqrt", template=_SQRT_TEMPLATE),
     torch.ops.aten.erf.default: _UnaryStep(op_name="erf", template=_ERF_TEMPLATE),
+    # ``aten.sigmoid.default`` is accepted as a standalone unary step so
+    # ``out[tile] = sigmoid(acc).to(...)`` fuses end-to-end. The same
+    # template is also embedded inside ``_SILU_TEMPLATE`` for the
+    # ``x * sigmoid(x)`` fusion below — keeping both paths on the
+    # ``cute.math.exp2`` form matches the inductor cutedsl pointwise
+    # sigmoid lowering byte-for-byte.
+    torch.ops.aten.sigmoid.default: _UnaryStep(
+        op_name="sigmoid",
+        template=_SIGMOID_TEMPLATE,
+    ),
     _gelu_erf: _UnaryStep(
         op_name="gelu_erf",
         template=gelu_erf_epilogue_unary_step_template(),
@@ -540,6 +568,143 @@ class Tcgen05UnaryEpilogueChain:
             prelude_lines.append(f"{prelude_indent}{local} = {step_expr}\n")
             cur_expr = local
         return ("".join(prelude_lines), local)
+
+
+def _is_sigmoid_of(node: object, carrier: torch.fx.Node) -> bool:
+    """Return True if ``node`` is ``aten.sigmoid.default(carrier)``.
+
+    Identity-keying on ``args[0]`` is sound because Helion's FX graph
+    deduplicates equal-expression nodes: any ``sigmoid(x)`` and
+    ``x * sigmoid(x)`` traced from the same ``x`` proxy share the same
+    underlying FX node for ``x``.
+    """
+    return (
+        isinstance(node, torch.fx.Node)
+        and node.op == "call_function"
+        and node.target is torch.ops.aten.sigmoid.default
+        and not node.kwargs
+        and len(node.args) == 1
+        and node.args[0] is carrier
+    )
+
+
+def _is_one_plus_exp_neg_of(node: object, carrier: torch.fx.Node) -> bool:
+    """Return True if ``node`` is ``add(exp(neg(carrier)), 1)`` (with the
+    scalar ``1`` on either side of the ``add``).
+
+    Matches the inductor-specific silu decomposition (see
+    ``torch/_inductor/decomposition.py``::``silu``) which expands
+    ``aten.silu.default`` as ``x / (1 + x.neg().exp())`` for exact eager
+    matching. That decomposition expands the silu denominator into
+    ``add(exp(neg(carrier)), 1)`` where the literal ``1`` is the Python
+    int ``1`` after the FX ``1 + tensor`` desugars to
+    ``tensor.__radd__(1)``. ``_classify_silu`` consumes this helper to
+    confirm a ``div`` node has the silu shape.
+    """
+    if not isinstance(node, torch.fx.Node):
+        return False
+    if node.op != "call_function" or node.kwargs:
+        return False
+    if node.target is not torch.ops.aten.add.Tensor:
+        return False
+    if len(node.args) != 2:
+        return False
+    a0, a1 = node.args
+    # ``1`` literal on either side. ``isinstance(True, int)`` is True in
+    # Python; explicitly reject booleans so an unlikely
+    # ``add(exp_node, True)`` is not misread as silu.
+    if (
+        isinstance(a0, torch.fx.Node)
+        and isinstance(a1, int)
+        and not isinstance(a1, bool)
+    ):
+        exp_node, scalar = a0, a1
+    elif (
+        isinstance(a1, torch.fx.Node)
+        and isinstance(a0, int)
+        and not isinstance(a0, bool)
+    ):
+        exp_node, scalar = a1, a0
+    else:
+        return False
+    if scalar != 1:
+        return False
+    if (
+        exp_node.op != "call_function"
+        or exp_node.target is not torch.ops.aten.exp.default
+        or exp_node.kwargs
+        or len(exp_node.args) != 1
+    ):
+        return False
+    neg_node = exp_node.args[0]
+    if not isinstance(neg_node, torch.fx.Node):
+        return False
+    return (
+        neg_node.op == "call_function"
+        and neg_node.target is torch.ops.aten.neg.default
+        and not neg_node.kwargs
+        and len(neg_node.args) == 1
+        and neg_node.args[0] is carrier
+    )
+
+
+def _classify_silu(
+    cur: torch.fx.Node,
+) -> tuple[_UnaryStep, torch.fx.Node] | None:
+    """Fold a decomposed silu activation into one chain step.
+
+    Two FX shapes are accepted:
+
+    - ``mul(carrier, sigmoid(carrier))`` / ``mul(sigmoid(carrier), carrier)``
+      — the core ``torch._decomp`` decomposition for ``aten.silu``
+      (``torch/_decomp/decompositions.py``::``silu``) is
+      ``self * torch.sigmoid(self)``. That FX shape is a non-scalar
+      binary multiply whose two operands point at the same carrier
+      node, so ``_classify_binary`` rejects it.
+
+    - ``div(carrier, add(exp(neg(carrier)), 1))`` — the
+      inductor-specific decomposition
+      (``torch/_inductor/decomposition.py``::``silu``) uses
+      ``x / (1 + x.neg().exp())`` for exact eager matching. The
+      ``aten.silu`` decomp registered into Helion's FX trace comes
+      from this inductor-specific entry (it shadows the core
+      decomposition because ``select_decomp_table`` is built from the
+      inductor lowering tables in ``helion._compiler.device_ir``).
+      This is the shape T13 / T17 / T26 hit in practice.
+
+    The same ``_SILU_TEMPLATE`` (``x * (1 / (1 + exp2(-x * log2_e)))``)
+    renders both forms. The pattern only matches when the inner
+    references point at the *same* carrier FX node — divergent
+    operands fall through to the generic binary classifier.
+
+    Returns ``None`` if ``cur`` is not a silu shape so the caller can
+    fall through to ``_classify_binary`` for ordinary scalar /
+    aux-tensor binaries.
+    """
+    if cur.kwargs:
+        return None
+    if len(cur.args) < 2:
+        return None
+    target = cur.target
+    lhs = cur.args[0]
+    rhs = cur.args[1]
+    # ``mul(carrier, sigmoid(carrier))`` form — core decomposition.
+    if target is torch.ops.aten.mul.Tensor:
+        if not (isinstance(lhs, torch.fx.Node) and isinstance(rhs, torch.fx.Node)):
+            return None
+        if _is_sigmoid_of(rhs, lhs):
+            return _UnaryStep(op_name="silu", template=_SILU_TEMPLATE), lhs
+        if _is_sigmoid_of(lhs, rhs):
+            return _UnaryStep(op_name="silu", template=_SILU_TEMPLATE), rhs
+        return None
+    # ``div(carrier, add(exp(neg(carrier)), 1))`` form — inductor decomp.
+    if target is torch.ops.aten.div.Tensor:
+        if not isinstance(lhs, torch.fx.Node):
+            return None
+        if _is_one_plus_exp_neg_of(rhs, lhs):
+            return _UnaryStep(op_name="silu", template=_SILU_TEMPLATE), lhs
+        return None
+    return None
 
 
 def _classify_binary(
@@ -925,6 +1090,26 @@ def analyze_tcgen05_unary_epilogue_chain(
                 steps.reverse()
                 return Tcgen05UnaryEpilogueChain(steps=tuple(steps)), anchor
             cur = arg
+            continue
+        # Decomposed silu — collapse multi-node silu shapes
+        # (``mul(x, sigmoid(x))`` and the inductor-form
+        # ``div(x, 1 + exp(-x))``) into a single chain step. Run before
+        # the generic binary classifier: the silu shape's two operands
+        # both reach back to the same carrier, neither is a scalar
+        # literal nor an aux-tensor load, so the generic classifier
+        # would reject it. See :func:`_classify_silu` for the accepted
+        # FX shapes and the rationale for matching the inductor form.
+        silu = _classify_silu(cur)
+        if silu is not None:
+            step, carrier = silu
+            steps.append(step)
+            anchor = walk_carrier_to_tcgen05_matmul(
+                carrier, target_fx_nodes, inner_outputs_by_graph_id
+            )
+            if anchor is not None:
+                steps.reverse()
+                return Tcgen05UnaryEpilogueChain(steps=tuple(steps)), anchor
+            cur = carrier
             continue
         # Binary ops (scalar literal *or* aux-tensor load on the
         # other side). The classifier rejects multi-tensor cases

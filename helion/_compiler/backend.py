@@ -3592,6 +3592,13 @@ class CuteBackend(Backend):
             compile_options: list[str] = []
             if config.get(TCGEN05_CUBIN_LINEINFO_CONFIG_KEY) is True:
                 compile_options.append("--generate-line-info")
+            # ``--enable-tvm-ffi`` is emitted in codegen only when the
+            # autotune flag is True so the generated code reflects which
+            # configs deliberately requested FFI. The runtime
+            # (``_get_compiled_cute_launcher``) unconditionally merges
+            # the flag in for the generic launcher, so configs with this
+            # flag False still execute with FFI enabled — that drift is
+            # intentional for now and noted here for future cleanups.
             if config.get(TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY) is True:
                 if (
                     _kernel_specialized_mma_impl(

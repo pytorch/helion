@@ -283,8 +283,11 @@ TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY = "tcgen05_tvm_ffi_launch"
 # targets can re-explore. ``{2, 3}`` fit structurally on B200 — see
 # ``cute_plan.md`` for the SMEM-budget audit. The autotune gate
 # (``aux_stages_autotune_fragments`` in ``tcgen05_config.py``) admits
-# the knob only for the ``_aux_tma_search_enabled`` family so other
-# paths stay byte-identical at the default.
+# the knob only for the ``_aux_tma_edge_search_enabled`` family so other
+# paths stay byte-identical at the default. (Cycle 46 widened
+# ``_aux_tma_search_enabled`` to also admit the full-tile cluster_m=2
+# family, but this stage-count knob remains scoped to the edge gate
+# because its choices were measured only on the T8/CLC edge rows.)
 TCGEN05_AUX_STAGES_CONFIG_KEY = "tcgen05_aux_stages"
 TCGEN05_AUX_STAGE_COUNT_DEFAULT = 2
 TCGEN05_AUX_STAGE_COUNT_CHOICES = (2, 3)
@@ -300,10 +303,13 @@ TCGEN05_AUX_STAGE_COUNT_CHOICES = (2, 3)
 # ``cute_mma.py`` ``_emit_mma_pipeline`` consumer branch; the
 # autotune gate (``consumer_regs_autotune_fragments`` in
 # ``tcgen05_config.py``) admits the knob only for the
-# ``_aux_tma_search_enabled`` family (mirroring the aux_stages gate)
-# so other paths stay byte-identical at the 256 default. The
-# choices include 256 so the default-with-knob configuration matches
-# the default-without-knob emission byte-for-byte.
+# ``_aux_tma_edge_search_enabled`` family (mirroring the aux_stages
+# gate) so other paths stay byte-identical at the 256 default. (Cycle
+# 46 widened ``_aux_tma_search_enabled`` to also admit the full-tile
+# cluster_m=2 family, but this register-cap knob stays scoped to the
+# edge gate because its choices were measured only on the T8/CLC edge
+# rows.) The choices include 256 so the default-with-knob configuration
+# matches the default-without-knob emission byte-for-byte.
 TCGEN05_CONSUMER_REGS_CONFIG_KEY = "tcgen05_consumer_regs"
 TCGEN05_CONSUMER_REGS_DEFAULT = 256
 TCGEN05_CONSUMER_REGS_CHOICES = (224, 232, 240, 256)
@@ -382,14 +388,39 @@ TCGEN05_TARGET7_TVM_FFI_SHAPE = (2048, 8192, 2048)
 TCGEN05_TARGET7_TVM_FFI_BLOCK_K = 128
 TCGEN05_TARGET7_TVM_FFI_AB_STAGES = 3
 TCGEN05_TARGET7_TVM_FFI_C_STAGES = 2
+# Validated cycle-38 Target9 envelope (2048x2048x2048 + identity epilogue):
+# admits the TVM-FFI direct entry on the bk=128 (ab=3, c=2) stage tuple.
+# T9 mirrors T3/T5/T7's identity-store envelope at the square
+# 2048x2048x2048 problem. K=2048 -> k_tile_count=16 (same as T2/T3/T6/T7).
+# The identity-store gate is shared with T1/T3/T5/T7; the shape gate
+# pins it to T9 so a T1/T3/T5/T7 host function does not get a T9 seed.
+TCGEN05_TARGET9_TVM_FFI_SHAPE = (2048, 2048, 2048)
+TCGEN05_TARGET9_TVM_FFI_BLOCK_K = 128
+TCGEN05_TARGET9_TVM_FFI_AB_STAGES = 3
+TCGEN05_TARGET9_TVM_FFI_C_STAGES = 2
+# Validated cycle-42 Target10 envelope (2048x2048x2048 + ``acc + bias[n]``
+# epilogue, fp16 or bf16 operand dtype): admits the TVM-FFI direct entry
+# on the bk=128 (ab=3, c=2) stage tuple. T10 mirrors T2's bias-store
+# envelope at the square 2048x2048x2048 problem (T9's shape, T2's
+# rank-1 trailing-axis bias add). Cycle-41 force-config measurements
+# converged on the (ab=3, c=2) stage tuple under the role_local_monolithic
+# strategy with ``c_input_seed=0`` and ``l2_groupings=[2]``; this seed
+# closed the gap on T22 (fp16 2048³ bias) from +21.25% to +3.7% vs Quack.
+# T10 is the first envelope that admits fp16 operands — the per-target
+# fp16 admission gates are scoped to T10's shape so T1-T9 stay bf16-only.
+TCGEN05_TARGET10_TVM_FFI_SHAPE = (2048, 2048, 2048)
+TCGEN05_TARGET10_TVM_FFI_BLOCK_K = 128
+TCGEN05_TARGET10_TVM_FFI_AB_STAGES = 3
+TCGEN05_TARGET10_TVM_FFI_C_STAGES = 2
 
 # Stage tuples that the TVM-FFI direct entry accepts, keyed by ``bk``.
 # The codegen-side ``tcgen05_direct_entry`` source builder and the
 # runtime-side ``_validate_target1_direct_entry_args`` both consume this
 # table so they cannot drift out of sync. ``bk=64`` covers Target 1's
 # two envelopes; ``bk=128`` covers the cycle-2 Target 4, cycle-3 Target
-# 5, cycle-4 Target 3, cycle-6 Target 2, cycle-7 Target 6, and cycle-8
-# Target 7 envelopes (all share the (3, 2) stage tuple).
+# 5, cycle-4 Target 3, cycle-6 Target 2, cycle-7 Target 6, cycle-8
+# Target 7, cycle-38 Target 9, and cycle-42 Target 10 envelopes (all
+# share the (3, 2) stage tuple).
 TCGEN05_DIRECT_ENTRY_STAGE_TUPLES_BY_BK: dict[int, tuple[tuple[int, int], ...]] = {
     TCGEN05_TARGET1_TVM_FFI_BLOCK_K: ((3, 2), (6, 4)),
     TCGEN05_TARGET4_TVM_FFI_BLOCK_K: (
@@ -399,17 +430,18 @@ TCGEN05_DIRECT_ENTRY_STAGE_TUPLES_BY_BK: dict[int, tuple[tuple[int, int], ...]] 
 
 # Accepted (lhs_shape, rhs_shape, d_shape) envelopes keyed by ``bk``.
 # Ties the direct-entry tensor shape envelope to the plan's ``bk`` so a
-# bk=64 (T1) plan cannot launch with T2/T3/T4/T5/T6/T7-shaped tensors
-# and vice versa. Each entry is
+# bk=64 (T1) plan cannot launch with T2/T3/T4/T5/T6/T7/T9/T10-shaped
+# tensors and vice versa. Each entry is
 # ``((lhs_m, lhs_k), (rhs_k, rhs_n), (d_m, d_n))``. T2, T3, T4, T5, T6,
-# and T7 share ``bk=128`` but have distinct M/N/K shapes; all six are
-# admitted in the same bk-keyed table so the runtime validator accepts
-# any of them (it additionally dispatches on the per-plan
-# ``validated_shape`` so a T3-plan with T4/T5/T7 tensors is still
-# rejected; T2 and T6 plans each carry a ``bias_idx`` so a 3-arg
-# launch is rejected against either plan even at the same shape
-# envelope, and a 4-arg launch is rejected against the T3/T4/T5/T7
-# plans).
+# T7, T9, and T10 share ``bk=128`` but have distinct M/N/K shapes (with
+# T9 and T10 sharing the square 2048³ shape but differing on epilogue +
+# input dtype); all eight are admitted in the same bk-keyed table so
+# the runtime validator accepts any of them (it additionally dispatches
+# on the per-plan ``validated_shape`` so a T3-plan with T4/T5/T7/T9/T10
+# tensors is still rejected; T2, T6, and T10 plans each carry a
+# ``bias_idx`` so a 3-arg launch is rejected against any of them even
+# at the same shape envelope, and a 4-arg launch is rejected against
+# the T3/T4/T5/T7/T9 plans).
 TCGEN05_DIRECT_ENTRY_SHAPE_SETS_BY_BK: dict[
     int,
     tuple[tuple[tuple[int, int], tuple[int, int], tuple[int, int]], ...],
@@ -422,6 +454,7 @@ TCGEN05_DIRECT_ENTRY_SHAPE_SETS_BY_BK: dict[
         ((4096, 2048), (2048, 2048), (4096, 2048)),
         ((8192, 2048), (2048, 2048), (8192, 2048)),
         ((2048, 2048), (2048, 8192), (2048, 8192)),
+        ((2048, 2048), (2048, 2048), (2048, 2048)),
     ),
 }
 
@@ -442,13 +475,14 @@ TCGEN05_DIRECT_ENTRY_CLUSTER_M = 2
 
 # Total work-cluster counts produced by the codegen scheduler for the
 # validated direct-entry shapes. Target 1 (1024x4096x1024) yields 64
-# work clusters; Targets 2 (4096x2048x2048), 3 (2048x4096x2048), 4
-# (8192x1024x1024), and 5 (1024x8192x1024) each yield 128; Target 6
-# (8192x2048x2048) and Target 7 (2048x8192x2048) each yield 256 (per
-# ``_tcgen05_num_work_clusters_expr`` in program_id.py:
-# dims[0] = ceil(M_tiles*cluster_m / cluster_m) * N_tiles at
-# cluster_m=2 cluster_n=1; T1 = 4*16 = 64; T4 = 32*4 = 128; T5 = 4*32
-# = 128; T2 = 16*8 = 128; T3 = 8*16 = 128; T6 = 32*8 = 256;
+# work clusters; Target 9 (2048x2048x2048) yields 64; Targets 2
+# (4096x2048x2048), 3 (2048x4096x2048), 4 (8192x1024x1024), and 5
+# (1024x8192x1024) each yield 128; Target 6 (8192x2048x2048) and
+# Target 7 (2048x8192x2048) each yield 256 (per
+# ``_tcgen05_num_work_clusters_expr`` in program_id.py: dims[0] =
+# ceil(M_tiles*cluster_m / cluster_m) * N_tiles at cluster_m=2
+# cluster_n=1; T1 = 4*16 = 64; T9 = 8*8 = 64; T4 = 32*4 = 128;
+# T5 = 4*32 = 128; T2 = 16*8 = 128; T3 = 8*16 = 128; T6 = 32*8 = 256;
 # T7 = 8*32 = 256). The runtime grid is
 # ``(cluster_m, cluster_n, min(total_clusters, num_sms // cluster_m))``;
 # both ``total_clusters`` and ``num_sms // cluster_m`` are admissible
