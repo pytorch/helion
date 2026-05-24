@@ -2197,6 +2197,12 @@ def _emit_mma_pipeline(
     if lhs_fake.ndim != 2 or rhs_fake.ndim != 2:
         return None
 
+    # Universal-MMA / tcgen05 MMA kernels rely on runtime tensor layouts
+    # for SMEM-load guards and TMA descriptors; baking literal shapes
+    # silently miscompiles those paths.  Mirror the flag set in
+    # ``_emit_cute_matmul`` so the host-side launcher disables the bake.
+    cg.cute_uses_matmul = True
+
     df = cg.device_function
     lhs_arg = df.tensor_arg(lhs_fake)
     rhs_arg = df.tensor_arg(rhs_fake)

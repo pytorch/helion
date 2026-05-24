@@ -42,6 +42,7 @@ two for-loops' ``target`` / ``iter`` / range bounds.
 from __future__ import annotations
 
 import ast
+import re
 
 from ..ast_extension import statement_from_string
 
@@ -83,6 +84,79 @@ def _looks_like_tracked_load(node: ast.AST) -> ast.IfExp | None:
     if not isinstance(func, ast.Attribute) or func.attr != "load":
         return None
     return node
+
+
+def _looks_like_unmasked_load(node: ast.AST) -> ast.Call | None:
+    """Return the Call if ``node`` is an unmasked scalar ``(PTR).load()``.
+
+    The CuTe scalar load emitter drops the ``if mask else CONST`` wrapping
+    when no mask is active (e.g. ``weight[:]`` loads in RMS-norm consume
+    sweeps); we still want to fuse those across the two passes.
+    """
+    if isinstance(node, ast.Call):
+        func = node.func
+        if isinstance(func, ast.Attribute) and func.attr == "load":
+            return node
+    return None
+
+
+def _looks_like_vec_load(node: ast.AST) -> ast.Call | None:
+    """Return the Call if ``node`` is a ``cute.arch.load(ptr, vec_type)``
+    expression — the hoisted U16 vec load emitted by the LoopedReductionStrategy
+    ``unroll`` mode.
+    """
+    if not isinstance(node, ast.Call):
+        return None
+    func = node.func
+    if not isinstance(func, ast.Attribute):
+        return None
+    if func.attr != "load":
+        return None
+    val = func.value
+    # Match either ``cute.arch.load`` or ``cute.arch.<whatever>.load`` — we
+    # only care that ``arch`` is in the call chain because that's what the
+    # cute helper uses.
+    while isinstance(val, ast.Attribute):
+        if val.attr == "arch":
+            return node
+        val = val.value
+    return None
+
+
+def _load_kind(node: ast.AST) -> str | None:
+    """Classify the load shape into ``"masked"`` / ``"unmasked"`` / ``"vec"``.
+
+    Returns None when ``node`` doesn't look like a gmem load we can fuse.
+    """
+    if _looks_like_tracked_load(node) is not None:
+        return "masked"
+    if _looks_like_vec_load(node) is not None:
+        return "vec"
+    if _looks_like_unmasked_load(node) is not None:
+        return "unmasked"
+    return None
+
+
+def _vec_width(node: ast.AST) -> int | None:
+    """Extract the V from ``cute.arch.load(ptr, ir.VectorType.get([V], ...))``.
+
+    Returns None when the expression isn't a recognised vec load.
+    """
+    if not isinstance(node, ast.Call) or len(node.args) < 2:
+        return None
+    vec_arg = node.args[1]
+    if (
+        isinstance(vec_arg, ast.Call)
+        and isinstance(vec_arg.func, ast.Attribute)
+        and vec_arg.func.attr == "get"
+        and len(vec_arg.args) >= 1
+    ):
+        shape_arg = vec_arg.args[0]
+        if isinstance(shape_arg, ast.List) and len(shape_arg.elts) == 1:
+            elt = shape_arg.elts[0]
+            if isinstance(elt, ast.Constant) and isinstance(elt.value, int):
+                return elt.value
+    return None
 
 
 def offset_var_for(loop: ast.For) -> str:
@@ -140,6 +214,49 @@ def _node_text(node: ast.AST) -> str:
     return ast.unparse(node)
 
 
+def _rewrite_vec_extract(
+    node: ast.AST, hoist_var: str, cache: str, idx_expr: str, vec_w: int
+) -> None:
+    """In-place rewrite of ``hoist_var[<vi>]`` -> ``cache[(idx_expr)*V + vi]``
+    inside ``node``.  Used after the vec hoist itself has been deleted from
+    the consume sweep so the dependent extracts still resolve.
+    """
+
+    class _RewriteVecExtract(ast.NodeTransformer):
+        def visit_Subscript(self, node: ast.Subscript) -> ast.AST:
+            self.generic_visit(node)
+            if isinstance(node.value, ast.Name) and node.value.id == hoist_var:
+                vi_text = ast.unparse(node.slice)
+                new = ast.parse(f"{cache}[({idx_expr}) * {vec_w} + ({vi_text})]").body[
+                    0
+                ]
+                assert isinstance(new, ast.Expr)
+                return new.value
+            return node
+
+    transformer = _RewriteVecExtract()
+    transformer.visit(node)
+    ast.fix_missing_locations(node)
+
+
+def _canonical_load_text(node: ast.AST, lane_var_alias: dict[str, str]) -> str:
+    """Stringify a load node with lane-base / hoist variables canonicalised.
+
+    The strategy creates fresh variable names for each sweep
+    (``reduction_lane_base_1`` in the reduce sweep, ``reduction_lane_base_2``
+    in the consume sweep, ``_unroll_vec_0`` vs ``_unroll_vec_1``...).  The
+    fuser matches loads across the two sweeps, so it must compare their
+    textual form modulo the rename — otherwise identical loads compare
+    unequal and fusion bails.
+    """
+    text = ast.unparse(node)
+    for old, new in lane_var_alias.items():
+        # Word-boundary replacement so suffixed vars don't pick up matches
+        # for shorter prefixes.
+        text = re.sub(rf"\b{re.escape(old)}\b", new, text)
+    return text
+
+
 class _CuteFuseTwoPassLoads(ast.NodeTransformer):
     """See module docstring."""
 
@@ -152,6 +269,143 @@ class _CuteFuseTwoPassLoads(ast.NodeTransformer):
         name = f"_fuse_cache_{self._counter}"
         self._counter += 1
         return name
+
+    def _resolve_load_container(
+        self,
+        outer_loop: ast.For,
+        start: ast.expr,
+        step: ast.expr,
+        trip: int,
+    ) -> tuple[list[ast.stmt], str, int] | None:
+        """Find the body list holding the actual gmem loads + the index
+        expression used to address the cache for one iter of ``outer_loop``.
+
+        Returns ``(container, cache_index_expr, cache_size)`` or None when
+        the body shape is not recognised.
+
+        Supported shapes:
+          A) Flat body (``for offset ...: load...``) — original simple case.
+          B) One nested for-loop (lane loop): ``for lane in range(K)`` —
+             cache index is ``(offset - start) // step * K + lane`` and the
+             container is the lane loop body.
+          C) Two nested for-loops (lane + constexpr vec lane) — the load
+             dispatcher hoists vec loads ABOVE the constexpr loop, so the
+             container is the lane loop body (between base_stmt and
+             vec_for); index is ``(offset - start) // step * K + lane``.
+        """
+        body = outer_loop.body
+        offset_var = offset_var_for(outer_loop)
+        cache_index_outer = (
+            f"({offset_var} - ({_node_text(start)})) // ({_node_text(step)})"
+        )
+        for_children = [s for s in body if isinstance(s, ast.For)]
+        if not for_children:
+            return body, cache_index_outer, trip
+        if len(for_children) != 1:
+            return None
+        # Shape B/C: one nested lane loop
+        lane_loop = for_children[0]
+        if not isinstance(lane_loop.target, ast.Name):
+            return None
+        # Resolve lane extent from range(K)
+        lane_range = _range_bounds(lane_loop.iter)
+        if lane_range is None:
+            return None
+        lane_start, lane_end, lane_step = lane_range
+        lane_trip = _trip_count_for(
+            lane_start, lane_end, lane_step, self._constexpr_values
+        )
+        if lane_trip is None or lane_trip < 1 or lane_trip > 32:
+            return None
+        lane_var = lane_loop.target.id
+        cache_index = f"({cache_index_outer}) * {lane_trip} + ({lane_var})"
+        # Check if the lane body contains a NESTED for (the constexpr vec
+        # loop in shape C).  If yes, the cache loads sit BEFORE that
+        # constexpr loop (the vec-hoist pattern from the LoopedReduction
+        # ``unroll`` mode).
+        lane_inner_fors = [s for s in lane_loop.body if isinstance(s, ast.For)]
+        if not lane_inner_fors:
+            # Shape B: lane body itself is the load container.
+            return lane_loop.body, cache_index, trip * lane_trip
+        if len(lane_inner_fors) != 1:
+            return None
+        # Shape C: cache the hoisted vec loads (which sit BEFORE the
+        # constexpr loop).  The constexpr V-loop itself is left alone
+        # because it only reads ``hoist_var[vi].bitcast(...)`` — once the
+        # hoist is replaced by a cache read, those inner extracts still
+        # work unchanged.
+        return lane_loop.body, cache_index, trip * lane_trip
+
+    def _build_second_alias(
+        self, first_loop: ast.For, second_loop: ast.For
+    ) -> dict[str, str]:
+        """Collect per-loop variable renames that need to be normalised so
+        the two sweeps' load expressions compare equal.
+
+        Currently handles the LoopedReductionStrategy's ``unroll`` mode:
+          - ``reduction_lane_base_<N>`` (per sweep)
+          - ``reduction_vec_lane_<N>`` (per sweep)
+        """
+        alias: dict[str, str] = {}
+
+        def _collect(loop: ast.For, prefix: str) -> str | None:
+            for s in ast.walk(loop):
+                if isinstance(s, ast.Name) and s.id.startswith(prefix):
+                    return s.id
+                if isinstance(s, ast.Assign):
+                    for t in s.targets:
+                        if isinstance(t, ast.Name) and t.id.startswith(prefix):
+                            return t.id
+            return None
+
+        for prefix in ("reduction_lane_base_", "reduction_vec_lane_"):
+            first_var = _collect(first_loop, prefix)
+            second_var = _collect(second_loop, prefix)
+            if first_var and second_var and first_var != second_var:
+                # Canonicalise the second sweep's var to the first sweep's
+                # name so textual comparison succeeds.
+                alias[second_var] = first_var
+        return alias
+
+    def _dtype_for_load_kind(self, node: ast.AST, kind: str) -> str | None:
+        """Extract the storage dtype string for the fragment that backs the
+        cached load.  For masked scalar loads, derive from the ``else
+        CONST`` branch.  For unmasked / vec loads, derive from the pointer
+        or vec-type expression.
+        """
+        if kind == "masked":
+            assert isinstance(node, ast.IfExp)
+            return _dtype_from_default(node.orelse)
+        if kind == "unmasked":
+            # ``(ptr_expr).load()`` — the load expression itself doesn't
+            # carry a dtype, but we can look it up later via the assignment
+            # target's downstream usage.  For now, fall back to a Float32
+            # cache which the cute compiler will coerce.  (RMS-norm consume
+            # sweeps in fp16/bf16 take the masked path; this fallback is
+            # rarely exercised.)
+            return None
+        if kind == "vec":
+            # ``cute.arch.load(ptr, ir.VectorType.get([V], <elem>.mlir_type))``
+            # Pull the element type expression out so the fragment is the
+            # right dtype.  The third arg to VectorType.get is the elem.
+            assert isinstance(node, ast.Call)
+            if len(node.args) >= 2:
+                vec_arg = node.args[1]
+                # ir.VectorType.get([V], <elem>.mlir_type)
+                if (
+                    isinstance(vec_arg, ast.Call)
+                    and isinstance(vec_arg.func, ast.Attribute)
+                    and vec_arg.func.attr == "get"
+                    and len(vec_arg.args) >= 2
+                ):
+                    elem_arg = vec_arg.args[1]
+                    if (
+                        isinstance(elem_arg, ast.Attribute)
+                        and elem_arg.attr == "mlir_type"
+                    ):
+                        return ast.unparse(elem_arg.value)
+            return None
+        return None
 
     def _try_fuse(self, body: list[ast.stmt]) -> list[ast.stmt] | None:
         # Find top-level ``for offset in range(...)`` loops with matching
@@ -201,124 +455,181 @@ class _CuteFuseTwoPassLoads(ast.NodeTransformer):
             second_idx = group[1]
             second_loop = new_body[second_idx]
             assert isinstance(second_loop, ast.For)
-            # Only the simple (no nested lane loop) case is fused. With a
-            # nested lane loop the cache index mixes runtime ``offset``
-            # with the lane variable, and CUTLASS DSL falls back to local
-            # memory (spilled to stack), which regresses performance.
-            container_first = first_loop.body
-            container_second = second_loop.body
-            cache_size = trip
-            cache_index = (
-                f"({offset_var_for(first_loop)} - ({_node_text(start)})) // "
-                f"({_node_text(step)})"
-            )
-            # Bail out on nested for-loops in either body to keep the
-            # simple-case invariant.
-            if any(isinstance(s, ast.For) for s in container_first):
+            # Resolve the load-container for each sweep: usually the for
+            # body itself, but for wide-chunk / vec configs the loads sit
+            # inside a nested lane for-loop.  Track the (load_container,
+            # cache_index) pair so the rewrite handles both shapes.
+            first_ctx = self._resolve_load_container(first_loop, start, step, trip)
+            second_ctx = self._resolve_load_container(second_loop, start, step, trip)
+            if first_ctx is None or second_ctx is None:
                 continue
-            if any(isinstance(s, ast.For) for s in container_second):
+            first_container, first_cache_index, first_cache_size = first_ctx
+            second_container, second_cache_index, second_cache_size = second_ctx
+            if first_cache_size != second_cache_size:
                 continue
+            cache_size = first_cache_size
+            # Sanity cap (avoid runaway register pressure).
+            if cache_size > 64:
+                continue
+            cache_index = first_cache_index
+            second_cache_index_str = second_cache_index
 
-            # Collect tracked loads, keyed by unparsed text.
-            tracked: dict[str, tuple[int, str]] = {}
-            for j, s in enumerate(container_first):
+            # Build a canonical-form alias map that smooths over per-sweep
+            # variable renames (``reduction_lane_base_1`` vs
+            # ``reduction_lane_base_2``, lane var counters, etc.) so the
+            # two sweeps' loads compare equal by text.
+            second_alias = self._build_second_alias(first_loop, second_loop)
+
+            # Collect tracked loads from the first container.  Vec loads
+            # (the ``unroll`` mode's U16 vec hoist) cache via a *scalar*
+            # fragment of ``cache_size * V`` slots — one slot per
+            # extracted lane — because the CUTLASS DSL's
+            # ``cute.make_fragment(N, dtype)`` does not currently accept a
+            # vec element type.  Scalar (masked / unmasked) loads cache as
+            # the existing fast path.
+            tracked: dict[str, tuple[int, str, str, str | None, int | None]] = {}
+            for j, s in enumerate(first_container):
                 if (
                     isinstance(s, ast.Assign)
                     and len(s.targets) == 1
                     and isinstance(s.targets[0], ast.Name)
                 ):
-                    load = _looks_like_tracked_load(s.value)
-                    if load is not None:
-                        tracked[_node_text(load)] = (j, s.targets[0].id)
+                    kind = _load_kind(s.value)
+                    if kind is None:
+                        continue
+                    dtype = self._dtype_for_load_kind(s.value, kind)
+                    if dtype is None:
+                        continue
+                    v_width = _vec_width(s.value) if kind == "vec" else 1
+                    if kind == "vec" and v_width is None:
+                        continue
+                    tracked[_node_text(s.value)] = (
+                        j,
+                        s.targets[0].id,
+                        kind,
+                        dtype,
+                        v_width,
+                    )
             if not tracked:
                 continue
 
-            # Find matching loads in the second loop's container.
+            # Match loads in the second container.
             assignments_to_rewrite: list[tuple[int, str, str]] = []
-            for j, s in enumerate(container_second):
+            for j, s in enumerate(second_container):
                 if (
                     isinstance(s, ast.Assign)
                     and len(s.targets) == 1
                     and isinstance(s.targets[0], ast.Name)
                 ):
-                    load = _looks_like_tracked_load(s.value)
-                    if load is None:
+                    kind = _load_kind(s.value)
+                    if kind is None:
                         continue
-                    key = _node_text(load)
+                    # Canonicalise the second sweep's load text against the
+                    # first sweep's variable names before keying.
+                    key = _canonical_load_text(s.value, second_alias)
                     if key in tracked:
                         assignments_to_rewrite.append((j, s.targets[0].id, key))
             if not assignments_to_rewrite:
                 continue
 
-            # Build cache declarations.
-            cache_names: dict[str, str] = {}
+            # Build cache declarations.  For vec loads, allocate
+            # ``cache_size * V`` scalar slots; for scalar loads use the
+            # original ``cache_size`` count.
+            cache_names: dict[str, tuple[str, int]] = {}
             cache_decls: list[ast.stmt] = []
-            for key, (j, _name) in tracked.items():
+            for key, (_j, _name, _kind, dtype, vec_w) in tracked.items():
                 if not any(akey == key for _, _, akey in assignments_to_rewrite):
                     continue
-                load_stmt = container_first[j]
-                assert isinstance(load_stmt, ast.Assign)
-                load_ifexp = _looks_like_tracked_load(load_stmt.value)
-                assert load_ifexp is not None
-                dtype = _dtype_from_default(load_ifexp.orelse)
-                if dtype is None:
+                if dtype is None or vec_w is None:
                     continue
                 cache = self._new_cache_name()
-                cache_names[key] = cache
+                cache_names[key] = (cache, vec_w)
+                cache_total = cache_size * vec_w
                 cache_decls.append(
                     statement_from_string(
-                        f"{cache} = cute.make_fragment({cache_size}, {dtype})"
+                        f"{cache} = cute.make_fragment({cache_total}, {dtype})"
                     )
                 )
             if not cache_names:
                 continue
 
-            # Rewrite the first loop: insert cache writes after each tracked
-            # load.
+            # Rewrite the first container: append cache writes after each
+            # tracked load assignment.  Vec loads write V scalars per
+            # cache slot; scalar loads write a single scalar.
             new_first_body: list[ast.stmt] = []
-            for s in container_first:
+            for s in first_container:
                 new_first_body.append(s)
                 if (
                     isinstance(s, ast.Assign)
                     and len(s.targets) == 1
                     and isinstance(s.targets[0], ast.Name)
                 ):
-                    load = _looks_like_tracked_load(s.value)
-                    if load is None:
+                    if _load_kind(s.value) is None:
                         continue
-                    key = _node_text(load)
-                    cache = cache_names.get(key)
-                    if cache is None:
+                    key = _node_text(s.value)
+                    entry = cache_names.get(key)
+                    if entry is None:
                         continue
+                    cache, vec_w = entry
                     name = s.targets[0].id
-                    new_first_body.append(
-                        statement_from_string(f"{cache}[{cache_index}] = {name}")
-                    )
-            first_loop.body = new_first_body
+                    if vec_w == 1:
+                        new_first_body.append(
+                            statement_from_string(f"{cache}[{cache_index}] = {name}")
+                        )
+                    else:
+                        for v in range(vec_w):
+                            new_first_body.append(
+                                statement_from_string(
+                                    f"{cache}[({cache_index}) * {vec_w} + {v}] = "
+                                    f"{name}[{v}]"
+                                )
+                            )
+            first_container[:] = new_first_body
 
-            # Rewrite the second loop: replace each matched load with a
-            # read from the cache.
+            # Rewrite the second container: replace each matched load.
+            # Scalar loads become a single cache read.  Vec loads are
+            # eliminated entirely (the consume sweep's hoist disappears)
+            # and any downstream ``hoist_var[vi]`` extracts inside the
+            # nested constexpr V-loop are rewritten to read from the cache
+            # at ``cache_index*V + vi``.
+            vec_extract_rewrites: list[tuple[str, str, str, int]] = []
             new_second_body: list[ast.stmt] = []
-            for s in container_second:
+            for s in second_container:
                 if (
                     isinstance(s, ast.Assign)
                     and len(s.targets) == 1
                     and isinstance(s.targets[0], ast.Name)
                 ):
-                    load = _looks_like_tracked_load(s.value)
-                    if load is not None:
-                        key = _node_text(load)
-                        cache = cache_names.get(key)
-                        if cache is not None:
+                    kind = _load_kind(s.value)
+                    if kind is not None:
+                        key = _canonical_load_text(s.value, second_alias)
+                        entry = cache_names.get(key)
+                        if entry is not None:
+                            cache, vec_w = entry
                             name = s.targets[0].id
-                            new_second_body.append(
-                                statement_from_string(
-                                    f"{name} = {cache}[{cache_index}]"
+                            if vec_w == 1:
+                                new_second_body.append(
+                                    statement_from_string(
+                                        f"{name} = {cache}[{second_cache_index_str}]"
+                                    )
                                 )
-                            )
+                            else:
+                                # Drop the hoist entirely; remember that
+                                # ``name[vi]`` needs to be rewritten to
+                                # ``cache[idx*V + vi]`` in subsequent
+                                # statements (especially inside the
+                                # constexpr V-loop).
+                                vec_extract_rewrites.append(
+                                    (name, cache, second_cache_index_str, vec_w)
+                                )
                             continue
                 new_second_body.append(s)
-            second_loop.body = new_second_body
+            # Apply the vec extract rewrites recursively to ``new_second_body``.
+            if vec_extract_rewrites:
+                for hoist_var, cache, idx_expr, vec_w in vec_extract_rewrites:
+                    for stmt in new_second_body:
+                        _rewrite_vec_extract(stmt, hoist_var, cache, idx_expr, vec_w)
+            second_container[:] = new_second_body
 
             # Insert cache declarations before the first loop.
             for decl in cache_decls:
