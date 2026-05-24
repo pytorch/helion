@@ -36,6 +36,7 @@ from .benchmark_provider import LocalBenchmarkProvider
 from .benchmark_provider import _clone_args
 from .benchmark_provider import _unset_fn
 from .benchmarking import interleaved_bench
+from .benchmarking import paired_interleaved_bench
 from .logger import AutotuningLogger
 from .metrics import AutotuneMetrics
 from .metrics import _run_post_autotune_hooks
@@ -66,16 +67,26 @@ _SUSPICIOUS_REBENCHMARK_REP = 100
 # ranking of close configs survives ±10-20% per-call noise on short kernels.
 # Disable by exporting ``HELION_AUTOTUNE_FINAL_PICK_PASSES=0``.
 _DEFAULT_FINAL_PICK_PASSES = 3
-_DEFAULT_FINAL_PICK_TOP_K = 5
+_DEFAULT_FINAL_PICK_TOP_K = 10
+# Pair every candidate call with a call to the incoming best inside the same
+# per-call timing window and rank by median paired delta.  Common-mode
+# thermal/scheduler drift cancels in the delta, reducing noise-driven
+# misranking on short kernels.  Disable via
+# ``HELION_AUTOTUNE_FINAL_PICK_PAIRED=0`` to fall back to absolute medians.
+_DEFAULT_FINAL_PICK_PAIRED = True
 
 
-def final_pick_settings() -> tuple[int, int]:
+def final_pick_settings() -> tuple[int, int, bool]:
     """Read the final-pick verification knobs from the environment.
 
-    Returns ``(passes, top_k)`` for
-    :meth:`PopulationBasedSearch.run_final_pick_verification`.  Both knobs
-    accept non-negative ints; ``passes=0`` disables the phase.
+    Returns ``(passes, top_k, paired)`` for
+    :meth:`PopulationBasedSearch.run_final_pick_verification`.  ``passes``
+    and ``top_k`` are non-negative ints; ``passes=0`` disables the phase.
+    ``paired`` is a bool that controls whether the per-pass rebenchmark
+    uses paired-sample timing against the incoming best (default
+    :data:`_DEFAULT_FINAL_PICK_PAIRED`).
     """
+    from ..runtime.settings import _env_get_bool
     from ..runtime.settings import _env_get_optional_int
 
     passes = _env_get_optional_int("HELION_AUTOTUNE_FINAL_PICK_PASSES")
@@ -84,7 +95,10 @@ def final_pick_settings() -> tuple[int, int]:
     top_k = _env_get_optional_int("HELION_AUTOTUNE_FINAL_PICK_TOP_K")
     if top_k is None:
         top_k = _DEFAULT_FINAL_PICK_TOP_K
-    return max(0, passes), max(0, top_k)
+    paired = _env_get_bool(
+        "HELION_AUTOTUNE_FINAL_PICK_PAIRED", _DEFAULT_FINAL_PICK_PAIRED
+    )
+    return max(0, passes), max(0, top_k), paired
 
 
 class _HasDeviceAndProcessGroupName(Protocol):
@@ -1234,6 +1248,8 @@ class PopulationBasedSearch(BaseSearch):
         best: PopulationMember,
         passes: int,
         top_k: int,
+        *,
+        paired: bool = _DEFAULT_FINAL_PICK_PAIRED,
     ) -> PopulationMember:
         """Re-benchmark the top candidates multiple times to harden ranking against noise.
 
@@ -1247,12 +1263,22 @@ class PopulationBasedSearch(BaseSearch):
         between runs of the autotuner.
 
         This phase takes the top-``top_k`` members of ``self.population``
-        (including ``best``) and runs ``passes`` independent rebenchmark calls
-        against each, then re-ranks by the **median of the per-pass medians**.
-        Doing the passes interleaved (one rebenchmark of all candidates per
-        pass, repeated ``passes`` times) keeps thermal / scheduling drift
-        balanced across configs so a transient slow-down on any single pass
-        does not bias one config over another.
+        (including ``best``) and runs ``passes`` independent rebenchmark
+        calls against each.  Two ranking modes are supported:
+
+        * ``paired=True`` (default): each per-pass rebenchmark uses
+          :func:`paired_interleaved_bench` to pair every candidate call
+          with a call to the incoming ``best`` inside the same
+          ``perf_counter`` window, then ranks candidates by the median
+          of per-pass paired deltas.  Common-mode thermal/scheduler
+          drift cancels in the delta so the decision survives noise
+          that would otherwise flip the rank.  Falls back to the
+          ``paired=False`` path when ``self.args``,
+          ``self.benchmark_provider``, or ``self.kernel`` are unset.
+        * ``paired=False``: per-pass rebenchmark uses
+          :meth:`rebenchmark` (interleaved across the cohort but not
+          paired against a reference) and ranks by the median of
+          per-pass medians.
 
         Args:
             best: The best configuration returned by the main search loop.
@@ -1261,6 +1287,10 @@ class PopulationBasedSearch(BaseSearch):
             top_k: Number of top members (by current perf) to verify.  The
                 returned configuration is guaranteed to be drawn from this set
                 (or ``best`` itself if no other candidate is reachable).
+            paired: When ``True``, use paired-sample timing against
+                ``best`` and rank by the median paired delta (default).
+                When ``False``, fall back to ranking by the median of
+                per-pass absolute medians.
 
         Returns:
             The population member with the lowest aggregate median across
@@ -1290,6 +1320,9 @@ class PopulationBasedSearch(BaseSearch):
 
         if len(candidates) < 2:
             return best
+
+        if paired and self._paired_rebenchmark_available():
+            return self._run_final_pick_verification_paired(best, candidates, passes)
 
         # Track each pass's median per candidate so the aggregate is a
         # median of independent medians (robust to a single bad pass).
@@ -1361,6 +1394,177 @@ class PopulationBasedSearch(BaseSearch):
 
         if math.isfinite(best_agg) and best_agg < self.best_perf_so_far:
             self.best_perf_so_far = best_agg
+        return best_member
+
+    def _paired_rebenchmark_available(self) -> bool:
+        """Return True when the paired-sample re-rank path can be used.
+
+        The paired path needs the real-autotune scaffolding
+        (``self.args``, ``self.kernel``, ``self.benchmark_provider`` and
+        ``self.settings``) so it can build per-candidate partials and run
+        :func:`paired_interleaved_bench`.  Unit-test scaffolds that build
+        a search via ``__new__`` and patch ``self.rebenchmark`` directly
+        will fall back to the legacy ranking flow.
+        """
+        if getattr(self, "args", None) is None:
+            return False
+        if getattr(self, "kernel", None) is None:
+            return False
+        if getattr(self, "benchmark_provider", None) is None:
+            return False
+        if getattr(self, "settings", None) is None:
+            return False
+        # A user-supplied ``autotune_benchmark_fn`` is responsible for its
+        # own ranking semantics; leave the legacy path in place.
+        return self.settings.autotune_benchmark_fn is None
+
+    def _run_final_pick_verification_paired(
+        self,
+        best: PopulationMember,
+        candidates: list[PopulationMember],
+        passes: int,
+    ) -> PopulationMember:
+        """Paired-sample re-rank path for :meth:`run_final_pick_verification`.
+
+        Each pass pairs every candidate call with one call to ``best``
+        inside the same ``perf_counter`` window via
+        :func:`paired_interleaved_bench`.  Rank by ``median(paired
+        delta)`` across passes; common-mode drift cancels so the decision
+        survives chip-thermal noise that would otherwise flip the rank.
+        """
+        # Repeat count mirrors :meth:`rebenchmark` so paired-sample
+        # measurements scale with kernel cost the same way the
+        # absolute-median path does.
+        base_repeat = (
+            int(200 / self.best_perf_so_far)
+            if math.isfinite(self.best_perf_so_far) and self.best_perf_so_far > 0
+            else 1000
+        )
+        repeat = min(1000, max(3, base_repeat))
+        if (capstr := os.getenv("HELION_CAP_REBENCHMARK_REPEAT")) is not None:
+            repeat = min(repeat, int(capstr))
+
+        if len(self.benchmark_provider.mutated_arg_indices) > 0:
+            benchmark_args = _clone_args(
+                self.args,
+                self.kernel.env.process_group_name,
+                idx_to_clone=self.benchmark_provider.mutated_arg_indices,
+            )
+        else:
+            benchmark_args = self.args
+        candidate_fns: list[Callable[..., object]] = [
+            functools.partial(member.fn, *benchmark_args) for member in candidates
+        ]
+        reference_fn: Callable[..., object] = functools.partial(
+            best.fn, *benchmark_args
+        )
+
+        # Per-candidate accumulators for the per-pass median and the
+        # per-pass paired delta vs. the incoming best.  The legacy
+        # ``perfs`` list also gets appended-to so downstream code (logs,
+        # final-pick reports) still sees the new measurements.
+        per_candidate_medians: list[list[float]] = [[] for _ in candidates]
+        per_candidate_deltas: list[list[float]] = [[] for _ in candidates]
+
+        for pass_idx in range(passes):
+            desc = f"Final-pick verification paired {pass_idx + 1}/{passes}"
+            self.log(
+                f"Final-pick verification paired pass {pass_idx + 1}/{passes} on "
+                f"{len(candidates)} candidates"
+            )
+            try:
+                paired_results = paired_interleaved_bench(
+                    candidate_fns,
+                    reference_fn,
+                    repeat=repeat,
+                    desc=desc if self.settings.autotune_progress_bar else None,
+                )
+            except Exception as err:  # pragma: no cover - defensive
+                self.log(
+                    f"Paired-sample rebenchmark failed on pass "
+                    f"{pass_idx + 1}/{passes} ({err!r}); falling back to "
+                    f"absolute-median rebenchmark for the remaining passes."
+                )
+                # Fall back to the legacy ranking for the rest of the
+                # phase by chaining into the absolute-median path.
+                return self.run_final_pick_verification(
+                    best,
+                    passes=passes,
+                    top_k=len(candidates),
+                    paired=False,
+                )
+            for slot_idx, (median_ms, delta_ms) in enumerate(paired_results):
+                per_candidate_medians[slot_idx].append(median_ms)
+                per_candidate_deltas[slot_idx].append(delta_ms)
+                if math.isfinite(median_ms):
+                    candidates[slot_idx].perfs.append(median_ms)
+                    if median_ms < self.best_perf_so_far:
+                        self.best_perf_so_far = median_ms
+
+        # Rank by the median of per-pass paired deltas vs ``best``; ties
+        # (e.g. the incoming best paired against itself) fall back to the
+        # candidate's median absolute timing.
+        aggregated: list[tuple[int, float, float]] = []
+        for slot_idx, deltas in enumerate(per_candidate_deltas):
+            finite_deltas = [d for d in deltas if math.isfinite(d)]
+            finite_medians = [
+                m for m in per_candidate_medians[slot_idx] if math.isfinite(m)
+            ]
+            if not finite_deltas or not finite_medians:
+                aggregated.append((slot_idx, inf, inf))
+                continue
+            aggregated.append(
+                (
+                    slot_idx,
+                    statistics.median(finite_deltas),
+                    statistics.median(finite_medians),
+                )
+            )
+
+        # Primary key: median paired delta (smaller = faster than the
+        # reference).  Secondary key: median absolute time, so two
+        # candidates with identical paired deltas are broken by their
+        # absolute speed.
+        best_slot, best_delta, best_median = min(
+            aggregated, key=operator.itemgetter(1, 2)
+        )
+        if not math.isfinite(best_delta) or not math.isfinite(best_median):
+            return best
+
+        best_member = candidates[best_slot]
+        if best_member is best:
+            self.log(
+                f"Final-pick verification (paired) confirmed best "
+                f"(paired-delta median {best_delta:+.4f}ms, absolute "
+                f"median {best_median:.4f}ms across {passes} pass(es))"
+            )
+        else:
+            original_agg_idx = next(
+                (
+                    slot_idx
+                    for slot_idx, member in enumerate(candidates)
+                    if member is best
+                ),
+                None,
+            )
+            if original_agg_idx is not None:
+                original_delta = aggregated[original_agg_idx][1]
+                self.log(
+                    f"Final-pick verification (paired) re-picked "
+                    f"{best_member.config} (paired-delta median "
+                    f"{best_delta:+.4f}ms) over previous best "
+                    f"{best.config} (paired-delta median "
+                    f"{original_delta:+.4f}ms)"
+                )
+            else:
+                self.log(
+                    f"Final-pick verification (paired) picked "
+                    f"{best_member.config} (paired-delta median "
+                    f"{best_delta:+.4f}ms)"
+                )
+
+        if math.isfinite(best_median) and best_median < self.best_perf_so_far:
+            self.best_perf_so_far = best_median
         return best_member
 
 

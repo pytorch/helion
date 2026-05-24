@@ -1179,6 +1179,263 @@ class TestPallas(TestCase):
             "[256, 256, 256] family.",
         )
 
+    def test_pallas_autotuner_final_pick_uses_interleaved_timing(self) -> None:
+        """Final-pick verification ranks by paired delta, not absolute median.
+
+        Plan.md §2.10 / Deep Replan 6: on noisy TPU pods the per-call
+        absolute median wanders 10-20 % between rebenchmark passes
+        because of chip-thermal / scheduler drift that accumulates
+        across the ``repeat`` axis.  Under that regime, ranking two
+        near-equal candidates by their per-pass absolute median is
+        unstable -- one out of every two-to-three sweeps the rank flips
+        and the autotuner ships a sub-best config.  Paired-sample
+        timing pairs every candidate call with one call to the cohort's
+        running best inside the same ``perf_counter`` window so the
+        common-mode drift cancels in the (candidate - reference)
+        delta.  Ranking by ``median(paired delta)`` is then stable.
+
+        Scenario in this pin:
+
+        * Candidate ``[512, 512, 512]`` is the running best and is
+          intrinsically 5 us faster than ``[256, 256, 256]`` on every
+          paired sample.
+        * Across passes the chip drifts by +/- 30 us (a per-pass DC
+          offset that hits both candidates equally inside the same
+          pass).  That offset is large enough that the per-pass
+          absolute medians cross -- on one of three passes the slower
+          candidate's absolute median is *lower* than the faster one's
+          (the slow-pass offset pushed both up, then the next pass'
+          offset pushed both down).
+        * Paired delta (always +5 us in favor of ``[512, 512, 512]``)
+          is stable, so the paired path picks ``[512, 512, 512]`` on
+          every one of 10 simulated sweeps.
+
+        The pin asserts that ``run_final_pick_verification`` (with
+        ``paired=True``, the default) consistently picks
+        ``[512, 512, 512]`` even though the absolute medians flip the
+        rank, and that the legacy ``paired=False`` path picks the
+        wrong candidate at least once on the same scripted timings --
+        i.e., paired timing is *both necessary* (legacy fails) *and
+        sufficient* (paired stays correct) for the decision.
+
+        Regression hazard pinned: if a refactor accidentally reverts
+        the decision metric back to absolute medians, or skips the
+        paired branch when the real-autotune scaffolding is present,
+        the pin fails.
+        """
+        from unittest.mock import patch
+
+        from helion.autotuner.base_search import PopulationBasedSearch
+        from helion.autotuner.base_search import PopulationMember
+        from helion.runtime.config import Config
+
+        # Two candidates with a small constant delta in the paired
+        # sample but a large per-pass DC offset shared between them.
+        # The DC offset crosses zero between passes 0/1/2 so the
+        # absolute-median rank flips while the paired-delta rank does
+        # not.
+        fast_cfg = Config(block_sizes=[512, 512, 512])
+        slow_cfg = Config(block_sizes=[256, 256, 256])
+
+        # Scripted absolute medians per pass (us) that any realistic
+        # noisy-pod rebenchmark might observe.  Per-pass DC offsets
+        # (chip drift) are huge enough that the **absolute** median
+        # crosses the true 5 us per-sample gap: passes 0 and 2 are
+        # "warm" passes where fast lands *above* slow because the
+        # drift hit the fast measurement window harder than the slow
+        # one; pass 1 is a "cool" pass that recovers the true rank.
+        # Across all 3 passes the median of fast absolute is **above**
+        # the median of slow absolute, so the legacy
+        # absolute-median aggregate picks the *slow* candidate.  The
+        # paired path sees the same medians but the paired deltas
+        # (which are kernel-intrinsic, not noise) always favor fast
+        # by 5 us, so the paired aggregate keeps picking fast.
+        passes_per_call = [
+            # (fast_us, slow_us)
+            (240, 200),  # warm pass -- chip drift inflated fast
+            (180, 205),  # cool pass -- true rank visible
+            (240, 200),  # warm pass -- chip drift inflated fast
+        ]
+
+        scripted_iterator = iter(passes_per_call)
+
+        def fake_paired(
+            fns: list[Callable[[], object]],
+            reference_fn: Callable[[], object],
+            *,
+            repeat: int,
+            desc: str | None = None,
+        ) -> list[tuple[float, float]]:
+            # Each fake "pass" delivers a fresh (fast_us, slow_us)
+            # absolute pair plus a constant +5 us paired delta for the
+            # slow candidate (the kernel's intrinsic gap).  The
+            # reference is the fast candidate, so its paired delta is
+            # 0; the slow candidate's paired delta is +5 us, regardless
+            # of which way chip drift pushed the absolute medians on
+            # this pass.  This mirrors the production behavior of
+            # ``paired_interleaved_bench``: per-sample drift cancels
+            # in (candidate - reference) so the delta tracks the
+            # kernel's true cost difference.
+            fast_us, slow_us = next(scripted_iterator)
+            results: list[tuple[float, float]] = []
+            for fn in fns:
+                # The wiring wraps each member's ``fn`` in a
+                # ``functools.partial`` with the benchmark args; the
+                # underlying callable is ``partial.func``.
+                inner = getattr(fn, "func", fn)
+                if inner is fast_fn:
+                    results.append((fast_us / 1000.0, 0.0))
+                elif inner is slow_fn:
+                    # +5 us above reference (fast).
+                    results.append((slow_us / 1000.0, 0.005))
+                else:  # pragma: no cover - defensive
+                    raise AssertionError(f"unexpected fn passed to paired bench: {fn}")
+            return results
+
+        # Build minimal scaffold so ``_paired_rebenchmark_available()``
+        # returns True.  The real autotune init populates ``args``,
+        # ``kernel``, ``settings``, and ``benchmark_provider``; we
+        # forge just enough of each for the verification path.
+        class _NoopLog:
+            def __call__(self, *_: object, **__: object) -> None:
+                return None
+
+            def debug(self, *_: object, **__: object) -> None:
+                return None
+
+            def warning(self, *_: object, **__: object) -> None:
+                return None
+
+        class _FakeBenchmarkProvider:
+            mutated_arg_indices: tuple[int, ...] = ()
+
+        class _FakeSettings:
+            autotune_benchmark_fn: Callable[..., list[float]] | None = None
+            autotune_progress_bar: bool = False
+
+        class _FakeKernel:
+            class env:
+                process_group_name: str | None = None
+
+        def fast_fn() -> None:
+            return None
+
+        def slow_fn() -> None:
+            return None
+
+        def run_verification_once() -> Config:
+            fast_member = PopulationMember(
+                fn=fast_fn,
+                perfs=[0.200],
+                flat_values=[id(fast_cfg)],
+                config=fast_cfg,
+                status="ok",
+                compile_time=0.0,
+            )
+            slow_member = PopulationMember(
+                fn=slow_fn,
+                perfs=[0.201],
+                flat_values=[id(slow_cfg)],
+                config=slow_cfg,
+                status="ok",
+                compile_time=0.0,
+            )
+            search = PopulationBasedSearch.__new__(PopulationBasedSearch)
+            search.population = [fast_member, slow_member]
+            search.best_perf_so_far = min(m.perf for m in search.population)
+            search.log = _NoopLog()
+            search.args = ()
+            search.kernel = _FakeKernel()
+            search.benchmark_provider = _FakeBenchmarkProvider()
+            search.settings = _FakeSettings()
+            search._compiler_seed_members = []
+            final = search.run_final_pick_verification(fast_member, passes=3, top_k=5)
+            return final.config
+
+        # Paired path: scripted deltas always favor fast_cfg, so the
+        # paired-delta median is -5 us for fast and 0 us for slow ->
+        # fast wins on every sweep across 10 independent invocations.
+        paired_picks: list[Config] = []
+        for _ in range(10):
+            scripted_iterator = iter(passes_per_call)
+            with patch(
+                "helion.autotuner.base_search.paired_interleaved_bench",
+                side_effect=fake_paired,
+            ):
+                paired_picks.append(run_verification_once())
+
+        self.assertEqual(
+            sum(1 for c in paired_picks if list(c["block_sizes"]) == [512, 512, 512]),
+            10,
+            f"Paired final-pick must consistently pick fast candidate, "
+            f"got picks: {[list(c['block_sizes']) for c in paired_picks]}",
+        )
+
+        # Legacy (paired=False) path on the same scripted absolute
+        # medians: rebenchmark feeds back (fast_us, slow_us) directly,
+        # so the per-pass absolute median crosses zero and the legacy
+        # rank picks the slow candidate on at least one pass out of
+        # three (the [240,245] / [250,255] passes raise the fast
+        # candidate's median above the slow candidate's median on the
+        # following pass).  We force the rebenchmark to feed back
+        # *exactly* the scripted absolute medians per pass so the
+        # decision is reproducible.
+        legacy_passes_iter = iter(passes_per_call)
+
+        def fake_rebenchmark(
+            members_to_bench: list[PopulationMember], *, desc: str = ""
+        ) -> None:
+            fast_us, slow_us = next(legacy_passes_iter)
+            for member in members_to_bench:
+                if member.config is fast_cfg:
+                    member.perfs.append(fast_us / 1000.0)
+                elif member.config is slow_cfg:
+                    member.perfs.append(slow_us / 1000.0)
+
+        fast_member = PopulationMember(
+            fn=fast_fn,
+            perfs=[0.200],
+            flat_values=[id(fast_cfg)],
+            config=fast_cfg,
+            status="ok",
+            compile_time=0.0,
+        )
+        slow_member = PopulationMember(
+            fn=slow_fn,
+            perfs=[0.201],
+            flat_values=[id(slow_cfg)],
+            config=slow_cfg,
+            status="ok",
+            compile_time=0.0,
+        )
+        search = PopulationBasedSearch.__new__(PopulationBasedSearch)
+        search.population = [fast_member, slow_member]
+        search.best_perf_so_far = min(m.perf for m in search.population)
+        search.log = _NoopLog()
+        search._compiler_seed_members = []
+
+        # Legacy path: paired=False explicitly, scaffold left
+        # unpopulated so the legacy branch is the only one taken.
+        with patch.object(search, "rebenchmark", side_effect=fake_rebenchmark):
+            legacy_final = search.run_final_pick_verification(
+                fast_member, passes=3, top_k=5, paired=False
+            )
+
+        # Legacy absolute-median ranking on the same scripted passes
+        # picks slow: fast medians = {240, 180, 240} -> median 240;
+        # slow medians = {200, 205, 200} -> median 200.  Slow wins
+        # the legacy aggregate even though it is the true loser by
+        # kernel cost -- exactly the failure mode the paired path
+        # exists to prevent.
+        self.assertEqual(
+            list(legacy_final.config["block_sizes"]),
+            [256, 256, 256],
+            "Legacy absolute-median path must mis-rank the slow "
+            "candidate as best when chip-drift is large enough to "
+            "flip the absolute median, demonstrating why paired-sample "
+            "timing is needed in the final-pick verification path.",
+        )
+
     def test_bmm(self) -> None:
         """Test BMM with default config — exercises size_matches fix.
 

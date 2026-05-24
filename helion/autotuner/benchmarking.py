@@ -291,6 +291,86 @@ def interleaved_bench_generic(
     return [statistics.median(times) for times in all_times]
 
 
+def paired_interleaved_bench(
+    fns: list[Callable[..., object]],
+    reference_fn: Callable[..., object],
+    *,
+    repeat: int,
+    desc: str | None = None,
+) -> list[tuple[float, float]]:
+    """Paired-sample timing: each candidate is paired with ``reference_fn``.
+
+    For every iteration and every candidate ``fns[j]``, the helper times
+    one ``fns[j]()`` call immediately followed by one ``reference_fn()``
+    call (both with per-call ``synchronize_device``).  The candidate and
+    its paired reference time are accumulated together so that any
+    chip-thermal or scheduling drift that affects one call also affects
+    the other inside the same ~microsecond window.
+
+    The returned ``(median_ms, paired_delta_median_ms)`` per fn lets the
+    caller rank by paired delta instead of absolute median.  Ranking by
+    paired delta cancels common-mode drift that accumulates across the
+    ``repeat`` axis (the dominant noise source on noisy TPU pods, per
+    plan.md §2.10 / Deep Replan 6); ranking by absolute median does not.
+
+    Wall-clock based via ``time.perf_counter()`` + ``synchronize_device``
+    so the same helper works for CUDA, Pallas / TPU, CuTe, and any other
+    backend that exposes a device synchronization primitive.
+
+    Args:
+        fns: List of candidate functions to benchmark.
+        reference_fn: Stable reference function (typically the cohort's
+            current best) timed once per candidate per iteration so the
+            paired deltas are one-to-one.
+        repeat: Number of paired iterations per candidate.
+        desc: Optional description for progress bar.
+
+    Returns:
+        A list of ``(median_ms, paired_delta_median_ms)`` tuples, one per
+        candidate in ``fns``.  ``paired_delta_median_ms`` is positive when
+        the candidate is slower than the reference and negative when
+        faster.
+    """
+    # warmup
+    out: object = None
+    for fn in fns:
+        out = fn()
+    out = reference_fn()
+    synchronize_device(out)
+
+    fn_times: list[list[float]] = [[] for _ in range(len(fns))]
+    ref_paired_times: list[list[float]] = [[] for _ in range(len(fns))]
+
+    iterator = iter_with_progress(
+        range(repeat),
+        total=repeat,
+        description=desc,
+        enabled=desc is not None,
+    )
+    for _i in iterator:
+        for j in range(len(fns)):
+            synchronize_device(out)
+            t0 = time.perf_counter()
+            out = fns[j]()
+            synchronize_device(out)
+            t1 = time.perf_counter()
+            out = reference_fn()
+            synchronize_device(out)
+            t2 = time.perf_counter()
+            fn_times[j].append((t1 - t0) * 1000)
+            ref_paired_times[j].append((t2 - t1) * 1000)
+
+    results: list[tuple[float, float]] = []
+    for j in range(len(fns)):
+        candidate_median = statistics.median(fn_times[j])
+        paired_deltas = [
+            c - r for c, r in zip(fn_times[j], ref_paired_times[j], strict=True)
+        ]
+        paired_delta_median = statistics.median(paired_deltas)
+        results.append((candidate_median, paired_delta_median))
+    return results
+
+
 def _summarize_statistics_fallback(
     times: list[float],
     quantiles: list[float] | None,

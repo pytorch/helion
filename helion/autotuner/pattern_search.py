@@ -211,8 +211,10 @@ class PatternSearch(PopulationBasedSearch):
         # passes to drown out per-call noise on short kernels.
         from .base_search import final_pick_settings
 
-        passes, top_k = final_pick_settings()
-        best = self.run_final_pick_verification(best, passes=passes, top_k=top_k)
+        passes, top_k, paired = final_pick_settings()
+        best = self.run_final_pick_verification(
+            best, passes=passes, top_k=top_k, paired=paired
+        )
 
         return best.config
 
