@@ -1124,7 +1124,9 @@ def _prepare_quack_direct(
                 is_dynamic_persistent=config["is_dynamic_persistent"],
                 max_swizzle_size=config["max_swizzle_size"],
                 rowvec_bias=bias_d,
+                # pyrefly: ignore [unexpected-keyword]
                 alpha=1.25 if args.epilogue == "bias_residual_gelu" else 1.0,
+                # pyrefly: ignore [unexpected-keyword]
                 beta=0.5 if args.epilogue == "bias_residual_gelu" else 1.0,
             )
             return out[0]

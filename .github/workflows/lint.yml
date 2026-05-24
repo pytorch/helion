@@ -45,7 +45,7 @@ jobs:
       - name: Install lint dependencies
         run: |
           source .venv/bin/activate
-          uv pip install pyrefly==0.63.1
+          uv pip install pyrefly==1.0.0
           uv pip install .'[dev,pallas-cpu]'
           ./scripts/install_cute.sh
 
