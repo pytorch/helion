@@ -1182,6 +1182,92 @@ class TestPallas(TestCase):
             "(direct-dispatch path engaged), not stay on the slow path.",
         )
 
+    def test_pallas_launcher_caches_output_tensor(self) -> None:
+        """Static-shape kernel caches the output ``device='meta'`` placeholder and
+        reuses the same object across calls (no per-call re-allocation)."""
+
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def _matmul_output_meta_pin(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty(
+                [m, n],
+                device=x.device,
+                dtype=torch.promote_types(x.dtype, y.dtype),
+            )
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = acc
+            return out
+
+        torch.manual_seed(0)
+        x = torch.randn(256, 256, device=DEVICE, dtype=torch.bfloat16)
+        torch.manual_seed(1)
+        y = torch.randn(256, 256, device=DEVICE, dtype=torch.bfloat16)
+
+        bound = _matmul_output_meta_pin.bind((x, y))
+        config = bound.config_spec.default_config()
+        compiled_fn = bound.compile_config(config)
+
+        reference = compiled_fn(x, y).clone()
+        owners = [
+            value
+            for value in compiled_fn.__globals__.values()
+            if getattr(value, "_helion_output_meta_cache_0", None) is not None
+        ]
+        self.assertTrue(owners, "Output meta placeholder was not cached.")
+        cached_meta = owners[0]._helion_output_meta_cache_0
+
+        # Repeat calls must reuse the same placeholder object and keep the output.
+        n_repeats = 10
+        for _ in range(n_repeats):
+            result = compiled_fn(x, y)
+            self.assertTrue(
+                torch.equal(result, reference),
+                "Output diverged after cached meta-placeholder reuse "
+                f"(max_abs_diff="
+                f"{(result.float() - reference.float()).abs().max().item()}).",
+            )
+            self.assertIs(
+                owners[0]._helion_output_meta_cache_0,
+                cached_meta,
+                "Repeat calls must reuse the cached placeholder, not re-allocate.",
+            )
+
+        # Bitwise-identical to a fresh-compiled baseline: the cache holds only the
+        # zero-storage meta placeholder, not output bytes.
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def _matmul_output_meta_baseline(
+            x: torch.Tensor, y: torch.Tensor
+        ) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty(
+                [m, n],
+                device=x.device,
+                dtype=torch.promote_types(x.dtype, y.dtype),
+            )
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = acc
+            return out
+
+        bound_baseline = _matmul_output_meta_baseline.bind((x, y))
+        baseline_fn = bound_baseline.compile_config(
+            bound_baseline.config_spec.default_config()
+        )
+        baseline_result = baseline_fn(x, y)
+        self.assertTrue(
+            torch.equal(reference, baseline_result),
+            "Cached-meta result diverged from fresh-compiled baseline "
+            f"(max_abs_diff="
+            f"{(reference.float() - baseline_result.float()).abs().max().item()}).",
+        )
+
     def test_bmm(self) -> None:
         """Test BMM with default config — exercises size_matches fix.
 
@@ -1398,7 +1484,7 @@ class TestPallas(TestCase):
 
         # test that we're not manually allocating and donating out tensor HBM,
         # but are instead taking over tensor returned by torch_tpu JaxCallable
-        self.assertIn("out = torch.empty_like(q_view, device='meta')", _code)
+        self.assertIn("torch.empty_like(q_view, device='meta')", _code)
         self.assertIn("out = _launcher(", _code)
 
     def test_hl_zeros_outer_arithmetic_emit_pipeline(self) -> None:
