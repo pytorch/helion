@@ -41,7 +41,6 @@ from helion._testing import HALF_DTYPE
 from helion._testing import run_example
 import helion.language as hl
 
-
 # %%
 # XSA Kernel
 # ----------
