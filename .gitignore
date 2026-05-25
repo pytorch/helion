@@ -112,3 +112,4 @@ cute_sweep_results.jsonl
 # Per-user Claude Code settings; ``.claude/skills/`` is tracked but
 # this file lives alongside it and is per-session local state.
 .claude/settings.local.json
+.claude/worktrees/*
