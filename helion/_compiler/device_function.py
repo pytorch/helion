@@ -880,7 +880,16 @@ class DeviceFunction:
             # +20% bench gain on (4096, 12672) fp16.
             from .cute.hoist_loop_invariant_recip import hoist_loop_invariant_recips
 
-            kernel_body = hoist_loop_invariant_recips(kernel_body)
+            # Pass the post-renames map so the invariance analysis can
+            # treat ``v_1_0`` (which will be renamed to ``mi`` by
+            # ast_rename below) as an assignment to ``mi`` for the
+            # purpose of LICM.  Without this the FMA hoist would
+            # mistakenly classify ``mi`` as loop-invariant in the reduce
+            # loop and capture its stale initial value.
+            rename_groups = {k: v[0] for k, v in self._variable_renames.items()}
+            kernel_body = hoist_loop_invariant_recips(
+                kernel_body, rename_groups=rename_groups
+            )
         return [
             *prefix,
             ast_rename(
