@@ -4,10 +4,10 @@
 + python /home/ymu_google_com/helion/tmp/jagged_sum_pallas_experiment/variants/v3_slab_grid.py
 ----- BEGIN VARIANT v3_slab_grid -----
 WARNING: All log messages before absl::InitializeLog() is called are written to STDERR
-I0000 00:00:1779828545.686689 1855361 pjrt_api.cc:96] PJRT_Api is set for device type cpu
-I0000 00:00:1779828545.710976 1855361 pjrt_api.cc:118] GetPjrtApi was found for TPU at /home/ymu_google_com/miniconda3/envs/tpu/lib/python3.12/site-packages/libtpu/libtpu.so
-I0000 00:00:1779828545.711008 1855361 pjrt_api.cc:96] PJRT_Api is set for device type tpu
-I0000 00:00:1779828545.733226 1855361 device_rt.cc:97] PjRt runtime initialization deferred for tpu
+I0000 00:00:1779829685.719188 1865436 pjrt_api.cc:96] PJRT_Api is set for device type cpu
+I0000 00:00:1779829685.743646 1865436 pjrt_api.cc:118] GetPjrtApi was found for TPU at /home/ymu_google_com/miniconda3/envs/tpu/lib/python3.12/site-packages/libtpu/libtpu.so
+I0000 00:00:1779829685.743677 1865436 pjrt_api.cc:96] PJRT_Api is set for device type tpu
+I0000 00:00:1779829685.765830 1865436 device_rt.cc:97] PjRt runtime initialization deferred for tpu
 Successfully renamed PrivateUse1 backend to 'tpu'. Device: device(type='tpu')
 Registered Python module for 'tpu'.
 Device type: tpu, Device index: default
@@ -15,14 +15,15 @@ Initializing TPU distributed runtime
 ==============================================================================
 === V3 — hl.grid + direct slab slice x_data[start:end, :]
 ==============================================================================
-I0000 00:00:1779828546.743312 1855361 pjrt_api.cc:167] The PJRT plugin has PJRT API version 0.108. The framework PJRT API version is 0.104.
-I0000 00:00:1779828549.083950 1855361 pjrt_c_api_client.cc:197] PjRtCApiClient created.
-W0000 00:00:1779828549.083989 1855361 pjrt_state.cc:230] Only using 1 device out of all the 8 addressable devices.
-I0000 00:00:1779828549.117435 1856144 tier2_compilation_cache.cc:149] Tier-2 compilation cache is disabled for world size 1.
-I0000 00:00:1779828549.117462 1856144 tier3_compilation_cache.cc:65] Backup compilation for tier-3 cache read is disabled as tier-3 cache is disabled.
+I0000 00:00:1779829686.771887 1865436 pjrt_api.cc:167] The PJRT plugin has PJRT API version 0.108. The framework PJRT API version is 0.104.
+I0000 00:00:1779829689.096402 1865436 pjrt_c_api_client.cc:197] PjRtCApiClient created.
+W0000 00:00:1779829689.096438 1865436 pjrt_state.cc:230] Only using 1 device out of all the 8 addressable devices.
+I0000 00:00:1779829689.128386 1866221 tier2_compilation_cache.cc:149] Tier-2 compilation cache is disabled for world size 1.
+I0000 00:00:1779829689.128410 1866221 tier3_compilation_cache.cc:65] Backup compilation for tier-3 cache read is disabled as tier-3 cache is disabled.
 INPUT  x_data.shape=(256, 128) dtype=torch.float32 device=tpu:0
-INPUT  x_offsets.shape=(9,) dtype=torch.int64 value=[0, 45, 93, 147, 148, 152, 212, 216, 256]
-INPUT  per-batch nnz = [45, 48, 54, 1, 4, 60, 4, 40]
+INPUT  x_offsets.shape=(9,) dtype=torch.int32
+INPUT  x_offsets head/tail = [0, 45, 93, 147, 148, 152, 212, 216, 256]
+INPUT  L=nnz_total=256; if backend allocates full-input VMEM scratch, that's ~128.0 KiB (~0.12 MiB)
 /home/ymu_google_com/helion/helion/_compiler/compile_environment.py:238: UserWarning: The 'pallas' backend is experimental and may have limited functionality.
   warn_once(
 COMPILE/RUN FAILED — full traceback:
@@ -125,9 +126,9 @@ While processing:
     x_slab = x_data[start:end, :]
              ^^^^^^^^^^^^^^^^^^^^
 
-I0000 00:00:1779828550.388182 1855361 compilation_cache.cc:354] Compilation cache evicted.
-I0000 00:00:1779828550.388203 1855361 compilation_cache.cc:219] CompilationCache final stats: num_cache_reqs=42
-num_cache_hits=29 {69.0%}
+I0000 00:00:1779829690.373902 1865436 compilation_cache.cc:354] Compilation cache evicted.
+I0000 00:00:1779829690.373922 1865436 compilation_cache.cc:219] CompilationCache final stats: num_cache_reqs=42
+num_cache_hits=30 {71.4%}
 peak_compilation_memory_bytes=unknown
 
 ----- END VARIANT v3_slab_grid (exit=1) -----

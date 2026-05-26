@@ -30,6 +30,14 @@ has BoundedSlice: True
 has ds: True
 
 === sanity: import helion ===
-Traceback (most recent call last):
-  File "<string>", line 4, in <module>
-ModuleNotFoundError: No module named 'helion'
+WARNING: All log messages before absl::InitializeLog() is called are written to STDERR
+I0000 00:00:1779829660.116387 1860998 pjrt_api.cc:96] PJRT_Api is set for device type cpu
+I0000 00:00:1779829660.140714 1860998 pjrt_api.cc:118] GetPjrtApi was found for TPU at /home/ymu_google_com/miniconda3/envs/tpu/lib/python3.12/site-packages/libtpu/libtpu.so
+I0000 00:00:1779829660.140745 1860998 pjrt_api.cc:96] PJRT_Api is set for device type tpu
+I0000 00:00:1779829660.162901 1860998 device_rt.cc:97] PjRt runtime initialization deferred for tpu
+Successfully renamed PrivateUse1 backend to 'tpu'. Device: device(type='tpu')
+Registered Python module for 'tpu'.
+Device type: tpu, Device index: default
+Initializing TPU distributed runtime
+helion backend: pallas
+helion DEVICE: tpu

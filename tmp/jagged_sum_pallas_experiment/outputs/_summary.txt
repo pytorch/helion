@@ -1,5 +1,21 @@
 === summary ===
-v1_gather               | COMPILE/RUN FAILED — full traceback:
-v2_2d_index             | COMPILE/RUN FAILED — full traceback:
-v3_slab_grid            | COMPILE/RUN FAILED — full traceback:
-v4_grid_jagged_tile     | COMPILE/RUN FAILED — full traceback:
+[v1_gather] 
+    SIZE 'small': COMPILE/RUN FAILED — full traceback:
+    SIZE 'medium': COMPILE/RUN FAILED — full traceback:
+    SIZE 'large': COMPILE/RUN FAILED — full traceback:
+    SIZE 'huge': COMPILE/RUN FAILED — full traceback:
+    err: NotImplementedError: Pallas gather: resident block is 71787520 bytes, exceeds the 16777216 byte VMEM threshold. The current codegen requires the full gather axis in VMEM; reduce V, tile the broadcast dims, or use a half-precision dtype.
+
+[v2_2d_index] 
+    SIZE 'small': COMPILE/RUN FAILED — full traceback:
+    SIZE 'medium': COMPILE/RUN FAILED — full traceback:
+    SIZE 'large': COMPILE/RUN FAILED — full traceback:
+    SIZE 'huge': COMPILE/RUN FAILED — full traceback:
+    err: NotImplementedError: Pallas gather: resident block is 71787520 bytes, exceeds the 16777216 byte VMEM threshold. The current codegen requires the full gather axis in VMEM; reduce V, tile the broadcast dims, or use a half-precision dtype.
+
+[v3_slab_grid] 
+    err: helion.exc.InternalError: GuardOnDataDependentSymNode: Could not guard on data-dependent expression Eq(u2, 1) (unhinted: Eq(u2, 1)).  (Size-like symbols: none)
+
+[v4_grid_jagged_tile] 
+    err: helion.exc.InvalidJaggedTileUsage: Invalid usage of hl.jagged_tile: hl.jagged_tile only accepts a tensor with rank >= 1 as an argument
+

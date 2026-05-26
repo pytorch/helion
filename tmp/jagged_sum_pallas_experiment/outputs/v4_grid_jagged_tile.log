@@ -4,10 +4,10 @@
 + python /home/ymu_google_com/helion/tmp/jagged_sum_pallas_experiment/variants/v4_grid_jagged_tile.py
 ----- BEGIN VARIANT v4_grid_jagged_tile -----
 WARNING: All log messages before absl::InitializeLog() is called are written to STDERR
-I0000 00:00:1779828555.053545 1856989 pjrt_api.cc:96] PJRT_Api is set for device type cpu
-I0000 00:00:1779828555.077725 1856989 pjrt_api.cc:118] GetPjrtApi was found for TPU at /home/ymu_google_com/miniconda3/envs/tpu/lib/python3.12/site-packages/libtpu/libtpu.so
-I0000 00:00:1779828555.077758 1856989 pjrt_api.cc:96] PJRT_Api is set for device type tpu
-I0000 00:00:1779828555.099902 1856989 device_rt.cc:97] PjRt runtime initialization deferred for tpu
+I0000 00:00:1779829694.888914 1867046 pjrt_api.cc:96] PJRT_Api is set for device type cpu
+I0000 00:00:1779829694.913460 1867046 pjrt_api.cc:118] GetPjrtApi was found for TPU at /home/ymu_google_com/miniconda3/envs/tpu/lib/python3.12/site-packages/libtpu/libtpu.so
+I0000 00:00:1779829694.913493 1867046 pjrt_api.cc:96] PJRT_Api is set for device type tpu
+I0000 00:00:1779829694.936096 1867046 device_rt.cc:97] PjRt runtime initialization deferred for tpu
 Successfully renamed PrivateUse1 backend to 'tpu'. Device: device(type='tpu')
 Registered Python module for 'tpu'.
 Device type: tpu, Device index: default
@@ -15,14 +15,15 @@ Initializing TPU distributed runtime
 ==============================================================================
 === V4 — hl.grid (outer per-batch) + hl.jagged_tile (inner)
 ==============================================================================
-I0000 00:00:1779828556.108957 1856989 pjrt_api.cc:167] The PJRT plugin has PJRT API version 0.108. The framework PJRT API version is 0.104.
-I0000 00:00:1779828558.377303 1856989 pjrt_c_api_client.cc:197] PjRtCApiClient created.
-W0000 00:00:1779828558.377342 1856989 pjrt_state.cc:230] Only using 1 device out of all the 8 addressable devices.
-I0000 00:00:1779828558.408778 1857772 tier2_compilation_cache.cc:149] Tier-2 compilation cache is disabled for world size 1.
-I0000 00:00:1779828558.408805 1857772 tier3_compilation_cache.cc:65] Backup compilation for tier-3 cache read is disabled as tier-3 cache is disabled.
+I0000 00:00:1779829695.997660 1867046 pjrt_api.cc:167] The PJRT plugin has PJRT API version 0.108. The framework PJRT API version is 0.104.
+I0000 00:00:1779829698.268499 1867046 pjrt_c_api_client.cc:197] PjRtCApiClient created.
+W0000 00:00:1779829698.268542 1867046 pjrt_state.cc:230] Only using 1 device out of all the 8 addressable devices.
+I0000 00:00:1779829698.300592 1867894 tier2_compilation_cache.cc:149] Tier-2 compilation cache is disabled for world size 1.
+I0000 00:00:1779829698.300618 1867894 tier3_compilation_cache.cc:65] Backup compilation for tier-3 cache read is disabled as tier-3 cache is disabled.
 INPUT  x_data.shape=(256, 128) dtype=torch.float32 device=tpu:0
-INPUT  x_offsets.shape=(9,) dtype=torch.int64 value=[0, 45, 93, 147, 148, 152, 212, 216, 256]
-INPUT  per-batch nnz = [45, 48, 54, 1, 4, 60, 4, 40]
+INPUT  x_offsets.shape=(9,) dtype=torch.int32
+INPUT  x_offsets head/tail = [0, 45, 93, 147, 148, 152, 212, 216, 256]
+INPUT  L=nnz_total=256; if backend allocates full-input VMEM scratch, that's ~128.0 KiB (~0.12 MiB)
 /home/ymu_google_com/helion/helion/_compiler/compile_environment.py:238: UserWarning: The 'pallas' backend is experimental and may have limited functionality.
   warn_once(
 COMPILE/RUN FAILED — full traceback:
@@ -76,9 +77,9 @@ While processing:
     for tile_k in hl.jagged_tile(nnz):
                   ^^^^^^^^^^^^^^^^^^^
 
-I0000 00:00:1779828559.683179 1856989 compilation_cache.cc:354] Compilation cache evicted.
-I0000 00:00:1779828559.683201 1856989 compilation_cache.cc:219] CompilationCache final stats: num_cache_reqs=42
-num_cache_hits=29 {69.0%}
+I0000 00:00:1779829699.539534 1867046 compilation_cache.cc:354] Compilation cache evicted.
+I0000 00:00:1779829699.539556 1867046 compilation_cache.cc:219] CompilationCache final stats: num_cache_reqs=42
+num_cache_hits=30 {71.4%}
 peak_compilation_memory_bytes=unknown
 
 ----- END VARIANT v4_grid_jagged_tile (exit=1) -----

@@ -4,10 +4,10 @@
 + python /home/ymu_google_com/helion/tmp/jagged_sum_pallas_experiment/variants/v1_gather.py
 ----- BEGIN VARIANT v1_gather -----
 WARNING: All log messages before absl::InitializeLog() is called are written to STDERR
-I0000 00:00:1779828525.054626 1852086 pjrt_api.cc:96] PJRT_Api is set for device type cpu
-I0000 00:00:1779828525.078911 1852086 pjrt_api.cc:118] GetPjrtApi was found for TPU at /home/ymu_google_com/miniconda3/envs/tpu/lib/python3.12/site-packages/libtpu/libtpu.so
-I0000 00:00:1779828525.078940 1852086 pjrt_api.cc:96] PJRT_Api is set for device type tpu
-I0000 00:00:1779828525.101074 1852086 device_rt.cc:97] PjRt runtime initialization deferred for tpu
+I0000 00:00:1779829663.708388 1861126 pjrt_api.cc:96] PJRT_Api is set for device type cpu
+I0000 00:00:1779829663.732647 1861126 pjrt_api.cc:118] GetPjrtApi was found for TPU at /home/ymu_google_com/miniconda3/envs/tpu/lib/python3.12/site-packages/libtpu/libtpu.so
+I0000 00:00:1779829663.732721 1861126 pjrt_api.cc:96] PJRT_Api is set for device type tpu
+I0000 00:00:1779829663.754885 1861126 device_rt.cc:97] PjRt runtime initialization deferred for tpu
 Successfully renamed PrivateUse1 backend to 'tpu'. Device: device(type='tpu')
 Registered Python module for 'tpu'.
 Device type: tpu, Device index: default
@@ -15,18 +15,22 @@ Initializing TPU distributed runtime
 ==============================================================================
 === V1 — gather-based source (current examples/jagged_sum.py pattern)
 ==============================================================================
-I0000 00:00:1779828526.327552 1852086 pjrt_api.cc:167] The PJRT plugin has PJRT API version 0.108. The framework PJRT API version is 0.104.
-I0000 00:00:1779828528.675141 1852086 pjrt_c_api_client.cc:197] PjRtCApiClient created.
-W0000 00:00:1779828528.675181 1852086 pjrt_state.cc:230] Only using 1 device out of all the 8 addressable devices.
-I0000 00:00:1779828528.705726 1852871 tier2_compilation_cache.cc:149] Tier-2 compilation cache is disabled for world size 1.
-I0000 00:00:1779828528.705762 1852871 tier3_compilation_cache.cc:65] Backup compilation for tier-3 cache read is disabled as tier-3 cache is disabled.
+------------------------------------------------------------------------------
+--- size 'small': {'B': 8, 'max_seqlen': 64}
+------------------------------------------------------------------------------
+I0000 00:00:1779829664.760895 1861126 pjrt_api.cc:167] The PJRT plugin has PJRT API version 0.108. The framework PJRT API version is 0.104.
+I0000 00:00:1779829667.067633 1861126 pjrt_c_api_client.cc:197] PjRtCApiClient created.
+W0000 00:00:1779829667.067673 1861126 pjrt_state.cc:230] Only using 1 device out of all the 8 addressable devices.
+I0000 00:00:1779829667.101331 1861911 tier2_compilation_cache.cc:149] Tier-2 compilation cache is disabled for world size 1.
+I0000 00:00:1779829667.101359 1861911 tier3_compilation_cache.cc:65] Backup compilation for tier-3 cache read is disabled as tier-3 cache is disabled.
 INPUT  x_data.shape=(256, 128) dtype=torch.float32 device=tpu:0
-INPUT  x_offsets.shape=(9,) dtype=torch.int64 value=[0, 45, 93, 147, 148, 152, 212, 216, 256]
-INPUT  per-batch nnz = [45, 48, 54, 1, 4, 60, 4, 40]
+INPUT  x_offsets.shape=(9,) dtype=torch.int32
+INPUT  x_offsets head/tail = [0, 45, 93, 147, 148, 152, 212, 216, 256]
+INPUT  L=nnz_total=256; if backend allocates full-input VMEM scratch, that's ~128.0 KiB (~0.12 MiB)
 /home/ymu_google_com/helion/helion/_compiler/compile_environment.py:238: UserWarning: The 'pallas' backend is experimental and may have limited functionality.
   warn_once(
 Using default config: @helion.kernel(config=helion.Config(block_sizes=[8, 128, 16], pallas_loop_type='fori_loop', pallas_pre_broadcast=False), static_shapes=True)
-# Output code written to: /tmp/torchinductor_ymu_google_com/4m/c4mvlt2xwoqdr3k42vmpuyafojhxvuulowx55ycvzh6w5pacc7hs.py
+# Output code written to: /tmp/torchinductor_ymu_google_com/k2/ck25uwfjvlnhslf2fg5jup7nwg5yjvrbmsqeufrb4rksz6tctape.py
 from __future__ import annotations
 
 import torch
@@ -42,47 +46,47 @@ _BLOCK_SIZE_1 = int(128)
 _BLOCK_SIZE_2 = int(16)
 
 def _helion_jagged_sum_gather(x_offsets, out, x_flat, out_buf, out_sem, scratch_2, x_flat_buf, x_flat_sem):
-    # src[v1_gather.py:36]: for tile_b in hl.tile(num_rows):
+    # src[v1_gather.py:35]: for tile_b in hl.tile(num_rows):
     pid_0 = pl.program_id(0)
     offset_0 = pid_0 * _BLOCK_SIZE_0
     indices_0 = offset_0 + jnp.arange(0, _BLOCK_SIZE_0, dtype=jnp.int32)
-    # src[v1_gather.py:37]: starts = x_offsets[tile_b]
+    # src[v1_gather.py:36]: starts = x_offsets[tile_b]
     starts = x_offsets[pl.ds(offset_0, _BLOCK_SIZE_0)]
-    starts = tl.cast(starts, tl.int64)
-    tl.static_assert(starts.dtype == tl.int64)
-    # src[v1_gather.py:38]: ends = x_offsets[tile_b.index + 1]
+    starts = tl.cast(starts, tl.int32)
+    tl.static_assert(starts.dtype == tl.int32)
+    # src[v1_gather.py:37]: ends = x_offsets[tile_b.index + 1]
     v_0 = jnp.array(1, dtype=jnp.int32)
     v_1 = indices_0 + v_0
     ends = x_offsets[pl.ds(offset_0 + 1, _BLOCK_SIZE_0)]
-    ends = tl.cast(ends, tl.int64)
-    tl.static_assert(ends.dtype == tl.int64)
-    # src[v1_gather.py:39]: nnz = ends - starts
+    ends = tl.cast(ends, tl.int32)
+    tl.static_assert(ends.dtype == tl.int32)
+    # src[v1_gather.py:38]: nnz = ends - starts
     v_2 = ends - starts
 
     def _fori_body_1(_j, _):
         nonlocal out_buf, scratch_2, x_flat_buf
-        # src[v1_gather.py:41]: for tile_m in hl.tile(M):
-        # src[v1_gather.py:42]:     row_sums = hl.zeros([tile_b, tile_m], dtype=x_data.dtype)
-        # src[v1_gather.py:43]:     for tile_k in hl.jagged_tile(nnz):
-        # src[v1_gather.py:41-48]: ...
+        # src[v1_gather.py:40]: for tile_m in hl.tile(M):
+        # src[v1_gather.py:41]:     row_sums = hl.zeros([tile_b, tile_m], dtype=x_data.dtype)
+        # src[v1_gather.py:42]:     for tile_k in hl.jagged_tile(nnz):
+        # src[v1_gather.py:40-47]: ...
         offset_1 = 0 + _j * _BLOCK_SIZE_1
         indices_1 = offset_1 + jnp.arange(0, _BLOCK_SIZE_1, dtype=jnp.int32)
         v_2_copy = v_2
         starts_copy = starts
         v_2_copy_0 = v_2_copy
         starts_copy_0 = starts_copy
-        # src[v1_gather.py:42]: row_sums = hl.zeros([tile_b, tile_m], dtype=x_data.dtype)
+        # src[v1_gather.py:41]: row_sums = hl.zeros([tile_b, tile_m], dtype=x_data.dtype)
         row_sums = jnp.full([_BLOCK_SIZE_0, _BLOCK_SIZE_1], 0.0, jnp.float32)
         row_sums = tl.cast(row_sums, tl.float32)
         tl.static_assert(row_sums.dtype == tl.float32)
-        # src[v1_gather.py:43]: for tile_k in hl.jagged_tile(nnz):
-        # src[v1_gather.py:44]:     base = starts[:, None] + tile_k.index[None, :]
-        # src[v1_gather.py:45]:     flat = base[:, :, None] * M + tile_m.index[None, None, :]
-        # src[v1_gather.py:43-47]: ...
+        # src[v1_gather.py:42]: for tile_k in hl.jagged_tile(nnz):
+        # src[v1_gather.py:43]:     base = starts[:, None] + tile_k.index[None, :]
+        # src[v1_gather.py:44]:     flat = base[:, :, None] * M + tile_m.index[None, None, :]
+        # src[v1_gather.py:42-46]: ...
         view = jnp.reshape(v_2_copy_0, [_BLOCK_SIZE_0])
-        amax = lax.convert_element_type(jnp.max(view, axis=0), jnp.int64)
-        amax = tl.cast(amax, tl.int64)
-        tl.static_assert(amax.dtype == tl.int64)
+        amax = lax.convert_element_type(jnp.max(view, axis=0), jnp.int32)
+        amax = tl.cast(amax, tl.int32)
+        tl.static_assert(amax.dtype == tl.int32)
         scratch_2[...] = row_sums[...]
 
         def _fori_body_0(_j_1, _):
@@ -97,106 +101,602 @@ def _helion_jagged_sum_gather(x_offsets, out, x_flat, out_buf, out_sem, scratch_
             v_3 = scratch_2[...]
             starts_copy_0_copy_0 = starts_copy_0_copy
             v_3_0 = v_3
-            # src[v1_gather.py:44]: base = starts[:, None] + tile_k.index[None, :]
+            # src[v1_gather.py:43]: base = starts[:, None] + tile_k.index[None, :]
             subscript = starts_copy_0_copy_0[:, None]
-            subscript = tl.cast(subscript, tl.int64)
-            tl.static_assert(subscript.dtype == tl.int64)
+            subscript = tl.cast(subscript, tl.int32)
+            tl.static_assert(subscript.dtype == tl.int32)
             subscript_1 = indices_2[None, :]
             subscript_1 = tl.cast(subscript_1, tl.int32)
             tl.static_assert(subscript_1.dtype == tl.int32)
-            v_4 = lax.convert_element_type(subscript_1, jnp.int64)
-            v_5 = subscript + v_4
-            # src[v1_gather.py:45]: flat = base[:, :, None] * M + tile_m.index[None, None, :]
-            subscript_2 = v_5[:, :, None]
-            subscript_2 = tl.cast(subscript_2, tl.int64)
-            tl.static_assert(subscript_2.dtype == tl.int64)
-            v_6 = jnp.array(128, dtype=jnp.int64)
-            v_7 = subscript_2 * v_6
+            v_4 = subscript + subscript_1
+            # src[v1_gather.py:44]: flat = base[:, :, None] * M + tile_m.index[None, None, :]
+            subscript_2 = v_4[:, :, None]
+            subscript_2 = tl.cast(subscript_2, tl.int32)
+            tl.static_assert(subscript_2.dtype == tl.int32)
+            v_5 = jnp.array(128, dtype=jnp.int32)
+            v_6 = subscript_2 * v_5
             subscript_3 = indices_1[None, None, :]
             subscript_3 = tl.cast(subscript_3, tl.int32)
             tl.static_assert(subscript_3.dtype == tl.int32)
-            v_8 = lax.convert_element_type(subscript_3, jnp.int64)
-            v_9 = v_7 + v_8
-            # src[v1_gather.py:46]: x_slice = hl.load(x_flat, [flat])
-            x_slice = jax.lax.dot_general(jax.nn.one_hot(v_9[...], x_flat_buf.shape[0], dtype=jnp.float32), x_flat_buf[...].astype(jnp.float32), (((jnp.ndim(v_9[...]),), (0,)), ((), ())), preferred_element_type=jnp.float32, precision=jax.lax.Precision.HIGHEST).astype(jnp.float32)
+            v_7 = v_6 + subscript_3
+            # src[v1_gather.py:45]: x_slice = hl.load(x_flat, [flat])
+            x_slice = jax.lax.dot_general(jax.nn.one_hot(v_7[...], x_flat_buf.shape[0], dtype=jnp.float32), x_flat_buf[...].astype(jnp.float32), (((jnp.ndim(v_7[...]),), (0,)), ((), ())), preferred_element_type=jnp.float32, precision=jax.lax.Precision.HIGHEST).astype(jnp.float32)
             x_slice = tl.cast(x_slice, tl.float32)
             tl.static_assert(x_slice.dtype == tl.float32)
-            # src[v1_gather.py:47]: row_sums = row_sums + x_slice.sum(dim=1)
+            # src[v1_gather.py:46]: row_sums = row_sums + x_slice.sum(dim=1)
             sum_1 = lax.convert_element_type(jnp.sum(x_slice, axis=1), jnp.float32)
             sum_1 = tl.cast(sum_1, tl.float32)
             tl.static_assert(sum_1.dtype == tl.float32)
-            v_10 = v_3_0 + sum_1
-            # src[v1_gather.py:43]: for tile_k in hl.jagged_tile(nnz):
-            # src[v1_gather.py:44]:     base = starts[:, None] + tile_k.index[None, :]
-            # src[v1_gather.py:45]:     flat = base[:, :, None] * M + tile_m.index[None, None, :]
-            # src[v1_gather.py:43-47]: ...
-            scratch_2[...] = v_10[...]
+            v_8 = v_3_0 + sum_1
+            # src[v1_gather.py:42]: for tile_k in hl.jagged_tile(nnz):
+            # src[v1_gather.py:43]:     base = starts[:, None] + tile_k.index[None, :]
+            # src[v1_gather.py:44]:     flat = base[:, :, None] * M + tile_m.index[None, None, :]
+            # src[v1_gather.py:42-46]: ...
+            scratch_2[...] = v_8[...]
         jax.lax.fori_loop(0, (amax - 0 + _BLOCK_SIZE_2 - 1) // _BLOCK_SIZE_2, _fori_body_0, None)
         row_sums = scratch_2[...]
-        # src[v1_gather.py:48]: out[tile_b, tile_m] = row_sums
+        # src[v1_gather.py:47]: out[tile_b, tile_m] = row_sums
         out_buf[:, :] = row_sums
-        # src[v1_gather.py:41]: for tile_m in hl.tile(M):
-        # src[v1_gather.py:42]:     row_sums = hl.zeros([tile_b, tile_m], dtype=x_data.dtype)
-        # src[v1_gather.py:43]:     for tile_k in hl.jagged_tile(nnz):
-        # src[v1_gather.py:41-48]: ...
+        # src[v1_gather.py:40]: for tile_m in hl.tile(M):
+        # src[v1_gather.py:41]:     row_sums = hl.zeros([tile_b, tile_m], dtype=x_data.dtype)
+        # src[v1_gather.py:42]:     for tile_k in hl.jagged_tile(nnz):
+        # src[v1_gather.py:40-47]: ...
         _copy_out = pltpu.make_async_copy(out_buf, out.at[pl.ds(offset_0, _BLOCK_SIZE_0), pl.ds(0 + _j * _BLOCK_SIZE_1, _BLOCK_SIZE_1)], out_sem)
         _copy_out.start()
         _copy_out.wait()
     jax.lax.fori_loop(0, (128 - 0 + _BLOCK_SIZE_1 - 1) // _BLOCK_SIZE_1, _fori_body_1, None)
 
 def jagged_sum_gather(x_data: torch.Tensor, x_offsets: torch.Tensor, *, _launcher=_default_pallas_fori_launcher):
-    # src[v1_gather.py:29]: M = x_data.shape[1]
+    # src[v1_gather.py:28]: M = x_data.shape[1]
     M = x_data.shape[1]
-    # src[v1_gather.py:30]: num_rows = x_offsets.size(0) - 1
+    # src[v1_gather.py:29]: num_rows = x_offsets.size(0) - 1
     num_rows = x_offsets.size(0) - 1
-    # src[v1_gather.py:31]: out = torch.zeros(
-    # src[v1_gather.py:32]:     [num_rows, M], dtype=x_data.dtype, device=x_data.device
-    # src[v1_gather.py:33]: )
+    # src[v1_gather.py:30]: out = torch.zeros(
+    # src[v1_gather.py:31]:     [num_rows, M], dtype=x_data.dtype, device=x_data.device
+    # src[v1_gather.py:32]: )
     out = torch.zeros([num_rows, M], dtype=x_data.dtype, device=x_data.device)
-    # src[v1_gather.py:34]: x_flat = x_data.view(-1)
+    # src[v1_gather.py:33]: x_flat = x_data.view(-1)
     x_flat = x_data.view(-1)
-    # src[v1_gather.py:36]: for tile_b in hl.tile(num_rows):
+    # src[v1_gather.py:35]: for tile_b in hl.tile(num_rows):
     _BLOCK_SIZE_0 = 8
-    # src[v1_gather.py:36]: for tile_b in hl.tile(num_rows):
-    # src[v1_gather.py:37]:     starts = x_offsets[tile_b]
-    # src[v1_gather.py:38]:     ends = x_offsets[tile_b.index + 1]
-    # src[v1_gather.py:36-48]: ...
+    # src[v1_gather.py:35]: for tile_b in hl.tile(num_rows):
+    # src[v1_gather.py:36]:     starts = x_offsets[tile_b]
+    # src[v1_gather.py:37]:     ends = x_offsets[tile_b.index + 1]
+    # src[v1_gather.py:35-47]: ...
     _launcher(_helion_jagged_sum_gather, ((8 + _BLOCK_SIZE_0 - 1) // _BLOCK_SIZE_0,), x_offsets, out, x_flat, _output_indices=[1], _inplace_indices=[1], _block_spec_info=[((None,), (None,)), ((8, None), (None, None)), ((None,), (None,))], _ds_pad_dims=[(0, 0, 8, 0), (1, 1, 128, 0)], _scratch_shapes=[((8, 128), 'jnp.float32', 'vmem'), ((), None, 'dma_semaphore'), ((8, 128), 'jnp.float32', 'vmem'), ((32768,), 'jnp.float32', 'vmem'), ((), None, 'dma_semaphore')], _pipeline_arg_indices=[1, 2])
-    # src[v1_gather.py:49]: return out
+    # src[v1_gather.py:48]: return out
     return out
 
 def call():
     from torch._dynamo.testing import rand_strided
-    # src[v1_gather.py:25]: def jagged_sum_gather(
-    # src[v1_gather.py:26]:     x_data: torch.Tensor,
-    # src[v1_gather.py:27]:     x_offsets: torch.Tensor,
-    # src[v1_gather.py:25-49]: ...
+    # src[v1_gather.py:24]: def jagged_sum_gather(
+    # src[v1_gather.py:25]:     x_data: torch.Tensor,
+    # src[v1_gather.py:26]:     x_offsets: torch.Tensor,
+    # src[v1_gather.py:24-48]: ...
     x_data = rand_strided(size=(256, 128), stride=(128, 1), dtype=torch.float32, device='tpu:0')
-    x_offsets = rand_strided(size=(9,), stride=(1,), dtype=torch.int64, device='tpu:0')
+    x_offsets = rand_strided(size=(9,), stride=(1,), dtype=torch.int32, device='tpu:0')
     jagged_sum_gather(x_data, x_offsets)
 if __name__ == '__main__':
     call()
-COMPILE/RUN FAILED — full traceback:
+SIZE 'small': COMPILE/RUN FAILED — full traceback:
 Traceback (most recent call last):
-  File "/home/ymu_google_com/helion/tmp/jagged_sum_pallas_experiment/variants/v1_gather.py", line 58, in main
-    out = jagged_sum_gather(x_data, x_offsets)
-          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/ymu_google_com/helion/tmp/jagged_sum_pallas_experiment/variants/_common.py", line 117, in run_all_sizes
+    out = kernel_fn(x_data, x_offsets)
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
   File "/home/ymu_google_com/helion/helion/runtime/kernel.py", line 415, in __call__
     return self.bind(args)(*args)
            ^^^^^^^^^^^^^^^^^^^^^^
   File "/home/ymu_google_com/helion/helion/runtime/kernel.py", line 1188, in __call__
     return self._run(*args)
            ^^^^^^^^^^^^^^^^
-  File "/tmp/torchinductor_ymu_google_com/4m/c4mvlt2xwoqdr3k42vmpuyafojhxvuulowx55ycvzh6w5pacc7hs.py", line 135, in jagged_sum_gather
+  File "/tmp/torchinductor_ymu_google_com/k2/ck25uwfjvlnhslf2fg5jup7nwg5yjvrbmsqeufrb4rksz6tctape.py", line 133, in jagged_sum_gather
     _launcher(_helion_jagged_sum_gather, ((8 + _BLOCK_SIZE_0 - 1) // _BLOCK_SIZE_0,), x_offsets, out, x_flat, _output_indices=[1], _inplace_indices=[1], _block_spec_info=[((None,), (None,)), ((8, None), (None, None)), ((None,), (None,))], _ds_pad_dims=[(0, 0, 8, 0), (1, 1, 128, 0)], _scratch_shapes=[((8, 128), 'jnp.float32', 'vmem'), ((), None, 'dma_semaphore'), ((8, 128), 'jnp.float32', 'vmem'), ((32768,), 'jnp.float32', 'vmem'), ((), None, 'dma_semaphore')], _pipeline_arg_indices=[1, 2])
-  File "/home/ymu_google_com/helion/helion/runtime/__init__.py", line 1259, in default_pallas_fori_launcher
-    _pallas_check_dtypes(args)
-  File "/home/ymu_google_com/helion/helion/runtime/__init__.py", line 519, in _pallas_check_dtypes
-    raise TypeError(
-TypeError: Pallas/TPU does not support torch.int64 tensors. Cast to a 32-bit type before calling the kernel.
-I0000 00:00:1779828530.822416 1852086 compilation_cache.cc:354] Compilation cache evicted.
-I0000 00:00:1779828530.822440 1852086 compilation_cache.cc:219] CompilationCache final stats: num_cache_reqs=44
-num_cache_hits=29 {65.9%}
+  File "/home/ymu_google_com/helion/helion/runtime/__init__.py", line 1386, in default_pallas_fori_launcher
+    return _pallas_invoke_and_return(
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/ymu_google_com/helion/helion/runtime/__init__.py", line 787, in _pallas_invoke_and_return
+    results = jax_callable(*input_tensors)  # type: ignore[operator]
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/ymu_google_com/miniconda3/envs/tpu/lib/python3.12/site-packages/torch_tpu/_internal/pallas/pallas.py", line 514, in __call__
+    lowered = self.exported(*jax_args, **kwargs)
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/ymu_google_com/miniconda3/envs/tpu/lib/python3.12/site-packages/jax/_src/export/_export.py", line 645, in do_export
+    traced = fun_jit.trace(*args_specs, **kwargs_specs)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/ymu_google_com/miniconda3/envs/tpu/lib/python3.12/site-packages/jax/_src/pallas/pallas_call.py", line 1531, in wrapped
+    jaxpr, consts = _trace_kernel_to_jaxpr(
+                    ^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/ymu_google_com/miniconda3/envs/tpu/lib/python3.12/site-packages/jax/_src/pallas/pallas_call.py", line 1070, in _trace_kernel_to_jaxpr
+    jaxpr, _, consts = pe.trace_to_jaxpr_dynamic(
+                       ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/ymu_google_com/miniconda3/envs/tpu/lib/python3.12/site-packages/jax/_src/pallas/primitives.py", line 652, in wrap_with_transforms
+    return f(*new_args)
+           ^^^^^^^^^^^^
+  File "/home/ymu_google_com/helion/helion/runtime/__init__.py", line 643, in reordered_kernel
+    pallas_kernel(*original_order, *extra_refs)  # type: ignore[operator]
+    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/tmp/torchinductor_ymu_google_com/k2/ck25uwfjvlnhslf2fg5jup7nwg5yjvrbmsqeufrb4rksz6tctape.py", line 22, in _helion_jagged_sum_gather
+    starts = tl.cast(starts, tl.int32)
+             ^^
+NameError: name 'tl' is not defined
+--------------------
+For simplicity, JAX has removed its internal frames from the traceback of the following exception. Set JAX_TRACEBACK_FILTERING=off to include these.
+------------------------------------------------------------------------------
+--- size 'medium': {'B': 16, 'max_seqlen': 256}
+------------------------------------------------------------------------------
+INPUT  x_data.shape=(2052, 128) dtype=torch.float32 device=tpu:0
+INPUT  x_offsets.shape=(17,) dtype=torch.int32
+INPUT  x_offsets head/tail = [0, 173, 221, 339, 532, 600, 852, 1048, '...', 1835, 2052]
+INPUT  L=nnz_total=2052; if backend allocates full-input VMEM scratch, that's ~1026.0 KiB (~1.00 MiB)
+Using default config: @helion.kernel(config=helion.Config(block_sizes=[16, 128, 16], pallas_loop_type='fori_loop', pallas_pre_broadcast=False), static_shapes=True)
+# Output code written to: /tmp/torchinductor_ymu_google_com/k4/ck4ne3ogshgapbzrukwxjfdadvbjmlk32ymeai7qoom2r36htk7v.py
+from __future__ import annotations
+
+import torch
+import jax
+import jax.numpy as jnp
+from jax.experimental import pallas as pl
+import jax.lax as lax
+from jax.experimental.pallas import tpu as pltpu
+from helion.runtime import default_pallas_fori_launcher as _default_pallas_fori_launcher
+
+_BLOCK_SIZE_0 = int(16)
+_BLOCK_SIZE_1 = int(128)
+_BLOCK_SIZE_2 = int(16)
+
+def _helion_jagged_sum_gather(x_offsets, out, x_flat, out_buf, out_sem, scratch_2, x_flat_buf, x_flat_sem):
+    # src[v1_gather.py:35]: for tile_b in hl.tile(num_rows):
+    pid_0 = pl.program_id(0)
+    offset_0 = pid_0 * _BLOCK_SIZE_0
+    indices_0 = offset_0 + jnp.arange(0, _BLOCK_SIZE_0, dtype=jnp.int32)
+    # src[v1_gather.py:36]: starts = x_offsets[tile_b]
+    starts = x_offsets[pl.ds(offset_0, _BLOCK_SIZE_0)]
+    starts = tl.cast(starts, tl.int32)
+    tl.static_assert(starts.dtype == tl.int32)
+    # src[v1_gather.py:37]: ends = x_offsets[tile_b.index + 1]
+    v_0 = jnp.array(1, dtype=jnp.int32)
+    v_1 = indices_0 + v_0
+    ends = x_offsets[pl.ds(offset_0 + 1, _BLOCK_SIZE_0)]
+    ends = tl.cast(ends, tl.int32)
+    tl.static_assert(ends.dtype == tl.int32)
+    # src[v1_gather.py:38]: nnz = ends - starts
+    v_2 = ends - starts
+
+    def _fori_body_1(_j, _):
+        nonlocal out_buf, scratch_2, x_flat_buf
+        # src[v1_gather.py:40]: for tile_m in hl.tile(M):
+        # src[v1_gather.py:41]:     row_sums = hl.zeros([tile_b, tile_m], dtype=x_data.dtype)
+        # src[v1_gather.py:42]:     for tile_k in hl.jagged_tile(nnz):
+        # src[v1_gather.py:40-47]: ...
+        offset_1 = 0 + _j * _BLOCK_SIZE_1
+        indices_1 = offset_1 + jnp.arange(0, _BLOCK_SIZE_1, dtype=jnp.int32)
+        v_2_copy = v_2
+        starts_copy = starts
+        v_2_copy_0 = v_2_copy
+        starts_copy_0 = starts_copy
+        # src[v1_gather.py:41]: row_sums = hl.zeros([tile_b, tile_m], dtype=x_data.dtype)
+        row_sums = jnp.full([_BLOCK_SIZE_0, _BLOCK_SIZE_1], 0.0, jnp.float32)
+        row_sums = tl.cast(row_sums, tl.float32)
+        tl.static_assert(row_sums.dtype == tl.float32)
+        # src[v1_gather.py:42]: for tile_k in hl.jagged_tile(nnz):
+        # src[v1_gather.py:43]:     base = starts[:, None] + tile_k.index[None, :]
+        # src[v1_gather.py:44]:     flat = base[:, :, None] * M + tile_m.index[None, None, :]
+        # src[v1_gather.py:42-46]: ...
+        view = jnp.reshape(v_2_copy_0, [_BLOCK_SIZE_0])
+        amax = lax.convert_element_type(jnp.max(view, axis=0), jnp.int32)
+        amax = tl.cast(amax, tl.int32)
+        tl.static_assert(amax.dtype == tl.int32)
+        scratch_2[...] = row_sums[...]
+
+        def _fori_body_0(_j_1, _):
+            nonlocal out_buf, scratch_2, x_flat_buf
+            offset_2 = 0 + _j_1 * _BLOCK_SIZE_2
+            indices_2 = offset_2 + jnp.arange(0, _BLOCK_SIZE_2, dtype=jnp.int32)
+            offset_5 = _j_1 * _BLOCK_SIZE_2 + jnp.arange(_BLOCK_SIZE_2)
+            _copy = pltpu.make_async_copy(x_flat, x_flat_buf, x_flat_sem)
+            _copy.start()
+            _copy.wait()
+            starts_copy_0_copy = starts_copy_0
+            v_3 = scratch_2[...]
+            starts_copy_0_copy_0 = starts_copy_0_copy
+            v_3_0 = v_3
+            # src[v1_gather.py:43]: base = starts[:, None] + tile_k.index[None, :]
+            subscript = starts_copy_0_copy_0[:, None]
+            subscript = tl.cast(subscript, tl.int32)
+            tl.static_assert(subscript.dtype == tl.int32)
+            subscript_1 = indices_2[None, :]
+            subscript_1 = tl.cast(subscript_1, tl.int32)
+            tl.static_assert(subscript_1.dtype == tl.int32)
+            v_4 = subscript + subscript_1
+            # src[v1_gather.py:44]: flat = base[:, :, None] * M + tile_m.index[None, None, :]
+            subscript_2 = v_4[:, :, None]
+            subscript_2 = tl.cast(subscript_2, tl.int32)
+            tl.static_assert(subscript_2.dtype == tl.int32)
+            v_5 = jnp.array(128, dtype=jnp.int32)
+            v_6 = subscript_2 * v_5
+            subscript_3 = indices_1[None, None, :]
+            subscript_3 = tl.cast(subscript_3, tl.int32)
+            tl.static_assert(subscript_3.dtype == tl.int32)
+            v_7 = v_6 + subscript_3
+            # src[v1_gather.py:45]: x_slice = hl.load(x_flat, [flat])
+            x_slice = jax.lax.dot_general(jax.nn.one_hot(v_7[...], x_flat_buf.shape[0], dtype=jnp.float32), x_flat_buf[...].astype(jnp.float32), (((jnp.ndim(v_7[...]),), (0,)), ((), ())), preferred_element_type=jnp.float32, precision=jax.lax.Precision.HIGHEST).astype(jnp.float32)
+            x_slice = tl.cast(x_slice, tl.float32)
+            tl.static_assert(x_slice.dtype == tl.float32)
+            # src[v1_gather.py:46]: row_sums = row_sums + x_slice.sum(dim=1)
+            sum_1 = lax.convert_element_type(jnp.sum(x_slice, axis=1), jnp.float32)
+            sum_1 = tl.cast(sum_1, tl.float32)
+            tl.static_assert(sum_1.dtype == tl.float32)
+            v_8 = v_3_0 + sum_1
+            # src[v1_gather.py:42]: for tile_k in hl.jagged_tile(nnz):
+            # src[v1_gather.py:43]:     base = starts[:, None] + tile_k.index[None, :]
+            # src[v1_gather.py:44]:     flat = base[:, :, None] * M + tile_m.index[None, None, :]
+            # src[v1_gather.py:42-46]: ...
+            scratch_2[...] = v_8[...]
+        jax.lax.fori_loop(0, (amax - 0 + _BLOCK_SIZE_2 - 1) // _BLOCK_SIZE_2, _fori_body_0, None)
+        row_sums = scratch_2[...]
+        # src[v1_gather.py:47]: out[tile_b, tile_m] = row_sums
+        out_buf[:, :] = row_sums
+        # src[v1_gather.py:40]: for tile_m in hl.tile(M):
+        # src[v1_gather.py:41]:     row_sums = hl.zeros([tile_b, tile_m], dtype=x_data.dtype)
+        # src[v1_gather.py:42]:     for tile_k in hl.jagged_tile(nnz):
+        # src[v1_gather.py:40-47]: ...
+        _copy_out = pltpu.make_async_copy(out_buf, out.at[pl.ds(offset_0, _BLOCK_SIZE_0), pl.ds(0 + _j * _BLOCK_SIZE_1, _BLOCK_SIZE_1)], out_sem)
+        _copy_out.start()
+        _copy_out.wait()
+    jax.lax.fori_loop(0, (128 - 0 + _BLOCK_SIZE_1 - 1) // _BLOCK_SIZE_1, _fori_body_1, None)
+
+def jagged_sum_gather(x_data: torch.Tensor, x_offsets: torch.Tensor, *, _launcher=_default_pallas_fori_launcher):
+    # src[v1_gather.py:28]: M = x_data.shape[1]
+    M = x_data.shape[1]
+    # src[v1_gather.py:29]: num_rows = x_offsets.size(0) - 1
+    num_rows = x_offsets.size(0) - 1
+    # src[v1_gather.py:30]: out = torch.zeros(
+    # src[v1_gather.py:31]:     [num_rows, M], dtype=x_data.dtype, device=x_data.device
+    # src[v1_gather.py:32]: )
+    out = torch.zeros([num_rows, M], dtype=x_data.dtype, device=x_data.device)
+    # src[v1_gather.py:33]: x_flat = x_data.view(-1)
+    x_flat = x_data.view(-1)
+    # src[v1_gather.py:35]: for tile_b in hl.tile(num_rows):
+    _BLOCK_SIZE_0 = 16
+    # src[v1_gather.py:35]: for tile_b in hl.tile(num_rows):
+    # src[v1_gather.py:36]:     starts = x_offsets[tile_b]
+    # src[v1_gather.py:37]:     ends = x_offsets[tile_b.index + 1]
+    # src[v1_gather.py:35-47]: ...
+    _launcher(_helion_jagged_sum_gather, ((16 + _BLOCK_SIZE_0 - 1) // _BLOCK_SIZE_0,), x_offsets, out, x_flat, _output_indices=[1], _inplace_indices=[1], _block_spec_info=[((None,), (None,)), ((16, None), (None, None)), ((None,), (None,))], _ds_pad_dims=[(0, 0, 16, 0), (1, 1, 128, 0)], _scratch_shapes=[((16, 128), 'jnp.float32', 'vmem'), ((), None, 'dma_semaphore'), ((16, 128), 'jnp.float32', 'vmem'), ((262656,), 'jnp.float32', 'vmem'), ((), None, 'dma_semaphore')], _pipeline_arg_indices=[1, 2])
+    # src[v1_gather.py:48]: return out
+    return out
+
+def call():
+    from torch._dynamo.testing import rand_strided
+    # src[v1_gather.py:24]: def jagged_sum_gather(
+    # src[v1_gather.py:25]:     x_data: torch.Tensor,
+    # src[v1_gather.py:26]:     x_offsets: torch.Tensor,
+    # src[v1_gather.py:24-48]: ...
+    x_data = rand_strided(size=(2052, 128), stride=(128, 1), dtype=torch.float32, device='tpu:0')
+    x_offsets = rand_strided(size=(17,), stride=(1,), dtype=torch.int32, device='tpu:0')
+    jagged_sum_gather(x_data, x_offsets)
+if __name__ == '__main__':
+    call()
+SIZE 'medium': COMPILE/RUN FAILED — full traceback:
+Traceback (most recent call last):
+  File "/home/ymu_google_com/helion/tmp/jagged_sum_pallas_experiment/variants/_common.py", line 117, in run_all_sizes
+    out = kernel_fn(x_data, x_offsets)
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/ymu_google_com/helion/helion/runtime/kernel.py", line 415, in __call__
+    return self.bind(args)(*args)
+           ^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/ymu_google_com/helion/helion/runtime/kernel.py", line 1188, in __call__
+    return self._run(*args)
+           ^^^^^^^^^^^^^^^^
+  File "/tmp/torchinductor_ymu_google_com/k4/ck4ne3ogshgapbzrukwxjfdadvbjmlk32ymeai7qoom2r36htk7v.py", line 133, in jagged_sum_gather
+    _launcher(_helion_jagged_sum_gather, ((16 + _BLOCK_SIZE_0 - 1) // _BLOCK_SIZE_0,), x_offsets, out, x_flat, _output_indices=[1], _inplace_indices=[1], _block_spec_info=[((None,), (None,)), ((16, None), (None, None)), ((None,), (None,))], _ds_pad_dims=[(0, 0, 16, 0), (1, 1, 128, 0)], _scratch_shapes=[((16, 128), 'jnp.float32', 'vmem'), ((), None, 'dma_semaphore'), ((16, 128), 'jnp.float32', 'vmem'), ((262656,), 'jnp.float32', 'vmem'), ((), None, 'dma_semaphore')], _pipeline_arg_indices=[1, 2])
+  File "/home/ymu_google_com/helion/helion/runtime/__init__.py", line 1386, in default_pallas_fori_launcher
+    return _pallas_invoke_and_return(
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/ymu_google_com/helion/helion/runtime/__init__.py", line 787, in _pallas_invoke_and_return
+    results = jax_callable(*input_tensors)  # type: ignore[operator]
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/ymu_google_com/miniconda3/envs/tpu/lib/python3.12/site-packages/torch_tpu/_internal/pallas/pallas.py", line 514, in __call__
+    lowered = self.exported(*jax_args, **kwargs)
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/ymu_google_com/miniconda3/envs/tpu/lib/python3.12/site-packages/jax/_src/export/_export.py", line 645, in do_export
+    traced = fun_jit.trace(*args_specs, **kwargs_specs)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/ymu_google_com/miniconda3/envs/tpu/lib/python3.12/site-packages/jax/_src/pallas/pallas_call.py", line 1531, in wrapped
+    jaxpr, consts = _trace_kernel_to_jaxpr(
+                    ^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/ymu_google_com/miniconda3/envs/tpu/lib/python3.12/site-packages/jax/_src/pallas/pallas_call.py", line 1070, in _trace_kernel_to_jaxpr
+    jaxpr, _, consts = pe.trace_to_jaxpr_dynamic(
+                       ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/ymu_google_com/miniconda3/envs/tpu/lib/python3.12/site-packages/jax/_src/pallas/primitives.py", line 652, in wrap_with_transforms
+    return f(*new_args)
+           ^^^^^^^^^^^^
+  File "/home/ymu_google_com/helion/helion/runtime/__init__.py", line 643, in reordered_kernel
+    pallas_kernel(*original_order, *extra_refs)  # type: ignore[operator]
+    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/tmp/torchinductor_ymu_google_com/k4/ck4ne3ogshgapbzrukwxjfdadvbjmlk32ymeai7qoom2r36htk7v.py", line 22, in _helion_jagged_sum_gather
+    starts = tl.cast(starts, tl.int32)
+             ^^
+NameError: name 'tl' is not defined
+--------------------
+For simplicity, JAX has removed its internal frames from the traceback of the following exception. Set JAX_TRACEBACK_FILTERING=off to include these.
+------------------------------------------------------------------------------
+--- size 'large': {'B': 32, 'max_seqlen': 1024}
+------------------------------------------------------------------------------
+INPUT  x_data.shape=(17054, 128) dtype=torch.float32 device=tpu:0
+INPUT  x_offsets.shape=(33,) dtype=torch.int32
+INPUT  x_offsets head/tail = [0, 685, 1245, 1875, 2068, 2904, 3668, 4376, '...', 16137, 17054]
+INPUT  L=nnz_total=17054; if backend allocates full-input VMEM scratch, that's ~8527.0 KiB (~8.33 MiB)
+Using default config: @helion.kernel(config=helion.Config(block_sizes=[32, 128, 16], pallas_loop_type='fori_loop', pallas_pre_broadcast=False), static_shapes=True)
+# Output code written to: /tmp/torchinductor_ymu_google_com/4w/c4wknj7ujq6nimqfwunnpyrmc6ms4ye4ckimx2orhr6y57n73uj3.py
+from __future__ import annotations
+
+import torch
+import jax
+import jax.numpy as jnp
+from jax.experimental import pallas as pl
+import jax.lax as lax
+from jax.experimental.pallas import tpu as pltpu
+from helion.runtime import default_pallas_fori_launcher as _default_pallas_fori_launcher
+
+_BLOCK_SIZE_0 = int(32)
+_BLOCK_SIZE_1 = int(128)
+_BLOCK_SIZE_2 = int(16)
+
+def _helion_jagged_sum_gather(x_offsets, out, x_flat, out_buf, out_sem, scratch_2, x_flat_buf, x_flat_sem):
+    # src[v1_gather.py:35]: for tile_b in hl.tile(num_rows):
+    pid_0 = pl.program_id(0)
+    offset_0 = pid_0 * _BLOCK_SIZE_0
+    indices_0 = offset_0 + jnp.arange(0, _BLOCK_SIZE_0, dtype=jnp.int32)
+    # src[v1_gather.py:36]: starts = x_offsets[tile_b]
+    starts = x_offsets[pl.ds(offset_0, _BLOCK_SIZE_0)]
+    starts = tl.cast(starts, tl.int32)
+    tl.static_assert(starts.dtype == tl.int32)
+    # src[v1_gather.py:37]: ends = x_offsets[tile_b.index + 1]
+    v_0 = jnp.array(1, dtype=jnp.int32)
+    v_1 = indices_0 + v_0
+    ends = x_offsets[pl.ds(offset_0 + 1, _BLOCK_SIZE_0)]
+    ends = tl.cast(ends, tl.int32)
+    tl.static_assert(ends.dtype == tl.int32)
+    # src[v1_gather.py:38]: nnz = ends - starts
+    v_2 = ends - starts
+
+    def _fori_body_1(_j, _):
+        nonlocal out_buf, scratch_2, x_flat_buf
+        # src[v1_gather.py:40]: for tile_m in hl.tile(M):
+        # src[v1_gather.py:41]:     row_sums = hl.zeros([tile_b, tile_m], dtype=x_data.dtype)
+        # src[v1_gather.py:42]:     for tile_k in hl.jagged_tile(nnz):
+        # src[v1_gather.py:40-47]: ...
+        offset_1 = 0 + _j * _BLOCK_SIZE_1
+        indices_1 = offset_1 + jnp.arange(0, _BLOCK_SIZE_1, dtype=jnp.int32)
+        v_2_copy = v_2
+        starts_copy = starts
+        v_2_copy_0 = v_2_copy
+        starts_copy_0 = starts_copy
+        # src[v1_gather.py:41]: row_sums = hl.zeros([tile_b, tile_m], dtype=x_data.dtype)
+        row_sums = jnp.full([_BLOCK_SIZE_0, _BLOCK_SIZE_1], 0.0, jnp.float32)
+        row_sums = tl.cast(row_sums, tl.float32)
+        tl.static_assert(row_sums.dtype == tl.float32)
+        # src[v1_gather.py:42]: for tile_k in hl.jagged_tile(nnz):
+        # src[v1_gather.py:43]:     base = starts[:, None] + tile_k.index[None, :]
+        # src[v1_gather.py:44]:     flat = base[:, :, None] * M + tile_m.index[None, None, :]
+        # src[v1_gather.py:42-46]: ...
+        view = jnp.reshape(v_2_copy_0, [_BLOCK_SIZE_0])
+        amax = lax.convert_element_type(jnp.max(view, axis=0), jnp.int32)
+        amax = tl.cast(amax, tl.int32)
+        tl.static_assert(amax.dtype == tl.int32)
+        scratch_2[...] = row_sums[...]
+
+        def _fori_body_0(_j_1, _):
+            nonlocal out_buf, scratch_2, x_flat_buf
+            offset_2 = 0 + _j_1 * _BLOCK_SIZE_2
+            indices_2 = offset_2 + jnp.arange(0, _BLOCK_SIZE_2, dtype=jnp.int32)
+            offset_5 = _j_1 * _BLOCK_SIZE_2 + jnp.arange(_BLOCK_SIZE_2)
+            _copy = pltpu.make_async_copy(x_flat, x_flat_buf, x_flat_sem)
+            _copy.start()
+            _copy.wait()
+            starts_copy_0_copy = starts_copy_0
+            v_3 = scratch_2[...]
+            starts_copy_0_copy_0 = starts_copy_0_copy
+            v_3_0 = v_3
+            # src[v1_gather.py:43]: base = starts[:, None] + tile_k.index[None, :]
+            subscript = starts_copy_0_copy_0[:, None]
+            subscript = tl.cast(subscript, tl.int32)
+            tl.static_assert(subscript.dtype == tl.int32)
+            subscript_1 = indices_2[None, :]
+            subscript_1 = tl.cast(subscript_1, tl.int32)
+            tl.static_assert(subscript_1.dtype == tl.int32)
+            v_4 = subscript + subscript_1
+            # src[v1_gather.py:44]: flat = base[:, :, None] * M + tile_m.index[None, None, :]
+            subscript_2 = v_4[:, :, None]
+            subscript_2 = tl.cast(subscript_2, tl.int32)
+            tl.static_assert(subscript_2.dtype == tl.int32)
+            v_5 = jnp.array(128, dtype=jnp.int32)
+            v_6 = subscript_2 * v_5
+            subscript_3 = indices_1[None, None, :]
+            subscript_3 = tl.cast(subscript_3, tl.int32)
+            tl.static_assert(subscript_3.dtype == tl.int32)
+            v_7 = v_6 + subscript_3
+            # src[v1_gather.py:45]: x_slice = hl.load(x_flat, [flat])
+            x_slice = jax.lax.dot_general(jax.nn.one_hot(v_7[...], x_flat_buf.shape[0], dtype=jnp.float32), x_flat_buf[...].astype(jnp.float32), (((jnp.ndim(v_7[...]),), (0,)), ((), ())), preferred_element_type=jnp.float32, precision=jax.lax.Precision.HIGHEST).astype(jnp.float32)
+            x_slice = tl.cast(x_slice, tl.float32)
+            tl.static_assert(x_slice.dtype == tl.float32)
+            # src[v1_gather.py:46]: row_sums = row_sums + x_slice.sum(dim=1)
+            sum_1 = lax.convert_element_type(jnp.sum(x_slice, axis=1), jnp.float32)
+            sum_1 = tl.cast(sum_1, tl.float32)
+            tl.static_assert(sum_1.dtype == tl.float32)
+            v_8 = v_3_0 + sum_1
+            # src[v1_gather.py:42]: for tile_k in hl.jagged_tile(nnz):
+            # src[v1_gather.py:43]:     base = starts[:, None] + tile_k.index[None, :]
+            # src[v1_gather.py:44]:     flat = base[:, :, None] * M + tile_m.index[None, None, :]
+            # src[v1_gather.py:42-46]: ...
+            scratch_2[...] = v_8[...]
+        jax.lax.fori_loop(0, (amax - 0 + _BLOCK_SIZE_2 - 1) // _BLOCK_SIZE_2, _fori_body_0, None)
+        row_sums = scratch_2[...]
+        # src[v1_gather.py:47]: out[tile_b, tile_m] = row_sums
+        out_buf[:, :] = row_sums
+        # src[v1_gather.py:40]: for tile_m in hl.tile(M):
+        # src[v1_gather.py:41]:     row_sums = hl.zeros([tile_b, tile_m], dtype=x_data.dtype)
+        # src[v1_gather.py:42]:     for tile_k in hl.jagged_tile(nnz):
+        # src[v1_gather.py:40-47]: ...
+        _copy_out = pltpu.make_async_copy(out_buf, out.at[pl.ds(offset_0, _BLOCK_SIZE_0), pl.ds(0 + _j * _BLOCK_SIZE_1, _BLOCK_SIZE_1)], out_sem)
+        _copy_out.start()
+        _copy_out.wait()
+    jax.lax.fori_loop(0, (128 - 0 + _BLOCK_SIZE_1 - 1) // _BLOCK_SIZE_1, _fori_body_1, None)
+
+def jagged_sum_gather(x_data: torch.Tensor, x_offsets: torch.Tensor, *, _launcher=_default_pallas_fori_launcher):
+    # src[v1_gather.py:28]: M = x_data.shape[1]
+    M = x_data.shape[1]
+    # src[v1_gather.py:29]: num_rows = x_offsets.size(0) - 1
+    num_rows = x_offsets.size(0) - 1
+    # src[v1_gather.py:30]: out = torch.zeros(
+    # src[v1_gather.py:31]:     [num_rows, M], dtype=x_data.dtype, device=x_data.device
+    # src[v1_gather.py:32]: )
+    out = torch.zeros([num_rows, M], dtype=x_data.dtype, device=x_data.device)
+    # src[v1_gather.py:33]: x_flat = x_data.view(-1)
+    x_flat = x_data.view(-1)
+    # src[v1_gather.py:35]: for tile_b in hl.tile(num_rows):
+    _BLOCK_SIZE_0 = 32
+    # src[v1_gather.py:35]: for tile_b in hl.tile(num_rows):
+    # src[v1_gather.py:36]:     starts = x_offsets[tile_b]
+    # src[v1_gather.py:37]:     ends = x_offsets[tile_b.index + 1]
+    # src[v1_gather.py:35-47]: ...
+    _launcher(_helion_jagged_sum_gather, ((32 + _BLOCK_SIZE_0 - 1) // _BLOCK_SIZE_0,), x_offsets, out, x_flat, _output_indices=[1], _inplace_indices=[1], _block_spec_info=[((None,), (None,)), ((32, None), (None, None)), ((None,), (None,))], _ds_pad_dims=[(0, 0, 32, 0), (1, 1, 128, 0)], _scratch_shapes=[((32, 128), 'jnp.float32', 'vmem'), ((), None, 'dma_semaphore'), ((32, 128), 'jnp.float32', 'vmem'), ((2182912,), 'jnp.float32', 'vmem'), ((), None, 'dma_semaphore')], _pipeline_arg_indices=[1, 2])
+    # src[v1_gather.py:48]: return out
+    return out
+
+def call():
+    from torch._dynamo.testing import rand_strided
+    # src[v1_gather.py:24]: def jagged_sum_gather(
+    # src[v1_gather.py:25]:     x_data: torch.Tensor,
+    # src[v1_gather.py:26]:     x_offsets: torch.Tensor,
+    # src[v1_gather.py:24-48]: ...
+    x_data = rand_strided(size=(17054, 128), stride=(128, 1), dtype=torch.float32, device='tpu:0')
+    x_offsets = rand_strided(size=(33,), stride=(1,), dtype=torch.int32, device='tpu:0')
+    jagged_sum_gather(x_data, x_offsets)
+if __name__ == '__main__':
+    call()
+SIZE 'large': COMPILE/RUN FAILED — full traceback:
+Traceback (most recent call last):
+  File "/home/ymu_google_com/helion/tmp/jagged_sum_pallas_experiment/variants/_common.py", line 117, in run_all_sizes
+    out = kernel_fn(x_data, x_offsets)
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/ymu_google_com/helion/helion/runtime/kernel.py", line 415, in __call__
+    return self.bind(args)(*args)
+           ^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/ymu_google_com/helion/helion/runtime/kernel.py", line 1188, in __call__
+    return self._run(*args)
+           ^^^^^^^^^^^^^^^^
+  File "/tmp/torchinductor_ymu_google_com/4w/c4wknj7ujq6nimqfwunnpyrmc6ms4ye4ckimx2orhr6y57n73uj3.py", line 133, in jagged_sum_gather
+    _launcher(_helion_jagged_sum_gather, ((32 + _BLOCK_SIZE_0 - 1) // _BLOCK_SIZE_0,), x_offsets, out, x_flat, _output_indices=[1], _inplace_indices=[1], _block_spec_info=[((None,), (None,)), ((32, None), (None, None)), ((None,), (None,))], _ds_pad_dims=[(0, 0, 32, 0), (1, 1, 128, 0)], _scratch_shapes=[((32, 128), 'jnp.float32', 'vmem'), ((), None, 'dma_semaphore'), ((32, 128), 'jnp.float32', 'vmem'), ((2182912,), 'jnp.float32', 'vmem'), ((), None, 'dma_semaphore')], _pipeline_arg_indices=[1, 2])
+  File "/home/ymu_google_com/helion/helion/runtime/__init__.py", line 1386, in default_pallas_fori_launcher
+    return _pallas_invoke_and_return(
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/ymu_google_com/helion/helion/runtime/__init__.py", line 787, in _pallas_invoke_and_return
+    results = jax_callable(*input_tensors)  # type: ignore[operator]
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/ymu_google_com/miniconda3/envs/tpu/lib/python3.12/site-packages/torch_tpu/_internal/pallas/pallas.py", line 514, in __call__
+    lowered = self.exported(*jax_args, **kwargs)
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/ymu_google_com/miniconda3/envs/tpu/lib/python3.12/site-packages/jax/_src/export/_export.py", line 645, in do_export
+    traced = fun_jit.trace(*args_specs, **kwargs_specs)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/ymu_google_com/miniconda3/envs/tpu/lib/python3.12/site-packages/jax/_src/pallas/pallas_call.py", line 1531, in wrapped
+    jaxpr, consts = _trace_kernel_to_jaxpr(
+                    ^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/ymu_google_com/miniconda3/envs/tpu/lib/python3.12/site-packages/jax/_src/pallas/pallas_call.py", line 1070, in _trace_kernel_to_jaxpr
+    jaxpr, _, consts = pe.trace_to_jaxpr_dynamic(
+                       ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/ymu_google_com/miniconda3/envs/tpu/lib/python3.12/site-packages/jax/_src/pallas/primitives.py", line 652, in wrap_with_transforms
+    return f(*new_args)
+           ^^^^^^^^^^^^
+  File "/home/ymu_google_com/helion/helion/runtime/__init__.py", line 643, in reordered_kernel
+    pallas_kernel(*original_order, *extra_refs)  # type: ignore[operator]
+    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/tmp/torchinductor_ymu_google_com/4w/c4wknj7ujq6nimqfwunnpyrmc6ms4ye4ckimx2orhr6y57n73uj3.py", line 22, in _helion_jagged_sum_gather
+    starts = tl.cast(starts, tl.int32)
+             ^^
+NameError: name 'tl' is not defined
+--------------------
+For simplicity, JAX has removed its internal frames from the traceback of the following exception. Set JAX_TRACEBACK_FILTERING=off to include these.
+------------------------------------------------------------------------------
+--- size 'huge': {'B': 64, 'max_seqlen': 4096}
+------------------------------------------------------------------------------
+INPUT  x_data.shape=(140210, 128) dtype=torch.float32 device=tpu:0
+INPUT  x_offsets.shape=(65,) dtype=torch.int32
+INPUT  x_offsets head/tail = [0, 2733, 5341, 6995, 10260, 11096, 11860, 13592, '...', 137279, 140210]
+INPUT  L=nnz_total=140210; if backend allocates full-input VMEM scratch, that's ~70105.0 KiB (~68.46 MiB)
+Using default config: @helion.kernel(config=helion.Config(block_sizes=[64, 128, 16], pallas_loop_type='fori_loop', pallas_pre_broadcast=False), static_shapes=True)
+WARNING:helion.runtime.kernel:Helion compiler triton codegen error for @helion.kernel(config=helion.Config(block_sizes=[64, 128, 16], pallas_loop_type='fori_loop', pallas_pre_broadcast=False), static_shapes=True)
+Traceback (most recent call last):
+  File "/home/ymu_google_com/helion/helion/runtime/kernel.py", line 792, in compile_config
+    triton_code = self.to_triton_code(
+                  ^^^^^^^^^^^^^^^^^^^^
+  File "/home/ymu_google_com/helion/helion/runtime/kernel.py", line 752, in to_triton_code
+    return self.to_code(
+           ^^^^^^^^^^^^^
+  File "/home/ymu_google_com/helion/helion/runtime/kernel.py", line 718, in to_code
+    root = generate_ast(self.host_function, config, emit_repro_caller)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/ymu_google_com/helion/helion/_compiler/generate_ast.py", line 862, in generate_ast
+    CompileEnvironment.current().backend.pre_codegen(
+  File "/home/ymu_google_com/helion/helion/_compiler/backend.py", line 1961, in pre_codegen
+    plan_tiling(graphs, config, tile_strategy)
+  File "/home/ymu_google_com/helion/helion/_compiler/pallas/plan_tiling.py", line 98, in plan_tiling
+    _analyze_indexing_expressions(graph_info, config)
+  File "/home/ymu_google_com/helion/helion/_compiler/pallas/plan_tiling.py", line 110, in _analyze_indexing_expressions
+    _analyze_indexing(node, config)
+  File "/home/ymu_google_com/helion/helion/_compiler/pallas/plan_tiling.py", line 135, in _analyze_indexing
+    _resolve_tensor_index_patterns(
+  File "/home/ymu_google_com/helion/helion/_compiler/pallas/plan_tiling.py", line 405, in _resolve_tensor_index_patterns
+    plan = build_gather_plan(tensor, subscript, positions, patterns, config)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/ymu_google_com/helion/helion/_compiler/pallas/gather.py", line 70, in build_gather_plan
+    raise NotImplementedError(
+NotImplementedError: Pallas gather: resident block is 71787520 bytes, exceeds the 16777216 byte VMEM threshold. The current codegen requires the full gather axis in VMEM; reduce V, tile the broadcast dims, or use a half-precision dtype.
+SIZE 'huge': COMPILE/RUN FAILED — full traceback:
+Traceback (most recent call last):
+  File "/home/ymu_google_com/helion/tmp/jagged_sum_pallas_experiment/variants/_common.py", line 117, in run_all_sizes
+    out = kernel_fn(x_data, x_offsets)
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/ymu_google_com/helion/helion/runtime/kernel.py", line 415, in __call__
+    return self.bind(args)(*args)
+           ^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/ymu_google_com/helion/helion/runtime/kernel.py", line 1184, in __call__
+    self.ensure_config_exists(args)
+  File "/home/ymu_google_com/helion/helion/runtime/kernel.py", line 1149, in ensure_config_exists
+    self.set_config(config)
+  File "/home/ymu_google_com/helion/helion/runtime/kernel.py", line 971, in set_config
+    self._run = self.compile_config(config)
+                ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/ymu_google_com/helion/helion/runtime/kernel.py", line 792, in compile_config
+    triton_code = self.to_triton_code(
+                  ^^^^^^^^^^^^^^^^^^^^
+  File "/home/ymu_google_com/helion/helion/runtime/kernel.py", line 752, in to_triton_code
+    return self.to_code(
+           ^^^^^^^^^^^^^
+  File "/home/ymu_google_com/helion/helion/runtime/kernel.py", line 718, in to_code
+    root = generate_ast(self.host_function, config, emit_repro_caller)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/ymu_google_com/helion/helion/_compiler/generate_ast.py", line 862, in generate_ast
+    CompileEnvironment.current().backend.pre_codegen(
+  File "/home/ymu_google_com/helion/helion/_compiler/backend.py", line 1961, in pre_codegen
+    plan_tiling(graphs, config, tile_strategy)
+  File "/home/ymu_google_com/helion/helion/_compiler/pallas/plan_tiling.py", line 98, in plan_tiling
+    _analyze_indexing_expressions(graph_info, config)
+  File "/home/ymu_google_com/helion/helion/_compiler/pallas/plan_tiling.py", line 110, in _analyze_indexing_expressions
+    _analyze_indexing(node, config)
+  File "/home/ymu_google_com/helion/helion/_compiler/pallas/plan_tiling.py", line 135, in _analyze_indexing
+    _resolve_tensor_index_patterns(
+  File "/home/ymu_google_com/helion/helion/_compiler/pallas/plan_tiling.py", line 405, in _resolve_tensor_index_patterns
+    plan = build_gather_plan(tensor, subscript, positions, patterns, config)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/ymu_google_com/helion/helion/_compiler/pallas/gather.py", line 70, in build_gather_plan
+    raise NotImplementedError(
+NotImplementedError: Pallas gather: resident block is 71787520 bytes, exceeds the 16777216 byte VMEM threshold. The current codegen requires the full gather axis in VMEM; reduce V, tile the broadcast dims, or use a half-precision dtype.
+I0000 00:00:1779829670.171603 1861126 compilation_cache.cc:354] Compilation cache evicted.
+I0000 00:00:1779829670.171624 1861126 compilation_cache.cc:219] CompilationCache final stats: num_cache_reqs=108
+num_cache_hits=81 {75.0%}
 peak_compilation_memory_bytes=unknown
 
 ----- END VARIANT v1_gather (exit=1) -----
