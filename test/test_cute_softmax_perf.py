@@ -1,4 +1,4 @@
-"""Tests for the CuTe softmax performance changes (P1, P2, P5, P6, P7, P11).
+"""Tests for the CuTe softmax performance changes (P1, P2, P5, P6, P7, P11, P14).
 
 These tests exercise the codegen paths that lifted Helion CuTe softmax
 performance from ~0.45x ATen to ~0.66x ATen on (4096, *) shapes:
@@ -18,6 +18,13 @@ performance from ~0.45x ATen to ~0.66x ATen on (4096, *) shapes:
 - P11: ``hoist_warp_reduce`` AST pass moves ``cute.arch.warp_reduction_*``
   calls out of constexpr ``range_constexpr(V)`` loops so the reduce
   runs once per outer iter instead of V times.
+- P14: ``merge_sibling_v_loops`` AST pass caches the per-V-lane scalar
+  shared across two consecutive constexpr V-loops (online softmax max +
+  sum passes) into a small ``cute.make_fragment(V, fp32)`` so V-loop 2
+  reads the cached fp32 value rather than re-bitcasting from the
+  underlying U16 vec load.  Same pass also elides the redundant
+  ``Float32(Float16(warp_reduction(...)))`` round-trip on warp-reduce
+  results.
 """
 
 from __future__ import annotations
@@ -268,6 +275,93 @@ class TestCuteHoistWarpReduce(TestCase):
         torch.testing.assert_close(out, ref, atol=1e-2, rtol=1e-2)
         # No hoist accumulator names (no V-loop to hoist out of).
         self.assertNotIn("_helion_vfold_acc_", code)
+
+
+@onlyBackends(["cute"])
+class TestCuteMergeSiblingVLoops(TestCase):
+    """P14: ``merge_sibling_v_loops`` AST pass caches the per-V-lane
+    scalar shared across two consecutive constexpr V-loops.
+
+    For online softmax's max + sum passes inside one outer tile iter,
+    both V-loops read the SAME ``bitcast(_tile_unroll_vec_*[v])`` value.
+    The pass introduces a ``cute.make_fragment(V, Float32)`` cache so
+    V-loop 1 stores fp32 there once, V-loop 2 reads back instead of
+    re-running the bitcast/cast chain.  Same pass also elides the
+    redundant Float16(...) wrap on warp_reduction results when the
+    downstream code immediately re-promotes to fp32.
+    """
+
+    def test_merge_fires_on_softmax_two_pass(self) -> None:
+        """The pass must fire on the canonical softmax shape and emit
+        a ``_helion_vmerge_cache_*`` fragment populated in V-loop 1
+        and read in V-loop 2.
+        """
+        x = torch.randn(4096, 12672, device=DEVICE, dtype=HALF_DTYPE)
+        code, out = code_and_output(
+            softmax_two_pass_kernel,
+            (x,),
+            block_sizes=[1, 128],
+            num_threads=[0, 32],
+            cute_vector_widths=[1, 4],
+        )
+        ref = torch.nn.functional.softmax(x, dim=1)
+        torch.testing.assert_close(out, ref, atol=1e-2, rtol=1e-2)
+        # Cache fragment allocated.
+        self.assertIn("_helion_vmerge_cache_", code)
+        # Cache write in V-loop 1 (writes Float32(values) at the
+        # vec_lane index).
+        self.assertIn("_helion_vmerge_cache_0[vec_lane_1]", code)
+        # The cache is allocated as Float32 (promotes from fp16 so V-loop
+        # 2 doesn't need the redundant Float32 cast).
+        self.assertIn(
+            "_helion_vmerge_cache_0 = cute.make_fragment(4, cutlass.Float32)",
+            code,
+        )
+
+    def test_cast_elision_on_warp_reduction(self) -> None:
+        """The double-cast peephole (part of ``merge_sibling_v_loops``)
+        must collapse ``A = Float16(warp_reduction(...)); B = Float32(A)``
+        into ``A = warp_reduction(...); B = A``.  The inner Float16
+        wrap on the max-reduce becomes dead and gets removed.
+        """
+        x = torch.randn(4096, 12672, device=DEVICE, dtype=HALF_DTYPE)
+        code, out = code_and_output(
+            softmax_two_pass_kernel,
+            (x,),
+            block_sizes=[1, 128],
+            num_threads=[0, 32],
+            cute_vector_widths=[1, 4],
+        )
+        ref = torch.nn.functional.softmax(x, dim=1)
+        torch.testing.assert_close(out, ref, atol=1e-2, rtol=1e-2)
+        # The original pattern ``local_amax = Float16(warp_reduction_max(...))``
+        # must have been elided to just ``local_amax = warp_reduction_max(...)``.
+        # (The hoist pass already promoted the V-fold acc to fp32, so the
+        # warp_reduction returns fp32 — the Float16 wrap was a no-op cycle.)
+        self.assertNotIn(
+            "local_amax = cutlass.Float16(cute.arch.warp_reduction_max",
+            code,
+        )
+        self.assertIn(
+            "local_amax = cute.arch.warp_reduction_max",
+            code,
+        )
+
+    def test_no_merge_when_v_loop_absent(self) -> None:
+        """When V=1 there's no constexpr V-loop, so the merge pass must
+        be a no-op — no cache fragment should be emitted.
+        """
+        x = torch.randn(4096, 4096, device=DEVICE, dtype=HALF_DTYPE)
+        code, out = code_and_output(
+            softmax_two_pass_kernel,
+            (x,),
+            block_sizes=[1, 128],
+            num_threads=[0, 32],
+            cute_vector_widths=[1, 1],
+        )
+        ref = torch.nn.functional.softmax(x, dim=1)
+        torch.testing.assert_close(out, ref, atol=1e-2, rtol=1e-2)
+        self.assertNotIn("_helion_vmerge_cache_", code)
 
 
 @onlyBackends(["cute"])
