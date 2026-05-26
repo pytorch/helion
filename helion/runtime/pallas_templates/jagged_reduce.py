@@ -1,4 +1,25 @@
-"""Pallas/TPU template for jagged reductions over the second-minor axis.
+"""Pallas/TPU template for jagged_sum.
+
+L-space grid: programs iterate over fixed-size ``(block_L, block_M)``
+slabs of the input. Inside each program, an inner ``lax.fori_loop`` walks
+all ``N`` items, clipping each to the current L-block via SMEM-resident
+``x_offsets``, then mask-reduces and accumulates into a single shared
+output block.
+
+Key choice: the output BlockSpec is ``(N, block_M)`` with ``index_map ->
+(0, j)`` — i.e. **all L-programs share the same output block** (per
+M-block). Pallas's read-modify-write through HBM makes the per-program
+``out_ref[item_idx, :] += partial`` accumulate correctly across the
+L-programs that touch each item. Block shape equals the array's first
+dim (N), which satisfies Mosaic's sublane-alignment rule via the
+"equal to array dim" escape clause — for any N.
+
+This avoids three things we tried unsuccessfully:
+  - ``pl.BoundedSlice`` (not supported at top-level ``pl.pallas_call``)
+  - ``pltpu.emit_pipeline`` + sublane bitcast (not needed for static
+    blocks; only needed if we wanted dynamic per-program slabs)
+  - manual ``pltpu.make_async_copy`` orchestration (BlockSpec + the
+    "equal to array dim" escape clause handle alignment naturally).
 
 Computes::
 
@@ -6,30 +27,25 @@ Computes::
 
 I/O layout (HBM)::
 
-    x_data    : [L, M_padded]  values, M_padded multiple of 128 (lane-aligned)
-    x_offsets : i32[B + 1]     cumulative offsets, x_offsets[B] == L
-    out       : [B, M_padded]  one row per item
+    x_data    : [L, M]       values (M must divide block_M)
+    x_offsets : i32[N + 1]   cumulative, x_offsets[N] == L
+    out       : [N, M]       per-item sums
 
-Lowering shape:
-  - Grid: ``(num_b,)`` — one program per item.
-  - ``x_offsets`` is scalar-prefetched into SMEM. The SPU reads
-    ``offsets[b], offsets[b+1]`` per program and passes a dynamic
-    ``pl.ds(start, len)`` into the input BlockSpec's index_map.
-  - Input BlockSpec uses ``pl.BoundedSlice(k_sz)`` for the seq dim,
-    so the per-program DMA moves only the live rows (rounded up to
-    8-sublane alignment); the trailing VMEM region is undefined.
-  - Mosaic handles the double-buffered DMA automatically; no manual
-    ``pltpu.make_async_copy`` / semaphore orchestration.
+``L`` is internally zero-padded up to a multiple of ``block_L``; the
+padding rows are never referenced by any item (since x_offsets values
+are bounded by L), so they don't affect any sum.
 
-In-kernel work:
-  - Re-read ``offsets[b], offsets[b+1]`` from SMEM to recover the actual
-    live row count (``actual``).
-  - Mask the partial-tail rows ``iota < actual`` (0 is the sum identity).
-  - Reduce + cast + store to the single output row.
+Cost model:
+  - Per L-program: ``N`` inner-loop iterations, of which only the few
+    items touching this L-block do real work (the rest hit
+    ``pl.when(lo < hi)`` and skip). Inner-loop cost ~ O(N).
+  - Output block size in VMEM: ``N * block_M * sizeof(dtype)``. For N
+    large enough that this exceeds VMEM, switch to a different grid
+    layout. For typical jagged workloads (B in the hundreds), fits
+    easily.
 
-This template is intentionally narrow (only ``sum`` over a lane-padded M);
-it will be extended with a ``reduction_kind`` parameter once a second
-reduction (mean / layer_norm) needs the same scaffolding.
+Adapted from the L-space panel in jagged_sum_loop_structures.html
+(committed earlier in this branch).
 """
 from __future__ import annotations
 
@@ -37,128 +53,113 @@ import functools
 from typing import Any
 
 import jax
+import jax.lax as lax
 import jax.numpy as jnp
-from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
 
-_LANE_ALIGN = 128
-_SUBLANE_ALIGN = 8
+def _jagged_sum_pallas_kernel(
+    offsets_ref: jax.Array,  # SMEM ref, int32[N + 1]
+    x_ref: jax.Array,        # VMEM slab, [block_L, block_M]
+    out_ref: jax.Array,      # VMEM block, [N, block_M]
+    *,
+    N: int,
+    block_L: int,
+):
+    """Inner Pallas kernel. See module docstring for the design."""
+    i_L = pl.program_id(0)
+    l_start = i_L * block_L
 
+    # Zero-init the shared output block once per (j) M-program. All
+    # L-programs in this M-column share the same out_ref via the
+    # index_map -> (0, j) and accumulate into it. Without this, the
+    # first read of HBM is undefined.
+    @pl.when(i_L == 0)
+    def _init_out():
+        out_ref[...] = jnp.zeros_like(out_ref[...])
 
-def _align_to(x: int, a: int) -> int:
-    return ((x + a - 1) // a) * a
+    def loop_body(item_idx, _):
+        it_start = offsets_ref[item_idx]
+        it_end = offsets_ref[item_idx + 1]
+
+        # Overlap between item [it_start, it_end) and this L-block.
+        lo = jnp.maximum(it_start, l_start) - l_start
+        hi = jnp.minimum(it_end, l_start + block_L) - l_start
+
+        @pl.when(lo < hi)
+        def _accumulate():
+            iota = lax.iota(jnp.int32, block_L)
+            mask = jnp.logical_and(iota >= lo, iota < hi)
+            # Arithmetic mask, not jnp.where: boolean broadcast trips a
+            # Mosaic layout bug for some block shapes.
+            mask_f = mask.astype(x_ref.dtype)
+            partial = (mask_f[:, None] * x_ref[...]).sum(axis=0)
+            out_ref[item_idx, :] += partial
+
+    lax.fori_loop(0, N, loop_body, None)
 
 
 @functools.partial(
     jax.jit,
-    static_argnames=("k_sz", "o_dtype", "vmem_limit_bytes"),
+    static_argnames=("block_L", "block_M", "o_dtype", "vmem_limit_bytes"),
 )
 def jagged_sum_pallas(
-    x_data: jax.Array,       # [L, M_padded]  values
-    x_offsets: jax.Array,    # i32[B + 1]     cumulative offsets
+    x_data: jax.Array,       # [L, M]
+    x_offsets: jax.Array,    # i32[N + 1]
     *,
-    k_sz: int = 64,          # BoundedSlice upper bound (rows per program)
+    block_L: int = 64,
+    block_M: int = 128,
     o_dtype: Any = None,
     vmem_limit_bytes: int | None = None,
-) -> jax.Array:              # [B, M_padded]
-    """Jagged sum over the second-minor axis. See module docstring."""
+) -> jax.Array:              # [N, M]
+    """JAX-native wrapper around the jagged-sum Pallas kernel.
+
+    See module docstring for the kernel design. This wrapper handles
+    L-padding and assembles the pallas_call.
+    """
     if o_dtype is None:
         o_dtype = x_data.dtype
-    if vmem_limit_bytes is None:
-        vmem_limit_bytes = pltpu.get_tpu_info().vmem_capacity_bytes
 
-    L, M = x_data.shape
-    num_b = x_offsets.shape[0] - 1
+    L_raw, M = x_data.shape
+    N = x_offsets.shape[0] - 1
 
-    if M % _LANE_ALIGN != 0:
+    if M % block_M != 0:
         raise ValueError(
-            f"M={M} must be a multiple of {_LANE_ALIGN} (TPU lane alignment); "
-            f"caller is responsible for zero-padding the M dim before calling "
-            f"the kernel."
-        )
-    if k_sz % _SUBLANE_ALIGN != 0:
-        raise ValueError(
-            f"k_sz={k_sz} must be a multiple of {_SUBLANE_ALIGN} (TPU sublane "
-            f"alignment for BoundedSlice)."
+            f"M={M} must be a multiple of block_M={block_M}"
         )
 
-    # ------------------------------------------------------------------ #
-    # Specs.                                                             #
-    #                                                                    #
-    # PrefetchScalarGridSpec convention (cf. JAX tests/pallas/            #
-    # tpu_pallas_test.py:test_trivial_scalar_prefetch):                   #
-    #   - index_map signature: (grid_indices..., scalar_refs...)         #
-    #   - kernel body signature: (scalar_refs..., in_refs..., out_refs,  #
-    #                             scratch_refs...)                       #
-    #                                                                    #
-    # Input: dynamic per-program slab via BlockSpec+BoundedSlice+ds.     #
-    # Output: kept in HBM (memory_space=pltpu.HBM). Mosaic enforces a     #
-    # block-shape alignment rule — last two dims divisible by 8 and 128, #
-    # or equal to the array dims — and a (1, M) per-program output block #
-    # violates the sublane rule. Same shape gmm.py uses at the top level: #
-    # output stays in HBM, the kernel does an explicit per-program DMA   #
-    # writeback via pltpu.make_async_copy from a VMEM staging buffer.    #
-    # ------------------------------------------------------------------ #
-    def x_index_map(b_id, x_offsets_ref):
-        # SPU scalar reads from SMEM, fed into pl.ds for the DMA.
-        start = x_offsets_ref[b_id]
-        end = x_offsets_ref[b_id + 1]
-        return (pl.ds(start, end - start), 0)
+    # Zero-pad x_data so total rows is a multiple of block_L. Padding rows
+    # are never referenced (no item spans into them) so they don't affect
+    # correctness; they just round the input out to a static-block grid.
+    L_pad = ((L_raw + block_L - 1) // block_L) * block_L
+    if L_pad != L_raw:
+        x_data = jnp.pad(x_data, ((0, L_pad - L_raw), (0, 0)))
 
-    x_spec = pl.BlockSpec(
-        (pl.BoundedSlice(k_sz), M),
-        x_index_map,
-    )
-    out_spec = pl.BlockSpec(memory_space=pltpu.HBM)
+    grid = (L_pad // block_L, M // block_M)
 
-    scratch_shapes = [
-        pltpu.VMEM((1, M), o_dtype),     # output staging row
-        pltpu.SemaphoreType.DMA,         # out-write semaphore
-    ]
-
-    # --------------------------------------------------- #
-    # Inner kernel: masked reduce + explicit DMA out.     #
-    # --------------------------------------------------- #
-    def kernel(x_offsets_ref, x_ref, out_ref, out_buf, out_sem):
-        b_id = pl.program_id(0)
-        start = x_offsets_ref[b_id]
-        end = x_offsets_ref[b_id + 1]
-        actual = end - start
-
-        # The BoundedSlice block has static shape [k_sz, M]; only the first
-        # `actual` rows are live (Mosaic rounds DMA up to a sublane boundary,
-        # so rows [actual, align_to(actual, 8)) may hold live garbage from a
-        # prior DMA; rows [align_to(actual, 8), k_sz) are uninitialized).
-        # Masking by `iota < actual` zero-fills both regions before sum.
-        iota = lax.broadcasted_iota(jnp.int32, (k_sz, 1), 0)
-        mask = iota < actual
-        x = jnp.where(mask, x_ref[...], jnp.zeros_like(x_ref[...]))
-        partial = x.sum(axis=0, dtype=jnp.float32).astype(o_dtype)
-        out_buf[0, :] = partial
-
-        cp = pltpu.make_async_copy(
-            out_buf,
-            out_ref.at[pl.ds(b_id, 1), :],
-            out_sem,
-        )
-        cp.start()
-        cp.wait()
+    compiler_params_kwargs: dict[str, Any] = {"disable_bounds_checks": True}
+    if vmem_limit_bytes is not None:
+        compiler_params_kwargs["vmem_limit_bytes"] = vmem_limit_bytes
 
     return pl.pallas_call(
-        kernel,
-        out_shape=jax.ShapeDtypeStruct((num_b, M), o_dtype),
+        functools.partial(
+            _jagged_sum_pallas_kernel,
+            N=N,
+            block_L=block_L,
+        ),
+        out_shape=jax.ShapeDtypeStruct((N, M), o_dtype),
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=1,
-            in_specs=[x_spec],
-            out_specs=out_spec,
-            scratch_shapes=scratch_shapes,
-            grid=(num_b,),
+            grid=grid,
+            in_specs=[
+                pl.BlockSpec((block_L, block_M), lambda i, j, _: (i, j)),
+            ],
+            out_specs=pl.BlockSpec(
+                (N, block_M), lambda i, j, _: (0, j)
+            ),
+            scratch_shapes=[],
         ),
-        compiler_params=pltpu.CompilerParams(
-            dimension_semantics=("arbitrary",),
-            vmem_limit_bytes=vmem_limit_bytes,
-        ),
-        name=f"JaggedSum-k_{k_sz}",
+        compiler_params=pltpu.CompilerParams(**compiler_params_kwargs),
+        name=f"JaggedSum-L{block_L}-M{block_M}",
     )(x_offsets, x_data)

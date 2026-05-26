@@ -61,25 +61,26 @@ def reference_numpy(x_np: np.ndarray, offsets_np: np.ndarray) -> np.ndarray:
 
 SIZES: list[tuple[str, dict]] = [
     # Matches the HTML walkthrough: B=4, ni=[3,7,5,9], M_actual=8 → M_padded=128.
-    # Exercises the M-padding path and an irregular seq distribution.
     ("html_example", dict(B=4, M_actual=8, seq_lengths=[3, 7, 5, 9])),
     # Tiny: a few items, M is already lane-aligned.
     ("tiny",   dict(B=4,  M_actual=128, max_seq=16)),
     # Small: realistic-looking single-batch sizes.
     ("small",  dict(B=8,  M_actual=128, max_seq=64)),
-    # Medium: stresses scratch + buffer count.
+    # Medium: more items, larger seqs.
     ("medium", dict(B=32, M_actual=128, max_seq=512)),
-    # Large: full single-tile pressure (~32 KiB per VMEM block at k_sz=64).
-    # Not "huge" — that bracket is for once we get past the basics.
+    # Large: pressure on the (N, block_M) output VMEM block (~64 KiB at N=128).
     ("large",  dict(B=128, M_actual=128, max_seq=2048)),
 ]
 
-K_SIZES = [16, 64]
+# block_L = L-block height (rows DMA'd per L-program). Static, so the
+# autotuner would sweep this. For now just two values to spot-check that
+# the kernel works across more than one block size.
+BLOCK_LS = [32, 128]
 
 
-def run_one(name: str, params: dict, *, k_sz: int) -> int:
+def run_one(name: str, params: dict, *, block_L: int) -> int:
     print("=" * 78, flush=True)
-    print(f"=== size '{name}' params={params} k_sz={k_sz}", flush=True)
+    print(f"=== size '{name}' params={params} block_L={block_L}", flush=True)
     print("=" * 78, flush=True)
     try:
         x_padded, offsets, seq_lengths, M_actual, M_padded = make_inputs(**params)
@@ -103,7 +104,7 @@ def run_one(name: str, params: dict, *, k_sz: int) -> int:
         return 4
 
     try:
-        out = jagged_sum_pallas(x_padded, offsets, k_sz=k_sz)
+        out = jagged_sum_pallas(x_padded, offsets, block_L=block_L)
         out.block_until_ready()
     except Exception:
         print("KERNEL FAILED — full traceback:", flush=True)
@@ -141,10 +142,10 @@ def main() -> int:
 
     overall_rc = 0
     for name, params in SIZES:
-        for k_sz in K_SIZES:
-            rc = run_one(name, dict(params), k_sz=k_sz)
+        for block_L in BLOCK_LS:
+            rc = run_one(name, dict(params), block_L=block_L)
             overall_rc = max(overall_rc, rc)
-            print(f"SUMMARY size='{name}' k_sz={k_sz} rc={rc}", flush=True)
+            print(f"SUMMARY size='{name}' block_L={block_L} rc={rc}", flush=True)
     return overall_rc
 
 

@@ -9,7 +9,8 @@ integration we layer on later.
 ## What it tests
 
 `test_jagged_sum.py` runs `jagged_sum_pallas` at five input sizes and two
-`k_sz` values (`16`, `64`):
+`block_L` values (32, 128) — the static L-block height the kernel uses
+for its DMA stride:
 
 | Size | B | M_actual | max_seq | Notes |
 |---|---|---|---|---|
