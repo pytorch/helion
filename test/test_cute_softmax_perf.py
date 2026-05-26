@@ -571,22 +571,20 @@ class TestCuteMultiRowInvestigation(TestCase):
         # is reduced (4096 / 8 = 512 CTAs vs 4096).
         self.assertIn("block=(32, 1, 1)", code)
 
-    def test_multi_row_threaded_8_compiles_uses_shared_reduce(self) -> None:
-        """``block_sizes=[8, 128], num_threads=[0, 32]`` — M is threaded,
-        so we get ``block=(8, 32, 1)`` (M on thread_idx[0], N on
-        thread_idx[1]).  The inner reduction's strided thread-reduction
-        has pre=8, group_span=256, which dispatches to
-        ``_cute_grouped_reduce_shared_two_stage``.  This is the
-        "P9 finding" path: with the current axis layout the warp
-        boundaries don't align with rows (warp 0 = thread_idx[0..7] x
-        thread_idx[1..3] = data from 8 rows × 4 N-segments), so the
-        per-row reduce needs SMEM.  Slower than single-row.
+    def test_multi_row_threaded_8_uses_warp_per_row(self) -> None:
+        """``block_sizes=[8, 128], num_threads=[0, 32]`` — M is threaded.
 
-        Note: a true "warp-per-row" layout would require ``block=(32,
-        8, 1)`` (N on thread_idx[0], M on thread_idx[1]) — but the
-        current ``CuteNDTileStrategy`` claims thread axes in the order
-        M (outer grid) → axis 0, N (inner tile) → axis 1.  Swapping
-        would require new infra in ``_BaseNDTileStrategy._thread_axis_map``.
+        With the warp-per-row layout (P15), the codegen swaps the
+        thread-axis assignment so N (the reduction axis) lands on
+        ``thread_idx[0]`` (32 contiguous threads = one warp per row)
+        and M lands on ``thread_idx[1]`` (warp index = row index).
+        Each warp's per-row reduction uses ``_cute_grouped_reduce_warp``
+        with ``pre=1, group_span=32`` (one warp shuffle per warp), NOT
+        the cross-warp ``_cute_grouped_reduce_shared_two_stage`` path.
+
+        The launch becomes ``block=(32, 8, 1)`` (was ``(8, 32, 1)``
+        before P15) and the joint thread count is 8 × 32 = 256, giving
+        8 warps per CTA for higher occupancy on softmax-shaped kernels.
         """
         x = torch.randn(4096, 128, device=DEVICE, dtype=HALF_DTYPE)
         code, out = code_and_output(
@@ -598,15 +596,55 @@ class TestCuteMultiRowInvestigation(TestCase):
         )
         ref = torch.nn.functional.softmax(x, dim=1)
         torch.testing.assert_close(out, ref, atol=1e-2, rtol=1e-2)
-        # Block is (M=8 on thread_idx[0], N=32 on thread_idx[1], 1).
-        # NOT the warp-per-row ``(32, 8, 1)`` that would let warp-reduce
-        # fire — this is the "wrong" layout that hits shared-mem reduce.
-        self.assertIn("block=(8, 32, 1)", code)
-        # Reduction goes through shared-memory two-stage path (the
-        # "bad" path the prompt's P9 warned about).
-        self.assertIn("_cute_grouped_reduce_shared_two_stage", code)
-        # group_span = pre * reduce_extent = 8 * 32 = 256.
-        self.assertIn("group_span=256", code)
+        # Warp-per-row launch: N (the reduction axis with 32 threads)
+        # lands on axis 0, M (8 rows) lands on axis 1.
+        self.assertIn("block=(32, 8, 1)", code)
+        # Each warp reduces its own row via _cute_grouped_reduce_warp
+        # — NO cross-warp SMEM reduce.
+        self.assertIn("_cute_grouped_reduce_warp", code)
+        self.assertIn("pre=1, group_span=32", code)
+        self.assertNotIn("_cute_grouped_reduce_shared_two_stage", code)
+
+    def test_warp_per_row_axis_swap_emits_warp_reduce(self) -> None:
+        """P15: when M is threaded (``num_threads=[0, 32]``) the warp-per-row
+        plan swaps the thread-axis assignment so:
+
+        * N (inner reduction axis) lands on ``thread_idx[0]``
+        * M (outer grid row axis) lands on ``thread_idx[1]``
+
+        And the reduction dispatcher picks the per-warp
+        ``_cute_grouped_reduce_warp`` path with ``pre=1, group_span=32``
+        (each warp does ONE warp shuffle for its own row independently)
+        instead of ``_cute_grouped_reduce_shared_two_stage`` (the
+        cross-warp SMEM path that would dominate without the axis swap).
+        """
+        x = torch.randn(4096, 12672, device=DEVICE, dtype=HALF_DTYPE)
+        code, out = code_and_output(
+            softmax_two_pass_kernel,
+            (x,),
+            block_sizes=[2, 128],
+            num_threads=[0, 32],
+            cute_vector_widths=[1, 4],
+        )
+        ref = torch.nn.functional.softmax(x, dim=1)
+        torch.testing.assert_close(out, ref, atol=1e-2, rtol=1e-2)
+        # The launch is ``block=(32, 2, 1)`` — N on axis 0 (32 threads
+        # per warp = one row), M on axis 1 (2 warps = 2 rows).
+        self.assertIn("block=(32, 2, 1)", code)
+        # M uses ``thread_idx[1]`` for the row index.
+        self.assertIn(
+            "indices_0 = tile_offset_0 + cutlass.Int32(cute.arch.thread_idx()[1])",
+            code,
+        )
+        # N uses ``thread_idx[0]`` for the lane (32 contiguous lanes).
+        self.assertIn("cute.arch.thread_idx()[0]) * 4", code)
+        # Per-warp reduce via ``_cute_grouped_reduce_warp`` (with pre=1
+        # the helper does ONE warp shuffle per warp -- effectively the
+        # direct cute.arch.warp_reduction_* path).
+        self.assertIn("_cute_grouped_reduce_warp", code)
+        self.assertIn("pre=1, group_span=32", code)
+        # NO shared-memory two-stage reduce.
+        self.assertNotIn("_cute_grouped_reduce_shared_two_stage", code)
 
     def test_single_row_warp_reduce_is_baseline(self) -> None:
         """Pin the single-row + warp-reduce config that ``CuteTileVecWarpReduceHeuristic``

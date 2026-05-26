@@ -680,10 +680,34 @@ class BlockSizeTileStrategy(TileStrategy):
         Counts axes already claimed by active device loops, reserving at
         least one axis for reduction strategies when the backend places
         reductions first.
+
+        When a ``CuTeGridExecutionPlan`` with ``block_axis_priority`` is
+        in scope for this strategy's blocks, the offset is instead
+        derived from ``thread_axis_for_strategy`` so the M/N axis order
+        is dictated by the plan (e.g. the warp-per-row layout swaps the
+        outer M-grid and inner N-tile axes so each warp owns one row).
         """
         from .reduction_strategy import ReductionStrategy
 
         env = CompileEnvironment.current()
+
+        # Plan-driven path: honor ``block_axis_priority`` so the outer
+        # grid loop can reserve an axis for a lower-priority inner tile
+        # loop even when that inner loop has not yet entered
+        # ``active_device_loops``.  Used by the warp-per-row layout where
+        # the outer M-grid must take a HIGHER thread-axis index than the
+        # inner N-tile so 32 contiguous threads on axis 0 form one warp
+        # per row.
+        plan = self.fn.tile_strategy.current_cute_grid_execution_plan(
+            block_ids=self.block_ids
+        )
+        if plan is not None and any(
+            plan.priority_for_block(block_id) is not None for block_id in self.block_ids
+        ):
+            offset = self.fn.tile_strategy.thread_axis_for_strategy(self)
+            if offset is not None:
+                return offset
+
         seen: set[int] = set()
         active_reduction_axes = 0
         active_non_reduction_axes = 0
@@ -707,9 +731,6 @@ class BlockSizeTileStrategy(TileStrategy):
         has_reduction_strategy = any(
             isinstance(strategy, ReductionStrategy) and strategy.thread_axes_used() > 0
             for strategy in self.fn.tile_strategy.strategies
-        )
-        plan = self.fn.tile_strategy.current_cute_grid_execution_plan(
-            block_ids=self.block_ids
         )
         if plan is not None and any(
             plan.disables_reduction_axis_reservation(block_id)
