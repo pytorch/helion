@@ -222,7 +222,8 @@ def _rewrite_vec_extract(
     vec_w: int,
     *,
     use_smem: bool = False,
-    thread_count: int = 1,
+    cache_size: int = 1,
+    tid_expr: str = "cutlass.Int32(cute.arch.thread_idx()[0])",
 ) -> None:
     """In-place rewrite of ``hoist_var[<vi>]`` -> cache read inside ``node``.
 
@@ -230,12 +231,10 @@ def _rewrite_vec_extract(
     sweep so the dependent extracts still resolve.
 
     Register-cache slot: ``cache[(idx_expr)*V + vi]`` (per-thread).
-    SMEM-cache slot: ``cache[((idx_expr)*V + vi) * num_threads + tid]``
-    (per-CTA, with the thread offset tail-packed so writes from the
-    first sweep land at the same slot the consume sweep reads).
+    SMEM-cache slot: per-thread contiguous layout —
+        ``cache[tid * (cache_size * V) + (idx_expr) * V + vi]``
+    matching the writer in ``_slot_expr``.
     """
-
-    tid_expr = "cutlass.Int32(cute.arch.thread_idx()[0])"
 
     class _RewriteVecExtract(ast.NodeTransformer):
         def visit_Subscript(self, node: ast.Subscript) -> ast.AST:
@@ -244,7 +243,7 @@ def _rewrite_vec_extract(
                 vi_text = ast.unparse(node.slice)
                 inner = f"({idx_expr}) * {vec_w} + ({vi_text})"
                 if use_smem:
-                    slot = f"({inner}) * {thread_count} + ({tid_expr})"
+                    slot = f"({tid_expr}) * {cache_size * vec_w} + ({inner})"
                 else:
                     slot = inner
                 new = ast.parse(f"{cache}[{slot}]").body[0]
@@ -762,7 +761,7 @@ class _CuteFuseTwoPassLoads(ast.NodeTransformer):
             # and any downstream ``hoist_var[vi]`` extracts inside the
             # nested constexpr V-loop are rewritten to read from the cache
             # at the appropriate slot expression.
-            vec_extract_rewrites: list[tuple[str, str, str, int, bool, int]] = []
+            vec_extract_rewrites: list[tuple[str, str, str, int, bool, int, str]] = []
             new_second_body: list[ast.stmt] = []
             for s in second_container:
                 if (
@@ -794,7 +793,8 @@ class _CuteFuseTwoPassLoads(ast.NodeTransformer):
                                         second_cache_index_str,
                                         vec_w,
                                         use_smem,
-                                        self._thread_count,
+                                        cache_size,
+                                        tid_expr,
                                     )
                                 )
                             continue
@@ -807,7 +807,8 @@ class _CuteFuseTwoPassLoads(ast.NodeTransformer):
                     idx_expr,
                     vec_w,
                     use_smem_,
-                    tcount,
+                    cache_size_,
+                    tid_expr_,
                 ) in vec_extract_rewrites:
                     for stmt in new_second_body:
                         _rewrite_vec_extract(
@@ -817,7 +818,8 @@ class _CuteFuseTwoPassLoads(ast.NodeTransformer):
                             idx_expr,
                             vec_w,
                             use_smem=use_smem_,
-                            thread_count=tcount,
+                            cache_size=cache_size_,
+                            tid_expr=tid_expr_,
                         )
             second_container[:] = new_second_body
 

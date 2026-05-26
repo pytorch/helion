@@ -365,6 +365,114 @@ class TestCuteMergeSiblingVLoops(TestCase):
 
 
 @onlyBackends(["cute"])
+class TestCuteHoistLoopInvariantRecip(TestCase):
+    """P16: ``hoist_loop_invariant_recips`` AST pass hoists ``x / scalar``
+    divisions out of inner loops when the divisor is loop-invariant.
+
+    Softmax's second pass computes ``out[k] = exp(x[k] - mi) / di`` where
+    ``di`` is a per-row scalar.  Each inner tile iteration does a
+    floating-point divide; B200 fp32 divide is ~22 cycles vs ~2 for
+    multiply.  The pass turns the divide into ``inv = 1.0 / di`` hoisted
+    above the loop + ``x * inv`` inside, yielding +20% wall-clock on
+    (4096, 12672) fp16 and even larger gains on N <= 4096 shapes.
+
+    The pass handles SSA-style alias chains
+    (``di_copy = di; di_copy_0 = di_copy; out = x / di_copy_0``) by
+    transitively walking the assignments to find the loop-EXTERNAL root
+    divisor name, so the hoisted reciprocal references a name visible
+    outside the loop.
+    """
+
+    def test_recip_hoist_fires_on_softmax_two_pass(self) -> None:
+        """For ``softmax_two_pass``, the consume sweep's per-element
+        divide by ``di`` (a per-row scalar) must be rewritten to a
+        single hoisted ``_helion_inv_div_*`` reciprocal + multiply.
+        """
+        x = torch.randn(4096, 12672, device=DEVICE, dtype=HALF_DTYPE)
+        code, out = code_and_output(
+            softmax_two_pass_kernel,
+            (x,),
+            block_sizes=[1, 128],
+            num_threads=[0, 32],
+            cute_vector_widths=[1, 4],
+        )
+        ref = torch.nn.functional.softmax(x, dim=1)
+        torch.testing.assert_close(out, ref, atol=1e-2, rtol=1e-2)
+        # The hoisted reciprocal declaration must reference the
+        # loop-external root name ``di``, not the inside-loop alias
+        # ``di_copy_*`` (which wouldn't be visible above the loop).
+        self.assertIn("_helion_inv_div_", code)
+        self.assertIn("= 1.0 / di", code)
+        # The inner divide must have been rewritten to a multiply against
+        # the hoisted reciprocal name.
+        self.assertIn("* _helion_inv_div_", code)
+        # The original per-element divide pattern is no longer present.
+        # (The two-pass kernel had ``v_12 = v_11 / di_copy_1_0`` — that
+        # specific text must be gone after the rewrite.)
+        self.assertNotIn("/ di_copy_1_0", code)
+
+    def test_recip_hoist_does_not_fire_on_loop_dependent_divisor(self) -> None:
+        """When the divisor changes per-iteration (e.g. ``local_sum``
+        computed inside the loop), the pass must NOT hoist it.  Pinning
+        this guards against accidentally hoisting genuinely loop-dependent
+        divides which would produce wrong values.
+        """
+
+        @helion.kernel(backend="cute")
+        def divide_inside_loop(x: torch.Tensor) -> torch.Tensor:
+            m, n = x.size()
+            out = torch.empty_like(x)
+            for tile_m in hl.tile(m):
+                for tile_n in hl.tile(n):
+                    values = x[tile_m, tile_n]
+                    # The divisor changes per tile_n iteration.
+                    local_sum = torch.sum(values, dim=1, keepdim=True)
+                    out[tile_m, tile_n] = values / local_sum
+            return out
+
+        x = torch.randn(4096, 1024, device=DEVICE, dtype=HALF_DTYPE)
+        code, out = code_and_output(
+            divide_inside_loop,
+            (x,),
+            block_sizes=[1, 128],
+            num_threads=[0, 32],
+            cute_vector_widths=[1, 4],
+        )
+        # No reciprocal hoist — local_sum is recomputed every iter.
+        self.assertNotIn("_helion_inv_div_", code)
+
+    def test_recip_hoist_disable_env(self) -> None:
+        """``HELION_DISABLE_HOIST_RECIP=1`` disables the pass for
+        experimentation.  The two-pass kernel must compile + run
+        correctly when the pass is disabled, just slower.
+        """
+        import os
+
+        old = os.environ.get("HELION_DISABLE_HOIST_RECIP")
+        os.environ["HELION_DISABLE_HOIST_RECIP"] = "1"
+        try:
+            x = torch.randn(4096, 12672, device=DEVICE, dtype=HALF_DTYPE)
+            code, out = code_and_output(
+                softmax_two_pass_kernel,
+                (x,),
+                block_sizes=[1, 128],
+                num_threads=[0, 32],
+                cute_vector_widths=[1, 4],
+            )
+            ref = torch.nn.functional.softmax(x, dim=1)
+            torch.testing.assert_close(out, ref, atol=1e-2, rtol=1e-2)
+            # No reciprocal hoist with the env disabled.
+            self.assertNotIn("_helion_inv_div_", code)
+            # The original per-element divide is still there.
+            self.assertIn("/ di_copy_", code)
+        finally:
+            if old is None:
+                os.environ.pop("HELION_DISABLE_HOIST_RECIP", None)
+            else:
+                os.environ["HELION_DISABLE_HOIST_RECIP"] = old
+
+
+@onlyBackends(["cute"])
 class TestCuteThreadBudgetRejection(TestCase):
     """P6: reject configs where the launcher would silently truncate
     joint thread count below what codegen committed to.
