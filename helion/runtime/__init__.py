@@ -891,6 +891,57 @@ def _pallas_apply_ds_padding(
     return tuple(args_list), orig_output_tensors
 
 
+def _compute_dimension_semantics(
+    grid: tuple[int, ...],
+    block_spec_info: object,
+    output_indices: list[int],
+) -> tuple[str, ...]:
+    """Per-grid-axis ``"parallel"`` vs ``"arbitrary"`` decision.
+
+    An axis is safe to declare ``"parallel"`` only when different program-ids
+    on that axis write to **disjoint** output blocks. That fact lives in
+    ``_block_spec_info``: each output's ``grid_dims`` tuple parameterizes
+    each tensor dim by either a grid axis (``int`` or ``(axis, stride, n)``
+    tuple) or ``None`` (static — every program-id on every grid axis sees
+    the same slice of that dim).
+
+    Rule: axis ``k`` is parallel-safe iff some output's ``grid_dims``
+    mentions ``k`` somewhere. Otherwise all program-ids on axis ``k`` map
+    to the same output block; the resulting reads-modify-writes only
+    commute under sequential execution.
+
+    Without this, in-place accumulator patterns (``out[item, :] +=`` where
+    the index doesn't include every grid axis) silently produce wrong
+    results: declaring an axis ``"parallel"`` not only allows Megacore
+    cross-core split (where present) but also tells Mosaic there are no
+    inter-program ordering dependencies, so async DMA writebacks and reads
+    overlap across iterations even on a single core. Iteration k+1 then
+    reads stale HBM that pre-dates iteration k's writeback.
+
+    We default to ``"arbitrary"`` to preserve correctness; we only opt
+    into ``"parallel"`` when codegen has signaled disjoint output blocks.
+    """
+    n_grid = len(grid)
+    used: set[int] = set()
+    if block_spec_info is not None:
+        for out_idx in output_indices:
+            try:
+                _, grid_dims = block_spec_info[out_idx]  # type: ignore[index]
+            except (IndexError, TypeError, ValueError):
+                # Conservatively fall back to fully-sequential.
+                return tuple("arbitrary" for _ in grid)
+            for g in grid_dims:
+                if g is None:
+                    continue
+                if isinstance(g, tuple) and len(g) >= 1:
+                    used.add(int(g[0]))
+                elif isinstance(g, int):
+                    used.add(g)
+    return tuple(
+        "parallel" if k in used else "arbitrary" for k in range(n_grid)
+    )
+
+
 def default_pallas_launcher(
     pallas_kernel: object,
     grid: tuple[int, ...],
@@ -1181,7 +1232,9 @@ def default_pallas_pipeline_launcher(
             "out_shape": out_shape_arg,
             "grid_spec": grid_spec,
             "compiler_params": pltpu.CompilerParams(  # pyrefly: ignore[bad-instantiation]
-                dimension_semantics=tuple("parallel" for _ in grid),
+                dimension_semantics=_compute_dimension_semantics(
+                    grid, _block_spec_info, _output_indices
+                ),
             ),
         }
         if interpret:
@@ -1359,7 +1412,9 @@ def default_pallas_fori_launcher(
             "out_shape": out_shape_arg,
             "grid_spec": grid_spec,
             "compiler_params": pltpu.CompilerParams(  # pyrefly: ignore[bad-instantiation]
-                dimension_semantics=tuple("parallel" for _ in grid),
+                dimension_semantics=_compute_dimension_semantics(
+                    grid, _block_spec_info, _output_indices
+                ),
             ),
         }
         if interpret:
