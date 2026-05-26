@@ -1240,13 +1240,26 @@ def _print_hbm_probe(label: str) -> None:
     handoff). Cold subprocess should show min-HBM; if shape N>=1 sees higher
     start-HBM, that's evidence of leaked device-side state across PjRtClient
     teardown/restart.
+
+    Uses ``jax.devices()[0].memory_stats()`` because torch.tpu's
+    ``_hbm_usage_summary`` only reports CompilationCache HBM, not total
+    user-allocated HBM.
     """
     try:
-        summary = torch.tpu._hbm_usage_summary()  # pyrefly: ignore[missing-attribute]
-    except (AttributeError, RuntimeError) as e:
+        import jax
+
+        stats = jax.devices()[0].memory_stats()
+    except Exception as e:  # noqa: BLE001
         print(f"  [hbm-probe@{label}] unavailable: {e}", file=sys.stderr)
         return
-    print(f"  [hbm-probe@{label}] {summary}", file=sys.stderr)
+    in_use = stats.get("bytes_in_use", -1)
+    peak = stats.get("peak_bytes_in_use", -1)
+    largest_free = stats.get("largest_free_block_bytes", -1)
+    print(
+        f"  [hbm-probe@{label}] in_use={in_use:_} peak={peak:_} "
+        f"largest_free_block={largest_free:_} num_allocs={stats.get('num_allocs', -1)}",
+        file=sys.stderr,
+    )
 
 
 def run_kernel_inner(name: str) -> KernelResult:
