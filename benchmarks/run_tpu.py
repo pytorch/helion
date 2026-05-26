@@ -1166,6 +1166,11 @@ def _run_kernel_per_shape(name: str) -> KernelResult:
     all_passed = True
     accuracy_verified = True
     error_msg: str | None = None
+    # Safety cap: no kernel in KERNEL_MAPPINGS has > 8 shapes today. The
+    # cap protects against a child failing to even reach the shape-index
+    # bound check (e.g., env misconfig where shapes_fn itself crashes) —
+    # without it, parent would iterate forever.
+    MAX_SHAPES_PER_KERNEL = 20
     idx = 0
     while True:
         print(f"  [subprocess shape {idx}]", file=sys.stderr)
@@ -1179,9 +1184,16 @@ def _run_kernel_per_shape(name: str) -> KernelResult:
             all_passed = False
             if result.error and not error_msg:
                 error_msg = result.error
+            # If the child failed without producing any shape_results, the
+            # failure is at bootstrap (not in autotune); iterating further
+            # will hit the same error. Bail out.
+            if not result.shape_results:
+                break
         accuracy_verified = accuracy_verified and result.accuracy_verified
         idx += 1
         if NUM_SHAPES is not None and idx >= NUM_SHAPES:
+            break
+        if idx >= MAX_SHAPES_PER_KERNEL:
             break
     return KernelResult(
         name=name,
