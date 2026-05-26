@@ -1774,6 +1774,71 @@ class PallasBackend(Backend):
 
         return result or None
 
+    def _compute_reduction_grid_dims(self) -> list[int]:
+        """Return the outer-grid axis indices that are reduction axes.
+
+        ``pltpu.CompilerParams(dimension_semantics=...)`` on the outer
+        ``pl.pallas_call`` marks each outer-grid axis as either
+        ``"parallel"`` (Mosaic may freely partition across cores and
+        reorder iterations) or ``"arbitrary"`` (no such freedom).  Reduction
+        axes do carry state across iterations and must be ``"arbitrary"``.
+
+        For typical Helion matmul kernels the user-written ``hl.tile(k)``
+        becomes an inner ``pltpu.emit_pipeline`` / ``jax.lax.fori_loop`` —
+        not an outer grid axis — so this list is empty and the launcher
+        keeps every outer-grid axis ``"parallel"``.  The fallback is in
+        place so any future kernel pattern that does put a reduction in
+        the outer grid (e.g. an explicit non-rolled K outer loop) is
+        labelled correctly.
+        """
+        from .compile_environment import CompileEnvironment
+        from .device_function import DeviceFunction
+        from .host_function import HostFunction
+
+        device_fn = DeviceFunction.current()
+        if device_fn.pid is None:
+            return []
+        env = CompileEnvironment.current()
+
+        # Outer-grid axis index → block_id via pid ordering.  Reduction
+        # block_ids are flagged on BlockSizeInfo (see ``BlockSizeInfo`` in
+        # compile_environment.py — set by ``allocate_reduction_dimension``
+        # for rolled reductions) OR carried on ``pallas_outer_grid_lifted``
+        # for user-written ``hl.tile`` loops whose K axis has been lifted
+        # into the outer grid by the ``pallas_loop_type="outer_grid"`` path
+        # (no global flag mutation; see
+        # ``helion/language/_tracing_ops.py::_codegen_outer_grid_or_fallback``).
+        reduction_dims: list[int] = []
+        lifted_block_ids = {
+            axis.block_id for axis in device_fn.pallas_outer_grid_lifted
+        }
+        for grid_dim, pid in enumerate(device_fn.pid.pid_info):
+            bsi = env.block_sizes[pid.block_id]
+            if bsi.reduction or pid.block_id in lifted_block_ids:
+                reduction_dims.append(grid_dim)
+
+        # FlattenedTileStrategy collapses multiple block_ids into one pid;
+        # if any of the flattened block_ids is a reduction the single pid
+        # carries reduction state.  Mark its outer-grid axis accordingly.
+        from .program_id import FlatProgramIDs
+
+        if isinstance(device_fn.pid, FlatProgramIDs):
+            device_ir = HostFunction.current().device_ir
+            flat_bids = {pid.block_id for pid in device_fn.pid.pid_info}
+            for grid_block_ids in device_ir.grid_block_ids:
+                for bid in grid_block_ids:
+                    if bid in flat_bids:
+                        continue
+                    if not env.block_sizes[bid].reduction:
+                        continue
+                    # Find the pid that absorbed this flattened block.
+                    for grid_dim, pid in enumerate(device_fn.pid.pid_info):
+                        if pid.block_id in flat_bids and grid_dim not in reduction_dims:
+                            reduction_dims.append(grid_dim)
+                            break
+
+        return sorted(set(reduction_dims))
+
     def build_launcher_args(
         self,
         args: list[str],
@@ -1888,9 +1953,11 @@ class PallasBackend(Backend):
             if smem_arg_indices:
                 launcher_args.append(f"_smem_arg_indices={smem_arg_indices!r}")
 
-        # Pass scratch shapes for pipeline/fori_loop launcher
+        # Pass scratch shapes for pipeline/fori_loop launcher (outer_grid
+        # reuses the pipeline launcher; its scratch buffers and reduction
+        # grid dims plumbing match exactly).
         pallas_loop_type = config.get("pallas_loop_type", "unroll")
-        if pallas_loop_type in ("emit_pipeline", "fori_loop"):
+        if pallas_loop_type in ("emit_pipeline", "fori_loop", "outer_grid"):
             scratch_shapes = [
                 (
                     s.shape,
@@ -1906,6 +1973,7 @@ class PallasBackend(Backend):
             # tensors (need HBM refs); all others get proper BlockSpecs.
             from .device_function import TensorArg
 
+            vmem_strip_ids = device_fn.pallas_pipeline_vmem_strip
             if sorted_args is not None:
                 pipeline_arg_indices = [
                     i
@@ -1917,6 +1985,25 @@ class PallasBackend(Backend):
                     launcher_args.append(
                         f"_pipeline_arg_indices={pipeline_arg_indices!r}"
                     )
+                # Pipelined tensors whose outer working-set fits the strip
+                # budget keep their outer BlockSpec as a VMEM strip (full
+                # inner dim) so emit_pipeline slices VMEM instead of
+                # DMAing per inner iteration from HBM.  See
+                # ``_OUTER_VMEM_STRIP_BUDGET_BYTES`` in
+                # ``helion/runtime/__init__.py``.
+                pipeline_vmem_strip_indices = [
+                    i
+                    for i in pipeline_arg_indices
+                    if id(sorted_args[i].fake_value) in vmem_strip_ids  # type: ignore[attr-defined]
+                ]
+                if pipeline_vmem_strip_indices:
+                    launcher_args.append(
+                        f"_pipeline_vmem_strip_indices={pipeline_vmem_strip_indices!r}"
+                    )
+
+            reduction_grid_dims = self._compute_reduction_grid_dims()
+            if reduction_grid_dims:
+                launcher_args.append(f"_reduction_grid_dims={reduction_grid_dims!r}")
 
         if CompileEnvironment.current().settings.pallas_interpret:
             launcher_args.append("_pallas_interpret=True")
@@ -1934,6 +2021,13 @@ class PallasBackend(Backend):
                 f"Expected one of {VALID_PALLAS_LOOP_TYPES}."
             )
         if pallas_loop_type == "emit_pipeline":
+            return "_default_pallas_pipeline_launcher"
+        if pallas_loop_type == "outer_grid":
+            # outer_grid reuses the pipeline launcher because the device fn
+            # still needs scratch buffers and (post-rewrite) the same
+            # ``dimension_semantics`` infrastructure that flags the lifted
+            # K axis as ``"arbitrary"``.  See
+            # ``helion/language/_tracing_ops.py::_apply_outer_grid_rewrites``.
             return "_default_pallas_pipeline_launcher"
         if pallas_loop_type == "fori_loop":
             return "_default_pallas_fori_launcher"

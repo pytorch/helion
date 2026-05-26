@@ -235,10 +235,16 @@ def _(state: CodegenState) -> object:
     When ``pallas_loop_type="emit_pipeline"``, generates ``pltpu.emit_pipeline``
     calls with automatic DMA pipelining.  When ``pallas_loop_type="fori_loop"``,
     generates ``jax.lax.fori_loop`` with explicit ``pltpu.make_async_copy`` DMA.
-    Otherwise falls through to the common ``ForLoopGraphInfo.codegen`` path.
+    When ``pallas_loop_type="outer_grid"`` AND the matmul-pattern eligibility
+    check passes, the inner K loop is lifted into the outer ``pl.pallas_call``
+    grid (matching ``examples/pallas_perf/matmul_pallas.py``); otherwise
+    falls back to ``emit_pipeline``.  Otherwise falls through to the common
+    ``ForLoopGraphInfo.codegen`` path.
     """
     config = state.config
     pallas_loop_type = config.get("pallas_loop_type", "unroll")
+    if pallas_loop_type == "outer_grid":
+        return _codegen_outer_grid_or_fallback(state)
     if pallas_loop_type == "emit_pipeline":
         return _codegen_emit_pipeline(state)
     if pallas_loop_type == "fori_loop":
@@ -253,6 +259,9 @@ def _(state: CodegenState) -> None:
     """Emit inner stepped device loops for Pallas/TPU."""
     config = state.config
     pallas_loop_type = config.get("pallas_loop_type", "unroll")
+    if pallas_loop_type == "outer_grid":
+        _codegen_outer_grid_or_fallback(state)
+        return None
     if pallas_loop_type == "emit_pipeline":
         _codegen_emit_pipeline(state)
         return None
@@ -585,7 +594,181 @@ def _write_back_loop_carried(
         ]
         for sname, result in zip(scratch_output_names, graph_results, strict=True):
             if isinstance(result, ast.AST):
+                if _try_inplace_accumulator_rewrite(state, sname, result):
+                    continue
                 state.codegen.add_statement(_scratch_write_stmt(state, sname, result))
+
+
+def _try_inplace_accumulator_rewrite(
+    state: CodegenState,
+    sname: str,
+    result: ast.AST,
+) -> bool:
+    """Rewrite ``result = scratch[...] + RHS; scratch[...] = result`` to
+    ``scratch[...] += RHS``.
+
+    The hand-written reference Pallas matmul accumulates with
+    ``acc_ref[...] += pl.dot(x_val, y_val)`` directly into the VMEM scratch.
+    Helion's default lowering emits the equivalent value-flow as a separate
+    ``acc_N = scratch[...] + dot(...)`` followed by ``scratch[...] =
+    acc_N[...]``, which the Mosaic backend then materializes through an
+    extra register binding per K iteration. Recognising the pattern here
+    lets the inner pipeline body stay in place on the VMEM ref between
+    iterations.
+
+    Returns True when the rewrite fires; the caller then skips emitting the
+    standard write-back statement. The rewrite is intentionally narrow: it
+    only matches when the result Name's most recent binding is
+    ``LHS + RHS`` and the LHS chain (through trivial ``a = b`` renames)
+    terminates at a Subscript read of *sname* with the same slice the
+    write-back would use. Anything else falls back to the unchanged
+    behaviour.
+    """
+    if not isinstance(result, ast.Name):
+        return False
+
+    stmts = state.codegen.statements_stack[-1]
+    sl = state.device_function.scratch_read_slice(sname)
+    scratch_idx = sl or "..."
+
+    # Locate the assignment that binds `result`, walking through trivial
+    # Name-to-Name renames added by ``codegen_call_with_graph``'s placeholder
+    # copy step.
+    name_to_find = result.id
+    binding_index: int | None = None
+    binding_stmt: ast.Assign | None = None
+    i = len(stmts) - 1
+    while i >= 0:
+        stmt = stmts[i]
+        if (
+            isinstance(stmt, ast.Assign)
+            and len(stmt.targets) == 1
+            and isinstance(stmt.targets[0], ast.Name)
+            and stmt.targets[0].id == name_to_find
+        ):
+            value = stmt.value
+            if isinstance(value, ast.Name):
+                name_to_find = value.id
+                i -= 1
+                continue
+            binding_index = i
+            binding_stmt = stmt
+            break
+        i -= 1
+
+    if binding_stmt is None or binding_index is None:
+        return False
+
+    value = binding_stmt.value
+    if not isinstance(value, ast.BinOp) or not isinstance(value.op, ast.Add):
+        return False
+
+    lhs_chain = _lhs_chain_to_scratch_read(
+        stmts, binding_index, value.left, sname, scratch_idx
+    )
+    if lhs_chain is None:
+        return False
+
+    # `result` must not be referenced anywhere else in the body; otherwise
+    # dropping its binding would leave a dangling reference. The write-back
+    # statement we are replacing is the only consumer in the matmul pattern.
+    if _name_referenced_outside(stmts, result.id, skip_index=binding_index):
+        return False
+
+    rhs = value.right
+    # Drop the binding for `result` and any intermediate Name aliases that
+    # only existed to feed the LHS of the addition. ``lhs_chain`` contains
+    # the indices (descending) of the trivial ``a = b`` and
+    # ``a = sname[...]`` statements that the LHS resolves through; each can
+    # be dropped only when the bound name is not referenced elsewhere.
+    drop_indices = [binding_index]
+    for idx, name in lhs_chain:
+        if _name_referenced_outside(
+            stmts, name, skip_index=binding_index, additional_skips=drop_indices
+        ):
+            break
+        drop_indices.append(idx)
+    for idx in sorted(drop_indices, reverse=True):
+        stmts.pop(idx)
+    state.codegen.add_statement(
+        statement_from_string(f"{sname}[{scratch_idx}] += {{rhs}}", rhs=rhs)
+    )
+    return True
+
+
+def _lhs_chain_to_scratch_read(
+    stmts: list[ast.AST],
+    before_index: int,
+    expr: ast.AST,
+    sname: str,
+    scratch_idx: str,
+) -> list[tuple[int, str]] | None:
+    """If *expr* ultimately reads ``sname[scratch_idx]`` return the chain
+    of intermediate ``a = b`` / ``a = sname[...]`` statements, else None.
+
+    The chain is a list of ``(statement_index, bound_name)`` pairs in
+    descending order of *statement_index* (most recent first). The caller
+    may use the indices to drop the now-redundant intermediate bindings
+    when fusing the read/compute/store into ``sname[...] += rhs``.
+    """
+    target_repr = f"{sname}[{scratch_idx}]"
+    chain: list[tuple[int, str]] = []
+    current = expr
+    j = before_index - 1
+    while True:
+        if isinstance(current, ast.Subscript):
+            if ast.unparse(current) == target_repr:
+                return chain
+            return None
+        if not isinstance(current, ast.Name):
+            return None
+        lookup_name = current.id
+        found_binding = False
+        while j >= 0:
+            stmt = stmts[j]
+            if (
+                isinstance(stmt, ast.Assign)
+                and len(stmt.targets) == 1
+                and isinstance(stmt.targets[0], ast.Name)
+                and stmt.targets[0].id == lookup_name
+            ):
+                chain.append((j, lookup_name))
+                current = stmt.value
+                j -= 1
+                found_binding = True
+                break
+            j -= 1
+        if not found_binding:
+            return None
+
+
+def _name_referenced_outside(
+    stmts: list[ast.AST],
+    name: str,
+    *,
+    skip_index: int,
+    additional_skips: list[int] | None = None,
+) -> bool:
+    """Return True if *name* is read in any stmt except *skip_index* and
+    the optional *additional_skips* list.
+
+    Only Load-context references count: a Store-context occurrence (the
+    LHS of the binding we plan to drop) is not a dependency.
+    """
+    skips: set[int] = {skip_index}
+    if additional_skips:
+        skips.update(additional_skips)
+    for idx, stmt in enumerate(stmts):
+        if idx in skips:
+            continue
+        for node in ast.walk(stmt):
+            if (
+                isinstance(node, ast.Name)
+                and node.id == name
+                and isinstance(node.ctx, ast.Load)
+            ):
+                return True
+    return False
 
 
 def _read_final_loop_state(
@@ -1394,6 +1577,678 @@ def _(state: CodegenState) -> ast.AST:
     )
 
 
+def _outer_pid_block_is_singleton(
+    env: CompileEnvironment,
+    config: object,
+    pid: object,
+) -> bool:
+    """Return True when the outer-grid axis described by ``pid`` resolves to
+    a configured block size of 1.
+
+    The outer-grid lift rewrite (``_apply_outer_grid_rewrites``) assumes the
+    loop-carried accumulator is a multi-row / multi-column matmul tile.  When
+    the configured block size for an outer axis is 1 (e.g. ``bm == 1`` on the
+    bf16 1×K×N row of the matrix), the scratch holds a degenerate 1-row or
+    1-column tile and the rewrite emits silently-wrong outputs whenever the
+    inner K loop has > 1 iteration.  Treating singleton outer-grid blocks as
+    ineligible falls back to ``_codegen_emit_pipeline``, which handles the
+    degenerate shape correctly.
+    """
+    block_id = pid.block_id  # pyrefly: ignore[missing-attribute]
+    if not (0 <= block_id < len(env.block_sizes)):
+        return False
+    block_size_info = env.block_sizes[block_id]
+    value = block_size_info.from_config(config)  # type: ignore[arg-type]
+    return isinstance(value, int) and value == 1
+
+
+def _codegen_outer_grid_or_fallback(state: CodegenState) -> object:
+    """Lift the inner K loop into the outer ``pl.pallas_call`` grid when the
+    matmul-pattern eligibility check passes; otherwise fall back to
+    ``_codegen_emit_pipeline``.
+
+    The hand-written reference matmul (``examples/pallas_perf/matmul_pallas.py``)
+    uses a 3-axis outer grid ``(grid_m, grid_n, grid_k)`` with
+    ``dimension_semantics = ("parallel", "parallel", "arbitrary")``, a
+    ``pl.when(pl.program_id(2) == 0)`` accumulator init guard, and a
+    ``pl.when(pl.program_id(2) == nsteps - 1)`` accumulator store guard.
+    The inner loop is a single ``scratch[...] += pl.dot(x_tile, y_tile)``
+    statement; ``X``/``Y`` outer in_specs are ``(bm, bk)`` / ``(bk, bn)``
+    indexed by ``(i, k)`` / ``(k, j)`` rather than ``(i, 0)`` / ``(0, j)``
+    VMEM strips, which lets Mosaic pipeline across the 8 grid iterations.
+
+    Helion's default ``emit_pipeline`` path keeps K inside
+    ``pltpu.emit_pipeline`` (a serial ``lax.fori_loop`` with double-buffered
+    DMA but no cross-iteration compute pipelining); the outer-grid form
+    matches the hand-written reference exactly.
+
+    Eligibility:
+      * Single inner block_id (the K reduction axis).
+      * Block size info marks that block_id as ``reduction=True``.
+      * Inner loop has loop-carried state (an accumulator).
+      * The outer grid currently has at least one non-reduction axis
+        (i.e. matmul-like; pure-reduction kernels stay on emit_pipeline).
+
+    On any miss, falls back transparently to ``_codegen_emit_pipeline`` so
+    the autotuner doesn't have to know about which inner loops qualify.
+    """
+    from .._compiler.device_function import DeviceFunction as _DF
+    from .._compiler.device_function import PallasOuterGridLiftedAxis
+    from .._compiler.device_ir import ForLoopGraphInfo
+
+    graph_info = state.get_graph(state.proxy_arg(0))
+    assert isinstance(graph_info, ForLoopGraphInfo)
+    block_ids = graph_info.block_ids
+    env = CompileEnvironment.current()
+    device_fn = _DF.current()
+
+    eligible = False
+    if (
+        len(block_ids) == 1
+        and device_fn.pid is not None
+        and len(device_fn.pid.pid_info) >= 1
+    ):
+        # Loop-carried state: the for_loop call passes the carried args as
+        # the last entry in ``ast_args`` / ``proxy_args``.  An accumulator
+        # pattern needs at least one carried tensor.  This is the semantic
+        # marker for "this inner loop is a reduction" — Helion's tile-loop
+        # block sizes don't carry an explicit ``reduction=True`` flag for
+        # user-written ``for tile_k in hl.tile(k)`` (only
+        # ``allocate_reduction_dimension`` sets it, and the lowering of
+        # ``torch.addmm`` does not), so we infer reduction-ness from the
+        # presence of accumulator state.
+        last_args = state.ast_args[-1] if isinstance(state.ast_args, list) else None
+        if isinstance(last_args, list) and len(last_args) > 0:
+            # Refuse to lift if any outer-grid block_id is also a reduction
+            # (some other helion pattern); the outer-grid restructure only
+            # makes sense when M/N really are independent.
+            outer_has_reduction = any(
+                env.block_sizes[pid.block_id].reduction
+                for pid in device_fn.pid.pid_info
+            )
+            # Refuse to lift when any outer-grid axis resolves to a
+            # configured block size of 1.  The body rewrite that lifts the
+            # inner K loop into the outer grid assumes the loop-carried
+            # accumulator is a 2D matmul tile; when ``bm == 1`` (or any
+            # outer-tile dim == 1) the scratch holds a 1-row / 1-col
+            # broadcast outer product instead and the rewrite produces
+            # silently-wrong outputs whenever the K loop has > 1 iteration
+            # (NaN / mismatch up to 4.5e6 vs CPU f32 reference; the
+            # autotuner's accuracy check skips these configs, but forced
+            # configs are unprotected).  Fall back to ``emit_pipeline``
+            # which handles singleton dims correctly.
+            outer_has_singleton_block = any(
+                _outer_pid_block_is_singleton(env, state.config, pid)
+                for pid in device_fn.pid.pid_info
+            )
+            if not outer_has_reduction and not outer_has_singleton_block:
+                eligible = True
+
+    if not eligible:
+        return _codegen_emit_pipeline(state)
+
+    # Record the body-list position before emit_pipeline runs so the
+    # post-codegen rewrite (``_apply_outer_grid_rewrites``) can locate
+    # the scratch init / pipeline call / scratch read it needs to wrap
+    # in ``pl.when`` guards.  Only ``idx_before`` is captured; the matching
+    # ``idx_after`` would be invalidated by DCE in the apply pass, which
+    # searches for the pipeline call by content instead.
+    body_list = state.codegen.statements_stack[-1]
+    idx_before = len(body_list)
+    result = _codegen_emit_pipeline(state)
+
+    # Determine the K loop's outer grid dim index: append after the
+    # existing outer-grid PIDs.  ``_compute_reduction_grid_dims`` will
+    # then flag it as a reduction so the launcher marks it ``"arbitrary"``.
+    block_id = block_ids[0]
+    nsteps_expr = env.backend.cdiv_expr(
+        _get_loop_numel(state, 0),
+        state.device_function.block_size_var(block_id) or "1",
+        is_device=False,
+    )
+
+    # The matched scratch is the loop-carried scratch.  ``_codegen_emit_pipeline``
+    # registered exactly one scratch for the carried accumulator; pick the
+    # most-recently registered VMEM scratch (the only one created in this
+    # pipeline emission frame).
+    scratch_name = ""
+    for sa in reversed(device_fn._scratch_args):
+        if sa.scratch_type == "vmem":
+            scratch_name = sa.name
+            break
+    if not scratch_name:
+        # Fallback: no scratch was registered; the rewrite would have nothing
+        # to wrap, so leave as emit_pipeline form.
+        return result
+
+    device_fn.pallas_outer_grid_lifted.append(
+        PallasOuterGridLiftedAxis(
+            block_id=block_id,
+            nsteps_expr=nsteps_expr,
+            scratch_name=scratch_name,
+        )
+    )
+
+    # Extend ``pid_info`` with the lifted K axis BEFORE the host wrapper
+    # (``codegen_function_call``) runs so the host's
+    # ``grid=(grid_m, grid_n, grid_k)`` expression and
+    # ``_block_spec_info``'s ``block_id → grid_dim`` mapping both include
+    # the new axis.  The K axis is placed at ``len(pid_info)``; the body
+    # rewrite emits ``_outer_pid_K = pl.program_id(<that index>)`` to
+    # match.  Mirror the matmul reference: K stays ``"arbitrary"`` via the
+    # existing ``_compute_reduction_grid_dims`` flow once we set the K
+    # block_size's ``reduction`` flag.
+    from .._compiler.program_id import PIDInfo
+
+    k_grid_dim = len(device_fn.pid.pid_info)  # type: ignore[union-attr]
+    k_pid_var = device_fn.new_var(f"_outer_pid_{k_grid_dim}")
+    block_size_var = device_fn.block_size_var(block_id) or "1"
+    k_numel = env.block_sizes[block_id].numel
+    device_fn.pid.pid_info.append(  # type: ignore[union-attr]
+        PIDInfo(
+            pid_var=k_pid_var,
+            block_size_var=block_size_var,
+            numel=k_numel,
+            block_id=block_id,
+        )
+    )
+    # ``_compute_reduction_grid_dims`` reads
+    # ``device_fn.pallas_outer_grid_lifted`` (set immediately below) and
+    # adds the lifted K grid dim to the reduction list, so the launcher
+    # marks it ``"arbitrary"`` in ``dimension_semantics``.  Avoid mutating
+    # ``env.block_sizes[block_id].reduction`` because the BlockSizeInfo is
+    # shared across re-compilations and other ``pallas_loop_type`` configs
+    # would silently inherit the flag flip.
+
+    # Strip the K block_id from the inner-pipeline tracking so the
+    # launcher emits a regular outer ``(bm, bk) / (bk, bn)`` BlockSpec for
+    # X / Y instead of an HBM ref + VMEM strip pair.  This is what makes
+    # the 3-axis grid actually carry K through the outer pallas_call: with
+    # X / Y now bound by ``_block_spec_info``'s ``(0, k_grid_dim)`` /
+    # ``(k_grid_dim, 1)`` mapping, Mosaic gets the same outer specs the
+    # hand-written matmul reference uses.  Walk the live emit_pipeline
+    # body output (the just-emitted ``def _pipeline_body(...)`` plus the
+    # ``pltpu.emit_pipeline(...)(x, y)`` call) to discover which outer
+    # refs are bound to the pipeline body's params (e.g. ``x`` <- ``x_vmem``)
+    # and reset their pipeline state.
+    _reset_pipeline_state_for_lifted_axis(device_fn, body_list, idx_before)
+
+    # Tag the position of the emit_pipeline call so the post-codegen rewrite
+    # can identify exactly which call to replace.  ``_apply_outer_grid_rewrites``
+    # searches the live body for the pipeline call (DCE may rearrange
+    # earlier setup statements between capture and now).
+    if not hasattr(device_fn, "_pallas_outer_grid_pending_rewrites"):
+        device_fn._pallas_outer_grid_pending_rewrites = []  # type: ignore[attr-defined]
+    device_fn._pallas_outer_grid_pending_rewrites.append(  # type: ignore[attr-defined]
+        {
+            "body_list": body_list,
+            "scratch_name": scratch_name,
+            "block_id": block_id,
+            "nsteps_expr": nsteps_expr,
+            "k_grid_dim": k_grid_dim,
+            "k_pid_var": k_pid_var,
+        }
+    )
+    return result
+
+
+def _reset_pipeline_state_for_lifted_axis(
+    device_fn: object,
+    body_list: list[ast.AST],
+    idx_before: int,
+) -> None:
+    """Reset HBM / VMEM-strip tags on tensors bound through the pipeline
+    body that's about to be inlined into the outer-grid form.
+
+    The just-emitted ``_codegen_emit_pipeline`` call appends:
+      def _pipeline_body(_pipeline_indices, x_vmem, y_vmem): ...
+      pltpu.emit_pipeline(_pipeline_body, ...)(x, y)
+
+    The pipeline call's args (``x``, ``y``) are the outer ref names whose
+    pipeline tagging we want to clear so the launcher emits a regular
+    BlockSpec for them on the now-3-axis outer grid.
+    """
+    from .._compiler.device_function import DeviceFunction
+    from .._compiler.device_function import PallasMemorySpace
+    from .._compiler.device_function import TensorArg
+
+    assert isinstance(device_fn, DeviceFunction)
+    referenced_names: set[str] = set()
+    for stmt in body_list[idx_before:]:
+        if _is_emit_pipeline_call_stmt(stmt):
+            assert isinstance(stmt, ast.Expr)
+            call = stmt.value
+            assert isinstance(call, ast.Call)
+            for arg in call.args:
+                if isinstance(arg, ast.Name):
+                    referenced_names.add(arg.id)
+    for arg in device_fn._tensor_args.values():
+        if not isinstance(arg, TensorArg):
+            continue
+        if arg.name in referenced_names:
+            tid = id(arg.fake_value)
+            if device_fn.pallas_memory_space.get(tid) == PallasMemorySpace.HBM:
+                del device_fn.pallas_memory_space[tid]
+            device_fn.pallas_pipeline_vmem_strip.discard(tid)
+
+
+def _apply_outer_grid_rewrites(
+    device_fn: object,
+    pending: list[dict[str, object]],
+) -> None:
+    """Rewrite ``DeviceFunction.body`` for each lifted outer-grid axis.
+
+    For every entry in *pending*, replaces the
+    ``scratch_init / pltpu.emit_pipeline(...)(args) / scratch_read``
+    triple plus the subsequent convert+store statements with a
+    matmul_pallas.py-style 3-axis outer-grid form:
+
+      _outer_pid_K = pl.program_id(<K_grid_dim>)
+      @pl.when(_outer_pid_K == 0)
+      def _init():
+          <init statements>
+
+      <inline pipeline body using outer refs and _outer_pid_K>
+
+      @pl.when(_outer_pid_K == <nsteps - 1>)
+      def _store():
+          <post-pipeline statements: scratch read, convert, store>
+
+    The rewrite is a pure AST surgery — no new tensors / scratches /
+    block sizes are introduced.  ``pid_info`` is also extended with a
+    PIDInfo for the K block_id so that ``pid.codegen_grid()`` returns the
+    3-axis grid tuple at host-wrapper emission time and
+    ``_compute_block_spec_info`` maps the X/Y K dim to the new grid axis.
+    Any pending entry whose scaffolding doesn't match the expected
+    matmul shape is left alone (the body stays in emit_pipeline form),
+    so the eligibility check in ``_codegen_outer_grid_or_fallback`` can
+    stay coarse and the rewrite stays the strict gate.
+    """
+    from .._compiler.device_function import DeviceFunction
+    from .._compiler.device_function import PallasOuterGridLiftedAxis
+
+    assert isinstance(device_fn, DeviceFunction)
+
+    for entry in pending:
+        # ``body_list`` is the live device_function.body reference captured
+        # at codegen time, but DCE / scratch-arg insertion may have removed
+        # early ``offset_N / indices_N / begin_N`` setup statements between
+        # capture and now, so the ``idx_before`` snapshot from
+        # ``_codegen_outer_grid_or_fallback`` is unreliable.  Search the
+        # body by content for the pipeline call instead — there's exactly
+        # one emit_pipeline call per pending entry by construction (each
+        # entry corresponds to a single matched inner loop).
+        body_list = cast("list[ast.AST]", entry["body_list"])
+        scratch_name = cast("str", entry["scratch_name"])
+        block_id = cast("int", entry["block_id"])
+
+        pipeline_call_idx = -1
+        pipeline_body_idx = -1
+        for i, stmt in enumerate(body_list):
+            if _is_emit_pipeline_call_stmt(stmt):
+                pipeline_call_idx = i
+            elif (
+                isinstance(stmt, ast.FunctionDef)
+                and stmt.name.startswith("_pipeline_body")
+                and pipeline_body_idx == -1
+            ):
+                pipeline_body_idx = i
+        if pipeline_call_idx < 0 or pipeline_body_idx < 0:
+            # Body shape didn't match (e.g. fori_loop fallback or another
+            # pass already rewrote this body); skip.
+            continue
+
+        # Walk back from the pipeline body def to find the scratch init
+        # ``scratch_N[...] = acc[...]`` and the surrounding init statements
+        # (outer accumulator assignment ``acc = jnp.full(...)``).  The
+        # scratch init line is the start of the init block we want to
+        # guard with ``pl.when(_outer_pid_K == 0)``.
+        init_start = 0
+        scratch_init_idx = -1
+        for i in range(pipeline_body_idx - 1, -1, -1):
+            stmt = body_list[i]
+            if _is_scratch_init_for(stmt, scratch_name):
+                scratch_init_idx = i
+                break
+        if scratch_init_idx < 0:
+            # No scratch init found — bail out and leave the body as-is.
+            continue
+        # Walk back from scratch_init_idx to swallow any contiguous run of
+        # outer-pre-init statements (e.g. ``acc = jnp.full(...)``,
+        # ``_outer_pid_N = pl.program_id(N)`` etc.).  We stop at the first
+        # statement that doesn't look like outer-init / pid-setup.
+        init_start = scratch_init_idx
+        while init_start > 0 and _looks_like_outer_init_stmt(body_list[init_start - 1]):
+            init_start -= 1
+
+        init_end_exclusive = pipeline_body_idx
+
+        # Post-pipeline statements: from pipeline_call_idx + 1 through end
+        # of the body (or until the next outer-grid pid setup, if multiple
+        # matmuls are stacked; the simple "to-end" form works for the
+        # headline since the kernel has a single matmul).
+        post_start = pipeline_call_idx + 1
+        post_end_exclusive = len(body_list)
+
+        # ``_outer_pid_N = pl.program_id(N)`` setup statements stay outside
+        # the pl.when guards (cheap and used by both branches).  The rest
+        # of init_start..init_end_exclusive becomes the guarded init body.
+        guard_init_stmts: list[ast.AST] = []
+        keep_outside_stmts: list[ast.AST] = []
+        for stmt in body_list[init_start:init_end_exclusive]:
+            if _is_outer_pid_setup_stmt(stmt):
+                keep_outside_stmts.append(stmt)
+            else:
+                guard_init_stmts.append(stmt)
+
+        # K's PIDInfo was already appended in ``_codegen_outer_grid_or_fallback``
+        # so the host grid is already 3-axis; pick up the saved indices.
+        k_grid_dim = cast("int", entry["k_grid_dim"])
+        k_pid_var = cast("str", entry["k_pid_var"])
+
+        # Compute device-side ``_K_NSTEPS_<i> = pl.num_programs(<k_grid_dim>)``
+        # so the store guard's ``_outer_pid_K == _K_NSTEPS - 1`` expression
+        # works with both compile-time and runtime grid sizes.
+        nsteps_var = device_fn.new_var(f"_k_nsteps_{k_grid_dim}")
+
+        # Extract the pipeline body's parameter names and arguments from
+        # the ``pltpu.emit_pipeline(_pipeline_body, ...)(x, y)`` call so we
+        # can substitute ``x_vmem -> x`` etc. when inlining.
+        pipeline_body_fn = body_list[pipeline_body_idx]
+        assert isinstance(pipeline_body_fn, ast.FunctionDef)
+        body_param_names = [arg.arg for arg in pipeline_body_fn.args.args]
+        pipeline_call_args = _extract_emit_pipeline_call_args(
+            body_list[pipeline_call_idx]
+        )
+        if (
+            len(body_param_names) < 1
+            or len(pipeline_call_args) != len(body_param_names) - 1
+        ):
+            # Unexpected shape — skip rewrite (leave body as emit_pipeline).
+            continue
+        # body_param_names[0] is ``_pipeline_indices``; remaining are tensor
+        # refs.  Replace tensor params with the outer ref names; replace
+        # ``_pipeline_indices[0]`` with the K pid var.
+        param_renames: dict[str, str] = {}
+        for i, param_name in enumerate(body_param_names[1:]):
+            param_renames[param_name] = pipeline_call_args[i]
+        pipeline_indices_name = body_param_names[0]
+        inner_body_stmts = _rename_and_dereference_body(
+            list(pipeline_body_fn.body),
+            param_renames,
+            pipeline_indices_name,
+            k_pid_var,
+        )
+
+        # Build the guarded init / inlined body / guarded store.
+        is_first_k = f"{k_pid_var} == 0"
+        is_last_k = f"{k_pid_var} == ({nsteps_var}) - 1"
+
+        new_section: list[ast.AST] = []
+        new_section.extend(keep_outside_stmts)
+        new_section.extend(
+            [
+                statement_from_string(f"{k_pid_var} = pl.program_id({k_grid_dim})"),
+                statement_from_string(f"{nsteps_var} = pl.num_programs({k_grid_dim})"),
+                _wrap_in_pl_when("_init", is_first_k, guard_init_stmts),
+            ]
+        )
+        new_section.extend(inner_body_stmts)
+        new_section.append(
+            _wrap_in_pl_when(
+                "_store", is_last_k, body_list[post_start:post_end_exclusive]
+            )
+        )
+
+        # Splice ``new_section`` in place of the old [init_start, end) range.
+        del body_list[init_start:post_end_exclusive]
+        for offset, stmt in enumerate(new_section):
+            body_list.insert(init_start + offset, stmt)
+
+        # Record on the device function (also flushed into the public list
+        # populated by the codegen so the launcher can pick it up).
+        device_fn.pallas_outer_grid_lifted[-1] = PallasOuterGridLiftedAxis(
+            block_id=block_id,
+            nsteps_expr=cast("str", entry["nsteps_expr"]),
+            scratch_name=scratch_name,
+        )
+
+        # Strip the K block_id from any pipeline-related sets so the launcher
+        # treats X/Y as ordinary outer-grid tiles (proper BlockSpec) rather
+        # than HBM refs / VMEM strips.  This is what makes the launcher emit
+        # the 3-axis ``(bm, bk)/(bk, bn)`` block specs that Mosaic can
+        # pipeline across the outer grid.
+        _restore_outer_grid_tensor_specs(
+            device_fn, body_list[init_start : init_start + len(new_section)]
+        )
+
+
+def _is_emit_pipeline_call_stmt(stmt: ast.AST) -> bool:
+    """True iff *stmt* is an ``Expr(call=pltpu.emit_pipeline(...)(...))`` stmt."""
+    if not isinstance(stmt, ast.Expr):
+        return False
+    call = stmt.value
+    if not isinstance(call, ast.Call):
+        return False
+    inner = call.func
+    if not isinstance(inner, ast.Call):
+        return False
+    fn = inner.func
+    return (
+        isinstance(fn, ast.Attribute)
+        and fn.attr == "emit_pipeline"
+        and isinstance(fn.value, ast.Name)
+        and fn.value.id == "pltpu"
+    )
+
+
+def _is_scratch_init_for(stmt: ast.AST, scratch_name: str) -> bool:
+    """True iff *stmt* assigns ``<scratch_name>[<slice>] = <expr>``.
+
+    The slice is either ``...`` or ``[:, :]`` style; both are accepted.
+    """
+    if not isinstance(stmt, ast.Assign) or len(stmt.targets) != 1:
+        return False
+    target = stmt.targets[0]
+    if not isinstance(target, ast.Subscript):
+        return False
+    return isinstance(target.value, ast.Name) and target.value.id == scratch_name
+
+
+def _looks_like_outer_init_stmt(stmt: ast.AST) -> bool:
+    """True iff *stmt* looks like an outer-pre-init or pid-setup statement.
+
+    Conservative: only accepts simple ``<name> = <expr>`` assignments where
+    the RHS is a ``Call`` or ``Subscript`` (i.e. ``acc = jnp.full(...)``,
+    ``_outer_pid_N = pl.program_id(N)``, ``offset_N = ...``).
+    """
+    if isinstance(stmt, ast.Assign) and len(stmt.targets) == 1:
+        target = stmt.targets[0]
+        return isinstance(target, ast.Name)
+    return False
+
+
+def _is_outer_pid_setup_stmt(stmt: ast.AST) -> bool:
+    """True iff *stmt* assigns ``_outer_pid_N = pl.program_id(N)``."""
+    if not isinstance(stmt, ast.Assign) or len(stmt.targets) != 1:
+        return False
+    target = stmt.targets[0]
+    if not isinstance(target, ast.Name) or not target.id.startswith("_outer_pid_"):
+        return False
+    value = stmt.value
+    return (
+        isinstance(value, ast.Call)
+        and isinstance(value.func, ast.Attribute)
+        and value.func.attr == "program_id"
+        and isinstance(value.func.value, ast.Name)
+        and value.func.value.id == "pl"
+    )
+
+
+def _drop_dead_outer_pid_reads(body_list: list[ast.AST]) -> None:
+    """DCE top-level ``_outer_pid_N = pl.program_id(N)`` setup statements
+    whose LHS name is never read elsewhere in *body_list*.
+
+    The ``outer_grid`` body rewrite and ``emit_pipeline`` codegen both
+    emit one ``_outer_pid_N`` setup per outer-grid axis (M / N / lifted
+    K), even when the body only references a subset of them.  For the
+    matmul headline the ``outer_grid`` path uses only ``_outer_pid_K``
+    (inside the ``@pl.when`` guards); the ``emit_pipeline`` strip path
+    uses none of the M / N pids inside its BlockSpec lambdas (the
+    lambda emits ``0`` for strip-tagged outer dims).  Leaving the dead
+    reads in place costs ~5% on the headline (hand-edit ablation: the
+    matmul_pallas.py mirror went from 125.5 us to 132.9 us when the
+    same two dead reads were inserted).
+
+    The pass is a strict use-def DCE on flat top-level statements.
+    Reference detection uses ``ast.walk`` so nested function bodies
+    (e.g. ``@pl.when(...) def _init():`` / ``def _pipeline_body``) and
+    BlockSpec lambdas are inspected — a pid var read from inside any of
+    those keeps its setup alive.  The setup statement itself only
+    writes its LHS (the call to ``pl.program_id`` is closed over), so
+    excluding the LHS of setup statements from the "uses" set is the
+    only subtlety.
+    """
+    used_pid_names: set[str] = set()
+    setup_indices: list[int] = []
+    setup_lhs_names: list[str] = []
+
+    for idx, stmt in enumerate(body_list):
+        if _is_outer_pid_setup_stmt(stmt):
+            assert isinstance(stmt, ast.Assign)
+            target = stmt.targets[0]
+            assert isinstance(target, ast.Name)
+            setup_indices.append(idx)
+            setup_lhs_names.append(target.id)
+        else:
+            for node in ast.walk(stmt):
+                if (
+                    isinstance(node, ast.Name)
+                    and isinstance(node.ctx, ast.Load)
+                    and node.id.startswith("_outer_pid_")
+                ):
+                    used_pid_names.add(node.id)
+
+    # Drop dead setups in reverse order so earlier indices stay valid.
+    for idx, lhs_name in zip(
+        reversed(setup_indices), reversed(setup_lhs_names), strict=True
+    ):
+        if lhs_name not in used_pid_names:
+            del body_list[idx]
+
+
+def _extract_emit_pipeline_call_args(stmt: ast.AST) -> list[str]:
+    """Return the call args of ``pltpu.emit_pipeline(...)(x, y)`` as strings."""
+    assert isinstance(stmt, ast.Expr)
+    call = stmt.value
+    assert isinstance(call, ast.Call)
+    return [ast.unparse(a) for a in call.args]
+
+
+def _rename_and_dereference_body(
+    body: list[ast.AST],
+    param_renames: dict[str, str],
+    pipeline_indices_name: str,
+    k_pid_var: str,
+) -> list[ast.AST]:
+    """Rename pipeline body parameters to outer ref names and rewrite the
+    ``_pipeline_indices[0]`` access to ``k_pid_var``.
+
+    Drops the ``nonlocal`` declaration the closure body carries — the body
+    is being inlined into the function scope where the names are already
+    visible.
+    """
+
+    class _Renamer(ast.NodeTransformer):
+        def visit_Subscript(self, node: ast.Subscript) -> ast.AST:
+            self.generic_visit(node)
+            # _pipeline_indices[<i>] → k_pid_var (single-axis lift only)
+            if (
+                isinstance(node.value, ast.Name)
+                and node.value.id == pipeline_indices_name
+                and isinstance(node.slice, ast.Constant)
+                and node.slice.value == 0
+            ):
+                return ast.copy_location(ast.Name(id=k_pid_var, ctx=ast.Load()), node)
+            return node
+
+        def visit_Name(self, node: ast.Name) -> ast.AST:
+            if node.id in param_renames:
+                new_id = param_renames[node.id]
+                return ast.copy_location(ast.Name(id=new_id, ctx=node.ctx), node)
+            return node
+
+    renamer = _Renamer()
+    out: list[ast.AST] = []
+    for stmt in body:
+        if isinstance(stmt, ast.Nonlocal):
+            continue
+        new_stmt = renamer.visit(stmt)
+        ast.fix_missing_locations(new_stmt)
+        out.append(new_stmt)
+    return out
+
+
+def _wrap_in_pl_when(
+    fn_name: str,
+    cond_expr: str,
+    body_stmts: list[ast.AST],
+) -> ast.AST:
+    """Build ``@pl.when(<cond_expr>); def <fn_name>(): <body_stmts>``.
+
+    Matches the hand-written ``matmul_pallas.py`` form exactly.  Empty
+    bodies get a ``pass`` so the FunctionDef stays valid.
+    """
+    fn_def = statement_from_string(f"def {fn_name}(): pass")
+    assert isinstance(fn_def, ast.FunctionDef)
+    fn_def.body = list(body_stmts) if body_stmts else [ast.Pass()]  # pyrefly: ignore[bad-assignment]
+    decorator_expr = expr_from_string(f"pl.when({cond_expr})")
+    assert isinstance(decorator_expr, ast.expr)
+    fn_def.decorator_list = [decorator_expr]
+    return fn_def
+
+
+def _restore_outer_grid_tensor_specs(
+    device_fn: object,
+    section: list[ast.AST],
+) -> None:
+    """When K is lifted into the outer grid, X and Y need ordinary outer
+    BlockSpecs (``(bm, bk)`` indexed by ``(i, k)`` / ``(bk, bn)`` indexed by
+    ``(k, j)``) rather than the HBM ref + VMEM strip pair that
+    ``_codegen_emit_pipeline`` registered.  Strip the relevant entries so
+    ``backend.build_launcher_args`` emits a regular outer ``BlockSpec`` for
+    each of them at host-wrapper time.
+
+    The simple heuristic walks the rewritten section, collects names that
+    appear as the outer ref in a load (``<name>[:, :]``), and clears the
+    pipeline-related state for any tensor whose ``tensor_arg`` name matches.
+    """
+    from .._compiler.device_function import DeviceFunction
+    from .._compiler.device_function import PallasMemorySpace
+    from .._compiler.device_function import TensorArg
+
+    assert isinstance(device_fn, DeviceFunction)
+    # Names that appear as ``<name>[:, :]`` or ``<name>[...]`` reads in the
+    # rewritten body.
+    referenced_names: set[str] = set()
+    for stmt in section:
+        for node in ast.walk(stmt):
+            if isinstance(node, ast.Subscript) and isinstance(node.value, ast.Name):
+                referenced_names.add(node.value.id)
+
+    # Reset memory_space / pipeline strip for any tensor whose arg name is
+    # referenced.  This makes ``_pallas_build_pipeline_specs`` emit a real
+    # BlockSpec (via ``_pallas_make_block_spec``) for each one.
+    for arg in device_fn._tensor_args.values():
+        if not isinstance(arg, TensorArg):
+            continue
+        if arg.name in referenced_names:
+            tid = id(arg.fake_value)
+            if device_fn.pallas_memory_space.get(tid) == PallasMemorySpace.HBM:
+                del device_fn.pallas_memory_space[tid]
+            device_fn.pallas_pipeline_vmem_strip.discard(tid)
+
+
 def _codegen_emit_pipeline(state: CodegenState) -> object:
     """Emit inner device loops using pltpu.emit_pipeline.
 
@@ -1464,13 +2319,37 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
             )
             _bid_to_pid_var[pid.block_id] = pid_var
 
+    # Decide which pipelined tensors should keep an outer VMEM-strip
+    # BlockSpec ``(outer_block, full_inner)`` instead of an HBM ref.  The
+    # strip lets the inner ``pltpu.emit_pipeline`` slice from VMEM, which
+    # the Deep Replan pod probe showed cuts per-K HBM DMA cost ~1.9x at
+    # bf16 block 128.  We opt in only when the combined strip working set
+    # of the candidate tensors fits the strip budget (separate from the
+    # ~65 MB vmem capacity check the launcher already enforces) so that
+    # large-block configs don't accidentally OOM the TPU.
+    pipeline_vmem_strip_ids = _select_pipeline_vmem_strip_ids(
+        all_tensor_info,
+        pipelined_tensor_ids,
+        block_ids,
+        _bid_to_pid_var,
+        env,
+        state,
+    )
+
     def _make_block_spec(fake: torch.Tensor, subscript_meta: list[object]) -> str:
         """Build a BlockSpec string for a tensor accessed in the pipeline body.
 
         Encodes BOTH outer grid dims (via pl.program_id) and inner pipeline
         dims into the BlockSpec lambda, so the full HBM tensor can be passed
         without pre-slicing.
+
+        For tensors whose outer pallas_call BlockSpec is a VMEM strip
+        (id in ``pipeline_vmem_strip_ids``), the inner BlockSpec uses
+        ``0`` for outer-grid dims because the outer ref is already
+        pre-sliced for the outer grid coordinate — indexing with the outer
+        pid would go out of bounds in that dim.
         """
+        is_vmem_strip = id(fake) in pipeline_vmem_strip_ids
         dim_to_bid = _get_dim_block_ids(subscript_meta, env)
         shape = fake.shape
         block_shape_parts: list[str] = []
@@ -1504,13 +2383,15 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
                     )
             elif bid is not None and bid in _bid_to_pid_var:
                 # Outer grid dim -- select via captured program_id variable
+                # (HBM-ref path) or constant 0 when the outer pallas_call
+                # already pre-sliced this dim via a VMEM-strip BlockSpec.
                 pid_var = _bid_to_pid_var[bid]
                 bs_var = state.device_function.block_size_var(bid)
                 if bs_var:
                     block_shape_parts.append(bs_var)
                 else:
                     block_shape_parts.append(str(int(shape[dim_idx])))
-                lambda_parts.append(pid_var)
+                lambda_parts.append("0" if is_vmem_strip else pid_var)
             else:
                 block_shape_parts.append(str(int(shape[dim_idx])))
                 lambda_parts.append("0")
@@ -1580,9 +2461,13 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
     for fake, _tensor_node, _sub_meta in loaded_tensors.values():
         if id(fake) in pipelined_tensor_ids:
             state.device_function.pallas_memory_space[id(fake)] = PallasMemorySpace.HBM
+            if id(fake) in pipeline_vmem_strip_ids:
+                state.device_function.pallas_pipeline_vmem_strip.add(id(fake))
     for fake, _tensor_node, _sub_meta in stored_tensors.values():
         if id(fake) in pipelined_tensor_ids:
             state.device_function.pallas_memory_space[id(fake)] = PallasMemorySpace.HBM
+            if id(fake) in pipeline_vmem_strip_ids:
+                state.device_function.pallas_pipeline_vmem_strip.add(id(fake))
 
     for key, (fake, _tensor_node, sub_meta) in loaded_tensors.items():
         if key in stored_tensors:
@@ -1806,6 +2691,96 @@ def _compute_vmem_shapes(
                 parts.append(int(fake.shape[dim_idx]))
         vmem_shapes.append(tuple(parts))
     return vmem_shapes
+
+
+def _select_pipeline_vmem_strip_ids(
+    all_tensor_info: list[tuple[torch.Tensor, list[object], str]],
+    pipelined_tensor_ids: set[int],
+    block_ids: list[int],
+    _bid_to_pid_var: dict[int, str],
+    env: CompileEnvironment,
+    state: CodegenState,
+) -> set[int]:
+    """Return pipelined tensor ids whose outer BlockSpec should be a VMEM strip.
+
+    A pipelined tensor is strip-eligible when each of its dimensions is
+    either tiled by the inner pipeline (block_id ∈ ``block_ids`` — kept at
+    full extent in the strip) or by an outer-grid loop (block_id in
+    ``_bid_to_pid_var`` — sliced to the outer block size in the strip).
+    Other dims (no block_id) are kept at full extent.  The strip footprint
+    is the product of those resolved sizes times ``dtype.itemsize``.
+
+    All strip-eligible candidates opt in together when the combined
+    footprint fits ``_OUTER_VMEM_STRIP_BUDGET_BYTES``; otherwise none do
+    and the launcher falls back to HBM refs for every pipelined arg.
+
+    Anything that depends on a still-symbolic shape is rejected — there is
+    no safe way to estimate its strip size at codegen time, and HBM refs
+    are the conservative choice.
+    """
+    from ..runtime import _OUTER_VMEM_STRIP_BUDGET_BYTES
+
+    if not pipelined_tensor_ids:
+        return set()
+
+    candidate_ids: list[int] = []
+    candidate_bytes: list[int] = []
+
+    for fake, sub_meta, _direction in all_tensor_info:
+        if id(fake) not in pipelined_tensor_ids:
+            continue
+        dim_to_bid = _get_dim_block_ids(sub_meta, env)
+        strip_numel = 1
+        has_outer_dim = False
+        ok = True
+        for dim_idx in range(len(fake.shape)):
+            bid = dim_to_bid.get(dim_idx)
+            if bid is not None and bid in block_ids:
+                # Inner pipeline dim — kept at full extent in the strip.
+                size = fake.shape[dim_idx]
+                if not isinstance(size, int):
+                    ok = False
+                    break
+                strip_numel *= size
+            elif bid is not None and bid in _bid_to_pid_var:
+                # Outer-grid dim — strip width = outer block size.
+                resolved = state.device_function.resolved_block_size(bid)
+                if not isinstance(resolved, int):
+                    ok = False
+                    break
+                dim_size = fake.shape[dim_idx]
+                if not isinstance(dim_size, int):
+                    ok = False
+                    break
+                strip_numel *= min(resolved, dim_size)
+                has_outer_dim = True
+            else:
+                size = fake.shape[dim_idx]
+                if not isinstance(size, int):
+                    ok = False
+                    break
+                strip_numel *= size
+        if not ok:
+            # Pessimise: even one unresolved candidate disables the strip
+            # path for the whole pallas_call so we never partially commit
+            # to a strip pattern we can't size-check.
+            return set()
+        if not has_outer_dim:
+            # No outer-grid dim varies for this tensor; a full HBM strip
+            # would just be the whole tensor in VMEM, with no per-grid-iter
+            # reuse benefit.  Skip — keep the existing HBM ref for it.
+            continue
+        candidate_ids.append(id(fake))
+        candidate_bytes.append(strip_numel * fake.element_size())
+
+    if not candidate_ids:
+        return set()
+    # Double-buffered Buffered(buffer_count=2) BlockSpecs are double-VMEM
+    # at runtime; budget the worst-case strip footprint accordingly.
+    total = sum(candidate_bytes) * 2
+    if total > _OUTER_VMEM_STRIP_BUDGET_BYTES:
+        return set()
+    return set(candidate_ids)
 
 
 def _classify_pipelined_tensors(
