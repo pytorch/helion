@@ -1,95 +1,87 @@
 === summary (rc=1) ===
-=== seed=0
+=== variant='emit_pipeline' seed=0
 RESULT max|out - ref(fp64)| = 2.431175e+01
 RESULT bad cells: 1024 / 1024  (100.00%)  @ rtol=0.001 atol=0.001
 RESULT first 10 bad cells:
 RESULT bad cells per row: [128, 128, 128, 128, 128, 128, 128, 128]
 RESULT seq_lengths        : [45, 48, 54, 1, 4, 60, 4, 40]
-=== seed=1
-RESULT max|out - ref(fp64)| = 1.882598e+01
-RESULT bad cells: 1023 / 1024  (99.90%)  @ rtol=0.001 atol=0.001
-RESULT first 10 bad cells:
-RESULT bad cells per row: [128, 128, 128, 127, 128, 128, 128, 128]
-RESULT seq_lengths        : [38, 44, 13, 9, 64, 10, 12, 6]
-=== seed=2
-RESULT max|out - ref(fp64)| = 2.115840e+01
+=== variant='fori_loop' seed=0
+RESULT max|out - ref(fp64)| = 2.431175e+01
 RESULT bad cells: 1024 / 1024  (100.00%)  @ rtol=0.001 atol=0.001
 RESULT first 10 bad cells:
 RESULT bad cells per row: [128, 128, 128, 128, 128, 128, 128, 128]
-RESULT seq_lengths        : [41, 16, 46, 9, 23, 44, 19, 12]
-=== seed=42
-RESULT max|out - ref(fp64)| = 2.382411e+01
+RESULT seq_lengths        : [45, 48, 54, 1, 4, 60, 4, 40]
+=== variant='unroll' seed=0
+RESULT max|out - ref(fp64)| = 2.431175e+01
 RESULT bad cells: 1024 / 1024  (100.00%)  @ rtol=0.001 atol=0.001
 RESULT first 10 bad cells:
 RESULT bad cells per row: [128, 128, 128, 128, 128, 128, 128, 128]
-RESULT seq_lengths        : [39, 52, 29, 15, 43, 8, 61, 21]
-=== cross-seed summary
-seed= 0  n_bad=1024
-seed= 1  n_bad=1023
-seed= 2  n_bad=1024
-seed=42  n_bad=1024
-  seed[0] vs seed[1]: |same|=False  |intersection|=1023  |sym_diff|=1
-  seed[0] vs seed[2]: |same|=True  |intersection|=1024  |sym_diff|=0
-  seed[0] vs seed[42]: |same|=True  |intersection|=1024  |sym_diff|=0
+RESULT seq_lengths        : [45, 48, 54, 1, 4, 60, 4, 40]
+=== variant summary (seed=0)
+variant= emit_pipeline  n_bad=1024
+variant=     fori_loop  n_bad=1024
+variant=        unroll  n_bad=1024
+  variant[0]='emit_pipeline' vs variant[1]='fori_loop': |same|=True  |intersection|=1024  |sym_diff|=0
+  variant[0]='emit_pipeline' vs variant[2]='unroll': |same|=True  |intersection|=1024  |sym_diff|=0
 
 === tail of diagnose.log ===
-==============================================================================
-=== seed=2
-==============================================================================
-INPUT  x_padded.shape=(1024, 128)  L_nnz=210
-INPUT  offsets=[0, 41, 57, 103, 112, 135, 179, 198, 210]
-INPUT  seq_lengths=[41, 16, 46, 9, 23, 44, 19, 12]
-RESULT max|out - ref(fp64)| = 2.115840e+01
+def kernel_unroll(x_data: torch.Tensor, x_offsets: torch.Tensor, *, _launcher=_default_pallas_launcher):
+    # src[kernel_variants.py:83]: M = x_data.shape[1]
+    M = x_data.shape[1]
+    # src[kernel_variants.py:84]: N = x_offsets.shape[0] - 1
+    N = x_offsets.shape[0] - 1
+    # src[kernel_variants.py:85]: L = x_data.shape[0]
+    L = x_data.shape[0]
+    # src[kernel_variants.py:86]: out = torch.zeros([N, M], dtype=x_data.dtype, device=x_data.device)
+    out = torch.zeros([N, M], dtype=x_data.dtype, device=x_data.device)
+    # src[kernel_variants.py:87]: for tile_l in hl.tile(L):
+    _BLOCK_SIZE_0 = 32
+    # src[kernel_variants.py:87]: for tile_l in hl.tile(L):
+    # src[kernel_variants.py:88]:     l_start = tile_l.index
+    # src[kernel_variants.py:89]:     block_L = tile_l.block_size
+    # src[kernel_variants.py:87-99]: ...
+    _launcher(_helion_kernel_unroll, ((1024 + _BLOCK_SIZE_0 - 1) // _BLOCK_SIZE_0,), x_data, x_offsets, out, _output_indices=[2], _inplace_indices=[2], _block_spec_info=[((32, None), (0, None)), ((None,), (None,)), ((None, None), (None, None))], _ds_pad_dims=[(0, 1, 128, 0), (2, 1, 128, 0)], _smem_arg_indices=[1])
+    # src[kernel_variants.py:100]: return out
+    return out
+
+def call():
+    from torch._dynamo.testing import rand_strided
+    # src[kernel_variants.py:80]: def kernel_unroll(
+    # src[kernel_variants.py:81]:     x_data: torch.Tensor, x_offsets: torch.Tensor
+    # src[kernel_variants.py:82]: ) -> torch.Tensor:
+    # src[kernel_variants.py:80-100]: ...
+    x_data = rand_strided(size=(1024, 128), stride=(128, 1), dtype=torch.float32, device='tpu:0')
+    x_offsets = rand_strided(size=(9,), stride=(1,), dtype=torch.int32, device='tpu:0')
+    kernel_unroll(x_data, x_offsets)
+if __name__ == '__main__':
+    call()
+RESULT max|out - ref(fp64)| = 2.431175e+01
 RESULT bad cells: 1024 / 1024  (100.00%)  @ rtol=0.001 atol=0.001
 RESULT first 10 bad cells:
-   [  0,   0]  ref=-7.594823e+00  out=+0.000000e+00  diff=7.594823e+00
-   [  0,   1]  ref=+6.111785e-01  out=+0.000000e+00  diff=6.111785e-01
-   [  0,   2]  ref=-2.901575e+00  out=+0.000000e+00  diff=2.901575e+00
-   [  0,   3]  ref=+6.911619e+00  out=+0.000000e+00  diff=6.911619e+00
-   [  0,   4]  ref=+6.244213e+00  out=+0.000000e+00  diff=6.244213e+00
-   [  0,   5]  ref=-4.172859e+00  out=+0.000000e+00  diff=4.172859e+00
-   [  0,   6]  ref=-9.728608e+00  out=+0.000000e+00  diff=9.728608e+00
-   [  0,   7]  ref=+3.575836e+00  out=+0.000000e+00  diff=3.575836e+00
-   [  0,   8]  ref=-2.822975e+00  out=+0.000000e+00  diff=2.822975e+00
-   [  0,   9]  ref=-2.600559e+00  out=+0.000000e+00  diff=2.600559e+00
+   [  0,   0]  ref=+2.506165e+00  out=+0.000000e+00  diff=2.506165e+00
+   [  0,   1]  ref=+7.937676e-02  out=+0.000000e+00  diff=7.937676e-02
+   [  0,   2]  ref=+6.402875e+00  out=+0.000000e+00  diff=6.402875e+00
+   [  0,   3]  ref=+4.186883e+00  out=+0.000000e+00  diff=4.186883e+00
+   [  0,   4]  ref=+6.543723e+00  out=+0.000000e+00  diff=6.543723e+00
+   [  0,   5]  ref=-4.299490e+00  out=+0.000000e+00  diff=4.299490e+00
+   [  0,   6]  ref=+2.676757e+00  out=+0.000000e+00  diff=2.676757e+00
+   [  0,   7]  ref=-7.830895e+00  out=+0.000000e+00  diff=7.830895e+00
+   [  0,   8]  ref=+4.723637e+00  out=+0.000000e+00  diff=4.723637e+00
+   [  0,   9]  ref=-1.609069e+00  out=+0.000000e+00  diff=1.609069e+00
 RESULT bad cells per row: [128, 128, 128, 128, 128, 128, 128, 128]
-RESULT seq_lengths        : [41, 16, 46, 9, 23, 44, 19, 12]
+RESULT seq_lengths        : [45, 48, 54, 1, 4, 60, 4, 40]
 
 ==============================================================================
-=== seed=42
+=== variant summary (seed=0)
 ==============================================================================
-INPUT  x_padded.shape=(1024, 128)  L_nnz=268
-INPUT  offsets=[0, 39, 91, 120, 135, 178, 186, 247, 268]
-INPUT  seq_lengths=[39, 52, 29, 15, 43, 8, 61, 21]
-RESULT max|out - ref(fp64)| = 2.382411e+01
-RESULT bad cells: 1024 / 1024  (100.00%)  @ rtol=0.001 atol=0.001
-RESULT first 10 bad cells:
-   [  0,   0]  ref=+1.018282e+00  out=+0.000000e+00  diff=1.018282e+00
-   [  0,   1]  ref=+1.087065e-01  out=+0.000000e+00  diff=1.087065e-01
-   [  0,   2]  ref=-8.461998e+00  out=+0.000000e+00  diff=8.461998e+00
-   [  0,   3]  ref=-5.300418e+00  out=+0.000000e+00  diff=5.300418e+00
-   [  0,   4]  ref=-5.661171e+00  out=+0.000000e+00  diff=5.661171e+00
-   [  0,   5]  ref=-7.294580e+00  out=+0.000000e+00  diff=7.294580e+00
-   [  0,   6]  ref=+9.485034e+00  out=+0.000000e+00  diff=9.485034e+00
-   [  0,   7]  ref=-4.384329e+00  out=+0.000000e+00  diff=4.384329e+00
-   [  0,   8]  ref=+5.882474e+00  out=+0.000000e+00  diff=5.882474e+00
-   [  0,   9]  ref=+1.234886e+00  out=+0.000000e+00  diff=1.234886e+00
-RESULT bad cells per row: [128, 128, 128, 128, 128, 128, 128, 128]
-RESULT seq_lengths        : [39, 52, 29, 15, 43, 8, 61, 21]
-
-==============================================================================
-=== cross-seed summary
-==============================================================================
-seed= 0  n_bad=1024
-seed= 1  n_bad=1023
-seed= 2  n_bad=1024
-seed=42  n_bad=1024
-  seed[0] vs seed[1]: |same|=False  |intersection|=1023  |sym_diff|=1
-  seed[0] vs seed[2]: |same|=True  |intersection|=1024  |sym_diff|=0
-  seed[0] vs seed[42]: |same|=True  |intersection|=1024  |sym_diff|=0
-I0000 00:00:1779837938.446419 2004241 compilation_cache.cc:354] Compilation cache evicted.
-I0000 00:00:1779837938.446448 2004241 compilation_cache.cc:219] CompilationCache final stats: num_cache_reqs=180
-num_cache_hits=154 {85.5%}
+variant= emit_pipeline  n_bad=1024
+variant=     fori_loop  n_bad=1024
+variant=        unroll  n_bad=1024
+  variant[0]='emit_pipeline' vs variant[1]='fori_loop': |same|=True  |intersection|=1024  |sym_diff|=0
+  variant[0]='emit_pipeline' vs variant[2]='unroll': |same|=True  |intersection|=1024  |sym_diff|=0
+I0000 00:00:1779839667.198778 2006362 compilation_cache.cc:354] Compilation cache evicted.
+I0000 00:00:1779839667.198807 2006362 compilation_cache.cc:219] CompilationCache final stats: num_cache_reqs=135
+num_cache_hits=110 {81.4%}
 peak_compilation_memory_bytes=unknown
 
 ----- END (exit=1) -----
