@@ -3623,6 +3623,7 @@ class TestAutotuneBudget(TestCase):
                 os.environ["HELION_AUTOTUNE_MAX_GRID_FOLDING_FACTOR"] = original
             else:
                 os.environ.pop("HELION_AUTOTUNE_MAX_GRID_FOLDING_FACTOR", None)
+
     def test_cute_wall_clock_benchmark_uses_subprocess_worker(self) -> None:
         from helion._compiler.backend import CuteBackend
 
