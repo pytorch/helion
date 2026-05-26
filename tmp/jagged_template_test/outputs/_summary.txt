@@ -1,0 +1,63 @@
+=== summary (rc=1) ===
+=== size 'html_example' params={'B': 4, 'M_actual': 8, 'seq_lengths': [3, 7, 5, 9]} k_sz=16
+KERNEL FAILED — full traceback:
+SUMMARY size='html_example' k_sz=16 rc=1
+=== size 'html_example' params={'B': 4, 'M_actual': 8, 'seq_lengths': [3, 7, 5, 9]} k_sz=64
+KERNEL FAILED — full traceback:
+SUMMARY size='html_example' k_sz=64 rc=1
+=== size 'tiny' params={'B': 4, 'M_actual': 128, 'max_seq': 16} k_sz=16
+KERNEL FAILED — full traceback:
+SUMMARY size='tiny' k_sz=16 rc=1
+=== size 'tiny' params={'B': 4, 'M_actual': 128, 'max_seq': 16} k_sz=64
+KERNEL FAILED — full traceback:
+SUMMARY size='tiny' k_sz=64 rc=1
+=== size 'small' params={'B': 8, 'M_actual': 128, 'max_seq': 64} k_sz=16
+KERNEL FAILED — full traceback:
+SUMMARY size='small' k_sz=16 rc=1
+=== size 'small' params={'B': 8, 'M_actual': 128, 'max_seq': 64} k_sz=64
+KERNEL FAILED — full traceback:
+SUMMARY size='small' k_sz=64 rc=1
+=== size 'medium' params={'B': 32, 'M_actual': 128, 'max_seq': 512} k_sz=16
+KERNEL FAILED — full traceback:
+SUMMARY size='medium' k_sz=16 rc=1
+=== size 'medium' params={'B': 32, 'M_actual': 128, 'max_seq': 512} k_sz=64
+KERNEL FAILED — full traceback:
+SUMMARY size='medium' k_sz=64 rc=1
+=== size 'large' params={'B': 128, 'M_actual': 128, 'max_seq': 2048} k_sz=16
+KERNEL FAILED — full traceback:
+SUMMARY size='large' k_sz=16 rc=1
+=== size 'large' params={'B': 128, 'M_actual': 128, 'max_seq': 2048} k_sz=64
+KERNEL FAILED — full traceback:
+SUMMARY size='large' k_sz=64 rc=1
+
+=== last 30 lines of test.log ===
+    jaxpr, out_avals, consts = pe.trace_to_jaxpr_dynamic(
+                               ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/ymu_google_com/miniconda3/envs/tpu/lib/python3.12/site-packages/jax/_src/pallas/core.py", line 488, in __call__
+    out_indices = self.index_map(*args, **kwargs)
+                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/ymu_google_com/helion/helion/runtime/pallas_templates/jagged_reduce.py", line 92, in x_index_map
+    start = x_offsets_ref[b_id]
+            ~~~~~~~~~~~~~^^^^^^
+  File "/home/ymu_google_com/miniconda3/envs/tpu/lib/python3.12/site-packages/jax/_src/numpy/array_methods.py", line 1404, in op
+    return getattr(self.aval, f"_{name}")(self, *args)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/ymu_google_com/miniconda3/envs/tpu/lib/python3.12/site-packages/jax/_src/numpy/array_methods.py", line 941, in _getitem
+    return indexing.rewriting_take(self, item)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/ymu_google_com/miniconda3/envs/tpu/lib/python3.12/site-packages/jax/_src/numpy/indexing.py", line 1080, in rewriting_take
+    indexer = NDIndexer.from_raw_indices(idx, arr.shape)
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/ymu_google_com/miniconda3/envs/tpu/lib/python3.12/site-packages/jax/_src/numpy/indexing.py", line 201, in from_raw_indices
+    parsed = _parse_indices(indices, shape)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/ymu_google_com/miniconda3/envs/tpu/lib/python3.12/site-packages/jax/_src/numpy/indexing.py", line 145, in _parse_indices
+    typ = IndexType.from_index(idx)
+          ^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/ymu_google_com/miniconda3/envs/tpu/lib/python3.12/site-packages/jax/_src/numpy/indexing.py", line 110, in from_index
+    raise IndexError("only integers, slices (`:`), ellipsis (`...`), newaxis (`None`)"
+IndexError: only integers, slices (`:`), ellipsis (`...`), newaxis (`None`) and integer or boolean arrays are valid indices. Got JitTracer(Ref<smem>{int32[129]})
+--------------------
+For simplicity, JAX has removed its internal frames from the traceback of the following exception. Set JAX_TRACEBACK_FILTERING=off to include these.
+SUMMARY size='large' k_sz=64 rc=1
+----- END (exit=1) -----
