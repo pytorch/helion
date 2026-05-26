@@ -31,12 +31,15 @@ from pathlib import Path
 
 import torch
 
-# Allow importing examples.jagged_sum_tpu when running from this dir.
-REPO_ROOT = Path(__file__).resolve().parents[2]
+# Allow importing examples.jagged_sum_tpu and the sibling kernel_variants
+# module when running from this dir.
+HERE = Path(__file__).resolve().parent
+REPO_ROOT = HERE.parents[1]
 sys.path.insert(0, str(REPO_ROOT))
+sys.path.insert(0, str(HERE))
 
 from helion._testing import DEVICE  # noqa: E402
-from examples.jagged_sum_tpu import jagged_sum_kernel_tpu  # noqa: E402
+from kernel_variants import VARIANTS  # noqa: E402
 
 
 def reference_fp64(x_data: torch.Tensor, x_offsets: torch.Tensor) -> torch.Tensor:
@@ -76,8 +79,18 @@ def make_inputs(seed: int, B: int = 8, M: int = 128, max_seqlen: int = 64):
     return x_padded, x_offsets, seq_lengths.tolist()
 
 
-def analyze(seed: int, *, rtol: float = 1e-3, atol: float = 1e-3) -> dict:
-    print(f"\n{'='*78}\n=== seed={seed}\n{'='*78}", flush=True)
+def analyze(
+    variant_name: str,
+    kernel_fn,
+    seed: int,
+    *,
+    rtol: float = 1e-3,
+    atol: float = 1e-3,
+) -> dict:
+    print(
+        f"\n{'='*78}\n=== variant={variant_name!r} seed={seed}\n{'='*78}",
+        flush=True,
+    )
     x_padded, offsets, seq_lengths = make_inputs(seed)
     print(
         f"INPUT  x_padded.shape={tuple(x_padded.shape)}  L_nnz={int(offsets[-1])}",
@@ -87,11 +100,11 @@ def analyze(seed: int, *, rtol: float = 1e-3, atol: float = 1e-3) -> dict:
     print(f"INPUT  seq_lengths={seq_lengths}", flush=True)
 
     try:
-        out = jagged_sum_kernel_tpu(x_padded, offsets)
+        out = kernel_fn(x_padded, offsets)
     except Exception:
         print("KERNEL FAILED — full traceback:", flush=True)
         traceback.print_exc()
-        return {"seed": seed, "n_bad": None, "bad_idx": None}
+        return {"variant": variant_name, "seed": seed, "n_bad": None, "bad_idx": None}
 
     ref = reference_fp64(x_padded, offsets)
     diff = (out - ref).abs()
@@ -130,7 +143,7 @@ def analyze(seed: int, *, rtol: float = 1e-3, atol: float = 1e-3) -> dict:
     else:
         print("RESULT PASS (no bad cells)", flush=True)
 
-    return {"seed": seed, "n_bad": n_bad, "bad_idx": bad_idx_list}
+    return {"variant": variant_name, "seed": seed, "n_bad": n_bad, "bad_idx": bad_idx_list}
 
 
 def main() -> int:
@@ -140,21 +153,34 @@ def main() -> int:
     print("jax devices:", jax.devices(), flush=True)
     print("torch device (DEVICE):", DEVICE, flush=True)
 
-    results = [analyze(seed) for seed in [0, 1, 2, 42]]
+    # Sweep all three pallas_loop_type variants on the same data, same seed.
+    # Single seed is enough — the bug is deterministic, and using only one
+    # seed keeps the log tractable.
+    seed = 0
+    all_results = []
+    for variant_name, kernel_fn in VARIANTS.items():
+        all_results.append(analyze(variant_name, kernel_fn, seed))
 
-    print(f"\n{'='*78}\n=== cross-seed summary\n{'='*78}", flush=True)
-    for r in results:
-        print(f"seed={r['seed']:>2}  n_bad={r['n_bad']}", flush=True)
+    print(f"\n{'='*78}\n=== variant summary (seed={seed})\n{'='*78}", flush=True)
+    for r in all_results:
+        print(
+            f"variant={r['variant']:>14}  n_bad={r['n_bad']}",
+            flush=True,
+        )
 
-    # If two consecutive seeds have IDENTICAL bad cell sets, it's
-    # deterministic. If different sets, it's a race / noise.
-    if all(r["n_bad"] is not None and r["n_bad"] > 0 for r in results):
-        sets = [{tuple(c) for c in r["bad_idx"]} for r in results]
+    # Cross-variant bad-cell set comparison. If two variants have identical
+    # bad-cell sets, the bug is in the upstream Helion source-to-Pallas
+    # lowering (independent of loop_type). If a variant has zero bad cells,
+    # the bug is loop_type-specific (and that variant is the workaround).
+    results = all_results
+    if all(r["n_bad"] is not None for r in results):
+        sets = [{tuple(c) for c in (r["bad_idx"] or [])} for r in results]
         for i in range(1, len(sets)):
             same = sets[i] == sets[0]
             inter = len(sets[i] & sets[0])
             print(
-                f"  seed[0] vs seed[{results[i]['seed']}]: "
+                f"  variant[0]={results[0]['variant']!r} vs "
+                f"variant[{i}]={results[i]['variant']!r}: "
                 f"|same|={same}  |intersection|={inter}  "
                 f"|sym_diff|={len(sets[i] ^ sets[0])}",
                 flush=True,

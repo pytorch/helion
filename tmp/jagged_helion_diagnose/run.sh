@@ -43,7 +43,7 @@ echo "[run] python diagnose.py exit=$RC (log: $LOG)"
 SUMMARY="$OUTDIR/_summary.txt"
 {
   echo "=== summary (rc=$RC) ==="
-  grep -E "^RESULT |^=== seed=|^=== cross-seed|^seed=|^  seed\[" "$LOG" || true
+  grep -E "^RESULT |^=== variant=|^=== variant summary|^variant=|^  variant\[" "$LOG" || true
   echo
   echo "=== tail of diagnose.log ==="
   tail -60 "$LOG"
