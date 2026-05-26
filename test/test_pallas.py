@@ -1344,6 +1344,500 @@ class TestPallas(TestCase):
         self.assertIn("lax.dot_general(", code)
         self.assertIn("precision=jax.lax.Precision.HIGHEST", code)
 
+    def test_pallas_autotuner_final_pick_picks_true_best_on_noisy_initial_rank(
+        self,
+    ) -> None:
+        """Final-pick verification re-ranks past noisy initial measurements.
+
+        On TPU pod-wide thermal / scheduler noise sometimes causes the
+        bf16 1024^3 autotuner to record a single-call median of ~224 us
+        for ``block_sizes=[512, 1024, 512]`` while
+        ``block_sizes=[512, 512, 512]`` records ~232 us in the same pass
+        and ~190 us when re-measured back-to-back (Deep Replan 2026-05-23,
+        plan.md §2.1 (a)). The new
+        ``PopulationBasedSearch.run_final_pick_verification`` phase
+        guards against that by re-benchmarking the top-K candidates
+        ``HELION_AUTOTUNE_FINAL_PICK_PASSES`` extra times and ranking by
+        the median of per-pass medians.
+
+        The pin asserts that when the **initial** ``perf`` of the
+        ``[512, 1024, 512]`` candidate is noisy-better but its true
+        repeated rebenchmark stays slower than ``[512, 512, 512]``, the
+        verification picks ``[512, 512, 512]``. The two block-512 configs
+        are the ones the bf16 1024^3 autotuner historically ties between
+        ([512, 512, 512] and [256, 256, 256]); the [512, 1024, 512]
+        config is the one we are explicitly steering away from.
+        """
+        from unittest.mock import patch
+
+        from helion.autotuner.base_search import PopulationBasedSearch
+        from helion.autotuner.base_search import PopulationMember
+        from helion.runtime.config import Config
+
+        # Fake measured times in ms.  "True" means the steady-state cost
+        # the kernel actually pays; "noisy initial" is the first
+        # rebenchmark median seen during search, which mis-ranks the
+        # configs.  ``[512, 1024, 512]`` shows a deceptive 0.220 ms in the
+        # initial benchmark even though every repeated probe lands above
+        # 0.232 ms; ``[512, 512, 512]`` shows a slow 0.232 ms initial but
+        # is consistently 0.190 ms when re-measured.
+        scripted_candidates = [
+            {
+                "block_sizes": [512, 1024, 512],
+                "noisy_initial_ms": 0.220,
+                "true_passes_ms": [0.232, 0.234, 0.230],
+            },
+            {
+                "block_sizes": [512, 512, 512],
+                "noisy_initial_ms": 0.232,
+                "true_passes_ms": [0.190, 0.192, 0.188],
+            },
+            {
+                "block_sizes": [256, 256, 256],
+                "noisy_initial_ms": 0.234,
+                "true_passes_ms": [0.205, 0.210, 0.208],
+            },
+            {
+                "block_sizes": [128, 128, 128],
+                "noisy_initial_ms": 0.260,
+                "true_passes_ms": [0.300, 0.305, 0.302],
+            },
+        ]
+
+        members: list[PopulationMember] = []
+        for entry in scripted_candidates:
+            config = Config(block_sizes=list(entry["block_sizes"]))
+            members.append(
+                PopulationMember(
+                    fn=lambda *a, **kw: None,
+                    perfs=[entry["noisy_initial_ms"]],
+                    flat_values=list(entry["block_sizes"]),
+                    config=config,
+                    status="ok",
+                    compile_time=0.0,
+                )
+            )
+
+        # Construct a minimal search instance without going through the
+        # full constructor (which requires a compiled kernel + arg tensors).
+        # ``log`` must itself be callable plus expose ``.debug`` /
+        # ``.warning`` like the real ``AutotuningLogger`` does, so wrap a
+        # no-op callable in a small adapter.
+        class _NoopLog:
+            def __call__(self, *_: object, **__: object) -> None:
+                return None
+
+            def debug(self, *_: object, **__: object) -> None:
+                return None
+
+            def warning(self, *_: object, **__: object) -> None:
+                return None
+
+        search = PopulationBasedSearch.__new__(PopulationBasedSearch)
+        search.population = members
+        search.best_perf_so_far = min(m.perf for m in members)
+        search.log = _NoopLog()
+
+        # Lookup of true per-pass timings keyed by config identity.  The
+        # pass counter advances per rebenchmark call so each pass sees a
+        # different scripted timing.
+        true_passes_by_id: dict[int, list[float]] = {
+            id(m): list(entry["true_passes_ms"])
+            for m, entry in zip(members, scripted_candidates, strict=True)
+        }
+
+        def fake_rebenchmark(
+            members_to_bench: list[PopulationMember], *, desc: str = ""
+        ) -> None:
+            for member in members_to_bench:
+                # Pop the next scripted timing for this member; reuse the
+                # last value if we exhaust the script.
+                queue = true_passes_by_id[id(member)]
+                timing = queue.pop(0) if queue else member.perfs[-1]
+                member.perfs.append(timing)
+                if timing < search.best_perf_so_far:
+                    search.best_perf_so_far = timing
+
+        with patch.object(search, "rebenchmark", side_effect=fake_rebenchmark):
+            initial_best = min(members, key=lambda m: m.perf)
+            self.assertEqual(
+                list(initial_best.config["block_sizes"]),
+                [512, 1024, 512],
+                "Precondition: noisy initial perf misranks 1024-bn config as best",
+            )
+            final_best = search.run_final_pick_verification(
+                initial_best, passes=3, top_k=5
+            )
+
+        self.assertIn(
+            list(final_best.config["block_sizes"]),
+            ([512, 512, 512], [256, 256, 256]),
+            "Final-pick verification must re-rank away from [512, 1024, 512] "
+            "(under-parallelised bn==N) and into the [512, 512, 512] or "
+            "[256, 256, 256] family.",
+        )
+
+    def test_pallas_matmul_bf16_square_seed_in_initial_population(self) -> None:
+        """Compiler seeds the headline-fast config into the initial population.
+
+        Deep Replan 2026-05-23 (plan.md §2.5 row 2) measured the forced
+        ``emit_pipeline [512, 512, 512] pb=False`` config on bf16 1024**3
+        at 161 us -- the fastest known Helion config -- but the autotuner
+        kept mis-ranking it against ``unroll`` family picks because of
+        per-call noise on short kernels.
+
+        ``PallasMatmulSquareSeedHeuristic`` plants this config in the
+        initial population (via ``ConfigSpec.compiler_seed_configs``,
+        the same path used by ``TritonSkinnyGemmHeuristic``).
+        Together with the existing final-pick verification phase
+        (re-ranking the top-10) this guarantees the autotuner always
+        considers the headline-fast config -- the search no longer has
+        to discover it by mutation.
+
+        Pin asserts:
+          1. The heuristic is eligible for bf16 1024**3.
+          2. ``compiler_seed_configs`` includes the
+             ``[512, 512, 512] emit_pipeline pb=False`` config.
+          3. The skinny shape (M=1) is NOT seeded (the heuristic refuses
+             when any static dim is below 512 so the M=1 / N=1 / K=1
+             paths -- which want ``unroll [_, _, 1]`` or
+             ``fori_loop`` -- aren't biased toward an inappropriate
+             family).
+        """
+        from helion._compiler.autotuner_heuristics.pallas import (
+            PallasMatmulSquareSeedHeuristic,
+        )
+
+        torch.manual_seed(0)
+        x = torch.empty(1024, 1024, device=DEVICE, dtype=torch.bfloat16)
+        torch.manual_seed(1)
+        y = torch.empty(1024, 1024, device=DEVICE, dtype=torch.bfloat16)
+        bound = pallas_matmul_bf16.bind((x, y))
+
+        self.assertTrue(
+            PallasMatmulSquareSeedHeuristic.is_eligible(
+                bound.env, bound.host_function.device_ir
+            ),
+            "Heuristic must fire on bf16 1024**3 (all dims >= 512, 2D matmul).",
+        )
+        self.assertIn(
+            PallasMatmulSquareSeedHeuristic.name,
+            bound.config_spec.autotuner_heuristics,
+            "Heuristic name must be recorded so the seed is attributable.",
+        )
+        seed_blocks = (512, 512, 512)
+        seeded = [
+            (
+                tuple(cfg.config.get("block_sizes", ())),
+                cfg.config.get("pallas_loop_type"),
+                cfg.config.get("pallas_pre_broadcast"),
+            )
+            for cfg in bound.config_spec.compiler_seed_configs
+        ]
+        self.assertIn(
+            (seed_blocks, "emit_pipeline", False),
+            seeded,
+            "Compiler seed configs must include the headline-fast "
+            "[512, 512, 512] emit_pipeline pb=False entry.",
+        )
+
+        skinny_x = torch.empty(1, 1024, device=DEVICE, dtype=torch.bfloat16)
+        skinny_y = torch.empty(1024, 1024, device=DEVICE, dtype=torch.bfloat16)
+        skinny_bound = pallas_matmul_bf16.bind((skinny_x, skinny_y))
+        self.assertFalse(
+            PallasMatmulSquareSeedHeuristic.is_eligible(
+                skinny_bound.env, skinny_bound.host_function.device_ir
+            ),
+            "Heuristic must refuse skinny shapes (M=1) so the [512, 512, 512] "
+            "block tile isn't seeded for shapes that can't use it.",
+        )
+        skinny_seeded = [
+            tuple(cfg.config.get("block_sizes", ()))
+            for cfg in skinny_bound.config_spec.compiler_seed_configs
+        ]
+        self.assertNotIn(
+            seed_blocks,
+            skinny_seeded,
+            "Skinny shape must not receive the [512, 512, 512] seed.",
+        )
+
+    def test_pallas_autotuner_compiler_seed_survives_final_pick(self) -> None:
+        """Compiler-seeded members are re-considered during final-pick verification.
+
+        The LFBO surrogate-driven search aggressively prunes the
+        population between generations: by the time
+        ``run_final_pick_verification`` fires, ``self.population`` may
+        hold only 2-3 members of the last generation's neighbors plus
+        the running best.  Without this pin a compiler-seeded
+        ``[512, 512, 512] emit_pipeline pb=False`` config that measured
+        merely "average" on its noisy initial bench would be dropped
+        from later generations -- the verification phase would never
+        see it.
+
+        The fix snapshots compiler-seeded members on
+        ``PopulationBasedSearch._compiler_seed_members`` at the end of
+        the initial-rebench step and merges them into the verification
+        candidate pool, so a backend's hand-picked seed always gets
+        re-benched against the search's best even when the search
+        moved away from it.
+        """
+        from unittest.mock import patch
+
+        from helion.autotuner.base_search import PopulationBasedSearch
+        from helion.autotuner.base_search import PopulationMember
+        from helion.runtime.config import Config
+
+        # "Last-gen population" = two random survivors of the LFBO
+        # pattern search, both around 0.205 ms.  "Compiler seed" = the
+        # hand-picked fast config that scored 0.215 ms on its noisy
+        # initial bench (so the LFBO surrogate dropped it from later
+        # generations) but consistently rebenches at 0.190 ms.
+        last_gen = [
+            (
+                Config(block_sizes=[1024, 256, 1024]),
+                0.205,
+                [0.207, 0.206, 0.204],
+            ),
+            (
+                Config(block_sizes=[256, 256, 256]),
+                0.210,
+                [0.212, 0.211, 0.209],
+            ),
+        ]
+        compiler_seed = (
+            Config(
+                block_sizes=[512, 512, 512],
+                pallas_loop_type="emit_pipeline",
+                pallas_pre_broadcast=False,
+            ),
+            0.215,
+            [0.190, 0.191, 0.189],
+        )
+
+        def make_member(config: Config, noisy_perf: float) -> PopulationMember:
+            return PopulationMember(
+                fn=lambda *a, **kw: None,
+                perfs=[noisy_perf],
+                flat_values=[id(config)],  # opaque -- never read by the test
+                config=config,
+                status="ok",
+                compile_time=0.0,
+            )
+
+        last_gen_members = [make_member(cfg, perf) for cfg, perf, _passes in last_gen]
+        seed_member = make_member(compiler_seed[0], compiler_seed[1])
+        true_passes_by_id: dict[int, list[float]] = {
+            id(member): list(passes)
+            for member, (_cfg, _noisy, passes) in zip(
+                last_gen_members, last_gen, strict=True
+            )
+        }
+        true_passes_by_id[id(seed_member)] = list(compiler_seed[2])
+
+        class _NoopLog:
+            def __call__(self, *_: object, **__: object) -> None:
+                return None
+
+            def debug(self, *_: object, **__: object) -> None:
+                return None
+
+            def warning(self, *_: object, **__: object) -> None:
+                return None
+
+        search = PopulationBasedSearch.__new__(PopulationBasedSearch)
+        search.population = last_gen_members  # seed NOT in last-gen population
+        search.best_perf_so_far = min(m.perf for m in last_gen_members)
+        search._compiler_seed_members = [seed_member]
+        search.log = _NoopLog()
+
+        def fake_rebenchmark(
+            members_to_bench: list[PopulationMember], *, desc: str = ""
+        ) -> None:
+            for member in members_to_bench:
+                queue = true_passes_by_id[id(member)]
+                timing = queue.pop(0) if queue else member.perfs[-1]
+                member.perfs.append(timing)
+                if timing < search.best_perf_so_far:
+                    search.best_perf_so_far = timing
+
+        with patch.object(search, "rebenchmark", side_effect=fake_rebenchmark):
+            initial_best = min(last_gen_members, key=lambda m: m.perf)
+            self.assertEqual(
+                list(initial_best.config["block_sizes"]),
+                [1024, 256, 1024],
+                "Precondition: search's running best is one of the last-gen members.",
+            )
+            final_best = search.run_final_pick_verification(
+                initial_best, passes=3, top_k=10
+            )
+
+        self.assertEqual(
+            list(final_best.config["block_sizes"]),
+            [512, 512, 512],
+            "Compiler-seeded [512, 512, 512] must be re-benched and "
+            "re-rank ahead of the last-gen best once its true 0.190 ms "
+            "perf is measured.",
+        )
+
+    def test_pallas_launcher_fast_path_hits_on_repeat_invocations(self) -> None:
+        """Cached static-shape Pallas launcher elides per-call helper iteration.
+
+        Deep Replan 2026-05-23 (§2.7 in ``plan.md``) decomposed the
+        bf16 1024^3 headline gap to per-call Python dispatch overhead.
+        On a cache hit, ``default_pallas_launcher`` /
+        ``default_pallas_pipeline_launcher`` / ``default_pallas_fori_launcher``
+        each branch into a fast path that:
+
+        * Reuses a precomputed ``_LauncherFastPath`` instance carried on
+          the cached launcher entry instead of re-running
+          ``_pallas_apply_ds_padding`` / ``_pallas_check_dtypes`` /
+          the output-only-results loop per call.
+        * Increments ``helion.runtime._LAUNCHER_FAST_PATH_HITS`` on each
+          cache hit so this pin can assert the elision is exercised.
+
+        The kernel allocates its output via ``torch.empty`` inside the
+        kernel body, so ``out`` is an output-only tensor and the fast
+        path exercises both the output-only-results loop short-circuit
+        and the ds-pad skip (1024-divisible block sizes mean every
+        pad_amount is 0).  The test binds + ``compile_config`` directly
+        so autotuning doesn't muddy the counter (autotuning would call
+        the launcher hundreds of times across configs); only the
+        compiled callable's per-call launcher work is observed.
+
+        Regression hazard pinned: if a refactor splits the cache tuple
+        differently or removes the counter increment, this test fails.
+        Equally, if a refactor accidentally takes the slow path on
+        every call (e.g. by storing a 4-tuple instead of a 5-tuple and
+        always missing the new ``fast_path`` unpack), the hit count
+        drops to 0 and the test fails.
+        """
+        from helion import runtime as helion_runtime
+
+        torch.manual_seed(0)
+        x = torch.randn(256, 256, device=DEVICE, dtype=torch.bfloat16)
+        torch.manual_seed(1)
+        y = torch.randn(256, 256, device=DEVICE, dtype=torch.bfloat16)
+
+        bound = pallas_matmul_bf16.bind((x, y))
+        config = bound.config_spec.default_config()
+        compiled_fn = bound.compile_config(config)
+
+        helion_runtime._reset_launcher_fast_path_hits()
+        self.assertEqual(helion_runtime._launcher_fast_path_hits(), 0)
+
+        # First call seeds the launcher cache (slow path / no counter
+        # bump); subsequent calls take the fast path.
+        result = compiled_fn(x, y)
+        expected = (x.float() @ y.float()).to(torch.bfloat16)
+        torch.testing.assert_close(result, expected, rtol=1e-2, atol=1e-2)
+        self.assertEqual(
+            helion_runtime._launcher_fast_path_hits(),
+            0,
+            "First call should miss the launcher cache and run the "
+            "slow path (no fast-path counter bump).",
+        )
+
+        # Repeat invocations: same kernel, same shape, same dtype → cache hit.
+        n_repeats = 4
+        for _ in range(n_repeats):
+            result = compiled_fn(x, y)
+            torch.testing.assert_close(result, expected, rtol=1e-2, atol=1e-2)
+
+        self.assertEqual(
+            helion_runtime._launcher_fast_path_hits(),
+            n_repeats,
+            f"Repeat calls on a cached static-shape kernel must each hit "
+            f"the launcher fast path. Expected {n_repeats} hits; got "
+            f"{helion_runtime._launcher_fast_path_hits()}.",
+        )
+
+    def test_pallas_jaxcallable_key_cache_hits_on_repeat_invocations(self) -> None:
+        """Cached static-shape JaxCallable reuses torch_tpu invocation key.
+
+        Deep Replan 2026-05-23 (§2.7 in ``plan.md``) localized ~50us of
+        the per-call Pallas dispatch overhead to torch_tpu's
+        ``JaxCallable.__call__``, of which the f-string built by
+        ``_get_kernel_invocation_key`` (per-arg shape / dtype walk) is a
+        measurable slice on every call.  For ``static_shapes=True``
+        kernels the invocation key is constant across calls, so Helion
+        installs a ``JaxCallable`` subclass that caches the first
+        call's ``(arg_shape_dtype_signature, kernel_key, output_shapes,
+        out_tree, input_output_aliases_items)`` and on subsequent calls
+        with a matching signature short-circuits to a direct
+        ``tpu_torch_pallas.call_custom_kernel`` invocation, bumping
+        ``helion.runtime._JAXCALLABLE_KEY_CACHE_HITS`` once per cache
+        hit.
+
+        The test asserts the counter increments exactly ``n_repeats``
+        times across ``1 + n_repeats`` consecutive calls of the same
+        compiled callable: the first call seeds the JaxCallable's
+        internal ``output_shapes`` cache and the subclass's
+        ``_helion_key_cache``; calls 2..N reuse them.
+        """
+        from helion import runtime as helion_runtime
+
+        # Define the kernel inside the test so the inner Helion-emitted
+        # function (and its ``_pallas_pipeline_cache``) is unique to
+        # this test run -- no cross-test pollution from other tests
+        # that bind ``pallas_matmul_bf16``.  The launcher cache lives on
+        # the *inner* generated function, not on the user-facing
+        # decorator object, so clearing attributes off the module-level
+        # ``pallas_matmul_bf16`` wouldn't help.
+
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def _matmul_jaxcallable_pin(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty(
+                [m, n],
+                device=x.device,
+                dtype=torch.promote_types(x.dtype, y.dtype),
+            )
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = acc
+            return out
+
+        torch.manual_seed(0)
+        x = torch.randn(256, 256, device=DEVICE, dtype=torch.bfloat16)
+        torch.manual_seed(1)
+        y = torch.randn(256, 256, device=DEVICE, dtype=torch.bfloat16)
+
+        bound = _matmul_jaxcallable_pin.bind((x, y))
+        config = bound.config_spec.default_config()
+        compiled_fn = bound.compile_config(config)
+
+        helion_runtime._reset_jaxcallable_key_cache_hits()
+        self.assertEqual(helion_runtime._jaxcallable_key_cache_hits(), 0)
+
+        # First call seeds the JaxCallable cache (slow path / no counter bump).
+        result = compiled_fn(x, y)
+        expected = (x.float() @ y.float()).to(torch.bfloat16)
+        torch.testing.assert_close(result, expected, rtol=1e-2, atol=1e-2)
+        self.assertEqual(
+            helion_runtime._jaxcallable_key_cache_hits(),
+            0,
+            "First call must miss the cached invocation key (no counter bump).",
+        )
+
+        # Subsequent calls share the same arg shape / dtype signature
+        # so the subclass's fast-path short-circuit fires every time.
+        n_repeats = 4
+        for _ in range(n_repeats):
+            result = compiled_fn(x, y)
+            torch.testing.assert_close(result, expected, rtol=1e-2, atol=1e-2)
+
+        self.assertEqual(
+            helion_runtime._jaxcallable_key_cache_hits(),
+            n_repeats,
+            f"Repeat calls on a cached static-shape kernel must each "
+            f"reuse the cached JaxCallable invocation key. Expected "
+            f"{n_repeats} hits; got "
+            f"{helion_runtime._jaxcallable_key_cache_hits()}.",
+        )
+
     def test_bmm(self) -> None:
         """Test BMM with default config — exercises size_matches fix.
 
