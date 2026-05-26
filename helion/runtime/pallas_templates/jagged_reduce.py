@@ -86,15 +86,19 @@ def jagged_sum_pallas(
 
     # ------------------------------------------------------------------ #
     # BlockSpecs: dynamic per-program slab of x_data, single row of out. #
+    #                                                                    #
+    # PrefetchScalarGridSpec convention (cf. JAX tests/pallas/            #
+    # tpu_pallas_test.py:test_trivial_scalar_prefetch):                   #
+    #   - index_map signature: (grid_indices..., scalar_refs...)         #
+    #   - kernel body signature: (scalar_refs..., in_refs..., out_refs)  #
     # ------------------------------------------------------------------ #
-    def x_index_map(x_offsets_ref, b_id):
+    def x_index_map(b_id, x_offsets_ref):
         # SPU scalar reads from SMEM, fed into pl.ds for the DMA.
         start = x_offsets_ref[b_id]
         end = x_offsets_ref[b_id + 1]
         return (pl.ds(start, end - start), 0)
 
-    def out_index_map(x_offsets_ref, b_id):
-        del x_offsets_ref  # unused; index_map signature must accept all prefetches
+    def out_index_map(b_id, x_offsets_ref):  # noqa: ARG001 — sig must match
         return (b_id, 0)
 
     x_spec = pl.BlockSpec(
