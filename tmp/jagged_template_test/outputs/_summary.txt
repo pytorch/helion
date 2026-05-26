@@ -1,42 +1,32 @@
-=== summary (rc=2) ===
+=== summary (rc=0) ===
 === size 'html_example' params={'B': 4, 'M_actual': 8, 'seq_lengths': [3, 7, 5, 9]} block_L=32
-PASS
 SUMMARY size='html_example' block_L=32 rc=0
 === size 'html_example' params={'B': 4, 'M_actual': 8, 'seq_lengths': [3, 7, 5, 9]} block_L=128
-PASS
 SUMMARY size='html_example' block_L=128 rc=0
 === size 'tiny' params={'B': 4, 'M_actual': 128, 'max_seq': 16} block_L=32
-PASS
 SUMMARY size='tiny' block_L=32 rc=0
 === size 'tiny' params={'B': 4, 'M_actual': 128, 'max_seq': 16} block_L=128
-PASS
 SUMMARY size='tiny' block_L=128 rc=0
 === size 'small' params={'B': 8, 'M_actual': 128, 'max_seq': 64} block_L=32
-PASS
 SUMMARY size='small' block_L=32 rc=0
 === size 'small' params={'B': 8, 'M_actual': 128, 'max_seq': 64} block_L=128
-PASS
 SUMMARY size='small' block_L=128 rc=0
 === size 'medium' params={'B': 32, 'M_actual': 128, 'max_seq': 512} block_L=32
-PASS
 SUMMARY size='medium' block_L=32 rc=0
 === size 'medium' params={'B': 32, 'M_actual': 128, 'max_seq': 512} block_L=128
-PASS
 SUMMARY size='medium' block_L=128 rc=0
 === size 'large' params={'B': 128, 'M_actual': 128, 'max_seq': 2048} block_L=32
-CORRECTNESS FAILED (max diff 1.754761e-04 > 1e-4)
-SUMMARY size='large' block_L=32 rc=2
+SUMMARY size='large' block_L=32 rc=0
 === size 'large' params={'B': 128, 'M_actual': 128, 'max_seq': 2048} block_L=128
-CORRECTNESS FAILED (max diff 1.754761e-04 > 1e-4)
-SUMMARY size='large' block_L=128 rc=2
+SUMMARY size='large' block_L=128 rc=0
 
 === last 30 lines of test.log ===
 offsets=[0, 173, 221, 339, 532, 856, 1108, 1304, 1664, 1674, 1886, 2164, 2407, 2700, 2788, 2859, 3332, 3421, 3818, 4133, 4327, 4814, 4854, 4942, 5117, 5206, 5544, 5710, 5736, 6070, 6143, 6409, 6814]  L=6814
 seq_lengths=[173, 48, 118, 193, 324, 252, 196, 360, 10, 212, 278, 243, 293, 88, 71, 473, 89, 397, 315, 194, 487, 40, 88, 175, 89, 338, 166, 26, 334, 73, 266, 405]
 M_actual=128 M_padded=128
 out.shape=(32, 128) dtype=float32
-max|out - ref| = 3.814697e-05
-PASS
+max|out - ref(fp64)| = 7.629395e-06
+PASS (rtol=0.001 atol=0.001)
 SUMMARY size='medium' block_L=128 rc=0
 ==============================================================================
 === size 'large' params={'B': 128, 'M_actual': 128, 'max_seq': 2048} block_L=32
@@ -46,9 +36,9 @@ offsets=[0, 685, 1245, 2899, 4116, 4952, 5716, 7448, 8832, 9866, 11614, 11892, 1
 seq_lengths=[685, 560, 1654, 1217, 836, 764, 1732, 1384, 1034, 1748, 278, 1779, 1829, 600, 1095, 1497, 601, 1421, 315, 706, 1511, 552, 88, 175, 1625, 850, 1702, 538, 846, 73, 778, 1941, 116, 977, 756, 1734, 2047, 1872, 1456, 449, 851, 100, 2009, 1202, 756, 798, 660, 1172, 911, 424, 1313, 1986, 1290, 698, 640, 545, 544, 715, 245, 152, 676, 511, 1484, 883, 1208, 29, 803, 129, 129, 1957, 1078, 1926, 1575, 1513, 757, 274, 336, 389, 1642, 1067, 1467, 544, 889, 258, 1346, 2024, 1962, 58, 292, 1895, 1144, 780, 431, 1107, 92, 1921, 399, 612, 1590, 909, 634, 1963, 85, 204, 325, 775, 965, 1072, 640, 2037, 1156, 973, 869, 1205, 2025, 1871, 1168, 1685, 1252, 955, 792, 720, 910, 374, 1878, 561, 1330, 1606]
 M_actual=128 M_padded=128
 out.shape=(128, 128) dtype=float32
-max|out - ref| = 1.754761e-04
-CORRECTNESS FAILED (max diff 1.754761e-04 > 1e-4)
-SUMMARY size='large' block_L=32 rc=2
+max|out - ref(fp64)| = 4.577637e-05
+PASS (rtol=0.001 atol=0.001)
+SUMMARY size='large' block_L=32 rc=0
 ==============================================================================
 === size 'large' params={'B': 128, 'M_actual': 128, 'max_seq': 2048} block_L=128
 ==============================================================================
@@ -57,7 +47,7 @@ offsets=[0, 685, 1245, 2899, 4116, 4952, 5716, 7448, 8832, 9866, 11614, 11892, 1
 seq_lengths=[685, 560, 1654, 1217, 836, 764, 1732, 1384, 1034, 1748, 278, 1779, 1829, 600, 1095, 1497, 601, 1421, 315, 706, 1511, 552, 88, 175, 1625, 850, 1702, 538, 846, 73, 778, 1941, 116, 977, 756, 1734, 2047, 1872, 1456, 449, 851, 100, 2009, 1202, 756, 798, 660, 1172, 911, 424, 1313, 1986, 1290, 698, 640, 545, 544, 715, 245, 152, 676, 511, 1484, 883, 1208, 29, 803, 129, 129, 1957, 1078, 1926, 1575, 1513, 757, 274, 336, 389, 1642, 1067, 1467, 544, 889, 258, 1346, 2024, 1962, 58, 292, 1895, 1144, 780, 431, 1107, 92, 1921, 399, 612, 1590, 909, 634, 1963, 85, 204, 325, 775, 965, 1072, 640, 2037, 1156, 973, 869, 1205, 2025, 1871, 1168, 1685, 1252, 955, 792, 720, 910, 374, 1878, 561, 1330, 1606]
 M_actual=128 M_padded=128
 out.shape=(128, 128) dtype=float32
-max|out - ref| = 1.754761e-04
-CORRECTNESS FAILED (max diff 1.754761e-04 > 1e-4)
-SUMMARY size='large' block_L=128 rc=2
------ END (exit=2) -----
+max|out - ref(fp64)| = 3.051758e-05
+PASS (rtol=0.001 atol=0.001)
+SUMMARY size='large' block_L=128 rc=0
+----- END (exit=0) -----
