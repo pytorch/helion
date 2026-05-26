@@ -76,6 +76,31 @@ def softmax_two_pass_kernel(x: torch.Tensor) -> torch.Tensor:
     return out
 
 
+@pytest.fixture(autouse=True)
+def _disable_online_to_3pass(request):
+    """The 2-loop softmax perf tests in this file pin codegen details of
+    the ORIGINAL online-merge form.  P21's online->3-pass AST rewrite
+    rewrites the kernel into a 3-loop form before tracing, which by
+    design changes the codegen those tests inspect.  This autouse
+    fixture sets ``HELION_DISABLE_ONLINE_TO_3PASS=1`` for every test in
+    the file EXCEPT those in ``TestCuteOnlineTo3PassRewrite`` (the
+    rewrite-specific tests at the bottom of this file).
+    """
+    cls = request.cls
+    if cls is not None and cls.__name__ == "TestCuteOnlineTo3PassRewrite":
+        yield
+        return
+    old = os.environ.get("HELION_DISABLE_ONLINE_TO_3PASS")
+    os.environ["HELION_DISABLE_ONLINE_TO_3PASS"] = "1"
+    try:
+        yield
+    finally:
+        if old is None:
+            os.environ.pop("HELION_DISABLE_ONLINE_TO_3PASS", None)
+        else:
+            os.environ["HELION_DISABLE_ONLINE_TO_3PASS"] = old
+
+
 @onlyBackends(["cute"])
 class TestCuteSoftmaxVecHoist(TestCase):
     """P1: tile-loop vec hoist for masked reductions."""
@@ -1231,3 +1256,182 @@ class TestCuteMultiRowInvestigation(TestCase):
         # which fires the fuser.  Document the trip-1 case here so the
         # fuser path stays explicit.
         self.assertEqual(code.count("cute.arch.load("), 2)
+
+
+# A second, separately-decorated kernel so the P21 tests below can
+# trigger the rewrite without inheriting the autouse fixture that
+# disables it for the rest of this file.
+@helion.kernel(backend="cute")
+def softmax_two_pass_kernel_for_3pass(x: torch.Tensor) -> torch.Tensor:
+    m, n = x.size()
+    out = torch.empty_like(x)
+    block_size_m = hl.register_block_size(m)
+    block_size_n = hl.register_block_size(n)
+    for tile_m in hl.tile(m, block_size=block_size_m):
+        mi = hl.full([tile_m], float("-inf"), dtype=torch.float32)
+        di = hl.zeros([tile_m], dtype=torch.float32)
+        for tile_n in hl.tile(n, block_size=block_size_n):
+            values = x[tile_m, tile_n]
+            local_amax = torch.amax(values, dim=1)
+            mi_next = torch.maximum(mi, local_amax)
+            di = di * torch.exp(mi - mi_next) + torch.exp(
+                values - mi_next[:, None]
+            ).sum(dim=1)
+            mi = mi_next
+        for tile_n in hl.tile(n, block_size=block_size_n):
+            values = x[tile_m, tile_n]
+            out[tile_m, tile_n] = torch.exp(values - mi[:, None]) / di[:, None]
+    return out
+
+
+@onlyBackends(["cute"])
+class TestCuteOnlineTo3PassRewrite(TestCase):
+    """P21: rewrite the online two-pass softmax body into the 3-pass form.
+
+    The CuTe backend pre-processes the user's AST before tracing.  When
+    the body matches the canonical online softmax pattern AND the
+    reduction-axis extent is at or above the cutoff (default 2048), the
+    pass rewrites the body into THREE inner ``for tile_n`` loops:
+
+      1. max-only sweep
+      2. sum-only sweep
+      3. consume sweep (unchanged)
+
+    The 3-pass form's two reductions are independent (no rescale data
+    dependency between them) and compile to materially faster code on
+    CuTe for large-N softmax shapes.
+
+    Tests below pin:
+      * detection fires for the canonical pattern,
+      * shape gate skips small-N shapes where the rewrite regresses,
+      * correctness end-to-end after the rewrite,
+      * disable env-var skips the pass entirely.
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        self._env_to_restore: dict[str, str | None] = {}
+        # The Kernel decorator caches bound kernels by input signature
+        # (shape + dtype + stride).  Each test in this class flips env
+        # vars that change the compiler pipeline behavior, so we must
+        # invalidate the cache before every test or stale compilations
+        # leak across cases.
+        softmax_two_pass_kernel_for_3pass.reset()
+
+    def tearDown(self) -> None:
+        for name, prev in self._env_to_restore.items():
+            if prev is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = prev
+        softmax_two_pass_kernel_for_3pass.reset()
+        super().tearDown()
+
+    def _set_env(self, name: str, value: str | None) -> None:
+        if name not in self._env_to_restore:
+            self._env_to_restore[name] = os.environ.get(name)
+        if value is None:
+            os.environ.pop(name, None)
+        else:
+            os.environ[name] = value
+
+    def _generated_loop_count(self, code: str) -> int:
+        """Count the number of inner ``for tile_offset_3 in range(`` sites in
+        the generated CuTe source.  Each inner sweep yields one of these
+        loops, so this is the number of inner sweeps the rewrite emitted.
+        """
+        import re
+
+        return len(re.findall(r"for tile_offset_\d+ in range\(", code))
+
+    def test_rewrite_fires_on_canonical_pattern(self) -> None:
+        """For (4096, 12672) the rewrite MUST fire and the generated
+        kernel MUST have THREE inner ``for tile_offset`` loops (max,
+        sum, consume) instead of TWO.
+        """
+        x = torch.randn(4096, 12672, device=DEVICE, dtype=HALF_DTYPE)
+        code, out = code_and_output(
+            softmax_two_pass_kernel_for_3pass,
+            (x,),
+            block_sizes=[1, 128],
+            num_threads=[0, 32],
+            cute_vector_widths=[1, 4],
+        )
+        ref = torch.nn.functional.softmax(x, dim=1)
+        torch.testing.assert_close(out, ref, atol=1e-2, rtol=1e-2)
+        # 3 inner sweeps now (was 2 in the original online form).
+        self.assertEqual(self._generated_loop_count(code), 3)
+
+    def test_shape_gate_skips_small_n(self) -> None:
+        """For (4096, 256) the rewrite MUST be skipped by the
+        reduction-axis-extent gate (256 < default cutoff 2048), so the
+        generated kernel still has TWO inner sweeps (the original
+        online form).
+        """
+        x = torch.randn(4096, 256, device=DEVICE, dtype=HALF_DTYPE)
+        code, out = code_and_output(
+            softmax_two_pass_kernel_for_3pass,
+            (x,),
+            block_sizes=[1, 128],
+            num_threads=[0, 32],
+            cute_vector_widths=[1, 4],
+        )
+        ref = torch.nn.functional.softmax(x, dim=1)
+        torch.testing.assert_close(out, ref, atol=1e-2, rtol=1e-2)
+        self.assertEqual(self._generated_loop_count(code), 2)
+
+    def test_disable_env_skips_rewrite(self) -> None:
+        """``HELION_DISABLE_ONLINE_TO_3PASS=1`` MUST skip the pass even
+        when the shape and pattern would otherwise match — the kernel
+        falls back to the original 2-loop online form.
+        """
+        self._set_env("HELION_DISABLE_ONLINE_TO_3PASS", "1")
+        x = torch.randn(4096, 12672, device=DEVICE, dtype=HALF_DTYPE)
+        code, out = code_and_output(
+            softmax_two_pass_kernel_for_3pass,
+            (x,),
+            block_sizes=[1, 128],
+            num_threads=[0, 32],
+            cute_vector_widths=[1, 4],
+        )
+        ref = torch.nn.functional.softmax(x, dim=1)
+        torch.testing.assert_close(out, ref, atol=1e-2, rtol=1e-2)
+        self.assertEqual(self._generated_loop_count(code), 2)
+
+    def test_min_n_env_override(self) -> None:
+        """``HELION_ONLINE_TO_3PASS_MIN_N=0`` MUST always fire the rewrite
+        regardless of reduction-axis extent (useful for A/B sweeps).
+        Verify by running the (4096, 256) shape — which the default gate
+        would skip — and observe the 3-loop form.
+        """
+        self._set_env("HELION_ONLINE_TO_3PASS_MIN_N", "0")
+        x = torch.randn(4096, 256, device=DEVICE, dtype=HALF_DTYPE)
+        code, out = code_and_output(
+            softmax_two_pass_kernel_for_3pass,
+            (x,),
+            block_sizes=[1, 128],
+            num_threads=[0, 32],
+            cute_vector_widths=[1, 4],
+        )
+        ref = torch.nn.functional.softmax(x, dim=1)
+        torch.testing.assert_close(out, ref, atol=1e-2, rtol=1e-2)
+        self.assertEqual(self._generated_loop_count(code), 3)
+
+    def test_correctness_after_rewrite(self) -> None:
+        """Tight-tolerance correctness check on the canonical large-N
+        shape.  Guards against any silent numeric drift introduced by
+        the rewrite (the 3-pass and online forms have different
+        rounding paths in fp16 — the diff must stay inside softmax's
+        existing tolerance).
+        """
+        for N in (4096, 6400, 12672, 16384):
+            x = torch.randn(4096, N, device=DEVICE, dtype=HALF_DTYPE)
+            _, out = code_and_output(
+                softmax_two_pass_kernel_for_3pass,
+                (x,),
+                block_sizes=[1, 128],
+                num_threads=[0, 32],
+                cute_vector_widths=[1, 4],
+            )
+            ref = torch.nn.functional.softmax(x, dim=1)
+            torch.testing.assert_close(out, ref, atol=1e-2, rtol=1e-2)
