@@ -85,12 +85,21 @@ def jagged_sum_pallas(
         )
 
     # ------------------------------------------------------------------ #
-    # BlockSpecs: dynamic per-program slab of x_data, single row of out. #
+    # Specs.                                                             #
     #                                                                    #
     # PrefetchScalarGridSpec convention (cf. JAX tests/pallas/            #
     # tpu_pallas_test.py:test_trivial_scalar_prefetch):                   #
     #   - index_map signature: (grid_indices..., scalar_refs...)         #
-    #   - kernel body signature: (scalar_refs..., in_refs..., out_refs)  #
+    #   - kernel body signature: (scalar_refs..., in_refs..., out_refs,  #
+    #                             scratch_refs...)                       #
+    #                                                                    #
+    # Input: dynamic per-program slab via BlockSpec+BoundedSlice+ds.     #
+    # Output: kept in HBM (memory_space=pltpu.HBM). Mosaic enforces a     #
+    # block-shape alignment rule — last two dims divisible by 8 and 128, #
+    # or equal to the array dims — and a (1, M) per-program output block #
+    # violates the sublane rule. Same shape gmm.py uses at the top level: #
+    # output stays in HBM, the kernel does an explicit per-program DMA   #
+    # writeback via pltpu.make_async_copy from a VMEM staging buffer.    #
     # ------------------------------------------------------------------ #
     def x_index_map(b_id, x_offsets_ref):
         # SPU scalar reads from SMEM, fed into pl.ds for the DMA.
@@ -98,39 +107,44 @@ def jagged_sum_pallas(
         end = x_offsets_ref[b_id + 1]
         return (pl.ds(start, end - start), 0)
 
-    def out_index_map(b_id, x_offsets_ref):  # noqa: ARG001 — sig must match
-        return (b_id, 0)
-
     x_spec = pl.BlockSpec(
         (pl.BoundedSlice(k_sz), M),
         x_index_map,
     )
-    out_spec = pl.BlockSpec(
-        (1, M),
-        out_index_map,
-    )
+    out_spec = pl.BlockSpec(memory_space=pltpu.HBM)
+
+    scratch_shapes = [
+        pltpu.VMEM((1, M), o_dtype),     # output staging row
+        pltpu.SemaphoreType.DMA,         # out-write semaphore
+    ]
 
     # --------------------------------------------------- #
-    # Inner kernel: masked reduce over the live row slab. #
+    # Inner kernel: masked reduce + explicit DMA out.     #
     # --------------------------------------------------- #
-    def kernel(x_offsets_ref, x_ref, out_ref):
+    def kernel(x_offsets_ref, x_ref, out_ref, out_buf, out_sem):
         b_id = pl.program_id(0)
-        # Re-derive `actual` from SMEM. (Index_map computed the same thing,
-        # but its return value isn't surfaced inside the kernel.)
         start = x_offsets_ref[b_id]
         end = x_offsets_ref[b_id + 1]
         actual = end - start
 
         # The BoundedSlice block has static shape [k_sz, M]; only the first
         # `actual` rows are live (Mosaic rounds DMA up to a sublane boundary,
-        # so rows [actual, align_to(actual, 8)) may be live garbage from a
+        # so rows [actual, align_to(actual, 8)) may hold live garbage from a
         # prior DMA; rows [align_to(actual, 8), k_sz) are uninitialized).
         # Masking by `iota < actual` zero-fills both regions before sum.
         iota = lax.broadcasted_iota(jnp.int32, (k_sz, 1), 0)
         mask = iota < actual
         x = jnp.where(mask, x_ref[...], jnp.zeros_like(x_ref[...]))
         partial = x.sum(axis=0, dtype=jnp.float32).astype(o_dtype)
-        out_ref[0, :] = partial
+        out_buf[0, :] = partial
+
+        cp = pltpu.make_async_copy(
+            out_buf,
+            out_ref.at[pl.ds(b_id, 1), :],
+            out_sem,
+        )
+        cp.start()
+        cp.wait()
 
     return pl.pallas_call(
         kernel,
@@ -139,6 +153,7 @@ def jagged_sum_pallas(
             num_scalar_prefetch=1,
             in_specs=[x_spec],
             out_specs=out_spec,
+            scratch_shapes=scratch_shapes,
             grid=(num_b,),
         ),
         compiler_params=pltpu.CompilerParams(
