@@ -1,0 +1,167 @@
++ HELION_BACKEND=pallas
++ HELION_PRINT_OUTPUT_CODE=1
++ HELION_LOGS=+pallas
++ python /home/ymu_google_com/helion/tmp/jagged_sum_pallas_experiment/variants/v2_2d_index.py
+----- BEGIN VARIANT v2_2d_index -----
+WARNING: All log messages before absl::InitializeLog() is called are written to STDERR
+I0000 00:00:1779828535.519199 1853723 pjrt_api.cc:96] PJRT_Api is set for device type cpu
+I0000 00:00:1779828535.543497 1853723 pjrt_api.cc:118] GetPjrtApi was found for TPU at /home/ymu_google_com/miniconda3/envs/tpu/lib/python3.12/site-packages/libtpu/libtpu.so
+I0000 00:00:1779828535.543527 1853723 pjrt_api.cc:96] PJRT_Api is set for device type tpu
+I0000 00:00:1779828535.565533 1853723 device_rt.cc:97] PjRt runtime initialization deferred for tpu
+Successfully renamed PrivateUse1 backend to 'tpu'. Device: device(type='tpu')
+Registered Python module for 'tpu'.
+Device type: tpu, Device index: default
+Initializing TPU distributed runtime
+==============================================================================
+=== V2 — 2D-index form: x_data[base, :] inside hl.jagged_tile
+==============================================================================
+I0000 00:00:1779828536.580808 1853723 pjrt_api.cc:167] The PJRT plugin has PJRT API version 0.108. The framework PJRT API version is 0.104.
+I0000 00:00:1779828538.879747 1853723 pjrt_c_api_client.cc:197] PjRtCApiClient created.
+W0000 00:00:1779828538.879786 1853723 pjrt_state.cc:230] Only using 1 device out of all the 8 addressable devices.
+I0000 00:00:1779828538.913688 1854508 tier2_compilation_cache.cc:149] Tier-2 compilation cache is disabled for world size 1.
+I0000 00:00:1779828538.913712 1854508 tier3_compilation_cache.cc:65] Backup compilation for tier-3 cache read is disabled as tier-3 cache is disabled.
+INPUT  x_data.shape=(256, 128) dtype=torch.float32 device=tpu:0
+INPUT  x_offsets.shape=(9,) dtype=torch.int64 value=[0, 45, 93, 147, 148, 152, 212, 216, 256]
+INPUT  per-batch nnz = [45, 48, 54, 1, 4, 60, 4, 40]
+/home/ymu_google_com/helion/helion/_compiler/compile_environment.py:238: UserWarning: The 'pallas' backend is experimental and may have limited functionality.
+  warn_once(
+Using default config: @helion.kernel(config=helion.Config(block_sizes=[8, 32], pallas_loop_type='fori_loop', pallas_pre_broadcast=False), static_shapes=True)
+# Output code written to: /tmp/torchinductor_ymu_google_com/po/cpo5n74vbx5xlyeav5ovdmcxjjajhepsldnyxhq3mco5zxspl6xq.py
+from __future__ import annotations
+
+import torch
+import jax
+import jax.numpy as jnp
+from jax.experimental import pallas as pl
+import jax.lax as lax
+from jax.experimental.pallas import tpu as pltpu
+from helion.runtime import default_pallas_fori_launcher as _default_pallas_fori_launcher
+
+_BLOCK_SIZE_0 = int(8)
+_BLOCK_SIZE_1 = int(32)
+
+def _helion_jagged_sum_2d_index(x_offsets, x_data, out, scratch_2, x_data_buf, x_data_sem):
+    # src[v2_2d_index.py:36]: for tile_b in hl.tile(num_rows):
+    pid_0 = pl.program_id(0)
+    offset_0 = pid_0 * _BLOCK_SIZE_0
+    indices_0 = offset_0 + jnp.arange(0, _BLOCK_SIZE_0, dtype=jnp.int32)
+    # src[v2_2d_index.py:37]: starts = x_offsets[tile_b]
+    starts = x_offsets[pl.ds(offset_0, _BLOCK_SIZE_0)]
+    starts = tl.cast(starts, tl.int64)
+    tl.static_assert(starts.dtype == tl.int64)
+    # src[v2_2d_index.py:38]: ends = x_offsets[tile_b.index + 1]
+    v_0 = jnp.array(1, dtype=jnp.int32)
+    v_1 = indices_0 + v_0
+    ends = x_offsets[pl.ds(offset_0 + 1, _BLOCK_SIZE_0)]
+    ends = tl.cast(ends, tl.int64)
+    tl.static_assert(ends.dtype == tl.int64)
+    # src[v2_2d_index.py:39]: nnz = ends - starts
+    v_2 = ends - starts
+    # src[v2_2d_index.py:41]: row_sums = hl.zeros([tile_b, M], dtype=x_data.dtype)
+    row_sums = jnp.full([_BLOCK_SIZE_0, 128], 0.0, jnp.float32)
+    row_sums = tl.cast(row_sums, tl.float32)
+    tl.static_assert(row_sums.dtype == tl.float32)
+    # src[v2_2d_index.py:42]: for tile_k in hl.jagged_tile(nnz):
+    # src[v2_2d_index.py:43]:     base = starts[:, None] + tile_k.index[None, :]  # [tile_b, tile_k]
+    # src[v2_2d_index.py:44]:     # 2D index over axis 0, full slice over axis 1.
+    # src[v2_2d_index.py:42-46]: ...
+    view = jnp.reshape(v_2, [_BLOCK_SIZE_0])
+    amax = lax.convert_element_type(jnp.max(view, axis=0), jnp.int64)
+    amax = tl.cast(amax, tl.int64)
+    tl.static_assert(amax.dtype == tl.int64)
+    scratch_2[...] = row_sums[...]
+
+    def _fori_body_0(_j, _):
+        nonlocal scratch_2, x_data_buf
+        offset_1 = 0 + _j * _BLOCK_SIZE_1
+        indices_1 = offset_1 + jnp.arange(0, _BLOCK_SIZE_1, dtype=jnp.int32)
+        offset_3 = _j * _BLOCK_SIZE_1 + jnp.arange(_BLOCK_SIZE_1)
+        _copy = pltpu.make_async_copy(x_data, x_data_buf, x_data_sem)
+        _copy.start()
+        _copy.wait()
+        starts_copy = starts
+        v_3 = scratch_2[...]
+        starts_copy_0 = starts_copy
+        v_3_0 = v_3
+        # src[v2_2d_index.py:43]: base = starts[:, None] + tile_k.index[None, :]  # [tile_b, tile_k]
+        subscript = starts_copy_0[:, None]
+        subscript = tl.cast(subscript, tl.int64)
+        tl.static_assert(subscript.dtype == tl.int64)
+        subscript_1 = indices_1[None, :]
+        subscript_1 = tl.cast(subscript_1, tl.int32)
+        tl.static_assert(subscript_1.dtype == tl.int32)
+        v_4 = lax.convert_element_type(subscript_1, jnp.int64)
+        v_5 = subscript + v_4
+        # src[v2_2d_index.py:45]: x_slice = x_data[base, :]  # expected shape [tile_b, tile_k, M]
+        x_slice = jax.lax.dot_general(jax.nn.one_hot(v_5[...], x_data_buf.shape[0], dtype=jnp.float32), x_data_buf[...].astype(jnp.float32), (((jnp.ndim(v_5[...]),), (0,)), ((), ())), preferred_element_type=jnp.float32, precision=jax.lax.Precision.HIGHEST).astype(jnp.float32)
+        x_slice = tl.cast(x_slice, tl.float32)
+        tl.static_assert(x_slice.dtype == tl.float32)
+        # src[v2_2d_index.py:46]: row_sums = row_sums + x_slice.sum(dim=1)
+        sum_1 = lax.convert_element_type(jnp.sum(x_slice, axis=1), jnp.float32)
+        sum_1 = tl.cast(sum_1, tl.float32)
+        tl.static_assert(sum_1.dtype == tl.float32)
+        v_6 = v_3_0 + sum_1
+        # src[v2_2d_index.py:42]: for tile_k in hl.jagged_tile(nnz):
+        # src[v2_2d_index.py:43]:     base = starts[:, None] + tile_k.index[None, :]  # [tile_b, tile_k]
+        # src[v2_2d_index.py:44]:     # 2D index over axis 0, full slice over axis 1.
+        # src[v2_2d_index.py:42-46]: ...
+        scratch_2[...] = v_6[...]
+    jax.lax.fori_loop(0, (amax - 0 + _BLOCK_SIZE_1 - 1) // _BLOCK_SIZE_1, _fori_body_0, None)
+    row_sums = scratch_2[...]
+    # src[v2_2d_index.py:48]: out[tile_b, :] = row_sums
+    out[:, :] = row_sums
+
+def jagged_sum_2d_index(x_data: torch.Tensor, x_offsets: torch.Tensor, *, _launcher=_default_pallas_fori_launcher):
+    # src[v2_2d_index.py:30]: M = x_data.shape[1]
+    M = x_data.shape[1]
+    # src[v2_2d_index.py:31]: num_rows = x_offsets.size(0) - 1
+    num_rows = x_offsets.size(0) - 1
+    # src[v2_2d_index.py:32]: out = torch.zeros(
+    # src[v2_2d_index.py:33]:     [num_rows, M], dtype=x_data.dtype, device=x_data.device
+    # src[v2_2d_index.py:34]: )
+    out = torch.zeros([num_rows, M], dtype=x_data.dtype, device=x_data.device)
+    # src[v2_2d_index.py:36]: for tile_b in hl.tile(num_rows):
+    _BLOCK_SIZE_0 = 8
+    # src[v2_2d_index.py:36]: for tile_b in hl.tile(num_rows):
+    # src[v2_2d_index.py:37]:     starts = x_offsets[tile_b]
+    # src[v2_2d_index.py:38]:     ends = x_offsets[tile_b.index + 1]
+    # src[v2_2d_index.py:36-48]: ...
+    _launcher(_helion_jagged_sum_2d_index, ((8 + _BLOCK_SIZE_0 - 1) // _BLOCK_SIZE_0,), x_offsets, x_data, out, _output_indices=[2], _inplace_indices=[2], _block_spec_info=[((None,), (None,)), ((None, None), (None, None)), ((8, None), (None, None))], _ds_pad_dims=[(0, 0, 8, 0)], _scratch_shapes=[((8, 128), 'jnp.float32', 'vmem'), ((256, 128), 'jnp.float32', 'vmem'), ((), None, 'dma_semaphore')], _pipeline_arg_indices=[1])
+    # src[v2_2d_index.py:49]: return out
+    return out
+
+def call():
+    from torch._dynamo.testing import rand_strided
+    # src[v2_2d_index.py:26]: def jagged_sum_2d_index(
+    # src[v2_2d_index.py:27]:     x_data: torch.Tensor,
+    # src[v2_2d_index.py:28]:     x_offsets: torch.Tensor,
+    # src[v2_2d_index.py:26-49]: ...
+    x_data = rand_strided(size=(256, 128), stride=(128, 1), dtype=torch.float32, device='tpu:0')
+    x_offsets = rand_strided(size=(9,), stride=(1,), dtype=torch.int64, device='tpu:0')
+    jagged_sum_2d_index(x_data, x_offsets)
+if __name__ == '__main__':
+    call()
+COMPILE/RUN FAILED — full traceback:
+Traceback (most recent call last):
+  File "/home/ymu_google_com/helion/tmp/jagged_sum_pallas_experiment/variants/v2_2d_index.py", line 58, in main
+    out = jagged_sum_2d_index(x_data, x_offsets)
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/ymu_google_com/helion/helion/runtime/kernel.py", line 415, in __call__
+    return self.bind(args)(*args)
+           ^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/ymu_google_com/helion/helion/runtime/kernel.py", line 1188, in __call__
+    return self._run(*args)
+           ^^^^^^^^^^^^^^^^
+  File "/tmp/torchinductor_ymu_google_com/po/cpo5n74vbx5xlyeav5ovdmcxjjajhepsldnyxhq3mco5zxspl6xq.py", line 100, in jagged_sum_2d_index
+    _launcher(_helion_jagged_sum_2d_index, ((8 + _BLOCK_SIZE_0 - 1) // _BLOCK_SIZE_0,), x_offsets, x_data, out, _output_indices=[2], _inplace_indices=[2], _block_spec_info=[((None,), (None,)), ((None, None), (None, None)), ((8, None), (None, None))], _ds_pad_dims=[(0, 0, 8, 0)], _scratch_shapes=[((8, 128), 'jnp.float32', 'vmem'), ((256, 128), 'jnp.float32', 'vmem'), ((), None, 'dma_semaphore')], _pipeline_arg_indices=[1])
+  File "/home/ymu_google_com/helion/helion/runtime/__init__.py", line 1259, in default_pallas_fori_launcher
+    _pallas_check_dtypes(args)
+  File "/home/ymu_google_com/helion/helion/runtime/__init__.py", line 519, in _pallas_check_dtypes
+    raise TypeError(
+TypeError: Pallas/TPU does not support torch.int64 tensors. Cast to a 32-bit type before calling the kernel.
+I0000 00:00:1779828540.880815 1853723 compilation_cache.cc:354] Compilation cache evicted.
+I0000 00:00:1779828540.880835 1853723 compilation_cache.cc:219] CompilationCache final stats: num_cache_reqs=44
+num_cache_hits=29 {65.9%}
+peak_compilation_memory_bytes=unknown
+
+----- END VARIANT v2_2d_index (exit=1) -----

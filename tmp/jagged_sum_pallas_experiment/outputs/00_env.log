@@ -1,0 +1,35 @@
+=== uname -a ===
+Linux t1v-n-7822eeda-w-0 6.17.0-1009-gcp #9~24.04.3-Ubuntu SMP Sat Mar  7 00:58:37 UTC 2026 x86_64 x86_64 x86_64 GNU/Linux
+
+=== which python ===
+/home/ymu_google_com/miniconda3/envs/tpu/bin/python
+
+=== python --version ===
+Python 3.12.12
+
+=== pip versions ===
+Name: torch
+Version: 2.13.0a0+gitae174ae
+Summary: Tensors and Dynamic neural networks in Python with strong GPU acceleration
+Name: jax
+Version: 0.9.2
+Summary: Differentiate, compile, and transform Numpy code.
+Name: jaxlib
+Version: 0.9.2
+Summary: XLA library for JAX
+WARNING: Package(s) not found: helion
+
+=== TPU / XLA env ===
+
+=== sanity: import jax + pallas ===
+jax 0.9.2
+jax devices: [TpuDevice(id=0, process_index=0, coords=(0,0,0), core_on_chip=0), TpuDevice(id=1, process_index=0, coords=(0,0,0), core_on_chip=1), TpuDevice(id=2, process_index=0, coords=(1,0,0), core_on_chip=0), TpuDevice(id=3, process_index=0, coords=(1,0,0), core_on_chip=1), TpuDevice(id=4, process_index=0, coords=(0,1,0), core_on_chip=0), TpuDevice(id=5, process_index=0, coords=(0,1,0), core_on_chip=1), TpuDevice(id=6, process_index=0, coords=(1,1,0), core_on_chip=0), TpuDevice(id=7, process_index=0, coords=(1,1,0), core_on_chip=1)]
+pallas import: OK
+pallas.tpu import: OK
+has BoundedSlice: True
+has ds: True
+
+=== sanity: import helion ===
+Traceback (most recent call last):
+  File "<string>", line 4, in <module>
+ModuleNotFoundError: No module named 'helion'

@@ -1,0 +1,5 @@
+=== summary ===
+v1_gather               | COMPILE/RUN FAILED — full traceback:
+v2_2d_index             | COMPILE/RUN FAILED — full traceback:
+v3_slab_grid            | COMPILE/RUN FAILED — full traceback:
+v4_grid_jagged_tile     | COMPILE/RUN FAILED — full traceback:
