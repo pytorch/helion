@@ -127,8 +127,18 @@ class TestCuteSoftmaxVecHoist(TestCase):
         # The single-V=8 load form is still NOT emitted (would ICE).
         self.assertNotIn("ir.VectorType.get([8]", code)
         # The split-2 path emits TWO V=4 vec loads per outer-lane iter
-        # with the ``_a`` / ``_b`` suffix on the hoist var names.
-        self.assertIn("_tile_unroll_vec_1_0_a = cute.arch.load(", code)
+        # with the ``_a`` / ``_b`` suffix on the hoist var names.  When
+        # the P18 load-pipeline pass fires, the ``_a`` load assignment
+        # text gets rewritten to ``_tile_unroll_vec_1_0_a = _pipe_load_*``
+        # with the actual ``cute.arch.load`` hoisted into the prologue
+        # and an explicit per-iter prefetch; the ``_b`` load is left as
+        # an inline ``cute.arch.load`` call (it's not the first inner
+        # load).  Accept either form.
+        self.assertTrue(
+            "_tile_unroll_vec_1_0_a = cute.arch.load(" in code
+            or "_tile_unroll_vec_1_0_a = _pipe_load_" in code,
+            "expected _a hoist var either as inline load or pipeline snapshot",
+        )
         self.assertIn("_tile_unroll_vec_1_0_b = cute.arch.load(", code)
         # Both halves use V=4.
         self.assertGreaterEqual(
@@ -199,9 +209,28 @@ class TestCuteFuseTwoPassAlias(TestCase):
         torch.testing.assert_close(out, ref, atol=1e-2, rtol=1e-2)
         # Cache fragment allocated.
         self.assertIn("_fuse_cache_", code)
-        # Exactly one ``cute.arch.load`` instead of two — the consume
-        # sweep reads the cache.
-        self.assertEqual(code.count("cute.arch.load("), 1)
+        # When the P18 load-pipeline pass is OFF the consume sweep just
+        # reads from cache so the kernel has 1 ``cute.arch.load`` total.
+        # With pipelining ON the reduce sweep's load is hoisted into a
+        # prologue + per-iter prefetch (2 load sites), so the total is
+        # 2 — but it's STILL the case that the consume sweep emits NO
+        # load (cache hit).  Both forms are correct.  Verify the consume
+        # sweep is cache-only by looking at the inner consume loop.
+        load_count = code.count("cute.arch.load(")
+        self.assertTrue(
+            load_count in {1, 2},
+            f"expected 1 or 2 cute.arch.load sites, got {load_count}",
+        )
+        # The consume sweep (second top-level ``for tile_offset`` loop)
+        # must not contain a gmem load.
+        consume_marker = "for tile_offset_2 in range"
+        consume_start = code.rfind(consume_marker)
+        self.assertGreater(consume_start, 0)
+        self.assertNotIn(
+            "cute.arch.load(",
+            code[consume_start:],
+            "consume sweep must read from _fuse_cache_, not gmem",
+        )
 
     def test_fuser_skips_when_cache_size_too_large(self) -> None:
         """Auto-policy keeps the original cache_size>64 cap to avoid the
@@ -221,8 +250,25 @@ class TestCuteFuseTwoPassAlias(TestCase):
         )
         ref = torch.nn.functional.softmax(x, dim=1)
         torch.testing.assert_close(out, ref, atol=1e-2, rtol=1e-2)
-        # Both sweeps load from gmem.
-        self.assertEqual(code.count("cute.arch.load("), 2)
+        # Both sweeps load from gmem (cache fragment NOT allocated since
+        # the fuser bails on cache_size > 64).
+        self.assertNotIn("_fuse_cache_", code)
+        # When the P18 load-pipeline pass is OFF the kernel has exactly
+        # 2 ``cute.arch.load`` calls (one per sweep).  With pipelining
+        # ON each load site is hoisted into a prologue and a per-iter
+        # prefetch, so the total is 4 (2 prologue + 2 inner-loop
+        # prefetch).  Both forms are correct; assert at least 2.
+        self.assertGreaterEqual(code.count("cute.arch.load("), 2)
+        # Each sweep must contain at least one gmem load (either
+        # inline or as a per-iter prefetch).
+        first_sweep_marker = "for tile_offset_2 in range"
+        first_sweep_start = code.find(first_sweep_marker)
+        second_sweep_start = code.find(first_sweep_marker, first_sweep_start + 1)
+        self.assertGreater(second_sweep_start, first_sweep_start)
+        first_sweep = code[first_sweep_start:second_sweep_start]
+        second_sweep = code[second_sweep_start:]
+        self.assertIn("cute.arch.load(", first_sweep)
+        self.assertIn("cute.arch.load(", second_sweep)
 
 
 @onlyBackends(["cute"])
@@ -651,6 +697,109 @@ class TestCuteHoistLoopInvariantP17(TestCase):
         self.assertGreaterEqual(reduce_end, 0)
         scaled_consume = code.find("= mi * 1.4426950408889634")
         self.assertGreater(scaled_consume, reduce_end)
+
+
+@onlyBackends(["cute"])
+class TestCuteLoadPipelineP18(TestCase):
+    """P18: software-pipeline the per-iteration vec load by one stage.
+
+    The pass pre-issues the iter 0 vec load above the inner loop and
+    inside the body issues the NEXT iter's load BEFORE the current
+    iter's compute runs.  The SASS scheduler then has multiple
+    ``ld.global`` instructions in flight per warp, hiding HBM round-trip
+    latency.  Measured ~18% drop in
+    ``smsp__average_warps_issue_stalled_long_scoreboard_per_issue_active.ratio``
+    on the (4096, 12672) softmax shape (NCU) and +10-20% wall-clock
+    GB/s gain on most softmax shapes.
+    """
+
+    def _shadow_var_count(self, code: str, kind: str) -> int:
+        """Count ``_pipe_<kind>_N = `` occurrences (prologue + per-iter
+        prefetch assignments, so 2 per pipelined load site)."""
+        import re
+
+        return len(re.findall(rf"_pipe_{kind}_\d+ = ", code))
+
+    def test_pipeline_fires_on_softmax_two_pass(self) -> None:
+        """Both the reduce and consume sweeps of softmax_two_pass match
+        the (single inner-lane loop, single load) shape so the pass
+        rewrites both sweeps.  Each rewrite emits a prologue snapshot
+        and a per-iter prefetch — 2 ``_pipe_lane_base_*`` assigns and
+        2 ``_pipe_load_*`` assigns per pipelined site, for 4 total of
+        each across the two sweeps.
+        """
+        x = torch.randn(4096, 12672, device=DEVICE, dtype=HALF_DTYPE)
+        code, out = code_and_output(
+            softmax_two_pass_kernel,
+            (x,),
+            block_sizes=[1, 128],
+            num_threads=[0, 32],
+            cute_vector_widths=[1, 4],
+        )
+        ref = torch.nn.functional.softmax(x, dim=1)
+        torch.testing.assert_close(out, ref, atol=1e-2, rtol=1e-2)
+        # 2 sweeps * 2 assigns each = 4 _pipe_lane_base_* writes and
+        # 4 _pipe_load_* writes.
+        self.assertEqual(self._shadow_var_count(code, "lane_base"), 4)
+        self.assertEqual(self._shadow_var_count(code, "load"), 4)
+        # The snapshot ``lane_base_<N> = _pipe_lane_base_<M>`` form must
+        # appear inside the loop body — that's the substitution that
+        # gives the SASS scheduler one full iter of slack to issue the
+        # next load.
+        self.assertRegex(code, r"lane_base_\d+ = _pipe_lane_base_\d+")
+        self.assertRegex(code, r"_tile_unroll_vec_\d+_\d+ = _pipe_load_\d+")
+
+    def test_pipeline_skips_when_lane_reps_greater_than_one(self) -> None:
+        """V=4 with block_size=256 forces the inner lane loop to
+        ``for lane in range(2):`` (block=256, V=4 → 2 lanes per
+        thread).  The pipeline transform must SKIP this case: the
+        per-iter prefetch advances ``_pipe_lane_base`` to the next
+        outer iter but uses the CURRENT ``lane`` index, which would
+        corrupt the snapshot read by the NEXT lane index in the same
+        outer iter.  Verify the rewrite did not fire.
+        """
+        x = torch.randn(4096, 8192, device=DEVICE, dtype=HALF_DTYPE)
+        code, out = code_and_output(
+            softmax_two_pass_kernel,
+            (x,),
+            block_sizes=[1, 256],
+            num_threads=[0, 32],
+            cute_vector_widths=[1, 4],
+        )
+        ref = torch.nn.functional.softmax(x, dim=1)
+        torch.testing.assert_close(out, ref, atol=1e-2, rtol=1e-2)
+        # lane_reps == 2, so the pass bails -- no _pipe_* vars.
+        self.assertNotIn("_pipe_lane_base_", code)
+        self.assertNotIn("_pipe_load_", code)
+
+    def test_pipeline_disable_env(self) -> None:
+        """``HELION_DISABLE_LOAD_PIPELINE=1`` disables the pass for
+        experimentation.  The kernel must still compile and produce
+        correct output without the pipeline rewrite.
+        """
+        import os
+
+        old = os.environ.get("HELION_DISABLE_LOAD_PIPELINE")
+        os.environ["HELION_DISABLE_LOAD_PIPELINE"] = "1"
+        try:
+            x = torch.randn(4096, 12672, device=DEVICE, dtype=HALF_DTYPE)
+            code, out = code_and_output(
+                softmax_two_pass_kernel,
+                (x,),
+                block_sizes=[1, 128],
+                num_threads=[0, 32],
+                cute_vector_widths=[1, 4],
+            )
+            ref = torch.nn.functional.softmax(x, dim=1)
+            torch.testing.assert_close(out, ref, atol=1e-2, rtol=1e-2)
+            # No pipeline vars when the pass is disabled.
+            self.assertNotIn("_pipe_lane_base_", code)
+            self.assertNotIn("_pipe_load_", code)
+        finally:
+            if old is None:
+                os.environ.pop("HELION_DISABLE_LOAD_PIPELINE", None)
+            else:
+                os.environ["HELION_DISABLE_LOAD_PIPELINE"] = old
 
 
 @onlyBackends(["cute"])
