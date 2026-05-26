@@ -1083,6 +1083,121 @@ def _cute_register_tile_unroll_vec_hoist(
     return f"cutlass.Uint16({hoist_var}[{vec_lane_var}]).bitcast({elem_dtype})"
 
 
+def _cute_register_tile_unroll_vec_hoist_split2(
+    state: CodegenState,
+    strategy: object,  # BlockSizeTileStrategy (CuteNDTileStrategy)
+    block_id: int,
+    tensor: torch.Tensor,
+    tensor_name: str,
+    index_exprs: list[str],
+    vec_width: int,
+) -> str:
+    """Split-2 variant of ``_cute_register_tile_unroll_vec_hoist`` for V=8
+    on fp16/bf16.
+
+    The CuTe DSL's ``nvvm.load.ext`` ICEs at V=8 for these dtypes, so the
+    full 16-byte LDG.128 is decomposed into TWO back-to-back V=4 loads
+    (lanes 0-3 and 4-7).  The SASS scheduler is free to overlap the two
+    LDGs, so the per-thread bytes-per-load grows from 8 (V=4) to the
+    full 16 (effective V=8) without invoking the DSL bug.
+
+    Returns a per-vec-lane expression of the form::
+
+        (
+            cutlass.Uint16(_tile_unroll_vec_ < n > _ < m > _a[vi]).bitcast(dtype)
+            if vi < 4
+            else cutlass.Uint16(_tile_unroll_vec_ < n > _ < m > _b[vi - 4]).bitcast(
+                dtype
+            )
+        )
+
+    Because ``vec_lane_var`` is the target of a ``cutlass.range_constexpr(8)``
+    loop, it is a Python-int constant at each unrolled iter, so the
+    ``if vi < 4`` branch folds away at trace time and the emitted SASS
+    contains only the active load's extract.
+    """
+    assert vec_width == 8, (
+        "tile_unroll_split2 expects V=8 (4+4); other widths use tile_unroll"
+    )
+    half = vec_width // 2
+    elem_dtype = _CUTE_VECTOR_UNROLL_DTYPES[tensor.dtype]
+    base_var_by_block = getattr(strategy, "_cute_lane_base_index_var_by_block", {})
+    lane_body_by_block = getattr(strategy, "_cute_lane_body_by_block", {})
+    vec_lane_var_by_block = getattr(strategy, "_cute_vec_lane_var_by_block", {})
+    base_index_var = base_var_by_block.get(block_id)
+    lane_body = lane_body_by_block.get(block_id)
+    vec_lane_var = vec_lane_var_by_block.get(block_id)
+    assert isinstance(base_index_var, str)
+    assert isinstance(lane_body, list)
+    assert isinstance(vec_lane_var, str)
+    base_exprs = list(index_exprs)
+    base_exprs[-1] = base_index_var
+    base_ptr_expr_a = _cute_scalar_pointer_expr(tensor_name, base_exprs)
+    # The second-half pointer points 4 elements past the first.  Build
+    # it by substituting ``base_index_var + half`` for the inner index.
+    base_exprs_b = list(index_exprs)
+    base_exprs_b[-1] = f"({base_index_var} + {half})"
+    base_ptr_expr_b = _cute_scalar_pointer_expr(tensor_name, base_exprs_b)
+    cache_key = (tensor_name, base_ptr_expr_a, "split2")
+    cache_by_block = getattr(strategy, "_cute_lane_vec_loads_by_block", None)
+    if cache_by_block is None:
+        cache_by_block = {}
+        # pyrefly: ignore [missing-attribute]
+        strategy._cute_lane_vec_loads_by_block = cache_by_block
+    cache = cache_by_block.setdefault(block_id, {})
+    if cache_key not in cache:
+        slot = len(cache)
+        hoist_var_a = state.device_function.new_var(
+            f"_tile_unroll_vec_{block_id}_{slot}_a", dce=False
+        )
+        hoist_var_b = state.device_function.new_var(
+            f"_tile_unroll_vec_{block_id}_{slot}_b", dce=False
+        )
+        # Stash both names plus the split marker so this entry doesn't
+        # collide with the V=4 cache_key shape.  Downstream readers
+        # don't introspect this tuple — it's just a sentinel.
+        cache[cache_key] = ((hoist_var_a, hoist_var_b), tensor.dtype)
+        env_local = CompileEnvironment.current()
+        numel = env_local.block_sizes[block_id].numel
+        numel_expr = state.sympy_expr(numel)
+        anchor_exprs = list(index_exprs)
+        anchor_exprs[-1] = "0"
+        anchor_ptr_expr = _cute_scalar_pointer_expr(tensor_name, anchor_exprs)
+        # The first-half OOB guard checks the same V-aligned base used by
+        # the V=4 path; the second-half pointer is ``base + 4`` and only
+        # needs guarding when ``base + 4 < numel``.  Reuse the same
+        # anchor pointer for both halves' fallbacks (the per-element
+        # mask gate downstream drops any anchor-fetched bytes anyway).
+        guarded_ptr_a = (
+            f"({base_ptr_expr_a} if {base_index_var} < {numel_expr} "
+            f"else {anchor_ptr_expr})"
+        )
+        guarded_ptr_b = (
+            f"({base_ptr_expr_b} if ({base_index_var} + {half}) < {numel_expr} "
+            f"else {anchor_ptr_expr})"
+        )
+        hoist_stmt_a = statement_from_string(
+            f"{hoist_var_a} = cute.arch.load({guarded_ptr_a}, "
+            f"ir.VectorType.get([{half}], cutlass.Uint16.mlir_type))"
+        )
+        hoist_stmt_b = statement_from_string(
+            f"{hoist_var_b} = cute.arch.load({guarded_ptr_b}, "
+            f"ir.VectorType.get([{half}], cutlass.Uint16.mlir_type))"
+        )
+        # Insert both hoists just BEFORE the constexpr V-loop (the last
+        # entry in lane_body).  Emit them back-to-back so the SASS
+        # scheduler can issue the two LDGs together.
+        lane_body.insert(len(lane_body) - 1, hoist_stmt_a)
+        lane_body.insert(len(lane_body) - 1, hoist_stmt_b)
+    else:
+        (hoist_var_a, hoist_var_b), _ = cache[cache_key]
+    return (
+        f"(cutlass.Uint16({hoist_var_a}[{vec_lane_var}]).bitcast({elem_dtype}) "
+        f"if {vec_lane_var} < {half} "
+        f"else cutlass.Uint16({hoist_var_b}[{vec_lane_var} - {half}]).bitcast({elem_dtype}))"
+    )
+
+
 def _cute_vector_load_ctx(
     state: CodegenState,
     tensor: torch.Tensor,
@@ -1260,7 +1375,16 @@ def _cute_vector_load_ctx(
             return None
         if tensor.dtype not in _CUTE_VECTOR_UNROLL_DTYPES:
             return None
-        if vec_width > 4:
+        # The CuTe DSL's ``nvvm.load.ext`` ICEs at V=8 for fp16/bf16, so
+        # widths > 4 cannot use a single ``cute.arch.load``.  V=8 still
+        # gets full LDG.128 throughput via the ``tile_unroll_split2``
+        # mode: two back-to-back ``cute.arch.load(..., V=4)`` calls
+        # (covering vec lanes 0-3 and 4-7) emit as two LDG.64s that the
+        # SASS scheduler can overlap.  Wider Vs (16, 32, ...) are not
+        # supported.
+        if vec_width > 8:
+            return None
+        if vec_width == 8 and vec_width % 4 != 0:
             return None
         base_var_by_block = getattr(
             strategy, "_cute_lane_base_index_var_by_block", None
@@ -1284,6 +1408,8 @@ def _cute_vector_load_ctx(
         numel = env.block_sizes[inner_block_id].numel
         if not env.known_multiple(numel, vec_width):
             return None
+        if vec_width == 8:
+            return vec_width, inner_block_id, "tile_unroll_split2"
         return vec_width, inner_block_id, "tile_unroll"
     return None
 
@@ -5586,14 +5712,31 @@ def _(state: CodegenState) -> object:
                 index_exprs,
                 vec_width,
             )
-        else:
-            assert vec_mode == "tile_unroll"
+        elif vec_mode == "tile_unroll":
             # Same hoist protocol as ``LoopedReductionStrategy``'s
             # ``unroll`` mode but for ``CuteNDTileStrategy`` lane loops.
             from .._compiler.tile_strategy import BlockSizeTileStrategy
 
             assert isinstance(strategy, BlockSizeTileStrategy)
             load_expr = _cute_register_tile_unroll_vec_hoist(
+                state,
+                strategy,
+                vec_block_id,
+                tensor,
+                tensor_name,
+                index_exprs,
+                vec_width,
+            )
+        else:
+            assert vec_mode == "tile_unroll_split2"
+            # V=8 fp16/bf16: emit two back-to-back ``cute.arch.load(...,
+            # V=4)`` calls (lanes 0-3 and 4-7).  Works around the CuTe
+            # DSL's ``nvvm.load.ext`` ICE on V=8 while still issuing the
+            # full LDG.128 of bytes-per-thread-per-outer-iter.
+            from .._compiler.tile_strategy import BlockSizeTileStrategy
+
+            assert isinstance(strategy, BlockSizeTileStrategy)
+            load_expr = _cute_register_tile_unroll_vec_hoist_split2(
                 state,
                 strategy,
                 vec_block_id,
