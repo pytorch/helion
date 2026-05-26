@@ -864,6 +864,14 @@ class DeviceFunction:
             from .cute.hoist_warp_reduce import hoist_warp_reduce_from_vloop
 
             kernel_body = hoist_warp_reduce_from_vloop(kernel_body)
+            # Merge adjacent constexpr V-loops that share an identical
+            # statement prefix.  Caches the last common per-V-lane value
+            # into a register fragment so V-loop 2's bitcast/cast chain
+            # disappears and the SASS scheduler can issue V-loop 2's
+            # arithmetic without waiting for V-loop 1's results.
+            from .cute.merge_sibling_v_loops import merge_sibling_v_loops
+
+            kernel_body = merge_sibling_v_loops(kernel_body)
         return [
             *prefix,
             ast_rename(
