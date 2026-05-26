@@ -3008,7 +3008,16 @@ class TestCuteBackend(TestCase):
         self.assertIn("cute.arch.warp_reduction_sum", code)
         self.assertNotIn("cute.gemm", code)
 
-    def test_strided_threaded_reduction_cross_warp_shared_memory(self) -> None:
+    def test_strided_threaded_reduction_uses_warp_per_row(self) -> None:
+        """With ``block_sizes=[32, 32]`` and the default
+        ``num_threads=[32, 32]`` the warp-per-row plan (P15) swaps the
+        thread-axis assignment so each warp owns one M-row.  The
+        ``acc.sum(-1)`` then lowers to a per-warp reduction (each warp
+        sums its row across the 32 lanes) instead of routing through
+        the cross-warp ``_cute_grouped_reduce_shared_two_stage`` SMEM
+        path.  The launch dim stays ``(32, 32, 1)`` (N on axis 0, M on
+        axis 1) so the joint thread count still fits the budget.
+        """
         args = (
             torch.randn(512, 512, device=DEVICE, dtype=torch.float32),
             torch.tensor([200], device=DEVICE, dtype=torch.int64),
@@ -3018,4 +3027,8 @@ class TestCuteBackend(TestCase):
         expected = x[:, : end.item()].sum(dim=1)
         torch.testing.assert_close(out, expected, rtol=1e-4, atol=1e-4)
         self.assertIn("block=(32, 32, 1)", code)
-        self.assertIn("_cute_grouped_reduce_shared_two_stage", code)
+        # Each warp reduces its own row via ``_cute_grouped_reduce_warp``
+        # with ``group_span=32``; no shared-memory two-stage reduce.
+        self.assertIn("_cute_grouped_reduce_warp", code)
+        self.assertIn("group_span=32", code)
+        self.assertNotIn("_cute_grouped_reduce_shared_two_stage", code)

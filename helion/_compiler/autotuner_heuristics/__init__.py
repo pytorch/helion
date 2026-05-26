@@ -8,6 +8,7 @@ from .cute import CuteReductionTileHeuristic
 from .cute import CuteReductionWideChunkHeuristic
 from .cute import CuteTcgen05ClusterM2Heuristic
 from .cute import CuteTileVecHeuristic
+from .cute import CuteTileVecWarpPerRowHeuristic
 from .cute import CuteTileVecWarpReduceHeuristic
 from .triton import TritonSkinnyGemmHeuristic
 
@@ -25,6 +26,7 @@ HEURISTICS_BY_BACKEND: dict[str, tuple[AutotunerHeuristicType, ...]] = {
         CuteReductionWideChunkHeuristic,
         CuteTileVecHeuristic,
         CuteTileVecWarpReduceHeuristic,
+        CuteTileVecWarpPerRowHeuristic,
     ),
     "triton": (TritonSkinnyGemmHeuristic,),
 }

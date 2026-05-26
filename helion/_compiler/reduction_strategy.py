@@ -1663,6 +1663,20 @@ class BlockReductionStrategy(ReductionStrategy):
                 logical_axis_sizes,
             )
             return None
+        # Skip to the direct ``cute.arch.warp_reduction_*`` path when the
+        # entire CTA is a single warp (num_threads == group_span <= 32):
+        # the standard ``call_reduction_function`` can emit a one-shot
+        # warp_reduction with ``threads_in_group=group_span``.
+        #
+        # When ``num_threads > group_span`` (e.g. warp-per-row layouts
+        # with multiple warps per CTA, each owning one row), keep the
+        # ``_cute_grouped_reduce_warp`` path at the bottom — it picks
+        # the right per-warp reduce even when other thread axes coexist
+        # within the CTA.  The "skip" shortcut would route through
+        # ``_needs_loop_carried_accumulator``, which returns True when
+        # the reduction block is no longer in ``active_device_loops``
+        # (e.g. ``cute_dynamic_row_sum``'s ``acc.sum(-1)`` after the
+        # inner ``hl.tile`` exits) and would silently drop the reduce.
         if pre <= 1 and group_span <= 32 and num_threads == group_span:
             debug(
                 "skip small direct",

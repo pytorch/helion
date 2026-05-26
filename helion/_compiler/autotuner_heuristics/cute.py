@@ -349,6 +349,102 @@ class CuteTileVecWarpReduceHeuristic(AutotunerHeuristic):
             return None
 
 
+class CuteTileVecWarpPerRowHeuristic(AutotunerHeuristic):
+    """P15: warp-per-row layout for softmax-shaped tile kernels.
+
+    Sibling seed for ``CuteTileVecWarpReduceHeuristic`` that puts MORE
+    than one row per CTA — each warp owns one row. The warp-per-row
+    plan in ``layout_propagation.py`` swaps the thread-axis assignment
+    so:
+
+    * N (reduction axis) lands on ``thread_idx[0]`` (32 contiguous
+      threads = one warp per row)
+    * M (outer grid row axis) lands on ``thread_idx[1]`` (warp index =
+      row index)
+
+    The strided reduction dispatcher then picks the direct
+    ``cute.arch.warp_reduction_*`` path with ``threads_in_group=32``
+    (group_span == 32, one warp per group), avoiding the
+    cross-warp shared-memory two-stage reduce that would dominate when
+    rows are spread across threads.
+
+    Seeds ``block_sizes=[2, V * 32]``, ``num_threads=[0, 32]``,
+    ``cute_vector_widths=[1, V]`` so each row stays inside a single
+    warp and 2 rows fit in one CTA (giving 64 threads = 2 warps per
+    CTA -> higher occupancy on softmax-shaped reductions).
+
+    Eligible whenever ``CuteTileVecWarpReduceHeuristic`` is eligible
+    and the outer tile fragment admits M >= 2.
+    """
+
+    name = "cute_tile_vec_warp_per_row"
+    backend = "cute"
+
+    @classmethod
+    def is_eligible(cls, env: CompileEnvironment, device_ir: DeviceIR) -> bool:
+        spec = env.config_spec
+        if spec.matmul_facts:
+            return False
+        if len(spec.block_sizes) != 2 or spec.reduction_loops:
+            return False
+        inner_block_id = (
+            cast("Any", spec.block_sizes[1]).block_ids[0]
+            if hasattr(cast("Any", spec.block_sizes[1]), "block_ids")
+            else None
+        )
+        if inner_block_id is None:
+            return False
+        if inner_block_id not in spec.cute_vector_widths.valid_block_ids():
+            return False
+        dtype = _cute_tile_inner_block_dtype(env, device_ir, inner_block_id)
+        vec = _cute_tile_seed_vec_width_for_dtype(dtype)
+        if vec <= 1:
+            return False
+        bn_fragment = cast("Any", spec.block_sizes[1])._fragment(spec)
+        bn_high = getattr(bn_fragment, "high", None)
+        if not isinstance(bn_high, int) or bn_high < vec * 32:
+            return False
+        # Outer (M) fragment must admit M=2 (warp-per-row launches 2
+        # warps per CTA so each row is one warp).
+        bm_fragment = cast("Any", spec.block_sizes[0])._fragment(spec)
+        bm_low = getattr(bm_fragment, "low", 1)
+        bm_high = getattr(bm_fragment, "high", None)
+        if not isinstance(bm_high, int):
+            return False
+        return bm_low <= 2 <= bm_high
+
+    @classmethod
+    def get_seed_config(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> Config | None:
+        spec = env.config_spec
+        inner_block_id = (
+            cast("Any", spec.block_sizes[1]).block_ids[0]
+            if hasattr(cast("Any", spec.block_sizes[1]), "block_ids")
+            else None
+        )
+        if inner_block_id is None:
+            return None
+        dtype = _cute_tile_inner_block_dtype(env, device_ir, inner_block_id)
+        vec = _cute_tile_seed_vec_width_for_dtype(dtype)
+        if vec <= 1:
+            return None
+        bn_fragment = cast("Any", spec.block_sizes[1])._fragment(spec)
+        bn_high = getattr(bn_fragment, "high", None)
+        block_n = vec * 32
+        if isinstance(bn_high, int) and bn_high < block_n:
+            return None
+        seed: dict[str, Any] = {
+            "block_sizes": [2, block_n],
+            "num_threads": [0, 32],
+            "cute_vector_widths": [1, vec],
+        }
+        try:
+            return Config(**seed)
+        except Exception:
+            return None
+
+
 class CuteReductionWideChunkHeuristic(AutotunerHeuristic):
     """Companion seed: chunk = max(max_threads, size_hint/2) so the inner
     reduction loop has very few outer iterations and lane_extent absorbs
