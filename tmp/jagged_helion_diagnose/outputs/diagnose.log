@@ -6,10 +6,10 @@
 + python diagnose.py
 ----- BEGIN -----
 WARNING: All log messages before absl::InitializeLog() is called are written to STDERR
-I0000 00:00:1779835931.017498 1987994 pjrt_api.cc:96] PJRT_Api is set for device type cpu
-I0000 00:00:1779835931.042949 1987994 pjrt_api.cc:118] GetPjrtApi was found for TPU at /home/ymu_google_com/miniconda3/envs/tpu/lib/python3.12/site-packages/libtpu/libtpu.so
-I0000 00:00:1779835931.042987 1987994 pjrt_api.cc:96] PJRT_Api is set for device type tpu
-I0000 00:00:1779835931.064998 1987994 device_rt.cc:97] PjRt runtime initialization deferred for tpu
+I0000 00:00:1779837932.618605 2004241 pjrt_api.cc:96] PJRT_Api is set for device type cpu
+I0000 00:00:1779837932.642637 2004241 pjrt_api.cc:118] GetPjrtApi was found for TPU at /home/ymu_google_com/miniconda3/envs/tpu/lib/python3.12/site-packages/libtpu/libtpu.so
+I0000 00:00:1779837932.642676 2004241 pjrt_api.cc:96] PJRT_Api is set for device type tpu
+I0000 00:00:1779837932.665004 2004241 device_rt.cc:97] PjRt runtime initialization deferred for tpu
 Successfully renamed PrivateUse1 backend to 'tpu'. Device: device(type='tpu')
 Registered Python module for 'tpu'.
 Device type: tpu, Device index: default
@@ -21,11 +21,11 @@ torch device (DEVICE): tpu
 ==============================================================================
 === seed=0
 ==============================================================================
-I0000 00:00:1779835934.497181 1987994 pjrt_api.cc:167] The PJRT plugin has PJRT API version 0.108. The framework PJRT API version is 0.104.
-I0000 00:00:1779835934.497789 1987994 pjrt_c_api_client.cc:197] PjRtCApiClient created.
-W0000 00:00:1779835934.497808 1987994 pjrt_state.cc:230] Only using 1 device out of all the 8 addressable devices.
-I0000 00:00:1779835934.529386 1989252 tier2_compilation_cache.cc:149] Tier-2 compilation cache is disabled for world size 1.
-I0000 00:00:1779835934.529415 1989252 tier3_compilation_cache.cc:65] Backup compilation for tier-3 cache read is disabled as tier-3 cache is disabled.
+I0000 00:00:1779837936.124407 2004241 pjrt_api.cc:167] The PJRT plugin has PJRT API version 0.108. The framework PJRT API version is 0.104.
+I0000 00:00:1779837936.124970 2004241 pjrt_c_api_client.cc:197] PjRtCApiClient created.
+W0000 00:00:1779837936.124989 2004241 pjrt_state.cc:230] Only using 1 device out of all the 8 addressable devices.
+I0000 00:00:1779837936.156450 2005499 tier2_compilation_cache.cc:149] Tier-2 compilation cache is disabled for world size 1.
+I0000 00:00:1779837936.156485 2005499 tier3_compilation_cache.cc:65] Backup compilation for tier-3 cache read is disabled as tier-3 cache is disabled.
 INPUT  x_padded.shape=(1024, 128)  L_nnz=256
 INPUT  offsets=[0, 45, 93, 147, 148, 152, 212, 216, 256]
 INPUT  seq_lengths=[45, 48, 54, 1, 4, 60, 4, 40]
@@ -245,8 +245,8 @@ seed=42  n_bad=1024
   seed[0] vs seed[1]: |same|=False  |intersection|=1023  |sym_diff|=1
   seed[0] vs seed[2]: |same|=True  |intersection|=1024  |sym_diff|=0
   seed[0] vs seed[42]: |same|=True  |intersection|=1024  |sym_diff|=0
-I0000 00:00:1779835936.828892 1987994 compilation_cache.cc:354] Compilation cache evicted.
-I0000 00:00:1779835936.828924 1987994 compilation_cache.cc:219] CompilationCache final stats: num_cache_reqs=180
+I0000 00:00:1779837938.446419 2004241 compilation_cache.cc:354] Compilation cache evicted.
+I0000 00:00:1779837938.446448 2004241 compilation_cache.cc:219] CompilationCache final stats: num_cache_reqs=180
 num_cache_hits=154 {85.5%}
 peak_compilation_memory_bytes=unknown
 

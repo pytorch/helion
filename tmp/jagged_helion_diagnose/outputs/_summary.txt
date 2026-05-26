@@ -87,8 +87,8 @@ seed=42  n_bad=1024
   seed[0] vs seed[1]: |same|=False  |intersection|=1023  |sym_diff|=1
   seed[0] vs seed[2]: |same|=True  |intersection|=1024  |sym_diff|=0
   seed[0] vs seed[42]: |same|=True  |intersection|=1024  |sym_diff|=0
-I0000 00:00:1779835936.828892 1987994 compilation_cache.cc:354] Compilation cache evicted.
-I0000 00:00:1779835936.828924 1987994 compilation_cache.cc:219] CompilationCache final stats: num_cache_reqs=180
+I0000 00:00:1779837938.446419 2004241 compilation_cache.cc:354] Compilation cache evicted.
+I0000 00:00:1779837938.446448 2004241 compilation_cache.cc:219] CompilationCache final stats: num_cache_reqs=180
 num_cache_hits=154 {85.5%}
 peak_compilation_memory_bytes=unknown
 
