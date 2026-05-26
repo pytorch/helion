@@ -900,7 +900,15 @@ class DeviceFunction:
             # dependency chain dominates the per-iter stall budget.
             from .cute.pipeline_inner_loads import pipeline_inner_loads
 
-            kernel_body = pipeline_inner_loads(kernel_body, constexpr_values)
+            # Pass the post-rename canonical map so the loop-carried-write
+            # gate can correctly identify writes whose pre-rename target
+            # is an alias (e.g. ``v_1_0 = v_1`` will be renamed to
+            # ``mi = v_1``).  Without this, the gate would mis-classify
+            # the softmax reduce sweep as having no loop-carried write
+            # and incorrectly skip pipelining.
+            kernel_body = pipeline_inner_loads(
+                kernel_body, constexpr_values, rename_groups=rename_groups
+            )
         return [
             *prefix,
             ast_rename(
