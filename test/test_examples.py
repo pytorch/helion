@@ -933,6 +933,43 @@ class TestExamples(RefEagerTestBase, TestCase):
             block_sizes=[1, 64, 32],
         )
 
+    @xfailIfCute(
+        "CuTe attention-style online-softmax kernel still returns incorrect results"
+    )
+    def test_xsa(self):
+        args = (
+            torch.randn(2, 32, 1024, 64, dtype=HALF_DTYPE, device=DEVICE),
+            torch.randn(2, 32, 1024, 64, dtype=HALF_DTYPE, device=DEVICE),
+            torch.randn(2, 32, 1024, 64, dtype=HALF_DTYPE, device=DEVICE),
+        )
+        mod = import_path(EXAMPLES_DIR / "xsa.py")
+        check_example(
+            "xsa",
+            args,
+            mod.ref_xsa(*args),
+            fn_name="xsa_kernel",
+            block_sizes=[1, 64, 32],
+        )
+
+    @xfailIfCute(
+        "CuTe attention-style online-softmax kernel still returns incorrect results"
+    )
+    def test_xsa_near_zero_v(self):
+        q = torch.randn(2, 4, 128, 64, dtype=HALF_DTYPE, device=DEVICE)
+        k = torch.randn_like(q)
+        v = torch.randn_like(q)
+        # Force ||V_i|| = 0 < eps so F.normalize's eps-clamp matters.
+        v[..., 0, :] = 0.0
+        args = (q, k, v)
+        mod = import_path(EXAMPLES_DIR / "xsa.py")
+        check_example(
+            "xsa",
+            args,
+            mod.ref_xsa(*args),
+            fn_name="xsa_kernel",
+            block_sizes=[1, 64, 32],
+        )
+
     def test_concat(self):
         args = (
             torch.randn(512, 500, device=DEVICE),

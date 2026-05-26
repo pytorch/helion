@@ -179,6 +179,7 @@ jobs:
     with:
       alias: tpu
       kernels: ${{ github.event.inputs.kernels_tpu }}
+      env-vars: ${{ github.event.inputs.env_vars }}
 
   trigger-docs-deploy:
     if: always()

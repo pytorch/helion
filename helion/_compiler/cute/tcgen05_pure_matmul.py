@@ -416,6 +416,99 @@ class Tcgen05PureClcSchedulerObject:
 
 
 @dataclasses.dataclass(frozen=True)
+class Tcgen05PureDynamicSchedulerObject:
+    """Cycle-16 H3 staged-only Target8 dynamic-persistent scheduler boundary.
+
+    Parallels ``Tcgen05PureClcSchedulerObject`` for the
+    ``DYNAMIC_PERSISTENT`` persistence model. The productive emission
+    surface — an atomic-counter (``tile_count_semaphore`` /
+    ``atomic_add_i32`` on a global counter) work-tile loop that avoids
+    the CLC scheduler warp + 16-bit mailbox SMEM hand-off + per-tile
+    ``mbarrier_arrive_and_expect_tx`` round-trip — is staged for a
+    follow-up cycle (see ``cute_plan.md`` §6 Target 8 cycle-13 Deep
+    Replan H3). Cycle 16 lands only the typed boundary so the
+    persistence-model dispatch in
+    ``cute_mma._new_tcgen05_sched_pipeline_plan`` already has a place to
+    consult before the codegen path raises ``BackendUnsupported``. The
+    builder methods deliberately raise ``BackendUnsupported`` rather
+    than emit AST so a caller that wires this object too early fails
+    loudly instead of silently emitting a wrong scheduler shape.
+
+    The class is shaped (``sched_plan`` + ``scheduler_warp_id``) to mirror
+    ``Tcgen05PureClcSchedulerObject`` so a future cycle can implement the
+    builder methods without changing the call sites. The
+    ``scheduler_warp_id`` field is retained for symmetry even though the
+    productive dynamic-persistent path will not use a dedicated scheduler
+    warp (the atomic-counter advance runs on the existing MMA / TMA
+    producer warps); a follow-up cycle that lands the productive emission
+    can re-interpret the field as a sentinel (``-1``) or drop it once
+    the actual lowering shape is finalized.
+    """
+
+    sched_plan: _Tcgen05SchedPipelinePlan
+    scheduler_warp_id: int
+
+    def _staged_error_message(self, where: str) -> str:
+        return (
+            "tcgen05_pure_dynamic_scheduler_object=True is cycle-16 "
+            f"infrastructure only; the productive {where} emission is "
+            "staged for cycle 17 (see cute_plan.md §6 Target 8 cycle-16 "
+            "H3 Option B landing)"
+        )
+
+    def scheduler_role_predicate(self) -> str:
+        # Mirror the CLC scheduler object's role-predicate surface so
+        # future callers that consult this from generic dispatch sites
+        # have a parallel API; the dynamic-persistent emission has no
+        # dedicated scheduler warp, so the staged placeholder pins the
+        # predicate to ``False`` (no current warp ever matches it).
+        return "cutlass.Int32(0) == cutlass.Int32(1)"
+
+    def build_clc_query_block(  # pragma: no cover - staged-only
+        self, params: Tcgen05ClcQueryParams
+    ) -> list[ast.stmt]:
+        from ... import exc
+
+        raise exc.BackendUnsupported("cute", self._staged_error_message("CLC query"))
+
+    def build_initial_work_tile_block(  # pragma: no cover - staged-only
+        self, params: Tcgen05InitialWorkTileParams
+    ) -> list[ast.stmt]:
+        from ... import exc
+
+        raise exc.BackendUnsupported(
+            "cute", self._staged_error_message("initial work-tile")
+        )
+
+    def build_work_tile_publish_block(  # pragma: no cover - staged-only
+        self, params: Tcgen05WorkTilePublishParams
+    ) -> list[ast.stmt]:
+        from ... import exc
+
+        raise exc.BackendUnsupported(
+            "cute", self._staged_error_message("work-tile publish")
+        )
+
+    def build_sentinel_publish_block(  # pragma: no cover - staged-only
+        self, params: Tcgen05WorkTilePublishParams
+    ) -> list[ast.stmt]:
+        from ... import exc
+
+        raise exc.BackendUnsupported(
+            "cute", self._staged_error_message("sentinel publish")
+        )
+
+    def build_next_work_tile_consume_block(  # pragma: no cover - staged-only
+        self, params: Tcgen05WorkTileConsumeParams
+    ) -> list[ast.stmt]:
+        from ... import exc
+
+        raise exc.BackendUnsupported(
+            "cute", self._staged_error_message("next work-tile consume")
+        )
+
+
+@dataclasses.dataclass(frozen=True)
 class Tcgen05PureMatmulObjectModel:
     """Token bundling pure tcgen05 MMA ownership with store cleanup."""
 

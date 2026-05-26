@@ -159,6 +159,7 @@ BACKEND_SPECIFIC_KEYS: frozenset[str] = (
     | _BACKEND_STRATEGY_CONFIG_KEYS
     | {
         "num_threads",
+        "cute_vector_widths",
         "pallas_loop_type",
         "pallas_pre_broadcast",
     }
@@ -187,6 +188,7 @@ VALID_KEYS: frozenset[str] = frozenset(
         "load_eviction_policies",
         "pallas_loop_type",
         "pallas_pre_broadcast",
+        "cute_vector_widths",
         *BACKEND_TUNABLE_KEYS,
         "advanced_controls_file",
         "epilogue_subtile",
@@ -282,6 +284,9 @@ class ConfigSpec:
         self.l2_groupings: BlockIdSequence[L2GroupingSpec] = BlockIdSequence()
         self.flatten_loops: BlockIdSequence[FlattenLoopSpec] = BlockIdSequence()
         self.reduction_loops: BlockIdSequence[ReductionLoopSpec] = BlockIdSequence()
+        self.cute_vector_widths: BlockIdSequence[CuteVectorWidthSpec] = (
+            BlockIdSequence()
+        )
         self.range_unroll_factors: BlockIdSequence[RangeUnrollFactorSpec] = (
             BlockIdSequence()
         )
@@ -461,6 +466,30 @@ class ConfigSpec:
         self._cute_tcgen05_config.identity_matmul_store_detected = value
 
     @property
+    def cute_tcgen05_relu_matmul_store_detected(self) -> bool:
+        return self._cute_tcgen05_config.relu_matmul_store_detected
+
+    @cute_tcgen05_relu_matmul_store_detected.setter
+    def cute_tcgen05_relu_matmul_store_detected(self, value: bool) -> None:
+        self._cute_tcgen05_config.relu_matmul_store_detected = value
+
+    @property
+    def cute_tcgen05_bias_matmul_store_detected(self) -> bool:
+        return self._cute_tcgen05_config.bias_matmul_store_detected
+
+    @cute_tcgen05_bias_matmul_store_detected.setter
+    def cute_tcgen05_bias_matmul_store_detected(self, value: bool) -> None:
+        self._cute_tcgen05_config.bias_matmul_store_detected = value
+
+    @property
+    def cute_tcgen05_bias_relu_matmul_store_detected(self) -> bool:
+        return self._cute_tcgen05_config.bias_relu_matmul_store_detected
+
+    @cute_tcgen05_bias_relu_matmul_store_detected.setter
+    def cute_tcgen05_bias_relu_matmul_store_detected(self, value: bool) -> None:
+        self._cute_tcgen05_config.bias_relu_matmul_store_detected = value
+
+    @property
     def _tcgen05_cluster_m_search_choices(self) -> tuple[int, ...] | None:
         return self._cute_tcgen05_config.cluster_m_search_choices
 
@@ -530,6 +559,24 @@ class ConfigSpec:
 
     def allow_tcgen05_target1_tvm_ffi_seed(self) -> None:
         self._cute_tcgen05_config.allow_target1_tvm_ffi_seed()
+
+    def allow_tcgen05_target2_tvm_ffi_seed(self) -> None:
+        self._cute_tcgen05_config.allow_target2_tvm_ffi_seed()
+
+    def allow_tcgen05_target3_tvm_ffi_seed(self) -> None:
+        self._cute_tcgen05_config.allow_target3_tvm_ffi_seed()
+
+    def allow_tcgen05_target4_tvm_ffi_seed(self) -> None:
+        self._cute_tcgen05_config.allow_target4_tvm_ffi_seed()
+
+    def allow_tcgen05_target5_tvm_ffi_seed(self) -> None:
+        self._cute_tcgen05_config.allow_target5_tvm_ffi_seed()
+
+    def allow_tcgen05_target6_tvm_ffi_seed(self) -> None:
+        self._cute_tcgen05_config.allow_target6_tvm_ffi_seed()
+
+    def allow_tcgen05_target7_tvm_ffi_seed(self) -> None:
+        self._cute_tcgen05_config.allow_target7_tvm_ffi_seed()
 
     @staticmethod
     def _tcgen05_cluster_m2_bk_is_valid(
@@ -757,6 +804,7 @@ class ConfigSpec:
             ("l2_groupings", self.l2_groupings, True),
             ("loop_orders", self.loop_orders, False),
             ("reduction_loops", self.reduction_loops, True),
+            ("cute_vector_widths", self.cute_vector_widths, True),
             ("range_unroll_factors", self.range_unroll_factors, True),
             ("range_warp_specializes", self.range_warp_specialize, True),
             ("range_num_stages", self.range_num_stages, True),
@@ -948,6 +996,7 @@ class ConfigSpec:
             "l2_groupings",
             "flatten_loops",
             "reduction_loops",
+            "cute_vector_widths",
             "range_unroll_factors",
             "range_warp_specializes",
             "range_num_stages",
@@ -1727,6 +1776,42 @@ class ReductionLoopSpec(_PowerOfTwoBlockIdItem):
 
     def _fill_missing(self) -> None:
         return None
+
+
+_CUTE_VECTOR_WIDTH_CHOICES: tuple[int, ...] = (1, 2, 4, 8)
+
+
+class CuteVectorWidthSpec(_BlockIdItem):
+    """Per-reduction-block vector load width for the CuTe backend.
+
+    V=1 disables vectorization (scalar loads). V=2/4/8 emits
+    ``cute.arch.load(..., ir.VectorType.get([V], elem_dtype.mlir_type))``
+    for the inner reduction load, lowering to LDG.64/LDG.128.
+    """
+
+    def __init__(
+        self,
+        *,
+        block_id: int,
+        size_hint: int,
+    ) -> None:
+        super().__init__([block_id])
+        self.size_hint = size_hint
+
+    def _fragment(self, base: ConfigSpec) -> EnumFragment:
+        return EnumFragment(choices=_CUTE_VECTOR_WIDTH_CHOICES)
+
+    def _normalize(self, name: str, value: object) -> int:
+        if not isinstance(value, int):
+            raise InvalidConfig(f"{name} must be an integer, got {value!r}")
+        if value not in _CUTE_VECTOR_WIDTH_CHOICES:
+            raise InvalidConfig(
+                f"{name} must be one of {_CUTE_VECTOR_WIDTH_CHOICES}, got {value!r}"
+            )
+        return value
+
+    def _fill_missing(self) -> int:
+        return 1
 
 
 class _OptionalIntSpec(_BlockIdItem):

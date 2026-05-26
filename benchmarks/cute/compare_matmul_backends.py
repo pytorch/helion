@@ -185,6 +185,9 @@ MATMUL_EPILOGUES = (
     "relu",
     "bias_relu",
     "bias_residual_gelu",
+    "silu",
+    "gelu",
+    "residual_add",
 )
 QUACK_TUNE_CHOICES = ("off", "brief")
 # Brief tuning covers the documented default, larger cluster/swizzle variants,
@@ -837,7 +840,7 @@ def _make_epilogue_inputs(
     residual = None
     if args.epilogue in ("bias", "bias_relu", "bias_residual_gelu"):
         bias = torch.randn((args.n,), device="cuda", dtype=dtype)
-    if args.epilogue == "bias_residual_gelu":
+    if args.epilogue in ("bias_residual_gelu", "residual_add"):
         residual = torch.randn((args.m, args.n), device="cuda", dtype=dtype)
     return bias, residual
 
@@ -875,6 +878,13 @@ def _apply_epilogue(
         assert residual is not None
         val = 1.25 * acc.float() + 0.5 * residual.float() + bias.float()
         return torch.nn.functional.gelu(val).to(dtype)
+    if args.epilogue == "silu":
+        return torch.nn.functional.silu(acc.float()).to(dtype)
+    if args.epilogue == "gelu":
+        return torch.nn.functional.gelu(acc.float()).to(dtype)
+    if args.epilogue == "residual_add":
+        assert residual is not None
+        return acc + residual
     raise AssertionError(f"unhandled epilogue {args.epilogue!r}")
 
 
@@ -1082,12 +1092,21 @@ def _prepare_quack_direct(
     bias_d = bias.unsqueeze(0) if bias is not None else None
     residual_d = residual.unsqueeze(0) if residual is not None else None
 
-    if args.epilogue in ("relu", "bias_relu", "bias_residual_gelu"):
+    activation_epilogues = ("relu", "bias_relu", "bias_residual_gelu", "silu", "gelu")
+    if args.epilogue in activation_epilogues:
         from quack.gemm_act import gemm_act  # pyrefly: ignore [missing-import]
+
+        if args.epilogue == "bias_residual_gelu":
+            activation = "gelu"
+        elif args.epilogue == "silu":
+            activation = "silu"
+        elif args.epilogue == "gelu":
+            activation = "gelu"
+        else:
+            activation = "relu"
 
         def fn() -> torch.Tensor:
             c_d = residual_d if args.epilogue == "bias_residual_gelu" else None
-            activation = "gelu" if args.epilogue == "bias_residual_gelu" else "relu"
             gemm_act(
                 a_d,
                 b_d,
@@ -1105,7 +1124,9 @@ def _prepare_quack_direct(
                 is_dynamic_persistent=config["is_dynamic_persistent"],
                 max_swizzle_size=config["max_swizzle_size"],
                 rowvec_bias=bias_d,
+                # pyrefly: ignore [unexpected-keyword]
                 alpha=1.25 if args.epilogue == "bias_residual_gelu" else 1.0,
+                # pyrefly: ignore [unexpected-keyword]
                 beta=0.5 if args.epilogue == "bias_residual_gelu" else 1.0,
             )
             return out[0]
@@ -1113,11 +1134,12 @@ def _prepare_quack_direct(
     else:
 
         def fn() -> torch.Tensor:
+            c_d = residual_d if args.epilogue == "residual_add" else None
             gemm_dispatch(
                 a_d,
                 b_d,
                 out,
-                None,
+                c_d,
                 None,
                 config["tile_m"],
                 config["tile_n"],
@@ -1408,6 +1430,64 @@ class BiasResidualGeluEpilogue(NamedTuple):
         return self.fn.__closure__
 
 
+class SiluEpilogue(NamedTuple):
+    @property
+    def fn(self) -> Callable[[torch.Tensor, tuple[torch.Tensor, ...]], torch.Tensor]:
+        def epilogue(acc: torch.Tensor, tile: tuple[torch.Tensor, ...]) -> torch.Tensor:
+            return torch.nn.functional.silu(acc)
+
+        return epilogue
+
+    def __call__(
+        self, acc: torch.Tensor, tile: tuple[torch.Tensor, ...]
+    ) -> torch.Tensor:
+        return self.fn(acc, tile)
+
+    @property
+    def __closure__(self) -> tuple[Any, ...] | None:
+        return self.fn.__closure__
+
+
+class GeluEpilogue(NamedTuple):
+    @property
+    def fn(self) -> Callable[[torch.Tensor, tuple[torch.Tensor, ...]], torch.Tensor]:
+        def epilogue(acc: torch.Tensor, tile: tuple[torch.Tensor, ...]) -> torch.Tensor:
+            return torch.nn.functional.gelu(acc)
+
+        return epilogue
+
+    def __call__(
+        self, acc: torch.Tensor, tile: tuple[torch.Tensor, ...]
+    ) -> torch.Tensor:
+        return self.fn(acc, tile)
+
+    @property
+    def __closure__(self) -> tuple[Any, ...] | None:
+        return self.fn.__closure__
+
+
+class ResidualAddEpilogue(NamedTuple):
+    residual: torch.Tensor
+
+    @property
+    def fn(self) -> Callable[[torch.Tensor, tuple[torch.Tensor, ...]], torch.Tensor]:
+        residual = self.residual
+
+        def epilogue(acc: torch.Tensor, tile: tuple[torch.Tensor, ...]) -> torch.Tensor:
+            return acc + residual[tile[0], tile[1]]
+
+        return epilogue
+
+    def __call__(
+        self, acc: torch.Tensor, tile: tuple[torch.Tensor, ...]
+    ) -> torch.Tensor:
+        return self.fn(acc, tile)
+
+    @property
+    def __closure__(self) -> tuple[Any, ...] | None:
+        return self.fn.__closure__
+
+
 def _helion_matmul_args(
     args: argparse.Namespace,
     a: torch.Tensor,
@@ -1429,6 +1509,13 @@ def _helion_matmul_args(
         assert bias is not None
         assert residual is not None
         return (a, b, BiasResidualGeluEpilogue(bias, residual))
+    if args.epilogue == "silu":
+        return (a, b, SiluEpilogue())
+    if args.epilogue == "gelu":
+        return (a, b, GeluEpilogue())
+    if args.epilogue == "residual_add":
+        assert residual is not None
+        return (a, b, ResidualAddEpilogue(residual))
     raise AssertionError(f"unhandled epilogue {args.epilogue!r}")
 
 

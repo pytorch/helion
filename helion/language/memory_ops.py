@@ -40,6 +40,7 @@ from .._compiler.cute.tcgen05_constants import TCGEN05_C_STORE_MODE_CONFIG_KEY
 from .._compiler.cute.tcgen05_constants import TCGEN05_C_STORE_MODE_NORMAL
 from .._compiler.cute.tcgen05_constants import TCGEN05_C_STORE_MODE_SKIP_EPILOGUE_STORE
 from .._compiler.cute.tcgen05_constants import TCGEN05_DIRECT_ENTRY_PLAN_CONFIG_KEY
+from .._compiler.cute.tcgen05_constants import TCGEN05_DIRECT_ENTRY_STAGE_TUPLES_BY_BK
 from .._compiler.cute.tcgen05_constants import TCGEN05_EPILOGUE_LAYOUT_CONFIG_KEY
 from .._compiler.cute.tcgen05_constants import (
     TCGEN05_EPILOGUE_LAYOUT_MODULE_HELPER_ACC_T2R,
@@ -242,7 +243,7 @@ def _(state: CodegenState) -> ast.AST:
         epilogue_subtile_group_id = fx_node.meta.get("epilogue_subtile_group_id")
         if epilogue_subtile_group_id is None:
             indexing_idx = device_fn.allocate_store_index()
-        elif fx_node.meta.get("epilogue_subtile_primary_store", False):
+        elif fx_node.meta.get("epilogue_subtile_primary_output", False):
             indexing_idx = device_fn.allocate_store_index()
             device_fn.epilogue_subtile_store_indices[epilogue_subtile_group_id] = (
                 indexing_idx
@@ -890,6 +891,274 @@ def _cute_scalar_store_expr(
     if "None" in index_exprs:
         return f"{tensor_name}.__setitem__({_cute_index_tuple(index_exprs)}, {value})"
     return f"{_cute_scalar_pointer_expr(tensor_name, index_exprs)}.store({value})"
+
+
+# Maximum bytes per vector load/store transaction (LDG.128/STG.128).
+_CUTE_VECTOR_MAX_BYTES = 16
+
+# Dtype -> (cutlass scalar type name, max vector width).  Used for the
+# ``vec`` mode that issues an explicit
+# ``cute.arch.load(ptr, ir.VectorType.get([V], elem.mlir_type))`` and folds
+# the result via ``_cute_pre_vec_fold``.
+_CUTE_VECTOR_DTYPES: dict[torch.dtype, tuple[str, int]] = {
+    torch.float32: ("cutlass.Float32", _CUTE_VECTOR_MAX_BYTES // 4),
+    torch.float16: ("cutlass.Float16", _CUTE_VECTOR_MAX_BYTES // 2),
+    torch.bfloat16: ("cutlass.BFloat16", _CUTE_VECTOR_MAX_BYTES // 2),
+}
+
+# ``unroll`` mode loads bf16/fp16 inputs as Uint16 vectors and bitcasts each
+# extracted lane back to the original dtype.  This avoids the CuTe DSL
+# crash that fires when subscripting a bf16/fp16 vector value.  Cutlass
+# scalar type for the extracted lane is paired with the vec-element type
+# name used in ``ir.VectorType.get``.
+_CUTE_VECTOR_UNROLL_DTYPES: dict[torch.dtype, str] = {
+    torch.float16: "cutlass.Float16",
+    torch.bfloat16: "cutlass.BFloat16",
+}
+
+
+def _cute_vector_load_expr(
+    tensor_name: str,
+    index_exprs: list[str],
+    dtype: torch.dtype,
+    *,
+    vec_width: int,
+) -> str:
+    elem_str, _ = _CUTE_VECTOR_DTYPES[dtype]
+    ptr = _cute_scalar_pointer_expr(tensor_name, index_exprs)
+    return (
+        f"cute.arch.load({ptr}, ir.VectorType.get([{vec_width}], {elem_str}.mlir_type))"
+    )
+
+
+def _cute_vector_store_expr(
+    tensor_name: str,
+    index_exprs: list[str],
+    value: str,
+    dtype: torch.dtype,
+    *,
+    vec_width: int,
+) -> str:
+    elem_str, _ = _CUTE_VECTOR_DTYPES[dtype]
+    ptr = _cute_scalar_pointer_expr(tensor_name, index_exprs)
+    return (
+        f"cute.arch.store({ptr}, {value}, "
+        f"ir.VectorType.get([{vec_width}], {elem_str}.mlir_type))"
+    )
+
+
+def _cute_register_unroll_vec_hoist(
+    state: CodegenState,
+    strategy: object,  # LoopedReductionStrategy at runtime
+    tensor: torch.Tensor,
+    tensor_name: str,
+    index_exprs: list[str],
+    vec_width: int,
+) -> str:
+    """Register a Uint16 vec load to be hoisted above the constexpr V-loop
+    in the active lane body and return the per-element extract expression.
+
+    The hoist runs once per outer-lane iter; the constexpr V-loop's body
+    receives ``hoist_var[vi].bitcast(dtype)`` (a scalar) so the existing
+    cast/mul/accumulate pipeline keeps working unchanged.
+    """
+    elem_dtype = _CUTE_VECTOR_UNROLL_DTYPES[tensor.dtype]
+    base_index_var = getattr(strategy, "_cute_lane_base_index_var", None)
+    lane_body = getattr(strategy, "_cute_lane_body", None)
+    assert isinstance(base_index_var, str)
+    assert isinstance(lane_body, list)
+    # The inner reduction-axis index_expr is the last entry; swap it with
+    # the per-lane base so the vec load points at the start of the V-wide
+    # chunk this thread owns.
+    base_exprs = list(index_exprs)
+    base_exprs[-1] = base_index_var
+    base_ptr_expr = _cute_scalar_pointer_expr(tensor_name, base_exprs)
+    cache_key = (tensor_name, base_ptr_expr)
+    cache = getattr(strategy, "_cute_lane_vec_loads", None)
+    if cache is None:
+        cache = {}
+        # pyrefly: ignore [missing-attribute]
+        strategy._cute_lane_vec_loads = cache
+    if cache_key not in cache:
+        hoist_var = state.device_function.new_var(
+            f"_unroll_vec_{len(cache)}", dce=False
+        )
+        cache[cache_key] = (hoist_var, tensor.dtype)
+        hoist_stmt = statement_from_string(
+            f"{hoist_var} = cute.arch.load({base_ptr_expr}, "
+            f"ir.VectorType.get([{vec_width}], cutlass.Uint16.mlir_type))"
+        )
+        # Insert the hoist just BEFORE the constexpr V-loop (the last entry
+        # in lane_body).  ``lane_body[-1]`` is the constexpr loop.
+        lane_body.insert(len(lane_body) - 1, hoist_stmt)
+    else:
+        hoist_var, _ = cache[cache_key]
+    # The constexpr V-loop's target var is the last element's loop var.
+    constexpr_loop = lane_body[-1]
+    assert isinstance(constexpr_loop, ast.For)
+    assert isinstance(constexpr_loop.target, ast.Name)
+    vec_lane_var = constexpr_loop.target.id
+    return f"cutlass.Uint16({hoist_var}[{vec_lane_var}]).bitcast({elem_dtype})"
+
+
+def _cute_vector_load_ctx(
+    state: CodegenState,
+    tensor: torch.Tensor,
+    subscript: list[object] | tuple[object, ...],
+    index_exprs: list[str],
+    extra_mask: ast.AST | None,
+) -> tuple[int, int, str] | None:
+    """Return (vec_width, lane_block_id, mode) when a vec load may be emitted.
+
+    ``mode`` is one of ``"vec"`` (explicit ``cute.arch.load(..., V)``) or
+    ``"unroll"`` (per-element scalar bitcast inside a constexpr V-loop).
+    Returns None when any predicate for a 128-bit gmem load fails, in which
+    case the caller falls back to ``_cute_scalar_load_expr``.
+    """
+    from .._compiler.reduction_strategy import LoopedReductionStrategy
+
+    env = CompileEnvironment.current()
+    if env.backend.name != "cute":
+        return None
+    if extra_mask is not None:
+        return None
+    if "None" in index_exprs:
+        return None
+    if (
+        tensor.dtype not in _CUTE_VECTOR_DTYPES
+        and tensor.dtype not in _CUTE_VECTOR_UNROLL_DTYPES
+    ):
+        return None
+    # Only enable the vec path when the load's result eventually feeds a
+    # reduction op.  The consume-sweep mixes the loaded vector with scalar
+    # values (e.g. the post-reduction inverse-RMS), and broadcasting
+    # scalar->vec is not supported by the CuTe DSL today.  When the load's
+    # immediate user is a dtype cast (``to(torch.float32)``), the
+    # ``"unroll"`` mode further down keeps the strategy on a per-element
+    # scalar pipeline and the explicit-vec path is skipped — the explicit
+    # ``cute.arch.load(ptr, ir.VectorType.get([V], dtype.mlir_type))`` form
+    # would otherwise crash inside the CuTe DSL when subscripting bf16/fp16
+    # vectors.
+    fx_node = state.fx_node
+    if fx_node is None:
+        return None
+    visited: set[torch.fx.Node] = set()
+    pending = list(fx_node.users.keys())
+    feeds_reduction = False
+    while pending:
+        user = pending.pop()
+        if user in visited:
+            continue
+        visited.add(user)
+        target_name = getattr(user.target, "__name__", "") or ""
+        target_qualname = getattr(user.target, "_qualname", "") or ""
+        if (
+            "reduction" in target_name
+            or "_inductor_lowering_extra" in target_name
+            or "reduction" in target_qualname
+        ):
+            feeds_reduction = True
+            break
+        pending.extend(user.users.keys())
+    # Note: ``feeds_reduction`` is required ONLY for the ``vec`` mode below;
+    # the ``unroll`` mode also applies to the consume sweep where the load
+    # result feeds an elementwise pipeline (no reduction).
+    # The innermost dim of the load must be the reduction lane axis and
+    # the tensor must be stride-1 in that dim so that consecutive lane
+    # iters fetch consecutive bytes.
+    try:
+        if int(tensor.stride(-1)) != 1:
+            return None
+    except (TypeError, ValueError):
+        return None
+    # Locate the innermost (last) non-None subscript and pull the active
+    # block_id off it.  Slices resolve to the matching tensor-dim block via
+    # the strategy that's currently active for that block.
+    inner_block_id: int | None = None
+    tensor_dim = 0
+    for idx in subscript:
+        if idx is None:
+            continue
+        if isinstance(idx, torch.SymInt):
+            bid = env.get_block_id(idx)
+            if bid is not None:
+                inner_block_id = bid
+        elif isinstance(idx, slice) and idx == slice(None):
+            if tensor_dim < tensor.ndim:
+                dim_size = tensor.shape[tensor_dim]
+                for cand_bid, bs in enumerate(env.block_sizes):
+                    if not isinstance(bs.size, (int, torch.SymInt)):
+                        continue
+                    bs_numel = bs.numel
+                    # Try a few candidate forms for the size equality
+                    # check: sympy.Integer (most common via specialize()),
+                    # int, and torch.SymInt all flow through known_equal
+                    # after we coerce to plain int when possible.
+                    bs_int: int | torch.SymInt | None
+                    if isinstance(bs_numel, (int, torch.SymInt)):
+                        bs_int = bs_numel
+                    else:
+                        try:
+                            bs_int = int(bs_numel)
+                        except (TypeError, ValueError):
+                            bs_int = None
+                    if bs_int is None:
+                        continue
+                    dim_int: int | torch.SymInt | None
+                    if isinstance(dim_size, (int, torch.SymInt)):
+                        dim_int = dim_size
+                    else:
+                        try:
+                            dim_int = int(dim_size)
+                        except (TypeError, ValueError):
+                            dim_int = None
+                    if dim_int is None:
+                        continue
+                    if env.known_equal(
+                        bs_int, dim_int
+                    ) and state.codegen.active_device_loops.get(cand_bid):
+                        inner_block_id = cand_bid
+                        break
+        tensor_dim += 1
+    if inner_block_id is None:
+        return None
+    loops = state.codegen.active_device_loops.get(inner_block_id)
+    if not loops:
+        return None
+    strategy = getattr(loops[-1], "strategy", None)
+    if not isinstance(strategy, LoopedReductionStrategy):
+        return None
+    vec_width = getattr(strategy, "_cute_reduction_vec_width", 1)
+    if vec_width <= 1:
+        return None
+    if strategy._mask_var is not None:
+        return None
+    if strategy._cute_reduction_lane_extent <= 0:
+        return None
+    mode = getattr(strategy, "_cute_reduction_vec_mode", "vec")
+    if mode == "vec":
+        if not feeds_reduction:
+            return None
+        if tensor.dtype not in _CUTE_VECTOR_DTYPES:
+            return None
+        return vec_width, inner_block_id, "vec"
+    if mode == "unroll":
+        if tensor.dtype not in _CUTE_VECTOR_UNROLL_DTYPES:
+            return None
+        # The CuTe DSL's ``nvvm.load.ext`` only supports vec sizes 2 and 4
+        # for bf16/fp16 (V=8 raises ICE).  Cap effective V here so the
+        # autotuner's V=8 seed still compiles instead of crashing.
+        if vec_width > 4:
+            return None
+        # Need a lane base index var + a constexpr V-loop var; both are
+        # set up by the strategy's codegen_device_loop.
+        if (
+            getattr(strategy, "_cute_lane_base_index_var", None) is None
+            or getattr(strategy, "_cute_lane_body", None) is None
+        ):
+            return None
+        return vec_width, inner_block_id, "unroll"
+    return None
 
 
 def _cute_stack_tensor_offset_expr(
@@ -2717,6 +2986,17 @@ def _codegen_cute_store_tcgen05_tile(
                     "exactly one tcgen05 A/B TMA wrapper plan",
                 )
             ab_tma_plan = ab_tma_plans[0]
+            # A1 (cycle-2 review): the stage tuple is keyed on the
+            # plan's ``bk`` so a cross-mismatch (e.g. (3, 2) at bk=64
+            # vs at bk=128) is rejected here at codegen instead of at
+            # the runtime validator. The bk-keyed accept set lives in
+            # ``tcgen05_constants.py`` so codegen and runtime never
+            # drift.
+            ab_plan_bk = ab_tma_plan.get("bk")
+            ab_plan_stage_tuple = (
+                ab_tma_plan.get("ab_stage_count"),
+                tcgen05_value.c_stage_count,
+            )
             if not (
                 tcgen05_value.has_explicit_epilogue_tile
                 and tcgen05_value.explicit_epi_tile_m == 128
@@ -2726,16 +3006,14 @@ def _codegen_cute_store_tcgen05_tile(
                 and ab_tma_plan.get("bn") == tcgen05_value.bn
                 and ab_tma_plan.get("cluster_m") == 2
                 and ab_tma_plan.get("cluster_n") == 1
-                and (
-                    ab_tma_plan.get("ab_stage_count"),
-                    tcgen05_value.c_stage_count,
-                )
-                in ((3, 2), (6, 4))
+                and isinstance(ab_plan_bk, int)
+                and ab_plan_stage_tuple
+                in TCGEN05_DIRECT_ENTRY_STAGE_TUPLES_BY_BK.get(ab_plan_bk, ())
             ):
                 raise exc.BackendUnsupported(
                     "cute",
                     f"{TCGEN05_DIRECT_ENTRY_PLAN_CONFIG_KEY}=True requires "
-                    "the validated Target1 A/B/D TMA fact envelope",
+                    "the validated T1/T4 A/B/D TMA fact envelope",
                 )
             ab_kernel_args = tuple(
                 str(v) for v in cast("list[object]", ab_tma_plan["kernel_args"])
@@ -2751,6 +3029,35 @@ def _codegen_cute_store_tcgen05_tile(
             assert isinstance(ab_cluster_m, int)
             assert isinstance(ab_cluster_n, int)
             assert isinstance(ab_stage_count, int)
+            # B1 (cycle-3 review): the AB TMA plan carries the
+            # validated problem shape so the direct-entry plan can
+            # record it and the runtime validator can dispatch on
+            # the exact shape envelope (T4 and T5 share ``bk=128``
+            # so the bk-keyed shape-set alone is ambiguous).
+            ab_m_size = ab_tma_plan["m_size"]
+            ab_n_size = ab_tma_plan["n_size"]
+            ab_k_total_size = ab_tma_plan["k_total_size"]
+            assert isinstance(ab_m_size, int)
+            assert isinstance(ab_n_size, int)
+            assert isinstance(ab_k_total_size, int)
+            # T2's direct entry needs to thread the rank-1 trailing-axis
+            # bias tensor through the kernel call. The bias is the only
+            # rank-1 ``_AuxiliaryTensorStep`` in the epilogue chain at T2;
+            # T1/T3/T5 (identity) and T4 (relu) have no aux step. The
+            # codegen-side ``_codegen_cute_store_tcgen05_tile`` already
+            # registers the bias tensor as a kernel arg via
+            # ``placeholder_args``; we just need to record its FX name
+            # so ``resolve_cute_plan_arg_positions`` can turn it into a
+            # positional ``bias_idx`` for the runtime validator and the
+            # direct-entry source builder.
+            bias_name: str | None = None
+            rowvec_aux_records = [
+                rec for rec in aux_step_records if rec.broadcast_axis == 1
+            ]
+            if len(rowvec_aux_records) == 1 and not [
+                rec for rec in aux_step_records if rec.broadcast_axis is None
+            ]:
+                bias_name = rowvec_aux_records[0].aux_tensor_name
             state.codegen.cute_direct_entry_plans.append(
                 Tcgen05DirectEntryPlan(
                     lhs_name=str(ab_tma_plan["lhs_name"]),
@@ -2769,6 +3076,8 @@ def _codegen_cute_store_tcgen05_tile(
                     tma_store_tensor=tcgen05_value.tma_store_tensor,
                     ab_kernel_args=ab_kernel_args,
                     d_kernel_args=d_kernel_args,
+                    validated_shape=(ab_m_size, ab_n_size, ab_k_total_size),
+                    bias_name=bias_name,
                 ).to_codegen_plan()
             )
 
@@ -5109,7 +5418,6 @@ def _(state: CodegenState) -> object:
         inactive_slice_expr="None",
         inactive_singleton_slice_expr="0",
     )
-    load_expr = _cute_scalar_load_expr(tensor_name, index_exprs, tensor.dtype)
     mask_expr = _cute_combined_mask(
         state,
         subscript,
@@ -5117,6 +5425,43 @@ def _(state: CodegenState) -> object:
         tensor=tensor,
         include_tensor_index_masks=False,
     )
+    vec_ctx = _cute_vector_load_ctx(state, tensor, subscript, index_exprs, extra_mask)
+    if vec_ctx is not None:
+        vec_width, vec_block_id, vec_mode = vec_ctx
+        from .._compiler.reduction_strategy import LoopedReductionStrategy
+
+        loops = state.codegen.active_device_loops.get(vec_block_id)
+        strategy = loops[-1].strategy if loops else None
+        if vec_mode == "vec":
+            load_expr = _cute_vector_load_expr(
+                tensor_name, index_exprs, tensor.dtype, vec_width=vec_width
+            )
+            # The mask is deferred to the post-fold scalar in
+            # codegen_reduction.  The vec load itself is unconditional; the
+            # mask is recorded on the active LoopedReductionStrategy and
+            # applied around the folded sum.
+            if isinstance(strategy, LoopedReductionStrategy):
+                strategy._cute_emitted_vec_load = True
+                if mask_expr is not None:
+                    strategy._cute_pending_vec_masks.append(mask_expr)
+            mask_expr = None
+        else:
+            assert vec_mode == "unroll"
+            # Register (or reuse) a hoisted U16 vec load for this (tensor,
+            # base_index) pair, then return ``hoist_var[vi].bitcast(dtype)``
+            # so the existing scalar pipeline sees a scalar of the original
+            # dtype.
+            assert isinstance(strategy, LoopedReductionStrategy)
+            load_expr = _cute_register_unroll_vec_hoist(
+                state,
+                strategy,
+                tensor,
+                tensor_name,
+                index_exprs,
+                vec_width,
+            )
+    else:
+        load_expr = _cute_scalar_load_expr(tensor_name, index_exprs, tensor.dtype)
     if tensor.dtype is torch.bool:
         load_expr = f"({load_expr} != cutlass.Uint8(0))"
         if mask_expr is None:

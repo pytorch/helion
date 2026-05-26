@@ -200,6 +200,8 @@ def _emit_cute_matmul(
     rhs_dtype: torch.dtype | None = None,
 ) -> ast.AST:
     """Build a CuTe matmul fallback using a cross-thread reduction over K."""
+    if hasattr(cg, "cute_uses_matmul"):
+        cg.cute_uses_matmul = True  # type: ignore[attr-defined]
     reduction_dtype: torch.dtype | None = acc_dtype or out_dtype
     lhs_terms: tuple[ast.AST, ...]
     if isinstance(lhs, CutePackedAffineLoad):
