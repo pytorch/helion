@@ -1377,6 +1377,17 @@ class ConfigSpec:
                     and len(self.loop_orders) > 0
                 ):
                     fields["loop_orders"] = self.loop_orders
+                # Expose ``cute_vector_widths`` per-block so the
+                # autotuner can vary V in {1, 2, 4, 8} for lane-loop
+                # vec loads (and for ``LoopedReductionStrategy`` rolled
+                # reductions).  Without this entry, ``flatten`` strips V
+                # back to the default of 1, defeating the seed
+                # heuristics that try to bias toward LDG.128 lattices.
+                if (
+                    self.supports_config_key("cute_vector_widths")
+                    and len(self.cute_vector_widths) > 0
+                ):
+                    fields["cute_vector_widths"] = self.cute_vector_widths
             if self.epilogue_subtile_autotune_choices is not None:
                 fields["epilogue_subtile"] = EnumFragment(
                     choices=self.epilogue_subtile_autotune_choices

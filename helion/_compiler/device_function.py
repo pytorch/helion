@@ -838,7 +838,32 @@ class DeviceFunction:
                     and isinstance(stmt.value.value, int)
                 ):
                     constexpr_values[stmt.targets[0].id] = stmt.value.value
-            kernel_body = fuse_two_pass_loads(kernel_body, constexpr_values)
+            # Pass the per-axis thread dims so the fuser can size
+            # SMEM-backed caches correctly and build a per-thread
+            # linear slot index when ``cache_size`` exceeds the
+            # register-fragment threshold (opt-in via
+            # ``HELION_FUSER_MODE=smem``).
+            try:
+                thread_dims = self.tile_strategy.thread_block_dims()
+                thread_block_dims: tuple[int, int, int] = (
+                    int(thread_dims[0]),
+                    int(thread_dims[1]),
+                    int(thread_dims[2]),
+                )
+            except Exception:
+                thread_block_dims = (1, 1, 1)
+            kernel_body = fuse_two_pass_loads(
+                kernel_body,
+                constexpr_values,
+                thread_block_dims=thread_block_dims,
+            )
+            # Hoist warp reductions out of constexpr V-loops to collapse
+            # 4 per-V-lane warp reductions into 1 V-fold + 1 warp reduce.
+            # For online softmax style kernels this drops per-row reductions
+            # from ~396 to ~99 (4x fewer SHFL trees).
+            from .cute.hoist_warp_reduce import hoist_warp_reduce_from_vloop
+
+            kernel_body = hoist_warp_reduce_from_vloop(kernel_body)
         return [
             *prefix,
             ast_rename(

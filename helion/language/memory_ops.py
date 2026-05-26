@@ -1001,6 +1001,88 @@ def _cute_register_unroll_vec_hoist(
     return f"cutlass.Uint16({hoist_var}[{vec_lane_var}]).bitcast({elem_dtype})"
 
 
+def _cute_register_tile_unroll_vec_hoist(
+    state: CodegenState,
+    strategy: object,  # BlockSizeTileStrategy (CuteNDTileStrategy)
+    block_id: int,
+    tensor: torch.Tensor,
+    tensor_name: str,
+    index_exprs: list[str],
+    vec_width: int,
+) -> str:
+    """Tile-loop variant of ``_cute_register_unroll_vec_hoist`` for
+    ``CuteNDTileStrategy`` lane loops.
+
+    Splices a single ``cute.arch.load(base_ptr, Uint16x V)`` into the
+    outer-lane body (above the constexpr V-loop) and returns the
+    per-element bitcast expression ``hoist_var[vi].bitcast(dtype)`` so
+    the existing scalar pipeline keeps working.
+    """
+    elem_dtype = _CUTE_VECTOR_UNROLL_DTYPES[tensor.dtype]
+    base_var_by_block = getattr(strategy, "_cute_lane_base_index_var_by_block", {})
+    lane_body_by_block = getattr(strategy, "_cute_lane_body_by_block", {})
+    vec_lane_var_by_block = getattr(strategy, "_cute_vec_lane_var_by_block", {})
+    base_index_var = base_var_by_block.get(block_id)
+    lane_body = lane_body_by_block.get(block_id)
+    vec_lane_var = vec_lane_var_by_block.get(block_id)
+    assert isinstance(base_index_var, str)
+    assert isinstance(lane_body, list)
+    assert isinstance(vec_lane_var, str)
+    # The inner reduction-axis index_expr is the last entry; swap it
+    # with the per-lane base so the vec load points at the start of the
+    # V-wide chunk this thread owns.
+    base_exprs = list(index_exprs)
+    base_exprs[-1] = base_index_var
+    base_ptr_expr = _cute_scalar_pointer_expr(tensor_name, base_exprs)
+    cache_key = (tensor_name, base_ptr_expr)
+    cache_by_block = getattr(strategy, "_cute_lane_vec_loads_by_block", None)
+    if cache_by_block is None:
+        cache_by_block = {}
+        # pyrefly: ignore [missing-attribute]
+        strategy._cute_lane_vec_loads_by_block = cache_by_block
+    cache = cache_by_block.setdefault(block_id, {})
+    if cache_key not in cache:
+        hoist_var = state.device_function.new_var(
+            f"_tile_unroll_vec_{block_id}_{len(cache)}", dce=False
+        )
+        cache[cache_key] = (hoist_var, tensor.dtype)
+        # Guard the LDG against per-thread OOB: on the very last grid
+        # block + tail outer-tile iter, a thread whose vec base equals
+        # ``numel`` would otherwise read past the end of the underlying
+        # allocation (the next row doesn't exist for the last grid
+        # block).  Use an "anchor pointer" fallback for the unsafe
+        # threads: it points inside the tensor (specifically at the
+        # per-thread base of the FIRST outer-tile iter, which is the
+        # ``base_ptr_expr`` with the outer-lane index folded to 0).  The
+        # fetched bytes are then ignored downstream by the per-lane
+        # mask gate that wraps the bitcast result.
+        env_local = CompileEnvironment.current()
+        numel = env_local.block_sizes[block_id].numel
+        numel_expr = state.sympy_expr(numel)
+        # Build the "anchor" pointer: same index_exprs but with the
+        # inner reduction-axis index forced to 0.  This is the
+        # ``tile_offset == 0, lane_var == 0, vec_lane_var == 0`` base
+        # for the very first outer-tile iter, which is always in-bounds
+        # for any grid block.
+        anchor_exprs = list(index_exprs)
+        anchor_exprs[-1] = "0"
+        anchor_ptr_expr = _cute_scalar_pointer_expr(tensor_name, anchor_exprs)
+        guarded_ptr = (
+            f"({base_ptr_expr} if {base_index_var} < {numel_expr} "
+            f"else {anchor_ptr_expr})"
+        )
+        hoist_stmt = statement_from_string(
+            f"{hoist_var} = cute.arch.load({guarded_ptr}, "
+            f"ir.VectorType.get([{vec_width}], cutlass.Uint16.mlir_type))"
+        )
+        # Insert the hoist just BEFORE the constexpr V-loop (the last
+        # entry in lane_body).
+        lane_body.insert(len(lane_body) - 1, hoist_stmt)
+    else:
+        hoist_var, _ = cache[cache_key]
+    return f"cutlass.Uint16({hoist_var}[{vec_lane_var}]).bitcast({elem_dtype})"
+
+
 def _cute_vector_load_ctx(
     state: CodegenState,
     tensor: torch.Tensor,
@@ -1126,38 +1208,83 @@ def _cute_vector_load_ctx(
     if not loops:
         return None
     strategy = getattr(loops[-1], "strategy", None)
-    if not isinstance(strategy, LoopedReductionStrategy):
-        return None
-    vec_width = getattr(strategy, "_cute_reduction_vec_width", 1)
-    if vec_width <= 1:
-        return None
-    if strategy._mask_var is not None:
-        return None
-    if strategy._cute_reduction_lane_extent <= 0:
-        return None
-    mode = getattr(strategy, "_cute_reduction_vec_mode", "vec")
-    if mode == "vec":
-        if not feeds_reduction:
+    if isinstance(strategy, LoopedReductionStrategy):
+        vec_width = getattr(strategy, "_cute_reduction_vec_width", 1)
+        if vec_width <= 1:
             return None
-        if tensor.dtype not in _CUTE_VECTOR_DTYPES:
+        if strategy._mask_var is not None:
             return None
-        return vec_width, inner_block_id, "vec"
-    if mode == "unroll":
+        if strategy._cute_reduction_lane_extent <= 0:
+            return None
+        mode = getattr(strategy, "_cute_reduction_vec_mode", "vec")
+        if mode == "vec":
+            if not feeds_reduction:
+                return None
+            if tensor.dtype not in _CUTE_VECTOR_DTYPES:
+                return None
+            return vec_width, inner_block_id, "vec"
+        if mode == "unroll":
+            if tensor.dtype not in _CUTE_VECTOR_UNROLL_DTYPES:
+                return None
+            # The CuTe DSL's ``nvvm.load.ext`` only supports vec sizes 2
+            # and 4 for bf16/fp16 (V=8 raises ICE).  Cap effective V
+            # here so the autotuner's V=8 seed still compiles instead
+            # of crashing.
+            if vec_width > 4:
+                return None
+            # Need a lane base index var + a constexpr V-loop var; both
+            # are set up by the strategy's codegen_device_loop.
+            if (
+                getattr(strategy, "_cute_lane_base_index_var", None) is None
+                or getattr(strategy, "_cute_lane_body", None) is None
+            ):
+                return None
+            return vec_width, inner_block_id, "unroll"
+        return None
+    # CuTe N-D tile strategy with lane loops: vec is set up per-block in
+    # ``CuteNDTileStrategy.__init__`` when the autotuner picks
+    # ``cute_vector_widths[block_id]`` > 1 and EPT is divisible by V.  Mode
+    # is forced to ``"unroll"`` (per-element bitcast) for fp16/bf16 since
+    # subscripting a bf16/fp16 vector in the CuTe DSL is unsafe; fp32
+    # could in principle use ``"vec"`` but the per-element pipeline runs
+    # most of the consume-sweep code after a cast, so unroll is the
+    # robust choice.
+    from .._compiler.tile_strategy import BlockSizeTileStrategy
+
+    if isinstance(strategy, BlockSizeTileStrategy):
+        vec_by_block = getattr(strategy, "_cute_lane_vec_width_by_block", None)
+        if not isinstance(vec_by_block, dict):
+            return None
+        vec_width = vec_by_block.get(inner_block_id, 1)
+        if vec_width <= 1:
+            return None
         if tensor.dtype not in _CUTE_VECTOR_UNROLL_DTYPES:
             return None
-        # The CuTe DSL's ``nvvm.load.ext`` only supports vec sizes 2 and 4
-        # for bf16/fp16 (V=8 raises ICE).  Cap effective V here so the
-        # autotuner's V=8 seed still compiles instead of crashing.
         if vec_width > 4:
             return None
-        # Need a lane base index var + a constexpr V-loop var; both are
-        # set up by the strategy's codegen_device_loop.
+        base_var_by_block = getattr(
+            strategy, "_cute_lane_base_index_var_by_block", None
+        )
+        lane_body_by_block = getattr(strategy, "_cute_lane_body_by_block", None)
+        vec_lane_var_by_block = getattr(strategy, "_cute_vec_lane_var_by_block", None)
         if (
-            getattr(strategy, "_cute_lane_base_index_var", None) is None
-            or getattr(strategy, "_cute_lane_body", None) is None
+            not isinstance(base_var_by_block, dict)
+            or not isinstance(lane_body_by_block, dict)
+            or not isinstance(vec_lane_var_by_block, dict)
+            or inner_block_id not in base_var_by_block
+            or inner_block_id not in lane_body_by_block
+            or inner_block_id not in vec_lane_var_by_block
         ):
             return None
-        return vec_width, inner_block_id, "unroll"
+        # When the per-thread vec base could straddle the tensor edge
+        # (e.g. ``numel`` not a multiple of V), the masked-tail iter
+        # could load garbage in some lanes.  Gate the per-element mask
+        # path correctly by requiring ``numel % V == 0`` so partial-vec
+        # straddles are impossible.
+        numel = env.block_sizes[inner_block_id].numel
+        if not env.known_multiple(numel, vec_width):
+            return None
+        return vec_width, inner_block_id, "tile_unroll"
     return None
 
 
@@ -5445,8 +5572,7 @@ def _(state: CodegenState) -> object:
                 if mask_expr is not None:
                     strategy._cute_pending_vec_masks.append(mask_expr)
             mask_expr = None
-        else:
-            assert vec_mode == "unroll"
+        elif vec_mode == "unroll":
             # Register (or reuse) a hoisted U16 vec load for this (tensor,
             # base_index) pair, then return ``hoist_var[vi].bitcast(dtype)``
             # so the existing scalar pipeline sees a scalar of the original
@@ -5455,6 +5581,22 @@ def _(state: CodegenState) -> object:
             load_expr = _cute_register_unroll_vec_hoist(
                 state,
                 strategy,
+                tensor,
+                tensor_name,
+                index_exprs,
+                vec_width,
+            )
+        else:
+            assert vec_mode == "tile_unroll"
+            # Same hoist protocol as ``LoopedReductionStrategy``'s
+            # ``unroll`` mode but for ``CuteNDTileStrategy`` lane loops.
+            from .._compiler.tile_strategy import BlockSizeTileStrategy
+
+            assert isinstance(strategy, BlockSizeTileStrategy)
+            load_expr = _cute_register_tile_unroll_vec_hoist(
+                state,
+                strategy,
+                vec_block_id,
                 tensor,
                 tensor_name,
                 index_exprs,

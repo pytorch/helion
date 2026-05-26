@@ -50,17 +50,23 @@ def _cute_seed_vec_width(
     Returns 1 (scalar) when the kernel has no plausible LDG.128 win, or
     the dtype is not supported by the vector load helper. For supported
     dtypes, prefer 4 (fp32) / 8 (fp16/bf16) when the reduction is wide
-    enough that a vec-load actually halves the number of inner-loop iters.
+    enough that a vec-load actually halves the number of inner-loop
+    iters.  For fp16/bf16 the V=8 seed is sampled even when the picked
+    tile doesn't exactly match the seed size_hint — the per-block
+    strategy at construction time validates ``EPT % V == 0`` and falls
+    back to V=1 if the chosen lattice can't fit V=8, so over-seeding is
+    safe and lets the hill-climber discover the V>1 lattices that lift
+    softmax-style reductions from scalar LDG to LDG.64/LDG.128.
     """
     spec = env.config_spec
     if not spec.cute_vector_widths.valid_block_ids():
         return 1
-    if size_hint < max_threads * 2:
-        # Reduction extent already fits in one wide chunk; vec wouldn't
+    if size_hint < max_threads:
+        # Reduction extent barely fits in one wide chunk; vec wouldn't
         # remove enough loop iters to matter.
         return 1
-    # Find the dtype of the reduction-source tensor by walking nodes that
-    # have a fake-tensor value matching the reduction extent.
+    # Find the dtype of the reduction-source tensor by walking nodes
+    # that have a fake-tensor value matching the reduction extent.
     dtype: torch.dtype | None = None
     rdim_size = rl_spec.size_hint
     for graph_info in device_ir.graphs:
@@ -122,6 +128,218 @@ class CuteReductionTileHeuristic(AutotunerHeuristic):
         if vec > 1:
             seed["cute_vector_widths"] = [vec]
         return Config(**seed)
+
+
+def _cute_tile_seed_vec_width_for_dtype(dtype: torch.dtype | None) -> int:
+    """V seed for ``CuteNDTileStrategy`` lane-loop vec on a given dtype.
+
+    Returns 4 for fp32 (LDG.128 = 16 bytes), 4 for fp16/bf16 — the cute
+    DSL caps the bf16/fp16 vec unroll path at V=4 (LDG.64) because
+    V=8 hits an ICE inside ``nvvm.load.ext``.  Other dtypes get V=1.
+    """
+    if dtype is torch.float32:
+        return 4
+    if dtype in (torch.float16, torch.bfloat16):
+        return 4
+    return 1
+
+
+def _cute_tile_inner_block_dtype(
+    env: CompileEnvironment, device_ir: DeviceIR, block_id: int
+) -> torch.dtype | None:
+    """Walk the device graphs to find the dtype of any tensor whose
+    LAST dim corresponds to ``block_id``'s tile.  Used to seed the per-
+    block vec width when the kernel has no rolled reduction (e.g.
+    softmax_two_pass — its two ``hl.tile`` loops over the reduction
+    axis don't go through the ``ReductionLoopSpec`` path)."""
+    bs = env.block_sizes[block_id]
+    block_numel = bs.numel
+    try:
+        block_numel_int = int(block_numel)
+    except (TypeError, ValueError):
+        return None
+    for graph_info in device_ir.graphs:
+        for node in graph_info.graph.nodes:
+            val = node.meta.get("val")
+            if isinstance(val, torch.Tensor) and val.ndim >= 1:
+                last = val.shape[-1]
+                if isinstance(last, int) and last == block_numel_int:
+                    return val.dtype
+    return None
+
+
+class CuteTileVecHeuristic(AutotunerHeuristic):
+    """Seed config for canonical tile kernels (softmax_two_pass etc.)
+    that drive their own explicit tile loop over the reduction axis.
+
+    Seeds the "wide reduction + per-thread vec" config: block_size=
+    [1, R] on the M and reduction axes (1 row per grid block), num_threads
+    sized so each thread owns V contiguous elements (lane_extent = V),
+    cute_vector_widths=[1, V].  This lets the strategy hoist a single
+    LDG.64 / LDG.128 per outer-tile iter, lifting the kernel from scalar
+    LDG bandwidth.
+
+    The heuristic fires when:
+    * The kernel has exactly 2 tile blocks (one outer row tile + one
+      inner reduction tile), no matmul facts, no rolled reductions.
+    * The inner tile has a stride-1 fp16/bf16/fp32 source tensor.
+    """
+
+    name = "cute_tile_vec"
+    backend = "cute"
+
+    @classmethod
+    def is_eligible(cls, env: CompileEnvironment, device_ir: DeviceIR) -> bool:
+        spec = env.config_spec
+        if spec.matmul_facts:
+            return False
+        # Two-tile pattern: outer row + inner reduction (no rolled
+        # reductions registered — those use the
+        # CuteReductionTileHeuristic seed instead).
+        if len(spec.block_sizes) != 2 or spec.reduction_loops:
+            return False
+        # The inner tile block must have a vec slot registered
+        # (added by ``register_rollable_reductions`` for cute tile blocks).
+        inner_block_id = (
+            cast("Any", spec.block_sizes[1]).block_ids[0]
+            if hasattr(cast("Any", spec.block_sizes[1]), "block_ids")
+            else None
+        )
+        if inner_block_id is None:
+            return False
+        if inner_block_id not in spec.cute_vector_widths.valid_block_ids():
+            return False
+        # Need a recognisable dtype to seed V.
+        dtype = _cute_tile_inner_block_dtype(env, device_ir, inner_block_id)
+        return _cute_tile_seed_vec_width_for_dtype(dtype) > 1
+
+    @classmethod
+    def get_seed_config(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> Config | None:
+        spec = env.config_spec
+        inner_block_id = (
+            cast("Any", spec.block_sizes[1]).block_ids[0]
+            if hasattr(cast("Any", spec.block_sizes[1]), "block_ids")
+            else None
+        )
+        if inner_block_id is None:
+            return None
+        dtype = _cute_tile_inner_block_dtype(env, device_ir, inner_block_id)
+        vec = _cute_tile_seed_vec_width_for_dtype(dtype)
+        if vec <= 1:
+            return None
+        # Pick a reasonable inner block_size: prefer 1024 (matches
+        # SM100 warp + L2 hit cadence) when reachable, else cap at the
+        # inner tile's fragment.high.  ``num_threads`` is sized so the
+        # lane_extent equals V (one vec load per thread per outer iter).
+        bn_fragment = cast("Any", spec.block_sizes[1])._fragment(spec)
+        bn_high = getattr(bn_fragment, "high", None)
+        block_n: int
+        if isinstance(bn_high, int):
+            block_n = 1024 if bn_high >= 1024 else max(bn_high, vec)
+        else:
+            block_n = 1024
+        # Threads = block_n // V so each thread owns V contiguous elts.
+        nt_n = max(1, block_n // vec)
+        seed: dict[str, Any] = {
+            "block_sizes": [1, block_n],
+            "num_threads": [0, nt_n],
+            "cute_vector_widths": [1, vec],
+        }
+        try:
+            return Config(**seed)
+        except Exception:
+            return None
+
+
+class CuteTileVecWarpReduceHeuristic(AutotunerHeuristic):
+    """Sibling seed for ``CuteTileVecHeuristic`` favouring a warp-sized
+    thread block over the wider 1024-thread lattice.
+
+    For tile kernels that reduce across the inner axis per outer-tile
+    iter (softmax_two_pass, RMS norm, etc.), the cross-thread combine
+    is the dominant cost. With ``num_threads <= 32`` the reduction
+    strategy lowers to ``cute.arch.warp_reduction`` (one warp-shuffle,
+    no shared memory, no CTA-wide barrier); with ``num_threads > 32``
+    it lowers to ``_cute_grouped_reduce_shared_two_stage`` which costs
+    two ``sync_threads`` per reduction. For wide reduction axes the
+    larger number of outer iters is more than offset by the per-iter
+    savings.
+
+    Seeds ``block_sizes=[1, V * 32]``, ``num_threads=[0, 32]``,
+    ``cute_vector_widths=[1, V]`` so each thread owns V contiguous
+    elements (one vec load per outer iter) and the cross-thread
+    reduction stays inside a single warp. Applies only when the
+    reduction extent is large enough to amortise the launch cost of
+    many CTAs (each row is a CTA) and the dtype admits a vec >= 2.
+    """
+
+    name = "cute_tile_vec_warp_reduce"
+    backend = "cute"
+
+    @classmethod
+    def is_eligible(cls, env: CompileEnvironment, device_ir: DeviceIR) -> bool:
+        spec = env.config_spec
+        if spec.matmul_facts:
+            return False
+        if len(spec.block_sizes) != 2 or spec.reduction_loops:
+            return False
+        inner_block_id = (
+            cast("Any", spec.block_sizes[1]).block_ids[0]
+            if hasattr(cast("Any", spec.block_sizes[1]), "block_ids")
+            else None
+        )
+        if inner_block_id is None:
+            return False
+        if inner_block_id not in spec.cute_vector_widths.valid_block_ids():
+            return False
+        dtype = _cute_tile_inner_block_dtype(env, device_ir, inner_block_id)
+        vec = _cute_tile_seed_vec_width_for_dtype(dtype)
+        if vec <= 1:
+            return False
+        # Only worth it when the reduction extent is wide enough that
+        # the warp-only reduction's many outer iters still amortise
+        # against the launch cost (and an autotuner-picked warp lattice
+        # can hold the row).  We use the inner block fragment's high
+        # bound as a proxy for the reduction extent.
+        bn_fragment = cast("Any", spec.block_sizes[1])._fragment(spec)
+        bn_high = getattr(bn_fragment, "high", None)
+        return isinstance(bn_high, int) and bn_high >= vec * 32
+
+    @classmethod
+    def get_seed_config(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> Config | None:
+        spec = env.config_spec
+        inner_block_id = (
+            cast("Any", spec.block_sizes[1]).block_ids[0]
+            if hasattr(cast("Any", spec.block_sizes[1]), "block_ids")
+            else None
+        )
+        if inner_block_id is None:
+            return None
+        dtype = _cute_tile_inner_block_dtype(env, device_ir, inner_block_id)
+        vec = _cute_tile_seed_vec_width_for_dtype(dtype)
+        if vec <= 1:
+            return None
+        # Each thread owns V contiguous elements; one warp = 32 threads
+        # = 32 * V elements per outer-tile iter. Cap by the fragment's
+        # high bound so the seed is reachable for short reduction axes.
+        bn_fragment = cast("Any", spec.block_sizes[1])._fragment(spec)
+        bn_high = getattr(bn_fragment, "high", None)
+        block_n = vec * 32
+        if isinstance(bn_high, int) and bn_high < block_n:
+            return None
+        seed: dict[str, Any] = {
+            "block_sizes": [1, block_n],
+            "num_threads": [0, 32],
+            "cute_vector_widths": [1, vec],
+        }
+        try:
+            return Config(**seed)
+        except Exception:
+            return None
 
 
 class CuteReductionWideChunkHeuristic(AutotunerHeuristic):
