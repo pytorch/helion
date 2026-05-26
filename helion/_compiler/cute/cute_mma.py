@@ -34,22 +34,26 @@ from torch.fx.node import Node
 from ... import exc
 from ..ast_extension import expr_from_string
 from ..ast_extension import statement_from_string
-from ..device_function import CuteTcgen05MatmulPlan
-from ..device_function import CuteTcgen05StoreValue
 from ..dtype_utils import cast_ast
 from ..matmul_utils import _needs_f32_accumulator
 from ..tile_strategy import DeviceLoopState
 from .aux_tensor import discover_tcgen05_aux_tensor_descriptors
 from .cutedsl_compat import emit_pipeline_advance
+from .device_state import CuteDeviceFunctionState
+from .device_state import CuteTcgen05MatmulPlan
+from .device_state import CuteTcgen05StoreValue
 from .layout import MatmulExecutionKind
 from .layout import MatmulExecutionPlan
 from .matmul_utils import analyze_direct_grouped_n_loads
 from .mma_support import get_cute_mma_support
 from .strategies import TCGEN05_LEGAL_SMEM_SWIZZLE_BYTES
 from .strategies import Tcgen05PersistenceModel
+from .strategies import is_pure_matmul_role_lifecycle_config
 from .strategies import l2_swizzle_size_from_config
 from .strategies import layout_overrides_from_config
 from .strategies import smem_swizzle_min_major_mode_bytes
+from .strategies import tcgen05_default_epilogue_tile_expr
+from .strategies import tcgen05_explicit_epilogue_tile_expr
 from .strategies import tcgen05_smem_layout_expr
 from .strategies import warp_spec_from_config
 from .tcgen05_constants import TCGEN05_AB_CONSUMER_PHASE_MODE_CONFIG_KEY
@@ -73,13 +77,51 @@ from .tcgen05_constants import TCGEN05_ACC_PRODUCER_ADVANCE_MODE_SKIP
 from .tcgen05_constants import TCGEN05_ACC_PRODUCER_MODE_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_ACC_PRODUCER_MODE_NORMAL
 from .tcgen05_constants import TCGEN05_ACC_PRODUCER_MODE_SKIP_UMMA
+from .tcgen05_constants import TCGEN05_AUX_LOAD_MODE_CONFIG_KEY
+from .tcgen05_constants import TCGEN05_AUX_LOAD_MODE_TMA
+from .tcgen05_constants import TCGEN05_AUX_STAGE_COUNT_CHOICES
+from .tcgen05_constants import TCGEN05_AUX_STAGE_COUNT_DEFAULT
+from .tcgen05_constants import TCGEN05_AUX_STAGES_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_CLUSTER_M2_ONE_CTA_ROLE_LOCAL_CONFIG_KEY
+from .tcgen05_constants import TCGEN05_CONSUMER_REGS_CHOICES
+from .tcgen05_constants import TCGEN05_CONSUMER_REGS_CONFIG_KEY
+from .tcgen05_constants import TCGEN05_CONSUMER_REGS_DEFAULT
+from .tcgen05_constants import TCGEN05_DIRECT_ENTRY_PLAN_CONFIG_KEY
+from .tcgen05_constants import TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_LARGE_BN_PROOF_BLOCK_SIZES
 from .tcgen05_constants import TCGEN05_LARGE_BN_PROOF_CLUSTER_M
 from .tcgen05_constants import TCGEN05_LARGE_BN_PROOF_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_LARGE_BN_PROOF_PID_TYPE
 from .tcgen05_constants import TCGEN05_LARGE_BN_PROOF_PROBLEM_SHAPE
+from .tcgen05_constants import TCGEN05_PURE_CLC_SCHEDULER_OBJECT_CONFIG_KEY
+from .tcgen05_constants import TCGEN05_PURE_DYNAMIC_SCHEDULER_OBJECT_CONFIG_KEY
+from .tcgen05_constants import TCGEN05_SCHED_STAGE_COUNT_CONFIG_KEY
+from .tcgen05_constants import TCGEN05_TARGET1_TVM_FFI_BLOCK_K
+from .tcgen05_constants import TCGEN05_TARGET2_TVM_FFI_AB_STAGES
+from .tcgen05_constants import TCGEN05_TARGET2_TVM_FFI_BLOCK_K
+from .tcgen05_constants import TCGEN05_TARGET2_TVM_FFI_C_STAGES
+from .tcgen05_constants import TCGEN05_TARGET3_TVM_FFI_AB_STAGES
+from .tcgen05_constants import TCGEN05_TARGET3_TVM_FFI_BLOCK_K
+from .tcgen05_constants import TCGEN05_TARGET3_TVM_FFI_C_STAGES
+from .tcgen05_constants import TCGEN05_TARGET4_TVM_FFI_AB_STAGES
+from .tcgen05_constants import TCGEN05_TARGET4_TVM_FFI_BLOCK_K
+from .tcgen05_constants import TCGEN05_TARGET4_TVM_FFI_C_STAGES
+from .tcgen05_constants import TCGEN05_TARGET5_TVM_FFI_AB_STAGES
+from .tcgen05_constants import TCGEN05_TARGET5_TVM_FFI_BLOCK_K
+from .tcgen05_constants import TCGEN05_TARGET5_TVM_FFI_C_STAGES
+from .tcgen05_constants import TCGEN05_TARGET6_TVM_FFI_AB_STAGES
+from .tcgen05_constants import TCGEN05_TARGET6_TVM_FFI_BLOCK_K
+from .tcgen05_constants import TCGEN05_TARGET6_TVM_FFI_C_STAGES
+from .tcgen05_constants import TCGEN05_TARGET7_TVM_FFI_AB_STAGES
+from .tcgen05_constants import TCGEN05_TARGET7_TVM_FFI_BLOCK_K
+from .tcgen05_constants import TCGEN05_TARGET7_TVM_FFI_C_STAGES
+from .tcgen05_constants import TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_M
+from .tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_N
+from .tcgen05_constants import TCGEN05_TWO_CTA_EDGE_TMA_STORE_MAX_AB_STAGES
+from .tcgen05_lifecycle import Tcgen05LifecycleContext
+from .tcgen05_pure_matmul import Tcgen05PureClcSchedulerObject
+from .tcgen05_pure_matmul import Tcgen05PureMatmulObjectModel
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
@@ -105,13 +147,23 @@ _TRACE_THROUGH_TARGETS = {
 # barrier ops, so they can give back registers; consumer warps (MMA
 # exec, epilogue) need the extra budget for register-resident
 # accumulators and TMEM↔RMEM staging. Values match Quack's sm100
-# reference (`gemm_sm100.py`).
+# reference (`gemm_sm100.py`). The consumer-side ceiling is autotune-
+# searchable via ``TCGEN05_CONSUMER_REGS_CONFIG_KEY`` (cycle 15 H2);
+# the default 256 lives in ``tcgen05_constants.py`` so the codegen
+# call site reads the per-config value and emission stays byte-
+# identical at the default.
 _TCGEN05_PRODUCER_REGS = 120
-_TCGEN05_CONSUMER_REGS = 256
+# 128x32 bf16 gives the validated 64 Ki-bit D-store TMA box and x32 TMEM
+# drain for the current Target1 CtaGroup.TWO diagnostic path.
+_TCGEN05_EXPLICIT_EPI_TILE_VALIDATED_SHAPE = (
+    TCGEN05_TWO_CTA_BLOCK_M // 2,
+    32,
+    32,
+)
 # Cluster-leader (cta_rank == 0) form. Used only when V-leader semantics
 # degenerate to cluster-leader -- i.e. cluster_size == V (no V-non-leader
 # CTAs), today's cluster_m=2 cluster_n=1 use_2cta=True path. Preserves the
-# cluster_n=1 byte-identity golden.
+# cluster_n=1 leader predicate form.
 _TCGEN05_CLUSTER_LEADER_PREDICATE = (
     "cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster()) == cutlass.Int32(0)"
 )
@@ -187,6 +239,8 @@ class _Tcgen05AuxPerDescriptorRingNames:
     smem_layout: str
     smem_ptr: str
     smem: str
+    tma_atom: str | None
+    tma_tensor: str | None
 
 
 @dataclass(frozen=True)
@@ -232,6 +286,8 @@ class _Tcgen05AuxPipelinePlan:
     # off this state per subtile of the per-output-tile aux region.
     consumer_state: str
     rings: tuple[_Tcgen05AuxPerDescriptorRingNames, ...]
+    use_tma_load: bool
+    stage_count: int
     # ``epi_tile_var`` is the matmul-plan ``epi_tile`` variable
     # name. The producer body in
     # ``program_id._build_c_input_warp_role_local_while`` uses it
@@ -306,6 +362,49 @@ def _collect_node_dependencies(node: Node) -> set[Node]:
         for arg in current.kwargs.values():
             stack.extend(_iter_node_inputs(arg))
     return required
+
+
+def _collective_load_dependency_nodes(
+    load_node: Node,
+    collective_dependency_nodes: set[Node],
+    terminal_load_nodes: set[Node],
+) -> tuple[Node, ...]:
+    """Return exclusive FX dependency nodes for a tcgen05 collective load."""
+    dependencies = _collect_node_dependencies(load_node)
+    exclusive_nodes = set(collective_dependency_nodes)
+    terminal_load_nodes = terminal_load_nodes & exclusive_nodes
+    changed = True
+    while changed:
+        changed = False
+        for dependency in tuple(exclusive_nodes):
+            if dependency in terminal_load_nodes:
+                continue
+            if any(user not in exclusive_nodes for user in dependency.users):
+                exclusive_nodes.remove(dependency)
+                changed = True
+    return tuple(
+        sorted(dependencies & exclusive_nodes, key=lambda dependency: dependency.name)
+    )
+
+
+def _register_collective_handled_loads(
+    cute_state: CuteDeviceFunctionState, *load_nodes: Node
+) -> None:
+    # This is called both by the early lane-loop-suppression probe and by MMA
+    # emission. Registration is set-based, so repeating it is idempotent and
+    # keeps both call sites local to the decision they support.
+    collective_dependency_nodes: set[Node] = set()
+    for load_node in load_nodes:
+        collective_dependency_nodes.update(_collect_node_dependencies(load_node))
+    terminal_load_nodes = set(load_nodes)
+    for load_node in load_nodes:
+        dependency_nodes = _collective_load_dependency_nodes(
+            load_node, collective_dependency_nodes, terminal_load_nodes
+        )
+        cute_state.register_collective_handled_load(
+            load_node.name,
+            dependency_nodes=dependency_nodes,
+        )
 
 
 def _mma_loop_is_exclusive(node: Node) -> bool:
@@ -610,6 +709,64 @@ def _grid_thread_extent(cg: GenerateAST, block_id: int) -> int:
     return grid_state.thread_axis_sizes.get(thread_axis, 1)
 
 
+@dataclass(frozen=True)
+class _MmaRoleCoordinatePlan:
+    """Logical MMA/role coordinates for the current CUDA launch topology."""
+
+    mma_m_coord: str
+    mma_n_coord: str
+    mma_m_thread_extent: int
+    mma_active_n_threads: int
+
+    def mma_tidx_expr(self) -> str:
+        return (
+            f"{self.mma_m_coord} + "
+            f"({self.mma_n_coord}) * cutlass.Int32({self.mma_m_thread_extent})"
+        )
+
+    def mma_active_expr(self) -> str:
+        return f"({self.mma_n_coord}) < cutlass.Int32({self.mma_active_n_threads})"
+
+
+def _mma_epi_tidx_expr(*, lane_idx: str, warp_idx: str, epi_active: str) -> str:
+    return (
+        f"{lane_idx} + {warp_idx} * cutlass.Int32(32) "
+        f"if {epi_active} else cutlass.Int32(0)"
+    )
+
+
+def _block_axis_mma_role_coordinate_plan(
+    cg: GenerateAST,
+    *,
+    m_block_id: int,
+    n_block_id: int,
+    mma_m_thread_extent: int,
+    mma_active_n_threads: int,
+) -> _MmaRoleCoordinatePlan:
+    """Return the current block-axis-backed MMA role-coordinate plan."""
+    return _MmaRoleCoordinatePlan(
+        mma_m_coord=_physical_mma_coord_expr(cg, m_block_id),
+        mma_n_coord=_physical_mma_coord_expr(cg, n_block_id),
+        mma_m_thread_extent=mma_m_thread_extent,
+        mma_active_n_threads=mma_active_n_threads,
+    )
+
+
+def _flat_mma_role_coordinate_plan(
+    *,
+    lane_idx: str,
+    warp_idx: str,
+    mma_active_n_threads: int,
+) -> _MmaRoleCoordinatePlan:
+    """Return logical MMA coordinates derived from a flat 8-warp launch."""
+    return _MmaRoleCoordinatePlan(
+        mma_m_coord=lane_idx,
+        mma_n_coord=warp_idx,
+        mma_m_thread_extent=32,
+        mma_active_n_threads=mma_active_n_threads,
+    )
+
+
 def _grid_cta_thread_count(cg: GenerateAST) -> int:
     grid_state = cg.current_grid_state
     if grid_state is None:
@@ -802,9 +959,6 @@ def prepare_cute_collective_lane_loop_suppression(
             and isinstance(lhs_fake.shape[1], int)
         ):
             continue
-        m = lhs_fake.shape[0]
-        n = rhs_fake.shape[1]
-        k = lhs_fake.shape[1]
         bm = bn = bk = None
         candidate_block_ids = [*grid_state.block_ids]
         if (
@@ -836,8 +990,6 @@ def prepare_cute_collective_lane_loop_suppression(
             != "tcgen05"
         ):
             continue
-        if m % bm != 0 or n % bn != 0 or k % bk != 0:
-            continue
         if (
             len(lhs_load.users) != 1
             or len(rhs_load.users) != 1
@@ -846,10 +998,10 @@ def prepare_cute_collective_lane_loop_suppression(
         ):
             continue
 
-        cg.device_function.register_cute_collective_handled_load(lhs_load.name)
-        cg.device_function.register_cute_collective_handled_load(rhs_load.name)
+        cute_state = cg.device_function.cute_state
+        _register_collective_handled_loads(cute_state, lhs_load, rhs_load)
         if grid_state.has_lane_loops():
-            cg.device_function.suppress_cute_root_lane_loops = True
+            cute_state.request_root_lane_loop_suppression()
 
 
 def _mma_result_can_be_deferred(node: Node) -> bool:
@@ -901,6 +1053,10 @@ class _PerKiterTmaArgs:
     # (cute_plan.md §6.12.7). Default 1 preserves byte-identity for the
     # validated cluster_m=2 cluster_n=1 path.
     cluster_n: int = 1
+    # Static-full one-CTA pipelined TMA loops can drop the per-K runtime
+    # full-tile branch and scalar fallback. Non-pipelined/asymmetric or two-CTA
+    # TMA paths must keep the guarded fallback path.
+    static_full_tiles: bool = False
 
 
 def _kloop_tma_copy_a_src(args: _PerKiterTmaArgs, *, k_offset: str) -> str:
@@ -951,11 +1107,11 @@ def _tcgen05_two_cta_owner_predicate(
     of each V-pair so the AB consumer-release barrier and MMA issuance are
     *not* duplicated by the V-non-leader CTA. With ``cluster_n=1`` the only
     V-pair has V-leader rank 0 (cluster-leader), so the cheaper ``rank == 0``
-    spelling is used to preserve the validated cluster_n=1 byte-identity
-    golden. With ``cluster_n=2`` there are two V-pairs (V-leaders {0, 2})
-    so the predicate must use ``rank % 2 == 0``; rank 2 must commit on its
-    own V-pair's empty barrier or the cluster races (cycle-26 hang root
-    cause; see cute_plan.md §6.12.3).
+    spelling keeps the validated cluster_n=1 predicate shape. With
+    ``cluster_n=2`` there are two V-pairs (V-leaders {0, 2}) so the predicate
+    must use ``rank % 2 == 0``; rank 2 must commit on its own V-pair's empty
+    barrier or the cluster races (cycle-26 hang root cause; see cute_plan.md
+    §6.12.3).
     """
     predicate_terms = []
     if gate_exec_warp:
@@ -989,8 +1145,13 @@ def _build_kloop_pipeline_producer_if(
     assert args.use_tma_a and args.use_tma_b, (
         "pipelined branch requires both A and B to be TMA-loaded"
     )
+    assert not (args.static_full_tiles and args.is_two_cta), (
+        "static-full fast path is only valid for one-CTA pipelined TMA loops"
+    )
     k_offset = f"{args.tma_k_tile} + cutlass.Int32({args.ab_stage_count})"
-    predicate_terms = [args.tma_full_tile]
+    predicate_terms = []
+    if not args.static_full_tiles:
+        predicate_terms.append(args.tma_full_tile)
     if gate_tma_warp:
         predicate_terms.append(args.tma_warp)
     predicate_terms.append(args.tma_next_full_tile)
@@ -1028,8 +1189,20 @@ def _build_kloop_pipeline_consumer_if(
     gate_exec_warp: bool = True,
     include_scalar_fallback: bool = True,
     use_existing_try_token: bool = False,
+    sync_before_scalar_fallback: bool = False,
 ) -> ast.stmt:
     """Per-K-iter TMA consumer / scalar-fallback ``if`` for the pipelined branch."""
+    if args.static_full_tiles:
+        assert not args.is_two_cta, (
+            "static-full fast path is only valid for one-CTA pipelined TMA loops"
+        )
+        assert gate_exec_warp, "static-full fast path requires an exec-warp gate"
+        assert not include_scalar_fallback, (
+            "static-full fast path has no scalar fallback branch"
+        )
+        assert not sync_before_scalar_fallback, (
+            "static-full fast path has no scalar fallback presync"
+        )
     if args.skip_consumer_wait:
         consumer_src = "pass"
     else:
@@ -1051,14 +1224,20 @@ def _build_kloop_pipeline_consumer_if(
             gate_exec_warp=gate_exec_warp,
             cluster_n=args.cluster_n,
         ),
-        indent="    ",
+        indent="" if args.static_full_tiles else "    ",
     )
+    if args.static_full_tiles:
+        return statement_from_string(full_tile_src)
     fallback_src = ""
     if include_scalar_fallback:
         scalar_load_a_src = textwrap.indent(ast.unparse(args.scalar_load_a), "    ")
         scalar_load_b_src = textwrap.indent(ast.unparse(args.scalar_load_b), "    ")
+        leading_sync_src = (
+            "    cute.arch.sync_threads()\n" if sync_before_scalar_fallback else ""
+        )
         fallback_src = (
             "\nelse:\n"
+            f"{leading_sync_src}"
             f"{scalar_load_a_src}\n"
             f"{scalar_load_b_src}\n"
             "    cute.arch.sync_threads()"
@@ -1108,6 +1287,14 @@ def _build_kloop_pipeline_release_if(
     advance their local consumer state. Peer CTAs participate via the
     multicast mask; separate peer arrivals over-count the empty barrier.
     """
+    if args.static_full_tiles:
+        assert not args.is_two_cta, (
+            "static-full fast path is only valid for one-CTA pipelined TMA loops"
+        )
+        assert gate_exec_warp, "static-full fast path requires an exec-warp gate"
+        assert not include_scalar_fallback, (
+            "static-full fast path has no scalar fallback branch"
+        )
     release_src = f"{args.tma_pipeline}.consumer_release({args.tma_consumer_state})"
     release_gate = _tcgen05_two_cta_owner_predicate(
         args.exec_active,
@@ -1116,19 +1303,22 @@ def _build_kloop_pipeline_release_if(
         cluster_n=args.cluster_n,
     )
     advance_src = emit_pipeline_advance(args.tma_consumer_state)
+    indent = "" if args.static_full_tiles else "    "
     if args.is_two_cta:
         # With gate_exec_warp=False the caller is already inside the
         # role-local exec loop, so every iteration can advance local state.
         advance_gate = args.exec_active if gate_exec_warp else None
         full_tile_src = (
-            _tcgen05_emit_optional_gate(release_src, release_gate, indent="    ")
+            _tcgen05_emit_optional_gate(release_src, release_gate, indent=indent)
             + "\n"
-            + _tcgen05_emit_optional_gate(advance_src, advance_gate, indent="    ")
+            + _tcgen05_emit_optional_gate(advance_src, advance_gate, indent=indent)
         )
     else:
         full_tile_src = _tcgen05_emit_optional_gate(
-            release_src + "\n" + advance_src, release_gate, indent="    "
+            release_src + "\n" + advance_src, release_gate, indent=indent
         )
+    if args.static_full_tiles:
+        return statement_from_string(full_tile_src)
     fallback_src = (
         "\nelse:\n    cute.arch.sync_threads()" if include_scalar_fallback else ""
     )
@@ -1199,6 +1389,9 @@ def _build_kloop_non_pipeline_producer_if(
     offset on the cute.copy, and no ``advance`` here (the release block
     advances both producer and consumer state).
     """
+    assert not args.static_full_tiles, (
+        "static-full fast path is only valid for pipelined all-TMA K loops"
+    )
     predicate_terms = [args.tma_full_tile]
     if gate_tma_warp:
         predicate_terms.append(args.tma_warp)
@@ -1224,37 +1417,36 @@ def _build_kloop_non_pipeline_consumer_if(args: _PerKiterTmaArgs) -> ast.stmt:
     into the full-tile branch (e.g. A-TMA + B-scalar still loads B
     here on full tiles).
     """
-    scalar_load_a_src = textwrap.indent(ast.unparse(args.scalar_load_a), "    ")
-    scalar_load_b_src = textwrap.indent(ast.unparse(args.scalar_load_b), "    ")
-    scalar_load_a_tma_src = (
-        textwrap.indent(ast.unparse(args.scalar_load_a), "    ") + "\n"
-        if not args.use_tma_a
-        else ""
+    assert not args.static_full_tiles, (
+        "static-full fast path is only valid for pipelined all-TMA K loops"
     )
-    scalar_load_b_tma_src = (
-        textwrap.indent(ast.unparse(args.scalar_load_b), "    ") + "\n"
-        if not args.use_tma_b
-        else ""
-    )
-    src = (
-        f"if {args.tma_full_tile}:\n"
+    scalar_load_a_src = ast.unparse(args.scalar_load_a)
+    scalar_load_b_src = ast.unparse(args.scalar_load_b)
+    scalar_load_a_tma_src = scalar_load_a_src + "\n" if not args.use_tma_a else ""
+    scalar_load_b_tma_src = scalar_load_b_src + "\n" if not args.use_tma_b else ""
+    full_body = (
         f"{scalar_load_a_tma_src}"
         f"{scalar_load_b_tma_src}"
-        f"    if {args.exec_active}:\n"
-        "        cute.arch.sync_warp()\n"
+        f"if {args.exec_active}:\n"
+        "    cute.arch.sync_warp()\n"
         + (
-            "        pass\n"
+            "    pass\n"
             if args.skip_consumer_wait
             else (
-                f"        {args.tma_pipeline}.consumer_wait("
+                f"    {args.tma_pipeline}.consumer_wait("
                 f"{args.tma_consumer_state}, {args.tma_consumer_try_token})\n"
             )
         )
-        + "    cute.arch.sync_threads()\n"
-        + "else:\n"
-        + f"{scalar_load_a_src}\n"
-        + f"{scalar_load_b_src}\n"
-        + "    cute.arch.sync_threads()"
+        + "cute.arch.sync_threads()"
+    )
+    fallback_body = (
+        f"{scalar_load_a_src}\n{scalar_load_b_src}\ncute.arch.sync_threads()"
+    )
+    src = (
+        f"if {args.tma_full_tile}:\n"
+        f"{textwrap.indent(full_body, '    ')}\n"
+        "else:\n"
+        f"{textwrap.indent(fallback_body, '    ')}"
     )
     return statement_from_string(src)
 
@@ -1267,20 +1459,25 @@ def _build_kloop_non_pipeline_release_if(args: _PerKiterTmaArgs) -> ast.stmt:
     consumer state normally advance here. The producer advance is omitted
     only by the guarded invalid-output bridge diagnostic.
     """
+    assert not args.static_full_tiles, (
+        "static-full fast path is only valid for pipelined all-TMA K loops"
+    )
     producer_advance_src = (
-        emit_pipeline_advance(args.tma_producer_state, indent="    ") + "\n"
+        emit_pipeline_advance(args.tma_producer_state, indent="") + "\n"
         if not args.skip_producer_advance
         else ""
     )
+    full_body = (
+        "cute.arch.sync_threads()\n"
+        f"if {args.exec_active}:\n"
+        "    cute.arch.sync_warp()\n"
+        f"    {args.tma_pipeline}.consumer_release({args.tma_consumer_state})\n"
+        + producer_advance_src
+        + emit_pipeline_advance(args.tma_consumer_state, indent="")
+    )
     src = (
         f"if {args.tma_full_tile}:\n"
-        "    cute.arch.sync_threads()\n"
-        f"    if {args.exec_active}:\n"
-        "        cute.arch.sync_warp()\n"
-        f"        {args.tma_pipeline}.consumer_release({args.tma_consumer_state})\n"
-        + producer_advance_src
-        + emit_pipeline_advance(args.tma_consumer_state, indent="    ")
-        + "\n"
+        f"{textwrap.indent(full_body, '    ')}\n"
         "else:\n"
         "    cute.arch.sync_threads()"
     )
@@ -1404,7 +1601,10 @@ def _is_persistent_pid_config(config: Mapping[str, object]) -> bool:
 
 
 def _clone_k_loop_with_body(
-    device_loop: DeviceLoopState, body: list[ast.stmt]
+    device_loop: DeviceLoopState,
+    body: list[ast.stmt],
+    *,
+    iter_expr: ast.expr | None = None,
 ) -> ast.For:
     """Clone the active K-loop header with a replacement body."""
     # Do not reuse the original target / iter AST nodes: the original loop
@@ -1415,9 +1615,10 @@ def _clone_k_loop_with_body(
         f"for {ast.unparse(device_loop.for_node.target)} in ():\n    pass"
     ).body[0]
     assert isinstance(parsed_loop, ast.For)
-    iter_expr = cast(
-        "ast.expr", expr_from_string(ast.unparse(device_loop.for_node.iter))
-    )
+    if iter_expr is None:
+        iter_expr = cast(
+            "ast.expr", expr_from_string(ast.unparse(device_loop.for_node.iter))
+        )
     return ast.copy_location(
         ast.For(
             target=parsed_loop.target,
@@ -1430,18 +1631,47 @@ def _clone_k_loop_with_body(
     )
 
 
-def _trace_mma_to_store_dtype(
+def _tcgen05_k_loop_nounroll_iter_expr(device_loop: DeviceLoopState) -> ast.expr:
+    """Preserve the active K-loop bounds while adding CuTe no-unroll metadata."""
+    iter_expr = cast(
+        "ast.expr", expr_from_string(ast.unparse(device_loop.for_node.iter))
+    )
+    assert isinstance(iter_expr, ast.Call)
+    assert isinstance(iter_expr.func, ast.Name)
+    assert iter_expr.func.id == "range"
+    assert not any(
+        keyword.arg in ("unroll", "unroll_full") for keyword in iter_expr.keywords
+    )
+    iter_expr.func = cast("ast.expr", expr_from_string("cutlass.range"))
+    iter_expr.keywords.append(ast.keyword(arg="unroll", value=ast.Constant(value=1)))
+    return iter_expr
+
+
+def _wrap_stmt_in_if(stmt: ast.stmt, predicate_src: str) -> ast.If:
+    return ast.copy_location(
+        ast.If(
+            test=cast("ast.expr", expr_from_string(predicate_src)),
+            body=[stmt],
+            orelse=[],
+        ),
+        stmt,
+    )
+
+
+def _trace_mma_to_single_store_value_and_dtype(
     mma_node: Node,
     graphs: list[GraphInfo],
-) -> torch.dtype | None:
-    """Forward-trace ``mma_node`` to the unique consuming store target dtype.
+    *,
+    extra_trace_through: frozenset[object] = frozenset(),
+) -> tuple[Node, torch.dtype] | None:
+    """Forward-trace ``mma_node`` to exactly one consuming store.
 
     Walks ``_phi`` / ``_new_var`` / ``convert_element_type`` /
     ``operator.getitem`` chains and crosses subgraph boundaries via the
     inner ``output`` node and the matching outer-graph
     ``operator.getitem(_for_loop_node, idx)``. Returns ``None`` when the
-    trace cannot pin a unique store target — multiple stores with
-    different dtypes, an op the trace cannot safely follow, no reachable
+    trace cannot pin exactly one store target — multiple stores even with
+    the same dtype, an op the trace cannot safely follow, no reachable
     store, or ``mma_node.graph`` not present in ``graphs``. The caller
     must treat ``None`` as "fall back; the cross-site assertion catches
     real mismatches".
@@ -1451,6 +1681,106 @@ def _trace_mma_to_store_dtype(
     ``GraphInfo.graph`` by identity — that's the disambiguator across
     structurally-identical subgraphs (e.g., a kernel with two distinct
     matmuls would otherwise collide on ``_graph_signature``).
+
+    ``extra_trace_through`` lets the caller broaden the set of ops the
+    walker will follow past — e.g. ``aten.relu.default`` for the
+    relu-store gate. Default behaviour is unchanged.
+    """
+    import operator
+
+    from ...language import _tracing_ops
+    from ...language import memory_ops
+
+    graph_id_of: dict[torch.fx.Graph, int] = {}
+    for_loop_calls_by_graph_id: dict[int, list[Node]] = {}
+    for graph_info in graphs:
+        graph_id_of[graph_info.graph] = graph_info.graph_id
+        for node in graph_info.graph.nodes:
+            if node.op != "call_function":
+                continue
+            if not _tracing_ops.is_for_loop_target(node.target):
+                continue
+            graph_id_arg = node.args[0] if node.args else None
+            if not isinstance(graph_id_arg, int):
+                continue
+            for_loop_calls_by_graph_id.setdefault(graph_id_arg, []).append(node)
+
+    if mma_node.graph not in graph_id_of:
+        return None
+
+    store_target: tuple[Node, torch.dtype] | None = None
+    store_count = 0
+    visited: set[Node] = set()
+    stack: list[Node] = [mma_node]
+    while stack:
+        cur = stack.pop()
+        if cur in visited:
+            continue
+        visited.add(cur)
+        for user in cur.users:
+            if user.op == "output":
+                graph_id = graph_id_of.get(cur.graph)
+                if graph_id is None:
+                    return None
+                output_args = user.args[0] if user.args else None
+                if not isinstance(output_args, (list, tuple)):
+                    return None
+                out_indices = [i for i, arg in enumerate(output_args) if arg is cur]
+                if not out_indices:
+                    return None
+                for outer_call in for_loop_calls_by_graph_id.get(graph_id, []):
+                    for outer_user in outer_call.users:
+                        if (
+                            outer_user.op == "call_function"
+                            and outer_user.target is operator.getitem
+                            and len(outer_user.args) >= 2
+                            and outer_user.args[1] in out_indices
+                            and outer_user not in visited
+                        ):
+                            stack.append(outer_user)
+                continue
+            if user.op != "call_function":
+                continue
+            target = user.target
+            if target is memory_ops.store:
+                tensor_node = user.args[0] if user.args else None
+                if not isinstance(tensor_node, Node):
+                    return None
+                fake = tensor_node.meta.get("val")
+                if not isinstance(fake, torch.Tensor):
+                    return None
+                store_count += 1
+                if store_count > 1:
+                    return None
+                store_target = (cur, fake.dtype)
+                continue
+            if store_count > 0:
+                # A value that already reached its single store cannot also feed
+                # additional pointwise/use chains under this identity-store trace.
+                return None
+            if (
+                target is _tracing_ops._phi
+                or target is _tracing_ops._new_var
+                or target is operator.getitem
+                or target in _TRACE_THROUGH_TARGETS
+                or target in extra_trace_through
+            ):
+                stack.append(user)
+                continue
+            return None
+
+    return store_target if store_count == 1 else None
+
+
+def _trace_mma_to_store_dtype(
+    mma_node: Node,
+    graphs: list[GraphInfo],
+) -> torch.dtype | None:
+    """Forward-trace ``mma_node`` to a unique reachable store dtype.
+
+    Unlike the pure CLC identity-store gate, this general dtype-inference
+    helper allows same-dtype fan-out because normal tcgen05 epilogue planning
+    only needs a single target dtype.
     """
     import operator
 
@@ -1533,6 +1863,315 @@ def _trace_mma_to_store_dtype(
     return None
 
 
+def _trace_mma_to_single_identity_store_dtype(
+    mma_node: Node,
+    graphs: list[GraphInfo],
+) -> torch.dtype | None:
+    """Return the store dtype only for exactly one identity cast store."""
+    from .cute_fx_walk import build_inner_outputs_index_from_graphs
+    from .cute_fx_walk import walk_carrier_to_tcgen05_matmul
+
+    traced = _trace_mma_to_single_store_value_and_dtype(mma_node, graphs)
+    if traced is None:
+        return None
+    store_value, output_dtype = traced
+    if (
+        store_value.op != "call_function"
+        or store_value.target is not torch.ops.prims.convert_element_type.default
+        or store_value.kwargs
+    ):
+        return None
+    cast_input = store_value.args[0] if store_value.args else None
+    if not isinstance(cast_input, Node):
+        return None
+    if (
+        walk_carrier_to_tcgen05_matmul(
+            cast_input,
+            {mma_node},
+            build_inner_outputs_index_from_graphs(graphs),
+        )
+        is None
+    ):
+        return None
+    dtype_arg = store_value.args[1] if len(store_value.args) > 1 else None
+    if dtype_arg != output_dtype:
+        return None
+    return output_dtype
+
+
+_RELU_STORE_EXTRA_TRACE_THROUGH = frozenset({torch.ops.aten.relu.default})
+
+
+def _trace_mma_to_single_relu_store_dtype(
+    mma_node: Node,
+    graphs: list[GraphInfo],
+) -> torch.dtype | None:
+    """Return the store dtype only for exactly one ``relu`` + cast store.
+
+    The chain accepted here is ``mma -> relu -> convert_element_type ->
+    store``: exactly one ``aten.relu.default`` between the MMA carrier and
+    the cast that feeds the store. This mirrors
+    ``_trace_mma_to_single_identity_store_dtype`` for the relu epilogue
+    so the TVM-FFI direct entry can admit Target 4 without broadening the
+    general-purpose identity-store gate. The base walker is extended with
+    ``aten.relu.default`` so the forward trace can step past relu on its
+    way from the MMA carrier to the convert-and-store node.
+    """
+    from .cute_fx_walk import build_inner_outputs_index_from_graphs
+    from .cute_fx_walk import walk_carrier_to_tcgen05_matmul
+
+    traced = _trace_mma_to_single_store_value_and_dtype(
+        mma_node,
+        graphs,
+        extra_trace_through=_RELU_STORE_EXTRA_TRACE_THROUGH,
+    )
+    if traced is None:
+        return None
+    store_value, output_dtype = traced
+    if (
+        store_value.op != "call_function"
+        or store_value.target is not torch.ops.prims.convert_element_type.default
+        or store_value.kwargs
+    ):
+        return None
+    cast_input = store_value.args[0] if store_value.args else None
+    if not isinstance(cast_input, Node):
+        return None
+    if (
+        cast_input.op != "call_function"
+        or cast_input.target is not torch.ops.aten.relu.default
+        or cast_input.kwargs
+        or len(cast_input.args) != 1
+    ):
+        return None
+    relu_input = cast_input.args[0]
+    if not isinstance(relu_input, Node):
+        return None
+    if (
+        walk_carrier_to_tcgen05_matmul(
+            relu_input,
+            {mma_node},
+            build_inner_outputs_index_from_graphs(graphs),
+        )
+        is None
+    ):
+        return None
+    dtype_arg = store_value.args[1] if len(store_value.args) > 1 else None
+    if dtype_arg != output_dtype:
+        return None
+    return output_dtype
+
+
+# T2's bias add (``aten.add.Tensor(carrier, bias_load)``) sits between
+# the MMA carrier and the convert-and-store node. The base walker stops
+# at every ``call_function`` target outside its trace-through set, so
+# the bias-store walker has to extend the set with ``aten.add.Tensor``
+# to step past the bias add and reach the cast that feeds the store.
+_BIAS_STORE_EXTRA_TRACE_THROUGH = frozenset({torch.ops.aten.add.Tensor})
+
+
+def _trace_mma_to_single_bias_store_dtype(
+    mma_node: Node,
+    graphs: list[GraphInfo],
+) -> torch.dtype | None:
+    """Return the store dtype only for exactly one ``acc + bias[n]`` + cast store.
+
+    The chain accepted here is ``mma -> aten.add.Tensor(carrier,
+    bias_load) -> convert_element_type -> store``: exactly one
+    ``aten.add.Tensor`` between the MMA carrier and the cast that feeds
+    the store, where one of the add's operands is the MMA carrier and
+    the other is a rank-1 ``helion.language.load`` against a GMEM
+    tensor with shape ``(N,)``.
+
+    Mutually exclusive with the identity and relu walkers: identity
+    rejects any binary op in the chain, and relu requires a single-arg
+    ``aten.relu.default`` rather than the two-arg add. A T6
+    (``acc + bias[n] -> relu -> convert -> store``) chain is rejected
+    because the cast feeds off a relu rather than the add. The
+    rank-1 GMEM-load operand makes this walker T2-specific even at
+    shapes where a T3 / T4 / T5 walker would otherwise admit the
+    chain.
+    """
+    from .cute_fx_walk import build_inner_outputs_index_from_graphs
+    from .cute_fx_walk import walk_carrier_to_tcgen05_matmul
+
+    traced = _trace_mma_to_single_store_value_and_dtype(
+        mma_node,
+        graphs,
+        extra_trace_through=_BIAS_STORE_EXTRA_TRACE_THROUGH,
+    )
+    if traced is None:
+        return None
+    store_value, output_dtype = traced
+    if (
+        store_value.op != "call_function"
+        or store_value.target is not torch.ops.prims.convert_element_type.default
+        or store_value.kwargs
+    ):
+        return None
+    cast_input = store_value.args[0] if store_value.args else None
+    if not isinstance(cast_input, Node):
+        return None
+    if (
+        cast_input.op != "call_function"
+        or cast_input.target is not torch.ops.aten.add.Tensor
+        or cast_input.kwargs
+        or len(cast_input.args) != 2
+    ):
+        return None
+    add_lhs, add_rhs = cast_input.args
+    if not isinstance(add_lhs, Node) or not isinstance(add_rhs, Node):
+        return None
+    inner_outputs_index = build_inner_outputs_index_from_graphs(graphs)
+
+    def _is_rank1_bias_load(node: Node) -> bool:
+        from ...language import memory_ops
+
+        if node.op != "call_function" or node.target is not memory_ops.load:
+            return False
+        host_arg = node.args[0] if node.args else None
+        if not isinstance(host_arg, Node):
+            return False
+        host_val = host_arg.meta.get("val")
+        if not isinstance(host_val, torch.Tensor):
+            return False
+        # P2: the runtime validator only admits bf16 bias tensors, so
+        # gate the codegen walker on dtype too — a non-bf16 bias
+        # kernel at T2 shape must not reach the direct-entry path (it
+        # would otherwise fail loudly at launch instead of falling
+        # back to the wrapper-dispatch route at codegen).
+        return host_val.ndim == 1 and host_val.dtype == torch.bfloat16
+
+    # Either side of the add can be the carrier (commutative); the
+    # other must be a rank-1 bias load.
+    carrier_first = walk_carrier_to_tcgen05_matmul(
+        add_lhs, {mma_node}, inner_outputs_index
+    ) is not None and _is_rank1_bias_load(add_rhs)
+    carrier_second = walk_carrier_to_tcgen05_matmul(
+        add_rhs, {mma_node}, inner_outputs_index
+    ) is not None and _is_rank1_bias_load(add_lhs)
+    if not (carrier_first or carrier_second):
+        return None
+    dtype_arg = store_value.args[1] if len(store_value.args) > 1 else None
+    if dtype_arg != output_dtype:
+        return None
+    return output_dtype
+
+
+# T6's bias_relu chain has both ``aten.add.Tensor`` (the bias add) and
+# ``aten.relu.default`` (the post-add activation) between the MMA carrier
+# and the convert-and-store node. The walker has to step past both ops to
+# reach the cast that feeds the store, so the extra trace-through set is
+# the union of T2's bias trace-through and T4's relu trace-through.
+_BIAS_RELU_STORE_EXTRA_TRACE_THROUGH = frozenset(
+    {torch.ops.aten.add.Tensor, torch.ops.aten.relu.default}
+)
+
+
+def _trace_mma_to_single_bias_relu_store_dtype(
+    mma_node: Node,
+    graphs: list[GraphInfo],
+) -> torch.dtype | None:
+    """Return the store dtype only for one ``relu(acc + bias[n])`` + cast store.
+
+    The chain accepted here is ``mma -> aten.add.Tensor(carrier,
+    bias_load) -> aten.relu.default -> convert_element_type -> store``:
+    exactly one ``aten.add.Tensor`` (with a rank-1 bf16 GMEM bias load on
+    one side and the MMA carrier on the other) followed by exactly one
+    ``aten.relu.default`` between the MMA carrier and the cast that
+    feeds the store. This mirrors
+    ``_trace_mma_to_single_bias_store_dtype`` but additionally requires
+    the relu wrapper, gating the Target 6 TVM-FFI direct-entry seed
+    without broadening the T2 (no relu) or T4 (no bias) walkers.
+
+    Mutually exclusive with the identity (no binary op), relu (no add),
+    and bias (no relu) walkers via the chain shape: T6's
+    ``cast_input`` is a relu whose input is a bias add, while the T2
+    walker requires the cast_input to be the bias add itself. T6 also
+    keeps the bf16 dtype gate on the bias load (cycle-6 P2) so a
+    non-bf16 bias kernel at T6 shape does not reach the direct-entry
+    plan and fail only at launch.
+    """
+    from .cute_fx_walk import build_inner_outputs_index_from_graphs
+    from .cute_fx_walk import walk_carrier_to_tcgen05_matmul
+
+    traced = _trace_mma_to_single_store_value_and_dtype(
+        mma_node,
+        graphs,
+        extra_trace_through=_BIAS_RELU_STORE_EXTRA_TRACE_THROUGH,
+    )
+    if traced is None:
+        return None
+    store_value, output_dtype = traced
+    if (
+        store_value.op != "call_function"
+        or store_value.target is not torch.ops.prims.convert_element_type.default
+        or store_value.kwargs
+    ):
+        return None
+    cast_input = store_value.args[0] if store_value.args else None
+    if not isinstance(cast_input, Node):
+        return None
+    # T6 requires a relu directly feeding the cast (whereas T2 has the
+    # bias add feed the cast directly without an intervening relu).
+    if (
+        cast_input.op != "call_function"
+        or cast_input.target is not torch.ops.aten.relu.default
+        or cast_input.kwargs
+        or len(cast_input.args) != 1
+    ):
+        return None
+    relu_input = cast_input.args[0]
+    if not isinstance(relu_input, Node):
+        return None
+    # The relu's input must be the bias add: ``aten.add.Tensor(carrier,
+    # bias_load)`` or the commutative variant.
+    if (
+        relu_input.op != "call_function"
+        or relu_input.target is not torch.ops.aten.add.Tensor
+        or relu_input.kwargs
+        or len(relu_input.args) != 2
+    ):
+        return None
+    add_lhs, add_rhs = relu_input.args
+    if not isinstance(add_lhs, Node) or not isinstance(add_rhs, Node):
+        return None
+    inner_outputs_index = build_inner_outputs_index_from_graphs(graphs)
+
+    def _is_rank1_bias_load(node: Node) -> bool:
+        from ...language import memory_ops
+
+        if node.op != "call_function" or node.target is not memory_ops.load:
+            return False
+        host_arg = node.args[0] if node.args else None
+        if not isinstance(host_arg, Node):
+            return False
+        host_val = host_arg.meta.get("val")
+        if not isinstance(host_val, torch.Tensor):
+            return False
+        # P2 (cycle-6): the runtime validator only admits bf16 bias
+        # tensors, so the codegen walker is gated on dtype too — a
+        # non-bf16 bias kernel at T6 shape must not reach the direct-
+        # entry path (it would otherwise fail loudly at launch instead
+        # of falling back to the wrapper-dispatch route at codegen).
+        return host_val.ndim == 1 and host_val.dtype == torch.bfloat16
+
+    # Either side of the add can be the carrier (commutative); the
+    # other must be a rank-1 bias load.
+    carrier_first = walk_carrier_to_tcgen05_matmul(
+        add_lhs, {mma_node}, inner_outputs_index
+    ) is not None and _is_rank1_bias_load(add_rhs)
+    carrier_second = walk_carrier_to_tcgen05_matmul(
+        add_rhs, {mma_node}, inner_outputs_index
+    ) is not None and _is_rank1_bias_load(add_lhs)
+    if not (carrier_first or carrier_second):
+        return None
+    dtype_arg = store_value.args[1] if len(store_value.args) > 1 else None
+    if dtype_arg != output_dtype:
+        return None
+    return output_dtype
+
+
 def _emit_mma_pipeline(
     cg: GenerateAST,
     lhs_node: Node,
@@ -1557,6 +2196,12 @@ def _emit_mma_pipeline(
     rhs_load, _, rhs_fake = rhs_info
     if lhs_fake.ndim != 2 or rhs_fake.ndim != 2:
         return None
+
+    # Universal-MMA / tcgen05 MMA kernels rely on runtime tensor layouts
+    # for SMEM-load guards and TMA descriptors; baking literal shapes
+    # silently miscompiles those paths.  Mirror the flag set in
+    # ``_emit_cute_matmul`` so the host-side launcher disables the bake.
+    cg.cute_uses_matmul = True
 
     df = cg.device_function
     lhs_arg = df.tensor_arg(lhs_fake)
@@ -1604,6 +2249,9 @@ def _emit_mma_pipeline(
     tcgen05_use_tma_b = tcgen05_use_tma
     tcgen05_use_tma = tcgen05_use_tma_a or tcgen05_use_tma_b
     tcgen05_use_tma_pipeline = tcgen05_use_tma_a and tcgen05_use_tma_b
+    tcgen05_requested_pure_matmul_role_lifecycle = is_pure_matmul_role_lifecycle_config(
+        df.config
+    )
 
     k_total_size = int(lhs_fake.shape[1])
 
@@ -1734,13 +2382,152 @@ def _emit_mma_pipeline(
         mma_impl = "universal"
     if mma_impl != "universal" and zero_acc_expr:
         acc_expr = None
-    tcgen05_static_full_tiles = (
-        m_size % bm == 0 and n_size % bn == 0 and k_total_size % bk == 0
+    tcgen05_requested_flat_role_coordinates = bool(
+        df.config.get(TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY, False)
     )
+    tcgen05_requested_direct_entry_plan = bool(
+        df.config.get(TCGEN05_DIRECT_ENTRY_PLAN_CONFIG_KEY, False)
+    )
+    tcgen05_requested_pure_clc_scheduler_object = bool(
+        df.config.get(TCGEN05_PURE_CLC_SCHEDULER_OBJECT_CONFIG_KEY, False)
+    )
+    tcgen05_requested_pure_dynamic_scheduler_object = bool(
+        df.config.get(TCGEN05_PURE_DYNAMIC_SCHEDULER_OBJECT_CONFIG_KEY, False)
+    )
+    if tcgen05_requested_flat_role_coordinates and mma_impl != "tcgen05":
+        raise exc.BackendUnsupported(
+            "cute",
+            f"{TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY}=True requires "
+            "tcgen05 MMA codegen",
+        )
+    if tcgen05_requested_pure_clc_scheduler_object and mma_impl != "tcgen05":
+        raise exc.BackendUnsupported(
+            "cute",
+            f"{TCGEN05_PURE_CLC_SCHEDULER_OBJECT_CONFIG_KEY}=True requires "
+            "tcgen05 MMA codegen",
+        )
+    # Cycle-16 H3 Option B (staged): the pure dynamic-persistent scheduler
+    # object lives at the same dispatch layer as pure-CLC. We surface the
+    # config key + autotune knob now so cycle 17 can land productive
+    # codegen without re-doing the search / validator plumbing; in this
+    # cycle every selection of the knob still errors out with
+    # BackendUnsupported (the error is consistent whether the knob is
+    # selected by autotune or by an explicit user Config). The mma_impl
+    # gate matches the CLC predecessor.
+    if tcgen05_requested_pure_dynamic_scheduler_object and mma_impl != "tcgen05":
+        raise exc.BackendUnsupported(
+            "cute",
+            f"{TCGEN05_PURE_DYNAMIC_SCHEDULER_OBJECT_CONFIG_KEY}=True "
+            "requires tcgen05 MMA codegen",
+        )
+    if tcgen05_requested_direct_entry_plan and mma_impl != "tcgen05":
+        raise exc.BackendUnsupported(
+            "cute",
+            f"{TCGEN05_DIRECT_ENTRY_PLAN_CONFIG_KEY}=True requires tcgen05 MMA codegen",
+        )
     tcgen05_pid_is_persistent = _is_persistent_pid_config(df.config)
     tcgen05_requested_two_cta = _tcgen05_use_2cta_instrs(
         bm=bm, cluster_m=tcgen05_cluster_m
     )
+    tcgen05_cluster_n_requested = _tcgen05_cluster_n(df.config)
+    tcgen05_static_output_tiles = m_size % bm == 0 and n_size % bn == 0
+    tcgen05_static_full_tiles = tcgen05_static_output_tiles and k_total_size % bk == 0
+    tcgen05_has_k_tail = k_total_size > bk and k_total_size % bk != 0
+    tcgen05_k_tail_only = tcgen05_static_output_tiles and tcgen05_has_k_tail
+    tcgen05_double_edge_output = m_size % bm != 0 and n_size % bn != 0
+    tcgen05_double_edge_tma = (
+        mma_impl == "tcgen05"
+        and tcgen05_use_tma_pipeline
+        and tcgen05_pid_is_persistent
+        and tcgen05_cluster_m == 2
+        and tcgen05_cluster_n_requested == 1
+        and tcgen05_requested_two_cta
+        and tcgen05_double_edge_output
+        and (k_total_size % bk == 0 or tcgen05_has_k_tail)
+    )
+    if (
+        mma_impl == "tcgen05"
+        and tcgen05_double_edge_output
+        and not tcgen05_double_edge_tma
+        and (tcgen05_pid_is_persistent or tcgen05_cluster_m != 1)
+    ):
+        raise exc.BackendUnsupported(
+            "cute",
+            "tcgen05 SIMT edge epilogue double-edge output tiles are currently "
+            "validated only for flat tcgen05_cluster_m=1 kernels or "
+            "role-local CtaGroup.TWO kernels where K is divisible by block_k "
+            "or K > block_k with a tail; K <= block_k with a partial K tile "
+            "is still unsupported. "
+            "Choose a block_m or block_n that divides the static output extent, "
+            "choose a supported block_k for the static K extent, or use a "
+            "non-tcgen05 fallback for this persistent/clustered config.",
+        )
+    tcgen05_mixed_tma_scalar_fallback = (
+        mma_impl == "tcgen05"
+        and tcgen05_use_tma_pipeline
+        and not tcgen05_static_full_tiles
+        and not tcgen05_pid_is_persistent
+        and tcgen05_cluster_m == 1
+    )
+    tcgen05_edge_scalar_fallback_needs_inter_smem_a = (
+        tcgen05_mixed_tma_scalar_fallback
+        and bk >= 128
+        and (m_size % bm != 0 or n_size % bn != 0)
+    )
+    tcgen05_sync_before_scalar_fallback = (
+        tcgen05_mixed_tma_scalar_fallback and k_total_size % bk != 0
+    )
+    tcgen05_preserve_tma_for_two_cta_k_tail = (
+        mma_impl == "tcgen05"
+        and tcgen05_use_tma_pipeline
+        and tcgen05_pid_is_persistent
+        and tcgen05_cluster_m == 2
+        and tcgen05_cluster_n_requested == 1
+        and tcgen05_requested_two_cta
+        and tcgen05_k_tail_only
+    )
+    tcgen05_m_edge_only = (
+        mma_impl == "tcgen05"
+        and tcgen05_use_tma_pipeline
+        and tcgen05_pid_is_persistent
+        and tcgen05_cluster_m == 2
+        and tcgen05_cluster_n_requested == 1
+        and tcgen05_requested_two_cta
+        and m_size % bm != 0
+        and n_size % bn == 0
+        and k_total_size % bk == 0
+    )
+    tcgen05_n_edge_only = (
+        mma_impl == "tcgen05"
+        and tcgen05_use_tma_pipeline
+        and tcgen05_pid_is_persistent
+        and tcgen05_cluster_m == 2
+        and tcgen05_cluster_n_requested == 1
+        and tcgen05_requested_two_cta
+        and m_size % bm == 0
+        and n_size % bn != 0
+        and k_total_size % bk == 0
+    )
+    if (
+        mma_impl == "tcgen05"
+        and not tcgen05_static_full_tiles
+        and not tcgen05_mixed_tma_scalar_fallback
+        and not tcgen05_preserve_tma_for_two_cta_k_tail
+        and not tcgen05_m_edge_only
+        and not tcgen05_n_edge_only
+        and not tcgen05_double_edge_tma
+    ):
+        # Mixed TMA full K tiles + scalar fallback tails are currently
+        # validated only for flat one-CTA kernels. Persistent CtaGroup.TWO
+        # K-tail-only kernels keep TMA enabled for
+        # tcgen05_role_local_k_tail_tma. Output-edge kernels keep TMA
+        # enabled for role-local AB production plus the predicated SIMT
+        # epilogue. Other persistent or clustered partial-output kernels keep
+        # the shared scalar path.
+        tcgen05_use_tma_a = False
+        tcgen05_use_tma_b = False
+        tcgen05_use_tma = False
+        tcgen05_use_tma_pipeline = False
     # cluster_m == 2 has two valid shapes:
     # - bm=128, CtaGroup.ONE, where each clustered CTA owns a different
     #   128-row output tile. This legacy clustered shape remains guarded.
@@ -1780,7 +2567,6 @@ def _emit_mma_pipeline(
     # this validated pairing demote to cluster_n=1 instead of throwing —
     # explicit user configs hit the BackendUnsupported gate, and autotune
     # stays narrowed to the validated subset.
-    tcgen05_cluster_n_requested = _tcgen05_cluster_n(df.config)
     if tcgen05_cluster_n_requested > 1 and not (
         mma_impl == "tcgen05" and tcgen05_is_two_cta and tcgen05_cluster_m == 2
     ):
@@ -1794,6 +2580,25 @@ def _emit_mma_pipeline(
         tcgen05_cluster_n = 1
     else:
         tcgen05_cluster_n = tcgen05_cluster_n_requested
+    tcgen05_role_local_k_tail_tma = (
+        tcgen05_preserve_tma_for_two_cta_k_tail
+        and tcgen05_is_two_cta
+        and tcgen05_cluster_n == 1
+    )
+    # Mirror the K-tail role-local guard so later cluster demotion or
+    # cluster_n enablement cannot silently admit unvalidated edge ownership.
+    tcgen05_role_local_m_edge_tma = (
+        tcgen05_m_edge_only and tcgen05_is_two_cta and tcgen05_cluster_n == 1
+    )
+    tcgen05_role_local_n_edge_tma = (
+        tcgen05_n_edge_only and tcgen05_is_two_cta and tcgen05_cluster_n == 1
+    )
+    tcgen05_role_local_double_edge_tma = (
+        tcgen05_double_edge_tma and tcgen05_is_two_cta and tcgen05_cluster_n == 1
+    )
+    tcgen05_role_local_uses_k_tail_tma = tcgen05_role_local_k_tail_tma or (
+        tcgen05_role_local_double_edge_tma and tcgen05_has_k_tail
+    )
     tcgen05_diagnose_cluster_m2_one_cta_role_local = bool(
         df.config.get(TCGEN05_CLUSTER_M2_ONE_CTA_ROLE_LOCAL_CONFIG_KEY, False)
     )
@@ -1835,12 +2640,55 @@ def _emit_mma_pipeline(
     tcgen05_use_role_local_tma_producer = (
         mma_impl == "tcgen05"
         and tcgen05_use_tma_pipeline
-        and tcgen05_static_full_tiles
+        and (
+            tcgen05_static_full_tiles
+            or tcgen05_role_local_k_tail_tma
+            or tcgen05_role_local_m_edge_tma
+            or tcgen05_role_local_n_edge_tma
+            or tcgen05_role_local_double_edge_tma
+        )
         and tcgen05_role_local_codegen_allowed
         and tcgen05_pid_is_persistent
     )
+    tcgen05_use_pure_matmul_role_lifecycle = (
+        tcgen05_requested_pure_matmul_role_lifecycle
+        and mma_impl == "tcgen05"
+        and tcgen05_use_tma_pipeline
+        and tcgen05_static_full_tiles
+        and not tcgen05_pid_is_persistent
+        and tcgen05_cluster_m == 1
+        and tcgen05_cluster_n == 1
+        and acc_expr is None
+    )
+    if (
+        tcgen05_requested_pure_matmul_role_lifecycle
+        and not tcgen05_use_pure_matmul_role_lifecycle
+    ):
+        raise exc.BackendUnsupported(
+            "cute",
+            "tcgen05_strategy='pure_matmul_role_lifecycle' requires static-full "
+            "non-persistent tcgen05 TMA pure matmul with cluster_m=1, "
+            "cluster_n=1, and an identity/zero accumulator epilogue",
+        )
+    tcgen05_use_separate_tma_producer = (
+        tcgen05_use_role_local_tma_producer or tcgen05_use_pure_matmul_role_lifecycle
+    )
     # Keep a distinct name so future MMA-exec gating changes are localized.
     tcgen05_use_role_local_mma_exec = tcgen05_use_role_local_tma_producer
+    tcgen05_use_separate_mma_exec = (
+        tcgen05_use_role_local_mma_exec or tcgen05_use_pure_matmul_role_lifecycle
+    )
+    tcgen05_pipeline_state_ns = (
+        "_helion_tcgen05_pipeline"
+        if tcgen05_use_pure_matmul_role_lifecycle
+        else "cutlass.pipeline"
+    )
+    tcgen05_static_full_tma_fast_path = (
+        tcgen05_static_full_tiles
+        and tcgen05_use_tma_pipeline
+        and not tcgen05_is_two_cta
+        and not tcgen05_use_role_local_mma_exec
+    )
     tcgen05_acc_producer_mode = df.config.get(
         TCGEN05_ACC_PRODUCER_MODE_CONFIG_KEY,
         TCGEN05_ACC_PRODUCER_MODE_NORMAL,
@@ -1963,21 +2811,56 @@ def _emit_mma_pipeline(
         and tcgen05_use_tma_pipeline
     )
     # Keep a distinct name so future epi-role gating changes are localized.
-    tcgen05_use_role_local_epi = tcgen05_use_role_local_tma_producer
+    tcgen05_use_role_local_epi = (
+        tcgen05_use_role_local_tma_producer or tcgen05_use_pure_matmul_role_lifecycle
+    )
     # This is the kernel-wide contract ProgramID consumes. Today the TMA
     # producer flag is the master predicate for all three role-local loops.
     tcgen05_use_role_local_persistent_body = tcgen05_use_role_local_tma_producer
+    tcgen05_ab_stage_count_value = _tcgen05_config_int(
+        df.config, "tcgen05_ab_stages", _tcgen05_ab_stage_count(df.config.num_stages)
+    )
+    tcgen05_output_edge_tma_store_fits_smem = (
+        tcgen05_ab_stage_count_value <= TCGEN05_TWO_CTA_EDGE_TMA_STORE_MAX_AB_STAGES
+    )
+    tcgen05_use_output_edge_tma_store_for_full_tiles = (
+        tcgen05_role_local_m_edge_tma
+        or tcgen05_role_local_n_edge_tma
+        or tcgen05_role_local_double_edge_tma
+    ) and tcgen05_output_edge_tma_store_fits_smem
     # Flat kernels process one output tile per CTA, so the c_pipeline stage is
     # just the subtile index. Persistent kernels use a role-local tile counter
     # to rotate c_pipeline stages across work tiles. Static-full CtaGroup.TWO
     # uses the same SMEM-staged TMA-store epilogue: each CTA's epilogue warp 0
-    # stores its partitioned C tile.
+    # stores its partitioned C tile. Output-edge role-local kernels can use the
+    # same TMA-store path for interior full tiles while retaining the predicated
+    # SIMT fallback for fringe tiles, but only when the AB-stage count leaves
+    # enough SMEM budget for the extra epilogue tile.
     tcgen05_use_tma_store_epilogue = (
         mma_impl == "tcgen05"
         and tcgen05_use_tma_pipeline
-        and tcgen05_static_full_tiles
+        and (
+            tcgen05_static_full_tiles
+            or tcgen05_role_local_k_tail_tma
+            or tcgen05_use_output_edge_tma_store_for_full_tiles
+        )
         and tcgen05_role_local_codegen_allowed
         and (not _is_persistent_pid_config(df.config) or tcgen05_use_role_local_epi)
+    )
+
+    def tcgen05_tma_store_full_tiles_only_for(
+        partial_output_tma_store: bool,
+    ) -> bool:
+        return (
+            tcgen05_use_tma_store_epilogue
+            and tcgen05_use_output_edge_tma_store_for_full_tiles
+            and not tcgen05_static_output_tiles
+            and not partial_output_tma_store
+        )
+
+    tcgen05_partial_output_tma_store = False
+    tcgen05_tma_store_full_tiles_only = tcgen05_tma_store_full_tiles_only_for(
+        tcgen05_partial_output_tma_store
     )
     if tcgen05_large_bn_proof and (
         mma_impl != "tcgen05"
@@ -1995,19 +2878,18 @@ def _emit_mma_pipeline(
         mma_impl == "tcgen05"
         and fx_node is not None
         and cg.current_grid_state is not None
-        and tcgen05_static_full_tiles
         and len(lhs_load.users) == 1
         and len(rhs_load.users) == 1
         and next(iter(lhs_load.users)) is fx_node
         and next(iter(rhs_load.users)) is fx_node
     )
     if tcgen05_collective_handles_operand_loads:
-        df.register_cute_collective_handled_load(lhs_load.name)
-        df.register_cute_collective_handled_load(rhs_load.name)
+        cute_state = df.cute_state
+        _register_collective_handled_loads(cute_state, lhs_load, rhs_load)
         grid_state = cg.current_grid_state
         assert grid_state is not None
         if grid_state.has_lane_loops():
-            df.suppress_cute_root_lane_loops = True
+            cute_state.request_root_lane_loop_suppression()
 
     # Variable names
     tiled_mma = df.new_var("tiled_mma")
@@ -2024,11 +2906,18 @@ def _emit_mma_pipeline(
     # === outer_prefix: MMA setup + shared memory alloc + accumulator init ===
     prefix = device_loop.outer_prefix
     suffix = device_loop.outer_suffix
+    # This call corresponds to one MMA FX-node lowering. The later
+    # register_tcgen05_kloop_owned_stmts slice starts here, so pre-existing
+    # K-loop prelude remains outside the cleanup region and later FX-node code
+    # remains unowned. Future role-lifecycle cleanup must pass that exact slice.
+    # Operand-load scaffolding emitted before this snapshot is owned separately
+    # by the FX-node statement-owner hook in GenerateAST.add_statement.
+    tcgen05_kloop_stmt_start = len(device_loop.inner_statements)
     # Statements appended to ``prefix`` that reference per-tile coordinates
     # (m_offset_var, n_offset_var, advancing pipeline state). When the
     # persistent kernel splits the device-loop prefix, these stay inside the
     # work-tile loop while everything else hoists out. See
-    # ``DeviceFunction.register_cute_tcgen05_per_tile_stmts`` and
+    # ``DeviceFunction.cute_state.register_tcgen05_per_tile_stmts`` and
     # ``ProgramID._split_tcgen05_invariant_setup``.
     per_tile_stmts: list[ast.AST] = []
     # Statements that conceptually belong to the TMA-load warp's role
@@ -2209,12 +3098,9 @@ def _emit_mma_pipeline(
     mma_physical_m_threads = _grid_thread_extent(cg, m_block_id)
     tcgen05_cta_thread_count = _grid_cta_thread_count(cg)
     if mma_impl == "tcgen05" and tcgen05_cluster_m * tcgen05_cluster_n > 1:
-        df.cute_cluster_shape = (tcgen05_cluster_m, tcgen05_cluster_n, 1)
+        df.cute_state.cluster_shape = (tcgen05_cluster_m, tcgen05_cluster_n, 1)
     tcgen05_acc_stage_count_value = _tcgen05_config_int(
         df.config, "tcgen05_acc_stages", _tcgen05_acc_stage_count(bn)
-    )
-    tcgen05_ab_stage_count_value = _tcgen05_config_int(
-        df.config, "tcgen05_ab_stages", _tcgen05_ab_stage_count(df.config.num_stages)
     )
     # PipelineTmaUmma empty barriers are released by the leader CTA with the
     # pipeline's multicast mask. Peer CTAs still advance local consumer state,
@@ -2266,6 +3152,11 @@ def _emit_mma_pipeline(
     # below when the branch is entered.
     tcgen05_smem_swizzle_a: int | None = None
     tcgen05_smem_swizzle_b: int | None = None
+    tcgen05_explicit_epi_tile_m: int | None = None
+    tcgen05_explicit_epi_tile_n: int | None = None
+    tcgen05_explicit_d_store_box_n: int | None = None
+    tcgen05_use_pure_clc_scheduler_object = False
+    tcgen05_use_flat_role_coordinates = False
     if mma_impl == "tcgen05":
         # Use ``warp_spec.ab_load_warps`` so the strategy data model
         # stays the source of truth for warp role IDs; ``epi_warps``
@@ -2281,6 +3172,24 @@ def _emit_mma_pipeline(
         _tcgen05_layout_overrides = layout_overrides_from_config(df.config)
         tcgen05_smem_swizzle_a = _tcgen05_layout_overrides.smem_swizzle_a
         tcgen05_smem_swizzle_b = _tcgen05_layout_overrides.smem_swizzle_b
+        tcgen05_explicit_epi_tile_m = _tcgen05_layout_overrides.epi_tile_m
+        tcgen05_explicit_epi_tile_n = _tcgen05_layout_overrides.epi_tile_n
+        tcgen05_explicit_d_store_box_n = _tcgen05_layout_overrides.d_store_box_n
+        if tcgen05_edge_scalar_fallback_needs_inter_smem_a:
+            # The mixed TMA/scalar edge path writes logical (_row, _col)
+            # coordinates into the tcgen05 A SMEM view. With bk=128,
+            # CuTe's default SW128 A atom is correct for TMA-filled full
+            # tiles but corrupts scalar-filled output-edge tiles. Force
+            # the explicit INTER atom so fallback writes and the wrapper
+            # descriptor agree on the same layout.
+            if tcgen05_smem_swizzle_a not in (None, 0):
+                raise exc.BackendUnsupported(
+                    "cute",
+                    "tcgen05 output-edge scalar fallback with bk >= 128 "
+                    "requires smem_swizzle_a=0 (INTER); nonzero "
+                    "A swizzle overrides are not validated for this path.",
+                )
+            tcgen05_smem_swizzle_a = 0
         if tcgen05_smem_swizzle_a is not None:
             _validate_tcgen05_smem_swizzle_override(
                 operand="a",
@@ -2313,18 +3222,17 @@ def _emit_mma_pipeline(
         tcgen05_acc_consumer_arrive_count_value = tcgen05_epi_warp_count_value * (
             2 if tcgen05_is_two_cta else 1
         )
-        # Scheduler-warp pipeline depth. Use 1 stage for now: with
-        # a single SMEM mailbox shared across all consumer warps,
-        # each consumer warp must see the same tile per iteration.
-        # Multiple stages would let the producer overwrite the
-        # mailbox while a slower consumer is still reading the
-        # previous tile (each consumer has its own register-state
-        # advancement, so they can drift). Quack uses 2 stages
-        # because Quack's design has the mailbox sized num_stages
-        # entries; if we widen the SMEM mailbox to per-stage
-        # entries that change can come later.
+        # Scheduler-warp pipeline depth. The default remains one stage because
+        # consumer warps advance their own register-state independently; with
+        # one shared mailbox, a multi-stage producer could overwrite metadata
+        # while a slower consumer still reads the previous tile. The optional
+        # two-stage diagnostic is paired with a staged SMEM mailbox in
+        # ``program_id.py`` so the scheduler can publish the next work tile
+        # without overwriting a slower consumer's current tile.
         tcgen05_sched_stage_count_value = (
-            1 if tcgen05_warp_spec.scheduler_warps > 0 else 0
+            cast("int", df.config.get(TCGEN05_SCHED_STAGE_COUNT_CONFIG_KEY, 1))
+            if tcgen05_warp_spec.scheduler_warps > 0
+            else 0
         )
         # Persistence model from the active config. Default
         # ``static_persistent`` keeps the existing path; G2-H
@@ -2369,7 +3277,7 @@ def _emit_mma_pipeline(
             "aux-tensor walker can identify downstream stores"
         )
         # Register the matmul fx_node in
-        # ``cute_tcgen05_matmul_fx_nodes`` before the aux-tensor
+        # ``cute_state.matmul_fx_nodes`` before the aux-tensor
         # walker runs. The walker's analyzer reads the same set to
         # know where to stop, so the fx_node must be present
         # *before* the walk. The registered-graph invariant: the
@@ -2392,9 +3300,356 @@ def _emit_mma_pipeline(
         assert any(fx_node.graph is gi.graph for gi in cg.codegen_graphs), (
             "matmul fx_node graph must be a registered codegen graph"
         )
-        df.cute_tcgen05_matmul_fx_nodes.add(fx_node)
+        df.cute_state.matmul_fx_nodes.add(fx_node)
         aux_tensor_descriptors_value = discover_tcgen05_aux_tensor_descriptors(
             cg, fx_node
+        )
+        c_input_aux_tensor_descriptors_value = tuple(
+            d for d in aux_tensor_descriptors_value if d.broadcast_axis is None
+        )
+        aux_tma_productive_body_gate_open = (
+            tcgen05_warp_spec.c_input_warps > 0
+            and bool(c_input_aux_tensor_descriptors_value)
+            and len({d.store_value_node for d in c_input_aux_tensor_descriptors_value})
+            <= 1
+        )
+        # CuTe's TMA descriptor bounds checks correctly suppress partial M/N
+        # output stores for the admitted aux-TMA output-edge family, so keep
+        # those edge tiles on the same TMA-store path as full tiles. Kernels
+        # without a productive aux-TMA body keep the original predicated
+        # full-tile/edge split.
+        tcgen05_partial_output_tma_store = (
+            tcgen05_use_tma_store_epilogue
+            and tcgen05_use_output_edge_tma_store_for_full_tiles
+            and not tcgen05_static_output_tiles
+            and df.config.get(TCGEN05_AUX_LOAD_MODE_CONFIG_KEY)
+            == TCGEN05_AUX_LOAD_MODE_TMA
+            and aux_tma_productive_body_gate_open
+        )
+        tcgen05_tma_store_full_tiles_only = tcgen05_tma_store_full_tiles_only_for(
+            tcgen05_partial_output_tma_store
+        )
+        explicit_epi_tile_requested = any(
+            value is not None
+            for value in (
+                tcgen05_explicit_epi_tile_m,
+                tcgen05_explicit_epi_tile_n,
+                tcgen05_explicit_d_store_box_n,
+            )
+        )
+        tcgen05_use_flat_role_coordinates = tcgen05_requested_flat_role_coordinates
+        # T2's rowvec ``acc + bias[n]`` epilogue surfaces a single rank-1
+        # (broadcast_axis=1) aux descriptor. The aux pipeline keeps the
+        # bias on the SIMT load path (no TMA), so the explicit
+        # epilogue-tile family stays validated for the T2 envelope: the
+        # store side still uses the same TMA-store + epi-tile shape as
+        # T1/T3/T4/T5. Exact-shape rank-2 aux tensors (broadcast_axis=
+        # None) and any other broadcast shape remain rejected here.
+        aux_descriptors_compatible_with_explicit_epi_tile = all(
+            d.broadcast_axis == 1 for d in aux_tensor_descriptors_value
+        )
+        if explicit_epi_tile_requested:
+            if not (
+                tcgen05_static_full_tiles
+                and tcgen05_is_two_cta
+                and bm == TCGEN05_TWO_CTA_BLOCK_M
+                and bn == TCGEN05_TWO_CTA_BLOCK_N
+                and input_dtype == torch.bfloat16
+                and epi_elem_dtype_str == "cutlass.BFloat16"
+                and aux_descriptors_compatible_with_explicit_epi_tile
+            ):
+                raise exc.BackendUnsupported(
+                    "cute",
+                    "explicit tcgen05 epilogue tile overrides are validated only "
+                    "for static-full bf16 pure matmul CtaGroup.TWO kernels "
+                    "(rank-1 rowvec aux tensors admitted for the T2 bias "
+                    "envelope)",
+                )
+            if (
+                tcgen05_explicit_epi_tile_m,
+                tcgen05_explicit_epi_tile_n,
+                tcgen05_explicit_d_store_box_n,
+            ) != _TCGEN05_EXPLICIT_EPI_TILE_VALIDATED_SHAPE:
+                raise exc.BackendUnsupported(
+                    "cute",
+                    "explicit tcgen05 epilogue tile is currently validated only "
+                    "for epi_tile="
+                    f"{_TCGEN05_EXPLICIT_EPI_TILE_VALIDATED_SHAPE[:2]} "
+                    "and d_store_box_n="
+                    f"{_TCGEN05_EXPLICIT_EPI_TILE_VALIDATED_SHAPE[2]}",
+                )
+        if tcgen05_use_flat_role_coordinates:
+            if not (
+                explicit_epi_tile_requested
+                and (
+                    tcgen05_explicit_epi_tile_m,
+                    tcgen05_explicit_epi_tile_n,
+                    tcgen05_explicit_d_store_box_n,
+                )
+                == _TCGEN05_EXPLICIT_EPI_TILE_VALIDATED_SHAPE
+                and tcgen05_static_full_tiles
+                and tcgen05_is_two_cta
+                and tcgen05_cluster_n == 1
+                and bm == TCGEN05_TWO_CTA_BLOCK_M
+                and bn == TCGEN05_TWO_CTA_BLOCK_N
+                # T1 validated at bk=64, T4 validated at bk=128. Both share
+                # the bm=bn=256, cluster_m=2, cluster_n=1 envelope and use
+                # the same flat-role launch shape.
+                and bk in (64, 128)
+                and input_dtype == torch.bfloat16
+                and epi_elem_dtype_str == "cutlass.BFloat16"
+                and aux_descriptors_compatible_with_explicit_epi_tile
+                and tcgen05_use_tma_store_epilogue
+                and tcgen05_warp_spec.scheduler_warps == 0
+                and tcgen05_warp_spec.c_input_warps == 0
+                and tcgen05_warp_spec.ab_load_warps == 1
+                and tcgen05_warp_spec.epi_warps == 4
+            ):
+                raise exc.BackendUnsupported(
+                    "cute",
+                    f"{TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY}=True requires "
+                    "the guarded static-full bf16 pure matmul CtaGroup.TWO "
+                    "256x256 bk in {64,128} explicit-epilogue-tile path",
+                )
+        tcgen05_use_pure_clc_scheduler_object = (
+            tcgen05_requested_pure_clc_scheduler_object
+        )
+        tcgen05_use_pure_dynamic_scheduler_object = (
+            tcgen05_requested_pure_dynamic_scheduler_object
+        )
+        # Cycle-16 H3 Option B (staged): a request for the
+        # ``DYNAMIC_PERSISTENT`` scheduler object is mutually exclusive
+        # with the ``PURE_CLC`` scheduler object — they are alternate
+        # persistence-model lowerings of the same dispatch slot. Reject
+        # the simultaneous request loudly so a user / autotune
+        # exploration cannot reach an ambiguous state. The autotune
+        # surface gates these as separate ``BooleanFragment`` knobs;
+        # the validator narrowing below ensures at most one is True
+        # in normal search.
+        if (
+            tcgen05_use_pure_clc_scheduler_object
+            and tcgen05_use_pure_dynamic_scheduler_object
+        ):
+            raise exc.BackendUnsupported(
+                "cute",
+                f"{TCGEN05_PURE_CLC_SCHEDULER_OBJECT_CONFIG_KEY}=True and "
+                f"{TCGEN05_PURE_DYNAMIC_SCHEDULER_OBJECT_CONFIG_KEY}=True "
+                "are mutually exclusive scheduler-object selections "
+                "(CLC vs dynamic-persistent persistence models cannot "
+                "share the same lowering slot)",
+            )
+        tcgen05_use_direct_entry_plan = tcgen05_requested_direct_entry_plan
+        if tcgen05_use_pure_clc_scheduler_object or tcgen05_use_direct_entry_plan:
+            identity_store_dtype = (
+                _trace_mma_to_single_identity_store_dtype(fx_node, cg.codegen_graphs)
+                if fx_node is not None
+                else None
+            )
+            # P2 (cycle-2 review): the pure-CLC scheduler-object diagnostic
+            # is still narrow-gated to the validated T1 identity-store
+            # envelope. The TVM-FFI direct entry additionally admits the
+            # T4 (8192x1024x1024) relu-epilogue, T5 (1024x8192x1024)
+            # identity-store, T3 (2048x4096x2048) identity-store, and
+            # T2 (4096x2048x2048) rowvec bias-store envelopes at bk=128;
+            # the relu (T4) and bias (T2) fusions are handled inside the
+            # kernel body, so all the direct entry needs is to confirm
+            # the store shape/dtype matches. The two surfaces are gated
+            # separately so ``pure_clc_scheduler_object=True`` +
+            # T2/T3/T4/T5 cannot silently admit a non-T1 launch through
+            # an unvalidated CLC scheduler.
+            relu_store_dtype = (
+                _trace_mma_to_single_relu_store_dtype(fx_node, cg.codegen_graphs)
+                if fx_node is not None
+                else None
+            )
+            bias_store_dtype = (
+                _trace_mma_to_single_bias_store_dtype(fx_node, cg.codegen_graphs)
+                if fx_node is not None
+                else None
+            )
+            bias_relu_store_dtype = (
+                _trace_mma_to_single_bias_relu_store_dtype(fx_node, cg.codegen_graphs)
+                if fx_node is not None
+                else None
+            )
+            # A1 (cycle-2 second-pass review): each envelope predicate
+            # pins ``bk`` to its validated block_k so a T1-shape config
+            # with ``bk=128`` (or T3/T4/T5-shape with ``bk=64``) is
+            # rejected here at codegen instead of only at the runtime
+            # validator.
+            target1_envelope_ok = (
+                (m_size, n_size, k_total_size) == (1024, 4096, 1024)
+                and bk == TCGEN05_TARGET1_TVM_FFI_BLOCK_K
+                and (tcgen05_ab_stage_count_value, tcgen05_c_stage_count_value)
+                in ((3, 2), (6, 4))
+                and acc_expr is None
+                and identity_store_dtype == input_dtype
+            )
+            target4_envelope_ok = (
+                (m_size, n_size, k_total_size) == (8192, 1024, 1024)
+                and bk == TCGEN05_TARGET4_TVM_FFI_BLOCK_K
+                and (tcgen05_ab_stage_count_value, tcgen05_c_stage_count_value)
+                == (TCGEN05_TARGET4_TVM_FFI_AB_STAGES, TCGEN05_TARGET4_TVM_FFI_C_STAGES)
+                and acc_expr is None
+                and relu_store_dtype == input_dtype
+            )
+            # T5 (1024x8192x1024) uses identity store (no relu epilogue),
+            # matching T1's epilogue shape but at the T4 bk=128 stage
+            # tuple. The predicate is pinned to T5's shape so a T1-shape
+            # config with bk=128 is still rejected (handled by the T1
+            # predicate's bk pin), and a T4-shape config with identity
+            # store would also fall through here.
+            target5_envelope_ok = (
+                (m_size, n_size, k_total_size) == (1024, 8192, 1024)
+                and bk == TCGEN05_TARGET5_TVM_FFI_BLOCK_K
+                and (tcgen05_ab_stage_count_value, tcgen05_c_stage_count_value)
+                == (TCGEN05_TARGET5_TVM_FFI_AB_STAGES, TCGEN05_TARGET5_TVM_FFI_C_STAGES)
+                and acc_expr is None
+                and identity_store_dtype == input_dtype
+            )
+            # T3 (2048x4096x2048) uses identity store at the same bk=128
+            # (ab=3, c=2) stage tuple as T4/T5. The K=2048 problem yields
+            # ``k_tile_count = 16`` (double T4/T5's 8); this fits the
+            # ``TCGEN05_TWO_CTA_MAX_K_TILES`` cap and the (3, 2) stage
+            # tuple. The predicate is pinned to T3's shape so a T1/T5
+            # host function does not get a T3 admission and vice versa.
+            target3_envelope_ok = (
+                (m_size, n_size, k_total_size) == (2048, 4096, 2048)
+                and bk == TCGEN05_TARGET3_TVM_FFI_BLOCK_K
+                and (tcgen05_ab_stage_count_value, tcgen05_c_stage_count_value)
+                == (TCGEN05_TARGET3_TVM_FFI_AB_STAGES, TCGEN05_TARGET3_TVM_FFI_C_STAGES)
+                and acc_expr is None
+                and identity_store_dtype == input_dtype
+            )
+            # T2 (4096x2048x2048) uses a rank-1 trailing-axis (rowvec)
+            # ``acc + bias[n]`` epilogue at the same bk=128 (ab=3, c=2)
+            # stage tuple as T3/T4/T5. The bias-store walker (above)
+            # confirms exactly one ``aten.add.Tensor(carrier,
+            # bias_load)`` between the MMA carrier and the
+            # convert-and-store node and that ``bias_load`` is a rank-1
+            # GMEM load. The predicate is pinned to T2's shape so T6
+            # (8192x2048x2048 + bias_relu) does not silently get a T2
+            # admission, and so a T2-shape config with bk=64 (or a
+            # T1/T3/T4/T5 host function at the T2 shape) is rejected.
+            target2_envelope_ok = (
+                (m_size, n_size, k_total_size) == (4096, 2048, 2048)
+                and bk == TCGEN05_TARGET2_TVM_FFI_BLOCK_K
+                and (tcgen05_ab_stage_count_value, tcgen05_c_stage_count_value)
+                == (TCGEN05_TARGET2_TVM_FFI_AB_STAGES, TCGEN05_TARGET2_TVM_FFI_C_STAGES)
+                and acc_expr is None
+                and bias_store_dtype == input_dtype
+            )
+            # T6 (8192x2048x2048) composes T2's rank-1 trailing-axis
+            # (rowvec) ``acc + bias[n]`` with T4's relu activation:
+            # ``relu(acc + bias[n])``. The bias-relu walker (above)
+            # confirms exactly one ``aten.add.Tensor(carrier,
+            # bias_load)`` followed by exactly one
+            # ``aten.relu.default`` between the MMA carrier and the
+            # convert-and-store node, and that ``bias_load`` is a
+            # rank-1 bf16 GMEM load. The predicate is pinned to T6's
+            # shape so a T2 (4096x2048x2048 + bias) host function does
+            # not silently get a T6 admission, and so a T6-shape
+            # config with bk=64 (or a T1/T3/T4/T5 host function at the
+            # T6 shape) is rejected.
+            target6_envelope_ok = (
+                (m_size, n_size, k_total_size) == (8192, 2048, 2048)
+                and bk == TCGEN05_TARGET6_TVM_FFI_BLOCK_K
+                and (tcgen05_ab_stage_count_value, tcgen05_c_stage_count_value)
+                == (TCGEN05_TARGET6_TVM_FFI_AB_STAGES, TCGEN05_TARGET6_TVM_FFI_C_STAGES)
+                and acc_expr is None
+                and bias_relu_store_dtype == input_dtype
+            )
+            # T7 (2048x8192x2048) uses identity store at the same
+            # bk=128 (ab=3, c=2) stage tuple as T3/T4/T5/T6. The
+            # K=2048 problem yields ``k_tile_count = 16`` (same as
+            # T2/T3/T6); this fits the ``TCGEN05_TWO_CTA_MAX_K_TILES``
+            # cap. T7 is structurally similar to T5 (1024x8192x1024)
+            # with M and K doubled (M_tiles*N_tiles = 8*32 = 256
+            # work clusters, matching T6's 256). The identity-store
+            # gate is shared with the T1/T3/T5 seeds; the shape gate
+            # below pins it to T7 so a T1/T3/T5 host function does not
+            # get a T7 admission and vice versa.
+            target7_envelope_ok = (
+                (m_size, n_size, k_total_size) == (2048, 8192, 2048)
+                and bk == TCGEN05_TARGET7_TVM_FFI_BLOCK_K
+                and (tcgen05_ab_stage_count_value, tcgen05_c_stage_count_value)
+                == (TCGEN05_TARGET7_TVM_FFI_AB_STAGES, TCGEN05_TARGET7_TVM_FFI_C_STAGES)
+                and acc_expr is None
+                and identity_store_dtype == input_dtype
+            )
+            common_ok = (
+                tcgen05_use_flat_role_coordinates
+                and TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY in df.config
+                and df.config.get(TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY) is True
+                and tcgen05_acc_stage_count_value == 2
+            )
+            if tcgen05_use_pure_clc_scheduler_object:
+                pure_clc_ok = common_ok and target1_envelope_ok
+                if not pure_clc_ok:
+                    raise exc.BackendUnsupported(
+                        "cute",
+                        f"{TCGEN05_PURE_CLC_SCHEDULER_OBJECT_CONFIG_KEY}=True "
+                        "requires the validated T1 identity-store "
+                        "TVM-FFI flat-role seed (pure-CLC scheduler "
+                        "object is not validated for T2 bias-store, "
+                        "T3 identity-store, T4 relu-store, T5 "
+                        "identity-store, T6 bias-relu-store, or T7 "
+                        "identity-store)",
+                    )
+            if tcgen05_use_direct_entry_plan:
+                direct_entry_ok = common_ok and (
+                    target1_envelope_ok
+                    or target4_envelope_ok
+                    or target5_envelope_ok
+                    or target3_envelope_ok
+                    or target2_envelope_ok
+                    or target6_envelope_ok
+                    or target7_envelope_ok
+                )
+                if not direct_entry_ok:
+                    raise exc.BackendUnsupported(
+                        "cute",
+                        f"{TCGEN05_DIRECT_ENTRY_PLAN_CONFIG_KEY}=True "
+                        "requires the validated T1 identity-store, T2 "
+                        "bias-store, T3 identity-store, T4 relu-store, "
+                        "T5 identity-store, T6 bias-relu-store, or T7 "
+                        "identity-store TVM-FFI flat-role seed",
+                    )
+        # Cycle-16 H3 Option B (staged): the productive
+        # ``DYNAMIC_PERSISTENT`` codegen path is staged for cycle 17.
+        # Any request for the pure-dynamic scheduler object reaches the
+        # dispatch slot but bails out here with a clear error so the
+        # autotuner / explicit-config caller sees a deterministic
+        # rejection. Until the productive emission lands, this raise
+        # is the entire user-visible behavior of the knob. The
+        # rejection happens AFTER the pure-CLC envelope checks so the
+        # mutually-exclusive guard above is the source of truth for
+        # "you cannot select both"; this raise is the source of truth
+        # for "the dynamic-persistent codegen has not landed yet".
+        if tcgen05_use_pure_dynamic_scheduler_object:
+            raise exc.BackendUnsupported(
+                "cute",
+                f"{TCGEN05_PURE_DYNAMIC_SCHEDULER_OBJECT_CONFIG_KEY}=True "
+                "is cycle-16 infrastructure only; the productive "
+                "DYNAMIC_PERSISTENT codegen (atomic-counter "
+                "tile_count_semaphore work-tile loop) is staged for "
+                "cycle 17 (see cute_plan.md §6 Target 8 cycle-16 H3 "
+                "Option B landing)",
+            )
+        tcgen05_scheduler_warp_count_for_plan = (
+            1
+            if tcgen05_use_pure_clc_scheduler_object
+            else tcgen05_warp_spec.scheduler_warps
+        )
+        tcgen05_sched_stage_count_for_plan = (
+            max(1, tcgen05_sched_stage_count_value)
+            if tcgen05_use_pure_clc_scheduler_object
+            else tcgen05_sched_stage_count_value
+        )
+        tcgen05_persistence_model_for_plan = (
+            Tcgen05PersistenceModel.CLC_PERSISTENT.value
+            if tcgen05_use_pure_clc_scheduler_object
+            else tcgen05_persistence_model_str
         )
         tcgen05_matmul_plan = CuteTcgen05MatmulPlan(
             bm=bm,
@@ -2414,18 +3669,22 @@ def _emit_mma_pipeline(
             c_stage_count=tcgen05_c_stage_count_value,
             epi_warp_count=tcgen05_epi_warp_count_value,
             ab_load_warp_count=tcgen05_warp_spec.ab_load_warps,
-            scheduler_warp_count=tcgen05_warp_spec.scheduler_warps,
-            sched_stage_count=tcgen05_sched_stage_count_value,
+            scheduler_warp_count=tcgen05_scheduler_warp_count_for_plan,
+            sched_stage_count=tcgen05_sched_stage_count_for_plan,
             # ``c_input_warp_count`` plumbs the warp-spec slot
             # through the matmul plan (``cute_plan.md`` §7.5.3.2).
             # Validator restricts the value to ``{0, 1}`` under
             # WITH_SCHEDULER and ``{0}`` under MONOLITHIC; codegen
             # body for the C-input warp is inert today.
             c_input_warp_count=tcgen05_warp_spec.c_input_warps,
-            persistence_model=tcgen05_persistence_model_str,
+            persistence_model=tcgen05_persistence_model_for_plan,
             cluster_n=tcgen05_cluster_n,
             l2_swizzle_size=tcgen05_l2_swizzle_size_value,
+            tma_store_full_tiles_only=tcgen05_tma_store_full_tiles_only,
             aux_tensor_descriptors=aux_tensor_descriptors_value,
+            flat_role_launch_warp_count=8
+            if tcgen05_use_flat_role_coordinates
+            else None,
         )
         assert tcgen05_plan is not None
         tcgen05_mma_owner_active = _tcgen05_two_cta_owner_predicate(
@@ -2435,7 +3694,7 @@ def _emit_mma_pipeline(
             cluster_n=tcgen05_cluster_n,
         )
         candidate_block_shape = tcgen05_matmul_plan.block_shape
-        df.register_cute_tcgen05_matmul_plan(tcgen05_matmul_plan)
+        df.cute_state.register_tcgen05_matmul_plan(tcgen05_matmul_plan)
         if (
             candidate_block_shape[0]
             * candidate_block_shape[1]
@@ -2473,15 +3732,15 @@ def _emit_mma_pipeline(
         # SMEM cost, so the rejection must NOT fire — fan-out
         # ``ab=3 + c_input=1`` paths are legal and pinned by
         # ``test_aux_pipeline_ab_stages_3_with_c_input_fanout_not_rejected``.
+        c_input_aux_tensor_descriptors = (
+            tcgen05_matmul_plan.c_input_aux_tensor_descriptors
+        )
         aux_single_store_value = (
-            len(
-                {d.store_value_node for d in tcgen05_matmul_plan.aux_tensor_descriptors}
-            )
-            <= 1
+            len({d.store_value_node for d in c_input_aux_tensor_descriptors}) <= 1
         )
         if (
             tcgen05_matmul_plan.has_c_input_warp
-            and tcgen05_matmul_plan.aux_tensor_descriptors
+            and c_input_aux_tensor_descriptors
             and aux_single_store_value
             and tcgen05_matmul_plan.ab_stage_count >= 3
         ):
@@ -2502,7 +3761,7 @@ def _emit_mma_pipeline(
                 "keep ``tcgen05_ab_stages=3``. See "
                 "``cute_plan.md`` §1.3 / §7.5.3.2.",
             )
-        df.cute_block_shape = candidate_block_shape
+        df.cute_state.block_shape = candidate_block_shape
     if mma_impl == "universal":
         prefix.extend(
             _make_tiled_mma_setup(
@@ -2533,11 +3792,23 @@ def _emit_mma_pipeline(
             )
         )
         prefix.append(statement_from_string(f"{lane_idx} = cute.arch.lane_idx()"))
+        if tcgen05_use_flat_role_coordinates:
+            mma_role_coordinates = _flat_mma_role_coordinate_plan(
+                lane_idx=lane_idx,
+                warp_idx=warp_idx,
+                mma_active_n_threads=mma_phys_n,
+            )
+        else:
+            mma_role_coordinates = _block_axis_mma_role_coordinate_plan(
+                cg,
+                m_block_id=m_block_id,
+                n_block_id=n_block_id,
+                mma_m_thread_extent=mma_physical_m_threads,
+                mma_active_n_threads=mma_phys_n,
+            )
         prefix.append(
             statement_from_string(
-                f"{mma_participant_linear} = "
-                f"{_physical_mma_coord_expr(cg, m_block_id)} + "
-                f"({n_physical}) * cutlass.Int32({mma_physical_m_threads})"
+                f"{mma_participant_linear} = {mma_role_coordinates.mma_tidx_expr()}"
             )
         )
         prefix.append(
@@ -2552,7 +3823,7 @@ def _emit_mma_pipeline(
         )
         prefix.append(
             statement_from_string(
-                f"{mma_active} = ({n_physical}) < cutlass.Int32({mma_phys_n})"
+                f"{mma_active} = {mma_role_coordinates.mma_active_expr()}"
             )
         )
         if mma_impl == "tcgen05":
@@ -2582,8 +3853,8 @@ def _emit_mma_pipeline(
             )
             prefix.append(
                 statement_from_string(
-                    f"{epi_tidx} = {lane_idx} + {warp_idx} * cutlass.Int32(32)"
-                    f" if {epi_active} else cutlass.Int32(0)"
+                    f"{epi_tidx} = "
+                    f"{_mma_epi_tidx_expr(lane_idx=lane_idx, warp_idx=warp_idx, epi_active=epi_active)}"
                 )
             )
             # Register reallocation: consumer warps (exec MMA + epilogue
@@ -2620,10 +3891,23 @@ def _emit_mma_pipeline(
             # consumers; exec joins the producer warpgroup (lower
             # register budget) so warpgroup 1 is uniformly
             # decrease.
-            if tcgen05_matmul_plan.has_scheduler_warp:
+            if (
+                tcgen05_matmul_plan.has_scheduler_warp
+                or tcgen05_use_flat_role_coordinates
+            ):
                 consumer_predicate = epi_active
             else:
                 consumer_predicate = f"{tcgen05_plan.exec_active} or {epi_active}"
+            # Cycle 15 H2 (cute_plan.md §6 Target 8): the consumer-warp
+            # register ceiling is config-driven. Default 256 preserves
+            # cycle-14 byte-identity; lower values cap ``ptxas``'s
+            # per-thread register allocation and force a spill rather
+            # than reserving at the natural 255-reg peak. The autotune
+            # gate ``consumer_regs_autotune_fragments`` admits the knob
+            # only for the T8 wide-N CLC + aux-TMA seed family (same
+            # gate as ``aux_stages``), so T1-T7 stay byte-identical at
+            # the 256 default.
+            consumer_regs_value = _tcgen05_consumer_regs_from_config(df.config)
             prefix.append(
                 statement_from_string(
                     f"if not ({consumer_predicate}):\n"
@@ -2635,7 +3919,7 @@ def _emit_mma_pipeline(
                 statement_from_string(
                     f"if {consumer_predicate}:\n"
                     f"    cute.arch.setmaxregister_increase("
-                    f"{_TCGEN05_CONSUMER_REGS})"
+                    f"{consumer_regs_value})"
                 )
             )
             prefix.append(
@@ -2708,6 +3992,8 @@ def _emit_mma_pipeline(
                 epi_elem_dtype_str=epi_elem_dtype_str,
                 smem_swizzle_a=tcgen05_smem_swizzle_a,
                 smem_swizzle_b=tcgen05_smem_swizzle_b,
+                explicit_epi_tile_m=tcgen05_explicit_epi_tile_m,
+                explicit_epi_tile_n=tcgen05_explicit_epi_tile_n,
             )
         )
         prefix.append(
@@ -2782,13 +4068,13 @@ def _emit_mma_pipeline(
         )
         prefix.append(
             statement_from_string(
-                f"{tcgen05_plan.acc_producer_state} = cutlass.pipeline.make_pipeline_state("
+                f"{tcgen05_plan.acc_producer_state} = {tcgen05_pipeline_state_ns}.make_pipeline_state("
                 f"cutlass.pipeline.PipelineUserType.Producer, {tcgen05_acc_stage_count_value})"
             )
         )
         prefix.append(
             statement_from_string(
-                f"{tcgen05_plan.acc_consumer_state} = cutlass.pipeline.make_pipeline_state("
+                f"{tcgen05_plan.acc_consumer_state} = {tcgen05_pipeline_state_ns}.make_pipeline_state("
                 f"cutlass.pipeline.PipelineUserType.Consumer, {tcgen05_acc_stage_count_value})"
             )
         )
@@ -2807,7 +4093,14 @@ def _emit_mma_pipeline(
             tcgen05_sched_plan = _new_tcgen05_sched_pipeline_plan(
                 df, use_clc=tcgen05_matmul_plan.is_clc_persistent
             )
-            df.register_cute_tcgen05_sched_pipeline_plan(tcgen05_sched_plan)
+            df.cute_state.register_tcgen05_sched_pipeline_plan(tcgen05_sched_plan)
+            if tcgen05_use_pure_clc_scheduler_object:
+                df.cute_state.register_tcgen05_pure_clc_scheduler_object(
+                    Tcgen05PureClcSchedulerObject(
+                        sched_plan=tcgen05_sched_plan,
+                        scheduler_warp_id=tcgen05_matmul_plan.scheduler_warp_id,
+                    )
+                )
             # WITH_SCHEDULER's scheduler-warp topology: every CTA in
             # the cluster runs its own scheduler warp, publishing to
             # its own SMEM mailbox. Both CTAs converge on the same
@@ -2881,14 +4174,14 @@ def _emit_mma_pipeline(
                 len(
                     {
                         d.store_value_node
-                        for d in tcgen05_matmul_plan.aux_tensor_descriptors
+                        for d in tcgen05_matmul_plan.c_input_aux_tensor_descriptors
                     }
                 )
                 <= 1
             )
             c_input_is_sched_consumer = (
                 tcgen05_matmul_plan.has_c_input_warp
-                and bool(tcgen05_matmul_plan.aux_tensor_descriptors)
+                and bool(tcgen05_matmul_plan.c_input_aux_tensor_descriptors)
                 and _aux_single_store_value
             )
             tcgen05_sched_consumer_role_count = (
@@ -2935,7 +4228,10 @@ def _emit_mma_pipeline(
             # ``PipelineAsync`` (``cute_plan.md`` §7.5.3.2 cycle 2
             # of the producer-body split). Fires only when the
             # productive-body gate is open: ``c_input_warp_count > 0``
-            # AND a non-empty ``aux_tensor_descriptors`` tuple. The
+            # AND a non-empty exact-shape ``c_input_aux_tensor_descriptors``
+            # tuple. Broadcast row-vector aux loads intentionally stay on the
+            # direct per-thread path; staging them as 2-D rings burns a full
+            # epilogue tile of SMEM for a one-dimensional input. The
             # role-local while builder in
             # ``program_id._build_c_input_warp_role_local_while``
             # emits the per-descriptor producer body that issues
@@ -2964,26 +4260,119 @@ def _emit_mma_pipeline(
             # writes of the same value gives one ``store_value_node``
             # in the descriptor set (and the GMEM fallback path
             # remains byte-identical to the pre-cycle-2b shape).
+            c_input_aux_tensor_descriptors = (
+                tcgen05_matmul_plan.c_input_aux_tensor_descriptors
+            )
+            all_aux_tensor_descriptors = tcgen05_matmul_plan.aux_tensor_descriptors
+            tcgen05_aux_tma_requested = (
+                df.config.get(TCGEN05_AUX_LOAD_MODE_CONFIG_KEY)
+                == TCGEN05_AUX_LOAD_MODE_TMA
+            )
             aux_store_value_nodes = {
-                desc.store_value_node
-                for desc in tcgen05_matmul_plan.aux_tensor_descriptors
+                desc.store_value_node for desc in c_input_aux_tensor_descriptors
             }
             aux_single_store_value = len(aux_store_value_nodes) <= 1
-            if (
+            aux_productive_body_gate_open = (
                 tcgen05_matmul_plan.has_c_input_warp
-                and tcgen05_matmul_plan.aux_tensor_descriptors
+                and c_input_aux_tensor_descriptors
                 and aux_single_store_value
+            )
+            if (
+                tcgen05_aux_tma_requested
+                and all_aux_tensor_descriptors
+                and not aux_productive_body_gate_open
             ):
+                if not tcgen05_matmul_plan.has_c_input_warp:
+                    reason = (
+                        "requires the productive C-input warp "
+                        "(``tcgen05_warp_spec_c_input_warps=1``)"
+                    )
+                elif not c_input_aux_tensor_descriptors:
+                    reason = (
+                        "requires at least one exact-shape rank-2 auxiliary "
+                        "tensor; broadcast-only auxiliary tensors are not "
+                        "staged by the aux TMA path"
+                    )
+                else:
+                    reason = (
+                        "requires single-store fan-out for the staged aux descriptors"
+                    )
+                raise exc.BackendUnsupported(
+                    "cute",
+                    f"{TCGEN05_AUX_LOAD_MODE_CONFIG_KEY}="
+                    f"{TCGEN05_AUX_LOAD_MODE_TMA!r} {reason}",
+                )
+            if aux_productive_body_gate_open:
                 aux_descriptor_dtype_strs = tuple(
                     env.backend.dtype_str(desc.host_tensor_val.dtype)
-                    for desc in tcgen05_matmul_plan.aux_tensor_descriptors
+                    for desc in c_input_aux_tensor_descriptors
+                )
+                # With dynamic M/N output shapes, a TMA-store epilogue is only
+                # enabled for the output-edge family, which routes partial tiles
+                # through either the full/edge split or the bounds-checked
+                # partial-output TMA-store path.
+                tma_store_handles_partial_tiles = tcgen05_use_tma_store_epilogue
+                aux_tma_needs_edge_routing = (
+                    tcgen05_aux_tma_requested
+                    and not tcgen05_static_output_tiles
+                    and not tma_store_handles_partial_tiles
+                )
+                if aux_tma_needs_edge_routing:
+                    raise exc.BackendUnsupported(
+                        "cute",
+                        f"{TCGEN05_AUX_LOAD_MODE_CONFIG_KEY}="
+                        f"{TCGEN05_AUX_LOAD_MODE_TMA!r} with partial output "
+                        "tiles requires either a partial-output TMA-store "
+                        "epilogue or the full-tile/edge fallback split used "
+                        "by output-edge stores",
+                    )
+                if tcgen05_aux_tma_requested and any(
+                    dtype_str != epi_elem_dtype_str
+                    for dtype_str in aux_descriptor_dtype_strs
+                ):
+                    raise exc.BackendUnsupported(
+                        "cute",
+                        f"{TCGEN05_AUX_LOAD_MODE_CONFIG_KEY}="
+                        f"{TCGEN05_AUX_LOAD_MODE_TMA!r} requires auxiliary "
+                        "tensor dtype to match the epilogue/output dtype",
+                    )
+                tcgen05_aux_use_tma_load = tcgen05_aux_tma_requested
+                tcgen05_aux_stage_count = _tcgen05_aux_pipeline_stage_count_from_config(
+                    df.config
                 )
                 tcgen05_aux_plan = _new_tcgen05_aux_pipeline_plan(
                     df,
-                    num_rings=len(tcgen05_matmul_plan.aux_tensor_descriptors),
+                    num_rings=len(c_input_aux_tensor_descriptors),
                     epi_tile_var=tcgen05_plan.epi_tile,
+                    use_tma_load=tcgen05_aux_use_tma_load,
+                    stage_count=tcgen05_aux_stage_count,
                 )
-                df.register_cute_tcgen05_aux_pipeline_plan(tcgen05_aux_plan)
+                if tcgen05_aux_use_tma_load:
+                    for desc, ring, aux_dtype_str in zip(
+                        c_input_aux_tensor_descriptors,
+                        tcgen05_aux_plan.rings,
+                        aux_descriptor_dtype_strs,
+                        strict=True,
+                    ):
+                        tma_atom = ring.tma_atom
+                        tma_tensor = ring.tma_tensor
+                        assert tma_atom is not None
+                        assert tma_tensor is not None
+                        aux_tensor_name = df.tensor_arg(desc.host_tensor_val).name
+                        df.placeholder_args.add(aux_tensor_name)
+                        df.wrapper_only_params.extend([tma_atom, tma_tensor])
+                        cg.cute_wrapper_plans.append(
+                            {
+                                "kind": "tcgen05_aux_tma",
+                                "c_name": aux_tensor_name,
+                                "bm": bm,
+                                "bn": bn,
+                                "stage_count": tcgen05_aux_stage_count,
+                                "input_dtype": aux_dtype_str,
+                                "kernel_args": [tma_atom, tma_tensor],
+                            }
+                        )
+                df.cute_state.register_tcgen05_aux_pipeline_plan(tcgen05_aux_plan)
                 prefix.extend(
                     _emit_tcgen05_aux_pipeline_setup(
                         tcgen05_aux_plan,
@@ -3072,6 +4461,53 @@ def _emit_mma_pipeline(
     tma_full_tile = df.new_var("tcgen05_tma_full_tile")
     tma_next_full_tile = df.new_var("tcgen05_tma_next_full_tile")
     tma_next_consumer_tile = df.new_var("tcgen05_tma_next_consumer_tile")
+
+    def _tcgen05_tma_output_tile_predicate() -> str:
+        if tcgen05_role_local_double_edge_tma:
+            # The role-local double-edge path lets TMA handle both partial AB
+            # stripes while the SIMT epilogue predicates aux loads and stores.
+            return (
+                f"{m_offset_var} < cutlass.Int32({m_size}) "
+                f"and {n_offset_var} < cutlass.Int32({n_size}) "
+            )
+        if tcgen05_role_local_m_edge_tma:
+            # The role-local M-edge path lets TMA handle the partial A stripe
+            # while the SIMT epilogue predicates aux loads and D stores.
+            return (
+                f"{m_offset_var} < cutlass.Int32({m_size}) "
+                f"and {n_offset_var} + cutlass.Int32({bn}) <= cutlass.Int32({n_size}) "
+            )
+        if tcgen05_role_local_n_edge_tma:
+            # The role-local N-edge path lets TMA handle the partial B stripe
+            # while the SIMT epilogue predicates aux loads and D stores.
+            return (
+                f"{m_offset_var} + cutlass.Int32({bm}) <= cutlass.Int32({m_size}) "
+                f"and {n_offset_var} < cutlass.Int32({n_size}) "
+            )
+        return (
+            f"{m_offset_var} + cutlass.Int32({bm}) <= cutlass.Int32({m_size}) "
+            f"and {n_offset_var} + cutlass.Int32({bn}) <= cutlass.Int32({n_size}) "
+        )
+
+    def _tcgen05_tma_k_tile_predicate(
+        *, k_tile_start_expr: str, full_tile_end_expr: str
+    ) -> str:
+        if tcgen05_role_local_uses_k_tail_tma:
+            return f"{k_tile_start_expr} < cutlass.Int32({k_total_size})"
+        return f"{full_tile_end_expr} <= cutlass.Int32({k_total_size})"
+
+    def _tcgen05_tma_tile_predicate(
+        *, k_tile_start_expr: str, full_tile_end_expr: str
+    ) -> str:
+        return (
+            _tcgen05_tma_output_tile_predicate()
+            + "and "
+            + _tcgen05_tma_k_tile_predicate(
+                k_tile_start_expr=k_tile_start_expr,
+                full_tile_end_expr=full_tile_end_expr,
+            )
+        )
+
     tma_k_tile = df.new_var("tcgen05_tma_k_tile")
     tma_barrier_ptr = df.new_var("tcgen05_tma_barrier")
     tma_producer_try_token = df.new_var("tcgen05_ab_producer_try_token")
@@ -3090,7 +4526,7 @@ def _emit_mma_pipeline(
     tma_consumer_state = df.new_var("tcgen05_ab_consumer_state")
     tma_store_role_tile_counter = (
         df.new_var("tcgen05_tma_store_role_tile")
-        if tcgen05_use_tma_store_epilogue and tcgen05_use_role_local_epi
+        if tcgen05_use_tma_store_epilogue and tcgen05_use_role_local_tma_producer
         else ""
     )
     tcgen05_frag_a = df.new_var("tcgen05_tCrA")
@@ -3125,15 +4561,25 @@ def _emit_mma_pipeline(
                 "ab_stage_count": tcgen05_ab_stage_count_value,
                 "input_dtype": input_dtype_str,
                 "acc_dtype": acc_dtype_str,
+                # B1 (cycle-3 review): plumb the validated problem
+                # shape onto the AB plan so the direct-entry plan can
+                # carry an envelope identity that the runtime
+                # validator dispatches on. T4 and T5 share ``bk=128``,
+                # so the bk-keyed shape-set alone cannot distinguish
+                # a T4 plan from a T5 plan when both are admitted.
+                "m_size": m_size,
+                "n_size": n_size,
+                "k_total_size": k_total_size,
                 "kernel_args": [tma_atom_a, tma_tensor_a, tma_atom_b, tma_tensor_b],
             }
-            # ``smem_swizzle_*`` overrides are recorded only when the
-            # user opts in. Keeping the keys absent on the default path
-            # preserves the no-override wrapper-plan literal so
-            # byte-identity with the canonical 4096³ seed holds. The
-            # wrapper-side ``_append_cute_wrapper_plan`` reads
-            # ``plan.get(..., None)`` and emits the override-aware SMEM
-            # atom expression only when an explicit value is present.
+            # ``smem_swizzle_*`` overrides are recorded only when codegen
+            # selected an explicit SMEM atom kind (either from a user
+            # override or the scalar-edge fallback workaround). Keeping
+            # the keys absent on the default path preserves the legacy
+            # wrapper-plan literal. The wrapper-side
+            # ``_append_cute_wrapper_plan`` reads ``plan.get(..., None)``
+            # and emits the override-aware SMEM atom expression only
+            # when an explicit value is present.
             if tcgen05_smem_swizzle_a is not None:
                 ab_tma_plan["smem_swizzle_a"] = tcgen05_smem_swizzle_a
             if tcgen05_smem_swizzle_b is not None:
@@ -3374,16 +4820,19 @@ def _emit_mma_pipeline(
             )
             prefix.append(
                 statement_from_string(
-                    f"{tma_producer_state} = cutlass.pipeline.make_pipeline_state("
+                    f"{tma_producer_state} = {tcgen05_pipeline_state_ns}.make_pipeline_state("
                     f"cutlass.pipeline.PipelineUserType.Producer, {tcgen05_ab_stage_count_value})"
                 )
             )
             tma_consumer_state_init = (
+                # Diagnostic phase override intentionally uses the upstream
+                # raw state constructor; it does not participate in the Helion
+                # wrapper ownership experiment.
                 f"cutlass.pipeline.PipelineState({tcgen05_ab_stage_count_value}, "
                 "cutlass.Int32(0), cutlass.Int32(0), cutlass.Int32(1))"
                 if diagnose_ab_consumer_phase1
                 else (
-                    "cutlass.pipeline.make_pipeline_state("
+                    f"{tcgen05_pipeline_state_ns}.make_pipeline_state("
                     "cutlass.pipeline.PipelineUserType.Consumer, "
                     f"{tcgen05_ab_stage_count_value})"
                 )
@@ -3427,9 +4876,10 @@ def _emit_mma_pipeline(
                 )
                 _emit_per_tile(
                     f"{tma_initial_full_tile} = "
-                    f"{m_offset_var} + cutlass.Int32({bm}) <= cutlass.Int32({m_size}) "
-                    f"and {n_offset_var} + cutlass.Int32({bn}) <= cutlass.Int32({n_size}) "
-                    f"and cutlass.Int32({bk}) <= cutlass.Int32({k_total_size})",
+                    + _tcgen05_tma_tile_predicate(
+                        k_tile_start_expr="cutlass.Int32(0)",
+                        full_tile_end_expr=f"cutlass.Int32({bk})",
+                    ),
                     tma_load=tcgen05_use_role_local_tma_producer,
                 )
                 stage0_prefetch = _build_initial_prefetch_if(
@@ -3455,9 +4905,10 @@ def _emit_mma_pipeline(
                     # phase 0. See cute_plan.md §6.9.1.
                     _emit_per_tile(
                         f"{tma_initial_next_full_tile} = "
-                        f"{m_offset_var} + cutlass.Int32({bm}) <= cutlass.Int32({m_size}) "
-                        f"and {n_offset_var} + cutlass.Int32({bn}) <= cutlass.Int32({n_size}) "
-                        f"and cutlass.Int32({bk * tcgen05_ab_stage_count_value}) <= cutlass.Int32({k_total_size})",
+                        + _tcgen05_tma_tile_predicate(
+                            k_tile_start_expr=f"cutlass.Int32({bk * (tcgen05_ab_stage_count_value - 1)})",
+                            full_tile_end_expr=f"cutlass.Int32({bk * tcgen05_ab_stage_count_value})",
+                        ),
                         tma_load=tcgen05_use_role_local_tma_producer,
                     )
                     for stage_idx in range(1, tcgen05_ab_stage_count_value):
@@ -3472,9 +4923,10 @@ def _emit_mma_pipeline(
                             )
                             _emit_per_tile(
                                 f"{stage_gate_var} = "
-                                f"{m_offset_var} + cutlass.Int32({bm}) <= cutlass.Int32({m_size}) "
-                                f"and {n_offset_var} + cutlass.Int32({bn}) <= cutlass.Int32({n_size}) "
-                                f"and cutlass.Int32({bk * (stage_idx + 1)}) <= cutlass.Int32({k_total_size})",
+                                + _tcgen05_tma_tile_predicate(
+                                    k_tile_start_expr=f"cutlass.Int32({bk * stage_idx})",
+                                    full_tile_end_expr=f"cutlass.Int32({bk * (stage_idx + 1)})",
+                                ),
                                 tma_load=tcgen05_use_role_local_tma_producer,
                             )
                             stage_gates = [tma_initial_full_tile, stage_gate_var]
@@ -3603,31 +5055,40 @@ def _emit_mma_pipeline(
             and mma_participant_linear is not None
             and mma_copy_linear is not None
         )
-        load_thread_count = active_threads
+        load_thread_count = (
+            mma_physical_m_threads * mma_phys_n
+            if mma_impl == "tcgen05" and tcgen05_collective_handles_operand_loads
+            else active_threads
+        )
         load_guard = mma_active
         mma_stage_stmt: ast.stmt | None = None
         smem_a_mma_stmt: ast.stmt | None = None
         smem_b_mma_stmt: ast.stmt | None = None
+        tma_full_tile_predicate_src: str | None = None
         tma_full_tile_stmt: ast.stmt | None = None
         if mma_impl == "tcgen05":
             assert tcgen05_plan is not None
             # The smem cache for A/B is laid out as (..., ab_stage_count); we
             # index into the current stage every K-loop iteration.
             #
-            # When the kernel uses the TMA pipeline, ``tma_consumer_state.index``
-            # is the canonical stage index: it advances exactly once per K-loop
-            # iteration via ``consumer_release`` + ``advance``, and (critically
-            # for the persistent path) it carries its value across virtual
-            # tiles. Computing ``mma_stage`` from ``k_offset // bk`` resets to
-            # zero at each tile while the pipeline state stays where it was at
-            # the end of the prior tile -- the two diverge across persistent
-            # tile boundaries. Use the pipeline state directly so the K-loop
-            # always reads the stage the consumer just unblocked.
+            # When the role-local persistent kernel uses the TMA pipeline,
+            # ``tma_consumer_state.index`` is the canonical stage index: it
+            # advances exactly once per K-loop iteration via ``consumer_release``
+            # + ``advance`` and carries its value across virtual tiles. Computing
+            # ``mma_stage`` from ``k_offset // bk`` resets to zero at each tile
+            # while the pipeline state stays where it was at the end of the
+            # prior tile -- the two diverge across persistent tile boundaries.
+            #
+            # Non-role-local edge fallback is different: scalar fallback loader
+            # warps also need the stage, but only the exec warp advances its
+            # thread-local AB consumer state on full TMA K tiles. Compute the
+            # stage from the K tile index there so loader and exec warps agree
+            # when a later partial K tile falls back to scalar SMEM fills.
             #
             # For the non-TMA tcgen05 path there is no pipeline state to track
             # and ``ab_stage_count`` is always 1, so the modular form is a
             # constant zero anyway.
-            if tcgen05_use_tma:
+            if tcgen05_use_tma and tcgen05_use_separate_mma_exec:
                 mma_stage_stmt = statement_from_string(
                     f"{mma_stage} = {tma_consumer_state}.index"
                 )
@@ -3643,7 +5104,7 @@ def _emit_mma_pipeline(
             smem_b_mma_stmt = statement_from_string(
                 f"{smem_b_mma} = {smem_b}[(None, 0, 0, {mma_stage})]"
             )
-            if not tcgen05_use_role_local_mma_exec:
+            if not tcgen05_use_separate_mma_exec:
                 cg.add_statement(mma_stage_stmt)
                 cg.add_statement(smem_a_mma_stmt)
                 cg.add_statement(smem_b_mma_stmt)
@@ -3651,15 +5112,17 @@ def _emit_mma_pipeline(
                 tma_k_tile_stmt = statement_from_string(
                     f"{tma_k_tile} = {k_offset_var} // cutlass.Int32({bk})"
                 )
-                tma_full_tile_stmt = statement_from_string(
-                    f"{tma_full_tile} = "
-                    f"{m_offset_var} + cutlass.Int32({bm}) <= cutlass.Int32({m_size}) "
-                    f"and {n_offset_var} + cutlass.Int32({bn}) <= cutlass.Int32({n_size}) "
-                    f"and {k_offset_var} + cutlass.Int32({bk}) <= cutlass.Int32({k_total_size})"
+                tma_full_tile_predicate_src = _tcgen05_tma_tile_predicate(
+                    k_tile_start_expr=k_offset_var,
+                    full_tile_end_expr=f"{k_offset_var} + cutlass.Int32({bk})",
                 )
-                if not tcgen05_use_role_local_mma_exec:
+                tma_full_tile_stmt = statement_from_string(
+                    f"{tma_full_tile} = " + tma_full_tile_predicate_src
+                )
+                if not tcgen05_use_separate_mma_exec:
                     cg.add_statement(tma_k_tile_stmt)
-                    cg.add_statement(tma_full_tile_stmt)
+                    if not tcgen05_static_full_tma_fast_path:
+                        cg.add_statement(tma_full_tile_stmt)
         smem_a_store = f"{smem_a}[_row, _col]"
         smem_b_store = f"{smem_b}[_row, _col]"
         if mma_impl == "tcgen05":
@@ -3698,6 +5161,24 @@ def _emit_mma_pipeline(
         if mma_impl == "tcgen05" and tcgen05_use_tma:
             assert tcgen05_plan is not None
             assert tma_warp is not None
+            # The validated explicit two-CTA store-box family uses bk=64 to
+            # match Quack's four logical 2CTA MMA K blocks. Python ``range``
+            # lets the outer K-loop duplicate those issue sites; a CuTe range
+            # with no-unroll metadata keeps that guarded family in one loop
+            # body while normal loops keep their existing range lowering.
+            tcgen05_use_nounroll_k_loop = (
+                any(
+                    value is not None
+                    for value in (
+                        tcgen05_explicit_epi_tile_m,
+                        tcgen05_explicit_epi_tile_n,
+                        tcgen05_explicit_d_store_box_n,
+                    )
+                )
+                and tcgen05_static_full_tiles
+                and tcgen05_is_two_cta
+                and bk == 64
+            )
             tma_kloop_args = _PerKiterTmaArgs(
                 tma_pipeline=tma_pipeline,
                 tma_producer_state=tma_producer_state,
@@ -3730,54 +5211,77 @@ def _emit_mma_pipeline(
                 scalar_load_a=scalar_load_a,
                 scalar_load_b=scalar_load_b,
                 cluster_n=tcgen05_cluster_n,
+                static_full_tiles=tcgen05_static_full_tma_fast_path,
             )
             if tcgen05_use_tma_pipeline:
-                if tcgen05_use_role_local_tma_producer:
-                    producer_loop_body: list[ast.stmt] = [
+                if tcgen05_use_separate_tma_producer:
+                    producer_loop_body = [
                         statement_from_string(
                             f"{tma_k_tile} = {k_offset_var} // cutlass.Int32({bk})"
-                        ),
-                        statement_from_string(
-                            f"{tma_full_tile} = "
-                            f"{m_offset_var} + cutlass.Int32({bm}) <= cutlass.Int32({m_size}) "
-                            f"and {n_offset_var} + cutlass.Int32({bn}) <= cutlass.Int32({n_size}) "
-                            f"and {k_offset_var} + cutlass.Int32({bk}) <= cutlass.Int32({k_total_size})"
-                        ),
-                        statement_from_string(
-                            f"{tma_next_full_tile} = "
-                            f"{m_offset_var} + cutlass.Int32({bm}) <= cutlass.Int32({m_size}) "
-                            f"and {n_offset_var} + cutlass.Int32({bn}) <= cutlass.Int32({n_size}) "
-                            f"and {k_offset_var} + cutlass.Int32({bk * (tcgen05_ab_stage_count_value + 1)}) <= cutlass.Int32({k_total_size})"
-                        ),
-                        statement_from_string(
-                            f"{tma_producer_try_token} = cutlass.Boolean(0)"
-                        ),
-                        _build_kloop_pipeline_producer_if(
-                            tma_kloop_args, gate_tma_warp=False
-                        ),
+                        )
                     ]
-                    producer_loop = _clone_k_loop_with_body(
-                        device_loop, producer_loop_body
+                    if not tcgen05_static_full_tma_fast_path:
+                        assert tma_full_tile_predicate_src is not None
+                        producer_loop_body.append(
+                            statement_from_string(
+                                f"{tma_full_tile} = " + tma_full_tile_predicate_src
+                            )
+                        )
+                    producer_loop_body.extend(
+                        [
+                            statement_from_string(
+                                f"{tma_next_full_tile} = "
+                                + _tcgen05_tma_tile_predicate(
+                                    k_tile_start_expr=f"{k_offset_var} + cutlass.Int32({bk * tcgen05_ab_stage_count_value})",
+                                    full_tile_end_expr=f"{k_offset_var} + cutlass.Int32({bk * (tcgen05_ab_stage_count_value + 1)})",
+                                )
+                            ),
+                            statement_from_string(
+                                f"{tma_producer_try_token} = cutlass.Boolean(0)"
+                            ),
+                            _build_kloop_pipeline_producer_if(
+                                tma_kloop_args, gate_tma_warp=False
+                            ),
+                        ]
                     )
-                    prefix.append(producer_loop)
-                    per_tile_stmts.append(producer_loop)
-                    tma_load_role_stmts.append(producer_loop)
-                if tcgen05_use_role_local_mma_exec:
+                    producer_loop = _clone_k_loop_with_body(
+                        device_loop,
+                        producer_loop_body,
+                        iter_expr=(
+                            _tcgen05_k_loop_nounroll_iter_expr(device_loop)
+                            if tcgen05_use_nounroll_k_loop
+                            else None
+                        ),
+                    )
+                    producer_stmt: ast.stmt = producer_loop
+                    if tcgen05_use_pure_matmul_role_lifecycle:
+                        # Pure lifecycle emits role bodies directly instead of
+                        # relying on the generic role-local partitioner.
+                        producer_stmt = _wrap_stmt_in_if(producer_loop, tma_warp)
+                    prefix.append(producer_stmt)
+                    per_tile_stmts.append(producer_stmt)
+                    if tcgen05_use_role_local_tma_producer:
+                        tma_load_role_stmts.append(producer_loop)
+                if tcgen05_use_separate_mma_exec:
                     assert mma_stage_stmt is not None
                     assert smem_a_mma_stmt is not None
                     assert smem_b_mma_stmt is not None
-                    assert tma_full_tile_stmt is not None
                     exec_loop_body: list[ast.stmt] = [
                         mma_stage_stmt,
                         smem_a_mma_stmt,
                         smem_b_mma_stmt,
-                        tma_full_tile_stmt,
                     ]
+                    if not tcgen05_static_full_tma_fast_path:
+                        assert tma_full_tile_stmt is not None
+                        exec_loop_body.append(tma_full_tile_stmt)
                     if tcgen05_use_role_local_ab_consumer_prefetch:
                         exec_loop_body.append(
                             statement_from_string(
                                 f"{tma_next_consumer_tile} = "
-                                f"{k_offset_var} + cutlass.Int32({bk * 2}) <= cutlass.Int32({k_total_size})"
+                                + _tcgen05_tma_k_tile_predicate(
+                                    k_tile_start_expr=f"{k_offset_var} + cutlass.Int32({bk})",
+                                    full_tile_end_expr=f"{k_offset_var} + cutlass.Int32({bk * 2})",
+                                )
                             )
                         )
                     else:
@@ -3789,7 +5293,11 @@ def _emit_mma_pipeline(
                     exec_loop_body.append(
                         _build_kloop_pipeline_consumer_if(
                             tma_kloop_args,
-                            gate_exec_warp=False,
+                            # Static-full pipeline builders require their
+                            # internal exec gate to keep emitting a single
+                            # statement. The outer wrapper below makes the
+                            # cloned loop's role ownership explicit.
+                            gate_exec_warp=tcgen05_static_full_tma_fast_path,
                             include_scalar_fallback=False,
                             use_existing_try_token=tcgen05_use_role_local_ab_consumer_prefetch,
                         )
@@ -3809,7 +5317,10 @@ def _emit_mma_pipeline(
                                 tcgen05_frag_a=tcgen05_frag_a,
                                 tcgen05_frag_b=tcgen05_frag_b,
                                 mma_stage=mma_stage,
-                                gate_exec_warp=False,
+                                # See the consumer wait comment above: pure
+                                # lifecycle has an outer exec-active role
+                                # wrapper plus the static-full builder gate.
+                                gate_exec_warp=tcgen05_static_full_tma_fast_path,
                                 is_two_cta=tcgen05_is_two_cta,
                                 cluster_n=tcgen05_cluster_n,
                             )
@@ -3817,7 +5328,8 @@ def _emit_mma_pipeline(
                     exec_loop_body.append(
                         _build_kloop_pipeline_release_if(
                             tma_kloop_args,
-                            gate_exec_warp=False,
+                            # See the consumer wait comment above.
+                            gate_exec_warp=tcgen05_static_full_tma_fast_path,
                             include_scalar_fallback=False,
                         )
                     )
@@ -3828,10 +5340,24 @@ def _emit_mma_pipeline(
                                 gate_exec_warp=False,
                             )
                         )
-                    exec_loop = _clone_k_loop_with_body(device_loop, exec_loop_body)
-                    prefix.append(exec_loop)
-                    per_tile_stmts.append(exec_loop)
-                    mma_exec_role_stmts.append(exec_loop)
+                    exec_loop = _clone_k_loop_with_body(
+                        device_loop,
+                        exec_loop_body,
+                        iter_expr=(
+                            _tcgen05_k_loop_nounroll_iter_expr(device_loop)
+                            if tcgen05_use_nounroll_k_loop
+                            else None
+                        ),
+                    )
+                    exec_stmt: ast.stmt = exec_loop
+                    if tcgen05_use_pure_matmul_role_lifecycle:
+                        exec_stmt = _wrap_stmt_in_if(
+                            exec_loop, tcgen05_plan.exec_active
+                        )
+                    prefix.append(exec_stmt)
+                    per_tile_stmts.append(exec_stmt)
+                    if tcgen05_use_role_local_mma_exec:
+                        mma_exec_role_stmts.append(exec_loop)
                 else:
                     cg.add_statement(
                         statement_from_string(
@@ -3851,7 +5377,7 @@ def _emit_mma_pipeline(
                             f"{tma_consumer_try_token} = cutlass.Boolean(0)"
                         )
                     )
-                    if not tcgen05_use_role_local_tma_producer:
+                    if not tcgen05_use_separate_tma_producer:
                         # Legacy inline path: keep producer and consumer
                         # adjacent inside the shared K-loop. Persistent
                         # role-local mode emits the producer as a top-level
@@ -3861,7 +5387,18 @@ def _emit_mma_pipeline(
                             tma_kloop_args
                         )
                         cg.add_statement(pipeline_producer_stmt)
-                    cg.add_statement(_build_kloop_pipeline_consumer_if(tma_kloop_args))
+                    cg.add_statement(
+                        _build_kloop_pipeline_consumer_if(
+                            tma_kloop_args,
+                            include_scalar_fallback=(
+                                not tcgen05_static_full_tma_fast_path
+                            ),
+                            sync_before_scalar_fallback=(
+                                tcgen05_sync_before_scalar_fallback
+                                and not tcgen05_static_full_tma_fast_path
+                            ),
+                        )
+                    )
             else:
                 non_pipeline_producer_stmt = _build_kloop_non_pipeline_producer_if(
                     tma_kloop_args
@@ -3927,7 +5464,7 @@ def _emit_mma_pipeline(
             )
         else:
             assert tcgen05_plan is not None
-            if not tcgen05_use_role_local_mma_exec:
+            if not tcgen05_use_separate_mma_exec:
                 if not diagnose_skip_umma_issue:
                     # No async-shared fence: the pipelined AB consumer_wait
                     # is a transaction-count ``mbarrier_try_wait`` and the
@@ -3952,7 +5489,12 @@ def _emit_mma_pipeline(
                     assert tma_kloop_args is not None
                     if tcgen05_use_tma_pipeline:
                         cg.add_statement(
-                            _build_kloop_pipeline_release_if(tma_kloop_args)
+                            _build_kloop_pipeline_release_if(
+                                tma_kloop_args,
+                                include_scalar_fallback=(
+                                    not tcgen05_static_full_tma_fast_path
+                                ),
+                            )
                         )
                     else:
                         cg.add_statement(
@@ -4059,9 +5601,40 @@ def _emit_mma_pipeline(
         assert epi_active is not None
         assert tma_warp is not None
         assert warp_idx is not None
-        df.register_cute_tcgen05_store_value(
+        tcgen05_lifecycle_context = Tcgen05LifecycleContext(
+            exec_active=tcgen05_plan.exec_active,
+            epi_active=epi_active,
+            tma_warp=tma_warp,
+            tma_pipeline=tma_pipeline,
+            tma_producer_state=tma_producer_state,
+            acc_pipeline=tcgen05_plan.acc_pipeline,
+            acc_producer_state=tcgen05_plan.acc_producer_state,
+            acc_consumer_state=tcgen05_plan.acc_consumer_state,
+            tmem_alloc_barrier=tcgen05_plan.tmem_alloc_barrier,
+            tmem_allocator=tcgen05_plan.tmem_allocator,
+            tmem_holding_buf=tcgen05_plan.tmem_holding_buf,
+            tmem_dealloc_mbar_ptr=tcgen05_plan.tmem_dealloc_mbar_ptr,
+            epi_acc_tmem_ptr=tcgen05_epi_acc_tmem_ptr,
+            acc_tmem_cols=tcgen05_plan.acc_tmem_cols,
+            is_two_cta=tcgen05_is_two_cta,
+            use_tma=tcgen05_use_tma,
+            ab_stage_count=tcgen05_ab_stage_count_value,
+            acc_stage_count=tcgen05_acc_stage_count_value,
+            skip_ab_producer_advance=diagnose_skip_ab_producer_advance,
+        )
+        tcgen05_pure_matmul_object = (
+            Tcgen05PureMatmulObjectModel(
+                lifecycle_context=tcgen05_lifecycle_context,
+                cleanup_loop=device_loop,
+            )
+            if tcgen05_use_pure_matmul_role_lifecycle
+            else None
+        )
+        df.cute_state.register_tcgen05_store_value(
             result_var,
             CuteTcgen05StoreValue(
+                lifecycle_context=tcgen05_lifecycle_context,
+                pure_matmul_object=tcgen05_pure_matmul_object,
                 bm=bm,
                 bn=bn,
                 bk=bk,
@@ -4069,50 +5642,38 @@ def _emit_mma_pipeline(
                 epi_warp_count=tcgen05_epi_warp_count_value,
                 epi_acc_frag_base=tcgen05_epi_acc_frag_base,
                 epi_tidx=epi_tidx,
-                epi_active=epi_active,
-                exec_active=tcgen05_plan.exec_active,
                 warp_idx=warp_idx,
                 epi_tile=tcgen05_plan.epi_tile,
                 c_stage_count=tcgen05_c_stage_count_value,
                 epilog_sync_barrier_id=_TCGEN05_EPILOG_SYNC_BARRIER_ID,
                 tmem_load_atom=tcgen05_plan.tmem_load_atom,
                 epilogue_rest_mode=tcgen05_plan.epilogue_rest_mode,
-                acc_pipeline=tcgen05_plan.acc_pipeline,
-                acc_producer_state=tcgen05_plan.acc_producer_state,
-                acc_consumer_state=tcgen05_plan.acc_consumer_state,
-                tmem_alloc_barrier=tcgen05_plan.tmem_alloc_barrier,
-                tmem_allocator=tcgen05_plan.tmem_allocator,
-                tmem_holding_buf=tcgen05_plan.tmem_holding_buf,
-                tmem_dealloc_mbar_ptr=tcgen05_plan.tmem_dealloc_mbar_ptr,
-                epi_acc_tmem_ptr=tcgen05_epi_acc_tmem_ptr,
-                acc_tmem_cols=tcgen05_plan.acc_tmem_cols,
-                tma_warp=tma_warp,
-                tma_pipeline=tma_pipeline,
-                tma_producer_state=tma_producer_state,
                 tma_store_atom=tma_store_atom,
                 tma_store_tensor=tma_store_tensor,
                 role_local_tile_counter=tma_store_role_tile_counter,
-                is_two_cta=tcgen05_is_two_cta,
-                use_tma=tcgen05_use_tma,
                 use_role_local_epi=tcgen05_use_role_local_epi,
                 use_tma_store_epilogue=tcgen05_use_tma_store_epilogue,
-                ab_stage_count=tcgen05_ab_stage_count_value,
-                acc_stage_count=tcgen05_acc_stage_count_value,
-                skip_ab_producer_advance=diagnose_skip_ab_producer_advance,
+                tma_store_full_tiles_only=tcgen05_tma_store_full_tiles_only,
+                partial_output_tma_store=tcgen05_partial_output_tma_store,
                 # Mirror the value passed to `_make_tcgen05_layout_plan_setup`
                 # above; the store path compares this against `target_dtype`
                 # to enforce the kernel/store equality contract on
                 # `compute_epilogue_tile_shape`'s dtype kwargs.
                 epi_elem_dtype_str=epi_elem_dtype_str,
+                explicit_epi_tile_m=tcgen05_explicit_epi_tile_m,
+                explicit_epi_tile_n=tcgen05_explicit_epi_tile_n,
+                explicit_d_store_box_n=tcgen05_explicit_d_store_box_n,
             ),
         )
+        if tcgen05_pure_matmul_object is not None:
+            tcgen05_pure_matmul_object.register_pending_store(df.cute_state)
         if fx_node is not None:
             # Map the matmul fx_node -> result_var so the G3.1.1 fused
             # epilogue splice path can reuse the existing
             # `CuteTcgen05StoreValue` registration via a backward FX
             # walk from the user's store value through a whitelisted
             # unary chain to this matmul fx_node.
-            df.cute_tcgen05_matmul_fx_node_result_vars[fx_node] = result_var
+            df.cute_state.matmul_fx_node_result_vars[fx_node] = result_var
     else:
         # Each thread reads its own (m, n) element from shared memory.
         suffix.append(
@@ -4127,7 +5688,11 @@ def _emit_mma_pipeline(
     # non-persistent ``pid_type`` (the splitter is only invoked from
     # ``_setup_tcgen05_persistent_kernel``).
     if per_tile_stmts:
-        df.register_cute_tcgen05_per_tile_stmts(per_tile_stmts)
+        df.cute_state.register_tcgen05_per_tile_stmts(per_tile_stmts)
+    if mma_impl == "tcgen05":
+        df.cute_state.register_tcgen05_kloop_owned_stmts(
+            device_loop, device_loop.inner_statements[tcgen05_kloop_stmt_start:]
+        )
     # Register role-block statements with the persistent role partitioner
     # (see ``Tcgen05PersistentProgramIDs._collect_tcgen05_role_blocks``).
     # Two registration shapes land here:
@@ -4147,9 +5712,9 @@ def _emit_mma_pipeline(
     # visited, so a misregistered top-level stmt fails loudly rather
     # than silently dropping its role gate.
     if tma_load_role_stmts:
-        df.register_cute_tcgen05_tma_load_role_stmts(tma_load_role_stmts)
+        df.cute_state.register_tcgen05_tma_load_role_stmts(tma_load_role_stmts)
     if mma_exec_role_stmts:
-        df.register_cute_tcgen05_mma_exec_role_stmts(mma_exec_role_stmts)
+        df.cute_state.register_tcgen05_mma_exec_role_stmts(mma_exec_role_stmts)
 
     return expr_from_string(result_var)
 
@@ -4508,6 +6073,8 @@ def _make_tcgen05_layout_plan_setup(
     epi_elem_dtype_str: str | None = None,
     smem_swizzle_a: int | None = None,
     smem_swizzle_b: int | None = None,
+    explicit_epi_tile_m: int | None = None,
+    explicit_epi_tile_n: int | None = None,
 ) -> list[ast.AST]:
     # `compute_epilogue_tile_shape` must receive `elem_ty_d` and `elem_ty_c`
     # equal to the eventual D-output dtype so the helper takes the
@@ -4521,6 +6088,18 @@ def _make_tcgen05_layout_plan_setup(
     # is the loud-failure backstop for any mismatch.
     if epi_elem_dtype_str is None:
         epi_elem_dtype_str = input_dtype_str
+    if (explicit_epi_tile_m is None) != (explicit_epi_tile_n is None):
+        raise exc.BackendUnsupported(
+            "cute",
+            "explicit tcgen05 epilogue tile requires both tile dimensions",
+        )
+    epi_tile_expr = (
+        tcgen05_explicit_epilogue_tile_expr(explicit_epi_tile_m, explicit_epi_tile_n)
+        if explicit_epi_tile_m is not None and explicit_epi_tile_n is not None
+        else tcgen05_default_epilogue_tile_expr(
+            bm, bn, epi_elem_dtype_str, c_layout=plan.c_layout
+        )
+    )
     return [
         statement_from_string(
             f"{plan.smem_a_layout} = "
@@ -4533,12 +6112,7 @@ def _make_tcgen05_layout_plan_setup(
         statement_from_string(
             f"{plan.c_layout} = cutlass.utils.layout.LayoutEnum.ROW_MAJOR"
         ),
-        statement_from_string(
-            f"{plan.epi_tile} = cutlass.utils.blackwell_helpers.compute_epilogue_tile_shape("
-            f"({bm}, {bn}), False, {plan.c_layout}, "
-            f"{epi_elem_dtype_str}, layout_c={plan.c_layout}, "
-            f"elem_ty_c={epi_elem_dtype_str})"
-        ),
+        statement_from_string(f"{plan.epi_tile} = {epi_tile_expr}"),
         statement_from_string(
             f"{plan.tmem_load_atom} = cutlass.utils.blackwell_helpers.get_tmem_load_op("
             f"({bm}, {bn}, {bk}), {plan.c_layout}, "
@@ -4759,11 +6333,46 @@ def _emit_sched_pipeline_setup(
     ]
 
 
-#: Fixed stage count for the aux SMEM-ring pipeline (cycle 2 of the
-#: producer-body split, ``cute_plan.md`` §7.5.3.2). Matches the
-#: existing D-store ``c_pipeline`` 2-stage default. Future cycles
-#: may make this autotunable once the producer body lands.
-_TCGEN05_AUX_PIPELINE_STAGE_COUNT = 2
+def _tcgen05_aux_pipeline_stage_count_from_config(config: object) -> int:
+    """Return the aux-pipeline stage count for ``config``, defaulting to
+    ``TCGEN05_AUX_STAGE_COUNT_DEFAULT`` when the knob is absent.
+
+    Bad values raise via the downstream
+    ``_new_tcgen05_aux_pipeline_plan`` assert; the validator gate
+    (``_validate_int_enum_config`` in ``tcgen05_config.py``) is the
+    single source of truth that rejects out-of-range values before
+    they reach codegen, so any value seen here that fails the
+    downstream assert is a programmer bug, not user input.
+    """
+    return _tcgen05_config_int(
+        config, TCGEN05_AUX_STAGES_CONFIG_KEY, TCGEN05_AUX_STAGE_COUNT_DEFAULT
+    )
+
+
+def _tcgen05_consumer_regs_from_config(config: object) -> int:
+    """Return the consumer-warp ``setmaxregister_increase`` ceiling for
+    ``config``, defaulting to ``TCGEN05_CONSUMER_REGS_DEFAULT`` (256)
+    when the knob is absent.
+
+    Cycle 15 H2 (``cute_plan.md`` §6 Target 8). The default preserves
+    cycle-14 byte-identical emission; lower values force ``ptxas`` to
+    cap the consumer-warp per-thread register count. The validator
+    (``_validate_int_enum_config`` in ``tcgen05_config.py``) is the
+    single source of truth that rejects out-of-range values before
+    they reach codegen; values seen here that are outside
+    ``TCGEN05_CONSUMER_REGS_CHOICES`` are programmer bugs, not user
+    input, so this helper falls back to the default rather than
+    asserting (matching the ``_tcgen05_aux_pipeline_stage_count_from_config``
+    pattern). The default is included in ``CHOICES`` so the
+    default-with-knob configuration emits the same code as the
+    default-without-knob configuration.
+    """
+    value = _tcgen05_config_int(
+        config, TCGEN05_CONSUMER_REGS_CONFIG_KEY, TCGEN05_CONSUMER_REGS_DEFAULT
+    )
+    if value not in TCGEN05_CONSUMER_REGS_CHOICES:
+        return TCGEN05_CONSUMER_REGS_DEFAULT
+    return value
 
 
 def _new_tcgen05_aux_pipeline_plan(
@@ -4771,6 +6380,8 @@ def _new_tcgen05_aux_pipeline_plan(
     *,
     num_rings: int,
     epi_tile_var: str,
+    use_tma_load: bool,
+    stage_count: int = TCGEN05_AUX_STAGE_COUNT_DEFAULT,
 ) -> _Tcgen05AuxPipelinePlan:
     """Allocate variable names for the C-input warp's aux-tensor
     SMEM-ring pipeline (``cute_plan.md`` §7.5.3.2).
@@ -4787,17 +6398,32 @@ def _new_tcgen05_aux_pipeline_plan(
     shape is read directly from the matmul plan by the
     producer-body codegen, so no block-shape fields are plumbed
     through the aux pipeline plan.
+
+    ``stage_count`` controls the depth of the SMEM ring. Cycle 10
+    makes this config-driven so the T8 wide-N CLC + aux-TMA seed
+    family can sample ``{2, 3}`` while every other path keeps the
+    pre-cycle-10 default of 2 (preserving T1-T7 byte-identity).
     """
     assert num_rings >= 1, (
         "aux pipeline plan requires at least one descriptor; the gate "
         "in ``_codegen_cute_mma`` should not call this with an empty "
         "descriptor tuple"
     )
+    assert stage_count in TCGEN05_AUX_STAGE_COUNT_CHOICES, (
+        f"aux pipeline stage_count={stage_count!r} not in "
+        f"TCGEN05_AUX_STAGE_COUNT_CHOICES={TCGEN05_AUX_STAGE_COUNT_CHOICES!r}"
+    )
     rings = tuple(
         _Tcgen05AuxPerDescriptorRingNames(
             smem_layout=df.new_var(f"tcgen05_aux_smem_layout_{idx}"),
             smem_ptr=df.new_var(f"tcgen05_aux_smem_ptr_{idx}"),
             smem=df.new_var(f"tcgen05_aux_smem_{idx}"),
+            tma_atom=(
+                df.new_var(f"tcgen05_aux_tma_atom_{idx}") if use_tma_load else None
+            ),
+            tma_tensor=(
+                df.new_var(f"tcgen05_aux_tma_tensor_{idx}") if use_tma_load else None
+            ),
         )
         for idx in range(num_rings)
     )
@@ -4809,6 +6435,8 @@ def _new_tcgen05_aux_pipeline_plan(
         producer_state=df.new_var("tcgen05_aux_pipeline_producer_state"),
         consumer_state=df.new_var("tcgen05_aux_pipeline_consumer_state"),
         rings=rings,
+        use_tma_load=use_tma_load,
+        stage_count=stage_count,
         epi_tile_var=epi_tile_var,
     )
 
@@ -4828,13 +6456,13 @@ def _emit_tcgen05_aux_pipeline_setup(
 
     Per descriptor, allocates a SMEM ring sized by
     ``make_smem_layout_epi(<aux_dtype>, ROW_MAJOR, epi_tile,
-    _TCGEN05_AUX_PIPELINE_STAGE_COUNT)`` — each ring stage holds
-    ONE subtile (``epi_tile``-shaped slice) of the per-output-tile
-    aux region, not the full ``(bm, bn)`` tile. Per-subtile
-    staging keeps the SMEM ring footprint at one ``epi_tile``
-    chunk per stage rather than one ``(bm, bn)`` chunk, which is
-    essential to fit cluster_m=2 + ``tcgen05_ab_stages=3`` in the
-    228 KB B200 SMEM cap. The producer issues one cooperative
+    plan.stage_count)`` — each ring stage holds ONE subtile
+    (``epi_tile``-shaped slice) of the per-output-tile aux region,
+    not the full ``(bm, bn)`` tile. Per-subtile staging keeps the
+    SMEM ring footprint at one ``epi_tile`` chunk per stage rather
+    than one ``(bm, bn)`` chunk, which is essential to fit
+    cluster_m=2 + ``tcgen05_ab_stages=3`` in the 228 KB B200 SMEM
+    cap. The producer issues one cooperative
     ``cute.copy(GMEM_aux_subtile, SMEM_aux_ring[stage])`` *per
     subtile* (looping over the per-output-tile subtile axis),
     framed by ``producer_acquire`` / ``producer_commit`` / state
@@ -4843,14 +6471,19 @@ def _emit_tcgen05_aux_pipeline_setup(
     / lane-0 ``consumer_release`` / state advance per subtile.
     ``tile_shape_expr`` is the ``epi_tile`` variable name so the
     SMEM ring sizing matches the producer-side subtile copy
-    extent.
+    extent. ``plan.stage_count`` controls the depth — cycle 10
+    makes it config-driven so the T8 wide-N CLC + aux-TMA seed
+    family can sample ``{2, 3}``.
 
     Pipeline parameters:
 
-    - ``producer_arrive_count = c_input_warp_thread_count`` (32 for
-      the single C-input warp). The producer body issues
-      ``producer_acquire`` / ``producer_commit`` per-thread, so
-      the cooperative-group arrive count is per-thread.
+    - SIMT aux loads use ``producer_arrive_count =
+      c_input_warp_thread_count`` (32 for the single C-input warp).
+      The producer body issues ``producer_acquire`` /
+      ``producer_commit`` per-thread, so the cooperative-group
+      arrive count is per-thread. TMA aux loads use a
+      ``PipelineTmaAsync`` producer group matching the CUTLASS TMA
+      pipeline convention.
     - ``consumer_arrive_count = epi_warp_count`` (per-warp, NOT
       per-thread). The consumer-side flip in
       ``memory_ops._aux_subtile_load_source`` gates
@@ -4865,7 +6498,7 @@ def _emit_tcgen05_aux_pipeline_setup(
       spans every pipeline.
     """
     extra_args = ", defer_sync=True" if defer_sync else ""
-    stage_count = _TCGEN05_AUX_PIPELINE_STAGE_COUNT
+    stage_count = plan.stage_count
     lines: list[ast.AST] = []
     for ring, dtype_str in zip(plan.rings, descriptor_dtype_strs, strict=True):
         lines.extend(
@@ -4889,32 +6522,70 @@ def _emit_tcgen05_aux_pipeline_setup(
                 ),
             ]
         )
+    lines.append(
+        statement_from_string(
+            f"{plan.barriers} = cute.arch.alloc_smem("
+            f"cutlass.Int64, cutlass.Int32({stage_count * 2}))"
+        )
+    )
+    if plan.use_tma_load:
+        tx_terms = [
+            f"cute.size_in_bytes({dtype_str}, cute.slice_({ring.smem_layout}.outer, "
+            "(None, None, 0)))"
+            for ring, dtype_str in zip(plan.rings, descriptor_dtype_strs, strict=True)
+        ]
+        tx_count = " + ".join(tx_terms)
+        lines.extend(
+            [
+                statement_from_string(
+                    f"{plan.producer_group} = "
+                    "cutlass.pipeline.CooperativeGroup("
+                    "cutlass.pipeline.Agent.Thread)"
+                ),
+                statement_from_string(
+                    f"{plan.consumer_group} = "
+                    "cutlass.pipeline.CooperativeGroup("
+                    "cutlass.pipeline.Agent.Thread, "
+                    f"cutlass.Int32({epi_warp_count}))"
+                ),
+                statement_from_string(
+                    f"{plan.pipeline} = cutlass.pipeline.PipelineTmaAsync.create("
+                    f"num_stages={stage_count}, "
+                    f"producer_group={plan.producer_group}, "
+                    f"consumer_group={plan.consumer_group}, "
+                    f"tx_count={tx_count}, "
+                    f"barrier_storage={plan.barriers}"
+                    f"{extra_args})"
+                ),
+            ]
+        )
+    else:
+        lines.extend(
+            [
+                statement_from_string(
+                    f"{plan.producer_group} = "
+                    "cutlass.pipeline.CooperativeGroup("
+                    "cutlass.pipeline.Agent.Thread, "
+                    f"cutlass.Int32({c_input_warp_thread_count}))"
+                ),
+                statement_from_string(
+                    f"{plan.consumer_group} = "
+                    "cutlass.pipeline.CooperativeGroup("
+                    "cutlass.pipeline.Agent.Thread, "
+                    f"cutlass.Int32({epi_warp_count}))"
+                ),
+                statement_from_string(
+                    f"{plan.pipeline} = cutlass.pipeline.PipelineAsync.create("
+                    f"num_stages={stage_count}, "
+                    f"producer_group={plan.producer_group}, "
+                    f"consumer_group={plan.consumer_group}, "
+                    f"barrier_storage={plan.barriers}"
+                    f"{extra_args})"
+                ),
+            ]
+        )
     lines.extend(
         [
-            statement_from_string(
-                f"{plan.barriers} = cute.arch.alloc_smem("
-                f"cutlass.Int64, cutlass.Int32({stage_count * 2}))"
-            ),
-            statement_from_string(
-                f"{plan.producer_group} = "
-                "cutlass.pipeline.CooperativeGroup("
-                "cutlass.pipeline.Agent.Thread, "
-                f"cutlass.Int32({c_input_warp_thread_count}))"
-            ),
-            statement_from_string(
-                f"{plan.consumer_group} = "
-                "cutlass.pipeline.CooperativeGroup("
-                "cutlass.pipeline.Agent.Thread, "
-                f"cutlass.Int32({epi_warp_count}))"
-            ),
-            statement_from_string(
-                f"{plan.pipeline} = cutlass.pipeline.PipelineAsync.create("
-                f"num_stages={stage_count}, "
-                f"producer_group={plan.producer_group}, "
-                f"consumer_group={plan.consumer_group}, "
-                f"barrier_storage={plan.barriers}"
-                f"{extra_args})"
-            ),
             statement_from_string(
                 f"{plan.producer_state} = cutlass.pipeline.make_pipeline_state("
                 f"cutlass.pipeline.PipelineUserType.Producer, {stage_count})"
@@ -5326,6 +6997,12 @@ def codegen_cute_mma_dot(state: CodegenState) -> object | None:
         fx_node=state.fx_node,
     )
     if result is None:
+        if is_pure_matmul_role_lifecycle_config(state.device_function.config):
+            raise exc.BackendUnsupported(
+                "cute",
+                "tcgen05_strategy='pure_matmul_role_lifecycle' requires hl.dot "
+                "to lower through the tcgen05 K-loop path",
+            )
         return None
 
     acc_proxy = state.proxy_args[2] if len(state.proxy_args) > 2 else None

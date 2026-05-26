@@ -126,6 +126,51 @@ class TestExamples(RefEagerTestBase, TestCase):
             args[0] @ args[1],
         )
 
+    @xfailIfPallas(
+        "Pallas TPU clamps the N block to the lane width (128) which does"
+        " not match the test's N=96 bias dimension"
+    )
+    def test_matmul_bias_epilogue_wrapper(self):
+        from typing import Any
+        from typing import Callable
+        from typing import NamedTuple
+
+        class BiasEpilogue(NamedTuple):
+            bias: torch.Tensor
+
+            @property
+            def fn(
+                self,
+            ) -> Callable[[torch.Tensor, tuple[torch.Tensor, ...]], torch.Tensor]:
+                bias = self.bias
+
+                def epilogue(
+                    acc: torch.Tensor, tile: tuple[torch.Tensor, ...]
+                ) -> torch.Tensor:
+                    return acc + bias[tile[1]]
+
+                return epilogue
+
+            def __call__(
+                self, acc: torch.Tensor, tile: tuple[torch.Tensor, ...]
+            ) -> torch.Tensor:
+                return self.fn(acc, tile)
+
+            @property
+            def __closure__(self) -> tuple[Any, ...] | None:
+                return self.fn.__closure__
+
+        a = torch.randn([128, 64], device=DEVICE, dtype=torch.float32)
+        b = torch.randn([64, 96], device=DEVICE, dtype=torch.float32)
+        bias = torch.randn([96], device=DEVICE, dtype=torch.float32)
+
+        check_example(
+            "matmul",
+            (a, b, BiasEpilogue(bias)),
+            a @ b + bias,
+            block_sizes=[32, 32, 32],
+        )
+
     def test_matmul_bf16_tcgen05(self):
         """Matmul at 256^3 bf16 — fixture sized just above the cute
         tcgen05 admission floor (M >= 64 divisible by 64) so the cute
@@ -787,10 +832,6 @@ class TestExamples(RefEagerTestBase, TestCase):
         )
 
     @skipIfTileIR("PassManager::run failed")
-    @xfailIfCute(
-        "CuTe tcgen05 MMA path does not yet emit indices/masks for the "
-        "user-level epilogue write that follows the MMA"
-    )
     def test_epilogue_subtiling_residual_gelu(self):
         m, k, n = 8192, 8192, 8192
         x = torch.randn([m, k], device=DEVICE, dtype=HALF_DTYPE)
@@ -889,6 +930,43 @@ class TestExamples(RefEagerTestBase, TestCase):
             args,
             torch.nn.functional.scaled_dot_product_attention(*args),
             fn_name="attention_dynamic",
+            block_sizes=[1, 64, 32],
+        )
+
+    @xfailIfCute(
+        "CuTe attention-style online-softmax kernel still returns incorrect results"
+    )
+    def test_xsa(self):
+        args = (
+            torch.randn(2, 32, 1024, 64, dtype=HALF_DTYPE, device=DEVICE),
+            torch.randn(2, 32, 1024, 64, dtype=HALF_DTYPE, device=DEVICE),
+            torch.randn(2, 32, 1024, 64, dtype=HALF_DTYPE, device=DEVICE),
+        )
+        mod = import_path(EXAMPLES_DIR / "xsa.py")
+        check_example(
+            "xsa",
+            args,
+            mod.ref_xsa(*args),
+            fn_name="xsa_kernel",
+            block_sizes=[1, 64, 32],
+        )
+
+    @xfailIfCute(
+        "CuTe attention-style online-softmax kernel still returns incorrect results"
+    )
+    def test_xsa_near_zero_v(self):
+        q = torch.randn(2, 4, 128, 64, dtype=HALF_DTYPE, device=DEVICE)
+        k = torch.randn_like(q)
+        v = torch.randn_like(q)
+        # Force ||V_i|| = 0 < eps so F.normalize's eps-clamp matters.
+        v[..., 0, :] = 0.0
+        args = (q, k, v)
+        mod = import_path(EXAMPLES_DIR / "xsa.py")
+        check_example(
+            "xsa",
+            args,
+            mod.ref_xsa(*args),
+            fn_name="xsa_kernel",
             block_sizes=[1, 64, 32],
         )
 
@@ -1614,13 +1692,11 @@ class TestExamples(RefEagerTestBase, TestCase):
             num_stages=3,
         )
 
-    @xfailIfPallas("BackendError on pallas")
-    @skipIfXPU("Timeout on XPU")
-    def test_gather_gemv(self):
+    def _check_gather_gemv(self, dtype: torch.dtype):
         args = (
-            torch.randn([4, 512, 512], device=DEVICE, dtype=torch.float32),
+            torch.randn([4, 512, 512], device=DEVICE, dtype=dtype),
             torch.randint(0, 4, [2], device=DEVICE, dtype=torch.int32),
-            torch.randn([512], device=DEVICE, dtype=torch.float32),
+            torch.randn([512], device=DEVICE, dtype=dtype),
         )
 
         def expected(w, idx, x):
@@ -1636,6 +1712,16 @@ class TestExamples(RefEagerTestBase, TestCase):
             num_warps=8,
             num_stages=1,
         )
+
+    # Pallas f32 succeeds under CPU emulation but fails on TPU.
+    @skipIfPallas("Pallas int32 gather coverage uses test_gather_gemv_half")
+    @skipIfXPU("Timeout on XPU")
+    def test_gather_gemv(self):
+        self._check_gather_gemv(torch.float32)
+
+    @skipIfXPU("Timeout on XPU")
+    def test_gather_gemv_half(self):
+        self._check_gather_gemv(HALF_DTYPE)
 
     @xfailIfCute("CuTe int4 GEMM example is not supported yet")
     @xfailIfPallas("int4 unpacking not supported on pallas")

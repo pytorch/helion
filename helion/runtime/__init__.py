@@ -15,7 +15,17 @@ import torch
 
 from .. import _compat as _compat  # ensure Triton compatibility patches run
 from .. import exc
+from .._compiler.cute.strategies import tcgen05_default_epilogue_tile_expr
+from .._compiler.cute.strategies import tcgen05_explicit_d_store_tile_expr
 from .._compiler.cute.strategies import tcgen05_smem_layout_expr
+from .._compiler.cute.tcgen05_constants import TCGEN05_DIRECT_ENTRY_CLUSTER_M
+from .._compiler.cute.tcgen05_constants import (
+    TCGEN05_DIRECT_ENTRY_SHAPE_SETS_BY_BK as _DIRECT_ENTRY_SHAPE_SETS_BY_BK,
+)
+from .._compiler.cute.tcgen05_constants import (
+    TCGEN05_DIRECT_ENTRY_STAGE_TUPLES_BY_BK as _DIRECT_ENTRY_STAGE_TUPLES_BY_BK,
+)
+from .._compiler.cute.tcgen05_constants import TCGEN05_DIRECT_ENTRY_TOTAL_WORK_CLUSTERS
 from .._utils import triton_is_available
 from .config import Config as Config
 from .kernel import Kernel as Kernel
@@ -1508,6 +1518,79 @@ def _append_cute_wrapper_plan(
         assert isinstance(value, int)
         return value
 
+    def plan_optional_int(key: str) -> int | None:
+        value = plan.get(key)
+        assert value is None or isinstance(value, int)
+        return value
+
+    def require_positive_int(value: int | None, name: str) -> int:
+        assert type(value) is int, name
+        assert value > 0, name
+        return value
+
+    def append_tcgen05_epilogue_tma_wrapper(
+        *,
+        tensor_idx: int,
+        bm: int,
+        bn: int,
+        stage_count: int,
+        dtype: str,
+        kernel_args: list[str],
+        copy_op: str,
+        epi_tile_m: int | None = None,
+        epi_tile_n: int | None = None,
+        d_store_box_n: int | None = None,
+    ) -> None:
+        assert len(kernel_args) == 2
+        explicit_epi_tile = any(
+            value is not None for value in (epi_tile_m, epi_tile_n, d_store_box_n)
+        )
+        if explicit_epi_tile:
+            checked_epi_tile_m = require_positive_int(epi_tile_m, "epi_tile_m")
+            checked_epi_tile_n = require_positive_int(epi_tile_n, "epi_tile_n")
+            checked_d_store_box_n = require_positive_int(d_store_box_n, "d_store_box_n")
+            assert checked_epi_tile_n == checked_d_store_box_n
+            epi_tile_expr = tcgen05_explicit_d_store_tile_expr(
+                checked_epi_tile_m, checked_d_store_box_n
+            )
+        else:
+            epi_tile_expr = tcgen05_default_epilogue_tile_expr(
+                bm,
+                bn,
+                dtype,
+                c_layout="cutlass.utils.layout.LayoutEnum.ROW_MAJOR",
+            )
+        tma_atom, tma_tensor = kernel_args
+        epi_tile = f"{tma_atom}_epi_tile"
+        smem_layout = f"{tma_atom}_smem_layout"
+        cta_v_layout = f"{tma_atom}_cta_v_layout"
+        # Keep these layout arguments in sync with the device-side
+        # ``make_smem_layout_epi`` calls; the wrapper's TMA atom and the kernel's
+        # SMEM staging must slice the same epilogue tile shape.
+        body.extend(
+            (
+                f"    {epi_tile} = {epi_tile_expr}",
+                (
+                    f"    {smem_layout} = cutlass.utils.blackwell_helpers."
+                    "make_smem_layout_epi("
+                    f"{dtype}, cutlass.utils.layout.LayoutEnum.ROW_MAJOR, "
+                    f"{epi_tile}, {stage_count})"
+                ),
+                (
+                    f"    {cta_v_layout} = cute.composition("
+                    f"cute.make_identity_layout(arg{tensor_idx}.shape), {epi_tile})"
+                ),
+                (
+                    f"    {tma_atom}, {tma_tensor} = "
+                    "cute.nvgpu.cpasync.make_tiled_tma_atom("
+                    f"{copy_op}, "
+                    f"arg{tensor_idx}, cute.slice_({smem_layout}, (None, None, 0)), "
+                    f"{cta_v_layout})"
+                ),
+            )
+        )
+        call_args.extend(kernel_args)
+
     kind = plan["kind"]
     if kind == "tcgen05_d_tma":
         d_idx = plan_int("d_idx")
@@ -1516,48 +1599,35 @@ def _append_cute_wrapper_plan(
         c_stage_count = plan_int("c_stage_count")
         output_dtype = str(plan["output_dtype"])
         kernel_args = [str(arg) for arg in cast("list[object]", plan["kernel_args"])]
-        assert len(kernel_args) == 2
-        tma_atom_d, tma_tensor_d = kernel_args
-        epi_tile = f"{tma_atom_d}_epi_tile"
-        smem_layout = f"{tma_atom_d}_smem_layout"
-        cta_v_layout = f"{tma_atom_d}_cta_v_layout"
-        # Keep these layout arguments in sync with the device-side
-        # `make_smem_layout_epi` call in `_codegen_cute_store_tcgen05_tile`;
-        # the TMA atom slices the same SMEM stage that the kernel allocates.
-        # `elem_ty_c=` matches the D-output dtype so the wrapper's TMA atom
-        # and the kernel's SMEM staging pick the same `tile_n` from
-        # `compute_epilogue_tile_shape`.
-        body.extend(
-            (
-                (
-                    f"    {epi_tile} = "
-                    "cutlass.utils.blackwell_helpers.compute_epilogue_tile_shape("
-                    f"({bm}, {bn}), False, "
-                    "cutlass.utils.layout.LayoutEnum.ROW_MAJOR, "
-                    f"{output_dtype}, "
-                    "layout_c=cutlass.utils.layout.LayoutEnum.ROW_MAJOR, "
-                    f"elem_ty_c={output_dtype})"
-                ),
-                (
-                    f"    {smem_layout} = cutlass.utils.blackwell_helpers."
-                    "make_smem_layout_epi("
-                    f"{output_dtype}, cutlass.utils.layout.LayoutEnum.ROW_MAJOR, "
-                    f"{epi_tile}, {c_stage_count})"
-                ),
-                (
-                    f"    {cta_v_layout} = cute.composition("
-                    f"cute.make_identity_layout(arg{d_idx}.shape), {epi_tile})"
-                ),
-                (
-                    f"    {tma_atom_d}, {tma_tensor_d} = "
-                    "cute.nvgpu.cpasync.make_tiled_tma_atom("
-                    "cute.nvgpu.cpasync.CopyBulkTensorTileS2GOp(), "
-                    f"arg{d_idx}, cute.slice_({smem_layout}, (None, None, 0)), "
-                    f"{cta_v_layout})"
-                ),
-            )
+        append_tcgen05_epilogue_tma_wrapper(
+            tensor_idx=d_idx,
+            bm=bm,
+            bn=bn,
+            stage_count=c_stage_count,
+            dtype=output_dtype,
+            kernel_args=kernel_args,
+            copy_op="cute.nvgpu.cpasync.CopyBulkTensorTileS2GOp()",
+            epi_tile_m=plan_optional_int("epi_tile_m"),
+            epi_tile_n=plan_optional_int("epi_tile_n"),
+            d_store_box_n=plan_optional_int("d_store_box_n"),
         )
-        call_args.extend(kernel_args)
+        return
+    if kind == "tcgen05_aux_tma":
+        c_idx = plan_int("c_idx")
+        bm = plan_int("bm")
+        bn = plan_int("bn")
+        stage_count = plan_int("stage_count")
+        input_dtype = str(plan["input_dtype"])
+        kernel_args = [str(arg) for arg in cast("list[object]", plan["kernel_args"])]
+        append_tcgen05_epilogue_tma_wrapper(
+            tensor_idx=c_idx,
+            bm=bm,
+            bn=bn,
+            stage_count=stage_count,
+            dtype=input_dtype,
+            kernel_args=kernel_args,
+            copy_op="cute.nvgpu.cpasync.CopyBulkTensorTileG2SOp()",
+        )
         return
     if kind != "tcgen05_ab_tma":
         raise exc.BackendUnsupported("cute", f"wrapper plan kind: {kind}")
@@ -1577,8 +1647,8 @@ def _append_cute_wrapper_plan(
     # Optional ``smem_swizzle_*`` overrides recorded by the device-side
     # codegen when the user opts into a non-default A/B SMEM atom
     # swizzle. When absent the wrapper emits the legacy
-    # ``make_smem_layout_a/b`` calls so the canonical 4096³
-    # byte-identity golden (no override) stays valid.
+    # ``make_smem_layout_a/b`` calls. The no-override wrapper markers
+    # are covered by the focused tcgen05 SMEM-swizzle codegen test.
     smem_swizzle_a_raw = plan.get("smem_swizzle_a")
     smem_swizzle_b_raw = plan.get("smem_swizzle_b")
     smem_swizzle_a: int | None = (
@@ -1661,14 +1731,13 @@ def _append_cute_wrapper_plan(
             #   cluster shape; the cluster_m=1 cluster_n=1 case still
             #   passes the 1×1×1 shape harmlessly).
             # - ``_A`` only adds the same trailing arg when
-            #   ``cluster_n > 1``. Adding it unconditionally would
-            #   change the byte-identity golden for the validated
-            #   cluster_m∈{1,2} cluster_n=1 paths
-            #   (``test_tcgen05_role_local_monolithic_byte_identical_golden``)
-            #   because A's atom is otherwise constructed from the
-            #   3-arg form on those paths. The asymmetry is
+            #   ``cluster_n > 1``. For the validated cluster_n=1
+            #   paths, A's atom is constructed without the cluster
+            #   shape while B still receives it. The asymmetry is
             #   intentional: A only needs the cluster shape when N
-            #   multicast is active (cluster_n>1).
+            #   multicast is active (cluster_n>1). The cluster_n=1
+            #   form is pinned by
+            #   ``test_tcgen05_role_local_monolithic_codegen_markers``.
             (
                 f"    {tma_atom_a}, {tma_tensor_a} = cute.nvgpu.make_tiled_tma_atom_A("
                 "cutlass.utils.blackwell_helpers.cluster_shape_to_tma_atom_A("
@@ -1754,10 +1823,41 @@ def _create_cute_wrapper(
     for i, entry in enumerate(schema_key):
         kind = entry[0]
         if kind == "tensor":
-            (_, _dtype, rank) = entry
-            assert isinstance(rank, int)
             ptr_name = f"arg{i}_ptr"
             params.append(f"{ptr_name}: cute.Pointer")
+            if len(entry) == 5:
+                # ("tensor", dtype, rank, sizes, strides) — baked layout.
+                # Wrapper plans (matmul TMA) also reference
+                # ``arg{i}_shape{d}`` / ``arg{i}_stride{d}`` names, so we
+                # bind those names to their literal values in the wrapper
+                # body before constructing the tensor.
+                (_, _dtype, rank, sizes_t, strides_t) = entry
+                assert isinstance(rank, int)
+                assert isinstance(sizes_t, tuple) and len(sizes_t) == rank
+                assert isinstance(strides_t, tuple) and len(strides_t) == rank
+                shape_literals = [repr(int(s)) for s in sizes_t]
+                stride_literals = [repr(int(s)) for s in strides_t]
+                for d, lit in enumerate(shape_literals):
+                    body.append(f"    arg{i}_shape{d} = {lit}")
+                for d, lit in enumerate(stride_literals):
+                    body.append(f"    arg{i}_stride{d} = {lit}")
+                shape_tuple = (
+                    f"({shape_literals[0]},)"
+                    if rank == 1
+                    else f"({', '.join(shape_literals)})"
+                )
+                stride_tuple = (
+                    f"({stride_literals[0]},)"
+                    if rank == 1
+                    else f"({', '.join(stride_literals)})"
+                )
+                body.append(
+                    f"    arg{i} = cute.make_tensor({ptr_name}, layout=cute.make_layout({shape_tuple}, stride={stride_tuple}))"
+                )
+                call_args.append(f"arg{i}")
+                continue
+            (_, _dtype, rank) = entry
+            assert isinstance(rank, int)
             shape_names = [f"arg{i}_shape{d}" for d in range(rank)]
             stride_names = [f"arg{i}_stride{d}" for d in range(rank)]
             params.extend(f"{name}: cutlass.Int64" for name in shape_names)
@@ -1775,7 +1875,7 @@ def _create_cute_wrapper(
             continue
 
         if kind == "scalar_constexpr":
-            (_, scalar_kind, scalar_value) = entry
+            (_, scalar_kind, _scalar_key_value, scalar_value) = entry
             assert isinstance(scalar_kind, str)
             literal = repr(scalar_value)
             body.append(f"    arg{i} = {literal}")
@@ -1850,6 +1950,438 @@ def _create_cute_wrapper(
     return namespace[func_name]
 
 
+# Per-``bk`` stage tuple and tensor shape sets for the TVM-FFI
+# direct-entry fast launch path. The validator imports these from
+# ``tcgen05_constants`` (see top of file) so the codegen-side
+# direct-entry source builder and the runtime-side validator cannot
+# drift out of sync.
+
+
+def _target1_direct_entry_plan(
+    cute_kernel: object,
+) -> dict[str, object] | None:
+    direct_plans = [
+        cast("dict[str, object]", plan)
+        for plan in getattr(
+            cast("Any", cute_kernel), "_helion_cute_direct_entry_plans", []
+        )
+    ]
+    if not direct_plans:
+        return None
+    if len(direct_plans) != 1:
+        raise exc.BackendUnsupported(
+            "cute",
+            "tcgen05 direct entry requires exactly one direct-entry plan",
+        )
+    plan = direct_plans[0]
+    if plan.get("kind") != "tcgen05_target1_direct_entry":
+        raise exc.BackendUnsupported(
+            "cute",
+            f"unsupported direct-entry plan kind: {plan.get('kind')!r}",
+        )
+    return plan
+
+
+def _plan_int(plan: dict[str, object], key: str) -> int:
+    value = plan[key]
+    if not isinstance(value, int):
+        raise exc.BackendUnsupported(
+            "cute",
+            f"invalid direct-entry plan {key}: {value!r}",
+        )
+    return value
+
+
+def _target1_direct_entry_arg_indices(
+    plan: dict[str, object],
+) -> tuple[int, ...]:
+    # T2 adds a 4th index for the rowvec bias tensor when the plan
+    # carries ``bias_idx``. T1/T3/T4/T5 keep the 3-index lhs/rhs/output
+    # signature.
+    indices: tuple[int, ...] = (
+        _plan_int(plan, "lhs_idx"),
+        _plan_int(plan, "rhs_idx"),
+        _plan_int(plan, "d_idx"),
+    )
+    if "bias_idx" in plan:
+        indices = (*indices, _plan_int(plan, "bias_idx"))
+    return indices
+
+
+def _direct_entry_clustered_grid_k(device: torch.device) -> tuple[int, ...]:
+    """Return the accepted ``grid[2]`` set for the clustered direct-entry launch.
+
+    The clustered grid is ``(cluster_m, cluster_n, min(total_clusters,
+    num_sms // cluster_m))`` (see the codegen at ``program_id.py``).
+    Both the unconstrained ``total_clusters`` value (when ``num_sms``
+    is large enough) and the cap ``num_sms // cluster_m`` are valid
+    runtime values; the accept set is the union for the validated
+    ``total_clusters`` envelope.
+
+    On B200 with 148 SMs and ``cluster_m=2``: T1 yields ``min(64, 74)
+    = 64``; T2/T3/T4/T5 each yield ``min(128, 74) = 74``; T6 yields
+    ``min(256, 74) = 74``. The validator derives this set from the
+    actual CUDA device so different Blackwell SKUs with a different
+    ``num_sms`` extend automatically — on a hypothetical larger SKU
+    with ``num_sms // cluster_m >= 256`` the T6 runtime ``grid[2] =
+    256`` is in the accept set because
+    ``TCGEN05_DIRECT_ENTRY_TOTAL_WORK_CLUSTERS`` includes 256.
+    """
+    if device.type != "cuda" or not torch.cuda.is_available():
+        # Fall back to the B200 set; tests that mock device access never
+        # hit launch-time validation.
+        return (64, 74)
+    sm_count = int(torch.cuda.get_device_properties(device).multi_processor_count)
+    cap = sm_count // TCGEN05_DIRECT_ENTRY_CLUSTER_M
+    accepted: set[int] = {cap}
+    accepted.update(
+        min(total, cap) for total in TCGEN05_DIRECT_ENTRY_TOTAL_WORK_CLUSTERS
+    )
+    return tuple(sorted(accepted))
+
+
+def _validate_target1_direct_entry_args(
+    plan: dict[str, object],
+    args: tuple[object, ...],
+    grid: tuple[int, int, int],
+    block: tuple[int, int, int],
+    compile_options: str | None,
+) -> tuple[int, ...]:
+    if compile_options is None or "--enable-tvm-ffi" not in compile_options.split():
+        raise exc.BackendUnsupported(
+            "cute",
+            "tcgen05 direct entry requires --enable-tvm-ffi",
+        )
+    # The clustered grid is ``(cluster_m, cluster_n, K)`` for some
+    # device/shape-dependent ``K``: Target 1 yields ``K = 64`` (matches
+    # total work clusters at the T1 shape) and Target 4 caps at
+    # ``K = num_sms // cluster_m`` (= 74 on B200). The x-linear
+    # ``(128, 1, 1)`` is the legacy generated direct-entry form used
+    # inside the compiler-emitted entry point. We pin the accepted
+    # ``grid[2]`` set to the two validated values so a runtime grid that
+    # diverges from the validated envelope is rejected loudly.
+    if block != (256, 1, 1):
+        raise exc.BackendUnsupported(
+            "cute",
+            f"tcgen05 direct entry requires block=(256, 1, 1), got {block}",
+        )
+    # A4 (cycle-2 review): the clustered ``grid[2]`` accept set is
+    # derived from the target tensor's CUDA device's SM count via
+    # ``_direct_entry_clustered_grid_k`` so different Blackwell SKUs
+    # extend automatically instead of being silently rejected by a
+    # B200-hardcoded literal.
+    first_tensor = next(
+        (a for a in args if isinstance(a, torch.Tensor)),
+        None,
+    )
+    if first_tensor is None:
+        raise exc.BackendUnsupported(
+            "cute",
+            "tcgen05 direct entry requires at least one tensor argument",
+        )
+    accepted_clustered_grid_k = _direct_entry_clustered_grid_k(first_tensor.device)
+    if not (
+        (grid[0] == 2 and grid[1] == 1 and grid[2] in accepted_clustered_grid_k)
+        or grid == (128, 1, 1)
+    ):
+        raise exc.BackendUnsupported(
+            "cute",
+            f"tcgen05 direct entry requires the validated cluster_m=2 "
+            f"launch geometry (clustered grid[2] in "
+            f"{accepted_clustered_grid_k!r}), got {grid}",
+        )
+    bm = _plan_int(plan, "bm")
+    bn = _plan_int(plan, "bn")
+    bk = _plan_int(plan, "bk")
+    cluster_m = _plan_int(plan, "cluster_m")
+    cluster_n = _plan_int(plan, "cluster_n")
+    ab_stage_count = _plan_int(plan, "ab_stage_count")
+    c_stage_count = _plan_int(plan, "c_stage_count")
+    if (bm, bn, cluster_m, cluster_n) != (256, 256, 2, 1):
+        raise exc.BackendUnsupported(
+            "cute",
+            "tcgen05 direct entry requires bm=bn=256 cluster_m=2 cluster_n=1, "
+            f"got bm={bm} bn={bn} cluster_m={cluster_m} cluster_n={cluster_n}",
+        )
+    if (ab_stage_count, c_stage_count) not in _DIRECT_ENTRY_STAGE_TUPLES_BY_BK.get(
+        bk, ()
+    ):
+        raise exc.BackendUnsupported(
+            "cute",
+            "tcgen05 direct entry requires a validated stage tuple, got "
+            f"bk={bk} (ab,c)=({ab_stage_count},{c_stage_count})",
+        )
+    if (
+        plan.get("input_dtype") != "cutlass.BFloat16"
+        or plan.get("output_dtype") != "cutlass.BFloat16"
+    ):
+        raise exc.BackendUnsupported(
+            "cute",
+            "tcgen05 direct entry requires bf16 input/output dtypes",
+        )
+
+    indices = _target1_direct_entry_arg_indices(plan)
+    # T1/T3/T4/T5 keep the 3-tensor (lhs/rhs/output) signature; T2 adds
+    # a 4th rank-1 trailing-axis bias tensor signalled by the plan's
+    # ``bias_idx`` (= ``indices[3]``).
+    has_bias = len(indices) == 4
+    if not has_bias and (indices != (0, 1, 2) or len(args) != 3):
+        raise exc.BackendUnsupported(
+            "cute",
+            "tcgen05 direct entry currently supports exactly lhs/rhs/output args",
+        )
+    if has_bias and (indices != (0, 1, 2, 3) or len(args) != 4):
+        raise exc.BackendUnsupported(
+            "cute",
+            "tcgen05 direct entry with bias requires exactly lhs/rhs/output/bias args",
+        )
+    matmul_args = args[:3]
+    arg_shapes: list[tuple[int, ...]] = []
+    for arg in matmul_args:
+        if not isinstance(arg, torch.Tensor):
+            raise exc.BackendUnsupported(
+                "cute",
+                "tcgen05 direct entry requires tensor arguments",
+            )
+        _validate_cute_launcher_tensor(arg)
+        if arg.dtype is not torch.bfloat16:
+            raise exc.BackendUnsupported(
+                "cute",
+                "tcgen05 direct entry requires bf16 tensor arguments",
+            )
+        if arg.ndim != 2 or int(arg.stride(1)) != 1:
+            raise exc.BackendUnsupported(
+                "cute",
+                "tcgen05 direct entry requires row-major rank-2 tensors",
+            )
+        arg_shapes.append(tuple(int(arg.size(dim)) for dim in range(arg.ndim)))
+    observed_shapes = tuple(arg_shapes)
+    # B1 (cycle-3 review): each direct-entry plan carries its
+    # validated problem shape so the validator can dispatch on the
+    # exact (M, N, K) envelope baked into the plan. T4 and T5 share
+    # ``bk=128`` (and the same ``(ab,c)`` stage tuple and cluster
+    # geometry), so the bk-keyed shape-set alone cannot distinguish
+    # a T4-plan from a T5-plan — the plan-carried ``validated_shape``
+    # is what keeps them apart at the validator boundary. The legacy
+    # bk-keyed shape-set (``_DIRECT_ENTRY_SHAPE_SETS_BY_BK``) remains
+    # as defense-in-depth: the per-plan check below additionally
+    # asserts that the plan's ``validated_shape`` is one of the
+    # bk-allowed shapes (so a future plan-construction-site bug that
+    # forged an off-envelope shape into a plan still gets caught).
+    validated_shape_raw = plan.get("validated_shape")
+    if not (
+        isinstance(validated_shape_raw, (list, tuple))
+        and len(validated_shape_raw) == 3
+        and all(isinstance(v, int) for v in validated_shape_raw)
+    ):
+        raise exc.BackendUnsupported(
+            "cute",
+            f"tcgen05 direct entry plan requires validated_shape, got "
+            f"{validated_shape_raw!r}",
+        )
+    plan_m, plan_n, plan_k = (int(v) for v in validated_shape_raw)
+    bk_allowed_shapes = _DIRECT_ENTRY_SHAPE_SETS_BY_BK.get(bk, ())
+    expected_lhs = (plan_m, plan_k)
+    expected_rhs = (plan_k, plan_n)
+    expected_d = (plan_m, plan_n)
+    expected_shapes = (expected_lhs, expected_rhs, expected_d)
+    if expected_shapes not in bk_allowed_shapes:
+        raise exc.BackendUnsupported(
+            "cute",
+            f"tcgen05 direct entry plan bk={bk} carries unvalidated "
+            f"validated_shape={plan_m, plan_n, plan_k}; bk-allowed shape "
+            f"envelopes are {bk_allowed_shapes!r}",
+        )
+    if observed_shapes != expected_shapes:
+        raise exc.BackendUnsupported(
+            "cute",
+            f"tcgen05 direct entry plan validated_shape="
+            f"{plan_m, plan_n, plan_k} (bk={bk}) requires shapes "
+            f"{expected_shapes!r}, got {observed_shapes!r}",
+        )
+    if has_bias:
+        # The arity check above already required ``len(args) == 4`` when
+        # ``has_bias`` is set; pyrefly cannot narrow the tuple type
+        # across the conditional, so index the args by ``cast`` below.
+        bias_arg = cast("tuple[object, ...]", args)[3]
+        if not isinstance(bias_arg, torch.Tensor):
+            raise exc.BackendUnsupported(
+                "cute",
+                "tcgen05 direct entry bias requires a tensor argument",
+            )
+        _validate_cute_launcher_tensor(bias_arg)
+        if bias_arg.dtype is not torch.bfloat16:
+            raise exc.BackendUnsupported(
+                "cute",
+                "tcgen05 direct entry bias requires a bf16 tensor",
+            )
+        # The bias tensor for T2 is rank-1 with N elements (trailing-axis
+        # rowvec broadcast); stride must be 1 so the GMEM load uses
+        # contiguous reads. The N-extent matches the matmul's N to keep
+        # the bias broadcast aligned with the output tile columns.
+        if (
+            bias_arg.ndim != 1
+            or int(bias_arg.stride(0)) != 1
+            or int(bias_arg.size(0)) != plan_n
+        ):
+            raise exc.BackendUnsupported(
+                "cute",
+                "tcgen05 direct entry bias requires a contiguous rank-1 "
+                f"bf16 tensor of shape ({plan_n},), got shape "
+                f"{tuple(int(bias_arg.size(d)) for d in range(bias_arg.ndim))!r} "
+                f"stride {tuple(int(bias_arg.stride(d)) for d in range(bias_arg.ndim))!r}",
+            )
+    return indices
+
+
+def _wrapper_plans_for_direct_entry(
+    cute_kernel: object,
+    direct_plan: dict[str, object],
+) -> list[dict[str, object]]:
+    wrapper_plans = [
+        cast("dict[str, object]", plan)
+        for plan in getattr(cast("Any", cute_kernel), "_helion_cute_wrapper_plans", [])
+    ]
+    if [plan.get("kind") for plan in wrapper_plans] != [
+        "tcgen05_ab_tma",
+        "tcgen05_d_tma",
+    ]:
+        raise exc.BackendUnsupported(
+            "cute",
+            "tcgen05 direct entry requires A/B and D TMA wrapper plans",
+        )
+    ab_plan, d_plan = wrapper_plans
+    expected_ab_fields = {
+        "lhs_idx": _plan_int(direct_plan, "lhs_idx"),
+        "rhs_idx": _plan_int(direct_plan, "rhs_idx"),
+        "bm": _plan_int(direct_plan, "bm"),
+        "bn": _plan_int(direct_plan, "bn"),
+        "bk": _plan_int(direct_plan, "bk"),
+        "cluster_m": _plan_int(direct_plan, "cluster_m"),
+        "cluster_n": _plan_int(direct_plan, "cluster_n"),
+        "ab_stage_count": _plan_int(direct_plan, "ab_stage_count"),
+        "input_dtype": direct_plan.get("input_dtype"),
+        "acc_dtype": "cutlass.Float32",
+    }
+    expected_d_fields = {
+        "d_idx": _plan_int(direct_plan, "d_idx"),
+        "bm": _plan_int(direct_plan, "bm"),
+        "bn": _plan_int(direct_plan, "bn"),
+        "c_stage_count": _plan_int(direct_plan, "c_stage_count"),
+        "output_dtype": direct_plan.get("output_dtype"),
+        "epi_tile_m": 128,
+        "epi_tile_n": 32,
+        "d_store_box_n": 32,
+    }
+    for key, expected in expected_ab_fields.items():
+        if ab_plan.get(key) != expected:
+            raise exc.BackendUnsupported(
+                "cute",
+                f"tcgen05 direct entry wrapper A/B plan mismatch for {key}",
+            )
+    for key, expected in expected_d_fields.items():
+        if d_plan.get(key) != expected:
+            raise exc.BackendUnsupported(
+                "cute",
+                f"tcgen05 direct entry wrapper D plan mismatch for {key}",
+            )
+    if "smem_swizzle_a" in ab_plan or "smem_swizzle_b" in ab_plan:
+        raise exc.BackendUnsupported(
+            "cute",
+            "tcgen05 direct entry requires default A/B SMEM wrapper layouts",
+        )
+    if list(cast("list[object]", direct_plan["ab_kernel_args"])) != list(
+        cast("list[object]", ab_plan["kernel_args"])
+    ) or list(cast("list[object]", direct_plan["d_kernel_args"])) != list(
+        cast("list[object]", d_plan["kernel_args"])
+    ):
+        raise exc.BackendUnsupported(
+            "cute",
+            "tcgen05 direct entry plan does not match wrapper TMA args",
+        )
+    return wrapper_plans
+
+
+def _create_cute_direct_entry(
+    cute_kernel: object,
+    direct_plan: dict[str, object],
+    grid: tuple[int, int, int],
+    block: tuple[int, int, int],
+) -> object:
+    _patch_cutlass_jit_shutdown_unload()
+    import cutlass
+    import cutlass.cute as cute
+
+    wrapper_plans = _wrapper_plans_for_direct_entry(cute_kernel, direct_plan)
+    body: list[str] = []
+    arg_indices = _target1_direct_entry_arg_indices(direct_plan)
+    # The lhs/rhs/output tensors are rank-2; the optional bias tensor
+    # for T2 is rank-1 and only contributes a single shape/stride pair.
+    for index in arg_indices[:3]:
+        body.extend(
+            (
+                f"    arg{index}_shape0 = arg{index}.shape[0]",
+                f"    arg{index}_shape1 = arg{index}.shape[1]",
+                f"    arg{index}_stride0 = arg{index}.stride[0]",
+                f"    arg{index}_stride1 = arg{index}.stride[1]",
+            )
+        )
+    has_bias = len(arg_indices) == 4
+    if has_bias:
+        bias_index = arg_indices[3]
+        body.extend(
+            (
+                f"    arg{bias_index}_shape0 = arg{bias_index}.shape[0]",
+                f"    arg{bias_index}_stride0 = arg{bias_index}.stride[0]",
+            )
+        )
+    call_args = ["arg0", "arg1", "arg2"]
+    if has_bias:
+        call_args.append(f"arg{arg_indices[3]}")
+    for plan in wrapper_plans:
+        _append_cute_wrapper_plan(body, call_args, plan)
+
+    launch_suffix = f", block={block!r}"
+    cluster_shape = _cute_cluster_shape(cute_kernel, wrapper_plans)
+    if cluster_shape is not None:
+        launch_suffix += f", cluster={list(cluster_shape)!r}"
+    if any(plan.get("use_pdl") for plan in wrapper_plans):
+        launch_suffix += ", use_pdl=True"
+    body.extend(
+        (
+            f"    _helion_cute_kernel_tag = {getattr(cast('Any', cute_kernel), '__name__', 'cute_kernel')!r}",
+            "    _kernel("
+            + ", ".join(call_args)
+            + f").launch(grid={grid!r}{launch_suffix})",
+        )
+    )
+
+    kernel_name = getattr(cast("Any", cute_kernel), "__name__", "cute_kernel")
+    func_name = f"_helion_cute_direct_entry_{kernel_name}_{id(cute_kernel):x}"
+    entry_params = ", ".join(f"arg{i}" for i in range(len(arg_indices)))
+    source = "\n".join(
+        [
+            "@cute.jit",
+            f"def {func_name}({entry_params}) -> None:",
+            *body,
+        ]
+    )
+    namespace: dict[str, Any] = {
+        "cutlass": cutlass,
+        "cute": cute,
+        "_kernel": cute_kernel,
+    }
+    filename = f"<helion_cute_direct_entry:{kernel_name}:{id(cute_kernel):x}>"
+    linecache.cache[filename] = (
+        len(source),
+        None,
+        [line + "\n" for line in source.splitlines()],
+        filename,
+    )
+    exec(compile(source, filename, "exec"), namespace)
+    return namespace[func_name]
+
+
 class _CompiledCuteLauncher:
     """Lazily compile a Helion ``@cute.jit`` wrapper via ``cute.compile``.
 
@@ -1884,11 +2416,142 @@ class _CompiledCuteLauncher:
         return cast("Any", compiled)(*args)
 
 
+class _CompiledCuteDirectEntryLauncher:
+    """Compile a Target1 direct tensor-entry wrapper with fake tensor args."""
+
+    __slots__ = (
+        "_compile_args",
+        "_compile_options",
+        "_compiled",
+        "_jit_func",
+        "_runtime_arg_indices",
+    )
+
+    def __init__(
+        self,
+        jit_func: object,
+        compile_args: tuple[object, ...],
+        runtime_arg_indices: tuple[int, ...],
+        compile_options: str,
+    ) -> None:
+        self._jit_func = jit_func
+        self._compile_args = compile_args
+        self._runtime_arg_indices = runtime_arg_indices
+        self._compile_options = compile_options
+        self._compiled: object = None
+
+    def __call__(self, *args: object) -> object:
+        compiled = self._compiled
+        if compiled is None:
+            _patch_cutlass_jit_shutdown_unload()
+            import cutlass.cute as cute
+
+            compiled = cute.compile(
+                self._jit_func,
+                *self._compile_args,
+                options=self._compile_options,
+            )
+            self._compiled = compiled
+        launch_args = tuple(args[index] for index in self._runtime_arg_indices)
+        return cast("Any", compiled)(*launch_args)
+
+
+def _make_cute_direct_entry_fake_tensor(arg: torch.Tensor) -> object:
+    import cutlass.cute as cute
+
+    dtype = cast("type[Any]", _torch_dtype_to_cutlass(arg.dtype))
+    assert dtype is not None
+    shape = tuple(cute.sym_int() for _ in range(arg.ndim))
+    leading_dim = arg.ndim - 1
+    divisibility = max(1, 16 // max(1, arg.element_size()))
+    stride = tuple(
+        1 if dim == leading_dim else cute.sym_int64(divisibility=divisibility)
+        for dim in range(arg.ndim)
+    )
+    return cute.runtime.make_fake_tensor(
+        dtype,
+        shape,
+        stride=stride,
+        assumed_align=16,
+    )
+
+
+def _get_compiled_cute_direct_entry_launcher(
+    cute_kernel: object,
+    direct_plan: dict[str, object],
+    args: tuple[object, ...],
+    grid: tuple[int, int, int],
+    block: tuple[int, int, int],
+    compile_options: str,
+) -> object:
+    runtime_arg_indices = _validate_target1_direct_entry_args(
+        direct_plan,
+        args,
+        grid,
+        block,
+        compile_options,
+    )
+    try:
+        # pyrefly: ignore [missing-attribute]
+        cache = cute_kernel._helion_cute_direct_entry_launchers
+    except AttributeError:
+        cache = {}
+        # pyrefly: ignore [missing-attribute]
+        cute_kernel._helion_cute_direct_entry_launchers = cache
+    wrapper_plans = tuple(
+        repr(plan)
+        for plan in getattr(cast("Any", cute_kernel), "_helion_cute_wrapper_plans", [])
+    )
+    cluster_shape = getattr(
+        cast("Any", cute_kernel), "_helion_cute_cluster_shape", None
+    )
+    generated_direct_entry = getattr(
+        cast("Any", cute_kernel), "_helion_cute_generated_direct_entry", None
+    )
+    # The compiler-emitted direct entry hard-codes an x-linear
+    # ``grid=(128,1,1)`` launch. The validator above also admits the
+    # clustered ``(2,1,64)`` form for the runtime descriptor fallback;
+    # only the x-linear launch may reuse the generated direct entry.
+    if generated_direct_entry is not None and grid != (128, 1, 1):
+        generated_direct_entry = None
+    cache_key = (
+        repr(direct_plan),
+        wrapper_plans,
+        repr(cluster_shape),
+        grid,
+        block,
+        compile_options,
+        id(generated_direct_entry) if generated_direct_entry is not None else None,
+    )
+    cached = cache.get(cache_key)
+    if cached is not None:
+        return cached
+    _ensure_cute_dsl_arch_env(args)
+    jit_func = (
+        generated_direct_entry
+        if generated_direct_entry is not None
+        else _create_cute_direct_entry(cute_kernel, direct_plan, grid, block)
+    )
+    compile_args = tuple(
+        _make_cute_direct_entry_fake_tensor(cast("torch.Tensor", args[index]))
+        for index in runtime_arg_indices
+    )
+    launcher = _CompiledCuteDirectEntryLauncher(
+        jit_func,
+        compile_args,
+        runtime_arg_indices,
+        compile_options,
+    )
+    cache[cache_key] = launcher
+    return launcher
+
+
 def _get_compiled_cute_launcher(
     cute_kernel: object,
     schema_key: tuple[tuple[object, ...], ...],
     block: tuple[int, int, int],
     compile_options: str | None = None,
+    arch_args: tuple[object, ...] | None = None,
 ) -> object:
     try:
         # pyrefly: ignore [missing-attribute]
@@ -1915,6 +2578,8 @@ def _get_compiled_cute_launcher(
     if cached is not None:
         return cached
 
+    if arch_args is not None:
+        _ensure_cute_dsl_arch_env(arch_args)
     jit_func = _create_cute_wrapper(cute_kernel, schema_key, block)
     launcher = _CompiledCuteLauncher(jit_func, compile_options)
     cache[cache_key] = launcher
@@ -1939,28 +2604,120 @@ def _get_cute_launcher_imports() -> tuple[object, ...]:
     return cached
 
 
-def _build_cute_schema_and_args(
+# Keep the per-kernel launch-argument cache small: production kernels normally
+# relaunch one or two stable tensor signatures, while autotune may probe many.
+_CUTE_LAUNCH_ARG_CACHE_LIMIT = 8
+
+
+def _cute_scalar_cache_value(scalar_kind: str, scalar_value: object) -> object:
+    return cast("float", scalar_value).hex() if scalar_kind == "float" else scalar_value
+
+
+def _validate_cute_launcher_tensor(arg: torch.Tensor) -> None:
+    if arg.device.type != "cuda":
+        raise exc.BackendUnsupported("cute", "launcher requires CUDA tensors")
+    if arg.ndim <= 0:
+        raise exc.BackendUnsupported("cute", "launcher requires tensor rank >= 1")
+
+
+def _cute_launch_arg_cache_key(
+    cute_kernel: object,
+    args: tuple[object, ...],
+    grid: tuple[int, int, int],
+) -> tuple[object, ...]:
+    constexpr_flags = _cute_kernel_param_is_constexpr(cute_kernel)
+    key: list[object] = [grid]
+    for i, arg in enumerate(args):
+        if isinstance(arg, torch.Tensor):
+            _validate_cute_launcher_tensor(arg)
+            key.append(
+                (
+                    "tensor",
+                    arg.device.type,
+                    arg.device.index,
+                    str(arg.dtype),
+                    arg.ndim,
+                    arg.data_ptr(),
+                    tuple(int(arg.size(d)) for d in range(arg.ndim)),
+                    tuple(int(arg.stride(d)) for d in range(arg.ndim)),
+                )
+            )
+            continue
+
+        scalar_kind, scalar_value = _normalize_cute_scalar(arg)
+        scalar_key_value = _cute_scalar_cache_value(scalar_kind, scalar_value)
+        is_constexpr = i < len(constexpr_flags) and constexpr_flags[i]
+        key.append(
+            (
+                "scalar_constexpr" if is_constexpr else "scalar",
+                scalar_kind,
+                scalar_key_value,
+            )
+        )
+    return tuple(key)
+
+
+def _build_cached_cute_schema_and_args(
     cute_kernel: object,
     args: tuple[object, ...],
     grid: tuple[int, int, int],
 ) -> tuple[tuple[tuple[object, ...], ...], tuple[object, ...]]:
+    cache_key = _cute_launch_arg_cache_key(cute_kernel, args, grid)
+    try:
+        # pyrefly: ignore [missing-attribute]
+        cache = cute_kernel._helion_cute_launch_arg_cache
+    except AttributeError:
+        cache = {}
+        # pyrefly: ignore [missing-attribute]
+        cute_kernel._helion_cute_launch_arg_cache = cache
+    cached = cache.get(cache_key)
+    if cached is not None:
+        cache[cache_key] = cache.pop(cache_key)
+        return cached
+
+    built = _build_cute_schema_and_args(cute_kernel, args, grid)
+    cache[cache_key] = built
+    if len(cache) > _CUTE_LAUNCH_ARG_CACHE_LIMIT:
+        cache.pop(next(iter(cache)))
+    return built
+
+
+def _build_cute_schema_and_args(
+    cute_kernel: object,
+    args: tuple[object, ...],
+    grid: tuple[int, int, int],
+    bake_tensor_shapes: bool = True,
+) -> tuple[tuple[tuple[object, ...], ...], tuple[object, ...]]:
     gmem_space, make_ptr_obj, current_stream_obj = _get_cute_launcher_imports()
     make_ptr = cast("Any", make_ptr_obj)
     current_stream = cast("Any", current_stream_obj)
-    _ensure_cute_dsl_arch_env(args)
     constexpr_flags = _cute_kernel_param_is_constexpr(cute_kernel)
+    # Kernels that emit cute MMA ops (universal matmul fallback or tcgen05
+    # TMA wrapper plans) need runtime tensor layouts: the wrapper's
+    # ``cute.make_tensor`` feeds into ``.mark_layout_dynamic`` (TMA path) or
+    # into in-kernel arithmetic that relies on dynamic shape/stride
+    # propagation (universal MMA SMEM-load guards). Baking literal shapes
+    # silently miscompiles those paths.
+    if bake_tensor_shapes:
+        any_obj = cast("Any", cute_kernel)
+        disable_bake = bool(
+            getattr(any_obj, "_helion_cute_disable_bake_tensor_shapes", False)
+            or getattr(any_obj, "_helion_cute_wrapper_plans", None)
+        )
+        if disable_bake:
+            bake_tensor_shapes = False
     schema: list[tuple[object, ...]] = []
     launch_args: list[object] = []
     for i, arg in enumerate(args):
         if isinstance(arg, torch.Tensor):
-            if arg.device.type != "cuda":
-                raise exc.BackendUnsupported("cute", "launcher requires CUDA tensors")
+            _validate_cute_launcher_tensor(arg)
             ndim = arg.ndim
             if ndim <= 0:
                 raise exc.BackendUnsupported(
                     "cute", "launcher requires tensor rank >= 1"
                 )
-            schema.append(("tensor", str(arg.dtype), ndim))
+            sizes_t = tuple(int(arg.size(d)) for d in range(ndim))
+            strides_t = tuple(int(arg.stride(d)) for d in range(ndim))
             launch_args.append(
                 make_ptr(
                     cast("Any", _torch_dtype_to_cutlass(arg.dtype)),
@@ -1969,10 +2726,21 @@ def _build_cute_schema_and_args(
                     assumed_align=16,
                 )
             )
-            sizes = arg.size()
-            strides = arg.stride()
-            launch_args.extend(int(sizes[d]) for d in range(ndim))
-            launch_args.extend(int(strides[d]) for d in range(ndim))
+            # ``cute.make_layout`` rejects a 0 in any shape dimension, so
+            # zero-sized tensors must keep the runtime-shape path.
+            if bake_tensor_shapes and all(s > 0 for s in sizes_t):
+                # Bake the shape / stride tuple into the schema key.  The
+                # generated wrapper substitutes literal Int values for each
+                # dimension, so the CuTe DSL sees a fully static tensor
+                # layout and the per-load offset arithmetic collapses to
+                # constant strides — typically a 2-3x reduction in
+                # ``smsp__inst_executed`` for reduction kernels where the
+                # inner loop is dominated by stride multiplies.
+                schema.append(("tensor", str(arg.dtype), ndim, sizes_t, strides_t))
+            else:
+                schema.append(("tensor", str(arg.dtype), ndim))
+                launch_args.extend(sizes_t)
+                launch_args.extend(strides_t)
             continue
 
         scalar_kind, scalar_value = _normalize_cute_scalar(arg)
@@ -1982,7 +2750,14 @@ def _build_cute_schema_and_args(
             # >=4.5 fails IR verification ("value defined outside the region")
             # if a runtime scalar is fed to a kernel parameter declared as
             # ``cutlass.Constexpr``.
-            schema.append(("scalar_constexpr", scalar_kind, scalar_value))
+            schema.append(
+                (
+                    "scalar_constexpr",
+                    scalar_kind,
+                    _cute_scalar_cache_value(scalar_kind, scalar_value),
+                    scalar_value,
+                )
+            )
         else:
             schema.append(("scalar", scalar_kind))
             launch_args.append(scalar_value)
@@ -2054,14 +2829,33 @@ def default_cute_launcher(
     if any(dim <= 0 for dim in grid_xyz):
         return None
 
-    schema_key, launch_args = _build_cute_schema_and_args(
-        cute_kernel, tuple(args), grid_xyz
+    args_tuple = tuple(args)
+    direct_plan = _target1_direct_entry_plan(cute_kernel)
+    if direct_plan is not None:
+        if cute_compile_options is None:
+            raise exc.BackendUnsupported(
+                "cute",
+                "tcgen05 direct entry requires explicit CuTe compile options",
+            )
+        direct_launcher = _get_compiled_cute_direct_entry_launcher(
+            cute_kernel,
+            direct_plan,
+            args_tuple,
+            grid_xyz,
+            block_xyz,
+            cute_compile_options,
+        )
+        return cast("Any", direct_launcher)(*args_tuple)
+
+    schema_key, launch_args = _build_cached_cute_schema_and_args(
+        cute_kernel, args_tuple, grid_xyz
     )
     compiled = _get_compiled_cute_launcher(
         cute_kernel,
         schema_key,
         block_xyz,
         compile_options=cute_compile_options,
+        arch_args=args_tuple,
     )
     return cast("Any", compiled)(*launch_args)
 

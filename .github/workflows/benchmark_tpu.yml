@@ -9,6 +9,10 @@ on:
       kernels:
         required: true
         type: string
+      env-vars:
+        required: false
+        type: string
+        default: ""
 
 permissions:
   contents: read
@@ -133,7 +137,7 @@ jobs:
           # HELION_MEASURE_COMPILE_TIME=1 has helion's compile-time tracker
           # capture per-shape autotune+codegen cost; run_example does its own
           # warmup so post-autotune latency measurements are stable.
-          HELION_PRINT_OUTPUT_CODE=1 HELION_MEASURE_COMPILE_TIME=1 \
+          ${{ inputs.env-vars }} HELION_PRINT_OUTPUT_CODE=1 HELION_MEASURE_COMPILE_TIME=1 \
             python benchmarks/run_tpu.py \
               "${KERNEL_FLAG[@]}" \
               --num-shapes 2 \

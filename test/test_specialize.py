@@ -455,7 +455,9 @@ class TestMarkStatic(RefEagerTestBase, TestCase):
                 out[tile_m, tile_n] = acc.to(x.dtype)
             return out
 
-        m, k, n = 96, 128, 48
+        # Keep this half-precision while staying below CuTe tcgen05 admission;
+        # this test is about mark_static specialization, not MMA selection.
+        m, k, n = 48, 96, 24
 
         # First, run WITHOUT mark_static - dimensions should NOT be constants
         x = torch.randn([m, k], device=DEVICE, dtype=HALF_DTYPE)
@@ -467,9 +469,9 @@ class TestMarkStatic(RefEagerTestBase, TestCase):
         code_normalized = AssertExpectedJournal.normalize_source_comment_structure(
             code_no_spec
         )
-        self.assertNotIn("96", code_normalized)
-        self.assertNotIn("128", code_normalized)
         self.assertNotIn("48", code_normalized)
+        self.assertNotIn("96", code_normalized)
+        self.assertNotIn("24", code_normalized)
 
         # Now, run WITH mark_static - dimensions SHOULD be constants
         x_static = torch.randn([m, k], device=DEVICE, dtype=HALF_DTYPE)
@@ -481,17 +483,17 @@ class TestMarkStatic(RefEagerTestBase, TestCase):
             matmul, (x_static, y_static), block_sizes=[32, 32, 32]
         )
         torch.testing.assert_close(result, x_static @ y_static, rtol=1e-2, atol=1e-2)
-        self.assertIn("96", code)
-        self.assertIn("128", code)
         self.assertIn("48", code)
+        self.assertIn("96", code)
+        self.assertIn("24", code)
 
         # Cache hit: same tensors
         self.assertIs(
             matmul.bind((x_static, y_static)), matmul.bind((x_static, y_static))
         )
         # Cache miss: different specialized values
-        x2 = torch.randn([48, 96], device=DEVICE, dtype=HALF_DTYPE)
-        y2 = torch.randn([96, 24], device=DEVICE, dtype=HALF_DTYPE)
+        x2 = torch.randn([32, 80], device=DEVICE, dtype=HALF_DTYPE)
+        y2 = torch.randn([80, 16], device=DEVICE, dtype=HALF_DTYPE)
         torch._dynamo.mark_static(x2, [0, -1])
         torch._dynamo.mark_static(y2, 1)
         self.assertIsNot(matmul.bind((x_static, y_static)), matmul.bind((x2, y2)))

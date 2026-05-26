@@ -1,4 +1,4 @@
-"""Epilogue subtiling: split → pointwise → multi-store pattern.
+"""Epilogue subtiling: split → pointwise → multi-store/atomic pattern.
 
 Splits the epilogue along a tile dimension by a power-of-two factor S.
 
@@ -15,7 +15,7 @@ Splits the epilogue along a tile dimension by a power-of-two factor S.
         v_0 = pointwise(piece_0)            # [M, N//S] -- cloned per piece
         v_1 = pointwise(piece_1)
 
-        store(v_0, [tile_m, tile_n + 0])    # store each piece separately
+        store(v_0, [tile_m, tile_n + 0])    # store/atomic each piece separately
         store(v_1, [tile_m, tile_n + N//S])
 """
 
@@ -39,20 +39,31 @@ if TYPE_CHECKING:
     from collections.abc import Iterator
 
 CUTE_DIM_LOCAL_COORD_META = "cute_dim_local_coords"
+_PYTHON_POINTWISE_TARGETS = frozenset(
+    {
+        operator.add,
+        operator.sub,
+        operator.mul,
+        operator.truediv,
+        operator.neg,
+    }
+)
 
 
 class EpilogueSubtilingCandidate(NamedTuple):
-    store_node: torch.fx.Node
+    output_node: torch.fx.Node
     pointwise_nodes: list[torch.fx.Node]
     boundary: torch.fx.Node
     split_dim: int
-    block_id: int
+    block_id: int | None
+    split_size: int | torch.SymInt
 
 
 def apply_epilogue_subtiling(
     graph: torch.fx.Graph,
     split_factor: int = 2,
     configured_block_sizes: dict[int, int | torch.SymInt] | None = None,
+    descriptor_output_nodes: set[torch.fx.Node] | None = None,
 ) -> bool:
     """Apply epilogue subtiling to the graph in-place."""
     if split_factor < 2 or not integer_power_of_two(split_factor):
@@ -61,9 +72,12 @@ def apply_epilogue_subtiling(
         )
     env = CompileEnvironment.current()
     configured_block_sizes = configured_block_sizes or {}
+    descriptor_output_nodes = descriptor_output_nodes or set()
     changed = False
 
-    for candidate in _iter_eligible_epilogue_chains(graph, env, split_factor):
+    for candidate in _iter_eligible_epilogue_chains(
+        graph, env, split_factor, descriptor_output_nodes
+    ):
         _rewrite_chain(
             graph,
             env,
@@ -92,15 +106,25 @@ def _iter_eligible_epilogue_chains(
     graph: torch.fx.Graph,
     env: CompileEnvironment,
     split_factor: int,
+    descriptor_output_nodes: set[torch.fx.Node] | None = None,
 ) -> Iterator[EpilogueSubtilingCandidate]:
-    """Yield eligible store + pointwise chains that can be split."""
+    """Yield eligible store/atomic + pointwise chains that can be split."""
+    from ..language.atomic_ops import atomic_add
     from ..language.memory_ops import store
 
-    for store_node in list(graph.nodes):
-        if store_node.op != "call_function" or store_node.target is not store:
+    descriptor_output_nodes = descriptor_output_nodes or set()
+    for output_node in list(graph.nodes):
+        if output_node.op != "call_function" or output_node.target not in (
+            store,
+            atomic_add,
+        ):
+            continue
+        if output_node.target is atomic_add and output_node.users:
+            continue
+        if output_node.target is atomic_add and env.backend_name != "triton":
             continue
 
-        value_node = store_node.args[2]
+        value_node = output_node.args[2]
         if not isinstance(value_node, torch.fx.Node):
             continue
 
@@ -113,17 +137,34 @@ def _iter_eligible_epilogue_chains(
         if not isinstance(boundary_val, torch.Tensor):
             continue
 
-        split_candidate = _find_split_candidate(boundary_val, env, split_factor)
+        # Tensor descriptors require the value tile shape to match the descriptor
+        # block shape.  For outputs like out[tile_m, :], split the static slice
+        # dimension first instead of the tiled row dimension.
+        split_candidate = (
+            _find_static_slice_split_candidate(
+                boundary_val,
+                output_node,
+                split_factor,
+            )
+            if output_node in descriptor_output_nodes
+            else None
+        )
+        split_candidate = split_candidate or _find_split_candidate(
+            boundary_val,
+            env,
+            split_factor,
+        )
         if split_candidate is None:
             continue
 
-        split_dim, block_id = split_candidate
+        split_dim, block_id, split_size = split_candidate
         yield EpilogueSubtilingCandidate(
-            store_node=store_node,
+            output_node=output_node,
             pointwise_nodes=pointwise_nodes,
             boundary=boundary,
             split_dim=split_dim,
             block_id=block_id,
+            split_size=split_size,
         )
 
 
@@ -138,10 +179,16 @@ def _rewrite_chain(
     block_id = candidate.block_id
     split_dim = candidate.split_dim
     boundary_val = boundary.meta["val"]
-    piece_shape_size = boundary_val.size(split_dim) // split_factor
+    piece_shape_size = candidate.split_size // split_factor
+    # block_id=None means this candidate came from a static slice, so there is
+    # no configured Helion tile block size to query.
+    if block_id is None:
+        piece_shape_size = env.size_hint(piece_shape_size)
     piece_block_size = (
         configured_block_sizes.get(block_id, boundary_val.size(split_dim))
         // split_factor
+        if block_id is not None
+        else piece_shape_size
     )
 
     with graph.inserting_before(candidate.pointwise_nodes[0]):
@@ -149,19 +196,22 @@ def _rewrite_chain(
 
     # Clone pointwise ops for each piece and split broadcasted inputs as needed.
     node_pieces: dict[torch.fx.Node, list[torch.fx.Node]] = {boundary: pieces}
-    with graph.inserting_before(candidate.store_node):
+    with graph.inserting_before(candidate.output_node):
         for pw in candidate.pointwise_nodes:
-            for arg_node in _tensor_input_nodes(pw):
-                if arg_node in node_pieces:
-                    continue
-                if split_nodes := _split_node_for_block(
-                    graph,
-                    env,
-                    arg_node,
-                    block_id,
-                    split_factor,
-                ):
-                    node_pieces[arg_node] = split_nodes
+            # Static-slice splits only split the main value chain.  There is no
+            # tile block id to use for splitting other broadcasted inputs.
+            if block_id is not None:
+                for arg_node in _tensor_input_nodes(pw):
+                    if arg_node in node_pieces:
+                        continue
+                    if split_nodes := _split_node_for_block(
+                        graph,
+                        env,
+                        arg_node,
+                        block_id,
+                        split_factor,
+                    ):
+                        node_pieces[arg_node] = split_nodes
 
             node_pieces[pw] = [
                 _clone_pointwise_piece(
@@ -170,6 +220,7 @@ def _rewrite_chain(
                     pw,
                     piece_idx,
                     node_pieces,
+                    split_dim,
                     piece_shape_size,
                     block_id,
                 )
@@ -178,9 +229,9 @@ def _rewrite_chain(
 
     pw_results = node_pieces[candidate.pointwise_nodes[-1]]
 
-    _rewrite_store(
+    _rewrite_output_node(
         graph,
-        candidate.store_node,
+        candidate.output_node,
         pw_results,
         split_dim,
         piece_shape_size,
@@ -201,8 +252,9 @@ def _clone_pointwise_piece(
     pointwise_node: torch.fx.Node,
     piece_idx: int,
     node_pieces: dict[torch.fx.Node, list[torch.fx.Node]],
+    split_dim: int,
     piece_shape_size: int | torch.SymInt,
-    block_id: int,
+    block_id: int | None,
 ) -> torch.fx.Node:
     def _remap(arg: torch.fx.Node) -> torch.fx.Node:
         split_nodes = node_pieces.get(arg)
@@ -219,8 +271,13 @@ def _clone_pointwise_piece(
             **pointwise_node.meta,
             "val": orig_val.new_empty(
                 [
-                    piece_shape_size if env.get_block_id(size) == block_id else size
-                    for size in orig_val.shape
+                    piece_shape_size
+                    if (
+                        (block_id is not None and env.get_block_id(size) == block_id)
+                        or (block_id is None and dim == split_dim)
+                    )
+                    else size
+                    for dim, size in enumerate(orig_val.shape)
                 ]
             ),
         }
@@ -248,52 +305,60 @@ def _split_node_for_block(
     return _reshape_and_split(graph, node, split_dim, split_factor, block_id)
 
 
-def _rewrite_store(
+def _rewrite_output_node(
     graph: torch.fx.Graph,
-    store_node: torch.fx.Node,
+    output_node: torch.fx.Node,
     pieces: list[torch.fx.Node],
     split_dim: int,
     piece_shape_size: int | torch.SymInt,
     piece_block_size: int | torch.SymInt,
-    block_id: int,
+    block_id: int | None,
 ) -> None:
-    subscript_arg = store_node.args[1]
+    subscript_arg = output_node.args[1]
     assert isinstance(subscript_arg, (list, tuple))
     subscript = list(cast("list[object] | tuple[object, ...]", subscript_arg))
-    base_index_node = subscript[split_dim]
-    assert isinstance(base_index_node, torch.fx.Node)
-    group_id = store_node.name
+    group_id = output_node.name
 
-    with graph.inserting_before(store_node):
+    with graph.inserting_before(output_node):
         for piece_idx, piece in enumerate(pieces):
             new_subscript = [*subscript]
-            new_subscript[split_dim] = _new_subtile_index_node(
-                graph,
-                base_index_node,
-                piece_idx,
-                piece_shape_size,
-                piece_block_size,
-                block_id,
-            )
+            if block_id is None:
+                # Static-slice split: rewrite ":" into concrete slice ranges.
+                offset = piece_idx * piece_shape_size
+                new_subscript[split_dim] = slice(offset, offset + piece_shape_size)
+            else:
+                base_index_node = subscript[split_dim]
+                assert isinstance(base_index_node, torch.fx.Node)
+                new_subscript[split_dim] = _new_subtile_index_node(
+                    graph,
+                    base_index_node,
+                    piece_idx,
+                    piece_shape_size,
+                    piece_block_size,
+                    block_id,
+                )
             new_args = (
-                store_node.args[0],
+                output_node.args[0],
                 new_subscript,
                 piece,
-                *store_node.args[3:],
+                *output_node.args[3:],
             )
-            new_store = graph.call_function(
-                cast("Callable[..., object]", store_node.target),
+            new_output = graph.call_function(
+                cast("Callable[..., object]", output_node.target),
                 # pyrefly: ignore [bad-argument-type]
                 new_args,
-                store_node.kwargs,
+                output_node.kwargs,
             )
-            new_store.meta = {
-                **store_node.meta,
+            new_output.meta = {
+                **output_node.meta,
+                # Split pieces still represent one logical store/atomic.  The
+                # codegen path uses this group id to reuse the original indexing
+                # strategy slot across all pieces.
                 "epilogue_subtile_group_id": group_id,
-                "epilogue_subtile_primary_store": piece_idx == 0,
+                "epilogue_subtile_primary_output": piece_idx == 0,
             }
 
-    graph.erase_node(store_node)
+    graph.erase_node(output_node)
 
 
 def _new_subtile_index_node(
@@ -323,7 +388,7 @@ def _reshape_and_split(
     node: torch.fx.Node,
     split_dim: int,
     split_factor: int,
-    block_id: int,
+    block_id: int | None,
 ) -> list[torch.fx.Node]:
     """Reshape [... N ...] -> [... S, N//S ...] at split_dim and recursively split."""
     val = node.meta["val"]
@@ -339,16 +404,17 @@ def _reshape_and_split(
         node.meta,
         reshaped_val,
     )
-    _set_dim_coord_meta(
-        reshape_node,
-        _initial_subtile_dim_coord_meta(
-            node,
-            split_dim,
-            split_factor,
-            piece_size,
-            block_id,
-        ),
-    )
+    if block_id is not None:
+        _set_dim_coord_meta(
+            reshape_node,
+            _initial_subtile_dim_coord_meta(
+                node,
+                split_dim,
+                split_factor,
+                piece_size,
+                block_id,
+            ),
+        )
     return _recursive_split(
         graph,
         reshape_node,
@@ -544,7 +610,10 @@ def _trace_pointwise_chain(
     while (
         isinstance(current, torch.fx.Node)
         and current.op == "call_function"
-        and isinstance(current.target, torch._ops.OpOverload)
+        and (
+            isinstance(current.target, torch._ops.OpOverload)
+            or current.target in _PYTHON_POINTWISE_TARGETS
+        )
         and len(current.users) == 1
     ):
         pointwise_nodes.append(current)
@@ -570,8 +639,8 @@ def _find_split_candidate(
     value: torch.Tensor,
     env: CompileEnvironment,
     split_factor: int,
-) -> tuple[int, int] | None:
-    """Find a non-reduction, non-jagged tile dim to split. Returns (dim, block_id)."""
+) -> tuple[int, int, int | torch.SymInt] | None:
+    """Find a non-reduction, non-jagged tile dim to split."""
     for dim in range(value.dim() - 1, -1, -1):
         size = value.size(dim)
         block_id = env.get_block_id(size)
@@ -581,8 +650,59 @@ def _find_split_candidate(
             and not env.is_jagged_tile(block_id)
             and size % split_factor == 0
         ):
-            return dim, block_id
+            return dim, block_id, size
     return None
+
+
+def _find_static_slice_split_candidate(
+    value: torch.Tensor,
+    output_node: torch.fx.Node,
+    split_factor: int,
+) -> tuple[int, None, int | torch.SymInt] | None:
+    """Find a full-slice output dim, e.g. the ``:`` in ``out[tile_m, :]``."""
+    subscript_arg = output_node.args[1]
+    if not isinstance(subscript_arg, (list, tuple)):
+        return None
+
+    target_arg = output_node.args[0]
+    target_val = (
+        target_arg.meta.get("val") if isinstance(target_arg, torch.fx.Node) else None
+    )
+    value_dim = 0
+    tensor_dim = 0
+    candidate: tuple[int, None, int | torch.SymInt] | None = None
+    # Iterate in output-subscript order to keep tensor/value dims aligned, but
+    # keep the last eligible slice so we still prefer the innermost split dim.
+    for subscript in subscript_arg:
+        if isinstance(subscript, int):
+            tensor_dim += 1
+            continue
+        if value_dim >= value.dim():
+            break
+        if subscript is None:
+            value_dim += 1
+            continue
+
+        # Use the target tensor dimension for descriptor block shape.  The value
+        # meta can be larger for full slices backed by reduction dimensions.
+        split_size = (
+            target_val.size(tensor_dim)
+            if isinstance(target_val, torch.Tensor)
+            else value.size(value_dim)
+        )
+        if (
+            isinstance(subscript, slice)
+            and subscript.start is None
+            and subscript.stop is None
+            and subscript.step in (None, 1)
+            and value.size(value_dim) % split_factor == 0
+            and split_size % split_factor == 0
+        ):
+            candidate = (value_dim, None, split_size)
+        tensor_dim += 1
+        value_dim += 1
+
+    return candidate
 
 
 def _find_split_dim_for_block(

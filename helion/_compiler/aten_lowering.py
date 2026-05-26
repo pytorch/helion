@@ -39,6 +39,11 @@ from .cute.matmul_utils import cute_resolve_active_matmul_k_block_id
 from .cute.matmul_utils import cute_static_k_invariant_extent
 from .cute.matmul_utils import cute_static_serial_matmul_k_extent
 from .cute.matmul_utils import emit_cute_serial_scalar_mm_from_loads
+from .cute.strategies import is_pure_matmul_role_lifecycle_config
+from .cute.tcgen05_constants import TCGEN05_DIRECT_ENTRY_PLAN_CONFIG_KEY
+from .cute.tcgen05_constants import TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY
+from .cute.tcgen05_constants import TCGEN05_PURE_CLC_SCHEDULER_OBJECT_CONFIG_KEY
+from .cute.tcgen05_constants import TCGEN05_PURE_DYNAMIC_SCHEDULER_OBJECT_CONFIG_KEY
 from .matmul_utils import _emit_pallas_matmul
 from .matmul_utils import _needs_f32_accumulator
 from .matmul_utils import emit_tl_dot_with_padding
@@ -56,6 +61,72 @@ class LoweringContext:
 
     def to_ast(self, value: object) -> ast.AST:
         raise NotImplementedError
+
+
+def _requested_pure_matmul_role_lifecycle(ctx: LoweringContext) -> bool:
+    return is_pure_matmul_role_lifecycle_config(ctx.cg.device_function.config)
+
+
+def _requested_tcgen05_flat_role_coordinates(ctx: LoweringContext) -> bool:
+    return bool(
+        ctx.cg.device_function.config.get(
+            TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY, False
+        )
+    )
+
+
+def _requested_tcgen05_pure_clc_scheduler_object(ctx: LoweringContext) -> bool:
+    return bool(
+        ctx.cg.device_function.config.get(
+            TCGEN05_PURE_CLC_SCHEDULER_OBJECT_CONFIG_KEY, False
+        )
+    )
+
+
+def _requested_tcgen05_pure_dynamic_scheduler_object(ctx: LoweringContext) -> bool:
+    return bool(
+        ctx.cg.device_function.config.get(
+            TCGEN05_PURE_DYNAMIC_SCHEDULER_OBJECT_CONFIG_KEY, False
+        )
+    )
+
+
+def _requested_tcgen05_direct_entry_plan(ctx: LoweringContext) -> bool:
+    return bool(
+        ctx.cg.device_function.config.get(TCGEN05_DIRECT_ENTRY_PLAN_CONFIG_KEY, False)
+    )
+
+
+def _reject_tcgen05_flat_role_coordinates_fallback() -> None:
+    raise exc.BackendUnsupported(
+        "cute",
+        f"{TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY}=True requires "
+        "active-K-loop tcgen05 MMA lowering",
+    )
+
+
+def _reject_tcgen05_pure_clc_scheduler_object_fallback() -> None:
+    raise exc.BackendUnsupported(
+        "cute",
+        f"{TCGEN05_PURE_CLC_SCHEDULER_OBJECT_CONFIG_KEY}=True requires "
+        "active-K-loop tcgen05 MMA lowering",
+    )
+
+
+def _reject_tcgen05_pure_dynamic_scheduler_object_fallback() -> None:
+    raise exc.BackendUnsupported(
+        "cute",
+        f"{TCGEN05_PURE_DYNAMIC_SCHEDULER_OBJECT_CONFIG_KEY}=True requires "
+        "active-K-loop tcgen05 MMA lowering",
+    )
+
+
+def _reject_tcgen05_direct_entry_plan_fallback() -> None:
+    raise exc.BackendUnsupported(
+        "cute",
+        f"{TCGEN05_DIRECT_ENTRY_PLAN_CONFIG_KEY}=True requires active-K-loop "
+        "tcgen05 MMA lowering",
+    )
 
 
 class Lowering:
@@ -1145,6 +1216,20 @@ def codegen_mm_cute(ctx: LoweringContext, node: Node) -> ast.AST:
         serial_k_extent=serial_k_extent,
     )
     if direct_mma_result is not None:
+        if _requested_tcgen05_flat_role_coordinates(ctx):
+            _reject_tcgen05_flat_role_coordinates_fallback()
+        if _requested_tcgen05_pure_clc_scheduler_object(ctx):
+            _reject_tcgen05_pure_clc_scheduler_object_fallback()
+        if _requested_tcgen05_pure_dynamic_scheduler_object(ctx):
+            _reject_tcgen05_pure_dynamic_scheduler_object_fallback()
+        if _requested_tcgen05_direct_entry_plan(ctx):
+            _reject_tcgen05_direct_entry_plan_fallback()
+        if _requested_pure_matmul_role_lifecycle(ctx):
+            raise exc.BackendUnsupported(
+                "cute",
+                "tcgen05_strategy='pure_matmul_role_lifecycle' requires the "
+                "active-K-loop tcgen05 matmul lowering, not direct-mm fallback",
+            )
         return direct_mma_result
     serial_result = emit_cute_serial_scalar_mm_from_loads(
         ctx,
@@ -1154,12 +1239,40 @@ def codegen_mm_cute(ctx: LoweringContext, node: Node) -> ast.AST:
         out_dtype=effective_out_dtype,
     )
     if serial_result is not None:
+        if _requested_tcgen05_flat_role_coordinates(ctx):
+            _reject_tcgen05_flat_role_coordinates_fallback()
+        if _requested_tcgen05_pure_clc_scheduler_object(ctx):
+            _reject_tcgen05_pure_clc_scheduler_object_fallback()
+        if _requested_tcgen05_pure_dynamic_scheduler_object(ctx):
+            _reject_tcgen05_pure_dynamic_scheduler_object_fallback()
+        if _requested_tcgen05_direct_entry_plan(ctx):
+            _reject_tcgen05_direct_entry_plan_fallback()
+        if _requested_pure_matmul_role_lifecycle(ctx):
+            raise exc.BackendUnsupported(
+                "cute",
+                "tcgen05_strategy='pure_matmul_role_lifecycle' requires the "
+                "active-K-loop tcgen05 matmul lowering, not serial scalar fallback",
+            )
         return serial_result
     if serial_k_extent is not None:
         raise exc.BackendUnsupported(
             "cute",
             "CuTe direct mm without an active K tile only supports contiguous direct-load operands",
         )
+    if _requested_pure_matmul_role_lifecycle(ctx):
+        raise exc.BackendUnsupported(
+            "cute",
+            "tcgen05_strategy='pure_matmul_role_lifecycle' requires aten.mm "
+            "to lower through the tcgen05 K-loop path",
+        )
+    if _requested_tcgen05_flat_role_coordinates(ctx):
+        _reject_tcgen05_flat_role_coordinates_fallback()
+    if _requested_tcgen05_pure_clc_scheduler_object(ctx):
+        _reject_tcgen05_pure_clc_scheduler_object_fallback()
+    if _requested_tcgen05_pure_dynamic_scheduler_object(ctx):
+        _reject_tcgen05_pure_dynamic_scheduler_object_fallback()
+    if _requested_tcgen05_direct_entry_plan(ctx):
+        _reject_tcgen05_direct_entry_plan_fallback()
     return _emit_cute_matmul(
         ctx.cg,
         lhs,
@@ -1184,6 +1297,20 @@ def codegen_addmm_cute(ctx: LoweringContext, node: Node) -> ast.AST:
     result = codegen_cute_mma(ctx, node, with_acc=True)
     if result is not None:
         return result
+    if _requested_tcgen05_flat_role_coordinates(ctx):
+        _reject_tcgen05_flat_role_coordinates_fallback()
+    if _requested_tcgen05_pure_clc_scheduler_object(ctx):
+        _reject_tcgen05_pure_clc_scheduler_object_fallback()
+    if _requested_tcgen05_pure_dynamic_scheduler_object(ctx):
+        _reject_tcgen05_pure_dynamic_scheduler_object_fallback()
+    if _requested_tcgen05_direct_entry_plan(ctx):
+        _reject_tcgen05_direct_entry_plan_fallback()
+    if _requested_pure_matmul_role_lifecycle(ctx):
+        raise exc.BackendUnsupported(
+            "cute",
+            "tcgen05_strategy='pure_matmul_role_lifecycle' requires the "
+            "active-K-loop tcgen05 addmm lowering",
+        )
     acc, lhs, rhs = map_arg(node.args, lambda arg: _env_arg(ctx, arg))
     assert isinstance(acc, ast.AST)
     assert isinstance(lhs, (ast.AST, CutePackedAffineLoad))
@@ -1231,6 +1358,12 @@ def codegen_addmm_cute(ctx: LoweringContext, node: Node) -> ast.AST:
             "cute",
             "CuTe scalar matmul fallback requires an active K tile or a K-invariant static shortcut",
         )
+    if _requested_tcgen05_pure_clc_scheduler_object(ctx):
+        _reject_tcgen05_pure_clc_scheduler_object_fallback()
+    if _requested_tcgen05_pure_dynamic_scheduler_object(ctx):
+        _reject_tcgen05_pure_dynamic_scheduler_object_fallback()
+    if _requested_tcgen05_direct_entry_plan(ctx):
+        _reject_tcgen05_direct_entry_plan_fallback()
     return _emit_cute_matmul(
         ctx.cg,
         lhs,
@@ -1252,6 +1385,20 @@ def codegen_baddbmm_cute(ctx: LoweringContext, node: Node) -> ast.AST:
     result = codegen_cute_mma(ctx, node, with_acc=True)
     if result is not None:
         return result
+    if _requested_tcgen05_flat_role_coordinates(ctx):
+        _reject_tcgen05_flat_role_coordinates_fallback()
+    if _requested_tcgen05_pure_clc_scheduler_object(ctx):
+        _reject_tcgen05_pure_clc_scheduler_object_fallback()
+    if _requested_tcgen05_pure_dynamic_scheduler_object(ctx):
+        _reject_tcgen05_pure_dynamic_scheduler_object_fallback()
+    if _requested_tcgen05_direct_entry_plan(ctx):
+        _reject_tcgen05_direct_entry_plan_fallback()
+    if _requested_pure_matmul_role_lifecycle(ctx):
+        raise exc.BackendUnsupported(
+            "cute",
+            "tcgen05_strategy='pure_matmul_role_lifecycle' requires "
+            "aten.baddbmm to lower through the tcgen05 K-loop path",
+        )
     acc, lhs, rhs = map_arg(node.args, lambda arg: _env_arg(ctx, arg))
     assert isinstance(acc, ast.AST)
     assert isinstance(lhs, (ast.AST, CutePackedAffineLoad))

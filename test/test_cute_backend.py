@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib
 import os
+from typing import cast
 from unittest.mock import patch
 
 import pytest
@@ -14,10 +15,14 @@ from helion._testing import TestCase
 from helion._testing import code_and_output
 from helion._testing import onlyBackends
 import helion.language as hl
+from helion.runtime import _create_cute_direct_entry
 from helion.runtime import _cute_cluster_shape
 from helion.runtime import _cute_cluster_shape_from_wrapper_plans
+from helion.runtime import _direct_entry_clustered_grid_k
 from helion.runtime import _ensure_cute_dsl_arch_env
+from helion.runtime import _get_compiled_cute_direct_entry_launcher
 from helion.runtime import _get_compiled_cute_launcher
+from helion.runtime import _validate_target1_direct_entry_args
 from helion.runtime import default_cute_launcher
 
 cutlass = pytest.importorskip("cutlass")
@@ -130,6 +135,27 @@ def cute_row_sum(x: torch.Tensor) -> torch.Tensor:
     out = torch.empty([n], dtype=x.dtype, device=x.device)
     for tile_n in hl.tile(n):
         out[tile_n] = x[tile_n, :].sum(-1)
+    return out
+
+
+@helion.kernel(backend="cute")
+def cute_normalize_by_sum(x: torch.Tensor) -> torch.Tensor:
+    n, _m = x.size()
+    out = torch.empty_like(x)
+    for tile_n in hl.tile(n):
+        row_sum = x[tile_n, :].sum(-1)
+        out[tile_n, :] = x[tile_n, :] / row_sum[:, None]
+    return out
+
+
+@helion.kernel(backend="cute")
+def cute_normalize_by_sum_fp32_cast(x: torch.Tensor) -> torch.Tensor:
+    n, _m = x.size()
+    out = torch.empty_like(x)
+    for tile_n in hl.tile(n):
+        vals = x[tile_n, :].to(torch.float32)
+        row_sum = vals.sum(-1)
+        out[tile_n, :] = (vals / row_sum[:, None]).to(x.dtype)
     return out
 
 
@@ -843,6 +869,87 @@ class TestCuteBackend(TestCase):
         self.assertIn("_cute_grouped_reduce_shared_two_stage", code)
         self.assertIn("group_span=1024", code)
         self.assertIn("block=(1024, 1, 1)", code)
+
+    def test_cute_vector_widths_partitions_lane_extent(self) -> None:
+        """cute_vector_widths=[V] partitions the lane extent into
+        outer x inner=V, so the consume sweep walks each V-chunk via a
+        constexpr V-loop and the per-thread base stride becomes V."""
+        args = (torch.randn(2, 16384, device=DEVICE, dtype=torch.float32) + 2.0,)
+        code_v1, _ = code_and_output(
+            cute_normalize_by_sum,
+            args,
+            block_sizes=[1],
+            reduction_loop=8192,
+        )
+        code_v4, _ = code_and_output(
+            cute_normalize_by_sum,
+            args,
+            block_sizes=[1],
+            reduction_loop=8192,
+            cute_vector_widths=[4],
+        )
+        # V=1 baseline: no constexpr V-loop, no per-thread V-stride.
+        self.assertNotIn("cutlass.range_constexpr(4)", code_v1)
+        self.assertNotIn("thread_idx()[0]) * 4", code_v1)
+        # V=4: the consume sweep emits a constexpr V-loop and the per-thread
+        # base index is offset by ``thread_idx * V``.
+        self.assertIn("cutlass.range_constexpr(4)", code_v4)
+        self.assertIn("thread_idx()[0]) * 4", code_v4)
+
+    def test_bf16_unroll_mode_emits_uint16_vec_load_and_bitcast(self) -> None:
+        """For a bf16 reduction with an explicit fp32 cast, the 'unroll' vec
+        mode loads each V-chunk as a Uint16 vector and bitcasts each lane
+        back to bf16 via cutlass.Uint16(...).bitcast(cutlass.BFloat16)."""
+        args = (torch.randn(2, 16384, device=DEVICE, dtype=torch.bfloat16) + 2.0,)
+        code, out = code_and_output(
+            cute_normalize_by_sum_fp32_cast,
+            args,
+            block_sizes=[1],
+            reduction_loop=8192,
+            cute_vector_widths=[4],
+        )
+        (x,) = args
+        expected = (x.float() / x.float().sum(-1, keepdim=True)).to(x.dtype)
+        torch.testing.assert_close(out, expected, rtol=1e-2, atol=1e-2)
+        self.assertIn("ir.VectorType.get([4], cutlass.Uint16.mlir_type)", code)
+        self.assertIn(".bitcast(cutlass.BFloat16)", code)
+
+    def test_two_pass_load_fusion_shape_b_wide_chunk(self) -> None:
+        """Shape B: V=1 wide-chunk reduction emits a lane loop inside the
+        outer offset loop, and the fuser caches loaded x values across the
+        reduce and consume sweeps."""
+        args = (torch.randn(2, 16384, device=DEVICE, dtype=torch.float32) + 2.0,)
+        code, out = code_and_output(
+            cute_normalize_by_sum,
+            args,
+            block_sizes=[1],
+            reduction_loop=8192,
+        )
+        (x,) = args
+        expected = x / x.sum(-1, keepdim=True)
+        torch.testing.assert_close(out, expected, rtol=1e-4, atol=1e-4)
+        # The fuser allocates a fragment and rewrites the consume sweep's
+        # load to read from the cache.
+        self.assertIn("cute.make_fragment", code)
+        self.assertIn("_fuse_cache_0", code)
+
+    def test_two_pass_load_fusion_shape_c_vec_unroll(self) -> None:
+        """Shape C: V>1 unroll mode hoists a Uint16 vec load above the
+        constexpr V-loop; the fuser recognises the vec hoist and caches
+        cache_size * V scalar slots across the two sweeps."""
+        args = (torch.randn(2, 16384, device=DEVICE, dtype=torch.bfloat16) + 2.0,)
+        code, out = code_and_output(
+            cute_normalize_by_sum_fp32_cast,
+            args,
+            block_sizes=[1],
+            reduction_loop=8192,
+            cute_vector_widths=[4],
+        )
+        (x,) = args
+        expected = (x.float() / x.float().sum(-1, keepdim=True)).to(x.dtype)
+        torch.testing.assert_close(out, expected, rtol=1e-2, atol=1e-2)
+        self.assertIn("cute.make_fragment", code)
+        self.assertIn("_fuse_cache_0", code)
 
     def test_strided_threaded_block_reduction(self) -> None:
         args = (torch.randn(4, 16, device=DEVICE, dtype=torch.float32),)
@@ -1611,6 +1718,1193 @@ class TestCuteBackend(TestCase):
             [("jit-wrapper", (1, 2, 3), "--generate-line-info")],
         )
         self.assertEqual(result, ("launched", (1, 2, 3)))
+
+    def test_cute_launcher_uses_target1_direct_entry_plan(self) -> None:
+        cute_kernel = type("DummyCuteKernel", (), {})()
+        cute_kernel._helion_cute_direct_entry_plans = [
+            {
+                "kind": "tcgen05_target1_direct_entry",
+                "lhs_idx": 0,
+                "rhs_idx": 1,
+                "d_idx": 2,
+            }
+        ]
+        x = torch.empty((1024, 1024), device=DEVICE, dtype=torch.bfloat16)
+        y = torch.empty((1024, 4096), device=DEVICE, dtype=torch.bfloat16)
+        out = torch.empty((1024, 4096), device=DEVICE, dtype=torch.bfloat16)
+        launched_args: list[tuple[object, ...]] = []
+
+        class FakeDirectLauncher:
+            def __call__(self, *args: object) -> tuple[str, tuple[object, ...]]:
+                launched_args.append(args)
+                return ("direct", args)
+
+        with (
+            patch(
+                "helion.runtime._get_compiled_cute_direct_entry_launcher",
+                return_value=FakeDirectLauncher(),
+            ) as direct_launcher,
+            patch("helion.runtime._build_cached_cute_schema_and_args") as build_schema,
+            patch("helion.runtime._get_compiled_cute_launcher") as wrapper_launcher,
+        ):
+            result = default_cute_launcher(
+                cute_kernel,
+                (2, 1, 64),
+                x,
+                y,
+                out,
+                block=(256, 1, 1),
+                cute_compile_options="--enable-tvm-ffi",
+            )
+
+        direct_launcher.assert_called_once()
+        build_schema.assert_not_called()
+        wrapper_launcher.assert_not_called()
+        self.assertEqual(launched_args, [(x, y, out)])
+        self.assertEqual(result, ("direct", (x, y, out)))
+
+    def test_cute_launcher_direct_entry_requires_tvm_ffi_option(self) -> None:
+        cute_kernel = type("DummyCuteKernel", (), {})()
+        cute_kernel._helion_cute_direct_entry_plans = [
+            {
+                "kind": "tcgen05_target1_direct_entry",
+                "lhs_idx": 0,
+                "rhs_idx": 1,
+                "d_idx": 2,
+            }
+        ]
+        x = torch.empty((1024, 1024), device=DEVICE, dtype=torch.bfloat16)
+        y = torch.empty((1024, 4096), device=DEVICE, dtype=torch.bfloat16)
+        out = torch.empty((1024, 4096), device=DEVICE, dtype=torch.bfloat16)
+
+        with self.assertRaisesRegex(
+            helion.exc.BackendUnsupported,
+            "explicit CuTe compile options",
+        ):
+            default_cute_launcher(
+                cute_kernel,
+                (2, 1, 64),
+                x,
+                y,
+                out,
+                block=(256, 1, 1),
+            )
+
+    def test_cute_direct_entry_launcher_compiles_with_fake_tensors(self) -> None:
+        cute_kernel = type("DummyCuteKernel", (), {})()
+        direct_plan: dict[str, object] = {
+            "kind": "tcgen05_target1_direct_entry",
+            "lhs_idx": 0,
+            "rhs_idx": 1,
+            "d_idx": 2,
+            "bm": 256,
+            "bn": 256,
+            "bk": 64,
+            "cluster_m": 2,
+            "cluster_n": 1,
+            "ab_stage_count": 3,
+            "c_stage_count": 2,
+            "input_dtype": "cutlass.BFloat16",
+            "output_dtype": "cutlass.BFloat16",
+            "validated_shape": [1024, 4096, 1024],
+        }
+        x = torch.empty((1024, 1024), device=DEVICE, dtype=torch.bfloat16)
+        y = torch.empty((1024, 4096), device=DEVICE, dtype=torch.bfloat16)
+        out = torch.empty((1024, 4096), device=DEVICE, dtype=torch.bfloat16)
+        fake_args = ("fake-x", "fake-y", "fake-out")
+        compiled_calls: list[tuple[object, tuple[object, ...], str | None]] = []
+        launched_args: list[tuple[object, ...]] = []
+
+        class FakeCompiled:
+            def __call__(self, *args: object) -> tuple[str, tuple[object, ...]]:
+                launched_args.append(args)
+                return ("direct", args)
+
+        def fake_compile(
+            jit_func: object,
+            *args: object,
+            options: str | None = None,
+        ) -> FakeCompiled:
+            compiled_calls.append((jit_func, args, options))
+            return FakeCompiled()
+
+        with (
+            patch("helion.runtime._ensure_cute_dsl_arch_env"),
+            patch(
+                "helion.runtime._create_cute_direct_entry",
+                return_value="jit-direct-entry",
+            ),
+            patch(
+                "helion.runtime._make_cute_direct_entry_fake_tensor",
+                side_effect=fake_args,
+            ),
+            patch("cutlass.cute.compile", side_effect=fake_compile),
+        ):
+            launcher = _get_compiled_cute_direct_entry_launcher(
+                cute_kernel,
+                direct_plan,
+                (x, y, out),
+                (2, 1, 64),
+                (256, 1, 1),
+                "--enable-tvm-ffi",
+            )
+            first = launcher(x, y, out)
+            second = launcher(x, y, out)
+
+        self.assertEqual(
+            compiled_calls,
+            [("jit-direct-entry", fake_args, "--enable-tvm-ffi")],
+        )
+        self.assertEqual(launched_args, [(x, y, out), (x, y, out)])
+        self.assertEqual(first, ("direct", (x, y, out)))
+        self.assertEqual(second, first)
+
+    def test_cute_direct_entry_launcher_uses_generated_entry(self) -> None:
+        cute_kernel = type("DummyCuteKernel", (), {})()
+        direct_plan: dict[str, object] = {
+            "kind": "tcgen05_target1_direct_entry",
+            "lhs_idx": 0,
+            "rhs_idx": 1,
+            "d_idx": 2,
+            "bm": 256,
+            "bn": 256,
+            "bk": 64,
+            "cluster_m": 2,
+            "cluster_n": 1,
+            "ab_stage_count": 3,
+            "c_stage_count": 2,
+            "input_dtype": "cutlass.BFloat16",
+            "output_dtype": "cutlass.BFloat16",
+            "validated_shape": [1024, 4096, 1024],
+        }
+        cute_kernel._helion_cute_generated_direct_entry = "generated-direct-entry"
+        x = torch.empty((1024, 1024), device=DEVICE, dtype=torch.bfloat16)
+        y = torch.empty((1024, 4096), device=DEVICE, dtype=torch.bfloat16)
+        out = torch.empty((1024, 4096), device=DEVICE, dtype=torch.bfloat16)
+        fake_args = ("fake-x", "fake-y", "fake-out")
+        compiled_calls: list[tuple[object, tuple[object, ...], str | None]] = []
+
+        class FakeCompiled:
+            def __call__(self, *args: object) -> tuple[str, tuple[object, ...]]:
+                return ("direct", args)
+
+        def fake_compile(
+            jit_func: object,
+            *args: object,
+            options: str | None = None,
+        ) -> FakeCompiled:
+            compiled_calls.append((jit_func, args, options))
+            return FakeCompiled()
+
+        with (
+            patch("helion.runtime._ensure_cute_dsl_arch_env"),
+            patch(
+                "helion.runtime._patch_cutlass_jit_shutdown_unload"
+            ) as patch_shutdown,
+            patch(
+                "helion.runtime._create_cute_direct_entry",
+                side_effect=AssertionError("runtime direct entry fallback used"),
+            ),
+            patch(
+                "helion.runtime._make_cute_direct_entry_fake_tensor",
+                side_effect=fake_args,
+            ),
+            patch("cutlass.cute.compile", side_effect=fake_compile),
+        ):
+            launcher = _get_compiled_cute_direct_entry_launcher(
+                cute_kernel,
+                direct_plan,
+                (x, y, out),
+                (128, 1, 1),
+                (256, 1, 1),
+                "--enable-tvm-ffi",
+            )
+            result = launcher(x, y, out)
+
+        patch_shutdown.assert_called_once()
+        self.assertEqual(
+            compiled_calls,
+            [("generated-direct-entry", fake_args, "--enable-tvm-ffi")],
+        )
+        self.assertEqual(result, ("direct", (x, y, out)))
+
+    def test_cute_direct_entry_cache_key_includes_cluster_shape(self) -> None:
+        cute_kernel = type("DummyCuteKernel", (), {})()
+        direct_plan: dict[str, object] = {
+            "kind": "tcgen05_target1_direct_entry",
+            "lhs_idx": 0,
+            "rhs_idx": 1,
+            "d_idx": 2,
+            "bm": 256,
+            "bn": 256,
+            "bk": 64,
+            "cluster_m": 2,
+            "cluster_n": 1,
+            "ab_stage_count": 3,
+            "c_stage_count": 2,
+            "input_dtype": "cutlass.BFloat16",
+            "output_dtype": "cutlass.BFloat16",
+            "validated_shape": [1024, 4096, 1024],
+        }
+        cute_kernel._helion_cute_wrapper_plans = [
+            {
+                "kind": "tcgen05_ab_tma",
+                "kernel_args": [
+                    "tma_atom_a",
+                    "tma_tensor_a",
+                    "tma_atom_b",
+                    "tma_tensor_b",
+                ],
+            },
+            {
+                "kind": "tcgen05_d_tma",
+                "kernel_args": [
+                    "tma_store_atom",
+                    "tma_store_tensor",
+                ],
+            },
+        ]
+        x = torch.empty((1024, 1024), device=DEVICE, dtype=torch.bfloat16)
+        y = torch.empty((1024, 4096), device=DEVICE, dtype=torch.bfloat16)
+        out = torch.empty((1024, 4096), device=DEVICE, dtype=torch.bfloat16)
+        fake_args = ("fake-x", "fake-y", "fake-out")
+        created: list[object] = []
+
+        def make_direct_entry(*_args: object) -> object:
+            entry = f"jit-direct-entry-{len(created)}"
+            created.append(entry)
+            return entry
+
+        with (
+            patch("helion.runtime._ensure_cute_dsl_arch_env"),
+            patch(
+                "helion.runtime._create_cute_direct_entry",
+                side_effect=make_direct_entry,
+            ),
+            patch(
+                "helion.runtime._make_cute_direct_entry_fake_tensor",
+                side_effect=fake_args * 3,
+            ),
+        ):
+            cute_kernel._helion_cute_cluster_shape = (1, 1, 1)
+            launcher_a0 = _get_compiled_cute_direct_entry_launcher(
+                cute_kernel,
+                direct_plan,
+                (x, y, out),
+                (2, 1, 64),
+                (256, 1, 1),
+                "--enable-tvm-ffi",
+            )
+            launcher_a1 = _get_compiled_cute_direct_entry_launcher(
+                cute_kernel,
+                direct_plan,
+                (x, y, out),
+                (2, 1, 64),
+                (256, 1, 1),
+                "--enable-tvm-ffi",
+            )
+            cute_kernel._helion_cute_cluster_shape = (2, 1, 1)
+            launcher_b = _get_compiled_cute_direct_entry_launcher(
+                cute_kernel,
+                direct_plan,
+                (x, y, out),
+                (2, 1, 64),
+                (256, 1, 1),
+                "--enable-tvm-ffi",
+            )
+
+        self.assertIs(launcher_a0, launcher_a1)
+        self.assertIsNot(launcher_a0, launcher_b)
+        self.assertEqual(created, ["jit-direct-entry-0", "jit-direct-entry-1"])
+
+    def test_cute_direct_entry_rejects_stale_wrapper_metadata(self) -> None:
+        direct_plan: dict[str, object] = {
+            "kind": "tcgen05_target1_direct_entry",
+            "lhs_idx": 0,
+            "rhs_idx": 1,
+            "d_idx": 2,
+            "bm": 256,
+            "bn": 256,
+            "bk": 64,
+            "cluster_m": 2,
+            "cluster_n": 1,
+            "ab_stage_count": 3,
+            "c_stage_count": 2,
+            "input_dtype": "cutlass.BFloat16",
+            "output_dtype": "cutlass.BFloat16",
+            "ab_kernel_args": [
+                "tma_atom_a",
+                "tma_tensor_a",
+                "tma_atom_b",
+                "tma_tensor_b",
+            ],
+            "d_kernel_args": [
+                "tma_store_atom",
+                "tma_store_tensor",
+            ],
+        }
+        ab_plan: dict[str, object] = {
+            "kind": "tcgen05_ab_tma",
+            "lhs_idx": 0,
+            "rhs_idx": 1,
+            "bm": 256,
+            "bn": 256,
+            "bk": 64,
+            "cluster_m": 2,
+            "cluster_n": 1,
+            "ab_stage_count": 3,
+            "input_dtype": "cutlass.BFloat16",
+            "acc_dtype": "cutlass.Float32",
+            "kernel_args": [
+                "tma_atom_a",
+                "tma_tensor_a",
+                "tma_atom_b",
+                "tma_tensor_b",
+            ],
+        }
+        d_plan: dict[str, object] = {
+            "kind": "tcgen05_d_tma",
+            "d_idx": 2,
+            "bm": 256,
+            "bn": 256,
+            "c_stage_count": 2,
+            "output_dtype": "cutlass.BFloat16",
+            "epi_tile_m": 128,
+            "epi_tile_n": 32,
+            "d_store_box_n": 32,
+            "kernel_args": [
+                "tma_store_atom",
+                "tma_store_tensor",
+            ],
+        }
+        cute_kernel = type("DummyCuteKernel", (), {})()
+        cute_kernel._helion_cute_wrapper_plans = [ab_plan, d_plan]
+
+        direct_entry = _create_cute_direct_entry(
+            cute_kernel,
+            direct_plan,
+            (2, 1, 64),
+            (256, 1, 1),
+        )
+        self.assertTrue(direct_entry.__name__.startswith("_helion_cute_direct_entry_"))
+
+        stale_index_kernel = type("DummyCuteKernel", (), {})()
+        stale_index_kernel._helion_cute_wrapper_plans = [
+            {**ab_plan, "lhs_idx": 1},
+            d_plan,
+        ]
+        with self.assertRaisesRegex(
+            helion.exc.BackendUnsupported,
+            "wrapper A/B plan mismatch for lhs_idx",
+        ):
+            _create_cute_direct_entry(
+                stale_index_kernel,
+                direct_plan,
+                (2, 1, 64),
+                (256, 1, 1),
+            )
+
+        stale_acc_kernel = type("DummyCuteKernel", (), {})()
+        stale_acc_kernel._helion_cute_wrapper_plans = [
+            {**ab_plan, "acc_dtype": "cutlass.Float16"},
+            d_plan,
+        ]
+        with self.assertRaisesRegex(
+            helion.exc.BackendUnsupported,
+            "wrapper A/B plan mismatch for acc_dtype",
+        ):
+            _create_cute_direct_entry(
+                stale_acc_kernel,
+                direct_plan,
+                (2, 1, 64),
+                (256, 1, 1),
+            )
+
+        stale_shape_kernel = type("DummyCuteKernel", (), {})()
+        stale_shape_kernel._helion_cute_wrapper_plans = [
+            ab_plan,
+            {**d_plan, "epi_tile_n": 64},
+        ]
+        with self.assertRaisesRegex(
+            helion.exc.BackendUnsupported,
+            "wrapper D plan mismatch for epi_tile_n",
+        ):
+            _create_cute_direct_entry(
+                stale_shape_kernel,
+                direct_plan,
+                (2, 1, 64),
+                (256, 1, 1),
+            )
+
+        stale_layout_kernel = type("DummyCuteKernel", (), {})()
+        stale_layout_kernel._helion_cute_wrapper_plans = [
+            {**ab_plan, "smem_swizzle_a": 8},
+            d_plan,
+        ]
+        with self.assertRaisesRegex(
+            helion.exc.BackendUnsupported,
+            "default A/B SMEM wrapper layouts",
+        ):
+            _create_cute_direct_entry(
+                stale_layout_kernel,
+                direct_plan,
+                (2, 1, 64),
+                (256, 1, 1),
+            )
+
+    def test_cute_direct_entry_validator_rejects_shape_bk_mismatch(self) -> None:
+        """Cycle-2 P1 + cycle-3 B1: tensor shape envelope must be tied to
+        both the plan's ``bk`` AND the plan's recorded ``validated_shape``.
+
+        The cycle-3 review identified that T4 and T5 share ``bk=128``
+        and the same ``(ab,c)`` stage tuple, so the bk-keyed shape-set
+        alone cannot tell a T4 plan apart from a T5 plan at the
+        validator boundary. The plan now carries its
+        ``validated_shape=(M,N,K)`` envelope so the validator
+        dispatches on it directly.
+        """
+        t1_plan: dict[str, object] = {
+            "kind": "tcgen05_target1_direct_entry",
+            "lhs_idx": 0,
+            "rhs_idx": 1,
+            "d_idx": 2,
+            "bm": 256,
+            "bn": 256,
+            "bk": 64,
+            "cluster_m": 2,
+            "cluster_n": 1,
+            "ab_stage_count": 3,
+            "c_stage_count": 2,
+            "input_dtype": "cutlass.BFloat16",
+            "output_dtype": "cutlass.BFloat16",
+            "validated_shape": [1024, 4096, 1024],
+        }
+        # T2, T3, T4, T5, and T6 share bk=128 but carry distinct
+        # validated_shape triples so the validator can tell them apart
+        # even when the bk-keyed shape-set table contains all five. T2
+        # and T6 additionally carry ``bias_idx=3`` so they require a
+        # 4th rank-1 arg; T3/T4/T5 keep the 3-tensor (lhs/rhs/output)
+        # signature.
+        t2_plan: dict[str, object] = {
+            **t1_plan,
+            "bk": 128,
+            "validated_shape": [4096, 2048, 2048],
+            "bias_idx": 3,
+        }
+        t3_plan: dict[str, object] = {
+            **t1_plan,
+            "bk": 128,
+            "validated_shape": [2048, 4096, 2048],
+        }
+        t4_plan: dict[str, object] = {
+            **t1_plan,
+            "bk": 128,
+            "validated_shape": [8192, 1024, 1024],
+        }
+        t5_plan: dict[str, object] = {
+            **t1_plan,
+            "bk": 128,
+            "validated_shape": [1024, 8192, 1024],
+        }
+        t6_plan: dict[str, object] = {
+            **t1_plan,
+            "bk": 128,
+            "validated_shape": [8192, 2048, 2048],
+            "bias_idx": 3,
+        }
+        t7_plan: dict[str, object] = {
+            **t1_plan,
+            "bk": 128,
+            "validated_shape": [2048, 8192, 2048],
+        }
+        t1_tensors = (
+            torch.empty((1024, 1024), device=DEVICE, dtype=torch.bfloat16),
+            torch.empty((1024, 4096), device=DEVICE, dtype=torch.bfloat16),
+            torch.empty((1024, 4096), device=DEVICE, dtype=torch.bfloat16),
+        )
+        t2_tensors = (
+            torch.empty((4096, 2048), device=DEVICE, dtype=torch.bfloat16),
+            torch.empty((2048, 2048), device=DEVICE, dtype=torch.bfloat16),
+            torch.empty((4096, 2048), device=DEVICE, dtype=torch.bfloat16),
+            torch.empty((2048,), device=DEVICE, dtype=torch.bfloat16),
+        )
+        t3_tensors = (
+            torch.empty((2048, 2048), device=DEVICE, dtype=torch.bfloat16),
+            torch.empty((2048, 4096), device=DEVICE, dtype=torch.bfloat16),
+            torch.empty((2048, 4096), device=DEVICE, dtype=torch.bfloat16),
+        )
+        t4_tensors = (
+            torch.empty((8192, 1024), device=DEVICE, dtype=torch.bfloat16),
+            torch.empty((1024, 1024), device=DEVICE, dtype=torch.bfloat16),
+            torch.empty((8192, 1024), device=DEVICE, dtype=torch.bfloat16),
+        )
+        t5_tensors = (
+            torch.empty((1024, 1024), device=DEVICE, dtype=torch.bfloat16),
+            torch.empty((1024, 8192), device=DEVICE, dtype=torch.bfloat16),
+            torch.empty((1024, 8192), device=DEVICE, dtype=torch.bfloat16),
+        )
+        t6_tensors = (
+            torch.empty((8192, 2048), device=DEVICE, dtype=torch.bfloat16),
+            torch.empty((2048, 2048), device=DEVICE, dtype=torch.bfloat16),
+            torch.empty((8192, 2048), device=DEVICE, dtype=torch.bfloat16),
+            torch.empty((2048,), device=DEVICE, dtype=torch.bfloat16),
+        )
+        t7_tensors = (
+            torch.empty((2048, 2048), device=DEVICE, dtype=torch.bfloat16),
+            torch.empty((2048, 8192), device=DEVICE, dtype=torch.bfloat16),
+            torch.empty((2048, 8192), device=DEVICE, dtype=torch.bfloat16),
+        )
+        # T1 plan + T1 tensors accepted.
+        _validate_target1_direct_entry_args(
+            t1_plan,
+            t1_tensors,
+            (2, 1, 64),
+            (256, 1, 1),
+            "--enable-tvm-ffi",
+        )
+        # T4 plan + T4 tensors accepted.
+        _validate_target1_direct_entry_args(
+            t4_plan,
+            t4_tensors,
+            (2, 1, 74),
+            (256, 1, 1),
+            "--enable-tvm-ffi",
+        )
+        # T5 plan + T5 tensors accepted (same bk=128 accept set; the
+        # validator now also matches validated_shape against tensors).
+        _validate_target1_direct_entry_args(
+            t5_plan,
+            t5_tensors,
+            (2, 1, 74),
+            (256, 1, 1),
+            "--enable-tvm-ffi",
+        )
+        # T3 plan + T3 tensors accepted. T3's runtime clustered grid is
+        # ``(2, 1, 74)`` (M_tiles*N_tiles = 8*16 = 128, capped to
+        # min(128, num_sms // cluster_m = 74) on B200) — same as
+        # T4/T5's grid value on the bk=128 stage tuple plus T3's shape
+        # envelope.
+        _validate_target1_direct_entry_args(
+            t3_plan,
+            t3_tensors,
+            (2, 1, 74),
+            (256, 1, 1),
+            "--enable-tvm-ffi",
+        )
+        # T2 plan + T2 tensors accepted (4 args: lhs, rhs, output, bias).
+        # T2 shares bk=128 with T3/T4/T5/T6 but adds a 4th rank-1 bias arg.
+        _validate_target1_direct_entry_args(
+            t2_plan,
+            t2_tensors,
+            (2, 1, 74),
+            (256, 1, 1),
+            "--enable-tvm-ffi",
+        )
+        # T6 plan + T6 tensors accepted (4 args). T6 shares the 4-arg
+        # signature with T2 but has a different validated_shape. T6's
+        # runtime clustered grid is ``(2, 1, 74)`` (M_tiles*N_tiles =
+        # 32*8 = 256, capped to min(256, num_sms // cluster_m = 74) on
+        # B200).
+        _validate_target1_direct_entry_args(
+            t6_plan,
+            t6_tensors,
+            (2, 1, 74),
+            (256, 1, 1),
+            "--enable-tvm-ffi",
+        )
+        # T7 plan + T7 tensors accepted (3 args). T7 shares bk=128 and
+        # the 3-tensor signature with T3/T4/T5 but has a different
+        # validated_shape. T7's runtime clustered grid is ``(2, 1, 74)``
+        # (M_tiles*N_tiles = 8*32 = 256, capped to min(256,
+        # num_sms // cluster_m = 74) on B200) — same as T6's grid.
+        _validate_target1_direct_entry_args(
+            t7_plan,
+            t7_tensors,
+            (2, 1, 74),
+            (256, 1, 1),
+            "--enable-tvm-ffi",
+        )
+        # T1 plan + T4 tensors rejected.
+        with self.assertRaisesRegex(
+            helion.exc.BackendUnsupported,
+            r"validated_shape=\(1024, 4096, 1024\) \(bk=64\) requires shapes",
+        ):
+            _validate_target1_direct_entry_args(
+                t1_plan,
+                t4_tensors,
+                (2, 1, 64),
+                (256, 1, 1),
+                "--enable-tvm-ffi",
+            )
+        # T1 plan + T5 tensors rejected (bk=64 requires T1 shape).
+        with self.assertRaisesRegex(
+            helion.exc.BackendUnsupported,
+            r"validated_shape=\(1024, 4096, 1024\) \(bk=64\) requires shapes",
+        ):
+            _validate_target1_direct_entry_args(
+                t1_plan,
+                t5_tensors,
+                (2, 1, 64),
+                (256, 1, 1),
+                "--enable-tvm-ffi",
+            )
+        # T4 plan + T1 tensors rejected.
+        with self.assertRaisesRegex(
+            helion.exc.BackendUnsupported,
+            r"validated_shape=\(8192, 1024, 1024\) \(bk=128\) requires shapes",
+        ):
+            _validate_target1_direct_entry_args(
+                t4_plan,
+                t1_tensors,
+                (2, 1, 74),
+                (256, 1, 1),
+                "--enable-tvm-ffi",
+            )
+        # B1 (cycle-3 review): T4 plan + T5 tensors must be rejected.
+        # Both share bk=128, ab=3, c=2, and the clustered grid (2,1,74),
+        # so only the per-plan validated_shape can tell them apart.
+        with self.assertRaisesRegex(
+            helion.exc.BackendUnsupported,
+            r"validated_shape=\(8192, 1024, 1024\) \(bk=128\) requires shapes",
+        ):
+            _validate_target1_direct_entry_args(
+                t4_plan,
+                t5_tensors,
+                (2, 1, 74),
+                (256, 1, 1),
+                "--enable-tvm-ffi",
+            )
+        # B1 (cycle-3 review): T5 plan + T4 tensors must be rejected.
+        # Symmetric to the above; this is the defense-in-depth case
+        # cycle 3 was missing.
+        with self.assertRaisesRegex(
+            helion.exc.BackendUnsupported,
+            r"validated_shape=\(1024, 8192, 1024\) \(bk=128\) requires shapes",
+        ):
+            _validate_target1_direct_entry_args(
+                t5_plan,
+                t4_tensors,
+                (2, 1, 74),
+                (256, 1, 1),
+                "--enable-tvm-ffi",
+            )
+        # T3 plan + T4 tensors must be rejected (same bk, different
+        # validated_shape).
+        with self.assertRaisesRegex(
+            helion.exc.BackendUnsupported,
+            r"validated_shape=\(2048, 4096, 2048\) \(bk=128\) requires shapes",
+        ):
+            _validate_target1_direct_entry_args(
+                t3_plan,
+                t4_tensors,
+                (2, 1, 74),
+                (256, 1, 1),
+                "--enable-tvm-ffi",
+            )
+        # T4 plan + T3 tensors must be rejected (same bk, different
+        # validated_shape).
+        with self.assertRaisesRegex(
+            helion.exc.BackendUnsupported,
+            r"validated_shape=\(8192, 1024, 1024\) \(bk=128\) requires shapes",
+        ):
+            _validate_target1_direct_entry_args(
+                t4_plan,
+                t3_tensors,
+                (2, 1, 74),
+                (256, 1, 1),
+                "--enable-tvm-ffi",
+            )
+        # T1 plan + T3 tensors rejected (bk=64 requires T1 shape).
+        with self.assertRaisesRegex(
+            helion.exc.BackendUnsupported,
+            r"validated_shape=\(1024, 4096, 1024\) \(bk=64\) requires shapes",
+        ):
+            _validate_target1_direct_entry_args(
+                t1_plan,
+                t3_tensors,
+                (2, 1, 64),
+                (256, 1, 1),
+                "--enable-tvm-ffi",
+            )
+        # T2 plan + 3 args rejected: T2's plan carries bias_idx=3, so the
+        # validator requires exactly 4 args.
+        with self.assertRaisesRegex(
+            helion.exc.BackendUnsupported,
+            r"lhs/rhs/output/bias args",
+        ):
+            _validate_target1_direct_entry_args(
+                t2_plan,
+                t2_tensors[:3],
+                (2, 1, 74),
+                (256, 1, 1),
+                "--enable-tvm-ffi",
+            )
+        # T3 plan + T2 tensors (4-tensor call) rejected: T3 lacks
+        # bias_idx so the validator requires exactly 3 args.
+        with self.assertRaisesRegex(
+            helion.exc.BackendUnsupported,
+            r"lhs/rhs/output args",
+        ):
+            _validate_target1_direct_entry_args(
+                t3_plan,
+                t2_tensors,
+                (2, 1, 74),
+                (256, 1, 1),
+                "--enable-tvm-ffi",
+            )
+        # T2 plan + T3 tensors (with a bf16 rank-1 bias appended) rejected:
+        # same bk=128 but different validated_shape, so the shape
+        # envelope cross-check catches it.
+        with self.assertRaisesRegex(
+            helion.exc.BackendUnsupported,
+            r"validated_shape=\(4096, 2048, 2048\) \(bk=128\) requires shapes",
+        ):
+            _validate_target1_direct_entry_args(
+                t2_plan,
+                (
+                    *t3_tensors,
+                    torch.empty((4096,), device=DEVICE, dtype=torch.bfloat16),
+                ),
+                (2, 1, 74),
+                (256, 1, 1),
+                "--enable-tvm-ffi",
+            )
+        # T2 plan + rank-2 4th tensor rejected: the bias must be rank-1
+        # with shape (N,).
+        with self.assertRaisesRegex(
+            helion.exc.BackendUnsupported,
+            r"contiguous rank-1 bf16 tensor of shape \(2048,\)",
+        ):
+            _validate_target1_direct_entry_args(
+                t2_plan,
+                (
+                    *t2_tensors[:3],
+                    torch.empty((1, 2048), device=DEVICE, dtype=torch.bfloat16),
+                ),
+                (2, 1, 74),
+                (256, 1, 1),
+                "--enable-tvm-ffi",
+            )
+        # T2 plan + rank-1 4th tensor with wrong N-extent rejected: the
+        # bias's N must match the validated_shape's N.
+        with self.assertRaisesRegex(
+            helion.exc.BackendUnsupported,
+            r"contiguous rank-1 bf16 tensor of shape \(2048,\)",
+        ):
+            _validate_target1_direct_entry_args(
+                t2_plan,
+                (
+                    *t2_tensors[:3],
+                    torch.empty((4096,), device=DEVICE, dtype=torch.bfloat16),
+                ),
+                (2, 1, 74),
+                (256, 1, 1),
+                "--enable-tvm-ffi",
+            )
+        # T6 plan + 3 args rejected: T6's plan carries bias_idx=3, so
+        # the validator requires exactly 4 args.
+        with self.assertRaisesRegex(
+            helion.exc.BackendUnsupported,
+            r"lhs/rhs/output/bias args",
+        ):
+            _validate_target1_direct_entry_args(
+                t6_plan,
+                t6_tensors[:3],
+                (2, 1, 74),
+                (256, 1, 1),
+                "--enable-tvm-ffi",
+            )
+        # T6 plan + T2 tensors rejected: same bk=128 and 4-arg signature,
+        # but different validated_shape.
+        with self.assertRaisesRegex(
+            helion.exc.BackendUnsupported,
+            r"validated_shape=\(8192, 2048, 2048\) \(bk=128\) requires shapes",
+        ):
+            _validate_target1_direct_entry_args(
+                t6_plan,
+                t2_tensors,
+                (2, 1, 74),
+                (256, 1, 1),
+                "--enable-tvm-ffi",
+            )
+        # T2 plan + T6 tensors rejected: same bk=128 and 4-arg signature,
+        # but different validated_shape.
+        with self.assertRaisesRegex(
+            helion.exc.BackendUnsupported,
+            r"validated_shape=\(4096, 2048, 2048\) \(bk=128\) requires shapes",
+        ):
+            _validate_target1_direct_entry_args(
+                t2_plan,
+                t6_tensors,
+                (2, 1, 74),
+                (256, 1, 1),
+                "--enable-tvm-ffi",
+            )
+        # T6 plan + T3 tensors (3 args) rejected: T6 plan requires 4 args.
+        with self.assertRaisesRegex(
+            helion.exc.BackendUnsupported,
+            r"lhs/rhs/output/bias args",
+        ):
+            _validate_target1_direct_entry_args(
+                t6_plan,
+                t3_tensors,
+                (2, 1, 74),
+                (256, 1, 1),
+                "--enable-tvm-ffi",
+            )
+        # T3 plan + T6 tensors (4 args) rejected: T3 plan lacks bias_idx.
+        with self.assertRaisesRegex(
+            helion.exc.BackendUnsupported,
+            r"lhs/rhs/output args",
+        ):
+            _validate_target1_direct_entry_args(
+                t3_plan,
+                t6_tensors,
+                (2, 1, 74),
+                (256, 1, 1),
+                "--enable-tvm-ffi",
+            )
+        # T6 plan + rank-1 4th tensor with wrong N-extent rejected: the
+        # bias's N must match the validated_shape's N (= 2048 for T6).
+        with self.assertRaisesRegex(
+            helion.exc.BackendUnsupported,
+            r"contiguous rank-1 bf16 tensor of shape \(2048,\)",
+        ):
+            _validate_target1_direct_entry_args(
+                t6_plan,
+                (
+                    *t6_tensors[:3],
+                    torch.empty((8192,), device=DEVICE, dtype=torch.bfloat16),
+                ),
+                (2, 1, 74),
+                (256, 1, 1),
+                "--enable-tvm-ffi",
+            )
+        # T7 plan + T3 tensors rejected: same bk=128 + 3-tensor signature
+        # but different validated_shape.
+        with self.assertRaisesRegex(
+            helion.exc.BackendUnsupported,
+            r"validated_shape=\(2048, 8192, 2048\) \(bk=128\) requires shapes",
+        ):
+            _validate_target1_direct_entry_args(
+                t7_plan,
+                t3_tensors,
+                (2, 1, 74),
+                (256, 1, 1),
+                "--enable-tvm-ffi",
+            )
+        # T3 plan + T7 tensors rejected: symmetric to above.
+        with self.assertRaisesRegex(
+            helion.exc.BackendUnsupported,
+            r"validated_shape=\(2048, 4096, 2048\) \(bk=128\) requires shapes",
+        ):
+            _validate_target1_direct_entry_args(
+                t3_plan,
+                t7_tensors,
+                (2, 1, 74),
+                (256, 1, 1),
+                "--enable-tvm-ffi",
+            )
+        # T7 plan + T5 tensors rejected: T5 (1024x8192x1024) and T7
+        # (2048x8192x2048) share N=8192 but differ on M and K, so only
+        # the validated_shape cross-check catches the mismatch.
+        with self.assertRaisesRegex(
+            helion.exc.BackendUnsupported,
+            r"validated_shape=\(2048, 8192, 2048\) \(bk=128\) requires shapes",
+        ):
+            _validate_target1_direct_entry_args(
+                t7_plan,
+                t5_tensors,
+                (2, 1, 74),
+                (256, 1, 1),
+                "--enable-tvm-ffi",
+            )
+        # T5 plan + T7 tensors rejected: symmetric to above.
+        with self.assertRaisesRegex(
+            helion.exc.BackendUnsupported,
+            r"validated_shape=\(1024, 8192, 1024\) \(bk=128\) requires shapes",
+        ):
+            _validate_target1_direct_entry_args(
+                t5_plan,
+                t7_tensors,
+                (2, 1, 74),
+                (256, 1, 1),
+                "--enable-tvm-ffi",
+            )
+        # T7 plan + T6 tensors (4 args) rejected: T7 plan lacks
+        # bias_idx so the validator requires exactly 3 args.
+        with self.assertRaisesRegex(
+            helion.exc.BackendUnsupported,
+            r"lhs/rhs/output args",
+        ):
+            _validate_target1_direct_entry_args(
+                t7_plan,
+                t6_tensors,
+                (2, 1, 74),
+                (256, 1, 1),
+                "--enable-tvm-ffi",
+            )
+        # T6 plan + T7 tensors (3 args) rejected: T6 plan requires 4
+        # args (with bias_idx).
+        with self.assertRaisesRegex(
+            helion.exc.BackendUnsupported,
+            r"lhs/rhs/output/bias args",
+        ):
+            _validate_target1_direct_entry_args(
+                t6_plan,
+                t7_tensors,
+                (2, 1, 74),
+                (256, 1, 1),
+                "--enable-tvm-ffi",
+            )
+        # T1 plan + T7 tensors rejected (bk=64 requires T1 shape).
+        with self.assertRaisesRegex(
+            helion.exc.BackendUnsupported,
+            r"validated_shape=\(1024, 4096, 1024\) \(bk=64\) requires shapes",
+        ):
+            _validate_target1_direct_entry_args(
+                t1_plan,
+                t7_tensors,
+                (2, 1, 64),
+                (256, 1, 1),
+                "--enable-tvm-ffi",
+            )
+        # Unvalidated clustered grid K is also rejected (V1 tightening).
+        with self.assertRaisesRegex(
+            helion.exc.BackendUnsupported,
+            r"validated cluster_m=2 launch geometry",
+        ):
+            _validate_target1_direct_entry_args(
+                t4_plan,
+                t4_tensors,
+                (2, 1, 73),
+                (256, 1, 1),
+                "--enable-tvm-ffi",
+            )
+
+    def test_cute_direct_entry_clustered_grid_accepts_target_total_clusters(
+        self,
+    ) -> None:
+        """A1 (cycle-7 review): the clustered ``grid[2]`` accept set must
+        include every validated ``total_clusters`` value once SM-count is
+        large enough.
+
+        On B200 (148 SMs, cluster_m=2 cap = 74) all validated
+        ``total_clusters`` collapse to the cap. The validator must keep
+        emitting the unclamped accept-set values on a hypothetical
+        larger SKU where ``num_sms // cluster_m >= 256`` so T6's
+        runtime ``grid[2] = 256`` is in the accept set (and T2/T3/T4/T5
+        keep their ``grid[2] = 128``, T1 its ``64``).
+        """
+        from unittest.mock import patch
+
+        FakeDeviceProps = type("FakeDeviceProps", (), {"multi_processor_count": 0})
+
+        # B200-like (148 SMs, cap=74): all targets collapse to 74.
+        b200_props = FakeDeviceProps()
+        b200_props.multi_processor_count = 148
+        with (
+            patch("torch.cuda.is_available", return_value=True),
+            patch("torch.cuda.get_device_properties", return_value=b200_props),
+        ):
+            b200_accepted = _direct_entry_clustered_grid_k(torch.device("cuda:0"))
+        # ``{74} ∪ {min(64, 74), min(128, 74), min(256, 74)}`` = {64, 74}
+        # because every total_clusters >= 74 clamps to 74.
+        self.assertEqual(b200_accepted, (64, 74))
+
+        # Hypothetical larger SKU (520 SMs, cap=260): all four validated
+        # total_clusters fit under the cap, so the unclamped 64, 128, and
+        # 256 values are all in the accept set alongside the cap.
+        large_props = FakeDeviceProps()
+        large_props.multi_processor_count = 520
+        with (
+            patch("torch.cuda.is_available", return_value=True),
+            patch("torch.cuda.get_device_properties", return_value=large_props),
+        ):
+            large_accepted = _direct_entry_clustered_grid_k(torch.device("cuda:0"))
+        self.assertEqual(large_accepted, (64, 128, 256, 260))
+        # T6's runtime ``grid[2] = 256`` is in the accept set on the
+        # hypothetical larger SKU; that's the load-bearing check this
+        # test guards against in case ``TCGEN05_DIRECT_ENTRY_TOTAL_WORK_CLUSTERS``
+        # were to drop 256.
+        self.assertIn(256, large_accepted)
+
+    def test_cute_launcher_reuses_launch_args_for_stable_scalar_signature(
+        self,
+    ) -> None:
+        cute_kernel = type("DummyCuteKernel", (), {})()
+        build_calls: list[tuple[tuple[object, ...], tuple[int, int, int]]] = []
+        launched_args: list[tuple[object, ...]] = []
+
+        class FakeCompiled:
+            def __call__(self, *args: object) -> tuple[str, tuple[object, ...]]:
+                launched_args.append(args)
+                return ("launched", args)
+
+        def fake_build(
+            _cute_kernel: object,
+            args: tuple[object, ...],
+            grid: tuple[int, int, int],
+        ) -> tuple[tuple[tuple[object, ...], ...], tuple[object, ...]]:
+            build_calls.append((args, grid))
+            return (("scalar", "int"),), ("launch-arg", *args, *grid)
+
+        with (
+            patch("helion.runtime._build_cute_schema_and_args", side_effect=fake_build),
+            patch(
+                "helion.runtime._get_compiled_cute_launcher",
+                return_value=FakeCompiled(),
+            ),
+        ):
+            first = default_cute_launcher(cute_kernel, (2,), 7, block=(32, 1, 1))
+            second = default_cute_launcher(cute_kernel, (2,), 7, block=(32, 1, 1))
+            third = default_cute_launcher(cute_kernel, (2,), 8, block=(32, 1, 1))
+
+        self.assertEqual(build_calls, [((7,), (2, 1, 1)), ((8,), (2, 1, 1))])
+        self.assertEqual(
+            launched_args,
+            [
+                ("launch-arg", 7, 2, 1, 1),
+                ("launch-arg", 7, 2, 1, 1),
+                ("launch-arg", 8, 2, 1, 1),
+            ],
+        )
+        self.assertEqual(first, ("launched", ("launch-arg", 7, 2, 1, 1)))
+        self.assertEqual(second, first)
+        self.assertEqual(third, ("launched", ("launch-arg", 8, 2, 1, 1)))
+
+    def test_cute_launcher_launch_arg_cache_distinguishes_signed_zero(
+        self,
+    ) -> None:
+        cute_kernel = type("DummyCuteKernel", (), {})()
+        build_calls: list[tuple[object, ...]] = []
+        launched_args: list[tuple[object, ...]] = []
+
+        class FakeCompiled:
+            def __call__(self, *args: object) -> tuple[str, tuple[object, ...]]:
+                launched_args.append(args)
+                return ("launched", args)
+
+        def fake_build(
+            _cute_kernel: object,
+            args: tuple[object, ...],
+            _grid: tuple[int, int, int],
+        ) -> tuple[tuple[tuple[object, ...], ...], tuple[object, ...]]:
+            build_calls.append(args)
+            return (("scalar", "float"),), (f"float-{len(build_calls)}",)
+
+        with (
+            patch("helion.runtime._build_cute_schema_and_args", side_effect=fake_build),
+            patch(
+                "helion.runtime._get_compiled_cute_launcher",
+                return_value=FakeCompiled(),
+            ),
+        ):
+            positive = default_cute_launcher(cute_kernel, (1,), 0.0)
+            negative = default_cute_launcher(cute_kernel, (1,), -0.0)
+
+        self.assertEqual(build_calls, [(0.0,), (-0.0,)])
+        self.assertEqual(launched_args, [("float-1",), ("float-2",)])
+        self.assertEqual(positive, ("launched", ("float-1",)))
+        self.assertEqual(negative, ("launched", ("float-2",)))
+
+    def test_cute_launcher_sets_arch_env_only_before_first_compile(self) -> None:
+        cute_kernel = type("DummyCuteKernel", (), {})()
+
+        class FakeCompiled:
+            def __call__(self, *args: object) -> tuple[str, tuple[object, ...]]:
+                return ("launched", args)
+
+        with (
+            patch(
+                "helion.runtime._build_cute_schema_and_args",
+                return_value=((("scalar", "int"),), ("launch-arg",)),
+            ),
+            patch("helion.runtime._create_cute_wrapper", return_value="jit-wrapper"),
+            patch("helion.runtime._ensure_cute_dsl_arch_env") as ensure_arch,
+            patch("cutlass.cute.compile", return_value=FakeCompiled()),
+        ):
+            first = default_cute_launcher(cute_kernel, (1,), 7, block=(32, 1, 1))
+            second = default_cute_launcher(cute_kernel, (1,), 7, block=(32, 1, 1))
+
+        self.assertEqual(ensure_arch.call_count, 1)
+        self.assertEqual(first, ("launched", ("launch-arg",)))
+        self.assertEqual(second, first)
+
+    def test_cute_launcher_constexpr_float_cache_distinguishes_signed_zero(
+        self,
+    ) -> None:
+        def cute_kernel(alpha: cutlass.Constexpr) -> None:
+            pass
+
+        created_schema_keys: list[tuple[tuple[object, ...], ...]] = []
+
+        class FakeCompiled:
+            def __call__(self, *args: object) -> tuple[str, tuple[object, ...]]:
+                return ("launched", args)
+
+        def fake_create_wrapper(
+            _cute_kernel: object,
+            schema_key: tuple[tuple[object, ...], ...],
+            _block: tuple[int, int, int],
+        ) -> str:
+            created_schema_keys.append(schema_key)
+            return f"jit-wrapper-{len(created_schema_keys)}"
+
+        with (
+            patch(
+                "helion.runtime._create_cute_wrapper", side_effect=fake_create_wrapper
+            ),
+            patch("helion.runtime._ensure_cute_dsl_arch_env"),
+            patch("cutlass.cute.compile", return_value=FakeCompiled()),
+        ):
+            positive = default_cute_launcher(cute_kernel, (1,), 0.0)
+            negative = default_cute_launcher(cute_kernel, (1,), -0.0)
+
+        self.assertEqual(len(created_schema_keys), 2)
+        self.assertNotEqual(created_schema_keys[0], created_schema_keys[1])
+        self.assertEqual(positive[0], "launched")
+        self.assertEqual(positive[1][:3], (1, 1, 1))
+        self.assertEqual(negative, positive)
+
+    def test_cute_launcher_launch_arg_cache_misses_on_tensor_pointer_change(
+        self,
+    ) -> None:
+        cute_kernel = type("DummyCuteKernel", (), {})()
+        build_calls: list[int] = []
+        launched_args: list[tuple[object, ...]] = []
+        tensor = torch.empty(2, device=DEVICE)
+        other_tensor = torch.empty(2, device=DEVICE)
+        self.assertNotEqual(tensor.data_ptr(), other_tensor.data_ptr())
+
+        class FakeCompiled:
+            def __call__(self, *args: object) -> tuple[str, tuple[object, ...]]:
+                launched_args.append(args)
+                return ("launched", args)
+
+        def fake_build(
+            _cute_kernel: object,
+            args: tuple[object, ...],
+            _grid: tuple[int, int, int],
+        ) -> tuple[tuple[tuple[object, ...], ...], tuple[object, ...]]:
+            build_calls.append(cast("torch.Tensor", args[0]).data_ptr())
+            return (("tensor", "torch.float32", 1),), (f"ptr-{len(build_calls)}",)
+
+        with (
+            patch("helion.runtime._build_cute_schema_and_args", side_effect=fake_build),
+            patch(
+                "helion.runtime._get_compiled_cute_launcher",
+                return_value=FakeCompiled(),
+            ),
+        ):
+            first = default_cute_launcher(cute_kernel, (1,), tensor)
+            second = default_cute_launcher(cute_kernel, (1,), tensor)
+            third = default_cute_launcher(cute_kernel, (1,), other_tensor)
+
+        self.assertEqual(build_calls, [tensor.data_ptr(), other_tensor.data_ptr()])
+        self.assertEqual(launched_args, [("ptr-1",), ("ptr-1",), ("ptr-2",)])
+        self.assertEqual(first, second)
+        self.assertEqual(third, ("launched", ("ptr-2",)))
 
     def test_cute_cluster_shape_from_wrapper_plans(self) -> None:
         self.assertIsNone(_cute_cluster_shape_from_wrapper_plans([]))

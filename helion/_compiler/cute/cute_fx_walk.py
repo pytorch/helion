@@ -39,7 +39,26 @@ import torch
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
+    from ..device_ir import GraphInfo
     from ..inductor_lowering import CodegenState
+
+
+def build_inner_outputs_index_from_graphs(
+    graphs: Sequence[GraphInfo],
+) -> dict[int, tuple[torch.fx.Node | None, ...]]:
+    """Index graph outputs by ``graph_id`` for for-loop getitem hops."""
+    inner_outputs_by_graph_id: dict[int, tuple[torch.fx.Node | None, ...]] = {}
+    for graph_info in graphs:
+        output_nodes = list(graph_info.graph.find_nodes(op="output"))
+        if not output_nodes:
+            continue
+        (output_node,) = output_nodes
+        outs = output_node.args[0] if output_node.args else ()
+        if isinstance(outs, (list, tuple)):
+            inner_outputs_by_graph_id[graph_info.graph_id] = tuple(
+                n if isinstance(n, torch.fx.Node) else None for n in outs
+            )
+    return inner_outputs_by_graph_id
 
 
 def build_inner_outputs_index(
@@ -59,18 +78,7 @@ def build_inner_outputs_index(
     walks would silently stop firing — today ``build_codegen_graphs``
     is the only graph-copy site and runs once per ``to_triton_code``.
     """
-    inner_outputs_by_graph_id: dict[int, tuple[torch.fx.Node | None, ...]] = {}
-    for graph_info in state.codegen.codegen_graphs:
-        output_nodes = list(graph_info.graph.find_nodes(op="output"))
-        if not output_nodes:
-            continue
-        (output_node,) = output_nodes
-        outs = output_node.args[0] if output_node.args else ()
-        if isinstance(outs, (list, tuple)):
-            inner_outputs_by_graph_id[graph_info.graph_id] = tuple(
-                n if isinstance(n, torch.fx.Node) else None for n in outs
-            )
-    return inner_outputs_by_graph_id
+    return build_inner_outputs_index_from_graphs(state.codegen.codegen_graphs)
 
 
 def _resolve_for_loop_getitem(
@@ -125,7 +133,7 @@ def reach_tcgen05_matmul_anchors(
     consume a different loop-output mode.
 
     Used by the loud-failure diagnostic backstop in
-    :mod:`memory_ops` (the ``cute_tcgen05_matmul_fx_nodes`` reach
+    :mod:`memory_ops` (the ``cute_state.matmul_fx_nodes`` reach
     check at the cute store-codegen entry point) and by the splice
     site to recover the unique matmul anchor for the accepted
     chain. The classifier in :mod:`cute_epilogue` uses a separate
@@ -133,7 +141,7 @@ def reach_tcgen05_matmul_anchors(
     to commit to a single carrier path.
     """
     df = state.device_function
-    target_fx_nodes = df.cute_tcgen05_matmul_fx_nodes
+    target_fx_nodes = df.cute_state.matmul_fx_nodes
     if not target_fx_nodes:
         return set()
 

@@ -20,6 +20,7 @@ import torch
 from .. import exc
 from .ast_extension import expr_from_string
 from .cute.tcgen05_constants import TCGEN05_CUBIN_LINEINFO_CONFIG_KEY
+from .cute.tcgen05_constants import TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY
 
 if TYPE_CHECKING:
     from torch._inductor.ops_handler import OpsHandler
@@ -1912,11 +1913,12 @@ class PallasBackend(Backend):
                     output_only_names.append(arg.host_str())
         self._output_only_names = output_only_names
 
-        launcher_args = [*args, f"_output_indices={output_indices}"]
-        launcher_args.append(f"_inplace_indices={inplace_indices}")
-
+        launcher_args = [*args]
         if has_rng_ops:
-            launcher_args.insert(-1, "_rng_seed_buffer")
+            launcher_args.append("_rng_seed_buffer")
+        launcher_args.extend(
+            [f"_output_indices={output_indices}", f"_inplace_indices={inplace_indices}"]
+        )
 
         block_spec_info = self._compute_block_spec_info(sorted_args, config)
         if block_spec_info is not None:
@@ -2645,6 +2647,12 @@ def _active_loop_block_ids(fn: DeviceFunction) -> set[int]:
     return active
 
 
+# Leave broad headroom below the G1 sweep's 3600s subprocess timeout: budget
+# checks happen between inline CuTe compile/benchmark units, then the selected
+# config still has to compile, pass correctness, and run the final benchmark.
+_CUTE_DEFAULT_AUTOTUNE_BUDGET_SECONDS = 600
+
+
 class CuteBackend(Backend):
     """CuTe DSL (CUTLASS Python DSL) code generation backend."""
 
@@ -2663,7 +2671,11 @@ class CuteBackend(Backend):
         plan_layouts(graphs, config, tile_strategy)
 
     def supports_config_key(self, key: str) -> bool:
-        if key == "num_threads" or key.startswith("tcgen05_"):
+        if (
+            key == "num_threads"
+            or key == "cute_vector_widths"
+            or key.startswith("tcgen05_")
+        ):
             return True
         return super().supports_config_key(key)
 
@@ -2737,7 +2749,15 @@ class CuteBackend(Backend):
         force: bool = True,
         **kwargs: object,
     ) -> Config:
-        return super().autotune(bound_kernel, args, force=force, **kwargs)
+        original_budget = bound_kernel.settings.autotune_budget_seconds
+        if bound_kernel.settings.autotune_budget_seconds is None:
+            bound_kernel.settings.autotune_budget_seconds = (
+                _CUTE_DEFAULT_AUTOTUNE_BUDGET_SECONDS
+            )
+        try:
+            return super().autotune(bound_kernel, args, force=force, **kwargs)
+        finally:
+            bound_kernel.settings.autotune_budget_seconds = original_budget
 
     @property
     def function_decorator(self) -> str:
@@ -2764,12 +2784,22 @@ class CuteBackend(Backend):
             "hl": "import helion.language as hl",
             "cutlass": "import cutlass",
             "cute": "import cutlass.cute as cute",
+            "ir": "from cutlass._mlir import ir",
             "_default_cute_launcher": "from helion.runtime import default_cute_launcher as _default_cute_launcher",
             "_next_power_of_2": "from helion._utils import next_power_of_2 as _next_power_of_2",
             "_cute_argreduce_index": "from helion._compiler.cute.reduce_helpers import _cute_argreduce_index",
+            "_helion_tcgen05_pipeline": (
+                "from helion._compiler.cute import tcgen05_pipeline "
+                "as _helion_tcgen05_pipeline"
+            ),
+            "_cute_gelu_erf_exact_f32x2": (
+                "from helion._compiler.cute.epilogue_helpers import "
+                "gelu_erf_exact_f32x2 as _cute_gelu_erf_exact_f32x2"
+            ),
             "_cute_grouped_reduce_shared_tree": "from helion._compiler.cute.reduce_helpers import _cute_grouped_reduce_shared_tree",
             "_cute_grouped_reduce_shared_two_stage": "from helion._compiler.cute.reduce_helpers import _cute_grouped_reduce_shared_two_stage",
             "_cute_grouped_reduce_warp": "from helion._compiler.cute.reduce_helpers import _cute_grouped_reduce_warp",
+            "_cute_pre_vec_fold": "from helion._compiler.cute.reduce_helpers import _cute_pre_vec_fold",
             "_cute_store_shared_remote_x4": "from helion._compiler.cute.cluster_helpers import store_shared_remote_x4 as _cute_store_shared_remote_x4",
             "_cute_issue_clc_query_nomulticast": "from helion._compiler.cute.clc_helpers import issue_clc_query_nomulticast as _cute_issue_clc_query_nomulticast",
             "_cute_inline_asm_elementwise": "from helion._compiler.cute.inline_asm_helpers import inline_asm_elementwise as _cute_inline_asm_elementwise",
@@ -2817,7 +2847,10 @@ class CuteBackend(Backend):
             except NoCurrentFunction:
                 pass
             else:
-                if df.get_cute_tcgen05_store_value(x.id) is not None:
+                if (
+                    df.cute_state.get_tcgen05_store_value(df.variable_aliases(x.id))
+                    is not None
+                ):
                     return x
         return super().cast_ast(x, target_dtype)
 
@@ -3185,8 +3218,27 @@ class CuteBackend(Backend):
 
         def launcher_args_with_compile_options(block_arg: str) -> list[str]:
             launcher_args = [block_arg]
+            compile_options: list[str] = []
             if config.get(TCGEN05_CUBIN_LINEINFO_CONFIG_KEY) is True:
-                launcher_args.append("cute_compile_options='--generate-line-info'")
+                compile_options.append("--generate-line-info")
+            if config.get(TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY) is True:
+                if (
+                    _kernel_specialized_mma_impl(
+                        device_function,
+                        config=device_function.config,
+                    )
+                    != "tcgen05"
+                ):
+                    raise exc.BackendUnsupported(
+                        "cute",
+                        f"{TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY}=True requires "
+                        "tcgen05 CuTe lowering",
+                    )
+                compile_options.append("--enable-tvm-ffi")
+            if compile_options:
+                launcher_args.append(
+                    f"cute_compile_options={' '.join(compile_options)!r}"
+                )
             return launcher_args
 
         block_size_values = {
@@ -3363,7 +3415,7 @@ class CuteBackend(Backend):
             and root_static_threads <= MAX_THREADS_PER_BLOCK
         )
         tcgen05_compact_dims = (
-            device_function.cute_block_shape if specialized_root_tcgen05 else None
+            device_function.cute_state.block_shape if specialized_root_tcgen05 else None
         )
         if referenced_dims != (1, 1, 1):
             dims = referenced_dims

@@ -99,7 +99,7 @@
       "image": "intelgpu/ubuntu-24.04-lts2:2523.40",
       "runtime-version": "xpu",
       "container-options": "--group-add 109 --device=/dev/mem --device=/dev/dri -e ZE_AFFINITY_MASK",
-      "pytorch-version": "pytorch-nightly",
+      "pytorch-version": "pytorch-2.12",
       "alias": "xpu",
       "backend": "triton",
       "triton-repo": "https://github.com/intel/intel-xpu-backend-for-triton.git",

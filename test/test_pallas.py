@@ -444,6 +444,16 @@ def pallas_chunked_add(x: torch.Tensor) -> torch.Tensor:
     return out
 
 
+@helion.kernel(backend="pallas", static_shapes=True)
+def pallas_rand_add(x: torch.Tensor, seed: int) -> torch.Tensor:
+    """Kernel that uses hl.rand to generate random values and add them to x."""
+    out = torch.empty_like(x)
+    (m,) = x.size()
+    for tile_m in hl.tile(m):
+        out[tile_m] = x[tile_m] + hl.rand([tile_m], seed=seed)
+    return out
+
+
 @onlyBackends(["triton", "pallas"])
 @skipUnlessPallas("JAX/Pallas TPU not available")
 class TestPallas(TestCase):
@@ -2776,6 +2786,82 @@ class TestPallas(TestCase):
         )
         torch.testing.assert_close(result, x * coeffs[0] * coeffs[4] * coeffs[5])
 
+    def test_rand_add(self) -> None:
+        """Test kernel using hl.rand (RNG ops) passes _rng_seed_buffer correctly.
+
+        Regression test: the Pallas launcher previously inserted _rng_seed_buffer
+        at position -1 (before _inplace_indices), which put it between
+        _output_indices and _inplace_indices. The fix places _rng_seed_buffer
+        before both _output_indices and _inplace_indices so the Pallas runtime
+        receives arguments in the correct order.
+        """
+        x = torch.randn(1024, device=DEVICE, dtype=torch.float32)
+        _, result = code_and_output(
+            pallas_rand_add,
+            (x, 42),
+            block_sizes=[1024],
+        )
+        # Verify shape and dtype are correct
+        self.assertEqual(result.shape, x.shape)
+        self.assertEqual(result.dtype, x.dtype)
+        # The result should differ from x (random values added)
+        self.assertFalse(torch.allclose(result, x))
+        # All added random values should be in [0, 1), so result >= x and < x + 1
+        self.assertTrue(torch.all(result >= x))
+        self.assertTrue(torch.all(result < x + 1.0))
+
+    def test_broadcast_mask_size1_first_dim(self) -> None:
+        """Mask must not be applied to size-1 broadcast dims (first dim)."""
+
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def k(x: torch.Tensor, bias: torch.Tensor) -> torch.Tensor:
+            out = torch.empty(
+                [x.size(0), bias.size(0)],
+                device=x.device,
+                dtype=x.dtype,
+            )
+            for tile_m, tile_n in hl.tile(out.size()):
+                out[tile_m, tile_n] = x[tile_m, tile_n] + bias[tile_n]
+            return out
+
+        x = torch.randn(1, 10, device=DEVICE, dtype=torch.float32)
+        bias = torch.randn(10, device=DEVICE, dtype=torch.float32)
+        _, result = code_and_output(k, (x, bias), block_sizes=[16, 16])
+        expected = x + bias
+        torch.testing.assert_close(result, expected)
+
+    def test_broadcast_mask_size1_last_dim(self) -> None:
+        """Mask must not be applied to size-1 broadcast dims (last dim)."""
+
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def k(x: torch.Tensor, bias: torch.Tensor, out: torch.Tensor) -> None:
+            for tile_m, tile_n in hl.tile(out.size()):
+                out[tile_m, tile_n] = x[tile_m, tile_n] + bias[tile_n]
+
+        x = torch.randn(10, 1, device=DEVICE, dtype=torch.float32)
+        bias = torch.randn(10, device=DEVICE, dtype=torch.float32)
+        out = torch.zeros(10, 10, device=DEVICE, dtype=torch.float32)
+        code, _result = code_and_output(k, (x, bias, out), block_sizes=[16, 16])
+        expected = x + bias[None, :]
+        torch.testing.assert_close(out, expected)
+
+    def test_broadcast_mask_size1_multiple_dims(self) -> None:
+        """Mask must not be applied to size-1 broadcast dims (multiple dims)."""
+
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def k(x: torch.Tensor, bias: torch.Tensor, out: torch.Tensor) -> None:
+            for tile_0, tile_1, tile_2 in hl.tile(out.size()):
+                tmp0 = x[tile_0, tile_1, tile_2]
+                tmp1 = bias[tile_2].unsqueeze(0).unsqueeze(0)
+                out[tile_0, tile_1, tile_2] = tmp0 + tmp1.to(torch.float32)
+
+        x = torch.randn(1, 10, 1, device=DEVICE, dtype=torch.float32)
+        bias = torch.arange(10, device=DEVICE, dtype=torch.int32)
+        out = torch.zeros(1, 10, 10, device=DEVICE, dtype=torch.float32)
+        code, _result = code_and_output(k, (x, bias, out), block_sizes=[1, 16, 16])
+        expected = x + bias.float()
+        torch.testing.assert_close(out, expected)
+
 
 @skipUnlessPallas("JAX/Pallas TPU not available")
 class TestPallasIndirectGather(TestCase):
@@ -2877,13 +2963,60 @@ class TestPallasIndirectGather(TestCase):
         code_and_output(gather, (indices, table), block_sizes=[128, 256])
 
     @parametrize("static_shapes", (True, False))
-    def test_gather_integer_table_rejected(self, static_shapes: bool) -> None:
-        """Gather on non-floating tables raises at plan time."""
+    def test_gather_int32_table_uses_select_reduce(self, static_shapes: bool) -> None:
+        """Gather on int32 tables uses select-reduce instead of dot."""
         gather = self._gather_2d_kernel(static_shapes=static_shapes)
         table = torch.randint(0, 100, (16, 64), device=DEVICE, dtype=torch.int32)
         indices = torch.randint(0, 16, (256,), device=DEVICE, dtype=torch.int32)
-        with self.assertRaisesRegex(Exception, "must be floating point"):
-            code_and_output(gather, (indices, table), block_sizes=[128, 64])
+        code, result = code_and_output(gather, (indices, table), block_sizes=[128, 64])
+        self.assertIn("one_hot", code)
+        self.assertIn("dtype=jnp.int32", code)
+        self.assertNotIn("dot_general", code)
+        ref = table.cpu()[indices.long().cpu()].to(device=DEVICE)
+        torch.testing.assert_close(result, ref)
+
+    @parametrize("static_shapes", (True, False))
+    def test_gather_int32_5d_table_broadcasts_mask(self, static_shapes: bool) -> None:
+        """Gather on higher-rank int32 tables broadcasts the select mask."""
+
+        @helion.kernel(backend="pallas", static_shapes=static_shapes)
+        def gather(indices: torch.Tensor, table: torch.Tensor) -> torch.Tensor:
+            out = torch.empty(
+                [
+                    indices.size(0),
+                    table.size(1),
+                    table.size(2),
+                    table.size(3),
+                    table.size(4),
+                ],
+                dtype=table.dtype,
+                device=table.device,
+            )
+            for tile_b, tile_i, tile_j, tile_k, tile_l in hl.tile(
+                [
+                    indices.size(0),
+                    table.size(1),
+                    table.size(2),
+                    table.size(3),
+                    table.size(4),
+                ]
+            ):
+                out[tile_b, tile_i, tile_j, tile_k, tile_l] = table[
+                    indices[tile_b], tile_i, tile_j, tile_k, tile_l
+                ]
+            return out
+
+        table = torch.randint(0, 100, (8, 2, 4, 4, 8), device=DEVICE, dtype=torch.int32)
+        indices = torch.randint(0, 8, (8,), device=DEVICE, dtype=torch.int32)
+        code, result = code_and_output(
+            gather,
+            (indices, table),
+            block_sizes=[8, 2, 4, 4, 8],
+        )
+        self.assertEqual(code.count("expand_dims"), 4)
+        self.assertNotIn("dot_general", code)
+        ref = table.cpu()[indices.long().cpu()].to(device=DEVICE)
+        torch.testing.assert_close(result, ref)
 
     @parametrize("static_shapes", (True, False))
     def test_scatter_raises(self, static_shapes: bool) -> None:

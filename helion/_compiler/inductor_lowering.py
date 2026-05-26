@@ -1325,7 +1325,12 @@ class GraphInterpreter(LoweringContext, Interpreter):
 
     def run_node(self, n: Node) -> object:
         if n.op == "call_function":
-            with self._set_current_node(n), n.meta["location"], V.set_current_node(n):
+            with (
+                self.cg.statement_owner_node(n),
+                self._set_current_node(n),
+                n.meta["location"],
+                V.set_current_node(n),
+            ):
                 try:
                     lowering: Lowering = n.meta["lowering"]
                     result = lowering.codegen(self, n)
@@ -1407,12 +1412,14 @@ def codegen_call_with_graph(
                 # Phi nodes will merge variable names from outside the loop, but the old value
                 # of those variables could have usages.
                 copy_name = cg.device_function.new_var(arg.id + "_copy")
-                cg.add_statement(
-                    statement_from_string(f"{copy_name} = {{arg}}", arg=arg)
-                )
+                with cg.statement_owner_node(placeholder):
+                    cg.add_statement(
+                        statement_from_string(f"{copy_name} = {{arg}}", arg=arg)
+                    )
                 new_args.append(expr_from_string(copy_name))
             else:
-                new_args.append(cg.lift(arg))
+                with cg.statement_owner_node(placeholder):
+                    new_args.append(cg.lift(arg))
         return GraphInterpreter(graph, cg).run(*new_args)
 
 
