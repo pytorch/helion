@@ -1233,8 +1233,25 @@ def run_kernel(name: str) -> KernelResult:
         signal.signal(signal.SIGALRM, old_handler)
 
 
+def _print_hbm_probe(label: str) -> None:
+    """Diagnostic: print TPU HBM usage at named lifecycle points.
+
+    Compares shape 0 subprocess (cold device) vs shape N subprocess (post-
+    handoff). Cold subprocess should show min-HBM; if shape N>=1 sees higher
+    start-HBM, that's evidence of leaked device-side state across PjRtClient
+    teardown/restart.
+    """
+    try:
+        summary = torch.tpu._hbm_usage_summary()  # pyrefly: ignore[missing-attribute]
+    except (AttributeError, RuntimeError) as e:
+        print(f"  [hbm-probe@{label}] unavailable: {e}", file=sys.stderr)
+        return
+    print(f"  [hbm-probe@{label}] {summary}", file=sys.stderr)
+
+
 def run_kernel_inner(name: str) -> KernelResult:
     """Run a single kernel benchmark: accuracy check + timing vs baseline."""
+    _print_hbm_probe("run_kernel_inner-start")
     if name not in KERNEL_MAPPINGS:
         return KernelResult(name=name, passed=False, error=f"Unknown kernel: {name}")
 
@@ -1275,6 +1292,7 @@ def run_kernel_inner(name: str) -> KernelResult:
                     error=f"--shape-index={SHAPE_INDEX} out of range (have {len(shapes)} shapes)",
                 )
             shapes = [shapes[SHAPE_INDEX]]
+        _print_hbm_probe("post-shape-alloc")
         all_passed = True
         shape_results: list[ShapeResult] = []
         accuracy_verified = max_mismatch_pct is None or max_mismatch_pct < 1.0
