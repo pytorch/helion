@@ -1,0 +1,253 @@
++ HELION_BACKEND=pallas
++ HELION_PRINT_OUTPUT_CODE=1
++ HELION_AUTOTUNE_EFFORT=none
++ HELION_LOGS=+pallas
++ PYTHONPATH=/home/ymu_google_com/helion
++ python diagnose.py
+----- BEGIN -----
+WARNING: All log messages before absl::InitializeLog() is called are written to STDERR
+I0000 00:00:1779835931.017498 1987994 pjrt_api.cc:96] PJRT_Api is set for device type cpu
+I0000 00:00:1779835931.042949 1987994 pjrt_api.cc:118] GetPjrtApi was found for TPU at /home/ymu_google_com/miniconda3/envs/tpu/lib/python3.12/site-packages/libtpu/libtpu.so
+I0000 00:00:1779835931.042987 1987994 pjrt_api.cc:96] PJRT_Api is set for device type tpu
+I0000 00:00:1779835931.064998 1987994 device_rt.cc:97] PjRt runtime initialization deferred for tpu
+Successfully renamed PrivateUse1 backend to 'tpu'. Device: device(type='tpu')
+Registered Python module for 'tpu'.
+Device type: tpu, Device index: default
+Initializing TPU distributed runtime
+jax 0.9.2
+jax devices: [TpuDevice(id=0, process_index=0, coords=(0,0,0), core_on_chip=0), TpuDevice(id=1, process_index=0, coords=(0,0,0), core_on_chip=1), TpuDevice(id=2, process_index=0, coords=(1,0,0), core_on_chip=0), TpuDevice(id=3, process_index=0, coords=(1,0,0), core_on_chip=1), TpuDevice(id=4, process_index=0, coords=(0,1,0), core_on_chip=0), TpuDevice(id=5, process_index=0, coords=(0,1,0), core_on_chip=1), TpuDevice(id=6, process_index=0, coords=(1,1,0), core_on_chip=0), TpuDevice(id=7, process_index=0, coords=(1,1,0), core_on_chip=1)]
+torch device (DEVICE): tpu
+
+==============================================================================
+=== seed=0
+==============================================================================
+I0000 00:00:1779835934.497181 1987994 pjrt_api.cc:167] The PJRT plugin has PJRT API version 0.108. The framework PJRT API version is 0.104.
+I0000 00:00:1779835934.497789 1987994 pjrt_c_api_client.cc:197] PjRtCApiClient created.
+W0000 00:00:1779835934.497808 1987994 pjrt_state.cc:230] Only using 1 device out of all the 8 addressable devices.
+I0000 00:00:1779835934.529386 1989252 tier2_compilation_cache.cc:149] Tier-2 compilation cache is disabled for world size 1.
+I0000 00:00:1779835934.529415 1989252 tier3_compilation_cache.cc:65] Backup compilation for tier-3 cache read is disabled as tier-3 cache is disabled.
+INPUT  x_padded.shape=(1024, 128)  L_nnz=256
+INPUT  offsets=[0, 45, 93, 147, 148, 152, 212, 216, 256]
+INPUT  seq_lengths=[45, 48, 54, 1, 4, 60, 4, 40]
+/home/ymu_google_com/helion/helion/_compiler/compile_environment.py:238: UserWarning: The 'pallas' backend is experimental and may have limited functionality.
+  warn_once(
+Using default config: @helion.kernel(config=helion.Config(block_sizes=[32, 128], pallas_loop_type='emit_pipeline', pallas_pre_broadcast=False), static_shapes=True)
+# Output code written to: /tmp/torchinductor_ymu_google_com/mg/cmg3vjcez6sw45tsywndjviytmpcz3yznoskdp5k7skz5sjajtc7.py
+from __future__ import annotations
+
+import torch
+import jax.numpy as jnp
+from jax.experimental import pallas as pl
+import jax.lax as lax
+from jax.experimental.pallas import tpu as pltpu
+from helion.runtime import default_pallas_pipeline_launcher as _default_pallas_pipeline_launcher
+
+_BLOCK_SIZE_0 = int(32)
+_BLOCK_SIZE_1 = int(128)
+_BLOCK_SIZE_2 = int(1)
+
+def _helion_jagged_sum_kernel_tpu(x_data, x_offsets, out):
+    # src[jagged_sum_tpu.py:44]: for tile_l in hl.tile(L):
+    pid_0 = pl.program_id(0)
+    offset_0 = pid_0 * _BLOCK_SIZE_0
+    indices_0 = offset_0 + jnp.arange(0, _BLOCK_SIZE_0, dtype=jnp.int32)
+    # src[jagged_sum_tpu.py:48]: for tile_m in hl.tile(M):
+    # src[jagged_sum_tpu.py:49]:     # DMA fetches perfectly aligned block_L x block_M chunk from HBM
+    # src[jagged_sum_tpu.py:50]:     chunk = x_data[tile_l, tile_m]
+    # src[jagged_sum_tpu.py:48-69]: ...
+    _outer_pid_0 = pl.program_id(0)
+
+    def _pipeline_body(_pipeline_indices, x_data_vmem):
+        offset_1 = 0 + _pipeline_indices[0] * _BLOCK_SIZE_1
+        indices_0_copy = indices_0
+        indices_0_copy_0 = indices_0_copy
+        # src[jagged_sum_tpu.py:50]: chunk = x_data[tile_l, tile_m]
+        chunk = x_data_vmem[:, :]
+        # src[jagged_sum_tpu.py:53]: for item_idx in range(N):
+        # src[jagged_sum_tpu.py:54]:     it_start = x_offsets[item_idx]
+        # src[jagged_sum_tpu.py:55]:     it_end = x_offsets[item_idx + 1]
+        # src[jagged_sum_tpu.py:53-69]: ...
+        _outer_pid_0 = pl.program_id(0)
+
+        def _pipeline_body_1(_pipeline_indices):
+            offset_2 = 0 + _pipeline_indices[0] * _BLOCK_SIZE_2
+            offset_2 = 0 + _pipeline_indices[0] * _BLOCK_SIZE_2
+            indices_0_copy_0_copy = indices_0_copy_0
+            chunk_copy = chunk
+            indices_0_copy_0_copy_0 = indices_0_copy_0_copy
+            chunk_copy_0 = chunk_copy
+            # src[jagged_sum_tpu.py:54]: it_start = x_offsets[item_idx]
+            it_start = x_offsets[offset_2]
+            # src[jagged_sum_tpu.py:55]: it_end = x_offsets[item_idx + 1]
+            add = 1 + offset_2
+            it_end = x_offsets[add]
+            # src[jagged_sum_tpu.py:59]: global_row = l_start + hl.arange(block_L)
+            add_1 = 1 + _BLOCK_SIZE_0
+            iota = jnp.arange(0, _BLOCK_SIZE_0, dtype=jnp.int32)
+            v_0 = indices_0_copy_0_copy_0 + iota
+            # src[jagged_sum_tpu.py:60]: mask = (global_row >= it_start) & (global_row < it_end)
+            v_1 = v_0 >= it_start
+            v_2 = v_0 < it_end
+            v_3 = jnp.bitwise_and(v_1, v_2)
+            # src[jagged_sum_tpu.py:65]: safe_chunk = (mask * 1.0)[:, None] * chunk
+            v_4 = lax.convert_element_type(v_3, jnp.float32)
+            v_5 = jnp.array(1.0, dtype=jnp.float32)
+            v_6 = v_4 * v_5
+            subscript = v_6[:, None]
+            v_7 = subscript * chunk_copy_0
+            # src[jagged_sum_tpu.py:66]: partial = safe_chunk.sum(dim=0)
+            partial = lax.convert_element_type(jnp.sum(v_7, axis=0), jnp.float32)
+            # src[jagged_sum_tpu.py:69]: out[item_idx, tile_m] += partial
+            load_2 = out[offset_2, pl.ds(pl.multiple_of(offset_1, _BLOCK_SIZE_1), _BLOCK_SIZE_1)]
+            v_8 = load_2 + partial
+            out[offset_2, pl.ds(pl.multiple_of(offset_1, _BLOCK_SIZE_1), _BLOCK_SIZE_1)] = v_8
+        # src[jagged_sum_tpu.py:53]: for item_idx in range(N):
+        # src[jagged_sum_tpu.py:54]:     it_start = x_offsets[item_idx]
+        # src[jagged_sum_tpu.py:55]:     it_end = x_offsets[item_idx + 1]
+        # src[jagged_sum_tpu.py:53-69]: ...
+        pltpu.emit_pipeline(_pipeline_body_1, grid=((8 - 0 + _BLOCK_SIZE_2 - 1) // _BLOCK_SIZE_2,), _explicit_indices=True)()
+    # src[jagged_sum_tpu.py:48]: for tile_m in hl.tile(M):
+    # src[jagged_sum_tpu.py:49]:     # DMA fetches perfectly aligned block_L x block_M chunk from HBM
+    # src[jagged_sum_tpu.py:50]:     chunk = x_data[tile_l, tile_m]
+    # src[jagged_sum_tpu.py:48-69]: ...
+    pltpu.emit_pipeline(_pipeline_body, grid=((128 - 0 + _BLOCK_SIZE_1 - 1) // _BLOCK_SIZE_1,), in_specs=[pl.BlockSpec((_BLOCK_SIZE_0, _BLOCK_SIZE_1), lambda _j: (_outer_pid_0, _j), pipeline_mode=pl.Buffered(buffer_count=2))], _explicit_indices=True)(x_data)
+
+def jagged_sum_kernel_tpu(x_data: torch.Tensor, x_offsets: torch.Tensor, *, _launcher=_default_pallas_pipeline_launcher):
+    """
+    TPU-optimized jagged sum kernel using the Helion DSL.
+
+    Args:
+        x_data: 2-D tensor of shape (L, M) holding all elements
+        x_offsets: (N + 1) tensor. Row i is the slice
+                   x_data[x_offsets[i] : x_offsets[i+1], :]
+
+    Returns:
+        2-D tensor of shape (N, M) containing the sum of jagged dimension.
+    """
+    # src[jagged_sum_tpu.py:37]: M = x_data.shape[1]
+    M = x_data.shape[1]
+    # src[jagged_sum_tpu.py:38]: N = x_offsets.shape[0] - 1
+    N = x_offsets.shape[0] - 1
+    # src[jagged_sum_tpu.py:39]: L = x_data.shape[0]
+    L = x_data.shape[0]
+    # src[jagged_sum_tpu.py:41]: out = torch.zeros([N, M], dtype=x_data.dtype, device=x_data.device)
+    out = torch.zeros([N, M], dtype=x_data.dtype, device=x_data.device)
+    # src[jagged_sum_tpu.py:44]: for tile_l in hl.tile(L):
+    _BLOCK_SIZE_0 = 32
+    # src[jagged_sum_tpu.py:44]: for tile_l in hl.tile(L):
+    # src[jagged_sum_tpu.py:45]:     l_start = tile_l.index
+    # src[jagged_sum_tpu.py:46]:     block_L = tile_l.block_size
+    # src[jagged_sum_tpu.py:44-69]: ...
+    _launcher(_helion_jagged_sum_kernel_tpu, ((1024 + _BLOCK_SIZE_0 - 1) // _BLOCK_SIZE_0,), x_data, x_offsets, out, _output_indices=[2], _inplace_indices=[2], _block_spec_info=[((32, None), (0, None)), ((None,), (None,)), ((None, None), (None, None))], _ds_pad_dims=[(0, 1, 128, 0), (2, 1, 128, 0)], _smem_arg_indices=[1], _pipeline_arg_indices=[0])
+    # src[jagged_sum_tpu.py:71]: return out
+    return out
+
+def call():
+    from torch._dynamo.testing import rand_strided
+    # src[jagged_sum_tpu.py:22]: def jagged_sum_kernel_tpu(
+    # src[jagged_sum_tpu.py:23]:     x_data: torch.Tensor,
+    # src[jagged_sum_tpu.py:24]:     x_offsets: torch.Tensor,
+    # src[jagged_sum_tpu.py:22-71]: ...
+    x_data = rand_strided(size=(1024, 128), stride=(128, 1), dtype=torch.float32, device='tpu:0')
+    x_offsets = rand_strided(size=(9,), stride=(1,), dtype=torch.int32, device='tpu:0')
+    jagged_sum_kernel_tpu(x_data, x_offsets)
+if __name__ == '__main__':
+    call()
+RESULT max|out - ref(fp64)| = 2.431175e+01
+RESULT bad cells: 1024 / 1024  (100.00%)  @ rtol=0.001 atol=0.001
+RESULT first 10 bad cells:
+   [  0,   0]  ref=+2.506165e+00  out=+0.000000e+00  diff=2.506165e+00
+   [  0,   1]  ref=+7.937676e-02  out=+0.000000e+00  diff=7.937676e-02
+   [  0,   2]  ref=+6.402875e+00  out=+0.000000e+00  diff=6.402875e+00
+   [  0,   3]  ref=+4.186883e+00  out=+0.000000e+00  diff=4.186883e+00
+   [  0,   4]  ref=+6.543723e+00  out=+0.000000e+00  diff=6.543723e+00
+   [  0,   5]  ref=-4.299490e+00  out=+0.000000e+00  diff=4.299490e+00
+   [  0,   6]  ref=+2.676757e+00  out=+0.000000e+00  diff=2.676757e+00
+   [  0,   7]  ref=-7.830895e+00  out=+0.000000e+00  diff=7.830895e+00
+   [  0,   8]  ref=+4.723637e+00  out=+0.000000e+00  diff=4.723637e+00
+   [  0,   9]  ref=-1.609069e+00  out=+0.000000e+00  diff=1.609069e+00
+RESULT bad cells per row: [128, 128, 128, 128, 128, 128, 128, 128]
+RESULT seq_lengths        : [45, 48, 54, 1, 4, 60, 4, 40]
+
+==============================================================================
+=== seed=1
+==============================================================================
+INPUT  x_padded.shape=(1024, 128)  L_nnz=196
+INPUT  offsets=[0, 38, 82, 95, 104, 168, 178, 190, 196]
+INPUT  seq_lengths=[38, 44, 13, 9, 64, 10, 12, 6]
+RESULT max|out - ref(fp64)| = 1.882598e+01
+RESULT bad cells: 1023 / 1024  (99.90%)  @ rtol=0.001 atol=0.001
+RESULT first 10 bad cells:
+   [  0,   0]  ref=-1.691627e+00  out=+0.000000e+00  diff=1.691627e+00
+   [  0,   1]  ref=-7.711236e+00  out=+0.000000e+00  diff=7.711236e+00
+   [  0,   2]  ref=-9.843513e+00  out=+0.000000e+00  diff=9.843513e+00
+   [  0,   3]  ref=+1.311785e+00  out=+0.000000e+00  diff=1.311785e+00
+   [  0,   4]  ref=+3.827656e+00  out=+0.000000e+00  diff=3.827656e+00
+   [  0,   5]  ref=+2.997380e+00  out=+0.000000e+00  diff=2.997380e+00
+   [  0,   6]  ref=+1.623488e+00  out=+0.000000e+00  diff=1.623488e+00
+   [  0,   7]  ref=+1.955304e+00  out=+0.000000e+00  diff=1.955304e+00
+   [  0,   8]  ref=+3.075366e+00  out=+0.000000e+00  diff=3.075366e+00
+   [  0,   9]  ref=+8.973957e+00  out=+0.000000e+00  diff=8.973957e+00
+RESULT bad cells per row: [128, 128, 128, 127, 128, 128, 128, 128]
+RESULT seq_lengths        : [38, 44, 13, 9, 64, 10, 12, 6]
+
+==============================================================================
+=== seed=2
+==============================================================================
+INPUT  x_padded.shape=(1024, 128)  L_nnz=210
+INPUT  offsets=[0, 41, 57, 103, 112, 135, 179, 198, 210]
+INPUT  seq_lengths=[41, 16, 46, 9, 23, 44, 19, 12]
+RESULT max|out - ref(fp64)| = 2.115840e+01
+RESULT bad cells: 1024 / 1024  (100.00%)  @ rtol=0.001 atol=0.001
+RESULT first 10 bad cells:
+   [  0,   0]  ref=-7.594823e+00  out=+0.000000e+00  diff=7.594823e+00
+   [  0,   1]  ref=+6.111785e-01  out=+0.000000e+00  diff=6.111785e-01
+   [  0,   2]  ref=-2.901575e+00  out=+0.000000e+00  diff=2.901575e+00
+   [  0,   3]  ref=+6.911619e+00  out=+0.000000e+00  diff=6.911619e+00
+   [  0,   4]  ref=+6.244213e+00  out=+0.000000e+00  diff=6.244213e+00
+   [  0,   5]  ref=-4.172859e+00  out=+0.000000e+00  diff=4.172859e+00
+   [  0,   6]  ref=-9.728608e+00  out=+0.000000e+00  diff=9.728608e+00
+   [  0,   7]  ref=+3.575836e+00  out=+0.000000e+00  diff=3.575836e+00
+   [  0,   8]  ref=-2.822975e+00  out=+0.000000e+00  diff=2.822975e+00
+   [  0,   9]  ref=-2.600559e+00  out=+0.000000e+00  diff=2.600559e+00
+RESULT bad cells per row: [128, 128, 128, 128, 128, 128, 128, 128]
+RESULT seq_lengths        : [41, 16, 46, 9, 23, 44, 19, 12]
+
+==============================================================================
+=== seed=42
+==============================================================================
+INPUT  x_padded.shape=(1024, 128)  L_nnz=268
+INPUT  offsets=[0, 39, 91, 120, 135, 178, 186, 247, 268]
+INPUT  seq_lengths=[39, 52, 29, 15, 43, 8, 61, 21]
+RESULT max|out - ref(fp64)| = 2.382411e+01
+RESULT bad cells: 1024 / 1024  (100.00%)  @ rtol=0.001 atol=0.001
+RESULT first 10 bad cells:
+   [  0,   0]  ref=+1.018282e+00  out=+0.000000e+00  diff=1.018282e+00
+   [  0,   1]  ref=+1.087065e-01  out=+0.000000e+00  diff=1.087065e-01
+   [  0,   2]  ref=-8.461998e+00  out=+0.000000e+00  diff=8.461998e+00
+   [  0,   3]  ref=-5.300418e+00  out=+0.000000e+00  diff=5.300418e+00
+   [  0,   4]  ref=-5.661171e+00  out=+0.000000e+00  diff=5.661171e+00
+   [  0,   5]  ref=-7.294580e+00  out=+0.000000e+00  diff=7.294580e+00
+   [  0,   6]  ref=+9.485034e+00  out=+0.000000e+00  diff=9.485034e+00
+   [  0,   7]  ref=-4.384329e+00  out=+0.000000e+00  diff=4.384329e+00
+   [  0,   8]  ref=+5.882474e+00  out=+0.000000e+00  diff=5.882474e+00
+   [  0,   9]  ref=+1.234886e+00  out=+0.000000e+00  diff=1.234886e+00
+RESULT bad cells per row: [128, 128, 128, 128, 128, 128, 128, 128]
+RESULT seq_lengths        : [39, 52, 29, 15, 43, 8, 61, 21]
+
+==============================================================================
+=== cross-seed summary
+==============================================================================
+seed= 0  n_bad=1024
+seed= 1  n_bad=1023
+seed= 2  n_bad=1024
+seed=42  n_bad=1024
+  seed[0] vs seed[1]: |same|=False  |intersection|=1023  |sym_diff|=1
+  seed[0] vs seed[2]: |same|=True  |intersection|=1024  |sym_diff|=0
+  seed[0] vs seed[42]: |same|=True  |intersection|=1024  |sym_diff|=0
+I0000 00:00:1779835936.828892 1987994 compilation_cache.cc:354] Compilation cache evicted.
+I0000 00:00:1779835936.828924 1987994 compilation_cache.cc:219] CompilationCache final stats: num_cache_reqs=180
+num_cache_hits=154 {85.5%}
+peak_compilation_memory_bytes=unknown
+
+----- END (exit=1) -----
