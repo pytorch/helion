@@ -302,6 +302,22 @@ def _get_indexing_patterns(state: CodegenState, tensor: torch.Tensor) -> list[ob
     return patterns
 
 
+def _arbitrary_index_pattern_code(
+    pattern: object,
+    idx: object,
+    state: CodegenState,
+    subscript_index: int,
+    in_pipeline: bool,
+) -> str:
+    from helion._utils import is_scalar_index
+
+    if in_pipeline and is_scalar_index(idx):
+        return "0"
+    if isinstance(idx, int):
+        return str(idx)
+    return _index_expr_from_ast(state, subscript_index)
+
+
 def _generated_index_code(
     pattern: object,
     idx: object,
@@ -327,20 +343,22 @@ def _generated_index_code(
         )
 
     if isinstance(pattern, TileIndexWithOffsetPattern):
-        return _tile_index_with_offset_pattern_code(pattern, state, tensor, tensor_dim)
+        return _tile_index_with_offset_pattern_code(
+            pattern, state, tensor, tensor_dim, in_pipeline, pipeline_block_ids
+        )
 
     if isinstance(pattern, TileBeginWithOffsetPattern):
         return _tile_begin_with_offset_pattern_code(
-            pattern, state, subscript_index, tensor_dim
+            pattern, state, subscript_index, tensor_dim, in_pipeline, pipeline_block_ids
         )
 
     if isinstance(pattern, ArbitrarySlicePattern):
         return _slice_code(idx, pattern, state, tensor, tensor_dim)
 
     if isinstance(pattern, ArbitraryIndexPattern):
-        if isinstance(idx, int):
-            return str(idx)
-        return _index_expr_from_ast(state, subscript_index)
+        return _arbitrary_index_pattern_code(
+            pattern, idx, state, subscript_index, in_pipeline
+        )
 
     if isinstance(pattern, IndirectGatherPattern):
         # The gather emitter consumes the tensor index and projects the full
@@ -409,6 +427,8 @@ def _tile_index_with_offset_pattern_code(
     state: CodegenState,
     tensor: torch.Tensor,
     tensor_dim: int,
+    in_pipeline: bool,
+    pipeline_block_ids: set[int],
 ) -> str:
     from helion._compiler.pallas.plan_tiling import TileIndexWithOffsetPattern
 
@@ -424,11 +444,19 @@ def _tile_begin_with_offset_pattern_code(
     state: CodegenState,
     subscript_index: int,
     tensor_dim: int,
+    in_pipeline: bool,
+    pipeline_block_ids: set[int],
 ) -> str:
     from helion._compiler.pallas.plan_tiling import TileBeginWithOffsetPattern
     from helion._compiler.tile_strategy import DeviceLoopState
 
     assert isinstance(pattern, TileBeginWithOffsetPattern)
+
+    block_id = pattern.block_id
+    offset_str = state.device_function.literal_expr(pattern.offset)
+
+    if in_pipeline and block_id in pipeline_block_ids:
+        return offset_str
 
     can_tile = _can_tile_dimension(state, tensor_dim)
 
@@ -437,9 +465,9 @@ def _tile_begin_with_offset_pattern_code(
 
     assert isinstance(pattern.offset, int)
 
-    loops = state.codegen.active_device_loops.get(pattern.block_id)
+    loops = state.codegen.active_device_loops.get(block_id)
     if loops and any(isinstance(loop, DeviceLoopState) for loop in loops):
-        offset = state.codegen.offset_var(pattern.block_id)
+        offset = state.codegen.offset_var(block_id)
         if pattern.offset != 0:
             offset = f"{offset} + {pattern.offset}"
         return offset

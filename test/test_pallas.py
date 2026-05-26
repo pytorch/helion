@@ -462,6 +462,48 @@ def pallas_rand_add(x: torch.Tensor, seed: int) -> torch.Tensor:
     return out
 
 
+@helion.kernel(backend="pallas", static_shapes=True)
+def kernel_output_index_remapping(
+    x: torch.Tensor,  # [batch*heads, seq_len, head_dim]
+    batch: int,
+    heads: int,
+) -> torch.Tensor:
+    """Reshapes a [batch*heads, seq_len, head_dim] tensor to [batch, heads, seq_len, head_dim].
+
+    Iterates over the combined batch*heads dimension and the seq_len dimension.
+    """
+    batch_heads, seq_len, head_dim = x.size()
+    out = torch.empty([batch, heads, seq_len, head_dim], dtype=x.dtype, device=x.device)
+    for bh in hl.grid(batch_heads):
+        b = bh // heads
+        h = bh % heads
+        for tile_m in hl.tile(seq_len):
+            out[b, h, tile_m, :] = x[bh, tile_m, :]
+    return out
+
+
+@helion.kernel(backend="pallas", static_shapes=True)
+def kernel_tile_index_is_blockwise(
+    x: torch.Tensor,
+) -> torch.Tensor:
+    seq_len = x.size(0)
+    out = torch.empty_like(x)
+    for tile_m in hl.tile(seq_len):
+        out[tile_m.index] = x[tile_m.index] + 1.0
+    return out
+
+
+@helion.kernel(backend="pallas", static_shapes=True)
+def kernel_tile_begin_plus_offset_is_elementwise(
+    x: torch.Tensor,
+) -> torch.Tensor:
+    seq_len = x.size(0)
+    out = torch.zeros_like(x)
+    for tile_m in hl.tile(seq_len):
+        out[tile_m.begin + 5] = x[tile_m.begin + 5] + 1.0
+    return out
+
+
 @onlyBackends(["triton", "pallas"])
 @skipUnlessPallas("JAX/Pallas TPU not available")
 class TestPallas(TestCase):
@@ -512,6 +554,65 @@ class TestPallas(TestCase):
             r"Ran out of memory in memory space vmem.*Estimated [0-9.]+MB exceeds",
         ):
             code_and_output(pallas_add_2d, args_fp8, block_sizes=[4096, 8192])
+
+    def test_output_index_remapping_in_pipeline(self) -> None:
+        total_elements = 8 * 128 * 128
+        x = torch.arange(total_elements, device=DEVICE, dtype=torch.bfloat16).view(
+            8, 128, 128
+        )
+        batch = 2
+        heads = 4
+        code, result = code_and_output(
+            kernel_output_index_remapping,
+            (x, batch, heads),
+            block_sizes=[32],
+            pallas_loop_type="emit_pipeline",
+        )
+        expected = x.reshape(batch, heads, 128, 128)
+
+        with self.subTest(name="correctness"):
+            torch.testing.assert_close(result, expected)
+
+        with self.subTest(name="pipeline_emit"):
+            self.assertIn("pltpu.emit_pipeline", code)
+
+        with self.subTest(name="shrunken_blockspec"):
+            self.assertIn(
+                "pl.BlockSpec((1, 1, _BLOCK_SIZE_1, 128), "
+                "lambda _j: (offset_0 // heads, offset_0 % heads, _j, 0)",
+                code,
+            )
+
+        with self.subTest(name="body_vmem_indices"):
+            self.assertIn("out_vmem[0, 0, :, :]", code)
+
+    def test_pipeline_kernel_tile_index_is_blockwise(self) -> None:
+        x = torch.arange(1024, device=DEVICE, dtype=torch.float32)
+        code, result = code_and_output(
+            kernel_tile_index_is_blockwise,
+            (x,),
+            block_sizes=[256],
+            pallas_loop_type="emit_pipeline",
+        )
+        torch.testing.assert_close(result, x + 1.0)
+        self.assertNotIn("pltpu.emit_pipeline", code)
+        self.assertIn("out[:]", code)
+
+    @xfailIfPallasInterpret("numerical mismatch in JAX interpret mode")
+    def test_pipeline_kernel_tile_begin_plus_offset_is_elementwise(self) -> None:
+        x = torch.arange(1024, device=DEVICE, dtype=torch.float32)
+        code, result = code_and_output(
+            kernel_tile_begin_plus_offset_is_elementwise,
+            (x,),
+            block_sizes=[256],
+            pallas_loop_type="emit_pipeline",
+        )
+        expected = torch.zeros_like(x)
+        expected[5::256] = x[5::256] + 1.0
+        torch.testing.assert_close(result, expected)
+        self.assertNotIn("pltpu.emit_pipeline", code)
+        self.assertIn("_smem_arg_indices", code)
+        self.assertIn("out[5]", code)
 
     def test_add_1d(self) -> None:
         args = (torch.randn(1024, device=DEVICE), torch.randn(1024, device=DEVICE))
