@@ -11,19 +11,18 @@ offsets=[0, 3, 10, 15, 24]  L=24
 seq_lengths=[3, 7, 5, 9]
 M_actual=8 M_padded=128
 WARNING: All log messages before absl::InitializeLog() is called are written to STDERR
-I0000 00:00:1779832218.046632 1925779 pjrt_api.cc:96] PJRT_Api is set for device type cpu
-I0000 00:00:1779832218.050682 1925779 pjrt_api.cc:118] GetPjrtApi was found for TPU at /home/ymu_google_com/miniconda3/envs/tpu/lib/python3.12/site-packages/libtpu/libtpu.so
-I0000 00:00:1779832218.050711 1925779 pjrt_api.cc:96] PJRT_Api is set for device type tpu
+I0000 00:00:1779832740.499960 1940725 pjrt_api.cc:96] PJRT_Api is set for device type cpu
+I0000 00:00:1779832740.503976 1940725 pjrt_api.cc:118] GetPjrtApi was found for TPU at /home/ymu_google_com/miniconda3/envs/tpu/lib/python3.12/site-packages/libtpu/libtpu.so
+I0000 00:00:1779832740.504004 1940725 pjrt_api.cc:96] PJRT_Api is set for device type tpu
 Successfully renamed PrivateUse1 backend to 'tpu'. Device: device(type='tpu')
 Registered Python module for 'tpu'.
 Device type: tpu, Device index: default
 Initializing TPU distributed runtime
 KERNEL FAILED — full traceback:
 Traceback (most recent call last):
-  File "/home/ymu_google_com/helion/helion/runtime/pallas_templates/jagged_reduce.py", line 135, in jagged_sum_pallas
+  File "/home/ymu_google_com/helion/helion/runtime/pallas_templates/jagged_reduce.py", line 149, in jagged_sum_pallas
     return pl.pallas_call(
-jax._src.source_info_util.JaxStackTraceBeforeTransformation: ValueError: The Pallas TPU lowering currently requires that the last two dimensions of your block shape are divisible by 8 and 128 respectively, or be equal to the respective dimensions of the overall array. Block spec for outputs in pallas_call JaggedSum-k_16 at /home/ymu_google_com/helion/helion/runtime/pallas_templates/jagged_reduce.py:116 has block shape (Blocked(block_size=1), Blocked(block_size=128)), array shape (4, 128), and index_map { lambda ; a:i32[] b:Ref<smem>{i32[5]}. let  in (a, 0:i32[]) }, in memory space None.
-See details at https://docs.jax.dev/en/latest/pallas/grid_blockspec.html#pallas-blockspec
+jax._src.source_info_util.JaxStackTraceBeforeTransformation: NotImplementedError: Unsupported block dimension type: <class 'jax._src.pallas.core.BoundedSlice'> for block shape: (BoundedSlice(16), Blocked(block_size=128))
 
 The preceding stack trace is the source of the JAX operation that, once transformed by JAX, triggered the following exception.
 
@@ -46,12 +45,9 @@ Traceback (most recent call last):
                     ^^^^^^^^^^^^^^^^^^^^^^
   File "/home/ymu_google_com/miniconda3/envs/tpu/lib/python3.12/site-packages/jax/_src/pallas/mosaic/lowering.py", line 782, in lower_jaxpr_to_module
     lower_jaxpr_into_module(
-  File "/home/ymu_google_com/miniconda3/envs/tpu/lib/python3.12/site-packages/jax/_src/pallas/mosaic/lowering.py", line 836, in lower_jaxpr_into_module
-    _check_block_mappings(
-  File "/home/ymu_google_com/miniconda3/envs/tpu/lib/python3.12/site-packages/jax/_src/pallas/mosaic/lowering.py", line 733, in _check_block_mappings
-    raise ValueError(
-ValueError: The Pallas TPU lowering currently requires that the last two dimensions of your block shape are divisible by 8 and 128 respectively, or be equal to the respective dimensions of the overall array. Block spec for outputs in pallas_call JaggedSum-k_16 at /home/ymu_google_com/helion/helion/runtime/pallas_templates/jagged_reduce.py:116 has block shape (Blocked(block_size=1), Blocked(block_size=128)), array shape (4, 128), and index_map { lambda ; a:i32[] b:Ref<smem>{i32[5]}. let  in (a, 0:i32[]) }, in memory space None.
-See details at https://docs.jax.dev/en/latest/pallas/grid_blockspec.html#pallas-blockspec
+  File "/home/ymu_google_com/miniconda3/envs/tpu/lib/python3.12/site-packages/jax/_src/pallas/mosaic/lowering.py", line 925, in lower_jaxpr_into_module
+    raise NotImplementedError(
+NotImplementedError: Unsupported block dimension type: <class 'jax._src.pallas.core.BoundedSlice'> for block shape: (BoundedSlice(16), Blocked(block_size=128))
 --------------------
 For simplicity, JAX has removed its internal frames from the traceback of the following exception. Set JAX_TRACEBACK_FILTERING=off to include these.
 SUMMARY size='html_example' k_sz=16 rc=1
@@ -64,10 +60,9 @@ seq_lengths=[3, 7, 5, 9]
 M_actual=8 M_padded=128
 KERNEL FAILED — full traceback:
 Traceback (most recent call last):
-  File "/home/ymu_google_com/helion/helion/runtime/pallas_templates/jagged_reduce.py", line 135, in jagged_sum_pallas
+  File "/home/ymu_google_com/helion/helion/runtime/pallas_templates/jagged_reduce.py", line 149, in jagged_sum_pallas
     return pl.pallas_call(
-jax._src.source_info_util.JaxStackTraceBeforeTransformation: ValueError: The Pallas TPU lowering currently requires that the last two dimensions of your block shape are divisible by 8 and 128 respectively, or be equal to the respective dimensions of the overall array. Block spec for outputs in pallas_call JaggedSum-k_64 at /home/ymu_google_com/helion/helion/runtime/pallas_templates/jagged_reduce.py:116 has block shape (Blocked(block_size=1), Blocked(block_size=128)), array shape (4, 128), and index_map { lambda ; a:i32[] b:Ref<smem>{i32[5]}. let  in (a, 0:i32[]) }, in memory space None.
-See details at https://docs.jax.dev/en/latest/pallas/grid_blockspec.html#pallas-blockspec
+jax._src.source_info_util.JaxStackTraceBeforeTransformation: NotImplementedError: Unsupported block dimension type: <class 'jax._src.pallas.core.BoundedSlice'> for block shape: (BoundedSlice(64), Blocked(block_size=128))
 
 The preceding stack trace is the source of the JAX operation that, once transformed by JAX, triggered the following exception.
 
@@ -90,12 +85,9 @@ Traceback (most recent call last):
                     ^^^^^^^^^^^^^^^^^^^^^^
   File "/home/ymu_google_com/miniconda3/envs/tpu/lib/python3.12/site-packages/jax/_src/pallas/mosaic/lowering.py", line 782, in lower_jaxpr_to_module
     lower_jaxpr_into_module(
-  File "/home/ymu_google_com/miniconda3/envs/tpu/lib/python3.12/site-packages/jax/_src/pallas/mosaic/lowering.py", line 836, in lower_jaxpr_into_module
-    _check_block_mappings(
-  File "/home/ymu_google_com/miniconda3/envs/tpu/lib/python3.12/site-packages/jax/_src/pallas/mosaic/lowering.py", line 733, in _check_block_mappings
-    raise ValueError(
-ValueError: The Pallas TPU lowering currently requires that the last two dimensions of your block shape are divisible by 8 and 128 respectively, or be equal to the respective dimensions of the overall array. Block spec for outputs in pallas_call JaggedSum-k_64 at /home/ymu_google_com/helion/helion/runtime/pallas_templates/jagged_reduce.py:116 has block shape (Blocked(block_size=1), Blocked(block_size=128)), array shape (4, 128), and index_map { lambda ; a:i32[] b:Ref<smem>{i32[5]}. let  in (a, 0:i32[]) }, in memory space None.
-See details at https://docs.jax.dev/en/latest/pallas/grid_blockspec.html#pallas-blockspec
+  File "/home/ymu_google_com/miniconda3/envs/tpu/lib/python3.12/site-packages/jax/_src/pallas/mosaic/lowering.py", line 925, in lower_jaxpr_into_module
+    raise NotImplementedError(
+NotImplementedError: Unsupported block dimension type: <class 'jax._src.pallas.core.BoundedSlice'> for block shape: (BoundedSlice(64), Blocked(block_size=128))
 --------------------
 For simplicity, JAX has removed its internal frames from the traceback of the following exception. Set JAX_TRACEBACK_FILTERING=off to include these.
 SUMMARY size='html_example' k_sz=64 rc=1
@@ -108,10 +100,9 @@ seq_lengths=[13, 16, 6, 1]
 M_actual=128 M_padded=128
 KERNEL FAILED — full traceback:
 Traceback (most recent call last):
-  File "/home/ymu_google_com/helion/helion/runtime/pallas_templates/jagged_reduce.py", line 135, in jagged_sum_pallas
+  File "/home/ymu_google_com/helion/helion/runtime/pallas_templates/jagged_reduce.py", line 149, in jagged_sum_pallas
     return pl.pallas_call(
-jax._src.source_info_util.JaxStackTraceBeforeTransformation: ValueError: The Pallas TPU lowering currently requires that the last two dimensions of your block shape are divisible by 8 and 128 respectively, or be equal to the respective dimensions of the overall array. Block spec for outputs in pallas_call JaggedSum-k_16 at /home/ymu_google_com/helion/helion/runtime/pallas_templates/jagged_reduce.py:116 has block shape (Blocked(block_size=1), Blocked(block_size=128)), array shape (4, 128), and index_map { lambda ; a:i32[] b:Ref<smem>{i32[5]}. let  in (a, 0:i32[]) }, in memory space None.
-See details at https://docs.jax.dev/en/latest/pallas/grid_blockspec.html#pallas-blockspec
+jax._src.source_info_util.JaxStackTraceBeforeTransformation: NotImplementedError: Unsupported block dimension type: <class 'jax._src.pallas.core.BoundedSlice'> for block shape: (BoundedSlice(16), Blocked(block_size=128))
 
 The preceding stack trace is the source of the JAX operation that, once transformed by JAX, triggered the following exception.
 
@@ -134,12 +125,9 @@ Traceback (most recent call last):
                     ^^^^^^^^^^^^^^^^^^^^^^
   File "/home/ymu_google_com/miniconda3/envs/tpu/lib/python3.12/site-packages/jax/_src/pallas/mosaic/lowering.py", line 782, in lower_jaxpr_to_module
     lower_jaxpr_into_module(
-  File "/home/ymu_google_com/miniconda3/envs/tpu/lib/python3.12/site-packages/jax/_src/pallas/mosaic/lowering.py", line 836, in lower_jaxpr_into_module
-    _check_block_mappings(
-  File "/home/ymu_google_com/miniconda3/envs/tpu/lib/python3.12/site-packages/jax/_src/pallas/mosaic/lowering.py", line 733, in _check_block_mappings
-    raise ValueError(
-ValueError: The Pallas TPU lowering currently requires that the last two dimensions of your block shape are divisible by 8 and 128 respectively, or be equal to the respective dimensions of the overall array. Block spec for outputs in pallas_call JaggedSum-k_16 at /home/ymu_google_com/helion/helion/runtime/pallas_templates/jagged_reduce.py:116 has block shape (Blocked(block_size=1), Blocked(block_size=128)), array shape (4, 128), and index_map { lambda ; a:i32[] b:Ref<smem>{i32[5]}. let  in (a, 0:i32[]) }, in memory space None.
-See details at https://docs.jax.dev/en/latest/pallas/grid_blockspec.html#pallas-blockspec
+  File "/home/ymu_google_com/miniconda3/envs/tpu/lib/python3.12/site-packages/jax/_src/pallas/mosaic/lowering.py", line 925, in lower_jaxpr_into_module
+    raise NotImplementedError(
+NotImplementedError: Unsupported block dimension type: <class 'jax._src.pallas.core.BoundedSlice'> for block shape: (BoundedSlice(16), Blocked(block_size=128))
 --------------------
 For simplicity, JAX has removed its internal frames from the traceback of the following exception. Set JAX_TRACEBACK_FILTERING=off to include these.
 SUMMARY size='tiny' k_sz=16 rc=1
@@ -152,10 +140,9 @@ seq_lengths=[13, 16, 6, 1]
 M_actual=128 M_padded=128
 KERNEL FAILED — full traceback:
 Traceback (most recent call last):
-  File "/home/ymu_google_com/helion/helion/runtime/pallas_templates/jagged_reduce.py", line 135, in jagged_sum_pallas
+  File "/home/ymu_google_com/helion/helion/runtime/pallas_templates/jagged_reduce.py", line 149, in jagged_sum_pallas
     return pl.pallas_call(
-jax._src.source_info_util.JaxStackTraceBeforeTransformation: ValueError: The Pallas TPU lowering currently requires that the last two dimensions of your block shape are divisible by 8 and 128 respectively, or be equal to the respective dimensions of the overall array. Block spec for outputs in pallas_call JaggedSum-k_64 at /home/ymu_google_com/helion/helion/runtime/pallas_templates/jagged_reduce.py:116 has block shape (Blocked(block_size=1), Blocked(block_size=128)), array shape (4, 128), and index_map { lambda ; a:i32[] b:Ref<smem>{i32[5]}. let  in (a, 0:i32[]) }, in memory space None.
-See details at https://docs.jax.dev/en/latest/pallas/grid_blockspec.html#pallas-blockspec
+jax._src.source_info_util.JaxStackTraceBeforeTransformation: NotImplementedError: Unsupported block dimension type: <class 'jax._src.pallas.core.BoundedSlice'> for block shape: (BoundedSlice(64), Blocked(block_size=128))
 
 The preceding stack trace is the source of the JAX operation that, once transformed by JAX, triggered the following exception.
 
@@ -178,12 +165,9 @@ Traceback (most recent call last):
                     ^^^^^^^^^^^^^^^^^^^^^^
   File "/home/ymu_google_com/miniconda3/envs/tpu/lib/python3.12/site-packages/jax/_src/pallas/mosaic/lowering.py", line 782, in lower_jaxpr_to_module
     lower_jaxpr_into_module(
-  File "/home/ymu_google_com/miniconda3/envs/tpu/lib/python3.12/site-packages/jax/_src/pallas/mosaic/lowering.py", line 836, in lower_jaxpr_into_module
-    _check_block_mappings(
-  File "/home/ymu_google_com/miniconda3/envs/tpu/lib/python3.12/site-packages/jax/_src/pallas/mosaic/lowering.py", line 733, in _check_block_mappings
-    raise ValueError(
-ValueError: The Pallas TPU lowering currently requires that the last two dimensions of your block shape are divisible by 8 and 128 respectively, or be equal to the respective dimensions of the overall array. Block spec for outputs in pallas_call JaggedSum-k_64 at /home/ymu_google_com/helion/helion/runtime/pallas_templates/jagged_reduce.py:116 has block shape (Blocked(block_size=1), Blocked(block_size=128)), array shape (4, 128), and index_map { lambda ; a:i32[] b:Ref<smem>{i32[5]}. let  in (a, 0:i32[]) }, in memory space None.
-See details at https://docs.jax.dev/en/latest/pallas/grid_blockspec.html#pallas-blockspec
+  File "/home/ymu_google_com/miniconda3/envs/tpu/lib/python3.12/site-packages/jax/_src/pallas/mosaic/lowering.py", line 925, in lower_jaxpr_into_module
+    raise NotImplementedError(
+NotImplementedError: Unsupported block dimension type: <class 'jax._src.pallas.core.BoundedSlice'> for block shape: (BoundedSlice(64), Blocked(block_size=128))
 --------------------
 For simplicity, JAX has removed its internal frames from the traceback of the following exception. Set JAX_TRACEBACK_FILTERING=off to include these.
 SUMMARY size='tiny' k_sz=64 rc=1
@@ -196,10 +180,9 @@ seq_lengths=[45, 48, 54, 1, 4, 60, 4, 40]
 M_actual=128 M_padded=128
 KERNEL FAILED — full traceback:
 Traceback (most recent call last):
-  File "/home/ymu_google_com/helion/helion/runtime/pallas_templates/jagged_reduce.py", line 135, in jagged_sum_pallas
+  File "/home/ymu_google_com/helion/helion/runtime/pallas_templates/jagged_reduce.py", line 149, in jagged_sum_pallas
     return pl.pallas_call(
-jax._src.source_info_util.JaxStackTraceBeforeTransformation: ValueError: The Pallas TPU lowering currently requires that the last two dimensions of your block shape are divisible by 8 and 128 respectively, or be equal to the respective dimensions of the overall array. Block spec for outputs in pallas_call JaggedSum-k_16 at /home/ymu_google_com/helion/helion/runtime/pallas_templates/jagged_reduce.py:116 has block shape (Blocked(block_size=1), Blocked(block_size=128)), array shape (8, 128), and index_map { lambda ; a:i32[] b:Ref<smem>{i32[9]}. let  in (a, 0:i32[]) }, in memory space None.
-See details at https://docs.jax.dev/en/latest/pallas/grid_blockspec.html#pallas-blockspec
+jax._src.source_info_util.JaxStackTraceBeforeTransformation: NotImplementedError: Unsupported block dimension type: <class 'jax._src.pallas.core.BoundedSlice'> for block shape: (BoundedSlice(16), Blocked(block_size=128))
 
 The preceding stack trace is the source of the JAX operation that, once transformed by JAX, triggered the following exception.
 
@@ -222,12 +205,9 @@ Traceback (most recent call last):
                     ^^^^^^^^^^^^^^^^^^^^^^
   File "/home/ymu_google_com/miniconda3/envs/tpu/lib/python3.12/site-packages/jax/_src/pallas/mosaic/lowering.py", line 782, in lower_jaxpr_to_module
     lower_jaxpr_into_module(
-  File "/home/ymu_google_com/miniconda3/envs/tpu/lib/python3.12/site-packages/jax/_src/pallas/mosaic/lowering.py", line 836, in lower_jaxpr_into_module
-    _check_block_mappings(
-  File "/home/ymu_google_com/miniconda3/envs/tpu/lib/python3.12/site-packages/jax/_src/pallas/mosaic/lowering.py", line 733, in _check_block_mappings
-    raise ValueError(
-ValueError: The Pallas TPU lowering currently requires that the last two dimensions of your block shape are divisible by 8 and 128 respectively, or be equal to the respective dimensions of the overall array. Block spec for outputs in pallas_call JaggedSum-k_16 at /home/ymu_google_com/helion/helion/runtime/pallas_templates/jagged_reduce.py:116 has block shape (Blocked(block_size=1), Blocked(block_size=128)), array shape (8, 128), and index_map { lambda ; a:i32[] b:Ref<smem>{i32[9]}. let  in (a, 0:i32[]) }, in memory space None.
-See details at https://docs.jax.dev/en/latest/pallas/grid_blockspec.html#pallas-blockspec
+  File "/home/ymu_google_com/miniconda3/envs/tpu/lib/python3.12/site-packages/jax/_src/pallas/mosaic/lowering.py", line 925, in lower_jaxpr_into_module
+    raise NotImplementedError(
+NotImplementedError: Unsupported block dimension type: <class 'jax._src.pallas.core.BoundedSlice'> for block shape: (BoundedSlice(16), Blocked(block_size=128))
 --------------------
 For simplicity, JAX has removed its internal frames from the traceback of the following exception. Set JAX_TRACEBACK_FILTERING=off to include these.
 SUMMARY size='small' k_sz=16 rc=1
@@ -240,10 +220,9 @@ seq_lengths=[45, 48, 54, 1, 4, 60, 4, 40]
 M_actual=128 M_padded=128
 KERNEL FAILED — full traceback:
 Traceback (most recent call last):
-  File "/home/ymu_google_com/helion/helion/runtime/pallas_templates/jagged_reduce.py", line 135, in jagged_sum_pallas
+  File "/home/ymu_google_com/helion/helion/runtime/pallas_templates/jagged_reduce.py", line 149, in jagged_sum_pallas
     return pl.pallas_call(
-jax._src.source_info_util.JaxStackTraceBeforeTransformation: ValueError: The Pallas TPU lowering currently requires that the last two dimensions of your block shape are divisible by 8 and 128 respectively, or be equal to the respective dimensions of the overall array. Block spec for outputs in pallas_call JaggedSum-k_64 at /home/ymu_google_com/helion/helion/runtime/pallas_templates/jagged_reduce.py:116 has block shape (Blocked(block_size=1), Blocked(block_size=128)), array shape (8, 128), and index_map { lambda ; a:i32[] b:Ref<smem>{i32[9]}. let  in (a, 0:i32[]) }, in memory space None.
-See details at https://docs.jax.dev/en/latest/pallas/grid_blockspec.html#pallas-blockspec
+jax._src.source_info_util.JaxStackTraceBeforeTransformation: NotImplementedError: Unsupported block dimension type: <class 'jax._src.pallas.core.BoundedSlice'> for block shape: (BoundedSlice(64), Blocked(block_size=128))
 
 The preceding stack trace is the source of the JAX operation that, once transformed by JAX, triggered the following exception.
 
@@ -266,12 +245,9 @@ Traceback (most recent call last):
                     ^^^^^^^^^^^^^^^^^^^^^^
   File "/home/ymu_google_com/miniconda3/envs/tpu/lib/python3.12/site-packages/jax/_src/pallas/mosaic/lowering.py", line 782, in lower_jaxpr_to_module
     lower_jaxpr_into_module(
-  File "/home/ymu_google_com/miniconda3/envs/tpu/lib/python3.12/site-packages/jax/_src/pallas/mosaic/lowering.py", line 836, in lower_jaxpr_into_module
-    _check_block_mappings(
-  File "/home/ymu_google_com/miniconda3/envs/tpu/lib/python3.12/site-packages/jax/_src/pallas/mosaic/lowering.py", line 733, in _check_block_mappings
-    raise ValueError(
-ValueError: The Pallas TPU lowering currently requires that the last two dimensions of your block shape are divisible by 8 and 128 respectively, or be equal to the respective dimensions of the overall array. Block spec for outputs in pallas_call JaggedSum-k_64 at /home/ymu_google_com/helion/helion/runtime/pallas_templates/jagged_reduce.py:116 has block shape (Blocked(block_size=1), Blocked(block_size=128)), array shape (8, 128), and index_map { lambda ; a:i32[] b:Ref<smem>{i32[9]}. let  in (a, 0:i32[]) }, in memory space None.
-See details at https://docs.jax.dev/en/latest/pallas/grid_blockspec.html#pallas-blockspec
+  File "/home/ymu_google_com/miniconda3/envs/tpu/lib/python3.12/site-packages/jax/_src/pallas/mosaic/lowering.py", line 925, in lower_jaxpr_into_module
+    raise NotImplementedError(
+NotImplementedError: Unsupported block dimension type: <class 'jax._src.pallas.core.BoundedSlice'> for block shape: (BoundedSlice(64), Blocked(block_size=128))
 --------------------
 For simplicity, JAX has removed its internal frames from the traceback of the following exception. Set JAX_TRACEBACK_FILTERING=off to include these.
 SUMMARY size='small' k_sz=64 rc=1
@@ -284,10 +260,9 @@ seq_lengths=[173, 48, 118, 193, 324, 252, 196, 360, 10, 212, 278, 243, 293, 88, 
 M_actual=128 M_padded=128
 KERNEL FAILED — full traceback:
 Traceback (most recent call last):
-  File "/home/ymu_google_com/helion/helion/runtime/pallas_templates/jagged_reduce.py", line 135, in jagged_sum_pallas
+  File "/home/ymu_google_com/helion/helion/runtime/pallas_templates/jagged_reduce.py", line 149, in jagged_sum_pallas
     return pl.pallas_call(
-jax._src.source_info_util.JaxStackTraceBeforeTransformation: ValueError: The Pallas TPU lowering currently requires that the last two dimensions of your block shape are divisible by 8 and 128 respectively, or be equal to the respective dimensions of the overall array. Block spec for outputs in pallas_call JaggedSum-k_16 at /home/ymu_google_com/helion/helion/runtime/pallas_templates/jagged_reduce.py:116 has block shape (Blocked(block_size=1), Blocked(block_size=128)), array shape (32, 128), and index_map { lambda ; a:i32[] b:Ref<smem>{i32[33]}. let  in (a, 0:i32[]) }, in memory space None.
-See details at https://docs.jax.dev/en/latest/pallas/grid_blockspec.html#pallas-blockspec
+jax._src.source_info_util.JaxStackTraceBeforeTransformation: NotImplementedError: Unsupported block dimension type: <class 'jax._src.pallas.core.BoundedSlice'> for block shape: (BoundedSlice(16), Blocked(block_size=128))
 
 The preceding stack trace is the source of the JAX operation that, once transformed by JAX, triggered the following exception.
 
@@ -310,12 +285,9 @@ Traceback (most recent call last):
                     ^^^^^^^^^^^^^^^^^^^^^^
   File "/home/ymu_google_com/miniconda3/envs/tpu/lib/python3.12/site-packages/jax/_src/pallas/mosaic/lowering.py", line 782, in lower_jaxpr_to_module
     lower_jaxpr_into_module(
-  File "/home/ymu_google_com/miniconda3/envs/tpu/lib/python3.12/site-packages/jax/_src/pallas/mosaic/lowering.py", line 836, in lower_jaxpr_into_module
-    _check_block_mappings(
-  File "/home/ymu_google_com/miniconda3/envs/tpu/lib/python3.12/site-packages/jax/_src/pallas/mosaic/lowering.py", line 733, in _check_block_mappings
-    raise ValueError(
-ValueError: The Pallas TPU lowering currently requires that the last two dimensions of your block shape are divisible by 8 and 128 respectively, or be equal to the respective dimensions of the overall array. Block spec for outputs in pallas_call JaggedSum-k_16 at /home/ymu_google_com/helion/helion/runtime/pallas_templates/jagged_reduce.py:116 has block shape (Blocked(block_size=1), Blocked(block_size=128)), array shape (32, 128), and index_map { lambda ; a:i32[] b:Ref<smem>{i32[33]}. let  in (a, 0:i32[]) }, in memory space None.
-See details at https://docs.jax.dev/en/latest/pallas/grid_blockspec.html#pallas-blockspec
+  File "/home/ymu_google_com/miniconda3/envs/tpu/lib/python3.12/site-packages/jax/_src/pallas/mosaic/lowering.py", line 925, in lower_jaxpr_into_module
+    raise NotImplementedError(
+NotImplementedError: Unsupported block dimension type: <class 'jax._src.pallas.core.BoundedSlice'> for block shape: (BoundedSlice(16), Blocked(block_size=128))
 --------------------
 For simplicity, JAX has removed its internal frames from the traceback of the following exception. Set JAX_TRACEBACK_FILTERING=off to include these.
 SUMMARY size='medium' k_sz=16 rc=1
@@ -328,10 +300,9 @@ seq_lengths=[173, 48, 118, 193, 324, 252, 196, 360, 10, 212, 278, 243, 293, 88, 
 M_actual=128 M_padded=128
 KERNEL FAILED — full traceback:
 Traceback (most recent call last):
-  File "/home/ymu_google_com/helion/helion/runtime/pallas_templates/jagged_reduce.py", line 135, in jagged_sum_pallas
+  File "/home/ymu_google_com/helion/helion/runtime/pallas_templates/jagged_reduce.py", line 149, in jagged_sum_pallas
     return pl.pallas_call(
-jax._src.source_info_util.JaxStackTraceBeforeTransformation: ValueError: The Pallas TPU lowering currently requires that the last two dimensions of your block shape are divisible by 8 and 128 respectively, or be equal to the respective dimensions of the overall array. Block spec for outputs in pallas_call JaggedSum-k_64 at /home/ymu_google_com/helion/helion/runtime/pallas_templates/jagged_reduce.py:116 has block shape (Blocked(block_size=1), Blocked(block_size=128)), array shape (32, 128), and index_map { lambda ; a:i32[] b:Ref<smem>{i32[33]}. let  in (a, 0:i32[]) }, in memory space None.
-See details at https://docs.jax.dev/en/latest/pallas/grid_blockspec.html#pallas-blockspec
+jax._src.source_info_util.JaxStackTraceBeforeTransformation: NotImplementedError: Unsupported block dimension type: <class 'jax._src.pallas.core.BoundedSlice'> for block shape: (BoundedSlice(64), Blocked(block_size=128))
 
 The preceding stack trace is the source of the JAX operation that, once transformed by JAX, triggered the following exception.
 
@@ -354,12 +325,9 @@ Traceback (most recent call last):
                     ^^^^^^^^^^^^^^^^^^^^^^
   File "/home/ymu_google_com/miniconda3/envs/tpu/lib/python3.12/site-packages/jax/_src/pallas/mosaic/lowering.py", line 782, in lower_jaxpr_to_module
     lower_jaxpr_into_module(
-  File "/home/ymu_google_com/miniconda3/envs/tpu/lib/python3.12/site-packages/jax/_src/pallas/mosaic/lowering.py", line 836, in lower_jaxpr_into_module
-    _check_block_mappings(
-  File "/home/ymu_google_com/miniconda3/envs/tpu/lib/python3.12/site-packages/jax/_src/pallas/mosaic/lowering.py", line 733, in _check_block_mappings
-    raise ValueError(
-ValueError: The Pallas TPU lowering currently requires that the last two dimensions of your block shape are divisible by 8 and 128 respectively, or be equal to the respective dimensions of the overall array. Block spec for outputs in pallas_call JaggedSum-k_64 at /home/ymu_google_com/helion/helion/runtime/pallas_templates/jagged_reduce.py:116 has block shape (Blocked(block_size=1), Blocked(block_size=128)), array shape (32, 128), and index_map { lambda ; a:i32[] b:Ref<smem>{i32[33]}. let  in (a, 0:i32[]) }, in memory space None.
-See details at https://docs.jax.dev/en/latest/pallas/grid_blockspec.html#pallas-blockspec
+  File "/home/ymu_google_com/miniconda3/envs/tpu/lib/python3.12/site-packages/jax/_src/pallas/mosaic/lowering.py", line 925, in lower_jaxpr_into_module
+    raise NotImplementedError(
+NotImplementedError: Unsupported block dimension type: <class 'jax._src.pallas.core.BoundedSlice'> for block shape: (BoundedSlice(64), Blocked(block_size=128))
 --------------------
 For simplicity, JAX has removed its internal frames from the traceback of the following exception. Set JAX_TRACEBACK_FILTERING=off to include these.
 SUMMARY size='medium' k_sz=64 rc=1
@@ -372,10 +340,9 @@ seq_lengths=[685, 560, 1654, 1217, 836, 764, 1732, 1384, 1034, 1748, 278, 1779, 
 M_actual=128 M_padded=128
 KERNEL FAILED — full traceback:
 Traceback (most recent call last):
-  File "/home/ymu_google_com/helion/helion/runtime/pallas_templates/jagged_reduce.py", line 135, in jagged_sum_pallas
+  File "/home/ymu_google_com/helion/helion/runtime/pallas_templates/jagged_reduce.py", line 149, in jagged_sum_pallas
     return pl.pallas_call(
-jax._src.source_info_util.JaxStackTraceBeforeTransformation: ValueError: The Pallas TPU lowering currently requires that the last two dimensions of your block shape are divisible by 8 and 128 respectively, or be equal to the respective dimensions of the overall array. Block spec for outputs in pallas_call JaggedSum-k_16 at /home/ymu_google_com/helion/helion/runtime/pallas_templates/jagged_reduce.py:116 has block shape (Blocked(block_size=1), Blocked(block_size=128)), array shape (128, 128), and index_map { lambda ; a:i32[] b:Ref<smem>{i32[129]}. let  in (a, 0:i32[]) }, in memory space None.
-See details at https://docs.jax.dev/en/latest/pallas/grid_blockspec.html#pallas-blockspec
+jax._src.source_info_util.JaxStackTraceBeforeTransformation: NotImplementedError: Unsupported block dimension type: <class 'jax._src.pallas.core.BoundedSlice'> for block shape: (BoundedSlice(16), Blocked(block_size=128))
 
 The preceding stack trace is the source of the JAX operation that, once transformed by JAX, triggered the following exception.
 
@@ -398,12 +365,9 @@ Traceback (most recent call last):
                     ^^^^^^^^^^^^^^^^^^^^^^
   File "/home/ymu_google_com/miniconda3/envs/tpu/lib/python3.12/site-packages/jax/_src/pallas/mosaic/lowering.py", line 782, in lower_jaxpr_to_module
     lower_jaxpr_into_module(
-  File "/home/ymu_google_com/miniconda3/envs/tpu/lib/python3.12/site-packages/jax/_src/pallas/mosaic/lowering.py", line 836, in lower_jaxpr_into_module
-    _check_block_mappings(
-  File "/home/ymu_google_com/miniconda3/envs/tpu/lib/python3.12/site-packages/jax/_src/pallas/mosaic/lowering.py", line 733, in _check_block_mappings
-    raise ValueError(
-ValueError: The Pallas TPU lowering currently requires that the last two dimensions of your block shape are divisible by 8 and 128 respectively, or be equal to the respective dimensions of the overall array. Block spec for outputs in pallas_call JaggedSum-k_16 at /home/ymu_google_com/helion/helion/runtime/pallas_templates/jagged_reduce.py:116 has block shape (Blocked(block_size=1), Blocked(block_size=128)), array shape (128, 128), and index_map { lambda ; a:i32[] b:Ref<smem>{i32[129]}. let  in (a, 0:i32[]) }, in memory space None.
-See details at https://docs.jax.dev/en/latest/pallas/grid_blockspec.html#pallas-blockspec
+  File "/home/ymu_google_com/miniconda3/envs/tpu/lib/python3.12/site-packages/jax/_src/pallas/mosaic/lowering.py", line 925, in lower_jaxpr_into_module
+    raise NotImplementedError(
+NotImplementedError: Unsupported block dimension type: <class 'jax._src.pallas.core.BoundedSlice'> for block shape: (BoundedSlice(16), Blocked(block_size=128))
 --------------------
 For simplicity, JAX has removed its internal frames from the traceback of the following exception. Set JAX_TRACEBACK_FILTERING=off to include these.
 SUMMARY size='large' k_sz=16 rc=1
@@ -416,10 +380,9 @@ seq_lengths=[685, 560, 1654, 1217, 836, 764, 1732, 1384, 1034, 1748, 278, 1779, 
 M_actual=128 M_padded=128
 KERNEL FAILED — full traceback:
 Traceback (most recent call last):
-  File "/home/ymu_google_com/helion/helion/runtime/pallas_templates/jagged_reduce.py", line 135, in jagged_sum_pallas
+  File "/home/ymu_google_com/helion/helion/runtime/pallas_templates/jagged_reduce.py", line 149, in jagged_sum_pallas
     return pl.pallas_call(
-jax._src.source_info_util.JaxStackTraceBeforeTransformation: ValueError: The Pallas TPU lowering currently requires that the last two dimensions of your block shape are divisible by 8 and 128 respectively, or be equal to the respective dimensions of the overall array. Block spec for outputs in pallas_call JaggedSum-k_64 at /home/ymu_google_com/helion/helion/runtime/pallas_templates/jagged_reduce.py:116 has block shape (Blocked(block_size=1), Blocked(block_size=128)), array shape (128, 128), and index_map { lambda ; a:i32[] b:Ref<smem>{i32[129]}. let  in (a, 0:i32[]) }, in memory space None.
-See details at https://docs.jax.dev/en/latest/pallas/grid_blockspec.html#pallas-blockspec
+jax._src.source_info_util.JaxStackTraceBeforeTransformation: NotImplementedError: Unsupported block dimension type: <class 'jax._src.pallas.core.BoundedSlice'> for block shape: (BoundedSlice(64), Blocked(block_size=128))
 
 The preceding stack trace is the source of the JAX operation that, once transformed by JAX, triggered the following exception.
 
@@ -442,12 +405,9 @@ Traceback (most recent call last):
                     ^^^^^^^^^^^^^^^^^^^^^^
   File "/home/ymu_google_com/miniconda3/envs/tpu/lib/python3.12/site-packages/jax/_src/pallas/mosaic/lowering.py", line 782, in lower_jaxpr_to_module
     lower_jaxpr_into_module(
-  File "/home/ymu_google_com/miniconda3/envs/tpu/lib/python3.12/site-packages/jax/_src/pallas/mosaic/lowering.py", line 836, in lower_jaxpr_into_module
-    _check_block_mappings(
-  File "/home/ymu_google_com/miniconda3/envs/tpu/lib/python3.12/site-packages/jax/_src/pallas/mosaic/lowering.py", line 733, in _check_block_mappings
-    raise ValueError(
-ValueError: The Pallas TPU lowering currently requires that the last two dimensions of your block shape are divisible by 8 and 128 respectively, or be equal to the respective dimensions of the overall array. Block spec for outputs in pallas_call JaggedSum-k_64 at /home/ymu_google_com/helion/helion/runtime/pallas_templates/jagged_reduce.py:116 has block shape (Blocked(block_size=1), Blocked(block_size=128)), array shape (128, 128), and index_map { lambda ; a:i32[] b:Ref<smem>{i32[129]}. let  in (a, 0:i32[]) }, in memory space None.
-See details at https://docs.jax.dev/en/latest/pallas/grid_blockspec.html#pallas-blockspec
+  File "/home/ymu_google_com/miniconda3/envs/tpu/lib/python3.12/site-packages/jax/_src/pallas/mosaic/lowering.py", line 925, in lower_jaxpr_into_module
+    raise NotImplementedError(
+NotImplementedError: Unsupported block dimension type: <class 'jax._src.pallas.core.BoundedSlice'> for block shape: (BoundedSlice(64), Blocked(block_size=128))
 --------------------
 For simplicity, JAX has removed its internal frames from the traceback of the following exception. Set JAX_TRACEBACK_FILTERING=off to include these.
 SUMMARY size='large' k_sz=64 rc=1

@@ -31,6 +31,9 @@ KERNEL FAILED — full traceback:
 SUMMARY size='large' k_sz=64 rc=1
 
 === last 30 lines of test.log ===
+jax._src.source_info_util.JaxStackTraceBeforeTransformation: NotImplementedError: Unsupported block dimension type: <class 'jax._src.pallas.core.BoundedSlice'> for block shape: (BoundedSlice(64), Blocked(block_size=128))
+
+The preceding stack trace is the source of the JAX operation that, once transformed by JAX, triggered the following exception.
 
 --------------------
 
@@ -51,12 +54,9 @@ Traceback (most recent call last):
                     ^^^^^^^^^^^^^^^^^^^^^^
   File "/home/ymu_google_com/miniconda3/envs/tpu/lib/python3.12/site-packages/jax/_src/pallas/mosaic/lowering.py", line 782, in lower_jaxpr_to_module
     lower_jaxpr_into_module(
-  File "/home/ymu_google_com/miniconda3/envs/tpu/lib/python3.12/site-packages/jax/_src/pallas/mosaic/lowering.py", line 836, in lower_jaxpr_into_module
-    _check_block_mappings(
-  File "/home/ymu_google_com/miniconda3/envs/tpu/lib/python3.12/site-packages/jax/_src/pallas/mosaic/lowering.py", line 733, in _check_block_mappings
-    raise ValueError(
-ValueError: The Pallas TPU lowering currently requires that the last two dimensions of your block shape are divisible by 8 and 128 respectively, or be equal to the respective dimensions of the overall array. Block spec for outputs in pallas_call JaggedSum-k_64 at /home/ymu_google_com/helion/helion/runtime/pallas_templates/jagged_reduce.py:116 has block shape (Blocked(block_size=1), Blocked(block_size=128)), array shape (128, 128), and index_map { lambda ; a:i32[] b:Ref<smem>{i32[129]}. let  in (a, 0:i32[]) }, in memory space None.
-See details at https://docs.jax.dev/en/latest/pallas/grid_blockspec.html#pallas-blockspec
+  File "/home/ymu_google_com/miniconda3/envs/tpu/lib/python3.12/site-packages/jax/_src/pallas/mosaic/lowering.py", line 925, in lower_jaxpr_into_module
+    raise NotImplementedError(
+NotImplementedError: Unsupported block dimension type: <class 'jax._src.pallas.core.BoundedSlice'> for block shape: (BoundedSlice(64), Blocked(block_size=128))
 --------------------
 For simplicity, JAX has removed its internal frames from the traceback of the following exception. Set JAX_TRACEBACK_FILTERING=off to include these.
 SUMMARY size='large' k_sz=64 rc=1
