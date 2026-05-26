@@ -99,11 +99,13 @@ class TestCuteSoftmaxVecHoist(TestCase):
         # And the per-V-lane extract is a bitcast back to Float16.
         self.assertIn("bitcast(cutlass.Float16)", code)
 
-    def test_vec_hoist_v8_falls_back_to_scalar(self) -> None:
-        """V=8 fp16/bf16 must NOT fire because the CuTe DSL's
-        ``nvvm.load.ext`` ICEs at V=8 — see the cap at
-        ``memory_ops.py`` ~line 1263 (``if vec_width > 4: return None``).
-        The codegen must fall back to scalar loads, not crash.
+    def test_vec_hoist_v8_uses_4plus4_split(self) -> None:
+        """V=8 fp16/bf16 cannot use a single ``cute.arch.load`` (the CuTe
+        DSL's ``nvvm.load.ext`` ICEs at V=8), so the codegen lowers it as
+        TWO back-to-back ``cute.arch.load(..., V=4)`` calls (covering vec
+        lanes 0-3 and 4-7).  The SASS scheduler is free to overlap the
+        two LDGs, so per-thread bytes-per-load still hit the full
+        LDG.128 (16 bytes) without invoking the DSL bug.
         """
         x = torch.randn(4096, 8192, device=DEVICE, dtype=HALF_DTYPE)
         code, out = code_and_output(
@@ -115,8 +117,22 @@ class TestCuteSoftmaxVecHoist(TestCase):
         )
         ref = torch.nn.functional.softmax(x, dim=1)
         torch.testing.assert_close(out, ref, atol=1e-2, rtol=1e-2)
-        # No vec load was emitted (V=8 cap).
+        # The single-V=8 load form is still NOT emitted (would ICE).
         self.assertNotIn("ir.VectorType.get([8]", code)
+        # The split-2 path emits TWO V=4 vec loads per outer-lane iter
+        # with the ``_a`` / ``_b`` suffix on the hoist var names.
+        self.assertIn("_tile_unroll_vec_1_0_a = cute.arch.load(", code)
+        self.assertIn("_tile_unroll_vec_1_0_b = cute.arch.load(", code)
+        # Both halves use V=4.
+        self.assertGreaterEqual(
+            code.count("ir.VectorType.get([4], cutlass.Uint16.mlir_type)"),
+            2,
+        )
+        # The constexpr V-loop now runs 8 iters (not 4).
+        self.assertIn("cutlass.range_constexpr(8)", code)
+        # The per-vec-lane extract uses the if-else split selector so the
+        # constexpr loop unroller picks the right half per iter.
+        self.assertIn("if vec_lane_1 < 4 else", code)
 
     def test_vec_hoist_bf16(self) -> None:
         """The vec hoist must also fire for bf16 (also a uint16-backed type)."""
@@ -391,3 +407,139 @@ class TestCuteSoftmaxCorrectness(TestCase):
                 "cute_vector_widths": [1, 4],
             },
         )
+
+
+@onlyBackends(["cute"])
+class TestCuteMultiRowInvestigation(TestCase):
+    """P13: multi-row CTAs were investigated as a way to lift small-N
+    softmax shapes (e.g. (4096, 256)) toward ATen.  The investigation
+    concluded that within the current Helion CuTe launcher architecture,
+    multi-row CTAs do NOT improve wall-clock perf — the bottleneck is
+    the per-launch Python overhead in ``default_cute_launcher`` (~25us
+    per call), not the per-CTA scheduling overhead.
+
+    Findings (CUDA_VISIBLE_DEVICES=7, B200, fp16):
+
+    * Single-row (autotuned: ``block_sizes=[1, 128]``, ``num_threads=[0, 32]``,
+      ``cute_vector_widths=[1, 4]``): 31us wall / 134 GB/s
+      (4.3us GPU kernel time, ~25us Python launcher overhead).
+    * Multi-row 2/4/8/16/32 rows + serialized M (``num_threads=[1, 32]``):
+      31-36us wall / 116-133 GB/s — no improvement.
+    * Multi-row 8 rows + threaded M (``num_threads=[0, 32]``,
+      shared-mem reduce): 48us wall / 87 GB/s — WORSE due to
+      ``_cute_grouped_reduce_shared_two_stage`` cost.
+    * Hand-coded warp-per-row kernel with ``block=(32, M_block, 1)``:
+      kernel time drops to ~2us (NCU) but wall-clock stays at ~34us
+      because the Helion ``_CompiledCuteLauncher.__call__`` +
+      cutlass DSL ``generate_execution_args`` dominate (~30us per call).
+
+    The "warp-per-row" layout (one CUDA warp per row, with
+    ``thread_idx[0]`` = lane in row, ``thread_idx[1]`` = row index)
+    would require structurally swapping the thread-axis assignment
+    between the M-grid loop and the inner N-tile loop in
+    ``CuteNDTileStrategy``.  Even if implemented, the wall-clock gain
+    is bounded by the launcher overhead.
+
+    Future work to close the (4096, 256) gap should target either:
+    (a) reducing the per-call Helion CuTe launcher overhead, or
+    (b) using CUDA graphs / static launcher (not enabled in the
+    autotuner bench mode), or
+    (c) batching multiple shapes into one launch (kernel-level fusion).
+
+    These tests pin the multi-row configs as compilable / correct so
+    that a future architectural change does not silently regress them.
+    """
+
+    def test_multi_row_serial_8_compiles_and_is_correct(self) -> None:
+        """``block_sizes=[8, 128], num_threads=[1, 32]`` — M serialized
+        via a ``for lane_0 in range(8)`` loop inside the kernel.  This
+        is the path the prompt's example targeted; it does compile and
+        produce correct output, but is slower than single-row.
+        """
+        x = torch.randn(4096, 128, device=DEVICE, dtype=HALF_DTYPE)
+        code, out = code_and_output(
+            softmax_two_pass_kernel,
+            (x,),
+            block_sizes=[8, 128],
+            num_threads=[1, 32],
+            cute_vector_widths=[1, 4],
+        )
+        ref = torch.nn.functional.softmax(x, dim=1)
+        torch.testing.assert_close(out, ref, atol=1e-2, rtol=1e-2)
+        # The M-axis is serialized — a ``for lane_0 in range(8):`` loop
+        # wraps the per-row body. (8 = block_sizes[0].)
+        self.assertIn("for lane_0 in range(8):", code)
+        # Warp-reduce IS used (since the M-axis doesn't contribute to
+        # group_span — it's serialized, so group_span = reduce_extent =
+        # 32 → warp-reduce path fires).
+        self.assertIn("cute.arch.warp_reduction_max", code)
+        # The launch is still a single-warp block; only the grid count
+        # is reduced (4096 / 8 = 512 CTAs vs 4096).
+        self.assertIn("block=(32, 1, 1)", code)
+
+    def test_multi_row_threaded_8_compiles_uses_shared_reduce(self) -> None:
+        """``block_sizes=[8, 128], num_threads=[0, 32]`` — M is threaded,
+        so we get ``block=(8, 32, 1)`` (M on thread_idx[0], N on
+        thread_idx[1]).  The inner reduction's strided thread-reduction
+        has pre=8, group_span=256, which dispatches to
+        ``_cute_grouped_reduce_shared_two_stage``.  This is the
+        "P9 finding" path: with the current axis layout the warp
+        boundaries don't align with rows (warp 0 = thread_idx[0..7] x
+        thread_idx[1..3] = data from 8 rows × 4 N-segments), so the
+        per-row reduce needs SMEM.  Slower than single-row.
+
+        Note: a true "warp-per-row" layout would require ``block=(32,
+        8, 1)`` (N on thread_idx[0], M on thread_idx[1]) — but the
+        current ``CuteNDTileStrategy`` claims thread axes in the order
+        M (outer grid) → axis 0, N (inner tile) → axis 1.  Swapping
+        would require new infra in ``_BaseNDTileStrategy._thread_axis_map``.
+        """
+        x = torch.randn(4096, 128, device=DEVICE, dtype=HALF_DTYPE)
+        code, out = code_and_output(
+            softmax_two_pass_kernel,
+            (x,),
+            block_sizes=[8, 128],
+            num_threads=[0, 32],
+            cute_vector_widths=[1, 4],
+        )
+        ref = torch.nn.functional.softmax(x, dim=1)
+        torch.testing.assert_close(out, ref, atol=1e-2, rtol=1e-2)
+        # Block is (M=8 on thread_idx[0], N=32 on thread_idx[1], 1).
+        # NOT the warp-per-row ``(32, 8, 1)`` that would let warp-reduce
+        # fire — this is the "wrong" layout that hits shared-mem reduce.
+        self.assertIn("block=(8, 32, 1)", code)
+        # Reduction goes through shared-memory two-stage path (the
+        # "bad" path the prompt's P9 warned about).
+        self.assertIn("_cute_grouped_reduce_shared_two_stage", code)
+        # group_span = pre * reduce_extent = 8 * 32 = 256.
+        self.assertIn("group_span=256", code)
+
+    def test_single_row_warp_reduce_is_baseline(self) -> None:
+        """Pin the single-row + warp-reduce config that ``CuteTileVecWarpReduceHeuristic``
+        seeds — this is the autotuner's pick for (4096, 256) and the
+        baseline that multi-row attempts had to beat.  Documents the
+        baseline shape so a future regression in heuristic seed coverage
+        would be caught.
+        """
+        x = torch.randn(4096, 128, device=DEVICE, dtype=HALF_DTYPE)
+        code, out = code_and_output(
+            softmax_two_pass_kernel,
+            (x,),
+            block_sizes=[1, 128],
+            num_threads=[0, 32],
+            cute_vector_widths=[1, 4],
+        )
+        ref = torch.nn.functional.softmax(x, dim=1)
+        torch.testing.assert_close(out, ref, atol=1e-2, rtol=1e-2)
+        # One warp per CTA.
+        self.assertIn("block=(32, 1, 1)", code)
+        # Warp reduce, no shared-mem reduction.
+        self.assertIn("cute.arch.warp_reduction_max", code)
+        self.assertNotIn("_cute_grouped_reduce_shared_two_stage", code)
+        # The two-pass fuser must fire here so the consume sweep
+        # reads x from a register cache (only one ``cute.arch.load``).
+        # For (4096, 128) with block_size 128, trip = 1 → fuser bails;
+        # but the larger N=256 path with block_size=128 has trip=2
+        # which fires the fuser.  Document the trip-1 case here so the
+        # fuser path stays explicit.
+        self.assertEqual(code.count("cute.arch.load("), 2)

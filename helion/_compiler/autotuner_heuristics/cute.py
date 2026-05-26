@@ -133,9 +133,16 @@ class CuteReductionTileHeuristic(AutotunerHeuristic):
 def _cute_tile_seed_vec_width_for_dtype(dtype: torch.dtype | None) -> int:
     """V seed for ``CuteNDTileStrategy`` lane-loop vec on a given dtype.
 
-    Returns 4 for fp32 (LDG.128 = 16 bytes), 4 for fp16/bf16 — the cute
-    DSL caps the bf16/fp16 vec unroll path at V=4 (LDG.64) because
-    V=8 hits an ICE inside ``nvvm.load.ext``.  Other dtypes get V=1.
+    Returns 4 for fp32 (LDG.128 = 16 bytes), 4 for fp16/bf16 (LDG.64,
+    8 bytes per thread per outer iter).  Note: V=8 for fp16/bf16 IS now
+    supported via a 2x V=4 split (see
+    ``_cute_register_tile_unroll_vec_hoist_split2``), but the autotuner
+    seed stays at 4 because the split emits two LDG.64s rather than a
+    single LDG.128 — empirically the per-element bookkeeping in the 8-
+    iter constexpr V-loop and the doubled fuser cache offset the
+    extra bytes-per-load.  The split path stays available as a
+    reachable point in the autotuner's V search space for shapes where
+    it does win.
     """
     if dtype is torch.float32:
         return 4
