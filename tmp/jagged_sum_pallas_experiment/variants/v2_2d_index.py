@@ -10,7 +10,6 @@ M dim out (since it's a full take), the load could become a per-row slab.
 from __future__ import annotations
 
 import sys
-import traceback
 from pathlib import Path
 
 import torch
@@ -19,7 +18,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 import helion  # noqa: E402
 import helion.language as hl  # noqa: E402
-from _common import banner, check_close, make_data, reference, report_inputs  # noqa: E402
+from _common import run_all_sizes  # noqa: E402
 
 
 @helion.kernel(autotune_effort="none")
@@ -50,25 +49,10 @@ def jagged_sum_2d_index(
 
 
 def main() -> int:
-    banner("V2 — 2D-index form: x_data[base, :] inside hl.jagged_tile")
-    x_data, x_offsets = make_data()
-    report_inputs(x_data, x_offsets)
-
-    try:
-        out = jagged_sum_2d_index(x_data, x_offsets)
-    except Exception:
-        print("COMPILE/RUN FAILED — full traceback:", flush=True)
-        traceback.print_exc()
-        return 1
-
-    ref = reference(x_data, x_offsets)
-    try:
-        check_close(out, ref)
-    except AssertionError:
-        print("CORRECTNESS FAILED — full traceback:", flush=True)
-        traceback.print_exc()
-        return 2
-    return 0
+    return run_all_sizes(
+        "V2 — 2D-index form: x_data[base, :] inside hl.jagged_tile",
+        jagged_sum_2d_index,
+    )
 
 
 if __name__ == "__main__":

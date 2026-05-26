@@ -20,6 +20,9 @@ OUTDIR="$HERE/outputs"
 mkdir -p "$OUTDIR"
 rm -f "$OUTDIR"/*.log "$OUTDIR"/*.txt 2>/dev/null || true
 
+# Ensure repo on PYTHONPATH for ALL python invocations below (env dump + variants).
+export PYTHONPATH="$REPO_ROOT${PYTHONPATH:+:$PYTHONPATH}"
+
 # -------------------------------------------------------------------------
 # Environment dump (versions, TPU presence, JAX/Pallas availability)
 # -------------------------------------------------------------------------
@@ -91,8 +94,6 @@ export HELION_BACKEND=pallas
 export HELION_PRINT_OUTPUT_CODE=1
 export HELION_DEBUG_DTYPE_ASSERTS=1
 export HELION_LOGS="+pallas"
-# Ensure repo on PYTHONPATH so `import helion` picks up this checkout
-export PYTHONPATH="$REPO_ROOT${PYTHONPATH:+:$PYTHONPATH}"
 
 run_variant() {
   local name="$1"
@@ -126,8 +127,18 @@ SUMMARY="$OUTDIR/_summary.txt"
   for f in "$OUTDIR"/v*.log; do
     name="$(basename "$f" .log)"
     rc_line="$(grep -E "END VARIANT .* exit=" "$f" | tail -1)"
-    last_result="$(grep -E "^RESULT correctness:|COMPILE/RUN FAILED|CORRECTNESS FAILED" "$f" | tail -1)"
-    printf "%-22s %s | %s\n" "$name" "$rc_line" "$last_result"
+    echo "[$name] $rc_line"
+    # Per-size status (set by run_all_sizes in _common.py)
+    if grep -qE "^SIZE '.*': " "$f"; then
+      grep -E "^SIZE '.*': " "$f" | sed 's/^/    /'
+    fi
+    # Compile-time errors (no SIZE line gets printed if compile fails before
+    # the size sweep starts — e.g. v3, v4 fail in propagate_types).
+    err_line="$(grep -E "^helion\.exc\.|^TypeError: Pallas|^[A-Za-z_.]*Error: " "$f" | tail -1)"
+    if [ -n "$err_line" ]; then
+      echo "    err: $err_line"
+    fi
+    echo
   done
 } | tee "$SUMMARY"
 

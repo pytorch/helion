@@ -8,7 +8,6 @@ The printed lowered code tells us which.
 from __future__ import annotations
 
 import sys
-import traceback
 from pathlib import Path
 
 import torch
@@ -18,7 +17,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 import helion  # noqa: E402
 import helion.language as hl  # noqa: E402
-from _common import banner, check_close, make_data, reference, report_inputs  # noqa: E402
+from _common import run_all_sizes  # noqa: E402
 
 
 @helion.kernel(autotune_effort="none")
@@ -50,25 +49,10 @@ def jagged_sum_gather(
 
 
 def main() -> int:
-    banner("V1 — gather-based source (current examples/jagged_sum.py pattern)")
-    x_data, x_offsets = make_data()
-    report_inputs(x_data, x_offsets)
-
-    try:
-        out = jagged_sum_gather(x_data, x_offsets)
-    except Exception:
-        print("COMPILE/RUN FAILED — full traceback:", flush=True)
-        traceback.print_exc()
-        return 1
-
-    ref = reference(x_data, x_offsets)
-    try:
-        check_close(out, ref)
-    except AssertionError:
-        print("CORRECTNESS FAILED — full traceback:", flush=True)
-        traceback.print_exc()
-        return 2
-    return 0
+    return run_all_sizes(
+        "V1 — gather-based source (current examples/jagged_sum.py pattern)",
+        jagged_sum_gather,
+    )
 
 
 if __name__ == "__main__":
