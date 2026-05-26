@@ -2003,6 +2003,633 @@ class TestPallas(TestCase):
             "Three repeat calls must each hit the direct-dispatch path.",
         )
 
+    def test_pallas_direct_call_sig_check_locks_on_static_shapes(self) -> None:
+        """Static-shape kernel locks the per-call sig check on first match.
+
+        G5-launcher-Y squeeze (2026-05-25 plan.md §5 G5-launcher-Y):
+        once the launcher's direct-dispatch path sees one successful
+        ``direct_sig == direct_call.sig`` match on a launcher cache
+        entry, the per-call tuple build + comparison is provably
+        constant-True (the launcher cache is grid-keyed and a
+        grid-stable cache hit on a static-shape kernel implies
+        shape-stable args).  The first match flips
+        ``_DirectCallKernel.sig_locked`` to ``True`` so subsequent calls
+        skip the per-call tuple build + comparison entirely and bump
+        ``helion.runtime._DIRECT_CALL_SIG_CHECKS_SKIPPED``.
+
+        The test asserts: calls 1 (slow path, populates cache) + 2
+        (first direct-dispatch hit, sig matches, lock flips) do NOT
+        bump the skip counter; calls 3..N each skip the sig check and
+        bump the counter exactly once per call.  Output equality is
+        preserved (the lock is safe under static_shapes=True).
+        """
+        from helion import runtime as helion_runtime
+
+        # Define inside the test so the launcher cache is fresh and
+        # not polluted by other tests that bind the same kernel.
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def _matmul_sig_lock_pin(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty(
+                [m, n],
+                device=x.device,
+                dtype=torch.promote_types(x.dtype, y.dtype),
+            )
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = acc
+            return out
+
+        torch.manual_seed(0)
+        x = torch.randn(256, 256, device=DEVICE, dtype=torch.bfloat16)
+        torch.manual_seed(1)
+        y = torch.randn(256, 256, device=DEVICE, dtype=torch.bfloat16)
+
+        bound = _matmul_sig_lock_pin.bind((x, y))
+        config = bound.config_spec.default_config()
+        compiled_fn = bound.compile_config(config)
+
+        helion_runtime._reset_direct_call_sig_checks_skipped()
+        self.assertEqual(helion_runtime._direct_call_sig_checks_skipped(), 0)
+
+        # Call 1: slow path (seeds the JaxCallable cache; no
+        # direct-dispatch yet, no sig check, no skip).
+        reference = compiled_fn(x, y).clone()
+        self.assertEqual(
+            helion_runtime._direct_call_sig_checks_skipped(),
+            0,
+            "First call must be the slow path; no sig check yet.",
+        )
+
+        # Call 2: first direct-dispatch call.  Runs the sig check,
+        # matches, flips ``sig_locked``.  Does NOT bump the skip
+        # counter (the lock only takes effect on subsequent calls).
+        result = compiled_fn(x, y)
+        self.assertTrue(
+            torch.equal(result, reference),
+            "Direct-dispatch first-match call output diverged "
+            "(max_abs_diff="
+            f"{(result.float() - reference.float()).abs().max().item()}).",
+        )
+        self.assertEqual(
+            helion_runtime._direct_call_sig_checks_skipped(),
+            0,
+            "First sig-match call must run the sig check, not skip it.",
+        )
+
+        # Calls 3..N: sig_locked is True; each call skips the per-call
+        # tuple build + comparison and bumps the skip counter.
+        n_repeats = 5
+        for _ in range(n_repeats):
+            result = compiled_fn(x, y)
+            self.assertTrue(
+                torch.equal(result, reference),
+                "Sig-locked direct-dispatch call output diverged "
+                "(max_abs_diff="
+                f"{(result.float() - reference.float()).abs().max().item()}).",
+            )
+        self.assertEqual(
+            helion_runtime._direct_call_sig_checks_skipped(),
+            n_repeats,
+            f"Sig-locked direct-dispatch calls must each skip the "
+            f"sig check; expected {n_repeats} skips, got "
+            f"{helion_runtime._direct_call_sig_checks_skipped()}.",
+        )
+
+    def test_pallas_launcher_caches_output_tensor(self) -> None:
+        """Static-shape kernel caches the per-call output meta placeholder.
+
+        The generated host code's ``torch.empty(..., device='meta')`` for
+        each output-only tensor is hoisted to a one-shot cache slot
+        attached to the inner Helion-emitted function (see the
+        ``output_meta_init_stmts`` block in
+        ``helion/_compiler/generate_ast.py``).  On a
+        ``static_shapes=True`` kernel the output shape / dtype / device
+        are constant across calls, so the meta placeholder is built
+        exactly once on the first call and reused on every subsequent
+        call; the runtime counter
+        ``helion.runtime._OUTPUT_TENSOR_ALLOCATIONS`` is bumped exactly
+        once per cached slot.
+        """
+        from helion import runtime as helion_runtime
+
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def _matmul_output_meta_pin(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty(
+                [m, n],
+                device=x.device,
+                dtype=torch.promote_types(x.dtype, y.dtype),
+            )
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = acc
+            return out
+
+        torch.manual_seed(0)
+        x = torch.randn(256, 256, device=DEVICE, dtype=torch.bfloat16)
+        torch.manual_seed(1)
+        y = torch.randn(256, 256, device=DEVICE, dtype=torch.bfloat16)
+
+        bound = _matmul_output_meta_pin.bind((x, y))
+        config = bound.config_spec.default_config()
+        compiled_fn = bound.compile_config(config)
+
+        helion_runtime._reset_output_tensor_allocations()
+        self.assertEqual(helion_runtime._output_tensor_allocations(), 0)
+
+        # First call populates the cache and bumps the counter once.
+        # Save the result so we can confirm bitwise equality vs a
+        # freshly-compiled baseline (which proves that the cached meta
+        # placeholder does not contaminate the result).
+        reference = compiled_fn(x, y).clone()
+        self.assertEqual(
+            helion_runtime._output_tensor_allocations(),
+            1,
+            "First call must allocate the meta placeholder exactly once.",
+        )
+
+        # Repeat invocations: the cache slot is now populated, so the
+        # ``if out is None`` branch in the generated host code does not
+        # fire and the counter stays at 1.
+        n_repeats = 10
+        for _ in range(n_repeats):
+            result = compiled_fn(x, y)
+            self.assertTrue(
+                torch.equal(result, reference),
+                "Output diverged after cached meta-placeholder reuse "
+                f"(max_abs_diff="
+                f"{(result.float() - reference.float()).abs().max().item()}).",
+            )
+        self.assertEqual(
+            helion_runtime._output_tensor_allocations(),
+            1,
+            f"Repeat calls must reuse the cached meta placeholder; "
+            f"expected exactly 1 allocation across "
+            f"{1 + n_repeats} calls, got "
+            f"{helion_runtime._output_tensor_allocations()}.",
+        )
+
+        # Compare to a freshly-compiled baseline kernel (no caching
+        # state on the inner device function): the result must be
+        # bitwise identical, proving the cache only stores the meta
+        # placeholder (zero-storage metadata only), not any kernel
+        # output bytes.
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def _matmul_output_meta_baseline(
+            x: torch.Tensor, y: torch.Tensor
+        ) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty(
+                [m, n],
+                device=x.device,
+                dtype=torch.promote_types(x.dtype, y.dtype),
+            )
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = acc
+            return out
+
+        bound_baseline = _matmul_output_meta_baseline.bind((x, y))
+        baseline_fn = bound_baseline.compile_config(
+            bound_baseline.config_spec.default_config()
+        )
+        baseline_result = baseline_fn(x, y)
+        self.assertTrue(
+            torch.equal(reference, baseline_result),
+            "Cached-meta result diverged from freshly-compiled baseline "
+            f"(max_abs_diff="
+            f"{(reference.float() - baseline_result.float()).abs().max().item()}).",
+        )
+
+    def test_pallas_direct_call_full_invoke_bakes_on_locked_static_shapes(
+        self,
+    ) -> None:
+        """Static-shape kernel pre-bakes the full locked-path closure.
+
+        G5-launcher-Z squeeze (2026-05-25 plan.md §5 G5-launcher-Z):
+        once the launcher sees a successful sig-lock on the
+        direct-dispatch path, it pre-bakes a ``full_invoke`` closure
+        on ``_DirectCallKernel`` that folds the ``args.contiguous()``
+        walk, the ``call_custom_kernel`` invocation, and the
+        ``out_tree.unflatten`` together with the three locked-path
+        counter bumps into a single function call.  Subsequent
+        launcher invocations short-circuit before
+        ``_pallas_invoke_and_return_fast`` entirely, returning
+        ``direct_call.full_invoke(args)`` directly.
+
+        The test asserts: (a) ``full_invoke`` is ``None`` before the
+        first call; (b) still ``None`` after calls 1 (slow path) and
+        2 (first sig-match, lock flip); (c) populated after call 3
+        (the bake-trigger call); (d) every subsequent call returns a
+        bitwise-identical result; (e) the three test-instrumentation
+        counters fire exactly once per locked invocation (the
+        ``_bump_direct_locked_counters`` batched bump must match the
+        unbatched cycle-28 path's accounting).
+        """
+        from helion import runtime as helion_runtime
+
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def _matmul_full_invoke_pin(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty(
+                [m, n],
+                device=x.device,
+                dtype=torch.promote_types(x.dtype, y.dtype),
+            )
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = acc
+            return out
+
+        torch.manual_seed(0)
+        x = torch.randn(256, 256, device=DEVICE, dtype=torch.bfloat16)
+        torch.manual_seed(1)
+        y = torch.randn(256, 256, device=DEVICE, dtype=torch.bfloat16)
+
+        bound = _matmul_full_invoke_pin.bind((x, y))
+        config = bound.config_spec.default_config()
+        compiled_fn = bound.compile_config(config)
+
+        # The generated host function lives in ``compiled_fn``;
+        # ``compiled_fn.__globals__`` is the generated module
+        # namespace, which holds the inner ``_helion_<host>`` device
+        # function — the object the launcher writes its cache onto.
+        # The exact cache attribute name (``_pallas_cache`` /
+        # ``_pallas_pipeline_cache`` / ``_pallas_fori_cache``) depends
+        # on which ``pallas_loop_type`` the default config picks
+        # (``unroll`` / ``emit_pipeline`` / ``fori_loop``); read
+        # whichever one is populated.
+        _CACHE_ATTRS = (
+            "_pallas_cache",
+            "_pallas_pipeline_cache",
+            "_pallas_fori_cache",
+        )
+
+        def _find_pallas_kernel() -> object:
+            module_globals = compiled_fn.__globals__
+            inner_name = f"_helion_{compiled_fn.__name__}"
+            inner = module_globals.get(inner_name)
+            assert inner is not None, (
+                f"Generated module must export the inner Helion "
+                f"function ``{inner_name}`` from "
+                f"``compiled_fn.__globals__``; found keys "
+                f"{[k for k in module_globals if k.startswith('_helion')]}."
+            )
+            return inner
+
+        def _read_cache(pallas_kernel: object) -> tuple:
+            for attr in _CACHE_ATTRS:
+                cache = getattr(pallas_kernel, attr, None)
+                if cache is not None:
+                    return cache  # type: ignore[return-value]
+            raise AssertionError(
+                f"None of {_CACHE_ATTRS} populated on the inner "
+                f"Helion kernel ``{type(pallas_kernel).__name__}``; "
+                f"available attrs: "
+                f"{[a for a in dir(pallas_kernel) if a.startswith('_pallas')]}."
+            )
+
+        helion_runtime._reset_direct_call_sig_checks_skipped()
+        helion_runtime._reset_call_custom_kernel_direct_hits()
+        helion_runtime._reset_jaxcallable_key_cache_hits()
+
+        # Call 1: slow path; builds the launcher cache, snapshots the
+        # ``_helion_direct_call`` on the JaxCallable subclass, returns
+        # the reference output.  No counters bumped yet.
+        reference = compiled_fn(x, y).clone()
+        pallas_kernel = _find_pallas_kernel()
+        cache = _read_cache(pallas_kernel)
+        # cache tuple shape: (grid, jax_callable, tensor_arg_indices,
+        # arg_to_tensor_pos, fast_path, direct_call).
+        # direct_call is None until the launcher's lazy-lift fires on
+        # call 2.
+        self.assertIsNone(
+            cache[5],
+            "direct_call slot must be None before the lazy lift fires "
+            "(it's populated lazily on call 2).",
+        )
+
+        # Call 2: cache hit, lazy lift of direct_call off the
+        # JaxCallable subclass, sig check matches, lock flips.
+        # full_invoke is NOT baked yet (the launcher only bakes on the
+        # call *after* sig_locked flips to True, since baking requires
+        # the sig_locked precondition to gate the short-circuit).
+        result_2 = compiled_fn(x, y)
+        cache = _read_cache(pallas_kernel)
+        direct_call = cache[5]
+        self.assertIsNotNone(
+            direct_call,
+            "direct_call slot must be populated after the lazy lift on call 2.",
+        )
+        self.assertTrue(
+            direct_call.sig_locked,
+            "sig_locked must flip to True on the first successful sig match (call 2).",
+        )
+        self.assertIsNone(
+            direct_call.full_invoke,
+            "full_invoke must NOT be baked until call 3 (the launcher "
+            "only bakes when sig_locked is already True on entry).",
+        )
+        self.assertTrue(
+            torch.equal(result_2, reference),
+            "Call 2 (first sig-match) output diverged "
+            "(max_abs_diff="
+            f"{(result_2.float() - reference.float()).abs().max().item()}).",
+        )
+
+        # Call 3: bake-trigger call.  Enters the launcher with
+        # sig_locked=True and full_invoke=None, so ``_maybe_bake_full_invoke``
+        # populates ``direct_call.full_invoke`` before dispatching
+        # through ``_pallas_invoke_and_return_fast``'s locked path.
+        # This call still bumps the counters via the locked-path
+        # branch in ``_pallas_invoke_and_return_fast`` (one batch of
+        # three increments).
+        result_3 = compiled_fn(x, y)
+        self.assertIsNotNone(
+            direct_call.full_invoke,
+            "full_invoke must be baked on call 3 (the launcher bakes "
+            "after sig_locked is True and before invoking the locked "
+            "path).",
+        )
+        # Sanity check: the baked closure isn't the
+        # ``_DIRECT_CALL_FULL_INVOKE_UNAVAILABLE`` sentinel (this
+        # matmul fits the pure-output pattern).
+        self.assertIsNot(
+            direct_call.full_invoke,
+            helion_runtime._DIRECT_CALL_FULL_INVOKE_UNAVAILABLE,
+            "full_invoke must be a real closure for a pure-output "
+            "kernel; got the unavailability sentinel.",
+        )
+        self.assertTrue(
+            torch.equal(result_3, reference),
+            "Call 3 (bake-trigger) output diverged "
+            "(max_abs_diff="
+            f"{(result_3.float() - reference.float()).abs().max().item()}).",
+        )
+
+        # Calls 4..N: full_invoke is now baked, so the launcher
+        # short-circuits to ``direct_call.full_invoke(args)`` before
+        # ``_pallas_invoke_and_return_fast``.  Every call still bumps
+        # the three locked counters once (via
+        # ``_bump_direct_locked_counters`` inside the closure).
+        # Snapshot baseline counters for the post-bake-only delta.
+        skipped_before = helion_runtime._direct_call_sig_checks_skipped()
+        direct_hits_before = helion_runtime._call_custom_kernel_direct_hits()
+        keycache_hits_before = helion_runtime._jaxcallable_key_cache_hits()
+        n_repeats = 5
+        for _ in range(n_repeats):
+            result = compiled_fn(x, y)
+            self.assertTrue(
+                torch.equal(result, reference),
+                "Post-bake locked-path call output diverged "
+                "(max_abs_diff="
+                f"{(result.float() - reference.float()).abs().max().item()}).",
+            )
+        # Each post-bake call must bump all three counters exactly
+        # once (the batched ``_bump_direct_locked_counters`` matches
+        # the cycle-28 unbatched three-increment accounting).
+        self.assertEqual(
+            helion_runtime._direct_call_sig_checks_skipped() - skipped_before,
+            n_repeats,
+            f"Post-bake locked-path calls must each bump the sig-skip "
+            f"counter; expected {n_repeats} new skips, got "
+            f"{helion_runtime._direct_call_sig_checks_skipped() - skipped_before}.",
+        )
+        self.assertEqual(
+            helion_runtime._call_custom_kernel_direct_hits() - direct_hits_before,
+            n_repeats,
+            f"Post-bake locked-path calls must each bump the "
+            f"direct-hits counter; expected {n_repeats} new hits, got "
+            f"{helion_runtime._call_custom_kernel_direct_hits() - direct_hits_before}.",
+        )
+        self.assertEqual(
+            helion_runtime._jaxcallable_key_cache_hits() - keycache_hits_before,
+            n_repeats,
+            f"Post-bake locked-path calls must each bump the "
+            f"key-cache counter; expected {n_repeats} new hits, got "
+            f"{helion_runtime._jaxcallable_key_cache_hits() - keycache_hits_before}.",
+        )
+
+    def test_pallas_kernel_decorator_fast_path_skips_bind_on_repeat_calls(
+        self,
+    ) -> None:
+        """Static-shape kernel short-circuits Kernel.__call__ to BoundKernel._run.
+
+        G5-decorator squeeze (2026-05-25 plan.md §5 G5-decorator): once
+        ``Kernel.__call__`` has dispatched one call to a ``BoundKernel``
+        whose ``_run`` is set, the speculative ``_last_bound`` slot is
+        populated with the per-call fingerprint
+        (``_kernel_fast_call_key``) for the args.  Subsequent calls with
+        args matching that fingerprint (per-tensor
+        ``dtype/shape/stride/device`` + per-scalar value identity) skip
+        ``Kernel.bind`` (which spends ~12-20us on
+        ``_base_specialization_key`` / ``_device_specialization_key`` /
+        ``_get_bound_kernel_cache_key``) and
+        ``BoundKernel.__call__`` (which costs an attribute load + an
+        ``is None`` check) entirely, routing through the
+        ``_last_bound[1]._run(*args)`` direct dispatch.  The counter
+        ``helion.runtime._kernel_fast_path_hits()`` bumps once per
+        shortcut.
+
+        The test asserts: call 1 goes through the slow ``bind`` path
+        (counter stays at 0); calls 2..N each shortcut and bump the
+        counter exactly once per call.  Output equality is preserved
+        (the bypass is safe under static_shapes=True because the
+        fingerprint captures exactly what the slow
+        ``_base_specialization_key`` derives from for tensor args).
+        """
+        from helion import runtime as helion_runtime
+
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def _matmul_decorator_fast_path_pin(
+            x: torch.Tensor, y: torch.Tensor
+        ) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty(
+                [m, n],
+                device=x.device,
+                dtype=torch.promote_types(x.dtype, y.dtype),
+            )
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = acc
+            return out
+
+        torch.manual_seed(0)
+        x = torch.randn(256, 256, device=DEVICE, dtype=torch.bfloat16)
+        torch.manual_seed(1)
+        y = torch.randn(256, 256, device=DEVICE, dtype=torch.bfloat16)
+
+        # Pin the slow-path fingerprint installer: before any call,
+        # ``_last_bound`` must be ``None`` (no speculative cache).
+        self.assertIsNone(
+            _matmul_decorator_fast_path_pin._last_bound,
+            "Fast-path slot must be None before the first call.",
+        )
+
+        helion_runtime._reset_kernel_fast_path_hits()
+        self.assertEqual(helion_runtime._kernel_fast_path_hits(), 0)
+
+        # Call 1: slow path (autotune / compile / set_config /
+        # _run := compiled_fn).  After the call, ``_last_bound`` is
+        # installed with the fingerprint for ``(x, y)``.  The counter
+        # is still 0 — the slow path itself does not bump it.
+        reference = _matmul_decorator_fast_path_pin(x, y).clone()
+        self.assertEqual(
+            helion_runtime._kernel_fast_path_hits(),
+            0,
+            "First call must run the slow ``bind`` path; counter must not bump.",
+        )
+        self.assertIsNotNone(
+            _matmul_decorator_fast_path_pin._last_bound,
+            "Fast-path slot must be populated after the first call "
+            "completes (the slow path installs ``_last_bound`` once "
+            "``BoundKernel._run`` is set).",
+        )
+
+        # Calls 2..N: ``_last_bound`` is populated and the per-call
+        # fingerprint matches, so each call shortcuts to
+        # ``last[1]._run(*args)`` and bumps the counter.
+        n_repeats = 10
+        for _ in range(n_repeats):
+            result = _matmul_decorator_fast_path_pin(x, y)
+            self.assertTrue(
+                torch.equal(result, reference),
+                "Decorator fast-path call output diverged "
+                "(max_abs_diff="
+                f"{(result.float() - reference.float()).abs().max().item()}).",
+            )
+        self.assertEqual(
+            helion_runtime._kernel_fast_path_hits(),
+            n_repeats,
+            f"Each post-warmup call must bump the decorator fast-path "
+            f"counter exactly once; expected {n_repeats} hits, got "
+            f"{helion_runtime._kernel_fast_path_hits()}.",
+        )
+
+        # Sanity: a shape-changing call must miss the fast path
+        # (different fingerprint) and route back through the slow
+        # ``bind`` path.  The counter must NOT bump on that call.
+        x2 = torch.randn(128, 128, device=DEVICE, dtype=torch.bfloat16)
+        y2 = torch.randn(128, 128, device=DEVICE, dtype=torch.bfloat16)
+        hits_before_miss = helion_runtime._kernel_fast_path_hits()
+        _ = _matmul_decorator_fast_path_pin(x2, y2)
+        self.assertEqual(
+            helion_runtime._kernel_fast_path_hits(),
+            hits_before_miss,
+            "Shape-changing call must miss the fast path; counter must not bump.",
+        )
+
+        # Bail #1: passing kwargs forces ``Kernel.__call__`` through
+        # ``normalize_args`` and the slow ``bind`` path; the fast-path
+        # check is skipped (the speculative cache is keyed on positional
+        # args only).  After the kwargs call ``_last_bound`` is
+        # refreshed for the normalized positional form, so the
+        # immediately-following positional call hits the fast path
+        # again.  Pinned so a future change to the kwargs branch can't
+        # silently break the bail.
+        hits_before_kwargs = helion_runtime._kernel_fast_path_hits()
+        _ = _matmul_decorator_fast_path_pin(x=x, y=y)
+        self.assertEqual(
+            helion_runtime._kernel_fast_path_hits(),
+            hits_before_kwargs,
+            "kwargs call must bail out of the fast path; counter must "
+            "not bump on the kwargs invocation itself.",
+        )
+
+    def test_pallas_kernel_decorator_fast_path_bails_on_key_fn(self) -> None:
+        """Kernels created with ``helion.kernel(key=...)`` skip the fast path.
+
+        G5-decorator bail: the speculative single-bound-kernel cache
+        only fingerprints ``(dtype, shape, stride, device)`` per tensor
+        (and the literal value for primitives / ``ConstExpr``).  A
+        user-supplied ``key=`` extractor passed to ``helion.kernel``
+        can derive its bucket from tensor *values* (e.g. a heuristic
+        that picks a different config based on a hash of the input),
+        so two calls with identical metadata may legitimately need
+        different ``BoundKernel`` instances.  ``Kernel.__call__`` must
+        bail at the top before consulting ``_last_bound`` whenever
+        ``self._key_fn is not None``, and must NOT install
+        ``_last_bound`` on the post-call refresh either.
+
+        The test asserts both bails by inspecting ``_last_bound``
+        across a sequence of calls on a kernel with a ``key=`` fn:
+        the slot stays ``None`` permanently and the counter never
+        bumps.
+        """
+        from helion import runtime as helion_runtime
+
+        @helion.kernel(
+            backend="pallas",
+            static_shapes=True,
+            key=lambda x, y: ("static-key",),
+        )
+        def _matmul_decorator_keyfn_pin(
+            x: torch.Tensor, y: torch.Tensor
+        ) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty(
+                [m, n],
+                device=x.device,
+                dtype=torch.promote_types(x.dtype, y.dtype),
+            )
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = acc
+            return out
+
+        torch.manual_seed(0)
+        x = torch.randn(256, 256, device=DEVICE, dtype=torch.bfloat16)
+        torch.manual_seed(1)
+        y = torch.randn(256, 256, device=DEVICE, dtype=torch.bfloat16)
+
+        helion_runtime._reset_kernel_fast_path_hits()
+        self.assertEqual(helion_runtime._kernel_fast_path_hits(), 0)
+        self.assertIsNone(_matmul_decorator_keyfn_pin._last_bound)
+
+        # 1 warmup + 5 hot calls.  None should touch the fast path.
+        reference = _matmul_decorator_keyfn_pin(x, y).clone()
+        for _ in range(5):
+            result = _matmul_decorator_keyfn_pin(x, y)
+            self.assertTrue(
+                torch.equal(result, reference),
+                "Key-fn kernel call output diverged "
+                f"(max_abs_diff="
+                f"{(result.float() - reference.float()).abs().max().item()}).",
+            )
+
+        self.assertEqual(
+            helion_runtime._kernel_fast_path_hits(),
+            0,
+            "Key-fn kernels must skip the decorator fast path; counter "
+            "must stay at 0 across warmup + 5 hot calls.",
+        )
+        self.assertIsNone(
+            _matmul_decorator_keyfn_pin._last_bound,
+            "Key-fn kernels must NOT populate ``_last_bound`` either "
+            "(the post-call install path is gated on the same "
+            "``_key_fn is None`` precondition as the cache-check).",
+        )
+
     def test_bmm(self) -> None:
         """Test BMM with default config — exercises size_matches fix.
 

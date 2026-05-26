@@ -1157,6 +1157,12 @@ class PallasBackend(Backend):
             "_default_pallas_launcher": "from helion.runtime import default_pallas_launcher as _default_pallas_launcher",
             "_default_pallas_pipeline_launcher": "from helion.runtime import default_pallas_pipeline_launcher as _default_pallas_pipeline_launcher",
             "_default_pallas_fori_launcher": "from helion.runtime import default_pallas_fori_launcher as _default_pallas_fori_launcher",
+            # Generated host code for ``static_shapes=True`` Pallas kernels
+            # caches the per-output-only meta placeholder on the inner
+            # device function and bumps ``_OUTPUT_TENSOR_ALLOCATIONS`` on
+            # first allocation via ``_helion_runtime._bump_output_tensor_allocations()``;
+            # see the ``output_meta_init_stmts`` block in ``generate_ast.py``.
+            "_helion_runtime": "import helion.runtime as _helion_runtime",
         }
 
     # Config keys that Pallas actually uses.  Everything else

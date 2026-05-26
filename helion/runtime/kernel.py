@@ -193,6 +193,19 @@ class Kernel(Generic[_R]):
         self._specialize_extra: dict[
             Hashable, list[Callable[[Sequence[object]], Hashable]]
         ] = {}
+        # G5-decorator fast path: speculative single-bound-kernel cache.
+        # Holds a tuple ``(fast_key, bound_kernel)`` where ``fast_key`` is
+        # the per-call fingerprint computed by ``_kernel_fast_call_key``
+        # for the most recent successful ``bind(...)`` result whose
+        # ``BoundKernel._run`` is populated.  ``Kernel.__call__`` checks
+        # the cached ``fast_key`` against the incoming args' fingerprint
+        # *before* entering ``bind`` / ``BoundKernel.__call__`` and
+        # short-circuits to ``bound._run(*args)`` on a hit, skipping
+        # ``_base_specialization_key`` / ``_get_bound_kernel_cache_key``
+        # / ``BoundKernel.__call__``'s ``if self._run is None`` check
+        # entirely.  ``None`` until the slow path completes one call and
+        # ``BoundKernel._run`` is set.
+        self._last_bound: tuple[tuple[object, ...], BoundKernel[_R]] | None = None
         if any(
             param.kind
             in (
@@ -410,9 +423,53 @@ class Kernel(Generic[_R]):
         Returns:
             _R: The result of the Kernel function call.
         """
+        # G5-decorator fast path: skip ``bind`` / ``_base_specialization_key``
+        # / ``BoundKernel.__call__`` entirely when ``args`` matches the
+        # most recently dispatched ``BoundKernel``'s per-call
+        # fingerprint.  Steady-state matmul / output-only kernel calls
+        # (single shape, static dtype / stride / device) hit this branch
+        # every time after the first warmup call seeds ``_last_bound``.
+        #
+        # Bail conditions for safety:
+        # - ``kwargs`` non-empty (must run through ``normalize_args``);
+        # - ``self._key_fn is not None`` (caller-supplied
+        #   ``helion.kernel(key=...)`` extractor; we don't replicate it
+        #   on the fast path because its return value can depend on
+        #   tensor *values* — see ``_base_specialization_key`` lines
+        #   appending ``self._key_fn(*args)`` — so a fast-key match on
+        #   the same ``(dtype, shape, stride, device)`` could still
+        #   require a different ``BoundKernel``.  Skip the speculative
+        #   cache entirely for these kernels);
+        # - ``args`` contains an unsupported type (``_kernel_fast_call_key``
+        #   returns ``None``).
+        if not kwargs and self._key_fn is None:
+            last = self._last_bound
+            if last is not None:
+                fast_key = _kernel_fast_call_key(args)
+                if fast_key is not None and fast_key == last[0]:
+                    _bump_kernel_fast_path_hits()
+                    # ``_last_bound`` is only installed once ``_run`` is
+                    # set (and the slot is cleared on ``reset()``), so
+                    # the ``Callable[..., _R] | None`` type is narrowed
+                    # to ``Callable[..., _R]`` here.
+                    return last[1]._run(*args)  # type: ignore[misc]
         if kwargs:
             args = self.normalize_args(*args, **kwargs)
-        return self.bind(args)(*args)
+        bound = self.bind(args)
+        # Install / refresh the speculative cache only once the
+        # ``BoundKernel`` has a compiled ``_run``; the first call still
+        # falls into ``BoundKernel.__call__``'s slow path (which triggers
+        # autotune / set_config / compile_config), so we trigger the
+        # bound invocation first and then promote it to ``_last_bound``
+        # for subsequent calls.  Skip the install when ``_key_fn`` is
+        # set so the fast path stays disabled across the kernel's
+        # lifetime — symmetric with the bail at the top of this method.
+        result = bound(*args)
+        if bound._run is not None and self._key_fn is None:
+            fast_key = _kernel_fast_call_key(args)
+            if fast_key is not None:
+                self._last_bound = (fast_key, bound)
+        return result
 
     def reset(self) -> None:
         """
@@ -420,6 +477,7 @@ class Kernel(Generic[_R]):
         recompile and re-autotune.
         """
         self._bound_kernels.clear()
+        self._last_bound = None
 
 
 class BoundKernel(_AutotunableKernel, Generic[_R]):
@@ -1420,6 +1478,109 @@ def _safe_bucket_dim(s: int | torch.SymInt) -> Hashable:
 
 
 _EMPTY_FROZENSET: frozenset[int] = frozenset()
+
+
+# G5-decorator: per-call ``Kernel.__call__`` decorator fast-path hits.
+# Counter lives here (not in ``helion/runtime/__init__.py``) because the
+# bump fires from ``Kernel.__call__`` and routing through the parent
+# module would create an import cycle (``helion.runtime`` imports
+# ``Kernel`` from this module at line ``from .kernel import Kernel``).
+# The parent module re-exports the three accessors so test code reads
+# ``helion.runtime._kernel_fast_path_hits()`` consistent with the other
+# per-call counters defined alongside ``_DirectCallKernel``.
+_KERNEL_FAST_PATH_HITS: int = 0
+
+
+def _kernel_fast_path_hits() -> int:
+    """Return the count of decorator-fast-path direct-dispatch hits."""
+    return _KERNEL_FAST_PATH_HITS
+
+
+def _reset_kernel_fast_path_hits() -> None:
+    """Reset the decorator-fast-path counter (test instrumentation)."""
+    global _KERNEL_FAST_PATH_HITS
+    _KERNEL_FAST_PATH_HITS = 0
+
+
+def _bump_kernel_fast_path_hits() -> None:
+    """Increment the decorator-fast-path counter.
+
+    Called from ``Kernel.__call__`` on every cache-hit invocation that
+    short-circuits to the cached ``BoundKernel._run`` without entering
+    ``Kernel.bind`` / ``BoundKernel.__call__``.
+    """
+    global _KERNEL_FAST_PATH_HITS
+    _KERNEL_FAST_PATH_HITS += 1
+
+
+# Types whose values are themselves hashable in a way that uniquely
+# determines their specialization key — primitive scalars, dtypes,
+# devices, and the ``ConstExpr`` wrapper.  Sequences and dicts deliberately
+# excluded: their specialization key recursively walks per element,
+# which we don't want to replicate on the hot path; ``Kernel.__call__``
+# falls through to the slow ``bind`` path on those types.
+_FAST_KEY_VALUE_TYPES: tuple[type, ...] = (
+    int,
+    float,
+    bool,
+    str,
+    type(None),
+    torch.dtype,
+    torch.device,
+)
+
+
+def _kernel_fast_call_key(args: tuple[object, ...]) -> tuple[object, ...] | None:
+    """Build a cheap per-call fingerprint for the decorator fast path.
+
+    Returns a tuple comparable with ``==`` against a previously cached
+    fingerprint, or ``None`` if any arg's type isn't on the supported
+    fast-path allow-list (``torch.Tensor``, scalar / primitive,
+    ``torch.dtype``, ``torch.device``, ``ConstExpr``).  Sequence / dict
+    / GraphModule / custom-class args fall through to the slow path
+    (``Kernel.bind`` / ``_base_specialization_key``) because their
+    specialization key recurses per element, which is too expensive to
+    replicate inline on the hot path for a single-slot cache.
+
+    The per-tensor entry captures the same metadata as the slow
+    ``_tensor_key`` path (``dtype``, ``shape``, ``stride``) plus the
+    tensor's ``device`` (the slow path captures device only via
+    ``_device_specialization_key`` over all args; the fast path captures
+    it per-tensor so a device change is caught even when the tensor's
+    other metadata coincides).  Pinning per-tensor ``device`` rather than
+    a global device fingerprint also lets the fast path correctly miss
+    when one of two same-shape tensors moves to a different device.
+    """
+    n = len(args)
+    if n == 0:
+        # Zero-arg kernels can't pin a fingerprint to anything useful;
+        # fall through to the slow path.  (The slow path's
+        # ``_find_device`` would also raise ``NoTensorArgs`` here, but
+        # we don't want to silently mask that.)
+        return None
+    key: list[object] = []
+    for arg in args:
+        if isinstance(arg, torch.Tensor):
+            # ``shape`` returns the cached ``torch.Size``; ``stride()``
+            # returns a fresh tuple but is cheap.  ``dtype`` and
+            # ``device`` are interned singletons.
+            key.append((torch.Tensor, arg.dtype, arg.shape, arg.stride(), arg.device))
+        elif isinstance(arg, ConstExpr):
+            # ConstExpr's specialization key is ``arg.value`` (see
+            # ``_specialization_extractors[ConstExpr]``); fingerprint by
+            # ``(ConstExpr, value)`` so two ``ConstExpr`` with the same
+            # value share the cached bound kernel.  Value itself must be
+            # one of the supported fast-key value types (otherwise its
+            # equality semantics aren't safe for the speculative cache).
+            value = arg.value
+            if not isinstance(value, _FAST_KEY_VALUE_TYPES):
+                return None
+            key.append((ConstExpr, value))
+        elif isinstance(arg, _FAST_KEY_VALUE_TYPES):
+            key.append((type(arg), arg))
+        else:
+            return None
+    return tuple(key)
 
 
 def _bucketed_size(obj: torch.Tensor) -> tuple[Hashable, ...]:
