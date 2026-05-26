@@ -31,32 +31,32 @@ KERNEL FAILED — full traceback:
 SUMMARY size='large' k_sz=64 rc=1
 
 === last 30 lines of test.log ===
-    jaxpr, out_avals, consts = pe.trace_to_jaxpr_dynamic(
-                               ^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/home/ymu_google_com/miniconda3/envs/tpu/lib/python3.12/site-packages/jax/_src/pallas/core.py", line 488, in __call__
-    out_indices = self.index_map(*args, **kwargs)
-                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/home/ymu_google_com/helion/helion/runtime/pallas_templates/jagged_reduce.py", line 92, in x_index_map
-    start = x_offsets_ref[b_id]
-            ~~~~~~~~~~~~~^^^^^^
-  File "/home/ymu_google_com/miniconda3/envs/tpu/lib/python3.12/site-packages/jax/_src/numpy/array_methods.py", line 1404, in op
-    return getattr(self.aval, f"_{name}")(self, *args)
-           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/home/ymu_google_com/miniconda3/envs/tpu/lib/python3.12/site-packages/jax/_src/numpy/array_methods.py", line 941, in _getitem
-    return indexing.rewriting_take(self, item)
-           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/home/ymu_google_com/miniconda3/envs/tpu/lib/python3.12/site-packages/jax/_src/numpy/indexing.py", line 1080, in rewriting_take
-    indexer = NDIndexer.from_raw_indices(idx, arr.shape)
-              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/home/ymu_google_com/miniconda3/envs/tpu/lib/python3.12/site-packages/jax/_src/numpy/indexing.py", line 201, in from_raw_indices
-    parsed = _parse_indices(indices, shape)
-             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/home/ymu_google_com/miniconda3/envs/tpu/lib/python3.12/site-packages/jax/_src/numpy/indexing.py", line 145, in _parse_indices
-    typ = IndexType.from_index(idx)
-          ^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/home/ymu_google_com/miniconda3/envs/tpu/lib/python3.12/site-packages/jax/_src/numpy/indexing.py", line 110, in from_index
-    raise IndexError("only integers, slices (`:`), ellipsis (`...`), newaxis (`None`)"
-IndexError: only integers, slices (`:`), ellipsis (`...`), newaxis (`None`) and integer or boolean arrays are valid indices. Got JitTracer(Ref<smem>{int32[129]})
+
+--------------------
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/home/ymu_google_com/helion/tmp/jagged_template_test/test_jagged_sum.py", line 106, in run_one
+    out = jagged_sum_pallas(x_padded, offsets, k_sz=k_sz)
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/ymu_google_com/miniconda3/envs/tpu/lib/python3.12/site-packages/jax/_src/pallas/pallas_call.py", line 1191, in _pallas_call_lowering
+    return mlir.lower_per_platform(
+           ^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/ymu_google_com/miniconda3/envs/tpu/lib/python3.12/site-packages/jax/_src/pallas/pallas_call.py", line 1150, in tpu_lowering
+    return mosaic_tpu_backend.pallas_call_tpu_lowering_rule(
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/ymu_google_com/miniconda3/envs/tpu/lib/python3.12/site-packages/jax/_src/pallas/mosaic/pallas_call_registration.py", line 396, in pallas_call_tpu_lowering_rule
+    mosaic_module = lower_jaxpr_to_module(
+                    ^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/ymu_google_com/miniconda3/envs/tpu/lib/python3.12/site-packages/jax/_src/pallas/mosaic/lowering.py", line 782, in lower_jaxpr_to_module
+    lower_jaxpr_into_module(
+  File "/home/ymu_google_com/miniconda3/envs/tpu/lib/python3.12/site-packages/jax/_src/pallas/mosaic/lowering.py", line 836, in lower_jaxpr_into_module
+    _check_block_mappings(
+  File "/home/ymu_google_com/miniconda3/envs/tpu/lib/python3.12/site-packages/jax/_src/pallas/mosaic/lowering.py", line 733, in _check_block_mappings
+    raise ValueError(
+ValueError: The Pallas TPU lowering currently requires that the last two dimensions of your block shape are divisible by 8 and 128 respectively, or be equal to the respective dimensions of the overall array. Block spec for outputs in pallas_call JaggedSum-k_64 at /home/ymu_google_com/helion/helion/runtime/pallas_templates/jagged_reduce.py:116 has block shape (Blocked(block_size=1), Blocked(block_size=128)), array shape (128, 128), and index_map { lambda ; a:i32[] b:Ref<smem>{i32[129]}. let  in (a, 0:i32[]) }, in memory space None.
+See details at https://docs.jax.dev/en/latest/pallas/grid_blockspec.html#pallas-blockspec
 --------------------
 For simplicity, JAX has removed its internal frames from the traceback of the following exception. Set JAX_TRACEBACK_FILTERING=off to include these.
 SUMMARY size='large' k_sz=64 rc=1
