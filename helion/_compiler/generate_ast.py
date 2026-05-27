@@ -807,6 +807,86 @@ if __name__ == "__main__":
     """)
 
 
+# Set of ``torch`` factory functions whose output we'll redirect to the
+# pool when ``HELION_OUTPUT_POOL=1``. Restricted to ``empty_like`` —
+# the only output-allocation pattern Helion's current codegen emits.
+# (``torch.empty`` with explicit ``(shape, dtype, device)`` args would
+# also be safe to pool, but our ``helion.runtime.empty_like`` helper
+# only accepts the template-tensor signature, so we'd need a separate
+# pool helper for the explicit-args case. Easy to extend later.)
+_POOL_ELIGIBLE_TORCH_FNS: frozenset[str] = frozenset({"empty_like"})
+
+
+def _rewrite_output_allocs_for_pool(host_statements: list[ast.stmt]) -> None:
+    """Route output-tensor allocations through ``helion.runtime.empty_like``.
+
+    Walks the generated host wrapper statements, looking for
+    ``Assign(target=Name(v), value=Call(torch.<fn>(...)))`` where
+    ``<fn>`` is in :data:`_POOL_ELIGIBLE_TORCH_FNS` AND the target
+    name ``v`` is passed as a positional arg to a kernel launcher
+    call later in the same scope. Such ``v`` is unambiguously a
+    kernel-output buffer; replacing the factory call with the pool
+    helper is safe because the kernel will overwrite the buffer
+    before any read.
+
+    Other names (helpers, locals returned from utility functions,
+    etc.) are left alone.
+
+    The rewrite is a no-op when ``HELION_OUTPUT_POOL`` is unset; the
+    caller guards on the env var before invoking this.
+    """
+    # First pass: collect names passed as positional args to kernel
+    # launcher calls. The launcher call's statement is marked with
+    # ``_is_kernel_call=True`` by the codegen.
+    launcher_arg_names: set[str] = set()
+    for stmt in host_statements:
+        if not getattr(stmt, "_is_kernel_call", False):
+            continue
+        call: ast.AST | None = None
+        if (
+            isinstance(stmt, ast.Expr)
+            and isinstance(stmt.value, ast.Call)
+            or isinstance(stmt, ast.Assign)
+            and isinstance(stmt.value, ast.Call)
+        ):
+            call = stmt.value
+        if not isinstance(call, ast.Call):
+            continue
+        for arg in call.args:
+            if isinstance(arg, ast.Name):
+                launcher_arg_names.add(arg.id)
+
+    # Second pass: rewrite ``torch.<fn>(...)`` factory expressions
+    # whose Assign target is a launcher-arg name.
+    for stmt in host_statements:
+        if not (
+            isinstance(stmt, ast.Assign)
+            and len(stmt.targets) == 1
+            and isinstance(stmt.targets[0], ast.Name)
+            and stmt.targets[0].id in launcher_arg_names
+            and not getattr(stmt, "_is_kernel_call", False)
+            and isinstance(stmt.value, ast.Call)
+        ):
+            continue
+        call = stmt.value
+        # Match ``torch.<eligible>(...)``: an Attribute whose value is
+        # ``Name('torch')`` and whose attr is in the eligible set.
+        if not (
+            isinstance(call.func, ast.Attribute)
+            and isinstance(call.func.value, ast.Name)
+            and call.func.value.id == "torch"
+            and call.func.attr in _POOL_ELIGIBLE_TORCH_FNS
+        ):
+            continue
+        # Replace the called function with the pool helper. The pool
+        # helper accepts the same template-tensor positional arg that
+        # ``torch.empty_like`` takes, AND the same ``(*shape, dtype,
+        # device)`` form that ``torch.empty`` takes (it normalizes
+        # both via ``isinstance`` on the first positional). The
+        # helper's args/kwargs are passed through unchanged.
+        call.func = ast.Name(id="_helion_pool_empty_like", ctx=ast.Load())
+
+
 def generate_ast(
     func: HostFunction,
     config: Config,
@@ -863,6 +943,32 @@ def generate_ast(
                         ] + [
                             ast.keyword(arg="device", value=ast.Constant(value="meta"))
                         ]
+
+            # When ``HELION_OUTPUT_POOL=1`` is set, rewrite the wrapper's
+            # ``torch.empty_like(x)`` calls (and the few other output-only
+            # factory expressions we know about) to route through
+            # ``helion.runtime.empty_like`` (the pool helper). On cache
+            # hit the pool returns a recycled buffer without invoking
+            # the CUDA allocator at all, so each kernel call skips
+            # ~0.7 us of allocator + tensor-metadata work.
+            #
+            # The rewrite is conservative: only triggers on assignments
+            # whose target name is consumed by a kernel launcher call
+            # in the same scope. Tensors that escape via other paths
+            # (returned by helpers, captured by closures, etc.) are not
+            # safe to recycle and stay on ``torch.empty_like``.
+            #
+            # Pairs with Chunk D (the pool runtime) and Chunk E (the C
+            # launcher) to approach #2534's reported 10.7 us/call pool=1
+            # number on small kernels.
+            import os as _os
+
+            if _os.environ.get("HELION_OUTPUT_POOL", "").lower() in (
+                "1",
+                "true",
+                "yes",
+            ):
+                _rewrite_output_allocs_for_pool(codegen.host_statements)
 
             # Inject RNG seed buffer creation if needed
             rng_statements = (

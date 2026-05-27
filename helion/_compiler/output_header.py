@@ -26,6 +26,7 @@ library_imports: dict[str, str] = {
     "tl_math": "from torch._inductor.runtime.triton_helpers import math as tl_math",
     "libdevice": "from torch._inductor.runtime.triton_compat import libdevice",
     "_default_launcher": "from helion.runtime import default_launcher as _default_launcher",
+    "_helion_pool_empty_like": "from helion.runtime import empty_like as _helion_pool_empty_like",
 }
 
 disallowed_names: dict[str, None] = dict.fromkeys(
@@ -35,6 +36,7 @@ disallowed_names: dict[str, None] = dict.fromkeys(
         "_default_launcher",
         "_default_pallas_launcher",
         "_default_cute_launcher",
+        "_helion_pool_empty_like",
         "_NUM_SM",
     ]
 )
