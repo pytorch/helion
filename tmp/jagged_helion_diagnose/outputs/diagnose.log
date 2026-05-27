@@ -6,10 +6,10 @@
 + python diagnose.py
 ----- BEGIN -----
 WARNING: All log messages before absl::InitializeLog() is called are written to STDERR
-I0000 00:00:1779844484.614611 2021634 pjrt_api.cc:96] PJRT_Api is set for device type cpu
-I0000 00:00:1779844484.641454 2021634 pjrt_api.cc:118] GetPjrtApi was found for TPU at /home/ymu_google_com/miniconda3/envs/tpu/lib/python3.12/site-packages/libtpu/libtpu.so
-I0000 00:00:1779844484.641499 2021634 pjrt_api.cc:96] PJRT_Api is set for device type tpu
-I0000 00:00:1779844484.672181 2021634 device_rt.cc:97] PjRt runtime initialization deferred for tpu
+I0000 00:00:1779844649.756146 2023689 pjrt_api.cc:96] PJRT_Api is set for device type cpu
+I0000 00:00:1779844649.781769 2023689 pjrt_api.cc:118] GetPjrtApi was found for TPU at /home/ymu_google_com/miniconda3/envs/tpu/lib/python3.12/site-packages/libtpu/libtpu.so
+I0000 00:00:1779844649.781809 2023689 pjrt_api.cc:96] PJRT_Api is set for device type tpu
+I0000 00:00:1779844649.803917 2023689 device_rt.cc:97] PjRt runtime initialization deferred for tpu
 Successfully renamed PrivateUse1 backend to 'tpu'. Device: device(type='tpu')
 Registered Python module for 'tpu'.
 Device type: tpu, Device index: default
@@ -21,16 +21,16 @@ torch device (DEVICE): tpu
 ==============================================================================
 === structural repro (constant += 1.0)
 ==============================================================================
-I0000 00:00:1779844488.169804 2021634 pjrt_api.cc:167] The PJRT plugin has PJRT API version 0.108. The framework PJRT API version is 0.104.
-I0000 00:00:1779844488.170424 2021634 pjrt_c_api_client.cc:197] PjRtCApiClient created.
-W0000 00:00:1779844488.170447 2021634 pjrt_state.cc:230] Only using 1 device out of all the 8 addressable devices.
-I0000 00:00:1779844488.206199 2022893 tier2_compilation_cache.cc:149] Tier-2 compilation cache is disabled for world size 1.
-I0000 00:00:1779844488.206233 2022893 tier3_compilation_cache.cc:65] Backup compilation for tier-3 cache read is disabled as tier-3 cache is disabled.
+I0000 00:00:1779844653.288499 2023689 pjrt_api.cc:167] The PJRT plugin has PJRT API version 0.108. The framework PJRT API version is 0.104.
+I0000 00:00:1779844653.289128 2023689 pjrt_c_api_client.cc:197] PjRtCApiClient created.
+W0000 00:00:1779844653.289152 2023689 pjrt_state.cc:230] Only using 1 device out of all the 8 addressable devices.
+I0000 00:00:1779844653.322240 2024949 tier2_compilation_cache.cc:149] Tier-2 compilation cache is disabled for world size 1.
+I0000 00:00:1779844653.322270 2024949 tier3_compilation_cache.cc:65] Backup compilation for tier-3 cache read is disabled as tier-3 cache is disabled.
 INPUT  x_data.shape=(1024, 128)  out_size=8  block_L=32
 INPUT  expected per-cell value = L // block_L = 32.0
 /home/ymu_google_com/helion/helion/_compiler/compile_environment.py:238: UserWarning: The 'pallas' backend is experimental and may have limited functionality.
   warn_once(
-# Output code written to: /tmp/torchinductor_ymu_google_com/aw/cawfgm3qvvogo2qm4dvrcn3jstdru4v4zkdyj65acssz6myuul2s.py
+# Output code written to: /tmp/torchinductor_ymu_google_com/xa/cxag3rq4spplyxzfsa6bvwhy2hl6ayrsnftvts5u2ozczuza7o6c.py
 from __future__ import annotations
 
 import torch
@@ -62,20 +62,18 @@ def _helion_repro_kernel(x_data, out):
         v_2 = jnp.array(1.0, dtype=jnp.float32)
         v_3 = sum_1 + v_2
         # src[repro_kernel.py:52]: for i in range(out_size):
-        # src[repro_kernel.py:53]:     out[i, tile_m] += partial
+        # src[repro_kernel.py:53]:     hl.atomic_add(out, [i, tile_m], partial)
         _outer_pid_0 = pl.program_id(0)
 
         def _pipeline_body_1(_pipeline_indices):
             offset_2 = 0 + _pipeline_indices[0] * _BLOCK_SIZE_2
-            offset_2 = 0 + _pipeline_indices[0] * _BLOCK_SIZE_2
             v_3_copy = v_3
             v_3_copy_0 = v_3_copy
-            # src[repro_kernel.py:53]: out[i, tile_m] += partial
-            load = out[offset_2, pl.ds(pl.multiple_of(offset_1, _BLOCK_SIZE_1), _BLOCK_SIZE_1)]
-            v_4 = load + v_3_copy_0
-            out[offset_2, pl.ds(pl.multiple_of(offset_1, _BLOCK_SIZE_1), _BLOCK_SIZE_1)] = v_4
+            # src[repro_kernel.py:53]: hl.atomic_add(out, [i, tile_m], partial)
+            _prev = out[offset_2, pl.ds(pl.multiple_of(offset_1, _BLOCK_SIZE_1), _BLOCK_SIZE_1)]
+            out[offset_2, pl.ds(pl.multiple_of(offset_1, _BLOCK_SIZE_1), _BLOCK_SIZE_1)] = _prev + lax.convert_element_type(v_3_copy_0, _prev.dtype)
         # src[repro_kernel.py:52]: for i in range(out_size):
-        # src[repro_kernel.py:53]:     out[i, tile_m] += partial
+        # src[repro_kernel.py:53]:     hl.atomic_add(out, [i, tile_m], partial)
         pltpu.emit_pipeline(_pipeline_body_1, grid=((8 - 0 + _BLOCK_SIZE_2 - 1) // _BLOCK_SIZE_2,), _explicit_indices=True)()
     # src[repro_kernel.py:47]: for tile_m in hl.tile(M):
     # src[repro_kernel.py:48]:     chunk = x_data[tile_l, tile_m]
@@ -100,7 +98,7 @@ def repro_kernel(x_data: torch.Tensor, out_size_hint: torch.Tensor, *, _launcher
     # src[repro_kernel.py:47]:     for tile_m in hl.tile(M):
     # src[repro_kernel.py:48]:         chunk = x_data[tile_l, tile_m]
     # src[repro_kernel.py:46-53]: ...
-    _launcher(_helion_repro_kernel, ((1024 + _BLOCK_SIZE_0 - 1) // _BLOCK_SIZE_0,), x_data, out, _output_indices=[1], _inplace_indices=[1], _block_spec_info=[((32, None), (0, None)), ((None, None), (None, None))], _ds_pad_dims=[(0, 1, 128, 0), (1, 1, 128, 0)], _pipeline_arg_indices=[0])
+    _launcher(_helion_repro_kernel, ((1024 + _BLOCK_SIZE_0 - 1) // _BLOCK_SIZE_0,), x_data, out, _output_indices=[1], _inplace_indices=[1], _atomic_indices=[1], _block_spec_info=[((32, None), (0, None)), ((None, None), (None, None))], _ds_pad_dims=[(0, 1, 128, 0), (1, 1, 128, 0)], _pipeline_arg_indices=[0])
     # src[repro_kernel.py:54]: return out
     return out
 
@@ -117,16 +115,16 @@ if __name__ == '__main__':
     call()
 RESULT out.shape=(8, 128) dtype=torch.float32
 RESULT out[:, :4] =
-   row 0: [1.0, 1.0, 1.0, 1.0]
-   row 1: [1.0, 1.0, 1.0, 1.0]
-   row 2: [1.0, 1.0, 1.0, 1.0]
-   row 3: [1.0, 1.0, 1.0, 1.0]
-   row 4: [1.0, 1.0, 1.0, 1.0]
-   row 5: [1.0, 1.0, 1.0, 1.0]
-   row 6: [1.0, 1.0, 1.0, 1.0]
-   row 7: [1.0, 1.0, 1.0, 1.0]
-RESULT min=1.000000  max=1.000000
-REPRO VERDICT: unexpected mix. unique values (up to 20): [1.0]
+   row 0: [32.0, 32.0, 32.0, 32.0]
+   row 1: [32.0, 32.0, 32.0, 32.0]
+   row 2: [32.0, 32.0, 32.0, 32.0]
+   row 3: [32.0, 32.0, 32.0, 32.0]
+   row 4: [32.0, 32.0, 32.0, 32.0]
+   row 5: [32.0, 32.0, 32.0, 32.0]
+   row 6: [32.0, 32.0, 32.0, 32.0]
+   row 7: [32.0, 32.0, 32.0, 32.0]
+RESULT min=32.000000  max=32.000000
+REPRO VERDICT: all cells == 32.0 — structural pattern WORKS. The all-zeros bug in jagged_sum_tpu must be in the mask / partial-value computation, not in the access pattern.
 
 ==============================================================================
 === variant='emit_pipeline' seed=0
@@ -134,7 +132,7 @@ REPRO VERDICT: unexpected mix. unique values (up to 20): [1.0]
 INPUT  x_padded.shape=(1024, 128)  L_nnz=256
 INPUT  offsets=[0, 45, 93, 147, 148, 152, 212, 216, 256]
 INPUT  seq_lengths=[45, 48, 54, 1, 4, 60, 4, 40]
-# Output code written to: /tmp/torchinductor_ymu_google_com/h2/ch2sl7szbpqabaocgv5f52pgv43qi3mque6q77gpdyksvehjq56k.py
+# Output code written to: /tmp/torchinductor_ymu_google_com/c7/cc7z6t5f6uyqnd77caceh4f2jx2u7hcagcsmssakdzpzwxpsaqx2.py
 from __future__ import annotations
 
 import torch
@@ -199,10 +197,9 @@ def _helion_kernel_emit_pipeline(x_data, x_offsets, out):
             v_7 = subscript * chunk_copy_0
             # src[kernel_variants.py:44]: partial = safe_chunk.sum(dim=0)
             partial = lax.convert_element_type(jnp.sum(v_7, axis=0), jnp.float32)
-            # src[kernel_variants.py:45]: out[item_idx, tile_m] += partial
-            load_2 = out[offset_2, pl.ds(pl.multiple_of(offset_1, _BLOCK_SIZE_1), _BLOCK_SIZE_1)]
-            v_8 = load_2 + partial
-            out[offset_2, pl.ds(pl.multiple_of(offset_1, _BLOCK_SIZE_1), _BLOCK_SIZE_1)] = v_8
+            # src[kernel_variants.py:45]: hl.atomic_add(out, [item_idx, tile_m], partial)
+            _prev = out[offset_2, pl.ds(pl.multiple_of(offset_1, _BLOCK_SIZE_1), _BLOCK_SIZE_1)]
+            out[offset_2, pl.ds(pl.multiple_of(offset_1, _BLOCK_SIZE_1), _BLOCK_SIZE_1)] = _prev + lax.convert_element_type(partial, _prev.dtype)
         # src[kernel_variants.py:38]: for item_idx in range(N):
         # src[kernel_variants.py:39]:     it_start = x_offsets[item_idx]
         # src[kernel_variants.py:40]:     it_end = x_offsets[item_idx + 1]
@@ -229,7 +226,7 @@ def kernel_emit_pipeline(x_data: torch.Tensor, x_offsets: torch.Tensor, *, _laun
     # src[kernel_variants.py:34]:     l_start = tile_l.index
     # src[kernel_variants.py:35]:     block_L = tile_l.block_size
     # src[kernel_variants.py:33-45]: ...
-    _launcher(_helion_kernel_emit_pipeline, ((1024 + _BLOCK_SIZE_0 - 1) // _BLOCK_SIZE_0,), x_data, x_offsets, out, _output_indices=[2], _inplace_indices=[2], _block_spec_info=[((32, None), (0, None)), ((None,), (None,)), ((None, None), (None, None))], _ds_pad_dims=[(0, 1, 128, 0), (2, 1, 128, 0)], _smem_arg_indices=[1], _pipeline_arg_indices=[0])
+    _launcher(_helion_kernel_emit_pipeline, ((1024 + _BLOCK_SIZE_0 - 1) // _BLOCK_SIZE_0,), x_data, x_offsets, out, _output_indices=[2], _inplace_indices=[2], _atomic_indices=[2], _block_spec_info=[((32, None), (0, None)), ((None,), (None,)), ((None, None), (None, None))], _ds_pad_dims=[(0, 1, 128, 0), (2, 1, 128, 0)], _smem_arg_indices=[1], _pipeline_arg_indices=[0])
     # src[kernel_variants.py:46]: return out
     return out
 
@@ -244,19 +241,19 @@ def call():
     kernel_emit_pipeline(x_data, x_offsets)
 if __name__ == '__main__':
     call()
-RESULT max|out - ref(fp64)| = 2.431175e+01
+RESULT max|out - ref(fp64)| = 1.785674e+01
 RESULT bad cells: 1024 / 1024  (100.00%)  @ rtol=0.001 atol=0.001
 RESULT first 10 bad cells:
-   [  0,   0]  ref=+2.506165e+00  out=+0.000000e+00  diff=2.506165e+00
-   [  0,   1]  ref=+7.937676e-02  out=+0.000000e+00  diff=7.937676e-02
-   [  0,   2]  ref=+6.402875e+00  out=+0.000000e+00  diff=6.402875e+00
-   [  0,   3]  ref=+4.186883e+00  out=+0.000000e+00  diff=4.186883e+00
-   [  0,   4]  ref=+6.543723e+00  out=+0.000000e+00  diff=6.543723e+00
-   [  0,   5]  ref=-4.299490e+00  out=+0.000000e+00  diff=4.299490e+00
-   [  0,   6]  ref=+2.676757e+00  out=+0.000000e+00  diff=2.676757e+00
-   [  0,   7]  ref=-7.830895e+00  out=+0.000000e+00  diff=7.830895e+00
-   [  0,   8]  ref=+4.723637e+00  out=+0.000000e+00  diff=4.723637e+00
-   [  0,   9]  ref=-1.609069e+00  out=+0.000000e+00  diff=1.609069e+00
+   [  0,   0]  ref=+2.506165e+00  out=+2.718719e+00  diff=2.125542e-01
+   [  0,   1]  ref=+7.937676e-02  out=+4.184301e+00  diff=4.104925e+00
+   [  0,   2]  ref=+6.402875e+00  out=+2.672595e+00  diff=3.730280e+00
+   [  0,   3]  ref=+4.186883e+00  out=+3.830504e+00  diff=3.563790e-01
+   [  0,   4]  ref=+6.543723e+00  out=+5.337192e+00  diff=1.206532e+00
+   [  0,   5]  ref=-4.299490e+00  out=+2.399492e+00  diff=6.698982e+00
+   [  0,   6]  ref=+2.676757e+00  out=+7.238275e-01  diff=1.952929e+00
+   [  0,   7]  ref=-7.830895e+00  out=-4.843409e+00  diff=2.987486e+00
+   [  0,   8]  ref=+4.723637e+00  out=+6.468922e+00  diff=1.745285e+00
+   [  0,   9]  ref=-1.609069e+00  out=-3.463732e+00  diff=1.854663e+00
 RESULT bad cells per row: [128, 128, 128, 128, 128, 128, 128, 128]
 RESULT seq_lengths        : [45, 48, 54, 1, 4, 60, 4, 40]
 
@@ -266,7 +263,7 @@ RESULT seq_lengths        : [45, 48, 54, 1, 4, 60, 4, 40]
 INPUT  x_padded.shape=(1024, 128)  L_nnz=256
 INPUT  offsets=[0, 45, 93, 147, 148, 152, 212, 216, 256]
 INPUT  seq_lengths=[45, 48, 54, 1, 4, 60, 4, 40]
-# Output code written to: /tmp/torchinductor_ymu_google_com/hy/chyy74eucizbs2f53xc2jyivtf6ih2e6r64552p7gv3dfynbui3i.py
+# Output code written to: /tmp/torchinductor_ymu_google_com/4v/c4vhtewgm2nm476pddeazu4clobaz4d7isjdc2w2nqa6rntcskqw.py
 from __future__ import annotations
 
 import torch
@@ -335,10 +332,9 @@ def _helion_kernel_fori_loop(x_data, x_offsets, out, x_data_buf, x_data_sem):
             v_7 = subscript * chunk_copy_0
             # src[kernel_variants.py:71]: partial = safe_chunk.sum(dim=0)
             partial = lax.convert_element_type(jnp.sum(v_7, axis=0), jnp.float32)
-            # src[kernel_variants.py:72]: out[item_idx, tile_m] += partial
-            load_2 = out[offset_2, pl.ds(pl.multiple_of(offset_1, _BLOCK_SIZE_1), _BLOCK_SIZE_1)]
-            v_8 = load_2 + partial
-            out[offset_2, pl.ds(pl.multiple_of(offset_1, _BLOCK_SIZE_1), _BLOCK_SIZE_1)] = v_8
+            # src[kernel_variants.py:72]: hl.atomic_add(out, [item_idx, tile_m], partial)
+            _prev = out[offset_2, pl.ds(pl.multiple_of(offset_1, _BLOCK_SIZE_1), _BLOCK_SIZE_1)]
+            out[offset_2, pl.ds(pl.multiple_of(offset_1, _BLOCK_SIZE_1), _BLOCK_SIZE_1)] = _prev + lax.convert_element_type(partial, _prev.dtype)
         # src[kernel_variants.py:65]: for item_idx in range(N):
         # src[kernel_variants.py:66]:     it_start = x_offsets[item_idx]
         # src[kernel_variants.py:67]:     it_end = x_offsets[item_idx + 1]
@@ -365,7 +361,7 @@ def kernel_fori_loop(x_data: torch.Tensor, x_offsets: torch.Tensor, *, _launcher
     # src[kernel_variants.py:61]:     l_start = tile_l.index
     # src[kernel_variants.py:62]:     block_L = tile_l.block_size
     # src[kernel_variants.py:60-72]: ...
-    _launcher(_helion_kernel_fori_loop, ((1024 + _BLOCK_SIZE_0 - 1) // _BLOCK_SIZE_0,), x_data, x_offsets, out, _output_indices=[2], _inplace_indices=[2], _block_spec_info=[((32, None), (0, None)), ((None,), (None,)), ((None, None), (None, None))], _ds_pad_dims=[(0, 1, 128, 0), (2, 1, 128, 0)], _smem_arg_indices=[1], _scratch_shapes=[((32, 128), 'jnp.float32', 'vmem'), ((), None, 'dma_semaphore')], _pipeline_arg_indices=[0])
+    _launcher(_helion_kernel_fori_loop, ((1024 + _BLOCK_SIZE_0 - 1) // _BLOCK_SIZE_0,), x_data, x_offsets, out, _output_indices=[2], _inplace_indices=[2], _atomic_indices=[2], _block_spec_info=[((32, None), (0, None)), ((None,), (None,)), ((None, None), (None, None))], _ds_pad_dims=[(0, 1, 128, 0), (2, 1, 128, 0)], _smem_arg_indices=[1], _scratch_shapes=[((32, 128), 'jnp.float32', 'vmem'), ((), None, 'dma_semaphore')], _pipeline_arg_indices=[0])
     # src[kernel_variants.py:73]: return out
     return out
 
@@ -380,19 +376,19 @@ def call():
     kernel_fori_loop(x_data, x_offsets)
 if __name__ == '__main__':
     call()
-RESULT max|out - ref(fp64)| = 2.431175e+01
+RESULT max|out - ref(fp64)| = 1.785674e+01
 RESULT bad cells: 1024 / 1024  (100.00%)  @ rtol=0.001 atol=0.001
 RESULT first 10 bad cells:
-   [  0,   0]  ref=+2.506165e+00  out=+0.000000e+00  diff=2.506165e+00
-   [  0,   1]  ref=+7.937676e-02  out=+0.000000e+00  diff=7.937676e-02
-   [  0,   2]  ref=+6.402875e+00  out=+0.000000e+00  diff=6.402875e+00
-   [  0,   3]  ref=+4.186883e+00  out=+0.000000e+00  diff=4.186883e+00
-   [  0,   4]  ref=+6.543723e+00  out=+0.000000e+00  diff=6.543723e+00
-   [  0,   5]  ref=-4.299490e+00  out=+0.000000e+00  diff=4.299490e+00
-   [  0,   6]  ref=+2.676757e+00  out=+0.000000e+00  diff=2.676757e+00
-   [  0,   7]  ref=-7.830895e+00  out=+0.000000e+00  diff=7.830895e+00
-   [  0,   8]  ref=+4.723637e+00  out=+0.000000e+00  diff=4.723637e+00
-   [  0,   9]  ref=-1.609069e+00  out=+0.000000e+00  diff=1.609069e+00
+   [  0,   0]  ref=+2.506165e+00  out=+2.718719e+00  diff=2.125542e-01
+   [  0,   1]  ref=+7.937676e-02  out=+4.184301e+00  diff=4.104925e+00
+   [  0,   2]  ref=+6.402875e+00  out=+2.672595e+00  diff=3.730280e+00
+   [  0,   3]  ref=+4.186883e+00  out=+3.830504e+00  diff=3.563790e-01
+   [  0,   4]  ref=+6.543723e+00  out=+5.337192e+00  diff=1.206532e+00
+   [  0,   5]  ref=-4.299490e+00  out=+2.399492e+00  diff=6.698982e+00
+   [  0,   6]  ref=+2.676757e+00  out=+7.238275e-01  diff=1.952929e+00
+   [  0,   7]  ref=-7.830895e+00  out=-4.843409e+00  diff=2.987486e+00
+   [  0,   8]  ref=+4.723637e+00  out=+6.468922e+00  diff=1.745285e+00
+   [  0,   9]  ref=-1.609069e+00  out=-3.463732e+00  diff=1.854663e+00
 RESULT bad cells per row: [128, 128, 128, 128, 128, 128, 128, 128]
 RESULT seq_lengths        : [45, 48, 54, 1, 4, 60, 4, 40]
 
@@ -402,7 +398,7 @@ RESULT seq_lengths        : [45, 48, 54, 1, 4, 60, 4, 40]
 INPUT  x_padded.shape=(1024, 128)  L_nnz=256
 INPUT  offsets=[0, 45, 93, 147, 148, 152, 212, 216, 256]
 INPUT  seq_lengths=[45, 48, 54, 1, 4, 60, 4, 40]
-# Output code written to: /tmp/torchinductor_ymu_google_com/m3/cm3pobh5uqirg7nzrcaqtdt7quppkelvqib6k4iqwlffoyujanow.py
+# Output code written to: /tmp/torchinductor_ymu_google_com/mn/cmnkysafnlnaz6myfko7xqeh74cjxpgzqrs4slnqndca5vamcgmq.py
 from __future__ import annotations
 
 import torch
@@ -458,10 +454,9 @@ def _helion_kernel_unroll(x_data, x_offsets, out):
             v_7 = subscript * chunk_copy_0
             # src[kernel_variants.py:98]: partial = safe_chunk.sum(dim=0)
             partial = lax.convert_element_type(jnp.sum(v_7, axis=0), jnp.float32)
-            # src[kernel_variants.py:99]: out[item_idx, tile_m] += partial
-            load_2 = out[offset_2, pl.ds(pl.multiple_of(offset_1, _BLOCK_SIZE_1), _BLOCK_SIZE_1)]
-            v_8 = load_2 + partial
-            out[offset_2, pl.ds(pl.multiple_of(offset_1, _BLOCK_SIZE_1), _BLOCK_SIZE_1)] = v_8
+            # src[kernel_variants.py:99]: hl.atomic_add(out, [item_idx, tile_m], partial)
+            _prev = out[offset_2, pl.ds(pl.multiple_of(offset_1, _BLOCK_SIZE_1), _BLOCK_SIZE_1)]
+            out[offset_2, pl.ds(pl.multiple_of(offset_1, _BLOCK_SIZE_1), _BLOCK_SIZE_1)] = _prev + lax.convert_element_type(partial, _prev.dtype)
 
 def kernel_unroll(x_data: torch.Tensor, x_offsets: torch.Tensor, *, _launcher=_default_pallas_launcher):
     # src[kernel_variants.py:83]: M = x_data.shape[1]
@@ -478,7 +473,7 @@ def kernel_unroll(x_data: torch.Tensor, x_offsets: torch.Tensor, *, _launcher=_d
     # src[kernel_variants.py:88]:     l_start = tile_l.index
     # src[kernel_variants.py:89]:     block_L = tile_l.block_size
     # src[kernel_variants.py:87-99]: ...
-    _launcher(_helion_kernel_unroll, ((1024 + _BLOCK_SIZE_0 - 1) // _BLOCK_SIZE_0,), x_data, x_offsets, out, _output_indices=[2], _inplace_indices=[2], _block_spec_info=[((32, None), (0, None)), ((None,), (None,)), ((None, None), (None, None))], _ds_pad_dims=[(0, 1, 128, 0), (2, 1, 128, 0)], _smem_arg_indices=[1])
+    _launcher(_helion_kernel_unroll, ((1024 + _BLOCK_SIZE_0 - 1) // _BLOCK_SIZE_0,), x_data, x_offsets, out, _output_indices=[2], _inplace_indices=[2], _atomic_indices=[2], _block_spec_info=[((32, None), (0, None)), ((None,), (None,)), ((None, None), (None, None))], _ds_pad_dims=[(0, 1, 128, 0), (2, 1, 128, 0)], _smem_arg_indices=[1])
     # src[kernel_variants.py:100]: return out
     return out
 
@@ -493,19 +488,19 @@ def call():
     kernel_unroll(x_data, x_offsets)
 if __name__ == '__main__':
     call()
-RESULT max|out - ref(fp64)| = 2.431175e+01
+RESULT max|out - ref(fp64)| = 1.785674e+01
 RESULT bad cells: 1024 / 1024  (100.00%)  @ rtol=0.001 atol=0.001
 RESULT first 10 bad cells:
-   [  0,   0]  ref=+2.506165e+00  out=+0.000000e+00  diff=2.506165e+00
-   [  0,   1]  ref=+7.937676e-02  out=+0.000000e+00  diff=7.937676e-02
-   [  0,   2]  ref=+6.402875e+00  out=+0.000000e+00  diff=6.402875e+00
-   [  0,   3]  ref=+4.186883e+00  out=+0.000000e+00  diff=4.186883e+00
-   [  0,   4]  ref=+6.543723e+00  out=+0.000000e+00  diff=6.543723e+00
-   [  0,   5]  ref=-4.299490e+00  out=+0.000000e+00  diff=4.299490e+00
-   [  0,   6]  ref=+2.676757e+00  out=+0.000000e+00  diff=2.676757e+00
-   [  0,   7]  ref=-7.830895e+00  out=+0.000000e+00  diff=7.830895e+00
-   [  0,   8]  ref=+4.723637e+00  out=+0.000000e+00  diff=4.723637e+00
-   [  0,   9]  ref=-1.609069e+00  out=+0.000000e+00  diff=1.609069e+00
+   [  0,   0]  ref=+2.506165e+00  out=+2.718719e+00  diff=2.125542e-01
+   [  0,   1]  ref=+7.937676e-02  out=+4.184301e+00  diff=4.104925e+00
+   [  0,   2]  ref=+6.402875e+00  out=+2.672595e+00  diff=3.730280e+00
+   [  0,   3]  ref=+4.186883e+00  out=+3.830504e+00  diff=3.563790e-01
+   [  0,   4]  ref=+6.543723e+00  out=+5.337192e+00  diff=1.206532e+00
+   [  0,   5]  ref=-4.299490e+00  out=+2.399492e+00  diff=6.698982e+00
+   [  0,   6]  ref=+2.676757e+00  out=+7.238275e-01  diff=1.952929e+00
+   [  0,   7]  ref=-7.830895e+00  out=-4.843409e+00  diff=2.987486e+00
+   [  0,   8]  ref=+4.723637e+00  out=+6.468922e+00  diff=1.745285e+00
+   [  0,   9]  ref=-1.609069e+00  out=-3.463732e+00  diff=1.854663e+00
 RESULT bad cells per row: [128, 128, 128, 128, 128, 128, 128, 128]
 RESULT seq_lengths        : [45, 48, 54, 1, 4, 60, 4, 40]
 
@@ -517,8 +512,8 @@ variant=     fori_loop  n_bad=1024
 variant=        unroll  n_bad=1024
   variant[0]='emit_pipeline' vs variant[1]='fori_loop': |same|=True  |intersection|=1024  |sym_diff|=0
   variant[0]='emit_pipeline' vs variant[2]='unroll': |same|=True  |intersection|=1024  |sym_diff|=0
-I0000 00:00:1779844490.878464 2021634 compilation_cache.cc:354] Compilation cache evicted.
-I0000 00:00:1779844490.878719 2021634 compilation_cache.cc:219] CompilationCache final stats: num_cache_reqs=138
+I0000 00:00:1779844655.967900 2023689 compilation_cache.cc:354] Compilation cache evicted.
+I0000 00:00:1779844655.967933 2023689 compilation_cache.cc:219] CompilationCache final stats: num_cache_reqs=138
 num_cache_hits=111 {80.4%}
 peak_compilation_memory_bytes=unknown
 

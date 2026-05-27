@@ -2,22 +2,22 @@
 === structural repro (constant += 1.0)
 RESULT out.shape=(8, 128) dtype=torch.float32
 RESULT out[:, :4] =
-RESULT min=1.000000  max=1.000000
-REPRO VERDICT: unexpected mix. unique values (up to 20): [1.0]
+RESULT min=32.000000  max=32.000000
+REPRO VERDICT: all cells == 32.0 — structural pattern WORKS. The all-zeros bug in jagged_sum_tpu must be in the mask / partial-value computation, not in the access pattern.
 === variant='emit_pipeline' seed=0
-RESULT max|out - ref(fp64)| = 2.431175e+01
+RESULT max|out - ref(fp64)| = 1.785674e+01
 RESULT bad cells: 1024 / 1024  (100.00%)  @ rtol=0.001 atol=0.001
 RESULT first 10 bad cells:
 RESULT bad cells per row: [128, 128, 128, 128, 128, 128, 128, 128]
 RESULT seq_lengths        : [45, 48, 54, 1, 4, 60, 4, 40]
 === variant='fori_loop' seed=0
-RESULT max|out - ref(fp64)| = 2.431175e+01
+RESULT max|out - ref(fp64)| = 1.785674e+01
 RESULT bad cells: 1024 / 1024  (100.00%)  @ rtol=0.001 atol=0.001
 RESULT first 10 bad cells:
 RESULT bad cells per row: [128, 128, 128, 128, 128, 128, 128, 128]
 RESULT seq_lengths        : [45, 48, 54, 1, 4, 60, 4, 40]
 === variant='unroll' seed=0
-RESULT max|out - ref(fp64)| = 2.431175e+01
+RESULT max|out - ref(fp64)| = 1.785674e+01
 RESULT bad cells: 1024 / 1024  (100.00%)  @ rtol=0.001 atol=0.001
 RESULT first 10 bad cells:
 RESULT bad cells per row: [128, 128, 128, 128, 128, 128, 128, 128]
@@ -45,7 +45,7 @@ def kernel_unroll(x_data: torch.Tensor, x_offsets: torch.Tensor, *, _launcher=_d
     # src[kernel_variants.py:88]:     l_start = tile_l.index
     # src[kernel_variants.py:89]:     block_L = tile_l.block_size
     # src[kernel_variants.py:87-99]: ...
-    _launcher(_helion_kernel_unroll, ((1024 + _BLOCK_SIZE_0 - 1) // _BLOCK_SIZE_0,), x_data, x_offsets, out, _output_indices=[2], _inplace_indices=[2], _block_spec_info=[((32, None), (0, None)), ((None,), (None,)), ((None, None), (None, None))], _ds_pad_dims=[(0, 1, 128, 0), (2, 1, 128, 0)], _smem_arg_indices=[1])
+    _launcher(_helion_kernel_unroll, ((1024 + _BLOCK_SIZE_0 - 1) // _BLOCK_SIZE_0,), x_data, x_offsets, out, _output_indices=[2], _inplace_indices=[2], _atomic_indices=[2], _block_spec_info=[((32, None), (0, None)), ((None,), (None,)), ((None, None), (None, None))], _ds_pad_dims=[(0, 1, 128, 0), (2, 1, 128, 0)], _smem_arg_indices=[1])
     # src[kernel_variants.py:100]: return out
     return out
 
@@ -60,19 +60,19 @@ def call():
     kernel_unroll(x_data, x_offsets)
 if __name__ == '__main__':
     call()
-RESULT max|out - ref(fp64)| = 2.431175e+01
+RESULT max|out - ref(fp64)| = 1.785674e+01
 RESULT bad cells: 1024 / 1024  (100.00%)  @ rtol=0.001 atol=0.001
 RESULT first 10 bad cells:
-   [  0,   0]  ref=+2.506165e+00  out=+0.000000e+00  diff=2.506165e+00
-   [  0,   1]  ref=+7.937676e-02  out=+0.000000e+00  diff=7.937676e-02
-   [  0,   2]  ref=+6.402875e+00  out=+0.000000e+00  diff=6.402875e+00
-   [  0,   3]  ref=+4.186883e+00  out=+0.000000e+00  diff=4.186883e+00
-   [  0,   4]  ref=+6.543723e+00  out=+0.000000e+00  diff=6.543723e+00
-   [  0,   5]  ref=-4.299490e+00  out=+0.000000e+00  diff=4.299490e+00
-   [  0,   6]  ref=+2.676757e+00  out=+0.000000e+00  diff=2.676757e+00
-   [  0,   7]  ref=-7.830895e+00  out=+0.000000e+00  diff=7.830895e+00
-   [  0,   8]  ref=+4.723637e+00  out=+0.000000e+00  diff=4.723637e+00
-   [  0,   9]  ref=-1.609069e+00  out=+0.000000e+00  diff=1.609069e+00
+   [  0,   0]  ref=+2.506165e+00  out=+2.718719e+00  diff=2.125542e-01
+   [  0,   1]  ref=+7.937676e-02  out=+4.184301e+00  diff=4.104925e+00
+   [  0,   2]  ref=+6.402875e+00  out=+2.672595e+00  diff=3.730280e+00
+   [  0,   3]  ref=+4.186883e+00  out=+3.830504e+00  diff=3.563790e-01
+   [  0,   4]  ref=+6.543723e+00  out=+5.337192e+00  diff=1.206532e+00
+   [  0,   5]  ref=-4.299490e+00  out=+2.399492e+00  diff=6.698982e+00
+   [  0,   6]  ref=+2.676757e+00  out=+7.238275e-01  diff=1.952929e+00
+   [  0,   7]  ref=-7.830895e+00  out=-4.843409e+00  diff=2.987486e+00
+   [  0,   8]  ref=+4.723637e+00  out=+6.468922e+00  diff=1.745285e+00
+   [  0,   9]  ref=-1.609069e+00  out=-3.463732e+00  diff=1.854663e+00
 RESULT bad cells per row: [128, 128, 128, 128, 128, 128, 128, 128]
 RESULT seq_lengths        : [45, 48, 54, 1, 4, 60, 4, 40]
 
@@ -84,8 +84,8 @@ variant=     fori_loop  n_bad=1024
 variant=        unroll  n_bad=1024
   variant[0]='emit_pipeline' vs variant[1]='fori_loop': |same|=True  |intersection|=1024  |sym_diff|=0
   variant[0]='emit_pipeline' vs variant[2]='unroll': |same|=True  |intersection|=1024  |sym_diff|=0
-I0000 00:00:1779844490.878464 2021634 compilation_cache.cc:354] Compilation cache evicted.
-I0000 00:00:1779844490.878719 2021634 compilation_cache.cc:219] CompilationCache final stats: num_cache_reqs=138
+I0000 00:00:1779844655.967900 2023689 compilation_cache.cc:354] Compilation cache evicted.
+I0000 00:00:1779844655.967933 2023689 compilation_cache.cc:219] CompilationCache final stats: num_cache_reqs=138
 num_cache_hits=111 {80.4%}
 peak_compilation_memory_bytes=unknown
 
