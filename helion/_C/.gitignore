@@ -1,0 +1,4 @@
+# Compiled native extension is a build artifact, not source.
+_native*.so
+_native*.pyd
+_native*.dylib

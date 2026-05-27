@@ -1316,6 +1316,15 @@ def _safe_bucket_dim(s: int | torch.SymInt) -> Hashable:
 
 _EMPTY_FROZENSET: frozenset[int] = frozenset()
 
+# Module-level binding of the optional C accelerator. Captured at import
+# time so the hot path inside ``_tensor_key`` skips the
+# ``helion._C.tensor_key`` attribute lookup on every call. ``None`` if
+# the C extension isn't built; in that case ``_tensor_key`` falls
+# through to the pure-Python implementation below.
+from .. import _C as _helion_C  # noqa: E402
+
+_C_tensor_key = _helion_C.tensor_key
+
 
 def _bucketed_size(obj: torch.Tensor) -> tuple[Hashable, ...]:
     sz = obj.size()
@@ -1345,6 +1354,16 @@ def _hashable_dims(dims: Sequence[int | torch.SymInt]) -> tuple[Hashable, ...]:
 
 
 def _tensor_key(fn: Kernel, obj: torch.Tensor) -> Hashable:
+    # Fast path: optional C extension that builds the static-shapes
+    # specialization tuple in C. Returns ``None`` to signal "unsupported
+    # input, fall back to Python" (e.g. for SymInt sizes, fake tensors,
+    # or dynamic-shapes mode which needs the bucketed-size logic below).
+    if _C_tensor_key is not None and fn.settings.static_shapes:
+        si = getattr(obj, "_dynamo_static_indices", None)
+        static_indices = frozenset(si) if si is not None else _EMPTY_FROZENSET
+        c_key = _C_tensor_key(obj, static_indices)
+        if c_key is not None:
+            return c_key
     si = getattr(obj, "_dynamo_static_indices", None)
     static_indices = frozenset(si) if si is not None else _EMPTY_FROZENSET
     if fn.settings.static_shapes:
