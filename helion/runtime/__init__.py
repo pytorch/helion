@@ -1049,6 +1049,7 @@ def default_pallas_pipeline_launcher(
     _pipeline_arg_indices: list[int] | None = None,
     _ds_pad_dims: list[tuple[int, int, int, int]] | None = None,
     _smem_arg_indices: list[int] | None = None,
+    _reduction_grid_dims: list[int] | None = None,
     _pallas_interpret: bool | None = None,
     **kwargs: object,
 ) -> object:
@@ -1057,6 +1058,10 @@ def default_pallas_pipeline_launcher(
     Used when ``pallas_loop_type='emit_pipeline'``.  Pipeline-body tensors
     (listed in ``_pipeline_arg_indices``) use HBM refs; all other tensors
     get proper BlockSpecs for automatic VMEM prefetch.
+
+    ``_reduction_grid_dims`` indices are marked ``"arbitrary"`` (vs the
+    default ``"parallel"``) so the pipeliner doesn't assume cross-iteration
+    independence; typically empty since matmul keeps K inside emit_pipeline.
     """
     from .settings import is_pallas_interpret
 
@@ -1177,11 +1182,16 @@ def default_pallas_pipeline_launcher(
                 f"Estimated {estimated_vmem / 1e6:.2f}MB exceeds {vmem_limit_bytes / 1e6:.2f}MB vmem capacity."
             )
 
+        reduction_grid_dims = set(_reduction_grid_dims or [])
+        dim_semantics = tuple(
+            "arbitrary" if g in reduction_grid_dims else "parallel"
+            for g in range(len(grid))
+        )
         pallas_call_kwargs: dict[str, object] = {
             "out_shape": out_shape_arg,
             "grid_spec": grid_spec,
             "compiler_params": pltpu.CompilerParams(  # pyrefly: ignore[bad-instantiation]
-                dimension_semantics=tuple("parallel" for _ in grid),
+                dimension_semantics=dim_semantics,  # pyrefly: ignore[bad-argument-type]
             ),
         }
         if interpret:
@@ -1226,6 +1236,7 @@ def default_pallas_fori_launcher(
     _scratch_shapes: list[tuple[tuple[int, ...], str | None, str]] | None = None,
     _ds_pad_dims: list[tuple[int, int, int, int]] | None = None,
     _smem_arg_indices: list[int] | None = None,
+    _reduction_grid_dims: list[int] | None = None,
     _pallas_interpret: bool | None = None,
     **kwargs: object,
 ) -> object:
@@ -1236,6 +1247,10 @@ def default_pallas_fori_launcher(
     ``pltpu.VMEM`` shapes plus ``pltpu.SemaphoreType.DMA`` for async copies.
     The kernel uses ``jax.lax.fori_loop`` with ``pltpu.make_async_copy``
     internally for DMA control.
+
+    ``_reduction_grid_dims`` marks reduction-axis grid dims as
+    ``"arbitrary"`` in ``dimension_semantics``; see
+    :func:`default_pallas_pipeline_launcher`.
     """
     from .settings import is_pallas_interpret
 
@@ -1355,11 +1370,16 @@ def default_pallas_fori_launcher(
                 f"Estimated {estimated_vmem / 1e6:.2f}MB exceeds {vmem_limit_bytes / 1e6:.2f}MB vmem capacity."
             )
 
+        reduction_grid_dims = set(_reduction_grid_dims or [])
+        dim_semantics = tuple(
+            "arbitrary" if g in reduction_grid_dims else "parallel"
+            for g in range(len(grid))
+        )
         pallas_call_kwargs: dict[str, object] = {
             "out_shape": out_shape_arg,
             "grid_spec": grid_spec,
             "compiler_params": pltpu.CompilerParams(  # pyrefly: ignore[bad-instantiation]
-                dimension_semantics=tuple("parallel" for _ in grid),
+                dimension_semantics=dim_semantics,  # pyrefly: ignore[bad-argument-type]
             ),
         }
         if interpret:
