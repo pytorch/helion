@@ -147,18 +147,23 @@ class KernelCompiler:
             self.env.finalize_config_spec()
 
     def lower(self, hf: HostFunction) -> None:
-        from .device_ir import lower_to_device_ir
+        lowering = self.env.backend.get_device_ir_lowering()
+        if lowering is not None:
+            with measure("HostFunction.lower_to_device_ir"):
+                hf.device_ir = lowering.run(hf)
+        else:
+            from .device_ir import lower_to_device_ir
 
-        factory_padding = (
-            patch_tensor_factories()
-            if self.env.backend.pad_factory_tensors_to_power_of_2
-            else contextlib.nullcontext()
-        )
-        with (
-            measure("HostFunction.lower_to_device_ir"),
-            factory_padding,
-        ):
-            hf.device_ir = lower_to_device_ir(hf)
+            factory_padding = (
+                patch_tensor_factories()
+                if self.env.backend.pad_factory_tensors_to_power_of_2
+                else contextlib.nullcontext()
+            )
+            with (
+                measure("HostFunction.lower_to_device_ir"),
+                factory_padding,
+            ):
+                hf.device_ir = lower_to_device_ir(hf)
 
     @contextlib.contextmanager
     def _compilation_context(self) -> typing.Generator[None, None, None]:
