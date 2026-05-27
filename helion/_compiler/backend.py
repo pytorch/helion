@@ -759,18 +759,7 @@ class Backend(abc.ABC):
         if bound_kernel.settings.autotune_effort == "none" and (
             force or not bound_kernel.kernel.configs
         ):
-            from ..autotuner.matmul_heuristics import (
-                matmul_heuristic_default_config_for_kernel,
-            )
-
-            config = (
-                matmul_heuristic_default_config_for_kernel(
-                    bound_kernel,
-                    args,
-                    config_spec=bound_kernel.config_spec,
-                )
-                or bound_kernel.config_spec.default_config()
-            )
+            config = bound_kernel.config_spec.default_config()
         elif not force and bound_kernel.kernel.configs:
             if len(bound_kernel.kernel.configs) == 1:
                 (config,) = bound_kernel.kernel.configs

@@ -10,6 +10,7 @@ from .cute import CuteTcgen05ClusterM2Heuristic
 from .cute import CuteTileVecHeuristic
 from .cute import CuteTileVecWarpPerRowHeuristic
 from .cute import CuteTileVecWarpReduceHeuristic
+from .triton import TritonB200MatmulHeuristic
 from .triton import TritonSkinnyGemmHeuristic
 
 if TYPE_CHECKING:
@@ -28,7 +29,7 @@ HEURISTICS_BY_BACKEND: dict[str, tuple[AutotunerHeuristicType, ...]] = {
         CuteTileVecWarpReduceHeuristic,
         CuteTileVecWarpPerRowHeuristic,
     ),
-    "triton": (TritonSkinnyGemmHeuristic,),
+    "triton": (TritonSkinnyGemmHeuristic, TritonB200MatmulHeuristic),
 }
 
 log: logging.Logger = logging.getLogger(__name__)
@@ -44,6 +45,7 @@ def compiler_seed_configs(
 ) -> list[Config]:
     configs: list[Config] = []
     env.config_spec.autotuner_heuristics = []
+    env.config_spec.compiler_default_config = None
     if env.settings.disable_autotuner_heuristics:
         return configs
 
@@ -64,5 +66,7 @@ def compiler_seed_configs(
         if config is None:
             continue
         configs.append(config)
+        if heuristic.promote_seed_to_default:
+            env.config_spec.compiler_default_config = config
         env.config_spec.autotuner_heuristics.append(heuristic.name)
     return dedupe_configs(configs)

@@ -273,6 +273,24 @@ class TestAutotunerHeuristic(TestCase):
         self.assertEqual(len(messages), 1)
         self.assertIn("Failed to transfer compiler seed config 1", messages[0])
 
+    def test_default_config_promotes_compiler_seed(self) -> None:
+        spec = ConfigSpec(backend=TritonBackend())
+        spec.block_sizes.append(BlockSizeSpec(block_id=0, size_hint=1024))
+        spec.compiler_default_config = helion.Config(
+            block_sizes=[64], num_warps=8, num_stages=2
+        )
+
+        default = spec.default_config()
+        config_gen = spec.create_config_generation()
+        flat_default = config_gen.unflatten(config_gen.default_flat())
+
+        self.assertEqual(default.config["block_sizes"], [64])
+        self.assertEqual(default.config["num_warps"], 8)
+        self.assertEqual(default.config["num_stages"], 2)
+        self.assertEqual(flat_default.config["block_sizes"], [64])
+        self.assertEqual(flat_default.config["num_warps"], 8)
+        self.assertEqual(flat_default.config["num_stages"], 2)
+
 
 class TestMatmulFacts(TestCase):
     @onlyBackends(["triton"])

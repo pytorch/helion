@@ -35,7 +35,6 @@ from .benchmark_provider import _clone_args
 from .benchmark_provider import _unset_fn
 from .benchmarking import interleaved_bench
 from .logger import AutotuningLogger
-from .matmul_heuristics import matmul_heuristic_seed_configs_for_kernel
 from .metrics import AutotuneMetrics
 from .metrics import _run_post_autotune_hooks
 from .precompile_future import PrecompileFuture as PrecompileFuture
@@ -731,24 +730,6 @@ class PopulationBasedSearch(BaseSearch):
             **super().get_kwargs_from_profile(profile, settings),
         }
 
-    def _heuristic_seed_configs(self, max_configs: int = 1) -> list[Config]:
-        return matmul_heuristic_seed_configs_for_kernel(
-            self.kernel,
-            self.args,
-            config_spec=self.config_gen.config_spec,
-            max_configs=max_configs,
-        )
-
-    def _autotune_seed_configs_with_heuristics(self) -> list[Config]:
-        return [*self._heuristic_seed_configs(), *self._autotune_seed_configs()]
-
-    def _random_population_flat_with_heuristics(self, n: int) -> list[FlatConfig]:
-        return self.config_gen.random_population_flat(
-            n,
-            user_seed_configs=self._autotune_seed_configs_with_heuristics(),
-            log_func=self.log,
-        )
-
     @property
     def best(self) -> PopulationMember:
         """
@@ -840,43 +821,25 @@ class PopulationBasedSearch(BaseSearch):
         Generate initial population using default config, explicit seed configs,
         and cached configs.
 
-        Starts with a matching heuristic config when available, otherwise starts
-        with the default configuration, then adds up to
+        Starts with the default configuration, then adds up to
         MAX_BEST_AVAILABLE_CONFIGS matching cached configs from previous runs.
         Explicit seed configs provided by the caller are added ahead of cached
         configs and are not suppressed by cache-skip settings. No random configs
         are added. Duplicate configs are discarded.
 
         Returns:
-            A list of unique FlatConfig values for the initial population. Minimum
-            size is 1 (heuristic or default), plus any valid unique explicit seed
-            configs and up to autotune_best_available_max_configs cached configs.
+            A list of unique FlatConfig values for the initial population.
+            Minimum size is 1 (default), plus any valid unique explicit seed configs
+            and up to autotune_best_available_max_configs cached configs.
         """
         max_configs = self.settings.autotune_best_available_max_configs
-        matmul_heuristic_configs = self._heuristic_seed_configs(max_configs=max_configs)
 
         seen: set[Config] = set()
-        result: list[FlatConfig] = []
-        for i, config in enumerate(matmul_heuristic_configs):
-            try:
-                flat = self.config_gen.flatten(config)
-                transferred_config = self.config_gen.unflatten(flat)
-                seen.add(transferred_config)
-                result.append(flat)
-                self.log(
-                    f"Starting with matmul heuristic config {i + 1}: "
-                    f"{transferred_config}"
-                )
-                break
-            except (ValueError, TypeError, KeyError, AssertionError) as e:
-                self.log(f"Failed to transfer matmul initial config: {e}")
-
-        if not result:
-            default_flat = self.config_gen.default_flat()
-            default_config = self.config_gen.unflatten(default_flat)
-            seen.add(default_config)
-            result.append(default_flat)
-            self.log("Starting with default config")
+        default_flat = self.config_gen.default_flat()
+        default_config = self.config_gen.unflatten(default_flat)
+        seen.add(default_config)
+        result: list[FlatConfig] = [default_flat]
+        self.log("Starting with default config")
 
         # User seed configs are explicit requests, so try them before compiler-owned
         # seeds and cached configs while still deduplicating normalized configs.

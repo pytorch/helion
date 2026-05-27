@@ -58,7 +58,6 @@ from .._dist_utils import check_config_consistancy as dist_check_config_consista
 from .._logging import LazyString
 from .._utils import counters
 from ..autotuner.base_search import _AutotunableKernel
-from ..autotuner.matmul_heuristics import matmul_heuristic_default_config_for_kernel
 from ..language.constexpr import ConstExpr
 from .config import Config
 from .ref_mode import RefModeContext
@@ -441,7 +440,6 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
         """
         super().__init__()
         self.kernel = kernel
-        self.args = args
         self._run: Callable[..., _R] | None = None
         self._config: Config | None = None
         self._compile_cache: dict[Config, CompiledConfig] = {}
@@ -508,7 +506,8 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
 
                 self.env.config_spec.configure_epilogue_subtile_autotune(args)
                 self.env.config_spec.compiler_seed_configs = compiler_seed_configs(
-                    self.env, self.host_function.device_ir
+                    self.env,
+                    self.host_function.device_ir,
                 )
 
                 # Post-compile FX-graph scan to detect kernels
@@ -1090,14 +1089,7 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
         if self.kernel.settings.autotune_effort == "none" and (
             len(self.kernel.configs) == 0 or self.settings.force_autotune
         ):
-            return (
-                matmul_heuristic_default_config_for_kernel(
-                    self,
-                    self.args,
-                    config_spec=self.config_spec,
-                )
-                or self.config_spec.default_config()
-            )
+            return self.config_spec.default_config()
         if self.settings.force_autotune:
             return None
         if len(self.kernel.configs) == 1:
@@ -1114,14 +1106,7 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
         if self.kernel.settings.autotune_effort == "none" and (
             len(configs) == 0 or self.settings.force_autotune
         ):
-            config = (
-                matmul_heuristic_default_config_for_kernel(
-                    self,
-                    self.args,
-                    config_spec=self.config_spec,
-                )
-                or self.config_spec.default_config()
-            )
+            config = self.config_spec.default_config()
             if not is_ref_mode_enabled(self.kernel.settings):
                 kernel_decorator = self.format_kernel_decorator(config, self.settings)
                 print(
