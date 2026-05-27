@@ -27,8 +27,8 @@ class DeviceIRLowering:
     """Default compilation pipeline from traced FX graphs to DeviceIR.
 
     Backends subclass this and override individual stages to customize
-    the pipeline.  Shared helper functions (prefixed with ``_``) are
-    importable so backend implementations can compose them freely.
+    the pipeline.  Shared helper functions are importable from this
+    module so backend implementations can compose them freely.
     """
 
     def run(self, func: HostFunction) -> DeviceIR:
