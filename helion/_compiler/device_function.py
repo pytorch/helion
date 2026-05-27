@@ -890,6 +890,17 @@ class DeviceFunction:
             kernel_body = hoist_loop_invariant_recips(
                 kernel_body, rename_groups=rename_groups
             )
+            # P18: software-pipeline the per-iteration vec load by one
+            # stage.  Pre-issue iter 0's load above the loop and, inside
+            # the body, issue iter N+1's load BEFORE iter N's compute
+            # runs.  The B200 SASS scheduler can then keep multiple
+            # ld.global instructions in flight, hiding HBM round-trip
+            # latency on softmax/online-reduction inner loops where the
+            # ``load -> compute(mi, di) -> next iter`` sequential
+            # dependency chain dominates the per-iter stall budget.
+            from .cute.pipeline_inner_loads import pipeline_inner_loads
+
+            kernel_body = pipeline_inner_loads(kernel_body, constexpr_values)
         return [
             *prefix,
             ast_rename(
