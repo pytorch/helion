@@ -50,5 +50,5 @@ def repro_kernel(
             # so that `chunk` (and therefore tile_l) stay live in the IR.
             partial = (chunk * 0.0).sum(dim=0) + 1.0  # (block_M,) of 1.0
             for i in range(out_size):
-                out[i, tile_m] += partial
+                hl.atomic_add(out, [i, tile_m], partial)
     return out

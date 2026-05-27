@@ -42,7 +42,7 @@ def kernel_emit_pipeline(
                 mask = (global_row >= it_start) & (global_row < it_end)
                 safe_chunk = (mask * 1.0)[:, None] * chunk
                 partial = safe_chunk.sum(dim=0)
-                out[item_idx, tile_m] += partial
+                hl.atomic_add(out, [item_idx, tile_m], partial)
     return out
 
 
@@ -69,7 +69,7 @@ def kernel_fori_loop(
                 mask = (global_row >= it_start) & (global_row < it_end)
                 safe_chunk = (mask * 1.0)[:, None] * chunk
                 partial = safe_chunk.sum(dim=0)
-                out[item_idx, tile_m] += partial
+                hl.atomic_add(out, [item_idx, tile_m], partial)
     return out
 
 
@@ -96,7 +96,7 @@ def kernel_unroll(
                 mask = (global_row >= it_start) & (global_row < it_end)
                 safe_chunk = (mask * 1.0)[:, None] * chunk
                 partial = safe_chunk.sum(dim=0)
-                out[item_idx, tile_m] += partial
+                hl.atomic_add(out, [item_idx, tile_m], partial)
     return out
 
 
