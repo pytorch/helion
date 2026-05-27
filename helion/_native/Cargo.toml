@@ -1,0 +1,28 @@
+[package]
+name = "helion_native"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Minimal Rust extension for Helion's per-call hot paths."
+
+[lib]
+# Cargo emits ``lib_launcher.so`` (Linux) / ``lib_launcher.dylib``
+# (macOS) / ``_launcher.dll`` (Windows). The README's build script
+# strips the platform-specific prefix/suffix and renames to
+# ``_launcher.<ext_suffix>`` so Python's import machinery can find it
+# as ``helion._native._launcher``.
+name = "_launcher"
+crate-type = ["cdylib"]
+
+[dependencies.pyo3]
+version = "0.28"
+# ``abi3-py310`` makes the resulting .so binary-compatible with any
+# CPython >= 3.10 — matches Helion's minimum Python version (see
+# pyproject.toml: requires-python = ">=3.10"). Without abi3 the
+# extension is pinned to whichever Python it was built against.
+features = ["abi3-py310", "extension-module"]
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
