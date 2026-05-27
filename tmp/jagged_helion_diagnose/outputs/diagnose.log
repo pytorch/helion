@@ -6,10 +6,10 @@
 + python diagnose.py
 ----- BEGIN -----
 WARNING: All log messages before absl::InitializeLog() is called are written to STDERR
-I0000 00:00:1779841058.345938 2010882 pjrt_api.cc:96] PJRT_Api is set for device type cpu
-I0000 00:00:1779841058.369915 2010882 pjrt_api.cc:118] GetPjrtApi was found for TPU at /home/ymu_google_com/miniconda3/envs/tpu/lib/python3.12/site-packages/libtpu/libtpu.so
-I0000 00:00:1779841058.369955 2010882 pjrt_api.cc:96] PJRT_Api is set for device type tpu
-I0000 00:00:1779841058.392222 2010882 device_rt.cc:97] PjRt runtime initialization deferred for tpu
+I0000 00:00:1779841460.317590 2012932 pjrt_api.cc:96] PJRT_Api is set for device type cpu
+I0000 00:00:1779841460.341671 2012932 pjrt_api.cc:118] GetPjrtApi was found for TPU at /home/ymu_google_com/miniconda3/envs/tpu/lib/python3.12/site-packages/libtpu/libtpu.so
+I0000 00:00:1779841460.341708 2012932 pjrt_api.cc:96] PJRT_Api is set for device type tpu
+I0000 00:00:1779841460.363665 2012932 device_rt.cc:97] PjRt runtime initialization deferred for tpu
 Successfully renamed PrivateUse1 backend to 'tpu'. Device: device(type='tpu')
 Registered Python module for 'tpu'.
 Device type: tpu, Device index: default
@@ -21,11 +21,11 @@ torch device (DEVICE): tpu
 ==============================================================================
 === structural repro (constant += 1.0)
 ==============================================================================
-I0000 00:00:1779841061.886139 2010882 pjrt_api.cc:167] The PJRT plugin has PJRT API version 0.108. The framework PJRT API version is 0.104.
-I0000 00:00:1779841061.886804 2010882 pjrt_c_api_client.cc:197] PjRtCApiClient created.
-W0000 00:00:1779841061.886831 2010882 pjrt_state.cc:230] Only using 1 device out of all the 8 addressable devices.
-I0000 00:00:1779841061.918689 2012140 tier2_compilation_cache.cc:149] Tier-2 compilation cache is disabled for world size 1.
-I0000 00:00:1779841061.918723 2012140 tier3_compilation_cache.cc:65] Backup compilation for tier-3 cache read is disabled as tier-3 cache is disabled.
+I0000 00:00:1779841463.824004 2012932 pjrt_api.cc:167] The PJRT plugin has PJRT API version 0.108. The framework PJRT API version is 0.104.
+I0000 00:00:1779841463.824615 2012932 pjrt_c_api_client.cc:197] PjRtCApiClient created.
+W0000 00:00:1779841463.824636 2012932 pjrt_state.cc:230] Only using 1 device out of all the 8 addressable devices.
+I0000 00:00:1779841463.857064 2014190 tier2_compilation_cache.cc:149] Tier-2 compilation cache is disabled for world size 1.
+I0000 00:00:1779841463.857093 2014190 tier3_compilation_cache.cc:65] Backup compilation for tier-3 cache read is disabled as tier-3 cache is disabled.
 INPUT  x_data.shape=(1024, 128)  out_size=8  block_L=32
 INPUT  expected per-cell value = L // block_L = 32.0
 /home/ymu_google_com/helion/helion/_compiler/compile_environment.py:238: UserWarning: The 'pallas' backend is experimental and may have limited functionality.
@@ -517,8 +517,8 @@ variant=     fori_loop  n_bad=1024
 variant=        unroll  n_bad=1024
   variant[0]='emit_pipeline' vs variant[1]='fori_loop': |same|=True  |intersection|=1024  |sym_diff|=0
   variant[0]='emit_pipeline' vs variant[2]='unroll': |same|=True  |intersection|=1024  |sym_diff|=0
-I0000 00:00:1779841064.569053 2010882 compilation_cache.cc:354] Compilation cache evicted.
-I0000 00:00:1779841064.569086 2010882 compilation_cache.cc:219] CompilationCache final stats: num_cache_reqs=138
+I0000 00:00:1779841466.525984 2012932 compilation_cache.cc:354] Compilation cache evicted.
+I0000 00:00:1779841466.526012 2012932 compilation_cache.cc:219] CompilationCache final stats: num_cache_reqs=138
 num_cache_hits=111 {80.4%}
 peak_compilation_memory_bytes=unknown
 
