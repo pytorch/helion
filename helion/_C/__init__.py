@@ -58,13 +58,30 @@ AVAILABLE: bool = False
 # Each is either a callable (C-backed) or ``None`` (use Python path).
 tensor_key = None
 
+# Minimal Chunk-E C launcher: a Python type with a ``tp_call`` slot
+# that dispatches a Triton kernel directly into ``compiled_kernel.run``,
+# bypassing both the Python ``default_launcher`` frame AND Triton's
+# ``JITFunction.run`` pipeline. Caller is responsible for priming the
+# launcher via ``CompiledLauncher.prime(triton_kernel, grid, args, ...)``
+# before installing it in place of the wrapper's ``_default_launcher``
+# kwdefault. ``None`` if the extension isn't built — callers must use
+# the pure-Python ``default_launcher`` in that case.
+CompiledLauncher = None
+
 try:
     from . import _native  # type: ignore[attr-defined]
 except ImportError as e:
-    log.debug("helion._C native extension not available: %s", e)
+    log.debug("helion._C._native not available: %s", e)
 else:
     AVAILABLE = True
     tensor_key = getattr(_native, "tensor_key", None)
 
+try:
+    from . import _launcher  # type: ignore[attr-defined]
+except ImportError as e:
+    log.debug("helion._C._launcher not available: %s", e)
+else:
+    CompiledLauncher = getattr(_launcher, "CompiledLauncher", None)
 
-__all__ = ["AVAILABLE", "tensor_key"]
+
+__all__ = ["AVAILABLE", "CompiledLauncher", "tensor_key"]

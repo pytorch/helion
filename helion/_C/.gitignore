@@ -1,4 +1,7 @@
-# Compiled native extension is a build artifact, not source.
+# Compiled native extensions are build artifacts, not source.
 _native*.so
 _native*.pyd
 _native*.dylib
+_launcher*.so
+_launcher*.pyd
+_launcher*.dylib
