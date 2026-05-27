@@ -20,11 +20,11 @@ def make_inputs(
     max_seq: int = 32,
     seq_lengths: list[int] | None = None,
     seed: int = 0,
-) -> tuple[Any, Any, list[int], int, int]:
-    """Build (x_padded[L, M_padded], offsets[B+1], seq_lengths, M_actual, M_padded).
+) -> tuple[Any, Any, list[int], int]:
+    """Build (x[L, M_actual], offsets[B+1], seq_lengths, M_actual).
 
-    Pads M_actual up to a multiple of 128 (lane alignment) using zero — zero
-    is the identity for sum, so padded lanes contribute nothing.
+    The new kernel template lane-pads M_actual internally — caller passes
+    the un-padded tensor.
     """
     import jax.numpy as jnp
 
@@ -34,18 +34,8 @@ def make_inputs(
     seq_lengths_np = np.asarray(seq_lengths, dtype=np.int32)
     offsets_np = np.concatenate([[0], np.cumsum(seq_lengths_np)]).astype(np.int32)
     L = int(offsets_np[-1])
-
-    M_padded = ((M_actual + 127) // 128) * 128
     x = rng.randn(L, M_actual).astype(np.float32)
-    if M_padded != M_actual:
-        x_padded_np = np.zeros((L, M_padded), dtype=np.float32)
-        x_padded_np[:, :M_actual] = x
-    else:
-        x_padded_np = x
-
-    x_padded = jnp.asarray(x_padded_np)
-    offsets = jnp.asarray(offsets_np, dtype=jnp.int32)
-    return x_padded, offsets, seq_lengths, M_actual, M_padded
+    return jnp.asarray(x), jnp.asarray(offsets_np, dtype=jnp.int32), seq_lengths, M_actual
 
 
 def reference_numpy(x_np: np.ndarray, offsets_np: np.ndarray) -> np.ndarray:
@@ -80,27 +70,25 @@ SIZES: list[tuple[str, dict]] = [
     ("large",  dict(B=128, M_actual=128, max_seq=2048)),
 ]
 
-# block_L = L-block height (rows DMA'd per L-program). Static, so the
-# autotuner would sweep this. For now just two values to spot-check that
-# the kernel works across more than one block size.
-BLOCK_LS = [32, 128]
+# k_sz = rows of x per DMA block. Spot-check two values.
+K_SIZES = [32, 64]
 
 
-def run_one(name: str, params: dict, *, block_L: int) -> int:
+def run_one(name: str, params: dict, *, k_sz: int) -> int:
     print("=" * 78, flush=True)
-    print(f"=== size '{name}' params={params} block_L={block_L}", flush=True)
+    print(f"=== size '{name}' params={params} k_sz={k_sz}", flush=True)
     print("=" * 78, flush=True)
     try:
-        x_padded, offsets, seq_lengths, M_actual, M_padded = make_inputs(**params)
+        x, offsets, seq_lengths, M_actual = make_inputs(**params)
     except Exception:
         print("INPUT-GEN FAILED — full traceback:", flush=True)
         traceback.print_exc()
         return 3
 
-    print(f"x_padded.shape={tuple(x_padded.shape)} dtype={x_padded.dtype}", flush=True)
+    print(f"x.shape={tuple(x.shape)} dtype={x.dtype}", flush=True)
     print(f"offsets={offsets.tolist()}  L={int(offsets[-1])}", flush=True)
     print(f"seq_lengths={seq_lengths}", flush=True)
-    print(f"M_actual={M_actual} M_padded={M_padded}", flush=True)
+    print(f"M_actual={M_actual}  (kernel lane-pads internally to multiple of 128)", flush=True)
 
     # Import inside the function so that import-time errors land in the per-size
     # log section (helps when the template itself fails to import).
@@ -112,7 +100,7 @@ def run_one(name: str, params: dict, *, block_L: int) -> int:
         return 4
 
     try:
-        out = jagged_sum_pallas(x_padded, offsets, block_L=block_L)
+        out = jagged_sum_pallas(x, offsets, k_sz=k_sz)
         out.block_until_ready()
     except Exception:
         print("KERNEL FAILED — full traceback:", flush=True)
@@ -122,15 +110,12 @@ def run_one(name: str, params: dict, *, block_L: int) -> int:
     print(f"out.shape={tuple(out.shape)} dtype={out.dtype}", flush=True)
 
     try:
-        x_np = np.asarray(x_padded)
+        x_np = np.asarray(x)
         offsets_np = np.asarray(offsets)
         out_np = np.asarray(out)
         ref_np = reference_numpy(x_np, offsets_np)
         diff = float(np.max(np.abs(out_np - ref_np)))
         print(f"max|out - ref(fp64)| = {diff:.6e}", flush=True)
-        if M_actual < M_padded:
-            tail_max = float(np.max(np.abs(out_np[:, M_actual:])))
-            print(f"max|out[:, M_actual:M_padded]| = {tail_max:.6e}", flush=True)
         # Tolerance: fp32 reductions of N values introduce O(N * eps_fp32 *
         # |sum|) noise. With max_seq up to ~2048 and Normal(0,1) inputs,
         # this can reach ~1e-3. rtol covers magnitudes; atol covers small
@@ -159,10 +144,10 @@ def main() -> int:
 
     overall_rc = 0
     for name, params in SIZES:
-        for block_L in BLOCK_LS:
-            rc = run_one(name, dict(params), block_L=block_L)
+        for k_sz in K_SIZES:
+            rc = run_one(name, dict(params), k_sz=k_sz)
             overall_rc = max(overall_rc, rc)
-            print(f"SUMMARY size='{name}' block_L={block_L} rc={rc}", flush=True)
+            print(f"SUMMARY size='{name}' k_sz={k_sz} rc={rc}", flush=True)
     return overall_rc
 
 
