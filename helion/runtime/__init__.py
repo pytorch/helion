@@ -17,6 +17,10 @@ from .. import _compat as _compat  # ensure Triton compatibility patches run
 from .. import exc
 from .._compiler.cute.strategies import tcgen05_smem_layout_expr
 from .._utils import triton_is_available
+from ._output_pool import clear_pool as clear_pool
+from ._output_pool import empty_like as empty_like
+from ._output_pool import is_pool_enabled as is_pool_enabled
+from ._output_pool import set_pool_enabled as set_pool_enabled
 from .config import Config as Config
 from .kernel import Kernel as Kernel
 from .kernel import kernel as kernel
