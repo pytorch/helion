@@ -691,7 +691,6 @@ def _pallas_build_callable(
 
     kernel_name = getattr(pallas_kernel, "__name__", "pallas_kernel")
 
-    jax.config.update("jax_export_ignore_forward_compatibility", True)
     jax_callable = JaxCallable(
         name=kernel_name,
         jit_fn=jax.jit(jit_fn),
