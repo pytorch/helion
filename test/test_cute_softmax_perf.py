@@ -29,6 +29,8 @@ performance from ~0.45x ATen to ~0.66x ATen on (4096, *) shapes:
 
 from __future__ import annotations
 
+import os
+
 import pytest
 import torch
 
@@ -800,6 +802,122 @@ class TestCuteLoadPipelineP18(TestCase):
                 os.environ.pop("HELION_DISABLE_LOAD_PIPELINE", None)
             else:
                 os.environ["HELION_DISABLE_LOAD_PIPELINE"] = old
+
+
+@onlyBackends(["cute"])
+class TestCuteLoadPipelineCarriedOnlyP19(TestCase):
+    """P19: opt-in loop-carried-scalar-write gate for the load
+    pipeline pass.
+
+    The default behavior (P18) pipelines BOTH sweeps of two-pass
+    softmax: the reduce sweep (which writes the ``mi``/``di``
+    accumulator) and the consume sweep (a pure stream-store).  In
+    microbench across the standard 4 shapes (5248/10240/12672/16384)
+    the consume-sweep pipeline still measures faster at the GPU
+    level so the default is to pipeline both.
+
+    However, autotuner sweeps that want to explore a more
+    conservative alternative (only pipeline loops with an
+    inter-iter scalar dep) can set
+    ``HELION_LOAD_PIPELINE_CARRIED_ONLY=1`` to enable the gate.
+    These tests pin both the gate semantics and the env-var plumbing.
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        self._env_to_restore: dict[str, str | None] = {}
+
+    def tearDown(self) -> None:
+        for name, prev in self._env_to_restore.items():
+            if prev is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = prev
+        super().tearDown()
+
+    def _set_env(self, name: str, value: str | None) -> None:
+        """Restore-aware env var setter."""
+        if name not in self._env_to_restore:
+            self._env_to_restore[name] = os.environ.get(name)
+        if value is None:
+            os.environ.pop(name, None)
+        else:
+            os.environ[name] = value
+
+    def test_carried_only_pipelines_reduce_sweep(self) -> None:
+        """With the gate enabled, the reduce sweep (which writes ``mi``
+        and ``di`` — both defined in the outer function-body scope
+        before the loop) MUST still be pipelined.
+        """
+        self._set_env("HELION_LOAD_PIPELINE_CARRIED_ONLY", "1")
+        x = torch.randn(4096, 12672, device=DEVICE, dtype=HALF_DTYPE)
+        code, out = code_and_output(
+            softmax_two_pass_kernel,
+            (x,),
+            block_sizes=[1, 128],
+            num_threads=[0, 32],
+            cute_vector_widths=[1, 4],
+        )
+        ref = torch.nn.functional.softmax(x, dim=1)
+        torch.testing.assert_close(out, ref, atol=1e-2, rtol=1e-2)
+        # The reduce sweep MUST still be pipelined — there's a
+        # loop-carried scalar write to ``mi`` (pre-rename: ``v_1_0
+        # = v_1``) so the gate fires positive.
+        self.assertIn("_pipe_lane_base_", code)
+        self.assertIn("_pipe_load_", code)
+        # And the per-iter snapshot ``lane_base_<N> = _pipe_lane_base_<M>``
+        # form appears inside the reduce loop body.
+        self.assertRegex(code, r"lane_base_\d+ = _pipe_lane_base_\d+")
+
+    def test_carried_only_skips_consume_sweep(self) -> None:
+        """With the gate enabled, the consume sweep (which only
+        stores into ``out[k]`` and never writes a scalar accumulator
+        in the outer scope) MUST NOT be pipelined.
+
+        The reduce-sweep pipeline writes ``_pipe_lane_base_0`` and
+        ``_pipe_load_0``; the consume sweep would have written
+        ``_pipe_lane_base_1`` and ``_pipe_load_1`` under the default
+        behavior.  Under the gate, only the ``_0`` indices appear.
+        """
+        self._set_env("HELION_LOAD_PIPELINE_CARRIED_ONLY", "1")
+        x = torch.randn(4096, 12672, device=DEVICE, dtype=HALF_DTYPE)
+        code, _ = code_and_output(
+            softmax_two_pass_kernel,
+            (x,),
+            block_sizes=[1, 128],
+            num_threads=[0, 32],
+            cute_vector_widths=[1, 4],
+        )
+        # ONLY the reduce-sweep pipe (index 0) — no index 1.
+        self.assertIn("_pipe_load_0", code)
+        self.assertNotIn("_pipe_load_1", code)
+        self.assertNotIn("_pipe_lane_base_1", code)
+        # And the consume sweep retains its original inline
+        # ``cute.arch.load`` (no snapshot/prefetch rewrite).  The
+        # consume sweep's load assigns to ``_tile_unroll_vec_1_1``.
+        self.assertIn("_tile_unroll_vec_1_1 = cute.arch.load(", code)
+
+    def test_pipeline_all_overrides_carried_only(self) -> None:
+        """``HELION_LOAD_PIPELINE_ALL=1`` must explicitly override the
+        gate even when ``HELION_LOAD_PIPELINE_CARRIED_ONLY`` is also
+        set, restoring the pre-P19 "pipeline every qualifying loop"
+        behavior.
+        """
+        self._set_env("HELION_LOAD_PIPELINE_CARRIED_ONLY", "1")
+        self._set_env("HELION_LOAD_PIPELINE_ALL", "1")
+        x = torch.randn(4096, 12672, device=DEVICE, dtype=HALF_DTYPE)
+        code, _ = code_and_output(
+            softmax_two_pass_kernel,
+            (x,),
+            block_sizes=[1, 128],
+            num_threads=[0, 32],
+            cute_vector_widths=[1, 4],
+        )
+        # Both sweeps pipelined → both _pipe_load_0 and _pipe_load_1
+        # appear (4 total ``_pipe_load_*`` write sites, same as the
+        # P18 default).
+        self.assertIn("_pipe_load_0", code)
+        self.assertIn("_pipe_load_1", code)
 
 
 @onlyBackends(["cute"])

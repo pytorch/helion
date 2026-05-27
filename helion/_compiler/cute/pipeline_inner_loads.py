@@ -64,7 +64,29 @@ The pass is conservative.  It only triggers when:
   4. The outer-loop trip count must be > 1 (otherwise there's no second
      iter to pipeline) and the loop must not be empty.
 
-Set ``HELION_DISABLE_LOAD_PIPELINE=1`` to skip the pass.
+P19 (optional gate): an opt-in heuristic restricts pipelining to
+loops whose body contains a **loop-carried scalar write** — an
+assignment to a name that is defined in the OUTER scope before the
+loop (a reduction accumulator like ``mi``/``di``).  This is the
+structural marker that the load feeds a per-iter dependency chain
+the SASS scheduler can't overlap on its own.
+
+For pure stream-store sweeps (e.g. the consume sweep of two-pass
+softmax), the SASS scheduler can already overlap consecutive iter
+loads since slow ops like ``exp``/``div`` provide latency room.
+In the standard microbench (5248/10240/12672/16384) pipelining
+the consume sweep still measures slightly faster at the GPU level
+than skipping it, so the gate is OFF by default.
+
+The gate is provided as an opt-in for autotuner sweeps that want
+to explore the "carried-only" alternative when a specific shape
+shows a wall-clock regression that the default pipeline misses.
+
+Set ``HELION_DISABLE_LOAD_PIPELINE=1`` to skip the pass entirely.
+Set ``HELION_LOAD_PIPELINE_CARRIED_ONLY=1`` to enable the P19 gate
+(only pipeline loops with a loop-carried scalar write).
+Set ``HELION_LOAD_PIPELINE_ALL=1`` to force-disable the gate even
+when the carried-only env var is set (used in test/debug scripts).
 """
 
 from __future__ import annotations
@@ -259,9 +281,86 @@ def _format_step_expr(step: ast.expr) -> str:
     return ast.unparse(step)
 
 
+class _AssignTargetCollector(ast.NodeVisitor):
+    """Collect all simple ``ast.Name`` assignment LHSes in a subtree.
+
+    Used to detect "loop-carried scalar writes": assignments inside the
+    inner body whose target name is also defined in the OUTER scope before
+    the loop (a reduction accumulator like ``mi``, ``di``).
+    """
+
+    def __init__(self) -> None:
+        self.names: set[str] = set()
+
+    def visit_Assign(self, node: ast.Assign) -> None:
+        for target in node.targets:
+            if isinstance(target, ast.Name):
+                self.names.add(target.id)
+        self.generic_visit(node)
+
+    def visit_AugAssign(self, node: ast.AugAssign) -> None:
+        if isinstance(node.target, ast.Name):
+            self.names.add(node.target.id)
+        self.generic_visit(node)
+
+
+def _names_assigned(node: ast.AST) -> set[str]:
+    c = _AssignTargetCollector()
+    c.visit(node)
+    return c.names
+
+
+def _has_loop_carried_scalar_write(
+    inner_body: list[ast.stmt],
+    outer_scope_names: set[str],
+    rename_groups: dict[str, str] | None = None,
+) -> bool:
+    """True if any statement in ``inner_body`` writes to a name in
+    ``outer_scope_names`` (after canonicalization via ``rename_groups``).
+
+    This indicates the body is a reduction-style loop where the load
+    feeds a chain that flows into the next iter via the named
+    accumulator.  Pipelining hides that chain's HBM latency.
+
+    Absent any such write (pure stream-store / read-compute-store
+    loops), the SASS scheduler can already overlap consecutive iter
+    loads naturally and pipelining only inflates register pressure.
+
+    The check is recursive — it traverses the full subtree of each
+    inner-body statement so writes nested inside ``range_constexpr``
+    V-loops or if-bodies are correctly counted.
+
+    ``rename_groups`` (if supplied) maps pre-rename SSA names (e.g.
+    ``v_1_0``) to their post-rename canonical names (e.g. ``mi``).
+    The pipeline pass runs BEFORE ``ast_rename`` collapses those
+    aliases, so inner writes to ``v_1_0`` need to be matched against
+    the outer-scope ``mi`` initialization.
+    """
+    renames = rename_groups or {}
+    # Canonicalize outer_scope_names: anything that's the TARGET of a
+    # rename group (i.e., the canonical name) stays as-is; pre-rename
+    # aliases get their canonical name added too, so a write to either
+    # form counts.
+    canonical_outer = set(outer_scope_names)
+    for pre, canon in renames.items():
+        if pre in outer_scope_names or canon in outer_scope_names:
+            canonical_outer.add(pre)
+            canonical_outer.add(canon)
+
+    for stmt in inner_body:
+        for written in _names_assigned(stmt):
+            # Canonicalize the written name through rename_groups.
+            canon = renames.get(written, written)
+            if written in canonical_outer or canon in canonical_outer:
+                return True
+    return False
+
+
 def _try_pipeline_one_outer_loop(
     loop: ast.For,
     constexpr_values: dict[str, int] | None,
+    outer_scope_names: set[str] | None = None,
+    rename_groups: dict[str, str] | None = None,
 ) -> list[ast.stmt] | None:
     """Try to software-pipeline a single qualifying outer loop.
 
@@ -341,6 +440,45 @@ def _try_pipeline_one_outer_loop(
     if len(body) != 1:
         return None
 
+    # P19 optional gate: when ``HELION_LOAD_PIPELINE_CARRIED_ONLY=1`` is
+    # set, only pipeline loops whose body has a **loop-carried scalar
+    # write** — an assignment to a name defined in the OUTER scope
+    # before the loop (a reduction accumulator like ``mi``/``di``).
+    #
+    # This is the structural marker that the load feeds a per-iter
+    # dependency chain, which is exactly when software pipelining
+    # most clearly hides HBM latency.  For pure stream-store sweeps
+    # (e.g., the consume sweep of two-pass softmax:
+    # ``out[k] = exp(values - mi) / di``) there's no inter-iter dep —
+    # the SASS scheduler can already overlap consecutive iter loads
+    # without help from us, and pipelining only inflates register
+    # pressure and instruction count.  In practice the consume-sweep
+    # pipeline does sometimes help (the slow ``exp``/``div`` ops give
+    # the prefetch room to hide), but on a few softmax shapes where
+    # the trip count is awkward (e.g., ``(4096, 12672)`` → 99 trips),
+    # NCU shows the consume-sweep pipeline can be a small wall-clock
+    # regression.
+    #
+    # The gate is OPT-IN (default OFF) because in microbench across
+    # the standard four shapes (5248/10240/12672/16384) full
+    # pipelining (the P18 default) still measures faster at the GPU
+    # level than carried-only.  The env var is provided so an
+    # autotuner sweep or a future heuristic can flip it without
+    # touching code.
+    #
+    # ``HELION_LOAD_PIPELINE_ALL=1`` is an alias that explicitly
+    # disables the gate (pre-P19 behavior — pipeline every qualifying
+    # loop).  The two env vars are inverses; the ``ALL`` form is kept
+    # for explicitness in test/debug scripts.
+    _carried_only = os.environ.get(
+        "HELION_LOAD_PIPELINE_CARRIED_ONLY"
+    ) and not os.environ.get("HELION_LOAD_PIPELINE_ALL")
+    if _carried_only and outer_scope_names is not None:
+        if not _has_loop_carried_scalar_write(
+            inner_body, outer_scope_names, rename_groups
+        ):
+            return None
+
     # Now: allocate pipeline shadow names and build the prologue.
     pipe_lane_base, pipe_load = _new_pipe_names()
 
@@ -405,27 +543,77 @@ def _try_pipeline_one_outer_loop(
 def _walk_and_pipeline(
     body: list[ast.stmt],
     constexpr_values: dict[str, int] | None,
+    outer_scope_names: set[str] | None = None,
+    rename_groups: dict[str, str] | None = None,
 ) -> list[ast.stmt]:
     """Walk ``body`` recursively, attempting the pipeline transform on
     each top-level qualifying outer loop.  Returns a new body list.
+
+    ``outer_scope_names`` tracks names already defined in scopes that
+    enclose ``body``.  Names assigned within ``body`` before each
+    candidate loop are unioned in as we walk, so by the time we test a
+    given outer loop we know every name that's "live and visible" in
+    the enclosing scope of the loop.  See ``_try_pipeline_one_outer_loop``
+    for the gating rationale.
+
+    ``rename_groups`` maps pre-rename SSA names to their post-rename
+    canonical names so the gate can correctly identify loop-carried
+    writes that pre-rename go to alias names (e.g. ``v_1_0 = v_1``
+    that ``ast_rename`` will collapse to ``mi = v_1``).
     """
+    if outer_scope_names is None:
+        outer_scope_names = set()
+    # The names visible to each loop body are: enclosing scope names
+    # (passed in) plus assignments earlier in this scope.  We track the
+    # latter as we walk so each candidate sees its own correct snapshot.
+    local_visible: set[str] = set(outer_scope_names)
     new_body: list[ast.stmt] = []
     for stmt in body:
-        # Recurse into nested scopes.
+        # Recurse into nested scopes BEFORE the assignment-tracking step
+        # so the recursion sees the correct visible set.
         if isinstance(stmt, ast.FunctionDef):
-            stmt.body = _walk_and_pipeline(stmt.body, constexpr_values)
+            # A new function scope; do not propagate enclosing names.
+            stmt.body = _walk_and_pipeline(
+                stmt.body, constexpr_values, rename_groups=rename_groups
+            )
             new_body.append(stmt)
             continue
         if isinstance(stmt, (ast.For, ast.If, ast.With)):
-            # Recurse into the body first.
-            stmt.body = _walk_and_pipeline(stmt.body, constexpr_values)
+            # Recurse into the body first, passing through the current
+            # visible set so nested loops can see outer-scope writes.
+            stmt.body = _walk_and_pipeline(
+                stmt.body, constexpr_values, local_visible, rename_groups
+            )
             if isinstance(stmt, (ast.For, ast.If)):
-                stmt.orelse = _walk_and_pipeline(stmt.orelse, constexpr_values)
+                stmt.orelse = _walk_and_pipeline(
+                    stmt.orelse, constexpr_values, local_visible, rename_groups
+                )
         if isinstance(stmt, ast.For):
-            pipelined = _try_pipeline_one_outer_loop(stmt, constexpr_values)
+            pipelined = _try_pipeline_one_outer_loop(
+                stmt, constexpr_values, local_visible, rename_groups
+            )
             if pipelined is not None:
                 new_body.extend(pipelined)
+                # Update local_visible to include any names written by
+                # the rewritten loop's outer-level prologue.
+                for ps in pipelined:
+                    if isinstance(ps, ast.Assign):
+                        for target in ps.targets:
+                            if isinstance(target, ast.Name):
+                                local_visible.add(target.id)
                 continue
+        # Track this statement's assignments so subsequent candidate
+        # loops in this scope see them as outer-scope-visible.
+        if isinstance(stmt, ast.Assign):
+            for target in stmt.targets:
+                if isinstance(target, ast.Name):
+                    local_visible.add(target.id)
+        elif isinstance(stmt, ast.AugAssign) and isinstance(stmt.target, ast.Name):
+            local_visible.add(stmt.target.id)
+        elif isinstance(stmt, ast.For):
+            # The for-loop body may have written to outer-visible names
+            # via reduction accumulator updates; union those in too.
+            local_visible |= _names_assigned(stmt)
         new_body.append(stmt)
     return new_body
 
@@ -433,6 +621,7 @@ def _walk_and_pipeline(
 def pipeline_inner_loads(
     body: list[ast.stmt],
     constexpr_values: dict[str, int] | None = None,
+    rename_groups: dict[str, str] | None = None,
 ) -> list[ast.stmt]:
     """Apply the inner-load pipelining peephole to a kernel body.
 
@@ -440,12 +629,26 @@ def pipeline_inner_loads(
     ``_BLOCK_SIZE_1``) to their static int value so the range trip
     count can be resolved.
 
+    ``rename_groups`` (optional) maps pre-rename SSA names to their
+    post-rename canonical names (e.g. ``{"v_1_0": "mi"}``).  The pass
+    runs BEFORE ``ast_rename`` collapses those aliases, so the
+    loop-carried-write gate uses this map to identify reduction
+    accumulator writes whose pre-rename target is an alias.  Without
+    this, the gate would mis-classify the softmax reduce sweep as
+    having no loop-carried write and skip pipelining.
+
     Returns the (possibly modified) body.  Safe to call on any kernel
     body — only rewrites when the strict pattern match succeeds.
 
-    Set ``HELION_DISABLE_LOAD_PIPELINE=1`` to skip the pass.
+    Env vars:
+      * ``HELION_DISABLE_LOAD_PIPELINE=1`` — skip the pass entirely.
+      * ``HELION_LOAD_PIPELINE_CARRIED_ONLY=1`` — opt in to the P19
+        loop-carried-scalar-write gate (only pipeline reduction-style
+        loops); see module docstring.
+      * ``HELION_LOAD_PIPELINE_ALL=1`` — explicit override that
+        force-disables the gate.
     """
     if os.environ.get("HELION_DISABLE_LOAD_PIPELINE"):
         return body
     _PIPE_COUNTER[0] = 0
-    return _walk_and_pipeline(body, constexpr_values)
+    return _walk_and_pipeline(body, constexpr_values, rename_groups=rename_groups)
