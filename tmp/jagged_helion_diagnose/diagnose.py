@@ -146,6 +146,71 @@ def analyze(
     return {"variant": variant_name, "seed": seed, "n_bad": n_bad, "bad_idx": bad_idx_list}
 
 
+def run_structural_repro() -> None:
+    """Minimal repro: same `out[i, tile_m] += partial` access pattern with
+    a CONSTANT partial of 1.0. Expected output: every cell equals L // block_L
+    (the number of L-programs each contributing +1.0). All zeros => structural
+    codegen bug; expected value => bug is somewhere in the mask / partial
+    computation of the original kernel.
+    """
+    print(f"\n{'='*78}\n=== structural repro (constant += 1.0)\n{'='*78}", flush=True)
+    try:
+        from repro_kernel import repro_kernel
+    except Exception:
+        print("REPRO IMPORT FAILED — full traceback:", flush=True)
+        traceback.print_exc()
+        return
+
+    out_size = 8
+    L = 1024
+    M = 128
+    block_L = 32
+    expected = float(L // block_L)  # = 32
+
+    x_data = torch.randn(L, M, dtype=torch.float32).to(DEVICE)
+    out_size_hint = torch.zeros(out_size, dtype=torch.int32, device=DEVICE)
+
+    print(f"INPUT  x_data.shape=({L}, {M})  out_size={out_size}  block_L={block_L}",
+          flush=True)
+    print(f"INPUT  expected per-cell value = L // block_L = {expected}", flush=True)
+    try:
+        out = repro_kernel(x_data, out_size_hint)
+    except Exception:
+        print("REPRO KERNEL FAILED — full traceback:", flush=True)
+        traceback.print_exc()
+        return
+
+    out_cpu = out.detach().cpu()
+    print(f"RESULT out.shape={tuple(out.shape)} dtype={out.dtype}", flush=True)
+    print(f"RESULT out[:, :4] =", flush=True)
+    for r in range(out_size):
+        print(f"   row {r}: {out_cpu[r, :4].tolist()}", flush=True)
+    minv, maxv = float(out_cpu.min()), float(out_cpu.max())
+    print(f"RESULT min={minv:.6f}  max={maxv:.6f}", flush=True)
+    if (out_cpu == 0).all():
+        print(
+            "REPRO VERDICT: all zeros — writes silently dropped at codegen. "
+            "Confirms STRUCTURAL bug: Helion's Pallas codegen does not "
+            "propagate in-place += writes to outputs whose index_map "
+            "doesn't include the outer tile axis.",
+            flush=True,
+        )
+    elif torch.allclose(out_cpu, torch.full_like(out_cpu, expected), rtol=1e-4, atol=1e-4):
+        print(
+            f"REPRO VERDICT: all cells == {expected} — structural pattern WORKS. "
+            "The all-zeros bug in jagged_sum_tpu must be in the mask / "
+            "partial-value computation, not in the access pattern.",
+            flush=True,
+        )
+    else:
+        uniques = out_cpu.unique().tolist()
+        print(
+            f"REPRO VERDICT: unexpected mix. unique values (up to 20): "
+            f"{uniques[:20]}",
+            flush=True,
+        )
+
+
 def main() -> int:
     import jax
 
@@ -153,9 +218,10 @@ def main() -> int:
     print("jax devices:", jax.devices(), flush=True)
     print("torch device (DEVICE):", DEVICE, flush=True)
 
-    # Sweep all three pallas_loop_type variants on the same data, same seed.
-    # Single seed is enough — the bug is deterministic, and using only one
-    # seed keeps the log tractable.
+    # 1) Structural repro first — cheap, isolates the question.
+    run_structural_repro()
+
+    # 2) Three-variant sweep on the actual user kernel.
     seed = 0
     all_results = []
     for variant_name, kernel_fn in VARIANTS.items():
