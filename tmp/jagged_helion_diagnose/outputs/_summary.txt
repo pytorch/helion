@@ -1,4 +1,9 @@
 === summary (rc=1) ===
+=== structural repro (constant += 1.0)
+RESULT out.shape=(8, 128) dtype=torch.float32
+RESULT out[:, :4] =
+RESULT min=1.000000  max=1.000000
+REPRO VERDICT: unexpected mix. unique values (up to 20): [1.0]
 === variant='emit_pipeline' seed=0
 RESULT max|out - ref(fp64)| = 2.431175e+01
 RESULT bad cells: 1024 / 1024  (100.00%)  @ rtol=0.001 atol=0.001
@@ -79,9 +84,9 @@ variant=     fori_loop  n_bad=1024
 variant=        unroll  n_bad=1024
   variant[0]='emit_pipeline' vs variant[1]='fori_loop': |same|=True  |intersection|=1024  |sym_diff|=0
   variant[0]='emit_pipeline' vs variant[2]='unroll': |same|=True  |intersection|=1024  |sym_diff|=0
-I0000 00:00:1779839667.198778 2006362 compilation_cache.cc:354] Compilation cache evicted.
-I0000 00:00:1779839667.198807 2006362 compilation_cache.cc:219] CompilationCache final stats: num_cache_reqs=135
-num_cache_hits=110 {81.4%}
+I0000 00:00:1779840194.850589 2008818 compilation_cache.cc:354] Compilation cache evicted.
+I0000 00:00:1779840194.850897 2008818 compilation_cache.cc:219] CompilationCache final stats: num_cache_reqs=138
+num_cache_hits=111 {80.4%}
 peak_compilation_memory_bytes=unknown
 
 ----- END (exit=1) -----

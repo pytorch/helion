@@ -6,10 +6,10 @@
 + python diagnose.py
 ----- BEGIN -----
 WARNING: All log messages before absl::InitializeLog() is called are written to STDERR
-I0000 00:00:1779839660.988220 2006362 pjrt_api.cc:96] PJRT_Api is set for device type cpu
-I0000 00:00:1779839661.012316 2006362 pjrt_api.cc:118] GetPjrtApi was found for TPU at /home/ymu_google_com/miniconda3/envs/tpu/lib/python3.12/site-packages/libtpu/libtpu.so
-I0000 00:00:1779839661.012354 2006362 pjrt_api.cc:96] PJRT_Api is set for device type tpu
-I0000 00:00:1779839661.034436 2006362 device_rt.cc:97] PjRt runtime initialization deferred for tpu
+I0000 00:00:1779840188.679808 2008818 pjrt_api.cc:96] PJRT_Api is set for device type cpu
+I0000 00:00:1779840188.704302 2008818 pjrt_api.cc:118] GetPjrtApi was found for TPU at /home/ymu_google_com/miniconda3/envs/tpu/lib/python3.12/site-packages/libtpu/libtpu.so
+I0000 00:00:1779840188.704344 2008818 pjrt_api.cc:96] PJRT_Api is set for device type tpu
+I0000 00:00:1779840188.726759 2008818 device_rt.cc:97] PjRt runtime initialization deferred for tpu
 Successfully renamed PrivateUse1 backend to 'tpu'. Device: device(type='tpu')
 Registered Python module for 'tpu'.
 Device type: tpu, Device index: default
@@ -19,18 +19,121 @@ jax devices: [TpuDevice(id=0, process_index=0, coords=(0,0,0), core_on_chip=0), 
 torch device (DEVICE): tpu
 
 ==============================================================================
+=== structural repro (constant += 1.0)
+==============================================================================
+I0000 00:00:1779840192.167791 2008818 pjrt_api.cc:167] The PJRT plugin has PJRT API version 0.108. The framework PJRT API version is 0.104.
+I0000 00:00:1779840192.168435 2008818 pjrt_c_api_client.cc:197] PjRtCApiClient created.
+W0000 00:00:1779840192.168458 2008818 pjrt_state.cc:230] Only using 1 device out of all the 8 addressable devices.
+I0000 00:00:1779840192.201798 2010076 tier2_compilation_cache.cc:149] Tier-2 compilation cache is disabled for world size 1.
+I0000 00:00:1779840192.201833 2010076 tier3_compilation_cache.cc:65] Backup compilation for tier-3 cache read is disabled as tier-3 cache is disabled.
+INPUT  x_data.shape=(1024, 128)  out_size=8  block_L=32
+INPUT  expected per-cell value = L // block_L = 32.0
+/home/ymu_google_com/helion/helion/_compiler/compile_environment.py:238: UserWarning: The 'pallas' backend is experimental and may have limited functionality.
+  warn_once(
+# Output code written to: /tmp/torchinductor_ymu_google_com/aw/cawfgm3qvvogo2qm4dvrcn3jstdru4v4zkdyj65acssz6myuul2s.py
+from __future__ import annotations
+
+import torch
+import jax.numpy as jnp
+from jax.experimental import pallas as pl
+import jax.lax as lax
+from jax.experimental.pallas import tpu as pltpu
+from helion.runtime import default_pallas_pipeline_launcher as _default_pallas_pipeline_launcher
+
+_BLOCK_SIZE_0 = int(32)
+_BLOCK_SIZE_1 = int(128)
+_BLOCK_SIZE_2 = int(1)
+
+def _helion_repro_kernel(x_data, out):
+    # src[repro_kernel.py:47]: for tile_m in hl.tile(M):
+    # src[repro_kernel.py:48]:     chunk = x_data[tile_l, tile_m]
+    # src[repro_kernel.py:49]:     # Constant partial of value 1.0 per column. Done via `chunk * 0.0`
+    # src[repro_kernel.py:47-53]: ...
+    _outer_pid_0 = pl.program_id(0)
+
+    def _pipeline_body(_pipeline_indices, x_data_vmem):
+        offset_1 = 0 + _pipeline_indices[0] * _BLOCK_SIZE_1
+        # src[repro_kernel.py:48]: chunk = x_data[tile_l, tile_m]
+        chunk = x_data_vmem[:, :]
+        # src[repro_kernel.py:51]: partial = (chunk * 0.0).sum(dim=0) + 1.0  # (block_M,) of 1.0
+        v_0 = jnp.array(0.0, dtype=jnp.float32)
+        v_1 = chunk * v_0
+        sum_1 = lax.convert_element_type(jnp.sum(v_1, axis=0), jnp.float32)
+        v_2 = jnp.array(1.0, dtype=jnp.float32)
+        v_3 = sum_1 + v_2
+        # src[repro_kernel.py:52]: for i in range(out_size):
+        # src[repro_kernel.py:53]:     out[i, tile_m] += partial
+        _outer_pid_0 = pl.program_id(0)
+
+        def _pipeline_body_1(_pipeline_indices):
+            offset_2 = 0 + _pipeline_indices[0] * _BLOCK_SIZE_2
+            offset_2 = 0 + _pipeline_indices[0] * _BLOCK_SIZE_2
+            v_3_copy = v_3
+            v_3_copy_0 = v_3_copy
+            # src[repro_kernel.py:53]: out[i, tile_m] += partial
+            load = out[offset_2, pl.ds(pl.multiple_of(offset_1, _BLOCK_SIZE_1), _BLOCK_SIZE_1)]
+            v_4 = load + v_3_copy_0
+            out[offset_2, pl.ds(pl.multiple_of(offset_1, _BLOCK_SIZE_1), _BLOCK_SIZE_1)] = v_4
+        # src[repro_kernel.py:52]: for i in range(out_size):
+        # src[repro_kernel.py:53]:     out[i, tile_m] += partial
+        pltpu.emit_pipeline(_pipeline_body_1, grid=((8 - 0 + _BLOCK_SIZE_2 - 1) // _BLOCK_SIZE_2,), _explicit_indices=True)()
+    # src[repro_kernel.py:47]: for tile_m in hl.tile(M):
+    # src[repro_kernel.py:48]:     chunk = x_data[tile_l, tile_m]
+    # src[repro_kernel.py:49]:     # Constant partial of value 1.0 per column. Done via `chunk * 0.0`
+    # src[repro_kernel.py:47-53]: ...
+    pltpu.emit_pipeline(_pipeline_body, grid=((128 - 0 + _BLOCK_SIZE_1 - 1) // _BLOCK_SIZE_1,), in_specs=[pl.BlockSpec((_BLOCK_SIZE_0, _BLOCK_SIZE_1), lambda _j: (_outer_pid_0, _j), pipeline_mode=pl.Buffered(buffer_count=2))], _explicit_indices=True)(x_data)
+
+def repro_kernel(x_data: torch.Tensor, out_size_hint: torch.Tensor, *, _launcher=_default_pallas_pipeline_launcher):
+    # src[repro_kernel.py:40]: out_size = out_size_hint.shape[0]
+    out_size = out_size_hint.shape[0]
+    # src[repro_kernel.py:41]: M = x_data.shape[1]
+    M = x_data.shape[1]
+    # src[repro_kernel.py:42]: L = x_data.shape[0]
+    L = x_data.shape[0]
+    # src[repro_kernel.py:43]: out = torch.zeros(
+    # src[repro_kernel.py:44]:     [out_size, M], dtype=x_data.dtype, device=x_data.device
+    # src[repro_kernel.py:45]: )
+    out = torch.zeros([out_size, M], dtype=x_data.dtype, device=x_data.device)
+    # src[repro_kernel.py:46]: for tile_l in hl.tile(L):
+    _BLOCK_SIZE_0 = 32
+    # src[repro_kernel.py:46]: for tile_l in hl.tile(L):
+    # src[repro_kernel.py:47]:     for tile_m in hl.tile(M):
+    # src[repro_kernel.py:48]:         chunk = x_data[tile_l, tile_m]
+    # src[repro_kernel.py:46-53]: ...
+    _launcher(_helion_repro_kernel, ((1024 + _BLOCK_SIZE_0 - 1) // _BLOCK_SIZE_0,), x_data, out, _output_indices=[1], _inplace_indices=[1], _block_spec_info=[((32, None), (0, None)), ((None, None), (None, None))], _ds_pad_dims=[(0, 1, 128, 0), (1, 1, 128, 0)], _pipeline_arg_indices=[0])
+    # src[repro_kernel.py:54]: return out
+    return out
+
+def call():
+    from torch._dynamo.testing import rand_strided
+    # src[repro_kernel.py:36]: def repro_kernel(
+    # src[repro_kernel.py:37]:     x_data: torch.Tensor,        # [L, M] — only used to keep tile_l live
+    # src[repro_kernel.py:38]:     out_size_hint: torch.Tensor, # [out_size]    — out_size from shape
+    # src[repro_kernel.py:36-54]: ...
+    x_data = rand_strided(size=(1024, 128), stride=(128, 1), dtype=torch.float32, device='tpu:0')
+    out_size_hint = rand_strided(size=(8,), stride=(1,), dtype=torch.int32, device='tpu:0')
+    repro_kernel(x_data, out_size_hint)
+if __name__ == '__main__':
+    call()
+RESULT out.shape=(8, 128) dtype=torch.float32
+RESULT out[:, :4] =
+   row 0: [1.0, 1.0, 1.0, 1.0]
+   row 1: [1.0, 1.0, 1.0, 1.0]
+   row 2: [1.0, 1.0, 1.0, 1.0]
+   row 3: [1.0, 1.0, 1.0, 1.0]
+   row 4: [1.0, 1.0, 1.0, 1.0]
+   row 5: [1.0, 1.0, 1.0, 1.0]
+   row 6: [1.0, 1.0, 1.0, 1.0]
+   row 7: [1.0, 1.0, 1.0, 1.0]
+RESULT min=1.000000  max=1.000000
+REPRO VERDICT: unexpected mix. unique values (up to 20): [1.0]
+
+==============================================================================
 === variant='emit_pipeline' seed=0
 ==============================================================================
-I0000 00:00:1779839664.514650 2006362 pjrt_api.cc:167] The PJRT plugin has PJRT API version 0.108. The framework PJRT API version is 0.104.
-I0000 00:00:1779839664.515300 2006362 pjrt_c_api_client.cc:197] PjRtCApiClient created.
-W0000 00:00:1779839664.515321 2006362 pjrt_state.cc:230] Only using 1 device out of all the 8 addressable devices.
-I0000 00:00:1779839664.547197 2007619 tier2_compilation_cache.cc:149] Tier-2 compilation cache is disabled for world size 1.
-I0000 00:00:1779839664.547227 2007619 tier3_compilation_cache.cc:65] Backup compilation for tier-3 cache read is disabled as tier-3 cache is disabled.
 INPUT  x_padded.shape=(1024, 128)  L_nnz=256
 INPUT  offsets=[0, 45, 93, 147, 148, 152, 212, 216, 256]
 INPUT  seq_lengths=[45, 48, 54, 1, 4, 60, 4, 40]
-/home/ymu_google_com/helion/helion/_compiler/compile_environment.py:238: UserWarning: The 'pallas' backend is experimental and may have limited functionality.
-  warn_once(
 # Output code written to: /tmp/torchinductor_ymu_google_com/h2/ch2sl7szbpqabaocgv5f52pgv43qi3mque6q77gpdyksvehjq56k.py
 from __future__ import annotations
 
@@ -414,9 +517,9 @@ variant=     fori_loop  n_bad=1024
 variant=        unroll  n_bad=1024
   variant[0]='emit_pipeline' vs variant[1]='fori_loop': |same|=True  |intersection|=1024  |sym_diff|=0
   variant[0]='emit_pipeline' vs variant[2]='unroll': |same|=True  |intersection|=1024  |sym_diff|=0
-I0000 00:00:1779839667.198778 2006362 compilation_cache.cc:354] Compilation cache evicted.
-I0000 00:00:1779839667.198807 2006362 compilation_cache.cc:219] CompilationCache final stats: num_cache_reqs=135
-num_cache_hits=110 {81.4%}
+I0000 00:00:1779840194.850589 2008818 compilation_cache.cc:354] Compilation cache evicted.
+I0000 00:00:1779840194.850897 2008818 compilation_cache.cc:219] CompilationCache final stats: num_cache_reqs=138
+num_cache_hits=111 {80.4%}
 peak_compilation_memory_bytes=unknown
 
 ----- END (exit=1) -----
