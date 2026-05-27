@@ -364,6 +364,7 @@ class TestExamplesDist(TestCase, MultiProcessTestCase):
         self._init_process()
         from torch._C._distributed_c10d import _SymmetricMemory
 
+        os.environ["_USE_HARDCODED_CONFIG_FOR_CI"] = "1"
         mod = import_path(
             EXAMPLES_DIR / "distributed" / "fp8_scaled_all_gather_matmul.py"
         )

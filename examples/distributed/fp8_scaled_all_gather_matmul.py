@@ -33,13 +33,23 @@ def _wait_progress_at_idx(progress: tl.tensor, idx: int) -> None:
     triton_wait_signal(progress + idx, 1, 0, "acquire", "gpu", "ld", False)
 
 
+# Use hardcoded config in CI to avoid autotuning overhead.
+# Users get autotuning (config=None) for their specific platform.
+_KERNEL_CONFIG_4H100 = helion.Config(
+    block_sizes=[128, 256, 128],  # M, N, K
+    num_warps=8,
+    num_stages=3,
+    indexing="block_ptr",
+)
+_KERNEL_CONFIG = (
+    _KERNEL_CONFIG_4H100
+    if os.environ.get("_USE_HARDCODED_CONFIG_FOR_CI") == "1"
+    else None
+)
+
+
 @helion.kernel(
-    config=helion.Config(
-        block_sizes=[128, 256, 128],  # M, N, K
-        num_warps=8,
-        num_stages=3,
-        indexing="block_ptr",
-    ),
+    config=_KERNEL_CONFIG,
     static_shapes=True,
     ignore_warnings=[helion.exc.TensorOperationInWrapper],
 )
