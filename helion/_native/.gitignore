@@ -1,0 +1,5 @@
+# Build artifacts are not source.
+target/
+*.so
+*.pyd
+*.dylib
