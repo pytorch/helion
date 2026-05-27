@@ -3070,6 +3070,56 @@ class TestPallasIndirectGather(TestCase):
         ref = table.cpu()[indices.long().cpu()].to(device=DEVICE)
         torch.testing.assert_close(result, ref, rtol=1e-2, atol=1e-2)
 
+    @parametrize("static_shapes", (True, False))
+    def test_gather_mid_dim_3d_float(self, static_shapes: bool) -> None:
+        """Float gather on mid dim of a 3D table emits moveaxis."""
+
+        @helion.kernel(backend="pallas", static_shapes=static_shapes)
+        def gather(indices: torch.Tensor, table: torch.Tensor) -> torch.Tensor:
+            out = torch.empty(
+                [table.size(0), indices.size(0), table.size(2)],
+                dtype=table.dtype,
+                device=table.device,
+            )
+            for tile_a, tile_b, tile_c in hl.tile(
+                [table.size(0), indices.size(0), table.size(2)]
+            ):
+                out[tile_a, tile_b, tile_c] = table[tile_a, indices[tile_b], tile_c]
+            return out
+
+        table = torch.randn(8, 16, 32, device=DEVICE, dtype=torch.bfloat16)
+        indices = torch.randint(0, 16, (64,), device=DEVICE, dtype=torch.int32)
+        code, result = code_and_output(
+            gather, (indices, table), block_sizes=[8, 64, 32]
+        )
+        self.assertIn("dot_general", code)
+        self.assertIn("moveaxis", code)
+        torch.testing.assert_close(result, table[:, indices.long(), :])
+
+    @parametrize("static_shapes", (True, False))
+    def test_gather_mid_dim_2d_index(self, static_shapes: bool) -> None:
+        """Float gather with 2D index on mid dim exercises full moveaxis formula."""
+
+        @helion.kernel(backend="pallas", static_shapes=static_shapes)
+        def gather(indices: torch.Tensor, table: torch.Tensor) -> torch.Tensor:
+            A, _, C = table.size(0), table.size(1), table.size(2)
+            B, S = indices.size(0), indices.size(1)
+            out = torch.empty([A, B, S, C], dtype=table.dtype, device=table.device)
+            for tile_a, tile_b, tile_s, tile_c in hl.tile([A, B, S, C]):
+                out[tile_a, tile_b, tile_s, tile_c] = table[
+                    tile_a, indices[tile_b, tile_s], tile_c
+                ]
+            return out
+
+        table = torch.randn(4, 8, 16, device=DEVICE, dtype=torch.bfloat16)
+        indices = torch.randint(0, 8, (2, 4), device=DEVICE, dtype=torch.int32)
+        code, result = code_and_output(
+            gather, (indices, table), block_sizes=[4, 2, 4, 16]
+        )
+        self.assertIn("dot_general", code)
+        self.assertIn("moveaxis", code)
+        torch.testing.assert_close(result, table[:, indices.long(), :])
+
 
 instantiate_parametrized_tests(TestPallasIndirectGather)
 

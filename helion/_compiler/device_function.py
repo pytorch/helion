@@ -880,7 +880,35 @@ class DeviceFunction:
             # +20% bench gain on (4096, 12672) fp16.
             from .cute.hoist_loop_invariant_recip import hoist_loop_invariant_recips
 
-            kernel_body = hoist_loop_invariant_recips(kernel_body)
+            # Pass the post-renames map so the invariance analysis can
+            # treat ``v_1_0`` (which will be renamed to ``mi`` by
+            # ast_rename below) as an assignment to ``mi`` for the
+            # purpose of LICM.  Without this the FMA hoist would
+            # mistakenly classify ``mi`` as loop-invariant in the reduce
+            # loop and capture its stale initial value.
+            rename_groups = {k: v[0] for k, v in self._variable_renames.items()}
+            kernel_body = hoist_loop_invariant_recips(
+                kernel_body, rename_groups=rename_groups
+            )
+            # P18: software-pipeline the per-iteration vec load by one
+            # stage.  Pre-issue iter 0's load above the loop and, inside
+            # the body, issue iter N+1's load BEFORE iter N's compute
+            # runs.  The B200 SASS scheduler can then keep multiple
+            # ld.global instructions in flight, hiding HBM round-trip
+            # latency on softmax/online-reduction inner loops where the
+            # ``load -> compute(mi, di) -> next iter`` sequential
+            # dependency chain dominates the per-iter stall budget.
+            from .cute.pipeline_inner_loads import pipeline_inner_loads
+
+            # Pass the post-rename canonical map so the loop-carried-write
+            # gate can correctly identify writes whose pre-rename target
+            # is an alias (e.g. ``v_1_0 = v_1`` will be renamed to
+            # ``mi = v_1``).  Without this, the gate would mis-classify
+            # the softmax reduce sweep as having no loop-carried write
+            # and incorrectly skip pipelining.
+            kernel_body = pipeline_inner_loads(
+                kernel_body, constexpr_values, rename_groups=rename_groups
+            )
         return [
             *prefix,
             ast_rename(
