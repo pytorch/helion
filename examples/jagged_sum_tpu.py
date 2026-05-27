@@ -3,13 +3,13 @@ Jagged Sum Example (TPU optimized Helion DSL)
 =============================================
 
 This example computes the sum of each row in a jagged tensor using a purely
-static L-space grid, written entirely in the Helion DSL. 
-The DMA fetches perfectly aligned dense blocks from the L-dimension, and the 
+static L-space grid, written entirely in the Helion DSL.
+The DMA fetches perfectly aligned dense blocks from the L-dimension, and the
 kernel resolves item boundaries within VMEM dynamically using masking.
 """
 
 from __future__ import annotations
-from typing import Callable
+
 import torch
 
 import helion
@@ -83,6 +83,7 @@ def jagged_sum_kernel_tpu(
 # Reference Implementation
 # ------------------------
 
+
 def reference_jagged_sum_kernel_pytorch(
     x_data: torch.Tensor,
     x_offsets: torch.Tensor,
@@ -106,16 +107,18 @@ def create_test_jagged_tensor(
     dtype: torch.dtype = torch.float32,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     seq_lengths = torch.randint(1, max_seqlen + 1, (B,), device=device)
-    x_offsets = torch.cat([
-        torch.zeros(1, dtype=torch.long, device=device),
-        torch.cumsum(seq_lengths, dim=0),
-    ])
+    x_offsets = torch.cat(
+        [
+            torch.zeros(1, dtype=torch.long, device=device),
+            torch.cumsum(seq_lengths, dim=0),
+        ]
+    )
     nnz = int(x_offsets[-1])
     x_data = torch.randn(nnz, M, dtype=dtype, device=device)
-    
+
     # TPUs only support up to 32-bit integers
     x_offsets = x_offsets.to(torch.int32)
-    
+
     return x_data, x_offsets
 
 
@@ -127,13 +130,13 @@ def main() -> None:
         B, M, max_seqlen, device, dtype=torch.float32
     )
 
-    # Pad x_data to a safe large multiple (e.g. 1024) to avoid TPU hardware memory faults 
-    # when the Helion compiler's dynamic block_L size (e.g. 128, 256, 512) overhangs the 
+    # Pad x_data to a safe large multiple (e.g. 1024) to avoid TPU hardware memory faults
+    # when the Helion compiler's dynamic block_L size (e.g. 128, 256, 512) overhangs the
     # end of the flat array during its static tile loads.
     nnz = x_data.shape[0]
     MAX_BLOCK_SIZE = 1024
     padded_L = ((nnz + MAX_BLOCK_SIZE - 1) // MAX_BLOCK_SIZE) * MAX_BLOCK_SIZE
-    
+
     x_padded = torch.zeros((padded_L, M), dtype=x_data.dtype, device=x_data.device)
     x_padded[:nnz, :] = x_data
 
