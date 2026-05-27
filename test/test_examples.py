@@ -1196,8 +1196,21 @@ class TestExamples(RefEagerTestBase, TestCase):
         lambda: _get_backend() == "cute",
         "CuTe FP8 attention destabilizes later cute tests when it fails in-process",
     )
-    @skipIfNotCUDA()
-    @skipIfCudaCapabilityLessThan((9, 0), reason="FP8 requires CUDA capability >= 9.0")
+    @skipIfFn(
+        lambda: _get_backend() not in ("triton", "pallas"),
+        "FP8 attention requires Triton or Pallas backend",
+    )
+    @skipIfFn(
+        lambda: _get_backend() == "triton" and not torch.cuda.is_available(),
+        "Triton backend requires CUDA GPU",
+    )
+    @skipIfFn(
+        lambda: (
+            _get_backend() == "triton"
+            and torch.cuda.get_device_capability(DEVICE) < (9, 0)
+        ),
+        "FP8 Triton requires CUDA capability >= 9.0",
+    )
     def test_fp8_attention(self):
         batch = 2
         heads = 4

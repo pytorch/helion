@@ -296,7 +296,7 @@ def main() -> None:
     Tests with small, medium, and large attention configurations.
     """
     # TODO(adam-smnk): generalize to XPU
-    assert DEVICE.type == "cuda", "Requires CUDA device"
+    assert DEVICE.type == "cuda" or DEVICE.type == "tpu", "Requires CUDA or TPU device"
     check(1, 2, 128, 64)
     check(2, 4, 256, 64)
     check(4, 8, 512, 128)
