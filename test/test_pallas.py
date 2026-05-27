@@ -1046,6 +1046,73 @@ class TestPallas(TestCase):
         # The bias block_spec_info must have None for dim 0 (not a grid index).
         self.assertIn("(None, 1)", code)
 
+    def test_pallas_launcher_fast_path_hits_on_repeat_invocations(self) -> None:
+        """Repeat calls on a cached static-shape kernel take the launcher fast path.
+
+        On the first call the launcher seeds a grid-keyed cache on the inner
+        device function; every later call hits ``cache is not None and
+        cache[0] == grid`` and reuses the precomputed ``_LauncherFastPath``
+        instead of recomputing the per-call dtype check + ds-pad + output-only
+        loop.  The launcher branches deterministically on the cache, so a
+        populated cache after the first call means the fast path is taken; the
+        test asserts that and that the output stays correct.
+        """
+
+        # Define the kernel inside the test so its launcher cache -- which lives
+        # on the inner generated function, not the decorator object -- is unique
+        # to this run, avoiding cross-test pollution.
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def _matmul_launcher_fast_path_pin(
+            x: torch.Tensor, y: torch.Tensor
+        ) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty(
+                [m, n],
+                device=x.device,
+                dtype=torch.promote_types(x.dtype, y.dtype),
+            )
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = acc
+            return out
+
+        torch.manual_seed(0)
+        x = torch.randn(256, 256, device=DEVICE, dtype=torch.bfloat16)
+        torch.manual_seed(1)
+        y = torch.randn(256, 256, device=DEVICE, dtype=torch.bfloat16)
+
+        bound = _matmul_launcher_fast_path_pin.bind((x, y))
+        config = bound.config_spec.default_config()
+        compiled_fn = bound.compile_config(config)
+
+        expected = (x.float() @ y.float()).to(torch.bfloat16)
+
+        # First call seeds the launcher cache; subsequent calls take the fast
+        # path off it.  Output must stay correct throughout.
+        for _ in range(5):
+            result = compiled_fn(x, y)
+            torch.testing.assert_close(result, expected, rtol=1e-2, atol=1e-2)
+
+        # The launcher stores its grid-keyed cache on the inner device-kernel
+        # object (``_pallas_cache`` / ``_pallas_pipeline_cache`` /
+        # ``_pallas_fori_cache``, depending on which launcher the config
+        # selects), reachable via the compiled function's module globals.  A
+        # populated cache means repeat calls took the fast-path branch.
+        cache_attrs = ("_pallas_cache", "_pallas_pipeline_cache", "_pallas_fori_cache")
+        cached = [
+            value
+            for value in compiled_fn.__globals__.values()
+            if any(getattr(value, a, None) is not None for a in cache_attrs)
+        ]
+        self.assertTrue(
+            cached,
+            "Repeat calls on a cached static-shape kernel must populate the "
+            "launcher fast-path cache on the inner device function.",
+        )
+
     def test_bmm(self) -> None:
         """Test BMM with default config — exercises size_matches fix.
 
