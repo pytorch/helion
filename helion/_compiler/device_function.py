@@ -749,6 +749,12 @@ class DeviceFunction:
         return self.arguments
 
     def codegen_function_def(self) -> list[ast.stmt]:
+        # Under jagged dispatch the device kernel is never called (the
+        # host wrapper calls _default_pallas_jagged_reduce_launcher
+        # directly), so skip emitting it as dead code.
+        if getattr(self, "_jagged_dispatch_items_axis", None) is not None:
+            return []
+
         prefix = []
         if self._tensor_descriptor_args:
             prefix.append(
@@ -930,6 +936,13 @@ class DeviceFunction:
         env = CompileEnvironment.current()
         backend = env.backend
 
+        # Jagged dispatch: short-circuit to the per-item DMA template
+        # instead of building a normal _launcher(...) call. The flag is
+        # set by jagged_dispatch.detect_jagged_dispatch() in
+        # PallasBackend.pre_codegen.
+        if getattr(self, "_jagged_dispatch_items_axis", None) is not None:
+            return self._codegen_jagged_dispatch_call(env)
+
         args: list[str] = []
         tensor_host_args: list[str] = []
         arg_objects: list[Argument] = []
@@ -985,6 +998,71 @@ class DeviceFunction:
         # Mark the kernel call so we can find it in codegen_precompile_def
         call_statement._is_kernel_call = True
         return call_statement
+
+    def _codegen_jagged_dispatch_call(self, env: CompileEnvironment) -> ast.AST:
+        """Emit ``<out> = _default_pallas_jagged_reduce_launcher(<inputs>)``.
+
+        Replaces the normal ``_launcher(...)`` statement when the
+        kernel's source matches the pair-based jagged pattern detected
+        in :mod:`helion._compiler.pallas.jagged_dispatch`. The launcher
+        lives at
+        :func:`helion.runtime.default_pallas_jagged_reduce_launcher`
+        and is imported via ``library_imports``.
+
+        Currently sum-only: expects exactly a (2-D data, 1-D offsets)
+        pair on the kernel signature. Kernels with additional inputs
+        (e.g. ``jagged_mean``'s feature counts) are not yet supported.
+        """
+        # Identify inputs by the USER's kernel parameter names, not by
+        # iterating sorted_args. The latter contains intermediates like
+        # `x_flat = x_data.view(-1)`, which surfaces as a 1-D TensorArg
+        # sharing x_data's storage — we want the original 2-D parameter,
+        # not the view.
+        hf = HostFunction.current()
+        jagged_data_param: str | None = None
+        offsets_param: str | None = None
+        for param_name, value in hf.params.arguments.items():
+            if not isinstance(value, torch.Tensor):
+                continue
+            if value.ndim == 2 and jagged_data_param is None:
+                jagged_data_param = param_name
+            elif value.ndim == 1 and offsets_param is None:
+                offsets_param = param_name
+
+        assert jagged_data_param is not None, (
+            "jagged dispatch expects a 2-D tensor parameter "
+            "(jagged_data); none found in kernel signature"
+        )
+        assert offsets_param is not None, (
+            "jagged dispatch expects a 1-D tensor parameter "
+            "(jagged_dim_offsets); none found in kernel signature"
+        )
+
+        # Find the output by storage identity: a TensorArg whose storage
+        # is not in env.input_sources was created in the kernel body
+        # (e.g. via torch.zeros(...)) and is the output to return.
+        input_storages = {id(t.untyped_storage()) for t in env.input_sources}
+        output_name: str | None = None
+        for arg in self.sorted_args():
+            if not isinstance(arg, TensorArg):
+                continue
+            if id(arg.fake_value.untyped_storage()) not in input_storages:
+                assert output_name is None, (
+                    "jagged dispatch expects a single output tensor; "
+                    f"got {output_name!r} and {arg.host_str()!r}"
+                )
+                output_name = arg.host_str()
+
+        assert output_name is not None, "jagged dispatch expects an output tensor"
+
+        call_src = (
+            f"{output_name} = _default_pallas_jagged_reduce_launcher("
+            f"{jagged_data_param}, {offsets_param})"
+        )
+        stmt = statement_from_string(call_src)
+        assert isinstance(stmt, ExtendedAST)
+        stmt._is_kernel_call = True
+        return stmt
 
     def dead_code_elimination(self) -> None:
         """

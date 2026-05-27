@@ -1393,6 +1393,71 @@ def default_pallas_fori_launcher(
     )
 
 
+_jagged_reduce_launcher_cache: dict[tuple[int, int], object] = {}
+
+
+def default_pallas_jagged_reduce_launcher(
+    jagged_data: torch.Tensor,
+    jagged_dim_offsets: torch.Tensor,
+    *,
+    jagged_tile_size: int = 64,
+) -> torch.Tensor:
+    """Launch the per-item DMA-orchestrated jagged reduce template.
+
+    Called from the generated host wrapper when the Pallas backend's
+    jagged dispatch detector flagged the kernel as dispatchable.
+    Accepts torch tensors, calls the JAX-side template
+    :func:`helion.runtime.pallas_templates.jagged_reduce_pallas`, and
+    returns a torch tensor on the original device.
+
+    Interpret mode (CPU) uses the DLPack bridge below.  On TPU we wrap
+    the template in a cached ``JaxCallable`` so torch_tpu handles the
+    tensor bridge natively (no DLPack-via-CPU roundtrip).
+    """
+    if jagged_dim_offsets.dtype != torch.int32:
+        jagged_dim_offsets = jagged_dim_offsets.to(torch.int32)
+
+    from .pallas_templates import jagged_reduce_pallas
+    from .settings import is_pallas_interpret
+
+    if is_pallas_interpret():
+        data_jax = _torch_to_jax(jagged_data)
+        off_jax = _torch_to_jax(jagged_dim_offsets)
+        out_jax = jagged_reduce_pallas(
+            data_jax, off_jax, jagged_tile_size=jagged_tile_size
+        )
+        return _jax_to_torch(
+            out_jax, device=jagged_data.device, dtype=jagged_data.dtype
+        )
+
+    import jax
+    from torch_tpu._internal.pallas.pallas import (  # pyrefly: ignore[missing-import]
+        JaxCallable,
+    )
+
+    # Cache the JaxCallable per (template-fn-id, jagged_tile_size).
+    # jagged_reduce_pallas is not @jax.jit'd internally — we jit once
+    # here so JaxCallable sees a properly-jit'd entry point. Single
+    # jit layer, no nesting.
+    key = (id(jagged_reduce_pallas), jagged_tile_size)
+    cached = _jagged_reduce_launcher_cache.get(key)
+    if cached is None:
+        jax.config.update("jax_export_ignore_forward_compatibility", True)
+        jit_fn = jax.jit(
+            lambda data, off: jagged_reduce_pallas(
+                data, off, jagged_tile_size=jagged_tile_size
+            )
+        )
+        cached = JaxCallable(
+            name=f"jagged_reduce_launcher_k{jagged_tile_size}",
+            jit_fn=jit_fn,
+            trace_key=f"jagged_reduce_launcher_k{jagged_tile_size}",
+            input_output_aliases={},
+        )
+        _jagged_reduce_launcher_cache[key] = cached
+    return cached(jagged_data, jagged_dim_offsets)
+
+
 def _torch_to_jax(t: torch.Tensor) -> object:
     """Convert a torch.Tensor to a JAX array via DLPack (for interpret mode on CPU)."""
     import jax.numpy as jnp

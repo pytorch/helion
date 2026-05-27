@@ -1157,6 +1157,7 @@ class PallasBackend(Backend):
             "_default_pallas_launcher": "from helion.runtime import default_pallas_launcher as _default_pallas_launcher",
             "_default_pallas_pipeline_launcher": "from helion.runtime import default_pallas_pipeline_launcher as _default_pallas_pipeline_launcher",
             "_default_pallas_fori_launcher": "from helion.runtime import default_pallas_fori_launcher as _default_pallas_fori_launcher",
+            "_default_pallas_jagged_reduce_launcher": "from helion.runtime import default_pallas_jagged_reduce_launcher as _default_pallas_jagged_reduce_launcher",
         }
 
     # Config keys that Pallas actually uses.  Everything else
@@ -1956,9 +1957,23 @@ class PallasBackend(Backend):
         config: Config,
         tile_strategy: TileStrategyDispatch,
     ) -> None:
+        from .compile_environment import CompileEnvironment
+        from .pallas.jagged_dispatch import detect_jagged_dispatch
         from .pallas.plan_tiling import plan_tiling
 
         plan_tiling(graphs, config, tile_strategy)
+
+        # Tag the device function if this kernel matches the pair-based
+        # jagged dispatch rule, so codegen can route the call through the
+        # per-item DMA template at
+        # helion.runtime.pallas_templates.jagged_reduce_pallas rather
+        # than the gather-based lowering (which does not work for jagged
+        # sources on Pallas).
+        items_axis = detect_jagged_dispatch(CompileEnvironment.current())
+        if items_axis is not None:
+            from .device_function import DeviceFunction
+
+            DeviceFunction.current()._jagged_dispatch_items_axis = items_axis
 
 
 def _detect_mma_loop(
