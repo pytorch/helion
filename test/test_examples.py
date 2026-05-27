@@ -1841,7 +1841,9 @@ class TestExamples(RefEagerTestBase, TestCase):
             rtol=2e-1,
         )
 
-    @xfailIfPallas("JAX tracer error")
+    @xfailIfPallasInterpret(
+        "jagged_reduce template uses pltpu primitives that require a real TPU"
+    )
     @skipIfRefEager("hl.jagged_tile does not support ref mode yet")
     def test_jagged_sum(self):
         num_rows, max_cols = 128, 64
