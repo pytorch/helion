@@ -999,6 +999,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             block_sizes=[128, 64],
         )
 
+    @skipIfPallas("TODO: follow up on timeout due to google-pytorch/torch_tpu@42d10ff")
     @xfailIfPallas("BlockSpec tiling failure")
     def test_jagged_dense_add(self):
         mod = import_path(EXAMPLES_DIR / "jagged_dense_add.py")
