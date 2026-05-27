@@ -10,6 +10,7 @@ import operator
 from typing import TYPE_CHECKING
 from typing import NamedTuple
 from typing import TypeVar
+from typing import cast
 import weakref
 
 import sympy
@@ -679,10 +680,34 @@ class BlockSizeTileStrategy(TileStrategy):
         Counts axes already claimed by active device loops, reserving at
         least one axis for reduction strategies when the backend places
         reductions first.
+
+        When a ``CuTeGridExecutionPlan`` with ``block_axis_priority`` is
+        in scope for this strategy's blocks, the offset is instead
+        derived from ``thread_axis_for_strategy`` so the M/N axis order
+        is dictated by the plan (e.g. the warp-per-row layout swaps the
+        outer M-grid and inner N-tile axes so each warp owns one row).
         """
         from .reduction_strategy import ReductionStrategy
 
         env = CompileEnvironment.current()
+
+        # Plan-driven path: honor ``block_axis_priority`` so the outer
+        # grid loop can reserve an axis for a lower-priority inner tile
+        # loop even when that inner loop has not yet entered
+        # ``active_device_loops``.  Used by the warp-per-row layout where
+        # the outer M-grid must take a HIGHER thread-axis index than the
+        # inner N-tile so 32 contiguous threads on axis 0 form one warp
+        # per row.
+        plan = self.fn.tile_strategy.current_cute_grid_execution_plan(
+            block_ids=self.block_ids
+        )
+        if plan is not None and any(
+            plan.priority_for_block(block_id) is not None for block_id in self.block_ids
+        ):
+            offset = self.fn.tile_strategy.thread_axis_for_strategy(self)
+            if offset is not None:
+                return offset
+
         seen: set[int] = set()
         active_reduction_axes = 0
         active_non_reduction_axes = 0
@@ -706,9 +731,6 @@ class BlockSizeTileStrategy(TileStrategy):
         has_reduction_strategy = any(
             isinstance(strategy, ReductionStrategy) and strategy.thread_axes_used() > 0
             for strategy in self.fn.tile_strategy.strategies
-        )
-        plan = self.fn.tile_strategy.current_cute_grid_execution_plan(
-            block_ids=self.block_ids
         )
         if plan is not None and any(
             plan.disables_reduction_axis_reservation(block_id)
@@ -1842,7 +1864,40 @@ class CuteNDTileStrategy(NDTileStrategy):
         self.mma_mode = mma_mode
         self.inactive_block_ids = inactive_block_ids or set()
         self._lane_var_by_block: dict[int, str] = {}
+        # Per-block vec width for the lane loop (1 = scalar).  Populated
+        # from the autotuner-selected ``cute_vector_widths`` config when
+        # the block has a lane loop and its ``elements_per_thread`` is
+        # divisible by the picked V.  When > 1, ``codegen_device_loop``
+        # partitions the lane loop into outer (epT/V) x inner constexpr V
+        # so memory_ops can hoist a single ``cute.arch.load(..., V)`` per
+        # outer-lane iter (LDG.64 / LDG.128).
+        self._cute_lane_vec_width_by_block: dict[int, int] = {}
+        # Per-block constexpr V-loop var (only set when the lane loop is
+        # vec-partitioned). Used by memory_ops to find the inner loop's
+        # target var when emitting per-lane bitcasts.
+        self._cute_vec_lane_var_by_block: dict[int, str] = {}
+        # Per-block lane-base index var (the per-thread base of a V-wide
+        # contiguous chunk).  Set when lane vec is in play; used by
+        # memory_ops to compute the vec load pointer once per outer-lane
+        # iter.
+        self._cute_lane_base_index_var_by_block: dict[int, str] = {}
+        # Per-block lane body (list of AST statements inside the outer
+        # lane loop, ending in the constexpr V-loop). memory_ops uses
+        # ``insert(len(lane_body)-1, hoist_stmt)`` to splice the vec
+        # load just before the inner V-loop.
+        self._cute_lane_body_by_block: dict[int, list] = {}
+        # Shared per-block hoist cache: (tensor_name, base_ptr_expr) ->
+        # (hoist_var, dtype).  Same shape as
+        # ``LoopedReductionStrategy._cute_lane_vec_loads``.
+        self._cute_lane_vec_loads_by_block: dict[int, dict] = {}
         if not mma_mode:
+            from ..autotuner.config_spec import CuteVectorWidthSpec
+
+            env_local = CompileEnvironment.current()
+            cute_vec_widths_cfg = cast(
+                "list[int]",
+                fn.config.config.get("cute_vector_widths", []) or [],
+            )
             for block_id, nt, bs in zip(
                 block_ids, num_threads, block_size, strict=True
             ):
@@ -1858,6 +1913,38 @@ class CuteNDTileStrategy(NDTileStrategy):
                     self._lane_var_by_block[block_id] = self.fn.new_var(
                         f"lane_{block_id}"
                     )
+                    # Register a cute_vector_widths slot for this lane
+                    # block if not already present (rolled reductions
+                    # register their own via device_ir).  We add idempotently
+                    # so the autotuner can explore V in {1,2,4,8}.
+                    if (
+                        block_id
+                        not in env_local.config_spec.cute_vector_widths.valid_block_ids()
+                    ):
+                        import contextlib
+
+                        # Silently skip when append fails (e.g.
+                        # config_spec frozen) — the lane loop just
+                        # runs in scalar mode in that case.
+                        with contextlib.suppress(Exception):
+                            env_local.config_spec.cute_vector_widths.append(
+                                CuteVectorWidthSpec(
+                                    block_id=block_id,
+                                    size_hint=static_bs,
+                                )
+                            )
+                    elements_per_thread = static_bs // nt
+                    vec_width = env_local.config_spec.cute_vector_widths.config_get(
+                        cute_vec_widths_cfg,
+                        block_id,
+                        1,
+                    )
+                    if (
+                        isinstance(vec_width, int)
+                        and vec_width > 1
+                        and elements_per_thread % vec_width == 0
+                    ):
+                        self._cute_lane_vec_width_by_block[block_id] = vec_width
 
     def _configured_block_size_int(self, block_size: SymIntLike) -> int | None:
         if isinstance(block_size, int):
@@ -2151,17 +2238,55 @@ class CuteNDTileStrategy(NDTileStrategy):
         block_sizes = self.block_size
         user_body: list[ast.AST] = []
         body: list[ast.AST] = user_body
-        lane_loops = [
-            (
-                self._lane_var_by_block[block_id],
-                self._elements_per_thread_for_block(block_id),
-            )
-            for block_id in (self.block_ids[i] for i in self.loop_order)
-            if block_id in self._lane_var_by_block
-        ]
-        for lane_var, extent in reversed(lane_loops):
-            lane_for = _create_lane_loop(lane_var, extent, body)
-            body = [lane_for]
+        # Capture per-block (lane_var, full_extent, vec_width).  When
+        # vec_width > 1, the outer lane runs (full_extent // vec_width)
+        # iters; the inner constexpr-V loop handles V elements per outer
+        # iter.  The memory_ops vec-load dispatcher splices a single
+        # ``cute.arch.load(..., V)`` between the outer lane setup and the
+        # inner constexpr loop, so per-thread bytes-per-load grow from
+        # ``sizeof(dtype)`` to ``V * sizeof(dtype)`` (LDG.64 / LDG.128).
+        lane_loops_meta: list[tuple[int, str, int, int]] = []
+        for block_id in (self.block_ids[i] for i in self.loop_order):
+            if block_id not in self._lane_var_by_block:
+                continue
+            lane_var = self._lane_var_by_block[block_id]
+            extent = self._elements_per_thread_for_block(block_id)
+            vec_width = self._cute_lane_vec_width_by_block.get(block_id, 1)
+            lane_loops_meta.append((block_id, lane_var, extent, vec_width))
+        for block_id, lane_var, extent, vec_width in reversed(lane_loops_meta):
+            if vec_width > 1 and extent > 0 and extent % vec_width == 0:
+                # Partition the lane loop into outer x inner constexpr V.
+                # The inner constexpr-V loop's body re-runs the user body
+                # for each of the V lanes (the user body's per-lane
+                # ``index_var = ...`` setup keys off the COMPOSITE lane =
+                # outer*V + inner so the per-element index is correct).
+                vec_lane_var = self.fn.new_var(f"vec_lane_{block_id}", dce=False)
+                self._cute_vec_lane_var_by_block[block_id] = vec_lane_var
+                inner_for = cast(
+                    "ast.For",
+                    ast.parse(
+                        f"for {vec_lane_var} in cutlass.range_constexpr({vec_width}):\n"
+                        f"    pass"
+                    ).body[0],
+                )
+                inner_for.body = body  # type: ignore[assignment]
+                # ``lane_body`` is what's INSIDE the outer lane loop:
+                # statements above the constexpr V-loop, plus the loop
+                # itself (last entry).  memory_ops.py splices a hoisted
+                # ``cute.arch.load(..., V)`` into ``lane_body[-1:]`` via
+                # the same protocol ``LoopedReductionStrategy`` uses.
+                lane_body: list[ast.AST] = [inner_for]
+                self._cute_lane_body_by_block[block_id] = lane_body
+                outer_extent = extent // vec_width
+                # Always emit the outer lane loop even when ``outer_extent
+                # == 1`` (i.e. EPT == V): the lane-base index expression
+                # references ``lane_var``, which must be defined in scope.
+                # The CuTe DSL constant-folds the 1-iter loop away.
+                outer_for = _create_lane_loop(lane_var, outer_extent, lane_body)
+                body = [outer_for]
+            else:
+                lane_for = _create_lane_loop(lane_var, extent, body)
+                body = [lane_for]
         for_node: ast.For | None = None
         assert len(block_sizes) == len(block_ids)
         if len(state.ast_args) == 5:
@@ -2253,8 +2378,44 @@ class CuteNDTileStrategy(NDTileStrategy):
                     tracker.record(block_idx, axis, static_extent)
             else:
                 idx_expr = offset_var
+            block_vec_width = self._cute_lane_vec_width_by_block.get(block_idx, 1)
+            vec_lane_var = self._cute_vec_lane_var_by_block.get(block_idx)
             if lane_var := self._lane_var_by_block.get(block_idx):
-                idx_expr = f"{idx_expr} + {env.backend.lane_offset_expr(lane_var)}"
+                if block_vec_width > 1 and vec_lane_var is not None:
+                    # Composite per-element lane index = outer*V + inner.
+                    # outer (``lane_var``) ranges [0, EPT/V); inner
+                    # (``vec_lane_var``) ranges [0, V).  Per-thread base
+                    # (the start of the V-wide chunk this thread owns
+                    # for this outer iter) is stashed in
+                    # ``_cute_lane_base_index_var_by_block`` so the vec
+                    # load can use it directly (mirrors the
+                    # ``LoopedReductionStrategy`` unroll path).
+                    base_index_var = self.fn.new_var(
+                        f"lane_base_{block_idx}", dce=False
+                    )
+                    self._cute_lane_base_index_var_by_block[block_idx] = base_index_var
+                    # ``base = offset + tid*EPT + outer*V``  (per-thread
+                    # V-aligned base) — emitted INSIDE the outer lane
+                    # loop's body (above the constexpr V-loop) so a
+                    # single ``cute.arch.load(..., V)`` can be hoisted
+                    # at the same level by memory_ops.
+                    lane_body_list = self._cute_lane_body_by_block.get(block_idx)
+                    if lane_body_list is not None:
+                        base_expr = (
+                            f"{idx_expr} + {env.backend.lane_offset_expr(lane_var)} "
+                            f"* {block_vec_width}"
+                        )
+                        lane_body_list.insert(
+                            0,
+                            statement_from_string(f"{base_index_var} = {base_expr}"),
+                        )
+                    # The user-body's per-element index uses the base +
+                    # the inner constexpr-V var so the existing scalar
+                    # pipeline (mask + cast + reduce-or-store) keeps
+                    # working unchanged.
+                    idx_expr = f"{base_index_var} + cutlass.Int32({vec_lane_var})"
+                else:
+                    idx_expr = f"{idx_expr} + {env.backend.lane_offset_expr(lane_var)}"
             index_setup.append(statement_from_string(f"{index_var} = {idx_expr}"))
             mask_statement = self._setup_mask(
                 state, block_idx, block_size, index_var, end
