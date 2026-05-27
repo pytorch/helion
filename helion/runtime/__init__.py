@@ -17,6 +17,10 @@ from .. import _compat as _compat  # ensure Triton compatibility patches run
 from .. import exc
 from .._compiler.cute.strategies import tcgen05_smem_layout_expr
 from .._utils import triton_is_available
+from ._fast_launcher import _FastLauncher as _FastLauncher
+from ._fast_launcher import _SpecEntry as _SpecEntry
+from ._fast_launcher import build_fast_launcher as build_fast_launcher
+from ._fast_launcher import default_launcher as default_launcher
 from ._output_pool import clear_pool as clear_pool
 from ._output_pool import empty_like as empty_like
 from ._output_pool import is_pool_enabled as is_pool_enabled
@@ -149,40 +153,6 @@ def get_num_sm(device: torch.device, *, reserved_sms: int = 0) -> int:
     if reserved_sms <= 0:
         return available_sms
     return max(available_sms - reserved_sms, 1)
-
-
-def default_launcher(
-    triton_kernel: object,
-    grid: tuple[int, ...],
-    *args: object,
-    num_warps: int,
-    num_stages: int,
-    ptx_options: str | None = None,
-    launch_cooperative_grid: bool = False,
-    **kwargs: dict,
-) -> object:
-    """Default launcher function that executes the kernel immediately."""
-    # For both CUDA and MTIA, use the same kernel execution
-    run_kwargs: dict = {
-        "grid": grid,
-        "warmup": False,
-        "num_warps": num_warps,
-        "num_stages": num_stages,
-        "launch_cooperative_grid": launch_cooperative_grid,
-        **kwargs,
-    }
-    if ptx_options is not None:
-        run_kwargs["ptx_options"] = ptx_options
-    try:
-        return triton_kernel.run(  # type: ignore[union-attr]
-            *args,
-            **run_kwargs,
-        )
-    except Exception as error:
-        message = str(error)
-        if "Cannot make_shape_compatible: incompatible dimensions" in message:
-            raise exc.ShapeMismatch("kernel operands", message) from error
-        raise
 
 
 def _pallas_make_block_spec(
