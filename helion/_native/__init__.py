@@ -8,8 +8,8 @@ stable Python-side contract they will plug into.
 
 Layout
 ------
-- ``_launcher`` (added in a later commit) — the compiled Rust
-  extension.
+- ``_launcher`` — the compiled Rust extension (``src/lib.rs``,
+  built via ``cargo`` — see ``README.md``).
 - This ``__init__.py`` exposes ``AVAILABLE`` and the public function
   names. When the extension is importable, the names resolve to its
   Rust implementations. When it isn't, they resolve to ``None`` and
