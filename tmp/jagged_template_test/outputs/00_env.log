@@ -19,9 +19,9 @@ Version: 0.0.41
 
 === sanity: jax + pallas + template ===
 WARNING: All log messages before absl::InitializeLog() is called are written to STDERR
-I0000 00:00:1779834375.909422 1971215 pjrt_api.cc:96] PJRT_Api is set for device type cpu
-I0000 00:00:1779834375.914524 1971215 pjrt_api.cc:118] GetPjrtApi was found for TPU at /home/ymu_google_com/miniconda3/envs/tpu/lib/python3.12/site-packages/libtpu/libtpu.so
-I0000 00:00:1779834375.914556 1971215 pjrt_api.cc:96] PJRT_Api is set for device type tpu
+I0000 00:00:1779841610.452720 2014982 pjrt_api.cc:96] PJRT_Api is set for device type cpu
+I0000 00:00:1779841610.456911 2014982 pjrt_api.cc:118] GetPjrtApi was found for TPU at /home/ymu_google_com/miniconda3/envs/tpu/lib/python3.12/site-packages/libtpu/libtpu.so
+I0000 00:00:1779841610.456941 2014982 pjrt_api.cc:96] PJRT_Api is set for device type tpu
 Successfully renamed PrivateUse1 backend to 'tpu'. Device: device(type='tpu')
 Registered Python module for 'tpu'.
 jax 0.9.2
