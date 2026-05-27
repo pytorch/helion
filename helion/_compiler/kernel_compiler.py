@@ -72,6 +72,7 @@ class KernelCompiler:
         hf = self.parse(fn, fake_args, constexpr_args)
         with hf, self._compilation_context():
             self.unroll(hf)
+            self.rewrite_cute_patterns(hf)
             self.propagate_types(hf)
             self.finalize_config()
             self.lower(hf)
@@ -120,6 +121,26 @@ class KernelCompiler:
 
         with measure("HostFunction.unroll_static_loops"):
             unroll_static_loops(hf)
+
+    def rewrite_cute_patterns(self, hf: HostFunction) -> None:
+        """CuTe-only AST pre-passes that rewrite high-level patterns into
+        equivalent forms that compile to materially faster code.
+
+        Currently:
+          * ``rewrite_online_to_3pass`` rewrites the online two-pass
+            softmax pattern into the 3-pass form (max-only, then
+            sum-only, then consume).  The 3-pass form's two reductions
+            are independent and compile to a more efficient layout on
+            the CuTe backend.
+
+        Other backends use the user's source unchanged.
+        """
+        if self.env.backend.name != "cute":
+            return
+        from .cute.online_to_3pass import rewrite_online_to_3pass
+
+        with measure("HostFunction.rewrite_cute_patterns"):
+            rewrite_online_to_3pass(hf)
 
     def propagate_types(self, hf: HostFunction) -> None:
         from .type_propagation import propagate_types
