@@ -26,6 +26,16 @@ def jagged_sum_kernel_tpu(
     """
     TPU-optimized jagged sum kernel using the Helion DSL.
 
+    Cross-L-tile accumulation into `out` uses ``hl.atomic_add`` (rather than
+    `out[item_idx, tile_m] += partial`). On Pallas, the bare `+=` pattern on
+    an output whose index doesn't include the outer grid axis silently fails:
+    each L-program's read returns the initial HBM value (not the previous
+    program's writeback), so `+=` collapses to `=` and the last L-program
+    wins. ``hl.atomic_add`` routes the write through a VMEM scratch
+    (see ``helion/runtime/_pallas_rmw.py``) which preloads from HBM on the
+    first cell and commits back on the last cell, so accumulation across
+    L-tiles is correct.
+
     Args:
         x_data: 2-D tensor of shape (L, M) holding all elements
         x_offsets: (N + 1) tensor. Row i is the slice
@@ -40,33 +50,30 @@ def jagged_sum_kernel_tpu(
 
     out = torch.zeros([N, M], dtype=x_data.dtype, device=x_data.device)
 
-    # Static L-space grid: Avoids dynamic loop bounds on the MXUs
+    # Static L-space grid: avoids dynamic loop bounds on the MXUs.
     for tile_l in hl.tile(L):
         l_start = tile_l.index
         block_L = tile_l.block_size
 
         for tile_m in hl.tile(M):
-            # DMA fetches perfectly aligned block_L x block_M chunk from HBM
+            # DMA fetches perfectly aligned block_L x block_M chunk from HBM.
             chunk = x_data[tile_l, tile_m]
 
-            # Resolve item boundaries dynamically within VMEM
+            # Resolve item boundaries dynamically within VMEM.
             for item_idx in range(N):
                 it_start = x_offsets[item_idx]
                 it_end = x_offsets[item_idx + 1]
 
-                # We can determine validity purely by checking if the global row index 
-                # falls within this batch item's start and end offsets!
                 global_row = l_start + hl.arange(block_L)
                 mask = (global_row >= it_start) & (global_row < it_end)
 
-                # Arithmetic masking bypasses boolean broadcast layout constraints.
-                # Multiplying by 1.0 implicitly casts the boolean mask to a float 
-                # safely within the Helion AST without using .to()
+                # Arithmetic masking bypasses boolean broadcast layout
+                # constraints (Mosaic gotcha on some block shapes).
                 safe_chunk = (mask * 1.0)[:, None] * chunk
                 partial = safe_chunk.sum(dim=0)
 
-                # Accumulate the partial sum for this batch item
-                out[item_idx, tile_m] += partial
+                # Cross-L-tile accumulation — must be atomic on Pallas.
+                hl.atomic_add(out, [item_idx, tile_m], partial)
 
     return out
 
