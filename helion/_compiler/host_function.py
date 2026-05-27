@@ -33,7 +33,7 @@ if TYPE_CHECKING:
 
     from .device_ir import DeviceIR
     from .source_location import SourceLocation
-    from .type_propagation import TypeInfo
+    from .type_info import TypeInfo
 
     class _TLS(Protocol):
         functions: list[HostFunction]

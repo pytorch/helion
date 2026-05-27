@@ -514,7 +514,7 @@ class TestSettingsEnv(TestCase):
         import sympy
 
         from helion._compiler.host_function import SymbolOrigin
-        from helion._compiler.type_propagation import _detect_outer_block_bound
+        from helion._compiler.type_info import _detect_outer_block_bound
         from helion._compiler.variable_origin import TileBeginOrigin
         from helion._compiler.variable_origin import TileEndOrigin
 
@@ -530,11 +530,11 @@ class TestSettingsEnv(TestCase):
 
         with (
             patch(
-                "helion._compiler.type_propagation.HostFunction.current",
+                "helion._compiler.type_info.HostFunction.current",
                 return_value=fake_host,
             ),
             patch(
-                "helion._compiler.type_propagation._symint_expr",
+                "helion._compiler.type_info._symint_expr",
                 side_effect=lambda expr: expr,
             ),
         ):
@@ -544,7 +544,7 @@ class TestSettingsEnv(TestCase):
     def test_detect_outer_block_bound_accepts_direct_block_size(self) -> None:
         from types import SimpleNamespace
 
-        from helion._compiler.type_propagation import _detect_outer_block_bound
+        from helion._compiler.type_info import _detect_outer_block_bound
 
         numel = object()
         fake_env = SimpleNamespace(
@@ -552,7 +552,7 @@ class TestSettingsEnv(TestCase):
         )
 
         with patch(
-            "helion._compiler.type_propagation._symint_expr",
+            "helion._compiler.type_info._symint_expr",
             side_effect=AssertionError("_symint_expr should not be called"),
         ):
             self.assertEqual(_detect_outer_block_bound(numel, fake_env), 5)

@@ -56,21 +56,21 @@ from .matmul_utils import torch_matmul_replacement
 from .node_masking import remove_unnecessary_masking
 from .roll_reduction import ReductionRoller
 from .source_location import current_location
-from .type_propagation import CallableType
-from .type_propagation import DictType
-from .type_propagation import GridIndexType
-from .type_propagation import IterType
-from .type_propagation import JaggedTileIndexType
-from .type_propagation import LiteralType
-from .type_propagation import NumericType
-from .type_propagation import SequenceType
-from .type_propagation import StackTensorType
-from .type_propagation import TensorType
-from .type_propagation import TileIndexType
-from .type_propagation import TypeInfo
-from .type_propagation import _eval_binary
-from .type_propagation import _eval_compare
-from .type_propagation import _eval_unary
+from .type_info import CallableType
+from .type_info import DictType
+from .type_info import GridIndexType
+from .type_info import IterType
+from .type_info import JaggedTileIndexType
+from .type_info import LiteralType
+from .type_info import NumericType
+from .type_info import SequenceType
+from .type_info import StackTensorType
+from .type_info import TensorType
+from .type_info import TileIndexType
+from .type_info import TypeInfo
+from .type_info import _eval_binary
+from .type_info import _eval_compare
+from .type_info import _eval_unary
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -1904,7 +1904,7 @@ class WalkDeviceAST(NodeVisitor):
         lhs_type = target._type_info
 
         # Validate that we're assigning to a tensor subscript
-        from .type_propagation import TensorType
+        from .type_info import TensorType
 
         if not isinstance(lhs_type, TensorType):
             raise exc.NonTensorSubscriptAssign(lhs_type, type(val))
@@ -2085,7 +2085,7 @@ class WalkHostAST(NodeVisitor):
 
     def visit_Expr(self, node: ast.Expr) -> None:
         # Record barrier placement between top-level loops.
-        from .type_propagation import BarrierResultType
+        from .type_info import BarrierResultType
 
         assert isinstance(node, ExtendedAST)
         assert isinstance(node.value, ExtendedAST)

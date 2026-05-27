@@ -17,8 +17,8 @@ if TYPE_CHECKING:
     from .._compiler.device_ir import HelperFunctionGraphInfo
     from .._compiler.helper_function import CombineFunction
     from .._compiler.inductor_lowering import CodegenState
-    from .._compiler.type_propagation import Origin
-    from .._compiler.type_propagation import TypeInfo
+    from .._compiler.type_info import Origin
+    from .._compiler.type_info import TypeInfo
 
 
 __all__ = ["associative_scan", "cumprod", "cumsum"]
@@ -217,9 +217,9 @@ def _(
     origin: Origin,
 ) -> TypeInfo:
     """Type propagation for associative_scan - output has same type as input."""
-    from .._compiler.type_propagation import CallableType
-    from .._compiler.type_propagation import SequenceType
-    from .._compiler.type_propagation import TensorType
+    from .._compiler.type_info import CallableType
+    from .._compiler.type_info import SequenceType
+    from .._compiler.type_info import TensorType
 
     # Validate that combine_fn is callable
     if not isinstance(combine_fn, CallableType):

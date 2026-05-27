@@ -715,7 +715,7 @@ class CompileEnvironment:
             index: The full index list (may contain torch.Tensor or TensorType)
         """
         # Import here to avoid circular import
-        from .type_propagation import TensorType
+        from .type_info import TensorType
 
         positions = [
             i for i, k in enumerate(index) if isinstance(k, (torch.Tensor, TensorType))

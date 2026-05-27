@@ -18,7 +18,7 @@ if TYPE_CHECKING:
     import ast
 
     from .._compiler.inductor_lowering import CodegenState
-    from .._compiler.type_propagation import TypeInfo
+    from .._compiler.type_info import TypeInfo
     from .._compiler.variable_origin import Origin
 
     _T = TypeVar("_T")

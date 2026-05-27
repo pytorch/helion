@@ -1442,9 +1442,9 @@ class PallasBackend(Backend):
         from .compile_environment import BlockSizeInfo
         from helion._compiler.compile_environment import _to_sympy
         from helion._compiler.host_function import HostFunction
-        from helion._compiler.type_propagation import SequenceType
-        from helion._compiler.type_propagation import TensorType
-        from helion._compiler.type_propagation import TileIndexType
+        from helion._compiler.type_info import SequenceType
+        from helion._compiler.type_info import TensorType
+        from helion._compiler.type_info import TileIndexType
 
         host_func = HostFunction.current()
 

@@ -13,7 +13,7 @@ from . import _decorators
 
 if TYPE_CHECKING:
     from .._compiler.inductor_lowering import CodegenState
-    from .._compiler.type_propagation import TypeInfo
+    from .._compiler.type_info import TypeInfo
     from .._compiler.variable_origin import Origin
 
 
@@ -41,9 +41,9 @@ def _(*values: object, sep: str = " ", end: str = "\n") -> None:
 
 @_decorators.type_propagation(device_print)
 def _(*args: object, origin: Origin, **kwargs: object) -> TypeInfo:
-    from .._compiler.type_propagation import LiteralType
-    from .._compiler.type_propagation import NoType
-    from .._compiler.type_propagation import TensorType
+    from .._compiler.type_info import LiteralType
+    from .._compiler.type_info import NoType
+    from .._compiler.type_info import TensorType
 
     # Check that we have at least one argument (prefix)
     if len(args) == 0:
