@@ -1344,6 +1344,29 @@ def _hashable_dims(dims: Sequence[int | torch.SymInt]) -> tuple[Hashable, ...]:
     return tuple(_hashable_dim(s) for s in dims)
 
 
+def _concrete_tensor_key(fn: Kernel, obj: torch.Tensor) -> Hashable:
+    # Fast extractor for ``torch.Tensor`` and ``torch.nn.Parameter`` —
+    # both always have concrete-int sizes and strides, so we can use
+    # ``torch.Size`` and the stride tuple directly as cache-key
+    # components (both are tuple subclasses whose hash matches a plain
+    # tuple of the same ints). The ``_hashable_dims`` wrap in
+    # ``_tensor_key`` exists only to normalize SymInts, which appear on
+    # FakeTensors during tracing — those go through ``_tensor_key`` via
+    # a separate dispatch entry.
+    si = getattr(obj, "_dynamo_static_indices", None)
+    static_indices = frozenset(si) if si is not None else _EMPTY_FROZENSET
+    if fn.settings.static_shapes:
+        return (obj.dtype, obj.size(), obj.stride(), static_indices)
+    bucketed = _bucketed_size(obj)
+    if fn.settings.index_dtype is None:
+        try:
+            needs_int64 = bool(obj.numel() > _INT32_INDEX_LIMIT)
+        except RuntimeError:
+            needs_int64 = True
+        return (obj.dtype, bucketed, needs_int64, static_indices)
+    return (obj.dtype, bucketed, static_indices)
+
+
 def _tensor_key(fn: Kernel, obj: torch.Tensor) -> Hashable:
     si = getattr(obj, "_dynamo_static_indices", None)
     static_indices = frozenset(si) if si is not None else _EMPTY_FROZENSET
@@ -1423,8 +1446,8 @@ _specialization_extractors: dict[
     type[object] | str, Callable[[Kernel, object], Hashable]
     # pyrefly: ignore [bad-assignment]
 ] = {
-    torch.Tensor: _tensor_key,
-    torch.nn.Parameter: _tensor_key,
+    torch.Tensor: _concrete_tensor_key,
+    torch.nn.Parameter: _concrete_tensor_key,
     FakeTensor: _tensor_key,
     torch.dtype: lambda fn, x: x,
     torch.device: lambda fn, x: x,
