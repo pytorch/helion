@@ -52,8 +52,10 @@ def jagged_sum_kernel_tpu(
 
     # Static L-space grid: avoids dynamic loop bounds on the MXUs.
     for tile_l in hl.tile(L):
-        l_start = tile_l.index
-        block_L = tile_l.block_size
+        # tile_l.index is ALREADY the 1-D vector [l_start, l_start+1, ..., l_start+block_L-1]
+        # — adding another hl.arange(block_L) on top doubles the stride.
+        # Use tile_l.index directly as the global row index.
+        global_row = tile_l.index
 
         for tile_m in hl.tile(M):
             # DMA fetches perfectly aligned block_L x block_M chunk from HBM.
@@ -64,7 +66,6 @@ def jagged_sum_kernel_tpu(
                 it_start = x_offsets[item_idx]
                 it_end = x_offsets[item_idx + 1]
 
-                global_row = l_start + hl.arange(block_L)
                 mask = (global_row >= it_start) & (global_row < it_end)
 
                 # Arithmetic masking bypasses boolean broadcast layout

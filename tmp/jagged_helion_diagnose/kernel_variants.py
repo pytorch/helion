@@ -31,14 +31,14 @@ def kernel_emit_pipeline(
     L = x_data.shape[0]
     out = torch.zeros([N, M], dtype=x_data.dtype, device=x_data.device)
     for tile_l in hl.tile(L):
-        l_start = tile_l.index
-        block_L = tile_l.block_size
+        global_row = tile_l.index
+        
         for tile_m in hl.tile(M):
             chunk = x_data[tile_l, tile_m]
             for item_idx in range(N):
                 it_start = x_offsets[item_idx]
                 it_end = x_offsets[item_idx + 1]
-                global_row = l_start + hl.arange(block_L)
+                
                 mask = (global_row >= it_start) & (global_row < it_end)
                 safe_chunk = (mask * 1.0)[:, None] * chunk
                 partial = safe_chunk.sum(dim=0)
@@ -58,14 +58,14 @@ def kernel_fori_loop(
     L = x_data.shape[0]
     out = torch.zeros([N, M], dtype=x_data.dtype, device=x_data.device)
     for tile_l in hl.tile(L):
-        l_start = tile_l.index
-        block_L = tile_l.block_size
+        global_row = tile_l.index
+        
         for tile_m in hl.tile(M):
             chunk = x_data[tile_l, tile_m]
             for item_idx in range(N):
                 it_start = x_offsets[item_idx]
                 it_end = x_offsets[item_idx + 1]
-                global_row = l_start + hl.arange(block_L)
+                
                 mask = (global_row >= it_start) & (global_row < it_end)
                 safe_chunk = (mask * 1.0)[:, None] * chunk
                 partial = safe_chunk.sum(dim=0)
@@ -85,14 +85,14 @@ def kernel_unroll(
     L = x_data.shape[0]
     out = torch.zeros([N, M], dtype=x_data.dtype, device=x_data.device)
     for tile_l in hl.tile(L):
-        l_start = tile_l.index
-        block_L = tile_l.block_size
+        global_row = tile_l.index
+        
         for tile_m in hl.tile(M):
             chunk = x_data[tile_l, tile_m]
             for item_idx in range(N):
                 it_start = x_offsets[item_idx]
                 it_end = x_offsets[item_idx + 1]
-                global_row = l_start + hl.arange(block_L)
+                
                 mask = (global_row >= it_start) & (global_row < it_end)
                 safe_chunk = (mask * 1.0)[:, None] * chunk
                 partial = safe_chunk.sum(dim=0)
