@@ -113,6 +113,10 @@ exclude = ["test/data/*", ".github/*", "notebooks/**/*.ipynb", "_helion_aot_*.py
 
 [tool.ruff.lint.per-file-ignores]
 "test/*" = ["ANN"]
+# Pallas kernel templates deal in Pallas Refs and JAX traced values
+# throughout; annotating them all as `object` adds noise without
+# improving safety.
+"helion/runtime/pallas_templates/*" = ["ANN001", "ANN202"]
 
 [tool.ruff.lint.isort]
 extra-standard-library = ["typing_extensions"]
