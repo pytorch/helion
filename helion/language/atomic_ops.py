@@ -744,6 +744,7 @@ def _codegen_tensor_index_loop_common_cute(
 
 def _pallas_atomic_load_prev(
     state: CodegenState,
+    op: str,
 ) -> tuple[str, str, str]:
     """Load previous value for a Pallas atomic op.
 
@@ -763,6 +764,13 @@ def _pallas_atomic_load_prev(
     host_function = HostFunction.current()
     if target not in host_function.tensor_to_origin:
         raise exc.AtomicOnDeviceTensor("pallas atomic")
+
+    # Runtime uses this metadata to detect shared output tiles that need
+    # ordered contributor execution.
+    target_id = id(target)
+    state.device_function.pallas_atomic_target_ops.setdefault(target_id, set()).add(op)
+    if state.fx_node is not None and len(state.fx_node.users) > 0:
+        state.device_function.pallas_atomic_return_used_target_ids.add(target_id)
 
     name = state.device_function.tensor_arg(target).name
     index_str, _ = pallas_codegen.index_str(state, index, target)
@@ -1008,7 +1016,7 @@ def _(state: CodegenState) -> ast.AST:
     from .._compiler.ast_extension import statement_from_string
     from .._compiler.compile_environment import CompileEnvironment
 
-    name, index_str, prev_var = _pallas_atomic_load_prev(state)
+    name, index_str, prev_var = _pallas_atomic_load_prev(state, "atomic_add")
     value_ast = _to_ast_values([state.ast_args[2]])[0]
     target = state.proxy_arg(0)
     assert isinstance(target, torch.Tensor)
@@ -1100,7 +1108,7 @@ def _(state: CodegenState) -> ast.AST:
 def _(state: CodegenState) -> ast.AST:
     from .._compiler.ast_extension import statement_from_string
 
-    name, index_str, prev_var = _pallas_atomic_load_prev(state)
+    name, index_str, prev_var = _pallas_atomic_load_prev(state, "atomic_xchg")
     value_ast = _to_ast_values([state.ast_args[2]])[0]
     state.codegen.add_statement(
         statement_from_string(f"{name}[{index_str}] = {{value}}", value=value_ast)
@@ -1182,7 +1190,7 @@ def _(state: CodegenState) -> ast.AST:
 def _(state: CodegenState) -> ast.AST:
     from .._compiler.ast_extension import statement_from_string
 
-    name, index_str, prev_var = _pallas_atomic_load_prev(state)
+    name, index_str, prev_var = _pallas_atomic_load_prev(state, "atomic_and")
     value_ast = _to_ast_values([state.ast_args[2]])[0]
     state.codegen.add_statement(
         statement_from_string(
@@ -1263,7 +1271,7 @@ def _(state: CodegenState) -> ast.AST:
 def _(state: CodegenState) -> ast.AST:
     from .._compiler.ast_extension import statement_from_string
 
-    name, index_str, prev_var = _pallas_atomic_load_prev(state)
+    name, index_str, prev_var = _pallas_atomic_load_prev(state, "atomic_or")
     value_ast = _to_ast_values([state.ast_args[2]])[0]
     state.codegen.add_statement(
         statement_from_string(
@@ -1344,7 +1352,7 @@ def _(state: CodegenState) -> ast.AST:
 def _(state: CodegenState) -> ast.AST:
     from .._compiler.ast_extension import statement_from_string
 
-    name, index_str, prev_var = _pallas_atomic_load_prev(state)
+    name, index_str, prev_var = _pallas_atomic_load_prev(state, "atomic_xor")
     value_ast = _to_ast_values([state.ast_args[2]])[0]
     state.codegen.add_statement(
         statement_from_string(
@@ -1429,7 +1437,7 @@ def _(state: CodegenState) -> ast.AST:
 def _(state: CodegenState) -> ast.AST:
     from .._compiler.ast_extension import statement_from_string
 
-    name, index_str, prev_var = _pallas_atomic_load_prev(state)
+    name, index_str, prev_var = _pallas_atomic_load_prev(state, "atomic_max")
     value_ast = _to_ast_values([state.ast_args[2]])[0]
     state.codegen.add_statement(
         statement_from_string(
@@ -1512,7 +1520,7 @@ def _(state: CodegenState) -> ast.AST:
 def _(state: CodegenState) -> ast.AST:
     from .._compiler.ast_extension import statement_from_string
 
-    name, index_str, prev_var = _pallas_atomic_load_prev(state)
+    name, index_str, prev_var = _pallas_atomic_load_prev(state, "atomic_min")
     value_ast = _to_ast_values([state.ast_args[2]])[0]
     state.codegen.add_statement(
         statement_from_string(
@@ -1690,6 +1698,14 @@ def _(state: CodegenState) -> ast.AST:
     host_function = HostFunction.current()
     if target not in host_function.tensor_to_origin:
         raise exc.AtomicOnDeviceTensor("pallas atomic_cas")
+
+    # CAS does not use _pallas_atomic_load_prev, so record its metadata here.
+    target_id = id(target)
+    state.device_function.pallas_atomic_target_ops.setdefault(target_id, set()).add(
+        "atomic_cas"
+    )
+    if state.fx_node is not None and len(state.fx_node.users) > 0:
+        state.device_function.pallas_atomic_return_used_target_ids.add(target_id)
 
     name = state.device_function.tensor_arg(target).name
     index_str, _ = pallas_codegen.index_str(state, index, target)

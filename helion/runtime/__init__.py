@@ -9,6 +9,7 @@ import os
 import sys
 from typing import TYPE_CHECKING
 from typing import Any
+from typing import TypedDict
 from typing import cast
 
 import torch
@@ -383,6 +384,119 @@ _BlockSpecInfo = list[
 ]
 
 
+class _PallasAtomicInfo(TypedDict):
+    target_arg_pos: int
+    ops: tuple[str, ...]
+    return_used: bool
+
+
+_PallasAtomicInfos = list[_PallasAtomicInfo]
+
+
+def _pallas_tensor_pos_map(
+    tensor_arg_indices: list[int],
+    output_only_indices: list[int] | None,
+) -> dict[int, int]:
+    all_positions = sorted(set(tensor_arg_indices) | set(output_only_indices or []))
+    return {orig: tpos for tpos, orig in enumerate(all_positions)}
+
+
+def _pallas_grid_dims_used_by_block_spec(
+    block_info: tuple[
+        tuple[int | None, ...], tuple[int | tuple[int, int, int] | None, ...]
+    ],
+) -> set[int]:
+    used: set[int] = set()
+    _, grid_dims = block_info
+    for grid_dim in grid_dims:
+        if isinstance(grid_dim, int):
+            used.add(grid_dim)
+        elif isinstance(grid_dim, tuple):
+            used.add(grid_dim[0])
+    return used
+
+
+def _pallas_atomic_contributor_plan(
+    grid: tuple[int, ...],
+    tensor_arg_indices: list[int],
+    output_only_indices: list[int],
+    output_indices: list[int],
+    inplace_indices: list[int] | None,
+    block_spec_info: _BlockSpecInfo | None,
+    atomic_infos: _PallasAtomicInfos | None,
+) -> tuple[dict[int, tuple[int, ...]], tuple[str, ...]]:
+    """Plan ordered shared-tile atomic RMW for Pallas outputs.
+
+    For a structural atomic such as split-K, the target BlockSpec maps only
+    output-tile dimensions while one or more grid dimensions contribute to the
+    same tile. Those contributor dimensions must run sequentially, and the
+    output preload must happen only for the first contributor.
+    """
+    dim_semantics = ["parallel"] * len(grid)
+    guarded_copies: dict[int, tuple[int, ...]] = {}
+    if not atomic_infos:
+        return guarded_copies, tuple(dim_semantics)
+    if block_spec_info is None:
+        raise RuntimeError(
+            "Pallas atomic lowering requires block-spec metadata for atomic targets"
+        )
+
+    output_set = set(output_indices)
+    inplace_set = set(inplace_indices or [])
+    arg_to_tpos = _pallas_tensor_pos_map(tensor_arg_indices, output_only_indices)
+    reduction_ops = {
+        "atomic_add",
+        "atomic_max",
+        "atomic_min",
+    }
+    for info in atomic_infos:
+        orig_pos = info["target_arg_pos"]
+        ops = info["ops"]
+        return_used = info["return_used"]
+        if orig_pos not in output_set:
+            raise RuntimeError(
+                "Pallas atomic target is not an output tensor; cannot lower atomic RMW safely"
+            )
+        tensor_pos = arg_to_tpos.get(orig_pos)
+        if tensor_pos is None or tensor_pos >= len(block_spec_info):
+            raise RuntimeError(
+                "Pallas atomic lowering requires block-spec metadata for the target tensor"
+            )
+        block_info = block_spec_info[tensor_pos]
+        if block_info is None:
+            raise RuntimeError(
+                "Pallas atomic lowering requires block-spec metadata for the target tensor"
+            )
+        used_dims = _pallas_grid_dims_used_by_block_spec(block_info)
+        # In split-K, the output tile uses the M/N grid dims; K is a contributor.
+        contributor_dims = tuple(
+            dim for dim, size in enumerate(grid) if size > 1 and dim not in used_dims
+        )
+        if not contributor_dims:
+            continue
+        if orig_pos not in inplace_set:
+            # TODO(tcombes): route this through launcher-owned VMEM scratch once
+            # shared atomic accumulator substitution is implemented.
+            raise RuntimeError(
+                "Pallas shared-tile atomics without an aliased input/output "
+                "target are not supported by this lowering"
+            )
+        unsupported = tuple(op for op in ops if op not in reduction_ops)
+        if unsupported:
+            raise RuntimeError(
+                "Pallas shared-tile atomics only support reduction-style ops "
+                f"for now; got {unsupported}"
+            )
+        if return_used:
+            raise RuntimeError(
+                "Pallas shared-tile atomics with used return values are not supported yet"
+            )
+        guarded_copies[orig_pos] = contributor_dims
+        for dim in contributor_dims:
+            dim_semantics[dim] = "arbitrary"
+    return guarded_copies, tuple(dim_semantics)
+
+
 def _pallas_build_block_specs(
     pl: object,
     jnp: object,
@@ -606,6 +720,7 @@ def _pallas_make_reordered_kernel(
     n_extra_refs: int = 0,
     skip_inplace_copy: set[int] | None = None,
     _smem_arg_indices: list[int] | None = None,
+    atomic_copy_guards: dict[int, tuple[int, ...]] | None = None,
 ) -> object:
     """Create a wrapper kernel that reorders pallas_call refs to the original arg order.
 
@@ -620,6 +735,9 @@ def _pallas_make_reordered_kernel(
     where direct load/store is not allowed.
     """
     _skip_copy = skip_inplace_copy or set()
+    _atomic_copy_guards = atomic_copy_guards or {}
+    if _atomic_copy_guards:
+        from jax.experimental import pallas as pl
 
     def reordered_kernel(*refs: object) -> None:
         n_kernel_params = len(args)
@@ -636,6 +754,25 @@ def _pallas_make_reordered_kernel(
                     # [...] cannot be used for SMEMs,
                     # TODO(dunfanlu): handle in-place copy for SMEM refs
                     pass
+                elif orig_pos in _atomic_copy_guards:
+                    # Only the first contributor initializes the accumulator;
+                    # later contributors must preserve earlier RMW updates.
+                    condition = None
+                    for dim in _atomic_copy_guards[orig_pos]:
+                        dim_is_first = pl.program_id(dim) == 0
+                        condition = (
+                            dim_is_first
+                            if condition is None
+                            else condition & dim_is_first
+                        )
+                    assert condition is not None
+
+                    @pl.when(condition)
+                    def _copy_atomic_initial_value(
+                        out_ref: object = out_ref, in_ref: object = in_ref
+                    ) -> None:
+                        out_ref[...] = in_ref[...]  # type: ignore[index]
+
                 else:
                     out_ref[...] = in_ref[...]  # type: ignore[index]
             original_order[orig_pos] = out_ref
@@ -897,6 +1034,7 @@ def default_pallas_launcher(
     _output_indices: list[int] | None = None,
     _inplace_indices: list[int] | None = None,
     _block_spec_info: _BlockSpecInfo | None = None,
+    _pallas_atomic_infos: _PallasAtomicInfos | None = None,
     _smem_arg_indices: list[int] | None = None,
     _ds_pad_dims: list[tuple[int, int, int, int]] | None = None,
     _pallas_interpret: bool | None = None,
@@ -966,6 +1104,15 @@ def default_pallas_launcher(
             _smem_arg_indices,
             output_only_indices,
         )
+        atomic_copy_guards, dimension_semantics = _pallas_atomic_contributor_plan(
+            grid,
+            tensor_arg_indices,
+            output_only_indices,
+            _output_indices,
+            _inplace_indices,
+            _block_spec_info,
+            _pallas_atomic_infos,
+        )
 
         reordered_kernel = _pallas_make_reordered_kernel(
             pallas_kernel,
@@ -977,6 +1124,7 @@ def default_pallas_launcher(
             inplace_positions,
             arg_to_tensor_pos,
             _smem_arg_indices=_smem_arg_indices,
+            atomic_copy_guards=atomic_copy_guards,
         )
 
         out_shape_arg = out_shapes if len(out_shapes) > 1 else out_shapes[0]
@@ -1003,6 +1151,10 @@ def default_pallas_launcher(
             "out_shape": out_shape_arg,
             "grid": grid,
         }
+        if any(dim != "parallel" for dim in dimension_semantics):
+            pallas_call_kwargs["compiler_params"] = pltpu.CompilerParams(  # pyrefly: ignore[bad-instantiation]
+                dimension_semantics=cast("Any", dimension_semantics),
+            )
         if interpret:
             pallas_call_kwargs["interpret"] = True
         if in_specs is not None:
@@ -1044,6 +1196,7 @@ def default_pallas_pipeline_launcher(
     _output_indices: list[int] | None = None,
     _inplace_indices: list[int] | None = None,
     _block_spec_info: _BlockSpecInfo | None = None,
+    _pallas_atomic_infos: _PallasAtomicInfos | None = None,
     _scratch_shapes: list[tuple[tuple[int, ...], str]] | None = None,
     _pipeline_arg_indices: list[int] | None = None,
     _ds_pad_dims: list[tuple[int, int, int, int]] | None = None,
@@ -1132,6 +1285,15 @@ def default_pallas_pipeline_launcher(
             output_only_indices,
             smem_arg_indices=_smem_arg_indices,
         )
+        atomic_copy_guards, dimension_semantics = _pallas_atomic_contributor_plan(
+            grid,
+            tensor_arg_indices,
+            output_only_indices,
+            _output_indices,
+            _inplace_indices,
+            _block_spec_info,
+            _pallas_atomic_infos,
+        )
 
         _pipeline_set = set(_pipeline_arg_indices or [])
         reordered_kernel = _pallas_make_reordered_kernel(
@@ -1146,6 +1308,7 @@ def default_pallas_pipeline_launcher(
             n_extra_refs=len(scratch_shapes),
             skip_inplace_copy=_pipeline_set,
             _smem_arg_indices=_smem_arg_indices,
+            atomic_copy_guards=atomic_copy_guards,
         )
 
         out_shape_arg = out_shapes if len(out_shapes) > 1 else out_shapes[0]
@@ -1180,7 +1343,7 @@ def default_pallas_pipeline_launcher(
             "out_shape": out_shape_arg,
             "grid_spec": grid_spec,
             "compiler_params": pltpu.CompilerParams(  # pyrefly: ignore[bad-instantiation]
-                dimension_semantics=tuple("parallel" for _ in grid),
+                dimension_semantics=cast("Any", dimension_semantics),
             ),
         }
         if interpret:
@@ -1222,6 +1385,7 @@ def default_pallas_fori_launcher(
     _output_indices: list[int] | None = None,
     _inplace_indices: list[int] | None = None,
     _block_spec_info: _BlockSpecInfo | None = None,
+    _pallas_atomic_infos: _PallasAtomicInfos | None = None,
     _scratch_shapes: list[tuple[tuple[int, ...], str | None, str]] | None = None,
     _ds_pad_dims: list[tuple[int, int, int, int]] | None = None,
     _smem_arg_indices: list[int] | None = None,
@@ -1310,6 +1474,15 @@ def default_pallas_fori_launcher(
             output_only_indices,
             smem_arg_indices=_smem_arg_indices,
         )
+        atomic_copy_guards, dimension_semantics = _pallas_atomic_contributor_plan(
+            grid,
+            tensor_arg_indices,
+            output_only_indices,
+            _output_indices,
+            _inplace_indices,
+            _block_spec_info,
+            _pallas_atomic_infos,
+        )
 
         _fori_pipeline_set = set(_fori_pipeline_indices or [])  # type: ignore[arg-type]
         reordered_kernel = _pallas_make_reordered_kernel(
@@ -1324,6 +1497,7 @@ def default_pallas_fori_launcher(
             n_extra_refs=len(scratch_shapes),
             skip_inplace_copy=_fori_pipeline_set,
             _smem_arg_indices=_smem_arg_indices,
+            atomic_copy_guards=atomic_copy_guards,
         )
 
         out_shape_arg = out_shapes if len(out_shapes) > 1 else out_shapes[0]
@@ -1358,7 +1532,7 @@ def default_pallas_fori_launcher(
             "out_shape": out_shape_arg,
             "grid_spec": grid_spec,
             "compiler_params": pltpu.CompilerParams(  # pyrefly: ignore[bad-instantiation]
-                dimension_semantics=tuple("parallel" for _ in grid),
+                dimension_semantics=cast("Any", dimension_semantics),
             ),
         }
         if interpret:

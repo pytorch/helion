@@ -17,6 +17,7 @@ from helion._testing import skipIfTileIR
 from helion._testing import skipUnlessTensorDescriptor
 from helion._testing import xfailIfPallas
 import helion.language as hl
+from helion.runtime import _pallas_atomic_contributor_plan
 from helion.runtime.settings import _get_backend
 
 
@@ -157,6 +158,109 @@ def atomic_add_tensor_index_kernel(
     return out
 
 
+@helion.kernel(static_shapes=True)
+def pallas_structural_atomic_add_kernel(x: torch.Tensor) -> torch.Tensor:
+    """Structurally shared output tile: contributor dim is leading K."""
+    k, m, n = x.shape
+    out = torch.ones([m, n], dtype=x.dtype, device=x.device)
+    for tile_k, tile_m, tile_n in hl.tile([k, m, n]):
+        value = torch.sum(x[tile_k, tile_m, tile_n], dim=0)
+        hl.atomic_add(out, [tile_m, tile_n], value)
+    return out
+
+
+@helion.kernel(static_shapes=True)
+def pallas_structural_atomic_add_2_contributor_kernel(
+    x: torch.Tensor,
+) -> torch.Tensor:
+    """Two contributor dims both update the same output tile."""
+    r, k, m, n = x.shape
+    out = torch.ones([m, n], dtype=x.dtype, device=x.device)
+    for tile_r, tile_k, tile_m, tile_n in hl.tile([r, k, m, n]):
+        value = torch.sum(torch.sum(x[tile_r, tile_k, tile_m, tile_n], dim=0), dim=0)
+        hl.atomic_add(out, [tile_m, tile_n], value)
+    return out
+
+
+@helion.kernel(static_shapes=True)
+def pallas_structural_atomic_add_two_outputs_kernel(
+    x: torch.Tensor, y: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    k, m, n = x.shape
+    out_x = torch.ones([m, n], dtype=x.dtype, device=x.device)
+    out_y = torch.full([m, n], 2.0, dtype=y.dtype, device=y.device)
+    for tile_k, tile_m, tile_n in hl.tile([k, m, n]):
+        x_value = torch.sum(x[tile_k, tile_m, tile_n], dim=0)
+        y_value = torch.sum(y[tile_k, tile_m, tile_n], dim=0)
+        hl.atomic_add(out_x, [tile_m, tile_n], x_value)
+        hl.atomic_add(out_y, [tile_m, tile_n], y_value)
+    return out_x, out_y
+
+
+@helion.kernel(static_shapes=True)
+def pallas_structural_atomic_add_used_return_kernel(
+    x: torch.Tensor,
+) -> torch.Tensor:
+    k, m, n = x.shape
+    out = torch.ones([m, n], dtype=x.dtype, device=x.device)
+    prev = torch.empty([m, n], dtype=x.dtype, device=x.device)
+    for tile_k, tile_m, tile_n in hl.tile([k, m, n]):
+        value = torch.sum(x[tile_k, tile_m, tile_n], dim=0)
+        old = hl.atomic_add(out, [tile_m, tile_n], value)
+        prev[tile_m, tile_n] = old
+    return prev
+
+
+@helion.kernel(static_shapes=True)
+def pallas_structural_atomic_xchg_kernel(x: torch.Tensor) -> torch.Tensor:
+    k, m, n = x.shape
+    out = torch.zeros([m, n], dtype=x.dtype, device=x.device)
+    for tile_k, tile_m, tile_n in hl.tile([k, m, n]):
+        value = torch.sum(x[tile_k, tile_m, tile_n], dim=0)
+        hl.atomic_xchg(out, [tile_m, tile_n], value)
+    return out
+
+
+@helion.kernel(static_shapes=True)
+def pallas_structural_atomic_cas_kernel(x: torch.Tensor) -> torch.Tensor:
+    k, m, n = x.shape
+    out = torch.zeros([m, n], dtype=x.dtype, device=x.device)
+    for tile_k, tile_m, tile_n in hl.tile([k, m, n]):
+        value = torch.sum(x[tile_k, tile_m, tile_n], dim=0)
+        hl.atomic_cas(out, [tile_m, tile_n], 0.0, value)
+    return out
+
+
+@helion.kernel(static_shapes=True)
+def pallas_structural_atomic_or_kernel(x: torch.Tensor) -> torch.Tensor:
+    k, m, n = x.shape
+    out = torch.zeros([m, n], dtype=x.dtype, device=x.device)
+    for tile_k, tile_m, tile_n in hl.tile([k, m, n]):
+        value = torch.sum(x[tile_k, tile_m, tile_n], dim=0)
+        hl.atomic_or(out, [tile_m, tile_n], value)
+    return out
+
+
+@helion.kernel(static_shapes=True)
+def pallas_structural_atomic_max_kernel(x: torch.Tensor) -> torch.Tensor:
+    k, m, n = x.shape
+    out = torch.full([m, n], -1000.0, dtype=x.dtype, device=x.device)
+    for tile_k, tile_m, tile_n in hl.tile([k, m, n]):
+        value = torch.amax(x[tile_k, tile_m, tile_n], dim=0)
+        hl.atomic_max(out, [tile_m, tile_n], value)
+    return out
+
+
+@helion.kernel(static_shapes=True)
+def pallas_structural_atomic_min_kernel(x: torch.Tensor) -> torch.Tensor:
+    k, m, n = x.shape
+    out = torch.full([m, n], 1000.0, dtype=x.dtype, device=x.device)
+    for tile_k, tile_m, tile_n in hl.tile([k, m, n]):
+        value = torch.amin(x[tile_k, tile_m, tile_n], dim=0)
+        hl.atomic_min(out, [tile_m, tile_n], value)
+    return out
+
+
 # New kernels for other atomics
 
 
@@ -274,6 +378,78 @@ def atomic_xchg_2d_td_kernel(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
 
 @onlyBackends(["triton", "cute", "pallas"])
 class TestAtomicOperations(RefEagerTestBase, TestCase):
+    @onlyBackends(["pallas"])
+    def test_pallas_output_ref_accumulator_contract(self):
+        import jax
+        from jax.experimental import pallas as pl
+        from jax.experimental.pallas import tpu as pltpu
+        import jax.numpy as jnp
+
+        def kernel(x_ref, out_ref):
+            k_pid = pl.program_id(0)
+
+            @pl.when(k_pid == 0)
+            def _init():
+                out_ref[...] = x_ref[...]
+
+            out_ref[...] = out_ref[...] + (k_pid + 1).astype(jnp.float32)
+
+        call = pl.pallas_call(
+            kernel,
+            out_shape=jax.ShapeDtypeStruct((8, 128), jnp.float32),
+            grid=(4,),
+            in_specs=[pl.BlockSpec((8, 128), lambda k: (0, 0))],
+            out_specs=pl.BlockSpec((8, 128), lambda k: (0, 0)),
+            input_output_aliases={0: 0},
+            compiler_params=pltpu.CompilerParams(dimension_semantics=("arbitrary",)),
+        )
+        x = jnp.ones((8, 128), dtype=jnp.float32)
+        result = jax.jit(call)(x).block_until_ready()
+        expected = x + sum(range(1, 5))
+        torch.testing.assert_close(
+            torch.from_numpy(jax.device_get(result).copy()),
+            torch.from_numpy(jax.device_get(expected).copy()),
+        )
+
+    @onlyBackends(["pallas"])
+    def test_pallas_atomic_contributor_plan_marks_arbitrary_dims(self):
+        copy_guards, dim_semantics = _pallas_atomic_contributor_plan(
+            (3, 4, 2, 1),
+            [0, 1],
+            [],
+            [1],
+            [1],
+            [
+                ((1, 1, 8, 128), (0, 1, 2, None)),
+                ((8, 128), (2, None)),
+            ],
+            [{"target_arg_pos": 1, "ops": ("atomic_add",), "return_used": False}],
+        )
+
+        self.assertEqual(copy_guards, {1: (0, 1)})
+        self.assertEqual(
+            dim_semantics, ("arbitrary", "arbitrary", "parallel", "parallel")
+        )
+
+    @onlyBackends(["pallas"])
+    def test_pallas_atomic_contributor_plan_rejects_non_aliased_output(self):
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "without an aliased input/output target are not supported",
+        ):
+            _pallas_atomic_contributor_plan(
+                (3, 4, 2, 1),
+                [0],
+                [1],
+                [1],
+                [],
+                [
+                    ((1, 1, 8, 128), (0, 1, 2, None)),
+                    ((8, 128), (2, None)),
+                ],
+                [{"target_arg_pos": 1, "ops": ("atomic_add",), "return_used": False}],
+            )
+
     def test_basic_atomic_add(self):
         x = torch.zeros(10, device=DEVICE)
         y = torch.ones(10, device=DEVICE)
@@ -454,6 +630,129 @@ class TestAtomicOperations(RefEagerTestBase, TestCase):
             torch.bfloat16
         )
         torch.testing.assert_close(result, expected, atol=0.1, rtol=0.05)
+
+    @onlyBackends(["pallas"])
+    def test_pallas_structural_atomic_add_shared_tile(self):
+        x = torch.randn(4, 16, 128, device=DEVICE, dtype=torch.float32)
+
+        for loop_type in ("unroll", "fori_loop", "emit_pipeline"):
+            with self.subTest(loop_type=loop_type):
+                code, result = code_and_output(
+                    pallas_structural_atomic_add_kernel,
+                    (x,),
+                    block_sizes=[1, 8, 128],
+                    pallas_loop_type=loop_type,
+                )
+                expected = torch.ones(16, 128, device=DEVICE) + x.sum(dim=0)
+                torch.testing.assert_close(result, expected)
+                self.assertIn("_pallas_atomic_infos=", code)
+
+    @onlyBackends(["pallas"])
+    def test_pallas_structural_atomic_add_two_contributor_dims(self):
+        x = torch.randn(3, 4, 16, 128, device=DEVICE, dtype=torch.float32)
+
+        code, result = code_and_output(
+            pallas_structural_atomic_add_2_contributor_kernel,
+            (x,),
+            block_sizes=[1, 1, 8, 128],
+            pallas_loop_type="fori_loop",
+        )
+
+        expected = torch.ones(16, 128, device=DEVICE) + x.sum(dim=(0, 1))
+        torch.testing.assert_close(result, expected)
+        self.assertIn("_pallas_atomic_infos=", code)
+
+    @onlyBackends(["pallas"])
+    def test_pallas_structural_atomic_add_multiple_outputs(self):
+        x = torch.randn(4, 16, 128, device=DEVICE, dtype=torch.float32)
+        y = torch.randn(4, 16, 128, device=DEVICE, dtype=torch.float32)
+
+        code, (out_x, out_y) = code_and_output(
+            pallas_structural_atomic_add_two_outputs_kernel,
+            (x, y),
+            block_sizes=[1, 8, 128],
+            pallas_loop_type="emit_pipeline",
+        )
+
+        torch.testing.assert_close(
+            out_x, torch.ones(16, 128, device=DEVICE) + x.sum(dim=0)
+        )
+        torch.testing.assert_close(
+            out_y, torch.full([16, 128], 2.0, device=DEVICE) + y.sum(dim=0)
+        )
+        self.assertIn("_pallas_atomic_infos=", code)
+
+    @onlyBackends(["pallas"])
+    def test_pallas_structural_atomic_max_min_shared_tile(self):
+        x = torch.randn(4, 16, 128, device=DEVICE, dtype=torch.float32)
+
+        code_max, result_max = code_and_output(
+            pallas_structural_atomic_max_kernel,
+            (x,),
+            block_sizes=[1, 8, 128],
+        )
+        expected_max = torch.maximum(
+            torch.full([16, 128], -1000.0, device=DEVICE), x.amax(dim=0)
+        )
+        torch.testing.assert_close(result_max, expected_max)
+        self.assertIn("_pallas_atomic_infos=", code_max)
+
+        code_min, result_min = code_and_output(
+            pallas_structural_atomic_min_kernel,
+            (x,),
+            block_sizes=[1, 8, 128],
+        )
+        expected_min = torch.minimum(
+            torch.full([16, 128], 1000.0, device=DEVICE), x.amin(dim=0)
+        )
+        torch.testing.assert_close(result_min, expected_min)
+        self.assertIn("_pallas_atomic_infos=", code_min)
+
+    @onlyBackends(["pallas"])
+    def test_pallas_structural_atomic_add_used_return_rejected(self):
+        x = torch.randn(4, 16, 128, device=DEVICE, dtype=torch.float32)
+
+        with self.assertRaisesRegex(
+            RuntimeError, "used return values are not supported"
+        ):
+            code_and_output(
+                pallas_structural_atomic_add_used_return_kernel,
+                (x,),
+                block_sizes=[1, 8, 128],
+            )
+
+    @onlyBackends(["pallas"])
+    def test_pallas_structural_atomic_xchg_rejected(self):
+        x = torch.randn(4, 16, 128, device=DEVICE, dtype=torch.float32)
+
+        with self.assertRaisesRegex(RuntimeError, "only support reduction-style ops"):
+            code_and_output(
+                pallas_structural_atomic_xchg_kernel,
+                (x,),
+                block_sizes=[1, 8, 128],
+            )
+
+    @onlyBackends(["pallas"])
+    def test_pallas_structural_atomic_cas_rejected(self):
+        x = torch.randn(4, 16, 128, device=DEVICE, dtype=torch.float32)
+
+        with self.assertRaisesRegex(RuntimeError, "only support reduction-style ops"):
+            code_and_output(
+                pallas_structural_atomic_cas_kernel,
+                (x,),
+                block_sizes=[1, 8, 128],
+            )
+
+    @onlyBackends(["pallas"])
+    def test_pallas_structural_bitwise_atomic_rejected(self):
+        x = torch.randint(0, 16, (4, 16, 128), device=DEVICE, dtype=torch.int32)
+
+        with self.assertRaisesRegex(RuntimeError, "only support reduction-style ops"):
+            code_and_output(
+                pallas_structural_atomic_or_kernel,
+                (x,),
+                block_sizes=[1, 8, 128],
+            )
 
     def test_atomic_add_code_generation(self):
         """Test that the generated code contains atomic_add."""
