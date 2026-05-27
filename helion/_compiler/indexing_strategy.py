@@ -476,7 +476,10 @@ class TensorDescriptorIndexingStrategy(IndexingStrategy):
                 return False
 
         def valid_block_size(
-            block_size: int | torch.SymInt | None, stride: int | torch.SymInt, idx: int
+            block_size: int | torch.SymInt | None,
+            stride: int | torch.SymInt,
+            idx: int,
+            dim_size: int | torch.SymInt,
         ) -> bool:
             if not isinstance(block_size, int):
                 return False
@@ -492,6 +495,9 @@ class TensorDescriptorIndexingStrategy(IndexingStrategy):
 
                 if fake_tensor.ndim == 2 and block_size < threshold:
                     return False
+
+            if isinstance(dim_size, int) and block_size > dim_size:
+                return False
 
             # Tensor-descriptor path (TMA + WGMMA / stmatrix writes)
             # moves data in 16-byte chunks. Enforce a 16-byte minimum so the
@@ -523,7 +529,7 @@ class TensorDescriptorIndexingStrategy(IndexingStrategy):
                 block_size = env.allocate_reduction_dimension(slice_size).from_config(
                     config
                 )
-                if not valid_block_size(block_size, stride, i):
+                if not valid_block_size(block_size, stride, i, size):
                     return False
                 assert isinstance(block_size, int)
                 descriptor_block_shape.append(block_size)
@@ -536,7 +542,7 @@ class TensorDescriptorIndexingStrategy(IndexingStrategy):
                     if tile_info.block_size is not None
                     else env.block_sizes[tile_info.block_id].from_config(config)
                 )
-                if not valid_block_size(block_size, stride, i):
+                if not valid_block_size(block_size, stride, i, size):
                     return False
                 assert isinstance(block_size, int)
                 descriptor_block_shape.append(block_size)
@@ -549,7 +555,7 @@ class TensorDescriptorIndexingStrategy(IndexingStrategy):
                     block_size = env.block_sizes[origin.origin.block_id].from_config(
                         config
                     )
-                    if not valid_block_size(block_size, stride, i):
+                    if not valid_block_size(block_size, stride, i, size):
                         return False
                     assert isinstance(block_size, int)
                     descriptor_block_shape.append(block_size)
@@ -572,6 +578,7 @@ class TensorDescriptorIndexingStrategy(IndexingStrategy):
             descriptor_block_shape[stride_one_dim],
             fake_tensor.stride(stride_one_dim),
             stride_one_dim,
+            fake_tensor.size(stride_one_dim),
         )
 
     def codegen_load(
