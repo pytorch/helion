@@ -1,7 +1,7 @@
-# helion._C — optional native extension
+# helion._C — optional native extensions
 
-This directory holds an OPTIONAL compiled extension that accelerates
-Helion's hot paths. It is not built by the default Helion install
+This directory holds OPTIONAL compiled extensions that accelerate
+Helion's hot paths. They are not built by the default Helion install
 (which uses `hatchling` and ships a pure-Python wheel).
 
 ## What's here
@@ -9,7 +9,12 @@ Helion's hot paths. It is not built by the default Helion install
 - `_native.c` — single-file C extension. Currently exports
   `tensor_key(tensor, static_indices) -> tuple | None`, the
   static-shapes specialization key built per-call by `Kernel.bind`.
-- `__init__.py` — Python shim that imports the compiled extension if
+- `_launcher.c` — minimal C launcher. Exposes
+  `CompiledLauncher` (a Python type with a `tp_call` slot) that
+  dispatches a Triton kernel directly into `compiled_kernel.run`,
+  bypassing both the Python `default_launcher` frame and Triton's
+  `JITFunction.run` pipeline.
+- `__init__.py` — Python shim that imports the compiled extensions if
   present and exposes `AVAILABLE` + per-symbol fallback sentinels.
 
 ## When to build
@@ -24,19 +29,19 @@ From the repo root, with the active Python env:
 
 ```sh
 python -c "
-import distutils.sysconfig as s, subprocess, sysconfig
-cflags = sysconfig.get_config_var('CFLAGS') or ''
+import subprocess, sysconfig
 inc = sysconfig.get_path('include')
 ext_suffix = sysconfig.get_config_var('EXT_SUFFIX')
-out = f'helion/_C/_native{ext_suffix}'
-subprocess.check_call([
-    'gcc', '-shared', '-fPIC',
-    '-O3',
-    f'-I{inc}',
-    'helion/_C/_native.c',
-    '-o', out,
-])
-print('Built', out)
+for stem in ('_native', '_launcher'):
+    out = f'helion/_C/{stem}{ext_suffix}'
+    subprocess.check_call([
+        'gcc', '-shared', '-fPIC',
+        '-O3',
+        f'-I{inc}',
+        f'helion/_C/{stem}.c',
+        '-o', out,
+    ])
+    print('Built', out)
 "
 ```
 
