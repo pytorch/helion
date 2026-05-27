@@ -334,14 +334,34 @@ class TileStrategyDispatch:
         return branches
 
     def thread_axis_for_strategy(self, target: TileStrategy) -> int | None:
-        """Return the starting thread-axis index for a strategy in its branch."""
+        """Return the starting thread-axis index for a strategy in its branch.
+
+        Strategies that share their entire ``block_ids`` set with an
+        earlier strategy in the branch (e.g. two sibling ``hl.tile`` loops
+        over the same N-axis in a softmax kernel) reuse the earlier
+        strategy's thread axis — they are mutually exclusive in time, so
+        they map to the same hardware lane.  Without this dedup the
+        warp-per-row layout would assign one axis per inner tile loop
+        and bury M on axis 2 or 3.
+        """
         for branch in self._strategy_branches():
             if target not in branch:
                 continue
             axis = 0
+            seen_block_id_sets: dict[tuple[int, ...], int] = {}
             for strategy in self._ordered_strategies_for_branch(branch):
+                key = tuple(sorted(strategy.block_ids))
+                cached = seen_block_id_sets.get(key)
+                if cached is not None:
+                    # Same block-id footprint as an earlier sibling —
+                    # they're mutually exclusive in time so they share
+                    # the axis.
+                    if strategy is target:
+                        return cached
+                    continue
                 if strategy is target:
                     return axis
+                seen_block_id_sets[key] = axis
                 axis += strategy.thread_axes_used()
         return None
 

@@ -3459,7 +3459,89 @@ class CuteBackend(Backend):
                 dims = dynamic_dims
             else:
                 dims = DeviceFunction.current().tile_strategy.thread_block_dims()
+        # Detect the silent-truncation case: codegen has already emitted
+        # thread_idx[axis] references that assume a certain per-axis
+        # extent (recorded in ``referenced_thread_block_dims``), but the
+        # chosen launch ``dims`` for that axis is smaller. This happens
+        # when the joint requested thread count exceeds 1024 and the
+        # earlier fallback paths in this function dropped axes to (1, 1, 1)
+        # to fit the budget. Under-dimensioning here would leave
+        # cross-thread reductions (group_span, warp_reduce) operating
+        # against nonexistent lanes, silently producing wrong results
+        # (e.g. softmax with M*N>1024 returning max_err on the order of
+        # tens). Surface this as ``BackendUnsupported`` so the autotuner
+        # skips the config and falls back to a viable one.
+        #
+        # Skip this check when the joint referenced thread count fits
+        # within ``MAX_THREADS_PER_BLOCK``: in that case any per-axis
+        # mismatch comes from a strategy that intentionally launches
+        # fewer threads than the codegen "references" (e.g. an outer-
+        # tile axis with a single logical lane that still appears in a
+        # warp-reduction call), and the CuTe runtime degenerates the
+        # reduction to the live lanes without losing data.
+        #
+        # Skip this check for tcgen05-specialized matmul kernels: those
+        # use a custom role-warp launch shape that intentionally differs
+        # from the SIMT thread-axis counts (the latter being how many
+        # threads the user-visible per-element loops would expect). The
+        # tcgen05 code paths know which lanes are alive on their own.
+        # Also skip when the kernel has any matmul / MMA call (addmm,
+        # baddbmm, mm, bmm, or hl.dot): those paths cooperate within a
+        # warp through CUTLASS MMA intrinsics that don't depend on the
+        # SIMT axis layout, so the strategy can intentionally launch
+        # fewer threads on a reduction axis (e.g. K) than the codegen
+        # "references" through the strategy's per-block thread count.
+        from ..language._decorators import is_api_func
         from .cute.thread_budget import check_thread_limit
+
+        _matmul_targets = {
+            torch.ops.aten.mm.default,
+            torch.ops.aten.addmm.default,
+            torch.ops.aten.bmm.default,
+            torch.ops.aten.baddbmm.default,
+        }
+
+        def _has_matmul_call() -> bool:
+            for graph_info in device_function.codegen.codegen_graphs:
+                graph = getattr(graph_info, "graph", None)
+                if not isinstance(graph, torch.fx.Graph):
+                    continue
+                for node in graph.nodes:
+                    if node.op != "call_function":
+                        continue
+                    if node.target in _matmul_targets:
+                        return True
+                    if is_api_func(node.target) and (
+                        getattr(node.target, "__name__", "") == "dot"
+                    ):
+                        return True
+            return False
+
+        kernel_has_mma = _has_matmul_call()
+        if (
+            tcgen05_compact_dims is None
+            and not specialized_root_tcgen05
+            and not kernel_has_mma
+        ):
+            referenced_threads = functools.reduce(
+                operator.mul, codegen.referenced_thread_block_dims, 1
+            )
+            if referenced_threads > MAX_THREADS_PER_BLOCK:
+                for axis, ref_size in enumerate(codegen.referenced_thread_block_dims):
+                    if ref_size > 1 and axis < len(dims) and dims[axis] < ref_size:
+                        raise exc.BackendUnsupported(
+                            self.name,
+                            (
+                                f"launch dims {tuple(dims)} under-dimension"
+                                f" referenced_thread_block_dims="
+                                f"{tuple(codegen.referenced_thread_block_dims)}"
+                                f" (axis {axis}: launched={dims[axis]} <"
+                                f" referenced={ref_size}). Codegen would access"
+                                f" nonexistent threads — joint requested"
+                                f" thread count {referenced_threads} >"
+                                f" {MAX_THREADS_PER_BLOCK}."
+                            ),
+                        )
 
         check_thread_limit(dims[0] * dims[1] * dims[2], context=str(tuple(dims)))
         return launcher_args_with_compile_options(

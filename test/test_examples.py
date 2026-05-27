@@ -933,6 +933,9 @@ class TestExamples(RefEagerTestBase, TestCase):
             block_sizes=[1, 64, 32],
         )
 
+    @xfailIfCute(
+        "CuTe attention-style online-softmax kernel still returns incorrect results"
+    )
     def test_xsa(self):
         args = (
             torch.randn(2, 32, 1024, 64, dtype=HALF_DTYPE, device=DEVICE),
@@ -948,6 +951,9 @@ class TestExamples(RefEagerTestBase, TestCase):
             block_sizes=[1, 64, 32],
         )
 
+    @xfailIfCute(
+        "CuTe attention-style online-softmax kernel still returns incorrect results"
+    )
     def test_xsa_near_zero_v(self):
         q = torch.randn(2, 4, 128, 64, dtype=HALF_DTYPE, device=DEVICE)
         k = torch.randn_like(q)

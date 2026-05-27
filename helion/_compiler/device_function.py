@@ -838,7 +838,49 @@ class DeviceFunction:
                     and isinstance(stmt.value.value, int)
                 ):
                     constexpr_values[stmt.targets[0].id] = stmt.value.value
-            kernel_body = fuse_two_pass_loads(kernel_body, constexpr_values)
+            # Pass the per-axis thread dims so the fuser can size
+            # SMEM-backed caches correctly and build a per-thread
+            # linear slot index when ``cache_size`` exceeds the
+            # register-fragment threshold (opt-in via
+            # ``HELION_FUSER_MODE=smem``).
+            try:
+                thread_dims = self.tile_strategy.thread_block_dims()
+                thread_block_dims: tuple[int, int, int] = (
+                    int(thread_dims[0]),
+                    int(thread_dims[1]),
+                    int(thread_dims[2]),
+                )
+            except Exception:
+                thread_block_dims = (1, 1, 1)
+            kernel_body = fuse_two_pass_loads(
+                kernel_body,
+                constexpr_values,
+                thread_block_dims=thread_block_dims,
+            )
+            # Hoist warp reductions out of constexpr V-loops to collapse
+            # 4 per-V-lane warp reductions into 1 V-fold + 1 warp reduce.
+            # For online softmax style kernels this drops per-row reductions
+            # from ~396 to ~99 (4x fewer SHFL trees).
+            from .cute.hoist_warp_reduce import hoist_warp_reduce_from_vloop
+
+            kernel_body = hoist_warp_reduce_from_vloop(kernel_body)
+            # Merge adjacent constexpr V-loops that share an identical
+            # statement prefix.  Caches the last common per-V-lane value
+            # into a register fragment so V-loop 2's bitcast/cast chain
+            # disappears and the SASS scheduler can issue V-loop 2's
+            # arithmetic without waiting for V-loop 1's results.
+            from .cute.merge_sibling_v_loops import merge_sibling_v_loops
+
+            kernel_body = merge_sibling_v_loops(kernel_body)
+            # Hoist loop-invariant floating-point divisions out of inner
+            # tile loops, replacing each ``x / scalar`` with a hoisted
+            # ``inv = 1.0 / scalar`` + ``x * inv`` in the loop body.
+            # B200 div is ~22 cycles vs ~2 for multiply, so the softmax
+            # consume sweep (~12672 divides per row) sees a measured
+            # +20% bench gain on (4096, 12672) fp16.
+            from .cute.hoist_loop_invariant_recip import hoist_loop_invariant_recips
+
+            kernel_body = hoist_loop_invariant_recips(kernel_body)
         return [
             *prefix,
             ast_rename(

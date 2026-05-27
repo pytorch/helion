@@ -113,8 +113,11 @@ class TestReductions(RefEagerTestBase, TestCase):
     def test_cross_warp_reduction_non_sum_ops(self):
         """Exercise shared-memory (two-stage) strided reduction for non-sum ops.
 
-        Using block_sizes=[4, 32] gives group_span=128 (>32 and %32==0),
-        which triggers the shared two-stage reduction path on CuTe.
+        Using block_sizes=[1, 128] keeps the outer M-block at one row per
+        CTA (so the warp-per-row layout's ``m_threads >= 2`` check fails)
+        while the inner reduction spans 128 threads (4 warps cooperating
+        on a single row), giving group_span=128 (>32 and %32==0) which
+        triggers the shared two-stage reduction path on CuTe.
         """
 
         @helion.kernel(autotune_effort="none")
@@ -162,7 +165,7 @@ class TestReductions(RefEagerTestBase, TestCase):
         ]
         for kernel, ref_fn in cases:
             with self.subTest(kernel=kernel.__name__):
-                code, out = code_and_output(kernel, (x,), block_sizes=[4, 32])
+                code, out = code_and_output(kernel, (x,), block_sizes=[1, 128])
                 torch.testing.assert_close(out, ref_fn(x), rtol=1e-4, atol=1e-4)
                 if _get_backend() == "cute":
                     self.assertIn("_cute_grouped_reduce_shared_two_stage", code)

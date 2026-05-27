@@ -7,6 +7,9 @@ from .common import dedupe_configs
 from .cute import CuteReductionTileHeuristic
 from .cute import CuteReductionWideChunkHeuristic
 from .cute import CuteTcgen05ClusterM2Heuristic
+from .cute import CuteTileVecHeuristic
+from .cute import CuteTileVecWarpPerRowHeuristic
+from .cute import CuteTileVecWarpReduceHeuristic
 from .triton import TritonSkinnyGemmHeuristic
 
 if TYPE_CHECKING:
@@ -21,6 +24,9 @@ HEURISTICS_BY_BACKEND: dict[str, tuple[AutotunerHeuristicType, ...]] = {
         CuteTcgen05ClusterM2Heuristic,
         CuteReductionTileHeuristic,
         CuteReductionWideChunkHeuristic,
+        CuteTileVecHeuristic,
+        CuteTileVecWarpReduceHeuristic,
+        CuteTileVecWarpPerRowHeuristic,
     ),
     "triton": (TritonSkinnyGemmHeuristic,),
 }
