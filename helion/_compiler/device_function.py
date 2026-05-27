@@ -872,6 +872,15 @@ class DeviceFunction:
             from .cute.merge_sibling_v_loops import merge_sibling_v_loops
 
             kernel_body = merge_sibling_v_loops(kernel_body)
+            # Hoist loop-invariant floating-point divisions out of inner
+            # tile loops, replacing each ``x / scalar`` with a hoisted
+            # ``inv = 1.0 / scalar`` + ``x * inv`` in the loop body.
+            # B200 div is ~22 cycles vs ~2 for multiply, so the softmax
+            # consume sweep (~12672 divides per row) sees a measured
+            # +20% bench gain on (4096, 12672) fp16.
+            from .cute.hoist_loop_invariant_recip import hoist_loop_invariant_recips
+
+            kernel_body = hoist_loop_invariant_recips(kernel_body)
         return [
             *prefix,
             ast_rename(
