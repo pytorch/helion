@@ -119,6 +119,8 @@ jobs:
 
       - name: Install PyTorch
         run: |
+          set -eux
+
           source .venv/bin/activate
           if [[ "${{ matrix.pytorch-version }}" == pytorch-[0-9]* ]]; then
             VERSION="${{ matrix.pytorch-version }}"
