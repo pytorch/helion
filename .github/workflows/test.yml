@@ -193,7 +193,7 @@ jobs:
             --extra-index-url https://us-python.pkg.dev/ml-oss-artifacts-published/jax/simple/ \
             --find-links https://storage.googleapis.com/jax-releases/libtpu_releases.html \
             --pre \
-            'jax==0.10.0' 'jaxlib==0.10.0' 'libtpu==0.0.40' 'tpu-info==0.7.1' 'jaxtyping' 'frozendict' 'immutabledict'
+            'jax==0.10.1' 'jaxlib==0.10.1' 'libtpu==0.0.40' 'tpu-info==0.7.1' 'jaxtyping' 'frozendict' 'immutabledict'
           # Install Bazel
           if ! command -v bazel &> /dev/null; then
             sudo curl -L https://github.com/bazelbuild/bazelisk/releases/download/v1.27.0/bazelisk-linux-amd64 -o /usr/local/bin/bazel
@@ -240,7 +240,7 @@ jobs:
         if: matrix.alias == 'pallas-interpret'
         run: |
           source .venv/bin/activate
-          uv pip install 'jax==0.10.0' 'jaxlib==0.10.0' 'absl-py'
+          uv pip install 'jax==0.10.1' 'jaxlib==0.10.1' 'absl-py'
 
       - name: Install CUTLASS CuTe DSL
         if: matrix.backend == 'cute'
