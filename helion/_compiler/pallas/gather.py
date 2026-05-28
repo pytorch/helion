@@ -32,6 +32,7 @@ class GatherPlan:
     none_dims: tuple[int, ...]
     jnp_dtype: str
     table_ndim: int
+    index_ndim: int
     emit_select: bool
     use_highest_precision: bool
 
@@ -52,11 +53,11 @@ def build_gather_plan(
             "Pallas gather: multiple indirect dims are not supported"
         )
     indirect_pos = indirect_positions[0]
-    if indirect_pos != 0:
-        raise NotImplementedError(
-            "Pallas gather: only dim-0 indirect indexing is supported"
-        )
     emit_select = not tensor.dtype.is_floating_point
+    if emit_select and indirect_pos != 0:
+        raise NotImplementedError(
+            "Pallas gather: integer table gather on non-zero dim is not yet supported"
+        )
     if emit_select and tensor.dtype != torch.int32:
         raise NotImplementedError(
             f"Pallas gather: integer table gather only supports torch.int32, "
@@ -79,12 +80,15 @@ def build_gather_plan(
 
     none_dims = tuple(i for i, idx in enumerate(subscript) if idx is None)
     jnp_dtype = CompileEnvironment.current().backend.dtype_str(tensor.dtype)
+    idx_element = subscript[indirect_pos]
+    index_ndim = idx_element.meta["val"].ndim  # type: ignore[union-attr]
 
     return GatherPlan(
         indirect_pos=indirect_pos,
         none_dims=none_dims,
         jnp_dtype=jnp_dtype,
         table_ndim=tensor.ndim,
+        index_ndim=index_ndim,
         emit_select=emit_select,
         use_highest_precision=use_highest,
     )
@@ -135,15 +139,23 @@ def emit_gather(
         table_expr = f"{name}[...]"
         precision_arg = ""
 
+    p = plan.indirect_pos
     result = expr_from_string(
         "jax.lax.dot_general("
-        f"jax.nn.one_hot({idx_name}[...], {name}.shape[0], dtype={oh_dtype}), "
+        f"jax.nn.one_hot({idx_name}[...], {name}.shape[{p}], dtype={oh_dtype}), "
         f"{table_expr}, "
-        f"(((jnp.ndim({idx_name}[...]),), (0,)), ((), ())), "
+        f"(((jnp.ndim({idx_name}[...]),), ({p},)), ((), ())), "
         "preferred_element_type=jnp.float32, "
         f"{precision_arg}"
         f").astype({plan.jnp_dtype})"
     )
+    if p > 0:
+        n = plan.index_ndim
+        src = tuple(range(n, n + p))
+        dst = tuple(range(p))
+        result = expr_from_string(
+            f"jnp.moveaxis({{result}}, {src}, {dst})", result=result
+        )
     for dim in plan.none_dims:
         result = expr_from_string(
             f"jnp.expand_dims({{result}}, axis={dim})", result=result

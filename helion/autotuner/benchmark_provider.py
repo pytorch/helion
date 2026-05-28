@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import abc
-import contextlib
 import datetime
 import functools
 from itertools import count
@@ -36,7 +35,6 @@ from .benchmarking import do_bench_generic
 from .benchmarking import synchronize_device
 from .logger import SUPPRESSED_TRITON_CODE_MSG
 from .logger import AutotuneLogEntry
-from .logger import _get_failure_dump_dir
 from .logger import capture_output
 from .logger import classify_triton_exception
 from .logger import format_triton_compile_failure
@@ -748,11 +746,18 @@ class LocalBenchmarkProvider(BenchmarkProvider):
         for i, config in enumerate(all_configs):
             if self._budget_exceeded_synced():
                 break
+            # Defensive: if `capture_output().__enter__` itself raises, the
+            # except handler below still needs `captured` bound.
+            captured: list[str] = [""]
             try:
-                compiled[i] = self.kernel.compile_config(config, allow_print=False)
-            except Exception:
+                with capture_output() as captured:
+                    compiled[i] = self.kernel.compile_config(config, allow_print=False)
+            except Exception as e:
                 if not compiled and i == len(all_configs) - 1:
                     raise
+                maybe_dump_triton_failure(
+                    self.kernel, config, e, captured_output=captured[0] or None
+                )
                 self.log.warning(
                     "Skipping config that failed to compile: %s",
                     self.kernel.format_kernel_decorator(config, self.settings),
@@ -895,13 +900,6 @@ class LocalBenchmarkProvider(BenchmarkProvider):
             # None means the subprocess path could not handle this config
             # (e.g., serialization failed); fall through to in-process.
 
-        _captured_output: list[str] = [""]
-        _capture_ctx = (
-            capture_output()
-            if _get_failure_dump_dir()
-            else contextlib.nullcontext(_captured_output)
-        )
-
         if len(self.mutated_arg_indices) > 0:
             working_args = _clone_args(
                 self.args,
@@ -941,16 +939,21 @@ class LocalBenchmarkProvider(BenchmarkProvider):
             if not compile_success_all:
                 return inf
 
+        # Defensive: if `capture_output().__enter__` itself raises, the except
+        # handler below still needs `_captured_output` bound.
+        _captured_output: list[str] = [""]
         try:
             # TODO(jansel): early exit with fewer trials if early runs are slow
             self.log.debug(lambda: f"Running {config} at {datetime.datetime.now()}")
             t0 = time.perf_counter()
-            synchronize_device()
 
-            with _capture_ctx as _captured_output:
+            # Narrow capture: only the kernel compile+launch sites (which can
+            # emit Triton C-level MLIR diagnostics). Leave the accuracy check
+            # and Python-level logging outside so warnings still reach stderr.
+            with capture_output() as _captured_output:
+                synchronize_device()
                 output = fn(*working_args)  # make sure the kernel is compiled
-
-            synchronize_device(output)
+                synchronize_device(output)
 
             pass_accuracy_check = (
                 not self.settings.autotune_accuracy_check
@@ -971,23 +974,24 @@ class LocalBenchmarkProvider(BenchmarkProvider):
                 # while other ranks return immediately, this will cause stuck jobs!
                 return inf
 
-            benchmark_function = self.kernel.bench_compile_config(
-                config, allow_print=False
-            )
-            benchmark_function(*working_args)  # warmup benchmark kernel
+            with capture_output() as _captured_output:
+                benchmark_function = self.kernel.bench_compile_config(
+                    config, allow_print=False
+                )
+                benchmark_function(*working_args)  # warmup benchmark kernel
 
-            t1 = time.perf_counter()
-            _backend = getattr(getattr(self, "config_spec", None), "backend", None)
-            benchmark_runner = (
-                _backend.get_do_bench() if _backend is not None else None
-            ) or do_bench
-            res = benchmark_runner(
-                functools.partial(benchmark_function, *working_args),
-                return_mode="median",
-                warmup=1,  # we are already warmed up above
-                rep=50,
-                process_group_name=self.kernel.env.process_group_name,
-            )
+                t1 = time.perf_counter()
+                _backend = getattr(getattr(self, "config_spec", None), "backend", None)
+                benchmark_runner = (
+                    _backend.get_do_bench() if _backend is not None else None
+                ) or do_bench
+                res = benchmark_runner(
+                    functools.partial(benchmark_function, *working_args),
+                    return_mode="median",
+                    warmup=1,  # we are already warmed up above
+                    rep=50,
+                    process_group_name=self.kernel.env.process_group_name,
+                )
             res = sync_object(
                 res, process_group_name=self.kernel.env.process_group_name
             )
@@ -1041,6 +1045,9 @@ class LocalBenchmarkProvider(BenchmarkProvider):
                     code=SUPPRESSED_TRITON_CODE_MSG,
                 ) from e
             elif action == "warn":
+                # Compile-related failures (e.g., PTXASError, PassManager
+                # failed). Message is debug to keep autotune output quiet;
+                # repro is warning so HELION_PRINT_REPRO=1 stays visible.
                 decorator = self.kernel.format_kernel_decorator(config, self.settings)
                 log_generated_triton_code_debug(
                     self.log,
@@ -1048,9 +1055,9 @@ class LocalBenchmarkProvider(BenchmarkProvider):
                     config,
                     prefix=f"Generated Triton code for {decorator}:",
                 )
-                self.log.warning(format_triton_compile_failure(config, e, self.kernel))
+                self.log.debug(format_triton_compile_failure(config, e, self.kernel))
                 self.kernel.maybe_log_repro(self.log.warning, self.args, config)
-            else:
+            else:  # action == "debug" (CUDA OOM, expected runtime failures)
                 decorator = self.kernel.format_kernel_decorator(config, self.settings)
                 log_generated_triton_code_debug(
                     self.log,

@@ -2862,6 +2862,25 @@ class TestPallas(TestCase):
         expected = x + bias.float()
         torch.testing.assert_close(out, expected)
 
+    def test_inner_tile_alignment_propagates_to_outer(self) -> None:
+        """Inner tile alignment min must propagate to the bounding outer tile."""
+
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def k(x: torch.Tensor) -> torch.Tensor:
+            M = x.size(0)
+            out = torch.empty_like(x)
+            m_block = hl.register_block_size(M)
+            for tile_outer in hl.tile(M, block_size=m_block):
+                for tile_inner in hl.tile(tile_outer.begin, tile_outer.end):
+                    out[tile_inner, :] = x[tile_inner, :] * 2
+            return out
+
+        args = (torch.randn([1024, 256], device=DEVICE, dtype=torch.bfloat16),)
+        spec = k.bind(args).config_spec
+        outer_min = spec.block_sizes[0].min_size
+        inner_min = spec.block_sizes[1].min_size
+        self.assertGreaterEqual(outer_min, inner_min)
+
 
 @skipUnlessPallas("JAX/Pallas TPU not available")
 class TestPallasIndirectGather(TestCase):
@@ -3050,6 +3069,56 @@ class TestPallasIndirectGather(TestCase):
         self.assertNotIn("pl.ds(offset_0, 8)", code)
         ref = table.cpu()[indices.long().cpu()].to(device=DEVICE)
         torch.testing.assert_close(result, ref, rtol=1e-2, atol=1e-2)
+
+    @parametrize("static_shapes", (True, False))
+    def test_gather_mid_dim_3d_float(self, static_shapes: bool) -> None:
+        """Float gather on mid dim of a 3D table emits moveaxis."""
+
+        @helion.kernel(backend="pallas", static_shapes=static_shapes)
+        def gather(indices: torch.Tensor, table: torch.Tensor) -> torch.Tensor:
+            out = torch.empty(
+                [table.size(0), indices.size(0), table.size(2)],
+                dtype=table.dtype,
+                device=table.device,
+            )
+            for tile_a, tile_b, tile_c in hl.tile(
+                [table.size(0), indices.size(0), table.size(2)]
+            ):
+                out[tile_a, tile_b, tile_c] = table[tile_a, indices[tile_b], tile_c]
+            return out
+
+        table = torch.randn(8, 16, 32, device=DEVICE, dtype=torch.bfloat16)
+        indices = torch.randint(0, 16, (64,), device=DEVICE, dtype=torch.int32)
+        code, result = code_and_output(
+            gather, (indices, table), block_sizes=[8, 64, 32]
+        )
+        self.assertIn("dot_general", code)
+        self.assertIn("moveaxis", code)
+        torch.testing.assert_close(result, table[:, indices.long(), :])
+
+    @parametrize("static_shapes", (True, False))
+    def test_gather_mid_dim_2d_index(self, static_shapes: bool) -> None:
+        """Float gather with 2D index on mid dim exercises full moveaxis formula."""
+
+        @helion.kernel(backend="pallas", static_shapes=static_shapes)
+        def gather(indices: torch.Tensor, table: torch.Tensor) -> torch.Tensor:
+            A, _, C = table.size(0), table.size(1), table.size(2)
+            B, S = indices.size(0), indices.size(1)
+            out = torch.empty([A, B, S, C], dtype=table.dtype, device=table.device)
+            for tile_a, tile_b, tile_s, tile_c in hl.tile([A, B, S, C]):
+                out[tile_a, tile_b, tile_s, tile_c] = table[
+                    tile_a, indices[tile_b, tile_s], tile_c
+                ]
+            return out
+
+        table = torch.randn(4, 8, 16, device=DEVICE, dtype=torch.bfloat16)
+        indices = torch.randint(0, 8, (2, 4), device=DEVICE, dtype=torch.int32)
+        code, result = code_and_output(
+            gather, (indices, table), block_sizes=[4, 2, 4, 16]
+        )
+        self.assertIn("dot_general", code)
+        self.assertIn("moveaxis", code)
+        torch.testing.assert_close(result, table[:, indices.long(), :])
 
 
 instantiate_parametrized_tests(TestPallasIndirectGather)
