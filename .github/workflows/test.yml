@@ -49,7 +49,7 @@ jobs:
 
     steps:
       - name: Run NVIDIA command
-        if: startsWith(matrix.image, 'nvidia')
+        if: contains(matrix.image, 'cuda')
         run: |
           echo "Detected NVIDIA image"
           nvidia-smi || echo "nvidia-smi not found"
@@ -249,7 +249,7 @@ jobs:
           ./scripts/install_cute.sh
 
       - name: CUDA Compute Check
-        if: startsWith(matrix.image, 'nvidia')
+        if: contains(matrix.image, 'cuda')
         run: |
           source .venv/bin/activate
           python -c "
@@ -270,7 +270,7 @@ jobs:
           "
 
       - name: Inductor Worker Check
-        if: startsWith(matrix.image, 'nvidia')
+        if: contains(matrix.image, 'cuda')
         run: |
           source .venv/bin/activate
           python -c "
