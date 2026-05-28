@@ -3,7 +3,6 @@ from __future__ import annotations
 import sys
 import unittest
 
-import pytest
 import torch
 
 import helion
@@ -570,36 +569,18 @@ class TestMetalMultiDim(unittest.TestCase):
 class TestMetalLargeBlock(unittest.TestCase):
     """Tests for threadgroup auto-capping when block_size > 1024."""
 
-    # The 1D large-block tests below rely on the Flattened tile strategy
-    # auto-capping num_threads to MAX_THREADS_PER_BLOCK when
-    # block_size > 1024.  CuTe's flattened path does not yet implement
-    # this (its ND path does, via _shrink_auto_thread_counts).  Metal
-    # inherits CuTe's behavior for now, so these tests xfail until that
-    # asymmetry is fixed in CuTe.
-    @pytest.mark.xfail(
-        reason="CuTe Flattened strategy doesn't auto-cap num_threads > 1024",
-        strict=True,
-    )
     def test_large_block_1d(self) -> None:
         """1D kernel with block_size=2048 auto-caps to 1024 threads."""
         x = torch.randn(4096, device=DEVICE)
         y = torch.randn(4096, device=DEVICE)
         torch.testing.assert_close(large_block_add(x, y), x + y)
 
-    @pytest.mark.xfail(
-        reason="CuTe Flattened strategy doesn't auto-cap num_threads > 1024",
-        strict=True,
-    )
     def test_large_block_1d_non_aligned(self) -> None:
         """Non-aligned size with large block still works correctly."""
         x = torch.randn(3000, device=DEVICE)
         y = torch.randn(3000, device=DEVICE)
         torch.testing.assert_close(large_block_add(x, y), x + y)
 
-    @pytest.mark.xfail(
-        reason="CuTe Flattened strategy doesn't auto-cap num_threads > 1024",
-        strict=True,
-    )
     def test_codegen_lane_loop(self) -> None:
         """Generated MSL must contain a for loop when block_size > 1024."""
         x = torch.randn(4096, device=DEVICE)

@@ -3876,6 +3876,7 @@ class CuteBackend(Backend):
         nd_block_size = [bs.from_config_assert(config) for bs in block_size_infos]
         block_size = functools.reduce(operator.mul, nd_block_size)
         # Resolve per-axis thread counts then flatten to a single total
+        all_auto = all(nt <= 0 for nt in num_threads_config)
         flat_num_threads = functools.reduce(
             operator.mul,
             (
@@ -3884,6 +3885,14 @@ class CuteBackend(Backend):
             ),
             1,
         )
+        if (
+            isinstance(block_size, int)
+            and flat_num_threads > MAX_THREADS_PER_BLOCK
+            and all_auto
+        ):
+            # Auto thread budget exceeds the 1024-per-CTA cap: fall back to a
+            # lane loop (each thread owns block_size // 1024 elements).
+            flat_num_threads = MAX_THREADS_PER_BLOCK
         if isinstance(block_size, int) and flat_num_threads > 0:
             from .cute.thread_budget import check_thread_limit
 
