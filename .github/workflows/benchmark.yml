@@ -101,11 +101,9 @@ jobs:
         run: |
           source .venv/bin/activate
 
-          # Clear default index values (set on OSDC runners) so the explicit
-          # --index-url below is honored when installing torch.
-          unset UV_DEFAULT_INDEX
-
-          uv pip install -U "torch==2.11.*" --index-url https://download.pytorch.org/whl/${{ inputs.runtime-version }}
+          # Use the explicit PyTorch index with first-index strategy so torch
+          # resolves from it instead of the default index set on OSDC runners.
+          uv pip install -U "torch==2.11.*" --index https://download.pytorch.org/whl/${{ inputs.runtime-version }} --index-strategy first-index
 
       - name: Install Helion
         run: |
