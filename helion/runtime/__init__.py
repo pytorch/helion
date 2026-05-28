@@ -2885,6 +2885,9 @@ def default_metal_launcher(
             "metal", f"unexpected launcher kwargs: {sorted(kwargs)}"
         )
 
+    from .._compiler.metal.metal_launcher import set_required_threads_per_threadgroup
+
+    set_required_threads_per_threadgroup(metal_kernel, _block_dims)
     lib, kernel_name = metal_kernel(*args)  # type: ignore[operator]
 
     tensor_args = [a for a in args if isinstance(a, torch.Tensor)]
