@@ -98,7 +98,7 @@ def make_precompiler(
                     compiled_kernel._init_handles()
             except Exception as e:
                 action = classify_triton_exception(e)
-                if action != "debug":
+                if action == "raise":
                     print(
                         format_triton_compile_failure(config, e, bound_kernel),
                         file=sys.stderr,
