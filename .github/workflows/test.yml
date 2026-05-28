@@ -123,33 +123,22 @@ jobs:
 
           source .venv/bin/activate
 
-          # On OSDC runners pip/uv are pointed at an in-cluster pypi-cache
-          # (UV_DEFAULT_INDEX/UV_INDEX) and direct egress to pypi.org /
-          # files.pythonhosted.org is firewalled. Route the PyTorch index
-          # through the cache's /whl proxy (so torch's deps stay reachable) and
-          # clear the cache index vars so the explicit nightly/cuXXX index wins
-          # instead of the cache default (which serves release/cpu torch).
-          # Off OSDC PYPI_CACHE_WHL_URL is unset, so we hit download.pytorch.org.
-          PYTORCH_INDEX_BASE="https://download.pytorch.org"
-          if [[ -n "${PYPI_CACHE_WHL_URL:-}" ]]; then
-            PYTORCH_INDEX_BASE="${PYPI_CACHE_WHL_URL%/whl/*}"
-            export UV_DEFAULT_INDEX= UV_INDEX=
-          fi
-
           if [[ "${{ matrix.pytorch-version }}" == pytorch-[0-9]* ]]; then
             VERSION="${{ matrix.pytorch-version }}"
             VERSION="${VERSION#pytorch-}"
-            uv pip install -U "torch==${VERSION}.*" --index-url "${PYTORCH_INDEX_BASE}/whl/${{ matrix.runtime-version }}"
+            uv pip install -U "torch==${VERSION}.*" --index-url https://download.pytorch.org/whl/${{ matrix.runtime-version }}
           elif [[ "${{ matrix.runtime-version }}" == "tpu" ]]; then
             # TPU: install CPU-only PyTorch nightly (torch_tpu provides TPU backend)
-            uv pip install -U --pre torch --index-url "${PYTORCH_INDEX_BASE}/whl/nightly/cpu"
+            uv pip install -U --pre torch --index-url https://download.pytorch.org/whl/nightly/cpu
           else
             # Default to nightly
             if [[ "${{ matrix.runtime-version }}" == "cu128" ]]; then
               # Install nvidia-nvshmem-cu12 from cu129 index (missing on cu128)
-              uv pip install -U --pre nvidia-nvshmem-cu12 --index-url "${PYTORCH_INDEX_BASE}/whl/nightly/cu129"
+              uv pip install -U --pre nvidia-nvshmem-cu12 --index-url https://download.pytorch.org/whl/nightly/cu129
             fi
-            uv pip install -U --pre torch --index-url "${PYTORCH_INDEX_BASE}/whl/nightly/${{ matrix.runtime-version }}"
+            # On OSDC, route nightly through the pypi-cache /whl proxy (deps stay reachable behind the egress firewall) and clear the cache index vars so it wins over the cache default; off OSDC PYPI_CACHE_WHL_URL is unset so we hit download.pytorch.org.
+            PYTORCH_INDEX="${PYPI_CACHE_WHL_URL:-https://download.pytorch.org/whl/cpu}"
+            UV_DEFAULT_INDEX= UV_INDEX= uv pip install -U --pre torch --index-url "${PYTORCH_INDEX%/whl/*}/whl/nightly/${{ matrix.runtime-version }}"
           fi
 
       - name: Configure XPU runtime library path
