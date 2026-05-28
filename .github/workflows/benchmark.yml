@@ -101,9 +101,19 @@ jobs:
         run: |
           source .venv/bin/activate
 
-          # Clear UV_INDEX (set on OSDC runners) per-command so torch resolves
-          # from the explicit --index-url below instead of the default index.
-          UV_INDEX= uv pip install -U "torch==2.11.*" --index-url https://download.pytorch.org/whl/${{ inputs.runtime-version }}
+          # On OSDC runners pip/uv are pointed at an in-cluster pypi-cache
+          # (UV_DEFAULT_INDEX/UV_INDEX) and direct egress to pypi.org /
+          # files.pythonhosted.org is firewalled. Route the PyTorch index
+          # through the cache's /whl proxy (so torch's deps stay reachable) and
+          # clear the cache index vars so the explicit index wins instead of the
+          # cache default (which serves release/cpu torch). Off OSDC
+          # PYPI_CACHE_WHL_URL is unset, so we hit download.pytorch.org.
+          PYTORCH_INDEX_BASE="https://download.pytorch.org"
+          if [[ -n "${PYPI_CACHE_WHL_URL:-}" ]]; then
+            PYTORCH_INDEX_BASE="${PYPI_CACHE_WHL_URL%/whl/*}"
+            export UV_DEFAULT_INDEX= UV_INDEX=
+          fi
+          uv pip install -U "torch==2.11.*" --index-url "${PYTORCH_INDEX_BASE}/whl/${{ inputs.runtime-version }}"
 
       - name: Install Helion
         run: |
