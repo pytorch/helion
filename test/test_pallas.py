@@ -717,6 +717,34 @@ class TestPallas(TestCase):
                 block_size=16,
             )
 
+    def test_scatter_store_multiple_tensor_indices_raises(self) -> None:
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def scatter_store_multiple_tensor_indices(
+            values: torch.Tensor, row_indices: torch.Tensor, col_indices: torch.Tensor
+        ) -> torch.Tensor:
+            out = torch.zeros(
+                [values.size(0), values.size(0)],
+                dtype=values.dtype,
+                device=values.device,
+            )
+            for tile in hl.tile(values.size(0)):
+                out[row_indices[tile], col_indices[tile]] = values[tile, tile]
+            return out
+
+        values = torch.randn(16, 16, device=DEVICE, dtype=torch.float32)
+        row_indices = torch.randperm(16, device=DEVICE).to(torch.int32)
+        col_indices = torch.randperm(16, device=DEVICE).to(torch.int32)
+
+        with self.assertRaisesRegex(
+            NotImplementedError,
+            "multiple indirect dims are not supported",
+        ):
+            code_and_output(
+                scatter_store_multiple_tensor_indices,
+                (values, row_indices, col_indices),
+                block_size=16,
+            )
+
     def test_inplace_add(self) -> None:
         x = torch.randn(1024, device=DEVICE, dtype=torch.float32)
         y = torch.randn(1024, device=DEVICE, dtype=torch.float32)

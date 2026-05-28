@@ -112,6 +112,11 @@ def build_scatter_plan(
     """Validate a Pallas scatter site and return its one-hot plan."""
     from ..compile_environment import CompileEnvironment
 
+    if not tensor.dtype.is_floating_point:
+        raise NotImplementedError(
+            f"Pallas scatter: only floating-point output dtypes are supported, "
+            f"got {tensor.dtype}"
+        )
     if len(indirect_positions) > 1:
         raise NotImplementedError(
             "Pallas scatter: multiple indirect dims are not supported"
