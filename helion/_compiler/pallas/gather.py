@@ -228,6 +228,8 @@ def _scatter_one_hot_name(
     ast_idx = ast_subscripts[plan.indirect_pos]
     assert isinstance(ast_idx, ast.AST)
     idx_name = state.codegen.lift(ast_idx, dce=False, prefix="index").id
+    # TODO(tcombes): investigate making the metadata into dtype,
+    # currently hitting Mosaic issues with bf16 mask.
     return (
         f"jax.nn.one_hot({idx_name}[...], {name}.shape[{plan.indirect_pos}], "
         "dtype=jnp.float32)"
