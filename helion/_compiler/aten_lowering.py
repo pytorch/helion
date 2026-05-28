@@ -662,6 +662,16 @@ def codegen_view_pallas(ctx: LoweringContext, node: Node) -> object:
     shape_str = ctx.cg.device_function.tile_strategy.shape_str(
         [*node.meta["val"].size()]
     )
+    input_node = node.args[0]
+    if isinstance(input_node, Node):
+        input_val = input_node.meta.get("val")
+        if isinstance(input_val, torch.Tensor) and input_val.dtype is torch.bool:
+            # Mosaic cannot reshape bool vectors directly:
+            # https://github.com/jax-ml/jax/issues/37370
+            return expr_from_string(
+                f"(jnp.reshape(({{tensor}}).astype(jnp.int32), {shape_str}) != 0)",
+                tensor=tensor,
+            )
     return expr_from_string(f"jnp.reshape({{tensor}}, {shape_str})", tensor=tensor)
 
 
