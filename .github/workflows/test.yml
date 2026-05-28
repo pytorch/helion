@@ -123,10 +123,9 @@ jobs:
 
           source .venv/bin/activate
 
-          # Temporarily unset UV_DEFAULT_INDEX (set on OSDC runners) so the
-          # explicit --index-url below is honored when installing torch. This
-          # step is its own shell, so the unset is scoped to the torch install.
-          unset UV_DEFAULT_INDEX
+          # Clear default index values (set on OSDC runners) so the explicit
+          # --index-url below is honored when installing torch.
+          unset UV_DEFAULT_INDEX UV_INDEX
 
           if [[ "${{ matrix.pytorch-version }}" == pytorch-[0-9]* ]]; then
             VERSION="${{ matrix.pytorch-version }}"
