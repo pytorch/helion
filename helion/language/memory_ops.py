@@ -340,7 +340,9 @@ def _(state: CodegenState) -> None:
         for pattern in patterns or ()
         if isinstance(pattern, IndirectScatterPattern)
     ]
-    assert len(scatter_patterns) <= 1
+    assert len(scatter_patterns) <= 1, (
+        "Pallas store expected at most one indirect scatter pattern"
+    )
     if scatter_patterns:
         value = emit_scatter_store(
             state, scatter_patterns[0].plan, name, idx_str, value

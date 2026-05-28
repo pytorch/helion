@@ -420,7 +420,7 @@ def _resolve_tensor_index_patterns(
 
     op_name = getattr(node.target, "__name__", str(node.target))
     raise NotImplementedError(
-        f"Pallas: indirect scatter is not supported for op={op_name}."
+        f"Pallas: tensor-indexed memory op is not supported for op={op_name}."
     )
 
 

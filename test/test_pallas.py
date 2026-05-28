@@ -694,6 +694,29 @@ class TestPallas(TestCase):
         torch.testing.assert_close(result, expected)
         self.assertIn("triu", code)
 
+    def test_tensor_index_atomic_add_raises(self) -> None:
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def atomic_add_tensor_index(
+            values: torch.Tensor, indices: torch.Tensor
+        ) -> torch.Tensor:
+            out = torch.zeros_like(values)
+            for tile in hl.tile(values.size(0)):
+                hl.atomic_add(out, [indices[tile]], values[tile])
+            return out
+
+        values = torch.randn(16, device=DEVICE, dtype=torch.float32)
+        indices = torch.randperm(16, device=DEVICE).to(torch.int32)
+
+        with self.assertRaisesRegex(
+            NotImplementedError,
+            "tensor-indexed memory op is not supported for op=atomic_add",
+        ):
+            code_and_output(
+                atomic_add_tensor_index,
+                (values, indices),
+                block_size=16,
+            )
+
     def test_inplace_add(self) -> None:
         x = torch.randn(1024, device=DEVICE, dtype=torch.float32)
         y = torch.randn(1024, device=DEVICE, dtype=torch.float32)
