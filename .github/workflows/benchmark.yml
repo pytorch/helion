@@ -103,7 +103,7 @@ jobs:
 
           # Clear default index values (set on OSDC runners) so the explicit
           # --index-url below is honored when installing torch.
-          unset UV_DEFAULT_INDEX UV_INDEX
+          unset UV_DEFAULT_INDEX
 
           uv pip install -U "torch==2.11.*" --index-url https://download.pytorch.org/whl/${{ inputs.runtime-version }}
 
