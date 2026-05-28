@@ -1575,6 +1575,20 @@ class PallasBackend(Backend):
 
             spec.update_min(min(requirement_alignment, dim_size))
 
+        # Propagate alignment minimums from inner tiles to their bounding outer tiles.
+        block_specs_by_id = {
+            spec.block_ids[0]: spec
+            for spec in block_specs
+            if isinstance(spec, BlockSizeSpec)
+        }
+        for spec in block_specs_by_id.values():
+            bounded_by = spec.bounded_by_block_id
+            if bounded_by is None:
+                continue
+            outer_spec = block_specs_by_id.get(bounded_by)
+            if outer_spec is not None:
+                outer_spec.update_min(spec.min_size)
+
     def tunable_fragments(self) -> dict[str, ConfigSpecFragment]:
         return {}
 

@@ -2862,6 +2862,25 @@ class TestPallas(TestCase):
         expected = x + bias.float()
         torch.testing.assert_close(out, expected)
 
+    def test_inner_tile_alignment_propagates_to_outer(self) -> None:
+        """Inner tile alignment min must propagate to the bounding outer tile."""
+
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def k(x: torch.Tensor) -> torch.Tensor:
+            M = x.size(0)
+            out = torch.empty_like(x)
+            m_block = hl.register_block_size(M)
+            for tile_outer in hl.tile(M, block_size=m_block):
+                for tile_inner in hl.tile(tile_outer.begin, tile_outer.end):
+                    out[tile_inner, :] = x[tile_inner, :] * 2
+            return out
+
+        args = (torch.randn([1024, 256], device=DEVICE, dtype=torch.bfloat16),)
+        spec = k.bind(args).config_spec
+        outer_min = spec.block_sizes[0].min_size
+        inner_min = spec.block_sizes[1].min_size
+        self.assertGreaterEqual(outer_min, inner_min)
+
 
 @skipUnlessPallas("JAX/Pallas TPU not available")
 class TestPallasIndirectGather(TestCase):
