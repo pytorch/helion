@@ -349,6 +349,9 @@ def _generated_index_code(
         return ":"
 
     if isinstance(pattern, IndirectScatterPattern):
+        # The scatter emitter consumes the tensor index and projects source lanes
+        # through one-hot matrices, so normal store codegen must expose the full
+        # resident target axis instead of indexing it a second time.
         return ":"
 
     raise RuntimeError(

@@ -667,16 +667,24 @@ class TestPallas(TestCase):
         self.assertIn("values[:,", code)
 
     def test_scatter_store(self) -> None:
-        values = torch.randn(16, 8, device=DEVICE, dtype=torch.float32)
-        indices = torch.randperm(16, device=DEVICE).to(torch.int32)
-        code, result = code_and_output(
-            pallas_scatter_store, (values, indices), block_sizes=[4, 4]
-        )
+        for dtype in (torch.float32, torch.bfloat16):
+            with self.subTest(dtype=dtype):
+                values = torch.randn(16, 8, device=DEVICE, dtype=dtype)
+                indices = torch.randperm(16, device=DEVICE).to(torch.int32)
+                code, result = code_and_output(
+                    pallas_scatter_store, (values, indices), block_sizes=[4, 4]
+                )
 
-        expected = torch.zeros_like(values)
-        expected[indices.to(torch.int64)] = values
-        torch.testing.assert_close(result, expected)
-        self.assertIn("one_hot", code)
+                expected = torch.zeros_like(values)
+                expected[indices.to(torch.int64)] = values
+                torch.testing.assert_close(result, expected)
+                self.assertIn("one_hot", code)
+                self.assertIn("jnp.triu", code)
+                self.assertIn("jnp.eye", code)
+                self.assertIn("jnp.swapaxes", code)
+                self.assertIn("jnp.ones_like", code)
+                self.assertIn("jnp.where", code)
+                self.assertIn("dot_general", code)
 
     def test_scatter_store_duplicate_indices(self) -> None:
         values = torch.randn(16, 8, device=DEVICE, dtype=torch.float32)
@@ -692,7 +700,6 @@ class TestPallas(TestCase):
         expected = torch.zeros_like(values)
         expected[indices.to(torch.int64)] = values
         torch.testing.assert_close(result, expected)
-        self.assertIn("triu", code)
 
     def test_tensor_index_atomic_add_raises(self) -> None:
         @helion.kernel(backend="pallas", static_shapes=True)
