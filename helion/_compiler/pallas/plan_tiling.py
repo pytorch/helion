@@ -20,6 +20,7 @@ if TYPE_CHECKING:
     from ..host_function import SymbolOrigin
     from ..tile_dispatch import TileStrategyDispatch
     from .gather import GatherPlan
+    from .gather import ScatterPlan
 
 
 @dataclass
@@ -67,7 +68,7 @@ class NonePattern(IndexingPattern):
 
 @dataclass
 class TensorIndexPattern(IndexingPattern):
-    """Tensor-valued index - no tiling. Resolved to IndirectGatherPattern for loads, rejected for stores."""
+    """Tensor-valued index - no tiling. Resolved for indirect load/store codegen."""
 
 
 @dataclass
@@ -75,6 +76,13 @@ class IndirectGatherPattern(IndexingPattern):
     """Indirect gather load ``table[idx, ...]`` - no tiling on this dim."""
 
     plan: GatherPlan
+
+
+@dataclass
+class IndirectScatterPattern(IndexingPattern):
+    """Indirect scatter store ``table[idx, ...]`` - no tiling on this dim."""
+
+    plan: ScatterPlan
 
 
 @dataclass
@@ -387,24 +395,33 @@ def _resolve_tensor_index_patterns(
     patterns: list[IndexingPattern],
     config: Config,
 ) -> None:
-    """Replace TensorIndexPattern with IndirectGatherPattern for loads. Raise for stores."""
+    """Replace TensorIndexPattern with Pallas indirect load/store patterns."""
     positions = [i for i, p in enumerate(patterns) if isinstance(p, TensorIndexPattern)]
     if not positions:
         return
 
     from ...language import memory_ops
 
-    if node.target is not memory_ops.load:
-        op_name = getattr(node.target, "__name__", str(node.target))
-        raise NotImplementedError(
-            f"Pallas: indirect store (scatter) is not supported (op={op_name})."
-        )
+    if node.target is memory_ops.load:
+        from .gather import build_gather_plan
 
-    from .gather import build_gather_plan
+        plan = build_gather_plan(tensor, subscript, positions, patterns, config)
+        for i in positions:
+            patterns[i] = IndirectGatherPattern(plan=plan)
+        return
 
-    plan = build_gather_plan(tensor, subscript, positions, patterns, config)
-    for i in positions:
-        patterns[i] = IndirectGatherPattern(plan=plan)
+    if node.target is memory_ops.store:
+        from .gather import build_scatter_plan
+
+        plan = build_scatter_plan(tensor, subscript, positions)
+        for i in positions:
+            patterns[i] = IndirectScatterPattern(plan=plan)
+        return
+
+    op_name = getattr(node.target, "__name__", str(node.target))
+    raise NotImplementedError(
+        f"Pallas: indirect scatter is not supported for op={op_name}."
+    )
 
 
 # Helper functions moved from memory_ops.py

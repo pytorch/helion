@@ -316,6 +316,7 @@ def _generated_index_code(
     from helion._compiler.pallas.plan_tiling import ArbitraryIndexPattern
     from helion._compiler.pallas.plan_tiling import ArbitrarySlicePattern
     from helion._compiler.pallas.plan_tiling import IndirectGatherPattern
+    from helion._compiler.pallas.plan_tiling import IndirectScatterPattern
     from helion._compiler.pallas.plan_tiling import TileBeginWithOffsetPattern
     from helion._compiler.pallas.plan_tiling import TileIndexWithOffsetPattern
     from helion._compiler.pallas.plan_tiling import TilePattern
@@ -345,6 +346,9 @@ def _generated_index_code(
         # The gather emitter consumes the tensor index and projects the full
         # resident table axis through one-hot, so normal load codegen must
         # expose that axis instead of indexing it a second time.
+        return ":"
+
+    if isinstance(pattern, IndirectScatterPattern):
         return ":"
 
     raise RuntimeError(

@@ -1,8 +1,10 @@
-"""Pallas indirect-gather lowering.
+"""Pallas indirect-gather/scatter lowering.
 
 No native gather in Pallas. Floating ``table[idx]`` emits
 ``one_hot(idx, V) @ table``; int32 ``table[idx]`` emits a boolean one-hot
-select and reduction. Scatter is rejected at plan_tiling time.
+select and reduction. Scatter store projects source lanes to target rows with
+one-hot matrices, resolves duplicate lanes within one program, and merges
+updates with the existing target block.
 """
 
 from __future__ import annotations
@@ -35,6 +37,14 @@ class GatherPlan:
     index_ndim: int
     emit_select: bool
     use_highest_precision: bool
+
+
+@dataclass(frozen=True)
+class ScatterPlan:
+    indirect_pos: int
+    jnp_dtype: str
+    target_ndim: int
+    index_ndim: int
 
 
 def build_gather_plan(
@@ -91,6 +101,36 @@ def build_gather_plan(
         index_ndim=index_ndim,
         emit_select=emit_select,
         use_highest_precision=use_highest,
+    )
+
+
+def build_scatter_plan(
+    tensor: torch.Tensor,
+    subscript: list[object] | tuple[object, ...],
+    indirect_positions: list[int],
+) -> ScatterPlan:
+    """Validate a Pallas scatter site and return its one-hot plan."""
+    from ..compile_environment import CompileEnvironment
+
+    if len(indirect_positions) > 1:
+        raise NotImplementedError(
+            "Pallas scatter: multiple indirect dims are not supported"
+        )
+    indirect_pos = indirect_positions[0]
+    if indirect_pos != 0:
+        raise NotImplementedError("Pallas scatter: only indirect dim 0 is supported")
+    idx_element = subscript[indirect_pos]
+    index_ndim = idx_element.meta["val"].ndim  # type: ignore[union-attr]
+    if index_ndim != 1:
+        raise NotImplementedError(
+            "Pallas scatter: only rank-1 tensor indices are supported"
+        )
+    jnp_dtype = CompileEnvironment.current().backend.dtype_str(tensor.dtype)
+    return ScatterPlan(
+        indirect_pos=indirect_pos,
+        jnp_dtype=jnp_dtype,
+        target_ndim=tensor.ndim,
+        index_ndim=index_ndim,
     )
 
 
@@ -171,3 +211,83 @@ def emit_gather(
             f"jnp.expand_dims({{result}}, axis={dim})", result=result
         )
     return result
+
+
+def _scatter_one_hot_name(
+    state: CodegenState,
+    plan: ScatterPlan,
+    name: str,
+) -> str:
+    ast_subscripts = state.ast_args[1]
+    assert isinstance(ast_subscripts, list)
+    ast_idx = ast_subscripts[plan.indirect_pos]
+    assert isinstance(ast_idx, ast.AST)
+    idx_name = state.codegen.lift(ast_idx, dce=False, prefix="index").id
+    return (
+        f"jax.nn.one_hot({idx_name}[...], {name}.shape[{plan.indirect_pos}], "
+        "dtype=jnp.float32)"
+    )
+
+
+def emit_scatter_store(
+    state: CodegenState,
+    plan: ScatterPlan,
+    name: str,
+    base_index: str,
+    value: ast.AST,
+) -> ast.AST:
+    """Emit one Pallas program's tensor-indexed store block.
+
+    ``base_index`` is the target block with the indirect dimension replaced by
+    ``:``. For ``target[idx, cols] = value`` this is ``target[:, cols]``.
+
+    The lowering builds:
+      - ``oh``: one-hot source-lane-to-target-row map, shape ``[M, V]``.
+      - ``same_output_row``/``is_lane_j_after_i``/``is_last_writer``: local duplicate
+        detection. If two lanes in this program target the same row, only the
+        last source lane is kept.
+      - ``row_to_lane``: target-row-to-source-lane map, shape ``[V, M]``.
+      - ``updates``: projected values for every row in ``base_index``.
+      - ``mask``: rows touched by this program.
+
+    The final expression is ``where(mask, updates, old_target_block)`` so
+    untouched rows keep their previous value. Duplicate handling is local to
+    this Pallas program; duplicate writes from different programs have the same
+    unspecified winner semantics as regular parallel stores in other backends.
+    """
+    oh = _scatter_one_hot_name(state, plan, name)
+    m = f"jnp.shape({oh})[0]"
+    eye = f"jnp.eye({m}, dtype=jnp.float32)"
+    is_lane_j_after_i = f"jnp.triu(jnp.ones(({m}, {m}), dtype=jnp.float32), k=1)"
+    same_output_row = (
+        f"jax.lax.dot_general({oh}, jnp.swapaxes({oh}, 0, 1), (((1,), (0,)), ((), ())))"
+    )
+    is_last_writer = f"(jnp.sum(({same_output_row}) * ({is_lane_j_after_i}), axis=1) == 0).astype(jnp.float32)"
+    row_to_lane = (
+        f"jax.lax.dot_general(jnp.swapaxes({oh}, 0, 1), "
+        f"({eye}) * jnp.expand_dims({is_last_writer}, axis=0), "
+        "(((1,), (0,)), ((), ())))"
+    )
+    updates = expr_from_string(
+        "jax.lax.dot_general("
+        f"{row_to_lane}, "
+        "{value}.astype(jnp.float32), "
+        "(((1,), (0,)), "
+        "((), ())), "
+        "preferred_element_type=jnp.float32, "
+        "precision=jax.lax.Precision.HIGHEST"
+        f").astype({plan.jnp_dtype})",
+        value=value,
+    )
+    mask_expr = (
+        "jax.lax.dot_general("
+        f"{row_to_lane}, "
+        "jnp.ones_like({value}, dtype=jnp.float32), "
+        "(((1,), (0,)), ((), ()))"
+        ") > 0"
+    )
+    return expr_from_string(
+        f"jnp.where({mask_expr}, {{updates}}, {name}[{base_index}])",
+        updates=updates,
+        value=value,
+    )
