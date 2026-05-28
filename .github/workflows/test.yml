@@ -49,7 +49,7 @@ jobs:
 
     steps:
       - name: Run NVIDIA command
-        if: contains(matrix.image, 'cuda')
+        if: startsWith(matrix.image, 'nvidia') || (startsWith(matrix.image, 'pytorch') && contains(matrix.image, 'cuda'))
         run: |
           echo "Detected NVIDIA image"
           nvidia-smi || echo "nvidia-smi not found"
@@ -122,6 +122,12 @@ jobs:
           set -eux
 
           source .venv/bin/activate
+
+          # Temporarily unset UV_DEFAULT_INDEX (set on OSDC runners) so the
+          # explicit --index-url below is honored when installing torch. This
+          # step is its own shell, so the unset is scoped to the torch install.
+          unset UV_DEFAULT_INDEX
+
           if [[ "${{ matrix.pytorch-version }}" == pytorch-[0-9]* ]]; then
             VERSION="${{ matrix.pytorch-version }}"
             VERSION="${VERSION#pytorch-}"
@@ -137,8 +143,6 @@ jobs:
             fi
             uv pip install -U --pre torch --index-url https://download.pytorch.org/whl/nightly/${{ matrix.runtime-version }}
           fi
-
-          sleep 7200
 
       - name: Configure XPU runtime library path
         if: matrix.alias == 'xpu'
@@ -253,7 +257,7 @@ jobs:
           ./scripts/install_cute.sh
 
       - name: CUDA Compute Check
-        if: contains(matrix.image, 'cuda')
+        if: startsWith(matrix.image, 'nvidia') || (startsWith(matrix.image, 'pytorch') && contains(matrix.image, 'cuda'))
         run: |
           source .venv/bin/activate
           python -c "
@@ -274,7 +278,7 @@ jobs:
           "
 
       - name: Inductor Worker Check
-        if: contains(matrix.image, 'cuda')
+        if: startsWith(matrix.image, 'nvidia') || (startsWith(matrix.image, 'pytorch') && contains(matrix.image, 'cuda'))
         run: |
           source .venv/bin/activate
           python -c "

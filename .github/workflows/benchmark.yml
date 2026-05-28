@@ -65,7 +65,7 @@ jobs:
 
     steps:
       - name: Run NVIDIA command
-        if: contains(inputs.image, 'cuda')
+        if: startsWith(inputs.image, 'nvidia') || (startsWith(inputs.image, 'pytorch') && contains(inputs.image, 'cuda'))
         run: |
           echo "Detected NVIDIA image"
           nvidia-smi || echo "nvidia-smi not found"
@@ -100,6 +100,12 @@ jobs:
       - name: Install PyTorch
         run: |
           source .venv/bin/activate
+
+          # Temporarily unset UV_DEFAULT_INDEX (set on OSDC runners) so the
+          # explicit --index-url below is honored when installing torch. This
+          # step is its own shell, so the unset is scoped to the torch install.
+          unset UV_DEFAULT_INDEX
+
           uv pip install -U "torch==2.11.*" --index-url https://download.pytorch.org/whl/${{ inputs.runtime-version }}
 
       - name: Install Helion
@@ -115,7 +121,7 @@ jobs:
           ./scripts/install_cute.sh
 
       - name: CUDA Compute Check
-        if: contains(inputs.image, 'cuda')
+        if: startsWith(inputs.image, 'nvidia') || (startsWith(inputs.image, 'pytorch') && contains(inputs.image, 'cuda'))
         run: |
           source .venv/bin/activate
           python -c "
