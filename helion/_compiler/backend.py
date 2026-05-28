@@ -31,6 +31,7 @@ if TYPE_CHECKING:
     from .device_function import Argument
     from .device_function import DeviceFunction
     from .device_ir import GraphInfo
+    from .host_function import HostFunction
     from .tile_dispatch import TileStrategyDispatch
     from .tile_strategy import TileStrategy
 
@@ -543,6 +544,15 @@ class Backend(abc.ABC):
 
     def launcher_keyword_args(self, config: Config, *, has_barrier: bool) -> list[str]:
         return []
+
+    def customize_ast(self, hf: HostFunction) -> None:
+        """Run backend-specific AST customizations.
+
+        Called after static loop unrolling but before type propagation
+        and tracing.  Backends can override this to rewrite the user's
+        AST for algorithmic transformations that change loop structure.
+        """
+        return None
 
     def pre_codegen(
         self,
@@ -2618,6 +2628,21 @@ class CuteBackend(Backend):
     @property
     def name(self) -> str:
         return "cute"
+
+    def customize_ast(self, hf: HostFunction) -> None:
+        """CuTe-specific AST rewrites that rewrite high-level patterns into
+        equivalent forms that compile to materially faster code.
+
+        Currently:
+          * ``rewrite_online_to_3pass`` rewrites the online two-pass
+            softmax pattern into the 3-pass form (max-only, then
+            sum-only, then consume).  The 3-pass form's two reductions
+            are independent and compile to a more efficient layout on
+            the CuTe backend.
+        """
+        from .cute.online_to_3pass import rewrite_online_to_3pass
+
+        rewrite_online_to_3pass(hf)
 
     def pre_codegen(
         self,
