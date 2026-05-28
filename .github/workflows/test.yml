@@ -127,9 +127,6 @@ jobs:
           # --index-url below is honored when installing torch.
           unset UV_DEFAULT_INDEX
 
-          # DEBUG: keep the pod alive to inspect the uv index environment.
-          sleep 7200
-
           if [[ "${{ matrix.pytorch-version }}" == pytorch-[0-9]* ]]; then
             VERSION="${{ matrix.pytorch-version }}"
             VERSION="${VERSION#pytorch-}"
