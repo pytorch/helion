@@ -53,7 +53,7 @@
       "image": "pytorch/pytorch:2.12.0-cuda13.0-cudnn9-devel",
       "runtime-version": "cu130",
       "container-options": "--gpus all",
-      "pytorch-version": "pytorch-2.12",
+      "pytorch-version": "pytorch-nightly",
       "alias": "h100",
       "backend": "triton"
     },
@@ -64,7 +64,7 @@
       "image": "pytorch/pytorch:2.12.0-cuda13.0-cudnn9-devel",
       "runtime-version": "cu130",
       "container-options": "--gpus all",
-      "pytorch-version": "pytorch-2.12",
+      "pytorch-version": "pytorch-nightly",
       "alias": "h100-distributed",
       "backend": "triton"
     },
