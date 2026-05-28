@@ -342,6 +342,9 @@ def _generated_index_code(
         return _index_expr_from_ast(state, subscript_index)
 
     if isinstance(pattern, IndirectGatherPattern):
+        # The gather emitter consumes the tensor index and projects the full
+        # resident table axis through one-hot, so normal load codegen must
+        # expose that axis instead of indexing it a second time.
         return ":"
 
     raise RuntimeError(
