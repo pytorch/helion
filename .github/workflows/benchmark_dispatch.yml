@@ -79,7 +79,7 @@ jobs:
       id-token: write
       contents: read
     with:
-      runner: linux.aws.h100
+      runner: a.linux.h100
       python-version: "3.12"
       image: nvidia/cuda:12.8.1-devel-ubuntu24.04
       runtime-version: cu128
