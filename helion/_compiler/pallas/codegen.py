@@ -315,6 +315,7 @@ def _generated_index_code(
     """Generate index code based on the indexing pattern."""
     from helion._compiler.pallas.plan_tiling import ArbitraryIndexPattern
     from helion._compiler.pallas.plan_tiling import ArbitrarySlicePattern
+    from helion._compiler.pallas.plan_tiling import IndirectGatherPattern
     from helion._compiler.pallas.plan_tiling import TileBeginWithOffsetPattern
     from helion._compiler.pallas.plan_tiling import TileIndexWithOffsetPattern
     from helion._compiler.pallas.plan_tiling import TilePattern
@@ -339,6 +340,9 @@ def _generated_index_code(
         if isinstance(idx, int):
             return str(idx)
         return _index_expr_from_ast(state, subscript_index)
+
+    if isinstance(pattern, IndirectGatherPattern):
+        return ":"
 
     raise RuntimeError(
         f"Unhandled indexing pattern type: {type(pattern).__name__}. "
