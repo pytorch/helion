@@ -128,14 +128,18 @@ jobs:
           if [[ "${{ matrix.pytorch-version }}" == pytorch-[0-9]* ]]; then
             VERSION="${{ matrix.pytorch-version }}"
             VERSION="${VERSION#pytorch-}"
-            uv pip install -U "torch==${VERSION}.*" --index https://download.pytorch.org/whl/${{ matrix.runtime-version }}          elif [[ "${{ matrix.runtime-version }}" == "tpu" ]]; then
+            uv pip install -U "torch==${VERSION}.*" --index https://download.pytorch.org/whl/${{ matrix.runtime-version }}
+          elif [[ "${{ matrix.runtime-version }}" == "tpu" ]]; then
             # TPU: install CPU-only PyTorch nightly (torch_tpu provides TPU backend)
-            uv pip install -U --pre torch --index https://download.pytorch.org/whl/nightly/cpu          else
+            uv pip install -U --pre torch --index https://download.pytorch.org/whl/nightly/cpu
+          else
             # Default to nightly
             if [[ "${{ matrix.runtime-version }}" == "cu128" ]]; then
               # Install nvidia-nvshmem-cu12 from cu129 index (missing on cu128)
-              uv pip install -U --pre nvidia-nvshmem-cu12 --index https://download.pytorch.org/whl/nightly/cu129            fi
-            uv pip install -U --pre torch --index https://download.pytorch.org/whl/nightly/${{ matrix.runtime-version }}          fi
+              uv pip install -U --pre nvidia-nvshmem-cu12 --index https://download.pytorch.org/whl/nightly/cu129
+            fi
+            uv pip install -U --pre torch --index https://download.pytorch.org/whl/nightly/${{ matrix.runtime-version }}
+          fi
 
       - name: Configure XPU runtime library path
         if: matrix.alias == 'xpu'

@@ -104,6 +104,7 @@ jobs:
           # Use the explicit PyTorch index so torch resolves from it instead of
           # the default index set on OSDC runners.
           uv pip install -U "torch==2.11.*" --index https://download.pytorch.org/whl/${{ inputs.runtime-version }}
+
       - name: Install Helion
         run: |
           source .venv/bin/activate
