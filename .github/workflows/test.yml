@@ -123,24 +123,22 @@ jobs:
 
           source .venv/bin/activate
 
-          # Use the explicit PyTorch index so torch resolves from it instead of
-          # the default index set on OSDC runners.
+          # Clear UV_INDEX (set on OSDC runners) per-command so torch resolves
+          # from the explicit --index-url below instead of the default index.
           if [[ "${{ matrix.pytorch-version }}" == pytorch-[0-9]* ]]; then
             VERSION="${{ matrix.pytorch-version }}"
             VERSION="${VERSION#pytorch-}"
-            uv pip install -U "torch==${VERSION}.*" --index https://download.pytorch.org/whl/${{ matrix.runtime-version }}
+            UV_INDEX= uv pip install -U "torch==${VERSION}.*" --index-url https://download.pytorch.org/whl/${{ matrix.runtime-version }}
           elif [[ "${{ matrix.runtime-version }}" == "tpu" ]]; then
             # TPU: install CPU-only PyTorch nightly (torch_tpu provides TPU backend)
-            uv pip install -U --pre torch --index https://download.pytorch.org/whl/nightly/cpu
+            UV_INDEX= uv pip install -U --pre torch --index-url https://download.pytorch.org/whl/nightly/cpu
           else
             # Default to nightly
             if [[ "${{ matrix.runtime-version }}" == "cu128" ]]; then
               # Install nvidia-nvshmem-cu12 from cu129 index (missing on cu128)
-              uv pip install -U --pre nvidia-nvshmem-cu12 --index https://download.pytorch.org/whl/nightly/cu129
+              UV_INDEX= uv pip install -U --pre nvidia-nvshmem-cu12 --index-url https://download.pytorch.org/whl/nightly/cu129
             fi
-
-            sleep 7200
-            uv pip install -U --pre torch --index https://download.pytorch.org/whl/nightly/${{ matrix.runtime-version }}
+            UV_INDEX= uv pip install -U --pre torch --index-url https://download.pytorch.org/whl/nightly/${{ matrix.runtime-version }}
           fi
 
       - name: Configure XPU runtime library path
