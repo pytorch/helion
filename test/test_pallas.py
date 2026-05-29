@@ -231,6 +231,14 @@ def pallas_arange_add(x: torch.Tensor) -> torch.Tensor:
 
 
 @helion.kernel(backend="pallas", static_shapes=True)
+def pallas_scatter_store(values: torch.Tensor, indices: torch.Tensor) -> torch.Tensor:
+    out = torch.zeros_like(values)
+    for tile_m, tile_n in hl.tile(values.size()):
+        out[indices[tile_m], tile_n] = values[tile_m, tile_n]
+    return out
+
+
+@helion.kernel(backend="pallas", static_shapes=True)
 def pallas_inner_loop_add(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     """Kernel with an outer grid loop and an inner device loop."""
     m, n = x.size()
@@ -657,6 +665,92 @@ class TestPallas(TestCase):
 
         torch.testing.assert_close(result, values[indices.to(torch.int64), :])
         self.assertIn("values[:,", code)
+
+    def test_scatter_store(self) -> None:
+        for dtype in (torch.float32, torch.bfloat16):
+            with self.subTest(dtype=dtype):
+                values = torch.randn(16, 8, device=DEVICE, dtype=dtype)
+                indices = torch.randperm(16, device=DEVICE).to(torch.int32)
+                code, result = code_and_output(
+                    pallas_scatter_store, (values, indices), block_sizes=[4, 4]
+                )
+
+                expected = torch.zeros_like(values)
+                expected[indices.to(torch.int64)] = values
+                torch.testing.assert_close(result, expected)
+                self.assertIn("one_hot", code)
+                self.assertIn("jnp.triu", code)
+                self.assertIn("jnp.eye", code)
+                self.assertIn("jnp.swapaxes", code)
+                self.assertIn("jnp.ones_like", code)
+                self.assertIn("jnp.where", code)
+                self.assertIn("dot_general", code)
+
+    def test_scatter_store_duplicate_indices(self) -> None:
+        values = torch.randn(16, 8, device=DEVICE, dtype=torch.float32)
+        indices = torch.tensor(
+            [0, 1, 1, 2, 4, 4, 4, 8, 8, 9, 10, 10, 12, 13, 14, 14],
+            device=DEVICE,
+            dtype=torch.int32,
+        )
+        code, result = code_and_output(
+            pallas_scatter_store, (values, indices), block_sizes=[16, 8]
+        )
+
+        expected = torch.zeros_like(values)
+        expected[indices.to(torch.int64)] = values
+        torch.testing.assert_close(result, expected)
+
+    def test_tensor_index_atomic_add_raises(self) -> None:
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def atomic_add_tensor_index(
+            values: torch.Tensor, indices: torch.Tensor
+        ) -> torch.Tensor:
+            out = torch.zeros_like(values)
+            for tile in hl.tile(values.size(0)):
+                hl.atomic_add(out, [indices[tile]], values[tile])
+            return out
+
+        values = torch.randn(16, device=DEVICE, dtype=torch.float32)
+        indices = torch.randperm(16, device=DEVICE).to(torch.int32)
+
+        with self.assertRaisesRegex(
+            NotImplementedError,
+            "tensor-indexed memory op is not supported for op=atomic_add",
+        ):
+            code_and_output(
+                atomic_add_tensor_index,
+                (values, indices),
+                block_size=16,
+            )
+
+    def test_scatter_store_multiple_tensor_indices_raises(self) -> None:
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def scatter_store_multiple_tensor_indices(
+            values: torch.Tensor, row_indices: torch.Tensor, col_indices: torch.Tensor
+        ) -> torch.Tensor:
+            out = torch.zeros(
+                [values.size(0), values.size(0)],
+                dtype=values.dtype,
+                device=values.device,
+            )
+            for tile in hl.tile(values.size(0)):
+                out[row_indices[tile], col_indices[tile]] = values[tile, tile]
+            return out
+
+        values = torch.randn(16, 16, device=DEVICE, dtype=torch.float32)
+        row_indices = torch.randperm(16, device=DEVICE).to(torch.int32)
+        col_indices = torch.randperm(16, device=DEVICE).to(torch.int32)
+
+        with self.assertRaisesRegex(
+            NotImplementedError,
+            "multiple indirect dims are not supported",
+        ):
+            code_and_output(
+                scatter_store_multiple_tensor_indices,
+                (values, row_indices, col_indices),
+                block_size=16,
+            )
 
     def test_inplace_add(self) -> None:
         x = torch.randn(1024, device=DEVICE, dtype=torch.float32)
@@ -3081,24 +3175,6 @@ class TestPallasIndirectGather(TestCase):
         self.assertNotIn("dot_general", code)
         ref = table.cpu()[indices.long().cpu()].to(device=DEVICE)
         torch.testing.assert_close(result, ref)
-
-    @parametrize("static_shapes", (True, False))
-    def test_scatter_raises(self, static_shapes: bool) -> None:
-        """Indirect store has no Pallas strategy; plan_tiling must raise."""
-
-        @helion.kernel(backend="pallas", static_shapes=static_shapes)
-        def scatter(
-            out: torch.Tensor, values: torch.Tensor, indices: torch.Tensor
-        ) -> torch.Tensor:
-            for tile_b, tile_e in hl.tile([values.size(0), values.size(1)]):
-                out[indices[tile_b], tile_e] = values[tile_b, tile_e]
-            return out
-
-        out = torch.zeros(16, 64, device=DEVICE, dtype=torch.float32)
-        values = torch.randn(8, 64, device=DEVICE, dtype=torch.float32)
-        indices = torch.arange(8, device=DEVICE, dtype=torch.int32)
-        with self.assertRaisesRegex(Exception, "indirect store"):
-            code_and_output(scatter, (out, values, indices), block_sizes=[8, 64])
 
     @parametrize("static_shapes", (True, False))
     def test_gather_1d_index_bumps_block_to_tpu_alignment(

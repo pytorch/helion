@@ -331,6 +331,22 @@ def _(state: CodegenState) -> None:
         state, tensor, subscript, parts, value
     )
     idx_str = ", ".join(parts)
+    patterns = state.fx_node.meta.get("indexing_patterns") if state.fx_node else ()
+    from .._compiler.pallas.gather import emit_scatter_store
+    from .._compiler.pallas.plan_tiling import IndirectScatterPattern
+
+    scatter_patterns = [
+        pattern
+        for pattern in patterns or ()
+        if isinstance(pattern, IndirectScatterPattern)
+    ]
+    assert len(scatter_patterns) <= 1, (
+        "Pallas store expected at most one indirect scatter pattern"
+    )
+    if scatter_patterns:
+        value = emit_scatter_store(
+            state, scatter_patterns[0].plan, name, idx_str, value
+        )
     state.codegen.add_statement(
         statement_from_string(f"{name}[{idx_str}] = {{value}}", value=value)
     )
