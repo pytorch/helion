@@ -1257,38 +1257,8 @@ def run_kernel(name: str) -> KernelResult:
         signal.signal(signal.SIGALRM, old_handler)
 
 
-def _print_hbm_probe(label: str) -> None:
-    """Diagnostic: print TPU HBM usage at named lifecycle points.
-
-    Compares shape 0 subprocess (cold device) vs shape N subprocess (post-
-    handoff). Cold subprocess should show min-HBM; if shape N>=1 sees higher
-    start-HBM, that's evidence of leaked device-side state across PjRtClient
-    teardown/restart.
-
-    Uses ``jax.devices()[0].memory_stats()`` because torch.tpu's
-    ``_hbm_usage_summary`` only reports CompilationCache HBM, not total
-    user-allocated HBM.
-    """
-    try:
-        import jax
-
-        stats = jax.devices()[0].memory_stats()
-    except Exception as e:
-        print(f"  [hbm-probe@{label}] unavailable: {e}", file=sys.stderr)
-        return
-    in_use = stats.get("bytes_in_use", -1)
-    peak = stats.get("peak_bytes_in_use", -1)
-    largest_free = stats.get("largest_free_block_bytes", -1)
-    print(
-        f"  [hbm-probe@{label}] in_use={in_use:_} peak={peak:_} "
-        f"largest_free_block={largest_free:_} num_allocs={stats.get('num_allocs', -1)}",
-        file=sys.stderr,
-    )
-
-
 def run_kernel_inner(name: str) -> KernelResult:
     """Run a single kernel benchmark: accuracy check + timing vs baseline."""
-    _print_hbm_probe("run_kernel_inner-start")
     if name not in KERNEL_MAPPINGS:
         return KernelResult(name=name, passed=False, error=f"Unknown kernel: {name}")
 
@@ -1330,7 +1300,6 @@ def run_kernel_inner(name: str) -> KernelResult:
                     shape_index_out_of_range=True,
                 )
             shapes = [shapes[SHAPE_INDEX]]
-        _print_hbm_probe("post-shape-alloc")
         all_passed = True
         shape_results: list[ShapeResult] = []
         accuracy_verified = max_mismatch_pct is None or max_mismatch_pct < 1.0
