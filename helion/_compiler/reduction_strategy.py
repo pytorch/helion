@@ -13,6 +13,7 @@ from torch._inductor.codegen.simd import constant_repr
 from torch._inductor.runtime.runtime_utils import next_power_of_2
 from torch._prims_common import get_computation_dtype
 
+from .. import exc
 from .._compat import shape_env_size_hint
 from .ast_extension import create
 from .ast_extension import expr_from_string
@@ -742,7 +743,10 @@ class LoopedReductionStrategy(ReductionStrategy):
         block_size: int,
     ) -> None:
         env = CompileEnvironment.current()
-        assert block_size > 1
+        if block_size <= 1:
+            raise exc.InvalidConfig(
+                f"LoopedReductionStrategy requires block_size > 1, got {block_size}"
+            )
         # Compute thread count for warp-level reductions
         max_threads = env.backend.max_reduction_threads()
         if max_threads is not None:

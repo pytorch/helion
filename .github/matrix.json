@@ -47,10 +47,10 @@
       "backend": "triton"
     },
     {
-      "runner": "linux.aws.h100",
+      "runner": "mt-l-x86iamx-22-225-h100",
       "python-version": "3.12",
       "ref-eager": false,
-      "image": "nvidia/cuda:12.8.1-devel-ubuntu24.04",
+      "image": "pytorch/pytorch:2.11.0-cuda12.8-cudnn9-devel",
       "runtime-version": "cu128",
       "container-options": "--gpus all",
       "pytorch-version": "pytorch-nightly",
@@ -58,10 +58,10 @@
       "backend": "triton"
     },
     {
-      "runner": "linux.aws.h100.4",
+      "runner": "mt-l-x86iamx-88-900-h100-4",
       "python-version": "3.12",
       "ref-eager": false,
-      "image": "nvidia/cuda:12.8.1-devel-ubuntu24.04",
+      "image": "pytorch/pytorch:2.11.0-cuda12.8-cudnn9-devel",
       "runtime-version": "cu128",
       "container-options": "--gpus all",
       "pytorch-version": "pytorch-nightly",

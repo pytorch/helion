@@ -65,7 +65,7 @@ jobs:
 
     steps:
       - name: Run NVIDIA command
-        if: startsWith(inputs.image, 'nvidia')
+        if: startsWith(inputs.image, 'nvidia') || (startsWith(inputs.image, 'pytorch') && contains(inputs.image, 'cuda'))
         run: |
           echo "Detected NVIDIA image"
           nvidia-smi || echo "nvidia-smi not found"
@@ -100,7 +100,10 @@ jobs:
       - name: Install PyTorch
         run: |
           source .venv/bin/activate
-          uv pip install -U "torch==2.11.*" --index-url https://download.pytorch.org/whl/${{ inputs.runtime-version }}
+
+          # On OSDC, route through the pypi-cache /whl proxy (deps stay reachable behind the egress firewall) and clear the cache index vars so it wins over the cache default; off OSDC PYPI_CACHE_WHL_URL is unset so we hit download.pytorch.org.
+          PYTORCH_INDEX="${PYPI_CACHE_WHL_URL:-https://download.pytorch.org/whl/cpu}"
+          UV_DEFAULT_INDEX= UV_INDEX= uv pip install -U "torch==2.11.*" --index-url "${PYTORCH_INDEX%/whl/*}/whl/${{ inputs.runtime-version }}"
 
       - name: Install Helion
         run: |
@@ -115,7 +118,7 @@ jobs:
           ./scripts/install_cute.sh
 
       - name: CUDA Compute Check
-        if: startsWith(inputs.image, 'nvidia')
+        if: startsWith(inputs.image, 'nvidia') || (startsWith(inputs.image, 'pytorch') && contains(inputs.image, 'cuda'))
         run: |
           source .venv/bin/activate
           python -c "
