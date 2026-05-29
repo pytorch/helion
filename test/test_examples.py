@@ -1349,7 +1349,6 @@ class TestExamples(RefEagerTestBase, TestCase):
         """Test combined backward pass for layer norm with bias."""
         self._run_layernorm_bwd(batch_size=32, dim=64)
 
-    @xfailIfCute("CuTe LayerNorm backward example still returns incorrect results")
     @xfailIfPallas("VMEM OOM: untiled block specs load full tensors")
     @skipIfA10G("accuracy check fails on A10G GPUs")
     def test_layernorm_bwd_large_batch(self):
