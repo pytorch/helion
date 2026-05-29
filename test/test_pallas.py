@@ -613,6 +613,51 @@ class TestPallas(TestCase):
         torch.testing.assert_close(result, x + offsets[None, :])
         self.assertIn("jnp.arange", code)
 
+    def test_bool_view_expand_where(self) -> None:
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def pallas_bool_view_expand_where(x: torch.Tensor) -> torch.Tensor:
+            m, n = x.size()
+            out = torch.empty_like(x)
+            for tile_m, tile_n in hl.tile([m, n]):
+                mask = x[tile_m, 0] > 0
+                mask_2d = mask.view(tile_m.block_size, 1).expand(
+                    tile_m.block_size, tile_n.block_size
+                )
+                out[tile_m, tile_n] = torch.where(mask_2d, x[tile_m, tile_n], 0.0)
+            return out
+
+        x = torch.randn(16, 128, device=DEVICE, dtype=torch.float32)
+        code, result = code_and_output(
+            pallas_bool_view_expand_where,
+            (x,),
+            block_sizes=[16, 128],
+        )
+
+        expected = torch.where(x[:, :1] > 0, x, torch.zeros_like(x))
+        torch.testing.assert_close(result, expected)
+        self.assertIn("astype(jnp.int32)", code)
+
+    def test_indirect_gather_with_tiled_dim(self) -> None:
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def pallas_indirect_gather_with_tiled_dim(
+            values: torch.Tensor, indices: torch.Tensor
+        ) -> torch.Tensor:
+            out = torch.empty([indices.size(0), values.size(1)], device=values.device)
+            for tile_m, tile_n in hl.tile(out.size()):
+                out[tile_m, tile_n] = values[indices[tile_m], tile_n]
+            return out
+
+        values = torch.randn(16, 8, device=DEVICE, dtype=torch.float32)
+        indices = torch.randperm(16, device=DEVICE).to(torch.int32)
+        code, result = code_and_output(
+            pallas_indirect_gather_with_tiled_dim,
+            (values, indices),
+            block_sizes=[4, 4],
+        )
+
+        torch.testing.assert_close(result, values[indices.to(torch.int64), :])
+        self.assertIn("values[:,", code)
+
     def test_inplace_add(self) -> None:
         x = torch.randn(1024, device=DEVICE, dtype=torch.float32)
         y = torch.randn(1024, device=DEVICE, dtype=torch.float32)

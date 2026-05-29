@@ -112,6 +112,16 @@ def emit_gather(
     ast_idx = ast_subscripts[plan.indirect_pos]
     assert isinstance(ast_idx, ast.AST)
     idx_name = state.codegen.lift(ast_idx, dce=False, prefix="index").id
+    tensor = state.proxy_arg(0)
+    subscript = state.proxy_arg(1)
+    assert isinstance(tensor, torch.Tensor)
+    assert isinstance(subscript, (list, tuple))
+
+    from . import codegen as pallas_codegen
+
+    parts, _ = pallas_codegen.index_parts(state, subscript, tensor)
+    base_index = ", ".join(parts)
+    table_expr = f"{name}[{base_index}]"
 
     if plan.emit_select:
         mask_expr = (
@@ -120,7 +130,7 @@ def emit_gather(
         for _ in range(plan.table_ndim - 1):
             mask_expr = f"jnp.expand_dims({mask_expr}, axis=-1)"
         result = expr_from_string(
-            f"jnp.sum({name}[...] * {mask_expr}, "
+            f"jnp.sum({table_expr} * {mask_expr}, "
             f"axis=jnp.ndim({idx_name}[...])"
             f").astype({plan.jnp_dtype})"
         )
@@ -132,18 +142,18 @@ def emit_gather(
 
     if plan.use_highest_precision:
         oh_dtype = "jnp.float32"
-        table_expr = f"{name}[...].astype(jnp.float32)"
+        table_dot_expr = f"{table_expr}.astype(jnp.float32)"
         precision_arg = "precision=jax.lax.Precision.HIGHEST, "
     else:
         oh_dtype = plan.jnp_dtype
-        table_expr = f"{name}[...]"
+        table_dot_expr = table_expr
         precision_arg = ""
 
     p = plan.indirect_pos
     result = expr_from_string(
         "jax.lax.dot_general("
         f"jax.nn.one_hot({idx_name}[...], {name}.shape[{p}], dtype={oh_dtype}), "
-        f"{table_expr}, "
+        f"{table_dot_expr}, "
         f"(((jnp.ndim({idx_name}[...]),), ({p},)), ((), ())), "
         "preferred_element_type=jnp.float32, "
         f"{precision_arg}"
