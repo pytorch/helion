@@ -1249,7 +1249,7 @@ def _print_hbm_probe(label: str) -> None:
         import jax
 
         stats = jax.devices()[0].memory_stats()
-    except Exception as e:  # noqa: BLE001
+    except Exception as e:
         print(f"  [hbm-probe@{label}] unavailable: {e}", file=sys.stderr)
         return
     in_use = stats.get("bytes_in_use", -1)
@@ -1298,7 +1298,7 @@ def run_kernel_inner(name: str) -> KernelResult:
         # fresh TPU device with no accumulated libtpu allocator state. The
         # child is invoked with --shape-index=N to restrict its work.
         if SHAPE_INDEX is not None:
-            if SHAPE_INDEX >= len(shapes):
+            if len(shapes) <= SHAPE_INDEX:
                 return KernelResult(
                     name=name,
                     passed=False,
