@@ -1037,6 +1037,9 @@ class KernelResult:
     # was no real numerical check, so we drop helion_accuracy from the dashboard
     # JSON instead of falsely reporting 1.0.
     accuracy_verified: bool = True
+    # Set by the child when --shape-index walks past the end of shapes_fn's
+    # list, so the parent can stop iterating without parsing the error string.
+    shape_index_out_of_range: bool = False
 
 
 def import_example(module_file: str) -> types.ModuleType:
@@ -1129,7 +1132,27 @@ def _run_one_shape_via_subprocess(name: str, shape_index: int | None) -> KernelR
             cmd += ["--num-shapes", str(NUM_SHAPES)]
         if shape_index is not None:
             cmd += ["--shape-index", str(shape_index)]
-        proc = subprocess.run(cmd, env=os.environ.copy(), check=False)
+        # Parent-side hard cap. The child also installs SIGALRM at KERNEL_TIMEOUT;
+        # the extra slack covers child startup + autotune ramp-up + SIGALRM cleanup.
+        # If the child wedges before its own alarm fires (e.g., stuck on a TPU
+        # lockfile), this prevents the parent from hanging indefinitely.
+        subprocess_timeout = KERNEL_TIMEOUT + 120
+        try:
+            proc = subprocess.run(
+                cmd,
+                env=os.environ.copy(),
+                check=False,
+                timeout=subprocess_timeout,
+            )
+        except subprocess.TimeoutExpired:
+            return KernelResult(
+                name=name,
+                passed=False,
+                error=(
+                    f"Subprocess exceeded parent timeout of {subprocess_timeout}s "
+                    f"(KERNEL_TIMEOUT={KERNEL_TIMEOUT}s + 120s slack)"
+                ),
+            )
         if proc.returncode != 0 or not os.path.exists(tmp_path):
             return KernelResult(
                 name=name,
@@ -1146,6 +1169,7 @@ def _run_one_shape_via_subprocess(name: str, shape_index: int | None) -> KernelR
             error=payload.get("error"),
             shape_results=shape_results,
             accuracy_verified=payload.get("accuracy_verified", True),
+            shape_index_out_of_range=payload.get("shape_index_out_of_range", False),
         )
     finally:
         if os.path.exists(tmp_path):
@@ -1156,7 +1180,7 @@ def _run_kernel_per_shape(name: str) -> KernelResult:
     """Orchestrate per-shape subprocesses for one kernel, merge into one result.
 
     Walks shape indices 0, 1, 2, ... by spawning one child per index. Stops
-    when a child returns an error matching ``--shape-index=N out of range``.
+    when a child sets ``shape_index_out_of_range=True`` in its KernelResult.
     Doing it this way avoids the parent calling ``shapes_fn`` (which would
     allocate `device=DEVICE` tensors and lock the TPU for the children).
     """
@@ -1175,7 +1199,7 @@ def _run_kernel_per_shape(name: str) -> KernelResult:
     while True:
         print(f"  [subprocess shape {idx}]", file=sys.stderr)
         result = _run_one_shape_via_subprocess(name, shape_index=idx)
-        if result.error and "out of range" in result.error:
+        if result.shape_index_out_of_range:
             # Sentinel: we've walked off the end of shapes_fn's list.
             break
         if result.shape_results:
@@ -1303,6 +1327,7 @@ def run_kernel_inner(name: str) -> KernelResult:
                     name=name,
                     passed=False,
                     error=f"--shape-index={SHAPE_INDEX} out of range (have {len(shapes)} shapes)",
+                    shape_index_out_of_range=True,
                 )
             shapes = [shapes[SHAPE_INDEX]]
         _print_hbm_probe("post-shape-alloc")
