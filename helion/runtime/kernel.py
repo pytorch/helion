@@ -142,19 +142,20 @@ def _resolve_index_dtype(
 
 def _device_specialization_key(
     args: Sequence[object],
-) -> tuple[str | None, tuple[int, int] | None]:
+) -> tuple[str | None, tuple[int, int] | None, int | None]:
     """Return the recursive argument device key used by bound-kernel caching.
 
     `_find_device` intentionally searches tensors and bare `torch.device`
     objects inside supported containers to match binding device selection.
-    Capability splits mixed-sm cache entries. Device index remains excluded so
-    same-capability devices share bound kernels, matching prior behavior.
+    Capability splits mixed-sm cache entries; ``device.index`` splits
+    same-capability cards (e.g. cuda:0 vs cuda:1) so each device gets its
+    own ``BoundKernel`` + correctly-pinned ``StaticLauncher``.
     """
     try:
         device = _find_device(tuple(args))
     except exc.NoTensorArgs:
-        return None, None
-    return device.type, target_device_capability(device)
+        return None, None, None
+    return device.type, target_device_capability(device), device.index
 
 
 class Kernel(Generic[_R]):
@@ -304,10 +305,16 @@ class Kernel(Generic[_R]):
                 result.append(value)
             else:
                 result.append(self._specialization_key(value))
-        device_type, device_capability = _device_specialization_key(args)
+        device_type, device_capability, device_index = _device_specialization_key(args)
         if self._key_fn is not None:
-            return (*result, device_type, device_capability, self._key_fn(*args))
-        return (*result, device_type, device_capability)
+            return (
+                *result,
+                device_type,
+                device_capability,
+                device_index,
+                self._key_fn(*args),
+            )
+        return (*result, device_type, device_capability, device_index)
 
     def specialization_key(self, args: Sequence[object]) -> tuple[Hashable, ...]:
         """
@@ -968,11 +975,87 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
             config: The configuration to set.
         """
         config = self._normalize_config(config)
-        self._run = self.compile_config(config)
+        compiled = self.compile_config(config)
+        # Clone the compiled function so each BoundKernel has its own
+        # ``__kwdefaults__`` to mutate. ``compile_config`` returns
+        # functions loaded via ``PyCodeCache``, which keys on source
+        # hash — two BoundKernels for the same kernel on cuda:0 vs
+        # cuda:1 generate IDENTICAL Triton source (device isn't baked
+        # in), share a function object, and an in-place
+        # ``__kwdefaults__["_launcher"] = ...`` in
+        # :meth:`_install_fast_launcher` would clobber the earlier
+        # BoundKernel's device-pinned launcher.
+        run = types.FunctionType(
+            compiled.__code__,
+            compiled.__globals__,
+            compiled.__name__,
+            compiled.__defaults__,
+            compiled.__closure__,
+        )
+        if compiled.__kwdefaults__ is not None:
+            run.__kwdefaults__ = dict(compiled.__kwdefaults__)
+        self._install_fast_launcher(run, config)
+        self._run = run
         self._config = config
         counters["best_config_decorator"][
             self.format_kernel_decorator(config, self.settings)
         ] = 1
+
+    def _install_fast_launcher(
+        self,
+        compiled: CompiledConfig,
+        config: Config,
+    ) -> None:
+        """Re-point ``compiled``'s ``_launcher`` kwarg default at a fast closure.
+
+        The generated host wrapper declares
+        ``def add(x, y, *, _launcher=_default_launcher)``; Python stores the
+        ``_default_launcher`` value in ``compiled.__kwdefaults__``. By
+        overwriting that entry with a :class:`helion.runtime.StaticLauncher`
+        closure (built once with this config's ``num_warps`` / ``num_stages``
+        / etc. baked in), every direct call to ``compiled(*args)`` —
+        including from ``BoundKernel.__call__`` on the steady-state hot
+        path — uses the fast launcher with no extra Python wrapping.
+
+        The autotune trial harness and any external caller that explicitly
+        passes ``_launcher=`` overrides the kwdefault automatically, so
+        this is safe.
+
+        Non-Triton backends and any priming failure cause the kwdefault to
+        be left at :func:`default_launcher`. Setting the env var
+        ``HELION_SKIP_FAST_LAUNCHER=1`` (or ``true`` / ``yes``) is an
+        escape hatch: the fast launcher is not installed and every
+        Helion call goes through ``default_launcher`` (= Triton's
+        ``JITFunction.run``). Useful for quickly bisecting whether a
+        bug is in the fast launcher itself.
+        """
+        from ._fast_launcher import _build_fast_launcher
+
+        if os.environ.get("HELION_SKIP_FAST_LAUNCHER", "").lower() in (
+            "1",
+            "true",
+            "yes",
+        ):
+            return
+
+        backend = self.env.backend
+        if not isinstance(backend, TritonBackend):
+            return
+        kwdefaults = getattr(compiled, "__kwdefaults__", None)
+        if not kwdefaults or "_launcher" not in kwdefaults:
+            # No ``_launcher`` kwonly default — nothing to wire up.
+            # (Should not happen for Helion-compiled Triton kernels.)
+            return
+
+        try:
+            launcher = _build_fast_launcher(config=config, env=self._env)
+        except Exception:
+            log.debug(
+                "StaticLauncher disabled: _build_fast_launcher raised",
+                exc_info=True,
+            )
+            return
+        kwdefaults["_launcher"] = launcher
 
     def _specialize_extra(self) -> list[Callable[[Sequence[object]], Hashable]]:
         """

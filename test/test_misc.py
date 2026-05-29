@@ -34,6 +34,7 @@ from helion._testing import skipIfPyTorchBaseVerLessThan
 from helion._testing import skipIfRefEager
 from helion._testing import skipIfTileIR
 from helion._testing import skipUnlessTensorDescriptor
+from helion._testing import synchronize_device
 import helion.language as hl
 from helion.runtime.settings import _get_backend
 
@@ -1253,21 +1254,49 @@ class TestHelionTritonPrinter(TestCase):
             self.assertIn("div_floor_integer", result)
 
 
+def _scope_launcher(testcase: unittest.TestCase, launcher: str) -> None:
+    """Force the named launcher via ``HELION_SKIP_FAST_LAUNCHER`` for
+    the duration of the test, restoring the prior env var on cleanup.
+
+    - ``"default"`` sets ``HELION_SKIP_FAST_LAUNCHER=1``, routing every
+      call through :func:`helion.runtime.default_launcher` (Triton's
+      ``JITFunction.run``).
+    - ``"static"`` unsets the env var, letting Helion install its
+      :class:`helion.runtime.StaticLauncher`.
+    """
+    prev = os.environ.get("HELION_SKIP_FAST_LAUNCHER")
+    if launcher == "default":
+        os.environ["HELION_SKIP_FAST_LAUNCHER"] = "1"
+    elif launcher == "static":
+        os.environ.pop("HELION_SKIP_FAST_LAUNCHER", None)
+    else:
+        raise ValueError(f"unknown launcher: {launcher!r}")
+
+    def _restore() -> None:
+        if prev is None:
+            os.environ.pop("HELION_SKIP_FAST_LAUNCHER", None)
+        else:
+            os.environ["HELION_SKIP_FAST_LAUNCHER"] = prev
+
+    testcase.addCleanup(_restore)
+
+
+@instantiate_parametrized_tests
 @onlyBackends(["triton"])
 class TestLauncher(TestCase):
     """Launcher-agnostic contract tests — every launcher
     implementation must satisfy these regardless of which Triton
-    dispatch path it uses. Currently exercises whichever launcher
-    Helion installs by default; the same scenarios are pinned down
-    against the static-kernel launcher in
-    ``test/test_static_launcher.py``.
+    dispatch path it uses. Each test is parametrized over
+    ``launcher=["default", "static"]`` so both paths are exercised.
     """
 
-    def test_unaligned_input_produces_correct_output(self) -> None:
+    @parametrize("launcher", ["default", "static"])
+    def test_unaligned_input_produces_correct_output(self, launcher: str) -> None:
         """An unaligned tensor (e.g. ``x[1:]`` on fp32) primed after
         an aligned call must still produce the correct numeric output:
         the launcher either falls back to Triton's full path or
         otherwise handles the new alignment cleanly."""
+        _scope_launcher(self, launcher)
 
         @helion.kernel(
             static_shapes=True,
@@ -1287,15 +1316,19 @@ class TestLauncher(TestCase):
         self.assertNotEqual(unaligned.data_ptr() % 16, 0)
 
         add(aligned, aligned)
-        torch.cuda.synchronize()
+        synchronize_device()
         out = add(unaligned, unaligned)
-        torch.cuda.synchronize()
+        synchronize_device()
         torch.testing.assert_close(out, unaligned + unaligned)
 
-    def test_unaligned_writes_to_user_out_arg_land_on_original(self) -> None:
+    @parametrize("launcher", ["default", "static"])
+    def test_unaligned_writes_to_user_out_arg_land_on_original(
+        self, launcher: str
+    ) -> None:
         """If the kernel writes to an unaligned user-supplied output
         buffer, those writes must land on the user's tensor (not on
         a clone)."""
+        _scope_launcher(self, launcher)
 
         @helion.kernel(
             static_shapes=True,
@@ -1316,7 +1349,7 @@ class TestLauncher(TestCase):
         # Prime with aligned slices, then call with only ``out``
         # unaligned so the test isolates the write-to-unaligned case.
         add_write_out(x_aligned, y_aligned, base_out[:n])
-        torch.cuda.synchronize()
+        synchronize_device()
 
         out_unaligned = base_out[1 : n + 1]
         self.assertEqual(x_aligned.data_ptr() % 16, 0)
@@ -1324,17 +1357,19 @@ class TestLauncher(TestCase):
         self.assertNotEqual(out_unaligned.data_ptr() % 16, 0)
         out_unaligned.fill_(0.0)
         add_write_out(x_aligned, y_aligned, out_unaligned)
-        torch.cuda.synchronize()
+        synchronize_device()
         torch.testing.assert_close(out_unaligned, x_aligned + y_aligned)
 
     @skipIfRefEager(
         "Inspects the bound kernel's Triton JITFunction, which doesn't "
         "exist in ref-eager mode"
     )
-    def test_used_global_vals_mutation_raises(self) -> None:
+    @parametrize("launcher", ["default", "static"])
+    def test_used_global_vals_mutation_raises(self, launcher: str) -> None:
         """Mutating a tracked global (e.g. a ``_BLOCK_SIZE_*``
         constexpr captured via ``used_global_vals``) between calls
         must trigger ``RuntimeError`` from Triton's own guard."""
+        _scope_launcher(self, launcher)
 
         @helion.kernel(
             static_shapes=True,
@@ -1348,7 +1383,7 @@ class TestLauncher(TestCase):
 
         x = torch.randn(1024, device=DEVICE, dtype=torch.float32)
         add(x, x)
-        torch.cuda.synchronize()
+        synchronize_device()
 
         from triton.runtime.jit import JITFunction
 
@@ -1366,11 +1401,12 @@ class TestLauncher(TestCase):
         try:
             with self.assertRaises(RuntimeError):
                 add(x, x)
-                torch.cuda.synchronize()
+                synchronize_device()
         finally:
             gdict[name] = original
 
-    def test_correct_result_on_each_cuda_device(self) -> None:
+    @parametrize("launcher", ["default", "static"])
+    def test_correct_result_on_each_cuda_device(self, launcher: str) -> None:
         """The same kernel called on ``cuda:0`` then ``cuda:1`` must
         yield correct numeric results landing on each device. Whether
         the two calls share a ``BoundKernel`` (cache key collapses on
@@ -1386,6 +1422,7 @@ class TestLauncher(TestCase):
         non-default device."""
         if torch.cuda.device_count() < 2:
             self.skipTest("requires >= 2 CUDA devices")
+        _scope_launcher(self, launcher)
 
         @helion.kernel(
             static_shapes=True,
