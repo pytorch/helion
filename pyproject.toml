@@ -39,11 +39,7 @@ dev = [
 # .github/ci_commit_pins/nvidia_cutlass_dsl.txt is the single source of
 # truth — keep these extras in sync with that pin, and prefer
 # scripts/install_cute.sh in CI/dev environments.
-cute-cu12 = [
-    "nvidia-cutlass-dsl==4.5.2",
-    "apache-tvm-ffi",
-]
-cute-cu13 = [
+cute = [
     "nvidia-cutlass-dsl[cu13]==4.5.2",
     "apache-tvm-ffi",
 ]
