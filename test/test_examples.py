@@ -1029,7 +1029,6 @@ class TestExamples(RefEagerTestBase, TestCase):
             mod.jagged_dense_bmm_reference(*args),
         )
 
-    @xfailIfPallasTpu("tensor-derived if-predicates not supported")
     @skipIfRefEager("Test has skip_accuracy=True and doesn't call assert_close")
     def test_moe_matmul_ogs(self):
         mod = import_path(EXAMPLES_DIR / "moe_matmul_ogs.py")
