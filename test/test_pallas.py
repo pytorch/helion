@@ -637,6 +637,27 @@ class TestPallas(TestCase):
         torch.testing.assert_close(result, expected)
         self.assertIn("astype(jnp.int32)", code)
 
+    def test_indirect_gather_with_tiled_dim(self) -> None:
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def pallas_indirect_gather_with_tiled_dim(
+            values: torch.Tensor, indices: torch.Tensor
+        ) -> torch.Tensor:
+            out = torch.empty([indices.size(0), values.size(1)], device=values.device)
+            for tile_m, tile_n in hl.tile(out.size()):
+                out[tile_m, tile_n] = values[indices[tile_m], tile_n]
+            return out
+
+        values = torch.randn(16, 8, device=DEVICE, dtype=torch.float32)
+        indices = torch.randperm(16, device=DEVICE).to(torch.int32)
+        code, result = code_and_output(
+            pallas_indirect_gather_with_tiled_dim,
+            (values, indices),
+            block_sizes=[4, 4],
+        )
+
+        torch.testing.assert_close(result, values[indices.to(torch.int64), :])
+        self.assertIn("values[:,", code)
+
     def test_inplace_add(self) -> None:
         x = torch.randn(1024, device=DEVICE, dtype=torch.float32)
         y = torch.randn(1024, device=DEVICE, dtype=torch.float32)
