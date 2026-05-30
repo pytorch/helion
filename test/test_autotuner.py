@@ -2845,6 +2845,399 @@ class TestAutotuneRandomSeed(RefEagerTestDisabled, TestCase):
         self.assertNotEqual(first, second)
 
 
+class TestAutotuneBestOfKSettings(TestCase):
+    """Settings-only coverage for ``autotune_best_of_k`` (no GPU/backend
+    dependency)."""
+
+    def test_default_is_one(self) -> None:
+        with without_env_var("HELION_AUTOTUNE_BEST_OF_K"):
+            self.assertEqual(helion.Settings().autotune_best_of_k, 1)
+
+    def test_env_var_override(self) -> None:
+        with patch.dict(os.environ, {"HELION_AUTOTUNE_BEST_OF_K": "5"}, clear=False):
+            self.assertEqual(helion.Settings().autotune_best_of_k, 5)
+
+    def test_setting_override(self) -> None:
+        self.assertEqual(helion.Settings(autotune_best_of_k=3).autotune_best_of_k, 3)
+
+    def test_k_zero_rejected(self) -> None:
+        with self.assertRaisesRegex(ValueError, r"autotune_best_of_k must be >= 1"):
+            helion.Settings(autotune_best_of_k=0)
+
+    def test_k_negative_rejected(self) -> None:
+        with self.assertRaisesRegex(ValueError, r"autotune_best_of_k must be >= 1"):
+            helion.Settings(autotune_best_of_k=-3)
+
+
+@onlyBackends(["triton"])
+class TestAutotuneBestOfK(RefEagerTestDisabled, TestCase):
+    """Best-of-K multi-seed autotune selection — cache key + K-loop coverage.
+
+    Covers:
+      - K = 1 leaves the cache hash byte-identical with the pre-feature
+        repr (no field appended to the dataclass repr).
+      - K > 1 differentiates the cache hash structurally; the K value
+        appears as a field on the key dataclass, not concatenated into
+        ``extra_cache_key``.
+      - K > 1 with no ``_autotuner_factory`` wired raises a clear error.
+      - The K-loop runs K trials with deterministic per-trial seeds,
+        and the winner is picked by the **final rebench** (not the
+        per-trial ``best_perf_so_far`` low-water mark).
+      - The autotuner reference on the cache is restored to the
+        original after the loop.
+    """
+
+    def test_cache_key_byte_identical_when_k_is_one(self) -> None:
+        """K=1 cache hash must match the bytes produced by the original
+        ``LooseAutotuneCacheKey`` repr (before ``best_of_k`` was added)."""
+        from helion.autotuner.base_cache import LooseAutotuneCacheKey
+
+        # Build a key with K=1 and one with K=5; the K=1 repr must equal
+        # the repr that omits ``best_of_k`` entirely.
+        common_kwargs = {
+            "specialization_key": (),
+            "extra_results": (),
+            "kernel_source_hash": "abc",
+            "hardware": "B200",
+            "runtime_name": "12.6",
+            "backend": "triton",
+            "config_spec_hash": "h1",
+            "extra_cache_key": "",
+        }
+        k1 = LooseAutotuneCacheKey(**common_kwargs, best_of_k=1)
+        k5 = LooseAutotuneCacheKey(**common_kwargs, best_of_k=5)
+        # K=1 repr matches a manually-constructed repr without best_of_k.
+        expected_k1_repr = (
+            "LooseAutotuneCacheKey("
+            "specialization_key=(), extra_results=(), "
+            "kernel_source_hash='abc', hardware='B200', "
+            "runtime_name='12.6', backend='triton', "
+            "config_spec_hash='h1', extra_cache_key='')"
+        )
+        self.assertEqual(repr(k1), expected_k1_repr)
+        # K=5 includes the field in the repr.
+        self.assertIn("best_of_k=5", repr(k5))
+        # Hashes differ structurally.
+        self.assertNotEqual(k1.stable_hash(), k5.stable_hash())
+
+    def test_cache_key_does_not_alias_extra_cache_key(self) -> None:
+        """A K=1 key with ``extra_cache_key`` carrying a literal
+        ``;best_of_k=5`` suffix must NOT collide with a K=5 key whose
+        ``extra_cache_key`` is empty — i.e. the K must be a structural
+        field, not folded into the string."""
+        from helion.autotuner.base_cache import LooseAutotuneCacheKey
+
+        k1_aliased = LooseAutotuneCacheKey(
+            specialization_key=(),
+            extra_results=(),
+            kernel_source_hash="abc",
+            hardware="B200",
+            runtime_name="12.6",
+            backend="triton",
+            config_spec_hash="h1",
+            extra_cache_key="foo;best_of_k=5",
+            best_of_k=1,
+        )
+        k5 = LooseAutotuneCacheKey(
+            specialization_key=(),
+            extra_results=(),
+            kernel_source_hash="abc",
+            hardware="B200",
+            runtime_name="12.6",
+            backend="triton",
+            config_spec_hash="h1",
+            extra_cache_key="foo",
+            best_of_k=5,
+        )
+        self.assertNotEqual(k1_aliased.stable_hash(), k5.stable_hash())
+
+    def test_best_of_k_gt_1_without_factory_raises(self) -> None:
+        """The bare ``Cache(autotuner)`` constructor must reject K>1 at
+        run time rather than silently fall back to single-trial."""
+        from helion.autotuner.local_cache import LocalAutotuneCache
+
+        @helion.kernel(autotune_best_of_k=3, autotune_log_level=0)
+        def add(a, b):
+            out = torch.empty_like(a)
+            for tile in hl.tile(out.size()):
+                out[tile] = a[tile] + b[tile]
+            return out
+
+        args = (
+            torch.randn([8, 32], device=DEVICE),
+            torch.randn([8, 32], device=DEVICE),
+        )
+        bound = add.bind(args)
+
+        # Build a cache with NO autotuner_factory wired; this models the
+        # external ``Cache(autotuner)`` constructor path.
+        class _MinimalSearch:
+            def __init__(self):
+                self.kernel = bound
+                self.settings = bound.settings
+                self.args = args
+                self.best_perf_so_far = math.inf
+                self._skip_cache = False
+
+                class _Log:
+                    def __call__(self, *a, **kw):
+                        pass
+
+                    def reset(self):
+                        pass
+
+                    def warning(self, *a, **kw):
+                        pass
+
+                self.log = _Log()
+
+            def autotune(self, *, skip_cache: bool = False):
+                return None  # never reached: K>1 must raise before this
+
+        cache = LocalAutotuneCache(_MinimalSearch())  # no autotuner_factory
+        with (
+            patch("helion.autotuner.base_cache.should_skip_cache", return_value=True),
+            self.assertRaisesRegex(
+                RuntimeError,
+                r"autotune_best_of_k > 1 requires a registered _autotuner_factory",
+            ),
+        ):
+            cache.autotune()
+
+    def test_k_loop_runs_k_trials_with_deterministic_seeds(self) -> None:
+        """The K-loop runs K trials with seeds ``base + i``."""
+        from helion.autotuner.local_cache import LocalAutotuneCache
+        from helion.runtime.config import Config
+
+        seeds_seen: list[int] = []
+        # ``block_sizes`` must be powers of two; pick four distinct values.
+        trial_configs = [Config(block_sizes=[16, 1 << (3 + i)]) for i in range(4)]
+        # Low-water perfs (per-trial best_perf_so_far) and rebench perfs
+        # disagree on the winner: low-water best is index 2, rebench
+        # best is index 3.
+        low_water_perfs = [3.0, 5.0, 1.0, 2.0]
+        rebench_perfs = [3.0, 5.0, 8.0, 2.0]
+        trial_idx = {"n": 0}
+
+        class MockTrialSearch:
+            def __init__(self, bound_kernel, args, **kwargs):
+                self.kernel = bound_kernel
+                self.settings = bound_kernel.settings
+                self.args = args
+                self.best_perf_so_far = math.inf
+                self._skip_cache = False
+
+                class _Log:
+                    def __call__(self, *a, **kw):
+                        pass
+
+                    def reset(self):
+                        pass
+
+                    def warning(self, *a, **kw):
+                        pass
+
+                self.log = _Log()
+
+            def autotune(self, *, skip_cache: bool = False):
+                i = trial_idx["n"]
+                seeds_seen.append(self.settings.autotune_random_seed)
+                self.best_perf_so_far = low_water_perfs[i]
+                cfg = trial_configs[i]
+                trial_idx["n"] += 1
+                return cfg
+
+        def mock_autotuner_fn(bound_kernel, args, **kwargs):
+            def factory():
+                return MockTrialSearch(bound_kernel, args, **kwargs)
+
+            return LocalAutotuneCache(factory(), autotuner_factory=factory)
+
+        @helion.kernel(
+            autotuner_fn=mock_autotuner_fn,
+            autotune_best_of_k=4,
+            autotune_random_seed=100,
+            autotune_log_level=0,
+        )
+        def add(a, b):
+            out = torch.empty_like(a)
+            for tile in hl.tile(out.size()):
+                out[tile] = a[tile] + b[tile]
+            return out
+
+        args = (
+            torch.randn([8, 32], device=DEVICE),
+            torch.randn([8, 32], device=DEVICE),
+        )
+        bound = add.bind(args)
+
+        # Patch the final-rebench step so we can return the desired perfs
+        # without needing a real benchmark_provider.
+        with (
+            patch("helion.autotuner.base_cache.should_skip_cache", return_value=True),
+            patch.object(
+                LocalAutotuneCache,
+                "_rebench_trial_configs",
+                lambda self, configs: rebench_perfs,
+            ),
+        ):
+            picked = bound.autotune(args)
+
+        # K trials ran.
+        self.assertEqual(trial_idx["n"], 4)
+        # Deterministic seeds: base + i.
+        self.assertEqual(seeds_seen, [100, 101, 102, 103])
+        # Winner is picked by REBENCH (index 3), not by low-water (index 2).
+        rebench_winner = rebench_perfs.index(min(rebench_perfs))
+        low_water_winner = low_water_perfs.index(min(low_water_perfs))
+        self.assertNotEqual(rebench_winner, low_water_winner)
+        self.assertEqual(picked, trial_configs[rebench_winner])
+
+    def test_k_loop_restores_autotuner_and_settings(self) -> None:
+        """After the K-loop, ``cache.autotuner`` must equal the original
+        instance, and the mutated settings must be restored to base."""
+        from helion.autotuner.local_cache import LocalAutotuneCache
+        from helion.runtime.config import Config
+
+        cfg = Config(block_sizes=[16, 32])
+
+        class MockSearch:
+            def __init__(self, bound_kernel, args, **kwargs):
+                self.kernel = bound_kernel
+                self.settings = bound_kernel.settings
+                self.args = args
+                self.best_perf_so_far = math.inf
+                self._skip_cache = False
+
+                class _Log:
+                    def __call__(self, *a, **kw):
+                        pass
+
+                    def reset(self):
+                        pass
+
+                    def warning(self, *a, **kw):
+                        pass
+
+                self.log = _Log()
+
+            def autotune(self, *, skip_cache: bool = False):
+                # Simulate the adaptive-timeout mutation that the real
+                # BaseSearch does inside _prepare()/set_adaptive_compile_timeout.
+                self.settings.autotune_compile_timeout = 5
+                self.best_perf_so_far = 1.0
+                return cfg
+
+        original_autotuner_ref = {"r": None}
+
+        def mock_autotuner_fn(bound_kernel, args, **kwargs):
+            def factory():
+                return MockSearch(bound_kernel, args, **kwargs)
+
+            inner = factory()
+            original_autotuner_ref["r"] = inner
+            return LocalAutotuneCache(inner, autotuner_factory=factory)
+
+        @helion.kernel(
+            autotuner_fn=mock_autotuner_fn,
+            autotune_best_of_k=3,
+            autotune_random_seed=100,
+            autotune_compile_timeout=60,
+            autotune_log_level=0,
+        )
+        def add(a, b):
+            out = torch.empty_like(a)
+            for tile in hl.tile(out.size()):
+                out[tile] = a[tile] + b[tile]
+            return out
+
+        args = (
+            torch.randn([8, 32], device=DEVICE),
+            torch.randn([8, 32], device=DEVICE),
+        )
+        bound = add.bind(args)
+
+        with (
+            patch("helion.autotuner.base_cache.should_skip_cache", return_value=True),
+            patch.object(
+                LocalAutotuneCache,
+                "_rebench_trial_configs",
+                lambda self, configs: [1.0] * len(configs),
+            ),
+        ):
+            captured_cache = bound.settings.autotuner_fn(bound, args)
+            self.assertIsNotNone(original_autotuner_ref["r"])
+            self.assertIs(captured_cache.autotuner, original_autotuner_ref["r"])
+            captured_cache.autotune()
+
+        # After the K-loop, the cache's ``autotuner`` reference must be
+        # restored to the original instance (no leaked trial swap).
+        self.assertIs(captured_cache.autotuner, original_autotuner_ref["r"])
+        # And the settings the autotuner mutated must be restored to base.
+        self.assertEqual(bound.settings.autotune_compile_timeout, 60)
+        self.assertEqual(bound.settings.autotune_random_seed, 100)
+
+    def test_k_one_falls_through_to_single_trial(self) -> None:
+        """With ``autotune_best_of_k=1`` the K-loop must not run; the
+        cache calls the autotuner exactly once and returns its config.
+        """
+        from helion.autotuner.local_cache import LocalAutotuneCache
+        from helion.runtime.config import Config
+
+        call_count = {"n": 0}
+        only_config = Config(block_sizes=[16, 32])
+
+        class _Log:
+            def __call__(self, *a, **kw):
+                pass
+
+            def reset(self):
+                pass
+
+            def warning(self, *a, **kw):
+                pass
+
+        class SingleTrialSearch:
+            def __init__(self, bound_kernel, args, **kwargs):
+                self.kernel = bound_kernel
+                self.settings = bound_kernel.settings
+                self.args = args
+                self.best_perf_so_far = 1.0
+                self._skip_cache = False
+                self.log = _Log()
+
+            def autotune(self, *, skip_cache: bool = False):
+                call_count["n"] += 1
+                return only_config
+
+        def mock_autotuner_fn(bound_kernel, args, **kwargs):
+            def factory():
+                return SingleTrialSearch(bound_kernel, args, **kwargs)
+
+            return LocalAutotuneCache(factory(), autotuner_factory=factory)
+
+        @helion.kernel(
+            autotuner_fn=mock_autotuner_fn,
+            autotune_best_of_k=1,
+            autotune_log_level=0,
+        )
+        def add(a, b):
+            out = torch.empty_like(a)
+            for tile in hl.tile(out.size()):
+                out[tile] = a[tile] + b[tile]
+            return out
+
+        args = (
+            torch.randn([8, 32], device=DEVICE),
+            torch.randn([8, 32], device=DEVICE),
+        )
+        bound = add.bind(args)
+        with patch("helion.autotuner.base_cache.should_skip_cache", return_value=True):
+            picked = bound.autotune(args)
+        self.assertEqual(call_count["n"], 1)
+        self.assertEqual(picked, only_config)
+
+
 @onlyBackends(["triton", "cute"])
 class TestAutotuneCacheSelection(TestCase):
     """Selection of the autotune cache via HELION_AUTOTUNE_CACHE."""

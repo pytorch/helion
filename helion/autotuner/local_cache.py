@@ -26,6 +26,7 @@ from .base_cache import StrictAutotuneCacheKey
 if TYPE_CHECKING:
     from collections.abc import Iterator
     from collections.abc import Sequence
+    from typing import Callable
 
     from .base_search import BaseSearch
 
@@ -125,8 +126,13 @@ class LocalAutotuneCache(AutotuneCacheBase):
     PyTorch. Use StrictLocalAutotuneCache to consider these properties.
     """
 
-    def __init__(self, autotuner: BaseSearch) -> None:
-        super().__init__(autotuner)
+    def __init__(
+        self,
+        autotuner: BaseSearch,
+        *,
+        autotuner_factory: Callable[[], BaseSearch] | None = None,
+    ) -> None:
+        super().__init__(autotuner, autotuner_factory=autotuner_factory)
         self.key = self._generate_key()
 
     def _generate_key(self) -> LooseAutotuneCacheKey:
@@ -189,6 +195,7 @@ class LocalAutotuneCache(AutotuneCacheBase):
             backend=self.kernel.env.backend.name,
             config_spec_hash=config_spec_hash,
             extra_cache_key=self.kernel.extra_cache_key(),
+            best_of_k=self.autotuner.settings.autotune_best_of_k,
         )
 
     def _get_local_cache_path(self) -> Path:
