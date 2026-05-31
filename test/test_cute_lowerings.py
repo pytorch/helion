@@ -973,7 +973,7 @@ class TestCuteLowerings(unittest.TestCase):
             code = cute_matmul_mma_codegen_only.bind(args).to_triton_code(config)
 
         self.assertIn("cutlass.utils.blackwell_helpers.make_trivial_tiled_mma", code)
-        self.assertIn("cute.nvgpu.tcgen05.OperandMajorMode.MN", code)
+        self.assertIn("cute.nvgpu.OperandMajorMode.MN", code)
         self.assertIn(".make_fragment_B(", code)
         self.assertIn("cute.gemm(", code)
         self.assertIn(
@@ -1028,7 +1028,7 @@ class TestCuteLowerings(unittest.TestCase):
         self.assertGreaterEqual(config.config["block_sizes"][1], 8)
         self.assertLessEqual(config.config["block_sizes"][1], 128)
         self.assertIn("cutlass.utils.blackwell_helpers.make_trivial_tiled_mma", code)
-        self.assertIn("cute.nvgpu.tcgen05.OperandMajorMode.MN", code)
+        self.assertIn("cute.nvgpu.OperandMajorMode.MN", code)
         self.assertIn(".make_fragment_B(", code)
         self.assertIn("cute.gemm(", code)
         self.assertIn(
@@ -6402,7 +6402,7 @@ class TestCuteLowerings(unittest.TestCase):
         # only when the lowering selects the tcgen05 path (the
         # universal lane-loop fallback uses scalar ops, no tcgen05
         # symbols).
-        self.assertIn("cute.nvgpu.tcgen05.OperandMajorMode", code)
+        self.assertIn("cute.nvgpu.OperandMajorMode", code)
         # PipelineTmaUmma marker: pins the role-local TMA + UMMA
         # pipeline pairing, present only on the tcgen05 path.
         self.assertIn("PipelineTmaUmma", code)
@@ -18003,7 +18003,7 @@ class TestCuteTcgen05AuxPipelineCycle2a(unittest.TestCase):
         self.assertNotIn("'kind': 'tcgen05_d_tma'", code)
         self.assertNotIn("cutlass.pipeline.PipelineTmaStore.create", code)
         self.assertNotIn("cute.copy(tcgen05_tma_store_atom", code)
-        self.assertIn("cute.nvgpu.CopyUniversalOp()", code)
+        self.assertIn("cute.nvgpu.CopyR2GOp()", code)
 
     def _expected_c_input_warp_id(self, config: helion.Config) -> int:
         """Compute the expected ``c_input_warp_id`` from the config

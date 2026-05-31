@@ -172,8 +172,9 @@ def _append_target1_ab_tma_descriptor_source(
             (
                 f"    {tiled_mma} = cutlass.utils.blackwell_helpers.make_trivial_tiled_mma("
                 f"{input_dtype}, "
-                "cute.nvgpu.tcgen05.OperandMajorMode.K, "
-                "cute.nvgpu.tcgen05.OperandMajorMode.MN, "
+                f"{input_dtype}, "
+                "cute.nvgpu.OperandMajorMode.K, "
+                "cute.nvgpu.OperandMajorMode.MN, "
                 f"{acc_dtype}, "
                 "cute.nvgpu.tcgen05.CtaGroup.TWO, "
                 f"({bm}, {bn}), "

@@ -954,7 +954,7 @@ class TestCuteBackend(TestCase):
         torch.testing.assert_close(out, expected, rtol=1e-4, atol=1e-4)
         # The fuser allocates a fragment and rewrites the consume sweep's
         # load to read from the cache.
-        self.assertIn("cute.make_fragment", code)
+        self.assertIn("cute.make_rmem_tensor", code)
         self.assertIn("_fuse_cache_0", code)
 
     def test_two_pass_load_fusion_shape_c_vec_unroll(self) -> None:
@@ -972,7 +972,7 @@ class TestCuteBackend(TestCase):
         (x,) = args
         expected = (x.float() / x.float().sum(-1, keepdim=True)).to(x.dtype)
         torch.testing.assert_close(out, expected, rtol=1e-2, atol=1e-2)
-        self.assertIn("cute.make_fragment", code)
+        self.assertIn("cute.make_rmem_tensor", code)
         self.assertIn("_fuse_cache_0", code)
 
     def test_strided_threaded_block_reduction(self) -> None:
