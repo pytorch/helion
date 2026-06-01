@@ -125,6 +125,81 @@ def tcgen05_ab_smem_bytes_per_cta(
     return ab_stages * (a_per_stage + b_per_stage)
 
 
+# Workstream A Stage 2 (cycle 90): the residual full-tile family gets a deeper
+# C-store ring (foundation for the Stage-4 store-warp split, which drains tile N
+# while the epi warps run tile N+1). The validated deeper depth is 4 — the only
+# other ``EnumFragment((2, 4))`` choice — and it fits at ab=2 under the 232 KB
+# B200 SMEM cap (256x256x128 CtaGroup.TWO bf16: 128 KB AB + 64 KB C = 192 KB).
+# ab=3 + c=4 overflows (192 KB AB + 64 KB C = 256 KB → raw ``ptxas: too much
+# shared``), so the deeper ring is admitted only behind the c-stages SMEM budget
+# gate in ``CuteTcgen05Config``.
+TCGEN05_RESIDUAL_FULL_TILE_DEEP_C_STAGES = 4
+
+
+def tcgen05_default_epilogue_tile_size(
+    bm: int,
+    bn: int,
+    *,
+    elem_width_d: int,
+    elem_width_c: int | None,
+) -> tuple[int, int]:
+    """Return the DEFAULT (auto) epilogue subtile ``(tile_m, tile_n)`` in elems.
+
+    The role-local ``Tcgen05LayoutStrategy.DEFAULT`` path sizes its epilogue
+    subtile via ``cutlass.utils.blackwell_helpers.compute_epilogue_tile_shape``
+    (``tcgen05_default_epilogue_tile_expr``), whose tile choice is the pure
+    Python ``compute_epilogue_tile_size``. The tile depends on whether the
+    epilogue reads a source-C tensor: ``compute_epilogue_tile_size`` shrinks N
+    when a C tile competes for SMEM. For a 256x256 CTA tile with 16-bit elements
+    it is ``(128, 64)`` WITH a source C (residual family, ``elem_width_c`` set)
+    but ``(128, 32)`` WITHOUT one (plain matmul, ``elem_width_c=None``) — and in
+    both cases NOT the ``(128, 32)`` EXPLICIT_EPI_TILE direct-entry (TVM-FFI)
+    tile, which is a separate codepath. Pass ``elem_width_c`` matching the
+    config's real source-C presence so the SMEM budget gate matches codegen (and
+    tracks any future CuTe tile-rule change rather than a hard-coded guess).
+    """
+    # Lazy import: ``cutlass`` is only loaded on the cute backend, while this
+    # module is imported on the general autotuner path too.
+    from cutlass.utils.blackwell_helpers import compute_epilogue_tile_size
+
+    # The role-local epilogue D/C tensors are row-major (LayoutEnum.ROW_MAJOR,
+    # see ``cute_mma.py`` ``tcgen05_c_layout``), i.e. NOT M-major.
+    tile_m, tile_n = compute_epilogue_tile_size(
+        bm,
+        bn,
+        False,
+        elem_width_d,
+        elem_width_c,
+        d_is_m_major=False,
+        c_is_m_major=False,
+    )
+    return tile_m, tile_n
+
+
+def tcgen05_c_smem_bytes_per_cta(
+    *,
+    epi_tile_m: int,
+    epi_tile_n: int,
+    dtype_bytes: int,
+    c_stages: int,
+) -> int:
+    """Return per-CTA C-store-ring SMEM bytes for a tcgen05 epilogue.
+
+    The role-local TMA-store epilogue allocates a multistage SMEM ring whose
+    per-stage cosize is ``epi_tile_m * epi_tile_n * dtype_bytes``. The autotune
+    search-space gate sums this against the AB pipeline cost to admit a deeper
+    C ring (``tcgen05_c_stages=4``) only when the combined AB+C SMEM fits the
+    B200 optin budget after the same non-AB reservation the
+    ``tcgen05_ab_stages=3`` gate uses. For the residual full-tile family
+    (256x256 CTA tile, 16-bit, DEFAULT epi tile ``(128, 64)``): each C stage is
+    128*64*2 = 16 KB, so ab=2 + c=4 = 128 KB AB + 64 KB C = 192 KB (fits the
+    232 KB cap), while ab=3 + c=4 = 192 KB AB + 64 KB C = 256 KB (overflows).
+    """
+    assert c_stages >= 1
+    assert epi_tile_m > 0 and epi_tile_n > 0 and dtype_bytes > 0
+    return c_stages * epi_tile_m * epi_tile_n * dtype_bytes
+
+
 # C-store epilogue placement knobs. Keeping these in Config makes generated-code
 # changes visible to BoundKernel's Config-keyed compile cache; most values are
 # used for diagnostics, while the output-edge + K-tail seed uses the measured

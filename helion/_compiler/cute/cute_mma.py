@@ -3693,6 +3693,13 @@ def _emit_mma_pipeline(
             # WITH_SCHEDULER and ``{0}`` under MONOLITHIC; codegen
             # body for the C-input warp is inert today.
             c_input_warp_count=tcgen05_warp_spec.c_input_warps,
+            # ``store_warp_count`` plumbs the Stage-3 store-warp slot
+            # (cycle 91, ``cute_plan.md`` §4.2) through the plan the same
+            # way. Validator restricts it to ``{0, 1}`` under WITH_SCHEDULER
+            # and ``{0}`` under MONOLITHIC; the store warp's body is inert in
+            # cycle 91 (it occupies the former padding slot, so launch
+            # accounting is unchanged), the R2S->TMA-D drain lands in Stage 4.
+            store_warp_count=tcgen05_warp_spec.store_warps,
             persistence_model=tcgen05_persistence_model_for_plan,
             cluster_n=tcgen05_cluster_n,
             l2_swizzle_size=tcgen05_l2_swizzle_size_value,
@@ -3740,13 +3747,17 @@ def _emit_mma_pipeline(
         #     ``_fix_tcgen05_ab_stages_three_search_config``).
         # The predicate mirrors the productive-body aux-pipeline
         # allocation gate at ``_emit_mma_pipeline`` below
-        # (``has_c_input_warp AND aux_tensor_descriptors AND
-        # aux_single_store_value``). When the multi-store
-        # fan-out gate closes the productive body, the aux SMEM
-        # ring + ``c_pipeline_aux`` are NOT allocated and the
-        # kernel falls back to GMEM-aux reads with no extra
-        # SMEM cost, so the rejection must NOT fire — fan-out
-        # ``ab=3 + c_input=1`` paths are legal and pinned by
+        # (``has_aux_producer_warp AND aux_tensor_descriptors AND
+        # aux_single_store_value``), where the aux producer is the
+        # C-input warp (SIMT or TMA) OR — under the cycle-94 merge —
+        # the store warp (TMA only). The store-warp TMA aux ring has
+        # the SAME SMEM cost as the C-input TMA ring, so ab=3 overshoots
+        # the cap identically and must be rejected for it too. When the
+        # multi-store fan-out gate closes the productive body, the aux
+        # SMEM ring + ``c_pipeline_aux`` are NOT allocated and the
+        # kernel falls back to GMEM-aux reads with no extra SMEM cost,
+        # so the rejection must NOT fire — fan-out ``ab=3 + c_input=1``
+        # paths are legal and pinned by
         # ``test_aux_pipeline_ab_stages_3_with_c_input_fanout_not_rejected``.
         c_input_aux_tensor_descriptors = (
             tcgen05_matmul_plan.c_input_aux_tensor_descriptors
@@ -3754,8 +3765,14 @@ def _emit_mma_pipeline(
         aux_single_store_value = (
             len({d.store_value_node for d in c_input_aux_tensor_descriptors}) <= 1
         )
+        ab_reject_aux_tma_requested = (
+            df.config.get(TCGEN05_AUX_LOAD_MODE_CONFIG_KEY) == TCGEN05_AUX_LOAD_MODE_TMA
+        )
+        ab_reject_has_aux_producer_warp = tcgen05_matmul_plan.has_c_input_warp or (
+            tcgen05_matmul_plan.has_store_warp and ab_reject_aux_tma_requested
+        )
         if (
-            tcgen05_matmul_plan.has_c_input_warp
+            ab_reject_has_aux_producer_warp
             and c_input_aux_tensor_descriptors
             and aux_single_store_value
             and tcgen05_matmul_plan.ab_stage_count >= 3
@@ -3763,8 +3780,11 @@ def _emit_mma_pipeline(
             raise exc.BackendUnsupported(
                 "cute",
                 "tcgen05 ``tcgen05_ab_stages=3`` is incompatible "
-                "with the productive C-input warp "
-                "(``tcgen05_warp_spec_c_input_warps=1`` + "
+                "with a productive aux producer warp "
+                "(``tcgen05_warp_spec_c_input_warps=1``, or the "
+                "cycle-94 store-warp merge "
+                "``tcgen05_warp_spec_store_warps=1`` + "
+                "``tcgen05_aux_load_mode=tma``, + "
                 "non-empty aux tensors from the epilogue chain): "
                 "the aux SMEM ring + AB pipeline together "
                 "overshoot the 232 KB B200 SMEM cap at every "
@@ -3772,9 +3792,8 @@ def _emit_mma_pipeline(
                 "``(bm=bn=256, bk=128, cluster_m=2)`` shape uses "
                 "263 KB vs 232 KB cap). Drop to "
                 "``tcgen05_ab_stages=2`` for residual epilogues "
-                "with ``tcgen05_warp_spec_c_input_warps=1``, or "
-                "drop ``tcgen05_warp_spec_c_input_warps=0`` to "
-                "keep ``tcgen05_ab_stages=3``. See "
+                "with an aux producer warp, or drop the aux "
+                "producer warp to keep ``tcgen05_ab_stages=3``. See "
                 "``cute_plan.md`` §1.3 / §7.5.3.2.",
             )
         df.cute_state.block_shape = candidate_block_shape
@@ -4208,6 +4227,15 @@ def _emit_mma_pipeline(
                     if c_input_is_sched_consumer
                     else tcgen05_matmul_plan.c_input_warp_count
                 )
+                # Workstream A Stage 4 (cycle 93): the store warp now runs a
+                # PRODUCTIVE role-local body — it joins the (widened) epilogue
+                # role-local while and consumes the scheduler broadcast to read
+                # the per-tile coordinates it needs for the shared descriptor
+                # setup. It is therefore a REAL sched consumer, so the cycle-91
+                # ``- store_warp_count`` subtraction (which excluded the inert
+                # Stage-3 warp) is REMOVED: the count goes back to including the
+                # store warp. The store warp is a sched consumer + the C-store
+                # ring consumer; it is NOT an acc-pipeline or AB consumer.
             )
             if tcgen05_matmul_plan.is_clc_persistent and tcgen05_sched_cluster_size > 1:
                 tcgen05_sched_consumer_arrive_count = (
@@ -4288,8 +4316,27 @@ def _emit_mma_pipeline(
                 desc.store_value_node for desc in c_input_aux_tensor_descriptors
             }
             aux_single_store_value = len(aux_store_value_nodes) <= 1
+            # Workstream A Stage 5 (cycle 94, the merge): the aux residual load
+            # runs on a dedicated PRODUCER warp. The C-input warp is the producer
+            # in BOTH the SIMT (cooperative ld/st) and the TMA (bulk copy) aux
+            # paths. The merge lets the STORE warp (id 7, 120-reg, idle between
+            # the early aux load and the late TMA-D drain) be that producer — but
+            # ONLY for the TMA path: the merge injects the store warp's aux body
+            # as a TMA bulk producer into the epilogue role-local while. There is
+            # no SIMT store-warp producer body, and the SIMT producer arrive
+            # count is hardcoded to ``c_input_warp_count * 32`` (= 0 with no
+            # C-input warp), which would pair a 0-thread producer group with a
+            # 32-thread SIMT copy and wedge the consumer. So ``store_warps=1 +
+            # SIMT aux`` must fall back to the direct-GMEM aux path (the producer
+            # gate stays closed), exactly as before this merge landed.
+            store_warp_is_aux_producer = (
+                tcgen05_matmul_plan.has_store_warp and tcgen05_aux_tma_requested
+            )
+            has_aux_producer_warp = (
+                tcgen05_matmul_plan.has_c_input_warp or store_warp_is_aux_producer
+            )
             aux_productive_body_gate_open = (
-                tcgen05_matmul_plan.has_c_input_warp
+                has_aux_producer_warp
                 and c_input_aux_tensor_descriptors
                 and aux_single_store_value
             )
@@ -4298,10 +4345,11 @@ def _emit_mma_pipeline(
                 and all_aux_tensor_descriptors
                 and not aux_productive_body_gate_open
             ):
-                if not tcgen05_matmul_plan.has_c_input_warp:
+                if not has_aux_producer_warp:
                     reason = (
-                        "requires the productive C-input warp "
-                        "(``tcgen05_warp_spec_c_input_warps=1``)"
+                        "requires a productive aux producer warp "
+                        "(``tcgen05_warp_spec_c_input_warps=1`` or "
+                        "``tcgen05_warp_spec_store_warps=1``)"
                     )
                 elif not c_input_aux_tensor_descriptors:
                     reason = (
@@ -4413,11 +4461,16 @@ def _emit_mma_pipeline(
                         # tcgen05_ab_stages=3`` (cycle 48 measured
                         # 263 KB used at bk=128; bk=64 fits).
                         tile_shape_expr=tcgen05_plan.epi_tile,
-                        # Single C-input warp = 32 lanes (validator
-                        # pins ``c_input_warp_count`` to ``{0, 1}``
-                        # under WITH_SCHEDULER); all 32 lanes
-                        # participate in the producer-side
-                        # cooperative copy.
+                        # SIMT producer thread count. A single C-input warp = 32
+                        # lanes (validator pins ``c_input_warp_count`` to
+                        # ``{0, 1}`` under WITH_SCHEDULER); all 32 lanes do the
+                        # cooperative SIMT copy. This is only consumed on the
+                        # SIMT aux path; the store-warp merge is TMA-only (the
+                        # ``store_warp_is_aux_producer`` gate above requires
+                        # ``aux_load_mode=tma``), where the producer group is the
+                        # 1-thread ``PipelineTmaAsync`` group and this SIMT count
+                        # is unused — so ``c_input_warp_count * 32`` (= 0 in the
+                        # merge) is correct and never reaches the SIMT branch.
                         c_input_warp_thread_count=(
                             tcgen05_matmul_plan.c_input_warp_count * 32
                         ),

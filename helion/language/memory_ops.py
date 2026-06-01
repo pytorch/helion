@@ -2587,6 +2587,32 @@ def _codegen_cute_store_tcgen05_tile(
     c_pipeline_producer_group = df.new_var("tcgen05_c_pipeline_producer_group")
     c_pipeline = df.new_var("tcgen05_c_pipeline")
     subtile_count = df.new_var("tcgen05_subtile_count")
+    # Workstream A Stage 4 (cycle 93, Path B): the C-store producer->consumer
+    # edge over the C-ring SMEM (``tRS_sD``, depth ``c_stage_count``). Producer
+    # = the 4 epi warps (arrive after R2S + ``fence_view_async_shared``);
+    # consumer = the single store warp (waits, issues the TMA-D, releases the
+    # SMEM stage). Replaces the second ``epilog_sync_barrier`` (R2S-visible)
+    # CTA-wide barrier with a cheaper cross-warp pipeline edge that lets the
+    # epi warps proceed to the next subtile while the store warp drains.
+    c_store_edge_barriers = df.new_var("tcgen05_c_store_edge_barriers")
+    c_store_edge_producer_group = df.new_var("tcgen05_c_store_edge_producer_group")
+    c_store_edge_consumer_group = df.new_var("tcgen05_c_store_edge_consumer_group")
+    c_store_edge = df.new_var("tcgen05_c_store_edge")
+    c_store_edge_producer_state = df.new_var("tcgen05_c_store_edge_producer_state")
+    c_store_edge_consumer_state = df.new_var("tcgen05_c_store_edge_consumer_state")
+    # Separate consumer state for the LAGGED release. The store warp's TMA-D is
+    # an async bulk copy that reads the C-ring SMEM stage; the stage may not be
+    # reused (epi R2S overwrite) until that read completes. ``c_pipeline``
+    # (PipelineTmaStore) tracks store completion via ``cp_async_bulk_wait_group``
+    # (read=True), which after committing store i and waiting drains every store
+    # except the ``c_stages - 1`` most recent. So the store warp releases the
+    # C-ring stage from ``c_stages - 1`` subtiles ago (provably drained), lagging
+    # the consumer-wait by ``c_stages - 1``. This leaves exactly one free stage
+    # (edge depth ``c_stages``), giving the ~1-subtile store/T2R overlap the
+    # acc_stages=2 bound permits. The first ``c_stages - 1`` releases are
+    # suppressed (no drained stage yet); the trailing stages release naturally
+    # in subsequent tiles as the global subtile index advances.
+    c_store_edge_release_state = df.new_var("tcgen05_c_store_edge_release_state")
     epi_warp_ids = ", ".join(
         f"cutlass.Int32({i})" for i in range(tcgen05_value.epi_warp_count)
     )
@@ -2700,6 +2726,18 @@ def _codegen_cute_store_tcgen05_tile(
     # GMEM path byte-identical.
     aux_matmul_plan = df.cute_state.matmul_plan
     aux_pipeline_plan_obj = df.cute_state.aux_pipeline_plan
+    # Workstream A Stage 4 (cycle 93, Path B): when the plan carries a store
+    # warp, the per-subtile R2S->TMA-D tail is split by warp role and the
+    # second epilogue barrier is replaced by the C-store pipeline edge. The
+    # store warp drains the TMA-D so the 4 epi warps proceed to the next
+    # subtile's T2R. ``store_warps=0`` keeps the original fused tail unchanged
+    # (the production path; byte-identical codegen).
+    has_store_warp = aux_matmul_plan is not None and aux_matmul_plan.has_store_warp
+    store_warp_predicate = (
+        f"{tcgen05_value.warp_idx} == cutlass.Int32({aux_matmul_plan.store_warp_id})"
+        if aux_matmul_plan is not None and has_store_warp
+        else ""
+    )
     # Match each store-side record to its descriptor by
     # ``load_node`` FX-node identity rather than positional
     # index. The descriptor walker dedups by ``store_value_node``
@@ -2738,10 +2776,27 @@ def _codegen_cute_store_tcgen05_tile(
     aux_has_staged_steps = any(
         ring_idx is not None for ring_idx in aux_ring_index_by_step
     )
+    # Workstream A Stage 5 (cycle 94, the merge): the aux SMEM ring producer is
+    # the C-input warp normally (SIMT or TMA), or the store warp under the merge
+    # — but the store warp is TMA-ONLY (there is no SIMT store-warp producer;
+    # ``store_warps=1 + SIMT aux`` falls back to direct-GMEM aux). The epi-warp
+    # consumer reads the staged ring whenever a producer is present. The
+    # ``aux_pipeline_plan_obj is not None`` term already closes this gate for
+    # ``store_warps=1 + SIMT`` (``cute_mma`` never allocates the plan there);
+    # the explicit ``use_tma_load`` term on the store-warp branch makes the
+    # TMA-only requirement local and defensive.
+    aux_producer_warp_present = aux_matmul_plan is not None and (
+        aux_matmul_plan.has_c_input_warp
+        or (
+            aux_matmul_plan.has_store_warp
+            and aux_pipeline_plan_obj is not None
+            and aux_pipeline_plan_obj.use_tma_load
+        )
+    )
     use_aux_smem_source = (
         aux_step_records
         and aux_matmul_plan is not None
-        and aux_matmul_plan.has_c_input_warp
+        and aux_producer_warp_present
         and bool(aux_matmul_plan.c_input_aux_tensor_descriptors)
         and aux_pipeline_plan_obj is not None
         and aux_has_staged_steps
@@ -3841,12 +3896,64 @@ def _codegen_cute_store_tcgen05_tile(
             )
         ),
     ]
+    # Workstream A Stage 4 (cycle 93, Path B): C-store producer->consumer edge.
+    # Mirrors ``_emit_tcgen05_aux_pipeline_setup``'s SIMT PipelineAsync shape.
+    # producer_arrive_count = ``epi_warp_count`` (per-warp: each of the 4 epi
+    # warps arrives once via ``elect_one`` after R2S + fence); consumer_arrive
+    # _count = 1 (the single store warp); num_stages = ``c_stage_count`` so the
+    # store can lag up to ``c_stages`` subtiles behind the epi warps' T2R/R2S.
+    # Producer (epi ``producer_commit``) AND consumer (store ``consumer_wait`` /
+    # ``consumer_release``) BOTH land in this commit so the ring is never a
+    # one-sided handshake that wedges only after wrapping the depth (the
+    # cycle-2a partial-handshake lesson).
+    c_store_edge_setup = (
+        [
+            (
+                f"{c_store_edge_barriers} = cute.arch.alloc_smem("
+                f"cutlass.Int64, cutlass.Int32({tcgen05_value.c_stage_count * 2}))"
+            ),
+            (
+                f"{c_store_edge_producer_group} = cutlass.pipeline.CooperativeGroup("
+                f"cutlass.pipeline.Agent.Thread, "
+                f"cutlass.Int32({tcgen05_value.epi_warp_count}))"
+            ),
+            (
+                f"{c_store_edge_consumer_group} = cutlass.pipeline.CooperativeGroup("
+                "cutlass.pipeline.Agent.Thread, cutlass.Int32(1))"
+            ),
+            (
+                f"{c_store_edge} = cutlass.pipeline.PipelineAsync.create("
+                f"num_stages={tcgen05_value.c_stage_count}, "
+                f"producer_group={c_store_edge_producer_group}, "
+                f"consumer_group={c_store_edge_consumer_group}, "
+                f"barrier_storage={c_store_edge_barriers})"
+            ),
+            (
+                f"{c_store_edge_producer_state} = cutlass.pipeline.make_pipeline_state("
+                f"cutlass.pipeline.PipelineUserType.Producer, "
+                f"{tcgen05_value.c_stage_count})"
+            ),
+            (
+                f"{c_store_edge_consumer_state} = cutlass.pipeline.make_pipeline_state("
+                f"cutlass.pipeline.PipelineUserType.Consumer, "
+                f"{tcgen05_value.c_stage_count})"
+            ),
+            (
+                f"{c_store_edge_release_state} = cutlass.pipeline.make_pipeline_state("
+                f"cutlass.pipeline.PipelineUserType.Consumer, "
+                f"{tcgen05_value.c_stage_count})"
+            ),
+        ]
+        if has_store_warp
+        else []
+    )
     tma_store_pipeline_setup = [
         (
             f"{epilog_sync_barrier} = cutlass.pipeline.NamedBarrier("
             f"barrier_id=cutlass.Int32({tcgen05_value.epilog_sync_barrier_id}), "
             f"num_threads=cutlass.Int32({tcgen05_value.epi_warp_count * 32}))"
         ),
+        *c_store_edge_setup,
         (
             f"{c_pipeline_producer_group} = cutlass.pipeline.CooperativeGroup("
             f"cutlass.pipeline.Agent.Thread, cutlass.Int32({tcgen05_value.epi_warp_count * 32}))"
@@ -3909,6 +4016,41 @@ def _codegen_cute_store_tcgen05_tile(
             "tcgen05_strategy='pure_matmul_role_lifecycle' does not support "
             f"{TCGEN05_EPILOGUE_LAYOUT_CONFIG_KEY}={epilogue_layout!r}",
         )
+    if tcgen05_pure_matmul_object is not None and has_store_warp:
+        # Workstream A Stage 4 (cycle 93) wires the store-warp tail split into
+        # the non-pure ROLE_LOCAL_WITH_SCHEDULER path only. The pure-matmul
+        # role-lifecycle object renders its own tail (``render_tma_store_tail
+        # _region``) and is gated out here so a store warp never silently lands
+        # on the unsplit pure tail (a correctness break). Stage 5 may wire it.
+        raise exc.BackendUnsupported(
+            "cute",
+            "tcgen05_strategy='pure_matmul_role_lifecycle' does not support "
+            "tcgen05_warp_spec_store_warps>0 (Workstream A Stage 4 wires the "
+            "store-warp epilogue split into the non-pure WITH_SCHEDULER path)",
+        )
+    # The diagnostic split / module-helper epilogue layouts route the
+    # per-subtile tail through helpers that emit ONLY the ``if epi_active``
+    # half under ``has_store_warp`` (and ``module_helper_store_tail`` keeps the
+    # OLD two-barrier warp-0 ``c_pipeline`` tail while the main path suppressed
+    # the matching acquires) — so the C-store edge would have no consumer and
+    # wedge once the ring wraps, or the ``c_pipeline`` commit/acquire counts
+    # mismatch. They are diagnostic-only source-boundary layouts; production
+    # uses the DEFAULT layout, so reject the combination loudly (same guard
+    # class as the pure-matmul tail above). ``split_first_t2r`` routes through
+    # ``tma_store_subtile_body`` and IS handled by the Stage-4 split, so it is
+    # intentionally excluded.
+    if has_store_warp and (
+        diagnose_split_acc_t2r_store_tail
+        or diagnose_module_helper_acc_t2r
+        or diagnose_module_helper_store_tail
+    ):
+        raise exc.BackendUnsupported(
+            "cute",
+            f"{TCGEN05_EPILOGUE_LAYOUT_CONFIG_KEY}={epilogue_layout!r} does not "
+            "support tcgen05_warp_spec_store_warps>0 (the diagnostic split / "
+            "module-helper epilogue layouts do not emit the store-warp tail "
+            "half of the Workstream A Stage 4 split; use the default layout)",
+        )
     if tcgen05_pure_matmul_object is not None:
         pure_c_store_pipeline = Tcgen05TmaStorePipelineParams(
             c_pipeline=c_pipeline,
@@ -3948,19 +4090,34 @@ def _codegen_cute_store_tcgen05_tile(
             )
         )
     else:
+        # Workstream A Stage 4 (cycle 93, Path B): the ``c_pipeline``
+        # (PipelineTmaStore) producer lifecycle is per-warp — its
+        # ``producer_acquire`` is a ``cp_async_bulk_wait_group`` and its
+        # ``producer_commit`` a ``cp_async_bulk_commit_group``, both scoped to
+        # the warp that ISSUES the TMA-D bulk copy. So when a store warp owns
+        # the TMA-D, the entire ``c_pipeline`` lifecycle (acquire + commit +
+        # tail) moves onto the store warp: its ``wait_group`` reuse guard lives
+        # in the store-warp tail (after the TMA-D + commit, gating the lagged
+        # release), the epi warps' historical store-prefix acquire lines are
+        # dropped (the C-ring is gated by the cross-warp C-store edge instead),
+        # and ``producer_tail`` (final ``wait_group(0)``) stays on the store warp.
+        c_pipeline_owner_predicate = (
+            store_warp_predicate
+            if has_store_warp
+            else f"{tcgen05_value.warp_idx} == cutlass.Int32(0)"
+        )
+        first_acquire_role_gate = (
+            f"{tcgen05_lifecycle.epi_active} and "
+            f"{tcgen05_value.warp_idx} == cutlass.Int32(0)"
+        )
         tma_store_pipeline_tail = (
-            f"if {tcgen05_value.warp_idx} == cutlass.Int32(0):\n"
-            f"    {c_pipeline}.producer_tail()"
+            f"if {c_pipeline_owner_predicate}:\n    {c_pipeline}.producer_tail()"
         )
         tma_store_first_subtile_acquire = (
             []
-            if diagnose_first_c_acquire_in_loop
+            if (diagnose_first_c_acquire_in_loop or has_store_warp)
             else [
-                (
-                    f"if {tcgen05_lifecycle.epi_active} and "
-                    f"{tcgen05_value.warp_idx} == cutlass.Int32(0):\n"
-                    f"    {c_pipeline}.producer_acquire()"
-                )
+                (f"if {first_acquire_role_gate}:\n    {c_pipeline}.producer_acquire()")
             ]
         )
         tma_store_loop_first_subtile_acquire = (
@@ -3969,12 +4126,12 @@ def _codegen_cute_store_tcgen05_tile(
                 f"{tcgen05_value.warp_idx} == cutlass.Int32(0):\n"
                 f"            {c_pipeline}.producer_acquire()\n"
             )
-            if diagnose_first_c_acquire_in_loop
+            if (diagnose_first_c_acquire_in_loop and not has_store_warp)
             else ""
         )
         tma_store_loop_later_subtile_acquire = (
             ""
-            if diagnose_later_c_acquire_before_barrier
+            if (diagnose_later_c_acquire_before_barrier or has_store_warp)
             else (
                 f"        if _tcgen05_subtile != 0 and "
                 f"{tcgen05_value.warp_idx} == cutlass.Int32(0):\n"
@@ -3987,7 +4144,7 @@ def _codegen_cute_store_tcgen05_tile(
                 f"{tcgen05_value.warp_idx} == cutlass.Int32(0):\n"
                 f"            {c_pipeline}.producer_acquire()\n"
             )
-            if diagnose_later_c_acquire_before_barrier
+            if (diagnose_later_c_acquire_before_barrier and not has_store_warp)
             else ""
         )
     if diagnose_split_epilogue_layout:
@@ -4097,6 +4254,9 @@ def _codegen_cute_store_tcgen05_tile(
     tcgen05_acc_consumer_state = tcgen05_lifecycle.acc_consumer_state
     tcgen05_warp_idx = tcgen05_value.warp_idx
     tcgen05_tma_store_atom = tcgen05_value.tma_store_atom
+    # Locals for the store-warp tail closure (Pyrefly drops the non-None
+    # tcgen05_value narrowing inside nested source formatters; see above).
+    tcgen05_role_local_tile_counter = tcgen05_value.role_local_tile_counter
 
     def tma_store_acc_t2r_region_body(
         *, acc_wait: str, allow_aux_chain: bool = False
@@ -4174,6 +4334,29 @@ def _codegen_cute_store_tcgen05_tile(
                     late_later_subtile_acquire=late_later_subtile_acquire
                 )
             )
+        if has_store_warp:
+            # Path B epi-warp tail (inside ``if epi_active:``): acquire the
+            # C-store edge stage (wait until the store warp released it, i.e.
+            # the prior TMA-D reading this physical C-ring slot completed),
+            # barrier-1 (intra-epi convergence), R2S, fence, then a C-store-edge
+            # PRODUCER commit in place of the second CTA barrier. The TMA-D +
+            # ``c_pipeline`` lifecycle move to the store warp's tail
+            # (``tma_store_store_warp_tail_region``). The epi warps drop
+            # straight into the next subtile's T2R after committing — that is
+            # the store/T2R overlap. The producer cooperative group is per-warp
+            # (count ``epi_warp_count``), so ``producer_acquire`` is a full-warp
+            # wait on every epi warp and ``producer_commit`` arrives once per
+            # warp via ``elect_one``.
+            return (
+                f"        {c_store_edge}.producer_acquire({c_store_edge_producer_state})\n"
+                f"        {epilog_sync_barrier}.arrive_and_wait()\n"
+                f"        {c_buffer} = ({tma_c_buffer_expr}) % cutlass.Int32({tcgen05_c_stage_count})\n"
+                f"        cute.copy({tiled_copy_r2s}, {trs_rd}, {trs_sd}[(None, None, None, {c_buffer})])\n"
+                f"        cute.arch.fence_view_async_shared()\n"
+                f"        with cute.arch.elect_one():\n"
+                f"            {c_store_edge}.producer_commit({c_store_edge_producer_state})\n"
+                f"        {c_store_edge_producer_state}.advance()\n"
+            )
         return (
             f"{late_later_subtile_acquire}"
             f"        {epilog_sync_barrier}.arrive_and_wait()\n"
@@ -4184,6 +4367,45 @@ def _codegen_cute_store_tcgen05_tile(
             f"        if {tcgen05_warp_idx} == cutlass.Int32(0):\n"
             f"            cute.copy({tcgen05_tma_store_atom}, {bsg_sd}[(None, {c_buffer})], {bsg_gd}[(None, cutlass.Int32(_tcgen05_subtile))])\n"
             f"            {c_pipeline}.producer_commit()\n"
+        )
+
+    def tma_store_store_warp_tail_region() -> str:
+        # Path B store-warp tail (inside ``if store_warp_predicate:``): consume
+        # the C-store edge, issue the TMA-D, and recycle the C-ring SMEM stage
+        # with a ``c_stages - 1`` lagged release so a stage is only freed for
+        # the epi producer AFTER its TMA-D read has provably completed.
+        #
+        # Ordering (per subtile, ``S`` = ``c_buffer``):
+        #  1. ``consumer_wait``: the epi warps' R2S of stage ``S`` has landed.
+        #  2. TMA-D ``S`` -> GMEM + ``c_pipeline.producer_commit`` (commit_group).
+        #  3. ``c_pipeline.producer_acquire`` = ``cp_async_bulk_wait_group(
+        #     c_stages - 1, read=True)``: after committing store i this drains
+        #     every store except the ``c_stages - 1`` most recent, i.e. proves
+        #     store ``i - (c_stages - 1)`` finished reading its SMEM stage.
+        #  4. release that proven-drained stage (the ``release_state``, which
+        #     lags the wait ``consumer_state`` by ``c_stages - 1``). Suppressed
+        #     for the first ``c_stages - 1`` global subtiles (nothing drained
+        #     yet); the trailing stages release naturally as later tiles' global
+        #     subtile index advances, and the final unreleased stores drain via
+        #     ``c_pipeline.producer_tail`` after the loop.
+        lag = tcgen05_c_stage_count - 1
+        global_subtile = (
+            f"({tcgen05_role_local_tile_counter} * "
+            f"cutlass.Int32({subtile_count}) + cutlass.Int32(_tcgen05_subtile))"
+            if tcgen05_role_local_tile_counter
+            else "cutlass.Int32(_tcgen05_subtile)"
+        )
+        return (
+            f"        {c_store_edge}.consumer_wait({c_store_edge_consumer_state})\n"
+            f"        {c_store_edge_consumer_state}.advance()\n"
+            f"        {c_buffer} = ({tma_c_buffer_expr}) % cutlass.Int32({tcgen05_c_stage_count})\n"
+            f"        cute.copy({tcgen05_tma_store_atom}, {bsg_sd}[(None, {c_buffer})], {bsg_gd}[(None, cutlass.Int32(_tcgen05_subtile))])\n"
+            f"        {c_pipeline}.producer_commit()\n"
+            f"        {c_pipeline}.producer_acquire()\n"
+            f"        if {global_subtile} >= cutlass.Int32({lag}):\n"
+            f"            with cute.arch.elect_one():\n"
+            f"                {c_store_edge}.consumer_release({c_store_edge_release_state})\n"
+            f"            {c_store_edge_release_state}.advance()\n"
         )
 
     def tma_store_subtile_body(
@@ -4201,6 +4423,21 @@ def _codegen_cute_store_tcgen05_tile(
             acc_wait=acc_wait,
             allow_aux_chain=True,
         )
+        if has_store_warp:
+            # Path B: the epi warps own T2R/R2S + the C-store producer commit;
+            # the store warp (a SEPARATE ``if``, NOT under ``epi_active``) owns
+            # the TMA-D + ``c_pipeline`` commit/acquire (its ``cp_async_bulk
+            # _wait_group`` reuse guard) + the lagged edge release. The C-ring
+            # acquire/commit move WHOLLY onto the store warp (PipelineTmaStore
+            # is per-warp commit-group state), so the epi warps never touch
+            # ``c_pipeline``; their store-prefix acquire lines are dropped.
+            return (
+                f"    if {tcgen05_epi_active}:\n"
+                f"{t2r_body}"
+                f"{tma_store_tail_region(late_later_subtile_acquire='')}"
+                f"    if {store_warp_predicate}:\n"
+                f"{tma_store_store_warp_tail_region()}"
+            )
         return (
             f"    if {tcgen05_epi_active}:\n"
             f"{first_subtile_acquire}"

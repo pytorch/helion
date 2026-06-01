@@ -6472,6 +6472,678 @@ class TestCuteLowerings(unittest.TestCase):
         expected = (x @ y).to(x.dtype)
         torch.testing.assert_close(out, expected, atol=2e-1, rtol=1e-2)
 
+    def test_tcgen05_with_scheduler_store_warp_split_codegen(
+        self,
+    ) -> None:
+        """Workstream A Stage 4 (cycle 93, Path B) store-warp DECOUPLE pin.
+
+        Cycle 91 plumbed an INERT store warp (byte-identical to store=0).
+        Cycle 93 gives it a PRODUCTIVE body via the Path B shared-loop split:
+        the epilogue role predicate is WIDENED to admit the store warp
+        (warp id 7) into the SAME role-local while as the 4 epi warps, and the
+        per-subtile R2S->TMA-D tail is split by warp role through a new C-store
+        ``PipelineAsync`` edge (producer = 4 epi warps, consumer = 1 store
+        warp, depth = c_stages). The store warp is now a REAL sched consumer,
+        so the cycle-91 ``- store_warp_count`` sched-consumer subtraction is
+        removed (count goes 6 -> 7).
+
+        Pins (store_warps=1): the widened role gate, the C-store edge, the
+        epi-warp producer commit + the store-warp consumer wait/release, and
+        the sched consumer arrive count = 7. The launch envelope stays 8.
+
+        The store_warps=0 production path is asserted BYTE-IDENTICAL (the whole
+        split is behind ``has_store_warp``) by
+        ``test_tcgen05_with_scheduler_store_warp_zero_byte_identical``.
+        """
+
+        @helion.kernel(backend="cute")
+        def cute_matmul_with_scheduler_store(
+            x: torch.Tensor, y: torch.Tensor
+        ) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = acc.to(x.dtype)
+            return out
+
+        args = (
+            torch.empty([4096, 4096], device=DEVICE, dtype=torch.bfloat16),
+            torch.empty([4096, 4096], device=DEVICE, dtype=torch.bfloat16),
+        )
+
+        def _config(store_warps: int) -> helion.Config:
+            return helion.Config(
+                block_sizes=[256, 256, 128],
+                l2_groupings=[1],
+                num_warps=4,
+                num_sm_multiplier=1,
+                pid_type="persistent_interleaved",
+                tcgen05_cluster_m=2,
+                tcgen05_ab_stages=2,
+                tcgen05_acc_stages=2,
+                tcgen05_c_stages=4,
+                tcgen05_num_epi_warps=4,
+                tcgen05_strategy="role_local_with_scheduler",
+                tcgen05_warp_spec_scheduler_warps=1,
+                tcgen05_warp_spec_store_warps=store_warps,
+                indexing=[
+                    "tensor_descriptor",
+                    "tensor_descriptor",
+                    "tensor_descriptor",
+                ],
+            )
+
+        with patch_cute_mma_support():
+            bound = cute_matmul_with_scheduler_store.bind(args)
+            bound.env.config_spec.cute_tcgen05_search_enabled = True
+            code_store0 = bound.to_triton_code(_config(0))
+            code_store1 = bound.to_triton_code(_config(1))
+
+        # The productive store warp emits a DIFFERENT epilogue from store=0.
+        self.assertNotEqual(code_store1, code_store0)
+        # Widened epilogue role gate: epi warps OR the store warp (id 7).
+        self.assertIn(
+            "cute.arch.make_warp_uniform(cute.arch.warp_idx()) < cutlass.Int32(4) "
+            "or cute.arch.make_warp_uniform(cute.arch.warp_idx()) == cutlass.Int32(7)",
+            code_store1,
+        )
+        # C-store PipelineAsync edge: producer (4 epi) / consumer (1 store).
+        self.assertIn(
+            "tcgen05_c_store_edge = cutlass.pipeline.PipelineAsync.create(num_stages=4",
+            code_store1,
+        )
+        self.assertIn(
+            "tcgen05_c_store_edge_producer_group = "
+            "cutlass.pipeline.CooperativeGroup("
+            "cutlass.pipeline.Agent.Thread, cutlass.Int32(4))",
+            code_store1,
+        )
+        self.assertIn(
+            "tcgen05_c_store_edge_consumer_group = "
+            "cutlass.pipeline.CooperativeGroup("
+            "cutlass.pipeline.Agent.Thread, cutlass.Int32(1))",
+            code_store1,
+        )
+        # Epi-warp producer commit + store-warp consumer wait/release.
+        self.assertIn(
+            "tcgen05_c_store_edge.producer_commit(tcgen05_c_store_edge_producer_state)",
+            code_store1,
+        )
+        self.assertIn(
+            "tcgen05_c_store_edge.consumer_wait(tcgen05_c_store_edge_consumer_state)",
+            code_store1,
+        )
+        self.assertIn(
+            "tcgen05_c_store_edge.consumer_release(tcgen05_c_store_edge_release_state)",
+            code_store1,
+        )
+        # Store warp (id 7) owns the TMA-D + the c_pipeline lifecycle.
+        self.assertIn("if tcgen05_warp_idx == cutlass.Int32(7):", code_store1)
+        # Sched consumer arrive count is now 7 (the store warp is a REAL sched
+        # consumer; the cycle-91 ``- store_warp_count`` subtraction is removed).
+        self.assertIn(
+            "tcgen05_sched_pipeline_consumer_group = "
+            "cutlass.pipeline.CooperativeGroup("
+            "cutlass.pipeline.Agent.Thread, cutlass.Int32(7))",
+            code_store1,
+        )
+        # Launch envelope unchanged (8 warps either way).
+        self.assertIn("cute.make_layout((2, 1, 1))", code_store1)
+        self.assertIn("PipelineTmaUmma", code_store1)
+
+    def test_tcgen05_with_scheduler_store_warp_zero_byte_identical(
+        self,
+    ) -> None:
+        """Workstream A Stage 4 (cycle 93): store_warps=0 production path is
+        BYTE-IDENTICAL to a strategy-matched config with the store-warp field
+        absent. The entire Path B split is gated on ``has_store_warp``
+        (= ``store_warp_count>0``, default 0), so no passing target that uses
+        ``role_local_with_scheduler`` is perturbed — this is why no full sweep
+        is needed this cycle.
+        """
+
+        @helion.kernel(backend="cute")
+        def cute_matmul_store_zero(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = acc.to(x.dtype)
+            return out
+
+        args = (
+            torch.empty([4096, 4096], device=DEVICE, dtype=torch.bfloat16),
+            torch.empty([4096, 4096], device=DEVICE, dtype=torch.bfloat16),
+        )
+        base: dict[str, object] = {
+            "block_sizes": [256, 256, 128],
+            "l2_groupings": [1],
+            "num_warps": 4,
+            "num_sm_multiplier": 1,
+            "pid_type": "persistent_interleaved",
+            "tcgen05_cluster_m": 2,
+            "tcgen05_ab_stages": 2,
+            "tcgen05_acc_stages": 2,
+            "tcgen05_c_stages": 4,
+            "tcgen05_num_epi_warps": 4,
+            "tcgen05_strategy": "role_local_with_scheduler",
+            "tcgen05_warp_spec_scheduler_warps": 1,
+            "indexing": [
+                "tensor_descriptor",
+                "tensor_descriptor",
+                "tensor_descriptor",
+            ],
+        }
+        with patch_cute_mma_support():
+            bound = cute_matmul_store_zero.bind(args)
+            bound.env.config_spec.cute_tcgen05_search_enabled = True
+            code_default = bound.to_triton_code(helion.Config(**base))
+            code_store0 = bound.to_triton_code(
+                helion.Config(**{**base, "tcgen05_warp_spec_store_warps": 0})
+            )
+        self.assertEqual(code_store0, code_default)
+        self.assertNotIn("tcgen05_c_store_edge", code_store0)
+
+    def test_tcgen05_store_warp_with_diagnostic_layout_rejected(self) -> None:
+        """Workstream A Stage 4 (cycle 93): reject store_warps=1 combined with a
+        diagnostic split / module-helper epilogue layout.
+
+        Those diagnostic layouts route the per-subtile tail through helpers that
+        emit only the ``if epi_active`` half under ``has_store_warp`` (and the
+        module-helper-store-tail keeps the OLD two-barrier warp-0 ``c_pipeline``
+        tail while the main path suppressed the matching acquires), so the
+        C-store edge would have no consumer and wedge at ring wrap. They are
+        diagnostic-only; production uses the DEFAULT layout, so the combo raises
+        ``BackendUnsupported`` (same guard class as the pure-matmul tail).
+        ``split_first_t2r`` routes through the Stage-4 split and is allowed.
+        """
+
+        @helion.kernel(backend="cute")
+        def cute_matmul_store_diag(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = acc.to(x.dtype)
+            return out
+
+        args = (
+            torch.empty([4096, 4096], device=DEVICE, dtype=torch.bfloat16),
+            torch.empty([4096, 4096], device=DEVICE, dtype=torch.bfloat16),
+        )
+        rejected_layouts = (
+            TCGEN05_EPILOGUE_LAYOUT_SPLIT_ACC_T2R_STORE_TAIL,
+            TCGEN05_EPILOGUE_LAYOUT_MODULE_HELPER_ACC_T2R,
+            TCGEN05_EPILOGUE_LAYOUT_MODULE_HELPER_STORE_TAIL,
+        )
+        with patch_cute_mma_support():
+            bound = cute_matmul_store_diag.bind(args)
+            bound.env.config_spec.cute_tcgen05_search_enabled = True
+            for epilogue_layout in rejected_layouts:
+                with self.subTest(epilogue_layout=epilogue_layout):
+                    cfg = helion.Config(
+                        block_sizes=[256, 256, 128],
+                        l2_groupings=[1],
+                        num_warps=4,
+                        num_sm_multiplier=1,
+                        pid_type="persistent_interleaved",
+                        tcgen05_cluster_m=2,
+                        tcgen05_ab_stages=2,
+                        tcgen05_acc_stages=2,
+                        tcgen05_c_stages=4,
+                        tcgen05_num_epi_warps=4,
+                        tcgen05_strategy="role_local_with_scheduler",
+                        tcgen05_warp_spec_scheduler_warps=1,
+                        tcgen05_warp_spec_store_warps=1,
+                        tcgen05_epilogue_layout=epilogue_layout,
+                        indexing=[
+                            "tensor_descriptor",
+                            "tensor_descriptor",
+                            "tensor_descriptor",
+                        ],
+                    )
+                    with self.assertRaisesRegex(
+                        exc.BackendUnsupported,
+                        "does not support tcgen05_warp_spec_store_warps>0",
+                    ):
+                        bound.to_triton_code(cfg)
+
+    def test_tcgen05_with_scheduler_store_warp_split_runtime_correctness(
+        self,
+    ) -> None:
+        """Runtime-correctness companion to
+        ``test_tcgen05_with_scheduler_store_warp_split_codegen``.
+
+        Workstream A Stage 4 (cycle 93): a ``ROLE_LOCAL_WITH_SCHEDULER`` config
+        with ``tcgen05_warp_spec_store_warps=1`` + the PRODUCTIVE Path B split
+        must LAUNCH (no ``CUDA_ERROR_LAUNCH_FAILED`` — the store warp at id 7
+        stays ``not epi_active`` -> same ``setmaxregister_decrease(120)`` as its
+        warpgroup-1 peers) AND produce correct output with NO C-ring deadlock at
+        wrap. ``c_stages=4`` with ``subtile_count=16`` per 256x256 tile wraps the
+        C-store ring 4x WITHIN one output tile, and the 1024x1024 problem has 16
+        output tiles, so both intra-tile and cross-tile ring wraps are exercised
+        (the cycle-2a partial-handshake deadlock surface).
+        """
+        from helion._compiler.cute.mma_support import get_cute_mma_support
+
+        if not get_cute_mma_support().tcgen05_f16bf16:
+            self.skipTest("tcgen05 F16/BF16 MMA is not supported on this machine")
+
+        @helion.kernel(backend="cute")
+        def cute_matmul_with_scheduler_store_rt(
+            x: torch.Tensor, y: torch.Tensor
+        ) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = acc.to(x.dtype)
+            return out
+
+        torch.manual_seed(0)
+        x = torch.randn(1024, 1024, dtype=torch.bfloat16, device=DEVICE)
+        y = torch.randn(1024, 1024, dtype=torch.bfloat16, device=DEVICE)
+        config = helion.Config(
+            block_sizes=[256, 256, 128],
+            l2_groupings=[1],
+            num_warps=4,
+            num_sm_multiplier=1,
+            pid_type="persistent_interleaved",
+            tcgen05_cluster_m=2,
+            tcgen05_ab_stages=2,
+            tcgen05_acc_stages=2,
+            tcgen05_c_stages=4,
+            tcgen05_num_epi_warps=4,
+            tcgen05_strategy="role_local_with_scheduler",
+            tcgen05_warp_spec_scheduler_warps=1,
+            tcgen05_warp_spec_store_warps=1,
+            indexing=[
+                "tensor_descriptor",
+                "tensor_descriptor",
+                "tensor_descriptor",
+            ],
+        )
+        bound = cute_matmul_with_scheduler_store_rt.bind((x, y))
+        bound.env.config_spec.cute_tcgen05_search_enabled = True
+        bound.set_config(config)
+        out = bound(x, y)
+        expected = (x @ y).to(x.dtype)
+        torch.testing.assert_close(out, expected, atol=2e-1, rtol=1e-2)
+
+    def test_tcgen05_store_warp_aux_tma_merge_codegen(self) -> None:
+        """Workstream A Stage 5 (cycle 94, the merge) codegen pin.
+
+        The merged config ``c_input_warps=0 + store_warps=1 +
+        aux_load_mode=tma`` makes the single store/epi-load warp (id 7) the aux
+        residual PRODUCER (early per tile, GMEM->SMEM ring) AND the TMA-D store
+        drain consumer (late per subtile) in ONE role-local while at 8 warps —
+        no c_input/store collision. The epi warps consume the staged residual
+        from SMEM. This is validated-but-NOT-wired (the merge measured neutral
+        vs aux-TMA-alone under the acc_stages=2 overlap bound, so the autotune
+        surface stays ``store_warps=(0,)``); the pin guards the codegen shape if
+        a future change relaxes the bound and re-enables the merge.
+        """
+
+        @helion.kernel(backend="cute")
+        def cute_matmul_merge(
+            x: torch.Tensor, y: torch.Tensor, residual: torch.Tensor
+        ) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = (acc + residual[tile_m, tile_n]).to(x.dtype)
+            return out
+
+        args = (
+            torch.empty([4096, 4096], device=DEVICE, dtype=torch.bfloat16),
+            torch.empty([4096, 4096], device=DEVICE, dtype=torch.bfloat16),
+            torch.empty([4096, 4096], device=DEVICE, dtype=torch.bfloat16),
+        )
+        config = helion.Config(
+            block_sizes=[256, 256, 128],
+            l2_groupings=[1],
+            num_warps=4,
+            num_sm_multiplier=1,
+            pid_type="persistent_interleaved",
+            tcgen05_cluster_m=2,
+            tcgen05_ab_stages=2,
+            tcgen05_acc_stages=2,
+            tcgen05_c_stages=4,
+            tcgen05_num_epi_warps=4,
+            tcgen05_strategy="role_local_with_scheduler",
+            tcgen05_warp_spec_scheduler_warps=1,
+            tcgen05_warp_spec_c_input_warps=0,
+            tcgen05_warp_spec_store_warps=1,
+            **{TCGEN05_AUX_LOAD_MODE_CONFIG_KEY: TCGEN05_AUX_LOAD_MODE_TMA},
+            indexing=[
+                "tensor_descriptor",
+                "tensor_descriptor",
+                "tensor_descriptor",
+            ],
+        )
+        with patch_cute_mma_support():
+            bound = cute_matmul_merge.bind(args)
+            bound.env.config_spec.cute_tcgen05_search_enabled = True
+            code = bound.to_triton_code(config)
+        # The store warp (id 7) is BOTH the aux-TMA producer and the C-store
+        # consumer in the widened epilogue role-local while.
+        self.assertIn(
+            "cute.arch.make_warp_uniform(cute.arch.warp_idx()) < cutlass.Int32(4) "
+            "or cute.arch.make_warp_uniform(cute.arch.warp_idx()) == cutlass.Int32(7)",
+            code,
+        )
+        # Aux-TMA producer pipeline (PipelineTmaAsync) is allocated even with
+        # c_input_warps=0 (the store warp is the producer).
+        self.assertIn("tcgen05_aux_pipeline = cutlass.pipeline.PipelineTmaAsync", code)
+        # Aux-TMA producer body fires on the store warp (id 7), and the C-store
+        # consumer drain also fires on it.
+        self.assertIn("tcgen05_aux_pipeline.producer_acquire", code)
+        self.assertIn("tcgen05_c_store_edge.consumer_wait", code)
+        # Epi warps consume the staged residual from SMEM (no per-tile GMEM
+        # residual load on the epi critical path).
+        self.assertIn("tcgen05_aux_pipeline.consumer_wait", code)
+
+    def test_tcgen05_store_warp_aux_tma_merge_runtime_correctness(self) -> None:
+        """Runtime-correctness + no-deadlock pin for the cycle-94 merge.
+
+        The merged store/epi-load warp must LAUNCH and produce correct residual
+        output with NO deadlock when both the aux ring AND the c=4 C-store ring
+        wrap (1024x1024 = 16 output tiles; subtile_count=16 per tile wraps both
+        rings within one tile). Guards the dual-role warp's two interleaved
+        pipelines (aux producer early + C-store consumer late) against a
+        wrap-deadlock.
+        """
+        from helion._compiler.cute.mma_support import get_cute_mma_support
+
+        if not get_cute_mma_support().tcgen05_f16bf16:
+            self.skipTest("tcgen05 F16/BF16 MMA is not supported on this machine")
+
+        @helion.kernel(backend="cute")
+        def cute_matmul_merge_rt(
+            x: torch.Tensor, y: torch.Tensor, residual: torch.Tensor
+        ) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = (acc + residual[tile_m, tile_n]).to(x.dtype)
+            return out
+
+        torch.manual_seed(0)
+        x = torch.randn(1024, 1024, dtype=torch.bfloat16, device=DEVICE)
+        y = torch.randn(1024, 1024, dtype=torch.bfloat16, device=DEVICE)
+        residual = torch.randn(1024, 1024, dtype=torch.bfloat16, device=DEVICE)
+        config = helion.Config(
+            block_sizes=[256, 256, 128],
+            l2_groupings=[1],
+            num_warps=4,
+            num_sm_multiplier=1,
+            pid_type="persistent_interleaved",
+            tcgen05_cluster_m=2,
+            tcgen05_ab_stages=2,
+            tcgen05_acc_stages=2,
+            tcgen05_c_stages=4,
+            tcgen05_num_epi_warps=4,
+            tcgen05_strategy="role_local_with_scheduler",
+            tcgen05_warp_spec_scheduler_warps=1,
+            tcgen05_warp_spec_c_input_warps=0,
+            tcgen05_warp_spec_store_warps=1,
+            **{TCGEN05_AUX_LOAD_MODE_CONFIG_KEY: TCGEN05_AUX_LOAD_MODE_TMA},
+            indexing=[
+                "tensor_descriptor",
+                "tensor_descriptor",
+                "tensor_descriptor",
+            ],
+        )
+        bound = cute_matmul_merge_rt.bind((x, y, residual))
+        bound.env.config_spec.cute_tcgen05_search_enabled = True
+        bound.set_config(config)
+        out = bound(x, y, residual)
+        expected = (x.float() @ y.float() + residual.float()).to(torch.bfloat16)
+        torch.testing.assert_close(out, expected, atol=3e-1, rtol=2e-2)
+
+    def test_tcgen05_store_warp_aux_tma_merge_edge_tile_runtime(self) -> None:
+        """Cycle-94 autoreview #4b: the merge must handle EDGE tiles correctly.
+
+        A non-256-multiple shape (1152x1152) has M/N output-edge tiles that the
+        TMA-store full-tile epilogue routes through the SIMT direct-GMEM aux
+        path (``tile_phase="edge"`` in the role-local-while builder; the
+        store-warp aux producer stages the ring on full tiles only). Exact-
+        multiple shapes (the other merge runtime test at 1024^2) miss this path.
+        Pins correctness + no-deadlock across the full/edge aux split.
+        """
+        from helion._compiler.cute.mma_support import get_cute_mma_support
+
+        if not get_cute_mma_support().tcgen05_f16bf16:
+            self.skipTest("tcgen05 F16/BF16 MMA is not supported on this machine")
+
+        @helion.kernel(backend="cute")
+        def cute_matmul_merge_edge_rt(
+            x: torch.Tensor, y: torch.Tensor, residual: torch.Tensor
+        ) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = (acc + residual[tile_m, tile_n]).to(x.dtype)
+            return out
+
+        torch.manual_seed(0)
+        # 1152 = 4.5 * 256: M and N both have a 128-wide output-edge tile.
+        x = torch.randn(1152, 512, dtype=torch.bfloat16, device=DEVICE)
+        y = torch.randn(512, 1152, dtype=torch.bfloat16, device=DEVICE)
+        residual = torch.randn(1152, 1152, dtype=torch.bfloat16, device=DEVICE)
+        config = helion.Config(
+            block_sizes=[256, 256, 128],
+            l2_groupings=[1],
+            num_warps=4,
+            num_sm_multiplier=1,
+            pid_type="persistent_interleaved",
+            tcgen05_cluster_m=2,
+            tcgen05_ab_stages=2,
+            tcgen05_acc_stages=2,
+            tcgen05_c_stages=4,
+            tcgen05_num_epi_warps=4,
+            tcgen05_strategy="role_local_with_scheduler",
+            tcgen05_warp_spec_scheduler_warps=1,
+            tcgen05_warp_spec_c_input_warps=0,
+            tcgen05_warp_spec_store_warps=1,
+            **{TCGEN05_AUX_LOAD_MODE_CONFIG_KEY: TCGEN05_AUX_LOAD_MODE_TMA},
+            indexing=[
+                "tensor_descriptor",
+                "tensor_descriptor",
+                "tensor_descriptor",
+            ],
+        )
+        bound = cute_matmul_merge_edge_rt.bind((x, y, residual))
+        bound.env.config_spec.cute_tcgen05_search_enabled = True
+        bound.set_config(config)
+        out = bound(x, y, residual)
+        expected = (x.float() @ y.float() + residual.float()).to(torch.bfloat16)
+        torch.testing.assert_close(out, expected, atol=3e-1, rtol=2e-2)
+
+    def test_tcgen05_store_warp_simt_aux_falls_back_to_gmem(self) -> None:
+        """Cycle-94 autoreview #1: ``store_warps=1 + SIMT aux`` must NOT engage
+        the aux-on-store-warp merge (which is TMA-only).
+
+        The merge injects a TMA bulk aux producer on the store warp; there is no
+        SIMT store-warp producer, and the SIMT producer arrive count is
+        ``c_input_warp_count * 32`` (= 0 with no C-input warp). If the merge
+        gate fired on SIMT, it would pair a 0-thread producer group with a
+        32-thread SIMT cooperative copy -> consumers read uninitialized SMEM /
+        wedge. So ``store_warps=1 + aux_load_mode=simt`` must fall back to the
+        direct-GMEM aux path: NO aux SMEM-ring pipeline, NO 0-thread producer
+        group, residual read directly from GMEM, while the store-drain decouple
+        (cycle 93) stays active. Codegen is BYTE-IDENTICAL to the cycle-93
+        store=1/SIMT behavior. Correctness is also checked at a wrapping shape.
+        """
+
+        @helion.kernel(backend="cute")
+        def cute_matmul_simt_store(
+            x: torch.Tensor, y: torch.Tensor, residual: torch.Tensor
+        ) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = (acc + residual[tile_m, tile_n]).to(x.dtype)
+            return out
+
+        compile_args = (
+            torch.empty([4096, 4096], device=DEVICE, dtype=torch.bfloat16),
+            torch.empty([4096, 4096], device=DEVICE, dtype=torch.bfloat16),
+            torch.empty([4096, 4096], device=DEVICE, dtype=torch.bfloat16),
+        )
+
+        def _config() -> helion.Config:
+            return helion.Config(
+                block_sizes=[256, 256, 128],
+                l2_groupings=[1],
+                num_warps=4,
+                num_sm_multiplier=1,
+                pid_type="persistent_interleaved",
+                tcgen05_cluster_m=2,
+                tcgen05_ab_stages=2,
+                tcgen05_acc_stages=2,
+                tcgen05_c_stages=4,
+                tcgen05_num_epi_warps=4,
+                tcgen05_strategy="role_local_with_scheduler",
+                tcgen05_warp_spec_scheduler_warps=1,
+                tcgen05_warp_spec_c_input_warps=0,
+                tcgen05_warp_spec_store_warps=1,
+                # aux_load_mode defaults to SIMT (no TMA key).
+                indexing=[
+                    "tensor_descriptor",
+                    "tensor_descriptor",
+                    "tensor_descriptor",
+                ],
+            )
+
+        with patch_cute_mma_support():
+            bound = cute_matmul_simt_store.bind(compile_args)
+            bound.env.config_spec.cute_tcgen05_search_enabled = True
+            code = bound.to_triton_code(_config())
+        # No aux SMEM-ring pipeline (SIMT store-warp merge is gated off).
+        self.assertNotIn("tcgen05_aux_pipeline", code)
+        # No 0-thread producer cooperative group (the broken-merge symptom).
+        self.assertNotIn(
+            "cutlass.pipeline.CooperativeGroup("
+            "cutlass.pipeline.Agent.Thread, cutlass.Int32(0))",
+            code,
+        )
+        # The store-drain decouple (cycle 93) is still active.
+        self.assertIn("tcgen05_c_store_edge", code)
+        self.assertIn(
+            "cute.arch.make_warp_uniform(cute.arch.warp_idx()) < cutlass.Int32(4) "
+            "or cute.arch.make_warp_uniform(cute.arch.warp_idx()) == cutlass.Int32(7)",
+            code,
+        )
+
+        from helion._compiler.cute.mma_support import get_cute_mma_support
+
+        if not get_cute_mma_support().tcgen05_f16bf16:
+            self.skipTest("tcgen05 F16/BF16 MMA is not supported on this machine")
+        torch.manual_seed(0)
+        x = torch.randn(1024, 1024, dtype=torch.bfloat16, device=DEVICE)
+        y = torch.randn(1024, 1024, dtype=torch.bfloat16, device=DEVICE)
+        residual = torch.randn(1024, 1024, dtype=torch.bfloat16, device=DEVICE)
+        bound_rt = cute_matmul_simt_store.bind((x, y, residual))
+        bound_rt.env.config_spec.cute_tcgen05_search_enabled = True
+        bound_rt.set_config(_config())
+        out = bound_rt(x, y, residual)
+        expected = (x.float() @ y.float() + residual.float()).to(torch.bfloat16)
+        torch.testing.assert_close(out, expected, atol=3e-1, rtol=2e-2)
+
+    def test_tcgen05_with_scheduler_store_and_c_input_warps_rejected(
+        self,
+    ) -> None:
+        """Cycle 91 autoreview #1: ``c_input_warps=1`` and ``store_warps=1``
+        cannot both be set under ROLE_LOCAL_WITH_SCHEDULER.
+
+        Each independently reuses the single inert warpgroup-padding slot, so
+        setting both sums ``role_warp_count`` to 9 -> ``launched_warp_count``
+        rounds to 12 (= 384 threads) -> the (128, 12, 1) block overflows the
+        validated 1024-thread / 8-warp launch envelope. The cross-field guard
+        in ``validate_tcgen05_strategy_invariants`` rejects this loudly at
+        normalize time with a clear message rather than letting it surface as a
+        late, confusing ``BackendUnsupported`` at codegen. The intended
+        Stage-3 path is store=1 with c_input=0.
+        """
+
+        @helion.kernel(backend="cute")
+        def cute_matmul_store_and_c_input(
+            x: torch.Tensor, y: torch.Tensor
+        ) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = acc.to(x.dtype)
+            return out
+
+        args = (
+            torch.empty([4096, 4096], device=DEVICE, dtype=torch.bfloat16),
+            torch.empty([4096, 4096], device=DEVICE, dtype=torch.bfloat16),
+        )
+        with patch_cute_mma_support():
+            bound = cute_matmul_store_and_c_input.bind(args)
+        bound.env.config_spec.cute_tcgen05_search_enabled = True
+        dual_config: dict[str, object] = {
+            "block_sizes": [256, 256, 128],
+            "l2_groupings": [1],
+            "num_warps": 4,
+            "num_sm_multiplier": 1,
+            "pid_type": "persistent_interleaved",
+            "tcgen05_cluster_m": 2,
+            "tcgen05_ab_stages": 2,
+            "tcgen05_acc_stages": 2,
+            "tcgen05_c_stages": 2,
+            "tcgen05_num_epi_warps": 4,
+            "tcgen05_strategy": "role_local_with_scheduler",
+            "tcgen05_warp_spec_scheduler_warps": 1,
+            "tcgen05_warp_spec_c_input_warps": 1,
+            "tcgen05_warp_spec_store_warps": 1,
+            "indexing": [
+                "tensor_descriptor",
+                "tensor_descriptor",
+                "tensor_descriptor",
+            ],
+        }
+        with self.assertRaisesRegex(
+            exc.InvalidConfig,
+            "cannot run a C-input warp and a store warp at the same time",
+        ):
+            bound.env.config_spec.normalize(dual_config)
+
     def test_tcgen05_clc_persistent_codegen(self) -> None:
         """G2-H CLC scheduler-warp body codegen pin (cute_plan.md).
 
@@ -17594,8 +18266,13 @@ class TestCuteTcgen05AuxPipelineCycle2a(unittest.TestCase):
         self.assertIn("partial output tiles", msg)
         self.assertIn("partial-output TMA-store epilogue", msg)
 
-    def test_aux_tma_load_rejects_c_input_warp_zero(self) -> None:
-        """Explicit aux TMA must not silently no-op when the producer gate is shut."""
+    def test_aux_tma_load_rejects_no_producer_warp(self) -> None:
+        """Explicit aux TMA must not silently no-op when the producer gate is shut.
+
+        Cycle 94 (Workstream A Stage 5, the merge): the aux producer warp can be
+        the C-input warp OR the store warp. With NEITHER set (c_input=0,
+        store=0), aux-TMA has no producer and must reject loudly.
+        """
 
         kernel = self._residual_kernel()
         args = (
@@ -17617,6 +18294,7 @@ class TestCuteTcgen05AuxPipelineCycle2a(unittest.TestCase):
                 tcgen05_strategy="role_local_with_scheduler",
                 tcgen05_warp_spec_scheduler_warps=1,
                 tcgen05_warp_spec_c_input_warps=0,
+                tcgen05_warp_spec_store_warps=0,
                 **{TCGEN05_AUX_LOAD_MODE_CONFIG_KEY: TCGEN05_AUX_LOAD_MODE_TMA},
                 indexing=["tensor_descriptor"] * bound.env.config_spec.indexing.length,
             )
@@ -17624,7 +18302,7 @@ class TestCuteTcgen05AuxPipelineCycle2a(unittest.TestCase):
                 bound.to_triton_code(cfg)
         msg = str(cm.exception)
         self.assertIn(TCGEN05_AUX_LOAD_MODE_CONFIG_KEY, msg)
-        self.assertIn("productive C-input warp", msg)
+        self.assertIn("productive aux producer warp", msg)
 
     def test_aux_tma_load_rejects_multi_store_fanout(self) -> None:
         """Explicit aux TMA rejects multi-store fan-out instead of falling back."""
@@ -19315,14 +19993,17 @@ class TestCuteTcgen05AuxPipelineCycle2a(unittest.TestCase):
             with self.assertRaises(exc.BackendUnsupported) as cm:
                 bound.to_triton_code(config)
         msg = str(cm.exception)
-        # The rejection message names both knobs by their full
+        # The rejection message names the knobs by their full
         # ``helion.Config(...)`` field spelling so a user
         # dropping into the message can grep their config for
-        # the exact key names.
+        # the exact key names. Cycle 94 generalized the producer
+        # warp to "C-input OR the store-warp merge", so the
+        # remediation says "drop the aux producer warp" rather
+        # than naming ``c_input_warps=0`` specifically.
         self.assertIn("tcgen05_ab_stages=3", msg)
         self.assertIn("tcgen05_warp_spec_c_input_warps=1", msg)
         self.assertIn("tcgen05_ab_stages=2", msg)
-        self.assertIn("tcgen05_warp_spec_c_input_warps=0", msg)
+        self.assertIn("drop the aux producer warp", msg)
 
     def test_aux_pipeline_ab_stages_2_with_c_input_compiles(self) -> None:
         """Companion positive pin:
