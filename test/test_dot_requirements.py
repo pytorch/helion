@@ -657,13 +657,16 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
         """SMEM-budget gate validates explicit ``tcgen05_ab_stages=3`` configs.
 
         The 4096^3 BF16 matmul binding records the SMEM-budget gate so
-        search-time normalization can demote explicit ``ab=3`` candidates
+        search-time normalization can demote sampled ``ab=3`` candidates
         whose ``(bm, bn, bk, cluster_m)`` per-CTA AB-SMEM cost exceeds the
         device's optin SMEM cap minus the non-AB reservation (see
-        ``cute_plan.md`` §7.0). The broad random search fragment remains
-        capped at ``ab=2``; ``ab=3`` is now exposed through validated seeds
-        only, with the Target1 TVM-FFI seed owning the promoted search
-        family. The validation surface stays unchanged: explicit
+        ``cute_plan.md`` §7.0). Cycle 97 made ``ab=3`` BUDGET-AWARE-SEARCHABLE:
+        the broad random search fragment is now lifted to ``ab=3`` wherever
+        the SMEM-budget constraints are recorded (B200-class optin, bf16/fp16),
+        and ``_fix_ab_stages_search_config`` demotes a sampled ab=3 that does
+        not fit (over-budget bare AB, or the real source-C ring overflow) — so
+        the autotuner can reach the ab=3 winner directly instead of only via the
+        per-shape seeds. The validation surface stays unchanged: explicit
         ``helion.Config(tcgen05_ab_stages=3)`` always round-trips for
         explicit user configs.
 
@@ -691,10 +694,13 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
         self.assertEqual(constraints.per_cta_smem_budget_bytes, b200_budget_bytes)
 
         search_fragments = spec._tcgen05_optional_fragments(for_search=True)
-        # Broad random search stays fail-closed at ab=2 unless the exact
-        # Target1 TVM-FFI seed is available. The validation surface is
-        # independently 3 for explicit configs.
-        self.assertEqual(search_fragments["tcgen05_ab_stages"].high, 2)
+        # Cycle 97: ab=3 is BUDGET-AWARE-SEARCHABLE — the for_search cap is lifted
+        # to 3 wherever the SMEM-budget constraints were recorded (here: the mocked
+        # B200 budget), so the autotuner can SAMPLE ab=3 directly. A sampled ab=3
+        # that does not fit is then demoted by ``_fix_ab_stages_search_config`` (the
+        # over-budget cases below). The validation surface is independently 3 for
+        # explicit configs.
+        self.assertEqual(search_fragments["tcgen05_ab_stages"].high, 3)
         validation_fragments = spec._tcgen05_optional_fragments(for_search=False)
         self.assertEqual(validation_fragments["tcgen05_ab_stages"].high, 3)
 
