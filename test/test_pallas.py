@@ -213,6 +213,13 @@ def pallas_inplace_add(x: torch.Tensor, y: torch.Tensor) -> None:
         x[tile] = x[tile] + y[tile]
 
 
+@helion.kernel(backend="pallas", static_shapes=True, autotune_effort="none")
+def pallas_shared_output_disjoint_rows(x: torch.Tensor) -> torch.Tensor:
+    for row in hl.grid(2):
+        x[row, :] = x[row, :] + (row + 10)
+    return x
+
+
 @helion.kernel(backend="pallas", static_shapes=True)
 def pallas_add_2d(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     out = torch.empty_like(x)
@@ -893,6 +900,17 @@ class TestPallas(TestCase):
         code, result = code_and_output(pallas_inplace_add, (x, y), block_size=1024)
         # x should be mutated in place
         torch.testing.assert_close(x, expected)
+
+    def test_shared_output_disjoint_rows(self) -> None:
+        x = torch.zeros([2, 128], device=DEVICE, dtype=torch.float32)
+        expected = torch.stack(
+            [
+                torch.full([128], 10.0, device=DEVICE),
+                torch.full([128], 11.0, device=DEVICE),
+            ]
+        )
+        code, result = code_and_output(pallas_shared_output_disjoint_rows, (x,))
+        torch.testing.assert_close(result, expected)
 
     def test_pointwise_mul(self) -> None:
         args = (
