@@ -2101,7 +2101,19 @@ def _codegen_fori_loop(state: CodegenState) -> object:
                 else:
                     parts.append(":")
             else:
-                parts.append(":")
+                idx_meta = (
+                    subscript_meta[dim_idx]
+                    if dim_idx < len(subscript_meta)
+                    else slice(None)
+                )
+                from helion._utils import is_scalar_index
+
+                if is_scalar_index(idx_meta):
+                    offset_expr = state.device_function.literal_expr(idx_meta)
+                    parts.append(f"pl.ds({offset_expr}, 1)")
+                    needs_slice = True
+                else:
+                    parts.append(":")
         if not needs_slice:
             return hbm_name
         return f"{hbm_name}.at[{', '.join(parts)}]"

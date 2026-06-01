@@ -586,6 +586,36 @@ class TestPallas(TestCase):
         with self.subTest(name="body_vmem_indices"):
             self.assertIn("out_vmem[0, 0, :, :]", code)
 
+    def test_output_index_remapping_in_fori_loop(self) -> None:
+        total_elements = 8 * 128 * 128
+        x = torch.arange(total_elements, device=DEVICE, dtype=torch.bfloat16).view(
+            8, 128, 128
+        )
+        batch = 2
+        heads = 4
+        code, result = code_and_output(
+            kernel_output_index_remapping,
+            (x, batch, heads),
+            block_sizes=[32],
+            pallas_loop_type="fori_loop",
+        )
+
+        with self.subTest(name="correctness"):
+            expected = x.reshape(batch, heads, 128, 128)
+            torch.testing.assert_close(result, expected)
+
+        with self.subTest(name="fori_loop_emit"):
+            self.assertIn("jax.lax.fori_loop", code)
+
+        with self.subTest(name="body_vmem_indices"):
+            self.assertIn("out_buf[0, 0, :, :]", code)
+
+        with self.subTest(name="vmem_shape_allocation"):
+            self.assertIn("((1, 1, 32, 128), 'jnp.bfloat16', 'vmem')", code)
+
+        with self.subTest(name="hbm_dma_slices"):
+            self.assertIn("pl.ds(symnode_0, 1), pl.ds(symnode_1, 1)", code)
+
     def test_pipeline_kernel_tile_index_is_blockwise(self) -> None:
         x = torch.arange(1024, device=DEVICE, dtype=torch.float32)
         code, result = code_and_output(
