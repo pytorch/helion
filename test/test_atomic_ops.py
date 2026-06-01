@@ -11,6 +11,7 @@ from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
 from helion._testing import code_and_output
 from helion._testing import onlyBackends
+from helion._testing import skipIfCute
 from helion._testing import skipIfRefEager
 from helion._testing import skipIfRocm
 from helion._testing import skipIfTileIR
@@ -154,65 +155,6 @@ def atomic_add_tensor_index_kernel(
     out = torch.zeros([n], dtype=values.dtype, device=values.device)
     for tile in hl.tile(n):
         hl.atomic_add(out, [indices[tile]], values[tile])
-    return out
-
-
-@helion.kernel(static_shapes=True)
-def pallas_structural_atomic_add_kernel(x: torch.Tensor) -> torch.Tensor:
-    """Structurally shared output tile: contributor dim is leading K."""
-    k, m, n = x.shape
-    out = torch.ones([m, n], dtype=x.dtype, device=x.device)
-    for tile_k, tile_m, tile_n in hl.tile([k, m, n]):
-        value = torch.sum(x[tile_k, tile_m, tile_n], dim=0)
-        hl.atomic_add(out, [tile_m, tile_n], value)
-    return out
-
-
-@helion.kernel(static_shapes=True)
-def pallas_structural_atomic_add_2_contributor_kernel(
-    x: torch.Tensor,
-) -> torch.Tensor:
-    """Two contributor dims both update the same output tile."""
-    r, k, m, n = x.shape
-    out = torch.ones([m, n], dtype=x.dtype, device=x.device)
-    for tile_r, tile_k, tile_m, tile_n in hl.tile([r, k, m, n]):
-        value = torch.sum(torch.sum(x[tile_r, tile_k, tile_m, tile_n], dim=0), dim=0)
-        hl.atomic_add(out, [tile_m, tile_n], value)
-    return out
-
-
-@helion.kernel(static_shapes=True)
-def pallas_structural_atomic_add_two_outputs_kernel(
-    x: torch.Tensor, y: torch.Tensor
-) -> tuple[torch.Tensor, torch.Tensor]:
-    k, m, n = x.shape
-    out_x = torch.ones([m, n], dtype=x.dtype, device=x.device)
-    out_y = torch.full([m, n], 2.0, dtype=y.dtype, device=y.device)
-    for tile_k, tile_m, tile_n in hl.tile([k, m, n]):
-        x_value = torch.sum(x[tile_k, tile_m, tile_n], dim=0)
-        y_value = torch.sum(y[tile_k, tile_m, tile_n], dim=0)
-        hl.atomic_add(out_x, [tile_m, tile_n], x_value)
-        hl.atomic_add(out_y, [tile_m, tile_n], y_value)
-    return out_x, out_y
-
-
-@helion.kernel(static_shapes=True)
-def pallas_structural_atomic_max_kernel(x: torch.Tensor) -> torch.Tensor:
-    out = torch.full(
-        [x.size(1), x.size(2)], -1000.0, dtype=x.dtype, device=x.device
-    )
-    for tile_k, tile_m, tile_n in hl.tile(x.size()):
-        value = torch.amax(x[tile_k, tile_m, tile_n], dim=0)
-        hl.atomic_max(out, [tile_m, tile_n], value)
-    return out
-
-
-@helion.kernel(static_shapes=True)
-def pallas_structural_atomic_min_kernel(x: torch.Tensor) -> torch.Tensor:
-    out = torch.full([x.size(1), x.size(2)], 1000.0, dtype=x.dtype, device=x.device)
-    for tile_k, tile_m, tile_n in hl.tile(x.size()):
-        value = torch.amin(x[tile_k, tile_m, tile_n], dim=0)
-        hl.atomic_min(out, [tile_m, tile_n], value)
     return out
 
 
@@ -516,6 +458,16 @@ class TestAtomicOperations(RefEagerTestBase, TestCase):
 
     @onlyBackends(["pallas"])
     def test_pallas_structural_atomic_add_shared_tile(self):
+        @helion.kernel(static_shapes=True)
+        def pallas_structural_atomic_add_kernel(x: torch.Tensor) -> torch.Tensor:
+            """Structurally shared output tile: contributor dim is leading K."""
+            k, m, n = x.shape
+            out = torch.ones([m, n], dtype=x.dtype, device=x.device)
+            for tile_k, tile_m, tile_n in hl.tile([k, m, n]):
+                value = torch.sum(x[tile_k, tile_m, tile_n], dim=0)
+                hl.atomic_add(out, [tile_m, tile_n], value)
+            return out
+
         x = torch.randn(4, 16, 128, device=DEVICE, dtype=torch.float32)
 
         for loop_type in ("unroll", "fori_loop", "emit_pipeline"):
@@ -529,30 +481,56 @@ class TestAtomicOperations(RefEagerTestBase, TestCase):
                 expected = torch.ones(16, 128, device=DEVICE) + x.sum(dim=0)
                 torch.testing.assert_close(result, expected)
 
-    @onlyBackends(["pallas"])
-    def test_pallas_structural_atomic_add_two_contributor_dims(self):
+    @skipIfCute("CuTe does not handle structural shared-tile atomics yet")
+    def test_structural_atomic_add_two_contributor_dims(self):
+        @helion.kernel(static_shapes=True)
+        def structural_atomic_add_2_contributor_kernel(
+            x: torch.Tensor,
+        ) -> torch.Tensor:
+            """Two contributor dims both update the same output tile."""
+            r, k, m, n = x.shape
+            out = torch.ones([m, n], dtype=x.dtype, device=x.device)
+            for tile_r, tile_k, tile_m, tile_n in hl.tile([r, k, m, n]):
+                value = torch.sum(
+                    torch.sum(x[tile_r, tile_k, tile_m, tile_n], dim=0), dim=0
+                )
+                hl.atomic_add(out, [tile_m, tile_n], value)
+            return out
+
         x = torch.randn(3, 4, 16, 128, device=DEVICE, dtype=torch.float32)
 
         code, result = code_and_output(
-            pallas_structural_atomic_add_2_contributor_kernel,
+            structural_atomic_add_2_contributor_kernel,
             (x,),
             block_sizes=[1, 1, 8, 128],
-            pallas_loop_type="fori_loop",
         )
 
         expected = torch.ones(16, 128, device=DEVICE) + x.sum(dim=(0, 1))
         torch.testing.assert_close(result, expected)
 
-    @onlyBackends(["pallas"])
-    def test_pallas_structural_atomic_add_multiple_outputs(self):
+    @skipIfCute("CuTe does not handle structural shared-tile atomics yet")
+    def test_structural_atomic_add_multiple_outputs(self):
+        @helion.kernel(static_shapes=True)
+        def structural_atomic_add_two_outputs_kernel(
+            x: torch.Tensor, y: torch.Tensor
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            k, m, n = x.shape
+            out_x = torch.ones([m, n], dtype=x.dtype, device=x.device)
+            out_y = torch.full([m, n], 2.0, dtype=y.dtype, device=y.device)
+            for tile_k, tile_m, tile_n in hl.tile([k, m, n]):
+                x_value = torch.sum(x[tile_k, tile_m, tile_n], dim=0)
+                y_value = torch.sum(y[tile_k, tile_m, tile_n], dim=0)
+                hl.atomic_add(out_x, [tile_m, tile_n], x_value)
+                hl.atomic_add(out_y, [tile_m, tile_n], y_value)
+            return out_x, out_y
+
         x = torch.randn(4, 16, 128, device=DEVICE, dtype=torch.float32)
         y = torch.randn(4, 16, 128, device=DEVICE, dtype=torch.float32)
 
         code, (out_x, out_y) = code_and_output(
-            pallas_structural_atomic_add_two_outputs_kernel,
+            structural_atomic_add_two_outputs_kernel,
             (x, y),
             block_sizes=[1, 8, 128],
-            pallas_loop_type="emit_pipeline",
         )
 
         torch.testing.assert_close(
@@ -562,12 +540,32 @@ class TestAtomicOperations(RefEagerTestBase, TestCase):
             out_y, torch.full([16, 128], 2.0, device=DEVICE) + y.sum(dim=0)
         )
 
-    @onlyBackends(["pallas"])
-    def test_pallas_structural_atomic_max_min_shared_tile(self):
+    @skipIfCute("CuTe does not handle structural shared-tile atomics yet")
+    def test_structural_atomic_max_min_shared_tile(self):
+        @helion.kernel(static_shapes=True)
+        def structural_atomic_max_kernel(x: torch.Tensor) -> torch.Tensor:
+            out = torch.full(
+                [x.size(1), x.size(2)], -1000.0, dtype=x.dtype, device=x.device
+            )
+            for tile_k, tile_m, tile_n in hl.tile(x.size()):
+                value = torch.amax(x[tile_k, tile_m, tile_n], dim=0)
+                hl.atomic_max(out, [tile_m, tile_n], value)
+            return out
+
+        @helion.kernel(static_shapes=True)
+        def structural_atomic_min_kernel(x: torch.Tensor) -> torch.Tensor:
+            out = torch.full(
+                [x.size(1), x.size(2)], 1000.0, dtype=x.dtype, device=x.device
+            )
+            for tile_k, tile_m, tile_n in hl.tile(x.size()):
+                value = torch.amin(x[tile_k, tile_m, tile_n], dim=0)
+                hl.atomic_min(out, [tile_m, tile_n], value)
+            return out
+
         x = torch.randn(4, 16, 128, device=DEVICE, dtype=torch.float32)
 
         code_max, result_max = code_and_output(
-            pallas_structural_atomic_max_kernel,
+            structural_atomic_max_kernel,
             (x,),
             block_sizes=[1, 8, 128],
         )
@@ -577,7 +575,7 @@ class TestAtomicOperations(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result_max, expected_max)
 
         code_min, result_min = code_and_output(
-            pallas_structural_atomic_min_kernel,
+            structural_atomic_min_kernel,
             (x,),
             block_sizes=[1, 8, 128],
         )

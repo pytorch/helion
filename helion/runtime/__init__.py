@@ -10,6 +10,7 @@ import os
 import sys
 from typing import TYPE_CHECKING
 from typing import Any
+from typing import Literal
 from typing import cast
 
 import torch
@@ -385,6 +386,7 @@ _BlockSpecInfo = list[
     tuple[tuple[int | None, ...], tuple[int | tuple[int, int, int] | None, ...]] | None
 ]
 _PallasCopyGuards = dict[int, tuple[int, ...]]
+_PallasDimensionSemantic = Literal["parallel", "arbitrary"]
 
 
 def _pallas_tensor_pos_map(
@@ -417,9 +419,9 @@ def _pallas_shared_output_plan(
     output_indices: list[int],
     inplace_indices: set[int],
     block_spec_info: _BlockSpecInfo | None,
-) -> tuple[_PallasCopyGuards, tuple[str, ...]]:
+) -> tuple[_PallasCopyGuards, tuple[_PallasDimensionSemantic, ...]]:
     """Plan ordered updates for aliased outputs shared by multiple programs."""
-    dim_semantics = ["parallel"] * len(grid)
+    dim_semantics: list[_PallasDimensionSemantic] = ["parallel"] * len(grid)
     copy_guards: _PallasCopyGuards = {}
     if not output_indices or not grid:
         return copy_guards, tuple(dim_semantics)
