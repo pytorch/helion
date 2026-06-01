@@ -905,16 +905,16 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
         )
         for case_name, config in cases:
             with self.subTest(case=case_name):
-                if case_name == "n_axis_lane":
-                    # CuTe DSL 4.5.1 regressed the SMEM-load guards on the
-                    # N-axis lane-loop path: ``x @ y`` mismatches at ~0.05%
-                    # of elements with a >10 absolute diff. M-axis still
-                    # passes, so the asymmetry needs investigation in the
-                    # upstream cute release before this case can be
-                    # re-enabled.
+                if case_name in ("n_axis_lane", "m_axis_lane"):
+                    # CuTe DSL 4.5.1 regressed the SMEM-load guards on
+                    # the lane-loop path: ``x @ y`` mismatches at
+                    # ~0.0%–0.05% of elements with multi-tenth absolute
+                    # diffs. Both M and N axes flake on B200; needs
+                    # investigation in the upstream cute release before
+                    # either case can be re-enabled.
                     self.skipTest(
-                        "CuTe 4.5.1 regression: n_axis_lane SMEM-load guard "
-                        "produces wrong values; see _codegen_cute_mma."
+                        f"CuTe 4.5.1 regression: {case_name} SMEM-load "
+                        "guard produces wrong values; see _codegen_cute_mma."
                     )
                 # Fresh bind cache: the in-memory bind cache is keyed
                 # by args and other subTest iterations populate it.
