@@ -1196,8 +1196,9 @@ class TestExamples(RefEagerTestBase, TestCase):
         lambda: _get_backend() == "cute",
         "CuTe FP8 attention destabilizes later cute tests when it fails in-process",
     )
-    @skipIfNotCUDA()
+    @onlyBackends(["triton", "pallas"])
     @skipIfCudaCapabilityLessThan((9, 0), reason="FP8 requires CUDA capability >= 9.0")
+    @xfailIfPallasInterpret("unsupported torch.float8_e4m3fn dtype")
     def test_fp8_attention(self):
         batch = 2
         heads = 4
