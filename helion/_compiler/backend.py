@@ -31,6 +31,7 @@ if TYPE_CHECKING:
     from .device_function import Argument
     from .device_function import DeviceFunction
     from .device_ir import GraphInfo
+    from .host_function import HostFunction
     from .tile_dispatch import TileStrategyDispatch
     from .tile_strategy import TileStrategy
 
@@ -543,6 +544,15 @@ class Backend(abc.ABC):
 
     def launcher_keyword_args(self, config: Config, *, has_barrier: bool) -> list[str]:
         return []
+
+    def customize_ast(self, hf: HostFunction) -> None:
+        """Run backend-specific AST customizations.
+
+        Called after static loop unrolling but before type propagation
+        and tracing.  Backends can override this to rewrite the user's
+        AST for algorithmic transformations that change loop structure.
+        """
+        return None
 
     def pre_codegen(
         self,
@@ -2619,6 +2629,21 @@ class CuteBackend(Backend):
     def name(self) -> str:
         return "cute"
 
+    def customize_ast(self, hf: HostFunction) -> None:
+        """CuTe-specific AST rewrites that rewrite high-level patterns into
+        equivalent forms that compile to materially faster code.
+
+        Currently:
+          * ``rewrite_online_to_3pass`` rewrites the online two-pass
+            softmax pattern into the 3-pass form (max-only, then
+            sum-only, then consume).  The 3-pass form's two reductions
+            are independent and compile to a more efficient layout on
+            the CuTe backend.
+        """
+        from .cute.online_to_3pass import rewrite_online_to_3pass
+
+        rewrite_online_to_3pass(hf)
+
     def pre_codegen(
         self,
         graphs: list[GraphInfo],
@@ -3870,6 +3895,7 @@ class CuteBackend(Backend):
         nd_block_size = [bs.from_config_assert(config) for bs in block_size_infos]
         block_size = functools.reduce(operator.mul, nd_block_size)
         # Resolve per-axis thread counts then flatten to a single total
+        all_auto = all(nt <= 0 for nt in num_threads_config)
         flat_num_threads = functools.reduce(
             operator.mul,
             (
@@ -3878,6 +3904,14 @@ class CuteBackend(Backend):
             ),
             1,
         )
+        if (
+            isinstance(block_size, int)
+            and flat_num_threads > MAX_THREADS_PER_BLOCK
+            and all_auto
+        ):
+            # Auto thread budget exceeds the 1024-per-CTA cap: fall back to a
+            # lane loop (each thread owns block_size // 1024 elements).
+            flat_num_threads = MAX_THREADS_PER_BLOCK
         if isinstance(block_size, int) and flat_num_threads > 0:
             from .cute.thread_budget import check_thread_limit
 

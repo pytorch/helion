@@ -2767,6 +2767,18 @@ def _build_cute_schema_and_args(
 
 
 _CUTE_DSL_ARCH_CACHE: dict[int, str] = {}
+_CUTE_MIN_CUDA_VERSION = "13"
+
+
+def _require_cuda13_for_cute() -> None:
+    from .._compat import requires_cuda_version
+
+    if not requires_cuda_version(_CUTE_MIN_CUDA_VERSION):
+        raise exc.BackendUnsupported(
+            "cute",
+            f"requires CUDA >= {_CUTE_MIN_CUDA_VERSION} "
+            f"(found torch.version.cuda={torch.version.cuda!r})",
+        )
 
 
 def _ensure_cute_dsl_arch_env(args: tuple[object, ...]) -> None:
@@ -2780,6 +2792,7 @@ def _ensure_cute_dsl_arch_env(args: tuple[object, ...]) -> None:
         return
     else:
         device_index = torch.cuda.current_device()
+    _require_cuda13_for_cute()
     desired = _CUTE_DSL_ARCH_CACHE.get(device_index)
     if desired is None:
         if tensor_args:

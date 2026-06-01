@@ -580,6 +580,23 @@ def requires_torch_version(min_version: str) -> bool:
 
 
 @functools.cache
+def requires_cuda_version(min_version: str) -> bool:
+    """Check if PyTorch's CUDA runtime version meets the minimum requirement.
+
+    Args:
+        min_version: Minimum required CUDA version (e.g., "13").
+
+    Returns:
+        True if ``torch.version.cuda`` is set and >= ``min_version``.
+        False if PyTorch was not built with CUDA support.
+    """
+    cuda_version = torch.version.cuda
+    if cuda_version is None:
+        return False
+    return version.parse(cuda_version) >= version.parse(min_version)
+
+
+@functools.cache
 def supports_torch_compile_fusion() -> bool:
     """Check whether this PyTorch build exposes Helion's fusion entrypoint."""
     if torch.xpu.is_available():
