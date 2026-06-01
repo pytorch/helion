@@ -20,6 +20,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+from dataclasses import asdict
 from dataclasses import dataclass
 from dataclasses import field
 import functools
@@ -28,7 +29,9 @@ import json
 import os
 from pathlib import Path
 import signal
+import subprocess
 import sys
+import tempfile
 import time
 from typing import TYPE_CHECKING
 from typing import Any
@@ -1034,6 +1037,9 @@ class KernelResult:
     # was no real numerical check, so we drop helion_accuracy from the dashboard
     # JSON instead of falsely reporting 1.0.
     accuracy_verified: bool = True
+    # Set by the child when --shape-index walks past the end of shapes_fn's
+    # list, so the parent can stop iterating without parsing the error string.
+    shape_index_out_of_range: bool = False
 
 
 def import_example(module_file: str) -> types.ModuleType:
@@ -1050,6 +1056,7 @@ def import_example(module_file: str) -> types.ModuleType:
 
 KERNEL_TIMEOUT = int(os.environ.get("HELION_BENCHMARK_KERNEL_TIMEOUT", "1200"))
 NUM_SHAPES: int | None = None  # Set from CLI; None means all shapes
+SHAPE_INDEX: int | None = None  # Set from CLI; restricts the kernel to one shape
 
 
 class _KernelTimeout(Exception):
@@ -1058,6 +1065,167 @@ class _KernelTimeout(Exception):
 
 def _alarm_handler(signum: int, frame: object) -> None:
     raise _KernelTimeout
+
+
+def _kernel_is_baseline_less(name: str) -> bool:
+    """Whether `name` runs via `mod.main()` instead of per-shape autotune.
+
+    Cheap to evaluate — only inspects KERNEL_MAPPINGS metadata, never calls
+    `shapes_fn`. The orchestrator must NOT call shapes_fn in the parent
+    because it allocates `device=DEVICE` tensors which forces PJRT to grab
+    the TPU lock — subsequent child subprocesses then fail with `open(
+    /dev/vfio/N): Device or resource busy`.
+    """
+    if name not in KERNEL_MAPPINGS:
+        return False
+    _, _, baseline_fn, shapes_fn, _ = KERNEL_MAPPINGS[name][:5]
+    return baseline_fn is None or shapes_fn is None
+
+
+_LIBTPU_LOCKFILE = "/tmp/libtpu_lockfile"
+
+
+def _wait_for_tpu_release(timeout_s: float = 30.0, poll_s: float = 0.25) -> None:
+    """Block until the previous subprocess fully releases the TPU.
+
+    libtpu creates `/tmp/libtpu_lockfile` while a process holds the device.
+    When the process exits the file is removed, but the underlying
+    `/dev/vfio/<chip>` iommu group can stay busy for a moment longer.
+    Without this gate, the next subprocess hits `FAILED_PRECONDITION: open(
+    /dev/vfio/N): Device or resource busy`. Polls the lockfile + adds a
+    small slack to cover the OS-level iommu release. Times out silently —
+    the caller still tries to spawn and will get a clear error if the
+    device truly stays busy.
+    """
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        if not os.path.exists(_LIBTPU_LOCKFILE):
+            break
+        time.sleep(poll_s)
+    # Small slack after lockfile clears so vfio/iommu finishes teardown.
+    time.sleep(1.0)
+
+
+def _run_one_shape_via_subprocess(name: str, shape_index: int | None) -> KernelResult:
+    """Spawn a child `run_tpu.py` invocation for one (kernel, shape) pair.
+
+    The child writes its KernelResult to a temp file via `--intermediate-result`.
+    stdout/stderr are inherited so autotune progress streams to the parent log
+    (and to GH Actions). A non-zero exit code is folded into a FAIL result so a
+    crashed shape doesn't abort the whole sweep.
+    """
+    _wait_for_tpu_release()
+    with tempfile.NamedTemporaryFile(
+        prefix="run_tpu_result_", suffix=".json", delete=False, mode="w"
+    ) as tmp:
+        tmp_path = tmp.name
+    try:
+        cmd = [
+            sys.executable,
+            __file__,
+            "--kernel",
+            name,
+            "--intermediate-result",
+            tmp_path,
+        ]
+        if NUM_SHAPES is not None:
+            cmd += ["--num-shapes", str(NUM_SHAPES)]
+        if shape_index is not None:
+            cmd += ["--shape-index", str(shape_index)]
+        # Parent-side hard cap. The child also installs SIGALRM at KERNEL_TIMEOUT;
+        # the extra slack covers child startup + autotune ramp-up + SIGALRM cleanup.
+        # If the child wedges before its own alarm fires (e.g., stuck on a TPU
+        # lockfile), this prevents the parent from hanging indefinitely.
+        subprocess_timeout = KERNEL_TIMEOUT + 120
+        try:
+            proc = subprocess.run(
+                cmd,
+                env=os.environ.copy(),
+                check=False,
+                timeout=subprocess_timeout,
+            )
+        except subprocess.TimeoutExpired:
+            return KernelResult(
+                name=name,
+                passed=False,
+                error=(
+                    f"Subprocess exceeded parent timeout of {subprocess_timeout}s "
+                    f"(KERNEL_TIMEOUT={KERNEL_TIMEOUT}s + 120s slack)"
+                ),
+            )
+        if proc.returncode != 0 or not os.path.exists(tmp_path):
+            return KernelResult(
+                name=name,
+                passed=False,
+                error=f"Subprocess exited with code {proc.returncode}",
+            )
+        with open(tmp_path) as f:
+            payload = json.load(f)
+        shape_results = [ShapeResult(**sr) for sr in payload.get("shape_results", [])]
+        return KernelResult(
+            name=payload["name"],
+            passed=payload["passed"],
+            kernel_time_ms=payload.get("kernel_time_ms", 0.0),
+            error=payload.get("error"),
+            shape_results=shape_results,
+            accuracy_verified=payload.get("accuracy_verified", True),
+            shape_index_out_of_range=payload.get("shape_index_out_of_range", False),
+        )
+    finally:
+        if os.path.exists(tmp_path):
+            os.unlink(tmp_path)
+
+
+def _run_kernel_per_shape(name: str) -> KernelResult:
+    """Orchestrate per-shape subprocesses for one kernel, merge into one result.
+
+    Walks shape indices 0, 1, 2, ... by spawning one child per index. Stops
+    when a child sets ``shape_index_out_of_range=True`` in its KernelResult.
+    Doing it this way avoids the parent calling ``shapes_fn`` (which would
+    allocate `device=DEVICE` tensors and lock the TPU for the children).
+    """
+    if _kernel_is_baseline_less(name):
+        return _run_one_shape_via_subprocess(name, shape_index=None)
+    merged_shape_results: list[ShapeResult] = []
+    all_passed = True
+    accuracy_verified = True
+    error_msg: str | None = None
+    # Safety cap: no kernel in KERNEL_MAPPINGS has > 8 shapes today. The
+    # cap protects against a child failing to even reach the shape-index
+    # bound check (e.g., env misconfig where shapes_fn itself crashes) —
+    # without it, parent would iterate forever.
+    MAX_SHAPES_PER_KERNEL = 20
+    idx = 0
+    while True:
+        print(f"  [subprocess shape {idx}]", file=sys.stderr)
+        result = _run_one_shape_via_subprocess(name, shape_index=idx)
+        if result.shape_index_out_of_range:
+            # Sentinel: we've walked off the end of shapes_fn's list.
+            break
+        if result.shape_results:
+            merged_shape_results.extend(result.shape_results)
+        if not result.passed:
+            all_passed = False
+            if result.error and not error_msg:
+                error_msg = result.error
+            # If the child failed without producing any shape_results, the
+            # failure is at bootstrap (not in autotune); iterating further
+            # will hit the same error. Bail out.
+            if not result.shape_results:
+                break
+        accuracy_verified = accuracy_verified and result.accuracy_verified
+        idx += 1
+        if NUM_SHAPES is not None and idx >= NUM_SHAPES:
+            break
+        if idx >= MAX_SHAPES_PER_KERNEL:
+            break
+    return KernelResult(
+        name=name,
+        passed=all_passed,
+        error=error_msg,
+        shape_results=merged_shape_results,
+        accuracy_verified=accuracy_verified,
+    )
 
 
 def run_kernel(name: str) -> KernelResult:
@@ -1119,6 +1287,19 @@ def run_kernel_inner(name: str) -> KernelResult:
         # shape on TPU first and only then drop the unused tail, which can
         # OOM during shape construction with --num-shapes 2.
         shapes = shapes_fn(NUM_SHAPES)
+        # In subprocess-per-shape mode, the parent process spawns one child
+        # per (kernel, shape_index) so each autotune session starts on a
+        # fresh TPU device with no accumulated libtpu allocator state. The
+        # child is invoked with --shape-index=N to restrict its work.
+        if SHAPE_INDEX is not None:
+            if len(shapes) <= SHAPE_INDEX:
+                return KernelResult(
+                    name=name,
+                    passed=False,
+                    error=f"--shape-index={SHAPE_INDEX} out of range (have {len(shapes)} shapes)",
+                    shape_index_out_of_range=True,
+                )
+            shapes = [shapes[SHAPE_INDEX]]
         all_passed = True
         shape_results: list[ShapeResult] = []
         accuracy_verified = max_mismatch_pct is None or max_mismatch_pct < 1.0
@@ -1380,10 +1561,38 @@ def main() -> None:
         action="store_true",
         help="List available kernel names and exit",
     )
+    parser.add_argument(
+        "--shape-index",
+        type=int,
+        default=None,
+        help=(
+            "Restrict the run to this single shape index. Combined with --kernel, "
+            "runs exactly one (kernel, shape) — used by --subprocess-per-shape."
+        ),
+    )
+    parser.add_argument(
+        "--subprocess-per-shape",
+        action="store_true",
+        help=(
+            "Spawn one subprocess per (kernel, shape). Each subprocess gets a "
+            "fresh TPU device, isolating libtpu allocator state across runs. "
+            "Adds ~30-60s per subprocess for Python/JAX/torch_tpu init."
+        ),
+    )
+    parser.add_argument(
+        "--intermediate-result",
+        type=str,
+        default=None,
+        help=(
+            "Write a single KernelResult as JSON to this path (used by the "
+            "subprocess child to communicate its result back to the parent)."
+        ),
+    )
     args = parser.parse_args()
 
-    global NUM_SHAPES
+    global NUM_SHAPES, SHAPE_INDEX
     NUM_SHAPES = args.num_shapes
+    SHAPE_INDEX = args.shape_index
 
     if args.list_kernels:
         for name in KERNEL_MAPPINGS:
@@ -1419,7 +1628,10 @@ def main() -> None:
         print(f"\n{'=' * 65}", file=sys.stderr)
         print(f"Kernel: {name}", file=sys.stderr)
         print(f"{'=' * 65}", file=sys.stderr)
-        result = run_kernel(name)
+        if args.subprocess_per_shape:
+            result = _run_kernel_per_shape(name)
+        else:
+            result = run_kernel(name)
         results.append(result)
 
         status = "PASS" if result.passed else "FAIL"
@@ -1493,6 +1705,19 @@ def main() -> None:
     if args.output:
         write_results_json(args.output, results)
         print(f"Results written to {args.output}", file=sys.stderr)
+
+    if args.intermediate_result:
+        # Child-mode handoff: serialize the (single) KernelResult so the parent
+        # subprocess-per-shape orchestrator can reconstruct it. Always exactly
+        # one result when this flag is set (parent passes --kernel=<one>).
+        if len(results) != 1:
+            print(
+                f"Warning: --intermediate-result expects 1 result, got {len(results)}",
+                file=sys.stderr,
+            )
+        if results:
+            with open(args.intermediate_result, "w") as f:
+                json.dump(asdict(results[0]), f)
 
 
 if __name__ == "__main__":

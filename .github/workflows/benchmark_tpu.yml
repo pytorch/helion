@@ -141,6 +141,7 @@ jobs:
             python benchmarks/run_tpu.py \
               "${KERNEL_FLAG[@]}" \
               --num-shapes 2 \
+              --subprocess-per-shape \
               --output "$TEST_REPORTS_DIR/helionbench.json"
 
           if [[ ! -s "$TEST_REPORTS_DIR/helionbench.json" ]]; then
