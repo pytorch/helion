@@ -499,6 +499,14 @@ class ConfigSpec:
         self._cute_tcgen05_config.bias_relu_matmul_store_detected = value
 
     @property
+    def cute_tcgen05_gelu_matmul_store_detected(self) -> bool:
+        return self._cute_tcgen05_config.gelu_matmul_store_detected
+
+    @cute_tcgen05_gelu_matmul_store_detected.setter
+    def cute_tcgen05_gelu_matmul_store_detected(self, value: bool) -> None:
+        self._cute_tcgen05_config.gelu_matmul_store_detected = value
+
+    @property
     def _tcgen05_cluster_m_search_choices(self) -> tuple[int, ...] | None:
         return self._cute_tcgen05_config.cluster_m_search_choices
 
@@ -586,6 +594,9 @@ class ConfigSpec:
 
     def allow_tcgen05_target7_tvm_ffi_seed(self) -> None:
         self._cute_tcgen05_config.allow_target7_tvm_ffi_seed()
+
+    def allow_tcgen05_target8_gelu_seed(self) -> None:
+        self._cute_tcgen05_config.allow_target8_gelu_seed()
 
     def allow_tcgen05_target9_tvm_ffi_seed(self) -> None:
         self._cute_tcgen05_config.allow_target9_tvm_ffi_seed()

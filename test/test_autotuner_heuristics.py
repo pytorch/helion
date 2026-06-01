@@ -66,6 +66,9 @@ from helion._compiler.cute.tcgen05_constants import (
 from helion._compiler.cute.tcgen05_constants import TCGEN05_TARGET1_TVM_FFI_AB_STAGES
 from helion._compiler.cute.tcgen05_constants import TCGEN05_TARGET1_TVM_FFI_BLOCK_K
 from helion._compiler.cute.tcgen05_constants import TCGEN05_TARGET1_TVM_FFI_C_STAGES
+from helion._compiler.cute.tcgen05_constants import TCGEN05_TARGET8_GELU_AB_STAGES
+from helion._compiler.cute.tcgen05_constants import TCGEN05_TARGET8_GELU_BLOCK_K
+from helion._compiler.cute.tcgen05_constants import TCGEN05_TARGET8_GELU_C_STAGES
 from helion._compiler.cute.tcgen05_constants import TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY
 from helion._compiler.cute.tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_M
 from helion._compiler.cute.tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_N
@@ -1300,6 +1303,163 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
         )
 
     @onlyBackends(["cute"])
+    def test_cute_tcgen05_target8_gelu_seed_config(self) -> None:
+        # T8 (cycle 87, MatmulTarget 27): fp16 plain ``gelu(acc)`` at
+        # 1536x6144x1536 produces a single plain two-CTA seed using the
+        # DEFAULT epilogue layout (no FFI / explicit-epi-tile, which is
+        # bf16-only). The bf16 gelu shapes (T4/T19) share the chain shape so
+        # the detector fires on them, but the fp16-pinned shape fact must
+        # keep the T8 seed disabled there.
+        @helion.kernel(backend="cute")
+        def cute_matmul_gelu(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = torch.nn.functional.gelu(acc).to(x.dtype)
+            return out
+
+        fp16_args = (
+            torch.empty([1536, 1536], device=DEVICE, dtype=torch.float16),
+            torch.empty([1536, 6144], device=DEVICE, dtype=torch.float16),
+        )
+        with (
+            patch_cute_mma_support(),
+            patch("helion.language.matmul_ops._cuda_num_sms_or_zero", return_value=132),
+        ):
+            bound = cute_matmul_gelu.bind(fp16_args)
+        self.assertTrue(
+            bound.config_spec.cute_tcgen05_gelu_matmul_store_detected,
+            "plain-gelu store detector must fire on the fp16 T8 shape",
+        )
+        seeds = [config.config for config in bound.config_spec.autotune_seed_configs()]
+        gelu_seeds = [
+            seed
+            for seed in seeds
+            if seed.get("block_sizes")
+            == [
+                TCGEN05_TWO_CTA_BLOCK_M,
+                TCGEN05_TWO_CTA_BLOCK_N,
+                TCGEN05_TARGET8_GELU_BLOCK_K,
+            ]
+            and seed.get("tcgen05_ab_stages") == TCGEN05_TARGET8_GELU_AB_STAGES
+        ]
+        self.assertEqual(len(gelu_seeds), 1)
+        seed = gelu_seeds[0]
+        # The T8 seed must NOT use the FFI / explicit-epi-tile path (the
+        # fp16 gelu store is rejected by that codegen gate).
+        self.assertIsNot(seed.get(TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY), True)
+        self.assertIsNot(seed.get(TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY), True)
+        self.assertIn(
+            seed.get(TCGEN05_LAYOUT_STRATEGY_CONFIG_KEY),
+            (None, Tcgen05LayoutStrategy.DEFAULT.value),
+        )
+        self.assertEqual(seed["tcgen05_cluster_m"], 2)
+        self.assertEqual(seed["tcgen05_cluster_n"], 1)
+        self.assertEqual(seed["tcgen05_c_stages"], TCGEN05_TARGET8_GELU_C_STAGES)
+        self.assertEqual(seed["pid_type"], "persistent_interleaved")
+        self.assertEqual(seed["l2_groupings"], [2])
+        # Seed survives flatten/unflatten against the live spec.
+        config_gen = bound.config_spec.create_config_generation()
+        transferred = [
+            config.config
+            for _flat, config in config_gen.seed_flat_config_pairs()
+            if config.config.get("block_sizes")
+            == [
+                TCGEN05_TWO_CTA_BLOCK_M,
+                TCGEN05_TWO_CTA_BLOCK_N,
+                TCGEN05_TARGET8_GELU_BLOCK_K,
+            ]
+            and config.config.get("tcgen05_ab_stages") == TCGEN05_TARGET8_GELU_AB_STAGES
+        ]
+        self.assertGreaterEqual(len(transferred), 1)
+        # The transferred seed survives ``num_warps`` normalization (8 -> 4)
+        # while keeping the tile/stage/cluster envelope intact.
+        self.assertEqual(transferred[0]["tcgen05_cluster_m"], 2)
+        self.assertEqual(
+            transferred[0]["block_sizes"],
+            [
+                TCGEN05_TWO_CTA_BLOCK_M,
+                TCGEN05_TWO_CTA_BLOCK_N,
+                TCGEN05_TARGET8_GELU_BLOCK_K,
+            ],
+        )
+
+        # The search projection promotes a cluster_m=2 + bk=128 candidate
+        # (which the for_search ab fragment caps at ab=2) back to the seed's
+        # ab=3 stage tuple, so the autotuner actually samples the fast regime.
+        promoted = helion.Config(
+            block_sizes=[
+                TCGEN05_TWO_CTA_BLOCK_M,
+                TCGEN05_TWO_CTA_BLOCK_N,
+                TCGEN05_TARGET8_GELU_BLOCK_K,
+            ],
+            indexing=["tensor_descriptor", "tensor_descriptor", "tensor_descriptor"],
+            pid_type="persistent_interleaved",
+            tcgen05_cluster_m=2,
+            tcgen05_cluster_n=1,
+            tcgen05_ab_stages=2,
+            tcgen05_acc_stages=2,
+            tcgen05_c_stages=4,
+        )
+        bound.config_spec.normalize(promoted, _fix_invalid=True)
+        self.assertEqual(
+            promoted.config["tcgen05_ab_stages"], TCGEN05_TARGET8_GELU_AB_STAGES
+        )
+        self.assertEqual(
+            promoted.config["tcgen05_c_stages"], TCGEN05_TARGET8_GELU_C_STAGES
+        )
+        # A bk=64 candidate is left in its own regime (not promoted).
+        not_promoted = helion.Config(
+            block_sizes=[TCGEN05_TWO_CTA_BLOCK_M, TCGEN05_TWO_CTA_BLOCK_N, 64],
+            indexing=["tensor_descriptor", "tensor_descriptor", "tensor_descriptor"],
+            pid_type="persistent_interleaved",
+            tcgen05_cluster_m=2,
+            tcgen05_cluster_n=1,
+            tcgen05_ab_stages=2,
+            tcgen05_acc_stages=2,
+            tcgen05_c_stages=2,
+        )
+        bound.config_spec.normalize(not_promoted, _fix_invalid=True)
+        self.assertEqual(not_promoted.config["tcgen05_ab_stages"], 2)
+        self.assertEqual(not_promoted.config["block_sizes"][2], 64)
+
+        # bf16 gelu (T19 shape) fires the detector but must NOT enable the
+        # fp16-pinned T8 seed.
+        bf16_args = (
+            torch.empty([3072, 3072], device=DEVICE, dtype=torch.bfloat16),
+            torch.empty([3072, 3072], device=DEVICE, dtype=torch.bfloat16),
+        )
+        with (
+            patch_cute_mma_support(),
+            patch("helion.language.matmul_ops._cuda_num_sms_or_zero", return_value=132),
+        ):
+            bf16_bound = cute_matmul_gelu.bind(bf16_args)
+        self.assertTrue(
+            bf16_bound.config_spec.cute_tcgen05_gelu_matmul_store_detected,
+            "plain-gelu detector also fires on the bf16 gelu shape",
+        )
+        self.assertFalse(
+            bf16_bound.config_spec._cute_tcgen05_config.target8_gelu_seed_enabled,
+            "T8 seed must stay disabled on bf16 (fp16-pinned shape fact)",
+        )
+        self.assertFalse(
+            any(
+                config.config.get("tcgen05_ab_stages") == TCGEN05_TARGET8_GELU_AB_STAGES
+                and config.config.get("block_sizes")
+                == [
+                    TCGEN05_TWO_CTA_BLOCK_M,
+                    TCGEN05_TWO_CTA_BLOCK_N,
+                    TCGEN05_TARGET8_GELU_BLOCK_K,
+                ]
+                for config in bf16_bound.config_spec.autotune_seed_configs()
+            )
+        )
+
+    @onlyBackends(["cute"])
     def test_cute_tcgen05_cluster_m2_edge_k_tail_bk_requires_tail(self) -> None:
         valid_tail = Tcgen05ClusterM2SearchConstraints(
             static_k=5000,
@@ -2506,6 +2666,95 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
                 == TCGEN05_AUX_LOAD_MODE_TMA
                 for config in spec.compiler_seed_configs
             )
+        )
+
+    @onlyBackends(["cute"])
+    def test_cute_tcgen05_aux_tma_full_tile_search_projection(self) -> None:
+        # Cycle 88 (Workstream B): on the residual full-tile cluster_m=2
+        # family (T20-shape 6144³ bf16 residual_add), the search projection
+        # ``_fix_aux_tma_full_tile_search_config`` forces cluster_m=2 SIMT
+        # candidates onto the validated aux-TMA producer regime so the
+        # +14 pp aux-TMA gain is banked deterministically. cluster_m=1
+        # candidates stay untouched.
+        @helion.kernel(backend="cute")
+        def cute_matmul_residual_add(
+            x: torch.Tensor,
+            y: torch.Tensor,
+            residual: torch.Tensor,
+        ) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = (acc + residual[tile_m, tile_n]).to(x.dtype)
+            return out
+
+        args = (
+            torch.empty([6144, 6144], device=DEVICE, dtype=torch.bfloat16),
+            torch.empty([6144, 6144], device=DEVICE, dtype=torch.bfloat16),
+            torch.empty([6144, 6144], device=DEVICE, dtype=torch.bfloat16),
+        )
+        with (
+            patch_cute_mma_support(),
+            patch("helion.language.matmul_ops._cuda_num_sms_or_zero", return_value=132),
+        ):
+            bound = cute_matmul_residual_add.bind(args)
+        spec = bound.config_spec
+        self.assertTrue(spec.cute_tcgen05_exact_shape_aux_kernel_detected)
+        self.assertTrue(spec._cute_tcgen05_config._aux_tma_full_tile_search_enabled())
+        # The aux-TMA seed is present in the compiler seed pool.
+        self.assertTrue(
+            any(
+                config.config.get(TCGEN05_AUX_LOAD_MODE_CONFIG_KEY)
+                == TCGEN05_AUX_LOAD_MODE_TMA
+                for config in spec.autotune_seed_configs()
+            )
+        )
+        # A cluster_m=2 SIMT monolithic ab=3 candidate is projected onto the
+        # aux-TMA regime (role_local_with_scheduler + warps + ab=2 + tma).
+        cm2 = helion.Config(
+            block_sizes=[256, 256, 128],
+            indexing=["tensor_descriptor", "tensor_descriptor", "tensor_descriptor"],
+            pid_type="persistent_interleaved",
+            tcgen05_cluster_m=2,
+            tcgen05_cluster_n=1,
+            tcgen05_ab_stages=3,
+            tcgen05_acc_stages=2,
+            tcgen05_c_stages=2,
+            tcgen05_strategy=Tcgen05Strategy.ROLE_LOCAL_MONOLITHIC.value,
+            tcgen05_persistence_model="static_persistent",
+        )
+        spec.normalize(cm2, _fix_invalid=True)
+        self.assertEqual(
+            cm2.config[TCGEN05_AUX_LOAD_MODE_CONFIG_KEY], TCGEN05_AUX_LOAD_MODE_TMA
+        )
+        self.assertEqual(
+            cm2.config["tcgen05_strategy"],
+            Tcgen05Strategy.ROLE_LOCAL_WITH_SCHEDULER.value,
+        )
+        self.assertEqual(cm2.config["tcgen05_ab_stages"], 2)
+        self.assertEqual(cm2.config[TCGEN05_WARP_SPEC_SCHEDULER_WARPS_KEY], 1)
+        self.assertEqual(cm2.config[TCGEN05_WARP_SPEC_C_INPUT_WARPS_KEY], 1)
+        # A cluster_m=1 candidate is left in its own regime (not forced to TMA).
+        cm1 = helion.Config(
+            block_sizes=[128, 256, 64],
+            indexing=["pointer", "tensor_descriptor", "tensor_descriptor"],
+            pid_type="flat",
+            tcgen05_cluster_m=1,
+            tcgen05_cluster_n=1,
+            tcgen05_ab_stages=2,
+            tcgen05_acc_stages=2,
+            tcgen05_c_stages=2,
+            tcgen05_strategy=Tcgen05Strategy.ROLE_LOCAL_MONOLITHIC.value,
+        )
+        spec.normalize(cm1, _fix_invalid=True)
+        self.assertEqual(cm1.config["tcgen05_cluster_m"], 1)
+        self.assertNotEqual(
+            cm1.config.get(TCGEN05_AUX_LOAD_MODE_CONFIG_KEY),
+            TCGEN05_AUX_LOAD_MODE_TMA,
         )
 
     @onlyBackends(["cute"])
