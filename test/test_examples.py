@@ -1053,7 +1053,6 @@ class TestExamples(RefEagerTestBase, TestCase):
             skip_accuracy=True,  # TODO(yf225): fix unstable numerics
         )
 
-    @xfailIfPallas("InductorLoweringError")
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
     def test_matmul_split_k(self):
         args = (

@@ -70,6 +70,33 @@ def split_k_atomic_add_kernel(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     return out
 
 
+@helion.kernel(static_shapes=True)
+def split_k_atomic_max_kernel(x: torch.Tensor) -> torch.Tensor:
+    """Split-K reduction where each K-tile contributes its max via atomic_max."""
+    m, k = x.size()
+    out = torch.full([m], -1e30, dtype=x.dtype, device=x.device)
+    for tile_m, tile_k in hl.tile([m, k]):
+        block = x[tile_m, tile_k]
+        per_row = torch.amax(block, dim=1)
+        hl.atomic_max(out, [tile_m], per_row)
+    return out
+
+
+@helion.kernel(static_shapes=True)
+def split_k_multi_atomic_kernel(
+    x: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Two atomic outputs in one kernel, both needing the scratch accumulator."""
+    m, k = x.size()
+    sum_out = torch.zeros([m], dtype=x.dtype, device=x.device)
+    sumsq_out = torch.zeros([m], dtype=x.dtype, device=x.device)
+    for tile_m, tile_k in hl.tile([m, k]):
+        block = x[tile_m, tile_k]
+        hl.atomic_add(sum_out, [tile_m], torch.sum(block, dim=1))
+        hl.atomic_add(sumsq_out, [tile_m], torch.sum(block * block, dim=1))
+    return sum_out, sumsq_out
+
+
 @helion.kernel()
 def atomic_add_f32_into_bf16_kernel(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     """Test atomic_add where value dtype (float32) differs from output (bfloat16)."""
@@ -454,6 +481,149 @@ class TestAtomicOperations(RefEagerTestBase, TestCase):
             torch.bfloat16
         )
         torch.testing.assert_close(result, expected, atol=0.1, rtol=0.05)
+
+    def _run_split_k_atomic_max(self, loop_type: str | None) -> None:
+        m, k = 128, 512
+        x = torch.randn(m, k, device=DEVICE, dtype=torch.float32)
+        kwargs = {"pallas_loop_type": loop_type} if loop_type else {}
+        _, result = code_and_output(
+            split_k_atomic_max_kernel,
+            (x,),
+            block_sizes=[32, 128],
+            **kwargs,
+        )
+        torch.testing.assert_close(result, torch.amax(x, dim=1))
+
+    @onlyBackends(["pallas"])
+    def test_split_k_atomic_max_fori(self):
+        self._run_split_k_atomic_max("fori_loop")
+
+    @onlyBackends(["pallas"])
+    def test_split_k_atomic_max_pipeline(self):
+        self._run_split_k_atomic_max("emit_pipeline")
+
+    @onlyBackends(["pallas"])
+    def test_split_k_atomic_max_default(self):
+        self._run_split_k_atomic_max(None)
+
+    def _run_split_k_multi_atomic(self, loop_type: str | None) -> None:
+        m, k = 128, 512
+        x = torch.randn(m, k, device=DEVICE, dtype=torch.float32)
+        kwargs = {"pallas_loop_type": loop_type} if loop_type else {}
+        _, (sum_out, sumsq_out) = code_and_output(
+            split_k_multi_atomic_kernel,
+            (x,),
+            block_sizes=[32, 128],
+            **kwargs,
+        )
+        torch.testing.assert_close(sum_out, torch.sum(x, dim=1))
+        torch.testing.assert_close(sumsq_out, torch.sum(x * x, dim=1))
+
+    @onlyBackends(["pallas"])
+    def test_split_k_multi_atomic_outputs_fori(self):
+        self._run_split_k_multi_atomic("fori_loop")
+
+    @onlyBackends(["pallas"])
+    def test_split_k_multi_atomic_outputs_pipeline(self):
+        self._run_split_k_multi_atomic("emit_pipeline")
+
+    @onlyBackends(["pallas"])
+    def test_split_k_multi_atomic_outputs_default(self):
+        self._run_split_k_multi_atomic(None)
+
+    def _run_split_k_add(
+        self,
+        loop_type: str | None,
+        m: int = 128,
+        k: int = 512,
+        n: int = 128,
+        block_m: int = 32,
+        block_n: int = 128,
+        block_k: int = 128,
+        inner_k: int = 128,
+    ) -> None:
+        """Split-K matmul via atomic_add, verify on all launchers."""
+        x = torch.randn(m, k, device=DEVICE, dtype=torch.float32)
+        y = torch.randn(k, n, device=DEVICE, dtype=torch.float32)
+        kwargs = {"pallas_loop_type": loop_type} if loop_type else {}
+        _, result = code_and_output(
+            split_k_atomic_add_kernel,
+            (x, y),
+            block_sizes=[block_m, block_n, block_k, inner_k],
+            **kwargs,
+        )
+        # out starts as ones (see kernel), plus matmul result
+        expected = torch.ones(m, n, device=DEVICE, dtype=torch.float32) + x @ y
+        torch.testing.assert_close(result, expected, atol=0.5, rtol=0.05)
+
+    @onlyBackends(["pallas"])
+    def test_split_k_add_fori(self):
+        self._run_split_k_add("fori_loop")
+
+    @onlyBackends(["pallas"])
+    def test_split_k_add_pipeline(self):
+        self._run_split_k_add("emit_pipeline")
+
+    @onlyBackends(["pallas"])
+    def test_split_k_add_default(self):
+        self._run_split_k_add(None)
+
+    def _run_split_k_add_various_splits(self, loop_type: str) -> None:
+        m, k, n = 128, 1024, 128
+        x = torch.randn(m, k, device=DEVICE, dtype=torch.float32)
+        y = torch.randn(k, n, device=DEVICE, dtype=torch.float32)
+        expected = torch.ones(m, n, device=DEVICE, dtype=torch.float32) + x @ y
+        for split_k in (1, 2, 4, 8):
+            k_block = max(128, k // split_k)
+            _, result = code_and_output(
+                split_k_atomic_add_kernel,
+                (x, y),
+                block_sizes=[32, 128, k_block, 128],
+                pallas_loop_type=loop_type,
+            )
+            torch.testing.assert_close(
+                result,
+                expected,
+                atol=0.5,
+                rtol=0.05,
+                msg=f"Failed at split_k={split_k} loop_type={loop_type}",
+            )
+
+    @onlyBackends(["pallas"])
+    def test_split_k_add_various_splits_fori(self):
+        self._run_split_k_add_various_splits("fori_loop")
+
+    @onlyBackends(["pallas"])
+    def test_split_k_add_various_splits_pipeline(self):
+        self._run_split_k_add_various_splits("emit_pipeline")
+
+    # TODO(thcmbs): default launcher can't handle SymInt loop bounds
+    # (TracerIntegerConversionError).  Add default variant once fixed.
+
+    def _run_split_k_add_bf16(self, loop_type: str) -> None:
+        m, k, n = 128, 512, 128
+        x = torch.randn(m, k, device=DEVICE).to(torch.bfloat16)
+        y = torch.randn(k, n, device=DEVICE).to(torch.bfloat16)
+        _, result = code_and_output(
+            split_k_atomic_add_kernel,
+            (x, y),
+            block_sizes=[128, 128, 128, 128],
+            pallas_loop_type=loop_type,
+        )
+        expected = torch.ones(m, n, device=DEVICE, dtype=torch.bfloat16) + (x @ y).to(
+            torch.bfloat16
+        )
+        torch.testing.assert_close(result, expected, atol=2.0, rtol=0.1)
+
+    @onlyBackends(["pallas"])
+    def test_split_k_add_bf16_fori(self):
+        self._run_split_k_add_bf16("fori_loop")
+
+    @onlyBackends(["pallas"])
+    def test_split_k_add_bf16_pipeline(self):
+        self._run_split_k_add_bf16("emit_pipeline")
+
+    # TODO(thcmbs): same default-launcher SymInt limitation as above.
 
     def test_atomic_add_code_generation(self):
         """Test that the generated code contains atomic_add."""

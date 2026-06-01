@@ -27,6 +27,8 @@ from .._compiler.cute.tcgen05_constants import (
 )
 from .._compiler.cute.tcgen05_constants import TCGEN05_DIRECT_ENTRY_TOTAL_WORK_CLUSTERS
 from .._utils import triton_is_available
+from ._pallas_rmw import _grid_rmw_apply
+from ._pallas_rmw import _grid_rmw_plan
 from .config import Config as Config
 from .kernel import Kernel as Kernel
 from .kernel import kernel as kernel
@@ -900,6 +902,7 @@ def default_pallas_launcher(
     _smem_arg_indices: list[int] | None = None,
     _ds_pad_dims: list[tuple[int, int, int, int]] | None = None,
     _pallas_interpret: bool | None = None,
+    _atomic_indices: list[int] | None = None,
     **kwargs: object,
 ) -> object:
     """Default launcher for Pallas kernels on TPU (or CPU with interpret=True).
@@ -912,7 +915,9 @@ def default_pallas_launcher(
 
     Output-only tensors (in ``_output_indices`` but not in ``_inplace_indices``)
     are excluded from pallas_call inputs to save VMEM.  Their results are
-    returned as torch tensors.
+    returned as torch tensors.  ``_atomic_indices`` lists outputs written via
+    ``hl.atomic_*``; see :func:`_grid_rmw_plan` for the multi-cell VMEM
+    scratch path.
     """
     from .settings import is_pallas_interpret
 
@@ -953,6 +958,7 @@ def default_pallas_launcher(
         ) = _pallas_prepare_args(
             args, _output_indices, _inplace_indices, interpret=interpret
         )
+        output_only_set: set[int] = set(output_only_indices)
 
         in_specs, out_specs = _pallas_build_block_specs(
             pl,
@@ -967,6 +973,10 @@ def default_pallas_launcher(
             output_only_indices,
         )
 
+        dim_sem, scratch_tiles = _grid_rmw_plan(
+            grid, args, _atomic_indices, _block_spec_info, arg_to_tensor_pos
+        )
+
         reordered_kernel = _pallas_make_reordered_kernel(
             pallas_kernel,
             args,
@@ -977,6 +987,19 @@ def default_pallas_launcher(
             inplace_positions,
             arg_to_tensor_pos,
             _smem_arg_indices=_smem_arg_indices,
+            skip_inplace_copy=output_only_set | set(scratch_tiles),
+        )
+
+        reordered_kernel, scratch_shapes = _grid_rmw_apply(
+            reordered_kernel,
+            scratch_tiles,
+            dim_sem,
+            args,
+            arg_to_tensor_pos,
+            _output_indices,
+            n_tensor_inputs,
+            grid,
+            pltpu,
         )
 
         out_shape_arg = out_shapes if len(out_shapes) > 1 else out_shapes[0]
@@ -986,7 +1009,7 @@ def default_pallas_launcher(
             pltpu,
             in_specs,
             out_specs,
-            None,
+            scratch_shapes,
             args,
             tensor_arg_indices,
             _output_indices,
@@ -999,15 +1022,34 @@ def default_pallas_launcher(
                 f"Estimated {estimated_vmem / 1e6:.2f}MB exceeds {vmem_limit_bytes / 1e6:.2f}MB vmem capacity."
             )
 
-        pallas_call_kwargs: dict[str, object] = {
-            "out_shape": out_shape_arg,
-            "grid": grid,
-        }
+        if scratch_shapes:
+            grid_spec = pltpu.PrefetchScalarGridSpec(
+                num_scalar_prefetch=0,
+                in_specs=list(in_specs) if in_specs is not None else [],
+                out_specs=out_specs if out_specs is not None else [],
+                scratch_shapes=scratch_shapes,  # pyrefly: ignore[bad-argument-type]
+                grid=grid,
+            )
+            pallas_call_kwargs: dict[str, object] = {
+                "out_shape": out_shape_arg,
+                "input_output_aliases": pallas_aliases,
+                "grid_spec": grid_spec,
+                "compiler_params": pltpu.CompilerParams(  # pyrefly: ignore[bad-instantiation]
+                    dimension_semantics=dim_sem,  # pyrefly: ignore[bad-argument-type]
+                ),
+            }
+        else:
+            pallas_call_kwargs = {
+                "out_shape": out_shape_arg,
+                "input_output_aliases": pallas_aliases,
+                "grid": grid,
+            }
+            if in_specs is not None:
+                pallas_call_kwargs["in_specs"] = in_specs
+                pallas_call_kwargs["out_specs"] = out_specs
+
         if interpret:
             pallas_call_kwargs["interpret"] = True
-        if in_specs is not None:
-            pallas_call_kwargs["in_specs"] = in_specs
-            pallas_call_kwargs["out_specs"] = out_specs
 
         jit_fn = pl.pallas_call(
             reordered_kernel,  # pyrefly: ignore[bad-argument-type]
@@ -1049,13 +1091,14 @@ def default_pallas_pipeline_launcher(
     _ds_pad_dims: list[tuple[int, int, int, int]] | None = None,
     _smem_arg_indices: list[int] | None = None,
     _pallas_interpret: bool | None = None,
+    _atomic_indices: list[int] | None = None,
     **kwargs: object,
 ) -> object:
     """Launcher for Pallas kernels using PrefetchScalarGridSpec with scratch memory.
 
-    Used when ``pallas_loop_type='emit_pipeline'``.  Pipeline-body tensors
-    (listed in ``_pipeline_arg_indices``) use HBM refs; all other tensors
-    get proper BlockSpecs for automatic VMEM prefetch.
+    Pipeline-body tensors (``_pipeline_arg_indices``) use HBM refs; the
+    rest get BlockSpecs for automatic VMEM prefetch.  ``_atomic_indices``:
+    see :func:`default_pallas_launcher`.
     """
     from .settings import is_pallas_interpret
 
@@ -1133,7 +1176,10 @@ def default_pallas_pipeline_launcher(
             smem_arg_indices=_smem_arg_indices,
         )
 
-        _pipeline_set = set(_pipeline_arg_indices or [])
+        _pipeline_set: set[int] = set(_pipeline_arg_indices or [])
+        dim_sem, scratch_tiles = _grid_rmw_plan(
+            grid, args, _atomic_indices, _block_spec_info, arg_to_tensor_pos
+        )
         reordered_kernel = _pallas_make_reordered_kernel(
             pallas_kernel,
             args,
@@ -1144,9 +1190,21 @@ def default_pallas_pipeline_launcher(
             inplace_positions,
             arg_to_tensor_pos,
             n_extra_refs=len(scratch_shapes),
-            skip_inplace_copy=_pipeline_set,
+            skip_inplace_copy=_pipeline_set | set(scratch_tiles),
             _smem_arg_indices=_smem_arg_indices,
         )
+        reordered_kernel, rmw_extras = _grid_rmw_apply(
+            reordered_kernel,
+            scratch_tiles,
+            dim_sem,
+            args,
+            arg_to_tensor_pos,
+            _output_indices,
+            n_tensor_inputs,
+            grid,
+            pltpu,
+        )
+        scratch_shapes.extend(rmw_extras)  # pyrefly: ignore[bad-argument-type]
 
         out_shape_arg = out_shapes if len(out_shapes) > 1 else out_shapes[0]
 
@@ -1180,7 +1238,7 @@ def default_pallas_pipeline_launcher(
             "out_shape": out_shape_arg,
             "grid_spec": grid_spec,
             "compiler_params": pltpu.CompilerParams(  # pyrefly: ignore[bad-instantiation]
-                dimension_semantics=tuple("parallel" for _ in grid),
+                dimension_semantics=dim_sem,  # pyrefly: ignore[bad-argument-type]
             ),
         }
         if interpret:
@@ -1226,15 +1284,15 @@ def default_pallas_fori_launcher(
     _ds_pad_dims: list[tuple[int, int, int, int]] | None = None,
     _smem_arg_indices: list[int] | None = None,
     _pallas_interpret: bool | None = None,
+    _atomic_indices: list[int] | None = None,
     **kwargs: object,
 ) -> object:
     """Launcher for Pallas kernels using fori_loop with manual DMA.
 
-    Used when ``pallas_loop_type="fori_loop"``.  Passes all tensors as
-    ``memory_space=pl.ANY`` (HBM refs) and adds scratch buffers as
-    ``pltpu.VMEM`` shapes plus ``pltpu.SemaphoreType.DMA`` for async copies.
-    The kernel uses ``jax.lax.fori_loop`` with ``pltpu.make_async_copy``
-    internally for DMA control.
+    All tensors are HBM refs; the kernel drives DMA via
+    ``pltpu.make_async_copy`` inside ``jax.lax.fori_loop``.  Scratch
+    buffers are ``pltpu.VMEM`` plus ``pltpu.SemaphoreType.DMA`` for the
+    async copies.  ``_atomic_indices``: see :func:`default_pallas_launcher`.
     """
     from .settings import is_pallas_interpret
 
@@ -1294,6 +1352,7 @@ def default_pallas_fori_launcher(
         # Build in_specs/out_specs: proper BlockSpecs for outer grid dims,
         # HBM refs for tensors used in the fori_loop body (DMA handles tiling).
         _fori_pipeline_indices = kwargs.get("_pipeline_arg_indices")
+        _fori_pipeline_set: set[int] = set(_fori_pipeline_indices or [])  # type: ignore[arg-type]
         assert _block_spec_info is not None, (
             "fori_loop launcher requires _block_spec_info from codegen"
         )
@@ -1311,7 +1370,9 @@ def default_pallas_fori_launcher(
             smem_arg_indices=_smem_arg_indices,
         )
 
-        _fori_pipeline_set = set(_fori_pipeline_indices or [])  # type: ignore[arg-type]
+        dim_sem, scratch_tiles = _grid_rmw_plan(
+            grid, args, _atomic_indices, _block_spec_info, arg_to_tensor_pos
+        )
         reordered_kernel = _pallas_make_reordered_kernel(
             pallas_kernel,
             args,
@@ -1322,9 +1383,21 @@ def default_pallas_fori_launcher(
             inplace_positions,
             arg_to_tensor_pos,
             n_extra_refs=len(scratch_shapes),
-            skip_inplace_copy=_fori_pipeline_set,
+            skip_inplace_copy=_fori_pipeline_set | set(scratch_tiles),
             _smem_arg_indices=_smem_arg_indices,
         )
+        reordered_kernel, rmw_extras = _grid_rmw_apply(
+            reordered_kernel,
+            scratch_tiles,
+            dim_sem,
+            args,
+            arg_to_tensor_pos,
+            _output_indices,
+            n_tensor_inputs,
+            grid,
+            pltpu,
+        )
+        scratch_shapes.extend(rmw_extras)  # pyrefly: ignore[bad-argument-type]
 
         out_shape_arg = out_shapes if len(out_shapes) > 1 else out_shapes[0]
 
@@ -1358,7 +1431,7 @@ def default_pallas_fori_launcher(
             "out_shape": out_shape_arg,
             "grid_spec": grid_spec,
             "compiler_params": pltpu.CompilerParams(  # pyrefly: ignore[bad-instantiation]
-                dimension_semantics=tuple("parallel" for _ in grid),
+                dimension_semantics=dim_sem,  # pyrefly: ignore[bad-argument-type]
             ),
         }
         if interpret:

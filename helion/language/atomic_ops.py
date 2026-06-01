@@ -11,6 +11,7 @@ from torch.fx import has_side_effect
 
 from .. import exc
 from .._compiler.ast_extension import expr_from_string
+from .._compiler.compile_environment import CompileEnvironment
 from .._compiler.compile_environment import _symint_expr
 from .._compiler.host_function import HostFunction
 from .._compiler.indexing_strategy import SubscriptIndexing
@@ -764,7 +765,9 @@ def _pallas_atomic_load_prev(
     if target not in host_function.tensor_to_origin:
         raise exc.AtomicOnDeviceTensor("pallas atomic")
 
-    name = state.device_function.tensor_arg(target).name
+    tensor_arg = state.device_function.tensor_arg(target)
+    name = tensor_arg.name
+    CompileEnvironment.current().atomic_target_host_names.add(tensor_arg.host_str())
     index_str, _ = pallas_codegen.index_str(state, index, target)
 
     prev_var = state.device_function.new_var("_prev", dce=True)
@@ -1010,15 +1013,16 @@ def _(state: CodegenState) -> ast.AST:
 
     name, index_str, prev_var = _pallas_atomic_load_prev(state)
     value_ast = _to_ast_values([state.ast_args[2]])[0]
-    target = state.proxy_arg(0)
-    assert isinstance(target, torch.Tensor)
+    # Cast value to the ref's dtype, not the target tensor's dtype, so the
+    # RMW stays in scratch dtype when ``runtime._apply_atomic_accumulator``
+    # promotes a bf16/f16 target to an f32 VMEM scratch.
     backend = CompileEnvironment.current().backend
-    target_dtype = backend.dtype_str(target.dtype)
-    # Cast the sum to the target dtype so the store doesn't fail when
-    # the value dtype differs (e.g. float32 accumulator into bfloat16 ref).
-    cast = backend.cast_expr(f"{prev_var} + {{value}}", target_dtype)
+    cast = backend.cast_expr("{value}", f"{prev_var}.dtype")
     state.codegen.add_statement(
-        statement_from_string(f"{name}[{index_str}] = {cast}", value=value_ast)
+        statement_from_string(
+            f"{name}[{index_str}] = {prev_var} + {cast}",
+            value=value_ast,
+        )
     )
     return expr_from_string(prev_var)
 
