@@ -1512,8 +1512,25 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
                     block_shape_parts.append(str(int(shape[dim_idx])))
                 lambda_parts.append(pid_var)
             else:
-                block_shape_parts.append(str(int(shape[dim_idx])))
-                lambda_parts.append("0")
+                idx_meta = (
+                    subscript_meta[dim_idx]
+                    if dim_idx < len(subscript_meta)
+                    else slice(None)
+                )
+                from helion._utils import is_scalar_index
+
+                if is_scalar_index(idx_meta):
+                    block_shape_parts.append("1")
+                    if isinstance(idx_meta, torch.Tensor):
+                        var_name = state.device_function.tensor_arg(idx_meta).name
+                        lambda_parts.append(var_name)
+                    else:
+                        lambda_parts.append(
+                            state.device_function.literal_expr(idx_meta)
+                        )
+                else:
+                    block_shape_parts.append(str(int(shape[dim_idx])))
+                    lambda_parts.append("0")
 
         block_shape_str = ", ".join(block_shape_parts)
         lambda_body = ", ".join(lambda_parts)
@@ -1803,7 +1820,13 @@ def _compute_vmem_shapes(
                 else:
                     parts.append(int(fake.shape[dim_idx]))
             else:
-                parts.append(int(fake.shape[dim_idx]))
+                idx_meta = sub_meta[dim_idx] if dim_idx < len(sub_meta) else slice(None)
+                from helion._utils import is_scalar_index
+
+                if is_scalar_index(idx_meta):
+                    parts.append(1)
+                else:
+                    parts.append(int(fake.shape[dim_idx]))
         vmem_shapes.append(tuple(parts))
     return vmem_shapes
 
