@@ -525,6 +525,21 @@ class PersistentReductionStrategy(ReductionStrategy):
             lane_extent = env.backend.create_synthetic_reduction_lanes(
                 self._thread_count, size_hint
             )
+            # When the reduction extent exceeds the live thread count a
+            # synthetic lane loop serializes the excess and codegen_reduction
+            # folds each lane into a per-thread accumulator. The cross-thread
+            # combine then runs as a single warp reduction inside that loop,
+            # which is only correct within one warp -- the cross-warp two-stage
+            # path is incompatible with the lane loop. Cap the thread count to
+            # the warp size so the per-lane warp reduction stays correct; the
+            # lane loop grows to cover the rest (issue #2643).
+            if lane_extent is not None and (
+                self._thread_count > _CUTE_WARP_REDUCTION_THREADS
+            ):
+                self._thread_count = _CUTE_WARP_REDUCTION_THREADS
+                lane_extent = env.backend.create_synthetic_reduction_lanes(
+                    self._thread_count, size_hint
+                )
             if lane_extent is not None:
                 self._synthetic_cute_lane_var = fn.new_var(
                     f"synthetic_lane_{block_index}",
@@ -716,9 +731,37 @@ class PersistentReductionStrategy(ReductionStrategy):
             )
         acc_dtype = get_computation_dtype(fake_input.dtype)
         default = ir.Reduction.default_accumulator(reduction_type, acc_dtype)
+        reduce_input = input_name
+        if (
+            self._synthetic_cute_lane_var is not None
+            and isinstance(default, (float, int, bool))
+            and not backend.is_indexed_reduction(reduction_type)
+        ):
+            # Synthetic-lane persistent reduction (CuTe): the reduction extent
+            # exceeds the live thread count, so the reduction body runs inside
+            # a synthetic lane loop (see codegen_preamble) that wraps the whole
+            # device body. Carry a per-thread accumulator across lanes -- init
+            # it before the loop and fold each lane's value in -- so the warp
+            # reduction on the final lane sees every element. Without this the
+            # warp reduction would only combine the last lane's slice and drop
+            # the rest, silently returning a wrong result (issue #2643).
+            current_grid = state.codegen.current_grid_state
+            assert isinstance(current_grid, DeviceGridState)
+            assert state.fx_node is not None
+            shape_dims = self.fn.tile_strategy.shape_dims([*fake_input.size()])
+            acc = self.fn.new_var(f"{state.fx_node.name}_acc", dce=True)
+            current_grid.outer_prefix.append(
+                statement_from_string(
+                    f"{acc} = {backend.full_expr(shape_dims, constant_repr(default), acc_dtype)}"
+                )
+            )
+            state.add_statement(
+                f"{acc} = {backend.reduction_combine_expr(reduction_type, acc, input_name, acc_dtype)}"
+            )
+            reduce_input = acc
         if isinstance(default, (float, int, bool)):
             cross_warp = self._cute_cross_warp_reduction_expr(
-                state, input_name, reduction_type, default, acc_dtype
+                state, reduce_input, reduction_type, default, acc_dtype
             )
         else:
             cross_warp = None
@@ -726,7 +769,7 @@ class PersistentReductionStrategy(ReductionStrategy):
             expr = cross_warp
         else:
             expr = self.call_reduction_function(
-                input_name,
+                reduce_input,
                 reduction_type,
                 dim,
                 fake_input,
