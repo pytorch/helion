@@ -15,6 +15,7 @@ from ..exc import InvalidConfig
 from .block_id_sequence import BlockIdSequence
 from .config_fragment import Category
 from .config_fragment import ConfigSpecFragment
+from .config_fragment import ListOf
 from .config_fragment import PowerOfTwoFragment
 from .config_spec import shrink_block_sizes_for_numel_constraints
 from helion._dist_utils import sync_seed
@@ -31,6 +32,15 @@ FlatConfig = list[object]
 
 
 TRITON_MAX_TENSOR_NUMEL = 1048576
+
+
+def _value_or(value: object, fallback: Callable[[], object]) -> object:
+    """Return ``value`` unless it is ``None``, in which case call ``fallback``.
+
+    Used by the biased sampler: a prior returns ``None`` to decline a slot, and
+    the slot then falls back to the fragment's uniform ``random()``.
+    """
+    return fallback() if value is None else value
 
 
 class ConfigGeneration:
@@ -518,13 +528,21 @@ class ConfigGeneration:
         with sync_seed(process_group_name=self.process_group_name):
             config: FlatConfig = []
             for i, spec in enumerate(self.flat_spec):
-                value: object | None = None
                 key_pos = index_to_key_pos.get(i)
-                if key_pos is not None:
-                    prior = priors.get(key_pos[0])
-                    if prior is not None:
-                        value = prior(spec, key_pos[1])
-                config.append(spec.random() if value is None else value)
+                prior = priors.get(key_pos[0]) if key_pos is not None else None
+                if prior is None or key_pos is None:
+                    config.append(spec.random())
+                elif isinstance(spec, ListOf):
+                    # A list-valued key (e.g. ``indexing``) occupies one flat slot
+                    # holding a list; bias each element via the inner fragment.
+                    config.append(
+                        [
+                            _value_or(prior(spec.inner, j), spec.inner.random)
+                            for j in range(spec.length)
+                        ]
+                    )
+                else:
+                    config.append(_value_or(prior(spec, key_pos[1]), spec.random))
             self.shrink_config(config, PowerOfTwoFragment(1, 2048, 32).random())
             self._repair_cute_num_threads(config)
             return config

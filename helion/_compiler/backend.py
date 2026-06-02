@@ -2938,6 +2938,63 @@ class CuteBackend(Backend):
 
         check_cute_backend_requirements()
 
+    def config_value_priors(self, config_spec: ConfigSpec) -> dict[str, ValuePrior]:
+        """Bias the random half of the initial population toward the config
+        family that performs well on Blackwell tcgen05 kernels.
+
+        This encodes, as a distribution, what the backend's former hardcoded
+        per-shape seed configs all converged on: a 2-CTA, TMA-fed,
+        role-local-monolithic, static-persistent, tvm-ffi launch with deep AB
+        staging and a 4-warp epilogue. Keys a given kernel does not expose
+        (e.g. the ``tcgen05_*`` keys on a pointwise/reduction kernel) are
+        ignored, and values a fragment cannot represent are dropped, so the
+        priors are safe for any cute kernel -- a non-matmul kernel just picks up
+        the generic biases (TMA indexing, 8 warps) on whichever keys it has.
+        """
+        from ..autotuner.config_priors import weighted_choice
+        from .cute.strategies import TCGEN05_PERSISTENCE_MODEL_CONFIG_KEY
+        from .cute.strategies import TCGEN05_STRATEGY_CONFIG_KEY
+        from .cute.strategies import Tcgen05PersistenceModel
+        from .cute.strategies import Tcgen05Strategy
+        from .cute.tcgen05_constants import TCGEN05_TWO_CTA_SEED_PID_TYPE
+
+        return {
+            # Generic knobs shared by every cute kernel.
+            "num_warps": weighted_choice({8: 4.0, 4: 2.0, 16: 1.0}),
+            "num_stages": weighted_choice({4: 3.0, 3: 2.0, 2: 1.0}),
+            "indexing": weighted_choice(
+                {"tensor_descriptor": 4.0, "pointer": 1.0, "block_ptr": 1.0}
+            ),
+            "pid_type": weighted_choice(
+                {
+                    TCGEN05_TWO_CTA_SEED_PID_TYPE: 3.0,
+                    "flat": 1.0,
+                    "persistent_blocked": 1.0,
+                }
+            ),
+            # tcgen05 / 2-CTA matmul knobs (absent on non-matmul kernels).
+            "tcgen05_cluster_m": weighted_choice({2: 3.0, 1: 1.0}),
+            "tcgen05_ab_stages": weighted_choice(
+                {3: 3.0, 4: 2.0, 5: 1.0, 6: 1.0, 2: 1.0}
+            ),
+            "tcgen05_acc_stages": weighted_choice({2: 4.0, 1: 1.0}),
+            "tcgen05_c_stages": weighted_choice({2: 3.0, 4: 2.0, 1: 1.0}),
+            "tcgen05_num_epi_warps": weighted_choice({4: 3.0, 2: 1.0, 8: 1.0}),
+            TCGEN05_STRATEGY_CONFIG_KEY: weighted_choice(
+                {
+                    Tcgen05Strategy.ROLE_LOCAL_MONOLITHIC.value: 3.0,
+                    Tcgen05Strategy.ROLE_LOCAL_WITH_SCHEDULER.value: 1.0,
+                }
+            ),
+            TCGEN05_PERSISTENCE_MODEL_CONFIG_KEY: weighted_choice(
+                {
+                    Tcgen05PersistenceModel.STATIC_PERSISTENT.value: 3.0,
+                    Tcgen05PersistenceModel.CLC_PERSISTENT.value: 1.0,
+                }
+            ),
+            TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY: weighted_choice({True: 3.0, False: 1.0}),
+        }
+
     def customize_ast(self, hf: HostFunction) -> None:
         """CuTe-specific AST rewrites that rewrite high-level patterns into
         equivalent forms that compile to materially faster code.
