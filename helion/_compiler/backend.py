@@ -33,6 +33,8 @@ if TYPE_CHECKING:
     from torch._inductor.ops_handler import OpsHandler
 
     from ..autotuner.config_fragment import ConfigSpecFragment
+    from ..autotuner.config_priors import ValuePrior
+    from ..autotuner.config_spec import ConfigSpec
     from ..runtime.config import Config
     from ..runtime.kernel import BoundKernel
     from .device_function import Argument
@@ -120,6 +122,20 @@ class Backend(abc.ABC):
         instead of crashing deep in codegen. The default is a no-op.
         """
         return None
+
+    def config_value_priors(self, config_spec: ConfigSpec) -> dict[str, ValuePrior]:
+        """Per-config-key priors that bias the autotuner's random exploration.
+
+        Returns a mapping from config-key name (e.g. ``"num_warps"``,
+        ``"indexing"``, ``"tcgen05_cluster_m"``) to a
+        :data:`~helion.autotuner.config_priors.ValuePrior`. Half of the random
+        portion of the initial population is drawn using these priors (the other
+        half stays uniform), so the search starts denser in the region good
+        configs tend to occupy without losing coverage. Keys without a prior --
+        and every key when this returns an empty mapping -- are sampled
+        uniformly. The default is no bias.
+        """
+        return {}
 
     @abc.abstractmethod
     def dtype_str(self, dtype: torch.dtype) -> str:
