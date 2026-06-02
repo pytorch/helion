@@ -16,7 +16,6 @@ from helion._testing import skipIfMetal
 from helion._testing import skipIfXPU
 from helion._testing import skipUnlessTensorDescriptor
 from helion._testing import xfailIfPallas
-from helion._testing import xfailIfPallasInterpret
 from helion._testing import xfailIfPallasTpu
 import helion.language as hl
 
@@ -168,7 +167,6 @@ class TestGrid(RefEagerTestBase, TestCase):
         code, result = code_and_output(grid_2d_idx_nested, args)
         torch.testing.assert_close(result, grid_2d_pytorch(args[0], args[1]))
 
-    @xfailIfPallasInterpret("numerical mismatch in JAX interpret mode")
     @skipIfMetal("BUG: hl.grid begin/end broken with CuteNDTileStrategy on Metal")
     def test_grid_begin_end(self):
         @helion.kernel(autotune_effort="none")
@@ -232,7 +230,6 @@ class TestGrid(RefEagerTestBase, TestCase):
         code, result = code_and_output(grid_end_step_kwarg, (x,))
         torch.testing.assert_close(result, grid_end_step_kwarg_pytorch(x))
 
-    @xfailIfPallasInterpret("numerical mismatch in JAX interpret mode")
     def test_grid_multidim_begin_end(self):
         @helion.kernel(autotune_effort="none")
         def grid_multidim_begin_end(x: torch.Tensor) -> torch.Tensor:
