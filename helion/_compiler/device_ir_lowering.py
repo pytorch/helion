@@ -105,9 +105,6 @@ class DeviceIRLowering:
         device_ir.register_rollable_reductions()
         detect_epilogue_subtiling(device_ir)
         register_grid_and_pid_constraints(device_ir)
-        register_load_store_tunables(device_ir)
-        register_atomic_tunables(device_ir)
-        register_tensor_descriptor_layout_guards(device_ir)
 
 
 # ── Shared helpers ──────────────────────────────────────────────────
