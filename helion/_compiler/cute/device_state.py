@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING
 from ... import exc
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
     from collections.abc import Sequence
 
     import torch
@@ -237,6 +238,20 @@ class CuteDeviceFunctionState:
     def __init__(self) -> None:
         self._tcgen05_store_values: dict[str, CuteTcgen05StoreValue] = {}
         self._tcgen05_consumed_store_value_ids: set[int] = set()
+        # tcgen05 TMA-store atom/tensor kernel-arg names are allocated once per
+        # matmul accumulator. When a single accumulator fans out to multiple
+        # output stores (e.g. aux = pre-activation, out = gelu(pre)), each store
+        # site must emit its own descriptor kernel params or the generated
+        # function gets duplicate argument names. Track which StoreValue object
+        # ids have already emitted their TMA-store kernel params so 2nd+ store
+        # sites can allocate fresh per-store names.
+        self._tcgen05_emitted_tma_store_value_ids: set[int] = set()
+        # Snapshot of the accumulator consumer-state stage index, keyed by the
+        # acc consumer-state variable name. A multi-store fan-out reads the same
+        # accumulator TMEM stage; the primary store advances the consumer state
+        # after its loop, so later stores must read the stage index captured
+        # before that advance instead of the live (already-advanced) index.
+        self._tcgen05_acc_stage_index_vars: dict[str, str] = {}
         # FX matmul / hl.dot / addmm nodes lowered through tcgen05. The store
         # path uses this to recognize fused epilogue chains that must use the
         # tcgen05 store splice instead of falling through to SIMT store codegen.
@@ -307,6 +322,42 @@ class CuteDeviceFunctionState:
             return value
         return None
 
+    def get_or_create_tcgen05_acc_stage_index_var(
+        self,
+        acc_consumer_state: str,
+        new_var: Callable[[str], str],
+    ) -> tuple[str, bool]:
+        """Return (snapshot_var, is_new) for an accumulator's stage index.
+
+        The first (primary) store of an accumulator captures the consumer-state
+        stage index into this variable before it advances the consumer state.
+        Later fan-out stores reuse the snapshot so they read the same live
+        accumulator TMEM stage. ``is_new`` is True only for the primary store,
+        which must emit the ``<var> = <acc_consumer_state>.index`` assignment.
+        """
+        existing = self._tcgen05_acc_stage_index_vars.get(acc_consumer_state)
+        if existing is not None:
+            return existing, False
+        snapshot = new_var("tcgen05_acc_stage_index")
+        self._tcgen05_acc_stage_index_vars[acc_consumer_state] = snapshot
+        return snapshot, True
+
+    def tcgen05_tma_store_names_already_emitted(
+        self, value: CuteTcgen05StoreValue
+    ) -> bool:
+        """Return whether this StoreValue already emitted TMA-store kernel params.
+
+        The first store site that uses a given accumulator's StoreValue keeps the
+        per-matmul ``tma_store_atom`` / ``tma_store_tensor`` names. Later store
+        sites fanning out from the same accumulator must allocate fresh per-store
+        names so the generated kernel signature has no duplicate parameters and so
+        each store binds its own TMA descriptor.
+        """
+        value_id = id(value)
+        already_emitted = value_id in self._tcgen05_emitted_tma_store_value_ids
+        self._tcgen05_emitted_tma_store_value_ids.add(value_id)
+        return already_emitted
+
     def register_tcgen05_matmul_plan(self, plan: CuteTcgen05MatmulPlan) -> None:
         if self.matmul_plan is not None:
             if self.matmul_plan != plan:
@@ -355,6 +406,29 @@ class CuteDeviceFunctionState:
 
     def is_tcgen05_post_loop(self, stmt: ast.stmt) -> bool:
         return id(stmt) in self._post_loop_stmt_ids
+
+    def move_tcgen05_post_loop_stmts_to_end(self, body: list[ast.AST]) -> list[ast.AST]:
+        """Reorder ``body`` so post-loop-tagged statements run last.
+
+        The persistent codegen path pulls post-loop cleanup out of the work-tile
+        loop. The non-persistent (flat-grid) path leaves those statements where
+        the store lowering emitted them. When a single accumulator fans out to
+        multiple stores, the primary store's matmul drain / TMEM-free teardown is
+        emitted inline before later store bodies; the teardown must instead run
+        after every store has read the still-live accumulator TMEM. Moving the
+        tagged statements to the end (preserving relative order) keeps the
+        single-store case a no-op while fixing the fan-out ordering.
+        """
+        if not self._post_loop_stmt_ids:
+            return body
+        remaining: list[ast.AST] = []
+        post_loop: list[ast.AST] = []
+        for stmt in body:
+            if id(stmt) in self._post_loop_stmt_ids:
+                post_loop.append(stmt)
+            else:
+                remaining.append(stmt)
+        return [*remaining, *post_loop]
 
     @property
     def has_tcgen05_post_loop_marks(self) -> bool:

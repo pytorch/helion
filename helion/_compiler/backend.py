@@ -619,6 +619,66 @@ class Backend(abc.ABC):
             raise exc.BackendUnsupported(self.name, "RNG ops")
         return [*args, *self.launcher_keyword_args(config, has_barrier=has_barrier)]
 
+    def _cute_matmul_contraction_reduction_block_ids(self) -> set[int]:
+        """Reduction block ids that are also a matmul-contraction (K) axis.
+
+        These are the blocks that must keep real threads for the whole K extent
+        instead of being split into ``threads x synthetic-lane`` (see OPTION B in
+        ``CuteBackend.create_loop_strategy`` and
+        ``cute_matmul_contraction_block_ids``).
+        """
+        from .compile_environment import CompileEnvironment
+        from .cute.matmul_utils import cute_matmul_contraction_block_ids
+
+        env = CompileEnvironment.current()
+        canonical_block_id = getattr(
+            env, "canonical_block_id", lambda block_id: block_id
+        )
+        contraction = cute_matmul_contraction_block_ids()
+        if not contraction:
+            return set()
+        return {
+            info.block_id
+            for info in env.block_sizes
+            if info.reduction and canonical_block_id(info.block_id) in contraction
+        }
+
+    def _cute_matmul_contraction_thread_reserve(
+        self, fn: DeviceFunction, tile_block_ids: list[int]
+    ) -> int:
+        """Threads to reserve for matmul-contraction reduction axes.
+
+        Returns the product of the per-axis full thread extents (power-of-two,
+        capped at ``max_reduction_threads``) of every reduction block that is a
+        matmul-contraction axis and is *not* one of ``tile_block_ids`` (i.e. it
+        is handled by a separate reduction strategy, not this tile strategy).
+        """
+        from torch._inductor.runtime.runtime_utils import next_power_of_2
+
+        from .._compat import shape_env_size_hint
+        from .compile_environment import CompileEnvironment
+
+        env = CompileEnvironment.current()
+        max_reduction_threads = self.max_reduction_threads()
+        if max_reduction_threads is None:
+            return 1
+        tile_ids = set(tile_block_ids)
+        reserve = 1
+        for block_id in self._cute_matmul_contraction_reduction_block_ids():
+            if block_id in tile_ids:
+                continue
+            numel = env.block_sizes[block_id].numel
+            if isinstance(numel, (int, sympy.Integer)):
+                size_hint = int(numel)
+            elif isinstance(numel, sympy.Expr):
+                size_hint = shape_env_size_hint(env.shape_env, numel)
+            else:
+                size_hint = env.size_hint(numel)
+            if size_hint <= 1:
+                continue
+            reserve *= next_power_of_2(min(size_hint, max_reduction_threads))
+        return reserve
+
     def create_loop_strategy(
         self, fn: DeviceFunction, block_ids: list[int], config: Config
     ) -> TileStrategy:
@@ -2789,6 +2849,7 @@ class CuteBackend(Backend):
             "_cute_inline_asm_elementwise": "from helion._compiler.cute.inline_asm_helpers import inline_asm_elementwise as _cute_inline_asm_elementwise",
             "_cute_fp8e4m3fn_to_float32": "from helion._compiler.cute.quantized_helpers import fp8e4m3fn_to_float32 as _cute_fp8e4m3fn_to_float32",
             "_cute_float4_e2m1fn_x2_to_float32": "from helion._compiler.cute.quantized_helpers import float4_e2m1fn_x2_to_float32 as _cute_float4_e2m1fn_x2_to_float32",
+            "_cute_grid_barrier": "from helion._compiler.cute.grid_barrier import grid_barrier as _cute_grid_barrier",
         }
 
     def program_id_expr(self, dim: int, *, index_dtype: str) -> str:
@@ -2839,8 +2900,9 @@ class CuteBackend(Backend):
         return super().cast_ast(x, target_dtype)
 
     def grid_barrier_stmt(self, sem_arg: str) -> str | None:
-        del sem_arg
-        raise exc.BackendUnsupported(self.name, "hl.barrier()")
+        # ``sem_arg`` is a TensorArg that arrives as a ``cute.Tensor``; its
+        # ``.iterator`` is the underlying ``cute.Pointer`` to the semaphore.
+        return f"_cute_grid_barrier({sem_arg}.iterator)"
 
     def lane_index_expr(
         self, offset_var: str, elements_per_thread: int, *, axis: int
@@ -3009,6 +3071,16 @@ class CuteBackend(Backend):
     ) -> str:
         # Use Python ternary instead of cute.where for max/min because
         # these operate on scalar registers, not tensors.
+        #
+        # Cast the incoming value to the accumulator dtype first.  The
+        # accumulator is promoted to the computation dtype (fp32 for
+        # half-precision inputs), but the per-iteration reduction input keeps
+        # the tensor's storage dtype (e.g. bf16 for a masked half load).  The
+        # CUTLASS DSL strictly type-checks the two branches of a Python ternary
+        # ("Then and else blocks of ifexp return different types"), so a bare
+        # ``acc if acc > val else val`` with mixed fp32/bf16 operands fails to
+        # compile.  The cast is a no-op when ``val`` already matches.
+        val = self.cast_expr(val, self.dtype_str(dtype))
         if reduction_type == "sum":
             return f"({acc} + {val})"
         if reduction_type == "max":
@@ -3841,6 +3913,23 @@ class CuteBackend(Backend):
                     )
                     for block_id in block_ids
                 ]
+            # OPTION B (matmul-contraction synthetic-lane fix): when a reduction
+            # block is the *contraction* (K) axis of a matmul lowered through the
+            # scalar fallback, it must keep enough real hardware threads to cover
+            # its full extent so the cross-warp shared-memory reduction sums the
+            # whole K.  Otherwise the budget below would hand the free tile axes
+            # the threads and leave K split into ``threads x synthetic-lane`` -
+            # the reduction then sums only the thread lanes, never the synthetic
+            # lanes, so each contracted dot product covers only a fraction of K.
+            # Reserve the K block's full thread extent up front by shrinking the
+            # thread limit available to the free tile axes; the contraction axis
+            # then claims that budget when its reduction strategy is created and
+            # the synthetic lane is pushed onto the free tile axes instead.
+            reserved_contraction_threads = self._cute_matmul_contraction_thread_reserve(
+                fn, block_ids
+            )
+            if reserved_contraction_threads > 1:
+                thread_limit = max(1, thread_limit // reserved_contraction_threads)
             static_threads = _shrink_auto_thread_counts(nd_block_size, thread_limit)
             from .cute.thread_budget import check_thread_limit
 

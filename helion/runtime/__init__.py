@@ -1435,6 +1435,7 @@ def _torch_dtype_to_cutlass(dtype: torch.dtype) -> object:
             torch.int32: cutlass.Int32,
             torch.int64: cutlass.Int64,
             torch.uint8: cutlass.Uint8,
+            torch.uint32: cutlass.Uint32,
             torch.uint64: cutlass.Int64,
         }
         _TORCH_DTYPE_TO_CUTLASS = mapping

@@ -1296,6 +1296,8 @@ def codegen_mm_cute(ctx: LoweringContext, node: Node) -> ast.AST:
         out_dtype=effective_out_dtype,
         lhs_dtype=lhs_node.meta["val"].dtype,
         rhs_dtype=rhs_node.meta["val"].dtype,
+        lhs_node=lhs_node,
+        rhs_node=rhs_node,
     )
 
 
@@ -1384,6 +1386,9 @@ def codegen_addmm_cute(ctx: LoweringContext, node: Node) -> ast.AST:
         acc_dtype=acc_node.meta["val"].dtype,
         lhs_dtype=lhs_node.meta["val"].dtype,
         rhs_dtype=rhs_node.meta["val"].dtype,
+        lhs_node=lhs_node,
+        rhs_node=rhs_node,
+        acc_node=acc_node,
     )
 
 
@@ -1466,6 +1471,9 @@ def codegen_baddbmm_cute(ctx: LoweringContext, node: Node) -> ast.AST:
         acc_dtype=acc_node.meta["val"].dtype,
         lhs_dtype=lhs_node.meta["val"].dtype,
         rhs_dtype=rhs_node.meta["val"].dtype,
+        lhs_node=lhs_node,
+        rhs_node=rhs_node,
+        acc_node=acc_node,
     )
 
 
