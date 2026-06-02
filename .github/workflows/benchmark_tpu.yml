@@ -9,6 +9,10 @@ on:
       kernels:
         required: true
         type: string
+      env-vars:
+        required: false
+        type: string
+        default: ""
 
 permissions:
   contents: read
@@ -69,7 +73,7 @@ jobs:
             --extra-index-url https://us-python.pkg.dev/ml-oss-artifacts-published/jax/simple/ \
             --find-links https://storage.googleapis.com/jax-releases/libtpu_releases.html \
             --pre \
-            'jax==0.10.0' 'jaxlib==0.10.0' 'libtpu==0.0.40' 'tpu-info==0.7.1' 'jaxtyping' 'frozendict'
+            'jax==0.10.1' 'jaxlib==0.10.1' 'libtpu==0.0.40' 'tpu-info==0.7.1' 'jaxtyping' 'frozendict'
           # Install Bazel
           if ! command -v bazel &> /dev/null; then
             sudo curl -L https://github.com/bazelbuild/bazelisk/releases/download/v1.27.0/bazelisk-linux-amd64 -o /usr/local/bin/bazel
@@ -133,10 +137,11 @@ jobs:
           # HELION_MEASURE_COMPILE_TIME=1 has helion's compile-time tracker
           # capture per-shape autotune+codegen cost; run_example does its own
           # warmup so post-autotune latency measurements are stable.
-          HELION_PRINT_OUTPUT_CODE=1 HELION_MEASURE_COMPILE_TIME=1 \
+          ${{ inputs.env-vars }} HELION_PRINT_OUTPUT_CODE=1 HELION_MEASURE_COMPILE_TIME=1 \
             python benchmarks/run_tpu.py \
               "${KERNEL_FLAG[@]}" \
               --num-shapes 2 \
+              --subprocess-per-shape \
               --output "$TEST_REPORTS_DIR/helionbench.json"
 
           if [[ ! -s "$TEST_REPORTS_DIR/helionbench.json" ]]; then

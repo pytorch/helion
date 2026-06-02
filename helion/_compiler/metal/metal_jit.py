@@ -30,6 +30,8 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from ... import exc
+from .msl_ast_walker import EmitState
 from .msl_ast_walker import _emit_stmts
 
 if TYPE_CHECKING:
@@ -48,6 +50,7 @@ class _MetalKernel:
         self._fn = fn
         self._name = fn.__name__
         self.msl_source: str | None = None
+        self.required_threads_per_threadgroup: tuple[int, int, int] | None = None
 
     def __call__(self, *args: object) -> tuple[object, str]:
         """Return (compiled_lib, kernel_name) for the launcher.
@@ -71,6 +74,7 @@ class _MetalKernel:
             param_names=param_names,
             args=args,
             fn_globals=self._fn.__globals__,
+            required_threads_per_threadgroup=self.required_threads_per_threadgroup,
         )
 
         # Compile MSL to a Metal shader library
@@ -84,6 +88,7 @@ def _generate_msl(
     param_names: list[str],
     args: tuple[object, ...],
     fn_globals: dict[str, object],
+    required_threads_per_threadgroup: tuple[int, int, int] | None = None,
 ) -> str:
     """Generate complete MSL source from Python AST body and actual args.
 
@@ -97,8 +102,29 @@ def _generate_msl(
         "#include <c10/metal/utils.h>",
         "#include <c10/metal/special_math.h>",
         "using namespace metal;",
-        "",
     ]
+    if _uses_mpp_markers(body_stmts):
+        _raise_if_mpp_unsupported_device()
+        msl_parts.extend(
+            [
+                "#if !__has_include(<metal_tensor>)",
+                '#error "Helion Metal MPP lowering requires <metal_tensor>"',
+                "#endif",
+                (
+                    "#if !__has_include("
+                    "<MetalPerformancePrimitives/MPPTensorOpsMatMul2d.h>)"
+                ),
+                (
+                    '#error "Helion Metal MPP lowering requires '
+                    '<MetalPerformancePrimitives/MPPTensorOpsMatMul2d.h>"'
+                ),
+                "#endif",
+                "#include <metal_tensor>",
+                "#include <MetalPerformancePrimitives/MPPTensorOpsMatMul2d.h>",
+                "using namespace mpp::tensor_ops;",
+            ]
+        )
+    msl_parts.append("")
 
     params: list[str] = []
     scalar_preamble: list[str] = []
@@ -125,7 +151,15 @@ def _generate_msl(
     )
 
     sig = ",\n    ".join(params)
-    msl_parts.append(f"kernel void {kernel_name}(\n    {sig}\n) {{")
+    required_threads_attr = ""
+    if required_threads_per_threadgroup is not None:
+        tx, ty, tz = required_threads_per_threadgroup
+        required_threads_attr = (
+            f"[[required_threads_per_threadgroup({tx}, {ty}, {tz})]] "
+        )
+    msl_parts.append(
+        f"{required_threads_attr}kernel void {kernel_name}(\n    {sig}\n) {{"
+    )
     msl_parts.extend(scalar_preamble)
 
     # Declare _BLOCK_SIZE_* constants from module globals
@@ -137,8 +171,30 @@ def _generate_msl(
     for name in sorted(block_sizes):
         msl_parts.append(f"    constexpr int {name} = {block_sizes[name]};")
 
-    declared: set[str] = set(block_sizes)
-    _emit_stmts(body_stmts, msl_parts, indent=4, declared=declared)
+    state = EmitState(declared=set(block_sizes))
+
+    _emit_stmts(body_stmts, msl_parts, indent=4, state=state)
 
     msl_parts.append("}")
     return "\n".join(msl_parts)
+
+
+def _uses_mpp_markers(body_stmts: list[ast.stmt]) -> bool:
+    for node in ast.walk(ast.Module(body=body_stmts, type_ignores=[])):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        if isinstance(func, ast.Name) and func.id.startswith("_metal_mpp_"):
+            return True
+    return False
+
+
+def _raise_if_mpp_unsupported_device() -> None:
+    device_name = torch._C._mps_get_name()  # type: ignore[attr-defined]
+    if "paravirtual" in device_name.lower():
+        raise exc.BackendUnsupported(
+            "metal",
+            "MPP matmul lowering is not supported on Apple paravirtual MPS "
+            "devices; use a physical Apple GPU such as a self-hosted M-series "
+            "runner",
+        )

@@ -113,11 +113,13 @@ class TestTensorDescriptor(RefEagerTestBase, TestCase):
         base_tensor = torch.randn(storage_size, device=DEVICE, dtype=torch.float32)
         x = base_tensor.as_strided([4, 8, 4], [64, 1, 4])
 
+        # Block sizes must not exceed tensor dim sizes — tensor descriptors
+        # require boxDim[i] <= tensorDim[i] in every dimension.
         code, result = code_and_output(
             kernel_3d_permutation,
             (x,),
             indexing="tensor_descriptor",
-            block_sizes=[8, 8, 8],
+            block_sizes=[4, 8, 4],
         )
 
         # Check correctness

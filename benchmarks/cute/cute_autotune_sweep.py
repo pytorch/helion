@@ -7,10 +7,10 @@ cannot poison the next. Results are appended to a JSONL file for
 later grep / diff.
 
 Also drives the active matmul target sweep from ``cute_plan.md``:
-the 8 bf16 matmul-family targets, each measured for ATen,
-Quack-direct, and Helion-CuTe by default. The Quack-direct row uses the
-benchmark harness's brief per-target tuning mode and records the selected
-config. Each measurement runs via
+32 matmul-family targets spanning bf16/fp16/fp32 and 8 epilogues, each
+measured for ATen, Quack-direct, and Helion-CuTe by default. The
+Quack-direct row uses the benchmark harness's brief per-target tuning
+mode and records the selected config. Each measurement runs via
 ``benchmarks/cute/compare_matmul_backends.py`` in a fresh subprocess.
 
 Usage::
@@ -27,7 +27,7 @@ Usage::
     # Dry-run the test list (no GPU work):
     python benchmarks/cute/cute_autotune_sweep.py --list
 
-    # Show the active 8 x 3 matmul benchmark worklist (no GPU work):
+    # Show the active 32 x 3 matmul benchmark worklist (no GPU work):
     python benchmarks/cute/cute_autotune_sweep.py --matmul-target-sweep --list
 
     # Show exact benchmark commands without launching GPU work:
@@ -94,6 +94,7 @@ MATMUL_PERFORMANCE_CSV_FIELDS = (
     "m",
     "n",
     "k",
+    "dtype",
     "epilogue",
     "backend",
     "backend_label",
@@ -119,11 +120,18 @@ class MatmulTarget:
     m: int
     n: int
     k: int
+    dtype: str
     epilogue: str
 
     @property
     def shape(self) -> str:
         return f"{self.m}x{self.n}x{self.k}"
+
+    @property
+    def require_tcgen05(self) -> bool:
+        # fp32 inputs fall back to the universal MMA atom on B200; tcgen05
+        # f16/bf16 cores are only engaged for half-precision GEMMs.
+        return self.dtype in ("bfloat16", "float16")
 
 
 @dataclass(frozen=True)
@@ -139,14 +147,41 @@ class MatmulWorkItem:
 
 
 MATMUL_TARGETS: tuple[MatmulTarget, ...] = (
-    MatmulTarget(1, 1024, 4096, 1024, "none"),
-    MatmulTarget(2, 4096, 2048, 2048, "bias"),
-    MatmulTarget(3, 2048, 4096, 2048, "none"),
-    MatmulTarget(4, 8192, 1024, 1024, "relu"),
-    MatmulTarget(5, 1024, 8192, 1024, "none"),
-    MatmulTarget(6, 8192, 2048, 2048, "bias_relu"),
-    MatmulTarget(7, 2048, 8192, 2048, "none"),
-    MatmulTarget(8, 5000, 5000, 5000, "bias_residual_gelu"),
+    # bf16 (T1-T20): primary tcgen05 path.
+    MatmulTarget(1, 1024, 1024, 1024, "bfloat16", "none"),
+    MatmulTarget(2, 1024, 4096, 1024, "bfloat16", "bias"),
+    MatmulTarget(3, 2048, 2048, 2048, "bfloat16", "none"),
+    MatmulTarget(4, 2048, 4096, 2048, "bfloat16", "gelu"),
+    MatmulTarget(5, 4096, 2048, 2048, "bfloat16", "bias"),
+    MatmulTarget(6, 4096, 4096, 4096, "bfloat16", "none"),
+    MatmulTarget(7, 8192, 1024, 1024, "bfloat16", "relu"),
+    MatmulTarget(8, 1024, 8192, 1024, "bfloat16", "none"),
+    MatmulTarget(9, 8192, 2048, 2048, "bfloat16", "bias_relu"),
+    MatmulTarget(10, 2048, 8192, 2048, "bfloat16", "none"),
+    MatmulTarget(11, 8192, 8192, 8192, "bfloat16", "bias_relu"),
+    MatmulTarget(12, 5000, 5000, 5000, "bfloat16", "bias_residual_gelu"),
+    MatmulTarget(13, 16384, 1024, 4096, "bfloat16", "silu"),
+    MatmulTarget(14, 1024, 16384, 4096, "bfloat16", "residual_add"),
+    MatmulTarget(15, 4096, 4096, 16384, "bfloat16", "none"),
+    MatmulTarget(16, 4096, 4096, 512, "bfloat16", "bias"),
+    MatmulTarget(17, 4096, 11008, 4096, "bfloat16", "silu"),
+    MatmulTarget(18, 4096, 4096, 11008, "bfloat16", "none"),
+    MatmulTarget(19, 3072, 3072, 3072, "bfloat16", "gelu"),
+    MatmulTarget(20, 6144, 6144, 6144, "bfloat16", "residual_add"),
+    # fp16 (T21-T28): secondary tcgen05 path.
+    MatmulTarget(21, 1024, 1024, 1024, "float16", "none"),
+    MatmulTarget(22, 2048, 2048, 2048, "float16", "bias"),
+    MatmulTarget(23, 4096, 4096, 4096, "float16", "relu"),
+    MatmulTarget(24, 8192, 4096, 2048, "float16", "bias_relu"),
+    MatmulTarget(25, 2048, 4096, 2048, "float16", "residual_add"),
+    MatmulTarget(26, 4096, 11008, 4096, "float16", "silu"),
+    MatmulTarget(27, 1536, 6144, 1536, "float16", "gelu"),
+    MatmulTarget(28, 6144, 6144, 6144, "float16", "bias_residual_gelu"),
+    # fp32 (T29-T32): universal MMA fallback (no tcgen05).
+    MatmulTarget(29, 1024, 1024, 1024, "float32", "none"),
+    MatmulTarget(30, 2048, 2048, 2048, "float32", "bias"),
+    MatmulTarget(31, 4096, 4096, 2048, "float32", "relu"),
+    MatmulTarget(32, 4096, 4096, 4096, "float32", "bias_residual_gelu"),
 )
 
 MATMUL_BACKENDS: tuple[MatmulBackend, ...] = (
@@ -311,8 +346,8 @@ def _iter_matmul_work_items(
 def _format_matmul_work_item(item: MatmulWorkItem) -> str:
     return (
         f"target={item.target.target_id} shape={item.target.shape} "
-        f"epilogue={item.target.epilogue} backend={item.backend.label} "
-        f"impl={item.backend.impl}"
+        f"dtype={item.target.dtype} epilogue={item.target.epilogue} "
+        f"backend={item.backend.label} impl={item.backend.impl}"
     )
 
 
@@ -348,7 +383,7 @@ def _build_matmul_compare_cmd(
         "--epilogue",
         item.target.epilogue,
         "--dtype",
-        "bfloat16",
+        item.target.dtype,
         "--num-runs",
         str(num_runs),
         "--warmup-ms",
@@ -363,7 +398,9 @@ def _build_matmul_compare_cmd(
     if item.backend.impl == "quack-direct":
         cmd.extend(["--quack-max-swizzle-size", "8", "--quack-tune", "brief"])
     if item.backend.impl == "helion-cute":
-        cmd.extend(["--helion-require-tcgen05", "1"])
+        cmd.extend(
+            ["--helion-require-tcgen05", "1" if item.target.require_tcgen05 else "0"]
+        )
     elif item.backend.impl == "helion-triton":
         cmd.extend(["--helion-require-tcgen05", "0"])
     if json_output:
@@ -450,8 +487,8 @@ def _format_matmul_markdown_table(results: list[dict[str, Any]]) -> str:
 
     backend_labels = [backend.label for backend in MATMUL_BACKENDS]
     lines = [
-        "| Target | Shape | Epilogue | " + " | ".join(backend_labels) + " |",
-        "|---:|---|---|" + "|".join("---:" for _ in MATMUL_BACKENDS) + "|",
+        "| Target | Shape | Dtype | Epilogue | " + " | ".join(backend_labels) + " |",
+        "|---:|---|---|---|" + "|".join("---:" for _ in MATMUL_BACKENDS) + "|",
     ]
     for target in _matmul_targets_for_results(results):
         cells = [
@@ -459,9 +496,8 @@ def _format_matmul_markdown_table(results: list[dict[str, Any]]) -> str:
             for backend in MATMUL_BACKENDS
         ]
         lines.append(
-            f"| {target.target_id} | {target.shape} | {target.epilogue} | "
-            + " | ".join(cells)
-            + " |"
+            f"| {target.target_id} | {target.shape} | {target.dtype} | "
+            f"{target.epilogue} | " + " | ".join(cells) + " |"
         )
     return "\n".join(lines) + "\n"
 
@@ -623,6 +659,7 @@ def _run_matmul_work_item(
     return {
         "target_id": item.target.target_id,
         "shape": item.target.shape,
+        "dtype": item.target.dtype,
         "epilogue": item.target.epilogue,
         "backend": item.backend.impl,
         "backend_label": item.backend.label,
@@ -721,6 +758,7 @@ def _append_matmul_performance_csv(
                     "m": record.get("shape", "").split("x")[0],
                     "n": record.get("shape", "").split("x")[1],
                     "k": record.get("shape", "").split("x")[2],
+                    "dtype": record.get("dtype", ""),
                     "epilogue": record.get("epilogue", ""),
                     "backend": record.get("backend", ""),
                     "backend_label": record.get("backend_label", ""),
@@ -752,6 +790,7 @@ def _compact_matmul_result(record: dict[str, Any]) -> dict[str, Any]:
     compact: dict[str, Any] = {
         "target_id": record.get("target_id"),
         "shape": record.get("shape"),
+        "dtype": record.get("dtype"),
         "epilogue": record.get("epilogue"),
         "backend": record.get("backend"),
         "backend_label": record.get("backend_label"),

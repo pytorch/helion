@@ -756,3 +756,106 @@ def _cute_argreduce_index(
             extent=extent,
         )
     raise ValueError(f"unsupported CuTe argreduce type: {reduction_type!r}")
+
+
+# Per-thread V-fold helpers for vectorized loads.  Used by the looped
+# reduction strategy to collapse a length-V vector load into a scalar
+# before the warp-level reduction.
+
+
+@cute.jit
+def _cute_pre_vec_fold_sum(vec: object, *, V: cutlass.Constexpr[int]) -> object:
+    acc = vec[0]
+    for i in cutlass.range_constexpr(1, V):
+        acc = acc + vec[i]
+    return acc
+
+
+@cute.jit
+def _cute_pre_vec_fold_max(vec: object, *, V: cutlass.Constexpr[int]) -> object:
+    acc = vec[0]
+    for i in cutlass.range_constexpr(1, V):
+        candidate = vec[i]
+        acc = max(acc, candidate)
+    return acc
+
+
+@cute.jit
+def _cute_pre_vec_fold_min(vec: object, *, V: cutlass.Constexpr[int]) -> object:
+    acc = vec[0]
+    for i in cutlass.range_constexpr(1, V):
+        candidate = vec[i]
+        acc = min(acc, candidate)
+    return acc
+
+
+@cute.jit
+def _cute_pre_vec_fold_prod(vec: object, *, V: cutlass.Constexpr[int]) -> object:
+    acc = vec[0]
+    for i in cutlass.range_constexpr(1, V):
+        acc = acc * vec[i]
+    return acc
+
+
+def _cute_pre_vec_fold(vec: object, reduction_type: str, *, V: int) -> object:
+    if reduction_type == "sum":
+        return _cute_pre_vec_fold_sum(vec, V=V)
+    if reduction_type == "max":
+        return _cute_pre_vec_fold_max(vec, V=V)
+    if reduction_type == "min":
+        return _cute_pre_vec_fold_min(vec, V=V)
+    if reduction_type == "prod":
+        return _cute_pre_vec_fold_prod(vec, V=V)
+    raise ValueError(f"unsupported CuTe pre-vec-fold type: {reduction_type!r}")
+
+
+# Variant that ALSO casts each element of the input vec to fp32 before
+# accumulating.  Lets the looped-reduction strategy keep the vec-load
+# fast path on bf16/fp16 inputs that would otherwise be degraded by the
+# scalarising ``cutlass.Float32(vec)`` cast.
+
+
+@cute.jit
+def _cute_pre_vec_fold_sum_fp32(vec: object, *, V: cutlass.Constexpr[int]) -> object:
+    acc = cutlass.Float32(vec[0])
+    for i in cutlass.range_constexpr(1, V):
+        acc = acc + cutlass.Float32(vec[i])
+    return acc
+
+
+@cute.jit
+def _cute_pre_vec_fold_max_fp32(vec: object, *, V: cutlass.Constexpr[int]) -> object:
+    acc = cutlass.Float32(vec[0])
+    for i in cutlass.range_constexpr(1, V):
+        candidate = cutlass.Float32(vec[i])
+        acc = max(acc, candidate)
+    return acc
+
+
+@cute.jit
+def _cute_pre_vec_fold_min_fp32(vec: object, *, V: cutlass.Constexpr[int]) -> object:
+    acc = cutlass.Float32(vec[0])
+    for i in cutlass.range_constexpr(1, V):
+        candidate = cutlass.Float32(vec[i])
+        acc = min(acc, candidate)
+    return acc
+
+
+@cute.jit
+def _cute_pre_vec_fold_prod_fp32(vec: object, *, V: cutlass.Constexpr[int]) -> object:
+    acc = cutlass.Float32(vec[0])
+    for i in cutlass.range_constexpr(1, V):
+        acc = acc * cutlass.Float32(vec[i])
+    return acc
+
+
+def _cute_pre_vec_fold_fp32(vec: object, reduction_type: str, *, V: int) -> object:
+    if reduction_type == "sum":
+        return _cute_pre_vec_fold_sum_fp32(vec, V=V)
+    if reduction_type == "max":
+        return _cute_pre_vec_fold_max_fp32(vec, V=V)
+    if reduction_type == "min":
+        return _cute_pre_vec_fold_min_fp32(vec, V=V)
+    if reduction_type == "prod":
+        return _cute_pre_vec_fold_prod_fp32(vec, V=V)
+    raise ValueError(f"unsupported CuTe pre-vec-fold type: {reduction_type!r}")

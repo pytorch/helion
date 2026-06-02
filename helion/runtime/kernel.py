@@ -532,10 +532,19 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
                     host_function_has_tcgen05_aux_kernel_pattern,
                 )
                 from .._compiler.cute.aux_tensor import (
+                    host_function_has_tcgen05_bias_matmul_store_pattern,
+                )
+                from .._compiler.cute.aux_tensor import (
+                    host_function_has_tcgen05_bias_relu_matmul_store_pattern,
+                )
+                from .._compiler.cute.aux_tensor import (
                     host_function_has_tcgen05_exact_shape_aux_kernel_pattern,
                 )
                 from .._compiler.cute.aux_tensor import (
                     host_function_has_tcgen05_identity_matmul_store_pattern,
+                )
+                from .._compiler.cute.aux_tensor import (
+                    host_function_has_tcgen05_relu_matmul_store_pattern,
                 )
 
                 self.env.config_spec.cute_tcgen05_aux_kernel_detected = (
@@ -551,8 +560,62 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
                         self.host_function
                     )
                 )
+                self.env.config_spec.cute_tcgen05_relu_matmul_store_detected = (
+                    host_function_has_tcgen05_relu_matmul_store_pattern(
+                        self.host_function
+                    )
+                )
+                self.env.config_spec.cute_tcgen05_bias_matmul_store_detected = (
+                    host_function_has_tcgen05_bias_matmul_store_pattern(
+                        self.host_function
+                    )
+                )
+                self.env.config_spec.cute_tcgen05_bias_relu_matmul_store_detected = (
+                    host_function_has_tcgen05_bias_relu_matmul_store_pattern(
+                        self.host_function
+                    )
+                )
                 if self.env.config_spec.cute_tcgen05_identity_matmul_store_detected:
+                    # T1, T3, T5, and T7 all gate on identity-store
+                    # detection and write into the same cluster_m=2
+                    # search constraints + pid_type allowlist. Mutual
+                    # exclusion is via shape facts (T1 = 1024x4096x1024,
+                    # T3 = 2048x4096x2048, T5 = 1024x8192x1024,
+                    # T7 = 2048x8192x2048) so at most one seed is
+                    # non-``None`` per host function; the values
+                    # written here must stay equal across the four
+                    # ``allow_target{1,3,5,7}_tvm_ffi_seed`` paths.
                     self.env.config_spec.allow_tcgen05_target1_tvm_ffi_seed()
+                    self.env.config_spec.allow_tcgen05_target3_tvm_ffi_seed()
+                    self.env.config_spec.allow_tcgen05_target5_tvm_ffi_seed()
+                    self.env.config_spec.allow_tcgen05_target7_tvm_ffi_seed()
+                if self.env.config_spec.cute_tcgen05_relu_matmul_store_detected:
+                    self.env.config_spec.allow_tcgen05_target4_tvm_ffi_seed()
+                if self.env.config_spec.cute_tcgen05_bias_matmul_store_detected:
+                    # T2 gates on the bias-store detection (rank-1
+                    # trailing-axis ``acc + bias[n]``) and writes into the
+                    # same cluster_m=2 search constraints + pid_type
+                    # allowlist used by the T1/T3/T5 identity-store and
+                    # T4 relu-store seeds. The bias-store detector is
+                    # mutually exclusive with both identity and relu
+                    # store walkers (rejected by the chain shape), and
+                    # T2's shape gate (4096x2048x2048) keeps it
+                    # mutually exclusive on the matmul fact.
+                    self.env.config_spec.allow_tcgen05_target2_tvm_ffi_seed()
+                if self.env.config_spec.cute_tcgen05_bias_relu_matmul_store_detected:
+                    # T6 gates on the bias-relu-store detection
+                    # (``relu(acc + bias[n])``) and writes into the
+                    # same cluster_m=2 search constraints + pid_type
+                    # allowlist used by the T1/T3/T5 identity-store,
+                    # T4 relu-store, and T2 bias-store seeds. The
+                    # bias-relu-store detector is mutually exclusive
+                    # with identity (no binary op), relu (no add), and
+                    # bias (no relu) walkers via the chain shape, and
+                    # T6's shape gate (8192x2048x2048) keeps it
+                    # mutually exclusive on the matmul fact (T2 shares
+                    # bias but has a different shape; T4 shares relu
+                    # but a different shape and no bias).
+                    self.env.config_spec.allow_tcgen05_target6_tvm_ffi_seed()
                 if not self.env.settings.disable_autotuner_heuristics:
                     for seed_config in self.env.config_spec.autotune_seed_configs():
                         if (
@@ -1046,7 +1109,7 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
             if not is_ref_mode_enabled(self.kernel.settings):
                 kernel_decorator = self.format_kernel_decorator(config, self.settings)
                 print(
-                    f"Using default config: {kernel_decorator}",
+                    f"Using default config:\n\t{kernel_decorator}",
                     file=sys.stderr,
                 )
             return config

@@ -51,9 +51,10 @@ class KernelCompiler:
 
       1. Parse source into ExtendedAST
       2. Static loop unrolling
-      3. Type propagation
-      4. Config spec finalization
-      5. Device IR lowering
+      3. Backend-specific AST customizations
+      4. Type propagation
+      5. Config spec finalization
+      6. Device IR lowering
 
     The HostFunction is the mutable compilation state that each step
     operates on.
@@ -61,6 +62,7 @@ class KernelCompiler:
 
     def __init__(self, env: CompileEnvironment) -> None:
         self.env = env
+        self.backend = env.backend
 
     def compile(
         self,
@@ -72,6 +74,7 @@ class KernelCompiler:
         hf = self.parse(fn, fake_args, constexpr_args)
         with hf, self._compilation_context():
             self.unroll(hf)
+            self.customize_ast(hf)
             self.propagate_types(hf)
             self.finalize_config()
             self.lower(hf)
@@ -120,6 +123,16 @@ class KernelCompiler:
 
         with measure("HostFunction.unroll_static_loops"):
             unroll_static_loops(hf)
+
+    def customize_ast(self, hf: HostFunction) -> None:
+        """Backend-specific AST customizations.
+
+        Rewrites high-level patterns in the user's kernel AST into
+        equivalent forms that compile to better code on the active
+        backend.
+        """
+        with measure("HostFunction.customize_ast"):
+            self.backend.customize_ast(hf)
 
     def propagate_types(self, hf: HostFunction) -> None:
         from .type_propagation import propagate_types

@@ -159,6 +159,7 @@ BACKEND_SPECIFIC_KEYS: frozenset[str] = (
     | _BACKEND_STRATEGY_CONFIG_KEYS
     | {
         "num_threads",
+        "cute_vector_widths",
         "pallas_loop_type",
         "pallas_pre_broadcast",
     }
@@ -187,6 +188,7 @@ VALID_KEYS: frozenset[str] = frozenset(
         "load_eviction_policies",
         "pallas_loop_type",
         "pallas_pre_broadcast",
+        "cute_vector_widths",
         *BACKEND_TUNABLE_KEYS,
         "advanced_controls_file",
         "epilogue_subtile",
@@ -282,6 +284,9 @@ class ConfigSpec:
         self.l2_groupings: BlockIdSequence[L2GroupingSpec] = BlockIdSequence()
         self.flatten_loops: BlockIdSequence[FlattenLoopSpec] = BlockIdSequence()
         self.reduction_loops: BlockIdSequence[ReductionLoopSpec] = BlockIdSequence()
+        self.cute_vector_widths: BlockIdSequence[CuteVectorWidthSpec] = (
+            BlockIdSequence()
+        )
         self.range_unroll_factors: BlockIdSequence[RangeUnrollFactorSpec] = (
             BlockIdSequence()
         )
@@ -461,6 +466,30 @@ class ConfigSpec:
         self._cute_tcgen05_config.identity_matmul_store_detected = value
 
     @property
+    def cute_tcgen05_relu_matmul_store_detected(self) -> bool:
+        return self._cute_tcgen05_config.relu_matmul_store_detected
+
+    @cute_tcgen05_relu_matmul_store_detected.setter
+    def cute_tcgen05_relu_matmul_store_detected(self, value: bool) -> None:
+        self._cute_tcgen05_config.relu_matmul_store_detected = value
+
+    @property
+    def cute_tcgen05_bias_matmul_store_detected(self) -> bool:
+        return self._cute_tcgen05_config.bias_matmul_store_detected
+
+    @cute_tcgen05_bias_matmul_store_detected.setter
+    def cute_tcgen05_bias_matmul_store_detected(self, value: bool) -> None:
+        self._cute_tcgen05_config.bias_matmul_store_detected = value
+
+    @property
+    def cute_tcgen05_bias_relu_matmul_store_detected(self) -> bool:
+        return self._cute_tcgen05_config.bias_relu_matmul_store_detected
+
+    @cute_tcgen05_bias_relu_matmul_store_detected.setter
+    def cute_tcgen05_bias_relu_matmul_store_detected(self, value: bool) -> None:
+        self._cute_tcgen05_config.bias_relu_matmul_store_detected = value
+
+    @property
     def _tcgen05_cluster_m_search_choices(self) -> tuple[int, ...] | None:
         return self._cute_tcgen05_config.cluster_m_search_choices
 
@@ -530,6 +559,24 @@ class ConfigSpec:
 
     def allow_tcgen05_target1_tvm_ffi_seed(self) -> None:
         self._cute_tcgen05_config.allow_target1_tvm_ffi_seed()
+
+    def allow_tcgen05_target2_tvm_ffi_seed(self) -> None:
+        self._cute_tcgen05_config.allow_target2_tvm_ffi_seed()
+
+    def allow_tcgen05_target3_tvm_ffi_seed(self) -> None:
+        self._cute_tcgen05_config.allow_target3_tvm_ffi_seed()
+
+    def allow_tcgen05_target4_tvm_ffi_seed(self) -> None:
+        self._cute_tcgen05_config.allow_target4_tvm_ffi_seed()
+
+    def allow_tcgen05_target5_tvm_ffi_seed(self) -> None:
+        self._cute_tcgen05_config.allow_target5_tvm_ffi_seed()
+
+    def allow_tcgen05_target6_tvm_ffi_seed(self) -> None:
+        self._cute_tcgen05_config.allow_target6_tvm_ffi_seed()
+
+    def allow_tcgen05_target7_tvm_ffi_seed(self) -> None:
+        self._cute_tcgen05_config.allow_target7_tvm_ffi_seed()
 
     @staticmethod
     def _tcgen05_cluster_m2_bk_is_valid(
@@ -757,6 +804,7 @@ class ConfigSpec:
             ("l2_groupings", self.l2_groupings, True),
             ("loop_orders", self.loop_orders, False),
             ("reduction_loops", self.reduction_loops, True),
+            ("cute_vector_widths", self.cute_vector_widths, True),
             ("range_unroll_factors", self.range_unroll_factors, True),
             ("range_warp_specializes", self.range_warp_specialize, True),
             ("range_num_stages", self.range_num_stages, True),
@@ -774,6 +822,60 @@ class ConfigSpec:
             config[name] = mapping._normalize(
                 name, config.get(name, ()), flatten=flatten
             )
+
+        # Clamp inner block sizes that are bounded by an outer block
+        # (e.g. ``hl.tile(outer.begin, outer.end)``): at this point the
+        # outer's concrete block size for this config is known, and the
+        # inner extent can never exceed it.
+        block_sizes_list = config.get("block_sizes")
+        if isinstance(block_sizes_list, list):
+            changed = False
+            new_block_sizes = list(block_sizes_list)
+            for i, spec in enumerate(self.block_sizes):
+                bb = spec.bounded_by_block_id
+                if (
+                    bb is None
+                    or i >= len(new_block_sizes)
+                    or new_block_sizes[i] is None
+                ):
+                    continue
+                try:
+                    outer_index = self.block_sizes.block_id_to_index(bb)
+                except KeyError:
+                    continue
+                outer_val = (
+                    new_block_sizes[outer_index]
+                    if outer_index < len(new_block_sizes)
+                    else None
+                )
+                if (
+                    isinstance(outer_val, int)
+                    and isinstance(new_block_sizes[i], int)
+                    and new_block_sizes[i] > outer_val
+                ):
+                    new_block_sizes[i] = outer_val
+                    changed = True
+            if changed:
+                config["block_sizes"] = new_block_sizes
+                num_threads = config.get("num_threads")
+                if isinstance(num_threads, list):
+                    new_num_threads = list(num_threads)
+                    for i, (block_size, num_thread) in enumerate(
+                        zip(new_block_sizes, new_num_threads, strict=False)
+                    ):
+                        if (
+                            type(block_size) is not int
+                            or type(num_thread) is not int
+                            or num_thread <= 0
+                        ):
+                            continue
+                        if num_thread > block_size:
+                            num_thread = 1 << (max(block_size, 1).bit_length() - 1)
+                        while num_thread > 1 and block_size % num_thread != 0:
+                            num_thread //= 2
+                        new_num_threads[i] = max(num_thread, 1)
+                    config["num_threads"] = new_num_threads
+
         if self.supports_config_key("num_threads"):
             num_threads = cast("list[int]", config.get("num_threads", []))
             if all(value == 0 for value in num_threads):
@@ -860,7 +962,20 @@ class ConfigSpec:
                     if i >= len(new_loops):
                         break
                     if new_loops[i] is None and spec.size_hint > available:
-                        chunk = min(spec.size_hint, max(available, 1))
+                        # When other_threads consumes the entire CuTe 1024 thread
+                        # budget there is no thread budget left for the reduction
+                        # axis. A chunk of 1 is invalid (LoopedReductionStrategy
+                        # requires block_size > 1) and a persistent reduction
+                        # would hit the synthetic-lane-loop bug described above.
+                        # Reject the config so the autotuner skips it.
+                        if available < 2:
+                            raise InvalidConfig(
+                                f"cute backend: reduction axis {i} has no thread "
+                                f"budget left (non-reduction axes use "
+                                f"{other_threads} of {self.max_reduction_threads} "
+                                f"threads)."
+                            )
+                        chunk = min(spec.size_hint, available)
                         if self.max_reduction_loop is not None:
                             chunk = min(chunk, self.max_reduction_loop)
                         new_loops[i] = chunk
@@ -894,6 +1009,7 @@ class ConfigSpec:
             "l2_groupings",
             "flatten_loops",
             "reduction_loops",
+            "cute_vector_widths",
             "range_unroll_factors",
             "range_warp_specializes",
             "range_num_stages",
@@ -1274,6 +1390,17 @@ class ConfigSpec:
                     and len(self.loop_orders) > 0
                 ):
                     fields["loop_orders"] = self.loop_orders
+                # Expose ``cute_vector_widths`` per-block so the
+                # autotuner can vary V in {1, 2, 4, 8} for lane-loop
+                # vec loads (and for ``LoopedReductionStrategy`` rolled
+                # reductions).  Without this entry, ``flatten`` strips V
+                # back to the default of 1, defeating the seed
+                # heuristics that try to bias toward LDG.128 lattices.
+                if (
+                    self.supports_config_key("cute_vector_widths")
+                    and len(self.cute_vector_widths) > 0
+                ):
+                    fields["cute_vector_widths"] = self.cute_vector_widths
             if self.epilogue_subtile_autotune_choices is not None:
                 fields["epilogue_subtile"] = EnumFragment(
                     choices=self.epilogue_subtile_autotune_choices
@@ -1496,6 +1623,7 @@ class BlockSizeSpec(_PowerOfTwoBlockIdItem):
         size_hint: int,
         min_size: int = 1,
         max_size: int | None = None,
+        bounded_by_block_id: int | None = None,
     ) -> None:
         super().__init__([block_id])
         self.size_hint = size_hint
@@ -1513,6 +1641,8 @@ class BlockSizeSpec(_PowerOfTwoBlockIdItem):
         self.max_size: int = (
             next_power_of_2(bounded_hint) if max_size is None else max_size
         )
+        # Outer block_id whose tile extent caps this block's size in normalize().
+        self.bounded_by_block_id: int | None = bounded_by_block_id
         if self.max_size < self.min_size:
             self.max_size = self.min_size
         assert self.min_size <= self.max_size
@@ -1524,6 +1654,7 @@ class BlockSizeSpec(_PowerOfTwoBlockIdItem):
             ("size_hint", None),
             ("min_size", 1),
             ("max_size", next_power_of_2(self.size_hint)),
+            ("bounded_by_block_id", None),
         ):
             value = getattr(self, field)
             if value != default:
@@ -1665,10 +1796,57 @@ class ReductionLoopSpec(_PowerOfTwoBlockIdItem):
     def _normalize(self, name: str, value: object) -> int | None:
         if value is None:
             return None
-        return super()._normalize(name, value)
+        normalized = super()._normalize(name, value)
+        # A looped reduction whose chunk equals or exceeds the reduction
+        # extent has only one iteration — it is semantically identical to a
+        # persistent reduction, but the looped codegen path occasionally
+        # produces subtly different results on the CuTe backend (e.g. when a
+        # multi-pass kernel like layer_norm reuses the loaded inputs across
+        # two reductions).  Collapsing to ``None`` here matches the
+        # ``_flat_config`` behaviour and keeps the persistent/loop choice in
+        # sync regardless of how the value was generated.
+        if isinstance(normalized, int) and normalized >= self.size_hint:
+            return None
+        return normalized
 
     def _fill_missing(self) -> None:
         return None
+
+
+_CUTE_VECTOR_WIDTH_CHOICES: tuple[int, ...] = (1, 2, 4, 8)
+
+
+class CuteVectorWidthSpec(_BlockIdItem):
+    """Per-reduction-block vector load width for the CuTe backend.
+
+    V=1 disables vectorization (scalar loads). V=2/4/8 emits
+    ``cute.arch.load(..., ir.VectorType.get([V], elem_dtype.mlir_type))``
+    for the inner reduction load, lowering to LDG.64/LDG.128.
+    """
+
+    def __init__(
+        self,
+        *,
+        block_id: int,
+        size_hint: int,
+    ) -> None:
+        super().__init__([block_id])
+        self.size_hint = size_hint
+
+    def _fragment(self, base: ConfigSpec) -> EnumFragment:
+        return EnumFragment(choices=_CUTE_VECTOR_WIDTH_CHOICES)
+
+    def _normalize(self, name: str, value: object) -> int:
+        if not isinstance(value, int):
+            raise InvalidConfig(f"{name} must be an integer, got {value!r}")
+        if value not in _CUTE_VECTOR_WIDTH_CHOICES:
+            raise InvalidConfig(
+                f"{name} must be one of {_CUTE_VECTOR_WIDTH_CHOICES}, got {value!r}"
+            )
+        return value
+
+    def _fill_missing(self) -> int:
+        return 1
 
 
 class _OptionalIntSpec(_BlockIdItem):

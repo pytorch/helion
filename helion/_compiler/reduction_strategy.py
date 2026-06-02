@@ -4,6 +4,7 @@ import ast
 import logging
 import operator
 from typing import TYPE_CHECKING
+from typing import cast
 
 import sympy
 import torch
@@ -12,6 +13,7 @@ from torch._inductor.codegen.simd import constant_repr
 from torch._inductor.runtime.runtime_utils import next_power_of_2
 from torch._prims_common import get_computation_dtype
 
+from .. import exc
 from .._compat import shape_env_size_hint
 from .ast_extension import create
 from .ast_extension import expr_from_string
@@ -21,6 +23,7 @@ from .cute.layout import LayoutTag as _CuteLayoutTag
 from .cute.layout_propagation import META_KEY as _CUTE_LAYOUT_META_KEY
 from .device_function import find_block_size_symbols
 from .host_function import HostFunction
+from .inductor_lowering import ReductionLowering
 from .inductor_lowering import install_inductor_kernel_handlers
 from .tile_strategy import CompactedShape
 from .tile_strategy import DeviceGridState
@@ -106,6 +109,53 @@ def cute_live_reduction_threads(max_threads: int) -> int:
     # autotuner / config_spec keeps the size_hint <= max_threads case here so
     # no synthetic lane wrap is required.
     return max_threads
+
+
+def _cute_vec_kernel_mode() -> str:
+    """Return ``"vec"`` when all reduction-feeding loads are vec-eligible
+    without a degrading dtype cast (i.e. fp32 -> fp32 pipeline), ``"unroll"``
+    when at least one load uses the bf16/fp16 -> fp32 cast pattern that the
+    CuTe DSL's ``Float32(vec)`` constructor would silently scalarise, or
+    ``"none"`` when there's no looped reduction at all.
+
+    ``"vec"`` lets the strategy emit a single ``cute.arch.load(..., V)`` +
+    V-fold per lane iter.  ``"unroll"`` falls back to a constexpr V-loop
+    around per-element scalar loads — the CUTLASS DSL cannot iterate the
+    elements of a bf16/fp16 vector without crashing during compile.
+    """
+    from .host_function import HostFunction
+    from .host_function import NoCurrentFunction
+
+    try:
+        hf = HostFunction.current()
+    except NoCurrentFunction:
+        return "none"
+    if hf._device_ir is None:
+        return "none"
+    cast_targets = {
+        "convert_element_type.default",
+        "convert_element_type",
+        "_to_copy.default",
+        "_to_copy",
+    }
+    from ..language import memory_ops as _memory_ops
+
+    load_target = _memory_ops.load
+    has_cast = False
+    for graph_info in hf.device_ir.graphs:
+        for node in graph_info.graph.nodes:
+            if node.target is not load_target:
+                continue
+            for user in node.users:
+                target_name = getattr(user.target, "__name__", "") or ""
+                if target_name in cast_targets:
+                    has_cast = True
+                    break
+            if has_cast:
+                break
+        if has_cast:
+            break
+    return "unroll" if has_cast else "vec"
 
 
 def _block_has_indexed_reduction(fn: DeviceFunction, block_index: int) -> bool:
@@ -693,7 +743,10 @@ class LoopedReductionStrategy(ReductionStrategy):
         block_size: int,
     ) -> None:
         env = CompileEnvironment.current()
-        assert block_size > 1
+        if block_size <= 1:
+            raise exc.InvalidConfig(
+                f"LoopedReductionStrategy requires block_size > 1, got {block_size}"
+            )
         # Compute thread count for warp-level reductions
         max_threads = env.backend.max_reduction_threads()
         if max_threads is not None:
@@ -718,6 +771,17 @@ class LoopedReductionStrategy(ReductionStrategy):
         self._loop_block_size = block_size
         self._cute_reduction_lane_var: str | None = None
         self._cute_reduction_lane_extent = 1
+        self._cute_reduction_vec_width = 1
+        # ``"vec"`` (fp32 fast path) or ``"unroll"`` (bf16/fp16 fallback)
+        # — controls how the lane body emits each per-iter load.
+        self._cute_reduction_vec_mode = "vec"
+        # Masks queued by vec loads inside the lane loop; consumed by
+        # codegen_reduction to wrap the V-fold scalar.
+        self._cute_pending_vec_masks: list[str] = []
+        # Set when a vec load was actually emitted for the current
+        # reduction's lane body — codegen_reduction inspects this to
+        # decide whether to emit the V-fold step.
+        self._cute_emitted_vec_load = False
         if (
             env.backend.name == "cute"
             and thread_count > 0
@@ -731,6 +795,30 @@ class LoopedReductionStrategy(ReductionStrategy):
                 f"reduction_lane_{block_index}",
                 dce=False,
             )
+            # Read autotuner-selected vector width and partition lane extent
+            # into outer × inner = lane_extent/V × V.  When V==1 (default)
+            # this preserves the original scalar codegen.
+            cute_vector_widths = cast(
+                "list[int]",
+                fn.config.config.get("cute_vector_widths", []) or [],
+            )
+            vec_width = env.config_spec.cute_vector_widths.config_get(
+                cute_vector_widths,
+                block_index,
+                1,
+            )
+            if (
+                isinstance(vec_width, int)
+                and vec_width > 1
+                and self._cute_reduction_lane_extent % vec_width == 0
+            ):
+                mode = _cute_vec_kernel_mode()
+                if mode in ("vec", "unroll"):
+                    self._cute_reduction_vec_width = vec_width
+                    self._cute_reduction_vec_mode = mode
+                    self._cute_reduction_lane_extent = (
+                        self._cute_reduction_lane_extent // vec_width
+                    )
         if env.known_multiple(
             env.block_sizes[block_index].numel, self._loop_block_size
         ):
@@ -861,10 +949,65 @@ class LoopedReductionStrategy(ReductionStrategy):
             ),
         ]
         reduction_lane_var = self._cute_reduction_lane_var
+        vec = self._cute_reduction_vec_width
+        # Detect whether the upcoming graph contains a reduction op so we
+        # can choose between the reduce-sweep shape (single vec load +
+        # V-fold) and the consume-sweep shape (V scalar elementwise ops in
+        # an inner constexpr loop).
+        active_graph_info = getattr(state.codegen, "_cute_active_graph_info", None)
+        graph_has_reduction = True
+        if vec > 1 and active_graph_info is not None:
+            graph = getattr(active_graph_info, "graph", None)
+            if graph is not None:
+                graph_has_reduction = any(
+                    isinstance(n.meta.get("lowering"), ReductionLowering)
+                    for n in graph.nodes
+                )
+        # Unroll the lane body via a constexpr V-loop when the consume sweep
+        # mixes scalars (no reduction in graph), OR when the reduce sweep is
+        # in ``"unroll"`` mode (bf16/fp16 inputs that the CuTe DSL can't
+        # safely subscript as a vector).
+        consume_unroll = vec > 1 and (
+            not graph_has_reduction or self._cute_reduction_vec_mode == "unroll"
+        )
+        # Map from (tensor_name, base_expr) -> (hoist_var, dtype) so the
+        # dispatcher can reuse one hoist per (tensor, base) pair instead of
+        # emitting a fresh vec load on every dispatcher call.
+        self._cute_lane_vec_loads: dict[tuple[str, str], tuple[str, torch.dtype]] = {}
+        # Variable name holding the per-lane-iter base index for vec hoists
+        # in ``unroll`` mode — the dispatcher uses this to compute the vec
+        # pointer offset once.
+        self._cute_lane_base_index_var: str | None = None
+        vec_lane_var: str | None = None
+        base_expr: str = ""
         if reduction_lane_var is not None:
-            inner_body[0] = statement_from_string(
-                f"{index_var} = {offset_var} + {self._index_init_expr(f'({block_size_var})', env.index_type(), block_index)} + cutlass.Int32({reduction_lane_var}) * {self._thread_count}"
-            )
+            if vec > 1:
+                # base = offset + thread_idx*V + lane*(THREADS*V)
+                base_expr = (
+                    f"{offset_var} + "
+                    f"{self._index_init_expr(f'({block_size_var})', env.index_type(), block_index)} "
+                    f"* {vec} + "
+                    f"cutlass.Int32({reduction_lane_var}) * {self._thread_count * vec}"
+                )
+                if consume_unroll:
+                    vec_lane_var = self.fn.new_var(
+                        f"reduction_vec_lane_{block_index}",
+                        dce=False,
+                    )
+                    self._cute_lane_base_index_var = self.fn.new_var(
+                        f"reduction_lane_base_{block_index}",
+                        dce=False,
+                    )
+                    # index_var = base + vi  (used inside the constexpr loop)
+                    inner_body[0] = statement_from_string(
+                        f"{index_var} = {self._cute_lane_base_index_var} + cutlass.Int32({vec_lane_var})"
+                    )
+                else:
+                    inner_body[0] = statement_from_string(f"{index_var} = {base_expr}")
+            else:
+                inner_body[0] = statement_from_string(
+                    f"{index_var} = {offset_var} + {self._index_init_expr(f'({block_size_var})', env.index_type(), block_index)} + cutlass.Int32({reduction_lane_var}) * {self._thread_count}"
+                )
         if (mask_var := self._mask_var) is not None:
             inner_body.append(
                 statement_from_string(
@@ -875,13 +1018,43 @@ class LoopedReductionStrategy(ReductionStrategy):
         if reduction_lane_var is not None:
             from .tile_strategy import _create_lane_loop
 
-            body = [
-                _create_lane_loop(
-                    reduction_lane_var,
-                    self._cute_reduction_lane_extent,
-                    inner_body,
+            if consume_unroll and vec_lane_var is not None:
+                # for vi in cutlass.range_constexpr(V): ...
+                vec_for = cast(
+                    "ast.For",
+                    ast.parse(
+                        f"for {vec_lane_var} in cutlass.range_constexpr({vec}):\n"
+                        f"    pass"
+                    ).body[0],
                 )
-            ]
+                vec_for.body = inner_body  # type: ignore[assignment]
+                # The lane-loop body holds the per-lane base index, then any
+                # dispatcher-requested vec hoists, then the constexpr loop.
+                base_stmt = statement_from_string(
+                    f"{self._cute_lane_base_index_var} = {base_expr}"
+                )
+                lane_body: list[ast.AST] = [
+                    base_stmt,
+                    vec_for,
+                ]
+                body = [
+                    _create_lane_loop(
+                        reduction_lane_var,
+                        self._cute_reduction_lane_extent,
+                        lane_body,
+                    )
+                ]
+                # Stash the lane body list so the dispatcher can splice
+                # hoists in (BETWEEN base_stmt and vec_for) as it runs.
+                self._cute_lane_body = lane_body
+            else:
+                body = [
+                    _create_lane_loop(
+                        reduction_lane_var,
+                        self._cute_reduction_lane_extent,
+                        inner_body,
+                    )
+                ]
 
         for_node = create(
             ast.For,
@@ -945,8 +1118,46 @@ class LoopedReductionStrategy(ReductionStrategy):
             )
             result = self.fn.new_var(state.fx_node.name, dce=True)
             if not backend.is_indexed_reduction(reduction_type):
+                vec_input = input_name
+                if (
+                    backend.name == "cute"
+                    and self._cute_reduction_vec_width > 1
+                    and self._cute_emitted_vec_load
+                ):
+                    # The vec load + downstream elementwise ops produced a
+                    # length-V vector; fold it into a scalar so the warp-level
+                    # reduction stays unchanged.
+                    folded = self.fn.new_var(f"{state.fx_node.name}_vfold", dce=True)
+                    state.add_statement(
+                        f"{folded} = _cute_pre_vec_fold({vec_input}, "
+                        f"{reduction_type!r}, V={self._cute_reduction_vec_width})"
+                    )
+                    # If any vec load was masked, gate the folded scalar by
+                    # the same mask so masked-out rows don't pollute acc.
+                    if self._cute_pending_vec_masks:
+                        identity_repr = constant_repr(default)
+                        identity_expr = backend.cast_expr(
+                            identity_repr, _dtype_str(acc_dtype)
+                        )
+                        mask_combined = " and ".join(
+                            f"({m})" for m in self._cute_pending_vec_masks
+                        )
+                        gated = self.fn.new_var(
+                            f"{state.fx_node.name}_vfold_gated", dce=True
+                        )
+                        state.add_statement(
+                            f"{gated} = {folded} if ({mask_combined}) "
+                            f"else {identity_expr}"
+                        )
+                        vec_input = gated
+                        self._cute_pending_vec_masks.clear()
+                    else:
+                        vec_input = folded
+                # Reset for the next reduction's lane body (the consume
+                # sweep may also be codegen'd later but with no vec load).
+                self._cute_emitted_vec_load = False
                 combine_expr = backend.reduction_combine_expr(
-                    reduction_type, acc, input_name, acc_dtype
+                    reduction_type, acc, vec_input, acc_dtype
                 )
                 state.add_statement(f"{acc} = {combine_expr}")
                 expr = self._cute_cross_warp_reduction_expr(
@@ -1456,6 +1667,20 @@ class BlockReductionStrategy(ReductionStrategy):
                 logical_axis_sizes,
             )
             return None
+        # Skip to the direct ``cute.arch.warp_reduction_*`` path when the
+        # entire CTA is a single warp (num_threads == group_span <= 32):
+        # the standard ``call_reduction_function`` can emit a one-shot
+        # warp_reduction with ``threads_in_group=group_span``.
+        #
+        # When ``num_threads > group_span`` (e.g. warp-per-row layouts
+        # with multiple warps per CTA, each owning one row), keep the
+        # ``_cute_grouped_reduce_warp`` path at the bottom — it picks
+        # the right per-warp reduce even when other thread axes coexist
+        # within the CTA.  The "skip" shortcut would route through
+        # ``_needs_loop_carried_accumulator``, which returns True when
+        # the reduction block is no longer in ``active_device_loops``
+        # (e.g. ``cute_dynamic_row_sum``'s ``acc.sum(-1)`` after the
+        # inner ``hl.tile`` exits) and would silently drop the reduce.
         if pre <= 1 and group_span <= 32 and num_threads == group_span:
             debug(
                 "skip small direct",

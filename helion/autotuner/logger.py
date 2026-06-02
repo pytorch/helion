@@ -365,7 +365,9 @@ class AutotuneLogSink:
 
 
 SUPPRESSED_TRITON_CODE_MSG = (
-    "Enable HELION_AUTOTUNE_LOG_LEVEL=DEBUG to log generated Triton code."
+    "Set HELION_AUTOTUNE_LOG_LEVEL=DEBUG to log the generated Triton code, "
+    "or HELION_AUTOTUNER_TRITON_FAILURE_DUMP_DIR=<dir> to write per-failure dumps "
+    "(source code + traceback) to <dir>."
 )
 
 
@@ -397,7 +399,7 @@ def _format_triton_code(kernel: _AutotunableKernel, config: Config, prefix: str)
     return f"{prefix}\n{code}"
 
 
-_FAILURE_DUMP_ENV = "HELION_AUTOTUNER_TRITON_FAILURE_DUMP"
+_FAILURE_DUMP_ENV = "HELION_AUTOTUNER_TRITON_FAILURE_DUMP_DIR"
 
 
 def _get_failure_dump_dir() -> str | None:
@@ -415,7 +417,7 @@ def maybe_dump_triton_failure(
     remote_traceback: str | None = None,
     captured_output: str | None = None,
 ) -> None:
-    """Dump a Triton failure report if HELION_AUTOTUNER_TRITON_FAILURE_DUMP is set."""
+    """Dump a Triton failure report if HELION_AUTOTUNER_TRITON_FAILURE_DUMP_DIR is set."""
     dump_dir = _get_failure_dump_dir()
     if not dump_dir:
         return

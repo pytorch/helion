@@ -79,9 +79,9 @@ jobs:
       id-token: write
       contents: read
     with:
-      runner: linux.aws.h100
+      runner: mt-l-x86iamx-22-225-h100
       python-version: "3.12"
-      image: nvidia/cuda:12.8.1-devel-ubuntu24.04
+      image: pytorch/pytorch:2.11.0-cuda12.8-cudnn9-devel
       runtime-version: cu128
       container-options: --gpus all
       alias: h100
@@ -179,6 +179,7 @@ jobs:
     with:
       alias: tpu
       kernels: ${{ github.event.inputs.kernels_tpu }}
+      env-vars: ${{ github.event.inputs.env_vars }}
 
   trigger-docs-deploy:
     if: always()

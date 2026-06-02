@@ -350,17 +350,22 @@ def skipUnlessTileIR(reason: str) -> Callable[[Callable], Callable]:
     return skipIfFn(lambda: _get_backend() != "tileir", reason)
 
 
+CUTE_MIN_CUDA_VERSION = "13"
+
+
 @functools.cache
 def _has_cute_dsl() -> bool:
     try:
         import cutlass.cute as _cute  # noqa: F401
     except ImportError:
         return False
-    return True
+    from ._compat import requires_cuda_version
+
+    return requires_cuda_version(CUTE_MIN_CUDA_VERSION)
 
 
 def skipUnlessCuteAvailable(reason: str) -> Callable[[Callable], Callable]:
-    """Skip test unless CUTLASS CuTe Python DSL is importable."""
+    """Skip test unless CUTLASS CuTe Python DSL is importable and CUDA >= 13."""
     return skipIfFn(lambda: not _has_cute_dsl(), reason)
 
 

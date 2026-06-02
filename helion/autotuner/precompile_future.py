@@ -719,12 +719,7 @@ class PrecompileFuture:
             formatted = (
                 f"{formatted}\nRemote traceback (spawned process):\n{error.traceback}"
             )
-        if classification == "warn":
-            self.ctx.log.warning(formatted)
-            self.ctx.kernel.maybe_log_repro(
-                self.ctx.log.warning, self.ctx.args, self.config
-            )
-        elif not ignore_errors:
+        if not ignore_errors:
             self.ctx.log.debug(formatted)
             self.ctx.kernel.maybe_log_repro(
                 self.ctx.log.debug, self.ctx.args, self.config

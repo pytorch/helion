@@ -89,3 +89,27 @@ def convert_tile_indices_to_slices(index: object) -> object:
     if isinstance(index, tuple):
         return tuple(_extract_slice(idx) for idx in index)
     return _extract_slice(index)
+
+
+def is_scalar_index(idx: object) -> bool:
+    """Return True if the given index behaves as a single scalar coordinate."""
+    import torch
+
+    if isinstance(idx, torch.SymInt):
+        # Exclude tiled block ranges.
+        from helion._compiler.compile_environment import CompileEnvironment
+        from helion._compiler.compile_environment import NoCurrentEnvironment
+
+        try:
+            env = CompileEnvironment.current()
+            if env.get_block_id(idx) is not None:
+                return False
+        except NoCurrentEnvironment:
+            pass
+        return True
+
+    if isinstance(idx, int):
+        return True
+    if hasattr(idx, "ndim"):
+        return idx.ndim == 0
+    return False

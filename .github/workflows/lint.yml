@@ -38,14 +38,13 @@ jobs:
       - name: Install PyTorch
         run: |
           source .venv/bin/activate
-          # Install nvidia-nvshmem-cu12 from cu129 index (missing on cu128)
-          uv pip install -U --pre nvidia-nvshmem-cu12 --index-url https://download.pytorch.org/whl/nightly/cu129
-          uv pip install -U --pre torch --index-url https://download.pytorch.org/whl/nightly/cu128
+          uv pip install -U --pre nvidia-nvshmem-cu13 --index-url https://download.pytorch.org/whl/nightly/cu130
+          uv pip install -U --pre torch --index-url https://download.pytorch.org/whl/nightly/cu130
 
       - name: Install lint dependencies
         run: |
           source .venv/bin/activate
-          uv pip install pyrefly==0.63.1
+          uv pip install pyrefly==1.0.0
           uv pip install .'[dev,pallas-cpu]'
           ./scripts/install_cute.sh
 

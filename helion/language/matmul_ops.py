@@ -29,6 +29,9 @@ from .._compiler.cute.tcgen05_constants import TCGEN05_FLAT_ROLE_COORDINATES_CON
 from .._compiler.cute.tcgen05_constants import (
     TCGEN05_PURE_CLC_SCHEDULER_OBJECT_CONFIG_KEY,
 )
+from .._compiler.cute.tcgen05_constants import (
+    TCGEN05_PURE_DYNAMIC_SCHEDULER_OBJECT_CONFIG_KEY,
+)
 from .._compiler.cute.tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_M
 from .._compiler.cute.tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_N
 from .._compiler.cute.tcgen05_constants import TCGEN05_TWO_CTA_EDGE_K_TAIL_MIN_DIM
@@ -83,6 +86,14 @@ def _requested_tcgen05_pure_clc_scheduler_object(state: CodegenState) -> bool:
     return bool(
         state.device_function.config.get(
             TCGEN05_PURE_CLC_SCHEDULER_OBJECT_CONFIG_KEY, False
+        )
+    )
+
+
+def _requested_tcgen05_pure_dynamic_scheduler_object(state: CodegenState) -> bool:
+    return bool(
+        state.device_function.config.get(
+            TCGEN05_PURE_DYNAMIC_SCHEDULER_OBJECT_CONFIG_KEY, False
         )
     )
 
@@ -694,6 +705,12 @@ def _(state: CodegenState) -> object:
             "cute",
             f"{TCGEN05_PURE_CLC_SCHEDULER_OBJECT_CONFIG_KEY}=True requires "
             "hl.dot to lower through the tcgen05 K-loop path",
+        )
+    if _requested_tcgen05_pure_dynamic_scheduler_object(state):
+        raise exc.BackendUnsupported(
+            "cute",
+            f"{TCGEN05_PURE_DYNAMIC_SCHEDULER_OBJECT_CONFIG_KEY}=True "
+            "requires hl.dot to lower through the tcgen05 K-loop path",
         )
     if _requested_tcgen05_direct_entry_plan(state):
         raise exc.BackendUnsupported(

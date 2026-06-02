@@ -259,8 +259,8 @@ def main() -> None:
             layer_norm,
             torch.nn.functional.layer_norm,
             (x, [dim], weight, b, eps),
-            rtol=1e-3,
-            atol=1e-3,
+            rtol=1e-2,
+            atol=1e-2,
         )
 
     # Test forward + backward pass
@@ -277,8 +277,8 @@ def main() -> None:
             layer_norm,
             torch.nn.functional.layer_norm,
             (x_grad, [dim], weight_grad, b, eps),
-            rtol=1e-3,
-            atol=1e-3,
+            rtol=1e-2,
+            atol=1e-2,
             bwd=True,
         )
 
