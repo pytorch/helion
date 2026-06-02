@@ -5,6 +5,7 @@ import logging
 import math
 import statistics
 import time
+from typing import TYPE_CHECKING
 from typing import Any
 from typing import Callable
 from typing import TypeVar
@@ -16,6 +17,9 @@ from ..runtime.settings import _get_backend
 from ..runtime.settings import is_pallas_interpret
 from .progress_bar import iter_with_progress
 from helion._dist_utils import sync_object
+
+if TYPE_CHECKING:
+    from .logger import AutotuningLogger
 
 T = TypeVar("T")
 
@@ -69,6 +73,25 @@ def _maybe_cudagraph_replay(
     except Exception:
         _log.debug("CUDA graph benchmark capture failed; falling back", exc_info=True)
         return fn
+
+
+def clear_jit_fast_path_caches(
+    fn: Callable[..., object],
+    log: logging.Logger | AutotuningLogger | None = None,
+) -> None:
+    """Clear Triton JIT fast-path caches for a generated Helion wrapper."""
+    try:
+        fn_name = getattr(fn, "__name__", None)
+        fn_globals = getattr(fn, "__globals__", None)
+        if fn_name is None or fn_globals is None:
+            return
+        triton_jit_fn = fn_globals.get(f"_helion_{fn_name}")
+        clear = getattr(triton_jit_fn, "clear_fast_path_caches", None)
+        if clear is not None:
+            clear()
+    except Exception:
+        if log is not None:
+            log.debug("Failed to clear Triton JIT fast-path cache.", exc_info=True)
 
 
 def _get_tpu_tensors(result: object) -> list[torch.Tensor]:

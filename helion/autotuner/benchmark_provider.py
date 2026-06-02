@@ -30,6 +30,7 @@ from ..runtime.precompile_shim import make_precompiler
 from .benchmark_job import BenchmarkJob
 from .benchmark_worker import BenchmarkSubprocessError
 from .benchmark_worker import BenchmarkWorker
+from .benchmarking import clear_jit_fast_path_caches
 from .benchmarking import do_bench
 from .benchmarking import do_bench_generic
 from .benchmarking import synchronize_device
@@ -876,17 +877,7 @@ class LocalBenchmarkProvider(BenchmarkProvider):
         remain pinned in GPU memory by its _last_call cache across config
         benchmarks.
         """
-        try:
-            fn_name = getattr(fn, "__name__", None)
-            fn_globals = getattr(fn, "__globals__", None)
-            if fn_name is None or fn_globals is None:
-                return
-            triton_jit_fn = fn_globals.get(f"_helion_{fn_name}")
-            clear = getattr(triton_jit_fn, "clear_fast_path_caches", None)
-            if clear is not None:
-                clear()
-        except Exception:
-            self.log.debug("Failed to clear Triton JIT fast-path cache.", exc_info=True)
+        clear_jit_fast_path_caches(fn, self.log)
 
     def _benchmark_function(self, config: Config, fn: CompiledConfig) -> float:
         """Benchmark a single compiled function.  Returns time in ms or inf."""

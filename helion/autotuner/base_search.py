@@ -33,6 +33,7 @@ from .benchmark_provider import BenchmarkResult
 from .benchmark_provider import LocalBenchmarkProvider
 from .benchmark_provider import _clone_args
 from .benchmark_provider import _unset_fn
+from .benchmarking import clear_jit_fast_path_caches
 from .benchmarking import interleaved_bench
 from .logger import AutotuningLogger
 from .metrics import AutotuneMetrics
@@ -995,7 +996,19 @@ class PopulationBasedSearch(BaseSearch):
             )
         else:
             benchmark_args = self.args
-        iterator = [functools.partial(m.fn, *benchmark_args) for m in members]
+
+        def make_rebenchmark_callable(member: PopulationMember) -> Callable[[], object]:
+            run_member = functools.partial(member.fn, *benchmark_args)
+
+            def wrapped() -> object:
+                try:
+                    return run_member()
+                finally:
+                    clear_jit_fast_path_caches(member.fn, self.log)
+
+            return wrapped
+
+        iterator = [make_rebenchmark_callable(m) for m in members]
         _backend = getattr(getattr(self, "config_spec", None), "backend", None)
         interleaved_benchmark = (
             _backend.get_interleaved_bench() if _backend is not None else None
@@ -1003,10 +1016,14 @@ class PopulationBasedSearch(BaseSearch):
         benchmark_function: Callable[..., list[float]] = (
             self.settings.autotune_benchmark_fn or interleaved_benchmark
         )
-        if self.settings.autotune_progress_bar:
-            new_timings = benchmark_function(iterator, repeat=repeat, desc=desc)
-        else:
-            new_timings = benchmark_function(iterator, repeat=repeat)
+        try:
+            if self.settings.autotune_progress_bar:
+                new_timings = benchmark_function(iterator, repeat=repeat, desc=desc)
+            else:
+                new_timings = benchmark_function(iterator, repeat=repeat)
+        finally:
+            for m in members:
+                clear_jit_fast_path_caches(m.fn, self.log)
         new_timings = self._confirm_suspicious_rebenchmark_timings(
             members,
             new_timings,
