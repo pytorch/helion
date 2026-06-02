@@ -1886,7 +1886,7 @@ class TestPallas(TestCase):
         result = fn(x)
         torch.testing.assert_close(result, x)
 
-    @xfailIfPallasInterpret("numerical mismatch in JAX interpret mode")
+    @skipIfPallasInterpret("SMEM preload copy is too expensive in JAX interpret mode")
     def test_scalar_access_2D_constexpr(self) -> None:
         @helion.kernel(backend="pallas", static_shapes=True, config=helion.Config())
         def fn(x: torch.Tensor) -> torch.Tensor:
@@ -2087,6 +2087,9 @@ class TestPallas(TestCase):
         expected = x[x.shape[0] // 2 :] + 0.5
         torch.testing.assert_close(result, expected)
 
+    @skipIfPallasInterpret(
+        "2D SMEM preload copy is too expensive in JAX interpret mode"
+    )
     def test_scalar_access_hl_grid_2d(self) -> None:
         @helion.kernel(backend="pallas", static_shapes=True, config=helion.Config())
         def fn(x: torch.Tensor) -> torch.Tensor:
@@ -2105,6 +2108,9 @@ class TestPallas(TestCase):
         _, result = code_and_output(fn, (x,), loop_order=[1, 0])
         torch.testing.assert_close(result, expected)
 
+    @skipIfPallasInterpret(
+        "2D SMEM preload copy is too expensive in JAX interpret mode"
+    )
     def test_scalar_access_hl_grid_2d_nested(self) -> None:
         @helion.kernel(backend="pallas", static_shapes=True, config=helion.Config())
         def fn(x: torch.Tensor) -> torch.Tensor:
