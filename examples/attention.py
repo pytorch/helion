@@ -152,13 +152,15 @@ def attention_backward(
     lse_in: torch.Tensor,
     do_in: torch.Tensor,
     delta_in: torch.Tensor,
-    qk_scale: float,
+    sm_scale: float,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     m_dim = q_in.size(-2)
     n_dim = k_in.size(-2)
     assert n_dim == v_in.size(-2)
     head_dim = hl.specialize(q_in.size(-1))
     assert head_dim == k_in.size(-1) == v_in.size(-1)
+    assert o_in.size(-2) == m_dim and o_in.size(-1) == head_dim
+    assert do_in.size(-2) == m_dim and do_in.size(-1) == head_dim
     q = q_in.reshape(-1, head_dim)
     k = k_in.reshape(-1, head_dim)
     v = v_in.reshape(-1, head_dim)
@@ -195,7 +197,7 @@ def attention_backward(
             hl.atomic_add(dq, [tile_m, slice(None)], dq_acc * LN2)
             dk_acc = hl.dot(ds_t, q_i, acc=dk_acc)
         dv[tile_n, :] = dv_acc.to(v.dtype)
-        dk[tile_n, :] = (dk_acc * qk_scale).to(k.dtype)
+        dk[tile_n, :] = (dk_acc * sm_scale).to(k.dtype)
     return dq.reshape(q_in.size()), dk.reshape(k_in.size()), dv.reshape(v_in.size())
 
 
@@ -209,7 +211,7 @@ class AttentionFunction(torch.autograd.Function):
     ) -> torch.Tensor:
         o, lse = attention(q, k, v)
         ctx.save_for_backward(q, k, v, o, lse)
-        ctx.qk_scale = math.sqrt(1.0 / q.size(-1))
+        ctx.sm_scale = math.sqrt(1.0 / q.size(-1))
         return o
 
     @staticmethod
@@ -218,8 +220,8 @@ class AttentionFunction(torch.autograd.Function):
         do: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         q, k, v, o, lse = ctx.saved_tensors
-        qk_scale = ctx.qk_scale
-        k_scaled = k * (qk_scale * 1.4426950408889634)
+        sm_scale = ctx.sm_scale
+        k_scaled = k * (sm_scale * 1.4426950408889634)
         delta = _attention_bwd_preprocess(o, do)
         return attention_backward(
             q,
@@ -229,7 +231,7 @@ class AttentionFunction(torch.autograd.Function):
             lse,
             do.contiguous(),
             delta,
-            qk_scale,
+            sm_scale,
         )
 
 
