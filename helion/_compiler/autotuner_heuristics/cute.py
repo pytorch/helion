@@ -514,7 +514,9 @@ class CuteTcgen05ClusterM2Heuristic(AutotunerHeuristic):
         return m_tile_reachable and n_tile_reachable and cls._select_bk(env) is not None
 
     @classmethod
-    def get_seed_config(cls, env: CompileEnvironment, device_ir: DeviceIR) -> Config:
+    def get_seed_config(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> Config | None:
         spec = env.config_spec
         bk = cls._select_bk(env)
         if bk is None:
@@ -524,14 +526,26 @@ class CuteTcgen05ClusterM2Heuristic(AutotunerHeuristic):
             spec._tcgen05_cluster_m2_search_constraints is not None
             and spec._tcgen05_cluster_m2_search_constraints.allow_edge_k_tail_family
         )
+        # Generalized known-good CtaGroup.TWO template (the DEFAULT-layout,
+        # non-FFI config family that the hand-pinned per-shape seeds shared).
+        # Pinning the full perf-critical knob set — not just the tile + cluster
+        # — gives the autotuner a strong, complete starting point for ANY
+        # 2-CTA-eligible matmul shape instead of relying on the search to
+        # rediscover num_warps/num_stages/staging from a partial seed.
+        # ``tcgen05_strategy`` (ROLE_LOCAL_MONOLITHIC) is the default, so it is
+        # left implicit; the search still owns every one of these knobs.
         seed: dict[str, Any] = {
             "block_sizes": [
                 TCGEN05_TWO_CTA_BLOCK_M,
                 TCGEN05_TWO_CTA_BLOCK_N,
                 bk,
             ],
+            "num_warps": 8,
+            "num_stages": 4,
             "pid_type": TCGEN05_TWO_CTA_SEED_PID_TYPE,
             "tcgen05_cluster_m": 2,
+            "tcgen05_cluster_n": 1,
+            "tcgen05_acc_stages": 2,
             # Matches the validated tcgen05 search restriction.
             "tcgen05_num_epi_warps": 4,
             TCGEN05_PERSISTENCE_MODEL_CONFIG_KEY: (
@@ -542,10 +556,11 @@ class CuteTcgen05ClusterM2Heuristic(AutotunerHeuristic):
             seed.update(tcgen05_two_cta_edge_k_tail_seed_overrides())
         else:
             seed["l2_groupings"] = [TCGEN05_TWO_CTA_SEED_L2_GROUPING]
+            seed["tcgen05_c_stages"] = 2
             # When the SMEM-budget gate admits ``ab=3`` for this seed tile
-            # shape, seed the canonical 4096^3 fast config family directly so
-            # it reaches the autotuner's initial population without depending
-            # on a search-stage mutation.
+            # shape, seed the canonical fast config family directly so it
+            # reaches the autotuner's initial population without depending on a
+            # search-stage mutation.
             if spec._tcgen05_ab_stages_three_fits(
                 bm=TCGEN05_TWO_CTA_BLOCK_M,
                 bn=TCGEN05_TWO_CTA_BLOCK_N,
@@ -591,3 +606,42 @@ class CuteTcgen05ClusterM2Heuristic(AutotunerHeuristic):
                 return bk
             bk //= 2
         return None
+
+
+class CuteTcgen05ClusterM2FfiHeuristic(CuteTcgen05ClusterM2Heuristic):
+    """Generalized TVM-FFI direct-entry seed for full-tile CtaGroup.TWO bf16 GEMMs.
+
+    The direct-entry codegen (``build_target1_direct_entry_source`` /
+    ``_create_cute_direct_entry``) builds its A/B/D TMA descriptors from the
+    runtime tensor shapes, so the fast launch path is shape-GENERAL: the only
+    real constraints are structural (256x256 CTA tile, cluster_m=2, a bk in the
+    direct-entry stage-tuple table, bf16 operands, the 128x32 explicit epilogue
+    subtile). This heuristic emits that full ``explicit_epi_tile`` + flat-role +
+    ``tvm_ffi_launch`` config for ANY eligible shape, replacing the bank of
+    hand-pinned per-shape seeds.
+
+    The DEFAULT-layout sibling (``CuteTcgen05ClusterM2Heuristic``) still seeds
+    the non-FFI config, so the autotuner benchmarks both and keeps whichever
+    wins: full-autotune A/B measured the FFI direct entry ~7-21% faster on
+    smaller / square GEMMs (1024x4096x1024, 2048^3) where launch + epilogue
+    overhead dominates, and tied on large compute-bound shapes
+    (8192x1024x1024, 8192x2048x2048). An FFI config that fails to compile or
+    the accuracy check for a given shape is dropped by the autotuner,
+    degrading gracefully to the DEFAULT seed.
+    """
+
+    name = "cute_tcgen05_cluster_m2_ffi"
+    backend = "cute"
+
+    @classmethod
+    def is_eligible(cls, env: CompileEnvironment, device_ir: DeviceIR) -> bool:
+        return env.config_spec._tcgen05_full_tile_direct_entry_seed_eligible()
+
+    @classmethod
+    def get_seed_config(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> Config | None:
+        # Single source of truth lives on the ConfigSpec/CuteTcgen05Config so the
+        # search-projection (``_fix_target1_tvm_ffi_search_config``) and this
+        # population seed emit the identical FFI envelope.
+        return env.config_spec._tcgen05_full_tile_direct_entry_seed_config()

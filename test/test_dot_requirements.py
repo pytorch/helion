@@ -461,17 +461,19 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
     def test_cute_tcgen05_small_shape_wave_quantization_gate(self) -> None:
         """Cycle 38 (cute_plan.md §7.6.3.2): the cluster_m=2 search arm
         is narrowed for shapes whose cluster_m=2 work-cluster count
-        cannot saturate even one wave of cluster slots.
+        cannot saturate even a quarter-wave of cluster slots.
 
         The gate measures ``(M / 256) * (N / 256)`` cluster_m=2 work
-        clusters and compares against ``num_sms // 2`` (one wave of
-        cluster slots when each cluster occupies two SMs). With the
-        SM count mocked to B200's 148 the threshold is 74 cluster
-        slots; the §7.6.1.1 boost-target shapes 1024^3 and 2048^3
-        sit at 16 and 64 cluster slots respectively and therefore
-        narrow to ``cluster_m=1`` only. The 4096^3 G2 closure
-        baseline sits at 256 cluster slots > 74 and keeps
-        cluster_m=2 search exposed (positive control covered by
+        clusters and compares against ``num_sms // 4``. The threshold
+        was lowered from ``num_sms // 2`` (one full wave of 2-SM cluster
+        slots) because the generalized TVM-FFI direct entry has a much
+        lower launch/epilogue overhead and wins at ~64 work clusters
+        (0.86 of a wave on a 148-SM B200). With the SM count mocked to
+        B200's 148 the threshold is 37 cluster slots: 1024^3 sits at 16
+        clusters (< 37) and narrows to ``cluster_m=1`` only, while 2048^3
+        sits at 64 clusters (>= 37) and now KEEPS cluster_m=2 search
+        exposed. The 4096^3 G2 closure baseline (256 clusters) also keeps
+        cluster_m=2 search (covered by
         ``test_cute_tcgen05_two_cta_enters_validated_search_space``).
 
         Mocking ``_cuda_num_sms_or_zero`` keeps the test hermetic:
@@ -491,39 +493,48 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
                 out[tile_m, tile_n] = acc.to(x.dtype)
             return out
 
-        for size in (1024, 2048):
-            with self.subTest(size=size):
-                args = (
-                    torch.empty([size, size], device=DEVICE, dtype=HALF_DTYPE),
-                    torch.empty([size, size], device=DEVICE, dtype=HALF_DTYPE),
-                )
-                with (
-                    patch_cute_mma_support(),
-                    patch(
-                        "helion.language.matmul_ops._cuda_num_sms_or_zero",
-                        return_value=148,
-                    ),
-                ):
-                    bound = cute_matmul_mma.bind(args)
-                spec = bound.config_spec
-                # Below the one-wave SM-slot threshold: cluster_m=2
-                # search is suppressed and the cluster_m2 seed
-                # / fixup machinery is disabled so the autotuner
-                # never spends budget on the cluster_m=2 seed for a
-                # shape where it has no productive lever.
-                self.assertEqual(spec._tcgen05_cluster_m_search_choices, (1,))
-                self.assertIsNone(spec._tcgen05_cluster_m2_search_constraints)
-                # Keep this assertion scoped to the cluster_m=2 seed heuristic:
-                # future unrelated heuristics may still apply to these shapes.
-                self.assertNotIn(
-                    CuteTcgen05ClusterM2Heuristic.name,
-                    spec.autotuner_heuristics,
-                )
-                # Persistent pid types are still allowed (the static-
-                # full-tile gate above this is unaffected) — only the
-                # cluster_m search arm narrows.
-                self.assertIn("persistent_interleaved", spec.allowed_pid_types)
-                self.assertIn("persistent_blocked", spec.allowed_pid_types)
+        def bind_at(size: int):
+            args = (
+                torch.empty([size, size], device=DEVICE, dtype=HALF_DTYPE),
+                torch.empty([size, size], device=DEVICE, dtype=HALF_DTYPE),
+            )
+            with (
+                patch_cute_mma_support(),
+                patch(
+                    "helion.language.matmul_ops._cuda_num_sms_or_zero",
+                    return_value=148,
+                ),
+            ):
+                return cute_matmul_mma.bind(args).config_spec
+
+        # Suppressed: 1024^3 = 16 cluster slots < 148 // 4 = 37. cluster_m=2
+        # search is suppressed and the cluster_m2 seed / fixup machinery is
+        # disabled so the autotuner never spends budget on the cluster_m=2 seed
+        # for a shape where it has no productive lever.
+        suppressed_spec = bind_at(1024)
+        self.assertEqual(suppressed_spec._tcgen05_cluster_m_search_choices, (1,))
+        self.assertIsNone(suppressed_spec._tcgen05_cluster_m2_search_constraints)
+        # Keep this assertion scoped to the cluster_m=2 seed heuristic:
+        # future unrelated heuristics may still apply to these shapes.
+        self.assertNotIn(
+            CuteTcgen05ClusterM2Heuristic.name,
+            suppressed_spec.autotuner_heuristics,
+        )
+        # Persistent pid types are still allowed (the static-full-tile gate
+        # above this is unaffected) — only the cluster_m search arm narrows.
+        self.assertIn("persistent_interleaved", suppressed_spec.allowed_pid_types)
+        self.assertIn("persistent_blocked", suppressed_spec.allowed_pid_types)
+
+        # Admitted (positive control for the lowered // 4 boundary): 2048^3 = 64
+        # cluster slots >= 37. cluster_m=2 search stays exposed, its constraints
+        # are recorded, and the cluster_m=2 seed heuristic is registered.
+        admitted_spec = bind_at(2048)
+        self.assertEqual(admitted_spec._tcgen05_cluster_m_search_choices, (1, 2))
+        self.assertIsNotNone(admitted_spec._tcgen05_cluster_m2_search_constraints)
+        self.assertIn(
+            CuteTcgen05ClusterM2Heuristic.name,
+            admitted_spec.autotuner_heuristics,
+        )
 
     @onlyBackends(["cute"])
     def test_cute_tcgen05_cluster_m1_persistent_search_caps_m_tile(self) -> None:

@@ -483,39 +483,11 @@ TCGEN05_TARGET9_TVM_FFI_C_STAGES = 2
 # closed the gap on T22 (fp16 2048³ bias) from +21.25% to +3.7% vs Quack.
 # T10 is the first TVM-FFI envelope that admits fp16 operands — the per-target
 # fp16 admission gates are scoped to T10's shape so the other FFI seeds
-# (T1-T7, T9) stay bf16-only. (The cycle-87 T8 fp16 plain-gelu seed below is
-# a separate, non-FFI DEFAULT-layout seed and does not use this envelope.)
+# (T1-T7, T9) stay bf16-only.
 TCGEN05_TARGET10_TVM_FFI_SHAPE = (2048, 2048, 2048)
 TCGEN05_TARGET10_TVM_FFI_BLOCK_K = 128
 TCGEN05_TARGET10_TVM_FFI_AB_STAGES = 3
 TCGEN05_TARGET10_TVM_FFI_C_STAGES = 2
-# Validated cycle-87 Target8 envelope (1536x6144x1536 + plain ``gelu(acc)``
-# epilogue, fp16 operands). Unlike the bf16 / T10 FFI seeds, T8 is NOT a
-# TVM-FFI seed: it uses the DEFAULT epilogue layout and the normal (non-FFI)
-# launch path on the bk=128 (ab=3, c=2) two-CTA stage tuple, because the
-# ``explicit_epi_tile`` / ``tvm_ffi_launch`` flat-role codegen path is gated
-# bf16-only (and fp16 only for the T10 2048³ bias envelope) and rejects a
-# fp16 gelu store. This is the medium-square fp16 MatmulTarget 27 coverage
-# gap from the cycle-86 study: the cold autotuner converges on the
-# ``256x256x64, ab=1/2`` (~556-578 TF) regime, but the validated
-# ``256x256x128, ab=3`` two-CTA envelope force-configs to ~649 TF.
-# K=1536 -> k_tile_count=12 (well below the ``TCGEN05_TWO_CTA_MAX_K_TILES``
-# cap; M_tiles*N_tiles = 6*24 = 144 work clusters). The plain-gelu-store gate
-# (``gelu(acc)`` with no bias and no residual) is unique to T8 and mutually
-# exclusive with the identity/relu/bias/bias_relu gates via the chain shape
-# (a single ``_gelu_erf`` unary op between the MMA carrier and the store
-# cast). The bf16 gelu MatmulTargets 4 (2048x4096x2048) and 19
-# (3072x3072x3072) share the same plain-gelu chain shape, so the detector
-# fires on them too, but the fp16-pinned shape fact below keeps the T8 seed
-# mutually exclusive with them (and the bias_residual_gelu MatmulTargets
-# 12/28 are excluded at the chain-shape level because their stores carry bias
-# + residual adds before the gelu). The "target8" slot name is the eighth
-# internal seed slot and is unrelated to MatmulTarget 8.
-TCGEN05_TARGET8_GELU_SHAPE = (1536, 6144, 1536)
-TCGEN05_TARGET8_GELU_BLOCK_K = 128
-TCGEN05_TARGET8_GELU_AB_STAGES = 3
-TCGEN05_TARGET8_GELU_C_STAGES = 2
-
 # Stage tuples that the TVM-FFI direct entry accepts, keyed by ``bk``.
 # The codegen-side ``tcgen05_direct_entry`` source builder and the
 # runtime-side ``_validate_target1_direct_entry_args`` both consume this
@@ -528,36 +500,6 @@ TCGEN05_DIRECT_ENTRY_STAGE_TUPLES_BY_BK: dict[int, tuple[tuple[int, int], ...]] 
     TCGEN05_TARGET1_TVM_FFI_BLOCK_K: ((3, 2), (6, 4)),
     TCGEN05_TARGET4_TVM_FFI_BLOCK_K: (
         (TCGEN05_TARGET4_TVM_FFI_AB_STAGES, TCGEN05_TARGET4_TVM_FFI_C_STAGES),
-    ),
-}
-
-# Accepted (lhs_shape, rhs_shape, d_shape) envelopes keyed by ``bk``.
-# Ties the direct-entry tensor shape envelope to the plan's ``bk`` so a
-# bk=64 (T1) plan cannot launch with T2/T3/T4/T5/T6/T7/T9/T10-shaped
-# tensors and vice versa. Each entry is
-# ``((lhs_m, lhs_k), (rhs_k, rhs_n), (d_m, d_n))``. T2, T3, T4, T5, T6,
-# T7, T9, and T10 share ``bk=128`` but have distinct M/N/K shapes (with
-# T9 and T10 sharing the square 2048³ shape but differing on epilogue +
-# input dtype); all eight are admitted in the same bk-keyed table so
-# the runtime validator accepts any of them (it additionally dispatches
-# on the per-plan ``validated_shape`` so a T3-plan with T4/T5/T7/T9/T10
-# tensors is still rejected; T2, T6, and T10 plans each carry a
-# ``bias_idx`` so a 3-arg launch is rejected against any of them even
-# at the same shape envelope, and a 4-arg launch is rejected against
-# the T3/T4/T5/T7/T9 plans).
-TCGEN05_DIRECT_ENTRY_SHAPE_SETS_BY_BK: dict[
-    int,
-    tuple[tuple[tuple[int, int], tuple[int, int], tuple[int, int]], ...],
-] = {
-    TCGEN05_TARGET1_TVM_FFI_BLOCK_K: (((1024, 1024), (1024, 4096), (1024, 4096)),),
-    TCGEN05_TARGET4_TVM_FFI_BLOCK_K: (
-        ((8192, 1024), (1024, 1024), (8192, 1024)),
-        ((1024, 1024), (1024, 8192), (1024, 8192)),
-        ((2048, 2048), (2048, 4096), (2048, 4096)),
-        ((4096, 2048), (2048, 2048), (4096, 2048)),
-        ((8192, 2048), (2048, 2048), (8192, 2048)),
-        ((2048, 2048), (2048, 8192), (2048, 8192)),
-        ((2048, 2048), (2048, 2048), (2048, 2048)),
     ),
 }
 

@@ -459,52 +459,12 @@ class ConfigSpec:
         self._cute_tcgen05_config.exact_shape_aux_kernel_detected = value
 
     @property
-    def cute_tcgen05_identity_matmul_store_detected(self) -> bool:
-        return self._cute_tcgen05_config.identity_matmul_store_detected
+    def cute_tcgen05_matmul_has_non_tcgen05_operand(self) -> bool:
+        return self._cute_tcgen05_config.matmul_has_non_tcgen05_operand
 
-    @cute_tcgen05_identity_matmul_store_detected.setter
-    def cute_tcgen05_identity_matmul_store_detected(self, value: bool) -> None:
-        self._cute_tcgen05_config.identity_matmul_store_detected = value
-
-    @property
-    def cute_tcgen05_relu_matmul_store_detected(self) -> bool:
-        return self._cute_tcgen05_config.relu_matmul_store_detected
-
-    @cute_tcgen05_relu_matmul_store_detected.setter
-    def cute_tcgen05_relu_matmul_store_detected(self, value: bool) -> None:
-        self._cute_tcgen05_config.relu_matmul_store_detected = value
-
-    @property
-    def cute_tcgen05_bias_matmul_store_detected(self) -> bool:
-        return self._cute_tcgen05_config.bias_matmul_store_detected
-
-    @cute_tcgen05_bias_matmul_store_detected.setter
-    def cute_tcgen05_bias_matmul_store_detected(self, value: bool) -> None:
-        self._cute_tcgen05_config.bias_matmul_store_detected = value
-
-    @property
-    def cute_tcgen05_bias_matmul_store_fp16_detected(self) -> bool:
-        return self._cute_tcgen05_config.bias_matmul_store_fp16_detected
-
-    @cute_tcgen05_bias_matmul_store_fp16_detected.setter
-    def cute_tcgen05_bias_matmul_store_fp16_detected(self, value: bool) -> None:
-        self._cute_tcgen05_config.bias_matmul_store_fp16_detected = value
-
-    @property
-    def cute_tcgen05_bias_relu_matmul_store_detected(self) -> bool:
-        return self._cute_tcgen05_config.bias_relu_matmul_store_detected
-
-    @cute_tcgen05_bias_relu_matmul_store_detected.setter
-    def cute_tcgen05_bias_relu_matmul_store_detected(self, value: bool) -> None:
-        self._cute_tcgen05_config.bias_relu_matmul_store_detected = value
-
-    @property
-    def cute_tcgen05_gelu_matmul_store_detected(self) -> bool:
-        return self._cute_tcgen05_config.gelu_matmul_store_detected
-
-    @cute_tcgen05_gelu_matmul_store_detected.setter
-    def cute_tcgen05_gelu_matmul_store_detected(self, value: bool) -> None:
-        self._cute_tcgen05_config.gelu_matmul_store_detected = value
+    @cute_tcgen05_matmul_has_non_tcgen05_operand.setter
+    def cute_tcgen05_matmul_has_non_tcgen05_operand(self, value: bool) -> None:
+        self._cute_tcgen05_config.matmul_has_non_tcgen05_operand = value
 
     @property
     def _tcgen05_cluster_m_search_choices(self) -> tuple[int, ...] | None:
@@ -558,6 +518,15 @@ class ConfigSpec:
     ) -> None:
         self._cute_tcgen05_config.num_epi_warps_validation_choices = value
 
+    def _tcgen05_full_tile_direct_entry_seed_eligible(self) -> bool:
+        return self._cute_tcgen05_config.full_tile_direct_entry_seed_eligible()
+
+    def _tcgen05_full_tile_direct_entry_seed_bk(self) -> int | None:
+        return self._cute_tcgen05_config.full_tile_direct_entry_seed_bk()
+
+    def _tcgen05_full_tile_direct_entry_seed_config(self) -> helion.Config | None:
+        return self._cute_tcgen05_config.full_tile_direct_entry_seed_config()
+
     def restrict_tcgen05_cluster_m_search(self, choices: tuple[int, ...]) -> None:
         self._cute_tcgen05_config.restrict_cluster_m_search(choices)
 
@@ -573,36 +542,6 @@ class ConfigSpec:
             max_k_tiles=max_k_tiles,
             allow_edge_k_tail_family=allow_edge_k_tail_family,
         )
-
-    def allow_tcgen05_target1_tvm_ffi_seed(self) -> None:
-        self._cute_tcgen05_config.allow_target1_tvm_ffi_seed()
-
-    def allow_tcgen05_target2_tvm_ffi_seed(self) -> None:
-        self._cute_tcgen05_config.allow_target2_tvm_ffi_seed()
-
-    def allow_tcgen05_target3_tvm_ffi_seed(self) -> None:
-        self._cute_tcgen05_config.allow_target3_tvm_ffi_seed()
-
-    def allow_tcgen05_target4_tvm_ffi_seed(self) -> None:
-        self._cute_tcgen05_config.allow_target4_tvm_ffi_seed()
-
-    def allow_tcgen05_target5_tvm_ffi_seed(self) -> None:
-        self._cute_tcgen05_config.allow_target5_tvm_ffi_seed()
-
-    def allow_tcgen05_target6_tvm_ffi_seed(self) -> None:
-        self._cute_tcgen05_config.allow_target6_tvm_ffi_seed()
-
-    def allow_tcgen05_target7_tvm_ffi_seed(self) -> None:
-        self._cute_tcgen05_config.allow_target7_tvm_ffi_seed()
-
-    def allow_tcgen05_target8_gelu_seed(self) -> None:
-        self._cute_tcgen05_config.allow_target8_gelu_seed()
-
-    def allow_tcgen05_target9_tvm_ffi_seed(self) -> None:
-        self._cute_tcgen05_config.allow_target9_tvm_ffi_seed()
-
-    def allow_tcgen05_target10_tvm_ffi_seed(self) -> None:
-        self._cute_tcgen05_config.allow_target10_tvm_ffi_seed()
 
     @staticmethod
     def _tcgen05_cluster_m2_bk_is_valid(
