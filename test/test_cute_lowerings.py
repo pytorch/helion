@@ -19751,87 +19751,6 @@ class TestCuteTcgen05AuxPipelineCycle2a(unittest.TestCase):
             producer_body,
         )
 
-    def test_aux_pipeline_producer_advance_indent_fallback_path(self) -> None:
-        """Producer-body indent regression for the fallback
-        ``emit_pipeline_advance`` path: when
-        ``cutedsl_has_opresultlist_fix()`` returns False (PyPI
-        4.5.0.dev0 build), ``emit_pipeline_advance`` returns a
-        multi-line ``if True: \\n    <line1> \\n    <line2>``
-        block rather than a single
-        ``state.advance()`` call. The producer-body
-        subtile-loop emitter must indent every line of that
-        block to the loop body's indent (``    `` for the
-        ``for _tcgen05_aux_subtile in ...:`` loop), not just
-        the first — otherwise the inner lines under-indent
-        and produce a SyntaxError when ``statement_from_string``
-        parses the loop source.
-        """
-        from helion._compiler.cute import cutedsl_compat
-
-        kernel = self._residual_kernel()
-        args = (
-            torch.empty([4096, 4096], device=DEVICE, dtype=torch.bfloat16),
-            torch.empty([4096, 4096], device=DEVICE, dtype=torch.bfloat16),
-            torch.empty([4096, 4096], device=DEVICE, dtype=torch.bfloat16),
-        )
-        config = self._canonical_c_input_config()
-        with (
-            patch_cute_mma_support(),
-            patch.object(
-                cutedsl_compat, "cutedsl_has_opresultlist_fix", return_value=False
-            ),
-        ):
-            bound = kernel.bind(args)
-            bound.env.config_spec.cute_tcgen05_search_enabled = True
-            code = bound.to_triton_code(config)
-
-        # The fallback ``emit_pipeline_advance`` body contains
-        # the ``state._count = state._count + cutlass.Int32(1)``
-        # update wrapped in ``if True: ...``. Pin that every
-        # such line under the producer subtile-loop body is
-        # indented at least to the loop's ``    `` body
-        # indent. The producer subtile loop is the
-        # ``for _tcgen05_aux_subtile in cutlass.range(...):``
-        # in the C-input warp role-local while body. Find the
-        # producer advance lines (those that update
-        # ``tcgen05_aux_pipeline_producer_state``) and verify
-        # each line carries a leading "    " indent.
-        producer_state_count_lines = [
-            line
-            for line in code.split("\n")
-            if (
-                "tcgen05_aux_pipeline_producer_state._count" in line
-                or "tcgen05_aux_pipeline_producer_state._index" in line
-                or "tcgen05_aux_pipeline_producer_state._phase" in line
-            )
-        ]
-        # Each producer-state update line lives inside the
-        # subtile loop body (which itself nests inside the
-        # role-local while + cluster-init prefix). The loop
-        # body indent is at least ``        `` (8 spaces) —
-        # role-local-while body indent + per-iter body indent.
-        # Pin a minimum of 8-space indent so an under-indented
-        # ``if True:\n``-then-flat-body emission would fail.
-        self.assertTrue(
-            producer_state_count_lines,
-            "expected at least one producer_state update line "
-            "in the fallback advance body; the fallback path "
-            "must emit explicit count/index/phase updates",
-        )
-        for line in producer_state_count_lines:
-            stripped = line.lstrip(" ")
-            indent_width = len(line) - len(stripped)
-            self.assertGreaterEqual(
-                indent_width,
-                8,
-                f"producer-state update line under-indented "
-                f"({indent_width} spaces): {line!r}. The "
-                f"subtile loop body requires ≥8-space indent; "
-                f"under-indentation indicates the multi-line "
-                f"``emit_pipeline_advance`` block was spliced "
-                f"without per-line reflow.",
-            )
-
     def test_aux_pipeline_multi_store_fanout_gate_closes(self) -> None:
         """Multi-store fan-out regression: a kernel that consumes
         one matmul result into multiple stores with different aux
@@ -20779,170 +20698,44 @@ class TestCuteTcgen05AuxPipelineCycle2a(unittest.TestCase):
 
 @onlyBackends(["cute"])
 class TestCuteDslCompat(unittest.TestCase):
-    def test_umma_async_tail_workaround_preserves_leader_cta_guard(self) -> None:
+    """The cute backend hard-requires the 4.5.1 CuTe DSL API (enforced up front
+    by ``CuteBackend.validate_environment``), so the pipeline emitters render
+    the native CuTe calls directly with no per-build workarounds."""
+
+    def test_pipeline_advance_emits_native_call(self) -> None:
         from helion._compiler.cute import cutedsl_compat
 
-        with patch.object(
-            cutedsl_compat, "cutedsl_has_opresultlist_fix", return_value=False
-        ):
-            src = cutedsl_compat.emit_producer_tail_umma_async(
-                "acc_pipeline", "acc_state", num_stages=3
-            )
-
-        self.assertIn("cute.arch.block_idx_in_cluster()", src)
-        self.assertIn("cute.arch.make_warp_uniform(_pt_bidx)", src)
-        leader_guard = "if _pt_cta_rank % cutlass.Int32(2) == cutlass.Int32(0):"
-        self.assertIn(leader_guard, src)
-        self.assertLess(
-            src.index(leader_guard),
-            src.index("acc_state._count = acc_state._count + cutlass.Int32(1)"),
-        )
-        self.assertLess(
-            src.index("acc_state._count = acc_state._count + cutlass.Int32(1)"),
-            src.index("acc_pipeline.producer_acquire(acc_state)"),
+        self.assertEqual(
+            cutedsl_compat.emit_pipeline_advance("ab_state"),
+            "ab_state.advance()",
         )
         self.assertEqual(
-            src.count("acc_state._count = acc_state._count + cutlass.Int32(1)"),
-            2,
+            cutedsl_compat.emit_pipeline_advance("ab_state", indent="    "),
+            "    ab_state.advance()",
         )
-        self.assertNotIn("acc_pipeline.sync_object_empty.wait", src)
-        self.assertIn("acc_pipeline.producer_acquire(acc_state)", src)
 
-    def test_tma_umma_tail_uses_upstream_when_advance_and_tail_safe(self) -> None:
+    def test_tma_umma_tail_emits_native_producer_tail(self) -> None:
         from helion._compiler.cute import cutedsl_compat
 
-        with (
-            patch.object(
-                cutedsl_compat, "cutedsl_has_opresultlist_fix", return_value=True
-            ),
-            patch.object(
-                cutedsl_compat,
-                "cutedsl_tma_umma_tail_has_peer_cta_semantics",
-                return_value=True,
-            ),
-        ):
-            self.assertEqual(
-                cutedsl_compat.emit_producer_tail_tma_umma(
-                    "ab_pipeline", "ab_state", num_stages=3
-                ),
-                "ab_pipeline.producer_tail(ab_state)",
-            )
-
-    def test_tma_umma_tail_inlines_when_tail_semantics_unsafe(self) -> None:
-        from helion._compiler.cute import cutedsl_compat
-
-        with (
-            patch.object(
-                cutedsl_compat, "cutedsl_has_opresultlist_fix", return_value=True
-            ),
-            patch.object(
-                cutedsl_compat,
-                "cutedsl_tma_umma_tail_has_peer_cta_semantics",
-                return_value=False,
-            ),
-        ):
-            src = cutedsl_compat.emit_producer_tail_tma_umma(
-                "ab_pipeline", "ab_state", num_stages=3
-            )
-
-        self.assertNotIn("block_idx_in_cluster", src)
-        self.assertNotIn("_pt_cta_rank", src)
-        self.assertNotIn("if True", src)
-        self.assertLess(
-            src.index("ab_state._count = ab_state._count + cutlass.Int32(1)"),
-            src.index("ab_pipeline.producer_acquire(ab_state)"),
+        self.assertEqual(
+            cutedsl_compat.emit_producer_tail_tma_umma("ab_pipeline", "ab_state"),
+            "ab_pipeline.producer_tail(ab_state)",
         )
         self.assertEqual(
-            src.count("ab_state._count = ab_state._count + cutlass.Int32(1)"),
-            2,
+            cutedsl_compat.emit_producer_tail_tma_umma(
+                "ab_pipeline", "ab_state", indent="    "
+            ),
+            "    ab_pipeline.producer_tail(ab_state)",
         )
-        self.assertIn("ab_pipeline.producer_acquire(ab_state)", src)
 
-    def test_tma_umma_tail_inlines_when_advance_workaround_needed(self) -> None:
+    def test_tma_umma_tail_skip_advances_emits_bare_acquire(self) -> None:
         from helion._compiler.cute import cutedsl_compat
 
-        with patch.object(
-            cutedsl_compat, "cutedsl_has_opresultlist_fix", return_value=False
-        ):
-            src = cutedsl_compat.emit_producer_tail_tma_umma(
-                "ab_pipeline", "ab_state", num_stages=3
-            )
-
-        self.assertNotIn("block_idx_in_cluster", src)
-        self.assertNotIn("if True", src)
-        self.assertIn("ab_pipeline.producer_acquire(ab_state)", src)
-
-    def test_tma_async_tail_uses_upstream_when_advance_safe(self) -> None:
-        from helion._compiler.cute import cutedsl_compat
-
-        with patch.object(
-            cutedsl_compat, "cutedsl_has_opresultlist_fix", return_value=True
-        ):
-            self.assertEqual(
-                cutedsl_compat.emit_producer_tail_tma_async(
-                    "aux_pipeline", "aux_state", num_stages=2
-                ),
-                "aux_pipeline.producer_tail(aux_state)",
-            )
-
-    def test_tma_async_tail_inlines_when_advance_workaround_needed(self) -> None:
-        from helion._compiler.cute import cutedsl_compat
-
-        with patch.object(
-            cutedsl_compat, "cutedsl_has_opresultlist_fix", return_value=False
-        ):
-            src = cutedsl_compat.emit_producer_tail_tma_async(
-                "aux_pipeline", "aux_state", num_stages=2
-            )
-
-        parsed = ast.parse(src)
-        self.assertEqual(len(parsed.body), 1, src)
-        self.assertNotIn("producer_tail", src)
-        self.assertIn("aux_state._count = aux_state._count + cutlass.Int32(1)", src)
-        self.assertIn("aux_pipeline.producer_acquire(aux_state)", src)
-
-    def test_tma_umma_tail_can_skip_state_advances(self) -> None:
-        from helion._compiler.cute import cutedsl_compat
-
-        with (
-            patch.object(
-                cutedsl_compat, "cutedsl_has_opresultlist_fix", return_value=True
-            ),
-            patch.object(
-                cutedsl_compat,
-                "cutedsl_tma_umma_tail_has_peer_cta_semantics",
-                return_value=True,
-            ),
-        ):
-            src = cutedsl_compat.emit_producer_tail_tma_umma(
-                "ab_pipeline",
-                "ab_state",
-                num_stages=3,
-                skip_advances=True,
-            )
-
+        src = cutedsl_compat.emit_producer_tail_tma_umma(
+            "ab_pipeline", "ab_state", skip_advances=True
+        )
         self.assertEqual(src, "ab_pipeline.producer_acquire(ab_state)")
         self.assertNotIn("producer_tail", src)
-        self.assertNotIn("ab_state._count", src)
-        self.assertNotIn("ab_state.advance", src)
-
-    def test_tma_umma_tail_detector_allows_state_rename(self) -> None:
-        from helion._compiler.cute import cutedsl_compat
-
-        cutedsl_compat.cutedsl_tma_umma_tail_has_peer_cta_semantics.cache_clear()
-        src = """
-def producer_tail(self, producer_state):
-    for i in range(self.num_stages - 1):
-        producer_state.advance()
-    self.producer_acquire(producer_state)
-"""
-        try:
-            with patch.object(cutedsl_compat.inspect, "getsource", return_value=src):
-                self.assertTrue(
-                    cutedsl_compat.cutedsl_tma_umma_tail_has_peer_cta_semantics()
-                )
-        finally:
-            cutedsl_compat.cutedsl_tma_umma_tail_has_peer_cta_semantics.cache_clear()
 
 
 @onlyBackends(["cute"])

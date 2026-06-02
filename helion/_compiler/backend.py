@@ -111,6 +111,16 @@ class Backend(abc.ABC):
         """Backend name used to look up registered codegen functions."""
         return self.name
 
+    def validate_environment(self) -> None:
+        """Raise a ``helion.exc.*`` error if this backend cannot run here.
+
+        Called once per :class:`CompileEnvironment` for the *selected* backend
+        (never at registration time), so a backend can hard-require libraries,
+        CUDA versions, or hardware and fail fast with an actionable message
+        instead of crashing deep in codegen. The default is a no-op.
+        """
+        return None
+
     @abc.abstractmethod
     def dtype_str(self, dtype: torch.dtype) -> str:
         """Convert a torch dtype to a backend-specific type string.
@@ -2906,6 +2916,11 @@ class CuteBackend(Backend):
     @property
     def name(self) -> str:
         return "cute"
+
+    def validate_environment(self) -> None:
+        from .cute.cutedsl_compat import check_cute_backend_requirements
+
+        check_cute_backend_requirements()
 
     def customize_ast(self, hf: HostFunction) -> None:
         """CuTe-specific AST rewrites that rewrite high-level patterns into

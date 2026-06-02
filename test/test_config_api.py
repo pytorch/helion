@@ -25,6 +25,7 @@ from helion._compiler.cute.tcgen05_constants import (
 from helion._testing import TestCase
 from helion._testing import onlyBackends
 from helion._testing import skipIfXPU
+from helion._testing import skipUnlessCuteAvailable
 import helion.language as hl
 
 
@@ -378,12 +379,14 @@ class TestSettingsEnv(TestCase):
             settings = helion.Settings()
         self.assertEqual(settings.backend, "tileir")
 
+    @skipUnlessCuteAvailable("Constructs a cute CompileEnvironment")
     def test_compile_environment_selects_cute_backend(self) -> None:
         settings = helion.Settings(backend="cute")
         env = CompileEnvironment(torch.device("cpu"), settings)
         self.assertEqual(env.backend_name, "cute")
         self.assertEqual(env.backend.default_launcher_name, "_default_cute_launcher")
 
+    @skipUnlessCuteAvailable("Constructs a cute CompileEnvironment")
     def test_num_threads_support_is_backend_specific(self) -> None:
         triton_env = CompileEnvironment(
             torch.device("cpu"), helion.Settings(backend="triton")

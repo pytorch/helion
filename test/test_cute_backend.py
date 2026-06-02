@@ -15,6 +15,7 @@ from helion._testing import TestCase
 from helion._testing import code_and_output
 from helion._testing import onlyBackends
 from helion.exc import BackendUnsupported
+from helion.exc import CuteBackendUnavailable
 import helion.language as hl
 from helion.runtime import _create_cute_direct_entry
 from helion.runtime import _cute_cluster_shape
@@ -3184,3 +3185,44 @@ class TestCuteTileVecWarpReduceHeuristic(TestCase):
         self.assertIn(
             CuteTileVecWarpReduceHeuristic, HEURISTICS_BY_BACKEND.get("cute", ())
         )
+
+
+class TestCuteBackendRequirements(TestCase):
+    """The cute backend hard-requires CuTe DSL >= 4.5.1, apache-tvm-ffi, and
+    CUDA >= 13, enforced up front via ``CuteBackend.validate_environment``.
+    This module is ``importorskip``-gated on cutlass, so the environment under
+    test already satisfies the requirements (the gate must pass here).
+    """
+
+    def test_requirements_satisfied_in_this_environment(self) -> None:
+        from helion._compiler.cute.cutedsl_compat import _cute_backend_requirement_error
+
+        self.assertIsNone(_cute_backend_requirement_error())
+
+    def test_check_does_not_raise_when_satisfied(self) -> None:
+        from helion._compiler.cute.cutedsl_compat import check_cute_backend_requirements
+
+        check_cute_backend_requirements()  # must not raise in this environment
+
+    def test_validate_environment_passes(self) -> None:
+        from helion._compiler.backend import CuteBackend
+
+        CuteBackend().validate_environment()  # must not raise in this environment
+
+    def test_unmet_requirement_raises_with_actionable_message(self) -> None:
+        from helion._compiler.cute import cutedsl_compat
+
+        with (
+            patch.object(
+                cutedsl_compat,
+                "_cute_backend_requirement_error",
+                return_value="the apache-tvm-ffi package is required (simulated)",
+            ),
+            self.assertRaises(CuteBackendUnavailable) as ctx,
+        ):
+            cutedsl_compat.check_cute_backend_requirements()
+        message = str(ctx.exception)
+        self.assertIn("apache-tvm-ffi package is required (simulated)", message)
+        # The fixed tail names all three requirements so the user knows the set.
+        self.assertIn("nvidia-cutlass-dsl >= 4.5.1", message)
+        self.assertIn("CUDA >= 13", message)

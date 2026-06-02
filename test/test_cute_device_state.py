@@ -73,8 +73,6 @@ def _lifecycle(**overrides: object) -> Tcgen05LifecycleContext:
         "acc_tmem_cols": "tcgen05_acc_tmem_cols",
         "is_two_cta": False,
         "use_tma": True,
-        "ab_stage_count": 2,
-        "acc_stage_count": 1,
     }
     kwargs.update(overrides)
     return Tcgen05LifecycleContext(**kwargs)
