@@ -38,6 +38,8 @@ if TYPE_CHECKING:
     from collections.abc import Callable
     from collections.abc import Iterable
 
+    import jax
+
 _CUTLASS_SHUTDOWN_PATCHED = False
 
 
@@ -1031,6 +1033,35 @@ def _pallas_prepare_args(
     )
 
 
+def _pallas_do_smem_inplace_copy(
+    in_ref: object,
+    out_ref: object,
+    current_indices: tuple[int, ...] = (),
+) -> None:
+    if len(current_indices) == len(in_ref.shape):  # type: ignore[attr-defined]
+        out_ref[current_indices] = in_ref[current_indices]  # type: ignore[index]
+        return
+    next_dim = len(current_indices)
+    for i in range(in_ref.shape[next_dim]):  # type: ignore[attr-defined]
+        _pallas_do_smem_inplace_copy(in_ref, out_ref, (*current_indices, i))
+
+
+def _pallas_inplace_copy(in_ref: object, out_ref: object, *, is_smem: bool) -> None:
+    if is_smem:
+        _pallas_do_smem_inplace_copy(in_ref, out_ref)
+    else:
+        out_ref[...] = in_ref[...]  # type: ignore[index]
+
+
+def _pallas_copy_guard(dims: tuple[int, ...]) -> bool | jax.Array:
+    from jax.experimental import pallas as pl
+
+    should_copy = True
+    for dim in dims:
+        should_copy = should_copy & (pl.program_id(dim) == 0)
+    return should_copy
+
+
 def _pallas_make_reordered_kernel(
     pallas_kernel: object,
     args: tuple[object, ...],
@@ -1058,7 +1089,11 @@ def _pallas_make_reordered_kernel(
     where direct load/store is not allowed.
     """
     _skip_copy = skip_inplace_copy or set()
-    copy_guards = _copy_guards or {}
+    copy_guards = {
+        orig_pos: guard_dims
+        for orig_pos, guard_dims in (_copy_guards or {}).items()
+        if guard_dims
+    }
 
     def reordered_kernel(*refs: object) -> None:
         from jax.experimental import pallas as pl
@@ -1073,24 +1108,23 @@ def _pallas_make_reordered_kernel(
             out_ref = refs[n_tensor_inputs + out_idx]
             if orig_pos in inplace_positions and orig_pos not in _skip_copy:
                 in_ref = refs[arg_to_tensor_pos[orig_pos]]
-                if _smem_arg_indices is not None and orig_pos in _smem_arg_indices:
-                    # [...] cannot be used for SMEMs,
-                    # TODO(dunfanlu): handle in-place copy for SMEM refs
-                    pass
-                elif orig_pos in copy_guards:
-                    should_copy = True
-                    for dim in copy_guards[orig_pos]:
-                        should_copy = should_copy & (pl.program_id(dim) == 0)
+                is_smem = (
+                    _smem_arg_indices is not None and orig_pos in _smem_arg_indices
+                )
+                copy_guard_dims = copy_guards.get(orig_pos)
+                if copy_guard_dims:
+                    should_copy = _pallas_copy_guard(copy_guard_dims)
 
                     @pl.when(should_copy)
                     def _copy_shared_output(
                         out_ref: object = out_ref,
                         in_ref: object = in_ref,
+                        is_smem: bool = is_smem,
                     ) -> None:
-                        out_ref[...] = in_ref[...]  # type: ignore[index]
+                        _pallas_inplace_copy(in_ref, out_ref, is_smem=is_smem)
 
                 else:
-                    out_ref[...] = in_ref[...]  # type: ignore[index]
+                    _pallas_inplace_copy(in_ref, out_ref, is_smem=is_smem)
             original_order[orig_pos] = out_ref
         extra_refs = refs[n_tensor_inputs + len(_output_indices) :]
         pallas_kernel(*original_order, *extra_refs)  # type: ignore[operator]

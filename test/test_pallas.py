@@ -2061,6 +2061,18 @@ class TestPallas(TestCase):
         expected = x + 0.5
         torch.testing.assert_close(result, expected)
 
+    def test_scalar_access_hl_grid_inplace(self) -> None:
+        @helion.kernel(backend="pallas", static_shapes=True, config=helion.Config())
+        def fn(x: torch.Tensor) -> torch.Tensor:
+            for i in hl.grid(x.size(0)):
+                x[i] = x[i] + 1
+            return x
+
+        x = torch.arange(128, device=DEVICE, dtype=torch.float32)
+        expected = x + 1
+        result = fn(x)
+        torch.testing.assert_close(result, expected)
+
     def test_scalar_access_hl_grid_offset(self) -> None:
         @helion.kernel(backend="pallas", static_shapes=True, config=helion.Config())
         def fn(x: torch.Tensor) -> torch.Tensor:
