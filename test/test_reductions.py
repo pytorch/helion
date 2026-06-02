@@ -477,20 +477,39 @@ class TestReductions(RefEagerTestBase, TestCase):
         x = torch.randn([64, 128], device=DEVICE, dtype=HALF_DTYPE)
 
         # The unified rdim must not be offered as a looped reduction: rolling
-        # it cannot re-index the iota-indexed arange load (issue #2643). This
-        # registration check is backend-agnostic.
+        # it cannot re-index the iota-indexed arange load (issue #2643).
         bound = mixed.bind((x,))
         self.assertEqual(bound.env.config_spec.reduction_loops.valid_block_ids(), [])
 
-        # Issue #2643 is a Triton rolling bug; the persistent fallback computes
-        # correctly there. CuTe lowers hl.arange reductions via a thread-layout
-        # warp-reduction path (unaffected by rolling) that has a separate
-        # limitation when an arange reduction is combined with a slice reduction
-        # over the same dim, so only run the numeric check on Triton.
-        if _get_backend() == "triton":
-            _code, output = code_and_output(mixed, (x,))
-            expected = x.to(torch.float32).sum(-1) + x.to(torch.float32).pow(2).sum(-1)
-            torch.testing.assert_close(output, expected, rtol=1e-2, atol=1e-2)
+        _code, output = code_and_output(mixed, (x,))
+        expected = x.to(torch.float32).sum(-1) + x.to(torch.float32).pow(2).sum(-1)
+        torch.testing.assert_close(output, expected, rtol=1e-2, atol=1e-2)
+
+    def test_arange_reduction_with_synthetic_lanes(self):
+        """A persistent ``hl.arange()`` reduction whose extent exceeds the live
+        thread count must accumulate across synthetic lanes.
+
+        On CuTe, when the reduction extent is wider than the threads available
+        for it, the body runs inside a synthetic lane loop. The per-thread
+        value must be carried across lanes so the final warp reduction sees
+        every element; otherwise only the last lane's slice is reduced and the
+        result is silently wrong (issue #2643). ``block_size=16`` splits the
+        CuTe thread budget so the 128-wide reduction needs that lane loop.
+        """
+
+        @helion.kernel(static_shapes=True)
+        def arange_reduce(x: torch.Tensor) -> torch.Tensor:
+            m, n = x.shape
+            out = torch.empty([m], dtype=torch.float32, device=x.device)
+            for tile_m in hl.tile(m):
+                tile_n = hl.arange(n)
+                out[tile_m] = x[tile_m, tile_n].to(torch.float32).pow(2).sum(-1)
+            return out
+
+        x = torch.randn([64, 128], device=DEVICE, dtype=HALF_DTYPE)
+        _code, output = code_and_output(arange_reduce, (x,), block_size=16)
+        expected = x.to(torch.float32).pow(2).sum(-1)
+        torch.testing.assert_close(output, expected, rtol=1e-2, atol=1e-2)
 
     def test_fp16_var_mean(self):
         @helion.kernel(static_shapes=True)
