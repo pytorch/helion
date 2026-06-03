@@ -14,7 +14,6 @@ from .._compile_time import measure
 from . import ast_extension
 from .host_function import HostFunction
 from .host_function import KernelDefinition
-from .tensor_utils import patch_tensor_factories
 
 if TYPE_CHECKING:
     import types
@@ -148,22 +147,8 @@ class KernelCompiler:
 
     def lower(self, hf: HostFunction) -> None:
         lowering = self.env.backend.get_device_ir_lowering()
-        if lowering is not None:
-            with measure("HostFunction.lower_to_device_ir"):
-                hf.device_ir = lowering.run(hf)
-        else:
-            from .device_ir import lower_to_device_ir
-
-            factory_padding = (
-                patch_tensor_factories()
-                if self.env.backend.pad_factory_tensors_to_power_of_2
-                else contextlib.nullcontext()
-            )
-            with (
-                measure("HostFunction.lower_to_device_ir"),
-                factory_padding,
-            ):
-                hf.device_ir = lower_to_device_ir(hf)
+        with measure("HostFunction.lower_to_device_ir"):
+            hf.device_ir = lowering.run(hf)
 
     @contextlib.contextmanager
     def _compilation_context(self) -> typing.Generator[None, None, None]:

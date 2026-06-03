@@ -567,16 +567,16 @@ class Backend(abc.ABC):
         """
         return None
 
-    def get_device_ir_lowering(self) -> DeviceIRLowering | None:
-        """Return a DeviceIRLowering for this backend, or None for the legacy path.
+    def get_device_ir_lowering(self) -> DeviceIRLowering:
+        """Return a DeviceIRLowering for this backend.
 
-        Backends that have migrated to the structured lowering pipeline
-        return a ``DeviceIRLowering`` subclass.  Backends that
-        have not yet migrated return ``None``, causing
-        ``KernelCompiler.lower()`` to fall back to the legacy
-        ``lower_to_device_ir()`` function.
+        Backends override this to return a backend-specific subclass
+        that customizes the lowering pipeline.  The base implementation
+        returns the generic ``DeviceIRLowering``.
         """
-        return None
+        from .device_ir_lowering import DeviceIRLowering
+
+        return DeviceIRLowering()
 
     @staticmethod
     def reserved_launch_param_names() -> frozenset[str]:
@@ -798,6 +798,11 @@ class TritonBackend(Backend):
     @property
     def name(self) -> str:
         return "triton"
+
+    def get_device_ir_lowering(self) -> DeviceIRLowering:
+        from .triton.device_ir_lowering import TritonDeviceIRLowering
+
+        return TritonDeviceIRLowering()
 
     @property
     def experimental(self) -> bool:
@@ -1186,6 +1191,11 @@ class PallasBackend(Backend):
     @property
     def name(self) -> str:
         return "pallas"
+
+    def get_device_ir_lowering(self) -> DeviceIRLowering:
+        from .pallas.device_ir_lowering import PallasDeviceIRLowering
+
+        return PallasDeviceIRLowering()
 
     @property
     def max_tensor_numel(self) -> int | None:
@@ -4033,6 +4043,11 @@ class CuteBackend(Backend):
 
 class MetalBackend(Backend):
     """Metal Shading Language (MSL) code generation backend for macOS."""
+
+    def get_device_ir_lowering(self) -> DeviceIRLowering:
+        from .metal.device_ir_lowering import MetalDeviceIRLowering
+
+        return MetalDeviceIRLowering()
 
     @staticmethod
     def _get_dtype_to_metal() -> dict[torch.dtype, str]:

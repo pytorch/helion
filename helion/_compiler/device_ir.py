@@ -21,7 +21,6 @@ from typing import cast
 from unittest.mock import patch
 
 import torch
-from torch._dynamo.convert_frame import compile_lock
 from torch._inductor.decomposition import select_decomp_table
 from torch.fx._lazy_graph_module import _LazyGraphModule
 from torch.fx.experimental import proxy_tensor
@@ -49,11 +48,9 @@ from .host_function import HostFunction
 from .inductor_lowering import APIFuncLowering
 from .inductor_lowering import CodegenState
 from .inductor_lowering import codegen_call_with_graph
-from .inductor_lowering import prepare_graph_lowerings
 from .loop_dependency_checker import LoopDependencyChecker
 from .matmul_utils import tensor_matmul_replacement
 from .matmul_utils import torch_matmul_replacement
-from .node_masking import remove_unnecessary_masking
 from .roll_reduction import ReductionRoller
 from .source_location import current_location
 from .type_propagation import CallableType
@@ -2037,56 +2034,6 @@ class WalkHostAST(NodeVisitor):
             self.current_phase_roots = []
 
 
-def _count_device_loads_and_stores(
-    device_ir: DeviceIR,
-) -> tuple[int, int, list[int]]:
-    """Count the number of load and store operations in device code for autotuning.
-
-    Returns:
-        tuple[int, int, list[int]]: (
-            total_load_count,
-            loads_without_eviction_policy,
-            store_indices,
-        )
-            - total_load_count: all loads (for indexing tunable)
-            - loads_without_eviction_policy: loads that need eviction policy tuning
-            - store_indices: positions of store ops in the combined indexing list
-    """
-    from ..language import memory_ops
-
-    total_load_count = 0
-    loads_without_eviction_policy = 0
-    memory_op_index = 0
-    store_indices: list[int] = []
-
-    for graph_info in device_ir.graphs:
-        for node in graph_info.graph.nodes:
-            if node.op == "call_function":
-                # Check if this is a load operation
-                if node.target is memory_ops.load:
-                    total_load_count += 1
-                    memory_op_index += 1
-                    # Check if this load needs eviction policy tuning
-                    # (user can still specify eviction_policy to override tuning)
-                    eviction_policy_arg = node.kwargs.get("eviction_policy")
-                    if eviction_policy_arg is None:
-                        # Check if eviction_policy was passed as positional arg (index 3)
-                        if len(node.args) >= 4:
-                            eviction_policy_arg = node.args[3]
-                        if eviction_policy_arg is None:
-                            loads_without_eviction_policy += 1
-                # Check if this is a store operation
-                elif node.target is memory_ops.store:
-                    store_indices.append(memory_op_index)
-                    memory_op_index += 1
-
-    return (
-        total_load_count,
-        loads_without_eviction_policy,
-        store_indices,
-    )
-
-
 def _indexing_uses_tensor_descriptor(
     indexing_config: object,
     op_index: int,
@@ -2099,184 +2046,6 @@ def _indexing_uses_tensor_descriptor(
             and indexing_config[op_index] == "tensor_descriptor"
         )
     return False
-
-
-def _count_device_atomics(device_ir: DeviceIR) -> int:
-    """Count the number of atomic operations in device code for autotuning."""
-    from ..language import atomic_ops
-
-    atomic_count = 0
-    for graph_info in device_ir.graphs:
-        for node in graph_info.graph.nodes:
-            if node.op == "call_function" and node.target in vars(atomic_ops).values():
-                atomic_count += 1
-    return atomic_count
-
-
-def _register_load_store_tunables(
-    total_load_count: int,
-    loads_without_eviction_policy: int,
-    store_indices: list[int],
-) -> None:
-    """Register list-based tunables (indexing, eviction policies) for all device loads and stores.
-
-    Args:
-        total_load_count: Total number of loads (for indexing tunable)
-        loads_without_eviction_policy: Number of loads that need eviction policy tuning
-        store_indices: Positions of store ops in the combined indexing list
-    """
-    store_count = len(store_indices)
-    env = CompileEnvironment.current()
-    env.config_spec.store_indices = store_indices
-    if total_load_count == 0 and store_count == 0:
-        return
-
-    from ..autotuner.config_fragment import EnumFragment
-    from ..autotuner.config_fragment import ListOf
-    from ..autotuner.config_spec import get_valid_eviction_policies
-
-    # Register eviction policies only for loads without explicit eviction_policy
-    if loads_without_eviction_policy > 0:
-        env.config_spec.load_eviction_policies = ListOf(
-            EnumFragment(choices=get_valid_eviction_policies(env.backend_name)),
-            length=loads_without_eviction_policy,
-        )
-
-    # Indexing applies to ALL loads and stores
-    total_count = total_load_count + store_count
-    if total_count > 0:
-        env.config_spec.indexing = ListOf(
-            EnumFragment(choices=env.config_spec.valid_indexing_types()),
-            length=total_count,
-        )
-
-
-def _register_atomic_tunables(atomic_count: int) -> None:
-    """Register atomic_indexing tunable for all atomic operations."""
-    if atomic_count == 0:
-        return
-
-    from ..autotuner.config_fragment import EnumFragment
-    from ..autotuner.config_fragment import ListOf
-
-    env = CompileEnvironment.current()
-    env.config_spec.atomic_indexing = ListOf(
-        EnumFragment(choices=env.config_spec.valid_atomic_indexing_types()),
-        length=atomic_count,
-    )
-
-
-def _register_tensor_descriptor_layout_guards(device_ir: DeviceIR) -> None:
-    env = CompileEnvironment.current()
-    if env.settings.static_shapes:
-        return
-
-    from .._compat import supports_tensor_descriptor
-    from ..language import atomic_ops
-    from ..language import memory_ops
-
-    if not supports_tensor_descriptor():
-        return
-
-    atomic_targets = tuple(getattr(atomic_ops, name) for name in atomic_ops.__all__)
-
-    def tensor_arg_value(arg: object) -> object:
-        if isinstance(arg, torch.fx.Node):
-            return arg.meta.get("val")
-        return arg
-
-    memory_op_index = 0
-    atomic_op_index = 0
-    for graph_info in device_ir.graphs:
-        for node in graph_info.graph.nodes:
-            if node.op != "call_function":
-                continue
-            if node.target in (memory_ops.load, memory_ops.store):
-                tensor = tensor_arg_value(node.args[0])
-                if isinstance(tensor, torch.Tensor) and 2 <= tensor.ndim <= 5:
-                    env.register_tensor_descriptor_layout_guard(
-                        tensor, memory_op_index=memory_op_index
-                    )
-                memory_op_index += 1
-                continue
-            if node.target in atomic_targets:
-                tensor = tensor_arg_value(node.args[0])
-                if isinstance(tensor, torch.Tensor) and 2 <= tensor.ndim <= 5:
-                    env.register_tensor_descriptor_layout_guard(
-                        tensor, atomic_op_index=atomic_op_index
-                    )
-                atomic_op_index += 1
-
-
-def lower_to_device_ir(func: HostFunction) -> DeviceIR:
-    device_ir = DeviceIR()
-    with func, device_ir, compile_lock:
-        visitor = WalkHostAST(device_ir)
-        for stmt in func.body:
-            visitor.visit(stmt)
-        visitor.flush_phases()
-        device_ir.phases = visitor.phases
-        # Run dependency checks once, per phase, so codegen does not redo it per-config.
-        for phase in device_ir.phases:
-            checker = phase.loop_dependency_checker
-            for loop_node in phase.root_nodes:
-                checker.register_loop(loop_node)
-        for phase_idx, phase in enumerate(device_ir.phases):
-            for ridx in phase.roots:
-                graph_info = device_ir.graphs[device_ir.root_ids[ridx]]
-                assert isinstance(graph_info, RootGraphInfo)
-                graph_info.phase_index = phase_idx
-        # If there are no top-level device loops, we cannot generate a valid kernel.
-        # Raise a friendly error instead of emitting an empty Triton function body.
-        if len(device_ir.root_ids) == 0:
-            raise exc.NoDeviceLoopsInKernel
-        from ..language.random_ops import rewrite_implicit_random_ops
-
-        for graph in device_ir.graphs:
-            rewrite_implicit_random_ops(graph.graph)
-        for graph in device_ir.graphs:
-            prepare_graph_lowerings(graph.graph)
-        for graph in device_ir.graphs:
-            validate_host_tensor_usage(graph.graph)
-            add_tile_with_offset_metadata(graph)
-            remove_unnecessary_tile_index(graph.graph)
-            remove_unnecessary_masking(graph.graph)
-
-        # TODO(hinriksnaer): extract into a separate step? everything below
-        # is post-processing computed from the completed DeviceIR.
-        from .epilogue_subtiling import has_epilogue_subtiling_candidate
-
-        has_epilogue_subtile_candidate = False
-        for graph_info in device_ir.graphs:
-            if has_epilogue_subtiling_candidate(graph_info.graph):
-                has_epilogue_subtile_candidate = True
-                break
-        config_spec = CompileEnvironment.current().config_spec
-        config_spec.epilogue_subtile_candidate_enabled = has_epilogue_subtile_candidate
-        config_spec.epilogue_subtile_k_hint = 0
-        config_spec.epilogue_subtile_autotune_choices = None
-
-        device_ir.register_rollable_reductions()
-        config_spec = CompileEnvironment.current().config_spec
-        config_spec.raise_grid_block_minimums()
-        if len(device_ir.root_ids) > 1:
-            config_spec.disallow_pid_type("xyz")
-
-        # Count all device loads and stores and register tunables
-        (
-            total_load_count,
-            loads_without_eviction_policy,
-            store_indices,
-        ) = _count_device_loads_and_stores(device_ir)
-        _register_load_store_tunables(
-            total_load_count,
-            loads_without_eviction_policy,
-            store_indices,
-        )
-        _register_atomic_tunables(_count_device_atomics(device_ir))
-        _register_tensor_descriptor_layout_guards(device_ir)
-
-        return device_ir
 
 
 @dataclasses.dataclass

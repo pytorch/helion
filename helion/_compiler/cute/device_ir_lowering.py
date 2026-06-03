@@ -9,6 +9,7 @@ import torch
 
 from ..compile_environment import CompileEnvironment
 from ..device_ir_lowering import DeviceIRLowering
+from ..device_ir_lowering import register_load_store_tunables
 
 if TYPE_CHECKING:
     from ..device_ir import DeviceIR
@@ -30,6 +31,7 @@ class CuteDeviceIRLowering(DeviceIRLowering):
 
     def register(self, device_ir: DeviceIR) -> None:
         super().register(device_ir)
+        register_load_store_tunables(device_ir)
         _register_cute_vector_widths(device_ir)
         _track_cute_indexed_reductions(device_ir)
 
