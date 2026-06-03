@@ -10,6 +10,7 @@ import operator
 from typing import TYPE_CHECKING
 from typing import NamedTuple
 from typing import TypeVar
+from typing import cast
 import weakref
 
 import sympy
@@ -90,6 +91,742 @@ def _create_lane_loop(lane_var: str, extent: int, body: list[ast.AST]) -> ast.Fo
     return loop
 
 
+# Marker call emitted by reduction strategies when a reduction over a
+# lane-distributed block is generated inside a single-pass lane loop.  The
+# ``split_lane_loop_reductions`` post-pass recognizes these markers and
+# rewrites the enclosing lane loop into a two-pass structure:
+#
+#   (phase 1) accumulate the per-lane reduction inputs across the lane loop,
+#             then combine across the live thread axis (``threads_in_group``)
+#             into the final scalar;
+#   (finalize) define the reduced scalar between the two passes;
+#   (phase 2) re-iterate the lanes to apply any lane-varying consumers (e.g.
+#             the broadcast normalize / store) using the finalized scalar.
+#
+# The marker never reaches the emitted kernel — the post-pass strips every
+# marker it processes.
+_HELION_LANE_REDUCE_MARKER = "_helion_lane_reduce"
+
+
+def _lane_reduce_marker_expr(
+    input_name: str,
+    reduction_type: str,
+    identity_expr: str,
+    threads_in_group: int,
+) -> str:
+    return (
+        f"{_HELION_LANE_REDUCE_MARKER}({input_name}, {reduction_type!r}, "
+        f"{identity_expr}, {threads_in_group})"
+    )
+
+
+@dataclasses.dataclass
+class _LaneReduceMarker:
+    result_var: str
+    input_name: str
+    reduction_type: str
+    identity_expr: str
+    threads_in_group: int
+    # The original RHS expression with the marker call replaced by the string
+    # ``{finalized}``; ``finalize_expr(x)`` substitutes ``x`` to re-apply any
+    # surrounding dtype cast / reshape to the finalized reduced scalar.
+    wrap_template: str
+
+    def finalize_expr(self, reduced: str) -> str:
+        return self.wrap_template.replace("__HELION_FINALIZED__", f"({reduced})")
+
+
+def _find_lane_reduce_call(node: ast.AST) -> ast.Call | None:
+    for sub in ast.walk(node):
+        if (
+            isinstance(sub, ast.Call)
+            and isinstance(sub.func, ast.Name)
+            and sub.func.id == _HELION_LANE_REDUCE_MARKER
+        ):
+            return sub
+    return None
+
+
+class _ReplaceLaneReduceCall(ast.NodeTransformer):
+    def visit_Call(self, node: ast.Call) -> ast.AST:
+        self.generic_visit(node)
+        if (
+            isinstance(node.func, ast.Name)
+            and node.func.id == _HELION_LANE_REDUCE_MARKER
+        ):
+            return ast.copy_location(
+                create(ast.Name, id="__HELION_FINALIZED__", ctx=ast.Load()), node
+            )
+        return node
+
+
+def _is_lane_reduce_marker_assign(stmt: ast.AST) -> _LaneReduceMarker | None:
+    """If ``stmt`` assigns an expression containing a single
+    ``_helion_lane_reduce(IN, TYPE, ID, T)`` marker call, return a
+    :class:`_LaneReduceMarker`; otherwise return ``None``.
+
+    The marker may be nested inside a surrounding cast/reshape (e.g.
+    ``R = cutlass.Float32(_helion_lane_reduce(...))``); the wrapping is
+    captured so it can be re-applied to the finalized reduced scalar.
+    """
+    if not isinstance(stmt, ast.Assign) or len(stmt.targets) != 1:
+        return None
+    target = stmt.targets[0]
+    if not isinstance(target, ast.Name):
+        return None
+    call = _find_lane_reduce_call(stmt.value)
+    if call is None or len(call.args) != 4:
+        return None
+    input_node, type_node, identity_node, threads_node = call.args
+    input_name = ast.unparse(input_node)
+    reduction_type = ast.literal_eval(type_node)
+    identity_expr = ast.unparse(identity_node)
+    threads_in_group = int(ast.literal_eval(threads_node))
+    # Build the wrap template by replacing the marker call with a sentinel.
+    wrapped = _ReplaceLaneReduceCall().visit(ast.parse(ast.unparse(stmt.value)).body[0])
+    assert isinstance(wrapped, ast.Expr)
+    wrap_template = ast.unparse(wrapped.value)
+    return _LaneReduceMarker(
+        result_var=target.id,
+        input_name=input_name,
+        reduction_type=reduction_type,
+        identity_expr=identity_expr,
+        threads_in_group=threads_in_group,
+        wrap_template=wrap_template,
+    )
+
+
+def _combine_expr(reduction_type: str, acc: str, val: str) -> str:
+    if reduction_type == "sum":
+        return f"({acc}) + ({val})"
+    if reduction_type == "prod":
+        return f"({acc}) * ({val})"
+    if reduction_type == "max":
+        return f"({acc}) if ({acc}) > ({val}) else ({val})"
+    if reduction_type == "min":
+        return f"({acc}) if ({acc}) < ({val}) else ({val})"
+    raise NotImplementedError(f"lane reduce combine {reduction_type!r}")
+
+
+def _dtype_ctor_from_identity(identity_expr: str) -> str | None:
+    """Extract the dtype constructor (e.g. ``cutlass.Float32``) from an identity
+    expression like ``cutlass.Float32(0)`` so the per-lane input can be cast to
+    the accumulator's dtype before combining."""
+    try:
+        node = ast.parse(identity_expr, mode="eval").body
+    except SyntaxError:
+        return None
+    if isinstance(node, ast.Call):
+        return ast.unparse(node.func)
+    return None
+
+
+def _warp_reduce_expr(reduction_type: str, acc: str, threads_in_group: int) -> str:
+    tg = f", threads_in_group={threads_in_group}"
+    if reduction_type == "sum":
+        return f"cute.arch.warp_reduction_sum({acc}{tg})"
+    if reduction_type == "max":
+        return f"cute.arch.warp_reduction_max({acc}{tg})"
+    if reduction_type == "min":
+        return f"cute.arch.warp_reduction(({acc}), lambda a, b: a if a < b else b{tg})"
+    if reduction_type == "prod":
+        return f"cute.arch.warp_reduction(({acc}), lambda a, b: (a * b){tg})"
+    raise NotImplementedError(f"lane warp reduce {reduction_type!r}")
+
+
+def _backward_slice(body: list[ast.AST], roots: set[str]) -> tuple[list[int], set[str]]:
+    """Return the indices of the statements in ``body`` that (transitively)
+    produce any name in ``roots``, plus the set of all names those statements
+    write.  Statements are scanned in reverse so a producer is included once a
+    later consumer (already selected) reads its output.
+    """
+    from .ast_read_writes import ReadWrites
+
+    needed = set(roots)
+    selected: list[int] = []
+    written: set[str] = set()
+    for idx in range(len(body) - 1, -1, -1):
+        stmt = body[idx]
+        rw = ReadWrites.from_ast(stmt)
+        writes = set(rw.writes)
+        if writes & needed:
+            selected.append(idx)
+            written |= writes
+            needed |= set(rw.reads)
+    selected.reverse()
+    return selected, written
+
+
+def split_lane_loop_reductions(body: list[ast.AST]) -> list[ast.AST]:
+    """Rewrite single-pass lane loops that contain ``_helion_lane_reduce``
+    markers into the two-pass accumulate / finalize / consume structure.
+
+    Operates bottom-up so nested lane loops are handled before their parents.
+    Lane loops without markers are returned unchanged (their inner statements
+    are still recursed into so nested markers are processed).
+    """
+    new_body: list[ast.AST] = []
+    for stmt in body:
+        new_body.extend(_split_stmt_lane_reductions(stmt))
+    return new_body
+
+
+def _restore_stmt_lane_reduce_markers(stmt: ast.AST) -> ast.AST:
+    """Recurse into statement-list fields and replace any surviving
+    ``R = ..._helion_lane_reduce(IN, TYPE, ID, T)...`` assignment with
+    ``R = ...IN...`` (the raw per-lane input)."""
+    for field in ("body", "orelse", "finalbody"):
+        old = getattr(stmt, field, None)
+        if isinstance(old, list) and all(isinstance(s, ast.stmt) for s in old):
+            setattr(stmt, field, [_restore_stmt_lane_reduce_markers(s) for s in old])
+    if isinstance(stmt, ast.Assign):
+        m = _is_lane_reduce_marker_assign(stmt)
+        if m is not None:
+            return statement_from_string(
+                f"{m.result_var} = {m.finalize_expr(m.input_name)}"
+            )
+    return stmt
+
+
+def restore_unprocessed_lane_reduce_markers(
+    body: list[ast.AST],
+) -> list[ast.AST]:
+    """Replace any surviving ``R = ..._helion_lane_reduce(IN, TYPE, ID, T)...``
+    assignment with ``R = ...IN...`` (the raw per-lane input).
+
+    A safety net: ``split_lane_loop_reductions`` only rewrites markers it can
+    place in a two-pass lane structure. A marker emitted in a context neither
+    that pass nor ``interchange_lane_outside_serial_reductions`` handles would
+    otherwise leak the ``_helion_lane_reduce`` call into the emitted kernel.
+    Reverting to the per-lane input keeps the kernel compilable (it falls back
+    to the original single-pass per-lane reduction behavior).
+
+    Recurses only into statement-bearing fields (``body``/``orelse``/
+    ``finalbody``) instead of using ``ast.NodeTransformer``; markers are always
+    statement-level assignments, so this avoids the transformer's in-place
+    mutation of expression list fields, which fails when an AST node carries a
+    ``torch.fx`` ``immutable_list`` (e.g. multi-output ``inline_asm_elementwise``).
+    """
+    return [_restore_stmt_lane_reduce_markers(stmt) for stmt in body]
+
+
+def _split_stmt_lane_reductions(stmt: ast.AST) -> list[ast.AST]:
+    # Recurse into any statement-list-bearing fields first so nested lane
+    # loops are rewritten before the enclosing one.
+    for field in ("body", "orelse", "finalbody"):
+        old = getattr(stmt, field, None)
+        if isinstance(old, list) and all(isinstance(s, ast.stmt) for s in old):
+            setattr(stmt, field, split_lane_loop_reductions(old))
+    lane_var = getattr(stmt, HELION_LANE_LOOP_VAR_ATTR, None)
+    if (
+        lane_var is None
+        or not isinstance(stmt, ast.For)
+        or not isinstance(stmt.target, ast.Name)
+        or stmt.target.id != lane_var
+    ):
+        return [stmt]
+    return _split_one_lane_loop(stmt, lane_var)
+
+
+def _split_one_lane_loop(loop: ast.For, lane_var: str) -> list[ast.AST]:
+    from .ast_read_writes import ReadWrites
+
+    body: list[ast.AST] = list(loop.body)
+    markers: list[tuple[int, _LaneReduceMarker]] = []
+    for idx, stmt in enumerate(body):
+        parsed = _is_lane_reduce_marker_assign(stmt)
+        if parsed is not None:
+            markers.append((idx, parsed))
+    if not markers:
+        return [loop]
+
+    # Safety: the two-pass split is only valid when the reduction marker is the
+    # ONLY cross-lane carried value in this lane loop. If the body has another
+    # loop-carried accumulator across the lanes (e.g. a matmul ``dot_acc`` or a
+    # plain ``extra += per_lane`` sum that already accumulates over the lanes),
+    # splitting would drop or double-count it. Fall back to the original
+    # single-pass per-lane behavior by replacing each marker with its raw input.
+    marker_indices = {i for i, _ in markers}
+    if _has_extra_cross_lane_carry(body, lane_var, marker_indices):
+        return [_restore_per_lane_markers(loop, markers)]
+
+    input_roots = {m.input_name for _, m in markers}
+
+    # Phase 1: the backward slice that produces all reduction inputs.
+    phase1_indices, _phase1_written = _backward_slice(body, input_roots)
+
+    # Sequentially-dependent reductions (one marker's input depends on another
+    # marker's result, e.g. online softmax's sum-of-exp needing the max first)
+    # would require a multi-pass split. The single-pass phase-1/finalize/phase-2
+    # structure can't express that, so fall back to per-lane behavior.
+    if set(phase1_indices) & marker_indices:
+        return [_restore_per_lane_markers(loop, markers)]
+
+    # The phase-1 (accumulate) and phase-2 (consume) passes both re-run the
+    # reduction-input producers. That is only safe for side-effect-free
+    # producers. A matmul / collective in the slice (cross-thread shared-memory
+    # reductions, ``cute.gemm``, ``dot``) cannot be duplicated without racing on
+    # shared memory, so fall back to per-lane behavior in that case.
+    if any(_contains_unduplicatable_op(body[i]) for i in phase1_indices):
+        return [_restore_per_lane_markers(loop, markers)]
+
+    extent = _lane_loop_extent(loop)
+
+    prefix: list[ast.AST] = []  # acc init statements (outside the lane loops)
+    accumulate_body: list[ast.AST] = [body[i] for i in phase1_indices]
+    finalize: list[ast.AST] = []
+    for _, m in markers:
+        acc_var = f"{m.result_var}_lane_acc"
+        prefix.append(statement_from_string(f"{acc_var} = {m.identity_expr}"))
+        # Cast the per-lane input to the accumulator dtype before combining so
+        # the CUTLASS DSL's strict ternary type check (max/min emit a Python
+        # ``a if a > b else b``) does not see mixed fp32/bf16 operands.
+        ctor = _dtype_ctor_from_identity(m.identity_expr)
+        combine_val = f"{ctor}({m.input_name})" if ctor is not None else m.input_name
+        accumulate_body.append(
+            statement_from_string(
+                f"{acc_var} = {_combine_expr(m.reduction_type, acc_var, combine_val)}"
+            )
+        )
+        if m.threads_in_group > 1:
+            reduced = _warp_reduce_expr(m.reduction_type, acc_var, m.threads_in_group)
+        else:
+            reduced = acc_var
+        finalize.append(
+            statement_from_string(f"{m.result_var} = {m.finalize_expr(reduced)}")
+        )
+
+    # Phase 2: everything except the marker assignments themselves; the
+    # reduced scalar is already finalized so consumers read it directly.
+    phase2_body = [s for i, s in enumerate(body) if i not in marker_indices]
+
+    # A statement is lane-varying if it (transitively) reads the lane var.
+    # Statements that only depend on the finalized scalar(s) are lane-invariant
+    # and run once after the lane loops; lane-varying consumers run in a second
+    # lane loop, but only those that contribute to a side effect (a store, an
+    # if-with-store, an in-place write). Pure lane-varying producers that fed
+    # only the (now-removed) reduction markers are dropped.
+    lane_varying_names = _lane_varying_names(phase2_body, lane_var)
+
+    def is_lane_varying(stmt: ast.AST) -> bool:
+        reads = set(ReadWrites.from_ast(stmt).reads)
+        return lane_var in reads or bool(reads & lane_varying_names)
+
+    keep_indices = _live_phase2_indices(phase2_body)
+    lane_invariant_tail: list[ast.AST] = []
+    lane_varying_tail: list[ast.AST] = []
+    for i, s in enumerate(phase2_body):
+        if is_lane_varying(s):
+            if i in keep_indices:
+                lane_varying_tail.append(s)
+        else:
+            lane_invariant_tail.append(s)
+
+    result: list[ast.AST] = []
+    result.extend(prefix)
+    result.append(_create_lane_loop(lane_var, extent, accumulate_body))
+    result.extend(finalize)
+    result.extend(lane_invariant_tail)
+    if lane_varying_tail:
+        result.append(_create_lane_loop(lane_var, extent, lane_varying_tail))
+    return result
+
+
+def _has_extra_cross_lane_carry(
+    body: list[ast.AST], lane_var: str, marker_indices: set[int]
+) -> bool:
+    """Return True when ``body`` contains a loop-carried accumulator across the
+    lanes that is INDEPENDENT of the reduction markers.
+
+    Two-pass splitting is correct whenever every cross-lane carried value
+    transitively consumes a marker result (e.g. an online-softmax
+    ``mi = max(mi, local_amax)`` or ``di = di + sum``): after the split the
+    carried update runs once per outer iteration on the fully-reduced scalar.
+    But an *independent* carried accumulator — one that does not depend on any
+    marker result, such as a matmul ``dot_acc += dot_product`` — must keep
+    accumulating once per lane, so the split would drop or corrupt it. In that
+    case the caller falls back to the single-pass per-lane behavior.
+
+    A carried value is detected as a name that is *live-in* to the lane body
+    (read before it is written within the body, directly or through a
+    ``X_copy = X`` alias) and also written within the body.
+    """
+    from .ast_read_writes import ReadWrites
+
+    written_so_far: set[str] = set()
+    aliases: dict[str, str] = {}  # copy_var -> original carried name
+    live_in: set[str] = set()
+    for stmt in body:
+        rw = ReadWrites.from_ast(stmt)
+        for name in rw.reads:
+            if name != lane_var and name not in written_so_far:
+                live_in.add(name)
+        if (
+            isinstance(stmt, ast.Assign)
+            and len(stmt.targets) == 1
+            and isinstance(stmt.targets[0], ast.Name)
+            and isinstance(stmt.value, ast.Name)
+        ):
+            aliases[stmt.targets[0].id] = stmt.value.id
+        written_so_far |= set(rw.writes)
+
+    def root(name: str) -> str:
+        seen: set[str] = set()
+        while name in aliases and name not in seen:
+            seen.add(name)
+            name = aliases[name]
+        return name
+
+    # Names that (transitively) depend on a marker result. Carried values that
+    # only depend on these are fine under the two-pass split.
+    marker_results = {
+        m.result_var
+        for i, stmt in enumerate(body)
+        if i in marker_indices
+        and (m := _is_lane_reduce_marker_assign(stmt)) is not None
+    }
+    marker_tainted = set(marker_results)
+    changed = True
+    while changed:
+        changed = False
+        for stmt in body:
+            rw = ReadWrites.from_ast(stmt)
+            if set(rw.reads) & marker_tainted:
+                for w in rw.writes:
+                    if w not in marker_tainted:
+                        marker_tainted.add(w)
+                        changed = True
+
+    # Names that (transitively) depend on the lane var. A carried accumulator
+    # whose per-iteration update is lane-varying (e.g. a matmul
+    # ``dot_acc += dot_product(lane)``) cannot move to the once-per-tile tail,
+    # so the two-pass split would break it. A lane-invariant update (e.g.
+    # welford's ``acc_cnt += block_size``) is fine in the tail.
+    lane_varying = _lane_varying_names(body, lane_var)
+
+    # Bail if some carried accumulator is independent of every marker AND its
+    # update consumes a lane-varying value.
+    for idx, stmt in enumerate(body):
+        if idx in marker_indices:
+            continue
+        rw = ReadWrites.from_ast(stmt)
+        reads = set(rw.reads)
+        update_is_lane_varying = lane_var in reads or bool(reads & lane_varying)
+        if not update_is_lane_varying:
+            continue
+        for w in rw.writes:
+            if root(w) in live_in and root(w) not in marker_tainted:
+                return True
+    return False
+
+
+def _restore_per_lane_markers(
+    loop: ast.For, markers: list[tuple[int, _LaneReduceMarker]]
+) -> ast.For:
+    """Replace each ``_helion_lane_reduce`` marker in ``loop`` with its raw
+    per-lane input, restoring the original single-pass behavior (used when the
+    two-pass split is unsafe)."""
+    body = list(loop.body)
+    for idx, m in markers:
+        body[idx] = statement_from_string(
+            f"{m.result_var} = {m.finalize_expr(m.input_name)}"
+        )
+    loop.body = body
+    return loop
+
+
+_UNDUPLICATABLE_CALLS = (
+    "_cute_grouped_reduce_shared_two_stage",
+    "_cute_grouped_reduce_shared_tree",
+    "_cute_grouped_reduce_warp",
+    "cute.gemm",
+    "warp_reduction",
+)
+
+
+def _contains_unduplicatable_op(stmt: ast.AST) -> bool:
+    """Return True when ``stmt`` (or any nested statement) contains a matmul /
+    collective whose shared-memory side effects make it unsafe to re-run in a
+    second lane pass."""
+    src = ast.unparse(stmt)
+    return any(call in src for call in _UNDUPLICATABLE_CALLS)
+
+
+def _has_side_effect(stmt: ast.AST) -> bool:
+    """Return True when ``stmt`` produces an observable side effect (a store,
+    an in-place / atomic write, or any non-plain-assignment statement such as
+    an ``if mask: tensor[...].store(...)``)."""
+    from .ast_read_writes import ReadWrites
+
+    if isinstance(stmt, ast.Assign):
+        return bool(ReadWrites.from_ast(stmt).inplace_writes)
+    # Conservatively treat structured / expression statements as
+    # side-effecting (store calls live inside ``if`` blocks / bare exprs).
+    return True
+
+
+def _live_phase2_indices(body: list[ast.AST]) -> set[int]:
+    """Indices of statements in ``body`` that contribute to a side effect
+    (directly, or by feeding a later side-effecting statement)."""
+    from .ast_read_writes import ReadWrites
+
+    needed_names: set[str] = set()
+    keep: set[int] = set()
+    for idx in range(len(body) - 1, -1, -1):
+        stmt = body[idx]
+        rw = ReadWrites.from_ast(stmt)
+        writes = set(rw.writes)
+        if _has_side_effect(stmt) or (writes & needed_names):
+            keep.add(idx)
+            needed_names |= set(rw.reads)
+    return keep
+
+
+def _lane_loop_extent(loop: ast.For) -> int:
+    call = loop.iter
+    assert isinstance(call, ast.Call)
+    assert len(call.args) == 1
+    return int(ast.literal_eval(call.args[0]))
+
+
+def _lane_varying_names(body: list[ast.AST], lane_var: str) -> set[str]:
+    """Names whose values (transitively) depend on the lane var within ``body``."""
+    from .ast_read_writes import ReadWrites
+
+    varying = {lane_var}
+    changed = True
+    while changed:
+        changed = False
+        for stmt in body:
+            rw = ReadWrites.from_ast(stmt)
+            if set(rw.reads) & varying:
+                for w in rw.writes:
+                    if w not in varying:
+                        varying.add(w)
+                        changed = True
+    varying.discard(lane_var)
+    return varying
+
+
+def _is_serial_for(stmt: ast.AST) -> bool:
+    """Return True when ``stmt`` is an ordinary serial ``for`` loop (a device
+    serial loop), NOT a per-thread lane loop."""
+    return (
+        isinstance(stmt, ast.For)
+        and getattr(stmt, HELION_LANE_LOOP_VAR_ATTR, None) is None
+    )
+
+
+def _clone_stmt(stmt: ast.AST) -> ast.AST:
+    """Return an independent copy of ``stmt`` via unparse + reparse.
+
+    ``interchange_lane_outside_serial_reductions`` emits two loop nests that
+    both re-run the shared (side-effect-free) producers. Splicing the same node
+    objects into two places in the tree breaks AST walking, so each reused
+    statement is rebuilt from its source text into a fresh ExtendedAST node.
+    """
+    return statement_from_string(ast.unparse(stmt))
+
+
+def _clone_expr(node: ast.AST) -> ast.AST:
+    return expr_from_string(ast.unparse(node))
+
+
+def _forward_live_names(body: list[ast.AST], roots: set[str]) -> set[str]:
+    """Names produced by the forward slice that (transitively) consumes any
+    name in ``roots`` within ``body``."""
+    from .ast_read_writes import ReadWrites
+
+    tainted = set(roots)
+    changed = True
+    while changed:
+        changed = False
+        for stmt in body:
+            rw = ReadWrites.from_ast(stmt)
+            if set(rw.reads) & tainted:
+                for w in rw.writes:
+                    if w not in tainted:
+                        tainted.add(w)
+                        changed = True
+    return tainted
+
+
+def interchange_lane_outside_serial_reductions(
+    body: list[ast.AST],
+) -> list[ast.AST]:
+    """Interchange a ``for LANE: ... for MB: ...`` nest whose inner serial loop
+    contains ``_helion_lane_reduce`` markers.
+
+    layer_norm_bwd / rms_norm_bwd compute, inside a serial ``mb`` loop, BOTH a
+    per-feature accumulator that must keep the lane loop OUTSIDE the ``mb`` loop
+    (``grad_w_acc += ...``) AND a feature reduction whose result is broadcast
+    back into a per-row store (``grad_x``), which needs every lane summed *per*
+    ``mb`` iteration (lane INSIDE ``mb``). A single lane loop cannot satisfy
+    both nestings, so emit two specialized loop nests:
+
+    * Nest B (grad_w): the original ``for LANE: ... for MB: ...`` loop with the
+      lane-reduce markers and the reduction-consuming side effects removed —
+      keeping only the per-feature accumulators and their stores.
+    * Nest A (grad_x): a ``for MB: ... for LANE: ...`` loop carrying only the
+      lane reduction and its broadcast consumer. Its inner lane loop still holds
+      the markers so the subsequent ``split_lane_loop_reductions`` pass produces
+      the per-``mb`` accumulate -> warp-combine -> consume structure.
+
+    Returns ``body`` unchanged when no such pattern is present.
+    """
+    new_body: list[ast.AST] = []
+    for stmt in body:
+        new_body.extend(_interchange_stmt(stmt))
+    return new_body
+
+
+def _interchange_stmt(stmt: ast.AST) -> list[ast.AST]:
+    for field in ("body", "orelse", "finalbody"):
+        old = getattr(stmt, field, None)
+        if isinstance(old, list) and all(isinstance(s, ast.stmt) for s in old):
+            setattr(stmt, field, interchange_lane_outside_serial_reductions(old))
+    lane_var = getattr(stmt, HELION_LANE_LOOP_VAR_ATTR, None)
+    if (
+        lane_var is None
+        or not isinstance(stmt, ast.For)
+        or not isinstance(stmt.target, ast.Name)
+        or stmt.target.id != lane_var
+    ):
+        return [stmt]
+    return _interchange_one_lane_loop(stmt, lane_var)
+
+
+def _interchange_one_lane_loop(loop: ast.For, lane_var: str) -> list[ast.AST]:
+    from .ast_read_writes import ReadWrites
+
+    body: list[ast.AST] = list(loop.body)
+    # Find the single inner serial ``for`` loop that carries lane-reduce markers.
+    mb_index: int | None = None
+    for idx, stmt in enumerate(body):
+        if _is_serial_for(stmt) and any(
+            _is_lane_reduce_marker_assign(s) is not None
+            for s in cast("ast.For", stmt).body
+        ):
+            if mb_index is not None:
+                # More than one candidate serial loop: not the simple pattern.
+                return [loop]
+            mb_index = idx
+    if mb_index is None:
+        return [loop]
+
+    mb_loop = cast("ast.For", body[mb_index])
+    lane_prefix = body[:mb_index]
+    lane_suffix = body[mb_index + 1 :]
+    mb_body: list[ast.AST] = list(mb_loop.body)
+
+    markers = [
+        (i, m)
+        for i, s in enumerate(mb_body)
+        if (m := _is_lane_reduce_marker_assign(s)) is not None
+    ]
+    if not markers:
+        return [loop]
+    marker_indices = {i for i, _ in markers}
+    marker_results = {m.result_var for _, m in markers}
+
+    # The mb body's only side effect that consumes a marker result is the
+    # broadcast-reduction store (e.g. ``grad_x[mb] = ...``). Everything else in
+    # the mb body / suffix (the per-feature accumulators and their stores) is
+    # independent of the reduction and is handled correctly by Nest B alone.
+    grad_x_seed = {m.input_name for _, m in markers} | marker_results
+    grad_x_live = _forward_live_names(mb_body, grad_x_seed)
+
+    def is_reduction_store(stmt: ast.AST) -> bool:
+        return _has_side_effect(stmt) and bool(
+            set(ReadWrites.from_ast(stmt).reads) & grad_x_live
+        )
+
+    if not any(is_reduction_store(s) for s in mb_body):
+        # The lane reduction inside the serial loop is not consumed by a
+        # broadcast store, so the interchange does not apply. Markers nested in
+        # a serial loop are not reachable by ``split_lane_loop_reductions`` (it
+        # only rewrites top-level lane loops), so restore them to their raw
+        # per-lane inputs to avoid leaving an unprocessed marker behind.
+        restored: list[ast.stmt] = [cast("ast.stmt", s) for s in mb_body]
+        for idx, m in markers:
+            restored[idx] = statement_from_string(
+                f"{m.result_var} = {m.finalize_expr(m.input_name)}"
+            )
+        mb_loop.body = restored
+        return [loop]
+
+    # A name is lane-varying if it (transitively) depends on the lane var across
+    # the whole lane-loop body; lane-invariant names (mb bounds, masks, ...) are
+    # recomputed once rather than per lane.
+    lane_varying = _lane_varying_names([*lane_prefix, *mb_body, *lane_suffix], lane_var)
+
+    def reads_lane(stmt: ast.AST) -> bool:
+        reads = set(ReadWrites.from_ast(stmt).reads)
+        return lane_var in reads or bool(reads & lane_varying)
+
+    # --- Nest A (grad_x): for MB: for LANE: <reduction + broadcast store> ------
+    # Backward slice from the reduction-broadcast stores and the marker inputs,
+    # across both the mb body and the lane prefix. The per-feature accumulators
+    # feed only the suffix stores (never the reduction store), so they are
+    # naturally excluded — no carry analysis is required.
+    mb_bound_names = set(ReadWrites.from_ast(mb_loop.iter).reads)
+    needed = {m.input_name for _, m in markers} | mb_bound_names
+    keep_mb_a: list[ast.AST] = []
+    for idx in range(len(mb_body) - 1, -1, -1):
+        stmt = mb_body[idx]
+        rw = ReadWrites.from_ast(stmt)
+        if idx in marker_indices:
+            keep_mb_a.append(stmt)
+            needed |= set(rw.reads) - marker_results
+            continue
+        if is_reduction_store(stmt) or (set(rw.writes) & needed):
+            keep_mb_a.append(stmt)
+            needed |= set(rw.reads)
+    keep_mb_a.reverse()
+    keep_prefix_a: list[ast.AST] = []
+    for stmt in reversed(lane_prefix):
+        rw = ReadWrites.from_ast(stmt)
+        if set(rw.writes) & needed:
+            keep_prefix_a.append(stmt)
+            needed |= set(rw.reads)
+    keep_prefix_a.reverse()
+
+    # Partition kept statements into lane-invariant (run once per mb iteration)
+    # vs lane-varying (recomputed per lane inside the inner lane loop).
+    prefix_invariant_a = [_clone_stmt(s) for s in keep_prefix_a if not reads_lane(s)]
+    prefix_varying_a = [_clone_stmt(s) for s in keep_prefix_a if reads_lane(s)]
+    mb_head_a = [_clone_stmt(s) for s in keep_mb_a if not reads_lane(s)]
+    mb_varying_a = [_clone_stmt(s) for s in keep_mb_a if reads_lane(s)]
+
+    extent = _lane_loop_extent(loop)
+    inner_lane_loop_a = _create_lane_loop(
+        lane_var, extent, [*prefix_varying_a, *mb_varying_a]
+    )
+    mb_loop_a = create(
+        ast.For,
+        target=_clone_expr(mb_loop.target),
+        iter=_clone_expr(mb_loop.iter),
+        body=[*mb_head_a, inner_lane_loop_a],
+        orelse=[],
+        type_comment=None,
+    )
+    nest_a: list[ast.AST] = [*prefix_invariant_a, mb_loop_a]
+
+    # --- Nest B (grad_w): the original lane loop with markers reverted to their
+    # raw per-lane inputs. Its per-feature accumulators (lane-outside-mb) are
+    # already correct; its reduction-broadcast store writes a partial (per-lane)
+    # value that Nest A re-stores with the full reduction afterwards.
+    restored_mb_body = list(mb_loop.body)
+    for idx, m in markers:
+        restored_mb_body[idx] = statement_from_string(
+            f"{m.result_var} = {m.finalize_expr(m.input_name)}"
+        )
+    mb_loop.body = restored_mb_body
+    nest_b = loop
+
+    return [nest_b, *nest_a]
+
+
 @dataclasses.dataclass
 class LoopDimInfo:
     begin_var_name: str | None = None
@@ -136,6 +873,10 @@ class DeviceLoopState(DeviceLoopOrGridState):
     inner_statements: list[ast.AST]
     outer_prefix: list[ast.AST] = dataclasses.field(default_factory=list)
     outer_suffix: list[ast.AST] = dataclasses.field(default_factory=list)
+    # Block ids that this device loop distributes across a per-thread lane
+    # loop (CuTe only). A reduction over one of these blocks needs the
+    # two-pass lane structure (see ``split_lane_loop_reductions``).
+    lane_loop_blocks: set[int] = dataclasses.field(default_factory=set)
 
 
 @dataclasses.dataclass
@@ -713,10 +1454,34 @@ class BlockSizeTileStrategy(TileStrategy):
         Counts axes already claimed by active device loops, reserving at
         least one axis for reduction strategies when the backend places
         reductions first.
+
+        When a ``CuTeGridExecutionPlan`` with ``block_axis_priority`` is
+        in scope for this strategy's blocks, the offset is instead
+        derived from ``thread_axis_for_strategy`` so the M/N axis order
+        is dictated by the plan (e.g. the warp-per-row layout swaps the
+        outer M-grid and inner N-tile axes so each warp owns one row).
         """
         from .reduction_strategy import ReductionStrategy
 
         env = CompileEnvironment.current()
+
+        # Plan-driven path: honor ``block_axis_priority`` so the outer
+        # grid loop can reserve an axis for a lower-priority inner tile
+        # loop even when that inner loop has not yet entered
+        # ``active_device_loops``.  Used by the warp-per-row layout where
+        # the outer M-grid must take a HIGHER thread-axis index than the
+        # inner N-tile so 32 contiguous threads on axis 0 form one warp
+        # per row.
+        plan = self.fn.tile_strategy.current_cute_grid_execution_plan(
+            block_ids=self.block_ids
+        )
+        if plan is not None and any(
+            plan.priority_for_block(block_id) is not None for block_id in self.block_ids
+        ):
+            offset = self.fn.tile_strategy.thread_axis_for_strategy(self)
+            if offset is not None:
+                return offset
+
         seen: set[int] = set()
         active_reduction_axes = 0
         active_non_reduction_axes = 0
@@ -740,9 +1505,6 @@ class BlockSizeTileStrategy(TileStrategy):
         has_reduction_strategy = any(
             isinstance(strategy, ReductionStrategy) and strategy.thread_axes_used() > 0
             for strategy in self.fn.tile_strategy.strategies
-        )
-        plan = self.fn.tile_strategy.current_cute_grid_execution_plan(
-            block_ids=self.block_ids
         )
         if plan is not None and any(
             plan.disables_reduction_axis_reservation(block_id)
@@ -2084,7 +2846,40 @@ class CuteNDTileStrategy(NDTileStrategy):
         self.mma_mode = mma_mode
         self.inactive_block_ids = inactive_block_ids or set()
         self._lane_var_by_block: dict[int, str] = {}
+        # Per-block vec width for the lane loop (1 = scalar).  Populated
+        # from the autotuner-selected ``cute_vector_widths`` config when
+        # the block has a lane loop and its ``elements_per_thread`` is
+        # divisible by the picked V.  When > 1, ``codegen_device_loop``
+        # partitions the lane loop into outer (epT/V) x inner constexpr V
+        # so memory_ops can hoist a single ``cute.arch.load(..., V)`` per
+        # outer-lane iter (LDG.64 / LDG.128).
+        self._cute_lane_vec_width_by_block: dict[int, int] = {}
+        # Per-block constexpr V-loop var (only set when the lane loop is
+        # vec-partitioned). Used by memory_ops to find the inner loop's
+        # target var when emitting per-lane bitcasts.
+        self._cute_vec_lane_var_by_block: dict[int, str] = {}
+        # Per-block lane-base index var (the per-thread base of a V-wide
+        # contiguous chunk).  Set when lane vec is in play; used by
+        # memory_ops to compute the vec load pointer once per outer-lane
+        # iter.
+        self._cute_lane_base_index_var_by_block: dict[int, str] = {}
+        # Per-block lane body (list of AST statements inside the outer
+        # lane loop, ending in the constexpr V-loop). memory_ops uses
+        # ``insert(len(lane_body)-1, hoist_stmt)`` to splice the vec
+        # load just before the inner V-loop.
+        self._cute_lane_body_by_block: dict[int, list] = {}
+        # Shared per-block hoist cache: (tensor_name, base_ptr_expr) ->
+        # (hoist_var, dtype).  Same shape as
+        # ``LoopedReductionStrategy._cute_lane_vec_loads``.
+        self._cute_lane_vec_loads_by_block: dict[int, dict] = {}
         if not mma_mode:
+            from ..autotuner.config_spec import CuteVectorWidthSpec
+
+            env_local = CompileEnvironment.current()
+            cute_vec_widths_cfg = cast(
+                "list[int]",
+                fn.config.config.get("cute_vector_widths", []) or [],
+            )
             for block_id, nt, bs in zip(
                 block_ids, num_threads, block_size, strict=True
             ):
@@ -2100,6 +2895,38 @@ class CuteNDTileStrategy(NDTileStrategy):
                     self._lane_var_by_block[block_id] = self.fn.new_var(
                         f"lane_{block_id}"
                     )
+                    # Register a cute_vector_widths slot for this lane
+                    # block if not already present (rolled reductions
+                    # register their own via device_ir).  We add idempotently
+                    # so the autotuner can explore V in {1,2,4,8}.
+                    if (
+                        block_id
+                        not in env_local.config_spec.cute_vector_widths.valid_block_ids()
+                    ):
+                        import contextlib
+
+                        # Silently skip when append fails (e.g.
+                        # config_spec frozen) — the lane loop just
+                        # runs in scalar mode in that case.
+                        with contextlib.suppress(Exception):
+                            env_local.config_spec.cute_vector_widths.append(
+                                CuteVectorWidthSpec(
+                                    block_id=block_id,
+                                    size_hint=static_bs,
+                                )
+                            )
+                    elements_per_thread = static_bs // nt
+                    vec_width = env_local.config_spec.cute_vector_widths.config_get(
+                        cute_vec_widths_cfg,
+                        block_id,
+                        1,
+                    )
+                    if (
+                        isinstance(vec_width, int)
+                        and vec_width > 1
+                        and elements_per_thread % vec_width == 0
+                    ):
+                        self._cute_lane_vec_width_by_block[block_id] = vec_width
 
     def _configured_block_size_int(self, block_size: SymIntLike) -> int | None:
         if isinstance(block_size, int):
@@ -2393,17 +3220,55 @@ class CuteNDTileStrategy(NDTileStrategy):
         block_sizes = self.block_size
         user_body: list[ast.AST] = []
         body: list[ast.AST] = user_body
-        lane_loops = [
-            (
-                self._lane_var_by_block[block_id],
-                self._elements_per_thread_for_block(block_id),
-            )
-            for block_id in (self.block_ids[i] for i in self.loop_order)
-            if block_id in self._lane_var_by_block
-        ]
-        for lane_var, extent in reversed(lane_loops):
-            lane_for = _create_lane_loop(lane_var, extent, body)
-            body = [lane_for]
+        # Capture per-block (lane_var, full_extent, vec_width).  When
+        # vec_width > 1, the outer lane runs (full_extent // vec_width)
+        # iters; the inner constexpr-V loop handles V elements per outer
+        # iter.  The memory_ops vec-load dispatcher splices a single
+        # ``cute.arch.load(..., V)`` between the outer lane setup and the
+        # inner constexpr loop, so per-thread bytes-per-load grow from
+        # ``sizeof(dtype)`` to ``V * sizeof(dtype)`` (LDG.64 / LDG.128).
+        lane_loops_meta: list[tuple[int, str, int, int]] = []
+        for block_id in (self.block_ids[i] for i in self.loop_order):
+            if block_id not in self._lane_var_by_block:
+                continue
+            lane_var = self._lane_var_by_block[block_id]
+            extent = self._elements_per_thread_for_block(block_id)
+            vec_width = self._cute_lane_vec_width_by_block.get(block_id, 1)
+            lane_loops_meta.append((block_id, lane_var, extent, vec_width))
+        for block_id, lane_var, extent, vec_width in reversed(lane_loops_meta):
+            if vec_width > 1 and extent > 0 and extent % vec_width == 0:
+                # Partition the lane loop into outer x inner constexpr V.
+                # The inner constexpr-V loop's body re-runs the user body
+                # for each of the V lanes (the user body's per-lane
+                # ``index_var = ...`` setup keys off the COMPOSITE lane =
+                # outer*V + inner so the per-element index is correct).
+                vec_lane_var = self.fn.new_var(f"vec_lane_{block_id}", dce=False)
+                self._cute_vec_lane_var_by_block[block_id] = vec_lane_var
+                inner_for = cast(
+                    "ast.For",
+                    ast.parse(
+                        f"for {vec_lane_var} in cutlass.range_constexpr({vec_width}):\n"
+                        f"    pass"
+                    ).body[0],
+                )
+                inner_for.body = body  # type: ignore[assignment]
+                # ``lane_body`` is what's INSIDE the outer lane loop:
+                # statements above the constexpr V-loop, plus the loop
+                # itself (last entry).  memory_ops.py splices a hoisted
+                # ``cute.arch.load(..., V)`` into ``lane_body[-1:]`` via
+                # the same protocol ``LoopedReductionStrategy`` uses.
+                lane_body: list[ast.AST] = [inner_for]
+                self._cute_lane_body_by_block[block_id] = lane_body
+                outer_extent = extent // vec_width
+                # Always emit the outer lane loop even when ``outer_extent
+                # == 1`` (i.e. EPT == V): the lane-base index expression
+                # references ``lane_var``, which must be defined in scope.
+                # The CuTe DSL constant-folds the 1-iter loop away.
+                outer_for = _create_lane_loop(lane_var, outer_extent, lane_body)
+                body = [outer_for]
+            else:
+                lane_for = _create_lane_loop(lane_var, extent, body)
+                body = [lane_for]
         for_node: ast.For | None = None
         assert len(block_sizes) == len(block_ids)
         if len(state.ast_args) == 5:
@@ -2495,8 +3360,44 @@ class CuteNDTileStrategy(NDTileStrategy):
                     tracker.record(block_idx, axis, static_extent)
             else:
                 idx_expr = offset_var
+            block_vec_width = self._cute_lane_vec_width_by_block.get(block_idx, 1)
+            vec_lane_var = self._cute_vec_lane_var_by_block.get(block_idx)
             if lane_var := self._lane_var_by_block.get(block_idx):
-                idx_expr = f"{idx_expr} + {env.backend.lane_offset_expr(lane_var)}"
+                if block_vec_width > 1 and vec_lane_var is not None:
+                    # Composite per-element lane index = outer*V + inner.
+                    # outer (``lane_var``) ranges [0, EPT/V); inner
+                    # (``vec_lane_var``) ranges [0, V).  Per-thread base
+                    # (the start of the V-wide chunk this thread owns
+                    # for this outer iter) is stashed in
+                    # ``_cute_lane_base_index_var_by_block`` so the vec
+                    # load can use it directly (mirrors the
+                    # ``LoopedReductionStrategy`` unroll path).
+                    base_index_var = self.fn.new_var(
+                        f"lane_base_{block_idx}", dce=False
+                    )
+                    self._cute_lane_base_index_var_by_block[block_idx] = base_index_var
+                    # ``base = offset + tid*EPT + outer*V``  (per-thread
+                    # V-aligned base) — emitted INSIDE the outer lane
+                    # loop's body (above the constexpr V-loop) so a
+                    # single ``cute.arch.load(..., V)`` can be hoisted
+                    # at the same level by memory_ops.
+                    lane_body_list = self._cute_lane_body_by_block.get(block_idx)
+                    if lane_body_list is not None:
+                        base_expr = (
+                            f"{idx_expr} + {env.backend.lane_offset_expr(lane_var)} "
+                            f"* {block_vec_width}"
+                        )
+                        lane_body_list.insert(
+                            0,
+                            statement_from_string(f"{base_index_var} = {base_expr}"),
+                        )
+                    # The user-body's per-element index uses the base +
+                    # the inner constexpr-V var so the existing scalar
+                    # pipeline (mask + cast + reduce-or-store) keeps
+                    # working unchanged.
+                    idx_expr = f"{base_index_var} + cutlass.Int32({vec_lane_var})"
+                else:
+                    idx_expr = f"{idx_expr} + {env.backend.lane_offset_expr(lane_var)}"
             index_setup.append(statement_from_string(f"{index_var} = {idx_expr}"))
             mask_statement = self._setup_mask(
                 state, block_idx, block_size, index_var, end
@@ -2514,6 +3415,7 @@ class CuteNDTileStrategy(NDTileStrategy):
             block_id_to_info=block_id_to_info,
             thread_axis_sizes=tracker.sizes,
             block_thread_axes=tracker.block_axes,
+            lane_loop_blocks=set(self._lane_var_by_block),
         )
 
     def supports_index_rank_expansion(self) -> bool:

@@ -14,6 +14,7 @@ from helion._testing import HALF_DTYPE
 from helion._testing import TestCase
 from helion._testing import code_and_output
 from helion._testing import onlyBackends
+from helion.exc import BackendUnsupported
 import helion.language as hl
 from helion.runtime import _create_cute_direct_entry
 from helion.runtime import _cute_cluster_shape
@@ -814,7 +815,28 @@ class TestCuteBackend(TestCase):
         torch.testing.assert_close(out, x + 1)
         self.assertIn("for lane_", code)
 
-    def test_oversized_flattened_block_raises(self) -> None:
+    def test_oversized_flattened_block_caps_threads(self) -> None:
+        """When num_threads is auto and block_size > 1024, the CuTe backend
+        falls back to a 1024-thread lane loop rather than raising."""
+
+        @helion.kernel(backend="cute", autotune_effort="none")
+        def cute_flattened_identity(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile in hl.tile(x.numel()):
+                out[tile] = x[tile]
+            return out
+
+        args = (torch.randn(2048, device=DEVICE, dtype=torch.float32),)
+        code, out = code_and_output(cute_flattened_identity, args, block_size=2048)
+        torch.testing.assert_close(out, args[0])
+        # block_size 2048 with auto threads now lowers to a 1024-thread lane
+        # loop (each thread owns two elements).
+        self.assertIn("for lane_", code)
+
+    def test_oversized_flattened_block_raises_when_threads_explicit(self) -> None:
+        """When num_threads is explicit and exceeds the 1024-per-CTA cap,
+        the backend still raises rather than silently downsizing."""
+
         @helion.kernel(backend="cute", autotune_effort="none")
         def cute_flattened_identity(x: torch.Tensor) -> torch.Tensor:
             out = torch.empty_like(x)
@@ -826,7 +848,9 @@ class TestCuteBackend(TestCase):
         with self.assertRaisesRegex(
             helion.exc.BackendUnsupported, "thread block too large for cute kernel"
         ):
-            code_and_output(cute_flattened_identity, args, block_size=2048)
+            code_and_output(
+                cute_flattened_identity, args, block_size=2048, num_threads=[2048]
+            )
 
     def test_reduction_num_threads(self) -> None:
         args = (torch.randn(129, 130, device=DEVICE, dtype=torch.float32),)
@@ -3008,7 +3032,16 @@ class TestCuteBackend(TestCase):
         self.assertIn("cute.arch.warp_reduction_sum", code)
         self.assertNotIn("cute.gemm", code)
 
-    def test_strided_threaded_reduction_cross_warp_shared_memory(self) -> None:
+    def test_strided_threaded_reduction_uses_warp_per_row(self) -> None:
+        """With ``block_sizes=[32, 32]`` and the default
+        ``num_threads=[32, 32]`` the warp-per-row plan (P15) swaps the
+        thread-axis assignment so each warp owns one M-row.  The
+        ``acc.sum(-1)`` then lowers to a per-warp reduction (each warp
+        sums its row across the 32 lanes) instead of routing through
+        the cross-warp ``_cute_grouped_reduce_shared_two_stage`` SMEM
+        path.  The launch dim stays ``(32, 32, 1)`` (N on axis 0, M on
+        axis 1) so the joint thread count still fits the budget.
+        """
         args = (
             torch.randn(512, 512, device=DEVICE, dtype=torch.float32),
             torch.tensor([200], device=DEVICE, dtype=torch.int64),
@@ -3018,4 +3051,126 @@ class TestCuteBackend(TestCase):
         expected = x[:, : end.item()].sum(dim=1)
         torch.testing.assert_close(out, expected, rtol=1e-4, atol=1e-4)
         self.assertIn("block=(32, 32, 1)", code)
-        self.assertIn("_cute_grouped_reduce_shared_two_stage", code)
+        # Each warp reduces its own row via ``_cute_grouped_reduce_warp``
+        # with ``group_span=32``; no shared-memory two-stage reduce.
+        self.assertIn("_cute_grouped_reduce_warp", code)
+        self.assertIn("group_span=32", code)
+        self.assertNotIn("_cute_grouped_reduce_shared_two_stage", code)
+
+
+@helion.kernel(backend="cute")
+def _cute_2d_tile_reduction_kernel(x: torch.Tensor) -> torch.Tensor:
+    """2D reduction kernel: outer M-grid tile + inner N-reduction tile.
+
+    Used by the thread-budget rejection tests and the warp-reduce
+    heuristic registration test below.
+    """
+    m, n = x.size()
+    out = torch.empty_like(x)
+    block_size_m = hl.register_block_size(m)
+    block_size_n = hl.register_block_size(n)
+    for tile_m in hl.tile(m, block_size=block_size_m):
+        mi = hl.full([tile_m], float("-inf"), dtype=torch.float32)
+        di = hl.zeros([tile_m], dtype=torch.float32)
+        for tile_n in hl.tile(n, block_size=block_size_n):
+            values = x[tile_m, tile_n]
+            local_amax = torch.amax(values, dim=1)
+            mi_next = torch.maximum(mi, local_amax)
+            di = di * torch.exp(mi - mi_next) + torch.exp(
+                values - mi_next[:, None]
+            ).sum(dim=1)
+            mi = mi_next
+        for tile_n in hl.tile(n, block_size=block_size_n):
+            values = x[tile_m, tile_n]
+            out[tile_m, tile_n] = torch.exp(values - mi[:, None]) / di[:, None]
+    return out
+
+
+@onlyBackends(["cute"])
+class TestCuteThreadBudgetRejection(TestCase):
+    """The CuTe launcher raises ``BackendUnsupported`` when a config
+    would force the launcher to silently truncate the joint thread
+    count below what codegen committed to.
+
+    The original bug: codegen for ``block_sizes=[8, 1024], num_threads=
+    [0, 256]`` commits to an 8 * 256 = 2048-thread layout, but the
+    launcher caps at MAX_THREADS_PER_BLOCK = 1024 → an axis is silently
+    dropped and the kernel writes nan.  The guard (in
+    ``CuteBackend.launcher_keyword_args``) rejects such configs cleanly
+    so the autotuner doesn't record them as "fast but wrong".
+    """
+
+    def test_joint_thread_overflow_rejected(self) -> None:
+        """A 2048-thread codegen budget on a launcher capped at 1024
+        MUST raise ``BackendUnsupported`` instead of silently truncating.
+        """
+        x = torch.randn(4096, 1024, device=DEVICE, dtype=HALF_DTYPE)
+        with pytest.raises(BackendUnsupported):
+            code_and_output(
+                _cute_2d_tile_reduction_kernel,
+                (x,),
+                block_sizes=[8, 1024],
+                num_threads=[0, 256],
+                cute_vector_widths=[1, 4],
+            )
+
+    def test_in_budget_multi_row_passes(self) -> None:
+        """A multi-row config that DOES fit in 1024 threads must still
+        compile and run cleanly — the rejection must be precise, not
+        over-broad.
+        """
+        x = torch.randn(4096, 256, device=DEVICE, dtype=HALF_DTYPE)
+        _, out = code_and_output(
+            _cute_2d_tile_reduction_kernel,
+            (x,),
+            block_sizes=[2, 256],
+            num_threads=[1, 32],  # 2 * 32 = 64 threads — within budget
+            cute_vector_widths=[1, 4],
+        )
+        ref = torch.nn.functional.softmax(x, dim=1)
+        torch.testing.assert_close(out, ref, atol=1e-2, rtol=1e-2)
+
+
+@onlyBackends(["cute"])
+class TestCuteTileVecWarpReduceHeuristic(TestCase):
+    """Pins the ``CuteTileVecWarpReduceHeuristic`` autotuner seed:
+    ``block_sizes=[1, V*32]``, ``num_threads=[0, 32]``,
+    ``cute_vector_widths=[1, V]`` — the warp-reduce config family that
+    is the picked default for 2D reduction kernels with no rolled
+    reduction.
+    """
+
+    def test_seed_compiles_to_warp_reduction(self) -> None:
+        """The seed config must produce a working kernel that uses
+        ``cute.arch.warp_reduction_*`` and not the shared-memory
+        two-stage reduce.
+        """
+        x = torch.randn(4096, 6400, device=DEVICE, dtype=HALF_DTYPE)
+        code, out = code_and_output(
+            _cute_2d_tile_reduction_kernel,
+            (x,),
+            block_sizes=[1, 128],
+            num_threads=[0, 32],
+            cute_vector_widths=[1, 4],
+        )
+        ref = torch.nn.functional.softmax(x, dim=1)
+        torch.testing.assert_close(out, ref, atol=1e-2, rtol=1e-2)
+        self.assertIn("cute.arch.warp_reduction_max", code)
+        self.assertIn("cute.arch.warp_reduction_sum", code)
+        # Block of 32 threads on the reduction axis — exactly one warp.
+        self.assertIn("block=(32, 1, 1)", code)
+        # Should NOT use the shared-memory two-stage reduce at this size.
+        self.assertNotIn("_cute_grouped_reduce_shared_two_stage", code)
+
+    def test_heuristic_class_is_registered(self) -> None:
+        """The class must be discoverable and registered for the cute
+        backend so the autotuner can use it as a seed.
+        """
+        from helion._compiler.autotuner_heuristics import HEURISTICS_BY_BACKEND
+        from helion._compiler.autotuner_heuristics.cute import (
+            CuteTileVecWarpReduceHeuristic,
+        )
+
+        self.assertIn(
+            CuteTileVecWarpReduceHeuristic, HEURISTICS_BY_BACKEND.get("cute", ())
+        )

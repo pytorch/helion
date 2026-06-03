@@ -998,6 +998,17 @@ def prepare_cute_collective_lane_loop_suppression(
         ):
             continue
 
+        # Mirror the real codegen bailout in ``_emit_mma_pipeline`` (it returns
+        # ``None`` and falls back to the scalar matmul path when non-root lane
+        # loops are active, see the ``_has_non_root_lane_loops`` guard there).
+        # If we predicted the collective tcgen05 path here but codegen actually
+        # takes the scalar fallback, requesting root lane-loop suppression would
+        # drop the synthetic-lane index/mask definitions for the grid axis and
+        # produce a ``NameError`` at runtime. Only register the loads / request
+        # suppression when the collective path will truly be taken.
+        if _has_non_root_lane_loops(cg):
+            continue
+
         cute_state = cg.device_function.cute_state
         _register_collective_handled_loads(cute_state, lhs_load, rhs_load)
         if grid_state.has_lane_loops():

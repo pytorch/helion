@@ -9,7 +9,6 @@ import logging
 import math
 from math import inf
 import os
-import pprint
 import random
 import re
 import sys
@@ -1235,18 +1234,18 @@ def population_statistics(population: list[PopulationMember]) -> str:
             status_counts["ok"] += 1
     if len(working) == 0:
         raise exc.NoConfigFound
-    parts: list[str] = []
-    for label in ("error", "timeout", "ok"):
-        count = status_counts.get(label, 0)
-        if count:
-            parts.append(f"{label}={count}")
-
-    parts.extend(
-        (
-            f"min={working[0].perf:.4f}",
-            f"mid={working[len(working) // 2].perf:.4f}",
-            f"max={working[-1].perf:.4f}",
-            f"best={pprint.pformat(dict(population[0].config), width=100, compact=True)}",
-        )
+    count_parts = [
+        f"{label}={status_counts[label]}"
+        for label in ("error", "timeout", "ok")
+        if status_counts[label]
+    ]
+    perf_parts = (
+        f"min={working[0].perf:.4f}",
+        f"mid={working[len(working) // 2].perf:.4f}",
+        f"max={working[-1].perf:.4f}",
     )
-    return "\n" + "\n".join(parts)
+    lines = [f"{' '.join(count_parts)} | {' '.join(perf_parts)}", "best:"]
+    best_config = dict(population[0].config)
+    key_width = max((len(k) for k in best_config), default=0)
+    lines.extend(f"  {k:<{key_width}} = {v!r}" for k, v in best_config.items())
+    return "\n" + "\n".join(lines)

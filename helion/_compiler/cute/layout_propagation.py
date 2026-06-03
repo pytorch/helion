@@ -70,6 +70,7 @@ def plan_layouts(
     for graph_info in graphs:
         _seed_constraints(graph_info, tile_strategy)
         _plan_matmul_execution(graph_info, tile_strategy)
+        _plan_warp_per_row_execution(graph_info, tile_strategy)
         _forward_propagate(graph_info)
         _backward_propagate(graph_info)
         _resolve_layouts(graph_info)
@@ -224,6 +225,116 @@ def _plan_matmul_execution(
                 ),
             ),
         )
+
+
+def _plan_warp_per_row_execution(
+    graph_info: GraphInfo,
+    tile_strategy: TileStrategyDispatch,
+) -> None:
+    """Detect the softmax-shaped warp-per-row layout.
+
+    When the kernel has a single 1-D outer grid loop over rows (M-axis)
+    and an inner non-reduction tile loop over the reduction axis (N),
+    and the autotuner picks ``num_threads`` such that:
+
+      * M-block (outer grid) has a thread extent >= 2 (multi-row CTAs)
+      * N-tile (inner) has a thread extent >= 32 and is a multiple of 32
+      * Joint thread extent (M_threads * N_threads) <= 1024
+
+    we want each CUDA warp to own ONE row so the inner reduction can
+    use ``cute.arch.warp_reduction_*`` (single warp shuffle) rather
+    than the cross-warp shared-memory two-stage reduce. That requires
+    swapping the thread-axis assignment so:
+
+      * N (inner) lands on thread_idx[0] (32 contiguous threads per warp)
+      * M (outer grid) lands on thread_idx[1] (warp index = row index)
+
+    This emits a ``CuTeGridExecutionPlan`` that sets
+    ``block_axis_priority`` to put N before M and disables the
+    reduction-axis reservation (no reduction strategy claims a thread
+    axis here — the strided reduction inside the inner tile body picks
+    the warp-reduce path because ``group_span = N_threads = 32`` once
+    M has moved to a higher-indexed thread axis).
+    """
+    from ..host_function import HostFunction
+    from ..reduction_strategy import ReductionStrategy
+    from ..tile_strategy import CuteNDTileStrategy
+
+    if not isinstance(graph_info, RootGraphInfo):
+        return
+    device_ir = HostFunction.current().device_ir
+    # Only one outer grid (1 M-block).
+    if len(device_ir.grid_block_ids) != 1 or len(device_ir.grid_block_ids[0]) != 1:
+        return
+    (m_block_id,) = device_ir.grid_block_ids[0]
+    # No MMA — those use a different plan.
+    matmul_nodes = [
+        node
+        for node in graph_info.graph.nodes
+        if node.op == "call_function" and node.target is torch.ops.aten.mm.default
+    ]
+    if matmul_nodes:
+        return
+    # Don't conflict with a plan already attached for this graph (e.g.
+    # the matmul plan above).
+    if graph_info.cute_grid_execution_plans:
+        return
+    # No reduction strategy (rolled reduction) — that path runs the
+    # CuteTileVecWarpReduceHeuristic-style single-row layout already.
+    if any(
+        isinstance(s, ReductionStrategy) and s.thread_axes_used() > 0
+        for s in tile_strategy.strategies
+    ):
+        return
+    # Find the M strategy (outer grid) and the N strategy (inner tile)
+    # by walking ``tile_strategy.strategies``.  The M strategy owns
+    # ``m_block_id``; the N strategy is any other CuteNDTileStrategy
+    # with a different block_id and at least one thread axis.
+    m_strategy = tile_strategy.block_id_to_strategy.get((m_block_id,))
+    if not isinstance(m_strategy, CuteNDTileStrategy):
+        return
+    if m_strategy.thread_axes_used() != 1:
+        return
+    m_threads = tile_strategy.thread_extent_for_block_id(m_block_id)
+    if not isinstance(m_threads, int) or m_threads < 2:
+        return
+    n_strategies: list[CuteNDTileStrategy] = []
+    for strategy in tile_strategy.strategies:
+        if strategy is m_strategy:
+            continue
+        if not isinstance(strategy, CuteNDTileStrategy):
+            continue
+        if strategy.thread_axes_used() != 1:
+            continue
+        if m_block_id in strategy.block_ids:
+            continue
+        n_strategies.append(strategy)
+    if not n_strategies:
+        return
+    n_block_ids = {bid for s in n_strategies for bid in s.block_ids}
+    if len(n_block_ids) != 1:
+        # Multiple distinct inner blocks — not the simple softmax shape.
+        return
+    (n_block_id,) = n_block_ids
+    n_threads = tile_strategy.thread_extent_for_block_id(n_block_id)
+    if not isinstance(n_threads, int) or n_threads < 32 or n_threads % 32 != 0:
+        return
+    # Joint thread budget check.
+    from .thread_budget import MAX_THREADS_PER_BLOCK
+
+    if m_threads * n_threads > MAX_THREADS_PER_BLOCK:
+        return
+    graph_info.cute_grid_execution_plans = (
+        *graph_info.cute_grid_execution_plans,
+        CuTeGridExecutionPlan(
+            scoped_block_ids=frozenset({m_block_id, n_block_id}),
+            block_axis_priority={
+                n_block_id: 0,
+                m_block_id: 1,
+            },
+            disable_reduction_axis_reservation_for=frozenset({m_block_id, n_block_id}),
+        ),
+    )
 
 
 def _direct_grouped_n_scalar_block_id(

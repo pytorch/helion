@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from ... import exc
 from ..ast_extension import expr_from_string
 from ..ast_extension import statement_from_string
 from ..compile_environment import CompileEnvironment
@@ -15,6 +16,186 @@ from .indexing import CutePackedTerms
 
 if TYPE_CHECKING:
     from ..helper_function import CodegenInterface
+
+
+# fx ops that preserve the underlying byte storage of a tensor (no dtype
+# change, no arithmetic).  Used to trace a matmul operand back to its raw
+# ``memory_ops.load`` so we can tell a raw fp8 *byte* load apart from a
+# *computed* fp8 register value (e.g. ``p = exp2(...).to(fp8)``).
+_FP8_LOAD_PASSTHROUGH_TARGETS = frozenset(
+    {
+        torch.ops.aten.clone.default,
+        torch.ops.aten.detach.default,
+        torch.ops.aten.permute.default,
+        torch.ops.aten.reshape.default,
+        torch.ops.aten.squeeze.dim,
+        torch.ops.aten.squeeze.default,
+        torch.ops.aten.t.default,
+        torch.ops.aten.transpose.int,
+        torch.ops.aten.unsqueeze.default,
+        torch.ops.aten.view.default,
+        torch.ops.aten._unsafe_view.default,
+        torch.ops.aten.expand.default,
+    }
+)
+
+
+def _cute_operand_is_computed_fp8(node: object) -> bool:
+    """Return True when an fp8 operand is a *computed* register value.
+
+    A computed fp8 value (e.g. ``p = exp2(...).to(fp8)``) is produced by a
+    dtype conversion from a non-fp8 source and lands in registers as a typed
+    ``cutlass.Float8E4M3FN``.  Widening it uses an ordinary numeric cast -
+    routing it through the raw-byte PTX decode emits an invalid
+    ``(i8) -> f8E4M3FN`` conversion that fails to lower.
+
+    A *raw* fp8 load (possibly hoisted out of the K loop, so its fx node is a
+    loop-carried ``_new_var`` placeholder) keeps the value as raw
+    ``cutlass.Uint8`` bytes and MUST go through the PTX decode.  Anything that
+    is not provably a from-non-fp8 conversion is treated as a raw load.
+    """
+    import torch.fx
+
+    cur = node
+    for _ in range(64):
+        if not isinstance(cur, torch.fx.Node):
+            return False
+        if (
+            cur.op == "call_function"
+            and cur.target is torch.ops.prims.convert_element_type.default
+        ):
+            source = cur.args[0] if cur.args else None
+            src_dtype = None
+            if isinstance(source, torch.fx.Node):
+                src_val = source.meta.get("val")
+                if isinstance(src_val, torch.Tensor):
+                    src_dtype = src_val.dtype
+            # A convert *from* a non-fp8 dtype produces a computed fp8 value.
+            return src_dtype is not torch.float8_e4m3fn
+        if cur.op != "call_function" or cur.target not in _FP8_LOAD_PASSTHROUGH_TARGETS:
+            return False
+        inputs = [a for a in cur.args if isinstance(a, torch.fx.Node)]
+        if len(inputs) != 1:
+            return False
+        cur = inputs[0]
+    return False
+
+
+# fx ops that re-expose a value at the same numeric magnitude (no rescale).
+# Tracing the accumulator through these reaches the loop-carried phi without
+# crossing an arithmetic rescale.
+_ACC_PHI_PASSTHROUGH_TARGETS = frozenset(
+    {
+        torch.ops.aten.clone.default,
+        torch.ops.aten.detach.default,
+        torch.ops.aten.permute.default,
+        torch.ops.aten.reshape.default,
+        torch.ops.aten.squeeze.dim,
+        torch.ops.aten.squeeze.default,
+        torch.ops.aten.t.default,
+        torch.ops.aten.transpose.int,
+        torch.ops.aten.unsqueeze.default,
+        torch.ops.aten.view.default,
+        torch.ops.aten._unsafe_view.default,
+        torch.ops.aten.expand.default,
+        torch.ops.prims.convert_element_type.default,
+    }
+)
+
+
+def _cute_acc_is_rescaled_loop_carried(acc_node: object) -> bool:
+    """Return True for a *rescaled* loop-carried accumulator (online softmax).
+
+    The cross-lane ``dot_acc`` accumulator (sum the K products across lane
+    iterations in fp32, then add the accumulator once) is correct - and more
+    precise - for:
+
+    * a standalone ``addmm`` whose bias is a plain load (loop-invariant), and
+    * a plain matmul K-loop ``acc = hl.dot(x, y, acc=acc)`` where ``acc`` is the
+      loop-carried phi added to verbatim (no rescale inside the K loop).
+
+    A flash-attention online-softmax recurrence instead *rescales* the
+    accumulator every K iteration (``acc = acc * alpha + p @ v``).  The ``acc``
+    operand passed to the dot is therefore a value *derived from* the loop phi
+    through an arithmetic rescale rather than the bare phi.  There ``dot_acc``
+    double-counts every prior product (the running sum is re-added each
+    iteration while the rescaled base is recomputed), so the matmul must emit a
+    per-iteration ``acc = (rescaled acc) + product`` update and let the loop phi
+    carry the running sum.
+
+    Detection: strip pure dtype-casts / views off ``acc``.  If what remains is
+    a ``_new_var`` loop-carried phi (or anything not derived from a phi), the
+    accumulator is NOT rescaled -> keep ``dot_acc``.  If the phi is only
+    reachable *through* an arithmetic op (mul/add/sub/div/...), the accumulator
+    is rescaled -> use the per-iteration form.
+    """
+    import torch.fx
+
+    from ...language._tracing_ops import _new_var
+
+    if not isinstance(acc_node, torch.fx.Node):
+        return False
+
+    # Strip pure casts / views: a bare (possibly re-typed) loop phi is a plain
+    # accumulation, not a rescale.
+    cur = acc_node
+    for _ in range(64):
+        if not isinstance(cur, torch.fx.Node):
+            return False
+        if cur.op == "call_function" and cur.target is _new_var:
+            return False  # bare loop phi -> plain accumulation
+        if cur.op == "call_function" and cur.target in _ACC_PHI_PASSTHROUGH_TARGETS:
+            inputs = [a for a in cur.args if isinstance(a, torch.fx.Node)]
+            if len(inputs) == 1:
+                cur = inputs[0]
+                continue
+        break
+
+    # ``cur`` is an arithmetic node (or otherwise).  It is a rescaled
+    # accumulator only if it is fed by a loop-carried phi.
+    seen: set[torch.fx.Node] = set()
+    stack = [cur]
+    while stack:
+        node = stack.pop()
+        if node in seen:
+            continue
+        seen.add(node)
+        if len(seen) > 256:
+            break
+        if node.op == "call_function" and node.target is _new_var:
+            src = node.args[0] if node.args else None
+            if isinstance(src, torch.fx.Node) and src.op == "placeholder":
+                return True
+        if node.op != "call_function":
+            continue
+        for arg in node.args:
+            if isinstance(arg, torch.fx.Node):
+                stack.append(arg)
+            elif isinstance(arg, (list, tuple)):
+                stack.extend(a for a in arg if isinstance(a, torch.fx.Node))
+    return False
+
+
+def _cast_operand_to_f32(
+    term: ast.AST, dtype: torch.dtype | None, *, is_computed_fp8: bool
+) -> ast.AST:
+    """Promote a sub-f32 matmul operand to float32 for the scalar fallback.
+
+    Raw ``float8_e4m3fn`` tensors are loaded as raw ``cutlass.Uint8`` bytes
+    (the CuTe DSL has no scalar fp8 dereference), so a plain numeric cast would
+    interpret the storage byte as an integer (e.g. ``0x40`` -> ``64.0``)
+    instead of decoding the fp8 value.  Route those through the bit-exact PTX
+    decode helper.
+
+    A *computed* fp8 value (``exp2(...).to(fp8)``) is already a typed
+    ``cutlass.Float8E4M3FN`` register value, so it widens with the ordinary
+    numeric cast - applying the byte decode there emits an invalid
+    ``(i8) -> f8E4M3FN`` conversion.  bf16/fp16 are genuine numeric widenings
+    and always use the ordinary cast.
+    """
+    if dtype is torch.float8_e4m3fn and not is_computed_fp8:
+        return expr_from_string("_cute_fp8e4m3fn_to_float32({x})", x=term)
+    return cast_ast(term, torch.float32)
 
 
 def _cute_active_thread_layout(
@@ -117,15 +298,29 @@ def _emit_cute_grouped_sum_reduction(
     pre = 1
     for axis in range(thread_axis):
         pre *= axis_sizes.get(axis, 1)
-    if pre <= 1:
+    group_span = pre * reduce_extent
+    # ``cute.arch.warp_reduction_sum`` shuffles only within a single 32-thread
+    # warp (``shuffle_sync_bfly`` clamps to lane 31), so a direct warp reduce
+    # is only correct when the whole reduction group fits inside one warp.  A
+    # contraction dim with >32 threads (e.g. head_dim=64 on the QK matmul) must
+    # use the shared-memory two-stage reduction instead - otherwise it silently
+    # sums only the first 32 of the contraction elements.
+    direct_warp_ok = pre <= 1 and reduce_extent <= 32
+    if direct_warp_ok:
         return backend.reduction_expr(
             input_name, "sum", 0, threads_in_group=reduce_extent
         )
 
     lane_expr = backend.thread_linear_index_expr(axis_sizes)
     if lane_expr is None:
-        return backend.reduction_expr(
-            input_name, "sum", 0, threads_in_group=reduce_extent
+        if reduce_extent <= 32:
+            return backend.reduction_expr(
+                input_name, "sum", 0, threads_in_group=reduce_extent
+            )
+        raise exc.BackendUnsupported(
+            "cute",
+            "CuTe scalar matmul fallback cannot reduce a >32-thread contraction "
+            "without a linear thread index",
         )
 
     num_threads = 1
@@ -135,12 +330,17 @@ def _emit_cute_grouped_sum_reduction(
     for size in getattr(cg, "max_thread_block_dims", ()):
         actual_threads *= max(size, 1)
     if actual_threads > 0 and num_threads > actual_threads:
-        return backend.reduction_expr(
-            input_name, "sum", 0, threads_in_group=reduce_extent
+        if reduce_extent <= 32:
+            return backend.reduction_expr(
+                input_name, "sum", 0, threads_in_group=reduce_extent
+            )
+        raise exc.BackendUnsupported(
+            "cute",
+            "CuTe scalar matmul fallback cannot reduce a >32-thread contraction "
+            "when the planned thread count exceeds the launch block",
         )
 
     identity_expr = f"{backend.dtype_str(value_dtype)}(0)"
-    group_span = pre * reduce_extent
     if group_span <= 32:
         return (
             "_cute_grouped_reduce_warp("
@@ -198,6 +398,9 @@ def _emit_cute_matmul(
     acc_dtype: torch.dtype | None = None,
     lhs_dtype: torch.dtype | None = None,
     rhs_dtype: torch.dtype | None = None,
+    lhs_node: object = None,
+    rhs_node: object = None,
+    acc_node: object = None,
 ) -> ast.AST:
     """Build a CuTe matmul fallback using a cross-thread reduction over K."""
     if hasattr(cg, "cute_uses_matmul"):
@@ -219,8 +422,16 @@ def _emit_cute_matmul(
         and _needs_f32_accumulator(lhs_dtype, rhs_dtype)
     ):
         reduction_dtype = torch.float32
-        rhs_terms = tuple(cast_ast(term, reduction_dtype) for term in rhs_terms)
-        lhs_terms = tuple(cast_ast(term, reduction_dtype) for term in lhs_terms)
+        lhs_computed_fp8 = _cute_operand_is_computed_fp8(lhs_node)
+        rhs_computed_fp8 = _cute_operand_is_computed_fp8(rhs_node)
+        rhs_terms = tuple(
+            _cast_operand_to_f32(term, rhs_dtype, is_computed_fp8=rhs_computed_fp8)
+            for term in rhs_terms
+        )
+        lhs_terms = tuple(
+            _cast_operand_to_f32(term, lhs_dtype, is_computed_fp8=lhs_computed_fp8)
+            for term in lhs_terms
+        )
     if len(lhs_terms) == len(rhs_terms):
         term_pairs = zip(lhs_terms, rhs_terms, strict=True)
     elif len(lhs_terms) == 1:
@@ -254,6 +465,21 @@ def _emit_cute_matmul(
         lane_vars = getattr(loop_state.strategy, "_lane_var_by_block", None)
         lane_var = lane_vars.get(k_block_id) if isinstance(lane_vars, dict) else None
         if not accumulate_in_lane_loop:
+            lane_var = None
+        # BUG#1 fix: a flash-attention online-softmax accumulator is rescaled
+        # (``acc = acc * alpha + p @ v``) every iteration of the K lane loop.
+        # The cross-lane ``dot_acc`` running sum would then be re-added each
+        # iteration while ``acc`` is independently rescaled, double-counting
+        # every prior product.  When ``acc`` is such a loop-carried value, emit
+        # the per-iteration ``acc = acc + product`` update instead (the loop
+        # phi carries the running sum) by skipping the ``dot_acc`` path.  A
+        # loop-invariant accumulator (e.g. a standalone ``addmm`` bias) keeps
+        # ``dot_acc`` so the per-lane products are summed before the bias add.
+        if (
+            lane_var is not None
+            and acc is not None
+            and _cute_acc_is_rescaled_loop_carried(acc_node)
+        ):
             lane_var = None
         if lane_var is not None:
             product_name = cg.lift(product, dce=True, prefix="dot_product").id

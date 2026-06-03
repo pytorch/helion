@@ -643,6 +643,98 @@ def cute_resolve_active_matmul_k_block_id(
     return lhs_k_block_id
 
 
+def _cute_matmul_operand_indices() -> dict[object, tuple[int, int]]:
+    """``(lhs_arg_index, rhs_arg_index)`` for each matmul op the CuTe backend
+    lowers through the scalar fallback.
+
+    The contraction (K) axis is ``lhs.shape[-1]`` / ``rhs.shape[-2]``; the free
+    (output) axes are ``lhs.shape[-2]`` (M) and ``rhs.shape[-1]`` (N).  Includes
+    both the aten matmul family and Helion's device-IR ``hl.dot`` / ``dot_scaled``
+    ops, which appear *before* aten lowering when the tile strategies are built.
+    """
+    from ...language import matmul_ops
+
+    return {
+        torch.ops.aten.mm.default: (0, 1),
+        torch.ops.aten.bmm.default: (0, 1),
+        torch.ops.aten.bmm.dtype: (0, 1),
+        torch.ops.aten.addmm.default: (1, 2),
+        torch.ops.aten.baddbmm.default: (1, 2),
+        matmul_ops.dot: (0, 1),
+        matmul_ops.dot_scaled: (0, 3),
+    }
+
+
+def cute_matmul_contraction_block_ids() -> set[int]:
+    """Return block ids that are the *contraction* (K) axis of some matmul.
+
+    A matmul's contraction axis is ``lhs.shape[-1]`` (equivalently
+    ``rhs.shape[-2]``).  When such an axis is also a reduction block that the
+    CuTe backend would otherwise split into ``N`` hardware threads x a synthetic
+    per-thread lane loop, the cross-thread matmul reduction only sums the ``N``
+    thread lanes - never the synthetic-lane partials - so each contracted dot
+    product covers only ``N`` of the ``K`` elements.  The thread-budget planner
+    uses this set to give the contraction axis priority for real threads (so the
+    already-landed cross-warp shared-memory reduction can sum the full ``K``)
+    and pushes the synthetic lanes onto the free / output tile axes instead,
+    where a lane loop is correct.
+
+    Returns the *canonical* block ids so callers can compare against either the
+    raw or canonical form.
+    """
+    from ..host_function import HostFunction
+    from ..host_function import NoCurrentFunction
+
+    if not CompileEnvironment.has_current():
+        return set()
+    env = CompileEnvironment.current()
+    canonical_block_id = getattr(env, "canonical_block_id", lambda block_id: block_id)
+    try:
+        hf = HostFunction.current()
+    except NoCurrentFunction:
+        return set()
+    # Guard via getattr so a test double exposing only the public ``device_ir``
+    # (without the private ``_device_ir`` backing field) is handled too; the
+    # real HostFunction.device_ir property asserts when ``_device_ir`` is None,
+    # so we must avoid touching the property in that case.
+    if getattr(hf, "_device_ir", "unset") is None:
+        return set()
+    device_ir = hf.device_ir
+    operand_indices_by_target = _cute_matmul_operand_indices()
+    result: set[int] = set()
+    for graph_info in getattr(device_ir, "graphs", ()):
+        graph = getattr(graph_info, "graph", None)
+        if not isinstance(graph, torch.fx.Graph):
+            continue
+        for node in graph.nodes:
+            if node.op != "call_function":
+                continue
+            operand_indices = operand_indices_by_target.get(node.target)
+            if operand_indices is None:
+                continue
+            lhs_idx, rhs_idx = operand_indices
+            args = node.args
+            if len(args) <= max(lhs_idx, rhs_idx):
+                continue
+            lhs_arg = args[lhs_idx]
+            rhs_arg = args[rhs_idx]
+            if not isinstance(lhs_arg, Node) or not isinstance(rhs_arg, Node):
+                continue
+            lhs_val = lhs_arg.meta.get("val")
+            rhs_val = rhs_arg.meta.get("val")
+            if not isinstance(lhs_val, torch.Tensor) or not isinstance(
+                rhs_val, torch.Tensor
+            ):
+                continue
+            if lhs_val.ndim < 1 or rhs_val.ndim < 2:
+                continue
+            for k_size in (lhs_val.shape[-1], rhs_val.shape[-2]):
+                block_id = env.resolve_block_id(k_size)
+                if block_id is not None:
+                    result.add(canonical_block_id(block_id))
+    return result
+
+
 def cute_outer_accumulator_out_dtype(
     resolved_out_dtype: torch.dtype,
     outer_acc_dtype: torch.dtype | None,

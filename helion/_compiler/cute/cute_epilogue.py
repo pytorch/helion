@@ -121,23 +121,26 @@ class _AuxiliaryTensorStep:
     classify time).
 
     ``broadcast_axis`` is ``None`` when the aux tensor matches the
-    carrier rank exactly (``residual[tile_m, tile_n]``) or ``1`` for
+    carrier rank exactly (``residual[tile_m, tile_n]``), ``1`` for
     a trailing-axis (rowvec) broadcast aux load (``bias[tile_n]``
-    with shape ``(N,)``). The leading-axis (colvec / M-axis) form is
-    not accepted: a bare rank-1 operand on the RHS aligns to the
-    *last* dimension under PyTorch broadcasting rules
-    (``acc + bias[tile_m]`` is either a shape error when BM ≠ BN
-    or a rowvec broadcast when BM == BN), so accepting the colvec
-    pattern would silently rewrite the user's broadcast direction.
-    Users wanting an explicit colvec broadcast must spell it out
-    with ``[:, None]`` / ``.unsqueeze(-1)``; that is a separate
-    pattern handler not yet wired up. The splice site
+    with shape ``(N,)``), or ``0`` for a leading-axis (row /
+    M-axis) broadcast aux load spelled explicitly as a ``(1, N)``
+    tensor indexed ``bias[tile_m, tile_n]``. A *bare* rank-1
+    operand on the RHS (``acc + bias[tile_m]``) is still rejected
+    because it aligns to the *last* dimension under PyTorch
+    broadcasting rules (it is either a shape error when BM ≠ BN or
+    a rowvec broadcast when BM == BN), so accepting it as a colvec
+    would silently rewrite the user's broadcast direction. The
+    ``(1, N)`` form is unambiguous: the user materialized the unit
+    M axis themselves, so row 0 broadcasts over every output row.
+    The splice site
     (``memory_ops._codegen_cute_store_tcgen05_tile``) owns the
-    canonical broadcast-view contract — it builds a 2-D logical
-    view of the rank-1 tensor with stride 0 on the orthogonal axis
-    so the existing ``partition_C → flat_divide → partition_D``
-    pipeline can run unchanged. Mirrors Quack's ``RowVecLoad``
-    epilogue (``quack/quack/epi_ops.py``).
+    canonical broadcast-view contract — for both broadcast axes it
+    builds a 2-D logical view with stride 0 on the broadcast
+    (M) axis and stride 1 on the data (N) axis so the existing
+    ``partition_C → flat_divide → partition_D`` pipeline can run
+    unchanged. Mirrors Quack's ``RowVecLoad`` epilogue
+    (``quack/quack/epi_ops.py``).
     """
 
     op_name: str

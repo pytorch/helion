@@ -969,7 +969,20 @@ class ConfigSpec:
                     if i >= len(new_loops):
                         break
                     if new_loops[i] is None and spec.size_hint > available:
-                        chunk = min(spec.size_hint, max(available, 1))
+                        # When other_threads consumes the entire CuTe 1024 thread
+                        # budget there is no thread budget left for the reduction
+                        # axis. A chunk of 1 is invalid (LoopedReductionStrategy
+                        # requires block_size > 1) and a persistent reduction
+                        # would hit the synthetic-lane-loop bug described above.
+                        # Reject the config so the autotuner skips it.
+                        if available < 2:
+                            raise InvalidConfig(
+                                f"cute backend: reduction axis {i} has no thread "
+                                f"budget left (non-reduction axes use "
+                                f"{other_threads} of {self.max_reduction_threads} "
+                                f"threads)."
+                            )
+                        chunk = min(spec.size_hint, available)
                         if self.max_reduction_loop is not None:
                             chunk = min(chunk, self.max_reduction_loop)
                         new_loops[i] = chunk
@@ -1462,6 +1475,17 @@ class ConfigSpec:
                     and len(self.loop_orders) > 0
                 ):
                     fields["loop_orders"] = self.loop_orders
+                # Expose ``cute_vector_widths`` per-block so the
+                # autotuner can vary V in {1, 2, 4, 8} for lane-loop
+                # vec loads (and for ``LoopedReductionStrategy`` rolled
+                # reductions).  Without this entry, ``flatten`` strips V
+                # back to the default of 1, defeating the seed
+                # heuristics that try to bias toward LDG.128 lattices.
+                if (
+                    self.supports_config_key("cute_vector_widths")
+                    and len(self.cute_vector_widths) > 0
+                ):
+                    fields["cute_vector_widths"] = self.cute_vector_widths
             if self.epilogue_subtile_autotune_choices is not None:
                 fields["epilogue_subtile"] = EnumFragment(
                     choices=self.epilogue_subtile_autotune_choices
@@ -2001,7 +2025,18 @@ class ReductionLoopSpec(_PowerOfTwoBlockIdItem):
     def _normalize(self, name: str, value: object) -> int | None:
         if value is None:
             return None
-        return super()._normalize(name, value)
+        normalized = super()._normalize(name, value)
+        # A looped reduction whose chunk equals or exceeds the reduction
+        # extent has only one iteration — it is semantically identical to a
+        # persistent reduction, but the looped codegen path occasionally
+        # produces subtly different results on the CuTe backend (e.g. when a
+        # multi-pass kernel like layer_norm reuses the loaded inputs across
+        # two reductions).  Collapsing to ``None`` here matches the
+        # ``_flat_config`` behaviour and keeps the persistent/loop choice in
+        # sync regardless of how the value was generated.
+        if isinstance(normalized, int) and normalized >= self.size_hint:
+            return None
+        return normalized
 
     def _fill_missing(self) -> None:
         return None

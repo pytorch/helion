@@ -49,7 +49,7 @@ jobs:
 
     steps:
       - name: Run NVIDIA command
-        if: startsWith(matrix.image, 'nvidia')
+        if: startsWith(matrix.image, 'nvidia') || (startsWith(matrix.image, 'pytorch') && contains(matrix.image, 'cuda'))
         run: |
           echo "Detected NVIDIA image"
           nvidia-smi || echo "nvidia-smi not found"
@@ -119,7 +119,10 @@ jobs:
 
       - name: Install PyTorch
         run: |
+          set -eux
+
           source .venv/bin/activate
+
           if [[ "${{ matrix.pytorch-version }}" == pytorch-[0-9]* ]]; then
             VERSION="${{ matrix.pytorch-version }}"
             VERSION="${VERSION#pytorch-}"
@@ -133,7 +136,9 @@ jobs:
               # Install nvidia-nvshmem-cu12 from cu129 index (missing on cu128)
               uv pip install -U --pre nvidia-nvshmem-cu12 --index-url https://download.pytorch.org/whl/nightly/cu129
             fi
-            uv pip install -U --pre torch --index-url https://download.pytorch.org/whl/nightly/${{ matrix.runtime-version }}
+            # On OSDC, route nightly through the pypi-cache /whl proxy (deps stay reachable behind the egress firewall) and clear the cache index vars so it wins over the cache default; off OSDC PYPI_CACHE_WHL_URL is unset so we hit download.pytorch.org.
+            PYTORCH_INDEX="${PYPI_CACHE_WHL_URL:-https://download.pytorch.org/whl/cpu}"
+            UV_DEFAULT_INDEX= UV_INDEX= uv pip install -U --pre torch --index-url "${PYTORCH_INDEX%/whl/*}/whl/nightly/${{ matrix.runtime-version }}"
           fi
 
       - name: Configure XPU runtime library path
@@ -172,7 +177,7 @@ jobs:
           python -c "import triton; print(f'Triton version: {triton.__version__}')"
 
       - name: Pin networkx for Python 3.14
-        if: matrix.python-version == '3.14'
+        if: startsWith(matrix.python-version, '3.14')
         run: |
           source .venv/bin/activate
           uv pip install networkx==2.8.8
@@ -193,7 +198,7 @@ jobs:
             --extra-index-url https://us-python.pkg.dev/ml-oss-artifacts-published/jax/simple/ \
             --find-links https://storage.googleapis.com/jax-releases/libtpu_releases.html \
             --pre \
-            'jax==0.10.0' 'jaxlib==0.10.0' 'libtpu==0.0.40' 'tpu-info==0.7.1' 'jaxtyping' 'frozendict' 'immutabledict'
+            'jax==0.10.1' 'jaxlib==0.10.1' 'libtpu==0.0.40' 'tpu-info==0.7.1' 'jaxtyping' 'frozendict' 'immutabledict'
           # Install Bazel
           if ! command -v bazel &> /dev/null; then
             sudo curl -L https://github.com/bazelbuild/bazelisk/releases/download/v1.27.0/bazelisk-linux-amd64 -o /usr/local/bin/bazel
@@ -240,7 +245,7 @@ jobs:
         if: matrix.alias == 'pallas-interpret'
         run: |
           source .venv/bin/activate
-          uv pip install 'jax==0.10.0' 'jaxlib==0.10.0' 'absl-py'
+          uv pip install 'jax==0.10.1' 'jaxlib==0.10.1' 'absl-py'
 
       - name: Install CUTLASS CuTe DSL
         if: matrix.backend == 'cute'
@@ -249,7 +254,7 @@ jobs:
           ./scripts/install_cute.sh
 
       - name: CUDA Compute Check
-        if: startsWith(matrix.image, 'nvidia')
+        if: startsWith(matrix.image, 'nvidia') || (startsWith(matrix.image, 'pytorch') && contains(matrix.image, 'cuda'))
         run: |
           source .venv/bin/activate
           python -c "
@@ -270,7 +275,7 @@ jobs:
           "
 
       - name: Inductor Worker Check
-        if: startsWith(matrix.image, 'nvidia')
+        if: startsWith(matrix.image, 'nvidia') || (startsWith(matrix.image, 'pytorch') && contains(matrix.image, 'cuda'))
         run: |
           source .venv/bin/activate
           python -c "

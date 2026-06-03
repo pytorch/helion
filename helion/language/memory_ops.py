@@ -331,6 +331,22 @@ def _(state: CodegenState) -> None:
         state, tensor, subscript, parts, value
     )
     idx_str = ", ".join(parts)
+    patterns = state.fx_node.meta.get("indexing_patterns") if state.fx_node else ()
+    from .._compiler.pallas.gather import emit_scatter_store
+    from .._compiler.pallas.plan_tiling import IndirectScatterPattern
+
+    scatter_patterns = [
+        pattern
+        for pattern in patterns or ()
+        if isinstance(pattern, IndirectScatterPattern)
+    ]
+    assert len(scatter_patterns) <= 1, (
+        "Pallas store expected at most one indirect scatter pattern"
+    )
+    if scatter_patterns:
+        value = emit_scatter_store(
+            state, scatter_patterns[0].plan, name, idx_str, value
+        )
     state.codegen.add_statement(
         statement_from_string(f"{name}[{idx_str}] = {{value}}", value=value)
     )
@@ -1001,6 +1017,203 @@ def _cute_register_unroll_vec_hoist(
     return f"cutlass.Uint16({hoist_var}[{vec_lane_var}]).bitcast({elem_dtype})"
 
 
+def _cute_register_tile_unroll_vec_hoist(
+    state: CodegenState,
+    strategy: object,  # BlockSizeTileStrategy (CuteNDTileStrategy)
+    block_id: int,
+    tensor: torch.Tensor,
+    tensor_name: str,
+    index_exprs: list[str],
+    vec_width: int,
+) -> str:
+    """Tile-loop variant of ``_cute_register_unroll_vec_hoist`` for
+    ``CuteNDTileStrategy`` lane loops.
+
+    Splices a single ``cute.arch.load(base_ptr, Uint16x V)`` into the
+    outer-lane body (above the constexpr V-loop) and returns the
+    per-element bitcast expression ``hoist_var[vi].bitcast(dtype)`` so
+    the existing scalar pipeline keeps working.
+    """
+    elem_dtype = _CUTE_VECTOR_UNROLL_DTYPES[tensor.dtype]
+    base_var_by_block = getattr(strategy, "_cute_lane_base_index_var_by_block", {})
+    lane_body_by_block = getattr(strategy, "_cute_lane_body_by_block", {})
+    vec_lane_var_by_block = getattr(strategy, "_cute_vec_lane_var_by_block", {})
+    base_index_var = base_var_by_block.get(block_id)
+    lane_body = lane_body_by_block.get(block_id)
+    vec_lane_var = vec_lane_var_by_block.get(block_id)
+    assert isinstance(base_index_var, str)
+    assert isinstance(lane_body, list)
+    assert isinstance(vec_lane_var, str)
+    # The inner reduction-axis index_expr is the last entry; swap it
+    # with the per-lane base so the vec load points at the start of the
+    # V-wide chunk this thread owns.
+    base_exprs = list(index_exprs)
+    base_exprs[-1] = base_index_var
+    base_ptr_expr = _cute_scalar_pointer_expr(tensor_name, base_exprs)
+    cache_key = (tensor_name, base_ptr_expr)
+    cache_by_block = getattr(strategy, "_cute_lane_vec_loads_by_block", None)
+    if cache_by_block is None:
+        cache_by_block = {}
+        # pyrefly: ignore [missing-attribute]
+        strategy._cute_lane_vec_loads_by_block = cache_by_block
+    cache = cache_by_block.setdefault(block_id, {})
+    if cache_key not in cache:
+        hoist_var = state.device_function.new_var(
+            f"_tile_unroll_vec_{block_id}_{len(cache)}", dce=False
+        )
+        cache[cache_key] = (hoist_var, tensor.dtype)
+        # Guard the LDG against per-thread OOB: on the very last grid
+        # block + tail outer-tile iter, a thread whose vec base equals
+        # ``numel`` would otherwise read past the end of the underlying
+        # allocation (the next row doesn't exist for the last grid
+        # block).  Use an "anchor pointer" fallback for the unsafe
+        # threads: it points inside the tensor (specifically at the
+        # per-thread base of the FIRST outer-tile iter, which is the
+        # ``base_ptr_expr`` with the outer-lane index folded to 0).  The
+        # fetched bytes are then ignored downstream by the per-lane
+        # mask gate that wraps the bitcast result.
+        env_local = CompileEnvironment.current()
+        numel = env_local.block_sizes[block_id].numel
+        numel_expr = state.sympy_expr(numel)
+        # Build the "anchor" pointer: same index_exprs but with the
+        # inner reduction-axis index forced to 0.  This is the
+        # ``tile_offset == 0, lane_var == 0, vec_lane_var == 0`` base
+        # for the very first outer-tile iter, which is always in-bounds
+        # for any grid block.
+        anchor_exprs = list(index_exprs)
+        anchor_exprs[-1] = "0"
+        anchor_ptr_expr = _cute_scalar_pointer_expr(tensor_name, anchor_exprs)
+        guarded_ptr = (
+            f"({base_ptr_expr} if {base_index_var} < {numel_expr} "
+            f"else {anchor_ptr_expr})"
+        )
+        hoist_stmt = statement_from_string(
+            f"{hoist_var} = cute.arch.load({guarded_ptr}, "
+            f"ir.VectorType.get([{vec_width}], cutlass.Uint16.mlir_type))"
+        )
+        # Insert the hoist just BEFORE the constexpr V-loop (the last
+        # entry in lane_body).
+        lane_body.insert(len(lane_body) - 1, hoist_stmt)
+    else:
+        hoist_var, _ = cache[cache_key]
+    return f"cutlass.Uint16({hoist_var}[{vec_lane_var}]).bitcast({elem_dtype})"
+
+
+def _cute_register_tile_unroll_vec_hoist_split2(
+    state: CodegenState,
+    strategy: object,  # BlockSizeTileStrategy (CuteNDTileStrategy)
+    block_id: int,
+    tensor: torch.Tensor,
+    tensor_name: str,
+    index_exprs: list[str],
+    vec_width: int,
+) -> str:
+    """Split-2 variant of ``_cute_register_tile_unroll_vec_hoist`` for V=8
+    on fp16/bf16.
+
+    The CuTe DSL's ``nvvm.load.ext`` ICEs at V=8 for these dtypes, so the
+    full 16-byte LDG.128 is decomposed into TWO back-to-back V=4 loads
+    (lanes 0-3 and 4-7).  The SASS scheduler is free to overlap the two
+    LDGs, so the per-thread bytes-per-load grows from 8 (V=4) to the
+    full 16 (effective V=8) without invoking the DSL bug.
+
+    Returns a per-vec-lane expression of the form::
+
+        (
+            cutlass.Uint16(_tile_unroll_vec_ < n > _ < m > _a[vi]).bitcast(dtype)
+            if vi < 4
+            else cutlass.Uint16(_tile_unroll_vec_ < n > _ < m > _b[vi - 4]).bitcast(
+                dtype
+            )
+        )
+
+    Because ``vec_lane_var`` is the target of a ``cutlass.range_constexpr(8)``
+    loop, it is a Python-int constant at each unrolled iter, so the
+    ``if vi < 4`` branch folds away at trace time and the emitted SASS
+    contains only the active load's extract.
+    """
+    assert vec_width == 8, (
+        "tile_unroll_split2 expects V=8 (4+4); other widths use tile_unroll"
+    )
+    half = vec_width // 2
+    elem_dtype = _CUTE_VECTOR_UNROLL_DTYPES[tensor.dtype]
+    base_var_by_block = getattr(strategy, "_cute_lane_base_index_var_by_block", {})
+    lane_body_by_block = getattr(strategy, "_cute_lane_body_by_block", {})
+    vec_lane_var_by_block = getattr(strategy, "_cute_vec_lane_var_by_block", {})
+    base_index_var = base_var_by_block.get(block_id)
+    lane_body = lane_body_by_block.get(block_id)
+    vec_lane_var = vec_lane_var_by_block.get(block_id)
+    assert isinstance(base_index_var, str)
+    assert isinstance(lane_body, list)
+    assert isinstance(vec_lane_var, str)
+    base_exprs = list(index_exprs)
+    base_exprs[-1] = base_index_var
+    base_ptr_expr_a = _cute_scalar_pointer_expr(tensor_name, base_exprs)
+    # The second-half pointer points 4 elements past the first.  Build
+    # it by substituting ``base_index_var + half`` for the inner index.
+    base_exprs_b = list(index_exprs)
+    base_exprs_b[-1] = f"({base_index_var} + {half})"
+    base_ptr_expr_b = _cute_scalar_pointer_expr(tensor_name, base_exprs_b)
+    cache_key = (tensor_name, base_ptr_expr_a, "split2")
+    cache_by_block = getattr(strategy, "_cute_lane_vec_loads_by_block", None)
+    if cache_by_block is None:
+        cache_by_block = {}
+        # pyrefly: ignore [missing-attribute]
+        strategy._cute_lane_vec_loads_by_block = cache_by_block
+    cache = cache_by_block.setdefault(block_id, {})
+    if cache_key not in cache:
+        slot = len(cache)
+        hoist_var_a = state.device_function.new_var(
+            f"_tile_unroll_vec_{block_id}_{slot}_a", dce=False
+        )
+        hoist_var_b = state.device_function.new_var(
+            f"_tile_unroll_vec_{block_id}_{slot}_b", dce=False
+        )
+        # Stash both names plus the split marker so this entry doesn't
+        # collide with the V=4 cache_key shape.  Downstream readers
+        # don't introspect this tuple — it's just a sentinel.
+        cache[cache_key] = ((hoist_var_a, hoist_var_b), tensor.dtype)
+        env_local = CompileEnvironment.current()
+        numel = env_local.block_sizes[block_id].numel
+        numel_expr = state.sympy_expr(numel)
+        anchor_exprs = list(index_exprs)
+        anchor_exprs[-1] = "0"
+        anchor_ptr_expr = _cute_scalar_pointer_expr(tensor_name, anchor_exprs)
+        # The first-half OOB guard checks the same V-aligned base used by
+        # the V=4 path; the second-half pointer is ``base + 4`` and only
+        # needs guarding when ``base + 4 < numel``.  Reuse the same
+        # anchor pointer for both halves' fallbacks (the per-element
+        # mask gate downstream drops any anchor-fetched bytes anyway).
+        guarded_ptr_a = (
+            f"({base_ptr_expr_a} if {base_index_var} < {numel_expr} "
+            f"else {anchor_ptr_expr})"
+        )
+        guarded_ptr_b = (
+            f"({base_ptr_expr_b} if ({base_index_var} + {half}) < {numel_expr} "
+            f"else {anchor_ptr_expr})"
+        )
+        hoist_stmt_a = statement_from_string(
+            f"{hoist_var_a} = cute.arch.load({guarded_ptr_a}, "
+            f"ir.VectorType.get([{half}], cutlass.Uint16.mlir_type))"
+        )
+        hoist_stmt_b = statement_from_string(
+            f"{hoist_var_b} = cute.arch.load({guarded_ptr_b}, "
+            f"ir.VectorType.get([{half}], cutlass.Uint16.mlir_type))"
+        )
+        # Insert both hoists just BEFORE the constexpr V-loop (the last
+        # entry in lane_body).  Emit them back-to-back so the SASS
+        # scheduler can issue the two LDGs together.
+        lane_body.insert(len(lane_body) - 1, hoist_stmt_a)
+        lane_body.insert(len(lane_body) - 1, hoist_stmt_b)
+    else:
+        (hoist_var_a, hoist_var_b), _ = cache[cache_key]
+    return (
+        f"(cutlass.Uint16({hoist_var_a}[{vec_lane_var}]).bitcast({elem_dtype}) "
+        f"if {vec_lane_var} < {half} "
+        f"else cutlass.Uint16({hoist_var_b}[{vec_lane_var} - {half}]).bitcast({elem_dtype}))"
+    )
+
+
 def _cute_vector_load_ctx(
     state: CodegenState,
     tensor: torch.Tensor,
@@ -1126,38 +1339,94 @@ def _cute_vector_load_ctx(
     if not loops:
         return None
     strategy = getattr(loops[-1], "strategy", None)
-    if not isinstance(strategy, LoopedReductionStrategy):
-        return None
-    vec_width = getattr(strategy, "_cute_reduction_vec_width", 1)
-    if vec_width <= 1:
-        return None
-    if strategy._mask_var is not None:
-        return None
-    if strategy._cute_reduction_lane_extent <= 0:
-        return None
-    mode = getattr(strategy, "_cute_reduction_vec_mode", "vec")
-    if mode == "vec":
-        if not feeds_reduction:
+    if isinstance(strategy, LoopedReductionStrategy):
+        vec_width = getattr(strategy, "_cute_reduction_vec_width", 1)
+        if vec_width <= 1:
             return None
-        if tensor.dtype not in _CUTE_VECTOR_DTYPES:
+        if strategy._mask_var is not None:
             return None
-        return vec_width, inner_block_id, "vec"
-    if mode == "unroll":
+        if strategy._cute_reduction_lane_extent <= 0:
+            return None
+        mode = getattr(strategy, "_cute_reduction_vec_mode", "vec")
+        if mode == "vec":
+            if not feeds_reduction:
+                return None
+            if tensor.dtype not in _CUTE_VECTOR_DTYPES:
+                return None
+            return vec_width, inner_block_id, "vec"
+        if mode == "unroll":
+            if tensor.dtype not in _CUTE_VECTOR_UNROLL_DTYPES:
+                return None
+            # The CuTe DSL's ``nvvm.load.ext`` only supports vec sizes 2
+            # and 4 for bf16/fp16 (V=8 raises ICE).  Cap effective V
+            # here so the autotuner's V=8 seed still compiles instead
+            # of crashing.
+            if vec_width > 4:
+                return None
+            # Need a lane base index var + a constexpr V-loop var; both
+            # are set up by the strategy's codegen_device_loop.
+            if (
+                getattr(strategy, "_cute_lane_base_index_var", None) is None
+                or getattr(strategy, "_cute_lane_body", None) is None
+            ):
+                return None
+            return vec_width, inner_block_id, "unroll"
+        return None
+    # CuTe N-D tile strategy with lane loops: vec is set up per-block in
+    # ``CuteNDTileStrategy.__init__`` when the autotuner picks
+    # ``cute_vector_widths[block_id]`` > 1 and EPT is divisible by V.  Mode
+    # is forced to ``"unroll"`` (per-element bitcast) for fp16/bf16 since
+    # subscripting a bf16/fp16 vector in the CuTe DSL is unsafe; fp32
+    # could in principle use ``"vec"`` but the per-element pipeline runs
+    # most of the consume-sweep code after a cast, so unroll is the
+    # robust choice.
+    from .._compiler.tile_strategy import BlockSizeTileStrategy
+
+    if isinstance(strategy, BlockSizeTileStrategy):
+        vec_by_block = getattr(strategy, "_cute_lane_vec_width_by_block", None)
+        if not isinstance(vec_by_block, dict):
+            return None
+        vec_width = vec_by_block.get(inner_block_id, 1)
+        if vec_width <= 1:
+            return None
         if tensor.dtype not in _CUTE_VECTOR_UNROLL_DTYPES:
             return None
-        # The CuTe DSL's ``nvvm.load.ext`` only supports vec sizes 2 and 4
-        # for bf16/fp16 (V=8 raises ICE).  Cap effective V here so the
-        # autotuner's V=8 seed still compiles instead of crashing.
-        if vec_width > 4:
+        # The CuTe DSL's ``nvvm.load.ext`` ICEs at V=8 for fp16/bf16, so
+        # widths > 4 cannot use a single ``cute.arch.load``.  V=8 still
+        # gets full LDG.128 throughput via the ``tile_unroll_split2``
+        # mode: two back-to-back ``cute.arch.load(..., V=4)`` calls
+        # (covering vec lanes 0-3 and 4-7) emit as two LDG.64s that the
+        # SASS scheduler can overlap.  Wider Vs (16, 32, ...) are not
+        # supported.
+        if vec_width > 8:
             return None
-        # Need a lane base index var + a constexpr V-loop var; both are
-        # set up by the strategy's codegen_device_loop.
+        if vec_width == 8 and vec_width % 4 != 0:
+            return None
+        base_var_by_block = getattr(
+            strategy, "_cute_lane_base_index_var_by_block", None
+        )
+        lane_body_by_block = getattr(strategy, "_cute_lane_body_by_block", None)
+        vec_lane_var_by_block = getattr(strategy, "_cute_vec_lane_var_by_block", None)
         if (
-            getattr(strategy, "_cute_lane_base_index_var", None) is None
-            or getattr(strategy, "_cute_lane_body", None) is None
+            not isinstance(base_var_by_block, dict)
+            or not isinstance(lane_body_by_block, dict)
+            or not isinstance(vec_lane_var_by_block, dict)
+            or inner_block_id not in base_var_by_block
+            or inner_block_id not in lane_body_by_block
+            or inner_block_id not in vec_lane_var_by_block
         ):
             return None
-        return vec_width, inner_block_id, "unroll"
+        # When the per-thread vec base could straddle the tensor edge
+        # (e.g. ``numel`` not a multiple of V), the masked-tail iter
+        # could load garbage in some lanes.  Gate the per-element mask
+        # path correctly by requiring ``numel % V == 0`` so partial-vec
+        # straddles are impossible.
+        numel = env.block_sizes[inner_block_id].numel
+        if not env.known_multiple(numel, vec_width):
+            return None
+        if vec_width == 8:
+            return vec_width, inner_block_id, "tile_unroll_split2"
+        return vec_width, inner_block_id, "tile_unroll"
     return None
 
 
@@ -1980,8 +2249,66 @@ def _codegen_cute_store_tcgen05_tile(
                 "cute",
                 "tcgen05 pure role-lifecycle supports only identity pure-matmul stores",
             )
+    # When one matmul accumulator fans out to multiple output stores (e.g.
+    # aux = pre-activation and out = gelu(pre)), the per-matmul TMA-store
+    # atom/tensor kernel-arg names allocated in cute_mma are shared by every
+    # store site. Emitting them verbatim at each site produces duplicate kernel
+    # parameters (SyntaxError) and binds both device epilogues to the same TMA
+    # descriptor. The secondary store gets fresh per-store descriptor names so
+    # each store threads its own TMA descriptor; the first store keeps the
+    # original names. The secondary store also reuses the accumulator the first
+    # store already consumed: the accumulator TMEM stays live until the
+    # one-shot teardown frees it, so the secondary store reads it directly
+    # without re-running the accumulator pipeline's consumer wait/release/advance
+    # (those would hang waiting on a producer that has already drained) and
+    # without re-emitting the matmul drain / TMEM-free teardown.
+    is_secondary_store = (
+        tcgen05_value.use_tma_store_epilogue
+        and not tcgen05_value.pure_matmul_role_lifecycle
+        and df.cute_state.tcgen05_tma_store_names_already_emitted(tcgen05_value)
+    )
+    if is_secondary_store:
+        tcgen05_value = dataclasses.replace(
+            tcgen05_value,
+            tma_store_atom=df.new_var("tcgen05_tma_store_atom"),
+            tma_store_tensor=df.new_var("tcgen05_tma_store_tensor"),
+        )
     tcgen05_lifecycle = tcgen05_value.lifecycle_context
     tcgen05_pure_matmul_object = tcgen05_value.pure_matmul_object
+
+    # Snapshot the accumulator consumer-state stage index. The primary store
+    # captures it before advancing the consumer state; fan-out stores read the
+    # same live TMEM stage through the snapshot rather than the already-advanced
+    # live index. For single-store kernels the assignment is unused and DCE
+    # drops it, so the generated code is unchanged.
+    tcgen05_acc_stage_index_var, tcgen05_acc_stage_index_is_primary = (
+        df.cute_state.get_or_create_tcgen05_acc_stage_index_var(
+            tcgen05_lifecycle.acc_consumer_state,
+            df.new_var,
+        )
+    )
+    # The snapshot is captured at top level (before the store's control-flow
+    # block) by the primary store so fan-out stores can read it; CuTe DSL
+    # forbids defining a value inside one control-flow block and reading it in
+    # another. For single-store kernels the assignment is unused and DCE drops
+    # it, keeping generated code unchanged.
+    tcgen05_acc_stage_index_top_level_stmts = (
+        [
+            statement_from_string(
+                f"{tcgen05_acc_stage_index_var} = "
+                f"{tcgen05_lifecycle.acc_consumer_state}.index"
+            )
+        ]
+        if tcgen05_acc_stage_index_is_primary
+        else []
+    )
+    # The primary store keeps reading the live consumer index so single-store
+    # codegen is byte-identical; only fan-out stores route through the snapshot.
+    tcgen05_acc_stage_index_expr = (
+        f"{tcgen05_lifecycle.acc_consumer_state}.index"
+        if not is_secondary_store
+        else tcgen05_acc_stage_index_var
+    )
 
     # Backstop for callers that bypass Config.normalize() validation;
     # see _tcgen05_epi_warp_count docstring and cute_plan.md.
@@ -2560,24 +2887,31 @@ def _codegen_cute_store_tcgen05_tile(
                 source_for_local_tile = rec.aux_view2d
                 aux_tile_is_local = True
             else:
-                # Rank-1 trailing-axis (rowvec) broadcast aux: build a
-                # 2-D logical view of the rank-1 underlying tensor with
+                # M-axis (row) broadcast aux: build a 2-D logical view
+                # over the underlying tensor's ``.iterator`` with
                 # stride 0 on the leading (M) axis and stride 1 on the
                 # trailing (N) axis. Stride 0 on M causes every lane
                 # "owning" output ``(m, n)`` to read the same source
-                # element regardless of m, which is the rowvec
-                # broadcast semantic that matches PyTorch's
-                # ``acc + bias[tile_n]`` (rank-1 RHS aligns to the
-                # trailing axis). The view feeds the same
-                # ``partition_C → flat_divide → partition_D`` pipeline
-                # used by exact-shape aux. Mirrors Quack's
-                # ``RowVecLoad`` epilogue (``quack/quack/epi_ops.py``).
-                # Only the trailing axis (``broadcast_axis == 1``)
-                # form is accepted at classify time — see
-                # ``aux_tensor_load_kind`` /
-                # ``_AuxiliaryTensorStep.broadcast_axis`` for the
-                # rejection of the leading-axis form.
-                assert rec.broadcast_axis == 1
+                # element regardless of m, which is the broadcast
+                # semantic shared by two accepted forms:
+                #   * ``broadcast_axis == 1`` — a bare rank-1 tensor
+                #     ``bias[tile_n]`` with shape ``(N,)`` (rank-1 RHS
+                #     aligns to the trailing axis under PyTorch
+                #     broadcasting).
+                #   * ``broadcast_axis == 0`` — an explicit ``(1, N)``
+                #     tensor ``bias[tile_m, tile_n]`` (row 0 broadcasts
+                #     over M).
+                # Both have the same contiguous N-major memory layout
+                # (element ``(0, n)`` at offset ``n``), so the
+                # stride-(0, 1) view over ``.iterator`` is identical
+                # and feeds the same ``partition_C → flat_divide →
+                # partition_D`` pipeline used by exact-shape aux.
+                # Mirrors Quack's ``RowVecLoad`` epilogue
+                # (``quack/quack/epi_ops.py``). The classifier
+                # (``aux_tensor_load_kind``) admits only these two
+                # broadcast shapes; everything else drops to the
+                # loud-failure backstop.
+                assert rec.broadcast_axis in (0, 1)
                 assert rec.aux_view2d is not None
                 lines.append(
                     f"{rec.aux_view2d} = cute.make_tensor("
@@ -3221,11 +3555,17 @@ def _codegen_cute_store_tcgen05_tile(
         f"{ttr_gc} = {thr_copy_t2r}.partition_D({tcgc_epi})",
         (
             f"{ttr_tacc_stage} = {ttr_tacc_base}["
-            f"(None, None, None, None, None, {tcgen05_lifecycle.acc_consumer_state}.index)]"
+            f"(None, None, None, None, None, {tcgen05_acc_stage_index_expr})]"
         ),
-        (
-            f"if {tcgen05_lifecycle.epi_active}:\n"
-            f"    {tcgen05_lifecycle.acc_pipeline}.consumer_wait({tcgen05_lifecycle.acc_consumer_state})"
+        *(
+            []
+            if is_secondary_store
+            else [
+                (
+                    f"if {tcgen05_lifecycle.epi_active}:\n"
+                    f"    {tcgen05_lifecycle.acc_pipeline}.consumer_wait({tcgen05_lifecycle.acc_consumer_state})"
+                )
+            ]
         ),
         f"{ttr_tacc} = cute.group_modes({ttr_tacc_stage}, 3, cute.rank({ttr_tacc_stage}))",
         f"{ttr_gc_grouped} = cute.group_modes({ttr_gc}, 3, cute.rank({ttr_gc}))",
@@ -3284,21 +3624,38 @@ def _codegen_cute_store_tcgen05_tile(
             f"{simt_acc_vec_prelude}"
             f"        {acc_vec} = {simt_acc_vec_rhs}\n"
             f"        {ttr_rd}.store({acc_vec})\n"
-            f"        if _tcgen05_subtile == {subtile_count} - 1:\n"
-            # `cute.copy(t2r, ...)` issues async TMEM->reg loads. Releasing
-            # the acc consumer slot lets the MMA producer re-acquire the TMEM
-            # stage and issue UMMAs that overwrite TMEM, so we must fence the
-            # in-flight async TMEM loads first to avoid a race on the last
-            # subtile's `ttr_racc` / `ttr_rd` data. This matches Quack's
-            # sm100 gemm fence-before-release pattern.
-            f"            cute.arch.fence_view_async_tmem_load()\n"
-            f"            with cute.arch.elect_one():\n"
-            f"                {tcgen05_lifecycle.acc_pipeline}.consumer_release({tcgen05_lifecycle.acc_consumer_state})\n"
-            f"{simt_store_copy_source}"
+            # The secondary fan-out store reuses the still-live accumulator and
+            # must not release it; the primary store owns the release + advance.
+            + (
+                ""
+                if is_secondary_store
+                else (
+                    f"        if _tcgen05_subtile == {subtile_count} - 1:\n"
+                    # `cute.copy(t2r, ...)` issues async TMEM->reg loads.
+                    # Releasing the acc consumer slot lets the MMA producer
+                    # re-acquire the TMEM stage and issue UMMAs that overwrite
+                    # TMEM, so we must fence the in-flight async TMEM loads
+                    # first to avoid a race on the last subtile's `ttr_racc` /
+                    # `ttr_rd` data. This matches Quack's sm100 gemm
+                    # fence-before-release pattern.
+                    f"            cute.arch.fence_view_async_tmem_load()\n"
+                    f"            with cute.arch.elect_one():\n"
+                    f"                {tcgen05_lifecycle.acc_pipeline}.consumer_release({tcgen05_lifecycle.acc_consumer_state})\n"
+                )
+            )
+            + f"{simt_store_copy_source}"
             # Advance is a per-thread local state update, so it intentionally
             # stays outside elect_one; only the mbarrier release is elected.
-            f"if {tcgen05_lifecycle.epi_active}:\n"
-            + emit_pipeline_advance(tcgen05_lifecycle.acc_consumer_state, indent="    ")
+            + (
+                ""
+                if is_secondary_store
+                else (
+                    f"if {tcgen05_lifecycle.epi_active}:\n"
+                    + emit_pipeline_advance(
+                        tcgen05_lifecycle.acc_consumer_state, indent="    "
+                    )
+                )
+            )
         ),
     ]
     tma_store_pipeline_setup = [
@@ -3515,12 +3872,12 @@ def _codegen_cute_store_tcgen05_tile(
                 f"    {tcgen05_lifecycle.acc_pipeline}.consumer_wait({tcgen05_lifecycle.acc_consumer_state})"
             )
         ]
-        if diagnose_acc_wait_before_subtile_loop
+        if diagnose_acc_wait_before_subtile_loop and not is_secondary_store
         else []
     )
     tma_store_loop_acc_wait = (
         ""
-        if diagnose_acc_wait_before_subtile_loop
+        if diagnose_acc_wait_before_subtile_loop or is_secondary_store
         else (
             f"        if _tcgen05_subtile == 0:\n"
             f"            {tcgen05_lifecycle.acc_pipeline}.consumer_wait({tcgen05_lifecycle.acc_consumer_state})\n"
@@ -3583,6 +3940,20 @@ def _codegen_cute_store_tcgen05_tile(
             "        ",
             safe_direct_aux_with_full_tile=partial_tma_needs_full_tile_guard,
         )
+        # The secondary fan-out store reuses the still-live accumulator TMEM and
+        # must not release it: the primary store already owns the accumulator
+        # pipeline consumer release, and the one-shot teardown frees the TMEM
+        # after every store has read it.
+        acc_release = (
+            ""
+            if is_secondary_store
+            else (
+                f"        if _tcgen05_subtile == {subtile_count} - 1:\n"
+                f"            cute.arch.fence_view_async_tmem_load()\n"
+                f"            with cute.arch.elect_one():\n"
+                f"                {tcgen05_acc_pipeline}.consumer_release({tcgen05_acc_consumer_state})\n"
+            )
+        )
         return (
             f"{acc_wait}"
             f"        {ttr_tacc_mn} = {ttr_tacc}[(None, None, None, cutlass.Int32(_tcgen05_subtile))]\n"
@@ -3590,10 +3961,7 @@ def _codegen_cute_store_tcgen05_tile(
             f"{early_aux_prelude}"
             f"{late_prelude}"
             f"        {acc_vec} = {rhs}\n"
-            f"        if _tcgen05_subtile == {subtile_count} - 1:\n"
-            f"            cute.arch.fence_view_async_tmem_load()\n"
-            f"            with cute.arch.elect_one():\n"
-            f"                {tcgen05_acc_pipeline}.consumer_release({tcgen05_acc_consumer_state})\n"
+            f"{acc_release}"
             f"        {store_target}.store({acc_vec})\n"
         )
 
@@ -4082,7 +4450,7 @@ def _codegen_cute_store_tcgen05_tile(
         f"{bsg_gd} = cute.group_modes({bsg_gd}, 1, cute.rank({bsg_gd}))",
         (
             f"{ttr_tacc_stage} = {ttr_tacc_base}["
-            f"(None, None, None, None, None, {tcgen05_lifecycle.acc_consumer_state}.index)]"
+            f"(None, None, None, None, None, {tcgen05_acc_stage_index_expr})]"
         ),
         f"{ttr_tacc} = cute.group_modes({ttr_tacc_stage}, 3, cute.rank({ttr_tacc_stage}))",
         f"{subtile_count} = cutlass.const_expr(cute.size({ttr_tacc}.shape, mode=[3]))",
@@ -4146,11 +4514,17 @@ def _codegen_cute_store_tcgen05_tile(
             )
         )
     else:
+        # The secondary fan-out store does not own the accumulator consumer
+        # state, so it must not advance it (the primary store advances once).
         tma_store_acc_advance = (
-            f"if {tcgen05_lifecycle.epi_active}:\n"
-            + emit_pipeline_advance(
-                tcgen05_lifecycle.acc_consumer_state,
-                indent="    ",
+            ""
+            if is_secondary_store
+            else (
+                f"if {tcgen05_lifecycle.epi_active}:\n"
+                + emit_pipeline_advance(
+                    tcgen05_lifecycle.acc_consumer_state,
+                    indent="    ",
+                )
             )
         )
         tma_store_body_core = [
@@ -4251,6 +4625,7 @@ def _codegen_cute_store_tcgen05_tile(
                 tma_store_role_invariant_stmts
             )
             main_stmts = [
+                *tcgen05_acc_stage_index_top_level_stmts,
                 *tma_store_hoisted_stmts,
                 *tma_store_role_invariant_stmts,
                 sync_before_stmt,
@@ -4269,6 +4644,7 @@ def _codegen_cute_store_tcgen05_tile(
             )
             df.cute_state.register_tcgen05_epi_role_stmts([main_stmt])
             main_stmts = [
+                *tcgen05_acc_stage_index_top_level_stmts,
                 *tma_store_hoisted_stmts,
                 sync_before_stmt,
                 main_stmt,
@@ -4283,7 +4659,7 @@ def _codegen_cute_store_tcgen05_tile(
         main_stmt = statement_from_string(
             "if True:\n" + textwrap.indent("\n".join(store_body), "    ")
         )
-        main_stmts = [main_stmt]
+        main_stmts = [*tcgen05_acc_stage_index_top_level_stmts, main_stmt]
     # Pipeline drain + TMEM dealloc are one-shot cleanup. They must run
     # AFTER all tiles have been processed (in the persistent path) and
     # naturally land at the end of the kernel in the non-persistent path.
@@ -4296,7 +4672,11 @@ def _codegen_cute_store_tcgen05_tile(
         # serialize the next tile's epilogue against this tile's TMA stores.
         # The tail must run before TMEM dealloc setup below.
         tma_store_post_loop_tail = tma_store_pipeline_tail
-    if tcgen05_pure_matmul_object is not None:
+    if is_secondary_store:
+        # The matmul drain + TMEM-free teardown is one-shot and owned by the
+        # primary store; the secondary fan-out store emits only its store body.
+        post_loop_stmts = []
+    elif tcgen05_pure_matmul_object is not None:
         post_loop_stmts = tcgen05_pure_matmul_object.emit_store_post_loop_stmts(
             df.cute_state,
             candidate_names,
@@ -5308,6 +5688,45 @@ def _(state: CodegenState) -> ast.AST:
     raise exc.BackendUnsupported("metal", f"load tensor type: {type(tensor)}")
 
 
+def _cute_load_feeds_sort_or_scan(load_node: object) -> bool:
+    """Return True if ``load_node`` feeds a sort/topk/_associative_scan.
+
+    Direct users (sort/topk and the scalar ``_associative_scan`` path) are
+    matched immediately.  For a tuple ``_associative_scan`` the index stream is
+    typically a ``load`` that flows through a chain of dtype-cast / shape ops
+    (e.g. ``indices[tile].float().unsqueeze(1).expand_as(vals)``) before
+    reaching the scan.  To recover a scalar load for that stream we follow the
+    forward chain through those pass-through ops.
+    """
+    from torch.fx.node import Node
+
+    from .._compiler.cute.indexing import is_cute_shape_chain_target
+
+    if not isinstance(load_node, Node):
+        return False
+
+    passthrough_targets = (torch.ops.prims.convert_element_type.default,)
+    seen: set[Node] = set()
+    stack: list[Node] = [load_node]
+    while stack:
+        node = stack.pop()
+        for user in node.users:
+            if not isinstance(user, Node):
+                continue
+            target = user.target
+            if (
+                target in (torch.ops.aten.sort.default, torch.ops.aten.topk.default)
+                or getattr(target, "__name__", None) == "_associative_scan"
+            ):
+                return True
+            if (
+                is_cute_shape_chain_target(target) or target in passthrough_targets
+            ) and user not in seen:
+                seen.add(user)
+                stack.append(user)
+    return False
+
+
 @_decorators.codegen(load, "cute")
 def _(state: CodegenState) -> object:
     tensor = state.proxy_arg(0)
@@ -5445,8 +5864,7 @@ def _(state: CodegenState) -> object:
                 if mask_expr is not None:
                     strategy._cute_pending_vec_masks.append(mask_expr)
             mask_expr = None
-        else:
-            assert vec_mode == "unroll"
+        elif vec_mode == "unroll":
             # Register (or reuse) a hoisted U16 vec load for this (tensor,
             # base_index) pair, then return ``hoist_var[vi].bitcast(dtype)``
             # so the existing scalar pipeline sees a scalar of the original
@@ -5460,6 +5878,39 @@ def _(state: CodegenState) -> object:
                 index_exprs,
                 vec_width,
             )
+        elif vec_mode == "tile_unroll":
+            # Same hoist protocol as ``LoopedReductionStrategy``'s
+            # ``unroll`` mode but for ``CuteNDTileStrategy`` lane loops.
+            from .._compiler.tile_strategy import BlockSizeTileStrategy
+
+            assert isinstance(strategy, BlockSizeTileStrategy)
+            load_expr = _cute_register_tile_unroll_vec_hoist(
+                state,
+                strategy,
+                vec_block_id,
+                tensor,
+                tensor_name,
+                index_exprs,
+                vec_width,
+            )
+        else:
+            assert vec_mode == "tile_unroll_split2"
+            # V=8 fp16/bf16: emit two back-to-back ``cute.arch.load(...,
+            # V=4)`` calls (lanes 0-3 and 4-7).  Works around the CuTe
+            # DSL's ``nvvm.load.ext`` ICE on V=8 while still issuing the
+            # full LDG.128 of bytes-per-thread-per-outer-iter.
+            from .._compiler.tile_strategy import BlockSizeTileStrategy
+
+            assert isinstance(strategy, BlockSizeTileStrategy)
+            load_expr = _cute_register_tile_unroll_vec_hoist_split2(
+                state,
+                strategy,
+                vec_block_id,
+                tensor,
+                tensor_name,
+                index_exprs,
+                vec_width,
+            )
     else:
         load_expr = _cute_scalar_load_expr(tensor_name, index_exprs, tensor.dtype)
     if tensor.dtype is torch.bool:
@@ -5467,11 +5918,7 @@ def _(state: CodegenState) -> object:
         if mask_expr is None:
             return expr_from_string(load_expr)
         return expr_from_string(f"({load_expr} if {mask_expr} else cutlass.Boolean(0))")
-    if state.fx_node is not None and any(
-        user.target in (torch.ops.aten.sort.default, torch.ops.aten.topk.default)
-        or getattr(user.target, "__name__", None) == "_associative_scan"
-        for user in state.fx_node.users
-    ):
+    if state.fx_node is not None and _cute_load_feeds_sort_or_scan(state.fx_node):
         from .._compiler.cute.indexing import CuteSortableLoad
 
         tensor_dim = 0

@@ -71,6 +71,19 @@ def _maybe_cudagraph_replay(
         return fn
 
 
+def _get_tpu_tensors(result: object) -> list[torch.Tensor]:
+    """Extract TPU tensors from a result that may be a tensor, tuple, or list."""
+    if isinstance(result, torch.Tensor) and result.device.type == "tpu":
+        return [result]
+    if isinstance(result, (tuple, list)):
+        tensors = []
+        for v in result:
+            if isinstance(v, torch.Tensor) and v.device.type == "tpu":
+                tensors.append(v)
+        return tensors
+    return []
+
+
 def synchronize_device(result: object = None) -> None:
     """Wait for device computation to complete.
 
@@ -79,13 +92,14 @@ def synchronize_device(result: object = None) -> None:
     does not reliably wait on ``torch_tpu``).  For all other cases, falls
     back to ``torch.accelerator.synchronize()``.
     """
-    if isinstance(result, torch.Tensor) and result.device.type == "tpu":
+    tpu_tensors = _get_tpu_tensors(result)
+    if tpu_tensors:
         try:
             from torch_tpu._internal.sync import (  # pyrefly: ignore[missing-import]
                 synchronize as tpu_sync,
             )
 
-            tpu_sync(result, wait=True)
+            tpu_sync(tpu_tensors, wait=True)
             return
         except ImportError:
             raise ImportError(
