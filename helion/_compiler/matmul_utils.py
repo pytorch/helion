@@ -291,6 +291,17 @@ def emit_tl_dot_with_padding(
 
     m, k, n = lhs_shape_list[-2], lhs_shape_list[-1], rhs_shape_list[-1]
     common_dtype = torch.promote_types(lhs_dtype, rhs_dtype)
+    # FP8 inputs run on native fp8 tensor cores; forcing input_precision='tf32'
+    # (the default) routes them through slow tf32 emulation and, on Blackwell,
+    # blocks the warp-specialized tcgen05/TMEM accumulator path. Omit it for fp8.
+    _fp8_dtypes = (
+        torch.float8_e4m3fn,
+        torch.float8_e5m2,
+        torch.float8_e4m3fnuz,
+        torch.float8_e5m2fnuz,
+    )
+    if lhs_dtype in _fp8_dtypes or rhs_dtype in _fp8_dtypes:
+        input_precision = None
     lhs_cast, rhs_cast = cast_ast(lhs, common_dtype), cast_ast(rhs, common_dtype)
     m, n, k = (_resolve_dim_size(d) for d in (m, n, k))
 
