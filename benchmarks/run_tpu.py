@@ -147,6 +147,16 @@ def _welford_shapes(num_shapes: int | None = None) -> list[tuple[str, tuple[Any,
     ]
 
 
+def _fp8_attention_baseline(
+    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor
+) -> torch.Tensor:
+    # `fp8_attention_pytorch` returns a callable factory; unwrap it to the
+    # harness's `baseline_fn(*args) -> Tensor` contract.
+    from examples.fp8_attention import fp8_attention_pytorch
+
+    return fp8_attention_pytorch(q, k, v)()
+
+
 def _welford_baseline(
     weight: torch.Tensor, bias: torch.Tensor, x: torch.Tensor, eps: float = 1e-05
 ) -> torch.Tensor:
@@ -167,6 +177,30 @@ def _attention_shapes(
         (1, 4, 512, 64),
         (1, 4, 1024, 64),
         (2, 8, 512, 64),
+    ]
+    if num_shapes is not None:
+        configs = configs[:num_shapes]
+    return [
+        (
+            f"[{z},{h},{n},{d}]",
+            tuple(
+                torch.randn(z, h, n, d, device=DEVICE, dtype=torch.bfloat16)
+                for _ in range(3)
+            ),
+        )
+        for z, h, n, d in configs
+    ]
+
+
+def _fp8_attention_shapes(
+    num_shapes: int | None = None,
+) -> list[tuple[str, tuple[Any, ...]]]:
+    # Mirrors examples/fp8_attention.py main() — the canonical shapes that
+    # the example's own correctness check exercises.
+    configs = [
+        (1, 2, 128, 64),
+        (2, 4, 256, 64),
+        (4, 8, 512, 128),
     ]
     if num_shapes is not None:
         configs = configs[:num_shapes]
@@ -842,6 +876,17 @@ KERNEL_MAPPINGS: dict[str, KernelMapping] = {
         torch.nn.functional.scaled_dot_product_attention,
         _attention_shapes,
         None,
+    ),
+    # FP8 outputs vs the _scaled_mm reference can disagree on a few percent
+    # of elements at the harness's default tolerance (rtol=1e-2, atol=1e-1).
+    # The example's own check() uses atol/rtol=0.1; allow up to 5% mismatch
+    # here to mirror that intent while still catching gross regressions.
+    "fp8_attention": (
+        "fp8_attention",
+        "fp8_attention",
+        _fp8_attention_baseline,
+        _fp8_attention_shapes,
+        0.05,
     ),
     "bmm": ("bmm", "bmm", torch.bmm, _bmm_shapes, None),
     # Renamed from "matmul" to "gemm" so this kernel shares the same dashboard
