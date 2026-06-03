@@ -423,6 +423,23 @@ def patch_cute_mma_support(
         yield support
 
 
+@contextlib.contextmanager
+def float32_matmul_precision(precision: str) -> Generator[None, None, None]:
+    """Context manager to temporarily set the float32 matrix multiplication precision.
+
+    The original `torch.float32_matmul_precision` setting is restored upon exiting the context.
+
+    Args:
+        precision: The precision level to set ("highest", "high", or "medium").
+    """
+    original_precision = torch.get_float32_matmul_precision()
+    torch.set_float32_matmul_precision(precision)
+    try:
+        yield
+    finally:
+        torch.set_float32_matmul_precision(original_precision)
+
+
 def skipIfNotTriton(reason: str) -> Callable[[Callable], Callable]:
     """Skip test when backend is not Triton (e.g. cute, pallas)."""
     return skipIfFn(lambda: _get_backend() != "triton", reason)
