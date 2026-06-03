@@ -2660,7 +2660,14 @@ class TestCuteAutotuner(TestCase):
         self.assertTrue(any(config.num_threads for config in configs))
         for config in configs:
             self.assertLessEqual(
-                set(config.config), {"block_sizes", "num_threads", "loop_orders"}
+                set(config.config),
+                {
+                    "block_sizes",
+                    "num_threads",
+                    "loop_orders",
+                    "cute_vector_widths",
+                    "grid_foldings",
+                },
             )
             self.assertNotIn("persistent", config.pid_type)
             explicit_threads = [nt for nt in config.num_threads if nt > 0]
