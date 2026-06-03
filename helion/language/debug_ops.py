@@ -11,7 +11,7 @@ from . import _decorators
 
 if TYPE_CHECKING:
     from .._compiler.inductor_lowering import CodegenState
-    from .._compiler.type_propagation import TypeInfo
+    from .._compiler.type_info import TypeInfo
     from .._compiler.variable_origin import Origin
 
 
@@ -34,7 +34,7 @@ def _() -> None:
 
 @_decorators.type_propagation(breakpoint)
 def _(*args: object, origin: Origin, **kwargs: object) -> TypeInfo:
-    from .._compiler.type_propagation import LiteralType
+    from .._compiler.type_info import LiteralType
 
     if args or kwargs:
         raise exc.TypeInferenceError("breakpoint() does not take any arguments")

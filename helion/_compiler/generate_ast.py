@@ -51,7 +51,7 @@ if TYPE_CHECKING:
     from .host_function import HostFunction
     from .loop_dependency_checker import LoopDependencyChecker
     from .tile_strategy import DeviceLoopOrGridState
-    from .type_propagation import TensorType
+    from .type_info import TensorType
 
 
 class GenerateAST(NodeVisitor, CodegenInterface):
@@ -216,8 +216,8 @@ class GenerateAST(NodeVisitor, CodegenInterface):
         than silently mis-classifying SMEM-only tensors as needing a global
         barrier.
         """
-        from .type_propagation import StackTensorType
-        from .type_propagation import TensorType
+        from .type_info import StackTensorType
+        from .type_info import TensorType
 
         env = CompileEnvironment.current()
         assert env.codegen_name == "triton" and env.backend.name != "tileir", (
@@ -1081,9 +1081,9 @@ class GenerateAST(NodeVisitor, CodegenInterface):
         return node
 
     def visit_Call(self, node: ast.Call) -> ast.AST:
-        from .type_propagation import CallableType
-        from .type_propagation import SequenceType
-        from .type_propagation import TileIndexType
+        from .type_info import CallableType
+        from .type_info import SequenceType
+        from .type_info import TileIndexType
 
         func_node = node.func
         assert isinstance(func_node, ExtendedAST)
@@ -1155,7 +1155,7 @@ class GenerateAST(NodeVisitor, CodegenInterface):
 
     def _needs_device_kwarg(self, node: ast.Call) -> bool:
         """Check if a host-level torch factory call is missing device=."""
-        from .type_propagation import CallableType
+        from .type_info import CallableType
 
         func_node = node.func
         if not isinstance(func_node, ExtendedAST):

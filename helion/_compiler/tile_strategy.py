@@ -1847,9 +1847,9 @@ class FlattenedTileStrategy(BlockSizeTileStrategy):
         assert state.ast_args is None
 
         from .ast_extension import ExtendedAST
-        from .type_propagation import GridIndexType
-        from .type_propagation import IterType
-        from .type_propagation import SequenceType
+        from .type_info import GridIndexType
+        from .type_info import IterType
+        from .type_info import SequenceType
 
         type_info = ExtendedAST.current()[-1]._type_info
         scalar_grid_loop = False
@@ -2262,9 +2262,9 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
 
     def _root_grid_steps(self, state: CodegenState) -> list[object | None]:
         from .ast_extension import ExtendedAST
-        from .type_propagation import GridIndexType
-        from .type_propagation import IterType
-        from .type_propagation import SequenceType
+        from .type_info import GridIndexType
+        from .type_info import IterType
+        from .type_info import SequenceType
 
         type_info = ExtendedAST.current()[-1]._type_info
         assert isinstance(type_info, IterType)

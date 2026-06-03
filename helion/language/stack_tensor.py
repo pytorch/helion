@@ -11,7 +11,7 @@ from . import _decorators
 if TYPE_CHECKING:
     from typing import Sequence
 
-    from .._compiler.type_propagation import TypeInfo
+    from .._compiler.type_info import TypeInfo
     from .._compiler.variable_origin import Origin
 
 
@@ -185,8 +185,8 @@ def _stack_tensor(
 
 @_decorators.type_propagation(_stack_tensor)
 def _(tensor_like: TypeInfo, dev_ptrs: TypeInfo, *, origin: Origin) -> TypeInfo:
-    from .._compiler.type_propagation import StackTensorType
-    from .._compiler.type_propagation import TensorType
+    from .._compiler.type_info import StackTensorType
+    from .._compiler.type_info import TensorType
 
     assert isinstance(dev_ptrs, TensorType)
     assert isinstance(tensor_like, TensorType)
