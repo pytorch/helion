@@ -13,6 +13,7 @@ from helion._testing import DEVICE
 from helion._testing import TestCase
 from helion._testing import code_and_output
 from helion._testing import onlyBackends
+from helion._testing import skipIfPallasInterpret
 from helion._testing import skipUnlessPallas
 from helion._testing import xfailIfPallas
 from helion._testing import xfailIfPallasInterpret
@@ -1111,6 +1112,74 @@ class TestPallas(TestCase):
             cached,
             "Repeat calls on a cached static-shape kernel must populate the "
             "launcher fast-path cache on the inner device function.",
+        )
+
+    @skipIfPallasInterpret(
+        "direct call_custom_kernel dispatch is torch_tpu/TPU-only; the "
+        "_DirectCallKernel snapshot is not built in JAX interpret mode"
+    )
+    def test_pallas_call_custom_kernel_direct_matches_jaxcallable_output(
+        self,
+    ) -> None:
+        """Direct ``call_custom_kernel`` dispatch must produce bitwise-identical
+        output to the JaxCallable path on bf16 matmul (pin against silent
+        divergence from a refactor)."""
+
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def _matmul_direct_correctness(
+            x: torch.Tensor, y: torch.Tensor
+        ) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty(
+                [m, n],
+                device=x.device,
+                dtype=torch.promote_types(x.dtype, y.dtype),
+            )
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = acc
+            return out
+
+        torch.manual_seed(0)
+        x = torch.randn(256, 256, device=DEVICE, dtype=torch.bfloat16)
+        torch.manual_seed(1)
+        y = torch.randn(256, 256, device=DEVICE, dtype=torch.bfloat16)
+
+        bound = _matmul_direct_correctness.bind((x, y))
+        config = bound.config_spec.default_config()
+        compiled_fn = bound.compile_config(config)
+
+        # First call: slow path (JaxCallable wrapper).  Saves the reference.
+        reference = compiled_fn(x, y).clone()
+
+        # Subsequent calls: direct ``call_custom_kernel`` dispatch.  Each output
+        # must be bitwise identical to the reference.
+        for i in range(3):
+            result = compiled_fn(x, y)
+            self.assertTrue(
+                torch.equal(result, reference),
+                f"Direct-dispatch call {i + 1} output diverged from the "
+                f"JaxCallable-path reference (max_abs_diff="
+                f"{(result.float() - reference.float()).abs().max().item()}).",
+            )
+
+        # Confirm the direct-call snapshot was actually built (slot 5 of the
+        # launcher cache), so the equality above exercised the direct path and
+        # is not a trivial slow-path-vs-slow-path comparison.
+        cache_attrs = ("_pallas_cache", "_pallas_pipeline_cache", "_pallas_fori_cache")
+        caches = [
+            getattr(value, a)
+            for value in compiled_fn.__globals__.values()
+            for a in cache_attrs
+            if getattr(value, a, None) is not None
+        ]
+        self.assertTrue(
+            caches and caches[0][5] is not None,
+            "Repeat calls must build the _DirectCallKernel snapshot "
+            "(direct-dispatch path engaged), not stay on the slow path.",
         )
 
     def test_bmm(self) -> None:
