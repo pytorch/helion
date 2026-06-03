@@ -10,6 +10,7 @@ import os
 import sys
 from typing import TYPE_CHECKING
 from typing import Any
+from typing import Literal
 from typing import cast
 
 import torch
@@ -36,6 +37,8 @@ from .settings import is_pallas_interpret as _module_is_pallas_interpret
 if TYPE_CHECKING:
     from collections.abc import Callable
     from collections.abc import Iterable
+
+    import jax
 
 _CUTLASS_SHUTDOWN_PATCHED = False
 
@@ -384,6 +387,71 @@ def _estimate_pallas_vmem_bytes(
 _BlockSpecInfo = list[
     tuple[tuple[int | None, ...], tuple[int | tuple[int, int, int] | None, ...]] | None
 ]
+_PallasCopyGuards = dict[int, tuple[int, ...]]
+_PallasDimensionSemantic = Literal["parallel", "arbitrary"]
+
+
+def _pallas_tensor_pos_map(
+    tensor_arg_indices: list[int],
+    output_only_indices: list[int] | None,
+) -> dict[int, int]:
+    all_positions = sorted(set(tensor_arg_indices) | set(output_only_indices or []))
+    return {orig: tpos for tpos, orig in enumerate(all_positions)}
+
+
+def _pallas_grid_dims_used_by_block_spec(
+    block_info: tuple[
+        tuple[int | None, ...], tuple[int | tuple[int, int, int] | None, ...]
+    ],
+) -> set[int]:
+    used: set[int] = set()
+    _, grid_dims = block_info
+    for grid_dim in grid_dims:
+        if isinstance(grid_dim, int):
+            used.add(grid_dim)
+        elif isinstance(grid_dim, tuple):
+            used.add(grid_dim[0])
+    return used
+
+
+def _pallas_shared_output_plan(
+    grid: tuple[int, ...],
+    tensor_arg_indices: list[int],
+    output_only_indices: list[int],
+    output_indices: list[int],
+    inplace_indices: set[int],
+    block_spec_info: _BlockSpecInfo | None,
+) -> tuple[_PallasCopyGuards, tuple[_PallasDimensionSemantic, ...]]:
+    """Plan ordered updates for aliased outputs shared by multiple programs."""
+    dim_semantics: list[_PallasDimensionSemantic] = ["parallel"] * len(grid)
+    copy_guards: _PallasCopyGuards = {}
+    if not output_indices or not grid:
+        return copy_guards, tuple(dim_semantics)
+    if block_spec_info is None:
+        return copy_guards, tuple(dim_semantics)
+
+    arg_to_tpos = _pallas_tensor_pos_map(tensor_arg_indices, output_only_indices)
+    for orig_pos in output_indices:
+        if orig_pos not in inplace_indices:
+            continue
+        tensor_pos = arg_to_tpos.get(orig_pos)
+        if tensor_pos is None or tensor_pos >= len(block_spec_info):
+            continue
+        block_info = block_spec_info[tensor_pos]
+        if block_info is None:
+            continue
+        used_dims = _pallas_grid_dims_used_by_block_spec(block_info)
+        # These programs update the same output tile and must observe one
+        # shared accumulator, not a freshly preloaded copy per program.
+        shared_dims = tuple(
+            dim for dim, size in enumerate(grid) if size > 1 and dim not in used_dims
+        )
+        if not shared_dims:
+            continue
+        copy_guards[orig_pos] = shared_dims
+        for dim in shared_dims:
+            dim_semantics[dim] = "arbitrary"
+    return copy_guards, tuple(dim_semantics)
 
 
 def _pallas_build_block_specs(
@@ -965,6 +1033,35 @@ def _pallas_prepare_args(
     )
 
 
+def _pallas_do_smem_inplace_copy(
+    in_ref: object,
+    out_ref: object,
+    current_indices: tuple[int, ...] = (),
+) -> None:
+    if len(current_indices) == len(in_ref.shape):  # type: ignore[attr-defined]
+        out_ref[current_indices] = in_ref[current_indices]  # type: ignore[index]
+        return
+    next_dim = len(current_indices)
+    for i in range(in_ref.shape[next_dim]):  # type: ignore[attr-defined]
+        _pallas_do_smem_inplace_copy(in_ref, out_ref, (*current_indices, i))
+
+
+def _pallas_inplace_copy(in_ref: object, out_ref: object, *, is_smem: bool) -> None:
+    if is_smem:
+        _pallas_do_smem_inplace_copy(in_ref, out_ref)
+    else:
+        out_ref[...] = in_ref[...]  # type: ignore[index]
+
+
+def _pallas_copy_guard(dims: tuple[int, ...]) -> bool | jax.Array:
+    from jax.experimental import pallas as pl
+
+    should_copy = True
+    for dim in dims:
+        should_copy = should_copy & (pl.program_id(dim) == 0)
+    return should_copy
+
+
 def _pallas_make_reordered_kernel(
     pallas_kernel: object,
     args: tuple[object, ...],
@@ -977,6 +1074,7 @@ def _pallas_make_reordered_kernel(
     n_extra_refs: int = 0,
     skip_inplace_copy: set[int] | None = None,
     _smem_arg_indices: list[int] | None = None,
+    _copy_guards: _PallasCopyGuards | None = None,
 ) -> object:
     """Create a wrapper kernel that reorders pallas_call refs to the original arg order.
 
@@ -991,8 +1089,15 @@ def _pallas_make_reordered_kernel(
     where direct load/store is not allowed.
     """
     _skip_copy = skip_inplace_copy or set()
+    copy_guards = {
+        orig_pos: guard_dims
+        for orig_pos, guard_dims in (_copy_guards or {}).items()
+        if guard_dims
+    }
 
     def reordered_kernel(*refs: object) -> None:
+        from jax.experimental import pallas as pl
+
         n_kernel_params = len(args)
         original_order: list[object] = [None] * n_kernel_params
         for tensor_pos, orig_pos in enumerate(tensor_arg_indices):
@@ -1003,12 +1108,23 @@ def _pallas_make_reordered_kernel(
             out_ref = refs[n_tensor_inputs + out_idx]
             if orig_pos in inplace_positions and orig_pos not in _skip_copy:
                 in_ref = refs[arg_to_tensor_pos[orig_pos]]
-                if _smem_arg_indices is not None and orig_pos in _smem_arg_indices:
-                    # [...] cannot be used for SMEMs,
-                    # TODO(dunfanlu): handle in-place copy for SMEM refs
-                    pass
+                is_smem = (
+                    _smem_arg_indices is not None and orig_pos in _smem_arg_indices
+                )
+                copy_guard_dims = copy_guards.get(orig_pos)
+                if copy_guard_dims:
+                    should_copy = _pallas_copy_guard(copy_guard_dims)
+
+                    @pl.when(should_copy)
+                    def _copy_shared_output(
+                        out_ref: object = out_ref,
+                        in_ref: object = in_ref,
+                        is_smem: bool = is_smem,
+                    ) -> None:
+                        _pallas_inplace_copy(in_ref, out_ref, is_smem=is_smem)
+
                 else:
-                    out_ref[...] = in_ref[...]  # type: ignore[index]
+                    _pallas_inplace_copy(in_ref, out_ref, is_smem=is_smem)
             original_order[orig_pos] = out_ref
         extra_refs = refs[n_tensor_inputs + len(_output_indices) :]
         pallas_kernel(*original_order, *extra_refs)  # type: ignore[operator]
@@ -1230,6 +1346,14 @@ def default_pallas_launcher(
             spec_args, _output_indices, _inplace_indices, interpret=interpret
         )
 
+        copy_guards, dimension_semantics = _pallas_shared_output_plan(
+            grid,
+            tensor_arg_indices,
+            output_only_indices,
+            _output_indices,
+            inplace_positions,
+            _block_spec_info,
+        )
         in_specs, out_specs = _pallas_build_block_specs(
             pl,
             jnp,
@@ -1253,6 +1377,7 @@ def default_pallas_launcher(
             inplace_positions,
             arg_to_tensor_pos,
             _smem_arg_indices=_smem_arg_indices,
+            _copy_guards=copy_guards,
         )
 
         out_shape_arg = out_shapes if len(out_shapes) > 1 else out_shapes[0]
@@ -1284,6 +1409,10 @@ def default_pallas_launcher(
         if in_specs is not None:
             pallas_call_kwargs["in_specs"] = in_specs
             pallas_call_kwargs["out_specs"] = out_specs
+        if any(sem != "parallel" for sem in dimension_semantics):
+            pallas_call_kwargs["compiler_params"] = pltpu.CompilerParams(  # pyrefly: ignore[bad-instantiation]
+                dimension_semantics=dimension_semantics,
+            )
 
         jit_fn = pl.pallas_call(
             reordered_kernel,  # pyrefly: ignore[bad-argument-type]
@@ -1433,6 +1562,15 @@ def default_pallas_pipeline_launcher(
         assert _block_spec_info is not None, (
             "emit_pipeline launcher requires _block_spec_info from codegen"
         )
+        copy_guards, dimension_semantics = _pallas_shared_output_plan(
+            grid,
+            tensor_arg_indices,
+            output_only_indices,
+            _output_indices,
+            inplace_positions,
+            _block_spec_info,
+        )
+
         in_specs_list, out_specs = _pallas_build_pipeline_specs(
             pl,
             jnp,
@@ -1460,6 +1598,7 @@ def default_pallas_pipeline_launcher(
             n_extra_refs=len(scratch_shapes),
             skip_inplace_copy=_pipeline_set,
             _smem_arg_indices=_smem_arg_indices,
+            _copy_guards=copy_guards,
         )
 
         out_shape_arg = out_shapes if len(out_shapes) > 1 else out_shapes[0]
@@ -1494,7 +1633,7 @@ def default_pallas_pipeline_launcher(
             "out_shape": out_shape_arg,
             "grid_spec": grid_spec,
             "compiler_params": pltpu.CompilerParams(  # pyrefly: ignore[bad-instantiation]
-                dimension_semantics=tuple("parallel" for _ in grid),
+                dimension_semantics=dimension_semantics,
             ),
         }
         if interpret:
@@ -1648,6 +1787,15 @@ def default_pallas_fori_launcher(
         assert _block_spec_info is not None, (
             "fori_loop launcher requires _block_spec_info from codegen"
         )
+        copy_guards, dimension_semantics = _pallas_shared_output_plan(
+            grid,
+            tensor_arg_indices,
+            output_only_indices,
+            _output_indices,
+            inplace_positions,
+            _block_spec_info,
+        )
+
         in_specs_list, out_specs = _pallas_build_pipeline_specs(
             pl,
             jnp,
@@ -1675,6 +1823,7 @@ def default_pallas_fori_launcher(
             n_extra_refs=len(scratch_shapes),
             skip_inplace_copy=_fori_pipeline_set,
             _smem_arg_indices=_smem_arg_indices,
+            _copy_guards=copy_guards,
         )
 
         out_shape_arg = out_shapes if len(out_shapes) > 1 else out_shapes[0]
@@ -1709,7 +1858,7 @@ def default_pallas_fori_launcher(
             "out_shape": out_shape_arg,
             "grid_spec": grid_spec,
             "compiler_params": pltpu.CompilerParams(  # pyrefly: ignore[bad-instantiation]
-                dimension_semantics=tuple("parallel" for _ in grid),
+                dimension_semantics=dimension_semantics,
             ),
         }
         if interpret:

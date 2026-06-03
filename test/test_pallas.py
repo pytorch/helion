@@ -629,7 +629,6 @@ class TestPallas(TestCase):
         self.assertNotIn("pltpu.emit_pipeline", code)
         self.assertIn("out[:]", code)
 
-    @xfailIfPallasInterpret("numerical mismatch in JAX interpret mode")
     def test_pipeline_kernel_tile_begin_plus_offset_is_elementwise(self) -> None:
         x = torch.arange(1024, device=DEVICE, dtype=torch.float32)
         code, result = code_and_output(
@@ -893,6 +892,23 @@ class TestPallas(TestCase):
         code, result = code_and_output(pallas_inplace_add, (x, y), block_size=1024)
         # x should be mutated in place
         torch.testing.assert_close(x, expected)
+
+    def test_shared_output_disjoint_rows(self) -> None:
+        @helion.kernel(backend="pallas", static_shapes=True, autotune_effort="none")
+        def pallas_shared_output_disjoint_rows(x: torch.Tensor) -> torch.Tensor:
+            for row in hl.grid(2):
+                x[row, :] = x[row, :] + (row + 10)
+            return x
+
+        x = torch.zeros([2, 128], device=DEVICE, dtype=torch.float32)
+        expected = torch.stack(
+            [
+                torch.full([128], 10.0, device=DEVICE),
+                torch.full([128], 11.0, device=DEVICE),
+            ]
+        )
+        code, result = code_and_output(pallas_shared_output_disjoint_rows, (x,))
+        torch.testing.assert_close(result, expected)
 
     def test_pointwise_mul(self) -> None:
         args = (
@@ -1869,7 +1885,7 @@ class TestPallas(TestCase):
         result = fn(x)
         torch.testing.assert_close(result, x)
 
-    @xfailIfPallasInterpret("numerical mismatch in JAX interpret mode")
+    @skipIfPallasInterpret("SMEM preload copy is too expensive in JAX interpret mode")
     def test_scalar_access_2D_constexpr(self) -> None:
         @helion.kernel(backend="pallas", static_shapes=True, config=helion.Config())
         def fn(x: torch.Tensor) -> torch.Tensor:
@@ -2044,6 +2060,18 @@ class TestPallas(TestCase):
         expected = x + 0.5
         torch.testing.assert_close(result, expected)
 
+    def test_scalar_access_hl_grid_inplace(self) -> None:
+        @helion.kernel(backend="pallas", static_shapes=True, config=helion.Config())
+        def fn(x: torch.Tensor) -> torch.Tensor:
+            for i in hl.grid(x.size(0)):
+                x[i] = x[i] + 1
+            return x
+
+        x = torch.arange(128, device=DEVICE, dtype=torch.float32)
+        expected = x + 1
+        result = fn(x)
+        torch.testing.assert_close(result, expected)
+
     def test_scalar_access_hl_grid_offset(self) -> None:
         @helion.kernel(backend="pallas", static_shapes=True, config=helion.Config())
         def fn(x: torch.Tensor) -> torch.Tensor:
@@ -2058,6 +2086,9 @@ class TestPallas(TestCase):
         expected = x[x.shape[0] // 2 :] + 0.5
         torch.testing.assert_close(result, expected)
 
+    @skipIfPallasInterpret(
+        "2D SMEM preload copy is too expensive in JAX interpret mode"
+    )
     def test_scalar_access_hl_grid_2d(self) -> None:
         @helion.kernel(backend="pallas", static_shapes=True, config=helion.Config())
         def fn(x: torch.Tensor) -> torch.Tensor:
@@ -2076,6 +2107,9 @@ class TestPallas(TestCase):
         _, result = code_and_output(fn, (x,), loop_order=[1, 0])
         torch.testing.assert_close(result, expected)
 
+    @skipIfPallasInterpret(
+        "2D SMEM preload copy is too expensive in JAX interpret mode"
+    )
     def test_scalar_access_hl_grid_2d_nested(self) -> None:
         @helion.kernel(backend="pallas", static_shapes=True, config=helion.Config())
         def fn(x: torch.Tensor) -> torch.Tensor:
