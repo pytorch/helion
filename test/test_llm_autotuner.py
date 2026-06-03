@@ -16,6 +16,9 @@ from helion.autotuner.config_fragment import IntegerFragment
 from helion.autotuner.config_fragment import ListOf
 from helion.autotuner.config_fragment import PowerOfTwoFragment
 from helion.autotuner.effort_profile import get_effort_profile
+from helion.autotuner.llm.prompting import build_author_seed_section
+from helion.autotuner.llm.prompting import build_compiler_analysis_section
+from helion.autotuner.llm.workload import compute_workload_hints
 from helion.autotuner.logger import AutotuningLogger
 from helion.autotuner.metrics import AutotuneMetrics
 import helion.language as hl
@@ -387,6 +390,127 @@ class TestLLMGuidedSearch(TestCase):
         future.set_exception(RuntimeError("simulated provider 401"))
         with self.assertRaisesRegex(RuntimeError, "simulated provider 401"):
             search._wait_for_initial_llm_response(future)
+
+
+class TestAuthorSeedConfigPrompt(TestCase):
+    """Author-provided autotune_seed_configs surface in the initial prompt."""
+
+    def test_renders_all_seed_config_values(self):
+        kernel = SimpleNamespace(
+            settings=Settings(
+                autotune_seed_configs=[
+                    helion.Config(block_sizes=[1, 1]),
+                    helion.Config(block_sizes=[16, 16], num_warps=8),
+                ]
+            )
+        )
+        section = build_author_seed_section(kernel)
+        self.assertIn("Author Seed Configs", section)
+        self.assertIn('"block_sizes":[1,1]', section)
+        self.assertIn('"block_sizes":[16,16]', section)
+        self.assertIn('"num_warps":8', section)
+
+    def test_empty_when_no_author_seeds(self):
+        kernel = SimpleNamespace(settings=Settings())
+        self.assertEqual(build_author_seed_section(kernel), "")
+
+
+class TestCompilerAnalysisPrompt(TestCase):
+    """Compiler-fired heuristics + analytical seed configs surface in the prompt."""
+
+    def test_renders_heuristic_name_purpose_and_seed(self):
+        config_spec = SimpleNamespace(
+            autotuner_heuristics=["triton_skinny_gemm"],
+            compiler_seed_configs=[helion.Config(block_sizes=[64, 64, 256])],
+        )
+        section = build_compiler_analysis_section(config_spec)
+        self.assertIn("Compiler Analysis", section)
+        self.assertIn("triton_skinny_gemm", section)
+        self.assertIn("skinny GEMM", section)
+        self.assertIn('"block_sizes":[64,64,256]', section)
+        self.assertIn("structural prior", section.lower())
+
+    def test_empty_when_nothing_fired(self):
+        config_spec = SimpleNamespace(autotuner_heuristics=[], compiler_seed_configs=[])
+        self.assertEqual(build_compiler_analysis_section(config_spec), "")
+
+
+def _meta_tensor(shape: list[int]) -> torch.Tensor:
+    """Shape/dtype-only tensor for workload-hint tests (no real device needed)."""
+    return torch.randn(shape, device="meta", dtype=torch.float16)  # @ignore-device-lint
+
+
+class TestReductionWorkloadHints(TestCase):
+    """Pure (non-attention, non-matmul) reductions get cache-eviction guidance."""
+
+    def test_reduction_gets_eviction_hint_family_general(self):
+        args = (_meta_tensor([1024, 1024]),)
+        hints = compute_workload_hints(args, workload_traits=frozenset({"reduction"}))
+        self.assertIn("load_eviction_policies", hints)
+        self.assertIn("last", hints.lower())
+        # Family-general: no specific kernel name or shape.
+        self.assertNotIn("softmax", hints.lower())
+        self.assertNotIn("1024", hints)
+
+    def test_not_emitted_for_matmul_attention_or_non_reduction(self):
+        sentence = "memory-bound reduction/normalization that streams"
+        for traits in (
+            frozenset({"matmul", "reduction"}),
+            frozenset({"matmul", "reduction", "attention_reduction"}),
+            frozenset(),
+        ):
+            with self.subTest(traits=sorted(traits)):
+                args = (
+                    _meta_tensor([1024, 1024]),
+                    _meta_tensor([1024, 1024]),
+                )
+                hints = compute_workload_hints(args, workload_traits=traits)
+                self.assertNotIn(sentence, hints)
+
+
+class TestLargeMatmulWorkloadHints(TestCase):
+    """Large standalone 2D GEMMs get coherent flat + small-K guidance.
+
+    The default matmul guidance is counterproductive for a large GEMM (it pushes
+    persistent and caps K-tile at 64); the large branch suppresses it and
+    recommends flat pid + K-tile 32. Double-gated to a rank-2 pure-matmul
+    workload so it cannot leak to fused or batched (SSM-style) kernels.
+    """
+
+    _PERSISTENT_PUSH = "try pid_type='persistent_blocked' with l2_groupings"
+    _DEFAULT_START_TILE = "as starting point"
+
+    @staticmethod
+    def _hints(shapes, traits=frozenset({"matmul"})):
+        args = tuple(_meta_tensor(s) for s in shapes)
+        return compute_workload_hints(args, workload_traits=frozenset(traits))
+
+    def test_large_2d_gemm_gets_flat_k32_and_suppresses_default(self):
+        hints = self._hints([[4096, 4096], [4096, 4096]])
+        self.assertIn("large compute-bound GEMM", hints)
+        self.assertIn("K-tile 32", hints)
+        self.assertIn("pid_type='flat'", hints)
+        self.assertNotIn(self._PERSISTENT_PUSH, hints)
+        self.assertNotIn(self._DEFAULT_START_TILE, hints)
+
+    def test_medium_gemm_keeps_default_guidance(self):
+        hints = self._hints([[2048, 2048], [2048, 2048]])
+        self.assertNotIn("large compute-bound GEMM", hints)
+        self.assertIn(self._DEFAULT_START_TILE, hints)
+
+    def test_does_not_leak_to_fused_batched_or_non_matmul(self):
+        # Fused matmul+reduction, batched (rank-3) operands, and non-matmul
+        # workloads must never get the standalone large-GEMM hint.
+        cases = (
+            ([[4096, 4096], [4096, 4096]], frozenset({"matmul", "reduction"})),
+            ([[8, 4096, 4096], [8, 4096, 4096]], frozenset({"matmul"})),
+            ([[4096, 4096]], frozenset()),
+        )
+        for shapes, traits in cases:
+            with self.subTest(traits=sorted(traits), rank=len(shapes[0])):
+                self.assertNotIn(
+                    "large compute-bound GEMM", self._hints(shapes, traits)
+                )
 
 
 class TestLLMTransport(TestCase):
