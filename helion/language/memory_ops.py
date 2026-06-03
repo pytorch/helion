@@ -404,7 +404,23 @@ def _cute_remap_block_id(state: CodegenState, block_id: int) -> int:
     return remap.get(block_id, block_id)
 
 
+def _cute_index_override(state: CodegenState, block_id: int) -> str | None:
+    """Return a raw index-expression override for *block_id*, if active.
+
+    Applied after ``_cute_remap_block_id``.  When set (only while
+    re-materializing the rhs of a static-MN-collapse baddbmm), the operand's
+    free (N) axis is indexed by this serial-loop variable instead of the shared
+    M thread index, and masking for that axis is suppressed.
+    """
+    override = state.device_function.cute_state.matmul_operand_index_override
+    if not override:
+        return None
+    return override.get(_cute_remap_block_id(state, block_id))
+
+
 def _cute_active_index_var(state: CodegenState, block_id: int) -> str | None:
+    if (override := _cute_index_override(state, block_id)) is not None:
+        return override
     block_id = _cute_remap_block_id(state, block_id)
     loops = state.codegen.active_device_loops.get(block_id)
     if loops:
@@ -416,6 +432,8 @@ def _cute_active_index_var(state: CodegenState, block_id: int) -> str | None:
 
 
 def _cute_active_mask_var(state: CodegenState, block_id: int) -> str | None:
+    if _cute_index_override(state, block_id) is not None:
+        return None
     block_id = _cute_remap_block_id(state, block_id)
     loops = state.codegen.active_device_loops.get(block_id)
     if loops:
@@ -719,6 +737,8 @@ def _cute_index_exprs(
         return begin_var
 
     def active_index_var(block_id: int) -> str | None:
+        if (override := _cute_index_override(state, block_id)) is not None:
+            return override
         block_id = _cute_remap_block_id(state, block_id)
         loops = state.codegen.active_device_loops.get(block_id)
         if loops:
@@ -2153,6 +2173,8 @@ def _cute_combined_mask(
     terms: list[str] = []
 
     def mask_var_for_block_id(block_id: int) -> str | None:
+        if _cute_index_override(state, block_id) is not None:
+            return None
         block_id = _cute_remap_block_id(state, block_id)
         loops = state.codegen.active_device_loops.get(block_id)
         if loops:
@@ -2160,6 +2182,8 @@ def _cute_combined_mask(
         return None
 
     def active_index_var(block_id: int) -> str | None:
+        if (override := _cute_index_override(state, block_id)) is not None:
+            return override
         block_id = _cute_remap_block_id(state, block_id)
         loops = state.codegen.active_device_loops.get(block_id)
         if loops:
@@ -2172,6 +2196,8 @@ def _cute_combined_mask(
     def active_local_coord(block_id: int) -> str | None:
         from .._compiler.cute.cute_reshape import _grid_local_coord_expr
 
+        if _cute_index_override(state, block_id) is not None:
+            return None
         block_id = _cute_remap_block_id(state, block_id)
         loops = state.codegen.active_device_loops.get(block_id)
         if loops:

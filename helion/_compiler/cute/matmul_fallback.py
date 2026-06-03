@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 from typing import TYPE_CHECKING
+from typing import cast
 
 import torch
 
@@ -15,6 +16,8 @@ from .indexing import CutePackedAffineLoad
 from .indexing import CutePackedTerms
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from ..helper_function import CodegenInterface
 
 
@@ -383,6 +386,143 @@ def _emit_cute_grouped_sum_reduction(
         num_threads=num_threads,
         group_count=num_threads // group_span,
     )
+
+
+def _emit_cute_matmul_n_collapse(
+    cg: CodegenInterface,
+    lhs: ast.AST,
+    *,
+    rhs_at_n: Callable[[str], ast.AST],
+    n_extent: int,
+    k_block_id: int | None,
+    static_k_extent: int | None,
+    acc: ast.AST,
+    acc_dtype: torch.dtype | None,
+    lhs_dtype: torch.dtype | None,
+    rhs_dtype: torch.dtype | None,
+    lhs_node: object,
+    rhs_node: object,
+) -> ast.AST:
+    """Lower a static-M==N-collapse baddbmm reduced over N (CuTe layout A).
+
+    The matmul's M (lhs free) and N (rhs free) axes share a block id, so the
+    standard fallback indexes the rhs N at the M thread index and computes only
+    the diagonal.  Here M stays the thread axis and N becomes a serial loop:
+
+        out_acc = 0
+        for n in range(N):
+            out_acc += K-reduce( lhs[m, k] * rhs[n, k] )
+        result = acc + out_acc
+
+    where the K reduction is the existing per-lane / cross-thread reduction.
+    Because the only consumer of this matmul's result is a sum over N, folding
+    the N reduction here makes ``result`` already the N-summed value and the
+    downstream ``.sum(-1)`` a no-op.
+    """
+    from ..generate_ast import GenerateAST
+
+    assert isinstance(cg, GenerateAST)
+    if hasattr(cg, "cute_uses_matmul"):
+        cg.cute_uses_matmul = True  # type: ignore[attr-defined]
+
+    reduction_dtype: torch.dtype | None = acc_dtype
+    if (
+        lhs_dtype is not None
+        and rhs_dtype is not None
+        and _needs_f32_accumulator(lhs_dtype, rhs_dtype)
+    ):
+        reduction_dtype = torch.float32
+    value_dtype = reduction_dtype or lhs_dtype or rhs_dtype or torch.float32
+
+    loop_state = None
+    if k_block_id is not None:
+        from ..tile_strategy import DeviceLoopOrGridState
+
+        active_device_loops = getattr(cg, "active_device_loops", None)
+        if isinstance(active_device_loops, dict):
+            loops = active_device_loops.get(k_block_id)
+            if loops and isinstance(loops[-1], DeviceLoopOrGridState):
+                loop_state = loops[-1]
+        # This path sums each K element across hardware threads (cross-thread
+        # reduction).  A K axis lowered as a *serial* per-thread lane loop would
+        # need the products accumulated across lane iterations, which this fold
+        # does not emit - reject it rather than silently summing one lane.
+        if loop_state is not None:
+            lane_vars = getattr(loop_state.strategy, "_lane_var_by_block", None)
+            if isinstance(lane_vars, dict) and k_block_id in lane_vars:
+                raise exc.BackendUnsupported(
+                    "cute",
+                    "CuTe static-MN-collapse baddbmm requires the contraction "
+                    "axis to be a cross-thread reduction, not a serial lane loop",
+                )
+
+    backend = CompileEnvironment.current().backend
+    zero_expr = f"{backend.dtype_str(value_dtype)}(0)"
+    out_acc = cg.device_function.new_var("dot_n_acc")
+    cg.add_statement(f"{out_acc} = {zero_expr}")
+
+    n_var = cg.device_function.new_var("dot_n")
+    loop_body: list[ast.AST] = []
+    with cg.set_statements(loop_body):
+        rhs = rhs_at_n(n_var)
+        lhs_term: ast.AST = lhs
+        rhs_term: ast.AST = rhs
+        if reduction_dtype is not None:
+            lhs_computed_fp8 = _cute_operand_is_computed_fp8(lhs_node)
+            rhs_computed_fp8 = _cute_operand_is_computed_fp8(rhs_node)
+            if (
+                lhs_dtype is not None
+                and rhs_dtype is not None
+                and _needs_f32_accumulator(lhs_dtype, rhs_dtype)
+            ):
+                lhs_term = _cast_operand_to_f32(
+                    lhs_term, lhs_dtype, is_computed_fp8=lhs_computed_fp8
+                )
+                rhs_term = _cast_operand_to_f32(
+                    rhs_term, rhs_dtype, is_computed_fp8=rhs_computed_fp8
+                )
+        product = expr_from_string("{lhs} * {rhs}", lhs=lhs_term, rhs=rhs_term)
+        if reduction_dtype is not None:
+            product = cast_ast(product, reduction_dtype)
+        if k_block_id is not None:
+            reduction_input = cg.lift(product, dce=True, prefix="dot_product").id
+            reduced_expr: ast.AST = expr_from_string(
+                _emit_cute_grouped_sum_reduction(
+                    cg,
+                    reduction_input,
+                    value_dtype=value_dtype,
+                    loop_state=loop_state,
+                    k_block_id=k_block_id,
+                )
+            )
+        else:
+            reduced_expr = product
+            if static_k_extent is not None and static_k_extent > 1:
+                scale = expr_from_string(
+                    f"{backend.dtype_str(value_dtype)}({static_k_extent})"
+                )
+                reduced_expr = expr_from_string(
+                    "({product}) * ({scale})", product=reduced_expr, scale=scale
+                )
+        cg.add_statement(
+            statement_from_string(
+                f"{out_acc} = {out_acc} + ({{reduced}})", reduced=reduced_expr
+            )
+        )
+
+    for_node = statement_from_string(f"for {n_var} in range({n_extent}):\n    pass")
+    assert isinstance(for_node, ast.For)
+    for_node.body = cast("list[ast.stmt]", loop_body)
+    cg.add_statement(for_node)
+
+    result: ast.AST = expr_from_string(out_acc)
+    base_acc = acc
+    if acc_dtype is not None and acc_dtype != reduction_dtype and reduction_dtype:
+        base_acc = cast_ast(base_acc, reduction_dtype)
+    result = expr_from_string("{acc} + {product}", acc=base_acc, product=result)
+    if acc_dtype is not None and acc_dtype != reduction_dtype:
+        result = cast_ast(result, acc_dtype)
+    return result
 
 
 def _emit_cute_matmul(

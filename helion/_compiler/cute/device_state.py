@@ -295,6 +295,15 @@ class CuteDeviceFunctionState:
         # step instead of the loop-invariant ``rhs[..., m, ...]``.  Empty
         # except while re-materializing a matmul operand load.
         self.matmul_operand_block_remap: dict[int, int] = {}
+        # Active block-id -> raw index-expression override for matmul operand
+        # re-materialization.  Used by the static-MN-collapse baddbmm path: the
+        # rhs free (N) axis shares a block_id with the lhs M (output) axis, so
+        # the standard resolver would index the rhs at the M thread index
+        # (computing only the diagonal).  Re-lowering the rhs with this override
+        # makes its N axis read a serial N-loop variable instead, and suppresses
+        # masking for that axis (the serial loop already covers exactly [0, C)).
+        # Empty except while re-materializing such an operand load.
+        self.matmul_operand_index_override: dict[int, str] = {}
 
     def register_tcgen05_store_value(
         self, name: str, value: CuteTcgen05StoreValue
