@@ -673,6 +673,22 @@ def _lane_varying_names(body: list[ast.AST], lane_var: str) -> set[str]:
     return varying
 
 
+def _lane_body_live_in(body: list[ast.AST], lane_var: str) -> set[str]:
+    """Names read in ``body`` before they are written (live-in), excluding the
+    lane var.  A loop-carried accumulator phi is live-in to the lane body."""
+    from .ast_read_writes import ReadWrites
+
+    written: set[str] = set()
+    live_in: set[str] = set()
+    for stmt in body:
+        rw = ReadWrites.from_ast(stmt)
+        for name in rw.reads:
+            if name != lane_var and name not in written:
+                live_in.add(name)
+        written |= set(rw.writes)
+    return live_in
+
+
 def _is_serial_for(stmt: ast.AST) -> bool:
     """Return True when ``stmt`` is an ordinary serial ``for`` loop (a device
     serial loop), NOT a per-thread lane loop."""
@@ -890,6 +906,306 @@ def _interchange_one_lane_loop(loop: ast.For, lane_var: str) -> list[ast.AST]:
     nest_b = loop
 
     return [nest_b, *nest_a]
+
+
+# ---------------------------------------------------------------------------
+# Chunked-recurrence (GDN) lane-invariant accumulator hoist.
+#
+# A chunked recurrence such as gdn_fwd_h carries an accumulator ``b_h`` across a
+# SERIAL chunk loop and, inside each chunk, contracts a matmul over the
+# within-chunk position ``c`` (lowered as an inner lane loop).  ``matmul_fallback``
+# emits the running-sum ``dot_acc`` form for this matmul (because the per-chunk
+# rescale is lane-invariant), producing inside the lane loop:
+#
+#       dot_acc_base = <lane-invariant rescale of b_h>      # e.g. b_h * decay
+#       dot_acc = dot_acc + <product(c)>                    # accumulate over c
+#       b_h = dot_acc_base + dot_acc                        # WRONG: per-lane reassign
+#
+# with ``dot_acc = <identity>`` reset OUTSIDE the chunk loop.  Reassigning ``b_h``
+# every lane iteration corrupts the recurrence (and any lane-invariant op that
+# must read the chunk-ENTRY ``b_h``, e.g. the store of ``b_h`` and the matmul
+# operand ``c_h = b_h``).  This pass restructures the nest to apply the rescale
+# and the final add once per chunk:
+#
+#   for chunk:
+#       dot_acc = <identity>                  # reset per chunk
+#       <lane-invariant chunk-entry stores using b_h>
+#       dot_acc_base = <rescale of frozen b_h>
+#       for lane:
+#           <producers; dot_acc = dot_acc + product(c)>
+#       b_h = dot_acc_base + dot_acc          # once per chunk
+# ---------------------------------------------------------------------------
+
+
+def _find_dot_acc_recurrence(
+    lane_loop: ast.For, lane_var: str
+) -> tuple[str, str, str] | None:
+    """If ``lane_loop`` ends with the chunked-recurrence ``dot_acc`` triple,
+    return ``(acc_var, dot_acc_base_var, dot_acc_var)``; else ``None``.
+
+    The triple (emitted by ``_emit_cute_matmul``'s lane-invariant ``dot_acc``
+    path) is, as the LAST three statements of the lane-loop body:
+
+        dot_acc_base = <expr>             # lane-invariant rescale of acc
+        dot_acc = dot_acc + <product>    # running sum over the lane axis
+        acc = dot_acc_base + dot_acc     # final combine
+    """
+    body = lane_loop.body
+    if len(body) < 3:
+        return None
+    base_stmt, sum_stmt, final_stmt = body[-3], body[-2], body[-1]
+
+    def assign_name(stmt: ast.AST) -> str | None:
+        if (
+            isinstance(stmt, ast.Assign)
+            and len(stmt.targets) == 1
+            and isinstance(stmt.targets[0], ast.Name)
+        ):
+            return stmt.targets[0].id
+        return None
+
+    base_var = assign_name(base_stmt)
+    dot_acc_var = assign_name(sum_stmt)
+    acc_var = assign_name(final_stmt)
+    if base_var is None or dot_acc_var is None or acc_var is None:
+        return None
+    if not (base_var.startswith("dot_acc_base") and dot_acc_var.startswith("dot_acc")):
+        return None
+    # ``dot_acc = dot_acc + product``: a running self-sum over the lane axis.
+    assert isinstance(sum_stmt, ast.Assign)
+    if not (
+        isinstance(sum_stmt.value, ast.BinOp)
+        and isinstance(sum_stmt.value.op, ast.Add)
+        and isinstance(sum_stmt.value.left, ast.Name)
+        and sum_stmt.value.left.id == dot_acc_var
+    ):
+        return None
+    # ``acc = dot_acc_base + dot_acc``: the final per-chunk combine.
+    assert isinstance(final_stmt, ast.Assign)
+    final_reads = {n.id for n in ast.walk(final_stmt.value) if isinstance(n, ast.Name)}
+    if final_reads != {base_var, dot_acc_var}:
+        return None
+    # The rescale (``dot_acc_base``) must be lane-INVARIANT: it must not read the
+    # lane var nor any value derived from it within the lane body.
+    lane_body: list[ast.AST] = list(body)
+    lane_varying = _lane_varying_names(lane_body, lane_var)
+    from .ast_read_writes import ReadWrites
+
+    base_reads = set(ReadWrites.from_ast(base_stmt).reads)
+    if lane_var in base_reads or (base_reads & lane_varying):
+        return None
+    return acc_var, base_var, dot_acc_var
+
+
+def _single_lane_loop_in_body(
+    body: list[ast.AST],
+) -> tuple[int, ast.For, str] | None:
+    """If ``body`` contains exactly one direct lane loop, return its index, the
+    loop node, and its lane var; else ``None``."""
+    found: tuple[int, ast.For, str] | None = None
+    for idx, stmt in enumerate(body):
+        lane_var = getattr(stmt, HELION_LANE_LOOP_VAR_ATTR, None)
+        if (
+            lane_var is not None
+            and isinstance(stmt, ast.For)
+            and isinstance(stmt.target, ast.Name)
+            and stmt.target.id == lane_var
+        ):
+            if found is not None:
+                return None
+            found = (idx, stmt, lane_var)
+    return found
+
+
+def _find_reset_assign(body: list[ast.AST], var: str) -> int | None:
+    """Index of the last ``var = <expr>`` plain assignment in ``body`` (the
+    ``dot_acc`` reset emitted before the chunk loop), or ``None``."""
+    for idx in range(len(body) - 1, -1, -1):
+        stmt = body[idx]
+        if (
+            isinstance(stmt, ast.Assign)
+            and len(stmt.targets) == 1
+            and isinstance(stmt.targets[0], ast.Name)
+            and stmt.targets[0].id == var
+        ):
+            return idx
+    return None
+
+
+def hoist_lane_invariant_chunk_recurrence(
+    body: list[ast.AST],
+) -> list[ast.AST]:
+    """Restructure ``for chunk: for lane: <dot_acc recurrence>`` nests so the
+    lane-invariant rescale, chunk-entry stores, and final accumulator combine
+    run once per chunk (see the module comment above).
+
+    Tightly gated: only fires on a serial chunk loop whose single inner lane
+    loop ends with the ``dot_acc`` triple and whose ``dot_acc`` reset sits in
+    the same statement list before the chunk loop.
+    """
+    new_body: list[ast.AST] = []
+    for stmt in body:
+        # Recurse into nested statement-bearing fields first.
+        for field in ("body", "orelse", "finalbody"):
+            old = getattr(stmt, field, None)
+            if isinstance(old, list) and all(isinstance(s, ast.stmt) for s in old):
+                setattr(stmt, field, hoist_lane_invariant_chunk_recurrence(old))
+
+        info = _detect_chunk_recurrence(stmt)
+        if info is None:
+            new_body.append(stmt)
+            continue
+        dot_acc_var = info[0]
+        reset_idx = _find_reset_assign(new_body, dot_acc_var)
+        if reset_idx is None:
+            # No relocatable reset found: bail out (leave nest unchanged).
+            new_body.append(stmt)
+            continue
+        reset_stmt = new_body.pop(reset_idx)
+        assert isinstance(stmt, ast.For)
+        new_body.append(_rewrite_chunk_recurrence(stmt, info, reset_stmt))
+    return new_body
+
+
+def _detect_chunk_recurrence(
+    stmt: ast.AST,
+) -> tuple[str, int, ast.For, str, str, str, str] | None:
+    """Return ``(dot_acc_var, lane_idx, lane_loop, lane_var, acc_var, base_var,
+    dot_acc_var)`` when ``stmt`` is a serial chunk loop carrying the ``dot_acc``
+    recurrence, else ``None``."""
+    if not _is_serial_for(stmt) or not isinstance(stmt, ast.For):
+        return None
+    found = _single_lane_loop_in_body(list(stmt.body))
+    if found is None:
+        return None
+    lane_idx, lane_loop, lane_var = found
+    triple = _find_dot_acc_recurrence(lane_loop, lane_var)
+    if triple is None:
+        return None
+    acc_var, base_var, dot_acc_var = triple
+    return dot_acc_var, lane_idx, lane_loop, lane_var, acc_var, base_var, dot_acc_var
+
+
+def _rewrite_chunk_recurrence(
+    stmt: ast.For,
+    info: tuple[str, int, ast.For, str, str, str, str],
+    reset_stmt: ast.AST,
+) -> ast.For:
+    """Build the restructured chunk loop (see module comment)."""
+    from .ast_read_writes import ReadWrites
+
+    _dot_acc, lane_idx, lane_loop, lane_var, acc_var, _base_var, _dot_acc2 = info
+    chunk_body: list[ast.AST] = list(stmt.body)
+    lane_body: list[ast.AST] = list(lane_loop.body)
+    base_stmt = lane_body[-3]
+    sum_stmt = lane_body[-2]
+    final_stmt = lane_body[-1]
+    producers: list[ast.AST] = lane_body[:-3]
+
+    lane_varying = _lane_varying_names(lane_body, lane_var)
+
+    def reads_lane(s: ast.AST) -> bool:
+        reads = set(ReadWrites.from_ast(s).reads)
+        return lane_var in reads or bool(reads & lane_varying)
+
+    # The "accumulator family": the names that all hold the chunk-ENTRY
+    # accumulator value.  Helion may capture the loop-carried phi through a chain
+    # of plain copy-aliases (``b_h_copy = b_h``; ``b_h_copy_0 = b_h_copy``) and
+    # the rescale / chunk-entry store read those copies, not ``acc_var`` (which
+    # is the chunk-EXIT result).  Build the copy-alias closure over the chunk
+    # prefix and the lane producers, seeded from the loop-carried phi: a name
+    # that is live-in to the lane body (read before written) and feeds the
+    # lane-invariant rescale ``base_stmt``.
+    chunk_prefix = chunk_body[:lane_idx]
+    copy_src: dict[str, str] = {}
+    for s in (*chunk_prefix, *producers):
+        if (
+            isinstance(s, ast.Assign)
+            and len(s.targets) == 1
+            and isinstance(s.targets[0], ast.Name)
+            and isinstance(s.value, ast.Name)
+        ):
+            copy_src[s.targets[0].id] = s.value.id
+
+    def copy_root(name: str) -> str:
+        seen: set[str] = set()
+        while name in copy_src and name not in seen:
+            seen.add(name)
+            name = copy_src[name]
+        return name
+
+    base_slice_indices, _ = _backward_slice(
+        producers, set(ReadWrites.from_ast(base_stmt).reads)
+    )
+    base_slice_reads = set(ReadWrites.from_ast(base_stmt).reads)
+    for i in base_slice_indices:
+        base_slice_reads |= set(ReadWrites.from_ast(producers[i]).reads)
+    lane_live_in = _lane_body_live_in(producers, lane_var)
+    phi_roots = {
+        copy_root(name) for name in base_slice_reads if copy_root(name) in lane_live_in
+    }
+    acc_family = set(phi_roots)
+    for name in (*copy_src.keys(),):
+        if copy_root(name) in phi_roots:
+            acc_family.add(name)
+
+    # Backward slice feeding the lane-invariant rescale ``base_stmt``: those
+    # producers are lane-invariant and hoist before the lane loop with it.
+    base_seed = set(ReadWrites.from_ast(base_stmt).reads)
+    hoist_indices, _ = _backward_slice(producers, base_seed)
+    hoist_set = set(hoist_indices)
+
+    # Lane-invariant side-effecting statements whose backward slice reaches the
+    # (frozen) chunk-ENTRY accumulator (the store of ``b_h``) must hoist before
+    # the lane loop so they run once per chunk on the frozen value; bring their
+    # producers along.  A store that does NOT read the accumulator stays in the
+    # lane loop (it is a genuinely per-lane side effect).
+    entry_indices: list[int] = []
+    for idx, prod in enumerate(producers):
+        if idx in hoist_set or reads_lane(prod) or not _has_side_effect(prod):
+            continue
+        slice_indices, _ = _backward_slice(
+            producers[:idx], set(ReadWrites.from_ast(prod).reads)
+        )
+        slice_reads = set(ReadWrites.from_ast(prod).reads)
+        for i in slice_indices:
+            slice_reads |= set(ReadWrites.from_ast(producers[i]).reads)
+        if not (acc_family & slice_reads):
+            continue
+        # The store + its lane-invariant producer slice all hoist.
+        if any(reads_lane(producers[i]) for i in slice_indices):
+            continue
+        entry_indices.append(idx)
+        hoist_set.update(slice_indices)
+
+    hoist_pre = sorted(hoist_set | set(entry_indices))
+    pre_lane = [producers[i] for i in hoist_pre]
+    lane_kept = [
+        producers[i]
+        for i in range(len(producers))
+        if i not in hoist_set and i not in set(entry_indices)
+    ]
+
+    new_lane_loop = _create_lane_loop(
+        lane_var, _lane_loop_extent(lane_loop), [*lane_kept, sum_stmt]
+    )
+    new_chunk_body: list[ast.AST] = [
+        *chunk_body[:lane_idx],
+        reset_stmt,
+        *pre_lane,
+        base_stmt,
+        new_lane_loop,
+        final_stmt,
+        *chunk_body[lane_idx + 1 :],
+    ]
+    return create(
+        ast.For,
+        target=stmt.target,
+        iter=stmt.iter,
+        body=new_chunk_body,
+        orelse=stmt.orelse,
+        type_comment=None,
+    )
 
 
 @dataclasses.dataclass
