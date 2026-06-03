@@ -1291,6 +1291,8 @@ class TestGenerateBestAvailablePopulation(unittest.TestCase):
         mock_search.settings = Settings()
         mock_search.log = MagicMock()
         mock_search.log.debug = MagicMock()
+        mock_search.args = ()
+        mock_search.kernel = None
         mock_search._find_similar_cached_configs = MagicMock(return_value=entries)
         return mock_search
 

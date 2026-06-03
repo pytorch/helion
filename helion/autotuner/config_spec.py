@@ -322,6 +322,7 @@ class ConfigSpec:
         self.has_pallas_inner_loops: bool = False
         self.has_symbolic_or_data_dependent_bounds: bool = False
         self._cute_tcgen05_config = CuteTcgen05Config(self)
+        self.compiler_default_config: helion.Config | None = None
         self.compiler_seed_configs: list[helion.Config] = []
         self.autotuner_heuristics: list[str] = []
         self.matmul_facts: list[MatmulFact] = []
@@ -1336,8 +1337,15 @@ class ConfigSpec:
                 overrides,
             )
 
-    def default_config(self) -> helion.Config:
+    def _base_default_config(self) -> helion.Config:
         config = self.flat_config(lambda x: x.default())
+        self._shrink_for_numel_constraints(config)
+        return config
+
+    def default_config(self) -> helion.Config:
+        if self.compiler_default_config is None:
+            return self._base_default_config()
+        config = helion.Config.from_dict(self.compiler_default_config.config)
         self._shrink_for_numel_constraints(config)
         return config
 

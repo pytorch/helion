@@ -821,7 +821,7 @@ class PopulationBasedSearch(BaseSearch):
         Generate initial population using default config, explicit seed configs,
         and cached configs.
 
-        Always starts with the default configuration, then adds up to
+        Starts with the default configuration, then adds up to
         MAX_BEST_AVAILABLE_CONFIGS matching cached configs from previous runs.
         Explicit seed configs provided by the caller are added ahead of cached
         configs and are not suppressed by cache-skip settings. No random configs
@@ -829,14 +829,15 @@ class PopulationBasedSearch(BaseSearch):
 
         Returns:
             A list of unique FlatConfig values for the initial population.
-            Minimum size is 1 (just default), plus any valid unique explicit
-            seed configs and up to autotune_best_available_max_configs cached
-            configs.
+            Minimum size is 1 (default), plus any valid unique explicit seed configs
+            and up to autotune_best_available_max_configs cached configs.
         """
-        # Always start with the default config
+        max_configs = self.settings.autotune_best_available_max_configs
+
+        seen: set[Config] = set()
         default_flat = self.config_gen.default_flat()
         default_config = self.config_gen.unflatten(default_flat)
-        seen: set[Config] = {default_config}
+        seen.add(default_config)
         result: list[FlatConfig] = [default_flat]
         self.log("Starting with default config")
 
@@ -868,7 +869,6 @@ class PopulationBasedSearch(BaseSearch):
             except (ValueError, TypeError, KeyError, AssertionError) as e:
                 self.log(f"Failed to transfer explicit seed config: {e}")
 
-        max_configs = self.settings.autotune_best_available_max_configs
         cached_entries = self._find_similar_cached_configs(max_configs)
 
         if cached_entries:

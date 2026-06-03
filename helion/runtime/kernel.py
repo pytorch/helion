@@ -506,7 +506,8 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
 
                 self.env.config_spec.configure_epilogue_subtile_autotune(args)
                 self.env.config_spec.compiler_seed_configs = compiler_seed_configs(
-                    self.env, self.host_function.device_ir
+                    self.env,
+                    self.host_function.device_ir,
                 )
 
                 # Post-compile FX-graph scan to detect kernels
@@ -1109,7 +1110,7 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
             if not is_ref_mode_enabled(self.kernel.settings):
                 kernel_decorator = self.format_kernel_decorator(config, self.settings)
                 print(
-                    f"Using default config:\n\t{kernel_decorator}",
+                    f"Using implicit config: {kernel_decorator}",
                     file=sys.stderr,
                 )
             return config

@@ -272,7 +272,7 @@ class ConfigGeneration:
 
     def flatten(self, config: Config) -> FlatConfig:
         """Inverse of unflatten: convert a Config to a FlatConfig."""
-        result = self.default_flat()
+        result = self._fragment_default_flat()
         flat_fields = self.config_spec._flat_fields()
         for key, (indices, is_sequence) in self._key_to_flat_indices.items():
             if key not in config.config:
@@ -390,9 +390,9 @@ class ConfigGeneration:
         self._shrink_for_numel_constraints(flat_config)
         self._repair_cute_num_threads(flat_config)
 
-    def default_flat(self) -> FlatConfig:
+    def _fragment_default_flat(self) -> FlatConfig:
         """
-        Retrieve the default flat configuration.
+        Retrieve the default flat configuration from raw fragment defaults.
 
         Returns:
             The default flat configuration values.
@@ -401,6 +401,17 @@ class ConfigGeneration:
         self._shrink_for_numel_constraints(config)
         self._repair_cute_num_threads(config)
         return config
+
+    def default_flat(self) -> FlatConfig:
+        """
+        Retrieve the default flat configuration.
+
+        Returns:
+            The default flat configuration values.
+        """
+        if self.config_spec.compiler_default_config is None:
+            return self._fragment_default_flat()
+        return self.flatten(self.config_spec.default_config())
 
     def seed_flat_config_pairs(
         self,
