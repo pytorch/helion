@@ -13,6 +13,7 @@ specifically tuned for Blackwell.
 from __future__ import annotations
 
 import math
+from typing import Any
 from typing import Callable
 
 import torch
@@ -76,25 +77,58 @@ def _fma_f32x2(a: torch.Tensor, b: torch.Tensor, c: torch.Tensor) -> torch.Tenso
 
 
 # %%
+# Best FWD AutoWS config found with Triton 3.6.0+fb.beta AutoWS patches.
+# Kept as a reference only; the active config below is unchanged from main.
+#   helion.Config(
+#       block_sizes=[128, 128],
+#       range_warp_specializes=[True, None],
+#       range_merge_epilogues=[True, None],
+#       range_data_partition_factors=[1, 0],
+#       range_tmem_alloc_algos=[2, 0],
+#       range_smem_alloc_algos=[1, 0],
+#       range_smem_budgets=[200000, 0],
+#       range_multi_buffers=[None, None],
+#       pid_type="persistent_interleaved",
+#       num_sm_multiplier=2,
+#       indexing=[
+#           "tensor_descriptor",
+#           "tensor_descriptor",
+#           "tensor_descriptor",
+#           "block_ptr",
+#           "tensor_descriptor",
+#       ],
+#       num_warps=4,
+#       num_stages=4,
+#       dot_stages=[0, 1],
+#       dot_orders=[0, 1],
+#       dot_channels=[
+#           ["opndB,smem,2,0"],
+#           ["opndB,smem,2,1"],
+#       ],
+#       _triton_range_id_data_partition_factor=0,
+#       _triton_range_value_data_partition_factor=0,
+#       _triton_config_maxRegAutoWS=196,
+#   )
 # pyrefly: ignore [no-matching-overload]
 @helion.kernel(
-    configs=[
-        helion.Config(
-            block_sizes=[256, N],
-            range_warp_specializes=[OUTER_LOOP or None, None if OUTER_LOOP else True],
-            range_multi_buffers=[None, False],
-            pid_type="persistent_interleaved",
-            indexing="tensor_descriptor",
-            num_warps=4,
-            num_stages=3,
-            _triton_range_id_data_partition_factor=0,
-            _triton_range_value_data_partition_factor=2,
-            _triton_config_maxRegAutoWS=maxreg,
-        )
-        for N in [64, 128]
-        for OUTER_LOOP in [True]
-        for maxreg in [152, 192]
-    ],
+    config=helion.Config(
+        block_sizes=[256, 128],
+        range_warp_specializes=[True, None],
+        range_multi_buffers=[None, None],
+        pid_type="persistent_interleaved",
+        indexing=[
+            "tensor_descriptor",  # q load
+            "tensor_descriptor",  # k load
+            "tensor_descriptor",  # v load
+            "block_ptr",  # lse store — block_ptr is correctly partitioned
+            "tensor_descriptor",  # o store   under WS dpf=2; pointer stores are not
+        ],
+        num_warps=4,
+        num_stages=3,
+        _triton_range_id_data_partition_factor=0,
+        _triton_range_value_data_partition_factor=2,
+        _triton_config_maxRegAutoWS=152,
+    ),
     static_shapes=True,
     autotune_accuracy_check=False,
 )
@@ -208,13 +242,238 @@ def blackwell_attention_kernel(
     return o.reshape(B, H, M, Dv), lse.reshape(B, H, M)
 
 
+# %%
+# Backward Kernel Implementation
+# -------------------------------
+
+
+@helion.kernel(
+    config=helion.Config(block_sizes=[128], num_warps=4),
+    static_shapes=True,
+)
+def _bwd_preprocess(o_in: torch.Tensor, do_in: torch.Tensor) -> torch.Tensor:
+    B, H, N, D = o_in.shape
+    D = hl.specialize(D)
+    o = o_in.reshape(-1, D)
+    do = do_in.reshape(-1, D)
+    total = o.size(0)
+    delta = torch.empty(total, device=o.device, dtype=torch.float32)
+    for tile in hl.tile(total):
+        delta[tile] = torch.sum(
+            o[tile, :].to(torch.float32) * do[tile, :].to(torch.float32), dim=-1
+        )
+    return delta.reshape(B, H, N)
+
+
+# %%
+# Best BWD AutoWS config found with Triton 3.6.0+fb.beta AutoWS patches.
+# To use it, the AutoWS branch also needs the public range controls and dot
+# scheduling controls shown here, plus the register tunable imported from
+# helion.autotuner.config_fragment.
+#
+#   helion.Config(
+#       block_sizes=[64, 128],
+#       range_warp_specializes=[True, True],
+#       range_merge_epilogues=[True, True],
+#       range_tmem_alloc_algos=[2, 2],
+#       range_smem_alloc_algos=[1, 1],
+#       range_smem_budgets=[232448, 232448],
+#       range_multi_buffers=[None, None],
+#       pid_type="persistent_interleaved",
+#       indexing=[
+#           "tensor_descriptor",
+#           "tensor_descriptor",
+#           "tensor_descriptor",
+#           "tensor_descriptor",
+#           "pointer",
+#           "pointer",
+#           "tensor_descriptor",
+#           "tensor_descriptor",
+#       ],
+#       atomic_indexing="tensor_descriptor",
+#       num_warps=4,
+#       num_stages=1,
+#       dot_stages=[0, 0, 0, 1, 1],
+#       dot_orders=[0, 2, 2, 1, 1],
+#       dot_channels=[
+#           ["opndA,smem,1,0", "opndB,smem,2,1", "opndD,tmem,1,2"],
+#           ["opndA,smem,1,3", "opndB,smem,1,4", "opndD,tmem,1,5"],
+#           ["opndA,tmem,1,2", "opndD,tmem,1,7"],
+#           ["opndA,smem,1,8", "opndD,tmem,1,11"],
+#           ["opndA,tmem,1,5", "opndD,tmem,1,10"],
+#       ],
+#       _triton_config_maxRegAutoWS=188,
+#   )
+#
+# The AutoWS variant also registers:
+#   hl.register_tunable(
+#       "_triton_config_maxRegAutoWS",
+#       EnumFragment(choices=(160, 168, 176, 184, 188, 192, 196)),
+#   )
+#
+# pyrefly: ignore [no-matching-overload]
+@helion.kernel(
+    config=helion.Config(
+        block_sizes=[64, 128],
+        indexing=[
+            "tensor_descriptor",
+            "tensor_descriptor",  # k, v loads
+            "tensor_descriptor",
+            "tensor_descriptor",  # q, do loads
+            "pointer",
+            "pointer",  # lse, delta loads
+            "tensor_descriptor",
+            "tensor_descriptor",  # dv, dk stores
+        ],
+        atomic_indexing="tensor_descriptor",
+        num_warps=4,
+        num_stages=2,
+    ),
+    static_shapes=True,
+    autotune_accuracy_check=False,
+)
+def blackwell_attention_backward_kernel(
+    q_in: torch.Tensor,
+    k_in: torch.Tensor,
+    v_in: torch.Tensor,
+    o_in: torch.Tensor,
+    lse_in: torch.Tensor,
+    do_in: torch.Tensor,
+    delta_in: torch.Tensor,
+    qk_scale: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Computes backward pass of scaled dot-product attention.
+
+    Args:
+        q_in: Query tensor [B, H, N, D]
+        k_in: Key tensor [B, H, N, D], pre-scaled by (sm_scale * RCP_LN2)
+        v_in: Value tensor [B, H, N, D]
+        o_in: Forward output tensor [B, H, N, D]
+        lse_in: Log-sum-exp from forward [B, H, N] (base-2)
+        do_in: Gradient of output [B, H, N, D]
+        delta_in: Precomputed (o * do).sum(-1) [B, H, N]
+        qk_scale: Scaling factor sqrt(1/D)
+
+    Returns:
+        (dq, dk, dv) gradient tensors, each [B, H, N, D]
+    """
+    B, H, N, D = q_in.shape
+    Bk, Hk, Nk, Dk = k_in.shape
+    assert Bk == B and Hk == H and Nk == N and Dk == D
+    Bv, Hv, Nv, Dv = v_in.shape
+    assert Bv == B and Hv == H and Nv == N and Dv == D
+    Bo, Ho, No, Do = o_in.shape
+    assert Bo == B and Ho == H and No == N and Do == D
+    Bd, Hd, Ndo, Ddo = do_in.shape
+    assert Bd == B and Hd == H and Ndo == N and Ddo == D
+    D = hl.specialize(D)
+    q = q_in.reshape(-1, D)
+    k = k_in.reshape(-1, D)
+    v = v_in.reshape(-1, D)
+    do = do_in.reshape(-1, D)
+    lse = lse_in.reshape(-1)
+    delta = delta_in.reshape(-1)
+    total_rows = q.size(0)
+    LN2: float = 0.6931471824645996
+    dq = torch.zeros((total_rows, D), device=q.device, dtype=torch.float32)
+    dk = torch.empty_like(k)
+    dv = torch.empty_like(v)
+    block_m = hl.register_block_size(N)
+    block_n = hl.register_block_size(N)
+    assert N % block_m == 0 and N % block_n == 0
+    for tile_n in hl.tile(total_rows, block_size=block_n):
+        k_j = k[tile_n, :]
+        v_j = v[tile_n, :]
+        dv_acc = hl.zeros([tile_n, D], dtype=torch.float32)
+        dk_acc = hl.zeros([tile_n, D], dtype=torch.float32)
+        start_m = tile_n.begin // N * N
+        end_m = start_m + N
+        for tile_m in hl.tile(start_m, end_m, block_size=block_m):
+            q_i = q[tile_m, :]
+            do_i = do[tile_m, :]
+            m_i = lse[tile_m]
+            di = delta[tile_m]
+            qk_t = hl.dot(k_j, q_i.T, out_dtype=torch.float32)
+            p_t = torch.exp2(qk_t - m_i[None, :])
+            dp_t = hl.dot(v_j, do_i.T, out_dtype=torch.float32)
+            dv_acc = hl.dot(p_t.to(v.dtype), do_i, acc=dv_acc)
+            ds_t = (p_t * (dp_t - di[None, :])).to(q.dtype)
+            dq_acc = hl.dot(ds_t.T, k_j, out_dtype=torch.float32)
+            hl.atomic_add(dq, [tile_m, slice(None)], dq_acc * LN2)
+            dk_acc = hl.dot(ds_t, q_i, acc=dk_acc)
+        dv[tile_n, :] = dv_acc.to(v.dtype)
+        dk[tile_n, :] = (dk_acc * qk_scale).to(k.dtype)
+    return (
+        dq.reshape(B, H, N, D),
+        dk.reshape(B, H, N, D),
+        dv.reshape(B, H, N, D),
+    )
+
+
+# %%
+# Autograd Function
+# -----------------
+
+
+# %%
+class _BlackwellAttentionFunc(torch.autograd.Function):
+    @staticmethod
+    def forward(  # pyrefly: ignore [bad-override]
+        ctx: Any,  # noqa: ANN401
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        sm_scale: float,
+    ) -> torch.Tensor:
+        o, lse = blackwell_attention_kernel(q, k, v, qk_scale=sm_scale)
+        ctx.save_for_backward(q, k, v, o, lse)
+        ctx.sm_scale = sm_scale  # type: ignore[attr-defined]
+        return o
+
+    @staticmethod
+    def backward(  # type: ignore[override]
+        ctx: Any,  # noqa: ANN401
+        do: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, None]:
+        q, k, v, o, lse = ctx.saved_tensors
+        sm_scale = ctx.sm_scale  # type: ignore[attr-defined]
+        RCP_LN2 = 1.4426950408889634
+        k_scaled = k * (sm_scale * RCP_LN2)
+        delta = _bwd_preprocess(o, do)
+        dq, dk, dv = blackwell_attention_backward_kernel(
+            q, k_scaled, v, o, lse, do.contiguous(), delta, sm_scale
+        )
+        return dq, dk, dv, None
+
+
 def blackwell_attention(
     q: torch.Tensor, k: torch.Tensor, v: torch.Tensor
 ) -> tuple[torch.Tensor, torch.Tensor]:
     return blackwell_attention_kernel(q, k, v, qk_scale=math.sqrt(1.0 / q.shape[-1]))
 
 
+def blackwell_attention_fwd_bwd(
+    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor
+) -> torch.Tensor:
+    return _BlackwellAttentionFunc.apply(q, k, v, math.sqrt(1.0 / q.shape[-1]))
+
+
 def blackwell_attention_tritonbench(
+    tb_mod: object, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor
+) -> Callable:
+    q = q.detach().requires_grad_(True)
+    k = k.detach().requires_grad_(True)
+    v = v.detach().requires_grad_(True)
+
+    def fn() -> list[torch.Tensor]:
+        return [blackwell_attention_fwd_bwd(q, k, v)]
+
+    fn._grad_inputs = [q, k, v]  # type: ignore[attr-defined]
+    return fn
+
+
+def blackwell_attention_forward_tritonbench(
     tb_mod: object, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor
 ) -> Callable:
     return lambda: blackwell_attention(q, k, v)

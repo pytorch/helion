@@ -422,7 +422,7 @@ class TestTensorDescriptor(RefEagerTestBase, TestCase):
         check_example(
             "attention",
             args,
-            torch.nn.functional.scaled_dot_product_attention(*args),
+            (torch.nn.functional.scaled_dot_product_attention(*args), None),
             emit_code=False,
             block_sizes=[1, 128, 64],
             indexing="tensor_descriptor",
@@ -438,7 +438,7 @@ class TestTensorDescriptor(RefEagerTestBase, TestCase):
         check_example(
             "attention",
             args,
-            torch.nn.functional.scaled_dot_product_attention(*args),
+            (torch.nn.functional.scaled_dot_product_attention(*args), None),
             fn_name="attention_dynamic",
             emit_code=False,
             block_sizes=[1, 16, 16],
