@@ -1182,6 +1182,65 @@ class TestPallas(TestCase):
             "(direct-dispatch path engaged), not stay on the slow path.",
         )
 
+    @skipIfPallasInterpret(
+        "direct call_custom_kernel dispatch is torch_tpu/TPU-only; the "
+        "_DirectCallKernel snapshot is not built in JAX interpret mode"
+    )
+    def test_pallas_direct_call_sig_check_locks_on_static_shapes(self) -> None:
+        """Repeat direct-dispatch calls flip ``_DirectCallKernel.sig_locked`` to
+        ``True``, eliding the per-call sig check on a static-shape kernel."""
+
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def _matmul_sig_lock_pin(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty(
+                [m, n],
+                device=x.device,
+                dtype=torch.promote_types(x.dtype, y.dtype),
+            )
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = acc
+            return out
+
+        torch.manual_seed(0)
+        x = torch.randn(256, 256, device=DEVICE, dtype=torch.bfloat16)
+        torch.manual_seed(1)
+        y = torch.randn(256, 256, device=DEVICE, dtype=torch.bfloat16)
+
+        bound = _matmul_sig_lock_pin.bind((x, y))
+        config = bound.config_spec.default_config()
+        compiled_fn = bound.compile_config(config)
+
+        reference = compiled_fn(x, y).clone()
+        for _ in range(5):
+            result = compiled_fn(x, y)
+            self.assertTrue(
+                torch.equal(result, reference),
+                "Sig-locked direct-dispatch call output diverged "
+                "(max_abs_diff="
+                f"{(result.float() - reference.float()).abs().max().item()}).",
+            )
+
+        # Slot 5 of the launcher cache holds the _DirectCallKernel snapshot.
+        cache_attrs = ("_pallas_cache", "_pallas_pipeline_cache", "_pallas_fori_cache")
+        caches = [
+            getattr(value, a)
+            for value in compiled_fn.__globals__.values()
+            for a in cache_attrs
+            if getattr(value, a, None) is not None
+        ]
+        self.assertTrue(caches, "Launcher cache was not populated.")
+        direct_call = caches[0][5]
+        self.assertIsNotNone(direct_call, "Direct-call snapshot was not built.")
+        self.assertTrue(
+            direct_call.sig_locked,
+            "Repeat direct-dispatch calls must flip sig_locked to True.",
+        )
+
     def test_pallas_launcher_caches_output_tensor(self) -> None:
         """Static-shape kernel caches the output ``device='meta'`` placeholder and
         reuses the same object across calls (no per-call re-allocation)."""

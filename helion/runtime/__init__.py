@@ -531,8 +531,10 @@ class _DirectCallKernel:
 
     Built lazily on the first call of a static-shape Pallas kernel and
     attached to the launcher cache so subsequent calls bypass
-    ``JaxCallable.__call__``.  ``sig`` guards against shape changes on a
-    reused cache entry (mismatch falls back to the JaxCallable slow path).
+    ``JaxCallable.__call__``.  ``sig`` guards against shape changes (mismatch
+    falls back to JaxCallable); ``sig_locked`` flips after the first match so
+    later calls skip the sig check.  ``invoke`` is a pre-baked dispatch closure
+    populated by ``_build_direct_call_invoke``.
     """
 
     call_custom_kernel: object
@@ -543,6 +545,48 @@ class _DirectCallKernel:
     out_tree: object
     alias_items: tuple[tuple[int, int], ...]
     sig: tuple[object, ...]
+    invoke: object
+    sig_locked: bool = False
+
+
+def _build_direct_call_invoke(
+    call_custom_kernel: object,
+    kernel_name: str,
+    kernel_key: str,
+    output_shapes: object,
+    donate_argnums: object,
+    out_tree: object,
+    alias_items: tuple[tuple[int, int], ...],
+) -> object:
+    """Pre-bake a closure that runs the direct-dispatch hot path; two variants
+    (no-alias / with-alias) avoid a per-call branch on ``alias_items``."""
+    if not alias_items:
+
+        def invoke_no_alias(input_tensors: list[object]) -> object:
+            results = call_custom_kernel(  # type: ignore[operator]
+                kernel_name,
+                kernel_key,
+                inputs=input_tensors,
+                output_shapes=output_shapes,
+                donate_argnums=donate_argnums,
+            )
+            return out_tree.unflatten(results)  # type: ignore[attr-defined]
+
+        return invoke_no_alias
+
+    def invoke_with_alias(input_tensors: list[object]) -> object:
+        results = call_custom_kernel(  # type: ignore[operator]
+            kernel_name,
+            kernel_key,
+            inputs=input_tensors,
+            output_shapes=output_shapes,
+            donate_argnums=donate_argnums,
+        )
+        for in_idx, out_idx in alias_items:
+            input_tensors[in_idx].copy_(results[out_idx])  # type: ignore[attr-defined]
+        return out_tree.unflatten(results)  # type: ignore[attr-defined]
+
+    return invoke_with_alias
 
 
 _HELION_STATIC_JAX_CALLABLE_CLASS: type | None = None
@@ -604,7 +648,17 @@ def _make_helion_static_jax_callable_class() -> type:
             )
             alias_items = tuple(self.input_output_aliases.items())
             # Stash the launcher-side direct-call structure so the next call
-            # can bypass this ``__call__`` entirely.
+            # can bypass this ``__call__`` entirely.  Pre-bake ``invoke`` now
+            # so the hot path skips the attribute walk + kwargs dict alloc.
+            invoke = _build_direct_call_invoke(
+                tpu_torch_pallas.call_custom_kernel,
+                self.name,
+                kernel_key,
+                output_shapes,
+                self.donate_argnums,
+                out_tree,
+                alias_items,
+            )
             self._helion_direct_call = _DirectCallKernel(
                 call_custom_kernel=tpu_torch_pallas.call_custom_kernel,
                 kernel_name=self.name,
@@ -614,6 +668,7 @@ def _make_helion_static_jax_callable_class() -> type:
                 out_tree=out_tree,
                 alias_items=alias_items,
                 sig=sig_tuple,
+                invoke=invoke,
             )
             return result
 
@@ -797,24 +852,22 @@ def _pallas_invoke_and_return_fast(
         cast("torch.Tensor", args[i]).contiguous() for i in tensor_arg_indices
     ]
     if direct_call is not None:
-        # Guard on shape/dtype sig: mismatch (dynamic shape reusing cache entry)
-        # falls back to the JaxCallable slow path.
-        direct_sig: tuple[object, ...] = tuple(
-            (a.shape, a.dtype) for a in input_tensors
-        )
-        if direct_sig == direct_call.sig:
-            results = direct_call.call_custom_kernel(  # type: ignore[operator]
-                direct_call.kernel_name,
-                direct_call.kernel_key,
-                inputs=input_tensors,
-                output_shapes=direct_call.output_shapes,
-                donate_argnums=direct_call.donate_argnums,
-            )
-            for in_idx, out_idx in direct_call.alias_items:
-                input_tensors[in_idx].copy_(results[out_idx])
-            results = direct_call.out_tree.unflatten(results)  # type: ignore[attr-defined]
+        # Once the sig matches once, grid-keyed cache + static_shapes makes
+        # subsequent sig checks constant-True; skip them on the locked path
+        # and call the pre-baked ``invoke`` closure directly.
+        if direct_call.sig_locked:
+            results = direct_call.invoke(input_tensors)  # type: ignore[operator]
         else:
-            results = jax_callable(*input_tensors)  # type: ignore[operator]
+            # First direct-dispatch call: verify sig, flip the lock on match.
+            # Mismatch (dynamic shape reusing cache) falls back to JaxCallable.
+            direct_sig: tuple[object, ...] = tuple(
+                (a.shape, a.dtype) for a in input_tensors
+            )
+            if direct_sig == direct_call.sig:
+                direct_call.sig_locked = True
+                results = direct_call.invoke(input_tensors)  # type: ignore[operator]
+            else:
+                results = jax_callable(*input_tensors)  # type: ignore[operator]
     else:
         results = jax_callable(*input_tensors)  # type: ignore[operator]
 
@@ -822,6 +875,13 @@ def _pallas_invoke_and_return_fast(
     if output_only_count == 0 and _orig_output_tensors is None:
         # Hottest path: in-place outputs already written through donated aliases.
         return None
+    # Hot single-output (matmul) short-circuit: skip result post-processing.
+    if (
+        output_only_count == 1
+        and _orig_output_tensors is None
+        and isinstance(results, torch.Tensor)
+    ):
+        return results
 
     return _pallas_collect_outputs(
         results,
