@@ -1826,6 +1826,139 @@ def _codegen_cute_affine_range_store(
     )
 
 
+def _codegen_cute_affine_reshape_store(
+    state: CodegenState,
+    tensor: torch.Tensor,
+    subscript: list[object] | tuple[object, ...],
+    ast_subscript: list[object] | tuple[object, ...],
+    extra_mask: ast.AST | None,
+    value_node: torch.fx.Node | None,
+) -> ast.AST | None:
+    """Lower a 2-D affine-row store fed by a reshape/stack chain.
+
+    Handles ``out[(begin*K):(begin*K + block*K), tile_n] = reshaped`` where the
+    leading index is a ``CuteAffineRangeIndex`` (factor ``K``) over the m-tile,
+    the trailing index is the n-tile, and the value is a row-major shape chain
+    (e.g. ``stack([a, b], dim=1).reshape(block*K, block_n)``).
+
+    Each m-tile thread owns row ``m_local`` of the source; the reshaped tensor
+    has ``K`` rows per source row, so the thread loops ``s in range(K)`` and
+    writes the value resolved at flat index ``(K*m_local + s)*block_n + n_local``
+    to output row ``K*m_global + s``, column ``n_global``.
+    """
+    from .._compiler.ast_extension import create
+    from .._compiler.cute.cute_reshape import _get_block_local_coord
+    from .._compiler.cute.cute_reshape import resolve_cute_shape_chain_value_at
+    from .._compiler.cute.indexing import CuteAffineRangeIndex
+    from .._compiler.cute.indexing import is_cute_shape_chain_target
+    from .._compiler.generate_ast import GenerateAST
+
+    if (
+        tensor.ndim != 2
+        or len(subscript) != 2
+        or len(ast_subscript) != 2
+        or extra_mask is not None
+        or value_node is None
+        or not isinstance(state.codegen, GenerateAST)
+    ):
+        return None
+    affine = ast_subscript[0]
+    if not isinstance(affine, CuteAffineRangeIndex):
+        return None
+    if affine.step != 1 or affine.factor <= 0:
+        return None
+    n_index = subscript[1]
+    if not isinstance(n_index, torch.SymInt):
+        return None
+    env = CompileEnvironment.current()
+    block_id_n = env.get_block_id(n_index)
+    if block_id_n is None:
+        return None
+    block_id_m = _cute_affine_range_block_id(state, affine)
+    if block_id_m is None:
+        return None
+
+    if value_node.op != "call_function" or not is_cute_shape_chain_target(
+        value_node.target
+    ):
+        return None
+    value_val = value_node.meta.get("val")
+    if not isinstance(value_val, torch.Tensor) or value_val.ndim != 2:
+        return None
+
+    m_global = _cute_active_index_var(state, block_id_m)
+    n_global = _cute_active_index_var(state, block_id_n)
+    if m_global is None or n_global is None:
+        return None
+    m_local = _get_block_local_coord(state.codegen, block_id_m)
+    n_local = _get_block_local_coord(state.codegen, block_id_n)
+    if m_local is None or n_local is None:
+        return None
+    block_n = state.device_function.resolved_block_size(block_id_n)
+    if not isinstance(block_n, int):
+        return None
+
+    factor = affine.factor
+    lane_var = state.device_function.new_var("affine_lane", dce=True)
+    row_local = f"cutlass.Int32({factor}) * ({m_local}) + cutlass.Int32({lane_var})"
+    flat_index = (
+        f"(({row_local}) * cutlass.Int32({block_n})) + ({n_local})"
+        if block_n != 1
+        else f"({row_local}) + ({n_local})"
+    )
+    value_ast = resolve_cute_shape_chain_value_at(state, value_node, flat_index)
+    if value_ast is None:
+        return None
+
+    backend = env.backend
+    index_dtype = backend.dtype_str(env.index_dtype)
+    target_dtype = backend.dtype_str(tensor.dtype)
+    value_expr = backend.ast_to_dtype_expr(ast.unparse(value_ast), target_dtype)
+
+    # Bind the resolved (possibly select-based) value to a variable so the CuTe
+    # DSL sees the stack `ifexp` as its own assignment rather than nested inside
+    # the `.store(...)` call / masked store ternary.
+    value_var = state.device_function.new_var("affine_value", dce=True)
+
+    row_index = (
+        f"{index_dtype}(cutlass.Int32({factor}) * ({m_global}) "
+        f"+ cutlass.Int32({lane_var}))"
+    )
+    col_index = f"{index_dtype}({n_global})"
+    tensor_name = state.device_function.tensor_arg(tensor).name
+    store_expr = _cute_scalar_store_expr(tensor_name, [row_index, col_index], value_var)
+
+    store_stmt: ast.stmt = create(ast.Expr, value=expr_from_string(store_expr))
+    mask_parts = [
+        mask
+        for mask in (
+            _cute_active_mask_var(state, block_id_m),
+            _cute_active_mask_var(state, block_id_n),
+        )
+        if mask is not None
+    ]
+    if mask_parts:
+        # Use a guard statement (not a ternary) so the CuTe DSL accepts the
+        # device-value mask condition.
+        mask_ast = expr_from_string(" and ".join(mask_parts))
+        assert isinstance(mask_ast, ast.expr)
+        store_stmt = ast.fix_missing_locations(
+            ast.If(test=mask_ast, body=[store_stmt], orelse=[])
+        )
+
+    return create(
+        ast.For,
+        target=create(ast.Name, id=lane_var, ctx=ast.Store()),
+        iter=expr_from_string(f"range({factor})"),
+        body=[
+            statement_from_string(f"{value_var} = {value_expr}"),
+            store_stmt,
+        ],
+        orelse=[],
+        type_comment=None,
+    )
+
+
 def _is_cute_affine_range_load_for_store(
     state: CodegenState,
     subscript: list[object] | tuple[object, ...],
@@ -5154,6 +5287,17 @@ def _(state: CodegenState) -> ast.AST:
         )
         if affine_range_store is not None:
             state.add_statement(affine_range_store)
+            return ast.Constant(value=None)
+        affine_reshape_store = _codegen_cute_affine_reshape_store(
+            state,
+            tensor,
+            subscript,
+            ast_subscript,
+            extra_mask,
+            value_node,
+        )
+        if affine_reshape_store is not None:
+            state.add_statement(affine_reshape_store)
             return ast.Constant(value=None)
         strided_slice_store = _codegen_cute_strided_slice_store(
             state,

@@ -115,7 +115,6 @@ class TestViews(RefEagerTestBase, TestCase):
         _code, result = code_and_output(fn, args)
         torch.testing.assert_close(result, args[0] + args[1].transpose(0, 1))
 
-    @xfailIfCute("CuTe transpose+unsqueeze chain produces incorrect values")
     def test_transpose_T_unsqueeze(self):
         @helion.kernel(autotune_effort="none")
         def fn(x: torch.Tensor) -> torch.Tensor:
@@ -316,7 +315,6 @@ class TestViews(RefEagerTestBase, TestCase):
         expected = x.sum(dim=(1, 2))
         torch.testing.assert_close(result, expected)
 
-    @xfailIfCute("torch.stack with affine hl.arange indexing not supported on cute")
     @xfailIfPallas("torch.stack not supported on pallas")
     def test_stack_power_of_2(self):
         @helion.kernel(autotune_effort="none", static_shapes=True)

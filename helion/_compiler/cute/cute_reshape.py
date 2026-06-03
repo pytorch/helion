@@ -541,6 +541,67 @@ def _stack_choice_expr(
     return selected
 
 
+def _permute_node_perm(node: Node, value: torch.Tensor) -> list[int] | None:
+    """Return the explicit permutation for a permute/transpose/t node."""
+    if node.target is torch.ops.aten.permute.default:
+        dims = node.args[1] if len(node.args) > 1 else node.kwargs.get("dims")
+        if not isinstance(dims, (list, tuple)):
+            return None
+        perm = [dim for dim in dims if isinstance(dim, int)]
+        return perm if len(perm) == len(dims) else None
+    if node.target is torch.ops.aten.transpose.int:
+        dim0 = node.args[1] if len(node.args) > 1 else node.kwargs.get("dim0")
+        dim1 = node.args[2] if len(node.args) > 2 else node.kwargs.get("dim1")
+        if not isinstance(dim0, int) or not isinstance(dim1, int):
+            return None
+        ndim = len(value.shape)
+        dim0 %= ndim
+        dim1 %= ndim
+        perm = list(range(ndim))
+        perm[dim0], perm[dim1] = perm[dim1], perm[dim0]
+        return perm
+    if node.target is torch.ops.aten.t.default:
+        if len(value.shape) != 2:
+            return None
+        return [1, 0]
+    return None
+
+
+def _materialized_permute_value(
+    ctx: LoweringContext,
+    node: Node,
+    value: torch.Tensor,
+) -> ast.AST | None:
+    """Return the already-materialized AST for a permute/transpose/t node.
+
+    ``codegen_cute_permute`` materializes a permute to a concrete scalar (via a
+    shared-memory shuffle) whenever it reorders active thread dims *and* a
+    downstream consumer needs values. When a later shape op folds back through
+    such a node we must reuse that materialized value instead of re-folding the
+    coordinate swap all the way to the raw source (which would silently drop the
+    already-emitted shuffle).
+    """
+    if not node.args:
+        return None
+    source = node.args[0]
+    if not isinstance(source, Node):
+        return None
+    source_val = source.meta.get("val")
+    if not isinstance(source_val, torch.Tensor):
+        return None
+    perm = _permute_node_perm(node, value)
+    if perm is None:
+        return None
+    cg = cast("GenerateAST", ctx.cg)
+    if not (
+        _permute_reorders_active_dims(cg, source_val, perm)
+        and _permute_needs_materialization(node)
+    ):
+        return None
+    resolved = ctx.env.get(node)
+    return resolved if isinstance(resolved, ast.AST) else None
+
+
 def _resolve_shape_chain_expr(
     ctx: LoweringContext,
     node: Node,
@@ -553,6 +614,16 @@ def _resolve_shape_chain_expr(
     if not isinstance(value, torch.Tensor):
         resolved = ctx.env.get(node)
         return resolved if isinstance(resolved, ast.AST) else None
+
+    # A permute/transpose/t node that was already materialized to a concrete
+    # per-thread scalar must not be folded again: doing so would silently drop
+    # the shuffle that already applied its coordinate swap and recurse to the raw
+    # source, collapsing two transposes into one. The materialized value already
+    # holds the correct element for the current thread (just like a load), so we
+    # return it directly as a chain leaf.
+    materialized = _materialized_permute_value(ctx, node, value)
+    if materialized is not None:
+        return materialized
 
     if node.target in (
         torch.ops.aten.reshape.default,
@@ -745,6 +816,26 @@ def resolve_cute_shape_chain_value(
     return _resolve_shape_chain_expr(
         ctx, node, _current_flat_index_for_value(ctx, value)
     )
+
+
+def resolve_cute_shape_chain_value_at(
+    state: CodegenState,
+    node: Node,
+    flat_index: str,
+) -> ast.AST | None:
+    """Resolve a shape-chain value (reshape/stack/...) at an explicit flat index.
+
+    The store path holds a ``CodegenState`` rather than the ``GraphInterpreter``
+    ``LoweringContext`` that the regular value-lowering path uses, but the shape
+    chain resolver only needs the ``GenerateAST`` codegen object and the
+    fx-node -> argument map, both of which ``CodegenState`` already carries.
+    """
+    from ..aten_lowering import LoweringContext
+
+    ctx = LoweringContext.__new__(LoweringContext)
+    ctx.cg = state.codegen
+    ctx.env = state.env
+    return _resolve_shape_chain_expr(ctx, node, flat_index)
 
 
 def codegen_cute_reshape(ctx: LoweringContext, node: Node) -> object:
