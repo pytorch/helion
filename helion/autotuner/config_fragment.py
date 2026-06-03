@@ -524,6 +524,7 @@ class DynamicGridFoldingFragment(ConfigSpecFragment):
 
         if current_gen < self.min_generation:
             # Early generations: only allow no folding (factor 0)
+            # Partial folding factors (2, 4, 8, ...) and full folding (-1) are restricted
             return (0,)
 
         # Later generations: allow factors up to max_factor

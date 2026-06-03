@@ -487,6 +487,7 @@ class TestGridFoldingHeuristic(TestCase):
         x: torch.Tensor, y: torch.Tensor
     ) -> list[tuple[int, ...]]:
         """Bind add_2d_kernel and return per-dim folding choices."""
+        from helion.autotuner.config_fragment import DynamicGridFoldingFragment
         from helion.autotuner.config_fragment import EnumFragment
         from helion.autotuner.config_fragment import PerDimListOf
 
@@ -498,8 +499,14 @@ class TestGridFoldingHeuristic(TestCase):
         assert isinstance(frag, PerDimListOf)
         choices = []
         for f in frag.fragments:
-            assert isinstance(f, EnumFragment)
-            choices.append(f.choices)
+            # Handle both EnumFragment (static) and DynamicGridFoldingFragment (dynamic)
+            if isinstance(f, EnumFragment):
+                choices.append(f.choices)
+            elif isinstance(f, DynamicGridFoldingFragment):
+                # For dynamic fragments, get choices at generation 0 (default)
+                choices.append(f._get_allowed_choices())
+            else:
+                raise AssertionError(f"Unexpected fragment type: {type(f)}")
         return choices
 
     @staticmethod
@@ -507,6 +514,7 @@ class TestGridFoldingHeuristic(TestCase):
         x: torch.Tensor, y: torch.Tensor
     ) -> list[tuple[int, ...]]:
         """Bind add_3d_kernel and return per-dim folding choices."""
+        from helion.autotuner.config_fragment import DynamicGridFoldingFragment
         from helion.autotuner.config_fragment import EnumFragment
         from helion.autotuner.config_fragment import PerDimListOf
 
@@ -518,8 +526,14 @@ class TestGridFoldingHeuristic(TestCase):
         assert isinstance(frag, PerDimListOf)
         choices = []
         for f in frag.fragments:
-            assert isinstance(f, EnumFragment)
-            choices.append(f.choices)
+            # Handle both EnumFragment (static) and DynamicGridFoldingFragment (dynamic)
+            if isinstance(f, EnumFragment):
+                choices.append(f.choices)
+            elif isinstance(f, DynamicGridFoldingFragment):
+                # For dynamic fragments, get choices at generation 0 (default)
+                choices.append(f._get_allowed_choices())
+            else:
+                raise AssertionError(f"Unexpected fragment type: {type(f)}")
         return choices
 
     def test_small_dims_no_partial_folding(self):
@@ -668,11 +682,11 @@ class TestGridFoldingHeuristic(TestCase):
             device=DEVICE,
         )
         choices_below = self._get_folding_choices_2d(x_below, y_below)
-        # dim 0 should have only [0, -1]
+        # dim 0 should have only [0] (no folding at all for very small dims)
         self.assertEqual(
             choices_below[0],
-            (0, -1),
-            f"Expected small dim to have only [0, -1], got {choices_below[0]}",
+            (0,),
+            f"Expected small dim to have only [0], got {choices_below[0]}",
         )
 
     def test_max_factor_scaling(self):
@@ -724,11 +738,11 @@ class TestGridFoldingHeuristic(TestCase):
             f"Expected increasing choices with size: {choices}",
         )
 
-        # Verify smallest dim has only [0, -1]
+        # Verify smallest dim has only [0] (no folding for very small dims)
         self.assertEqual(
             choices[0],
-            (0, -1),
-            f"Expected smallest dim to have only [0, -1], got {choices[0]}",
+            (0,),
+            f"Expected smallest dim to have only [0], got {choices[0]}",
         )
 
     def test_symbolic_shape_fallback(self):
