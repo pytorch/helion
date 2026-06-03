@@ -629,7 +629,6 @@ class TestPallas(TestCase):
         self.assertNotIn("pltpu.emit_pipeline", code)
         self.assertIn("out[:]", code)
 
-    @xfailIfPallasInterpret("numerical mismatch in JAX interpret mode")
     def test_pipeline_kernel_tile_begin_plus_offset_is_elementwise(self) -> None:
         x = torch.arange(1024, device=DEVICE, dtype=torch.float32)
         code, result = code_and_output(
