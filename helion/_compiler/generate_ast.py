@@ -681,11 +681,46 @@ class GenerateAST(NodeVisitor, CodegenInterface):
                     if persistent_body is not None:
                         # pyrefly: ignore [bad-assignment]
                         self.device_function.body = persistent_body
+                    else:
+                        # The persistent path pulls tcgen05 post-loop cleanup to
+                        # the end of the body; the non-persistent (flat-grid)
+                        # path must do the same so a multi-store fan-out's
+                        # one-shot teardown runs after every store reads the
+                        # accumulator. No-op when there are no post-loop marks.
+                        self.device_function.body = self.device_function.cute_state.move_tcgen05_post_loop_stmts_to_end(
+                            list(self.device_function.body)
+                        )
                 # Mark extra params as placeholder args — they appear only in
                 # placeholder strings, not in the AST body, so DCE would
                 # otherwise remove them.
                 for param in self._extra_params:
                     self.device_function.placeholder_args.add(param)
+                if CompileEnvironment.current().backend.name == "cute":
+                    from .tile_strategy import (
+                        interchange_lane_outside_serial_reductions,
+                    )
+                    from .tile_strategy import restore_unprocessed_lane_reduce_markers
+                    from .tile_strategy import split_lane_loop_reductions
+
+                    # First interchange any ``for LANE: ... for MB: ...`` nest
+                    # whose inner serial loop carries lane-reduce markers into a
+                    # lane-outside-mb accumulator nest plus a lane-inside-mb
+                    # reduction nest; then split the (now inner) lane loops into
+                    # the two-pass accumulate/finalize/consume structure.
+                    self.device_function.body = (
+                        interchange_lane_outside_serial_reductions(
+                            list(self.device_function.body)
+                        )
+                    )
+                    self.device_function.body = split_lane_loop_reductions(
+                        list(self.device_function.body)
+                    )
+                    # Safety net: revert any lane-reduce marker that neither pass
+                    # rewrote so no ``_helion_lane_reduce`` call leaks into the
+                    # emitted kernel.
+                    self.device_function.body = restore_unprocessed_lane_reduce_markers(
+                        list(self.device_function.body)
+                    )
                 self.device_function.dead_code_elimination()
                 if not self.device_function.preamble and not self.device_function.body:
                     raise exc.EmptyDeviceLoopAfterDCE

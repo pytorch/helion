@@ -319,32 +319,79 @@ def _permute_reorders_active_dims(
     return [dim for dim in perm if dim in active_dims] != active_dims
 
 
+# Per-thread pointwise / cast ops whose output element on a given thread is a
+# pure function of that same thread's input element(s). A transpose-like shape op
+# feeding such an op only relabels the logical layout; the scalar each thread
+# holds is unchanged, so the shape op can stay folded into the load index and we
+# can look *through* these ops to find the ultimate consumer.
+_LAYOUT_PRESERVING_POINTWISE_TARGETS = frozenset(
+    {
+        torch.ops.aten.mul.Tensor,
+        torch.ops.aten.mul.Scalar,
+        torch.ops.aten.add.Tensor,
+        torch.ops.aten.add.Scalar,
+        torch.ops.aten.sub.Tensor,
+        torch.ops.aten.sub.Scalar,
+        torch.ops.aten.div.Tensor,
+        torch.ops.aten.div.Scalar,
+        torch.ops.aten.neg.default,
+        torch.ops.aten.exp.default,
+        torch.ops.aten.exp2.default,
+        torch.ops.aten._to_copy.default,
+        torch.ops.prims.convert_element_type.default,
+    }
+)
+
+
 def _shape_op_needs_materialization(node: Node) -> bool:
     """Return True when non-store consumers need values, not just metadata."""
     from ...language import memory_ops
+    from ...language.matmul_ops import dot as hl_dot
+    from ...language.matmul_ops import dot_scaled as hl_dot_scaled
 
     matmul_targets = {
         torch.ops.aten.mm.default,
         torch.ops.aten.addmm.default,
         torch.ops.aten.bmm.default,
         torch.ops.aten.baddbmm.default,
+        hl_dot,
+        hl_dot_scaled,
     }
     reduction_names = ("sum", "amax", "amin", "prod", "mean")
-    for user in node.users:
+
+    def _consumer_needs_materialization(user: Node, visited: set[Node]) -> bool:
         if user.op != "call_function":
             return True
         if user.target is memory_ops.store:
-            continue
+            return False
         # CuTe matmul fallbacks consume one scalar per thread/lane. In that mode a
         # transpose-like shape op only changes the logical operand layout, not the
         # scalar value held by the current thread.
         if user.target in matmul_targets:
-            continue
+            return False
         target_name = str(user.target)
         if any(name in target_name for name in reduction_names):
-            continue
+            return False
+        # Layout-preserving per-thread pointwise/cast ops keep each thread's
+        # element in place, so recurse to find the ultimate consumer instead of
+        # forcing a shared-memory shuffle for the intervening op.
+        if user.target in _LAYOUT_PRESERVING_POINTWISE_TARGETS:
+            if user in visited:
+                return False
+            visited.add(user)
+            # A pointwise op with no downstream users is not provably safe to
+            # fold (we cannot see where its value flows), so stay conservative
+            # and materialize, matching the pre-recursion behavior.
+            if not user.users:
+                return True
+            return any(
+                _consumer_needs_materialization(downstream, visited)
+                for downstream in user.users
+            )
         return True
-    return False
+
+    visited: set[Node] = set()
+    return any(_consumer_needs_materialization(user, visited) for user in node.users)
 
 
 def _permute_needs_materialization(node: Node) -> bool:

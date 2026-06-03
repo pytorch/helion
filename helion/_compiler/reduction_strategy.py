@@ -245,6 +245,95 @@ class ReductionStrategy(TileStrategy):
                     return True
         return False
 
+    def _reduction_block_in_device_lane_loop(self) -> bool:
+        """Return True when a ``DeviceLoopState`` distributes this reduction
+        block across a per-thread lane loop (CuteNDTileStrategy lanes).
+
+        Unlike :meth:`_reduction_block_has_lane_loops`, this does NOT feed
+        :meth:`_needs_loop_carried_accumulator` — it is a dedicated signal for
+        the two-pass marker so the existing warp / vec-fold paths keep their
+        tuned behavior.
+        """
+        codegen = getattr(self, "_codegen", None)
+        if codegen is None:
+            return False
+        for loops in codegen.active_device_loops.values():
+            for loop_state in loops:
+                if (
+                    isinstance(loop_state, DeviceLoopState)
+                    and self.block_index in loop_state.lane_loop_blocks
+                ):
+                    return True
+        return False
+
+    def _lane_reduce_threads_in_group(self) -> int | None:
+        """Return ``threads_in_group`` for a two-pass lane reduction over this
+        block, or ``None`` when this reduction is not over a lane-distributed
+        block.
+
+        When the block is split across a per-thread lane loop, the per-lane
+        partials must first be accumulated across the lane loop and then
+        combined across the live thread axis (``threads_in_group``). A value of
+        1 means the block has no live thread axis (a pure lane loop), so the
+        accumulator alone is the result.
+        """
+        # A synthetic reduction lane (PersistentReductionStrategy) always
+        # distributes the reduction axis across a lane loop; the live thread
+        # axis is ``_reduction_thread_count`` wide.
+        if getattr(self, "_synthetic_cute_lane_var", None) is not None:
+            return max(1, self._reduction_thread_count())
+        if not (
+            self._reduction_block_has_lane_loops()
+            or self._reduction_block_in_device_lane_loop()
+        ):
+            return None
+        threads = self._reduction_thread_count()
+        return max(1, threads)
+
+    def _lane_reduce_marker_unsupported(self, state: CodegenState) -> bool:
+        """Return True when the two-pass lane-reduction marker cannot be
+        handled by the ``split_lane_loop_reductions`` post-pass, so the caller
+        must fall back to the existing single-pass path.
+
+        Two situations are unsupported:
+
+        * An active *serial* device loop (over a different block) wraps this
+          reduction inside the lane scope. The post-pass splits the lane loop
+          at its top level, but here the reduction needs the lanes reduced
+          *per* serial iteration (the lane loop is outside the serial loop).
+        * An active ``LoopedReductionStrategy`` already rolls this block: the
+          rolled loop carries its own accumulator (and vec-fold) for the lane
+          reduction, so emitting a marker would double-handle it.
+        """
+        for block_id, loops in state.codegen.active_device_loops.items():
+            for loop_state in loops:
+                if not isinstance(loop_state, DeviceLoopState):
+                    continue
+                if isinstance(loop_state.strategy, LoopedReductionStrategy):
+                    # The rolled reduction owns the lane reduction over its
+                    # block; defer to its accumulate / vec-fold machinery.
+                    if block_id == self.block_index:
+                        return True
+                    continue
+                if (
+                    block_id != self.block_index
+                    and block_id not in loop_state.block_thread_axes
+                    and block_id not in loop_state.lane_loop_blocks
+                ):
+                    # The reduction's lane loop is OUTSIDE this serial device
+                    # loop. A synthetic-lane PersistentReductionStrategy can be
+                    # repaired by the ``interchange_lane_outside_serial_reductions``
+                    # post-pass (it splits the lane loop into a lane-inside-mb
+                    # two-pass nest for the broadcast consumer plus a
+                    # lane-outside-mb nest for any per-feature accumulators), so
+                    # keep emitting the marker in that case. Other (non-synthetic)
+                    # situations remain unsupported. ``getattr`` guards strategies
+                    # without a synthetic lane var (e.g. BlockReductionStrategy).
+                    if getattr(self, "_synthetic_cute_lane_var", None) is not None:
+                        continue
+                    return True
+        return False
+
     def _reduction_block_is_serial(self) -> bool:
         """Return True when this reduction block is being traversed by a
         serial ``DeviceLoopState`` (a Python ``for`` loop) rather than a
@@ -515,22 +604,38 @@ class PersistentReductionStrategy(ReductionStrategy):
             isinstance(graph, ReductionLoopGraphInfo) and block_index in graph.block_ids
             for graph in fn.codegen.codegen_graphs
         )
-        if not is_graph_reduction_dim and self._thread_count > 0:
+        if self._thread_count > 0:
             if isinstance(numel, (int, sympy.Integer)):
                 size_hint = int(numel)
             elif isinstance(numel, sympy.Expr):
                 size_hint = shape_env_size_hint(env.shape_env, numel)
             else:
                 size_hint = env.size_hint(numel)
-            lane_extent = env.backend.create_synthetic_reduction_lanes(
-                self._thread_count, size_hint
+            # For a non-graph-reduction dim we always try to recover the
+            # full extent through a synthetic lane loop. For a graph
+            # reduction dim we only need the synthetic lane loop when
+            # ``adjust_reduction_thread_count`` shrank ``thread_count``
+            # below the (padded) reduction extent — otherwise every logical
+            # lane is already backed by a live thread and the warp/cross-warp
+            # reduction covers the whole axis. Without this, a shrunk
+            # graph-reduction dim only addresses the first ``thread_count``
+            # elements (e.g. layer_norm_bwd's feature axis), leaving the
+            # remaining columns/partial sums uncomputed.
+            needs_synthetic = not is_graph_reduction_dim or (
+                self._thread_count < next_power_of_2(min(size_hint, max_threads))
+                if max_threads is not None
+                else False
             )
-            if lane_extent is not None:
-                self._synthetic_cute_lane_var = fn.new_var(
-                    f"synthetic_lane_{block_index}",
-                    dce=False,
+            if needs_synthetic:
+                lane_extent = env.backend.create_synthetic_reduction_lanes(
+                    self._thread_count, size_hint
                 )
-                self._synthetic_cute_lane_extent = lane_extent
+                if lane_extent is not None:
+                    self._synthetic_cute_lane_var = fn.new_var(
+                        f"synthetic_lane_{block_index}",
+                        dce=False,
+                    )
+                    self._synthetic_cute_lane_extent = lane_extent
 
     def _reduction_thread_count(self) -> int:
         return self._thread_count
@@ -716,6 +821,29 @@ class PersistentReductionStrategy(ReductionStrategy):
             )
         acc_dtype = get_computation_dtype(fake_input.dtype)
         default = ir.Reduction.default_accumulator(reduction_type, acc_dtype)
+        if (
+            self._synthetic_cute_lane_var is not None
+            and not backend.is_indexed_reduction(reduction_type)
+            and isinstance(default, (float, int, bool))
+            and not self._lane_reduce_marker_unsupported(state)
+            and (threads := self._lane_reduce_threads_in_group()) is not None
+        ):
+            # The reduction axis is split across a synthetic per-thread lane
+            # loop: the single warp reduction only covers one lane's worth of
+            # elements. Emit a marker so the ``split_lane_loop_reductions``
+            # post-pass produces the two-pass (accumulate across lanes ->
+            # warp-combine across ``threads`` -> consume) structure.
+            from .tile_strategy import _lane_reduce_marker_expr
+
+            identity_expr = backend.cast_expr(
+                constant_repr(default), _dtype_str(acc_dtype)
+            )
+            expr = _lane_reduce_marker_expr(
+                input_name, reduction_type, identity_expr, threads
+            )
+            return expr_from_string(
+                self.maybe_reshape(expr, dim, fake_input, fake_output)
+            )
         if isinstance(default, (float, int, bool)):
             cross_warp = self._cute_cross_warp_reduction_expr(
                 state, input_name, reduction_type, default, acc_dtype
@@ -1873,13 +2001,38 @@ class BlockReductionStrategy(ReductionStrategy):
             expr = strided_expr
         elif self._needs_loop_carried_accumulator():
             # The reduction block is not backed by a live thread axis in the
-            # active loop nest (it is iterated either by a serial device
-            # loop, by a synthetic lane loop, or has no thread axis at
-            # all). A warp-level reduction would fold together unrelated
-            # tensor elements, so each iteration contributes only its
-            # current scalar value and the surrounding loop-carried
-            # accumulator performs the real reduction.
-            expr = input_name
+            # active loop nest (it is iterated either by a serial device loop,
+            # by a lane loop, or has no thread axis at all).
+            if (
+                (
+                    self._reduction_block_has_lane_loops()
+                    or self._reduction_block_in_device_lane_loop()
+                )
+                and not self._lane_reduce_marker_unsupported(state)
+                and (threads := self._lane_reduce_threads_in_group()) is not None
+            ):
+                # The block is split across a per-thread lane loop. The
+                # single-pass lane loop can only produce a per-lane partial,
+                # but every consumer needs the full reduction. Emit a marker
+                # that the ``split_lane_loop_reductions`` post-pass rewrites
+                # into a two-pass (accumulate across lanes -> combine across
+                # ``threads`` -> consume) lane structure.
+                from .tile_strategy import _lane_reduce_marker_expr
+
+                acc_dtype = get_computation_dtype(fake_input.dtype)
+                identity_expr = env.backend.cast_expr(
+                    constant_repr(default), _dtype_str(acc_dtype)
+                )
+                expr = _lane_reduce_marker_expr(
+                    input_name, reduction_type, identity_expr, threads
+                )
+            else:
+                # A serial device loop (or no thread axis at all). A warp-level
+                # reduction would fold together unrelated tensor elements, so
+                # each iteration contributes only its current scalar value and
+                # the surrounding loop-carried accumulator performs the real
+                # reduction.
+                expr = input_name
         else:
             expr = self.call_reduction_function(
                 input_name,

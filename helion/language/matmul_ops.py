@@ -718,6 +718,21 @@ def _(state: CodegenState) -> object:
             f"{TCGEN05_DIRECT_ENTRY_PLAN_CONFIG_KEY}=True requires hl.dot "
             "to lower through the tcgen05 K-loop path",
         )
+    dot_lhs_node = (
+        state.fx_node.args[0]
+        if state.fx_node is not None and len(state.fx_node.args) > 0
+        else None
+    )
+    dot_rhs_node = (
+        state.fx_node.args[1]
+        if state.fx_node is not None and len(state.fx_node.args) > 1
+        else None
+    )
+    dot_acc_node = (
+        state.fx_node.args[2]
+        if state.fx_node is not None and len(state.fx_node.args) > 2
+        else None
+    )
     return _emit_cute_matmul(
         state.codegen,
         lhs_ast,
@@ -733,6 +748,9 @@ def _(state: CodegenState) -> object:
         acc_dtype=acc_dtype,
         lhs_dtype=lhs_proxy.dtype,
         rhs_dtype=rhs_proxy.dtype,
+        lhs_node=dot_lhs_node,
+        rhs_node=dot_rhs_node,
+        acc_node=None if is_acc_none else dot_acc_node,
     )
 
 

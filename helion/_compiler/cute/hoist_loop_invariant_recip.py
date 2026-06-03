@@ -470,6 +470,16 @@ def _inline_invariant_aliases_in_body(body: list[ast.stmt]) -> None:
             if name in alias_def_idx:
                 multi_assigned.add(name)
             non_alias_assign_idx.setdefault(name, []).append(idx)
+            # Also record this write under its canonical (post-rename)
+            # name so the Pass-4 root-reassignment safety check can see
+            # that a snapshot's chain root is reassigned through a renamed
+            # alias (e.g. ``v_9 = acc_cnt + ...`` writes canonical
+            # ``acc_cnt``). Without this, a snapshot taken before that
+            # write could be inlined past the reassignment, dropping the
+            # loop-carried value.
+            canon = _RENAME_GROUPS.get(name, name)
+            if canon != name:
+                non_alias_assign_idx.setdefault(canon, []).append(idx)
     for name in multi_assigned:
         alias_def_idx.pop(name, None)
         alias_rhs.pop(name, None)
@@ -596,6 +606,13 @@ def _inline_invariant_aliases_in_body(body: list[ast.stmt]) -> None:
         # are dropped only after the safety check, so they still count
         # as reassignment points if they exist).
         root_assign_idxs = list(non_alias_assign_idx.get(root, []))
+        # Also count reassignments of ROOT's canonical (post-rename)
+        # name: a renamed alias like ``v_9 = acc_cnt + ...`` writes the
+        # same logical loop-carried variable as ``root``, and inlining
+        # the snapshot past it would drop the carried value.
+        canon_root = _RENAME_GROUPS.get(root, root)
+        if canon_root != root:
+            root_assign_idxs.extend(non_alias_assign_idx.get(canon_root, []))
         if root in alias_def_idx:
             root_assign_idxs.append(alias_def_idx[root])
         # Reassignments strictly between the snapshot and any use are

@@ -208,19 +208,33 @@ def aux_tensor_load_kind(
       rank-1 operand to the *last* dimension of a rank-2 LHS:
       ``acc + bias[tile_m]`` is either a shape error (BM ≠ BN) or
       rowvec broadcast against the trailing axis (BM == BN). A
-      user wanting M-axis (column-vector) broadcasting must write
-      it explicitly (``bias[tile_m][:, None]`` /
-      ``.unsqueeze(-1)``); that is a separate, deferred pattern.
-      See :class:`Tcgen05UnaryEpilogueChain` (``cute_epilogue.py``)
-      for the splice-side broadcast-view contract.
+      user wanting M-axis (column-vector) broadcasting via a bare
+      rank-1 operand must write it explicitly (``bias[tile_m][:,
+      None]`` / ``.unsqueeze(-1)``); that is a separate, deferred
+      pattern. See :class:`Tcgen05UnaryEpilogueChain`
+      (``cute_epilogue.py``) for the splice-side broadcast-view
+      contract.
+    - ``("broadcast", 0)``: a rank-2 leading-axis broadcast aux
+      load (``bias[tile_m, tile_n]`` where ``bias`` has shape
+      ``(1, N)``). The underlying tensor's rank is 2 with a unit
+      leading (M) axis, the load result shape equals the carrier
+      tile shape, the load's two index symbols are exactly
+      ``carrier_tile_index_nodes`` in order, and the trailing
+      extent equals ``carrier_global_shape[1]``. This is the
+      explicit ``[1, N]`` row-broadcast form: PyTorch broadcasts
+      row 0 of the aux to every output row. The splice site builds
+      the same stride-``(0, 1)`` 2-D view as the trailing-axis
+      rowvec form (row 0 reused across M).
 
     The classifier returns ``None`` for everything else: 3-D
     underlying tensors with a static collapse
     (``aux3d[tile_m, tile_n, 0]``), broadcast variants whose index
     is not the exact carrier tile-id symbol (e.g. ``bias[tile_n + 1]``),
     rank mismatches, kwargs, non-default ``extra_mask`` /
-    ``eviction_policy`` positions, or rank-1 indexed by the
-    carrier's leading-axis tile id (``bias[tile_m]`` — see above).
+    ``eviction_policy`` positions, rank-1 indexed by the carrier's
+    leading-axis tile id (``bias[tile_m]`` — see above), or rank-2
+    aux whose underlying shape neither equals the carrier global
+    output shape nor is the ``(1, N)`` leading-broadcast form.
 
     Strict on ``kwargs`` (must be empty) and on the ``extra_mask``
     / ``eviction_policy`` argument positions — both must be
@@ -238,7 +252,12 @@ def aux_tensor_load_kind(
     broadcast classifier additionally checks that the rank-1 aux's
     extent matches the output's global size on the broadcast axis,
     closing the gap where the bias is smaller than the global axis
-    but happens to be divisible by the tile extent.
+    but happens to be divisible by the tile extent. The exact-shape
+    classifier also uses it to reject a rank-2 aux whose underlying
+    shape does not equal the global output shape (e.g. a ``(1, N)``
+    tensor whose per-tile load result happens to match the carrier
+    tile but which broadcasts over M) so it can never be silently
+    treated as a full ``[M, N]`` exact aux.
     """
     from ...language.memory_ops import load as helion_load
 
@@ -273,8 +292,16 @@ def aux_tensor_load_kind(
     # Without the carrier shape we cannot disambiguate the broadcast
     # axis, so only the rank-2 exact form is accepted in this mode
     # — broadcast classification is gated on having a known carrier.
+    # A unit leading axis is the ``(1, N)`` leading-broadcast form,
+    # which is *not* an exact aux; reject it here so the defensive
+    # path can never silently treat it as a full ``[M, N]`` tensor
+    # (it falls to the loud-failure backstop instead).
     if carrier_tile_shape is None:
-        if len(aux_shape) == 2 and len(aux_tensor_shape) == 2:
+        if (
+            len(aux_shape) == 2
+            and len(aux_tensor_shape) == 2
+            and aux_tensor_shape[0] != 1
+        ):
             return ("exact", None)
         return None
 
@@ -289,8 +316,21 @@ def aux_tensor_load_kind(
         index_list=index_list,
         carrier_tile_shape=carrier_tile_shape,
         carrier_tile_index_nodes=carrier_tile_index_nodes,
+        carrier_global_shape=carrier_global_shape,
     ):
         return ("exact", None)
+
+    leading = _matches_leading_broadcast(
+        aux_shape=aux_shape,
+        aux_tensor_shape=aux_tensor_shape,
+        aux_tensor_val=aux_tensor_val,
+        index_list=index_list,
+        carrier_tile_shape=carrier_tile_shape,
+        carrier_tile_index_nodes=carrier_tile_index_nodes,
+        carrier_global_shape=carrier_global_shape,
+    )
+    if leading is not None:
+        return leading
 
     return _matches_broadcast(
         aux_shape=aux_shape,
@@ -381,6 +421,75 @@ def _matches_broadcast(
     return ("broadcast", axis)
 
 
+def _matches_leading_broadcast(
+    *,
+    aux_shape: tuple[object, ...],
+    aux_tensor_shape: tuple[object, ...],
+    aux_tensor_val: torch.Tensor,
+    index_list: Sequence[object],
+    carrier_tile_shape: tuple[object, ...],
+    carrier_tile_index_nodes: tuple[torch.fx.Node, ...] | None,
+    carrier_global_shape: tuple[object, ...] | None,
+) -> tuple[str, int] | None:
+    """Check whether a load matches the rank-2 leading-axis
+    (column / M-axis) broadcast aux pattern, and return
+    ``("broadcast", 0)`` on success.
+
+    The accepted form is ``bias[tile_m, tile_n]`` where ``bias`` has
+    shape ``(1, N)``: a unit leading axis that PyTorch broadcasts
+    over every output row. Unlike the bare rank-1 trailing-axis form
+    (``bias[tile_n]``), this is an *explicit* rank-2 index of an
+    ``[1, N]`` tensor, so the broadcast direction is unambiguous —
+    the user materialized the unit M axis themselves. The load result
+    shape must equal the carrier tile shape dim-by-dim, both index
+    symbols must be exactly ``carrier_tile_index_nodes`` in order,
+    and the trailing extent must equal the output's global N.
+
+    The splice site builds the same 2-D ``cute.make_layout((m, n),
+    stride=(0, 1))`` view as the trailing-axis rowvec form: for a
+    contiguous ``(1, N)`` tensor element ``(0, n)`` lives at offset
+    ``n``, so stride ``(0, 1)`` over the ``.iterator`` makes every
+    output row ``m`` read row 0. Non-contiguous-trailing aux is
+    rejected loudly (the hard-coded stride 1 would otherwise be
+    wrong).
+    """
+    if (
+        len(aux_tensor_shape) != 2
+        or len(aux_shape) != 2
+        or len(index_list) != 2
+        or len(carrier_tile_shape) != 2
+    ):
+        return None
+    if aux_tensor_shape[0] != 1:
+        return None
+    if carrier_tile_index_nodes is None or len(carrier_tile_index_nodes) != 2:
+        # The leading-broadcast splice is unpredicated; without the
+        # carrier tile-id symbols we cannot confirm the load indexes
+        # the carrier's own (m, n) tile, so bail to the loud-failure
+        # backstop rather than broadcast a mismatched index silently.
+        return None
+    for idx, expected in zip(index_list, carrier_tile_index_nodes, strict=True):
+        if idx is not expected:
+            return None
+    for aux_dim, carrier_dim in zip(aux_shape, carrier_tile_shape, strict=True):
+        if aux_dim != carrier_dim:
+            return None
+    # Contiguous ``(1, N)`` so the stride-(0, 1) view's offset of
+    # element (m, n) is exactly n. The trailing stride must be 1; the
+    # leading stride is irrelevant (M extent is 1) but a contiguous
+    # tensor reports stride (N, 1) — accept any leading stride.
+    if aux_tensor_val.stride()[1] != 1:
+        return None
+    if carrier_global_shape is not None:
+        if len(carrier_global_shape) != 2:
+            return None
+        # The aux's trailing extent must match the output's global N
+        # so the per-tile slice never reads past the underlying row.
+        if aux_tensor_shape[1] != carrier_global_shape[1]:
+            return None
+    return ("broadcast", 0)
+
+
 def _matches_exact(
     *,
     aux_shape: tuple[object, ...],
@@ -388,6 +497,7 @@ def _matches_exact(
     index_list: Sequence[object],
     carrier_tile_shape: tuple[object, ...],
     carrier_tile_index_nodes: tuple[torch.fx.Node, ...] | None,
+    carrier_global_shape: tuple[object, ...] | None,
 ) -> bool:
     """Check whether a load matches the exact-shape aux pattern:
     underlying tensor rank equals carrier rank, result shape equals
@@ -397,6 +507,16 @@ def _matches_exact(
     (``carrier_tile_index_nodes is None``), fall back to checking
     each entry of ``index_list`` is an FX symint node — used only
     for defensive paths that lose the tile-id walk.
+
+    When ``carrier_global_shape`` is provided the underlying aux
+    tensor's full shape must equal the global output shape
+    dim-by-dim. Without this gate a ``(1, N)`` aux load whose
+    per-tile result happens to match the carrier tile shape (the
+    load slices ``bias[tile_m, tile_n]`` and broadcasts row 0 over
+    M) would be wrongly accepted as a full ``[M, N]`` exact aux and
+    the splice would ``local_tile`` past the unit M extent, reading
+    OOB rows. The leading-broadcast classifier handles that ``(1,
+    N)`` form separately.
     """
     rank = len(carrier_tile_shape)
     if (
@@ -408,6 +528,14 @@ def _matches_exact(
     for aux_dim, carrier_dim in zip(aux_shape, carrier_tile_shape, strict=True):
         if aux_dim != carrier_dim:
             return False
+    if carrier_global_shape is not None:
+        if len(carrier_global_shape) != rank:
+            return False
+        for aux_dim, global_dim in zip(
+            aux_tensor_shape, carrier_global_shape, strict=True
+        ):
+            if aux_dim != global_dim:
+                return False
     if carrier_tile_index_nodes is not None:
         if len(carrier_tile_index_nodes) != len(index_list):
             return False
