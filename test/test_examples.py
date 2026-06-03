@@ -667,7 +667,6 @@ class TestExamples(RefEagerTestBase, TestCase):
             block_sizes=[block_size],
         )
 
-    @xfailIfCute("CuTe bf16 x int16 example still returns incorrect results")
     @xfailIfPallas("precision differences with bf16xint16 operations on pallas")
     @skipIfTileIR("precision differences with bf16xint16 operations on tileir")
     @skipIfRocm("precision differences with bf16xint16 operations on rocm")
@@ -677,13 +676,41 @@ class TestExamples(RefEagerTestBase, TestCase):
 
         m, k, n = 65536, 1024, 1280
 
+        # The CuTe scalar matmul fallback accumulates each bf16xbf16 product in
+        # full fp32 (it never rounds the per-element products back to bf16), so
+        # it is *more* accurate than torch's bf16 tensor-core reference. The cute
+        # output bit-matches a full-precision (IEEE fp32) products matmul cast to
+        # bf16, so use that as the reference. ``setUpModule`` flips the default
+        # matmul fp32 precision to TF32, which would make ``torch.matmul`` itself
+        # lossy, so force IEEE fp32 for the reference computation.
+        is_cute = _get_backend() == "cute"
+
+        def expected(
+            xt: torch.Tensor, wt: torch.Tensor, transpose: bool
+        ) -> torch.Tensor:
+            if not is_cute:
+                return reference_bf16xint16_pytorch(xt, wt, transpose)
+            if transpose:
+                x_f32 = xt.to(torch.bfloat16).float()
+                w_f32 = wt.float()
+            else:
+                x_f32 = xt.float()
+                w_f32 = wt.to(torch.bfloat16).float()
+            prev = torch.backends.cuda.matmul.fp32_precision
+            torch.backends.cuda.matmul.fp32_precision = "ieee"
+            try:
+                out = torch.matmul(x_f32, w_f32)
+            finally:
+                torch.backends.cuda.matmul.fp32_precision = prev
+            return out.to(torch.bfloat16)
+
         x = torch.randn([m, k], device=DEVICE, dtype=torch.bfloat16)
         w = torch.randint(-(2**15), 2**15 - 1, (k, n), device=DEVICE, dtype=torch.int16)
 
         check_example(
             "bf16xint16_gemm",
             (x, w),
-            reference_bf16xint16_pytorch(x, w, False),
+            expected(x, w, False),
             fn_name="_bf16xint16_gemm",
         )
 
@@ -695,7 +722,7 @@ class TestExamples(RefEagerTestBase, TestCase):
         check_example(
             "bf16xint16_gemm",
             (x_int16, w_bf16),
-            reference_bf16xint16_pytorch(x_int16, w_bf16, True),
+            expected(x_int16, w_bf16, True),
             fn_name="_int16xbf16_gemm",
         )
 

@@ -26,7 +26,6 @@ from helion.autotuner import StrictLocalAutotuneCache
 from helion.autotuner.base_search import BaseSearch
 from helion.autotuner.remote_cache import RemoteCacheBackend
 import helion.language as hl
-from helion.runtime.settings import _get_backend
 
 
 class BasicSearch(BaseSearch):
@@ -201,8 +200,6 @@ class TestCache(RefEagerTestDisabled, TestCase):
         ("add", "matmul", "welford", "list_tensor", "list_tensor_different_shapes"),
     )
     def test_kernel(self, name):
-        if _get_backend() == "cute" and name == "welford":
-            self.skipTest("CuTe Welford example still returns incorrect results")
         kernel, args_a, result_a, args_b, result_b = KERNELS[name]()
 
         kernel.reset()

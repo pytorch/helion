@@ -102,15 +102,6 @@ def make_test_function(input_dtype, acc_dtype, static_shapes_option):
     combo = (input_dtype, input_dtype, acc_dtype)
 
     def test_impl(self):
-        # CuTe backend limitations
-        if _get_backend() == "cute":
-            # Truly unsupported dtypes — CuTe DSL has no int8/fp8 support
-            if input_dtype == torch.int8 or input_dtype in (
-                torch.float8_e4m3fn,
-                torch.float8_e5m2,
-            ):
-                self.skipTest(f"cute: no {input_dtype} support in CuTe DSL")
-
         # Skip FP8 tests if GPU doesn't support it
         def _is_cuda_fp8_supported():
             if not is_cuda():
