@@ -49,6 +49,7 @@ from helion.autotuner import LFBOPatternSearch
 from helion.autotuner import LFBOTreeSearch
 from helion.autotuner import PatternSearch
 from helion.autotuner.base_search import BaseSearch
+from helion.autotuner.base_search import PopulationBasedSearch
 from helion.autotuner.base_search import PopulationMember
 from helion.autotuner.benchmark_provider import LocalBenchmarkProvider
 from helion.autotuner.config_fragment import BooleanFragment
@@ -2281,6 +2282,72 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         )
         # Should have been called with 2 functions
         self.assertEqual(benchmark_calls[0][0], 2)
+
+    def test_rebenchmark_clears_jit_fast_path_caches(self) -> None:
+        settings = Settings(
+            autotune_log_level=logging.CRITICAL,
+            autotune_suspicious_rebenchmark_ratio=0,
+        )
+        search = PopulationBasedSearch.__new__(PopulationBasedSearch)
+        search.settings = settings
+        search.args = ()
+        search.log = AutotuningLogger(settings)
+        search.best_perf_so_far = 100.0
+        search.benchmark_provider = SimpleNamespace(mutated_arg_indices=[])
+        search.kernel = SimpleNamespace(env=SimpleNamespace(process_group_name=None))
+        search.config_spec = SimpleNamespace(backend=None)
+        events: list[str] = []
+
+        class FakeJITFunction:
+            def __init__(self, name: str) -> None:
+                self.name = name
+
+            def clear_fast_path_caches(self) -> None:
+                events.append(f"clear {self.name}")
+
+        def generated_kernel_a() -> None:
+            events.append("run a")
+
+        def generated_kernel_b() -> None:
+            events.append("run b")
+
+        globals_key_a = f"_helion_{generated_kernel_a.__name__}"
+        globals_key_b = f"_helion_{generated_kernel_b.__name__}"
+        generated_kernel_a.__globals__[globals_key_a] = FakeJITFunction("a")
+        generated_kernel_b.__globals__[globals_key_b] = FakeJITFunction("b")
+
+        def custom_benchmark_fn(
+            fns: list[Callable[[], object]], *, repeat: int, desc: str | None = None
+        ) -> list[float]:
+            for _ in range(2):
+                for fn in fns:
+                    fn()
+            return [100.0, 101.0]
+
+        search.settings.autotune_benchmark_fn = custom_benchmark_fn
+        member_a = PopulationMember(generated_kernel_a, [100.0], [], helion.Config())
+        member_b = PopulationMember(generated_kernel_b, [101.0], [], helion.Config())
+        try:
+            search.rebenchmark([member_a, member_b])
+        finally:
+            del generated_kernel_a.__globals__[globals_key_a]
+            del generated_kernel_b.__globals__[globals_key_b]
+
+        self.assertEqual(
+            events,
+            [
+                "run a",
+                "clear a",
+                "run b",
+                "clear b",
+                "run a",
+                "clear a",
+                "run b",
+                "clear b",
+                "clear a",
+                "clear b",
+            ],
+        )
 
     def test_autotune_configuration_cloning(self) -> None:
         """Tests base_search._clone_args function."""
