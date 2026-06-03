@@ -19,7 +19,6 @@ from helion._testing import skipIfRefEager
 from helion._testing import skipIfRocm
 from helion._testing import skipIfTileIR
 from helion._testing import skipUnlessTensorDescriptor
-from helion._testing import xfailIfCute
 from helion._testing import xfailIfPallasTpu
 import helion.language as hl
 
@@ -779,7 +778,6 @@ class TestReductions(RefEagerTestBase, TestCase):
 
     @skipIfPallas("barrier and persistent_blocked not supported on Pallas")
     @skipIfTileIR("TileIR does not support barrier operations")
-    @xfailIfCute("cute: hl.barrier() phase synchronization is not supported")
     def test_reduction_loop_with_multiple_rdims(self):
         """Test that reduction_loops works when there are multiple reduction dimensions."""
 

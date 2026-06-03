@@ -31,6 +31,7 @@ if TYPE_CHECKING:
     from .device_function import Argument
     from .device_function import DeviceFunction
     from .device_ir import GraphInfo
+    from .host_function import HostFunction
     from .tile_dispatch import TileStrategyDispatch
     from .tile_strategy import TileStrategy
 
@@ -544,6 +545,15 @@ class Backend(abc.ABC):
     def launcher_keyword_args(self, config: Config, *, has_barrier: bool) -> list[str]:
         return []
 
+    def customize_ast(self, hf: HostFunction) -> None:
+        """Run backend-specific AST customizations.
+
+        Called after static loop unrolling but before type propagation
+        and tracing.  Backends can override this to rewrite the user's
+        AST for algorithmic transformations that change loop structure.
+        """
+        return None
+
     def pre_codegen(
         self,
         graphs: list[GraphInfo],
@@ -608,6 +618,66 @@ class Backend(abc.ABC):
         if has_rng_ops:
             raise exc.BackendUnsupported(self.name, "RNG ops")
         return [*args, *self.launcher_keyword_args(config, has_barrier=has_barrier)]
+
+    def _cute_matmul_contraction_reduction_block_ids(self) -> set[int]:
+        """Reduction block ids that are also a matmul-contraction (K) axis.
+
+        These are the blocks that must keep real threads for the whole K extent
+        instead of being split into ``threads x synthetic-lane`` (see OPTION B in
+        ``CuteBackend.create_loop_strategy`` and
+        ``cute_matmul_contraction_block_ids``).
+        """
+        from .compile_environment import CompileEnvironment
+        from .cute.matmul_utils import cute_matmul_contraction_block_ids
+
+        env = CompileEnvironment.current()
+        canonical_block_id = getattr(
+            env, "canonical_block_id", lambda block_id: block_id
+        )
+        contraction = cute_matmul_contraction_block_ids()
+        if not contraction:
+            return set()
+        return {
+            info.block_id
+            for info in env.block_sizes
+            if info.reduction and canonical_block_id(info.block_id) in contraction
+        }
+
+    def _cute_matmul_contraction_thread_reserve(
+        self, fn: DeviceFunction, tile_block_ids: list[int]
+    ) -> int:
+        """Threads to reserve for matmul-contraction reduction axes.
+
+        Returns the product of the per-axis full thread extents (power-of-two,
+        capped at ``max_reduction_threads``) of every reduction block that is a
+        matmul-contraction axis and is *not* one of ``tile_block_ids`` (i.e. it
+        is handled by a separate reduction strategy, not this tile strategy).
+        """
+        from torch._inductor.runtime.runtime_utils import next_power_of_2
+
+        from .._compat import shape_env_size_hint
+        from .compile_environment import CompileEnvironment
+
+        env = CompileEnvironment.current()
+        max_reduction_threads = self.max_reduction_threads()
+        if max_reduction_threads is None:
+            return 1
+        tile_ids = set(tile_block_ids)
+        reserve = 1
+        for block_id in self._cute_matmul_contraction_reduction_block_ids():
+            if block_id in tile_ids:
+                continue
+            numel = env.block_sizes[block_id].numel
+            if isinstance(numel, (int, sympy.Integer)):
+                size_hint = int(numel)
+            elif isinstance(numel, sympy.Expr):
+                size_hint = shape_env_size_hint(env.shape_env, numel)
+            else:
+                size_hint = env.size_hint(numel)
+            if size_hint <= 1:
+                continue
+            reserve *= next_power_of_2(min(size_hint, max_reduction_threads))
+        return reserve
 
     def create_loop_strategy(
         self, fn: DeviceFunction, block_ids: list[int], config: Config
@@ -2046,6 +2116,13 @@ def _detect_mma_loop(
     return False
 
 
+def _largest_divisor_at_most(size: int, limit: int) -> int:
+    for divisor in range(limit, 0, -1):
+        if size % divisor == 0:
+            return divisor
+    return 1
+
+
 def _detect_specialized_mma_loop(
     fn: DeviceFunction,
     block_ids: list[int],
@@ -2088,13 +2165,6 @@ def _detect_specialized_mma_loop(
         root_thread_auto.append(threads == 0)
 
     if functools.reduce(operator.mul, root_thread_counts, 1) > 1024:
-
-        def _largest_divisor_at_most(size: int, limit: int) -> int:
-            for divisor in range(limit, 0, -1):
-                if size % divisor == 0:
-                    return divisor
-            return 1
-
         for idx in sorted(
             (i for i, is_auto in enumerate(root_thread_auto) if is_auto),
             reverse=True,
@@ -2619,6 +2689,21 @@ class CuteBackend(Backend):
     def name(self) -> str:
         return "cute"
 
+    def customize_ast(self, hf: HostFunction) -> None:
+        """CuTe-specific AST rewrites that rewrite high-level patterns into
+        equivalent forms that compile to materially faster code.
+
+        Currently:
+          * ``rewrite_online_to_3pass`` rewrites the online two-pass
+            softmax pattern into the 3-pass form (max-only, then
+            sum-only, then consume).  The 3-pass form's two reductions
+            are independent and compile to a more efficient layout on
+            the CuTe backend.
+        """
+        from .cute.online_to_3pass import rewrite_online_to_3pass
+
+        rewrite_online_to_3pass(hf)
+
     def pre_codegen(
         self,
         graphs: list[GraphInfo],
@@ -2764,6 +2849,7 @@ class CuteBackend(Backend):
             "_cute_inline_asm_elementwise": "from helion._compiler.cute.inline_asm_helpers import inline_asm_elementwise as _cute_inline_asm_elementwise",
             "_cute_fp8e4m3fn_to_float32": "from helion._compiler.cute.quantized_helpers import fp8e4m3fn_to_float32 as _cute_fp8e4m3fn_to_float32",
             "_cute_float4_e2m1fn_x2_to_float32": "from helion._compiler.cute.quantized_helpers import float4_e2m1fn_x2_to_float32 as _cute_float4_e2m1fn_x2_to_float32",
+            "_cute_grid_barrier": "from helion._compiler.cute.grid_barrier import grid_barrier as _cute_grid_barrier",
         }
 
     def program_id_expr(self, dim: int, *, index_dtype: str) -> str:
@@ -2814,8 +2900,9 @@ class CuteBackend(Backend):
         return super().cast_ast(x, target_dtype)
 
     def grid_barrier_stmt(self, sem_arg: str) -> str | None:
-        del sem_arg
-        raise exc.BackendUnsupported(self.name, "hl.barrier()")
+        # ``sem_arg`` is a TensorArg that arrives as a ``cute.Tensor``; its
+        # ``.iterator`` is the underlying ``cute.Pointer`` to the semaphore.
+        return f"_cute_grid_barrier({sem_arg}.iterator)"
 
     def lane_index_expr(
         self, offset_var: str, elements_per_thread: int, *, axis: int
@@ -2984,6 +3071,16 @@ class CuteBackend(Backend):
     ) -> str:
         # Use Python ternary instead of cute.where for max/min because
         # these operate on scalar registers, not tensors.
+        #
+        # Cast the incoming value to the accumulator dtype first.  The
+        # accumulator is promoted to the computation dtype (fp32 for
+        # half-precision inputs), but the per-iteration reduction input keeps
+        # the tensor's storage dtype (e.g. bf16 for a masked half load).  The
+        # CUTLASS DSL strictly type-checks the two branches of a Python ternary
+        # ("Then and else blocks of ifexp return different types"), so a bare
+        # ``acc if acc > val else val`` with mixed fp32/bf16 operands fails to
+        # compile.  The cast is a no-op when ``val`` already matches.
+        val = self.cast_expr(val, self.dtype_str(dtype))
         if reduction_type == "sum":
             return f"({acc} + {val})"
         if reduction_type == "max":
@@ -3617,12 +3714,6 @@ class CuteBackend(Backend):
         # dimensions to 1 thread to avoid budget overflow.
         from .cute.thread_budget import MAX_THREADS_PER_BLOCK
 
-        def _largest_divisor_at_most(size: int, limit: int) -> int:
-            for divisor in range(limit, 0, -1):
-                if size % divisor == 0:
-                    return divisor
-            return 1
-
         def _shrink_auto_thread_counts(
             nd_block_size: Sequence[object], thread_limit: int
         ) -> int:
@@ -3822,6 +3913,23 @@ class CuteBackend(Backend):
                     )
                     for block_id in block_ids
                 ]
+            # OPTION B (matmul-contraction synthetic-lane fix): when a reduction
+            # block is the *contraction* (K) axis of a matmul lowered through the
+            # scalar fallback, it must keep enough real hardware threads to cover
+            # its full extent so the cross-warp shared-memory reduction sums the
+            # whole K.  Otherwise the budget below would hand the free tile axes
+            # the threads and leave K split into ``threads x synthetic-lane`` -
+            # the reduction then sums only the thread lanes, never the synthetic
+            # lanes, so each contracted dot product covers only a fraction of K.
+            # Reserve the K block's full thread extent up front by shrinking the
+            # thread limit available to the free tile axes; the contraction axis
+            # then claims that budget when its reduction strategy is created and
+            # the synthetic lane is pushed onto the free tile axes instead.
+            reserved_contraction_threads = self._cute_matmul_contraction_thread_reserve(
+                fn, block_ids
+            )
+            if reserved_contraction_threads > 1:
+                thread_limit = max(1, thread_limit // reserved_contraction_threads)
             static_threads = _shrink_auto_thread_counts(nd_block_size, thread_limit)
             from .cute.thread_budget import check_thread_limit
 
@@ -3876,6 +3984,7 @@ class CuteBackend(Backend):
         nd_block_size = [bs.from_config_assert(config) for bs in block_size_infos]
         block_size = functools.reduce(operator.mul, nd_block_size)
         # Resolve per-axis thread counts then flatten to a single total
+        all_auto = all(nt <= 0 for nt in num_threads_config)
         flat_num_threads = functools.reduce(
             operator.mul,
             (
@@ -3884,6 +3993,14 @@ class CuteBackend(Backend):
             ),
             1,
         )
+        if (
+            isinstance(block_size, int)
+            and flat_num_threads > MAX_THREADS_PER_BLOCK
+            and all_auto
+        ):
+            # Auto thread budget exceeds the 1024-per-CTA cap: fall back to a
+            # lane loop (each thread owns block_size // 1024 elements).
+            flat_num_threads = MAX_THREADS_PER_BLOCK
         if isinstance(block_size, int) and flat_num_threads > 0:
             from .cute.thread_budget import check_thread_limit
 
@@ -4121,5 +4238,95 @@ class MetalBackend(Backend):
         Metal inherits this behavior for now; users hitting the error
         should pick a smaller ``block_sizes`` value.
         """
+        config = self._config_with_mpp_thread_budget(fn, block_ids, config)
         # pyrefly: ignore[bad-argument-type]
         return CuteBackend.create_loop_strategy(self, fn, block_ids, config)
+
+    def _config_with_mpp_thread_budget(
+        self, fn: DeviceFunction, block_ids: list[int], config: Config
+    ) -> Config:
+        """Reserve root-grid thread budget for MPPGraph cooperative work.
+
+        MPP matmul and ordinary scalar Metal code run inside one Metal
+        threadgroup.  MPP needs ``num_warps * 32`` threads participating on
+        ``tid[0]`` for its cooperative operation, while scalar code in the
+        surrounding root graph may still use ``tid[0]``, ``tid[1]``, and
+        ``tid[2]`` for normal tile indexing.  This method keeps the root graph
+        scalar-lowered, but caps auto ``num_threads`` on later root-grid axes
+        so the combined threadgroup stays within Metal's 1024-thread limit.
+        """
+        if not any(
+            type(graph_info).__name__ == "MPPGraphInfo"
+            for graph_info in fn.codegen.codegen_graphs
+        ):
+            return config
+
+        from .host_function import HostFunction
+
+        device_ir = HostFunction.current().device_ir
+        # Only adjust the loop strategy for the root grid.  MPPGraphInfo emits
+        # the cooperative K-loop internally; nested/device loops should keep
+        # their normal Metal/CuTe strategy.
+        if not device_ir.grid_block_ids or block_ids != device_ir.grid_block_ids[0]:
+            return config
+        if len(block_ids) < 2:
+            return config
+
+        from ..runtime.config import Config
+        from .compile_environment import CompileEnvironment
+        from .cute.thread_budget import MAX_THREADS_PER_BLOCK
+
+        env = CompileEnvironment.current()
+        num_threads = list(config.num_threads)
+        if len(num_threads) < len(env.config_spec.num_threads):
+            num_threads.extend(
+                [0] * (len(env.config_spec.num_threads) - len(num_threads))
+            )
+
+        first_block_id = block_ids[0]
+        first_axis_size = env.block_sizes[first_block_id].from_config(config)
+        if not isinstance(first_axis_size, int):
+            return config
+        first_axis_configured = int(
+            env.config_spec.num_threads.config_get(
+                config.num_threads, first_block_id, 0
+            )
+        )
+        first_axis_threads = (
+            first_axis_configured if first_axis_configured > 0 else first_axis_size
+        )
+
+        # MPP's execution_simdgroups<N> uses N simdgroups, and each Metal
+        # simdgroup has 32 threads.  tid[0] must be large enough for both
+        # MPP's cooperative operation and any scalar indexing on the first
+        # root axis.
+        mpp_threads = config.num_warps * 32
+        used_threads = max(mpp_threads, first_axis_threads)
+        changed = False
+
+        # Walk the remaining axes in launch order.  Explicit num_threads
+        # consume budget as-is; auto axes are reduced to the largest divisor
+        # that keeps the total threadgroup size under Metal's limit.
+        for block_id in block_ids[1:]:
+            configured = int(
+                env.config_spec.num_threads.config_get(config.num_threads, block_id, 0)
+            )
+            if configured > 0:
+                used_threads *= configured
+                continue
+
+            axis_size = env.block_sizes[block_id].from_config(config)
+            if not isinstance(axis_size, int):
+                continue
+
+            budget = max(1, MAX_THREADS_PER_BLOCK // max(1, used_threads))
+            chosen = _largest_divisor_at_most(axis_size, budget)
+            config_index = env.config_spec.num_threads.block_id_to_index(block_id)
+            if num_threads[config_index] != chosen:
+                num_threads[config_index] = chosen
+                changed = True
+            used_threads *= chosen
+
+        if not changed:
+            return config
+        return Config.from_dict({**config.config, "num_threads": num_threads})

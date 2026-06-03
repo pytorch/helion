@@ -815,7 +815,28 @@ class TestCuteBackend(TestCase):
         torch.testing.assert_close(out, x + 1)
         self.assertIn("for lane_", code)
 
-    def test_oversized_flattened_block_raises(self) -> None:
+    def test_oversized_flattened_block_caps_threads(self) -> None:
+        """When num_threads is auto and block_size > 1024, the CuTe backend
+        falls back to a 1024-thread lane loop rather than raising."""
+
+        @helion.kernel(backend="cute", autotune_effort="none")
+        def cute_flattened_identity(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile in hl.tile(x.numel()):
+                out[tile] = x[tile]
+            return out
+
+        args = (torch.randn(2048, device=DEVICE, dtype=torch.float32),)
+        code, out = code_and_output(cute_flattened_identity, args, block_size=2048)
+        torch.testing.assert_close(out, args[0])
+        # block_size 2048 with auto threads now lowers to a 1024-thread lane
+        # loop (each thread owns two elements).
+        self.assertIn("for lane_", code)
+
+    def test_oversized_flattened_block_raises_when_threads_explicit(self) -> None:
+        """When num_threads is explicit and exceeds the 1024-per-CTA cap,
+        the backend still raises rather than silently downsizing."""
+
         @helion.kernel(backend="cute", autotune_effort="none")
         def cute_flattened_identity(x: torch.Tensor) -> torch.Tensor:
             out = torch.empty_like(x)
@@ -827,7 +848,9 @@ class TestCuteBackend(TestCase):
         with self.assertRaisesRegex(
             helion.exc.BackendUnsupported, "thread block too large for cute kernel"
         ):
-            code_and_output(cute_flattened_identity, args, block_size=2048)
+            code_and_output(
+                cute_flattened_identity, args, block_size=2048, num_threads=[2048]
+            )
 
     def test_reduction_num_threads(self) -> None:
         args = (torch.randn(129, 130, device=DEVICE, dtype=torch.float32),)

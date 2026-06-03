@@ -13,6 +13,7 @@ from helion._testing import DEVICE
 from helion._testing import TestCase
 from helion._testing import code_and_output
 from helion._testing import onlyBackends
+from helion._testing import skipIfPallasInterpret
 from helion._testing import skipUnlessPallas
 from helion._testing import xfailIfPallas
 from helion._testing import xfailIfPallasInterpret
@@ -227,6 +228,14 @@ def pallas_arange_add(x: torch.Tensor) -> torch.Tensor:
     for tile_n in hl.tile(n):
         offsets = hl.arange(m)
         out[tile_n, :] = x[tile_n, :] + offsets[None, :]
+    return out
+
+
+@helion.kernel(backend="pallas", static_shapes=True)
+def pallas_scatter_store(values: torch.Tensor, indices: torch.Tensor) -> torch.Tensor:
+    out = torch.zeros_like(values)
+    for tile_m, tile_n in hl.tile(values.size()):
+        out[indices[tile_m], tile_n] = values[tile_m, tile_n]
     return out
 
 
@@ -454,6 +463,48 @@ def pallas_rand_add(x: torch.Tensor, seed: int) -> torch.Tensor:
     return out
 
 
+@helion.kernel(backend="pallas", static_shapes=True)
+def kernel_output_index_remapping(
+    x: torch.Tensor,  # [batch*heads, seq_len, head_dim]
+    batch: int,
+    heads: int,
+) -> torch.Tensor:
+    """Reshapes a [batch*heads, seq_len, head_dim] tensor to [batch, heads, seq_len, head_dim].
+
+    Iterates over the combined batch*heads dimension and the seq_len dimension.
+    """
+    batch_heads, seq_len, head_dim = x.size()
+    out = torch.empty([batch, heads, seq_len, head_dim], dtype=x.dtype, device=x.device)
+    for bh in hl.grid(batch_heads):
+        b = bh // heads
+        h = bh % heads
+        for tile_m in hl.tile(seq_len):
+            out[b, h, tile_m, :] = x[bh, tile_m, :]
+    return out
+
+
+@helion.kernel(backend="pallas", static_shapes=True)
+def kernel_tile_index_is_blockwise(
+    x: torch.Tensor,
+) -> torch.Tensor:
+    seq_len = x.size(0)
+    out = torch.empty_like(x)
+    for tile_m in hl.tile(seq_len):
+        out[tile_m.index] = x[tile_m.index] + 1.0
+    return out
+
+
+@helion.kernel(backend="pallas", static_shapes=True)
+def kernel_tile_begin_plus_offset_is_elementwise(
+    x: torch.Tensor,
+) -> torch.Tensor:
+    seq_len = x.size(0)
+    out = torch.zeros_like(x)
+    for tile_m in hl.tile(seq_len):
+        out[tile_m.begin + 5] = x[tile_m.begin + 5] + 1.0
+    return out
+
+
 @onlyBackends(["triton", "pallas"])
 @skipUnlessPallas("JAX/Pallas TPU not available")
 class TestPallas(TestCase):
@@ -504,6 +555,94 @@ class TestPallas(TestCase):
             r"Ran out of memory in memory space vmem.*Estimated [0-9.]+MB exceeds",
         ):
             code_and_output(pallas_add_2d, args_fp8, block_sizes=[4096, 8192])
+
+    def test_output_index_remapping_in_pipeline(self) -> None:
+        total_elements = 8 * 128 * 128
+        x = torch.arange(total_elements, device=DEVICE, dtype=torch.bfloat16).view(
+            8, 128, 128
+        )
+        batch = 2
+        heads = 4
+        code, result = code_and_output(
+            kernel_output_index_remapping,
+            (x, batch, heads),
+            block_sizes=[32],
+            pallas_loop_type="emit_pipeline",
+        )
+        expected = x.reshape(batch, heads, 128, 128)
+
+        with self.subTest(name="correctness"):
+            torch.testing.assert_close(result, expected)
+
+        with self.subTest(name="pipeline_emit"):
+            self.assertIn("pltpu.emit_pipeline", code)
+
+        with self.subTest(name="shrunken_blockspec"):
+            self.assertIn(
+                "pl.BlockSpec((1, 1, _BLOCK_SIZE_1, 128), "
+                "lambda _j: (offset_0 // heads, offset_0 % heads, _j, 0)",
+                code,
+            )
+
+        with self.subTest(name="body_vmem_indices"):
+            self.assertIn("out_vmem[0, 0, :, :]", code)
+
+    def test_output_index_remapping_in_fori_loop(self) -> None:
+        total_elements = 8 * 128 * 128
+        x = torch.arange(total_elements, device=DEVICE, dtype=torch.bfloat16).view(
+            8, 128, 128
+        )
+        batch = 2
+        heads = 4
+        code, result = code_and_output(
+            kernel_output_index_remapping,
+            (x, batch, heads),
+            block_sizes=[32],
+            pallas_loop_type="fori_loop",
+        )
+
+        with self.subTest(name="correctness"):
+            expected = x.reshape(batch, heads, 128, 128)
+            torch.testing.assert_close(result, expected)
+
+        with self.subTest(name="fori_loop_emit"):
+            self.assertIn("jax.lax.fori_loop", code)
+
+        with self.subTest(name="body_vmem_indices"):
+            self.assertIn("out_buf[0, 0, :, :]", code)
+
+        with self.subTest(name="vmem_shape_allocation"):
+            self.assertIn("((1, 1, 32, 128), 'jnp.bfloat16', 'vmem')", code)
+
+        with self.subTest(name="hbm_dma_slices"):
+            self.assertIn("pl.ds(symnode_0, 1), pl.ds(symnode_1, 1)", code)
+
+    def test_pipeline_kernel_tile_index_is_blockwise(self) -> None:
+        x = torch.arange(1024, device=DEVICE, dtype=torch.float32)
+        code, result = code_and_output(
+            kernel_tile_index_is_blockwise,
+            (x,),
+            block_sizes=[256],
+            pallas_loop_type="emit_pipeline",
+        )
+        torch.testing.assert_close(result, x + 1.0)
+        self.assertNotIn("pltpu.emit_pipeline", code)
+        self.assertIn("out[:]", code)
+
+    def test_pipeline_kernel_tile_begin_plus_offset_is_elementwise(self) -> None:
+        x = torch.arange(1024, device=DEVICE, dtype=torch.float32)
+        code, result = code_and_output(
+            kernel_tile_begin_plus_offset_is_elementwise,
+            (x,),
+            block_sizes=[256],
+            pallas_loop_type="emit_pipeline",
+        )
+        expected = torch.zeros_like(x)
+        expected[5::256] = x[5::256] + 1.0
+        torch.testing.assert_close(result, expected)
+        self.assertNotIn("pltpu.emit_pipeline", code)
+        self.assertIn("_smem_arg_indices", code)
+        self.assertIn("out[5]", code)
 
     def test_add_1d(self) -> None:
         args = (torch.randn(1024, device=DEVICE), torch.randn(1024, device=DEVICE))
@@ -613,6 +752,137 @@ class TestPallas(TestCase):
         torch.testing.assert_close(result, x + offsets[None, :])
         self.assertIn("jnp.arange", code)
 
+    def test_bool_view_expand_where(self) -> None:
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def pallas_bool_view_expand_where(x: torch.Tensor) -> torch.Tensor:
+            m, n = x.size()
+            out = torch.empty_like(x)
+            for tile_m, tile_n in hl.tile([m, n]):
+                mask = x[tile_m, 0] > 0
+                mask_2d = mask.view(tile_m.block_size, 1).expand(
+                    tile_m.block_size, tile_n.block_size
+                )
+                out[tile_m, tile_n] = torch.where(mask_2d, x[tile_m, tile_n], 0.0)
+            return out
+
+        x = torch.randn(16, 128, device=DEVICE, dtype=torch.float32)
+        code, result = code_and_output(
+            pallas_bool_view_expand_where,
+            (x,),
+            block_sizes=[16, 128],
+        )
+
+        expected = torch.where(x[:, :1] > 0, x, torch.zeros_like(x))
+        torch.testing.assert_close(result, expected)
+        self.assertIn("astype(jnp.int32)", code)
+
+    def test_indirect_gather_with_tiled_dim(self) -> None:
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def pallas_indirect_gather_with_tiled_dim(
+            values: torch.Tensor, indices: torch.Tensor
+        ) -> torch.Tensor:
+            out = torch.empty([indices.size(0), values.size(1)], device=values.device)
+            for tile_m, tile_n in hl.tile(out.size()):
+                out[tile_m, tile_n] = values[indices[tile_m], tile_n]
+            return out
+
+        values = torch.randn(16, 8, device=DEVICE, dtype=torch.float32)
+        indices = torch.randperm(16, device=DEVICE).to(torch.int32)
+        code, result = code_and_output(
+            pallas_indirect_gather_with_tiled_dim,
+            (values, indices),
+            block_sizes=[4, 4],
+        )
+
+        torch.testing.assert_close(result, values[indices.to(torch.int64), :])
+        self.assertIn("values[:,", code)
+
+    def test_scatter_store(self) -> None:
+        for dtype in (torch.float32, torch.bfloat16):
+            with self.subTest(dtype=dtype):
+                values = torch.randn(16, 8, device=DEVICE, dtype=dtype)
+                indices = torch.randperm(16, device=DEVICE).to(torch.int32)
+                code, result = code_and_output(
+                    pallas_scatter_store, (values, indices), block_sizes=[4, 4]
+                )
+
+                expected = torch.zeros_like(values)
+                expected[indices.to(torch.int64)] = values
+                torch.testing.assert_close(result, expected)
+                self.assertIn("one_hot", code)
+                self.assertIn("jnp.triu", code)
+                self.assertIn("jnp.eye", code)
+                self.assertIn("jnp.swapaxes", code)
+                self.assertIn("jnp.ones_like", code)
+                self.assertIn("jnp.where", code)
+                self.assertIn("dot_general", code)
+
+    def test_scatter_store_duplicate_indices(self) -> None:
+        values = torch.randn(16, 8, device=DEVICE, dtype=torch.float32)
+        indices = torch.tensor(
+            [0, 1, 1, 2, 4, 4, 4, 8, 8, 9, 10, 10, 12, 13, 14, 14],
+            device=DEVICE,
+            dtype=torch.int32,
+        )
+        code, result = code_and_output(
+            pallas_scatter_store, (values, indices), block_sizes=[16, 8]
+        )
+
+        expected = torch.zeros_like(values)
+        expected[indices.to(torch.int64)] = values
+        torch.testing.assert_close(result, expected)
+
+    def test_tensor_index_atomic_add_raises(self) -> None:
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def atomic_add_tensor_index(
+            values: torch.Tensor, indices: torch.Tensor
+        ) -> torch.Tensor:
+            out = torch.zeros_like(values)
+            for tile in hl.tile(values.size(0)):
+                hl.atomic_add(out, [indices[tile]], values[tile])
+            return out
+
+        values = torch.randn(16, device=DEVICE, dtype=torch.float32)
+        indices = torch.randperm(16, device=DEVICE).to(torch.int32)
+
+        with self.assertRaisesRegex(
+            NotImplementedError,
+            "tensor-indexed memory op is not supported for op=atomic_add",
+        ):
+            code_and_output(
+                atomic_add_tensor_index,
+                (values, indices),
+                block_size=16,
+            )
+
+    def test_scatter_store_multiple_tensor_indices_raises(self) -> None:
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def scatter_store_multiple_tensor_indices(
+            values: torch.Tensor, row_indices: torch.Tensor, col_indices: torch.Tensor
+        ) -> torch.Tensor:
+            out = torch.zeros(
+                [values.size(0), values.size(0)],
+                dtype=values.dtype,
+                device=values.device,
+            )
+            for tile in hl.tile(values.size(0)):
+                out[row_indices[tile], col_indices[tile]] = values[tile, tile]
+            return out
+
+        values = torch.randn(16, 16, device=DEVICE, dtype=torch.float32)
+        row_indices = torch.randperm(16, device=DEVICE).to(torch.int32)
+        col_indices = torch.randperm(16, device=DEVICE).to(torch.int32)
+
+        with self.assertRaisesRegex(
+            NotImplementedError,
+            "multiple indirect dims are not supported",
+        ):
+            code_and_output(
+                scatter_store_multiple_tensor_indices,
+                (values, row_indices, col_indices),
+                block_size=16,
+            )
+
     def test_inplace_add(self) -> None:
         x = torch.randn(1024, device=DEVICE, dtype=torch.float32)
         y = torch.randn(1024, device=DEVICE, dtype=torch.float32)
@@ -622,6 +892,23 @@ class TestPallas(TestCase):
         code, result = code_and_output(pallas_inplace_add, (x, y), block_size=1024)
         # x should be mutated in place
         torch.testing.assert_close(x, expected)
+
+    def test_shared_output_disjoint_rows(self) -> None:
+        @helion.kernel(backend="pallas", static_shapes=True, autotune_effort="none")
+        def pallas_shared_output_disjoint_rows(x: torch.Tensor) -> torch.Tensor:
+            for row in hl.grid(2):
+                x[row, :] = x[row, :] + (row + 10)
+            return x
+
+        x = torch.zeros([2, 128], device=DEVICE, dtype=torch.float32)
+        expected = torch.stack(
+            [
+                torch.full([128], 10.0, device=DEVICE),
+                torch.full([128], 11.0, device=DEVICE),
+            ]
+        )
+        code, result = code_and_output(pallas_shared_output_disjoint_rows, (x,))
+        torch.testing.assert_close(result, expected)
 
     def test_pointwise_mul(self) -> None:
         args = (
@@ -775,6 +1062,286 @@ class TestPallas(TestCase):
         torch.testing.assert_close(result, expected, rtol=1e-2, atol=1e-2)
         # The bias block_spec_info must have None for dim 0 (not a grid index).
         self.assertIn("(None, 1)", code)
+
+    def test_pallas_launcher_fast_path_hits_on_repeat_invocations(self) -> None:
+        """Repeat calls on a cached static-shape kernel take the launcher fast path.
+
+        On the first call the launcher seeds a grid-keyed cache on the inner
+        device function; every later call hits ``cache is not None and
+        cache[0] == grid`` and reuses the precomputed ``_LauncherFastPath``
+        instead of recomputing the per-call dtype check + ds-pad + output-only
+        loop.  The launcher branches deterministically on the cache, so a
+        populated cache after the first call means the fast path is taken; the
+        test asserts that and that the output stays correct.
+        """
+
+        # Define the kernel inside the test so its launcher cache -- which lives
+        # on the inner generated function, not the decorator object -- is unique
+        # to this run, avoiding cross-test pollution.
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def _matmul_launcher_fast_path_pin(
+            x: torch.Tensor, y: torch.Tensor
+        ) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty(
+                [m, n],
+                device=x.device,
+                dtype=torch.promote_types(x.dtype, y.dtype),
+            )
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = acc
+            return out
+
+        torch.manual_seed(0)
+        x = torch.randn(256, 256, device=DEVICE, dtype=torch.bfloat16)
+        torch.manual_seed(1)
+        y = torch.randn(256, 256, device=DEVICE, dtype=torch.bfloat16)
+
+        bound = _matmul_launcher_fast_path_pin.bind((x, y))
+        config = bound.config_spec.default_config()
+        compiled_fn = bound.compile_config(config)
+
+        expected = (x.float() @ y.float()).to(torch.bfloat16)
+
+        # First call seeds the launcher cache; subsequent calls take the fast
+        # path off it.  Output must stay correct throughout.
+        for _ in range(5):
+            result = compiled_fn(x, y)
+            torch.testing.assert_close(result, expected, rtol=1e-2, atol=1e-2)
+
+        # The launcher stores its grid-keyed cache on the inner device-kernel
+        # object (``_pallas_cache`` / ``_pallas_pipeline_cache`` /
+        # ``_pallas_fori_cache``, depending on which launcher the config
+        # selects), reachable via the compiled function's module globals.  A
+        # populated cache means repeat calls took the fast-path branch.
+        cache_attrs = ("_pallas_cache", "_pallas_pipeline_cache", "_pallas_fori_cache")
+        cached = [
+            value
+            for value in compiled_fn.__globals__.values()
+            if any(getattr(value, a, None) is not None for a in cache_attrs)
+        ]
+        self.assertTrue(
+            cached,
+            "Repeat calls on a cached static-shape kernel must populate the "
+            "launcher fast-path cache on the inner device function.",
+        )
+
+    @skipIfPallasInterpret(
+        "direct call_custom_kernel dispatch is torch_tpu/TPU-only; the "
+        "_DirectCallKernel snapshot is not built in JAX interpret mode"
+    )
+    def test_pallas_call_custom_kernel_direct_matches_jaxcallable_output(
+        self,
+    ) -> None:
+        """Direct ``call_custom_kernel`` dispatch must produce bitwise-identical
+        output to the JaxCallable path on bf16 matmul (pin against silent
+        divergence from a refactor)."""
+
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def _matmul_direct_correctness(
+            x: torch.Tensor, y: torch.Tensor
+        ) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty(
+                [m, n],
+                device=x.device,
+                dtype=torch.promote_types(x.dtype, y.dtype),
+            )
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = acc
+            return out
+
+        torch.manual_seed(0)
+        x = torch.randn(256, 256, device=DEVICE, dtype=torch.bfloat16)
+        torch.manual_seed(1)
+        y = torch.randn(256, 256, device=DEVICE, dtype=torch.bfloat16)
+
+        bound = _matmul_direct_correctness.bind((x, y))
+        config = bound.config_spec.default_config()
+        compiled_fn = bound.compile_config(config)
+
+        # First call: slow path (JaxCallable wrapper).  Saves the reference.
+        reference = compiled_fn(x, y).clone()
+
+        # Subsequent calls: direct ``call_custom_kernel`` dispatch.  Each output
+        # must be bitwise identical to the reference.
+        for i in range(3):
+            result = compiled_fn(x, y)
+            self.assertTrue(
+                torch.equal(result, reference),
+                f"Direct-dispatch call {i + 1} output diverged from the "
+                f"JaxCallable-path reference (max_abs_diff="
+                f"{(result.float() - reference.float()).abs().max().item()}).",
+            )
+
+        # Confirm the direct-call snapshot was actually built (slot 5 of the
+        # launcher cache), so the equality above exercised the direct path and
+        # is not a trivial slow-path-vs-slow-path comparison.
+        cache_attrs = ("_pallas_cache", "_pallas_pipeline_cache", "_pallas_fori_cache")
+        caches = [
+            getattr(value, a)
+            for value in compiled_fn.__globals__.values()
+            for a in cache_attrs
+            if getattr(value, a, None) is not None
+        ]
+        self.assertTrue(
+            caches and caches[0][5] is not None,
+            "Repeat calls must build the _DirectCallKernel snapshot "
+            "(direct-dispatch path engaged), not stay on the slow path.",
+        )
+
+    @skipIfPallasInterpret(
+        "direct call_custom_kernel dispatch is torch_tpu/TPU-only; the "
+        "_DirectCallKernel snapshot is not built in JAX interpret mode"
+    )
+    def test_pallas_direct_call_sig_check_locks_on_static_shapes(self) -> None:
+        """Repeat direct-dispatch calls flip ``_DirectCallKernel.sig_locked`` to
+        ``True``, eliding the per-call sig check on a static-shape kernel."""
+
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def _matmul_sig_lock_pin(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty(
+                [m, n],
+                device=x.device,
+                dtype=torch.promote_types(x.dtype, y.dtype),
+            )
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = acc
+            return out
+
+        torch.manual_seed(0)
+        x = torch.randn(256, 256, device=DEVICE, dtype=torch.bfloat16)
+        torch.manual_seed(1)
+        y = torch.randn(256, 256, device=DEVICE, dtype=torch.bfloat16)
+
+        bound = _matmul_sig_lock_pin.bind((x, y))
+        config = bound.config_spec.default_config()
+        compiled_fn = bound.compile_config(config)
+
+        reference = compiled_fn(x, y).clone()
+        for _ in range(5):
+            result = compiled_fn(x, y)
+            self.assertTrue(
+                torch.equal(result, reference),
+                "Sig-locked direct-dispatch call output diverged "
+                "(max_abs_diff="
+                f"{(result.float() - reference.float()).abs().max().item()}).",
+            )
+
+        # Slot 5 of the launcher cache holds the _DirectCallKernel snapshot.
+        cache_attrs = ("_pallas_cache", "_pallas_pipeline_cache", "_pallas_fori_cache")
+        caches = [
+            getattr(value, a)
+            for value in compiled_fn.__globals__.values()
+            for a in cache_attrs
+            if getattr(value, a, None) is not None
+        ]
+        self.assertTrue(caches, "Launcher cache was not populated.")
+        direct_call = caches[0][5]
+        self.assertIsNotNone(direct_call, "Direct-call snapshot was not built.")
+        self.assertTrue(
+            direct_call.sig_locked,
+            "Repeat direct-dispatch calls must flip sig_locked to True.",
+        )
+
+    def test_pallas_launcher_caches_output_tensor(self) -> None:
+        """Static-shape kernel caches the output ``device='meta'`` placeholder and
+        reuses the same object across calls (no per-call re-allocation)."""
+
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def _matmul_output_meta_pin(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty(
+                [m, n],
+                device=x.device,
+                dtype=torch.promote_types(x.dtype, y.dtype),
+            )
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = acc
+            return out
+
+        torch.manual_seed(0)
+        x = torch.randn(256, 256, device=DEVICE, dtype=torch.bfloat16)
+        torch.manual_seed(1)
+        y = torch.randn(256, 256, device=DEVICE, dtype=torch.bfloat16)
+
+        bound = _matmul_output_meta_pin.bind((x, y))
+        config = bound.config_spec.default_config()
+        compiled_fn = bound.compile_config(config)
+
+        reference = compiled_fn(x, y).clone()
+        owners = [
+            value
+            for value in compiled_fn.__globals__.values()
+            if getattr(value, "_helion_output_meta_cache_0", None) is not None
+        ]
+        self.assertTrue(owners, "Output meta placeholder was not cached.")
+        cached_meta = owners[0]._helion_output_meta_cache_0
+
+        # Repeat calls must reuse the same placeholder object and keep the output.
+        n_repeats = 10
+        for _ in range(n_repeats):
+            result = compiled_fn(x, y)
+            self.assertTrue(
+                torch.equal(result, reference),
+                "Output diverged after cached meta-placeholder reuse "
+                f"(max_abs_diff="
+                f"{(result.float() - reference.float()).abs().max().item()}).",
+            )
+            self.assertIs(
+                owners[0]._helion_output_meta_cache_0,
+                cached_meta,
+                "Repeat calls must reuse the cached placeholder, not re-allocate.",
+            )
+
+        # Bitwise-identical to a fresh-compiled baseline: the cache holds only the
+        # zero-storage meta placeholder, not output bytes.
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def _matmul_output_meta_baseline(
+            x: torch.Tensor, y: torch.Tensor
+        ) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty(
+                [m, n],
+                device=x.device,
+                dtype=torch.promote_types(x.dtype, y.dtype),
+            )
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = acc
+            return out
+
+        bound_baseline = _matmul_output_meta_baseline.bind((x, y))
+        baseline_fn = bound_baseline.compile_config(
+            bound_baseline.config_spec.default_config()
+        )
+        baseline_result = baseline_fn(x, y)
+        self.assertTrue(
+            torch.equal(reference, baseline_result),
+            "Cached-meta result diverged from fresh-compiled baseline "
+            f"(max_abs_diff="
+            f"{(reference.float() - baseline_result.float()).abs().max().item()}).",
+        )
 
     def test_bmm(self) -> None:
         """Test BMM with default config — exercises size_matches fix.
@@ -992,7 +1559,7 @@ class TestPallas(TestCase):
 
         # test that we're not manually allocating and donating out tensor HBM,
         # but are instead taking over tensor returned by torch_tpu JaxCallable
-        self.assertIn("out = torch.empty_like(q_view, device='meta')", _code)
+        self.assertIn("torch.empty_like(q_view, device='meta')", _code)
         self.assertIn("out = _launcher(", _code)
 
     def test_hl_zeros_outer_arithmetic_emit_pipeline(self) -> None:
@@ -1318,7 +1885,7 @@ class TestPallas(TestCase):
         result = fn(x)
         torch.testing.assert_close(result, x)
 
-    @xfailIfPallasInterpret("numerical mismatch in JAX interpret mode")
+    @skipIfPallasInterpret("SMEM preload copy is too expensive in JAX interpret mode")
     def test_scalar_access_2D_constexpr(self) -> None:
         @helion.kernel(backend="pallas", static_shapes=True, config=helion.Config())
         def fn(x: torch.Tensor) -> torch.Tensor:
@@ -1493,6 +2060,18 @@ class TestPallas(TestCase):
         expected = x + 0.5
         torch.testing.assert_close(result, expected)
 
+    def test_scalar_access_hl_grid_inplace(self) -> None:
+        @helion.kernel(backend="pallas", static_shapes=True, config=helion.Config())
+        def fn(x: torch.Tensor) -> torch.Tensor:
+            for i in hl.grid(x.size(0)):
+                x[i] = x[i] + 1
+            return x
+
+        x = torch.arange(128, device=DEVICE, dtype=torch.float32)
+        expected = x + 1
+        result = fn(x)
+        torch.testing.assert_close(result, expected)
+
     def test_scalar_access_hl_grid_offset(self) -> None:
         @helion.kernel(backend="pallas", static_shapes=True, config=helion.Config())
         def fn(x: torch.Tensor) -> torch.Tensor:
@@ -1507,6 +2086,9 @@ class TestPallas(TestCase):
         expected = x[x.shape[0] // 2 :] + 0.5
         torch.testing.assert_close(result, expected)
 
+    @skipIfPallasInterpret(
+        "2D SMEM preload copy is too expensive in JAX interpret mode"
+    )
     def test_scalar_access_hl_grid_2d(self) -> None:
         @helion.kernel(backend="pallas", static_shapes=True, config=helion.Config())
         def fn(x: torch.Tensor) -> torch.Tensor:
@@ -1525,6 +2107,9 @@ class TestPallas(TestCase):
         _, result = code_and_output(fn, (x,), loop_order=[1, 0])
         torch.testing.assert_close(result, expected)
 
+    @skipIfPallasInterpret(
+        "2D SMEM preload copy is too expensive in JAX interpret mode"
+    )
     def test_scalar_access_hl_grid_2d_nested(self) -> None:
         @helion.kernel(backend="pallas", static_shapes=True, config=helion.Config())
         def fn(x: torch.Tensor) -> torch.Tensor:
@@ -3036,24 +3621,6 @@ class TestPallasIndirectGather(TestCase):
         self.assertNotIn("dot_general", code)
         ref = table.cpu()[indices.long().cpu()].to(device=DEVICE)
         torch.testing.assert_close(result, ref)
-
-    @parametrize("static_shapes", (True, False))
-    def test_scatter_raises(self, static_shapes: bool) -> None:
-        """Indirect store has no Pallas strategy; plan_tiling must raise."""
-
-        @helion.kernel(backend="pallas", static_shapes=static_shapes)
-        def scatter(
-            out: torch.Tensor, values: torch.Tensor, indices: torch.Tensor
-        ) -> torch.Tensor:
-            for tile_b, tile_e in hl.tile([values.size(0), values.size(1)]):
-                out[indices[tile_b], tile_e] = values[tile_b, tile_e]
-            return out
-
-        out = torch.zeros(16, 64, device=DEVICE, dtype=torch.float32)
-        values = torch.randn(8, 64, device=DEVICE, dtype=torch.float32)
-        indices = torch.arange(8, device=DEVICE, dtype=torch.int32)
-        with self.assertRaisesRegex(Exception, "indirect store"):
-            code_and_output(scatter, (out, values, indices), block_sizes=[8, 64])
 
     @parametrize("static_shapes", (True, False))
     def test_gather_1d_index_bumps_block_to_tpu_alignment(

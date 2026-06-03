@@ -2,12 +2,12 @@
   "include": [
     {
       "runner": "linux.g5.4xlarge.nvidia.gpu",
-      "python-version": "3.10",
+      "python-version": "3.14t",
       "ref-eager": false,
       "image": "nvidia/cuda:12.8.1-devel-ubuntu24.04",
       "runtime-version": "cu128",
       "container-options": "--gpus all",
-      "pytorch-version": "pytorch-2.9",
+      "pytorch-version": "pytorch-nightly",
       "alias": "a10g",
       "backend": "triton"
     },
@@ -47,10 +47,10 @@
       "backend": "triton"
     },
     {
-      "runner": "linux.aws.h100",
+      "runner": "mt-l-x86iamx-22-225-h100",
       "python-version": "3.12",
       "ref-eager": false,
-      "image": "nvidia/cuda:12.8.1-devel-ubuntu24.04",
+      "image": "pytorch/pytorch:2.11.0-cuda12.8-cudnn9-devel",
       "runtime-version": "cu128",
       "container-options": "--gpus all",
       "pytorch-version": "pytorch-nightly",
@@ -58,10 +58,10 @@
       "backend": "triton"
     },
     {
-      "runner": "linux.aws.h100.4",
+      "runner": "mt-l-x86iamx-88-900-h100-4",
       "python-version": "3.12",
       "ref-eager": false,
-      "image": "nvidia/cuda:12.8.1-devel-ubuntu24.04",
+      "image": "pytorch/pytorch:2.11.0-cuda12.8-cudnn9-devel",
       "runtime-version": "cu128",
       "container-options": "--gpus all",
       "pytorch-version": "pytorch-nightly",
@@ -139,13 +139,13 @@
       "backend": "cute"
     },
     {
-      "runner": "macos-26-xlarge",
+      "runner": "macos-m2-26",
       "python-version": "3.12",
       "ref-eager": false,
       "image": "",
       "runtime-version": "cpu",
       "container-options": "",
-      "pytorch-version": "pytorch-2.9",
+      "pytorch-version": "pytorch-nightly",
       "alias": "m2-metal",
       "backend": "metal"
     },

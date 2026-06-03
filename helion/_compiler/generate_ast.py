@@ -681,11 +681,46 @@ class GenerateAST(NodeVisitor, CodegenInterface):
                     if persistent_body is not None:
                         # pyrefly: ignore [bad-assignment]
                         self.device_function.body = persistent_body
+                    else:
+                        # The persistent path pulls tcgen05 post-loop cleanup to
+                        # the end of the body; the non-persistent (flat-grid)
+                        # path must do the same so a multi-store fan-out's
+                        # one-shot teardown runs after every store reads the
+                        # accumulator. No-op when there are no post-loop marks.
+                        self.device_function.body = self.device_function.cute_state.move_tcgen05_post_loop_stmts_to_end(
+                            list(self.device_function.body)
+                        )
                 # Mark extra params as placeholder args — they appear only in
                 # placeholder strings, not in the AST body, so DCE would
                 # otherwise remove them.
                 for param in self._extra_params:
                     self.device_function.placeholder_args.add(param)
+                if CompileEnvironment.current().backend.name == "cute":
+                    from .tile_strategy import (
+                        interchange_lane_outside_serial_reductions,
+                    )
+                    from .tile_strategy import restore_unprocessed_lane_reduce_markers
+                    from .tile_strategy import split_lane_loop_reductions
+
+                    # First interchange any ``for LANE: ... for MB: ...`` nest
+                    # whose inner serial loop carries lane-reduce markers into a
+                    # lane-outside-mb accumulator nest plus a lane-inside-mb
+                    # reduction nest; then split the (now inner) lane loops into
+                    # the two-pass accumulate/finalize/consume structure.
+                    self.device_function.body = (
+                        interchange_lane_outside_serial_reductions(
+                            list(self.device_function.body)
+                        )
+                    )
+                    self.device_function.body = split_lane_loop_reductions(
+                        list(self.device_function.body)
+                    )
+                    # Safety net: revert any lane-reduce marker that neither pass
+                    # rewrote so no ``_helion_lane_reduce`` call leaks into the
+                    # emitted kernel.
+                    self.device_function.body = restore_unprocessed_lane_reduce_markers(
+                        list(self.device_function.body)
+                    )
                 self.device_function.dead_code_elimination()
                 if not self.device_function.preamble and not self.device_function.body:
                     raise exc.EmptyDeviceLoopAfterDCE
@@ -880,8 +915,18 @@ def generate_ast(
             )
             if output_only_names:
                 oo_set = set(output_only_names)
+                # ``static_shapes=True``: cache the output-only meta placeholder
+                # ``torch.empty(..., device='meta')`` on the inner device
+                # function so repeat calls reuse it (shape/dtype/device are
+                # constant).  ``static_shapes=False`` keeps the per-call alloc.
+                cache_static_shapes = (
+                    CompileEnvironment.current().settings.static_shapes
+                )
+                inner_fn_name = codegen.device_function.name
+                cached_meta_index = 0
+                new_host_statements: list[ast.AST] = []
                 for stmt in codegen.host_statements:
-                    if (
+                    if not (
                         isinstance(stmt, ast.Assign)
                         and len(stmt.targets) == 1
                         and isinstance(stmt.targets[0], ast.Name)
@@ -889,12 +934,33 @@ def generate_ast(
                         and not getattr(stmt, "_is_kernel_call", False)
                         and isinstance(stmt.value, ast.Call)
                     ):
-                        call = stmt.value
-                        call.keywords = [
-                            kw for kw in call.keywords if kw.arg != "device"
-                        ] + [
-                            ast.keyword(arg="device", value=ast.Constant(value="meta"))
-                        ]
+                        new_host_statements.append(stmt)
+                        continue
+                    call = stmt.value
+                    call.keywords = [
+                        kw for kw in call.keywords if kw.arg != "device"
+                    ] + [ast.keyword(arg="device", value=ast.Constant(value="meta"))]
+                    if not cache_static_shapes:
+                        new_host_statements.append(stmt)
+                        continue
+                    # Read the cache slot (``getattr`` -> ``None`` on the first
+                    # call) and populate it inline on the miss.  Kept inline (no
+                    # helper/lambda) so the warm path stays a plain attr read.
+                    varname = stmt.targets[0].id
+                    cache_attr = f"_helion_output_meta_cache_{cached_meta_index}"
+                    cached_meta_index += 1
+                    get_stmt = statement_from_string(
+                        f"{varname} = getattr({inner_fn_name}, '{cache_attr}', None)"
+                    )
+                    if_stmt = statement_from_string(
+                        f"if {varname} is None:\n"
+                        f"    {varname} = {inner_fn_name}.{cache_attr} = "
+                        f"{{__orig_call__}}\n",
+                        __orig_call__=call,
+                    )
+                    new_host_statements.extend([get_stmt, if_stmt])
+                if cache_static_shapes:
+                    codegen.host_statements = new_host_statements
 
             # Inject RNG seed buffer creation if needed
             rng_statements = (

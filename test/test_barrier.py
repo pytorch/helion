@@ -288,12 +288,13 @@ class TestBarrier(RefEagerTestBase, TestCase):
 
 @onlyBackends(["cute"])
 class TestCuteBarrier(RefEagerTestBase, TestCase):
-    def test_barrier_requires_real_backend_support(self) -> None:
+    def test_dep_across_barrier(self) -> None:
         x = torch.arange(8, device=DEVICE, dtype=torch.float32)
-        with self.assertRaisesRegex(exc.BackendUnsupported, "hl.barrier"):
-            code_and_output(
-                barrier_dep_single,
-                (x,),
-                block_sizes=[8, 8],
-                pid_type="persistent_blocked",
-            )
+        code, out = code_and_output(
+            barrier_dep_single,
+            (x,),
+            block_sizes=[8, 8],
+            pid_type="persistent_blocked",
+        )
+        expected = x * 2 + 1
+        torch.testing.assert_close(out, expected)

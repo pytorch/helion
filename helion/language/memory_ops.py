@@ -331,6 +331,22 @@ def _(state: CodegenState) -> None:
         state, tensor, subscript, parts, value
     )
     idx_str = ", ".join(parts)
+    patterns = state.fx_node.meta.get("indexing_patterns") if state.fx_node else ()
+    from .._compiler.pallas.gather import emit_scatter_store
+    from .._compiler.pallas.plan_tiling import IndirectScatterPattern
+
+    scatter_patterns = [
+        pattern
+        for pattern in patterns or ()
+        if isinstance(pattern, IndirectScatterPattern)
+    ]
+    assert len(scatter_patterns) <= 1, (
+        "Pallas store expected at most one indirect scatter pattern"
+    )
+    if scatter_patterns:
+        value = emit_scatter_store(
+            state, scatter_patterns[0].plan, name, idx_str, value
+        )
     state.codegen.add_statement(
         statement_from_string(f"{name}[{idx_str}] = {{value}}", value=value)
     )
@@ -2233,8 +2249,66 @@ def _codegen_cute_store_tcgen05_tile(
                 "cute",
                 "tcgen05 pure role-lifecycle supports only identity pure-matmul stores",
             )
+    # When one matmul accumulator fans out to multiple output stores (e.g.
+    # aux = pre-activation and out = gelu(pre)), the per-matmul TMA-store
+    # atom/tensor kernel-arg names allocated in cute_mma are shared by every
+    # store site. Emitting them verbatim at each site produces duplicate kernel
+    # parameters (SyntaxError) and binds both device epilogues to the same TMA
+    # descriptor. The secondary store gets fresh per-store descriptor names so
+    # each store threads its own TMA descriptor; the first store keeps the
+    # original names. The secondary store also reuses the accumulator the first
+    # store already consumed: the accumulator TMEM stays live until the
+    # one-shot teardown frees it, so the secondary store reads it directly
+    # without re-running the accumulator pipeline's consumer wait/release/advance
+    # (those would hang waiting on a producer that has already drained) and
+    # without re-emitting the matmul drain / TMEM-free teardown.
+    is_secondary_store = (
+        tcgen05_value.use_tma_store_epilogue
+        and not tcgen05_value.pure_matmul_role_lifecycle
+        and df.cute_state.tcgen05_tma_store_names_already_emitted(tcgen05_value)
+    )
+    if is_secondary_store:
+        tcgen05_value = dataclasses.replace(
+            tcgen05_value,
+            tma_store_atom=df.new_var("tcgen05_tma_store_atom"),
+            tma_store_tensor=df.new_var("tcgen05_tma_store_tensor"),
+        )
     tcgen05_lifecycle = tcgen05_value.lifecycle_context
     tcgen05_pure_matmul_object = tcgen05_value.pure_matmul_object
+
+    # Snapshot the accumulator consumer-state stage index. The primary store
+    # captures it before advancing the consumer state; fan-out stores read the
+    # same live TMEM stage through the snapshot rather than the already-advanced
+    # live index. For single-store kernels the assignment is unused and DCE
+    # drops it, so the generated code is unchanged.
+    tcgen05_acc_stage_index_var, tcgen05_acc_stage_index_is_primary = (
+        df.cute_state.get_or_create_tcgen05_acc_stage_index_var(
+            tcgen05_lifecycle.acc_consumer_state,
+            df.new_var,
+        )
+    )
+    # The snapshot is captured at top level (before the store's control-flow
+    # block) by the primary store so fan-out stores can read it; CuTe DSL
+    # forbids defining a value inside one control-flow block and reading it in
+    # another. For single-store kernels the assignment is unused and DCE drops
+    # it, keeping generated code unchanged.
+    tcgen05_acc_stage_index_top_level_stmts = (
+        [
+            statement_from_string(
+                f"{tcgen05_acc_stage_index_var} = "
+                f"{tcgen05_lifecycle.acc_consumer_state}.index"
+            )
+        ]
+        if tcgen05_acc_stage_index_is_primary
+        else []
+    )
+    # The primary store keeps reading the live consumer index so single-store
+    # codegen is byte-identical; only fan-out stores route through the snapshot.
+    tcgen05_acc_stage_index_expr = (
+        f"{tcgen05_lifecycle.acc_consumer_state}.index"
+        if not is_secondary_store
+        else tcgen05_acc_stage_index_var
+    )
 
     # Backstop for callers that bypass Config.normalize() validation;
     # see _tcgen05_epi_warp_count docstring and cute_plan.md.
@@ -2813,24 +2887,31 @@ def _codegen_cute_store_tcgen05_tile(
                 source_for_local_tile = rec.aux_view2d
                 aux_tile_is_local = True
             else:
-                # Rank-1 trailing-axis (rowvec) broadcast aux: build a
-                # 2-D logical view of the rank-1 underlying tensor with
+                # M-axis (row) broadcast aux: build a 2-D logical view
+                # over the underlying tensor's ``.iterator`` with
                 # stride 0 on the leading (M) axis and stride 1 on the
                 # trailing (N) axis. Stride 0 on M causes every lane
                 # "owning" output ``(m, n)`` to read the same source
-                # element regardless of m, which is the rowvec
-                # broadcast semantic that matches PyTorch's
-                # ``acc + bias[tile_n]`` (rank-1 RHS aligns to the
-                # trailing axis). The view feeds the same
-                # ``partition_C → flat_divide → partition_D`` pipeline
-                # used by exact-shape aux. Mirrors Quack's
-                # ``RowVecLoad`` epilogue (``quack/quack/epi_ops.py``).
-                # Only the trailing axis (``broadcast_axis == 1``)
-                # form is accepted at classify time — see
-                # ``aux_tensor_load_kind`` /
-                # ``_AuxiliaryTensorStep.broadcast_axis`` for the
-                # rejection of the leading-axis form.
-                assert rec.broadcast_axis == 1
+                # element regardless of m, which is the broadcast
+                # semantic shared by two accepted forms:
+                #   * ``broadcast_axis == 1`` — a bare rank-1 tensor
+                #     ``bias[tile_n]`` with shape ``(N,)`` (rank-1 RHS
+                #     aligns to the trailing axis under PyTorch
+                #     broadcasting).
+                #   * ``broadcast_axis == 0`` — an explicit ``(1, N)``
+                #     tensor ``bias[tile_m, tile_n]`` (row 0 broadcasts
+                #     over M).
+                # Both have the same contiguous N-major memory layout
+                # (element ``(0, n)`` at offset ``n``), so the
+                # stride-(0, 1) view over ``.iterator`` is identical
+                # and feeds the same ``partition_C → flat_divide →
+                # partition_D`` pipeline used by exact-shape aux.
+                # Mirrors Quack's ``RowVecLoad`` epilogue
+                # (``quack/quack/epi_ops.py``). The classifier
+                # (``aux_tensor_load_kind``) admits only these two
+                # broadcast shapes; everything else drops to the
+                # loud-failure backstop.
+                assert rec.broadcast_axis in (0, 1)
                 assert rec.aux_view2d is not None
                 lines.append(
                     f"{rec.aux_view2d} = cute.make_tensor("
@@ -3474,11 +3555,17 @@ def _codegen_cute_store_tcgen05_tile(
         f"{ttr_gc} = {thr_copy_t2r}.partition_D({tcgc_epi})",
         (
             f"{ttr_tacc_stage} = {ttr_tacc_base}["
-            f"(None, None, None, None, None, {tcgen05_lifecycle.acc_consumer_state}.index)]"
+            f"(None, None, None, None, None, {tcgen05_acc_stage_index_expr})]"
         ),
-        (
-            f"if {tcgen05_lifecycle.epi_active}:\n"
-            f"    {tcgen05_lifecycle.acc_pipeline}.consumer_wait({tcgen05_lifecycle.acc_consumer_state})"
+        *(
+            []
+            if is_secondary_store
+            else [
+                (
+                    f"if {tcgen05_lifecycle.epi_active}:\n"
+                    f"    {tcgen05_lifecycle.acc_pipeline}.consumer_wait({tcgen05_lifecycle.acc_consumer_state})"
+                )
+            ]
         ),
         f"{ttr_tacc} = cute.group_modes({ttr_tacc_stage}, 3, cute.rank({ttr_tacc_stage}))",
         f"{ttr_gc_grouped} = cute.group_modes({ttr_gc}, 3, cute.rank({ttr_gc}))",
@@ -3537,21 +3624,38 @@ def _codegen_cute_store_tcgen05_tile(
             f"{simt_acc_vec_prelude}"
             f"        {acc_vec} = {simt_acc_vec_rhs}\n"
             f"        {ttr_rd}.store({acc_vec})\n"
-            f"        if _tcgen05_subtile == {subtile_count} - 1:\n"
-            # `cute.copy(t2r, ...)` issues async TMEM->reg loads. Releasing
-            # the acc consumer slot lets the MMA producer re-acquire the TMEM
-            # stage and issue UMMAs that overwrite TMEM, so we must fence the
-            # in-flight async TMEM loads first to avoid a race on the last
-            # subtile's `ttr_racc` / `ttr_rd` data. This matches Quack's
-            # sm100 gemm fence-before-release pattern.
-            f"            cute.arch.fence_view_async_tmem_load()\n"
-            f"            with cute.arch.elect_one():\n"
-            f"                {tcgen05_lifecycle.acc_pipeline}.consumer_release({tcgen05_lifecycle.acc_consumer_state})\n"
-            f"{simt_store_copy_source}"
+            # The secondary fan-out store reuses the still-live accumulator and
+            # must not release it; the primary store owns the release + advance.
+            + (
+                ""
+                if is_secondary_store
+                else (
+                    f"        if _tcgen05_subtile == {subtile_count} - 1:\n"
+                    # `cute.copy(t2r, ...)` issues async TMEM->reg loads.
+                    # Releasing the acc consumer slot lets the MMA producer
+                    # re-acquire the TMEM stage and issue UMMAs that overwrite
+                    # TMEM, so we must fence the in-flight async TMEM loads
+                    # first to avoid a race on the last subtile's `ttr_racc` /
+                    # `ttr_rd` data. This matches Quack's sm100 gemm
+                    # fence-before-release pattern.
+                    f"            cute.arch.fence_view_async_tmem_load()\n"
+                    f"            with cute.arch.elect_one():\n"
+                    f"                {tcgen05_lifecycle.acc_pipeline}.consumer_release({tcgen05_lifecycle.acc_consumer_state})\n"
+                )
+            )
+            + f"{simt_store_copy_source}"
             # Advance is a per-thread local state update, so it intentionally
             # stays outside elect_one; only the mbarrier release is elected.
-            f"if {tcgen05_lifecycle.epi_active}:\n"
-            + emit_pipeline_advance(tcgen05_lifecycle.acc_consumer_state, indent="    ")
+            + (
+                ""
+                if is_secondary_store
+                else (
+                    f"if {tcgen05_lifecycle.epi_active}:\n"
+                    + emit_pipeline_advance(
+                        tcgen05_lifecycle.acc_consumer_state, indent="    "
+                    )
+                )
+            )
         ),
     ]
     tma_store_pipeline_setup = [
@@ -3768,12 +3872,12 @@ def _codegen_cute_store_tcgen05_tile(
                 f"    {tcgen05_lifecycle.acc_pipeline}.consumer_wait({tcgen05_lifecycle.acc_consumer_state})"
             )
         ]
-        if diagnose_acc_wait_before_subtile_loop
+        if diagnose_acc_wait_before_subtile_loop and not is_secondary_store
         else []
     )
     tma_store_loop_acc_wait = (
         ""
-        if diagnose_acc_wait_before_subtile_loop
+        if diagnose_acc_wait_before_subtile_loop or is_secondary_store
         else (
             f"        if _tcgen05_subtile == 0:\n"
             f"            {tcgen05_lifecycle.acc_pipeline}.consumer_wait({tcgen05_lifecycle.acc_consumer_state})\n"
@@ -3836,6 +3940,20 @@ def _codegen_cute_store_tcgen05_tile(
             "        ",
             safe_direct_aux_with_full_tile=partial_tma_needs_full_tile_guard,
         )
+        # The secondary fan-out store reuses the still-live accumulator TMEM and
+        # must not release it: the primary store already owns the accumulator
+        # pipeline consumer release, and the one-shot teardown frees the TMEM
+        # after every store has read it.
+        acc_release = (
+            ""
+            if is_secondary_store
+            else (
+                f"        if _tcgen05_subtile == {subtile_count} - 1:\n"
+                f"            cute.arch.fence_view_async_tmem_load()\n"
+                f"            with cute.arch.elect_one():\n"
+                f"                {tcgen05_acc_pipeline}.consumer_release({tcgen05_acc_consumer_state})\n"
+            )
+        )
         return (
             f"{acc_wait}"
             f"        {ttr_tacc_mn} = {ttr_tacc}[(None, None, None, cutlass.Int32(_tcgen05_subtile))]\n"
@@ -3843,10 +3961,7 @@ def _codegen_cute_store_tcgen05_tile(
             f"{early_aux_prelude}"
             f"{late_prelude}"
             f"        {acc_vec} = {rhs}\n"
-            f"        if _tcgen05_subtile == {subtile_count} - 1:\n"
-            f"            cute.arch.fence_view_async_tmem_load()\n"
-            f"            with cute.arch.elect_one():\n"
-            f"                {tcgen05_acc_pipeline}.consumer_release({tcgen05_acc_consumer_state})\n"
+            f"{acc_release}"
             f"        {store_target}.store({acc_vec})\n"
         )
 
@@ -4335,7 +4450,7 @@ def _codegen_cute_store_tcgen05_tile(
         f"{bsg_gd} = cute.group_modes({bsg_gd}, 1, cute.rank({bsg_gd}))",
         (
             f"{ttr_tacc_stage} = {ttr_tacc_base}["
-            f"(None, None, None, None, None, {tcgen05_lifecycle.acc_consumer_state}.index)]"
+            f"(None, None, None, None, None, {tcgen05_acc_stage_index_expr})]"
         ),
         f"{ttr_tacc} = cute.group_modes({ttr_tacc_stage}, 3, cute.rank({ttr_tacc_stage}))",
         f"{subtile_count} = cutlass.const_expr(cute.size({ttr_tacc}.shape, mode=[3]))",
@@ -4399,11 +4514,17 @@ def _codegen_cute_store_tcgen05_tile(
             )
         )
     else:
+        # The secondary fan-out store does not own the accumulator consumer
+        # state, so it must not advance it (the primary store advances once).
         tma_store_acc_advance = (
-            f"if {tcgen05_lifecycle.epi_active}:\n"
-            + emit_pipeline_advance(
-                tcgen05_lifecycle.acc_consumer_state,
-                indent="    ",
+            ""
+            if is_secondary_store
+            else (
+                f"if {tcgen05_lifecycle.epi_active}:\n"
+                + emit_pipeline_advance(
+                    tcgen05_lifecycle.acc_consumer_state,
+                    indent="    ",
+                )
             )
         )
         tma_store_body_core = [
@@ -4504,6 +4625,7 @@ def _codegen_cute_store_tcgen05_tile(
                 tma_store_role_invariant_stmts
             )
             main_stmts = [
+                *tcgen05_acc_stage_index_top_level_stmts,
                 *tma_store_hoisted_stmts,
                 *tma_store_role_invariant_stmts,
                 sync_before_stmt,
@@ -4522,6 +4644,7 @@ def _codegen_cute_store_tcgen05_tile(
             )
             df.cute_state.register_tcgen05_epi_role_stmts([main_stmt])
             main_stmts = [
+                *tcgen05_acc_stage_index_top_level_stmts,
                 *tma_store_hoisted_stmts,
                 sync_before_stmt,
                 main_stmt,
@@ -4536,7 +4659,7 @@ def _codegen_cute_store_tcgen05_tile(
         main_stmt = statement_from_string(
             "if True:\n" + textwrap.indent("\n".join(store_body), "    ")
         )
-        main_stmts = [main_stmt]
+        main_stmts = [*tcgen05_acc_stage_index_top_level_stmts, main_stmt]
     # Pipeline drain + TMEM dealloc are one-shot cleanup. They must run
     # AFTER all tiles have been processed (in the persistent path) and
     # naturally land at the end of the kernel in the non-persistent path.
@@ -4549,7 +4672,11 @@ def _codegen_cute_store_tcgen05_tile(
         # serialize the next tile's epilogue against this tile's TMA stores.
         # The tail must run before TMEM dealloc setup below.
         tma_store_post_loop_tail = tma_store_pipeline_tail
-    if tcgen05_pure_matmul_object is not None:
+    if is_secondary_store:
+        # The matmul drain + TMEM-free teardown is one-shot and owned by the
+        # primary store; the secondary fan-out store emits only its store body.
+        post_loop_stmts = []
+    elif tcgen05_pure_matmul_object is not None:
         post_loop_stmts = tcgen05_pure_matmul_object.emit_store_post_loop_stmts(
             df.cute_state,
             candidate_names,
@@ -5561,6 +5688,45 @@ def _(state: CodegenState) -> ast.AST:
     raise exc.BackendUnsupported("metal", f"load tensor type: {type(tensor)}")
 
 
+def _cute_load_feeds_sort_or_scan(load_node: object) -> bool:
+    """Return True if ``load_node`` feeds a sort/topk/_associative_scan.
+
+    Direct users (sort/topk and the scalar ``_associative_scan`` path) are
+    matched immediately.  For a tuple ``_associative_scan`` the index stream is
+    typically a ``load`` that flows through a chain of dtype-cast / shape ops
+    (e.g. ``indices[tile].float().unsqueeze(1).expand_as(vals)``) before
+    reaching the scan.  To recover a scalar load for that stream we follow the
+    forward chain through those pass-through ops.
+    """
+    from torch.fx.node import Node
+
+    from .._compiler.cute.indexing import is_cute_shape_chain_target
+
+    if not isinstance(load_node, Node):
+        return False
+
+    passthrough_targets = (torch.ops.prims.convert_element_type.default,)
+    seen: set[Node] = set()
+    stack: list[Node] = [load_node]
+    while stack:
+        node = stack.pop()
+        for user in node.users:
+            if not isinstance(user, Node):
+                continue
+            target = user.target
+            if (
+                target in (torch.ops.aten.sort.default, torch.ops.aten.topk.default)
+                or getattr(target, "__name__", None) == "_associative_scan"
+            ):
+                return True
+            if (
+                is_cute_shape_chain_target(target) or target in passthrough_targets
+            ) and user not in seen:
+                seen.add(user)
+                stack.append(user)
+    return False
+
+
 @_decorators.codegen(load, "cute")
 def _(state: CodegenState) -> object:
     tensor = state.proxy_arg(0)
@@ -5752,11 +5918,7 @@ def _(state: CodegenState) -> object:
         if mask_expr is None:
             return expr_from_string(load_expr)
         return expr_from_string(f"({load_expr} if {mask_expr} else cutlass.Boolean(0))")
-    if state.fx_node is not None and any(
-        user.target in (torch.ops.aten.sort.default, torch.ops.aten.topk.default)
-        or getattr(user.target, "__name__", None) == "_associative_scan"
-        for user in state.fx_node.users
-    ):
+    if state.fx_node is not None and _cute_load_feeds_sort_or_scan(state.fx_node):
         from .._compiler.cute.indexing import CuteSortableLoad
 
         tensor_dim = 0

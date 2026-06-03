@@ -393,6 +393,24 @@ def _cute_unindexed_axis_leader_predicate(
     indexed_block_ids: set[int] = set()
     has_block_size_index = False
     for idx in index:
+        if isinstance(idx, torch.Tensor):
+            # A gather/scatter index tensor (e.g. ``output[idxs, tile_f]``)
+            # covers the tile dimension it was loaded along: the per-thread
+            # ``idxs`` value differs across that axis, so it is *indexed* and
+            # must not be collapsed to a single leader thread.
+            tensor_block_id = (
+                env.resolve_block_id(idx.shape[0]) if idx.ndim >= 1 else None
+            )
+            if tensor_block_id is not None and state.fx_node is not None:
+                has_block_size_index = True
+                indexed_block_ids.add(
+                    env.resolve_codegen_block_id(
+                        tensor_block_id,
+                        state.codegen,
+                        state.fx_node.graph,
+                    )
+                )
+            continue
         if not isinstance(idx, torch.SymInt):
             continue
         expr = _symint_expr(idx)
