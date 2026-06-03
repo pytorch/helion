@@ -309,6 +309,30 @@ def pallas_add_3d(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
 
 
 @helion.kernel(backend="pallas", static_shapes=True)
+def pallas_nested_non_grid_outer_loop(
+    x: torch.Tensor, w: torch.Tensor
+) -> torch.Tensor:
+    """Outer grid (``tile_m``) → outer non-grid device loop (``tile_n``)
+    → inner pipeline (``tile_k``) where the pipeline reads
+    ``w[tile_k, tile_n]``.
+
+    The inner pipeline's BlockSpec for ``w`` has to encode ``tile_n``
+    — an outer non-grid loop offset — along ``w``'s last dim.
+    Mirrors the epilogue structure of ``squeeze_and_excitation_net``.
+    """
+    m, k = x.size()
+    n = w.size(1)
+    out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+    for tile_m in hl.tile(m):
+        for tile_n in hl.tile(n):
+            acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+            for tile_k in hl.tile(k):
+                acc = torch.addmm(acc, x[tile_m, tile_k], w[tile_k, tile_n])
+            out[tile_m, tile_n] = acc.to(x.dtype)
+    return out
+
+
+@helion.kernel(backend="pallas", static_shapes=True)
 def pallas_attention(
     q_in: torch.Tensor, k_in: torch.Tensor, v_in: torch.Tensor
 ) -> torch.Tensor:
@@ -1181,6 +1205,26 @@ class TestPallas(TestCase):
         """Same kernel as :meth:`test_scalar_lookup_with_emit_pipeline`
         compiled under ``pallas_loop_type='fori_loop'``."""
         self._check_scalar_lookup_in_pipeline("fori_loop")
+
+    def test_nested_non_grid_outer_loop_emit_pipeline(self) -> None:
+        """Outer non-grid device loop around an ``emit_pipeline`` whose
+        body reads a tensor indexed by that outer tile.
+
+        BlockSpec for the inner pipeline must encode the outer non-grid
+        offset; before the fix this fell through to the full-dim shape
+        and the matmul broadcast-failed with mismatched shapes.
+        """
+        m, k, n = 32, 256, 128
+        x = torch.randn(m, k, device=DEVICE, dtype=torch.float32)
+        w = torch.randn(k, n, device=DEVICE, dtype=torch.float32)
+        code, result = code_and_output(
+            pallas_nested_non_grid_outer_loop,
+            (x, w),
+            block_sizes=[16, 64, 128],
+            pallas_loop_type="emit_pipeline",
+        )
+        self.assertIn("pltpu.emit_pipeline", code)
+        torch.testing.assert_close(result, x @ w, rtol=1e-2, atol=1e-2)
 
     def test_two_pass_reduction_emit_pipeline(self) -> None:
         """Two inner reduction loops over the same dim compile and run under

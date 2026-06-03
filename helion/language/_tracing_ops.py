@@ -1511,6 +1511,17 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
                 else:
                     block_shape_parts.append(str(int(shape[dim_idx])))
                 lambda_parts.append(pid_var)
+            elif bid is not None and state.codegen.active_device_loops.get(bid):
+                # Outer non-grid device loop -- the HBM ref is pre-sliced via
+                # ``.at[pl.ds(offset, bs)]`` (see _make_hbm_slice), so the
+                # BlockSpec sees an already-sliced ref of size ``bs`` along
+                # this dim. Use the full sliced size with a constant index.
+                bs_var = state.device_function.block_size_var(bid)
+                if bs_var:
+                    block_shape_parts.append(bs_var)
+                else:
+                    block_shape_parts.append(str(int(shape[dim_idx])))
+                lambda_parts.append("0")
             else:
                 idx_meta = (
                     subscript_meta[dim_idx]
@@ -1544,23 +1555,30 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
     def _make_hbm_slice(
         fake: torch.Tensor, hbm_name: str, subscript_meta: list[object]
     ) -> str:
-        """Build an HBM ref slicing expression for outer grid dims."""
+        """Slice the HBM ref for outer non-grid device loop dims.
+
+        Outer grid dims are handled by BlockSpec via captured ``program_id``,
+        and inner pipeline dims are handled by BlockSpec via the iteration
+        lambda — so this only adds ``pl.ds(offset, bs)`` slices for outer
+        device loops whose offset is a closure variable in this scope.
+        """
         dim_to_bid = _get_dim_block_ids(subscript_meta, env)
         shape = fake.shape
         parts: list[str] = []
         needs_slice = False
         for dim_idx in range(len(shape)):
             bid = dim_to_bid.get(dim_idx)
-            if bid is not None and bid not in block_ids:
-                grid_loops = state.codegen.active_device_loops.get(bid)
-                if grid_loops:
-                    offset = state.codegen.offset_var(bid)
-                    bs_var = state.device_function.block_size_var(bid)
-                    if bs_var:
-                        parts.append(f"pl.ds({offset}, {bs_var})")
-                        needs_slice = True
-                    else:
-                        parts.append(":")
+            if (
+                bid is not None
+                and bid not in block_ids
+                and bid not in _bid_to_pid_var
+                and state.codegen.active_device_loops.get(bid)
+            ):
+                offset = state.codegen.offset_var(bid)
+                bs_var = state.device_function.block_size_var(bid)
+                if bs_var:
+                    parts.append(f"pl.ds({offset}, {bs_var})")
+                    needs_slice = True
                 else:
                     parts.append(":")
             else:
@@ -1613,7 +1631,7 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
         in_tensors.append((fake, hbm_name))
         in_specs.append(_make_block_spec(fake, sub_meta))
         body_params.append(vmem_name)
-        pipeline_in_args.append(hbm_name)
+        pipeline_in_args.append(_make_hbm_slice(fake, hbm_name, sub_meta))
 
     for fake, _tensor_node, sub_meta in stored_tensors.values():
         if id(fake) not in pipelined_tensor_ids:
@@ -1625,7 +1643,7 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
         out_tensors.append((fake, hbm_name))
         out_specs.append(_make_block_spec(fake, sub_meta))
         body_params.append(vmem_name)
-        pipeline_out_args.append(hbm_name)
+        pipeline_out_args.append(_make_hbm_slice(fake, hbm_name, sub_meta))
 
     # Build the body function
     body_fn_name = state.device_function.new_var("_pipeline_body")
