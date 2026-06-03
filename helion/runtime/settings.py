@@ -504,6 +504,12 @@ class _Settings:
             "HELION_AUTOTUNE_MAX_GRID_FOLDING_FACTOR",
         )
     )
+    autotune_grid_folding_min_generation: int | None = dataclasses.field(
+        default_factory=functools.partial(
+            _env_get_optional_int,
+            "HELION_AUTOTUNE_GRID_FOLDING_MIN_GENERATION",
+        )
+    )
     autotune_effort: AutotuneEffort = dataclasses.field(
         default_factory=functools.partial(
             _env_get_literal,
@@ -685,6 +691,13 @@ class Settings(_Settings):
             "limit max folding factor to N. Default: None (uses effort profile default: 0 for "
             "'quick' effort, None/-1 for 'full' effort). "
             "Set HELION_AUTOTUNE_MAX_GRID_FOLDING_FACTOR=N to override globally."
+        ),
+        "autotune_grid_folding_min_generation": (
+            "Minimum generation number before allowing grid folding factors to increase beyond "
+            "conservative values. Set to N>0 to wait N generations before allowing non-zero folding "
+            "factors. Set to 0 or None to allow folding from the start. Default: None (uses effort "
+            "profile default: 10 for 'full' effort, None for 'quick' effort). "
+            "Set HELION_AUTOTUNE_GRID_FOLDING_MIN_GENERATION=N to override globally."
         ),
         "allow_warp_specialize": "If True, allow warp specialization for tl.range calls on CUDA devices.",
         "debug_dtype_asserts": "If True, emit tl.static_assert checks for dtype after each device node.",
