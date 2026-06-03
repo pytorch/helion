@@ -1545,9 +1545,6 @@ class TestExamples(RefEagerTestBase, TestCase):
             fn_name="grouped_gemm_jagged",
         )
 
-    @xfailIfCute(
-        "CuTe persistent grouped jagged GEMM example still fails lowering/runtime"
-    )
     @xfailIfPallas("CUDA-specific code paths")
     def test_grouped_gemm_jagged_persistent(self):
         # Build small jagged grouped GEMM inputs

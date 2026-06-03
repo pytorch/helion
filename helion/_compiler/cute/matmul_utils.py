@@ -643,6 +643,118 @@ def cute_resolve_active_matmul_k_block_id(
     return lhs_k_block_id
 
 
+def cute_rematerialize_rhs_at_contraction_block(
+    ctx: LoweringContext,
+    lhs_node: torch.fx.Node,
+    rhs_node: torch.fx.Node,
+) -> tuple[ast.AST, int] | None:
+    """Re-lower a matmul ``rhs`` whose contraction axis is the *wrong* block.
+
+    Handles the case where ``lhs.shape[-1]`` (the contraction) and
+    ``rhs.shape[-2]`` (the contraction) resolve to *different* active block
+    ids that happen to share the same size (e.g. ``mask[b, q, k] @ q[b, q, h]``
+    where the lhs contracts on the inner ``tile_k`` loop but the rhs's middle
+    dim is indexed by the outer ``tile_q``).  The originally-lowered ``rhs``
+    load is then loop-invariant in the contraction loop and the matmul would
+    read ``rhs[..., q, ...]`` every step instead of ``rhs[..., k, ...]``.
+
+    Re-codegens the ``rhs`` load with the contraction block remapped from its
+    original (loop-invariant) block to the active contraction block, so each
+    contraction step reads the correct element.  Returns
+    ``(new_rhs_ast, k_block_id)`` on success, or ``None`` when the case does
+    not apply (caller keeps its existing behaviour).
+    """
+    env = CompileEnvironment.current()
+    canonical_block_id = getattr(env, "canonical_block_id", lambda block_id: block_id)
+    lhs_val = lhs_node.meta.get("val")
+    rhs_val = rhs_node.meta.get("val")
+    if not isinstance(lhs_val, torch.Tensor) or not isinstance(rhs_val, torch.Tensor):
+        return None
+    if lhs_val.ndim < 2 or rhs_val.ndim < 2:
+        return None
+    lhs_k_block_id = cute_resolve_active_block_id(ctx.cg, lhs_val.shape[-1])
+    rhs_k_block_id = cute_resolve_active_block_id(ctx.cg, rhs_val.shape[-2])
+    if lhs_k_block_id is None or rhs_k_block_id is None:
+        return None
+    if canonical_block_id(lhs_k_block_id) == canonical_block_id(rhs_k_block_id):
+        # Same block already - no remap needed; the standard resolver handles it.
+        return None
+    # The two contraction axes must have the same extent for the matmul to be
+    # well-defined; require the same static size before remapping.
+    if not env.known_equal(lhs_val.shape[-1], rhs_val.shape[-2]):
+        return None
+    # Only re-materialize a plain ``load`` whose middle (contraction) dim is the
+    # block we need to remap.  Anything more complex (computed operands,
+    # permutes) is left to the existing path.
+    if rhs_node.target is not load:
+        return None
+    if len(rhs_node.args) < 2 or not isinstance(rhs_node.args[1], (list, tuple)):
+        return None
+    # The remapped rhs would now contract on ``lhs_k_block_id``; reject if its
+    # free (N) axis collides with that same block.
+    rhs_n_block_id = cute_resolve_active_block_id(ctx.cg, rhs_val.shape[-1])
+    if rhs_n_block_id is not None and canonical_block_id(
+        rhs_n_block_id
+    ) == canonical_block_id(lhs_k_block_id):
+        return None
+
+    new_rhs = _cute_recodegen_load_with_block_remap(
+        ctx, rhs_node, {rhs_k_block_id: lhs_k_block_id}
+    )
+    if new_rhs is None:
+        return None
+    return new_rhs, lhs_k_block_id
+
+
+def _cute_recodegen_load_with_block_remap(
+    ctx: LoweringContext,
+    load_node: torch.fx.Node,
+    remap: dict[int, int],
+) -> ast.AST | None:
+    """Re-run the CuTe ``load`` codegen for *load_node* under a block remap."""
+    from ..generate_ast import GenerateAST
+    from ..inductor_lowering import CodegenState
+
+    cg = ctx.cg
+    if not isinstance(cg, GenerateAST):
+        return None
+    cute_state = cg.device_function.cute_state
+
+    def env_arg(arg: object) -> object:
+        if isinstance(arg, torch.fx.Node):
+            return ctx.env[arg]
+        if isinstance(arg, (list, tuple)):
+            return type(arg)(env_arg(a) for a in arg)
+        return arg
+
+    def proxy_arg(arg: object) -> object:
+        if isinstance(arg, torch.fx.Node):
+            return arg.meta["val"]
+        if isinstance(arg, (list, tuple)):
+            return type(arg)(proxy_arg(a) for a in arg)
+        return arg
+
+    proxy_args = [proxy_arg(a) for a in load_node.args]
+    ast_args = [env_arg(a) for a in load_node.args]
+    state = CodegenState(
+        cg,
+        fx_node=load_node,
+        env=ctx.env,
+        proxy_args=list(proxy_args),
+        ast_args=list(ast_args),
+    )
+    previous = dict(cute_state.matmul_operand_block_remap)
+    cute_state.matmul_operand_block_remap = dict(remap)
+    load_codegen = load._codegen["cute"]  # pyrefly: ignore[missing-attribute]
+    try:
+        result = load_codegen(state)
+    finally:
+        cute_state.matmul_operand_block_remap = previous
+    if isinstance(result, ast.AST):
+        return result
+    return None
+
+
 def _cute_matmul_operand_indices() -> dict[object, tuple[int, int]]:
     """``(lhs_arg_index, rhs_arg_index)`` for each matmul op the CuTe backend
     lowers through the scalar fallback.

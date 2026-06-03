@@ -14590,7 +14590,8 @@ class TestCuteLowerings(unittest.TestCase):
             fx_node=lhs,
             codegen=codegen,
             device_function=SimpleNamespace(
-                tensor_arg=lambda tensor: SimpleNamespace(name="A")
+                tensor_arg=lambda tensor: SimpleNamespace(name="A"),
+                cute_state=SimpleNamespace(matmul_operand_block_remap={}),
             ),
         )
 
@@ -15704,6 +15705,9 @@ class TestCuteLowerings(unittest.TestCase):
                 ),
             ),
             sympy_expr=lambda expr: str(expr),
+            device_function=SimpleNamespace(
+                cute_state=SimpleNamespace(matmul_operand_block_remap={})
+            ),
         )
         env = SimpleNamespace(
             get_block_id=lambda size: 1 if int(size) == 8 else None,
@@ -15736,7 +15740,10 @@ class TestCuteLowerings(unittest.TestCase):
 
     def test_cute_combined_mask_skips_none_axes(self) -> None:
         state = SimpleNamespace(
-            codegen=_FakeMaskCodegen(_FakeMaskedLoopStrategy([1]), {1})
+            codegen=_FakeMaskCodegen(_FakeMaskedLoopStrategy([1]), {1}),
+            device_function=SimpleNamespace(
+                cute_state=SimpleNamespace(matmul_operand_block_remap={})
+            ),
         )
         env = SimpleNamespace(
             get_block_id=lambda size: 1 if int(size) == 8 else None,

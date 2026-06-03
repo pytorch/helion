@@ -271,7 +271,6 @@ class TestIndexing(RefEagerTestBase, TestCase):
             result, torch.where(torch.arange(200, device=DEVICE) % 2 == 0, x, 0)
         )
 
-    @xfailIfCute("CuTe does not yet lower untiled cartesian hl.arange store indices")
     def test_mask_store_cartesian(self):
         @helion.kernel(autotune_effort="none")
         def cartesian_masked_store_kernel(
@@ -346,7 +345,6 @@ class TestIndexing(RefEagerTestBase, TestCase):
         result = cartesian_masked_store_kernel(packed, shared_b, offsets)
         torch.testing.assert_close(result, expected)
 
-    @xfailIfCute("CuTe does not yet lower untiled 3D cartesian hl.arange store indices")
     def test_mask_store_cartesian_3d(self):
         @helion.kernel(autotune_effort="none")
         def cartesian_masked_store_kernel_3d(
@@ -2335,9 +2333,6 @@ class TestIndexing(RefEagerTestBase, TestCase):
 
         torch.testing.assert_close(result, expected)
 
-    @xfailIfCute(
-        "CuTe does not yet support static hl.arange tensor indexers mixed with non-consecutive tensor indexers"
-    )
     def test_non_consecutive_tensor_indexers_no_broadcast(self):
         """Test that non-consecutive tensor indexers don't get incorrectly broadcast.
 

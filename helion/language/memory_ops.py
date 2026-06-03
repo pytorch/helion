@@ -390,7 +390,22 @@ def _log_cute_layout(state: CodegenState, op_name: str) -> None:
     )
 
 
+def _cute_remap_block_id(state: CodegenState, block_id: int) -> int:
+    """Apply the active matmul-operand block-id remap, if any.
+
+    Used while re-materializing a matmul operand load so its contraction
+    dimension is indexed by the active contraction block instead of the
+    loop-invariant block it was originally lowered with.  Returns *block_id*
+    unchanged when no remap is active.
+    """
+    remap = state.device_function.cute_state.matmul_operand_block_remap
+    if not remap:
+        return block_id
+    return remap.get(block_id, block_id)
+
+
 def _cute_active_index_var(state: CodegenState, block_id: int) -> str | None:
+    block_id = _cute_remap_block_id(state, block_id)
     loops = state.codegen.active_device_loops.get(block_id)
     if loops:
         return loops[-1].strategy.index_var(block_id)
@@ -401,6 +416,7 @@ def _cute_active_index_var(state: CodegenState, block_id: int) -> str | None:
 
 
 def _cute_active_mask_var(state: CodegenState, block_id: int) -> str | None:
+    block_id = _cute_remap_block_id(state, block_id)
     loops = state.codegen.active_device_loops.get(block_id)
     if loops:
         return loops[-1].strategy.mask_var(block_id)
@@ -657,6 +673,7 @@ def _cute_index_exprs(
         raise exc.BackendUnsupported("cute", f"unlowerable symbolic index: {idx}")
 
     def active_loop_info(block_id: int) -> LoopDimInfo | None:
+        block_id = _cute_remap_block_id(state, block_id)
         loops = state.codegen.active_device_loops.get(block_id)
         if loops:
             return loops[-1].block_id_to_info.get(block_id)
@@ -668,6 +685,7 @@ def _cute_index_exprs(
     def active_local_coord(block_id: int) -> str | None:
         from .._compiler.cute.cute_reshape import _grid_local_coord_expr
 
+        block_id = _cute_remap_block_id(state, block_id)
         loops = state.codegen.active_device_loops.get(block_id)
         if loops:
             thread_axis = loops[-1].block_thread_axes.get(block_id)
@@ -681,6 +699,7 @@ def _cute_index_exprs(
         return None
 
     def tile_begin_expr(block_id: int, loop_info: LoopDimInfo | None) -> str:
+        block_id = _cute_remap_block_id(state, block_id)
         loops = state.codegen.active_device_loops.get(block_id)
         if loops:
             return state.codegen.offset_var(block_id)
@@ -700,6 +719,7 @@ def _cute_index_exprs(
         return begin_var
 
     def active_index_var(block_id: int) -> str | None:
+        block_id = _cute_remap_block_id(state, block_id)
         loops = state.codegen.active_device_loops.get(block_id)
         if loops:
             return loops[-1].strategy.index_var(block_id)
@@ -2133,12 +2153,14 @@ def _cute_combined_mask(
     terms: list[str] = []
 
     def mask_var_for_block_id(block_id: int) -> str | None:
+        block_id = _cute_remap_block_id(state, block_id)
         loops = state.codegen.active_device_loops.get(block_id)
         if loops:
             return loops[-1].strategy.mask_var(block_id)
         return None
 
     def active_index_var(block_id: int) -> str | None:
+        block_id = _cute_remap_block_id(state, block_id)
         loops = state.codegen.active_device_loops.get(block_id)
         if loops:
             return loops[-1].strategy.index_var(block_id)
@@ -2150,6 +2172,7 @@ def _cute_combined_mask(
     def active_local_coord(block_id: int) -> str | None:
         from .._compiler.cute.cute_reshape import _grid_local_coord_expr
 
+        block_id = _cute_remap_block_id(state, block_id)
         loops = state.codegen.active_device_loops.get(block_id)
         if loops:
             thread_axis = loops[-1].block_thread_axes.get(block_id)
@@ -2163,6 +2186,7 @@ def _cute_combined_mask(
         return None
 
     def tile_begin_expr(block_id: int) -> str:
+        block_id = _cute_remap_block_id(state, block_id)
         loops = state.codegen.active_device_loops.get(block_id)
         if loops:
             return state.codegen.offset_var(block_id)
@@ -4985,6 +5009,287 @@ def _codegen_cute_store_loaded_index_trailing_slices(
     return ast.Constant(value=None)
 
 
+def _cute_expand_broadcast_dim(value_node: torch.fx.Node) -> int | None:
+    """Return the dim an ``aten.expand`` broadcasts (input size 1 -> >1).
+
+    Returns ``None`` unless ``value_node`` is an ``aten.expand`` whose value has
+    exactly one broadcast dimension — i.e. the expanded value carries a stride-0
+    mode at exactly one position whose pre-expand extent was 1. This is the
+    signal that the stored value replicates one source element across that dim.
+    """
+    if value_node.target is not torch.ops.aten.expand.default:
+        return None
+    input_arg = value_node.args[0]
+    if not isinstance(input_arg, torch.fx.Node):
+        return None
+    out_val = value_node.meta.get("val")
+    in_val = input_arg.meta.get("val")
+    if not isinstance(out_val, torch.Tensor) or not isinstance(in_val, torch.Tensor):
+        return None
+    if out_val.ndim != in_val.ndim:
+        return None
+    env = CompileEnvironment.current()
+    broadcast_dims = [
+        dim
+        for dim in range(out_val.ndim)
+        if env.known_equal(in_val.shape[dim], 1)
+        and not env.known_equal(out_val.shape[dim], 1)
+        and out_val.stride(dim) == 0
+    ]
+    if len(broadcast_dims) != 1:
+        return None
+    return broadcast_dims[0]
+
+
+def _cute_block_tile_begin_expr(state: CodegenState, block_id: int) -> str | None:
+    """Return the *per-block* tile start for a tile mapped onto a thread axis.
+
+    In the CuTe SIMT model a tile dimension is spread across a thread axis, so
+    the strategy's ``index_var`` is the per-*thread* global index
+    (``pid * block + thread_idx[axis]``). Subtracting the thread-local coordinate
+    yields the per-*block* tile base (``pid * block``), shared by every thread in
+    the tile — the correct anchor for a broadcast lane loop. Returns ``None`` when
+    the block id has no active thread axis in this scope.
+    """
+    from .._compiler.cute.cute_reshape import _grid_local_coord_expr
+
+    loops = state.codegen.active_device_loops.get(block_id)
+    if not loops:
+        return None
+    loop_state = loops[-1]
+    thread_axis = loop_state.block_thread_axes.get(block_id)
+    global_index = loop_state.strategy.index_var(block_id)
+    if thread_axis is None or global_index is None:
+        return None
+    local_coord = _grid_local_coord_expr(state.codegen, block_id, thread_axis)
+    return state.codegen.lift(
+        expr_from_string(f"({global_index}) - ({local_coord})"),
+        dce=True,
+        prefix="tile_begin",
+    ).id
+
+
+def _cute_unsqueeze_expand_load_source(
+    value_node: torch.fx.Node, broadcast_dim: int
+) -> torch.fx.Node | None:
+    """Return the ``hl.load`` feeding ``expand(val[..., None, ...])``.
+
+    Walks ``value_node`` (an ``aten.expand``) back through a single
+    unsqueeze-style subscript op (``val[:, None, :]`` inserting the broadcast dim)
+    to the originating ``hl.load``. Returns ``None`` unless the chain is exactly
+    that shape, so the caller falls back to the load-agnostic path.
+    """
+    from .view_ops import subscript as subscript_op
+
+    inner = value_node.args[0]
+    if not isinstance(inner, torch.fx.Node):
+        return None
+    if inner.op == "call_function" and inner.target is subscript_op:
+        index_arg = inner.args[1] if len(inner.args) > 1 else None
+        if not isinstance(index_arg, (list, tuple)):
+            return None
+        # Exactly one ``None`` (the inserted broadcast dim) at ``broadcast_dim``.
+        none_positions = [pos for pos, entry in enumerate(index_arg) if entry is None]
+        if none_positions != [broadcast_dim]:
+            return None
+        load_node = inner.args[0]
+    else:
+        load_node = inner
+    if (
+        isinstance(load_node, torch.fx.Node)
+        and load_node.op == "call_function"
+        and load_node.target is load
+        and len(load_node.args) >= 2
+    ):
+        return load_node
+    return None
+
+
+def _codegen_cute_store_expand_broadcast_tile(
+    state: CodegenState,
+    tensor: torch.Tensor,
+    subscript: list[object] | tuple[object, ...],
+    ast_subscript: list[object] | tuple[object, ...],
+    value: ast.AST,
+    extra_mask: ast.AST | None,
+    value_node: torch.fx.Node,
+) -> ast.AST | None:
+    """Lower a store whose value is broadcast across a reused tile dimension.
+
+    Handles the pattern::
+
+        val = hl.load(src, [tile, hl.arange(k)])  # (block, k)
+        val_3d = val[:, None, :].expand(block, block, k)  # stride-0 middle dim
+        hl.store(out, [idx[tile], tile.index, hl.arange(k)], val_3d)
+
+    Here ``tile`` appears twice in the store index — once as a tensor indexer
+    (``idx[tile]``) and once as the bare tile index (``tile.index``) — while the
+    value is broadcast (stride 0) along the second (``tile.index``) position. The
+    generic SIMT store lowers both positions onto ``tile``'s single thread axis,
+    so each thread only writes the ``a == b`` diagonal of the ``(block, block)``
+    block. Instead emit a sequential lane loop over the broadcast position so a
+    thread holding ``val[a]`` writes the full ``out[idx[a], begin+b, :]`` row for
+    every ``b`` in the tile, filling the block. ``val`` is broadcast, so every
+    lane reads the same per-thread register.
+
+    Returns ``None`` (a strict no-op) unless every gate matches, so existing
+    kernels are byte-for-byte unchanged.
+    """
+    env = CompileEnvironment.current()
+    broadcast_dim = _cute_expand_broadcast_dim(value_node)
+    if broadcast_dim is None:
+        return None
+    if broadcast_dim >= len(subscript):
+        return None
+    broadcast_idx = subscript[broadcast_dim]
+    # The broadcast position must be a bare tile index (a SymInt block id), and
+    # that same block id must be reused by another (tensor) index position — the
+    # collision the generic path mis-handles.
+    if not isinstance(broadcast_idx, torch.SymInt):
+        return None
+    broadcast_block_id = env.get_block_id(broadcast_idx)
+    if broadcast_block_id is None:
+        return None
+    block_size = state.device_function.resolved_block_size(broadcast_block_id)
+    if not isinstance(block_size, int) or block_size <= 1:
+        return None
+    reused = False
+    for pos, idx in enumerate(subscript):
+        if pos == broadcast_dim:
+            continue
+        if isinstance(idx, torch.Tensor):
+            for dim_size in idx.shape:
+                if broadcast_block_id in _matching_block_ids(env, dim_size):
+                    reused = True
+                    break
+        if reused:
+            break
+    if not reused:
+        return None
+
+    # Walk the value chain ``expand -> unsqueeze(None) -> load`` to recover the
+    # source load. The stored value is a per-thread register holding ``val[a, c]``
+    # whose coordinates live on the *load*'s thread axes; the store's own free
+    # ``hl.arange`` index entries are distinct nodes that the synthetic-axis
+    # machinery assigns to *different* axes. Reusing the load's coordinate for
+    # those non-broadcast positions keeps the register and the store address on
+    # the same thread axis (otherwise thread ``(a, c_load, c_store)`` would write
+    # ``out[..., c_store] = val[a, c_load]`` for ``c_load != c_store``).
+    load_node = _cute_unsqueeze_expand_load_source(value_node, broadcast_dim)
+    load_coords: list[str] | None = None
+    load_subscript_proxy: tuple[object, ...] | None = None
+    if load_node is not None:
+        load_tensor_node = load_node.args[0]
+        load_subscript = load_node.args[1]
+        if isinstance(load_tensor_node, torch.fx.Node) and isinstance(
+            load_subscript, (list, tuple)
+        ):
+            load_tensor = load_tensor_node.meta.get("val")
+            if isinstance(load_tensor, torch.Tensor):
+                load_subscript_proxy = tuple(
+                    map_arg([*load_subscript], lambda arg: arg.meta["val"])
+                )
+                load_subscript_ast = map_arg(
+                    [*load_subscript], lambda arg: state.env[arg]
+                )
+                load_coords = _cute_index_exprs(
+                    state,
+                    [*load_subscript_proxy],
+                    [*load_subscript_ast],
+                    tensor=load_tensor,
+                    inactive_singleton_slice_expr="0",
+                )
+                if len(load_coords) != load_tensor.ndim:
+                    load_coords = None
+                    load_subscript_proxy = None
+
+    index_exprs = _cute_index_exprs(
+        state,
+        subscript,
+        ast_subscript,
+        tensor=tensor,
+        inactive_singleton_slice_expr="0",
+    )
+    if len(index_exprs) != tensor.ndim or "None" in index_exprs:
+        return None
+
+    # Re-align each non-broadcast free-``hl.arange`` store position onto the
+    # load's matching coordinate. Value dim ``d`` maps to load dim ``d`` before
+    # the unsqueezed broadcast dim and ``d - 1`` after it. Only positions where
+    # *both* the store and the matching load entry are free ``hl.arange`` index
+    # tensors are remapped — a tensor *indexer* (``idx[tile]``) keeps its own
+    # coordinate.
+    if load_coords is not None and load_subscript_proxy is not None:
+        for pos, idx in enumerate(subscript):
+            if pos == broadcast_dim or not isinstance(idx, torch.Tensor):
+                continue
+            load_dim = pos if pos < broadcast_dim else pos - 1
+            if not (0 <= load_dim < len(load_coords)):
+                continue
+            if isinstance(load_subscript_proxy[load_dim], torch.Tensor):
+                index_exprs[pos] = load_coords[load_dim]
+
+    # Replace the broadcast position's coordinate (currently the reused tile's
+    # per-thread global index) with ``block_begin + lane`` so the lane loop sweeps
+    # the full tile block, identically for every thread in the tile. ``block_begin``
+    # is the *per-block* tile start (``global_index - local_coord``); in the CuTe
+    # SIMT model the tile is mapped onto a thread axis, so the bare offset var
+    # still carries the per-thread ``thread_idx`` lane and must be stripped.
+    block_begin = _cute_block_tile_begin_expr(state, broadcast_block_id)
+    if block_begin is None:
+        return None
+    lane_var = state.device_function.new_var("bcast_lane", dce=True)
+    index_dtype = env.index_type()
+    broadcast_coord = f"({block_begin}) + {index_dtype}({lane_var})"
+    index_exprs[broadcast_dim] = broadcast_coord
+
+    backend = env.backend
+    target_dtype = backend.dtype_str(tensor.dtype)
+    tensor_name = state.device_function.tensor_arg(tensor).name
+    value = expr_from_string(
+        backend.ast_to_dtype_expr("{value}", target_dtype),
+        value=value,
+    )
+    store_expr = expr_from_string(
+        _cute_scalar_store_expr(tensor_name, index_exprs, "{value}"),
+        value=value,
+    )
+
+    # Base mask excludes the broadcast position (its bound is enforced by the lane
+    # bound below); other positions keep their tile/tensor masks.
+    base_subscript = [
+        slice(None) if pos == broadcast_dim else idx
+        for pos, idx in enumerate(subscript)
+    ]
+    mask_expr = _cute_combined_mask(state, base_subscript, extra_mask, tensor=tensor)
+    dim_size = _cute_tensor_dim_size_expr(state, tensor, broadcast_dim)
+    lane_bound = f"({broadcast_coord}) < {dim_size}"
+    mask_expr = lane_bound if mask_expr is None else f"({mask_expr}) and {lane_bound}"
+
+    from .._compiler.ast_extension import create
+
+    mask_ast = expr_from_string(mask_expr)
+    assert isinstance(mask_ast, ast.expr)
+    assert isinstance(store_expr, ast.expr)
+    body_stmt: ast.stmt = ast.fix_missing_locations(
+        ast.If(
+            test=mask_ast,
+            body=[ast.Expr(value=store_expr)],
+            orelse=[],
+        )
+    )
+    loop_stmt = create(
+        ast.For,
+        target=create(ast.Name, id=lane_var, ctx=ast.Store()),
+        iter=expr_from_string(f"range({block_size})"),
+        body=[body_stmt],
+        orelse=[],
+        type_comment=None,
+    )
+    state.add_statement(loop_stmt)
+    return ast.Constant(value=None)
+
+
 def _codegen_cute_store_permute_lane_loops(
     state: CodegenState,
     tensor: torch.Tensor,
@@ -5332,6 +5637,17 @@ def _(state: CodegenState) -> ast.AST:
                     tensor,
                     subscript,
                     ast_subscript,
+                    extra_mask,
+                    value_node,
+                )
+                if rewritten_stmt is not None:
+                    return rewritten_stmt
+                rewritten_stmt = _codegen_cute_store_expand_broadcast_tile(
+                    state,
+                    tensor,
+                    subscript,
+                    ast_subscript,
+                    value,
                     extra_mask,
                     value_node,
                 )

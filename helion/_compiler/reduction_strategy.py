@@ -111,6 +111,41 @@ def cute_live_reduction_threads(max_threads: int) -> int:
     return max_threads
 
 
+def _strategies_concurrent_with_block(
+    tile_dispatch: object,
+    block_index: int,
+) -> list[TileStrategy]:
+    """Return strategies that can co-execute with reduction ``block_index``.
+
+    Drops reduction strategies that live in a control-flow branch mutually
+    exclusive with ``block_index``'s branch so the per-block thread budget is
+    not over-counted (CuTe branch-by-pid kernels). Outside that pattern (no
+    branch paths) this returns every strategy unchanged.
+    """
+    from .device_ir import DeviceIR
+    from .host_function import HostFunction
+
+    strategies = list(getattr(tile_dispatch, "strategies", []))
+    device_ir = HostFunction.current().device_ir
+    red_paths = device_ir.reduction_block_id_branch_paths()
+    own_paths = red_paths.get(block_index)
+    if not own_paths:
+        return strategies
+    own_path = own_paths[0]
+    result: list[TileStrategy] = []
+    for strategy in strategies:
+        other_path = None
+        for other_block in strategy.block_ids:
+            paths = red_paths.get(other_block)
+            if paths:
+                other_path = paths[0]
+                break
+        if DeviceIR.branch_paths_mutually_exclusive(own_path, other_path):
+            continue
+        result.append(strategy)
+    return result
+
+
 def _cute_vec_kernel_mode() -> str:
     """Return ``"vec"`` when all reduction-feeding loads are vec-eligible
     without a degrading dtype cast (i.e. fp32 -> fp32 pipeline), ``"unroll"``
@@ -688,8 +723,13 @@ class PersistentReductionStrategy(ReductionStrategy):
         # already on the dispatcher by the time we get here.
         tile_dispatch = getattr(fn, "tile_strategy", None)
         if tile_dispatch is not None:
+            # Reductions in mutually-exclusive control-flow branches share a
+            # thread axis (see ``TileStrategyDispatch._branch_by_control_flow``),
+            # so they never co-execute and must not be multiplied into this
+            # reduction's thread budget. Drop them before adjusting.
+            concurrent = _strategies_concurrent_with_block(tile_dispatch, block_index)
             self._thread_count = env.backend.adjust_reduction_thread_count(
-                self._thread_count, tile_dispatch.strategies
+                self._thread_count, concurrent
             )
         self._synthetic_cute_lane_var: str | None = None
         self._synthetic_cute_lane_extent = 1

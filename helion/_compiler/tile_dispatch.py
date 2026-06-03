@@ -315,7 +315,8 @@ class TileStrategyDispatch:
         grid_strategies = self.strategies[:num_grids]
 
         if num_grids <= 1:
-            return [self.strategies]
+            branched = self._branch_by_control_flow()
+            return branched if branched is not None else [self.strategies]
 
         loop_strategies = self.strategies[num_grids:]
         branches: list[list[TileStrategy]] = []
@@ -332,6 +333,67 @@ class TileStrategyDispatch:
                     branch.append(ls)
             branches.append(branch)
         return branches
+
+    def _branch_by_control_flow(self) -> list[list[TileStrategy]] | None:
+        """Split strategies into mutually-exclusive control-flow branches.
+
+        Handles the single-grid branch-by-pid pattern: a kernel whose body is
+        ``if pid == 0: ... elif pid == 1: ...`` where each branch carries its own
+        reduction (and free ``hl.arange``) over a distinct dimension. Such
+        reductions never co-execute, so they may share a CUDA thread axis instead
+        of each claiming a fresh one and blowing the per-block thread budget.
+
+        Returns ``None`` (caller falls back to the single-branch default) unless
+        at least one pair of reductions lives in mutually-exclusive branches.
+        """
+        from .device_ir import DeviceIR
+
+        if CompileEnvironment.current().backend.name != "cute":
+            return None
+        device_ir = HostFunction.current().device_ir
+        red_paths = device_ir.reduction_block_id_branch_paths()
+        if len(red_paths) < 2:
+            return None
+
+        def block_path(strategy: TileStrategy) -> list[tuple[int, int]] | None:
+            for block_id in strategy.block_ids:
+                paths = red_paths.get(block_id)
+                if paths:
+                    return paths[0]
+            return None
+
+        # Collect reduction strategies that carry a branch path.
+        branched_strategies = [s for s in self.strategies if block_path(s) is not None]
+        if len(branched_strategies) < 2:
+            return None
+        # Require at least one mutually-exclusive pair, else nothing is shared.
+        if not any(
+            DeviceIR.branch_paths_mutually_exclusive(block_path(a), block_path(b))
+            for i, a in enumerate(branched_strategies)
+            for b in branched_strategies[i + 1 :]
+        ):
+            return None
+
+        shared = [s for s in self.strategies if block_path(s) is None]
+        # Group branched strategies so that every pair within a group can
+        # co-execute (paths not mutually exclusive); distinct groups are
+        # mutually exclusive and become separate branches that share axes.
+        groups: list[list[TileStrategy]] = []
+        for candidate in branched_strategies:
+            placed = False
+            for group in groups:
+                if all(
+                    not DeviceIR.branch_paths_mutually_exclusive(
+                        block_path(candidate), block_path(member)
+                    )
+                    for member in group
+                ):
+                    group.append(candidate)
+                    placed = True
+                    break
+            if not placed:
+                groups.append([candidate])
+        return [[*shared, *group] for group in groups]
 
     def thread_axis_for_strategy(self, target: TileStrategy) -> int | None:
         """Return the starting thread-axis index for a strategy in its branch.
