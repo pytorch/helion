@@ -271,6 +271,7 @@ class DifferentialEvolutionSearch(PopulationBasedSearch):
 
         for i in self._budgeted_range(2, self.max_generations):
             self.set_generation(i)
+            self.config_gen.current_generation = i
             self.log(f"Generation {i} starting")
             replaced = self.evolve_population()
             self.log(f"Generation {i} complete: replaced={replaced}", self.statistics)

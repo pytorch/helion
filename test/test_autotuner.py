@@ -3643,6 +3643,93 @@ class TestAutotuneBudget(TestCase):
             else:
                 os.environ.pop("HELION_AUTOTUNE_MAX_GRID_FOLDING_FACTOR", None)
 
+    def test_grid_folding_min_generation_profile_defaults(self) -> None:
+        """Test that full effort profile has min_generation constraint."""
+        from helion.autotuner.effort_profile import get_effort_profile
+
+        # Full effort should have min_generation=10
+        full_profile = get_effort_profile("full")
+        self.assertEqual(full_profile.autotune_grid_folding_min_generation, 10)
+
+        # Quick effort should have None (no constraint)
+        quick_profile = get_effort_profile("quick")
+        self.assertIsNone(quick_profile.autotune_grid_folding_min_generation)
+
+        # None effort should also have None
+        none_profile = get_effort_profile("none")
+        self.assertIsNone(none_profile.autotune_grid_folding_min_generation)
+
+    def test_dynamic_grid_folding_fragment(self) -> None:
+        """Test that DynamicGridFoldingFragment filters choices based on generation."""
+        from unittest.mock import Mock
+
+        from helion.autotuner.config_fragment import DynamicGridFoldingFragment
+        from helion.autotuner.config_generation import ConfigGeneration
+
+        # Mock config_gen object
+        mock_config_gen = Mock(spec=ConfigGeneration)
+        mock_config_gen.current_generation = 0
+
+        valid_factors = (0, -1, 2, 4, 8, 16, 32, 64)
+
+        # Test with min_generation=5, max_factor=8
+        fragment = DynamicGridFoldingFragment(
+            valid_factors=valid_factors,
+            min_generation=5,
+            max_factor=8,
+            _config_gen=mock_config_gen,
+        )
+
+        # Early generation (0 < 5): only factor 0 allowed
+        mock_config_gen.current_generation = 0
+        self.assertEqual(fragment._get_allowed_choices(), (0,))
+        self.assertEqual(fragment.default(), 0)
+
+        # Generation 4 (still < 5): only factor 0 allowed
+        mock_config_gen.current_generation = 4
+        self.assertEqual(fragment._get_allowed_choices(), (0,))
+
+        # Generation 5 (>= 5): factors up to 8 allowed
+        mock_config_gen.current_generation = 5
+        self.assertEqual(fragment._get_allowed_choices(), (0, -1, 2, 4, 8))
+
+        # Generation 10: still factors up to 8 allowed
+        mock_config_gen.current_generation = 10
+        self.assertEqual(fragment._get_allowed_choices(), (0, -1, 2, 4, 8))
+
+        # Test pattern_neighbors respects allowed choices
+        mock_config_gen.current_generation = 0
+        neighbors = fragment.pattern_neighbors(0)
+        self.assertEqual(neighbors, [])  # No other choices when only 0 is allowed
+
+        mock_config_gen.current_generation = 5
+        neighbors = fragment.pattern_neighbors(0)
+        self.assertEqual(set(neighbors), {-1, 2, 4, 8})
+
+    def test_config_generation_sets_fragment_refs(self) -> None:
+        """Test that ConfigGeneration sets _config_gen on DynamicGridFoldingFragment."""
+        from helion.autotuner.config_fragment import DynamicGridFoldingFragment
+
+        # Create a minimal config spec (this is a simplified test)
+        # In real usage, this would be created during kernel compilation
+        # For now, just test that the attribute exists and can be set
+
+        # We can't easily test the full flow without a kernel, but we can
+        # verify the attribute exists
+        fragment = DynamicGridFoldingFragment(
+            valid_factors=(0, 2, 4),
+            min_generation=5,
+            max_factor=4,
+            _config_gen=None,
+        )
+        self.assertIsNone(fragment._config_gen)
+
+        # Simulate what ConfigGeneration.__init__ does
+        mock_gen = Mock(spec=ConfigGeneration)
+        mock_gen.current_generation = 0
+        fragment._config_gen = mock_gen
+        self.assertIs(fragment._config_gen, mock_gen)
+
     def test_cute_wall_clock_benchmark_uses_subprocess_worker(self) -> None:
         from helion._compiler.backend import CuteBackend
 

@@ -1872,6 +1872,14 @@ class GridFoldingSpec(_BlockIdItem):
             profile = get_effort_profile(env.settings.autotune_effort)
             max_factor_setting = profile.autotune_max_grid_folding_factor
 
+        # Check autotune_grid_folding_min_generation for dynamic constraint
+        min_generation_setting = env.settings.autotune_grid_folding_min_generation
+        if min_generation_setting is None:
+            from .effort_profile import get_effort_profile
+
+            profile = get_effort_profile(env.settings.autotune_effort)
+            min_generation_setting = profile.autotune_grid_folding_min_generation
+
         # Normalize None to -1 (both mean "no limit, use heuristics")
         if max_factor_setting is None:
             max_factor_setting = -1
@@ -1922,32 +1930,46 @@ class GridFoldingSpec(_BlockIdItem):
                     # Use heuristics for full effort
                     if small_grid or nb < self.MIN_BLOCKS_FOR_PARTIAL:
                         # Global gate or per-dim gate: no partial folding.
-                        choices = tuple(f for f in self.VALID_FACTORS if f <= 0)
+                        max_factor = 0
                     else:
                         # Cap max_factor aggressively: don't fold more than
                         # half the blocks in a dimension to preserve parallelism.
                         max_factor = max(0, nb // 2)
-                        choices = tuple(
-                            f for f in self.VALID_FACTORS if f <= 0 or f <= max_factor
-                        )
                 else:
-                    # Explicit max factor limit: filter VALID_FACTORS
-                    choices = tuple(
-                        f
-                        for f in self.VALID_FACTORS
-                        if f <= 0 or (f > 0 and f <= max_factor_setting)
-                    )
+                    # Explicit max factor limit
+                    max_factor = max_factor_setting
             else:
                 # Dynamic shape: use all factors up to max_factor_setting
-                if max_factor_setting == -1:
+                max_factor = max_factor_setting if max_factor_setting != -1 else 64
+
+            # Use dynamic fragment if min_generation is set, otherwise static
+            if min_generation_setting is not None:
+                from .config_fragment import DynamicGridFoldingFragment
+
+                # Pass config_gen reference for dynamic generation checking
+                # The actual config_gen will be set later during config generation
+                fragments.append(
+                    DynamicGridFoldingFragment(
+                        valid_factors=self.VALID_FACTORS,
+                        min_generation=min_generation_setting,
+                        max_factor=max_factor,
+                        _config_gen=None,  # Will be set by ConfigGeneration.__init__
+                    )
+                )
+            else:
+                # Static fragment for backward compatibility
+                if max_factor == 0:
+                    choices = (0,)
+                elif max_factor == -1:
                     choices = self.VALID_FACTORS
                 else:
                     choices = tuple(
                         f
                         for f in self.VALID_FACTORS
-                        if f <= 0 or (f > 0 and f <= max_factor_setting)
+                        if f <= 0 or (f > 0 and f <= max_factor)
                     )
-            fragments.append(EnumFragment(choices=choices))
+                fragments.append(EnumFragment(choices=choices))
+
         return PerDimListOf(fragments=fragments)
 
     def _normalize(self, name: str, value: object) -> list[int]:
