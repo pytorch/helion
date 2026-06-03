@@ -43,7 +43,6 @@ class TestViews(RefEagerTestBase, TestCase):
         )
         torch.testing.assert_close(result, x + 1)
 
-    @xfailIfCute("CuTe DSL fails to compile reshape-broadcast softmax pattern")
     def test_softmax_unsqueeze(self):
         @helion.kernel(config={"block_size": 1})
         def softmax(x: torch.Tensor) -> torch.Tensor:
@@ -63,7 +62,6 @@ class TestViews(RefEagerTestBase, TestCase):
             result, torch.nn.functional.softmax(x, dim=1), rtol=1e-2, atol=1e-1
         )
 
-    @xfailIfCute("CuTe DSL fails to compile reshape-broadcast softmax pattern")
     def test_softmax_view_reshape(self):
         @helion.kernel(config={"block_size": 1})
         def softmax(x: torch.Tensor) -> torch.Tensor:
@@ -301,7 +299,6 @@ class TestViews(RefEagerTestBase, TestCase):
         expected = torch.matmul(x, y)
         torch.testing.assert_close(result, expected, rtol=1e-2, atol=1e-2)
 
-    @xfailIfCute("reshape into reduction dim not supported on cute")
     @xfailIfPallas("triton.next_power_of_2 in generated host code crashes pallas")
     def test_reshape_sum(self):
         @helion.kernel(static_shapes=True)
