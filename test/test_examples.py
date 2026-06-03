@@ -28,6 +28,7 @@ from helion._testing import skipIfCudaSharedMemoryLessThan
 from helion._testing import skipIfFn
 from helion._testing import skipIfNotCUDA
 from helion._testing import skipIfPallas
+from helion._testing import skipIfPallasInterpret
 from helion._testing import skipIfRefEager
 from helion._testing import skipIfRocm
 from helion._testing import skipIfTileIR
@@ -666,7 +667,11 @@ class TestExamples(RefEagerTestBase, TestCase):
             block_sizes=[block_size],
         )
 
-    @xfailIfPallas("precision differences with bf16xint16 operations on pallas")
+    @skipIfPallasInterpret(
+        "65536x1024x1280 GEMM is too slow under CPU interpret -- it exceeds the "
+        "300s per-test timeout and (thread timeout method) kills the whole job"
+    )
+    @xfailIfPallasTpu("precision differences with bf16xint16 operations on pallas")
     @skipIfTileIR("precision differences with bf16xint16 operations on tileir")
     @skipIfRocm("precision differences with bf16xint16 operations on rocm")
     @skipIfXPU("precision differences with bf16xint16 operations on xpu")
