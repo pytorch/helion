@@ -309,9 +309,7 @@ def pallas_add_3d(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
 
 
 @helion.kernel(backend="pallas", static_shapes=True)
-def pallas_nested_non_grid_outer_loop(
-    x: torch.Tensor, w: torch.Tensor
-) -> torch.Tensor:
+def pallas_nested_non_grid_outer_loop(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
     """Outer grid (``tile_m``) → outer non-grid device loop (``tile_n``)
     → inner pipeline (``tile_k``) where the pipeline reads
     ``w[tile_k, tile_n]``.
@@ -1206,6 +1204,10 @@ class TestPallas(TestCase):
         compiled under ``pallas_loop_type='fori_loop'``."""
         self._check_scalar_lookup_in_pipeline("fori_loop")
 
+    @xfailIfPallasInterpret(
+        "pl.program_id captured into emit_pipeline body is not supported in "
+        "JAX interpret mode (program_id_p.bind asserts during trace)"
+    )
     def test_nested_non_grid_outer_loop_emit_pipeline(self) -> None:
         """Outer non-grid device loop around an ``emit_pipeline`` whose
         body reads a tensor indexed by that outer tile.
