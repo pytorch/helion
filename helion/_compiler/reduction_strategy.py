@@ -290,6 +290,99 @@ class ReductionStrategy(TileStrategy):
         threads = self._reduction_thread_count()
         return max(1, threads)
 
+    def _reshape_merged_reduction_group_params(
+        self,
+    ) -> tuple[int, int, str] | None:
+        """Return ``(pre, group_span, lane_expr)`` for a reshape-merged
+        reduction whose live thread axis is interleaved with a *sibling*
+        thread axis, or ``None`` when no such interleaving exists.
+
+        When ``x[tile0, tile1, tile2].reshape(tile0, -1).sum(-1)`` merges
+        ``tile1`` (a live thread axis) and ``tile2`` (a lane loop) into a
+        single synthetic reduction block, the reduction's live thread axis
+        (``tile1``) shares the launch warp with the *unrelated* ``tile0``
+        row axis. A plain ``cute.arch.warp_reduction_*(threads_in_group=N)``
+        folds together CONSECUTIVE warp lanes, so it would sum across both
+        ``tile1`` AND ``tile0`` (cross-contaminating rows). Instead the
+        reduction must be grouped/strided so each lane only combines the
+        lanes that share its ``tile0`` coordinate.
+
+        This computes the ``pre`` (product of live thread extents on axes
+        *below* the reduce axis) and ``group_span`` (``pre`` times the
+        reduce axis extent) used by ``_cute_grouped_reduce_warp``. Returns
+        ``None`` when ``pre == 1`` (no sibling axis below the reduce axis),
+        in which case the plain consecutive-lane warp reduction is already
+        correct.
+        """
+        env = CompileEnvironment.current()
+        backend = env.backend
+        if backend.name != "cute":
+            return None
+        numel = env.block_sizes[self.block_index].numel
+        if not isinstance(numel, sympy.Expr):
+            return None
+        # Source block ids merged into this reduction dim by the reshape.
+        source_block_ids: set[int] = set()
+        for symbol in numel.free_symbols:
+            if not isinstance(symbol, sympy.Symbol):
+                return None
+            block_id = env.get_block_id(symbol)
+            if block_id is None:
+                return None
+            source_block_ids.add(env.canonical_block_id(block_id))
+        if len(source_block_ids) < 2:
+            # A single source block needs no de-interleaving.
+            return None
+        tile_strategy = self.fn.tile_strategy
+        # The reduce axis is the (single) live thread axis spanned by the
+        # source blocks. A lane-looped source block has ``extent is None``.
+        reduce_axis: int | None = None
+        reduce_extent = 1
+        for block_id in source_block_ids:
+            axis = tile_strategy.thread_axis_for_block_id(block_id)
+            extent = tile_strategy.thread_extent_for_block_id(block_id)
+            if axis is None or extent is None or extent <= 1:
+                continue
+            if reduce_axis is not None and reduce_axis != axis:
+                # More than one live thread axis among the source blocks is
+                # not expressible as a single grouped warp reduce.
+                return None
+            reduce_axis = axis
+            reduce_extent = max(reduce_extent, extent)
+        if reduce_axis is None:
+            return None
+        # Live thread extents of ALL blocks (siblings included) so the linear
+        # lane index strides are computed correctly. The reduction block's own
+        # synthetic thread axis is excluded -- it is fictional (no real warp
+        # lanes back it); the source live axis carries the actual data.
+        logical_axis_sizes: dict[int, int] = {reduce_axis: reduce_extent}
+        for info in env.block_sizes:
+            block_id = info.block_id
+            if block_id == self.block_index or block_id in source_block_ids:
+                continue
+            axis = tile_strategy.thread_axis_for_block_id(block_id)
+            extent = tile_strategy.thread_extent_for_block_id(block_id)
+            if axis is None or extent is None or extent <= 1:
+                continue
+            logical_axis_sizes[axis] = max(logical_axis_sizes.get(axis, 1), extent)
+        pre = 1
+        for axis in range(reduce_axis):
+            pre *= logical_axis_sizes.get(axis, 1)
+        if pre <= 1:
+            # No sibling thread axis below the reduce axis: the reduce axis is
+            # already at the bottom of the linear lane index, so consecutive
+            # warp lanes belong to the reduction and the plain warp reduce is
+            # correct.
+            return None
+        group_span = pre * reduce_extent
+        if group_span > 32:
+            # Cross-warp grouped reduction is not handled by the marker path.
+            return None
+        lane_expr = backend.thread_linear_index_expr(logical_axis_sizes)
+        if lane_expr is None:
+            return None
+        return pre, group_span, lane_expr
+
     def _lane_reduce_marker_unsupported(self, state: CodegenState) -> bool:
         """Return True when the two-pass lane-reduction marker cannot be
         handled by the ``split_lane_loop_reductions`` post-pass, so the caller
@@ -798,6 +891,12 @@ class PersistentReductionStrategy(ReductionStrategy):
         identity_expr = backend.cast_expr(
             constant_repr(default_value), _dtype_str(dtype)
         )
+        # The two-stage shared reduce takes ``dtype`` (the accumulation dtype,
+        # ``get_computation_dtype(fake_input.dtype)``) from ``type(identity)``.
+        # Upcast the (possibly fp16/bf16) masked input to that same dtype so the
+        # helper's ``input if mask else identity`` selection unifies cleanly and
+        # the reduction still accumulates in the wider accumulation dtype.
+        input_expr = backend.cast_expr(input_name, _dtype_str(dtype))
         group_count = num_threads // group_span
         lane_var = self.fn.new_var("persistent_reduce_lane", dce=True)
         lane_in_group_var = self.fn.new_var("persistent_reduce_lane_in_group", dce=True)
@@ -808,7 +907,7 @@ class PersistentReductionStrategy(ReductionStrategy):
         state.add_statement(f"{lane_mod_pre_var} = ({lane_in_group_var}) % 1")
         state.add_statement(
             f"{result_var} = _cute_grouped_reduce_shared_two_stage("
-            f"{input_name}, {reduction_type!r}, {identity_expr}, "
+            f"{input_expr}, {reduction_type!r}, {identity_expr}, "
             f"{lane_var}, {lane_in_group_var}, {lane_mod_pre_var}, "
             f"pre=1, group_span={group_span}, group_count={group_count})"
         )
@@ -852,9 +951,22 @@ class PersistentReductionStrategy(ReductionStrategy):
             identity_expr = backend.cast_expr(
                 constant_repr(default), _dtype_str(acc_dtype)
             )
-            expr = _lane_reduce_marker_expr(
-                input_name, reduction_type, identity_expr, threads
-            )
+            group_params = self._reshape_merged_reduction_group_params()
+            if group_params is not None:
+                group_pre, group_span, group_lane_expr = group_params
+                expr = _lane_reduce_marker_expr(
+                    input_name,
+                    reduction_type,
+                    identity_expr,
+                    threads,
+                    group_pre=group_pre,
+                    group_span=group_span,
+                    group_lane_expr=group_lane_expr,
+                )
+            else:
+                expr = _lane_reduce_marker_expr(
+                    input_name, reduction_type, identity_expr, threads
+                )
             return expr_from_string(
                 self.maybe_reshape(expr, dim, fake_input, fake_output)
             )

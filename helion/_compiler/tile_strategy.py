@@ -111,10 +111,21 @@ def _lane_reduce_marker_expr(
     reduction_type: str,
     identity_expr: str,
     threads_in_group: int,
+    *,
+    group_pre: int = 1,
+    group_span: int = 0,
+    group_lane_expr: str = "",
 ) -> str:
+    # ``group_*`` (optional) carry the parameters of a strided grouped warp
+    # reduction. They are required when the reduction's live thread axis is
+    # interleaved with an unrelated sibling thread axis on the same warp (a
+    # reshape-merged reduction). ``group_lane_expr`` is base64-free but may
+    # contain commas/parens, so it is passed as a string literal that the
+    # post-pass re-parses.
     return (
         f"{_HELION_LANE_REDUCE_MARKER}({input_name}, {reduction_type!r}, "
-        f"{identity_expr}, {threads_in_group})"
+        f"{identity_expr}, {threads_in_group}, {group_pre}, {group_span}, "
+        f"{group_lane_expr!r})"
     )
 
 
@@ -129,6 +140,14 @@ class _LaneReduceMarker:
     # ``{finalized}``; ``finalize_expr(x)`` substitutes ``x`` to re-apply any
     # surrounding dtype cast / reshape to the finalized reduced scalar.
     wrap_template: str
+    # Optional strided grouped warp reduction (reshape-merged reductions whose
+    # live thread axis shares a warp with an unrelated sibling axis). When
+    # ``group_span`` > 0 the finalize uses ``_cute_grouped_reduce_warp`` with
+    # ``group_pre``/``group_span``/``group_lane_expr`` instead of a plain
+    # consecutive-lane ``cute.arch.warp_reduction_*``.
+    group_pre: int = 1
+    group_span: int = 0
+    group_lane_expr: str = ""
 
     def finalize_expr(self, reduced: str) -> str:
         return self.wrap_template.replace("__HELION_FINALIZED__", f"({reduced})")
@@ -173,13 +192,24 @@ def _is_lane_reduce_marker_assign(stmt: ast.AST) -> _LaneReduceMarker | None:
     if not isinstance(target, ast.Name):
         return None
     call = _find_lane_reduce_call(stmt.value)
-    if call is None or len(call.args) != 4:
+    if call is None or len(call.args) != 7:
         return None
-    input_node, type_node, identity_node, threads_node = call.args
+    (
+        input_node,
+        type_node,
+        identity_node,
+        threads_node,
+        group_pre_node,
+        group_span_node,
+        group_lane_node,
+    ) = call.args
     input_name = ast.unparse(input_node)
     reduction_type = ast.literal_eval(type_node)
     identity_expr = ast.unparse(identity_node)
     threads_in_group = int(ast.literal_eval(threads_node))
+    group_pre = int(ast.literal_eval(group_pre_node))
+    group_span = int(ast.literal_eval(group_span_node))
+    group_lane_expr = ast.literal_eval(group_lane_node)
     # Build the wrap template by replacing the marker call with a sentinel.
     wrapped = _ReplaceLaneReduceCall().visit(ast.parse(ast.unparse(stmt.value)).body[0])
     assert isinstance(wrapped, ast.Expr)
@@ -191,6 +221,9 @@ def _is_lane_reduce_marker_assign(stmt: ast.AST) -> _LaneReduceMarker | None:
         identity_expr=identity_expr,
         threads_in_group=threads_in_group,
         wrap_template=wrap_template,
+        group_pre=group_pre,
+        group_span=group_span,
+        group_lane_expr=group_lane_expr,
     )
 
 
@@ -217,6 +250,28 @@ def _dtype_ctor_from_identity(identity_expr: str) -> str | None:
     if isinstance(node, ast.Call):
         return ast.unparse(node.func)
     return None
+
+
+def _grouped_warp_reduce_expr(
+    reduction_type: str,
+    acc: str,
+    identity_expr: str,
+    lane_expr: str,
+    *,
+    pre: int,
+    group_span: int,
+) -> str:
+    """Strided grouped warp reduction over a single warp.
+
+    Reduces ``acc`` across the ``group_span`` lanes that share the same
+    ``lane % pre`` within each ``group_span``-lane block, so an interleaved
+    sibling thread axis (occupying the low ``pre`` strides) stays distinct.
+    """
+    return (
+        "_cute_grouped_reduce_warp("
+        f"{acc}, {reduction_type!r}, {identity_expr}, {lane_expr}, "
+        f"pre={pre}, group_span={group_span})"
+    )
 
 
 def _warp_reduce_expr(reduction_type: str, acc: str, threads_in_group: int) -> str:
@@ -386,7 +441,19 @@ def _split_one_lane_loop(loop: ast.For, lane_var: str) -> list[ast.AST]:
                 f"{acc_var} = {_combine_expr(m.reduction_type, acc_var, combine_val)}"
             )
         )
-        if m.threads_in_group > 1:
+        if m.group_span > 1 and m.group_pre > 1 and m.group_lane_expr:
+            # Strided grouped reduction: the reduce axis shares a warp with an
+            # unrelated sibling axis, so combine only the lanes that share the
+            # current lane's sibling coordinate.
+            reduced = _grouped_warp_reduce_expr(
+                m.reduction_type,
+                acc_var,
+                m.identity_expr,
+                m.group_lane_expr,
+                pre=m.group_pre,
+                group_span=m.group_span,
+            )
+        elif m.threads_in_group > 1:
             reduced = _warp_reduce_expr(m.reduction_type, acc_var, m.threads_in_group)
         else:
             reduced = acc_var
