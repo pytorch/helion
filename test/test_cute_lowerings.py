@@ -14591,7 +14591,9 @@ class TestCuteLowerings(unittest.TestCase):
             codegen=codegen,
             device_function=SimpleNamespace(
                 tensor_arg=lambda tensor: SimpleNamespace(name="A"),
-                cute_state=SimpleNamespace(matmul_operand_block_remap={}),
+                cute_state=SimpleNamespace(
+                    matmul_operand_block_remap={}, matmul_operand_index_override={}
+                ),
             ),
         )
 
@@ -15706,7 +15708,9 @@ class TestCuteLowerings(unittest.TestCase):
             ),
             sympy_expr=lambda expr: str(expr),
             device_function=SimpleNamespace(
-                cute_state=SimpleNamespace(matmul_operand_block_remap={})
+                cute_state=SimpleNamespace(
+                    matmul_operand_block_remap={}, matmul_operand_index_override={}
+                )
             ),
         )
         env = SimpleNamespace(
@@ -15742,7 +15746,9 @@ class TestCuteLowerings(unittest.TestCase):
         state = SimpleNamespace(
             codegen=_FakeMaskCodegen(_FakeMaskedLoopStrategy([1]), {1}),
             device_function=SimpleNamespace(
-                cute_state=SimpleNamespace(matmul_operand_block_remap={})
+                cute_state=SimpleNamespace(
+                    matmul_operand_block_remap={}, matmul_operand_index_override={}
+                )
             ),
         )
         env = SimpleNamespace(

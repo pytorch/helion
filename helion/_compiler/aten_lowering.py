@@ -32,14 +32,17 @@ from .cute.iota_utils import cute_free_arange_indexed_dim_key
 from .cute.iota_utils import cute_iota_has_atomic_tensor_index_only_users
 from .cute.iota_utils import cute_iota_is_free_memory_index
 from .cute.matmul_fallback import _emit_cute_matmul
+from .cute.matmul_fallback import _emit_cute_matmul_n_collapse
 from .cute.matmul_utils import cute_lower_rhs_for_matmul
 from .cute.matmul_utils import cute_outer_accumulates_result
 from .cute.matmul_utils import cute_outer_accumulator_dtype
 from .cute.matmul_utils import cute_outer_accumulator_out_dtype
 from .cute.matmul_utils import cute_rematerialize_rhs_at_contraction_block
+from .cute.matmul_utils import cute_rematerialize_rhs_at_index_override
 from .cute.matmul_utils import cute_resolve_active_block_id
 from .cute.matmul_utils import cute_resolve_active_matmul_k_block_id
 from .cute.matmul_utils import cute_static_k_invariant_extent
+from .cute.matmul_utils import cute_static_mn_collapse_n_block_id
 from .cute.matmul_utils import cute_static_serial_matmul_k_extent
 from .cute.matmul_utils import emit_cute_serial_scalar_mm_from_loads
 from .cute.strategies import is_pure_matmul_role_lifecycle_config
@@ -1422,6 +1425,155 @@ def codegen_addmm_cute(ctx: LoweringContext, node: Node) -> ast.AST:
     )
 
 
+def _cute_baddbmm_result_reduced_over_block(
+    node: Node,
+    n_block_id: int,
+) -> bool:
+    """Whether *node*'s collapsed result is summed away over *n_block_id*.
+
+    The matmul's M (lhs free) and N (rhs free) axes collapse to ``n_block_id``,
+    so the standard fallback would compute only the diagonal.  Folding the N
+    reduction into the matmul (layout A) is correct *only* when N is genuinely
+    reduced out downstream.  This guard requires:
+
+    * ``n_block_id`` is a reduction block (allocated for a ``sum`` /
+      reduction), and a reduction node over it exists somewhere in the device
+      IR (the ``.sum(-1)``), and
+    * the baddbmm result does not escape to any non-passthrough consumer in its
+      own graph - either it is consumed only by a same-graph reduction over the
+      block, or it is purely loop-carried (its only users are the graph output
+      and/or pure casts), so the carried value reaches the downstream reduction.
+
+    Returns ``False`` otherwise, leaving the (unchanged) standard path.
+    """
+    from ..language._tracing_ops import _new_var
+    from .host_function import HostFunction
+    from .inductor_lowering import ReductionLowering
+
+    env = CompileEnvironment.current()
+    canonical_block_id = getattr(env, "canonical_block_id", lambda block_id: block_id)
+    target_canonical = canonical_block_id(n_block_id)
+
+    if not env.block_sizes[n_block_id].reduction:
+        return False
+
+    # A reduction over the (canonical) N block must exist in the device IR.
+    device_ir = HostFunction.current().device_ir
+    has_block_reduction = False
+    for graph_info in getattr(device_ir, "graphs", ()):
+        graph = getattr(graph_info, "graph", None)
+        if not isinstance(graph, torch.fx.Graph):
+            continue
+        for other in graph.nodes:
+            lowering = other.meta.get("lowering")
+            if (
+                isinstance(lowering, ReductionLowering)
+                and canonical_block_id(lowering.block_index) == target_canonical
+            ):
+                has_block_reduction = True
+                break
+        if has_block_reduction:
+            break
+    if not has_block_reduction:
+        return False
+
+    passthrough = {
+        torch.ops.aten.clone.default,
+        torch.ops.aten.detach.default,
+        torch.ops.aten.to.dtype,
+        torch.ops.prims.convert_element_type.default,
+        _new_var,
+    }
+
+    # Walk forward inside the baddbmm's own graph; the result must not reach any
+    # non-passthrough consumer other than a reduction over the block or the
+    # graph output (loop carry).
+    seen: set[Node] = set()
+    stack: list[Node] = [node]
+    while stack:
+        cur = stack.pop()
+        for user in cur.users:
+            if not isinstance(user, Node) or user in seen:
+                continue
+            seen.add(user)
+            if len(seen) > 64:
+                return False
+            if user.op == "output":
+                continue
+            lowering = user.meta.get("lowering")
+            if (
+                isinstance(lowering, ReductionLowering)
+                and canonical_block_id(lowering.block_index) == target_canonical
+            ):
+                continue
+            if user.op == "call_function" and user.target in passthrough:
+                stack.append(user)
+                continue
+            return False
+    return True
+
+
+def _maybe_codegen_cute_baddbmm_n_collapse(
+    ctx: LoweringContext,
+    node: Node,
+    *,
+    lhs: ast.AST | CutePackedAffineLoad,
+    acc: ast.AST,
+    lhs_node: Node,
+    rhs_node: Node,
+    acc_node: Node,
+    k_block_id: int | None,
+    static_k_extent: int | None,
+) -> ast.AST | None:
+    """Layout (A) for a static-M==N-collapse baddbmm reduced over N.
+
+    See ``cute_static_mn_collapse_n_block_id`` /
+    ``_emit_cute_matmul_n_collapse``.  Returns ``None`` (caller keeps the
+    standard path) unless the tightly-gated pattern holds: the lhs M axis and
+    rhs N axis share a block id and the result is summed away over that block.
+    """
+    if not isinstance(lhs, ast.AST):
+        return None
+    n_block_id = cute_static_mn_collapse_n_block_id(ctx.cg, lhs_node, rhs_node)
+    if n_block_id is None:
+        return None
+    if not _cute_baddbmm_result_reduced_over_block(node, n_block_id):
+        return None
+    env = CompileEnvironment.current()
+    size_hint = getattr(env, "size_hint", None)
+    n_size = rhs_node.meta["val"].shape[-1]
+    n_extent = size_hint(n_size) if callable(size_hint) else int(n_size)
+    if not isinstance(n_extent, int) or n_extent <= 0:
+        return None
+
+    def rhs_at_n(n_var: str) -> ast.AST:
+        rematerialized = cute_rematerialize_rhs_at_index_override(
+            ctx, rhs_node, n_block_id, n_var
+        )
+        if rematerialized is None:
+            raise exc.BackendUnsupported(
+                "cute",
+                "CuTe static-MN-collapse baddbmm could not re-materialize the rhs "
+                "at the serial N index",
+            )
+        return rematerialized
+
+    return _emit_cute_matmul_n_collapse(
+        ctx.cg,
+        lhs,
+        rhs_at_n=rhs_at_n,
+        n_extent=n_extent,
+        k_block_id=k_block_id,
+        static_k_extent=static_k_extent,
+        acc=acc,
+        acc_dtype=acc_node.meta["val"].dtype,
+        lhs_dtype=lhs_node.meta["val"].dtype,
+        rhs_dtype=rhs_node.meta["val"].dtype,
+        lhs_node=lhs_node,
+        rhs_node=rhs_node,
+    )
+
+
 @baddbmm_lowering.register_codegen("cute")
 def codegen_baddbmm_cute(ctx: LoweringContext, node: Node) -> ast.AST:
     assert not node.kwargs, "baddbmm kwargs not supported"
@@ -1491,6 +1643,19 @@ def codegen_baddbmm_cute(ctx: LoweringContext, node: Node) -> ast.AST:
             "cute",
             "CuTe scalar matmul fallback requires an active K tile or a K-invariant static shortcut",
         )
+    n_collapse_result = _maybe_codegen_cute_baddbmm_n_collapse(
+        ctx,
+        node,
+        lhs=lhs,
+        acc=acc,
+        lhs_node=lhs_node,
+        rhs_node=rhs_node,
+        acc_node=acc_node,
+        k_block_id=k_block_id,
+        static_k_extent=static_k_extent,
+    )
+    if n_collapse_result is not None:
+        return n_collapse_result
     return _emit_cute_matmul(
         ctx.cg,
         lhs,

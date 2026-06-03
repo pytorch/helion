@@ -755,6 +755,135 @@ def _cute_recodegen_load_with_block_remap(
     return None
 
 
+# fx view ops whose scalar-fallback lowering is a no-op (the underlying load
+# value is unchanged) - peeling them reaches the rhs's underlying ``load``.
+_CUTE_RHS_VIEW_PASSTHROUGH_TARGETS = (
+    torch.ops.aten.permute.default,
+    torch.ops.aten.transpose.int,
+    torch.ops.aten.t.default,
+    torch.ops.aten.clone.default,
+    torch.ops.aten.detach.default,
+    torch.ops.aten.view.default,
+    torch.ops.aten._unsafe_view.default,
+    torch.ops.aten.reshape.default,
+    torch.ops.prims.convert_element_type.default,
+)
+
+
+def cute_static_mn_collapse_n_block_id(
+    cg: CodegenInterface,
+    lhs_node: torch.fx.Node,
+    rhs_node: torch.fx.Node,
+) -> int | None:
+    """Detect the static-M==N collapse of a matmul reduced over N.
+
+    Returns the shared (M and N) block id when a matmul's lhs free axis
+    (``lhs.shape[-2]`` = M) and rhs free axis (``rhs.shape[-1]`` = N) resolve to
+    the *same* active block id (the collapse: M and N are the same static-size
+    dim).  In this case the standard resolver indexes the rhs N axis at the M
+    thread index, computing only ``out[m, m]`` (the diagonal).  Returns ``None``
+    when M and N are distinct blocks (every ordinary matmul/bmm), so the caller
+    keeps its existing diagonal-free behaviour.
+    """
+    env = CompileEnvironment.current()
+    canonical_block_id = getattr(env, "canonical_block_id", lambda block_id: block_id)
+    lhs_val = lhs_node.meta.get("val")
+    rhs_val = rhs_node.meta.get("val")
+    if not isinstance(lhs_val, torch.Tensor) or not isinstance(rhs_val, torch.Tensor):
+        return None
+    if lhs_val.ndim < 2 or rhs_val.ndim < 2:
+        return None
+    m_block_id = cute_resolve_active_block_id(cg, lhs_val.shape[-2])
+    n_block_id = cute_resolve_active_block_id(cg, rhs_val.shape[-1])
+    if m_block_id is None or n_block_id is None:
+        return None
+    if canonical_block_id(m_block_id) != canonical_block_id(n_block_id):
+        return None
+    # The contraction (K) axis must be a *different* block from the shared M/N
+    # block - otherwise this is not a well-formed matmul.
+    k_block_id = cute_resolve_active_block_id(cg, lhs_val.shape[-1])
+    if k_block_id is not None and canonical_block_id(k_block_id) == canonical_block_id(
+        m_block_id
+    ):
+        return None
+    return n_block_id
+
+
+def cute_underlying_load_node(node: torch.fx.Node) -> torch.fx.Node | None:
+    """Peel no-op view ops off *node* to reach its underlying ``load`` node."""
+    cur: torch.fx.Node | None = node
+    for _ in range(16):
+        if cur is None or cur.op != "call_function":
+            return None
+        if cur.target is load:
+            return cur
+        if cur.target not in _CUTE_RHS_VIEW_PASSTHROUGH_TARGETS:
+            return None
+        source = cur.args[0] if cur.args else None
+        cur = source if isinstance(source, torch.fx.Node) else None
+    return None
+
+
+def cute_rematerialize_rhs_at_index_override(
+    ctx: LoweringContext,
+    rhs_node: torch.fx.Node,
+    n_block_id: int,
+    index_expr: str,
+) -> ast.AST | None:
+    """Re-lower the rhs of a static-M==N-collapse matmul at a serial N index.
+
+    The rhs's free (N) axis shares a block id with the lhs M axis, so the
+    standard load indexes it at the M thread index.  Re-codegen the rhs's
+    underlying ``load`` with that block's index overridden to *index_expr* (a
+    serial N-loop variable) and masking for it suppressed, so the load reads
+    ``rhs[..., n, ...]`` for the loop's current n instead of the diagonal.
+    """
+    from ..generate_ast import GenerateAST
+    from ..inductor_lowering import CodegenState
+
+    cg = ctx.cg
+    if not isinstance(cg, GenerateAST):
+        return None
+    load_node = cute_underlying_load_node(rhs_node)
+    if load_node is None:
+        return None
+    cute_state = cg.device_function.cute_state
+
+    def env_arg(arg: object) -> object:
+        if isinstance(arg, torch.fx.Node):
+            return ctx.env[arg]
+        if isinstance(arg, (list, tuple)):
+            return type(arg)(env_arg(a) for a in arg)
+        return arg
+
+    def proxy_arg(arg: object) -> object:
+        if isinstance(arg, torch.fx.Node):
+            return arg.meta["val"]
+        if isinstance(arg, (list, tuple)):
+            return type(arg)(proxy_arg(a) for a in arg)
+        return arg
+
+    proxy_args = [proxy_arg(a) for a in load_node.args]
+    ast_args = [env_arg(a) for a in load_node.args]
+    state = CodegenState(
+        cg,
+        fx_node=load_node,
+        env=ctx.env,
+        proxy_args=list(proxy_args),
+        ast_args=list(ast_args),
+    )
+    previous = dict(cute_state.matmul_operand_index_override)
+    cute_state.matmul_operand_index_override = {n_block_id: index_expr}
+    load_codegen = load._codegen["cute"]  # pyrefly: ignore[missing-attribute]
+    try:
+        result = load_codegen(state)
+    finally:
+        cute_state.matmul_operand_index_override = previous
+    if isinstance(result, ast.AST):
+        return result
+    return None
+
+
 def _cute_matmul_operand_indices() -> dict[object, tuple[int, int]]:
     """``(lhs_arg_index, rhs_arg_index)`` for each matmul op the CuTe backend
     lowers through the scalar fallback.

@@ -27,7 +27,6 @@ from helion._testing import skipIfRefEager
 from helion._testing import skipIfTileIR
 from helion._testing import skipIfXPU
 from helion._testing import skipUnlessTensorDescriptor
-from helion._testing import xfailIfCute
 import helion.language as hl
 
 _LARGE_BF16_SHAPE = (51200, 51200)
@@ -2592,9 +2591,6 @@ class TestIndexing(RefEagerTestBase, TestCase):
         expected = data[index_source, :, :]
         torch.testing.assert_close(result, expected)
 
-    @xfailIfCute(
-        "CuTe batched matmul lowering for full-slice loads in reduction loops is incorrect"
-    )
     def test_full_slice_in_reduction_loop(self):
         """Full slice between two tiled dims: q[tile_n, :, tile_d]
 
@@ -2624,7 +2620,8 @@ class TestIndexing(RefEagerTestBase, TestCase):
             torch.zeros(16, 16, 16, device=DEVICE), q, q.transpose(-2, -1)
         ).sum(-1)
         torch.testing.assert_close(result, expected, atol=0.2, rtol=0.01)
-        self.assertIn("tl.dot", code)
+        if _get_backend() == "triton":
+            self.assertIn("tl.dot", code)
 
     def test_symbolic_index_in_host_block(self):
         """Regression test for https://github.com/pytorch/helion/issues/1339.
