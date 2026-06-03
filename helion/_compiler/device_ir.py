@@ -811,13 +811,17 @@ class DeviceIR:
             graph_to_info: dict[int, RolledReductionInfo] = {}
             allow_loop = False
 
-            # Check if any graph contains matmul or dev_prts stacking with rdim
+            # Check if any graph contains matmul or dev_prts stacking with
+            # rdim, or reduces over rdim along a non-tile (hl.arange) axis
+            # that cannot be sliced inside the reduction loop.
             can_roll_graphs = True
             for graph_info in self.graphs[:num_original_graphs]:
                 roller = ReductionRoller(self, rdim, {})
-                if roller.has_matmul_with_rdim(
-                    graph_info.graph
-                ) or roller.has_stack_tensor_with_rdim(graph_info.graph):
+                if (
+                    roller.has_matmul_with_rdim(graph_info.graph)
+                    or roller.has_stack_tensor_with_rdim(graph_info.graph)
+                    or roller.has_unrollable_reduction(graph_info.graph)
+                ):
                     can_roll_graphs = False
                     break
 
