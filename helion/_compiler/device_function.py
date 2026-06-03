@@ -312,6 +312,11 @@ class DeviceFunction:
         self._atomic_indexing_config = config.atomic_indexing
         self.atomic_indexing_strategies: list[IndexingStrategy] = []
         self.atomic_op_index = 0
+        # Pallas atomics are lowered as ordered read-modify-write sequences.
+        # Codegen records their target tensors so the runtime launcher can
+        # identify grid dimensions that contribute to the same output tile.
+        self.pallas_atomic_target_ops: dict[int, set[str]] = {}
+        self.pallas_atomic_return_used_target_ids: set[int] = set()
 
         self.rng_seed_count = 0
         self.device_load_index = 0

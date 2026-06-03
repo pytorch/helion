@@ -1954,6 +1954,24 @@ class PallasBackend(Backend):
             if has_rng_ops:
                 block_spec_info.append(None)  # RNG seed buffer is untiled
             launcher_args.append(f"_block_spec_info={block_spec_info!r}")
+            atomic_infos: list[dict[str, object]] = []
+            if sorted_args is not None:
+                for i, arg in enumerate(sorted_args):
+                    if not isinstance(arg, TensorArg):
+                        continue
+                    target_id = id(arg.fake_value)
+                    ops = device_fn.pallas_atomic_target_ops.get(target_id)
+                    if ops:
+                        atomic_infos.append(
+                            {
+                                "target_arg_pos": i,
+                                "ops": tuple(sorted(ops)),
+                                "return_used": target_id
+                                in device_fn.pallas_atomic_return_used_target_ids,
+                            }
+                        )
+            if atomic_infos:
+                launcher_args.append(f"_pallas_atomic_infos={atomic_infos!r}")
 
         pad_info = self._compute_pad_info(sorted_args, config)
         if pad_info:
