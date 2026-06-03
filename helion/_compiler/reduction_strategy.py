@@ -630,6 +630,20 @@ class PersistentReductionStrategy(ReductionStrategy):
                 lane_extent = env.backend.create_synthetic_reduction_lanes(
                     self._thread_count, size_hint
                 )
+                # The synthetic lane loop folds each lane into a per-thread
+                # accumulator that is then combined with a single warp reduction
+                # over ``_reduction_thread_count`` threads. That warp reduction
+                # is only correct within one warp, so cap the thread count to
+                # the warp size and let the lane loop grow to cover the rest;
+                # otherwise a multi-warp group silently drops lanes (#2643).
+                if (
+                    lane_extent is not None
+                    and self._thread_count > _CUTE_WARP_REDUCTION_THREADS
+                ):
+                    self._thread_count = _CUTE_WARP_REDUCTION_THREADS
+                    lane_extent = env.backend.create_synthetic_reduction_lanes(
+                        self._thread_count, size_hint
+                    )
                 if lane_extent is not None:
                     self._synthetic_cute_lane_var = fn.new_var(
                         f"synthetic_lane_{block_index}",
