@@ -343,7 +343,6 @@ class TestControlFlow(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result, expected)
 
     @skipIfPallas("Pallas gather supports only dim-0 indirect indexing")
-    @skipIfCute("Cute requires hl.arange() to use an active tile/reduction axis")
     def test_grid_if_reduction_rolling_branch_graph_ids(self):
         """Test for reductions under branch-by-grid control flow.
 

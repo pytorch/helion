@@ -1821,11 +1821,16 @@ class FlattenedTileStrategy(BlockSizeTileStrategy):
         mask_var = self.mask_var(-1)
         if mask_var is not None:
             mask_terms = [f"{offsets_var} < ({self._numel_str(state, total_numel)})"]
-            thread_mask = env.backend.thread_in_tile_mask_expr(
-                block_size_var, axis=self._flat_thread_axis()
-            )
-            if thread_mask is not None:
-                mask_terms.insert(0, f"({thread_mask})")
+            # Skip the ``thread_idx[axis] < block_size`` term for a CuTe
+            # block-size-1 axis (see ``codegen_grid``): the axis is not a thread
+            # axis, so this term would otherwise pin the launch dim to 1 and
+            # block a synthetic free-``hl.arange`` axis from reusing it.
+            if not (env.backend.name == "cute" and not self._uses_thread_axis()):
+                thread_mask = env.backend.thread_in_tile_mask_expr(
+                    block_size_var, axis=self._flat_thread_axis()
+                )
+                if thread_mask is not None:
+                    mask_terms.insert(0, f"({thread_mask})")
             mask_expr = " and ".join(mask_terms)
             statements.append(statement_from_string(f"{mask_var} = {mask_expr}"))
         # pyrefly: ignore [bad-return]
@@ -1968,15 +1973,27 @@ class FlattenedTileStrategy(BlockSizeTileStrategy):
 
         pids.append(PIDInfo(pid_var, block_size_var, total_numel, self.block_ids[0]))
 
-        state.add_statement(
-            env.backend.arange_expr(
-                offsets_var,
-                pid_var,
-                block_size_var,
-                dtype,
-                axis=self._flat_thread_axis(),
+        # A CuTe grid whose block size is 1 does not claim a thread axis: its
+        # ``offsets = pid * 1 + thread_idx[axis]`` term is always 0 (launch dim
+        # for the axis is 1). Emit ``offsets = pid * 1`` instead so the axis is
+        # genuinely free for a synthetic free-``hl.arange`` thread axis to reuse
+        # without the grid's ``thread_idx[axis] < 1`` mask filtering its lanes.
+        if env.backend.name == "cute" and not self._uses_thread_axis():
+            state.add_statement(
+                statement_from_string(
+                    f"{offsets_var} = ({pid_var}) * ({block_size_var})"
+                )
             )
-        )
+        else:
+            state.add_statement(
+                env.backend.arange_expr(
+                    offsets_var,
+                    pid_var,
+                    block_size_var,
+                    dtype,
+                    axis=self._flat_thread_axis(),
+                )
+            )
         state.codegen.statements_stack[-1].extend(statements)
 
         pids.codegen(state)
@@ -2026,9 +2043,16 @@ class FlattenedTileStrategy(BlockSizeTileStrategy):
         lid = self.new_var("lid")
         numel_str = self._numel_str(state, total_numel)
         end_var = env.backend.cdiv_expr(numel_str, block_size_var, is_device=True)
-        arange_expr = env.backend.arange_expr(
-            offsets_var, lid, block_size_var, dtype, axis=self._flat_thread_axis()
-        )
+        # Mirror ``codegen_grid``: a CuTe block-size-1 loop axis does not claim a
+        # thread axis, so drop the always-zero ``+ thread_idx[axis]`` term so the
+        # axis stays free (and consistent with the mask emitted by
+        # ``_codegen_common``, which also drops its thread term for this case).
+        if env.backend.name == "cute" and not self._uses_thread_axis():
+            arange_expr = f"{offsets_var} = ({lid}) * ({block_size_var})"
+        else:
+            arange_expr = env.backend.arange_expr(
+                offsets_var, lid, block_size_var, dtype, axis=self._flat_thread_axis()
+            )
         for_node = create(
             ast.For,
             target=create(ast.Name, id=lid, ctx=ast.Store()),

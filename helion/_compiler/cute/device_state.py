@@ -288,6 +288,13 @@ class CuteDeviceFunctionState:
         self.cluster_shape: tuple[int, int, int] | None = None
         self.block_shape: tuple[int, int, int] | None = None
         self.suppress_root_lane_loops = False
+        # Active block-id remapping for matmul operand re-materialization.
+        # Maps a source block_id (e.g. the rhs operand's loop-invariant
+        # contraction index) to the active contraction block_id so a
+        # re-lowered operand load reads ``rhs[..., k, ...]`` per contraction
+        # step instead of the loop-invariant ``rhs[..., m, ...]``.  Empty
+        # except while re-materializing a matmul operand load.
+        self.matmul_operand_block_remap: dict[int, int] = {}
 
     def register_tcgen05_store_value(
         self, name: str, value: CuteTcgen05StoreValue

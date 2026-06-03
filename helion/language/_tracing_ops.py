@@ -2391,8 +2391,16 @@ def _(state: CodegenState) -> list[object]:
     assert all(isinstance(x, ast.AST) for x in if_args)
     assert all(isinstance(x, ast.AST) for x in else_args)
 
+    # Tag each branch with the dynamic ``_if`` node identity so synthetic
+    # ``hl.arange`` axes allocated in mutually-exclusive branches can share a
+    # single thread axis (only one branch runs per program instance).
+    if_node_id = id(state.fx_node)
+
     if_body_stmts: list[ast.AST] = []
-    with state.codegen.set_statements(if_body_stmts):
+    with (
+        state.codegen.set_statements(if_body_stmts),
+        state.codegen.cute_branch_scope(if_node_id, 0),
+    ):
         if_outputs = codegen_call_with_graph(
             state.codegen, graph_info.graph, [*if_args]
         )
@@ -2401,7 +2409,10 @@ def _(state: CodegenState) -> list[object]:
     else_graph = state.get_graph(graph_info.else_branch)
     assert isinstance(else_graph, ElseGraphInfo)
     else_body_stmts: list[ast.AST] = []
-    with state.codegen.set_statements(else_body_stmts):
+    with (
+        state.codegen.set_statements(else_body_stmts),
+        state.codegen.cute_branch_scope(if_node_id, 1),
+    ):
         else_outputs = codegen_call_with_graph(
             state.codegen, else_graph.graph, [*else_args]
         )

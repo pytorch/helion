@@ -753,6 +753,78 @@ class DeviceIR:
         assert isinstance(graph_info, RootGraphInfo)
         return graph_info.phase_index
 
+    @staticmethod
+    def branch_paths_mutually_exclusive(
+        path_a: list[tuple[int, int]] | None,
+        path_b: list[tuple[int, int]] | None,
+    ) -> bool:
+        """True when two control-flow branch paths can never both execute.
+
+        Paths are mutually exclusive when some dynamic ``_if`` appears in both
+        with different branch sides (one took the ``if`` body, the other the
+        ``else`` body). Each entry is ``(if_node_key, side)``.
+        """
+        if path_a is None or path_b is None:
+            return False
+        sides_b = dict(path_b)
+        return any(
+            node_id in sides_b and sides_b[node_id] != side for node_id, side in path_a
+        )
+
+    def reduction_block_id_branch_paths(
+        self,
+    ) -> dict[int, list[list[tuple[int, int]]]]:
+        """Map each reduction block id to the control-flow branch path(s) it runs in.
+
+        Walks the graph tree from each root, tracking ``(if_graph_id, side)``
+        decisions (side 0 = ``if`` body, 1 = ``else`` body) made by dynamic
+        ``_if`` nodes. For every reduction node it records the branch path of
+        the enclosing graph, keyed by the reduction's ``block_index``.
+
+        Two reductions whose paths diverge at a common ``_if`` (one took the
+        ``if`` body, the other the ``else`` body) are mutually exclusive in time
+        and may therefore share a CUDA thread axis. Returns ``{}`` when no
+        reduction lives under a dynamic branch (the common, non-branching case),
+        so callers leave the default thread-axis assignment untouched.
+        """
+        from .inductor_lowering import ReductionLowering
+
+        result: dict[int, list[list[tuple[int, int]]]] = {}
+
+        def walk(graph_id: int, path: list[tuple[int, int]]) -> None:
+            if not 0 <= graph_id < len(self.graphs):
+                return
+            graph = self.graphs[graph_id].graph
+            for node in graph.nodes:
+                if node.op != "call_function":
+                    continue
+                lowering = node.meta.get("lowering")
+                if isinstance(lowering, ReductionLowering) and isinstance(
+                    lowering.block_index, int
+                ):
+                    result.setdefault(lowering.block_index, [])
+                    if path not in result[lowering.block_index]:
+                        result[lowering.block_index].append(list(path))
+                if node.target is _tracing_ops._if and len(node.args) >= 3:
+                    _, if_graph_id, else_graph_id, *_rest = node.args
+                    if_node_key = id(node)
+                    if isinstance(if_graph_id, int):
+                        walk(if_graph_id, [*path, (if_node_key, 0)])
+                    if isinstance(else_graph_id, int):
+                        walk(else_graph_id, [*path, (if_node_key, 1)])
+                elif (
+                    _tracing_ops.is_for_loop_target(node.target)
+                    and node.args
+                    and isinstance(node.args[0], int)
+                ):
+                    # For/reduction loops do not introduce mutual exclusivity;
+                    # descend without extending the path.
+                    walk(node.args[0], path)
+
+        for root_id in self.root_ids:
+            walk(root_id, [])
+        return result
+
     def register_rollable_reductions(self) -> None:
         """Analyze graphs for rollable reductions and register ReductionLoopSpec entries.
 

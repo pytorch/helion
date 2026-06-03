@@ -300,8 +300,6 @@ class TestMisc(RefEagerTestBase, TestCase):
         Previously, the cast could be hoisted/ignored leading to FP32 p fed into BF16 v.
         This test ensures kernel runs and matches reference with BF16 inputs.
         """
-        if _get_backend() == "cute":
-            pytest.xfail("CUTe reduction codegen exceeds shared memory")
 
         @helion.kernel(autotune_effort="none", dot_precision=get_test_dot_precision())
         def kernel(

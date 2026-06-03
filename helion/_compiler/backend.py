@@ -679,6 +679,41 @@ class Backend(abc.ABC):
             reserve *= next_power_of_2(min(size_hint, max_reduction_threads))
         return reserve
 
+    def _cute_free_auto_thread_axis_count(
+        self, fn: DeviceFunction, config: Config
+    ) -> int:
+        """Count the kernel's free (non-reduction) tile axes that auto-thread.
+
+        These are the axes that compete for the thread budget left over after a
+        matmul-contraction reduction has reserved its slice (see OPTION B in
+        ``create_loop_strategy``).  The reserve's ``thread_limit`` shrink is
+        applied per ``create_loop_strategy`` call, but a kernel may build the M
+        and N tile axes in *separate* calls (e.g. M is the grid, N is a device
+        loop).  Each call only sees its own axes, so dividing the per-call
+        ``thread_limit`` by the reserve once is not enough: the product of every
+        free axis' threads must stay within ``1024 // reserve``.  Counting all
+        the free auto-threaded axes lets each call take only its fair share.
+        """
+        from .compile_environment import CompileEnvironment
+
+        env = CompileEnvironment.current()
+        count = 0
+        for block_id in _active_loop_block_ids(fn):
+            info = env.block_sizes[block_id]
+            if info.reduction:
+                continue
+            block_size = info.from_config(config)
+            if not isinstance(block_size, int) or block_size <= 1:
+                continue
+            threads = int(
+                env.config_spec.num_threads.config_get(config.num_threads, block_id, 0)
+            )
+            # Only auto-threaded (``num_threads == 0``) axes participate in the
+            # budget split; explicitly-threaded axes keep their configured count.
+            if threads == 0:
+                count += 1
+        return max(count, 1)
+
     def create_loop_strategy(
         self, fn: DeviceFunction, block_ids: list[int], config: Config
     ) -> TileStrategy:
@@ -2711,7 +2746,9 @@ class CuteBackend(Backend):
         tile_strategy: TileStrategyDispatch,
     ) -> None:
         from .cute.layout_propagation import plan_layouts
+        from .cute.view_subtile import annotate_view_subtiles
 
+        annotate_view_subtiles(graphs, config)
         plan_layouts(graphs, config, tile_strategy)
 
     def supports_config_key(self, key: str) -> bool:
@@ -3536,9 +3573,21 @@ class CuteBackend(Backend):
             and static_dims != (1, 1, 1)
             and not has_nested_device_loops
             and static_threads < dynamic_threads
+            # Synthetic free-``hl.arange`` thread axes are real launch lanes that
+            # the strategy's ``static_dims`` does not know about, so do not fall
+            # back to ``static_dims`` (which would drop them) when they are live.
+            and not codegen.cute_synthetic_arange_axis_sizes
         ):
             dims = static_dims
-        if dim_exprs is not None and dim_exprs != ("1", "1", "1"):
+        if (
+            dim_exprs is not None
+            and dim_exprs != ("1", "1", "1")
+            # ``dim_exprs`` is the strategy's static per-axis launch shape; it
+            # has no entry for synthetic free-``hl.arange`` axes, so adopting it
+            # wholesale would shrink those axes back to 1. Skip it when they are
+            # live (the synthetic extents are already folded into ``dims``).
+            and not codegen.cute_synthetic_arange_axis_sizes
+        ):
             if all(expr.isdigit() for expr in dim_exprs):
                 expr_dims = tuple(int(expr) for expr in dim_exprs)
                 if functools.reduce(
@@ -3930,7 +3979,17 @@ class CuteBackend(Backend):
                 fn, block_ids
             )
             if reserved_contraction_threads > 1:
-                thread_limit = max(1, thread_limit // reserved_contraction_threads)
+                # Budget left for the free tile axes after the contraction axis
+                # has claimed its full thread extent.
+                free_budget = max(1, thread_limit // reserved_contraction_threads)
+                # The free axes are built across separate ``create_loop_strategy``
+                # calls but their thread counts multiply, so split the budget so
+                # the product over every free axis stays within ``free_budget``.
+                free_axes = self._cute_free_auto_thread_axis_count(fn, config)
+                per_axis_limit = free_budget
+                while per_axis_limit > 1 and per_axis_limit**free_axes > free_budget:
+                    per_axis_limit //= 2
+                thread_limit = max(1, per_axis_limit)
             static_threads = _shrink_auto_thread_counts(nd_block_size, thread_limit)
             from .cute.thread_budget import check_thread_limit
 

@@ -14,7 +14,6 @@ from helion._testing import code_and_output
 from helion._testing import onlyBackends
 from helion._testing import skipIfRefEager
 from helion._testing import skipUnlessTensorDescriptor
-from helion._testing import xfailIfCute
 from helion._testing import xfailIfPallas
 import helion.language as hl
 from helion.runtime.settings import _get_backend
@@ -354,7 +353,6 @@ class TestViews(RefEagerTestBase, TestCase):
         expected[1::2] = b  # Every 2nd row starting from 1
         torch.testing.assert_close(result, expected, rtol=1e-5, atol=1e-5)
 
-    @xfailIfCute("torch.stack with direct store consumer not supported on cute")
     @xfailIfPallas("torch.stack not supported on pallas")
     def test_stack_non_power_of_2(self):
         @helion.kernel(autotune_effort="none", static_shapes=True)
@@ -389,7 +387,6 @@ class TestViews(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result, expected, rtol=1e-5, atol=1e-5)
 
     @skipIfRefEager("ref eager does not support lifted variable")
-    @xfailIfCute("hl.split with reshaped input not supported on cute")
     @xfailIfPallas("hl.split and tl.reshape not supported on pallas")
     def test_view_blocksize_constexpr(self):
         @helion.kernel(static_shapes=True, autotune_effort="none")
@@ -407,9 +404,36 @@ class TestViews(RefEagerTestBase, TestCase):
         x = torch.randn(1024, dtype=torch.bfloat16, device=DEVICE)
         code, result = code_and_output(foo, (x,))
         self.assertEqual(result.numel(), x.numel() // 2)
-        self.assertIn("tl.reshape", code)
+        if _get_backend() == "triton":
+            self.assertIn("tl.reshape", code)
 
-    @xfailIfCute("torch.stack with direct store consumer not supported on cute")
+    @skipIfRefEager("ref eager does not support lifted variable")
+    @xfailIfPallas("hl.split and tl.reshape not supported on pallas")
+    def test_view_blocksize_constexpr_pairsum(self):
+        # The split-over-view + compacted-store machinery exercised by
+        # ``test_view_blocksize_constexpr`` (which only checks codegen shape)
+        # must produce genuine ``x.view(N // 2, 2).sum(-1)`` values.  This
+        # variant writes the compacted result to the matching output offset
+        # (``n_tile.begin // 2``) so the result is numerically meaningful.
+        @helion.kernel(static_shapes=True, autotune_effort="none")
+        def foo(x: torch.Tensor) -> torch.Tensor:
+            N = x.shape[0]
+            N = hl.specialize(N)
+            out = x.new_empty(N // 2)
+            for (n_tile,) in hl.tile([N]):
+                val = x[n_tile]
+                val = val.view(n_tile.block_size // 2, 2)
+                val_a, val_b = hl.split(val)
+                out[n_tile.begin // 2 + hl.arange(0, n_tile.block_size // 2)] = (
+                    val_a + val_b
+                )
+            return out
+
+        x = torch.randn(1024, dtype=torch.float32, device=DEVICE)
+        _code, result = code_and_output(foo, (x,))
+        expected = x.view(x.numel() // 2, 2).sum(-1)
+        torch.testing.assert_close(result, expected, rtol=1e-3, atol=1e-3)
+
     @xfailIfPallas("torch.stack not supported on pallas")
     def test_stack_dim0(self):
         with torch._inductor.config.patch(

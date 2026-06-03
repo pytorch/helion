@@ -28,12 +28,15 @@ from .cute.indexing import CuteShapeChainView
 from .cute.indexing import CuteSortableLoad
 from .cute.indexing import is_cute_shape_chain_target
 from .cute.indexing import match_cute_affine_range_iota
+from .cute.iota_utils import cute_free_arange_indexed_dim_key
 from .cute.iota_utils import cute_iota_has_atomic_tensor_index_only_users
+from .cute.iota_utils import cute_iota_is_free_memory_index
 from .cute.matmul_fallback import _emit_cute_matmul
 from .cute.matmul_utils import cute_lower_rhs_for_matmul
 from .cute.matmul_utils import cute_outer_accumulates_result
 from .cute.matmul_utils import cute_outer_accumulator_dtype
 from .cute.matmul_utils import cute_outer_accumulator_out_dtype
+from .cute.matmul_utils import cute_rematerialize_rhs_at_contraction_block
 from .cute.matmul_utils import cute_resolve_active_block_id
 from .cute.matmul_utils import cute_resolve_active_matmul_k_block_id
 from .cute.matmul_utils import cute_static_k_invariant_extent
@@ -52,6 +55,7 @@ from .node_masking import cached_masked_value
 from .node_masking import getitem_masked_value
 
 if TYPE_CHECKING:
+    from .generate_ast import GenerateAST
     from .helper_function import CodegenInterface
 
 
@@ -896,9 +900,31 @@ def codegen_stack_cute(ctx: LoweringContext, node: Node) -> object:
         raise exc.BackendUnsupported("cute", "stack inputs")
     if _shape_chain_only_users(node):
         return CuteShapeChainView(node)
-    raise exc.BackendUnsupported(
-        "cute", "virtual shape-chain direct consumers are not yet supported"
-    )
+    # A stack materialized to a per-thread scalar is only correct when every
+    # consumer reads it element-wise (each output element is one stacked
+    # element), e.g. a direct store. A reduction or matmul that contracts over
+    # the virtual stacked dimension cannot gather the stacked operands from a
+    # single per-thread scalar and would silently produce wrong values, so only
+    # materialize when the direct consumers are stores (or further shape-chain
+    # ops); otherwise keep rejecting the pattern.
+    from ..language import memory_ops
+
+    if not all(
+        user.op == "call_function"
+        and (user.target is memory_ops.store or is_cute_shape_chain_target(user.target))
+        for user in node.users
+    ):
+        raise exc.BackendUnsupported(
+            "cute", "virtual shape-chain direct consumers are not yet supported"
+        )
+    from .cute.cute_reshape import resolve_cute_shape_chain_value
+
+    materialized = resolve_cute_shape_chain_value(ctx, node)
+    if materialized is None:
+        raise exc.BackendUnsupported(
+            "cute", "virtual shape-chain direct consumers are not yet supported"
+        )
+    return materialized
 
 
 expand_lowering = register_lowering(
@@ -1179,6 +1205,10 @@ def codegen_mm_cute(ctx: LoweringContext, node: Node) -> ast.AST:
         k_block_id = cute_resolve_active_block_id(
             ctx.cg, packed_node.meta["val"].shape[0]
         )
+    if k_block_id is None and packed_rhs is None:
+        remat = cute_rematerialize_rhs_at_contraction_block(ctx, lhs_node, rhs_node)
+        if remat is not None:
+            rhs, k_block_id = remat
     static_k_extent = (
         None
         if k_block_id is not None
@@ -1566,6 +1596,112 @@ def codegen_iota_pallas(ctx: LoweringContext, node: Node) -> object:
     )
 
 
+def _cute_compacted_tile_begin_lane_expr(
+    ctx: LoweringContext,
+    source_node: Node,
+    start: object,
+    step: object,
+    dtype: torch.dtype,
+) -> ast.AST | None:
+    """Resolve ``hl.arange(block // F)`` to the tile-local lane ``lane // F``.
+
+    Handles the compacted sub-block store ``out[tile.begin + hl.arange(block //
+    F)] = split_result`` where the value is a spread/compacted tile whose element
+    on lane ``t`` is the ``t // F`` piece. The arange must contribute only the
+    tile-local coordinate ``lane // F`` because ``tile.begin`` is added
+    explicitly; resolving it to the global ``index_var // F`` would fold the
+    tile's offset in twice. Returns ``None`` unless the pattern matches.
+    """
+    from .cute.cute_reshape import _get_block_local_coord
+    from .cute.iota_utils import cute_free_arange_compacted_tile_begin_factor
+    from .generate_ast import GenerateAST
+
+    assert isinstance(ctx.cg, GenerateAST)
+    cg = ctx.cg
+    match = cute_free_arange_compacted_tile_begin_factor(source_node, cg)
+    if match is None:
+        return None
+    block_id, factor = match
+    local_coord = _get_block_local_coord(cg, block_id)
+    if local_coord is None:
+        return None
+    expr = f"({local_coord}) // cutlass.Int32({factor})"
+    return _wrap_iota_coord_expr(ctx, expr, start, step, dtype)
+
+
+def _cute_free_arange_axis_expr(
+    cg: GenerateAST,
+    source_node: Node,
+    length_hint: int | None,
+    start: object,
+    step: object,
+) -> str | None:
+    """Map a free/unbound ``hl.arange`` index dim onto a synthetic thread axis.
+
+    Returns the per-thread coordinate expression (``thread_idx()[axis]``) when
+    ``source_node`` is an iota that flows into a load/store index but is bound
+    to no tile/reduction/grid axis. Returns ``None`` otherwise so the caller
+    keeps its existing (raising) behavior — this keeps the synthetic-axis path
+    a strict no-op for every already-supported arange.
+    """
+    if not isinstance(length_hint, int) or length_hint <= 0:
+        return None
+    if not cute_iota_is_free_memory_index(source_node, cg):
+        return None
+    # The synthetic axis is keyed by the size of the tensor dimension this
+    # arange indexes. Two arange dims that address the same logical dimension (the
+    # load and store ``hl.arange(k)`` over a K-sized axis) share one axis so a
+    # value loaded on a lane is stored back on that lane, while a cartesian
+    # ``row``/``col`` pair addressing differently-sized dims gets distinct axes.
+    # ``length``/``start``/``step`` round out the key so two distinct arange dims
+    # that happen to index equal-sized dims still separate.
+    dim_key = cute_free_arange_indexed_dim_key(source_node, cg)
+    if dim_key is None:
+        return None
+    key = (
+        dim_key,
+        length_hint,
+        _arange_endpoint_key(start),
+        _arange_endpoint_key(step),
+    )
+    return cg.allocate_cute_synthetic_arange_coord(key, length_hint)
+
+
+def _arange_endpoint_key(value: object) -> object:
+    if isinstance(value, int):
+        return value
+    if isinstance(value, torch.SymInt):
+        return str(value._sympy_())
+    return repr(value)
+
+
+def _wrap_iota_coord_expr(
+    ctx: LoweringContext,
+    coord_expr: str,
+    start: object,
+    step: object,
+    dtype: torch.dtype,
+) -> ast.AST:
+    """Apply ``start``/``step``/``dtype`` to a per-thread iota coordinate.
+
+    Mirrors the trailing wrapping ``_cute_iota_expr`` applies to a resolved
+    block-id coordinate so the synthetic-axis path produces identical
+    ``start + step * coord`` arithmetic.
+    """
+    expr = coord_expr
+    if step != 1:
+        expr = f"{{step}} * ({expr})"
+    if start != 0:
+        expr = f"{{start}} + ({expr})"
+    if dtype != torch.int32:
+        expr = f"{CompileEnvironment.current().backend.dtype_str(dtype)}({expr})"
+    return expr_from_string(
+        expr,
+        start=ctx.to_ast(start),
+        step=ctx.to_ast(step),
+    )
+
+
 def _cute_iota_expr(
     ctx: LoweringContext,
     *,
@@ -1732,6 +1868,12 @@ def _cute_iota_expr(
     if block_id is None:
         if (affine_range := match_cute_affine_range_iota(source_node)) is not None:
             return affine_range
+    if (
+        compacted := _cute_compacted_tile_begin_lane_expr(
+            ctx, source_node, start, step, dtype
+        )
+    ) is not None:
+        return compacted
     if "val" in source_node.meta:
         fake_val = source_node.meta["val"]
         if isinstance(fake_val, torch.Tensor) and fake_val.ndim == 1:
@@ -1778,6 +1920,12 @@ def _cute_iota_expr(
                 "cute.make_identity_tensor({length})",
                 length=ctx.to_ast(length_arg),
             )
+        if (
+            synthetic := _cute_free_arange_axis_expr(
+                cg, source_node, length_hint, start, step
+            )
+        ) is not None:
+            return _wrap_iota_coord_expr(ctx, synthetic, start, step, dtype)
         raise exc.BackendUnsupported(
             "cute",
             "hl.arange() requires an active tile/reduction axis in cute kernels",
@@ -1834,6 +1982,12 @@ def _cute_iota_expr(
                 "cute.make_identity_tensor({length})",
                 length=ctx.to_ast(length_arg),
             )
+        elif (
+            synthetic := _cute_free_arange_axis_expr(
+                cg, source_node, length_hint, start, step
+            )
+        ) is not None:
+            return _wrap_iota_coord_expr(ctx, synthetic, start, step, dtype)
         else:
             raise exc.BackendUnsupported(
                 "cute",
