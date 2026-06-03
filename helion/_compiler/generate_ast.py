@@ -1032,6 +1032,7 @@ class GenerateAST(NodeVisitor, CodegenInterface):
                 for param in self._extra_params:
                     self.device_function.placeholder_args.add(param)
                 if CompileEnvironment.current().backend.name == "cute":
+                    from .tile_strategy import hoist_lane_invariant_chunk_recurrence
                     from .tile_strategy import (
                         interchange_lane_outside_serial_reductions,
                     )
@@ -1055,6 +1056,13 @@ class GenerateAST(NodeVisitor, CodegenInterface):
                     # rewrote so no ``_helion_lane_reduce`` call leaks into the
                     # emitted kernel.
                     self.device_function.body = restore_unprocessed_lane_reduce_markers(
+                        list(self.device_function.body)
+                    )
+                    # Restructure chunked-recurrence ``for chunk: for lane:``
+                    # nests whose matmul ``dot_acc`` running-sum needs the
+                    # lane-invariant rescale / chunk-entry stores / final combine
+                    # hoisted to run once per chunk (gdn_fwd_h).
+                    self.device_function.body = hoist_lane_invariant_chunk_recurrence(
                         list(self.device_function.body)
                     )
                 self.device_function.dead_code_elimination()

@@ -179,6 +179,118 @@ def _cute_acc_is_rescaled_loop_carried(acc_node: object) -> bool:
     return False
 
 
+def _node_args_iter(node: object) -> list[object]:
+    """Flatten a node's args (including list/tuple-nested args) to a list."""
+    out: list[object] = []
+    if not hasattr(node, "args"):
+        return out
+    for arg in node.args:  # type: ignore[attr-defined]
+        if isinstance(arg, (list, tuple)):
+            out.extend(arg)
+        else:
+            out.append(arg)
+    return out
+
+
+def _cute_k_block_varying_nodes(graph: object, k_block_id: int) -> set[object]:
+    """Return the fx nodes whose value varies along the K-contraction tile.
+
+    The within-K-tile per-element index for block ``k_block_id`` is the
+    ``_get_symnode('block_size_{k_block_id}')`` node (used directly as a load
+    index) and any ``tile_index`` / ``tile_id`` taken over it.  Every fx value
+    transitively computed from one of those seeds varies as the lane / K
+    contraction index advances.  ``acc`` rescales that touch this set are
+    lane-VARYING (flash-attention's ``alpha``); rescales that avoid it are
+    lane-INVARIANT (GDN's per-chunk decay, which indexes ``g`` by the chunk
+    boundary, not the within-chunk position).
+    """
+    import torch.fx
+
+    from ...language import _tracing_ops
+
+    if not isinstance(graph, torch.fx.Graph):
+        return set()
+
+    block_size_name = f"block_size_{k_block_id}"
+    seeds: set[torch.fx.Node] = set()
+    for node in graph.nodes:
+        if node.op != "call_function":
+            continue
+        if (
+            node.target is _tracing_ops._get_symnode
+            and node.args
+            and node.args[0] == block_size_name
+        ):
+            seeds.add(node)
+    # Forward-propagate: any node consuming a varying value also varies.  This
+    # also captures the ``tile_index`` / ``tile_id`` taken over the K block-size
+    # symnode (still the within-tile index) and everything downstream.
+    varying: set[torch.fx.Node] = set(seeds)
+    changed = True
+    while changed:
+        changed = False
+        for node in graph.nodes:
+            if node in varying or node.op != "call_function":
+                continue
+            for arg in _node_args_iter(node):
+                if isinstance(arg, torch.fx.Node) and arg in varying:
+                    varying.add(node)
+                    changed = True
+                    break
+    return cast("set[object]", varying)
+
+
+def _cute_rescale_is_lane_invariant(acc_node: object, k_block_id: int | None) -> bool:
+    """Return True when ``acc``'s rescale does NOT depend on the K-contraction
+    tile index (lane-invariant rescale).
+
+    Only meaningful when ``acc`` is a rescaled loop-carried accumulator (see
+    ``_cute_acc_is_rescaled_loop_carried``).  GDN's chunk recurrence multiplies
+    the accumulator by a per-chunk decay (``b_h *= exp(g[..., chunk_last]))``
+    that is constant across the within-chunk / lane index, so the cross-lane
+    ``dot_acc`` running sum stays correct (the rescale factors out of the sum).
+    Flash-attention's ``acc = acc * alpha`` instead rescales by ``alpha``, which
+    is derived from the per-K-tile scores, so it is lane-varying and the
+    per-iteration update must be kept.
+    """
+    import torch.fx
+
+    from ...language._tracing_ops import _new_var
+
+    if k_block_id is None or not isinstance(acc_node, torch.fx.Node):
+        return False
+
+    graph = acc_node.graph
+    varying = _cute_k_block_varying_nodes(graph, k_block_id)
+    if not varying:
+        # No identifiable K-tile index node: be conservative and treat the
+        # rescale as lane-varying (keep the existing per-iteration behavior).
+        return False
+
+    # Walk the rescale subgraph feeding ``acc_node``.  Stop at the loop-carried
+    # phi (``_new_var`` of a placeholder) — the phi carries the running value
+    # and is not part of the rescale dependency we are classifying.
+    seen: set[torch.fx.Node] = set()
+    stack: list[torch.fx.Node] = [acc_node]
+    while stack:
+        node = stack.pop()
+        if node in seen:
+            continue
+        seen.add(node)
+        if len(seen) > 1024:
+            return False  # too large to analyze safely -> conservative
+        if node in varying:
+            return False  # rescale touches a K-varying value -> lane-varying
+        if node.op == "call_function" and node.target is _new_var:
+            continue  # loop-carried phi: do not recurse past it
+        if node.op != "call_function":
+            continue
+        for arg in _node_args_iter(node):
+            if isinstance(arg, torch.fx.Node):
+                stack.append(arg)
+    return True
+
+
 def _cast_operand_to_f32(
     term: ast.AST, dtype: torch.dtype | None, *, is_computed_fp8: bool
 ) -> ast.AST:
@@ -615,10 +727,20 @@ def _emit_cute_matmul(
         # phi carries the running sum) by skipping the ``dot_acc`` path.  A
         # loop-invariant accumulator (e.g. a standalone ``addmm`` bias) keeps
         # ``dot_acc`` so the per-lane products are summed before the bias add.
+        #
+        # EXCEPTION: a *lane-invariant* rescale (GDN's chunk recurrence
+        # ``b_h *= decay`` where ``decay`` depends only on the chunk, not the
+        # within-chunk / lane index) factors out of the cross-lane sum:
+        # ``sum_c (b_h*decay + p_k[c]*b_v[c]) over c`` is wrong, but the
+        # mathematically intended update ``b_h = b_h*decay + sum_c p_k[c]*b_v[c]``
+        # is exactly what the ``dot_acc`` path produces once the AST post-pass
+        # hoists the rescale + final add out of the lane loop.  Keep ``dot_acc``
+        # in that case; only flash-attention's lane-varying rescale falls back.
         if (
             lane_var is not None
             and acc is not None
             and _cute_acc_is_rescaled_loop_carried(acc_node)
+            and not _cute_rescale_is_lane_invariant(acc_node, k_block_id)
         ):
             lane_var = None
         if lane_var is not None:
