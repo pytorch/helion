@@ -7,9 +7,13 @@ from typing import TYPE_CHECKING
 from typing import Any
 from typing import cast
 
+from ...autotuner.config_fragment import EnumFragment
 from ...runtime.config import Config
+from .common import REDUCTION_TARGET_NAMES
 from .common import clamp_block_size_targets
+from .common import is_canonical_row_reduction
 from .common import matches_hardware
+from .common import op_name_parts
 from .registry import AutotunerHeuristic
 
 if TYPE_CHECKING:
@@ -245,3 +249,86 @@ class TritonB200MatmulHeuristic(AutotunerHeuristic):
         device_ir: DeviceIR,
     ) -> Config | None:
         return _seed_config_for_config_spec(env.config_spec)
+
+
+class TritonSplitJoinRotateHeuristic(AutotunerHeuristic):
+    """Seed all-ones ``block_sizes`` for split/join rotate kernels (rope).
+
+    These kernels load a large untiled inner slab per program, so tiling any
+    outer dim past 1 only wastes work and overflows Triton's block-numel cap.
+    Detected by ``hl.split`` + ``hl.join`` with no matmul and no reduction op.
+    """
+
+    name = "triton_split_join_rotate"
+    backend = "triton"
+
+    @classmethod
+    def is_eligible(cls, env: CompileEnvironment, device_ir: DeviceIR) -> bool:
+        # A GEMM (even fused) is not a rope-style rotate.
+        if env.config_spec.matmul_facts:
+            return False
+        if not env.config_spec.block_sizes:
+            return False
+        # Local import avoids a circular import at module load
+        # (runtime.kernel -> autotuner_heuristics -> helion.language).
+        from ...language import join as hl_join
+        from ...language import split as hl_split
+
+        saw_split = False
+        saw_join = False
+        for graph_info in device_ir.graphs:
+            for node in graph_info.graph.nodes:
+                if node.op != "call_function":
+                    continue
+                target = node.target
+                if target is hl_split:
+                    saw_split = True
+                elif target is hl_join:
+                    saw_join = True
+                elif op_name_parts(target) & REDUCTION_TARGET_NAMES:
+                    # Fused reduction → not a pure rotate; keep its own tiling.
+                    return False
+        return saw_split and saw_join
+
+    @classmethod
+    def get_seed_config(cls, env: CompileEnvironment, device_ir: DeviceIR) -> Config:
+        return Config(block_sizes=[1] * len(env.config_spec.block_sizes))
+
+
+# Triton analog of ``CuteReductionTileHeuristic``.
+class TritonReductionTileHeuristic(AutotunerHeuristic):
+    """Seed the "one row per program, persistent reduction" config for reductions.
+
+    For canonical row reductions (softmax, rms_norm, layer_norm, cross_entropy)
+    LFBO converges on the same family across widths; this supplies it as a
+    search seed (a starting point, not a forced config):
+    ``block_sizes=[1]`` (one row per program), ``reduction_loops=[None]`` (a
+    single persistent pass, not the looped family the LLM cold-guesses), and
+    ``load_eviction_policies=['last']`` where the backend supports it. Gated by
+    ``is_canonical_row_reduction``, shared with ``CuteReductionTileHeuristic``.
+    """
+
+    name = "triton_reduction_tile"
+    backend = "triton"
+
+    @classmethod
+    def is_eligible(cls, env: CompileEnvironment, device_ir: DeviceIR) -> bool:
+        return is_canonical_row_reduction(env)
+
+    @classmethod
+    def get_seed_config(cls, env: CompileEnvironment, device_ir: DeviceIR) -> Config:
+        spec = env.config_spec
+        seed: dict[str, Any] = {
+            "block_sizes": [1],
+            "reduction_loops": [None],
+        }
+        # Emit 'last' only where the backend supports it; backends that restrict
+        # eviction to ("",) keep the spec default so the seed stays valid.
+        eviction = spec.load_eviction_policies
+        if (
+            eviction.length
+            and isinstance(eviction.inner, EnumFragment)
+            and "last" in eviction.inner.choices
+        ):
+            seed["load_eviction_policies"] = ["last"] * eviction.length
+        return Config(**seed)

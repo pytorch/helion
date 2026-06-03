@@ -10,7 +10,9 @@ import helion
 from helion._compiler.autotuner_heuristics import compiler_seed_configs
 from helion._compiler.autotuner_heuristics.cute import CuteTcgen05ClusterM2Heuristic
 from helion._compiler.autotuner_heuristics.registry import AutotunerHeuristic
+from helion._compiler.autotuner_heuristics.triton import TritonReductionTileHeuristic
 from helion._compiler.autotuner_heuristics.triton import TritonSkinnyGemmHeuristic
+from helion._compiler.autotuner_heuristics.triton import TritonSplitJoinRotateHeuristic
 from helion._compiler.backend import TritonBackend
 from helion._compiler.cute.strategies import TCGEN05_LAYOUT_OVERRIDES_D_STORE_BOX_N_KEY
 from helion._compiler.cute.strategies import TCGEN05_LAYOUT_OVERRIDES_EPI_TILE_M_KEY
@@ -125,6 +127,7 @@ from helion.autotuner import IntegerFragment
 from helion.autotuner.config_spec import BlockSizeSpec
 from helion.autotuner.config_spec import ConfigSpec
 from helion.autotuner.config_spec import MatmulFact
+from helion.autotuner.config_spec import ReductionLoopSpec
 from helion.autotuner.pattern_search import InitialPopulationStrategy
 from helion.autotuner.pattern_search import PatternSearch
 import helion.language as hl
@@ -612,6 +615,213 @@ class TestTritonSkinnyGemmHeuristic(TestCase):
                         TritonSkinnyGemmHeuristic.name,
                         bound.config_spec.autotuner_heuristics,
                     )
+
+
+class TestTritonSplitJoinRotateHeuristic(TestCase):
+    """Rope split/join "rotate" heuristic: seeds all-ones ``block_sizes`` and
+    fires only for a split/join rotate kernel, not a plain elementwise one.
+    """
+
+    def test_seed_config_is_all_ones(self) -> None:
+        spec = ConfigSpec(backend=TritonBackend())
+        spec.block_sizes.append(BlockSizeSpec(block_id=0, size_hint=2048))
+        spec.block_sizes.append(BlockSizeSpec(block_id=1, size_hint=2048))
+        env = MagicMock()
+        env.config_spec = spec
+        config = TritonSplitJoinRotateHeuristic.get_seed_config(env, MagicMock())
+        self.assertEqual(config.config["block_sizes"], [1, 1])
+
+    @onlyBackends(["triton"])
+    @skipIfRefEager("Compiler heuristics are not collected in ref eager mode")
+    def test_fires_for_rope_not_elementwise(self) -> None:
+        @helion.kernel(backend="triton")
+        def rope_like(
+            q: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
+        ) -> torch.Tensor:
+            batch, heads, seq_len, head_dim = q.size()
+            half_dim = head_dim // 2
+            out = torch.empty_like(q)
+            for tile_b, tile_t in hl.tile([batch, seq_len]):
+                cos_pair = (
+                    cos[tile_b, tile_t, :]
+                    .to(torch.float32)
+                    .reshape([tile_b, tile_t, 2, half_dim])
+                    .permute(0, 1, 3, 2)
+                )
+                cos_first, cos_second = hl.split(cos_pair)
+                q_pair = (
+                    q[tile_b, :, tile_t, :]
+                    .to(torch.float32)
+                    .reshape([tile_b, heads, tile_t, 2, half_dim])
+                    .permute(0, 1, 2, 4, 3)
+                )
+                q_first, q_second = hl.split(q_pair)
+                out[tile_b, :, tile_t, :] = (
+                    hl.join(
+                        q_first * cos_first[:, None, :, :],
+                        q_second * cos_second[:, None, :, :],
+                    )
+                    .permute(0, 1, 2, 4, 3)
+                    .reshape([tile_b, heads, tile_t, head_dim])
+                    .to(out.dtype)
+                )
+            return out
+
+        @helion.kernel(backend="triton")
+        def elementwise(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile_m, tile_n in hl.tile(x.size()):
+                out[tile_m, tile_n] = x[tile_m, tile_n] * y[tile_m, tile_n]
+            return out
+
+        q = torch.randn(2, 8, 256, 64, device=DEVICE, dtype=HALF_DTYPE)
+        angles = torch.randn(2, 256, 64, device=DEVICE, dtype=HALF_DTYPE)
+        rope = rope_like.bind((q, torch.cos(angles), torch.sin(angles)))
+        self.assertTrue(
+            TritonSplitJoinRotateHeuristic.is_eligible(
+                rope.env, rope.host_function.device_ir
+            )
+        )
+        seed = TritonSplitJoinRotateHeuristic.get_seed_config(
+            rope.env, rope.host_function.device_ir
+        )
+        self.assertEqual(
+            seed.config["block_sizes"], [1] * len(rope.config_spec.block_sizes)
+        )
+
+        xy = (
+            torch.randn(512, 512, device=DEVICE, dtype=HALF_DTYPE),
+            torch.randn(512, 512, device=DEVICE, dtype=HALF_DTYPE),
+        )
+        ew = elementwise.bind(xy)
+        self.assertFalse(
+            TritonSplitJoinRotateHeuristic.is_eligible(
+                ew.env, ew.host_function.device_ir
+            )
+        )
+
+
+class TestTritonReductionTileHeuristic(TestCase):
+    """Triton row-reduction heuristic: seeds the "one row per program,
+    persistent reduction" skeleton, fires only for a canonical row reduction,
+    and its persistent seed survives flatten/unflatten (the config_spec
+    sentinel round-trip fix).
+    """
+
+    def _reduction_spec(self, *, reduction_size_hint: int) -> ConfigSpec:
+        spec = ConfigSpec(backend=TritonBackend())
+        spec.block_sizes.append(BlockSizeSpec(block_id=0, size_hint=1024))
+        spec.reduction_loops.append(
+            ReductionLoopSpec(block_id=1, size_hint=reduction_size_hint)
+        )
+        return spec
+
+    def test_seed_is_persistent_one_row(self) -> None:
+        # The structural seed: one row per program + persistent reduction. Warp
+        # count is left to the autotuner, not seeded.
+        env = MagicMock()
+        env.config_spec = self._reduction_spec(reduction_size_hint=1024)
+        seed = TritonReductionTileHeuristic.get_seed_config(env, MagicMock())
+        self.assertEqual(seed.config["block_sizes"], [1])
+        self.assertEqual(seed.config["reduction_loops"], [None])
+        self.assertNotIn("num_warps", seed.config)
+
+    def test_seed_broadcasts_last_eviction_over_load_slots(self) -> None:
+        # Streaming reductions want 'last' eviction, broadcast over the spec's
+        # load slots. Build the fragment explicitly so the test does not depend
+        # on the host backend's eviction choices.
+        from helion.autotuner.config_fragment import EnumFragment
+        from helion.autotuner.config_fragment import ListOf
+
+        env = MagicMock()
+        spec = self._reduction_spec(reduction_size_hint=1024)
+        spec.load_eviction_policies = ListOf(
+            EnumFragment(choices=("", "first", "last")), length=4
+        )
+        env.config_spec = spec
+        seed = TritonReductionTileHeuristic.get_seed_config(env, MagicMock())
+        self.assertEqual(
+            seed.config["load_eviction_policies"], ["last", "last", "last", "last"]
+        )
+
+    def test_persistent_seed_round_trips_through_config_generation(self) -> None:
+        # reduction_loops=[None] (persistent) MUST survive flatten/unflatten. For
+        # a wide reduction (size_hint 32000) a sentinel < size_hint would decode
+        # back to the SLOW looped family this heuristic exists to avoid; the
+        # config_spec fix encodes None as the fragment's ``high`` (>= size_hint).
+        from helion.autotuner.config_generation import ConfigGeneration
+
+        env = MagicMock()
+        spec = self._reduction_spec(reduction_size_hint=32000)
+        env.config_spec = spec
+        seed = TritonReductionTileHeuristic.get_seed_config(env, MagicMock())
+        spec.compiler_seed_configs = [seed]
+        pairs = ConfigGeneration(spec).seed_flat_config_pairs()
+        self.assertEqual(len(pairs), 1)
+        _flat, normalized = pairs[0]
+        self.assertEqual(normalized.config["reduction_loops"], [None])
+
+    def test_not_eligible_without_single_reduction_tile(self) -> None:
+        env = MagicMock()
+        # No reduction loop -> not a reduction.
+        spec = ConfigSpec(backend=TritonBackend())
+        spec.block_sizes.append(BlockSizeSpec(block_id=0, size_hint=1024))
+        env.config_spec = spec
+        self.assertFalse(TritonReductionTileHeuristic.is_eligible(env, MagicMock()))
+        # A matmul fact disqualifies even a 1-tile/1-reduction shape.
+        spec_mm = self._reduction_spec(reduction_size_hint=1024)
+        spec_mm.matmul_facts = [MagicMock()]
+        env.config_spec = spec_mm
+        self.assertFalse(TritonReductionTileHeuristic.is_eligible(env, MagicMock()))
+
+    @onlyBackends(["triton"])
+    @skipIfRefEager("Compiler heuristics are not collected in ref eager mode")
+    def test_fires_for_reduction_not_matmul(self) -> None:
+        @helion.kernel(backend="triton")
+        def row_reduction(x: torch.Tensor) -> torch.Tensor:
+            m, _ = x.size()
+            out = torch.empty([m], dtype=x.dtype, device=x.device)
+            for tile_m in hl.tile(m):
+                row = x[tile_m, :]
+                shifted = row - torch.amax(row, dim=-1, keepdim=True)
+                out[tile_m] = torch.log(torch.sum(torch.exp(shifted), dim=-1))
+            return out
+
+        @helion.kernel(backend="triton")
+        def matmul(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = acc.to(x.dtype)
+            return out
+
+        red = row_reduction.bind(
+            (torch.randn(1024, 1024, device=DEVICE, dtype=HALF_DTYPE),)
+        )
+        self.assertTrue(
+            TritonReductionTileHeuristic.is_eligible(
+                red.env, red.host_function.device_ir
+            )
+        )
+        seed = TritonReductionTileHeuristic.get_seed_config(
+            red.env, red.host_function.device_ir
+        )
+        self.assertEqual(seed.config["block_sizes"], [1])
+        self.assertEqual(seed.config["reduction_loops"], [None])
+
+        mm = matmul.bind(
+            (
+                torch.randn(256, 256, device=DEVICE, dtype=HALF_DTYPE),
+                torch.randn(256, 256, device=DEVICE, dtype=HALF_DTYPE),
+            )
+        )
+        self.assertFalse(
+            TritonReductionTileHeuristic.is_eligible(mm.env, mm.host_function.device_ir)
+        )
 
 
 class TestCuteTcgen05ClusterM2Heuristic(TestCase):

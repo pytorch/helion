@@ -11,7 +11,9 @@ from .cute import CuteTileVecHeuristic
 from .cute import CuteTileVecWarpPerRowHeuristic
 from .cute import CuteTileVecWarpReduceHeuristic
 from .triton import TritonB200MatmulHeuristic
+from .triton import TritonReductionTileHeuristic
 from .triton import TritonSkinnyGemmHeuristic
+from .triton import TritonSplitJoinRotateHeuristic
 
 if TYPE_CHECKING:
     from ...runtime.config import Config
@@ -29,7 +31,12 @@ HEURISTICS_BY_BACKEND: dict[str, tuple[AutotunerHeuristicType, ...]] = {
         CuteTileVecWarpReduceHeuristic,
         CuteTileVecWarpPerRowHeuristic,
     ),
-    "triton": (TritonSkinnyGemmHeuristic, TritonB200MatmulHeuristic),
+    "triton": (
+        TritonSkinnyGemmHeuristic,
+        TritonB200MatmulHeuristic,
+        TritonSplitJoinRotateHeuristic,
+        TritonReductionTileHeuristic,
+    ),
 }
 
 log: logging.Logger = logging.getLogger(__name__)
