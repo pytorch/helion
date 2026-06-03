@@ -815,23 +815,28 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
             for config in configs
             if config.config["tcgen05_cluster_m"] == 2
         ]
-        self.assertEqual(len(seeded), 1)
-        seed = seeded[0]
-        self.assertEqual(
-            seed["block_sizes"][:3],
-            [
-                TCGEN05_TWO_CTA_BLOCK_M,
-                TCGEN05_TWO_CTA_BLOCK_N,
-                expected_block_k,
-            ],
-        )
-        self.assertEqual(
-            seed["indexing"],
-            ["tensor_descriptor"] * expected_indexing_length,
-        )
-        self.assertEqual(seed["pid_type"], "persistent_interleaved")
-        self.assertEqual(seed["tcgen05_num_epi_warps"], 4)
-        return seed
+        # For an FFI-eligible 16-bit shape BOTH the DEFAULT-layout cluster_m=2
+        # heuristic and the generalized TVM-FFI direct-entry heuristic emit a
+        # cluster_m=2 seed; the FFI search projection then normalizes both onto
+        # the same validated CtaGroup.TWO envelope. Require at least one and
+        # check that every cluster_m=2 seed matches that envelope.
+        self.assertGreaterEqual(len(seeded), 1)
+        for seed in seeded:
+            self.assertEqual(
+                seed["block_sizes"][:3],
+                [
+                    TCGEN05_TWO_CTA_BLOCK_M,
+                    TCGEN05_TWO_CTA_BLOCK_N,
+                    expected_block_k,
+                ],
+            )
+            self.assertEqual(
+                seed["indexing"],
+                ["tensor_descriptor"] * expected_indexing_length,
+            )
+            self.assertEqual(seed["pid_type"], "persistent_interleaved")
+            self.assertEqual(seed["tcgen05_num_epi_warps"], 4)
+        return seeded[0]
 
     def _assert_cute_tcgen05_edge_k_tail_seed_overrides(
         self,
@@ -1158,7 +1163,10 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
         self.assertIsInstance(no_budget_ab_stages_fragment, IntegerFragment)
         self.assertEqual(no_budget_ab_stages_fragment.high, 2)
 
-        # An fp16 matmul is NOT eligible for the FFI seed (bf16-only).
+        # An fp16 matmul IS eligible for the FFI seed: the direct-entry TMA
+        # descriptors / SMEM layout / epilogue tile are dtype-general for any
+        # 16-bit operand, so fp16 (matching operand dtypes) at a structurally
+        # valid shape is admitted exactly like bf16. Only fp32 stays excluded.
         fp16_args = (
             torch.empty([1024, 1024], device=DEVICE, dtype=torch.float16),
             torch.empty([1024, 4096], device=DEVICE, dtype=torch.float16),
@@ -1168,12 +1176,49 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
             patch("helion.language.matmul_ops._cuda_num_sms_or_zero", return_value=132),
         ):
             fp16_bound = cute_matmul_mma.bind(fp16_args)
-        self.assertFalse(
+        self.assertTrue(
             fp16_bound.config_spec._tcgen05_full_tile_direct_entry_seed_eligible()
         )
-        self.assertIsNone(
+        self.assertIsNotNone(
             fp16_bound.config_spec._tcgen05_full_tile_direct_entry_seed_config()
         )
+
+    @onlyBackends(["cute"])
+    def test_cute_tcgen05_full_tile_ffi_seed_rejects_structurally_invalid_shape(
+        self,
+    ) -> None:
+        # The structural shape guard for the generalized FFI seed lives entirely
+        # in ``_tcgen05_full_tile_direct_entry_seed_eligible`` (the per-shape
+        # TargetN codegen gate and the runtime direct-entry validator were
+        # removed). A shape whose N is not a multiple of the 256 CtaGroup.TWO
+        # CTA tile is not a full-tile matmul, so the seed must be ineligible and
+        # emit no config even though the dtype is a supported 16-bit type.
+        @helion.kernel(backend="cute")
+        def cute_matmul_mma(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = acc.to(x.dtype)
+            return out
+
+        # N = 4080 is not divisible by the 256 CTA tile -> edge tile, not a
+        # full-tile CtaGroup.TWO matmul.
+        invalid_args = (
+            torch.empty([4096, 4096], device=DEVICE, dtype=torch.bfloat16),
+            torch.empty([4096, 4080], device=DEVICE, dtype=torch.bfloat16),
+        )
+        with (
+            patch_cute_mma_support(),
+            patch("helion.language.matmul_ops._cuda_num_sms_or_zero", return_value=132),
+        ):
+            invalid_bound = cute_matmul_mma.bind(invalid_args)
+        spec = invalid_bound.config_spec
+        self.assertFalse(spec._tcgen05_full_tile_direct_entry_seed_eligible())
+        self.assertIsNone(spec._tcgen05_full_tile_direct_entry_seed_config())
 
     @onlyBackends(["cute"])
     def test_cute_tcgen05_cluster_m2_edge_k_tail_bk_requires_tail(self) -> None:
@@ -2605,6 +2650,17 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
         # (no projection claims it — plain matmul, no aux) is demoted to c=2 so
         # tuning never reaches the raw ptxas overflow. ab=3 alone fits, so the
         # ab-stages gate keeps it — only c is demoted.
+        #
+        # Exercise the c-stages admission gate (``_fix_c_stages_search_config``)
+        # DIRECTLY rather than through the full ``fix_search_config`` chain.
+        # Since the generalized TVM-FFI direct-entry seed is now eligible for
+        # ANY structurally-valid 16-bit shape (including fp16 6144³), the FFI
+        # projection in ``fix_search_config`` would otherwise claim every
+        # cluster_m=2 candidate and project it onto the validated (ab=3, c=2)
+        # EXPLICIT_EPI_TILE envelope — shadowing the DEFAULT-layout c-stages
+        # gate. Calling the gate directly keeps the test focused on the
+        # c-stages budget demotion it is meant to validate.
+        tcfg.search_enabled = True
         ab3_c4 = helion.Config(
             block_sizes=[256, 256, 128],
             indexing=["tensor_descriptor", "tensor_descriptor", "tensor_descriptor"],
@@ -2618,8 +2674,8 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
             tcgen05_persistence_model="static_persistent",
         )
         # The budget is already recorded in the constraints from bind (mocked to
-        # B200 above), so ``fix_search_config`` is deterministic here.
-        tcfg.fix_search_config(ab3_c4.config)
+        # B200 above), so the gate is deterministic here.
+        tcfg._fix_c_stages_search_config(ab3_c4.config)
         self.assertEqual(ab3_c4.config["tcgen05_ab_stages"], 3)
         self.assertEqual(ab3_c4.config["tcgen05_c_stages"], 2)
         # ab=2 + c=4 (fits) is preserved by the gate.
@@ -2635,7 +2691,7 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
             tcgen05_strategy=Tcgen05Strategy.ROLE_LOCAL_MONOLITHIC.value,
             tcgen05_persistence_model="static_persistent",
         )
-        tcfg.fix_search_config(ab2_c4.config)
+        tcfg._fix_c_stages_search_config(ab2_c4.config)
         self.assertEqual(ab2_c4.config["tcgen05_c_stages"], 4)
         # Fail CLOSED: with no recorded SMEM budget (non-B200 / CPU host, where
         # ``ab_stages_three_search_constraints`` is None) a sampled c=4 cannot be
@@ -2653,7 +2709,7 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
             tcgen05_strategy=Tcgen05Strategy.ROLE_LOCAL_MONOLITHIC.value,
             tcgen05_persistence_model="static_persistent",
         )
-        tcfg.fix_search_config(ab2_c4_no_budget.config)
+        tcfg._fix_c_stages_search_config(ab2_c4_no_budget.config)
         self.assertEqual(ab2_c4_no_budget.config["tcgen05_c_stages"], 2)
 
     @onlyBackends(["cute"])
@@ -2988,18 +3044,23 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
             bound.config_spec.autotuner_heuristics,
         )
 
+        # fp16 4096³ is now FFI-eligible, so the leading compiler seed is the
+        # generalized TVM-FFI direct-entry cluster_m=2 seed (previously fp16 was
+        # bf16-only for the FFI seed, so the leading seed was the cluster_m=1
+        # universal default). The DEFAULT-layout cluster_m=2 seed is also
+        # emitted; both normalize onto the validated CtaGroup.TWO envelope.
         config_gen = bound.config_spec.create_config_generation()
         zero_flat = config_gen.random_population_flat(0)
         self.assertEqual(len(zero_flat), 1)
         zero_config = config_gen.unflatten(zero_flat[0])
-        self.assertEqual(zero_config.config["tcgen05_cluster_m"], 1)
+        self.assertEqual(zero_config.config["tcgen05_cluster_m"], 2)
         one_flat = config_gen.random_population_flat(1)
         self.assertEqual(len(one_flat), 1)
         one_config = config_gen.unflatten(one_flat[0])
-        self.assertEqual(one_config.config["tcgen05_cluster_m"], 1)
+        self.assertEqual(one_config.config["tcgen05_cluster_m"], 2)
         one_config_population = config_gen.random_population(1)
         self.assertEqual(len(one_config_population), 1)
-        self.assertEqual(one_config_population[0].config["tcgen05_cluster_m"], 1)
+        self.assertEqual(one_config_population[0].config["tcgen05_cluster_m"], 2)
         self._assert_cute_tcgen05_cluster_m2_seeded(
             config_gen.random_population(2),
             expected_block_k=128,
@@ -3037,9 +3098,11 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
                 search.config_gen.unflatten(flat)
                 for flat in search._generate_initial_population_flat()
             ]
-        # Future heuristics may add more compiler seeds; this test only
-        # requires the CuTe cluster-m2 seed to be present.
-        self.assertGreaterEqual(len(configs), 2)
+        # This test only requires the CuTe cluster-m2 seed to be present. For an
+        # FFI-eligible shape the DEFAULT and TVM-FFI cluster_m=2 seeds normalize
+        # to the same validated config, so the dedup'd FROM_BEST_AVAILABLE
+        # initial population can collapse to a single distinct config.
+        self.assertGreaterEqual(len(configs), 1)
         self._assert_cute_tcgen05_cluster_m2_seeded(
             configs,
             expected_block_k=128,
@@ -3077,8 +3140,12 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
             for config in configs
             if config.config["tcgen05_cluster_m"] == 2
         ]
-        self.assertEqual(len(seeded), 1)
-        self.assertEqual(
-            len(seeded[0]["indexing"]),
-            bound.config_spec.indexing.length,
-        )
+        # The bias epilogue is an FFI-supported family, so both the DEFAULT and
+        # the generalized TVM-FFI cluster_m=2 seeds are emitted; each must carry
+        # an indexing list matching the live spec's (wider-than-3) length.
+        self.assertGreaterEqual(len(seeded), 1)
+        for seed in seeded:
+            self.assertEqual(
+                len(seed["indexing"]),
+                bound.config_spec.indexing.length,
+            )

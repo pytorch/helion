@@ -18,7 +18,6 @@ if TYPE_CHECKING:
     from .cute_mma import _Tcgen05AuxPipelinePlan
     from .cute_mma import _Tcgen05SchedPipelinePlan
     from .tcgen05_lifecycle import Tcgen05LifecycleContext
-    from .tcgen05_pure_matmul import Tcgen05PureClcSchedulerObject
     from .tcgen05_pure_matmul import Tcgen05PureMatmulObjectModel
 
 
@@ -296,7 +295,6 @@ class CuteDeviceFunctionState:
         # ownership does not leak into the generic DeviceFunction body.
         self.sched_pipeline_plan: _Tcgen05SchedPipelinePlan | None = None
         self.aux_pipeline_plan: _Tcgen05AuxPipelinePlan | None = None
-        self.pure_clc_scheduler_object: Tcgen05PureClcSchedulerObject | None = None
         self._per_tile_stmt_ids: set[int] = set()
         self._post_loop_stmt_ids: set[int] = set()
         self._tma_load_role_stmt_ids: set[int] = set()
@@ -416,15 +414,6 @@ class CuteDeviceFunctionState:
         self, plan: _Tcgen05SchedPipelinePlan
     ) -> None:
         self.sched_pipeline_plan = plan
-
-    def register_tcgen05_pure_clc_scheduler_object(
-        self, obj: Tcgen05PureClcSchedulerObject
-    ) -> None:
-        if self.pure_clc_scheduler_object is not None:
-            raise exc.BackendUnsupported(
-                "cute", "tcgen05 pure CLC scheduler object registered more than once"
-            )
-        self.pure_clc_scheduler_object = obj
 
     def register_tcgen05_aux_pipeline_plan(self, plan: _Tcgen05AuxPipelinePlan) -> None:
         self.aux_pipeline_plan = plan

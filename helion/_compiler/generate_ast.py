@@ -25,7 +25,6 @@ from .ast_read_writes import dead_assignment_elimination
 from .ast_read_writes import dead_expression_elimination
 from .ast_read_writes import definitely_does_not_have_side_effects
 from .compile_environment import CompileEnvironment
-from .cute.tcgen05_direct_entry import build_target1_direct_entry_source
 from .device_function import ConstExprArg
 from .device_function import DeviceFunction
 from .helper_function import CodegenInterface
@@ -79,7 +78,6 @@ class GenerateAST(NodeVisitor, CodegenInterface):
         self.codegen_graphs = func.device_ir.build_codegen_graphs(config)
         self.host_statements: list[ast.AST] = []
         self.module_statements: list[ast.stmt] = []
-        self.cute_direct_entry_plans: list[dict[str, object]] = []
         self.cute_wrapper_plans: list[dict[str, object]] = []
         self.cute_uses_matmul: bool = False
         self.statements_stack: list[list[ast.AST]] = [self.host_statements]
@@ -1342,68 +1340,24 @@ def generate_ast(
                 resolved_plans: list[dict[str, object]] = []
                 for plan in plans:
                     resolved = dict(plan)
-                    # T2's bias tensor is plumbed via ``bias_name``
-                    # alongside the lhs/rhs/c/d names; the
-                    # ``key[:-5] + "_idx"`` substring rewrite turns each
-                    # one into a positional index resolved against the
-                    # device function's sorted-arg ordering so the
-                    # runtime validator and the direct-entry source
-                    # builder can identify the 4th tensor arg.
+                    # The ``key[:-5] + "_idx"`` substring rewrite turns each
+                    # tensor name into a positional index resolved against the
+                    # device function's sorted-arg ordering so the runtime
+                    # launcher can identify the tensor args.
                     for key in (
                         "lhs_name",
                         "rhs_name",
                         "c_name",
                         "d_name",
-                        "bias_name",
                     ):
                         if key in resolved:
                             resolved[key[:-5] + "_idx"] = launcher_arg_positions[
                                 str(resolved.pop(key))
                             ]
-                    # P1: pin the T2 direct-entry ABI ordering at codegen
-                    # time. The runtime validator and the runtime-built
-                    # source builder both assume the resolved indices are
-                    # ``(0, 1, 2)`` for T1/T3/T4/T5 and ``(0, 1, 2, 3)``
-                    # for T2 (lhs, rhs, output, bias). If the device
-                    # function's sorted-arg ordering ever produces a
-                    # different layout (e.g. ``bias_idx=2, d_idx=3``),
-                    # this assertion fires at codegen instead of at
-                    # launch where the wrappers would already have been
-                    # emitted against the wrong ordering.
-                    if resolved.get("kind") == "tcgen05_target1_direct_entry":
-                        plan_indices = (
-                            resolved.get("lhs_idx"),
-                            resolved.get("rhs_idx"),
-                            resolved.get("d_idx"),
-                        )
-                        bias_idx = resolved.get("bias_idx")
-                        if bias_idx is not None:
-                            plan_indices = (*plan_indices, bias_idx)
-                            expected_indices: tuple[int, ...] = (0, 1, 2, 3)
-                        else:
-                            expected_indices = (0, 1, 2)
-                        assert plan_indices == expected_indices, (
-                            "tcgen05 direct entry requires "
-                            f"(lhs/rhs/output{'/bias' if bias_idx is not None else ''}) "
-                            f"= {expected_indices}, got {plan_indices} "
-                            f"(launcher_arg_positions={launcher_arg_positions})"
-                        )
                     resolved_plans.append(resolved)
                 return resolved_plans
 
-            resolved_direct_entry_plans: list[dict[str, object]] = []
             resolved_wrapper_plans: list[dict[str, object]] = []
-            generated_direct_entry_defs: list[ast.stmt] = []
-            if codegen.cute_direct_entry_plans:
-                resolved_direct_entry_plans = resolve_cute_plan_arg_positions(
-                    codegen.cute_direct_entry_plans
-                )
-                final_host_statements = [
-                    statement_from_string(
-                        f"{codegen.device_function.name}._helion_cute_direct_entry_plans = {resolved_direct_entry_plans!r}"
-                    ),
-                    *final_host_statements,
-                ]
             if codegen.cute_wrapper_plans:
                 resolved_wrapper_plans = resolve_cute_plan_arg_positions(
                     codegen.cute_wrapper_plans
@@ -1421,44 +1375,6 @@ def generate_ast(
                     ),
                     *final_host_statements,
                 ]
-            # A3 (cycle-2 review): the compiler-emitted direct-entry
-            # source bakes an x-linear ``grid=(128, 1, 1)`` launch that
-            # only matches the Target 1 runtime grid. The runtime
-            # dispatch in ``helion/runtime/__init__.py`` skips it for
-            # any other grid (e.g. Target 4's ``(2, 1, 74)``), so
-            # emitting it for ``bk != 64`` produces dead code. Gate
-            # emission on the validated T1 ``bk=64`` envelope; T4 and
-            # other validated direct-entry shapes fall back to the
-            # runtime-built direct entry (``_create_cute_direct_entry``).
-            direct_entry_bk = (
-                resolved_direct_entry_plans[0].get("bk")
-                if resolved_direct_entry_plans
-                else None
-            )
-            if (
-                resolved_direct_entry_plans
-                and resolved_wrapper_plans
-                and direct_entry_bk == 64
-            ):
-                generated_direct_entry_name = (
-                    f"{codegen.device_function.name}_direct_entry"
-                )
-                generated_direct_entry_source = build_target1_direct_entry_source(
-                    function_name=generated_direct_entry_name,
-                    kernel_name=codegen.device_function.name,
-                    direct_plan=resolved_direct_entry_plans[0],
-                    wrapper_plans=resolved_wrapper_plans,
-                )
-                generated_direct_entry_defs.append(
-                    statement_from_string(generated_direct_entry_source)
-                )
-                final_host_statements = [
-                    statement_from_string(
-                        f"{codegen.device_function.name}._helion_cute_generated_direct_entry = {generated_direct_entry_name}"
-                    ),
-                    *final_host_statements,
-                ]
-
             # Assert sourceless prologue params were actually removed by DCE
             if codegen.device_function.sourceless_prologue_params:
                 remaining = codegen.device_function.sourceless_prologue_params & {
@@ -1485,7 +1401,6 @@ def generate_ast(
                 *codegen.module_statements,
                 *codegen.device_function.codegen_helper_functions(),
                 *kernel_def,
-                *generated_direct_entry_defs,
                 host_def,
                 *call_def,
                 *main_def,

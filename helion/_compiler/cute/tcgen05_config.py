@@ -84,7 +84,6 @@ from .tcgen05_constants import TCGEN05_CONSUMER_REGS_CHOICES
 from .tcgen05_constants import TCGEN05_CONSUMER_REGS_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_CUBIN_LINEINFO_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_DIAGNOSTIC_INVALID_OUTPUT_CONFIG_KEY
-from .tcgen05_constants import TCGEN05_DIRECT_ENTRY_PLAN_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_EPILOGUE_LAYOUT_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_EPILOGUE_LAYOUTS
 from .tcgen05_constants import TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY
@@ -94,8 +93,6 @@ from .tcgen05_constants import TCGEN05_LARGE_BN_PROOF_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_LARGE_BN_PROOF_PID_TYPE
 from .tcgen05_constants import TCGEN05_LARGE_BN_PROOF_STAGE_CONFIGS
 from .tcgen05_constants import TCGEN05_ONE_CTA_MAX_BLOCK_M
-from .tcgen05_constants import TCGEN05_PURE_CLC_SCHEDULER_OBJECT_CONFIG_KEY
-from .tcgen05_constants import TCGEN05_PURE_DYNAMIC_SCHEDULER_OBJECT_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_RESIDUAL_FULL_TILE_DEEP_C_STAGES
 from .tcgen05_constants import TCGEN05_SCHED_CONSUMER_WAIT_MODE_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_SCHED_CONSUMER_WAIT_MODE_NORMAL
@@ -183,12 +180,9 @@ CUTE_TCGEN05_DIAGNOSTIC_CONFIG_KEYS: frozenset[str] = frozenset(
         TCGEN05_CONSUMER_REGS_CONFIG_KEY,
         TCGEN05_CUBIN_LINEINFO_CONFIG_KEY,
         TCGEN05_DIAGNOSTIC_INVALID_OUTPUT_CONFIG_KEY,
-        TCGEN05_DIRECT_ENTRY_PLAN_CONFIG_KEY,
         TCGEN05_EPILOGUE_LAYOUT_CONFIG_KEY,
         TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY,
         TCGEN05_LARGE_BN_PROOF_CONFIG_KEY,
-        TCGEN05_PURE_CLC_SCHEDULER_OBJECT_CONFIG_KEY,
-        TCGEN05_PURE_DYNAMIC_SCHEDULER_OBJECT_CONFIG_KEY,
         TCGEN05_SCHED_CONSUMER_WAIT_MODE_CONFIG_KEY,
         TCGEN05_SCHED_STAGE_COUNT_CONFIG_KEY,
         TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY,
@@ -329,8 +323,9 @@ class CuteTcgen05Config:
         The direct-entry codegen + runtime validator build their A/B/D TMA
         descriptors from the runtime tensor shapes, so the fast launch path is
         shape-general; the constraints are purely structural: a full-tile (NOT
-        edge+K-tail) CtaGroup.TWO bf16 GEMM, the 256x256 CTA tile reachable, a
-        direct-entry-valid ``bk``, and the ``(ab=3, c=2)`` stage tuple admitted
+        edge+K-tail) CtaGroup.TWO 16-bit (bf16/fp16) GEMM, the 256x256 CTA tile
+        reachable, a direct-entry-valid ``bk``, and the ``(ab=3, c=2)`` stage
+        tuple admitted
         and SMEM-fitting. Both ``optional_fragments`` (to add the FFI search
         surface) and ``CuteTcgen05ClusterM2FfiHeuristic`` (to gate the seed) use
         this so they cannot disagree.
@@ -352,7 +347,14 @@ class CuteTcgen05Config:
         if len(facts) != 1:
             return False
         fact = facts[0]
-        if fact.lhs_dtype is not torch.bfloat16 or fact.rhs_dtype is not torch.bfloat16:
+        # The direct-entry TMA descriptors, SMEM layout, and epilogue tile are
+        # dtype-general for any 16-bit operand (the byte math keys on
+        # ``dtype_bytes``, and bf16/fp16 are both 2 bytes), so admit bf16 and
+        # fp16 with matching operand dtypes. fp32 stays excluded (no tcgen05
+        # fp32 SMEM-staged MMA path).
+        if fact.lhs_dtype is not fact.rhs_dtype:
+            return False
+        if fact.lhs_dtype not in (torch.bfloat16, torch.float16):
             return False
         bm_fragment = cast(
             "BlockSizeFragment",
@@ -416,8 +418,7 @@ class CuteTcgen05Config:
                 Tcgen05LayoutStrategy.EXPLICIT_EPI_TILE.value
             ),
             # (epi_tile_m, epi_tile_n, d_store_box_n) = (128, 32, 32) is the only
-            # explicit-epilogue subtile the direct-entry D-descriptor codegen
-            # accepts (asserted in tcgen05_direct_entry.py / cute_mma.py), so it
+            # explicit-epilogue subtile the D-descriptor codegen accepts, so it
             # is fixed for every eligible shape.
             TCGEN05_LAYOUT_OVERRIDES_EPI_TILE_M_KEY: 128,
             TCGEN05_LAYOUT_OVERRIDES_EPI_TILE_N_KEY: 32,
@@ -1726,18 +1727,6 @@ class CuteTcgen05Config:
                     ),
                 }
             )
-            if not for_search:
-                fragments[TCGEN05_DIRECT_ENTRY_PLAN_CONFIG_KEY] = BooleanFragment()
-                fragments[TCGEN05_PURE_CLC_SCHEDULER_OBJECT_CONFIG_KEY] = (
-                    BooleanFragment()
-                )
-                # Pure-dynamic scheduler-object key is in the validation
-                # surface only — user configs that set it round-trip through
-                # normalize, but the autotune ``for_search`` surface excludes
-                # it until the productive codegen lands.
-                fragments[TCGEN05_PURE_DYNAMIC_SCHEDULER_OBJECT_CONFIG_KEY] = (
-                    BooleanFragment()
-                )
         return fragments
 
     @staticmethod
@@ -1747,9 +1736,6 @@ class CuteTcgen05Config:
         return (
             config.get(TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY) is True
             or config.get(TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY) is True
-            or config.get(TCGEN05_DIRECT_ENTRY_PLAN_CONFIG_KEY) is True
-            or config.get(TCGEN05_PURE_CLC_SCHEDULER_OBJECT_CONFIG_KEY) is True
-            or config.get(TCGEN05_PURE_DYNAMIC_SCHEDULER_OBJECT_CONFIG_KEY) is True
             or (seed_enabled and config.get("tcgen05_cluster_m") == 2)
             or config.get(TCGEN05_LAYOUT_STRATEGY_CONFIG_KEY)
             == Tcgen05LayoutStrategy.EXPLICIT_EPI_TILE.value
@@ -1777,9 +1763,6 @@ class CuteTcgen05Config:
         if seed is None:
             config[TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY] = False
             config[TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY] = False
-            config[TCGEN05_DIRECT_ENTRY_PLAN_CONFIG_KEY] = False
-            config[TCGEN05_PURE_CLC_SCHEDULER_OBJECT_CONFIG_KEY] = False
-            config[TCGEN05_PURE_DYNAMIC_SCHEDULER_OBJECT_CONFIG_KEY] = False
             if (
                 config.get(TCGEN05_LAYOUT_STRATEGY_CONFIG_KEY)
                 == Tcgen05LayoutStrategy.EXPLICIT_EPI_TILE.value
@@ -1794,23 +1777,8 @@ class CuteTcgen05Config:
             ):
                 config[key] = None
             return
-        pure_clc_scheduler_requested = (
-            config.get(TCGEN05_PURE_CLC_SCHEDULER_OBJECT_CONFIG_KEY) is True
-        )
-        pure_dynamic_scheduler_requested = (
-            config.get(TCGEN05_PURE_DYNAMIC_SCHEDULER_OBJECT_CONFIG_KEY) is True
-        )
-        direct_entry_requested = (
-            config.get(TCGEN05_DIRECT_ENTRY_PLAN_CONFIG_KEY) is True
-        )
         self._clear_target1_tvm_ffi_promotion_surface(config)
         config.update(seed.config)
-        if direct_entry_requested:
-            config[TCGEN05_DIRECT_ENTRY_PLAN_CONFIG_KEY] = True
-        if pure_clc_scheduler_requested:
-            config[TCGEN05_PURE_CLC_SCHEDULER_OBJECT_CONFIG_KEY] = True
-        if pure_dynamic_scheduler_requested:
-            config[TCGEN05_PURE_DYNAMIC_SCHEDULER_OBJECT_CONFIG_KEY] = True
 
     def aux_load_mode_autotune_fragments(self) -> dict[str, ConfigSpecFragment]:
         if not self._aux_tma_search_enabled():
@@ -2199,22 +2167,7 @@ class CuteTcgen05Config:
         )
         self._validate_bool_config(
             config,
-            TCGEN05_DIRECT_ENTRY_PLAN_CONFIG_KEY,
-            fix_invalid=fix_invalid,
-        )
-        self._validate_bool_config(
-            config,
             TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY,
-            fix_invalid=fix_invalid,
-        )
-        self._validate_bool_config(
-            config,
-            TCGEN05_PURE_CLC_SCHEDULER_OBJECT_CONFIG_KEY,
-            fix_invalid=fix_invalid,
-        )
-        self._validate_bool_config(
-            config,
-            TCGEN05_PURE_DYNAMIC_SCHEDULER_OBJECT_CONFIG_KEY,
             fix_invalid=fix_invalid,
         )
         if config.get(TCGEN05_LARGE_BN_PROOF_CONFIG_KEY) is True:
