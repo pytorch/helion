@@ -2829,6 +2829,7 @@ class CuteBackend(Backend):
             "cutlass": "import cutlass",
             "cute": "import cutlass.cute as cute",
             "ir": "from cutlass._mlir import ir",
+            "mlir_math": "from cutlass._mlir.dialects import math as mlir_math",
             "_default_cute_launcher": "from helion.runtime import default_cute_launcher as _default_cute_launcher",
             "_next_power_of_2": "from helion._utils import next_power_of_2 as _next_power_of_2",
             "_cute_argreduce_index": "from helion._compiler.cute.reduce_helpers import _cute_argreduce_index",

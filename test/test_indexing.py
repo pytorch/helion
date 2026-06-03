@@ -2394,9 +2394,6 @@ class TestIndexing(RefEagerTestBase, TestCase):
             )
         torch.testing.assert_close(result, expected)
 
-    @xfailIfCute(
-        "CuTe layout propagation does not yet resolve mixed scalar/block stores with size-1 dimensions"
-    )
     def test_mixed_scalar_block_store_size1_dim(self):
         """Test store with mixed scalar/block indexing when block dimension has size 1.
 
