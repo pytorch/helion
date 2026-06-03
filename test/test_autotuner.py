@@ -2641,7 +2641,13 @@ class TestCuteAutotuner(TestCase):
         # grid_foldings is exposed for cute (see e67dafa7)
         self.assertEqual(
             flat_keys,
-            {"block_sizes", "num_threads", "loop_orders", "cute_vector_widths", "grid_foldings"},
+            {
+                "block_sizes",
+                "num_threads",
+                "loop_orders",
+                "cute_vector_widths",
+                "grid_foldings",
+            },
         )
 
         repaired = gen.unflatten(
