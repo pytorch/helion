@@ -15,27 +15,14 @@ from ..cute.tcgen05_constants import TCGEN05_TWO_CTA_EDGE_K_TAIL_BLOCK_K
 from ..cute.tcgen05_constants import TCGEN05_TWO_CTA_SEED_L2_GROUPING
 from ..cute.tcgen05_constants import TCGEN05_TWO_CTA_SEED_PID_TYPE
 from ..cute.tcgen05_constants import tcgen05_two_cta_edge_k_tail_seed_overrides
+from .common import is_canonical_row_reduction
 from .registry import AutotunerHeuristic
 
 if TYPE_CHECKING:
     from ...autotuner.config_fragment import BlockSizeFragment
-    from ...autotuner.config_spec import BlockSizeSpec
     from ...autotuner.config_spec import ReductionLoopSpec
     from ..compile_environment import CompileEnvironment
     from ..device_ir import DeviceIR
-
-
-def _reduction_kernel_eligible(env: CompileEnvironment, device_ir: DeviceIR) -> bool:
-    spec = env.config_spec
-    # Single non-reduction tile + single reduction dim.
-    if len(spec.block_sizes) != 1 or len(spec.reduction_loops) != 1:
-        return False
-    # No matmul facts (this seeds reduction kernels, not GEMMs).
-    if spec.matmul_facts:
-        return False
-    bs_spec = cast("BlockSizeSpec", spec.block_sizes[0])
-    # M-axis must accept block_size=1.
-    return max(bs_spec.min_size, bs_spec.autotuner_min) <= 1
 
 
 def _cute_seed_vec_width(
@@ -103,7 +90,7 @@ class CuteReductionTileHeuristic(AutotunerHeuristic):
 
     @classmethod
     def is_eligible(cls, env: CompileEnvironment, device_ir: DeviceIR) -> bool:
-        return _reduction_kernel_eligible(env, device_ir)
+        return is_canonical_row_reduction(env)
 
     @classmethod
     def get_seed_config(
@@ -464,7 +451,7 @@ class CuteReductionWideChunkHeuristic(AutotunerHeuristic):
 
     @classmethod
     def is_eligible(cls, env: CompileEnvironment, device_ir: DeviceIR) -> bool:
-        if not _reduction_kernel_eligible(env, device_ir):
+        if not is_canonical_row_reduction(env):
             return False
         spec = env.config_spec
         rl_spec = cast("ReductionLoopSpec", spec.reduction_loops[0])

@@ -21,7 +21,7 @@ import helion.language as hl
 
 
 # %%
-@helion.kernel(autotune_seed_configs=helion.Config(block_sizes=[1, 1]))
+@helion.kernel
 def rope_fwd(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -94,7 +94,7 @@ def rope_fwd(
     return q_out, k_out
 
 
-@helion.kernel(autotune_seed_configs=helion.Config(block_sizes=[1, 1]))
+@helion.kernel
 def rope_bwd(
     grad_q_out: torch.Tensor,
     grad_k_out: torch.Tensor,
