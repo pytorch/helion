@@ -15,6 +15,7 @@ from ..exc import InvalidConfig
 from .block_id_sequence import BlockIdSequence
 from .config_fragment import Category
 from .config_fragment import ConfigSpecFragment
+from .config_fragment import ListOf
 from .config_fragment import PowerOfTwoFragment
 from .config_spec import shrink_block_sizes_for_numel_constraints
 from helion._dist_utils import sync_seed
@@ -25,11 +26,21 @@ if TYPE_CHECKING:
 
     from .. import Config
     from . import ConfigSpec
+    from .config_priors import ValuePrior
 
 FlatConfig = list[object]
 
 
 TRITON_MAX_TENSOR_NUMEL = 1048576
+
+
+def _value_or(value: object, fallback: Callable[[], object]) -> object:
+    """Return ``value`` unless it is ``None``, in which case call ``fallback``.
+
+    Used by the biased sampler: a prior returns ``None`` to decline a slot, and
+    the slot then falls back to the fragment's uniform ``random()``.
+    """
+    return fallback() if value is None else value
 
 
 class ConfigGeneration:
@@ -487,6 +498,55 @@ class ConfigGeneration:
             self._repair_cute_num_threads(config)
             return config
 
+    @functools.cached_property
+    def _config_value_priors(self) -> dict[str, ValuePrior]:
+        """Per-config-key sampling priors supplied by the active backend."""
+        return dict(self.config_spec.backend.config_value_priors(self.config_spec))
+
+    @functools.cached_property
+    def _flat_index_to_key_pos(self) -> dict[int, tuple[str, int]]:
+        """Map each flat_spec index to its ``(config key, position-in-key)``."""
+        mapping: dict[int, tuple[str, int]] = {}
+        for key, (indices, _is_sequence) in self._key_to_flat_indices.items():
+            for position, flat_idx in enumerate(indices):
+                mapping[flat_idx] = (key, position)
+        return mapping
+
+    def biased_random_flat(self) -> FlatConfig:
+        """Random flat config biased by the backend's per-key value priors.
+
+        Identical to :meth:`random_flat` except that, for each flat slot whose
+        config key has a registered prior, the value is drawn from that prior
+        (falling back to the fragment's uniform ``random()`` when the prior
+        declines). Used for half of the random portion of the initial
+        population; with no priors this is exactly ``random_flat``.
+        """
+        priors = self._config_value_priors
+        if not priors:
+            return self.random_flat()
+        index_to_key_pos = self._flat_index_to_key_pos
+        with sync_seed(process_group_name=self.process_group_name):
+            config: FlatConfig = []
+            for i, spec in enumerate(self.flat_spec):
+                key_pos = index_to_key_pos.get(i)
+                prior = priors.get(key_pos[0]) if key_pos is not None else None
+                if prior is None or key_pos is None:
+                    config.append(spec.random())
+                elif isinstance(spec, ListOf):
+                    # A list-valued key (e.g. ``indexing``) occupies one flat slot
+                    # holding a list; bias each element via the inner fragment.
+                    config.append(
+                        [
+                            _value_or(prior(spec.inner, j), spec.inner.random)
+                            for j in range(spec.length)
+                        ]
+                    )
+                else:
+                    config.append(_value_or(prior(spec, key_pos[1]), spec.random))
+            self.shrink_config(config, PowerOfTwoFragment(1, 2048, 32).random())
+            self._repair_cute_num_threads(config)
+            return config
+
     def random_config(self) -> Config:
         errors: dict[str, int] = {}
         for _ in range(64):
@@ -532,7 +592,17 @@ class ConfigGeneration:
             if len(result) >= n:
                 return result[:n]
 
-        result.extend(self.random_flat() for _ in range(n - len(result)))
+        # Fill the remainder with random configs. When the backend supplies
+        # value priors, half the random fill is drawn from those priors (biased
+        # toward the region good configs occupy) and half stays uniform so the
+        # search keeps full coverage; with no priors every fill is uniform,
+        # leaving the historical behavior unchanged.
+        priors_present = bool(self._config_value_priors)
+        for j in range(n - len(result)):
+            if priors_present and j % 2 == 0:
+                result.append(self.biased_random_flat())
+            else:
+                result.append(self.random_flat())
         return result
 
     def random_population(

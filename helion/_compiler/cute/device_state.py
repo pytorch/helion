@@ -18,7 +18,6 @@ if TYPE_CHECKING:
     from .cute_mma import _Tcgen05AuxPipelinePlan
     from .cute_mma import _Tcgen05SchedPipelinePlan
     from .tcgen05_lifecycle import Tcgen05LifecycleContext
-    from .tcgen05_pure_matmul import Tcgen05PureClcSchedulerObject
     from .tcgen05_pure_matmul import Tcgen05PureMatmulObjectModel
 
 
@@ -114,6 +113,15 @@ class CuteTcgen05MatmulPlan:
     # The scheduler-pipeline arrive count includes this warp only when the
     # productive aux-body gate is open.
     c_input_warp_count: int = 0
+    # Optional epilogue store/drain warp (Workstream A Stage 3, cycle 91).
+    # WITH_SCHEDULER may lift this to one warp; like ``c_input_warp_count`` the
+    # lifted warp occupies the previous inert padding slot so
+    # ``launched_warp_count`` stays warpgroup-aligned (no extra warp launched).
+    # The store warp's body is inert in cycle 91 (the TMA-D store still runs on
+    # warp 0); Stage 4 moves the R2S->TMA-D drain onto it. It sits at the END of
+    # the warp-id order (after the C-input warp) so existing warp ids do not
+    # shift.
+    store_warp_count: int = 0
     persistence_model: str = "static_persistent"
     cluster_n: int = 1
     l2_swizzle_size: int = 1
@@ -201,6 +209,24 @@ class CuteTcgen05MatmulPlan:
         return self.scheduler_warp_id + self.scheduler_warp_count
 
     @property
+    def has_store_warp(self) -> bool:
+        return self.store_warp_count > 0
+
+    @property
+    def store_warp_id(self) -> int:
+        # The store warp is only valid in scheduler-backed role-local kernels;
+        # it sits at the END of the warp-id order — after the C-input warp (if
+        # present) — so adding it never shifts existing warp ids. With sched=1
+        # and no C-input that puts it at warp id 7 (warpgroup 1, warps 4-7),
+        # which is the former inert padding slot.
+        assert self.has_store_warp, (
+            "store_warp_id is only valid when store_warp_count > 0"
+        )
+        return (
+            self.scheduler_warp_id + self.scheduler_warp_count + self.c_input_warp_count
+        )
+
+    @property
     def role_warp_count(self) -> int:
         return (
             self.epi_warp_count
@@ -208,6 +234,7 @@ class CuteTcgen05MatmulPlan:
             + self.ab_load_warp_count
             + self.scheduler_warp_count
             + self.c_input_warp_count
+            + self.store_warp_count
         )
 
     @property
@@ -215,10 +242,11 @@ class CuteTcgen05MatmulPlan:
         # ``setmaxregister`` is warpgroup-uniform on Blackwell: all 4 warps in a
         # warpgroup must request a compatible register budget. Scheduler-backed
         # kernels therefore round the role count up to a full warpgroup. With
-        # the default C-input count this pads 7 role warps to 8; with one
-        # C-input warp, that warp occupies the former padding slot. MONOLITHIC
-        # keeps its historical 6-warp launch because generated-code golden pins
-        # and validated runtime behavior depend on that shape.
+        # the default C-input / store counts this pads 7 role warps to 8; with
+        # one C-input OR one store warp (cycle 91, Workstream A Stage 3), that
+        # warp occupies the former padding slot and the launch stays at 8.
+        # MONOLITHIC keeps its historical 6-warp launch because generated-code
+        # golden pins and validated runtime behavior depend on that shape.
         if self.has_scheduler_warp:
             warpgroup = 4
             return (self.role_warp_count + warpgroup - 1) // warpgroup * warpgroup
@@ -267,7 +295,6 @@ class CuteDeviceFunctionState:
         # ownership does not leak into the generic DeviceFunction body.
         self.sched_pipeline_plan: _Tcgen05SchedPipelinePlan | None = None
         self.aux_pipeline_plan: _Tcgen05AuxPipelinePlan | None = None
-        self.pure_clc_scheduler_object: Tcgen05PureClcSchedulerObject | None = None
         self._per_tile_stmt_ids: set[int] = set()
         self._post_loop_stmt_ids: set[int] = set()
         self._tma_load_role_stmt_ids: set[int] = set()
@@ -387,15 +414,6 @@ class CuteDeviceFunctionState:
         self, plan: _Tcgen05SchedPipelinePlan
     ) -> None:
         self.sched_pipeline_plan = plan
-
-    def register_tcgen05_pure_clc_scheduler_object(
-        self, obj: Tcgen05PureClcSchedulerObject
-    ) -> None:
-        if self.pure_clc_scheduler_object is not None:
-            raise exc.BackendUnsupported(
-                "cute", "tcgen05 pure CLC scheduler object registered more than once"
-            )
-        self.pure_clc_scheduler_object = obj
 
     def register_tcgen05_aux_pipeline_plan(self, plan: _Tcgen05AuxPipelinePlan) -> None:
         self.aux_pipeline_plan = plan

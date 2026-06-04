@@ -232,6 +232,7 @@ class CompileEnvironment:
         )
         self.process_group_name = None
         self._backend = get_backend_class(settings.backend)()
+        self._backend.validate_environment()
         if self._backend.experimental:
             from torch._dynamo.utils import warn_once
 

@@ -577,7 +577,7 @@ class _CuteFuseTwoPassLoads(ast.NodeTransformer):
             # (the ``unroll`` mode's U16 vec hoist) cache via a *scalar*
             # fragment of ``cache_size * V`` slots — one slot per
             # extracted lane — because the CUTLASS DSL's
-            # ``cute.make_fragment(N, dtype)`` does not currently accept a
+            # ``cute.make_rmem_tensor(N, dtype)`` does not currently accept a
             # vec element type.  Scalar (masked / unmasked) loads cache as
             # the existing fast path.
             tracked: dict[str, tuple[int, str, str, str | None, int | None]] = {}
@@ -678,7 +678,7 @@ class _CuteFuseTwoPassLoads(ast.NodeTransformer):
                     cache_total = cache_total_per_thread
                     cache_decls.append(
                         statement_from_string(
-                            f"{cache} = cute.make_fragment({cache_total}, {dtype})"
+                            f"{cache} = cute.make_rmem_tensor({cache_total}, {dtype})"
                         )
                     )
             if not cache_names:

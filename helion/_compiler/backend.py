@@ -33,6 +33,8 @@ if TYPE_CHECKING:
     from torch._inductor.ops_handler import OpsHandler
 
     from ..autotuner.config_fragment import ConfigSpecFragment
+    from ..autotuner.config_priors import ValuePrior
+    from ..autotuner.config_spec import ConfigSpec
     from ..runtime.config import Config
     from ..runtime.kernel import BoundKernel
     from .device_function import Argument
@@ -110,6 +112,30 @@ class Backend(abc.ABC):
     def codegen_name(self) -> str:
         """Backend name used to look up registered codegen functions."""
         return self.name
+
+    def validate_environment(self) -> None:
+        """Raise a ``helion.exc.*`` error if this backend cannot run here.
+
+        Called once per :class:`CompileEnvironment` for the *selected* backend
+        (never at registration time), so a backend can hard-require libraries,
+        CUDA versions, or hardware and fail fast with an actionable message
+        instead of crashing deep in codegen. The default is a no-op.
+        """
+        return None
+
+    def config_value_priors(self, config_spec: ConfigSpec) -> dict[str, ValuePrior]:
+        """Per-config-key priors that bias the autotuner's random exploration.
+
+        Returns a mapping from config-key name (e.g. ``"num_warps"``,
+        ``"indexing"``, ``"tcgen05_cluster_m"``) to a
+        :data:`~helion.autotuner.config_priors.ValuePrior`. Half of the random
+        portion of the initial population is drawn using these priors (the other
+        half stays uniform), so the search starts denser in the region good
+        configs tend to occupy without losing coverage. Keys without a prior --
+        and every key when this returns an empty mapping -- are sampled
+        uniformly. The default is no bias.
+        """
+        return {}
 
     @abc.abstractmethod
     def dtype_str(self, dtype: torch.dtype) -> str:
@@ -2907,6 +2933,68 @@ class CuteBackend(Backend):
     def name(self) -> str:
         return "cute"
 
+    def validate_environment(self) -> None:
+        from .cute.cutedsl_compat import check_cute_backend_requirements
+
+        check_cute_backend_requirements()
+
+    def config_value_priors(self, config_spec: ConfigSpec) -> dict[str, ValuePrior]:
+        """Bias the random half of the initial population toward the config
+        family that performs well on Blackwell tcgen05 kernels.
+
+        This encodes, as a distribution, what the backend's former hardcoded
+        per-shape seed configs all converged on: a 2-CTA, TMA-fed,
+        role-local-monolithic, static-persistent, tvm-ffi launch with deep AB
+        staging and a 4-warp epilogue. Keys a given kernel does not expose
+        (e.g. the ``tcgen05_*`` keys on a pointwise/reduction kernel) are
+        ignored, and values a fragment cannot represent are dropped, so the
+        priors are safe for any cute kernel -- a non-matmul kernel just picks up
+        the generic biases (TMA indexing, 8 warps) on whichever keys it has.
+        """
+        from ..autotuner.config_priors import weighted_choice
+        from .cute.strategies import TCGEN05_PERSISTENCE_MODEL_CONFIG_KEY
+        from .cute.strategies import TCGEN05_STRATEGY_CONFIG_KEY
+        from .cute.strategies import Tcgen05PersistenceModel
+        from .cute.strategies import Tcgen05Strategy
+        from .cute.tcgen05_constants import TCGEN05_TWO_CTA_SEED_PID_TYPE
+
+        return {
+            # Generic knobs shared by every cute kernel.
+            "num_warps": weighted_choice({8: 4.0, 4: 2.0, 16: 1.0}),
+            "num_stages": weighted_choice({4: 3.0, 3: 2.0, 2: 1.0}),
+            "indexing": weighted_choice(
+                {"tensor_descriptor": 4.0, "pointer": 1.0, "block_ptr": 1.0}
+            ),
+            "pid_type": weighted_choice(
+                {
+                    TCGEN05_TWO_CTA_SEED_PID_TYPE: 3.0,
+                    "flat": 1.0,
+                    "persistent_blocked": 1.0,
+                }
+            ),
+            # tcgen05 / 2-CTA matmul knobs (absent on non-matmul kernels).
+            "tcgen05_cluster_m": weighted_choice({2: 3.0, 1: 1.0}),
+            "tcgen05_ab_stages": weighted_choice(
+                {3: 3.0, 4: 2.0, 5: 1.0, 6: 1.0, 2: 1.0}
+            ),
+            "tcgen05_acc_stages": weighted_choice({2: 4.0, 1: 1.0}),
+            "tcgen05_c_stages": weighted_choice({2: 3.0, 4: 2.0, 1: 1.0}),
+            "tcgen05_num_epi_warps": weighted_choice({4: 3.0, 2: 1.0, 8: 1.0}),
+            TCGEN05_STRATEGY_CONFIG_KEY: weighted_choice(
+                {
+                    Tcgen05Strategy.ROLE_LOCAL_MONOLITHIC.value: 3.0,
+                    Tcgen05Strategy.ROLE_LOCAL_WITH_SCHEDULER.value: 1.0,
+                }
+            ),
+            TCGEN05_PERSISTENCE_MODEL_CONFIG_KEY: weighted_choice(
+                {
+                    Tcgen05PersistenceModel.STATIC_PERSISTENT.value: 3.0,
+                    Tcgen05PersistenceModel.CLC_PERSISTENT.value: 1.0,
+                }
+            ),
+            TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY: weighted_choice({True: 3.0, False: 1.0}),
+        }
+
     def customize_ast(self, hf: HostFunction) -> None:
         """CuTe-specific AST rewrites that rewrite high-level patterns into
         equivalent forms that compile to materially faster code.
@@ -3592,6 +3680,13 @@ class CuteBackend(Backend):
             compile_options: list[str] = []
             if config.get(TCGEN05_CUBIN_LINEINFO_CONFIG_KEY) is True:
                 compile_options.append("--generate-line-info")
+            # ``--enable-tvm-ffi`` is emitted in codegen only when the
+            # autotune flag is True so the generated code reflects which
+            # configs deliberately requested FFI. The runtime
+            # (``_get_compiled_cute_launcher``) unconditionally merges
+            # the flag in for the generic launcher, so configs with this
+            # flag False still execute with FFI enabled — that drift is
+            # intentional for now and noted here for future cleanups.
             if config.get(TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY) is True:
                 if (
                     _kernel_specialized_mma_impl(

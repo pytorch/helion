@@ -2,9 +2,7 @@ from __future__ import annotations
 
 import dataclasses
 
-from .cutedsl_compat import emit_dealloc_mbarrier_initialized_kwarg
 from .cutedsl_compat import emit_producer_tail_tma_umma
-from .cutedsl_compat import emit_producer_tail_umma_async
 
 
 @dataclasses.dataclass(frozen=True)
@@ -27,8 +25,6 @@ class Tcgen05LifecycleContext:
     acc_tmem_cols: str
     is_two_cta: bool
     use_tma: bool
-    ab_stage_count: int
-    acc_stage_count: int
     skip_ab_producer_advance: bool = False
 
     def render_store_post_loop_lines(
@@ -45,7 +41,6 @@ class Tcgen05LifecycleContext:
                 + emit_producer_tail_tma_umma(
                     self.tma_pipeline,
                     self.tma_producer_state,
-                    num_stages=self.ab_stage_count,
                     indent="    ",
                     skip_advances=self.skip_ab_producer_advance,
                 )
@@ -62,12 +57,7 @@ class Tcgen05LifecycleContext:
                 (f"if {self.exec_active}:\n    {self.tmem_alloc_barrier}.arrive()"),
                 (
                     f"if {self.exec_active}:\n"
-                    + emit_producer_tail_umma_async(
-                        self.acc_pipeline,
-                        self.acc_producer_state,
-                        num_stages=self.acc_stage_count,
-                        indent="    ",
-                    )
+                    f"    {self.acc_pipeline}.producer_tail({self.acc_producer_state})"
                 ),
                 (
                     f"{self.tmem_allocator} = cutlass.utils.TmemAllocator("
@@ -78,7 +68,7 @@ class Tcgen05LifecycleContext:
                     "two_cta_tmem_dealloc_mbar_ptr="
                     f"{self.tmem_dealloc_mbar_ptr}, "
                     f"num_allocated_columns={self.acc_tmem_cols}"
-                    f"{emit_dealloc_mbarrier_initialized_kwarg()})"
+                    ", initialize_mbarrier=False)"
                 ),
             ]
         )

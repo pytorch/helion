@@ -125,6 +125,81 @@ def tcgen05_ab_smem_bytes_per_cta(
     return ab_stages * (a_per_stage + b_per_stage)
 
 
+# Workstream A Stage 2 (cycle 90): the residual full-tile family gets a deeper
+# C-store ring (foundation for the Stage-4 store-warp split, which drains tile N
+# while the epi warps run tile N+1). The validated deeper depth is 4 — the only
+# other ``EnumFragment((2, 4))`` choice — and it fits at ab=2 under the 232 KB
+# B200 SMEM cap (256x256x128 CtaGroup.TWO bf16: 128 KB AB + 64 KB C = 192 KB).
+# ab=3 + c=4 overflows (192 KB AB + 64 KB C = 256 KB → raw ``ptxas: too much
+# shared``), so the deeper ring is admitted only behind the c-stages SMEM budget
+# gate in ``CuteTcgen05Config``.
+TCGEN05_RESIDUAL_FULL_TILE_DEEP_C_STAGES = 4
+
+
+def tcgen05_default_epilogue_tile_size(
+    bm: int,
+    bn: int,
+    *,
+    elem_width_d: int,
+    elem_width_c: int | None,
+) -> tuple[int, int]:
+    """Return the DEFAULT (auto) epilogue subtile ``(tile_m, tile_n)`` in elems.
+
+    The role-local ``Tcgen05LayoutStrategy.DEFAULT`` path sizes its epilogue
+    subtile via ``cutlass.utils.blackwell_helpers.compute_epilogue_tile_shape``
+    (``tcgen05_default_epilogue_tile_expr``), whose tile choice is the pure
+    Python ``compute_epilogue_tile_size``. The tile depends on whether the
+    epilogue reads a source-C tensor: ``compute_epilogue_tile_size`` shrinks N
+    when a C tile competes for SMEM. For a 256x256 CTA tile with 16-bit elements
+    it is ``(128, 64)`` WITH a source C (residual family, ``elem_width_c`` set)
+    but ``(128, 32)`` WITHOUT one (plain matmul, ``elem_width_c=None``) — and in
+    both cases NOT the ``(128, 32)`` EXPLICIT_EPI_TILE direct-entry (TVM-FFI)
+    tile, which is a separate codepath. Pass ``elem_width_c`` matching the
+    config's real source-C presence so the SMEM budget gate matches codegen (and
+    tracks any future CuTe tile-rule change rather than a hard-coded guess).
+    """
+    # Lazy import: ``cutlass`` is only loaded on the cute backend, while this
+    # module is imported on the general autotuner path too.
+    from cutlass.utils.blackwell_helpers import compute_epilogue_tile_size
+
+    # The role-local epilogue D/C tensors are row-major (LayoutEnum.ROW_MAJOR,
+    # see ``cute_mma.py`` ``tcgen05_c_layout``), i.e. NOT M-major.
+    tile_m, tile_n = compute_epilogue_tile_size(
+        bm,
+        bn,
+        False,
+        elem_width_d,
+        elem_width_c,
+        d_is_m_major=False,
+        c_is_m_major=False,
+    )
+    return tile_m, tile_n
+
+
+def tcgen05_c_smem_bytes_per_cta(
+    *,
+    epi_tile_m: int,
+    epi_tile_n: int,
+    dtype_bytes: int,
+    c_stages: int,
+) -> int:
+    """Return per-CTA C-store-ring SMEM bytes for a tcgen05 epilogue.
+
+    The role-local TMA-store epilogue allocates a multistage SMEM ring whose
+    per-stage cosize is ``epi_tile_m * epi_tile_n * dtype_bytes``. The autotune
+    search-space gate sums this against the AB pipeline cost to admit a deeper
+    C ring (``tcgen05_c_stages=4``) only when the combined AB+C SMEM fits the
+    B200 optin budget after the same non-AB reservation the
+    ``tcgen05_ab_stages=3`` gate uses. For the residual full-tile family
+    (256x256 CTA tile, 16-bit, DEFAULT epi tile ``(128, 64)``): each C stage is
+    128*64*2 = 16 KB, so ab=2 + c=4 = 128 KB AB + 64 KB C = 192 KB (fits the
+    232 KB cap), while ab=3 + c=4 = 192 KB AB + 64 KB C = 256 KB (overflows).
+    """
+    assert c_stages >= 1
+    assert epi_tile_m > 0 and epi_tile_n > 0 and dtype_bytes > 0
+    return c_stages * epi_tile_m * epi_tile_n * dtype_bytes
+
+
 # C-store epilogue placement knobs. Keeping these in Config makes generated-code
 # changes visible to BoundKernel's Config-keyed compile cache; most values are
 # used for diagnostics, while the output-edge + K-tail seed uses the measured
@@ -283,8 +358,11 @@ TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY = "tcgen05_tvm_ffi_launch"
 # targets can re-explore. ``{2, 3}`` fit structurally on B200 — see
 # ``cute_plan.md`` for the SMEM-budget audit. The autotune gate
 # (``aux_stages_autotune_fragments`` in ``tcgen05_config.py``) admits
-# the knob only for the ``_aux_tma_search_enabled`` family so other
-# paths stay byte-identical at the default.
+# the knob only for the ``_aux_tma_edge_search_enabled`` family so other
+# paths stay byte-identical at the default. (Cycle 46 widened
+# ``_aux_tma_search_enabled`` to also admit the full-tile cluster_m=2
+# family, but this stage-count knob remains scoped to the edge gate
+# because its choices were measured only on the T8/CLC edge rows.)
 TCGEN05_AUX_STAGES_CONFIG_KEY = "tcgen05_aux_stages"
 TCGEN05_AUX_STAGE_COUNT_DEFAULT = 2
 TCGEN05_AUX_STAGE_COUNT_CHOICES = (2, 3)
@@ -300,129 +378,26 @@ TCGEN05_AUX_STAGE_COUNT_CHOICES = (2, 3)
 # ``cute_mma.py`` ``_emit_mma_pipeline`` consumer branch; the
 # autotune gate (``consumer_regs_autotune_fragments`` in
 # ``tcgen05_config.py``) admits the knob only for the
-# ``_aux_tma_search_enabled`` family (mirroring the aux_stages gate)
-# so other paths stay byte-identical at the 256 default. The
-# choices include 256 so the default-with-knob configuration matches
-# the default-without-knob emission byte-for-byte.
+# ``_aux_tma_edge_search_enabled`` family (mirroring the aux_stages
+# gate) so other paths stay byte-identical at the 256 default. (Cycle
+# 46 widened ``_aux_tma_search_enabled`` to also admit the full-tile
+# cluster_m=2 family, but this register-cap knob stays scoped to the
+# edge gate because its choices were measured only on the T8/CLC edge
+# rows.) The choices include 256 so the default-with-knob configuration
+# matches the default-without-knob emission byte-for-byte.
 TCGEN05_CONSUMER_REGS_CONFIG_KEY = "tcgen05_consumer_regs"
 TCGEN05_CONSUMER_REGS_DEFAULT = 256
 TCGEN05_CONSUMER_REGS_CHOICES = (224, 232, 240, 256)
 
-# Validated G2.2 Target1 diagnostic envelope for promoting the TVM-FFI launch
-# path into normal autotune without enabling it broadly.
-TCGEN05_TARGET1_TVM_FFI_SHAPE = (1024, 4096, 1024)
-TCGEN05_TARGET1_TVM_FFI_BLOCK_K = 64
-TCGEN05_TARGET1_TVM_FFI_AB_STAGES = 6
-TCGEN05_TARGET1_TVM_FFI_C_STAGES = 4
-# Validated cycle-2 Target4 envelope (8192x1024x1024 + relu epilogue):
-# admits the TVM-FFI direct entry on the bk=128 (ab=3, c=2) stage tuple.
-TCGEN05_TARGET4_TVM_FFI_SHAPE = (8192, 1024, 1024)
-TCGEN05_TARGET4_TVM_FFI_BLOCK_K = 128
-TCGEN05_TARGET4_TVM_FFI_AB_STAGES = 3
-TCGEN05_TARGET4_TVM_FFI_C_STAGES = 2
-# Validated cycle-3 Target5 envelope (1024x8192x1024 + identity epilogue):
-# admits the TVM-FFI direct entry on the bk=128 (ab=3, c=2) stage tuple.
-# Shape is the M/N transpose of T4 with identity (no relu) store, which
-# lets T5 reuse T4's stage tuple + cluster shape via a separate envelope
-# predicate pinned to T5's shape.
-TCGEN05_TARGET5_TVM_FFI_SHAPE = (1024, 8192, 1024)
-TCGEN05_TARGET5_TVM_FFI_BLOCK_K = 128
-TCGEN05_TARGET5_TVM_FFI_AB_STAGES = 3
-TCGEN05_TARGET5_TVM_FFI_C_STAGES = 2
-# Validated cycle-4 Target3 envelope (2048x4096x2048 + identity epilogue):
-# admits the TVM-FFI direct entry on the bk=128 (ab=3, c=2) stage tuple.
-# T3 reuses T4/T5's (bk, stage tuple, cluster shape) envelope at a
-# larger M/N/K problem. K=2048 -> k_tile_count=16 (cf. T4/T5 with K=1024
-# -> k_tile_count=8); ``static_k=2048`` is below the
-# ``TCGEN05_TWO_CTA_MAX_K_TILES`` cap. The identity-store gate is shared
-# with the T1/T5 seeds; the shape gate pins it to T3 so a T1/T5 host
-# function does not get a T3 seed.
-TCGEN05_TARGET3_TVM_FFI_SHAPE = (2048, 4096, 2048)
-TCGEN05_TARGET3_TVM_FFI_BLOCK_K = 128
-TCGEN05_TARGET3_TVM_FFI_AB_STAGES = 3
-TCGEN05_TARGET3_TVM_FFI_C_STAGES = 2
-# Validated cycle-6 Target2 envelope (4096x2048x2048 + bias[n] epilogue):
-# admits the TVM-FFI direct entry on the bk=128 (ab=3, c=2) stage tuple.
-# T2 mirrors T3/T4/T5's (bk, stage tuple, cluster shape) envelope at the
-# 4096x2048x2048 problem but with a rank-1 trailing-axis (rowvec) bias
-# epilogue instead of identity/relu. K=2048 -> k_tile_count=16 (same as
-# T3, double T4/T5's K=1024). The bias-store gate is unique to T2; the
-# shape gate pins it to T2 so a T6 (8192x2048x2048 + bias_relu) host
-# function does not get a T2 seed.
-TCGEN05_TARGET2_TVM_FFI_SHAPE = (4096, 2048, 2048)
-TCGEN05_TARGET2_TVM_FFI_BLOCK_K = 128
-TCGEN05_TARGET2_TVM_FFI_AB_STAGES = 3
-TCGEN05_TARGET2_TVM_FFI_C_STAGES = 2
-# Validated cycle-7 Target6 envelope (8192x2048x2048 + relu(acc + bias[n])
-# epilogue): admits the TVM-FFI direct entry on the bk=128 (ab=3, c=2)
-# stage tuple. T6 is a composition of T2's rank-1 trailing-axis (rowvec)
-# bias and T4's relu — the chain shape is
-# ``mma -> aten.add.Tensor(carrier, bias_load) -> aten.relu.default ->
-# convert -> store``. K=2048 -> k_tile_count=16 (same as T2/T3); the
-# bias-relu-store gate is unique to T6 (mutually exclusive with the
-# identity/relu/bias gates that handle T1/T3/T5, T4, and T2 respectively).
-# The shape gate pins it to T6 so a T2 (4096x2048x2048 + bias) host
-# function does not get a T6 seed.
-TCGEN05_TARGET6_TVM_FFI_SHAPE = (8192, 2048, 2048)
-TCGEN05_TARGET6_TVM_FFI_BLOCK_K = 128
-TCGEN05_TARGET6_TVM_FFI_AB_STAGES = 3
-TCGEN05_TARGET6_TVM_FFI_C_STAGES = 2
-# Validated cycle-8 Target7 envelope (2048x8192x2048 + identity epilogue):
-# admits the TVM-FFI direct entry on the bk=128 (ab=3, c=2) stage tuple.
-# T7 is structurally similar to T5 (1024x8192x1024) but with M and K
-# doubled, sharing K=2048 with T2/T3/T6. K=2048 -> k_tile_count=16
-# (same as T2/T3/T6); the identity-store gate is shared with T1/T3/T5
-# (mutually exclusive with the relu/bias/bias-relu gates that handle
-# T4, T2, and T6 respectively). The shape gate pins it to T7 so a
-# T1/T3/T5 host function does not get a T7 seed. T7's runtime
-# clustered grid is ``(2, 1, 74)`` (M_tiles*N_tiles = 8*32 = 256,
-# capped to min(256, num_sms // cluster_m = 74) on B200) — same as
-# T6's cap on the bk=128 stage tuple plus T7's shape envelope.
-TCGEN05_TARGET7_TVM_FFI_SHAPE = (2048, 8192, 2048)
-TCGEN05_TARGET7_TVM_FFI_BLOCK_K = 128
-TCGEN05_TARGET7_TVM_FFI_AB_STAGES = 3
-TCGEN05_TARGET7_TVM_FFI_C_STAGES = 2
-
-# Stage tuples that the TVM-FFI direct entry accepts, keyed by ``bk``.
-# The codegen-side ``tcgen05_direct_entry`` source builder and the
-# runtime-side ``_validate_target1_direct_entry_args`` both consume this
-# table so they cannot drift out of sync. ``bk=64`` covers Target 1's
-# two envelopes; ``bk=128`` covers the cycle-2 Target 4, cycle-3 Target
-# 5, cycle-4 Target 3, cycle-6 Target 2, cycle-7 Target 6, and cycle-8
-# Target 7 envelopes (all share the (3, 2) stage tuple).
+# Stage tuples that the TVM-FFI flat-role seed accepts, keyed by ``bk``. The
+# general FFI seed eligibility (``tcgen05_config.py``) consumes this table via
+# ``tcgen05_direct_entry_stage_tuple_allowed``. ``bk=64`` admits the shallow
+# ``(3, 2)`` and deep ``(6, 4)`` A/B pipelines; ``bk=128`` admits the
+# ``(3, 2)`` pipeline. The admission is otherwise structural (any CtaGroup.TWO
+# ``bm=bn=256`` shape) — these stage tuples are the only per-``bk`` constraint.
 TCGEN05_DIRECT_ENTRY_STAGE_TUPLES_BY_BK: dict[int, tuple[tuple[int, int], ...]] = {
-    TCGEN05_TARGET1_TVM_FFI_BLOCK_K: ((3, 2), (6, 4)),
-    TCGEN05_TARGET4_TVM_FFI_BLOCK_K: (
-        (TCGEN05_TARGET4_TVM_FFI_AB_STAGES, TCGEN05_TARGET4_TVM_FFI_C_STAGES),
-    ),
-}
-
-# Accepted (lhs_shape, rhs_shape, d_shape) envelopes keyed by ``bk``.
-# Ties the direct-entry tensor shape envelope to the plan's ``bk`` so a
-# bk=64 (T1) plan cannot launch with T2/T3/T4/T5/T6/T7-shaped tensors
-# and vice versa. Each entry is
-# ``((lhs_m, lhs_k), (rhs_k, rhs_n), (d_m, d_n))``. T2, T3, T4, T5, T6,
-# and T7 share ``bk=128`` but have distinct M/N/K shapes; all six are
-# admitted in the same bk-keyed table so the runtime validator accepts
-# any of them (it additionally dispatches on the per-plan
-# ``validated_shape`` so a T3-plan with T4/T5/T7 tensors is still
-# rejected; T2 and T6 plans each carry a ``bias_idx`` so a 3-arg
-# launch is rejected against either plan even at the same shape
-# envelope, and a 4-arg launch is rejected against the T3/T4/T5/T7
-# plans).
-TCGEN05_DIRECT_ENTRY_SHAPE_SETS_BY_BK: dict[
-    int,
-    tuple[tuple[tuple[int, int], tuple[int, int], tuple[int, int]], ...],
-] = {
-    TCGEN05_TARGET1_TVM_FFI_BLOCK_K: (((1024, 1024), (1024, 4096), (1024, 4096)),),
-    TCGEN05_TARGET4_TVM_FFI_BLOCK_K: (
-        ((8192, 1024), (1024, 1024), (8192, 1024)),
-        ((1024, 1024), (1024, 8192), (1024, 8192)),
-        ((2048, 2048), (2048, 4096), (2048, 4096)),
-        ((4096, 2048), (2048, 2048), (4096, 2048)),
-        ((8192, 2048), (2048, 2048), (8192, 2048)),
-        ((2048, 2048), (2048, 8192), (2048, 8192)),
-    ),
+    64: ((3, 2), (6, 4)),
+    128: ((3, 2),),
 }
 
 
@@ -436,33 +411,6 @@ def tcgen05_direct_entry_stage_tuple_allowed(
     ) in TCGEN05_DIRECT_ENTRY_STAGE_TUPLES_BY_BK.get(bk, ())
 
 
-# Cluster shape baked into the cycle-2 direct entry: both T1 and T4 are
-# validated at ``cluster_m=2``, ``cluster_n=1``.
-TCGEN05_DIRECT_ENTRY_CLUSTER_M = 2
-
-# Total work-cluster counts produced by the codegen scheduler for the
-# validated direct-entry shapes. Target 1 (1024x4096x1024) yields 64
-# work clusters; Targets 2 (4096x2048x2048), 3 (2048x4096x2048), 4
-# (8192x1024x1024), and 5 (1024x8192x1024) each yield 128; Target 6
-# (8192x2048x2048) and Target 7 (2048x8192x2048) each yield 256 (per
-# ``_tcgen05_num_work_clusters_expr`` in program_id.py:
-# dims[0] = ceil(M_tiles*cluster_m / cluster_m) * N_tiles at
-# cluster_m=2 cluster_n=1; T1 = 4*16 = 64; T4 = 32*4 = 128; T5 = 4*32
-# = 128; T2 = 16*8 = 128; T3 = 8*16 = 128; T6 = 32*8 = 256;
-# T7 = 8*32 = 256). The runtime grid is
-# ``(cluster_m, cluster_n, min(total_clusters, num_sms // cluster_m))``;
-# both ``total_clusters`` and ``num_sms // cluster_m`` are admissible
-# values for the clustered ``grid[2]``. The validator at launch time
-# derives the actual accept set from the tensor's CUDA device's SM
-# count, so new Blackwell SKUs with a different ``num_sms`` extend
-# automatically. On B200 (148 SMs, cluster_m=2 cap = 74) all values
-# collapse to the cap; the explicit (64, 128, 256) tuple is what keeps
-# the validator correct on a future Blackwell SKU with
-# ``num_sms // cluster_m >= 256`` where T6/T7's runtime
-# ``grid[2] = 256`` would otherwise miss the bk-keyed accept set.
-TCGEN05_DIRECT_ENTRY_TOTAL_WORK_CLUSTERS: tuple[int, ...] = (64, 128, 256)
-
-
 # Diagnostic-only G4 admission proof. This key lets tests exercise the
 # smallest larger-BN tcgen05 codegen candidate without broadening production
 # selector/search defaults.
@@ -470,33 +418,6 @@ TCGEN05_LARGE_BN_PROOF_CONFIG_KEY = "tcgen05_large_bn_proof"
 # Diagnostic Target1 topology probe: keep role predicates warp-based while
 # deriving logical MMA coordinates from flat threadIdx.x / warp / lane values.
 TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY = "tcgen05_flat_role_coordinates"
-# Diagnostic Target1 scheduler-object probe: use a Helion-owned pure-matmul
-# CLC scheduler object to publish work tiles for the validated Target1
-# TVM-FFI/flat-role seed. This stays explicit until forced diagnostics show
-# it can replace the selected static scheduler path.
-TCGEN05_PURE_CLC_SCHEDULER_OBJECT_CONFIG_KEY = "tcgen05_pure_clc_scheduler_object"
-# Cycle-16 H3 staged-only Target8 scheduler-object probe: parallel of the pure
-# CLC scheduler object that names a Helion-owned ``DYNAMIC_PERSISTENT`` work-
-# tile loop driven by an atomic-counter (``tile_count_semaphore`` /
-# ``atomic_add_i32`` on a global counter) instead of the CLC scheduler warp
-# + 16-bit mailbox SMEM hand-off. Quack T8's winning config uses
-# ``is_dynamic_persistent=true`` (atomic-counter advance), not CLC; this
-# config key is the user-visible surface for the cycle-16 H3 hypothesis
-# (see ``cute_plan.md`` §6 Target 8 cycle-13 Deep Replan). Cycle-16
-# implementation is **Option B (staged)**: the config key is admitted into
-# the autotune search surface and through the validator, but the codegen
-# path raises ``BackendUnsupported`` in ``cute_mma.py`` because no
-# productive AST emission has landed yet. Only the config key plus that
-# rejection path exist today; the staged scheduler-object class was
-# removed in cycle 27. A future cycle can wire the atomic-counter
-# work-tile loop without re-doing the search-surface / dispatch plumbing.
-TCGEN05_PURE_DYNAMIC_SCHEDULER_OBJECT_CONFIG_KEY = (
-    "tcgen05_pure_dynamic_scheduler_object"
-)
-# Diagnostic metadata-only direct-entry plan for the validated Target1
-# TVM-FFI/flat-role identity-store seed. This does not change launch behavior;
-# it records the exact A/B/D TMA facts needed by the future direct CuTe entry.
-TCGEN05_DIRECT_ENTRY_PLAN_CONFIG_KEY = "tcgen05_direct_entry_plan"
 TCGEN05_LARGE_BN_PROOF_PROBLEM_SHAPE = (64, 512, 16)
 TCGEN05_LARGE_BN_PROOF_BLOCK_SIZES = (64, 512, 16)
 TCGEN05_LARGE_BN_PROOF_CLUSTER_M = 1

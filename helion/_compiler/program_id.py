@@ -17,7 +17,6 @@ from .ast_extension import expr_from_string
 from .ast_extension import statement_from_string
 from .compile_environment import CompileEnvironment
 from .cute.cutedsl_compat import emit_pipeline_advance
-from .cute.cutedsl_compat import emit_producer_tail_tma_async
 from .cute.strategies import TCGEN05_L2_SWIZZLE_SIZE_DEFAULT
 from .cute.strategies import l2_swizzle_size_from_config
 from .cute.tcgen05_constants import TCGEN05_SCHED_CONSUMER_WAIT_MODE_CONFIG_KEY
@@ -25,10 +24,6 @@ from .cute.tcgen05_constants import TCGEN05_SCHED_CONSUMER_WAIT_MODE_NORMAL
 from .cute.tcgen05_constants import TCGEN05_SCHED_CONSUMER_WAIT_MODE_WARP_LEADER
 from .cute.tcgen05_constants import TCGEN05_SCHED_STAGE_COUNT_CONFIG_KEY
 from .cute.tcgen05_constants import TCGEN05_TWO_CTA_MAX_K_TILES
-from .cute.tcgen05_pure_matmul import Tcgen05ClcQueryParams
-from .cute.tcgen05_pure_matmul import Tcgen05InitialWorkTileParams
-from .cute.tcgen05_pure_matmul import Tcgen05WorkTileConsumeParams
-from .cute.tcgen05_pure_matmul import Tcgen05WorkTilePublishParams
 from .device_function import DeviceFunction
 from .device_function import TensorArg
 from .host_function import HostFunction
@@ -192,7 +187,6 @@ if TYPE_CHECKING:
 
     from .cute.cute_mma import _Tcgen05SchedPipelinePlan
     from .cute.device_state import CuteTcgen05MatmulPlan
-    from .cute.tcgen05_pure_matmul import Tcgen05PureClcSchedulerObject
     from .inductor_lowering import CodegenState
 
 NUM_SM_VAR = "_NUM_SM"
@@ -1020,14 +1014,6 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         except NoCurrentFunction:
             return None
 
-    def _tcgen05_pure_clc_scheduler_object(
-        self,
-    ) -> Tcgen05PureClcSchedulerObject | None:
-        try:
-            return DeviceFunction.current().cute_state.pure_clc_scheduler_object
-        except NoCurrentFunction:
-            return None
-
     def _tcgen05_sched_stage_count(self) -> int:
         plan = self._tcgen05_plan()
         if plan is None:
@@ -1181,10 +1167,6 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         total_clusters = self._tcgen05_num_work_clusters_expr(is_device=False)
         plan = self._tcgen05_plan()
         if plan is not None and plan.is_clc_persistent:
-            if self._tcgen05_pure_clc_scheduler_object() is not None:
-                return expr_from_string(
-                    f"(({cluster_m}) * ({total_clusters}), {cluster_n}, 1)"
-                )
             # G2-H (cute_plan.md): CLC mode launches the *full*
             # problem grid (one cluster slot per problem cluster),
             # not the persistent sub-grid. The hardware tile-scheduler
@@ -1411,14 +1393,37 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         )
 
     def _tcgen05_epi_role_predicate(self) -> str:
-        """Boolean expression that gates the epilogue warps' role block."""
+        """Boolean expression that gates the epilogue warps' role block.
+
+        Workstream A Stage 4 (cycle 93, Path B shared-loop split): when the
+        matmul plan carries a store warp (``has_store_warp``), the predicate
+        is WIDENED to also admit ``store_warp_id`` so the store warp runs the
+        SAME epilogue role-local while as the 4 epi warps — sharing the
+        descriptor/SMEM/layout setup and the sched-consumer + subtile loop
+        (no re-derivation; this is what makes Path B cheap vs the independent
+        store-warp loop of Path A). Inside the loop the per-subtile tail is
+        split by warp role with inline gates emitted in the tail source
+        (``memory_ops._codegen_cute_store_tcgen05_tile``): the 4 epi warps
+        (``epi_active`` = ``warp_idx < epi_warp_count``) own T2R/R2S + the
+        C-store producer commit, and the store warp (``warp_idx ==
+        store_warp_id``) owns the consumer-wait + TMA-D + consumer-release
+        drain. When ``store_warps=0`` the predicate is the historical
+        ``warp_idx < epi_warp_count`` and codegen is byte-identical.
+        """
         plan = self._tcgen05_plan()
         assert plan is not None, (
             "tcgen05 epilogue role predicate requires a registered matmul plan"
         )
-        return (
+        epi_predicate = (
             "cute.arch.make_warp_uniform(cute.arch.warp_idx()) "
             f"< cutlass.Int32({plan.epi_warp_count})"
+        )
+        if not plan.has_store_warp:
+            return epi_predicate
+        return (
+            f"({epi_predicate} or "
+            "cute.arch.make_warp_uniform(cute.arch.warp_idx()) "
+            f"== cutlass.Int32({plan.store_warp_id}))"
         )
 
     def _tcgen05_scheduler_role_predicate(self) -> str:
@@ -1428,9 +1433,6 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         ``warp_idx == scheduler_warp_id`` against the dedicated warp
         the matmul plan reserves for centralized tile scheduling.
         """
-        pure_scheduler = self._tcgen05_pure_clc_scheduler_object()
-        if pure_scheduler is not None:
-            return pure_scheduler.scheduler_role_predicate()
         plan = self._tcgen05_plan()
         assert plan is not None and plan.has_scheduler_warp, (
             "tcgen05 scheduler role predicate requires a matmul plan "
@@ -2505,6 +2507,8 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         *,
         emit_pdl_wait: bool = True,
         initialize_tile_counter: bool = True,
+        store_aux_per_tile_stmts: list[ast.stmt] | None = None,
+        store_aux_predicate: str | None = None,
     ) -> ast.stmt:
         """Build a role-local ``while`` for one extracted role block.
 
@@ -2558,7 +2562,12 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
                 role_prelude_stmts=role_prelude_stmts,
                 emit_pdl_wait=emit_pdl_wait,
                 initialize_tile_counter=initialize_tile_counter,
+                store_aux_per_tile_stmts=store_aux_per_tile_stmts,
+                store_aux_predicate=store_aux_predicate,
             )
+        assert store_aux_per_tile_stmts is None, (
+            "store-warp aux merge requires ROLE_LOCAL_WITH_SCHEDULER"
+        )
 
         # Match the shared scheduler's cluster shape so the role-local
         # scheduler visits the same tile sequence in the same order.
@@ -2673,6 +2682,8 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         role_prelude_stmts: list[ast.stmt] | None = None,
         emit_pdl_wait: bool = True,
         initialize_tile_counter: bool = True,
+        store_aux_per_tile_stmts: list[ast.stmt] | None = None,
+        store_aux_predicate: str | None = None,
     ) -> ast.stmt:
         """``ROLE_LOCAL_WITH_SCHEDULER`` consumer-side role-local while.
 
@@ -2706,7 +2717,6 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         # Per-role variable for the linearized virtual pid read out
         # of the SMEM mailbox each iteration.
         valid_var = device_function.new_var(f"{scheduler_var_prefix}_valid")
-        pure_scheduler = self._tcgen05_pure_clc_scheduler_object()
 
         prelude: list[ast.stmt] = []
         if (
@@ -2739,93 +2749,6 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
             if self._tcgen05_uses_staged_work_tile_mailbox()
             else None
         )
-
-        if pure_scheduler is not None:
-            sched_params_var = device_function.new_var(
-                f"{scheduler_var_prefix}_initial_tile_sched_params"
-            )
-            sched_var = device_function.new_var(
-                f"{scheduler_var_prefix}_initial_tile_sched"
-            )
-            work_tile_var = device_function.new_var(
-                f"{scheduler_var_prefix}_initial_work_tile"
-            )
-            cluster_bidx_var = device_function.new_var(
-                f"{scheduler_var_prefix}_cluster_bidx"
-            )
-            cluster_bidy_var = device_function.new_var(
-                f"{scheduler_var_prefix}_cluster_bidy"
-            )
-            cluster_bidz_var = device_function.new_var(
-                f"{scheduler_var_prefix}_cluster_bidz"
-            )
-            prelude.extend(
-                pure_scheduler.build_initial_work_tile_block(
-                    Tcgen05InitialWorkTileParams(
-                        scheduler_params=sched_params_var,
-                        scheduler_params_args=self._tcgen05_persistent_tile_sched_params_args(
-                            cluster_m=layout.cluster_m,
-                            cluster_n=layout.cluster_n,
-                        ),
-                        scheduler=sched_var,
-                        work_tile=work_tile_var,
-                        cluster_bidx=cluster_bidx_var,
-                        cluster_bidy=cluster_bidy_var,
-                        cluster_bidz=cluster_bidz_var,
-                        valid=valid_var,
-                        cluster_m=layout.cluster_m,
-                    )
-                )
-            )
-            coord_terms = [
-                cluster_bidx_var,
-                cluster_bidy_var,
-                cluster_bidz_var,
-            ][: len(self.pid_info)]
-            linear_pid_expr = self._tcgen05_linear_virtual_pid_from_coords_expr(
-                coord_terms
-            )
-            per_tile_body: list[ast.stmt] = [
-                statement_from_string(f"{self.virtual_pid_var} = {linear_pid_expr}"),
-            ]
-            if dependency_stmts is not None:
-                per_tile_body.extend(dependency_stmts)
-            per_tile_body.extend(role_block.stmts)
-            if tile_counter_var is not None and increment_tile_counter_per_tile:
-                per_tile_body.append(
-                    statement_from_string(
-                        f"{tile_counter_var} = {tile_counter_var} + cutlass.Int32(1)"
-                    )
-                )
-            per_tile_body.extend(
-                pure_scheduler.build_next_work_tile_consume_block(
-                    Tcgen05WorkTileConsumeParams(
-                        sched_pipeline=sched_pipeline,
-                        sched_consumer_state=sched_consumer_state,
-                        work_tile_smem=layout.work_tile_smem,
-                        valid=valid_var,
-                        cluster_bidx=cluster_bidx_var,
-                        cluster_bidy=cluster_bidy_var,
-                        cluster_bidz=cluster_bidz_var,
-                        work_tile_stage_index=work_tile_stage_index,
-                    )
-                )
-            )
-            prelude.append(
-                create(
-                    ast.While,
-                    test=expr_from_string(f"{valid_var} != cutlass.Int32(0)"),
-                    body=per_tile_body,
-                    orelse=[],
-                )
-            )
-
-            return create(
-                ast.If,
-                test=expr_from_string(role_block.role_predicate),
-                body=prelude,
-                orelse=[],
-            )
 
         # Linear virtual pid expression: the scheduler warp publishes
         # work-tile coordinates into ``layout.work_tile_smem``; we
@@ -2874,6 +2797,22 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         per_tile_body.extend(_consumer_release_block())
         if dependency_stmts is not None:
             per_tile_body.extend(dependency_stmts)
+        # Cycle-94 merge: inject the store warp's aux GMEM->SMEM residual
+        # producer body AFTER the tile coords are materialized and BEFORE the
+        # store body (whose epi-warp consumers read the freshly staged aux),
+        # gated on the store-warp predicate so only the single producer warp
+        # issues the loads. The epi loop already owns the per-warp sched
+        # handshake, so the injected body carries no sched wait/release.
+        if store_aux_per_tile_stmts is not None:
+            assert store_aux_predicate is not None
+            per_tile_body.append(
+                create(
+                    ast.If,
+                    test=expr_from_string(store_aux_predicate),
+                    body=[_clone_stmt(stmt) for stmt in store_aux_per_tile_stmts],
+                    orelse=[],
+                )
+            )
         per_tile_body.extend(role_block.stmts)
         if tile_counter_var is not None and increment_tile_counter_per_tile:
             per_tile_body.append(
@@ -2893,6 +2832,13 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         # Final release + advance for the sentinel publish (lane-0
         # gate matches the per-iteration release inside the loop).
         prelude.extend(_consumer_release_block())
+        # Cycle-94 merge: no post-loop aux producer tail is injected. The store
+        # warp's aux producer_state advance lives inside the per-tile store-warp
+        # branch of THIS while; a post-loop ``producer_tail(state)`` would
+        # reference a loop-carried value defined in that nested region (IR
+        # domination error). The boundary drain is unnecessary because the
+        # epi-warp consumers release every aux stage by loop exit (see
+        # ``_build_c_input_warp_role_local_while(inline_aux_only=...)``).
 
         return create(
             ast.If,
@@ -3258,63 +3204,38 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         sched_params_var = device_function.new_var("tcgen05_clc_initial_sched_params")
         sched_var = device_function.new_var("tcgen05_clc_initial_sched")
         work_tile_var = device_function.new_var("tcgen05_clc_initial_work_tile")
-        pure_scheduler = self._tcgen05_pure_clc_scheduler_object()
-        if pure_scheduler is not None:
-            clc_initial_block = pure_scheduler.build_initial_work_tile_block(
-                Tcgen05InitialWorkTileParams(
-                    scheduler_params=sched_params_var,
-                    scheduler_params_args=self._tcgen05_persistent_tile_sched_params_args(
-                        cluster_m=layout.cluster_m,
-                        cluster_n=layout.cluster_n,
-                    ),
-                    scheduler=sched_var,
-                    work_tile=work_tile_var,
-                    cluster_bidx=cluster_bidx_var,
-                    cluster_bidy=cluster_bidy_var,
-                    cluster_bidz=cluster_bidz_var,
-                    valid=valid_var,
-                    cluster_m=layout.cluster_m,
-                )
-            )
-        else:
-            clc_initial_block = [
-                # Build the persistent tile-scheduler params for the
-                # initial decode. ``layout.cluster_m/n`` agrees with the
-                # launch grid's cluster shape ``(cluster_m, cluster_n, 1)``.
-                statement_from_string(
-                    f"{sched_params_var} = cutlass.utils.PersistentTileSchedulerParams("
-                    f"{self._tcgen05_persistent_tile_sched_params_args(cluster_m=layout.cluster_m, cluster_n=layout.cluster_n)})"
-                ),
-                statement_from_string(
-                    f"{sched_var} = cutlass.utils.StaticPersistentTileScheduler.create("
-                    f"{sched_params_var}, cute.arch.block_idx(), cute.arch.grid_dim())"
-                ),
-                statement_from_string(
-                    f"{work_tile_var} = {sched_var}.initial_work_tile_info()"
-                ),
-                # Bind the initial cluster coords from the static
-                # scheduler's decode. ``tile_idx[0]`` is already the
-                # per-CTA M coordinate (= cluster_id_m * cluster_m +
-                # cta_in_cluster_m) since the static scheduler folds the
-                # cta_in_cluster offset in via
-                # ``_get_current_work_for_linear_idx``.
-                statement_from_string(
-                    f"{cluster_bidx_var} = {work_tile_var}.tile_idx[0]"
-                ),
-                statement_from_string(
-                    f"{cluster_bidy_var} = {work_tile_var}.tile_idx[1]"
-                ),
-                statement_from_string(
-                    f"{cluster_bidz_var} = {work_tile_var}.tile_idx[2]"
-                ),
-                # Initial valid flag: the scheduler warp only runs if
-                # the launcher placed it on a valid cluster. The CLC
-                # query handles invalidation for subsequent waves.
-                statement_from_string(
-                    f"{valid_var} = cutlass.Int32(1) "
-                    f"if {work_tile_var}.is_valid_tile else cutlass.Int32(0)"
-                ),
-            ]
+        clc_initial_block = [
+            # Build the persistent tile-scheduler params for the
+            # initial decode. ``layout.cluster_m/n`` agrees with the
+            # launch grid's cluster shape ``(cluster_m, cluster_n, 1)``.
+            statement_from_string(
+                f"{sched_params_var} = cutlass.utils.PersistentTileSchedulerParams("
+                f"{self._tcgen05_persistent_tile_sched_params_args(cluster_m=layout.cluster_m, cluster_n=layout.cluster_n)})"
+            ),
+            statement_from_string(
+                f"{sched_var} = cutlass.utils.StaticPersistentTileScheduler.create("
+                f"{sched_params_var}, cute.arch.block_idx(), cute.arch.grid_dim())"
+            ),
+            statement_from_string(
+                f"{work_tile_var} = {sched_var}.initial_work_tile_info()"
+            ),
+            # Bind the initial cluster coords from the static
+            # scheduler's decode. ``tile_idx[0]`` is already the
+            # per-CTA M coordinate (= cluster_id_m * cluster_m +
+            # cta_in_cluster_m) since the static scheduler folds the
+            # cta_in_cluster offset in via
+            # ``_get_current_work_for_linear_idx``.
+            statement_from_string(f"{cluster_bidx_var} = {work_tile_var}.tile_idx[0]"),
+            statement_from_string(f"{cluster_bidy_var} = {work_tile_var}.tile_idx[1]"),
+            statement_from_string(f"{cluster_bidz_var} = {work_tile_var}.tile_idx[2]"),
+            # Initial valid flag: the scheduler warp only runs if
+            # the launcher placed it on a valid cluster. The CLC
+            # query handles invalidation for subsequent waves.
+            statement_from_string(
+                f"{valid_var} = cutlass.Int32(1) "
+                f"if {work_tile_var}.is_valid_tile else cutlass.Int32(0)"
+            ),
+        ]
 
         # Per-tile publish: write (bidx, bidy, bidz, valid) into the
         # work-tile mailbox.
@@ -3349,37 +3270,10 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
             sched_producer_state if staged_work_tile_mailbox else sched_consumer_state
         )
         producer_smem_ptr = self._tcgen05_work_tile_producer_smem_ptr(layout)
-        pure_publish_params = None
         if layout.cluster_m > 1:
             sched_barrier_ptr = device_function.new_var("tcgen05_clc_sched_barrier_ptr")
             sched_peer_rank = device_function.new_var("tcgen05_clc_sched_peer_rank")
             sched_peer_m = device_function.new_var("tcgen05_clc_sched_peer_m")
-        if pure_scheduler is not None:
-            pure_publish_params = Tcgen05WorkTilePublishParams(
-                cluster_m=layout.cluster_m,
-                sched_pipeline=sched_pipeline,
-                sched_producer_state=sched_producer_state,
-                producer_barrier_state=producer_barrier_state,
-                producer_smem_ptr=producer_smem_ptr,
-                leader_predicate=leader_predicate,
-                sched_barrier_ptr=sched_barrier_ptr,
-                sched_peer_rank=sched_peer_rank,
-                sched_peer_m=sched_peer_m,
-                cluster_bidx=cluster_bidx_var,
-                cluster_bidy=cluster_bidy_var,
-                cluster_bidz=cluster_bidz_var,
-                valid=valid_var,
-                local_slots=(
-                    self._tcgen05_work_tile_producer_slot(layout, 0),
-                    self._tcgen05_work_tile_producer_slot(layout, 1),
-                    self._tcgen05_work_tile_producer_slot(layout, 2),
-                    self._tcgen05_work_tile_producer_slot(layout, 3),
-                ),
-            )
-            per_tile_publish_warp = pure_scheduler.build_work_tile_publish_block(
-                pure_publish_params
-            )
-        elif layout.cluster_m > 1:
             # Whole-warp prelude: every lane runs ``producer_acquire``
             # (mbarrier wait) and computes the warp-uniform barrier
             # pointer + lane id. Lanes ``cluster_m..31`` no-op past
@@ -3478,72 +3372,50 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         # consumer's ``virtual_pid = work_tile_smem[0] // cluster_m``
         # collapse continues to work.
         next_work_tile_var = device_function.new_var("tcgen05_clc_next_work_tile")
-        if pure_scheduler is not None:
-            clc_query_block = pure_scheduler.build_clc_query_block(
-                Tcgen05ClcQueryParams(
-                    leader_predicate=leader_predicate,
-                    clc_mbar_smem_ptr=clc_mbar_smem_ptr,
-                    clc_response_smem_ptr=clc_response_smem_ptr,
-                    clc_mbar_phase=clc_mbar_phase,
-                    cluster_m=layout.cluster_m,
-                    bidx=bidx_var,
-                    bidy=bidy_var,
-                    bidz=bidz_var,
-                    valid=valid_var,
-                    scheduler=sched_var,
-                    next_work_tile=next_work_tile_var,
-                    cluster_bidx=cluster_bidx_var,
-                    cluster_bidy=cluster_bidy_var,
-                    cluster_bidz=cluster_bidz_var,
-                )
-            )
-        else:
-            clc_helper_call = "_cute_issue_clc_query_nomulticast"
-            clc_query_block = [
-                statement_from_string("cute.arch.sync_warp()"),
-                create(
-                    ast.If,
-                    test=expr_from_string(leader_predicate),
-                    body=[
-                        statement_from_string(
-                            f"cute.arch.mbarrier_arrive_and_expect_tx("
-                            f"{clc_mbar_smem_ptr}, 16)"
-                        ),
-                        statement_from_string(
-                            f"{clc_helper_call}("
-                            f"{clc_mbar_smem_ptr}, {clc_response_smem_ptr})"
-                        ),
-                    ],
-                    orelse=[],
-                ),
-                statement_from_string("cute.arch.sync_warp()"),
-                statement_from_string(
-                    f"cute.arch.mbarrier_wait({clc_mbar_smem_ptr}, {clc_mbar_phase})"
-                ),
-                statement_from_string(
-                    f"{clc_mbar_phase} = {clc_mbar_phase} ^ cutlass.Int32(1)"
-                ),
-                statement_from_string(
-                    f"({bidx_var}, {bidy_var}, {bidz_var}, {valid_var}) = "
-                    f"cute.arch.clc_response({clc_response_smem_ptr})"
-                ),
-                statement_from_string("cute.arch.fence_view_async_shared()"),
-                statement_from_string(
-                    f"{sched_var}._current_work_linear_idx = {bidz_var}"
-                ),
-                statement_from_string(
-                    f"{next_work_tile_var} = {sched_var}.get_current_work()"
-                ),
-                statement_from_string(
-                    f"{cluster_bidx_var} = {next_work_tile_var}.tile_idx[0]"
-                ),
-                statement_from_string(
-                    f"{cluster_bidy_var} = {next_work_tile_var}.tile_idx[1]"
-                ),
-                statement_from_string(
-                    f"{cluster_bidz_var} = {next_work_tile_var}.tile_idx[2]"
-                ),
-            ]
+        clc_helper_call = "_cute_issue_clc_query_nomulticast"
+        clc_query_block = [
+            statement_from_string("cute.arch.sync_warp()"),
+            create(
+                ast.If,
+                test=expr_from_string(leader_predicate),
+                body=[
+                    statement_from_string(
+                        f"cute.arch.mbarrier_arrive_and_expect_tx("
+                        f"{clc_mbar_smem_ptr}, 16)"
+                    ),
+                    statement_from_string(
+                        f"{clc_helper_call}("
+                        f"{clc_mbar_smem_ptr}, {clc_response_smem_ptr})"
+                    ),
+                ],
+                orelse=[],
+            ),
+            statement_from_string("cute.arch.sync_warp()"),
+            statement_from_string(
+                f"cute.arch.mbarrier_wait({clc_mbar_smem_ptr}, {clc_mbar_phase})"
+            ),
+            statement_from_string(
+                f"{clc_mbar_phase} = {clc_mbar_phase} ^ cutlass.Int32(1)"
+            ),
+            statement_from_string(
+                f"({bidx_var}, {bidy_var}, {bidz_var}, {valid_var}) = "
+                f"cute.arch.clc_response({clc_response_smem_ptr})"
+            ),
+            statement_from_string("cute.arch.fence_view_async_shared()"),
+            statement_from_string(f"{sched_var}._current_work_linear_idx = {bidz_var}"),
+            statement_from_string(
+                f"{next_work_tile_var} = {sched_var}.get_current_work()"
+            ),
+            statement_from_string(
+                f"{cluster_bidx_var} = {next_work_tile_var}.tile_idx[0]"
+            ),
+            statement_from_string(
+                f"{cluster_bidy_var} = {next_work_tile_var}.tile_idx[1]"
+            ),
+            statement_from_string(
+                f"{cluster_bidz_var} = {next_work_tile_var}.tile_idx[2]"
+            ),
+        ]
 
         # ``per_tile_publish_warp`` already does its own per-lane
         # gating internally (lane-0-only commit for cluster_m=1, the
@@ -3551,24 +3423,12 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         # Inserting another leader-only ``if`` around it would gate
         # the entire publish to lane 0 and either skip the broadcast
         # to peer CTAs or stall only lane 0 on ``producer_acquire``.
-        if pure_scheduler is not None:
-            # Quack-style CLC lifecycle: consumer roles derive tile 0 locally.
-            # The scheduler warp therefore queries and publishes only the next
-            # work tile. The final invalid CLC response is published in-loop and
-            # terminates consumers; no extra sentinel publish is needed below.
-            per_tile_body = [
-                *clc_query_block,
-                *per_tile_publish_warp,
-                statement_from_string(emit_pipeline_advance(sched_producer_state)),
-                statement_from_string("cute.arch.sync_warp()"),
-            ]
-        else:
-            per_tile_body = [
-                *per_tile_publish_warp,
-                statement_from_string(emit_pipeline_advance(sched_producer_state)),
-                *clc_query_block,
-                statement_from_string("cute.arch.sync_warp()"),
-            ]
+        per_tile_body = [
+            *per_tile_publish_warp,
+            statement_from_string(emit_pipeline_advance(sched_producer_state)),
+            *clc_query_block,
+            statement_from_string("cute.arch.sync_warp()"),
+        ]
 
         prelude: list[ast.stmt] = []
         # PDL (programmatic dependent launch) hand-off: the scheduler
@@ -3585,10 +3445,8 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         prelude.append(statement_from_string("cute.arch.griddepcontrol_wait()"))
         prelude.extend(clc_init_block)
         prelude.extend(clc_initial_block)
-        # Producer loop: legacy paths publish the current tile and then query
-        # the next one. The pure scheduler object path queries first and
-        # publishes the next tile, matching Quack's initial-local / next-publish
-        # lifecycle. CuTe DSL forbids ``break`` so the loop test is on the
+        # Producer loop: publish the current tile and then query the next one.
+        # CuTe DSL forbids ``break`` so the loop test is on the
         # dynamically-updated ``valid_var``.
         # ``valid_var`` is Int32 because ``cute.arch.clc_response``
         # returns Int32 for the valid flag — comparing against 0
@@ -3601,106 +3459,93 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
                 orelse=[],
             )
         )
-        if pure_scheduler is not None:
-            prelude.extend(
-                [
-                    # The invalid work tile was already published by the final
-                    # in-loop query/publish iteration. The scheduler warp only
-                    # needs to drain the pipeline before exiting.
-                    statement_from_string(
-                        f"{sched_pipeline}.producer_tail({sched_producer_state})"
+        # Sentinel publish after the loop exits so the consumer warps'
+        # last-iteration wait sees an invalid tile and exits. The
+        # sentinel mirrors the in-loop publish exactly: cluster_m>1
+        # broadcasts ``(0, 0, 0, valid=0)`` to every peer CTA via
+        # ``_cute_store_shared_remote_x4``; cluster_m=1 writes
+        # locally. ``producer_acquire`` runs on every lane.
+        if layout.cluster_m > 1:
+            sentinel_warp: list[ast.stmt] = [
+                statement_from_string(
+                    f"{sched_pipeline}.producer_acquire({sched_producer_state})"
+                ),
+                # Remote stores arm the current full barrier, matching Quack's
+                # PipelineState pairing and the clustered static mailbox bridge.
+                statement_from_string(
+                    f"{sched_barrier_ptr} = "
+                    f"{sched_pipeline}.producer_get_barrier({producer_barrier_state})"
+                ),
+                statement_from_string(f"{sched_peer_rank} = cute.arch.lane_idx()"),
+                create(
+                    ast.If,
+                    test=expr_from_string(
+                        f"{sched_peer_rank} < cutlass.Int32({layout.cluster_m})"
                     ),
-                    statement_from_string("cute.arch.sync_warp()"),
-                ]
-            )
-        else:
-            # Sentinel publish after the loop exits so the consumer warps'
-            # last-iteration wait sees an invalid tile and exits. The
-            # sentinel mirrors the in-loop publish exactly: cluster_m>1
-            # broadcasts ``(0, 0, 0, valid=0)`` to every peer CTA via
-            # ``_cute_store_shared_remote_x4``; cluster_m=1 writes
-            # locally. ``producer_acquire`` runs on every lane.
-            if layout.cluster_m > 1:
-                sentinel_warp: list[ast.stmt] = [
-                    statement_from_string(
-                        f"{sched_pipeline}.producer_acquire({sched_producer_state})"
-                    ),
-                    # Remote stores arm the current full barrier, matching Quack's
-                    # PipelineState pairing and the clustered static mailbox bridge.
-                    statement_from_string(
-                        f"{sched_barrier_ptr} = "
-                        f"{sched_pipeline}.producer_get_barrier({producer_barrier_state})"
-                    ),
-                    statement_from_string(f"{sched_peer_rank} = cute.arch.lane_idx()"),
-                    create(
-                        ast.If,
-                        test=expr_from_string(
-                            f"{sched_peer_rank} < cutlass.Int32({layout.cluster_m})"
+                    body=[
+                        statement_from_string(
+                            "cute.arch.mbarrier_arrive_and_expect_tx("
+                            f"{sched_barrier_ptr}, 16, {sched_peer_rank})"
                         ),
-                        body=[
-                            statement_from_string(
-                                "cute.arch.mbarrier_arrive_and_expect_tx("
-                                f"{sched_barrier_ptr}, 16, {sched_peer_rank})"
-                            ),
-                            statement_from_string(
-                                f"_cute_store_shared_remote_x4("
-                                "cutlass.Int32(0), cutlass.Int32(0), "
-                                "cutlass.Int32(0), cutlass.Int32(0), "
-                                f"smem_ptr={producer_smem_ptr}, "
-                                f"mbar_ptr={sched_barrier_ptr}, "
-                                f"peer_cta_rank_in_cluster={sched_peer_rank})"
-                            ),
-                        ],
-                        orelse=[],
-                    ),
-                ]
-            else:
-                sentinel_warp = [
-                    statement_from_string(
-                        f"{sched_pipeline}.producer_acquire({sched_producer_state})"
-                    ),
-                    create(
-                        ast.If,
-                        test=expr_from_string(leader_predicate),
-                        body=[
-                            statement_from_string(
-                                f"{self._tcgen05_work_tile_producer_slot(layout, 0)} = "
-                                "cutlass.Int32(0)"
-                            ),
-                            statement_from_string(
-                                f"{self._tcgen05_work_tile_producer_slot(layout, 1)} = "
-                                "cutlass.Int32(0)"
-                            ),
-                            statement_from_string(
-                                f"{self._tcgen05_work_tile_producer_slot(layout, 2)} = "
-                                "cutlass.Int32(0)"
-                            ),
-                            statement_from_string(
-                                f"{self._tcgen05_work_tile_producer_slot(layout, 3)} = "
-                                "cutlass.Int32(0)"
-                            ),
-                            statement_from_string(
-                                f"{sched_pipeline}.producer_commit({sched_producer_state})"
-                            ),
-                        ],
-                        orelse=[],
-                    ),
-                ]
-            prelude.extend(
-                [
-                    *sentinel_warp,
-                    statement_from_string(emit_pipeline_advance(sched_producer_state)),
-                    # Quack drains the scheduler pipeline from the whole scheduler
-                    # warp after publishing the invalid work tile. Helion's
-                    # scheduler warp does not consume its own mailbox, so tail here
-                    # waits for consumer roles to release the sentinel before the
-                    # scheduler role exits.
-                    statement_from_string(
-                        f"{sched_pipeline}.producer_tail({sched_producer_state})"
-                    ),
-                    statement_from_string("cute.arch.sync_warp()"),
-                ]
-            )
+                        statement_from_string(
+                            f"_cute_store_shared_remote_x4("
+                            "cutlass.Int32(0), cutlass.Int32(0), "
+                            "cutlass.Int32(0), cutlass.Int32(0), "
+                            f"smem_ptr={producer_smem_ptr}, "
+                            f"mbar_ptr={sched_barrier_ptr}, "
+                            f"peer_cta_rank_in_cluster={sched_peer_rank})"
+                        ),
+                    ],
+                    orelse=[],
+                ),
+            ]
+        else:
+            sentinel_warp = [
+                statement_from_string(
+                    f"{sched_pipeline}.producer_acquire({sched_producer_state})"
+                ),
+                create(
+                    ast.If,
+                    test=expr_from_string(leader_predicate),
+                    body=[
+                        statement_from_string(
+                            f"{self._tcgen05_work_tile_producer_slot(layout, 0)} = "
+                            "cutlass.Int32(0)"
+                        ),
+                        statement_from_string(
+                            f"{self._tcgen05_work_tile_producer_slot(layout, 1)} = "
+                            "cutlass.Int32(0)"
+                        ),
+                        statement_from_string(
+                            f"{self._tcgen05_work_tile_producer_slot(layout, 2)} = "
+                            "cutlass.Int32(0)"
+                        ),
+                        statement_from_string(
+                            f"{self._tcgen05_work_tile_producer_slot(layout, 3)} = "
+                            "cutlass.Int32(0)"
+                        ),
+                        statement_from_string(
+                            f"{sched_pipeline}.producer_commit({sched_producer_state})"
+                        ),
+                    ],
+                    orelse=[],
+                ),
+            ]
+        prelude.extend(
+            [
+                *sentinel_warp,
+                statement_from_string(emit_pipeline_advance(sched_producer_state)),
+                # Quack drains the scheduler pipeline from the whole scheduler
+                # warp after publishing the invalid work tile. Helion's
+                # scheduler warp does not consume its own mailbox, so tail here
+                # waits for consumer roles to release the sentinel before the
+                # scheduler role exits.
+                statement_from_string(
+                    f"{sched_pipeline}.producer_tail({sched_producer_state})"
+                ),
+                statement_from_string("cute.arch.sync_warp()"),
+            ]
+        )
 
         # cluster_m>1: gate the CLC body to leader CTA only (Quack
         # pattern). Non-leader CTAs' scheduler warps idle while the
@@ -3733,9 +3578,25 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         *,
         shared_body_extracted: list[ast.stmt] | None = None,
         tile_phase: str = "all",
-    ) -> ast.stmt:
+        inline_aux_only: bool = False,
+    ) -> ast.stmt | list[ast.stmt]:
         """Build the C-input warp's role-local while
         (``cute_plan.md`` §7.5.3.2 producer-body split).
+
+        Workstream A Stage 5 (cycle 94, the merge): when ``inline_aux_only`` is
+        set, this does NOT build a self-contained role-local while (which would
+        be a second sched-pipeline consumer on the warp). Instead it returns the
+        per-tile aux GMEM->SMEM producer body (``list[ast.stmt]``) for the
+        CALLER to inject into the (widened) epilogue role-local while on the
+        STORE warp, which already owns the single per-warp sched-pipeline
+        handshake. This is how the store/epi-load warp does BOTH the early
+        residual load and the late TMA-D store drain in one loop at 8 warps. No
+        post-loop producer tail is returned (the aux producer_state advance is
+        inside the shared loop's store-warp branch, so a post-loop tail would
+        hit an IR domination error; the boundary drain is unnecessary because
+        the consumers release all stages by loop exit). ``inline_aux_only`` uses
+        the post-L2 ``tile_offset_0/1`` coords (always present in the epi loop's
+        dependency stmts), so it asserts the post-L2 path.
 
         Active when the matmul plan has ``c_input_warp_count > 0``
         AND the forward FX walker discovered one or more
@@ -3804,8 +3665,11 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         ``TestCuteTcgen05AuxPipelineCycle2a``).
         """
         plan = self._tcgen05_plan()
-        assert plan is not None and plan.has_c_input_warp, (
-            "C-input role-local while requires a matmul plan with has_c_input_warp=True"
+        # The aux producer runs on the C-input warp normally; under the cycle-94
+        # merge (``inline_aux_only``) it runs on the store warp instead, so the
+        # producer-warp invariant is "C-input OR store warp present".
+        assert plan is not None and (plan.has_c_input_warp or plan.has_store_warp), (
+            "aux producer body requires a matmul plan with a C-input or store warp"
         )
         c_input_aux_tensor_descriptors = plan.c_input_aux_tensor_descriptors
         assert c_input_aux_tensor_descriptors, (
@@ -4098,7 +3962,6 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         aux_producer_state_name = aux_pipeline_plan.producer_state
         aux_rings = aux_pipeline_plan.rings
         aux_epi_tile_var = aux_pipeline_plan.epi_tile_var
-        aux_stage_count = aux_pipeline_plan.stage_count
         aux_tma_barrier_var = (
             device_function.new_var("tcgen05_aux_tma_barrier")
             if aux_use_tma_load
@@ -4477,6 +4340,45 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
             lines.append(statement_from_string(loop_src))
             return lines
 
+        if inline_aux_only:
+            # Cycle-94 merge: return the per-tile aux producer body for injection
+            # into the store warp's branch of the (widened) epilogue role-local
+            # while. The epi loop owns the sched handshake and materializes the
+            # post-L2 tile coords, so no sched wait/release is emitted here. The
+            # full-tile guard mirrors the standalone builder so edge tiles (SIMT
+            # aux) commit no aux stages the consumer never releases.
+            #
+            # No post-loop ``producer_tail`` is returned: the aux producer_state
+            # is advanced inside the store-warp branch of the SHARED epilogue
+            # while, so a post-loop ``producer_tail(state)`` would reference a
+            # loop-carried value defined in that nested region (IR domination
+            # error). The tail is only a boundary drain for the TMA-load empty
+            # barriers, and the epi-warp consumers have already released every
+            # aux stage by loop exit, so it is safely omitted on the merge path.
+            assert has_post_l2_coords, (
+                "inline_aux_only merge requires post-L2 tile coords "
+                "(tile_offset_0/1) from the epilogue loop's dependency stmts"
+            )
+            inline_per_tile: list[ast.stmt] = []
+            aux_copy_lines_inline = _aux_copy_lines()
+            if aux_requires_full_tile:
+                inline_per_tile.extend(
+                    [
+                        statement_from_string(
+                            f"{aux_full_tile_var} = {aux_full_tile_expr}"
+                        ),
+                        create(
+                            ast.If,
+                            test=expr_from_string(aux_full_tile_var),
+                            body=aux_copy_lines_inline,
+                            orelse=[],
+                        ),
+                    ]
+                )
+            else:
+                inline_per_tile.extend(aux_copy_lines_inline)
+            return inline_per_tile
+
         prelude: list[ast.stmt] = []
         prelude.extend(_sched_consumer_wait_block())
         per_tile_body: list[ast.stmt] = [
@@ -4533,11 +4435,7 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         if aux_use_tma_load:
             prelude.append(
                 statement_from_string(
-                    emit_producer_tail_tma_async(
-                        aux_pipeline_name,
-                        aux_producer_state_name,
-                        num_stages=aux_stage_count,
-                    )
+                    f"{aux_pipeline_name}.producer_tail({aux_producer_state_name})"
                 )
             )
 
@@ -4839,6 +4737,39 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
             self._tcgen05_has_scheduler_warp()
             and cute_state.has_tcgen05_epi_role_full_edge_split
         )
+        # Cycle-94 merge gate: the store warp is the aux residual producer when
+        # there is a store warp, NO C-input warp, and a single-store-value
+        # exact-shape aux ring exists. In that case the aux GMEM->SMEM producer
+        # body is injected into the (widened) epilogue role-local while on the
+        # store warp rather than emitted as a standalone C-input role-local
+        # while (which would be a second per-warp sched consumer). The standalone
+        # C-input while below stays gated on ``has_c_input_warp`` and does not
+        # fire in the merge.
+        #
+        # TMA-ONLY: the merge injects a TMA bulk producer body; there is no SIMT
+        # store-warp producer. ``cute_mma._emit_mma_pipeline`` only allocates the
+        # aux pipeline for the store warp when ``aux_load_mode=tma``, so for
+        # ``store_warps=1 + SIMT aux`` the pipeline plan is absent and the gate
+        # closes (the kernel falls back to direct-GMEM aux). The
+        # ``use_tma_load`` check below makes that requirement explicit and
+        # defends against a future SIMT-producing aux plan reaching this path.
+        store_merge_plan = self._tcgen05_plan()
+        aux_plan_for_merge = device_function.cute_state.aux_pipeline_plan
+        store_aux_merge_active = (
+            store_merge_plan is not None
+            and store_merge_plan.has_store_warp
+            and not store_merge_plan.has_c_input_warp
+            and bool(store_merge_plan.c_input_aux_tensor_descriptors)
+            and len(
+                {
+                    d.store_value_node
+                    for d in store_merge_plan.c_input_aux_tensor_descriptors
+                }
+            )
+            <= 1
+            and aux_plan_for_merge is not None
+            and aux_plan_for_merge.use_tma_load
+        )
         for i, predicate in enumerate(ordered_predicates):
             stmts = merged[predicate]
             split_epi_role = (
@@ -4901,6 +4832,32 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
                         _clone_stmt(stmt) for stmt in epi_role_prelude_stmts
                     ]
                 suffix = f"_{phase}" if phase else ""
+                # Cycle-94 merge: build the store warp's aux producer body for
+                # injection into the epilogue role-local while. Only on the epi
+                # predicate, and (under a full/edge split) only the full-tile
+                # phase stages the aux ring — the edge phase uses SIMT direct
+                # GMEM aux, like the standalone C-input builder.
+                store_aux_per_tile_stmts: list[ast.stmt] | None = None
+                store_aux_predicate: str | None = None
+                if (
+                    store_aux_merge_active
+                    and predicate == self._tcgen05_epi_role_predicate()
+                    and phase != "edge"
+                ):
+                    aux_inline = self._build_c_input_warp_role_local_while(
+                        device_function,
+                        layout,
+                        shared_body_extracted=partition.shared_body_extracted,
+                        tile_phase="all",
+                        inline_aux_only=True,
+                    )
+                    assert isinstance(aux_inline, list)
+                    store_aux_per_tile_stmts = aux_inline
+                    assert store_merge_plan is not None
+                    store_aux_predicate = (
+                        "cute.arch.make_warp_uniform(cute.arch.warp_idx()) "
+                        f"== cutlass.Int32({store_merge_plan.store_warp_id})"
+                    )
                 role_local_whiles.append(
                     self._build_role_local_while(
                         device_function,
@@ -4911,6 +4868,8 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
                         role_prelude_stmts=role_prelude_stmts,
                         emit_pdl_wait=phase != "edge",
                         initialize_tile_counter=phase != "edge",
+                        store_aux_per_tile_stmts=store_aux_per_tile_stmts,
+                        store_aux_predicate=store_aux_predicate,
                     )
                 )
         # ``ROLE_LOCAL_WITH_SCHEDULER`` adds a fourth role-local while
@@ -4962,26 +4921,28 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
                 ("full", "edge") if use_full_edge_scheduler_split else ("all",)
             )
             for c_input_phase in c_input_phases:
-                role_local_whiles.append(
-                    self._build_c_input_warp_role_local_while(
-                        device_function,
-                        layout,
-                        # ``shared_body_extracted`` carries the post-PID-
-                        # decomposition statements (incl. the L2-grouping
-                        # ``pid_0`` / ``pid_1`` / ``tile_offset_0`` /
-                        # ``tile_offset_1`` chain). The C-input producer
-                        # body needs the same chain so its per-CTA aux
-                        # GMEM tile coords match the consumer's
-                        # post-L2-remapped tile coords — without this
-                        # the producer fetches a misaligned aux tile
-                        # under ``l2_groupings=[g>1]`` and the residual
-                        # add reads wrong rows / columns of the
-                        # auxiliary tensor (cycle 2i: 60-69% mismatched
-                        # elements vs eager).
-                        shared_body_extracted=partition.shared_body_extracted,
-                        tile_phase=c_input_phase,
-                    )
+                c_input_while = self._build_c_input_warp_role_local_while(
+                    device_function,
+                    layout,
+                    # ``shared_body_extracted`` carries the post-PID-
+                    # decomposition statements (incl. the L2-grouping
+                    # ``pid_0`` / ``pid_1`` / ``tile_offset_0`` /
+                    # ``tile_offset_1`` chain). The C-input producer
+                    # body needs the same chain so its per-CTA aux
+                    # GMEM tile coords match the consumer's
+                    # post-L2-remapped tile coords — without this
+                    # the producer fetches a misaligned aux tile
+                    # under ``l2_groupings=[g>1]`` and the residual
+                    # add reads wrong rows / columns of the
+                    # auxiliary tensor (cycle 2i: 60-69% mismatched
+                    # elements vs eager).
+                    shared_body_extracted=partition.shared_body_extracted,
+                    tile_phase=c_input_phase,
                 )
+                # ``inline_aux_only`` is False here, so the builder returns the
+                # full role-local while statement (not the merge tuple).
+                assert isinstance(c_input_while, ast.stmt)
+                role_local_whiles.append(c_input_while)
         return role_local_whiles, shared_tile_body
 
     def setup_persistent_kernel(

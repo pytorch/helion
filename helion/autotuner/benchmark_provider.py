@@ -600,7 +600,16 @@ class LocalBenchmarkProvider(BenchmarkProvider):
         )
 
     def cleanup(self) -> None:
-        """Release precompile tmpdir and related resources."""
+        """Release precompile tmpdir, baseline tensors, and the budget hook.
+
+        The budget hook installed by ``BaseSearch._prepare`` is a bound
+        method that holds a reference to the search; without resetting it
+        the search ``->`` provider ``->`` bound-method ``->`` search
+        reference cycle keeps both alive until the next cyclic GC pass.
+        Dropping the baseline tensors here lets refcount reclaim the
+        cloned-arg GPU memory deterministically as soon as the provider
+        loses its last external reference.
+        """
         if self._benchmark_worker is not None:
             self._benchmark_worker.shutdown()
             self._benchmark_worker = None
@@ -609,6 +618,15 @@ class LocalBenchmarkProvider(BenchmarkProvider):
             self._precompile_tmpdir = None
         self._precompile_args_path = None
         self._precompile_result_counter = count()
+        # Drop the baseline tensors (GPU memory) so refcount frees them
+        # the moment the provider loses its last external reference.
+        self._baseline_output = None
+        self._baseline_post_args = None
+        # Restore the class-level no-op default so the provider no longer
+        # holds a bound-method reference back to the search. Without this
+        # the search-provider-budget-hook cycle (search -> provider ->
+        # bound-method -> search) survives until cyclic GC runs.
+        self.budget_exceeded_fn = _never_exceeded
 
     def _subprocess_benchmark_uses_wall_clock(self) -> bool:
         backend = getattr(self.config_spec, "backend", None)

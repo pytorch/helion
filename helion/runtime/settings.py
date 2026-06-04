@@ -29,6 +29,7 @@ from .ref_mode import RefMode
 
 if TYPE_CHECKING:
     from ..autotuner.base_search import BaseAutotuner
+    from ..autotuner.base_search import BaseSearch
     from ..autotuner.pattern_search import InitialPopulationStrategy
     from .config import Config
     from .kernel import BoundKernel
@@ -284,8 +285,14 @@ def default_autotuner_fn(
         if k not in kwargs and k in parameters:
             kwargs[k] = v
 
-    # pyrefly: ignore [bad-argument-type]
-    autotuner = autotuner_cls(bound_kernel, args, **kwargs)
+    def autotuner_factory() -> BaseSearch:
+        """Build a fresh inner BaseSearch instance.
+
+        Used by the best-of-K cache layer to construct K independent
+        autotuner instances, one per trial.
+        """
+        # pyrefly: ignore [bad-argument-type]
+        return autotuner_cls(bound_kernel, args, **kwargs)
 
     cache_name = bound_kernel.settings.autotune_cache
     cache_cls = cache_classes.get(cache_name)
@@ -295,7 +302,11 @@ def default_autotuner_fn(
             f"{', '.join(cache_classes.keys())}"
         )
 
-    return cache_cls(autotuner)
+    # The cache layer's best-of-K loop calls ``autotuner_factory`` once per
+    # trial. The first construction here is the autotuner the cache wraps
+    # for the K=1 path; the factory is also passed through so K>1 trials can
+    # build additional fresh autotuners.
+    return cache_cls(autotuner_factory(), autotuner_factory=autotuner_factory)
 
 
 def _get_autotune_random_seed() -> int:
@@ -423,6 +434,9 @@ class _Settings:
     )
     autotune_random_seed: int = dataclasses.field(
         default_factory=_get_autotune_random_seed
+    )
+    autotune_best_of_k: int = dataclasses.field(
+        default_factory=functools.partial(_env_get_int, "HELION_AUTOTUNE_BEST_OF_K", 1)
     )
     autotune_accuracy_check: bool = dataclasses.field(
         default_factory=functools.partial(
@@ -613,6 +627,16 @@ class Settings(_Settings):
         "autotune_precompile": "Autotuner precompile mode: 'fork', 'spawn', or falsy/None to disable. Defaults to 'fork' on non-Windows platforms.",
         "autotune_precompile_jobs": "Maximum concurrent Triton precompile processes, default to cpu count.",
         "autotune_random_seed": "Seed used for autotuner random number generation. Defaults to HELION_AUTOTUNE_RANDOM_SEED or a time-based seed.",
+        "autotune_best_of_k": (
+            "When > 1, run autotuning K times with different random seeds and "
+            "keep the config with the best benchmark performance. Each trial "
+            "uses ``seed = autotune_random_seed + i`` for i in range(K), so two "
+            "runs with the same base seed produce the same K configs. Cost is "
+            "K× the autotune wall time. Cache entries are keyed on K, so a "
+            "K≥2 result will not be overwritten by a later K=1 run and "
+            "vice versa. Default 1 (current single-trial behavior). Set "
+            "HELION_AUTOTUNE_BEST_OF_K=N to override."
+        ),
         "autotune_accuracy_check": "If True, validate candidate configs against the baseline kernel output before accepting them during autotuning.",
         "autotune_rebenchmark_threshold": "If a config is within threshold*best_perf, re-benchmark it to avoid outliers. Defaults to effort profile value. Set HELION_REBENCHMARK_THRESHOLD to override.",
         "autotune_suspicious_rebenchmark_ratio": "When subprocess benchmarking is enabled, recheck rebenchmark timings below ratio*previous_timing before accepting them. Defaults to 0.9. Set HELION_AUTOTUNE_SUSPICIOUS_REBENCHMARK_RATIO=0 to disable.",
@@ -767,6 +791,13 @@ class Settings(_Settings):
 
         if self.backend == "tileir" and os.environ.get("ENABLE_TILE", "0") != "1":
             raise exc.MissingEnableTile
+
+        if self.autotune_best_of_k < 1:
+            raise ValueError(
+                f"autotune_best_of_k must be >= 1, got {self.autotune_best_of_k!r}; "
+                f"set HELION_AUTOTUNE_BEST_OF_K to a positive integer "
+                f"(default 1 = single-trial behavior)"
+            )
 
         self._check_ref_eager_mode_before_print_output_code()
 
