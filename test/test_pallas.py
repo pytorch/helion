@@ -1413,6 +1413,130 @@ class TestPallas(TestCase):
             search.config_spec = SimpleNamespace(backend_name=backend_name)  # pyrefly: ignore[bad-assignment]
             self.assertFalse(search._final_pick_supported())
 
+    def test_pallas_autotuner_final_pick_uses_interleaved_timing(self) -> None:
+        """Final-pick verification ranks by paired delta, not absolute median.
+
+        On a noisy TPU pod the per-call absolute median drifts 10-20% between
+        rebenchmarks, so two near-tied candidates can swap rank.  The paired
+        path times each candidate against the running best in the same window,
+        so common-mode drift cancels in the (candidate - best) delta.
+
+        Scenario: ``[512, 512, 512]`` is intrinsically 5us faster than
+        ``[256, 256, 256]`` (paired delta always +5us for the slow config), but
+        on this rebenchmark a DC drift offset pushed the fast config's absolute
+        median *above* the slow one's (240us vs 200us).  The paired path picks
+        the true-fast config; the legacy absolute-median path mis-ranks and
+        picks the slow one -- so paired timing is both necessary and sufficient.
+        """
+        from unittest.mock import patch
+
+        from helion.autotuner.base_search import PopulationBasedSearch
+        from helion.autotuner.base_search import PopulationMember
+        from helion.runtime.config import Config
+
+        fast_cfg = Config(block_sizes=[512, 512, 512])
+        slow_cfg = Config(block_sizes=[256, 256, 256])
+
+        def fast_fn() -> None:
+            return None
+
+        def slow_fn() -> None:
+            return None
+
+        def make_search() -> tuple[PopulationBasedSearch, PopulationMember]:
+            fast_member = PopulationMember(
+                fn=fast_fn,
+                perfs=[0.200],
+                flat_values=[id(fast_cfg)],
+                config=fast_cfg,
+                status="ok",
+                compile_time=0.0,
+            )
+            slow_member = PopulationMember(
+                fn=slow_fn,
+                perfs=[0.201],
+                flat_values=[id(slow_cfg)],
+                config=slow_cfg,
+                status="ok",
+                compile_time=0.0,
+            )
+            search = PopulationBasedSearch.__new__(PopulationBasedSearch)
+            search.population = [fast_member, slow_member]
+            search.best_perf_so_far = min(m.perf for m in search.population)
+            search.log = lambda *a, **kw: None  # pyrefly: ignore[bad-assignment]
+            return search, fast_member
+
+        # Absolute medians a noisy rebenchmark observes this round: a DC drift
+        # offset inflated the fast config above the slow one (240us vs 200us);
+        # the kernel-intrinsic paired delta still favors fast (slow is +5us).
+        fast_ms, slow_ms = 0.240, 0.200
+
+        def fake_paired(
+            fns: list[Callable[[], object]],
+            reference_fn: Callable[[], object],
+            *,
+            repeat: int,
+            desc: str | None = None,
+        ) -> list[tuple[float, float]]:
+            results: list[tuple[float, float]] = []
+            for fn in fns:
+                inner = getattr(fn, "func", fn)  # unwrap functools.partial
+                if inner is fast_fn:
+                    results.append((fast_ms, 0.0))
+                else:
+                    results.append((slow_ms, 0.005))  # +5us above the reference
+            return results
+
+        class _FakeBenchmarkProvider:
+            mutated_arg_indices: tuple[int, ...] = ()
+
+        class _FakeSettings:
+            autotune_benchmark_fn = None
+            autotune_progress_bar: bool = False
+
+        class _FakeKernel:
+            class env:
+                process_group_name: str | None = None
+
+        # Paired path: populate the real-autotune scaffolding so
+        # ``_paired_rebenchmark_available()`` returns True.
+        search, fast_member = make_search()
+        search.args = ()
+        search.kernel = _FakeKernel()  # pyrefly: ignore[bad-assignment]
+        search.benchmark_provider = _FakeBenchmarkProvider()  # pyrefly: ignore[bad-assignment]
+        search.settings = _FakeSettings()  # pyrefly: ignore[bad-assignment]
+        with patch(
+            "helion.autotuner.base_search.paired_interleaved_bench",
+            side_effect=fake_paired,
+        ):
+            paired_final = search.run_final_pick_verification(fast_member, top_k=5)
+        self.assertEqual(
+            list(paired_final.config["block_sizes"]),
+            [512, 512, 512],
+            "Paired final-pick must pick the true-fast config even when chip "
+            "drift inflates its absolute median above the slow config.",
+        )
+
+        # Legacy (paired=False) path on the same absolute medians picks slow,
+        # because 240us > 200us -- exactly the failure mode paired timing fixes.
+        def fake_rebenchmark(
+            members: list[PopulationMember], *, desc: str = ""
+        ) -> None:
+            for member in members:
+                member.perfs.append(fast_ms if member.config is fast_cfg else slow_ms)
+
+        search, fast_member = make_search()
+        with patch.object(search, "rebenchmark", side_effect=fake_rebenchmark):
+            legacy_final = search.run_final_pick_verification(
+                fast_member, top_k=5, paired=False
+            )
+        self.assertEqual(
+            list(legacy_final.config["block_sizes"]),
+            [256, 256, 256],
+            "Legacy absolute-median path mis-ranks the slow config as best when "
+            "drift flips the absolute median -- why paired timing is needed.",
+        )
+
     def test_bmm(self) -> None:
         """Test BMM with default config — exercises size_matches fix.
 
