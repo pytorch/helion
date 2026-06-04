@@ -44,6 +44,10 @@ jobs:
     env:
       HELION_AUTOTUNE_LOG_LEVEL: INFO
       HELION_BACKEND: ${{ inputs.backend }}
+      # Per-shape autotune convergence cutoff (90 min): healthy searches finish
+      # well under it (slowest ~69 min); non-converging runaways are stopped with
+      # best-so-far.
+      HELION_AUTOTUNE_BUDGET_SECONDS: "5400"
 
     container:
       image: ${{ inputs.image }}
