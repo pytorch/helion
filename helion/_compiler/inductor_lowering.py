@@ -106,6 +106,13 @@ def prepare_graph_lowerings(graph: torch.fx.Graph) -> None:
                 if node.op == "call_function":
                     with node.meta["location"]:
                         prepare_node_lowering(graph_lowering, node)
+                        lowering = node.meta.get("lowering")
+                        if isinstance(lowering, PointwiseLowering):
+                            # Catch the missing-keepdim broadcast bug at graph
+                            # build time (backend- and config-independent) so it
+                            # is rejected consistently on every backend, before
+                            # any config-specific validation or codegen.
+                            lowering._check_reduction_broadcast_keepdim(node)
 
 
 def prepare_node_lowering(
@@ -654,6 +661,77 @@ class PointwiseLowering(InductorLowering):
                 else:
                     exprs.add(size_i)
             if len(exprs) >= 2:
+                raise exc.ShapeMismatch(
+                    str(shapes[0]),
+                    ", ".join(map(str, shapes[1:])),
+                )
+
+    def _check_reduction_broadcast_keepdim(self, node: torch.fx.Node) -> None:
+        """Reject a reduction result broadcast against a *different* tile axis.
+
+        This is the missing-``keepdim`` bug: e.g.
+        ``x[tile_m, :] - torch.amax(x[tile_m, :], dim=1)`` drops the reduced N
+        axis, then the surviving M axis is right-aligned onto N (``[M, N] - [M]``).
+        It is rejected on **every** backend at graph-build time (so the error is
+        config- and backend-independent), unlike the size-coincidence leniency in
+        :meth:`_check_block_broadcast_compatibility` which would otherwise let
+        ``[M, N] - [M]`` through whenever the M and N block sizes happen to match.
+
+        The check is gated on an operand actually being a reduction result, so it
+        does **not** touch structurally-identical but legitimately-handled
+        patterns such as matmul-epilogue column-vector / aux-tensor broadcasts
+        (``acc + colvec[tile_m]``), which the backend's epilogue classifier owns
+        and rejects with its own actionable diagnostics.
+        """
+        env = CompileEnvironment.current()
+        if not any(
+            isinstance(inp.meta.get("lowering"), ReductionLowering)
+            for inp in node.all_input_nodes
+        ):
+            return
+        inputs = self.input_fake_tensors(node)
+        if len(inputs) < 2:
+            return
+
+        shapes: list[list[int | torch.SymInt]] = [[*t.size()] for t in inputs]
+        max_rank = max((len(s) for s in shapes), default=0)
+        for i, s in enumerate(shapes):
+            pad = max_rank - len(s)
+            if pad > 0:
+                shapes[i] = [1] * pad + s
+
+        def is_one(x: int | torch.SymInt) -> bool:
+            if isinstance(x, int):
+                return x == 1
+            expr = _symint_expr(x)
+            if isinstance(expr, sympy.Integer):
+                return int(expr) == 1
+            block_id = env.get_block_id(x)
+            if block_id is not None:
+                bs = env.block_sizes[block_id]
+                if isinstance(bs.block_size_source, FixedBlockSizeSource):
+                    val = bs.block_size_source.value
+                    if isinstance(val, int):
+                        return val == 1
+                    vexpr = _symint_expr(val) if isinstance(val, torch.SymInt) else None
+                    return isinstance(vexpr, sympy.Integer) and int(vexpr) == 1
+            return False
+
+        for dim in range(max_rank):
+            symbols: set[object] = set()
+            for s in shapes:
+                size_i = s[dim]
+                if is_one(size_i):
+                    continue
+                block_id = env.resolve_block_id(size_i)
+                if block_id is not None:
+                    symbols.add(
+                        env.block_sizes[env.canonical_block_id(block_id)].symbol()
+                    )
+            # Two *distinct* tile axes aligned in the same broadcast position is a
+            # wrong-axis (missing-keepdim) reduction broadcast, even when their
+            # current sizes coincide.
+            if len(symbols) >= 2:
                 raise exc.ShapeMismatch(
                     str(shapes[0]),
                     ", ".join(map(str, shapes[1:])),
