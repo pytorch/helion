@@ -31,6 +31,9 @@ from .._compiler.cute.tcgen05_constants import (
     TCGEN05_DIRECT_ENTRY_STAGE_TUPLES_BY_BK as _DIRECT_ENTRY_STAGE_TUPLES_BY_BK,
 )
 from .._compiler.cute.tcgen05_constants import TCGEN05_DIRECT_ENTRY_TOTAL_WORK_CLUSTERS
+from .._compiler.cute.tcgen05_constants import (
+    TCGEN05_TARGET10_TVM_FFI_SHAPE as _TCGEN05_TARGET10_TVM_FFI_SHAPE,
+)
 from .._utils import triton_is_available
 from .config import Config as Config
 from .kernel import Kernel as Kernel
@@ -2653,20 +2656,50 @@ def _validate_target1_direct_entry_args(
             "tcgen05 direct entry requires a validated stage tuple, got "
             f"bk={bk} (ab,c)=({ab_stage_count},{c_stage_count})",
         )
+    # The legacy validator pinned every direct-entry plan to bf16. T10
+    # (cycle 42, 2048³ bias) is the first fp16-admitting envelope; the
+    # admission is scoped to that exact ``(validated_shape, has_bias)``
+    # signature so T1-T9 still reject fp16 plans here.
+    plan_input_dtype = plan.get("input_dtype")
+    plan_output_dtype = plan.get("output_dtype")
+    indices = _target1_direct_entry_arg_indices(plan)
+    has_bias = len(indices) == 4
+    plan_validated_shape_raw = plan.get("validated_shape")
+    plan_validated_shape: tuple[int, int, int] | None = None
     if (
-        plan.get("input_dtype") != "cutlass.BFloat16"
-        or plan.get("output_dtype") != "cutlass.BFloat16"
+        isinstance(plan_validated_shape_raw, (list, tuple))
+        and len(plan_validated_shape_raw) == 3
+        and all(isinstance(v, int) for v in plan_validated_shape_raw)
     ):
+        plan_validated_shape = (
+            int(plan_validated_shape_raw[0]),
+            int(plan_validated_shape_raw[1]),
+            int(plan_validated_shape_raw[2]),
+        )
+    target10_dtype_admission_ok = (
+        plan_input_dtype == "cutlass.Float16"
+        and plan_output_dtype == "cutlass.Float16"
+        and has_bias
+        and plan_validated_shape == _TCGEN05_TARGET10_TVM_FFI_SHAPE
+    )
+    bf16_dtype_admission_ok = (
+        plan_input_dtype == "cutlass.BFloat16"
+        and plan_output_dtype == "cutlass.BFloat16"
+    )
+    if not (bf16_dtype_admission_ok or target10_dtype_admission_ok):
         raise exc.BackendUnsupported(
             "cute",
-            "tcgen05 direct entry requires bf16 input/output dtypes",
+            "tcgen05 direct entry requires bf16 input/output dtypes "
+            "(fp16 admitted only for the T10 2048³ bias envelope)",
         )
+    expected_arg_dtype = (
+        torch.float16 if target10_dtype_admission_ok else torch.bfloat16
+    )
+    expected_arg_dtype_label = "fp16" if expected_arg_dtype is torch.float16 else "bf16"
 
-    indices = _target1_direct_entry_arg_indices(plan)
-    # T1/T3/T4/T5 keep the 3-tensor (lhs/rhs/output) signature; T2 adds
-    # a 4th rank-1 trailing-axis bias tensor signalled by the plan's
-    # ``bias_idx`` (= ``indices[3]``).
-    has_bias = len(indices) == 4
+    # T1/T3/T4/T5 keep the 3-tensor (lhs/rhs/output) signature; T2, T6,
+    # and T10 add a 4th rank-1 trailing-axis bias tensor signalled by
+    # the plan's ``bias_idx`` (= ``indices[3]``).
     if not has_bias and (indices != (0, 1, 2) or len(args) != 3):
         raise exc.BackendUnsupported(
             "cute",
@@ -2686,10 +2719,10 @@ def _validate_target1_direct_entry_args(
                 "tcgen05 direct entry requires tensor arguments",
             )
         _validate_cute_launcher_tensor(arg)
-        if arg.dtype is not torch.bfloat16:
+        if arg.dtype is not expected_arg_dtype:
             raise exc.BackendUnsupported(
                 "cute",
-                "tcgen05 direct entry requires bf16 tensor arguments",
+                f"tcgen05 direct entry requires {expected_arg_dtype_label} tensor arguments",
             )
         if arg.ndim != 2 or int(arg.stride(1)) != 1:
             raise exc.BackendUnsupported(
@@ -2710,18 +2743,13 @@ def _validate_target1_direct_entry_args(
     # asserts that the plan's ``validated_shape`` is one of the
     # bk-allowed shapes (so a future plan-construction-site bug that
     # forged an off-envelope shape into a plan still gets caught).
-    validated_shape_raw = plan.get("validated_shape")
-    if not (
-        isinstance(validated_shape_raw, (list, tuple))
-        and len(validated_shape_raw) == 3
-        and all(isinstance(v, int) for v in validated_shape_raw)
-    ):
+    if plan_validated_shape is None:
         raise exc.BackendUnsupported(
             "cute",
             f"tcgen05 direct entry plan requires validated_shape, got "
-            f"{validated_shape_raw!r}",
+            f"{plan_validated_shape_raw!r}",
         )
-    plan_m, plan_n, plan_k = (int(v) for v in validated_shape_raw)
+    plan_m, plan_n, plan_k = plan_validated_shape
     bk_allowed_shapes = _DIRECT_ENTRY_SHAPE_SETS_BY_BK.get(bk, ())
     expected_lhs = (plan_m, plan_k)
     expected_rhs = (plan_k, plan_n)
@@ -2752,15 +2780,20 @@ def _validate_target1_direct_entry_args(
                 "tcgen05 direct entry bias requires a tensor argument",
             )
         _validate_cute_launcher_tensor(bias_arg)
-        if bias_arg.dtype is not torch.bfloat16:
+        # T2/T6 stay pinned to bf16 (their plans set
+        # ``plan_input_dtype == 'cutlass.BFloat16'``); T10 admits an fp16
+        # bias whose dtype must match the operand dtype recorded in the
+        # plan (``expected_arg_dtype`` above).
+        if bias_arg.dtype is not expected_arg_dtype:
             raise exc.BackendUnsupported(
                 "cute",
-                "tcgen05 direct entry bias requires a bf16 tensor",
+                f"tcgen05 direct entry bias requires a {expected_arg_dtype_label} tensor",
             )
-        # The bias tensor for T2 is rank-1 with N elements (trailing-axis
-        # rowvec broadcast); stride must be 1 so the GMEM load uses
-        # contiguous reads. The N-extent matches the matmul's N to keep
-        # the bias broadcast aligned with the output tile columns.
+        # The bias tensor for T2/T6/T10 is rank-1 with N elements
+        # (trailing-axis rowvec broadcast); stride must be 1 so the GMEM
+        # load uses contiguous reads. The N-extent matches the matmul's
+        # N to keep the bias broadcast aligned with the output tile
+        # columns.
         if (
             bias_arg.ndim != 1
             or int(bias_arg.stride(0)) != 1
@@ -2769,7 +2802,7 @@ def _validate_target1_direct_entry_args(
             raise exc.BackendUnsupported(
                 "cute",
                 "tcgen05 direct entry bias requires a contiguous rank-1 "
-                f"bf16 tensor of shape ({plan_n},), got shape "
+                f"{expected_arg_dtype_label} tensor of shape ({plan_n},), got shape "
                 f"{tuple(int(bias_arg.size(d)) for d in range(bias_arg.ndim))!r} "
                 f"stride {tuple(int(bias_arg.stride(d)) for d in range(bias_arg.ndim))!r}",
             )
@@ -3201,6 +3234,27 @@ def _get_compiled_cute_direct_entry_launcher(
     return launcher
 
 
+_TVM_FFI_COMPILE_OPTION = "--enable-tvm-ffi"
+
+
+def _merge_tvm_ffi_compile_option(compile_options: str | None) -> str:
+    """Ensure ``--enable-tvm-ffi`` is present in *compile_options*.
+
+    The generic launcher always benefits from the FFI bridge (it skips
+    CUTLASS-DSL's per-arg cast/pointer work). Other flags such as
+    ``--generate-line-info`` may already be present (e.g. when the
+    autotuner picks ``tcgen05_cubin_lineinfo=True``), so we splice rather
+    than replace.
+    """
+    if compile_options is None:
+        return _TVM_FFI_COMPILE_OPTION
+    tokens = compile_options.split()
+    if _TVM_FFI_COMPILE_OPTION in tokens:
+        return compile_options
+    tokens.append(_TVM_FFI_COMPILE_OPTION)
+    return " ".join(tokens)
+
+
 def _get_compiled_cute_launcher(
     cute_kernel: object,
     schema_key: tuple[tuple[object, ...], ...],
@@ -3208,6 +3262,15 @@ def _get_compiled_cute_launcher(
     compile_options: str | None = None,
     arch_args: tuple[object, ...] | None = None,
 ) -> object:
+    # Always ensure ``--enable-tvm-ffi`` is present on the generic launcher
+    # path: the generated wrapper signature (``cute.Pointer`` + scalars) is
+    # TVM-FFI compatible and the FFI bridge bypasses CUTLASS-DSL's per-arg
+    # cast/pointer work in ``generate_execution_args``. We merge rather
+    # than replace because other flags (e.g. ``--generate-line-info`` when
+    # ``tcgen05_cubin_lineinfo`` is True) can already be in
+    # ``compile_options``. The direct-entry path is unaffected -- it goes
+    # through ``_CompiledCuteDirectEntryLauncher`` with an explicit value.
+    compile_options = _merge_tvm_ffi_compile_option(compile_options)
     try:
         # pyrefly: ignore [missing-attribute]
         cache = cute_kernel._helion_cute_compiled_launchers
