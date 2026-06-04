@@ -1552,8 +1552,11 @@ def run_kernel_variants(
                 if isinstance(kfunc, Kernel):
                     # Helion kernel - we call it in a lambda to delay execution until measurement
                     if operator_name == "flash_attention":
+                        # examples.attention.attention returns (out, lse); the
+                        # tritonbench flash_attention operator only compares the
+                        # output tensor, so unwrap it before wrapping in a list.
                         measured_func_callable = lambda: [  # noqa: E731
-                            kfunc(*args, **kwargs)
+                            kfunc(*args, **kwargs)[0]
                         ]
                     else:
                         measured_func_callable = lambda: kfunc(*args, **kwargs)  # noqa: E731
