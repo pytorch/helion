@@ -25,14 +25,20 @@ from .._compiler.cute.strategies import tcgen05_explicit_d_store_tile_expr
 from .._compiler.cute.strategies import tcgen05_smem_layout_expr
 from .._compiler.cute.tcgen05_constants import TCGEN05_DIRECT_ENTRY_CLUSTER_M
 from .._compiler.cute.tcgen05_constants import (
-    TCGEN05_DIRECT_ENTRY_SHAPE_SETS_BY_BK as _DIRECT_ENTRY_SHAPE_SETS_BY_BK,
-)
-from .._compiler.cute.tcgen05_constants import (
     TCGEN05_DIRECT_ENTRY_STAGE_TUPLES_BY_BK as _DIRECT_ENTRY_STAGE_TUPLES_BY_BK,
 )
 from .._compiler.cute.tcgen05_constants import TCGEN05_DIRECT_ENTRY_TOTAL_WORK_CLUSTERS
 from .._compiler.cute.tcgen05_constants import (
     TCGEN05_TARGET10_TVM_FFI_SHAPE as _TCGEN05_TARGET10_TVM_FFI_SHAPE,
+)
+from .._compiler.cute.tcgen05_constants import (
+    TCGEN05_TWO_CTA_BLOCK_M as _TCGEN05_TWO_CTA_BLOCK_M,
+)
+from .._compiler.cute.tcgen05_constants import (
+    TCGEN05_TWO_CTA_BLOCK_N as _TCGEN05_TWO_CTA_BLOCK_N,
+)
+from .._compiler.cute.tcgen05_constants import (
+    TCGEN05_TWO_CTA_MAX_K_TILES as _TCGEN05_TWO_CTA_MAX_K_TILES,
 )
 from .._utils import triton_is_available
 from .config import Config as Config
@@ -2732,18 +2738,12 @@ def _validate_target1_direct_entry_args(
             )
         arg_shapes.append(tuple(int(arg.size(dim)) for dim in range(arg.ndim)))
     observed_shapes = tuple(arg_shapes)
-    # B1 (cycle-3 review): each direct-entry plan carries its
-    # validated problem shape so the validator can dispatch on the
-    # exact (M, N, K) envelope baked into the plan. T4 and T5 share
-    # ``bk=128`` (and the same ``(ab,c)`` stage tuple and cluster
-    # geometry), so the bk-keyed shape-set alone cannot distinguish
-    # a T4-plan from a T5-plan — the plan-carried ``validated_shape``
-    # is what keeps them apart at the validator boundary. The legacy
-    # bk-keyed shape-set (``_DIRECT_ENTRY_SHAPE_SETS_BY_BK``) remains
-    # as defense-in-depth: the per-plan check below additionally
-    # asserts that the plan's ``validated_shape`` is one of the
-    # bk-allowed shapes (so a future plan-construction-site bug that
-    # forged an off-envelope shape into a plan still gets caught).
+    # Each direct-entry plan carries its validated problem shape so the
+    # validator can dispatch on the exact (M, N, K) envelope baked into the
+    # plan. The per-plan check below asserts that the plan's
+    # ``validated_shape`` satisfies the structural CtaGroup.TWO constraints
+    # for the plan's ``bk`` (so a plan-construction-site bug that forged an
+    # off-envelope shape into a plan still gets caught).
     if plan_validated_shape is None:
         raise exc.BackendUnsupported(
             "cute",
@@ -2751,17 +2751,30 @@ def _validate_target1_direct_entry_args(
             f"{plan_validated_shape_raw!r}",
         )
     plan_m, plan_n, plan_k = plan_validated_shape
-    bk_allowed_shapes = _DIRECT_ENTRY_SHAPE_SETS_BY_BK.get(bk, ())
     expected_lhs = (plan_m, plan_k)
     expected_rhs = (plan_k, plan_n)
     expected_d = (plan_m, plan_n)
     expected_shapes = (expected_lhs, expected_rhs, expected_d)
-    if expected_shapes not in bk_allowed_shapes:
+    # The direct-entry codegen builds its A/B/D TMA descriptors from the runtime
+    # tensor shapes, so the fast launch path is shape-GENERAL. Admit any shape
+    # that satisfies the structural CtaGroup.TWO constraints the descriptors and
+    # the (bm=bn=256, cluster_m=2) tiling require: M/N divisible by the 256 CTA
+    # tile and K an exact multiple of the K tile within the validated K-tile cap.
+    structural_shape_ok = (
+        plan_m % _TCGEN05_TWO_CTA_BLOCK_M == 0
+        and plan_n % _TCGEN05_TWO_CTA_BLOCK_N == 0
+        and bk > 0
+        and plan_k % bk == 0
+        and plan_k // bk <= _TCGEN05_TWO_CTA_MAX_K_TILES
+    )
+    if not structural_shape_ok:
         raise exc.BackendUnsupported(
             "cute",
-            f"tcgen05 direct entry plan bk={bk} carries unvalidated "
-            f"validated_shape={plan_m, plan_n, plan_k}; bk-allowed shape "
-            f"envelopes are {bk_allowed_shapes!r}",
+            f"tcgen05 direct entry plan bk={bk} validated_shape="
+            f"{plan_m, plan_n, plan_k} is not a structurally valid CtaGroup.TWO "
+            f"shape (need M%{_TCGEN05_TWO_CTA_BLOCK_M}==0, "
+            f"N%{_TCGEN05_TWO_CTA_BLOCK_N}==0, K%bk==0, "
+            f"K/bk<={_TCGEN05_TWO_CTA_MAX_K_TILES})",
         )
     if observed_shapes != expected_shapes:
         raise exc.BackendUnsupported(

@@ -430,20 +430,31 @@ def enforce_dot_requirements(lhs: torch.Tensor, rhs: torch.Tensor) -> None:
             allow_cluster_m2_search = (
                 allow_full_tile_cluster_m2_search or allow_edge_cluster_m2_search
             )
-            # Small-shape wave-quantization gate. Suppress cluster_m=2
-            # search when the cluster_m=2 work-cluster count cannot fill
-            # one wave of cluster slots (``num_sms // 2``); the persistent
-            # warp-spec prologue dominates and cluster_m=1 wins. ``num_sms
-            # == 0`` (non-CUDA / mocked) keeps search live. See
-            # cute_plan.md §7.6.3.2 for the NCU rationale and B200 numbers.
+            # Small-shape wave-quantization gate. Suppress cluster_m=2 search
+            # only for genuinely tiny problems that cannot fill a meaningful
+            # fraction of the device; below that the persistent warp-spec
+            # prologue dominates and cluster_m=1 wins. The original gate used
+            # ``num_sms // 2`` (one full wave of 2-SM cluster slots), but that
+            # was calibrated for the DEFAULT-layout cluster_m=2 path. The
+            # generalized TVM-FFI direct entry (see
+            # ``CuteTcgen05ClusterM2FfiHeuristic``) has a much lower launch +
+            # epilogue overhead, which shifts the cluster_m=1/2 crossover well
+            # below one wave: full-autotune A/B on B200 shows cluster_m=2 + FFI
+            # winning at 64 work clusters (1024x4096x1024 and 2048^3, ~64
+            # clusters on the 148-SM B200 = 0.86 of a wave) by 7-21% over
+            # cluster_m=1. Use ``num_sms // 4`` so those validated shapes are
+            # admitted on current and larger Blackwell SKUs while still
+            # suppressing the truly tiny shapes (fewer than a quarter-wave of
+            # cluster slots) that have no FFI coverage. ``num_sms == 0`` (non-CUDA / mocked) keeps search
+            # live. See cute_plan.md §7.6.3.2 for the original NCU rationale.
             if allow_cluster_m2_search:
                 num_sms_for_cm2_threshold = _cuda_num_sms_or_zero(lhs.device)
                 if num_sms_for_cm2_threshold > 0:
                     cm2_work_clusters = (static_m // TCGEN05_TWO_CTA_BLOCK_M) * (
                         static_n // TCGEN05_TWO_CTA_BLOCK_N
                     )
-                    cm2_one_wave_slots = num_sms_for_cm2_threshold // 2
-                    if cm2_work_clusters < cm2_one_wave_slots:
+                    cm2_min_clusters = num_sms_for_cm2_threshold // 4
+                    if cm2_work_clusters < cm2_min_clusters:
                         allow_cluster_m2_search = False
             # Narrow the autotune search to tcgen05 configs that have been
             # validated to compile and run correctly on B200. Static full-tile

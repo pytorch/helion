@@ -4015,10 +4015,9 @@ class TestCuteLowerings(unittest.TestCase):
 
         P2 (cycle-6 review): the runtime validator only admits bf16 bias
         tensors, so the codegen walker
-        ``_trace_mma_to_single_bias_store_dtype`` and the host detector
-        ``host_function_has_tcgen05_bias_matmul_store_pattern`` must
-        reject non-bf16 bias loads. Otherwise an fp32 bias would reach
-        a direct-entry plan and fail only at launch.
+        ``_trace_mma_to_single_bias_store_dtype`` must reject non-bf16
+        bias loads. Otherwise an fp32 bias would reach a direct-entry
+        plan and fail only at launch.
         """
         args = (
             torch.empty([4096, 2048], device=DEVICE, dtype=torch.bfloat16),
@@ -4050,16 +4049,10 @@ class TestCuteLowerings(unittest.TestCase):
         )
         with patch_cute_mma_support():
             bound = cute_matmul_role_local_monolithic_bias_bf16.bind(args)
-            # The fp32 bias must not enable the T2 seed at the
-            # detector level — confirm at the autotune surface.
-            self.assertFalse(
-                bound.env.config_spec.cute_tcgen05_bias_matmul_store_detected
-            )
             bound.env.config_spec.cute_tcgen05_search_enabled = True
-            # And at the codegen walker — forcing the direct-entry
-            # plan key with an fp32 bias must reject at codegen rather
-            # than emit a plan that the runtime validator would then
-            # reject at launch.
+            # The codegen walker — forcing the direct-entry plan key with
+            # an fp32 bias must reject at codegen rather than emit a plan
+            # that the runtime validator would then reject at launch.
             with self.assertRaisesRegex(
                 exc.BackendUnsupported,
                 "T2 bias-store",
@@ -4351,10 +4344,9 @@ class TestCuteLowerings(unittest.TestCase):
 
         Mirrors the cycle-6 P2 review for T2: the runtime validator
         only admits bf16 bias tensors, so the codegen walker
-        ``_trace_mma_to_single_bias_relu_store_dtype`` and the host
-        detector ``host_function_has_tcgen05_bias_relu_matmul_store_pattern``
-        must reject non-bf16 bias loads. Otherwise an fp32 bias would
-        reach a direct-entry plan and fail only at launch.
+        ``_trace_mma_to_single_bias_relu_store_dtype`` must reject
+        non-bf16 bias loads. Otherwise an fp32 bias would reach a
+        direct-entry plan and fail only at launch.
         """
         args = (
             torch.empty([8192, 2048], device=DEVICE, dtype=torch.bfloat16),
@@ -4386,16 +4378,10 @@ class TestCuteLowerings(unittest.TestCase):
         )
         with patch_cute_mma_support():
             bound = cute_matmul_role_local_monolithic_bias_relu_bf16.bind(args)
-            # The fp32 bias must not enable the T6 seed at the
-            # detector level — confirm at the autotune surface.
-            self.assertFalse(
-                bound.env.config_spec.cute_tcgen05_bias_relu_matmul_store_detected
-            )
             bound.env.config_spec.cute_tcgen05_search_enabled = True
-            # And at the codegen walker — forcing the direct-entry
-            # plan key with an fp32 bias must reject at codegen rather
-            # than emit a plan that the runtime validator would then
-            # reject at launch.
+            # The codegen walker — forcing the direct-entry plan key with
+            # an fp32 bias must reject at codegen rather than emit a plan
+            # that the runtime validator would then reject at launch.
             with self.assertRaisesRegex(
                 exc.BackendUnsupported,
                 # Anchor on the full enumerated tail of the

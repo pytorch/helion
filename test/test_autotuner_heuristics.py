@@ -17,11 +17,8 @@ from helion._compiler.backend import TritonBackend
 from helion._compiler.cute.strategies import TCGEN05_LAYOUT_OVERRIDES_D_STORE_BOX_N_KEY
 from helion._compiler.cute.strategies import TCGEN05_LAYOUT_OVERRIDES_EPI_TILE_M_KEY
 from helion._compiler.cute.strategies import TCGEN05_LAYOUT_OVERRIDES_EPI_TILE_N_KEY
-from helion._compiler.cute.strategies import TCGEN05_LAYOUT_OVERRIDES_SWIZZLE_A_KEY
-from helion._compiler.cute.strategies import TCGEN05_LAYOUT_OVERRIDES_SWIZZLE_B_KEY
 from helion._compiler.cute.strategies import TCGEN05_LAYOUT_STRATEGY_CONFIG_KEY
 from helion._compiler.cute.strategies import TCGEN05_PERSISTENCE_MODEL_CONFIG_KEY
-from helion._compiler.cute.strategies import TCGEN05_STRATEGY_CONFIG_KEY
 from helion._compiler.cute.strategies import TCGEN05_WARP_SPEC_C_INPUT_WARPS_KEY
 from helion._compiler.cute.strategies import TCGEN05_WARP_SPEC_SCHEDULER_WARPS_KEY
 from helion._compiler.cute.strategies import Tcgen05LayoutStrategy
@@ -29,8 +26,6 @@ from helion._compiler.cute.strategies import Tcgen05PersistenceModel
 from helion._compiler.cute.strategies import Tcgen05Strategy
 from helion._compiler.cute.tcgen05_config import CuteTcgen05Config
 from helion._compiler.cute.tcgen05_config import Tcgen05ClusterM2SearchConstraints
-from helion._compiler.cute.tcgen05_constants import TCGEN05_ACC_PRODUCER_MODE_CONFIG_KEY
-from helion._compiler.cute.tcgen05_constants import TCGEN05_ACC_PRODUCER_MODE_SKIP_UMMA
 from helion._compiler.cute.tcgen05_constants import (
     TCGEN05_ACC_WAIT_PLACEMENT_BEFORE_SUBTILE_LOOP,
 )
@@ -45,30 +40,9 @@ from helion._compiler.cute.tcgen05_constants import (
 from helion._compiler.cute.tcgen05_constants import (
     TCGEN05_C_ACQUIRE_PLACEMENT_FIRST_IN_LOOP,
 )
-from helion._compiler.cute.tcgen05_constants import TCGEN05_C_STORE_MODE_CONFIG_KEY
-from helion._compiler.cute.tcgen05_constants import (
-    TCGEN05_C_STORE_MODE_SKIP_EPILOGUE_STORE,
-)
-from helion._compiler.cute.tcgen05_constants import TCGEN05_CUBIN_LINEINFO_CONFIG_KEY
-from helion._compiler.cute.tcgen05_constants import (
-    TCGEN05_DIAGNOSTIC_INVALID_OUTPUT_CONFIG_KEY,
-)
-from helion._compiler.cute.tcgen05_constants import TCGEN05_EPILOGUE_LAYOUT_CONFIG_KEY
-from helion._compiler.cute.tcgen05_constants import (
-    TCGEN05_EPILOGUE_LAYOUT_SPLIT_FIRST_T2R,
-)
 from helion._compiler.cute.tcgen05_constants import (
     TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY,
 )
-from helion._compiler.cute.tcgen05_constants import (
-    TCGEN05_PURE_CLC_SCHEDULER_OBJECT_CONFIG_KEY,
-)
-from helion._compiler.cute.tcgen05_constants import TCGEN05_TARGET1_TVM_FFI_AB_STAGES
-from helion._compiler.cute.tcgen05_constants import TCGEN05_TARGET1_TVM_FFI_BLOCK_K
-from helion._compiler.cute.tcgen05_constants import TCGEN05_TARGET1_TVM_FFI_C_STAGES
-from helion._compiler.cute.tcgen05_constants import TCGEN05_TARGET8_GELU_AB_STAGES
-from helion._compiler.cute.tcgen05_constants import TCGEN05_TARGET8_GELU_BLOCK_K
-from helion._compiler.cute.tcgen05_constants import TCGEN05_TARGET8_GELU_C_STAGES
 from helion._compiler.cute.tcgen05_constants import TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY
 from helion._compiler.cute.tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_M
 from helion._compiler.cute.tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_N
@@ -988,7 +962,15 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
             )
 
     @onlyBackends(["cute"])
-    def test_cute_tcgen05_target1_tvm_ffi_seed_config(self) -> None:
+    def test_cute_tcgen05_full_tile_ffi_seed_config(self) -> None:
+        # The generalized FFI direct-entry seed drives ANY eligible bf16
+        # full-tile CtaGroup.TWO matmul (it replaced the bank of per-shape
+        # ``_target{N}`` seeds). The seed itself now lives on the
+        # ConfigSpec/CuteTcgen05Config and is emitted into the autotuner
+        # population by ``CuteTcgen05ClusterM2FfiHeuristic``; it is no longer
+        # part of ``autotune_seed_configs()`` (that chain is now only the
+        # c-input family). This asserts the eligibility gate + the generalized
+        # seed envelope plus the surviving search projection behavior.
         @helion.kernel(backend="cute")
         def cute_matmul_mma(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
             m, k = x.size()
@@ -1010,28 +992,119 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
             patch("helion.language.matmul_ops._cuda_num_sms_or_zero", return_value=132),
         ):
             bound = cute_matmul_mma.bind(args)
-        tvm_ffi_seeds = [
-            config.config
-            for config in bound.config_spec.autotune_seed_configs()
-            if config.config.get(TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY) is True
-        ]
-        self.assertEqual(len(tvm_ffi_seeds), 1)
-        seed = tvm_ffi_seeds[0]
+        spec = bound.config_spec
+        self.assertTrue(spec._tcgen05_full_tile_direct_entry_seed_eligible())
+        seed_config = spec._tcgen05_full_tile_direct_entry_seed_config()
+        self.assertIsNotNone(seed_config)
+        seed = seed_config.config
+        self.assertIs(seed[TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY], True)
+        self.assertEqual(
+            seed[TCGEN05_LAYOUT_STRATEGY_CONFIG_KEY],
+            Tcgen05LayoutStrategy.EXPLICIT_EPI_TILE.value,
+        )
+        bk = spec._tcgen05_full_tile_direct_entry_seed_bk()
+        self.assertIsNotNone(bk)
         self.assertEqual(
             seed["block_sizes"],
-            [
-                TCGEN05_TWO_CTA_BLOCK_M,
-                TCGEN05_TWO_CTA_BLOCK_N,
-                TCGEN05_TARGET1_TVM_FFI_BLOCK_K,
-            ],
+            [TCGEN05_TWO_CTA_BLOCK_M, TCGEN05_TWO_CTA_BLOCK_N, bk],
         )
-        self.assertEqual(seed["num_warps"], 8)
-        self.assertEqual(seed["pid_type"], "persistent_interleaved")
+        self.assertEqual(seed["tcgen05_ab_stages"], 3)
         self.assertEqual(seed["tcgen05_cluster_m"], 2)
         self.assertEqual(seed["tcgen05_cluster_n"], 1)
-        self.assertEqual(seed["tcgen05_ab_stages"], TCGEN05_TARGET1_TVM_FFI_AB_STAGES)
-        self.assertEqual(seed["tcgen05_c_stages"], TCGEN05_TARGET1_TVM_FFI_C_STAGES)
-        self.assertEqual(seed["tcgen05_l2_swizzle_size"], 1)
+        self.assertEqual(seed["tcgen05_c_stages"], 2)
+        self.assertEqual(seed["num_warps"], 8)
+        self.assertEqual(seed["pid_type"], "persistent_interleaved")
+        self.assertEqual(seed[TCGEN05_LAYOUT_OVERRIDES_EPI_TILE_M_KEY], 128)
+        self.assertEqual(seed[TCGEN05_LAYOUT_OVERRIDES_EPI_TILE_N_KEY], 32)
+        self.assertEqual(seed[TCGEN05_LAYOUT_OVERRIDES_D_STORE_BOX_N_KEY], 32)
+        self.assertIs(seed[TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY], True)
+
+        # The same generalized seed is what the search projection uses to map
+        # FFI-requesting cluster_m=2 candidates onto the validated envelope.
+        projected_cluster_m2_config = helion.Config(
+            block_sizes=[256, 256, 128],
+            indexing=["tensor_descriptor", "tensor_descriptor", "tensor_descriptor"],
+            pid_type="persistent_interleaved",
+            tcgen05_cluster_m=2,
+            tcgen05_cluster_n=1,
+        )
+        bound.config_spec.normalize(projected_cluster_m2_config, _fix_invalid=True)
+        self.assertIs(
+            projected_cluster_m2_config.config[TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY],
+            True,
+        )
+        self.assertEqual(
+            projected_cluster_m2_config.config["block_sizes"],
+            [TCGEN05_TWO_CTA_BLOCK_M, TCGEN05_TWO_CTA_BLOCK_N, bk],
+        )
+
+        # ab > 3 is only valid on the TVM-FFI direct-entry path for the
+        # (bk, ab, c) stage tuples the codegen accepts
+        # (``TCGEN05_DIRECT_ENTRY_STAGE_TUPLES_BY_BK``: bk=64 admits the deep
+        # (ab=6, c=4) tuple). ab=4 and ab=5 are admitted by NO bk, so they are
+        # rejected everywhere; a bare ab>3 config (no FFI launch) is likewise
+        # rejected. ``_fix_invalid=True`` clamps any such config down to ab=3.
+        def _non_seed_stage_config(requested_ab_stages: int) -> helion.Config:
+            return helion.Config(
+                block_sizes=[256, 256, 64],
+                indexing=[
+                    "tensor_descriptor",
+                    "tensor_descriptor",
+                    "tensor_descriptor",
+                ],
+                pid_type="persistent_interleaved",
+                tcgen05_cluster_m=1,
+                tcgen05_cluster_n=1,
+                tcgen05_ab_stages=requested_ab_stages,
+            )
+
+        for requested_ab_stages in (4, 5, 6):
+            with self.subTest(requested_ab_stages=requested_ab_stages):
+                fixed = _non_seed_stage_config(requested_ab_stages)
+                bound.config_spec.normalize(fixed, _fix_invalid=True)
+                self.assertEqual(fixed.config["tcgen05_ab_stages"], 3)
+
+                with self.assertRaisesRegex(
+                    helion.exc.InvalidConfig,
+                    "tcgen05_ab_stages > 3 is not supported",
+                ):
+                    bound.config_spec.normalize(
+                        _non_seed_stage_config(requested_ab_stages)
+                    )
+
+        # ab=6 IS accepted on the FFI direct-entry path at bk=64 with c=4: that
+        # is the (ab=6, c=4) tuple ``TCGEN05_DIRECT_ENTRY_STAGE_TUPLES_BY_BK``
+        # admits for bk=64. Plain normalize (no ``_fix_invalid``) leaves it at 6.
+        ffi_direct_entry_ab6 = helion.Config(
+            block_sizes=[256, 256, 64],
+            indexing=["tensor_descriptor", "tensor_descriptor", "tensor_descriptor"],
+            pid_type="persistent_interleaved",
+            tcgen05_cluster_m=2,
+            tcgen05_cluster_n=1,
+            tcgen05_ab_stages=6,
+            tcgen05_c_stages=4,
+            **{TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY: True},
+        )
+        bound.config_spec.normalize(ffi_direct_entry_ab6)
+        self.assertEqual(ffi_direct_entry_ab6.config["tcgen05_ab_stages"], 6)
+
+        # ab=6 is rejected for bk=128 even on the FFI direct-entry path: bk=128
+        # only admits the (ab=3, c=2) tuple.
+        ffi_direct_entry_ab6_bk128 = helion.Config(
+            block_sizes=[256, 256, 128],
+            indexing=["tensor_descriptor", "tensor_descriptor", "tensor_descriptor"],
+            pid_type="persistent_interleaved",
+            tcgen05_cluster_m=2,
+            tcgen05_cluster_n=1,
+            tcgen05_ab_stages=6,
+            tcgen05_c_stages=4,
+            **{TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY: True},
+        )
+        with self.assertRaisesRegex(
+            helion.exc.InvalidConfig, "tcgen05_ab_stages > 3 is not supported"
+        ):
+            bound.config_spec.normalize(ffi_direct_entry_ab6_bk128)
+
         search_ab_stages_fragment = bound.config_spec._tcgen05_optional_fragments(
             for_search=True
         )["tcgen05_ab_stages"]
@@ -1047,219 +1120,6 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
             else 2
         )
         self.assertEqual(search_ab_stages_fragment.high, expected_search_ab_high)
-        self.assertIn(
-            TCGEN05_PURE_CLC_SCHEDULER_OBJECT_CONFIG_KEY,
-            bound.config_spec._tcgen05_optional_fragments(),
-        )
-        self.assertNotIn(
-            TCGEN05_PURE_CLC_SCHEDULER_OBJECT_CONFIG_KEY,
-            bound.config_spec._tcgen05_optional_fragments(for_search=True),
-        )
-        self.assertEqual(
-            seed[TCGEN05_STRATEGY_CONFIG_KEY],
-            Tcgen05Strategy.ROLE_LOCAL_MONOLITHIC.value,
-        )
-        self.assertIsNone(seed.get(TCGEN05_PURE_CLC_SCHEDULER_OBJECT_CONFIG_KEY))
-        self.assertEqual(
-            seed[TCGEN05_LAYOUT_STRATEGY_CONFIG_KEY],
-            Tcgen05LayoutStrategy.EXPLICIT_EPI_TILE.value,
-        )
-        self.assertEqual(seed[TCGEN05_LAYOUT_OVERRIDES_EPI_TILE_M_KEY], 128)
-        self.assertEqual(seed[TCGEN05_LAYOUT_OVERRIDES_EPI_TILE_N_KEY], 32)
-        self.assertEqual(seed[TCGEN05_LAYOUT_OVERRIDES_D_STORE_BOX_N_KEY], 32)
-        self.assertIs(seed[TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY], True)
-        self.assertEqual(seed["range_unroll_factors"], [1, 1])
-
-        config_gen = bound.config_spec.create_config_generation()
-        transferred_tvm_ffi_seeds = [
-            config.config
-            for _flat, config in config_gen.seed_flat_config_pairs()
-            if config.config.get(TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY) is True
-        ]
-        self.assertEqual(len(transferred_tvm_ffi_seeds), 1)
-        transferred_seed = transferred_tvm_ffi_seeds[0]
-        self.assertEqual(
-            transferred_seed[TCGEN05_LAYOUT_STRATEGY_CONFIG_KEY],
-            Tcgen05LayoutStrategy.EXPLICIT_EPI_TILE.value,
-        )
-        self.assertEqual(transferred_seed[TCGEN05_LAYOUT_OVERRIDES_EPI_TILE_M_KEY], 128)
-        self.assertEqual(transferred_seed[TCGEN05_LAYOUT_OVERRIDES_EPI_TILE_N_KEY], 32)
-        self.assertEqual(
-            transferred_seed[TCGEN05_LAYOUT_OVERRIDES_D_STORE_BOX_N_KEY], 32
-        )
-        self.assertIs(transferred_seed[TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY], True)
-
-        bound.config_spec.user_defined_tunables["target1_extra"] = IntegerFragment(
-            1, 4, 2
-        )
-        projected_config = helion.Config(
-            block_sizes=[128, 32, 64],
-            indexing=["pointer", "pointer", "tensor_descriptor"],
-            pid_type="flat",
-            tcgen05_cluster_m=1,
-            tcgen05_cluster_n=1,
-            tcgen05_tvm_ffi_launch=True,
-            epilogue_subtile=2,
-            tcgen05_diagnostic_invalid_output=True,
-            tcgen05_c_store_mode=TCGEN05_C_STORE_MODE_SKIP_EPILOGUE_STORE,
-            tcgen05_acc_producer_mode=TCGEN05_ACC_PRODUCER_MODE_SKIP_UMMA,
-            tcgen05_aux_load_mode=TCGEN05_AUX_LOAD_MODE_TMA,
-            tcgen05_cubin_lineinfo=True,
-            tcgen05_epilogue_layout=TCGEN05_EPILOGUE_LAYOUT_SPLIT_FIRST_T2R,
-            tcgen05_warp_spec_scheduler_warps=1,
-            tcgen05_warp_spec_c_input_warps=1,
-            tcgen05_layout_overrides_smem_swizzle_a=128,
-            tcgen05_layout_overrides_smem_swizzle_b=64,
-            advanced_controls_file="/tmp/helion-test.acf",
-            target1_extra=3,
-        )
-        bound.config_spec.normalize(projected_config, _fix_invalid=True)
-        expected_seed_config = helion.Config(
-            **seed,
-            advanced_controls_file="/tmp/helion-test.acf",
-            target1_extra=3,
-        )
-        bound.config_spec.normalize(expected_seed_config, _fix_invalid=True)
-        self.assertEqual(projected_config.config, expected_seed_config.config)
-        self.assertEqual(
-            projected_config.config["block_sizes"],
-            [
-                TCGEN05_TWO_CTA_BLOCK_M,
-                TCGEN05_TWO_CTA_BLOCK_N,
-                TCGEN05_TARGET1_TVM_FFI_BLOCK_K,
-            ],
-        )
-        self.assertIs(projected_config.config[TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY], True)
-        self.assertEqual(
-            projected_config.config["tcgen05_ab_stages"],
-            TCGEN05_TARGET1_TVM_FFI_AB_STAGES,
-        )
-        self.assertEqual(
-            projected_config.config["tcgen05_c_stages"],
-            TCGEN05_TARGET1_TVM_FFI_C_STAGES,
-        )
-        self.assertIs(
-            projected_config.config[TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY],
-            True,
-        )
-        self.assertEqual(
-            projected_config.config[TCGEN05_LAYOUT_STRATEGY_CONFIG_KEY],
-            Tcgen05LayoutStrategy.EXPLICIT_EPI_TILE.value,
-        )
-        for stale_key in (
-            "epilogue_subtile",
-            TCGEN05_DIAGNOSTIC_INVALID_OUTPUT_CONFIG_KEY,
-            TCGEN05_C_STORE_MODE_CONFIG_KEY,
-            TCGEN05_ACC_PRODUCER_MODE_CONFIG_KEY,
-            TCGEN05_AUX_LOAD_MODE_CONFIG_KEY,
-            TCGEN05_CUBIN_LINEINFO_CONFIG_KEY,
-            TCGEN05_EPILOGUE_LAYOUT_CONFIG_KEY,
-        ):
-            self.assertNotIn(stale_key, projected_config.config)
-        self.assertEqual(
-            projected_config.config[TCGEN05_WARP_SPEC_SCHEDULER_WARPS_KEY], 0
-        )
-        self.assertEqual(
-            projected_config.config[TCGEN05_WARP_SPEC_C_INPUT_WARPS_KEY], 0
-        )
-        self.assertIsNone(
-            projected_config.config[TCGEN05_LAYOUT_OVERRIDES_SWIZZLE_A_KEY]
-        )
-        self.assertIsNone(
-            projected_config.config[TCGEN05_LAYOUT_OVERRIDES_SWIZZLE_B_KEY]
-        )
-
-        projected_cluster_m2_config = helion.Config(
-            block_sizes=[256, 256, 128],
-            indexing=["tensor_descriptor", "tensor_descriptor", "tensor_descriptor"],
-            pid_type="persistent_interleaved",
-            tcgen05_cluster_m=2,
-            tcgen05_cluster_n=1,
-        )
-        bound.config_spec.normalize(projected_cluster_m2_config, _fix_invalid=True)
-        self.assertIs(
-            projected_cluster_m2_config.config[TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY],
-            True,
-        )
-        self.assertEqual(
-            projected_cluster_m2_config.config["block_sizes"],
-            [
-                TCGEN05_TWO_CTA_BLOCK_M,
-                TCGEN05_TWO_CTA_BLOCK_N,
-                TCGEN05_TARGET1_TVM_FFI_BLOCK_K,
-            ],
-        )
-
-        for requested_ab_stages in (4, 5, 6):
-            with self.subTest(requested_ab_stages=requested_ab_stages):
-                non_seed_stage_config = helion.Config(
-                    block_sizes=[256, 256, 64],
-                    indexing=[
-                        "tensor_descriptor",
-                        "tensor_descriptor",
-                        "tensor_descriptor",
-                    ],
-                    pid_type="persistent_interleaved",
-                    tcgen05_cluster_m=1,
-                    tcgen05_cluster_n=1,
-                    tcgen05_ab_stages=requested_ab_stages,
-                )
-                bound.config_spec.normalize(non_seed_stage_config, _fix_invalid=True)
-                self.assertEqual(non_seed_stage_config.config["tcgen05_ab_stages"], 3)
-
-                invalid_non_seed_stage_config = helion.Config(
-                    block_sizes=[256, 256, 64],
-                    indexing=[
-                        "tensor_descriptor",
-                        "tensor_descriptor",
-                        "tensor_descriptor",
-                    ],
-                    pid_type="persistent_interleaved",
-                    tcgen05_cluster_m=1,
-                    tcgen05_cluster_n=1,
-                    tcgen05_ab_stages=requested_ab_stages,
-                )
-                with self.assertRaisesRegex(
-                    helion.exc.InvalidConfig, "validated Target1 TVM-FFI seed"
-                ):
-                    bound.config_spec.normalize(invalid_non_seed_stage_config)
-
-        non_target_args = (
-            torch.empty([1024, 1024], device=DEVICE, dtype=torch.bfloat16),
-            torch.empty([1024, 2048], device=DEVICE, dtype=torch.bfloat16),
-        )
-        with (
-            patch_cute_mma_support(),
-            patch("helion.language.matmul_ops._cuda_num_sms_or_zero", return_value=132),
-        ):
-            non_target_bound = cute_matmul_mma.bind(non_target_args)
-        self.assertFalse(
-            any(
-                config.config.get(TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY) is True
-                for config in non_target_bound.config_spec.autotune_seed_configs()
-            )
-        )
-        non_target_ab_stages_fragment = (
-            non_target_bound.config_spec._tcgen05_optional_fragments(for_search=True)[
-                "tcgen05_ab_stages"
-            ]
-        )
-        self.assertIsInstance(non_target_ab_stages_fragment, IntegerFragment)
-        # Cycle 97: ab=3 is now BUDGET-AWARE-SEARCHABLE for ANY bf16/fp16 kernel
-        # whose device admits it (constraints recorded) — not only the per-shape
-        # seed targets. The non-seed kernel still gets the lifted cap; a sampled
-        # over-budget ab=3 is demoted by ``_fix_ab_stages_search_config``.
-        expected_non_target_ab_high = (
-            3
-            if (
-                non_target_bound.config_spec._cute_tcgen05_config.ab_stages_three_search_constraints
-                is not None
-            )
-            else 2
-        )
-        self.assertEqual(
-            non_target_ab_stages_fragment.high, expected_non_target_ab_high
-        )
 
         @helion.kernel(backend="cute")
         def cute_matmul_mma_no_ab3_budget(
@@ -1285,11 +1145,10 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
             ),
         ):
             no_ab3_budget_bound = cute_matmul_mma_no_ab3_budget.bind(args)
+        # With no recorded SMEM budget the generalized FFI seed is ineligible
+        # (ab=3 cannot fit) and the for_search ab cap stays at 2.
         self.assertFalse(
-            any(
-                config.config.get(TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY) is True
-                for config in no_ab3_budget_bound.config_spec.autotune_seed_configs()
-            )
+            no_ab3_budget_bound.config_spec._tcgen05_full_tile_direct_entry_seed_eligible()
         )
         no_budget_ab_stages_fragment = (
             no_ab3_budget_bound.config_spec._tcgen05_optional_fragments(
@@ -1297,195 +1156,23 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
             )["tcgen05_ab_stages"]
         )
         self.assertIsInstance(no_budget_ab_stages_fragment, IntegerFragment)
-        # Cycle 97: with no recorded SMEM budget (``per_cta_ab_smem_budget_bytes``
-        # patched to 0 -> constraints stay None) the for_search ab cap stays at 2 —
-        # the budget-aware lift is gated on the recorded constraints, so a device
-        # below the B200 envelope never admits ab=3 into search.
         self.assertEqual(no_budget_ab_stages_fragment.high, 2)
 
-        @helion.kernel(backend="cute")
-        def cute_matmul_relu(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-            m, k = x.size()
-            _, n = y.size()
-            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
-            for tile_m, tile_n in hl.tile([m, n]):
-                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
-                for tile_k in hl.tile(k):
-                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
-                out[tile_m, tile_n] = torch.relu(acc).to(x.dtype)
-            return out
-
-        with (
-            patch_cute_mma_support(),
-            patch("helion.language.matmul_ops._cuda_num_sms_or_zero", return_value=132),
-        ):
-            relu_bound = cute_matmul_relu.bind(args)
-        self.assertFalse(
-            relu_bound.config_spec.cute_tcgen05_identity_matmul_store_detected
-        )
-        self.assertEqual(relu_bound.config_spec._tcgen05_cluster_m_search_choices, (1,))
-        self.assertFalse(
-            any(
-                config.config.get(TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY) is True
-                for config in relu_bound.config_spec.autotune_seed_configs()
-            )
-        )
-
-    @onlyBackends(["cute"])
-    def test_cute_tcgen05_target8_gelu_seed_config(self) -> None:
-        # T8 (cycle 87, MatmulTarget 27): fp16 plain ``gelu(acc)`` at
-        # 1536x6144x1536 produces a single plain two-CTA seed using the
-        # DEFAULT epilogue layout (no FFI / explicit-epi-tile, which is
-        # bf16-only). The bf16 gelu shapes (T4/T19) share the chain shape so
-        # the detector fires on them, but the fp16-pinned shape fact must
-        # keep the T8 seed disabled there.
-        @helion.kernel(backend="cute")
-        def cute_matmul_gelu(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-            m, k = x.size()
-            _, n = y.size()
-            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
-            for tile_m, tile_n in hl.tile([m, n]):
-                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
-                for tile_k in hl.tile(k):
-                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
-                out[tile_m, tile_n] = torch.nn.functional.gelu(acc).to(x.dtype)
-            return out
-
+        # An fp16 matmul is NOT eligible for the FFI seed (bf16-only).
         fp16_args = (
-            torch.empty([1536, 1536], device=DEVICE, dtype=torch.float16),
-            torch.empty([1536, 6144], device=DEVICE, dtype=torch.float16),
+            torch.empty([1024, 1024], device=DEVICE, dtype=torch.float16),
+            torch.empty([1024, 4096], device=DEVICE, dtype=torch.float16),
         )
         with (
             patch_cute_mma_support(),
             patch("helion.language.matmul_ops._cuda_num_sms_or_zero", return_value=132),
         ):
-            bound = cute_matmul_gelu.bind(fp16_args)
-        self.assertTrue(
-            bound.config_spec.cute_tcgen05_gelu_matmul_store_detected,
-            "plain-gelu store detector must fire on the fp16 T8 shape",
-        )
-        seeds = [config.config for config in bound.config_spec.autotune_seed_configs()]
-        gelu_seeds = [
-            seed
-            for seed in seeds
-            if seed.get("block_sizes")
-            == [
-                TCGEN05_TWO_CTA_BLOCK_M,
-                TCGEN05_TWO_CTA_BLOCK_N,
-                TCGEN05_TARGET8_GELU_BLOCK_K,
-            ]
-            and seed.get("tcgen05_ab_stages") == TCGEN05_TARGET8_GELU_AB_STAGES
-        ]
-        self.assertEqual(len(gelu_seeds), 1)
-        seed = gelu_seeds[0]
-        # The T8 seed must NOT use the FFI / explicit-epi-tile path (the
-        # fp16 gelu store is rejected by that codegen gate).
-        self.assertIsNot(seed.get(TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY), True)
-        self.assertIsNot(seed.get(TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY), True)
-        self.assertIn(
-            seed.get(TCGEN05_LAYOUT_STRATEGY_CONFIG_KEY),
-            (None, Tcgen05LayoutStrategy.DEFAULT.value),
-        )
-        self.assertEqual(seed["tcgen05_cluster_m"], 2)
-        self.assertEqual(seed["tcgen05_cluster_n"], 1)
-        self.assertEqual(seed["tcgen05_c_stages"], TCGEN05_TARGET8_GELU_C_STAGES)
-        self.assertEqual(seed["pid_type"], "persistent_interleaved")
-        self.assertEqual(seed["l2_groupings"], [2])
-        # Seed survives flatten/unflatten against the live spec.
-        config_gen = bound.config_spec.create_config_generation()
-        transferred = [
-            config.config
-            for _flat, config in config_gen.seed_flat_config_pairs()
-            if config.config.get("block_sizes")
-            == [
-                TCGEN05_TWO_CTA_BLOCK_M,
-                TCGEN05_TWO_CTA_BLOCK_N,
-                TCGEN05_TARGET8_GELU_BLOCK_K,
-            ]
-            and config.config.get("tcgen05_ab_stages") == TCGEN05_TARGET8_GELU_AB_STAGES
-        ]
-        self.assertGreaterEqual(len(transferred), 1)
-        # The transferred seed survives ``num_warps`` normalization (8 -> 4)
-        # while keeping the tile/stage/cluster envelope intact.
-        self.assertEqual(transferred[0]["tcgen05_cluster_m"], 2)
-        self.assertEqual(
-            transferred[0]["block_sizes"],
-            [
-                TCGEN05_TWO_CTA_BLOCK_M,
-                TCGEN05_TWO_CTA_BLOCK_N,
-                TCGEN05_TARGET8_GELU_BLOCK_K,
-            ],
-        )
-
-        # The search projection promotes a cluster_m=2 + bk=128 candidate
-        # (which the for_search ab fragment caps at ab=2) back to the seed's
-        # ab=3 stage tuple, so the autotuner actually samples the fast regime.
-        promoted = helion.Config(
-            block_sizes=[
-                TCGEN05_TWO_CTA_BLOCK_M,
-                TCGEN05_TWO_CTA_BLOCK_N,
-                TCGEN05_TARGET8_GELU_BLOCK_K,
-            ],
-            indexing=["tensor_descriptor", "tensor_descriptor", "tensor_descriptor"],
-            pid_type="persistent_interleaved",
-            tcgen05_cluster_m=2,
-            tcgen05_cluster_n=1,
-            tcgen05_ab_stages=2,
-            tcgen05_acc_stages=2,
-            tcgen05_c_stages=4,
-        )
-        bound.config_spec.normalize(promoted, _fix_invalid=True)
-        self.assertEqual(
-            promoted.config["tcgen05_ab_stages"], TCGEN05_TARGET8_GELU_AB_STAGES
-        )
-        self.assertEqual(
-            promoted.config["tcgen05_c_stages"], TCGEN05_TARGET8_GELU_C_STAGES
-        )
-        # A bk=64 candidate is left in its own regime (not promoted).
-        not_promoted = helion.Config(
-            block_sizes=[TCGEN05_TWO_CTA_BLOCK_M, TCGEN05_TWO_CTA_BLOCK_N, 64],
-            indexing=["tensor_descriptor", "tensor_descriptor", "tensor_descriptor"],
-            pid_type="persistent_interleaved",
-            tcgen05_cluster_m=2,
-            tcgen05_cluster_n=1,
-            tcgen05_ab_stages=2,
-            tcgen05_acc_stages=2,
-            tcgen05_c_stages=2,
-        )
-        bound.config_spec.normalize(not_promoted, _fix_invalid=True)
-        self.assertEqual(not_promoted.config["tcgen05_ab_stages"], 2)
-        self.assertEqual(not_promoted.config["block_sizes"][2], 64)
-
-        # bf16 gelu (T19 shape) fires the detector but must NOT enable the
-        # fp16-pinned T8 seed.
-        bf16_args = (
-            torch.empty([3072, 3072], device=DEVICE, dtype=torch.bfloat16),
-            torch.empty([3072, 3072], device=DEVICE, dtype=torch.bfloat16),
-        )
-        with (
-            patch_cute_mma_support(),
-            patch("helion.language.matmul_ops._cuda_num_sms_or_zero", return_value=132),
-        ):
-            bf16_bound = cute_matmul_gelu.bind(bf16_args)
-        self.assertTrue(
-            bf16_bound.config_spec.cute_tcgen05_gelu_matmul_store_detected,
-            "plain-gelu detector also fires on the bf16 gelu shape",
-        )
+            fp16_bound = cute_matmul_mma.bind(fp16_args)
         self.assertFalse(
-            bf16_bound.config_spec._cute_tcgen05_config.target8_gelu_seed_enabled,
-            "T8 seed must stay disabled on bf16 (fp16-pinned shape fact)",
+            fp16_bound.config_spec._tcgen05_full_tile_direct_entry_seed_eligible()
         )
-        self.assertFalse(
-            any(
-                config.config.get("tcgen05_ab_stages") == TCGEN05_TARGET8_GELU_AB_STAGES
-                and config.config.get("block_sizes")
-                == [
-                    TCGEN05_TWO_CTA_BLOCK_M,
-                    TCGEN05_TWO_CTA_BLOCK_N,
-                    TCGEN05_TARGET8_GELU_BLOCK_K,
-                ]
-                for config in bf16_bound.config_spec.autotune_seed_configs()
-            )
+        self.assertIsNone(
+            fp16_bound.config_spec._tcgen05_full_tile_direct_entry_seed_config()
         )
 
     @onlyBackends(["cute"])
@@ -2820,6 +2507,15 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
         # The SMEM budget is MOCKED to the B200 value so the gate is exercised
         # deterministically on any cute host (``@onlyBackends`` does not imply
         # B200).
+        #
+        # An fp16 (NOT bf16) matmul is used so the generalized TVM-FFI
+        # direct-entry seed — which is bf16-only — is INELIGIBLE here. On a
+        # bf16-eligible shape ``_fix_target1_tvm_ffi_search_config`` claims every
+        # cluster_m=2 candidate and projects it onto the validated FFI envelope
+        # (ab=3, c=2), which would shadow the c-stages gate before it could act.
+        # fp16 still records the ab=3 SMEM-budget constraints (16-bit), so the
+        # c-stages gate is exercised in isolation at the canonical cluster_m=2
+        # 256x256x128 tile.
         b200_budget = 232448 - 28 * 1024  # optin cap - ab=3 reservation
 
         @helion.kernel(backend="cute")
@@ -2838,8 +2534,8 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
             return out
 
         args = (
-            torch.empty([6144, 6144], device=DEVICE, dtype=torch.bfloat16),
-            torch.empty([6144, 6144], device=DEVICE, dtype=torch.bfloat16),
+            torch.empty([6144, 6144], device=DEVICE, dtype=torch.float16),
+            torch.empty([6144, 6144], device=DEVICE, dtype=torch.float16),
         )
         with (
             patch_cute_mma_support(),
