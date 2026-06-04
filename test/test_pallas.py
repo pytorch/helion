@@ -1469,6 +1469,56 @@ class TestPallas(TestCase):
             final = search.run_final_pick_verification(noisy_best, top_k=5)
         self.assertEqual(list(final.config["block_sizes"]), [512, 512, 512])
 
+    def test_pallas_matmul_bf16_no_tiling_seed_covers_large_cubes(self) -> None:
+        """No-tiling seed fires on each bf16 cube in ``_PALLAS_NO_TILING_DIMS``.
+
+        Per cube N, ``PallasMatmulNoTilingSeedHeuristic`` is eligible and plants
+        the ``[N, N, N] unroll pb=True`` compiler seed; a cube outside the set
+        (256) is refused so the seed stays scoped to ablation-validated shapes.
+        """
+        from helion._compiler.autotuner_heuristics.pallas import _PALLAS_NO_TILING_DIMS
+        from helion._compiler.autotuner_heuristics.pallas import (
+            PallasMatmulNoTilingSeedHeuristic,
+        )
+
+        self.assertEqual(sorted(_PALLAS_NO_TILING_DIMS), [1024, 2048, 4096])
+
+        for dim in sorted(_PALLAS_NO_TILING_DIMS):
+            x = torch.empty(dim, dim, device=DEVICE, dtype=torch.bfloat16)
+            y = torch.empty(dim, dim, device=DEVICE, dtype=torch.bfloat16)
+            bound = pallas_matmul_bf16.bind((x, y))
+
+            self.assertTrue(
+                PallasMatmulNoTilingSeedHeuristic.is_eligible(
+                    bound.env, bound.host_function.device_ir
+                ),
+                f"heuristic must fire on bf16 {dim}-cube",
+            )
+            seeded = [
+                (
+                    tuple(cfg.config.get("block_sizes", ())),
+                    cfg.config.get("pallas_loop_type"),
+                    cfg.config.get("pallas_pre_broadcast"),
+                )
+                for cfg in bound.config_spec.compiler_seed_configs
+            ]
+            self.assertIn(
+                ((dim, dim, dim), "unroll", True),
+                seeded,
+                f"compiler seeds must include the no-tiling entry on bf16 {dim}-cube",
+            )
+
+        # 256-cube is outside the set, so the heuristic must refuse it.
+        small_x = torch.empty(256, 256, device=DEVICE, dtype=torch.bfloat16)
+        small_y = torch.empty(256, 256, device=DEVICE, dtype=torch.bfloat16)
+        small_bound = pallas_matmul_bf16.bind((small_x, small_y))
+        self.assertFalse(
+            PallasMatmulNoTilingSeedHeuristic.is_eligible(
+                small_bound.env, small_bound.host_function.device_ir
+            ),
+            "heuristic must refuse cubes outside _PALLAS_NO_TILING_DIMS",
+        )
+
     def test_pallas_autotuner_compiler_seed_survives_final_pick(self) -> None:
         """Compiler-seeded members are re-considered during final-pick.
 
@@ -1600,6 +1650,84 @@ class TestPallas(TestCase):
         self.assertIn("lax.dot_general(", code)
         self.assertIn("preferred_element_type=jnp.float32", code)
         self.assertNotIn("pl.dot(", code)
+
+    def test_pallas_matmul_dot_general_lowering_fires_on_no_tiling(self) -> None:
+        """No-tiling 2-input matmul emits ``lax.dot_general``, not ``pl.pallas_call``.
+
+        Spies on ``_build_matmul_dot_general_jit_fn``: it runs once on first
+        compile (not on cache-hit repeats) and the output matches the
+        ``pl.pallas_call`` path.
+        """
+        from unittest.mock import patch
+
+        from helion import runtime as helion_runtime
+        from helion.runtime.config import Config
+
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def _matmul_dot_general_pin(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty(
+                [m, n],
+                device=x.device,
+                dtype=torch.promote_types(x.dtype, y.dtype),
+            )
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = acc
+            return out
+
+        torch.manual_seed(0)
+        x = torch.randn(256, 256, device=DEVICE, dtype=torch.bfloat16)
+        torch.manual_seed(1)
+        y = torch.randn(256, 256, device=DEVICE, dtype=torch.bfloat16)
+
+        # Force the no-tiling config (block_sizes match input dims).
+        bound = _matmul_dot_general_pin.bind((x, y))
+        no_tiling_cfg = Config(block_sizes=[256, 256, 256])
+
+        with patch.object(
+            helion_runtime,
+            "_build_matmul_dot_general_jit_fn",
+            wraps=helion_runtime._build_matmul_dot_general_jit_fn,
+        ) as build_spy:
+            compiled_fn = bound.compile_config(no_tiling_cfg)
+            result_no_tiling = compiled_fn(x, y)
+            for _ in range(3):
+                compiled_fn(x, y)
+        self.assertEqual(
+            build_spy.call_count,
+            1,
+            "Pure matmul + no-tiling config must lower via ``lax.dot_general`` "
+            "exactly once (first cache-build); cache hits must not rebuild.",
+        )
+
+        # Tiled config must keep the pl.pallas_call path (builder not run), and
+        # its output must match the no-tiling dot_general path within bf16 tol.
+        bound_ref = _matmul_dot_general_pin.bind((x, y))
+        tiled_cfg = Config(block_sizes=[128, 128, 128])
+        with patch.object(
+            helion_runtime,
+            "_build_matmul_dot_general_jit_fn",
+            wraps=helion_runtime._build_matmul_dot_general_jit_fn,
+        ) as build_spy_tiled:
+            compiled_ref = bound_ref.compile_config(tiled_cfg)
+            result_tiled = compiled_ref(x, y)
+        self.assertEqual(
+            build_spy_tiled.call_count,
+            0,
+            "tiled config (block_size < input_dim) must not run the dot_general builder",
+        )
+        max_abs_diff = (
+            (result_no_tiling.float() - result_tiled.float()).abs().max().item()
+        )
+        self.assertLess(
+            max_abs_diff,
+            5e-2,
+            f"dot_general output diverged from pallas_call by {max_abs_diff}",
+        )
 
     def test_bmm(self) -> None:
         """Test BMM with default config — exercises size_matches fix.
