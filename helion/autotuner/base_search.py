@@ -708,6 +708,12 @@ class PopulationBasedSearch(BaseSearch):
         super().__init__(kernel, args)
         self.finishing_rounds = finishing_rounds
         self.population: list[PopulationMember] = []
+        # Population members corresponding to compiler-seeded configs from
+        # ``ConfigSpec.compiler_seed_configs``.  Tracked separately so the
+        # final-pick verification phase can re-include them as candidates
+        # even when the surrogate-driven search has pruned them away from
+        # ``self.population``.
+        self._compiler_seed_members: list[PopulationMember] = []
         self._best_available_seed_configs: list[Config] = []
         self.config_gen: ConfigGeneration = self.config_spec.create_config_generation(
             overrides=self.settings.autotune_config_overrides or None,
@@ -748,6 +754,30 @@ class PopulationBasedSearch(BaseSearch):
         """Replace the current best member in the population."""
         idx = min(range(len(self.population)), key=lambda i: self.population[i].perf)
         self.population[idx] = value
+
+    def capture_compiler_seed_members(
+        self, members: Sequence[PopulationMember]
+    ) -> None:
+        """Snapshot which ``members`` came from compiler-seeded configs.
+
+        Called once by ``_autotune`` right after the initial population is
+        constructed.  Looks up the compiler-owned flat configs from
+        ``config_gen.seed_flat_config_pairs()`` and records the matching
+        members on ``self._compiler_seed_members`` so the final-pick
+        verification phase can re-include them even if the search loop
+        prunes them from ``self.population``.
+        """
+        self._compiler_seed_members = []
+        try:
+            seed_pairs = self.config_gen.seed_flat_config_pairs()
+        except Exception:
+            return
+        if not seed_pairs:
+            return
+        seed_flats: list[FlatConfig] = [flat for flat, _config in seed_pairs]
+        for member in members:
+            if member.flat_values in seed_flats:
+                self._compiler_seed_members.append(member)
 
     def benchmark_flat(self, flat_values: FlatConfig) -> PopulationMember:
         """
@@ -1220,9 +1250,10 @@ class PopulationBasedSearch(BaseSearch):
         """Re-benchmark the top-``top_k`` candidates once and re-pick the fastest.
 
         Hardens against the noisy single ``interleaved_bench`` median the search
-        ranks by.  With ``paired`` (default on) each candidate is timed against
-        ``best`` in one window so common-mode drift cancels.  Knobs:
-        ``HELION_AUTOTUNE_FINAL_PICK_TOP_K`` (10), ``..._PAIRED``; returns
+        ranks by.  Compiler-seed members are merged in so a hand-picked seed
+        survives surrogate pruning.  With ``paired`` (default on) each candidate
+        is timed against ``best`` in one window so common-mode drift cancels.
+        Knobs: ``HELION_AUTOTUNE_FINAL_PICK_TOP_K`` (10), ``..._PAIRED``; returns
         ``best`` unchanged when ``top_k <= 1`` or < 2 finite.
         """
         if top_k is None:
@@ -1232,17 +1263,20 @@ class PopulationBasedSearch(BaseSearch):
         if top_k <= 1:
             return best
 
-        # Top-k candidates by current perf, ``best`` first so its identity wins
-        # ties when we fall back.
+        # Top-k by current perf, ``best`` first so its identity wins ties on
+        # fallback.  Merge captured compiler-seed members with the last-gen
+        # population so a hand-picked seed pruned by the surrogate search is
+        # still re-benchmarked here.  ``_compiler_seed_members`` may be absent
+        # when a test builds the search via ``__new__``.
+        compiler_seed_members = getattr(self, "_compiler_seed_members", []) or []
+        candidate_pool: dict[int, PopulationMember] = {}
+        for member in (*self.population, *compiler_seed_members):
+            if math.isfinite(member.perf):
+                candidate_pool.setdefault(id(member), member)
+        scored_population = sorted(candidate_pool.values(), key=performance)
         candidates: list[PopulationMember] = []
         seen_ids: set[int] = set()
-        for member in (
-            best,
-            *sorted(
-                (m for m in self.population if math.isfinite(m.perf)),
-                key=performance,
-            ),
-        ):
+        for member in (best, *scored_population):
             if id(member) in seen_ids:
                 continue
             seen_ids.add(id(member))

@@ -1537,6 +1537,86 @@ class TestPallas(TestCase):
             "drift flips the absolute median -- why paired timing is needed.",
         )
 
+    def test_pallas_autotuner_compiler_seed_survives_final_pick(self) -> None:
+        """Compiler-seeded members are re-considered during final-pick verification.
+
+        The surrogate-driven search prunes the population between generations, so
+        by the time ``run_final_pick_verification`` fires a compiler-seeded config
+        that looked merely average on its noisy initial bench may be gone from
+        ``self.population``.  ``capture_compiler_seed_members`` snapshots such
+        seeds and merges them back into the verification candidate pool, so a
+        backend's hand-picked seed is re-benched against the search's best even
+        when the search moved away from it.
+        """
+        from unittest.mock import patch
+
+        from helion.autotuner.base_search import PopulationBasedSearch
+        from helion.autotuner.base_search import PopulationMember
+        from helion.runtime.config import Config
+
+        # Last-gen survivors (~0.205 ms) plus a compiler seed that scored a noisy
+        # 0.215 ms initially (so the search dropped it) but rebenches at a
+        # true-fastest 0.190 ms.  (config, noisy initial ms, true rebench ms):
+        last_gen = [
+            (Config(block_sizes=[1024, 256, 1024]), 0.205, 0.204),
+            (Config(block_sizes=[256, 256, 256]), 0.210, 0.209),
+        ]
+        compiler_seed = (
+            Config(
+                block_sizes=[512, 512, 512],
+                pallas_loop_type="emit_pipeline",
+                pallas_pre_broadcast=False,
+            ),
+            0.215,
+            0.190,
+        )
+
+        def make_member(config: Config, noisy_perf: float) -> PopulationMember:
+            return PopulationMember(
+                fn=lambda *a, **kw: None,
+                perfs=[noisy_perf],
+                flat_values=[id(config)],  # opaque -- never read by the test
+                config=config,
+                status="ok",
+                compile_time=0.0,
+            )
+
+        last_gen_members = [make_member(cfg, noisy) for cfg, noisy, _true in last_gen]
+        seed_member = make_member(compiler_seed[0], compiler_seed[1])
+        true_perf_by_id = {
+            id(m): true
+            for m, (_cfg, _noisy, true) in zip(last_gen_members, last_gen, strict=True)
+        }
+        true_perf_by_id[id(seed_member)] = compiler_seed[2]
+
+        search = PopulationBasedSearch.__new__(PopulationBasedSearch)
+        search.population = last_gen_members  # seed NOT in last-gen population
+        search.best_perf_so_far = min(m.perf for m in last_gen_members)
+        search._compiler_seed_members = [seed_member]
+        search.log = lambda *a, **kw: None  # pyrefly: ignore[bad-assignment]
+
+        def fake_rebenchmark(
+            members: list[PopulationMember], *, desc: str = ""
+        ) -> None:
+            for member in members:
+                member.perfs.append(true_perf_by_id[id(member)])
+
+        with patch.object(search, "rebenchmark", side_effect=fake_rebenchmark):
+            initial_best = min(last_gen_members, key=lambda m: m.perf)
+            self.assertEqual(
+                list(initial_best.config["block_sizes"]),
+                [1024, 256, 1024],
+                "Precondition: search's running best is one of the last-gen members.",
+            )
+            final_best = search.run_final_pick_verification(initial_best, top_k=10)
+
+        self.assertEqual(
+            list(final_best.config["block_sizes"]),
+            [512, 512, 512],
+            "Compiler-seeded [512, 512, 512] must be re-benched and re-rank "
+            "ahead of the last-gen best once its true 0.190 ms perf is measured.",
+        )
+
     def test_bmm(self) -> None:
         """Test BMM with default config — exercises size_matches fix.
 
