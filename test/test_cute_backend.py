@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib
 import os
+from typing import Any
 from typing import cast
 from unittest.mock import patch
 
@@ -3185,6 +3186,74 @@ class TestCuteTileVecWarpReduceHeuristic(TestCase):
         self.assertIn(
             CuteTileVecWarpReduceHeuristic, HEURISTICS_BY_BACKEND.get("cute", ())
         )
+
+
+@helion.kernel(backend="cute", autotune_effort="none")
+def cute_matmul(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    m, k = x.shape
+    _, n = y.shape
+    out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+    for tile_m, tile_n in hl.tile([m, n]):
+        acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+        for tile_k in hl.tile(k):
+            acc = hl.dot(x[tile_m, tile_k], y[tile_k, tile_n], acc=acc)
+        out[tile_m, tile_n] = acc.to(x.dtype)
+    return out
+
+
+class TestCuteConfigValuePriors(TestCase):
+    """The cute backend supplies per-key value priors (the learned distribution
+    that replaces the old hardcoded per-shape seeds); they bias the random half
+    of the initial population toward the known-good 2-CTA matmul family."""
+
+    def test_priors_cover_the_template_keys(self) -> None:
+        from helion._compiler.backend import CuteBackend
+
+        priors = CuteBackend().config_value_priors(cast("Any", None))
+        for key in (
+            "indexing",
+            "pid_type",
+            "tcgen05_cluster_m",
+            "tcgen05_ab_stages",
+            "tcgen05_acc_stages",
+            "tcgen05_c_stages",
+            "tcgen05_num_epi_warps",
+            "tcgen05_strategy",
+            "tcgen05_persistence_model",
+            "tcgen05_tvm_ffi_launch",
+        ):
+            self.assertIn(key, priors)
+
+    def test_priors_wired_and_sampling_valid_for_matmul(self) -> None:
+        from helion.autotuner.config_generation import ConfigGeneration
+
+        x = torch.randn(256, 256, device=DEVICE, dtype=torch.bfloat16)
+        gen = ConfigGeneration(cute_matmul.bind((x, x)).config_spec)
+        # The cute priors engage on real matmul knobs for this kernel.
+        engaged = set(gen._config_value_priors) & set(gen._key_to_flat_indices)
+        self.assertIn("tcgen05_cluster_m", engaged)
+        # Biased sampling must still produce only valid configs.
+        self.assertEqual(len(gen.random_population(8)), 8)
+
+    def test_priors_bias_indexing_toward_tma(self) -> None:
+        from helion.autotuner.config_generation import ConfigGeneration
+
+        x = torch.randn(256, 256, device=DEVICE, dtype=torch.bfloat16)
+        gen = ConfigGeneration(cute_matmul.bind((x, x)).config_spec)
+        (idx_slot,), _ = gen._key_to_flat_indices["indexing"]
+        # ``indexing`` is one ListOf slot whose inner EnumFragment holds the
+        # per-dimension choice; bias should favor tensor_descriptor per element.
+        inner = getattr(gen.flat_spec[idx_slot], "inner", None)
+        if "tensor_descriptor" not in getattr(inner, "choices", ()):
+            self.skipTest("tensor_descriptor indexing not available for this spec")
+        tma = total = 0
+        for _ in range(40):
+            for value in gen.biased_random_flat()[idx_slot]:
+                total += 1
+                tma += value == "tensor_descriptor"
+        # Prior weights tensor_descriptor 4:1 over pointer; a strict majority of
+        # the biased indexing slots should pick TMA.
+        self.assertGreater(tma, total // 2)
 
 
 class TestCuteBackendRequirements(TestCase):
