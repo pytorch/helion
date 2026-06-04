@@ -737,6 +737,49 @@ class TestPallas(TestCase):
         torch.testing.assert_close(x, x_copy)
         torch.testing.assert_close(y, y_copy)
 
+    def test_wrapper_gather_before_loop_is_read_only_input(self) -> None:
+        """A tensor created by eager wrapper code and only read by Pallas is not output."""
+
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def gather_then_tile(x: torch.Tensor, idx: torch.Tensor) -> torch.Tensor:
+            gathered = x[idx]
+            out = torch.empty_like(gathered)
+            for tile in hl.tile(out.size()):
+                out[tile] = gathered[tile] + 1.0
+            return out
+
+        x = torch.randn(128, device=DEVICE, dtype=torch.float32)
+        idx = torch.arange(127, -1, -1, device=DEVICE, dtype=torch.int32)
+        code, result = code_and_output(gather_then_tile, (x, idx), block_sizes=[128])
+        torch.testing.assert_close(result, x[idx] + 1.0)
+        self.assertIn("_output_indices=[1]", code)
+        self.assertIn("_inplace_indices=[]", code)
+
+    def test_wrapper_gather_and_scatter_around_loop(self) -> None:
+        """Eager prologue gather and epilogue scatter compose around Pallas."""
+
+        @helion.kernel(
+            backend="pallas",
+            static_shapes=True,
+            ignore_warnings=[helion.exc.TensorOperationInWrapper],
+        )
+        def gather_tile_scatter(x: torch.Tensor, idx: torch.Tensor) -> torch.Tensor:
+            gathered = x[idx]
+            out = torch.empty_like(gathered)
+            for tile in hl.tile(out.size()):
+                out[tile] = gathered[tile] + 1.0
+            scattered = torch.empty_like(out)
+            scattered[idx] = out
+            return scattered
+
+        x = torch.randn(128, device=DEVICE, dtype=torch.float32)
+        idx = torch.arange(127, -1, -1, device=DEVICE, dtype=torch.int32)
+        code, result = code_and_output(gather_tile_scatter, (x, idx), block_sizes=[128])
+        expected = torch.empty_like(x)
+        expected[idx] = x[idx] + 1.0
+        torch.testing.assert_close(result, expected)
+        self.assertIn("_inplace_indices=[]", code)
+
     def test_add_2d(self) -> None:
         args = (
             torch.randn(64, 512, device=DEVICE, dtype=torch.float32),

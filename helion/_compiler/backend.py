@@ -1954,13 +1954,17 @@ class PallasBackend(Backend):
             for i, arg in enumerate(sorted_args):
                 if not isinstance(arg, TensorArg):
                     continue
-                if id(arg.fake_value.untyped_storage()) not in input_storages:
+                arg_name = arg.host_str()
+                if (
+                    id(arg.fake_value.untyped_storage()) not in input_storages
+                    and arg_name in write_names
+                ):
                     # Tensor created inside the function body (output)
                     output_indices.append(i)
-                    if arg.host_str() in read_names or arg.host_str() not in empty_vars:
+                    if arg_name in read_names or arg_name not in empty_vars:
                         # Also read by the kernel (e.g. broadcast result)
                         inplace_indices.append(i)
-                elif arg.host_str() in mutated_params:
+                elif arg_name in mutated_params:
                     # Input tensor mutated in-place
                     output_indices.append(i)
                     inplace_indices.append(i)
