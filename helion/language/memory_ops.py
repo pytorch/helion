@@ -2647,9 +2647,12 @@ def _codegen_cute_store_tcgen05_tile(
         # Broadcast aux steps need a fresh AST var for the 2-D view
         # of the rank-1 underlying tensor (stride 0 on the orthogonal
         # axis). Exact-shape aux steps leave ``aux_view2d`` as None.
+        # broadcast_axis 0/1 build a stride-0 2-D view of a rank-1 tensor;
+        # the colvec form (2) reuses the exact-shape pipeline over its own
+        # (M, N) stride-(1,0) view, so it needs no separate ``aux_view2d``.
         aux_view2d = (
             df.new_var(f"tcgen05_aux_view2d_{aux_idx}")
-            if aux_step.broadcast_axis is not None
+            if aux_step.broadcast_axis in (0, 1)
             else None
         )
         aux_step_records.append(
@@ -2825,6 +2828,41 @@ def _codegen_cute_store_tcgen05_tile(
         aux_consumer_state_name = ""
         aux_pipeline_uses_tma_load = False
         aux_ring_smem_names = tuple(None for _ in aux_step_records)
+
+    # Row-vector register hoist (fp8 only). A rowvec aux (``bias[n]`` /
+    # rowwise ``scale_b[n]``) varies across each thread's N (vectorized
+    # epilogue) fragment, so the default per-subtile GMEM ``.load()`` issued
+    # AFTER the accumulator ``consumer_wait`` exposes its latency. CUTLASS's
+    # ``epilogue_tma_store_scaled`` instead reads the whole rowvec into
+    # registers ONCE (``cute.autovec_copy(tTR_gSB, tTR_rSB_full)``) BEFORE the
+    # acc wait so its latency overlaps the MMA. Mirror that here: hoist the
+    # per-tile rowvec LDG into a register tensor in the setup block (which
+    # runs before the subtile loop, hence before the acc wait), then read it
+    # per subtile from registers. fp8-gated because fp8 GEMMs are
+    # latency-bound at these compute-bound shapes (bf16's larger operands hide
+    # the load already, and the cycle-39/74 ablations found no bf16 win); the
+    # rowvec register tensor is small (1-D broadcast) so no spill risk. SMEM
+    # staging (``use_aux_smem_source``) owns its own ring, so skip there.
+    _ab_tma_plans_for_hoist = [
+        plan
+        for plan in state.codegen.cute_wrapper_plans
+        if plan.get("kind") == "tcgen05_ab_tma"
+    ]
+    aux_input_is_fp8 = (
+        len(_ab_tma_plans_for_hoist) == 1
+        and str(_ab_tma_plans_for_hoist[0].get("input_dtype")) == "cutlass.Float8E4M3FN"
+    )
+    aux_hoisted_vars: list[str | None] = []
+    for aux_idx, rec in enumerate(aux_step_records):
+        if (
+            aux_input_is_fp8
+            and rec.broadcast_axis == 1
+            and tcgen05_aux_use_tma_store_epilogue
+            and not use_aux_smem_source
+        ):
+            aux_hoisted_vars.append(df.new_var(f"tcgen05_aux_hoisted_{aux_idx}"))
+        else:
+            aux_hoisted_vars.append(None)
 
     rowvec_aux_stage_records: list[_RowvecAuxStageRecord | None] = []
     for aux_idx, rec in enumerate(aux_step_records):
@@ -3102,9 +3140,11 @@ def _codegen_cute_store_tcgen05_tile(
                 )
                 continue
 
-            if rec.broadcast_axis is None:
-                # Exact-shape rank-2 aux: slice the per-tile region
-                # of the underlying 2-D tensor directly.
+            if rec.broadcast_axis is None or rec.broadcast_axis == 2:
+                # Exact-shape rank-2 aux (or the colvec form, which is a full
+                # (M, N) stride-(1,0) view): slice the per-tile region of the
+                # underlying 2-D tensor directly. The colvec's per-subtile read
+                # is specialized to a scalar in ``_aux_subtile_load_source``.
                 source_for_local_tile = rec.aux_tensor_name
                 aux_tile_is_local = False
             elif rowvec_stage is not None:
@@ -3198,6 +3238,20 @@ def _codegen_cute_store_tcgen05_tile(
                     ),
                 ]
             )
+            hoisted = aux_hoisted_vars[aux_idx]
+            if hoisted is not None:
+                # Issue the whole-tile rowvec GMEM read into registers here
+                # (per-output-tile setup, before the subtile loop / acc wait)
+                # so its latency overlaps the MMA. See ``aux_hoisted_vars``.
+                lines.extend(
+                    [
+                        (
+                            f"{hoisted} = cute.make_rmem_tensor("
+                            f"{rec.ttr_aux_grouped}.shape, {rec.aux_dtype})"
+                        ),
+                        f"cute.autovec_copy({rec.ttr_aux_grouped}, {hoisted})",
+                    ]
+                )
         return lines
 
     def _aux_subtile_load_source(
@@ -3405,6 +3459,29 @@ def _codegen_cute_store_tcgen05_tile(
                     f"cute.filter_zeros({rec.ttr_aux_subtile}), "
                     f"cute.filter_zeros({rec.aux_rmem}))\n"
                     f"{prelude_indent}{rec.aux_loaded} = {rec.aux_rmem}.load()\n"
+                )
+                continue
+            hoisted = aux_hoisted_vars[aux_idx]
+            if hoisted is not None:
+                # Read the per-subtile slice from the register tensor the
+                # per-tile setup already loaded (latency overlapped the MMA),
+                # instead of issuing a fresh per-subtile GMEM ``.load()``.
+                lines.append(
+                    f"{prelude_indent}{rec.aux_loaded} = "
+                    f"{hoisted}[(None, None, None, "
+                    f"cutlass.Int32(_tcgen05_subtile))].load()\n"
+                )
+                continue
+            if rec.broadcast_axis == 2:
+                # Column-vector (per-row) aux: uniform over each thread's N
+                # fragment, so read a single SCALAR per subtile (T2R index
+                # (0,0,0)) instead of a redundant N-wide vector ``.load()``.
+                # Matches CUTLASS's ``sa = tTR_gSA[(0,0,0,subtile)]``; the
+                # scalar broadcasts in the ``acc * aux`` chain multiply.
+                lines.append(
+                    f"{prelude_indent}{rec.aux_loaded} = "
+                    f"{rec.ttr_aux_grouped}"
+                    f"[(0, 0, 0, cutlass.Int32(_tcgen05_subtile))]\n"
                 )
                 continue
             lines.extend(

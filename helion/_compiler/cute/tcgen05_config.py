@@ -945,6 +945,44 @@ class CuteTcgen05Config:
             and block_sizes[1] == TCGEN05_TWO_CTA_BLOCK_N
         )
 
+    def max_ab_stages_that_fit(
+        self,
+        *,
+        bm: int,
+        bn: int,
+        bk: int,
+        cluster_m: int,
+        hard_cap: int = 12,
+    ) -> int:
+        """Largest ``tcgen05_ab_stages`` whose AB SMEM fits the per-CTA budget.
+
+        Mirrors CUTLASS's ``_compute_stages`` (fill SMEM with as many AB
+        pipeline stages as fit). 1-byte fp8 operands fit ~2x more stages than
+        2-byte bf16, so the deeper pipeline that hides K-loop latency is only
+        reachable for fp8 once the bf16-tuned ``ab_stages<=3`` cap is lifted.
+        Returns at least 1; ``0`` when constraints are unknown.
+        """
+        constraints = self.ab_stages_three_search_constraints
+        if constraints is None or bm <= 0 or bn <= 0 or bk <= 0:
+            return 0
+        if cluster_m not in (1, 2):
+            return 0
+        best = 0
+        for ab_stages in range(1, hard_cap + 1):
+            bytes_per_cta = tcgen05_ab_smem_bytes_per_cta(
+                bm=bm,
+                bn=bn,
+                bk=bk,
+                dtype_bytes=constraints.dtype_bytes,
+                ab_stages=ab_stages,
+                cluster_m=cluster_m,
+            )
+            if bytes_per_cta <= constraints.per_cta_smem_budget_bytes:
+                best = ab_stages
+            else:
+                break
+        return best
+
     def _fix_ab_stages_three_search_config(self, config: dict[str, object]) -> None:
         if self.ab_stages_three_search_constraints is None:
             return
@@ -1224,10 +1262,33 @@ class CuteTcgen05Config:
             )
         ):
             return
+        # fp8 (1-byte) operands fit a deeper AB pipeline than the bf16-tuned
+        # cap of 3; admit ab_stages > 3 for fp8 as long as the AB SMEM fits the
+        # per-CTA budget. This lets Helion emit the same deeply-pipelined
+        # CtaGroup.TWO kernel CUTLASS uses for fp8 compute-bound GEMMs.
+        constraints = self.ab_stages_three_search_constraints
+        if constraints is not None and constraints.dtype_bytes < 2:
+            block_sizes = cast("list[int]", config.get("block_sizes"))
+            cluster_m = cast("int", config.get("tcgen05_cluster_m", 1))
+            if isinstance(block_sizes, list) and len(block_sizes) >= 3:
+                fit_max = self.max_ab_stages_that_fit(
+                    bm=block_sizes[0],
+                    bn=block_sizes[1],
+                    bk=block_sizes[2],
+                    cluster_m=cluster_m,
+                )
+                if fit_max > 0 and ab_stages <= fit_max:
+                    return
+                if fix_invalid and fit_max > 0:
+                    config["tcgen05_ab_stages"] = fit_max
+                    return
         if fix_invalid:
             config["tcgen05_ab_stages"] = 3
             return
-        raise InvalidConfig("tcgen05_ab_stages > 3 is not supported")
+        raise InvalidConfig(
+            "tcgen05_ab_stages > 3 is only supported by the validated "
+            "Target1 TVM-FFI seed (or fp8 within the SMEM budget)"
+        )
 
     def _is_validated_clc_persistence_search_candidate(
         self, config: dict[str, object]
@@ -1689,6 +1750,13 @@ class CuteTcgen05Config:
             # cluster_m=1 256x256 overflows bare-AB) before codegen, so admission is
             # free but an overflowing kernel is never generated.
             ab_stages_max = 3
+            # fp8 (1-byte) operands fit a deeper AB pipeline; widen the
+            # validation range so an explicit deep-staged fp8 config is
+            # accepted (``_validate_target1_ab_stage_envelope`` clamps it to
+            # the actual per-CTA SMEM budget for the chosen block sizes).
+            constraints = self.ab_stages_three_search_constraints
+            if constraints is not None and constraints.dtype_bytes < 2:
+                ab_stages_max = 12
         else:
             ab_stages_max = 2
         if for_search:
