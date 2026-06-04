@@ -2,12 +2,17 @@ from __future__ import annotations
 
 import abc
 import ast
+import base64
+import contextlib
 import functools
+import hashlib
 from itertools import starmap
+import logging
 import math
 import operator
 import os
 import re
+import tempfile
 from typing import TYPE_CHECKING
 from typing import Any
 from typing import Callable
@@ -23,6 +28,8 @@ from .cute.tcgen05_constants import TCGEN05_CUBIN_LINEINFO_CONFIG_KEY
 from .cute.tcgen05_constants import TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY
 
 if TYPE_CHECKING:
+    from collections.abc import Generator
+
     from torch._inductor.ops_handler import OpsHandler
 
     from ..autotuner.config_fragment import ConfigSpecFragment
@@ -36,6 +43,8 @@ if TYPE_CHECKING:
     from .tile_strategy import TileStrategy
 
     InductorOpOverrides = OpsHandler[Any]
+
+log: logging.Logger = logging.getLogger(__name__)
 
 
 @functools.cache
@@ -317,6 +326,71 @@ class Backend(abc.ABC):
         Other backends (Pallas, CuTe) may not need or support this.
         """
         return True
+
+    def setup_compile_cache_dir(self, device_index: int) -> None:
+        """Point the backend's on-disk compile cache at Helion's cache root.
+
+        Called from :meth:`BoundKernel.compile_config` before compilation.
+        Backends that use a per-device on-disk cache of compiled artifacts
+        (Triton, CuTe) override this to set the relevant environment variable
+        (respecting any user override).  The default is a no-op.
+        """
+        return None
+
+    def make_ephemeral_cache(
+        self,
+    ) -> contextlib.AbstractContextManager[None] | None:
+        """Return a context manager that redirects the on-disk compile cache
+        to a throwaway directory during autotuning, or ``None`` when the
+        backend has no ephemeral-cache behavior.
+
+        Autotuning compiles many candidate configs; without this they would
+        pollute the persistent cache.  The winning config is recompiled into
+        the real cache afterward (see :meth:`finalize_ephemeral_cache`).
+        """
+        return None
+
+    @staticmethod
+    def keep_compile_cache_requested() -> bool:
+        """Whether the user asked to keep every candidate's compile-cache
+        artifact during autotuning (i.e. disable the ephemeral cache).
+
+        ``HELION_KEEP_CACHE`` is the backend-agnostic control, matching the
+        rest of the ``HELION_*CACHE*`` env-var family.
+        """
+        return os.environ.get("HELION_KEEP_CACHE", "") == "1"
+
+    def finalize_ephemeral_cache(
+        self, bound_kernel: BoundKernel[Any], config: Config
+    ) -> None:
+        """Post-autotune cleanup after running inside an ephemeral cache.
+
+        Evicts the winning config's in-memory compiled artifact so the next
+        call recompiles it into the real (persistent) cache.  No-op by default.
+        """
+        return None
+
+    def compiled_cache_key(
+        self, bound_kernel: BoundKernel[Any], compiled_fn: object
+    ) -> str | None:
+        """Return a stable backend cache key for an already-compiled callable.
+
+        ``compiled_fn`` is the value stored in ``bound_kernel._compile_cache``
+        for the requested config.  Returns ``None`` if the backend has no cache
+        key or the kernel has not been JIT-compiled yet.
+        """
+        return None
+
+    def annotate_compiled_module(
+        self, module: object, source: str, kernel_name: str
+    ) -> None:
+        """Record codegen metadata on a freshly-loaded generated module.
+
+        Called from :meth:`BoundKernel.compile_config` after the generated
+        source has been imported.  Backends that derive a cross-process compile
+        cache key from the generated source (CuTe) override this.  No-op default.
+        """
+        return None
 
     def classify_autotune_exception(self, err: BaseException) -> str | None:
         """Classify an exception that occurred during autotuning.
@@ -862,6 +936,111 @@ class TritonBackend(Backend):
             fragments.update(get_mtia_tunable_fragments())
 
         return fragments
+
+    def setup_compile_cache_dir(self, device_index: int) -> None:
+        if "TRITON_CACHE_DIR" not in os.environ:
+            from ..autotuner.local_cache import helion_triton_cache_dir
+
+            triton_dir = helion_triton_cache_dir(device_index)
+            os.environ["TRITON_CACHE_DIR"] = triton_dir
+            log.debug("Set TRITON_CACHE_DIR=%s", triton_dir)
+
+    def make_ephemeral_cache(
+        self,
+    ) -> contextlib.AbstractContextManager[None] | None:
+        # HELION_KEEP_TRITON_CACHE is a deprecated alias kept for backward
+        # compatibility; HELION_KEEP_CACHE is the canonical control.
+        if (
+            self.keep_compile_cache_requested()
+            or os.environ.get("HELION_KEEP_TRITON_CACHE", "") == "1"
+        ):
+            return None
+        return self._ephemeral_triton_cache()
+
+    @contextlib.contextmanager
+    def _ephemeral_triton_cache(self) -> Generator[None, None, None]:
+        """Redirect Triton cache to a temporary dir during autotuning.
+
+        All candidate compilations write to an ephemeral directory that is
+        deleted on exit.  The winning config is recompiled afterward into the
+        real cache by the caller.
+        """
+        saved = os.environ.get("TRITON_CACHE_DIR")
+        with tempfile.TemporaryDirectory(prefix="helion_autotune_") as ephemeral:
+            os.environ["TRITON_CACHE_DIR"] = ephemeral
+            log.debug("Ephemeral Triton cache: %s", ephemeral)
+            try:
+                yield
+            finally:
+                if saved is not None:
+                    os.environ["TRITON_CACHE_DIR"] = saved
+                else:
+                    os.environ.pop("TRITON_CACHE_DIR", None)
+
+    def finalize_ephemeral_cache(
+        self, bound_kernel: BoundKernel[Any], config: Config
+    ) -> None:
+        from ..runtime.config import Config
+
+        self._clear_triton_jit_cache(bound_kernel, config)
+        evict = config
+        if bound_kernel._compile_cache.pop(evict, None) is None:
+            default = bound_kernel.config_spec.default_config()
+            # pyrefly: ignore [bad-argument-type]
+            evict = Config(**(default.config | config.config))
+            bound_kernel._compile_cache.pop(evict, None)
+        bound_kernel._cache_path_map.pop(evict, None)
+
+    def _clear_triton_jit_cache(
+        self, bound_kernel: BoundKernel[Any], config: Config
+    ) -> None:
+        """Clear Triton's in-memory JIT cache for the compiled kernel.
+
+        After autotuning in an ephemeral cache dir, device_caches on the
+        JITFunction still holds the compiled binary.  Clearing it forces
+        Triton to recompile (and write to TRITON_CACHE_DIR) on the next call.
+
+        If the config was minimized by the autotuner, the lookup is retried
+        with the full config (defaults merged back in).
+        """
+        from ..runtime.config import Config
+
+        compiled_fn = bound_kernel._compile_cache.get(config)
+        if compiled_fn is None:
+            default = bound_kernel.config_spec.default_config()
+            # pyrefly: ignore [bad-argument-type]
+            full_config = Config(**(default.config | config.config))
+            compiled_fn = bound_kernel._compile_cache.get(full_config)
+        if compiled_fn is None:
+            return
+        triton_jit_fn = compiled_fn.__globals__.get(
+            f"_helion_{bound_kernel.kernel.name}"
+        )
+        if triton_jit_fn is not None and hasattr(triton_jit_fn, "device_caches"):
+            triton_jit_fn.device_caches.clear()
+
+    def compiled_cache_key(
+        self, bound_kernel: BoundKernel[Any], compiled_fn: object
+    ) -> str | None:
+        # The jit_fn that - for helion - starts with _helion_
+        triton_jit_fn = compiled_fn.__globals__.get(  # type: ignore[attr-defined]
+            f"_helion_{bound_kernel.kernel.name}"
+        )
+        if triton_jit_fn is None:
+            return None
+        try:
+            for cache_tuple in triton_jit_fn.device_caches.values():
+                compiled_kernels = cache_tuple[0]
+                for compiled_kernel in compiled_kernels.values():
+                    h = getattr(compiled_kernel, "hash", None)
+                    if h is not None:
+                        return base64.b32encode(bytes.fromhex(h)).decode().rstrip("=")
+        except (AttributeError, IndexError, TypeError, ValueError):
+            # device_caches, cache-tuple layout, and CompiledKernel.hash are
+            # Triton-internal details that may change across Triton versions
+            # return None gracefully if this fails
+            return None
+        return None
 
     def dtype_str(self, dtype: torch.dtype) -> str:
         from torch._inductor.utils import triton_type
@@ -2788,6 +2967,100 @@ class CuteBackend(Backend):
         # The CuTe DSL does not expose a Triton-style precompile entry point;
         # the autotuner has to compile + benchmark each config inline.
         return False
+
+    def setup_compile_cache_dir(self, device_index: int) -> None:
+        if "CUTE_DSL_CACHE_DIR" not in os.environ:
+            from ..autotuner.local_cache import helion_cute_cache_dir
+
+            cute_dir = helion_cute_cache_dir(device_index)
+            os.environ["CUTE_DSL_CACHE_DIR"] = cute_dir
+            log.debug("Set CUTE_DSL_CACHE_DIR=%s", cute_dir)
+
+    def make_ephemeral_cache(
+        self,
+    ) -> contextlib.AbstractContextManager[None] | None:
+        if self.keep_compile_cache_requested():
+            return None
+        return self._ephemeral_cute_cache()
+
+    @contextlib.contextmanager
+    def _ephemeral_cute_cache(self) -> Generator[None, None, None]:
+        """Redirect the CuTe DSL on-disk cache to a temporary dir during
+        autotuning so candidate compilations don't pollute the real cache.
+
+        The winning config is recompiled into the real cache afterward (see
+        :meth:`finalize_ephemeral_cache`).
+        """
+        saved = os.environ.get("CUTE_DSL_CACHE_DIR")
+        with tempfile.TemporaryDirectory(prefix="helion_cute_autotune_") as ephemeral:
+            os.environ["CUTE_DSL_CACHE_DIR"] = ephemeral
+            log.debug("Ephemeral CuTe cache: %s", ephemeral)
+            try:
+                yield
+            finally:
+                if saved is not None:
+                    os.environ["CUTE_DSL_CACHE_DIR"] = saved
+                else:
+                    os.environ.pop("CUTE_DSL_CACHE_DIR", None)
+
+    def finalize_ephemeral_cache(
+        self, bound_kernel: BoundKernel[Any], config: Config
+    ) -> None:
+        from ..runtime.config import Config
+
+        compiled_fn = bound_kernel._compile_cache.get(config)
+        evict = config
+        if compiled_fn is None:
+            default = bound_kernel.config_spec.default_config()
+            # pyrefly: ignore [bad-argument-type]
+            evict = Config(**(default.config | config.config))
+            compiled_fn = bound_kernel._compile_cache.get(evict)
+        # Drop in-memory compiled launchers so the winning config recompiles
+        # (and persists its artifact into the real, non-ephemeral cache dir)
+        # on its next launch.  PyCodeCache returns the same generated module
+        # object, so clearing the launcher dict on it is what forces the
+        # recompile + persist.
+        if compiled_fn is not None:
+            cute_kernel = compiled_fn.__globals__.get(  # type: ignore[attr-defined]
+                f"_helion_{bound_kernel.kernel.name}"
+            )
+            launchers = getattr(cute_kernel, "_helion_cute_compiled_launchers", None)
+            if launchers is not None:
+                launchers.clear()
+        # Pop the compile-cache entry so compile_config re-runs
+        # setup_compile_cache_dir (pointing CUTE_DSL_CACHE_DIR at the real dir).
+        bound_kernel._compile_cache.pop(config, None)
+        bound_kernel._compile_cache.pop(evict, None)
+        bound_kernel._cache_path_map.pop(config, None)
+        bound_kernel._cache_path_map.pop(evict, None)
+
+    def compiled_cache_key(
+        self, bound_kernel: BoundKernel[Any], compiled_fn: object
+    ) -> str | None:
+        cute_kernel = compiled_fn.__globals__.get(  # type: ignore[attr-defined]
+            f"_helion_{bound_kernel.kernel.name}"
+        )
+        if cute_kernel is None:
+            return None
+        launchers = getattr(cute_kernel, "_helion_cute_compiled_launchers", None)
+        if not launchers:
+            return None
+        for launcher in launchers.values():
+            key = getattr(launcher, "_cache_key", None)
+            if key is not None:
+                return key
+        return None
+
+    def annotate_compiled_module(
+        self, module: object, source: str, kernel_name: str
+    ) -> None:
+        cute_kernel = getattr(module, f"_helion_{kernel_name}", None)
+        if cute_kernel is None:
+            return
+        with contextlib.suppress(AttributeError, TypeError):
+            cute_kernel._helion_cute_source_hash = hashlib.sha256(
+                source.encode("utf-8")
+            ).hexdigest()
 
     def classify_autotune_exception(self, err: BaseException) -> str | None:
         # Exceptions raised from inside the cute/cutlass DSL during compile or

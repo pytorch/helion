@@ -44,6 +44,11 @@ def helion_triton_cache_dir(device_index: int) -> str:
     return str(get_helion_cache_dir() / "triton" / str(device_index))
 
 
+def helion_cute_cache_dir(device_index: int) -> str:
+    """Return per-device CuTe DSL cache directory under Helion's cache root."""
+    return str(get_helion_cache_dir() / "cute" / str(device_index))
+
+
 @dataclasses.dataclass(frozen=True)
 class SavedBestConfig:
     """A parsed cache entry from a .best_config file."""
