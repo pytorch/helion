@@ -9,10 +9,8 @@ from .tcgen05_constants import TCGEN05_DIRECT_ENTRY_STAGE_TUPLES_BY_BK
 from .tcgen05_constants import tcgen05_direct_entry_stage_tuple_allowed
 
 __all__ = [
-    "TCGEN05_DIRECT_ENTRY_STAGE_TUPLES_BY_BK",
     "Tcgen05DirectEntryPlan",
     "build_target1_direct_entry_source",
-    "tcgen05_direct_entry_stage_tuple_allowed",
 ]
 
 

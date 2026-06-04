@@ -163,21 +163,17 @@ def _output_global_shape_from_store(
     return tuple(tensor_val.shape) if tensor_val is not None else None
 
 
-def _aux_descriptor_from_step(
-    step: _AuxiliaryTensorStep, store_value_node: torch.fx.Node
-) -> Tcgen05AuxTensorDescriptor:
-    """Build a :class:`Tcgen05AuxTensorDescriptor` from one
-    :class:`_AuxiliaryTensorStep` plus the store-value node whose
-    chain produced it.
+def _step_host_tensor(
+    step: _AuxiliaryTensorStep,
+) -> tuple[torch.fx.Node, torch.Tensor]:
+    """Return ``(host_tensor_fx_node, host_tensor_val)`` for an aux step.
 
-    Asserts on every field rather than silently returning ``None``:
-    the analyzer that produced ``step`` has already classified the
-    load against the same FX shape we read here (rank-1 / rank-2
-    aux operand with a recoverable ``meta['val']``), so any
-    mismatch is an internal invariant break — silent drops would
-    mask it and surface as a confusing downstream codegen error
-    (the productive-body SMEM ring is sized by descriptor count,
-    so a dropped descriptor would under-allocate).
+    Asserts rather than returning ``None``: the chain analyzer that
+    produced ``step`` has already classified the load against the same
+    FX shape we read here (rank-1 / rank-2 aux operand with a
+    recoverable ``meta['val']``), so any mismatch is an internal
+    invariant break — silent drops would mask it and surface as a
+    confusing downstream codegen error.
     """
     load_node = step.load_node
     assert load_node.args, "_AuxiliaryTensorStep.load_node missing args"
@@ -189,8 +185,19 @@ def _aux_descriptor_from_step(
     assert isinstance(host_tensor_val, torch.Tensor), (
         "_AuxiliaryTensorStep host-tensor FX node has no torch.Tensor meta"
     )
+    return host_tensor_fx_node, host_tensor_val
+
+
+def _aux_descriptor_from_step(
+    step: _AuxiliaryTensorStep, store_value_node: torch.fx.Node
+) -> Tcgen05AuxTensorDescriptor:
+    """Build a :class:`Tcgen05AuxTensorDescriptor` from one
+    :class:`_AuxiliaryTensorStep` plus the store-value node whose
+    chain produced it.
+    """
+    host_tensor_fx_node, host_tensor_val = _step_host_tensor(step)
     return Tcgen05AuxTensorDescriptor(
-        load_node=load_node,
+        load_node=step.load_node,
         host_tensor_fx_node=host_tensor_fx_node,
         host_tensor_val=host_tensor_val,
         broadcast_axis=step.broadcast_axis,
@@ -460,24 +467,8 @@ def _host_function_has_tcgen05_single_store_pattern(
     if not mma_nodes:
         return False
 
-    store_outputs: list[tuple[torch.fx.Node, torch.Tensor]] = []
-    for graph_info in graphs:
-        for store_node, store_value in _store_value_pairs_from_graph(graph_info.graph):
-            tensor_val = _output_tensor_from_store_node(store_node)
-            if tensor_val is not None:
-                store_outputs.append((store_value, tensor_val))
-    if len(store_outputs) != 1:
-        return False
-
-    store_value, _output = store_outputs[0]
-    if (
-        store_value.op != "call_function"
-        or store_value.target is not torch.ops.prims.convert_element_type.default
-        or store_value.kwargs
-    ):
-        return False
-    cast_input = store_value.args[0] if store_value.args else None
-    if not isinstance(cast_input, torch.fx.Node):
+    cast_input = _single_store_cast_input(graphs)
+    if cast_input is None:
         return False
     if intermediate_op is not None:
         if (
@@ -560,62 +551,10 @@ def host_function_has_tcgen05_bias_matmul_store_pattern(
     if not mma_nodes:
         return False
 
-    store_outputs: list[tuple[torch.fx.Node, torch.Tensor]] = []
-    for graph_info in graphs:
-        for store_node, store_value in _store_value_pairs_from_graph(graph_info.graph):
-            tensor_val = _output_tensor_from_store_node(store_node)
-            if tensor_val is not None:
-                store_outputs.append((store_value, tensor_val))
-    if len(store_outputs) != 1:
+    cast_input = _single_store_cast_input(graphs)
+    if cast_input is None:
         return False
-
-    store_value, _output = store_outputs[0]
-    if (
-        store_value.op != "call_function"
-        or store_value.target is not torch.ops.prims.convert_element_type.default
-        or store_value.kwargs
-    ):
-        return False
-    cast_input = store_value.args[0] if store_value.args else None
-    if not isinstance(cast_input, torch.fx.Node):
-        return False
-    if (
-        cast_input.op != "call_function"
-        or cast_input.target is not torch.ops.aten.add.Tensor
-        or cast_input.kwargs
-        or len(cast_input.args) != 2
-    ):
-        return False
-    add_lhs, add_rhs = cast_input.args
-    if not isinstance(add_lhs, torch.fx.Node) or not isinstance(add_rhs, torch.fx.Node):
-        return False
-    inner_outputs_index = build_inner_outputs_index_from_graphs(graphs)
-
-    def _is_rank1_bias_load(node: torch.fx.Node) -> bool:
-        if node.op != "call_function" or node.target is not memory_ops.load:
-            return False
-        host_arg = node.args[0] if node.args else None
-        if not isinstance(host_arg, torch.fx.Node):
-            return False
-        host_val = host_arg.meta.get("val")
-        if not isinstance(host_val, torch.Tensor):
-            return False
-        # P2: the runtime validator only admits bf16 bias tensors, so
-        # gate the host-side detector on dtype too — a non-bf16 bias
-        # kernel at T2 shape must not enable the T2 seed (it would
-        # otherwise fail loudly at launch instead of falling back to
-        # the wrapper-dispatch route at autotune-seed time).
-        return host_val.ndim == 1 and host_val.dtype == torch.bfloat16
-
-    # Either side of the add can be the carrier (commutative); the
-    # other must be a rank-1 bias load.
-    carrier_first = walk_carrier_to_tcgen05_matmul(
-        add_lhs, mma_nodes, inner_outputs_index
-    ) is not None and _is_rank1_bias_load(add_rhs)
-    carrier_second = walk_carrier_to_tcgen05_matmul(
-        add_rhs, mma_nodes, inner_outputs_index
-    ) is not None and _is_rank1_bias_load(add_lhs)
-    return carrier_first or carrier_second
+    return _bias_add_walks_to_mma_carrier(cast_input, mma_nodes, graphs)
 
 
 def host_function_has_tcgen05_bias_relu_matmul_store_pattern(
@@ -660,24 +599,8 @@ def host_function_has_tcgen05_bias_relu_matmul_store_pattern(
     if not mma_nodes:
         return False
 
-    store_outputs: list[tuple[torch.fx.Node, torch.Tensor]] = []
-    for graph_info in graphs:
-        for store_node, store_value in _store_value_pairs_from_graph(graph_info.graph):
-            tensor_val = _output_tensor_from_store_node(store_node)
-            if tensor_val is not None:
-                store_outputs.append((store_value, tensor_val))
-    if len(store_outputs) != 1:
-        return False
-
-    store_value, _output = store_outputs[0]
-    if (
-        store_value.op != "call_function"
-        or store_value.target is not torch.ops.prims.convert_element_type.default
-        or store_value.kwargs
-    ):
-        return False
-    cast_input = store_value.args[0] if store_value.args else None
-    if not isinstance(cast_input, torch.fx.Node):
+    cast_input = _single_store_cast_input(graphs)
+    if cast_input is None:
         return False
     # T6 requires a relu directly feeding the cast.
     if (
@@ -690,44 +613,7 @@ def host_function_has_tcgen05_bias_relu_matmul_store_pattern(
     relu_input = cast_input.args[0]
     if not isinstance(relu_input, torch.fx.Node):
         return False
-    # The relu's input must be a bias add.
-    if (
-        relu_input.op != "call_function"
-        or relu_input.target is not torch.ops.aten.add.Tensor
-        or relu_input.kwargs
-        or len(relu_input.args) != 2
-    ):
-        return False
-    add_lhs, add_rhs = relu_input.args
-    if not isinstance(add_lhs, torch.fx.Node) or not isinstance(add_rhs, torch.fx.Node):
-        return False
-    inner_outputs_index = build_inner_outputs_index_from_graphs(graphs)
-
-    def _is_rank1_bias_load(node: torch.fx.Node) -> bool:
-        if node.op != "call_function" or node.target is not memory_ops.load:
-            return False
-        host_arg = node.args[0] if node.args else None
-        if not isinstance(host_arg, torch.fx.Node):
-            return False
-        host_val = host_arg.meta.get("val")
-        if not isinstance(host_val, torch.Tensor):
-            return False
-        # P2 (cycle-6): the runtime validator only admits bf16 bias
-        # tensors, so gate the host-side detector on dtype too — a
-        # non-bf16 bias kernel at T6 shape must not enable the T6 seed
-        # (it would otherwise fail loudly at launch instead of falling
-        # back to the wrapper-dispatch route at autotune-seed time).
-        return host_val.ndim == 1 and host_val.dtype == torch.bfloat16
-
-    # Either side of the add can be the carrier (commutative); the
-    # other must be a rank-1 bias load.
-    carrier_first = walk_carrier_to_tcgen05_matmul(
-        add_lhs, mma_nodes, inner_outputs_index
-    ) is not None and _is_rank1_bias_load(add_rhs)
-    carrier_second = walk_carrier_to_tcgen05_matmul(
-        add_rhs, mma_nodes, inner_outputs_index
-    ) is not None and _is_rank1_bias_load(add_lhs)
-    return carrier_first or carrier_second
+    return _bias_add_walks_to_mma_carrier(relu_input, mma_nodes, graphs)
 
 
 def _tcgen05_aux_detector_mma_facts(
@@ -780,6 +666,84 @@ def _output_tensor_from_store_node(store_node: torch.fx.Node) -> torch.Tensor | 
     return tensor_val if isinstance(tensor_val, torch.Tensor) else None
 
 
+def _single_store_cast_input(
+    graphs: Sequence[GraphInfo],
+) -> torch.fx.Node | None:
+    """Return the FX node feeding the lone store's ``convert_element_type``.
+
+    Returns ``None`` unless the host function has exactly one store whose
+    value is a kwarg-free ``prims.convert_element_type.default`` call with
+    a single FX-node arg. This is the entry shape shared by the
+    identity/relu/bias/bias_relu direct-entry detectors.
+    """
+    store_outputs: list[torch.fx.Node] = []
+    for graph_info in graphs:
+        for store_node, store_value in _store_value_pairs_from_graph(graph_info.graph):
+            if _output_tensor_from_store_node(store_node) is not None:
+                store_outputs.append(store_value)
+    if len(store_outputs) != 1:
+        return None
+    store_value = store_outputs[0]
+    if (
+        store_value.op != "call_function"
+        or store_value.target is not torch.ops.prims.convert_element_type.default
+        or store_value.kwargs
+    ):
+        return None
+    cast_input = store_value.args[0] if store_value.args else None
+    return cast_input if isinstance(cast_input, torch.fx.Node) else None
+
+
+def _is_rank1_bf16_bias_load(node: torch.fx.Node) -> bool:
+    """Return True iff ``node`` is a rank-1 bf16 ``memory_ops.load`` call.
+
+    The runtime bias validator only admits bf16 bias tensors, so non-bf16
+    bias loads must not enable a bias-store direct-entry seed at the
+    host-detector level either.
+    """
+    if node.op != "call_function" or node.target is not memory_ops.load:
+        return False
+    host_arg = node.args[0] if node.args else None
+    if not isinstance(host_arg, torch.fx.Node):
+        return False
+    host_val = host_arg.meta.get("val")
+    if not isinstance(host_val, torch.Tensor):
+        return False
+    return host_val.ndim == 1 and host_val.dtype == torch.bfloat16
+
+
+def _bias_add_walks_to_mma_carrier(
+    add_node: torch.fx.Node,
+    mma_nodes: set[torch.fx.Node],
+    graphs: Sequence[GraphInfo],
+) -> bool:
+    """Return True iff ``add_node`` is ``aten.add.Tensor(carrier, bias_load)``.
+
+    One operand of the add must walk to an MMA carrier via
+    :func:`walk_carrier_to_tcgen05_matmul`; the other must satisfy
+    :func:`_is_rank1_bf16_bias_load`. Either operand may be the carrier
+    (commutative).
+    """
+    if (
+        add_node.op != "call_function"
+        or add_node.target is not torch.ops.aten.add.Tensor
+        or add_node.kwargs
+        or len(add_node.args) != 2
+    ):
+        return False
+    add_lhs, add_rhs = add_node.args
+    if not isinstance(add_lhs, torch.fx.Node) or not isinstance(add_rhs, torch.fx.Node):
+        return False
+    inner_outputs_index = build_inner_outputs_index_from_graphs(graphs)
+    carrier_first = walk_carrier_to_tcgen05_matmul(
+        add_lhs, mma_nodes, inner_outputs_index
+    ) is not None and _is_rank1_bf16_bias_load(add_rhs)
+    carrier_second = walk_carrier_to_tcgen05_matmul(
+        add_rhs, mma_nodes, inner_outputs_index
+    ) is not None and _is_rank1_bf16_bias_load(add_lhs)
+    return carrier_first or carrier_second
+
+
 def _same_static_shape(lhs: torch.Tensor, rhs: torch.Tensor) -> bool:
     if lhs.ndim != rhs.ndim:
         return False
@@ -818,15 +782,7 @@ def _has_tma_compatible_analyzed_aux_store(
         if not exact_steps:
             continue
         for step in exact_steps:
-            assert step.load_node.args, "_AuxiliaryTensorStep.load_node missing args"
-            tensor_arg = step.load_node.args[0]
-            assert isinstance(tensor_arg, torch.fx.Node), (
-                "_AuxiliaryTensorStep.load_node.args[0] is not an FX node"
-            )
-            aux_tensor = tensor_arg.meta.get("val")
-            assert isinstance(aux_tensor, torch.Tensor), (
-                "_AuxiliaryTensorStep host-tensor FX node has no torch.Tensor meta"
-            )
+            _, aux_tensor = _step_host_tensor(step)
             if not _same_static_shape(aux_tensor, output):
                 return False
             if aux_tensor.dtype != output.dtype:

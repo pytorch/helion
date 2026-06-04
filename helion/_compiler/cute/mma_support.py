@@ -1,11 +1,8 @@
 from __future__ import annotations
 
 import dataclasses
-import os
 
 import torch
-
-_VALID_IMPLS = ("universal", "warp", "warpgroup", "tcgen05")
 
 
 @dataclasses.dataclass(frozen=True)
@@ -33,13 +30,6 @@ class CuteMmaSupport:
         if self.tcgen05_f16bf16:
             impls.append("tcgen05")
         return tuple(impls)
-
-    @property
-    def default_impl(self) -> str | None:
-        # Helion's current MMA lowering is built around the universal FMA atom.
-        if self.universal:
-            return "universal"
-        return None
 
 
 def _current_cuda_device() -> torch.device | None:
@@ -143,23 +133,3 @@ def get_cute_mma_support() -> CuteMmaSupport:
         warpgroup_error=warpgroup_error,
         tcgen05_error=tcgen05_error,
     )
-
-
-def select_cute_mma_impl() -> str:
-    support = get_cute_mma_support()
-    override = os.environ.get("HELION_CUTE_MMA_IMPL", "auto").strip().lower()
-    if override == "auto":
-        default_impl = support.default_impl
-        if default_impl is None:
-            raise RuntimeError("CuTe MMA probing found no usable implementation")
-        return default_impl
-    if override not in _VALID_IMPLS:
-        raise ValueError(
-            f"Invalid HELION_CUTE_MMA_IMPL={override!r}; expected one of {_VALID_IMPLS}"
-        )
-    if override not in support.supported_impls:
-        raise RuntimeError(
-            "Requested HELION_CUTE_MMA_IMPL is not supported on this machine: "
-            f"{override}. Supported: {support.supported_impls}"
-        )
-    return override

@@ -159,22 +159,14 @@ def _vec_width(node: ast.AST) -> int | None:
     return None
 
 
-def offset_var_for(loop: ast.For) -> str:
-    """Return the for-loop target variable name."""
-    assert isinstance(loop.target, ast.Name)
-    return loop.target.id
-
-
 def _dtype_from_default(node: ast.expr) -> str | None:
     """Extract dtype from the else branch of a masked load.
 
     For ``... if mask else cutlass.Float32(0)``, the else expression is
     ``cutlass.Float32(0)`` and the dtype is ``cutlass.Float32``.
     """
-    if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+    if isinstance(node, ast.Call) and isinstance(node.func, (ast.Attribute, ast.Name)):
         return ast.unparse(node.func)
-    if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
-        return node.func.id
     return None
 
 
@@ -326,9 +318,9 @@ class _CuteFuseTwoPassLoads(ast.NodeTransformer):
              vec_for); index is ``(offset - start) // step * K + lane``.
         """
         body = outer_loop.body
-        offset_var = offset_var_for(outer_loop)
+        assert isinstance(outer_loop.target, ast.Name)
         cache_index_outer = (
-            f"({offset_var} - ({_node_text(start)})) // ({_node_text(step)})"
+            f"({outer_loop.target.id} - ({_node_text(start)})) // ({_node_text(step)})"
         )
         for_children = [s for s in body if isinstance(s, ast.For)]
         if not for_children:
