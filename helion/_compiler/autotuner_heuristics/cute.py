@@ -609,16 +609,15 @@ class CuteTcgen05ClusterM2Heuristic(AutotunerHeuristic):
 
 
 class CuteTcgen05ClusterM2FfiHeuristic(CuteTcgen05ClusterM2Heuristic):
-    """Generalized TVM-FFI direct-entry seed for full-tile CtaGroup.TWO bf16 GEMMs.
+    """Generalized TVM-FFI seed for full-tile CtaGroup.TWO 16-bit GEMMs.
 
-    The direct-entry codegen (``build_target1_direct_entry_source`` /
-    ``_create_cute_direct_entry``) builds its A/B/D TMA descriptors from the
-    runtime tensor shapes, so the fast launch path is shape-GENERAL: the only
-    real constraints are structural (256x256 CTA tile, cluster_m=2, a bk in the
-    direct-entry stage-tuple table, bf16 operands, the 128x32 explicit epilogue
-    subtile). This heuristic emits that full ``explicit_epi_tile`` + flat-role +
-    ``tvm_ffi_launch`` config for ANY eligible shape, replacing the bank of
-    hand-pinned per-shape seeds.
+    The generic ``--enable-tvm-ffi`` launcher builds its A/B/D TMA descriptors
+    from the runtime tensor shapes, so the fast launch path is shape-GENERAL:
+    the only real constraints are structural (256x256 CTA tile, cluster_m=2, a
+    bk in the direct-entry stage-tuple table, bf16/fp16 operands, the 128x32
+    explicit epilogue subtile). This heuristic emits that full
+    ``explicit_epi_tile`` + flat-role + ``tvm_ffi_launch`` config for ANY
+    eligible shape, replacing the bank of hand-pinned per-shape seeds.
 
     The DEFAULT-layout sibling (``CuteTcgen05ClusterM2Heuristic``) still seeds
     the non-FFI config, so the autotuner benchmarks both and keeps whichever
