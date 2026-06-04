@@ -11,7 +11,6 @@ from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
 from helion._testing import code_and_output
 from helion._testing import onlyBackends
-from helion._testing import skipIfCute
 from helion._testing import skipIfRefEager
 from helion._testing import skipIfRocm
 from helion._testing import skipIfTileIR
@@ -538,11 +537,6 @@ class TestAtomicOperations(RefEagerTestBase, TestCase):
             out_y, torch.full([16, 128], 2.0, device=DEVICE) + y.sum(dim=0)
         )
 
-    @skipIfCute(
-        "CuTe atomic_max/atomic_min on float32 emit an unsupported NVVM "
-        "atomicrmw (no native float atomic max/min); needs a CAS-loop "
-        "emulation"
-    )
     def test_structural_atomic_max_min_shared_tile(self):
         @helion.kernel(static_shapes=True)
         def structural_atomic_max_kernel(x: torch.Tensor) -> torch.Tensor:
