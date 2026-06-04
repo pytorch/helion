@@ -7,6 +7,7 @@ import functools
 import itertools
 import math
 import operator
+import re
 from typing import TYPE_CHECKING
 from typing import NamedTuple
 from typing import TypeVar
@@ -393,13 +394,37 @@ def _split_one_lane_loop(loop: ast.For, lane_var: str) -> list[ast.AST]:
     if not markers:
         return [loop]
 
+    marker_indices = {i for i, _ in markers}
+
+    # A matmul whose *output* is reduced over a lane-distributed axis (e.g.
+    # matmul_layernorm's ``acc.sum(-1)`` over the synthetic-lane N output) cannot
+    # be handled by the per-lane / two-pass paths below: each lane owns a
+    # distinct output column, so the reduction must combine DIFFERENT lanes, and
+    # the matmul (an unduplicatable cross-thread shared-memory reduction) cannot
+    # be re-run in a second lane pass.  The register-stash lowering runs the
+    # matmul once, stashes each lane's output in a per-thread fragment, and
+    # re-derives every downstream reduction / consumer from the stash.
+    #
+    # This is gated narrowly so it does NOT disturb kernels the existing paths
+    # already handle correctly:
+    #   * an unduplicatable op must feed the reduction, and
+    #   * the marker results must NOT be consumed by a cross-lane loop-carried
+    #     accumulator.  Online-softmax attention carries ``mi``/``di`` across the
+    #     lane loop (``di = di * alpha + sum``); there the per-lane restore is
+    #     correct, so the stash path must stay out of the way.
+    if any(
+        _contains_unduplicatable_op(stmt) for stmt in body
+    ) and not _markers_feed_cross_lane_carry(body, lane_var, markers):
+        stashed = _split_lane_loop_with_register_stash(loop, lane_var, markers)
+        if stashed is not None:
+            return stashed
+
     # Safety: the two-pass split is only valid when the reduction marker is the
     # ONLY cross-lane carried value in this lane loop. If the body has another
     # loop-carried accumulator across the lanes (e.g. a matmul ``dot_acc`` or a
     # plain ``extra += per_lane`` sum that already accumulates over the lanes),
     # splitting would drop or double-count it. Fall back to the original
     # single-pass per-lane behavior by replacing each marker with its raw input.
-    marker_indices = {i for i, _ in markers}
     if _has_extra_cross_lane_carry(body, lane_var, marker_indices):
         return [_restore_per_lane_markers(loop, markers)]
 
@@ -419,7 +444,9 @@ def _split_one_lane_loop(loop: ast.For, lane_var: str) -> list[ast.AST]:
     # reduction-input producers. That is only safe for side-effect-free
     # producers. A matmul / collective in the slice (cross-thread shared-memory
     # reductions, ``cute.gemm``, ``dot``) cannot be duplicated without racing on
-    # shared memory, so fall back to per-lane behavior in that case.
+    # shared memory, so fall back to per-lane behavior in that case (the
+    # register-stash path above handles the cases where the per-lane restore
+    # would be numerically wrong).
     if any(_contains_unduplicatable_op(body[i]) for i in phase1_indices):
         return [_restore_per_lane_markers(loop, markers)]
 
@@ -495,6 +522,370 @@ def _split_one_lane_loop(loop: ast.For, lane_var: str) -> list[ast.AST]:
     if lane_varying_tail:
         result.append(_create_lane_loop(lane_var, extent, lane_varying_tail))
     return result
+
+
+_LANE_STASH_COUNTER = itertools.count()
+
+
+def _stash_dtype_for_value(
+    value_name: str, body: list[ast.AST], markers: list[tuple[int, _LaneReduceMarker]]
+) -> str:
+    """Pick a CuTe scalar dtype constructor for a stashed lane value.
+
+    Prefer the accumulator dtype of a marker whose input transitively reads the
+    stashed value (matmul outputs feed an fp32 ``sum``), then any cast that
+    wraps the value's defining assignment, then ``cutlass.Float32``.
+    """
+    from .ast_read_writes import ReadWrites
+
+    for _idx, m in markers:
+        slice_indices, _ = _backward_slice(body, {m.input_name})
+        reads_value = any(
+            value_name in ReadWrites.from_ast(body[i]).reads for i in slice_indices
+        )
+        if reads_value:
+            ctor = _dtype_ctor_from_identity(m.identity_expr)
+            if ctor is not None:
+                return ctor
+    for stmt in body:
+        if (
+            isinstance(stmt, ast.Assign)
+            and len(stmt.targets) == 1
+            and isinstance(stmt.targets[0], ast.Name)
+            and stmt.targets[0].id == value_name
+            and isinstance(stmt.value, ast.Call)
+            and isinstance(stmt.value.func, ast.Attribute)
+            and isinstance(stmt.value.func.value, ast.Name)
+            and stmt.value.func.value.id == "cutlass"
+        ):
+            return f"cutlass.{stmt.value.func.attr}"
+    return "cutlass.Float32"
+
+
+def _strip_ssa_suffix(name: str) -> str:
+    """Strip Helion's SSA / loop-carry suffixes from a variable name.
+
+    ``acc_1`` / ``acc_copy`` / ``acc_copy_0`` all collapse to ``acc`` so a
+    loop-carried accumulator can be matched to its per-iteration rewrites.
+    """
+    base = re.sub(r"(_copy)(_\d+)*$", "", name)
+    return re.sub(r"(_\d+)+$", "", base)
+
+
+def _assigns_simple_name(stmt: ast.AST, names: set[str]) -> bool:
+    """Return True when ``stmt`` is ``X = ...`` for some ``X`` in ``names``."""
+    return (
+        isinstance(stmt, ast.Assign)
+        and len(stmt.targets) == 1
+        and isinstance(stmt.targets[0], ast.Name)
+        and stmt.targets[0].id in names
+    )
+
+
+def _undup_stmt_rederives(stmt: ast.AST, name: str) -> bool:
+    """Return True when ``stmt`` (an unduplicatable statement, typically the
+    matmul K ``for`` loop) re-derives the loop-carried accumulator ``name``.
+
+    The statement re-derives ``name`` when it both reads ``name`` (the live-in
+    accumulator) and writes a value transitively dependent on ``name`` whose
+    SSA-stripped name equals ``name`` (e.g. ``acc_1 = acc_copy_0 + ...``).  A
+    plain input the matmul only reads (``indices_2``) is not re-derived.
+    """
+    from .ast_read_writes import ReadWrites
+
+    if not isinstance(stmt, ast.For):
+        rw = ReadWrites.from_ast(stmt)
+        return name in rw.reads and any(_strip_ssa_suffix(w) == name for w in rw.writes)
+    if name not in ReadWrites.from_ast(stmt).reads:
+        return False
+    # Forward slice from ``name`` within the loop body; True when it reaches a
+    # write whose stripped name is ``name``.
+    inner = list(stmt.body)
+    tainted = {name}
+    changed = True
+    while changed:
+        changed = False
+        for s in inner:
+            rw = ReadWrites.from_ast(s)
+            if set(rw.reads) & tainted:
+                for w in rw.writes:
+                    if w not in tainted:
+                        tainted.add(w)
+                        changed = True
+    return any(_strip_ssa_suffix(w) == name for w in tainted if w != name)
+
+
+def _split_lane_loop_with_register_stash(
+    loop: ast.For,
+    lane_var: str,
+    markers: list[tuple[int, _LaneReduceMarker]],
+) -> list[ast.AST] | None:
+    """Lower a lane loop whose reduction inputs depend on an unduplicatable op.
+
+    The standard two-pass split re-runs the reduction-input producers in a
+    second pass, which is unsafe when a matmul / cross-thread reduction is in
+    the slice.  Instead, run the matmul-bearing *compute region* (the prefix of
+    the body up to and including the last unduplicatable statement) exactly
+    once, stashing each lane's unduplicatable-derived live-out values into
+    per-thread register fragments.  Every downstream reduction marker and
+    consumer is then re-derived from the stash (a plain register read, safely
+    duplicatable), one accumulate/finalize pass per marker in dependency order,
+    plus a final consume pass for the side-effecting statements.
+
+    Returns the replacement statement list, or ``None`` when the pattern does
+    not apply (caller then falls back to the per-lane single-pass behavior).
+    """
+    from .ast_read_writes import ReadWrites
+
+    body: list[ast.AST] = list(loop.body)
+    marker_indices = {i for i, _ in markers}
+    extent = _lane_loop_extent(loop)
+
+    # Compute region: prefix of the body up to (and including) the last
+    # unduplicatable statement.  Everything after it must be free of
+    # unduplicatable ops so it can be re-derived from the stash.
+    undup_indices = [
+        i for i in range(len(body)) if _contains_unduplicatable_op(body[i])
+    ]
+    if not undup_indices:
+        return None
+    region_end = max(undup_indices)
+    region = body[: region_end + 1]
+    tail = body[region_end + 1 :]
+    tail_offset = region_end + 1
+    if any(_contains_unduplicatable_op(s) for s in tail):
+        return None
+    # A marker inside the compute region cannot be re-derived from the stash
+    # (its reduction would have to run before the matmul finishes).
+    if any(i <= region_end for i in marker_indices):
+        return None
+
+    if extent <= 0 or extent > 256:
+        return None
+
+    lane_varying = _lane_varying_names(body, lane_var)
+
+    tail_reads: set[str] = set()
+    for stmt in tail:
+        tail_reads |= set(ReadWrites.from_ast(stmt).reads)
+
+    # Identify the loop-carried accumulators produced by the unduplicatable
+    # statements — values whose post-region magnitude depends on the matmul and
+    # therefore cannot be recomputed.  These are exactly the names that MUST be
+    # stashed.  Helion emits a matmul K loop as
+    # ``acc = 0; for k: acc_copy = acc; ...; acc_<n> = acc_copy_0 + reduce`` and
+    # an implicit phi makes the post-loop ``acc`` equal the loop output
+    # ``acc_<n>`` (collapsed by a later rename pass).  A name X is carried when:
+    #   * X is written by a non-unduplicatable region statement (its ``acc = 0``
+    #     seed) and read after the region (lane-varying), and
+    #   * an unduplicatable statement's body re-derives X — its forward slice
+    #     from X reaches a write whose SSA-stripped name equals X (``acc_1`` /
+    #     ``acc_copy`` -> ``acc``).
+    # The forward-slice condition distinguishes a true accumulator (``acc``,
+    # rewritten each K step) from a plain input that the matmul merely reads
+    # (``indices_2``, unchanged through the loop).
+    seed_writes: set[str] = set()
+    for i, stmt in enumerate(region):
+        if i in undup_indices:
+            continue
+        seed_writes |= set(ReadWrites.from_ast(stmt).writes)
+    # The carried accumulator's *name* (``acc`` from ``acc = 0``) is not itself
+    # lane-varying — only the loop output alias (``acc_1``) is — so do NOT filter
+    # candidates by ``lane_varying`` here.  The re-derives check confirms the
+    # matmul transforms the accumulator, and below we require the re-deriving
+    # statement to be lane-varying so a genuinely lane-invariant accumulator is
+    # left alone.
+    candidate_carried = seed_writes & tail_reads
+    carried: set[str] = set()
+    for name in candidate_carried:
+        for i in undup_indices:
+            if not _undup_stmt_rederives(body[i], name):
+                continue
+            stmt_reads = set(ReadWrites.from_ast(body[i]).reads)
+            if lane_var in stmt_reads or bool(stmt_reads & lane_varying):
+                carried.add(name)
+                break
+    # Also stash any value DIRECTLY produced by an unduplicatable statement that
+    # is read by the tail (e.g. a matmul whose output is a fresh name rather than
+    # an accumulator phi).
+    undup_writes: set[str] = set()
+    for i in undup_indices:
+        undup_writes |= set(ReadWrites.from_ast(body[i]).writes)
+    direct = undup_writes & lane_varying & tail_reads
+    stash_names = sorted(carried | direct)
+    if not stash_names:
+        return None
+
+    stash_set = set(stash_names)
+    # Region statements that are *duplicatable* and can be recomputed cheaply in
+    # the later passes (e.g. ``indices_2 = thread_idx[0] + lane * 4``).  Drop the
+    # unduplicatable statements and any statement that produces a stashed name.
+    recompute: list[ast.AST] = []
+    for i, stmt in enumerate(region):
+        if i in undup_indices:
+            continue
+        writes = set(ReadWrites.from_ast(stmt).writes)
+        if writes & stash_set:
+            continue
+        recompute.append(stmt)
+    # Keep only the recompute statements that (transitively) feed the tail.
+    recompute_keep_idx, _ = _backward_slice(recompute, tail_reads)
+    recompute_kept = [recompute[i] for i in recompute_keep_idx]
+    # The recompute slice must not pull in an unduplicatable op or reference a
+    # stashed name (which is only available from the fragment, not recomputable).
+    for s in recompute_kept:
+        if _contains_unduplicatable_op(s):
+            return None
+
+    # Allocate one register fragment per stashed value.
+    uid = next(_LANE_STASH_COUNTER)
+    frag_by_name: dict[str, str] = {}
+    decls: list[ast.AST] = []
+    for name in stash_names:
+        frag = f"_lane_stash_{uid}_{name}"
+        frag_by_name[name] = frag
+        dtype = _stash_dtype_for_value(name, body, markers)
+        decls.append(
+            statement_from_string(f"{frag} = cute.make_fragment({extent}, {dtype})")
+        )
+
+    def read_stash_stmts() -> list[ast.AST]:
+        return [
+            statement_from_string(f"{name} = {frag_by_name[name]}[{lane_var}]")
+            for name in stash_names
+        ]
+
+    # Phase 0: run the compute region once and stash the live-out values.
+    phase0_body: list[ast.AST] = list(region)
+    for name in stash_names:
+        phase0_body.append(
+            statement_from_string(f"{frag_by_name[name]}[{lane_var}] = {name}")
+        )
+
+    # The marker assignments within the tail produce already-finalized scalars
+    # (computed once after each reduction pass), so they must NOT be re-run as
+    # per-lane passthroughs inside any later pass.  Build the re-derivable tail
+    # (every non-marker statement) and the set of finalized marker result vars
+    # that downstream slices treat as pre-defined boundaries.
+    marker_result_vars = {m.result_var for _, m in markers}
+    rederivable_tail = [s for s in tail if _is_lane_reduce_marker_assign(s) is None]
+
+    result: list[ast.AST] = []
+    result.extend(decls)
+    result.append(_create_lane_loop(lane_var, extent, phase0_body))
+
+    # Process each marker in source order (they are sequentially dependent: a
+    # later marker's input may read an earlier marker's finalized scalar).
+    for _idx, m in markers:
+        acc_var = f"{m.result_var}_lane_acc"
+        result.append(statement_from_string(f"{acc_var} = {m.identity_expr}"))
+        # Accumulate pass: recompute cheap region producers, read the stash,
+        # then re-derive this marker's input and fold it into the accumulator.
+        # The slice runs over the re-derivable tail only; references to other
+        # markers' results stop at those finalized scalars.
+        input_slice_idx, _ = _backward_slice(rederivable_tail, {m.input_name})
+        input_stmts = [
+            rederivable_tail[i]
+            for i in input_slice_idx
+            if not _assigns_simple_name(rederivable_tail[i], marker_result_vars)
+        ]
+        acc_body: list[ast.AST] = []
+        acc_body.extend(_clone_stmt(s) for s in recompute_kept)
+        acc_body.extend(read_stash_stmts())
+        acc_body.extend(_clone_stmt(s) for s in input_stmts)
+        ctor = _dtype_ctor_from_identity(m.identity_expr)
+        combine_val = f"{ctor}({m.input_name})" if ctor is not None else m.input_name
+        acc_body.append(
+            statement_from_string(
+                f"{acc_var} = {_combine_expr(m.reduction_type, acc_var, combine_val)}"
+            )
+        )
+        result.append(_create_lane_loop(lane_var, extent, acc_body))
+        if m.group_span > 1 and m.group_pre > 1 and m.group_lane_expr:
+            reduced = _grouped_warp_reduce_expr(
+                m.reduction_type,
+                acc_var,
+                m.identity_expr,
+                m.group_lane_expr,
+                pre=m.group_pre,
+                group_span=m.group_span,
+            )
+        elif m.threads_in_group > 1:
+            reduced = _warp_reduce_expr(m.reduction_type, acc_var, m.threads_in_group)
+        else:
+            reduced = acc_var
+        result.append(
+            statement_from_string(f"{m.result_var} = {m.finalize_expr(reduced)}")
+        )
+
+    # Final consume pass: everything in the tail except the marker assignments,
+    # re-derived from the stash + finalized scalars.  Only keep statements that
+    # feed a side effect (a store / in-place write).
+    consume_candidates = [s for i, s in enumerate(body) if i >= tail_offset]
+    consume_candidates = [
+        s for s in consume_candidates if _is_lane_reduce_marker_assign(s) is None
+    ]
+    keep_idx = _live_phase2_indices(consume_candidates)
+    consume_kept = [s for i, s in enumerate(consume_candidates) if i in keep_idx]
+    if consume_kept:
+        consume_body: list[ast.AST] = []
+        consume_body.extend(_clone_stmt(s) for s in recompute_kept)
+        consume_body.extend(read_stash_stmts())
+        consume_body.extend(_clone_stmt(s) for s in consume_kept)
+        result.append(_create_lane_loop(lane_var, extent, consume_body))
+    return result
+
+
+def _markers_feed_cross_lane_carry(
+    body: list[ast.AST],
+    lane_var: str,
+    markers: list[tuple[int, _LaneReduceMarker]],
+) -> bool:
+    """Return True when the lane loop carries an accumulator across the lanes
+    that a marker result feeds (online-softmax attention's ``m_i`` / ``l_i`` /
+    ``acc`` recurrence).
+
+    Helion represents a loop-carried value with a phi ``X_copy = X`` read at the
+    TOP of the loop body (before the value is rewritten) and a corresponding
+    output assignment renamed back to ``X`` by a later pass.  Such an
+    accumulating lane loop must keep the existing per-lane restore lowering, so
+    the register-stash path (which assumes each marker result is consumed only by
+    per-lane / store consumers, never carried across lanes) must not fire.
+
+    matmul_layernorm's N-output lane loop has no such top-level ``X_copy = X``
+    carry (its ``acc`` is the matmul accumulator, carried by the *inner* K loop,
+    not across the lane iterations), so this returns False and the stash path is
+    free to run.
+    """
+    from .ast_read_writes import ReadWrites
+
+    if not markers:
+        return False
+
+    # Live-in names of the lane body (read before written), excluding the lane
+    # var.  A loop-carried accumulator phi is live-in.
+    written_so_far: set[str] = set()
+    live_in: set[str] = set()
+    for stmt in body:
+        rw = ReadWrites.from_ast(stmt)
+        for name in rw.reads:
+            if name != lane_var and name not in written_so_far:
+                live_in.add(name)
+        written_so_far |= set(rw.writes)
+
+    # Detect top-level phi copies ``X_copy = X`` of a live-in accumulator.
+    for stmt in body:
+        if (
+            isinstance(stmt, ast.Assign)
+            and len(stmt.targets) == 1
+            and isinstance(stmt.targets[0], ast.Name)
+            and isinstance(stmt.value, ast.Name)
+        ):
+            src = stmt.value.id
+            dst = stmt.targets[0].id
+            if src in live_in and _strip_ssa_suffix(dst) == _strip_ssa_suffix(src):
+                return True
+    return False
 
 
 def _has_extra_cross_lane_carry(
