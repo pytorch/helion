@@ -312,6 +312,13 @@ def _arbitrary_index_pattern_code(
     from helion._utils import is_scalar_index
 
     if in_pipeline and is_scalar_index(idx):
+        # In standard emit_pipeline mode the outer-grid scalar is encoded
+        # in the BlockSpec, so the kernel ref is already sliced and the
+        # in-body index becomes 0.  In outer_pipeline mode the scalar is
+        # an emit_pipeline grid axis (a lambda parameter) and the tensor
+        # is passed as an HBM ref, so we need the actual index expression.
+        if state.config.get("pallas_loop_type") == "outer_pipeline":
+            return _index_expr_from_ast(state, subscript_index)
         return "0"
     if isinstance(idx, int):
         return str(idx)
@@ -471,6 +478,13 @@ def _tile_begin_with_offset_pattern_code(
         if pattern.offset != 0:
             offset = f"{offset} + {pattern.offset}"
         return offset
+
+    # In outer_pipeline mode the outer ``hl.grid`` axis is folded into
+    # an emit_pipeline grid and its tensors are passed as HBM refs.  The
+    # in-body index must be the actual symbolic index expression
+    # (e.g. ``offset_0``), not the literal pattern offset.
+    if state.config.get("pallas_loop_type") == "outer_pipeline":
+        return _index_expr_from_ast(state, subscript_index)
 
     return f"{pattern.offset}"
 
