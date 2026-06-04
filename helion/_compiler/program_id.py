@@ -17,7 +17,6 @@ from .ast_extension import expr_from_string
 from .ast_extension import statement_from_string
 from .compile_environment import CompileEnvironment
 from .cute.cutedsl_compat import emit_pipeline_advance
-from .cute.cutedsl_compat import emit_producer_tail_tma_async
 from .cute.strategies import TCGEN05_L2_SWIZZLE_SIZE_DEFAULT
 from .cute.strategies import l2_swizzle_size_from_config
 from .cute.tcgen05_constants import TCGEN05_SCHED_CONSUMER_WAIT_MODE_CONFIG_KEY
@@ -4172,7 +4171,6 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         aux_producer_state_name = aux_pipeline_plan.producer_state
         aux_rings = aux_pipeline_plan.rings
         aux_epi_tile_var = aux_pipeline_plan.epi_tile_var
-        aux_stage_count = aux_pipeline_plan.stage_count
         aux_tma_barrier_var = (
             device_function.new_var("tcgen05_aux_tma_barrier")
             if aux_use_tma_load
@@ -4646,11 +4644,7 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         if aux_use_tma_load:
             prelude.append(
                 statement_from_string(
-                    emit_producer_tail_tma_async(
-                        aux_pipeline_name,
-                        aux_producer_state_name,
-                        num_stages=aux_stage_count,
-                    )
+                    f"{aux_pipeline_name}.producer_tail({aux_producer_state_name})"
                 )
             )
 

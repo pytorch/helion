@@ -5688,8 +5688,6 @@ def _emit_mma_pipeline(
             acc_tmem_cols=tcgen05_plan.acc_tmem_cols,
             is_two_cta=tcgen05_is_two_cta,
             use_tma=tcgen05_use_tma,
-            ab_stage_count=tcgen05_ab_stage_count_value,
-            acc_stage_count=tcgen05_acc_stage_count_value,
             skip_ab_producer_advance=diagnose_skip_ab_producer_advance,
         )
         tcgen05_pure_matmul_object = (
