@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import math
+import os
+from typing import TYPE_CHECKING
 from typing import Callable
 import unittest
 
@@ -19,6 +21,10 @@ from helion._testing import xfailIfPallas
 from helion._testing import xfailIfPallasInterpret
 from helion._testing import xfailIfPallasTpu
 import helion.language as hl
+
+if TYPE_CHECKING:
+    from helion.autotuner.base_search import PopulationBasedSearch
+    from helion.autotuner.base_search import PopulationMember
 
 
 @helion.kernel(backend="pallas", static_shapes=True)
@@ -1593,6 +1599,154 @@ class TestPallas(TestCase):
             [512, 512, 512],
             "Compiler-seeded [512, 512, 512] must be re-benched and re-rank "
             "ahead of the last-gen best once its true 0.190 ms perf is measured.",
+        )
+
+    def _make_device_micros_search(
+        self,
+        specs: list[tuple[str, list[int], float, float]],
+    ) -> tuple[PopulationBasedSearch, dict[str, PopulationMember]]:
+        """Device-µs final-pick scaffold from ``(key, block_sizes, wall_ms,
+        device_micros)`` specs, with a fake Pallas backend reporting the scripted
+        device µs.
+        """
+        from helion.autotuner.base_search import PopulationBasedSearch
+        from helion.autotuner.base_search import PopulationMember
+        from helion.runtime.config import Config
+
+        def _new_fn() -> Callable[..., object]:
+            def _fn() -> None:
+                return None
+
+            return _fn
+
+        device_micros_by_fn: dict[int, float] = {}
+        members: dict[str, PopulationMember] = {}
+        for key, block_sizes, wall_ms, device_micros in specs:
+            fn = _new_fn()
+            cfg = Config(block_sizes=block_sizes)
+            device_micros_by_fn[id(fn)] = device_micros
+            members[key] = PopulationMember(
+                fn=fn,
+                perfs=[wall_ms],
+                flat_values=[id(cfg)],
+                config=cfg,
+                status="ok",
+                compile_time=0.0,
+            )
+
+        def fake_device_micros_bench(
+            fns: list[Callable[..., object]],
+            reference_fn: Callable[..., object],
+            *,
+            desc: str | None = None,
+        ) -> list[tuple[float, float]]:
+            ref = device_micros_by_fn[id(getattr(reference_fn, "func", reference_fn))]
+            vals = [device_micros_by_fn[id(getattr(fn, "func", fn))] for fn in fns]
+            return [(v, v - ref) for v in vals]
+
+        class _Backend:
+            @staticmethod
+            def get_paired_device_micros_bench() -> Callable[
+                ..., list[tuple[float, float]]
+            ]:
+                return fake_device_micros_bench
+
+        class _ConfigSpec:
+            backend = _Backend()
+
+        class _Settings:
+            autotune_benchmark_fn: Callable[..., list[float]] | None = None
+            autotune_progress_bar: bool = False
+            static_shapes: bool = True
+
+        class _Kernel:
+            class env:
+                process_group_name: str | None = None
+
+        class _BenchProvider:
+            mutated_arg_indices: tuple[int, ...] = ()
+
+        search = PopulationBasedSearch.__new__(PopulationBasedSearch)
+        search.population = list(members.values())
+        search.best_perf_so_far = min(m.perf for m in search.population)
+        search.log = lambda *a, **kw: None  # pyrefly: ignore[bad-assignment]
+        search.args = ()
+        search.kernel = _Kernel()  # pyrefly: ignore[bad-assignment]
+        search.benchmark_provider = _BenchProvider()  # pyrefly: ignore[bad-assignment]
+        search.settings = _Settings()  # pyrefly: ignore[bad-assignment]
+        search.config_spec = _ConfigSpec()  # pyrefly: ignore[bad-assignment]
+        search._compiler_seed_members = []
+        return search, members
+
+    def test_pallas_autotuner_final_pick_reranks_by_device_micros(self) -> None:
+        """Final-pick ranks by on-device µs, not wall-clock.
+
+        ``fast`` is 10µs on-device but 125µs wall-clock; ``slow`` is 30µs
+        on-device but 124µs wall-clock (1µs "faster"). The re-rank must pick
+        ``fast`` despite its slower wall-clock.
+        """
+        from unittest.mock import patch
+
+        search, m = self._make_device_micros_search(
+            [
+                ("fast", [1024, 1024, 1024], 0.125, 10.0),
+                ("slow", [128, 1024, 1024], 0.124, 30.0),
+            ]
+        )
+        with patch.dict(os.environ, {"HELION_AUTOTUNE_PALLAS_RANK_BY": "device_time"}):
+            final = search.run_final_pick_verification(m["slow"], top_k=5)
+        self.assertEqual(list(final.config["block_sizes"]), [1024, 1024, 1024])
+
+    @skipIfPallasInterpret(
+        "device-µs ranking needs a real TPU; CPU-interpret has no /device:TPU events"
+    )
+    def test_pallas_paired_device_micros_bench_finite_on_large_compute_bound_shape(
+        self,
+    ) -> None:
+        """``paired_device_micros_bench`` stays finite on a 4096³ compute-bound shape.
+
+        Guards the ``count >= _MIN_TRACE_EVENTS`` predicate (vs an exact
+        ``== n_calls``): on large shapes the ``stop_trace`` flush drops a few tail
+        events, so an exact match would return ``+inf`` and silently route the
+        autotuner to its wall-clock fallback. Two structurally-identical jit_fns
+        must yield finite device µs and a near-zero paired delta.
+        """
+        import jax
+        import jax.numpy as jnp
+
+        from helion.autotuner.benchmarking import _pallas_device_micros_for_fn
+        from helion.autotuner.benchmarking import paired_device_micros_bench
+
+        m = k = n = 4096
+        k1, k2 = jax.random.split(jax.random.PRNGKey(0))
+        x = jax.random.normal(k1, (m, k), dtype=jnp.bfloat16)
+        y = jax.random.normal(k2, (k, n), dtype=jnp.bfloat16)
+
+        @jax.jit
+        def matmul(a: object, b: object) -> object:
+            return jax.lax.dot_general(a, b, dimension_numbers=(((1,), (0,)), ((), ())))
+
+        def _device_micros_fn(fn: Callable[[], object]) -> float:
+            return _pallas_device_micros_for_fn(fn, n_calls=50, n_warmup=2)
+
+        results = paired_device_micros_bench(
+            [lambda: matmul(x, y)],
+            lambda: matmul(x, y),
+            device_micros_fn=_device_micros_fn,
+        )
+        median_micros, delta_micros = results[0]
+        self.assertTrue(
+            math.isfinite(median_micros) and median_micros > 0,
+            f"candidate device µs must be finite + positive on 4096³; got {median_micros!r}",
+        )
+        self.assertTrue(
+            math.isfinite(delta_micros),
+            f"paired delta must be finite on 4096³; got {delta_micros!r}",
+        )
+        self.assertLess(
+            abs(delta_micros),
+            5.0,
+            f"identical jit_fns should give a near-zero paired delta; got {delta_micros!r}",
         )
 
     def test_pallas_matmul_bf16_emits_pl_dot(self) -> None:
