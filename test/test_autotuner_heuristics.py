@@ -1036,7 +1036,17 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
             for_search=True
         )["tcgen05_ab_stages"]
         self.assertIsInstance(search_ab_stages_fragment, IntegerFragment)
-        self.assertEqual(search_ab_stages_fragment.high, 2)
+        # Cycle 97: the for_search ab cap is BUDGET-AWARE — lifted to 3 wherever
+        # ab=3 is admissible (the SMEM-budget constraints were recorded at bind
+        # time, i.e. bf16/fp16 on a B200-class optin cap), else 2. Conditioning on
+        # the recorded constraints keeps the assertion deterministic across hosts.
+        expected_search_ab_high = (
+            3
+            if bound.config_spec._cute_tcgen05_config.ab_stages_three_search_constraints
+            is not None
+            else 2
+        )
+        self.assertEqual(search_ab_stages_fragment.high, expected_search_ab_high)
         self.assertIn(
             TCGEN05_PURE_CLC_SCHEDULER_OBJECT_CONFIG_KEY,
             bound.config_spec._tcgen05_optional_fragments(),
@@ -1235,7 +1245,21 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
             ]
         )
         self.assertIsInstance(non_target_ab_stages_fragment, IntegerFragment)
-        self.assertEqual(non_target_ab_stages_fragment.high, 2)
+        # Cycle 97: ab=3 is now BUDGET-AWARE-SEARCHABLE for ANY bf16/fp16 kernel
+        # whose device admits it (constraints recorded) — not only the per-shape
+        # seed targets. The non-seed kernel still gets the lifted cap; a sampled
+        # over-budget ab=3 is demoted by ``_fix_ab_stages_search_config``.
+        expected_non_target_ab_high = (
+            3
+            if (
+                non_target_bound.config_spec._cute_tcgen05_config.ab_stages_three_search_constraints
+                is not None
+            )
+            else 2
+        )
+        self.assertEqual(
+            non_target_ab_stages_fragment.high, expected_non_target_ab_high
+        )
 
         @helion.kernel(backend="cute")
         def cute_matmul_mma_no_ab3_budget(
@@ -1273,6 +1297,10 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
             )["tcgen05_ab_stages"]
         )
         self.assertIsInstance(no_budget_ab_stages_fragment, IntegerFragment)
+        # Cycle 97: with no recorded SMEM budget (``per_cta_ab_smem_budget_bytes``
+        # patched to 0 -> constraints stay None) the for_search ab cap stays at 2 —
+        # the budget-aware lift is gated on the recorded constraints, so a device
+        # below the B200 envelope never admits ab=3 into search.
         self.assertEqual(no_budget_ab_stages_fragment.high, 2)
 
         @helion.kernel(backend="cute")
@@ -2931,6 +2959,209 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
         )
         tcfg.fix_search_config(ab2_c4_no_budget.config)
         self.assertEqual(ab2_c4_no_budget.config["tcgen05_c_stages"], 2)
+
+    @onlyBackends(["cute"])
+    def test_cute_tcgen05_ab_stages_budget_gate(self) -> None:
+        # Cycle 97: ab=3 is BUDGET-AWARE-SEARCHABLE. The for_search ab cap is
+        # lifted to 3 wherever ab=3 is admissible (constraints recorded), and
+        # ``_fix_ab_stages_search_config`` demotes a sampled ab=3 that does not fit
+        # — fail-CLOSED, mirroring the c-stages budget gate. The new dimension over
+        # the bare-AB gate is REAL source-C presence, keyed on the PRECISE
+        # ``exact_shape_aux_kernel_detected`` (rank-2 exact-shape residual_add), NOT
+        # the broad ``aux_kernel_detected`` (which is also True for a rowvec bias
+        # that has no source-C ring). A real source-C kernel materializes the larger
+        # (128, 64) C ring, so AB(ab=3) + C overflows the 232 KiB B200 cap even at
+        # c=2 and MUST demote; the plain / rowvec-bias family (no source-C ring)
+        # keeps the calibrated bare-AB admission so its ab=3 cluster_m=2 winner stays
+        # searchable (cycle-97 force-config: bias 256x256x128 cluster_m=2 ab=3
+        # compiles + runs, T16 639.7 / T2 460.1 TF). The SMEM budget is MOCKED to the
+        # B200 value so the gate is deterministic on any cute host.
+        b200_budget = 232448 - 28 * 1024  # optin cap - ab=3 reservation
+
+        @helion.kernel(backend="cute")
+        def cute_matmul_plain(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = acc.to(x.dtype)
+            return out
+
+        @helion.kernel(backend="cute")
+        def cute_matmul_bias(
+            x: torch.Tensor, y: torch.Tensor, bias: torch.Tensor
+        ) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = (acc + bias[tile_n]).to(x.dtype)
+            return out
+
+        @helion.kernel(backend="cute")
+        def cute_matmul_residual_add(
+            x: torch.Tensor, y: torch.Tensor, residual: torch.Tensor
+        ) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = (acc + residual[tile_m, tile_n]).to(x.dtype)
+            return out
+
+        plain_args = (
+            torch.empty([6144, 6144], device=DEVICE, dtype=torch.bfloat16),
+            torch.empty([6144, 6144], device=DEVICE, dtype=torch.bfloat16),
+        )
+        bias_args = (
+            torch.empty([1024, 4096], device=DEVICE, dtype=torch.bfloat16),
+            torch.empty([4096, 1024], device=DEVICE, dtype=torch.bfloat16),
+            torch.empty([1024], device=DEVICE, dtype=torch.bfloat16),
+        )
+        # T16 shape (4096x4096x512): K=512 -> bk=128 -> 4 divisible k-tiles, so
+        # cluster_m=2 search IS admitted (passes ``cluster_m2_bk_is_valid``). Used
+        # for the END-TO-END bias guard below — unlike the 1024x4096x1024 bias
+        # above (cluster_m=2 search OFF -> reprojects to cluster_m=1).
+        bias_t16_args = (
+            torch.empty([4096, 512], device=DEVICE, dtype=torch.bfloat16),
+            torch.empty([512, 4096], device=DEVICE, dtype=torch.bfloat16),
+            torch.empty([4096], device=DEVICE, dtype=torch.bfloat16),
+        )
+        residual_args = (
+            torch.empty([6144, 6144], device=DEVICE, dtype=torch.bfloat16),
+            torch.empty([6144, 6144], device=DEVICE, dtype=torch.bfloat16),
+            torch.empty([6144, 6144], device=DEVICE, dtype=torch.bfloat16),
+        )
+        with (
+            patch_cute_mma_support(),
+            patch("helion.language.matmul_ops._cuda_num_sms_or_zero", return_value=132),
+            patch.object(
+                CuteTcgen05Config,
+                "per_cta_ab_smem_budget_bytes",
+                return_value=b200_budget,
+            ),
+        ):
+            plain_bound = cute_matmul_plain.bind(plain_args)
+            bias_bound = cute_matmul_bias.bind(bias_args)
+            bias_t16_bound = cute_matmul_bias.bind(bias_t16_args)
+            residual_bound = cute_matmul_residual_add.bind(residual_args)
+
+        plain_tcfg = plain_bound.config_spec._cute_tcgen05_config
+        bias_tcfg = bias_bound.config_spec._cute_tcgen05_config
+        bias_t16_tcfg = bias_t16_bound.config_spec._cute_tcgen05_config
+        residual_tcfg = residual_bound.config_spec._cute_tcgen05_config
+        # Plain: no aux at all. Bias: broad aux True but NO source-C ring (rowvec).
+        # Residual: real rank-2 exact-shape source-C.
+        self.assertFalse(plain_tcfg.aux_kernel_detected)
+        self.assertFalse(plain_tcfg.exact_shape_aux_kernel_detected)
+        self.assertTrue(bias_tcfg.aux_kernel_detected)
+        self.assertFalse(bias_tcfg.exact_shape_aux_kernel_detected)
+        self.assertTrue(residual_tcfg.aux_kernel_detected)
+        self.assertTrue(residual_tcfg.exact_shape_aux_kernel_detected)
+
+        # The for_search ab fragment is lifted to 3 (the budget was recorded at
+        # bind via the mocked B200 cap) for every family.
+        for tcfg in (plain_tcfg, bias_tcfg, residual_tcfg):
+            ab_fragment = tcfg.optional_fragments(for_search=True)["tcgen05_ab_stages"]
+            self.assertEqual(ab_fragment.high, 3)
+
+        def _ab3_config(cluster_m: int = 2) -> helion.Config:
+            return helion.Config(
+                block_sizes=[256, 256, 128],
+                indexing=[
+                    "tensor_descriptor",
+                    "tensor_descriptor",
+                    "tensor_descriptor",
+                ],
+                pid_type="persistent_interleaved",
+                tcgen05_cluster_m=cluster_m,
+                tcgen05_cluster_n=1,
+                tcgen05_ab_stages=3,
+                tcgen05_acc_stages=2,
+                tcgen05_c_stages=2,
+                tcgen05_strategy=Tcgen05Strategy.ROLE_LOCAL_MONOLITHIC.value,
+                tcgen05_persistence_model="static_persistent",
+            )
+
+        # PLAIN (no source-C): the bare AB pipeline (192 KiB at cluster_m=2) fits
+        # the 199 KiB budget and the small no-source-C epilogue D ring rides the
+        # non-AB reservation — the ab=3 winner is PRESERVED.
+        plain_ab3 = _ab3_config()
+        plain_tcfg.fix_search_config(plain_ab3.config)
+        self.assertEqual(plain_ab3.config["tcgen05_ab_stages"], 3)
+
+        # BIAS (broad-aux True, source-C False): the rowvec bias has NO source-C
+        # ring, so the gate's NON-source-C branch admits the same 192 KiB bare-AB
+        # ab=3 at cluster_m=2. This is the case that exercises the precise-signal
+        # fix — under the old broad ``aux_kernel_detected`` branch the gate would
+        # have wrongly demoted it (cycle-97 force-config proved bias 256x256x128
+        # cluster_m=2 ab=3 fits + runs). Call the gate in ISOLATION because the
+        # full chain's cluster_m=2 projection (``_fix_cluster_m2_search_config``)
+        # can reproject a bias candidate to cluster_m=1 for K-cap reasons unrelated
+        # to this gate; the gate itself must KEEP the bias cluster_m=2 ab=3.
+        bias_ab3 = _ab3_config()
+        bias_tcfg._fix_ab_stages_search_config(bias_ab3.config)
+        self.assertEqual(bias_ab3.config["tcgen05_ab_stages"], 3)
+
+        # BIAS END-TO-END (the P2 guard): on a bias shape where cluster_m=2 search
+        # is genuinely admitted (T16 = 4096x4096x512, K=512 -> 4 divisible k-tiles),
+        # the FULL ``fix_search_config`` chain must KEEP a cluster_m=2 256x256x128
+        # ab=3 bias candidate at ab=3 cluster_m=2 — NOT reprojected to cluster_m=1
+        # (the cluster_m=2 projection accepts it) and NOT demoted to ab=2 (no
+        # source-C ring). This locks in the bias-family "now admits cluster_m=2 ab=3"
+        # claim that GATE 2 confirmed empirically (T5/T9/T16), guarding it against a
+        # future regression the way the plain/silu winner is already covered.
+        self.assertTrue(bias_t16_tcfg.aux_kernel_detected)
+        self.assertFalse(bias_t16_tcfg.exact_shape_aux_kernel_detected)
+        self.assertIsNotNone(bias_t16_tcfg.cluster_m2_search_constraints)
+        bias_t16_ab3 = _ab3_config()
+        bias_t16_tcfg.fix_search_config(bias_t16_ab3.config)
+        self.assertEqual(bias_t16_ab3.config["tcgen05_ab_stages"], 3)
+        self.assertEqual(bias_t16_ab3.config["tcgen05_cluster_m"], 2)
+        self.assertEqual(bias_t16_ab3.config["block_sizes"][:3], [256, 256, 128])
+
+        # RESIDUAL source-C branch, in ISOLATION. The exact-shape aux-TMA full-tile
+        # projection forces ab=2 on a cluster_m=2 candidate BEFORE the gate runs, so
+        # to exercise the gate's source-C branch directly we call it on a cluster_m=1
+        # residual candidate (which no projection claims): AB(ab=3) + (128, 64) C
+        # ring overflows even at cluster_m=1, so it DEMOTES to 2.
+        residual_cm1_ab3 = _ab3_config(cluster_m=1)
+        residual_tcfg._fix_ab_stages_search_config(residual_cm1_ab3.config)
+        self.assertEqual(residual_cm1_ab3.config["tcgen05_ab_stages"], 2)
+
+        # And the same residual source-C branch demotes a cluster_m=2 candidate too
+        # (independent of the aux-TMA projection): call the gate in isolation.
+        residual_cm2_ab3 = _ab3_config(cluster_m=2)
+        residual_tcfg._fix_ab_stages_search_config(residual_cm2_ab3.config)
+        self.assertEqual(residual_cm2_ab3.config["tcgen05_ab_stages"], 2)
+
+        # Full chain on the cluster_m=2 residual: the aux-TMA projection forces ab=2
+        # first, and the gate is consistent (still 2).
+        residual_full = _ab3_config(cluster_m=2)
+        residual_tcfg.fix_search_config(residual_full.config)
+        self.assertEqual(residual_full.config["tcgen05_ab_stages"], 2)
+
+        # cluster_m=1 256x256 plain ab=3 overflows bare-AB (384 KiB > budget) and is
+        # demoted even without a source-C.
+        plain_cm1_ab3 = _ab3_config(cluster_m=1)
+        plain_tcfg.fix_search_config(plain_cm1_ab3.config)
+        self.assertEqual(plain_cm1_ab3.config["tcgen05_ab_stages"], 2)
+
+        # Fail CLOSED: with no recorded SMEM budget the sampled plain ab=3 cannot be
+        # proven to fit, so it is demoted to 2 rather than left to overflow.
+        plain_tcfg.ab_stages_three_search_constraints = None
+        plain_ab3_no_budget = _ab3_config()
+        plain_tcfg.fix_search_config(plain_ab3_no_budget.config)
+        self.assertEqual(plain_ab3_no_budget.config["tcgen05_ab_stages"], 2)
 
     @onlyBackends(["cute"])
     def test_cute_tcgen05_c_input_seed_respects_disable_heuristics(self) -> None:

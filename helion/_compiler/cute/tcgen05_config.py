@@ -2028,6 +2028,64 @@ class CuteTcgen05Config:
         ):
             config["tcgen05_ab_stages"] = 2
 
+    def _fix_ab_stages_search_config(self, config: dict[str, object]) -> None:
+        # Budget-aware ab=3 admission for the lifted ``for_search`` cap (see
+        # ``optional_fragments`` and cute_plan.md §4.5 for the empirical narrative).
+        # Mirror ``_fix_c_stages_search_config`` (fail-CLOSED, cast-based): on the
+        # canonical 256x256 DEFAULT-layout role-local path, demote a directly-sampled
+        # ab=3 to 2 when it does not fit the per-CTA SMEM budget. The invariant — the
+        # new dimension over the bare-AB ``_fix_ab_stages_three_search_config`` gate —
+        # is REAL source-C presence, keyed on the PRECISE
+        # ``exact_shape_aux_kernel_detected`` (rank-2 exact-shape residual_add), NOT
+        # the broad ``aux_kernel_detected`` (also True for a rowvec broadcast bias
+        # that has no source-C ring): a real source-C materializes the larger
+        # (128, 64) C ring, so AB(ab=3) + C overflows the cap even at c=2 and MUST
+        # demote, while the plain / rowvec-bias family (no source-C ring) keeps the
+        # bare-AB calibration so its ab=3 winner stays searchable. The exact-shape
+        # residual cluster_m=2 full-tile candidates are already forced to ab=2 by
+        # ``_fix_aux_tma_full_tile_search_config`` (runs first); this gate's source-C
+        # branch is the fail-closed backstop for any exact-shape residual ab=3 that
+        # projection does not claim (e.g. cluster_m=1). The EXPLICIT_EPI_TILE
+        # direct-entry (TVM-FFI) seeds use a separate (128, 32) tile + own admission
+        # and are out of the DEFAULT-layout scope, so their seeded ab=3/ab=6 is
+        # untouched.
+        if not self.search_enabled:
+            return
+        if config.get("tcgen05_ab_stages") != 3:
+            return
+        if not self._is_default_layout_full_tile_config(config):
+            return
+        block_sizes = cast("list[int]", config["block_sizes"])
+        cluster_m = cast("int", config.get("tcgen05_cluster_m", 1))
+        if self.exact_shape_aux_kernel_detected:
+            # Real source-C present: require AB(ab=3) + the (128, 64) C ring to fit
+            # together. ``c_stages_fits`` fails CLOSED when no SMEM budget is
+            # recorded (non-B200 / CPU host), so the over-budget and no-budget
+            # arms are both covered by a single ``not c_stages_fits`` check.
+            c_stages = cast("int", config.get("tcgen05_c_stages", 2))
+            fits = self.c_stages_fits(
+                bm=block_sizes[0],
+                bn=block_sizes[1],
+                bk=block_sizes[2],
+                cluster_m=cluster_m,
+                ab_stages=3,
+                c_stages=c_stages,
+                has_source_c=True,
+            )
+        else:
+            # Plain / rowvec-bias store (no source-C ring): the bare-AB gate is the
+            # calibrated admission — the small no-source-C epilogue D ring rides the
+            # non-AB reservation. ``ab_stages_three_fits`` returns False with no
+            # budget recorded, so this also fails CLOSED.
+            fits = self.ab_stages_three_fits(
+                bm=block_sizes[0],
+                bn=block_sizes[1],
+                bk=block_sizes[2],
+                cluster_m=cluster_m,
+            )
+        if not fits:
+            config["tcgen05_ab_stages"] = 2
+
     def _fix_with_scheduler_search_config(self, config: dict[str, object]) -> None:
         if not (self.search_enabled and self.aux_kernel_detected):
             return
@@ -2948,6 +3006,17 @@ class CuteTcgen05Config:
             ab_stages_max = max(3, TCGEN05_TARGET10_TVM_FFI_AB_STAGES)
         elif not for_search:
             ab_stages_max = 3
+        elif self.ab_stages_three_search_constraints is not None:
+            # Cycle 97: make ab=3 BUDGET-AWARE-SEARCHABLE. Where the device/dtype
+            # admits ab=3 at all (the SMEM-budget constraints were recorded by
+            # ``allow_ab_stages_three_search`` at bind time — B200-class optin cap,
+            # bf16/fp16), lift the ``for_search`` cap to 3 so the autotuner can
+            # SAMPLE ab=3 directly instead of reaching it only through the per-shape
+            # FFI / gelu seeds. ``_fix_ab_stages_search_config`` then demotes any
+            # sampled ab=3 that does not fit (the residual/source-C ring overflows;
+            # cluster_m=1 256x256 overflows bare-AB) before codegen, so admission is
+            # free but an overflowing kernel is never generated.
+            ab_stages_max = 3
         else:
             ab_stages_max = 2
         if for_search:
@@ -3736,6 +3805,14 @@ class CuteTcgen05Config:
         self._fix_aux_tma_full_tile_search_config(config)
         self._fix_with_scheduler_search_config(config)
         self._fix_aux_tma_search_config(config)
+        # Cycle 97: budget-aware ab-stages admission for the lifted for_search
+        # cap. Runs after the family projections (FFI / gelu / aux-TMA full-tile)
+        # have set their validated stage tuple, so a directly-SAMPLED ab=3 that no
+        # projection claimed — and that does not fit (residual/source-C ring
+        # overflow, or cluster_m=1 256x256 bare-AB overflow) — is demoted to 2 on
+        # the DEFAULT-layout full-tile path before codegen. The plain silu/gelu
+        # ab=3 winner (no source-C, cluster_m=2) is preserved.
+        self._fix_ab_stages_search_config(config)
         # Final c-stages admission: demote a directly-sampled (or any unclaimed)
         # deeper C ring on the canonical 256x256 DEFAULT-layout path that does
         # not fit AB+C under the B200 cap. Runs after the family fixups so their
