@@ -204,9 +204,8 @@ class PatternSearch(PopulationBasedSearch):
             # Log final statistics for this generation
             self.log(f"Generation {generation} complete:", self.statistics)
 
-        # Run finishing phase to simplify the best configuration
-        best = self.run_finishing_phase(self.best, self.finishing_rounds)
-        return best.config
+        # Finishing phase + (TPU-only) final-pick re-rank.
+        return self._finalize()
 
     def _pattern_search_from(
         self, current: PopulationMember, visited: set[Config]

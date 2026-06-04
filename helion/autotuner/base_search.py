@@ -28,6 +28,7 @@ from torch.utils._pytree import tree_map_only
 from .. import exc
 from .._compat import extract_device
 from .._compat import get_device_name
+from ..runtime.settings import _env_get_int
 from .benchmark_provider import BenchmarkProvider
 from .benchmark_provider import BenchmarkResult
 from .benchmark_provider import LocalBenchmarkProvider
@@ -1202,6 +1203,69 @@ class PopulationBasedSearch(BaseSearch):
         )
         self.log(f"Finishing phase complete: final config={current.config}")
         return current
+
+    def _final_pick_supported(self) -> bool:
+        """True only on Pallas/TPU; final-pick is untested on other backends."""
+        return self.config_spec.backend_name == "pallas"
+
+    def run_final_pick_verification(
+        self,
+        best: PopulationMember,
+        top_k: int | None = None,
+    ) -> PopulationMember:
+        """Re-benchmark the top-``top_k`` candidates once and re-pick the fastest.
+
+        Hardens against the noisy single ``interleaved_bench`` median the search
+        ranks by.  ``top_k`` defaults to ``HELION_AUTOTUNE_FINAL_PICK_TOP_K``
+        (10); returns ``best`` unchanged when ``top_k <= 1`` or < 2 finite.
+        """
+        if top_k is None:
+            top_k = max(0, _env_get_int("HELION_AUTOTUNE_FINAL_PICK_TOP_K", 10))
+        if top_k <= 1:
+            return best
+
+        # Top-k candidates by current perf, ``best`` first so its identity wins
+        # ties when we fall back.
+        candidates: list[PopulationMember] = []
+        seen_ids: set[int] = set()
+        for member in (
+            best,
+            *sorted(
+                (m for m in self.population if math.isfinite(m.perf)),
+                key=performance,
+            ),
+        ):
+            if id(member) in seen_ids:
+                continue
+            seen_ids.add(id(member))
+            candidates.append(member)
+            if len(candidates) >= top_k:
+                break
+        if len(candidates) < 2:
+            return best
+
+        self.rebenchmark(candidates, desc="Final-pick verification")
+        best_member = min(candidates, key=performance)
+        if not math.isfinite(best_member.perf):
+            return best
+        if best_member is not best:
+            self.log(
+                f"Final-pick re-picked {best_member.config} "
+                f"({best_member.perf:.4f}ms) over {best.config}"
+            )
+        self.best_perf_so_far = min(self.best_perf_so_far, best_member.perf)
+        return best_member
+
+    def _finalize(self) -> Config:
+        """Finishing phase + final-pick re-rank; return the chosen config.
+
+        Shared tail of the search ``_autotune`` methods; the final-pick re-rank
+        runs only on TPU/Pallas (see ``_final_pick_supported``).
+        """
+        best = self.run_finishing_phase(self.best, self.finishing_rounds)
+        if self._final_pick_supported():
+            best = self.run_final_pick_verification(best)
+        return best.config
 
 
 def population_statistics(population: list[PopulationMember]) -> str:

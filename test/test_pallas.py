@@ -1343,6 +1343,76 @@ class TestPallas(TestCase):
             f"{(reference.float() - baseline_result.float()).abs().max().item()}).",
         )
 
+    def test_pallas_autotuner_final_pick_picks_true_best_on_noisy_initial_rank(
+        self,
+    ) -> None:
+        """Final-pick re-ranks past a noisy initial measurement.
+
+        ``[512, 1024, 512]`` looks fastest on its noisy initial ``perf`` but
+        rebenches slower than ``[512, 512, 512]``, so
+        ``run_final_pick_verification`` must re-pick ``[512, 512, 512]``.
+        """
+        from unittest.mock import patch
+
+        from helion.autotuner.base_search import PopulationBasedSearch
+        from helion.autotuner.base_search import PopulationMember
+        from helion.runtime.config import Config
+
+        def member(block_sizes: list[int], noisy_ms: float) -> PopulationMember:
+            return PopulationMember(
+                fn=lambda *a, **kw: None,
+                perfs=[noisy_ms],
+                flat_values=block_sizes,
+                config=Config(block_sizes=block_sizes),
+                status="ok",
+                compile_time=0.0,
+            )
+
+        # noisy_best wins the noisy initial rank (0.220) but rebenches slowest
+        # (0.232); true_best looks slower initially (0.232) but is truly fastest
+        # (0.180).  true_ms is what the rebenchmark reveals.
+        noisy_best = member([512, 1024, 512], 0.220)
+        true_best = member([512, 512, 512], 0.232)
+        true_ms = {id(noisy_best): 0.232, id(true_best): 0.180}
+
+        search = PopulationBasedSearch.__new__(PopulationBasedSearch)
+        search.population = [noisy_best, true_best]
+        search.best_perf_so_far = min(m.perf for m in search.population)
+        search.log = lambda *a, **kw: None  # pyrefly: ignore[bad-assignment]
+
+        def fake_rebenchmark(
+            to_bench: list[PopulationMember], *, desc: str = ""
+        ) -> None:
+            for m in to_bench:
+                m.perfs.append(true_ms[id(m)])
+
+        with patch.object(search, "rebenchmark", side_effect=fake_rebenchmark):
+            final = search.run_final_pick_verification(noisy_best, top_k=5)
+        self.assertEqual(list(final.config["block_sizes"]), [512, 512, 512])
+
+    def test_pallas_autotuner_final_pick_supported_only_on_pallas_backend(
+        self,
+    ) -> None:
+        """The final-pick re-rank is gated to the Pallas/TPU backend.
+
+        It's only validated on TPU; on Triton/CuTe/Metal (GPU) it would run
+        an untested wall-clock re-rank, so the production call sites
+        (pattern_search / surrogate_pattern_search) skip it via
+        ``_final_pick_supported``.
+        """
+        from types import SimpleNamespace
+
+        from helion.autotuner.base_search import PopulationBasedSearch
+
+        search = PopulationBasedSearch.__new__(PopulationBasedSearch)
+
+        search.config_spec = SimpleNamespace(backend_name="pallas")  # pyrefly: ignore[bad-assignment]
+        self.assertTrue(search._final_pick_supported())
+
+        for backend_name in ("triton", "cute", "metal", "tileir"):
+            search.config_spec = SimpleNamespace(backend_name=backend_name)  # pyrefly: ignore[bad-assignment]
+            self.assertFalse(search._final_pick_supported())
+
     def test_bmm(self) -> None:
         """Test BMM with default config — exercises size_matches fix.
 
