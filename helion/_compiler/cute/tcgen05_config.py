@@ -35,6 +35,7 @@ from .strategies import TCGEN05_WARP_SPEC_MMA_WARPS_KEY
 from .strategies import TCGEN05_WARP_SPEC_REGISTER_DECREASE_KEY
 from .strategies import TCGEN05_WARP_SPEC_REGISTER_INCREASE_KEY
 from .strategies import TCGEN05_WARP_SPEC_SCHEDULER_WARPS_KEY
+from .strategies import TCGEN05_WARP_SPEC_STORE_WARPS_KEY
 from .strategies import Tcgen05LayoutStrategy
 from .strategies import Tcgen05PersistenceModel
 from .strategies import Tcgen05Strategy
@@ -95,6 +96,7 @@ from .tcgen05_constants import TCGEN05_LARGE_BN_PROOF_STAGE_CONFIGS
 from .tcgen05_constants import TCGEN05_ONE_CTA_MAX_BLOCK_M
 from .tcgen05_constants import TCGEN05_PURE_CLC_SCHEDULER_OBJECT_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_PURE_DYNAMIC_SCHEDULER_OBJECT_CONFIG_KEY
+from .tcgen05_constants import TCGEN05_RESIDUAL_FULL_TILE_DEEP_C_STAGES
 from .tcgen05_constants import TCGEN05_SCHED_CONSUMER_WAIT_MODE_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_SCHED_CONSUMER_WAIT_MODE_NORMAL
 from .tcgen05_constants import TCGEN05_SCHED_CONSUMER_WAIT_MODES
@@ -161,6 +163,8 @@ from .tcgen05_constants import TCGEN05_TWO_CTA_EDGE_K_TAIL_SCHEDULER_L2_SWIZZLE_
 from .tcgen05_constants import TCGEN05_TWO_CTA_MAX_K_TILES
 from .tcgen05_constants import TCGEN05_TWO_CTA_SEED_PID_TYPE
 from .tcgen05_constants import tcgen05_ab_smem_bytes_per_cta
+from .tcgen05_constants import tcgen05_c_smem_bytes_per_cta
+from .tcgen05_constants import tcgen05_default_epilogue_tile_size
 from .tcgen05_constants import tcgen05_two_cta_edge_k_tail_seed_overrides
 
 if TYPE_CHECKING:
@@ -1883,6 +1887,130 @@ class CuteTcgen05Config:
         )
         return bytes_per_cta <= constraints.per_cta_smem_budget_bytes
 
+    def c_stages_fits(
+        self,
+        *,
+        bm: int,
+        bn: int,
+        bk: int,
+        cluster_m: int,
+        ab_stages: int,
+        c_stages: int,
+        has_source_c: bool,
+    ) -> bool:
+        # Workstream A Stage 2 (cycle 90): budget-aware admission for the deeper
+        # C-store ring. Reuse the ``tcgen05_ab_stages=3`` SMEM-budget envelope
+        # (same dtype_bytes + per-CTA budget after the non-AB reservation) and
+        # require AB + C to fit together. This is the gate that keeps a deeper
+        # C ring (``tcgen05_c_stages=4``) out of the ab=3 regime, where AB+C
+        # overshoots the 232 KB B200 cap and ptxas raises a raw
+        # ``too much shared`` error during tuning. The C bytes use the REAL
+        # ``Tcgen05LayoutStrategy.DEFAULT`` epilogue subtile, not the (128, 32)
+        # EXPLICIT_EPI_TILE direct-entry tile, so the byte count matches the
+        # role-local codegen: a 256x256 16-bit tile is ``(128, 64)`` WITH a
+        # source-C (residual family) but ``(128, 32)`` WITHOUT one (plain
+        # matmul) -- ``compute_epilogue_tile_size`` shrinks N when no C tile
+        # competes for SMEM. ``has_source_c`` threads that distinction through.
+        constraints = self.ab_stages_three_search_constraints
+        if constraints is None:
+            return False
+        if cluster_m not in (1, 2):
+            return False
+        if bm <= 0 or bn <= 0 or bk <= 0:
+            return False
+        if ab_stages <= 0 or c_stages <= 0:
+            return False
+        ab_bytes = tcgen05_ab_smem_bytes_per_cta(
+            bm=bm,
+            bn=bn,
+            bk=bk,
+            dtype_bytes=constraints.dtype_bytes,
+            ab_stages=ab_stages,
+            cluster_m=cluster_m,
+        )
+        # The epilogue processes the full per-CTA output tile (bm, bn); unlike
+        # the AB operands it is NOT split across the cluster, so the C-ring
+        # bytes do not depend on cluster_m. ``elem_width`` is the operand /
+        # output element width in bits (the validated families are uniform
+        # 16-bit). ``elem_width_c`` is None for no-source-C (plain) kernels so
+        # the helper picks the smaller no-source-C epilogue tile.
+        elem_width = constraints.dtype_bytes * 8
+        epi_tile_m, epi_tile_n = tcgen05_default_epilogue_tile_size(
+            bm,
+            bn,
+            elem_width_d=elem_width,
+            elem_width_c=elem_width if has_source_c else None,
+        )
+        c_bytes = tcgen05_c_smem_bytes_per_cta(
+            epi_tile_m=epi_tile_m,
+            epi_tile_n=epi_tile_n,
+            dtype_bytes=constraints.dtype_bytes,
+            c_stages=c_stages,
+        )
+        return ab_bytes + c_bytes <= constraints.per_cta_smem_budget_bytes
+
+    def _fix_c_stages_search_config(self, config: dict[str, object]) -> None:
+        # Workstream A Stage 2 (cycle 90): true admission gate for the deeper C
+        # ring. ``tcgen05_c_stages`` is an ``EnumFragment((2, 4))`` knob, so the
+        # autotuner can SAMPLE c=4 independently of any projection — a directly
+        # sampled 256x256 cluster_m=2 ab=3 + c=4 reaches ptxas and fails with a
+        # raw ``too much shared`` error (verified cycle-90). Mirror
+        # ``_fix_ab_stages_three_search_config``: when a config carries c=4 from
+        # ANY source and ``c_stages_fits`` is False, demote it to 2.
+        #
+        # Scope: judge ONLY the canonical full-tile 256x256 DEFAULT-layout path,
+        # which is exactly where the AB+C arithmetic is calibrated (the validated
+        # CtaGroup.TWO cosize shapes) and where the role-local C ring lives. The
+        # narrow-N / bm=128 edge family (``_fix_aux_edge_search_config`` sets its
+        # own validated c=4 at a different cosize that the analytic model would
+        # mis-judge) and the EXPLICIT_EPI_TILE direct-entry seeds (separate
+        # (128, 32) tile + own admission) keep their c=4 untouched.
+        if not self.search_enabled:
+            return
+        if config.get("tcgen05_c_stages") != TCGEN05_RESIDUAL_FULL_TILE_DEEP_C_STAGES:
+            return
+        if not self._is_default_layout_full_tile_config(config):
+            return
+        # Fail CLOSED: the ``(2, 4)`` c-stages fragment is offered on every
+        # device, but with no SMEM budget recorded (non-B200 / CPU host) we
+        # cannot prove c=4 fits — demote rather than leave the ptxas-overflow
+        # window open. ``c_stages_fits`` itself returns False when constraints
+        # are absent, so a single ``not c_stages_fits`` check covers both the
+        # over-budget and the no-budget arms.
+        block_sizes = cast("list[int]", config["block_sizes"])
+        cluster_m = cast("int", config.get("tcgen05_cluster_m", 1))
+        ab_stages = cast("int", config.get("tcgen05_ab_stages", 2))
+        if not self.c_stages_fits(
+            bm=block_sizes[0],
+            bn=block_sizes[1],
+            bk=block_sizes[2],
+            cluster_m=cluster_m,
+            ab_stages=ab_stages,
+            c_stages=TCGEN05_RESIDUAL_FULL_TILE_DEEP_C_STAGES,
+            has_source_c=self.aux_kernel_detected,
+        ):
+            config["tcgen05_c_stages"] = 2
+
+    @staticmethod
+    def _is_default_layout_full_tile_config(config: dict[str, object]) -> bool:
+        # The canonical 256x256 DEFAULT-layout role-local tile, where the C-ring
+        # AB+C SMEM model is calibrated. EXPLICIT_EPI_TILE configs use a separate
+        # tile/admission and are excluded; an absent layout key defaults to
+        # DEFAULT.
+        layout = config.get(
+            TCGEN05_LAYOUT_STRATEGY_CONFIG_KEY,
+            Tcgen05LayoutStrategy.DEFAULT.value,
+        )
+        if layout != Tcgen05LayoutStrategy.DEFAULT.value:
+            return False
+        block_sizes = config.get("block_sizes")
+        if not isinstance(block_sizes, list) or len(block_sizes) < 2:
+            return False
+        return (
+            block_sizes[0] == TCGEN05_TWO_CTA_BLOCK_M
+            and block_sizes[1] == TCGEN05_TWO_CTA_BLOCK_N
+        )
+
     def _fix_ab_stages_three_search_config(self, config: dict[str, object]) -> None:
         if self.ab_stages_three_search_constraints is None:
             return
@@ -1981,6 +2109,27 @@ class CuteTcgen05Config:
         config[TCGEN05_WARP_SPEC_C_INPUT_WARPS_KEY] = 1
         config["tcgen05_ab_stages"] = 2
         config[TCGEN05_AUX_LOAD_MODE_CONFIG_KEY] = TCGEN05_AUX_LOAD_MODE_TMA
+        # Workstream A Stage 2 (cycle 90): give this family the deeper C-store
+        # ring (foundation for the Stage-4 store-warp split — the store warp
+        # drains tile N's TMA-D from the ring while the 4 epi warps run tile
+        # N+1's T2R; a 2-stage ring leaves no slack). At ab=2 the c=4 ring fits
+        # (128 KB AB + 64 KB C = 192 KB < 232 KB cap; the DEFAULT epi tile is
+        # (128, 64), so each C stage is 16 KB), confirmed correct on T20
+        # (cycle-90 force-config: c=2 942.2 TF vs c=4 936.1 TF — perf-neutral
+        # standalone, exactly the cycle-89 NCU prediction since the TMA-D store
+        # is already c_pipeline-overlapped). Gated by ``c_stages_fits`` so a
+        # future ab=3 candidate in this family cannot be lifted into overflow.
+        block_sizes = cast("list[int]", config["block_sizes"])
+        if self.c_stages_fits(
+            bm=block_sizes[0],
+            bn=block_sizes[1],
+            bk=block_sizes[2],
+            cluster_m=2,
+            ab_stages=2,
+            c_stages=TCGEN05_RESIDUAL_FULL_TILE_DEEP_C_STAGES,
+            has_source_c=True,
+        ):
+            config["tcgen05_c_stages"] = TCGEN05_RESIDUAL_FULL_TILE_DEEP_C_STAGES
 
     @staticmethod
     def _is_with_scheduler_c_input_config(config: dict[str, object]) -> bool:
@@ -3092,6 +3241,14 @@ class CuteTcgen05Config:
             strategy_choices = (Tcgen05Strategy.ROLE_LOCAL_MONOLITHIC.value,)
             scheduler_warps_choices = (0,)
             c_input_warps_choices = (0,)
+        # The store-warp slot stays narrowed to ``0`` in the autotune surface —
+        # only an explicit ``helion.Config(tcgen05_warp_spec_store_warps=1)``
+        # activates it. Cycle 93 (Workstream A Stage 4) landed the productive
+        # decouple body (the C-store edge + tail split, +1.1 % on T20), but the
+        # autotune surface stays at ``0`` until Stage 5 wires store=1 into the
+        # residual family's production config + runs the full regression sweep,
+        # so no passing target can pick it before it is characterized per-family.
+        store_warps_choices: tuple[int, ...] = (0,)
         if target1_tvm_ffi_seed_enabled:
             layout_choices = (
                 Tcgen05LayoutStrategy.DEFAULT.value,
@@ -3109,6 +3266,7 @@ class CuteTcgen05Config:
                 scheduler_warps_choices
             ),
             TCGEN05_WARP_SPEC_C_INPUT_WARPS_KEY: EnumFragment(c_input_warps_choices),
+            TCGEN05_WARP_SPEC_STORE_WARPS_KEY: EnumFragment(store_warps_choices),
             TCGEN05_WARP_SPEC_REGISTER_DECREASE_KEY: EnumFragment(
                 (ROLE_LOCAL_MONOLITHIC_DEFAULT_WARP_SPEC.register_split[0],)
             ),
@@ -3141,6 +3299,11 @@ class CuteTcgen05Config:
         )
         fragments[TCGEN05_WARP_SPEC_SCHEDULER_WARPS_KEY] = EnumFragment((0, 1))
         fragments[TCGEN05_WARP_SPEC_C_INPUT_WARPS_KEY] = EnumFragment((0, 1))
+        # Cycle 91 (Workstream A Stage 3): the user-config validation surface
+        # accepts ``{0, 1}`` so an explicit ``store_warps=1`` round-trips; the
+        # per-strategy accept set in ``_STRATEGY_SUPPORTED_STORE_WARPS`` still
+        # pins it to ``{0}`` outside ROLE_LOCAL_WITH_SCHEDULER.
+        fragments[TCGEN05_WARP_SPEC_STORE_WARPS_KEY] = EnumFragment((0, 1))
         return fragments
 
     @staticmethod
@@ -3573,6 +3736,12 @@ class CuteTcgen05Config:
         self._fix_aux_tma_full_tile_search_config(config)
         self._fix_with_scheduler_search_config(config)
         self._fix_aux_tma_search_config(config)
+        # Final c-stages admission: demote a directly-sampled (or any unclaimed)
+        # deeper C ring on the canonical 256x256 DEFAULT-layout path that does
+        # not fit AB+C under the B200 cap. Runs after the family fixups so their
+        # validated c=4 (residual ab=2 projection above; edge/seed families,
+        # which this gate's scope excludes) is set first.
+        self._fix_c_stages_search_config(config)
         # CLC admission depends on the projected cluster/pid/strategy tuple
         # above, including the scheduler/c-input warp fix-ups.
         self._fix_clc_persistence_search_config(config)

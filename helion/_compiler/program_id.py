@@ -1411,14 +1411,37 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         )
 
     def _tcgen05_epi_role_predicate(self) -> str:
-        """Boolean expression that gates the epilogue warps' role block."""
+        """Boolean expression that gates the epilogue warps' role block.
+
+        Workstream A Stage 4 (cycle 93, Path B shared-loop split): when the
+        matmul plan carries a store warp (``has_store_warp``), the predicate
+        is WIDENED to also admit ``store_warp_id`` so the store warp runs the
+        SAME epilogue role-local while as the 4 epi warps — sharing the
+        descriptor/SMEM/layout setup and the sched-consumer + subtile loop
+        (no re-derivation; this is what makes Path B cheap vs the independent
+        store-warp loop of Path A). Inside the loop the per-subtile tail is
+        split by warp role with inline gates emitted in the tail source
+        (``memory_ops._codegen_cute_store_tcgen05_tile``): the 4 epi warps
+        (``epi_active`` = ``warp_idx < epi_warp_count``) own T2R/R2S + the
+        C-store producer commit, and the store warp (``warp_idx ==
+        store_warp_id``) owns the consumer-wait + TMA-D + consumer-release
+        drain. When ``store_warps=0`` the predicate is the historical
+        ``warp_idx < epi_warp_count`` and codegen is byte-identical.
+        """
         plan = self._tcgen05_plan()
         assert plan is not None, (
             "tcgen05 epilogue role predicate requires a registered matmul plan"
         )
-        return (
+        epi_predicate = (
             "cute.arch.make_warp_uniform(cute.arch.warp_idx()) "
             f"< cutlass.Int32({plan.epi_warp_count})"
+        )
+        if not plan.has_store_warp:
+            return epi_predicate
+        return (
+            f"({epi_predicate} or "
+            "cute.arch.make_warp_uniform(cute.arch.warp_idx()) "
+            f"== cutlass.Int32({plan.store_warp_id}))"
         )
 
     def _tcgen05_scheduler_role_predicate(self) -> str:
@@ -2505,6 +2528,8 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         *,
         emit_pdl_wait: bool = True,
         initialize_tile_counter: bool = True,
+        store_aux_per_tile_stmts: list[ast.stmt] | None = None,
+        store_aux_predicate: str | None = None,
     ) -> ast.stmt:
         """Build a role-local ``while`` for one extracted role block.
 
@@ -2558,7 +2583,12 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
                 role_prelude_stmts=role_prelude_stmts,
                 emit_pdl_wait=emit_pdl_wait,
                 initialize_tile_counter=initialize_tile_counter,
+                store_aux_per_tile_stmts=store_aux_per_tile_stmts,
+                store_aux_predicate=store_aux_predicate,
             )
+        assert store_aux_per_tile_stmts is None, (
+            "store-warp aux merge requires ROLE_LOCAL_WITH_SCHEDULER"
+        )
 
         # Match the shared scheduler's cluster shape so the role-local
         # scheduler visits the same tile sequence in the same order.
@@ -2673,6 +2703,8 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         role_prelude_stmts: list[ast.stmt] | None = None,
         emit_pdl_wait: bool = True,
         initialize_tile_counter: bool = True,
+        store_aux_per_tile_stmts: list[ast.stmt] | None = None,
+        store_aux_predicate: str | None = None,
     ) -> ast.stmt:
         """``ROLE_LOCAL_WITH_SCHEDULER`` consumer-side role-local while.
 
@@ -2874,6 +2906,22 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         per_tile_body.extend(_consumer_release_block())
         if dependency_stmts is not None:
             per_tile_body.extend(dependency_stmts)
+        # Cycle-94 merge: inject the store warp's aux GMEM->SMEM residual
+        # producer body AFTER the tile coords are materialized and BEFORE the
+        # store body (whose epi-warp consumers read the freshly staged aux),
+        # gated on the store-warp predicate so only the single producer warp
+        # issues the loads. The epi loop already owns the per-warp sched
+        # handshake, so the injected body carries no sched wait/release.
+        if store_aux_per_tile_stmts is not None:
+            assert store_aux_predicate is not None
+            per_tile_body.append(
+                create(
+                    ast.If,
+                    test=expr_from_string(store_aux_predicate),
+                    body=[_clone_stmt(stmt) for stmt in store_aux_per_tile_stmts],
+                    orelse=[],
+                )
+            )
         per_tile_body.extend(role_block.stmts)
         if tile_counter_var is not None and increment_tile_counter_per_tile:
             per_tile_body.append(
@@ -2893,6 +2941,13 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         # Final release + advance for the sentinel publish (lane-0
         # gate matches the per-iteration release inside the loop).
         prelude.extend(_consumer_release_block())
+        # Cycle-94 merge: no post-loop aux producer tail is injected. The store
+        # warp's aux producer_state advance lives inside the per-tile store-warp
+        # branch of THIS while; a post-loop ``producer_tail(state)`` would
+        # reference a loop-carried value defined in that nested region (IR
+        # domination error). The boundary drain is unnecessary because the
+        # epi-warp consumers release every aux stage by loop exit (see
+        # ``_build_c_input_warp_role_local_while(inline_aux_only=...)``).
 
         return create(
             ast.If,
@@ -3733,9 +3788,25 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         *,
         shared_body_extracted: list[ast.stmt] | None = None,
         tile_phase: str = "all",
-    ) -> ast.stmt:
+        inline_aux_only: bool = False,
+    ) -> ast.stmt | list[ast.stmt]:
         """Build the C-input warp's role-local while
         (``cute_plan.md`` §7.5.3.2 producer-body split).
+
+        Workstream A Stage 5 (cycle 94, the merge): when ``inline_aux_only`` is
+        set, this does NOT build a self-contained role-local while (which would
+        be a second sched-pipeline consumer on the warp). Instead it returns the
+        per-tile aux GMEM->SMEM producer body (``list[ast.stmt]``) for the
+        CALLER to inject into the (widened) epilogue role-local while on the
+        STORE warp, which already owns the single per-warp sched-pipeline
+        handshake. This is how the store/epi-load warp does BOTH the early
+        residual load and the late TMA-D store drain in one loop at 8 warps. No
+        post-loop producer tail is returned (the aux producer_state advance is
+        inside the shared loop's store-warp branch, so a post-loop tail would
+        hit an IR domination error; the boundary drain is unnecessary because
+        the consumers release all stages by loop exit). ``inline_aux_only`` uses
+        the post-L2 ``tile_offset_0/1`` coords (always present in the epi loop's
+        dependency stmts), so it asserts the post-L2 path.
 
         Active when the matmul plan has ``c_input_warp_count > 0``
         AND the forward FX walker discovered one or more
@@ -3804,8 +3875,11 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         ``TestCuteTcgen05AuxPipelineCycle2a``).
         """
         plan = self._tcgen05_plan()
-        assert plan is not None and plan.has_c_input_warp, (
-            "C-input role-local while requires a matmul plan with has_c_input_warp=True"
+        # The aux producer runs on the C-input warp normally; under the cycle-94
+        # merge (``inline_aux_only``) it runs on the store warp instead, so the
+        # producer-warp invariant is "C-input OR store warp present".
+        assert plan is not None and (plan.has_c_input_warp or plan.has_store_warp), (
+            "aux producer body requires a matmul plan with a C-input or store warp"
         )
         c_input_aux_tensor_descriptors = plan.c_input_aux_tensor_descriptors
         assert c_input_aux_tensor_descriptors, (
@@ -4477,6 +4551,45 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
             lines.append(statement_from_string(loop_src))
             return lines
 
+        if inline_aux_only:
+            # Cycle-94 merge: return the per-tile aux producer body for injection
+            # into the store warp's branch of the (widened) epilogue role-local
+            # while. The epi loop owns the sched handshake and materializes the
+            # post-L2 tile coords, so no sched wait/release is emitted here. The
+            # full-tile guard mirrors the standalone builder so edge tiles (SIMT
+            # aux) commit no aux stages the consumer never releases.
+            #
+            # No post-loop ``producer_tail`` is returned: the aux producer_state
+            # is advanced inside the store-warp branch of the SHARED epilogue
+            # while, so a post-loop ``producer_tail(state)`` would reference a
+            # loop-carried value defined in that nested region (IR domination
+            # error). The tail is only a boundary drain for the TMA-load empty
+            # barriers, and the epi-warp consumers have already released every
+            # aux stage by loop exit, so it is safely omitted on the merge path.
+            assert has_post_l2_coords, (
+                "inline_aux_only merge requires post-L2 tile coords "
+                "(tile_offset_0/1) from the epilogue loop's dependency stmts"
+            )
+            inline_per_tile: list[ast.stmt] = []
+            aux_copy_lines_inline = _aux_copy_lines()
+            if aux_requires_full_tile:
+                inline_per_tile.extend(
+                    [
+                        statement_from_string(
+                            f"{aux_full_tile_var} = {aux_full_tile_expr}"
+                        ),
+                        create(
+                            ast.If,
+                            test=expr_from_string(aux_full_tile_var),
+                            body=aux_copy_lines_inline,
+                            orelse=[],
+                        ),
+                    ]
+                )
+            else:
+                inline_per_tile.extend(aux_copy_lines_inline)
+            return inline_per_tile
+
         prelude: list[ast.stmt] = []
         prelude.extend(_sched_consumer_wait_block())
         per_tile_body: list[ast.stmt] = [
@@ -4839,6 +4952,39 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
             self._tcgen05_has_scheduler_warp()
             and cute_state.has_tcgen05_epi_role_full_edge_split
         )
+        # Cycle-94 merge gate: the store warp is the aux residual producer when
+        # there is a store warp, NO C-input warp, and a single-store-value
+        # exact-shape aux ring exists. In that case the aux GMEM->SMEM producer
+        # body is injected into the (widened) epilogue role-local while on the
+        # store warp rather than emitted as a standalone C-input role-local
+        # while (which would be a second per-warp sched consumer). The standalone
+        # C-input while below stays gated on ``has_c_input_warp`` and does not
+        # fire in the merge.
+        #
+        # TMA-ONLY: the merge injects a TMA bulk producer body; there is no SIMT
+        # store-warp producer. ``cute_mma._emit_mma_pipeline`` only allocates the
+        # aux pipeline for the store warp when ``aux_load_mode=tma``, so for
+        # ``store_warps=1 + SIMT aux`` the pipeline plan is absent and the gate
+        # closes (the kernel falls back to direct-GMEM aux). The
+        # ``use_tma_load`` check below makes that requirement explicit and
+        # defends against a future SIMT-producing aux plan reaching this path.
+        store_merge_plan = self._tcgen05_plan()
+        aux_plan_for_merge = device_function.cute_state.aux_pipeline_plan
+        store_aux_merge_active = (
+            store_merge_plan is not None
+            and store_merge_plan.has_store_warp
+            and not store_merge_plan.has_c_input_warp
+            and bool(store_merge_plan.c_input_aux_tensor_descriptors)
+            and len(
+                {
+                    d.store_value_node
+                    for d in store_merge_plan.c_input_aux_tensor_descriptors
+                }
+            )
+            <= 1
+            and aux_plan_for_merge is not None
+            and aux_plan_for_merge.use_tma_load
+        )
         for i, predicate in enumerate(ordered_predicates):
             stmts = merged[predicate]
             split_epi_role = (
@@ -4901,6 +5047,32 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
                         _clone_stmt(stmt) for stmt in epi_role_prelude_stmts
                     ]
                 suffix = f"_{phase}" if phase else ""
+                # Cycle-94 merge: build the store warp's aux producer body for
+                # injection into the epilogue role-local while. Only on the epi
+                # predicate, and (under a full/edge split) only the full-tile
+                # phase stages the aux ring — the edge phase uses SIMT direct
+                # GMEM aux, like the standalone C-input builder.
+                store_aux_per_tile_stmts: list[ast.stmt] | None = None
+                store_aux_predicate: str | None = None
+                if (
+                    store_aux_merge_active
+                    and predicate == self._tcgen05_epi_role_predicate()
+                    and phase != "edge"
+                ):
+                    aux_inline = self._build_c_input_warp_role_local_while(
+                        device_function,
+                        layout,
+                        shared_body_extracted=partition.shared_body_extracted,
+                        tile_phase="all",
+                        inline_aux_only=True,
+                    )
+                    assert isinstance(aux_inline, list)
+                    store_aux_per_tile_stmts = aux_inline
+                    assert store_merge_plan is not None
+                    store_aux_predicate = (
+                        "cute.arch.make_warp_uniform(cute.arch.warp_idx()) "
+                        f"== cutlass.Int32({store_merge_plan.store_warp_id})"
+                    )
                 role_local_whiles.append(
                     self._build_role_local_while(
                         device_function,
@@ -4911,6 +5083,8 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
                         role_prelude_stmts=role_prelude_stmts,
                         emit_pdl_wait=phase != "edge",
                         initialize_tile_counter=phase != "edge",
+                        store_aux_per_tile_stmts=store_aux_per_tile_stmts,
+                        store_aux_predicate=store_aux_predicate,
                     )
                 )
         # ``ROLE_LOCAL_WITH_SCHEDULER`` adds a fourth role-local while
@@ -4962,26 +5136,28 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
                 ("full", "edge") if use_full_edge_scheduler_split else ("all",)
             )
             for c_input_phase in c_input_phases:
-                role_local_whiles.append(
-                    self._build_c_input_warp_role_local_while(
-                        device_function,
-                        layout,
-                        # ``shared_body_extracted`` carries the post-PID-
-                        # decomposition statements (incl. the L2-grouping
-                        # ``pid_0`` / ``pid_1`` / ``tile_offset_0`` /
-                        # ``tile_offset_1`` chain). The C-input producer
-                        # body needs the same chain so its per-CTA aux
-                        # GMEM tile coords match the consumer's
-                        # post-L2-remapped tile coords — without this
-                        # the producer fetches a misaligned aux tile
-                        # under ``l2_groupings=[g>1]`` and the residual
-                        # add reads wrong rows / columns of the
-                        # auxiliary tensor (cycle 2i: 60-69% mismatched
-                        # elements vs eager).
-                        shared_body_extracted=partition.shared_body_extracted,
-                        tile_phase=c_input_phase,
-                    )
+                c_input_while = self._build_c_input_warp_role_local_while(
+                    device_function,
+                    layout,
+                    # ``shared_body_extracted`` carries the post-PID-
+                    # decomposition statements (incl. the L2-grouping
+                    # ``pid_0`` / ``pid_1`` / ``tile_offset_0`` /
+                    # ``tile_offset_1`` chain). The C-input producer
+                    # body needs the same chain so its per-CTA aux
+                    # GMEM tile coords match the consumer's
+                    # post-L2-remapped tile coords — without this
+                    # the producer fetches a misaligned aux tile
+                    # under ``l2_groupings=[g>1]`` and the residual
+                    # add reads wrong rows / columns of the
+                    # auxiliary tensor (cycle 2i: 60-69% mismatched
+                    # elements vs eager).
+                    shared_body_extracted=partition.shared_body_extracted,
+                    tile_phase=c_input_phase,
                 )
+                # ``inline_aux_only`` is False here, so the builder returns the
+                # full role-local while statement (not the merge tuple).
+                assert isinstance(c_input_while, ast.stmt)
+                role_local_whiles.append(c_input_while)
         return role_local_whiles, shared_tile_body
 
     def setup_persistent_kernel(

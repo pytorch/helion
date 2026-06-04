@@ -84,6 +84,7 @@ import torch
 
 import helion
 from helion._compiler.cute.strategies import TCGEN05_WARP_SPEC_C_INPUT_WARPS_KEY
+from helion._compiler.cute.strategies import TCGEN05_WARP_SPEC_STORE_WARPS_KEY
 from helion._compiler.cute.tcgen05_constants import TCGEN05_ACC_PRODUCER_MODE_CONFIG_KEY
 from helion._compiler.cute.tcgen05_constants import TCGEN05_ACC_PRODUCER_MODE_NORMAL
 from helion._compiler.cute.tcgen05_constants import TCGEN05_ACC_PRODUCER_MODE_SKIP_UMMA
@@ -1248,6 +1249,8 @@ def _make_helion_config_from_args(args: argparse.Namespace) -> helion.Config:
             config["tcgen05_warp_spec_scheduler_warps"] = 1
     if args.helion_c_input_warps is not None:
         config[TCGEN05_WARP_SPEC_C_INPUT_WARPS_KEY] = args.helion_c_input_warps
+    if args.helion_store_warps is not None:
+        config[TCGEN05_WARP_SPEC_STORE_WARPS_KEY] = args.helion_store_warps
     if args.helion_consumer_regs is not None:
         config[TCGEN05_CONSUMER_REGS_CONFIG_KEY] = args.helion_consumer_regs
     if args.helion_persistence_model is not None:
@@ -1747,6 +1750,8 @@ def _build_subprocess_cmd(args: argparse.Namespace, impl: str) -> list[str]:
             cmd.extend(["--helion-strategy", args.helion_strategy])
         if args.helion_c_input_warps is not None:
             cmd.extend(["--helion-c-input-warps", str(args.helion_c_input_warps)])
+        if args.helion_store_warps is not None:
+            cmd.extend(["--helion-store-warps", str(args.helion_store_warps)])
         if args.helion_consumer_regs is not None:
             cmd.extend(["--helion-consumer-regs", str(args.helion_consumer_regs)])
         if args.helion_persistence_model is not None:
@@ -1857,6 +1862,7 @@ def _two_cta_edge_k_tail_monolithic_args(
             "helion_num_epi_warps": 4,
             "helion_strategy": "role_local_monolithic",
             "helion_c_input_warps": 0,
+            "helion_store_warps": 0,
             "helion_require_tcgen05": 1,
             "helion_range_flattens": list(_HELION_DEFAULT_RANGE_FLATTENS),
             "helion_range_multi_buffers": list(_HELION_DEFAULT_RANGE_MULTI_BUFFERS),
@@ -4206,6 +4212,8 @@ def _build_two_cta_ncu_profile_command(
             cmd.extend(["--helion-strategy", args.helion_strategy])
         if args.helion_c_input_warps is not None:
             cmd.extend(["--helion-c-input-warps", str(args.helion_c_input_warps)])
+        if args.helion_store_warps is not None:
+            cmd.extend(["--helion-store-warps", str(args.helion_store_warps)])
         if args.helion_consumer_regs is not None:
             cmd.extend(["--helion-consumer-regs", str(args.helion_consumer_regs)])
         if args.helion_persistence_model is not None:
@@ -6288,6 +6296,17 @@ def parse_args() -> argparse.Namespace:
         choices=(0, 1),
         default=None,
         help="Optional tcgen05 C-input warp override for fixed Helion configs.",
+    )
+    parser.add_argument(
+        "--helion-store-warps",
+        type=int,
+        choices=(0, 1),
+        default=None,
+        help=(
+            "Optional tcgen05 store-warp override for fixed Helion configs "
+            "(Workstream A Stage 3 inert store warp; only valid under "
+            "role_local_with_scheduler)."
+        ),
     )
     parser.add_argument(
         "--helion-consumer-regs",

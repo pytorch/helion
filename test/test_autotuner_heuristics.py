@@ -118,6 +118,7 @@ from helion._compiler.cute.tcgen05_constants import (
 )
 from helion._compiler.cute.tcgen05_constants import TCGEN05_TWO_CTA_MAX_K_TILES
 from helion._compiler.cute.tcgen05_constants import TCGEN05_TWO_CTA_SEED_L2_GROUPING
+from helion._compiler.cute.tcgen05_constants import tcgen05_default_epilogue_tile_size
 from helion._hardware import HardwareInfo
 from helion._testing import DEVICE
 from helion._testing import HALF_DTYPE
@@ -2697,9 +2698,19 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
             torch.empty([6144, 6144], device=DEVICE, dtype=torch.bfloat16),
             torch.empty([6144, 6144], device=DEVICE, dtype=torch.bfloat16),
         )
+        # Mock the SMEM budget to the B200 value at bind time (when
+        # ``allow_ab_stages_three_search`` records the budget into the
+        # constraints) so the c=4 lift's ``c_stages_fits`` gate is deterministic
+        # on any cute host (``@onlyBackends`` does not imply B200).
+        b200_budget = 232448 - 28 * 1024
         with (
             patch_cute_mma_support(),
             patch("helion.language.matmul_ops._cuda_num_sms_or_zero", return_value=132),
+            patch.object(
+                CuteTcgen05Config,
+                "per_cta_ab_smem_budget_bytes",
+                return_value=b200_budget,
+            ),
         ):
             bound = cute_matmul_residual_add.bind(args)
         spec = bound.config_spec
@@ -2727,6 +2738,8 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
             tcgen05_strategy=Tcgen05Strategy.ROLE_LOCAL_MONOLITHIC.value,
             tcgen05_persistence_model="static_persistent",
         )
+        # The budget was recorded into the constraints at bind time (mocked to
+        # B200 above), so ``c_stages_fits`` is deterministic here.
         spec.normalize(cm2, _fix_invalid=True)
         self.assertEqual(
             cm2.config[TCGEN05_AUX_LOAD_MODE_CONFIG_KEY], TCGEN05_AUX_LOAD_MODE_TMA
@@ -2738,7 +2751,12 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
         self.assertEqual(cm2.config["tcgen05_ab_stages"], 2)
         self.assertEqual(cm2.config[TCGEN05_WARP_SPEC_SCHEDULER_WARPS_KEY], 1)
         self.assertEqual(cm2.config[TCGEN05_WARP_SPEC_C_INPUT_WARPS_KEY], 1)
-        # A cluster_m=1 candidate is left in its own regime (not forced to TMA).
+        # Cycle 90 (Workstream A Stage 2): the same projection deepens the C
+        # ring to 4 (foundation for the Stage-4 store-warp split). At ab=2 the
+        # c=4 ring fits under the 232 KB B200 cap, so the budget gate admits it.
+        self.assertEqual(cm2.config["tcgen05_c_stages"], 4)
+        # A cluster_m=1 candidate is left in its own regime (not forced to TMA),
+        # and the deeper C ring is NOT projected onto it.
         cm1 = helion.Config(
             block_sizes=[128, 256, 64],
             indexing=["pointer", "tensor_descriptor", "tensor_descriptor"],
@@ -2756,6 +2774,163 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
             cm1.config.get(TCGEN05_AUX_LOAD_MODE_CONFIG_KEY),
             TCGEN05_AUX_LOAD_MODE_TMA,
         )
+        self.assertEqual(cm1.config["tcgen05_c_stages"], 2)
+
+    @onlyBackends(["cute"])
+    def test_cute_tcgen05_c_stages_budget_gate(self) -> None:
+        # Cycle 90 (Workstream A Stage 2): the budget-aware ``c_stages_fits``
+        # check sums AB + C SMEM against the same 232 KB B200 envelope as the
+        # ab=3 gate, using the REAL DEFAULT epilogue tile — which depends on
+        # source-C presence: 256x256 16-bit is (128, 64) WITH source C (residual
+        # family, 16 KB/stage) but (128, 32) WITHOUT one (plain matmul, 8
+        # KB/stage). At the canonical 256x256x128 cluster_m=2 tile: ab=2 + c=4
+        # fits (the foundation depth); ab=3 + c=4 overflows (matching the
+        # cycle-90 probe where a directly sampled 256x256 ab=3 + c=4 hit a raw
+        # ``ptxas: too much shared`` error). Uses a plain (no-epilogue) matmul so
+        # the residual aux-TMA projection (which forces ab=2) does not claim the
+        # sampled candidate — the admission gate is the only thing acting on c=4.
+        # The SMEM budget is MOCKED to the B200 value so the gate is exercised
+        # deterministically on any cute host (``@onlyBackends`` does not imply
+        # B200).
+        b200_budget = 232448 - 28 * 1024  # optin cap - ab=3 reservation
+
+        @helion.kernel(backend="cute")
+        def cute_matmul_plain(
+            x: torch.Tensor,
+            y: torch.Tensor,
+        ) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = acc.to(x.dtype)
+            return out
+
+        args = (
+            torch.empty([6144, 6144], device=DEVICE, dtype=torch.bfloat16),
+            torch.empty([6144, 6144], device=DEVICE, dtype=torch.bfloat16),
+        )
+        with (
+            patch_cute_mma_support(),
+            patch("helion.language.matmul_ops._cuda_num_sms_or_zero", return_value=132),
+            patch.object(
+                CuteTcgen05Config,
+                "per_cta_ab_smem_budget_bytes",
+                return_value=b200_budget,
+            ),
+        ):
+            bound = cute_matmul_plain.bind(args)
+        spec = bound.config_spec
+        tcfg = spec._cute_tcgen05_config
+        # The DEFAULT epilogue tile for a 256x256 16-bit tile depends on
+        # source-C presence (N shrinks when no C tile competes for SMEM).
+        self.assertEqual(
+            tcgen05_default_epilogue_tile_size(
+                256, 256, elem_width_d=16, elem_width_c=16
+            ),
+            (128, 64),
+        )
+        self.assertEqual(
+            tcgen05_default_epilogue_tile_size(
+                256, 256, elem_width_d=16, elem_width_c=None
+            ),
+            (128, 32),
+        )
+        # With source-C (residual family, 16 KB/stage): ab=2 + c=4 = 192 KB fits;
+        # ab=3 + c=4 = 256 KB overflows.
+        self.assertTrue(
+            tcfg.c_stages_fits(
+                bm=256,
+                bn=256,
+                bk=128,
+                cluster_m=2,
+                ab_stages=2,
+                c_stages=4,
+                has_source_c=True,
+            )
+        )
+        self.assertFalse(
+            tcfg.c_stages_fits(
+                bm=256,
+                bn=256,
+                bk=128,
+                cluster_m=2,
+                ab_stages=3,
+                c_stages=4,
+                has_source_c=True,
+            )
+        )
+        # Without source-C (plain matmul, 8 KB/stage): ab=3 + c=4 = 224 KB still
+        # overflows the conservative budget (the cycle-90 probe confirmed the
+        # plain 256x256 ab=3 + c=4 hits raw ptxas ``too much shared``).
+        self.assertFalse(
+            tcfg.c_stages_fits(
+                bm=256,
+                bn=256,
+                bk=128,
+                cluster_m=2,
+                ab_stages=3,
+                c_stages=4,
+                has_source_c=False,
+            )
+        )
+        # True admission gate: a DIRECTLY sampled 256x256 ab=3 + c=4 candidate
+        # (no projection claims it — plain matmul, no aux) is demoted to c=2 so
+        # tuning never reaches the raw ptxas overflow. ab=3 alone fits, so the
+        # ab-stages gate keeps it — only c is demoted.
+        ab3_c4 = helion.Config(
+            block_sizes=[256, 256, 128],
+            indexing=["tensor_descriptor", "tensor_descriptor", "tensor_descriptor"],
+            pid_type="persistent_interleaved",
+            tcgen05_cluster_m=2,
+            tcgen05_cluster_n=1,
+            tcgen05_ab_stages=3,
+            tcgen05_acc_stages=2,
+            tcgen05_c_stages=4,
+            tcgen05_strategy=Tcgen05Strategy.ROLE_LOCAL_MONOLITHIC.value,
+            tcgen05_persistence_model="static_persistent",
+        )
+        # The budget is already recorded in the constraints from bind (mocked to
+        # B200 above), so ``fix_search_config`` is deterministic here.
+        tcfg.fix_search_config(ab3_c4.config)
+        self.assertEqual(ab3_c4.config["tcgen05_ab_stages"], 3)
+        self.assertEqual(ab3_c4.config["tcgen05_c_stages"], 2)
+        # ab=2 + c=4 (fits) is preserved by the gate.
+        ab2_c4 = helion.Config(
+            block_sizes=[256, 256, 128],
+            indexing=["tensor_descriptor", "tensor_descriptor", "tensor_descriptor"],
+            pid_type="persistent_interleaved",
+            tcgen05_cluster_m=2,
+            tcgen05_cluster_n=1,
+            tcgen05_ab_stages=2,
+            tcgen05_acc_stages=2,
+            tcgen05_c_stages=4,
+            tcgen05_strategy=Tcgen05Strategy.ROLE_LOCAL_MONOLITHIC.value,
+            tcgen05_persistence_model="static_persistent",
+        )
+        tcfg.fix_search_config(ab2_c4.config)
+        self.assertEqual(ab2_c4.config["tcgen05_c_stages"], 4)
+        # Fail CLOSED: with no recorded SMEM budget (non-B200 / CPU host, where
+        # ``ab_stages_three_search_constraints`` is None) a sampled c=4 cannot be
+        # proven to fit, so it is demoted to 2 rather than left to overflow.
+        tcfg.ab_stages_three_search_constraints = None
+        ab2_c4_no_budget = helion.Config(
+            block_sizes=[256, 256, 128],
+            indexing=["tensor_descriptor", "tensor_descriptor", "tensor_descriptor"],
+            pid_type="persistent_interleaved",
+            tcgen05_cluster_m=2,
+            tcgen05_cluster_n=1,
+            tcgen05_ab_stages=2,
+            tcgen05_acc_stages=2,
+            tcgen05_c_stages=4,
+            tcgen05_strategy=Tcgen05Strategy.ROLE_LOCAL_MONOLITHIC.value,
+            tcgen05_persistence_model="static_persistent",
+        )
+        tcfg.fix_search_config(ab2_c4_no_budget.config)
+        self.assertEqual(ab2_c4_no_budget.config["tcgen05_c_stages"], 2)
 
     @onlyBackends(["cute"])
     def test_cute_tcgen05_c_input_seed_respects_disable_heuristics(self) -> None:
