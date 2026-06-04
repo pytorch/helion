@@ -12,7 +12,6 @@ from helion._testing import RefEagerTestDisabled
 from helion._testing import TestCase
 from helion._testing import code_and_output
 from helion._testing import onlyBackends
-from helion._testing import skipIfCute
 from helion.autotuner.base_search import PopulationBasedSearch
 from helion.autotuner.base_search import PopulationMember
 from helion.autotuner.differential_evolution import DifferentialEvolutionSearch
@@ -105,12 +104,15 @@ class TestErrors(RefEagerTestDisabled, TestCase):
         ):
             search.autotune()
 
-    @skipIfCute("CuTe lowers the full-row reduction as a row-wise scalar")
     def test_shape_mismatch_missing_keepdims(self):
         """Binary op should detect broadcast shape mismatch from reduction without keep_dims.
 
         This mirrors the softmax pattern where a row-wise reduction loses the
         dimension and then is subtracted from a 2D tensor without keep_dims.
+        On Triton this surfaces as a ``ShapeMismatch`` from the MLIR
+        ``make_shape_compatible`` check; CuTe instead lowers the full-row
+        reduction as a row-wise scalar, which broadcasts legally and produces
+        the correct softmax, so no error is raised there.
         """
 
         # Mirror scratch.py behavior exactly
@@ -124,8 +126,19 @@ class TestErrors(RefEagerTestDisabled, TestCase):
                 out[tile_m, :] = out_rows
             return out
 
-        with self.assertRaises(helion.exc.ShapeMismatch):
-            fn(torch.randn(32, 64, device=DEVICE))
+        x = torch.randn(32, 64, device=DEVICE)
+        if _get_backend() == "cute":
+            # CuTe lowers the dim-1 reduction as a row-wise scalar; the broadcast
+            # is legal and yields the correct softmax. Use an explicit config so
+            # the reduction axis keeps a thread budget (the default config has
+            # both tile axes consume the full 1024-thread budget).
+            _, result = code_and_output(fn, (x,), block_sizes=[16, 16], num_warps=4)
+            torch.testing.assert_close(
+                result, torch.softmax(x, dim=1), atol=1e-4, rtol=1e-4
+            )
+        else:
+            with self.assertRaises(helion.exc.ShapeMismatch):
+                fn(x)
 
     def test_tile_unpacking(self):
         @helion.kernel()
