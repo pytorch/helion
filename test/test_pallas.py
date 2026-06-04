@@ -1209,14 +1209,12 @@ class TestPallas(TestCase):
     )
     def test_nested_non_grid_outer_loop_emit_pipeline(self) -> None:
         """Outer non-grid device loop around an ``emit_pipeline`` whose
-        body reads a tensor indexed by that outer tile.
+        body reads a tensor indexed by that outer tile compiles and
+        produces correct matmul output.
 
-        BlockSpec for the inner pipeline must encode the outer non-grid
-        offset; without the fix this falls through to the full-dim shape
-        and the matmul broadcast-fails with ``(bs_m, bs_n) vs (bs_m, n)``.
-        ``n`` must exceed the effective ``bs_n`` (128 lanes on TPU) for the
-        mismatch to be visible — otherwise the broken full-dim spec
-        coincidentally equals the correct block shape.
+        ``n`` must exceed the effective ``bs_n`` (128 lanes on TPU) so the
+        inner BlockSpec for ``w`` is actually block-sized rather than
+        coincidentally equalling the full ``n`` dim.
         """
         m, k, n = 32, 256, 256
         x = torch.randn(m, k, device=DEVICE, dtype=torch.float32)
