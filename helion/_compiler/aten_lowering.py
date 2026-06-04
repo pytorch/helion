@@ -1117,6 +1117,8 @@ def _pallas_dot(ctx: LoweringContext, node: Node, with_acc: bool) -> ast.AST:
         need_f32_acc=need_f32_acc,
         out_dtype=out_dtype,
         lhs_ndim=lhs_ndim,
+        lhs_dtype=lhs_dtype,
+        rhs_dtype=rhs_dtype,
     )
 
 
