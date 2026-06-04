@@ -61,6 +61,7 @@ def _probe_warp_f16bf16() -> tuple[bool, str | None]:
 def _probe_warpgroup_f16bf16() -> tuple[bool, str | None]:
     try:
         import cutlass
+        from cutlass.cute.nvgpu import OperandMajorMode
         from cutlass.cute.nvgpu import warpgroup
 
         warpgroup.MmaF16BF16Op(
@@ -68,8 +69,8 @@ def _probe_warpgroup_f16bf16() -> tuple[bool, str | None]:
             cutlass.Float32,
             (64, 8, 16),
             warpgroup.OperandSource.SMEM,
-            warpgroup.OperandMajorMode.K,
-            warpgroup.OperandMajorMode.K,
+            OperandMajorMode.K,
+            OperandMajorMode.K,
         )
         return True, None
     except Exception as exc:
@@ -79,6 +80,7 @@ def _probe_warpgroup_f16bf16() -> tuple[bool, str | None]:
 def _probe_tcgen05_f16bf16() -> tuple[bool, str | None]:
     try:
         import cutlass
+        from cutlass.cute.nvgpu import OperandMajorMode
         from cutlass.cute.nvgpu import tcgen05
 
         tcgen05.MmaF16BF16Op(
@@ -87,8 +89,8 @@ def _probe_tcgen05_f16bf16() -> tuple[bool, str | None]:
             (128, 8, 16),
             tcgen05.CtaGroup.ONE,
             tcgen05.OperandSource.SMEM,
-            tcgen05.OperandMajorMode.K,
-            tcgen05.OperandMajorMode.K,
+            OperandMajorMode.K,
+            OperandMajorMode.K,
         )
         return True, None
     except Exception as exc:

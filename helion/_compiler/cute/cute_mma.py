@@ -4433,7 +4433,7 @@ def _emit_mma_pipeline(
     else:
         prefix.append(
             statement_from_string(
-                f"{acc_frag} = cute.make_fragment("
+                f"{acc_frag} = cute.make_rmem_tensor("
                 f"{tiled_mma}.partition_shape_C(({bm}, {bn})), {acc_dtype_str})"
             )
         )
@@ -6044,8 +6044,9 @@ def _tcgen05_tiled_mma_expr(
     return (
         "cutlass.utils.blackwell_helpers.make_trivial_tiled_mma("
         f"{input_dtype_str}, "
-        "cute.nvgpu.tcgen05.OperandMajorMode.K, "
-        "cute.nvgpu.tcgen05.OperandMajorMode.MN, "
+        f"{input_dtype_str}, "
+        "cute.nvgpu.OperandMajorMode.K, "
+        "cute.nvgpu.OperandMajorMode.MN, "
         f"{acc_dtype_str}, "
         f"{cta_group_expr}, "
         f"({bm}, {bn}), "
@@ -6871,7 +6872,7 @@ def codegen_cute_mma_direct_mm(
         prefix.append(stmt)
     prefix.append(
         statement_from_string(
-            f"{acc_frag} = cute.make_fragment("
+            f"{acc_frag} = cute.make_rmem_tensor("
             f"{tiled_mma}.partition_shape_C(({plan.bm}, {plan.bn})), {acc_dtype_str})"
         )
     )

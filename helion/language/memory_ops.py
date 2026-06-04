@@ -3778,7 +3778,7 @@ def _codegen_cute_store_tcgen05_tile(
         ),
         (
             f"{simt_atom} = cute.make_copy_atom("
-            f"cute.nvgpu.CopyUniversalOp(), {target_dtype}, "
+            f"cute.nvgpu.CopyR2GOp(), {target_dtype}, "
             f"num_bits_per_copy={num_bits}, "
             f"l1c_evict_priority=cute.nvgpu.CacheEvictionPriority.NO_ALLOCATE)"
         ),
