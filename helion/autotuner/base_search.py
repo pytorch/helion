@@ -28,6 +28,7 @@ from torch.utils._pytree import tree_map_only
 from .. import exc
 from .._compat import extract_device
 from .._compat import get_device_name
+from ..runtime.settings import _env_get_int
 from .benchmark_provider import BenchmarkProvider
 from .benchmark_provider import BenchmarkResult
 from .benchmark_provider import LocalBenchmarkProvider
@@ -706,6 +707,12 @@ class PopulationBasedSearch(BaseSearch):
         super().__init__(kernel, args)
         self.finishing_rounds = finishing_rounds
         self.population: list[PopulationMember] = []
+        # Population members corresponding to compiler-seeded configs from
+        # ``ConfigSpec.compiler_seed_configs``.  Tracked separately so the
+        # final-pick verification phase can re-include them as candidates
+        # even when the surrogate-driven search has pruned them away from
+        # ``self.population``.
+        self._compiler_seed_members: list[PopulationMember] = []
         self._best_available_seed_configs: list[Config] = []
         self.config_gen: ConfigGeneration = self.config_spec.create_config_generation(
             overrides=self.settings.autotune_config_overrides or None,
@@ -746,6 +753,29 @@ class PopulationBasedSearch(BaseSearch):
         """Replace the current best member in the population."""
         idx = min(range(len(self.population)), key=lambda i: self.population[i].perf)
         self.population[idx] = value
+
+    def capture_compiler_seed_members(
+        self, members: Sequence[PopulationMember]
+    ) -> None:
+        """Record which ``members`` came from compiler-seeded configs (TPU only).
+
+        Only the TPU/Pallas final-pick consumes this, so it's a no-op elsewhere.
+        Matches members against ``config_gen.seed_flat_config_pairs()`` so the
+        final-pick phase can re-include a seed even if the search later prunes it.
+        """
+        self._compiler_seed_members = []
+        if not self._final_pick_supported():
+            return
+        try:
+            seed_pairs = self.config_gen.seed_flat_config_pairs()
+        except Exception:
+            return
+        if not seed_pairs:
+            return
+        seed_flats: list[FlatConfig] = [flat for flat, _config in seed_pairs]
+        for member in members:
+            if member.flat_values in seed_flats:
+                self._compiler_seed_members.append(member)
 
     def benchmark_flat(self, flat_values: FlatConfig) -> PopulationMember:
         """
@@ -1219,6 +1249,74 @@ class PopulationBasedSearch(BaseSearch):
         )
         self.log(f"Finishing phase complete: final config={current.config}")
         return current
+
+    def _final_pick_supported(self) -> bool:
+        """True only on Pallas/TPU; final-pick is untested on other backends."""
+        return self.config_spec.backend_name == "pallas"
+
+    def run_final_pick_verification(
+        self,
+        best: PopulationMember,
+        top_k: int | None = None,
+    ) -> PopulationMember:
+        """Re-benchmark the top-``top_k`` candidates once and re-pick the fastest.
+
+        Beats the noisy single search-time median.  Compiler seeds are merged in.
+        Knob: ``HELION_AUTOTUNE_FINAL_PICK_TOP_K`` (10).
+        """
+        if top_k is None:
+            top_k = max(0, _env_get_int("HELION_AUTOTUNE_FINAL_PICK_TOP_K", 10))
+        if top_k <= 1:
+            return best
+
+        # Candidates: ``best`` first, then the finite population + compiler seeds
+        # (so a search-pruned seed still competes), ranked by perf and deduped by
+        # identity, capped at top_k.  getattr covers ``__new__`` test scaffolds.
+        seed_members = getattr(self, "_compiler_seed_members", []) or []
+        ranked = sorted(
+            (m for m in (*self.population, *seed_members) if math.isfinite(m.perf)),
+            key=performance,
+        )
+        candidates: list[PopulationMember] = []
+        seen: set[int] = set()
+        for member in (best, *ranked):
+            if id(member) in seen:
+                continue
+            seen.add(id(member))
+            candidates.append(member)
+            if len(candidates) >= top_k:
+                break
+        if len(candidates) < 2:
+            return best
+
+        return self._rebench_and_pick(best, candidates)
+
+    def _rebench_and_pick(
+        self, best: PopulationMember, candidates: list[PopulationMember]
+    ) -> PopulationMember:
+        """Re-benchmark ``candidates`` by absolute median and return the fastest."""
+        self.rebenchmark(candidates, desc="Final-pick verification")
+        best_member = min(candidates, key=performance)
+        if not math.isfinite(best_member.perf):
+            return best
+        if best_member is not best:
+            self.log(
+                f"Final-pick re-picked {best_member.config} "
+                f"({best_member.perf:.4f}ms) over {best.config}"
+            )
+        self.best_perf_so_far = min(self.best_perf_so_far, best_member.perf)
+        return best_member
+
+    def _finalize(self) -> Config:
+        """Finishing phase + final-pick re-rank; return the chosen config.
+
+        Shared tail of the search ``_autotune`` methods; the final-pick re-rank
+        runs only on TPU/Pallas (see ``_final_pick_supported``).
+        """
+        best = self.run_finishing_phase(self.best, self.finishing_rounds)
+        if self._final_pick_supported():
+            best = self.run_final_pick_verification(best)
+        return best.config
 
 
 def population_statistics(population: list[PopulationMember]) -> str:
