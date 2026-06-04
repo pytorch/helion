@@ -48,23 +48,15 @@ def cross_entropy(
     n, v = logits.shape
     losses = torch.zeros([n], dtype=logits.dtype, device=logits.device)
 
-    # Flatten logits once at the beginning
-    logits_flat = logits.view(-1)
-
     for tile_n in hl.tile(n):
         # Get data for this tile
         labels_tile = labels[tile_n]  # [tile_size]
-        base_indices_tile = tile_n.index * v  # [tile_size]
-
-        # Compute the actual flat indices by adding the label offset
-        flat_indices = base_indices_tile + labels_tile
-
-        # Load the logits at the target indices
-        logits_at_target = hl.load(logits_flat, [flat_indices])
 
         # Compute log_softmax for numerical stability
         # Load the full rows for this tile
         logits_rows = logits[tile_n, :]  # [tile_size, V]
+
+        logits_at_target = logits_rows.gather(1, labels_tile.unsqueeze(1)).squeeze(1)
 
         # Compute log-sum-exp
         max_logits = torch.amax(logits_rows, dim=-1, keepdim=True)
