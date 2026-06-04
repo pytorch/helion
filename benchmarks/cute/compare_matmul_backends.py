@@ -13,7 +13,7 @@ baseline. Use quack only to see public-API perf as a torch.compile user would.
 See ``perf_gap_findings.md``.
 
 Each impl runs in a fresh subprocess (so HELION_BACKEND env mutation does not
-leak), with steady-state methodology (2 s thermal warmup, do_bench
+leak), with steady-state methodology (10 s thermal warmup, do_bench
 warmup=1 s + rep=500 ms, 5 runs), and reports best plus mom-median ms/TFLOP/s.
 The gate metric is mom-median TFLOP/s: the median of the five do_bench medians.
 Best-of-N is diagnostic only.
@@ -118,6 +118,9 @@ from helion._compiler.cute.tcgen05_constants import (
     TCGEN05_C_STORE_MODE_SKIP_EPILOGUE_STORE,
 )
 from helion._compiler.cute.tcgen05_constants import TCGEN05_C_STORE_MODES
+from helion._compiler.cute.tcgen05_constants import TCGEN05_CONSUMER_REGS_CHOICES
+from helion._compiler.cute.tcgen05_constants import TCGEN05_CONSUMER_REGS_CONFIG_KEY
+from helion._compiler.cute.tcgen05_constants import TCGEN05_CONSUMER_REGS_DEFAULT
 from helion._compiler.cute.tcgen05_constants import TCGEN05_CUBIN_LINEINFO_CONFIG_KEY
 from helion._compiler.cute.tcgen05_constants import (
     TCGEN05_DIAGNOSTIC_INVALID_OUTPUT_CONFIG_KEY,
@@ -912,12 +915,21 @@ def _check_close(
         )
 
 
-def _gpu_warmup(duration_ms: int = 2000) -> None:
+def _gpu_warmup(duration_ms: int = 10000) -> None:
     """Drive the GPU to a stable clock state with sustained matmul work.
 
-    Without this, the first benchmark run after process startup gets
-    artificially good numbers because the GPU has not been clock-cycled
-    into its sustained-load state yet.
+    Without warmup the first benchmark in a new process is at the mercy of
+    the GPU's current clock state, which on B200 ranges from idle (120 MHz)
+    to sustained boost (~1965 MHz) with a ~5-7 s cold-to-boost ramp. The
+    direction of the bias depends on what the GPU was doing before this
+    process started: if the GPU was idle, the first samples are clocked
+    low and the kernel measures artificially slow; if the GPU was recently
+    hot from neighbor activity but is now coasting on residual boost, the
+    first samples measure artificially fast. Either way, the steady-state
+    measurement under sustained load is the canonical number, and the
+    warmup ensures we start there.
+
+    The default 10 s duration covers the cold-to-boost ramp on B200.
     """
     a = torch.randn(4096, 4096, device="cuda", dtype=torch.bfloat16)
     torch.cuda.synchronize()
@@ -936,7 +948,7 @@ def _bench_steady(
     warmup_ms: int,
     rep_ms: int,
     cache_warmup_calls: int = 5,
-    thermal_warmup_ms: int = 2000,
+    thermal_warmup_ms: int = 10000,
 ) -> dict[str, Any]:
     """Steady-state benchmark.
 
@@ -1236,6 +1248,8 @@ def _make_helion_config_from_args(args: argparse.Namespace) -> helion.Config:
             config["tcgen05_warp_spec_scheduler_warps"] = 1
     if args.helion_c_input_warps is not None:
         config[TCGEN05_WARP_SPEC_C_INPUT_WARPS_KEY] = args.helion_c_input_warps
+    if args.helion_consumer_regs is not None:
+        config[TCGEN05_CONSUMER_REGS_CONFIG_KEY] = args.helion_consumer_regs
     if args.helion_persistence_model is not None:
         config["tcgen05_persistence_model"] = args.helion_persistence_model
     if args.helion_acc_producer_mode != TCGEN05_ACC_PRODUCER_MODE_NORMAL:
@@ -1733,6 +1747,8 @@ def _build_subprocess_cmd(args: argparse.Namespace, impl: str) -> list[str]:
             cmd.extend(["--helion-strategy", args.helion_strategy])
         if args.helion_c_input_warps is not None:
             cmd.extend(["--helion-c-input-warps", str(args.helion_c_input_warps)])
+        if args.helion_consumer_regs is not None:
+            cmd.extend(["--helion-consumer-regs", str(args.helion_consumer_regs)])
         if args.helion_persistence_model is not None:
             cmd.extend(["--helion-persistence-model", args.helion_persistence_model])
         if args.helion_l2_swizzle_size is not None:
@@ -4190,6 +4206,8 @@ def _build_two_cta_ncu_profile_command(
             cmd.extend(["--helion-strategy", args.helion_strategy])
         if args.helion_c_input_warps is not None:
             cmd.extend(["--helion-c-input-warps", str(args.helion_c_input_warps)])
+        if args.helion_consumer_regs is not None:
+            cmd.extend(["--helion-consumer-regs", str(args.helion_consumer_regs)])
         if args.helion_persistence_model is not None:
             cmd.extend(["--helion-persistence-model", args.helion_persistence_model])
         cmd.extend(_helion_diagnostic_flag_args(args))
@@ -6270,6 +6288,19 @@ def parse_args() -> argparse.Namespace:
         choices=(0, 1),
         default=None,
         help="Optional tcgen05 C-input warp override for fixed Helion configs.",
+    )
+    parser.add_argument(
+        "--helion-consumer-regs",
+        type=int,
+        choices=TCGEN05_CONSUMER_REGS_CHOICES,
+        default=None,
+        help=(
+            "Optional tcgen05 consumer register-cap override for fixed Helion "
+            "configs. Sets the tcgen05_consumer_regs config key, which "
+            "CuTe codegen emits as cute.arch.setmaxregister_increase(<value>). "
+            "Default None omits the key (CuTe defaults to "
+            f"{TCGEN05_CONSUMER_REGS_DEFAULT})."
+        ),
     )
     parser.add_argument(
         "--helion-persistence-model",
