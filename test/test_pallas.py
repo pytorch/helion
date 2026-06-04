@@ -587,6 +587,39 @@ class TestPallas(TestCase):
         with self.subTest(name="body_vmem_indices"):
             self.assertIn("out_vmem[0, 0, :, :]", code)
 
+    def test_emit_pipeline_nested_matmul_tiled_n(self) -> None:
+        """A tensor indexed by an outer pipeline tile (the RHS column tile ``nt``,
+        read in the inner contraction pipeline) must be sliced to that tile's
+        block, not left at its full N extent."""
+
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def nested_matmul(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+            M, K = a.shape
+            K, N = b.shape
+            out = torch.empty((M, N), dtype=a.dtype, device=a.device)
+            for mt in hl.tile(M):
+                for nt in hl.tile(N):
+                    acc = hl.zeros([mt, nt], dtype=torch.float32)
+                    for kt in hl.tile(K):
+                        acc = acc + torch.matmul(a[mt, kt], b[kt, nt])
+                    out[mt, nt] = acc.to(a.dtype)
+            return out
+
+        torch.manual_seed(0)
+        a = torch.randn(64, 128, device=DEVICE, dtype=torch.bfloat16)
+        # N = 256 > block_n = 128 -> two output-column tiles (nt is an outer
+        # pipeline tile relative to the inner kt contraction pipeline that loads b).
+        b = torch.randn(128, 256, device=DEVICE, dtype=torch.bfloat16)
+        code, out = code_and_output(
+            nested_matmul,
+            (a, b),
+            block_sizes=[32, 128, 128],
+            pallas_loop_type="emit_pipeline",
+        )
+        self.assertIn("pltpu.emit_pipeline", code)
+        expected = a @ b
+        torch.testing.assert_close(out, expected)
+
     def test_output_index_remapping_in_fori_loop(self) -> None:
         total_elements = 8 * 128 * 128
         x = torch.arange(total_elements, device=DEVICE, dtype=torch.bfloat16).view(

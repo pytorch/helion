@@ -1511,6 +1511,16 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
                 else:
                     block_shape_parts.append(str(int(shape[dim_idx])))
                 lambda_parts.append(pid_var)
+            elif bid is not None and state.codegen.active_device_loops.get(bid):
+                # Outer pipeline dim -- slice to that tile's block via its offset
+                bs_var = state.device_function.block_size_var(bid)
+                offset_v = state.codegen.offset_var(bid)
+                assert bs_var is not None  # a pipelined tile always has a block size
+                from .memory_ops import _record_pad_info
+
+                block_shape_parts.append(bs_var)
+                lambda_parts.append(f"({offset_v}) // ({bs_var})")
+                _record_pad_info(state, fake, dim_idx, bid, 0)
             else:
                 idx_meta = (
                     subscript_meta[dim_idx]
