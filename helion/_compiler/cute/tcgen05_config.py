@@ -128,6 +128,10 @@ from .tcgen05_constants import TCGEN05_TARGET7_TVM_FFI_AB_STAGES
 from .tcgen05_constants import TCGEN05_TARGET7_TVM_FFI_BLOCK_K
 from .tcgen05_constants import TCGEN05_TARGET7_TVM_FFI_C_STAGES
 from .tcgen05_constants import TCGEN05_TARGET7_TVM_FFI_SHAPE
+from .tcgen05_constants import TCGEN05_TARGET8_GELU_AB_STAGES
+from .tcgen05_constants import TCGEN05_TARGET8_GELU_BLOCK_K
+from .tcgen05_constants import TCGEN05_TARGET8_GELU_C_STAGES
+from .tcgen05_constants import TCGEN05_TARGET8_GELU_SHAPE
 from .tcgen05_constants import TCGEN05_TARGET9_TVM_FFI_AB_STAGES
 from .tcgen05_constants import TCGEN05_TARGET9_TVM_FFI_BLOCK_K
 from .tcgen05_constants import TCGEN05_TARGET9_TVM_FFI_C_STAGES
@@ -247,6 +251,10 @@ class CuteTcgen05Config:
         # fp16 bias load (cycle 42 P2 fix; cycle 40 perturbation lesson).
         self.bias_matmul_store_fp16_detected: bool = False
         self.bias_relu_matmul_store_detected: bool = False
+        # Plain ``gelu(acc)`` store (no bias, no residual) — cycle-87 T8
+        # (MatmulTarget 27, fp16). Kept separate from bias_residual_gelu
+        # (T12/T28) since those carry add ops before the gelu.
+        self.gelu_matmul_store_detected: bool = False
         self.target1_tvm_ffi_seed_enabled: bool = False
         self.target2_tvm_ffi_seed_enabled: bool = False
         self.target3_tvm_ffi_seed_enabled: bool = False
@@ -254,6 +262,7 @@ class CuteTcgen05Config:
         self.target5_tvm_ffi_seed_enabled: bool = False
         self.target6_tvm_ffi_seed_enabled: bool = False
         self.target7_tvm_ffi_seed_enabled: bool = False
+        self.target8_gelu_seed_enabled: bool = False
         self.target9_tvm_ffi_seed_enabled: bool = False
         self.target10_tvm_ffi_seed_enabled: bool = False
         self.cluster_m_search_choices: tuple[int, ...] | None = None
@@ -448,6 +457,30 @@ class CuteTcgen05Config:
             return
         target_k = TCGEN05_TARGET7_TVM_FFI_SHAPE[2]
         self.target7_tvm_ffi_seed_enabled = True
+        self.cluster_m2_search_constraints = Tcgen05ClusterM2SearchConstraints(
+            static_k=target_k,
+            max_k_tiles=TCGEN05_TWO_CTA_MAX_K_TILES,
+        )
+        self.cluster_m_search_choices = (1, 2)
+        if TCGEN05_TWO_CTA_SEED_PID_TYPE not in self.allowed_pid_types:
+            self.allowed_pid_types = (
+                *self.allowed_pid_types,
+                cast("PidTypeLiteral", TCGEN05_TWO_CTA_SEED_PID_TYPE),
+            )
+
+    def allow_target8_gelu_seed(self) -> None:
+        # T8 (cycle 87, MatmulTarget 27) mirrors T6's two-CTA envelope at
+        # the (1536, 6144, 1536) fp16 problem with a plain ``gelu(acc)``
+        # epilogue. The plain-gelu-store gate is unique to T8 (mutually
+        # exclusive with identity/relu/bias/bias_relu via the chain shape),
+        # and the fp16-pinned shape fact keeps it mutually exclusive with the
+        # bf16 gelu MatmulTargets 4/19 that share the chain shape.
+        if not self.gelu_matmul_store_detected:
+            return
+        if not self._has_target8_gelu_matmul_fact():
+            return
+        target_k = TCGEN05_TARGET8_GELU_SHAPE[2]
+        self.target8_gelu_seed_enabled = True
         self.cluster_m2_search_constraints = Tcgen05ClusterM2SearchConstraints(
             static_k=target_k,
             max_k_tiles=TCGEN05_TWO_CTA_MAX_K_TILES,
@@ -854,6 +887,22 @@ class CuteTcgen05Config:
             and fact.static_k == target_k
             and fact.lhs_dtype == torch.bfloat16
             and fact.rhs_dtype == torch.bfloat16
+            for fact in self.config_spec.matmul_facts
+        )
+
+    def _has_target8_gelu_matmul_fact(self) -> bool:
+        # T8 is fp16-only at the (1536, 6144, 1536) plain-gelu shape. The
+        # fp16 pin is what keeps the seed mutually exclusive with the bf16
+        # gelu MatmulTargets 4 (2048x4096x2048) and 19 (3072x3072x3072) that
+        # share the plain-gelu chain shape detected by
+        # ``host_function_has_tcgen05_gelu_matmul_store_pattern``.
+        target_m, target_n, target_k = TCGEN05_TARGET8_GELU_SHAPE
+        return any(
+            fact.static_m == target_m
+            and fact.static_n == target_n
+            and fact.static_k == target_k
+            and fact.lhs_dtype == torch.float16
+            and fact.rhs_dtype == torch.float16
             for fact in self.config_spec.matmul_facts
         )
 
@@ -1423,6 +1472,88 @@ class CuteTcgen05Config:
         }
         return Config(**seed_config)
 
+    def _target8_gelu_seed_config(self) -> Config | None:
+        if not self.target8_gelu_seed_enabled:
+            return None
+        # T8 (cycle 87, MatmulTarget 27) is a plain ``gelu(acc)`` store with
+        # no auxiliary tensor at the (1536, 6144, 1536) fp16 shape. Unlike the
+        # bf16 two-CTA seeds (T1-T9) and the T10 fp16 bias seed, T8 uses the
+        # DEFAULT epilogue layout and the normal (non-FFI) launch path: the
+        # ``explicit_epi_tile`` overrides + ``tvm_ffi_launch`` / flat-role
+        # codegen path is gated bf16-only (and fp16 only for the T10 2048³
+        # bias envelope) in ``cute_mma.py`` ``_emit_mma_pipeline``, so it
+        # rejects a fp16 gelu store. The cycle-86/87 force-config win
+        # (``256x256x128, ab=3``, ~649 TF mom-median) was measured on this
+        # plain default-layout config, so the seed reproduces exactly that.
+        # The plain-gelu-store gate keeps it mutually exclusive with
+        # identity/relu/bias/bias_relu stores; the fp16-pinned shape fact
+        # keeps it mutually exclusive with the bf16 gelu MatmulTargets 4/19
+        # that share the chain shape.
+        if self.aux_kernel_detected:
+            return None
+        if not self.gelu_matmul_store_detected:
+            return None
+        if not self._has_target8_gelu_matmul_fact():
+            return None
+        constraints = self.cluster_m2_search_constraints
+        if constraints is None or constraints.allow_edge_k_tail_family:
+            return None
+        if TCGEN05_TWO_CTA_SEED_PID_TYPE not in self.allowed_pid_types:
+            return None
+        if len(self.config_spec.block_sizes) != 3:
+            return None
+        if self.config_spec.indexing.length != 3:
+            return None
+        if not self.cluster_m2_bk_is_valid(TCGEN05_TARGET8_GELU_BLOCK_K, constraints):
+            return None
+        if not self.ab_stages_three_fits(
+            bm=TCGEN05_TWO_CTA_BLOCK_M,
+            bn=TCGEN05_TWO_CTA_BLOCK_N,
+            bk=TCGEN05_TARGET8_GELU_BLOCK_K,
+            cluster_m=2,
+            ab_stages=TCGEN05_TARGET8_GELU_AB_STAGES,
+        ):
+            return None
+        range_count = len(self.config_spec.range_unroll_factors)
+        # T8 uses the validated two-CTA tile/stage envelope (256x256x128,
+        # ab=3, acc=2, c=2, cluster_m=2) at the DEFAULT epilogue layout;
+        # ``l2_groupings=[2]`` is inherited from the two-CTA envelope pending
+        # a dedicated T8 sweep.
+        seed_config: dict[str, Any] = {
+            "block_sizes": [
+                TCGEN05_TWO_CTA_BLOCK_M,
+                TCGEN05_TWO_CTA_BLOCK_N,
+                TCGEN05_TARGET8_GELU_BLOCK_K,
+            ],
+            "indexing": [
+                "tensor_descriptor",
+                "tensor_descriptor",
+                "tensor_descriptor",
+            ],
+            "l2_groupings": [2],
+            "loop_orders": [[0, 1]],
+            "num_stages": 4,
+            "num_warps": 8,
+            "pid_type": TCGEN05_TWO_CTA_SEED_PID_TYPE,
+            "range_flattens": [None] * range_count,
+            "range_multi_buffers": [None] * range_count,
+            "range_num_stages": [0] * range_count,
+            "range_unroll_factors": [1] * range_count,
+            "range_warp_specializes": [None] * range_count,
+            "tcgen05_cluster_m": 2,
+            "tcgen05_cluster_n": 1,
+            "tcgen05_ab_stages": TCGEN05_TARGET8_GELU_AB_STAGES,
+            "tcgen05_acc_stages": 2,
+            "tcgen05_c_stages": TCGEN05_TARGET8_GELU_C_STAGES,
+            TCGEN05_L2_SWIZZLE_SIZE_CONFIG_KEY: 1,
+            "tcgen05_num_epi_warps": 4,
+            TCGEN05_STRATEGY_CONFIG_KEY: Tcgen05Strategy.ROLE_LOCAL_MONOLITHIC.value,
+            TCGEN05_PERSISTENCE_MODEL_CONFIG_KEY: (
+                Tcgen05PersistenceModel.STATIC_PERSISTENT.value
+            ),
+        }
+        return Config(**seed_config)
+
     def _target10_tvm_ffi_seed_config(self) -> Config | None:
         if not self.target10_tvm_ffi_seed_enabled:
             return None
@@ -1607,6 +1738,9 @@ class CuteTcgen05Config:
         target7_tvm_ffi_seed = self._target7_tvm_ffi_seed_config()
         if target7_tvm_ffi_seed is not None:
             seeds.append(target7_tvm_ffi_seed)
+        target8_gelu_seed = self._target8_gelu_seed_config()
+        if target8_gelu_seed is not None:
+            seeds.append(target8_gelu_seed)
         target9_tvm_ffi_seed = self._target9_tvm_ffi_seed_config()
         if target9_tvm_ffi_seed is not None:
             seeds.append(target9_tvm_ffi_seed)
@@ -1806,6 +1940,48 @@ class CuteTcgen05Config:
         ):
             config[TCGEN05_AUX_LOAD_MODE_CONFIG_KEY] = TCGEN05_AUX_LOAD_MODE_SIMT
 
+    def _fix_aux_tma_full_tile_search_config(self, config: dict[str, object]) -> None:
+        # Cycle 88 (Workstream B): on the residual full-tile cluster_m=2
+        # family (T20/T14/T25/T28 — exact-shape-gated by
+        # ``_aux_tma_full_tile_search_enabled``), project every cluster_m=2
+        # candidate onto the validated aux-TMA producer regime
+        # (role_local_with_scheduler + scheduler/c-input warp + ab=2 +
+        # aux_load_mode=tma). Clean force-config measurements show aux-TMA
+        # strictly beats the same-config SIMT control on this family (T20
+        # 962.6 vs 844.0 TF = +14%; T25 730.8 vs 324.7 TF = +125%) and also
+        # beats the autotuner's default monolithic-ab=3 SIMT pick (T20 ~915
+        # TF). Without this projection the population search either keeps the
+        # monolithic-ab=3 SIMT region (T20 reliably) or randomly lands on a
+        # catastrophic SIMT cluster_m=2 pick (T25 variance: 756 aux-TMA vs 286
+        # SIMT), so the +2.4-14 pp aux-TMA gain is not banked deterministically.
+        # This is the aux-TMA analogue of the cycle-87
+        # ``_fix_target8_gelu_search_config`` projection. Tightly bounded:
+        # cluster_m=1 candidates are left untouched (search still explores
+        # them), the edge+K-tail T12 family keeps its own
+        # ``_aux_tma_edge_search_enabled`` CLC path, and the gate fires only
+        # when ``exact_shape_aux_kernel_detected`` is True (residual subset
+        # only — no non-residual target is perturbed).
+        if not self.search_enabled:
+            return
+        if not self._aux_tma_full_tile_search_enabled():
+            return
+        if config.get("tcgen05_cluster_m") != 2:
+            return
+        if not self._is_validated_cluster_m2_full_tile_search_candidate(config):
+            return
+        # ab=2 is the aux-TMA producer's validated stage depth for this family
+        # (the aux SMEM ring forces ab<=2 under the 232 KB B200 cap; the
+        # cycle-86/88 measurements ran at ab=2). ``_c_input_seed_config``
+        # already emits exactly this regime as a seed, so the shape envelope
+        # validated above is sufficient — no extra SMEM-fit check is needed.
+        config[TCGEN05_STRATEGY_CONFIG_KEY] = (
+            Tcgen05Strategy.ROLE_LOCAL_WITH_SCHEDULER.value
+        )
+        config[TCGEN05_WARP_SPEC_SCHEDULER_WARPS_KEY] = 1
+        config[TCGEN05_WARP_SPEC_C_INPUT_WARPS_KEY] = 1
+        config["tcgen05_ab_stages"] = 2
+        config[TCGEN05_AUX_LOAD_MODE_CONFIG_KEY] = TCGEN05_AUX_LOAD_MODE_TMA
+
     @staticmethod
     def _is_with_scheduler_c_input_config(config: dict[str, object]) -> bool:
         return (
@@ -1876,6 +2052,7 @@ class CuteTcgen05Config:
             or self._is_target5_tvm_ffi_seed_config(config)
             or self._is_target6_tvm_ffi_seed_config(config)
             or self._is_target7_tvm_ffi_seed_config(config)
+            or self._is_target8_gelu_seed_config(config)
             or self._is_target9_tvm_ffi_seed_config(config)
             or self._is_target10_tvm_ffi_seed_config(config)
         ):
@@ -2066,6 +2243,32 @@ class CuteTcgen05Config:
             and config.get(TCGEN05_LAYOUT_OVERRIDES_EPI_TILE_M_KEY) == 128
             and config.get(TCGEN05_LAYOUT_OVERRIDES_EPI_TILE_N_KEY) == 32
             and config.get(TCGEN05_LAYOUT_OVERRIDES_D_STORE_BOX_N_KEY) == 32
+        )
+
+    @staticmethod
+    def _is_target8_gelu_seed_config(config: dict[str, object]) -> bool:
+        # T8 (cycle 87, MatmulTarget 27) is the lone fp16 gelu two-CTA seed
+        # that uses the DEFAULT epilogue layout and the normal (non-FFI)
+        # launch path (the explicit-epi-tile / FFI codegen path is bf16-only
+        # except for the T10 fp16 bias envelope). The matcher therefore pins
+        # the validated two-CTA tile/stage envelope at the DEFAULT layout
+        # (no tvm_ffi_launch, no flat-role, no epi-tile overrides). The
+        # plain-gelu-store gate happens upstream.
+        return (
+            config.get(TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY) is not True
+            and config.get(TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY) is not True
+            and config.get("block_sizes")
+            == [
+                TCGEN05_TWO_CTA_BLOCK_M,
+                TCGEN05_TWO_CTA_BLOCK_N,
+                TCGEN05_TARGET8_GELU_BLOCK_K,
+            ]
+            and config.get("tcgen05_ab_stages") == TCGEN05_TARGET8_GELU_AB_STAGES
+            and config.get("tcgen05_c_stages") == TCGEN05_TARGET8_GELU_C_STAGES
+            and config.get("tcgen05_cluster_m") == 2
+            and config.get("tcgen05_cluster_n") == 1
+            and config.get(TCGEN05_LAYOUT_STRATEGY_CONFIG_KEY)
+            in (None, Tcgen05LayoutStrategy.DEFAULT.value)
         )
 
     @staticmethod
@@ -2588,6 +2791,8 @@ class CuteTcgen05Config:
             ab_stages_max = max(3, TCGEN05_TARGET6_TVM_FFI_AB_STAGES)
         elif not for_search and self._target7_tvm_ffi_seed_config() is not None:
             ab_stages_max = max(3, TCGEN05_TARGET7_TVM_FFI_AB_STAGES)
+        elif not for_search and self._target8_gelu_seed_config() is not None:
+            ab_stages_max = max(3, TCGEN05_TARGET8_GELU_AB_STAGES)
         elif not for_search and self._target9_tvm_ffi_seed_config() is not None:
             ab_stages_max = max(3, TCGEN05_TARGET9_TVM_FFI_AB_STAGES)
         elif not for_search and self._target10_tvm_ffi_seed_config() is not None:
@@ -2681,11 +2886,11 @@ class CuteTcgen05Config:
                 config.pop(key, None)
 
     def _fix_target1_tvm_ffi_search_config(self, config: dict[str, object]) -> None:
-        # T1-T7 plus T9-T10 share the TVM-FFI direct-entry promotion
-        # surface; pick the seed matching the detected (shape, store) so
-        # search candidates project onto the right envelope. The
-        # shape+store gates are mutually exclusive so at most one seed
-        # is non-None.
+        # T1-T7 plus T9-T10 share the TVM-FFI direct-entry promotion surface;
+        # pick the seed matching the detected (shape, store) so search
+        # candidates project onto the right envelope. The shape+store gates
+        # are mutually exclusive so at most one seed is non-None. (T8 is
+        # deliberately not in this list — see the note after the chain below.)
         seed = self._target1_tvm_ffi_seed_config()
         if seed is None:
             seed = self._target2_tvm_ffi_seed_config()
@@ -2703,6 +2908,10 @@ class CuteTcgen05Config:
             seed = self._target9_tvm_ffi_seed_config()
         if seed is None:
             seed = self._target10_tvm_ffi_seed_config()
+        # T8 (cycle 87) is intentionally absent: it is a plain DEFAULT-layout
+        # seed that does not use the FFI / explicit-epi-tile promotion surface
+        # (that path is bf16-only / T10-fp16-bias-only), so it must not be
+        # projected onto the FFI envelope here.
         if not self._target1_tvm_ffi_promotion_requested(
             config, seed_enabled=seed is not None
         ):
@@ -2744,6 +2953,47 @@ class CuteTcgen05Config:
             config[TCGEN05_PURE_CLC_SCHEDULER_OBJECT_CONFIG_KEY] = True
         if pure_dynamic_scheduler_requested:
             config[TCGEN05_PURE_DYNAMIC_SCHEDULER_OBJECT_CONFIG_KEY] = True
+
+    def _fix_target8_gelu_search_config(self, config: dict[str, object]) -> None:
+        # Project T8 (cycle 87, MatmulTarget 27) ``cluster_m=2`` search
+        # candidates onto the validated bk=128, ab=3 two-CTA stage tuple at
+        # the DEFAULT epilogue layout. Without this, the for_search
+        # ``tcgen05_ab_stages`` fragment caps ab at 2, so the autotuner never
+        # samples the seed's ab=3 (and lands in the slower bk=64 / ab=2
+        # regime, ~558-578 TF vs the seed's ~650+ TF — the cycle-86/87
+        # coverage gap). This is the plain-config analogue of
+        # ``_fix_target1_tvm_ffi_search_config`` for the bf16 / T10 FFI seeds:
+        # those project onto the FFI envelope, T8 projects onto the plain
+        # DEFAULT-layout envelope (the FFI / explicit-epi-tile path is
+        # bf16-only and rejects a fp16 gelu store). Other tiles (bk=64,
+        # cluster_m=1) are left untouched so the search still explores them.
+        seed = self._target8_gelu_seed_config()
+        if seed is None:
+            return
+        if config.get("tcgen05_cluster_m") != 2:
+            return
+        block_sizes = config.get("block_sizes")
+        if not (
+            isinstance(block_sizes, list)
+            and block_sizes[:3]
+            == [
+                TCGEN05_TWO_CTA_BLOCK_M,
+                TCGEN05_TWO_CTA_BLOCK_N,
+                TCGEN05_TARGET8_GELU_BLOCK_K,
+            ]
+        ):
+            return
+        if not self.ab_stages_three_fits(
+            bm=TCGEN05_TWO_CTA_BLOCK_M,
+            bn=TCGEN05_TWO_CTA_BLOCK_N,
+            bk=TCGEN05_TARGET8_GELU_BLOCK_K,
+            cluster_m=2,
+            ab_stages=TCGEN05_TARGET8_GELU_AB_STAGES,
+        ):
+            return
+        config["tcgen05_ab_stages"] = TCGEN05_TARGET8_GELU_AB_STAGES
+        config["tcgen05_acc_stages"] = 2
+        config["tcgen05_c_stages"] = TCGEN05_TARGET8_GELU_C_STAGES
 
     def aux_load_mode_autotune_fragments(self) -> dict[str, ConfigSpecFragment]:
         if not self._aux_tma_search_enabled():
@@ -3319,6 +3569,8 @@ class CuteTcgen05Config:
         self._fix_cluster_m1_persistent_search_config(config)
         self._fix_ab_stages_three_search_config(config)
         self._fix_target1_tvm_ffi_search_config(config)
+        self._fix_target8_gelu_search_config(config)
+        self._fix_aux_tma_full_tile_search_config(config)
         self._fix_with_scheduler_search_config(config)
         self._fix_aux_tma_search_config(config)
         # CLC admission depends on the projected cluster/pid/strategy tuple

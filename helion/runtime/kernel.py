@@ -537,6 +537,9 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
                     host_function_has_tcgen05_exact_shape_aux_kernel_pattern,
                 )
                 from .._compiler.cute.aux_tensor import (
+                    host_function_has_tcgen05_gelu_matmul_store_pattern,
+                )
+                from .._compiler.cute.aux_tensor import (
                     host_function_has_tcgen05_identity_matmul_store_pattern,
                 )
                 from .._compiler.cute.aux_tensor import (
@@ -578,6 +581,15 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
                 )
                 self.env.config_spec.cute_tcgen05_bias_relu_matmul_store_detected = (
                     host_function_has_tcgen05_bias_relu_matmul_store_pattern(
+                        self.host_function
+                    )
+                )
+                # Plain ``gelu(acc)`` store (no bias, no residual) — cycle-87
+                # T8 (MatmulTarget 27, fp16). Fires on the bf16 gelu
+                # MatmulTargets 4/19 too (same chain shape); the T8 seed's
+                # fp16-pinned shape fact keeps it mutually exclusive there.
+                self.env.config_spec.cute_tcgen05_gelu_matmul_store_detected = (
+                    host_function_has_tcgen05_gelu_matmul_store_pattern(
                         self.host_function
                     )
                 )
@@ -640,6 +652,19 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
                     # bias but has a different shape; T4 shares relu
                     # but a different shape and no bias).
                     self.env.config_spec.allow_tcgen05_target6_tvm_ffi_seed()
+                if self.env.config_spec.cute_tcgen05_gelu_matmul_store_detected:
+                    # T8 (cycle 87, MatmulTarget 27) gates on the plain-gelu-
+                    # store detection (``gelu(acc)`` with no bias and no
+                    # residual) and writes into the same cluster_m=2 search
+                    # constraints + pid_type allowlist used by the other
+                    # two-CTA seeds. The plain-gelu-store detector is mutually
+                    # exclusive with identity (no unary op), relu (relu, not
+                    # gelu), and bias/bias_relu (no add) walkers via the chain
+                    # shape. The bf16 gelu MatmulTargets 4/19 share the chain
+                    # shape so the detector fires on them too, but T8's
+                    # fp16-pinned shape gate (1536x6144x1536) keeps the seed
+                    # mutually exclusive on the matmul fact.
+                    self.env.config_spec.allow_tcgen05_target8_gelu_seed()
                 if not self.env.settings.disable_autotuner_heuristics:
                     for seed_config in self.env.config_spec.autotune_seed_configs():
                         if (

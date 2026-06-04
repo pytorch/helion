@@ -406,12 +406,40 @@ TCGEN05_TARGET9_TVM_FFI_C_STAGES = 2
 # converged on the (ab=3, c=2) stage tuple under the role_local_monolithic
 # strategy with ``c_input_seed=0`` and ``l2_groupings=[2]``; this seed
 # closed the gap on T22 (fp16 2048³ bias) from +21.25% to +3.7% vs Quack.
-# T10 is the first envelope that admits fp16 operands — the per-target
-# fp16 admission gates are scoped to T10's shape so T1-T9 stay bf16-only.
+# T10 is the first TVM-FFI envelope that admits fp16 operands — the per-target
+# fp16 admission gates are scoped to T10's shape so the other FFI seeds
+# (T1-T7, T9) stay bf16-only. (The cycle-87 T8 fp16 plain-gelu seed below is
+# a separate, non-FFI DEFAULT-layout seed and does not use this envelope.)
 TCGEN05_TARGET10_TVM_FFI_SHAPE = (2048, 2048, 2048)
 TCGEN05_TARGET10_TVM_FFI_BLOCK_K = 128
 TCGEN05_TARGET10_TVM_FFI_AB_STAGES = 3
 TCGEN05_TARGET10_TVM_FFI_C_STAGES = 2
+# Validated cycle-87 Target8 envelope (1536x6144x1536 + plain ``gelu(acc)``
+# epilogue, fp16 operands). Unlike the bf16 / T10 FFI seeds, T8 is NOT a
+# TVM-FFI seed: it uses the DEFAULT epilogue layout and the normal (non-FFI)
+# launch path on the bk=128 (ab=3, c=2) two-CTA stage tuple, because the
+# ``explicit_epi_tile`` / ``tvm_ffi_launch`` flat-role codegen path is gated
+# bf16-only (and fp16 only for the T10 2048³ bias envelope) and rejects a
+# fp16 gelu store. This is the medium-square fp16 MatmulTarget 27 coverage
+# gap from the cycle-86 study: the cold autotuner converges on the
+# ``256x256x64, ab=1/2`` (~556-578 TF) regime, but the validated
+# ``256x256x128, ab=3`` two-CTA envelope force-configs to ~649 TF.
+# K=1536 -> k_tile_count=12 (well below the ``TCGEN05_TWO_CTA_MAX_K_TILES``
+# cap; M_tiles*N_tiles = 6*24 = 144 work clusters). The plain-gelu-store gate
+# (``gelu(acc)`` with no bias and no residual) is unique to T8 and mutually
+# exclusive with the identity/relu/bias/bias_relu gates via the chain shape
+# (a single ``_gelu_erf`` unary op between the MMA carrier and the store
+# cast). The bf16 gelu MatmulTargets 4 (2048x4096x2048) and 19
+# (3072x3072x3072) share the same plain-gelu chain shape, so the detector
+# fires on them too, but the fp16-pinned shape fact below keeps the T8 seed
+# mutually exclusive with them (and the bias_residual_gelu MatmulTargets
+# 12/28 are excluded at the chain-shape level because their stores carry bias
+# + residual adds before the gelu). The "target8" slot name is the eighth
+# internal seed slot and is unrelated to MatmulTarget 8.
+TCGEN05_TARGET8_GELU_SHAPE = (1536, 6144, 1536)
+TCGEN05_TARGET8_GELU_BLOCK_K = 128
+TCGEN05_TARGET8_GELU_AB_STAGES = 3
+TCGEN05_TARGET8_GELU_C_STAGES = 2
 
 # Stage tuples that the TVM-FFI direct entry accepts, keyed by ``bk``.
 # The codegen-side ``tcgen05_direct_entry`` source builder and the

@@ -31,6 +31,7 @@ import torch
 
 from ...language import matmul_ops
 from ...language import memory_ops
+from ...language._gelu_tanh_approx import _gelu_erf
 from ..compile_environment import CompileEnvironment
 from .cute_epilogue import _AuxiliaryTensorStep
 from .cute_epilogue import analyze_tcgen05_unary_epilogue_chain
@@ -516,6 +517,35 @@ def host_function_has_tcgen05_relu_matmul_store_pattern(
     """
     return _host_function_has_tcgen05_single_store_pattern(
         host_function, intermediate_op=torch.ops.aten.relu.default
+    )
+
+
+def host_function_has_tcgen05_gelu_matmul_store_pattern(
+    host_function: HostFunction,
+) -> bool:
+    """Return True only for a single plain-``gelu`` + cast store of a matmul.
+
+    Gates the cycle-87 Target 8 TVM-FFI direct-entry seed (MatmulTarget 27,
+    1536x6144x1536 fp16 ``gelu(acc)``). The accepted chain shape is
+    ``mma -> _gelu_erf -> convert -> store`` where ``_gelu_erf`` is the
+    single-FX-node internal op the ``aten.gelu.default`` decomposition
+    materializes for the default (``approximate="none"``) erf GELU — the
+    same form ``torch.nn.functional.gelu(acc)`` produces. Symmetrical to the
+    identity/relu store detectors via
+    ``_host_function_has_tcgen05_single_store_pattern``.
+
+    Mutually exclusive with the identity/relu/bias/bias_relu detectors: the
+    identity walker rejects a unary op in the chain, relu requires
+    ``aten.relu.default`` rather than ``_gelu_erf``, and the bias / bias_relu
+    walkers require an ``aten.add.Tensor`` bias load between the carrier and
+    the store. The bias_residual_gelu MatmulTargets (12/28) carry bias +
+    residual ``add`` ops before the gelu, so their store-feeding cast does
+    not sit directly on a lone ``_gelu_erf`` and is rejected here. This
+    detector does fire on the bf16 gelu MatmulTargets 4/19, but the T8 seed's
+    fp16-pinned shape fact keeps the seed mutually exclusive with them.
+    """
+    return _host_function_has_tcgen05_single_store_pattern(
+        host_function, intermediate_op=_gelu_erf
     )
 
 
