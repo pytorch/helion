@@ -19,13 +19,44 @@ from helion._testing import RefEagerTestDisabled
 from helion._testing import TestCase
 from helion._testing import import_path
 from helion._testing import onlyBackends
-from helion._testing import skipIfCute
 from helion._utils import counters
 from helion.autotuner import LocalAutotuneCache
 from helion.autotuner import StrictLocalAutotuneCache
 from helion.autotuner.base_search import BaseSearch
 from helion.autotuner.remote_cache import RemoteCacheBackend
 import helion.language as hl
+from helion.runtime.settings import _get_backend
+
+
+def _is_cute() -> bool:
+    return _get_backend() == "cute"
+
+
+def _backend_cache_dir_env() -> str:
+    """Env var the active backend uses for its on-disk compile cache."""
+    return "CUTE_DSL_CACHE_DIR" if _is_cute() else "TRITON_CACHE_DIR"
+
+
+def _backend_cache_subdir() -> str:
+    """Per-device cache subdirectory the active backend uses under the
+    Helion cache root."""
+    return "cute" if _is_cute() else "triton"
+
+
+def _backend_cache_artifact(cache_root: Path, key: str) -> Path:
+    """Path of the on-disk artifact named by ``key``.
+
+    Triton stores a directory per key; CuTe stores a ``cute_dsl_<key>.mlir``
+    bytecode file (plus a JSON sidecar).
+    """
+    if _is_cute():
+        return cache_root / f"cute_dsl_{key}.mlir"
+    return cache_root / key
+
+
+def _backend_keep_cache_env() -> str:
+    """Backend-agnostic env var that disables the ephemeral autotune cache."""
+    return "HELION_KEEP_CACHE"
 
 
 class BasicSearch(BaseSearch):
@@ -380,7 +411,6 @@ class TestCache(RefEagerTestDisabled, TestCase):
         config = bound.config_spec.default_config()
         self.assertIsNone(bound.backend_cache_key(config))
 
-    @skipIfCute("CuTe does not use Triton's backend cache key")
     def test_backend_cache_key_after_compilation(self):
         """backend_cache_key returns a base32 string after compilation."""
         import re
@@ -397,7 +427,6 @@ class TestCache(RefEagerTestDisabled, TestCase):
         self.assertGreater(len(key), 0)
         self.assertRegex(key, re.compile(r"^[A-Z2-7]+$"))
 
-    @skipIfCute("CuTe does not use Triton's backend cache key")
     def test_backend_cache_key_stable(self):
         """backend_cache_key returns the same value on repeated calls."""
         kernel, args_a, _result_a, _args_b, _result_b = KERNELS["add"]()
@@ -411,7 +440,6 @@ class TestCache(RefEagerTestDisabled, TestCase):
         self.assertIsNotNone(key1)
         self.assertEqual(key1, key2)
 
-    @skipIfCute("CuTe does not use Triton's backend cache key")
     def test_backend_cache_key_explicit_config(self):
         """backend_cache_key returns the same key with implicit, Config, and dict configs."""
 
@@ -429,9 +457,13 @@ class TestCache(RefEagerTestDisabled, TestCase):
         self.assertEqual(key_implicit, key_config)
         self.assertEqual(key_implicit, key_dict)
 
-    @skipIfCute("CuTe does not use Triton's backend cache key")
     def test_backend_cache_key_matches_cache_directory(self):
-        """backend_cache_key corresponds to an actual directory in the Triton cache."""
+        """backend_cache_key corresponds to an actual on-disk cache artifact.
+
+        Triton stores a directory per key under ``TRITON_CACHE_DIR``; CuTe
+        stores a ``cute_dsl_<key>.mlir`` bytecode file under
+        ``CUTE_DSL_CACHE_DIR``.
+        """
         import pathlib
 
         kernel, args_a, _result_a, _args_b, _result_b = KERNELS["add"]()
@@ -443,13 +475,17 @@ class TestCache(RefEagerTestDisabled, TestCase):
         key = bound.backend_cache_key()
         self.assertIsNotNone(key)
 
-        cache_root = pathlib.Path(os.environ["TRITON_CACHE_DIR"])
-        cache_dir = cache_root / key
-        self.assertTrue(
-            cache_dir.is_dir(), f"Expected cache directory {cache_dir} to exist"
-        )
+        cache_root = pathlib.Path(os.environ[_backend_cache_dir_env()])
+        artifact = _backend_cache_artifact(cache_root, key)
+        if _is_cute():
+            self.assertTrue(
+                artifact.is_file(), f"Expected cache artifact {artifact} to exist"
+            )
+        else:
+            self.assertTrue(
+                artifact.is_dir(), f"Expected cache directory {artifact} to exist"
+            )
 
-    @skipIfCute("CuTe does not use Triton's backend cache key")
     def test_backend_cache_key_written_to_cache_file(self):
         """backend_cache_key is persisted in the .best_config JSON file.
 
@@ -477,42 +513,49 @@ class TestCache(RefEagerTestDisabled, TestCase):
         self.assertIsInstance(data["backend_cache_key"], str)
         self.assertGreater(len(data["backend_cache_key"]), 0)
 
-    @skipIfCute("CuTe does not use Triton's cache directory")
-    def test_triton_cache_dir_set_under_helion_cache(self):
-        """TRITON_CACHE_DIR is set under the Helion cache root after compilation."""
+    def test_backend_cache_dir_set_under_helion_cache(self):
+        """The backend cache dir env is set under the Helion cache root.
+
+        Triton uses ``TRITON_CACHE_DIR`` (under ``<root>/triton``); CuTe uses
+        ``CUTE_DSL_CACHE_DIR`` (under ``<root>/cute``).
+        """
         import pathlib
 
         from helion.autotuner.local_cache import get_helion_cache_dir
+
+        env_name = _backend_cache_dir_env()
+        subdir = _backend_cache_subdir()
 
         kernel, args_a, _result_a, _args_b, _result_b = KERNELS["add"]()
         kernel.reset()
         kernel.settings.autotuner_fn = StrictLocalAutotuneCache[BasicSearch]
 
         with patch.dict(os.environ, {}, clear=False):
-            os.environ.pop("TRITON_CACHE_DIR", None)
+            os.environ.pop(env_name, None)
             kernel(*args_a)
 
-            self.assertIn("TRITON_CACHE_DIR", os.environ)
-            triton_dir = pathlib.Path(os.environ["TRITON_CACHE_DIR"])
+            self.assertIn(env_name, os.environ)
+            cache_dir = pathlib.Path(os.environ[env_name])
             helion_root = get_helion_cache_dir()
             self.assertTrue(
-                triton_dir.is_relative_to(helion_root / "triton"),
-                f"Expected {triton_dir} to be under {helion_root / 'triton'}",
+                cache_dir.is_relative_to(helion_root / subdir),
+                f"Expected {cache_dir} to be under {helion_root / subdir}",
             )
 
-    @skipIfCute("CuTe does not use Triton's cache directory")
-    def test_triton_cache_dir_respects_user_override(self):
-        """User-set TRITON_CACHE_DIR is not overwritten by Helion."""
+    def test_backend_cache_dir_respects_user_override(self):
+        """A user-set backend cache dir env is not overwritten by Helion."""
+        env_name = _backend_cache_dir_env()
+
         kernel, args_a, _result_a, _args_b, _result_b = KERNELS["add"]()
         kernel.reset()
         kernel.settings.autotuner_fn = StrictLocalAutotuneCache[BasicSearch]
 
         with (
             tempfile.TemporaryDirectory() as user_dir,
-            patch.dict(os.environ, {"TRITON_CACHE_DIR": user_dir}),
+            patch.dict(os.environ, {env_name: user_dir}),
         ):
             kernel(*args_a)
-            self.assertEqual(os.environ["TRITON_CACHE_DIR"], user_dir)
+            self.assertEqual(os.environ[env_name], user_dir)
 
     def test_cache_key_includes_backend(self):
         """Different backends produce different cache key hashes."""
@@ -561,9 +604,17 @@ class TestCache(RefEagerTestDisabled, TestCase):
             CapturingSearch.captured_env.get("TRITON_STORE_BINARY_ONLY"), "0"
         )
 
-    @skipIfCute("CuTe does not use Triton's cache directory")
-    def test_ephemeral_triton_cache(self):
-        """Autotuning with multiple candidates keeps only the winner."""
+    def test_ephemeral_backend_cache(self):
+        """Autotuning with multiple candidates keeps only the winner.
+
+        The candidate compilations write to an ephemeral cache dir that is
+        discarded; only the winning config's artifact lands in the real cache.
+        Works for both the Triton (TRITON_CACHE_DIR, dir-per-key) and CuTe
+        (CUTE_DSL_CACHE_DIR, ``cute_dsl_<key>.mlir`` + sidecar) caches.
+        """
+        env_name = _backend_cache_dir_env()
+        subdir = _backend_cache_subdir()
+
         kernel, args_a, result_a, _args_b, _result_b = KERNELS["add"]()
 
         kernel.reset()
@@ -572,9 +623,9 @@ class TestCache(RefEagerTestDisabled, TestCase):
             tempfile.TemporaryDirectory() as baseline_tmp,
             patch.dict(os.environ, {"HELION_CACHE_DIR": baseline_tmp}),
         ):
-            os.environ.pop("TRITON_CACHE_DIR", None)
+            os.environ.pop(env_name, None)
             kernel(*args_a)
-            baseline_cache = Path(baseline_tmp) / "triton" / "0"
+            baseline_cache = Path(baseline_tmp) / subdir / "0"
             baseline_count = len(list(baseline_cache.iterdir()))
 
         kernel.reset()
@@ -583,27 +634,31 @@ class TestCache(RefEagerTestDisabled, TestCase):
             tempfile.TemporaryDirectory() as tmp,
             patch.dict(os.environ, {"HELION_CACHE_DIR": tmp}),
         ):
-            os.environ.pop("TRITON_CACHE_DIR", None)
+            os.environ.pop(env_name, None)
             result = kernel(*args_a)
             torch.testing.assert_close(result, result_a, rtol=1e-2, atol=5e-2)
 
-            triton_cache = Path(tmp) / "triton" / "0"
-            self.assertTrue(triton_cache.exists())
-            entries = [p for p in triton_cache.iterdir() if not p.name.startswith(".")]
+            backend_cache = Path(tmp) / subdir / "0"
+            self.assertTrue(backend_cache.exists())
+            entries = [p for p in backend_cache.iterdir() if not p.name.startswith(".")]
             self.assertEqual(len(entries), baseline_count)
 
             bound = kernel.bind(args_a)
             cache_key = bound.backend_cache_key()
             self.assertIsNotNone(cache_key)
-            self.assertTrue((triton_cache / cache_key).exists())
+            self.assertTrue(_backend_cache_artifact(backend_cache, cache_key).exists())
 
             kernel.reset()
             result2 = kernel(*args_a)
             torch.testing.assert_close(result2, result_a, rtol=1e-2, atol=5e-2)
 
-    @skipIfCute("CuTe does not use Triton's cache directory")
-    def test_keep_triton_cache_disables_ephemeral(self):
-        """HELION_KEEP_TRITON_CACHE=1 writes all candidates to the real cache."""
+    def test_keep_backend_cache_disables_ephemeral(self):
+        """The keep-cache env (HELION_KEEP_{TRITON,CUTE}_CACHE=1) writes all
+        candidates to the real cache instead of an ephemeral one."""
+        env_name = _backend_cache_dir_env()
+        subdir = _backend_cache_subdir()
+        keep_env = _backend_keep_cache_env()
+
         kernel, args_a, result_a, _args_b, _result_b = KERNELS["add"]()
         kernel.reset()
         kernel.settings.autotuner_fn = StrictLocalAutotuneCache[MultiConfigSearch]
@@ -612,22 +667,24 @@ class TestCache(RefEagerTestDisabled, TestCase):
             tempfile.TemporaryDirectory() as tmp,
             patch.dict(
                 os.environ,
-                {"HELION_CACHE_DIR": tmp, "HELION_KEEP_TRITON_CACHE": "1"},
+                {"HELION_CACHE_DIR": tmp, keep_env: "1"},
             ),
         ):
-            os.environ.pop("TRITON_CACHE_DIR", None)
+            os.environ.pop(env_name, None)
             result = kernel(*args_a)
             torch.testing.assert_close(result, result_a, rtol=1e-2, atol=5e-2)
 
-            triton_cache = Path(tmp) / "triton" / "0"
-            self.assertEqual(os.environ.get("TRITON_CACHE_DIR"), str(triton_cache))
-            self.assertTrue(triton_cache.exists())
-            entries = [p for p in triton_cache.iterdir() if not p.name.startswith(".")]
+            backend_cache = Path(tmp) / subdir / "0"
+            self.assertEqual(os.environ.get(env_name), str(backend_cache))
+            self.assertTrue(backend_cache.exists())
+            entries = [p for p in backend_cache.iterdir() if not p.name.startswith(".")]
             self.assertGreaterEqual(len(entries), 2)
 
-    @skipIfCute("CuTe does not use Triton's cache directory")
-    def test_ephemeral_triton_cache_minimized_config(self):
+    def test_ephemeral_backend_cache_minimized_config(self):
         """Ephemeral cache works when the autotuner returns a minimized config."""
+        env_name = _backend_cache_dir_env()
+        subdir = _backend_cache_subdir()
+
         kernel, args_a, result_a, _args_b, _result_b = KERNELS["add"]()
         kernel.reset()
         kernel.settings.autotuner_fn = StrictLocalAutotuneCache[MinimizingBasicSearch]
@@ -636,19 +693,19 @@ class TestCache(RefEagerTestDisabled, TestCase):
             tempfile.TemporaryDirectory() as tmp,
             patch.dict(os.environ, {"HELION_CACHE_DIR": tmp}),
         ):
-            os.environ.pop("TRITON_CACHE_DIR", None)
+            os.environ.pop(env_name, None)
             result = kernel(*args_a)
             torch.testing.assert_close(result, result_a, rtol=1e-2, atol=5e-2)
 
-            triton_cache = Path(tmp) / "triton" / "0"
-            self.assertTrue(triton_cache.exists())
-            entries = [p for p in triton_cache.iterdir() if not p.name.startswith(".")]
+            backend_cache = Path(tmp) / subdir / "0"
+            self.assertTrue(backend_cache.exists())
+            entries = [p for p in backend_cache.iterdir() if not p.name.startswith(".")]
             self.assertGreaterEqual(len(entries), 1)
 
             bound = kernel.bind(args_a)
             cache_key = bound.backend_cache_key()
             self.assertIsNotNone(cache_key)
-            self.assertTrue((triton_cache / cache_key).exists())
+            self.assertTrue(_backend_cache_artifact(backend_cache, cache_key).exists())
 
 
 instantiate_parametrized_tests(TestCache)

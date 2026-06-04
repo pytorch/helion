@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import ast
-import base64
 import contextlib
 import dataclasses
 import functools
@@ -9,10 +8,8 @@ import inspect
 import itertools
 import logging
 import operator
-import os
 import re
 import sys
-import tempfile
 import textwrap
 import types
 from typing import TYPE_CHECKING
@@ -42,7 +39,6 @@ from .._compat import target_device_capability
 from .._compile_time import measure
 from .._compiler.ast_extension import unparse
 from .._compiler.autotuner_heuristics import compiler_seed_configs
-from .._compiler.backend import TritonBackend
 from .._compiler.compile_environment import CompileEnvironment
 from .._compiler.compile_environment import TensorDescriptorLayoutGuard
 from .._compiler.compile_environment import (
@@ -65,7 +61,6 @@ from .ref_mode import is_ref_mode_enabled
 from .settings import Settings
 
 if TYPE_CHECKING:
-    from collections.abc import Generator
     from collections.abc import Hashable
     from collections.abc import Sequence
 
@@ -777,24 +772,19 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
         )
         if (rv := self._compile_cache.get(config)) is not None:
             return rv
-        if (
-            isinstance(self.env.backend, TritonBackend)
-            and "TRITON_CACHE_DIR" not in os.environ
-        ):
-            from ..autotuner.local_cache import helion_triton_cache_dir
-
-            device_index = (
-                self._env.device.index if self._env.device.index is not None else 0
-            )
-            triton_dir = helion_triton_cache_dir(device_index)
-            os.environ["TRITON_CACHE_DIR"] = triton_dir
-            log.debug("Set TRITON_CACHE_DIR=%s", triton_dir)
+        device_index = (
+            self._env.device.index if self._env.device.index is not None else 0
+        )
+        self.env.backend.setup_compile_cache_dir(device_index)
         try:
             triton_code = self.to_triton_code(
                 config, emit_repro_caller=self.settings.print_output_code
             )
             with measure("BoundKernel.PyCodeCache.load"):
                 module = PyCodeCache.load(triton_code)
+            self.env.backend.annotate_compiled_module(
+                module, triton_code, self.kernel.name
+            )
         except Exception:
             log.warning(
                 "Helion compiler triton codegen error for %s",
@@ -868,50 +858,6 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
         with self.env:
             return self.host_function.debug_str()
 
-    @contextlib.contextmanager
-    def _ephemeral_triton_cache(
-        self,
-    ) -> Generator[None, None, None]:
-        """Redirect Triton cache to a temporary dir during autotuning.
-
-        All candidate compilations write to an ephemeral directory that is
-        deleted on exit.  The winning config is recompiled afterward into the
-        real cache by the caller.
-        """
-        saved = os.environ.get("TRITON_CACHE_DIR")
-        with tempfile.TemporaryDirectory(prefix="helion_autotune_") as ephemeral:
-            os.environ["TRITON_CACHE_DIR"] = ephemeral
-            log.debug("Ephemeral Triton cache: %s", ephemeral)
-            try:
-                yield
-            finally:
-                if saved is not None:
-                    os.environ["TRITON_CACHE_DIR"] = saved
-                else:
-                    os.environ.pop("TRITON_CACHE_DIR", None)
-
-    def _clear_triton_jit_cache(self, config: Config) -> None:
-        """Clear Triton's in-memory JIT cache for the compiled kernel.
-
-        After autotuning in an ephemeral cache dir, device_caches on the
-        JITFunction still holds the compiled binary.  Clearing it forces
-        Triton to recompile (and write to TRITON_CACHE_DIR) on the next call.
-
-        If the config was minimized by the autotuner, the lookup is retried
-        with the full config (defaults merged back in).
-        """
-        compiled_fn = self._compile_cache.get(config)
-        if compiled_fn is None:
-            default = self.config_spec.default_config()
-            # pyrefly: ignore [bad-argument-type]
-            full_config = Config(**(default.config | config.config))
-            compiled_fn = self._compile_cache.get(full_config)
-        if compiled_fn is None:
-            return
-        triton_jit_fn = compiled_fn.__globals__.get(f"_helion_{self.kernel.name}")
-        if triton_jit_fn is not None and hasattr(triton_jit_fn, "device_caches"):
-            triton_jit_fn.device_caches.clear()
-
     def autotune(
         self,
         args: Sequence[object],
@@ -936,26 +882,12 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
         Returns:
             Config: The best configuration found during autotuning.
         """
-        use_ephemeral = (
-            isinstance(self.env.backend, TritonBackend)
-            and os.environ.get("HELION_KEEP_TRITON_CACHE", "") != "1"
-        )
-        ctx = (
-            self._ephemeral_triton_cache()
-            if use_ephemeral
-            else contextlib.nullcontext()
-        )
+        ephemeral = self.env.backend.make_ephemeral_cache()
+        ctx = ephemeral if ephemeral is not None else contextlib.nullcontext()
         with ctx:
             config = self.env.backend.autotune(self, args, force=force, **kwargs)
-        if use_ephemeral:
-            self._clear_triton_jit_cache(config)
-            evict = config
-            if self._compile_cache.pop(evict, None) is None:
-                default = self.config_spec.default_config()
-                # pyrefly: ignore [bad-argument-type]
-                evict = Config(**(default.config | config.config))
-                self._compile_cache.pop(evict, None)
-            self._cache_path_map.pop(evict, None)
+        if ephemeral is not None:
+            self.env.backend.finalize_ephemeral_cache(self, config)
         self.set_config(config)
         return config
 
@@ -1194,7 +1126,9 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
 
         For the Triton backend, this is the base32 encoding of the SHA-256
         hash that Triton uses to cache compiled GPU binaries under
-        ``TRITON_CACHE_DIR/<key>/``.
+        ``TRITON_CACHE_DIR/<key>/``.  For the CuTe backend, it is the base32
+        encoding of the SHA-256 hash of the compiled IR module, which names the
+        ``CUTE_DSL_CACHE_DIR/<key>.mlir`` artifact.
 
         Args:
             config: The configuration to look up. Defaults to the implicit config.
@@ -1203,34 +1137,13 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
             str | None: The cache key, or None if the kernel hasn't been
             JIT-compiled yet or the backend doesn't support cache keys.
         """
-        if not isinstance(self.env.backend, TritonBackend):
-            return None
-
         if config is None:
             config = self._require_implicit_config()
         config = self._normalize_config(config)
         compiled_fn = self._compile_cache.get(config)
         if compiled_fn is None:
             return None
-
-        # Get the jit_fn that - for helion - starts with _helion_
-        triton_jit_fn = compiled_fn.__globals__.get(f"_helion_{self.kernel.name}")
-        if triton_jit_fn is None:
-            return None
-
-        try:
-            for cache_tuple in triton_jit_fn.device_caches.values():
-                compiled_kernels = cache_tuple[0]
-                for compiled_kernel in compiled_kernels.values():
-                    h = getattr(compiled_kernel, "hash", None)
-                    if h is not None:
-                        return base64.b32encode(bytes.fromhex(h)).decode().rstrip("=")
-        except (AttributeError, IndexError, TypeError, ValueError):
-            # device_caches, cache-tuple layout, and CompiledKernel.hash are
-            # Triton-internal details that may change across Triton versions
-            # return None gracefully if this fails
-            return None
-        return None
+        return self.env.backend.compiled_cache_key(self, compiled_fn)
 
     def maybe_log_repro(
         self,

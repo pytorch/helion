@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import base64
 from contextlib import suppress
 import contextvars
 from dataclasses import dataclass
+import hashlib
 import importlib
 import inspect
+import json
 import linecache
 import os
 import sys
@@ -2929,30 +2932,143 @@ class _CompiledCuteLauncher:
     bypasses the per-launch ``@cute.jit`` argument-handling/dispatch path,
     matching Quack's pattern (see ``gemm_tvm_ffi_utils.py``). On B200 this
     collapses ~200ms of per-launch host overhead into ~0.1ms.
+
+    When ``cache_key`` is provided, the lowered IR module of the compiled
+    kernel is persisted under ``CUTE_DSL_CACHE_DIR`` and reloaded on a later
+    process, skipping recompilation.  ``cute.compile`` forces the CuTe DSL's
+    own ``no_cache=True`` path, so Helion drives the on-disk cache itself: it
+    writes the post-pass ``ir_module`` bytecode (plus a small JSON sidecar
+    holding the mangled entry symbol) and, on a hit, reconstructs a runnable
+    ``CudaDialectJitCompiledFunction`` by JIT-loading the stored module.
+    Any failure in the cache layer falls back to a plain ``cute.compile``.
     """
 
-    __slots__ = ("_compile_options", "_compiled", "_jit_func")
+    __slots__ = ("_cache_key", "_compile_options", "_compiled", "_jit_func")
 
-    def __init__(self, jit_func: object, compile_options: str | None) -> None:
+    def __init__(
+        self,
+        jit_func: object,
+        compile_options: str | None,
+        cache_key: str | None = None,
+    ) -> None:
         self._jit_func = jit_func
         self._compile_options = compile_options
         self._compiled: object = None
+        self._cache_key = cache_key
 
     def __call__(self, *args: object) -> object:
         compiled = self._compiled
         if compiled is None:
             import cutlass.cute as cute
 
-            if self._compile_options is None:
-                compiled = cute.compile(self._jit_func, *args)
-            else:
-                compiled = cute.compile(
-                    self._jit_func,
-                    *args,
-                    options=self._compile_options,
-                )
+            compiled = None
+            if self._cache_key is not None:
+                compiled = self._reload_from_disk()
+            if compiled is None:
+                if self._compile_options is None:
+                    compiled = cute.compile(self._jit_func, *args)
+                else:
+                    compiled = cute.compile(
+                        self._jit_func,
+                        *args,
+                        options=self._compile_options,
+                    )
+                if self._cache_key is not None:
+                    self._persist_to_disk(compiled)
             self._compiled = compiled
         return cast("Any", compiled)(*args)
+
+    def _cache_file_paths(self) -> tuple[str, str, str]:
+        from cutlass.base_dsl.cache_helpers import get_default_generated_ir_path
+
+        cache_dir = get_default_generated_ir_path("CUTE_DSL")
+        mlir = os.path.join(cache_dir, f"cute_dsl_{self._cache_key}.mlir")
+        meta = os.path.join(cache_dir, f"cute_dsl_{self._cache_key}.json")
+        return cache_dir, mlir, meta
+
+    def _persist_to_disk(self, compiled: object) -> None:
+        with suppress(Exception):
+            from cutlass.base_dsl.cache_helpers import save_ir
+            from cutlass.base_dsl.cache_helpers import write_bytecode_with_crc32
+
+            ir_module = getattr(compiled, "ir_module", None)
+            function_name = getattr(compiled, "function_name", None)
+            if ir_module is None or function_name is None:
+                return
+            cache_dir, _mlir, meta = self._cache_file_paths()
+            os.makedirs(cache_dir, exist_ok=True)
+            save_ir(
+                "CUTE_DSL",
+                ir_module,
+                str(self._cache_key),
+                output_dir=cache_dir,
+                as_bytecode=True,
+                bytecode_writer=lambda f: write_bytecode_with_crc32(f, ir_module),
+            )
+            # Atomic sidecar with the mangled entry symbol (process-dependent,
+            # so it cannot be recomputed and must be stored alongside the IR).
+            tmp = f"{meta}.tmp.{os.getpid()}"
+            with open(tmp, "w") as f:
+                json.dump(
+                    {
+                        "function_name": function_name,
+                        "has_gpu_module": bool(
+                            getattr(compiled, "has_gpu_module", True)
+                        ),
+                    },
+                    f,
+                )
+            os.replace(tmp, meta)
+
+    def _reload_from_disk(self) -> object:
+        try:
+            from cutlass.base_dsl.cache_helpers import load_ir
+            from cutlass.base_dsl.cache_helpers import read_bytecode_and_check_crc32
+            from cutlass.cutlass_dsl.cuda_jit_executor import (
+                CudaDialectJitCompiledFunction,
+            )
+            from cutlass.cutlass_dsl.cutlass import CuTeDSL
+
+            _cache_dir, mlir, meta = self._cache_file_paths()
+            if not (os.path.exists(mlir) and os.path.exists(meta)):
+                return None
+            with open(meta) as f:
+                metadata = json.load(f)
+            function_name = metadata["function_name"]
+            # The parsed Module holds an internal reference to the ir.Context
+            # that load_ir opened, so it stays valid after load_ir returns even
+            # though its ``with ir.Context()`` block has already exited.
+            _, module = load_ir(
+                mlir,
+                asBytecode=True,
+                bytecode_reader=read_bytecode_and_check_crc32,
+            )
+            dsl = CuTeDSL._get_dsl()
+            engine = dsl.compiler_provider.jit(
+                module, shared_libs=dsl.get_shared_libs()
+            )
+            capi_func = engine.lookup(function_name)
+            # The signature is reconstructable from the wrapper, so it does not
+            # need to be persisted.
+            wrapped = getattr(self._jit_func, "__wrapped__", self._jit_func)
+            signature = inspect.signature(cast("Any", wrapped), eval_str=True)
+            # Empty kernel_info / default extra-arg state is correct only for the
+            # non-experimental ``cute.compile`` path Helion uses here; the
+            # experimental DSL would populate these from module attributes.
+            return CudaDialectJitCompiledFunction(
+                module,
+                engine,
+                capi_func,
+                signature,
+                function_name,
+                {},
+                False,
+                None,
+                has_gpu_module=bool(metadata.get("has_gpu_module", True)),
+            )
+        except Exception:
+            # Any cutlass-internal change or corrupt artifact -> recompile.
+            return None
 
 
 class _CompiledCuteDirectEntryLauncher:
@@ -3120,9 +3236,80 @@ def _get_compiled_cute_launcher(
     if arch_args is not None:
         _ensure_cute_dsl_arch_env(arch_args)
     jit_func = _create_cute_wrapper(cute_kernel, schema_key, block)
-    launcher = _CompiledCuteLauncher(jit_func, compile_options)
+    disk_cache_key = _cute_disk_cache_key(
+        cute_kernel, schema_key, block, wrapper_plans, cluster_shape, compile_options
+    )
+    launcher = _CompiledCuteLauncher(
+        jit_func, compile_options, cache_key=disk_cache_key
+    )
     cache[cache_key] = launcher
     return launcher
+
+
+def _cute_cache_relevant_env() -> tuple[tuple[str, str], ...]:
+    """Return CuTe DSL env vars that can change the compiled IR.
+
+    The CuTe DSL folds *every* one of its ``CUTE_DSL_*`` env vars into its own
+    module hash (e.g. ``CUTE_DSL_ENABLE_ASSERTIONS``, ``CUTE_DSL_LINEINFO``,
+    ``CUTE_DSL_KEEP``, the tvm-ffi flags), so any of them can alter the
+    persisted artifact.  We snapshot the whole set (so future flags are covered
+    too) and only exclude the cache *location* ``CUTE_DSL_CACHE_DIR`` — that
+    selects where artifacts live (autotuning uses an ephemeral dir) and must not
+    affect the key.  Including an env var that does not actually affect codegen
+    only costs an occasional missed cache hit, never a wrong-kernel reload.
+    """
+    return tuple(
+        sorted(
+            (k, v)
+            for k, v in os.environ.items()
+            if k.startswith("CUTE_DSL_") and k != "CUTE_DSL_CACHE_DIR"
+        )
+    )
+
+
+def _cute_disk_cache_key(
+    cute_kernel: object,
+    schema_key: tuple[tuple[object, ...], ...],
+    block: tuple[int, int, int],
+    wrapper_plans: tuple[object, ...],
+    cluster_shape: object,
+    compile_options: str | None,
+) -> str | None:
+    """Compute a stable cross-process key for the on-disk CuTe compile cache.
+
+    Returns ``None`` (disabling the on-disk cache) when the generated-source
+    hash is unavailable.  The key must be computable *before* the kernel is
+    compiled (so a hit can skip recompilation), so it is derived from the
+    inputs that determine the lowered IR rather than from the IR itself:
+    generated device-kernel source, full input specialization (dtypes, ranks,
+    baked shapes/strides, constexpr values), launch shape (block/cluster), CuTe
+    compile options, the IR-affecting ``CUTE_DSL_*`` env vars (target SM arch
+    among them), and the cutlass version.
+    """
+    source_hash = getattr(cute_kernel, "_helion_cute_source_hash", None)
+    if source_hash is None:
+        return None
+    try:
+        import cutlass
+
+        cutlass_version = getattr(cutlass, "__version__", "")
+    except Exception:
+        cutlass_version = ""
+    payload = repr(
+        (
+            "helion-cute-cache-v1",
+            source_hash,
+            schema_key,
+            block,
+            wrapper_plans,
+            repr(cluster_shape),
+            compile_options or "",
+            _cute_cache_relevant_env(),
+            cutlass_version,
+        )
+    )
+    digest = hashlib.sha256(payload.encode("utf-8")).digest()
+    return base64.b32encode(digest).decode().rstrip("=")
 
 
 _CUTE_LAUNCHER_IMPORTS: tuple[object, ...] | None = None
