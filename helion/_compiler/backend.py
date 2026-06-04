@@ -3253,6 +3253,8 @@ class CuteBackend(Backend):
             "_cute_fp8e4m3fn_to_float32": "from helion._compiler.cute.quantized_helpers import fp8e4m3fn_to_float32 as _cute_fp8e4m3fn_to_float32",
             "_cute_float4_e2m1fn_x2_to_float32": "from helion._compiler.cute.quantized_helpers import float4_e2m1fn_x2_to_float32 as _cute_float4_e2m1fn_x2_to_float32",
             "_cute_grid_barrier": "from helion._compiler.cute.grid_barrier import grid_barrier as _cute_grid_barrier",
+            "_cute_atomic_max_float32": "from helion._compiler.cute.atomic_helpers import atomic_max_float32 as _cute_atomic_max_float32",
+            "_cute_atomic_min_float32": "from helion._compiler.cute.atomic_helpers import atomic_min_float32 as _cute_atomic_min_float32",
         }
 
     def program_id_expr(self, dim: int, *, index_dtype: str) -> str:
