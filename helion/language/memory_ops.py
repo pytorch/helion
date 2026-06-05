@@ -168,18 +168,21 @@ def store(
     index: list[object],
     value: torch.Tensor | torch.SymInt | float,
     extra_mask: torch.Tensor | None = None,
+    cache_modifier: str | None = None,
 ) -> None:
     """Store a value to a tensor using a list of indices.
 
     This function is equivalent to `tensor[index] = value` but allows
     setting `extra_mask=` to mask elements beyond the default masking
-    based on the hl.tile range.
+    based on the hl.tile range. It also accepts an optional `cache_modifier`
+    which is forwarded to Triton `tl.store` (e.g., ".wt").
 
     Args:
         tensor: The tensor / stack tensor to store to
         index: The indices to use to index into the tensor
         value: The value to store
         extra_mask: The extra mask (beyond automatic tile bounds masking) to apply to the tensor
+        cache_modifier: Optional Triton store cache modifier to hint cache behavior
     Returns:
         None
     """
@@ -192,11 +195,13 @@ def _(
     index: list[object],
     value: torch.Tensor | torch.SymInt | float,
     extra_mask: torch.Tensor | None = None,
+    cache_modifier: str | None = None,
 ) -> tuple[
     torch.Tensor | tuple,
     list[object],
     torch.Tensor | torch.SymInt | float | int,
     torch.Tensor | None,
+    str | None,
 ]:
     from .tile_proxy import Tile
 
@@ -205,10 +210,10 @@ def _(
     index = Tile._tiles_to_sizes_for_index(index)
 
     if isinstance(tensor, StackTensor):
-        return (tuple(tensor), index, value, extra_mask)
+        return (tuple(tensor), index, value, extra_mask, cache_modifier)
 
     if isinstance(tensor, torch.Tensor):
-        return (tensor, index, value, extra_mask)
+        return (tensor, index, value, extra_mask, cache_modifier)
 
     raise NotImplementedError(f"Cannot store to type: {type(tensor)}")
 
@@ -219,6 +224,7 @@ def _(
     index: list[object],
     value: torch.Tensor | torch.SymInt | float,
     extra_mask: torch.Tensor | None = None,
+    cache_modifier: str | None = None,
 ) -> None:
     return None
 
@@ -231,6 +237,10 @@ def _(state: CodegenState) -> ast.AST:
     value = state.ast_arg(2)
     extra_mask = state.ast_args[3]
     assert isinstance(extra_mask, (type(None), ast.AST))
+    cache_modifier = state.ast_args[4] if len(state.ast_args) > 4 else None
+    if cache_modifier is not None:
+        assert isinstance(cache_modifier, str)
+        cache_modifier = ast.Constant(value=cache_modifier)
 
     if isinstance(tensor, torch.Tensor):
         device_fn = state.device_function
@@ -257,10 +267,13 @@ def _(state: CodegenState) -> ast.AST:
                 [*subscript],
                 value,
                 extra_mask,
+                cache_modifier,
                 strategy.codegen_store,
             )
 
-        return strategy.codegen_store(state, tensor, [*subscript], value, extra_mask)
+        return strategy.codegen_store(
+            state, tensor, [*subscript], value, extra_mask, cache_modifier
+        )
     if isinstance(tensor, tuple):
         from .._compiler.indexing_strategy import StackIndexingStrategy
 
@@ -271,7 +284,13 @@ def _(state: CodegenState) -> ast.AST:
         assert len(stack_tensor_ast) == 2
         _tensor_like_ast, dev_ptrs_ast = stack_tensor_ast
         return StackIndexingStrategy.codegen_store(
-            state, tensor, dev_ptrs_ast, [*subscript], value, extra_mask
+            state,
+            tensor,
+            dev_ptrs_ast,
+            [*subscript],
+            value,
+            extra_mask,
+            cache_modifier,
         )
     raise NotImplementedError(f"Cannot store to type: {type(tensor)}")
 
@@ -315,6 +334,9 @@ def _(state: CodegenState) -> None:
     subscript = state.proxy_arg(1)
     assert isinstance(subscript, (list, tuple))
     value = state.ast_arg(2)
+    cache_modifier = state.ast_args[4] if len(state.ast_args) > 4 else None
+    if cache_modifier is not None:
+        raise exc.BackendUnsupported("pallas", "store cache_modifier")
     assert isinstance(tensor, torch.Tensor)
     name = state.device_function.tensor_arg(tensor).name
     name = pallas_codegen.vmem_name(state, name)
@@ -5637,6 +5659,9 @@ def _(state: CodegenState) -> ast.AST:
     value = state.ast_arg(2)
     extra_mask = state.ast_args[3]
     assert isinstance(extra_mask, (type(None), ast.AST))
+    cache_modifier = state.ast_args[4] if len(state.ast_args) > 4 else None
+    if cache_modifier is not None:
+        raise exc.BackendUnsupported("metal", "store cache_modifier")
 
     if isinstance(tensor, torch.Tensor):
         device_fn = state.device_function
@@ -5644,7 +5669,9 @@ def _(state: CodegenState) -> ast.AST:
         indexing_idx = device_fn.device_memory_op_index
         device_fn.device_memory_op_index += 1
         strategy = device_fn.get_indexing_strategy(indexing_idx)
-        return strategy.codegen_store(state, tensor, [*subscript], value, extra_mask)
+        return strategy.codegen_store(
+            state, tensor, [*subscript], value, extra_mask, None
+        )
     raise exc.BackendUnsupported("metal", f"store target type: {type(tensor)}")
 
 
@@ -5717,6 +5744,9 @@ def _(state: CodegenState) -> ast.AST:
     raw_value = state.ast_args[2]
     extra_mask = state.ast_args[3]
     assert isinstance(extra_mask, (type(None), ast.AST))
+    cache_modifier = state.ast_args[4] if len(state.ast_args) > 4 else None
+    if cache_modifier is not None:
+        raise exc.BackendUnsupported("cute", "store cache_modifier")
     value_node = None
     if state.fx_node is not None and len(state.fx_node.args) > 2:
         maybe_value_node = state.fx_node.args[2]
@@ -6004,6 +6034,7 @@ def _(
     index: list[object],
     value: torch.Tensor | torch.SymInt | float,
     extra_mask: torch.Tensor | None = None,
+    cache_modifier: str | None = None,
 ) -> None:
     from .ref_tile import RefTile
 
@@ -6088,6 +6119,7 @@ def load(
     index: list[object],
     extra_mask: torch.Tensor | None = None,
     eviction_policy: str | None = None,
+    cache_modifier: str | None = None,
 ) -> torch.Tensor:
     """Load a value from a tensor using a list of indices.
 
@@ -6095,13 +6127,16 @@ def load(
     setting `extra_mask=` to mask elements beyond the default masking
     based on the hl.tile range. It also accepts an optional
     `eviction_policy` which is forwarded to the underlying Triton `tl.load`
-    call to control the cache eviction behavior (e.g., "evict_last").
+    call to control the cache eviction behavior (e.g., "evict_last"), and an
+    optional `cache_modifier` which is forwarded to Triton `tl.load`
+    (e.g., ".cg").
 
     Args:
         tensor: The tensor / stack tensor to load from
         index: The indices to use to index into the tensor
         extra_mask: The extra mask (beyond automatic tile bounds masking) to apply to the tensor
         eviction_policy: Optional Triton load eviction policy to hint cache behavior
+        cache_modifier: Optional Triton load cache modifier to hint cache behavior
     Returns:
         torch.Tensor: The loaded value
     """
@@ -6114,14 +6149,21 @@ def _(
     index: list[object],
     extra_mask: torch.Tensor | None = None,
     eviction_policy: str | None = None,
-) -> tuple[torch.Tensor | tuple, list[object], torch.Tensor | None, str | None]:
+    cache_modifier: str | None = None,
+) -> tuple[
+    torch.Tensor | tuple,
+    list[object],
+    torch.Tensor | None,
+    str | None,
+    str | None,
+]:
     from .tile_proxy import Tile
 
     index = Tile._tiles_to_sizes_for_index(index)
     if isinstance(tensor, StackTensor):
-        return (tuple(tensor), index, extra_mask, eviction_policy)
+        return (tuple(tensor), index, extra_mask, eviction_policy, cache_modifier)
     assert isinstance(tensor, torch.Tensor)
-    return (tensor, index, extra_mask, eviction_policy)
+    return (tensor, index, extra_mask, eviction_policy, cache_modifier)
 
 
 @_decorators.register_fake(load)
@@ -6130,6 +6172,7 @@ def _(
     index: list[object],
     extra_mask: torch.Tensor | None = None,
     eviction_policy: str | None = None,
+    cache_modifier: str | None = None,
 ) -> torch.Tensor:
     if isinstance(tensor, torch.Tensor):
         target_shape = SubscriptIndexing.compute_shape(tensor, index)
@@ -6196,6 +6239,7 @@ def _(state: CodegenState) -> ast.AST:
     extra_mask = state.ast_args[2]
     assert isinstance(extra_mask, (type(None), ast.AST))
     eviction_policy = state.ast_args[3] if len(state.ast_args) > 3 else None
+    cache_modifier = state.ast_args[4] if len(state.ast_args) > 4 else None
 
     device_fn = state.device_function
     load_idx = device_fn.device_load_index
@@ -6211,6 +6255,9 @@ def _(state: CodegenState) -> ast.AST:
     if eviction_policy is not None:
         assert isinstance(eviction_policy, str)
         eviction_policy = ast.Constant(value=eviction_policy)
+    if cache_modifier is not None:
+        assert isinstance(cache_modifier, str)
+        cache_modifier = ast.Constant(value=cache_modifier)
 
     if isinstance(tensor, torch.Tensor):
         tile_index_result = _maybe_materialize_tile_index_load(state, tensor, subscript)
@@ -6229,11 +6276,12 @@ def _(state: CodegenState) -> ast.AST:
                 [*subscript],
                 extra_mask,
                 eviction_policy,
+                cache_modifier,
                 strategy.codegen_load,
             )
 
         return strategy.codegen_load(
-            state, tensor, [*subscript], extra_mask, eviction_policy
+            state, tensor, [*subscript], extra_mask, eviction_policy, cache_modifier
         )
     if isinstance(tensor, tuple):
         from .._compiler.indexing_strategy import StackIndexingStrategy
@@ -6245,7 +6293,13 @@ def _(state: CodegenState) -> ast.AST:
         assert len(stack_tensor_ast) == 2
         tensor_like_ast, dev_ptrs_ast = stack_tensor_ast
         return StackIndexingStrategy.codegen_load(
-            state, tensor, dev_ptrs_ast, [*subscript], extra_mask, eviction_policy
+            state,
+            tensor,
+            dev_ptrs_ast,
+            [*subscript],
+            extra_mask,
+            eviction_policy,
+            cache_modifier,
         )
     raise NotImplementedError(f"Unsupported tensor type: {type(tensor)}")
 
@@ -6256,6 +6310,9 @@ def _(state: CodegenState) -> ast.AST:
     subscript = state.proxy_arg(1)
     assert isinstance(tensor, torch.Tensor)
     assert isinstance(subscript, (list, tuple))
+    cache_modifier = state.ast_args[4] if len(state.ast_args) > 4 else None
+    if cache_modifier is not None:
+        raise exc.BackendUnsupported("pallas", "load cache_modifier")
 
     tile_index_result = _maybe_materialize_tile_index_load(state, tensor, subscript)
     if tile_index_result is not None:
@@ -6278,6 +6335,9 @@ def _(state: CodegenState) -> ast.AST:
     assert isinstance(extra_mask, (type(None), ast.AST))
     eviction_policy = state.ast_args[3] if len(state.ast_args) > 3 else None
     assert isinstance(eviction_policy, (type(None), ast.AST))
+    cache_modifier = state.ast_args[4] if len(state.ast_args) > 4 else None
+    if cache_modifier is not None:
+        raise exc.BackendUnsupported("metal", "load cache_modifier")
 
     if isinstance(tensor, torch.Tensor):
         device_fn = state.device_function
@@ -6286,7 +6346,7 @@ def _(state: CodegenState) -> ast.AST:
         device_fn.device_memory_op_index += 1
         strategy = device_fn.get_indexing_strategy(indexing_idx)
         return strategy.codegen_load(
-            state, tensor, [*subscript], extra_mask, eviction_policy
+            state, tensor, [*subscript], extra_mask, eviction_policy, None
         )
     raise exc.BackendUnsupported("metal", f"load tensor type: {type(tensor)}")
 
@@ -6339,6 +6399,9 @@ def _(state: CodegenState) -> object:
     assert isinstance(ast_subscript, (list, tuple))
     extra_mask = state.ast_args[2]
     assert isinstance(extra_mask, (type(None), ast.AST))
+    cache_modifier = state.ast_args[4] if len(state.ast_args) > 4 else None
+    if cache_modifier is not None:
+        raise exc.BackendUnsupported("cute", "load cache_modifier")
 
     if isinstance(tensor, tuple):
         stack_tensor_ast = state.ast_args[0]
@@ -6567,6 +6630,7 @@ def _(
     index: list[object],
     extra_mask: torch.Tensor | None = None,
     eviction_policy: str | None = None,
+    cache_modifier: str | None = None,
 ) -> torch.Tensor:
     from .ref_tile import RefTile
 
