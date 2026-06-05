@@ -1289,6 +1289,13 @@ class PopulationBasedSearch(BaseSearch):
         if len(candidates) < 2:
             return best
 
+        # TPU/Pallas: re-rank by per-call on-device µs when available; else fall
+        # back to the absolute-median rebench.
+        device_micros_bench = self._resolve_device_micros_paired_bench()
+        if device_micros_bench is not None:
+            return self._run_final_pick_verification_device_micros(
+                best, candidates, device_micros_bench=device_micros_bench
+            )
         return self._rebench_and_pick(best, candidates)
 
     def _rebench_and_pick(
@@ -1317,6 +1324,91 @@ class PopulationBasedSearch(BaseSearch):
         if self._final_pick_supported():
             best = self.run_final_pick_verification(best)
         return best.config
+
+    def _resolve_device_micros_paired_bench(
+        self,
+    ) -> Callable[..., list[tuple[float, float]]] | None:
+        """Paired device-µs bench from the backend, or None.
+
+        Pallas/TPU returns a ``jax.profiler`` closure (per-call on-chip µs) when
+        ``static_shapes`` is on and ``HELION_AUTOTUNE_PALLAS_RANK_BY=device_time`` (the
+        default); other backends and the ``wall_time`` opt-out return None.
+        """
+        # settings/config_spec are unset on the minimal final-pick test scaffolds;
+        # real searches always have them.
+        settings = getattr(self, "settings", None)
+        config_spec = getattr(self, "config_spec", None)
+        if settings is None or config_spec is None or not settings.static_shapes:
+            return None
+        return config_spec.backend.get_paired_device_micros_bench()
+
+    def _run_final_pick_verification_device_micros(
+        self,
+        best: PopulationMember,
+        candidates: list[PopulationMember],
+        *,
+        device_micros_bench: Callable[..., list[tuple[float, float]]],
+    ) -> PopulationMember:
+        """Re-rank the cohort by per-call on-chip µs instead of wall-clock.
+
+        ``device_micros_bench`` returns ``(device_micros, delta-vs-best)`` per candidate;
+        per-call device µs isn't masked by the ~125µs dispatch overhead. Picks the
+        smallest delta (tie-broken by absolute device µs). Device µs is not folded
+        into ``perfs`` (those are wall-clock ms). Falls back to the absolute-median
+        rebench on any error.
+        """
+        if len(self.benchmark_provider.mutated_arg_indices) > 0:
+            benchmark_args = _clone_args(
+                self.args,
+                self.kernel.env.process_group_name,
+                idx_to_clone=self.benchmark_provider.mutated_arg_indices,
+            )
+        else:
+            benchmark_args = self.args
+        candidate_fns: list[Callable[..., object]] = [
+            functools.partial(member.fn, *benchmark_args) for member in candidates
+        ]
+        reference_fn: Callable[..., object] = functools.partial(
+            best.fn, *benchmark_args
+        )
+        desc = (
+            "Final-pick verification device_micros"
+            if self.settings.autotune_progress_bar
+            else None
+        )
+        try:
+            results = device_micros_bench(candidate_fns, reference_fn, desc=desc)
+        except Exception as err:
+            self.log(f"Device-µs re-rank failed ({err!r}); falling back to rebench.")
+            return self._rebench_and_pick(best, candidates)
+
+        # results[i] == (absolute device µs, paired delta vs best).
+        device_micros_by_slot = [device_micros for device_micros, _ in results]
+        delta_by_slot = [delta for _, delta in results]
+        if not any(math.isfinite(u) and math.isfinite(d) for u, d in results):
+            self.log(
+                "Device-µs re-rank got no finite readings; falling back to rebench."
+            )
+            return self._rebench_and_pick(best, candidates)
+
+        def _device_key(slot: int) -> tuple[float, float]:
+            delta, device_micros = delta_by_slot[slot], device_micros_by_slot[slot]
+            if not math.isfinite(delta) or not math.isfinite(device_micros):
+                return (inf, inf)
+            return (delta, device_micros)
+
+        best_slot = min(range(len(candidates)), key=_device_key)
+        if not math.isfinite(delta_by_slot[best_slot]):
+            return best
+        best_member = candidates[best_slot]
+
+        if best_member is not best:
+            self.log(
+                f"Final-pick re-picked {best_member.config} (delta "
+                f"{delta_by_slot[best_slot]:+.3f}µs, absolute "
+                f"{device_micros_by_slot[best_slot]:.3f}µs) over {best.config}"
+            )
+        return best_member
 
 
 def population_statistics(population: list[PopulationMember]) -> str:

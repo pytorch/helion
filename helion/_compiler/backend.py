@@ -345,6 +345,18 @@ class Backend(abc.ABC):
         """
         return None
 
+    def get_paired_device_micros_bench(
+        self,
+    ) -> Callable[..., list[tuple[float, float]]] | None:
+        """Paired device-µs bench for the autotune final-pick re-rank, or None.
+
+        Backends that can cheaply report per-call on-device µs override this to
+        return a callable ``fn(candidates, reference, *, desc) ->
+        list[(candidate_device_micros, paired_delta_micros)]``. The default returns None,
+        leaving final-pick on its wall-clock rebench.
+        """
+        return None
+
     def supports_precompile(self) -> bool:
         """Whether this backend supports subprocess precompilation.
 
@@ -1911,6 +1923,18 @@ class PallasBackend(Backend):
         from ..autotuner.benchmarking import interleaved_bench_generic
 
         return interleaved_bench_generic
+
+    def get_paired_device_micros_bench(
+        self,
+    ) -> Callable[..., list[tuple[float, float]]] | None:
+        """Pallas ``jax.profiler`` device-µs bench for the final-pick re-rank.
+
+        Returns None (keeping the wall-clock rebench) when the user opts out via
+        ``HELION_AUTOTUNE_PALLAS_RANK_BY=wall_time`` or ``jax`` is unavailable.
+        """
+        from ..autotuner.benchmarking import make_pallas_paired_device_micros_bench
+
+        return make_pallas_paired_device_micros_bench()
 
     def supports_precompile(self) -> bool:
         return False
