@@ -11,6 +11,7 @@ from torch.testing._internal.common_utils import parametrize
 import helion
 import helion._compat as _compat
 from helion._compat import supports_tensor_descriptor
+from helion._compat import get_tensor_descriptor_fn_name
 from helion._testing import DEVICE
 from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
@@ -19,6 +20,7 @@ from helion._testing import onlyBackends
 from helion._testing import skipIfRefEager
 from helion._testing import skipIfRocm
 from helion._testing import skipIfTileIR
+from helion._testing import skipUnlessTensorDescriptor
 import helion.language as hl
 
 
@@ -53,7 +55,7 @@ class TestEvictionPolicy(RefEagerTestBase, TestCase):
 
         yield
 
-    @parametrize("indexing", ("pointer", "block_ptr", "tensor_descriptor"))
+    @parametrize("indexing", ("pointer", "block_ptr"))
     @skipIfTileIR("tileir backend will ignore `eviction_policy` hint")
     def test_hl_load_eviction_policy_emitted(self, indexing: str):
         with self._indexing_context(indexing):
@@ -71,6 +73,41 @@ class TestEvictionPolicy(RefEagerTestBase, TestCase):
             torch.testing.assert_close(result, x)
             self.assertIn("eviction_policy", code)
             self.assertIn("evict_last", code)
+
+    @skipUnlessTensorDescriptor("Tensor descriptor support is required")
+    @skipIfTileIR("tileir backend will ignore `eviction_policy` hint")
+    def test_explicit_eviction_policy_ignored_for_tensor_descriptor(self):
+        @helion.kernel(config={"indexing": "tensor_descriptor", "block_size": [8, 16]})
+        def copy_with_eviction(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile_m, tile_n in hl.tile(x.size()):
+                val = hl.load(x, [tile_m, tile_n], eviction_policy="evict_last")
+                out[tile_m, tile_n] = val
+            return out
+
+        x = torch.randn([8, 16], device=DEVICE, dtype=torch.float32)
+        code, result = code_and_output(copy_with_eviction, (x,))
+        torch.testing.assert_close(result, x)
+        self.assertIn(get_tensor_descriptor_fn_name(), code)
+        self.assertNotIn("eviction_policy", code)
+        self.assertNotIn("evict_last", code)
+
+    @skipIfTileIR("tileir backend will ignore `eviction_policy` hint")
+    def test_explicit_eviction_policy_preserved_for_tensor_descriptor_fallback(self):
+        @helion.kernel(config={"indexing": "tensor_descriptor", "block_size": 16})
+        def copy_with_eviction(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile in hl.tile(x.size(0)):
+                val = hl.load(x, [tile], eviction_policy="evict_last")
+                out[tile] = val
+            return out
+
+        x = torch.randn([128], device=DEVICE, dtype=torch.float32)
+        code, result = code_and_output(copy_with_eviction, (x,))
+        torch.testing.assert_close(result, x)
+        self.assertNotIn(get_tensor_descriptor_fn_name(), code)
+        self.assertIn("eviction_policy", code)
+        self.assertIn("evict_last", code)
 
     @skipIfRefEager("Config spec inspection not applicable in ref eager mode")
     @skipIfTileIR("tileir backend will ignore `eviction_policy` hint")

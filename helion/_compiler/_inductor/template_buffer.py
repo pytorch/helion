@@ -611,6 +611,7 @@ class HelionTemplateBuffer(TemplateBuffer):
         subscript: list[object],
         value: ast.expr,
         extra_mask: ast.expr | None,
+        cache_modifier: ast.AST | None,
         codegen_store: Callable[..., ast.expr],
     ) -> ast.expr:
         """Emit per-epilogue index definitions + ``<STORE_OUTPUT_{i}>`` placeholder.
@@ -643,7 +644,9 @@ class HelionTemplateBuffer(TemplateBuffer):
         param_name = state.device_function.tensor_arg(tensor).name
         epilogue_idx = self._fusion_metadata.epilogue_idx_by_param.get(param_name)
         if epilogue_idx is None:
-            return codegen_store(state, tensor, [*subscript], value, extra_mask)
+            return codegen_store(
+                state, tensor, [*subscript], value, extra_mask, cache_modifier
+            )
 
         kernel_val_name = f"_kernel_val_{epilogue_idx}"
 
@@ -714,7 +717,12 @@ class HelionTemplateBuffer(TemplateBuffer):
             state.add_statement(
                 ast.Expr(
                     value=codegen_store(
-                        state, tensor, [*subscript], store_val, extra_mask
+                        state,
+                        tensor,
+                        [*subscript],
+                        store_val,
+                        extra_mask,
+                        cache_modifier,
                     )
                 )
             )
@@ -730,6 +738,7 @@ class HelionTemplateBuffer(TemplateBuffer):
         subscript: list[object],
         extra_mask: ast.expr | None,
         eviction_policy: ast.AST | None,
+        cache_modifier: ast.AST | None,
         codegen_load: Callable[..., ast.expr],
         *,
         prologue_first_indexing: dict[str, str],
@@ -748,7 +757,12 @@ class HelionTemplateBuffer(TemplateBuffer):
         param_name = state.device_function.tensor_arg(tensor).name
         if param_name not in self._fusion_metadata.prologue_fused_params:
             return codegen_load(
-                state, tensor, [*subscript], extra_mask, eviction_policy
+                state,
+                tensor,
+                [*subscript],
+                extra_mask,
+                eviction_policy,
+                cache_modifier,
             )
 
         # Read prologue variable names from kernel (set by _setup_prologue_hook).
