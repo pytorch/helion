@@ -309,27 +309,6 @@ def pallas_add_3d(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
 
 
 @helion.kernel(backend="pallas", static_shapes=True)
-def pallas_nested_non_grid_outer_loop(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
-    """Grid (``tile_m``) → non-grid device loop (``tile_n``) wrapping an
-    inner emit_pipeline (``tile_k``) whose body reads ``w[tile_k, tile_n]``.
-
-    The inner pipeline's BlockSpec for ``w`` has to encode ``tile_n`` —
-    an outer non-grid loop offset — along ``w``'s last dim. Mirrors the
-    epilogue structure of ``squeeze_and_excitation_net``.
-    """
-    m, k = x.size()
-    n = w.size(1)
-    out = torch.empty([m, n], dtype=x.dtype, device=x.device)
-    for tile_m in hl.tile(m):
-        for tile_n in hl.tile(n):
-            acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
-            for tile_k in hl.tile(k):
-                acc = torch.addmm(acc, x[tile_m, tile_k], w[tile_k, tile_n])
-            out[tile_m, tile_n] = acc.to(x.dtype)
-    return out
-
-
-@helion.kernel(backend="pallas", static_shapes=True)
 def pallas_attention(
     q_in: torch.Tensor, k_in: torch.Tensor, v_in: torch.Tensor
 ) -> torch.Tensor:
@@ -1208,19 +1187,34 @@ class TestPallas(TestCase):
         "JAX interpret mode (program_id_p.bind asserts during trace)"
     )
     def test_nested_non_grid_outer_loop_emit_pipeline(self) -> None:
-        """Outer non-grid device loop around an ``emit_pipeline`` whose
-        body reads a tensor indexed by that outer tile compiles and
-        produces correct matmul output.
+        """Grid (``tile_m``) → non-grid device loop (``tile_n``) wrapping
+        an inner emit_pipeline (``tile_k``) whose body reads
+        ``w[tile_k, tile_n]`` compiles and produces correct matmul output.
+        Mirrors the epilogue structure of ``squeeze_and_excitation_net``.
 
         ``n`` must exceed the effective ``bs_n`` (128 lanes on TPU) so the
         inner BlockSpec for ``w`` is actually block-sized rather than
         coincidentally equalling the full ``n`` dim.
         """
+
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def kernel(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+            m, k = x.size()
+            n = w.size(1)
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m in hl.tile(m):
+                for tile_n in hl.tile(n):
+                    acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                    for tile_k in hl.tile(k):
+                        acc = torch.addmm(acc, x[tile_m, tile_k], w[tile_k, tile_n])
+                    out[tile_m, tile_n] = acc.to(x.dtype)
+            return out
+
         m, k, n = 32, 256, 256
         x = torch.randn(m, k, device=DEVICE, dtype=torch.float32)
         w = torch.randn(k, n, device=DEVICE, dtype=torch.float32)
         code, result = code_and_output(
-            pallas_nested_non_grid_outer_loop,
+            kernel,
             (x, w),
             block_sizes=[16, 128, 128],
             pallas_loop_type="emit_pipeline",
