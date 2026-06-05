@@ -283,7 +283,7 @@ class TestBarrier(RefEagerTestBase, TestCase):
             device_ir.register_rollable_reductions()
 
         # Sub-graphs (ReductionLoopGraphInfo) are kept so that
-        # _count_device_loads_and_stores can account for their loads/stores.
+        # _collect_memory_op_facts can account for their loads/stores.
         self.assertEqual(len(device_ir.graphs), original_graph_count + 1)
         self.assertEqual(len(device_ir.rolled_reductions), 1)
         self.assertEqual(len(fake_env.config_spec.reduction_loops), 1)

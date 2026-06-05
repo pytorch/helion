@@ -85,6 +85,29 @@ class MatmulFact(NamedTuple):
     rhs_dtype: torch.dtype
 
 
+class MemoryOpFact(NamedTuple):
+    """Metadata linking one ``Config.indexing`` slot to its graph memory op.
+
+    One entry per load/store, recorded in the same graph-traversal order that
+    sizes ``Config.indexing`` / ``Config.load_eviction_policies`` (see
+    ``_collect_memory_op_facts`` in ``device_ir``), so
+    ``memory_op_facts[i].indexing_index == i`` describes ``config.indexing[i]``.
+
+    Autotuner heuristics use this to reason about *which* load/store a slot is
+    (the row load, a matmul operand, a reused buffer, ...) instead of guessing
+    from a bare positional index.
+    """
+
+    indexing_index: int  # slot in Config.indexing (== position in this list)
+    kind: str  # "load" | "store"
+    eviction_index: int | None  # slot in Config.load_eviction_policies, else None
+    tensor_name: str | None  # host buffer name being accessed, e.g. "x", "weight"
+    dtype: torch.dtype | None  # element dtype of the accessed tensor
+    ndim: int  # rank of the accessed tensor
+    num_reuses: int  # downstream FX consumers of the load (0 for stores)
+    matmul_operand: str | None  # matmul/dot operand: "lhs" | "rhs" | None
+
+
 def shrink_block_sizes_for_numel_constraints(
     constraints: list[TensorNumelConstraint],
     block_sizes: list[int],
@@ -339,6 +362,7 @@ class ConfigSpec:
         self.autotuner_heuristics: list[str] = []
         self.matmul_facts: list[MatmulFact] = []
         self.store_indices: list[int] = []
+        self.memory_op_facts: list[MemoryOpFact] = []
         self.backend_tunable_fragments = self.backend.tunable_fragments()
         unknown_tunables = set(self.backend_tunable_fragments) - BACKEND_TUNABLE_KEYS
         if unknown_tunables:
