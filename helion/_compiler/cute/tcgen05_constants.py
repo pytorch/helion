@@ -389,6 +389,19 @@ TCGEN05_CONSUMER_REGS_CONFIG_KEY = "tcgen05_consumer_regs"
 TCGEN05_CONSUMER_REGS_DEFAULT = 256
 TCGEN05_CONSUMER_REGS_CHOICES = (224, 232, 240, 256)
 
+# Producer/consumer ``setmaxregister`` reallocation toggle. The warp-spec
+# split (producers ``setmaxregister_decrease`` to a lean budget, consumers
+# ``setmaxregister_increase`` to a high ceiling) only buys occupancy when the
+# per-thread register count is the occupancy limiter. For the deep-pipeline
+# FP8 GEMMs whose SMEM footprint already pins occupancy to 1 CTA/SM, the
+# ``increase`` ceiling instead makes ``ptxas`` over-allocate and spill (NCU:
+# 255 reg/thread + ~17 KB local-memory spill at bk=128) where the natural
+# allocation fits in ~190 reg with no spill. Setting this False skips emitting
+# both setmaxregister calls so ptxas picks its natural register count. Default
+# True preserves the validated warp-spec emission byte-for-byte.
+TCGEN05_WARP_SPEC_REGISTER_REALLOC_CONFIG_KEY = "tcgen05_warp_spec_register_realloc"
+TCGEN05_WARP_SPEC_REGISTER_REALLOC_DEFAULT = True
+
 # Stage tuples that the TVM-FFI flat-role seed accepts, keyed by ``bk``. The
 # general FFI seed eligibility (``tcgen05_config.py``) consumes this table via
 # ``tcgen05_direct_entry_stage_tuple_allowed``. ``bk=64`` admits the shallow

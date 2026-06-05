@@ -2164,6 +2164,10 @@ def _append_cute_wrapper_plan(
     input_dtype = str(plan["input_dtype"])
     acc_dtype = str(plan["acc_dtype"])
     ab_stage_count = plan_int("ab_stage_count", 2)
+    # B operand majorness. False = MN-major (row-major ``[K, N]``); True =
+    # K-major (column-major ``[K, N]``, the CUTLASS-style FP8 operand). Drives
+    # the MMA operand mode and the ``rhs_tma`` view / dynamic-leading-dim.
+    b_k_major = bool(plan.get("b_k_major", False))
     # Optional ``smem_swizzle_*`` overrides recorded by the device-side
     # codegen when the user opts into a non-default A/B SMEM atom
     # swizzle. When absent the wrapper emits the legacy
@@ -2226,8 +2230,12 @@ def _append_cute_wrapper_plan(
                 f"{input_dtype}, "
                 f"{input_dtype}, "
                 "cute.nvgpu.OperandMajorMode.K, "
-                "cute.nvgpu.OperandMajorMode.MN, "
-                f"{acc_dtype}, "
+                + (
+                    "cute.nvgpu.OperandMajorMode.K, "
+                    if b_k_major
+                    else "cute.nvgpu.OperandMajorMode.MN, "
+                )
+                + f"{acc_dtype}, "
                 f"{cta_group}, "
                 f"({bm}, {bn}), "
                 "cute.nvgpu.tcgen05.OperandSource.SMEM)"
@@ -2238,6 +2246,11 @@ def _append_cute_wrapper_plan(
             ),
             f"    {smem_a_layout} = {smem_a_layout_expr}",
             f"    {smem_b_layout} = {smem_b_layout_expr}",
+            # B is logically ``[K, N]``; TMA wants it presented as ``[N, K]``
+            # (swap shape/stride). The dynamic (non-contiguous) leading dim then
+            # differs by majorness: MN-major (row-major B) is N-contiguous so the
+            # N axis (dim 0 of the [N, K] view) is dynamic; K-major (column-major
+            # B) is K-contiguous so the K axis (dim 1) is dynamic.
             (
                 f"    {rhs_tma} = cute.make_tensor("
                 f"arg{rhs_idx}.iterator, "
@@ -2245,7 +2258,7 @@ def _append_cute_wrapper_plan(
                 f"(arg{rhs_idx}_shape1, arg{rhs_idx}_shape0), "
                 f"stride=(arg{rhs_idx}_stride1, arg{rhs_idx}_stride0)))"
             ),
-            f"    {rhs_tma}.mark_layout_dynamic(leading_dim=0)",
+            f"    {rhs_tma}.mark_layout_dynamic(leading_dim={1 if b_k_major else 0})",
             # ``make_tiled_tma_atom_A`` vs ``_B`` asymmetry:
             # - ``_B`` always passes ``cluster_layout_vmnk.shape`` as
             #   its trailing arg (CuTe's signature for B requires the

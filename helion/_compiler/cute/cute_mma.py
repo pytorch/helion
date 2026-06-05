@@ -96,6 +96,8 @@ from .tcgen05_constants import TCGEN05_SCHED_STAGE_COUNT_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_M
 from .tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_N
 from .tcgen05_constants import TCGEN05_TWO_CTA_EDGE_TMA_STORE_MAX_AB_STAGES
+from .tcgen05_constants import TCGEN05_WARP_SPEC_REGISTER_REALLOC_CONFIG_KEY
+from .tcgen05_constants import TCGEN05_WARP_SPEC_REGISTER_REALLOC_DEFAULT
 from .tcgen05_lifecycle import Tcgen05LifecycleContext
 from .tcgen05_pure_matmul import Tcgen05PureMatmulObjectModel
 
@@ -1064,6 +1066,10 @@ class _PerKiterTmaArgs:
     # full-tile branch and scalar fallback. Non-pipelined/asymmetric or two-CTA
     # TMA paths must keep the guarded fallback path.
     static_full_tiles: bool = False
+    # Cached leader-CTA predicates to avoid redundant special-register reads
+    # in the K-loop. Empty string if not applicable (one-CTA mode).
+    is_leader_cta_var: str = ""
+    is_v_leader_cta_var: str = ""
 
 
 def _kloop_tma_copy_a_src(args: _PerKiterTmaArgs, *, k_offset: str) -> str:
@@ -1107,6 +1113,8 @@ def _tcgen05_two_cta_owner_predicate(
     is_two_cta: bool,
     gate_exec_warp: bool,
     cluster_n: int = 1,
+    is_leader_cta_var: str | None = None,
+    is_v_leader_cta_var: str | None = None,
 ) -> str | None:
     """Owner-of-the-V-pair predicate for AB consumer release / MMA issuance.
 
@@ -1119,15 +1127,25 @@ def _tcgen05_two_cta_owner_predicate(
     must use ``rank % 2 == 0``; rank 2 must commit on its own V-pair's empty
     barrier or the cluster races (cycle-26 hang root cause; see cute_plan.md
     §6.12.3).
+
+    If ``is_leader_cta_var`` or ``is_v_leader_cta_var`` are provided, they
+    are used as cached boolean variables instead of recomputing the predicate
+    inline (avoiding redundant special-register reads in the K-loop).
     """
     predicate_terms = []
     if gate_exec_warp:
         predicate_terms.append(exec_active)
     if is_two_cta:
         if cluster_n > 1:
-            predicate_terms.append(_TCGEN05_V_LEADER_PREDICATE)
+            # Use cached variable if available, otherwise fall back to inline expression
+            predicate_terms.append(
+                is_v_leader_cta_var if is_v_leader_cta_var else _TCGEN05_V_LEADER_PREDICATE
+            )
         else:
-            predicate_terms.append(_TCGEN05_CLUSTER_LEADER_PREDICATE)
+            # Use cached variable if available, otherwise fall back to inline expression
+            predicate_terms.append(
+                is_leader_cta_var if is_leader_cta_var else _TCGEN05_CLUSTER_LEADER_PREDICATE
+            )
     if not predicate_terms:
         return None
     return " and ".join(predicate_terms)
@@ -1230,6 +1248,8 @@ def _build_kloop_pipeline_consumer_if(
             is_two_cta=args.is_two_cta,
             gate_exec_warp=gate_exec_warp,
             cluster_n=args.cluster_n,
+            is_leader_cta_var=args.is_leader_cta_var or None,
+            is_v_leader_cta_var=args.is_v_leader_cta_var or None,
         ),
         indent="" if args.static_full_tiles else "    ",
     )
@@ -1266,6 +1286,8 @@ def _build_kloop_pipeline_consumer_prefetch_stmts(
         is_two_cta=args.is_two_cta,
         gate_exec_warp=gate_exec_warp,
         cluster_n=args.cluster_n,
+        is_leader_cta_var=args.is_leader_cta_var or None,
+        is_v_leader_cta_var=args.is_v_leader_cta_var or None,
     )
     if owner_predicate is not None:
         predicate = f"{predicate} and {owner_predicate}"
@@ -1308,6 +1330,8 @@ def _build_kloop_pipeline_release_if(
         is_two_cta=args.is_two_cta,
         gate_exec_warp=gate_exec_warp,
         cluster_n=args.cluster_n,
+        is_leader_cta_var=args.is_leader_cta_var or None,
+        is_v_leader_cta_var=args.is_v_leader_cta_var or None,
     )
     advance_src = emit_pipeline_advance(args.tma_consumer_state)
     indent = "" if args.static_full_tiles else "    "
@@ -1340,6 +1364,8 @@ def _build_tcgen05_mma_accumulate_reset_stmt(
     gate_exec_warp: bool = True,
     is_two_cta: bool = False,
     cluster_n: int = 1,
+    is_leader_cta_var: str | None = None,
+    is_v_leader_cta_var: str | None = None,
 ) -> ast.stmt:
     reset_src = f"{tiled_mma}.set(cute.nvgpu.tcgen05.Field.ACCUMULATE, False)"
     predicate = _tcgen05_two_cta_owner_predicate(
@@ -1347,6 +1373,8 @@ def _build_tcgen05_mma_accumulate_reset_stmt(
         is_two_cta=is_two_cta,
         gate_exec_warp=gate_exec_warp,
         cluster_n=cluster_n,
+        is_leader_cta_var=is_leader_cta_var,
+        is_v_leader_cta_var=is_v_leader_cta_var,
     )
     if predicate is None:
         return statement_from_string(reset_src)
@@ -1364,6 +1392,8 @@ def _build_tcgen05_mma_issue_stmt(
     gate_exec_warp: bool = True,
     is_two_cta: bool = False,
     cluster_n: int = 1,
+    is_leader_cta_var: str | None = None,
+    is_v_leader_cta_var: str | None = None,
 ) -> ast.stmt:
     issue_src = (
         f"for _tcgen05_kblk_idx in range(cute.size({tcgen05_frag_a}, mode=[2])):\n"
@@ -1381,6 +1411,8 @@ def _build_tcgen05_mma_issue_stmt(
         is_two_cta=is_two_cta,
         gate_exec_warp=gate_exec_warp,
         cluster_n=cluster_n,
+        is_leader_cta_var=is_leader_cta_var,
+        is_v_leader_cta_var=is_v_leader_cta_var,
     )
     if predicate is not None:
         issue_src = f"if {predicate}:\n{textwrap.indent(issue_src, '    ')}"
@@ -1826,10 +1858,25 @@ def _emit_mma_pipeline(
     epi_elem_dtype_str = (
         _dtype_map[epi_elem_dtype] if epi_elem_dtype is not None else input_dtype_str
     )
+    # B operand majorness. ``B`` is logically ``[K, N]``. The validated path
+    # is MN-major (N-contiguous, ``stride(1)==1`` -- the row-major ``b[k, n]``
+    # case). CUTLASS-style FP8 GEMMs instead pass ``B`` column-major
+    # (K-contiguous, ``stride(0)==1``), which is K-major: still a perfectly
+    # TMA-loadable layout, but the MMA operand mode and SMEM/TMA tile layout
+    # must switch from ``OperandMajorMode.MN`` to ``OperandMajorMode.K``. Detect
+    # it here so the tiled-mma / smem-layout / TMA-view codegen can follow.
+    tcgen05_b_k_major = (
+        rhs_fake.dim() == 2
+        and rhs_fake.stride(0) == 1
+        and rhs_fake.stride(1) == rhs_fake.shape[0]
+    )
+    # A K-major B is contiguous in the transposed (column-major) sense; treat it
+    # as TMA-loadable rather than bailing to the unvalidated scalar/guard path.
+    rhs_tma_loadable = rhs_fake.is_contiguous() or tcgen05_b_k_major
     tcgen05_use_tma = (
         input_dtype in (torch.float16, torch.bfloat16, torch.float8_e4m3fn)
         and lhs_fake.is_contiguous()
-        and rhs_fake.is_contiguous()
+        and rhs_tma_loadable
     )
     tcgen05_use_tma_a = tcgen05_use_tma
     tcgen05_use_tma_b = tcgen05_use_tma
@@ -2454,6 +2501,10 @@ def _emit_mma_pipeline(
     tcgen05_epi_acc_frag_base = df.new_var("tcgen05_epi_acc_frag_base")
     tcgen05_plan = _new_tcgen05_layout_plan(df) if mma_impl == "tcgen05" else None
     tcgen05_cluster_layout_vmnk = df.new_var("tcgen05_cluster_layout_vmnk")
+    # Cached leader-CTA predicates to avoid redundant special-register reads.
+    # Declared early so they're available for per_tile statement generation.
+    tcgen05_is_leader_cta = df.new_var("tcgen05_is_leader_cta")
+    tcgen05_is_v_leader_cta = df.new_var("tcgen05_is_v_leader_cta")
 
     # === outer_prefix: MMA setup + shared memory alloc + accumulator init ===
     prefix = device_loop.outer_prefix
@@ -2596,6 +2647,8 @@ def _emit_mma_pipeline(
                 is_two_cta=tcgen05_is_two_cta,
                 gate_exec_warp=False,
                 cluster_n=tcgen05_cluster_n,
+                is_leader_cta_var=tcgen05_is_leader_cta if tcgen05_is_two_cta else None,
+                is_v_leader_cta_var=tcgen05_is_v_leader_cta if tcgen05_is_two_cta else None,
             )
             assert ab_consumer_prefetch_owner_predicate is not None
             _emit_per_tile(
@@ -2631,6 +2684,8 @@ def _emit_mma_pipeline(
             tiled_mma=tiled_mma,
             is_two_cta=tcgen05_is_two_cta,
             cluster_n=tcgen05_cluster_n,
+            is_leader_cta_var=tcgen05_is_leader_cta if tcgen05_is_two_cta else None,
+            is_v_leader_cta_var=tcgen05_is_v_leader_cta if tcgen05_is_two_cta else None,
         )
         prefix.append(reset_accumulate_stmt)
         per_tile_stmts.append(reset_accumulate_stmt)
@@ -3021,6 +3076,8 @@ def _emit_mma_pipeline(
             is_two_cta=tcgen05_is_two_cta,
             gate_exec_warp=True,
             cluster_n=tcgen05_cluster_n,
+            is_leader_cta_var=tcgen05_is_leader_cta if tcgen05_is_two_cta else None,
+            is_v_leader_cta_var=tcgen05_is_v_leader_cta if tcgen05_is_two_cta else None,
         )
         candidate_block_shape = tcgen05_matmul_plan.block_shape
         df.cute_state.register_tcgen05_matmul_plan(tcgen05_matmul_plan)
@@ -3115,6 +3172,7 @@ def _emit_mma_pipeline(
                 bm,
                 bn,
                 tcgen05_cluster_m=tcgen05_cluster_m,
+                tcgen05_b_k_major=tcgen05_b_k_major,
             )
         )
     else:
@@ -3249,20 +3307,33 @@ def _emit_mma_pipeline(
             # gate as ``aux_stages``), so T1-T7 stay byte-identical at
             # the 256 default.
             consumer_regs_value = _tcgen05_consumer_regs_from_config(df.config)
-            prefix.append(
-                statement_from_string(
-                    f"if not ({consumer_predicate}):\n"
-                    f"    cute.arch.setmaxregister_decrease("
-                    f"{_TCGEN05_PRODUCER_REGS})"
-                )
+            # The producer/consumer setmaxregister split only improves
+            # occupancy when registers are the occupancy limiter. For the
+            # deep-pipeline FP8 GEMMs whose SMEM footprint already pins
+            # occupancy at 1 CTA/SM, forcing the consumer ``increase`` ceiling
+            # makes ptxas over-allocate and spill where the natural allocation
+            # fits with no spill. ``tcgen05_warp_spec_register_realloc=False``
+            # skips both calls; default True keeps the validated emission.
+            tcgen05_emit_register_realloc = _tcgen05_config_bool(
+                df.config,
+                TCGEN05_WARP_SPEC_REGISTER_REALLOC_CONFIG_KEY,
+                TCGEN05_WARP_SPEC_REGISTER_REALLOC_DEFAULT,
             )
-            prefix.append(
-                statement_from_string(
-                    f"if {consumer_predicate}:\n"
-                    f"    cute.arch.setmaxregister_increase("
-                    f"{consumer_regs_value})"
+            if tcgen05_emit_register_realloc:
+                prefix.append(
+                    statement_from_string(
+                        f"if not ({consumer_predicate}):\n"
+                        f"    cute.arch.setmaxregister_decrease("
+                        f"{_TCGEN05_PRODUCER_REGS})"
+                    )
                 )
-            )
+                prefix.append(
+                    statement_from_string(
+                        f"if {consumer_predicate}:\n"
+                        f"    cute.arch.setmaxregister_increase("
+                        f"{consumer_regs_value})"
+                    )
+                )
             prefix.append(
                 statement_from_string(
                     # tcgen05 tiled_mma slicing is CTA-scoped, not per-thread.
@@ -3290,6 +3361,7 @@ def _emit_mma_pipeline(
                     bm,
                     bn,
                     tcgen05_cluster_m=tcgen05_cluster_m,
+                    tcgen05_b_k_major=tcgen05_b_k_major,
                 )
             )
         else:
@@ -3307,6 +3379,7 @@ def _emit_mma_pipeline(
                     bm,
                     bn,
                     tcgen05_cluster_m=tcgen05_cluster_m,
+                    tcgen05_b_k_major=tcgen05_b_k_major,
                 )
             )
     if mma_impl == "tcgen05":
@@ -3930,6 +4003,9 @@ def _emit_mma_pipeline(
                 "ab_stage_count": tcgen05_ab_stage_count_value,
                 "input_dtype": input_dtype_str,
                 "acc_dtype": acc_dtype_str,
+                # B operand majorness (False = MN-major row-major [K,N];
+                # True = K-major column-major [K,N], the CUTLASS-style operand).
+                "b_k_major": tcgen05_b_k_major,
                 # B1 (cycle-3 review): plumb the validated problem
                 # shape onto the AB plan so the direct-entry plan can
                 # carry an envelope identity that the runtime
@@ -4091,6 +4167,24 @@ def _emit_mma_pipeline(
                         f"{tcgen05_cluster_layout_vmnk}.get_flat_coord({tma_cta_rank_in_cluster})"
                     )
                 )
+                # Cache the leader-CTA predicate to avoid redundant special-register reads
+                # in the K-loop. With use_2cta=True cluster_n=1, the cluster-leader rank 0
+                # is the only V-leader; with cluster_n>1 both ranks {0,2} are V-leaders.
+                if tcgen05_is_two_cta:
+                    if tcgen05_cluster_n > 1:
+                        prefix.append(
+                            statement_from_string(
+                                f"{tcgen05_is_v_leader_cta} = "
+                                f"{tma_cta_rank_in_cluster} % cutlass.Int32(2) == cutlass.Int32(0)"
+                            )
+                        )
+                    else:
+                        prefix.append(
+                            statement_from_string(
+                                f"{tcgen05_is_leader_cta} = "
+                                f"{tma_cta_rank_in_cluster} == cutlass.Int32(0)"
+                            )
+                        )
                 if tcgen05_is_two_cta:
                     prefix.append(
                         statement_from_string(
@@ -4581,6 +4675,8 @@ def _emit_mma_pipeline(
                 scalar_load_b=scalar_load_b,
                 cluster_n=tcgen05_cluster_n,
                 static_full_tiles=tcgen05_static_full_tma_fast_path,
+                is_leader_cta_var=tcgen05_is_leader_cta if tcgen05_is_two_cta else "",
+                is_v_leader_cta_var=tcgen05_is_v_leader_cta if tcgen05_is_two_cta else "",
             )
             if tcgen05_use_tma_pipeline:
                 if tcgen05_use_separate_tma_producer:
@@ -4692,6 +4788,8 @@ def _emit_mma_pipeline(
                                 gate_exec_warp=tcgen05_static_full_tma_fast_path,
                                 is_two_cta=tcgen05_is_two_cta,
                                 cluster_n=tcgen05_cluster_n,
+                                is_leader_cta_var=tcgen05_is_leader_cta if tcgen05_is_two_cta else None,
+                                is_v_leader_cta_var=tcgen05_is_v_leader_cta if tcgen05_is_two_cta else None,
                             )
                         )
                     exec_loop_body.append(
@@ -4852,6 +4950,8 @@ def _emit_mma_pipeline(
                             mma_stage=mma_stage,
                             is_two_cta=tcgen05_is_two_cta,
                             cluster_n=tcgen05_cluster_n,
+                            is_leader_cta_var=tcgen05_is_leader_cta if tcgen05_is_two_cta else None,
+                            is_v_leader_cta_var=tcgen05_is_v_leader_cta if tcgen05_is_two_cta else None,
                         )
                     )
                 if tcgen05_use_tma:
@@ -5127,6 +5227,13 @@ def _tcgen05_config_int(config: object, key: str, default: int) -> int:
     return value
 
 
+def _tcgen05_config_bool(config: object, key: str, default: bool) -> bool:
+    value = cast("_ConfigLike", config).get(key, default)
+    if not isinstance(value, bool):
+        return default
+    return value
+
+
 def _tcgen05_cluster_m(config: object) -> int:
     return max(1, min(2, _tcgen05_config_int(config, "tcgen05_cluster_m", 1)))
 
@@ -5359,6 +5466,7 @@ def _make_tiled_mma_setup(
     bn: int,
     *,
     tcgen05_cluster_m: int = 1,
+    tcgen05_b_k_major: bool = False,
 ) -> list[ast.AST]:
     if mma_impl == "warp":
         tiled_mma_expr = (
@@ -5374,6 +5482,7 @@ def _make_tiled_mma_setup(
             bm,
             bn,
             tcgen05_cluster_m=tcgen05_cluster_m,
+            b_k_major=tcgen05_b_k_major,
         )
     else:
         assert mma_thread_linear
@@ -5402,16 +5511,24 @@ def _tcgen05_tiled_mma_expr(
     bn: int,
     *,
     tcgen05_cluster_m: int = 1,
+    b_k_major: bool = False,
 ) -> str:
     cta_group_expr = "cute.nvgpu.tcgen05.CtaGroup.ONE"
     if _tcgen05_use_2cta_instrs(bm=bm, cluster_m=tcgen05_cluster_m):
         cta_group_expr = "cute.nvgpu.tcgen05.CtaGroup.TWO"
+    # A is always K-major. B is MN-major for row-major ``[K, N]`` and K-major
+    # for the column-major (CUTLASS-style) ``[K, N]`` operand.
+    b_major_mode_expr = (
+        "cute.nvgpu.OperandMajorMode.K"
+        if b_k_major
+        else "cute.nvgpu.OperandMajorMode.MN"
+    )
     return (
         "cutlass.utils.blackwell_helpers.make_trivial_tiled_mma("
         f"{input_dtype_str}, "
         f"{input_dtype_str}, "
         "cute.nvgpu.OperandMajorMode.K, "
-        "cute.nvgpu.OperandMajorMode.MN, "
+        f"{b_major_mode_expr}, "
         f"{acc_dtype_str}, "
         f"{cta_group_expr}, "
         f"({bm}, {bn}), "

@@ -119,6 +119,7 @@ from .tcgen05_constants import TCGEN05_TWO_CTA_EDGE_K_TAIL_NARROW_L2_GROUPING
 from .tcgen05_constants import TCGEN05_TWO_CTA_EDGE_K_TAIL_SCHEDULER_L2_SWIZZLE_SIZE
 from .tcgen05_constants import TCGEN05_TWO_CTA_MAX_K_TILES
 from .tcgen05_constants import TCGEN05_TWO_CTA_SEED_PID_TYPE
+from .tcgen05_constants import TCGEN05_WARP_SPEC_REGISTER_REALLOC_CONFIG_KEY
 from .tcgen05_constants import tcgen05_ab_smem_bytes_per_cta
 from .tcgen05_constants import tcgen05_c_smem_bytes_per_cta
 from .tcgen05_constants import tcgen05_default_epilogue_tile_size
@@ -186,6 +187,7 @@ CUTE_TCGEN05_DIAGNOSTIC_CONFIG_KEYS: frozenset[str] = frozenset(
         TCGEN05_SCHED_CONSUMER_WAIT_MODE_CONFIG_KEY,
         TCGEN05_SCHED_STAGE_COUNT_CONFIG_KEY,
         TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY,
+        TCGEN05_WARP_SPEC_REGISTER_REALLOC_CONFIG_KEY,
     }
 )
 CUTE_TCGEN05_STRATEGY_CONFIG_KEYS: frozenset[str] = frozenset(
@@ -2232,6 +2234,11 @@ class CuteTcgen05Config:
         )
         self._validate_bool_config(
             config, TCGEN05_LARGE_BN_PROOF_CONFIG_KEY, fix_invalid=fix_invalid
+        )
+        self._validate_bool_config(
+            config,
+            TCGEN05_WARP_SPEC_REGISTER_REALLOC_CONFIG_KEY,
+            fix_invalid=fix_invalid,
         )
         self._validate_bool_config(
             config,

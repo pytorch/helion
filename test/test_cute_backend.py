@@ -1207,6 +1207,31 @@ class TestCuteBackend(TestCase):
         self.assertIn("cute.nvgpu.tcgen05", code)
         self.assertIn("cute.gemm(", code)
 
+    def test_matmul_mma_tcgen05_fp8_col_major_b(self) -> None:
+        # B passed column-major [K, N] (K-contiguous), the CUTLASS-style FP8
+        # operand layout. The tcgen05 MMA must switch operand B to
+        # OperandMajorMode.K; the row-major path uses OperandMajorMode.MN.
+        support = get_cute_mma_support()
+        if not support.tcgen05_f8:
+            self.skipTest("tcgen05 FP8 MMA is not supported on this machine")
+
+        torch.manual_seed(0)
+        x = (torch.randn(256, 128, device=DEVICE) * 0.4).to(torch.float8_e4m3fn)
+        y_row = (torch.randn(128, 128, device=DEVICE) * 0.4).to(torch.float8_e4m3fn)
+        y_col = y_row.t().contiguous().t()  # column-major [K, N]
+        self.assertEqual(y_col.stride(), (1, 128))
+        code, out = code_and_output(
+            cute_matmul_mma_fp8, (x, y_col), block_sizes=[128, 128, 128]
+        )
+        ref = x.float() @ y_col.float()
+        torch.testing.assert_close(out.float(), ref, atol=1.0, rtol=1e-1)
+        # K-major B emits OperandMajorMode.K for *both* operands (A is always
+        # K-major); the row-major path would emit one .MN. The runtime guard
+        # for the unvalidated persistent fallback must not fire.
+        self.assertIn("cute.nvgpu.OperandMajorMode.K", code)
+        self.assertNotIn("OperandMajorMode.MN", code)
+        self.assertNotIn("outside the validated persistent scheduler", code)
+
     def test_matmul_mma_tcgen05_fp8_rowvec_scale(self) -> None:
         support = get_cute_mma_support()
         if not support.tcgen05_f8:
@@ -1225,6 +1250,40 @@ class TestCuteBackend(TestCase):
         torch.testing.assert_close(out.float(), ref, atol=1.0, rtol=1e-1)
         self.assertIn("cutlass.Float8E4M3FN", code)
         self.assertIn("cute.nvgpu.tcgen05", code)
+
+    def test_matmul_mma_tcgen05_fp8_register_realloc_toggle(self) -> None:
+        support = get_cute_mma_support()
+        if not support.tcgen05_f8:
+            self.skipTest("tcgen05 FP8 MMA is not supported on this machine")
+
+        torch.manual_seed(0)
+        x = (torch.randn(256, 128, device=DEVICE) * 0.4).to(torch.float8_e4m3fn)
+        y = (torch.randn(128, 128, device=DEVICE) * 0.4).to(torch.float8_e4m3fn)
+        scale_n = torch.rand(128, device=DEVICE) + 0.5
+        ref = (x.float() @ y.float()) * scale_n.float()
+
+        # Default keeps the producer/consumer setmaxregister split.
+        code_on, out_on = code_and_output(
+            cute_matmul_mma_fp8_rowvec_scale,
+            (x, y, scale_n),
+            block_sizes=[128, 128, 128],
+        )
+        self.assertIn("setmaxregister_increase", code_on)
+        self.assertIn("setmaxregister_decrease", code_on)
+        torch.testing.assert_close(out_on.float(), ref, atol=1.0, rtol=1e-1)
+
+        # register_realloc=False skips both setmaxregister calls so ptxas
+        # picks its natural register count (avoids the bk=128 over-allocation
+        # spill); output must stay identical.
+        code_off, out_off = code_and_output(
+            cute_matmul_mma_fp8_rowvec_scale,
+            (x, y, scale_n),
+            block_sizes=[128, 128, 128],
+            tcgen05_warp_spec_register_realloc=False,
+        )
+        self.assertNotIn("setmaxregister_increase", code_off)
+        self.assertNotIn("setmaxregister_decrease", code_off)
+        torch.testing.assert_close(out_off.float(), ref, atol=1.0, rtol=1e-1)
 
     def test_matmul_dot_out_dtype_falls_back_from_mma(self) -> None:
         args = (

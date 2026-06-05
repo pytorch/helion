@@ -159,13 +159,16 @@ def scaled_mm_compute(
 # %%
 # Compute-bound FP8 RowWise scaled_mm on Helion's CuTe (tcgen05) backend.
 # This config is the deeply-pipelined 2-CTA recipe that matches CUTLASS on the
-# Blackwell M=512 compute-bound shapes (256x128 cluster(2,1), bk=64, ab_stages=8,
-# role_local_monolithic = 6-warp inline-scheduler layout). The rowwise scale is
-# fused in the epilogue: ``scale_a`` (per-row) is passed as a stride-(1,0)
-# ``(M, N)`` view so the backend reads it as a scalar, and ``scale_b`` (per-col)
-# as a rank-1 row-vector that is register-hoisted before the accumulator wait.
+# Blackwell M=512 compute-bound shapes (256x128 cluster(2,1), bk=128, ab_stages=8,
+# role_local_monolithic = 6-warp inline-scheduler layout). bk=128 mirrors the
+# CUTLASS persistent-GEMM mma-tiler K (mma_inst_k=32 x 4), halving the K-loop
+# iteration count vs bk=64 and the per-iteration pipeline-sync/TMA-issue overhead
+# (~1.3x -> ~1.05x on the long-K down_proj shape). The rowwise scale is fused in
+# the epilogue: ``scale_a`` (per-row) is passed as a stride-(1,0) ``(M, N)`` view
+# so the backend reads it as a scalar, and ``scale_b`` (per-col) as a rank-1
+# row-vector that is register-hoisted before the accumulator wait.
 _SCALED_MM_CUTE_FP8_CONFIG = helion.Config(
-    block_sizes=[256, 128, 64],
+    block_sizes=[256, 128, 128],
     cute_vector_widths=[1, 1, 1],
     indexing=[
         "pointer",
@@ -193,6 +196,12 @@ _SCALED_MM_CUTE_FP8_CONFIG = helion.Config(
     tcgen05_warp_spec_register_decrease=120,
     tcgen05_warp_spec_register_increase=256,
     tcgen05_warp_spec_scheduler_warps=0,
+    # Skip the producer/consumer setmaxregister split: this kernel's SMEM
+    # footprint already pins occupancy at 1 CTA/SM, so forcing the consumer
+    # increase ceiling only makes ptxas over-allocate and spill (255 reg +
+    # ~17 KB local spill). Letting ptxas pick its natural ~190-reg allocation
+    # removes the spill and matches CUTLASS on all 4 M=512 shapes.
+    tcgen05_warp_spec_register_realloc=False,
 )
 
 
