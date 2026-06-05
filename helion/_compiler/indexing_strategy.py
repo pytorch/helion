@@ -197,6 +197,7 @@ class IndexingStrategy:
         subscript: list[object],
         extra_mask: ast.AST | None,
         eviction_policy: ast.AST | None,
+        cache_modifier: ast.AST | None,
     ) -> ast.AST:
         raise NotImplementedError
 
@@ -245,6 +246,7 @@ class PointerIndexingStrategy(IndexingStrategy):
         subscript: list[object],
         extra_mask: ast.AST | None,
         eviction_policy: ast.AST | None,
+        cache_modifier: ast.AST | None,
     ) -> ast.AST:
         indexing = SubscriptIndexing.create(state, fake_tensor, subscript, extra_mask)
         extra = ""
@@ -257,12 +259,14 @@ class PointerIndexingStrategy(IndexingStrategy):
                 extra = ", other=0"
         name = state.device_function.tensor_arg(fake_tensor).name
         extra += ", eviction_policy={ev}" if eviction_policy is not None else ""
+        extra += ", cache_modifier={cm}" if cache_modifier is not None else ""
         load_expr = expr_from_string(
             f"tl.load({name} + {{offset}}, {{mask}}{extra})",
             offset=indexing.index_expr,
             mask=indexing.mask_expr,
             # pyrefly: ignore [bad-argument-type]
             ev=eviction_policy,
+            cm=cache_modifier,
         )
         # If any dimensions need broadcasting from size-1 to block_size, apply broadcast_to
         if indexing.needs_broadcast():
@@ -390,13 +394,21 @@ class BlockPtrIndexingStrategy(IndexingStrategy):
         subscript: list[object],
         extra_mask: ast.AST | None,
         eviction_policy: ast.AST | None,
+        cache_modifier: ast.AST | None,
     ) -> ast.AST:
         if not BlockedSubscriptIndexing.is_supported(state, fake_tensor, subscript):
             return PointerIndexingStrategy().codegen_load(
-                state, fake_tensor, subscript, extra_mask, eviction_policy
+                state,
+                fake_tensor,
+                subscript,
+                extra_mask,
+                eviction_policy,
+                cache_modifier,
             )
         indexing = BlockedSubscriptIndexing.create(state, fake_tensor, subscript)
-        extra = ", eviction_policy={ev}" if eviction_policy is not None else ""
+        extra = ""
+        extra += ", eviction_policy={ev}" if eviction_policy is not None else ""
+        extra += ", cache_modifier={cm}" if cache_modifier is not None else ""
         result = indexing.reshape_load(
             state,
             expr_from_string(
@@ -404,6 +416,7 @@ class BlockPtrIndexingStrategy(IndexingStrategy):
                 block_ptr=indexing.make_block_ptr(state),
                 # pyrefly: ignore [bad-argument-type]
                 ev=eviction_policy,
+                cm=cache_modifier,
             ),
         )
 
@@ -588,10 +601,16 @@ class TensorDescriptorIndexingStrategy(IndexingStrategy):
         subscript: list[object],
         extra_mask: ast.AST | None,
         eviction_policy: ast.AST | None,
+        cache_modifier: ast.AST | None,
     ) -> ast.AST:
         if not self.is_supported(state, fake_tensor, subscript):
             return PointerIndexingStrategy().codegen_load(
-                state, fake_tensor, subscript, extra_mask, eviction_policy
+                state,
+                fake_tensor,
+                subscript,
+                extra_mask,
+                eviction_policy,
+                cache_modifier,
             )
         indexing = BlockedSubscriptIndexing.create(state, fake_tensor, subscript)
 
@@ -790,6 +809,7 @@ class StackIndexingStrategy:
         subscript: list[object],
         extra_mask: ast.AST | None,
         eviction_policy: ast.AST | None,
+        cache_modifier: ast.AST | None,
     ) -> ast.AST:
         tensor_like, dev_ptrs = stack_tensor
         indexing = SubscriptIndexing.create(state, tensor_like, subscript, extra_mask)
@@ -812,6 +832,7 @@ class StackIndexingStrategy:
 
         dtype = triton_type(tensor_like.dtype)
         extra += ", eviction_policy={ev}" if eviction_policy is not None else ""
+        extra += ", cache_modifier={cm}" if cache_modifier is not None else ""
         return expr_from_string(
             f"tl.load(({{base}}.to(tl.pointer_type({dtype}))){stack_broadcast} + ({{offset}}){tensor_broadcast}, {{mask}}{extra})",
             base=dev_ptrs_ast,
@@ -819,6 +840,7 @@ class StackIndexingStrategy:
             mask=mask_expr,
             # pyrefly: ignore [bad-argument-type]
             ev=eviction_policy,
+            cm=cache_modifier,
         )
 
     @staticmethod
