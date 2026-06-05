@@ -838,6 +838,102 @@ if __name__ == "__main__":
     """)
 
 
+def _rewrite_output_allocs_for_pool(host_statements: list[ast.stmt]) -> None:
+    """Route output-tensor allocations through ``helion.runtime._output_pool.empty_like``.
+
+    Walks the generated host wrapper statements, looking for
+    ``Assign(target=Name(v), value=Call(torch.empty_like(template)))``
+    where the target name ``v`` is passed as a positional arg to a
+    kernel launcher call elsewhere in the same scope. Today Helion's
+    codegen emits ``torch.empty_like`` only for kernel-output buffers
+    that the kernel fully overwrites before any read, so replacing
+    the factory call with the pool helper is safe.
+
+    The rewrite is intentionally narrow: a future codegen path that
+    creates an ``empty_like`` buffer then reads its uninitialized
+    contents before the launcher writes them would be a pre-existing
+    correctness bug (the ``torch.empty_like`` contract is "contents
+    undefined"); the pool merely makes the prior call's leftover
+    contents — instead of allocator garbage — visible to such a read.
+    Either way, the user code is at fault.
+
+    Other names (helpers, locals returned from utility functions,
+    etc.) are left alone, as are ``torch.empty_like`` calls with
+    keyword args (see the second-pass shape filter below).
+
+    ``torch.empty`` with explicit ``(shape, dtype, device)`` args
+    would also be safe to pool, but our pool helper only accepts the
+    template-tensor signature, so we'd need a separate helper for the
+    explicit-args case. Easy to extend later.
+    """
+    # First pass: collect names passed as positional args to kernel
+    # launcher calls. The launcher call's statement is marked with
+    # ``_is_kernel_call=True`` by the codegen.
+    launcher_arg_names: set[str] = set()
+    for stmt in host_statements:
+        if not getattr(stmt, "_is_kernel_call", False):
+            continue
+        call: ast.AST | None = None
+        if (
+            isinstance(stmt, ast.Expr)
+            and isinstance(stmt.value, ast.Call)
+            or isinstance(stmt, ast.Assign)
+            and isinstance(stmt.value, ast.Call)
+        ):
+            call = stmt.value
+        if not isinstance(call, ast.Call):
+            continue
+        for arg in call.args:
+            if isinstance(arg, ast.Name):
+                launcher_arg_names.add(arg.id)
+
+    # Second pass: rewrite ``torch.<fn>(...)`` factory expressions
+    # whose Assign target is a launcher-arg name. Each rewritten call
+    # site gets a unique ``_slot`` kwarg so two same-key allocations
+    # in the same wrapper (e.g. a multi-output kernel emitting
+    # ``out1 = torch.empty_like(x); out2 = torch.empty_like(x)``) map
+    # to distinct cache entries instead of collapsing onto one buffer
+    # (which would silently alias the outputs).
+    slot_id = 0
+    for stmt in host_statements:
+        if not (
+            isinstance(stmt, ast.Assign)
+            and len(stmt.targets) == 1
+            and isinstance(stmt.targets[0], ast.Name)
+            and stmt.targets[0].id in launcher_arg_names
+            and not getattr(stmt, "_is_kernel_call", False)
+            and isinstance(stmt.value, ast.Call)
+        ):
+            continue
+        call = stmt.value
+        # Match ``torch.empty_like(...)``: an Attribute whose value is
+        # ``Name('torch')`` and whose attr is ``empty_like``.
+        if not (
+            isinstance(call.func, ast.Attribute)
+            and isinstance(call.func.value, ast.Name)
+            and call.func.value.id == "torch"
+            and call.func.attr == "empty_like"
+        ):
+            continue
+        # Skip the rewrite when the call has kwargs (e.g.
+        # ``torch.empty_like(x, dtype=torch.float32)``) or any
+        # non-trivial positional args beyond the template. The pool
+        # helper keys on the template's metadata; overriding dtype /
+        # device / memory_format etc. via kwargs would silently produce
+        # a buffer with the WRONG signature on cache hit. Keeping the
+        # original ``torch.empty_like(...)`` call is correct and the
+        # ~1.4 us / call cost only applies to those rarer sites.
+        if call.keywords or len(call.args) != 1:
+            continue
+        # Replace the called function with the pool helper, threading
+        # the per-site slot id through as a kwarg.
+        call.func = ast.Name(id="_helion_pool_empty_like", ctx=ast.Load())
+        call.keywords = [
+            ast.keyword(arg="_slot", value=ast.Constant(value=slot_id)),
+        ]
+        slot_id += 1
+
+
 def generate_ast(
     func: HostFunction,
     config: Config,
@@ -895,6 +991,28 @@ def generate_ast(
                         ] + [
                             ast.keyword(arg="device", value=ast.Constant(value="meta"))
                         ]
+
+            # Always rewrite the wrapper's ``torch.empty_like(x)`` calls
+            # to route through ``helion.runtime._output_pool.empty_like`` (the pool
+            # helper). When the pool is OFF at runtime (the default),
+            # the helper short-circuits to ``torch.empty_like`` for a
+            # ~30 ns/call overhead. When ON (autotune mode or explicit
+            # ``set_pool_enabled(True)``), the helper returns a
+            # recycled buffer from a small per-signature ring and skips
+            # the allocator entirely (~1 us/call saving).
+            #
+            # The rewrite is conservative: only triggers on assignments
+            # whose target name is consumed by a kernel launcher call
+            # in the same scope. Tensors that escape via other paths
+            # (returned by helpers, captured by closures, etc.) are not
+            # safe to recycle and stay on ``torch.empty_like``.
+            #
+            # Doing the rewrite unconditionally — rather than gating on
+            # an env var at codegen time — means a single compiled
+            # wrapper works for both autotune (pool on) and production
+            # (pool off). Autotune sets the runtime flag around the
+            # benchmark loop and restores it afterwards.
+            _rewrite_output_allocs_for_pool(codegen.host_statements)
 
             # Inject RNG seed buffer creation if needed
             rng_statements = (

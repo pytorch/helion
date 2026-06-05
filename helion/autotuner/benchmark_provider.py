@@ -950,6 +950,9 @@ class LocalBenchmarkProvider(BenchmarkProvider):
             # Narrow capture: only the kernel compile+launch sites (which can
             # emit Triton C-level MLIR diagnostics). Leave the accuracy check
             # and Python-level logging outside so warnings still reach stderr.
+            # Pool stays off here so the accuracy check runs with the live
+            # (production) allocator semantics and output mismatches surface
+            # naturally.
             with capture_output() as _captured_output:
                 synchronize_device()
                 output = fn(*working_args)  # make sure the kernel is compiled
@@ -974,7 +977,29 @@ class LocalBenchmarkProvider(BenchmarkProvider):
                 # while other ranks return immediately, this will cause stuck jobs!
                 return inf
 
-            with capture_output() as _captured_output:
+            # Autotune passes the SAME ``working_args`` to every
+            # benchmark iteration, so the output's
+            # ``(dtype, shape, stride, device)`` signature is invariant
+            # across calls. ``enable_pool`` scopes the output pool to
+            # this benchmark loop:
+            #
+            # - ``_helion_pool_empty_like(x)`` returns the cached buffer
+            #   for this ``(dtype, shape, device)`` triple instead of
+            #   going through ``torch.empty_like`` (~1.4 us/call).
+            # - Same Python tensor identity across calls (the pool's
+            #   per-key cache returns the same object each iteration),
+            #   so any launcher-level same-args identity fast path can
+            #   keep hitting on the OUT arg too.
+            #
+            # The aliasing hazard the pool normally carries doesn't
+            # apply during autotune: each iteration discards its
+            # output before the next call begins, and ``do_bench``
+            # only reads the elapsed time, not the tensor contents.
+            # Per-thread state; the context manager restores the prior
+            # setting and clears buffers on exit.
+            from ..runtime._output_pool import _enable_pool
+
+            with capture_output() as _captured_output, _enable_pool():
                 benchmark_function = self.kernel.bench_compile_config(
                     config, allow_print=False
                 )
