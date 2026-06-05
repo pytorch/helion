@@ -1829,6 +1829,21 @@ class BlockReductionStrategy(ReductionStrategy):
             reduce_axis = self._aliased_active_thread_axis(block_axes)
         if reduce_axis is None:
             aliased_block_id = self._aliased_strategy_block_id()
+            # Only treat the reduce dim as a strided thread reduction when the
+            # aliased block is actually backed by a *live* thread axis. A block
+            # with ``block_size == 1`` (a grid/serial dim such as a size-1
+            # contributor axis) reports no live thread extent; its
+            # ``_thread_axis_map`` entry still records a phantom local axis that
+            # collides with an unrelated sibling block's real thread axis (e.g.
+            # the M tile on CuTe). Using that phantom axis would fold the
+            # reduction across the sibling's tile instead of squeezing the
+            # size-1 dim, so bail to the loop-carried / passthrough path.
+            if (
+                aliased_block_id is not None
+                and self.fn.tile_strategy.thread_extent_for_block_id(aliased_block_id)
+                is None
+            ):
+                aliased_block_id = None
             if aliased_block_id is not None:
                 reduce_axis = self.fn.tile_strategy.thread_axis_for_block_id(
                     aliased_block_id
