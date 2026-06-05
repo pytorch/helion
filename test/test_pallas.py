@@ -106,27 +106,11 @@ def pallas_matmul_broadcast_bias(
 
 
 @helion.kernel(backend="pallas", static_shapes=True)
-def pallas_matmul_f32(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-    """f32 matmul kernel mirroring the perf harness's helion variant."""
-    m, k = x.size()
-    _, n = y.size()
-    out = torch.empty([m, n], device=x.device, dtype=torch.float32)
-    for tile_m, tile_n in hl.tile([m, n]):
-        acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
-        for tile_k in hl.tile(k):
-            acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
-        out[tile_m, tile_n] = acc
-    return out
-
-
-@helion.kernel(backend="pallas", static_shapes=True)
 def pallas_matmul_bf16(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     """bf16 matmul kernel mirroring the perf harness's helion variant.
 
-    Used by the pin test that verifies the bf16 2D path emits ``pl.dot``
-    (the Pallas-native MXU primitive used by the hand-written reference
-    kernel in ``examples/pallas_perf/matmul_pallas.py``) rather than the
-    slower ``lax.dot_general`` fallback.
+    Used by ``test_pallas_matmul_bf16_no_tiling_seed_covers_large_cubes`` to
+    exercise the no-tiling ``lax.dot_general`` lowering on bf16 square matmuls.
     """
     m, k = x.size()
     _, n = y.size()
@@ -1748,62 +1732,6 @@ class TestPallas(TestCase):
             5.0,
             f"identical jit_fns should give a near-zero paired delta; got {delta_micros!r}",
         )
-
-    def test_pallas_matmul_bf16_emits_pl_dot(self) -> None:
-        """bf16 1024x1024x1024: 2D MXU-legal tile should emit ``pl.dot``.
-
-        The hand-written reference kernel in
-        ``examples/pallas_perf/matmul_pallas.py`` uses ``pl.dot`` for the
-        bf16 square-matmul body; the Mosaic backend lowers it directly to
-        the TPU MXU. The previous Helion path emitted the equivalent
-        ``lax.dot_general(..., preferred_element_type=jnp.float32)``,
-        which the same Mosaic backend serializes through a slower
-        general dot path. The pin asserts:
-
-        * ``pl.dot(`` appears in the generated code (the routing rule
-          fired);
-        * the slower ``lax.dot_general(`` fallback is absent for this
-          2D bf16 tile (i.e. ``preferred_element_type=jnp.float32`` is no
-          longer needed because ``pl.dot`` returns f32 on bf16 inputs
-          automatically).
-
-        The shape is the headline 1024^3 anchor and the block matches
-        ``BLOCK_CONFIGS[1] = (128, 128, 128)`` from
-        ``examples/pallas_perf/matmul_configs.py``.
-        """
-        torch.manual_seed(0)
-        x = torch.randn(1024, 1024, device=DEVICE, dtype=torch.bfloat16)
-        torch.manual_seed(1)
-        y = torch.randn(1024, 1024, device=DEVICE, dtype=torch.bfloat16)
-        code, result = code_and_output(
-            pallas_matmul_bf16, (x, y), block_sizes=[128, 128, 128]
-        )
-        expected = (x.float() @ y.float()).to(torch.bfloat16)
-        torch.testing.assert_close(result, expected, rtol=1e-2, atol=1e-2)
-        self.assertIn("pl.dot(", code)
-        self.assertNotIn("lax.dot_general(", code)
-        self.assertNotIn("preferred_element_type=jnp.float32", code)
-
-    def test_pallas_matmul_bmm_stays_on_dot_general(self) -> None:
-        """3D BMM stays on ``lax.dot_general`` (``pl.dot`` is 2D-only).
-
-        ``pl.dot`` rejects non-2D inputs upstream
-        (``jax/_src/pallas/primitives.py``), so BMM kernels must keep
-        using the 3D ``dimension_numbers`` form. The pin guards against a
-        future routing widening that would break 3D paths.
-        """
-        torch.manual_seed(0)
-        a = torch.randn(4, 128, 256, device=DEVICE, dtype=torch.bfloat16)
-        torch.manual_seed(1)
-        b = torch.randn(4, 256, 128, device=DEVICE, dtype=torch.bfloat16)
-        code, result = code_and_output(
-            pallas_bmm, (a, b), block_sizes=[4, 128, 128, 256]
-        )
-        expected = torch.bmm(a.float(), b.float()).to(torch.bfloat16)
-        torch.testing.assert_close(result, expected, rtol=1e-2, atol=1e-2)
-        self.assertIn("lax.dot_general(", code)
-        self.assertIn("preferred_element_type=jnp.float32", code)
-        self.assertNotIn("pl.dot(", code)
 
     def test_pallas_matmul_dot_general_lowering_fires_on_no_tiling(self) -> None:
         """No-tiling 2-input matmul emits ``lax.dot_general``, not ``pl.pallas_call``.
