@@ -1,20 +1,18 @@
 from __future__ import annotations
 
+import csv
 import json
+import tempfile
 import unittest
 
 import torch
 
 import helion
-from helion._testing import DEVICE
 from helion._testing import TestCase
-from helion._testing import skipIfRefEager
+from helion.autotuner.logger import AutotuneLogEntry
+from helion.autotuner.logger import AutotuneLogSink
 from helion.autotuner.metrics import AutotuneMetrics
 from helion.autotuner.metrics import KernelMetadata
-from helion.autotuner.metrics import register_kernel_metadata_hook
-from helion.autotuner.metrics import register_post_autotune_hook
-from helion.autotuner.metrics import remove_kernel_metadata_hook
-from helion.autotuner.metrics import remove_post_autotune_hook
 import helion.language as hl
 
 
@@ -42,7 +40,14 @@ def _side_table_available() -> bool:
     return helion_kernel_side_table is not None
 
 
-class TestKernelId(TestCase):
+class TestKernelIdentity(TestCase):
+    def test_kernel_source_stable_and_distinct(self) -> None:
+        first = _add_kernel.kernel_source()
+        second = _add_kernel.kernel_source()
+        self.assertEqual(first, second)
+        self.assertIn("def _add_kernel", first)
+        self.assertNotEqual(first, _other_kernel.kernel_source())
+
     @unittest.skipUnless(_side_table_available(), "kernel side table unavailable")
     def test_kernel_id_idempotent(self) -> None:
         first = _add_kernel.kernel_id()
@@ -61,99 +66,79 @@ class TestKernelId(TestCase):
         idx = _add_kernel.kernel_id()
         self.assertIs(helion_kernel_side_table.get_kernel(idx), _add_kernel)
 
-    def test_kernel_source_hash_stable_and_hex(self) -> None:
-        first = _add_kernel.kernel_source_hash()
-        second = _add_kernel.kernel_source_hash()
-        self.assertEqual(first, second)
-        self.assertEqual(len(first), 64)
-        int(first, 16)  # raises ValueError if not hex
-        self.assertNotEqual(first, _other_kernel.kernel_source_hash())
-
 
 class TestMetadataSchema(TestCase):
     def test_autotune_metrics_to_dict_has_kernel_fields(self) -> None:
         record = AutotuneMetrics(
-            kernel_idx=7, kernel_name="k", kernel_source_hash="abc"
+            kernel_idx=7, kernel_name="k", kernel_source="def k(): ..."
         ).to_dict()
         self.assertEqual(record["kernel_idx"], 7)
         self.assertEqual(record["kernel_name"], "k")
-        self.assertEqual(record["kernel_source_hash"], "abc")
+        self.assertEqual(record["kernel_source"], "def k(): ...")
+        json.dumps(record)
 
     def test_kernel_metadata_to_dict_round_trip(self) -> None:
         record = KernelMetadata(
             kernel_idx=3,
             kernel_name="k",
-            kernel_source_hash="abc",
-            config="helion.Config(...)",
+            kernel_source="def k(): ...",
             input_shapes="[(16,)]",
             dtypes="['torch.float32']",
             hardware="TestGPU",
-            path="default",
         ).to_dict()
         self.assertEqual(record["kernel_idx"], 3)
-        self.assertEqual(record["path"], "default")
-        # Must be JSON serializable for any downstream sink.
+        self.assertEqual(record["kernel_source"], "def k(): ...")
+        # Must be JSON serializable for the sidecar file.
         json.dumps(record)
 
 
-class TestMetadataHooks(TestCase):
-    def test_kernel_metadata_hook_fires(self) -> None:
-        seen: list[KernelMetadata] = []
-        hook = seen.append
-        register_kernel_metadata_hook(hook)
-        try:
-            from helion.autotuner.metrics import _run_kernel_metadata_hooks
+class TestAutotuneLogSink(TestCase):
+    def _entry(self, perf_ms: float) -> AutotuneLogEntry:
+        return AutotuneLogEntry(
+            generation=0,
+            status="ok",
+            perf_ms=perf_ms,
+            compile_time=0.5,
+            config=helion.Config(block_sizes=[16]),
+        )
 
-            metadata = KernelMetadata(kernel_idx=1, path="default")
-            _run_kernel_metadata_hooks(metadata)
-        finally:
-            remove_kernel_metadata_hook(hook)
-        self.assertEqual(len(seen), 1)
-        self.assertEqual(seen[0].kernel_idx, 1)
-        # Hook is removed: a second dispatch must not reach it.
-        from helion.autotuner.metrics import _run_kernel_metadata_hooks
+    def test_sink_writes_metadata_sidecar_and_per_config_rows(self) -> None:
+        metadata = KernelMetadata(
+            kernel_idx=1,
+            kernel_name="_add_kernel",
+            kernel_source=_add_kernel.kernel_source(),
+            input_shapes="[(64,)]",
+            dtypes="['torch.float32']",
+            hardware="TestGPU",
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            base = f"{tmp}/run"
+            with AutotuneLogSink(base, metadata) as sink:
+                sink.start_run()
+                sink.record(self._entry(0.1))
+                sink.record(self._entry(0.2))
+                sink.end_run()
 
-        _run_kernel_metadata_hooks(KernelMetadata(kernel_idx=2))
-        self.assertEqual(len(seen), 1)
+            # Sidecar holds the kernel identity (stored once).
+            sidecar = json.loads(sink.meta_path.read_text(encoding="utf-8"))
+            self.assertEqual(sidecar["kernel_name"], "_add_kernel")
+            self.assertIn("def _add_kernel", sidecar["kernel_source"])
 
-    def test_post_autotune_hook_fires(self) -> None:
-        seen: list[AutotuneMetrics] = []
-        hook = seen.append
-        register_post_autotune_hook(hook)
-        try:
-            from helion.autotuner.metrics import _run_post_autotune_hooks
+            # Per-config CSV holds one row per benchmarked config + its result.
+            with sink.csv_path.open(encoding="utf-8", newline="") as f:
+                rows = list(csv.reader(f))
+            self.assertEqual(rows[0][:1], ["timestamp_s"])
+            data_rows = rows[1:]
+            self.assertEqual(len(data_rows), 2)
 
-            _run_post_autotune_hooks(AutotuneMetrics(kernel_idx=5))
-        finally:
-            remove_post_autotune_hook(hook)
-        self.assertEqual(len(seen), 1)
-        self.assertEqual(seen[0].kernel_idx, 5)
-
-
-class TestEndToEndEmission(TestCase):
-    @skipIfRefEager(
-        "Ref eager mode runs kernels via run_ref(), which bypasses "
-        "set_config()/metadata emission"
-    )
-    def test_set_config_emits_metadata_on_default_path(self) -> None:
-        seen: list[KernelMetadata] = []
-        hook = seen.append
-        register_kernel_metadata_hook(hook)
-        try:
-            x = torch.randn(64, device=DEVICE)
-            y = torch.randn(64, device=DEVICE)
-            result = _add_kernel(x, y)
-            torch.testing.assert_close(result, x + y)
-        finally:
-            remove_kernel_metadata_hook(hook)
-
-        records = [m for m in seen if m.kernel_name == "_add_kernel"]
-        self.assertTrue(records, "expected a KernelMetadata record for _add_kernel")
-        record = records[-1]
-        self.assertEqual(record.path, "default")
-        self.assertIn("64", record.input_shapes)
-        if _side_table_available():
-            self.assertEqual(record.kernel_idx, _add_kernel.kernel_id())
+    def test_sink_without_metadata_writes_no_sidecar(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = f"{tmp}/run"
+            with AutotuneLogSink(base) as sink:
+                sink.start_run()
+                sink.record(self._entry(0.1))
+                sink.end_run()
+            self.assertFalse(sink.meta_path.exists())
 
 
 if __name__ == "__main__":

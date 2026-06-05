@@ -8,7 +8,6 @@ if TYPE_CHECKING:
     from collections.abc import Callable
 
 _post_autotune_hooks: list[Callable[[AutotuneMetrics], None]] = []
-_kernel_metadata_hooks: list[Callable[[KernelMetadata], None]] = []
 
 
 def register_post_autotune_hook(hook: Callable[[AutotuneMetrics], None]) -> None:
@@ -24,25 +23,6 @@ def _run_post_autotune_hooks(metrics: AutotuneMetrics) -> None:
         hook(metrics)
 
 
-def register_kernel_metadata_hook(hook: Callable[[KernelMetadata], None]) -> None:
-    """Register a hook fired whenever a kernel is bound to a config and compiled.
-
-    Unlike :func:`register_post_autotune_hook`, this fires on every path that
-    activates a config (autotune, on-disk cache hit, and default config), so it
-    captures kernels that never go through the autotuner.
-    """
-    _kernel_metadata_hooks.append(hook)
-
-
-def remove_kernel_metadata_hook(hook: Callable[[KernelMetadata], None]) -> None:
-    _kernel_metadata_hooks.remove(hook)
-
-
-def _run_kernel_metadata_hooks(metadata: KernelMetadata) -> None:
-    for hook in _kernel_metadata_hooks:
-        hook(metadata)
-
-
 @dataclasses.dataclass
 class AutotuneMetrics:
     _start_time: float = dataclasses.field(default_factory=time.perf_counter)
@@ -54,7 +34,7 @@ class AutotuneMetrics:
     best_perf_ms: float = 0.0
     kernel_idx: int = -1
     kernel_name: str = ""
-    kernel_source_hash: str = ""
+    kernel_source: str = ""
     input_shapes: str = ""
     hardware: str = ""
     random_seed: int = 0
@@ -67,7 +47,7 @@ class AutotuneMetrics:
         return {
             "kernel_idx": self.kernel_idx,
             "kernel_name": self.kernel_name,
-            "kernel_source_hash": self.kernel_source_hash,
+            "kernel_source": self.kernel_source,
             "input_shapes": self.input_shapes,
             "hardware": self.hardware,
             "random_seed": self.random_seed,
@@ -83,31 +63,28 @@ class AutotuneMetrics:
 
 @dataclasses.dataclass
 class KernelMetadata:
-    """Metadata for a single kernel that has been bound to a config and compiled.
+    """Per-run identity for the kernel being autotuned.
 
-    Emitted on every path that activates a config so that cache hits and
-    default-config runs are captured in addition to autotuned runs. ``path``
-    records which path produced the record ("autotune", "default", or
-    "explicit").
+    Written once per autotuning run to the ``<autotune_log>.meta.json`` sidecar
+    that sits next to the per-config CSV telemetry. The CSV records each config
+    and its result; this provides the stable identity needed to group those rows
+    across runs. ``kernel_source`` is the stable cross-process key;
+    ``kernel_idx`` is a process-local convenience id.
     """
 
     kernel_idx: int = -1
     kernel_name: str = ""
-    kernel_source_hash: str = ""
-    config: str = ""
+    kernel_source: str = ""
     input_shapes: str = ""
     dtypes: str = ""
     hardware: str = ""
-    path: str = ""
 
     def to_dict(self) -> dict[str, object]:
         return {
             "kernel_idx": self.kernel_idx,
             "kernel_name": self.kernel_name,
-            "kernel_source_hash": self.kernel_source_hash,
-            "config": self.config,
+            "kernel_source": self.kernel_source,
             "input_shapes": self.input_shapes,
             "dtypes": self.dtypes,
             "hardware": self.hardware,
-            "path": self.path,
         }

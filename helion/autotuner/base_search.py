@@ -38,6 +38,7 @@ from .benchmarking import clear_jit_fast_path_caches
 from .benchmarking import interleaved_bench
 from .logger import AutotuningLogger
 from .metrics import AutotuneMetrics
+from .metrics import KernelMetadata
 from .metrics import _run_post_autotune_hooks
 from .precompile_future import PrecompileFuture as PrecompileFuture
 from helion._dist_utils import all_gather_object
@@ -252,24 +253,37 @@ class BaseSearch(BaseAutotuner):
         if budget is not None:
             self.log(f"Autotune budget: {budget}s")
         outer_kernel = getattr(self.kernel, "kernel", None)
-        kernel_source_hash = ""
+        kernel_idx = -1
+        kernel_source = ""
         if outer_kernel is not None:
+            kernel_idx = outer_kernel.kernel_id()
             try:
-                kernel_source_hash = outer_kernel.kernel_source_hash()
+                kernel_source = outer_kernel.kernel_source()
             except Exception:
-                self.log.debug(
-                    "Failed to compute Helion kernel source hash", exc_info=True
-                )
+                self.log.debug("Failed to read Helion kernel source", exc_info=True)
+        kernel_name = getattr(outer_kernel, "name", "")
+        tensors = [arg for arg in self.args if isinstance(arg, torch.Tensor)]
+        input_shapes = str([tuple(t.shape) for t in tensors])
+        dtypes = str([str(t.dtype) for t in tensors])
+        hardware = get_device_name(extract_device(self.args)) or ""
         self._autotune_metrics: AutotuneMetrics = AutotuneMetrics(
-            kernel_idx=outer_kernel.kernel_id() if outer_kernel is not None else -1,
-            kernel_name=getattr(outer_kernel, "name", ""),
-            kernel_source_hash=kernel_source_hash,
-            input_shapes=str(
-                [tuple(arg.shape) for arg in self.args if isinstance(arg, torch.Tensor)]
-            ),
-            hardware=get_device_name(extract_device(self.args)) or "",
+            kernel_idx=kernel_idx,
+            kernel_name=kernel_name,
+            kernel_source=kernel_source,
+            input_shapes=input_shapes,
+            hardware=hardware,
             random_seed=self.settings.autotune_random_seed,
             search_algorithm=type(self).__name__,
+        )
+        # Written once per run to the <autotune_log>.meta.json sidecar so the
+        # per-config CSV rows can be grouped by kernel across runs.
+        self._kernel_metadata: KernelMetadata = KernelMetadata(
+            kernel_idx=kernel_idx,
+            kernel_name=kernel_name,
+            kernel_source=kernel_source,
+            input_shapes=input_shapes,
+            dtypes=dtypes,
+            hardware=hardware,
         )
         self.benchmark_provider = self._benchmark_provider_cls(
             kernel=self.kernel,
@@ -461,7 +475,9 @@ class BaseSearch(BaseAutotuner):
         exit_stack = contextlib.ExitStack()
         with exit_stack:
             if self.settings.autotune_log:
-                exit_stack.enter_context(self.log.autotune_logging())
+                exit_stack.enter_context(
+                    self.log.autotune_logging(metadata=self._kernel_metadata)
+                )
             self.log.reset()
             # Autotuner triggers bugs in remote triton compile service.
             # Skip storing Triton intermediate IRs (.ttir, .ttgir, .llir, etc.)

@@ -4,7 +4,6 @@ import ast
 import contextlib
 import dataclasses
 import functools
-import hashlib
 import inspect
 import itertools
 import logging
@@ -37,7 +36,6 @@ from torch.utils._pytree import tree_map_only
 from torch.utils.weak import WeakIdKeyDictionary
 
 from .. import exc
-from .._compat import get_device_name
 from .._compat import target_device_capability
 from .._compile_time import measure
 from .._compiler.ast_extension import unparse
@@ -57,9 +55,6 @@ from .._dist_utils import check_config_consistancy as dist_check_config_consista
 from .._logging import LazyString
 from .._utils import counters
 from ..autotuner.base_search import _AutotunableKernel
-from ..autotuner.metrics import KernelMetadata
-from ..autotuner.metrics import _kernel_metadata_hooks
-from ..autotuner.metrics import _run_kernel_metadata_hooks
 from ..language.constexpr import ConstExpr
 from .config import Config
 from .ref_mode import RefModeContext
@@ -229,6 +224,7 @@ class Kernel(Generic[_R]):
         self.__defaults__ = fn.__defaults__
         self.__kwdefaults__ = fn.__kwdefaults__
 
+    @functools.cache  # noqa: B019
     def kernel_id(self) -> int:
         """
         Return the process-local integer id for this kernel.
@@ -240,7 +236,8 @@ class Kernel(Generic[_R]):
         ``torch.compile`` tracing path.
 
         Note: the id is process-local and NOT stable across processes. Use
-        :meth:`kernel_source_hash` for a stable, content-derived identifier.
+        :meth:`kernel_source` for a stable, content-derived identifier when
+        joining telemetry across runs.
 
         Returns ``-1`` when the side table is unavailable (e.g. on PyTorch
         versions that predate the Helion higher-order-op integration).
@@ -261,14 +258,14 @@ class Kernel(Generic[_R]):
             return -1
         return helion_kernel_side_table.add_kernel(self)
 
-    def kernel_source_hash(self) -> str:
+    def kernel_source(self) -> str:
         """
-        Return a stable SHA-256 hash of the kernel's source text.
+        Return the kernel's source text.
 
-        This deterministic ID across processes is suitable as a
-        content-derived key for joining telemetry across runs.
+        This is the stable identifier across processes/runs, suitable for
+        grouping telemetry rows by kernel during analysis.
         """
-        return hashlib.sha256(inspect.getsource(self.fn).encode("utf-8")).hexdigest()
+        return inspect.getsource(self.fn)
 
     def _get_bound_kernel_cache_key(
         self, args: tuple[object, ...], signature: tuple[Hashable, ...]
@@ -894,10 +891,10 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
             config = self.env.backend.autotune(self, args, force=force, **kwargs)
         if ephemeral is not None:
             self.env.backend.finalize_ephemeral_cache(self, config)
-        self.set_config(config, path="autotune")
+        self.set_config(config)
         return config
 
-    def set_config(self, config: ConfigLike, *, path: str = "explicit") -> None:
+    def set_config(self, config: ConfigLike) -> None:
         """
         Set the configuration for the kernel and compile it.
 
@@ -905,8 +902,6 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
 
         Args:
             config: The configuration to set.
-            path: How this config was produced, recorded in the emitted kernel
-                metadata. One of "autotune", "default", or "explicit".
         """
         config = self._normalize_config(config)
         self._run = self.compile_config(config)
@@ -914,33 +909,6 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
         counters["best_config_decorator"][
             self.format_kernel_decorator(config, self.settings)
         ] = 1
-        self._emit_kernel_metadata(config, path)
-
-    def _emit_kernel_metadata(self, config: Config, path: str) -> None:
-        """Emit kernel metadata to any registered hooks.
-
-        Fires on every path that activates a config (autotune, on-disk cache hit,
-        and default/user config), so kernels that never go through the autotuner
-        are also captured. Telemetry must never break kernel execution, so any
-        failure here is swallowed.
-        """
-        if not _kernel_metadata_hooks:
-            return
-        try:
-            tensors = [a for a in self.fake_args if isinstance(a, torch.Tensor)]
-            metadata = KernelMetadata(
-                kernel_idx=self.kernel.kernel_id(),
-                kernel_name=self.kernel.name,
-                kernel_source_hash=self.kernel.kernel_source_hash(),
-                config=self.format_kernel_decorator(config, self.settings),
-                input_shapes=str([tuple(t.shape) for t in tensors]),
-                dtypes=str([str(t.dtype) for t in tensors]),
-                hardware=get_device_name(self._env.device) or "",
-                path=path,
-            )
-            _run_kernel_metadata_hooks(metadata)
-        except Exception:
-            log.debug("Failed to emit Helion kernel metadata", exc_info=True)
 
     def _specialize_extra(self) -> list[Callable[[Sequence[object]], Hashable]]:
         """
@@ -1114,7 +1082,7 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
             return  # Already have a config
         if (config := self._implicit_config()) is not None:
             with measure("BoundKernel.set_config"):
-                self.set_config(config, path="default")
+                self.set_config(config)
         else:
             with measure("BoundKernel.autotune"):
                 self.autotune(args, force=False)
