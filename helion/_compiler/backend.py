@@ -345,6 +345,18 @@ class Backend(abc.ABC):
         """
         return None
 
+    def get_paired_device_micros_bench(
+        self,
+    ) -> Callable[..., list[tuple[float, float]]] | None:
+        """Paired device-µs bench for the autotune final-pick re-rank, or None.
+
+        Backends that can cheaply report per-call on-device µs override this to
+        return a callable ``fn(candidates, reference, *, desc) ->
+        list[(candidate_device_micros, paired_delta_micros)]``. The default returns None,
+        leaving final-pick on its wall-clock rebench.
+        """
+        return None
+
     def supports_precompile(self) -> bool:
         """Whether this backend supports subprocess precompilation.
 
@@ -1912,6 +1924,18 @@ class PallasBackend(Backend):
 
         return interleaved_bench_generic
 
+    def get_paired_device_micros_bench(
+        self,
+    ) -> Callable[..., list[tuple[float, float]]] | None:
+        """Pallas ``jax.profiler`` device-µs bench for the final-pick re-rank.
+
+        Returns None (keeping the wall-clock rebench) when the user opts out via
+        ``HELION_AUTOTUNE_PALLAS_RANK_BY=wall_time`` or ``jax`` is unavailable.
+        """
+        from ..autotuner.benchmarking import make_pallas_paired_device_micros_bench
+
+        return make_pallas_paired_device_micros_bench()
+
     def supports_precompile(self) -> bool:
         return False
 
@@ -2098,6 +2122,140 @@ class PallasBackend(Backend):
 
         return result or None
 
+    def _detect_matmul_dot_general_lowering(
+        self,
+        *,
+        sorted_args: list[Argument] | None,
+        config: Config,
+        output_indices: list[int],
+        inplace_indices: list[int],
+        block_spec_info: object,
+    ) -> dict[str, object] | None:
+        """Detect a pure-matmul, no-tiling kernel the launcher can lower as
+        ``jax.jit(lax.dot_general(...))`` instead of ``pl.pallas_call(...)``.
+
+        Eligible when: 2 input tensors + 1 output-only tensor; all 2D with
+        matching M/K/N contiguous layout (BMM not covered yet); the device IR
+        has one ``aten.mm``/``addmm`` family op; and the picked block sizes
+        cover every dim (single launch, no inner K tile).  Returns the spec
+        dict consumed by ``_build_matmul_dot_general_jit_fn``, else ``None``.
+        """
+        from .compile_environment import CompileEnvironment
+        from .device_function import DeviceFunction
+        from .device_function import TensorArg
+        from .host_function import HostFunction
+
+        if sorted_args is None or not output_indices:
+            return None
+        # Pure-output kernels only (no in-place mutation, single output).
+        if inplace_indices or len(output_indices) != 1:
+            return None
+
+        # Exactly 2 inputs + 1 output, all tensors (a scalar arg means it isn't
+        # a pure ``out = matmul(x, y)``).
+        tensor_positions = [
+            i for i, arg in enumerate(sorted_args) if isinstance(arg, TensorArg)
+        ]
+        if len(sorted_args) != 3 or len(tensor_positions) != 3:
+            return None
+
+        out_pos = output_indices[0]
+        input_positions = [p for p in tensor_positions if p != out_pos]
+        if len(input_positions) != 2:
+            return None
+
+        lhs_arg = sorted_args[input_positions[0]]
+        rhs_arg = sorted_args[input_positions[1]]
+        out_arg = sorted_args[out_pos]
+        assert isinstance(lhs_arg, TensorArg)
+        assert isinstance(rhs_arg, TensorArg)
+        assert isinstance(out_arg, TensorArg)
+        lhs_t = lhs_arg.fake_value
+        rhs_t = rhs_arg.fake_value
+        out_t = out_arg.fake_value
+        # 2D matmul, matching contraction dim, statically-known shapes.
+        if lhs_t.ndim != 2 or rhs_t.ndim != 2 or out_t.ndim != 2:
+            return None
+        try:
+            m = int(lhs_t.shape[0])
+            k_lhs = int(lhs_t.shape[1])
+            k_rhs = int(rhs_t.shape[0])
+            n = int(rhs_t.shape[1])
+            out_m = int(out_t.shape[0])
+            out_n = int(out_t.shape[1])
+        except (TypeError, ValueError):
+            return None
+        if k_lhs != k_rhs or out_m != m or out_n != n:
+            return None
+
+        # The device IR must contain an aten.mm/addmm/bmm family op
+        # (via the shared ``_loop_contains_matmul`` predicate).
+        device_fn = DeviceFunction.current()
+        device_ir = HostFunction.current().device_ir
+        if not device_ir.grid_block_ids:
+            return None
+        # Any root-grid loop containing a matmul qualifies.
+        matmul_present = any(
+            _loop_contains_matmul(device_fn, list(grid_block_ids))
+            for grid_block_ids in device_ir.grid_block_ids
+        )
+        if not matmul_present:
+            return None
+
+        # Orient to lhs=(M, K), rhs=(K, N); the user may have written
+        # ``f(y, x) -> x @ y``. For all-equal dims either ordering is the same.
+        if lhs_t.shape == (m, k_lhs) and rhs_t.shape == (k_lhs, n):
+            lhs_arg_pos, rhs_arg_pos = input_positions
+            lhs_resolved, rhs_resolved = lhs_t, rhs_t
+        elif lhs_t.shape == (k_lhs, n) and rhs_t.shape == (m, k_lhs):
+            rhs_arg_pos, lhs_arg_pos = input_positions
+            lhs_resolved, rhs_resolved = rhs_t, lhs_t
+        else:
+            return None
+
+        # Every block size must be >= max(M, N, K): a smaller block means a
+        # multi-launch (tiled) kernel, not the no-tiling case.
+        env = CompileEnvironment.current()
+        max_dim = max(m, k_lhs, n)
+        for bsi in env.block_sizes:
+            if bsi is None:  # type: ignore[unreachable]
+                continue
+            try:
+                bs = bsi.from_config(config)
+            except Exception:
+                return None
+            if not isinstance(bs, int) or bs < max_dim:
+                return None
+
+        # Every tensor must be fully untiled (all grid_dims None); outer-grid
+        # BlockSpecs still need pl.pallas_call.
+        if block_spec_info is None or not isinstance(block_spec_info, list):
+            return None
+        for pos in (input_positions[0], input_positions[1], out_pos):
+            if pos >= len(block_spec_info):
+                return None
+            entry = block_spec_info[pos]
+            if entry is None:
+                return None
+            block_shape, grid_dims = entry
+            if any(gd is not None for gd in grid_dims):
+                return None
+
+        # All checks passed; build the launcher spec. bf16/fp16 output from an
+        # f32 accumulator needs preferred f32 + cast-back; f32 is already f32.
+        f32_acc = out_t.dtype in (torch.bfloat16, torch.float16)
+        # Map positions to the launcher's tensor-arg order (sorted non-output
+        # positions; see ``_pallas_prepare_args``).
+        non_output_positions = sorted(p for p in tensor_positions if p != out_pos)
+        return {
+            "lhs_tensor_arg_index": non_output_positions.index(lhs_arg_pos),
+            "rhs_tensor_arg_index": non_output_positions.index(rhs_arg_pos),
+            "lhs_dtype": self.dtype_str(lhs_resolved.dtype),
+            "rhs_dtype": self.dtype_str(rhs_resolved.dtype),
+            "out_dtype": self.dtype_str(out_t.dtype),
+            "f32_accumulator": bool(f32_acc),
+        }
+
     def build_launcher_args(
         self,
         args: list[str],
@@ -2248,6 +2406,21 @@ class PallasBackend(Backend):
 
         if CompileEnvironment.current().settings.pallas_interpret:
             launcher_args.append("_pallas_interpret=True")
+
+        # No-tiling pure 2D matmul: emit ``_matmul_dot_general=...`` so the
+        # launcher uses ``jax.jit(lax.dot_general(...))`` instead of
+        # ``pl.pallas_call(...)``. XLA can then attach cross_program_prefetch,
+        # closing the ~12% gap to ``jnp.matmul`` that ``tpu_custom_call``
+        # opacity imposes. Falls back silently when ineligible.
+        matmul_spec = self._detect_matmul_dot_general_lowering(
+            sorted_args=sorted_args,
+            config=config,
+            output_indices=output_indices,
+            inplace_indices=inplace_indices,
+            block_spec_info=block_spec_info,
+        )
+        if matmul_spec is not None:
+            launcher_args.append(f"_matmul_dot_general={matmul_spec!r}")
 
         return launcher_args
 
@@ -3253,6 +3426,8 @@ class CuteBackend(Backend):
             "_cute_fp8e4m3fn_to_float32": "from helion._compiler.cute.quantized_helpers import fp8e4m3fn_to_float32 as _cute_fp8e4m3fn_to_float32",
             "_cute_float4_e2m1fn_x2_to_float32": "from helion._compiler.cute.quantized_helpers import float4_e2m1fn_x2_to_float32 as _cute_float4_e2m1fn_x2_to_float32",
             "_cute_grid_barrier": "from helion._compiler.cute.grid_barrier import grid_barrier as _cute_grid_barrier",
+            "_cute_atomic_max_float32": "from helion._compiler.cute.atomic_helpers import atomic_max_float32 as _cute_atomic_max_float32",
+            "_cute_atomic_min_float32": "from helion._compiler.cute.atomic_helpers import atomic_min_float32 as _cute_atomic_min_float32",
         }
 
     def program_id_expr(self, dim: int, *, index_dtype: str) -> str:
