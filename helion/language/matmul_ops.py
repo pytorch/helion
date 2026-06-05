@@ -754,6 +754,8 @@ def _(state: CodegenState) -> object:
         need_f32_acc=need_f32_acc,
         out_dtype=out_dtype,
         lhs_ndim=lhs_proxy.ndim,
+        lhs_dtype=lhs_dtype,
+        rhs_dtype=rhs_dtype,
     )
 
 
