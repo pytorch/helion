@@ -1276,6 +1276,48 @@ def _pallas_apply_ds_padding(
     return tuple(args_list), orig_output_tensors
 
 
+def _build_matmul_dot_general_jit_fn(
+    spec: dict[str, object],
+) -> Callable[..., object]:
+    """Build a ``jax.jit(lax.dot_general)`` wrapper replacing the
+    ``pl.pallas_call`` for a single-launch (no-tiling) Pallas matmul.
+
+    Same call signature as the ``pl.pallas_call`` it replaces, so torch_tpu's
+    dispatch is unchanged.  XLA sees a plain ``dot_general`` op (so
+    ``cross_program_prefetch_index`` is reachable), bypassing the Pallas
+    ``custom_call`` opacity that blocks the prefetch planner.  ``spec`` (from
+    ``_detect_matmul_dot_general_lowering``) carries the lhs/rhs arg positions
+    and the f32-accumulator flag.
+    """
+    import jax
+    import jax.lax as lax
+    import jax.numpy as jnp
+
+    out_dtype_str = cast("str", spec["out_dtype"])
+    out_jnp_dtype = cast("Any", _pallas_jnp_dtype_map().get(out_dtype_str, jnp.float32))
+    f32_accumulator = bool(spec.get("f32_accumulator"))
+    lhs_idx = int(cast("int", spec["lhs_tensor_arg_index"]))
+    rhs_idx = int(cast("int", spec["rhs_tensor_arg_index"]))
+
+    # Accumulate in f32 and cast back only when the output is narrower than f32
+    # (bf16/fp16 out); otherwise accumulate straight into the output dtype.
+    needs_cast = f32_accumulator and out_jnp_dtype is not jnp.float32
+    preferred = jnp.float32 if needs_cast else out_jnp_dtype
+
+    def matmul_fn(*tensor_inputs: Any) -> Any:  # noqa: ANN401
+        result = lax.dot_general(
+            tensor_inputs[lhs_idx],
+            tensor_inputs[rhs_idx],
+            dimension_numbers=(((1,), (0,)), ((), ())),
+            preferred_element_type=preferred,
+        )
+        if needs_cast:
+            result = lax.convert_element_type(result, out_jnp_dtype)
+        return result
+
+    return cast("Callable[..., object]", jax.jit(matmul_fn))
+
+
 def default_pallas_launcher(
     pallas_kernel: object,
     grid: tuple[int, ...],
@@ -1286,6 +1328,7 @@ def default_pallas_launcher(
     _smem_arg_indices: list[int] | None = None,
     _ds_pad_dims: list[tuple[int, int, int, int]] | None = None,
     _pallas_interpret: bool | None = None,
+    _matmul_dot_general: dict[str, object] | None = None,
     **kwargs: object,
 ) -> object:
     """Default launcher for Pallas kernels on TPU (or CPU with interpret=True).
@@ -1377,23 +1420,29 @@ def default_pallas_launcher(
 
         out_shape_arg = out_shapes if len(out_shapes) > 1 else out_shapes[0]
 
-        estimated_vmem = _estimate_pallas_vmem_bytes(
-            pl,
-            pltpu,
-            in_specs,
-            out_specs,
-            None,
-            spec_args,
-            tensor_arg_indices,
-            _output_indices,
-            pallas_aliases,
-        )
-        vmem_limit_bytes = _get_vmem_limit_bytes(pltpu)
-        if estimated_vmem > vmem_limit_bytes:
-            raise RuntimeError(
-                f"XLA:TPU compile permanent error. Ran out of memory in memory space vmem. "
-                f"Estimated {estimated_vmem / 1e6:.2f}MB exceeds {vmem_limit_bytes / 1e6:.2f}MB vmem capacity."
+        # The VMEM estimate only applies to the ``pl.pallas_call`` lowering.
+        # The ``jax.jit(lax.dot_general)`` path doesn't allocate VMEM the
+        # same way (XLA's planner streams the contraction).  Skipping the
+        # check for that path lets large no-tiling configs reach the
+        # dot_general substitution below.
+        if _matmul_dot_general is None:
+            estimated_vmem = _estimate_pallas_vmem_bytes(
+                pl,
+                pltpu,
+                in_specs,
+                out_specs,
+                None,
+                spec_args,
+                tensor_arg_indices,
+                _output_indices,
+                pallas_aliases,
             )
+            vmem_limit_bytes = _get_vmem_limit_bytes(pltpu)
+            if estimated_vmem > vmem_limit_bytes:
+                raise RuntimeError(
+                    f"XLA:TPU compile permanent error. Ran out of memory in memory space vmem. "
+                    f"Estimated {estimated_vmem / 1e6:.2f}MB exceeds {vmem_limit_bytes / 1e6:.2f}MB vmem capacity."
+                )
 
         pallas_call_kwargs: dict[str, object] = {
             "out_shape": out_shape_arg,
@@ -1409,10 +1458,16 @@ def default_pallas_launcher(
                 dimension_semantics=dimension_semantics,
             )
 
-        jit_fn = pl.pallas_call(
-            reordered_kernel,  # pyrefly: ignore[bad-argument-type]
-            **pallas_call_kwargs,  # type: ignore[arg-type]
-        )
+        if _matmul_dot_general is not None:
+            # Substitute ``lax.dot_general`` for ``pl.pallas_call`` on
+            # no-tiling matmul configs so XLA sees a regular ``dot`` and
+            # can attach ``cross_program_prefetch_index``.
+            jit_fn = _build_matmul_dot_general_jit_fn(_matmul_dot_general)
+        else:
+            jit_fn = pl.pallas_call(
+                reordered_kernel,  # pyrefly: ignore[bad-argument-type]
+                **pallas_call_kwargs,  # type: ignore[arg-type]
+            )
 
         jax_callable = _pallas_build_callable(
             pallas_kernel,
@@ -1489,6 +1544,7 @@ def default_pallas_pipeline_launcher(
     _ds_pad_dims: list[tuple[int, int, int, int]] | None = None,
     _smem_arg_indices: list[int] | None = None,
     _pallas_interpret: bool | None = None,
+    _matmul_dot_general: dict[str, object] | None = None,
     **kwargs: object,
 ) -> object:
     """Launcher for Pallas kernels using PrefetchScalarGridSpec with scratch memory.
@@ -1606,23 +1662,27 @@ def default_pallas_pipeline_launcher(
             grid=grid,
         )
 
-        estimated_vmem = _estimate_pallas_vmem_bytes(
-            pl,
-            pltpu,
-            in_specs_list,
-            out_specs,
-            scratch_shapes,
-            spec_args,
-            tensor_arg_indices,
-            _output_indices,
-            pallas_aliases,
-        )
-        vmem_limit_bytes = _get_vmem_limit_bytes(pltpu)
-        if estimated_vmem > vmem_limit_bytes:
-            raise RuntimeError(
-                f"XLA:TPU compile permanent error. Ran out of memory in memory space vmem. "
-                f"Estimated {estimated_vmem / 1e6:.2f}MB exceeds {vmem_limit_bytes / 1e6:.2f}MB vmem capacity."
+        # The VMEM-estimate check doesn't apply to the
+        # ``jax.jit(lax.dot_general)`` path, which doesn't go through
+        # ``pl.pallas_call``.
+        if _matmul_dot_general is None:
+            estimated_vmem = _estimate_pallas_vmem_bytes(
+                pl,
+                pltpu,
+                in_specs_list,
+                out_specs,
+                scratch_shapes,
+                spec_args,
+                tensor_arg_indices,
+                _output_indices,
+                pallas_aliases,
             )
+            vmem_limit_bytes = _get_vmem_limit_bytes(pltpu)
+            if estimated_vmem > vmem_limit_bytes:
+                raise RuntimeError(
+                    f"XLA:TPU compile permanent error. Ran out of memory in memory space vmem. "
+                    f"Estimated {estimated_vmem / 1e6:.2f}MB exceeds {vmem_limit_bytes / 1e6:.2f}MB vmem capacity."
+                )
 
         pallas_call_kwargs: dict[str, object] = {
             "out_shape": out_shape_arg,
@@ -1634,10 +1694,14 @@ def default_pallas_pipeline_launcher(
         if interpret:
             pallas_call_kwargs["interpret"] = True
 
-        jit_fn = pl.pallas_call(
-            reordered_kernel,  # pyrefly: ignore[bad-argument-type]
-            **pallas_call_kwargs,  # type: ignore[arg-type]
-        )
+        if _matmul_dot_general is not None:
+            # Substitute ``lax.dot_general`` on no-tiling matmul configs.
+            jit_fn = _build_matmul_dot_general_jit_fn(_matmul_dot_general)
+        else:
+            jit_fn = pl.pallas_call(
+                reordered_kernel,  # pyrefly: ignore[bad-argument-type]
+                **pallas_call_kwargs,  # type: ignore[arg-type]
+            )
 
         jax_callable = _pallas_build_callable(
             pallas_kernel,
