@@ -3,6 +3,7 @@ from __future__ import annotations
 import math
 import os
 from typing import TYPE_CHECKING
+from typing import Any
 from typing import Callable
 import unittest
 
@@ -4157,6 +4158,189 @@ class TestPallasIndirectGather(TestCase):
 
 
 instantiate_parametrized_tests(TestPallasIndirectGather)
+
+
+@skipUnlessPallas("JAX/Pallas TPU not available")
+class TestPallasJaxFn(TestCase):
+    """End-to-end tests for the ``Kernel.jax_fn`` pure-JAX export path.
+
+    Covers all three ``pallas_loop_type`` flavours plus a multi-kernel
+    composition test, each exercising the kernel inside a ``jax.jit``
+    boundary with non-trivial pure-JAX prologue / epilogue around it.
+    """
+
+    def _import_jax(self) -> tuple[Any, Any]:
+        import jax
+        import jax.numpy as jnp
+
+        return jax, jnp
+
+    def test_jax_fn_emit_pipeline(self) -> None:
+        """jax_fn drives an emit_pipeline kernel inside ``jax.jit``."""
+        jax, jnp = self._import_jax()
+
+        @helion.kernel(
+            backend="pallas",
+            static_shapes=True,
+            config=helion.Config(
+                block_sizes=[128, 128], pallas_loop_type="emit_pipeline"
+            ),
+        )
+        def add_kernel(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile in hl.tile(out.size()):
+                out[tile] = x[tile] + y[tile]
+            return out
+
+        jax_kernel = add_kernel.jax_fn
+
+        @jax.jit
+        def f(a: Any, b: Any, scale: float) -> Any:
+            # prologue (pure jax)
+            a = a * scale
+            b = jnp.tanh(b)
+            # kernel
+            c = jax_kernel(a, b)
+            # epilogue (pure jax)
+            return jnp.sum(c) + jnp.mean(c) * 0.5
+
+        a = jnp.ones((128, 128), dtype=jnp.float32)
+        b = jnp.full((128, 128), 0.5, dtype=jnp.float32)
+        scale = 2.0
+
+        result = float(f(a, b, scale))
+
+        # Reference: same prologue/epilogue, eager addition
+        ref_a = a * scale
+        ref_b = jnp.tanh(b)
+        ref_c = ref_a + ref_b
+        ref = float(jnp.sum(ref_c) + jnp.mean(ref_c) * 0.5)
+        self.assertAlmostEqual(result, ref, places=2)
+
+    def test_jax_fn_unroll(self) -> None:
+        """jax_fn drives an unroll kernel inside ``jax.jit``."""
+        jax, jnp = self._import_jax()
+
+        @helion.kernel(
+            backend="pallas",
+            static_shapes=True,
+            config=helion.Config(block_sizes=[128, 128], pallas_loop_type="unroll"),
+        )
+        def relu_add_kernel(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile in hl.tile(out.size()):
+                out[tile] = torch.relu(x[tile]) + y[tile]
+            return out
+
+        jax_kernel = relu_add_kernel.jax_fn
+
+        @jax.jit
+        def f(a: Any, b: Any) -> Any:
+            a = a - 0.25
+            b = b * b
+            c = jax_kernel(a, b)
+            return jnp.sum(c * c)
+
+        a = jnp.linspace(-1.0, 1.0, 128 * 128, dtype=jnp.float32).reshape((128, 128))
+        b = jnp.full((128, 128), 0.3, dtype=jnp.float32)
+
+        result = float(f(a, b))
+
+        ref_a = a - 0.25
+        ref_b = b * b
+        ref_c = jnp.maximum(ref_a, 0.0) + ref_b
+        ref = float(jnp.sum(ref_c * ref_c))
+        self.assertAlmostEqual(result, ref, places=1)
+
+    def test_jax_fn_fori_loop(self) -> None:
+        """jax_fn drives a fori_loop kernel inside ``jax.jit``."""
+        jax, jnp = self._import_jax()
+
+        @helion.kernel(
+            backend="pallas",
+            static_shapes=True,
+            config=helion.Config(block_sizes=[128, 128], pallas_loop_type="fori_loop"),
+        )
+        def mul_add_kernel(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile_m in hl.tile(x.size(0)):
+                for tile_n in hl.tile(x.size(1)):
+                    out[tile_m, tile_n] = x[tile_m, tile_n] * 1.5 + y[tile_m, tile_n]
+            return out
+
+        jax_kernel = mul_add_kernel.jax_fn
+
+        @jax.jit
+        def f(a: Any, b: Any) -> Any:
+            a = a * 0.5 + 1.0
+            b = jnp.exp(b * 0.1)
+            c = jax_kernel(a, b)
+            return jnp.mean(c)
+
+        a = jnp.full((128, 128), 2.0, dtype=jnp.float32)
+        b = jnp.zeros((128, 128), dtype=jnp.float32)
+
+        result = float(f(a, b))
+
+        ref_a = a * 0.5 + 1.0
+        ref_b = jnp.exp(b * 0.1)
+        ref_c = ref_a * 1.5 + ref_b
+        ref = float(jnp.mean(ref_c))
+        self.assertAlmostEqual(result, ref, places=2)
+
+    def test_jax_fn_multi_kernel_in_one_jit(self) -> None:
+        """A single ``jax.jit`` function uses two distinct Helion kernels."""
+        jax, jnp = self._import_jax()
+
+        @helion.kernel(
+            backend="pallas",
+            static_shapes=True,
+            config=helion.Config(block_sizes=[128, 128]),
+        )
+        def add_kernel(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile in hl.tile(out.size()):
+                out[tile] = x[tile] + y[tile]
+            return out
+
+        @helion.kernel(
+            backend="pallas",
+            static_shapes=True,
+            config=helion.Config(block_sizes=[128, 128]),
+        )
+        def mul_kernel(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile in hl.tile(out.size()):
+                out[tile] = x[tile] * y[tile]
+            return out
+
+        add_jax = add_kernel.jax_fn
+        mul_jax = mul_kernel.jax_fn
+
+        @jax.jit
+        def f(a: Any, b: Any, c: Any) -> Any:
+            # prologue
+            a = a + 1.0
+            # first kernel: a + b
+            ab = add_jax(a, b)
+            # middle pure-jax transform
+            ab = jnp.tanh(ab)
+            # second kernel: (tanh result) * c
+            out = mul_jax(ab, c)
+            # epilogue
+            return jnp.sum(out)
+
+        a = jnp.full((128, 128), 0.5, dtype=jnp.float32)
+        b = jnp.full((128, 128), 0.25, dtype=jnp.float32)
+        c = jnp.full((128, 128), 2.0, dtype=jnp.float32)
+
+        result = float(f(a, b, c))
+
+        ref_a = a + 1.0
+        ref_ab = jnp.tanh(ref_a + b)
+        ref_out = ref_ab * c
+        ref = float(jnp.sum(ref_out))
+        self.assertAlmostEqual(result, ref, places=2)
 
 
 class TestPallasPrinter(TestCase):
