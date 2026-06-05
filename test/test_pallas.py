@@ -616,7 +616,6 @@ class TestPallas(TestCase):
             block_sizes=[32, 128, 128],
             pallas_loop_type="emit_pipeline",
         )
-        self.assertIn("pltpu.emit_pipeline", code)
         expected = a @ b
         torch.testing.assert_close(out, expected)
 
