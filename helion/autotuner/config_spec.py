@@ -1265,6 +1265,41 @@ class ConfigSpec:
                     max(min_block, spec.autotuner_min)
                 )
 
+    def raise_attention_block_minimums(self) -> None:
+        """Raise the flash-attention query/M tile's ``autotuner_min`` to 64.
+
+        Keeps the search off the M<64 tensor-core cliff (measured on B200/sm100,
+        so gated to sm100 + the GPU MMA backends). Clamped to the tile's max;
+        no-op elsewhere.
+        """
+        if self.backend_name not in ("triton", "cute"):
+            return
+        # Local imports: avoid coupling config_spec to the autotuner_heuristics package.
+        from .._compiler.autotuner_heuristics.common import ATTENTION_MIN_QUERY_BLOCK
+        from .._compiler.autotuner_heuristics.common import attention_query_block_id
+        from .._compiler.compile_environment import CompileEnvironment
+        from .._hardware import get_hardware_info
+
+        env = CompileEnvironment.current()
+        # Gate to B200 (sm100), where the cliff was measured.
+        try:
+            hardware = get_hardware_info(env.device)
+        except RuntimeError:
+            return
+        if hardware.compute_capability != "sm100":
+            return
+
+        m_block_id = attention_query_block_id(env)
+        if m_block_id is None:
+            return
+        try:
+            spec = self.block_sizes.block_id_lookup(m_block_id)
+        except KeyError:
+            return
+        floor = min(ATTENTION_MIN_QUERY_BLOCK, spec.max_size)
+        if floor > spec.autotuner_min:
+            spec.autotuner_min = assert_integer_power_of_two(floor)
+
     def create_config_generation(
         self,
         *,

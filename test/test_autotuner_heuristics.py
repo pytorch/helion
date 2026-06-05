@@ -8,6 +8,8 @@ import torch
 
 import helion
 from helion._compiler.autotuner_heuristics import compiler_seed_configs
+from helion._compiler.autotuner_heuristics.common import ATTENTION_MIN_QUERY_BLOCK
+from helion._compiler.autotuner_heuristics.common import attention_query_block_id
 from helion._compiler.autotuner_heuristics.cute import CuteTcgen05ClusterM2Heuristic
 from helion._compiler.autotuner_heuristics.registry import AutotunerHeuristic
 from helion._compiler.autotuner_heuristics.triton import TritonReductionTileHeuristic
@@ -3149,3 +3151,326 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
                 len(seed["indexing"]),
                 bound.config_spec.indexing.length,
             )
+
+
+def _flash_attention_body(
+    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor
+) -> torch.Tensor:
+    """Flash attention (Q@Kᵀ → softmax → P@V) — the dataflow the guard floors."""
+    bh, seq_len, head_dim = q.size()
+    out = torch.empty_like(q)
+    sm_scale = 1.0 / (head_dim**0.5)
+    for b in hl.grid(bh):
+        for tile_m in hl.tile(seq_len):
+            m_i = hl.full([tile_m], float("-inf"), dtype=torch.float32)
+            l_i = hl.full([tile_m], 0.0, dtype=torch.float32)
+            acc = hl.zeros([tile_m, head_dim], dtype=torch.float32)
+            q_tile = q[b, tile_m, :]
+            for tile_n in hl.tile(seq_len):
+                qk = hl.dot(q_tile, k[b, tile_n, :].transpose(0, 1)) * sm_scale
+                m_new = torch.maximum(m_i, torch.amax(qk, dim=-1))
+                p = torch.exp(qk - m_new[:, None])
+                alpha = torch.exp(m_i - m_new)
+                l_i = l_i * alpha + torch.sum(p, dim=-1)
+                acc = acc * alpha[:, None]
+                acc = hl.dot(p.to(v.dtype), v[b, tile_n, :], acc=acc)
+                m_i = m_new
+            out[b, tile_m, :] = (acc / l_i[:, None]).to(out.dtype)
+    return out
+
+
+# The same dataflow with and without the autotuner heuristics, so the opt-out
+# test exercises the identical kernel as the fire/floor test.
+_flash_attention_kernel = helion.kernel(_flash_attention_body, backend="triton")
+_flash_attention_kernel_heuristics_disabled = helion.kernel(
+    _flash_attention_body, backend="triton", disable_autotuner_heuristics=True
+)
+
+
+@helion.kernel(backend="triton")
+def _plain_matmul_kernel(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    m, kk = x.size()
+    _, n = y.size()
+    out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+    for tile_m, tile_n in hl.tile([m, n]):
+        acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+        for tile_k in hl.tile(kk):
+            acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+        out[tile_m, tile_n] = acc.to(x.dtype)
+    return out
+
+
+@helion.kernel(backend="triton")
+def _two_parallel_matmuls_kernel(
+    x: torch.Tensor, y: torch.Tensor, z: torch.Tensor
+) -> torch.Tensor:
+    # acc0 = x@y, acc1 = x@z: shares M and K but with INDEPENDENT N, so the two
+    # GEMMs are not chained (no produce-then-consume kv tile) — not attention.
+    m, kk = x.size()
+    _, n = y.size()
+    out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+    for tile_m, tile_n in hl.tile([m, n]):
+        acc0 = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+        acc1 = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+        for tile_k in hl.tile(kk):
+            acc0 = torch.addmm(acc0, x[tile_m, tile_k], y[tile_k, tile_n])
+            acc1 = torch.addmm(acc1, x[tile_m, tile_k], z[tile_k, tile_n])
+        out[tile_m, tile_n] = (acc0 + acc1).to(x.dtype)
+    return out
+
+
+@helion.kernel(backend="triton")
+def _mlp_chain_kernel(
+    x: torch.Tensor, w1: torch.Tensor, w2: torch.Tensor
+) -> torch.Tensor:
+    # Produce-consume two-layer matmul: h = relu(x@w1); out = h@w2. Shares the
+    # row tile and chains the intermediate, but every axis is tiled (the head/
+    # feature dim is not left untiled), so it is NOT attention and not floored.
+    m, _ = x.size()
+    _, n2 = w2.size()
+    out = torch.empty([m, n2], dtype=x.dtype, device=x.device)
+    for tile_m in hl.tile(m):
+        h = torch.relu(torch.matmul(x[tile_m, :], w1[:, :]))
+        out[tile_m, :] = torch.matmul(h, w2[:, :])
+    return out
+
+
+class TestAttentionQueryTileFloor(TestCase):
+    """Attention query-tile floor.
+
+    The query-sequence tile is the MMA M-dimension shared by Q@Kᵀ and @V; below
+    M=64 tensor cores underutilize, a deterministic ~5x cliff. The floor detects
+    the flash-attention two-matmul chain STRUCTURALLY (not by shape or dtype) and
+    raises that tile's ``autotuner_min`` to 64 so the search cannot drift below
+    the cliff. It must fire on bf16/fp8 attention and NOT on a plain GEMM, two
+    independent GEMMs sharing M, a produce-consume two-layer matmul chain, a
+    reduction, or a rope rotate.
+    """
+
+    def _make_triton_env(self) -> MagicMock:
+        spec = ConfigSpec(backend=TritonBackend())
+        spec.block_sizes.append(BlockSizeSpec(block_id=0, size_hint=2048))
+        spec.block_sizes.append(BlockSizeSpec(block_id=1, size_hint=2048))
+        env = MagicMock()
+        env.backend_name = "triton"
+        env.config_spec = spec
+        env.device = DEVICE
+        env.settings = Settings()
+        return env
+
+    @staticmethod
+    def _fact(
+        *,
+        m_block_id: int | None,
+        n_block_id: int | None,
+        k_block_id: int | None,
+    ) -> MatmulFact:
+        return MatmulFact(
+            lhs_ndim=2,
+            rhs_ndim=2,
+            m_block_id=m_block_id,
+            n_block_id=n_block_id,
+            k_block_id=k_block_id,
+            static_m=2048,
+            static_n=2048,
+            static_k=64,
+            lhs_dtype=torch.float8_e4m3fn,
+            rhs_dtype=torch.float8_e4m3fn,
+        )
+
+    def test_predicate_fires_only_on_attention_chain(self) -> None:
+        # The flash-attention signature: query tile (block 0) is M of both
+        # matmuls; the kv tile (block 1) is N of the scores GEMM and K of the @V
+        # GEMM. Block ids mirror the real fp8/bf16 attention facts.
+        attn = self._make_triton_env()
+        attn.config_spec.matmul_facts.extend(
+            [
+                self._fact(m_block_id=0, n_block_id=1, k_block_id=None),
+                self._fact(m_block_id=0, n_block_id=None, k_block_id=1),
+            ]
+        )
+        self.assertEqual(attention_query_block_id(attn), 0)
+
+        # A single GEMM is not attention.
+        single = self._make_triton_env()
+        single.config_spec.matmul_facts.append(
+            self._fact(m_block_id=0, n_block_id=1, k_block_id=None)
+        )
+        self.assertIsNone(attention_query_block_id(single))
+
+        # Two GEMMs sharing M and K but with INDEPENDENT N (acc0 = x@y,
+        # acc1 = x@z) is not a chain: the kv tile is not produced-then-consumed.
+        parallel = self._make_triton_env()
+        parallel.config_spec.block_sizes.append(
+            BlockSizeSpec(block_id=2, size_hint=2048)
+        )
+        parallel.config_spec.matmul_facts.extend(
+            [
+                self._fact(m_block_id=0, n_block_id=1, k_block_id=2),
+                self._fact(m_block_id=0, n_block_id=1, k_block_id=2),
+            ]
+        )
+        self.assertIsNone(attention_query_block_id(parallel))
+
+        # A two-layer MLP chain (H=X@W1; out=H@W2) shares an M tile + chains an
+        # intermediate too, but every axis is tiled -- the guard must NOT fire.
+        mlp_chain = self._make_triton_env()
+        mlp_chain.config_spec.block_sizes.append(
+            BlockSizeSpec(block_id=2, size_hint=2048)
+        )
+        mlp_chain.config_spec.block_sizes.append(
+            BlockSizeSpec(block_id=3, size_hint=2048)
+        )
+        mlp_chain.config_spec.matmul_facts.extend(
+            [
+                # X@W1: M=0, N=1 (intermediate), K=2 (first contraction) -- tiled.
+                self._fact(m_block_id=0, n_block_id=1, k_block_id=2),
+                # H@W2: M=0, K=1 (intermediate contraction), N=3 (output) -- tiled.
+                self._fact(m_block_id=0, n_block_id=3, k_block_id=1),
+            ]
+        )
+        self.assertIsNone(attention_query_block_id(mlp_chain))
+
+        # No matmul facts (reduction / elementwise / rope) is not attention.
+        self.assertIsNone(attention_query_block_id(self._make_triton_env()))
+
+    def _attention_env(self, *, query_size_hint: int) -> MagicMock:
+        spec = ConfigSpec(backend=TritonBackend())
+        spec.block_sizes.append(BlockSizeSpec(block_id=0, size_hint=query_size_hint))
+        spec.block_sizes.append(BlockSizeSpec(block_id=1, size_hint=query_size_hint))
+        spec.matmul_facts.extend(
+            [
+                self._fact(m_block_id=0, n_block_id=1, k_block_id=None),
+                self._fact(m_block_id=0, n_block_id=None, k_block_id=1),
+            ]
+        )
+        env = MagicMock()
+        env.backend_name = "triton"
+        env.config_spec = spec
+        env.device = DEVICE
+        env.settings = Settings()
+        return env
+
+    def test_floor_raises_query_tile_minimum_clamped_to_max(self) -> None:
+        # Floor raises only the query tile's autotuner_min to 64, clamped to its
+        # max (kv tile untouched). Detector + sm100 hardware are mocked to isolate
+        # the clamp logic and run on any CI host.
+        for query_size_hint, expected_floor in (
+            (2048, ATTENTION_MIN_QUERY_BLOCK),
+            (64, 64),
+        ):
+            spec = self._attention_env(query_size_hint=query_size_hint).config_spec
+            m_before = spec.block_sizes.block_id_lookup(0).autotuner_min
+            kv_before = spec.block_sizes.block_id_lookup(1).autotuner_min
+            self.assertLessEqual(m_before, ATTENTION_MIN_QUERY_BLOCK)
+            with (
+                self.subTest(query_size_hint=query_size_hint),
+                patch(
+                    "helion._compiler.autotuner_heuristics.common."
+                    "attention_query_block_id",
+                    return_value=0,
+                ),
+                patch(
+                    "helion._compiler.compile_environment.CompileEnvironment.current",
+                    return_value=MagicMock(),
+                ),
+                patch(
+                    "helion._hardware.get_hardware_info",
+                    return_value=BLACKWELL_HARDWARE,
+                ),
+            ):
+                spec.raise_attention_block_minimums()
+            m_spec = spec.block_sizes.block_id_lookup(0)
+            # Floored at 64, but never raised past the tile's max.
+            self.assertEqual(m_spec.autotuner_min, expected_floor)
+            self.assertLessEqual(m_spec.autotuner_min, m_spec.max_size)
+            # The kv tile (block 1) is untouched by the floor.
+            self.assertEqual(
+                spec.block_sizes.block_id_lookup(1).autotuner_min, kv_before
+            )
+
+    def test_floor_is_gated_to_gpu_backends(self) -> None:
+        # The M<64 cliff is a GPU tensor-core fact; the floor must be a no-op on
+        # non-GPU backends (e.g. Pallas/TPU) even for an attention dataflow. The
+        # backend gate returns before any env lookup, so this needs no env.
+        spec = ConfigSpec(backend=TritonBackend())
+        spec.block_sizes.append(BlockSizeSpec(block_id=0, size_hint=2048))
+        spec.block_sizes.append(BlockSizeSpec(block_id=1, size_hint=2048))
+        spec.matmul_facts.extend(
+            [
+                self._fact(m_block_id=0, n_block_id=1, k_block_id=None),
+                self._fact(m_block_id=0, n_block_id=None, k_block_id=1),
+            ]
+        )
+        before = spec.block_sizes.block_id_lookup(0).autotuner_min
+        spec.backend_name = "pallas"
+        spec.raise_attention_block_minimums()
+        self.assertEqual(spec.block_sizes.block_id_lookup(0).autotuner_min, before)
+        self.assertLess(before, ATTENTION_MIN_QUERY_BLOCK)
+
+    @staticmethod
+    def _randn(*shape: int) -> torch.Tensor:
+        return torch.randn(*shape, device=DEVICE, dtype=HALF_DTYPE)
+
+    @onlyBackends(["triton"])
+    @skipIfRefEager("Compiler heuristics are not collected in ref eager mode")
+    def test_fires_and_floors_on_real_attention(self) -> None:
+        # The floor is gated to B200 (sm100), the hardware it was measured on.
+        # Mock the hardware to sm100 around the bind (where the floor is applied)
+        # so the floor logic is exercised on any CI runner, not just a B200.
+        with patch(
+            "helion._hardware.get_hardware_info",
+            return_value=BLACKWELL_HARDWARE,
+        ):
+            attn = _flash_attention_kernel.bind(
+                tuple(
+                    torch.randn(8, 512, 64, device=DEVICE, dtype=HALF_DTYPE)
+                    for _ in range(3)
+                )
+            )
+        m_block_id = attention_query_block_id(attn.env)
+        self.assertIsNotNone(m_block_id)
+        # The query tile is floored at 64 in the search space.
+        m_spec = attn.config_spec.block_sizes.block_id_lookup(m_block_id)
+        self.assertGreaterEqual(m_spec.autotuner_min, ATTENTION_MIN_QUERY_BLOCK)
+        seed_index = attn.config_spec.block_sizes.block_id_to_index(m_block_id)
+        # NEGATIVE CONTROL: a search over the floored spec cannot produce a query
+        # tile below 64 (the cliff). This assertion fails if the floor is reverted.
+        config_gen = attn.config_spec.create_config_generation()
+        for config in config_gen.random_population(16):
+            self.assertGreaterEqual(
+                config.config["block_sizes"][seed_index],
+                ATTENTION_MIN_QUERY_BLOCK,
+            )
+
+        # The floor must NOT fire on (and must not floor) these non-attention
+        # chains: a plain GEMM, two parallel GEMMs sharing M+K but with
+        # independent N, or a fully-tiled produce-consume MLP chain (x@w1 -> h@w2).
+        non_attention = (
+            _plain_matmul_kernel.bind((self._randn(512, 512), self._randn(512, 512))),
+            _two_parallel_matmuls_kernel.bind(
+                (self._randn(512, 512), self._randn(512, 512), self._randn(512, 512))
+            ),
+            _mlp_chain_kernel.bind(
+                (self._randn(512, 256), self._randn(256, 512), self._randn(512, 128))
+            ),
+        )
+        for bound in non_attention:
+            self.assertIsNone(attention_query_block_id(bound.env))
+
+    @onlyBackends(["triton"])
+    @skipIfRefEager("Compiler heuristics are not collected in ref eager mode")
+    def test_disable_autotuner_heuristics_opts_out_of_floor(self) -> None:
+        # The attention query-tile floor is a perf heuristic, so it must honor
+        # the same opt-out as the compiler seed heuristics: with the setting on,
+        # the SAME attention kernel parses as attention but is NOT floored.
+        attn = _flash_attention_kernel_heuristics_disabled.bind(
+            tuple(
+                torch.randn(8, 512, 64, device=DEVICE, dtype=HALF_DTYPE)
+                for _ in range(3)
+            )
+        )
+        m_block_id = attention_query_block_id(attn.env)
+        self.assertIsNotNone(m_block_id)
+        m_spec = attn.config_spec.block_sizes.block_id_lookup(m_block_id)
+        self.assertLess(m_spec.autotuner_min, ATTENTION_MIN_QUERY_BLOCK)
