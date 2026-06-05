@@ -435,6 +435,14 @@ KERNEL_MAPPINGS: dict[str, tuple[str, ...]] = {
             "num_inputs": 10,  # fp8_gemm takes long time on Benchmark CI, so use fewer inputs instead.
         },
     ),
+    "fp8_gemm_rowwise": (
+        "tritonbench.operators.fp8_gemm_rowwise.operator",
+        "examples.scaled_mm",
+        "scaled_mm_tritonbench",
+        {
+            "num_inputs": 10,  # fp8_gemm_rowwise takes long time on Benchmark CI, so use fewer inputs instead.
+        },
+    ),
     "flash_attention": (
         "tritonbench.operators.flash_attention.operator",
         "examples.attention",
@@ -933,6 +941,14 @@ KERNEL_METRIC_MAPPINGS: dict[str, dict[str, str]] = {
         "helion_fp8_gemm_tritonbench-speedup": "helion_speedup",
         "helion_fp8_gemm_tritonbench-accuracy": "helion_accuracy",
         "helion_fp8_gemm_tritonbench-latency": "helion_latency_ms",
+    },
+    "fp8_gemm_rowwise": {
+        "_triton": "baseline",
+        "_triton-speedup": "triton_speedup",
+        "_triton-accuracy": "triton_accuracy",
+        "helion_scaled_mm_tritonbench-speedup": "helion_speedup",
+        "helion_scaled_mm_tritonbench-accuracy": "helion_accuracy",
+        "helion_scaled_mm_tritonbench-latency": "helion_latency_ms",
     },
     "low_mem_dropout": {
         "seeded_dropout-accuracy": "triton_accuracy",
