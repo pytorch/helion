@@ -251,8 +251,19 @@ class BaseSearch(BaseAutotuner):
         budget = self.settings.autotune_budget_seconds
         if budget is not None:
             self.log(f"Autotune budget: {budget}s")
+        outer_kernel = getattr(self.kernel, "kernel", None)
+        kernel_source_hash = ""
+        if outer_kernel is not None:
+            try:
+                kernel_source_hash = outer_kernel.kernel_source_hash()
+            except Exception:
+                self.log.debug(
+                    "Failed to compute Helion kernel source hash", exc_info=True
+                )
         self._autotune_metrics: AutotuneMetrics = AutotuneMetrics(
-            kernel_name=getattr(getattr(self.kernel, "kernel", None), "name", ""),
+            kernel_idx=outer_kernel.kernel_id() if outer_kernel is not None else -1,
+            kernel_name=getattr(outer_kernel, "name", ""),
+            kernel_source_hash=kernel_source_hash,
             input_shapes=str(
                 [tuple(arg.shape) for arg in self.args if isinstance(arg, torch.Tensor)]
             ),
