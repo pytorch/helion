@@ -551,6 +551,30 @@ def kernel_tile_begin_plus_offset_is_elementwise(
 @onlyBackends(["triton", "pallas"])
 @skipUnlessPallas("JAX/Pallas TPU not available")
 class TestPallas(TestCase):
+    def test_slice_addressing_classification(self) -> None:
+        """_slice_addressing: major dim -> DIRECT; f32 single-lane-tile sublane
+        -> DIRECT; bf16 / wide-lane / unknown-lane sublane -> ALIGNED."""
+        from helion._compiler.backend import SliceAddressing as SA
+        from helion._compiler.backend import _slice_addressing as classify
+
+        f32_2d = torch.empty(16, 128, dtype=torch.float32)
+        bf16_2d = torch.empty(16, 128, dtype=torch.bfloat16)
+        f32_3d = torch.empty(4, 16, 128, dtype=torch.float32)
+
+        # major (leading) dim -> DIRECT regardless of the lane block
+        self.assertIs(classify(f32_3d, 0, 128), SA.DIRECT)
+        self.assertIs(classify(f32_3d, 0, None), SA.DIRECT)
+
+        # sublane dim, f32, lane block <= 128 -> DIRECT (single lane tile)
+        self.assertIs(classify(f32_2d, 0, 128), SA.DIRECT)
+        self.assertIs(classify(f32_3d, 1, 128), SA.DIRECT)
+        # sublane dim, f32, lane block > 128 -> ALIGNED (spans >1 lane tile)
+        self.assertIs(classify(f32_2d, 0, 256), SA.ALIGNED)
+        # sublane dim, f32, unknown lane block -> ALIGNED (conservative)
+        self.assertIs(classify(f32_2d, 0, None), SA.ALIGNED)
+        # sublane dim, bf16 -> ALIGNED regardless of the lane block
+        self.assertIs(classify(bf16_2d, 0, 128), SA.ALIGNED)
+
     def test_estimate_pallas_vmem_bytes(self) -> None:
         """VMEM OOM: Tests that block sizes and dtypes (fp32, bf16) are correctly estimated."""
 
