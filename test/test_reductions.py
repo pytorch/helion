@@ -169,6 +169,61 @@ class TestReductions(RefEagerTestBase, TestCase):
                 if _get_backend() == "cute":
                     self.assertIn("_cute_grouped_reduce_shared_two_stage", code)
 
+    def test_2d_tile_inner_dim_reduction_to_scalar(self):
+        """Reduce the inner dim of a single 2D ``hl.tile([o, d])`` into a per-row scalar.
+
+        Unlike ``test_cross_warp_reduction_non_sum_ops`` (which uses a separate
+        inner ``hl.tile(m)`` loop), this tiles both dims together in ONE
+        ``hl.tile([o, d])`` and reduces the inner dim (``dim=-1``) into a scalar
+        ``out[tile_o]``. That routes to ``BlockReductionStrategy`` with a runtime
+        lane loop over the block-resident inner dim. This form previously emitted
+        a per-thread partial with NO cross-thread reduction (the stride-32 reduce
+        group is spread across warps), so the threads owning a row raced to store
+        their partial sums -> silently wrong output. The fix folds the lane loop
+        into a per-thread partial and then combines across warps via
+        ``_cute_grouped_reduce_shared_two_stage`` (group_span=128, >32 and %32==0).
+
+        ``d_block`` is forced to the full power-of-2 extent so the reduction stays
+        block-resident (the well-posed form). D=128 makes the reduce group span
+        4 warps, exercising the cross-warp two-stage path on CuTe.
+        """
+
+        @helion.kernel(static_shapes=True, autotune_effort="none")
+        def sum_kernel(w: torch.Tensor) -> torch.Tensor:
+            o, d = w.shape
+            d = hl.specialize(d)
+            out = torch.empty([o], dtype=torch.float32, device=w.device)
+            d_block = hl.register_block_size(
+                helion.next_power_of_2(d), helion.next_power_of_2(d)
+            )
+            for tile_o, tile_d in hl.tile([o, d], block_size=[None, d_block]):
+                out[tile_o] = torch.sum(w[tile_o, tile_d].to(torch.float32), dim=-1)
+            return out
+
+        @helion.kernel(static_shapes=True, autotune_effort="none")
+        def amax_kernel(w: torch.Tensor) -> torch.Tensor:
+            o, d = w.shape
+            d = hl.specialize(d)
+            out = torch.empty([o], dtype=torch.float32, device=w.device)
+            d_block = hl.register_block_size(
+                helion.next_power_of_2(d), helion.next_power_of_2(d)
+            )
+            for tile_o, tile_d in hl.tile([o, d], block_size=[None, d_block]):
+                out[tile_o] = torch.amax(w[tile_o, tile_d].to(torch.float32), dim=-1)
+            return out
+
+        w = torch.randn([512, 128], device=DEVICE, dtype=torch.float32)
+        cases = [
+            (sum_kernel, lambda t: t.sum(-1)),
+            (amax_kernel, lambda t: t.amax(-1)),
+        ]
+        for kernel, ref_fn in cases:
+            with self.subTest(kernel=kernel.__name__):
+                code, out = code_and_output(kernel, (w,))
+                torch.testing.assert_close(out, ref_fn(w), rtol=1e-4, atol=1e-4)
+                if _get_backend() == "cute":
+                    self.assertIn("_cute_grouped_reduce_shared_two_stage", code)
+
     def test_sum_constant_inner_dim(self):
         """Sum over a known-constant inner dimension (e.g., 2) should work.
 
