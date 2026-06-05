@@ -343,6 +343,11 @@ def _(state: CodegenState) -> None:
         value = emit_scatter_store(
             state, scatter_patterns[0].plan, name, idx_str, value
         )
+    from .._compiler.pallas.ordered_carry import emit_carry_store
+
+    if not scatter_patterns and state.device_function.carry_tiles:
+        if emit_carry_store(state, tensor, subscript, name, idx_str, value):
+            return
     state.codegen.add_statement(
         statement_from_string(f"{name}[{idx_str}] = {{value}}", value=value)
     )

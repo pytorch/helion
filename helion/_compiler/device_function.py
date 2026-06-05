@@ -50,6 +50,7 @@ if TYPE_CHECKING:
     from .generate_ast import GenerateAST
     from .indexing_strategy import IndexingStrategy
     from .program_id import ProgramIDs
+    from helion._compiler.pallas.ordered_carry import CarryRowTile
     from helion._compiler.pallas.plan_tiling import DimensionTiling
 
     _P = TypeVar("_P", bound="TensorPropertyArg")
@@ -337,6 +338,12 @@ class DeviceFunction:
         # Pallas: id(fake_tensor) → {dim: (block_id, extra_pad)} for dims
         # using pl.ds() that may need host-side padding.
         self.pallas_pad_info: dict[int, dict[int, tuple[int, int]]] = {}
+        # Pallas ordered carry: jagged row block_id -> CarryRowTile.  Filled by
+        # the emit_pipeline codegen when the tile is a legal map axis; read by
+        # the store codegen to stitch the boundary across neighbouring groups.
+        self.carry_tiles: dict[int, CarryRowTile] = {}
+        # row block_id -> carry scratch var name (allocated lazily at the store).
+        self.carry_scratch: dict[int, str] = {}
 
     def allocate_store_index(self) -> int:
         """Bump store counters and return the indexing strategy slot."""

@@ -1765,6 +1765,18 @@ class PallasBackend(Backend):
             return 8
         return 1  # No requirements for other dimensions
 
+    def sublane_tiling(self, dtype: torch.dtype) -> int:
+        """Native sublane (2nd-minor) tile for ``dtype``: f32->8, bf16->16, i8->32.
+
+        The jagged carry slices its emit_pipeline VMEM refs at this
+        granularity, and such a ref must be accessed as a *whole* native tile:
+        a smaller slice (e.g. 8 rows of a bf16 ref, whose tile is 16) is
+        rejected by Mosaic ("E2003: unproven memory access alignment"),
+        independent of offset.
+        """
+        bitwidth = min(dtype.itemsize * 8, 32)
+        return 8 * (32 // bitwidth)
+
     fake_tensor_loads: list[tuple[torch.Tensor, list[object]]]
 
     def process_fake_tensor_load(
