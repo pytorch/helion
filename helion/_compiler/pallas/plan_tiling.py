@@ -86,6 +86,34 @@ class IndirectScatterPattern(IndexingPattern):
 
 
 @dataclass
+class JaggedSublanePattern(IndexingPattern):
+    """Sublane axis of a 2-D access in jagged scope.
+
+    Carries the sublane tile's bid and the per-item base FX node (the
+    ``starts`` placeholder when the sublane is jagged; ``None`` otherwise).
+    Whether the sublane axis is jagged is recovered at emit time via
+    ``env.is_jagged_tile(block_id)``.
+    """
+
+    base_fx: torch.fx.Node | None
+    block_id: int
+
+
+@dataclass
+class JaggedLanePattern(IndexingPattern):
+    """Lane axis of a 2-D access in jagged scope.
+
+    Carries the lane tile's bid. Whether the lane is jagged (host-padded
+    ``hl.jagged_tile`` lane, e.g. jagged_mean's ``tile_m``) is recovered at
+    emit time via ``env.is_jagged_tile(block_id)``; the length tensor
+    (e.g. feature_counts) is reachable from there via
+    ``env.jagged_tile_parent_ids`` + the tile strategy's ``mask_vars``.
+    """
+
+    block_id: int
+
+
+@dataclass
 class DimensionTiling:
     """Tiling decision for a specific dimension of a tensor
 

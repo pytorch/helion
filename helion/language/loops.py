@@ -746,6 +746,16 @@ def _(
     result = JaggedTileIndexType(origin, base.block_id, parent_block_ids)
     env.register_jagged_tile(base.block_id, parent_block_ids)
 
+    # On Pallas (TPU), the items axis of a jagged kernel must be pinned to
+    # block_size=1: each program owns exactly one item so the per-item DMA
+    # slice + chunk_mask emission can use the program_id as the row index
+    # without a per-program inner items loop. Other backends don't need this.
+    if env.config_spec.backend_name == "pallas":
+        for parent_bid in parent_block_ids:
+            parent_spec = env.config_spec.block_sizes.block_id_lookup(parent_bid)
+            parent_spec.min_size = 1
+            parent_spec.max_size = 1
+
     _add_config_choices(
         [result.block_id],
         is_tile=True,
