@@ -16,6 +16,8 @@ from . import _decorators
 if TYPE_CHECKING:
     from .._compiler.device_ir import HelperFunctionGraphInfo
     from .._compiler.helper_function import CombineFunction
+    from .._compiler.helper_function import CombineFunctionBasic
+    from .._compiler.helper_function import CombineFunctionTuple
     from .._compiler.inductor_lowering import CodegenState
     from .._compiler.type_info import Origin
     from .._compiler.type_info import TypeInfo
@@ -107,9 +109,34 @@ def _(
     dim: int,
     reverse: bool = False,
 ) -> torch.Tensor | tuple[torch.Tensor, ...]:
-    return higher_order_ops.associative_scan(
-        combine_fn, input_tensor, dim, reverse=reverse
+    # Eager inclusive scan. Ref mode must not call torch's associative_scan HOP: it
+    # runs Dynamo, which breaks under Helion's active RefMode TorchFunctionMode.
+    from .._compiler.helper_function import create_combine_function_wrapper
+
+    is_tuple = isinstance(input_tensor, (tuple, list))
+    leaves = tuple(input_tensor) if is_tuple else (input_tensor,)
+    combine = create_combine_function_wrapper(
+        combine_fn, is_tuple_input=is_tuple, target_format="tuple"
     )
+
+    scan_dim = dim % leaves[0].ndim
+    length = leaves[0].size(scan_dim)
+    order = reversed(range(length)) if reverse else range(length)
+
+    acc: tuple[torch.Tensor, ...] | None = None
+    out: list[tuple[torch.Tensor, ...]] = [()] * length
+    for k in order:
+        cur = tuple(leaf.select(scan_dim, k) for leaf in leaves)
+        if acc is None:
+            acc = cur
+        elif is_tuple:
+            acc = tuple(cast("CombineFunctionTuple", combine)(acc, cur))
+        else:
+            acc = (cast("CombineFunctionBasic", combine)(acc[0], cur[0]),)
+        out[k] = acc
+
+    result = tuple(torch.stack(col, dim=scan_dim) for col in zip(*out, strict=True))
+    return result if is_tuple else result[0]
 
 
 @_decorators.register_to_device_ir(associative_scan)
