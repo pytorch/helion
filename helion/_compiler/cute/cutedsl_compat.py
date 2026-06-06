@@ -2,6 +2,29 @@ from __future__ import annotations
 
 from functools import lru_cache
 import inspect
+import os
+
+
+def _ensure_cute_dsl_libs() -> None:
+    """Point ``CUTE_DSL_LIBS`` at the bundled CuTe DSL runtime library.
+
+    The CuTe DSL needs ``libcute_dsl_runtime.so`` and auto-discovers it relative
+    to a standard wheel install. In packaged/linked layouts (e.g. a buck
+    link-tree) that discovery fails, so locate the ``.so`` shipped inside the
+    ``nvidia_cutlass_dsl`` package and export it ourselves. No-op when the user
+    already set ``CUTE_DSL_LIBS`` or the library cannot be found. Must run before
+    ``import cutlass.cute`` (the discovery happens at import time).
+    """
+    if os.environ.get("CUTE_DSL_LIBS"):
+        return
+    import importlib.util
+
+    spec = importlib.util.find_spec("nvidia_cutlass_dsl")
+    for base in spec.submodule_search_locations or () if spec else ():
+        candidate = os.path.join(base, "lib", "libcute_dsl_runtime.so")
+        if os.path.exists(candidate):
+            os.environ["CUTE_DSL_LIBS"] = candidate
+            return
 
 # The cute backend hard-requires the CuTe DSL 4.5.1 API generation, the
 # apache-tvm-ffi package, and CUDA >= 13. ``check_cute_backend_requirements``
@@ -21,6 +44,7 @@ def _cute_backend_requirement_error() -> str | None:
     shipped in wheels that still self-report ``4.5.0``), so a version-string
     comparison would spuriously reject a working install.
     """
+    _ensure_cute_dsl_libs()
     try:
         import cutlass.cute as cute  # noqa: F401
         from cutlass.cutlass_dsl.cutlass import if_generate
