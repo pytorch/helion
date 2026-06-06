@@ -4101,6 +4101,109 @@ class TestPallas(TestCase):
         inner_min = spec.block_sizes[1].min_size
         self.assertGreaterEqual(outer_min, inner_min)
 
+    def test_jagged_tile_pins_parent_block_size_to_1(self) -> None:
+        """A jagged_tile's parent (items axis) is pinned to block_size=1 on
+        Pallas — each program owns exactly one item so the per-item DMA slice
+        + chunk_mask emission can use program_id directly as the row index.
+        """
+
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def k(x_data: torch.Tensor, x_offsets: torch.Tensor) -> torch.Tensor:
+            M = x_data.size(1)
+            num_rows = x_offsets.size(0) - 1
+            out = torch.zeros(
+                [num_rows, M], dtype=x_data.dtype, device=x_data.device
+            )
+            x_flat = x_data.view(-1)
+            for tile_b in hl.tile(num_rows):
+                starts = x_offsets[tile_b]
+                ends = x_offsets[tile_b.index + 1]
+                nnz = ends - starts
+                for tile_m in hl.tile(M):
+                    row_sums = hl.zeros([tile_b, tile_m], dtype=x_data.dtype)
+                    for tile_k in hl.jagged_tile(nnz):
+                        base = starts[:, None] + tile_k.index[None, :]
+                        flat = base[:, :, None] * M + tile_m.index[None, None, :]
+                        row_sums = row_sums + hl.load(x_flat, [flat]).sum(dim=1)
+                    out[tile_b, tile_m] = row_sums
+            return out
+
+        x_offsets = torch.tensor([0, 3, 8, 10, 14], dtype=torch.int32)
+        x_data = torch.randn(14, 8, dtype=torch.float32)
+        spec = k.bind((x_data, x_offsets)).config_spec
+        # tile_b is the items axis (parent of the jagged tile_k). On Pallas
+        # it must be pinned to exactly 1.
+        parent_spec = spec.block_sizes[0]
+        self.assertEqual(parent_spec.min_size, 1)
+        self.assertEqual(parent_spec.max_size, 1)
+
+    def test_jagged_tile_parent_pin_survives_alignment_propagation(self) -> None:
+        """The pin sticks even when the parent indexes into a tensor that
+        would otherwise raise its alignment min via
+        ``PallasBackend.adjust_block_size_constraints``.
+        """
+
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def k(x_data: torch.Tensor, x_offsets: torch.Tensor) -> torch.Tensor:
+            M = x_data.size(1)
+            num_rows = x_offsets.size(0) - 1
+            out = torch.zeros(
+                [num_rows, M], dtype=x_data.dtype, device=x_data.device
+            )
+            x_flat = x_data.view(-1)
+            # bfloat16 lane → 256-element alignment requirement on Pallas;
+            # without our skip, tile_b's min would be raised above 1.
+            for tile_b in hl.tile(num_rows):
+                starts = x_offsets[tile_b]
+                ends = x_offsets[tile_b.index + 1]
+                nnz = ends - starts
+                for tile_m in hl.tile(M):
+                    row_sums = hl.zeros([tile_b, tile_m], dtype=x_data.dtype)
+                    for tile_k in hl.jagged_tile(nnz):
+                        base = starts[:, None] + tile_k.index[None, :]
+                        flat = base[:, :, None] * M + tile_m.index[None, None, :]
+                        row_sums = row_sums + hl.load(x_flat, [flat]).sum(dim=1)
+                    out[tile_b, tile_m] = row_sums
+            return out
+
+        x_offsets = torch.tensor([0, 3, 8, 10, 14], dtype=torch.int32)
+        x_data = torch.randn(14, 8, dtype=torch.bfloat16)
+        spec = k.bind((x_data, x_offsets)).config_spec
+        self.assertEqual(spec.block_sizes[0].min_size, 1)
+        self.assertEqual(spec.block_sizes[0].max_size, 1)
+
+    def test_non_jagged_kernel_does_not_pin_outer_to_1(self) -> None:
+        """Regression: the jagged-parent pin must only apply in jagged kernels.
+        A regular ``hl.tile(...)``-only kernel should keep its autotuned
+        outer block-size range untouched.
+        """
+
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def k(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile in hl.tile(x.size(0)):
+                out[tile] = x[tile] * 2
+            return out
+
+        args = (torch.randn([1024], device=DEVICE, dtype=torch.float32),)
+        spec = k.bind(args).config_spec
+        # The outer tile is the only block in this kernel — its max should
+        # be much larger than 1 (the autotuner gets to pick from the full
+        # power-of-2 range bounded by the tensor size).
+        self.assertGreater(spec.block_sizes[0].max_size, 1)
+
+    def test_jagged_sublane_lane_patterns_construct(self) -> None:
+        """Trivial smoke test for the new IndexingPattern subclasses."""
+        from helion._compiler.pallas.plan_tiling import JaggedLanePattern
+        from helion._compiler.pallas.plan_tiling import JaggedSublanePattern
+
+        sublane = JaggedSublanePattern(base_fx=None, block_id=7)
+        self.assertEqual(sublane.block_id, 7)
+        self.assertIsNone(sublane.base_fx)
+
+        lane = JaggedLanePattern(block_id=12)
+        self.assertEqual(lane.block_id, 12)
+
 
 @skipUnlessPallas("JAX/Pallas TPU not available")
 class TestPallasIndirectGather(TestCase):

@@ -1936,11 +1936,25 @@ class PallasBackend(Backend):
                         # https://github.com/jax-ml/jax/issues/36970
                         analyzer.maybe_update_required_alignment(bid, 2)
 
+        # Jagged_tile parents are pinned to block_size=1 at trace time
+        # (each program owns one item; see loops.py jagged_tile registration).
+        # Alignment propagation must not raise their minimums.
+        from .compile_environment import CompileEnvironment as _CompileEnvironment
+
+        _env_for_jagged = _CompileEnvironment.current()
+        jagged_parent_bids: set[int] = {
+            p
+            for parents in _env_for_jagged.jagged_tile_parent_ids.values()
+            for p in parents
+        }
+
         for spec in block_specs:
             if not isinstance(spec, BlockSizeSpec):
                 continue
             bid = spec.block_ids[0]
             if bid not in analyzer.required_alignments:
+                continue
+            if bid in jagged_parent_bids:
                 continue
             requirement_alignment = analyzer.required_alignments[bid]
             dim_size = next_power_of_2(max(spec.size_hint, 1))
@@ -1960,7 +1974,7 @@ class PallasBackend(Backend):
         }
         for spec in block_specs_by_id.values():
             bounded_by = spec.bounded_by_block_id
-            if bounded_by is None:
+            if bounded_by is None or bounded_by in jagged_parent_bids:
                 continue
             outer_spec = block_specs_by_id.get(bounded_by)
             if outer_spec is not None:
