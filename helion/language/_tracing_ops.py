@@ -377,6 +377,21 @@ def _get_loop_numel(state: CodegenState, loop_dim_index: int) -> str:
     return f"(({end}) - ({begin}))"
 
 
+def _is_static_int(expr: str) -> bool:
+    """True if a begin/end expression string is a compile-time integer constant.
+
+    Used to decide whether a tile loop's ``[begin, end)`` extent is statically
+    known. When it is not (data-dependent bounds — a jagged ``hl.tile(start,
+    end)`` or even ``hl.tile(0, dynamic_end)``), the final tile may be a partial
+    sub-range of the backing tensor, so an output store must clamp its extent.
+    """
+    try:
+        int(expr)
+    except (TypeError, ValueError):
+        return False
+    return True
+
+
 def _compute_grid_and_block_sizes(
     state: CodegenState,
     block_ids: list[int],
@@ -1429,6 +1444,8 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
     begin_exprs, iter_step_exprs, slice_size_exprs = _pallas_loop_begin_and_step_exprs(
         state, block_ids, block_size_vars
     )
+    # Loop end expressions (used to clamp store extents for data-dependent begins).
+    end_exprs = [_get_loop_begin_and_end(state, i)[1] for i in range(len(block_ids))]
 
     # Pipelined tensors flow through emit_pipeline's per-iter Buffered
     # BlockSpec; the rest stay on the outer pallas_call BlockSpec
@@ -1464,7 +1481,9 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
             )
             _bid_to_pid_var[pid.block_id] = pid_var
 
-    def _make_block_spec(fake: torch.Tensor, subscript_meta: list[object]) -> str:
+    def _make_block_spec(
+        fake: torch.Tensor, subscript_meta: list[object], is_store: bool = False
+    ) -> str:
         """Build a BlockSpec string for a tensor accessed in the pipeline body.
 
         Encodes BOTH outer grid dims (via pl.program_id) and inner pipeline
@@ -1489,19 +1508,69 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
                 slice_size_expr = slice_size_exprs[bid_idx]
                 begin_expr = begin_exprs[bid_idx]
                 iter_step_expr = iter_step_exprs[bid_idx]
-                block_shape_parts.append(slice_size_expr)
                 from .memory_ops import _record_pad_info
 
                 extra_pad = _compute_pipeline_or_dma_extra_pad(
                     begin_expr, bid, env, state
                 )
                 _record_pad_info(state, fake, dim_idx, bid, extra_pad)
-                if begin_expr == "0" and iter_step_expr == slice_size_expr:
-                    lambda_parts.append(lambda_params[bid_idx])
-                else:
-                    lambda_parts.append(
-                        f"(({begin_expr}) + ({lambda_params[bid_idx]}) * ({iter_step_expr})) // ({slice_size_expr})"
+                begin_is_zero = begin_expr == "0"
+                end_expr = end_exprs[bid_idx]
+                dim_size = shape[dim_idx]
+                # Whether this loop spans the ENTIRE backing tensor dim, i.e.
+                # ``[0, dim_size)`` with a compile-time-constant extent. Only
+                # then is a full-block store safe: a partial final tile overruns
+                # past ``dim_size`` into padding, which the host-side pad handles.
+                # For any sub-range -- a jagged ``hl.tile(start, end)``, a
+                # ``hl.tile(0, dynamic_end)``, or even a static ``hl.tile(0, k)``
+                # with ``k < dim_size`` -- a full-block store would overrun into
+                # live rows of the tensor, so the extent must be clamped.
+                covers_full_dim = (
+                    begin_is_zero
+                    and _is_static_int(end_expr)
+                    and isinstance(dim_size, int)
+                    and int(end_expr) == dim_size
+                )
+                # Loads need a dynamic ``pl.ds`` only for a non-zero begin (a
+                # block-aligned index can't express an arbitrary start; the
+                # over-read past ``end`` is zeroed by the inner-loop mask).
+                # Stores need it whenever they target a sub-range (not the full
+                # dim), so the extent can be clamped and a partial final tile
+                # does not overrun live rows. Full-dim, from-zero loops keep the
+                # original block-index codegen (no change).
+                if not begin_is_zero or (is_store and not covers_full_dim):
+                    # Dynamic ``pl.ds`` at the true element offset, with a
+                    # ``pl.BoundedSlice`` block shape (required for ds-style
+                    # index maps). Lifts the "emit_pipeline fails on unaligned
+                    # dims" limitation so data-dependent tile loops can pipeline.
+                    block_shape_parts.append(f"pl.BoundedSlice({slice_size_expr})")
+                    start_expr = (
+                        f"({begin_expr}) + ({lambda_params[bid_idx]}) "
+                        f"* ({iter_step_expr})"
                     )
+                    if is_store:
+                        # Clamp the store extent to min(block, end - offset) so a
+                        # short final tile writes only its valid rows
+                        # [begin, end) instead of overrunning into the next
+                        # sub-range (which would corrupt it under cross-iteration
+                        # double-buffering, and is wasteful for large blocks).
+                        size_expr = (
+                            f"jnp.minimum({slice_size_expr}, "
+                            f"({end_exprs[bid_idx]}) - ({start_expr}))"
+                        )
+                    else:
+                        size_expr = slice_size_expr
+                    lambda_parts.append(f"pl.ds({start_expr}, {size_expr})")
+                else:
+                    # Static, from-zero loop: a block-aligned index is exact.
+                    # Identical to the pre-existing codegen.
+                    block_shape_parts.append(slice_size_expr)
+                    if iter_step_expr == slice_size_expr:
+                        lambda_parts.append(lambda_params[bid_idx])
+                    else:
+                        lambda_parts.append(
+                            f"(({begin_expr}) + ({lambda_params[bid_idx]}) * ({iter_step_expr})) // ({slice_size_expr})"
+                        )
             elif bid is not None and bid in _bid_to_pid_var:
                 # Outer grid dim -- select via captured program_id variable
                 pid_var = _bid_to_pid_var[bid]
@@ -1551,6 +1620,18 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
             f"lambda {lambda_param_str}: ({lambda_body},), "
             f"pipeline_mode=pl.Buffered(buffer_count=2))"
         )
+
+    def _make_load_block_spec(
+        fake: torch.Tensor, subscript_meta: list[object]
+    ) -> str:
+        """BlockSpec for a pipelined input (full-block ``pl.ds``; mask zeroes over-read)."""
+        return _make_block_spec(fake, subscript_meta, is_store=False)
+
+    def _make_store_block_spec(
+        fake: torch.Tensor, subscript_meta: list[object]
+    ) -> str:
+        """BlockSpec for a pipelined output (clamped ``pl.ds`` extent on dynamic bounds)."""
+        return _make_block_spec(fake, subscript_meta, is_store=True)
 
     def _make_hbm_slice(
         fake: torch.Tensor, hbm_name: str, subscript_meta: list[object]
@@ -1629,7 +1710,7 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
             hbm_name.replace("_hbm", "") + "_vmem"
         )
         in_tensors.append((fake, hbm_name))
-        in_specs.append(_make_block_spec(fake, sub_meta))
+        in_specs.append(_make_load_block_spec(fake, sub_meta))
         body_params.append(vmem_name)
         pipeline_in_args.append(_make_hbm_slice(fake, hbm_name, sub_meta))
 
@@ -1641,7 +1722,7 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
             hbm_name.replace("_hbm", "") + "_vmem"
         )
         out_tensors.append((fake, hbm_name))
-        out_specs.append(_make_block_spec(fake, sub_meta))
+        out_specs.append(_make_store_block_spec(fake, sub_meta))
         body_params.append(vmem_name)
         pipeline_out_args.append(_make_hbm_slice(fake, hbm_name, sub_meta))
 
