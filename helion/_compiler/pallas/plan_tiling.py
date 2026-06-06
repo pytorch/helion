@@ -6,6 +6,7 @@ Sets 'dim_tilings' metadata on tensors based on indexing constraints.
 
 from __future__ import annotations
 
+import operator
 from dataclasses import dataclass
 from dataclasses import field
 from typing import TYPE_CHECKING
@@ -68,7 +69,30 @@ class NonePattern(IndexingPattern):
 
 @dataclass
 class TensorIndexPattern(IndexingPattern):
-    """Tensor-valued index - no tiling. Resolved for indirect load/store codegen."""
+    """Tensor-valued index — no tiling.
+
+    Two emit paths depending on ``is_jagged_flat``:
+
+      * ``is_jagged_flat=False`` (default): resolved for indirect load/store
+        codegen (gather/scatter).
+
+      * ``is_jagged_flat=True``: this is the canonical jagged 1-D flat form
+        ``x_flat[(starts + tile_k.idx) * M + tile_m.idx]`` — one subscript
+        element that encodes BOTH axes (sublane + lane). Producer parses the
+        FX expression once and caches ``sublane_bid``, ``sublane_base_fx``,
+        ``lane_bid``, and ``lane_size`` (= M).
+
+        ``lane_size`` is needed only for this form: the host launcher reshapes
+        ``x_flat.view(-1, lane_size)`` before ``pl.pallas_call`` so the kernel
+        sees a 2-D ref. Non-flat (2-D source) accesses don't need M because
+        ``x.shape[-1]`` already carries it.
+    """
+
+    is_jagged_flat: bool = False
+    sublane_bid: int | None = None
+    sublane_base_fx: torch.fx.Node | None = None
+    lane_bid: int | None = None
+    lane_size: int | torch.SymInt | None = None
 
 
 @dataclass
@@ -83,34 +107,6 @@ class IndirectScatterPattern(IndexingPattern):
     """Indirect scatter store ``table[idx, ...]`` - no tiling on this dim."""
 
     plan: ScatterPlan
-
-
-@dataclass
-class JaggedSublanePattern(IndexingPattern):
-    """Sublane axis of a 2-D access in jagged scope.
-
-    Carries the sublane tile's bid and the per-item base FX node (the
-    ``starts`` placeholder when the sublane is jagged; ``None`` otherwise).
-    Whether the sublane axis is jagged is recovered at emit time via
-    ``env.is_jagged_tile(block_id)``.
-    """
-
-    base_fx: torch.fx.Node | None
-    block_id: int
-
-
-@dataclass
-class JaggedLanePattern(IndexingPattern):
-    """Lane axis of a 2-D access in jagged scope.
-
-    Carries the lane tile's bid. Whether the lane is jagged (host-padded
-    ``hl.jagged_tile`` lane, e.g. jagged_mean's ``tile_m``) is recovered at
-    emit time via ``env.is_jagged_tile(block_id)``; the length tensor
-    (e.g. feature_counts) is reachable from there via
-    ``env.jagged_tile_parent_ids`` + the tile strategy's ``mask_vars``.
-    """
-
-    block_id: int
 
 
 @dataclass
@@ -280,8 +276,21 @@ def _detect_indexing_pattern(
                 offset=tile_begin_with_offset.offset,
             )
         # A tensor-valued index that didn't match any arithmetic-of-tile
-        # pattern is an indirect gather (e.g. table[idx, :]).
+        # pattern is either an indirect gather (e.g. table[idx, :]) or the
+        # canonical jagged 1-D flat form
+        # ``x_flat[(starts + tile_k.idx) * M + tile_m.idx]``.
         if isinstance(idx_val, torch.Tensor):
+            if env.jagged_tile_parent_ids:
+                parsed = _parse_flat_jagged_subscript(idx, env)
+                if parsed is not None:
+                    sublane_bid, sublane_base_fx, lane_bid, lane_size = parsed
+                    return TensorIndexPattern(
+                        is_jagged_flat=True,
+                        sublane_bid=sublane_bid,
+                        sublane_base_fx=sublane_base_fx,
+                        lane_bid=lane_bid,
+                        lane_size=lane_size,
+                    )
             return TensorIndexPattern()
         # Indices produced by other FX nodes, such as indices[tile] used in
         # tensor-indexed atomics, are legal but cannot participate in Pallas
@@ -546,3 +555,194 @@ def _maybe_get_tile_begin_with_offset_info(
             offset = torch.SymInt(f"{block_size} + {offset}")  # type: ignore[arg-type]
 
     return TileBeginWithOffsetPattern(block_id=block_id, offset=offset)
+
+
+# ────────────────────────────────────────────────────────────────────
+# Jagged 1-D flat-form subscript parser
+# Recognises ``x_flat[(starts + tile_k.idx) * M + tile_m.idx]`` (with
+# broadcast wrappers in between) and recovers the 2-D structural pieces:
+# (sublane_bid, sublane_base_fx, lane_bid, lane_size=M).
+# ────────────────────────────────────────────────────────────────────
+
+
+_ADD_TARGETS = (operator.add, torch.ops.aten.add.Tensor)
+_MUL_TARGETS = (operator.mul, torch.ops.aten.mul.Tensor)
+
+
+def _transparent_wrapper_targets() -> tuple[object, ...]:
+    """Targets of FX nodes whose value equals their first arg's value —
+    peeling through these reveals the underlying placeholder / tile_index
+    for pattern matching.
+
+    Built lazily so the module-level import doesn't pull in helion.language
+    at file-import time (would cause a circular import in some entry paths).
+    """
+    from ...language import _tracing_ops, view_ops
+
+    return (
+        view_ops.subscript,
+        _tracing_ops._new_var,
+        torch.ops.aten.unsqueeze.default,
+    )
+
+
+def _peel_wrappers(node: torch.fx.Node) -> torch.fx.Node:
+    """Follow transparent wrappers (broadcast + ``_new_var``) to the
+    underlying FX node. Pure analysis — does not mutate the FX graph."""
+    wrappers = _transparent_wrapper_targets()
+    while (
+        isinstance(node, torch.fx.Node)
+        and node.op == "call_function"
+        and node.target in wrappers
+        and node.args
+        and isinstance(node.args[0], torch.fx.Node)
+    ):
+        node = node.args[0]
+    return node
+
+
+def _extract_scalar(arg: object) -> int | torch.SymInt | None:
+    """Return ``arg`` if it's an int/SymInt or extract from an FX node whose
+    ``meta['val']`` is scalar. Used to recover ``M`` from ``mul(jagged, M)``."""
+    if isinstance(arg, (int, torch.SymInt)):
+        return arg
+    if isinstance(arg, torch.fx.Node):
+        val = arg.meta.get("val")
+        if isinstance(val, (int, torch.SymInt)):
+            return val
+    return None
+
+
+def _maybe_jagged_tile_bid(
+    node: torch.fx.Node, env: CompileEnvironment
+) -> int | None:
+    """Return the jagged-tile block_id if ``node`` is a jagged-tile index
+    expression (either ``hl.tile_index(tile_sym)`` or the bare tile-sym FX
+    node). None if non-jagged or non-tile.
+    """
+    from ...language.tile_ops import tile_index as _tile_index_op
+
+    if (
+        node.op == "call_function"
+        and node.target is _tile_index_op
+        and node.args
+        and isinstance(node.args[0], torch.fx.Node)
+    ):
+        tile_val = node.args[0].meta.get("val")
+    else:
+        tile_val = node.meta.get("val")
+    if not isinstance(tile_val, torch.SymInt):
+        return None
+    bid = env.get_block_id(tile_val)
+    if bid is None or not env.is_jagged_tile(bid):
+        return None
+    return bid
+
+
+def _maybe_any_tile_bid(
+    node: torch.fx.Node, env: CompileEnvironment
+) -> int | None:
+    """Like ``_maybe_jagged_tile_bid`` but doesn't require jaggedness. Used
+    for the dense-arm side of the flat-form (tile_m may be plain ``hl.tile``
+    OR ``hl.jagged_tile`` host-padded to a uniform extent)."""
+    from ...language.tile_ops import tile_index as _tile_index_op
+
+    if (
+        node.op == "call_function"
+        and node.target is _tile_index_op
+        and node.args
+        and isinstance(node.args[0], torch.fx.Node)
+    ):
+        tile_val = node.args[0].meta.get("val")
+    else:
+        tile_val = node.meta.get("val")
+    if not isinstance(tile_val, torch.SymInt):
+        return None
+    return env.get_block_id(tile_val)
+
+
+def _decompose_jagged_idx(
+    idx_fx: torch.fx.Node, env: CompileEnvironment
+) -> tuple[int, torch.fx.Node | None] | None:
+    """Recognise the sublane arm ``add(starts, tile_k.idx)`` (commutative)
+    or a bare ``tile_k.idx`` and return (jagged_bid, base_fx).
+
+    ``base_fx`` is None when the bare form matches (no per-item offset).
+    """
+    bid = _maybe_jagged_tile_bid(idx_fx, env)
+    if bid is not None:
+        return bid, None
+
+    if idx_fx.op == "call_function" and idx_fx.target in _ADD_TARGETS and len(idx_fx.args) == 2:
+        left, right = idx_fx.args
+        left_peeled = _peel_wrappers(left) if isinstance(left, torch.fx.Node) else left
+        right_peeled = (
+            _peel_wrappers(right) if isinstance(right, torch.fx.Node) else right
+        )
+        if isinstance(left_peeled, torch.fx.Node):
+            bid = _maybe_jagged_tile_bid(left_peeled, env)
+            if bid is not None:
+                return bid, (
+                    right_peeled if isinstance(right_peeled, torch.fx.Node) else None
+                )
+        if isinstance(right_peeled, torch.fx.Node):
+            bid = _maybe_jagged_tile_bid(right_peeled, env)
+            if bid is not None:
+                return bid, (
+                    left_peeled if isinstance(left_peeled, torch.fx.Node) else None
+                )
+    return None
+
+
+def _parse_flat_jagged_subscript(
+    idx_fx: torch.fx.Node, env: CompileEnvironment
+) -> tuple[int, torch.fx.Node | None, int, int | torch.SymInt] | None:
+    """Recognise the canonical flat-1D form:
+
+        add(broadcast(mul(broadcast(add(starts, tile_k.idx)), M)),
+            broadcast(tile_m.idx))
+
+    Returns ``(sublane_bid, sublane_base_fx, lane_bid, M)`` or ``None``.
+
+    Tries both arms of each ``add``/``mul`` (commutative). Peels broadcast
+    wrappers (``aten.unsqueeze``, ``hl.subscript``, ``_new_var``).
+    """
+    if not (
+        idx_fx.op == "call_function"
+        and idx_fx.target in _ADD_TARGETS
+        and len(idx_fx.args) == 2
+    ):
+        return None
+    left, right = idx_fx.args
+    if not (isinstance(left, torch.fx.Node) and isinstance(right, torch.fx.Node)):
+        return None
+
+    for mul_arm, dense_arm in ((left, right), (right, left)):
+        peeled_mul = _peel_wrappers(mul_arm)
+        if not (
+            peeled_mul.op == "call_function"
+            and peeled_mul.target in _MUL_TARGETS
+            and len(peeled_mul.args) == 2
+        ):
+            continue
+        mul_left, mul_right = peeled_mul.args
+
+        for inner_arm, m_arm in ((mul_left, mul_right), (mul_right, mul_left)):
+            if not isinstance(inner_arm, torch.fx.Node):
+                continue
+            lane_size = _extract_scalar(m_arm)
+            if lane_size is None:
+                continue
+            peeled_inner = _peel_wrappers(inner_arm)
+            jagged_decomp = _decompose_jagged_idx(peeled_inner, env)
+            if jagged_decomp is None:
+                continue
+            sublane_bid, sublane_base_fx = jagged_decomp
+
+            peeled_dense = _peel_wrappers(dense_arm)
+            lane_bid = _maybe_any_tile_bid(peeled_dense, env)
+            if lane_bid is None:
+                continue
+            return sublane_bid, sublane_base_fx, lane_bid, lane_size
+
+    return None

@@ -4192,17 +4192,133 @@ class TestPallas(TestCase):
         # power-of-2 range bounded by the tensor size).
         self.assertGreater(spec.block_sizes[0].max_size, 1)
 
-    def test_jagged_sublane_lane_patterns_construct(self) -> None:
-        """Trivial smoke test for the new IndexingPattern subclasses."""
-        from helion._compiler.pallas.plan_tiling import JaggedLanePattern
-        from helion._compiler.pallas.plan_tiling import JaggedSublanePattern
+    def test_parse_flat_jagged_subscript_canonical(self) -> None:
+        """``_parse_flat_jagged_subscript`` recovers
+        ``(sublane_bid, sublane_base_fx, lane_bid, M)`` from the canonical
+        flat-1D form ``(starts + tile_k.idx) * M + tile_m.idx`` (with
+        broadcast wrappers)."""
+        import operator
+        from types import SimpleNamespace
 
-        sublane = JaggedSublanePattern(base_fx=None, block_id=7)
-        self.assertEqual(sublane.block_id, 7)
-        self.assertIsNone(sublane.base_fx)
+        from torch._subclasses.fake_tensor import FakeTensorMode
+        from torch.fx import Graph
+        from torch.fx.experimental.symbolic_shapes import ShapeEnv
 
-        lane = JaggedLanePattern(block_id=12)
-        self.assertEqual(lane.block_id, 12)
+        from helion._compiler.pallas.plan_tiling import (
+            _parse_flat_jagged_subscript,
+        )
+
+        shape_env = ShapeEnv()
+        mode = FakeTensorMode(shape_env=shape_env)
+        with mode:
+            k_sym = shape_env.create_unbacked_symint()
+            m_sym = shape_env.create_unbacked_symint()
+            torch._check(k_sym >= 1)
+            torch._check(m_sym >= 1)
+        bid_of = {id(k_sym): 7, id(m_sym): 8}
+        env = SimpleNamespace(
+            get_block_id=lambda s: bid_of.get(id(s)),
+            is_jagged_tile=lambda bid: bid == 7,
+            jagged_tile_parent_ids={7: [3]},
+        )
+
+        # Build: add(unsqueeze(mul(unsqueeze(add(starts, k_idx), -1), 64), 0),
+        #            unsqueeze(unsqueeze(m_idx, 0), 0))
+        g = Graph()
+        starts = g.placeholder("starts")
+        k_idx = g.placeholder("tile_k_idx")
+        k_idx.meta["val"] = k_sym
+        m_idx = g.placeholder("tile_m_idx")
+        m_idx.meta["val"] = m_sym
+
+        inner = g.call_function(operator.add, args=(starts, k_idx))
+        inner_u = g.call_function(
+            torch.ops.aten.unsqueeze.default, args=(inner, -1)
+        )
+        mul = g.call_function(operator.mul, args=(inner_u, 64))
+        mul_u = g.call_function(torch.ops.aten.unsqueeze.default, args=(mul, 0))
+        m_u1 = g.call_function(torch.ops.aten.unsqueeze.default, args=(m_idx, 0))
+        m_u2 = g.call_function(torch.ops.aten.unsqueeze.default, args=(m_u1, 0))
+        flat = g.call_function(operator.add, args=(mul_u, m_u2))
+        g.output(flat)
+
+        result = _parse_flat_jagged_subscript(flat, env)
+        self.assertIsNotNone(result)
+        sublane_bid, sublane_base_fx, lane_bid, lane_size = result
+        self.assertEqual(sublane_bid, 7)
+        self.assertIs(sublane_base_fx, starts)
+        self.assertEqual(lane_bid, 8)
+        self.assertEqual(lane_size, 64)
+
+    def test_parse_flat_jagged_subscript_non_canonical_returns_none(self) -> None:
+        """If the subscript doesn't match the canonical structure (e.g. a
+        bare add of two tile indices, missing the ``* M`` factor), the
+        parser returns None and the caller falls through to plain
+        ``TensorIndexPattern`` (the indirect-gather path)."""
+        import operator
+        from types import SimpleNamespace
+
+        from torch._subclasses.fake_tensor import FakeTensorMode
+        from torch.fx import Graph
+        from torch.fx.experimental.symbolic_shapes import ShapeEnv
+
+        from helion._compiler.pallas.plan_tiling import (
+            _parse_flat_jagged_subscript,
+        )
+
+        shape_env = ShapeEnv()
+        mode = FakeTensorMode(shape_env=shape_env)
+        with mode:
+            k_sym = shape_env.create_unbacked_symint()
+            m_sym = shape_env.create_unbacked_symint()
+            torch._check(k_sym >= 1)
+            torch._check(m_sym >= 1)
+        bid_of = {id(k_sym): 7, id(m_sym): 8}
+        env = SimpleNamespace(
+            get_block_id=lambda s: bid_of.get(id(s)),
+            is_jagged_tile=lambda bid: bid == 7,
+            jagged_tile_parent_ids={7: [3]},
+        )
+
+        # add(k_idx, m_idx) — no mul, no starts; should not match.
+        g = Graph()
+        k_idx = g.placeholder("tile_k_idx")
+        k_idx.meta["val"] = k_sym
+        m_idx = g.placeholder("tile_m_idx")
+        m_idx.meta["val"] = m_sym
+        flat = g.call_function(operator.add, args=(k_idx, m_idx))
+        g.output(flat)
+
+        self.assertIsNone(_parse_flat_jagged_subscript(flat, env))
+
+    def test_tensor_index_pattern_jagged_flat_fields(self) -> None:
+        """``TensorIndexPattern`` defaults preserve the indirect-gather emit
+        path; the jagged-flat fields opt in to the canonical jagged 2-D DMA
+        slice emit (filled by the plan_tiling producer when it parses a
+        1-D flat-form jagged subscript)."""
+        from helion._compiler.pallas.plan_tiling import TensorIndexPattern
+
+        # Default: non-jagged, the existing gather path consumes this.
+        plain = TensorIndexPattern()
+        self.assertFalse(plain.is_jagged_flat)
+        self.assertIsNone(plain.sublane_bid)
+        self.assertIsNone(plain.sublane_base_fx)
+        self.assertIsNone(plain.lane_bid)
+        self.assertIsNone(plain.lane_size)
+
+        # Jagged-flat: emit reads these to drive the DMA slice; launcher
+        # reads ``lane_size`` to reshape x_flat back to 2-D.
+        jagged = TensorIndexPattern(
+            is_jagged_flat=True,
+            sublane_bid=7,
+            sublane_base_fx=None,
+            lane_bid=12,
+            lane_size=64,
+        )
+        self.assertTrue(jagged.is_jagged_flat)
+        self.assertEqual(jagged.sublane_bid, 7)
+        self.assertEqual(jagged.lane_bid, 12)
+        self.assertEqual(jagged.lane_size, 64)
 
 
 @skipUnlessPallas("JAX/Pallas TPU not available")
