@@ -85,9 +85,7 @@ def _known_keys_strategy() -> st.SearchStrategy[dict[str, Any]]:
             "load_eviction_policies": st.lists(
                 st.sampled_from(["", "first", "last"]), max_size=4
             ),
-            "load_cache_modifiers": st.lists(
-                st.sampled_from(["", ".cg"]), max_size=4
-            ),
+            "load_cache_modifiers": st.lists(st.sampled_from(["", ".cg"]), max_size=4),
             "num_warps": st.integers(min_value=1, max_value=64),
             "num_stages": st.integers(min_value=1, max_value=16),
             "pid_type": st.sampled_from(
