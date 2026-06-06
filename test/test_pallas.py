@@ -324,6 +324,24 @@ def pallas_inner_loop_add_with_scalar_access(
 
 
 @helion.kernel(backend="pallas", static_shapes=True)
+def pallas_jagged_segment_add(
+    x: torch.Tensor, offsets: torch.Tensor
+) -> torch.Tensor:
+    """Outer grid over jagged segments + an inner ``hl.tile(start, end)`` loop
+    whose begin (``offsets[g]``) is an arbitrary runtime offset. A
+    block-aligned BlockSpec index can only address starts that are multiples of
+    the block size, so the emit_pipeline path must slice the segment with a
+    dynamic ``pl.ds`` (``pl.BoundedSlice`` block)."""
+    out = torch.empty_like(x)
+    for g in hl.grid(offsets.size(0) - 1):
+        start = offsets[g]
+        end = offsets[g + 1]
+        for tile in hl.tile(start, end):
+            out[tile, :] = x[tile, :] + 1.0
+    return out
+
+
+@helion.kernel(backend="pallas", static_shapes=True)
 def pallas_add_3d(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     """Kernel with an outer grid loop and a 2D inner device loop."""
     b, m, n = x.size()
@@ -1908,6 +1926,60 @@ class TestPallas(TestCase):
         torch.testing.assert_close(result, args[0] + args[1])
         # out is output-only, excluded from pallas_call inputs
         self.assertIn("_inplace_indices=[]", code)
+
+    @xfailIfPallasInterpret(
+        "dynamic pl.ds / pl.BoundedSlice BlockSpecs are not supported by JAX's "
+        "Pallas interpret mode (concrete-shape requirement); runs on real TPU."
+    )
+    def test_emit_pipeline_data_dependent_begin_uses_dynamic_ds(self) -> None:
+        """A data-dependent ``hl.tile(start, end)`` inner loop under
+        ``pallas_loop_type='emit_pipeline'`` must address the jagged segment
+        with a dynamic ``pl.ds`` slice + ``pl.BoundedSlice`` block, not a
+        block-aligned ``// block_size`` index (which only addresses starts that
+        are exact multiples of the block size). Regression test for the
+        "emit_pipeline fails on unaligned dims" limitation.
+        """
+        # Arbitrary, deliberately non-block-aligned segment bounds covering
+        # [0, 48) so the output is fully written (out = x + 1 everywhere).
+        offsets = torch.tensor([0, 10, 31, 48], device=DEVICE, dtype=torch.int32)
+        x = torch.randn(48, 128, device=DEVICE, dtype=torch.float32)
+        code, result = code_and_output(
+            pallas_jagged_segment_add,
+            (x, offsets),
+            block_sizes=[16],
+            pallas_loop_type="emit_pipeline",
+        )
+        self.assertIn("pltpu.emit_pipeline", code)
+        # The fix: dynamic ds slice + BoundedSlice block for the runtime begin.
+        self.assertIn("pl.BoundedSlice", code)
+        self.assertIn("pl.ds(", code)
+        # Load/store asymmetry: the input spec reads a full block (the over-read
+        # past ``end`` is zeroed by the mask), while the output spec clamps its
+        # extent to min(block, end - offset) so a short final tile writes only
+        # its valid rows instead of overrunning into the next segment.
+        in_part, _, out_part = code.partition("out_specs=")
+        self.assertIn("in_specs=", in_part)
+        self.assertNotIn("jnp.minimum", in_part)  # input: full block
+        self.assertIn("jnp.minimum", out_part)  # output: clamped extent
+        torch.testing.assert_close(result, x + 1.0, rtol=1e-5, atol=1e-5)
+
+    def test_emit_pipeline_static_begin_keeps_block_index(self) -> None:
+        """Control: a static (zero-begin) inner loop must NOT switch to the
+        dynamic ds/BoundedSlice path, so aligned/static kernels are unchanged.
+        """
+        args = (
+            torch.randn(64, 128, device=DEVICE, dtype=torch.float32),
+            torch.randn(64, 128, device=DEVICE, dtype=torch.float32),
+        )
+        code, result = code_and_output(
+            pallas_inner_loop_add,
+            args,
+            block_sizes=[8, 128],
+            pallas_loop_type="emit_pipeline",
+        )
+        self.assertIn("pltpu.emit_pipeline", code)
+        self.assertNotIn("pl.BoundedSlice", code)
+        torch.testing.assert_close(result, args[0] + args[1])
 
     def _check_scalar_lookup_in_pipeline(self, loop_type: str) -> None:
         torch.manual_seed(0)
@@ -3599,16 +3671,19 @@ class TestPallas(TestCase):
         _code2, result2 = code_and_output(sum_with_dynamic_offset, (data, offsets))
         torch.testing.assert_close(result2, ref, rtol=1e-3, atol=1e-3)
 
-    @xfailIfPallas(
-        "emit_pipeline BlockSpec index_map drops the tile.begin offset, "
-        "so a non-zero start in hl.tile(start, end, ...) reads from offset 0 "
-        "instead and produces wrong results."
+    @xfailIfPallasInterpret(
+        "emit_pipeline now includes tile.begin via a dynamic pl.ds BlockSpec, "
+        "but JAX's Pallas interpret mode does not support dynamic pl.ds / "
+        "pl.BoundedSlice (concrete-shape requirement). Expected to pass on real "
+        "TPU; xfail only under interpret."
     )
     def test_non_zero_tile_begin_emit_pipeline(self) -> None:
         """Same kernel as ``test_non_zero_tile_begin`` but pinned to emit_pipeline.
 
-        Documents the known emit_pipeline tile.begin bug.  Will start passing
-        once the BlockSpec ``index_map`` is taught to include ``tile.begin``.
+        The non-zero ``tile.begin`` is now carried by a dynamic ``pl.ds``
+        BlockSpec index_map, so this produces correct results on TPU. It still
+        xfails under JAX Pallas interpret, which cannot execute dynamic
+        ``pl.ds`` / ``pl.BoundedSlice`` BlockSpecs.
         """
         sum_with_constant_offset, _ = self._non_zero_tile_begin_kernels()
         N, A, B = 128, 8, 256
