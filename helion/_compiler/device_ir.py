@@ -2197,23 +2197,26 @@ class WalkHostAST(NodeVisitor):
 
 def _count_device_loads_and_stores(
     device_ir: DeviceIR,
-) -> tuple[int, int, list[int]]:
+) -> tuple[int, int, int, list[int]]:
     """Count the number of load and store operations in device code for autotuning.
 
     Returns:
-        tuple[int, int, list[int]]: (
+        tuple[int, int, int, list[int]]: (
             total_load_count,
             loads_without_eviction_policy,
+            loads_without_cache_modifier,
             store_indices,
         )
             - total_load_count: all loads (for indexing tunable)
             - loads_without_eviction_policy: loads that need eviction policy tuning
+            - loads_without_cache_modifier: loads that need cache modifier tuning
             - store_indices: positions of store ops in the combined indexing list
     """
     from ..language import memory_ops
 
     total_load_count = 0
     loads_without_eviction_policy = 0
+    loads_without_cache_modifier = 0
     memory_op_index = 0
     store_indices: list[int] = []
 
@@ -2233,6 +2236,7 @@ def _count_device_loads_and_stores(
                             eviction_policy_arg = node.args[3]
                         if eviction_policy_arg is None:
                             loads_without_eviction_policy += 1
+                    loads_without_cache_modifier += 1
                 # Check if this is a store operation
                 elif node.target is memory_ops.store:
                     store_indices.append(memory_op_index)
@@ -2241,6 +2245,7 @@ def _count_device_loads_and_stores(
     return (
         total_load_count,
         loads_without_eviction_policy,
+        loads_without_cache_modifier,
         store_indices,
     )
 
@@ -2274,13 +2279,15 @@ def _count_device_atomics(device_ir: DeviceIR) -> int:
 def _register_load_store_tunables(
     total_load_count: int,
     loads_without_eviction_policy: int,
+    loads_without_cache_modifier: int,
     store_indices: list[int],
 ) -> None:
-    """Register list-based tunables (indexing, eviction policies) for all device loads and stores.
+    """Register list-based tunables for device loads and stores.
 
     Args:
         total_load_count: Total number of loads (for indexing tunable)
         loads_without_eviction_policy: Number of loads that need eviction policy tuning
+        loads_without_cache_modifier: Number of loads that need cache modifier tuning
         store_indices: Positions of store ops in the combined indexing list
     """
     store_count = len(store_indices)
@@ -2292,12 +2299,22 @@ def _register_load_store_tunables(
     from ..autotuner.config_fragment import EnumFragment
     from ..autotuner.config_fragment import ListOf
     from ..autotuner.config_spec import get_valid_eviction_policies
+    from ..autotuner.config_spec import get_valid_load_cache_modifiers
 
     # Register eviction policies only for loads without explicit eviction_policy
     if loads_without_eviction_policy > 0:
         env.config_spec.load_eviction_policies = ListOf(
             EnumFragment(choices=get_valid_eviction_policies(env.backend_name)),
             length=loads_without_eviction_policy,
+        )
+
+    # Register cache modifiers only for loads and only when the backend has
+    # a non-trivial search space.
+    load_cache_modifier_choices = get_valid_load_cache_modifiers(env.backend_name)
+    if loads_without_cache_modifier > 0 and len(load_cache_modifier_choices) > 1:
+        env.config_spec.load_cache_modifiers = ListOf(
+            EnumFragment(choices=load_cache_modifier_choices),
+            length=loads_without_cache_modifier,
         )
 
     # Indexing applies to ALL loads and stores
@@ -2450,11 +2467,13 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
         (
             total_load_count,
             loads_without_eviction_policy,
+            loads_without_cache_modifier,
             store_indices,
         ) = _count_device_loads_and_stores(device_ir)
         _register_load_store_tunables(
             total_load_count,
             loads_without_eviction_policy,
+            loads_without_cache_modifier,
             store_indices,
         )
         _register_atomic_tunables(_count_device_atomics(device_ir))

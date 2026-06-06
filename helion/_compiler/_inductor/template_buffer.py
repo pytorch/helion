@@ -806,6 +806,7 @@ class HelionTemplateBuffer(TemplateBuffer):
         subscript: list[object],
         extra_mask: ast.expr | None,
         eviction_policy: ast.AST | None,
+        cache_modifier: ast.AST | None,
         codegen_load: Callable[..., ast.expr],
         *,
         prologue_first_indexing: dict[str, str],
@@ -824,7 +825,12 @@ class HelionTemplateBuffer(TemplateBuffer):
         param_name = state.device_function.tensor_arg(tensor).name
         if param_name not in self._fusion_metadata.prologue_fused_params:
             return codegen_load(
-                state, tensor, [*subscript], extra_mask, eviction_policy
+                state,
+                tensor,
+                [*subscript],
+                extra_mask,
+                eviction_policy,
+                cache_modifier,
             )
 
         # Read prologue variable names from kernel (set by _setup_prologue_hook).

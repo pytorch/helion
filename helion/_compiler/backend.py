@@ -939,6 +939,8 @@ class TritonBackend(Backend):
         return False
 
     def supports_config_key(self, key: str) -> bool:
+        if key == "load_cache_modifiers":
+            return True
         if key == "waves_per_eu":
             from .._compat import is_hip
 
