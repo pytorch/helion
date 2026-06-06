@@ -17,7 +17,7 @@ import helion.language as hl
 
 
 @onlyBackends(["triton"])
-class TestLoadCacheModifierAutotune(RefEagerTestBase, TestCase):
+class TestCacheModifier(RefEagerTestBase, TestCase):
     @skipIfRefEager("Config spec inspection not applicable in ref eager mode")
     @skipIfTileIR("tileir backend will ignore `cache_modifier` hint")
     def test_autotune_load_cache_modifier_registered_for_amd(self):
