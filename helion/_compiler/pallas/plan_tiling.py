@@ -164,6 +164,14 @@ def _analyze_indexing(node: torch.fx.Node, config: Config) -> None:
     indexing_patterns = _analyze_subscript_patterns(
         tensor_val, list(subscript), dim_tilings, node, config
     )
+    # Capture jagged-flat BEFORE ``_resolve_tensor_index_patterns`` rewrites
+    # every ``TensorIndexPattern`` into ``IndirectGather/ScatterPattern``,
+    # which would otherwise erase the ``is_jagged_flat`` flag used below to
+    # mark the tensor as HBM-resident.
+    is_jagged_flat = any(
+        isinstance(p, TensorIndexPattern) and p.is_jagged_flat
+        for p in indexing_patterns
+    )
     _resolve_tensor_index_patterns(
         node, tensor_val, list(subscript), indexing_patterns, config
     )
@@ -185,9 +193,38 @@ def _analyze_indexing(node: torch.fx.Node, config: Config) -> None:
         isinstance(p, (ArbitraryIndexPattern, TileBeginWithOffsetPattern, NonePattern))
         for p in indexing_patterns
     )
+    # Jagged-parent-only access: every subscript references a jagged_tile
+    # parent block_id, which is pinned to block_size=1 on Pallas.  Each
+    # access fetches a single element, so the tensor is effectively scalar
+    # from the kernel body's POV — must live in SMEM so dynamic
+    # ``x[pl.ds(pid_0, 1)]`` reads from the per-program @pl.loop body
+    # don't hit VMEM sublane/lane alignment.
+    from ..compile_environment import CompileEnvironment as _CompileEnvironment
+    _env = _CompileEnvironment.current()
+    _jagged_parent_bids = {
+        p for parents in _env.jagged_tile_parent_ids.values() for p in parents
+    }
+    is_jagged_pinned_only = bool(_jagged_parent_bids) and all(
+        (
+            isinstance(p, (TilePattern, TileIndexWithOffsetPattern))
+            and p.block_id in _jagged_parent_bids
+        )
+        or isinstance(p, NonePattern)
+        for p in indexing_patterns
+    )
     tid = id(tensor_val)
     current = device_fn.pallas_memory_space.get(tid)
-    if is_all_scalar:
+    if is_jagged_flat:
+        # Jagged-flat tensors are accessed only via DMA out of HBM from inside
+        # the per-item fori_loop body — they must not be hoisted into VMEM at
+        # kernel entry (the flat tensor is much larger than VMEM).
+        device_fn.pallas_memory_space[tid] = PallasMemorySpace.HBM
+    elif is_jagged_pinned_only:
+        # Override any prior VMEM/SMEM assignment: SMEM wins for
+        # jagged-pinned tensors (only HBM stays — used by jagged-flat).
+        if current != PallasMemorySpace.HBM:
+            device_fn.pallas_memory_space[tid] = PallasMemorySpace.SMEM
+    elif is_all_scalar:
         # Only mark for SMEM if not already assigned to VMEM or HBM
         if current is None:
             device_fn.pallas_memory_space[tid] = PallasMemorySpace.SMEM

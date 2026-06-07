@@ -4192,6 +4192,61 @@ class TestPallas(TestCase):
         # power-of-2 range bounded by the tensor size).
         self.assertGreater(spec.block_sizes[0].max_size, 1)
 
+    def test_jagged_kernel_emits_grid_1_and_fori_loop_wrapper(self) -> None:
+        """Pallas jagged kernel must launch as ``grid=(1,)`` and wrap the
+        kernel body in ``jax.lax.fori_loop(0, num_items, _kernel_body, None)``
+        with ``pid_0`` as the loop fn's iteration parameter — not
+        ``pl.program_id(0)``.
+        """
+
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def k(x_data: torch.Tensor, x_offsets: torch.Tensor) -> torch.Tensor:
+            M = x_data.size(1)
+            num_rows = x_offsets.size(0) - 1
+            out = torch.zeros(
+                [num_rows, M], dtype=x_data.dtype, device=x_data.device
+            )
+            x_flat = x_data.view(-1)
+            for tile_b in hl.tile(num_rows):
+                starts = x_offsets[tile_b]
+                ends = x_offsets[tile_b.index + 1]
+                nnz = ends - starts
+                for tile_m in hl.tile(M):
+                    row_sums = hl.zeros([tile_b, tile_m], dtype=x_data.dtype)
+                    for tile_k in hl.jagged_tile(nnz):
+                        base = starts[:, None] + tile_k.index[None, :]
+                        flat = base[:, :, None] * M + tile_m.index[None, None, :]
+                        row_sums = row_sums + hl.load(x_flat, [flat]).sum(dim=1)
+                    out[tile_b, tile_m] = row_sums
+            return out
+
+        x_offsets = torch.tensor([0, 3, 8, 10, 14], dtype=torch.int32)
+        x_data = torch.randn(14, 8, dtype=torch.float32)
+        bound = k.bind((x_data, x_offsets))
+        code = bound.to_triton_code(bound.config_spec.default_config())
+
+        # grid collapses to (1,): the single Pallas program iterates items
+        # inside via fori_loop.  The launcher receives grid as its second
+        # positional arg, so check the call site shape.
+        self.assertRegex(code, r"_launcher\(\s*_helion_\w+\s*,\s*\(1,\)")
+        # The body is wrapped in a fori_loop whose body fn declares pid_0
+        # as the iteration variable.
+        self.assertRegex(code, r"def\s+_kernel_body\w*\s*\(\s*pid_0\s*,\s*_\s*\)\s*:")
+        self.assertRegex(
+            code, r"jax\.lax\.fori_loop\s*\(\s*0\s*,.+_kernel_body\w*\s*,\s*None\s*\)"
+        )
+        # No ``pl.program_id(0)`` at the top of the body — pid_0 must come
+        # from the fori_loop body fn parameter, not the host launcher.
+        self.assertNotRegex(code, r"pid_0\s*=\s*pl\.program_id\s*\(\s*0\s*\)")
+        # The jagged-flat tensor (x_flat) must be marked HBM so it stays in
+        # HBM rather than being copied into VMEM on kernel entry.  Arg order
+        # is (x_offsets, x_flat, out) → x_flat is at launcher position 1.
+        self.assertRegex(code, r"_pipeline_arg_indices=\[\s*1\s*\]")
+        # x_offsets must live in SMEM so dynamic ``x_offsets[pl.ds(pid_0, 1)]``
+        # reads from inside the @pl.loop body don't hit VMEM sublane/lane
+        # alignment.  It's at launcher position 0.
+        self.assertRegex(code, r"_smem_arg_indices=\[\s*0\s*\]")
+
     def test_parse_flat_jagged_subscript_canonical(self) -> None:
         """``_parse_flat_jagged_subscript`` recovers
         ``(sublane_bid, sublane_base_fx, lane_bid, M)`` from the canonical
