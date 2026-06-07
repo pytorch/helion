@@ -427,6 +427,10 @@ class TestAssociativeScan(RefEagerTestBase, TestCase):
         self.assertEqual(result.shape, x.shape)
         self.assertEqual(result.dtype, x.dtype)
 
+    @skipIfRefEager(
+        "torch._higher_order_ops.associative_scan maps to hl.associative_scan only during tracing; "
+        "ref eager mode runs the raw torch HOP, which is unsupported"
+    )
     def test_associative_scan_torch_hops_mapping(self):
         """Test that torch._higher_order_ops.associative_scan automatically maps to hl.associative_scan."""
 

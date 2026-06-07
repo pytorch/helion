@@ -81,8 +81,8 @@ jobs:
     with:
       runner: mt-l-x86iamx-22-225-h100
       python-version: "3.12"
-      image: pytorch/pytorch:2.11.0-cuda12.8-cudnn9-devel
-      runtime-version: cu128
+      image: pytorch/pytorch:2.11.0-cuda13.0-cudnn9-devel
+      runtime-version: cu130
       container-options: --gpus all
       alias: h100
       kernels: ${{ matrix.kernels }}
