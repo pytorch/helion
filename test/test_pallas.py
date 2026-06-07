@@ -4375,6 +4375,134 @@ class TestPallas(TestCase):
         self.assertEqual(jagged.lane_bid, 12)
         self.assertEqual(jagged.lane_size, 64)
 
+    def test_get_reduced_block_ids_carried_acc_collapses_loop_bid(self) -> None:
+        """When a fori_loop has a carried tensor accumulator whose shape
+        lacks one of the loop's iterated block_ids, that block_id is
+        considered reduced.  Mirrors the jagged_sum / jagged_mean tile_k
+        loop (row_sums [BB, BM] carried across tile_k iters)."""
+        import operator
+        from types import SimpleNamespace
+
+        from torch._subclasses.fake_tensor import FakeTensorMode
+        from torch.fx import Graph
+        from torch.fx.experimental.symbolic_shapes import ShapeEnv
+
+        from helion._compiler.pallas.plan_tiling import get_reduced_block_ids
+        from helion.language._tracing_ops import _for_loop, _phi
+
+        shape_env = ShapeEnv()
+        mode = FakeTensorMode(shape_env=shape_env)
+        with mode:
+            k_sym = shape_env.create_unbacked_symint()
+            m_sym = shape_env.create_unbacked_symint()
+            torch._check(k_sym >= 1)
+            torch._check(m_sym >= 1)
+            acc_val = torch.empty((m_sym,))  # shape lacks k_sym
+        bid_of = {id(k_sym): 7, id(m_sym): 8}
+        env = SimpleNamespace(get_block_id=lambda s: bid_of.get(id(s)))
+
+        g = Graph()
+        acc = g.placeholder("acc")
+        acc.meta["val"] = acc_val
+        loop = g.call_function(_for_loop, args=(0, [0], [k_sym], [acc]))
+        out_get = g.call_function(operator.getitem, args=(loop, 0))
+        g.call_function(_phi, args=(acc, out_get))  # marks acc as carried
+
+        self.assertEqual(get_reduced_block_ids(loop, [7], env), {7})
+
+    def test_get_reduced_block_ids_no_carried_returns_empty(self) -> None:
+        """A fori_loop with no FX-phi'd accumulator is not a reduction
+        loop; the helper returns ∅ regardless of loop_block_ids."""
+        from types import SimpleNamespace
+
+        from torch.fx import Graph
+
+        from helion._compiler.pallas.plan_tiling import get_reduced_block_ids
+        from helion.language._tracing_ops import _for_loop
+
+        env = SimpleNamespace(get_block_id=lambda s: None)
+        g = Graph()
+        loop = g.call_function(_for_loop, args=(0, [0], [16], []))
+        self.assertEqual(get_reduced_block_ids(loop, [7], env), set())
+
+    def test_store_is_post_reduction_via_loop_getitem(self) -> None:
+        """If the stored value is a ``getitem(_for_loop, idx)`` (i.e. the
+        final-carry of an inner reduction loop), promotion fires: the
+        loop's reduced block_ids surface in the return set."""
+        import operator
+        from types import SimpleNamespace
+
+        from torch._subclasses.fake_tensor import FakeTensorMode
+        from torch.fx import Graph
+        from torch.fx.experimental.symbolic_shapes import ShapeEnv
+
+        from helion._compiler.pallas.plan_tiling import store_is_post_reduction
+        from helion.language._tracing_ops import _for_loop, _phi
+
+        shape_env = ShapeEnv()
+        mode = FakeTensorMode(shape_env=shape_env)
+        with mode:
+            k_sym = shape_env.create_unbacked_symint()
+            m_sym = shape_env.create_unbacked_symint()
+            torch._check(k_sym >= 1)
+            torch._check(m_sym >= 1)
+            acc_val = torch.empty((m_sym,))
+        bid_of = {id(k_sym): 7, id(m_sym): 8}
+        env = SimpleNamespace(get_block_id=lambda s: bid_of.get(id(s)))
+
+        g = Graph()
+        acc = g.placeholder("acc")
+        acc.meta["val"] = acc_val
+        loop = g.call_function(_for_loop, args=(0, [0], [k_sym], [acc]))
+        out_get = g.call_function(operator.getitem, args=(loop, 0))
+        g.call_function(_phi, args=(acc, out_get))
+
+        # Build a store node whose value (args[2]) is the loop's final-carry.
+
+        def _store_marker(*args: object) -> None:
+            return None
+
+        tensor_ph = g.placeholder("tensor")
+        store_node = g.call_function(
+            _store_marker, args=(tensor_ph, [], out_get, None)
+        )
+
+        # graph_id 0 → block_ids [7] (k_sym's bid).
+        self.assertEqual(
+            store_is_post_reduction(store_node, env, {0: [7]}), {7}
+        )
+
+    def test_store_is_post_reduction_inline_value_returns_empty(self) -> None:
+        """If the stored value is computed inline (not the final-carry of
+        any loop), no promotion fires — even if upstream loop-carry
+        values are *consumed* into the inline expression, the per-iter
+        write pattern is still disjoint.  Mirrors jagged_softmax /
+        jagged_layer_norm's final-pass store of ``block_out``."""
+        import operator
+        from types import SimpleNamespace
+
+        from torch.fx import Graph
+
+        from helion._compiler.pallas.plan_tiling import store_is_post_reduction
+
+        env = SimpleNamespace(get_block_id=lambda s: None)
+        g = Graph()
+        x = g.placeholder("x")
+        y = g.placeholder("y")
+        inline_value = g.call_function(operator.add, args=(x, y))
+
+        def _store_marker(*args: object) -> None:
+            return None
+
+        tensor_ph = g.placeholder("tensor")
+        store_node = g.call_function(
+            _store_marker, args=(tensor_ph, [], inline_value, None)
+        )
+
+        self.assertEqual(
+            store_is_post_reduction(store_node, env, {}), set()
+        )
+
 
 @skipUnlessPallas("JAX/Pallas TPU not available")
 class TestPallasIndirectGather(TestCase):

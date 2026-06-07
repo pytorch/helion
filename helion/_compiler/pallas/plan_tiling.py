@@ -783,3 +783,125 @@ def _parse_flat_jagged_subscript(
             return sublane_bid, sublane_base_fx, lane_bid, lane_size
 
     return None
+
+
+def _carried_indices_for_loop_node(for_loop_node: torch.fx.Node) -> set[int]:
+    """Standalone-FX version of ``_loop_carried_indices`` (in
+    ``language/_tracing_ops.py``): identifies carried-arg positions by
+    walking the ``getitem(_for_loop, idx) → _phi(init, getitem)`` user
+    chain.  Each phi's ``args[0]`` is the loop's init/carried value; we
+    match its name back to ``for_loop_node.args[3]`` (the carried args
+    list) to recover the positional index.
+    """
+    from ...language._tracing_ops import _phi
+
+    carried_names: set[str] = set()
+    for user in for_loop_node.users:
+        for phi_user in user.users:
+            if (
+                phi_user.op == "call_function"
+                and phi_user.target is _phi
+                and phi_user.args
+                and hasattr(phi_user.args[0], "name")
+            ):
+                carried_names.add(phi_user.args[0].name)
+
+    loop_args = for_loop_node.args[3]
+    assert isinstance(loop_args, list)
+    return {
+        i
+        for i, arg in enumerate(loop_args)
+        if hasattr(arg, "name") and arg.name in carried_names
+    }
+
+
+def get_reduced_block_ids(
+    for_loop_node: torch.fx.Node,
+    loop_block_ids: list[int],
+    env: CompileEnvironment,
+) -> set[int]:
+    """Block_ids this ``_for_loop`` *reduces* over.
+
+    A block_id is reduced iff (1) it is in ``loop_block_ids`` — this loop
+    iterates over it — AND (2) the loop has at least one carried tensor
+    accumulator AND (3) no carried tensor's shape contains a dim mapping
+    to that block_id via ``env.get_block_id``.
+
+    Returns ∅ when the loop has no carried accumulators (it isn't a
+    reduction loop at all).
+    """
+    carried = _carried_indices_for_loop_node(for_loop_node)
+    if not carried:
+        return set()
+
+    loop_args = for_loop_node.args[3]
+    block_ids_in_any_acc: set[int] = set()
+    for i in carried:
+        arg = loop_args[i]
+        if not isinstance(arg, torch.fx.Node):
+            continue
+        val = arg.meta.get("val")
+        if not isinstance(val, torch.Tensor):
+            continue
+        for dim_size in val.shape:
+            bid = env.get_block_id(dim_size)
+            if isinstance(bid, int):
+                block_ids_in_any_acc.add(bid)
+
+    return set(loop_block_ids) - block_ids_in_any_acc
+
+
+def store_is_post_reduction(
+    store_node: torch.fx.Node,
+    env: CompileEnvironment,
+    graph_block_ids: dict[int, list[int]],
+) -> set[int]:
+    """Walk backward from ``store_node.args[2]`` (the stored value) and
+    return the union of reduced block_ids contributed by any inner loop
+    whose final-carry surfaces in the value's FX chain.
+
+    Inner-loop final-carry values appear as ``getitem(_for_loop_node,
+    idx)``: when we hit one we read the inner loop's block_ids from
+    ``graph_block_ids`` (keyed by the loop's graph_id, ``args[0]`` of the
+    ``_for_loop`` node) and union :func:`get_reduced_block_ids`'s answer.
+    We do *not* descend into the loop body — the question is "was this
+    value collapsed by a reduction?", which is already answered at the
+    outer scope.
+
+    Returns ∅ when the stored value is computed inline within the
+    storing scope (case 1: per-iter writes are disjoint slices).
+    Non-empty → cases 2/3/4 — promote DMA-out to the tile_b epilogue.
+    """
+    from ...language._tracing_ops import is_for_loop_target
+
+    if len(store_node.args) < 3 or not isinstance(store_node.args[2], torch.fx.Node):
+        return set()
+
+    reduced: set[int] = set()
+    visited: set[torch.fx.Node] = set()
+    stack: list[torch.fx.Node] = [store_node.args[2]]
+
+    while stack:
+        cur = stack.pop()
+        if cur in visited:
+            continue
+        visited.add(cur)
+
+        if cur.op == "call_function" and cur.target is operator.getitem:
+            base = cur.args[0] if cur.args else None
+            if (
+                isinstance(base, torch.fx.Node)
+                and base.op == "call_function"
+                and is_for_loop_target(base.target)
+            ):
+                graph_id = base.args[0]
+                assert isinstance(graph_id, int)
+                loop_block_ids = graph_block_ids.get(graph_id, [])
+                reduced |= get_reduced_block_ids(base, loop_block_ids, env)
+                continue
+
+        for arg in cur.all_input_nodes:
+            if arg not in visited:
+                stack.append(arg)
+
+    return reduced
