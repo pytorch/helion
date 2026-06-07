@@ -246,10 +246,11 @@ class Kernel(Generic[_R]):
             from .._compiler._dynamo.higher_order_ops import helion_kernel_side_table
         except Exception as e:  # pragma: no cover - depends on torch version
             log.debug(
-                "Could not import the Helion kernel side table for kernel %r!!! "
-                "Falling back to kernel_id=-1. This usually means the installed "
-                "PyTorch (%s) predates the Helion higher-order-op integration, so "
-                "telemetry for this kernel will lack a stable kernel id. Cause: %s",
+                "Could not import the Helion kernel side table for kernel %r; "
+                "falling back to kernel_id=-1. This usually means the installed "
+                "PyTorch (%s) predates the Helion higher-order-op integration. "
+                "kernel_id is process-local anyway; telemetry can still group "
+                "rows for this kernel by kernel_source(). Cause: %s",
                 self.name,
                 torch.__version__,
                 e,
