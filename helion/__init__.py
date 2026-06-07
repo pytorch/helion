@@ -12,6 +12,7 @@ from .runtime import Config
 from .runtime import Kernel
 from .runtime import kernel
 from .runtime import kernel as jit  # alias
+from .runtime._tpu_compile_capture import tpu_compile_capture
 from .runtime.settings import RefMode
 from .runtime.settings import Settings
 
@@ -28,6 +29,7 @@ __all__ = [
     "language",
     "next_power_of_2",
     "runtime",
+    "tpu_compile_capture",
 ]
 
 _logging.init_logs()
