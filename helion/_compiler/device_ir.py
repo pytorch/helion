@@ -1071,6 +1071,13 @@ class DeviceIR:
 
         env = CompileEnvironment.current()
         spec = env.config_spec
+        # A kernel with a matmul is out of scope for the reduction seed (the gate
+        # excludes it via ``matmul_facts``), and its carried 2D accumulators (e.g.
+        # attention's ``[M_BLOCK, head_dim]``) have a static int last-dim that the
+        # reduction-axis walk does not expect. Decline before walking — matmul_facts
+        # are already populated at this point (recorded during tracing).
+        if spec.matmul_facts:
+            return
         grid_ids = {b for bids in self.grid_block_ids for b in bids}
 
         red_block_ids: set[int] = set()
@@ -1155,16 +1162,15 @@ class DeviceIR:
         resolved block to be the reduction axis; a compound expr resolving to ``None``
         falls back to symbol-membership.
 
-        A reduction-tile extent is never a bare int (it stays a block ``SymInt`` even
-        under ``static_shapes=True``), so we assert that rather than fall back to
-        int-equality — a tripwire for a future kernel with a constant extent.
+        A reduction-tile extent stays a block ``SymInt`` with provenance (even under
+        ``static_shapes=True``). A bare int has no block provenance, so it cannot BE
+        the reduction axis (a constant non-reduction dim equal to the extent would
+        otherwise be mis-classified by int-equality): treat it as not-the-axis.
         """
         import sympy
 
-        assert not isinstance(last, int), (
-            f"reduction-tile extent unexpectedly a bare int ({last!r}); expected a "
-            "block SymInt with provenance (see _extent_is_reduction_axis)"
-        )
+        if isinstance(last, int):
+            return False
         env = CompileEnvironment.current()
         bid = env.resolve_block_id(last)
         if bid is not None:

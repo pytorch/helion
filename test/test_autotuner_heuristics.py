@@ -720,14 +720,14 @@ class TestTritonReductionTileHeuristic(TestCase):
     def _reduction_env(self, spec: ConfigSpec) -> MagicMock:
         # The deepened heuristic reads env.backend.max_tensor_numel (the structural
         # persistent cap) — provide the real Triton cap so a sub-cap rnumel stays
-        # persistent. (matches_hardware on a MagicMock env resolves truthy, so the
-        # sm90 deep path is exercised, which is what these tests target.)
+        # persistent.
         from helion.autotuner.config_generation import TRITON_MAX_TENSOR_NUMEL
 
         env = MagicMock()
         env.backend_name = "triton"
         env.backend.max_tensor_numel = TRITON_MAX_TENSOR_NUMEL
         env.config_spec = spec
+        env.device = DEVICE
         return env
 
     def test_seed_is_persistent_one_row(self) -> None:
@@ -735,7 +735,8 @@ class TestTritonReductionTileHeuristic(TestCase):
         # deepened heuristic ALSO seeds num_warps via the rnumel ramp (rnumel=1024
         # -> 4 warps) and num_stages=1, rather than leaving them to the autotuner.
         env = self._reduction_env(self._reduction_spec(reduction_size_hint=1024))
-        seed = TritonReductionTileHeuristic.get_seed_config(env, MagicMock())
+        with patch("helion._hardware.get_hardware_info", return_value=HOPPER_HARDWARE):
+            seed = TritonReductionTileHeuristic.get_seed_config(env, MagicMock())
         self.assertEqual(seed.config["block_sizes"], [1])
         self.assertEqual(seed.config["reduction_loops"], [None])
         # rnumel ramp: 1024 falls in the <=1024 band -> 4 warps.
@@ -755,7 +756,8 @@ class TestTritonReductionTileHeuristic(TestCase):
             EnumFragment(choices=("", "first", "last")), length=4
         )
         env = self._reduction_env(spec)
-        seed = TritonReductionTileHeuristic.get_seed_config(env, MagicMock())
+        with patch("helion._hardware.get_hardware_info", return_value=HOPPER_HARDWARE):
+            seed = TritonReductionTileHeuristic.get_seed_config(env, MagicMock())
         self.assertEqual(
             seed.config["load_eviction_policies"],
             ["first", "first", "first", "first"],
@@ -770,7 +772,8 @@ class TestTritonReductionTileHeuristic(TestCase):
 
         spec = self._reduction_spec(reduction_size_hint=32000)
         env = self._reduction_env(spec)
-        seed = TritonReductionTileHeuristic.get_seed_config(env, MagicMock())
+        with patch("helion._hardware.get_hardware_info", return_value=HOPPER_HARDWARE):
+            seed = TritonReductionTileHeuristic.get_seed_config(env, MagicMock())
         spec.compiler_seed_configs = [seed]
         pairs = ConfigGeneration(spec).seed_flat_config_pairs()
         self.assertEqual(len(pairs), 1)
