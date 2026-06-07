@@ -209,6 +209,7 @@ BACKEND_SPECIFIC_KEYS: frozenset[str] = (
     | {
         "num_threads",
         "cute_vector_widths",
+        "load_cache_modifiers",
         "pallas_loop_type",
         "pallas_pre_broadcast",
     }
@@ -235,6 +236,7 @@ VALID_KEYS: frozenset[str] = frozenset(
         "indexing",
         "atomic_indexing",
         "load_eviction_policies",
+        "load_cache_modifiers",
         "pallas_loop_type",
         "pallas_pre_broadcast",
         "cute_vector_widths",
@@ -293,6 +295,12 @@ _CUTE_IMPLICIT_DEFAULT_KEYS: frozenset[str] = frozenset(
 def get_valid_eviction_policies(backend_name: str) -> tuple[str, ...]:
     if backend_name == "triton" and not supports_amd_cdna_tunables():
         return ("", "first", "last")
+    return ("",)
+
+
+def get_valid_load_cache_modifiers(backend_name: str) -> tuple[str, ...]:
+    if backend_name == "triton" and supports_amd_cdna_tunables():
+        return ("", ".cg")
     return ("",)
 
 
@@ -355,6 +363,10 @@ class ConfigSpec:
         self.tensor_numel_constraints: list[TensorNumelConstraint] = []
         self.load_eviction_policies = ListOf(
             EnumFragment(choices=get_valid_eviction_policies(self.backend_name)),
+            length=0,
+        )
+        self.load_cache_modifiers = ListOf(
+            EnumFragment(choices=get_valid_load_cache_modifiers(self.backend_name)),
             length=0,
         )
         self.indexing = ListOf(
@@ -1032,6 +1044,7 @@ class ConfigSpec:
             "range_flattens",
             "static_ranges",
             "load_eviction_policies",
+            "load_cache_modifiers",
             "indexing",
             "atomic_indexing",
         ):
@@ -1043,6 +1056,7 @@ class ConfigSpec:
             "num_warps",
             "num_stages",
             "load_eviction_policies",
+            "load_cache_modifiers",
             "indexing",
             "atomic_indexing",
             "pid_type",
@@ -1059,6 +1073,13 @@ class ConfigSpec:
         if self.supports_config_key("load_eviction_policies"):
             config.setdefault(
                 "load_eviction_policies", self.load_eviction_policies.default()
+            )
+        if (
+            self.supports_config_key("load_cache_modifiers")
+            and self.load_cache_modifiers.length > 0
+        ):
+            config.setdefault(
+                "load_cache_modifiers", self.load_cache_modifiers.default()
             )
         if self.supports_config_key("indexing"):
             config.setdefault("indexing", self.indexing.default())
@@ -1479,6 +1500,11 @@ class ConfigSpec:
             )
         if self.supports_config_key("load_eviction_policies"):
             fields["load_eviction_policies"] = self.load_eviction_policies
+        if (
+            self.supports_config_key("load_cache_modifiers")
+            and self.load_cache_modifiers.length > 0
+        ):
+            fields["load_cache_modifiers"] = self.load_cache_modifiers
         if self.supports_config_key("num_threads"):
             fields["num_threads"] = self.num_threads
         if is_tileir:
@@ -1596,6 +1622,7 @@ class ConfigSpec:
             "range_flattens",
             "static_ranges",
             "load_eviction_policies",
+            "load_cache_modifiers",
             "indexing",
             "atomic_indexing",
         ):

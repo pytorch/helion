@@ -3,6 +3,7 @@ from __future__ import annotations
 import math
 import os
 from typing import TYPE_CHECKING
+from typing import Any
 from typing import Callable
 import unittest
 
@@ -106,27 +107,11 @@ def pallas_matmul_broadcast_bias(
 
 
 @helion.kernel(backend="pallas", static_shapes=True)
-def pallas_matmul_f32(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-    """f32 matmul kernel mirroring the perf harness's helion variant."""
-    m, k = x.size()
-    _, n = y.size()
-    out = torch.empty([m, n], device=x.device, dtype=torch.float32)
-    for tile_m, tile_n in hl.tile([m, n]):
-        acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
-        for tile_k in hl.tile(k):
-            acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
-        out[tile_m, tile_n] = acc
-    return out
-
-
-@helion.kernel(backend="pallas", static_shapes=True)
 def pallas_matmul_bf16(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     """bf16 matmul kernel mirroring the perf harness's helion variant.
 
-    Used by the pin test that verifies the bf16 2D path emits ``pl.dot``
-    (the Pallas-native MXU primitive used by the hand-written reference
-    kernel in ``examples/pallas_perf/matmul_pallas.py``) rather than the
-    slower ``lax.dot_general`` fallback.
+    Used by ``test_pallas_matmul_bf16_no_tiling_seed_covers_large_cubes`` to
+    exercise the no-tiling ``lax.dot_general`` lowering on bf16 square matmuls.
     """
     m, k = x.size()
     _, n = y.size()
@@ -1749,62 +1734,6 @@ class TestPallas(TestCase):
             f"identical jit_fns should give a near-zero paired delta; got {delta_micros!r}",
         )
 
-    def test_pallas_matmul_bf16_emits_pl_dot(self) -> None:
-        """bf16 1024x1024x1024: 2D MXU-legal tile should emit ``pl.dot``.
-
-        The hand-written reference kernel in
-        ``examples/pallas_perf/matmul_pallas.py`` uses ``pl.dot`` for the
-        bf16 square-matmul body; the Mosaic backend lowers it directly to
-        the TPU MXU. The previous Helion path emitted the equivalent
-        ``lax.dot_general(..., preferred_element_type=jnp.float32)``,
-        which the same Mosaic backend serializes through a slower
-        general dot path. The pin asserts:
-
-        * ``pl.dot(`` appears in the generated code (the routing rule
-          fired);
-        * the slower ``lax.dot_general(`` fallback is absent for this
-          2D bf16 tile (i.e. ``preferred_element_type=jnp.float32`` is no
-          longer needed because ``pl.dot`` returns f32 on bf16 inputs
-          automatically).
-
-        The shape is the headline 1024^3 anchor and the block matches
-        ``BLOCK_CONFIGS[1] = (128, 128, 128)`` from
-        ``examples/pallas_perf/matmul_configs.py``.
-        """
-        torch.manual_seed(0)
-        x = torch.randn(1024, 1024, device=DEVICE, dtype=torch.bfloat16)
-        torch.manual_seed(1)
-        y = torch.randn(1024, 1024, device=DEVICE, dtype=torch.bfloat16)
-        code, result = code_and_output(
-            pallas_matmul_bf16, (x, y), block_sizes=[128, 128, 128]
-        )
-        expected = (x.float() @ y.float()).to(torch.bfloat16)
-        torch.testing.assert_close(result, expected, rtol=1e-2, atol=1e-2)
-        self.assertIn("pl.dot(", code)
-        self.assertNotIn("lax.dot_general(", code)
-        self.assertNotIn("preferred_element_type=jnp.float32", code)
-
-    def test_pallas_matmul_bmm_stays_on_dot_general(self) -> None:
-        """3D BMM stays on ``lax.dot_general`` (``pl.dot`` is 2D-only).
-
-        ``pl.dot`` rejects non-2D inputs upstream
-        (``jax/_src/pallas/primitives.py``), so BMM kernels must keep
-        using the 3D ``dimension_numbers`` form. The pin guards against a
-        future routing widening that would break 3D paths.
-        """
-        torch.manual_seed(0)
-        a = torch.randn(4, 128, 256, device=DEVICE, dtype=torch.bfloat16)
-        torch.manual_seed(1)
-        b = torch.randn(4, 256, 128, device=DEVICE, dtype=torch.bfloat16)
-        code, result = code_and_output(
-            pallas_bmm, (a, b), block_sizes=[4, 128, 128, 256]
-        )
-        expected = torch.bmm(a.float(), b.float()).to(torch.bfloat16)
-        torch.testing.assert_close(result, expected, rtol=1e-2, atol=1e-2)
-        self.assertIn("lax.dot_general(", code)
-        self.assertIn("preferred_element_type=jnp.float32", code)
-        self.assertNotIn("pl.dot(", code)
-
     def test_pallas_matmul_dot_general_lowering_fires_on_no_tiling(self) -> None:
         """No-tiling 2-input matmul emits ``lax.dot_general``, not ``pl.pallas_call``.
 
@@ -2018,6 +1947,46 @@ class TestPallas(TestCase):
         """Same kernel as :meth:`test_scalar_lookup_with_emit_pipeline`
         compiled under ``pallas_loop_type='fori_loop'``."""
         self._check_scalar_lookup_in_pipeline("fori_loop")
+
+    @xfailIfPallasInterpret(
+        "pl.program_id captured into emit_pipeline body is not supported in "
+        "JAX interpret mode (program_id_p.bind asserts during trace)"
+    )
+    def test_nested_non_grid_outer_loop_emit_pipeline(self) -> None:
+        """Grid (``tile_m``) → non-grid device loop (``tile_n``) wrapping
+        an inner emit_pipeline (``tile_k``) whose body reads
+        ``w[tile_k, tile_n]`` compiles and produces correct matmul output.
+        Mirrors the epilogue structure of ``squeeze_and_excitation_net``.
+
+        ``n`` must exceed the effective ``bs_n`` (128 lanes on TPU) so the
+        inner BlockSpec for ``w`` is actually block-sized rather than
+        coincidentally equalling the full ``n`` dim.
+        """
+
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def kernel(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+            m, k = x.size()
+            n = w.size(1)
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m in hl.tile(m):
+                for tile_n in hl.tile(n):
+                    acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                    for tile_k in hl.tile(k):
+                        acc = torch.addmm(acc, x[tile_m, tile_k], w[tile_k, tile_n])
+                    out[tile_m, tile_n] = acc.to(x.dtype)
+            return out
+
+        m, k, n = 32, 256, 256
+        x = torch.randn(m, k, device=DEVICE, dtype=torch.float32)
+        w = torch.randn(k, n, device=DEVICE, dtype=torch.float32)
+        code, result = code_and_output(
+            kernel,
+            (x, w),
+            block_sizes=[16, 128, 128],
+            pallas_loop_type="emit_pipeline",
+        )
+        self.assertIn("pltpu.emit_pipeline", code)
+        torch.testing.assert_close(result, x @ w, rtol=1e-2, atol=1e-2)
 
     def test_two_pass_reduction_emit_pipeline(self) -> None:
         """Two inner reduction loops over the same dim compile and run under
@@ -4229,6 +4198,189 @@ class TestPallasIndirectGather(TestCase):
 
 
 instantiate_parametrized_tests(TestPallasIndirectGather)
+
+
+@skipUnlessPallas("JAX/Pallas TPU not available")
+class TestPallasJaxFn(TestCase):
+    """End-to-end tests for the ``Kernel.jax_fn`` pure-JAX export path.
+
+    Covers all three ``pallas_loop_type`` flavours plus a multi-kernel
+    composition test, each exercising the kernel inside a ``jax.jit``
+    boundary with non-trivial pure-JAX prologue / epilogue around it.
+    """
+
+    def _import_jax(self) -> tuple[Any, Any]:
+        import jax
+        import jax.numpy as jnp
+
+        return jax, jnp
+
+    def test_jax_fn_emit_pipeline(self) -> None:
+        """jax_fn drives an emit_pipeline kernel inside ``jax.jit``."""
+        jax, jnp = self._import_jax()
+
+        @helion.kernel(
+            backend="pallas",
+            static_shapes=True,
+            config=helion.Config(
+                block_sizes=[128, 128], pallas_loop_type="emit_pipeline"
+            ),
+        )
+        def add_kernel(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile in hl.tile(out.size()):
+                out[tile] = x[tile] + y[tile]
+            return out
+
+        jax_kernel = add_kernel.jax_fn
+
+        @jax.jit
+        def f(a: Any, b: Any, scale: float) -> Any:
+            # prologue (pure jax)
+            a = a * scale
+            b = jnp.tanh(b)
+            # kernel
+            c = jax_kernel(a, b)
+            # epilogue (pure jax)
+            return jnp.sum(c) + jnp.mean(c) * 0.5
+
+        a = jnp.ones((128, 128), dtype=jnp.float32)
+        b = jnp.full((128, 128), 0.5, dtype=jnp.float32)
+        scale = 2.0
+
+        result = float(f(a, b, scale))
+
+        # Reference: same prologue/epilogue, eager addition
+        ref_a = a * scale
+        ref_b = jnp.tanh(b)
+        ref_c = ref_a + ref_b
+        ref = float(jnp.sum(ref_c) + jnp.mean(ref_c) * 0.5)
+        self.assertAlmostEqual(result, ref, places=2)
+
+    def test_jax_fn_unroll(self) -> None:
+        """jax_fn drives an unroll kernel inside ``jax.jit``."""
+        jax, jnp = self._import_jax()
+
+        @helion.kernel(
+            backend="pallas",
+            static_shapes=True,
+            config=helion.Config(block_sizes=[128, 128], pallas_loop_type="unroll"),
+        )
+        def relu_add_kernel(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile in hl.tile(out.size()):
+                out[tile] = torch.relu(x[tile]) + y[tile]
+            return out
+
+        jax_kernel = relu_add_kernel.jax_fn
+
+        @jax.jit
+        def f(a: Any, b: Any) -> Any:
+            a = a - 0.25
+            b = b * b
+            c = jax_kernel(a, b)
+            return jnp.sum(c * c)
+
+        a = jnp.linspace(-1.0, 1.0, 128 * 128, dtype=jnp.float32).reshape((128, 128))
+        b = jnp.full((128, 128), 0.3, dtype=jnp.float32)
+
+        result = float(f(a, b))
+
+        ref_a = a - 0.25
+        ref_b = b * b
+        ref_c = jnp.maximum(ref_a, 0.0) + ref_b
+        ref = float(jnp.sum(ref_c * ref_c))
+        self.assertAlmostEqual(result, ref, places=1)
+
+    def test_jax_fn_fori_loop(self) -> None:
+        """jax_fn drives a fori_loop kernel inside ``jax.jit``."""
+        jax, jnp = self._import_jax()
+
+        @helion.kernel(
+            backend="pallas",
+            static_shapes=True,
+            config=helion.Config(block_sizes=[128, 128], pallas_loop_type="fori_loop"),
+        )
+        def mul_add_kernel(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile_m in hl.tile(x.size(0)):
+                for tile_n in hl.tile(x.size(1)):
+                    out[tile_m, tile_n] = x[tile_m, tile_n] * 1.5 + y[tile_m, tile_n]
+            return out
+
+        jax_kernel = mul_add_kernel.jax_fn
+
+        @jax.jit
+        def f(a: Any, b: Any) -> Any:
+            a = a * 0.5 + 1.0
+            b = jnp.exp(b * 0.1)
+            c = jax_kernel(a, b)
+            return jnp.mean(c)
+
+        a = jnp.full((128, 128), 2.0, dtype=jnp.float32)
+        b = jnp.zeros((128, 128), dtype=jnp.float32)
+
+        result = float(f(a, b))
+
+        ref_a = a * 0.5 + 1.0
+        ref_b = jnp.exp(b * 0.1)
+        ref_c = ref_a * 1.5 + ref_b
+        ref = float(jnp.mean(ref_c))
+        self.assertAlmostEqual(result, ref, places=2)
+
+    def test_jax_fn_multi_kernel_in_one_jit(self) -> None:
+        """A single ``jax.jit`` function uses two distinct Helion kernels."""
+        jax, jnp = self._import_jax()
+
+        @helion.kernel(
+            backend="pallas",
+            static_shapes=True,
+            config=helion.Config(block_sizes=[128, 128]),
+        )
+        def add_kernel(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile in hl.tile(out.size()):
+                out[tile] = x[tile] + y[tile]
+            return out
+
+        @helion.kernel(
+            backend="pallas",
+            static_shapes=True,
+            config=helion.Config(block_sizes=[128, 128]),
+        )
+        def mul_kernel(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile in hl.tile(out.size()):
+                out[tile] = x[tile] * y[tile]
+            return out
+
+        add_jax = add_kernel.jax_fn
+        mul_jax = mul_kernel.jax_fn
+
+        @jax.jit
+        def f(a: Any, b: Any, c: Any) -> Any:
+            # prologue
+            a = a + 1.0
+            # first kernel: a + b
+            ab = add_jax(a, b)
+            # middle pure-jax transform
+            ab = jnp.tanh(ab)
+            # second kernel: (tanh result) * c
+            out = mul_jax(ab, c)
+            # epilogue
+            return jnp.sum(out)
+
+        a = jnp.full((128, 128), 0.5, dtype=jnp.float32)
+        b = jnp.full((128, 128), 0.25, dtype=jnp.float32)
+        c = jnp.full((128, 128), 2.0, dtype=jnp.float32)
+
+        result = float(f(a, b, c))
+
+        ref_a = a + 1.0
+        ref_ab = jnp.tanh(ref_a + b)
+        ref_out = ref_ab * c
+        ref = float(jnp.sum(ref_out))
+        self.assertAlmostEqual(result, ref, places=2)
 
 
 class TestPallasPrinter(TestCase):

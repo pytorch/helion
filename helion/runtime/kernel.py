@@ -13,6 +13,7 @@ import sys
 import textwrap
 import types
 from typing import TYPE_CHECKING
+from typing import Any
 from typing import Callable
 from typing import Generic
 from typing import Hashable
@@ -343,6 +344,10 @@ class Kernel(Generic[_R]):
             if isinstance(obj, torch.fx.GraphModule):
                 # GraphModule subclasses need special handling
                 extractor = _specialization_extractors[torch.fx.GraphModule]
+            elif isinstance(obj, torch.Tensor):
+                # torch.Tensor subclasses (e.g. the JAX-export adapter)
+                # share the standard tensor specialization key.
+                extractor = _specialization_extractors[torch.Tensor]
             elif isinstance(obj, tuple) and hasattr(obj, "_fields"):
                 # this is a namedtuple
                 extractor = _specialization_extractors["namedtuple"]
@@ -415,6 +420,28 @@ class Kernel(Generic[_R]):
         recompile and re-autotune.
         """
         self._bound_kernels.clear()
+
+    @property
+    def jax_fn(self) -> Callable[..., Any]:
+        """A pure-JAX callable view of this Helion kernel.
+
+        Pallas-backend kernels can be called directly with JAX arrays
+        or tracers (i.e. inside ``jax.jit``) by going through this
+        property.  The kernel's compile/specialize path runs the first
+        time the callable is invoked; subsequent calls reuse the
+        cached compilation just like ``__call__``.
+
+        This only supports kernels compiled for the Pallas backend.
+        """
+        from .pallas_jax_export import make_jax_fn
+
+        cached = getattr(self, "_jax_fn_callable", None)
+        if cached is not None:
+            return cast("Callable[..., Any]", cached)
+        rv = make_jax_fn(self)
+        # pyrefly: ignore [unsupported-attribute-set]
+        self._jax_fn_callable = rv
+        return rv
 
 
 class BoundKernel(_AutotunableKernel, Generic[_R]):

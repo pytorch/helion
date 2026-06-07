@@ -5,6 +5,7 @@ import functools
 import math
 import operator
 import re
+from typing import Any
 import unittest
 from unittest.mock import patch
 
@@ -12,10 +13,12 @@ import torch
 from torch._inductor import config as inductor_config
 from torch._inductor.codecache import FxGraphCache
 from torch._inductor.codecache import PyCodeCache
+from torch._inductor.ir import MutationOutput
 from torch._inductor.utils import fresh_cache
 from torch._inductor.utils import run_and_get_code
 from torch.testing._internal.common_utils import instantiate_parametrized_tests
 from torch.testing._internal.common_utils import parametrize
+from torch.utils._ordered_set import OrderedSet
 
 import helion
 from helion._compat import requires_torch_version
@@ -1773,6 +1776,100 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             kernels_ref=[k_add_inplace_ref],
             expected_num_kernels_ref=1,
         )
+
+    @unittest.skipUnless(
+        supports_torch_compile_fusion(),
+        "torch_compile_fusion=True requires PyTorch nightly build",
+    )
+    def test_mutating_template_prologue_fusion_respects_allowed_inputs(self):
+        """Only independent non-mutated inputs may prologue-fuse into mutation.
+
+        The hook returns True when Inductor should block prologue fusion.  Helion
+        should allow an independent producer feeding a non-mutated input, but
+        still block aliases, real mutations, and producers tied to mutated data.
+        """
+        from helion._compiler._inductor.template_buffer import HelionTemplateBuffer
+
+        class FakeInput:
+            def __init__(self, name, reads):
+                self._name = name
+                self._reads = OrderedSet(reads)
+
+            def get_name(self):
+                return self._name
+
+            def get_read_names(self):
+                return self._reads
+
+        class FakeOutput:
+            def __init__(self, *, aliases=(), mutations=(), node=None):
+                self._aliases = aliases
+                self._mutations = mutations
+                self.node = node
+
+            def get_aliases(self):
+                return self._aliases
+
+            def get_mutations(self):
+                return self._mutations
+
+        class FakeSchedulerNode:
+            def __init__(self, outputs):
+                self._outputs = outputs
+
+            def get_outputs(self):
+                return self._outputs
+
+        mutation_output = object.__new__(MutationOutput)
+        mutating_outputs = [FakeOutput(mutations=("x",), node=mutation_output)]
+
+        def blocks_prologue_fusion(
+            *,
+            input_name="y_prologue",
+            reads=("y",),
+            outputs=None,
+        ) -> bool:
+            template: Any = object.__new__(HelionTemplateBuffer)
+            template.inputs = [FakeInput(input_name, reads)]
+            template.allowed_prologue_inps = OrderedSet((input_name,))
+            return template.has_aliasing_or_mutation_for_prologue_fusion(
+                FakeSchedulerNode(mutating_outputs if outputs is None else outputs)
+            )
+
+        cases = [
+            (
+                "allow independent non-mutated prologue",
+                False,
+                {},
+            ),
+            (
+                "block prologue that replaces mutated input",
+                True,
+                {"input_name": "x", "reads": ("x",)},
+            ),
+            (
+                "block prologue that reads mutated input",
+                True,
+                {"reads": ("x",)},
+            ),
+            (
+                "block aliasing template output",
+                True,
+                {"outputs": [FakeOutput(aliases=("x",))]},
+            ),
+            (
+                "block real non-synthetic mutation",
+                True,
+                {"outputs": [FakeOutput(mutations=("x",), node=object())]},
+            ),
+        ]
+
+        for name, expected, kwargs in cases:
+            with self.subTest(name):
+                self.assertIs(
+                    blocks_prologue_fusion(**kwargs),
+                    expected,
+                )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")

@@ -374,7 +374,6 @@ class TestMatmul(RefEagerTestBase, TestCase):
         else:
             self.assertIn("tl.atomic_add", code)
 
-    @skipIfNotTriton("config reuse crashes CUDA on cute, corrupting test state")
     @skipIfRefEager("config_spec is not supported in ref eager mode")
     def test_matmul_config_reuse_with_unit_dim(self):
         torch.manual_seed(0)

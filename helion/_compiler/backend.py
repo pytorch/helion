@@ -37,6 +37,7 @@ if TYPE_CHECKING:
     from ..autotuner.config_spec import ConfigSpec
     from ..runtime.config import Config
     from ..runtime.kernel import BoundKernel
+    from ..runtime.settings import DotPrecision
     from .device_function import Argument
     from .device_function import DeviceFunction
     from .device_ir import GraphInfo
@@ -926,6 +927,22 @@ class Backend(abc.ABC):
             ).autotune(skip_cache=force)
         return config
 
+    @staticmethod
+    def map_dot_precision(precision: DotPrecision) -> str:
+        """Map Helion dot precision to backend-specific precision string.
+
+        Default implementation maps to Triton-compatible precision values.
+        """
+        triton_precision_by_dot_precision = {
+            "default": "tf32",
+            "high": "tf32x3",
+            "highest": "ieee",
+            "tf32": "tf32",
+            "tf32x3": "tf32x3",
+            "ieee": "ieee",
+        }
+        return triton_precision_by_dot_precision.get(precision, "")
+
 
 class TritonBackend(Backend):
     """Triton code generation backend."""
@@ -939,6 +956,8 @@ class TritonBackend(Backend):
         return False
 
     def supports_config_key(self, key: str) -> bool:
+        if key == "load_cache_modifiers":
+            return True
         if key == "waves_per_eu":
             from .._compat import is_hip
 
@@ -1426,6 +1445,26 @@ class PallasBackend(Backend):
     @property
     def name(self) -> str:
         return "pallas"
+
+    @staticmethod
+    # Overrides Backend.map_dot_precision.
+    def map_dot_precision(precision: DotPrecision) -> str:
+        """Map Helion dot precision to Pallas-specific precision string.
+
+        Pallas/TPU has limited support for different precisions, often
+        falling back to the highest available precision.
+        """
+        pallas_precision_by_dot_precision = {
+            "default": "default",
+            # "high" is mapped to "highest" because Pallas/Mosaic doesn't yet
+            # support it on TPU.
+            "high": "highest",
+            "highest": "highest",
+            "tf32": "highest",
+            "tf32x3": "highest",
+            "ieee": "highest",
+        }
+        return pallas_precision_by_dot_precision.get(precision, "default")
 
     @property
     def max_tensor_numel(self) -> int | None:
@@ -3426,6 +3465,8 @@ class CuteBackend(Backend):
             "_cute_fp8e4m3fn_to_float32": "from helion._compiler.cute.quantized_helpers import fp8e4m3fn_to_float32 as _cute_fp8e4m3fn_to_float32",
             "_cute_float4_e2m1fn_x2_to_float32": "from helion._compiler.cute.quantized_helpers import float4_e2m1fn_x2_to_float32 as _cute_float4_e2m1fn_x2_to_float32",
             "_cute_grid_barrier": "from helion._compiler.cute.grid_barrier import grid_barrier as _cute_grid_barrier",
+            "_cute_atomic_max_float32": "from helion._compiler.cute.atomic_helpers import atomic_max_float32 as _cute_atomic_max_float32",
+            "_cute_atomic_min_float32": "from helion._compiler.cute.atomic_helpers import atomic_min_float32 as _cute_atomic_min_float32",
         }
 
     def program_id_expr(self, dim: int, *, index_dtype: str) -> str:

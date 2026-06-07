@@ -131,27 +131,6 @@ def _needs_f32_accumulator(lhs_dtype: torch.dtype, rhs_dtype: torch.dtype) -> bo
     return lhs_dtype.itemsize < 4 or rhs_dtype.itemsize < 4
 
 
-def _can_emit_pallas_pl_dot(
-    lhs_ndim: int,
-    lhs_dtype: torch.dtype | None,
-    rhs_dtype: torch.dtype | None,
-) -> bool:
-    """Return True when the Pallas backend should emit ``pl.dot`` instead of
-    ``lax.dot_general``.
-
-    ``pl.dot`` is a Pallas-native 2D dot that maps directly onto the TPU MXU
-    and lowers more efficiently than ``lax.dot_general`` on MXU-legal tiles.
-    Eligible only for 2D bf16/f16 matmuls (the MXU's native input dtypes);
-    BMM (3D), f32, int8 and fp8 stay on ``lax.dot_general``.
-    """
-    if lhs_ndim != 2:
-        return False
-    return lhs_dtype in (torch.bfloat16, torch.float16) and rhs_dtype in (
-        torch.bfloat16,
-        torch.float16,
-    )
-
-
 def _emit_pallas_matmul(
     lhs: ast.AST,
     rhs: ast.AST,
@@ -160,32 +139,44 @@ def _emit_pallas_matmul(
     need_f32_acc: bool = False,
     out_dtype: torch.dtype | None = None,
     lhs_ndim: int = 2,
-    lhs_dtype: torch.dtype | None = None,
-    rhs_dtype: torch.dtype | None = None,
 ) -> ast.AST:
-    """Build a Pallas matmul AST node.
+    """Build a ``lax.dot_general`` AST node for the Pallas backend.
 
-    Emits ``pl.dot`` for MXU-legal 2D bf16/f16 tiles (see
-    :func:`_can_emit_pallas_pl_dot`); else ``lax.dot_general`` (BMM, f32, int8,
-    fp8).  With ``need_f32_acc`` the dot output is f32 (``dot_general`` gets
-    ``preferred_element_type=jnp.float32``; ``pl.dot`` is already f32 on bf16/f16
-    input), cast back to ``out_dtype`` when that is narrower.
+    Parameters
+    ----------
+    lhs, rhs:
+        AST nodes for the left / right operands.
+    acc:
+        Optional AST node for the accumulator (``acc + dot_general(...)``).
+    need_f32_acc:
+        When True, emit ``preferred_element_type=jnp.float32`` and, if
+        *out_dtype* is narrower than f32, append a
+        ``lax.convert_element_type`` cast.
+    out_dtype:
+        Desired output dtype.  Only used when *need_f32_acc* is True to
+        decide whether a cast-back is required.
+    lhs_ndim:
+        Number of dimensions in the left operand (2 for mm, 3 for bmm).
     """
-    if _can_emit_pallas_pl_dot(lhs_ndim, lhs_dtype, rhs_dtype):
-        dot_expr = expr_from_string("pl.dot({lhs}, {rhs})", lhs=lhs, rhs=rhs)
+    if lhs_ndim == 3:
+        dim_numbers = "(((2,), (1,)), ((0,), (0,)))"
+    elif lhs_ndim == 2:
+        dim_numbers = "(((1,), (0,)), ((), ()))"
     else:
-        if lhs_ndim == 3:
-            dim_numbers = "(((2,), (1,)), ((0,), (0,)))"
-        elif lhs_ndim == 2:
-            dim_numbers = "(((1,), (0,)), ((), ()))"
-        else:
-            raise ValueError(f"lhs_ndim must be 2 or 3, got {lhs_ndim}")
+        raise ValueError(f"lhs_ndim must be 2 or 3, got {lhs_ndim}")
 
-        kwargs = [f"dimension_numbers={dim_numbers}"]
-        if need_f32_acc:
-            kwargs.append("preferred_element_type=jnp.float32")
+    env = CompileEnvironment.current()
+    precision = env.backend.map_dot_precision(env.settings.dot_precision)
+    precision_arg = f", precision={precision!r}" if precision else ""
+    if need_f32_acc:
         dot_expr = expr_from_string(
-            f"lax.dot_general({{lhs}}, {{rhs}}, {', '.join(kwargs)})",
+            f"lax.dot_general({{lhs}}, {{rhs}}, dimension_numbers={dim_numbers}{precision_arg}, preferred_element_type=jnp.float32)",
+            lhs=lhs,
+            rhs=rhs,
+        )
+    else:
+        dot_expr = expr_from_string(
+            f"lax.dot_general({{lhs}}, {{rhs}}, dimension_numbers={dim_numbers}{precision_arg})",
             lhs=lhs,
             rhs=rhs,
         )
@@ -195,7 +186,6 @@ def _emit_pallas_matmul(
 
     # Cast back if the result should be narrower than f32
     if need_f32_acc and out_dtype is not None and out_dtype.itemsize < 4:
-        env = CompileEnvironment.current()
         dtype_str = env.backend.dtype_str(out_dtype)
         dot_expr = expr_from_string(
             f"lax.convert_element_type({{val}}, {dtype_str})", val=dot_expr
@@ -289,7 +279,7 @@ def emit_tl_dot_with_padding(
     shape_str = device_fn.tile_strategy.shape_str
 
     env = CompileEnvironment.current()
-    input_precision = env.settings.dot_precision
+    input_precision = env.backend.map_dot_precision(env.settings.dot_precision)
     config = device_fn.config
 
     lhs_shape_list = list(lhs_shape)

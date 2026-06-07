@@ -11,7 +11,6 @@ from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
 from helion._testing import code_and_output
 from helion._testing import onlyBackends
-from helion._testing import skipIfCute
 from helion._testing import skipIfRefEager
 from helion._testing import skipIfRocm
 from helion._testing import skipIfTileIR
@@ -481,7 +480,6 @@ class TestAtomicOperations(RefEagerTestBase, TestCase):
                 expected = torch.ones(16, 128, device=DEVICE) + x.sum(dim=0)
                 torch.testing.assert_close(result, expected)
 
-    @skipIfCute("CuTe does not handle structural shared-tile atomics yet")
     def test_structural_atomic_add_two_contributor_dims(self):
         @helion.kernel(static_shapes=True)
         def structural_atomic_add_2_contributor_kernel(
@@ -508,7 +506,6 @@ class TestAtomicOperations(RefEagerTestBase, TestCase):
         expected = torch.ones(16, 128, device=DEVICE) + x.sum(dim=(0, 1))
         torch.testing.assert_close(result, expected)
 
-    @skipIfCute("CuTe does not handle structural shared-tile atomics yet")
     def test_structural_atomic_add_multiple_outputs(self):
         @helion.kernel(static_shapes=True)
         def structural_atomic_add_two_outputs_kernel(
@@ -540,7 +537,6 @@ class TestAtomicOperations(RefEagerTestBase, TestCase):
             out_y, torch.full([16, 128], 2.0, device=DEVICE) + y.sum(dim=0)
         )
 
-    @skipIfCute("CuTe does not handle structural shared-tile atomics yet")
     def test_structural_atomic_max_min_shared_tile(self):
         @helion.kernel(static_shapes=True)
         def structural_atomic_max_kernel(x: torch.Tensor) -> torch.Tensor:

@@ -1285,9 +1285,9 @@ class TestLauncher(TestCase):
         self.assertNotEqual(unaligned.data_ptr() % 16, 0)
 
         add(aligned, aligned)
-        torch.cuda.synchronize()
+        torch.accelerator.synchronize()
         out = add(unaligned, unaligned)
-        torch.cuda.synchronize()
+        torch.accelerator.synchronize()
         torch.testing.assert_close(out, unaligned + unaligned)
 
     def test_unaligned_writes_to_user_out_arg_land_on_original(self) -> None:
@@ -1314,7 +1314,7 @@ class TestLauncher(TestCase):
         # Prime with aligned slices, then call with only ``out``
         # unaligned so the test isolates the write-to-unaligned case.
         add_write_out(x_aligned, y_aligned, base_out[:n])
-        torch.cuda.synchronize()
+        torch.accelerator.synchronize()
 
         out_unaligned = base_out[1 : n + 1]
         self.assertEqual(x_aligned.data_ptr() % 16, 0)
@@ -1322,7 +1322,7 @@ class TestLauncher(TestCase):
         self.assertNotEqual(out_unaligned.data_ptr() % 16, 0)
         out_unaligned.fill_(0.0)
         add_write_out(x_aligned, y_aligned, out_unaligned)
-        torch.cuda.synchronize()
+        torch.accelerator.synchronize()
         torch.testing.assert_close(out_unaligned, x_aligned + y_aligned)
 
     @skipIfRefEager(
@@ -1346,7 +1346,7 @@ class TestLauncher(TestCase):
 
         x = torch.randn(1024, device=DEVICE, dtype=torch.float32)
         add(x, x)
-        torch.cuda.synchronize()
+        torch.accelerator.synchronize()
 
         from triton.runtime.jit import JITFunction
 
@@ -1364,7 +1364,7 @@ class TestLauncher(TestCase):
         try:
             with self.assertRaises(RuntimeError):
                 add(x, x)
-                torch.cuda.synchronize()
+                torch.accelerator.synchronize()
         finally:
             gdict[name] = original
 

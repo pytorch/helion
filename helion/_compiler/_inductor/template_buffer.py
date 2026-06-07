@@ -18,6 +18,7 @@ from torch._inductor.ir import FinalizeCodegenResult
 from torch._inductor.ir import IRNode
 from torch._inductor.ir import Layout
 from torch._inductor.ir import MultiOutputLayout
+from torch._inductor.ir import MutationOutput
 from torch._inductor.ir import ReinterpretView
 from torch._inductor.ir import TemplateBuffer
 from torch._inductor.ir import TensorBox
@@ -54,6 +55,7 @@ if TYPE_CHECKING:
     from typing import Iterable
 
     from torch._inductor.ir import MultiOutput
+    from torch._inductor.scheduler import SchedulerNode
 
     from ..inductor_lowering import CodegenState
     from helion.runtime.kernel import BoundKernel
@@ -183,6 +185,33 @@ class HelionTemplateBuffer(TemplateBuffer):
             named_inputs=named_inputs,  # pyrefly: ignore[unexpected-keyword]
         )
 
+    @staticmethod
+    def _refresh_range_tree_node_symbols(kernel: Any) -> None:  # noqa: ANN401
+        """Keep Inductor range-tree lookups in sync after symbol renames."""
+
+        def refresh(nodes: dict[sympy.Symbol, Any]) -> None:
+            for old_symbol, entry in list(nodes.items()):
+                new_symbol = entry.symbol()
+                if old_symbol != new_symbol and old_symbol in entry.parent.var_list:
+                    entry.parent.var_list[entry.parent.var_list.index(old_symbol)] = (
+                        new_symbol
+                    )
+                if old_symbol in entry.parent.var_ranges:
+                    entry.parent.var_ranges.setdefault(
+                        new_symbol, entry.parent.var_ranges[old_symbol]
+                    )
+                for symbol in (
+                    new_symbol,
+                    sympy.Symbol(str(new_symbol), integer=True),
+                    sympy.Symbol(str(new_symbol)),
+                ):
+                    nodes[symbol] = entry
+
+        refresh(kernel.range_tree_nodes)
+        for subgraph in kernel.subgraph_bodies.values():
+            if subgraph.range_tree_nodes is not None:
+                refresh(subgraph.range_tree_nodes)
+
     def _render_with_hooks(self, kernel: Any) -> PartialRender:  # noqa: ANN401
         """Set up fusion hooks, read metadata, return a placeholder PartialRender.
 
@@ -194,6 +223,7 @@ class HelionTemplateBuffer(TemplateBuffer):
         """
         # 1. Set up fusion hooks (requires V.kernel context).
         kernel._setup_fusion_hooks()
+        self._refresh_range_tree_node_symbols(kernel)
 
         # 2. Read pre-computed fusion metadata from kernel into a single object.
         prologue_fused_params = set(kernel._prologue_vars.keys())
@@ -373,6 +403,46 @@ class HelionTemplateBuffer(TemplateBuffer):
     def set_current_node(self, node: object) -> AbstractContextManager[None]:
         return nullcontext()
 
+    def has_aliasing_or_mutation_for_prologue_fusion(
+        self,
+        scheduler_node: SchedulerNode,
+    ) -> bool:
+        """Return the Inductor fusion-blocking alias/mutation state.
+
+        Inductor's prologue-fusion gate asks templates this as a whole-template
+        question before checking ``allowed_prologue_inps``.  Helion mutating
+        templates can still safely fuse producers for independent inputs, so
+        ignore only safe synthetic MutationOutput buffers here.  The
+        MutationOutputs remain in the scheduler graph for dependencies and
+        memory planning.
+        """
+        mutation_names: set[str] = set()
+        for output in scheduler_node.get_outputs():
+            if output.get_aliases():
+                return True
+
+            mutations = output.get_mutations()
+            if not mutations:
+                continue
+            if not isinstance(output.node, MutationOutput):
+                return True
+            mutation_names.update(mutations)
+
+        if not mutation_names:
+            return False
+
+        allowed_prologue_inps = self.get_allowed_prologue_inps()
+        if any(name in allowed_prologue_inps for name in mutation_names):
+            return True
+
+        for inp in cast("Sequence[IRNode]", self.inputs):
+            if (
+                inp.get_name() in allowed_prologue_inps
+                and not mutation_names.isdisjoint(inp.get_read_names())
+            ):
+                return True
+        return False
+
     def _build_call_args(
         self,
         call_order: list[str],
@@ -456,6 +526,11 @@ class HelionTemplateBuffer(TemplateBuffer):
             for param_name, inp in realized_inputs.items()
             if "." in param_name
         }
+        mutation_dependent_inp_names = {
+            inp.get_name()  # type: ignore[union-attr]
+            for inp in inputs  # type: ignore[union-attr]
+            if inp.get_read_names() & mutated_inp_names
+        }
         buf = cls(
             layout=MultiOutputLayout(device=dev),  # pyrefly: ignore[bad-argument-type]
             inputs=inputs,
@@ -465,6 +540,7 @@ class HelionTemplateBuffer(TemplateBuffer):
                 for inp in inputs  # type: ignore[union-attr]
                 if inp.get_name() not in mutated_inp_names
                 and inp.get_name() not in container_inp_names
+                and inp.get_name() not in mutation_dependent_inp_names
             ),
             named_inputs=realized_inputs,
             **buffer_kwargs,
@@ -730,6 +806,7 @@ class HelionTemplateBuffer(TemplateBuffer):
         subscript: list[object],
         extra_mask: ast.expr | None,
         eviction_policy: ast.AST | None,
+        cache_modifier: ast.AST | None,
         codegen_load: Callable[..., ast.expr],
         *,
         prologue_first_indexing: dict[str, str],
@@ -748,7 +825,12 @@ class HelionTemplateBuffer(TemplateBuffer):
         param_name = state.device_function.tensor_arg(tensor).name
         if param_name not in self._fusion_metadata.prologue_fused_params:
             return codegen_load(
-                state, tensor, [*subscript], extra_mask, eviction_policy
+                state,
+                tensor,
+                [*subscript],
+                extra_mask,
+                eviction_policy,
+                cache_modifier,
             )
 
         # Read prologue variable names from kernel (set by _setup_prologue_hook).

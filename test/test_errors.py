@@ -12,7 +12,6 @@ from helion._testing import RefEagerTestDisabled
 from helion._testing import TestCase
 from helion._testing import code_and_output
 from helion._testing import onlyBackends
-from helion._testing import skipIfCute
 from helion.autotuner.base_search import PopulationBasedSearch
 from helion.autotuner.base_search import PopulationMember
 from helion.autotuner.differential_evolution import DifferentialEvolutionSearch
@@ -105,12 +104,14 @@ class TestErrors(RefEagerTestDisabled, TestCase):
         ):
             search.autotune()
 
-    @skipIfCute("CuTe lowers the full-row reduction as a row-wise scalar")
     def test_shape_mismatch_missing_keepdims(self):
         """Binary op should detect broadcast shape mismatch from reduction without keep_dims.
 
         This mirrors the softmax pattern where a row-wise reduction loses the
-        dimension and then is subtracted from a 2D tensor without keep_dims.
+        dimension and is then subtracted from a 2D tile without keep_dims, so the
+        reduction's M axis is silently aligned onto the N axis. Helion rejects
+        this with ``ShapeMismatch`` on every backend at graph-build time -- the
+        correct kernel uses ``keepdim=True`` (see examples/softmax.py).
         """
 
         # Mirror scratch.py behavior exactly
@@ -124,8 +125,9 @@ class TestErrors(RefEagerTestDisabled, TestCase):
                 out[tile_m, :] = out_rows
             return out
 
+        x = torch.randn(32, 64, device=DEVICE)
         with self.assertRaises(helion.exc.ShapeMismatch):
-            fn(torch.randn(32, 64, device=DEVICE))
+            fn(x)
 
     def test_tile_unpacking(self):
         @helion.kernel()

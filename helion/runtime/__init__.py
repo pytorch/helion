@@ -4,6 +4,7 @@ import base64
 from contextlib import suppress
 import contextvars
 from dataclasses import dataclass
+import enum
 import hashlib
 import importlib
 import inspect
@@ -739,6 +740,45 @@ def _make_helion_static_jax_callable_class() -> type:
     return _HelionStaticJaxCallable
 
 
+def _pallas_output_only_descriptors(
+    _output_indices: list[int],
+    arg_to_tensor_pos: dict[int, int],
+) -> tuple[tuple[int, int], ...]:
+    """Return ``((out_idx, orig_pos), ...)`` for write-only outputs.
+
+    These positions appear in ``_output_indices`` but not in
+    ``arg_to_tensor_pos`` — i.e. the kernel produces them as fresh
+    buffers rather than aliasing back into an input tensor.  Both the
+    torch fast-path (``_LauncherFastPath``) and the JAX-export
+    launcher iterate this tuple to pick output-only results out of
+    the full ``pallas_call`` result list.
+    """
+    return tuple(
+        (out_idx, orig_pos)
+        for out_idx, orig_pos in enumerate(_output_indices)
+        if orig_pos not in arg_to_tensor_pos
+    )
+
+
+def _pallas_padded_output_dims_by_arg(
+    _ds_pad_dims: list[tuple[int, int, int, int]],
+    output_arg_set: frozenset[int] | set[int],
+) -> dict[int, list[int]]:
+    """Group ``_ds_pad_dims`` entries (arg_idx → padded dims) for output args.
+
+    ``_ds_pad_dims`` carries ``(arg_idx, dim, block_size, extra_pad)``
+    tuples for every padded position; this filter keeps only the ones
+    whose ``arg_idx`` is in ``output_arg_set`` so callers can slice
+    those outputs back to their original shapes.  Both the torch path
+    (via ``_LauncherFastPath``) and the JAX-export launcher use this.
+    """
+    padded_dims_by_arg: dict[int, list[int]] = {}
+    for arg_idx, dim, _bs, _extra in _ds_pad_dims:
+        if arg_idx in output_arg_set:
+            padded_dims_by_arg.setdefault(arg_idx, []).append(dim)
+    return padded_dims_by_arg
+
+
 class _LauncherFastPath:
     """Precomputed per-call state stored on the cached launcher entry."""
 
@@ -762,31 +802,25 @@ class _LauncherFastPath:
         # Tuple iteration is faster than list in the hot-path comprehension.
         self.tensor_arg_indices_tuple: tuple[int, ...] = tuple(tensor_arg_indices)
 
-        descriptors: list[tuple[int, int]] = [
-            (out_idx, orig_pos)
-            for out_idx, orig_pos in enumerate(_output_indices)
-            if orig_pos not in arg_to_tensor_pos
-        ]
-        self.output_only_descriptors: tuple[tuple[int, int], ...] = tuple(descriptors)
-        self.output_only_count: int = len(descriptors)
+        self.output_only_descriptors: tuple[tuple[int, int], ...] = (
+            _pallas_output_only_descriptors(_output_indices, arg_to_tensor_pos)
+        )
+        self.output_only_count: int = len(self.output_only_descriptors)
 
         # ``None`` sentinel: filled in on the first call once we know if any pad is non-zero.
         self.ds_pad_required: bool | None = None
 
         if _ds_pad_dims:
-            output_arg_set = set(_output_indices)
-            padded_dims_by_arg: dict[int, list[int]] = {}
-            padded_output_arg_indices: set[int] = set()
-            for arg_idx, dim, _bs, _extra in _ds_pad_dims:
-                if arg_idx in output_arg_set:
-                    padded_dims_by_arg.setdefault(arg_idx, []).append(dim)
-                    padded_output_arg_indices.add(arg_idx)
-            self.padded_output_dims_by_arg: dict[int, list[int]] = padded_dims_by_arg
+            self.padded_output_dims_by_arg: dict[int, list[int]] = (
+                _pallas_padded_output_dims_by_arg(_ds_pad_dims, set(_output_indices))
+            )
             self.padded_output_arg_indices: frozenset[int] = frozenset(
-                padded_output_arg_indices
+                self.padded_output_dims_by_arg.keys()
             )
             self.ds_pad_orig_output_arg_indices: frozenset[int] = frozenset(
-                idx for idx in padded_output_arg_indices if idx in arg_to_tensor_pos
+                idx
+                for idx in self.padded_output_arg_indices
+                if idx in arg_to_tensor_pos
             )
         else:
             self.padded_output_dims_by_arg = {}
@@ -1318,6 +1352,412 @@ def _build_matmul_dot_general_jit_fn(
     return cast("Callable[..., object]", jax.jit(matmul_fn))
 
 
+class _PallasLoopKind(enum.Enum):
+    """Which ``pallas_loop_type`` flavour a launcher is compiling for.
+
+    Drives the spec-build / scratch / kernel-wrap branches inside
+    :func:`_pallas_compile_jit_fn`; the values match the
+    ``pallas_loop_type`` strings codegen emits so the JAX-export path
+    can resolve them straight from the bound kernel's config.
+    """
+
+    UNROLL = "unroll"
+    EMIT_PIPELINE = "emit_pipeline"
+    FORI_LOOP = "fori_loop"
+
+
+def _pallas_build_scratch_shapes(
+    pltpu: object,
+    jnp: object,
+    scratch_entries: list[object],
+) -> list[object]:
+    """Translate codegen scratch-shape descriptors into ``pltpu`` objects.
+
+    Each entry is either ``(shape, dtype_str, scratch_type)`` or the
+    legacy 2-tuple ``(shape, dtype_str)`` form (``scratch_type``
+    defaults to ``"vmem"``).  Supported scratch types: ``"vmem"`` and
+    ``"dma_semaphore"``.
+    """
+    _jnp_dtype_map = _pallas_jnp_dtype_map()
+    scratch_shapes: list[object] = []
+    for entry in scratch_entries:
+        if len(entry) == 3:  # type: ignore[arg-type]
+            shape, dtype_str, scratch_type = entry  # type: ignore[misc]
+        else:
+            shape, dtype_str = entry  # type: ignore[misc]
+            scratch_type = "vmem"
+        if scratch_type == "dma_semaphore":
+            scratch_shapes.append(pltpu.SemaphoreType.DMA(()))  # type: ignore[union-attr]
+        else:
+            assert dtype_str is not None
+            jnp_dtype = _jnp_dtype_map.get(dtype_str, jnp.float32)  # type: ignore[union-attr]
+            scratch_shapes.append(
+                pltpu.VMEM(shape, jnp_dtype)  # type: ignore[union-attr]  # pyrefly: ignore[bad-argument-type]
+            )
+    return scratch_shapes
+
+
+def _pallas_check_vmem_or_raise(
+    pl: object,
+    pltpu: object,
+    in_specs: list[object] | None,
+    out_specs: list[object] | object | None,
+    scratch_shapes: list[object] | None,
+    args: tuple[object, ...],
+    tensor_arg_indices: list[int],
+    output_indices: list[int],
+    pallas_aliases: dict[int, int] | None,
+) -> None:
+    """Estimate the kernel's VMEM footprint and raise if it exceeds the limit."""
+    estimated_vmem = _estimate_pallas_vmem_bytes(
+        pl,
+        pltpu,
+        in_specs,
+        out_specs,
+        scratch_shapes,
+        args,
+        tensor_arg_indices,
+        output_indices,
+        pallas_aliases,
+    )
+    vmem_limit_bytes = _get_vmem_limit_bytes(pltpu)
+    if estimated_vmem > vmem_limit_bytes:
+        raise RuntimeError(
+            f"XLA:TPU compile permanent error. Ran out of memory in memory space vmem. "
+            f"Estimated {estimated_vmem / 1e6:.2f}MB exceeds {vmem_limit_bytes / 1e6:.2f}MB vmem capacity."
+        )
+
+
+@dataclass(slots=True)
+class _PallasCompileResult:
+    """Bundle returned by :func:`_pallas_compile_jit_fn`.
+
+    Carries the compiled ``pl.pallas_call`` plus all per-arg metadata
+    that downstream consumers (``_pallas_build_callable``,
+    ``_LauncherFastPath`` setup, the JAX-export launcher) need to wire
+    inputs and outputs.  The fields mirror the named portion of the
+    ``_pallas_prepare_args`` return tuple so consumers can use them
+    directly without re-running argument prep.
+    """
+
+    jit_fn: object
+    tensor_arg_indices: list[int]
+    output_only_indices: list[int]
+    arg_to_tensor_pos: dict[int, int]
+    inplace_positions: set[int]
+    pallas_aliases: dict[int, int]
+
+
+def _pallas_compile_jit_fn(
+    pallas_kernel: object,
+    grid: tuple[int, ...],
+    args: tuple[object, ...],
+    *,
+    kind: _PallasLoopKind,
+    _output_indices: list[int],
+    _inplace_indices: list[int] | None,
+    _block_spec_info: _BlockSpecInfo | None,
+    _smem_arg_indices: list[int] | None,
+    _scratch_shapes: list[object] | None,
+    _pipeline_arg_indices: list[int] | None,
+    _matmul_dot_general: dict[str, object] | None,
+    interpret: bool,
+) -> _PallasCompileResult:
+    """Build the ``pl.pallas_call`` jit_fn shared by all Pallas launchers.
+
+    ``kind`` selects the loop-spec flavour:
+
+    - :attr:`_PallasLoopKind.UNROLL`: simple grid + ``BlockSpec`` per arg
+      (no scratch)
+    - :attr:`_PallasLoopKind.EMIT_PIPELINE`: ``PrefetchScalarGridSpec``
+      with HBM refs for pipeline-body tensors and VMEM scratch
+    - :attr:`_PallasLoopKind.FORI_LOOP`: same gridspec/scratch shape as
+      ``EMIT_PIPELINE``; the kernel body uses ``jax.lax.fori_loop`` with
+      manual DMA
+
+    When ``_matmul_dot_general`` is provided (only on ``UNROLL`` and
+    ``EMIT_PIPELINE`` no-tiling matmul configs), substitutes
+    ``jax.jit(lax.dot_general)`` for ``pl.pallas_call`` and skips the
+    VMEM check; XLA's planner streams the contraction so the
+    pallas_call lowering's VMEM estimate doesn't apply.
+
+    ``args`` must already have any ds-padding applied — this helper
+    builds specs from the post-pad shapes.  Returns a
+    :class:`_PallasCompileResult` so launchers can wrap the jit_fn in a
+    JaxCallable while the JAX-export path can call it directly.
+    """
+    from jax.experimental import pallas as pl
+    from jax.experimental.pallas import tpu as pltpu
+    import jax.numpy as jnp
+
+    (
+        tensor_arg_indices,
+        output_only_indices,
+        non_tensor_args,
+        n_tensor_inputs,
+        arg_to_tensor_pos,
+        inplace_positions,
+        out_shapes,
+        pallas_aliases,
+    ) = _pallas_prepare_args(
+        args, _output_indices, _inplace_indices, interpret=interpret
+    )
+
+    copy_guards, dimension_semantics = _pallas_shared_output_plan(
+        grid,
+        tensor_arg_indices,
+        output_only_indices,
+        _output_indices,
+        inplace_positions,
+        _block_spec_info,
+    )
+
+    if kind is _PallasLoopKind.UNROLL:
+        in_specs, out_specs = _pallas_build_block_specs(
+            pl,
+            jnp,
+            pltpu,
+            grid,
+            args,
+            tensor_arg_indices,
+            _output_indices,
+            _block_spec_info,
+            _smem_arg_indices,
+            output_only_indices,
+        )
+        scratch_shapes: list[object] = []
+        skip_inplace_copy: set[int] = set()
+    else:
+        assert _block_spec_info is not None, (
+            f"{kind.value!r} launcher requires _block_spec_info from codegen"
+        )
+        scratch_shapes = _pallas_build_scratch_shapes(pltpu, jnp, _scratch_shapes or [])
+        in_specs, out_specs = _pallas_build_pipeline_specs(
+            pl,
+            jnp,
+            pltpu,
+            grid,
+            args,
+            tensor_arg_indices,
+            _output_indices,
+            _block_spec_info,
+            _pipeline_arg_indices,
+            output_only_indices,
+            smem_arg_indices=_smem_arg_indices,
+        )
+        skip_inplace_copy = set(_pipeline_arg_indices or [])
+
+    reordered_kernel = _pallas_make_reordered_kernel(
+        pallas_kernel,
+        args,
+        tensor_arg_indices,
+        non_tensor_args,
+        n_tensor_inputs,
+        _output_indices,
+        inplace_positions,
+        arg_to_tensor_pos,
+        n_extra_refs=len(scratch_shapes),
+        skip_inplace_copy=skip_inplace_copy,
+        _smem_arg_indices=_smem_arg_indices,
+        _copy_guards=copy_guards,
+    )
+
+    out_shape_arg = out_shapes if len(out_shapes) > 1 else out_shapes[0]
+
+    # The VMEM estimate only applies to the ``pl.pallas_call`` lowering.
+    # The ``jax.jit(lax.dot_general)`` substitution streams the
+    # contraction through XLA's planner, so the pallas_call estimate
+    # doesn't apply — skip the check there.
+    if _matmul_dot_general is None:
+        _pallas_check_vmem_or_raise(
+            pl,
+            pltpu,
+            in_specs,
+            out_specs,
+            scratch_shapes if kind is not _PallasLoopKind.UNROLL else None,
+            args,
+            tensor_arg_indices,
+            _output_indices,
+            pallas_aliases,
+        )
+
+    if _matmul_dot_general is not None:
+        # Substitute ``lax.dot_general`` for ``pl.pallas_call`` on
+        # no-tiling matmul configs so XLA sees a regular ``dot`` and
+        # can attach ``cross_program_prefetch_index``.
+        jit_fn = _build_matmul_dot_general_jit_fn(_matmul_dot_general)
+    else:
+        pallas_call_kwargs: dict[str, object] = {"out_shape": out_shape_arg}
+        if kind is _PallasLoopKind.UNROLL:
+            pallas_call_kwargs["grid"] = grid
+            if in_specs is not None:
+                pallas_call_kwargs["in_specs"] = in_specs
+                pallas_call_kwargs["out_specs"] = out_specs
+            if any(sem != "parallel" for sem in dimension_semantics):
+                pallas_call_kwargs["compiler_params"] = pltpu.CompilerParams(  # pyrefly: ignore[bad-instantiation]
+                    dimension_semantics=dimension_semantics,
+                )
+        else:
+            pallas_call_kwargs["grid_spec"] = pltpu.PrefetchScalarGridSpec(  # pyrefly: ignore[missing-attribute]
+                num_scalar_prefetch=0,
+                in_specs=in_specs,
+                out_specs=out_specs,
+                scratch_shapes=scratch_shapes,  # pyrefly: ignore[bad-argument-type]
+                grid=grid,
+            )
+            pallas_call_kwargs["compiler_params"] = pltpu.CompilerParams(  # pyrefly: ignore[bad-instantiation]
+                dimension_semantics=dimension_semantics,
+            )
+        if interpret:
+            pallas_call_kwargs["interpret"] = True
+
+        jit_fn = pl.pallas_call(  # type: ignore[union-attr]
+            reordered_kernel,  # pyrefly: ignore[bad-argument-type]
+            **pallas_call_kwargs,  # type: ignore[arg-type]
+        )
+
+    return _PallasCompileResult(
+        jit_fn=jit_fn,
+        tensor_arg_indices=tensor_arg_indices,
+        output_only_indices=output_only_indices,
+        arg_to_tensor_pos=arg_to_tensor_pos,
+        inplace_positions=inplace_positions,
+        pallas_aliases=pallas_aliases,
+    )
+
+
+def _pallas_install_launcher_cache(
+    pallas_kernel: object,
+    grid: tuple[int, ...],
+    args: tuple[object, ...],
+    *,
+    kind: _PallasLoopKind,
+    cache_attr: str,
+    trace_key_suffix: str,
+    _output_indices: list[int] | None,
+    _inplace_indices: list[int] | None,
+    _block_spec_info: _BlockSpecInfo | None,
+    _smem_arg_indices: list[int] | None,
+    _scratch_shapes: list[object] | None,
+    _pipeline_arg_indices: list[int] | None,
+    _ds_pad_dims: list[tuple[int, int, int, int]] | None,
+    _pallas_interpret: bool | None,
+    _matmul_dot_general: dict[str, object] | None = None,
+) -> tuple[object, ...]:
+    """Cache-miss path shared by all three torch-tensor Pallas launchers.
+
+    Builds the ``pl.pallas_call`` jit_fn via :func:`_pallas_compile_jit_fn`,
+    wraps it in a ``JaxCallable`` (or interpret-mode shim), seeds the
+    ``_LauncherFastPath`` slot, stores the result on
+    ``pallas_kernel.<cache_attr>``, and returns the freshly-installed cache
+    tuple so the caller can fall straight through to the shared invoke.
+    """
+    interpret = (
+        _pallas_interpret
+        if _pallas_interpret is not None
+        else _module_is_pallas_interpret()
+    )
+    if interpret:
+        _ensure_cpu_tpu_info()
+
+    output_indices = _output_indices if _output_indices is not None else []
+
+    # Build the pallas specs from ds-padded shapes on a throwaway copy so
+    # ``args`` stays unpadded for the shared invoke below to pad fresh.
+    spec_args = args
+    if _ds_pad_dims:
+        spec_args, _ = _pallas_apply_ds_padding(args, output_indices, _ds_pad_dims)
+
+    _pallas_check_dtypes(spec_args)
+
+    result = _pallas_compile_jit_fn(
+        pallas_kernel,
+        grid,
+        spec_args,
+        kind=kind,
+        _output_indices=output_indices,
+        _inplace_indices=_inplace_indices,
+        _block_spec_info=_block_spec_info,
+        _smem_arg_indices=_smem_arg_indices,
+        _scratch_shapes=_scratch_shapes,
+        _pipeline_arg_indices=_pipeline_arg_indices,
+        _matmul_dot_general=_matmul_dot_general,
+        interpret=interpret,
+    )
+
+    jax_callable = _pallas_build_callable(
+        pallas_kernel,
+        grid,
+        cast("Callable[..., object]", result.jit_fn),
+        output_indices,
+        result.arg_to_tensor_pos,
+        result.tensor_arg_indices,
+        cache_attr=cache_attr,
+        call_aliases=result.pallas_aliases,
+        trace_key_suffix=trace_key_suffix,
+        interpret=interpret,
+    )
+
+    fast_path = _LauncherFastPath(
+        result.tensor_arg_indices,
+        result.arg_to_tensor_pos,
+        output_indices,
+        _ds_pad_dims,
+    )
+    cache = (
+        grid,
+        jax_callable,
+        result.tensor_arg_indices,
+        result.arg_to_tensor_pos,
+        fast_path,
+        None,
+    )
+    setattr(pallas_kernel, cache_attr, cache)
+    return cache
+
+
+def _pallas_invoke_cached_launcher(
+    pallas_kernel: object,
+    cache: tuple[object, ...],
+    args: tuple[object, ...],
+    *,
+    cache_attr: str,
+    _ds_pad_dims: list[tuple[int, int, int, int]] | None,
+) -> object:
+    """Shared fast-invoke tail: lift direct-call snapshot, ds-pad, dispatch."""
+    _grid = cache[0]
+    jax_callable = cache[1]
+    tensor_arg_indices = cast("list[int]", cache[2])
+    arg_to_tensor_pos = cast("dict[int, int]", cache[3])
+    fast_path = cast("_LauncherFastPath", cache[4])
+    direct_call = cast("_DirectCallKernel | None", cache[5])
+    if direct_call is None:
+        # Lazily lift the direct-call kernel off the JaxCallable subclass.
+        direct_call = getattr(jax_callable, "_helion_direct_call", None)
+        if direct_call is not None:
+            cache = (
+                _grid,
+                jax_callable,
+                tensor_arg_indices,
+                arg_to_tensor_pos,
+                fast_path,
+                direct_call,
+            )
+            setattr(pallas_kernel, cache_attr, cache)
+
+    _orig_output_tensors: dict[int, torch.Tensor] | None = None
+    if _ds_pad_dims and fast_path.ds_pad_required is not False:
+        args, _orig_output_tensors, _ = _pallas_apply_ds_padding_fast(
+            args,
+            _ds_pad_dims,
+            fast_path,
+            fast_path.padded_output_arg_indices,
+        )
+    return _pallas_invoke_and_return_fast(
+        jax_callable, args, fast_path, _orig_output_tensors, direct_call
+    )
+
+
 def default_pallas_launcher(
     pallas_kernel: object,
     grid: tuple[int, ...],
@@ -1345,190 +1785,30 @@ def default_pallas_launcher(
     """
     cache = getattr(pallas_kernel, "_pallas_cache", None)
     if cache is None or cache[0] != grid:
-        # Cold path: build the JaxCallable + ``_LauncherFastPath``, cache them,
-        # and fall through to the shared fast invoke below (so the first call
-        # exercises it too).  ``interpret`` is only needed here.
-        interpret = (
-            _pallas_interpret
-            if _pallas_interpret is not None
-            else _module_is_pallas_interpret()
-        )
-        if interpret:
-            _ensure_cpu_tpu_info()
-
-        if _output_indices is None:
-            _output_indices = []
-
-        # Build the pallas specs from ds-padded shapes on a throwaway copy so
-        # ``args`` stays unpadded for the shared invoke below to pad fresh.
-        spec_args = args
-        if _ds_pad_dims:
-            spec_args, _ = _pallas_apply_ds_padding(args, _output_indices, _ds_pad_dims)
-
-        _pallas_check_dtypes(spec_args)
-
-        from jax.experimental import pallas as pl
-        from jax.experimental.pallas import tpu as pltpu
-        import jax.numpy as jnp
-
-        (
-            tensor_arg_indices,
-            output_only_indices,
-            non_tensor_args,
-            n_tensor_inputs,
-            arg_to_tensor_pos,
-            inplace_positions,
-            out_shapes,
-            pallas_aliases,
-        ) = _pallas_prepare_args(
-            spec_args, _output_indices, _inplace_indices, interpret=interpret
-        )
-
-        copy_guards, dimension_semantics = _pallas_shared_output_plan(
-            grid,
-            tensor_arg_indices,
-            output_only_indices,
-            _output_indices,
-            inplace_positions,
-            _block_spec_info,
-        )
-        in_specs, out_specs = _pallas_build_block_specs(
-            pl,
-            jnp,
-            pltpu,
-            grid,
-            spec_args,
-            tensor_arg_indices,
-            _output_indices,
-            _block_spec_info,
-            _smem_arg_indices,
-            output_only_indices,
-        )
-
-        reordered_kernel = _pallas_make_reordered_kernel(
-            pallas_kernel,
-            spec_args,
-            tensor_arg_indices,
-            non_tensor_args,
-            n_tensor_inputs,
-            _output_indices,
-            inplace_positions,
-            arg_to_tensor_pos,
-            _smem_arg_indices=_smem_arg_indices,
-            _copy_guards=copy_guards,
-        )
-
-        out_shape_arg = out_shapes if len(out_shapes) > 1 else out_shapes[0]
-
-        # The VMEM estimate only applies to the ``pl.pallas_call`` lowering.
-        # The ``jax.jit(lax.dot_general)`` path doesn't allocate VMEM the
-        # same way (XLA's planner streams the contraction).  Skipping the
-        # check for that path lets large no-tiling configs reach the
-        # dot_general substitution below.
-        if _matmul_dot_general is None:
-            estimated_vmem = _estimate_pallas_vmem_bytes(
-                pl,
-                pltpu,
-                in_specs,
-                out_specs,
-                None,
-                spec_args,
-                tensor_arg_indices,
-                _output_indices,
-                pallas_aliases,
-            )
-            vmem_limit_bytes = _get_vmem_limit_bytes(pltpu)
-            if estimated_vmem > vmem_limit_bytes:
-                raise RuntimeError(
-                    f"XLA:TPU compile permanent error. Ran out of memory in memory space vmem. "
-                    f"Estimated {estimated_vmem / 1e6:.2f}MB exceeds {vmem_limit_bytes / 1e6:.2f}MB vmem capacity."
-                )
-
-        pallas_call_kwargs: dict[str, object] = {
-            "out_shape": out_shape_arg,
-            "grid": grid,
-        }
-        if interpret:
-            pallas_call_kwargs["interpret"] = True
-        if in_specs is not None:
-            pallas_call_kwargs["in_specs"] = in_specs
-            pallas_call_kwargs["out_specs"] = out_specs
-        if any(sem != "parallel" for sem in dimension_semantics):
-            pallas_call_kwargs["compiler_params"] = pltpu.CompilerParams(  # pyrefly: ignore[bad-instantiation]
-                dimension_semantics=dimension_semantics,
-            )
-
-        if _matmul_dot_general is not None:
-            # Substitute ``lax.dot_general`` for ``pl.pallas_call`` on
-            # no-tiling matmul configs so XLA sees a regular ``dot`` and
-            # can attach ``cross_program_prefetch_index``.
-            jit_fn = _build_matmul_dot_general_jit_fn(_matmul_dot_general)
-        else:
-            jit_fn = pl.pallas_call(
-                reordered_kernel,  # pyrefly: ignore[bad-argument-type]
-                **pallas_call_kwargs,  # type: ignore[arg-type]
-            )
-
-        jax_callable = _pallas_build_callable(
+        cache = _pallas_install_launcher_cache(
             pallas_kernel,
             grid,
-            jit_fn,
-            _output_indices,
-            arg_to_tensor_pos,
-            tensor_arg_indices,
-            cache_attr="_pallas_cache",
-            call_aliases=pallas_aliases,
-            interpret=interpret,
-        )
-
-        fast_path = _LauncherFastPath(
-            tensor_arg_indices,
-            arg_to_tensor_pos,
-            _output_indices,
-            _ds_pad_dims,
-        )
-        pallas_kernel._pallas_cache = (  # pyrefly: ignore[missing-attribute]
-            grid,
-            jax_callable,
-            tensor_arg_indices,
-            arg_to_tensor_pos,
-            fast_path,
-            None,
-        )
-        cache = pallas_kernel._pallas_cache  # pyrefly: ignore[missing-attribute]
-
-    # Shared fast invoke: first call (just-built cache) and every warm call.
-    (
-        _,
-        jax_callable,
-        tensor_arg_indices,
-        arg_to_tensor_pos,
-        fast_path,
-        direct_call,
-    ) = cache
-    if direct_call is None:
-        # Lazily lift the direct-call kernel off the JaxCallable subclass.
-        direct_call = getattr(jax_callable, "_helion_direct_call", None)
-        if direct_call is not None:
-            pallas_kernel._pallas_cache = (  # pyrefly: ignore[missing-attribute]
-                cache[0],
-                jax_callable,
-                tensor_arg_indices,
-                arg_to_tensor_pos,
-                fast_path,
-                direct_call,
-            )
-
-    _orig_output_tensors: dict[int, torch.Tensor] | None = None
-    if _ds_pad_dims and fast_path.ds_pad_required is not False:
-        args, _orig_output_tensors, _ = _pallas_apply_ds_padding_fast(
             args,
-            _ds_pad_dims,
-            fast_path,
-            fast_path.padded_output_arg_indices,
+            kind=_PallasLoopKind.UNROLL,
+            cache_attr="_pallas_cache",
+            trace_key_suffix="",
+            _output_indices=_output_indices,
+            _inplace_indices=_inplace_indices,
+            _block_spec_info=_block_spec_info,
+            _smem_arg_indices=_smem_arg_indices,
+            _scratch_shapes=None,
+            _pipeline_arg_indices=None,
+            _ds_pad_dims=_ds_pad_dims,
+            _pallas_interpret=_pallas_interpret,
+            _matmul_dot_general=_matmul_dot_general,
         )
-    return _pallas_invoke_and_return_fast(
-        jax_callable, args, fast_path, _orig_output_tensors, direct_call
+
+    return _pallas_invoke_cached_launcher(
+        pallas_kernel,
+        cache,
+        args,
+        cache_attr="_pallas_cache",
+        _ds_pad_dims=_ds_pad_dims,
     )
 
 
@@ -1555,214 +1835,30 @@ def default_pallas_pipeline_launcher(
     """
     cache = getattr(pallas_kernel, "_pallas_pipeline_cache", None)
     if cache is None or cache[0] != grid:
-        interpret = (
-            _pallas_interpret
-            if _pallas_interpret is not None
-            else _module_is_pallas_interpret()
-        )
-        if interpret:
-            _ensure_cpu_tpu_info()
-
-        if _output_indices is None:
-            _output_indices = []
-        if _scratch_shapes is None:
-            _scratch_shapes = []
-
-        # Build the pallas specs from ds-padded shapes on a throwaway copy so
-        # ``args`` stays unpadded for the shared invoke below to pad fresh.
-        spec_args = args
-        if _ds_pad_dims:
-            spec_args, _ = _pallas_apply_ds_padding(args, _output_indices, _ds_pad_dims)
-
-        _pallas_check_dtypes(spec_args)
-
-        from jax.experimental import pallas as pl
-        from jax.experimental.pallas import tpu as pltpu
-        import jax.numpy as jnp
-
-        (
-            tensor_arg_indices,
-            output_only_indices,
-            non_tensor_args,
-            n_tensor_inputs,
-            arg_to_tensor_pos,
-            inplace_positions,
-            out_shapes,
-            pallas_aliases,
-        ) = _pallas_prepare_args(
-            spec_args, _output_indices, _inplace_indices, interpret=interpret
-        )
-
-        # Build scratch shapes for VMEM
-        _jnp_dtype_map = _pallas_jnp_dtype_map()
-        scratch_shapes = []
-        for scratch_entry in _scratch_shapes:
-            if len(scratch_entry) == 3:
-                shape, dtype_str, scratch_type = scratch_entry
-            else:
-                shape, dtype_str = scratch_entry  # type: ignore[misc]
-                scratch_type = "vmem"
-            if scratch_type == "dma_semaphore":
-                scratch_shapes.append(pltpu.SemaphoreType.DMA(()))
-            else:
-                jnp_dtype = _jnp_dtype_map.get(dtype_str, jnp.float32)
-                scratch_shapes.append(
-                    pltpu.VMEM(shape, jnp_dtype)  # pyrefly: ignore[bad-argument-type]
-                )
-
-        assert _block_spec_info is not None, (
-            "emit_pipeline launcher requires _block_spec_info from codegen"
-        )
-        copy_guards, dimension_semantics = _pallas_shared_output_plan(
-            grid,
-            tensor_arg_indices,
-            output_only_indices,
-            _output_indices,
-            inplace_positions,
-            _block_spec_info,
-        )
-
-        in_specs_list, out_specs = _pallas_build_pipeline_specs(
-            pl,
-            jnp,
-            pltpu,
-            grid,
-            spec_args,
-            tensor_arg_indices,
-            _output_indices,
-            _block_spec_info,
-            _pipeline_arg_indices,
-            output_only_indices,
-            smem_arg_indices=_smem_arg_indices,
-        )
-
-        _pipeline_set = set(_pipeline_arg_indices or [])
-        reordered_kernel = _pallas_make_reordered_kernel(
-            pallas_kernel,
-            spec_args,
-            tensor_arg_indices,
-            non_tensor_args,
-            n_tensor_inputs,
-            _output_indices,
-            inplace_positions,
-            arg_to_tensor_pos,
-            n_extra_refs=len(scratch_shapes),
-            skip_inplace_copy=_pipeline_set,
-            _smem_arg_indices=_smem_arg_indices,
-            _copy_guards=copy_guards,
-        )
-
-        out_shape_arg = out_shapes if len(out_shapes) > 1 else out_shapes[0]
-
-        grid_spec = pltpu.PrefetchScalarGridSpec(
-            num_scalar_prefetch=0,
-            in_specs=in_specs_list,
-            out_specs=out_specs,
-            scratch_shapes=scratch_shapes,
-            grid=grid,
-        )
-
-        # The VMEM-estimate check doesn't apply to the
-        # ``jax.jit(lax.dot_general)`` path, which doesn't go through
-        # ``pl.pallas_call``.
-        if _matmul_dot_general is None:
-            estimated_vmem = _estimate_pallas_vmem_bytes(
-                pl,
-                pltpu,
-                in_specs_list,
-                out_specs,
-                scratch_shapes,
-                spec_args,
-                tensor_arg_indices,
-                _output_indices,
-                pallas_aliases,
-            )
-            vmem_limit_bytes = _get_vmem_limit_bytes(pltpu)
-            if estimated_vmem > vmem_limit_bytes:
-                raise RuntimeError(
-                    f"XLA:TPU compile permanent error. Ran out of memory in memory space vmem. "
-                    f"Estimated {estimated_vmem / 1e6:.2f}MB exceeds {vmem_limit_bytes / 1e6:.2f}MB vmem capacity."
-                )
-
-        pallas_call_kwargs: dict[str, object] = {
-            "out_shape": out_shape_arg,
-            "grid_spec": grid_spec,
-            "compiler_params": pltpu.CompilerParams(  # pyrefly: ignore[bad-instantiation]
-                dimension_semantics=dimension_semantics,
-            ),
-        }
-        if interpret:
-            pallas_call_kwargs["interpret"] = True
-
-        if _matmul_dot_general is not None:
-            # Substitute ``lax.dot_general`` on no-tiling matmul configs.
-            jit_fn = _build_matmul_dot_general_jit_fn(_matmul_dot_general)
-        else:
-            jit_fn = pl.pallas_call(
-                reordered_kernel,  # pyrefly: ignore[bad-argument-type]
-                **pallas_call_kwargs,  # type: ignore[arg-type]
-            )
-
-        jax_callable = _pallas_build_callable(
+        cache = _pallas_install_launcher_cache(
             pallas_kernel,
             grid,
-            jit_fn,
-            _output_indices,
-            arg_to_tensor_pos,
-            tensor_arg_indices,
-            cache_attr="_pallas_pipeline_cache",
-            call_aliases=pallas_aliases,
-            trace_key_suffix="_pipeline",
-            interpret=interpret,
-        )
-
-        fast_path = _LauncherFastPath(
-            tensor_arg_indices,
-            arg_to_tensor_pos,
-            _output_indices,
-            _ds_pad_dims,
-        )
-        pallas_kernel._pallas_pipeline_cache = (  # pyrefly: ignore[missing-attribute]
-            grid,
-            jax_callable,
-            tensor_arg_indices,
-            arg_to_tensor_pos,
-            fast_path,
-            None,
-        )
-        cache = pallas_kernel._pallas_pipeline_cache  # pyrefly: ignore[missing-attribute]
-
-    # Shared fast invoke: first call (just-built cache) and every warm call.
-    (
-        _,
-        jax_callable,
-        tensor_arg_indices,
-        arg_to_tensor_pos,
-        fast_path,
-        direct_call,
-    ) = cache
-    if direct_call is None:
-        direct_call = getattr(jax_callable, "_helion_direct_call", None)
-        if direct_call is not None:
-            pallas_kernel._pallas_pipeline_cache = (  # pyrefly: ignore[missing-attribute]
-                cache[0],
-                jax_callable,
-                tensor_arg_indices,
-                arg_to_tensor_pos,
-                fast_path,
-                direct_call,
-            )
-
-    _orig_output_tensors: dict[int, torch.Tensor] | None = None
-    if _ds_pad_dims and fast_path.ds_pad_required is not False:
-        args, _orig_output_tensors, _ = _pallas_apply_ds_padding_fast(
             args,
-            _ds_pad_dims,
-            fast_path,
-            fast_path.padded_output_arg_indices,
+            kind=_PallasLoopKind.EMIT_PIPELINE,
+            cache_attr="_pallas_pipeline_cache",
+            trace_key_suffix="_pipeline",
+            _output_indices=_output_indices,
+            _inplace_indices=_inplace_indices,
+            _block_spec_info=_block_spec_info,
+            _smem_arg_indices=_smem_arg_indices,
+            _scratch_shapes=cast("list[object] | None", _scratch_shapes),
+            _pipeline_arg_indices=_pipeline_arg_indices,
+            _ds_pad_dims=_ds_pad_dims,
+            _pallas_interpret=_pallas_interpret,
+            _matmul_dot_general=_matmul_dot_general,
         )
-    return _pallas_invoke_and_return_fast(
-        jax_callable, args, fast_path, _orig_output_tensors, direct_call
+
+    return _pallas_invoke_cached_launcher(
+        pallas_kernel,
+        cache,
+        args,
+        cache_attr="_pallas_pipeline_cache",
+        _ds_pad_dims=_ds_pad_dims,
     )
 
 
@@ -1789,205 +1885,31 @@ def default_pallas_fori_launcher(
     """
     cache = getattr(pallas_kernel, "_pallas_fori_cache", None)
     if cache is None or cache[0] != grid:
-        interpret = (
-            _pallas_interpret
-            if _pallas_interpret is not None
-            else _module_is_pallas_interpret()
-        )
-        if interpret:
-            _ensure_cpu_tpu_info()
-
-        if _output_indices is None:
-            _output_indices = []
-        if _scratch_shapes is None:
-            _scratch_shapes = []
-
-        # Build the pallas specs from ds-padded shapes on a throwaway copy so
-        # ``args`` stays unpadded for the shared invoke below to pad fresh.
-        spec_args = args
-        if _ds_pad_dims:
-            spec_args, _ = _pallas_apply_ds_padding(args, _output_indices, _ds_pad_dims)
-
-        _pallas_check_dtypes(spec_args)
-
-        from jax.experimental import pallas as pl
-        from jax.experimental.pallas import tpu as pltpu
-        import jax.numpy as jnp
-
-        (
-            tensor_arg_indices,
-            output_only_indices,
-            non_tensor_args,
-            n_tensor_inputs,
-            arg_to_tensor_pos,
-            inplace_positions,
-            out_shapes,
-            pallas_aliases,
-        ) = _pallas_prepare_args(
-            spec_args, _output_indices, _inplace_indices, interpret=interpret
-        )
-
-        # Build scratch shapes: VMEM buffers + DMA semaphores
-        _jnp_dtype_map = _pallas_jnp_dtype_map()
-        scratch_shapes = []
-        for shape, dtype_str, scratch_type in _scratch_shapes:
-            if scratch_type == "dma_semaphore":
-                scratch_shapes.append(pltpu.SemaphoreType.DMA(()))
-            else:  # "vmem"
-                assert dtype_str is not None
-                jnp_dtype = _jnp_dtype_map.get(dtype_str, jnp.float32)
-                scratch_shapes.append(
-                    pltpu.VMEM(shape, jnp_dtype)  # pyrefly: ignore[bad-argument-type]
-                )
-
-        # Build in_specs/out_specs: proper BlockSpecs for outer grid dims,
-        # HBM refs for tensors used in the fori_loop body (DMA handles tiling).
-        _fori_pipeline_indices = kwargs.get("_pipeline_arg_indices")
-        assert _block_spec_info is not None, (
-            "fori_loop launcher requires _block_spec_info from codegen"
-        )
-        copy_guards, dimension_semantics = _pallas_shared_output_plan(
-            grid,
-            tensor_arg_indices,
-            output_only_indices,
-            _output_indices,
-            inplace_positions,
-            _block_spec_info,
-        )
-
-        in_specs_list, out_specs = _pallas_build_pipeline_specs(
-            pl,
-            jnp,
-            pltpu,
-            grid,
-            spec_args,
-            tensor_arg_indices,
-            _output_indices,
-            _block_spec_info,
-            _fori_pipeline_indices,  # type: ignore[arg-type]
-            output_only_indices,
-            smem_arg_indices=_smem_arg_indices,
-        )
-
-        _fori_pipeline_set = set(_fori_pipeline_indices or [])  # type: ignore[arg-type]
-        reordered_kernel = _pallas_make_reordered_kernel(
-            pallas_kernel,
-            spec_args,
-            tensor_arg_indices,
-            non_tensor_args,
-            n_tensor_inputs,
-            _output_indices,
-            inplace_positions,
-            arg_to_tensor_pos,
-            n_extra_refs=len(scratch_shapes),
-            skip_inplace_copy=_fori_pipeline_set,
-            _smem_arg_indices=_smem_arg_indices,
-            _copy_guards=copy_guards,
-        )
-
-        out_shape_arg = out_shapes if len(out_shapes) > 1 else out_shapes[0]
-
-        grid_spec = pltpu.PrefetchScalarGridSpec(
-            num_scalar_prefetch=0,
-            in_specs=in_specs_list,
-            out_specs=out_specs,
-            scratch_shapes=scratch_shapes,
-            grid=grid,
-        )
-
-        estimated_vmem = _estimate_pallas_vmem_bytes(
-            pl,
-            pltpu,
-            in_specs_list,
-            out_specs,
-            scratch_shapes,
-            spec_args,
-            tensor_arg_indices,
-            _output_indices,
-            pallas_aliases,
-        )
-        vmem_limit_bytes = _get_vmem_limit_bytes(pltpu)
-        if estimated_vmem > vmem_limit_bytes:
-            raise RuntimeError(
-                f"XLA:TPU compile permanent error. Ran out of memory in memory space vmem. "
-                f"Estimated {estimated_vmem / 1e6:.2f}MB exceeds {vmem_limit_bytes / 1e6:.2f}MB vmem capacity."
-            )
-
-        pallas_call_kwargs: dict[str, object] = {
-            "out_shape": out_shape_arg,
-            "grid_spec": grid_spec,
-            "compiler_params": pltpu.CompilerParams(  # pyrefly: ignore[bad-instantiation]
-                dimension_semantics=dimension_semantics,
-            ),
-        }
-        if interpret:
-            pallas_call_kwargs["interpret"] = True
-
-        jit_fn = pl.pallas_call(
-            reordered_kernel,  # pyrefly: ignore[bad-argument-type]
-            **pallas_call_kwargs,  # type: ignore[arg-type]
-        )
-
-        jax_callable = _pallas_build_callable(
+        cache = _pallas_install_launcher_cache(
             pallas_kernel,
             grid,
-            jit_fn,
-            _output_indices,
-            arg_to_tensor_pos,
-            tensor_arg_indices,
-            cache_attr="_pallas_fori_cache",
-            call_aliases=pallas_aliases,
-            trace_key_suffix="_fori",
-            interpret=interpret,
-        )
-
-        fast_path = _LauncherFastPath(
-            tensor_arg_indices,
-            arg_to_tensor_pos,
-            _output_indices,
-            _ds_pad_dims,
-        )
-        pallas_kernel._pallas_fori_cache = (  # pyrefly: ignore[missing-attribute]
-            grid,
-            jax_callable,
-            tensor_arg_indices,
-            arg_to_tensor_pos,
-            fast_path,
-            None,
-        )
-        cache = pallas_kernel._pallas_fori_cache  # pyrefly: ignore[missing-attribute]
-
-    # Shared fast invoke: first call (just-built cache) and every warm call.
-    (
-        _,
-        jax_callable,
-        tensor_arg_indices,
-        arg_to_tensor_pos,
-        fast_path,
-        direct_call,
-    ) = cache
-    if direct_call is None:
-        direct_call = getattr(jax_callable, "_helion_direct_call", None)
-        if direct_call is not None:
-            pallas_kernel._pallas_fori_cache = (  # pyrefly: ignore[missing-attribute]
-                cache[0],
-                jax_callable,
-                tensor_arg_indices,
-                arg_to_tensor_pos,
-                fast_path,
-                direct_call,
-            )
-
-    _orig_output_tensors: dict[int, torch.Tensor] | None = None
-    if _ds_pad_dims and fast_path.ds_pad_required is not False:
-        args, _orig_output_tensors, _ = _pallas_apply_ds_padding_fast(
             args,
-            _ds_pad_dims,
-            fast_path,
-            fast_path.padded_output_arg_indices,
+            kind=_PallasLoopKind.FORI_LOOP,
+            cache_attr="_pallas_fori_cache",
+            trace_key_suffix="_fori",
+            _output_indices=_output_indices,
+            _inplace_indices=_inplace_indices,
+            _block_spec_info=_block_spec_info,
+            _smem_arg_indices=_smem_arg_indices,
+            _scratch_shapes=cast("list[object] | None", _scratch_shapes),
+            _pipeline_arg_indices=cast(
+                "list[int] | None", kwargs.get("_pipeline_arg_indices")
+            ),
+            _ds_pad_dims=_ds_pad_dims,
+            _pallas_interpret=_pallas_interpret,
         )
-    return _pallas_invoke_and_return_fast(
-        jax_callable, args, fast_path, _orig_output_tensors, direct_call
+
+    return _pallas_invoke_cached_launcher(
+        pallas_kernel,
+        cache,
+        args,
+        cache_attr="_pallas_fori_cache",
+        _ds_pad_dims=_ds_pad_dims,
     )
 
 

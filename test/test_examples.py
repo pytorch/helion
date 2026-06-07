@@ -16,10 +16,12 @@ from helion._testing import DEVICE
 from helion._testing import EXAMPLES_DIR
 from helion._testing import HALF_DTYPE
 from helion._testing import LONG_INT_TYPE
+from helion._testing import CosSimilarity
 from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
 from helion._testing import _get_backend
 from helion._testing import check_example
+from helion._testing import float32_matmul_precision
 from helion._testing import import_path
 from helion._testing import onlyBackends
 from helion._testing import skipIfA10G
@@ -306,10 +308,6 @@ class TestExamples(RefEagerTestBase, TestCase):
         torch.testing.assert_close(mat1.grad, mat1_ref.grad, atol=1e-1, rtol=1e-2)
         torch.testing.assert_close(mat2.grad, mat2_ref.grad, atol=1e-1, rtol=1e-2)
 
-    @skipIfFn(
-        lambda: _get_backend() == "cute",
-        "CuTe matmul+layernorm example is unsupported and too expensive in-process",
-    )
     def test_matmul_layernorm_static_shapes(self):
         args = (
             torch.randn([1024, 256], device=DEVICE, dtype=torch.float32),
@@ -1490,8 +1488,18 @@ class TestExamples(RefEagerTestBase, TestCase):
                 rtol=1e-2,
             )
 
+    @parametrize(
+        "helion_precision,torch_precision,atol,rtol",
+        [
+            ("highest", "highest", 1e-2, 1e-2),
+            ("default", "medium", 1.5, 5e-2),
+        ],
+    )
+    @xfailIfPallasInterpret(
+        "The get/set_float32_matmul_precision API needs an actual backend"
+    )
     @onlyBackends(["pallas"])
-    def test_jagged_hstu_attn_2(self):
+    def test_jagged_hstu_attn_2(self, helion_precision, torch_precision, atol, rtol):
         torch.manual_seed(0)
         num_sequnces = 4
         heads = 4
@@ -1520,28 +1528,41 @@ class TestExamples(RefEagerTestBase, TestCase):
 
         args = (max_seq_len, alpha, attn_scale, q, k, v, seq_offsets)
 
-        mod = import_path(EXAMPLES_DIR / "jagged_hstu_attn_2.py")
-        expected = mod.reference_jagged_hstu_attention(*args)
+        with float32_matmul_precision(torch_precision):
+            mod = import_path(EXAMPLES_DIR / "jagged_hstu_attn_2.py")
+            expected = mod.reference_jagged_hstu_attention(*args)
 
-        # Patch to use core silu decomposition instead of inductor's custom decomposition from pytorch PR #171723.
-        # This ensures consistent codegen across torch 2.9 (stable) and nightly versions.
-        from torch._decomp.decompositions import silu
-        import torch._inductor.decomposition as inductor_decomp
+            # Patch to use core silu decomposition instead of inductor's custom decomposition from pytorch PR #171723.
+            # This ensures consistent codegen across torch 2.9 (stable) and nightly versions.
+            from torch._decomp.decompositions import silu
+            import torch._inductor.decomposition as inductor_decomp
 
-        if hasattr(inductor_decomp.fast_random_decomps, "cache_clear"):
-            inductor_decomp.fast_random_decomps.cache_clear()
-        with patch.dict(
-            inductor_decomp.decompositions, {torch.ops.aten.silu.default: silu}
-        ):
-            check_example(
-                "jagged_hstu_attn_2",
-                args,
-                expected,
-                fn_name="jagged_hstu_attention",
-                block_sizes=[128, 128],
-                atol=1e-2,
-                rtol=1e-2,
-            )
+            if hasattr(inductor_decomp.fast_random_decomps, "cache_clear"):
+                inductor_decomp.fast_random_decomps.cache_clear()
+
+            with (
+                patch.object(
+                    mod.jagged_hstu_attention.settings,
+                    "dot_precision",
+                    helion_precision,
+                ),
+                patch.dict(
+                    inductor_decomp.decompositions, {torch.ops.aten.silu.default: silu}
+                ),
+            ):
+                # Clear the cache to ensure the modified settings are used.
+                mod.jagged_hstu_attention._bound_kernels.clear()
+
+                check_example(
+                    "jagged_hstu_attn_2",
+                    args,
+                    expected,
+                    fn_name="jagged_hstu_attention",
+                    block_sizes=[128, 128],
+                    cos_sim=CosSimilarity(dim=-1, min_similarity=0.999),
+                    atol=atol,
+                    rtol=rtol,
+                )
 
     @xfailIfPallasTpu("tensor-derived if-predicates not supported")
     def test_grouped_gemm_jagged(self):
