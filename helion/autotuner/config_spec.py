@@ -85,6 +85,55 @@ class MatmulFact(NamedTuple):
     rhs_dtype: torch.dtype
 
 
+class ReductionFact(NamedTuple):
+    """Workload facts for a single inner reduction dim, recorded at compile time
+    (analogous to ``MatmulFact``) so the seed heuristic can branch on workload
+    properties rather than kernel identity. Exactly one per seeded kernel; built in
+    device_ir's ``register_rollable_reductions`` (T1) or
+    ``register_user_tiled_reductions`` (T2).
+
+    - ``block_id`` / ``size_hint``: the reduction axis and its extent (rnumel).
+    - ``m_block_ids``: the non-reduction (kept) tile block_ids.
+    - ``static_rnumel``: the reduction extent if statically known, else None.
+    - ``itemsize``: bytes per element of the reduced tensor; the byte caps key on
+      ``size_hint * itemsize``.
+    - ``num_load``: device loads over this rdim (the ``== 1`` stream-eviction gate).
+    - ``num_carried_2d_tiles``: count of 2-D ``[M_BLOCK, R_BLOCK]`` tiles carried across
+      the inner reduction loop (as opposed to 1-D ``[M_BLOCK]`` per-row scalars, which
+      do not count). The Band-B signal: routes (``>= 1``) and sizes the R_BLOCK cap.
+      Excludes in-loop scratch, so jsd=2 / kl_div=1 / welford=0. See
+      ``_count_carried_2d_tiles``.
+    - ``non_reduction_loop_block_ids``: block_ids of non-grid tiled loops over the
+      reduction extent that are NOT the reduction axis — i.e. an apply/normalize pass
+      (welford's apply loop; a T1 reduction followed by a separate normalize loop). The
+      seed widens these tiles independently of the reduction tile. Empty unless such a
+      loop exists; ``len(...) >= 1`` is the reduce-then-apply (Band-C) signal that
+      replaced the former ``is_structured_combine`` bool. See the two fact builders.
+    - ``row_reread``: True iff the reduction-input row is live across the reduction
+      boundary, so a persistent whole-row tile risks spilling. Gates the persist byte
+      cap and re-read eviction. See ``_analyze_reread``.
+    - ``reread_buffer_name``: the host buffer name of the re-read reduction row
+      (``None`` unless ``row_reread``). A config-independent dataflow property — the
+      *which buffer*, not *which slot*. The seed resolves it to the actual
+      ``load_eviction_policies`` slot index at emit time via
+      ``DeviceIR.reread_eviction_slot_for_config`` (which walks the rolled codegen
+      graphs in ``device_load_index`` order), so the slot is observed from the graph
+      codegen will build, never predicted from the pre-rolling node order. See
+      ``_analyze_reread``.
+    """
+
+    block_id: int
+    size_hint: int
+    m_block_ids: tuple[int, ...]
+    static_rnumel: int | None
+    itemsize: int
+    num_load: int
+    num_carried_2d_tiles: int = 0
+    non_reduction_loop_block_ids: tuple[int, ...] = ()
+    row_reread: bool = False
+    reread_buffer_name: str | None = None
+
+
 def shrink_block_sizes_for_numel_constraints(
     constraints: list[TensorNumelConstraint],
     block_sizes: list[int],
@@ -326,6 +375,7 @@ class ConfigSpec:
         self.compiler_seed_configs: list[helion.Config] = []
         self.autotuner_heuristics: list[str] = []
         self.matmul_facts: list[MatmulFact] = []
+        self.reduction_facts: list[ReductionFact] = []
         self.store_indices: list[int] = []
         self.backend_tunable_fragments = self.backend.tunable_fragments()
         unknown_tunables = set(self.backend_tunable_fragments) - BACKEND_TUNABLE_KEYS

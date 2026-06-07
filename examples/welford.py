@@ -49,7 +49,14 @@ def welford(
 
         for tile_n in hl.tile(n):
             chunk = x[tile_m, tile_n]
-            Tn = chunk.size(-1)
+            # Count of VALID columns in this tile. Helion masks out-of-bounds
+            # loads with other=0, so sum_x/sum_x2 are already correct over the
+            # valid columns; the per-chunk count/mean/M2 must divide by the TRUE
+            # valid count, NOT the constexpr tile width chunk.size(-1) (which
+            # over-counts the padding on the last tile when block_size does not
+            # divide n -> wrong mean/M2/count at non-divisor N). `tile_n.index`
+            # is the canonical Helion masked-index idiom (tile_interface.index).
+            Tn = (tile_n.index < n).sum()
             sum_x = torch.sum(chunk, dim=-1)
             sum_x2 = torch.sum(chunk * chunk, dim=-1)
             mean_c = sum_x / Tn
