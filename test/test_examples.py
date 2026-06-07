@@ -2414,7 +2414,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             "batch_softmax",
             args,
             torch.nn.functional.softmax(args[0], dim=-1),
-            block_sizes=[8],
+            block_sizes=[1, 8],
         )
 
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
@@ -2425,7 +2425,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             "batch_softmax",
             args,
             torch.nn.functional.softmax(args[0], dim=-1),
-            block_sizes=[8],
+            block_sizes=[1, 8],
             indexing="block_ptr",
         )
 
