@@ -3220,6 +3220,14 @@ class TestTritonReductionHeuristic(TestCase):
         # Force the sm90 deep path so the test exercises the H100-tuned seed on any
         # runner (off-sm90 the heuristic falls back to the conservative narrow seed).
         with patch("helion._hardware.get_hardware_info", return_value=HOPPER_HARDWARE):
+            # rms_norm_fwd is a module-level singleton shared across the suite. A
+            # prior test (or a pytest --reruns retry) on the same worker may have
+            # bound it at these shapes WITHOUT this patch, caching a BoundKernel
+            # whose autotuner_heuristics were computed for the real (non-sm90)
+            # device. bind() keys its cache on arg signature, not hardware, so that
+            # stale entry would be returned here and the patch silently bypassed.
+            # reset() drops the cache so the bind below re-runs under the patch.
+            rms_norm_fwd.reset()
             bound = rms_norm_fwd.bind(args)
 
             # The reduction heuristic registered a single workload fact and fired.
@@ -3261,6 +3269,14 @@ class TestTritonReductionHeuristic(TestCase):
         # Force the sm90 deep path so the Band-B seed is exercised on any runner
         # (off-sm90 the heuristic declines to the conservative narrow seed).
         with patch("helion._hardware.get_hardware_info", return_value=HOPPER_HARDWARE):
+            # kl_div_forward is a module-level singleton shared across the suite. A
+            # prior test (or a pytest --reruns retry) on the same worker may have
+            # bound it at these shapes WITHOUT this patch, caching a BoundKernel
+            # whose autotuner_heuristics were computed for the real (non-sm90)
+            # device. bind() keys its cache on arg signature, not hardware, so that
+            # stale entry would be returned here and the patch silently bypassed.
+            # reset() drops the cache so the bind below re-runs under the patch.
+            kl_div_forward.reset()
             bound = kl_div_forward.bind(args)
 
             # Single workload fact carrying a 2D [M, R] tile -> Band B.

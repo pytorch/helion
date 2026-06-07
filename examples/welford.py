@@ -56,7 +56,12 @@ def welford(
             # over-counts the padding on the last tile when block_size does not
             # divide n -> wrong mean/M2/count at non-divisor N). `tile_n.index`
             # is the canonical Helion masked-index idiom (tile_interface.index).
-            Tn = (tile_n.index < n).sum()
+            # Cast the bool mask to int32 BEFORE summing: the CuTe backend derives
+            # the reduction accumulator dtype from the operand, and a bool operand
+            # yields a saturating boolean accumulator (Tn collapses to 1, not the
+            # true count -> wrong mean -> negative variance -> NaN). The explicit
+            # int32 cast forces an integer accumulator on every backend.
+            Tn = (tile_n.index < n).to(torch.int32).sum()
             sum_x = torch.sum(chunk, dim=-1)
             sum_x2 = torch.sum(chunk * chunk, dim=-1)
             mean_c = sum_x / Tn
