@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import ast
 import math
 import os
+import re
 from typing import TYPE_CHECKING
 from typing import Any
 from typing import Callable
@@ -3196,6 +3198,30 @@ class TestPallas(TestCase):
         self.assertIn("pl.ds(", code)
         self.assertIn("_pipeline_arg_indices=", code)
         torch.testing.assert_close(result, x * r)
+
+    def test_pipeline_begin_aligned_skips_pad(self) -> None:
+        # A block-aligned inner begin (the outer tile's offset) needs no boundary
+        # pad, so _ds_pad_dims must report extra_pad == 0 rather than block_size-1.
+        # Locks the pad-skip optimization (would be block_size-1 if it regressed).
+        x = torch.randn(64, 128, device=DEVICE, dtype=torch.float32)
+        r = torch.randn(64, 1, device=DEVICE, dtype=torch.float32)
+        code, result = code_and_output(
+            pallas_row_scale_mul,
+            (x, r),
+            block_sizes=[8],
+            pallas_loop_type="fori_loop",
+        )
+        torch.testing.assert_close(result, x * r)
+        match = re.search(r"_ds_pad_dims=(\[[^\]]*\])", code)
+        self.assertIsNotNone(match, "expected _ds_pad_dims in the launcher call")
+        pad_dims = ast.literal_eval(
+            match.group(1)
+        )  # [(arg, dim, block_size, extra_pad)]
+        self.assertTrue(pad_dims, "expected pl.ds pad dims to be present")
+        self.assertTrue(
+            all(extra_pad == 0 for *_, extra_pad in pad_dims),
+            f"block-aligned begin should skip the pad (extra_pad==0), got {pad_dims}",
+        )
 
     def test_squeeze_slice_access(self) -> None:
         """Test for the [None, :] indexing pattern (subscript index for slice >= tensor_ndim)"""
