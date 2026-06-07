@@ -773,7 +773,10 @@ class TritonReductionUserTileHeuristic(_TritonReductionSeedBase):
 
         seed: dict[str, Any] = {
             "block_sizes": cls._build_block_sizes(
-                spec, fact, fact.block_id, r_block,
+                spec,
+                fact,
+                fact.block_id,
+                r_block,
                 non_reduction_loop_ids=non_reduction_loop_ids,
             ),
             "num_warps": num_warps,

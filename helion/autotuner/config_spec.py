@@ -132,6 +132,8 @@ class ReductionFact(NamedTuple):
     non_reduction_loop_block_ids: tuple[int, ...] = ()
     row_reread: bool = False
     reread_buffer_name: str | None = None
+
+
 class MemoryOpFact(NamedTuple):
     """Metadata linking one ``Config.indexing`` slot to its graph memory op.
 

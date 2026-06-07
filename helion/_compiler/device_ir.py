@@ -81,8 +81,9 @@ if TYPE_CHECKING:
     from collections.abc import Sequence
 
     import sympy
-    from .compile_environment import BlockSizeInfo
+
     from ..autotuner.config_spec import MemoryOpFact
+    from .compile_environment import BlockSizeInfo
     from .cute.layout import CuTeGridExecutionPlan
 
     class _TLS(Protocol):
@@ -655,10 +656,10 @@ def _reduction_node_ids(graph: torch.fx.Graph, red_block_id: int) -> set[int]:
     from .inductor_lowering import ReductionLowering
 
     return {
-        id(nd)
-        for nd in graph.nodes
-        if isinstance(nd.meta.get("lowering"), ReductionLowering)
-        and getattr(nd.meta["lowering"], "block_index", None) == red_block_id
+        id(node)
+        for node in graph.nodes
+        if isinstance(node.meta.get("lowering"), ReductionLowering)
+        and getattr(node.meta["lowering"], "block_index", None) == red_block_id
     }
 
 
@@ -1450,8 +1451,10 @@ class DeviceIR:
             # well-formed device IR each subgraph is referenced from exactly one
             # parent node, so it never skips a real emission (codegen emits each
             # call site once, and distinct call sites carry distinct graph ids).
-            if found is not None or graph_id in visited or not 0 <= graph_id < len(
-                graphs
+            if (
+                found is not None
+                or graph_id in visited
+                or not 0 <= graph_id < len(graphs)
             ):
                 return
             visited.add(graph_id)
