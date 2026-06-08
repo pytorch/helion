@@ -143,8 +143,8 @@ def my_kernel(x: torch.Tensor) -> torch.Tensor:
 
 .. autoattribute:: Settings.autotune_log
 
-   When set, Helion writes per-config autotuning telemetry (config index, generation, status, perf, compile time, timestamp, config JSON) to ``<value>.csv`` and mirrors the autotune log output to ``<value>.log`` for population-based autotuners (currently ``PatternSearch`` and ``DifferentialEvolution``).
-   The kernel identity (id, name, source, input shapes, dtypes, hardware) is written once per run to ``<value>.meta.json`` so the per-config CSV rows can be grouped by kernel across runs.
+   When set, Helion writes per-config autotuning telemetry (kernel id, sample id, config index, generation, status, perf, compile time, timestamp, config JSON) to ``<value>.csv`` and mirrors the autotune log output to ``<value>.log`` for population-based autotuners (currently ``PatternSearch`` and ``DifferentialEvolution``).
+   The kernel identity (id, name, source, input shapes, dtypes, hardware) is written once per run to ``<value>.meta.json``. ``kernel_id`` is a stable content hash (of the kernel source and code-generation settings) that appears on every CSV row, acting as the foreign key to join rows back to the sidecar and group them by kernel across runs; ``sample_id`` additionally identifies each ``(kernel, config)`` pair so repeated benchmarks of the same config can be deduplicated.
    Controlled by ``HELION_AUTOTUNE_LOG``.
 
 .. autoattribute:: Settings.autotune_compile_timeout
