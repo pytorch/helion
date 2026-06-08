@@ -269,6 +269,8 @@ class AutotuneLogEntry(NamedTuple):
     perf_ms: float | None
     compile_time: float | None
     config: Config
+    # Stable per-(kernel, config) id: sha256(kernel_source + decorator(config)).
+    sample_id: str = ""
 
 
 class AutotuneLogSink:
@@ -314,6 +316,7 @@ class AutotuneLogSink:
         self._csv_writer.writerow(
             [
                 "kernel_id",
+                "sample_id",
                 "timestamp_s",
                 "config_index",
                 "generation",
@@ -369,6 +372,7 @@ class AutotuneLogSink:
         self._csv_writer.writerow(
             [
                 kernel_id,
+                entry.sample_id,
                 timestamp_field,
                 self._config_counter,
                 entry.generation,

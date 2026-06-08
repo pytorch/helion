@@ -134,7 +134,7 @@ class TestMetadataSchema(TestCase):
 
 
 class TestAutotuneLogSink(TestCase):
-    def _entry(self, perf_ms: float) -> AutotuneLogEntry:
+    def _entry(self, perf_ms: float, sample_id: str = "sample-xyz") -> AutotuneLogEntry:
         """
         Create fake log entry for testing.
         """
@@ -144,6 +144,7 @@ class TestAutotuneLogSink(TestCase):
             perf_ms=perf_ms,
             compile_time=0.5,
             config=helion.Config(block_sizes=[16]),
+            sample_id=sample_id,
         )
 
     def test_sink_writes_metadata_sidecar_and_per_config_rows(self) -> None:
@@ -180,6 +181,9 @@ class TestAutotuneLogSink(TestCase):
             # kernel_id foreign key is stamped on every row, matching the sidecar.
             kid_col = header.index("kernel_id")
             self.assertTrue(all(row[kid_col] == "abc123" for row in data_rows))
+            # sample_id (per-(kernel, config) key) is carried from the entry.
+            sid_col = header.index("sample_id")
+            self.assertTrue(all(row[sid_col] == "sample-xyz" for row in data_rows))
 
     def test_sink_without_metadata_writes_no_sidecar(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
