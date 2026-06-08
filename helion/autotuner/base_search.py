@@ -252,16 +252,16 @@ class BaseSearch(BaseAutotuner):
         budget = self.settings.autotune_budget_seconds
         if budget is not None:
             self.log(f"Autotune budget: {budget}s")
-        outer_kernel = getattr(self.kernel, "kernel", None)
+        kernel_obj = getattr(self.kernel, "kernel", None)
         kernel_idx = -1
         kernel_source = ""
-        if outer_kernel is not None:
-            kernel_idx = outer_kernel.kernel_id()
+        if kernel_obj is not None:
+            kernel_idx = kernel_obj.kernel_id()
             try:
-                kernel_source = outer_kernel.kernel_source()
+                kernel_source = kernel_obj.kernel_source()
             except Exception:
                 self.log.debug("Failed to read Helion kernel source", exc_info=True)
-        kernel_name = getattr(outer_kernel, "name", "")
+        kernel_name = getattr(kernel_obj, "name", "")
         tensors = [arg for arg in self.args if isinstance(arg, torch.Tensor)]
         input_shapes = str([tuple(t.shape) for t in tensors])
         dtypes = str([str(t.dtype) for t in tensors])
