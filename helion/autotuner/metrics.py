@@ -32,7 +32,7 @@ class AutotuneMetrics:
     num_generations: int = 0
     autotune_time: float = 0.0
     best_perf_ms: float = 0.0
-    kernel_idx: int = -1
+    kernel_id: str = ""
     kernel_name: str = ""
     kernel_source: str = ""
     input_shapes: str = ""
@@ -45,7 +45,7 @@ class AutotuneMetrics:
 
     def to_dict(self) -> dict[str, object]:
         return {
-            "kernel_idx": self.kernel_idx,
+            "kernel_id": self.kernel_id,
             "kernel_name": self.kernel_name,
             "kernel_source": self.kernel_source,
             "input_shapes": self.input_shapes,
@@ -68,11 +68,12 @@ class KernelMetadata:
     Written once per autotuning run to the ``<autotune_log>.meta.json`` sidecar
     that sits next to the per-config CSV telemetry. The CSV records each config
     and its result; this provides the stable identity needed to group those rows
-    across runs. ``kernel_source`` is the stable cross-process key;
-    ``kernel_idx`` is a process-local convenience id.
+    across runs. ``kernel_id`` is the stable, content-derived foreign key (a
+    hash of the kernel source and code-generation settings); ``kernel_source``
+    carries the full source text for analysis and debugging.
     """
 
-    kernel_idx: int = -1
+    kernel_id: str = ""
     kernel_name: str = ""
     kernel_source: str = ""
     input_shapes: str = ""
@@ -81,7 +82,7 @@ class KernelMetadata:
 
     def to_dict(self) -> dict[str, object]:
         return {
-            "kernel_idx": self.kernel_idx,
+            "kernel_id": self.kernel_id,
             "kernel_name": self.kernel_name,
             "kernel_source": self.kernel_source,
             "input_shapes": self.input_shapes,

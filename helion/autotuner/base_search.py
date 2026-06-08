@@ -253,13 +253,13 @@ class BaseSearch(BaseAutotuner):
         if budget is not None:
             self.log(f"Autotune budget: {budget}s")
         kernel_obj = getattr(self.kernel, "kernel", None)
-        kernel_idx = -1
+        kernel_id = ""
         kernel_source = ""
         if kernel_obj is not None:
-            kernel_idx = kernel_obj.kernel_id()
             try:
                 kernel_source = kernel_obj.kernel_source()
-            except Exception:
+                kernel_id = kernel_obj.kernel_id()
+            except OSError:
                 self.log.debug("Failed to read Helion kernel source", exc_info=True)
         kernel_name = getattr(kernel_obj, "name", "")
         tensors = [arg for arg in self.args if isinstance(arg, torch.Tensor)]
@@ -267,7 +267,7 @@ class BaseSearch(BaseAutotuner):
         dtypes = str([str(t.dtype) for t in tensors])
         hardware = get_device_name(extract_device(self.args)) or ""
         self._autotune_metrics: AutotuneMetrics = AutotuneMetrics(
-            kernel_idx=kernel_idx,
+            kernel_id=kernel_id,
             kernel_name=kernel_name,
             kernel_source=kernel_source,
             input_shapes=input_shapes,
@@ -278,7 +278,7 @@ class BaseSearch(BaseAutotuner):
         # Written once per run to the <autotune_log>.meta.json sidecar so the
         # per-config CSV rows can be grouped by kernel across runs.
         self._kernel_metadata: KernelMetadata = KernelMetadata(
-            kernel_idx=kernel_idx,
+            kernel_id=kernel_id,
             kernel_name=kernel_name,
             kernel_source=kernel_source,
             input_shapes=input_shapes,

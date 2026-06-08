@@ -4,6 +4,7 @@ import ast
 import contextlib
 import dataclasses
 import functools
+import hashlib
 import inspect
 import itertools
 import logging
@@ -224,40 +225,35 @@ class Kernel(Generic[_R]):
         self.__defaults__ = fn.__defaults__
         self.__kwdefaults__ = fn.__kwdefaults__
 
+    def _settings_signature(self) -> str:
+        """Return a stable string of settings that influence Triton codegen.
+
+        Mirrors the settings captured by
+        :meth:`BoundKernel.format_kernel_decorator` so the kernel id reflects
+        the same code-generation-affecting knobs.
+        """
+        parts = [f"static_shapes={self.settings.static_shapes}"]
+        if self.settings.index_dtype is not None:
+            parts.append(f"index_dtype={self.settings.index_dtype}")
+        return ", ".join(parts)
+
     @functools.cache  # noqa: B019
-    def kernel_id(self) -> int:
+    def kernel_id(self) -> str:
         """
-        Return the process-local integer id for this kernel.
+        Return a stable, content-derived identifier for this kernel.
 
-        This reuses the Helion kernel side-table index (``kernel_idx``) that the
-        ``torch.compile`` integration assigns. The id is allocated lazily and is
-        idempotent: the same ``Kernel`` instance always maps to the same index
-        within a process, whether it is first seen on the autotune, cached, or
-        ``torch.compile`` tracing path.
+        The id is the SHA-256 hash of the kernel source together with the
+        settings that influence Triton code generation (see
+        :meth:`_settings_signature`). Because it is derived purely from content,
+        it is stable across processes and runs, making it suitable as a foreign
+        key for grouping telemetry rows by kernel during analysis.
 
-        Note: the id is process-local and NOT stable across processes. Use
-        :meth:`kernel_source` for a stable, content-derived identifier when
-        joining telemetry across runs.
-
-        Returns ``-1`` when the side table is unavailable (e.g. on PyTorch
-        versions that predate the Helion higher-order-op integration).
+        Raises ``OSError`` if the source cannot be located (e.g. functions
+        defined in an interactive REPL or generated dynamically); see
+        :meth:`kernel_source`.
         """
-        try:
-            from .._compiler._dynamo.higher_order_ops import helion_kernel_side_table
-        except Exception as e:  # pragma: no cover - depends on torch version
-            log.debug(
-                "Could not import the Helion kernel side table for kernel %r; "
-                "falling back to kernel_id=-1. This usually means the installed "
-                "PyTorch (%s) predates the Helion higher-order-op integration. "
-                "kernel_id is process-local anyway; telemetry can still group "
-                "rows for this kernel by kernel_source(). Cause: %s",
-                self.name,
-                torch.__version__,
-                e,
-                exc_info=True,
-            )
-            return -1
-        return helion_kernel_side_table.add_kernel(self)
+        payload = self.kernel_source() + self._settings_signature()
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
     @functools.cache  # noqa: B019
     def kernel_source(self) -> str:
