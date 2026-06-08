@@ -163,7 +163,14 @@ def _clone_args(
         if not isinstance(arg, torch.Tensor):
             continue
         if _should_clone(i):
-            clone = arg.detach().clone()
+            clone = torch.empty_strided(
+                size=arg.size(),
+                stride=arg.stride(),
+                dtype=arg.dtype,
+                device=arg.device,
+                layout=arg.layout,
+            )
+            clone.copy_(arg)
             clone.requires_grad_(arg.requires_grad)
             args_flat[i] = clone
 
