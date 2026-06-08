@@ -266,7 +266,7 @@ def _canonical_load_text(node: ast.AST, lane_var_alias: dict[str, str]) -> str:
     return text
 
 
-class _CuteFuseTwoPassLoads(ast.NodeTransformer):
+class _CuteFuseTwoPassLoads:
     """See module docstring."""
 
     def __init__(
@@ -842,13 +842,6 @@ class _CuteFuseTwoPassLoads(ast.NodeTransformer):
         if not any_fused:
             return None
         return new_body
-
-    def visit_FunctionDef(self, node: ast.FunctionDef) -> ast.FunctionDef:
-        new_body = self._try_fuse(node.body)
-        if new_body is not None:
-            node.body = new_body
-        # Recurse for nested functions (unlikely in our kernels).
-        return self.generic_visit(node)  # type: ignore[return-value]
 
 
 def fuse_two_pass_loads(

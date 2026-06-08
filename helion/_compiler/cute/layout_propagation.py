@@ -90,7 +90,7 @@ def _seed_constraints(
 ) -> None:
     """Attach preferred LayoutConstraints to loads, stores, reductions."""
     for node in graph_info.graph.nodes:
-        constraint = preferred_constraint_for_node(node, graph_info, tile_strategy)
+        constraint = preferred_constraint_for_node(node, tile_strategy)
         if constraint is not None:
             node.meta[META_KEY] = constraint
 
@@ -430,8 +430,6 @@ def _backward_propagate(graph_info: GraphInfo) -> None:
         if not isinstance(val, torch.Tensor):
             continue
         constraint = _constraint_for_node(node)
-        if constraint.required:
-            continue  # non-negotiable
 
         # Don't backward-propagate through nodes with semantic preferences
         # (reductions need threads along the reduction axis).

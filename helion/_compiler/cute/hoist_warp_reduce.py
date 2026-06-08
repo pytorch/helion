@@ -43,6 +43,8 @@ import ast
 from typing import cast
 
 from ..ast_extension import statement_from_string
+from ._ast_pass_utils import _assignment_lhs_name
+from ._ast_pass_utils import _names_read
 
 # Warp-reduction call attribute names recognised by this pass.  Each maps
 # to the identity element used for the per-thread V-fold accumulator.
@@ -124,23 +126,6 @@ def _is_constexpr_v_loop(node: ast.stmt) -> tuple[ast.For, int] | None:
     return node, arg.value
 
 
-class _NameRefCollector(ast.NodeVisitor):
-    """Collect all ``ast.Name`` ids that appear as Load contexts in ``node``."""
-
-    def __init__(self) -> None:
-        self.names: set[str] = set()
-
-    def visit_Name(self, node: ast.Name) -> None:
-        if isinstance(node.ctx, ast.Load):
-            self.names.add(node.id)
-
-
-def _names_read(node: ast.AST) -> set[str]:
-    collector = _NameRefCollector()
-    collector.visit(node)
-    return collector.names
-
-
 def _names_written(node: ast.stmt) -> set[str]:
     """Collect names written by an assignment statement (LHS Name targets)."""
     written: set[str] = set()
@@ -153,15 +138,6 @@ def _names_written(node: ast.stmt) -> set[str]:
                     if isinstance(elt, ast.Name):
                         written.add(elt.id)
     return written
-
-
-def _assignment_lhs_name(node: ast.stmt) -> str | None:
-    """If ``node`` is ``LHS = RHS`` with LHS being a single Name, return LHS.id."""
-    if isinstance(node, ast.Assign) and len(node.targets) == 1:
-        target = node.targets[0]
-        if isinstance(target, ast.Name):
-            return target.id
-    return None
 
 
 def _assignment_rhs(node: ast.stmt) -> ast.expr | None:

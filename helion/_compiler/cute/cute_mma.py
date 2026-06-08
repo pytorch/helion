@@ -5233,33 +5233,6 @@ def _is_zero_acc_expr(acc_expr: ast.AST) -> bool:
     return False
 
 
-def _is_zero_acc_node(node: Node | None) -> bool:
-    if node is None:
-        return False
-    if node.op != "call_function":
-        return False
-
-    if node.target in _TRACE_THROUGH_TARGETS:
-        src = node.args[0] if node.args else None
-        return isinstance(src, Node) and _is_zero_acc_node(src)
-
-    target_name = getattr(node.target, "__name__", "")
-    if target_name in {"clone", "detach"}:
-        src = node.args[0] if node.args else None
-        return isinstance(src, Node) and _is_zero_acc_node(src)
-    if target_name == "zeros":
-        return True
-    if target_name != "full":
-        return False
-
-    value = None
-    if len(node.args) > 1:
-        value = node.args[1]
-    elif "value" in node.kwargs:
-        value = node.kwargs["value"]
-    return value in (0, 0.0)
-
-
 def _choose_mma_impl(
     input_dtype: torch.dtype,
     *,
@@ -5943,13 +5916,6 @@ def _emit_tcgen05_aux_pipeline_setup(
         ]
     )
     return lines
-
-
-def _tcgen05_epilogue_dest_expr(plan: _Tcgen05LayoutPlan, tensor: str) -> str:
-    planned_layout = tensor + ".layout"
-    for _ in range(3):
-        planned_layout = f"cute.append({planned_layout}, {plan.epilogue_rest_mode})"
-    return f"cute.make_tensor({tensor}.iterator, {planned_layout})"
 
 
 def _validate_tcgen05_smem_swizzle_override(

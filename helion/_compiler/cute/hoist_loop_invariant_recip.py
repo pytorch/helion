@@ -54,6 +54,7 @@ from __future__ import annotations
 import ast
 
 from ..ast_extension import statement_from_string
+from ._ast_pass_utils import _names_read
 
 _HOIST_COUNTER: list[int] = [0]
 
@@ -62,21 +63,6 @@ def _new_inv_name() -> str:
     name = f"_helion_inv_div_{_HOIST_COUNTER[0]}"
     _HOIST_COUNTER[0] += 1
     return name
-
-
-class _NameRefCollector(ast.NodeVisitor):
-    def __init__(self) -> None:
-        self.names: set[str] = set()
-
-    def visit_Name(self, node: ast.Name) -> None:
-        if isinstance(node.ctx, ast.Load):
-            self.names.add(node.id)
-
-
-def _names_read(node: ast.AST) -> set[str]:
-    collector = _NameRefCollector()
-    collector.visit(node)
-    return collector.names
 
 
 def _is_placeholder_body(body: list[ast.stmt]) -> bool:
@@ -678,11 +664,6 @@ def _new_scaled_name() -> str:
 
 def _is_numeric_const(node: ast.AST) -> bool:
     return isinstance(node, ast.Constant) and isinstance(node.value, (int, float))
-
-
-def _expr_text(node: ast.expr) -> str:
-    """ast.unparse the expression text (used to canonicalize hoist keys)."""
-    return ast.unparse(node)
 
 
 def _find_sub_assign_in_body(

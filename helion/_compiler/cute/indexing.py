@@ -18,8 +18,6 @@ if TYPE_CHECKING:
 class CuteAffineRangeIndex:
     base: object
     factor: int
-    start: object
-    length: object
     step: object
     dtype: torch.dtype
 
@@ -109,8 +107,6 @@ def match_cute_affine_range_iota(node: Node) -> CuteAffineRangeIndex | None:
     return CuteAffineRangeIndex(
         base=length_base,
         factor=length_factor,
-        start=start,
-        length=length_arg,
         step=step,
         dtype=dtype,
     )
