@@ -2929,6 +2929,15 @@ def _(state: CodegenState) -> ast.AST:
             mask_var := state.codegen.mask_var(index)
         ) is not None:
             expand = state.tile_strategy.expand_str(input_sizes, dim)
+            # Jagged-tile masks come out 2-D ``(parent_dims, block_size)``;
+            # the default ``expand_str`` assumes 1-D and yields the wrong
+            # rank.  Mirror the Triton handler above and use the jagged
+            # path's mask shape to compute the right transform.
+            if env.is_jagged_tile(index):
+                mask_shape = env.jagged_tile_mask_shapes[index]
+                expand = state.tile_strategy.jagged_tile_expand_str(
+                    mask_shape, input_sizes
+                )
             # Cast bool mask to float before expanding — Mosaic cannot
             # reshape bool vectors (e.g. vector<32xi1> → vector<32x1xi1>).
             expr = f"({mask_var}.astype(jnp.float32){expand})"
