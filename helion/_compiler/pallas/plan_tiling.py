@@ -486,8 +486,21 @@ def _resolve_tensor_index_patterns(
     patterns: list[IndexingPattern],
     config: Config,
 ) -> None:
-    """Replace TensorIndexPattern with Pallas indirect load/store patterns."""
-    positions = [i for i, p in enumerate(patterns) if isinstance(p, TensorIndexPattern)]
+    """Replace TensorIndexPattern with Pallas indirect load/store patterns.
+
+    Jagged-flat patterns (``TensorIndexPattern.is_jagged_flat=True``) are
+    deliberately skipped — they have their own DMA-driven emit path that
+    needs the original pattern (with cached ``sublane_bid`` /
+    ``sublane_base_fx`` / ``lane_bid`` / ``lane_size``) to build the
+    per-item HBM slice.  Converting them to ``IndirectGatherPattern`` here
+    would lose that metadata and force a one-hot dot-product gather that
+    is both wrong on jagged layouts and unusably slow on TPU.
+    """
+    positions = [
+        i
+        for i, p in enumerate(patterns)
+        if isinstance(p, TensorIndexPattern) and not p.is_jagged_flat
+    ]
     if not positions:
         return
 
