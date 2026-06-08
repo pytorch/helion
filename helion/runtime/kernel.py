@@ -259,6 +259,7 @@ class Kernel(Generic[_R]):
             return -1
         return helion_kernel_side_table.add_kernel(self)
 
+    @functools.cache  # noqa: B019
     def kernel_source(self) -> str:
         """
         Return the kernel's source text.
@@ -1443,7 +1444,8 @@ def _graph_module_key(fn: Kernel, obj: torch.fx.GraphModule) -> Hashable:
 
 
 _specialization_extractors: dict[
-    type[object] | str, Callable[[Kernel, object], Hashable]
+    type[object] | str,
+    Callable[[Kernel, object], Hashable],
     # pyrefly: ignore [bad-assignment]
 ] = {
     torch.Tensor: _tensor_key,
