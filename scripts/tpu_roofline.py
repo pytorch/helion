@@ -114,9 +114,7 @@ HBM_EFFECTIVE_GBPS = 3_160.0  # ~85.6% of peak (measured, jnp.add streaming)
 BF16_PEAK_TFLOPS = 1_153.0
 BF16_EFFECTIVE_TFLOPS = 912.0  # ~79% of peak (measured, jnp.matmul 4k+/8k+)
 MXU_REALIZATION = BF16_EFFECTIVE_TFLOPS / BF16_PEAK_TFLOPS  # 0.791
-FLOPS_PER_VMATMUL = (
-    2_097_152  # 2^21 — verified empirically
-)
+FLOPS_PER_VMATMUL = 2_097_152  # 2^21 — verified empirically
 
 # Per-lane effective peaks (per TC, bf16), calibrated via async-chained
 # jit'd kernels with high arithmetic intensity to escape memory bound.
@@ -1078,8 +1076,7 @@ def main() -> None:
                     if value > 1:
                         args.inner_loop_iters = value
                         print(
-                            f"ℹ Loaded inner_loop_iters={value} from "
-                            f"{meta_path.name}",
+                            f"ℹ Loaded inner_loop_iters={value} from {meta_path.name}",
                             file=sys.stderr,
                         )
                     break

@@ -43,13 +43,14 @@ Library:
 from __future__ import annotations
 
 import argparse
+from collections import defaultdict
+from dataclasses import dataclass
+from dataclasses import field
 import gzip
 import json
+from pathlib import Path
 import subprocess
 import sys
-from collections import defaultdict
-from dataclasses import dataclass, field
-from pathlib import Path
 from typing import Any
 
 # These names match what xprof emits with the LLO debug-info flags enabled.
@@ -99,9 +100,11 @@ class CallSummary:
 
 def load_trace(trace_dir: str | Path) -> list[dict[str, Any]]:
     """Load all `traceEvents` from the .trace.json.gz under trace_dir."""
-    gz_paths = subprocess.check_output(
-        ["find", str(trace_dir), "-name", "*.trace.json.gz"]
-    ).decode().split()
+    gz_paths = (
+        subprocess.check_output(["find", str(trace_dir), "-name", "*.trace.json.gz"])
+        .decode()
+        .split()
+    )
     if not gz_paths:
         raise FileNotFoundError(f"No .trace.json.gz under {trace_dir}")
     with gzip.open(gz_paths[0], "rt") as f:
@@ -140,7 +143,8 @@ def lane_stats_in_window(
     only for relative comparison between lanes within the same trace.
     """
     samples = [
-        e for e in events
+        e
+        for e in events
         if e.get("name") == lane_name and t_start <= e.get("ts", -1) < t_end
     ]
     window_us = max(1e-9, t_end - t_start)
@@ -176,8 +180,11 @@ def detect_lane_gaps(
     Returns list of (absolute_gap_start_us, gap_duration_us).
     """
     samples = sorted(
-        (e for e in events
-         if e.get("name") == lane_name and t_start <= e.get("ts", -1) < t_end),
+        (
+            e
+            for e in events
+            if e.get("name") == lane_name and t_start <= e.get("ts", -1) < t_end
+        ),
         key=lambda e: e["ts"],
     )
     gaps = []
@@ -195,8 +202,10 @@ def lane_activity_in_window(
 ) -> float:
     """Return total busy-µs of `lane_name` within [t_start, t_end)."""
     samples = [
-        e for e in events
-        if e.get("name") == lane_name and e.get("ts", -1) + e.get("dur", 0.0) > t_start
+        e
+        for e in events
+        if e.get("name") == lane_name
+        and e.get("ts", -1) + e.get("dur", 0.0) > t_start
         and e.get("ts", -1) < t_end
     ]
     busy = 0.0
@@ -225,9 +234,7 @@ def analyze_call(
     target = calls[call_index]
     t0, dur = target["ts"], target["dur"]
     t1 = t0 + dur
-    lanes = {
-        lane: lane_stats_in_window(events, lane, t0, t1) for lane in LANE_NAMES
-    }
+    lanes = {lane: lane_stats_in_window(events, lane, t0, t1) for lane in LANE_NAMES}
     mxu_gaps = [
         (gap_start - t0, gap_dur)
         for gap_start, gap_dur in detect_lane_gaps(
@@ -286,9 +293,7 @@ def print_comparison(
     summary_a: CallSummary, label_a: str, summary_b: CallSummary, label_b: str
 ) -> None:
     """Side-by-side comparison of two CallSummary objects."""
-    print(
-        f"=== Comparison: {label_a} vs {label_b} ==="
-    )
+    print(f"=== Comparison: {label_a} vs {label_b} ===")
     print(
         f"  duration:  {label_a}={summary_a.duration_us:.2f}us  |  "
         f"{label_b}={summary_b.duration_us:.2f}us"
@@ -317,9 +322,11 @@ def utilization_from_xplane(trace_dir: str | Path) -> dict[str, dict[str, float]
     Matches TensorBoard's "Unit Utilization" view exactly. Requires
     `xprof.convert.raw_to_tool_data` (ships with `pip install xprof`).
     """
-    xp_paths = subprocess.check_output(
-        ["find", str(trace_dir), "-name", "*.xplane.pb"]
-    ).decode().split()
+    xp_paths = (
+        subprocess.check_output(["find", str(trace_dir), "-name", "*.xplane.pb"])
+        .decode()
+        .split()
+    )
     if not xp_paths:
         raise FileNotFoundError(f"No .xplane.pb under {trace_dir}")
 
@@ -392,14 +399,18 @@ def main() -> None:
     args = p.parse_args()
 
     # Prefer authoritative xplane.pb path when available
-    xp_paths = subprocess.check_output(
-        ["find", str(args.trace_dir), "-name", "*.xplane.pb"]
-    ).decode().split()
+    xp_paths = (
+        subprocess.check_output(["find", str(args.trace_dir), "-name", "*.xplane.pb"])
+        .decode()
+        .split()
+    )
     if xp_paths and not args.json_only:
         try:
             util = utilization_from_xplane(args.trace_dir)
-            print(f"=== Authoritative utilization (from xplane.pb) ===")
-            print(f"  {'metric':<32}  {'achieved':>14}  {'peak':>14}  {'unit':>12}  {'%':>7}")
+            print("=== Authoritative utilization (from xplane.pb) ===")
+            print(
+                f"  {'metric':<32}  {'achieved':>14}  {'peak':>14}  {'unit':>12}  {'%':>7}"
+            )
             for name, m in util.items():
                 print(
                     f"  {name:<32}  {m['achieved']:>14,.0f}  {m['peak']:>14,.0f}  "
@@ -452,8 +463,10 @@ def main() -> None:
         print_summary(summary_b, gap_thresh)
         print()
         print_comparison(
-            summary_a, Path(args.trace_dir).name,
-            summary_b, Path(args.compare).name,
+            summary_a,
+            Path(args.trace_dir).name,
+            summary_b,
+            Path(args.compare).name,
         )
 
 
