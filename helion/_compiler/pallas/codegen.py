@@ -40,6 +40,16 @@ def load_expr(
         result = expr_from_string(f"{name}[{idx_str}] * ({mask_expr})")
     else:
         result = expr_from_string(f"{name}[{idx_str}]")
+    # Jagged-flat tensors: the VMEM scratch is 2-D ``(BK, BM)`` but the
+    # user-source load result is 3-D ``(BB=1, BK, BM)`` because the
+    # ``flat`` index was rank-expanded.  Add the leading dim via
+    # expand_dims (pl.ref doesn't accept ``[None, :]`` directly).
+    from helion._compiler.pallas.plan_tiling import TensorIndexPattern as _TIP
+
+    if any(isinstance(p, _TIP) and p.is_jagged_flat for p in patterns):
+        result = expr_from_string(
+            "jnp.expand_dims({result}, axis=0)", result=result
+        )
     for dim in none_dims:
         result = expr_from_string(
             f"jnp.expand_dims({{result}}, axis={dim})", result=result
@@ -378,8 +388,10 @@ def _generated_index_code(
         # The DMA-in/out for jagged-flat tensors injects the per-item base
         # offset (``starts[pid_0]``) at the slice level (see
         # ``_build_hbm_dma_slice``), so normal load/store codegen reads the
-        # whole VMEM scratch via ``:``.  The chunk_mask emitted by
-        # ``_setup_mask`` zeros K-padded positions.
+        # whole VMEM scratch via ``:``.  The user-source load result has a
+        # leading BB=1 dim (from the rank-expanded ``flat`` index tensor) —
+        # ``load_expr`` wraps with ``jnp.expand_dims(..., axis=0)`` for
+        # jagged-flat patterns.
         return ":"
 
     raise RuntimeError(

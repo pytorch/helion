@@ -315,6 +315,7 @@ def _(state: CodegenState) -> None:
     subscript = state.proxy_arg(1)
     assert isinstance(subscript, (list, tuple))
     value = state.ast_arg(2)
+    value_proxy = state.proxy_arg(2)
     assert isinstance(tensor, torch.Tensor)
     name = state.device_function.tensor_arg(tensor).name
     name = pallas_codegen.vmem_name(state, name)
@@ -330,6 +331,7 @@ def _(state: CodegenState) -> None:
     patterns = state.fx_node.meta.get("indexing_patterns") if state.fx_node else ()
     from .._compiler.pallas.gather import emit_scatter_store
     from .._compiler.pallas.plan_tiling import IndirectScatterPattern
+    from .._compiler.pallas.plan_tiling import TilePattern
 
     scatter_patterns = [
         pattern
@@ -343,6 +345,45 @@ def _(state: CodegenState) -> None:
         value = emit_scatter_store(
             state, scatter_patterns[0].plan, name, idx_str, value
         )
+    # Apply mask for any TilePattern dim whose tile has a ``mask_<bid>`` in
+    # scope — primarily M-jagged ``hl.jagged_tile`` (V1: jagged_mean), where
+    # writes past ``feature_counts[item]`` would otherwise dump garbage into
+    # padded positions.  Mirrors the load-side ``_mask_to`` mechanism: pull
+    # masks per dim, combine multiplicatively, wrap the store as
+    # ``where(mask, value, name[idx])`` so out-of-tile positions preserve
+    # whatever is currently in the VMEM scratch.  Falls through silently
+    # when no masks are in scope (non-jagged path).
+    if isinstance(value_proxy, torch.Tensor):
+        from .._compiler.compile_environment import CompileEnvironment
+
+        env = CompileEnvironment.current()
+        value_sizes = [*value_proxy.size()]
+        mask_exprs: list[str] = []
+        out_dim = 0
+        for idx, pattern in zip(subscript, patterns or (), strict=False):
+            if idx is None:
+                out_dim += 1
+                continue
+            if isinstance(pattern, TilePattern):
+                mask_var = state.codegen.mask_var(pattern.block_id)
+                if mask_var is not None:
+                    if env.is_jagged_tile(pattern.block_id):
+                        mask_shape = env.jagged_tile_mask_shapes[pattern.block_id]
+                        expand = state.tile_strategy.jagged_tile_expand_str(
+                            mask_shape, value_sizes
+                        )
+                    else:
+                        expand = state.tile_strategy.expand_str(value_sizes, out_dim)
+                    expr = f"({mask_var}.astype(jnp.float32){expand})"
+                    if expr not in mask_exprs:
+                        mask_exprs.append(expr)
+            out_dim += 1
+        if mask_exprs:
+            mask_expr = " * ".join(mask_exprs)
+            value = expr_from_string(
+                f"jnp.where(({mask_expr}).astype(jnp.bool_), {{value}}, {name}[{idx_str}])",
+                value=value,
+            )
     state.codegen.add_statement(
         statement_from_string(f"{name}[{idx_str}] = {{value}}", value=value)
     )
@@ -6592,7 +6633,41 @@ def _(state: CodegenState) -> object:
 
 
 @_decorators.get_masked_value(load)
-def _(node: torch.fx.Node) -> int:
+def _(node: torch.fx.Node) -> int | None:
+    # Triton-style loads zero-mask OOB by default (``tl.load`` returns 0 for
+    # masked positions), so ``_mask_to(load, 0)`` is redundant and gets
+    # removed by ``remove_unnecessary_masking``.
+    #
+    # On the Pallas backend, jagged-flat loads (``hl.load(x_flat, [flat])``
+    # where the subscript matches ``(starts + tile_k.idx) * M + tile_m.idx``)
+    # DO NOT have implicit masking — they DMA HBM→VMEM and the VMEM scratch
+    # contains whatever bytes the (possibly OOB) DMA copied.  Returning
+    # ``None`` keeps the ``_mask_to`` node alive so the reduction's mask
+    # actually fires.  Once preserved, the Pallas ``_mask_to`` codegen is
+    # already dim-agnostic — it walks each tensor dim, resolves it to a
+    # block_id, and applies whichever ``mask_<bid>`` is in scope.  Both
+    # K-jagged (mask_<tile_k.bid>) and M-jagged (mask_<tile_m.bid>) get
+    # picked up by the same loop; this gate only decides whether to keep
+    # the node alive long enough for that to run.
+    #
+    # ``remove_unnecessary_masking`` runs before plan_tiling, so we can't
+    # inspect ``node.meta["indexing_patterns"]`` for ``is_jagged_flat``.
+    # Conservative test: Pallas backend + tensor-valued subscript +
+    # kernel has any registered jagged_tile.  This is over-conservative
+    # for ``IndirectGatherPattern`` loads in jagged kernels, but those
+    # lower to a one-hot dot product that zeros OOB rows anyway, so the
+    # surviving ``_mask_to(*, 0)`` is a no-op there.
+    from .._compiler.compile_environment import CompileEnvironment
+
+    env = CompileEnvironment.current()
+    if env.backend.name == "pallas" and env.jagged_tile_parent_ids:
+        subscript = node.args[1]
+        if isinstance(subscript, (list, tuple)):
+            for idx in subscript:
+                if isinstance(idx, torch.fx.Node):
+                    val = idx.meta.get("val")
+                    if isinstance(val, torch.Tensor):
+                        return None
     return 0  # loads are always masked to 0
 
 
