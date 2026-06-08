@@ -1621,15 +1621,11 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
             f"pipeline_mode=pl.Buffered(buffer_count=2))"
         )
 
-    def _make_load_block_spec(
-        fake: torch.Tensor, subscript_meta: list[object]
-    ) -> str:
+    def _make_load_block_spec(fake: torch.Tensor, subscript_meta: list[object]) -> str:
         """BlockSpec for a pipelined input (full-block ``pl.ds``; mask zeroes over-read)."""
         return _make_block_spec(fake, subscript_meta, is_store=False)
 
-    def _make_store_block_spec(
-        fake: torch.Tensor, subscript_meta: list[object]
-    ) -> str:
+    def _make_store_block_spec(fake: torch.Tensor, subscript_meta: list[object]) -> str:
         """BlockSpec for a pipelined output (clamped ``pl.ds`` extent on dynamic bounds)."""
         return _make_block_spec(fake, subscript_meta, is_store=True)
 

@@ -324,9 +324,7 @@ def pallas_inner_loop_add_with_scalar_access(
 
 
 @helion.kernel(backend="pallas", static_shapes=True)
-def pallas_jagged_segment_add(
-    x: torch.Tensor, offsets: torch.Tensor
-) -> torch.Tensor:
+def pallas_jagged_segment_add(x: torch.Tensor, offsets: torch.Tensor) -> torch.Tensor:
     """Outer grid over jagged segments + an inner ``hl.tile(start, end)`` loop
     whose begin (``offsets[g]``) is an arbitrary runtime offset. A
     block-aligned BlockSpec index can only address starts that are multiples of
