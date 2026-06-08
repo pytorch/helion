@@ -372,6 +372,16 @@ def _generated_index_code(
         # resident target axis instead of indexing it a second time.
         return ":"
 
+    from helion._compiler.pallas.plan_tiling import TensorIndexPattern
+
+    if isinstance(pattern, TensorIndexPattern) and pattern.is_jagged_flat:
+        # The DMA-in/out for jagged-flat tensors injects the per-item base
+        # offset (``starts[pid_0]``) at the slice level (see
+        # ``_build_hbm_dma_slice``), so normal load/store codegen reads the
+        # whole VMEM scratch via ``:``.  The chunk_mask emitted by
+        # ``_setup_mask`` zeros K-padded positions.
+        return ":"
+
     raise RuntimeError(
         f"Unhandled indexing pattern type: {type(pattern).__name__}. "
         f"Pattern: {pattern}, idx: {idx}, subscript_index: {subscript_index}. "

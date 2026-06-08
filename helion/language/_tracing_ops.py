@@ -1890,6 +1890,41 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
     return None
 
 
+def _build_jagged_flat_pattern_map(
+    graph_info: object,
+) -> dict[int, object]:
+    """Map ``id(fake_tensor)`` to its ``TensorIndexPattern`` (the one with
+    ``is_jagged_flat=True``) by walking the loop body's load/store nodes.
+
+    Used by ``_compute_vmem_shapes`` and ``_build_hbm_dma_slice`` to swap
+    the default 1-D scratch/whole-tensor slice for the canonical 2-D
+    jagged DMA path on tensors whose subscript matches the
+    ``x_flat[(starts + tile_k.idx) * M + tile_m.idx]`` form.
+    """
+    from .._compiler.pallas.plan_tiling import TensorIndexPattern
+    from .memory_ops import load as _load_op
+    from .memory_ops import store as _store_op
+
+    result: dict[int, object] = {}
+    graph = getattr(graph_info, "graph", None)
+    if graph is None:
+        return result
+    for node in graph.nodes:
+        if node.op != "call_function" or node.target not in (_load_op, _store_op):
+            continue
+        tensor_node = node.args[0]
+        if not isinstance(tensor_node, torch.fx.Node):
+            continue
+        val = tensor_node.meta.get("val")
+        if not isinstance(val, torch.Tensor):
+            continue
+        for p in node.meta.get("indexing_patterns", []) or []:
+            if isinstance(p, TensorIndexPattern) and p.is_jagged_flat:
+                result[id(val)] = p
+                break
+    return result
+
+
 def _check_dma_alignment(vmem_shape: tuple[int, ...]) -> bool:
     """Check if a VMEM buffer shape satisfies TPU DMA alignment.
 
@@ -1916,10 +1951,23 @@ def _compute_vmem_shapes(
     slice_size_exprs: list[str],
     env: CompileEnvironment,
     state: CodegenState,
+    jagged_flat_patterns: dict[int, object] | None = None,
 ) -> list[tuple[int, ...]]:
     """Compute VMEM buffer shapes for each tensor in the fori_loop body."""
     vmem_shapes: list[tuple[int, ...]] = []
     for fake, sub_meta, _direction in all_tensor_info:
+        # Jagged-flat tensors are 1-D at the FX level (user wrote
+        # ``x_data.view(-1)``), but the launcher reshapes them to 2-D
+        # ``(total_K, M)`` before pl.pallas_call, and the per-iter DMA
+        # chunk is the (BK, BM) sublane×lane block — not the whole 1-D
+        # tensor that ``_get_dim_block_ids`` would default to.
+        jpat = (jagged_flat_patterns or {}).get(id(fake))
+        if jpat is not None:
+            sublane_bs = state.device_function.resolved_block_size(jpat.sublane_bid)
+            lane_bs = state.device_function.resolved_block_size(jpat.lane_bid)
+            assert isinstance(sublane_bs, int) and isinstance(lane_bs, int)
+            vmem_shapes.append((sublane_bs, lane_bs))
+            continue
         dim_to_bid = _get_dim_block_ids(sub_meta, env)
         parts: list[int] = []
         for dim_idx in range(len(fake.shape)):
@@ -1960,6 +2008,7 @@ def _classify_pipelined_tensors(
     slice_size_exprs: list[str],
     env: CompileEnvironment,
     state: CodegenState,
+    jagged_flat_patterns: dict[int, object] | None = None,
 ) -> tuple[
     list[tuple[torch.Tensor, list[object], str]], list[tuple[int, ...]], set[int]
 ]:
@@ -1995,7 +2044,7 @@ def _classify_pipelined_tensors(
     for fake, _tensor_node, sub_meta in stored_tensors.values():
         all_tensor_info.append((fake, sub_meta, "store"))
     vmem_shapes = _compute_vmem_shapes(
-        all_tensor_info, block_ids, slice_size_exprs, env, state
+        all_tensor_info, block_ids, slice_size_exprs, env, state, jagged_flat_patterns
     )
     device_ir = HostFunction.current().device_ir
 
@@ -2095,8 +2144,15 @@ def _codegen_fori_loop(state: CodegenState) -> object:
     # avoids forcing every tensor onto the non-DMA path when a lone
     # non-pipelined tensor is present (which would load full outer-block
     # tiles into VMEM and may OOM at large shapes).
+    jagged_flat_patterns = _build_jagged_flat_pattern_map(graph_info)
     all_tensor_info, vmem_shapes, pipelined_tensor_ids = _classify_pipelined_tensors(
-        loaded_tensors, stored_tensors, block_ids, slice_size_exprs, env, state
+        loaded_tensors,
+        stored_tensors,
+        block_ids,
+        slice_size_exprs,
+        env,
+        state,
+        jagged_flat_patterns,
     )
 
     from .._compiler.device_function import PallasMemorySpace
@@ -2191,6 +2247,44 @@ def _codegen_fori_loop(state: CodegenState) -> object:
         fake: torch.Tensor, hbm_name: str, subscript_meta: list[object]
     ) -> str:
         """Build an HBM ref slicing expression for DMA with loop variable."""
+        # Jagged-flat tensors: the host launcher reshapes the 1-D ``x_flat``
+        # to 2-D ``(total_K, M)``, and we emit a 2-D slice that injects the
+        # per-item base ``starts[pid_0]`` into the sublane (K) offset:
+        #   x_flat.at[pl.ds(starts[0] + k_offset, BK), pl.ds(m_offset, BM)]
+        jpat = jagged_flat_patterns.get(id(fake))
+        if jpat is not None:
+            slice_parts: list[str] = []
+            for axis_bid in (jpat.sublane_bid, jpat.lane_bid):
+                bs_var = state.device_function.block_size_var(axis_bid)
+                assert bs_var is not None
+                if axis_bid in block_ids:
+                    ax_idx = block_ids.index(axis_bid)
+                    begin_expr = begin_exprs[ax_idx]
+                    iter_step_expr = iter_step_exprs[ax_idx]
+                    dim_idx_expr = dim_idx_exprs[ax_idx]
+                    axis_offset = (
+                        f"({begin_expr}) + ({dim_idx_expr}) * ({iter_step_expr})"
+                    )
+                else:
+                    axis_offset = state.codegen.offset_var(axis_bid)
+                if axis_bid == jpat.sublane_bid:
+                    # Resolve sublane_base_fx (an inner-graph placeholder)
+                    # back to its outer-scope emit-time name.  The body
+                    # graph's placeholders correspond positionally to the
+                    # outer for_loop's args[3], whose AST is in
+                    # ``state.ast_args[-1]`` (= ``args`` here).
+                    placeholders = [
+                        n for n in graph_info.graph.nodes if n.op == "placeholder"
+                    ]
+                    if jpat.sublane_base_fx in placeholders:
+                        outer_ast = args[placeholders.index(jpat.sublane_base_fx)]
+                        starts_name = ast.unparse(outer_ast)
+                    else:
+                        starts_name = jpat.sublane_base_fx.name
+                    axis_offset = f"{starts_name}[0] + ({axis_offset})"
+                slice_parts.append(f"pl.ds({axis_offset}, {bs_var})")
+            return f"{hbm_name}.at[{', '.join(slice_parts)}]"
+
         dim_to_bid = _get_dim_block_ids(subscript_meta, env)
         shape = fake.shape
         parts: list[str] = []
