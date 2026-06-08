@@ -317,8 +317,28 @@ def _(state: CodegenState) -> None:
     value = state.ast_arg(2)
     value_proxy = state.proxy_arg(2)
     assert isinstance(tensor, torch.Tensor)
-    name = state.device_function.tensor_arg(tensor).name
-    name = pallas_codegen.vmem_name(state, name)
+    hbm_name = state.device_function.tensor_arg(tensor).name
+    name = pallas_codegen.vmem_name(state, hbm_name)
+    # Case 3/4 NotImplementedError: a store of an HBM-marked tensor at the
+    # root graph (no inner fori_loop pipelines it) would emit
+    # ``out[...] = value`` against an HBM ref, which TPU rejects — HBM refs
+    # only support DMA, not direct indexed writes.  This is the case 3/4
+    # "user wrote acc at tile_b scope" path that needs ``make_async_copy``
+    # emitted at tile_b's epilogue.  None of the V1 jagged kernels reach
+    # this; raise loudly until that lift work is implemented (tracked by
+    # the case 3/4 tile_b epilogue follow-up task).
+    from .._compiler.device_function import PallasMemorySpace
+
+    mem_space = state.device_function.pallas_memory_space.get(id(tensor))
+    if mem_space == PallasMemorySpace.HBM and name == hbm_name:
+        raise NotImplementedError(
+            "Pallas: store of HBM-marked tensor at root scope (case 3/4 of "
+            "the jagged DMA-out promotion table) is not implemented — "
+            "no V1 jagged kernel hits this. The proper fix is to emit "
+            "``pltpu.make_async_copy(out_scratch, hbm_ref.at[...])`` at "
+            "tile_b's epilogue; the bare ``name[idx] = value`` we'd emit "
+            "here writes directly to an HBM ref, which the TPU rejects."
+        )
     # Increment memory op index to stay in sync with triton backend
     device_fn = state.device_function
     device_fn.device_store_index += 1
@@ -331,6 +351,7 @@ def _(state: CodegenState) -> None:
     patterns = state.fx_node.meta.get("indexing_patterns") if state.fx_node else ()
     from .._compiler.pallas.gather import emit_scatter_store
     from .._compiler.pallas.plan_tiling import IndirectScatterPattern
+    from .._compiler.pallas.plan_tiling import TensorIndexPattern
     from .._compiler.pallas.plan_tiling import TilePattern
 
     scatter_patterns = [
@@ -345,11 +366,12 @@ def _(state: CodegenState) -> None:
         value = emit_scatter_store(
             state, scatter_patterns[0].plan, name, idx_str, value
         )
-    # Apply mask for any TilePattern dim whose tile has a ``mask_<bid>`` in
-    # scope — primarily M-jagged ``hl.jagged_tile`` (V1: jagged_mean), where
-    # writes past ``feature_counts[item]`` would otherwise dump garbage into
-    # padded positions.  Mirrors the load-side ``_mask_to`` mechanism: pull
-    # masks per dim, combine multiplicatively, wrap the store as
+    # Apply mask for any subscript dim whose tile has a ``mask_<bid>`` in
+    # scope — TilePattern handles jagged_tile lane/sublane (V1: jagged_mean
+    # M-axis), TensorIndexPattern.is_jagged_flat handles the canonical
+    # jagged-flat subscript (V1: jagged_softmax/jagged_layer_norm output).
+    # Mirrors the load-side ``_mask_to`` mechanism: pull masks per dim,
+    # combine multiplicatively, wrap the store as
     # ``where(mask, value, name[idx])`` so out-of-tile positions preserve
     # whatever is currently in the VMEM scratch.  Falls through silently
     # when no masks are in scope (non-jagged path).
@@ -357,33 +379,97 @@ def _(state: CodegenState) -> None:
         from .._compiler.compile_environment import CompileEnvironment
 
         env = CompileEnvironment.current()
+        jagged_flat_pattern: TensorIndexPattern | None = None
+        for p in patterns or ():
+            if isinstance(p, TensorIndexPattern) and p.is_jagged_flat:
+                jagged_flat_pattern = p
+                break
+        # Mask application uses the FX-level value shape (matches the
+        # ``flat`` index tensor's rank for jagged-flat stores).  For
+        # jagged-flat that's 3-D ``(BB=1, BK, BM)``; for TilePattern
+        # subscripts it's the tile shape.  After masking we squeeze the
+        # leading BB dim off jagged-flat values so they fit the 2-D
+        # ``(BK, BM)`` VMEM scratch shape produced by
+        # ``_compute_vmem_shapes``.
         value_sizes = [*value_proxy.size()]
         mask_exprs: list[str] = []
-        out_dim = 0
-        for idx, pattern in zip(subscript, patterns or (), strict=False):
-            if idx is None:
-                out_dim += 1
-                continue
-            if isinstance(pattern, TilePattern):
-                mask_var = state.codegen.mask_var(pattern.block_id)
-                if mask_var is not None:
-                    if env.is_jagged_tile(pattern.block_id):
+        if jagged_flat_pattern is not None:
+            # Apply masks for sublane/lane bids — the jagged-flat
+            # pattern's single subscript element represents both axes.
+            for axis_bid in (
+                jagged_flat_pattern.sublane_bid,
+                jagged_flat_pattern.lane_bid,
+            ):
+                if axis_bid is None:
+                    continue
+                mask_var = state.codegen.mask_var(axis_bid)
+                if mask_var is None:
+                    continue
+                if env.is_jagged_tile(axis_bid):
+                    mask_shape = env.jagged_tile_mask_shapes[axis_bid]
+                    expand = state.tile_strategy.jagged_tile_expand_str(
+                        mask_shape, value_sizes
+                    )
+                else:
+                    # Bare TilePattern-style expand based on the axis position
+                    # in value_sizes (jagged-flat output is BB, BK, BM —
+                    # sublane at 1, lane at 2).
+                    axis_pos = (
+                        1 if axis_bid == jagged_flat_pattern.sublane_bid else 2
+                    )
+                    expand = state.tile_strategy.expand_str(value_sizes, axis_pos)
+                expr = f"({mask_var}.astype(jnp.float32){expand})"
+                if expr not in mask_exprs:
+                    mask_exprs.append(expr)
+        else:
+            # Only fire the store mask for jagged tiles.  For non-jagged
+            # cases ``_setup_mask`` also emits ``mask_<bid>`` when block_size
+            # doesn't divide dim_size, but ``sliced_value_for_store`` has
+            # already clipped the value to dim_size in that path — re-masking
+            # would broadcast a (block_size,) mask against a (dim_size,)
+            # value and break.  The non-jagged unaligned case is handled by
+            # host-side padding (``_ds_pad_dims``) + host-side truncation, so
+            # the kernel never needs to mask.
+            out_dim = 0
+            for idx, pattern in zip(subscript, patterns or (), strict=False):
+                if idx is None:
+                    out_dim += 1
+                    continue
+                if isinstance(pattern, TilePattern) and env.is_jagged_tile(
+                    pattern.block_id
+                ):
+                    mask_var = state.codegen.mask_var(pattern.block_id)
+                    if mask_var is not None:
                         mask_shape = env.jagged_tile_mask_shapes[pattern.block_id]
                         expand = state.tile_strategy.jagged_tile_expand_str(
                             mask_shape, value_sizes
                         )
-                    else:
-                        expand = state.tile_strategy.expand_str(value_sizes, out_dim)
-                    expr = f"({mask_var}.astype(jnp.float32){expand})"
-                    if expr not in mask_exprs:
-                        mask_exprs.append(expr)
-            out_dim += 1
+                        expr = f"({mask_var}.astype(jnp.float32){expand})"
+                        if expr not in mask_exprs:
+                            mask_exprs.append(expr)
+                out_dim += 1
         if mask_exprs:
             mask_expr = " * ".join(mask_exprs)
-            value = expr_from_string(
-                f"jnp.where(({mask_expr}).astype(jnp.bool_), {{value}}, {name}[{idx_str}])",
-                value=value,
-            )
+            # For jagged-flat the ``where``'s fallback (``name[idx_str]`` is
+            # the post-squeeze 2-D scratch read) is shape-incompatible with
+            # the pre-squeeze 3-D value.  Use a 0 fallback there since the
+            # store is followed by a DMA that ships only the valid region.
+            if jagged_flat_pattern is not None:
+                value = expr_from_string(
+                    f"jnp.where(({mask_expr}).astype(jnp.bool_), {{value}}, "
+                    f"jnp.zeros_like({{value}}))",
+                    value=value,
+                )
+            else:
+                value = expr_from_string(
+                    f"jnp.where(({mask_expr}).astype(jnp.bool_), {{value}}, "
+                    f"{name}[{idx_str}])",
+                    value=value,
+                )
+        # Squeeze the leading BB=1 dim off the 3-D jagged-flat value so it
+        # writes cleanly into the 2-D ``(BK, BM)`` VMEM scratch.
+        if jagged_flat_pattern is not None and value_proxy.dim() >= 3:
+            value = expr_from_string("jnp.squeeze({value}, axis=0)", value=value)
     state.codegen.add_statement(
         statement_from_string(f"{name}[{idx_str}] = {{value}}", value=value)
     )
