@@ -283,5 +283,39 @@ class TestPallasJaggedCarry(TestCase):
         )
         torch.testing.assert_close(out, a @ b)
 
+    # Dynamic shapes.
+
+    @xfailIfPallasInterpret(_XFAIL_INTERPRET)
+    def test_dynamic_rows_specialized_cols(self) -> None:
+        # static_shapes=False with the feature dim specialized: the carry compiles
+        # once for any row / group count.  The launcher grid becomes (B,) instead
+        # of a baked constant; the column dim stays static for the VMEM scratch.
+        @helion.kernel(backend="pallas", static_shapes=False)
+        def jagged_scale_dyn(
+            seq_offsets: torch.Tensor, jagged: torch.Tensor
+        ) -> torch.Tensor:
+            L, D = jagged.shape
+            D = hl.specialize(D)
+            B = seq_offsets.shape[0] - 1
+            out = torch.empty((L, D), dtype=jagged.dtype, device=jagged.device)
+            for g in hl.grid(B):
+                s = seq_offsets[g]
+                e = seq_offsets[g + 1]
+                for st in hl.tile(s, e):
+                    for dt in hl.tile(0, D):
+                        out[st, dt] = jagged[st, dt] * 2.0
+            return out
+
+        off = torch.tensor([0, 13, 25], dtype=torch.int32, device=DEVICE)
+        j = torch.randn((25, 128), dtype=torch.bfloat16, device=DEVICE)
+        code, out = code_and_output(
+            jagged_scale_dyn,
+            (off, j),
+            block_sizes=[16, 128],
+            pallas_loop_type="emit_pipeline",
+        )
+        self.assertIn("(B,)", code)  # grid is the runtime group count, not baked
+        torch.testing.assert_close(out, j * 2)
+
 
 instantiate_parametrized_tests(TestPallasJaggedCarry)
