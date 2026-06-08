@@ -458,6 +458,8 @@ class TestAutotuneIgnoreErrors(TestCase):
         self.assertEqual(
             rows[0],
             [
+                "kernel_id",
+                "sample_id",
                 "timestamp_s",
                 "config_index",
                 "generation",
@@ -467,10 +469,13 @@ class TestAutotuneIgnoreErrors(TestCase):
                 "config",
             ],
         )
-        self.assertEqual(rows[1][1], "1")
-        self.assertEqual(rows[1][2], "5")
-        self.assertEqual(rows[1][3], "ok")
-        self.assertEqual(rows[1][4], "1.234000")
+        # No metadata/sample_id supplied here, so the identity columns are empty.
+        self.assertEqual(rows[1][0], "")
+        self.assertEqual(rows[1][1], "")
+        self.assertEqual(rows[1][3], "1")
+        self.assertEqual(rows[1][4], "5")
+        self.assertEqual(rows[1][5], "ok")
+        self.assertEqual(rows[1][6], "1.234000")
         log_text = log_path.read_text()
         self.assertIn("finalized entry", log_text)
 
@@ -706,7 +711,8 @@ class TestAutotuneIgnoreErrors(TestCase):
         csv_path = base_path.with_suffix(".csv")
         self.assertTrue(csv_path.exists())
         rows = list(csv.reader(csv_path.read_text().splitlines()))
-        statuses = [row[3] for row in rows[1:]]  # skip header
+        status_idx = rows[0].index("status")  # look up by name; column order may change
+        statuses = [row[status_idx] for row in rows[1:]]  # skip header
         started_count = sum(1 for s in statuses if s == "started")
         completed_count = sum(1 for s in statuses if s in ("ok", "error", "timeout"))
         self.assertGreater(started_count, 0, "Should log started entries")
@@ -3913,6 +3919,7 @@ class TestAutotuneBudget(TestCase):
             num_compile_failures=0,
             num_accuracy_failures=0,
             num_generations=0,
+            kernel_source="",
         )
         provider.mutated_arg_indices = ()
         provider._benchmark_worker = None
