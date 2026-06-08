@@ -313,6 +313,7 @@ class AutotuneLogSink:
         self._csv_writer = csv.writer(self._csv_file)
         self._csv_writer.writerow(
             [
+                "kernel_id",
                 "timestamp_s",
                 "config_index",
                 "generation",
@@ -362,8 +363,12 @@ class AutotuneLogSink:
         compile_field = ""
         if entry.compile_time is not None:
             compile_field = f"{entry.compile_time:.2f}"
+        # kernel_id is the foreign key joining each row back to the kernel
+        # identity stored once in the .meta.json sidecar.
+        kernel_id = self._metadata.kernel_id if self._metadata is not None else ""
         self._csv_writer.writerow(
             [
+                kernel_id,
                 timestamp_field,
                 self._config_counter,
                 entry.generation,

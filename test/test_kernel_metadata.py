@@ -165,15 +165,21 @@ class TestAutotuneLogSink(TestCase):
 
             # Sidecar holds the kernel identity (stored once).
             sidecar = json.loads(sink.meta_path.read_text(encoding="utf-8"))
+            self.assertEqual(sidecar["kernel_id"], "abc123")
             self.assertEqual(sidecar["kernel_name"], "_add_kernel")
             self.assertIn("def _add_kernel", sidecar["kernel_source"])
 
             # Per-config CSV holds one row per benchmarked config + its result.
             with sink.csv_path.open(encoding="utf-8", newline="") as f:
                 rows = list(csv.reader(f))
-            self.assertEqual(rows[0][:1], ["timestamp_s"])
+            header = rows[0]
+            self.assertEqual(header[0], "kernel_id")
+            self.assertIn("timestamp_s", header)
             data_rows = rows[1:]
             self.assertEqual(len(data_rows), 2)
+            # kernel_id foreign key is stamped on every row, matching the sidecar.
+            kid_col = header.index("kernel_id")
+            self.assertTrue(all(row[kid_col] == "abc123" for row in data_rows))
 
     def test_sink_without_metadata_writes_no_sidecar(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
