@@ -2015,11 +2015,15 @@ def _classify_pipelined_tensors(
             if isinstance(val, torch.Tensor):
                 outer_access_tensor_ids.add(id(val))
 
+    from .._compiler.device_function import PallasMemorySpace
+
     pipelined_ids: set[int] = set()
+    mem_space = state.device_function.pallas_memory_space
     for (fake, _sub_meta, _direction), vmem_shape in zip(
         all_tensor_info, vmem_shapes, strict=True
     ):
-        if not _check_dma_alignment(vmem_shape):
+        is_hbm_marked = mem_space.get(id(fake)) == PallasMemorySpace.HBM
+        if not is_hbm_marked and not _check_dma_alignment(vmem_shape):
             continue
         if id(fake) in outer_access_tensor_ids:
             continue
