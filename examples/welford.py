@@ -49,18 +49,13 @@ def welford(
 
         for tile_n in hl.tile(n):
             chunk = x[tile_m, tile_n]
-            # Count of VALID columns in this tile. Helion masks out-of-bounds
-            # loads with other=0, so sum_x/sum_x2 are already correct over the
-            # valid columns; the per-chunk count/mean/M2 must divide by the TRUE
-            # valid count, NOT the constexpr tile width chunk.size(-1) (which
-            # over-counts the padding on the last tile when block_size does not
-            # divide n -> wrong mean/M2/count at non-divisor N). `tile_n.index`
-            # is the canonical Helion masked-index idiom (tile_interface.index).
-            # Cast the bool mask to int32 BEFORE summing: the CuTe backend derives
-            # the reduction accumulator dtype from the operand, and a bool operand
-            # yields a saturating boolean accumulator (Tn collapses to 1, not the
-            # true count -> wrong mean -> negative variance -> NaN). The explicit
-            # int32 cast forces an integer accumulator on every backend.
+            # Count of VALID columns. OOB loads are masked to 0, so sum_x/sum_x2 are
+            # already correct; only the divisor must use the true valid count, NOT the
+            # constexpr tile width chunk.size(-1) (over-counts last-tile padding at
+            # non-divisor N -> wrong mean/M2/count). Cast the mask to int32 BEFORE
+            # summing: a bool operand gives CuTe a saturating boolean accumulator (Tn
+            # collapses to 1 -> negative variance -> NaN); the cast forces an integer
+            # accumulator on every backend, not just CuTe.
             Tn = (tile_n.index < n).to(torch.int32).sum()
             sum_x = torch.sum(chunk, dim=-1)
             sum_x2 = torch.sum(chunk * chunk, dim=-1)
