@@ -4,6 +4,7 @@ import csv
 import hashlib
 import json
 import tempfile
+import types
 import unittest
 
 import torch
@@ -101,6 +102,35 @@ class TestKernelIdentity(TestCase):
         self.assertEqual(_probe_static.kernel_source(), _probe_dynamic.kernel_source())
         self.assertNotEqual(_probe_static.kernel_id(), _probe_dynamic.kernel_id())
 
+    def test_kernel_id_independent_of_config(self) -> None:
+        """
+        kernel_id must NOT depend on the (autotunable) config: the same source
+        and settings under different configs share one id, so it stays constant
+        across the configs benchmarked in a run and can group their rows.
+        """
+        k16 = helion.kernel(_probe_kernel, config=helion.Config(block_sizes=[16]))
+        k32 = helion.kernel(_probe_kernel, config=helion.Config(block_sizes=[32]))
+        self.assertEqual(k16.kernel_id(), k32.kernel_id())
+
+    def test_dynamic_source_raises_oserror(self) -> None:
+        """
+        kernel_source/kernel_id raise OSError (and nothing broader) when the
+        source cannot be located, e.g. a function defined dynamically. This is
+        the contract the narrowed ``except OSError`` in the autotuner relies on.
+        """
+        namespace: dict[str, object] = {}
+        exec(
+            compile("def _dynamic(x, y):\n    return x\n", "<dynamic>", "exec"),
+            namespace,
+        )
+        fn = namespace["_dynamic"]
+        assert isinstance(fn, types.FunctionType)
+        dynamic = helion.kernel(fn, config=helion.Config(block_sizes=[16]))
+        with self.assertRaises(OSError):
+            dynamic.kernel_source()
+        with self.assertRaises(OSError):
+            dynamic.kernel_id()
+
 
 class TestMetadataSchema(TestCase):
     def test_autotune_metrics_to_dict_has_kernel_fields(self) -> None:
@@ -131,6 +161,29 @@ class TestMetadataSchema(TestCase):
         self.assertEqual(record["kernel_source"], "def k(): ...")
         # Must be JSON serializable for the sidecar file.
         json.dumps(record)
+
+    def test_default_metadata_has_empty_identity(self) -> None:
+        """
+        Default KernelMetadata carries an empty identity and still serializes,
+        so a sidecar can be written even when the kernel is unidentifiable.
+        """
+        record = KernelMetadata().to_dict()
+        self.assertEqual(record["kernel_id"], "")
+        self.assertEqual(record["kernel_source"], "")
+        json.dumps(record)
+
+    def test_log_entry_defaults_to_empty_sample_id(self) -> None:
+        """
+        sample_id is optional on AutotuneLogEntry and defaults to empty.
+        """
+        entry = AutotuneLogEntry(
+            generation=0,
+            status="ok",
+            perf_ms=1.0,
+            compile_time=0.1,
+            config=helion.Config(block_sizes=[16]),
+        )
+        self.assertEqual(entry.sample_id, "")
 
 
 class TestAutotuneLogSink(TestCase):
@@ -193,6 +246,35 @@ class TestAutotuneLogSink(TestCase):
                 sink.record(self._entry(0.1))
                 sink.end_run()
             self.assertFalse(sink.meta_path.exists())
+
+    def test_sink_without_metadata_rows_have_empty_kernel_id(self) -> None:
+        """
+        Without metadata the CSV still has the kernel_id column, but the
+        foreign key is empty on every row (no kernel identity to attach).
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            base = f"{tmp}/run"
+            with AutotuneLogSink(base) as sink:
+                sink.start_run()
+                sink.record(self._entry(0.1))
+                sink.end_run()
+            with sink.csv_path.open(encoding="utf-8", newline="") as f:
+                rows = list(csv.reader(f))
+            header = rows[0]
+            self.assertEqual(header[0], "kernel_id")
+            kid_col = header.index("kernel_id")
+            self.assertTrue(all(row[kid_col] == "" for row in rows[1:]))
+
+    def test_record_before_open_is_noop(self) -> None:
+        """
+        Recording on a sink that was never opened writes nothing and does not
+        create the CSV file (guards against lifecycle ordering bugs).
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            base = f"{tmp}/run"
+            sink = AutotuneLogSink(base)  # not opened
+            sink.record(self._entry(0.1))
+            self.assertFalse(sink.csv_path.exists())
 
 
 if __name__ == "__main__":
