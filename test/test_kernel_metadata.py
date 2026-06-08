@@ -51,15 +51,6 @@ def _probe_kernel(x: torch.Tensor) -> torch.Tensor:
     return out
 
 
-# Same source, different code-generation settings -> different kernel_id.
-_probe_static = helion.kernel(
-    _probe_kernel, config=helion.Config(block_sizes=[16]), static_shapes=True
-)
-_probe_dynamic = helion.kernel(
-    _probe_kernel, config=helion.Config(block_sizes=[16]), static_shapes=False
-)
-
-
 class TestKernelIdentity(TestCase):
     def test_kernel_source_stable_and_distinct(self) -> None:
         """
@@ -99,6 +90,13 @@ class TestKernelIdentity(TestCase):
         """
         Identical source under different codegen settings yields different ids.
         """
+        # Same source, different code-generation settings -> different kernel_id.
+        _probe_static = helion.kernel(
+            _probe_kernel, config=helion.Config(block_sizes=[16]), static_shapes=True
+        )
+        _probe_dynamic = helion.kernel(
+            _probe_kernel, config=helion.Config(block_sizes=[16]), static_shapes=False
+        )
         self.assertEqual(_probe_static.kernel_source(), _probe_dynamic.kernel_source())
         self.assertNotEqual(_probe_static.kernel_id(), _probe_dynamic.kernel_id())
 
@@ -189,7 +187,10 @@ class TestMetadataSchema(TestCase):
 class TestAutotuneLogSink(TestCase):
     def _entry(self, perf_ms: float, sample_id: str = "sample-xyz") -> AutotuneLogEntry:
         """
-        Create fake log entry for testing.
+        Build a minimal AutotuneLogEntry for sink tests.
+
+        Only perf_ms and sample_id vary across callers; the remaining fields
+        (generation, status, compile_time, config) are fixed placeholders.
         """
         return AutotuneLogEntry(
             generation=0,
@@ -201,6 +202,12 @@ class TestAutotuneLogSink(TestCase):
         )
 
     def test_sink_writes_metadata_sidecar_and_per_config_rows(self) -> None:
+        """
+        With KernelMetadata, the sink writes both outputs over a run: a JSON
+        sidecar holding the kernel identity once, and a CSV with one row per
+        recorded config. Each CSV row is stamped with the kernel_id foreign key
+        (matching the sidecar) and carries the entry's sample_id.
+        """
         metadata = KernelMetadata(
             kernel_id="abc123",
             kernel_name="_add_kernel",
@@ -239,6 +246,11 @@ class TestAutotuneLogSink(TestCase):
             self.assertTrue(all(row[sid_col] == "sample-xyz" for row in data_rows))
 
     def test_sink_without_metadata_writes_no_sidecar(self) -> None:
+        """
+        When the sink is created without KernelMetadata, a full run (start,
+        record, end) writes no sidecar file, since there is no kernel identity
+        to persist.
+        """
         with tempfile.TemporaryDirectory() as tmp:
             base = f"{tmp}/run"
             with AutotuneLogSink(base) as sink:
