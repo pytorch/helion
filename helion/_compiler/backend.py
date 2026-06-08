@@ -2473,6 +2473,22 @@ class PallasBackend(Backend):
                         f"_pipeline_arg_indices={pipeline_arg_indices!r}"
                     )
 
+                # Jagged-flat tensors are passed as 1-D from the host but
+                # the kernel's DMA slice treats them as 2-D ``(total_K, M)``.
+                # Emit (arg_idx, lane_size) pairs for the runtime reshape.
+                jagged_lane_sizes = device_fn.pallas_jagged_flat_lane_size
+                if jagged_lane_sizes:
+                    reshape_2d_indices = [
+                        (i, int(jagged_lane_sizes[id(arg.fake_value)]))
+                        for i, arg in enumerate(sorted_args)
+                        if isinstance(arg, TensorArg)
+                        and id(arg.fake_value) in jagged_lane_sizes
+                    ]
+                    if reshape_2d_indices:
+                        launcher_args.append(
+                            f"_reshape_2d_arg_indices={reshape_2d_indices!r}"
+                        )
+
         if CompileEnvironment.current().settings.pallas_interpret:
             launcher_args.append("_pallas_interpret=True")
 
