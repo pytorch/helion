@@ -212,6 +212,18 @@ def _analyze_indexing(node: torch.fx.Node, config: Config) -> None:
         or isinstance(p, NonePattern)
         for p in indexing_patterns
     )
+    # Jagged-kernel STORED tensor (e.g. jagged_sum / jagged_mean's `out`): in
+    # a grid=(1,) jagged kernel the whole-tensor VMEM BlockSpec would OOM at
+    # realistic output sizes.  Mark HBM so the existing _codegen_fori_loop
+    # store loop routes through tensor_to_dma_scratch + per-iter
+    # make_async_copy at the natural FX scope (Option B for cases 1/2).
+    # Doesn't apply when the access is jagged-flat (already HBM above),
+    # jagged-pinned-only (SMEM — small offset tables), or all-scalar (SMEM).
+    from ...language import memory_ops
+
+    is_store = node.target is memory_ops.store
+    is_jagged_kernel = bool(_jagged_parent_bids)
+
     tid = id(tensor_val)
     current = device_fn.pallas_memory_space.get(tid)
     if is_jagged_flat:
@@ -224,6 +236,11 @@ def _analyze_indexing(node: torch.fx.Node, config: Config) -> None:
         # jagged-pinned tensors (only HBM stays — used by jagged-flat).
         if current != PallasMemorySpace.HBM:
             device_fn.pallas_memory_space[tid] = PallasMemorySpace.SMEM
+    elif is_jagged_kernel and is_store and not is_all_scalar:
+        # See block comment above.  Promotion to HBM is sticky — don't downgrade
+        # if an earlier access already marked it HBM (idempotent).
+        if current != PallasMemorySpace.SMEM:
+            device_fn.pallas_memory_space[tid] = PallasMemorySpace.HBM
     elif is_all_scalar:
         # Only mark for SMEM if not already assigned to VMEM or HBM
         if current is None:

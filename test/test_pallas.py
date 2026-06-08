@@ -4238,10 +4238,12 @@ class TestPallas(TestCase):
         # No ``pl.program_id(0)`` at the top of the body — pid_0 must come
         # from the fori_loop body fn parameter, not the host launcher.
         self.assertNotRegex(code, r"pid_0\s*=\s*pl\.program_id\s*\(\s*0\s*\)")
-        # The jagged-flat tensor (x_flat) must be marked HBM so it stays in
-        # HBM rather than being copied into VMEM on kernel entry.  Arg order
-        # is (x_offsets, x_flat, out) → x_flat is at launcher position 1.
-        self.assertRegex(code, r"_pipeline_arg_indices=\[\s*1\s*\]")
+        # The jagged-flat tensor (x_flat) AND the output tensor (out) must
+        # both be marked HBM: x_flat because it's larger than VMEM; out
+        # because the whole-tensor VMEM BlockSpec would OOM at realistic
+        # output sizes.  Arg order is (x_offsets, x_flat, out) → x_flat at
+        # position 1, out at position 2.
+        self.assertRegex(code, r"_pipeline_arg_indices=\[\s*1\s*,\s*2\s*\]")
         # x_offsets must live in SMEM so dynamic ``x_offsets[pl.ds(pid_0, 1)]``
         # reads from inside the @pl.loop body don't hit VMEM sublane/lane
         # alignment.  It's at launcher position 0.
