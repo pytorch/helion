@@ -231,6 +231,11 @@ def _analyze_indexing(node: torch.fx.Node, config: Config) -> None:
         # the per-item fori_loop body — they must not be hoisted into VMEM at
         # kernel entry (the flat tensor is much larger than VMEM).
         device_fn.pallas_memory_space[tid] = PallasMemorySpace.HBM
+        # Cache lane_size for the launcher reshape (tensor.view(-1, M)).
+        for p in indexing_patterns:
+            if isinstance(p, TensorIndexPattern) and p.is_jagged_flat:
+                device_fn.pallas_jagged_flat_lane_size[tid] = p.lane_size
+                break
     elif is_jagged_pinned_only:
         # Override any prior VMEM/SMEM assignment: SMEM wins for
         # jagged-pinned tensors (only HBM stays — used by jagged-flat).
