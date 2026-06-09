@@ -2093,7 +2093,10 @@ class PallasBackend(Backend):
             if isinstance(arg, (SymbolArgument, TensorSizeArg, TensorStrideArg)):
                 result.append(None)  # scalars wrapped as 1-D tensors
                 continue
-            if not isinstance(arg, TensorArg) or arg.fake_value.ndim == 0:
+            if not isinstance(arg, TensorArg):
+                continue
+            if arg.fake_value.ndim == 0:
+                result.append(None)
                 continue
             tensor = arg.fake_value
             dim_tilings = device_fn.pallas_tensor_dim_tilings.get(id(tensor))
