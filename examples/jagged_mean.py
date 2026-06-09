@@ -33,7 +33,14 @@ def jagged_mean_kernel(
     x_data: torch.Tensor,
     x_offsets: torch.Tensor,
     x_feature_counts: torch.Tensor,  # [num_rows] - number of features per row
-    max_M: int,  # Maximum number of features
+    # ``max_M`` participates in shape math (``out`` lane dim,
+    # ``* max_M`` stride in ``flat_indices``).  Mark ``hl.constexpr`` so it
+    # bakes into the trace as a concrete int — the autotuner's static-shape
+    # analysis caps BM at the actual lane (e.g. 8) instead of defaulting to
+    # 128.  Without this annotation, Helion wraps ``max_M`` as an unbacked
+    # SymInt and ``out.shape`` lands as ``(num_rows, u0)`` — the autotuner
+    # can't reason about it.
+    max_M: hl.constexpr,  # Maximum number of features
 ) -> torch.Tensor:
     """
     Compute the mean of each row in a jagged tensor with variable features per row.
@@ -171,9 +178,16 @@ def main() -> None:
     num_rows, max_cols = 32, 64
     device = DEVICE
 
+    # Pallas/TPU rejects int64; use the testing helper that maps to int32 on
+    # pallas and int64 elsewhere so the script works on both.
+    from helion._testing import LONG_INT_TYPE
+
     lengths = torch.randint(1, max_cols + 1, (num_rows,), device=device)
     x_offsets = torch.cat(
-        [torch.zeros(1, dtype=torch.long, device=device), torch.cumsum(lengths, dim=0)]
+        [
+            torch.zeros(1, dtype=LONG_INT_TYPE, device=device),
+            torch.cumsum(lengths, dim=0).to(LONG_INT_TYPE),
+        ]
     )
     nnz = int(x_offsets[-1])
     M = 8  # number of features

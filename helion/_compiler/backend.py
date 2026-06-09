@@ -1830,7 +1830,22 @@ class PallasBackend(Backend):
                 super().__init__()
                 self.backend = backend
                 self.required_alignments: dict[int, int] = {}
+                # Smallest static tensor dim observed via ``t[..., tile, ...]``.
+                # ``hl.tile(M)``'s ``spec.size_hint`` already equals M so the
+                # alignment cap reads small-lane cases correctly there.
+                # ``hl.jagged_tile(parent)`` defaults ``size_hint=8192``
+                # (numel=None — data-dependent bound), so the cap can't use
+                # ``spec.size_hint`` as a stand-in for the indexed tensor dim.
+                # Recording the observed dim here lets the cap step honor
+                # small-lane cases for jagged tiles too (e.g. ``out[tile_b,
+                # tile_m]`` in jagged_mean where ``out.shape[1] == max_M``).
+                self.observed_dim_sizes: dict[int, int] = {}
                 self.update_requirements_from_fake_tensor_loads()
+
+            def maybe_update_observed_dim_size(self, bid: int, dim_size: int) -> None:
+                prev = self.observed_dim_sizes.get(bid)
+                if prev is None or dim_size < prev:
+                    self.observed_dim_sizes[bid] = dim_size
 
             def visit_Subscript(self, node: ast.Subscript) -> None:
                 assert isinstance(node, ExtendedAST)
@@ -1882,6 +1897,10 @@ class PallasBackend(Backend):
                         dim_from_end, tensor.ndim, bitwidth
                     )
                     self.maybe_update_required_alignment(bid, required_alignment)
+                    if 0 <= accessed_dim < tensor.ndim:
+                        dim_size = tensor.shape[accessed_dim]
+                        if isinstance(dim_size, int):
+                            self.maybe_update_observed_dim_size(bid, dim_size)
 
             def maybe_update_required_alignment(
                 self, bid: int, required_alignment: int
@@ -1918,6 +1937,10 @@ class PallasBackend(Backend):
                                 self.maybe_update_required_alignment(
                                     info.block_id, required_alignment
                                 )
+                                if isinstance(tensor.shape[dim], int):
+                                    self.maybe_update_observed_dim_size(
+                                        info.block_id, tensor.shape[dim]
+                                    )
 
         analyzer = TensorTiledAccessAnalyzer(self)
         for stmt in host_func.body:
@@ -1947,6 +1970,7 @@ class PallasBackend(Backend):
             for parents in _env_for_jagged.jagged_tile_parent_ids.values()
             for p in parents
         }
+        jagged_tile_bids: set[int] = set(_env_for_jagged.jagged_tile_parent_ids.keys())
 
         for spec in block_specs:
             if not isinstance(spec, BlockSizeSpec):
@@ -1957,13 +1981,25 @@ class PallasBackend(Backend):
             if bid in jagged_parent_bids:
                 continue
             requirement_alignment = analyzer.required_alignments[bid]
-            dim_size = next_power_of_2(max(spec.size_hint, 1))
-            # Cap the alignment requirement by the tensor lane dim: when
-            # the dim is smaller than the requirement, the full-dim access
-            # is always aligned at offset 0 so block_size = dim_size is
-            # safe.  When the dim is at least as big as the requirement,
-            # ``min`` returns ``requirement_alignment`` and the strict
-            # floor still applies (used by aot_example.sum_aot, n=256).
+            # Jagged_tile size_hint defaults to 8192 (parent.numel is
+            # data-dependent); cap to observed tensor dim when smaller so
+            # autotune picks reasonable block sizes (e.g. jagged_mean M=8).
+            # Skip when this bid is also a jagged-flat lane bid (req=128
+            # in a jagged kernel) — HBM DMA needs >=128 regardless.
+            apply_observed_cap = bid in jagged_tile_bids and not (
+                bool(jagged_parent_bids) and requirement_alignment == 128
+            )
+            if apply_observed_cap:
+                size_hint_dim = next_power_of_2(max(spec.size_hint, 1))
+                observed = analyzer.observed_dim_sizes.get(bid)
+                if observed is not None:
+                    dim_size = min(size_hint_dim, next_power_of_2(max(observed, 1)))
+                    if observed < spec.size_hint:
+                        spec.update_hint(observed)
+                else:
+                    dim_size = size_hint_dim
+            else:
+                dim_size = next_power_of_2(max(spec.size_hint, 1))
             spec.update_min(min(requirement_alignment, dim_size))
 
         # Propagate alignment minimums from inner tiles to their bounding outer tiles.
