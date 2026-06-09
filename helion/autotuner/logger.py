@@ -5,6 +5,7 @@ import csv
 import hashlib
 import io
 import itertools
+import json
 import logging
 import math
 import os
@@ -37,6 +38,7 @@ if TYPE_CHECKING:
     from ..runtime.config import Config
     from ..runtime.settings import Settings
     from .base_search import _AutotunableKernel
+    from .metrics import KernelMetadata
 
 else:
     CsvWriter = Any  # type: ignore[assignment]
@@ -114,15 +116,20 @@ class AutotuningLogger:
 
     @contextlib.contextmanager
     def autotune_logging(
-        self, base_path: str | None = None
+        self, base_path: str | None = None, metadata: KernelMetadata | None = None
     ) -> Iterator[AutotuneLogSink | None]:
-        """Attach an :class:`AutotuneLogSink` for the duration of a tuning run."""
+        """Attach an :class:`AutotuneLogSink` for the duration of a tuning run.
+
+        When ``metadata`` is provided, the kernel identity (source, id, shapes)
+        is written once to the ``<base>.meta.json`` sidecar so the per-config
+        CSV rows can be grouped by kernel across runs.
+        """
 
         path = base_path or self._settings.autotune_log
         if not path:
             yield None
             return
-        with AutotuneLogSink(path) as sink:
+        with AutotuneLogSink(path, metadata) as sink:
             self._attach_sink(sink)
             sink.start_run()
             try:
@@ -262,6 +269,8 @@ class AutotuneLogEntry(NamedTuple):
     perf_ms: float | None
     compile_time: float | None
     config: Config
+    # Stable per-(kernel, config) id: sha256(kernel_source + decorator(config)).
+    sample_id: str = ""
 
 
 class AutotuneLogSink:
@@ -269,10 +278,12 @@ class AutotuneLogSink:
     Writes autotune results to CSV and connects autotune logs to a file handler.
     """
 
-    def __init__(self, base_path: str) -> None:
+    def __init__(self, base_path: str, metadata: KernelMetadata | None = None) -> None:
         self._base_path = Path(base_path)
         self.csv_path = self._base_path.with_suffix(".csv")
         self.log_path = self._base_path.with_suffix(".log")
+        self.meta_path = self._base_path.with_suffix(".meta.json")
+        self._metadata = metadata
         self._csv_file: io.TextIOWrapper | None = None
         self._csv_writer: CsvWriter | None = None
         self._log_handler: logging.FileHandler | None = None
@@ -296,10 +307,16 @@ class AutotuneLogSink:
             return
         self.csv_path.parent.mkdir(parents=True, exist_ok=True)
         self.log_path.parent.mkdir(parents=True, exist_ok=True)
+        if self._metadata is not None:
+            self.meta_path.write_text(
+                json.dumps(self._metadata.to_dict(), indent=2), encoding="utf-8"
+            )
         self._csv_file = self.csv_path.open("w", encoding="utf-8", newline="")
         self._csv_writer = csv.writer(self._csv_file)
         self._csv_writer.writerow(
             [
+                "kernel_id",
+                "sample_id",
                 "timestamp_s",
                 "config_index",
                 "generation",
@@ -349,8 +366,13 @@ class AutotuneLogSink:
         compile_field = ""
         if entry.compile_time is not None:
             compile_field = f"{entry.compile_time:.2f}"
+        # kernel_id is the foreign key joining each row back to the kernel
+        # identity stored once in the .meta.json sidecar.
+        kernel_id = self._metadata.kernel_id if self._metadata is not None else ""
         self._csv_writer.writerow(
             [
+                kernel_id,
+                entry.sample_id,
                 timestamp_field,
                 self._config_counter,
                 entry.generation,
