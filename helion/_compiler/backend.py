@@ -41,6 +41,7 @@ if TYPE_CHECKING:
     from .device_function import Argument
     from .device_function import DeviceFunction
     from .device_ir import GraphInfo
+    from .device_ir_lowering import DeviceIRLowering
     from .host_function import HostFunction
     from .tile_dispatch import TileStrategyDispatch
     from .tile_strategy import TileStrategy
@@ -676,6 +677,17 @@ class Backend(abc.ABC):
         """Run backend-specific passes after tiling is finalized, before codegen.
 
         Backends can override this to analyze or transform the graphs.
+        """
+        return None
+
+    def get_device_ir_lowering(self) -> DeviceIRLowering | None:
+        """Return a DeviceIRLowering for this backend, or None for the legacy path.
+
+        Backends that have migrated to the structured lowering pipeline
+        return a ``DeviceIRLowering`` subclass.  Backends that
+        have not yet migrated return ``None``, causing
+        ``KernelCompiler.lower()`` to fall back to the legacy
+        ``lower_to_device_ir()`` function.
         """
         return None
 
@@ -3221,6 +3233,11 @@ class CuteBackend(Backend):
         from .cute.online_to_3pass import rewrite_online_to_3pass
 
         rewrite_online_to_3pass(hf)
+
+    def get_device_ir_lowering(self) -> DeviceIRLowering:
+        from .cute.device_ir_lowering import CuteDeviceIRLowering
+
+        return CuteDeviceIRLowering()
 
     def pre_codegen(
         self,

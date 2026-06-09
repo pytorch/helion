@@ -837,42 +837,6 @@ class DeviceIR:
         """
         env = CompileEnvironment.current()
         rdims = [bs for bs in env.block_sizes if bs.reduction]
-        # Register cute_vector_widths slots for non-reduction tile blocks
-        # upfront — this is for kernels like softmax_two_pass that drive
-        # their own inner tile loop over the reduction axis (no rolled
-        # reductions registered).  ``CuteNDTileStrategy`` reads these
-        # slots in ``__init__`` to wire up vec-aware lane loops; if no
-        # slots are registered, the autotuner has nothing to vary and
-        # the strategy defaults to scalar loads.  Skipped when rolled
-        # reductions are present so the reduction-dim slot stays at
-        # index 0 of ``cute_vector_widths`` (matches the
-        # ``CuteReductionTileHeuristic`` seed and user-facing API).
-        if env.backend_name == "cute" and not rdims:
-            from ..autotuner.config_spec import CuteVectorWidthSpec
-
-            already_registered = set(
-                env.config_spec.cute_vector_widths.valid_block_ids()
-            )
-            tile_blocks = [bs for bs in env.block_sizes if not bs.reduction]
-            for tile_bs in tile_blocks:
-                if tile_bs.block_id in already_registered:
-                    continue
-                # Skip blocks with unbound static size (e.g. jagged
-                # kernels' dynamic-extent tiles): ``size_hint()`` asserts
-                # the size is int/SymInt and the strategy's vec gate
-                # requires a static ``EPT % V == 0`` anyway.
-                if not isinstance(tile_bs.size, (int, torch.SymInt)):
-                    continue
-                try:
-                    size_hint_val = int(tile_bs.size_hint())
-                except (TypeError, ValueError, AttributeError, AssertionError):
-                    continue
-                env.config_spec.cute_vector_widths.append(
-                    CuteVectorWidthSpec(
-                        block_id=tile_bs.block_id,
-                        size_hint=size_hint_val,
-                    )
-                )
         if not rdims:
             return
         num_original_graphs = len(self.graphs)
@@ -944,53 +908,7 @@ class DeviceIR:
                         size_hint=rdim.size_hint(),
                     )
                 )
-                if env.backend_name == "cute":
-                    from ..autotuner.config_spec import CuteVectorWidthSpec
-
-                    env.config_spec.cute_vector_widths.append(
-                        CuteVectorWidthSpec(
-                            block_id=rdim.block_id,
-                            size_hint=rdim.size_hint(),
-                        )
-                    )
             graphs_with_rolled_rdim |= used_graphs
-
-        # Track which rdims appear as the reduction axis of an indexed
-        # reduction (argmin/argmax). On CuTe these can only be combined
-        # via cute.arch.warp_reduction (32 threads max), so the autotuner
-        # must keep their persistent thread count and looped chunk size
-        # within a single warp.
-        if env.backend_name == "cute":
-            indexed_blocks: set[int] = set()
-            indexed_targets = {
-                torch.ops.aten.argmin.default,
-                torch.ops.aten.argmax.default,
-            }
-            for graph_info in self.graphs[:num_original_graphs]:
-                for node in graph_info.graph.nodes:
-                    if getattr(node, "target", None) not in indexed_targets:
-                        continue
-                    args = node.args or ()
-                    if not args:
-                        continue
-                    val = getattr(args[0], "meta", {}).get("val")
-                    if val is None:
-                        continue
-                    dim_arg = args[1] if len(args) >= 2 else -1
-                    dim_indices = (
-                        [int(cast("int", d)) for d in dim_arg]
-                        if isinstance(dim_arg, list)
-                        else [int(cast("int", dim_arg))]
-                    )
-                    for dim_idx in dim_indices:
-                        if dim_idx < 0:
-                            dim_idx += val.ndim
-                        if 0 <= dim_idx < val.ndim:
-                            reduce_dim = val.size(dim_idx)
-                            block_id = env.resolve_block_id(reduce_dim)
-                            if block_id is not None:
-                                indexed_blocks.add(block_id)
-            env.config_spec.cute_indexed_reduction_block_ids = indexed_blocks
 
     def build_codegen_graphs(self, config: Config) -> list[GraphInfo]:
         """Build and return graph copies with reduction rolling and epilogue subtiling applied.
@@ -2487,12 +2405,6 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
 
         for graph in device_ir.graphs:
             rewrite_implicit_random_ops(graph.graph)
-        if CompileEnvironment.current().backend.name == "cute":
-            promotions = collect_cute_half_atomic_output_promotions(device_ir.graphs)
-            if promotions:
-                host_fn = HostFunction.current()
-                rewrite_cute_half_atomic_output_allocations(host_fn, promotions)
-                promote_cute_root_graph_host_tensors(device_ir.graphs, promotions)
         for graph in device_ir.graphs:
             prepare_graph_lowerings(graph.graph)
         for graph in device_ir.graphs:
