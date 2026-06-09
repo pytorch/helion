@@ -222,8 +222,15 @@ def main() -> None:
     both PyTorch reference implementations.
     """
     # B, M, max_seqlen = 3, 4, 3
+    from helion.runtime.settings import _get_backend
+
     B_list = [2**n for n in list(range(5, 16, 3))]
-    M_list = [2**n for n in list(range(5, 10, 3))]
+    # Pallas/TPU has a sublane alignment constraint on M>128 (tracked as a
+    # follow-up).  Cap there; GPU backends keep the original wider range.
+    if _get_backend() == "pallas":
+        M_list = [32, 128]
+    else:
+        M_list = [2**n for n in list(range(5, 10, 3))]
     max_seqlen_list = [128]
     eps = 1e-6
     device = DEVICE
