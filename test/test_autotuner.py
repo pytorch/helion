@@ -2470,7 +2470,13 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         config1 = helion.Config(block_sizes=[128], num_warps=4)
         config2 = helion.Config(block_sizes=[256], num_warps=4)
 
-        @helion.kernel(configs=[config1, config2], autotune_log_level=0)
+        # Pin the accuracy check to the parent so the patched _assert_close
+        # below is observed; the default subprocess path runs it in the worker.
+        @helion.kernel(
+            configs=[config1, config2],
+            autotune_log_level=0,
+            autotune_benchmark_subprocess=False,
+        )
         def vec_add(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
             out = torch.empty_like(a)
             for tile in hl.tile(a.size()):
