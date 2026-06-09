@@ -171,8 +171,6 @@ def main() -> None:
     num_rows, max_cols = 32, 64
     device = DEVICE
 
-    # Pallas/TPU rejects int64; use the testing helper that maps to int32 on
-    # pallas and int64 elsewhere so the script works on both.
     from helion._testing import LONG_INT_TYPE
 
     lengths = torch.randint(1, max_cols + 1, (num_rows,), device=device)
