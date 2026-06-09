@@ -318,22 +318,31 @@ def enforce_dot_requirements(lhs: torch.Tensor, rhs: torch.Tensor) -> None:
             rhs_dtype=rhs.dtype,
         )
     )
+    # tcgen05 MMA-K is 16 elements for BF16/FP16 but 32 for FP8 (e4m3); the
+    # block_k search granularity and minimum must follow the active dtype.
+    is_fp8 = lhs.dtype == torch.float8_e4m3fn
+    mma_k = 32 if is_fp8 else 16
     if (
         env.backend_name == "cute"
         and lhs.ndim == 2
         and rhs.ndim == 2
-        and lhs.dtype in (torch.float16, torch.bfloat16)
+        and (
+            lhs.dtype in (torch.float16, torch.bfloat16)
+            or lhs.dtype == torch.float8_e4m3fn
+        )
         and rhs.dtype == lhs.dtype
         and static_m is not None
         and static_n is not None
         and static_k is not None
         and static_m >= 64
         and static_n >= 8
-        and static_k >= 16
+        and static_k >= mma_k
     ):
         from .._compiler.cute.mma_support import get_cute_mma_support
 
-        if get_cute_mma_support().tcgen05_f16bf16:
+        support = get_cute_mma_support()
+        tcgen05_supported = support.tcgen05_f8 if is_fp8 else support.tcgen05_f16bf16
+        if tcgen05_supported:
 
             def pow2_floor_at_least(value: int, minimum: int) -> int:
                 return 1 << (max(minimum, value).bit_length() - 1)
@@ -342,8 +351,9 @@ def enforce_dot_requirements(lhs: torch.Tensor, rhs: torch.Tensor) -> None:
             max_tcgen05_m = 256 if max_tcgen05_n >= 128 and static_m >= 256 else 128
             # Larger tile_k packs more cute.gemm instructions per K loop
             # iteration on tcgen05 (mma instruction K is fixed at 16 for
-            # BF16/FP16). Cap at 128 to keep AB SMEM staging budget sane.
-            max_tcgen05_k = min(128, pow2_floor_at_least(static_k, 16))
+            # BF16/FP16, 32 for FP8). Cap at 128 to keep AB SMEM staging
+            # budget sane.
+            max_tcgen05_k = min(128, pow2_floor_at_least(static_k, mma_k))
             max_search_m = min(max_tcgen05_m, pow2_floor_at_least(static_m, 64))
             max_search_n = max_tcgen05_n
             max_search_k = max_tcgen05_k
@@ -475,7 +485,7 @@ def enforce_dot_requirements(lhs: torch.Tensor, rhs: torch.Tensor) -> None:
                 if block_idx is None:
                     continue
                 if axis_name == "k":
-                    min_size = 16
+                    min_size = mma_k
                 elif axis_name == "m":
                     min_size = min_search_m
                 else:

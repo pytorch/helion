@@ -118,6 +118,21 @@ _TRACE_THROUGH_TARGETS = {
     # data shuffle.  Permuted operands fall back to scalar codegen.
 }
 
+# Extra forward-trace targets used ONLY for *output dtype* inference
+# (``_trace_mma_to_store_dtype``). These are the whitelisted fused-epilogue
+# aux-binary ops (e.g. the rowwise scale ``acc * scale[...]``). Tracing
+# through them only follows the chain to the store node and reads the store
+# *target tensor's* dtype, so it never changes the inferred dtype; it just
+# lets inference reach the store past a fused scale/bias step. This is needed
+# for fp8 inputs (whose ``input_dtype`` is never a valid epilogue output
+# dtype) so the plan picks up the real bf16/f16/f32 store dtype.
+_DTYPE_TRACE_EXTRA_TARGETS = {
+    torch.ops.aten.mul.Tensor,
+    torch.ops.aten.add.Tensor,
+    torch.ops.aten.sub.Tensor,
+    torch.ops.aten.div.Tensor,
+}
+
 # Register reallocation budget for tcgen05 warp-specialized kernels.
 # Producer warps (TMA loads, scheduler) only do address arithmetic and
 # barrier ops, so they can give back registers; consumer warps (MMA
@@ -443,7 +458,12 @@ def _has_mma_operands(lhs_node: Node, rhs_node: Node) -> bool:
         return False
     lhs_load, _, lhs_fake = lhs_info
     rhs_load, _, rhs_fake = rhs_info
-    supported = {torch.float16, torch.bfloat16, torch.float32}
+    supported = {
+        torch.float16,
+        torch.bfloat16,
+        torch.float32,
+        torch.float8_e4m3fn,
+    }
     return (
         lhs_fake.dtype in supported
         and rhs_fake.dtype in supported
@@ -1726,6 +1746,7 @@ def _trace_mma_to_store_dtype(
                 or target is _tracing_ops._new_var
                 or target is operator.getitem
                 or target in _TRACE_THROUGH_TARGETS
+                or target in _DTYPE_TRACE_EXTRA_TARGETS
             ):
                 stack.append(user)
                 continue
@@ -1778,6 +1799,7 @@ def _emit_mma_pipeline(
         torch.float16: "cutlass.Float16",
         torch.bfloat16: "cutlass.BFloat16",
         torch.float32: "cutlass.Float32",
+        torch.float8_e4m3fn: "cutlass.Float8E4M3FN",
     }
     input_dtype_str = _dtype_map[input_dtype]
     acc_dtype_str = "cutlass.Float32"
@@ -1805,7 +1827,7 @@ def _emit_mma_pipeline(
         _dtype_map[epi_elem_dtype] if epi_elem_dtype is not None else input_dtype_str
     )
     tcgen05_use_tma = (
-        input_dtype in (torch.float16, torch.bfloat16)
+        input_dtype in (torch.float16, torch.bfloat16, torch.float8_e4m3fn)
         and lhs_fake.is_contiguous()
         and rhs_fake.is_contiguous()
     )
@@ -5187,7 +5209,12 @@ def _mma_impl_matches_problem_shape(
 ) -> bool:
     if mma_impl == "universal":
         return True
-    if input_dtype not in (torch.float16, torch.bfloat16) or bn < 8 or bn % 8 != 0:
+    is_fp8 = input_dtype == torch.float8_e4m3fn
+    if (
+        input_dtype not in (torch.float16, torch.bfloat16, torch.float8_e4m3fn)
+        or bn < 8
+        or bn % 8 != 0
+    ):
         return False
     if bn > 256 and (
         mma_impl != "tcgen05"
@@ -5201,16 +5228,21 @@ def _mma_impl_matches_problem_shape(
     ):
         return False
     if mma_impl == "warp":
-        # Warp MMA atom is fixed-K (16 elements per BF16/FP16 instruction).
+        # Warp MMA atom is fixed-K (16 elements per BF16/FP16 instruction);
+        # fp8 is only wired through tcgen05.
+        if is_fp8:
+            return False
         return bk == 16 and bm >= 16 and bm % 16 == 0 and bn == 8
     if mma_impl == "tcgen05":
-        # tcgen05 mma instruction K is 16 elements for BF16/FP16, but the
-        # tile's K can be any positive multiple of that (the inner cute.gemm
-        # loop just runs more instructions per K iteration). Larger tile_k
-        # roughly halves the per-K-iter overhead per doubling. Production
-        # remains capped at block_n=256 to keep AB SMEM staging budget sane;
-        # the explicit G4 proof key admits only the smallest 512-N candidate.
-        if bk < 16 or bk > 256 or bk % 16 != 0:
+        # tcgen05 mma instruction K is 16 elements for BF16/FP16 (32 for FP8),
+        # but the tile's K can be any positive multiple of that (the inner
+        # cute.gemm loop just runs more instructions per K iteration). Larger
+        # tile_k roughly halves the per-K-iter overhead per doubling.
+        # Production remains capped at block_n=256 to keep AB SMEM staging
+        # budget sane; the explicit G4 proof key admits only the smallest
+        # 512-N candidate.
+        mma_k = 32 if is_fp8 else 16
+        if bk < mma_k or bk > 256 or bk % mma_k != 0:
             return False
         if bm in (64, 128):
             return True
@@ -5276,7 +5308,12 @@ def _choose_mma_impl(
         tcgen05_cluster_m=tcgen05_cluster_m,
         tcgen05_large_bn_proof=tcgen05_large_bn_proof,
     ):
-        if support.tcgen05_f16bf16:
+        tcgen05_ok = (
+            support.tcgen05_f8
+            if input_dtype == torch.float8_e4m3fn
+            else support.tcgen05_f16bf16
+        )
+        if tcgen05_ok:
             return "tcgen05"
     if _mma_impl_matches_problem_shape("warp", input_dtype, bm=bm, bn=bn, bk=bk):
         if support.warp_f16bf16:

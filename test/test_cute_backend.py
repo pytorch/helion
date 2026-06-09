@@ -458,6 +458,39 @@ def cute_matmul_mma(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     return out
 
 
+@helion.kernel(backend="cute", static_shapes=True)
+def cute_matmul_mma_fp8(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    # fp8 (e4m3) inputs, f32 accumulate, bf16 output -- the tcgen05 MMA atom
+    # for fp8 is MmaF8F6F4Op (MMA-K=32 vs 16 for bf16/fp16).
+    m, k = x.size()
+    _, n = y.size()
+    out = torch.empty([m, n], dtype=torch.bfloat16, device=x.device)
+    for tile_m, tile_n in hl.tile([m, n]):
+        acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+        for tile_k in hl.tile(k):
+            acc = hl.dot(x[tile_m, tile_k], y[tile_k, tile_n], acc=acc)
+        out[tile_m, tile_n] = acc.to(torch.bfloat16)
+    return out
+
+
+@helion.kernel(backend="cute", static_shapes=True)
+def cute_matmul_mma_fp8_rowvec_scale(
+    x: torch.Tensor, y: torch.Tensor, scale_n: torch.Tensor
+) -> torch.Tensor:
+    # fp8 GEMM with a fused per-column (rowvec) scale in the epilogue.
+    # Exercises the rowvec aux chain on the tcgen05 fp8 path (and, for
+    # TMA-store configs, the register-hoist of the rowvec load).
+    m, k = x.size()
+    _, n = y.size()
+    out = torch.empty([m, n], dtype=torch.bfloat16, device=x.device)
+    for tile_m, tile_n in hl.tile([m, n]):
+        acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+        for tile_k in hl.tile(k):
+            acc = hl.dot(x[tile_m, tile_k], y[tile_k, tile_n], acc=acc)
+        out[tile_m, tile_n] = (acc * scale_n[tile_n]).to(torch.bfloat16)
+    return out
+
+
 @helion.kernel(backend="cute")
 def cute_matmul_mma_epilogue(
     x: torch.Tensor, y: torch.Tensor, bias: torch.Tensor
@@ -1154,6 +1187,44 @@ class TestCuteBackend(TestCase):
             code,
         )
         self.assertIn("cutlass.pipeline.NamedBarrier(barrier_id=1", code)
+
+    def test_matmul_mma_tcgen05_fp8(self) -> None:
+        support = get_cute_mma_support()
+        if not support.tcgen05_f8:
+            self.skipTest("tcgen05 FP8 MMA is not supported on this machine")
+
+        torch.manual_seed(0)
+        x = (torch.randn(256, 128, device=DEVICE) * 0.4).to(torch.float8_e4m3fn)
+        y = (torch.randn(128, 128, device=DEVICE) * 0.4).to(torch.float8_e4m3fn)
+        code, out = code_and_output(
+            cute_matmul_mma_fp8, (x, y), block_sizes=[128, 128, 128]
+        )
+        ref = x.float() @ y.float()
+        torch.testing.assert_close(out.float(), ref, atol=1.0, rtol=1e-1)
+        # fp8 routes through the tcgen05 F8F6F4 MMA atom (MMA-K=32).
+        self.assertIn("cutlass.utils.blackwell_helpers.make_trivial_tiled_mma", code)
+        self.assertIn("cutlass.Float8E4M3FN", code)
+        self.assertIn("cute.nvgpu.tcgen05", code)
+        self.assertIn("cute.gemm(", code)
+
+    def test_matmul_mma_tcgen05_fp8_rowvec_scale(self) -> None:
+        support = get_cute_mma_support()
+        if not support.tcgen05_f8:
+            self.skipTest("tcgen05 FP8 MMA is not supported on this machine")
+
+        torch.manual_seed(0)
+        x = (torch.randn(256, 128, device=DEVICE) * 0.4).to(torch.float8_e4m3fn)
+        y = (torch.randn(128, 128, device=DEVICE) * 0.4).to(torch.float8_e4m3fn)
+        scale_n = torch.rand(128, device=DEVICE) + 0.5
+        code, out = code_and_output(
+            cute_matmul_mma_fp8_rowvec_scale,
+            (x, y, scale_n),
+            block_sizes=[128, 128, 128],
+        )
+        ref = (x.float() @ y.float()) * scale_n.float()
+        torch.testing.assert_close(out.float(), ref, atol=1.0, rtol=1e-1)
+        self.assertIn("cutlass.Float8E4M3FN", code)
+        self.assertIn("cute.nvgpu.tcgen05", code)
 
     def test_matmul_dot_out_dtype_falls_back_from_mma(self) -> None:
         args = (
