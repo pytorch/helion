@@ -194,10 +194,12 @@ def create_test_jagged_tensor(
     seq_lengths = torch.randint(1, max_seqlen + 1, (B,), device=device)
 
     # Create offsets
+    from helion._testing import LONG_INT_TYPE
+
     x_offsets = torch.cat(
         [
-            torch.zeros(1, dtype=torch.long, device=device),
-            torch.cumsum(seq_lengths, dim=0),
+            torch.zeros(1, dtype=LONG_INT_TYPE, device=device),
+            torch.cumsum(seq_lengths, dim=0).to(LONG_INT_TYPE),
         ]
     )
 
