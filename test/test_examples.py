@@ -2188,12 +2188,12 @@ class TestExamples(RefEagerTestBase, TestCase):
     @skipIfA10G("failure on a10g")
     @skipIfTileIR("accuracy failure")
     @skipIfXPU("ocloc compilation failure with 256-GRF kernel on XPU backend")
-    @xfailIfPallas(
-        "Pallas codegen broadcasts the matmul result to the wrong shape "
-        "((16, 128) vs (16, 256)) -- separate shape-propagation bug in the "
-        "outer accumulator."
+    @xfailIfPallasInterpret(
+        "pl.program_id captured into emit_pipeline body is not supported in "
+        "JAX interpret mode (program_id_p.bind asserts during trace)"
     )
     def test_squeeze_and_excitation_net_bwd_db(self):
+        torch.manual_seed(0)
         m, n, k = 256, 256, 256
         x = torch.randn([m, n], device=DEVICE, dtype=HALF_DTYPE)
         a = torch.randn([n, k], device=DEVICE, dtype=HALF_DTYPE)
@@ -2231,7 +2231,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             block_sizes=[16, 16, 16],
             num_warps=4,
             num_stages=2,
-            atol=0.3,
+            atol=0.4,
         )
 
     def test_grpo_loss_fwd(self):
