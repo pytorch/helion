@@ -2283,6 +2283,23 @@ def _codegen_fori_loop(state: CodegenState) -> object:
                         starts_name = jpat.sublane_base_fx.name
                     axis_offset = f"{starts_name}[0] + ({axis_offset})"
                 slice_parts.append(f"pl.ds({axis_offset}, {bs_var})")
+            # Record host-pad info for the jagged-flat tensor.  The DMA reads
+            # ``(BK, BM)`` sublanes per fori iter starting at ``starts[i] +
+            # k*BK``; the last tile_k iter for a row whose nnz isn't a
+            # multiple of BK reads up to ``BK-1`` sublanes beyond the row's
+            # valid data.  Without sublane padding, a row near the end of
+            # ``x_flat`` (sum of all rows' nnz close to total_K) lets this
+            # over-read cross the buffer boundary and fault the TPU.  The
+            # compute mask (``offset_k < nnz``) already zeros the trailing
+            # garbage, so padding to zero is sufficient.  Matches the
+            # non-jagged ``_loop_begin_extra_pad`` policy for data-dependent
+            # begins (returns ``block_size - 1``).
+            from .memory_ops import _record_pad_info
+
+            sublane_bs = state.device_function.resolved_block_size(jpat.sublane_bid)
+            if isinstance(sublane_bs, int):
+                _record_pad_info(state, fake, 0, jpat.sublane_bid, sublane_bs - 1)
+            _record_pad_info(state, fake, 1, jpat.lane_bid, 0)
             return f"{hbm_name}.at[{', '.join(slice_parts)}]"
 
         dim_to_bid = _get_dim_block_ids(subscript_meta, env)
