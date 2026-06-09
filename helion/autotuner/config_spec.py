@@ -356,6 +356,7 @@ class ConfigSpec:
         self.epilogue_subtile_k_hint: int = 0
         self.has_pallas_inner_loops: bool = False
         self.has_symbolic_or_data_dependent_bounds: bool = False
+        self.has_jagged_tile: bool = False
         self._cute_tcgen05_config = CuteTcgen05Config(self)
         self.compiler_default_config: helion.Config | None = None
         self.compiler_seed_configs: list[helion.Config] = []
@@ -1496,6 +1497,13 @@ class ConfigSpec:
                 # TODO(thcmbs): Also exclude "emit_pipeline" when has_pallas_dma_unaligned
                 # is set, to avoid wasted autotuning effort. See PR #1969 review discussion.
                 choices = ("fori_loop", "emit_pipeline")
+            # Jagged kernels (hl.jagged_tile) use per-program data-dependent
+            # starts. emit_pipeline's BlockSpec model copies a regular
+            # (block_shape) window per grid step; it cannot express
+            # ``pl.ds(starts[i] + k*BK, BK)`` on HBM, so the codegen produces
+            # broadcast-shape mismatches at trace time. Restrict to fori_loop.
+            if self.has_jagged_tile:
+                choices = ("fori_loop",)
             fields["pallas_loop_type"] = EnumFragment(choices=choices)
             if self.supports_config_key("pallas_pre_broadcast"):
                 fields["pallas_pre_broadcast"] = BooleanFragment()

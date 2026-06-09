@@ -745,6 +745,7 @@ def _(
     base = TileIndexType.allocate(None, origin)
     result = JaggedTileIndexType(origin, base.block_id, parent_block_ids)
     env.register_jagged_tile(base.block_id, parent_block_ids)
+    env.config_spec.has_jagged_tile = True
 
     # On Pallas (TPU), the items axis of a jagged kernel must be pinned to
     # block_size=1: each program owns exactly one item so the per-item DMA
