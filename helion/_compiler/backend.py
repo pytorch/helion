@@ -1972,6 +1972,18 @@ class PallasBackend(Backend):
         }
         jagged_tile_bids: set[int] = set(_env_for_jagged.jagged_tile_parent_ids.keys())
 
+        # ``visit_Subscript`` only sees direct subscripts; jagged-flat
+        # tensors use a constructed FX index that hides the lane indexer,
+        # so force lane=128 alignment for every non-parent non-child bid.
+        if jagged_parent_bids:
+            for spec in block_specs:
+                if not isinstance(spec, BlockSizeSpec):
+                    continue
+                bid = spec.block_ids[0]
+                if bid in jagged_parent_bids or bid in jagged_tile_bids:
+                    continue
+                analyzer.maybe_update_required_alignment(bid, 128)
+
         for spec in block_specs:
             if not isinstance(spec, BlockSizeSpec):
                 continue
