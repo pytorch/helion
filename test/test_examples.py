@@ -1101,7 +1101,7 @@ class TestExamples(RefEagerTestBase, TestCase):
                 block_sizes=[32768, 1],
             )
 
-    @xfailIfPallas("JAX tracer error with dynamic shapes")
+    @xfailIfPallasInterpret("currently failing with the interpreter")
     @skipIfRefEager("hl.jagged_tile does not support ref mode yet")
     def test_jagged_mean(self):
         num_rows, max_cols = 32, 64
@@ -1109,8 +1109,8 @@ class TestExamples(RefEagerTestBase, TestCase):
         lengths = torch.randint(1, max_cols + 1, (num_rows,), device=DEVICE)
         x_offsets = torch.cat(
             [
-                torch.zeros(1, dtype=torch.long, device=DEVICE),
-                torch.cumsum(lengths, dim=0),
+                torch.zeros(1, dtype=LONG_INT_TYPE, device=DEVICE),
+                torch.cumsum(lengths, dim=0).to(LONG_INT_TYPE),
             ]
         )
         nnz = int(x_offsets[-1])
@@ -1125,13 +1125,18 @@ class TestExamples(RefEagerTestBase, TestCase):
             x_data, x_offsets, feature_counts, M
         )
 
-        check_example(
-            "jagged_mean",
-            args,
-            expected,
-            fn_name="jagged_mean_kernel",
-            block_sizes=[16, 8, 16],
-        )
+        if _get_backend() == "pallas":
+            check_example(
+                "jagged_mean", args, expected, fn_name="jagged_mean_kernel_pallas"
+            )
+        else:
+            check_example(
+                "jagged_mean",
+                args,
+                expected,
+                fn_name="jagged_mean_kernel",
+                block_sizes=[16, 8, 16],
+            )
 
     @xfailIfPallas("requires triton module")
     @skipIfRefEager(
@@ -1387,7 +1392,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             num_stages=3,
         )
 
-    @xfailIfPallas("JAX tracer error with dynamic shapes")
+    @xfailIfPallasInterpret("currently failing with the interpreter")
     @skipIfRefEager("hl.jagged_tile does not support ref mode yet")
     def test_jagged_softmax(self):
         num_rows, max_cols = 128, 64
@@ -1395,8 +1400,8 @@ class TestExamples(RefEagerTestBase, TestCase):
         lengths = torch.randint(1, max_cols + 1, (num_rows,), device=DEVICE)
         x_offsets = torch.cat(
             [
-                torch.zeros(1, dtype=torch.long, device=DEVICE),
-                torch.cumsum(lengths, dim=0),
+                torch.zeros(1, dtype=LONG_INT_TYPE, device=DEVICE),
+                torch.cumsum(lengths, dim=0).to(LONG_INT_TYPE),
             ]
         )
         nnz = int(x_offsets[-1])
@@ -1407,13 +1412,18 @@ class TestExamples(RefEagerTestBase, TestCase):
         mod = import_path(EXAMPLES_DIR / "jagged_softmax.py")
         expected = mod.reference_jagged_softmax_pytorch(x_data, x_offsets)
 
-        check_example(
-            "jagged_softmax",
-            args,
-            expected,
-            fn_name="jagged_softmax_kernel",
-            block_sizes=[16, 8, 16, 16],
-        )
+        if _get_backend() == "pallas":
+            check_example(
+                "jagged_softmax", args, expected, fn_name="jagged_softmax_kernel_pallas"
+            )
+        else:
+            check_example(
+                "jagged_softmax",
+                args,
+                expected,
+                fn_name="jagged_softmax_kernel",
+                block_sizes=[16, 8, 16, 16],
+            )
 
     @xfailIfPallas("tensor-derived if-predicates not supported")
     @skipIfXPU("Jagged tensor operations not fully supported on XPU")
@@ -1888,7 +1898,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             rtol=2e-1,
         )
 
-    @xfailIfPallas("JAX tracer error")
+    @xfailIfPallasInterpret("currently failing with the interpreter")
     @skipIfRefEager("hl.jagged_tile does not support ref mode yet")
     def test_jagged_sum(self):
         num_rows, max_cols = 128, 64
@@ -1896,8 +1906,8 @@ class TestExamples(RefEagerTestBase, TestCase):
         lengths = torch.randint(1, max_cols + 1, (num_rows,), device=DEVICE)
         x_offsets = torch.cat(
             [
-                torch.zeros(1, dtype=torch.long, device=DEVICE),
-                torch.cumsum(lengths, dim=0),
+                torch.zeros(1, dtype=LONG_INT_TYPE, device=DEVICE),
+                torch.cumsum(lengths, dim=0).to(LONG_INT_TYPE),
             ]
         )
         nnz = int(x_offsets[-1])
@@ -1908,13 +1918,19 @@ class TestExamples(RefEagerTestBase, TestCase):
         mod = import_path(EXAMPLES_DIR / "jagged_sum.py")
         expected = mod.reference_jagged_sum_kernel_pytorch(x_data, x_offsets)
 
-        check_example(
-            "jagged_sum",
-            args,
-            expected,
-            fn_name="jagged_sum_kernel",
-            block_sizes=[16, 8, 16],
-        )
+        if _get_backend() == "pallas":
+            # Structured hl.tile(s, e) rewrite; config pinned on the kernel.
+            check_example(
+                "jagged_sum", args, expected, fn_name="jagged_sum_kernel_pallas"
+            )
+        else:
+            check_example(
+                "jagged_sum",
+                args,
+                expected,
+                fn_name="jagged_sum_kernel",
+                block_sizes=[16, 8, 16],
+            )
 
     @skipIfXPU("Timeout on XPU")
     def test_fused_linear_jsd(self):
@@ -2005,7 +2021,7 @@ class TestExamples(RefEagerTestBase, TestCase):
         )
         torch.testing.assert_close(result, expected, atol=1e-1, rtol=1e-2)
 
-    @xfailIfPallas("JAX tracer error")
+    @xfailIfPallasInterpret("currently failing with the interpreter")
     @skipIfRefEager("hl.jagged_tile does not support ref mode yet")
     def test_jagged_layer_norm(self):
         num_rows, max_cols = 128, 64
@@ -2013,8 +2029,8 @@ class TestExamples(RefEagerTestBase, TestCase):
         lengths = torch.randint(1, max_cols + 1, (num_rows,), device=DEVICE)
         x_offsets = torch.cat(
             [
-                torch.zeros(1, dtype=torch.long, device=DEVICE),
-                torch.cumsum(lengths, dim=0),
+                torch.zeros(1, dtype=LONG_INT_TYPE, device=DEVICE),
+                torch.cumsum(lengths, dim=0).to(LONG_INT_TYPE),
             ]
         )
         nnz = int(x_offsets[-1])
@@ -2026,13 +2042,21 @@ class TestExamples(RefEagerTestBase, TestCase):
         mod = import_path(EXAMPLES_DIR / "jagged_layer_norm.py")
         expected = mod.reference_jagged_layer_norm_pytorch(x_data, x_offsets, eps)
 
-        check_example(
-            "jagged_layer_norm",
-            args,
-            expected,
-            fn_name="jagged_layer_norm_kernel",
-            block_sizes=[4, 8, 8, 8, 8, 8, 8],
-        )
+        if _get_backend() == "pallas":
+            check_example(
+                "jagged_layer_norm",
+                args,
+                expected,
+                fn_name="jagged_layer_norm_kernel_pallas",
+            )
+        else:
+            check_example(
+                "jagged_layer_norm",
+                args,
+                expected,
+                fn_name="jagged_layer_norm_kernel",
+                block_sizes=[4, 8, 8, 8, 8, 8, 8],
+            )
 
     def test_exp_fwd(self):
         x = torch.randn([1024], device=DEVICE, dtype=torch.bfloat16)
