@@ -934,6 +934,197 @@ class TestLLMTransport(TestCase):
         self.assertNotIn("speed", captured["payload"])
 
 
+class TestBedrockTransport(TestCase):
+    """Tests for the AWS Bedrock provider (boto3/SigV4, no API key)."""
+
+    def test_infer_provider_requires_explicit_bedrock_prefix(self):
+        """Bedrock must be opted into with an explicit `bedrock/` prefix (or the
+        HELION_LLM_PROVIDER override). Bare region-prefixed Bedrock model IDs are
+        NOT auto-routed, since the same string can be served by the direct API."""
+        from helion.autotuner.llm.transport import infer_provider
+
+        cases = {
+            # Explicit bedrock/ prefix -> bedrock.
+            "bedrock/us.anthropic.claude-sonnet-4-6": "bedrock",
+            "bedrock/us.anthropic.claude-opus-4-8": "bedrock",
+            # Bare region-prefixed Bedrock IDs are NOT auto-detected.
+            "us.anthropic.claude-sonnet-4-6": "unsupported",
+            "apac.anthropic.claude-3-5-haiku-20241022-v1:0": "unsupported",
+            # Bare Anthropic / OpenAI IDs keep their existing providers.
+            "claude-opus-4-7": "anthropic",
+            "anthropic/claude-3-5-sonnet": "anthropic",
+            "gpt-5.5": "openai_responses",
+            "custom/model": "unsupported",
+            # Explicit provider override still routes a bare id to bedrock.
+            ("us.anthropic.claude-sonnet-4-6", "bedrock"): "bedrock",
+        }
+        for model, expected in cases.items():
+            with self.subTest(model=model):
+                if isinstance(model, tuple):
+                    self.assertEqual(infer_provider(model[0], model[1]), expected)
+                else:
+                    self.assertEqual(infer_provider(model), expected)
+
+    def test_normalize_provider_aliases_and_error(self):
+        """Bedrock provider aliases canonicalize; bedrock joins the error message."""
+        from helion.autotuner.llm.transport import normalize_provider
+
+        for alias in ("bedrock", "aws_bedrock", "aws-bedrock"):
+            with self.subTest(alias=alias):
+                self.assertEqual(normalize_provider(alias), "bedrock")
+        with self.assertRaisesRegex(ValueError, "bedrock"):
+            normalize_provider("bogus")
+
+    def test_strip_provider_prefix_drops_bedrock(self):
+        """The bedrock/ prefix is stripped like anthropic/ and openai/."""
+        from helion.autotuner.llm.transport import strip_provider_prefix
+
+        self.assertEqual(
+            strip_provider_prefix("bedrock/us.anthropic.claude-opus-4-8"),
+            "us.anthropic.claude-opus-4-8",
+        )
+        self.assertEqual(
+            strip_provider_prefix("us.anthropic.claude-opus-4-8"),
+            "us.anthropic.claude-opus-4-8",
+        )
+
+    def test_temperature_deprecated_version_matrix(self):
+        """`temperature` deprecation follows per-family minimum versions and
+        tolerates Bedrock-prefixed IDs."""
+        from helion.autotuner.llm.transport import _temperature_deprecated
+
+        cases = {
+            # Opus 4.7+ rejects temperature (both bare and Bedrock-prefixed forms).
+            "claude-opus-4-7": True,
+            "claude-opus-4-8": True,
+            "us.anthropic.claude-opus-4-7": True,
+            "us.anthropic.claude-opus-4-8": True,
+            "us.anthropic.claude-opus-5-0": True,
+            # Opus 4.6 and earlier still accept temperature.
+            "claude-opus-4-6": False,
+            "us.anthropic.claude-opus-4-6-v1": False,
+            "us.anthropic.claude-opus-4-5-20251101-v1:0": False,
+            # Sonnet has no temperature-deprecation entry -> always accepts it.
+            "claude-sonnet-4-6": False,
+            "us.anthropic.claude-sonnet-4-6": False,
+            "us.anthropic.claude-sonnet-4-5-20250929-v1:0": False,
+            # Non-Anthropic / unknown strings fall through.
+            "gpt-5.5": False,
+            "custom-model": False,
+        }
+        for model, expected in cases.items():
+            with self.subTest(model=model):
+                self.assertEqual(_temperature_deprecated(model), expected)
+
+    def test_resolve_bedrock_region_precedence(self):
+        """Region comes from api_base override first, then AWS_REGION,
+        then AWS_DEFAULT_REGION."""
+        from helion.autotuner.llm.transport import _resolve_bedrock_region
+
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(_resolve_bedrock_region("us-west-2"), "us-west-2")
+            self.assertIsNone(_resolve_bedrock_region(None))
+        with patch.dict(os.environ, {"AWS_REGION": "us-east-1"}, clear=True):
+            self.assertEqual(_resolve_bedrock_region(None), "us-east-1")
+            # Explicit api_base still wins over the env var.
+            self.assertEqual(_resolve_bedrock_region("eu-west-1"), "eu-west-1")
+        with patch.dict(os.environ, {"AWS_DEFAULT_REGION": "ap-south-1"}, clear=True):
+            self.assertEqual(_resolve_bedrock_region(None), "ap-south-1")
+
+    def test_call_provider_bedrock_invokes_boto3_and_extracts_text(self):
+        """call_provider('bedrock', ...) builds the Anthropic body, moves the
+        model to modelId, adds anthropic_version, and parses the response."""
+        import json
+
+        from helion.autotuner.llm.transport import call_provider
+
+        captured = {}
+
+        class FakeBody:
+            def __init__(self, payload: bytes) -> None:
+                self._payload = payload
+
+            def read(self) -> bytes:
+                return self._payload
+
+        class FakeBedrockClient:
+            def invoke_model(self, *, modelId, body):
+                captured["modelId"] = modelId
+                captured["body"] = json.loads(body)
+                resp = {"content": [{"type": "text", "text": '{"configs": []}'}]}
+                return {"body": FakeBody(json.dumps(resp).encode("utf-8"))}
+
+        def fake_boto3_client(service, *, region_name=None, config=None):
+            captured["service"] = service
+            captured["region_name"] = region_name
+            return FakeBedrockClient()
+
+        fake_boto3 = SimpleNamespace(client=fake_boto3_client)
+        fake_botocore_config = SimpleNamespace(
+            config=SimpleNamespace(Config=lambda **kw: ("config", kw))
+        )
+        messages = [
+            {"role": "system", "content": "tune kernels"},
+            {"role": "user", "content": "suggest configs"},
+        ]
+        with (
+            patch.dict(os.environ, {"AWS_REGION": "us-east-2"}, clear=True),
+            patch.dict(
+                "sys.modules",
+                {
+                    "boto3": fake_boto3,
+                    "botocore": SimpleNamespace(config=fake_botocore_config.config),
+                    "botocore.config": fake_botocore_config.config,
+                },
+            ),
+        ):
+            response = call_provider(
+                "bedrock",
+                model="us.anthropic.claude-sonnet-4-6",
+                api_base=None,
+                api_key=None,
+                messages=messages,
+                max_output_tokens=512,
+                request_timeout_s=120.0,
+            )
+
+        self.assertEqual(response, '{"configs": []}')
+        self.assertEqual(captured["service"], "bedrock-runtime")
+        self.assertEqual(captured["region_name"], "us-east-2")
+        # The model is named via modelId, not in the request body.
+        self.assertEqual(captured["modelId"], "us.anthropic.claude-sonnet-4-6")
+        self.assertNotIn("model", captured["body"])
+        # Bedrock requires the version string and the standard Anthropic fields.
+        self.assertEqual(captured["body"]["anthropic_version"], "bedrock-2023-05-31")
+        self.assertEqual(captured["body"]["system"], "tune kernels")
+        self.assertEqual(captured["body"]["messages"][0]["role"], "user")
+
+    def test_call_provider_bedrock_missing_boto3_raises_clear_error(self):
+        """A helpful error is raised when boto3 is not installed."""
+        import builtins
+
+        from helion.autotuner.llm.transport import call_provider
+
+        real_import = builtins.__import__
+
+        def fake_import(name, *args, **kwargs):
+            if name == "boto3" or name.startswith("botocore"):
+                raise ImportError(f"No module named {name!r}")
+            return real_import(name, *args, **kwargs)
+
+        with patch.object(builtins, "__import__", side_effect=fake_import):
+            with self.assertRaisesRegex(RuntimeError, "boto3 is not installed"):
+                call_provider(
+                    "bedrock",
+                    model="us.anthropic.claude-sonnet-4-6",
+                    api_base=None,
+                    api_key=None,
+                    messages=[{"role": "user", "content": "hi"}],
+                    max_output_tokens=64,
+                    request_timeout_s=120.0,
+                )
+
+
 class TestLLMSeededLFBOTreeSearch(TestCase):
     """Tests for the two-stage LLM-seeded hybrid autotuner."""
 
