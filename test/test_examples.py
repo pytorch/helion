@@ -1121,8 +1121,8 @@ class TestExamples(RefEagerTestBase, TestCase):
         lengths = torch.randint(1, max_cols + 1, (num_rows,), device=DEVICE)
         x_offsets = torch.cat(
             [
-                torch.zeros(1, dtype=torch.long, device=DEVICE),
-                torch.cumsum(lengths, dim=0),
+                torch.zeros(1, dtype=LONG_INT_TYPE, device=DEVICE),
+                torch.cumsum(lengths, dim=0).to(LONG_INT_TYPE),
             ]
         )
         nnz = int(x_offsets[-1])
@@ -1406,8 +1406,8 @@ class TestExamples(RefEagerTestBase, TestCase):
         lengths = torch.randint(1, max_cols + 1, (num_rows,), device=DEVICE)
         x_offsets = torch.cat(
             [
-                torch.zeros(1, dtype=torch.long, device=DEVICE),
-                torch.cumsum(lengths, dim=0),
+                torch.zeros(1, dtype=LONG_INT_TYPE, device=DEVICE),
+                torch.cumsum(lengths, dim=0).to(LONG_INT_TYPE),
             ]
         )
         nnz = int(x_offsets[-1])
@@ -1907,8 +1907,8 @@ class TestExamples(RefEagerTestBase, TestCase):
         lengths = torch.randint(1, max_cols + 1, (num_rows,), device=DEVICE)
         x_offsets = torch.cat(
             [
-                torch.zeros(1, dtype=torch.long, device=DEVICE),
-                torch.cumsum(lengths, dim=0),
+                torch.zeros(1, dtype=LONG_INT_TYPE, device=DEVICE),
+                torch.cumsum(lengths, dim=0).to(LONG_INT_TYPE),
             ]
         )
         nnz = int(x_offsets[-1])
@@ -2032,8 +2032,8 @@ class TestExamples(RefEagerTestBase, TestCase):
         lengths = torch.randint(1, max_cols + 1, (num_rows,), device=DEVICE)
         x_offsets = torch.cat(
             [
-                torch.zeros(1, dtype=torch.long, device=DEVICE),
-                torch.cumsum(lengths, dim=0),
+                torch.zeros(1, dtype=LONG_INT_TYPE, device=DEVICE),
+                torch.cumsum(lengths, dim=0).to(LONG_INT_TYPE),
             ]
         )
         nnz = int(x_offsets[-1])
