@@ -756,6 +756,7 @@ def _(
             parent_spec = env.config_spec.block_sizes.block_id_lookup(parent_bid)
             parent_spec.min_size = 1
             parent_spec.max_size = 1
+            parent_spec.is_hard_pin = True
 
     _add_config_choices(
         [result.block_id],
