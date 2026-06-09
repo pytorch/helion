@@ -3668,10 +3668,10 @@ class CuteNDTileStrategy(NDTileStrategy):
                         ):
                             self._cute_lane_vec_width_by_block[block_id] = vec_width
                     else:
-                        # Unregistered only when bs.size is non-static (the eager
-                        # pass skips those) — run scalar.  A missing static-size
-                        # slot is an eager-pass bug.
-                        assert not isinstance(
+                        # Metal shares this strategy without vec-width tuning,
+                        # and non-static sizes are eager-skipped — both run
+                        # scalar.  A missing static slot on cute is a bug.
+                        assert env_local.backend_name != "cute" or not isinstance(
                             env_local.block_sizes[block_id].size,
                             (int, torch.SymInt),
                         ), (
