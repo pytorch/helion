@@ -77,6 +77,7 @@ if TYPE_CHECKING:
     from collections.abc import Iterable
     from collections.abc import Sequence
 
+    from ..autotuner.config_spec import MemoryOpFact
     from .cute.layout import CuTeGridExecutionPlan
 
     class _TLS(Protocol):
@@ -831,7 +832,7 @@ class DeviceIR:
         This is analysis-only: it runs the roller to determine which graphs can
         be rolled, records lightweight RolledReductionInfo entries, and registers
         config_spec entries for the autotuner.  Sub-graphs created by the roller
-        (e.g. ReductionLoopGraphInfo) are kept so that _count_device_loads_and_stores
+        (e.g. ReductionLoopGraphInfo) are kept so that _collect_memory_op_facts
         can account for their loads/stores in the indexing config.
         """
         env = CompileEnvironment.current()
@@ -2195,54 +2196,136 @@ class WalkHostAST(NodeVisitor):
             self.current_phase_roots = []
 
 
-def _count_device_loads_and_stores(
-    device_ir: DeviceIR,
-) -> tuple[int, int, list[int]]:
-    """Count the number of load and store operations in device code for autotuning.
+# Matmul/dot FX targets mapped to (lhs_arg_index, rhs_arg_index). Used to tag
+# which load nodes feed a matmul (and as which operand) at the recognition site,
+# instead of scanning every load's downstream users.
+def _matmul_operand_positions() -> dict[object, tuple[int, int]]:
+    from ..language import matmul_ops
 
-    Returns:
-        tuple[int, int, list[int]]: (
-            total_load_count,
-            loads_without_eviction_policy,
-            store_indices,
-        )
-            - total_load_count: all loads (for indexing tunable)
-            - loads_without_eviction_policy: loads that need eviction policy tuning
-            - store_indices: positions of store ops in the combined indexing list
+    return {
+        # mat1=0, mat1_scale=1, mat1_format=2, mat2=3 -> lhs/rhs matrices are 0/3
+        matmul_ops.dot_scaled: (0, 3),
+        matmul_ops.dot: (0, 1),
+        torch.ops.aten.mm.default: (0, 1),
+        torch.ops.aten.bmm.default: (0, 1),
+        torch.ops.aten.addmm.default: (1, 2),
+        torch.ops.aten.baddbmm.default: (1, 2),
+    }
+
+
+def _trace_back_to_load(arg: object, load_op: object) -> torch.fx.Node | None:
+    """Follow a matmul operand back through pass-through ops to its load node.
+
+    Only follows single-input pass-through ops (cast / transpose / view / unary
+    elementwise), so an operand that is a genuine computation of two loads (e.g.
+    ``a[...] + bias[...]``) is left untagged rather than mis-attributed to its
+    first input. Returns the producing ``hl.load`` node, or ``None``.
     """
+    cur = arg
+    for _ in range(8):
+        if not isinstance(cur, torch.fx.Node):
+            return None
+        if cur.target is load_op:
+            return cur
+        tensor_inputs = [
+            a
+            for a in cur.args
+            if isinstance(a, torch.fx.Node)
+            and isinstance(a.meta.get("val"), torch.Tensor)
+        ]
+        if len(tensor_inputs) != 1:
+            return None
+        cur = tensor_inputs[0]
+    return None
+
+
+def _load_needs_eviction_tunable(node: torch.fx.Node) -> bool:
+    """A load gets an eviction-policy slot only when the user did not pass one."""
+    eviction_policy_arg = node.kwargs.get("eviction_policy")
+    if eviction_policy_arg is None and len(node.args) >= 4:
+        eviction_policy_arg = node.args[3]
+    return eviction_policy_arg is None
+
+
+def _accessed_tensor_fake(node: torch.fx.Node) -> torch.Tensor | None:
+    """Fake tensor of the buffer a load/store accesses (``args[0]``)."""
+    arg = node.args[0] if node.args else None
+    if isinstance(arg, torch.fx.Node):
+        val = arg.meta.get("val")
+        if isinstance(val, torch.Tensor):
+            return val
+    return None
+
+
+def _collect_memory_op_facts(device_ir: DeviceIR) -> list[MemoryOpFact]:
+    """Walk every device graph once and record per-load/store metadata.
+
+    Produces one ``MemoryOpFact`` per load/store in the same order used to size
+    ``Config.indexing``, so ``memory_op_facts[i]`` describes
+    ``config.indexing[i]``. This is the single source of truth for load/store
+    counts, eviction slots, and ``store_indices`` (all derived from the result).
+    """
+    from ..autotuner.config_spec import MemoryOpFact
     from ..language import memory_ops
 
-    total_load_count = 0
-    loads_without_eviction_policy = 0
+    load_op = memory_ops.load
+    store_op = memory_ops.store
+    operand_positions = _matmul_operand_positions()
+
+    host = HostFunction.current()
+    # Matmul operands always precede their matmul in graph order, so `operands` is
+    # complete by the time we apply it to the (operand-less) facts below.
+    operands: dict[torch.fx.Node, str] = {}
+    records: list[tuple[torch.fx.Node, MemoryOpFact]] = []
     memory_op_index = 0
-    store_indices: list[int] = []
+    eviction_index = 0
 
     for graph_info in device_ir.graphs:
         for node in graph_info.graph.nodes:
-            if node.op == "call_function":
-                # Check if this is a load operation
-                if node.target is memory_ops.load:
-                    total_load_count += 1
-                    memory_op_index += 1
-                    # Check if this load needs eviction policy tuning
-                    # (user can still specify eviction_policy to override tuning)
-                    eviction_policy_arg = node.kwargs.get("eviction_policy")
-                    if eviction_policy_arg is None:
-                        # Check if eviction_policy was passed as positional arg (index 3)
-                        if len(node.args) >= 4:
-                            eviction_policy_arg = node.args[3]
-                        if eviction_policy_arg is None:
-                            loads_without_eviction_policy += 1
-                # Check if this is a store operation
-                elif node.target is memory_ops.store:
-                    store_indices.append(memory_op_index)
-                    memory_op_index += 1
+            if node.op != "call_function":
+                continue
 
-    return (
-        total_load_count,
-        loads_without_eviction_policy,
-        store_indices,
-    )
+            positions = operand_positions.get(node.target)
+            if positions is not None:
+                for arg_index, operand in (
+                    (positions[0], "lhs"),
+                    (positions[1], "rhs"),
+                ):
+                    if arg_index < len(node.args):
+                        load = _trace_back_to_load(node.args[arg_index], load_op)
+                        if load is not None:
+                            operands.setdefault(load, operand)
+                continue
+
+            is_load = node.target is load_op
+            if not (is_load or node.target is store_op):
+                continue
+
+            this_eviction_index: int | None = None
+            if is_load and _load_needs_eviction_tunable(node):
+                this_eviction_index = eviction_index
+                eviction_index += 1
+
+            fake = _accessed_tensor_fake(node)
+            origin = host.tensor_to_origin.get(fake) if fake is not None else None
+            records.append(
+                (
+                    node,
+                    MemoryOpFact(
+                        indexing_index=memory_op_index,
+                        kind="load" if is_load else "store",
+                        eviction_index=this_eviction_index,
+                        tensor_name=origin.root_rw_name() if origin else None,
+                        dtype=fake.dtype if fake is not None else None,
+                        ndim=fake.ndim if fake is not None else 0,
+                        num_reuses=len(node.users) if is_load else 0,
+                        matmul_operand=None,
+                    ),
+                )
+            )
+            memory_op_index += 1
+
+    return [fact._replace(matmul_operand=operands.get(node)) for node, fact in records]
 
 
 def _indexing_uses_tensor_descriptor(
@@ -2274,13 +2357,15 @@ def _count_device_atomics(device_ir: DeviceIR) -> int:
 def _register_load_store_tunables(
     total_load_count: int,
     loads_without_eviction_policy: int,
+    loads_without_cache_modifier: int,
     store_indices: list[int],
 ) -> None:
-    """Register list-based tunables (indexing, eviction policies) for all device loads and stores.
+    """Register list-based tunables for device loads and stores.
 
     Args:
         total_load_count: Total number of loads (for indexing tunable)
         loads_without_eviction_policy: Number of loads that need eviction policy tuning
+        loads_without_cache_modifier: Number of loads that need cache modifier tuning
         store_indices: Positions of store ops in the combined indexing list
     """
     store_count = len(store_indices)
@@ -2292,12 +2377,22 @@ def _register_load_store_tunables(
     from ..autotuner.config_fragment import EnumFragment
     from ..autotuner.config_fragment import ListOf
     from ..autotuner.config_spec import get_valid_eviction_policies
+    from ..autotuner.config_spec import get_valid_load_cache_modifiers
 
     # Register eviction policies only for loads without explicit eviction_policy
     if loads_without_eviction_policy > 0:
         env.config_spec.load_eviction_policies = ListOf(
             EnumFragment(choices=get_valid_eviction_policies(env.backend_name)),
             length=loads_without_eviction_policy,
+        )
+
+    # Register cache modifiers only for loads and only when the backend has
+    # a non-trivial search space.
+    load_cache_modifier_choices = get_valid_load_cache_modifiers(env.backend_name)
+    if loads_without_cache_modifier > 0 and len(load_cache_modifier_choices) > 1:
+        env.config_spec.load_cache_modifiers = ListOf(
+            EnumFragment(choices=load_cache_modifier_choices),
+            length=loads_without_cache_modifier,
         )
 
     # Indexing applies to ALL loads and stores
@@ -2446,16 +2541,17 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
                     )
                 config_spec.allowed_pid_types = non_persistent_pid_types
 
-        # Count all device loads and stores and register tunables
-        (
-            total_load_count,
-            loads_without_eviction_policy,
-            store_indices,
-        ) = _count_device_loads_and_stores(device_ir)
+        # Collect per-load/store metadata once; derive the load/store tunables
+        # from it so heuristics can map each Config.indexing slot to its graph op.
+        memory_op_facts = _collect_memory_op_facts(device_ir)
+        config_spec.memory_op_facts = memory_op_facts
+        load_count = sum(f.kind == "load" for f in memory_op_facts)
         _register_load_store_tunables(
-            total_load_count,
-            loads_without_eviction_policy,
-            store_indices,
+            load_count,
+            sum(f.eviction_index is not None for f in memory_op_facts),
+            # cache_modifier is tuned for every load (no per-load override)
+            load_count,
+            [f.indexing_index for f in memory_op_facts if f.kind == "store"],
         )
         _register_atomic_tunables(_count_device_atomics(device_ir))
         _register_tensor_descriptor_layout_guards(device_ir)

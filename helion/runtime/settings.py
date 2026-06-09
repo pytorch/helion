@@ -14,6 +14,7 @@ from typing import Protocol
 from typing import Sequence
 from typing import TypeVar
 from typing import cast
+from typing import get_args
 
 import torch
 from torch._environment import is_fbcode
@@ -43,7 +44,7 @@ if TYPE_CHECKING:
         ) -> BaseAutotuner: ...
 
 
-DotPrecision = Literal["tf32", "tf32x3", "ieee"]
+DotPrecision = Literal["tf32", "tf32x3", "ieee", "default", "high", "highest"]
 PrecompileMode = Literal["spawn", "fork"] | None
 _TRUE_LITERALS = frozenset({"1", "true", "yes", "on"})
 _FALSE_LITERALS = frozenset({"0", "false", "no", "off"})
@@ -325,9 +326,24 @@ def _get_ref_mode() -> RefMode:
 
 def _get_dot_precision() -> DotPrecision:
     """
-    Get the dot precision setting from TRITON_F32_DEFAULT environment variable.
+    Gets the dot precision setting from the TRITON_F32_DEFAULT environment variable.
     Defaults to 'tf32', 'ieee' if rocm and not CDNA.
+    For Pallas, gets the precision setting from the JAX_DEFAULT_MATMUL_PRECISION environment variable, defaulting to 'default'.
     """
+    if _get_backend() == "pallas":
+        return _env_get_literal(
+            "JAX_DEFAULT_MATMUL_PRECISION",
+            cast("DotPrecision", "default"),
+            mapping={
+                "default": "default",
+                "high": "high",
+                "highest": "highest",
+                "bfloat16": "default",
+                "tensorfloat32": "high",
+                "float32": "highest",
+            },
+        )
+
     if is_hip():
         default_precision = "tf32" if supports_tf32_precision_on_amd() else "ieee"
     else:
@@ -336,7 +352,7 @@ def _get_dot_precision() -> DotPrecision:
     return _env_get_literal(
         "TRITON_F32_DEFAULT",
         cast("DotPrecision", default_precision),
-        mapping={k: k for k in ("tf32", "tf32x3", "ieee")},
+        mapping={k: k for k in get_args(DotPrecision)},
     )
 
 
@@ -596,7 +612,7 @@ class Settings(_Settings):
             "The dtype to use for index variables. Default auto-selects torch.int32 or torch.int64 based on input sizes. "
             "Override with HELION_INDEX_DTYPE=<dtype> (or set to 'auto')."
         ),
-        "dot_precision": "Precision for dot products, see `triton.language.dot`. Can be 'tf32', 'tf32x3', or 'ieee'.",
+        "dot_precision": "Precision for dot products. For Triton backend, see `triton.language.dot` (can be 'tf32', 'tf32x3', 'ieee'). For JAX/Pallas backend, can be 'default', 'high', 'highest' (mapped to JAX precision). Unified mappings exist so that any value can be used on any backend.",
         "fast_math": (
             "If True, enable fast math approximations (Helion-level and Inductor-level). "
             "May reduce numerical precision. Set HELION_FAST_MATH=1 to enable."

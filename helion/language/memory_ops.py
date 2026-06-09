@@ -6212,6 +6212,14 @@ def _(state: CodegenState) -> ast.AST:
         assert isinstance(eviction_policy, str)
         eviction_policy = ast.Constant(value=eviction_policy)
 
+    cache_modifier = None
+    if state.codegen.on_device:
+        modifier_idx = device_fn.device_load_cache_modifier_index
+        device_fn.device_load_cache_modifier_index += 1
+        modifiers = state.config.load_cache_modifiers
+        if modifier_idx < len(modifiers) and modifiers[modifier_idx]:
+            cache_modifier = ast.Constant(value=modifiers[modifier_idx])
+
     if isinstance(tensor, torch.Tensor):
         tile_index_result = _maybe_materialize_tile_index_load(state, tensor, subscript)
         if tile_index_result is not None:
@@ -6229,11 +6237,12 @@ def _(state: CodegenState) -> ast.AST:
                 [*subscript],
                 extra_mask,
                 eviction_policy,
+                cache_modifier,
                 strategy.codegen_load,
             )
 
         return strategy.codegen_load(
-            state, tensor, [*subscript], extra_mask, eviction_policy
+            state, tensor, [*subscript], extra_mask, eviction_policy, cache_modifier
         )
     if isinstance(tensor, tuple):
         from .._compiler.indexing_strategy import StackIndexingStrategy
@@ -6245,7 +6254,13 @@ def _(state: CodegenState) -> ast.AST:
         assert len(stack_tensor_ast) == 2
         tensor_like_ast, dev_ptrs_ast = stack_tensor_ast
         return StackIndexingStrategy.codegen_load(
-            state, tensor, dev_ptrs_ast, [*subscript], extra_mask, eviction_policy
+            state,
+            tensor,
+            dev_ptrs_ast,
+            [*subscript],
+            extra_mask,
+            eviction_policy,
+            cache_modifier,
         )
     raise NotImplementedError(f"Unsupported tensor type: {type(tensor)}")
 
@@ -6286,7 +6301,7 @@ def _(state: CodegenState) -> ast.AST:
         device_fn.device_memory_op_index += 1
         strategy = device_fn.get_indexing_strategy(indexing_idx)
         return strategy.codegen_load(
-            state, tensor, [*subscript], extra_mask, eviction_policy
+            state, tensor, [*subscript], extra_mask, eviction_policy, None
         )
     raise exc.BackendUnsupported("metal", f"load tensor type: {type(tensor)}")
 

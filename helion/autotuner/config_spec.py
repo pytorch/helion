@@ -85,6 +85,29 @@ class MatmulFact(NamedTuple):
     rhs_dtype: torch.dtype
 
 
+class MemoryOpFact(NamedTuple):
+    """Metadata linking one ``Config.indexing`` slot to its graph memory op.
+
+    One entry per load/store, recorded in the same graph-traversal order that
+    sizes ``Config.indexing`` / ``Config.load_eviction_policies`` (see
+    ``_collect_memory_op_facts`` in ``device_ir``), so
+    ``memory_op_facts[i].indexing_index == i`` describes ``config.indexing[i]``.
+
+    Autotuner heuristics use this to reason about *which* load/store a slot is
+    (the row load, a matmul operand, a reused buffer, ...) instead of guessing
+    from a bare positional index.
+    """
+
+    indexing_index: int  # slot in Config.indexing (== position in this list)
+    kind: str  # "load" | "store"
+    eviction_index: int | None  # slot in Config.load_eviction_policies, else None
+    tensor_name: str | None  # host buffer name being accessed, e.g. "x", "weight"
+    dtype: torch.dtype | None  # element dtype of the accessed tensor
+    ndim: int  # rank of the accessed tensor
+    num_reuses: int  # downstream FX consumers of the load (0 for stores)
+    matmul_operand: str | None  # matmul/dot operand: "lhs" | "rhs" | None
+
+
 def shrink_block_sizes_for_numel_constraints(
     constraints: list[TensorNumelConstraint],
     block_sizes: list[int],
@@ -160,6 +183,7 @@ BACKEND_SPECIFIC_KEYS: frozenset[str] = (
     | {
         "num_threads",
         "cute_vector_widths",
+        "load_cache_modifiers",
         "pallas_loop_type",
         "pallas_pre_broadcast",
     }
@@ -186,6 +210,7 @@ VALID_KEYS: frozenset[str] = frozenset(
         "indexing",
         "atomic_indexing",
         "load_eviction_policies",
+        "load_cache_modifiers",
         "pallas_loop_type",
         "pallas_pre_broadcast",
         "cute_vector_widths",
@@ -244,6 +269,12 @@ _CUTE_IMPLICIT_DEFAULT_KEYS: frozenset[str] = frozenset(
 def get_valid_eviction_policies(backend_name: str) -> tuple[str, ...]:
     if backend_name == "triton" and not supports_amd_cdna_tunables():
         return ("", "first", "last")
+    return ("",)
+
+
+def get_valid_load_cache_modifiers(backend_name: str) -> tuple[str, ...]:
+    if backend_name == "triton" and supports_amd_cdna_tunables():
+        return ("", ".cg")
     return ("",)
 
 
@@ -308,6 +339,10 @@ class ConfigSpec:
             EnumFragment(choices=get_valid_eviction_policies(self.backend_name)),
             length=0,
         )
+        self.load_cache_modifiers = ListOf(
+            EnumFragment(choices=get_valid_load_cache_modifiers(self.backend_name)),
+            length=0,
+        )
         self.indexing = ListOf(
             EnumFragment(choices=self.valid_indexing_types()),
             length=0,
@@ -327,6 +362,7 @@ class ConfigSpec:
         self.autotuner_heuristics: list[str] = []
         self.matmul_facts: list[MatmulFact] = []
         self.store_indices: list[int] = []
+        self.memory_op_facts: list[MemoryOpFact] = []
         self.backend_tunable_fragments = self.backend.tunable_fragments()
         unknown_tunables = set(self.backend_tunable_fragments) - BACKEND_TUNABLE_KEYS
         if unknown_tunables:
@@ -982,6 +1018,7 @@ class ConfigSpec:
             "range_flattens",
             "static_ranges",
             "load_eviction_policies",
+            "load_cache_modifiers",
             "indexing",
             "atomic_indexing",
         ):
@@ -993,6 +1030,7 @@ class ConfigSpec:
             "num_warps",
             "num_stages",
             "load_eviction_policies",
+            "load_cache_modifiers",
             "indexing",
             "atomic_indexing",
             "pid_type",
@@ -1009,6 +1047,13 @@ class ConfigSpec:
         if self.supports_config_key("load_eviction_policies"):
             config.setdefault(
                 "load_eviction_policies", self.load_eviction_policies.default()
+            )
+        if (
+            self.supports_config_key("load_cache_modifiers")
+            and self.load_cache_modifiers.length > 0
+        ):
+            config.setdefault(
+                "load_cache_modifiers", self.load_cache_modifiers.default()
             )
         if self.supports_config_key("indexing"):
             config.setdefault("indexing", self.indexing.default())
@@ -1429,6 +1474,11 @@ class ConfigSpec:
             )
         if self.supports_config_key("load_eviction_policies"):
             fields["load_eviction_policies"] = self.load_eviction_policies
+        if (
+            self.supports_config_key("load_cache_modifiers")
+            and self.load_cache_modifiers.length > 0
+        ):
+            fields["load_cache_modifiers"] = self.load_cache_modifiers
         if self.supports_config_key("num_threads"):
             fields["num_threads"] = self.num_threads
         if is_tileir:
@@ -1546,6 +1596,7 @@ class ConfigSpec:
             "range_flattens",
             "static_ranges",
             "load_eviction_policies",
+            "load_cache_modifiers",
             "indexing",
             "atomic_indexing",
         ):

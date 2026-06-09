@@ -16,6 +16,7 @@ from types import SimpleNamespace
 from typing import TYPE_CHECKING
 from typing import Callable
 from typing import Generator
+from typing import NamedTuple
 from typing import ParamSpec
 from typing import Sequence
 from typing import TypeVar
@@ -26,6 +27,7 @@ from unittest.mock import patch
 import pytest
 import torch
 import torch.distributed as dist
+import torch.nn.functional
 from torch.utils._pytree import tree_map
 
 from ._compat import get_mtia_tunable_fragments
@@ -64,6 +66,11 @@ if TYPE_CHECKING:
 
 _R = TypeVar("_R")
 _P = ParamSpec("_P")
+
+
+class CosSimilarity(NamedTuple):
+    dim: int
+    min_similarity: float
 
 
 def _strip_launcher_args(value: str) -> str:
@@ -414,6 +421,23 @@ def patch_cute_mma_support(
         ),
     ):
         yield support
+
+
+@contextlib.contextmanager
+def float32_matmul_precision(precision: str) -> Generator[None, None, None]:
+    """Context manager to temporarily set the float32 matrix multiplication precision.
+
+    The original `torch.float32_matmul_precision` setting is restored upon exiting the context.
+
+    Args:
+        precision: The precision level to set ("highest", "high", or "medium").
+    """
+    original_precision = torch.get_float32_matmul_precision()
+    torch.set_float32_matmul_precision(precision)
+    try:
+        yield
+    finally:
+        torch.set_float32_matmul_precision(original_precision)
 
 
 def skipIfNotTriton(reason: str) -> Callable[[Callable], Callable]:
@@ -1347,6 +1371,7 @@ def _assert_example_result_close(
     skip_accuracy: bool,
     atol: float,
     rtol: float,
+    cos_sim: CosSimilarity | tuple[int, float] | None = None,
 ) -> None:
     if skip_accuracy:
         return
@@ -1362,9 +1387,19 @@ def _assert_example_result_close(
         assert isinstance(got, torch.Tensor) and isinstance(exp, torch.Tensor), (
             f"Type mismatch: got {type(got)}, expected {type(exp)}"
         )
+        got_f32 = got.to(torch.float32)
+        exp_f32 = exp.to(torch.float32)
+
+        if cos_sim is not None:
+            dim, min_sim = cos_sim
+            sim = torch.nn.functional.cosine_similarity(got_f32, exp_f32, dim=dim)
+            assert sim.mean().item() >= min_sim, (
+                f"Cosine similarity {sim.mean().item()} is less than {min_sim}"
+            )
+
         torch.testing.assert_close(
-            got.to(torch.float32),
-            exp.to(torch.float32),
+            got_f32,
+            exp_f32,
             atol=atol,
             rtol=rtol,
         )
@@ -1394,6 +1429,7 @@ def check_example(
     atol: float = 1e-1,
     rtol: float = 1e-2,
     emit_code: bool = True,
+    cos_sim: CosSimilarity | tuple[int, float] | None = None,
     **kwargs: object,
 ) -> str:
     """Helper used in unit tests to run a single example kernel and check its output."""
@@ -1413,7 +1449,12 @@ def check_example(
             **kwargs,
         )
     _assert_example_result_close(
-        result, expected, skip_accuracy=skip_accuracy, atol=atol, rtol=rtol
+        result,
+        expected,
+        skip_accuracy=skip_accuracy,
+        atol=atol,
+        rtol=rtol,
+        cos_sim=cos_sim,
     )
     return code
 

@@ -778,8 +778,8 @@ class LocalBenchmarkProvider(BenchmarkProvider):
                     self.kernel, config, e, captured_output=captured[0] or None
                 )
                 self.log.warning(
-                    "Skipping config that failed to compile: %s",
-                    self.kernel.format_kernel_decorator(config, self.settings),
+                    "Skipping config that failed to compile: "
+                    f"{self.kernel.format_kernel_decorator(config, self.settings)}",
                     exc_info=True,
                 )
         fns = list(compiled.values())

@@ -85,6 +85,7 @@ def _known_keys_strategy() -> st.SearchStrategy[dict[str, Any]]:
             "load_eviction_policies": st.lists(
                 st.sampled_from(["", "first", "last"]), max_size=4
             ),
+            "load_cache_modifiers": st.lists(st.sampled_from(["", ".cg"]), max_size=4),
             "num_warps": st.integers(min_value=1, max_value=64),
             "num_stages": st.integers(min_value=1, max_value=16),
             "pid_type": st.sampled_from(
@@ -116,6 +117,7 @@ def _unknown_keys_strategy() -> st.SearchStrategy[dict[str, Any]]:
                     "range_flattens",
                     "static_ranges",
                     "load_eviction_policies",
+                    "load_cache_modifiers",
                     "num_warps",
                     "num_stages",
                     "pid_type",
@@ -173,6 +175,7 @@ class TestConfigAPI(TestCase):
             "range_flattens",
             "static_ranges",
             "load_eviction_policies",
+            "load_cache_modifiers",
             "num_warps",
             "num_stages",
             "pid_type",
@@ -728,6 +731,25 @@ class TestHardwareConfigSpecRanges(TestCase):
             nvidia_spec.load_eviction_policies.inner.choices,
             ("", "first", "last"),
         )
+
+    def test_load_cache_modifier_choices_do_not_leak_mocked_amd_state(self) -> None:
+        """Mocked AMD capability detection should not poison later Triton specs."""
+        from helion._compiler.backend import TritonBackend
+        from helion.autotuner.config_spec import ConfigSpec
+
+        with patch(
+            "helion.autotuner.config_spec.supports_amd_cdna_tunables",
+            return_value=True,
+        ):
+            amd_spec = ConfigSpec(backend=TritonBackend())
+        self.assertEqual(amd_spec.load_cache_modifiers.inner.choices, ("", ".cg"))
+
+        with patch(
+            "helion.autotuner.config_spec.supports_amd_cdna_tunables",
+            return_value=False,
+        ):
+            nvidia_spec = ConfigSpec(backend=TritonBackend())
+        self.assertEqual(nvidia_spec.load_cache_modifiers.inner.choices, ("",))
 
 
 class TestCuteTcgen05ConfigSpecSplit(TestCase):
