@@ -153,8 +153,6 @@ def create_test_jagged_tensor(
     # Generate random sequence lengths
     seq_lengths = torch.randint(1, max_seqlen + 1, (B,), device=device)
 
-    # Create offsets.  Pallas/TPU rejects int64; use the testing helper that
-    # maps to int32 on pallas and int64 elsewhere so the script works on both.
     from helion._testing import LONG_INT_TYPE
 
     x_offsets = torch.cat(

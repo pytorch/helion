@@ -450,11 +450,7 @@ def _(state: CodegenState) -> None:
                 out_dim += 1
         if mask_exprs:
             mask_expr = " * ".join(mask_exprs)
-            # For jagged-flat the ``where``'s fallback (``name[idx_str]`` is
-            # the post-squeeze 2-D scratch read) is shape-incompatible with
-            # the pre-squeeze 3-D value.  Use a 0 fallback there since the
-            # store is followed by a DMA that ships only the valid region.
-            if jagged_flat_pattern is not None:
+            if jagged_flat_pattern is not None or mem_space == PallasMemorySpace.HBM:
                 value = expr_from_string(
                     f"jnp.where(({mask_expr}).astype(jnp.bool_), {{value}}, "
                     f"jnp.zeros_like({{value}}))",
