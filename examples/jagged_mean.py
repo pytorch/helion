@@ -33,14 +33,7 @@ def jagged_mean_kernel(
     x_data: torch.Tensor,
     x_offsets: torch.Tensor,
     x_feature_counts: torch.Tensor,  # [num_rows] - number of features per row
-    # ``max_M`` participates in shape math (``out`` lane dim,
-    # ``* max_M`` stride in ``flat_indices``).  Mark ``hl.constexpr`` so it
-    # bakes into the trace as a concrete int — the autotuner's static-shape
-    # analysis caps BM at the actual lane (e.g. 8) instead of defaulting to
-    # 128.  Without this annotation, Helion wraps ``max_M`` as an unbacked
-    # SymInt and ``out.shape`` lands as ``(num_rows, u0)`` — the autotuner
-    # can't reason about it.
-    max_M: hl.constexpr,  # Maximum number of features
+    max_M: int,  # Maximum number of features
 ) -> torch.Tensor:
     """
     Compute the mean of each row in a jagged tensor with variable features per row.
