@@ -289,15 +289,22 @@ def _record_pad_info(
     at offset 0, ``begin % block_size`` for a constant begin, or
     ``block_size - 1`` for a data-dependent begin.
 
-    Note: stores one entry per (tensor, dim).  If two inner loops tile the
-    same dim with different block_ids, the last one wins.  This is fine when
-    both loops use the same block size (the common case).
+    When two inner loops tile the same (tensor, dim) with different
+    ``block_id`` (e.g. softmax's pass1 and pass2 each running ``hl.tile``
+    over the sublane), keep the LARGER ``extra_pad`` -- otherwise a
+    small-BK loop registered last clobbers a big-BK loop's required
+    tail buffer and the big-BK DMA over-reads HBM at runtime
+    (RuntimeUnexpectedCoreHalt: BoundsCheck on dma.hbm_to_vmem).  The
+    block_id we keep is the one contributing the max extra_pad, since
+    its block_size drives the alignment requirement.
     """
     pad_info = state.device_function.pallas_pad_info
     tensor_id = id(tensor)
     if tensor_id not in pad_info:
         pad_info[tensor_id] = {}
-    pad_info[tensor_id][tensor_dim] = (block_id, extra_pad)
+    existing = pad_info[tensor_id].get(tensor_dim)
+    if existing is None or extra_pad > existing[1]:
+        pad_info[tensor_id][tensor_dim] = (block_id, extra_pad)
 
 
 def _maybe_get_symbol_origin(idx: object) -> SymbolOrigin | None:
