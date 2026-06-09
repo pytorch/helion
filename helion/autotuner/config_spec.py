@@ -1674,6 +1674,12 @@ class BlockSizeSpec(_PowerOfTwoBlockIdItem):
         )
         # Outer block_id whose tile extent caps this block's size in normalize().
         self.bounded_by_block_id: int | None = bounded_by_block_id
+        # Set by backend code that wants user-supplied block_size CLAMPED
+        # DOWN to max_size (e.g. Pallas jagged-tile parents).  Without this
+        # flag, _normalize lets values above max_size flow through unchanged
+        # so users can intentionally over-block (e.g. block_size > tensor_dim
+        # to exercise codegen slicing).
+        self.is_hard_pin: bool = False
         if self.max_size < self.min_size:
             self.max_size = self.min_size
         assert self.min_size <= self.max_size
@@ -1694,8 +1700,18 @@ class BlockSizeSpec(_PowerOfTwoBlockIdItem):
 
     def _normalize(self, name: str, value: object) -> int | None:
         result = super()._normalize(name, value)
-        if isinstance(result, int) and result < self.min_size:
-            result = self.min_size
+        if isinstance(result, int):
+            if result < self.min_size:
+                result = self.min_size
+            # Backend-imposed hard pins (e.g. Pallas jagged-tile parents pinned
+            # to block_size=1) must override user-supplied configs.  We use an
+            # explicit ``is_hard_pin`` flag rather than inferring from
+            # min_size == max_size: other code paths (matmul broadcast-dim
+            # collapse, numel=1 dims, etc.) can legitimately end up with
+            # min == max for sizing reasons, and we don't want to silently
+            # clamp those user values.
+            if self.is_hard_pin and result > self.max_size:
+                result = self.max_size
         return result
 
     def update_min(self, value: int) -> None:
