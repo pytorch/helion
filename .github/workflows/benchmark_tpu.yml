@@ -110,7 +110,7 @@ jobs:
           cd -
           rm -rf /tmp/torch_tpu
           # Verify
-          python -c "from torch_tpu import api; print(f'TPU device: {api.tpu_device()}')"
+          python -c "import torch, sys; print('Success') if torch.tpu.is_available() else (print('(Torch)TPU not available'), sys.exit(1))"
 
       - name: Run TPU Benchmark
         run: |
