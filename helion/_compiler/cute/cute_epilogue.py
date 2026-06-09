@@ -105,13 +105,9 @@ class _AuxiliaryTensorStep:
     ``{aux}`` (the per-thread auxiliary load expression). Renderers
     do **not** parenthesize ``{aux}`` because the splice site emits
     ``aux`` as a bound local first — there is no precedence
-    ambiguity inside the rendered binary expression.
-
-    ``forward_form`` is ``True`` when the carrier is the *left*
-    operand (``carrier <op> aux``) and ``False`` when it is the
-    right (``aux <op> carrier``). Commutative ops (``add`` / ``mul``)
-    only need one form; non-commutative ones (``sub`` / ``div``)
-    use the flag to render the correct direction.
+    ambiguity inside the rendered binary expression. The direction
+    (``carrier <op> aux`` vs ``aux <op> carrier``) is already baked
+    into ``op_template`` for non-commutative ops (``sub`` / ``div``).
 
     ``load_node`` is the FX node for the ``helion.language.load``
     call. The splice site reads ``load_node.args[0]`` (the auxiliary
@@ -145,7 +141,6 @@ class _AuxiliaryTensorStep:
 
     op_name: str
     op_template: str
-    forward_form: bool
     load_node: torch.fx.Node
     broadcast_axis: int | None = None
 
@@ -802,7 +797,6 @@ def _classify_binary(
             _AuxiliaryTensorStep(
                 op_name=op_name,
                 op_template=op_template,
-                forward_form=forward_form,
                 load_node=aux_load,
                 broadcast_axis=broadcast_axis,
             ),

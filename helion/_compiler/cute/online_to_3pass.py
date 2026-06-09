@@ -113,51 +113,9 @@ def _single_target_name(assign: ast.AST) -> str | None:
     return _name(assign.targets[0])
 
 
-def _is_full_init(node: ast.AST, tile_name: str, value_repr: str) -> bool:
-    """Detect ``hl.full([<tile_name>], <value>, dtype=torch.float32)`` /
-    ``hl.zeros([<tile_name>], dtype=torch.float32)``.
-
-    ``value_repr`` is the textual ast.unparse of the expected value
-    expression (e.g. ``float('-inf')`` or ``0.0`` or ``0``).
-    """
-    if not (
-        _is_hl_call(node, "full") or _is_hl_call(node, "zeros")
-    ):  # pragma: no cover
-        return False
-    call = node
-    assert isinstance(call, ast.Call)
-    args = call.args
-    if not args:
-        return False
-    first = args[0]
-    if not (
-        isinstance(first, ast.List)
-        and len(first.elts) == 1
-        and _name(first.elts[0]) == tile_name
-    ):
-        return False
-    if _is_hl_call(node, "zeros"):
-        return value_repr in {"0", "0.0"}
-    # hl.full — second arg is the value
-    if len(args) < 2:
-        return False
-    return ast.unparse(args[1]) == value_repr
-
-
 def _is_tile_call(node: ast.AST) -> bool:
     """Detect ``hl.tile(<extent>, ...)`` calls used as for-loop iterators."""
     return _is_hl_call(node, "tile")
-
-
-def _matches_subscript(node: ast.AST, value: str, index_text: str) -> bool:
-    """Return True if ``node`` is a Subscript ``<value>[<index_text>]`` where
-    ``index_text`` is the unparsed slice expression.
-    """
-    if not isinstance(node, ast.Subscript):
-        return False
-    if _name(node.value) != value:
-        return False
-    return ast.unparse(node.slice) == index_text
 
 
 def _expr_unparse(node: ast.AST) -> str:

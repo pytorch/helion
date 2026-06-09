@@ -239,7 +239,6 @@ class LayoutConstraint:
       inputs.
     * *preferred_output* / *output_layout* describe how this node produces its
       tensor output.
-    * *required* marks the constraint as non-negotiable for propagation.
 
     Pointwise / passthrough ops typically resolve both sides to the same
     layout. Ops like ``load`` only have an output layout, while ``store`` and
@@ -252,7 +251,6 @@ class LayoutConstraint:
     output_layout: ThreadLayout | None = None
     matmul_axes: MatmulAxisModel | None = None
     matmul_plan: MatmulExecutionPlan | None = None
-    required: bool = False
 
     def primary_layout(self) -> ThreadLayout | None:
         """Return the node's main resolved layout for logging/debugging."""
