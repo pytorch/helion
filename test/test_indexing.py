@@ -230,7 +230,7 @@ class TestIndexing(RefEagerTestBase, TestCase):
     @skipIfTileIR("hint is emitted by the Triton pointer indexing strategy")
     @skipIfRefEager("asserts on generated Triton code")
     def test_contiguity_hint_does_not_fire_outside_swizzle(self):
-        # Blocklist: plain loads, data gathers, permutations, and non-useful widths.
+        # Blocklist: plain loads, data gathers, permutations, and non-vectorizable widths.
         @helion.kernel(static_shapes=True)
         def affine_load(scale: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
             (n,) = out.shape
