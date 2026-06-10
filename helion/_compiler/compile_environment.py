@@ -204,7 +204,10 @@ def shape_env_var_hints(shape_env: ShapeEnv) -> dict[sympy.Symbol, sympy.Integer
     # torch renamed ShapeEnv.var_to_val -> ShapeEnv.backed_var_to_val.
     if (backed_var_to_val := getattr(shape_env, "backed_var_to_val", None)) is not None:
         return typing.cast("dict[sympy.Symbol, sympy.Integer]", backed_var_to_val)
-    return shape_env.var_to_val  # pyrefly: ignore [deprecated]
+    return typing.cast(
+        "dict[sympy.Symbol, sympy.Integer]",
+        shape_env.var_to_val,  # pyrefly: ignore [deprecated]
+    )
 
 
 class CompileEnvironment:
@@ -614,7 +617,7 @@ class CompileEnvironment:
                 return False
             expr = x._sympy_()
             if isinstance(expr, sympy.Symbol):
-                return symbol_is_type(expr, SymT.UNBACKED_INT)
+                return symbol_is_type(expr, SymT.UNBACKED_INT)  # pyrefly: ignore [bad-argument-type]
             return False
 
         # Check for existing reduction dimensions with the same size

@@ -1,11 +1,11 @@
 from __future__ import annotations
 
 import ast
-from collections.abc import Callable
 import dataclasses
 from typing import TYPE_CHECKING
 from typing import Literal
 from typing import NamedTuple
+from typing import cast
 
 import torch
 
@@ -14,6 +14,8 @@ from ..ast_extension import ExtendedAST
 from ..ast_extension import expr_from_string
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from ..compile_environment import CompileEnvironment
     from ..inductor_lowering import CodegenState
 
@@ -201,9 +203,7 @@ class PipelineContext:
     @property
     def outer_offset_vars(self) -> list[str]:
         return [
-            axis.offset_var
-            for axis in self.outer_axes
-            if axis.offset_var is not None
+            axis.offset_var for axis in self.outer_axes if axis.offset_var is not None
         ]
 
     @property
@@ -488,6 +488,7 @@ class _PrologueTensorPipelineInputCollector(ast.NodeVisitor):
         outer_info = _outer_offset_dim(self.outer_context, dims)
         if outer_info is None:
             _raise_unsupported_outer_prologue_access(hbm_name)
+        assert outer_info is not None
         outer_dim, offset_name = outer_info
         existing = self.prologue_inputs.get(hbm_name)
         if existing is not None:
@@ -577,11 +578,11 @@ class _PrologueTensorPipelineInputRemapper(ast.NodeTransformer):
             return node
         outer_dim, _offset_name = outer_info
         dims[outer_dim] = ast.Constant(value=0)
-        new_slice: ast.AST
+        new_slice: ast.expr
         if len(dims) == 1:
-            new_slice = dims[0]
+            new_slice = cast("ast.expr", dims[0])
         else:
-            new_slice = ast.Tuple(elts=dims, ctx=ast.Load())
+            new_slice = ast.Tuple(elts=cast("list[ast.expr]", dims), ctx=ast.Load())
         return ast.copy_location(
             ast.Subscript(
                 value=ast.Name(id=remap.vmem_name, ctx=ast.Load()),

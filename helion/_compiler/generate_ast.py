@@ -49,6 +49,7 @@ if TYPE_CHECKING:
     from .device_ir import GraphInfo
     from .host_function import HostFunction
     from .loop_dependency_checker import LoopDependencyChecker
+    from .pallas.outer_pipeline import PipelineContext
     from .tile_strategy import DeviceLoopOrGridState
     from .type_info import TensorType
 
@@ -240,6 +241,25 @@ class GenerateAST(NodeVisitor, CodegenInterface):
                 out.add(name)
         return out
 
+    def _outer_pipeline_context_for_statement(self) -> PipelineContext | None:
+        """Return active outer-pipeline context for device statements only.
+
+        Keep the generic ``add_statement`` hook inert unless this is a fully
+        initialized Pallas outer-pipeline codegen. Some tests use lightweight
+        ``GenerateAST`` doubles that intentionally skip ``__init__``.
+        """
+        if not getattr(self, "on_device", False):
+            return None
+
+        device_function = getattr(self, "device_function", None)
+        config = getattr(device_function, "config", None)
+        if config is None:
+            return None
+        if config.get("pallas_loop_type", "unroll") != "outer_pipeline":
+            return None
+
+        return CompileEnvironment.current().outer_pipeline_context
+
     def add_statement(self, stmt: ast.AST | str | None) -> None:
         if stmt is None:
             return
@@ -250,13 +270,7 @@ class GenerateAST(NodeVisitor, CodegenInterface):
         # context for replay inside the pipeline body rather than the current
         # scope. The scope guards ensure the grid body holds nothing but this
         # prologue and the folded loop, so capturing everything here is sound.
-        outer_context = (
-            CompileEnvironment.current().outer_pipeline_context
-            if self.on_device
-            and self.device_function.config.get("pallas_loop_type", "unroll")
-            == "outer_pipeline"
-            else None
-        )
+        outer_context = self._outer_pipeline_context_for_statement()
         if outer_context is not None and outer_context.capturing_prologue_replay:
             outer_context.capture_prologue_statement(stmt)
         elif (

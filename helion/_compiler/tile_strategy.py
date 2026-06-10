@@ -28,8 +28,8 @@ from .compile_environment import _has_unbacked
 from .compile_environment import _to_sympy
 from .device_function import DeviceFunction
 from .host_function import HostFunction
-from .program_id import FlatProgramIDs
 from .program_id import EmptyGridProgramIDs
+from .program_id import FlatProgramIDs
 from .program_id import ForEachProgramID
 from .program_id import L2GroupingProgramIDs
 from .program_id import PersistentBlockedProgramIDs
@@ -2595,7 +2595,10 @@ class FlattenedTileStrategy(BlockSizeTileStrategy):
                 f"({self._expr_str(step)}) - 1) // ({self._expr_str(step)})"
             )
         if diff_expr is not None:
-            return sympy.ceiling(sympy.Mul(diff_expr, sympy.Pow(step_expr, -1)))
+            return cast(
+                "sympy.Expr",
+                sympy.ceiling(sympy.Mul(diff_expr, sympy.Pow(step_expr, -1))),
+            )
         return (
             f"((({self._expr_str(end)}) - ({self._expr_str(begin)})) + "
             f"({self._expr_str(step)}) - 1) // ({self._expr_str(step)})"
@@ -3184,6 +3187,16 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
             return [None] * len(self.block_ids)
         return self._normalize_loop_steps(state.proxy_args[2], len(self.block_ids))
 
+    def _setup_mask(
+        self,
+        state: CodegenState,
+        block_idx: int,
+        block_size: SymIntLike,
+        index_var: str,
+        end: object,
+    ) -> ast.stmt | None:
+        raise NotImplementedError
+
     def _range_numel_expr(
         self, begin: object, end: object, step: object | None
     ) -> sympy.Expr | str:
@@ -3212,7 +3225,10 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
                 f"({self._expr_str(step)}) - 1) // ({self._expr_str(step)})"
             )
         if diff_expr is not None:
-            return sympy.ceiling(sympy.Mul(diff_expr, sympy.Pow(step_expr, -1)))
+            return cast(
+                "sympy.Expr",
+                sympy.ceiling(sympy.Mul(diff_expr, sympy.Pow(step_expr, -1))),
+            )
         return (
             f"((({self._expr_str(end)}) - ({self._expr_str(begin)})) + "
             f"({self._expr_str(step)}) - 1) // ({self._expr_str(step)})"
@@ -3369,7 +3385,9 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
 
         has_tensor_ends = any(isinstance(e, torch.Tensor) for e in ends)
         block_id_to_info = (
-            self._create_block_id_info_dict(state, ends_override=ends)
+            self._create_block_id_info_dict(
+                state, ends_override=cast("list[object]", ends)
+            )
             if has_tensor_ends
             else self._create_block_id_info_dict(state)
         )

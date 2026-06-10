@@ -12,8 +12,8 @@ from typing import TypeGuard
 from typing import cast
 from typing import overload
 
-import torch
 import sympy
+import torch
 from torch._inductor.runtime.triton_heuristics import (
     get_max_y_grid,  # type: ignore[import-untyped]
 )
@@ -323,7 +323,7 @@ def _validate_max_extent(
         for symbol in expr.free_symbols:
             if (
                 isinstance(symbol, sympy.Symbol)
-                and symbol_is_type(symbol, SymT.UNBACKED_INT)
+                and symbol_is_type(symbol, SymT.UNBACKED_INT)  # pyrefly: ignore [bad-argument-type]
                 and symbol not in env.specialized_vars
             ):
                 raise exc.IncorrectTileUsage(

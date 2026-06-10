@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ast
 from typing import TYPE_CHECKING
+from typing import cast
 
 import torch
 
@@ -170,7 +171,9 @@ def _tile_mask_expr(
             ):
                 mask_var = state.codegen.mask_var(block_id)
                 if mask_var is not None:
-                    expand = state.tile_strategy.expand_str(output_sizes, out_dim)
+                    expand = state.tile_strategy.expand_str(
+                        cast("list[int | torch.SymInt]", output_sizes), out_dim
+                    )
                     if dtype_str is None:
                         expr = f"({mask_var}{expand})"
                     else:

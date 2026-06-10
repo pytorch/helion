@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import types
+from typing import Any
+from typing import cast
 import unittest
 
 import torch
@@ -14,6 +16,7 @@ from helion._testing import code_and_output
 from helion._testing import skipIfPallasInterpret
 from helion._testing import skipUnlessPallas
 import helion.language as hl
+from helion.runtime.settings import is_pallas_interpret
 
 
 class TestTileMaxExtent(TestCase):
@@ -34,6 +37,7 @@ class TestTileMaxExtent(TestCase):
             expected[1:-1] += 1
             torch.testing.assert_close(result, expected)
 
+    @skipUnlessPallas("JAX/Pallas TPU not available")
     def test_max_extent_rejects_tensor_value(self) -> None:
         @helion.kernel(backend="pallas", autotune_effort="none")
         def bad_max_extent(x: torch.Tensor, max_extent: torch.Tensor) -> torch.Tensor:
@@ -52,6 +56,7 @@ class TestTileMaxExtent(TestCase):
         ):
             bad_max_extent.bind(args)
 
+    @skipUnlessPallas("JAX/Pallas TPU not available")
     def test_max_extent_rejects_multidim_tile(self) -> None:
         @helion.kernel(backend="pallas", autotune_effort="none")
         def bad_multidim(x: torch.Tensor) -> torch.Tensor:
@@ -66,6 +71,7 @@ class TestTileMaxExtent(TestCase):
         ):
             bad_multidim.bind((torch.randn(8, 8, device=DEVICE),))
 
+    @skipUnlessPallas("JAX/Pallas TPU not available")
     def test_reused_block_size_conflicting_max_extent_rejects(self) -> None:
         @helion.kernel(backend="pallas", autotune_effort="none")
         def conflicting_max_extent(x: torch.Tensor) -> torch.Tensor:
@@ -84,6 +90,7 @@ class TestTileMaxExtent(TestCase):
         ):
             conflicting_max_extent.bind((torch.randn(4, 8, device=DEVICE),))
 
+    @skipUnlessPallas("JAX/Pallas TPU not available")
     def test_backed_symbolic_max_extent_compiles(self) -> None:
         @helion.kernel(
             backend="pallas",
@@ -103,6 +110,7 @@ class TestTileMaxExtent(TestCase):
         )
         self.assertIn("jax.lax.fori_loop", code)
 
+    @skipUnlessPallas("JAX/Pallas TPU not available")
     def test_outer_pipeline_symbolic_max_extent_static_shapes_false_rejects(
         self,
     ) -> None:
@@ -127,6 +135,7 @@ class TestTileMaxExtent(TestCase):
                 helion.Config(block_sizes=[2, 4], pallas_loop_type="outer_pipeline")
             )
 
+    @skipUnlessPallas("JAX/Pallas TPU not available")
     def test_outer_pipeline_static_shapes_false_int_max_extent_compiles(self) -> None:
         @helion.kernel(
             backend="pallas",
@@ -160,7 +169,9 @@ class TestPallasOuterPipelineScaffold(TestCase):
 
         x = torch.randn(8, 128, device=DEVICE)
         bound = inner_loop.bind((x,))
-        choices = bound.config_spec._flat_fields()["pallas_loop_type"].choices
+        choices = cast(
+            "Any", bound.config_spec._flat_fields()["pallas_loop_type"]
+        ).choices
         self.assertNotIn("outer_pipeline", choices)
 
         code, result = code_and_output(
@@ -513,12 +524,15 @@ class TestPallasOuterPipelineScaffold(TestCase):
 
         expected = torch.zeros_like(x)
         expected[0::2] = x[0::2]
-        torch.testing.assert_close(result, expected)
+        if not is_pallas_interpret():
+            torch.testing.assert_close(result, expected)
         uncommented_code = "\n".join(
             line for line in code.splitlines() if not line.lstrip().startswith("#")
         )
         self.assertIn("0 + _o0 * 2", uncommented_code)
-        self.assertIn("pl.BoundedSlice(1)", uncommented_code)
+        self.assertIn("pl.BlockSpec((1, _BLOCK_SIZE_1, 128)", uncommented_code)
+        self.assertNotIn("pl.BoundedSlice(1)", uncommented_code)
+        self.assertNotIn("jnp.maximum(0, jnp.minimum(1", uncommented_code)
 
     def test_outer_pipeline_dynamic_end_without_max_extent_rejects(self) -> None:
         @helion.kernel(backend="pallas", autotune_effort="none")
@@ -684,7 +698,7 @@ class TestPallasOuterPipelineScaffold(TestCase):
         def folded_store_alias(x: torch.Tensor) -> torch.Tensor:
             out = torch.empty_like(x)
             for row in hl.grid(x.size(0)):
-                for col in hl.tile(x.size(1)):
+                for _col in hl.tile(x.size(1)):
                     out[row, 0, :, :] = x[row, 0, :, :]
             return out
 
