@@ -289,21 +289,31 @@ def _record_pad_info(
     at offset 0, ``begin % block_size`` for a constant begin, or
     ``block_size - 1`` for a data-dependent begin.
 
-    When two inner loops tile the same (tensor, dim) with different
-    ``block_id`` (e.g. softmax's pass1 and pass2 each running ``hl.tile``
-    over the sublane), keep the LARGER ``extra_pad`` -- otherwise a
-    small-BK loop registered last clobbers a big-BK loop's required
-    tail buffer and the big-BK DMA over-reads HBM at runtime
-    (RuntimeUnexpectedCoreHalt: BoundsCheck on dma.hbm_to_vmem).  The
-    block_id we keep is the one contributing the max extra_pad, since
-    its block_size drives the alignment requirement.
+    For jagged-flat tensors specifically, two inner loops can tile the
+    same (tensor, dim) with different ``block_id`` (e.g. softmax's pass1
+    and pass2 each running ``hl.tile`` over the sublane of the same
+    jagged-flat HBM tensor).  In that case we keep the LARGER
+    ``extra_pad`` -- otherwise a small-BK loop registered last clobbers
+    a big-BK loop's required tail buffer and the big-BK DMA over-reads
+    HBM at runtime (RuntimeUnexpectedCoreHalt: BoundsCheck on
+    dma.hbm_to_vmem).  The block_id we keep is the one contributing the
+    max extra_pad, since its block_size drives the alignment requirement.
+
+    For non-jagged-flat tensors we keep last-wins (the original
+    pre-jagged behavior).  The hazard above is specific to the
+    jagged-flat DMA emit path; over-padding regular tensors would be
+    safe but wasteful, and changing their behavior tripped real
+    regressions on non-jagged kernels.
     """
     pad_info = state.device_function.pallas_pad_info
     tensor_id = id(tensor)
     if tensor_id not in pad_info:
         pad_info[tensor_id] = {}
-    existing = pad_info[tensor_id].get(tensor_dim)
-    if existing is None or extra_pad > existing[1]:
+    if tensor_id in state.device_function.pallas_jagged_flat_lane_size:
+        existing = pad_info[tensor_id].get(tensor_dim)
+        if existing is None or extra_pad > existing[1]:
+            pad_info[tensor_id][tensor_dim] = (block_id, extra_pad)
+    else:
         pad_info[tensor_id][tensor_dim] = (block_id, extra_pad)
 
 
