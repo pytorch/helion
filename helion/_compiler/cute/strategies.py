@@ -441,7 +441,8 @@ def tcgen05_smem_layout_expr(
         )
     assert operand == "b", f"unexpected operand {operand!r}"
     if b_k_major:
-        # K-major (column-major / K-contiguous) B. Delegate to CuTe's helper
+        # K-major (column-major / K-contiguous) B -- the native fp8
+        # scaled_mm / torch._scaled_mm layout. Delegate to CuTe's helper
         # with ``is_k_major=True`` so the SMEM atom selection mirrors the
         # K-major A path exactly; the smem_swizzle_b override knob is not
         # plumbed through this path (correctness-first), which is fine
