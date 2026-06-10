@@ -1266,6 +1266,33 @@ class TestCuteBackend(TestCase):
         self.assertIn("cutlass.Float8E4M3FN", code)
         self.assertIn("cute.nvgpu.tcgen05", code)
 
+    def test_matmul_mma_tcgen05_fp8_cluster_m2_persistent(self) -> None:
+        """Test FP8 E4M3 with cluster_m=2 persistent scheduling."""
+        support = get_cute_mma_support()
+        if not support.tcgen05_f8:
+            self.skipTest("tcgen05 FP8 MMA is not supported on this machine")
+
+        torch.manual_seed(0)
+        x = (torch.randn(512, 2048, device=DEVICE) * 0.4).to(torch.float8_e4m3fn)
+        y = (torch.randn(2048, 2048, device=DEVICE) * 0.4).to(torch.float8_e4m3fn)
+
+        # Use block_m=256 to enable is_two_cta (required for cluster_m=2 role-local)
+        code, out = code_and_output(
+            cute_matmul_mma_fp8,
+            (x, y),
+            block_sizes=[256, 256, 64],
+            tcgen05_cluster_m=2,
+            pid_type="persistent_blocked",
+        )
+        ref = x.float() @ y.float()
+        torch.testing.assert_close(out.float(), ref, atol=1.0, rtol=1e-1)
+
+        # Verify FP8 dtype, tcgen05 backend, cluster_m=2, and persistent scheduler
+        self.assertIn("cutlass.Float8E4M3FN", code)
+        self.assertIn("cute.nvgpu.tcgen05", code)
+        self.assertIn("(2, 1, 1)", code)  # cluster_m=2
+        self.assertIn("StaticPersistentTileScheduler", code)
+
     def test_matmul_dot_out_dtype_falls_back_from_mma(self) -> None:
         args = (
             torch.randn(16, 64, device=DEVICE, dtype=HALF_DTYPE),
