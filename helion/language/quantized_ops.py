@@ -1,16 +1,16 @@
 from __future__ import annotations
 
+import ast
 from typing import TYPE_CHECKING
 
 import torch
 
 from .. import exc
+from .._compiler.ast_extension import create
 from .._compiler.ast_extension import expr_from_string
 from . import _decorators
 
 if TYPE_CHECKING:
-    import ast
-
     from .._compiler.inductor_lowering import CodegenState
 
 __all__ = ["float4_e2m1fn_x2_to_float32"]
@@ -42,6 +42,43 @@ def _(state: CodegenState) -> list[ast.AST]:
     call = expr_from_string(
         "_cute_float4_e2m1fn_x2_to_float32({value})",
         value=state.ast_arg(0),
+    )
+    result = state.codegen.lift(call, dce=True, prefix="fp4_pair")
+    return [
+        expr_from_string(f"{result.id}[0]"),
+        expr_from_string(f"{result.id}[1]"),
+    ]
+
+
+# Triton uses inline asm for the same fp4x2 unpack instruction as CuTe.
+_FP4X2_TO_F32_ASM = """
+{
+    .reg .b8 b0, b1, b2, b3;
+    .reg .b16 lo, hi;
+    .reg .b32 h2;
+    mov.b32 {b0, b1, b2, b3}, $2;
+    cvt.rn.f16x2.e2m1x2 h2, b0;
+    mov.b32 {lo, hi}, h2;
+    cvt.f32.f16 $0, lo;
+    cvt.f32.f16 $1, hi;
+}
+"""
+
+
+@_decorators.codegen(float4_e2m1fn_x2_to_float32, "triton")
+def _(state: CodegenState) -> list[ast.AST]:
+    call = create(
+        ast.Call,
+        func=expr_from_string("tl.inline_asm_elementwise"),
+        args=[
+            create(ast.Constant, value=_FP4X2_TO_F32_ASM),
+            create(ast.Constant, value="=f,=f,r"),
+            create(ast.List, elts=[state.ast_arg(0)], ctx=ast.Load()),
+            expr_from_string("(tl.float32, tl.float32)"),
+            create(ast.Constant, value=True),  # is_pure
+            create(ast.Constant, value=1),  # pack
+        ],
+        keywords=[],
     )
     result = state.codegen.lift(call, dce=True, prefix="fp4_pair")
     return [

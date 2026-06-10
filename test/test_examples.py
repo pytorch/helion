@@ -1852,7 +1852,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             rtol=2e-1,
         )
 
-    @onlyBackends(["cute"])
+    @onlyBackends(["cute", "triton"])
     @skipIfNotCUDA()
     @skipIfCudaCapabilityLessThan(
         (10, 0), reason="NVFP4 conversion instructions require Blackwell"
