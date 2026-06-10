@@ -68,13 +68,14 @@ _FP4X2_TO_F32_ASM = """
 
 @_decorators.codegen(float4_e2m1fn_x2_to_float32, "triton")
 def _(state: CodegenState) -> list[ast.AST]:
+    value = expr_from_string("{value}.to(tl.int32)", value=state.ast_arg(0))
     call = create(
         ast.Call,
         func=expr_from_string("tl.inline_asm_elementwise"),
         args=[
             create(ast.Constant, value=_FP4X2_TO_F32_ASM),
             create(ast.Constant, value="=f,=f,r"),
-            create(ast.List, elts=[state.ast_arg(0)], ctx=ast.Load()),
+            create(ast.List, elts=[value], ctx=ast.Load()),
             expr_from_string("(tl.float32, tl.float32)"),
             create(ast.Constant, value=True),  # is_pure
             create(ast.Constant, value=1),  # pack
