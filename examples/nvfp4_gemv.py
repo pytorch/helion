@@ -29,6 +29,7 @@ from helion._testing import DEVICE
 from helion._testing import run_example
 import helion.language as hl
 from helion.runtime import default_cute_launcher
+from helion.runtime.settings import _get_backend
 
 cutlass: Any
 cute: Any
@@ -623,7 +624,7 @@ FP4IN_CONFIGS: dict[BackendName, helion.Config] = {
 
 
 def _selected_backend(backend: BackendName | None) -> BackendName:
-    selected = helion.Settings().backend if backend is None else backend
+    selected = _get_backend() if backend is None else backend
     if selected not in ("triton", "cute"):
         raise ValueError(
             f"nvfp4_gemv supports backend='triton' or 'cute', got {selected!r}"
