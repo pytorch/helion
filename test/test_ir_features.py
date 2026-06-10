@@ -233,6 +233,64 @@ class TestIrFeaturesEdgeCases(TestCase):
         actual = concrete_names(GraphInfo) - {"NodeArgsGraphInfo"}
         self.assertEqual(ir_features._KNOWN_REGION_KINDS, frozenset(actual))
 
+    def test_is_graph_id_rejects_bool(self) -> None:
+        """A graph id must be a real int, not a bool (bool is an int subclass)."""
+        self.assertTrue(ir_features._is_graph_id(3))
+        self.assertFalse(ir_features._is_graph_id(True))
+        self.assertFalse(ir_features._is_graph_id("0"))
+
+    def test_malformed_control_flow_node_warns(self) -> None:
+        """A control-flow target with bad args returns [] AND warns (not silent)."""
+        from helion.language._tracing_ops import _for_loop
+
+        ir_features._warn_malformed_region_spec.cache_clear()
+        node = types.SimpleNamespace(target=_for_loop, args=())  # missing args
+        with self.assertLogs(ir_features.log, level="WARNING") as captured:
+            self.assertEqual(ir_features._region_specs(node), [])
+        self.assertTrue(any("unexpected args" in m for m in captured.output))
+
+    def test_non_control_flow_node_does_not_warn(self) -> None:
+        """A normal (non-control-flow) node returns [] quietly, no warning."""
+
+        def _plain() -> None:
+            return None
+
+        node = types.SimpleNamespace(target=_plain, args=())
+        with self.assertNoLogs(ir_features.log, level="WARNING"):
+            self.assertEqual(ir_features._region_specs(node), [])
+
+    def test_ir_node_composes_val_and_lowering_keys(self) -> None:
+        """The composed IrNode carries both val and lowering field keys."""
+        from examples.add import add
+
+        g = _extract(
+            add,
+            (
+                torch.randn(64, 64, device=DEVICE),
+                torch.randn(64, 64, device=DEVICE),
+            ),
+            "add",
+        )
+        node = g["nodes"][0]
+        # _NodeCore + ValFeatures + LoweringFeatures keys are all present.
+        for key in ("id", "op_kind", "dtype", "shape", "lowering_class"):
+            self.assertIn(key, node)
+
+    def test_schema_version_present_and_gateable(self) -> None:
+        """Records carry the current schema_version; the documented gate works."""
+        empty_ir = types.SimpleNamespace(graphs=[], root_ids=[], rolled_reductions=[])
+        g = extract_ir_graph(
+            empty_ir,  # type: ignore[arg-type]
+            run_id="rid",
+            kernel_id="kid",
+            kernel_name="empty",
+            input_shapes="[]",
+        )
+        self.assertIsInstance(g["schema_version"], int)
+        self.assertEqual(g["schema_version"], ir_features.IR_SCHEMA_VERSION)
+        # Documented consumer gate: a pre-versioned record falls back to 0.
+        self.assertEqual({}.get("schema_version", 0), 0)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -25,6 +25,15 @@ Extraction is best-effort: anything that cannot be resolved is recorded as
 ``DeviceIR`` (iterable ``graphs`` of ``GraphInfo``); the autotuner call site
 (:meth:`BaseSearch._extract_ir_graph`) wraps it so a malformed/absent device IR
 degrades to "no IR artifact" and never breaks autotuning.
+
+Schema versioning: every record carries an integer ``schema_version``
+(``IR_SCHEMA_VERSION``), bumped whenever the record shape changes. ``.ir.jsonl``
+is a new artifact, so v1 is the first format. A consumer should read the version
+defensively and gate on it::
+
+    version = record.get("schema_version", 0)  # 0 == pre-versioned / unknown
+    if version != IR_SCHEMA_VERSION:
+        ...  # migrate or skip
 """
 
 from __future__ import annotations
@@ -33,6 +42,7 @@ import functools
 import logging
 from typing import TYPE_CHECKING
 from typing import TypedDict
+from typing import TypeGuard
 
 import torch
 from torch.fx.node import map_arg
@@ -45,6 +55,15 @@ if TYPE_CHECKING:
     from .._compiler.device_ir import DeviceIR
 
 log = logging.getLogger(__name__)
+
+__all__ = [
+    "IR_SCHEMA_VERSION",
+    "IrEdge",
+    "IrGraphMeta",
+    "IrGraphRecord",
+    "IrNode",
+    "extract_ir_graph",
+]
 
 # Cap on stringified scalar values / source locations so a stray large object
 # can't bloat the JSON line.
@@ -98,8 +117,8 @@ class LoweringFeatures(TypedDict):
     input_shapes: list[list[str]] | None
 
 
-class IrNode(TypedDict):
-    """A single device-IR fx node (a node-link ``nodes`` entry)."""
+class _NodeCore(TypedDict):
+    """Node fields that come from the fx node itself (not val/lowering)."""
 
     id: str
     graph_id: int
@@ -107,20 +126,15 @@ class IrNode(TypedDict):
     block_ids: list[int]
     op_kind: str
     target: str
-    lowering_class: str | None
-    dtype: str | None
-    shape: list[str] | None
-    concrete_shape: list[int | None] | None
-    stride: list[str] | None
-    concrete_stride: list[int | None] | None
-    device: str | None
-    value: str | None
-    input_dtypes: list[str] | None
-    input_shapes: list[list[str]] | None
-    reduction_type: str | None
-    reduction_ranges: list[str] | None
-    pointwise_ranges: list[str] | None
     source_loc: str | None
+
+
+class IrNode(_NodeCore, ValFeatures, LoweringFeatures):
+    """A single device-IR fx node (a node-link ``nodes`` entry).
+
+    Composed from :class:`_NodeCore` plus the (disjoint) :class:`ValFeatures`
+    and :class:`LoweringFeatures` key sets, so the schema is declared once.
+    """
 
 
 class IrEdge(TypedDict):
@@ -191,6 +205,30 @@ def _warn_unknown_region_kind(region_kind: str) -> None:
             "Helion's device IR may have changed -- the extractor should be updated.",
             region_kind,
         )
+
+
+@functools.cache
+def _warn_malformed_region_spec(target_name: str) -> None:
+    """Warn once per process when a control-flow node has an unexpected shape.
+
+    A node whose ``target`` is a known control-flow op but whose args don't fit
+    the expected layout is a real IR-shape anomaly -- surface it (best-effort,
+    not raised) instead of silently dropping the region edges.
+    """
+    log.warning(
+        "ir_features: control-flow node %r has unexpected args; skipping its "
+        "region edges. Helion's device IR may have changed.",
+        target_name,
+    )
+
+
+def _is_graph_id(value: object) -> TypeGuard[int]:
+    """True only for a concrete ``int`` graph id (excludes ``bool``).
+
+    ``type(value) is int`` rejects ``bool`` (an ``int`` subclass); the
+    ``TypeGuard`` return narrows the value to ``int`` for the type checker.
+    """
+    return type(value) is int
 
 
 def _truncate(text: str) -> str:
@@ -335,21 +373,25 @@ def _region_specs(node: torch.fx.Node) -> list[tuple[int, object]]:
     target = node.target
     args = node.args
     # Child graph ids must be concrete ints; narrow them so a malformed node
-    # degrades to [] rather than producing a wrong edge (and to satisfy typing).
+    # degrades to [] (and warns) rather than producing a wrong edge. A
+    # non-control-flow node returns [] quietly (the common case).
     if is_for_loop_target(target):
-        if len(args) >= 4 and isinstance(args[0], int):
+        if len(args) >= 4 and _is_graph_id(args[0]):
             return [(args[0], args[3])]
+        _warn_malformed_region_spec(_target_str(target))
         return []
     if target is _if:
-        if len(args) >= 5 and isinstance(args[1], int) and isinstance(args[2], int):
+        if len(args) >= 5 and _is_graph_id(args[1]) and _is_graph_id(args[2]):
             return [(args[1], args[3]), (args[2], args[4])]
+        _warn_malformed_region_spec(_target_str(target))
         return []
     if target is _while_loop:
-        if len(args) >= 3 and isinstance(args[0], int) and isinstance(args[1], int):
+        if len(args) >= 3 and _is_graph_id(args[0]) and _is_graph_id(args[1]):
             specs: list[tuple[int, object]] = [(args[1], args[2]), (args[0], args[2])]
-            if len(args) > 3 and isinstance(args[3], int):
+            if len(args) > 3 and _is_graph_id(args[3]):
                 specs.append((args[3], args[2]))
             return specs
+        _warn_malformed_region_spec(_target_str(target))
         return []
     return []
 
