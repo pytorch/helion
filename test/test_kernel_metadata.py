@@ -215,12 +215,17 @@ class TestMetadataSchema(TestCase):
 
 
 class TestAutotuneLogSink(TestCase):
-    def _entry(self, perf_ms: float, sample_id: str = "sample-xyz") -> AutotuneLogEntry:
+    def _entry(
+        self,
+        perf_ms: float,
+        sample_id: str = "sample-xyz",
+        decorator: str = "@helion.kernel(config=helion.Config(block_sizes=[16]))",
+    ) -> AutotuneLogEntry:
         """
         Build a minimal AutotuneLogEntry for sink tests.
 
-        Only perf_ms and sample_id vary across callers; the remaining fields
-        (generation, status, compile_time, config) are fixed placeholders.
+        Only perf_ms, sample_id and decorator vary across callers; the remaining
+        fields (generation, status, compile_time, config) are fixed placeholders.
         """
         return AutotuneLogEntry(
             generation=0,
@@ -229,6 +234,7 @@ class TestAutotuneLogSink(TestCase):
             compile_time=0.5,
             config=helion.Config(block_sizes=[16]),
             sample_id=sample_id,
+            decorator=decorator,
         )
 
     def test_sink_writes_metadata_sidecar_and_per_config_rows(self) -> None:
@@ -279,6 +285,15 @@ class TestAutotuneLogSink(TestCase):
             # run_id foreign key joins each row to the sidecar record.
             rid_col = header.index("run_id")
             self.assertTrue(all(row[rid_col] == sidecar["run_id"] for row in data_rows))
+            # decorator string is collected as a structured column on every row.
+            dec_col = header.index("decorator")
+            self.assertTrue(
+                all(
+                    row[dec_col]
+                    == "@helion.kernel(config=helion.Config(block_sizes=[16]))"
+                    for row in data_rows
+                )
+            )
 
     def test_sink_appends_across_runs_at_same_base_path(self) -> None:
         """
