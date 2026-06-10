@@ -610,12 +610,12 @@ def remap_prologue_tensor_pipeline_inputs(
     return body_stmts
 
 
-def static_cdiv(numer: int, denom: int) -> int:
-    """``ceil(numer / denom)`` for positive ``denom`` (>= 1); the folded
+def static_cdiv(number: int, denom: int) -> int:
+    """``ceil(number / denom)`` for positive ``denom`` (>= 1); the folded
     ``max_tiles`` count for a pipeline grid dim."""
     if denom <= 0:
         raise ValueError(f"outer_pipeline block size must be positive, got {denom}")
-    return max(1, -(-numer // denom))
+    return max(1, -(-number // denom))
 
 
 def declared_or_static_bound(
