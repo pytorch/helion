@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import types
 import unittest
 
 import networkx as nx
@@ -110,6 +111,76 @@ class TestIrFeatures(TestCase):
         ir_features._warned_region_kinds.clear()
         with self.assertNoLogs(ir_features.log, level="WARNING"):
             ir_features._warn_unknown_region_kind("RootGraphInfo")
+
+
+class TestIrFeaturesEdgeCases(TestCase):
+    """Negative / degenerate cases for the extractor helpers (no GPU needed)."""
+
+    def test_val_features_handles_missing_and_scalar_values(self) -> None:
+        # No val -> every tensor field is None (never raises).
+        none_feats = ir_features._val_features(None)
+        self.assertTrue(all(v is None for v in none_feats.values()))
+        # A non-tensor scalar records its type name and stringified value only.
+        scalar = ir_features._val_features(7)
+        self.assertEqual(scalar["dtype"], "int")
+        self.assertEqual(scalar["value"], "7")
+        self.assertIsNone(scalar["shape"])
+        self.assertIsNone(scalar["concrete_shape"])
+
+    def test_lowering_features_without_lowering_is_all_none(self) -> None:
+        node = types.SimpleNamespace(meta={})  # no "lowering" key
+        feats = ir_features._lowering_features(node)
+        self.assertTrue(all(v is None for v in feats.values()))
+
+    def test_target_str_is_stable_and_address_free(self) -> None:
+        # String targets pass through (placeholder/output/get_attr).
+        self.assertEqual(ir_features._target_str("output"), "output")
+        # A function uses its qualified name, never an address (determinism).
+        text = ir_features._target_str(extract_ir_graph)
+        self.assertIn("extract_ir_graph", text)
+        self.assertNotIn("0x", text)
+        # An object with neither qualname nor name falls back to str().
+        self.assertEqual(ir_features._target_str(5), "5")
+
+    def test_concrete_dim_returns_none_for_unconvertible(self) -> None:
+        self.assertEqual(ir_features._concrete_dim(64), 64)
+        self.assertIsNone(ir_features._concrete_dim("not-an-int"))
+        self.assertIsNone(ir_features._concrete_dim(None))
+
+    def test_region_specs_empty_for_non_control_flow_node(self) -> None:
+        def _not_control_flow() -> None:  # arbitrary non-CF target
+            return None
+
+        node = types.SimpleNamespace(target=_not_control_flow, args=())
+        self.assertEqual(ir_features._region_specs(node), [])
+
+    def test_extract_handles_empty_device_ir(self) -> None:
+        """A device IR with no graphs yields a valid, empty node-link record."""
+        empty_ir = types.SimpleNamespace(graphs=[], root_ids=[], rolled_reductions=[])
+        g = extract_ir_graph(
+            empty_ir,  # type: ignore[arg-type]
+            run_id="rid",
+            kernel_id="kid",
+            kernel_name="empty",
+            input_shapes="[]",
+        )
+        self.assertEqual(g["nodes"], [])
+        self.assertEqual(g["links"], [])
+        self.assertEqual(g["run_id"], "rid")
+        self.assertEqual(g["graph"]["num_graphs"], 0)
+        # Still a loadable (empty) networkx DiGraph.
+        graph = nx.node_link_graph(json.loads(json.dumps(g)), edges="links")
+        self.assertEqual(graph.number_of_nodes(), 0)
+        self.assertTrue(graph.is_directed())
+
+    def test_unknown_region_kind_warns_only_once(self) -> None:
+        """The same unknown kind warns once, not on every repeat occurrence."""
+        ir_features._warned_region_kinds.clear()
+        with self.assertLogs(ir_features.log, level="WARNING"):
+            ir_features._warn_unknown_region_kind("OnceOnlyGraphInfo")
+        # Second occurrence of the same kind must not warn again.
+        with self.assertNoLogs(ir_features.log, level="WARNING"):
+            ir_features._warn_unknown_region_kind("OnceOnlyGraphInfo")
 
 
 if __name__ == "__main__":
