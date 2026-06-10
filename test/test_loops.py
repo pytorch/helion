@@ -408,7 +408,7 @@ class TestLoops(RefEagerTestBase, TestCase):
         else:
             torch.testing.assert_close(result, expected)
 
-    @xfailIfPallas("data-dependent bounds hit JAX tracing issues on pallas")
+    @xfailIfPallas("int64 index dtype not supported on Pallas")
     @skipIfXPU("worker crash on XPU")
     def test_data_dependent_bounds3(self):
         @helion.kernel()
