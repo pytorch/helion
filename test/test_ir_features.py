@@ -103,12 +103,12 @@ class TestIrFeatures(TestCase):
 
     def test_unknown_region_kind_warns_once(self) -> None:
         """An undocumented region_kind warns (so upstream IR shifts are caught)."""
-        ir_features._warned_region_kinds.clear()
+        ir_features._warn_unknown_region_kind.cache_clear()
         with self.assertLogs(ir_features.log, level="WARNING") as captured:
             ir_features._warn_unknown_region_kind("BrandNewGraphInfo")
         self.assertTrue(any("BrandNewGraphInfo" in m for m in captured.output))
         # Known kinds never warn.
-        ir_features._warned_region_kinds.clear()
+        ir_features._warn_unknown_region_kind.cache_clear()
         with self.assertNoLogs(ir_features.log, level="WARNING"):
             ir_features._warn_unknown_region_kind("RootGraphInfo")
 
@@ -175,12 +175,62 @@ class TestIrFeaturesEdgeCases(TestCase):
 
     def test_unknown_region_kind_warns_only_once(self) -> None:
         """The same unknown kind warns once, not on every repeat occurrence."""
-        ir_features._warned_region_kinds.clear()
+        ir_features._warn_unknown_region_kind.cache_clear()
         with self.assertLogs(ir_features.log, level="WARNING"):
             ir_features._warn_unknown_region_kind("OnceOnlyGraphInfo")
         # Second occurrence of the same kind must not warn again.
         with self.assertNoLogs(ir_features.log, level="WARNING"):
             ir_features._warn_unknown_region_kind("OnceOnlyGraphInfo")
+
+    def test_region_specs_short_args_do_not_raise(self) -> None:
+        """A control-flow target with too few args degrades to [] (no IndexError)."""
+        from helion.language._tracing_ops import _for_loop
+
+        node = types.SimpleNamespace(target=_for_loop, args=())  # missing args
+        self.assertEqual(ir_features._region_specs(node), [])
+
+    def test_input_edges_preserve_multiplicity_and_nesting(self) -> None:
+        """_input_edges walks fx containers and keeps every producer position."""
+        graph = torch.fx.Graph()
+        a = graph.placeholder("a")
+        b = graph.placeholder("b")
+        # a appears twice (direct + inside a nested list) -> two positions.
+        node = graph.call_function(torch.add, (a, [a, b]))
+        positions = ir_features._input_edges(node)
+        self.assertEqual(positions[a], [0, 1])
+        self.assertEqual(positions[b], [2])
+
+    def test_value_and_source_loc_are_length_capped(self) -> None:
+        """Large stringified values are truncated so they can't bloat the JSON."""
+        long = "x" * (ir_features._MAX_VALUE_LEN + 50)
+        capped = ir_features._truncate(long)
+        self.assertLess(len(capped), len(long))
+        self.assertTrue(capped.endswith("...<truncated>"))
+        self.assertEqual(ir_features._truncate("short"), "short")
+        # A non-tensor scalar value is capped too.
+        feats = ir_features._val_features(long)
+        self.assertTrue(feats["value"].endswith("...<truncated>"))
+
+    def test_known_region_kinds_match_device_ir(self) -> None:
+        """Drift guard: the known set must match the concrete GraphInfo subclasses.
+
+        Fails loudly in CI if device_ir.py renames/adds a region kind, so the
+        extractor (which only warns at runtime) is kept in sync deliberately.
+        """
+        from helion._compiler.device_ir import GraphInfo
+
+        def concrete_names(cls: type) -> set[str]:
+            names: set[str] = set()
+            for sub in cls.__subclasses__():
+                names |= concrete_names(sub)
+                # Only count region kinds defined in device_ir.py itself.
+                if sub.__module__ == GraphInfo.__module__:
+                    names.add(sub.__name__)
+            return names
+
+        # NodeArgsGraphInfo is an abstract base (no `name`), never instantiated.
+        actual = concrete_names(GraphInfo) - {"NodeArgsGraphInfo"}
+        self.assertEqual(ir_features._KNOWN_REGION_KINDS, frozenset(actual))
 
 
 if __name__ == "__main__":
