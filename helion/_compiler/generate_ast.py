@@ -253,6 +253,8 @@ class GenerateAST(NodeVisitor, CodegenInterface):
         outer_context = (
             CompileEnvironment.current().outer_pipeline_context
             if self.on_device
+            and self.device_function.config.get("pallas_loop_type", "unroll")
+            == "outer_pipeline"
             else None
         )
         if outer_context is not None and outer_context.capturing_prologue_replay:

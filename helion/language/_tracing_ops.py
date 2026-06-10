@@ -1817,7 +1817,7 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
                     and isinstance(dim_size, int)
                     and int(end_expr) == dim_size
                 )
-                if outer_context is None and not (is_store and not covers_full_dim):
+                if outer_context is None:
                     from .memory_ops import _record_pad_info
 
                     extra_pad = _compute_pipeline_or_dma_extra_pad(
@@ -1854,10 +1854,15 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
                     lambda_end_expr = _outer_lambda_expr(
                         end_exprs[bid_idx], outer_lambda_params
                     )
-                    if outer_context is not None or is_store:
+                    if outer_context is not None:
                         extent_expr = (
                             f"jnp.maximum(0, jnp.minimum({slice_size_expr}, "
                             f"({lambda_end_expr}) - ({raw_start_expr})))"
+                        )
+                    elif is_store:
+                        extent_expr = (
+                            f"jnp.minimum({slice_size_expr}, "
+                            f"({lambda_end_expr}) - ({raw_start_expr}))"
                         )
                     else:
                         extent_expr = slice_size_expr

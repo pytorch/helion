@@ -70,7 +70,10 @@ def _load_mask_expr(
     from helion._compiler.pallas.plan_tiling import TilePattern
 
     env = CompileEnvironment.current()
-    if env.outer_pipeline_context is not None:
+    if (
+        state.config.get("pallas_loop_type", "unroll") == "outer_pipeline"
+        and env.outer_pipeline_context is not None
+    ):
         dtype_str = env.backend.dtype_str(tensor.dtype)
         return _tile_mask_expr(state, subscript, tensor, dtype_str=dtype_str)
 
@@ -275,7 +278,11 @@ def _tile_needs_mask(
     if info.begin_expr is not None and info.begin_expr != 0:
         return True
     outer_context = env.outer_pipeline_context
-    if outer_context is not None and block_id in outer_context.axis_by_block_id:
+    if (
+        state.config.get("pallas_loop_type", "unroll") == "outer_pipeline"
+        and outer_context is not None
+        and block_id in outer_context.axis_by_block_id
+    ):
         block_value = state.device_function.resolved_block_size(block_id)
         if not isinstance(block_value, int):
             return True
@@ -428,8 +435,8 @@ def _active_grid_loop_offset_code(
 
     env = CompileEnvironment.current()
     if (
-        env.outer_pipeline_context is None
-        and state.config.get("pallas_loop_type", "unroll") != "outer_pipeline"
+        state.config.get("pallas_loop_type", "unroll") != "outer_pipeline"
+        or env.outer_pipeline_context is None
     ):
         return None
 
