@@ -59,13 +59,20 @@ def _load_mask_expr(
     data-dependent bounds, constexpr sub-ranges), generates a mask term so
     that out-of-tile positions are zeroed.
 
-    Only applies to dimensions that are ds-padded (the ref is padded to a
-    multiple of block_size).  Grid/tile dimensions where BlockSpecs size the
-    ref to the actual remainder are not masked — a block-sized mask would
-    cause a shape mismatch against the smaller ref.
+    For ordinary emit_pipeline, preserve the existing load-mask behavior.
+    outer_pipeline uses the scalar-aware helper because dynamic
+    ``pl.BoundedSlice`` BlockSpecs make the HBM access legal while body
+    expressions still see the static block extent. Reductions or arbitrary lane
+    mixing across folded axes need their own masked lowering and are rejected by
+    outer_pipeline for now.
     """
     from helion._compiler.compile_environment import CompileEnvironment
     from helion._compiler.pallas.plan_tiling import TilePattern
+
+    env = CompileEnvironment.current()
+    if env.outer_pipeline_context is not None:
+        dtype_str = env.backend.dtype_str(tensor.dtype)
+        return _tile_mask_expr(state, subscript, tensor, dtype_str=dtype_str)
 
     assert state.fx_node is not None
     output_val = state.fx_node.meta.get("val")
@@ -73,7 +80,6 @@ def _load_mask_expr(
         return None
 
     indexing_patterns = _get_indexing_patterns(state, tensor)
-    env = CompileEnvironment.current()
     output_sizes = [*output_val.size()]
     mask_exprs: list[str] = []
     dtype_str: str | None = None
@@ -105,6 +111,73 @@ def _load_mask_expr(
         # TODO(dunfanlu): Do other patterns beside TilePattern require masking?
 
         out_dim += 1
+        tensor_dim += 1
+
+    if not mask_exprs:
+        return None
+    return "*".join(mask_exprs)
+
+
+def _tile_mask_expr(
+    state: CodegenState,
+    subscript: list[object],
+    tensor: torch.Tensor,
+    *,
+    dtype_str: str | None,
+    output_sizes: list[object] | None = None,
+) -> str | None:
+    """Build the boolean tile-mask expression for a Pallas access (or ``None``).
+
+    Emits a ``mask_var``-based factor for each tiled dim that needs one, skipping
+    size-1 (broadcast) dims. ``output_sizes`` overrides the inferred result
+    shape; ``dtype_str`` casts the mask so it can multiply float values.
+    """
+    from helion._compiler.pallas.plan_tiling import TilePattern
+
+    assert state.fx_node is not None
+    if output_sizes is None:
+        output_val = state.fx_node.meta.get("val")
+        if not isinstance(output_val, torch.Tensor):
+            return None
+        output_sizes = [*output_val.size()]
+
+    indexing_patterns = _get_indexing_patterns(state, tensor)
+    mask_exprs: list[str] = []
+    out_dim = 0
+    tensor_dim = 0
+    from helion._compiler.pallas.plan_tiling import ArbitraryIndexPattern
+    from helion._compiler.pallas.plan_tiling import TileBeginWithOffsetPattern
+
+    for idx, pattern in zip(subscript, indexing_patterns, strict=True):
+        if idx is None:
+            out_dim += 1
+            continue
+        is_scalar = isinstance(
+            pattern, (ArbitraryIndexPattern, TileBeginWithOffsetPattern)
+        )
+
+        if isinstance(pattern, TilePattern):
+            block_id = pattern.block_id
+            # Skip masking for size-1 (broadcast) dims: a single element is
+            # always valid, and applying a block-sized mask would broadcast
+            # the dim from 1 to block_size, causing shape mismatches.
+            dim_size = tensor.shape[tensor_dim]
+            if (not isinstance(dim_size, int) or dim_size > 1) and _tile_needs_mask(
+                state, block_id, tensor, tensor_dim
+            ):
+                mask_var = state.codegen.mask_var(block_id)
+                if mask_var is not None:
+                    expand = state.tile_strategy.expand_str(output_sizes, out_dim)
+                    if dtype_str is None:
+                        expr = f"({mask_var}{expand})"
+                    else:
+                        expr = f"({mask_var}.astype({dtype_str}){expand})"
+                    mask_exprs.append(expr)
+
+        # TODO(dunfanlu): Do other patterns beside TilePattern require masking?
+
+        if not is_scalar:
+            out_dim += 1
         tensor_dim += 1
 
     if not mask_exprs:
@@ -193,10 +266,21 @@ def _tile_needs_mask(
     info = loops[-1].block_id_to_info.get(block_id)
     if info is None:
         return False
+    from helion._compiler.compile_environment import CompileEnvironment
+
+    env = CompileEnvironment.current()
     dim_size = tensor.shape[tensor_dim]
     if not info.is_end_matching(dim_size):
         return True
-    return info.begin_expr is not None and info.begin_expr != 0
+    if info.begin_expr is not None and info.begin_expr != 0:
+        return True
+    outer_context = env.outer_pipeline_context
+    if outer_context is not None and block_id in outer_context.axis_by_block_id:
+        block_value = state.device_function.resolved_block_size(block_id)
+        if not isinstance(block_value, int):
+            return True
+        return not env.block_sizes[block_id].known_multiple(block_value)
+    return False
 
 
 def _can_tile_dimension(state: CodegenState, tensor_dim: int) -> bool:
@@ -309,13 +393,56 @@ def _arbitrary_index_pattern_code(
     subscript_index: int,
     in_pipeline: bool,
 ) -> str:
+    from helion._compiler.compile_environment import CompileEnvironment
     from helion._utils import is_scalar_index
 
     if in_pipeline and is_scalar_index(idx):
         return "0"
+    block_id = CompileEnvironment.current().resolve_block_id(idx)
+    if (
+        grid_offset := _active_grid_loop_offset_code(
+            state, block_id, in_pipeline=in_pipeline
+        )
+    ) is not None:
+        return grid_offset
     if isinstance(idx, int):
         return str(idx)
     return _index_expr_from_ast(state, subscript_index)
+
+
+def _active_grid_loop_offset_code(
+    state: CodegenState,
+    block_id: int | None,
+    *,
+    in_pipeline: bool,
+    offset_str: str | None = None,
+) -> str | None:
+    # outer_pipeline: a non-pipelined tensor indexed by a folded outer-grid dim
+    # (an active DeviceGridState loop) is sliced in the body via that dim's
+    # offset var (e.g. ``offset_0``), optionally added to a constant ``offset_str``.
+    # Returns None when not applicable (in-pipeline tensors are pre-sliced).
+    if in_pipeline or block_id is None:
+        return None
+
+    from helion._compiler.compile_environment import CompileEnvironment
+
+    env = CompileEnvironment.current()
+    if (
+        env.outer_pipeline_context is None
+        and state.config.get("pallas_loop_type", "unroll") != "outer_pipeline"
+    ):
+        return None
+
+    from helion._compiler.tile_strategy import DeviceGridState
+
+    loops = state.codegen.active_device_loops.get(block_id)
+    if not loops or not isinstance(loops[-1], DeviceGridState):
+        return None
+
+    index = state.codegen.offset_var(block_id)
+    if offset_str is not None and offset_str != "0":
+        index = f"({index}) + {offset_str}"
+    return index
 
 
 def _generated_index_code(
@@ -457,6 +584,16 @@ def _tile_begin_with_offset_pattern_code(
 
     if in_pipeline and block_id in pipeline_block_ids:
         return offset_str
+
+    if (
+        grid_offset := _active_grid_loop_offset_code(
+            state,
+            block_id,
+            in_pipeline=in_pipeline,
+            offset_str=offset_str if pattern.offset != 0 else None,
+        )
+    ) is not None:
+        return grid_offset
 
     can_tile = _can_tile_dimension(state, tensor_dim)
 

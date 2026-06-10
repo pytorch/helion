@@ -221,7 +221,8 @@ VALID_KEYS: frozenset[str] = frozenset(
         *_BACKEND_STRATEGY_CONFIG_KEYS,
     ]
 )
-VALID_PALLAS_LOOP_TYPES = ("emit_pipeline", "unroll", "fori_loop")
+AUTOTUNED_PALLAS_LOOP_TYPES = ("emit_pipeline", "unroll", "fori_loop")
+VALID_PALLAS_LOOP_TYPES = (*AUTOTUNED_PALLAS_LOOP_TYPES, "outer_pipeline")
 VALID_PID_TYPES = (
     "flat",
     "xyz",
@@ -1074,7 +1075,7 @@ class ConfigSpec:
                 # "emit_pipeline" fails on unaligned dims.
                 config.setdefault("pallas_loop_type", "fori_loop")
             else:
-                config.setdefault("pallas_loop_type", VALID_PALLAS_LOOP_TYPES[0])
+                config.setdefault("pallas_loop_type", AUTOTUNED_PALLAS_LOOP_TYPES[0])
 
         if self.supports_config_key("pid_type"):
             if "pid_type" in config:
@@ -1487,7 +1488,7 @@ class ConfigSpec:
         else:
             fields.update(self.backend_tunable_fragments)
         if self.has_pallas_inner_loops:
-            choices = VALID_PALLAS_LOOP_TYPES
+            choices = AUTOTUNED_PALLAS_LOOP_TYPES
             if self.has_symbolic_or_data_dependent_bounds:
                 # Exclude "unroll" (uses Python range(), can't handle traced
                 # bounds) and put "fori_loop" first: it handles both DMA-aligned

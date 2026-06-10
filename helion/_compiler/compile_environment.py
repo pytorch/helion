@@ -161,6 +161,7 @@ if TYPE_CHECKING:
     from .. import Config
     from ..runtime.settings import Settings
     from .backend import Backend
+    from .pallas.outer_pipeline import PipelineContext
 
     class _TLS(Protocol):
         env: CompileEnvironment | None
@@ -269,6 +270,7 @@ class CompileEnvironment:
         self._tensor_descriptor_layout_guard_source_cache: dict[int, Source | None] = {}
         self.jagged_tile_parent_ids: dict[int, list[int]] = {}
         self.jagged_tile_mask_shapes: dict[int, list[torch.SymInt]] = {}
+        self.outer_pipeline_context: PipelineContext | None = None
         self._symint_cache: dict[object, torch.SymInt] = {}
         self._foreign_symint_cache: dict[
             tuple[int, sympy.Expr], int | torch.SymInt
@@ -1247,6 +1249,7 @@ class BlockSizeInfo:
     reduction: bool
     block_size_source: BlockSizeSource
     debug_names: set[str] = dataclasses.field(default_factory=set)
+    max_extent: torch.SymInt | int | None = None
 
     def add_debug_name(self, name: str) -> None:
         if not name:
@@ -1309,6 +1312,22 @@ class BlockSizeInfo:
                     ).update_hint(hint)
         elif size is None or self.size is None or self.size != size:
             self.size = None
+
+    def mark_max_extent(self, max_extent: torch.SymInt | int | None) -> None:
+        """Record the declared static bound for a data-dependent tile loop."""
+        if max_extent is None:
+            return
+        if self.max_extent is None:
+            self.max_extent = max_extent
+            return
+        env = CompileEnvironment.current()
+        old = env.specialize_expr(_to_sympy(self.max_extent))
+        new = env.specialize_expr(_to_sympy(max_extent))
+        if old != new:
+            raise exc.IncorrectTileUsage(
+                "Conflicting hl.tile(max_extent=...) values for the same "
+                f"registered block size: {old} vs {new}."
+            )
 
     def symbol(self) -> sympy.Symbol:
         expr = _symint_expr(self.var)

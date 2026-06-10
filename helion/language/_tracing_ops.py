@@ -243,6 +243,8 @@ def _(state: CodegenState) -> object:
         return _codegen_emit_pipeline(state)
     if pallas_loop_type == "fori_loop":
         return _codegen_fori_loop(state)
+    if pallas_loop_type == "outer_pipeline":
+        return _codegen_emit_pipeline(state)
     # unroll: fall through to common codegen path
     # pyrefly: ignore[bad-return]
     return state.get_graph(state.proxy_arg(0)).codegen(state)
@@ -258,6 +260,9 @@ def _(state: CodegenState) -> None:
         return None
     if pallas_loop_type == "fori_loop":
         _codegen_fori_loop(state)
+        return None
+    if pallas_loop_type == "outer_pipeline":
+        _codegen_emit_pipeline(state)
         return None
     # pyrefly: ignore[bad-return]
     return state.get_graph(state.proxy_arg(0)).codegen(state)
@@ -335,6 +340,51 @@ def _get_dim_block_ids(
     return dim_to_bid
 
 
+def _validate_outer_pipeline_folded_body(
+    graph_info: object,
+    block_ids: list[int],
+    env: CompileEnvironment,
+    loaded_tensors: dict[int, tuple[torch.Tensor, torch.fx.Node, list[object]]],
+    stored_tensors: dict[int, tuple[torch.Tensor, torch.fx.Node, list[object]]],
+) -> None:
+    """First-PR legality checks for folding an inner tile into emit_pipeline."""
+    from .atomic_ops import ATOMIC_OPS
+    from .memory_ops import store as _store_op
+
+    folded_ids = set(block_ids)
+    for node in graph_info.graph.nodes:  # type: ignore[union-attr]
+        if node.op != "call_function":
+            continue
+        if node.target in ATOMIC_OPS:
+            raise BackendUnsupported(
+                "pallas",
+                "outer_pipeline does not support atomics in the folded hl.tile body",
+            )
+        if _aten_op_name(node.target) in _FOLDED_AXIS_REDUCTION_OPS:
+            raise BackendUnsupported(
+                "pallas",
+                "outer_pipeline does not support reductions in the folded "
+                "hl.tile body yet; keep the reduction outside the folded loop "
+                "or use fori_loop",
+            )
+        if node.target is not _store_op:
+            continue
+        sub_meta = _extract_subscript_vals(node.args[1])
+        store_block_ids = set(_get_dim_block_ids(sub_meta, env).values())
+        if not (store_block_ids & folded_ids):
+            raise BackendUnsupported(
+                "pallas",
+                "outer_pipeline folded-body stores must reference the folded "
+                "hl.tile index",
+            )
+
+    if set(loaded_tensors) & set(stored_tensors):
+        raise BackendUnsupported(
+            "pallas",
+            "outer_pipeline does not support folded-body read-modify-write stores",
+        )
+
+
 def _find_strategy(
     state: CodegenState,
     block_ids: list[int],
@@ -390,6 +440,30 @@ def _is_static_int(expr: str) -> bool:
     except (TypeError, ValueError):
         return False
     return True
+
+
+def _aten_op_name(target: object) -> str | None:
+    target_str = str(target)
+    if not target_str.startswith("aten."):
+        return None
+    parts = target_str.split(".")
+    return parts[1] if len(parts) > 1 else None
+
+
+_FOLDED_AXIS_REDUCTION_OPS = {
+    "amax",
+    "amin",
+    "argmax",
+    "argmin",
+    "logsumexp",
+    "max",
+    "mean",
+    "min",
+    "nanmean",
+    "nansum",
+    "prod",
+    "sum",
+}
 
 
 def _compute_grid_and_block_sizes(
@@ -677,16 +751,22 @@ def _setup_inner_loop_masks(
     env: CompileEnvironment,
     body_stmts: list[ast.AST],
     offset_expr_fn: Callable[[int, str], str],
+    force_mask_block_ids: set[int] | None = None,
 ) -> bool:
     """Set up mask variables for inner-loop block_ids.
 
     Args:
         offset_expr_fn: Given (block_id_index, block_size_var), returns a string
-            expression for the per-element offset (e.g. "_j * bs + jnp.arange(bs)").
+            expression for the per-element offset (e.g. "_j * step + jnp.arange(bs)").
+        force_mask_block_ids: block ids that must get a mask even when the
+            configured max extent is a known multiple of the block size. Folded
+            outer-pipeline axes need this because a dynamic BoundedSlice can be
+            shorter than its static max extent, and body code may mix lanes.
 
     Returns True if any mask requires explicit indices.
     """
     needs_explicit = False
+    force_mask_block_ids = force_mask_block_ids or set()
     if hasattr(strategy, "_setup_mask"):
         for i, bid in enumerate(block_ids):
             block_value = state.device_function.resolved_block_size(bid)
@@ -696,6 +776,19 @@ def _setup_inner_loop_masks(
             mask_stmt = strategy._setup_mask(
                 state, bid, block_value, offset_var, numel_expr
             )
+            if mask_stmt is None and bid in force_mask_block_ids:
+                mask_vars = getattr(strategy, "mask_vars", None)
+                if not isinstance(mask_vars, dict):
+                    raise BackendUnsupported(
+                        "pallas",
+                        "outer_pipeline requires a tile strategy that can "
+                        "materialize folded-axis validity masks",
+                    )
+                mask_var = state.device_function.new_var(f"mask_{bid}", dce=True)
+                mask_vars[bid] = mask_var
+                mask_stmt = statement_from_string(
+                    f"{mask_var} = ({offset_var}) < ({numel_expr})"
+                )
             if mask_stmt is not None:
                 needs_explicit = True
                 body_stmts.extend(
@@ -1428,6 +1521,18 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
 
     block_ids = graph_info.block_ids
     env = CompileEnvironment.current()
+    outer_context = (
+        env.outer_pipeline_context
+        if state.config.get("pallas_loop_type", "unroll") == "outer_pipeline"
+        else None
+    )
+    if outer_context is not None and outer_context.folded_block_ids:
+        raise BackendUnsupported(
+            "pallas",
+            "outer_pipeline currently supports one folded hl.tile loop",
+        )
+    if outer_context is not None:
+        outer_context.capturing_prologue_replay = False
 
     args = state.ast_args[-1]
     assert isinstance(args, list)
@@ -1436,16 +1541,70 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
     # Check if we have loop-carried state (accumulators etc.)
     proxy_args = state.proxy_args[-1]
     assert isinstance(proxy_args, list)
-    has_loop_state = len(args) > 0
+    if outer_context is None:
+        has_loop_state = bool(args)
+    else:
+        has_loop_state = bool(_loop_carried_indices(state, len(args))) if args else False
+    if outer_context is not None and has_loop_state:
+        raise BackendUnsupported(
+            "pallas",
+            "outer_pipeline does not support loop-carried state in the folded "
+            "hl.tile loop",
+        )
 
-    grid_parts, block_size_vars = _compute_grid_and_block_sizes(state, block_ids, env)
+    folded_max_tiles: list[int] = []
+    if outer_context is None:
+        grid_parts, block_size_vars = _compute_grid_and_block_sizes(
+            state, block_ids, env
+        )
+    else:
+        from .._compiler.pallas.outer_pipeline import PipelineAxis
+        from .._compiler.pallas.outer_pipeline import PipelineExpr
+        from .._compiler.pallas.outer_pipeline import max_tiles_for_block
+
+        block_size_vars = []
+        for block_id in block_ids:
+            block_size_var = state.device_function.block_size_var(block_id)
+            assert block_size_var is not None
+            block_size_vars.append(block_size_var)
+            block_value = state.device_function.resolved_block_size(block_id)
+            if block_value is not None:
+                state.device_function.constexpr_arg(block_size_var, block_value)
+            if not isinstance(block_value, int):
+                raise BackendUnsupported(
+                    "pallas",
+                    "outer_pipeline requires concrete folded block sizes",
+                )
+            folded_max_tiles.append(max_tiles_for_block(env, block_id, block_value))
 
     loaded_tensors, stored_tensors = _classify_loop_tensors(graph_info, state)
+    if outer_context is not None:
+        _validate_outer_pipeline_folded_body(
+            graph_info, block_ids, env, loaded_tensors, stored_tensors
+        )
     begin_exprs, iter_step_exprs, slice_size_exprs = _pallas_loop_begin_and_step_exprs(
         state, block_ids, block_size_vars
     )
     # Loop end expressions (used to clamp store extents for data-dependent begins).
     end_exprs = [_get_loop_begin_and_end(state, i)[1] for i in range(len(block_ids))]
+    if outer_context is not None:
+        inner_lambda_params_for_axes = [
+            f"_j{i}" if len(block_ids) > 1 else "_j" for i in range(len(block_ids))
+        ]
+        for i, block_id in enumerate(block_ids):
+            outer_context.add_folded_axis(
+                PipelineAxis(
+                    block_id=block_id,
+                    kind="parallel",
+                    begin=PipelineExpr.from_string(begin_exprs[i]),
+                    end=PipelineExpr.from_string(end_exprs[i]),
+                    max_tiles=folded_max_tiles[i],
+                    step=PipelineExpr.from_string(iter_step_exprs[i]),
+                    block_extent=slice_size_exprs[i],
+                    lambda_param=inner_lambda_params_for_axes[i],
+                )
+            )
+        grid_parts = outer_context.grid_parts
 
     # Pipelined tensors flow through emit_pipeline's per-iter Buffered
     # BlockSpec; the rest stay on the outer pallas_call BlockSpec
@@ -1453,6 +1612,12 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
     all_tensor_info, _vmem_shapes, pipelined_tensor_ids = _classify_pipelined_tensors(
         loaded_tensors, stored_tensors, block_ids, slice_size_exprs, env, state
     )
+    if outer_context is not None and len(pipelined_tensor_ids) < len(all_tensor_info):
+        raise BackendUnsupported(
+            "pallas",
+            "outer_pipeline currently requires folded-loop tensor accesses to "
+            "use emit_pipeline BlockSpecs",
+        )
 
     # Build in_specs and out_specs
     in_tensors: list[tuple[torch.Tensor, str]] = []
@@ -1471,15 +1636,62 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
     # correctly maps to the block_id at grid dimension g.
     from .._compiler.device_function import DeviceFunction as _DF
 
+    outer_rank = len(outer_context.outer_block_ids) if outer_context else 0
     _bid_to_pid_var: dict[int, str] = {}
     device_fn = _DF.current()
-    if device_fn.pid is not None:
+    if outer_context is None and device_fn.pid is not None:
         for g, pid in enumerate(device_fn.pid.pid_info):
             pid_var = f"_outer_pid_{g}"
             state.add_statement(
                 statement_from_string(f"{pid_var} = pl.program_id({g})")
             )
             _bid_to_pid_var[pid.block_id] = pid_var
+
+    def _outer_lambda_params() -> tuple[list[str], dict[int, str]]:
+        """The ``_o{i}`` BlockSpec-lambda params for the folded outer grid dims,
+        plus a ``block_id -> param`` map."""
+        lambda_params: list[str] = []
+        outer_lambda_params: dict[int, str] = {}
+        if outer_context is not None:
+            for axis in outer_context.outer_axes:
+                param = axis.lambda_param
+                lambda_params.append(param)
+                outer_lambda_params[axis.block_id] = param
+        return lambda_params, outer_lambda_params
+
+    def _inner_lambda_params() -> list[str]:
+        """The ``_j{i}`` BlockSpec-lambda params for the folded inner tile dims."""
+        if outer_context is not None:
+            return [axis.lambda_param for axis in outer_context.folded_axes]
+        return [f"_j{i}" if len(block_ids) > 1 else "_j" for i in range(len(block_ids))]
+
+    def _buffered_block_spec(
+        block_shape_parts: list[str],
+        lambda_params: list[str],
+        lambda_parts: list[str],
+    ) -> str:
+        """Assemble a double-buffered ``pl.BlockSpec`` string from its block-shape
+        parts and index-map lambda params/parts."""
+        return (
+            f"pl.BlockSpec(({', '.join(block_shape_parts)},), "
+            f"lambda {', '.join(lambda_params)}: ({', '.join(lambda_parts)},), "
+            f"pipeline_mode=pl.Buffered(buffer_count=2))"
+        )
+
+    def _outer_lambda_expr(
+        expr: str, outer_lambda_params: dict[int, str]
+    ) -> str:
+        """Rewrite a body-local bound expr for use in a BlockSpec index_map lambda.
+
+        Replaces outer pid vars with the lambda's pipeline-index params and
+        recursively inlines captured prologue assignments (e.g. ``s =
+        x_offsets[g]``) so the lambda is self-contained. Raises BackendUnsupported
+        if any body-local folded name can't be resolved -- fails loud rather than
+        emitting a lambda that references an out-of-scope variable.
+        """
+        if outer_context is None:
+            return expr
+        return outer_context.resolve_for_lambda(expr)
 
     def _make_block_spec(
         fake: torch.Tensor, subscript_meta: list[object], is_store: bool = False
@@ -1494,26 +1706,100 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
         shape = fake.shape
         block_shape_parts: list[str] = []
         lambda_parts: list[str] = []
-        lambda_params: list[str] = []
+        if outer_context is not None:
+            lambda_params = [axis.lambda_param for axis in outer_context.axes]
+            outer_lambda_params: dict[int, str] = {}
+            inner_lambda_params: list[str] = []
+        else:
+            lambda_params, outer_lambda_params = _outer_lambda_params()
+            inner_lambda_params = _inner_lambda_params()
+            lambda_params.extend(inner_lambda_params)
 
-        for i, _bid in enumerate(block_ids):
-            param = f"_j{i}" if len(block_ids) > 1 else "_j"
-            lambda_params.append(param)
+        def _static_int_expr_value(
+            expr: str, block_id: int | None = None
+        ) -> int | None:
+            expr = expr.strip()
+            if _is_static_int(expr):
+                return int(expr)
+            if block_id is None:
+                return None
+            block_size_var = state.device_function.block_size_var(block_id)
+            if expr == block_size_var:
+                block_value = state.device_function.resolved_block_size(block_id)
+                if isinstance(block_value, int):
+                    return block_value
+            return None
+
+        def _append_axis_dim(axis: object, dim_idx: int, dim_size: object) -> None:
+            assert outer_context is not None
+            from .._compiler.pallas.outer_pipeline import PipelineAxis
+
+            assert isinstance(axis, PipelineAxis)
+            block_extent = axis.block_extent
+            lambda_begin_expr = axis.begin.render_lambda(outer_context)
+            lambda_step_expr = axis.step.render_lambda(outer_context)
+            lambda_end_expr = axis.end.render_lambda(outer_context)
+            raw_start_expr = (
+                f"({lambda_begin_expr}) + ({axis.lambda_param}) "
+                f"* ({lambda_step_expr})"
+            )
+            begin_is_zero = lambda_begin_expr == "0"
+            exact_block_index = begin_is_zero and lambda_step_expr == block_extent
+            covers_full_dim = (
+                exact_block_index
+                and _is_static_int(lambda_end_expr)
+                and isinstance(dim_size, int)
+                and int(lambda_end_expr) == dim_size
+            )
+            block_extent_int = _static_int_expr_value(block_extent, axis.block_id)
+            full_static_blocks = (
+                covers_full_dim
+                and block_extent_int is not None
+                and dim_size % block_extent_int == 0
+            )
+            needs_dynamic_ds = not full_static_blocks
+            if needs_dynamic_ds:
+                if dim_idx == len(shape) - 1:
+                    raise BackendUnsupported(
+                        "pallas",
+                        "outer_pipeline dynamic BoundedSlice access on the "
+                        "innermost tensor dimension is not supported; tile a "
+                        "non-innermost dimension or use emit_pipeline.",
+                    )
+                block_shape_parts.append(f"pl.BoundedSlice({block_extent})")
+                extent_expr = (
+                    f"jnp.maximum(0, jnp.minimum({block_extent}, "
+                    f"({lambda_end_expr}) - ({raw_start_expr})))"
+                )
+                dim_size_expr = state.device_function.literal_expr(dim_size)
+                start_expr = (
+                    f"jnp.minimum(jnp.maximum({raw_start_expr}, 0), "
+                    f"({dim_size_expr}) - 1)"
+                )
+                lambda_parts.append(f"pl.ds({start_expr}, {extent_expr})")
+                return
+
+            block_shape_parts.append(block_extent)
+            if exact_block_index:
+                lambda_parts.append(axis.lambda_param)
+            else:
+                lambda_parts.append(raw_start_expr)
 
         for dim_idx in range(len(shape)):
             bid = dim_to_bid.get(dim_idx)
-            if bid is not None and bid in block_ids:
+            axis = (
+                outer_context.axis_by_block_id.get(bid)
+                if outer_context is not None and bid is not None
+                else None
+            )
+            if axis is not None:
+                _append_axis_dim(axis, dim_idx, shape[dim_idx])
+            elif outer_context is None and bid is not None and bid in block_ids:
                 # Inner pipeline dim -- tiled by pipeline grid
                 bid_idx = block_ids.index(bid)
                 slice_size_expr = slice_size_exprs[bid_idx]
                 begin_expr = begin_exprs[bid_idx]
                 iter_step_expr = iter_step_exprs[bid_idx]
-                from .memory_ops import _record_pad_info
-
-                extra_pad = _compute_pipeline_or_dma_extra_pad(
-                    begin_expr, bid, env, state
-                )
-                _record_pad_info(state, fake, dim_idx, bid, extra_pad)
                 begin_is_zero = begin_expr == "0"
                 end_expr = end_exprs[bid_idx]
                 dim_size = shape[dim_idx]
@@ -1531,47 +1817,71 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
                     and isinstance(dim_size, int)
                     and int(end_expr) == dim_size
                 )
-                # Loads need a dynamic ``pl.ds`` only for a non-zero begin (a
-                # block-aligned index can't express an arbitrary start; the
-                # over-read past ``end`` is zeroed by the inner-loop mask).
-                # Stores need it whenever they target a sub-range (not the full
-                # dim), so the extent can be clamped and a partial final tile
-                # does not overrun live rows. Full-dim, from-zero loops keep the
-                # original block-index codegen (no change).
-                if not begin_is_zero or (is_store and not covers_full_dim):
-                    # Dynamic ``pl.ds`` at the true element offset, with a
-                    # ``pl.BoundedSlice`` block shape (required for ds-style
-                    # index maps). Lifts the "emit_pipeline fails on unaligned
-                    # dims" limitation so data-dependent tile loops can pipeline.
+                if outer_context is None and not (is_store and not covers_full_dim):
+                    from .memory_ops import _record_pad_info
+
+                    extra_pad = _compute_pipeline_or_dma_extra_pad(
+                        begin_expr, bid, env, state
+                    )
+                    _record_pad_info(state, fake, dim_idx, bid, extra_pad)
+                outer_load_needs_dynamic_extent = (
+                    outer_context is not None and not is_store and not covers_full_dim
+                )
+                # A dynamic ``pl.ds`` is required when the block-aligned index
+                # cannot express the true start, when a folded load targets a
+                # sub-range, or when a store targets a sub-range.
+                needs_dynamic_ds = (
+                    not begin_is_zero
+                    or outer_load_needs_dynamic_extent
+                    or (is_store and not covers_full_dim)
+                )
+                if needs_dynamic_ds:
+                    if outer_context is not None and dim_idx == len(shape) - 1:
+                        raise BackendUnsupported(
+                            "pallas",
+                            "outer_pipeline dynamic BoundedSlice access on the "
+                            "innermost tensor dimension is not supported; tile a "
+                            "non-innermost dimension or use emit_pipeline.",
+                        )
                     block_shape_parts.append(f"pl.BoundedSlice({slice_size_expr})")
-                    start_expr = (
-                        f"({begin_expr}) + ({lambda_params[bid_idx]}) "
+                    lambda_begin_expr = _outer_lambda_expr(
+                        begin_expr, outer_lambda_params
+                    )
+                    raw_start_expr = (
+                        f"({lambda_begin_expr}) + ({inner_lambda_params[bid_idx]}) "
                         f"* ({iter_step_expr})"
                     )
-                    if is_store:
-                        # Clamp the store extent to min(block, end - offset) so a
-                        # short final tile writes only its valid rows
-                        # [begin, end) instead of overrunning into the next
-                        # sub-range (which would corrupt it under cross-iteration
-                        # double-buffering, and is wasteful for large blocks).
-                        size_expr = (
-                            f"jnp.minimum({slice_size_expr}, "
-                            f"({end_exprs[bid_idx]}) - ({start_expr}))"
+                    lambda_end_expr = _outer_lambda_expr(
+                        end_exprs[bid_idx], outer_lambda_params
+                    )
+                    if outer_context is not None or is_store:
+                        extent_expr = (
+                            f"jnp.maximum(0, jnp.minimum({slice_size_expr}, "
+                            f"({lambda_end_expr}) - ({raw_start_expr})))"
                         )
                     else:
-                        size_expr = slice_size_expr
-                    lambda_parts.append(f"pl.ds({start_expr}, {size_expr})")
+                        extent_expr = slice_size_expr
+
+                    if outer_context is not None:
+                        dim_size_expr = state.device_function.literal_expr(dim_size)
+                        start_expr = (
+                            f"jnp.minimum(jnp.maximum({raw_start_expr}, 0), "
+                            f"({dim_size_expr}) - 1)"
+                        )
+                    else:
+                        start_expr = raw_start_expr
+                    lambda_parts.append(f"pl.ds({start_expr}, {extent_expr})")
                 else:
                     # Static, from-zero loop: a block-aligned index is exact.
                     # Identical to the pre-existing codegen.
                     block_shape_parts.append(slice_size_expr)
                     if iter_step_expr == slice_size_expr:
-                        lambda_parts.append(lambda_params[bid_idx])
+                        lambda_parts.append(inner_lambda_params[bid_idx])
                     else:
                         lambda_parts.append(
-                            f"(({begin_expr}) + ({lambda_params[bid_idx]}) * ({iter_step_expr})) // ({slice_size_expr})"
+                            f"(({begin_expr}) + ({inner_lambda_params[bid_idx]}) * ({iter_step_expr})) // ({slice_size_expr})"
                         )
-            elif bid is not None and bid in _bid_to_pid_var:
+            elif outer_context is None and bid is not None and bid in _bid_to_pid_var:
                 # Outer grid dim -- select via captured program_id variable
                 pid_var = _bid_to_pid_var[bid]
                 bs_var = state.device_function.block_size_var(bid)
@@ -1612,14 +1922,7 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
                     block_shape_parts.append(str(int(shape[dim_idx])))
                     lambda_parts.append("0")
 
-        block_shape_str = ", ".join(block_shape_parts)
-        lambda_body = ", ".join(lambda_parts)
-        lambda_param_str = ", ".join(lambda_params)
-        return (
-            f"pl.BlockSpec(({block_shape_str},), "
-            f"lambda {lambda_param_str}: ({lambda_body},), "
-            f"pipeline_mode=pl.Buffered(buffer_count=2))"
-        )
+        return _buffered_block_spec(block_shape_parts, lambda_params, lambda_parts)
 
     def _make_load_block_spec(fake: torch.Tensor, subscript_meta: list[object]) -> str:
         """BlockSpec for a pipelined input (full-block ``pl.ds``; mask zeroes over-read)."""
@@ -1648,6 +1951,10 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
             if (
                 bid is not None
                 and bid not in block_ids
+                and not (
+                    outer_context is not None
+                    and bid in outer_context.outer_block_ids
+                )
                 and bid not in _bid_to_pid_var
                 and state.codegen.active_device_loops.get(bid)
             ):
@@ -1663,6 +1970,23 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
         if not needs_slice:
             return hbm_name
         return f"{hbm_name}.at[{', '.join(parts)}]"
+
+    prologue_tensor_pipeline_inputs = {}
+    if outer_context is not None:
+        from .._compiler.pallas.outer_pipeline import (
+            collect_prologue_tensor_pipeline_inputs,
+        )
+
+        outer_lambda_params, outer_lambda_param_by_block = _outer_lambda_params()
+        prologue_tensor_pipeline_inputs = collect_prologue_tensor_pipeline_inputs(
+            state=state,
+            outer_context=outer_context,
+            outer_lambda_params=outer_lambda_params,
+            outer_lambda_param_by_block=outer_lambda_param_by_block,
+            inner_lambda_params=_inner_lambda_params(),
+            outer_lambda_expr=_outer_lambda_expr,
+            buffered_block_spec=_buffered_block_spec,
+        )
 
     # --- Handle loop-carried state as scratch VMEM buffers ---
     scratch_names: list[str] = []
@@ -1695,6 +2019,10 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
     for fake, _tensor_node, _sub_meta in stored_tensors.values():
         if id(fake) in pipelined_tensor_ids:
             state.device_function.pallas_memory_space[id(fake)] = PallasMemorySpace.HBM
+    for prologue_input in prologue_tensor_pipeline_inputs.values():
+        state.device_function.pallas_memory_space[id(prologue_input.fake)] = (
+            PallasMemorySpace.HBM
+        )
 
     for key, (fake, _tensor_node, sub_meta) in loaded_tensors.items():
         if key in stored_tensors:
@@ -1709,6 +2037,12 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
         in_specs.append(_make_load_block_spec(fake, sub_meta))
         body_params.append(vmem_name)
         pipeline_in_args.append(_make_hbm_slice(fake, hbm_name, sub_meta))
+
+    for hbm_name, prologue_input in prologue_tensor_pipeline_inputs.items():
+        in_tensors.append((prologue_input.fake, hbm_name))
+        in_specs.append(prologue_input.block_spec)
+        body_params.append(prologue_input.vmem_name)
+        pipeline_in_args.append(hbm_name)
 
     for fake, _tensor_node, sub_meta in stored_tensors.values():
         if id(fake) not in pipelined_tensor_ids:
@@ -1725,17 +2059,34 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
     # Build the body function
     body_fn_name = state.device_function.new_var("_pipeline_body")
     body_stmts: list[ast.AST] = []
+    if outer_context is not None:
+        from .._compiler.pallas.outer_pipeline import (
+            remap_prologue_tensor_pipeline_inputs,
+        )
+
+        body_stmts.extend(
+            remap_prologue_tensor_pipeline_inputs(
+                outer_context, prologue_tensor_pipeline_inputs
+            )
+        )
 
     # Build block_id_to_info for the pipeline state
     block_id_to_info: dict[int, LoopDimInfo] = {}
-    for block_id in block_ids:
+    for i, block_id in enumerate(block_ids):
         block_size = env.block_sizes[block_id]
         # when the block_size.size is None, we cannot form a SymPy expr for the numel
         sympy_end_expr = block_size.numel if block_size.size is not None else None
-        block_id_to_info[block_id] = LoopDimInfo(
-            end_var_name=None,
-            end_expr=sympy_end_expr,
-        )
+        if outer_context is None:
+            block_id_to_info[block_id] = LoopDimInfo(
+                end_var_name=None,
+                end_expr=sympy_end_expr,
+            )
+        else:
+            block_id_to_info[block_id] = LoopDimInfo(
+                begin_var_name=begin_exprs[i],
+                end_var_name=end_exprs[i],
+                end_expr=sympy_end_expr,
+            )
 
     strategy = _find_strategy(state, block_ids)
     # Emit offset_<bid>/indices_<bid> at the body prologue.
@@ -1746,10 +2097,19 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
         block_size_vars,
         begin_exprs,
         iter_step_exprs,
-        [f"_pipeline_indices[{i}]" for i in range(len(block_ids))],
+        [f"_pipeline_indices[{outer_rank + i}]" for i in range(len(block_ids))],
         env,
         body_stmts,
     )
+    if outer_context is None:
+        pipeline_mask_offset_expr = (
+            lambda i, bs: f"_pipeline_indices[{i}] * {bs} + jnp.arange({bs})"
+        )
+    else:
+        pipeline_mask_offset_expr = lambda i, bs: (
+            f"_pipeline_indices[{outer_rank + i}] * ({iter_step_exprs[i]}) "
+            f"+ jnp.arange({bs})"
+        )
     # Set up mask variables for inner-loop block_ids (non-divisible bounds).
     _setup_inner_loop_masks(
         state,
@@ -1759,9 +2119,8 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
         env,
         body_stmts,
         # emit_pipeline passes indices as a single tuple arg
-        offset_expr_fn=lambda i, bs: (
-            f"_pipeline_indices[{i}] * {bs} + jnp.arange({bs})"
-        ),
+        offset_expr_fn=pipeline_mask_offset_expr,
+        force_mask_block_ids=set(block_ids) if outer_context is not None else None,
     )
 
     # Emit absolute offset assignments inside the pipeline body so any
@@ -1777,9 +2136,11 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
             body_stmts.append(
                 statement_from_string(
                     f"{offset_name} = ({begin_exprs[i]}) + "
-                    f"(_pipeline_indices[{i}]) * ({iter_step_exprs[i]})"
+                    f"(_pipeline_indices[{outer_rank + i}]) * ({iter_step_exprs[i]})"
                 )
             )
+
+    body_guard_start = len(body_stmts)
 
     # Build tensor_to_dma_scratch mapping
     tensor_to_dma_scratch: dict[str, str] = {}
@@ -1791,7 +2152,6 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
         tensor_to_dma_scratch[hbm_name] = body_params[idx]
         idx += 1
 
-    # Create the pipeline loop state
     pipeline_state = EmitPipelineLoopState(
         strategy=strategy,  # pyrefly: ignore[bad-argument-type]
         block_id_to_info=block_id_to_info,
@@ -1817,6 +2177,40 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
         if has_loop_state:
             _write_back_loop_carried(state, scratch_names, carried, graph_results)
 
+    if outer_context is not None:
+        guarded_body_stmts = body_stmts[body_guard_start:]
+        del body_stmts[body_guard_start:]
+
+        valid_terms = []
+        for i in range(len(block_ids)):
+            tile_start = (
+                f"({begin_exprs[i]}) + "
+                f"(_pipeline_indices[{outer_rank + i}]) * ({iter_step_exprs[i]})"
+            )
+            valid_terms.append(f"(({tile_start}) < ({end_exprs[i]}))")
+        valid_expr = " & ".join(valid_terms) if valid_terms else "True"
+
+        valid_fn_name = state.device_function.new_var("_valid_pipeline_body")
+        invalid_fn_name = state.device_function.new_var("_invalid_pipeline_body")
+
+        valid_fn_def = statement_from_string(f"def {valid_fn_name}(): pass")
+        assert isinstance(valid_fn_def, ast.FunctionDef)
+        valid_fn_def.body = guarded_body_stmts or [ast.Pass()]  # pyrefly: ignore[bad-assignment]
+
+        invalid_fn_def = statement_from_string(f"def {invalid_fn_name}(): pass")
+        assert isinstance(invalid_fn_def, ast.FunctionDef)
+        invalid_fn_def.body = [ast.Pass()]  # pyrefly: ignore[bad-assignment]
+
+        body_stmts.extend(
+            [
+                valid_fn_def,
+                invalid_fn_def,
+                statement_from_string(
+                    f"lax.cond({valid_expr}, {valid_fn_name}, {invalid_fn_name})"
+                ),
+            ]
+        )
+
     _emit_nonlocal_scratch_declarations(state, body_stmts)
 
     all_body_params = body_params
@@ -1838,6 +2232,10 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
     if out_specs:
         spec_parts.append(f"out_specs=[{out_specs_str}]")
     spec_parts.append("_explicit_indices=True")
+    if outer_context is not None:
+        spec_parts.append(
+            f"dimension_semantics={outer_context.dimension_semantics!r}"
+        )
     specs_str = ", ".join(spec_parts)
 
     all_pipeline_args = pipeline_in_args + pipeline_out_args
@@ -1853,9 +2251,15 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
             f"pltpu.emit_pipeline({body_fn_name}, grid=({grid_str},))({call_args_str})"
         )
 
-    # Emit the function def and pipeline call into the current scope
-    state.add_statement(fn_def)
-    state.add_statement(statement_from_string(pipeline_call_str))
+    # Emit the function def and pipeline call into the current scope.
+    if outer_context is not None:
+        outer_context.emitting_folded_pipeline = True
+    try:
+        state.add_statement(fn_def)
+        state.add_statement(statement_from_string(pipeline_call_str))
+    finally:
+        if outer_context is not None:
+            outer_context.emitting_folded_pipeline = False
 
     # After pipeline: read final loop-carried state from scratch
     if has_loop_state:
@@ -1971,22 +2375,31 @@ def _classify_pipelined_tensors(
         all_tensor_info, block_ids, slice_size_exprs, env, state
     )
     device_ir = HostFunction.current().device_ir
+    outer_context = (
+        env.outer_pipeline_context
+        if state.config.get("pallas_loop_type", "unroll") == "outer_pipeline"
+        else None
+    )
 
     # Walk all root graphs (outer pallas_call body) for load/store/atomic
     # nodes; any tensor accessed there is read/written outside the inner
     # loop and must keep its outer BlockSpec.
     outer_access_tensor_ids: set[int] = set()
-    for root_id in device_ir.root_ids:
-        root_graph = device_ir.graphs[root_id].graph
-        for node in root_graph.nodes:
-            if node.op != "call_function" or node.target not in outer_access_targets:
-                continue
-            tensor_node = node.args[0]
-            if not isinstance(tensor_node, torch.fx.Node):
-                continue
-            val = tensor_node.meta.get("val")
-            if isinstance(val, torch.Tensor):
-                outer_access_tensor_ids.add(id(val))
+    if outer_context is None:
+        for root_id in device_ir.root_ids:
+            root_graph = device_ir.graphs[root_id].graph
+            for node in root_graph.nodes:
+                if (
+                    node.op != "call_function"
+                    or node.target not in outer_access_targets
+                ):
+                    continue
+                tensor_node = node.args[0]
+                if not isinstance(tensor_node, torch.fx.Node):
+                    continue
+                val = tensor_node.meta.get("val")
+                if isinstance(val, torch.Tensor):
+                    outer_access_tensor_ids.add(id(val))
 
     pipelined_ids: set[int] = set()
     for (fake, _sub_meta, _direction), vmem_shape in zip(

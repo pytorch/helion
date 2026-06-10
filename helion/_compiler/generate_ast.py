@@ -75,6 +75,7 @@ class GenerateAST(NodeVisitor, CodegenInterface):
 
         # Initialize our attributes
         self.host_function = func
+        CompileEnvironment.current().outer_pipeline_context = None
         self.codegen_graphs = func.device_ir.build_codegen_graphs(config)
         self.host_statements: list[ast.AST] = []
         self.module_statements: list[ast.stmt] = []
@@ -244,7 +245,34 @@ class GenerateAST(NodeVisitor, CodegenInterface):
             return
         if isinstance(stmt, str):
             stmt = statement_from_string(stmt)
-        self.statements_stack[-1].append(stmt)
+        # outer_pipeline: while capturing the grid-body prologue (everything
+        # emitted before the folded inner loop), divert statements into the
+        # context for replay inside the pipeline body rather than the current
+        # scope. The scope guards ensure the grid body holds nothing but this
+        # prologue and the folded loop, so capturing everything here is sound.
+        outer_context = (
+            CompileEnvironment.current().outer_pipeline_context
+            if self.on_device
+            else None
+        )
+        if outer_context is not None and outer_context.capturing_prologue_replay:
+            outer_context.capture_prologue_statement(stmt)
+        elif (
+            outer_context is not None
+            and outer_context.folded_block_ids
+            and not outer_context.emitting_folded_pipeline
+            and not any(
+                isinstance(loop_state, EmitPipelineLoopState)
+                for loop_state in self._active_loop_stack()
+            )
+        ):
+            raise exc.BackendUnsupported(
+                "pallas",
+                "outer_pipeline currently requires the folded hl.tile loop to "
+                "be the final statement in the grid body",
+            )
+        else:
+            self.statements_stack[-1].append(stmt)
         self._record_statement_thread_references([stmt])
         self._record_tcgen05_owned_statement(stmt)
 
@@ -879,6 +907,17 @@ class GenerateAST(NodeVisitor, CodegenInterface):
             assert node._root_id is not None
             # Loop dependency checks were already run during lowering; phase checker kept for symmetry/debug.
             self._phase_checker(node._root_id)
+            env = CompileEnvironment.current()
+            if (
+                env.backend.name == "pallas"
+                and self.device_function.config.get("pallas_loop_type", "unroll")
+                == "outer_pipeline"
+                and len(self.host_function.device_ir.root_ids) != 1
+            ):
+                raise exc.BackendUnsupported(
+                    "pallas",
+                    "outer_pipeline currently supports exactly one top-level grid",
+                )
 
             if len(self.host_function.device_ir.root_ids) == 1:
                 body = self.device_function.body
