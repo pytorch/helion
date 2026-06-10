@@ -1254,7 +1254,8 @@ class TestCuteBackend(TestCase):
 
         torch.manual_seed(0)
         x = (torch.randn(256, 128, device=DEVICE) * 0.4).to(torch.float8_e4m3fn)
-        # Column-major (K-contiguous) B. Helion must emit a K-major B operand
+        # Column-major (K-contiguous) B -- the native fp8 scaled_mm /
+        # torch._scaled_mm layout. Helion must emit a K-major B operand
         # (OperandMajorMode.K for B) and a matching K-major B SMEM layout,
         # rather than forcing the slow non-TMA fallback.
         y = (torch.randn(128, 128, device=DEVICE) * 0.4).to(torch.float8_e4m3fn)

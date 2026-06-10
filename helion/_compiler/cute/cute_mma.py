@@ -1854,7 +1854,8 @@ def _emit_mma_pipeline(
     tcgen05_use_tma_a = _dtype_tma_ok and _lhs_major == "row"
     tcgen05_use_tma_b = _dtype_tma_ok and _rhs_major in ("row", "col")
     # B is K-major when its (K, N) storage is K-contiguous (column-major),
-    # i.e. stride[0] == 1 -> _rhs_major == "col".
+    # i.e. stride[0] == 1 -> _rhs_major == "col". This is the native fp8
+    # scaled_mm / torch._scaled_mm B layout.
     tcgen05_b_k_major = _rhs_major == "col"
     tcgen05_use_tma = tcgen05_use_tma_a or tcgen05_use_tma_b
     tcgen05_use_tma_pipeline = tcgen05_use_tma_a and tcgen05_use_tma_b
@@ -3968,9 +3969,9 @@ def _emit_mma_pipeline(
                 "k_total_size": k_total_size,
                 "kernel_args": [tma_atom_a, tma_tensor_a, tma_atom_b, tma_tensor_b],
             }
-            # K-major (column-major / K-contiguous) B. Only recorded when True
-            # so MN-major (row-major B) wrapper-plan literals stay byte-identical
-            # to the golden.
+            # K-major (column-major / K-contiguous) B -- the native fp8
+            # scaled_mm layout. Only recorded when True so MN-major (row-major
+            # B) wrapper-plan literals stay byte-identical to the golden.
             if tcgen05_b_k_major:
                 ab_tma_plan["b_k_major"] = True
             # ``smem_swizzle_*`` overrides are recorded only when codegen
@@ -5415,7 +5416,8 @@ def _tcgen05_tiled_mma_expr(
     if _tcgen05_use_2cta_instrs(bm=bm, cluster_m=tcgen05_cluster_m):
         cta_group_expr = "cute.nvgpu.tcgen05.CtaGroup.TWO"
     # A is always K-major. B is MN-major for row-major (N-contiguous) B and
-    # K-major for column-major (K-contiguous) B.
+    # K-major for column-major (K-contiguous) B -- the native fp8 scaled_mm /
+    # torch._scaled_mm layout.
     b_major_expr = (
         "cute.nvgpu.OperandMajorMode.K"
         if b_k_major
