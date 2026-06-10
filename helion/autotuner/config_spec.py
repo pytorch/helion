@@ -356,7 +356,12 @@ class ConfigSpec:
         self.epilogue_subtile_k_hint: int = 0
         self.has_pallas_inner_loops: bool = False
         self.has_symbolic_or_data_dependent_bounds: bool = False
-        self.has_jagged_tile: bool = False
+        # True iff a jagged-flat DMA (sublane / lane jagged on a 2-D HBM
+        # ref) was registered in this kernel.  Strictly narrower than
+        # "kernel has any ``hl.jagged_tile``": kernels that use jagged_tile
+        # on an outer dim never emit the conflicting flat DMA, so they
+        # shouldn't be locked out of the ``emit_pipeline`` autotune path.
+        self.has_jagged_flat_dma: bool = False
         self._cute_tcgen05_config = CuteTcgen05Config(self)
         self.compiler_default_config: helion.Config | None = None
         self.compiler_seed_configs: list[helion.Config] = []
@@ -1497,12 +1502,14 @@ class ConfigSpec:
                 # TODO(thcmbs): Also exclude "emit_pipeline" when has_pallas_dma_unaligned
                 # is set, to avoid wasted autotuning effort. See PR #1969 review discussion.
                 choices = ("fori_loop", "emit_pipeline")
-            # Jagged kernels (hl.jagged_tile) use per-program data-dependent
-            # starts. emit_pipeline's BlockSpec model copies a regular
+            # Jagged-flat DMAs use per-program data-dependent starts.
+            # emit_pipeline's BlockSpec model copies a regular
             # (block_shape) window per grid step; it cannot express
-            # ``pl.ds(starts[i] + k*BK, BK)`` on HBM, so the codegen produces
-            # broadcast-shape mismatches at trace time. Restrict to fori_loop.
-            if self.has_jagged_tile:
+            # ``pl.ds(starts[i] + k*BK, BK)`` on HBM, so the codegen
+            # produces broadcast-shape mismatches at trace time.
+            # Restrict to fori_loop only when such a DMA is registered --
+            # outer-dim jagged kernels keep emit_pipeline.
+            if self.has_jagged_flat_dma:
                 choices = ("fori_loop",)
             fields["pallas_loop_type"] = EnumFragment(choices=choices)
             if self.supports_config_key("pallas_pre_broadcast"):

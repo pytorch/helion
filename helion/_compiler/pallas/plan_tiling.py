@@ -231,10 +231,17 @@ def _analyze_indexing(node: torch.fx.Node, config: Config) -> None:
         # the per-item fori_loop body — they must not be hoisted into VMEM at
         # kernel entry (the flat tensor is much larger than VMEM).
         device_fn.pallas_memory_space[tid] = PallasMemorySpace.HBM
-        # Cache lane_size for the launcher reshape (tensor.view(-1, M)).
+        # Cache lane_size + sublane/lane bids, and flip the autotune flag.
+        # The two bid sets are read by backend.py / memory_ops.py to gate
+        # jagged-flat-only codegen rules; ``has_jagged_flat_dma`` bridges
+        # into ``ConfigSpec._normalize`` where there's no live env access.
         for p in indexing_patterns:
             if isinstance(p, TensorIndexPattern) and p.is_jagged_flat:
                 device_fn.pallas_jagged_flat_lane_size[tid] = p.lane_size
+                assert p.sublane_bid is not None and p.lane_bid is not None
+                _env.pallas_jagged_flat_sublane_bids.add(p.sublane_bid)
+                _env.pallas_jagged_flat_lane_bids.add(p.lane_bid)
+                _env.config_spec.has_jagged_flat_dma = True
                 break
     elif is_jagged_pinned_only:
         # Override any prior VMEM/SMEM assignment: SMEM wins for
