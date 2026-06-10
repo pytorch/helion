@@ -206,6 +206,71 @@ class TestMatmul(RefEagerTestBase, TestCase):
             self.assertNotIn("cute.gemm", code)
             self.assertNotIn("permute_smem", code)
 
+    def test_tcgen05_fused_colvec_scale_emits_scalar_read(self):
+        """End-to-end: a per-row column-vector scale spelled explicitly as
+        ``scale_a.unsqueeze(1).expand(m, n)`` (a full ``(M, N)`` view with
+        trailing stride 0) classifies as ``("broadcast", 2)`` and the
+        generated cute epilogue reads it as a SCALAR per subtile
+        (``aux_loaded = ttr_aux_grouped[(0, 0, 0, subtile)]``) instead of a
+        redundant N-wide vector ``.load()`` — matching CUTLASS's
+        ``sa = tTR_gSA[(0,0,0,subtile)]``. Numerics are checked on every
+        backend; the scalar-read codegen pin is cute-only.
+        """
+        if _get_backend() != "cute":
+            self.skipTest("colvec scalar-read codegen is cute-specific")
+
+        from helion._compiler.cute.mma_support import get_cute_mma_support
+
+        if not get_cute_mma_support().tcgen05_f16bf16:
+            self.skipTest("tcgen05 F16/BF16 MMA is not supported on this machine")
+
+        @helion.kernel(backend="cute")
+        def cute_matmul_colvec_scale(
+            x: torch.Tensor, y: torch.Tensor, scale_a: torch.Tensor
+        ) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                # Explicit per-row column-vector broadcast over N.
+                out[tile_m, tile_n] = (acc * scale_a[tile_m, tile_n]).to(x.dtype)
+            return out
+
+        x = torch.randn(128, 128, dtype=torch.bfloat16, device=DEVICE)
+        y = torch.randn(128, 128, dtype=torch.bfloat16, device=DEVICE)
+        scale_a_vec = torch.randn(128, dtype=torch.float32, device=DEVICE)
+        # ``(M,) -> (M, N)`` with trailing stride 0: the colvec form.
+        scale_a = scale_a_vec.unsqueeze(1).expand(128, 128)
+        self.assertEqual(scale_a.stride(), (1, 0))
+
+        code, output = code_and_output(
+            cute_matmul_colvec_scale,
+            (x, y, scale_a),
+            block_sizes=[128, 128, 32],
+            pid_type="persistent_interleaved",
+        )
+
+        # Codegen pin: the colvec aux is read as a scalar (T2R index
+        # (0, 0, 0) plus the subtile) with NO trailing ``.load()`` — that
+        # is the whole point of the ``("broadcast", 2)`` classification.
+        scalar_read = (
+            "tcgen05_aux_loaded_0 = tcgen05_tTR_gAux_grouped_0"
+            "[0, 0, 0, cutlass.Int32(_tcgen05_subtile)]"
+        )
+        self.assertIn(scalar_read, code)
+        # It must NOT fall back to the N-wide vector load the rowvec /
+        # exact forms use.
+        self.assertNotIn(
+            "tcgen05_aux_loaded_0 = tcgen05_tTR_gAux_grouped_0.load()", code
+        )
+
+        # Numerics: the scalar broadcast must compute acc * scale_a[m].
+        ref = (x.float() @ y.float()) * scale_a_vec.unsqueeze(1)
+        torch.testing.assert_close(output.float(), ref, atol=1.0, rtol=1e-1)
+
     @skipIfNotTriton("block_ptr is triton-only")
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
     @skipIfTileIR("TileIR does not support block_ptr indexing")
