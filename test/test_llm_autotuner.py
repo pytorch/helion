@@ -1112,17 +1112,19 @@ class TestBedrockTransport(TestCase):
                 raise ImportError(f"No module named {name!r}")
             return real_import(name, *args, **kwargs)
 
-        with patch.object(builtins, "__import__", side_effect=fake_import):
-            with self.assertRaisesRegex(RuntimeError, "boto3 is not installed"):
-                call_provider(
-                    "bedrock",
-                    model="us.anthropic.claude-sonnet-4-6",
-                    api_base=None,
-                    api_key=None,
-                    messages=[{"role": "user", "content": "hi"}],
-                    max_output_tokens=64,
-                    request_timeout_s=120.0,
-                )
+        with (
+            patch.object(builtins, "__import__", side_effect=fake_import),
+            self.assertRaisesRegex(RuntimeError, "boto3 is not installed"),
+        ):
+            call_provider(
+                "bedrock",
+                model="us.anthropic.claude-sonnet-4-6",
+                api_base=None,
+                api_key=None,
+                messages=[{"role": "user", "content": "hi"}],
+                max_output_tokens=64,
+                request_timeout_s=120.0,
+            )
 
 
 class TestLLMSeededLFBOTreeSearch(TestCase):
