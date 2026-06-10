@@ -85,6 +85,45 @@ class MatmulFact(NamedTuple):
     rhs_dtype: torch.dtype
 
 
+class ReductionFact(NamedTuple):
+    """Workload facts for one inner reduction dim, recorded at compile time (analogous
+    to ``MatmulFact``) so the seed heuristic branches on workload properties, not kernel
+    identity. Exactly one per seeded kernel; built in device_ir's
+    ``register_rollable_reductions`` (T1) or ``register_user_tiled_reductions`` (T2).
+
+    - ``block_id`` / ``size_hint``: the reduction axis and its extent (rnumel).
+    - ``m_block_ids``: the non-reduction (kept) tile block_ids.
+    - ``static_rnumel``: the extent if statically known, else None.
+    - ``itemsize``: bytes/element of the reduced tensor; byte caps key on
+      ``size_hint * itemsize``.
+    - ``num_load``: device loads over this rdim (the ``== 1`` stream-eviction gate).
+    - ``num_carried_2d_tiles``: 2-D ``[M_BLOCK, R_BLOCK]`` tiles carried across the inner
+      loop (1-D per-row scalars do not count). The Band-B signal — routes (``>= 1``) and
+      sizes the R_BLOCK cap. jsd=2 / kl_div=1 / welford=0. See ``_count_carried_2d_tiles``.
+    - ``non_reduction_loop_block_ids``: non-grid loop tiles over the reduction extent that
+      are NOT the rdim (an apply/normalize pass). The seed widens these independently.
+      ``len(...) >= 1`` is the reduce-then-apply (Band-C) signal. See the fact builders.
+    - ``row_reread``: True iff the reduction-input row is live across the boundary (a
+      persistent whole-row tile risks spilling). Gates the persist byte cap and re-read
+      eviction. See ``_analyze_reread``.
+    - ``reread_buffer_name``: host buffer name of the re-read row (``None`` unless
+      ``row_reread``) — the *which buffer*, not *which slot*. Config-independent; the seed
+      resolves the slot at emit time via ``reread_eviction_slot_for_config``. See
+      ``_analyze_reread``.
+    """
+
+    block_id: int
+    size_hint: int
+    m_block_ids: tuple[int, ...]
+    static_rnumel: int | None
+    itemsize: int
+    num_load: int
+    num_carried_2d_tiles: int = 0
+    non_reduction_loop_block_ids: tuple[int, ...] = ()
+    row_reread: bool = False
+    reread_buffer_name: str | None = None
+
+
 class MemoryOpFact(NamedTuple):
     """Metadata linking one ``Config.indexing`` slot to its graph memory op.
 
@@ -361,6 +400,7 @@ class ConfigSpec:
         self.compiler_seed_configs: list[helion.Config] = []
         self.autotuner_heuristics: list[str] = []
         self.matmul_facts: list[MatmulFact] = []
+        self.reduction_facts: list[ReductionFact] = []
         self.store_indices: list[int] = []
         self.memory_op_facts: list[MemoryOpFact] = []
         self.backend_tunable_fragments = self.backend.tunable_fragments()

@@ -49,7 +49,14 @@ def welford(
 
         for tile_n in hl.tile(n):
             chunk = x[tile_m, tile_n]
-            Tn = chunk.size(-1)
+            # Count of VALID columns. OOB loads are masked to 0, so sum_x/sum_x2 are
+            # already correct; only the divisor must use the true valid count, NOT the
+            # constexpr tile width chunk.size(-1) (over-counts last-tile padding at
+            # non-divisor N -> wrong mean/M2/count). Cast the mask to int32 BEFORE
+            # summing: a bool operand gives CuTe a saturating boolean accumulator (Tn
+            # collapses to 1 -> negative variance -> NaN); the cast forces an integer
+            # accumulator on every backend, not just CuTe.
+            Tn = (tile_n.index < n).to(torch.int32).sum()
             sum_x = torch.sum(chunk, dim=-1)
             sum_x2 = torch.sum(chunk * chunk, dim=-1)
             mean_c = sum_x / Tn

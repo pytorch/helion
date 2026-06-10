@@ -11,6 +11,9 @@ from helion._compiler.autotuner_heuristics import compiler_seed_configs
 from helion._compiler.autotuner_heuristics.cute import CuteTcgen05ClusterM2Heuristic
 from helion._compiler.autotuner_heuristics.registry import AutotunerHeuristic
 from helion._compiler.autotuner_heuristics.triton import TritonReductionTileHeuristic
+from helion._compiler.autotuner_heuristics.triton import (
+    TritonReductionUserTileHeuristic,
+)
 from helion._compiler.autotuner_heuristics.triton import TritonSkinnyGemmHeuristic
 from helion._compiler.autotuner_heuristics.triton import TritonSplitJoinRotateHeuristic
 from helion._compiler.backend import TritonBackend
@@ -105,6 +108,7 @@ from helion.autotuner import IntegerFragment
 from helion.autotuner.config_spec import BlockSizeSpec
 from helion.autotuner.config_spec import ConfigSpec
 from helion.autotuner.config_spec import MatmulFact
+from helion.autotuner.config_spec import ReductionFact
 from helion.autotuner.config_spec import ReductionLoopSpec
 from helion.autotuner.pattern_search import InitialPopulationStrategy
 from helion.autotuner.pattern_search import PatternSearch
@@ -680,46 +684,83 @@ class TestTritonSplitJoinRotateHeuristic(TestCase):
 
 
 class TestTritonReductionTileHeuristic(TestCase):
-    """Triton row-reduction heuristic: seeds the "one row per program,
-    persistent reduction" skeleton, fires only for a canonical row reduction,
-    and its persistent seed survives flatten/unflatten (the config_spec
-    sentinel round-trip fix).
+    """Triton T1 row-reduction heuristic: seeds the "one row per program"
+    skeleton with an rnumel-scaled ``num_warps`` ramp and faithful per-slot load
+    eviction, fires only for a canonical row reduction, and its persistent seed
+    survives flatten/unflatten (the config_spec sentinel round-trip fix).
     """
 
-    def _reduction_spec(self, *, reduction_size_hint: int) -> ConfigSpec:
+    def _reduction_spec(
+        self,
+        *,
+        reduction_size_hint: int,
+        num_load: int = 1,
+        itemsize: int = 4,
+    ) -> ConfigSpec:
         spec = ConfigSpec(backend=TritonBackend())
         spec.block_sizes.append(BlockSizeSpec(block_id=0, size_hint=1024))
         spec.reduction_loops.append(
             ReductionLoopSpec(block_id=1, size_hint=reduction_size_hint)
         )
+        # The deepened heuristic reads a ReductionFact (the workload facts it keys
+        # the warp ramp / eviction / persist decision on); the reduction axis is
+        # block_id=1 (the rolled reduction loop above), the row axis block_id=0.
+        spec.reduction_facts.append(
+            ReductionFact(
+                block_id=1,
+                size_hint=reduction_size_hint,
+                m_block_ids=(0,),
+                static_rnumel=reduction_size_hint,
+                itemsize=itemsize,
+                num_load=num_load,
+            )
+        )
         return spec
 
-    def test_seed_is_persistent_one_row(self) -> None:
-        # The structural seed: one row per program + persistent reduction. Warp
-        # count is left to the autotuner, not seeded.
+    def _reduction_env(self, spec: ConfigSpec) -> MagicMock:
+        # The deepened heuristic reads env.backend.max_tensor_numel (the structural
+        # persistent cap) — provide the real Triton cap so a sub-cap rnumel stays
+        # persistent.
+        from helion.autotuner.config_generation import TRITON_MAX_TENSOR_NUMEL
+
         env = MagicMock()
-        env.config_spec = self._reduction_spec(reduction_size_hint=1024)
-        seed = TritonReductionTileHeuristic.get_seed_config(env, MagicMock())
+        env.backend_name = "triton"
+        env.backend.max_tensor_numel = TRITON_MAX_TENSOR_NUMEL
+        env.config_spec = spec
+        env.device = DEVICE
+        return env
+
+    def test_seed_is_persistent_one_row(self) -> None:
+        # The structural seed: one row per program + persistent reduction. The
+        # deepened heuristic ALSO seeds num_warps via the rnumel ramp (rnumel=1024
+        # -> 4 warps) and num_stages=1, rather than leaving them to the autotuner.
+        env = self._reduction_env(self._reduction_spec(reduction_size_hint=1024))
+        with patch("helion._hardware.get_hardware_info", return_value=HOPPER_HARDWARE):
+            seed = TritonReductionTileHeuristic.get_seed_config(env, MagicMock())
         self.assertEqual(seed.config["block_sizes"], [1])
         self.assertEqual(seed.config["reduction_loops"], [None])
-        self.assertNotIn("num_warps", seed.config)
+        # rnumel ramp: 1024 falls in the <=1024 band -> 4 warps.
+        self.assertEqual(seed.config["num_warps"], 4)
+        self.assertEqual(seed.config["num_stages"], 1)
 
-    def test_seed_broadcasts_last_eviction_over_load_slots(self) -> None:
-        # Streaming reductions want 'last' eviction, broadcast over the spec's
-        # load slots. Build the fragment explicitly so the test does not depend
-        # on the host backend's eviction choices.
+    def test_single_load_seeds_stream_eviction_over_load_slots(self) -> None:
+        # A single-load streaming reduction (num_load==1: e.g. sum) is read once
+        # and never reused, so every load slot -> 'first' (evict_first frees L2),
+        # broadcast over the spec's load slots. Build the fragment explicitly so
+        # the test does not depend on the host backend's eviction choices.
         from helion.autotuner.config_fragment import EnumFragment
         from helion.autotuner.config_fragment import ListOf
 
-        env = MagicMock()
-        spec = self._reduction_spec(reduction_size_hint=1024)
+        spec = self._reduction_spec(reduction_size_hint=1024, num_load=1)
         spec.load_eviction_policies = ListOf(
             EnumFragment(choices=("", "first", "last")), length=4
         )
-        env.config_spec = spec
-        seed = TritonReductionTileHeuristic.get_seed_config(env, MagicMock())
+        env = self._reduction_env(spec)
+        with patch("helion._hardware.get_hardware_info", return_value=HOPPER_HARDWARE):
+            seed = TritonReductionTileHeuristic.get_seed_config(env, MagicMock())
         self.assertEqual(
-            seed.config["load_eviction_policies"], ["last", "last", "last", "last"]
+            seed.config["load_eviction_policies"],
+            ["first", "first", "first", "first"],
         )
 
     def test_persistent_seed_round_trips_through_config_generation(self) -> None:
@@ -729,10 +770,10 @@ class TestTritonReductionTileHeuristic(TestCase):
         # config_spec fix encodes None as the fragment's ``high`` (>= size_hint).
         from helion.autotuner.config_generation import ConfigGeneration
 
-        env = MagicMock()
         spec = self._reduction_spec(reduction_size_hint=32000)
-        env.config_spec = spec
-        seed = TritonReductionTileHeuristic.get_seed_config(env, MagicMock())
+        env = self._reduction_env(spec)
+        with patch("helion._hardware.get_hardware_info", return_value=HOPPER_HARDWARE):
+            seed = TritonReductionTileHeuristic.get_seed_config(env, MagicMock())
         spec.compiler_seed_configs = [seed]
         pairs = ConfigGeneration(spec).seed_flat_config_pairs()
         self.assertEqual(len(pairs), 1)
@@ -3149,3 +3190,259 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
                 len(seed["indexing"]),
                 bound.config_spec.indexing.length,
             )
+
+
+class TestTritonReductionHeuristic(TestCase):
+    """Lock the reduction seed heuristics' branch decisions on two kernels, one per
+    track:
+
+    - rms_norm wide (rnumel=16384): the T1 path (``TritonReductionTileHeuristic``)
+      seeds a persistent reduction (``reduction_loops=[None]``) with the rnumel-ramp
+      warp count.
+    - kl_div wide (rnumel=131072): the Band-B T2 path
+      (``TritonReductionUserTileHeuristic``) caps R_BLOCK by the accumulator footprint
+      instead of going full-N persistent, with M at floor 1.
+    """
+
+    @onlyBackends(["triton"])
+    @skipIfRefEager("Compiler reduction facts are not collected in ref eager mode")
+    def test_rms_norm_wide_seeds_persistent_with_warps(self) -> None:
+        from examples.rms_norm import rms_norm_fwd
+
+        m, n = 2048, 16384
+        args = (
+            torch.randn([m, n], device=DEVICE, dtype=torch.float32),
+            torch.randn([n], device=DEVICE, dtype=torch.float32),
+            1e-5,
+        )
+        heuristic = TritonReductionTileHeuristic
+
+        # Pin the kernel to the triton backend. autotuner_heuristics is populated by
+        # iterating HEURISTICS_BY_BACKEND[env.backend_name], which only has triton /
+        # cute / pallas entries. @onlyBackends(["triton"]) still RUNS this test on the
+        # tileir lane (tileir is triton-compatible there), where env.backend_name would
+        # be "tileir" -> no registered heuristics -> autotuner_heuristics == [] and the
+        # assertIn below fails. Binding a triton-pinned kernel keeps backend_name
+        # "triton" on every lane, matching test_t1_reduction_then_normalize_loop_widens_tile.
+        kernel = helion.kernel(rms_norm_fwd.fn, backend="triton")
+
+        # Force the sm90 deep path so the test exercises the H100-tuned seed on any
+        # runner (off-sm90 the heuristic falls back to the conservative narrow seed).
+        with patch("helion._hardware.get_hardware_info", return_value=HOPPER_HARDWARE):
+            bound = kernel.bind(args)
+
+            # The reduction heuristic registered a single workload fact and fired.
+            self.assertEqual(len(bound.config_spec.reduction_facts), 1)
+            fact = bound.config_spec.reduction_facts[0]
+            self.assertEqual(fact.size_hint, n)
+            # rms_norm has no separate apply/normalize loop (its apply is over the full
+            # row in the reduction scope), so no reduce-then-apply tile is captured.
+            self.assertEqual(fact.non_reduction_loop_block_ids, ())
+            self.assertIn(
+                TritonReductionTileHeuristic.name,
+                bound.config_spec.autotuner_heuristics,
+            )
+            self.assertTrue(
+                heuristic.is_eligible(bound.env, bound.host_function.device_ir)
+            )
+
+            # Exactly one compiler seed, and it is the *persistent* T1 config.
+            seeds = compiler_seed_configs(bound.env, bound.host_function.device_ir)
+        self.assertEqual(len(seeds), 1)
+        seed = seeds[0].config
+        # rnumel ramp: 16384 falls in the (4096, 16384] band -> 16 warps.
+        self.assertEqual(seed["block_sizes"], [1])
+        self.assertEqual(seed["reduction_loops"], [None])
+        self.assertEqual(seed["num_warps"], 16)
+        self.assertEqual(seed["num_stages"], 1)
+
+    @onlyBackends(["triton"])
+    @skipIfRefEager("Compiler reduction facts are not collected in ref eager mode")
+    def test_kl_div_wide_seeds_band_b_r_block_cap(self) -> None:
+        from examples.kl_div import kl_div_forward
+
+        m, n = 4096, 131072
+        log_q = torch.log_softmax(torch.randn([m, n], device=DEVICE), dim=-1)
+        p = torch.softmax(torch.randn([m, n], device=DEVICE), dim=-1)
+        args = (log_q, p)
+        heuristic = TritonReductionUserTileHeuristic
+
+        # Pin the kernel to the triton backend. autotuner_heuristics is populated by
+        # iterating HEURISTICS_BY_BACKEND[env.backend_name], which only has triton /
+        # cute / pallas entries. @onlyBackends(["triton"]) still RUNS this test on the
+        # tileir lane (tileir is triton-compatible there), where env.backend_name would
+        # be "tileir" -> no registered heuristics -> autotuner_heuristics == [] and the
+        # assertIn below fails. Binding a triton-pinned kernel keeps backend_name
+        # "triton" on every lane, matching test_t1_reduction_then_normalize_loop_widens_tile.
+        kernel = helion.kernel(kl_div_forward.fn, backend="triton")
+
+        # Force the sm90 deep path so the Band-B seed is exercised on any runner
+        # (off-sm90 the heuristic declines to the conservative narrow seed).
+        with patch("helion._hardware.get_hardware_info", return_value=HOPPER_HARDWARE):
+            bound = kernel.bind(args)
+
+            # Single workload fact carrying a 2D [M, R] tile -> Band B.
+            self.assertEqual(len(bound.config_spec.reduction_facts), 1)
+            fact = bound.config_spec.reduction_facts[0]
+            self.assertEqual(fact.size_hint, n)
+            self.assertGreaterEqual(fact.num_carried_2d_tiles, 1)
+            self.assertEqual(fact.non_reduction_loop_block_ids, ())
+            self.assertIn(
+                TritonReductionUserTileHeuristic.name,
+                bound.config_spec.autotuner_heuristics,
+            )
+            self.assertTrue(
+                heuristic.is_eligible(bound.env, bound.host_function.device_ir)
+            )
+
+            # Exactly one seed; R_BLOCK is capped, NOT full-N persistent, and the
+            # grid (M) axis sits at its floor of 1.
+            seeds = compiler_seed_configs(bound.env, bound.host_function.device_ir)
+        self.assertEqual(len(seeds), 1)
+        seed = seeds[0].config
+        expected_cap = max(
+            1,
+            TritonReductionUserTileHeuristic.BANDB_R_BLOCK_BYTES
+            // max(1, fact.itemsize),
+        )
+        # block_sizes is [R_BLOCK, M_BLOCK]; the reduction axis is capped well
+        # below next_pow2(131072) and M stays at 1.
+        self.assertEqual(seed["block_sizes"], [expected_cap, 1])
+        self.assertLess(expected_cap, n)
+        # rnumel 131072 > the 16384 warps-32 breakpoint -> 32 warps.
+        self.assertEqual(seed["num_warps"], 32)
+        self.assertEqual(seed["num_stages"], 1)
+        # Band B must NOT use the T1 reduction_loops knob.
+        self.assertNotIn("reduction_loops", seed)
+
+    @onlyBackends(["triton"])
+    @skipIfRefEager("Compiler reduction facts are not collected in ref eager mode")
+    def test_t1_reduction_then_normalize_loop_widens_tile(self) -> None:
+        # A T1 rollable reduction (hl.sum over the full inner dim) IMMEDIATELY followed
+        # by a SEPARATE non-reduction hl.tile(n) loop that normalizes the row. No
+        # curriculum kernel has this shape, so it pins the T1 non-reduction-loop path:
+        # - the fact captures the normalize loop as non_reduction_loop_block_ids and
+        #   keeps m_block_ids grid-only (the normalize tile is NOT a row axis), and
+        # - the seed emits a full-length block_sizes with that tile widened (without it
+        #   the T1 seed would emit a wrong-length [grid_floor] and crash) — for BOTH the
+        #   persistent and the looped (wide-N) reduction cases.
+        # NOTE: this T1+normalize seed is NOT performance-validated (no oracle); it is
+        # only a seed (worse tile => more autotuning, never wrong results), so the test
+        # asserts only that the emitted config is well-formed in both regimes.
+        @helion.kernel(backend="triton")
+        def t1_then_normalize(x: torch.Tensor) -> torch.Tensor:
+            m, n = x.size()
+            out = torch.empty_like(x)
+            for tile_m in hl.tile(m):
+                s = torch.sum(x[tile_m, :], dim=-1)
+                for tile_n in hl.tile(n):
+                    out[tile_m, tile_n] = x[tile_m, tile_n] / s[:, None]
+            return out
+
+        def check(m: int, n: int, expect_looped: bool) -> None:
+            # Force the sm90 deep path so the T1+normalize seed is exercised on any
+            # runner (off-sm90 the heuristic falls back to the narrow seed, which does
+            # not widen the normalize tile).
+            with patch(
+                "helion._hardware.get_hardware_info", return_value=HOPPER_HARDWARE
+            ):
+                bound = t1_then_normalize.bind(
+                    (torch.randn([m, n], device=DEVICE, dtype=torch.float32),)
+                )
+                # One workload fact: reduction axis + grid-only row axis + the normalize
+                # loop captured as a non-reduction loop tile (NOT a row axis).
+                self.assertEqual(len(bound.config_spec.reduction_facts), 1)
+                fact = bound.config_spec.reduction_facts[0]
+                self.assertEqual(fact.size_hint, n)
+                self.assertEqual(fact.m_block_ids, (0,))
+                self.assertEqual(len(fact.non_reduction_loop_block_ids), 1)
+                self.assertNotIn(fact.block_id, fact.non_reduction_loop_block_ids)
+                self.assertEqual(fact.num_carried_2d_tiles, 0)
+                self.assertIn(
+                    TritonReductionTileHeuristic.name,
+                    bound.config_spec.autotuner_heuristics,
+                )
+                # Exactly one seed; block_sizes has an entry per tiled dim (grid +
+                # normalize loop), the grid axis at its floor and the normalize tile
+                # widened (> 1), and it normalizes without error (the crux: a valid,
+                # full-length config).
+                seeds = compiler_seed_configs(bound.env, bound.host_function.device_ir)
+            self.assertEqual(len(seeds), 1)
+            seed = seeds[0].config
+            self.assertEqual(
+                len(seed["block_sizes"]), len(bound.config_spec.block_sizes)
+            )
+            norm_idx = bound.config_spec.block_sizes.block_id_to_index(
+                fact.non_reduction_loop_block_ids[0]
+            )
+            self.assertGreater(seed["block_sizes"][norm_idx], 1)
+            # Persistent (narrow row) -> reduction_loops=[None]; looped (wide row past
+            # the byte cap) -> reduction_loops=[LOOPED_CHUNK].
+            if expect_looped:
+                self.assertEqual(
+                    seed["reduction_loops"],
+                    [TritonReductionTileHeuristic.LOOPED_CHUNK],
+                )
+            else:
+                self.assertEqual(seed["reduction_loops"], [None])
+            # The emitted seed must round-trip through normalize() without raising.
+            bound.config_spec.normalize(dict(seed))
+
+        # 1024x4096: 16 KB/row < 240 KB byte cap -> persistent.
+        check(1024, 4096, expect_looped=False)
+        # 1024x131072: 512 KB/row > 240 KB byte cap -> looped (the case the old guard
+        # wrongly declined into a wrong-length crash; now emits a widened looped seed).
+        check(1024, 131072, expect_looped=True)
+
+    def test_dynamic_extent_normalize_tile_matches_reduction_tile(self) -> None:
+        # When the reduction extent is NOT statically known (static_rnumel is None,
+        # e.g. a dynamic/jagged reduce-then-apply reduction), the per-row-bytes cap has
+        # no extent to key on, so the non-reduction loop tile falls back to "match the
+        # reduction tile". This default is NOT tuned on any kernel (no curriculum kernel
+        # has a dynamic-extent non-reduction loop); the test pins the fallback's two
+        # shapes.
+        from helion.autotuner.config_spec import BlockSizeSpec
+
+        H = TritonReductionUserTileHeuristic
+        size_hint = 4096  # next_pow2(size_hint) == 4096
+
+        def spec_with(reduction_bid: int, norm_bid: int) -> ConfigSpec:
+            spec = ConfigSpec(backend=TritonBackend())
+            # grid (block 0), reduction axis, normalize-loop axis — all block_sizes.
+            spec.block_sizes.append(BlockSizeSpec(block_id=0, size_hint=1024))
+            spec.block_sizes.append(
+                BlockSizeSpec(block_id=reduction_bid, size_hint=size_hint)
+            )
+            spec.block_sizes.append(
+                BlockSizeSpec(block_id=norm_bid, size_hint=size_hint)
+            )
+            return spec
+
+        def fact(block_id: int, norm_bid: int) -> ReductionFact:
+            return ReductionFact(
+                block_id=block_id,
+                size_hint=size_hint,
+                m_block_ids=(0,),
+                static_rnumel=None,  # <-- dynamic extent: triggers the fallback
+                itemsize=4,
+                num_load=1,
+                non_reduction_loop_block_ids=(norm_bid,),
+            )
+
+        # T2: the reduction axis IS a block_sizes entry (red_value given). The normalize
+        # tile matches that red_value (777, an arbitrary sentinel), NOT a byte-cap value.
+        spec = spec_with(reduction_bid=1, norm_bid=2)
+        bs = H._build_block_sizes(spec, fact(1, 2), 1, 777, non_reduction_loop_ids={2})
+        red_idx = spec.block_sizes.block_id_to_index(1)
+        norm_idx = spec.block_sizes.block_id_to_index(2)
+        self.assertEqual(bs[red_idx], 777)
+        self.assertEqual(bs[norm_idx], 777)  # normalize tile == reduction tile
+
+        # T1: the reduction rides reduction_loops (red_block_id=None, red_value=None), so
+        # the normalize tile matches next_pow2(size_hint) instead — must NOT floor to 1.
+        bs_t1 = H._build_block_sizes(
+            spec, fact(1, 2), None, None, non_reduction_loop_ids={2}
+        )
+        self.assertEqual(bs_t1[norm_idx], 4096)  # next_pow2(4096)
+        self.assertNotEqual(bs_t1[norm_idx], 1)
+        self.assertEqual(bs_t1[0], H._block_floor(spec.block_sizes[0]))  # grid floored
