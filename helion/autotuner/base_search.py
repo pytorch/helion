@@ -275,8 +275,9 @@ class BaseSearch(BaseAutotuner):
             random_seed=self.settings.autotune_random_seed,
             search_algorithm=type(self).__name__,
         )
-        # Written once per run to the <autotune_log>.meta.json sidecar so the
-        # per-config CSV rows can be grouped by kernel across runs.
+        # Appended once per run to the <autotune_log>.meta.jsonl sidecar so the
+        # per-config CSV rows can be joined back to it (run_id) and grouped by
+        # kernel (kernel_id) across runs. run_id is derived inside KernelMetadata.
         self._kernel_metadata: KernelMetadata = KernelMetadata(
             kernel_id=kernel_id,
             kernel_name=kernel_name,
