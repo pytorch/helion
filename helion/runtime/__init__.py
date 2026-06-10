@@ -2177,6 +2177,9 @@ def _append_cute_wrapper_plan(
     smem_swizzle_b: int | None = (
         int(smem_swizzle_b_raw) if isinstance(smem_swizzle_b_raw, int) else None
     )
+    # K-major (column-major / K-contiguous) B. Absent on the MN-major
+    # (row-major B) default path.
+    b_k_major = bool(plan.get("b_k_major"))
     kernel_args = [str(arg) for arg in cast("list[object]", plan["kernel_args"])]
     assert len(kernel_args) == 4
     tma_atom_a, tma_tensor_a, tma_atom_b, tma_tensor_b = kernel_args
@@ -2218,6 +2221,7 @@ def _append_cute_wrapper_plan(
         num_stages=ab_stage_count,
         operand="b",
         swizzle_override=smem_swizzle_b,
+        b_k_major=b_k_major,
     )
     body.extend(
         (
@@ -2226,8 +2230,12 @@ def _append_cute_wrapper_plan(
                 f"{input_dtype}, "
                 f"{input_dtype}, "
                 "cute.nvgpu.OperandMajorMode.K, "
-                "cute.nvgpu.OperandMajorMode.MN, "
-                f"{acc_dtype}, "
+                + (
+                    "cute.nvgpu.OperandMajorMode.K, "
+                    if b_k_major
+                    else "cute.nvgpu.OperandMajorMode.MN, "
+                )
+                + f"{acc_dtype}, "
                 f"{cta_group}, "
                 f"({bm}, {bn}), "
                 "cute.nvgpu.tcgen05.OperandSource.SMEM)"
@@ -2245,7 +2253,10 @@ def _append_cute_wrapper_plan(
                 f"(arg{rhs_idx}_shape1, arg{rhs_idx}_shape0), "
                 f"stride=(arg{rhs_idx}_stride1, arg{rhs_idx}_stride0)))"
             ),
-            f"    {rhs_tma}.mark_layout_dynamic(leading_dim=0)",
+            # B is viewed as (N, K). For row-major B (MN-major) the N axis
+            # (position 0) is contiguous; for column-major B (K-major, native
+            # fp8 layout) the K axis (position 1) is contiguous.
+            f"    {rhs_tma}.mark_layout_dynamic(leading_dim={1 if b_k_major else 0})",
             # ``make_tiled_tma_atom_A`` vs ``_B`` asymmetry:
             # - ``_B`` always passes ``cluster_layout_vmnk.shape`` as
             #   its trailing arg (CuTe's signature for B requires the
