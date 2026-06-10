@@ -333,18 +333,21 @@ class LocalBenchmarkProvider(BenchmarkProvider):
         )
         self._jobs = self._decide_num_jobs()
 
-    def _sample_id(self, config: Config) -> str:
-        """Return a stable per-(kernel, config) id for telemetry rows.
+    def _sample_identity(self, config: Config) -> tuple[str, str]:
+        """Return ``(sample_id, decorator)`` for a config's telemetry rows.
 
-        Computed as ``sha256(kernel_source + decorator(config))`` so the same
-        kernel benchmarked with the same config produces the same id across
-        runs, enabling label aggregation/dedup for the cost-model dataset.
+        ``decorator`` is ``format_kernel_decorator(config)`` -- the canonical
+        ``@helion.kernel(...)`` string that reproduces this config -- and is
+        collected as a structured artifact. ``sample_id`` is
+        ``sha256(kernel_source + decorator)``, a stable per-(kernel, config) id
+        so the same kernel benchmarked with the same config produces the same id
+        across runs, enabling label aggregation/dedup for the cost-model dataset.
+        The decorator is computed once here and reused for both ids and the row.
         """
-        payload = (
-            self._autotune_metrics.kernel_source
-            + self.kernel.format_kernel_decorator(config, self.settings)
-        )
-        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+        decorator = self.kernel.format_kernel_decorator(config, self.settings)
+        payload = self._autotune_metrics.kernel_source + decorator
+        sample_id = hashlib.sha256(payload.encode("utf-8")).hexdigest()
+        return sample_id, decorator
 
     def _compute_baseline(
         self,
@@ -817,7 +820,7 @@ class LocalBenchmarkProvider(BenchmarkProvider):
                     process_group_name=self.kernel.env.process_group_name,
                 )
             ):
-                sample_id = self._sample_id(config)
+                sample_id, decorator = self._sample_identity(config)
                 self.log.record_autotune_entry(
                     AutotuneLogEntry(
                         generation=self._autotune_metrics.num_generations,
@@ -826,6 +829,7 @@ class LocalBenchmarkProvider(BenchmarkProvider):
                         compile_time=compile_time,
                         config=config,
                         sample_id=sample_id,
+                        decorator=decorator,
                     )
                 )
                 perf = self._benchmark_function(config, fn)
@@ -838,6 +842,7 @@ class LocalBenchmarkProvider(BenchmarkProvider):
                         compile_time=compile_time,
                         config=config,
                         sample_id=sample_id,
+                        decorator=decorator,
                     )
                 )
                 results[valid_indices[index]] = BenchmarkResult(

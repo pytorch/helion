@@ -272,6 +272,9 @@ class AutotuneLogEntry(NamedTuple):
     config: Config
     # Stable per-(kernel, config) id: sha256(kernel_source + decorator(config)).
     sample_id: str = ""
+    # The @helion.kernel(...) decorator string that reproduces this config;
+    # the source artifact sample_id is derived from.
+    decorator: str = ""
 
 
 class AutotuneLogSink:
@@ -332,6 +335,7 @@ class AutotuneLogSink:
                     "status",
                     "perf_ms",
                     "compile_time_s",
+                    "decorator",
                     "config",
                 ]
             )
@@ -391,6 +395,7 @@ class AutotuneLogSink:
                 entry.status,
                 perf_field,
                 compile_field,
+                entry.decorator,
                 str(entry.config),
             ]
         )

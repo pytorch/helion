@@ -468,6 +468,7 @@ class TestAutotuneIgnoreErrors(TestCase):
                 "status",
                 "perf_ms",
                 "compile_time_s",
+                "decorator",
                 "config",
             ],
         )
