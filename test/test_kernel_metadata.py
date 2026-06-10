@@ -353,6 +353,48 @@ class TestAutotuneLogSink(TestCase):
                 [r[rid_col] for r in data_rows], [rec_a["run_id"], rec_b["run_id"]]
             )
 
+    def test_sink_writes_ir_jsonl_joinable_to_meta_and_csv(self) -> None:
+        """When an ir_graph is provided, the sink appends it to <base>.ir.jsonl,
+        one record per run, joinable to the meta record and CSV rows on run_id.
+        """
+        metadata = KernelMetadata(
+            kernel_id="abc123",
+            kernel_name="_add_kernel",
+            kernel_source="def _add_kernel(): ...",
+            input_shapes="[(64,)]",
+            dtypes="['torch.float32']",
+            hardware="TestGPU",
+        )
+        ir_graph = {
+            "run_id": metadata.run_id,
+            "kernel_id": metadata.kernel_id,
+            "directed": True,
+            "multigraph": False,
+            "graph": {"run_id": metadata.run_id},
+            "nodes": [{"id": "g0:x"}],
+            "links": [],
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            base = f"{tmp}/run"
+            with AutotuneLogSink(base, metadata, ir_graph) as sink:
+                sink.start_run()
+                sink.record(self._entry(0.1))
+                sink.end_run()
+
+            ir_lines = sink.ir_path.read_text(encoding="utf-8").splitlines()
+            self.assertEqual(len(ir_lines), 1)
+            ir_record = json.loads(ir_lines[0])
+            meta_record = json.loads(
+                sink.meta_path.read_text(encoding="utf-8").splitlines()[0]
+            )
+            with sink.csv_path.open(encoding="utf-8", newline="") as f:
+                rows = list(csv.reader(f))
+            header, data_rows = rows[0], rows[1:]
+            rid_col = header.index("run_id")
+            # ir <-> meta <-> csv all join on run_id.
+            self.assertEqual(ir_record["run_id"], meta_record["run_id"])
+            self.assertTrue(all(r[rid_col] == ir_record["run_id"] for r in data_rows))
+
     def test_sink_without_metadata_writes_no_sidecar(self) -> None:
         """
         When the sink is created without KernelMetadata, a full run (start,

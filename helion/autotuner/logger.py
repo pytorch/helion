@@ -116,21 +116,26 @@ class AutotuningLogger:
 
     @contextlib.contextmanager
     def autotune_logging(
-        self, base_path: str | None = None, metadata: KernelMetadata | None = None
+        self,
+        base_path: str | None = None,
+        metadata: KernelMetadata | None = None,
+        ir_graph: dict[str, object] | None = None,
     ) -> Iterator[AutotuneLogSink | None]:
         """Attach an :class:`AutotuneLogSink` for the duration of a tuning run.
 
         When ``metadata`` is provided, the kernel identity (source, ids, shapes)
         is appended as one record to the ``<base>.meta.jsonl`` sidecar so the
         per-config CSV rows can be joined back to it (via ``run_id``) and grouped
-        by kernel (via ``kernel_id``) across runs.
+        by kernel (via ``kernel_id``) across runs. When ``ir_graph`` is provided,
+        the device-IR node-link dump is appended to ``<base>.ir.jsonl`` (one
+        record per run, joined on ``run_id``).
         """
 
         path = base_path or self._settings.autotune_log
         if not path:
             yield None
             return
-        with AutotuneLogSink(path, metadata) as sink:
+        with AutotuneLogSink(path, metadata, ir_graph) as sink:
             self._attach_sink(sink)
             sink.start_run()
             try:
@@ -282,12 +287,19 @@ class AutotuneLogSink:
     Writes autotune results to CSV and connects autotune logs to a file handler.
     """
 
-    def __init__(self, base_path: str, metadata: KernelMetadata | None = None) -> None:
+    def __init__(
+        self,
+        base_path: str,
+        metadata: KernelMetadata | None = None,
+        ir_graph: dict[str, object] | None = None,
+    ) -> None:
         self._base_path = Path(base_path)
         self.csv_path = self._base_path.with_suffix(".csv")
         self.log_path = self._base_path.with_suffix(".log")
         self.meta_path = self._base_path.with_suffix(".meta.jsonl")
+        self.ir_path = self._base_path.with_suffix(".ir.jsonl")
         self._metadata = metadata
+        self._ir_graph = ir_graph
         self._csv_file: io.TextIOWrapper | None = None
         self._csv_writer: CsvWriter | None = None
         self._log_handler: logging.FileHandler | None = None
@@ -318,6 +330,11 @@ class AutotuneLogSink:
             # these records via kernel_id.
             with self.meta_path.open("a", encoding="utf-8") as meta_file:
                 meta_file.write(json.dumps(self._metadata.to_dict()) + "\n")
+        if self._ir_graph is not None:
+            # One device-IR node-link record per run, appended alongside the
+            # meta record; joins back to it (and the CSV rows) on run_id.
+            with self.ir_path.open("a", encoding="utf-8") as ir_file:
+                ir_file.write(json.dumps(self._ir_graph) + "\n")
         # Append rather than truncate so multiple autotune runs sharing one base
         # path accumulate; write the header only for a new or empty file.
         write_header = not self.csv_path.exists() or self.csv_path.stat().st_size == 0

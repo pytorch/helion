@@ -36,6 +36,7 @@ from .benchmark_provider import _clone_args
 from .benchmark_provider import _unset_fn
 from .benchmarking import clear_jit_fast_path_caches
 from .benchmarking import interleaved_bench
+from .ir_features import extract_ir_graph
 from .logger import AutotuningLogger
 from .metrics import AutotuneMetrics
 from .metrics import KernelMetadata
@@ -295,6 +296,34 @@ class BaseSearch(BaseAutotuner):
             autotune_metrics=self._autotune_metrics,
         )
         self.benchmark_provider.set_budget_exceeded_fn(self._autotune_budget_exceeded)
+        # Device IR is config-independent, so dump it once per run (joined to the
+        # per-config CSV rows on run_id). Only when telemetry is on.
+        self._ir_graph: dict[str, object] | None = self._extract_ir_graph()
+
+    def _extract_ir_graph(self) -> dict[str, object] | None:
+        """Best-effort device-IR node-link dump for the autotune-log sidecar.
+
+        Returns ``None`` (no IR artifact) when telemetry is off or the device IR
+        is unavailable (e.g. a backend without a standard device IR); extraction
+        never breaks autotuning.
+        """
+        if not self.settings.autotune_log:
+            return None
+        host_function = getattr(self.kernel, "host_function", None)
+        device_ir = getattr(host_function, "device_ir", None)
+        if device_ir is None:
+            return None
+        try:
+            return extract_ir_graph(
+                device_ir,
+                run_id=self._kernel_metadata.run_id,
+                kernel_id=self._kernel_metadata.kernel_id,
+                kernel_name=self._kernel_metadata.kernel_name,
+                input_shapes=self._kernel_metadata.input_shapes,
+            )
+        except Exception:
+            self.log.debug("Failed to extract device IR features", exc_info=True)
+            return None
 
     def _autotune_budget_exceeded(self) -> bool:
         budget = self.settings.autotune_budget_seconds
@@ -477,7 +506,9 @@ class BaseSearch(BaseAutotuner):
         with exit_stack:
             if self.settings.autotune_log:
                 exit_stack.enter_context(
-                    self.log.autotune_logging(metadata=self._kernel_metadata)
+                    self.log.autotune_logging(
+                        metadata=self._kernel_metadata, ir_graph=self._ir_graph
+                    )
                 )
             self.log.reset()
             # Autotuner triggers bugs in remote triton compile service.
