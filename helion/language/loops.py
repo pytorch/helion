@@ -745,11 +745,13 @@ def _(
     base = TileIndexType.allocate(None, origin)
     result = JaggedTileIndexType(origin, base.block_id, parent_block_ids)
     env.register_jagged_tile(base.block_id, parent_block_ids)
-    # ``config_spec.has_jagged_flat_dma`` is set later in plan_tiling, only
-    # when a jagged-flat ``TensorIndexPattern`` actually materializes -- a
-    # kernel that uses ``hl.jagged_tile`` on an outer (3+ minor) dim never
-    # emits the conflicting jagged-flat DMA, so it should keep
-    # ``emit_pipeline`` in its autotune search.
+    # ``has_jagged_flat_dma`` bridges into autotune-setup (config_spec
+    # normalize / _get_tunable_fragments), which runs BEFORE plan_tiling.
+    # plan_tiling re-sets the flag with the precise condition; here we set
+    # it eagerly so the autotune-search emit_pipeline drop fires from the
+    # first sample.  Mildly over-broad for hypothetical outer-dim jagged
+    # kernels -- refine when those are supported.
+    env.config_spec.has_jagged_flat_dma = True
 
     # On Pallas (TPU), the items axis of a jagged kernel must be pinned to
     # block_size=1: each program owns exactly one item so the per-item DMA
