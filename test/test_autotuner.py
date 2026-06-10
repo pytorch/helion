@@ -455,9 +455,11 @@ class TestAutotuneIgnoreErrors(TestCase):
         self.assertTrue(csv_path.exists())
         self.assertTrue(log_path.exists())
         rows = list(csv.reader(csv_path.read_text().splitlines()))
+        header = rows[0]
         self.assertEqual(
-            rows[0],
+            header,
             [
+                "run_id",
                 "kernel_id",
                 "sample_id",
                 "timestamp_s",
@@ -470,12 +472,13 @@ class TestAutotuneIgnoreErrors(TestCase):
             ],
         )
         # No metadata/sample_id supplied here, so the identity columns are empty.
-        self.assertEqual(rows[1][0], "")
-        self.assertEqual(rows[1][1], "")
-        self.assertEqual(rows[1][3], "1")
-        self.assertEqual(rows[1][4], "5")
-        self.assertEqual(rows[1][5], "ok")
-        self.assertEqual(rows[1][6], "1.234000")
+        self.assertEqual(rows[1][header.index("run_id")], "")
+        self.assertEqual(rows[1][header.index("kernel_id")], "")
+        self.assertEqual(rows[1][header.index("sample_id")], "")
+        self.assertEqual(rows[1][header.index("config_index")], "1")
+        self.assertEqual(rows[1][header.index("generation")], "5")
+        self.assertEqual(rows[1][header.index("status")], "ok")
+        self.assertEqual(rows[1][header.index("perf_ms")], "1.234000")
         log_text = log_path.read_text()
         self.assertIn("finalized entry", log_text)
 
