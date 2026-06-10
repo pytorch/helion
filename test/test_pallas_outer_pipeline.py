@@ -12,6 +12,7 @@ from helion._testing import TestCase
 from helion._testing import assert_ref_eager_mode
 from helion._testing import code_and_output
 from helion._testing import skipIfPallasInterpret
+from helion._testing import skipUnlessPallas
 import helion.language as hl
 
 
@@ -146,6 +147,7 @@ class TestTileMaxExtent(TestCase):
         self.assertIn("pltpu.emit_pipeline", code)
 
 
+@skipUnlessPallas("JAX/Pallas TPU not available")
 class TestPallasOuterPipelineScaffold(TestCase):
     def test_outer_pipeline_is_explicit_but_not_autotuned(self) -> None:
         @helion.kernel(backend="pallas", autotune_effort="none")
