@@ -389,6 +389,7 @@ def tcgen05_smem_layout_expr(
     num_stages: int,
     operand: str,
     swizzle_override: int | None,
+    b_k_major: bool = False,
 ) -> str:
     """Emit the CuTe expression that builds the staged SMEM layout for A or B.
 
@@ -439,6 +440,17 @@ def tcgen05_smem_layout_expr(
             "order=(1, 2, 3))"
         )
     assert operand == "b", f"unexpected operand {operand!r}"
+    if b_k_major:
+        # K-major (column-major / K-contiguous) B. Delegate to CuTe's helper
+        # with ``is_k_major=True`` so the SMEM atom selection mirrors the
+        # K-major A path exactly; the smem_swizzle_b override knob is not
+        # plumbed through this path (correctness-first), which is fine
+        # since the fp8 default path uses swizzle_override=None.
+        return (
+            "cutlass.utils.blackwell_helpers.make_smem_layout_b("
+            f"{tiled_mma}, ({bm}, {bn}, {bk}), {dtype_str}, {num_stages}, "
+            "is_k_major=True)"
+        )
     if swizzle_override is None:
         return (
             "cutlass.utils.blackwell_helpers.make_smem_layout_b("
