@@ -55,8 +55,9 @@ _FP4X2_TO_F32_ASM = """
 {
     .reg .b8 b0, b1, b2, b3;
     .reg .b16 lo, hi;
-    .reg .b32 h2;
-    mov.b32 {b0, b1, b2, b3}, $2;
+    .reg .b32 packed, h2;
+    and.b32 packed, $2, 0xFF;
+    mov.b32 {b0, b1, b2, b3}, packed;
     cvt.rn.f16x2.e2m1x2 h2, b0;
     mov.b32 {lo, hi}, h2;
     cvt.f32.f16 $0, lo;

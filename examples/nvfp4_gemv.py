@@ -17,19 +17,10 @@ from __future__ import annotations
 
 import functools
 from typing import TYPE_CHECKING
+from typing import Any
 from typing import Literal
 from typing import cast
 
-import cutlass
-from cutlass import Int32
-from cutlass._mlir.dialects import llvm
-import cutlass.cute as cute
-from cutlass.cute.arch.nvvm_wrappers import _normalize_ptr
-from cutlass.cute.typing import Float32
-from cutlass.cute.typing import Pointer as CutePointer
-from cutlass.cute.typing import Tensor as CuteTensor
-from cutlass.cutlass_dsl import T
-from cutlass.cutlass_dsl import dsl_user_op
 import torch
 from torch import Tensor
 
@@ -38,6 +29,28 @@ from helion._testing import DEVICE
 from helion._testing import run_example
 import helion.language as hl
 from helion.runtime import default_cute_launcher
+
+cutlass: Any
+cute: Any
+dsl_user_op: Any
+
+try:
+    import cutlass
+    from cutlass import Int32
+    from cutlass._mlir.dialects import llvm
+    import cutlass.cute as cute
+    from cutlass.cute.arch.nvvm_wrappers import _normalize_ptr
+    from cutlass.cute.typing import Float32
+    from cutlass.cute.typing import Pointer as CutePointer
+    from cutlass.cute.typing import Tensor as CuteTensor
+    from cutlass.cutlass_dsl import T
+    from cutlass.cutlass_dsl import dsl_user_op
+except ModuleNotFoundError as e:
+    if e.name is None or not e.name.startswith("cutlass"):
+        raise
+    cutlass = cast("Any", None)
+    cute = cast("Any", None)
+    dsl_user_op = cast("Any", None)
 
 if TYPE_CHECKING:
     from collections.abc import Callable
