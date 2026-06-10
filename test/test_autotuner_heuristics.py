@@ -1863,11 +1863,32 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
         with (
             patch_cute_mma_support(),
             patch("torch.cuda.get_device_capability", return_value=(10, 0)),
+            # target_device_capability is memoized (is_hip / _is_hip pattern),
+            # so torch.cuda.get_device_capability alone no longer reaches its
+            # consumers. Patch each seam the bind path reads: the bound-kernel
+            # cache key (runtime.kernel) and the ConfigSpec arch capability,
+            # which CompileEnvironment captures onto config_spec at build time.
+            patch(
+                "helion.runtime.kernel.target_device_capability",
+                return_value=(10, 0),
+            ),
+            patch(
+                "helion._compiler.compile_environment.target_device_capability",
+                return_value=(10, 0),
+            ),
         ):
             bound = cute_matmul_bias_residual_gelu.bind(args)
         with (
             patch_cute_mma_support(),
             patch("torch.cuda.get_device_capability", return_value=(9, 0)),
+            patch(
+                "helion.runtime.kernel.target_device_capability",
+                return_value=(9, 0),
+            ),
+            patch(
+                "helion._compiler.compile_environment.target_device_capability",
+                return_value=(9, 0),
+            ),
         ):
             sm90_bound = cute_matmul_bias_residual_gelu.bind(args)
         self.assertIsNot(sm90_bound, bound)
