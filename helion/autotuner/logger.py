@@ -38,6 +38,7 @@ if TYPE_CHECKING:
     from ..runtime.config import Config
     from ..runtime.settings import Settings
     from .base_search import _AutotunableKernel
+    from .ir_features import IrGraphRecord
     from .metrics import KernelMetadata
 
 else:
@@ -119,7 +120,7 @@ class AutotuningLogger:
         self,
         base_path: str | None = None,
         metadata: KernelMetadata | None = None,
-        ir_graph: dict[str, object] | None = None,
+        ir_graph: IrGraphRecord | None = None,
     ) -> Iterator[AutotuneLogSink | None]:
         """Attach an :class:`AutotuneLogSink` for the duration of a tuning run.
 
@@ -291,7 +292,7 @@ class AutotuneLogSink:
         self,
         base_path: str,
         metadata: KernelMetadata | None = None,
-        ir_graph: dict[str, object] | None = None,
+        ir_graph: IrGraphRecord | None = None,
     ) -> None:
         self._base_path = Path(base_path)
         self.csv_path = self._base_path.with_suffix(".csv")

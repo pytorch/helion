@@ -36,6 +36,7 @@ from .benchmark_provider import _clone_args
 from .benchmark_provider import _unset_fn
 from .benchmarking import clear_jit_fast_path_caches
 from .benchmarking import interleaved_bench
+from .ir_features import IrGraphRecord
 from .ir_features import extract_ir_graph
 from .logger import AutotuningLogger
 from .metrics import AutotuneMetrics
@@ -298,9 +299,9 @@ class BaseSearch(BaseAutotuner):
         self.benchmark_provider.set_budget_exceeded_fn(self._autotune_budget_exceeded)
         # Device IR is config-independent, so dump it once per run (joined to the
         # per-config CSV rows on run_id). Only when telemetry is on.
-        self._ir_graph: dict[str, object] | None = self._extract_ir_graph()
+        self._ir_graph: IrGraphRecord | None = self._extract_ir_graph()
 
-    def _extract_ir_graph(self) -> dict[str, object] | None:
+    def _extract_ir_graph(self) -> IrGraphRecord | None:
         """Best-effort device-IR node-link dump for the autotune-log sidecar.
 
         Returns ``None`` (no IR artifact) when telemetry is off or the device IR

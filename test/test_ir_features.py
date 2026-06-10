@@ -167,6 +167,7 @@ class TestIrFeaturesEdgeCases(TestCase):
         self.assertEqual(g["nodes"], [])
         self.assertEqual(g["links"], [])
         self.assertEqual(g["run_id"], "rid")
+        self.assertEqual(g["schema_version"], ir_features.IR_SCHEMA_VERSION)
         self.assertEqual(g["graph"]["num_graphs"], 0)
         # Still a loadable (empty) networkx DiGraph.
         graph = nx.node_link_graph(json.loads(json.dumps(g)), edges="links")

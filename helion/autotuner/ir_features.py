@@ -75,6 +75,29 @@ _KNOWN_REGION_KINDS = frozenset(
 )
 
 
+class ValFeatures(TypedDict):
+    """Features derived from a node's ``meta['val']`` (tensor or sym scalar)."""
+
+    dtype: str | None
+    shape: list[str] | None
+    concrete_shape: list[int | None] | None
+    stride: list[str] | None
+    concrete_stride: list[int | None] | None
+    device: str | None
+    value: str | None
+
+
+class LoweringFeatures(TypedDict):
+    """Features derived from a node's ``meta['lowering']``."""
+
+    lowering_class: str | None
+    reduction_type: str | None
+    reduction_ranges: list[str] | None
+    pointwise_ranges: list[str] | None
+    input_dtypes: list[str] | None
+    input_shapes: list[list[str]] | None
+
+
 class IrNode(TypedDict):
     """A single device-IR fx node (a node-link ``nodes`` entry)."""
 
@@ -140,12 +163,18 @@ class IrGraphMeta(TypedDict):
 class IrGraphRecord(TypedDict):
     """One ``.ir.jsonl`` record; loadable via ``nx.node_link_graph(.., edges="links")``."""
 
+    schema_version: int
     run_id: str
     directed: bool
     multigraph: bool
     graph: IrGraphMeta
     nodes: list[IrNode]
     links: list[IrEdge]
+
+
+# Bump when the .ir.jsonl record shape changes, so consumers can detect format
+# drift. 1 = initial schema.
+IR_SCHEMA_VERSION = 1
 
 
 @functools.cache
@@ -196,9 +225,9 @@ def _concrete_dim(dim: object) -> int | None:
         return None
 
 
-def _val_features(val: object) -> dict[str, object]:
+def _val_features(val: object) -> ValFeatures:
     """Type/shape/stride features for ``node.meta['val']`` (tensor or sym scalar)."""
-    out: dict[str, object] = {
+    out: ValFeatures = {
         "dtype": None,
         "shape": None,
         "concrete_shape": None,
@@ -223,13 +252,13 @@ def _val_features(val: object) -> dict[str, object]:
     return out
 
 
-def _lowering_features(node: torch.fx.Node) -> dict[str, object]:
+def _lowering_features(node: torch.fx.Node) -> LoweringFeatures:
     """Lowering-class and reduction/pointwise/operand features for a node.
 
     Reads ``node.meta['lowering']`` and dispatches reduction/pointwise ranges by
     lowering class name (see ``_REDUCTION_LOWERING``/``_POINTWISE_LOWERING``).
     """
-    out: dict[str, object] = {
+    out: LoweringFeatures = {
         "lowering_class": None,
         "reduction_type": None,
         "reduction_ranges": None,
@@ -305,18 +334,20 @@ def _region_specs(node: torch.fx.Node) -> list[tuple[int, object]]:
     """
     target = node.target
     args = node.args
+    # Child graph ids must be concrete ints; narrow them so a malformed node
+    # degrades to [] rather than producing a wrong edge (and to satisfy typing).
     if is_for_loop_target(target):
-        if len(args) >= 4:
+        if len(args) >= 4 and isinstance(args[0], int):
             return [(args[0], args[3])]
         return []
     if target is _if:
-        if len(args) >= 5:
+        if len(args) >= 5 and isinstance(args[1], int) and isinstance(args[2], int):
             return [(args[1], args[3]), (args[2], args[4])]
         return []
     if target is _while_loop:
-        if len(args) >= 3:
+        if len(args) >= 3 and isinstance(args[0], int) and isinstance(args[1], int):
             specs: list[tuple[int, object]] = [(args[1], args[2]), (args[0], args[2])]
-            if len(args) > 3 and args[3] is not None:
+            if len(args) > 3 and isinstance(args[3], int):
                 specs.append((args[3], args[2]))
             return specs
         return []
@@ -349,7 +380,7 @@ def extract_ir_graph(
     # edges reuse them instead of recomputing per producer (O(N) not O(N+E)).
     graphs_by_id = {gi.graph_id: gi for gi in graphs}
     node_id: dict[torch.fx.Node, str] = {}
-    val_by_node: dict[torch.fx.Node, dict[str, object]] = {}
+    val_by_node: dict[torch.fx.Node, ValFeatures] = {}
     for graph_info in graphs:
         gid = graph_info.graph_id
         for node in graph_info.graph.nodes:
@@ -467,6 +498,7 @@ def extract_ir_graph(
         ],
     }
     return {
+        "schema_version": IR_SCHEMA_VERSION,
         "run_id": run_id,  # top-level per-line join key (networkx ignores it)
         "directed": True,
         "multigraph": False,
