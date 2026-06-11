@@ -9,6 +9,7 @@ import inspect
 import itertools
 import logging
 import operator
+import os
 import re
 import sys
 import textwrap
@@ -99,6 +100,10 @@ def _td_layout_guard_active_for_config(
 
 _R = TypeVar("_R")
 CompiledConfig = Callable[..., _R]
+
+# Opt-in: auto-capture Pallas kernels under torch.compile (see _tpu_compile_capture).
+# Off by default so the eager dispatch path is unchanged.
+_TPU_COMPILE_CAPTURE = os.environ.get("HELION_TPU_COMPILE_CAPTURE", "0") == "1"
 
 # Cache for GraphModule hashes
 _graph_module_hash_cache: WeakIdKeyDictionary = WeakIdKeyDictionary()
@@ -224,6 +229,16 @@ class Kernel(Generic[_R]):
         self.__code__ = fn.__code__
         self.__defaults__ = fn.__defaults__
         self.__kwdefaults__ = fn.__kwdefaults__
+
+        # Opt-in: register the torch.compile(backend="tpu") capture op now, so an
+        # annotated/functional/benchmark-free Pallas kernel is captured with zero
+        # warm-up (like a hand-written custom_op). None if it must use first-call
+        # registration (unannotated, mutating, or autotuning among configs=[...]).
+        self._capture_op: Callable[..., Any] | None = None
+        if self.settings.backend == "pallas" and _TPU_COMPILE_CAPTURE:
+            from ._tpu_compile_capture import register_decoration_op
+
+            self._capture_op = register_decoration_op(self)
 
     def _settings_signature(self) -> str:
         """Return a stable string of settings that influence Triton codegen.
@@ -453,6 +468,15 @@ class Kernel(Generic[_R]):
         """
         if kwargs:
             args = self.normalize_args(*args, **kwargs)
+        if self.settings.backend == "pallas" and _TPU_COMPILE_CAPTURE:
+            # Local import: _tpu_compile_capture pulls in the dynamo HOP machinery,
+            # not ready when kernel.py first loads during ``import helion``.
+            from ._tpu_compile_capture import RUN_NORMAL
+            from ._tpu_compile_capture import auto_capture_call
+
+            result = auto_capture_call(self, args)
+            if result is not RUN_NORMAL:
+                return cast("_R", result)
         return self.bind(args)(*args)
 
     def reset(self) -> None:
@@ -1485,6 +1509,8 @@ def _find_device(args: tuple[object, ...]) -> torch.device:
             return arg
         if isinstance(arg, torch.Tensor):
             return arg.device
+        if isinstance(arg, ConstExpr):
+            continue  # a constexpr-wrapped value carries no device; skip it
         if isinstance(arg, (tuple, list)):
             for item in arg:
                 try:
