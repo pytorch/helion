@@ -4255,9 +4255,7 @@ class TestPallas(TestCase):
         from torch.fx import Graph
         from torch.fx.experimental.symbolic_shapes import ShapeEnv
 
-        from helion._compiler.pallas.plan_tiling import (
-            _parse_flat_jagged_subscript,
-        )
+        from helion._compiler.pallas.plan_tiling import _parse_flat_jagged_subscript
 
         shape_env = ShapeEnv()
         mode = FakeTensorMode(shape_env=shape_env)
@@ -4311,9 +4309,7 @@ class TestPallas(TestCase):
         from torch.fx import Graph
         from torch.fx.experimental.symbolic_shapes import ShapeEnv
 
-        from helion._compiler.pallas.plan_tiling import (
-            _parse_flat_jagged_subscript,
-        )
+        from helion._compiler.pallas.plan_tiling import _parse_flat_jagged_subscript
 
         shape_env = ShapeEnv()
         mode = FakeTensorMode(shape_env=shape_env)
@@ -4382,7 +4378,8 @@ class TestPallas(TestCase):
         from torch.fx.experimental.symbolic_shapes import ShapeEnv
 
         from helion._compiler.pallas.plan_tiling import get_reduced_block_ids
-        from helion.language._tracing_ops import _for_loop, _phi
+        from helion.language._tracing_ops import _for_loop
+        from helion.language._tracing_ops import _phi
 
         shape_env = ShapeEnv()
         mode = FakeTensorMode(shape_env=shape_env)
@@ -4431,7 +4428,8 @@ class TestPallas(TestCase):
         from torch.fx.experimental.symbolic_shapes import ShapeEnv
 
         from helion._compiler.pallas.plan_tiling import store_is_post_reduction
-        from helion.language._tracing_ops import _for_loop, _phi
+        from helion.language._tracing_ops import _for_loop
+        from helion.language._tracing_ops import _phi
 
         shape_env = ShapeEnv()
         mode = FakeTensorMode(shape_env=shape_env)

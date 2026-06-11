@@ -592,7 +592,7 @@ class JaggedProgramIDs(FlatProgramIDs):
         fn_name = device_function.new_var("_kernel_body")
         fn_def = statement_from_string(f"def {fn_name}({pid.pid_var}, _): pass")
         assert isinstance(fn_def, ast.FunctionDef)
-        fn_def.body = body_stmts or [ast.Pass()]
+        fn_def.body = cast("list[ast.stmt]", body_stmts) or [ast.Pass()]
         fori_call = statement_from_string(
             f"jax.lax.fori_loop(0, {num_items}, {fn_name}, None)"
         )

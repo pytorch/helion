@@ -29,6 +29,7 @@ if TYPE_CHECKING:
     from collections.abc import Callable
 
     from .._compiler.inductor_lowering import CodegenState
+    from .._compiler.pallas.plan_tiling import TensorIndexPattern
     from .._compiler.tile_strategy import TileStrategy
     from ..runtime.config import Config
 
@@ -1892,7 +1893,7 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
 
 def _build_jagged_flat_pattern_map(
     graph_info: object,
-) -> dict[int, object]:
+) -> dict[int, TensorIndexPattern]:
     """Map ``id(fake_tensor)`` to its ``TensorIndexPattern`` (the one with
     ``is_jagged_flat=True``) by walking the loop body's load/store nodes.
 
@@ -1905,7 +1906,7 @@ def _build_jagged_flat_pattern_map(
     from .memory_ops import load as _load_op
     from .memory_ops import store as _store_op
 
-    result: dict[int, object] = {}
+    result: dict[int, TensorIndexPattern] = {}
     graph = getattr(graph_info, "graph", None)
     if graph is None:
         return result
@@ -1951,7 +1952,7 @@ def _compute_vmem_shapes(
     slice_size_exprs: list[str],
     env: CompileEnvironment,
     state: CodegenState,
-    jagged_flat_patterns: dict[int, object] | None = None,
+    jagged_flat_patterns: dict[int, TensorIndexPattern] | None = None,
 ) -> list[tuple[int, ...]]:
     """Compute VMEM buffer shapes for each tensor in the fori_loop body."""
     vmem_shapes: list[tuple[int, ...]] = []
@@ -2008,7 +2009,7 @@ def _classify_pipelined_tensors(
     slice_size_exprs: list[str],
     env: CompileEnvironment,
     state: CodegenState,
-    jagged_flat_patterns: dict[int, object] | None = None,
+    jagged_flat_patterns: dict[int, TensorIndexPattern] | None = None,
 ) -> tuple[
     list[tuple[torch.Tensor, list[object], str]], list[tuple[int, ...]], set[int]
 ]:
