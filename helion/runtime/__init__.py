@@ -1889,9 +1889,7 @@ def default_pallas_fori_launcher(
     reshape_2d = kwargs.get("_reshape_2d_arg_indices")
     if reshape_2d:
         args_list = list(args)
-        for arg_idx, lane_size in cast(
-            "list[tuple[int, int]]", reshape_2d
-        ):
+        for arg_idx, lane_size in cast("list[tuple[int, int]]", reshape_2d):
             t = args_list[arg_idx]
             assert isinstance(t, torch.Tensor)
             args_list[arg_idx] = t.view(-1, lane_size)

@@ -200,6 +200,7 @@ def _analyze_indexing(node: torch.fx.Node, config: Config) -> None:
     # ``x[pl.ds(pid_0, 1)]`` reads from the per-program @pl.loop body
     # don't hit VMEM sublane/lane alignment.
     from ..compile_environment import CompileEnvironment as _CompileEnvironment
+
     _env = _CompileEnvironment.current()
     _jagged_parent_bids = {
         p for parents in _env.jagged_tile_parent_ids.values() for p in parents
@@ -237,8 +238,12 @@ def _analyze_indexing(node: torch.fx.Node, config: Config) -> None:
         # into ``ConfigSpec._normalize`` where there's no live env access.
         for p in indexing_patterns:
             if isinstance(p, TensorIndexPattern) and p.is_jagged_flat:
+                assert (
+                    p.sublane_bid is not None
+                    and p.lane_bid is not None
+                    and p.lane_size is not None
+                )
                 device_fn.pallas_jagged_flat_lane_size[tid] = p.lane_size
-                assert p.sublane_bid is not None and p.lane_bid is not None
                 _env.pallas_jagged_flat_sublane_bids.add(p.sublane_bid)
                 _env.pallas_jagged_flat_lane_bids.add(p.lane_bid)
                 _env.config_spec.has_jagged_flat_dma = True
@@ -692,9 +697,7 @@ def _extract_scalar(arg: object) -> int | torch.SymInt | None:
     return None
 
 
-def _maybe_jagged_tile_bid(
-    node: torch.fx.Node, env: CompileEnvironment
-) -> int | None:
+def _maybe_jagged_tile_bid(node: torch.fx.Node, env: CompileEnvironment) -> int | None:
     """Return the jagged-tile block_id if ``node`` is a jagged-tile index
     expression (either ``hl.tile_index(tile_sym)`` or the bare tile-sym FX
     node). None if non-jagged or non-tile.
@@ -718,9 +721,7 @@ def _maybe_jagged_tile_bid(
     return bid
 
 
-def _maybe_any_tile_bid(
-    node: torch.fx.Node, env: CompileEnvironment
-) -> int | None:
+def _maybe_any_tile_bid(node: torch.fx.Node, env: CompileEnvironment) -> int | None:
     """Like ``_maybe_jagged_tile_bid`` but doesn't require jaggedness. Used
     for the dense-arm side of the flat-form (tile_m may be plain ``hl.tile``
     OR ``hl.jagged_tile`` host-padded to a uniform extent)."""
@@ -752,7 +753,11 @@ def _decompose_jagged_idx(
     if bid is not None:
         return bid, None
 
-    if idx_fx.op == "call_function" and idx_fx.target in _ADD_TARGETS and len(idx_fx.args) == 2:
+    if (
+        idx_fx.op == "call_function"
+        and idx_fx.target in _ADD_TARGETS
+        and len(idx_fx.args) == 2
+    ):
         left, right = idx_fx.args
         left_peeled = _peel_wrappers(left) if isinstance(left, torch.fx.Node) else left
         right_peeled = (
@@ -844,7 +849,7 @@ def _carried_indices_for_loop_node(for_loop_node: torch.fx.Node) -> set[int]:
                 phi_user.op == "call_function"
                 and phi_user.target is _phi
                 and phi_user.args
-                and hasattr(phi_user.args[0], "name")
+                and isinstance(phi_user.args[0], torch.fx.Node)
             ):
                 carried_names.add(phi_user.args[0].name)
 
@@ -877,6 +882,7 @@ def get_reduced_block_ids(
         return set()
 
     loop_args = for_loop_node.args[3]
+    assert isinstance(loop_args, list)
     block_ids_in_any_acc: set[int] = set()
     for i in carried:
         arg = loop_args[i]

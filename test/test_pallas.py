@@ -4111,9 +4111,7 @@ class TestPallas(TestCase):
         def k(x_data: torch.Tensor, x_offsets: torch.Tensor) -> torch.Tensor:
             M = x_data.size(1)
             num_rows = x_offsets.size(0) - 1
-            out = torch.zeros(
-                [num_rows, M], dtype=x_data.dtype, device=x_data.device
-            )
+            out = torch.zeros([num_rows, M], dtype=x_data.dtype, device=x_data.device)
             x_flat = x_data.view(-1)
             for tile_b in hl.tile(num_rows):
                 starts = x_offsets[tile_b]
@@ -4147,9 +4145,7 @@ class TestPallas(TestCase):
         def k(x_data: torch.Tensor, x_offsets: torch.Tensor) -> torch.Tensor:
             M = x_data.size(1)
             num_rows = x_offsets.size(0) - 1
-            out = torch.zeros(
-                [num_rows, M], dtype=x_data.dtype, device=x_data.device
-            )
+            out = torch.zeros([num_rows, M], dtype=x_data.dtype, device=x_data.device)
             x_flat = x_data.view(-1)
             # bfloat16 lane → 256-element alignment requirement on Pallas;
             # without our skip, tile_b's min would be raised above 1.
@@ -4203,9 +4199,7 @@ class TestPallas(TestCase):
         def k(x_data: torch.Tensor, x_offsets: torch.Tensor) -> torch.Tensor:
             M = x_data.size(1)
             num_rows = x_offsets.size(0) - 1
-            out = torch.zeros(
-                [num_rows, M], dtype=x_data.dtype, device=x_data.device
-            )
+            out = torch.zeros([num_rows, M], dtype=x_data.dtype, device=x_data.device)
             x_flat = x_data.view(-1)
             for tile_b in hl.tile(num_rows):
                 starts = x_offsets[tile_b]
@@ -4289,9 +4283,7 @@ class TestPallas(TestCase):
         m_idx.meta["val"] = m_sym
 
         inner = g.call_function(operator.add, args=(starts, k_idx))
-        inner_u = g.call_function(
-            torch.ops.aten.unsqueeze.default, args=(inner, -1)
-        )
+        inner_u = g.call_function(torch.ops.aten.unsqueeze.default, args=(inner, -1))
         mul = g.call_function(operator.mul, args=(inner_u, 64))
         mul_u = g.call_function(torch.ops.aten.unsqueeze.default, args=(mul, 0))
         m_u1 = g.call_function(torch.ops.aten.unsqueeze.default, args=(m_idx, 0))
@@ -4465,14 +4457,10 @@ class TestPallas(TestCase):
             return None
 
         tensor_ph = g.placeholder("tensor")
-        store_node = g.call_function(
-            _store_marker, args=(tensor_ph, [], out_get, None)
-        )
+        store_node = g.call_function(_store_marker, args=(tensor_ph, [], out_get, None))
 
         # graph_id 0 → block_ids [7] (k_sym's bid).
-        self.assertEqual(
-            store_is_post_reduction(store_node, env, {0: [7]}), {7}
-        )
+        self.assertEqual(store_is_post_reduction(store_node, env, {0: [7]}), {7})
 
     def test_store_is_post_reduction_inline_value_returns_empty(self) -> None:
         """If the stored value is computed inline (not the final-carry of
@@ -4501,9 +4489,7 @@ class TestPallas(TestCase):
             _store_marker, args=(tensor_ph, [], inline_value, None)
         )
 
-        self.assertEqual(
-            store_is_post_reduction(store_node, env, {}), set()
-        )
+        self.assertEqual(store_is_post_reduction(store_node, env, {}), set())
 
 
 @skipUnlessPallas("JAX/Pallas TPU not available")

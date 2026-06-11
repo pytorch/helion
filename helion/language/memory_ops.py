@@ -431,9 +431,7 @@ def _(state: CodegenState) -> None:
                     # Bare TilePattern-style expand based on the axis position
                     # in value_sizes (jagged-flat output is BB, BK, BM —
                     # sublane at 1, lane at 2).
-                    axis_pos = (
-                        1 if axis_bid == jagged_flat_pattern.sublane_bid else 2
-                    )
+                    axis_pos = 1 if axis_bid == jagged_flat_pattern.sublane_bid else 2
                     expand = state.tile_strategy.expand_str(value_sizes, axis_pos)
                 expr = f"({mask_var}.astype(jnp.float32){expand})"
                 if expr not in mask_exprs:
