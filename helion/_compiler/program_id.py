@@ -562,18 +562,12 @@ class CuteProgramIDs(FlatProgramIDs):
 
 
 class JaggedProgramIDs(FlatProgramIDs):
-    """Pallas jagged kernel: ``grid=(1,)`` + ``jax.lax.fori_loop`` wrapper.
-
-    The single Pallas program iterates items inside via ``jax.lax.fori_loop``.
-    ``pid_0`` is the fori_loop body function's parameter, not
-    ``pl.program_id(0)``.  Selected by ``_BaseNDTileStrategy.codegen_grid``
-    when the (single) grid block_id is a registered jagged_tile parent.
+    """``grid=(1,)`` + ``jax.lax.fori_loop`` over items.  ``pid_0`` is
+    the body fn parameter, not ``pl.program_id(0)``.
     """
 
     def codegen(self, state: CodegenState) -> None:
-        # The body wrap in ``wrap_kernel_body`` defines ``pid_0`` as the
-        # fori_loop body fn's parameter, so we intentionally emit nothing
-        # at the kernel-body top.
+        # ``pid_0`` comes from the fori_loop body fn param (see wrap_kernel_body).
         return
 
     def codegen_grid(self) -> ast.AST:

@@ -227,8 +227,7 @@ def main() -> None:
     from helion.runtime.settings import _get_backend
 
     B_list = [2**n for n in list(range(5, 16, 3))]
-    # Pallas/TPU has a sublane alignment constraint on M>128 (tracked as a
-    # follow-up).  Cap there; GPU backends keep the original wider range.
+    # Pallas/TPU: M>128 hits a sublane alignment constraint.
     if _get_backend() == "pallas":
         M_list = [32, 128]
     else:

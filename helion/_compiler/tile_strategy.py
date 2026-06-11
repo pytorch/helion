@@ -3238,11 +3238,7 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
             and block_ids[0]
             in {p for parents in env.jagged_tile_parent_ids.values() for p in parents}
         ):
-            # Pallas jagged tile: collapse grid to (1,) and iterate items
-            # inside via jax.lax.fori_loop (wrap applied in generate_ast.py).
-            # The grid block_id is the *parent* of a registered jagged_tile;
-            # ``is_jagged_tile`` keys on the jagged tile's own bid, not the
-            # parent, so we look up the parent set explicitly.
+            # Grid → (1,); fori_loop wrap applied in generate_ast.py.
             pids = JaggedProgramIDs()
         elif (
             isinstance(pids, FlatProgramIDs)

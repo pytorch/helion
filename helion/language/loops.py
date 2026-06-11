@@ -745,18 +745,12 @@ def _(
     base = TileIndexType.allocate(None, origin)
     result = JaggedTileIndexType(origin, base.block_id, parent_block_ids)
     env.register_jagged_tile(base.block_id, parent_block_ids)
-    # ``has_jagged_flat_dma`` bridges into autotune-setup (config_spec
-    # normalize / _get_tunable_fragments), which runs BEFORE plan_tiling.
-    # plan_tiling re-sets the flag with the precise condition; here we set
-    # it eagerly so the autotune-search emit_pipeline drop fires from the
-    # first sample.  Mildly over-broad for hypothetical outer-dim jagged
-    # kernels -- refine when those are supported.
+    # Set eagerly so emit_pipeline drop fires from first autotune sample;
+    # plan_tiling re-sets with the precise condition.
     env.config_spec.has_jagged_flat_dma = True
 
-    # On Pallas (TPU), the items axis of a jagged kernel must be pinned to
-    # block_size=1: each program owns exactly one item so the per-item DMA
-    # slice + chunk_mask emission can use the program_id as the row index
-    # without a per-program inner items loop. Other backends don't need this.
+    # On Pallas the items axis is pinned to 1 (one program per item) so
+    # the per-item DMA slice can use program_id directly.
     if env.config_spec.backend_name == "pallas":
         for parent_bid in parent_block_ids:
             parent_spec = env.config_spec.block_sizes.block_id_lookup(parent_bid)

@@ -69,23 +69,10 @@ class NonePattern(IndexingPattern):
 
 @dataclass
 class TensorIndexPattern(IndexingPattern):
-    """Tensor-valued index — no tiling.
-
-    Two emit paths depending on ``is_jagged_flat``:
-
-      * ``is_jagged_flat=False`` (default): resolved for indirect load/store
-        codegen (gather/scatter).
-
-      * ``is_jagged_flat=True``: this is the canonical jagged 1-D flat form
-        ``x_flat[(starts + tile_k.idx) * M + tile_m.idx]`` — one subscript
-        element that encodes BOTH axes (sublane + lane). Producer parses the
-        FX expression once and caches ``sublane_bid``, ``sublane_base_fx``,
-        ``lane_bid``, and ``lane_size`` (= M).
-
-        ``lane_size`` is needed only for this form: the host launcher reshapes
-        ``x_flat.view(-1, lane_size)`` before ``pl.pallas_call`` so the kernel
-        sees a 2-D ref. Non-flat (2-D source) accesses don't need M because
-        ``x.shape[-1]`` already carries it.
+    """Tensor-valued index.  ``is_jagged_flat=False`` → indirect
+    gather/scatter.  ``is_jagged_flat=True`` → canonical flat-1D form
+    ``x_flat[(starts + tile_k.idx) * M + tile_m.idx]`` with cached
+    sublane/lane axes; launcher reshapes flat tensor by ``lane_size``.
     """
 
     is_jagged_flat: bool = False
@@ -164,10 +151,8 @@ def _analyze_indexing(node: torch.fx.Node, config: Config) -> None:
     indexing_patterns = _analyze_subscript_patterns(
         tensor_val, list(subscript), dim_tilings, node, config
     )
-    # Capture jagged-flat BEFORE ``_resolve_tensor_index_patterns`` rewrites
-    # every ``TensorIndexPattern`` into ``IndirectGather/ScatterPattern``,
-    # which would otherwise erase the ``is_jagged_flat`` flag used below to
-    # mark the tensor as HBM-resident.
+    # Must capture before ``_resolve_tensor_index_patterns`` rewrites
+    # TensorIndexPattern into IndirectGather/ScatterPattern.
     is_jagged_flat = any(
         isinstance(p, TensorIndexPattern) and p.is_jagged_flat
         for p in indexing_patterns
@@ -193,12 +178,8 @@ def _analyze_indexing(node: torch.fx.Node, config: Config) -> None:
         isinstance(p, (ArbitraryIndexPattern, TileBeginWithOffsetPattern, NonePattern))
         for p in indexing_patterns
     )
-    # Jagged-parent-only access: every subscript references a jagged_tile
-    # parent block_id, which is pinned to block_size=1 on Pallas.  Each
-    # access fetches a single element, so the tensor is effectively scalar
-    # from the kernel body's POV — must live in SMEM so dynamic
-    # ``x[pl.ds(pid_0, 1)]`` reads from the per-program @pl.loop body
-    # don't hit VMEM sublane/lane alignment.
+    # Jagged-parent-only access fetches a single element per program
+    # (parent block_size=1), so the tensor lives in SMEM.
     from ..compile_environment import CompileEnvironment as _CompileEnvironment
 
     _env = _CompileEnvironment.current()
@@ -213,13 +194,8 @@ def _analyze_indexing(node: torch.fx.Node, config: Config) -> None:
         or isinstance(p, NonePattern)
         for p in indexing_patterns
     )
-    # Jagged-kernel STORED tensor (e.g. jagged_sum / jagged_mean's `out`): in
-    # a grid=(1,) jagged kernel the whole-tensor VMEM BlockSpec would OOM at
-    # realistic output sizes.  Mark HBM so the existing _codegen_fori_loop
-    # store loop routes through tensor_to_dma_scratch + per-iter
-    # make_async_copy at the natural FX scope (Option B for cases 1/2).
-    # Doesn't apply when the access is jagged-flat (already HBM above),
-    # jagged-pinned-only (SMEM — small offset tables), or all-scalar (SMEM).
+    # In a grid=(1,) jagged kernel, the whole-tensor VMEM BlockSpec would
+    # OOM at realistic output sizes — route stored tensors through HBM.
     from ...language import memory_ops
 
     is_store = node.target is memory_ops.store
@@ -228,14 +204,10 @@ def _analyze_indexing(node: torch.fx.Node, config: Config) -> None:
     tid = id(tensor_val)
     current = device_fn.pallas_memory_space.get(tid)
     if is_jagged_flat:
-        # Jagged-flat tensors are accessed only via DMA out of HBM from inside
-        # the per-item fori_loop body — they must not be hoisted into VMEM at
-        # kernel entry (the flat tensor is much larger than VMEM).
+        # Flat tensor too large for VMEM; access via per-iter DMA from HBM.
         device_fn.pallas_memory_space[tid] = PallasMemorySpace.HBM
-        # Cache lane_size + sublane/lane bids, and flip the autotune flag.
-        # The two bid sets are read by backend.py / memory_ops.py to gate
-        # jagged-flat-only codegen rules; ``has_jagged_flat_dma`` bridges
-        # into ``ConfigSpec._normalize`` where there's no live env access.
+        # ``has_jagged_flat_dma`` bridges per-axis bids into ConfigSpec
+        # (no live env access there).
         for p in indexing_patterns:
             if isinstance(p, TensorIndexPattern) and p.is_jagged_flat:
                 assert (
@@ -249,13 +221,9 @@ def _analyze_indexing(node: torch.fx.Node, config: Config) -> None:
                 _env.config_spec.has_jagged_flat_dma = True
                 break
     elif is_jagged_pinned_only:
-        # Override any prior VMEM/SMEM assignment: SMEM wins for
-        # jagged-pinned tensors (only HBM stays — used by jagged-flat).
         if current != PallasMemorySpace.HBM:
             device_fn.pallas_memory_space[tid] = PallasMemorySpace.SMEM
     elif is_jagged_kernel and is_store and not is_all_scalar:
-        # See block comment above.  Promotion to HBM is sticky — don't downgrade
-        # if an earlier access already marked it HBM (idempotent).
         if current != PallasMemorySpace.SMEM:
             device_fn.pallas_memory_space[tid] = PallasMemorySpace.HBM
     elif is_all_scalar:
@@ -346,10 +314,6 @@ def _detect_indexing_pattern(
                 block_id=tile_begin_with_offset.block_id,
                 offset=tile_begin_with_offset.offset,
             )
-        # A tensor-valued index that didn't match any arithmetic-of-tile
-        # pattern is either an indirect gather (e.g. table[idx, :]) or the
-        # canonical jagged 1-D flat form
-        # ``x_flat[(starts + tile_k.idx) * M + tile_m.idx]``.
         if isinstance(idx_val, torch.Tensor):
             if env.jagged_tile_parent_ids:
                 parsed = _parse_flat_jagged_subscript(idx, env)
@@ -505,13 +469,8 @@ def _resolve_tensor_index_patterns(
 ) -> None:
     """Replace TensorIndexPattern with Pallas indirect load/store patterns.
 
-    Jagged-flat patterns (``TensorIndexPattern.is_jagged_flat=True``) are
-    deliberately skipped — they have their own DMA-driven emit path that
-    needs the original pattern (with cached ``sublane_bid`` /
-    ``sublane_base_fx`` / ``lane_bid`` / ``lane_size``) to build the
-    per-item HBM slice.  Converting them to ``IndirectGatherPattern`` here
-    would lose that metadata and force a one-hot dot-product gather that
-    is both wrong on jagged layouts and unusably slow on TPU.
+    Jagged-flat patterns are skipped — they have their own DMA emit path
+    that needs the cached sublane/lane metadata.
     """
     positions = [
         i
@@ -641,12 +600,9 @@ def _maybe_get_tile_begin_with_offset_info(
     return TileBeginWithOffsetPattern(block_id=block_id, offset=offset)
 
 
-# ────────────────────────────────────────────────────────────────────
-# Jagged 1-D flat-form subscript parser
-# Recognises ``x_flat[(starts + tile_k.idx) * M + tile_m.idx]`` (with
-# broadcast wrappers in between) and recovers the 2-D structural pieces:
+# Jagged 1-D flat-form subscript parser:
+# ``x_flat[(starts + tile_k.idx) * M + tile_m.idx]`` →
 # (sublane_bid, sublane_base_fx, lane_bid, lane_size=M).
-# ────────────────────────────────────────────────────────────────────
 
 
 _ADD_TARGETS = (operator.add, torch.ops.aten.add.Tensor)
@@ -654,12 +610,8 @@ _MUL_TARGETS = (operator.mul, torch.ops.aten.mul.Tensor)
 
 
 def _transparent_wrapper_targets() -> tuple[object, ...]:
-    """Targets of FX nodes whose value equals their first arg's value —
-    peeling through these reveals the underlying placeholder / tile_index
-    for pattern matching.
-
-    Built lazily so the module-level import doesn't pull in helion.language
-    at file-import time (would cause a circular import in some entry paths).
+    """FX targets that pass through args[0] unchanged.  Built lazily to
+    avoid a circular import on module load.
     """
     from ...language import _tracing_ops
     from ...language import view_ops
@@ -834,12 +786,8 @@ def _parse_flat_jagged_subscript(
 
 
 def _carried_indices_for_loop_node(for_loop_node: torch.fx.Node) -> set[int]:
-    """Standalone-FX version of ``_loop_carried_indices`` (in
-    ``language/_tracing_ops.py``): identifies carried-arg positions by
-    walking the ``getitem(_for_loop, idx) → _phi(init, getitem)`` user
-    chain.  Each phi's ``args[0]`` is the loop's init/carried value; we
-    match its name back to ``for_loop_node.args[3]`` (the carried args
-    list) to recover the positional index.
+    """Positional indices into ``for_loop_node.args[3]`` that are carried
+    across iterations.
     """
     from ...language._tracing_ops import _phi
 
@@ -868,15 +816,8 @@ def get_reduced_block_ids(
     loop_block_ids: list[int],
     env: CompileEnvironment,
 ) -> set[int]:
-    """Block_ids this ``_for_loop`` *reduces* over.
-
-    A block_id is reduced iff (1) it is in ``loop_block_ids`` — this loop
-    iterates over it — AND (2) the loop has at least one carried tensor
-    accumulator AND (3) no carried tensor's shape contains a dim mapping
-    to that block_id via ``env.get_block_id``.
-
-    Returns ∅ when the loop has no carried accumulators (it isn't a
-    reduction loop at all).
+    """Block_ids iterated by this loop whose dim is NOT present in any
+    carried accumulator's shape — i.e. reduced away.
     """
     carried = _carried_indices_for_loop_node(for_loop_node)
     if not carried:
@@ -905,21 +846,9 @@ def store_is_post_reduction(
     env: CompileEnvironment,
     graph_block_ids: dict[int, list[int]],
 ) -> set[int]:
-    """Walk backward from ``store_node.args[2]`` (the stored value) and
-    return the union of reduced block_ids contributed by any inner loop
-    whose final-carry surfaces in the value's FX chain.
-
-    Inner-loop final-carry values appear as ``getitem(_for_loop_node,
-    idx)``: when we hit one we read the inner loop's block_ids from
-    ``graph_block_ids`` (keyed by the loop's graph_id, ``args[0]`` of the
-    ``_for_loop`` node) and union :func:`get_reduced_block_ids`'s answer.
-    We do *not* descend into the loop body — the question is "was this
-    value collapsed by a reduction?", which is already answered at the
-    outer scope.
-
-    Returns ∅ when the stored value is computed inline within the
-    storing scope (case 1: per-iter writes are disjoint slices).
-    Non-empty → cases 2/3/4 — promote DMA-out to the tile_b epilogue.
+    """Block_ids reduced by any inner loop whose final-carry feeds
+    ``store_node``'s stored value.  Empty when the value is computed
+    inline (per-iter disjoint writes).
     """
     from ...language._tracing_ops import is_for_loop_target
 

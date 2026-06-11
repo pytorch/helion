@@ -356,11 +356,8 @@ class ConfigSpec:
         self.epilogue_subtile_k_hint: int = 0
         self.has_pallas_inner_loops: bool = False
         self.has_symbolic_or_data_dependent_bounds: bool = False
-        # True iff a jagged-flat DMA (sublane / lane jagged on a 2-D HBM
-        # ref) was registered in this kernel.  Strictly narrower than
-        # "kernel has any ``hl.jagged_tile``": kernels that use jagged_tile
-        # on an outer dim never emit the conflicting flat DMA, so they
-        # shouldn't be locked out of the ``emit_pipeline`` autotune path.
+        # Narrower than "any jagged_tile" — outer-dim jagged kernels don't
+        # emit the conflicting flat DMA and stay on the emit_pipeline path.
         self.has_jagged_flat_dma: bool = False
         self._cute_tcgen05_config = CuteTcgen05Config(self)
         self.compiler_default_config: helion.Config | None = None
@@ -1502,13 +1499,8 @@ class ConfigSpec:
                 # TODO(thcmbs): Also exclude "emit_pipeline" when has_pallas_dma_unaligned
                 # is set, to avoid wasted autotuning effort. See PR #1969 review discussion.
                 choices = ("fori_loop", "emit_pipeline")
-            # Jagged-flat DMAs use per-program data-dependent starts.
-            # emit_pipeline's BlockSpec model copies a regular
-            # (block_shape) window per grid step; it cannot express
-            # ``pl.ds(starts[i] + k*BK, BK)`` on HBM, so the codegen
-            # produces broadcast-shape mismatches at trace time.
-            # Restrict to fori_loop only when such a DMA is registered --
-            # outer-dim jagged kernels keep emit_pipeline.
+            # emit_pipeline's BlockSpec cannot express data-dependent
+            # ``pl.ds(starts[i] + k*BK, BK)`` per-program DMA starts.
             if self.has_jagged_flat_dma:
                 choices = ("fori_loop",)
             fields["pallas_loop_type"] = EnumFragment(choices=choices)
@@ -1681,11 +1673,9 @@ class BlockSizeSpec(_PowerOfTwoBlockIdItem):
         )
         # Outer block_id whose tile extent caps this block's size in normalize().
         self.bounded_by_block_id: int | None = bounded_by_block_id
-        # Set by backend code that wants user-supplied block_size CLAMPED
-        # DOWN to max_size (e.g. Pallas jagged-tile parents).  Without this
-        # flag, _normalize lets values above max_size flow through unchanged
-        # so users can intentionally over-block (e.g. block_size > tensor_dim
-        # to exercise codegen slicing).
+        # If True, user-supplied block_size is clamped down to max_size in
+        # _normalize.  Default leaves over-blocking unchanged so users can
+        # exercise codegen slicing intentionally.
         self.is_hard_pin: bool = False
         if self.max_size < self.min_size:
             self.max_size = self.min_size
@@ -1710,13 +1700,9 @@ class BlockSizeSpec(_PowerOfTwoBlockIdItem):
         if isinstance(result, int):
             if result < self.min_size:
                 result = self.min_size
-            # Backend-imposed hard pins (e.g. Pallas jagged-tile parents pinned
-            # to block_size=1) must override user-supplied configs.  We use an
-            # explicit ``is_hard_pin`` flag rather than inferring from
-            # min_size == max_size: other code paths (matmul broadcast-dim
-            # collapse, numel=1 dims, etc.) can legitimately end up with
-            # min == max for sizing reasons, and we don't want to silently
-            # clamp those user values.
+            # Explicit flag, not ``min_size == max_size`` — that condition
+            # also fires for matmul broadcast-dim collapse and numel=1 dims
+            # where the user value should NOT be clamped.
             if self.is_hard_pin and result > self.max_size:
                 result = self.max_size
         return result

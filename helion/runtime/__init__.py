@@ -1883,9 +1883,8 @@ def default_pallas_fori_launcher(
     The kernel uses ``jax.lax.fori_loop`` with ``pltpu.make_async_copy``
     internally for DMA control.
     """
-    # Jagged-flat tensors: reshape the user-flat ``x_data.view(-1)`` argument
-    # to 2-D ``(total_K, M)`` so the kernel's DMA slice can index it as
-    # ``ref.at[pl.ds(starts[0] + k_offset, BK), pl.ds(m_offset, BM)]``.
+    # Jagged-flat: reshape user-flat (total_K * M,) → 2-D (total_K, M)
+    # so the kernel can drive a 2-D DMA slice.
     reshape_2d = kwargs.get("_reshape_2d_arg_indices")
     if reshape_2d:
         args_list = list(args)

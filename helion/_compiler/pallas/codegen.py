@@ -39,21 +39,13 @@ def load_expr(
     if mask_expr is not None:
         result = expr_from_string(f"{name}[{idx_str}] * ({mask_expr})")
     elif _is_smem_tensor(state, tensor) and _smem_needs_scalar_rewrap(state, patterns):
-        # SMEM scalar load: ``_ds_expr`` dropped ``pl.ds(offset, 1)`` to a
-        # bare scalar offset, so ``name[offset]`` returns a 0-D scalar.  The
-        # user-source contract for ``x_offsets[tile_b]`` (block_size=1 tile)
-        # is a (1,)-vector — wrap to restore it; downstream subscripts
-        # (``starts[0]``, ``starts[:, None]``, etc.) remain valid.  Only
-        # fires when the original pattern was a TilePattern that would have
-        # emitted ``pl.ds(., 1)``; ``hl.grid`` (ArbitraryIndexPattern) was
-        # already scalar pre-SMEM-rule and stays scalar here.
+        # SMEM scalar load returns 0-D; rewrap as (1,)-vector to match the
+        # user-source TilePattern contract.
         result = expr_from_string(f"jnp.array([{name}[{idx_str}]])")
     else:
         result = expr_from_string(f"{name}[{idx_str}]")
-    # Jagged-flat tensors: the VMEM scratch is 2-D ``(BK, BM)`` but the
-    # user-source load result is 3-D ``(BB=1, BK, BM)`` because the
-    # ``flat`` index was rank-expanded.  Add the leading dim via
-    # expand_dims (pl.ref doesn't accept ``[None, :]`` directly).
+    # Jagged-flat: 2-D VMEM scratch but rank-expanded ``flat`` index makes
+    # the user-source load result 3-D (BB=1, BK, BM).
     from helion._compiler.pallas.plan_tiling import TensorIndexPattern as _TIP
 
     if any(isinstance(p, _TIP) and p.is_jagged_flat for p in patterns):
@@ -393,13 +385,8 @@ def _generated_index_code(
     from helion._compiler.pallas.plan_tiling import TensorIndexPattern
 
     if isinstance(pattern, TensorIndexPattern) and pattern.is_jagged_flat:
-        # The DMA-in/out for jagged-flat tensors injects the per-item base
-        # offset (``starts[pid_0]``) at the slice level (see
-        # ``_build_hbm_dma_slice``), so normal load/store codegen reads the
-        # whole VMEM scratch via ``:``.  The user-source load result has a
-        # leading BB=1 dim (from the rank-expanded ``flat`` index tensor) —
-        # ``load_expr`` wraps with ``jnp.expand_dims(..., axis=0)`` for
-        # jagged-flat patterns.
+        # Per-item base offset is injected at the DMA slice (see
+        # ``_build_hbm_dma_slice``); body reads the full VMEM scratch.
         return ":"
 
     raise RuntimeError(
@@ -561,10 +548,8 @@ def _ds_expr(
     block_size = state.device_function.block_size_var(block_id)
     if block_size is None:
         return ":"
-    # Pallas SMEM rejects length-1 vector loads ("Can only load scalars from
-    # SMEM").  When the tensor is in SMEM and block_size resolves to 1, emit
-    # the bare scalar offset; ``load_expr`` wraps the result in ``jnp.array``
-    # to preserve the (1,)-vec contract user-source code relies on.
+    # Pallas SMEM only loads scalars; emit bare offset and let load_expr
+    # rewrap to the (1,)-vec contract.
     if tensor is not None and _is_smem_tensor(state, tensor):
         resolved_bs = state.device_function.resolved_block_size(block_id)
         if isinstance(resolved_bs, int) and resolved_bs == 1:
@@ -663,14 +648,8 @@ def _loop_offset_alignment(
 
 
 def _smem_needs_scalar_rewrap(state: CodegenState, patterns: tuple) -> bool:
-    """Return True iff this SMEM load was scalarized by ``_ds_expr``.
-
-    ``_ds_expr`` drops ``pl.ds(offset, 1)`` to a bare scalar offset when the
-    target is SMEM (Pallas rejects vector SMEM reads).  The downstream
-    contract for that load is a (1,)-vector — so ``load_expr`` must wrap
-    the scalar result.  Other SMEM access paths (``hl.grid`` via
-    ``ArbitraryIndexPattern``) were always scalar both above and below the
-    load, so they stay unwrapped.
+    """True iff the SMEM load was scalarized by ``_ds_expr`` (block_size==1
+    TilePattern) and needs a (1,)-vec rewrap to match user-source contract.
     """
     from helion._compiler.pallas.plan_tiling import TileIndexWithOffsetPattern
     from helion._compiler.pallas.plan_tiling import TilePattern
@@ -684,12 +663,7 @@ def _smem_needs_scalar_rewrap(state: CodegenState, patterns: tuple) -> bool:
 
 
 def _is_smem_tensor(state: CodegenState, tensor: torch.Tensor) -> bool:
-    """Return True iff *tensor* is classified as Pallas SMEM by plan_tiling.
-
-    SMEM tensors are scalar or 1-D offset tables (e.g. jagged ``x_offsets``);
-    Pallas TPU's SMEM load rule rejects vector reads — even length-1 — so
-    codegen must drop ``pl.ds(offset, 1)`` to a bare scalar offset.
-    """
+    """True iff *tensor* is classified as Pallas SMEM (scalar / offset table)."""
     from helion._compiler.device_function import PallasMemorySpace
 
     mem_space = state.device_function.pallas_memory_space.get(id(tensor))
