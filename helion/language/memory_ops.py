@@ -285,25 +285,13 @@ def _record_pad_info(
 ) -> None:
     """Record that a tensor dimension uses pl.ds() and may need host-side padding.
 
-    *extra_pad* accounts for non-zero loop begins: 0 when the loop starts
-    at offset 0, ``begin % block_size`` for a constant begin, or
-    ``block_size - 1`` for a data-dependent begin.
+    *extra_pad* is 0 for begin=0, ``begin % block_size`` for a constant
+    begin, or ``block_size - 1`` for a data-dependent begin.
 
-    For jagged-flat tensors specifically, two inner loops can tile the
-    same (tensor, dim) with different ``block_id`` (e.g. softmax's pass1
-    and pass2 each running ``hl.tile`` over the sublane of the same
-    jagged-flat HBM tensor).  In that case we keep the LARGER
-    ``extra_pad`` -- otherwise a small-BK loop registered last clobbers
-    a big-BK loop's required tail buffer and the big-BK DMA over-reads
-    HBM at runtime (RuntimeUnexpectedCoreHalt: BoundsCheck on
-    dma.hbm_to_vmem).  The block_id we keep is the one contributing the
-    max extra_pad, since its block_size drives the alignment requirement.
-
-    For non-jagged-flat tensors we keep last-wins (the original
-    pre-jagged behavior).  The hazard above is specific to the
-    jagged-flat DMA emit path; over-padding regular tensors would be
-    safe but wasteful, and changing their behavior tripped real
-    regressions on non-jagged kernels.
+    For jagged-flat tensors we keep the max ``extra_pad`` across all
+    block_ids tiling the same (tensor, dim); last-wins would let a
+    small-BK loop clobber a big-BK loop's tail buffer and the big-BK
+    DMA over-reads HBM at runtime.  Non-jagged-flat keeps last-wins.
     """
     pad_info = state.device_function.pallas_pad_info
     tensor_id = id(tensor)
@@ -336,25 +324,15 @@ def _(state: CodegenState) -> None:
     assert isinstance(tensor, torch.Tensor)
     hbm_name = state.device_function.tensor_arg(tensor).name
     name = pallas_codegen.vmem_name(state, hbm_name)
-    # Case 3/4 NotImplementedError: a store of an HBM-marked tensor at the
-    # root graph (no inner fori_loop pipelines it) would emit
-    # ``out[...] = value`` against an HBM ref, which TPU rejects — HBM refs
-    # only support DMA, not direct indexed writes.  This is the case 3/4
-    # "user wrote acc at tile_b scope" path that needs ``make_async_copy``
-    # emitted at tile_b's epilogue.  None of the V1 jagged kernels reach
-    # this; raise loudly until that lift work is implemented (tracked by
-    # the case 3/4 tile_b epilogue follow-up task).
+    # HBM refs reject indexed writes; only DMA.  Raise rather than emit
+    # a write that the TPU will reject at runtime.
     from .._compiler.device_function import PallasMemorySpace
 
     mem_space = state.device_function.pallas_memory_space.get(id(tensor))
     if mem_space == PallasMemorySpace.HBM and name == hbm_name:
         raise NotImplementedError(
-            "Pallas: store of HBM-marked tensor at root scope (case 3/4 of "
-            "the jagged DMA-out promotion table) is not implemented — "
-            "no V1 jagged kernel hits this. The proper fix is to emit "
-            "``pltpu.make_async_copy(out_scratch, hbm_ref.at[...])`` at "
-            "tile_b's epilogue; the bare ``name[idx] = value`` we'd emit "
-            "here writes directly to an HBM ref, which the TPU rejects."
+            "Pallas: direct store to HBM-marked tensor is not supported; "
+            "DMA emission via tile_b epilogue is required."
         )
     # Increment memory op index to stay in sync with triton backend
     device_fn = state.device_function
@@ -383,15 +361,6 @@ def _(state: CodegenState) -> None:
         value = emit_scatter_store(
             state, scatter_patterns[0].plan, name, idx_str, value
         )
-    # Apply mask for any subscript dim whose tile has a ``mask_<bid>`` in
-    # scope — TilePattern handles jagged_tile lane/sublane (V1: jagged_mean
-    # M-axis), TensorIndexPattern.is_jagged_flat handles the canonical
-    # jagged-flat subscript (V1: jagged_softmax/jagged_layer_norm output).
-    # Mirrors the load-side ``_mask_to`` mechanism: pull masks per dim,
-    # combine multiplicatively, wrap the store as
-    # ``where(mask, value, name[idx])`` so out-of-tile positions preserve
-    # whatever is currently in the VMEM scratch.  Falls through silently
-    # when no masks are in scope (non-jagged path).
     if isinstance(value_proxy, torch.Tensor):
         from .._compiler.compile_environment import CompileEnvironment
 
@@ -401,18 +370,11 @@ def _(state: CodegenState) -> None:
             if isinstance(p, TensorIndexPattern) and p.is_jagged_flat:
                 jagged_flat_pattern = p
                 break
-        # Mask application uses the FX-level value shape (matches the
-        # ``flat`` index tensor's rank for jagged-flat stores).  For
-        # jagged-flat that's 3-D ``(BB=1, BK, BM)``; for TilePattern
-        # subscripts it's the tile shape.  After masking we squeeze the
-        # leading BB dim off jagged-flat values so they fit the 2-D
-        # ``(BK, BM)`` VMEM scratch shape produced by
-        # ``_compute_vmem_shapes``.
+        # Jagged-flat value is 3-D (BB=1, BK, BM); the leading BB dim is
+        # squeezed below to fit the 2-D (BK, BM) VMEM scratch.
         value_sizes = [*value_proxy.size()]
         mask_exprs: list[str] = []
         if jagged_flat_pattern is not None:
-            # Apply masks for sublane/lane bids — the jagged-flat
-            # pattern's single subscript element represents both axes.
             for axis_bid in (
                 jagged_flat_pattern.sublane_bid,
                 jagged_flat_pattern.lane_bid,
@@ -428,23 +390,15 @@ def _(state: CodegenState) -> None:
                         mask_shape, value_sizes
                     )
                 else:
-                    # Bare TilePattern-style expand based on the axis position
-                    # in value_sizes (jagged-flat output is BB, BK, BM —
-                    # sublane at 1, lane at 2).
                     axis_pos = 1 if axis_bid == jagged_flat_pattern.sublane_bid else 2
                     expand = state.tile_strategy.expand_str(value_sizes, axis_pos)
                 expr = f"({mask_var}.astype(jnp.float32){expand})"
                 if expr not in mask_exprs:
                     mask_exprs.append(expr)
         else:
-            # Only fire the store mask for jagged tiles.  For non-jagged
-            # cases ``_setup_mask`` also emits ``mask_<bid>`` when block_size
-            # doesn't divide dim_size, but ``sliced_value_for_store`` has
-            # already clipped the value to dim_size in that path — re-masking
-            # would broadcast a (block_size,) mask against a (dim_size,)
-            # value and break.  The non-jagged unaligned case is handled by
-            # host-side padding (``_ds_pad_dims``) + host-side truncation, so
-            # the kernel never needs to mask.
+            # Mask only jagged tiles; non-jagged unaligned cases are
+            # already handled by ``sliced_value_for_store`` host-pad +
+            # host-trunc, and re-masking would broadcast-mismatch.
             out_dim = 0
             for idx, pattern in zip(subscript, patterns or (), strict=False):
                 if idx is None:
@@ -477,8 +431,6 @@ def _(state: CodegenState) -> None:
                     f"{name}[{idx_str}])",
                     value=value,
                 )
-        # Squeeze the leading BB=1 dim off the 3-D jagged-flat value so it
-        # writes cleanly into the 2-D ``(BK, BM)`` VMEM scratch.
         if jagged_flat_pattern is not None and value_proxy.dim() >= 3:
             value = expr_from_string("jnp.squeeze({value}, axis=0)", value=value)
     state.codegen.add_statement(
@@ -6731,29 +6683,11 @@ def _(state: CodegenState) -> object:
 
 @_decorators.get_masked_value(load)
 def _(node: torch.fx.Node) -> int | None:
-    # Triton-style loads zero-mask OOB by default (``tl.load`` returns 0 for
-    # masked positions), so ``_mask_to(load, 0)`` is redundant and gets
-    # removed by ``remove_unnecessary_masking``.
-    #
-    # On the Pallas backend, jagged-flat loads (``hl.load(x_flat, [flat])``
-    # where the subscript matches ``(starts + tile_k.idx) * M + tile_m.idx``)
-    # DO NOT have implicit masking — they DMA HBM→VMEM and the VMEM scratch
-    # contains whatever bytes the (possibly OOB) DMA copied.  Returning
-    # ``None`` keeps the ``_mask_to`` node alive so the reduction's mask
-    # actually fires.  Once preserved, the Pallas ``_mask_to`` codegen is
-    # already dim-agnostic — it walks each tensor dim, resolves it to a
-    # block_id, and applies whichever ``mask_<bid>`` is in scope.  Both
-    # K-jagged (mask_<tile_k.bid>) and M-jagged (mask_<tile_m.bid>) get
-    # picked up by the same loop; this gate only decides whether to keep
-    # the node alive long enough for that to run.
-    #
-    # ``remove_unnecessary_masking`` runs before plan_tiling, so we can't
-    # inspect ``node.meta["indexing_patterns"]`` for ``is_jagged_flat``.
-    # Conservative test: Pallas backend + tensor-valued subscript +
-    # kernel has any registered jagged_tile.  This is over-conservative
-    # for ``IndirectGatherPattern`` loads in jagged kernels, but those
-    # lower to a one-hot dot product that zeros OOB rows anyway, so the
-    # surviving ``_mask_to(*, 0)`` is a no-op there.
+    # Pallas jagged-flat loads have no implicit OOB masking (DMA copies
+    # whatever bytes), so return None to keep _mask_to alive for the
+    # reduction.  Detection runs before plan_tiling so we can't read
+    # ``indexing_patterns``; conservative test: pallas + tensor-valued
+    # subscript + any registered jagged_tile.
     from .._compiler.compile_environment import CompileEnvironment
 
     env = CompileEnvironment.current()

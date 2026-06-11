@@ -1831,14 +1831,9 @@ class PallasBackend(Backend):
                 self.backend = backend
                 self.required_alignments: dict[int, int] = {}
                 # Smallest static tensor dim observed via ``t[..., tile, ...]``.
-                # ``hl.tile(M)``'s ``spec.size_hint`` already equals M so the
-                # alignment cap reads small-lane cases correctly there.
-                # ``hl.jagged_tile(parent)`` defaults ``size_hint=8192``
-                # (numel=None — data-dependent bound), so the cap can't use
-                # ``spec.size_hint`` as a stand-in for the indexed tensor dim.
-                # Recording the observed dim here lets the cap step honor
-                # small-lane cases for jagged tiles too (e.g. ``out[tile_b,
-                # tile_m]`` in jagged_mean where ``out.shape[1] == max_M``).
+                # Needed because ``hl.jagged_tile`` defaults ``size_hint=8192``
+                # (data-dependent numel), so the cap step can't use size_hint
+                # as a stand-in for the indexed tensor dim.
                 self.observed_dim_sizes: dict[int, int] = {}
                 self.update_requirements_from_fake_tensor_loads()
 
@@ -1959,9 +1954,8 @@ class PallasBackend(Backend):
                         # https://github.com/jax-ml/jax/issues/36970
                         analyzer.maybe_update_required_alignment(bid, 2)
 
-        # Jagged_tile parents are pinned to block_size=1 at trace time
-        # (each program owns one item; see loops.py jagged_tile registration).
-        # Alignment propagation must not raise their minimums.
+        # Jagged_tile parents are pinned to block_size=1 (one program per
+        # item); alignment propagation must not raise their minimums.
         from .compile_environment import CompileEnvironment as _CompileEnvironment
 
         _env_for_jagged = _CompileEnvironment.current()
@@ -2521,9 +2515,7 @@ class PallasBackend(Backend):
                         f"_pipeline_arg_indices={pipeline_arg_indices!r}"
                     )
 
-                # Jagged-flat tensors are passed as 1-D from the host but
-                # the kernel's DMA slice treats them as 2-D ``(total_K, M)``.
-                # Emit (arg_idx, lane_size) pairs for the runtime reshape.
+                # Host-side 1-D, kernel-side 2-D ``(total_K, M)``.
                 jagged_lane_sizes = device_fn.pallas_jagged_flat_lane_size
                 if jagged_lane_sizes:
                     reshape_2d_indices = [

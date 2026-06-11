@@ -1957,11 +1957,8 @@ def _compute_vmem_shapes(
     """Compute VMEM buffer shapes for each tensor in the fori_loop body."""
     vmem_shapes: list[tuple[int, ...]] = []
     for fake, sub_meta, _direction in all_tensor_info:
-        # Jagged-flat tensors are 1-D at the FX level (user wrote
-        # ``x_data.view(-1)``), but the launcher reshapes them to 2-D
-        # ``(total_K, M)`` before pl.pallas_call, and the per-iter DMA
-        # chunk is the (BK, BM) sublane×lane block — not the whole 1-D
-        # tensor that ``_get_dim_block_ids`` would default to.
+        # Jagged-flat: 1-D at FX, but launcher reshapes to 2-D (total_K, M)
+        # and the per-iter DMA chunk is (BK, BM).
         jpat = (jagged_flat_patterns or {}).get(id(fake))
         if jpat is not None:
             sublane_bs = state.device_function.resolved_block_size(jpat.sublane_bid)
@@ -2248,10 +2245,8 @@ def _codegen_fori_loop(state: CodegenState) -> object:
         fake: torch.Tensor, hbm_name: str, subscript_meta: list[object]
     ) -> str:
         """Build an HBM ref slicing expression for DMA with loop variable."""
-        # Jagged-flat tensors: the host launcher reshapes the 1-D ``x_flat``
-        # to 2-D ``(total_K, M)``, and we emit a 2-D slice that injects the
-        # per-item base ``starts[pid_0]`` into the sublane (K) offset:
-        #   x_flat.at[pl.ds(starts[0] + k_offset, BK), pl.ds(m_offset, BM)]
+        # Jagged-flat: emit 2-D slice
+        # ``x_flat.at[pl.ds(starts[0] + k_offset, BK), pl.ds(m_offset, BM)]``.
         jpat = jagged_flat_patterns.get(id(fake))
         if jpat is not None:
             slice_parts: list[str] = []
@@ -2269,11 +2264,8 @@ def _codegen_fori_loop(state: CodegenState) -> object:
                 else:
                     axis_offset = state.codegen.offset_var(axis_bid)
                 if axis_bid == jpat.sublane_bid:
-                    # Resolve sublane_base_fx (an inner-graph placeholder)
-                    # back to its outer-scope emit-time name.  The body
-                    # graph's placeholders correspond positionally to the
-                    # outer for_loop's args[3], whose AST is in
-                    # ``state.ast_args[-1]`` (= ``args`` here).
+                    # Resolve the inner-graph placeholder back to its
+                    # outer-scope emit-time name via positional match.
                     placeholders = [
                         n for n in graph_info.graph.nodes if n.op == "placeholder"
                     ]
@@ -2284,17 +2276,10 @@ def _codegen_fori_loop(state: CodegenState) -> object:
                         starts_name = jpat.sublane_base_fx.name
                     axis_offset = f"{starts_name}[0] + ({axis_offset})"
                 slice_parts.append(f"pl.ds({axis_offset}, {bs_var})")
-            # Record host-pad info for the jagged-flat tensor.  The DMA reads
-            # ``(BK, BM)`` sublanes per fori iter starting at ``starts[i] +
-            # k*BK``; the last tile_k iter for a row whose nnz isn't a
-            # multiple of BK reads up to ``BK-1`` sublanes beyond the row's
-            # valid data.  Without sublane padding, a row near the end of
-            # ``x_flat`` (sum of all rows' nnz close to total_K) lets this
-            # over-read cross the buffer boundary and fault the TPU.  The
-            # compute mask (``offset_k < nnz``) already zeros the trailing
-            # garbage, so padding to zero is sufficient.  Matches the
-            # non-jagged ``_loop_begin_extra_pad`` policy for data-dependent
-            # begins (returns ``block_size - 1``).
+            # Sublane DMA over-reads by up to ``BK-1`` past the row's valid
+            # data on the last tile_k iter; without host pad, a near-tail
+            # row can read past ``x_flat`` end and fault the TPU.  The
+            # compute mask zeros the over-read so pad-to-0 is sufficient.
             from .memory_ops import _record_pad_info
 
             sublane_bs = state.device_function.resolved_block_size(jpat.sublane_bid)
@@ -2947,10 +2932,8 @@ def _(state: CodegenState) -> ast.AST:
             mask_var := state.codegen.mask_var(index)
         ) is not None:
             expand = state.tile_strategy.expand_str(input_sizes, dim)
-            # Jagged-tile masks come out 2-D ``(parent_dims, block_size)``;
-            # the default ``expand_str`` assumes 1-D and yields the wrong
-            # rank.  Mirror the Triton handler above and use the jagged
-            # path's mask shape to compute the right transform.
+            # Jagged-tile masks are 2-D (parent_dims, block_size); the
+            # default expand_str assumes 1-D.
             if env.is_jagged_tile(index):
                 mask_shape = env.jagged_tile_mask_shapes[index]
                 expand = state.tile_strategy.jagged_tile_expand_str(

@@ -974,10 +974,7 @@ class GenerateAST(NodeVisitor, CodegenInterface):
                                 )
                             self.statements_stack[-1].extend(grid_state.outer_suffix)
                         elif isinstance(self.device_function.pid, JaggedProgramIDs):
-                            # Wrap the tile-loop prologue (offset/index/mask
-                            # statements emitted into ``body`` by
-                            # ``codegen_grid``) together with the user-code
-                            # ``wrapped_body`` inside a jax.lax.fori_loop.
+                            # Wrap prologue + user body inside jax.lax.fori_loop.
                             prologue = list(self.statements_stack[-1])
                             self.statements_stack[-1].clear()
                             full_body = prologue + wrapped_body

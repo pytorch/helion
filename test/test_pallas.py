@@ -4129,8 +4129,6 @@ class TestPallas(TestCase):
         x_offsets = torch.tensor([0, 3, 8, 10, 14], dtype=torch.int32)
         x_data = torch.randn(14, 8, dtype=torch.float32)
         spec = k.bind((x_data, x_offsets)).config_spec
-        # tile_b is the items axis (parent of the jagged tile_k). On Pallas
-        # it must be pinned to exactly 1.
         parent_spec = spec.block_sizes[0]
         self.assertEqual(parent_spec.min_size, 1)
         self.assertEqual(parent_spec.max_size, 1)
@@ -4147,8 +4145,7 @@ class TestPallas(TestCase):
             num_rows = x_offsets.size(0) - 1
             out = torch.zeros([num_rows, M], dtype=x_data.dtype, device=x_data.device)
             x_flat = x_data.view(-1)
-            # bfloat16 lane → 256-element alignment requirement on Pallas;
-            # without our skip, tile_b's min would be raised above 1.
+            # bfloat16 lane → 256-element alignment; pin must survive it.
             for tile_b in hl.tile(num_rows):
                 starts = x_offsets[tile_b]
                 ends = x_offsets[tile_b.index + 1]
@@ -4183,9 +4180,6 @@ class TestPallas(TestCase):
 
         args = (torch.randn([1024], device=DEVICE, dtype=torch.float32),)
         spec = k.bind(args).config_spec
-        # The outer tile is the only block in this kernel — its max should
-        # be much larger than 1 (the autotuner gets to pick from the full
-        # power-of-2 range bounded by the tensor size).
         self.assertGreater(spec.block_sizes[0].max_size, 1)
 
     def test_jagged_kernel_emits_grid_1_and_fori_loop_wrapper(self) -> None:
@@ -4219,28 +4213,15 @@ class TestPallas(TestCase):
         bound = k.bind((x_data, x_offsets))
         code = bound.to_triton_code(bound.config_spec.default_config())
 
-        # grid collapses to (1,): the single Pallas program iterates items
-        # inside via fori_loop.  The launcher receives grid as its second
-        # positional arg, so check the call site shape.
         self.assertRegex(code, r"_launcher\(\s*_helion_\w+\s*,\s*\(1,\)")
-        # The body is wrapped in a fori_loop whose body fn declares pid_0
-        # as the iteration variable.
         self.assertRegex(code, r"def\s+_kernel_body\w*\s*\(\s*pid_0\s*,\s*_\s*\)\s*:")
         self.assertRegex(
             code, r"jax\.lax\.fori_loop\s*\(\s*0\s*,.+_kernel_body\w*\s*,\s*None\s*\)"
         )
-        # No ``pl.program_id(0)`` at the top of the body — pid_0 must come
-        # from the fori_loop body fn parameter, not the host launcher.
         self.assertNotRegex(code, r"pid_0\s*=\s*pl\.program_id\s*\(\s*0\s*\)")
-        # The jagged-flat tensor (x_flat) AND the output tensor (out) must
-        # both be marked HBM: x_flat because it's larger than VMEM; out
-        # because the whole-tensor VMEM BlockSpec would OOM at realistic
-        # output sizes.  Arg order is (x_offsets, x_flat, out) → x_flat at
-        # position 1, out at position 2.
+        # x_flat at arg position 1, out at position 2 (both HBM).
         self.assertRegex(code, r"_pipeline_arg_indices=\[\s*1\s*,\s*2\s*\]")
-        # x_offsets must live in SMEM so dynamic ``x_offsets[pl.ds(pid_0, 1)]``
-        # reads from inside the @pl.loop body don't hit VMEM sublane/lane
-        # alignment.  It's at launcher position 0.
+        # x_offsets at arg position 0 (SMEM).
         self.assertRegex(code, r"_smem_arg_indices=\[\s*0\s*\]")
 
     def test_parse_flat_jagged_subscript_canonical(self) -> None:
@@ -4271,8 +4252,6 @@ class TestPallas(TestCase):
             jagged_tile_parent_ids={7: [3]},
         )
 
-        # Build: add(unsqueeze(mul(unsqueeze(add(starts, k_idx), -1), 64), 0),
-        #            unsqueeze(unsqueeze(m_idx, 0), 0))
         g = Graph()
         starts = g.placeholder("starts")
         k_idx = g.placeholder("tile_k_idx")
@@ -4325,7 +4304,6 @@ class TestPallas(TestCase):
             jagged_tile_parent_ids={7: [3]},
         )
 
-        # add(k_idx, m_idx) — no mul, no starts; should not match.
         g = Graph()
         k_idx = g.placeholder("tile_k_idx")
         k_idx.meta["val"] = k_sym
@@ -4343,7 +4321,6 @@ class TestPallas(TestCase):
         1-D flat-form jagged subscript)."""
         from helion._compiler.pallas.plan_tiling import TensorIndexPattern
 
-        # Default: non-jagged, the existing gather path consumes this.
         plain = TensorIndexPattern()
         self.assertFalse(plain.is_jagged_flat)
         self.assertIsNone(plain.sublane_bid)
@@ -4351,8 +4328,6 @@ class TestPallas(TestCase):
         self.assertIsNone(plain.lane_bid)
         self.assertIsNone(plain.lane_size)
 
-        # Jagged-flat: emit reads these to drive the DMA slice; launcher
-        # reads ``lane_size`` to reshape x_flat back to 2-D.
         jagged = TensorIndexPattern(
             is_jagged_flat=True,
             sublane_bid=7,
@@ -4449,15 +4424,12 @@ class TestPallas(TestCase):
         out_get = g.call_function(operator.getitem, args=(loop, 0))
         g.call_function(_phi, args=(acc, out_get))
 
-        # Build a store node whose value (args[2]) is the loop's final-carry.
-
         def _store_marker(*args: object) -> None:
             return None
 
         tensor_ph = g.placeholder("tensor")
         store_node = g.call_function(_store_marker, args=(tensor_ph, [], out_get, None))
 
-        # graph_id 0 → block_ids [7] (k_sym's bid).
         self.assertEqual(store_is_post_reduction(store_node, env, {0: [7]}), {7})
 
     def test_store_is_post_reduction_inline_value_returns_empty(self) -> None:
