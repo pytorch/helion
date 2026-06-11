@@ -253,6 +253,17 @@ def measure(name: str) -> contextlib.AbstractContextManager[None]:
     return _MeasureContext(name, get_tracker())
 
 
+def is_enabled() -> bool:
+    """Whether compile-time measurement is active.
+
+    Lets hot paths skip even entering a (disabled) ``measure()`` context
+    manager — the ``with`` protocol alone costs ~115ns/call, which is
+    significant on the per-call kernel dispatch path. ``enable()`` flips
+    this at runtime, so read it fresh rather than caching.
+    """
+    return _enabled
+
+
 def enable() -> None:
     """Enable compile-time measurement after this module has been imported."""
     global _enabled
