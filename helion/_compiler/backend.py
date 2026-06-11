@@ -955,6 +955,22 @@ class TritonBackend(Backend):
     def experimental(self) -> bool:
         return False
 
+    def transform_host_arg(
+        self,
+        arg: Argument,
+        host_str: str,
+        tensor_host_args: list[str],
+    ) -> str:
+        from .device_function import TensorArg
+
+        # Bind fp4x2 storage as uint8; Triton has no pointer type for the shell dtype.
+        if (
+            isinstance(arg, TensorArg)
+            and arg.fake_value.dtype is torch.float4_e2m1fn_x2
+        ):
+            return f"{host_str}.view(torch.uint8)"
+        return host_str
+
     def supports_config_key(self, key: str) -> bool:
         if key == "load_cache_modifiers":
             return True
