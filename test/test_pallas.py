@@ -7,6 +7,8 @@ from typing import Any
 from typing import Callable
 import unittest
 
+from examples.geglu import _geglu_pallas as _geglu_pallas_example
+from examples.swiglu import _swiglu_fwd_pallas as _swiglu_fwd_pallas_example
 import torch
 from torch.testing._internal.common_utils import instantiate_parametrized_tests
 from torch.testing._internal.common_utils import parametrize
@@ -26,6 +28,15 @@ import helion.language as hl
 if TYPE_CHECKING:
     from helion.autotuner.base_search import PopulationBasedSearch
     from helion.autotuner.base_search import PopulationMember
+
+# N-D-tiled Pallas geglu/swiglu (#2725), re-wrapped on the pallas backend so the
+# example kernels get real correctness coverage under pallas interpret / TPU CI.
+_geglu_pallas = helion.kernel(
+    _geglu_pallas_example.fn, backend="pallas", static_shapes=True
+)
+_swiglu_fwd_pallas = helion.kernel(
+    _swiglu_fwd_pallas_example.fn, backend="pallas", static_shapes=True
+)
 
 
 @helion.kernel(backend="pallas", static_shapes=True)
@@ -696,6 +707,22 @@ class TestPallas(TestCase):
         args = (torch.randn(4096, device=DEVICE), torch.randn(4096, device=DEVICE))
         code, result = code_and_output(add_kernel, args, block_size=512)
         torch.testing.assert_close(result, args[0] + args[1])
+
+    def test_geglu_pallas_nd(self) -> None:
+        # N-D-tiled GEGLU (#2725): correctness on the pallas backend.
+        a = torch.randn(64, 128, device=DEVICE, dtype=torch.float32)
+        b = torch.randn(64, 128, device=DEVICE, dtype=torch.float32)
+        code, result = code_and_output(_geglu_pallas, (a, b), block_sizes=[16, 32])
+        expected = torch.nn.functional.gelu(a, approximate="tanh") * b
+        torch.testing.assert_close(result, expected, rtol=1e-3, atol=1e-3)
+
+    def test_swiglu_pallas_nd(self) -> None:
+        # N-D-tiled SwiGLU (#2725): correctness on the pallas backend.
+        a = torch.randn(64, 128, device=DEVICE, dtype=torch.float32)
+        b = torch.randn(64, 128, device=DEVICE, dtype=torch.float32)
+        code, result = code_and_output(_swiglu_fwd_pallas, (a, b), block_sizes=[16, 32])
+        expected = torch.nn.functional.silu(a) * b
+        torch.testing.assert_close(result, expected, rtol=1e-3, atol=1e-3)
 
     def test_store_slice_1d(self) -> None:
         """Store value sliced when block_size > tensor dim (1D)."""
