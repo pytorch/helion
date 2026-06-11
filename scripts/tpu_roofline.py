@@ -784,7 +784,9 @@ def predict(
         lane_pct.append((name, cap, busy, pct))
 
     # Identify binding lane (highest occupancy among non-memory lanes)
-    binding_lane = max(lane_pct, key=operator.itemgetter(3))[0]
+    binding_entry = max(lane_pct, key=operator.itemgetter(3))
+    binding_lane = binding_entry[0]
+    binding_util = binding_entry[3]
 
     # Compute floor — bundle count × clock period, with per-lane realization
     # adjustments. Real hardware delivers only `realization` × theoretical
@@ -972,6 +974,7 @@ def predict(
         "regime": regime,
         "dependency_bound": dependency_bound,
         "binding_lane": binding_lane,
+        "binding_util": binding_util,
         "lane_pct": lane_pct,
         "mxu_busy": mxu_busy,
         "realized_mxu_tflops": realized_mxu_tflops,
@@ -1277,6 +1280,35 @@ def main() -> None:
         )
 
     r = predict(stats, bytes_moved, cycle_accurate_instrs=cycle_accurate_instrs)
+
+    # Fail-loud guard: refuse when the binding lane is SALU (scalar / loop
+    # control). The roofline models compute-lane and memory THROUGHPUT; when
+    # the busiest resource is scalar control, the kernel is control- or
+    # latency-bound (loop overhead, un-hidden DMA round-trips) and the
+    # throughput floor systematically under-predicts. Empirically (llo/ corpus,
+    # 2026-06): every SALU-bound kernel ran ≥85% under-predicted (bmm, exp, and
+    # the dependency-bound microbenchmark), while NO accurately-predicted kernel
+    # binds SALU — so this is a clean, false-positive-free refusal. The
+    # throughput floor is still a valid LOWER bound (the unmodeled control /
+    # latency cost only adds time), so --lower-bound bypasses the guard.
+    if r["binding_lane"] == "SALU" and not args.lower_bound:
+        print(
+            "\n╔══════════════════════════════════════════════════════════╗\n"
+            "║  REFUSING TO PREDICT — SALU (control/latency) bound      ║\n"
+            "╚══════════════════════════════════════════════════════════╝\n"
+            f"Reason: the binding lane is SALU at {r['binding_util']:.1f}% — the "
+            "busiest resource is scalar/loop control, not a compute lane. This "
+            "kernel is control- or latency-bound (loop overhead, un-hidden DMA "
+            "round-trips), a regime the throughput roofline does not model; it "
+            "will under-predict, often by many ×.\n\n"
+            "Options:\n"
+            "  1. Pass --lower-bound to report the throughput floor anyway as a "
+            "strict LOWER bound (true runtime is at least this).\n"
+            "  2. Restructure the kernel so a compute or memory lane binds "
+            "(larger tiles, fewer/longer loop iterations) and re-dump.\n",
+            file=sys.stderr,
+        )
+        sys.exit(2)
 
     print("\n=== LLO stats ===")
     print(f"Static bundles:   {stats.static_bundles:,}")
