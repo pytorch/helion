@@ -324,6 +324,64 @@ class TestBestAvailable(unittest.TestCase):
         roundtripped = config_gen.flatten(config)
         self.assertEqual(roundtripped, default_flat)
 
+    def test_flatten_persistent_reduction_loop_roundtrip_large_rnumel(self):
+        """Persistent (None) must round-trip through flatten/unflatten for
+        rnumel>4096, not just <=4096.
+
+        Regression guard: the encode sentinel must be the fragment max (``.high`` ==
+        next_power_of_2(size_hint)), which decodes back to None for every size_hint.
+        The fragment default is capped at max_reduction_loop (4096), which is <
+        size_hint for rnumel>4096 and would degrade [None] to a looped chunk. The
+        <=4096 cases guard that the fix keeps the already-working path.
+        """
+        # rnumel>4096: the broken cases (encode default capped at 4096 < hint).
+        for size_hint in (8192, 65536, 262144):
+            config_spec = ConfigSpec(backend=TritonBackend())
+            config_spec.block_sizes.append(
+                BlockSizeSpec(block_id=0, size_hint=64, min_size=16, max_size=256)
+            )
+            config_spec.reduction_loops.append(
+                ReductionLoopSpec(block_id=1, size_hint=size_hint)
+            )
+            config_gen = ConfigGeneration(config_spec)
+
+            config = config_spec.default_config()
+            config.config["reduction_loops"] = [None]  # persistent
+            config_spec.normalize(config.config)
+
+            flat = config_gen.flatten(config)
+            restored = config_gen.unflatten(flat)
+            self.assertEqual(
+                restored.config["reduction_loops"],
+                [None],
+                f"persistent must round-trip for rnumel={size_hint} "
+                f"(got {restored.config['reduction_loops']})",
+            )
+            # flatten/unflatten is idempotent at the flat level too.
+            self.assertEqual(config_gen.flatten(restored), flat)
+
+        # rnumel<=4096: guard that the fix keeps the already-working path.
+        for size_hint in (256, 4096):
+            config_spec = ConfigSpec(backend=TritonBackend())
+            config_spec.block_sizes.append(
+                BlockSizeSpec(block_id=0, size_hint=64, min_size=16, max_size=256)
+            )
+            config_spec.reduction_loops.append(
+                ReductionLoopSpec(block_id=1, size_hint=size_hint)
+            )
+            config_gen = ConfigGeneration(config_spec)
+
+            config = config_spec.default_config()
+            config.config["reduction_loops"] = [None]
+            config_spec.normalize(config.config)
+
+            restored = config_gen.unflatten(config_gen.flatten(config))
+            self.assertEqual(
+                restored.config["reduction_loops"],
+                [None],
+                f"persistent must still round-trip for rnumel={size_hint}",
+            )
+
 
 class TestCacheMatching(unittest.TestCase):
     """Tests for cache file matching in warm start."""
