@@ -2829,41 +2829,19 @@ def _codegen_cute_store_tcgen05_tile(
         aux_pipeline_uses_tma_load = False
         aux_ring_smem_names = tuple(None for _ in aux_step_records)
 
-    # Row-vector register hoist (fp8 only). A rowvec aux (``bias[n]`` /
-    # rowwise ``scale_b[n]``) varies across each thread's N (vectorized
-    # epilogue) fragment, so the default per-subtile GMEM ``.load()`` issued
-    # AFTER the accumulator ``consumer_wait`` exposes its latency. CUTLASS's
-    # ``epilogue_tma_store_scaled`` instead reads the whole rowvec into
-    # registers ONCE (``cute.autovec_copy(tTR_gSB, tTR_rSB_full)``) BEFORE the
-    # acc wait so its latency overlaps the MMA. Mirror that here: hoist the
-    # per-tile rowvec LDG into a register tensor in the setup block (which
-    # runs before the subtile loop, hence before the acc wait), then read it
-    # per subtile from registers. fp8-gated because fp8 GEMMs are
-    # latency-bound at these compute-bound shapes (bf16's larger operands hide
-    # the load already, and the cycle-39/74 ablations found no bf16 win); the
-    # rowvec register tensor is small (1-D broadcast) so no spill risk. SMEM
-    # staging (``use_aux_smem_source``) owns its own ring, so skip there.
-    _ab_tma_plans_for_hoist = [
-        plan
-        for plan in state.codegen.cute_wrapper_plans
-        if plan.get("kind") == "tcgen05_ab_tma"
-    ]
-    aux_input_is_fp8 = (
-        len(_ab_tma_plans_for_hoist) == 1
-        and str(_ab_tma_plans_for_hoist[0].get("input_dtype")) == "cutlass.Float8E4M3FN"
-    )
-    aux_hoisted_vars: list[str | None] = []
-    for aux_idx, rec in enumerate(aux_step_records):
-        if (
-            aux_input_is_fp8
-            and rec.broadcast_axis == 1
-            and tcgen05_aux_use_tma_store_epilogue
-            and not use_aux_smem_source
-        ):
-            aux_hoisted_vars.append(df.new_var(f"tcgen05_aux_hoisted_{aux_idx}"))
-        else:
-            aux_hoisted_vars.append(None)
-
+    # Row-vector aux (``bias[n]`` / rowwise ``scale_b[n]``) reads stay
+    # per-subtile (the generic ``ttr_aux_subtile.load()`` path below, placed
+    # after the c_pipeline acquire / acc ``consumer_wait`` / T2R prefix per the
+    # cycle-69 placement). An earlier fp8-gated variant hoisted the WHOLE
+    # tile's rowvec fragment into a register tensor in the per-tile setup
+    # (mirroring CUTLASS's ``tTR_rSB_full`` whole-tile ``autovec_copy``) so the
+    # LDG latency overlapped the MMA. At ``bk=128`` that fragment — all
+    # subtiles' fp32 values live across the entire subtile loop on top of the
+    # accumulator and TMA-store state — pushed epilogue warps to the 255-reg
+    # cap and 409k dynamic LDL/STL local-memory spills (~10% kernel time:
+    # 57.8us vs 52.9us; 1915 vs 2105 TFLOP/s at 4096^3 fp8 scaled_mm). At
+    # ``bk=64`` the hoist measured neutral (1711 vs 1712 TFLOP/s). Per-subtile
+    # loads spill zero on both, so the hoist machinery was removed.
     rowvec_aux_stage_records: list[_RowvecAuxStageRecord | None] = []
     for aux_idx, rec in enumerate(aux_step_records):
         copy_bits = 128
@@ -3238,20 +3216,6 @@ def _codegen_cute_store_tcgen05_tile(
                     ),
                 ]
             )
-            hoisted = aux_hoisted_vars[aux_idx]
-            if hoisted is not None:
-                # Issue the whole-tile rowvec GMEM read into registers here
-                # (per-output-tile setup, before the subtile loop / acc wait)
-                # so its latency overlaps the MMA. See ``aux_hoisted_vars``.
-                lines.extend(
-                    [
-                        (
-                            f"{hoisted} = cute.make_rmem_tensor("
-                            f"{rec.ttr_aux_grouped}.shape, {rec.aux_dtype})"
-                        ),
-                        f"cute.autovec_copy({rec.ttr_aux_grouped}, {hoisted})",
-                    ]
-                )
         return lines
 
     def _aux_subtile_load_source(
@@ -3459,17 +3423,6 @@ def _codegen_cute_store_tcgen05_tile(
                     f"cute.filter_zeros({rec.ttr_aux_subtile}), "
                     f"cute.filter_zeros({rec.aux_rmem}))\n"
                     f"{prelude_indent}{rec.aux_loaded} = {rec.aux_rmem}.load()\n"
-                )
-                continue
-            hoisted = aux_hoisted_vars[aux_idx]
-            if hoisted is not None:
-                # Read the per-subtile slice from the register tensor the
-                # per-tile setup already loaded (latency overlapped the MMA),
-                # instead of issuing a fresh per-subtile GMEM ``.load()``.
-                lines.append(
-                    f"{prelude_indent}{rec.aux_loaded} = "
-                    f"{hoisted}[(None, None, None, "
-                    f"cutlass.Int32(_tcgen05_subtile))].load()\n"
                 )
                 continue
             if rec.broadcast_axis == 2:
