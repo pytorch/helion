@@ -35,20 +35,25 @@ cutlass: Any
 cute: Any
 dsl_user_op: Any
 
-try:
-    import cutlass
-    from cutlass import Int32
-    from cutlass._mlir.dialects import llvm
-    import cutlass.cute as cute
-    from cutlass.cute.arch.nvvm_wrappers import _normalize_ptr
-    from cutlass.cute.typing import Float32
-    from cutlass.cute.typing import Pointer as CutePointer
-    from cutlass.cute.typing import Tensor as CuteTensor
-    from cutlass.cutlass_dsl import T
-    from cutlass.cutlass_dsl import dsl_user_op
-except ModuleNotFoundError as e:
-    if e.name is None or not e.name.startswith("cutlass"):
-        raise
+if _get_backend() == "cute":
+    try:
+        import cutlass
+        from cutlass import Int32
+        from cutlass._mlir.dialects import llvm
+        import cutlass.cute as cute
+        from cutlass.cute.arch.nvvm_wrappers import _normalize_ptr
+        from cutlass.cute.typing import Float32
+        from cutlass.cute.typing import Pointer as CutePointer
+        from cutlass.cute.typing import Tensor as CuteTensor
+        from cutlass.cutlass_dsl import T
+        from cutlass.cutlass_dsl import dsl_user_op
+    except ModuleNotFoundError as e:
+        if e.name is None or not e.name.startswith("cutlass"):
+            raise
+        cutlass = cast("Any", None)
+        cute = cast("Any", None)
+        dsl_user_op = cast("Any", None)
+else:
     cutlass = cast("Any", None)
     cute = cast("Any", None)
     dsl_user_op = cast("Any", None)
