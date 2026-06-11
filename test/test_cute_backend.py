@@ -634,6 +634,23 @@ def cute_permute_store_then_read(x: torch.Tensor) -> torch.Tensor:
     return out
 
 
+@helion.kernel(backend="cute")
+def cute_reduction_with_nested_tiles(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+    """RMS-norm-backward-shaped kernel: a `.mean(-1)` reduction plus nested
+    non-reduction M tiling (register_block_size + inner hl.tile)."""
+    m, n = x.size()
+    out = torch.empty_like(x)
+    block_m = hl.register_block_size(m)
+    for tile_cta in hl.tile(m, block_size=block_m):
+        for tile_m in hl.tile(tile_cta.begin, tile_cta.end):
+            row = x[tile_m, :].to(torch.float32)
+            mean_sq = (row * row).mean(-1)
+            out[tile_m, :] = (
+                row * torch.rsqrt(mean_sq[:, None] + 1e-6) * w[None, :]
+            ).to(x.dtype)
+    return out
+
+
 @onlyBackends(["cute"])
 class TestCuteBackend(TestCase):
     def test_pointwise_add(self) -> None:
@@ -644,6 +661,29 @@ class TestCuteBackend(TestCase):
         code, out = code_and_output(cute_add, args)
         x, y = args
         torch.testing.assert_close(out, x + y)
+
+    def test_reduction_with_nested_tiles_registers_vec_slots_eagerly(self) -> None:
+        """Regression: a cute reduction kernel with its own non-reduction tiling
+        (rms_norm backward) registered the tile's cute_vector_widths slot lazily
+        during codegen, growing the config spec after the autotuner snapshotted
+        it -> IndexError.  Assert the slots are registered eagerly instead.
+        """
+        x = torch.randn(512, 4096, device=DEVICE, dtype=HALF_DTYPE)
+        w = torch.randn(4096, device=DEVICE, dtype=HALF_DTYPE)
+        bound = cute_reduction_with_nested_tiles.bind((x, w))
+        tile_block_ids = {
+            bs.block_id for bs in bound.env.block_sizes if not bs.reduction
+        }
+        registered = set(bound.config_spec.cute_vector_widths.valid_block_ids())
+        self.assertTrue(tile_block_ids, "kernel should expose non-reduction tiles")
+        missing = tile_block_ids - registered
+        self.assertFalse(
+            missing,
+            f"non-reduction tile blocks {sorted(missing)} were not registered in "
+            f"cute_vector_widths during device-IR analysis (registered: "
+            f"{sorted(registered)}); they would be appended lazily during codegen "
+            f"and grow the config spec mid-autotune",
+        )
 
     def test_pointwise_add_three_inputs(self) -> None:
         args = (
