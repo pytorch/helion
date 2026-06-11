@@ -33,6 +33,15 @@ def matmul_kernel(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     return out
 
 
+@helion.kernel
+def row_sum_kernel(x: torch.Tensor) -> torch.Tensor:
+    m, _ = x.shape
+    out = torch.empty([m], dtype=x.dtype, device=x.device)
+    for tile_m in hl.tile(m):
+        out[tile_m] = x[tile_m, :].sum(-1)
+    return out
+
+
 @skipIfRefEager("config spec inspection is not applicable in ref eager mode")
 class TestMemoryOpFacts(RefEagerTestBase, TestCase):
     def test_specs_align_with_indexing_list(self):
@@ -53,6 +62,40 @@ class TestMemoryOpFacts(RefEagerTestBase, TestCase):
             spec.load_eviction_policies.length,
             sum(1 for s in specs if s.eviction_index is not None),
         )
+
+    @skipIfNotCUDA()
+    @onlyBackends(["triton"])
+    def test_reduction_fact_indexing_slot_invariant(self):
+        """The 3-phase reorder builds the ReductionFact AFTER _collect_memory_op_facts,
+        but the collector still runs AFTER the reduction rolling — so every rolled-
+        subgraph load/store keeps its Config.indexing slot and the
+        ``memory_op_facts[i].indexing_index == i`` invariant holds (this is the hard
+        invariant the reorder must preserve; running the collector before the rolling
+        would desync ``Config.indexing`` from codegen)."""
+        x = torch.randn([256, 512], device=DEVICE, dtype=torch.float32)
+        spec = row_sum_kernel.bind((x,)).config_spec
+        specs = spec.memory_op_facts
+
+        # The reorder must not change the indexing-slot alignment / length.
+        self.assertEqual(len(specs), spec.indexing.length)
+        self.assertEqual([s.indexing_index for s in specs], list(range(len(specs))))
+        self.assertEqual(
+            spec.load_eviction_policies.length,
+            sum(1 for s in specs if s.eviction_index is not None),
+        )
+
+        # Phase 3 built exactly one ReductionFact, derived from the enriched facts.
+        self.assertEqual(len(spec.reduction_facts), 1)
+        fact = spec.reduction_facts[0]
+        # num_load scopes to the rdim's ORIGINAL graph(s) (one streamed input row), so the
+        # rolled-subgraph copy is not double-counted by the derived-from-facts count.
+        self.assertEqual(fact.num_load, 1)
+
+        # The collector ran AFTER the rolling: the rolled reduction subgraph's load copy
+        # is accounted for, so a load fact lives in a later graph than the root (and the
+        # superset has > 1 load fact even though num_load == 1).
+        self.assertTrue(any(s.graph_id > 0 for s in specs if s.kind == "load"))
+        self.assertGreater(sum(1 for s in specs if s.kind == "load"), fact.num_load)
 
     def test_load_store_metadata(self):
         x = torch.randn([256, 256], device=DEVICE, dtype=torch.float32)

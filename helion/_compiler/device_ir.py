@@ -32,6 +32,7 @@ from .. import Config
 from .. import exc
 from .. import language as hl
 from ..autotuner.config_spec import CuteVectorWidthSpec
+from ..autotuner.config_spec import ReductionFact
 from ..autotuner.config_spec import ReductionLoopSpec
 from ..language import _tracing_ops
 from ..language._decorators import args_to_proxies
@@ -78,7 +79,9 @@ if TYPE_CHECKING:
     from collections.abc import Iterable
     from collections.abc import Sequence
 
+    from ..autotuner.config_spec import AccumulatorFact
     from ..autotuner.config_spec import MemoryOpFact
+    from .compile_environment import BlockSizeInfo
     from .cute.layout import CuTeGridExecutionPlan
 
     class _TLS(Protocol):
@@ -644,18 +647,75 @@ def _fx_trace_tensor_arg_rw_names(
     return out2
 
 
+def _classify_load_dataflow(
+    load_node: torch.fx.Node, redset: set[int], env: CompileEnvironment
+) -> tuple[set[int], tuple[tuple[int | None, ...], ...]]:
+    """Trace a load's value forward over ``node.users``, cutting at BOTH reductions and
+    stores, and record the sinks it reaches:
+
+    - ``reductions_fed``: the ``redset`` reduction ids the value flows into (recorded,
+      not traversed through — we want where the row goes, not the reduced result).
+    - ``stores_fed``: the stores the value reaches WITHOUT passing through a reduction,
+      each keyed by the store's full subscript-axis tuple (``store[tile_m, tile_n]`` ->
+      ``(id_m, id_n)``). A non-empty set means the row is live across the reduction; this
+      subsumes the old ``bypasses_to_store`` bool, which was just ``bool(stores_fed)``.
+    """
+    from ..language.memory_ops import store as _store_op
+
+    reductions_fed: set[int] = set()
+    stores_fed: set[tuple[int | None, ...]] = set()
+    seen: set[int] = set()
+    stack = list(load_node.users)
+    while stack:
+        u = stack.pop()
+        if id(u) in redset:
+            reductions_fed.add(id(u))
+            continue  # do not traverse THROUGH the reduction
+        if id(u) in seen:
+            continue
+        seen.add(id(u))
+        if u.op == "call_function" and u.target is _store_op:
+            stores_fed.add(_store_axis_key(env, u))
+            continue  # do not traverse THROUGH the store
+        stack.extend(u.users)
+    # deterministic order (None sorts low); only non-emptiness is consumed today
+    stores_sorted = tuple(
+        sorted(stores_fed, key=lambda t: tuple(-1 if b is None else b for b in t))
+    )
+    return reductions_fed, stores_sorted
+
+
+def _store_axis_key(
+    env: CompileEnvironment, store_node: torch.fx.Node
+) -> tuple[int | None, ...]:
+    """Full subscript-axis key of a store: the block-id each non-bare-int subscript indexes
+    (the faithful subscript provenance, falling back to the shape-resolved id for a plain-slice
+    subscript), one entry per dim. E.g. ``store[tile_m, tile_n]`` -> ``(id_m, id_n)``;
+    ``out[tile_m, :]`` -> ``(id_m, <shape-resolved id>)``."""
+    fake = _accessed_tensor_fake(store_node)
+    index_list = store_node.args[1] if len(store_node.args) >= 2 else None
+    if fake is None or not isinstance(index_list, (list, tuple)):
+        return ()
+    key: list[int | None] = []
+    for pos, sub in enumerate(index_list):
+        if isinstance(sub, int) or pos >= fake.ndim:
+            continue
+        bid = _subscript_block_id(env, sub)
+        if bid is None:
+            bid = env.resolve_block_id(fake.shape[pos])
+        key.append(bid)
+    return tuple(key)
+
+
 def _reduction_fx_inter_loop_rw_names(
     graph: torch.fx.Graph,
     host: HostFunction,
 ) -> tuple[frozenset[str], frozenset[str]]:
     """Infer host buffer names read/written in a rolled reduction FX subgraph.
 
-    Walks every hl.load / hl.store / atomic_* node in ``graph`` and resolves
-    its tensor argument back to host-named buffers via
-    :func:`_fx_trace_tensor_arg_rw_names`.  Buffers that don't resolve to a
-    host name are device-internal temporaries and don't participate in
-    cross-wavefront global coherence, so they're correctly excluded from the
-    returned sets.
+    Resolves every hl.load / hl.store / atomic_* tensor arg back to host-named buffers.
+    Args not resolving to a host name are device-internal temporaries (no cross-wavefront
+    coherence) and are excluded.
     """
     from ..language import atomic_add
     from ..language import atomic_and
@@ -711,6 +771,13 @@ class DeviceIR:
         self.rolled_reductions: list[RolledReductionInfo] = []
         self.phases: list[KernelPhase] = []
         self.grid_block_ids: list[list[int]] = []
+        # Owning HostFunction (captured in ``lower_to_device_ir``).
+        self.host_function: HostFunction | None = None
+        # Phase-1 stash for the 3-phase reduction-fact reorder: each rollable
+        # (standard) rdim + the graph ids using it. The ReductionFact is built
+        # later in ``build_reduction_facts`` (after ``_collect_memory_op_facts``)
+        # so it can read the enriched ``memory_op_facts``.
+        self._rollable_reduction_records: list[tuple[BlockSizeInfo, set[int]]] = []
 
     def __str__(self) -> str:
         return "\n\n".join(map(str, self.graphs))
@@ -914,6 +981,9 @@ class DeviceIR:
                         size_hint=rdim.size_hint(),
                     )
                 )
+                # Stash (rdim, used_graphs) for build_reduction_facts (see the field def). Kept
+                # under the same non-pallas guard as the reduction_loops append.
+                self._rollable_reduction_records.append((rdim, used_graphs))
                 if env.backend_name == "cute":
                     env.config_spec.cute_vector_widths.append(
                         CuteVectorWidthSpec(
@@ -989,6 +1059,331 @@ class DeviceIR:
                     size_hint=size_hint_val,
                 )
             )
+
+    def register_user_tiled_reductions(
+        self,
+        memory_op_facts: list[MemoryOpFact],
+        accumulator_facts: list[AccumulatorFact],
+    ) -> None:
+        """Register a ReductionFact for a user-tiled inner reduction.
+
+        user-tiled = a hand-written nested ``hl.tile`` over the reduction axis
+        (softmax_two_pass, kl_div, jsd): no ``reduction=True`` block, so both axes are
+        ordinary ``block_sizes`` entries. Caller-guarded (``if not reduction_loops``) so
+        standard vs user-tiled are mutually exclusive. Finds the axis by collecting every
+        ``ReductionLowering.block_index`` and dropping the grid axes (load-bearing for
+        jsd's dead ``amax(dim=0)``); registers only if exactly one inner axis survives.
+
+        Built in Phase 3 of the reorder (after ``_collect_memory_op_facts``), so the
+        per-op-dataflow fields are derived from ``memory_op_facts``/``accumulator_facts``.
+        """
+        from .inductor_lowering import ReductionLowering
+
+        env = CompileEnvironment.current()
+        spec = env.config_spec
+        # A matmul kernel is out of scope (its carried 2D accumulators have a static
+        # int last-dim the reduction-axis walk does not expect). Decline before walking;
+        # matmul_facts are already populated here (recorded during tracing).
+        if spec.matmul_facts:
+            return
+        grid_ids = {b for bids in self.grid_block_ids for b in bids}
+
+        red_block_ids: set[int] = set()
+        for graph_info in self.graphs:
+            for node in graph_info.graph.nodes:
+                lowering = node.meta.get("lowering")
+                if isinstance(lowering, ReductionLowering):
+                    bid = getattr(lowering, "block_index", None)
+                    if bid is not None:
+                        red_block_ids.add(bid)
+        # Drop the grid axis (jsd's dead amax(dim=0) over the M tile, etc.).
+        inner_red = [b for b in red_block_ids if b not in grid_ids]
+        if len(inner_red) != 1:
+            return
+        red_block_id = inner_red[0]
+        # The reduction axis must be a user tile in the block_sizes spec.
+        if red_block_id not in spec.block_sizes.valid_block_ids():
+            return
+        try:
+            block_info = env.block_sizes[red_block_id]
+        except (IndexError, KeyError):
+            return
+        # The reduction axis must have a resolvable extent: a dynamic/jagged dim
+        # (jagged_softmax) has ``size=None``, for which the extent-keyed lever is
+        # undefined; decline so the gate does not fire there.
+        if not isinstance(block_info.size, (int, torch.SymInt)):
+            return
+
+        # Additional non-grid, non-reduction tile loop(s) (beyond the reduction axis).
+        # Each must span the reduction extent with a resolvable static size, else
+        # ``all_qualified`` is False and the structured seed is undefined (decline).
+        non_reduction_loop_block_ids, all_qualified = (
+            self._non_reduction_loop_candidates(red_block_id, grid_ids)
+        )
+        if not all_qualified:
+            return
+
+        # The kept (non-reduction) axes are the grid block_ids — the "rows".
+        m_block_ids = tuple(sorted(grid_ids))
+        size_hint = block_info.size_hint()
+        static_rnumel = block_info.size if isinstance(block_info.size, int) else None
+        # user-tiled digests over ALL device graphs (the manual inner loop body is in
+        # the main device graph, not a roller subgraph), so num_load scopes to every
+        # graph_id.
+        all_graph_ids = set(range(len(self.graphs)))
+        spec.reduction_facts.append(
+            self._assemble_reduction_fact(
+                red_block_id,
+                size_hint,
+                static_rnumel,
+                m_block_ids,
+                non_reduction_loop_block_ids,
+                all_graph_ids,
+                memory_op_facts,
+                accumulator_facts,
+            )
+        )
+
+    def build_reduction_facts(self, memory_op_facts: list[MemoryOpFact]) -> None:
+        """Phase 3 of the reduction-fact reorder: build the ``ReductionFact``s now that
+        ``_collect_memory_op_facts`` has produced the enriched ``memory_op_facts``.
+
+        Reads the already-built ``spec.accumulator_facts`` (populated independently by
+        ``build_accumulator_facts`` in ``lower_to_device_ir``), then builds each stashed
+        standard fact, then — only when no standard rollable reduction was registered —
+        the user-tiled fact.
+        """
+        env = CompileEnvironment.current()
+        spec = env.config_spec
+        accumulator_facts = spec.accumulator_facts
+        # standard (rollable): one fact per stashed (rdim, used_graphs). num_load scopes
+        # to the rdim's ORIGINAL graphs (used_graphs), so the rolled-subgraph copies of a
+        # standard rdim load are not double-counted (device_ir.graphs is a superset of any
+        # one config).
+        for rdim, used_graphs in self._rollable_reduction_records:
+            grid_ids = {b for bids in self.grid_block_ids for b in bids}
+            m_block_ids = tuple(sorted(grid_ids))
+            static_rnumel = rdim.size if isinstance(rdim.size, int) else None
+            non_reduction_loop_block_ids, _all_qualified = (
+                self._non_reduction_loop_candidates(rdim.block_id, grid_ids)
+            )
+            spec.reduction_facts.append(
+                self._assemble_reduction_fact(
+                    rdim.block_id,
+                    rdim.size_hint(),
+                    static_rnumel,
+                    m_block_ids,
+                    non_reduction_loop_block_ids,
+                    used_graphs,
+                    memory_op_facts,
+                    accumulator_facts,
+                )
+            )
+        # user-tiled: mutually exclusive with standard — keys on the reduction_loops spec
+        # registered in Phase 1 under the non-pallas guard (preserves pallas behavior).
+        if not spec.reduction_loops:
+            self.register_user_tiled_reductions(memory_op_facts, accumulator_facts)
+
+    def build_accumulator_facts(self) -> list[AccumulatorFact]:
+        """One ``AccumulatorFact`` per loop-carried tensor accumulator in any loop —
+        reduction-AGNOSTIC, so it is built independently of (and before) the reduction
+        facts in ``lower_to_device_ir``: it is a standalone fact layer any heuristic can
+        read off ``ConfigSpec.accumulator_facts``, not just the reduction seed. Run
+        unconditionally (matmul/elementwise kernels simply get a list with no rdim-shaped
+        tile). ``ReductionLoopGraphInfo`` is a ``ForLoopGraphInfo`` subclass, so this also
+        reaches standard's rolled loops (whose ``[M_BLOCK]`` scalar carry yields
+        ``num_carried_2d_tiles == 0`` naturally). Must run after the reduction rolling so
+        the rolled subgraphs exist.
+        """
+        from ..autotuner.config_spec import AccumulatorFact
+
+        env = CompileEnvironment.current()
+        facts: list[AccumulatorFact] = []
+        for gi in self.graphs:
+            if not isinstance(gi, ForLoopGraphInfo):
+                continue
+            for outer_node in gi.node_args:
+                val = getattr(outer_node, "meta", {}).get("val")
+                if isinstance(val, torch.Tensor):
+                    facts.append(
+                        AccumulatorFact(
+                            dim_block_ids=tuple(
+                                env.resolve_block_id(s) for s in val.shape
+                            ),
+                            itemsize=val.element_size(),
+                        )
+                    )
+        return facts
+
+    def _reduction_input_itemsize(self, red_block_id: int) -> int:
+        """Element size (bytes) of the tensor reduced over ``red_block_id`` — read from the
+        reduction node's INPUT (not its ``meta['val']`` output, which may differ in dtype,
+        e.g. argmax). Helion promotes the norm/softmax family to fp32, so this is 4 at BOTH
+        bf16 and fp32 there. All reductions over one rdim share an input element size (last
+        wins). The byte caps key on ``size_hint * itemsize``.
+        """
+        from .inductor_lowering import ReductionLowering
+
+        itemsize = 0
+        for graph_info in self.graphs:
+            for node in graph_info.graph.nodes:
+                lowering = node.meta.get("lowering")
+                if (
+                    isinstance(lowering, ReductionLowering)
+                    and getattr(lowering, "block_index", None) == red_block_id
+                ):
+                    for inp in node.all_input_nodes:
+                        in_val = inp.meta.get("val")
+                        if isinstance(in_val, torch.Tensor):
+                            itemsize = in_val.element_size()
+                            break
+        return itemsize
+
+    def _assemble_reduction_fact(
+        self,
+        red_block_id: int,
+        size_hint: int,
+        static_rnumel: int | None,
+        m_block_ids: tuple[int, ...],
+        non_reduction_loop_block_ids: tuple[int, ...],
+        load_graph_ids: set[int],
+        memory_op_facts: list[MemoryOpFact],
+        accumulator_facts: list[AccumulatorFact],
+    ) -> ReductionFact:
+        """Build one ``ReductionFact`` for axis ``red_block_id`` from the enriched
+        ``memory_op_facts`` + ``accumulator_facts`` (no bespoke graph walk). Shared by the
+        standard (``build_reduction_facts``) and user-tiled
+        (``register_user_tiled_reductions``) paths; only ``load_graph_ids`` (standard: the
+        rdim's original graphs; user-tiled: every graph) differ.
+        """
+        # num_load: every load in the reduction's graphs (the stream-eviction == 1 gate).
+        # Scoped by graph_id so rolled-subgraph copies of a standard rdim load are excluded.
+        num_load = sum(
+            1
+            for f in memory_op_facts
+            if f.kind == "load" and f.graph_id in load_graph_ids
+        )
+        # num_carried_2d_tiles: carried [.., R_BLOCK] tiles whose last dim is the rdim
+        # (jsd=2 / kl_div=1 / welford=0; standard's [M_BLOCK] scalar carry -> 0).
+        num_carried_2d_tiles = sum(
+            1
+            for a in accumulator_facts
+            if len(a.dim_block_ids) >= 2 and a.dim_block_ids[-1] == red_block_id
+        )
+        # row_reread + reread_eviction_index: the FIRST load live across the reduction boundary
+        # (feeds >= 2 reductions on this axis, or one + a bypass store); the slot is read straight
+        # from MemoryOpFact (no per-config re-walk).
+        row_reread = False
+        reread_eviction_index: int | None = None
+        for f in memory_op_facts:
+            if f.kind != "load":
+                continue
+            cnt = next((c for ax, c in f.reductions_fed if ax == red_block_id), 0)
+            if cnt >= 2 or (cnt >= 1 and f.stores_fed):
+                row_reread = True
+                reread_eviction_index = f.eviction_index
+                break
+        # full_width_output: a rank>=2 store whose inner dim is the reduction-extent AXIS
+        # ({rdim} ∪ normalize loops), keyed on the store's inner SUBSCRIPT block-id
+        # (reduction-agnostic) or, for the standard ``out[tile_m, :]`` plain slice, the
+        # shape-resolved indexed_block_ids fallback. No size-match (a non-reduction dim
+        # that merely equals the extent is not full-width).
+        extent_axes = {red_block_id, *non_reduction_loop_block_ids}
+        full_width_output = any(
+            f.kind == "store"
+            and f.ndim >= 2
+            and (
+                (f.subscript_block_ids and f.subscript_block_ids[-1] in extent_axes)
+                or (f.indexed_block_ids and f.indexed_block_ids[-1] in extent_axes)
+            )
+            for f in memory_op_facts
+        )
+        # input_load_itemsize: min element size over reduction-fed loads (the streamed
+        # row), with a Band-B fallback to rank>=2 row loads of the reduction extent.
+        fed_sizes = [
+            f.dtype.itemsize
+            for f in memory_op_facts
+            if f.kind == "load"
+            and f.dtype is not None
+            and any(ax == red_block_id for ax, _ in f.reductions_fed)
+        ]
+        if fed_sizes:
+            input_load_itemsize = min(fed_sizes)
+        else:
+            # Band-B fallback: rank>=2 row loads whose inner subscript IS the reduction
+            # AXIS (block-id), replacing the inner_extent==size_hint size-match.
+            # Why it's needed: accumulator-carried reductions (kl_div/jsd) feed a loop
+            # `+=`, not a ReductionLowering, so the row load is invisible to reductions_fed
+            # (fed_sizes empty); this structural axis-match is the faithful recovery.
+            row_sizes = [
+                f.dtype.itemsize
+                for f in memory_op_facts
+                if f.kind == "load"
+                and f.dtype is not None
+                and (
+                    (
+                        f.subscript_block_ids
+                        and f.subscript_block_ids[-1] == red_block_id
+                    )
+                    or (f.indexed_block_ids and f.indexed_block_ids[-1] == red_block_id)
+                )
+            ]
+            input_load_itemsize = min(row_sizes) if row_sizes else 0
+
+        return ReductionFact(
+            block_id=red_block_id,
+            size_hint=size_hint,
+            m_block_ids=m_block_ids,
+            static_rnumel=static_rnumel,
+            itemsize=self._reduction_input_itemsize(red_block_id),
+            num_load=num_load,
+            num_carried_2d_tiles=num_carried_2d_tiles,
+            non_reduction_loop_block_ids=non_reduction_loop_block_ids,
+            row_reread=row_reread,
+            reread_eviction_index=reread_eviction_index,
+            full_width_output=full_width_output,
+            input_load_itemsize=input_load_itemsize,
+        )
+
+    def _non_reduction_loop_candidates(
+        self, red_block_id: int, grid_ids: set[int]
+    ) -> tuple[tuple[int, ...], bool]:
+        """Identify non-reduction loop tiles for ``red_block_id`` — non-grid
+        ``block_sizes`` loops that are NOT the reduction axis. Shared by the standard and
+        user-tiled fact builders.
+
+        Returns ``(qualifying, all_qualified)``: ``qualifying`` (block_sizes order) are
+        the candidate loops spanning the reduction extent with a resolvable static size
+        — the seed widens these to ``next_pow2`` of that extent. ``all_qualified`` is
+        False iff some candidate did NOT qualify (extent unresolvable or != the reduction
+        extent), where the structured seed is undefined so a caller must decline.
+        """
+        try:
+            red_info = CompileEnvironment.current().block_sizes[red_block_id]
+        except (IndexError, KeyError):
+            return (), True
+        if not isinstance(red_info.size, (int, torch.SymInt)):
+            return (), True
+        red_size_hint = red_info.size_hint()
+
+        env = CompileEnvironment.current()
+        qualifying: list[int] = []
+        all_qualified = True
+        for bid in env.config_spec.block_sizes.valid_block_ids():
+            if bid in grid_ids or bid == red_block_id:
+                continue
+            try:
+                info = env.block_sizes[bid]
+            except (IndexError, KeyError):
+                all_qualified = False
+                continue
+            if not isinstance(info.size, (int, torch.SymInt)) or (
+                info.size_hint() != red_size_hint
+            ):
+                all_qualified = False
+                continue
+            qualifying.append(bid)
+        return tuple(qualifying), all_qualified
 
     def build_codegen_graphs(self, config: Config) -> list[GraphInfo]:
         """Build and return graph copies with reduction rolling and epilogue subtiling applied.
@@ -2255,6 +2650,21 @@ def _accessed_tensor_fake(node: torch.fx.Node) -> torch.Tensor | None:
     return None
 
 
+def _subscript_block_id(env: CompileEnvironment, sub: object) -> int | None:
+    """Block-id a subscript expression INDEXES, from the index node's own provenance (tile/offset
+    meta, else its block-var SymInt). Reduction-AGNOSTIC (resolves a tile var regardless of the
+    block's ``reduction`` flag, unlike a shape-size resolve). ``None`` for a plain slice / scalar."""
+    if not isinstance(sub, torch.fx.Node):
+        return None
+    two = sub.meta.get("tile_with_offset")
+    if isinstance(two, dict) and two.get("block_id") is not None:
+        return two["block_id"]
+    val = sub.meta.get("val")
+    if val is not None:
+        return env.resolve_block_id(val)
+    return None
+
+
 def _collect_memory_op_facts(device_ir: DeviceIR) -> list[MemoryOpFact]:
     """Walk every device graph once and record per-load/store metadata.
 
@@ -2262,14 +2672,22 @@ def _collect_memory_op_facts(device_ir: DeviceIR) -> list[MemoryOpFact]:
     ``Config.indexing``, so ``memory_op_facts[i]`` describes
     ``config.indexing[i]``. This is the single source of truth for load/store
     counts, eviction slots, and ``store_indices`` (all derived from the result).
+
+    The per-op enrichment fields (``reductions_fed``/``stores_fed``/
+    ``indexed_block_ids``/``inner_extent``/``graph_id``) are computed here so the
+    reduction-fact builders can derive their per-op-dataflow properties without a
+    bespoke graph walk. ``reductions_fed`` generalizes ``_classify_load_dataflow``
+    (run once over ALL reduction axes, grouped by axis) — see ``build_reduction_facts``.
     """
     from ..autotuner.config_spec import MemoryOpFact
     from ..language import memory_ops
+    from .inductor_lowering import ReductionLowering
 
     load_op = memory_ops.load
     store_op = memory_ops.store
     operand_positions = _matmul_operand_positions()
 
+    env = CompileEnvironment.current()
     host = HostFunction.current()
     # Matmul operands always precede their matmul in graph order, so `operands` is
     # complete by the time we apply it to the (operand-less) facts below.
@@ -2279,7 +2697,17 @@ def _collect_memory_op_facts(device_ir: DeviceIR) -> list[MemoryOpFact]:
     eviction_index = 0
 
     for graph_info in device_ir.graphs:
-        for node in graph_info.graph.nodes:
+        graph = graph_info.graph
+        # Axis (block_index) of every ReductionLowering node in this graph — the cut set
+        # for the dataflow classification, keyed so a fed reduction maps to its axis.
+        red_axis_by_id: dict[int, int] = {
+            id(node): node.meta["lowering"].block_index
+            for node in graph.nodes
+            if isinstance(node.meta.get("lowering"), ReductionLowering)
+            and isinstance(getattr(node.meta["lowering"], "block_index", None), int)
+        }
+        redset = set(red_axis_by_id)
+        for node in graph.nodes:
             if node.op != "call_function":
                 continue
 
@@ -2306,6 +2734,47 @@ def _collect_memory_op_facts(device_ir: DeviceIR) -> list[MemoryOpFact]:
 
             fake = _accessed_tensor_fake(node)
             origin = host.tensor_to_origin.get(fake) if fake is not None else None
+
+            # reductions_fed (loads): axis-keyed per-axis count of the reductions this
+            # load's value flows into; stores_fed: the stores it reaches without passing a
+            # reduction, keyed by full axis tuple. Both reduction-AGNOSTIC (all axes at once).
+            reductions_fed: tuple[tuple[int, int], ...] = ()
+            stores_fed: tuple[tuple[int | None, ...], ...] = ()
+            if is_load:
+                feeds, stores_fed = _classify_load_dataflow(node, redset, env)
+                per_axis: dict[int, int] = {}
+                for fed_id in feeds:
+                    axis = red_axis_by_id[fed_id]
+                    per_axis[axis] = per_axis.get(axis, 0) + 1
+                reductions_fed = tuple(sorted(per_axis.items()))
+
+            # indexed_block_ids: shape-resolved block-id per non-bare-int subscript (None where
+            # unresolvable; the fallback). subscript_block_ids: the index-subscript block-id (the
+            # faithful axis key). inner_extent: legacy inner-dim extent (gates use the block-ids).
+            indexed_block_ids: tuple[int | None, ...] = ()
+            subscript_block_ids: tuple[int | None, ...] = ()
+            inner_extent: int | None = None
+            if fake is not None:
+                index_list = node.args[1] if len(node.args) >= 2 else None
+                if isinstance(index_list, (list, tuple)):
+                    # same positions for both tuples so [-1] aligns (drop bare-int / OOB)
+                    positions = [
+                        pos
+                        for pos, sub in enumerate(index_list)
+                        if not isinstance(sub, int) and pos < fake.ndim
+                    ]
+                    indexed_block_ids = tuple(
+                        env.resolve_block_id(fake.shape[pos]) for pos in positions
+                    )
+                    subscript_block_ids = tuple(
+                        _subscript_block_id(env, index_list[pos]) for pos in positions
+                    )
+                if fake.ndim >= 2:
+                    # size_hint (not int()): reading a SymInt inner dim via int() guards it
+                    # to a constant, over-specializing dynamic-shape kernels. inner_extent is a
+                    # heuristic size signal, so a hint is sufficient and must not specialize.
+                    inner_extent = env.size_hint(fake.shape[-1])
+
             records.append(
                 (
                     node,
@@ -2318,6 +2787,12 @@ def _collect_memory_op_facts(device_ir: DeviceIR) -> list[MemoryOpFact]:
                         ndim=fake.ndim if fake is not None else 0,
                         num_reuses=len(node.users) if is_load else 0,
                         matmul_operand=None,
+                        graph_id=graph_info.graph_id,
+                        reductions_fed=reductions_fed,
+                        stores_fed=stores_fed,
+                        indexed_block_ids=indexed_block_ids,
+                        inner_extent=inner_extent,
+                        subscript_block_ids=subscript_block_ids,
                     ),
                 )
             )
@@ -2461,6 +2936,7 @@ def _register_tensor_descriptor_layout_guards(device_ir: DeviceIR) -> None:
 
 def lower_to_device_ir(func: HostFunction) -> DeviceIR:
     device_ir = DeviceIR()
+    device_ir.host_function = func
     with func, device_ir, compile_lock:
         visitor = WalkHostAST(device_ir)
         for stmt in func.body:
@@ -2513,8 +2989,11 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
         config_spec.epilogue_subtile_k_hint = 0
         config_spec.epilogue_subtile_autotune_choices = None
 
+        # Phase 1 of the reduction-fact reorder: roll + register the reduction_loops spec
+        # and stash the rollable (standard) rdims. ReductionFacts are built in Phase 3
+        # (build_reduction_facts, after _collect_memory_op_facts) so they read the enriched
+        # memory_op_facts.
         device_ir.register_rollable_reductions()
-        config_spec = CompileEnvironment.current().config_spec
         config_spec.raise_grid_block_minimums()
         if len(device_ir.root_ids) > 1:
             # xyz is not supported with shared program IDs. Non-tcgen05
@@ -2553,6 +3032,15 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
         )
         _register_atomic_tunables(_count_device_atomics(device_ir))
         _register_tensor_descriptor_layout_guards(device_ir)
+
+        # Accumulator facts are a standalone, reduction-agnostic fact layer (any heuristic
+        # may read them), so build them independently of the reduction facts. Must run
+        # after the rolling (it walks the rolled loop subgraphs).
+        config_spec.accumulator_facts = device_ir.build_accumulator_facts()
+        # Phase 3: build the ReductionFacts (standard from the stashed rollable rdims, then
+        # user-tiled when no standard fired) now that the enriched memory_op_facts +
+        # accumulator_facts exist.
+        device_ir.build_reduction_facts(memory_op_facts)
 
         return device_ir
 
