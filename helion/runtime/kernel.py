@@ -39,7 +39,6 @@ from torch.utils.weak import WeakIdKeyDictionary
 
 from .. import exc
 from .._compat import target_device_capability
-from .._compile_time import is_enabled as _compile_time_enabled
 from .._compile_time import measure
 from .._compiler.ast_extension import unparse
 from .._compiler.autotuner_heuristics import compiler_seed_configs
@@ -192,7 +191,10 @@ class Kernel(Generic[_R]):
             Config(**config) if isinstance(config, dict) else config
             for config in configs or []
         ]
-        self._bound_kernels: dict[BoundKernelInMemoryCacheKey, BoundKernel] = {}
+        # Keyed by ``(signature, extra_results)`` tuples — the tuple form of
+        # ``BoundKernelInMemoryCacheKey``, kept plain for cheap per-call
+        # construction in ``bind``.
+        self._bound_kernels: dict[Hashable, BoundKernel] = {}
         self._specialize_extra: dict[
             Hashable, list[Callable[[Sequence[object]], Hashable]]
         ] = {}
@@ -283,13 +285,15 @@ class Kernel(Generic[_R]):
 
     def _get_bound_kernel_cache_key(
         self, args: tuple[object, ...], signature: tuple[Hashable, ...]
-    ) -> BoundKernelInMemoryCacheKey | None:
-        from ..autotuner.base_cache import BoundKernelInMemoryCacheKey
-
+    ) -> tuple[Hashable, ...] | None:
+        # Plain tuples keep the per-call dispatch path free of dataclass
+        # construction; `_create_bound_kernel_cache_key` provides the
+        # `BoundKernelInMemoryCacheKey` form for the autotuner caches.
         extra_fns = self._specialize_extra.get(signature)
         if extra_fns is not None:
-            extra_results: tuple[Hashable, ...] = tuple([s(args) for s in extra_fns])
-            return BoundKernelInMemoryCacheKey(signature, extra_results)
+            if extra_fns:
+                return (signature, tuple([s(args) for s in extra_fns]))
+            return (signature, ())
         return None
 
     def _create_bound_kernel_cache_key(
@@ -314,18 +318,6 @@ class Kernel(Generic[_R]):
         Returns:
             BoundKernel: A BoundKernel object with the given arguments bound.
         """
-        # The "Kernel.bind" compile-time metric covers the whole bind body
-        # (key computation + cache lookup + any compile). But entering a
-        # context manager costs ~115ns even when measurement is disabled,
-        # which is significant on this per-call dispatch path, so only pay
-        # for it when measurement is actually on. Semantics are unchanged:
-        # when enabled, the same code runs under the same measure() scope.
-        if _compile_time_enabled():
-            with measure("Kernel.bind"):
-                return self._bind_impl(args)
-        return self._bind_impl(args)
-
-    def _bind_impl(self, args: tuple[object, ...]) -> BoundKernel[_R]:
         if not isinstance(args, tuple):
             assert isinstance(args, list), "args must be a tuple or list"
             args = tuple(args)
@@ -339,17 +331,19 @@ class Kernel(Generic[_R]):
             None if cache_key is None else self._bound_kernels.get(cache_key, None)
         )
         if bound_kernel is None:
-            normalized_args: tuple[object, ...] = self.normalize_args(*args)
-            if len(normalized_args) != len(args):
-                # we had default args that needed to be applied
-                bound_kernel = self.bind(normalized_args)
-            else:
-                bound_kernel = BoundKernel(self, args)
-            if cache_key is None:
-                cache_key = self._create_bound_kernel_cache_key(
-                    bound_kernel, args, signature
-                )
-            self._bound_kernels[cache_key] = bound_kernel
+            with measure("Kernel.bind"):
+                normalized_args: tuple[object, ...] = self.normalize_args(*args)
+                if len(normalized_args) != len(args):
+                    # we had default args that needed to be applied
+                    bound_kernel = self.bind(normalized_args)
+                else:
+                    bound_kernel = BoundKernel(self, args)
+                if cache_key is None:
+                    full_key = self._create_bound_kernel_cache_key(
+                        bound_kernel, args, signature
+                    )
+                    cache_key = (full_key.specialization_key, full_key.extra_results)
+                self._bound_kernels[cache_key] = bound_kernel
         return bound_kernel
 
     def _base_specialization_key(self, args: Sequence[object]) -> tuple[Hashable, ...]:
@@ -414,10 +408,8 @@ class Kernel(Generic[_R]):
                 extractor = _specialization_extractors[torch.fx.GraphModule]
             elif isinstance(obj, torch.Tensor):
                 # torch.Tensor subclasses (e.g. the JAX-export adapter)
-                # share the standard tensor specialization key. Use the
-                # SymInt-safe extractor: unlike exact ``torch.Tensor``,
-                # subclasses may carry symbolic sizes/strides.
-                extractor = _specialization_extractors["tensor_subclass"]
+                # share the standard tensor specialization key.
+                extractor = _specialization_extractors[torch.Tensor]
             elif isinstance(obj, tuple) and hasattr(obj, "_fields"):
                 # this is a namedtuple
                 extractor = _specialization_extractors["namedtuple"]
@@ -940,108 +932,11 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
             config: The configuration to set.
         """
         config = self._normalize_config(config)
-        compiled = self.compile_config(config)
-        # Clone the compiled function so each BoundKernel has its own
-        # ``__kwdefaults__`` to mutate. ``compile_config`` returns functions
-        # loaded via ``PyCodeCache``, which keys on source hash — two
-        # BoundKernels for the same kernel (e.g. cuda:0 vs cuda:1) can
-        # generate IDENTICAL Triton source, share a function object, and an
-        # in-place ``__kwdefaults__["_launcher"] = ...`` in
-        # :meth:`_install_fast_launcher` would clobber the earlier
-        # BoundKernel's launcher.
-        run = types.FunctionType(
-            compiled.__code__,
-            compiled.__globals__,
-            compiled.__name__,
-            compiled.__defaults__,
-            compiled.__closure__,
-        )
-        if compiled.__kwdefaults__ is not None:
-            run.__kwdefaults__ = dict(compiled.__kwdefaults__)
-        self._install_fast_launcher(run, config)
-        self._run = run
+        self._run = self.compile_config(config)
         self._config = config
         counters["best_config_decorator"][
             self.format_kernel_decorator(config, self.settings)
         ] = 1
-
-    def _install_fast_launcher(
-        self,
-        compiled: CompiledConfig,
-        config: Config,
-    ) -> None:
-        """Re-point ``compiled``'s ``_launcher`` kwarg default at a fast closure.
-
-        The generated host wrapper declares
-        ``def add(x, y, *, _launcher=_default_launcher)``; Python stores the
-        ``_default_launcher`` value in ``compiled.__kwdefaults__``. By
-        overwriting that entry with a :class:`helion.runtime._FastLauncher`
-        closure (built once with this config's ``num_warps`` / ``num_stages``
-        / etc. baked in), every direct call to ``compiled(*args)`` —
-        including from ``BoundKernel.__call__`` on the steady-state hot
-        path — uses the fast launcher with no extra Python wrapping.
-
-        The autotune trial harness and any external caller that explicitly
-        passes ``_launcher=`` overrides the kwdefault automatically, so
-        this is safe.
-
-        Non-Triton backends and any priming failure cause the kwdefault to
-        be left at :func:`default_launcher`. Setting the env var
-        ``HELION_SKIP_FAST_LAUNCHER=1`` (or ``true`` / ``yes``) is an
-        escape hatch: the fast launcher is not installed and every
-        Helion call goes through ``default_launcher`` (= Triton's
-        ``JITFunction.run``). Useful for quickly bisecting whether a
-        bug is in the fast launcher itself.
-        """
-        import os
-
-        from .._compiler.backend import TritonBackend
-        from ._fast_launcher import build_fast_launcher
-
-        if os.environ.get("HELION_SKIP_FAST_LAUNCHER", "").lower() in (
-            "1",
-            "true",
-            "yes",
-        ):
-            return
-
-        backend = self.env.backend
-        if not isinstance(backend, TritonBackend):
-            return
-        kwdefaults = getattr(compiled, "__kwdefaults__", None)
-        if not kwdefaults or "_launcher" not in kwdefaults:
-            # No ``_launcher`` kwonly default — nothing to wire up.
-            # (Should not happen for Helion-compiled Triton kernels.)
-            return
-
-        try:
-            kwargs = backend.launcher_runtime_kwargs(
-                config, has_barrier=self._env.has_barrier
-            )
-        except Exception:
-            log.debug(
-                "FastLauncher disabled: backend.launcher_runtime_kwargs raised",
-                exc_info=True,
-            )
-            return
-
-        num_warps = cast("int", kwargs.pop("num_warps"))
-        num_stages = cast("int", kwargs.pop("num_stages"))
-        launch_cooperative_grid = cast(
-            "bool", kwargs.pop("launch_cooperative_grid", False)
-        )
-        ptx_options = cast("str | None", kwargs.pop("ptx_options", None))
-        # Anything left in kwargs (backend tunable keys, maxnreg,
-        # _triton_config_*) is forwarded as ``extra_kwargs`` to be baked
-        # into the closure.
-        fast_launcher = build_fast_launcher(
-            num_warps=num_warps,
-            num_stages=num_stages,
-            launch_cooperative_grid=launch_cooperative_grid,
-            ptx_options=ptx_options,
-            extra_kwargs=kwargs or None,
-        )
-        kwdefaults["_launcher"] = fast_launcher
 
     def _specialize_extra(self) -> list[Callable[[Sequence[object]], Hashable]]:
         """
@@ -1499,36 +1394,6 @@ def _hashable_dims(dims: Sequence[int | torch.SymInt]) -> tuple[Hashable, ...]:
     return tuple(_hashable_dim(s) for s in dims)
 
 
-def _concrete_tensor_key(fn: Kernel, obj: torch.Tensor) -> Hashable:
-    # Fast extractor for plain ``torch.Tensor`` / ``torch.nn.Parameter``:
-    # exact-type dispatch guarantees concrete int sizes/strides, so
-    # ``torch.Size`` and the stride tuple can be used directly (both are
-    # tuple subclasses that hash/compare identically to plain int tuples).
-    # The ``_hashable_dims`` wrap in ``_tensor_key`` exists only to
-    # normalize SymInts, which appear on FakeTensors during tracing.
-    si = getattr(obj, "_dynamo_static_indices", None)
-    static_indices = frozenset(si) if si is not None else _EMPTY_FROZENSET
-    if fn.settings.static_shapes:
-        return (obj.dtype, obj.size(), obj.stride(), static_indices)
-    bucketed = _bucketed_size(obj)
-    if fn.settings.index_dtype is None:
-        try:
-            needs_int64 = bool(obj.numel() > _INT32_INDEX_LIMIT)
-        except RuntimeError:
-            needs_int64 = True  # unbacked SymInt
-        return (
-            obj.dtype,
-            bucketed,
-            needs_int64,
-            static_indices,
-        )
-    return (
-        obj.dtype,
-        bucketed,
-        static_indices,
-    )
-
-
 def _tensor_key(fn: Kernel, obj: torch.Tensor) -> Hashable:
     si = getattr(obj, "_dynamo_static_indices", None)
     static_indices = frozenset(si) if si is not None else _EMPTY_FROZENSET
@@ -1608,17 +1473,9 @@ _specialization_extractors: dict[
     type[object] | str, Callable[[Kernel, object], Hashable]
     # pyrefly: ignore [bad-assignment]
 ] = {
-    # Exact-type dispatch (see ``_specialization_key``): plain tensors and
-    # Parameters always have concrete int sizes/strides and take the fast
-    # extractor. Subclasses (FakeTensor below, or anything hitting the
-    # ``isinstance`` fallback) go through SymInt-safe ``_tensor_key``.
-    torch.Tensor: _concrete_tensor_key,
-    torch.nn.Parameter: _concrete_tensor_key,
+    torch.Tensor: _tensor_key,
+    torch.nn.Parameter: _tensor_key,
     FakeTensor: _tensor_key,
-    # SymInt-safe extractor for torch.Tensor subclasses reached via the
-    # isinstance fallback in ``_specialization_key`` (string key so the
-    # fallback stays loosely typed, like "namedtuple" / "dataclass").
-    "tensor_subclass": _tensor_key,
     torch.dtype: lambda fn, x: x,
     torch.device: lambda fn, x: x,
     int: _number_key,
