@@ -37,6 +37,7 @@ from torch.utils.weak import WeakIdKeyDictionary
 
 from .. import exc
 from .._compat import target_device_capability
+from .._compile_time import is_enabled as _compile_time_enabled
 from .._compile_time import measure
 from .._compiler.ast_extension import unparse
 from .._compiler.autotuner_heuristics import compiler_seed_configs
@@ -185,10 +186,7 @@ class Kernel(Generic[_R]):
             Config(**config) if isinstance(config, dict) else config
             for config in configs or []
         ]
-        # Keyed by ``(signature, extra_results)`` tuples — the tuple form of
-        # ``BoundKernelInMemoryCacheKey``, kept plain for cheap per-call
-        # construction in ``bind``.
-        self._bound_kernels: dict[Hashable, BoundKernel] = {}
+        self._bound_kernels: dict[BoundKernelInMemoryCacheKey, BoundKernel] = {}
         self._specialize_extra: dict[
             Hashable, list[Callable[[Sequence[object]], Hashable]]
         ] = {}
@@ -229,15 +227,13 @@ class Kernel(Generic[_R]):
 
     def _get_bound_kernel_cache_key(
         self, args: tuple[object, ...], signature: tuple[Hashable, ...]
-    ) -> tuple[Hashable, ...] | None:
-        # Plain tuples keep the per-call dispatch path free of dataclass
-        # construction; `_create_bound_kernel_cache_key` provides the
-        # `BoundKernelInMemoryCacheKey` form for the autotuner caches.
+    ) -> BoundKernelInMemoryCacheKey | None:
+        from ..autotuner.base_cache import BoundKernelInMemoryCacheKey
+
         extra_fns = self._specialize_extra.get(signature)
         if extra_fns is not None:
-            if extra_fns:
-                return (signature, tuple([s(args) for s in extra_fns]))
-            return (signature, ())
+            extra_results: tuple[Hashable, ...] = tuple([s(args) for s in extra_fns])
+            return BoundKernelInMemoryCacheKey(signature, extra_results)
         return None
 
     def _create_bound_kernel_cache_key(
@@ -262,6 +258,18 @@ class Kernel(Generic[_R]):
         Returns:
             BoundKernel: A BoundKernel object with the given arguments bound.
         """
+        # The "Kernel.bind" compile-time metric covers the whole bind body
+        # (key computation + cache lookup + any compile). But entering a
+        # context manager costs ~115ns even when measurement is disabled,
+        # which is significant on this per-call dispatch path, so only pay
+        # for it when measurement is actually on. Semantics are unchanged:
+        # when enabled, the same code runs under the same measure() scope.
+        if _compile_time_enabled():
+            with measure("Kernel.bind"):
+                return self._bind_impl(args)
+        return self._bind_impl(args)
+
+    def _bind_impl(self, args: tuple[object, ...]) -> BoundKernel[_R]:
         if not isinstance(args, tuple):
             assert isinstance(args, list), "args must be a tuple or list"
             args = tuple(args)
@@ -275,19 +283,17 @@ class Kernel(Generic[_R]):
             None if cache_key is None else self._bound_kernels.get(cache_key, None)
         )
         if bound_kernel is None:
-            with measure("Kernel.bind"):
-                normalized_args: tuple[object, ...] = self.normalize_args(*args)
-                if len(normalized_args) != len(args):
-                    # we had default args that needed to be applied
-                    bound_kernel = self.bind(normalized_args)
-                else:
-                    bound_kernel = BoundKernel(self, args)
-                if cache_key is None:
-                    full_key = self._create_bound_kernel_cache_key(
-                        bound_kernel, args, signature
-                    )
-                    cache_key = (full_key.specialization_key, full_key.extra_results)
-                self._bound_kernels[cache_key] = bound_kernel
+            normalized_args: tuple[object, ...] = self.normalize_args(*args)
+            if len(normalized_args) != len(args):
+                # we had default args that needed to be applied
+                bound_kernel = self.bind(normalized_args)
+            else:
+                bound_kernel = BoundKernel(self, args)
+            if cache_key is None:
+                cache_key = self._create_bound_kernel_cache_key(
+                    bound_kernel, args, signature
+                )
+            self._bound_kernels[cache_key] = bound_kernel
         return bound_kernel
 
     def _base_specialization_key(self, args: Sequence[object]) -> tuple[Hashable, ...]:
