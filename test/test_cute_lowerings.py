@@ -49,7 +49,7 @@ from helion._compiler.cute.cute_mma import _build_kloop_non_pipeline_release_if
 from helion._compiler.cute.cute_mma import _build_kloop_pipeline_consumer_if
 from helion._compiler.cute.cute_mma import _build_kloop_pipeline_consumer_prefetch_stmts
 from helion._compiler.cute.cute_mma import _build_kloop_pipeline_producer_if
-from helion._compiler.cute.cute_mma import _build_kloop_pipeline_release_if
+from helion._compiler.cute.cute_mma import _build_kloop_pipeline_release_stmts
 from helion._compiler.cute.cute_mma import _build_tcgen05_mma_accumulate_reset_stmt
 from helion._compiler.cute.cute_mma import _build_tcgen05_mma_issue_stmt
 from helion._compiler.cute.cute_mma import _choose_mma_impl
@@ -238,6 +238,18 @@ from helion.language.memory_ops import _maybe_codegen_cute_packed_affine_lhs_loa
 from helion.language.memory_ops import _tcgen05_rowvec_aux_stage_copy_elems
 from helion.language.memory_ops import load
 from helion.runtime import _append_cute_wrapper_plan
+
+
+def _build_kloop_pipeline_release_if(*args: object, **kwargs: object) -> ast.stmt:
+    """Single-statement shim over the list-returning release builder.
+
+    Every non-static-full form still emits exactly one statement; the
+    static-full two-CTA form returns two sibling gated statements and is
+    asserted directly against ``_build_kloop_pipeline_release_stmts``.
+    """
+    (stmt,) = _build_kloop_pipeline_release_stmts(*args, **kwargs)  # pyrefly: ignore
+    return stmt
+
 
 # The legacy ``T1`` direct-entry seed (1024x4096x1024, bk=64) used a deep
 # (ab=6, c=4) A/B pipeline. The per-target constants were removed when the
@@ -4760,15 +4772,16 @@ class TestCuteLowerings(unittest.TestCase):
                 self.assertIn("pid_0 = virtual_pid % num_blocks_0", role_src)
                 self.assertIn("tile_offset_0 = pid_0 * _BLOCK_SIZE_0", role_src)
                 self.assertIn("for tile_offset_2 in range", role_src)
+                # Static-full role-local configs emit the unified producer:
+                # an unconditional blocking acquire + copy pair per K tile
+                # with no full-tile predicates or per-stage prologue chain.
                 self.assertIn(
-                    "if tcgen05_tma_full_tile and tcgen05_tma_next_full_tile",
+                    "tcgen05_ab_pipeline.producer_acquire(tcgen05_ab_producer_state)",
                     role_src,
                 )
-                self.assertNotIn(
-                    "tcgen05_tma_full_tile and tcgen05_tma_warp and "
-                    "tcgen05_tma_next_full_tile",
-                    role_src,
-                )
+                self.assertIn("tma_gA[None, tcgen05_tma_k_tile]", role_src)
+                self.assertNotIn("tcgen05_tma_full_tile", role_src)
+                self.assertNotIn("tcgen05_tma_warp and", role_src)
                 found_role_local_producer_loop = True
 
         for node in ast.walk(tree):
@@ -6133,11 +6146,14 @@ class TestCuteLowerings(unittest.TestCase):
         seeded inputs, executing the kernel, and asserting closeness
         against the torch reference. See ``cute_plan.md §6.9.1``.
 
-        Pinned codegen markers (``num_stages=3``, intermediate-stage
-        gate variable, per-stage prefetch ``k_offset=0,1,2``) are also
-        checked so a producer-side regression that codegens fine but
-        re-introduces the prefetch gap fails fast at the codegen layer
-        before consuming the runtime budget.
+        Static-full role-local configs (this one) now emit the unified
+        TMA producer — one rolled K loop whose blocking
+        ``producer_acquire`` fills every stage in order, so the
+        stage-gap deadlock is structurally impossible. The pinned
+        codegen markers assert that unified shape (``num_stages=3``,
+        a single ``tma_gA[None, tcgen05_tma_k_tile]`` issue site, no
+        per-stage prefetch chain); the runtime check still defends the
+        end-to-end behaviour.
         """
 
         from helion._compiler.cute.mma_support import get_cute_mma_support
@@ -6178,16 +6194,18 @@ class TestCuteLowerings(unittest.TestCase):
                         tcgen05_ab_stages=3,
                     )
                     code = bound.to_triton_code(cfg)
-                    # Codegen markers: pipeline depth + per-stage prefetch.
+                    # Codegen markers: pipeline depth + the unified rolled
+                    # producer (single un-offset TMA issue site, no unrolled
+                    # per-stage prefetch chain).
                     self.assertIn("PipelineTmaUmma.create(num_stages=3", code)
-                    for k_offset in (0, 1, 2):
-                        self.assertIn(f"tma_gA[None, cutlass.Int32({k_offset})]", code)
-                        self.assertIn(f"tma_gB[None, cutlass.Int32({k_offset})]", code)
-                    self.assertIn(
+                    self.assertIn("tma_gA[None, tcgen05_tma_k_tile]", code)
+                    self.assertIn("tma_gB[None, tcgen05_tma_k_tile]", code)
+                    self.assertNotIn("tma_gA[None, cutlass.Int32(0)]", code)
+                    self.assertNotIn(
                         "tma_gA[None, tcgen05_tma_k_tile + cutlass.Int32(3)]",
                         code,
                     )
-                    self.assertIn("tcgen05_tma_initial_stage_1_full_tile", code)
+                    self.assertNotIn("tcgen05_tma_initial_stage_1_full_tile", code)
                     bound.set_config(cfg)
                     out = bound(*args)
                 # If the deadlock regresses, the kernel hangs (CI test
@@ -9563,12 +9581,19 @@ class TestCuteLowerings(unittest.TestCase):
                     self.assertIn("tcgen05_ab_consumer_state.advance()", role_src)
                     release_pos = role_src.index("tcgen05_ab_pipeline.consumer_release")
                     advance_pos = role_src.index("tcgen05_ab_consumer_state.advance()")
+                    # Per-K gates reuse the hoisted cluster-rank local
+                    # (``tcgen05_cta_rank_in_cluster``); per-tile gates keep
+                    # the inline ``make_warp_uniform(...)`` leader form.
+                    hoisted_leader = "tcgen05_cta_rank_in_cluster == cutlass.Int32(0)"
                     next_ab_peek_blocks = [
                         ast.unparse(child)
                         for child in ast.walk(node)
                         if isinstance(child, ast.If)
                         and "tcgen05_tma_next_consumer_tile" in ast.unparse(child.test)
-                        and _TCGEN05_CLUSTER_LEADER_PREDICATE in ast.unparse(child.test)
+                        and (
+                            _TCGEN05_CLUSTER_LEADER_PREDICATE in ast.unparse(child.test)
+                            or hoisted_leader in ast.unparse(child.test)
+                        )
                     ]
                     self.assertTrue(
                         next_ab_peek_blocks,
@@ -9589,7 +9614,10 @@ class TestCuteLowerings(unittest.TestCase):
                         ast.unparse(child)
                         for child in ast.walk(node)
                         if isinstance(child, ast.If)
-                        and _TCGEN05_CLUSTER_LEADER_PREDICATE in ast.unparse(child.test)
+                        and (
+                            _TCGEN05_CLUSTER_LEADER_PREDICATE in ast.unparse(child.test)
+                            or hoisted_leader in ast.unparse(child.test)
+                        )
                     ]
                     self.assertTrue(
                         any(
@@ -19525,20 +19553,32 @@ class TestPerKiterTmaBuilders(unittest.TestCase):
         with self.assertRaisesRegex(AssertionError, "scalar fallback"):
             _build_kloop_pipeline_release_if(args)
 
+        # The per-K-iter producer-if never serves two-CTA static-full (the
+        # unified rolled producer loop replaces it there); consumer wait /
+        # release DO serve it from the role-local exec loop, emitting
+        # leader-gated statements with no full-tile wrapper.
         two_cta_args = self._make_args(is_two_cta=True, static_full_tiles=True)
-        for builder in (
-            _build_kloop_pipeline_producer_if,
-            _build_kloop_pipeline_consumer_if,
-            _build_kloop_pipeline_release_if,
-        ):
-            with (
-                self.subTest(builder=builder.__name__),
-                self.assertRaisesRegex(AssertionError, "one-CTA"),
-            ):
-                if builder is _build_kloop_pipeline_producer_if:
-                    builder(two_cta_args)
-                else:
-                    builder(two_cta_args, include_scalar_fallback=False)
+        with self.assertRaisesRegex(AssertionError, "one-CTA"):
+            _build_kloop_pipeline_producer_if(two_cta_args)
+        two_cta_consumer = _build_kloop_pipeline_consumer_if(
+            two_cta_args,
+            gate_exec_warp=False,
+            include_scalar_fallback=False,
+        )
+        self.assertIsInstance(two_cta_consumer, ast.If)
+        self.assertEqual(
+            ast.unparse(two_cta_consumer.test), _TCGEN05_CLUSTER_LEADER_PREDICATE
+        )
+        release_stmt, advance_stmt = _build_kloop_pipeline_release_stmts(
+            two_cta_args,
+            gate_exec_warp=False,
+            include_scalar_fallback=False,
+        )
+        self.assertIsInstance(release_stmt, ast.If)
+        self.assertEqual(
+            ast.unparse(release_stmt.test), _TCGEN05_CLUSTER_LEADER_PREDICATE
+        )
+        self.assertEqual(self._stmt_kinds([advance_stmt]), ["advance"])
 
     def test_non_pipeline_builders_reject_static_full_fast_path(self) -> None:
         args = self._make_args(static_full_tiles=True)
