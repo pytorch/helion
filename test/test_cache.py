@@ -707,6 +707,49 @@ class TestCache(RefEagerTestDisabled, TestCase):
             self.assertIsNotNone(cache_key)
             self.assertTrue(_backend_cache_artifact(backend_cache, cache_key).exists())
 
+    def test_ephemeral_cache_winner_persisted_at_finalize(self):
+        """CuTe finalize re-persists the winner from memory: the artifact lands
+        in the real cache dir at autotune time (before any post-autotune
+        launch) and the first launch does not recompile."""
+        if not _is_cute():
+            self.skipTest("cute-only: finalize persists from memory")
+
+        env_name = _backend_cache_dir_env()
+        subdir = _backend_cache_subdir()
+
+        kernel, args_a, result_a, _args_b, _result_b = KERNELS["add"]()
+        kernel.reset()
+        kernel.settings.autotuner_fn = StrictLocalAutotuneCache[MultiConfigSearch]
+
+        with (
+            tempfile.TemporaryDirectory() as tmp,
+            patch.dict(os.environ, {"HELION_CACHE_DIR": tmp}),
+        ):
+            os.environ.pop(env_name, None)
+            bound = kernel.bind(args_a)
+            bound.autotune(args_a)
+
+            cache_key = bound.backend_cache_key()
+            self.assertIsNotNone(cache_key)
+            backend_cache = Path(tmp) / subdir / "0"
+            artifact = _backend_cache_artifact(backend_cache, cache_key)
+            self.assertTrue(artifact.is_file())
+            sidecar = backend_cache / f"cute_dsl_{cache_key}.json"
+            self.assertTrue(sidecar.is_file())
+            # Only the winner's artifact pair was persisted.
+            entries = [p for p in backend_cache.iterdir() if not p.name.startswith(".")]
+            self.assertEqual(len(entries), 2)
+
+            import cutlass.cute as cute
+
+            with patch.object(
+                cute,
+                "compile",
+                side_effect=AssertionError("winner should not recompile"),
+            ):
+                result = kernel(*args_a)
+            torch.testing.assert_close(result, result_a, rtol=1e-2, atol=5e-2)
+
 
 instantiate_parametrized_tests(TestCache)
 
