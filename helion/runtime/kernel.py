@@ -4,7 +4,6 @@ import ast
 import contextlib
 import dataclasses
 import functools
-import hashlib
 import inspect
 import itertools
 import logging
@@ -228,46 +227,6 @@ class Kernel(Generic[_R]):
         self.__defaults__ = fn.__defaults__
         self.__kwdefaults__ = fn.__kwdefaults__
 
-    def _settings_signature(self) -> str:
-        """Return a stable string of settings that influence Triton codegen.
-
-        Mirrors the settings captured by
-        :meth:`BoundKernel.format_kernel_decorator` so the kernel id reflects
-        the same code-generation-affecting knobs.
-        """
-        parts = [f"static_shapes={self.settings.static_shapes}"]
-        if self.settings.index_dtype is not None:
-            parts.append(f"index_dtype={self.settings.index_dtype}")
-        return ", ".join(parts)
-
-    @functools.cache  # noqa: B019
-    def kernel_id(self) -> str:
-        """
-        Return a stable, content-derived identifier for this kernel.
-
-        The id is the SHA-256 hash of the kernel source together with the
-        settings that influence Triton code generation (see
-        :meth:`_settings_signature`). Because it is derived purely from content,
-        it is stable across processes and runs, making it suitable as a foreign
-        key for grouping telemetry rows by kernel during analysis.
-
-        Raises ``OSError`` if the source cannot be located (e.g. functions
-        defined in an interactive REPL or generated dynamically); see
-        :meth:`kernel_source`.
-        """
-        payload = self.kernel_source() + self._settings_signature()
-        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
-
-    @functools.cache  # noqa: B019
-    def kernel_source(self) -> str:
-        """
-        Return the kernel's source text.
-
-        This is the stable identifier across processes/runs, suitable for
-        grouping telemetry rows by kernel during analysis.
-        """
-        return inspect.getsource(self.fn)
-
     def _get_bound_kernel_cache_key(
         self, args: tuple[object, ...], signature: tuple[Hashable, ...]
     ) -> tuple[Hashable, ...] | None:
@@ -303,20 +262,20 @@ class Kernel(Generic[_R]):
         Returns:
             BoundKernel: A BoundKernel object with the given arguments bound.
         """
-        with measure("Kernel.bind"):
-            if not isinstance(args, tuple):
-                assert isinstance(args, list), "args must be a tuple or list"
-                args = tuple(args)
-            if len(args) > self._num_params:
-                raise TypeError(
-                    f"Too many arguments passed to the kernel, expected: {self._num_params} got: {len(args)}."
-                )
-            signature = self._base_specialization_key(args)
-            cache_key = self._get_bound_kernel_cache_key(args, signature)
-            bound_kernel = (
-                None if cache_key is None else self._bound_kernels.get(cache_key, None)
+        if not isinstance(args, tuple):
+            assert isinstance(args, list), "args must be a tuple or list"
+            args = tuple(args)
+        if len(args) > self._num_params:
+            raise TypeError(
+                f"Too many arguments passed to the kernel, expected: {self._num_params} got: {len(args)}."
             )
-            if bound_kernel is None:
+        signature = self._base_specialization_key(args)
+        cache_key = self._get_bound_kernel_cache_key(args, signature)
+        bound_kernel = (
+            None if cache_key is None else self._bound_kernels.get(cache_key, None)
+        )
+        if bound_kernel is None:
+            with measure("Kernel.bind"):
                 normalized_args: tuple[object, ...] = self.normalize_args(*args)
                 if len(normalized_args) != len(args):
                     # we had default args that needed to be applied
@@ -329,7 +288,7 @@ class Kernel(Generic[_R]):
                     )
                     cache_key = (full_key.specialization_key, full_key.extra_results)
                 self._bound_kernels[cache_key] = bound_kernel
-            return bound_kernel
+        return bound_kernel
 
     def _base_specialization_key(self, args: Sequence[object]) -> tuple[Hashable, ...]:
         """
@@ -1446,8 +1405,7 @@ def _graph_module_key(fn: Kernel, obj: torch.fx.GraphModule) -> Hashable:
 
 
 _specialization_extractors: dict[
-    type[object] | str,
-    Callable[[Kernel, object], Hashable],
+    type[object] | str, Callable[[Kernel, object], Hashable]
     # pyrefly: ignore [bad-assignment]
 ] = {
     torch.Tensor: _tensor_key,
