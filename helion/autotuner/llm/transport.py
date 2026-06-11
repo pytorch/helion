@@ -34,6 +34,12 @@ _ANTHROPIC_ADAPTIVE_MIN_VERSIONS: dict[str, tuple[int, int]] = {
     "opus": (4, 5),
     "sonnet": (4, 6),
 }
+# Per-family minimum (major, minor) at/after which the `temperature` knob is
+# deprecated and rejected (HTTP 400 on the API, ValidationException on Bedrock).
+# Opus 4.7+ rejects it. Below-minimum / unlisted families still accept it.
+_ANTHROPIC_TEMPERATURE_DEPRECATED_MIN_VERSIONS: dict[str, tuple[int, int]] = {
+    "opus": (4, 7),
+}
 # Minor capped at 2 digits + non-digit lookahead so 8-digit date suffixes (e.g.
 # `claude-opus-4-20250514`) don't get mis-parsed as the minor version.
 _ANTHROPIC_MODEL_VERSION_RE = re.compile(
@@ -48,6 +54,9 @@ _PROVIDER_ALIASES = {
     "openai": "openai_responses",
     "openai_responses": "openai_responses",
     "openai-responses": "openai_responses",
+    "bedrock": "bedrock",
+    "aws_bedrock": "bedrock",
+    "aws-bedrock": "bedrock",
 }
 
 
@@ -58,7 +67,7 @@ def normalize_provider(provider: str) -> str:
         return resolved
     raise ValueError(
         f"Unsupported LLM provider {provider!r}. "
-        "Valid providers are: anthropic, openai, openai_responses."
+        "Valid providers are: anthropic, openai, openai_responses, bedrock."
     )
 
 
@@ -67,6 +76,12 @@ def infer_provider(model: str, provider: str | None = None) -> str:
     if provider is not None:
         return normalize_provider(provider)
     normalized = model.lower()
+    # Bedrock must be opted into explicitly with a `bedrock/` prefix (e.g.
+    # `bedrock/us.anthropic.claude-sonnet-4-6`), or via HELION_LLM_PROVIDER=bedrock.
+    # A bare region-prefixed id like `us.anthropic.claude-...` is NOT auto-routed
+    # to Bedrock, since the same model string can be served by the direct API.
+    if normalized.startswith("bedrock/"):
+        return "bedrock"
     if normalized.startswith(("claude", "anthropic/")):
         return "anthropic"
     if normalized.startswith(
@@ -78,7 +93,7 @@ def infer_provider(model: str, provider: str | None = None) -> str:
 
 def strip_provider_prefix(model: str) -> str:
     """Remove a provider prefix before sending the model name to the API."""
-    for prefix in ("anthropic/", "openai/"):
+    for prefix in ("anthropic/", "openai/", "bedrock/"):
         if model.startswith(prefix):
             return model.removeprefix(prefix)
     return model
@@ -158,15 +173,38 @@ def _anthropic_thinking_budget_tokens(effort_level: str | None) -> int | None:
     return _ANTHROPIC_THINKING_BUDGET_BY_EFFORT[normalized]
 
 
-def _supports_anthropic_adaptive(model: str) -> bool:
-    match = _ANTHROPIC_MODEL_VERSION_RE.match(model.lower())
+def _anthropic_version_at_least(
+    model: str, minimums: dict[str, tuple[int, int]]
+) -> bool:
+    """Return True if `model`'s (family, version) meets the per-family minimum.
+
+    Tolerates Bedrock-style IDs (e.g. `us.anthropic.claude-opus-4-8`) by matching
+    the `claude-...` segment anywhere in the string, not just at the start.
+    """
+    normalized = model.lower()
+    # Bedrock prefixes the model with a region/partition + `anthropic.`; drop
+    # everything up to and including that so the `claude-...` regex can match.
+    if "anthropic." in normalized:
+        normalized = normalized.rsplit("anthropic.", 1)[1]
+    match = _ANTHROPIC_MODEL_VERSION_RE.match(normalized)
     if match is None:
         return False
     family, major_str, minor_str = match.groups()
-    minimum = _ANTHROPIC_ADAPTIVE_MIN_VERSIONS.get(family)
+    minimum = minimums.get(family)
     if minimum is None:
         return False
     return (int(major_str), int(minor_str) if minor_str else 0) >= minimum
+
+
+def _supports_anthropic_adaptive(model: str) -> bool:
+    return _anthropic_version_at_least(model, _ANTHROPIC_ADAPTIVE_MIN_VERSIONS)
+
+
+def _temperature_deprecated(model: str) -> bool:
+    """Whether the model rejects the `temperature` knob (Opus 4.7+)."""
+    return _anthropic_version_at_least(
+        model, _ANTHROPIC_TEMPERATURE_DEPRECATED_MIN_VERSIONS
+    )
 
 
 def _anthropic_max_tokens(
@@ -272,11 +310,11 @@ def _anthropic_payload(
             "type": "enabled",
             "budget_tokens": thinking_token_budget,
         }
-    # Claude Opus 4.7, extended thinking, and fast mode each reject `temperature`.
+    # Claude Opus 4.7+, extended thinking, and fast mode each reject `temperature`.
     if (
         not enable_thinking
         and not fast_mode
-        and not normalized_model.lower().startswith("claude-opus-4-7")
+        and not _temperature_deprecated(normalized_model)
     ):
         payload["temperature"] = DEFAULT_ANTHROPIC_TEMPERATURE
     if system_prompt:
@@ -516,6 +554,86 @@ def _post_json(
     raise RuntimeError(f"Unexpected JSON payload from {url}: {type(body).__name__}")
 
 
+# Anthropic-on-Bedrock requires this version string in the request body and
+# forbids the `model` field (the model is named by `modelId` on the API call).
+_BEDROCK_ANTHROPIC_VERSION = "bedrock-2023-05-31"
+
+
+def _resolve_bedrock_region(api_base: str | None) -> str | None:
+    """Pick the AWS region for Bedrock from the api_base override or env."""
+    # Allow `api_base` to carry the region (e.g. "us-east-1") for parity with
+    # the other providers' single knob; otherwise fall back to the standard
+    # AWS env vars, then let boto3's own config/role resolution take over.
+    return (
+        api_base or os.environ.get("AWS_REGION") or os.environ.get("AWS_DEFAULT_REGION")
+    )
+
+
+def _call_bedrock(
+    *,
+    model: str,
+    api_base: str | None,
+    messages: list[dict[str, str]],
+    max_output_tokens: int,
+    request_timeout_s: float,
+    effort_level: str | None,
+    fast_mode: bool,
+) -> str:
+    """Invoke Anthropic-on-Bedrock via boto3, reusing the Anthropic codecs.
+
+    Auth is handled by boto3's default credential chain (IAM role, env creds,
+    or profile) -- no API key is read. The request body is the same Anthropic
+    Messages payload used by the direct API, minus `model` and plus the Bedrock
+    `anthropic_version`.
+
+    Request/response format and the boto3 ``invoke_model`` usage follow the AWS
+    reference example:
+    https://docs.aws.amazon.com/bedrock/latest/userguide/bedrock-runtime_example_bedrock-runtime_InvokeModel_AnthropicClaude_section.html
+    """
+    try:
+        # boto3 is an optional dependency: only required when the Bedrock
+        # provider is actually used, so it isn't a Helion install requirement.
+        import boto3  # pyrefly: ignore [missing-import]
+        import botocore.config  # pyrefly: ignore [missing-import]
+    except ImportError as e:
+        raise RuntimeError(
+            "Bedrock provider requested but boto3 is not installed. "
+            "Install it with `pip install boto3`."
+        ) from e
+
+    payload = _anthropic_payload(
+        model,
+        messages,
+        max_output_tokens,
+        effort_level,
+        fast_mode,
+    )
+    # On Bedrock the model is named by `modelId`, not in the body.
+    model_id = payload.pop("model")
+    payload["anthropic_version"] = _BEDROCK_ANTHROPIC_VERSION
+
+    client = boto3.client(
+        "bedrock-runtime",
+        region_name=_resolve_bedrock_region(api_base),
+        config=botocore.config.Config(
+            read_timeout=request_timeout_s,
+            connect_timeout=request_timeout_s,
+            retries={"max_attempts": 2, "mode": "standard"},
+        ),
+    )
+    try:
+        response = client.invoke_model(modelId=model_id, body=json.dumps(payload))
+    except Exception as e:  # botocore.exceptions.ClientError and friends
+        raise RuntimeError(f"Bedrock invoke_model failed for {model_id!r}: {e}") from e
+
+    body = json.loads(response["body"].read())
+    if not isinstance(body, dict):
+        raise RuntimeError(
+            f"Unexpected Bedrock payload from {model_id!r}: {type(body).__name__}"
+        )
+    return extract_anthropic_text(body)
+
+
 def call_provider(
     provider: str,
     *,
@@ -530,6 +648,18 @@ def call_provider(
 ) -> str:
     """Resolve credentials, send one request, and extract text from the response."""
     normalized_provider = normalize_provider(provider)
+    if normalized_provider == "bedrock":
+        # Bedrock uses boto3/SigV4 instead of an HTTP+api-key transport, so it
+        # bypasses the _ProviderConfig path entirely.
+        return _call_bedrock(
+            model=model,
+            api_base=api_base,
+            messages=messages,
+            max_output_tokens=max_output_tokens,
+            request_timeout_s=request_timeout_s,
+            effort_level=effort_level,
+            fast_mode=fast_mode,
+        )
     config = _provider_config(normalized_provider)
     resolved_api_key = _resolve_api_key(normalized_provider, api_key)
     response = _post_json(
