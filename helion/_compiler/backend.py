@@ -1245,9 +1245,9 @@ class TritonBackend(Backend):
         return f"triton.cdiv({numel}, {block_size})"
 
     def inductor_op_overrides(self) -> InductorOpOverrides:
-        from torch._inductor.codegen.triton import TritonOverrides
+        from .triton.overrides import HelionTritonOverrides
 
-        return TritonOverrides()
+        return HelionTritonOverrides()
 
     def grid_index_expr(
         self, offset_var: str, block_size_var: str, dtype: str, *, axis: int

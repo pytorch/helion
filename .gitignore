@@ -88,7 +88,7 @@ site
 tags
 TAGS
 torch
-triton
+/triton
 *.user
 uv.lock
 venv
