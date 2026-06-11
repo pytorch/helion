@@ -8,7 +8,8 @@ node-link schema, so a consumer can rebuild a graph with no extra effort::
     import json, networkx as nx
 
     data = json.loads(line)  # one line of <base>.ir.jsonl
-    g = nx.node_link_graph(data, edges="links")
+    g = nx.node_link_graph(data, edges="links")   # networkx >= 3.4
+    # networkx < 3.4 renamed this parameter: use ``link="links"`` instead.
 
 Two edge kinds are emitted, both grounded in *live* graph nodes: ``data`` edges
 from ``node.args``/``kwargs``, and ``region`` edges from explicit control-flow

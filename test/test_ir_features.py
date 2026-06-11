@@ -13,6 +13,18 @@ from helion.autotuner import ir_features
 from helion.autotuner.ir_features import extract_ir_graph
 
 
+def _node_link_graph(data: dict[str, object]) -> nx.DiGraph:
+    """Load a node-link record across networkx versions.
+
+    networkx renamed the edge-key parameter from ``link=`` to ``edges=`` in 3.4;
+    our edge array lives under the ``"links"`` key in both cases.
+    """
+    try:
+        return nx.node_link_graph(data, edges="links")  # networkx >= 3.4
+    except TypeError:
+        return nx.node_link_graph(data, link="links")  # networkx < 3.4
+
+
 def _extract(kernel: object, args: tuple[object, ...], name: str) -> dict[str, object]:
     bound = kernel.bind(args)  # type: ignore[attr-defined]
     return extract_ir_graph(
@@ -51,7 +63,7 @@ class TestIrFeatures(TestCase):
         self.assertTrue(pointwise)
         self.assertIsNotNone(pointwise[0]["pointwise_ranges"])
         # Reconstructs as a networkx DiGraph with no effort.
-        graph = nx.node_link_graph(json.loads(json.dumps(g)), edges="links")
+        graph = _node_link_graph(json.loads(json.dumps(g)))
         self.assertTrue(graph.is_directed())
         self.assertEqual(graph.number_of_nodes(), len(g["nodes"]))
         self.assertEqual(graph.number_of_edges(), len(g["links"]))
@@ -170,7 +182,7 @@ class TestIrFeaturesEdgeCases(TestCase):
         self.assertEqual(g["schema_version"], ir_features.IR_SCHEMA_VERSION)
         self.assertEqual(g["graph"]["num_graphs"], 0)
         # Still a loadable (empty) networkx DiGraph.
-        graph = nx.node_link_graph(json.loads(json.dumps(g)), edges="links")
+        graph = _node_link_graph(json.loads(json.dumps(g)))
         self.assertEqual(graph.number_of_nodes(), 0)
         self.assertTrue(graph.is_directed())
 
