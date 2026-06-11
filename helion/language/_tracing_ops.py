@@ -2275,6 +2275,7 @@ def _codegen_fori_loop(state: CodegenState) -> object:
                     placeholders = [
                         n for n in graph_info.graph.nodes if n.op == "placeholder"
                     ]
+                    assert isinstance(args, list)
                     if jpat.sublane_base_fx in placeholders:
                         outer_ast = args[placeholders.index(jpat.sublane_base_fx)]
                         starts_name = ast.unparse(outer_ast)
