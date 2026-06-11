@@ -253,12 +253,10 @@ class BaseSearch(BaseAutotuner):
         if budget is not None:
             self.log(f"Autotune budget: {budget}s")
         kernel_obj = getattr(self.kernel, "kernel", None)
-        kernel_id = ""
         kernel_source = ""
         if kernel_obj is not None:
             try:
                 kernel_source = kernel_obj.kernel_source()
-                kernel_id = kernel_obj.kernel_id()
             except OSError:
                 self.log.debug("Failed to read Helion kernel source", exc_info=True)
         kernel_name = getattr(kernel_obj, "name", "")
@@ -267,7 +265,6 @@ class BaseSearch(BaseAutotuner):
         dtypes = str([str(t.dtype) for t in tensors])
         hardware = get_device_name(extract_device(self.args)) or ""
         self._autotune_metrics: AutotuneMetrics = AutotuneMetrics(
-            kernel_id=kernel_id,
             kernel_name=kernel_name,
             kernel_source=kernel_source,
             input_shapes=input_shapes,
@@ -276,15 +273,19 @@ class BaseSearch(BaseAutotuner):
             search_algorithm=type(self).__name__,
         )
         # Appended once per run to the <autotune_log>.meta.jsonl sidecar so the
-        # per-config CSV rows can be joined back to it (run_id) and grouped by
-        # kernel (kernel_id) across runs. run_id is derived inside KernelMetadata.
+        # per-config CSV rows can be joined back to it on run_id. run_id is
+        # derived inside KernelMetadata directly from the kernel identity; the
+        # full settings carry the codegen/reproduction context. config_defaults
+        # carries the run's default config so a consumer can rebuild each row's
+        # minimized config via {**config_defaults, **row_config}.
         self._kernel_metadata: KernelMetadata = KernelMetadata(
-            kernel_id=kernel_id,
             kernel_name=kernel_name,
             kernel_source=kernel_source,
             input_shapes=input_shapes,
             dtypes=dtypes,
             hardware=hardware,
+            settings=self.settings.to_dict(),
+            config_defaults=self.config_spec.default_config().config,
         )
         self.benchmark_provider = self._benchmark_provider_cls(
             kernel=self.kernel,
@@ -295,6 +296,20 @@ class BaseSearch(BaseAutotuner):
             autotune_metrics=self._autotune_metrics,
         )
         self.benchmark_provider.set_budget_exceeded_fn(self._autotune_budget_exceeded)
+
+    def _is_restricted_search(self) -> bool:
+        """Whether the search space is the user's pinned configs.
+
+        A kernel decorated with ``configs=[...]`` (and not ``force_autotune``)
+        tunes only between those user-chosen configs, so its telemetry is a
+        biased, non-representative slice; such runs are excluded from data
+        collection. ``force_autotune`` searches the full space and is collected.
+        Best-effort: a missing kernel object / ``configs`` attribute reads as
+        "not restricted" so a genuine search is never dropped by accident.
+        """
+        kernel_obj = getattr(self.kernel, "kernel", None)
+        configs = getattr(kernel_obj, "configs", None)
+        return bool(configs) and not self.settings.force_autotune
 
     def _autotune_budget_exceeded(self) -> bool:
         budget = self.settings.autotune_budget_seconds
@@ -475,7 +490,7 @@ class BaseSearch(BaseAutotuner):
         start = time.perf_counter()
         exit_stack = contextlib.ExitStack()
         with exit_stack:
-            if self.settings.autotune_log:
+            if self.settings.autotune_log and not self._is_restricted_search():
                 exit_stack.enter_context(
                     self.log.autotune_logging(metadata=self._kernel_metadata)
                 )

@@ -3,7 +3,6 @@ from __future__ import annotations
 import abc
 import datetime
 import functools
-import hashlib
 from itertools import count
 from itertools import starmap
 import math
@@ -332,22 +331,6 @@ class LocalBenchmarkProvider(BenchmarkProvider):
             self._compute_effective_tolerances()
         )
         self._jobs = self._decide_num_jobs()
-
-    def _sample_identity(self, config: Config) -> tuple[str, str]:
-        """Return ``(sample_id, decorator)`` for a config's telemetry rows.
-
-        ``decorator`` is ``format_kernel_decorator(config)`` -- the canonical
-        ``@helion.kernel(...)`` string that reproduces this config -- and is
-        collected as a structured artifact. ``sample_id`` is
-        ``sha256(kernel_source + decorator)``, a stable per-(kernel, config) id
-        so the same kernel benchmarked with the same config produces the same id
-        across runs, enabling label aggregation/dedup for the cost-model dataset.
-        The decorator is computed once here and reused for both ids and the row.
-        """
-        decorator = self.kernel.format_kernel_decorator(config, self.settings)
-        payload = self._autotune_metrics.kernel_source + decorator
-        sample_id = hashlib.sha256(payload.encode("utf-8")).hexdigest()
-        return sample_id, decorator
 
     def _compute_baseline(
         self,
@@ -820,31 +803,36 @@ class LocalBenchmarkProvider(BenchmarkProvider):
                     process_group_name=self.kernel.env.process_group_name,
                 )
             ):
-                sample_id, decorator = self._sample_identity(config)
-                self.log.record_autotune_entry(
-                    AutotuneLogEntry(
-                        generation=self._autotune_metrics.num_generations,
-                        status="started",
-                        perf_ms=None,
-                        compile_time=compile_time,
-                        config=config,
-                        sample_id=sample_id,
-                        decorator=decorator,
-                    )
+                # Only minimize/record when telemetry is active (an active log
+                # sink). Record the minimized config (defaults dropped) so the
+                # dataset stays lean; benchmark the original config so behaviour
+                # is unchanged. ``minimized is not None`` <=> recording, and also
+                # narrows the type for AutotuneLogEntry(config=...).
+                minimized = (
+                    config.minimize(self.config_spec) if self.log.recording else None
                 )
+                if minimized is not None:
+                    self.log.record_autotune_entry(
+                        AutotuneLogEntry(
+                            generation=self._autotune_metrics.num_generations,
+                            status="started",
+                            perf_ms=None,
+                            compile_time=compile_time,
+                            config=minimized,
+                        )
+                    )
                 perf = self._benchmark_function(config, fn)
                 status = "ok" if math.isfinite(perf) else "error"
-                self.log.record_autotune_entry(
-                    AutotuneLogEntry(
-                        generation=self._autotune_metrics.num_generations,
-                        status=status,
-                        perf_ms=perf if math.isfinite(perf) else None,
-                        compile_time=compile_time,
-                        config=config,
-                        sample_id=sample_id,
-                        decorator=decorator,
+                if minimized is not None:
+                    self.log.record_autotune_entry(
+                        AutotuneLogEntry(
+                            generation=self._autotune_metrics.num_generations,
+                            status=status,
+                            perf_ms=perf if math.isfinite(perf) else None,
+                            compile_time=compile_time,
+                            config=minimized,
+                        )
                     )
-                )
                 results[valid_indices[index]] = BenchmarkResult(
                     config=config,
                     fn=fn,

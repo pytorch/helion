@@ -119,7 +119,9 @@ class TestAutotuneIgnoreErrors(TestCase):
         )
         search.args = args
         search.log = AutotuningLogger(settings)
-        search.config_spec = SimpleNamespace(default_config=dict)
+        search.config_spec = SimpleNamespace(
+            default_config=lambda: helion.Config(block_sizes=[1])
+        )
         search._benchmark_provider_cls = LocalBenchmarkProvider
         search.best_perf_so_far = float("inf")
         search._prepared = False
@@ -460,22 +462,20 @@ class TestAutotuneIgnoreErrors(TestCase):
             header,
             [
                 "run_id",
-                "kernel_id",
-                "sample_id",
                 "timestamp_s",
                 "config_index",
                 "generation",
                 "status",
                 "perf_ms",
                 "compile_time_s",
-                "decorator",
                 "config",
             ],
         )
-        # No metadata/sample_id supplied here, so the identity columns are empty.
+        # Lean schema: no kernel_id/sample_id/decorator columns.
+        for absent in ("kernel_id", "sample_id", "decorator"):
+            self.assertNotIn(absent, header)
+        # No metadata supplied here, so the run_id join key is empty.
         self.assertEqual(rows[1][header.index("run_id")], "")
-        self.assertEqual(rows[1][header.index("kernel_id")], "")
-        self.assertEqual(rows[1][header.index("sample_id")], "")
         self.assertEqual(rows[1][header.index("config_index")], "1")
         self.assertEqual(rows[1][header.index("generation")], "5")
         self.assertEqual(rows[1][header.index("status")], "ok")
@@ -754,6 +754,48 @@ class TestAutotuneIgnoreErrors(TestCase):
         for name, factory in search_factories:
             with self.subTest(algorithm=name):
                 self._run_autotuner_and_check_logging(factory)
+
+    @skipIfRefEager("Autotuning not supported in ref eager mode")
+    @skipIfXPU("maxnreg parameter not supported on XPU backend")
+    def test_autotune_skips_restricted_search(self):
+        """A run restricted to user-pinned configs (``configs=[...]`` without
+        ``force_autotune``) is excluded from data collection: neither the
+        ``.csv`` nor the ``.meta.jsonl`` is written (PRD FR1)."""
+        configs = [
+            helion.Config(block_sizes=[32], num_warps=4),
+            helion.Config(block_sizes=[64], num_warps=8),
+        ]
+        tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(tmpdir.cleanup)
+        base_path = Path(tmpdir.name) / "autotune_run"
+
+        with patch.dict(
+            os.environ,
+            {
+                "HELION_AUTOTUNE_LOG": str(base_path),
+                "HELION_AUTOTUNE_LOG_LEVEL": "0",
+            },
+        ):
+
+            @helion.kernel(configs=configs)
+            def add(a, b):
+                out = torch.empty_like(a)
+                for tile in hl.tile(out.size()):
+                    out[tile] = a[tile] + b[tile]
+                return out
+
+            args = (
+                torch.randn([64], device=DEVICE),
+                torch.randn([64], device=DEVICE),
+            )
+            bound_kernel = add.bind(args)
+            random.seed(123)
+            search = FiniteSearch(bound_kernel, args, configs=configs)
+            search.autotune()
+
+        # Restricted search -> no telemetry files at all.
+        self.assertFalse(base_path.with_suffix(".csv").exists())
+        self.assertFalse(base_path.with_suffix(".meta.jsonl").exists())
 
 
 @onlyBackends(["triton"])
@@ -3683,7 +3725,9 @@ class TestAutotuneBudget(TestCase):
         )
         search.args = ()
         search.log = AutotuningLogger(settings)
-        search.config_spec = SimpleNamespace(default_config=dict)
+        search.config_spec = SimpleNamespace(
+            default_config=lambda: helion.Config(block_sizes=[1])
+        )
         search._benchmark_provider_cls = LocalBenchmarkProvider
         search.best_perf_so_far = float("inf")
         search._prepared = False

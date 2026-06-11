@@ -50,6 +50,20 @@ _TRUE_LITERALS = frozenset({"1", "true", "yes", "on"})
 _FALSE_LITERALS = frozenset({"0", "false", "no", "off"})
 
 
+def codegen_decorator_parts(static_shapes: object, index_dtype: object) -> list[str]:
+    """Settings that influence Triton codegen, as ``key=value`` decorator parts.
+
+    Single source of truth shared by :meth:`BoundKernel.format_kernel_decorator`
+    (the config-reproduction decorator) and the autotune-telemetry ``run_id``
+    signature, so the two never drift: ``static_shapes`` always, ``index_dtype``
+    when set. Adding a codegen-affecting setting here updates both consumers.
+    """
+    parts = [f"static_shapes={static_shapes}"]
+    if index_dtype is not None:
+        parts.append(f"index_dtype={index_dtype}")
+    return parts
+
+
 def _resolve_warning_name(name: str) -> type[exc.BaseWarning]:
     attr = name.strip()
     if not attr:
