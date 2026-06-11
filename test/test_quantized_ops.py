@@ -124,8 +124,9 @@ class TestTritonQuantizedOps(RefEagerTestDisabled, TestCase):
         raw_i32 = raw.to(torch.int32)
         torch.testing.assert_close(lo, _dequant_e2m1(raw_i32 & 0xF))
         torch.testing.assert_close(hi, _dequant_e2m1((raw_i32 >> 4) & 0xF))
-        self.assertIn(" = load.to(tl.int32)", code)
+        self.assertIn(" = load.to(tl.int16)", code)
         self.assertIn("[fp4_packed_", code)
+        self.assertIn("=f,=f,h", code)
         self.assertIn("tl.inline_asm_elementwise", code)
 
 

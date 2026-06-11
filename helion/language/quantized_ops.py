@@ -53,11 +53,10 @@ def _(state: CodegenState) -> list[ast.AST]:
 # Triton uses inline asm for the same fp4x2 unpack instruction as CuTe.
 _FP4X2_TO_F32_ASM = """
 {
-    .reg .b8 b0, b1, b2, b3;
+    .reg .b8 b0;
     .reg .b16 lo, hi;
-    .reg .b32 packed, h2;
-    and.b32 packed, $2, 0xFF;
-    mov.b32 {b0, b1, b2, b3}, packed;
+    .reg .b32 h2;
+    mov.b16 {b0, _}, $2;
     cvt.rn.f16x2.e2m1x2 h2, b0;
     mov.b32 {lo, hi}, h2;
     cvt.f32.f16 $0, lo;
@@ -69,7 +68,7 @@ _FP4X2_TO_F32_ASM = """
 @_decorators.codegen(float4_e2m1fn_x2_to_float32, "triton")
 def _(state: CodegenState) -> list[ast.AST]:
     value = state.codegen.lift(
-        expr_from_string("{value}.to(tl.int32)", value=state.ast_arg(0)),
+        expr_from_string("{value}.to(tl.int16)", value=state.ast_arg(0)),
         dce=True,
         prefix="fp4_packed",
     )
@@ -78,7 +77,7 @@ def _(state: CodegenState) -> list[ast.AST]:
         func=expr_from_string("tl.inline_asm_elementwise"),
         args=[
             create(ast.Constant, value=_FP4X2_TO_F32_ASM),
-            create(ast.Constant, value="=f,=f,r"),
+            create(ast.Constant, value="=f,=f,h"),
             create(ast.List, elts=[value], ctx=ast.Load()),
             expr_from_string("(tl.float32, tl.float32)"),
             create(ast.Constant, value=True),  # is_pure
