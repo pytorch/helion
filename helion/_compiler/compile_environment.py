@@ -962,6 +962,19 @@ class CompileEnvironment:
                     )
         return result
 
+    def try_concretize_symint(self, size: int | torch.SymInt) -> int | torch.SymInt:
+        """Convert a SymInt to a plain int when the value is provably concrete.
+
+        Backed SymInts (whose values are determined by input shapes) are
+        concretized via their size hint.  Unbacked SymInts (e.g. block-size
+        variables) are left symbolic.
+        """
+        if not isinstance(size, torch.SymInt):
+            return size
+        if _has_unbacked(size._sympy_()):
+            return size
+        return self.size_hint(size)
+
     def size_hint(self, n: int | torch.SymInt) -> int:
         if isinstance(n, torch.SymInt):
             expr = n._sympy_()
