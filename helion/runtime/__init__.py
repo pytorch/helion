@@ -10,6 +10,7 @@ import importlib
 import inspect
 import json
 import linecache
+import logging
 import os
 import sys
 from typing import TYPE_CHECKING
@@ -35,6 +36,8 @@ if TYPE_CHECKING:
     from collections.abc import Iterable
 
     import jax
+
+log: logging.Logger = logging.getLogger(__name__)
 
 _CUTLASS_SHUTDOWN_PATCHED = False
 
@@ -2545,7 +2548,7 @@ class _CompiledCuteLauncher:
         return cache_dir, mlir, meta
 
     def _persist_to_disk(self, compiled: object) -> None:
-        with suppress(Exception):
+        try:
             from cutlass.base_dsl.cache_helpers import save_ir
             from cutlass.base_dsl.cache_helpers import write_bytecode_with_crc32
 
@@ -2577,6 +2580,13 @@ class _CompiledCuteLauncher:
                     f,
                 )
             os.replace(tmp, meta)
+        except Exception:
+            # A failed persist only costs a recompile in a later process.
+            log.debug(
+                "CuTe disk-cache persist failed for key %s",
+                self._cache_key,
+                exc_info=True,
+            )
 
     def _reload_from_disk(self) -> object:
         try:
