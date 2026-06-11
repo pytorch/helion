@@ -120,10 +120,10 @@ class AutotuningLogger:
     ) -> Iterator[AutotuneLogSink | None]:
         """Attach an :class:`AutotuneLogSink` for the duration of a tuning run.
 
-        When ``metadata`` is provided, the kernel identity (source, ids, shapes)
-        is appended as one record to the ``<base>.meta.jsonl`` sidecar so the
-        per-config CSV rows can be joined back to it (via ``run_id``) and grouped
-        by kernel (via ``kernel_id``) across runs.
+        When ``metadata`` is provided, the kernel identity (source, shapes,
+        dtypes, hardware, settings) is appended as one record to the
+        ``<base>.meta.jsonl`` sidecar so the per-config CSV rows can be joined
+        back to it via ``run_id``.
         """
 
         path = base_path or self._settings.autotune_log
@@ -138,6 +138,16 @@ class AutotuningLogger:
             finally:
                 sink.end_run()
                 self._detach_sink()
+
+    @property
+    def recording(self) -> bool:
+        """True when an autotune log sink is attached (telemetry is collected).
+
+        Lets callers skip building/serializing log entries (e.g. minimizing the
+        config) when telemetry is disabled — purely an optimization; the entry
+        path no-ops without a sink regardless.
+        """
+        return self._log_sink is not None
 
     def record_autotune_entry(self, entry: AutotuneLogEntry) -> None:
         """Write a structured autotune log entry when a sink is active."""
@@ -270,11 +280,6 @@ class AutotuneLogEntry(NamedTuple):
     perf_ms: float | None
     compile_time: float | None
     config: Config
-    # Stable per-(kernel, config) id: sha256(kernel_source + decorator(config)).
-    sample_id: str = ""
-    # The @helion.kernel(...) decorator string that reproduces this config;
-    # the source artifact sample_id is derived from.
-    decorator: str = ""
 
 
 class AutotuneLogSink:
@@ -315,9 +320,12 @@ class AutotuneLogSink:
             # Append one identity record (JSON Lines) per run so a single log
             # path can accumulate every (kernel, input shape) autotuned in the
             # process without clobbering earlier runs. CSV rows join back to
-            # these records via kernel_id.
+            # these records via run_id. default=str keeps the dump JSON-safe when
+            # settings carry non-serializable values (torch.dtype, enums, callables).
             with self.meta_path.open("a", encoding="utf-8") as meta_file:
-                meta_file.write(json.dumps(self._metadata.to_dict()) + "\n")
+                meta_file.write(
+                    json.dumps(self._metadata.to_dict(), default=str) + "\n"
+                )
         # Append rather than truncate so multiple autotune runs sharing one base
         # path accumulate; write the header only for a new or empty file.
         write_header = not self.csv_path.exists() or self.csv_path.stat().st_size == 0
@@ -327,15 +335,12 @@ class AutotuneLogSink:
             self._csv_writer.writerow(
                 [
                     "run_id",
-                    "kernel_id",
-                    "sample_id",
                     "timestamp_s",
                     "config_index",
                     "generation",
                     "status",
                     "perf_ms",
                     "compile_time_s",
-                    "decorator",
                     "config",
                 ]
             )
@@ -380,23 +385,20 @@ class AutotuneLogSink:
         if entry.compile_time is not None:
             compile_field = f"{entry.compile_time:.2f}"
         # run_id joins each row to exactly one .meta.jsonl record (kernel +
-        # input shape/dtype/hardware); kernel_id is the coarser foreign key that
-        # groups every row for the same kernel across shapes and runs.
+        # input shape/dtype/hardware).
         run_id = self._metadata.run_id if self._metadata is not None else ""
-        kernel_id = self._metadata.kernel_id if self._metadata is not None else ""
         self._csv_writer.writerow(
             [
                 run_id,
-                kernel_id,
-                entry.sample_id,
                 timestamp_field,
                 self._config_counter,
                 entry.generation,
                 entry.status,
                 perf_field,
                 compile_field,
-                entry.decorator,
-                str(entry.config),
+                # Compact JSON (not Config.to_json()'s indent=2) keeps each CSV
+                # cell on one line; round-trips via Config.from_json.
+                json.dumps(entry.config.config, separators=(",", ":")),
             ]
         )
         if self._csv_file is not None:
