@@ -661,7 +661,8 @@ def _transparent_wrapper_targets() -> tuple[object, ...]:
     Built lazily so the module-level import doesn't pull in helion.language
     at file-import time (would cause a circular import in some entry paths).
     """
-    from ...language import _tracing_ops, view_ops
+    from ...language import _tracing_ops
+    from ...language import view_ops
 
     return (
         view_ops.subscript,
