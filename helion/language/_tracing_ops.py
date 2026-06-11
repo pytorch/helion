@@ -448,6 +448,31 @@ def _pallas_loop_begin_and_step_exprs(
     return begin_exprs, iter_step_exprs, slice_size_exprs
 
 
+def _pipeline_begin_alignment(
+    begin_expr: str,
+    state: CodegenState,
+) -> int | None:
+    """Return a proven divisor of ``begin_expr``, or ``None``.
+
+    A nested-tile inner loop's begin is its outer loop's ``offset_var``, which is
+    a multiple of the outer block size when that outer loop begins at 0 — so it
+    needs no extra pad. Returns that block size in that case.
+    """
+    for block_id, loops in state.codegen.active_device_loops.items():
+        if not loops:
+            continue
+        if state.codegen.offset_var(block_id) != begin_expr:
+            continue
+        info = loops[-1].block_id_to_info.get(block_id)
+        # Only sound when the outer loop begins at 0, so the offset is a clean
+        # multiple of the outer block size.
+        if info is None or info.begin_expr not in (0, sympy.Integer(0)):
+            return None
+        outer_bs = state.device_function.resolved_block_size(block_id)
+        return outer_bs if isinstance(outer_bs, int) else None
+    return None
+
+
 def _compute_pipeline_or_dma_extra_pad(
     begin_expr: str,
     bid: int,
@@ -459,17 +484,19 @@ def _compute_pipeline_or_dma_extra_pad(
     When ``pl.ds(offset, block_size)`` reads from a tensor whose loop starts
     at a non-zero begin, the last block can overshoot the tensor boundary
     beyond what ``(-shape) % block_size`` accounts for.  The worst case is
-    ``block_size - 1`` extra elements when the begin is data-dependent.
-
-    # TODO(dunfanlu): if begin isn't "0" but is another constexpr int,
-    # we should be able to use a smaller padding than bs-1?
+    ``block_size - 1`` extra elements when the begin is data-dependent, but a
+    begin that is provably a multiple of ``block_size`` (e.g. an outer tile's
+    aligned offset) needs no extra padding at all.
     """
     if begin_expr == "0":
         return 0
     bs_val = state.device_function.resolved_block_size(bid)
-    if isinstance(bs_val, int):
-        return bs_val - 1
-    return 0
+    if not isinstance(bs_val, int):
+        return 0
+    alignment = _pipeline_begin_alignment(begin_expr, state)
+    if alignment is not None and alignment % bs_val == 0:
+        return 0
+    return bs_val - 1
 
 
 def _scratch_read(state: CodegenState, sname: str) -> str:
