@@ -44,9 +44,9 @@ import argparse
 import os
 
 import torch
+from triton.testing import do_bench
 
 from helion._testing import DEVICE
-from helion.autotuner.benchmarking import do_bench_generic as do_bench
 import helion.experimental
 import helion.language as hl
 
@@ -269,44 +269,9 @@ def matmul_custom_key(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     return out
 
 
-@helion.experimental.aot_kernel()
-def sum_aot(x: torch.Tensor) -> torch.Tensor:
-    """
-    Sums a 2D tensor along the last dimension.
-    This kernel is proven to compile and run reliably on Pallas/TPU.
-    """
-    m, n = x.shape
-    out = torch.empty([m], dtype=x.dtype, device=x.device)
-
-    for tile_m in hl.tile(m):
-        out[tile_m] = x[tile_m, :].sum(-1)
-
-    return out
-
-
 # ============================================================================
 # Benchmarking
 # ============================================================================
-
-
-def benchmark_sum_aot() -> None:
-    """Benchmark sum_aot kernel."""
-    print("=== sum_aot kernel ===")
-    print(f"{'Shape':>16} {'Time (ms)':>12} {'GB/s':>10}")
-    print("-" * 40)
-    # Use sizes that trigger interesting block selection behavior
-    shapes = [
-        (5120, 256),
-        (10240, 256),
-    ]
-    for m, n in shapes:
-        x = torch.randn(m, n, device=DEVICE, dtype=torch.bfloat16)
-        sum_aot(x)  # Warmup
-        time_ms = do_bench(lambda x=x: sum_aot(x))
-        assert isinstance(time_ms, float)
-        total_bytes = x.numel() * x.element_size() * 2  # read + write
-        gbps = total_bytes / time_ms * 1e-6
-        print(f"{(m, n)!s:>16} {time_ms:>12.4f} {gbps:>10.2f}")
 
 
 def benchmark_vector_scale() -> None:
@@ -460,10 +425,6 @@ KERNEL_BENCHMARKS = {
     "matmul_custom_key": benchmark_matmul_custom_key,
 }
 
-TPU_SUPPORTED_KERNELS = {
-    "sum_aot": benchmark_sum_aot,
-}
-
 
 def benchmark_kernels(kernels: list[str] | None = None) -> None:
     """Run benchmarks on selected kernels."""
@@ -471,21 +432,17 @@ def benchmark_kernels(kernels: list[str] | None = None) -> None:
     print(f"AOT Data Dir: {os.environ.get('HELION_AOT_DATA_DIR', 'N/A')}")
     print()
 
-    active_benchmarks = (
-        TPU_SUPPORTED_KERNELS if DEVICE.type == "tpu" else KERNEL_BENCHMARKS
-    )
-
     if kernels is None:
-        kernels = list(active_benchmarks.keys())
+        kernels = list(KERNEL_BENCHMARKS.keys())
 
     for i, kernel_name in enumerate(kernels):
-        if kernel_name in active_benchmarks:
+        if kernel_name in KERNEL_BENCHMARKS:
             if i > 0:
                 print()
-            active_benchmarks[kernel_name]()
+            KERNEL_BENCHMARKS[kernel_name]()
         else:
             print(f"Unknown kernel: {kernel_name}")
-            print(f"Available kernels: {', '.join(active_benchmarks.keys())}")
+            print(f"Available kernels: {', '.join(KERNEL_BENCHMARKS.keys())}")
 
 
 def main() -> None:

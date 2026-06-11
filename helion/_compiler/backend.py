@@ -1927,11 +1927,14 @@ class PallasBackend(Backend):
             if bid not in analyzer.required_alignments:
                 continue
             requirement_alignment = analyzer.required_alignments[bid]
-            if requirement_alignment >= 128:
-                spec.update_min(requirement_alignment)
-            else:
-                dim_size = next_power_of_2(max(spec.size_hint, 1))
-                spec.update_min(min(requirement_alignment, dim_size))
+            # When the tensor dim is smaller than the alignment, any
+            # block_size >= tensor_dim will be capped to tensor_dim at
+            # runtime (full-dim access, always valid).  Use the
+            # tensor dim as the minimum so smaller but still-valid
+            # block sizes are not unnecessarily excluded.
+            dim_size = next_power_of_2(max(spec.size_hint, 1))
+
+            spec.update_min(min(requirement_alignment, dim_size))
 
         # Propagate alignment minimums from inner tiles to their bounding outer tiles.
         block_specs_by_id = {
