@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import ast
 from dataclasses import dataclass
+from dataclasses import replace as dataclass_replace
 import os
 import textwrap
 from typing import TYPE_CHECKING
@@ -1060,6 +1061,10 @@ class _PerKiterTmaArgs:
     # (cute_plan.md §6.12.7). Default 1 preserves byte-identity for the
     # validated cluster_m=2 cluster_n=1 path.
     cluster_n: int = 1
+    # Optional name of a hoisted ``make_warp_uniform(block_idx_in_cluster())``
+    # local; when set, owner predicates compare against it instead of
+    # re-deriving the cluster rank inline at every K-loop gate.
+    cluster_rank_var: str = ""
     # Static-full one-CTA pipelined TMA loops can drop the per-K runtime
     # full-tile branch and scalar fallback. Non-pipelined/asymmetric or two-CTA
     # TMA paths must keep the guarded fallback path.
@@ -1107,6 +1112,7 @@ def _tcgen05_two_cta_owner_predicate(
     is_two_cta: bool,
     gate_exec_warp: bool,
     cluster_n: int = 1,
+    cluster_rank_var: str = "",
 ) -> str | None:
     """Owner-of-the-V-pair predicate for AB consumer release / MMA issuance.
 
@@ -1124,7 +1130,18 @@ def _tcgen05_two_cta_owner_predicate(
     if gate_exec_warp:
         predicate_terms.append(exec_active)
     if is_two_cta:
-        if cluster_n > 1:
+        if cluster_rank_var:
+            # Caller hoisted ``make_warp_uniform(block_idx_in_cluster())``
+            # into a per-kernel local; reuse it instead of re-deriving the
+            # rank at every gate (the inline form costs S2UR+IMAD per use
+            # inside the K loop).
+            if cluster_n > 1:
+                predicate_terms.append(
+                    f"{cluster_rank_var} % cutlass.Int32(2) == cutlass.Int32(0)"
+                )
+            else:
+                predicate_terms.append(f"{cluster_rank_var} == cutlass.Int32(0)")
+        elif cluster_n > 1:
             predicate_terms.append(_TCGEN05_V_LEADER_PREDICATE)
         else:
             predicate_terms.append(_TCGEN05_CLUSTER_LEADER_PREDICATE)
@@ -1190,20 +1207,58 @@ def _build_kloop_pipeline_producer_if(
     return statement_from_string(src)
 
 
-def _build_kloop_pipeline_consumer_if(
+def _build_unified_tma_producer_stmts(args: _PerKiterTmaArgs) -> list[ast.stmt]:
+    """Unified per-K-tile TMA producer body (CUTLASS reference shape).
+
+    One body for ALL K tiles: ``try_acquire``-peeked ``producer_acquire``
+    blocks once the AB ring is full, so the same statements serve prologue
+    (ring filling) and steady state (ring reuse) — no separate unrolled
+    warm-up chain and no ``+ab_stage_count`` K offset. Only valid under
+    static-full tiles (no full/next-tile predicates needed) inside the
+    role-local producer's own K loop (blocking acquire cannot stall the MMA
+    or epilogue warps).
+    """
+    assert args.use_tma_a and args.use_tma_b, (
+        "pipelined branch requires both A and B to be TMA-loaded"
+    )
+    assert not args.skip_producer_acquire and not args.skip_producer_advance, (
+        "diagnostic acquire/advance skips keep the unrolled prologue path"
+    )
+    copy_a_src = _kloop_tma_copy_a_src(args, k_offset=args.tma_k_tile)
+    copy_b_src = _kloop_tma_copy_b_src(args, k_offset=args.tma_k_tile)
+    return [
+        statement_from_string(line)
+        for line in (
+            f"{args.tma_pipeline}.producer_acquire({args.tma_producer_state})",
+            f"{args.tma_barrier_ptr} = "
+            f"{args.tma_pipeline}.producer_get_barrier({args.tma_producer_state})",
+            copy_a_src.strip(),
+            copy_b_src.strip(),
+            f"{args.tma_pipeline}.producer_commit({args.tma_producer_state})",
+            emit_pipeline_advance(args.tma_producer_state),
+        )
+    ]
+
+
+def _build_kloop_pipeline_consumer_stmts(
     args: _PerKiterTmaArgs,
     *,
     gate_exec_warp: bool = True,
     include_scalar_fallback: bool = True,
     use_existing_try_token: bool = False,
     sync_before_scalar_fallback: bool = False,
-) -> ast.stmt:
-    """Per-K-iter TMA consumer / scalar-fallback ``if`` for the pipelined branch."""
+) -> list[ast.stmt]:
+    """Per-K-iter TMA consumer / scalar-fallback statements (pipelined branch).
+
+    Every form emits a single statement except the ungated static-full
+    try-wait + wait pair, which emits two siblings.
+    """
     if args.static_full_tiles:
-        assert not args.is_two_cta, (
-            "static-full fast path is only valid for one-CTA pipelined TMA loops"
-        )
-        assert gate_exec_warp, "static-full fast path requires an exec-warp gate"
+        # One-CTA inline callers keep the exec-warp gate; the role-local
+        # separate exec loop passes ``gate_exec_warp=False`` because the
+        # loop already lives inside the MMA-exec role block (two-CTA adds
+        # the V/cluster-leader owner predicate below).
+        assert gate_exec_warp or not args.is_two_cta or args.cluster_n >= 1
         assert not include_scalar_fallback, (
             "static-full fast path has no scalar fallback branch"
         )
@@ -1223,18 +1278,28 @@ def _build_kloop_pipeline_consumer_if(
             f"{args.tma_pipeline}.consumer_wait("
             f"{args.tma_consumer_state}, {args.tma_consumer_try_token})"
         )
+    consumer_gate = _tcgen05_two_cta_owner_predicate(
+        args.exec_active,
+        is_two_cta=args.is_two_cta,
+        gate_exec_warp=gate_exec_warp,
+        cluster_n=args.cluster_n,
+        cluster_rank_var=args.cluster_rank_var,
+    )
+    if args.static_full_tiles and consumer_gate is None:
+        # Ungated static-full form: emit the (possibly multi-line) wait
+        # sequence as sibling statements with no wrapper.
+        return [
+            statement_from_string(line)
+            for line in consumer_src.splitlines()
+            if line.strip()
+        ]
     full_tile_src = _tcgen05_emit_optional_gate(
         consumer_src,
-        _tcgen05_two_cta_owner_predicate(
-            args.exec_active,
-            is_two_cta=args.is_two_cta,
-            gate_exec_warp=gate_exec_warp,
-            cluster_n=args.cluster_n,
-        ),
+        consumer_gate,
         indent="" if args.static_full_tiles else "    ",
     )
     if args.static_full_tiles:
-        return statement_from_string(full_tile_src)
+        return [statement_from_string(full_tile_src)]
     fallback_src = ""
     if include_scalar_fallback:
         scalar_load_a_src = textwrap.indent(ast.unparse(args.scalar_load_a), "    ")
@@ -1250,7 +1315,26 @@ def _build_kloop_pipeline_consumer_if(
             "    cute.arch.sync_threads()"
         )
     src = f"if {args.tma_full_tile}:\n{full_tile_src}{fallback_src}"
-    return statement_from_string(src)
+    return [statement_from_string(src)]
+
+
+def _build_kloop_pipeline_consumer_if(
+    args: _PerKiterTmaArgs,
+    *,
+    gate_exec_warp: bool = True,
+    include_scalar_fallback: bool = True,
+    use_existing_try_token: bool = False,
+    sync_before_scalar_fallback: bool = False,
+) -> ast.stmt:
+    """Single-statement form of :func:`_build_kloop_pipeline_consumer_stmts`."""
+    (stmt,) = _build_kloop_pipeline_consumer_stmts(
+        args,
+        gate_exec_warp=gate_exec_warp,
+        include_scalar_fallback=include_scalar_fallback,
+        use_existing_try_token=use_existing_try_token,
+        sync_before_scalar_fallback=sync_before_scalar_fallback,
+    )
+    return stmt
 
 
 def _build_kloop_pipeline_consumer_prefetch_stmts(
@@ -1266,6 +1350,7 @@ def _build_kloop_pipeline_consumer_prefetch_stmts(
         is_two_cta=args.is_two_cta,
         gate_exec_warp=gate_exec_warp,
         cluster_n=args.cluster_n,
+        cluster_rank_var=args.cluster_rank_var,
     )
     if owner_predicate is not None:
         predicate = f"{predicate} and {owner_predicate}"
@@ -1279,13 +1364,13 @@ def _build_kloop_pipeline_consumer_prefetch_stmts(
     ]
 
 
-def _build_kloop_pipeline_release_if(
+def _build_kloop_pipeline_release_stmts(
     args: _PerKiterTmaArgs,
     *,
     gate_exec_warp: bool = True,
     include_scalar_fallback: bool = True,
-) -> ast.stmt:
-    """Per-K-iter consumer release ``if`` for the pipelined branch.
+) -> list[ast.stmt]:
+    """Per-K-iter consumer release statements for the pipelined branch.
 
     Producer-state advance lives in the producer block (one per
     commit), so only the consumer-state advance is emitted here. In
@@ -1295,10 +1380,9 @@ def _build_kloop_pipeline_release_if(
     multicast mask; separate peer arrivals over-count the empty barrier.
     """
     if args.static_full_tiles:
-        assert not args.is_two_cta, (
-            "static-full fast path is only valid for one-CTA pipelined TMA loops"
-        )
-        assert gate_exec_warp, "static-full fast path requires an exec-warp gate"
+        # See the consumer-if note: one-CTA inline callers keep the exec-warp
+        # gate; the role-local separate exec loop drops it (two-CTA keeps the
+        # leader owner predicate below).
         assert not include_scalar_fallback, (
             "static-full fast path has no scalar fallback branch"
         )
@@ -1308,6 +1392,7 @@ def _build_kloop_pipeline_release_if(
         is_two_cta=args.is_two_cta,
         gate_exec_warp=gate_exec_warp,
         cluster_n=args.cluster_n,
+        cluster_rank_var=args.cluster_rank_var,
     )
     advance_src = emit_pipeline_advance(args.tma_consumer_state)
     indent = "" if args.static_full_tiles else "    "
@@ -1315,22 +1400,38 @@ def _build_kloop_pipeline_release_if(
         # With gate_exec_warp=False the caller is already inside the
         # role-local exec loop, so every iteration can advance local state.
         advance_gate = args.exec_active if gate_exec_warp else None
+        if args.static_full_tiles:
+            # No full-tile wrapper: the two gated blocks are siblings.
+            return [
+                statement_from_string(
+                    _tcgen05_emit_optional_gate(release_src, release_gate, indent="")
+                ),
+                statement_from_string(
+                    _tcgen05_emit_optional_gate(advance_src, advance_gate, indent="")
+                ),
+            ]
         full_tile_src = (
             _tcgen05_emit_optional_gate(release_src, release_gate, indent=indent)
             + "\n"
             + _tcgen05_emit_optional_gate(advance_src, advance_gate, indent=indent)
         )
     else:
+        if args.static_full_tiles and release_gate is None:
+            # Ungated static-full form: two sibling statements, no wrapper.
+            return [
+                statement_from_string(release_src),
+                statement_from_string(advance_src),
+            ]
         full_tile_src = _tcgen05_emit_optional_gate(
             release_src + "\n" + advance_src, release_gate, indent=indent
         )
     if args.static_full_tiles:
-        return statement_from_string(full_tile_src)
+        return [statement_from_string(full_tile_src)]
     fallback_src = (
         "\nelse:\n    cute.arch.sync_threads()" if include_scalar_fallback else ""
     )
     src = f"if {args.tma_full_tile}:\n{full_tile_src}{fallback_src}"
-    return statement_from_string(src)
+    return [statement_from_string(src)]
 
 
 def _build_tcgen05_mma_accumulate_reset_stmt(
@@ -1340,6 +1441,7 @@ def _build_tcgen05_mma_accumulate_reset_stmt(
     gate_exec_warp: bool = True,
     is_two_cta: bool = False,
     cluster_n: int = 1,
+    cluster_rank_var: str = "",
 ) -> ast.stmt:
     reset_src = f"{tiled_mma}.set(cute.nvgpu.tcgen05.Field.ACCUMULATE, False)"
     predicate = _tcgen05_two_cta_owner_predicate(
@@ -1347,6 +1449,7 @@ def _build_tcgen05_mma_accumulate_reset_stmt(
         is_two_cta=is_two_cta,
         gate_exec_warp=gate_exec_warp,
         cluster_n=cluster_n,
+        cluster_rank_var=cluster_rank_var,
     )
     if predicate is None:
         return statement_from_string(reset_src)
@@ -1364,6 +1467,7 @@ def _build_tcgen05_mma_issue_stmt(
     gate_exec_warp: bool = True,
     is_two_cta: bool = False,
     cluster_n: int = 1,
+    cluster_rank_var: str = "",
 ) -> ast.stmt:
     issue_src = (
         f"for _tcgen05_kblk_idx in range(cute.size({tcgen05_frag_a}, mode=[2])):\n"
@@ -1381,6 +1485,7 @@ def _build_tcgen05_mma_issue_stmt(
         is_two_cta=is_two_cta,
         gate_exec_warp=gate_exec_warp,
         cluster_n=cluster_n,
+        cluster_rank_var=cluster_rank_var,
     )
     if predicate is not None:
         issue_src = f"if {predicate}:\n{textwrap.indent(issue_src, '    ')}"
@@ -2378,6 +2483,32 @@ def _emit_mma_pipeline(
             f"{TCGEN05_AB_CONSUMER_PHASE_MODE_PHASE1!r} requires the guarded "
             "cluster_m=2, CtaGroup.ONE, 128x256x128 bridge shape",
         )
+    # Unified TMA producer (CUTLASS reference shape): one rolled K loop over
+    # ALL K tiles where ``producer_acquire`` blocks once the AB ring is
+    # full — pipelining comes from the mbarrier handshake, not from a
+    # separate unrolled warm-up prologue plus an ``+ab_stages``-offset
+    # steady-state loop. Requires static-full tiles (every prologue/tail
+    # predicate is a compile-time truth) and the role-local separate
+    # producer loop (the producer warp owns its own K loop, so blocking in
+    # ``producer_acquire`` cannot stall MMA or epilogue work). The
+    # unrolled-prologue form at ab_stages=8 put 24 static UTMALDG sites in
+    # SASS (vs the reference's 2) and re-derived loop-invariant full-tile
+    # predicates per stage and per K iteration.
+    tcgen05_use_unified_tma_producer = (
+        tcgen05_static_full_tiles
+        and tcgen05_use_tma_pipeline
+        and tcgen05_use_separate_tma_producer
+        and not tcgen05_role_local_uses_k_tail_tma
+        and not tcgen05_role_local_double_edge_tma
+        and not tcgen05_role_local_m_edge_tma
+        and not tcgen05_role_local_n_edge_tma
+        # Bridge diagnostics address individual acquire/advance edges of the
+        # unrolled prologue + offset steady-state form; keep that form when
+        # any of them is requested.
+        and not diagnose_skip_ab_producer_acquire
+        and not diagnose_skip_initial_ab_producer_acquire
+        and not diagnose_skip_ab_producer_advance
+    )
     # Static-full CtaGroup.TWO keeps a prefetched AB consumer token live
     # across the accumulator acquire and each K-loop issue. CtaGroup.ONE
     # keeps the older adjacent try-wait/wait sequence.
@@ -4276,28 +4407,32 @@ def _emit_mma_pipeline(
                     skip_producer_acquire=diagnose_skip_ab_producer_acquire,
                     skip_producer_advance=diagnose_skip_ab_producer_advance,
                 )
-                _emit_per_tile(
-                    f"{tma_initial_full_tile} = "
-                    + _tcgen05_tma_tile_predicate(
-                        k_tile_start_expr="cutlass.Int32(0)",
-                        full_tile_end_expr=f"cutlass.Int32({bk})",
-                    ),
-                    tma_load=tcgen05_use_role_local_tma_producer,
-                )
-                stage0_prefetch = _build_initial_prefetch_if(
-                    prefetch_args,
-                    full_tile_gates=[tma_initial_full_tile],
-                    k_offset="cutlass.Int32(0)",
-                    skip_producer_acquire=(
-                        diagnose_skip_ab_producer_acquire
-                        or diagnose_skip_initial_ab_producer_acquire
-                    ),
-                )
-                prefix.append(stage0_prefetch)
-                per_tile_stmts.append(stage0_prefetch)
-                if tcgen05_use_role_local_tma_producer:
-                    tma_load_role_stmts.append(stage0_prefetch)
-                if tcgen05_ab_stage_count_value > 1:
+                if not tcgen05_use_unified_tma_producer:
+                    _emit_per_tile(
+                        f"{tma_initial_full_tile} = "
+                        + _tcgen05_tma_tile_predicate(
+                            k_tile_start_expr="cutlass.Int32(0)",
+                            full_tile_end_expr=f"cutlass.Int32({bk})",
+                        ),
+                        tma_load=tcgen05_use_role_local_tma_producer,
+                    )
+                    stage0_prefetch = _build_initial_prefetch_if(
+                        prefetch_args,
+                        full_tile_gates=[tma_initial_full_tile],
+                        k_offset="cutlass.Int32(0)",
+                        skip_producer_acquire=(
+                            diagnose_skip_ab_producer_acquire
+                            or diagnose_skip_initial_ab_producer_acquire
+                        ),
+                    )
+                    prefix.append(stage0_prefetch)
+                    per_tile_stmts.append(stage0_prefetch)
+                    if tcgen05_use_role_local_tma_producer:
+                        tma_load_role_stmts.append(stage0_prefetch)
+                if (
+                    not tcgen05_use_unified_tma_producer
+                    and tcgen05_ab_stage_count_value > 1
+                ):
                     # Warm every stage 1..ab_stage_count-1; each gated by
                     # an ``i+1``-k_tile fits-in-K predicate. The old
                     # two-call pattern only covered stages 0 and N-1
@@ -4614,6 +4749,15 @@ def _emit_mma_pipeline(
                 scalar_load_b=scalar_load_b,
                 cluster_n=tcgen05_cluster_n,
                 static_full_tiles=tcgen05_static_full_tma_fast_path,
+                # The hoisted rank local is emitted in the prefix under the
+                # same condition (see ``tma_cta_rank_in_cluster`` above), so
+                # per-K owner gates can reuse it instead of re-deriving the
+                # cluster rank each iteration.
+                cluster_rank_var=(
+                    tma_cta_rank_in_cluster
+                    if (tcgen05_cluster_m > 1 or tcgen05_is_two_cta)
+                    else ""
+                ),
             )
             if tcgen05_use_tma_pipeline:
                 if tcgen05_use_separate_tma_producer:
@@ -4622,30 +4766,35 @@ def _emit_mma_pipeline(
                             f"{tma_k_tile} = {k_offset_var} // cutlass.Int32({bk})"
                         )
                     ]
-                    if not tcgen05_static_full_tma_fast_path:
-                        assert tma_full_tile_predicate_src is not None
-                        producer_loop_body.append(
-                            statement_from_string(
-                                f"{tma_full_tile} = " + tma_full_tile_predicate_src
-                            )
+                    if tcgen05_use_unified_tma_producer:
+                        producer_loop_body.extend(
+                            _build_unified_tma_producer_stmts(tma_kloop_args)
                         )
-                    producer_loop_body.extend(
-                        [
-                            statement_from_string(
-                                f"{tma_next_full_tile} = "
-                                + _tcgen05_tma_tile_predicate(
-                                    k_tile_start_expr=f"{k_offset_var} + cutlass.Int32({bk * tcgen05_ab_stage_count_value})",
-                                    full_tile_end_expr=f"{k_offset_var} + cutlass.Int32({bk * (tcgen05_ab_stage_count_value + 1)})",
+                    else:
+                        if not tcgen05_static_full_tma_fast_path:
+                            assert tma_full_tile_predicate_src is not None
+                            producer_loop_body.append(
+                                statement_from_string(
+                                    f"{tma_full_tile} = " + tma_full_tile_predicate_src
                                 )
-                            ),
-                            statement_from_string(
-                                f"{tma_producer_try_token} = cutlass.Boolean(0)"
-                            ),
-                            _build_kloop_pipeline_producer_if(
-                                tma_kloop_args, gate_tma_warp=False
-                            ),
-                        ]
-                    )
+                            )
+                        producer_loop_body.extend(
+                            [
+                                statement_from_string(
+                                    f"{tma_next_full_tile} = "
+                                    + _tcgen05_tma_tile_predicate(
+                                        k_tile_start_expr=f"{k_offset_var} + cutlass.Int32({bk * tcgen05_ab_stage_count_value})",
+                                        full_tile_end_expr=f"{k_offset_var} + cutlass.Int32({bk * (tcgen05_ab_stage_count_value + 1)})",
+                                    )
+                                ),
+                                statement_from_string(
+                                    f"{tma_producer_try_token} = cutlass.Boolean(0)"
+                                ),
+                                _build_kloop_pipeline_producer_if(
+                                    tma_kloop_args, gate_tma_warp=False
+                                ),
+                            ]
+                        )
                     producer_loop = _clone_k_loop_with_body(
                         device_loop,
                         producer_loop_body,
@@ -4668,12 +4817,25 @@ def _emit_mma_pipeline(
                     assert mma_stage_stmt is not None
                     assert smem_a_mma_stmt is not None
                     assert smem_b_mma_stmt is not None
+                    # Under the unified producer the exec K loop also drops
+                    # its per-iteration full-tile predicate: static-full means
+                    # every K tile is full, so consumer wait/release run
+                    # unconditionally (their two-CTA owner gates remain).
+                    exec_static_full = (
+                        tcgen05_static_full_tma_fast_path
+                        or tcgen05_use_unified_tma_producer
+                    )
+                    exec_kloop_args = (
+                        dataclass_replace(tma_kloop_args, static_full_tiles=True)
+                        if tcgen05_use_unified_tma_producer
+                        else tma_kloop_args
+                    )
                     exec_loop_body: list[ast.stmt] = [
                         mma_stage_stmt,
                         smem_a_mma_stmt,
                         smem_b_mma_stmt,
                     ]
-                    if not tcgen05_static_full_tma_fast_path:
+                    if not exec_static_full:
                         assert tma_full_tile_stmt is not None
                         exec_loop_body.append(tma_full_tile_stmt)
                     if tcgen05_use_role_local_ab_consumer_prefetch:
@@ -4692,9 +4854,9 @@ def _emit_mma_pipeline(
                                 f"{tma_consumer_try_token} = cutlass.Boolean(0)"
                             )
                         )
-                    exec_loop_body.append(
-                        _build_kloop_pipeline_consumer_if(
-                            tma_kloop_args,
+                    exec_loop_body.extend(
+                        _build_kloop_pipeline_consumer_stmts(
+                            exec_kloop_args,
                             # Static-full pipeline builders require their
                             # internal exec gate to keep emitting a single
                             # statement. The outer wrapper below makes the
@@ -4725,11 +4887,12 @@ def _emit_mma_pipeline(
                                 gate_exec_warp=tcgen05_static_full_tma_fast_path,
                                 is_two_cta=tcgen05_is_two_cta,
                                 cluster_n=tcgen05_cluster_n,
+                                cluster_rank_var=tma_kloop_args.cluster_rank_var,
                             )
                         )
-                    exec_loop_body.append(
-                        _build_kloop_pipeline_release_if(
-                            tma_kloop_args,
+                    exec_loop_body.extend(
+                        _build_kloop_pipeline_release_stmts(
+                            exec_kloop_args,
                             # See the consumer wait comment above.
                             gate_exec_warp=tcgen05_static_full_tma_fast_path,
                             include_scalar_fallback=False,
@@ -4885,19 +5048,23 @@ def _emit_mma_pipeline(
                             mma_stage=mma_stage,
                             is_two_cta=tcgen05_is_two_cta,
                             cluster_n=tcgen05_cluster_n,
+                            cluster_rank_var=(
+                                tma_kloop_args.cluster_rank_var
+                                if tcgen05_use_tma and tma_kloop_args is not None
+                                else ""
+                            ),
                         )
                     )
                 if tcgen05_use_tma:
                     assert tma_kloop_args is not None
                     if tcgen05_use_tma_pipeline:
-                        cg.add_statement(
-                            _build_kloop_pipeline_release_if(
-                                tma_kloop_args,
-                                include_scalar_fallback=(
-                                    not tcgen05_static_full_tma_fast_path
-                                ),
-                            )
-                        )
+                        for release_stmt in _build_kloop_pipeline_release_stmts(
+                            tma_kloop_args,
+                            include_scalar_fallback=(
+                                not tcgen05_static_full_tma_fast_path
+                            ),
+                        ):
+                            cg.add_statement(release_stmt)
                     else:
                         cg.add_statement(
                             _build_kloop_non_pipeline_release_if(tma_kloop_args)
