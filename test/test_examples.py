@@ -962,6 +962,18 @@ class TestExamples(RefEagerTestBase, TestCase):
             block_sizes=[1, 64, 32],
         )
 
+    def test_concat_simple(self):
+        args = (
+            torch.randn(512, 500, device=DEVICE),
+            torch.randn(512, 512, device=DEVICE),
+        )
+        check_example(
+            "concatenate",
+            args,
+            torch.cat(args, dim=1),
+            fn_name="concat2d_dim1_simple",
+        )
+
     def test_concat(self):
         args = (
             torch.randn(512, 500, device=DEVICE),
