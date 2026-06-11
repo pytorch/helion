@@ -4,13 +4,20 @@ import json
 import types
 import unittest
 
-import networkx as nx
 import torch
 
 from helion._testing import DEVICE
 from helion._testing import TestCase
 from helion.autotuner import ir_features
 from helion.autotuner.ir_features import extract_ir_graph
+
+try:
+    import networkx as nx
+
+    _HAS_NETWORKX = True
+except ImportError:  # networkx is not a declared Helion dependency
+    nx = None  # type: ignore[assignment]
+    _HAS_NETWORKX = False
 
 
 def _node_link_graph(data: dict[str, object]) -> nx.DiGraph:
@@ -37,6 +44,7 @@ def _extract(kernel: object, args: tuple[object, ...], name: str) -> dict[str, o
 
 
 class TestIrFeatures(TestCase):
+    @unittest.skipUnless(_HAS_NETWORKX, "networkx not installed")
     def test_pointwise_dump_is_networkx_loadable(self) -> None:
         """A pointwise kernel yields a node-link DiGraph with data-only edges."""
         from examples.add import add
@@ -166,6 +174,7 @@ class TestIrFeaturesEdgeCases(TestCase):
         node = types.SimpleNamespace(target=_not_control_flow, args=())
         self.assertEqual(ir_features._region_specs(node), [])
 
+    @unittest.skipUnless(_HAS_NETWORKX, "networkx not installed")
     def test_extract_handles_empty_device_ir(self) -> None:
         """A device IR with no graphs yields a valid, empty node-link record."""
         empty_ir = types.SimpleNamespace(graphs=[], root_ids=[], rolled_reductions=[])
