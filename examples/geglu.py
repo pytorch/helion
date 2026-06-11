@@ -34,6 +34,7 @@ from helion._testing import DEVICE
 from helion._testing import HALF_DTYPE
 from helion._testing import run_example
 import helion.language as hl
+from helion.runtime.settings import _get_backend
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -47,7 +48,7 @@ if TYPE_CHECKING:
 
 # %%
 @helion.kernel()
-def geglu(a: Tensor, b: Tensor) -> Tensor:
+def _geglu(a: Tensor, b: Tensor) -> Tensor:
     """
     Performs GEGLU operation: GELU(a) * b using tanh approximation for GELU.
 
@@ -104,6 +105,33 @@ def geglu(a: Tensor, b: Tensor) -> Tensor:
         out_flat[tile_idx] = result
 
     return out
+
+
+@helion.kernel()
+def _geglu_pallas(a: Tensor, b: Tensor) -> Tensor:
+    """GEGLU forward for the Pallas/TPU backend, tiled over the natural N-D shape.
+
+    Tiling ``a.size()`` directly lets the autotuner pick an N-D BlockSpec and
+    avoids a reshape/retile; a 1-D flatten would defeat the TPU's (8,128) tiling.
+    """
+    assert a.shape == b.shape, (
+        f"Input tensors must have same shape, got {a.shape} != {b.shape}"
+    )
+    out = torch.empty_like(a, dtype=torch.promote_types(a.dtype, b.dtype))
+    for tile in hl.tile(a.size()):
+        a_vals = a[tile].to(torch.float32)
+        b_vals = b[tile]
+        sqrt_2_over_pi = 0.7978845608028654  # sqrt(2 / pi)
+        a_cubed = a_vals * a_vals * a_vals
+        tanh_arg = sqrt_2_over_pi * (a_vals + 0.044715 * a_cubed)
+        gelu_a = 0.5 * a_vals * (1.0 + torch.tanh(tanh_arg))
+        out[tile] = gelu_a.to(b_vals.dtype) * b_vals
+    return out
+
+
+# Select the N-D-tiled Pallas kernel on TPU, the 1-D GPU kernel otherwise. An
+# alias (not a wrapper fn) keeps ``geglu`` a Kernel, so .settings/autograd work.
+geglu = _geglu_pallas if _get_backend() == "pallas" else _geglu
 
 
 @helion.kernel()

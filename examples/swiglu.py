@@ -34,6 +34,7 @@ from helion._testing import DEVICE
 from helion._testing import HALF_DTYPE
 from helion._testing import run_example
 import helion.language as hl
+from helion.runtime.settings import _get_backend
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -47,7 +48,7 @@ if TYPE_CHECKING:
 
 # %%
 @helion.kernel()
-def swiglu_fwd(a: Tensor, b: Tensor) -> Tensor:
+def _swiglu_fwd(a: Tensor, b: Tensor) -> Tensor:
     """
     Performs SwiGLU operation: SiLU(a) * b where SiLU is the Swish activation.
 
@@ -94,6 +95,30 @@ def swiglu_fwd(a: Tensor, b: Tensor) -> Tensor:
         out_flat[tile_idx] = result
 
     return out
+
+
+@helion.kernel()
+def _swiglu_fwd_pallas(a: Tensor, b: Tensor) -> Tensor:
+    """SwiGLU forward for the Pallas/TPU backend, tiled over the natural N-D shape.
+
+    Tiling ``a.size()`` directly lets the autotuner pick an N-D BlockSpec and
+    avoids a reshape/retile; a 1-D flatten would defeat the TPU's (8,128) tiling.
+    """
+    assert a.shape == b.shape, (
+        f"Input tensors must have same shape, got {a.shape} != {b.shape}"
+    )
+    out = torch.empty_like(a, dtype=torch.promote_types(a.dtype, b.dtype))
+    for tile in hl.tile(a.size()):
+        a_vals = a[tile].to(torch.float32)
+        b_vals = b[tile]
+        silu_a = a_vals * torch.sigmoid(a_vals)
+        out[tile] = silu_a.to(b_vals.dtype) * b_vals
+    return out
+
+
+# Select the N-D-tiled Pallas kernel on TPU, the 1-D GPU kernel otherwise. An
+# alias (not a wrapper fn) keeps ``swiglu_fwd`` a Kernel, so .settings/autograd work.
+swiglu_fwd = _swiglu_fwd_pallas if _get_backend() == "pallas" else _swiglu_fwd
 
 
 @helion.kernel()
