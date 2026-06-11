@@ -3628,8 +3628,6 @@ class CuteNDTileStrategy(NDTileStrategy):
         # ``LoopedReductionStrategy._cute_lane_vec_loads``.
         self._cute_lane_vec_loads_by_block: dict[int, dict] = {}
         if not mma_mode:
-            from ..autotuner.config_spec import CuteVectorWidthSpec
-
             env_local = CompileEnvironment.current()
             cute_vec_widths_cfg = cast(
                 "list[int]",
@@ -3650,38 +3648,37 @@ class CuteNDTileStrategy(NDTileStrategy):
                     self._lane_var_by_block[block_id] = self.fn.new_var(
                         f"lane_{block_id}"
                     )
-                    # Register a cute_vector_widths slot for this lane
-                    # block if not already present (rolled reductions
-                    # register their own via device_ir).  We add idempotently
-                    # so the autotuner can explore V in {1,2,4,8}.
+                    elements_per_thread = static_bs // nt
+                    # Vec slot is registered eagerly in device-IR analysis; read
+                    # the tuned V.  Never append here — growing the spec during
+                    # codegen breaks the autotuner's fixed-width unflatten.
                     if (
                         block_id
-                        not in env_local.config_spec.cute_vector_widths.valid_block_ids()
+                        in env_local.config_spec.cute_vector_widths.valid_block_ids()
                     ):
-                        import contextlib
-
-                        # Silently skip when append fails (e.g.
-                        # config_spec frozen) — the lane loop just
-                        # runs in scalar mode in that case.
-                        with contextlib.suppress(Exception):
-                            env_local.config_spec.cute_vector_widths.append(
-                                CuteVectorWidthSpec(
-                                    block_id=block_id,
-                                    size_hint=static_bs,
-                                )
-                            )
-                    elements_per_thread = static_bs // nt
-                    vec_width = env_local.config_spec.cute_vector_widths.config_get(
-                        cute_vec_widths_cfg,
-                        block_id,
-                        1,
-                    )
-                    if (
-                        isinstance(vec_width, int)
-                        and vec_width > 1
-                        and elements_per_thread % vec_width == 0
-                    ):
-                        self._cute_lane_vec_width_by_block[block_id] = vec_width
+                        vec_width = env_local.config_spec.cute_vector_widths.config_get(
+                            cute_vec_widths_cfg,
+                            block_id,
+                            1,
+                        )
+                        if (
+                            isinstance(vec_width, int)
+                            and vec_width > 1
+                            and elements_per_thread % vec_width == 0
+                        ):
+                            self._cute_lane_vec_width_by_block[block_id] = vec_width
+                    else:
+                        # Metal shares this strategy without vec-width tuning,
+                        # and non-static sizes are eager-skipped — both run
+                        # scalar.  A missing static slot on cute is a bug.
+                        assert env_local.backend_name != "cute" or not isinstance(
+                            env_local.block_sizes[block_id].size,
+                            (int, torch.SymInt),
+                        ), (
+                            f"cute_vector_widths slot missing for static-size "
+                            f"block_id={block_id}; it must be registered during "
+                            f"device-IR analysis, not lazily during codegen"
+                        )
 
     def _configured_block_size_int(self, block_size: SymIntLike) -> int | None:
         if isinstance(block_size, int):

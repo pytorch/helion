@@ -376,7 +376,6 @@ class TestExamples(RefEagerTestBase, TestCase):
         lambda: _get_backend() == "cute",
         "CuTe matmul+layernorm example is unsupported and too expensive in-process",
     )
-    @xfailIfPallas("JAX tracer error with dynamic shapes")
     def test_matmul_layernorm_dynamic_shapes(self):
         args = (
             torch.randn([128, 256], device=DEVICE, dtype=torch.float32),
@@ -1643,6 +1642,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             "geglu",
             args,
             torch.nn.functional.gelu(args[0], approximate="tanh") * args[1],
+            fn_name="_geglu",
             block_sizes=[1024],
             num_warps=4,
             num_stages=3,
@@ -1679,7 +1679,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             "swiglu",
             args,
             torch.nn.functional.silu(args[0]) * args[1],
-            fn_name="swiglu_fwd",
+            fn_name="_swiglu_fwd",
             block_sizes=[1024],
             num_warps=4,
             num_stages=3,
@@ -2413,7 +2413,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             "batch_softmax",
             args,
             torch.nn.functional.softmax(args[0], dim=-1),
-            block_sizes=[8],
+            block_sizes=[1, 8],
         )
 
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
@@ -2424,7 +2424,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             "batch_softmax",
             args,
             torch.nn.functional.softmax(args[0], dim=-1),
-            block_sizes=[8],
+            block_sizes=[1, 8],
             indexing="block_ptr",
         )
 
