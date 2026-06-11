@@ -85,17 +85,62 @@ class MatmulFact(NamedTuple):
     rhs_dtype: torch.dtype
 
 
+class ReductionFact(NamedTuple):
+    """Workload facts for one inner reduction dim, recorded at compile time (analogous
+    to ``MatmulFact``) so the seed heuristic branches on workload properties, not kernel
+    identity. Exactly one per seeded kernel; built in device_ir's
+    ``register_rollable_reductions`` (standard) or ``register_user_tiled_reductions``
+    (user-tiled).
+
+    - ``block_id`` / ``size_hint``: the reduction axis and its extent (rnumel).
+    - ``m_block_ids``: the non-reduction (kept) tile block_ids.
+    - ``static_rnumel``: the extent if statically known, else None.
+    - ``itemsize``: bytes/element of the reduced tensor; byte caps key on
+      ``size_hint * itemsize``.
+    - ``num_load``: device loads over this rdim (the ``== 1`` stream-eviction gate).
+    - ``num_carried_2d_tiles``: 2-D [M_BLOCK, R_BLOCK] tiles carried across the inner
+      loop (the Band-B signal). Derived from ``AccumulatorFact``.
+    - ``non_reduction_loop_block_ids``: non-grid loop tiles over the extent that are NOT
+      the rdim (an apply/normalize pass); ``len(...) >= 1`` is the reduce-then-apply
+      (Band-C) signal.
+    - ``row_reread``: True iff the reduction-input row is live across the loop boundary
+      (risks spilling). Gates the persist byte cap + re-read eviction. From ``MemoryOpFact``.
+    - ``reread_eviction_index``: ``load_eviction_policies`` slot of the re-read load
+      (``None`` unless ``row_reread``), read from that load's
+      ``MemoryOpFact.eviction_index`` — no re-walk.
+    - ``full_width_output``: True iff a store writes the result back over the reduction
+      axis ([M, N], e.g. layer_norm), False for a per-row scalar ([M], e.g. sum) —
+      full-width is store/occupancy-bound, scalar-output reduction-tree-bound (opposite
+      num_warps).
+    - ``input_load_itemsize``: element size of the HBM input row load — the dtype-faithful
+      per-byte signal, distinct from ``itemsize`` (fp32-promoted = 4 at both dtypes). 0
+      when no single reduction-fed row load exists.
+
+    ``grid_rows`` is NOT stored — a pure function of ``m_block_ids`` + env, computed on
+    demand by its one consumer (the narrow-row ``num_warps`` lever).
+    """
+
+    block_id: int
+    size_hint: int
+    m_block_ids: tuple[int, ...]
+    static_rnumel: int | None
+    itemsize: int
+    num_load: int
+    num_carried_2d_tiles: int = 0
+    non_reduction_loop_block_ids: tuple[int, ...] = ()
+    row_reread: bool = False
+    reread_eviction_index: int | None = None
+    full_width_output: bool = True
+    input_load_itemsize: int = 0
+
+
 class MemoryOpFact(NamedTuple):
-    """Metadata linking one ``Config.indexing`` slot to its graph memory op.
+    """Metadata linking one ``Config.indexing`` slot to its graph memory op, one entry per
+    load/store in graph-traversal order (so ``memory_op_facts[i]`` describes ``config.indexing[i]``).
+    Lets heuristics reason about *which* load/store a slot is, not a bare positional index.
 
-    One entry per load/store, recorded in the same graph-traversal order that
-    sizes ``Config.indexing`` / ``Config.load_eviction_policies`` (see
-    ``_collect_memory_op_facts`` in ``device_ir``), so
-    ``memory_op_facts[i].indexing_index == i`` describes ``config.indexing[i]``.
-
-    Autotuner heuristics use this to reason about *which* load/store a slot is
-    (the row load, a matmul operand, a reused buffer, ...) instead of guessing
-    from a bare positional index.
+    The reduction-fact builders consume the enrichment fields below (all reduction-AGNOSTIC — no
+    notion of which axis is "the" reduction; the builders index them by the reduction's ``block_id``).
     """
 
     indexing_index: int  # slot in Config.indexing (== position in this list)
@@ -106,6 +151,37 @@ class MemoryOpFact(NamedTuple):
     ndim: int  # rank of the accessed tensor
     num_reuses: int  # downstream FX consumers of the load (0 for stores)
     matmul_operand: str | None  # matmul/dot operand: "lhs" | "rhs" | None
+    # --- reduction-fact enrichment (reduction-agnostic; () / False / None for stores) ---
+    # device_ir.graphs index this op lives in (scopes per-graph counts).
+    graph_id: int = -1
+    # per-axis count of reductions this load FEEDS: ((reduction_axis_block_id, count), ...).
+    reductions_fed: tuple[tuple[int, int], ...] = ()
+    # stores the load's value reaches WITHOUT passing through a reduction, each keyed by the
+    # store's full subscript-axis tuple (store[tile_m, tile_n] -> (id_m, id_n)); the forward
+    # walk cuts at both reductions and stores. Empty == value never bypasses a reduction.
+    stores_fed: tuple[tuple[int | None, ...], ...] = ()
+    # block-id per non-bare-int subscript, from the accessed tensor's SHAPE dims (``None`` where
+    # unresolvable). Shape-resolved fallback for the gates below (the plain-slice case,
+    # e.g. ``out[tile_m, :]``).
+    indexed_block_ids: tuple[int | None, ...] = ()
+    # inner-dim extent for a rank>=2 op (legacy reduction-width signal; gates use subscript_block_ids).
+    inner_extent: int | None = None
+    # AXIS the op's INDEX subscripts address (block-id per non-bare-int position, from the tile/offset
+    # subscript so it is reduction-AGNOSTIC; ``None`` for a plain slice). The faithful axis key for
+    # the full_width_output / input_load_itemsize gates.
+    subscript_block_ids: tuple[int | None, ...] = ()
+
+
+class AccumulatorFact(NamedTuple):
+    """One loop-carried tensor accumulator in a reduction loop, recorded at compile time.
+    Reduction-AGNOSTIC (like ``MemoryOpFact``): ``dim_block_ids`` is the per-dim block-id
+    provenance (``None`` for a static dim), ``itemsize`` the element size.
+    ``ReductionFact.num_carried_2d_tiles`` counts accumulators whose last dim is the rdim
+    (a 1-D [M_BLOCK] scalar accumulator counts as 0).
+    """
+
+    dim_block_ids: tuple[int | None, ...]
+    itemsize: int
 
 
 def shrink_block_sizes_for_numel_constraints(
@@ -368,6 +444,8 @@ class ConfigSpec:
         self.compiler_seed_configs: list[helion.Config] = []
         self.autotuner_heuristics: list[str] = []
         self.matmul_facts: list[MatmulFact] = []
+        self.reduction_facts: list[ReductionFact] = []
+        self.accumulator_facts: list[AccumulatorFact] = []
         self.store_indices: list[int] = []
         self.memory_op_facts: list[MemoryOpFact] = []
         self.backend_tunable_fragments = self.backend.tunable_fragments()
