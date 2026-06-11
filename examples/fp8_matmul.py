@@ -27,6 +27,56 @@ if TYPE_CHECKING:
 
 
 # %%
+# Measured-good config for this kernel on the CuTe backend (B200 / sm_100),
+# tuned at 4096x4096x4096 fp8 e4m3 -> bf16. Not pinned on the kernel decorator
+# because the tcgen05_* keys are CuTe-only (the Triton backend rejects them);
+# apply it explicitly when running on the CuTe backend:
+#
+#     bound = fp8_matmul.bind((x, y, scale_a2d, scale_b1d))
+#     bound.set_config(FP8_MATMUL_CUTE_B200_CONFIG)
+#
+# Why these values:
+#   * ``block_sizes=[256, 128, 128]``: bk=128 matches CUTLASS's fp8 K tile
+#     (4 x MMA-K of 32). bk=64 doubles TMA transactions / barrier phases per
+#     FLOP and leaves the single MMA warp issuing only ~52% of cycles
+#     (1711 vs 2422 peak TFLOP/s measured).
+#   * ``tcgen05_ab_stages=8``: 1-byte fp8 operands fit a deeper AB SMEM ring
+#     than bf16; the deep pipeline hides K-loop latency for the
+#     latency-sensitive fp8 MMA (CUTLASS's _compute_stages fills SMEM the
+#     same way).
+#   * ``tcgen05_cluster_m=2`` (CtaGroup.TWO) + persistent scheduling with the
+#     ``static_persistent`` model: the validated 2-CTA envelope.
+#   * ``indexing``: TMA tensor descriptors for the two scale operands feed
+#     the fused-rowwise-scale epilogue's aux path.
+#
+# Measured on B200 at 4096^3 (do_bench, device-side ~52.6 us):
+#   ~2100-2130 TFLOP/s vs torch._scaled_mm ~1860 and a hand-written CuTe DSL
+#   reference ~2330.
+FP8_MATMUL_CUTE_B200_CONFIG = helion.Config(
+    block_sizes=[256, 128, 128],
+    indexing=[
+        "pointer",  # x load
+        "pointer",  # y load
+        "pointer",  # out store
+        "tensor_descriptor",  # scale_a2d load
+        "tensor_descriptor",  # scale_b1d load
+    ],
+    l2_groupings=[4],
+    num_stages=4,
+    num_warps=8,
+    pid_type="persistent_blocked",
+    tcgen05_ab_stages=8,
+    tcgen05_acc_stages=2,
+    tcgen05_c_stages=2,
+    tcgen05_cluster_m=2,
+    tcgen05_cluster_n=1,
+    tcgen05_num_epi_warps=4,
+    tcgen05_persistence_model="static_persistent",
+    tcgen05_strategy="role_local_monolithic",
+)
+
+
+# %%
 @helion.kernel(static_shapes=True)
 def fp8_matmul(
     x: torch.Tensor,
