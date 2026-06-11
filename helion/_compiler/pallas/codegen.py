@@ -57,9 +57,7 @@ def load_expr(
     from helion._compiler.pallas.plan_tiling import TensorIndexPattern as _TIP
 
     if any(isinstance(p, _TIP) and p.is_jagged_flat for p in patterns):
-        result = expr_from_string(
-            "jnp.expand_dims({result}, axis=0)", result=result
-        )
+        result = expr_from_string("jnp.expand_dims({result}, axis=0)", result=result)
     for dim in none_dims:
         result = expr_from_string(
             f"jnp.expand_dims({{result}}, axis={dim})", result=result
