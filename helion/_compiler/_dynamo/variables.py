@@ -32,9 +32,15 @@ if TYPE_CHECKING:
 
 
 def _detect_mutated_inputs(body: list[ast.stmt], param_names: set[str]) -> list[str]:
-    """Find params mutated via subscript assignment (e.g. x[tile] = ...)."""
+    """Find params mutated in place via subscript store (x[tile] = ...) or
+    atomic op (hl.atomic_*(x, ...)).
+
+    Uses ``inplace_writes`` rather than ``writes`` so that a plain rebind of a
+    param name (``x, y = torch.broadcast_tensors(x, y)``) is not mistaken for a
+    mutation of the caller's tensor.
+    """
     rw = ReadWrites.from_list(body)
-    return [name for name in rw.writes if name in param_names]
+    return [name for name in rw.inplace_writes if name in param_names]
 
 
 def _validate_return(
