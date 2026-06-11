@@ -38,19 +38,31 @@ Known modeling gaps / TODOs:
     So the gap is structural, not a config artifact, though the absolute
     µs error scales with kernel time (472 µs un-autotuned, 7 µs autotuned).
 
-  - The `--cycle-accurate` operand-graph simulator now uses MEASURED
-    per-op latencies extracted from each LLO dump's
-    `*-34-critical-path.txt` file (the compiler's own scheduler
-    annotations: vmatmul=7, vmatpush1=3, vld/vmatprep/vpop=1, dma=7
-    cycles, etc.). Despite this, cycle-accurate STILL under-predicts
-    matmul-pattern kernels by 10-25% vs the default. Finding: the
-    compiler successfully software-pipelines around these latencies, so
-    they don't fire as cross-bundle stalls in the operand graph. The
-    actual source of the 10-25% gap on matmul kernels is irreducible
-    microarch overhead (register pressure, memory contention, sustained-
-    throughput < theoretical) that's NOT visible in the LLO schedule —
-    `LANE_REALIZATION` is the empirical compensation, and the
-    cycle-accurate sim doesn't replace its function.
+  - The `--cycle-accurate` operand-graph simulator uses MEASURED per-op
+    latencies extracted from each LLO dump's `*-34-critical-path.txt`
+    file (the compiler's own scheduler annotations: vmatmul=7,
+    vmatpush1=3, vld/vmatprep/vpop=1, dma=7 cycles, etc.). On its own it
+    computes the DEPENDENCY CRITICAL PATH, but the compiler
+    software-pipelines around those latencies, so on well-scheduled
+    kernels the critical path under-predicts the true runtime. Corpus
+    finding (llo/, 2026-06): MXU-bound kernels ran a near-CONSTANT −7 pts
+    below the default gated-dispatch model — the missing term is
+    sustained-lane OCCUPANCY (register pressure, bank conflicts,
+    sustained < peak), which lives in LANE_REALIZATION and which the
+    critical path cannot see. Fix: cycle-accurate now reports
+    `compute_floor = max(critical path, busiest-lane occupancy)` — the
+    lane-level roofline. It therefore matches the default model on
+    occupancy-bound kernels and only diverges (higher) when a true
+    dependency chain dominates. See design doc: `llo/ROOFLINE_DESIGN.md`.
+
+  - TODO (Group B, dynamic bundle undercount — NOT a timing-model bug):
+    six corpus kernels (exp, bmm, splash-swa, softmax, attention
+    llm_pb/lfbo_no_pb) predict 70-97% low because `dynamic_bundles` is
+    undercounted (emit_pipeline dynamic trip count / GMM RHS re-read).
+    Both timing models are equally off there (they agree to <1 pt), which
+    confirms the error is upstream in bundle counting, not in the stretch
+    model. Fix path is K back-solve / loop-factor correction (see GMM
+    note below), independent of the cycle-accurate work.
 
   - GMM at larger M (e.g. M=4096): outer-M tile count is not in
     `loop_factor` and `--inputs` undercounts HBM bytes when RHS is
@@ -60,6 +72,13 @@ Known modeling gaps / TODOs:
     suffix (`tm_NN-tk_NN-tn_NN`) for tile sizes and combining with a
     user-supplied `--shape` to derive K, AND (b) a `--bytes-multiplier`
     or DMA-pattern scanner for re-read accounting.
+
+  - Per-cycle lane-busy visualization lives in `scripts/llo_visualize.py`.
+    Run it as `python scripts/llo_visualize.py <llo_dir>` to render a
+    per-bundle heatmap (lane × bundle, color = busy/capacity) plus a
+    stacked-area chart of slot usage over the bundle stream. Useful for
+    diagnosing WHICH bundles are MXU-heavy vs which are stalled — the
+    aggregate %s the roofline reports above can't show that.
 
 How to produce the LLO dump that this script consumes:
   # On the TPU pod (Linux, libtpu installed):
@@ -472,7 +491,7 @@ def simulate_cycle_accurate(
     instrs: list[Instr],
     lane_realization: dict[str, float],
 ) -> dict:
-    """Cycle-accurate VLIW simulator with operand-graph dependency tracking.
+    """VLIW operand-graph simulator — the DEPENDENCY-CRITICAL-PATH component.
 
     Per bundle (instructions grouped by bundle index):
       - dispatch_cycle = max(current_cycle,
@@ -482,8 +501,15 @@ def simulate_cycle_accurate(
       - For each instruction: unit_ready[unit] = dispatch + issue_period / realization
       - current_cycle = dispatch + 1
 
+    NOTE: this returns only the critical-path estimate. It UNDER-predicts
+    occupancy-bound kernels because the compiler pipelines around the RAW
+    latencies it tracks. The caller (`predict`) combines this with the
+    gated-dispatch occupancy estimate via `max(...)` to form the lane-level
+    roofline — see the long comment at the call site. Do not use this
+    function's output directly as a runtime estimate.
+
     Returns:
-      total_cycles: simulated cycle count for the static body
+      total_cycles: simulated cycle count for the static body (critical path)
       stall_unit: cycles attributed to unit-readiness stalls per unit
       stall_operand: cycles attributed to operand RAW stalls (lumped — we don't
                       always know which producer's lane is to blame)
@@ -779,20 +805,63 @@ def predict(
         if busy_frac > 0:
             realization_breakdown.append((lane_name, busy_frac, realization))
 
-    # Compute floor: prefer cycle-accurate operand-graph simulator when
-    # provided, fall back to gated-dispatch lane simulator. The cycle-
-    # accurate path tracks per-register producer cycles + per-instruction
-    # latency, so it catches cross-bundle RAW stalls (vmatmul → consumer
-    # 8 cycles later, vexp → consumer 140+ cycles later, etc.) that the
-    # lane-level simulator misses entirely.
+    # Compute floor = raw_bundles × avg_stretch, where avg_stretch is the
+    # per-bundle slowdown over the ideal "1 bundle / cycle" schedule.
+    #
+    # Two simulators estimate avg_stretch, modeling DIFFERENT physical limiters:
+    #
+    #   gated-dispatch  → busiest-lane SUSTAINED OCCUPANCY. Each bundle a
+    #     calibrated lane is active advances that lane's ready-time by
+    #     1/realization (e.g. MXU 1/0.81). Consecutive same-lane bundles
+    #     serialize, so the stretch converges to the binding lane's occupancy
+    #     limit — the microarch reality (register pressure, bank conflicts,
+    #     sustained < peak throughput) folded into LANE_REALIZATION.
+    #
+    #   cycle-accurate  → DEPENDENCY CRITICAL PATH. Tracks per-register
+    #     producer cycles + per-instruction latency, so it catches cross-bundle
+    #     RAW stalls (vmatmul → consumer 7 cycles later, etc.). But the
+    #     compiler already software-pipelines around these, so on well-scheduled
+    #     kernels its stretch stays near 1.0 and UNDER-predicts occupancy-bound
+    #     kernels by ~7 pts (verified across the llo/ corpus: MXU-bound kernels
+    #     ran a near-constant −7 pts vs gated-dispatch).
+    #
+    # Physical truth: execution_time ≥ max(critical path, busiest-lane
+    # occupancy) — the lane-level roofline. So when both are available we take
+    # the max. This makes cycle-accurate a strict improvement: it matches
+    # gated-dispatch on occupancy-bound kernels (where gated binds) AND adds
+    # operand-stall visibility on dependency-bound kernels (where CA binds).
+    # dependency_bound: True only when the cycle-accurate critical path EXCEEDS
+    # the gated-dispatch occupancy limit, i.e. cross-bundle RAW dependencies —
+    # not lane throughput — set the compute floor. The downstream regime label
+    # and stall attribution branch on this so a dependency-bound kernel isn't
+    # mislabeled as "compute-bound (<busiest lane>)".
+    dependency_bound = False
     if cycle_accurate_instrs is not None:
-        sim_ca = simulate_cycle_accurate(cycle_accurate_instrs, LANE_REALIZATION)
-        body_cycles = sim_ca["total_cycles"]
         n_body = len(stats.util_rows) if stats.util_rows else 1
-        avg_stretch = body_cycles / n_body
+        sim_ca = simulate_cycle_accurate(cycle_accurate_instrs, LANE_REALIZATION)
+        ca_stretch = sim_ca["total_cycles"] / n_body
+        sim_gated = simulate_gated_dispatch(stats, LANE_REALIZATION)
+        gated_stretch = sim_gated["avg_stretch"]
+        avg_stretch = max(ca_stretch, gated_stretch)
+        dependency_bound = ca_stretch > gated_stretch
+        if not dependency_bound:
+            # Occupancy-bound (every measured corpus kernel): the busiest lane's
+            # sustained throughput is the limiter — report the gated lane stalls.
+            stall_source = dict(sim_gated["stall_attribution"])
+        else:
+            # Dependency-bound: the RAW critical path is the limiter. Report the
+            # per-unit stalls AND the lumped operand-RAW bucket (sim_ca's
+            # headline diagnostic — without it the attribution would understate
+            # the very dependency that raised the floor).
+            stall_source = dict(sim_ca["stall_unit"])
+            operand_cycles = sim_ca.get("stall_operand", 0.0)
+            if operand_cycles > 0:
+                stall_source["OPERAND(RAW)"] = (
+                    stall_source.get("OPERAND(RAW)", 0.0) + operand_cycles
+                )
         stall_attribution_us = {
             lane: cycles * stats.loop_factor / CLOCK_GHZ / 1000
-            for lane, cycles in sim_ca["stall_unit"].items()
+            for lane, cycles in stall_source.items()
         }
     else:
         sim = simulate_gated_dispatch(stats, LANE_REALIZATION)
@@ -850,7 +919,12 @@ def predict(
     if additive_predicted_us <= MIN_TIME_FLOOR_US:
         regime = "overhead-bound (small-shape min-time floor binds)"
     elif compute_floor_us >= memory_floor_us:
-        regime = f"compute-bound ({binding_lane})"
+        if dependency_bound:
+            # The critical path, not lane throughput, set the floor — don't
+            # point the user at the busiest lane (it has headroom).
+            regime = "dependency-bound (RAW critical path)"
+        else:
+            regime = f"compute-bound ({binding_lane})"
     else:
         regime = "memory-bound"
 
@@ -896,6 +970,7 @@ def predict(
         "additive_predicted_us": additive_predicted_us,
         "predicted_us": predicted_us,
         "regime": regime,
+        "dependency_bound": dependency_bound,
         "binding_lane": binding_lane,
         "lane_pct": lane_pct,
         "mxu_busy": mxu_busy,
@@ -1193,10 +1268,11 @@ def main() -> None:
             sys.exit(2)
         cycle_accurate_instrs = parse_bundle_instructions(bundles_path)
         print(
-            f"[cycle-accurate] EXPERIMENTAL — parsed "
+            f"[cycle-accurate] parsed "
             f"{len(cycle_accurate_instrs):,} instructions from {bundles_path.name}. "
-            f"Without libtpu ground-truth latency tables, expect 5-15% under-"
-            f"prediction; --gated-dispatch (default) is more reliable.",
+            f"Compute floor = max(dependency critical path, busiest-lane "
+            f"occupancy); the operand graph adds RAW-stall visibility on top of "
+            f"the default lane-occupancy model.",
             file=sys.stderr,
         )
 
@@ -1325,6 +1401,18 @@ def main() -> None:
         print()
         print("=== Counterfactuals ===")
         baseline = r["predicted_us"]
+        if r.get("dependency_bound"):
+            # The counterfactuals below re-run only the gated-dispatch
+            # (occupancy) model, but the baseline floor was set by the
+            # cycle-accurate critical path. On a dependency-bound kernel the
+            # reported per-lane savings therefore OVER-state the benefit
+            # (they fold in the critical-path gap, not just the lane). Treat
+            # them as loose upper bounds — the real lever is shortening the
+            # RAW dependency chain, not freeing a lane.
+            print(
+                "  NOTE: kernel is dependency-bound (RAW critical path); "
+                "lane-savings below are upper bounds, not occupancy-limited."
+            )
         if args.advise:
             # For each calibrated lane that has non-zero busy frac, set it
             # to 1.0 and rerun. This is the upper-bound benefit of fully
