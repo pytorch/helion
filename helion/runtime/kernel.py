@@ -39,6 +39,7 @@ from torch.utils.weak import WeakIdKeyDictionary
 
 from .. import exc
 from .._compat import target_device_capability
+from .._compile_time import is_enabled as _compile_time_enabled
 from .._compile_time import measure
 from .._compiler.ast_extension import unparse
 from .._compiler.autotuner_heuristics import compiler_seed_configs
@@ -313,32 +314,43 @@ class Kernel(Generic[_R]):
         Returns:
             BoundKernel: A BoundKernel object with the given arguments bound.
         """
-        with measure("Kernel.bind"):
-            if not isinstance(args, tuple):
-                assert isinstance(args, list), "args must be a tuple or list"
-                args = tuple(args)
-            if len(args) > self._num_params:
-                raise TypeError(
-                    f"Too many arguments passed to the kernel, expected: {self._num_params} got: {len(args)}."
-                )
-            signature = self._base_specialization_key(args)
-            cache_key = self._get_bound_kernel_cache_key(args, signature)
-            bound_kernel = (
-                None if cache_key is None else self._bound_kernels.get(cache_key, None)
+        # The "Kernel.bind" compile-time metric covers the whole bind body
+        # (key computation + cache lookup + any compile). But entering a
+        # context manager costs ~115ns even when measurement is disabled,
+        # which is significant on this per-call dispatch path, so only pay
+        # for it when measurement is actually on. Semantics are unchanged:
+        # when enabled, the same code runs under the same measure() scope.
+        if _compile_time_enabled():
+            with measure("Kernel.bind"):
+                return self._bind_impl(args)
+        return self._bind_impl(args)
+
+    def _bind_impl(self, args: tuple[object, ...]) -> BoundKernel[_R]:
+        if not isinstance(args, tuple):
+            assert isinstance(args, list), "args must be a tuple or list"
+            args = tuple(args)
+        if len(args) > self._num_params:
+            raise TypeError(
+                f"Too many arguments passed to the kernel, expected: {self._num_params} got: {len(args)}."
             )
-            if bound_kernel is None:
-                normalized_args: tuple[object, ...] = self.normalize_args(*args)
-                if len(normalized_args) != len(args):
-                    # we had default args that needed to be applied
-                    bound_kernel = self.bind(normalized_args)
-                else:
-                    bound_kernel = BoundKernel(self, args)
-                if cache_key is None:
-                    cache_key = self._create_bound_kernel_cache_key(
-                        bound_kernel, args, signature
-                    )
-                self._bound_kernels[cache_key] = bound_kernel
-            return bound_kernel
+        signature = self._base_specialization_key(args)
+        cache_key = self._get_bound_kernel_cache_key(args, signature)
+        bound_kernel = (
+            None if cache_key is None else self._bound_kernels.get(cache_key, None)
+        )
+        if bound_kernel is None:
+            normalized_args: tuple[object, ...] = self.normalize_args(*args)
+            if len(normalized_args) != len(args):
+                # we had default args that needed to be applied
+                bound_kernel = self.bind(normalized_args)
+            else:
+                bound_kernel = BoundKernel(self, args)
+            if cache_key is None:
+                cache_key = self._create_bound_kernel_cache_key(
+                    bound_kernel, args, signature
+                )
+            self._bound_kernels[cache_key] = bound_kernel
+        return bound_kernel
 
     def _base_specialization_key(self, args: Sequence[object]) -> tuple[Hashable, ...]:
         """
@@ -1464,8 +1476,7 @@ def _graph_module_key(fn: Kernel, obj: torch.fx.GraphModule) -> Hashable:
 
 
 _specialization_extractors: dict[
-    type[object] | str,
-    Callable[[Kernel, object], Hashable],
+    type[object] | str, Callable[[Kernel, object], Hashable]
     # pyrefly: ignore [bad-assignment]
 ] = {
     torch.Tensor: _tensor_key,

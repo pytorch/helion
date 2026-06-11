@@ -2177,8 +2177,8 @@ def _append_cute_wrapper_plan(
     smem_swizzle_b: int | None = (
         int(smem_swizzle_b_raw) if isinstance(smem_swizzle_b_raw, int) else None
     )
-    # K-major (column-major / K-contiguous) B. Absent on the MN-major
-    # (row-major B) default path.
+    # K-major (column-major / K-contiguous) B -- native fp8 scaled_mm layout.
+    # Absent on the MN-major (row-major B) default path.
     b_k_major = bool(plan.get("b_k_major"))
     kernel_args = [str(arg) for arg in cast("list[object]", plan["kernel_args"])]
     assert len(kernel_args) == 4

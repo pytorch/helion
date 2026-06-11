@@ -347,12 +347,64 @@ def supports_tensor_descriptor() -> bool:
     return _supports_tensor_descriptor()
 
 
+# Per-device-index cache for ``target_device_capability``. A physical
+# device's compute capability cannot change within a process (torch itself
+# caches ``device_count`` behind ``is_available``), but the query costs
+# ~2.5us and sits on the per-call kernel dispatch path via
+# ``_device_specialization_key``. Entries are only read/written while
+# ``torch.cuda.is_available`` / ``torch.cuda.get_device_capability`` are
+# the original functions — tests patch them to simulate other
+# architectures, and the identity check below routes patched calls to the
+# uncached path.
+#
+# NB: a plain ``@functools.cache`` on this function is wrong on two counts,
+# which is why the cache is hand-rolled:
+#   1. It keys on the ``device`` argument, not on whether the torch
+#      functions are patched, so it cannot fall back to a live query.
+#      Tests that patch ``get_device_capability`` to return (9, 0) then
+#      (10, 0) for the same device (e.g. test_config_api's sm90-vs-sm100
+#      cache-key test) would get the first cached value both times.
+#   2. ``device=None`` means "the current device", which can change via
+#      ``torch.cuda.set_device``. functools.cache would freeze the first
+#      answer under the ``None`` key forever; here ``None`` is resolved to
+#      a concrete index per call before the cache lookup.
+_REAL_CUDA_IS_AVAILABLE: Callable[[], bool] = torch.cuda.is_available
+_REAL_CUDA_GET_CAPABILITY: Callable[..., tuple[int, int]] = (
+    torch.cuda.get_device_capability
+)
+_CUDA_CAPABILITY_CACHE: dict[int, tuple[int, int]] = {}
+_CUDA_AVAILABLE: bool | None = None
+
+
 def target_device_capability(
     device: torch.device | None = None,
 ) -> tuple[int, int] | None:
     """Return CUDA compute capability, or None for non-CUDA/unavailable targets."""
     if device is not None and device.type != "cuda":
         return None
+    if (
+        torch.cuda.is_available is _REAL_CUDA_IS_AVAILABLE
+        and torch.cuda.get_device_capability is _REAL_CUDA_GET_CAPABILITY
+    ):
+        global _CUDA_AVAILABLE
+        if _CUDA_AVAILABLE is not True:
+            # Only cache the True result; an unavailable runtime has no GPU
+            # launches to speed up, so keep re-querying in that case.
+            if not _REAL_CUDA_IS_AVAILABLE():
+                return None
+            _CUDA_AVAILABLE = True
+        index = device.index if device is not None else None
+        if index is None:
+            # An index-less device refers to the *current* device, which can
+            # change between calls — resolve it each time (cheap), then hit
+            # the per-index cache.
+            index = torch.cuda.current_device()
+        capability = _CUDA_CAPABILITY_CACHE.get(index)
+        if capability is None:
+            _CUDA_CAPABILITY_CACHE[index] = capability = _REAL_CUDA_GET_CAPABILITY(
+                index
+            )
+        return capability
     if not torch.cuda.is_available():
         return None
     if device is None:
