@@ -185,7 +185,10 @@ class Kernel(Generic[_R]):
             Config(**config) if isinstance(config, dict) else config
             for config in configs or []
         ]
-        self._bound_kernels: dict[BoundKernelInMemoryCacheKey, BoundKernel] = {}
+        # Keyed by ``(signature, extra_results)`` tuples — the tuple form of
+        # ``BoundKernelInMemoryCacheKey``, kept plain for cheap per-call
+        # construction in ``bind``.
+        self._bound_kernels: dict[Hashable, BoundKernel] = {}
         self._specialize_extra: dict[
             Hashable, list[Callable[[Sequence[object]], Hashable]]
         ] = {}
@@ -226,13 +229,15 @@ class Kernel(Generic[_R]):
 
     def _get_bound_kernel_cache_key(
         self, args: tuple[object, ...], signature: tuple[Hashable, ...]
-    ) -> BoundKernelInMemoryCacheKey | None:
-        from ..autotuner.base_cache import BoundKernelInMemoryCacheKey
-
+    ) -> tuple[Hashable, ...] | None:
+        # Plain tuples keep the per-call dispatch path free of dataclass
+        # construction; `_create_bound_kernel_cache_key` provides the
+        # `BoundKernelInMemoryCacheKey` form for the autotuner caches.
         extra_fns = self._specialize_extra.get(signature)
         if extra_fns is not None:
-            extra_results: tuple[Hashable, ...] = tuple([s(args) for s in extra_fns])
-            return BoundKernelInMemoryCacheKey(signature, extra_results)
+            if extra_fns:
+                return (signature, tuple([s(args) for s in extra_fns]))
+            return (signature, ())
         return None
 
     def _create_bound_kernel_cache_key(
@@ -278,9 +283,10 @@ class Kernel(Generic[_R]):
                 else:
                     bound_kernel = BoundKernel(self, args)
                 if cache_key is None:
-                    cache_key = self._create_bound_kernel_cache_key(
+                    full_key = self._create_bound_kernel_cache_key(
                         bound_kernel, args, signature
                     )
+                    cache_key = (full_key.specialization_key, full_key.extra_results)
                 self._bound_kernels[cache_key] = bound_kernel
             return bound_kernel
 
