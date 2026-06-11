@@ -5,14 +5,11 @@ Batch Softmax Example (Arithmetic Broadcasting)
 This example demonstrates arithmetic broadcasting in Helion kernels via a
 batched softmax: x[B, M, N] -> softmax over the last dimension.
 
-The key pattern is x - x_max, where x is [B*M, N] and x_max is [B*M].
-Broadcasting uses [:, None] to expand x_max from [tile_bm] to [tile_bm, 1]
-for element-wise subtraction with [tile_bm, N].
-
-For 3D broadcasting without flattening (e.g., inside an attention kernel
-where batch dims are already tiled separately), see examples/attention.py
-which uses the [:, :, None] pattern: m_ij[:, :, None] broadcasts
-[tile_b, tile_m] to [tile_b, tile_m, 1].
+The batch dims [B, M] are tiled directly with ``hl.tile([b, m])`` and the last
+dim is loaded whole, so the kernel works in the native 3D layout with no reshape
+— which also avoids a retile of the output on the TPU/Pallas backend. The
+[:, :, None] pattern broadcasts the reduced [tile_b, tile_m] back over the last
+dim.
 """
 
 # %%
@@ -36,7 +33,12 @@ import helion.language as hl
 
 
 # %%
-@helion.kernel()
+@helion.kernel(
+    # Validate autotuning against eager softmax (the ground truth) rather than
+    # the kernel's default config, which loads the whole last dim and so can be
+    # too large to compile as the baseline before autotuning shrinks the block.
+    autotune_baseline_fn=lambda x: torch.nn.functional.softmax(x, dim=-1),
+)
 def batch_softmax(x: torch.Tensor) -> torch.Tensor:
     """
     Batched softmax with arithmetic broadcasting.
@@ -48,23 +50,21 @@ def batch_softmax(x: torch.Tensor) -> torch.Tensor:
         Softmax output of shape [B, M, N], normalized along the last dimension.
     """
     b, m, n = x.size()
-    # Flatten [B, M, N] -> [B*M, N] to use standard 2D softmax pattern
-    x_2d = x.reshape([b * m, n])
-    out_2d = torch.empty_like(x_2d)
-    for tile_bm in hl.tile(b * m):
-        # Load entire last dimension for each row
-        values = x_2d[tile_bm, :]  # [tile_bm, N]
+    out = torch.empty_like(x)
+    # Tile the batch dims [B, M] together; load the whole last dim per tile.
+    for tile_b, tile_m in hl.tile([b, m]):
+        values = x[tile_b, tile_m, :]  # [tile_b, tile_m, N]
 
-        # Reduce over last dim -> [tile_bm]
-        x_max = torch.amax(values, dim=1)
+        # Reduce over last dim -> [tile_b, tile_m]
+        x_max = torch.amax(values, dim=2)
 
-        # Broadcast x_max from [tile_bm] to [tile_bm, 1]
-        # using [:, None], then subtract from [tile_bm, N]
-        exp_vals = torch.exp(values - x_max[:, None])
+        # Broadcast x_max from [tile_b, tile_m] to [tile_b, tile_m, 1]
+        # using [:, :, None], then subtract from [tile_b, tile_m, N]
+        exp_vals = torch.exp(values - x_max[:, :, None])
 
-        sum_exp = torch.sum(exp_vals, dim=1)  # [tile_bm]
-        out_2d[tile_bm, :] = exp_vals / sum_exp[:, None]
-    return out_2d.view(b, m, n)
+        sum_exp = torch.sum(exp_vals, dim=2)  # [tile_b, tile_m]
+        out[tile_b, tile_m, :] = exp_vals / sum_exp[:, :, None]
+    return out
 
 
 # %%
