@@ -6,9 +6,9 @@ Sets 'dim_tilings' metadata on tensors based on indexing constraints.
 
 from __future__ import annotations
 
-import operator
 from dataclasses import dataclass
 from dataclasses import field
+import operator
 from typing import TYPE_CHECKING
 
 import sympy

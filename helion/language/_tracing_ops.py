@@ -1961,6 +1961,7 @@ def _compute_vmem_shapes(
         # and the per-iter DMA chunk is (BK, BM).
         jpat = (jagged_flat_patterns or {}).get(id(fake))
         if jpat is not None:
+            assert jpat.sublane_bid is not None and jpat.lane_bid is not None
             sublane_bs = state.device_function.resolved_block_size(jpat.sublane_bid)
             lane_bs = state.device_function.resolved_block_size(jpat.lane_bid)
             assert isinstance(sublane_bs, int) and isinstance(lane_bs, int)
@@ -2249,6 +2250,11 @@ def _codegen_fori_loop(state: CodegenState) -> object:
         # ``x_flat.at[pl.ds(starts[0] + k_offset, BK), pl.ds(m_offset, BM)]``.
         jpat = jagged_flat_patterns.get(id(fake))
         if jpat is not None:
+            assert (
+                jpat.sublane_bid is not None
+                and jpat.lane_bid is not None
+                and jpat.sublane_base_fx is not None
+            )
             slice_parts: list[str] = []
             for axis_bid in (jpat.sublane_bid, jpat.lane_bid):
                 bs_var = state.device_function.block_size_var(axis_bid)
