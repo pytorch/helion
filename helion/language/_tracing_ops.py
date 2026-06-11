@@ -17,6 +17,7 @@ from .._compiler.ast_extension import create
 from .._compiler.ast_extension import expr_from_string
 from .._compiler.ast_extension import statement_from_string
 from .._compiler.compile_environment import CompileEnvironment
+from .._compiler.device_function import find_block_size_symbols
 from .._compiler.dtype_utils import cast_ast
 from .._compiler.host_function import HostFunction
 from .._compiler.variable_origin import BlockSizeOrigin
@@ -520,6 +521,50 @@ def _scratch_write_stmt(state: CodegenState, sname: str, val: ast.AST) -> ast.AS
     return statement_from_string(f"{sname}[{idx}] = {{val}}", val=val)
 
 
+def _resolve_dim_size(
+    s: object,
+    env: CompileEnvironment,
+    config: Config,
+) -> int | None:
+    """Resolve one tensor-dim size ``s`` to a concrete int from ``config``.
+
+    First tries ``resolve_block_id`` for a single tile dim (this also handles
+    grid/reduction provenance and fixed-block aliases). Otherwise substitutes
+    every block-size symbol in ``s`` with its configured block size and
+    evaluates -- so a ``reshape`` that merges tiled dims (a product ``u0*u1*u2``,
+    a sum ``u0+u1``, a power ``u0**2`` or a nested combination) resolves to the
+    right value. Without this the fallback ``int(s)`` returns the symbol's *size
+    hint* (the full tensor extent), which over-sizes loop-carried scratch buffers
+    and crashes at runtime. Returns ``None`` (caller falls back to ``int(s)``)
+    whenever ``s`` is not a recognized expression or does not reduce to a
+    concrete int.
+    """
+    bid = env.resolve_block_id(s)
+    if bid is not None:
+        bs = env.block_sizes[bid].from_config(config)
+        return bs if isinstance(bs, int) else None
+
+    if isinstance(s, int):
+        return s
+    expr = s._sympy_() if isinstance(s, torch.SymInt) else s
+    if not isinstance(expr, sympy.Expr):
+        return None
+    if expr.is_Integer:
+        return int(expr)
+
+    block_mapping, non_block_symbols = find_block_size_symbols(expr)
+    if non_block_symbols:
+        return None
+    subs: dict[sympy.Symbol, sympy.Integer] = {}
+    for symbol, block_id in block_mapping.items():
+        bs = env.block_sizes[block_id].from_config(config)
+        if not isinstance(bs, int):
+            return None
+        subs[symbol] = sympy.Integer(bs)
+    resolved = expr.xreplace(subs)
+    return int(resolved) if resolved.is_Integer else None
+
+
 def _resolve_shape(
     proxy: torch.Tensor,
     env: CompileEnvironment,
@@ -528,11 +573,9 @@ def _resolve_shape(
     """Resolve symbolic tile sizes to concrete block sizes from config."""
     resolved = []
     for s in proxy.shape:
-        bid = env.resolve_block_id(s)
-        if bid is not None:
-            bs = env.block_sizes[bid].from_config(config)
-            assert isinstance(bs, int)
-            resolved.append(bs)
+        size = _resolve_dim_size(s, env, config)
+        if size is not None:
+            resolved.append(size)
         else:
             resolved.append(int(s))
     return tuple(resolved)
