@@ -750,6 +750,20 @@ class TestCache(RefEagerTestDisabled, TestCase):
                 result = kernel(*args_a)
             torch.testing.assert_close(result, result_a, rtol=1e-2, atol=5e-2)
 
+            # Force the disk-reload path: with the in-memory launchers cleared,
+            # a successful launch must come from the persisted artifact.
+            config = bound._require_implicit_config()
+            compiled_fn = bound._compile_cache[config]
+            cute_kernel = compiled_fn.__globals__[f"_helion_{bound.kernel.name}"]
+            cute_kernel._helion_cute_compiled_launchers.clear()
+            with patch.object(
+                cute,
+                "compile",
+                side_effect=AssertionError("reload should hit the persisted artifact"),
+            ):
+                result = kernel(*args_a)
+            torch.testing.assert_close(result, result_a, rtol=1e-2, atol=5e-2)
+
 
 instantiate_parametrized_tests(TestCache)
 
