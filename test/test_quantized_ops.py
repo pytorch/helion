@@ -96,5 +96,39 @@ class TestCuteQuantizedOps(RefEagerTestDisabled, TestCase):
         self.assertIn("_cute_float4_e2m1fn_x2_to_float32", code)
 
 
+@onlyBackends(["triton"])
+class TestTritonQuantizedOps(RefEagerTestDisabled, TestCase):
+    @skipIfNotCUDA()
+    @skipIfCudaCapabilityLessThan(
+        (10, 0), reason="FP4/FP8 conversion instructions require Blackwell"
+    )
+    def test_float4_e2m1fn_x2_to_float32(self):
+        # Also covers fp4x2 host args viewed as uint8 for Triton.
+        @helion.kernel(autotune_effort="none")
+        def fp4_to_f32_pair(
+            x: torch.Tensor,
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            lo = torch.empty(x.shape, dtype=torch.float32, device=x.device)
+            hi = torch.empty(x.shape, dtype=torch.float32, device=x.device)
+            for tile in hl.tile(x.size(0), block_size=16):
+                lo_value, hi_value = hl.float4_e2m1fn_x2_to_float32(x[tile])
+                lo[tile] = lo_value
+                hi[tile] = hi_value
+            return lo, hi
+
+        raw = torch.arange(16, dtype=torch.uint8, device=DEVICE) * 17  # 0x00..0xFF
+        code, (lo, hi) = code_and_output(
+            fp4_to_f32_pair,
+            (raw.view(torch.float4_e2m1fn_x2),),
+        )
+        raw_i32 = raw.to(torch.int32)
+        torch.testing.assert_close(lo, _dequant_e2m1(raw_i32 & 0xF))
+        torch.testing.assert_close(hi, _dequant_e2m1((raw_i32 >> 4) & 0xF))
+        self.assertIn(" = load.to(tl.int16)", code)
+        self.assertIn("[fp4_packed_", code)
+        self.assertIn("=f,=f,h", code)
+        self.assertIn("tl.inline_asm_elementwise", code)
+
+
 if __name__ == "__main__":
     unittest.main()

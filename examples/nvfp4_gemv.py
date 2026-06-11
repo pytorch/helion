@@ -15,19 +15,12 @@ Two variants are provided:
 # %%
 from __future__ import annotations
 
+import functools
 from typing import TYPE_CHECKING
+from typing import Any
+from typing import Literal
 from typing import cast
 
-import cutlass
-from cutlass import Int32
-from cutlass._mlir.dialects import llvm
-import cutlass.cute as cute
-from cutlass.cute.arch.nvvm_wrappers import _normalize_ptr
-from cutlass.cute.typing import Float32
-from cutlass.cute.typing import Pointer as CutePointer
-from cutlass.cute.typing import Tensor as CuteTensor
-from cutlass.cutlass_dsl import T
-from cutlass.cutlass_dsl import dsl_user_op
 import torch
 from torch import Tensor
 
@@ -36,11 +29,41 @@ from helion._testing import DEVICE
 from helion._testing import run_example
 import helion.language as hl
 from helion.runtime import default_cute_launcher
+from helion.runtime.settings import _get_backend
+
+cutlass: Any
+cute: Any
+dsl_user_op: Any
+
+if _get_backend() == "cute":
+    try:
+        import cutlass
+        from cutlass import Int32
+        from cutlass._mlir.dialects import llvm
+        import cutlass.cute as cute
+        from cutlass.cute.arch.nvvm_wrappers import _normalize_ptr
+        from cutlass.cute.typing import Float32
+        from cutlass.cute.typing import Pointer as CutePointer
+        from cutlass.cute.typing import Tensor as CuteTensor
+        from cutlass.cutlass_dsl import T
+        from cutlass.cutlass_dsl import dsl_user_op
+    except ModuleNotFoundError as e:
+        if e.name is None or not e.name.startswith("cutlass"):
+            raise
+        cutlass = cast("Any", None)
+        cute = cast("Any", None)
+        dsl_user_op = cast("Any", None)
+else:
+    cutlass = cast("Any", None)
+    cute = cast("Any", None)
+    dsl_user_op = cast("Any", None)
 
 if TYPE_CHECKING:
     from collections.abc import Callable
 
     from cutlass._mlir import ir
+
+BackendName = Literal["triton", "cute"]
 
 BF16IN_CONFIG = helion.Config(
     block_sizes=[1, 128],
@@ -502,8 +525,7 @@ def _fp4_storage(tensor: Tensor) -> Tensor:
     return tensor
 
 
-@helion.kernel(static_shapes=True, config=BF16IN_CONFIG, backend="cute")
-def _nvfp4_gemv_bf16in_kernel(
+def _nvfp4_gemv_bf16in_body(
     weight_fp4x2: Tensor,
     x_values: Tensor,
     weight_scale: Tensor,
@@ -530,7 +552,7 @@ def _nvfp4_gemv_bf16in_kernel(
                     torch.float32
                 )
             scale_offsets = swizzled_scale_offsets(
-                row,
+                cast("int", row),
                 tile_k.index,
                 K_groups,
             )
@@ -544,8 +566,7 @@ def _nvfp4_gemv_bf16in_kernel(
     return out
 
 
-@helion.kernel(static_shapes=True, config=FP4IN_CONFIG, backend="cute")
-def _nvfp4_gemv_fp4in_kernel(
+def _nvfp4_gemv_fp4in_body(
     weight_fp4x2: Tensor,
     x_fp4x2: Tensor,
     weight_scale: Tensor,
@@ -569,7 +590,7 @@ def _nvfp4_gemv_fp4in_kernel(
                 x_lo, x_hi = hl.float4_e2m1fn_x2_to_float32(x_fp4x2[tile_k, byte])
                 contrib = contrib + weight_lo * x_lo + weight_hi * x_hi
             weight_scale_offsets = swizzled_scale_offsets(
-                row,
+                cast("int", row),
                 tile_k.index,
                 K_groups,
             )
@@ -593,13 +614,59 @@ def _nvfp4_gemv_fp4in_kernel(
     return out
 
 
+# Share the DSL bodies across backends; each backend keeps its tuned config.
+BF16IN_TRITON_CONFIG = helion.Config(block_sizes=[1, 512], num_warps=1, num_stages=2)
+FP4IN_TRITON_CONFIG = helion.Config(block_sizes=[1, 128], num_warps=4, num_stages=3)
+
+BF16IN_CONFIGS: dict[BackendName, helion.Config] = {
+    "triton": BF16IN_TRITON_CONFIG,
+    "cute": BF16IN_CONFIG,
+}
+FP4IN_CONFIGS: dict[BackendName, helion.Config] = {
+    "triton": FP4IN_TRITON_CONFIG,
+    "cute": FP4IN_CONFIG,
+}
+
+
+def _selected_backend(backend: BackendName | None) -> BackendName:
+    selected = _get_backend() if backend is None else backend
+    if selected not in ("triton", "cute"):
+        raise ValueError(
+            f"nvfp4_gemv supports backend='triton' or 'cute', got {selected!r}"
+        )
+    return selected
+
+
+@functools.cache
+def _nvfp4_gemv_bf16in_kernel(backend: BackendName) -> helion.Kernel[Tensor]:
+    return helion.kernel(
+        _nvfp4_gemv_bf16in_body,
+        static_shapes=True,
+        config=BF16IN_CONFIGS[backend],
+        backend=backend,
+    )
+
+
+@functools.cache
+def _nvfp4_gemv_fp4in_kernel(backend: BackendName) -> helion.Kernel[Tensor]:
+    return helion.kernel(
+        _nvfp4_gemv_fp4in_body,
+        static_shapes=True,
+        config=FP4IN_CONFIGS[backend],
+        backend=backend,
+    )
+
+
 def nvfp4_gemv_bf16in(
     weight_packed: Tensor,
     x_bf16: Tensor,
     weight_scale: Tensor,
     alpha: float = 1.0,
+    *,
+    backend: BackendName | None = None,
 ) -> Tensor:
     """Compute ``weight_packed @ x_bf16`` for NVFP4 weights and BF16 input."""
+    backend = _selected_backend(backend)
     weight_fp4x2 = _as_fp4x2(weight_packed)
     weight_bytes = weight_fp4x2.view(torch.uint8)
     scale_cols = weight_bytes.shape[1] // 8
@@ -612,7 +679,7 @@ def nvfp4_gemv_bf16in(
     out = torch.empty(
         weight_bytes.shape[0], dtype=torch.bfloat16, device=weight_bytes.device
     )
-    if _can_use_fast_cute_path(
+    if backend == "cute" and _can_use_fast_cute_path(
         weight_bytes,
         x_bf16,
         weight_scale,
@@ -630,7 +697,7 @@ def nvfp4_gemv_bf16in(
             block=(128, 1, 1),
         )
         return out
-    return _nvfp4_gemv_bf16in_kernel(
+    return _nvfp4_gemv_bf16in_kernel(backend)(
         weight_fp4x2.view(weight_bytes.shape[0], weight_bytes.shape[1] // 8, 8),
         x_bf16.view(weight_bytes.shape[1] // 8, 16),
         weight_scale.reshape(-1),
@@ -645,8 +712,11 @@ def nvfp4_gemv_fp4in(
     weight_scale: Tensor,
     x_scale: Tensor,
     alpha: float = 1.0,
+    *,
+    backend: BackendName | None = None,
 ) -> Tensor:
     """Compute ``weight_packed @ x_packed`` for NVFP4 weights and input."""
+    backend = _selected_backend(backend)
     weight_fp4x2 = _as_fp4x2(weight_packed)
     x_fp4x2 = _as_fp4x2(x_packed)
     weight_bytes = weight_fp4x2.view(torch.uint8)
@@ -662,7 +732,7 @@ def nvfp4_gemv_fp4in(
     out = torch.empty(
         weight_bytes.shape[0], dtype=torch.bfloat16, device=weight_bytes.device
     )
-    if _can_use_fast_cute_path(
+    if backend == "cute" and _can_use_fast_cute_path(
         weight_bytes,
         x_bytes,
         weight_scale,
@@ -682,7 +752,7 @@ def nvfp4_gemv_fp4in(
             block=(64, 1, 1),
         )
         return out
-    return _nvfp4_gemv_fp4in_kernel(
+    return _nvfp4_gemv_fp4in_kernel(backend)(
         weight_fp4x2.view(weight_bytes.shape[0], weight_bytes.shape[1] // 8, 8),
         x_fp4x2.view(weight_bytes.shape[1] // 8, 8),
         weight_scale.reshape(-1),
@@ -764,22 +834,23 @@ def make_fp8_scales(shape: tuple[int, ...], device: torch.device) -> Tensor:
     return swizzle_fp8_scales(logical_scales)
 
 
-def check_bf16in(M: int, K_bytes: int) -> None:
+def check_bf16in(M: int, K_bytes: int, backend: BackendName) -> None:
     weight = torch.randint(0, 256, (M, K_bytes), dtype=torch.uint8, device=DEVICE).view(
         torch.float4_e2m1fn_x2
     )
     x = torch.randn(K_bytes * 2, dtype=torch.bfloat16, device=DEVICE)
     weight_scale = make_fp8_scales((M, K_bytes // 8), DEVICE)
     run_example(
-        nvfp4_gemv_bf16in,
+        functools.partial(nvfp4_gemv_bf16in, backend=backend),
         reference_nvfp4_gemv_bf16in,
         (weight, x, weight_scale),
+        kernel_name=f"helion-{backend}",
         atol=4.0,
         rtol=2e-1,
     )
 
 
-def check_fp4in(M: int, K_bytes: int) -> None:
+def check_fp4in(M: int, K_bytes: int, backend: BackendName) -> None:
     weight = torch.randint(0, 256, (M, K_bytes), dtype=torch.uint8, device=DEVICE).view(
         torch.float4_e2m1fn_x2
     )
@@ -789,9 +860,10 @@ def check_fp4in(M: int, K_bytes: int) -> None:
     weight_scale = make_fp8_scales((M, K_bytes // 8), DEVICE)
     x_scale = make_fp8_scales((K_bytes // 8,), DEVICE)
     run_example(
-        nvfp4_gemv_fp4in,
+        functools.partial(nvfp4_gemv_fp4in, backend=backend),
         reference_nvfp4_gemv_fp4in,
         (weight, x, weight_scale, x_scale),
+        kernel_name=f"helion-{backend}",
         atol=4.0,
         rtol=2e-1,
     )
@@ -803,7 +875,9 @@ def nvfp4_gemv_bf16in_tritonbench(
     x_bf16: Tensor,
     weight_scale: Tensor,
 ) -> Callable[[], Tensor]:
-    return lambda: nvfp4_gemv_bf16in(weight_packed, x_bf16, weight_scale)
+    return lambda: nvfp4_gemv_bf16in(
+        weight_packed, x_bf16, weight_scale, backend="triton"
+    )
 
 
 def nvfp4_gemv_fp4in_tritonbench(
@@ -813,12 +887,15 @@ def nvfp4_gemv_fp4in_tritonbench(
     weight_scale: Tensor,
     x_scale: Tensor,
 ) -> Callable[[], Tensor]:
-    return lambda: nvfp4_gemv_fp4in(weight_packed, x_packed, weight_scale, x_scale)
+    return lambda: nvfp4_gemv_fp4in(
+        weight_packed, x_packed, weight_scale, x_scale, backend="triton"
+    )
 
 
 def main() -> None:
-    check_bf16in(64, 128)
-    check_fp4in(64, 128)
+    for backend in ("triton", "cute"):
+        check_bf16in(64, 128, backend)
+        check_fp4in(64, 128, backend)
 
 
 if __name__ == "__main__":

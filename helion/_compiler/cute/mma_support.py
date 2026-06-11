@@ -11,6 +11,7 @@ class CuteMmaSupport:
     warp_f16bf16: bool
     warpgroup_f16bf16: bool
     tcgen05_f16bf16: bool
+    tcgen05_f8: bool = False
 
     @property
     def supported_impls(self) -> tuple[str, ...]:
@@ -91,6 +92,28 @@ def _probe_tcgen05_f16bf16() -> bool:
         return False
 
 
+def _probe_tcgen05_f8() -> tuple[bool, str | None]:
+    try:
+        import cutlass
+        from cutlass.cute.nvgpu import tcgen05
+
+        # fp8 (e4m3) MMA on tcgen05 uses the F8F6F4 op with MMA-K=32 (vs 16
+        # for BF16/FP16) and a separate a_dtype/b_dtype.
+        tcgen05.MmaF8F6F4Op(
+            cutlass.Float8E4M3FN,
+            cutlass.Float8E4M3FN,
+            cutlass.Float32,
+            (128, 8, 32),
+            tcgen05.CtaGroup.ONE,
+            tcgen05.OperandSource.SMEM,
+            tcgen05.OperandMajorMode.K,
+            tcgen05.OperandMajorMode.K,
+        )
+        return True, None
+    except Exception as exc:
+        return False, f"{type(exc).__name__}: {exc}"
+
+
 def get_cute_mma_support() -> CuteMmaSupport:
     device = _current_cuda_device()
     if device is None:
@@ -99,15 +122,18 @@ def get_cute_mma_support() -> CuteMmaSupport:
             warp_f16bf16=False,
             warpgroup_f16bf16=False,
             tcgen05_f16bf16=False,
+            tcgen05_f8=False,
         )
 
     cutlass_arch = _current_cutlass_arch_name()
 
     # The universal atom is the only lowering Helion currently wires up end-to-end.
     universal = cutlass_arch is not None
+    tcgen05_f8_ok, _ = _probe_tcgen05_f8()
     return CuteMmaSupport(
         universal=universal,
         warp_f16bf16=_probe_warp_f16bf16(),
         warpgroup_f16bf16=_probe_warpgroup_f16bf16(),
         tcgen05_f16bf16=_probe_tcgen05_f16bf16(),
+        tcgen05_f8=tcgen05_f8_ok,
     )

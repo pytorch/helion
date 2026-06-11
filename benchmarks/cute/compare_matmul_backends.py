@@ -192,6 +192,10 @@ MATMUL_EPILOGUES = (
     "silu",
     "gelu",
     "residual_add",
+    # FP8 RowWise scaled_mm: out = scale_a[m] * scale_b[n] * (a_fp8 @ b_fp8).
+    # The rowwise scale is fused into the epilogue. Intended for --dtype
+    # float8_e4m3fn; the reference is torch._scaled_mm.
+    "scaled_mm",
 )
 QUACK_TUNE_CHOICES = ("off", "brief")
 # Brief tuning covers the documented default, larger cluster/swizzle variants,
@@ -725,7 +729,12 @@ def _dtype_from_name(name: str) -> torch.dtype:
         "float16": torch.float16,
         "bfloat16": torch.bfloat16,
         "float32": torch.float32,
+        "float8_e4m3fn": torch.float8_e4m3fn,
     }[name]
+
+
+def _is_fp8(dtype: torch.dtype) -> bool:
+    return dtype == torch.float8_e4m3fn
 
 
 def _tflops(m: int, n: int, k: int, ms: float) -> float:
@@ -832,9 +841,27 @@ def _make_inputs(
     seed: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     torch.manual_seed(seed)
+    if _is_fp8(dtype):
+        # fp8 has a tiny dynamic range, so build the operands in f32 and cast.
+        # b is laid out column-major (K-contiguous), the layout the tcgen05
+        # fp8 path and torch._scaled_mm expect for the second operand.
+        a = (torch.randn((m, k), device="cuda") * 0.4).to(dtype)
+        b = (torch.randn((k, n), device="cuda") * 0.4).to(dtype).T.contiguous().T
+        return a, b
     a = torch.randn((m, k), device="cuda", dtype=dtype)
     b = torch.randn((k, n), device="cuda", dtype=dtype) / math.sqrt(k)
     return a, b
+
+
+def _make_scales(
+    args: argparse.Namespace,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Per-row (scale_a [m,1]) and per-column (scale_b [1,n]) f32 rowwise scales
+    for the ``scaled_mm`` epilogue. Non-trivial (random) values so a broadcast
+    bug actually surfaces in the correctness check."""
+    scale_a = (torch.rand((args.m, 1), device="cuda") + 0.5).to(torch.float32)
+    scale_b = (torch.rand((1, args.n), device="cuda") + 0.5).to(torch.float32)
+    return scale_a, scale_b
 
 
 def _make_epilogue_inputs(
@@ -842,10 +869,13 @@ def _make_epilogue_inputs(
 ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
     bias = None
     residual = None
+    # fp8 epilogue aux tensors (bias/residual) are kept in the *output* dtype
+    # (bf16); only the matmul operands are fp8.
+    aux_dtype = torch.bfloat16 if _is_fp8(dtype) else dtype
     if args.epilogue in ("bias", "bias_relu", "bias_residual_gelu"):
-        bias = torch.randn((args.n,), device="cuda", dtype=dtype)
+        bias = torch.randn((args.n,), device="cuda", dtype=aux_dtype)
     if args.epilogue in ("bias_residual_gelu", "residual_add"):
-        residual = torch.randn((args.m, args.n), device="cuda", dtype=dtype)
+        residual = torch.randn((args.m, args.n), device="cuda", dtype=aux_dtype)
     return bias, residual
 
 
@@ -857,7 +887,18 @@ def _make_matmul_problem(
     dtype = _dtype_from_name(args.dtype)
     a, b = _make_inputs(args.m, args.n, args.k, dtype, seed=args.seed)
     bias, residual = _make_epilogue_inputs(args, dtype)
+    # Stash the rowwise scales on args so the (a, b, bias, residual) tuple
+    # threaded through every impl stays unchanged. Only the scaled_mm path reads
+    # them, via _scaled_mm_scales().
+    if args.epilogue == "scaled_mm":
+        args._scale_a, args._scale_b = _make_scales(args)
     return dtype, a, b, bias, residual
+
+
+def _scaled_mm_scales(
+    args: argparse.Namespace,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return args._scale_a, args._scale_b
 
 
 def _apply_epilogue(
@@ -889,6 +930,11 @@ def _apply_epilogue(
     if args.epilogue == "residual_add":
         assert residual is not None
         return acc + residual
+    if args.epilogue == "scaled_mm":
+        # out = scale_a[m] * scale_b[n] * acc, cast to bf16. The scale is folded
+        # on the f32 accumulator before the cast (matches the fused epilogue).
+        scale_a, scale_b = _scaled_mm_scales(args)
+        return (acc.float() * scale_a * scale_b).to(torch.bfloat16)
     raise AssertionError(f"unhandled epilogue {args.epilogue!r}")
 
 
@@ -900,7 +946,10 @@ def _matmul_expected(
     residual: torch.Tensor | None,
     dtype: torch.dtype,
 ) -> torch.Tensor:
-    return _apply_epilogue(args, a @ b, bias, residual, dtype)
+    # acc is f32; for fp8 inputs the product is computed in f32 to mirror the
+    # tensor-core accumulate before any epilogue (scaled_mm, activation, ...).
+    acc = (a.float() @ b.float()) if _is_fp8(dtype) else (a @ b)
+    return _apply_epilogue(args, acc, bias, residual, dtype)
 
 
 def _check_close(
@@ -908,6 +957,14 @@ def _check_close(
 ) -> None:
     if dtype == torch.float32:
         torch.testing.assert_close(actual, expected, atol=1e-4, rtol=1e-4)
+    elif _is_fp8(dtype):
+        # fp8 (e4m3) operands carry ~2 decimal digits, so the GEMM accumulates
+        # substantial quantization error; use a relative-error tolerance like
+        # the scaled_mm unit checks.
+        ref_max = expected.float().abs().max().item() + 1e-12
+        rel = (actual.float() - expected.float()).abs().max().item() / ref_max
+        if rel > 0.1:
+            raise AssertionError(f"fp8 mismatch: rel_err={rel:.4f} > 0.1")
     else:
         # bf16/fp16 GEMMs accumulate enough rounding noise that benchmark
         # smoke tests need a looser threshold than unit tests.
@@ -1020,7 +1077,17 @@ def _result(
 
 def _benchmark_aten(args: argparse.Namespace) -> dict[str, Any]:
     dtype, a, b, bias, residual = _make_matmul_problem(args)
-    fn = lambda: _apply_epilogue(args, a @ b, bias, residual, dtype)  # noqa: E731
+    if args.epilogue == "scaled_mm":
+        # ATen's fp8 rowwise GEMM is torch._scaled_mm — the SOTA baseline to
+        # time against (a dequantized f32 matmul would be a misleadingly slow
+        # reference). _apply_epilogue still owns the scaled_mm *semantics* for
+        # the correctness reference in _matmul_expected.
+        scale_a, scale_b = _scaled_mm_scales(args)
+        fn = lambda: torch._scaled_mm(  # noqa: E731
+            a, b, scale_a, scale_b, use_fast_accum=False, out_dtype=torch.bfloat16
+        )
+    else:
+        fn = lambda: _apply_epilogue(args, a @ b, bias, residual, dtype)  # noqa: E731
     stats = _bench_steady(
         fn,
         num_runs=args.num_runs,
@@ -1533,17 +1600,31 @@ def _helion_matmul_args(
     if args.epilogue == "residual_add":
         assert residual is not None
         return (a, b, ResidualAddEpilogue(residual))
+    if args.epilogue == "scaled_mm":
+        scale_a, scale_b = _scaled_mm_scales(args)
+        # examples/fp8_matmul.fp8_matmul takes (x, y, sa2d, sb1d) directly and
+        # bakes the scale in itself (not via an epilogue callable): scale_a as a
+        # (M, N) stride-(1,0) colvec view, scale_b as a rank-1 row vector.
+        scale_a2d = scale_a.reshape(args.m, 1).expand(args.m, args.n)
+        scale_b1d = scale_b.reshape(args.n)
+        return (a, b, scale_a2d, scale_b1d)
     raise AssertionError(f"unhandled epilogue {args.epilogue!r}")
 
 
 def _prepare_helion(args: argparse.Namespace) -> _PreparedHelion:
     backend = args.helion_backend
     os.environ["HELION_BACKEND"] = backend
-    from examples.matmul import matmul
 
     dtype, a, b, bias, residual = _make_matmul_problem(args)
     expected = _matmul_expected(args, a, b, bias, residual, dtype)
     kernel_args = _helion_matmul_args(args, a, b, bias, residual)
+
+    if args.epilogue == "scaled_mm":
+        # fp8 RowWise scaled_mm uses examples/fp8_matmul.py (hl.dot + fused
+        # rowwise scale); the example matmul's torch.addmm does not accept fp8.
+        from examples.fp8_matmul import fp8_matmul as matmul
+    else:
+        from examples.matmul import matmul
 
     bound = matmul.bind(kernel_args)
     config = _make_helion_config_from_args(args) if args.helion_force_config else None
@@ -5931,7 +6012,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--dtype",
-        choices=("float16", "bfloat16", "float32"),
+        choices=("float16", "bfloat16", "float32", "float8_e4m3fn"),
         default="bfloat16",
     )
     parser.add_argument("--num-runs", type=int, default=5)
@@ -6387,6 +6468,27 @@ def _uses_invalid_output_diagnostic_mode(args: argparse.Namespace) -> bool:
 
 
 def _validate_args(args: argparse.Namespace) -> None:
+    # fp8 + scaled_mm wiring. The scaled_mm epilogue is the fp8 RowWise path; it
+    # is only meaningful for fp8 inputs, and the only impls that implement it are
+    # ATen (torch._scaled_mm) and Helion. quack-direct/quack do not.
+    if args.epilogue == "scaled_mm" and args.dtype != "float8_e4m3fn":
+        raise SystemExit("--epilogue scaled_mm requires --dtype float8_e4m3fn")
+    if args.dtype == "float8_e4m3fn":
+        if args.epilogue != "scaled_mm":
+            raise SystemExit("--dtype float8_e4m3fn requires --epilogue scaled_mm")
+        impls = args.impls or list(DEFAULT_IMPLS)
+        requested = [args.impl] if args.impl != "all" else impls
+        bad = [i for i in requested if i in ("quack", "quack-direct")]
+        if bad:
+            raise SystemExit(
+                f"impl(s) {bad} do not support fp8 scaled_mm; use --impls with "
+                "aten and/or helion-cute (quack-direct has no fp8 rowwise GEMM here)"
+            )
+        if "helion-triton" in requested:
+            raise SystemExit(
+                "helion-triton does not support the fp8 tcgen05 path; "
+                "use --impls aten helion-cute"
+            )
     special_modes = (
         args.helion_two_cta_diagnostic_sweep,
         args.helion_two_cta_codegen_report,
