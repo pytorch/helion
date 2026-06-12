@@ -1071,7 +1071,7 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
 
                 with self.assertRaisesRegex(
                     helion.exc.InvalidConfig,
-                    "tcgen05_ab_stages > 3 is not supported",
+                    "tcgen05_ab_stages > 3 is only supported",
                 ):
                     bound.config_spec.normalize(
                         _non_seed_stage_config(requested_ab_stages)
@@ -1106,7 +1106,7 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
             **{TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY: True},
         )
         with self.assertRaisesRegex(
-            helion.exc.InvalidConfig, "tcgen05_ab_stages > 3 is not supported"
+            helion.exc.InvalidConfig, "tcgen05_ab_stages > 3 is only supported"
         ):
             bound.config_spec.normalize(ffi_direct_entry_ab6_bk128)
 

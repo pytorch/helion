@@ -1826,13 +1826,36 @@ def _emit_mma_pipeline(
     epi_elem_dtype_str = (
         _dtype_map[epi_elem_dtype] if epi_elem_dtype is not None else input_dtype_str
     )
-    tcgen05_use_tma = (
-        input_dtype in (torch.float16, torch.bfloat16, torch.float8_e4m3fn)
-        and lhs_fake.is_contiguous()
-        and rhs_fake.is_contiguous()
+
+    def _tcgen05_tma_2d_major(t: torch.Tensor) -> str | None:
+        # A 2D operand is TMA-eligible if it is contiguous in EITHER axis.
+        # Returns "row" (last-dim contiguous), "col" (first-dim contiguous),
+        # or None (neither -> not TMA-eligible). Row-major contiguous returns
+        # "row"; a transposed/column-major view returns "col".
+        if t.dim() != 2:
+            return "row" if t.is_contiguous() else None
+        s = t.stride()
+        if s[1] == 1:
+            return "row"
+        if s[0] == 1:
+            return "col"
+        return None
+
+    _dtype_tma_ok = input_dtype in (
+        torch.float16,
+        torch.bfloat16,
+        torch.float8_e4m3fn,
     )
-    tcgen05_use_tma_a = tcgen05_use_tma
-    tcgen05_use_tma_b = tcgen05_use_tma
+    _lhs_major = _tcgen05_tma_2d_major(lhs_fake)
+    _rhs_major = _tcgen05_tma_2d_major(rhs_fake)
+    # A must be row-major (M,K) K-contiguous == "row"; the K-major A SMEM
+    # layout Helion emits expects the standard row-major A. Only B's major
+    # mode is made layout-aware here.
+    tcgen05_use_tma_a = _dtype_tma_ok and _lhs_major == "row"
+    tcgen05_use_tma_b = _dtype_tma_ok and _rhs_major in ("row", "col")
+    # B is K-major when its (K, N) storage is K-contiguous (column-major),
+    # i.e. stride[0] == 1 -> _rhs_major == "col".
+    tcgen05_b_k_major = _rhs_major == "col"
     tcgen05_use_tma = tcgen05_use_tma_a or tcgen05_use_tma_b
     tcgen05_use_tma_pipeline = tcgen05_use_tma_a and tcgen05_use_tma_b
     tcgen05_requested_pure_matmul_role_lifecycle = is_pure_matmul_role_lifecycle_config(
@@ -3115,6 +3138,7 @@ def _emit_mma_pipeline(
                 bm,
                 bn,
                 tcgen05_cluster_m=tcgen05_cluster_m,
+                b_k_major=tcgen05_b_k_major,
             )
         )
     else:
@@ -3290,6 +3314,7 @@ def _emit_mma_pipeline(
                     bm,
                     bn,
                     tcgen05_cluster_m=tcgen05_cluster_m,
+                    b_k_major=tcgen05_b_k_major,
                 )
             )
         else:
@@ -3307,6 +3332,7 @@ def _emit_mma_pipeline(
                     bm,
                     bn,
                     tcgen05_cluster_m=tcgen05_cluster_m,
+                    b_k_major=tcgen05_b_k_major,
                 )
             )
     if mma_impl == "tcgen05":
@@ -3335,6 +3361,7 @@ def _emit_mma_pipeline(
                 smem_swizzle_b=tcgen05_smem_swizzle_b,
                 explicit_epi_tile_m=tcgen05_explicit_epi_tile_m,
                 explicit_epi_tile_n=tcgen05_explicit_epi_tile_n,
+                b_k_major=tcgen05_b_k_major,
             )
         )
         prefix.append(
@@ -3941,6 +3968,11 @@ def _emit_mma_pipeline(
                 "k_total_size": k_total_size,
                 "kernel_args": [tma_atom_a, tma_tensor_a, tma_atom_b, tma_tensor_b],
             }
+            # K-major (column-major / K-contiguous) B. Only recorded when True
+            # so MN-major (row-major B) wrapper-plan literals stay byte-identical
+            # to the golden.
+            if tcgen05_b_k_major:
+                ab_tma_plan["b_k_major"] = True
             # ``smem_swizzle_*`` overrides are recorded only when codegen
             # selected an explicit SMEM atom kind (either from a user
             # override or the scalar-edge fallback workaround). Keeping
@@ -5332,6 +5364,7 @@ def _make_tiled_mma_setup(
     bn: int,
     *,
     tcgen05_cluster_m: int = 1,
+    b_k_major: bool = False,
 ) -> list[ast.AST]:
     if mma_impl == "warp":
         tiled_mma_expr = (
@@ -5347,6 +5380,7 @@ def _make_tiled_mma_setup(
             bm,
             bn,
             tcgen05_cluster_m=tcgen05_cluster_m,
+            b_k_major=b_k_major,
         )
     else:
         assert mma_thread_linear
@@ -5375,16 +5409,24 @@ def _tcgen05_tiled_mma_expr(
     bn: int,
     *,
     tcgen05_cluster_m: int = 1,
+    b_k_major: bool = False,
 ) -> str:
     cta_group_expr = "cute.nvgpu.tcgen05.CtaGroup.ONE"
     if _tcgen05_use_2cta_instrs(bm=bm, cluster_m=tcgen05_cluster_m):
         cta_group_expr = "cute.nvgpu.tcgen05.CtaGroup.TWO"
+    # A is always K-major. B is MN-major for row-major (N-contiguous) B and
+    # K-major for column-major (K-contiguous) B.
+    b_major_expr = (
+        "cute.nvgpu.OperandMajorMode.K"
+        if b_k_major
+        else "cute.nvgpu.OperandMajorMode.MN"
+    )
     return (
         "cutlass.utils.blackwell_helpers.make_trivial_tiled_mma("
         f"{input_dtype_str}, "
         f"{input_dtype_str}, "
         "cute.nvgpu.OperandMajorMode.K, "
-        "cute.nvgpu.OperandMajorMode.MN, "
+        f"{b_major_expr}, "
         f"{acc_dtype_str}, "
         f"{cta_group_expr}, "
         f"({bm}, {bn}), "
@@ -5431,6 +5473,7 @@ def _make_tcgen05_layout_plan_setup(
     smem_swizzle_b: int | None = None,
     explicit_epi_tile_m: int | None = None,
     explicit_epi_tile_n: int | None = None,
+    b_k_major: bool = False,
 ) -> list[ast.AST]:
     # `compute_epilogue_tile_shape` must receive `elem_ty_d` and `elem_ty_c`
     # equal to the eventual D-output dtype so the helper takes the
@@ -5463,7 +5506,7 @@ def _make_tcgen05_layout_plan_setup(
         ),
         statement_from_string(
             f"{plan.smem_b_layout} = "
-            f"{tcgen05_smem_layout_expr(tiled_mma=tiled_mma, bm=bm, bn=bn, bk=bk, dtype_str=input_dtype_str, num_stages=ab_stage_count, operand='b', swizzle_override=smem_swizzle_b)}"
+            f"{tcgen05_smem_layout_expr(tiled_mma=tiled_mma, bm=bm, bn=bn, bk=bk, dtype_str=input_dtype_str, num_stages=ab_stage_count, operand='b', swizzle_override=smem_swizzle_b, b_k_major=b_k_major)}"
         ),
         statement_from_string(
             f"{plan.c_layout} = cutlass.utils.layout.LayoutEnum.ROW_MAJOR"
