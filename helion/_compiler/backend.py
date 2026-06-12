@@ -384,8 +384,9 @@ class Backend(abc.ABC):
         backend has no ephemeral-cache behavior.
 
         Autotuning compiles many candidate configs; without this they would
-        pollute the persistent cache.  The winning config is recompiled into
-        the real cache afterward (see :meth:`finalize_ephemeral_cache`).
+        pollute the persistent cache.  The winning config's artifact is
+        restored into the real cache afterward (see
+        :meth:`finalize_ephemeral_cache`).
         """
         return None
 
@@ -404,8 +405,10 @@ class Backend(abc.ABC):
     ) -> None:
         """Post-autotune cleanup after running inside an ephemeral cache.
 
-        Evicts the winning config's in-memory compiled artifact so the next
-        call recompiles it into the real (persistent) cache.  No-op by default.
+        Restores the winning config's artifact into the real (persistent)
+        cache: CuTe re-persists the in-memory compiled module directly;
+        Triton evicts the in-memory artifact so the next call recompiles
+        into the real cache.  No-op by default.
         """
         return None
 
@@ -3308,8 +3311,8 @@ class CuteBackend(Backend):
         """Redirect the CuTe DSL on-disk cache to a temporary dir during
         autotuning so candidate compilations don't pollute the real cache.
 
-        The winning config is recompiled into the real cache afterward (see
-        :meth:`finalize_ephemeral_cache`).
+        The winning config's artifact is re-persisted from memory into the
+        real cache afterward (see :meth:`finalize_ephemeral_cache`).
         """
         saved = os.environ.get("CUTE_DSL_CACHE_DIR")
         with tempfile.TemporaryDirectory(prefix="helion_cute_autotune_") as ephemeral:
@@ -3326,33 +3329,43 @@ class CuteBackend(Backend):
     def finalize_ephemeral_cache(
         self, bound_kernel: BoundKernel[Any], config: Config
     ) -> None:
+        """Persist the winning config's compiled artifact into the real cache.
+
+        Candidate artifacts died with the ephemeral dir, but the winner's
+        launcher still holds the compiled module in memory and the disk-cache
+        key excludes ``CUTE_DSL_CACHE_DIR``, so re-persisting from memory
+        writes the exact artifact a later process will look up.  Launchers and
+        compile-cache entries are kept so the winner launches without
+        recompiling.
+        """
         from ..runtime.config import Config
 
         compiled_fn = bound_kernel._compile_cache.get(config)
-        evict = config
         if compiled_fn is None:
+            # The autotuner may return a minimized config (default values
+            # stripped); the compiled entry is keyed by the full config.
             default = bound_kernel.config_spec.default_config()
             # pyrefly: ignore [bad-argument-type]
-            evict = Config(**(default.config | config.config))
-            compiled_fn = bound_kernel._compile_cache.get(evict)
-        # Drop in-memory compiled launchers so the winning config recompiles
-        # (and persists its artifact into the real, non-ephemeral cache dir)
-        # on its next launch.  PyCodeCache returns the same generated module
-        # object, so clearing the launcher dict on it is what forces the
-        # recompile + persist.
-        if compiled_fn is not None:
-            cute_kernel = compiled_fn.__globals__.get(  # type: ignore[attr-defined]
-                f"_helion_{bound_kernel.kernel.name}"
-            )
-            launchers = getattr(cute_kernel, "_helion_cute_compiled_launchers", None)
-            if launchers is not None:
-                launchers.clear()
-        # Pop the compile-cache entry so compile_config re-runs
-        # setup_compile_cache_dir (pointing CUTE_DSL_CACHE_DIR at the real dir).
-        bound_kernel._compile_cache.pop(config, None)
-        bound_kernel._compile_cache.pop(evict, None)
-        bound_kernel._cache_path_map.pop(config, None)
-        bound_kernel._cache_path_map.pop(evict, None)
+            full_config = Config(**(default.config | config.config))
+            compiled_fn = bound_kernel._compile_cache.get(full_config)
+        if compiled_fn is None:
+            return
+        cute_kernel = compiled_fn.__globals__.get(  # type: ignore[attr-defined]
+            f"_helion_{bound_kernel.kernel.name}"
+        )
+        launchers = getattr(cute_kernel, "_helion_cute_compiled_launchers", None)
+        if not launchers:
+            return
+        device_index = (
+            bound_kernel.env.device.index
+            if bound_kernel.env.device.index is not None
+            else 0
+        )
+        # The ephemeral context restored CUTE_DSL_CACHE_DIR on exit; this sets
+        # the real per-device dir when the user did not provide one.
+        self.setup_compile_cache_dir(device_index)
+        for launcher in launchers.values():
+            launcher.persist_compiled()
 
     def compiled_cache_key(
         self, bound_kernel: BoundKernel[Any], compiled_fn: object
