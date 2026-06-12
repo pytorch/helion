@@ -157,8 +157,38 @@ class TestMetadataSchema(TestCase):
         ).to_dict()
         self.assertEqual(record["kernel_id"], "abc123")
         self.assertEqual(record["kernel_source"], "def k(): ...")
+        self.assertIn("run_id", record)
         # Must be JSON serializable for the sidecar file.
         json.dumps(record)
+
+    def test_run_id_is_derived_and_distinguishes_shapes(self) -> None:
+        """
+        run_id is a content hash of (kernel_id, input_shapes, dtypes, hardware):
+        derived when not supplied, stable for identical invocations, and
+        distinct across shapes/dtypes/hardware so per-config rows can be
+        attributed to the exact instance they were measured on.
+        """
+
+        def make(**overrides: str) -> KernelMetadata:
+            fields = {
+                "kernel_id": "kid",
+                "input_shapes": "[(16,)]",
+                "dtypes": "['torch.float32']",
+                "hardware": "TestGPU",
+            }
+            fields.update(overrides)
+            return KernelMetadata(**fields)
+
+        base = make()
+        self.assertTrue(base.run_id)  # derived, non-empty
+        self.assertEqual(base.run_id, make().run_id)  # stable / reproducible
+        # Any identity field changing the invocation changes the run_id.
+        self.assertNotEqual(base.run_id, make(input_shapes="[(32,)]").run_id)
+        self.assertNotEqual(base.run_id, make(dtypes="['torch.float16']").run_id)
+        self.assertNotEqual(base.run_id, make(hardware="OtherGPU").run_id)
+        self.assertNotEqual(base.run_id, make(kernel_id="other").run_id)
+        # An explicitly supplied run_id is preserved (not overwritten).
+        self.assertEqual(make(run_id="pinned").run_id, "pinned")
 
     def test_default_metadata_has_empty_identity(self) -> None:
         """
@@ -170,9 +200,20 @@ class TestMetadataSchema(TestCase):
         self.assertEqual(record["kernel_source"], "")
         json.dumps(record)
 
-    def test_log_entry_defaults_to_empty_sample_id(self) -> None:
+    def test_empty_metadata_run_id_is_derived_and_stable(self) -> None:
         """
-        sample_id is optional on AutotuneLogEntry and defaults to empty.
+        Even with an empty identity, run_id is still a derived, non-empty,
+        reproducible hash (it never falls back to the empty string).
+        """
+        run_id = KernelMetadata().run_id
+        self.assertTrue(run_id)
+        self.assertEqual(run_id, KernelMetadata().run_id)
+        # A different identity yields a different run_id.
+        self.assertNotEqual(run_id, KernelMetadata(kernel_id="x").run_id)
+
+    def test_log_entry_defaults_to_empty_sample_id_and_decorator(self) -> None:
+        """
+        sample_id and decorator are optional on AutotuneLogEntry, default empty.
         """
         entry = AutotuneLogEntry(
             generation=0,
@@ -182,15 +223,21 @@ class TestMetadataSchema(TestCase):
             config=helion.Config(block_sizes=[16]),
         )
         self.assertEqual(entry.sample_id, "")
+        self.assertEqual(entry.decorator, "")
 
 
 class TestAutotuneLogSink(TestCase):
-    def _entry(self, perf_ms: float, sample_id: str = "sample-xyz") -> AutotuneLogEntry:
+    def _entry(
+        self,
+        perf_ms: float,
+        sample_id: str = "sample-xyz",
+        decorator: str = "@helion.kernel(config=helion.Config(block_sizes=[16]))",
+    ) -> AutotuneLogEntry:
         """
         Build a minimal AutotuneLogEntry for sink tests.
 
-        Only perf_ms and sample_id vary across callers; the remaining fields
-        (generation, status, compile_time, config) are fixed placeholders.
+        Only perf_ms, sample_id and decorator vary across callers; the remaining
+        fields (generation, status, compile_time, config) are fixed placeholders.
         """
         return AutotuneLogEntry(
             generation=0,
@@ -199,14 +246,15 @@ class TestAutotuneLogSink(TestCase):
             compile_time=0.5,
             config=helion.Config(block_sizes=[16]),
             sample_id=sample_id,
+            decorator=decorator,
         )
 
     def test_sink_writes_metadata_sidecar_and_per_config_rows(self) -> None:
         """
         With KernelMetadata, the sink writes both outputs over a run: a JSON
-        sidecar holding the kernel identity once, and a CSV with one row per
-        recorded config. Each CSV row is stamped with the kernel_id foreign key
-        (matching the sidecar) and carries the entry's sample_id.
+        Lines sidecar holding one kernel-identity record per run, and a CSV with
+        one row per recorded config. Each CSV row is stamped with the kernel_id
+        foreign key (matching the sidecar) and carries the entry's sample_id.
         """
         metadata = KernelMetadata(
             kernel_id="abc123",
@@ -224,8 +272,10 @@ class TestAutotuneLogSink(TestCase):
                 sink.record(self._entry(0.2))
                 sink.end_run()
 
-            # Sidecar holds the kernel identity (stored once).
-            sidecar = json.loads(sink.meta_path.read_text(encoding="utf-8"))
+            # Sidecar holds one kernel-identity record (JSON Lines) for the run.
+            meta_lines = sink.meta_path.read_text(encoding="utf-8").splitlines()
+            self.assertEqual(len(meta_lines), 1)
+            sidecar = json.loads(meta_lines[0])
             self.assertEqual(sidecar["kernel_id"], "abc123")
             self.assertEqual(sidecar["kernel_name"], "_add_kernel")
             self.assertIn("def _add_kernel", sidecar["kernel_source"])
@@ -234,7 +284,7 @@ class TestAutotuneLogSink(TestCase):
             with sink.csv_path.open(encoding="utf-8", newline="") as f:
                 rows = list(csv.reader(f))
             header = rows[0]
-            self.assertEqual(header[0], "kernel_id")
+            self.assertEqual(header[0], "run_id")
             self.assertIn("timestamp_s", header)
             data_rows = rows[1:]
             self.assertEqual(len(data_rows), 2)
@@ -244,12 +294,124 @@ class TestAutotuneLogSink(TestCase):
             # sample_id (per-(kernel, config) key) is carried from the entry.
             sid_col = header.index("sample_id")
             self.assertTrue(all(row[sid_col] == "sample-xyz" for row in data_rows))
+            # run_id foreign key joins each row to the sidecar record.
+            rid_col = header.index("run_id")
+            self.assertTrue(all(row[rid_col] == sidecar["run_id"] for row in data_rows))
+            # decorator string is collected as a structured column on every row.
+            dec_col = header.index("decorator")
+            self.assertTrue(
+                all(
+                    row[dec_col]
+                    == "@helion.kernel(config=helion.Config(block_sizes=[16]))"
+                    for row in data_rows
+                )
+            )
+
+    def test_sink_appends_across_runs_at_same_base_path(self) -> None:
+        """
+        Multiple autotune runs sharing one base path accumulate instead of
+        clobbering: each opens a fresh sink, the CSV keeps a single header with
+        rows from every run, and the .meta.jsonl sidecar gains one identity
+        record per run. This is the multi-kernel/multi-shape CI collection case
+        (one process autotunes many kernels into one HELION_AUTOTUNE_LOG path).
+        """
+        meta_a = KernelMetadata(
+            kernel_id="kid-a",
+            kernel_name="kernel_a",
+            kernel_source="def kernel_a(): ...",
+            input_shapes="[(64,)]",
+            dtypes="['torch.float32']",
+            hardware="TestGPU",
+        )
+        meta_b = KernelMetadata(
+            kernel_id="kid-b",
+            kernel_name="kernel_b",
+            kernel_source="def kernel_b(): ...",
+            input_shapes="[(128,)]",
+            dtypes="['torch.float16']",
+            hardware="TestGPU",
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            base = f"{tmp}/run"
+            for meta, sid in ((meta_a, "sid-a"), (meta_b, "sid-b")):
+                with AutotuneLogSink(base, meta) as sink:
+                    sink.start_run()
+                    sink.record(self._entry(0.1, sample_id=sid))
+                    sink.end_run()
+
+            # One identity record per run, in order.
+            meta_lines = sink.meta_path.read_text(encoding="utf-8").splitlines()
+            self.assertEqual(len(meta_lines), 2)
+            rec_a, rec_b = (json.loads(line) for line in meta_lines)
+            self.assertEqual(rec_a["kernel_id"], "kid-a")
+            self.assertEqual(rec_b["kernel_id"], "kid-b")
+            # Different invocations get different run_ids.
+            self.assertNotEqual(rec_a["run_id"], rec_b["run_id"])
+
+            # Single header, one data row per run, each carrying its own keys.
+            with sink.csv_path.open(encoding="utf-8", newline="") as f:
+                rows = list(csv.reader(f))
+            header = rows[0]
+            data_rows = rows[1:]
+            self.assertEqual(header[0], "run_id")
+            self.assertEqual(len(data_rows), 2)
+            kid_col = header.index("kernel_id")
+            sid_col = header.index("sample_id")
+            rid_col = header.index("run_id")
+            self.assertEqual([r[kid_col] for r in data_rows], ["kid-a", "kid-b"])
+            self.assertEqual([r[sid_col] for r in data_rows], ["sid-a", "sid-b"])
+            # Each row's run_id joins back to its own meta record.
+            self.assertEqual(
+                [r[rid_col] for r in data_rows], [rec_a["run_id"], rec_b["run_id"]]
+            )
+
+    def test_sink_writes_ir_jsonl_joinable_to_meta_and_csv(self) -> None:
+        """When an ir_graph is provided, the sink appends it to <base>.ir.jsonl,
+        one record per run, joinable to the meta record and CSV rows on run_id.
+        """
+        metadata = KernelMetadata(
+            kernel_id="abc123",
+            kernel_name="_add_kernel",
+            kernel_source="def _add_kernel(): ...",
+            input_shapes="[(64,)]",
+            dtypes="['torch.float32']",
+            hardware="TestGPU",
+        )
+        ir_graph = {
+            "run_id": metadata.run_id,
+            "kernel_id": metadata.kernel_id,
+            "directed": True,
+            "multigraph": False,
+            "graph": {"run_id": metadata.run_id},
+            "nodes": [{"id": "g0:x"}],
+            "links": [],
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            base = f"{tmp}/run"
+            with AutotuneLogSink(base, metadata, ir_graph) as sink:
+                sink.start_run()
+                sink.record(self._entry(0.1))
+                sink.end_run()
+
+            ir_lines = sink.ir_path.read_text(encoding="utf-8").splitlines()
+            self.assertEqual(len(ir_lines), 1)
+            ir_record = json.loads(ir_lines[0])
+            meta_record = json.loads(
+                sink.meta_path.read_text(encoding="utf-8").splitlines()[0]
+            )
+            with sink.csv_path.open(encoding="utf-8", newline="") as f:
+                rows = list(csv.reader(f))
+            header, data_rows = rows[0], rows[1:]
+            rid_col = header.index("run_id")
+            # ir <-> meta <-> csv all join on run_id.
+            self.assertEqual(ir_record["run_id"], meta_record["run_id"])
+            self.assertTrue(all(r[rid_col] == ir_record["run_id"] for r in data_rows))
 
     def test_sink_without_metadata_writes_no_sidecar(self) -> None:
         """
         When the sink is created without KernelMetadata, a full run (start,
-        record, end) writes no sidecar file, since there is no kernel identity
-        to persist.
+        record, end) writes neither the .meta.jsonl nor the .ir.jsonl sidecar,
+        since there is no kernel identity (or IR graph) to persist.
         """
         with tempfile.TemporaryDirectory() as tmp:
             base = f"{tmp}/run"
@@ -258,6 +420,9 @@ class TestAutotuneLogSink(TestCase):
                 sink.record(self._entry(0.1))
                 sink.end_run()
             self.assertFalse(sink.meta_path.exists())
+            self.assertFalse(sink.ir_path.exists())
+            # The CSV is still produced (the run happened); only sidecars are gated.
+            self.assertTrue(sink.csv_path.exists())
 
     def test_sink_without_metadata_rows_have_empty_kernel_id(self) -> None:
         """
@@ -273,9 +438,33 @@ class TestAutotuneLogSink(TestCase):
             with sink.csv_path.open(encoding="utf-8", newline="") as f:
                 rows = list(csv.reader(f))
             header = rows[0]
-            self.assertEqual(header[0], "kernel_id")
+            self.assertEqual(header[0], "run_id")
             kid_col = header.index("kernel_id")
+            rid_col = header.index("run_id")
             self.assertTrue(all(row[kid_col] == "" for row in rows[1:]))
+            self.assertTrue(all(row[rid_col] == "" for row in rows[1:]))
+
+    def test_sink_with_metadata_but_no_ir_graph_writes_no_ir_jsonl(self) -> None:
+        """
+        Metadata without an ir_graph writes the .meta.jsonl sidecar but no
+        .ir.jsonl (the IR dump is independently optional / best-effort).
+        """
+        metadata = KernelMetadata(
+            kernel_id="abc123",
+            kernel_name="_add_kernel",
+            kernel_source="def _add_kernel(): ...",
+            input_shapes="[(64,)]",
+            dtypes="['torch.float32']",
+            hardware="TestGPU",
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            base = f"{tmp}/run"
+            with AutotuneLogSink(base, metadata) as sink:  # ir_graph omitted
+                sink.start_run()
+                sink.record(self._entry(0.1))
+                sink.end_run()
+            self.assertTrue(sink.meta_path.exists())
+            self.assertFalse(sink.ir_path.exists())
 
     def test_record_before_open_is_noop(self) -> None:
         """
@@ -287,6 +476,24 @@ class TestAutotuneLogSink(TestCase):
             sink = AutotuneLogSink(base)  # not opened
             sink.record(self._entry(0.1))
             self.assertFalse(sink.csv_path.exists())
+
+    def test_record_after_close_is_noop(self) -> None:
+        """
+        Recording after the sink is closed adds no rows and does not raise
+        (the writer is torn down on close).
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            base = f"{tmp}/run"
+            with AutotuneLogSink(base) as sink:
+                sink.start_run()
+                sink.record(self._entry(0.1))
+                sink.end_run()
+            with sink.csv_path.open(encoding="utf-8", newline="") as f:
+                rows_before = list(csv.reader(f))
+            sink.record(self._entry(0.2))  # after close: must be a no-op
+            with sink.csv_path.open(encoding="utf-8", newline="") as f:
+                rows_after = list(csv.reader(f))
+            self.assertEqual(rows_before, rows_after)
 
 
 if __name__ == "__main__":
