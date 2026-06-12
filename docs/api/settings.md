@@ -143,11 +143,15 @@ def my_kernel(x: torch.Tensor) -> torch.Tensor:
 
 .. autoattribute:: Settings.autotune_log
 
-   When set, Helion writes per-config autotuning telemetry (run id, timestamp, config index, generation, status, perf, compile time, minimized config JSON) to ``<value>.csv`` and mirrors the autotune log output to ``<value>.log`` for population-based autotuners (currently ``PatternSearch`` and ``DifferentialEvolution``).
-   The kernel identity (run id, name, source, input shapes, dtypes, hardware, full ``helion.settings``, and ``config_defaults``) is appended, one JSON record per run, to the ``<value>.meta.jsonl`` sidecar. All three files are opened in append mode, so multiple autotune runs that share one base path (e.g. many kernels and input shapes benchmarked in a single process) accumulate instead of overwriting each other; because ``run_id`` is content-stable, a consumer should de-duplicate on ``run_id`` when the same base path is reused across re-runs (the ``.log`` file just interleaves and carries no join key).
-   ``run_id`` is the single join key. It is a content hash derived directly from the kernel source, the code-generation-affecting settings, and the input shapes, dtypes, and hardware, so the same invocation yields the same ``run_id`` across processes and runs and each CSV row joins to exactly one ``.meta.jsonl`` record. Runs whose search space is restricted to user-pinned ``configs`` (without ``force_autotune``) are excluded from collection.
-   The per-config ``config`` column is *minimized* (values equal to the kernel's defaults are dropped). To reconstruct the config as benchmarked, merge it over the run's ``config_defaults``: ``{**config_defaults, **json.loads(row_config)}``. The ``settings`` mapping is serialized JSON-safe (``json.dumps(default=str)``), so non-serializable values such as ``index_dtype`` (a ``torch.dtype``) and callables are stored as strings for analysis rather than as faithful round-trippable objects.
+   When set, Helion writes per-config telemetry (run id, timestamp, config id, generation, status, perf, compile time) to ``<value>.csv`` and mirrors the autotune log to ``<value>.log`` (for population-based autotuners: ``PatternSearch``, ``DifferentialEvolution``). Both append, so runs sharing one base path accumulate.
+   Each CSV row carries two content-hash join keys: ``run_id`` (the invocation -- kernel source, codegen-affecting settings, shapes, dtypes, hardware) and ``config_id`` (the config). Because both are content hashes, a config's ``started``/``ok``/``error`` rows and re-benchmarks share one ``config_id``. The config itself is not in the CSV; it lives in the ``.meta.jsonl`` sidecar keyed by ``config_id`` (see ``autotune_dataset``).
    Controlled by ``HELION_AUTOTUNE_LOG``.
+
+.. autoattribute:: Settings.autotune_dataset
+
+   Opt-in to the cost-model dataset sidecar. When enabled (``HELION_AUTOTUNE_DATASET=1``) and ``autotune_log`` is set, Helion appends one JSON record per run to ``<autotune_log>.meta.jsonl``: the kernel identity (``run_id``, name, source, shapes, dtypes, hardware), the full ``helion.settings`` (JSON-safe via ``json.dumps(default=str)``, so ``torch.dtype``/callables become strings), and a ``configs`` map from ``config_id`` to the config tested.
+   Recover a measured ``(config, perf)`` sample by joining a CSV row to its record: ``meta[run_id]["configs"][row["config_id"]]``. ``run_id`` may recur (re-runs, processes, ``autotune_best_of_k``), but the ``configs`` maps are union-safe (same ``config_id`` implies the same config), so de-duplicating on ``run_id`` is lossless. Searches restricted to user-pinned ``configs`` (without ``force_autotune``) are excluded as a biased slice (``.csv``/``.log`` still written); setting this without ``autotune_log`` collects nothing and warns once.
+   Controlled by ``HELION_AUTOTUNE_DATASET``.
 
 .. autoattribute:: Settings.autotune_compile_timeout
 

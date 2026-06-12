@@ -196,15 +196,16 @@ jobs:
             echo "Using baseline: $BASELINE"
             echo "Available implementations for $kernel: $IMPLS"
 
-            # Single pass: autotune search + codegen + compilation happen inline,
-            # so --measure-compile-time reports end-to-end user-visible compile time.
-            # HELION_AUTOTUNE_LOG is per-kernel so the per-config CSV / .meta.jsonl
-            # sidecars don't clobber across the kernel loop (the sink appends, so
-            # every input shape for this kernel accumulates into one file pair).
-            # --autotune-metrics-json captures the per-run kernel-level summary
-            # (kernel_id, source, shapes, hardware) and is overwrite-safe on its own.
+            # Single inline pass (autotune + codegen + compile), so
+            # --measure-compile-time is end-to-end. HELION_AUTOTUNE_LOG is
+            # per-kernel (the sink appends, accumulating input shapes) and sits
+            # under $TEST_REPORTS_DIR, so its .csv/.log and the dataset .meta.jsonl
+            # ride out in the artifact. HELION_AUTOTUNE_DATASET=1 opts into that
+            # .meta.jsonl (identity + configs keyed by config_id) inline.
+            # --autotune-metrics-json: per-run summary, overwrite-safe.
             ${{ inputs.env-vars }} HELION_PRINT_OUTPUT_CODE=1 \
             HELION_AUTOTUNE_LOG="$TEST_REPORTS_DIR/autotune-$kernel" \
+            HELION_AUTOTUNE_DATASET=1 \
             python benchmarks/run.py \
                 --op $kernel \
                 --helion-backend "${{ inputs.backend }}" \

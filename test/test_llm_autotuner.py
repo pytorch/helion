@@ -1158,9 +1158,7 @@ class TestLLMSeededLFBOTreeSearch(TestCase):
 
         kernel = SimpleNamespace(
             settings=Settings(),
-            config_spec=SimpleNamespace(
-                default_config=lambda: helion.Config(block_sizes=[1])
-            ),
+            config_spec=SimpleNamespace(),
         )
         with patch.dict(
             os.environ,
@@ -1278,9 +1276,7 @@ class TestLLMSeededLFBOTreeSearch(TestCase):
 
         kernel = SimpleNamespace(
             settings=Settings(),
-            config_spec=SimpleNamespace(
-                default_config=lambda: helion.Config(block_sizes=[1])
-            ),
+            config_spec=SimpleNamespace(),
             env=SimpleNamespace(device=DEVICE, process_group_name=None),
         )
         args = (torch.randn([8], device=DEVICE),)
@@ -1485,9 +1481,7 @@ class TestLLMSeededLFBOTreeSearch(TestCase):
 
         kernel = SimpleNamespace(
             settings=Settings(),
-            config_spec=SimpleNamespace(
-                default_config=lambda: helion.Config(block_sizes=[1])
-            ),
+            config_spec=SimpleNamespace(),
             env=SimpleNamespace(device=DEVICE, process_group_name=None),
         )
         args = (torch.randn([8], device=DEVICE),)
