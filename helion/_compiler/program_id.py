@@ -4503,6 +4503,7 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
             "cutlass.Boolean",
             "cutlass.Float16",
             "cutlass.Float32",
+            "cutlass.Float8E4M3FN",
             "cutlass.Int32",
         }
     )

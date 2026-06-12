@@ -49,7 +49,7 @@ jobs:
 
     steps:
       - name: Run NVIDIA command
-        if: startsWith(matrix.image, 'nvidia') || (startsWith(matrix.image, 'pytorch') && contains(matrix.image, 'cuda'))
+        if: startsWith(matrix.image, 'nvidia')
         run: |
           echo "Detected NVIDIA image"
           nvidia-smi || echo "nvidia-smi not found"
@@ -128,8 +128,10 @@ jobs:
             VERSION="${VERSION#pytorch-}"
             uv pip install -U "torch==${VERSION}.*" --index-url https://download.pytorch.org/whl/${{ matrix.runtime-version }}
           elif [[ "${{ matrix.runtime-version }}" == "tpu" ]]; then
-            # TPU: install CPU-only PyTorch nightly (torch_tpu provides TPU backend)
-            uv pip install -U --pre torch --index-url https://download.pytorch.org/whl/nightly/cpu
+            # TODO: TorchTPU needs to catch up with a recent PyTorch change:
+            #   https://github.com/pytorch/pytorch/pull/186928
+            # In the meantime, use a PyTorch wheel that does not contain that change.
+            uv pip install -U --pre "torch==2.13.0.dev20260609" --index-url https://download.pytorch.org/whl/nightly/cpu
           else
             # Default to nightly
             # On OSDC, route nightly through the pypi-cache /whl proxy (deps stay reachable behind the egress firewall) and clear the cache index vars so it wins over the cache default; off OSDC PYPI_CACHE_WHL_URL is unset so we hit download.pytorch.org.
@@ -250,7 +252,7 @@ jobs:
           ./scripts/install_cute.sh
 
       - name: CUDA Compute Check
-        if: startsWith(matrix.image, 'nvidia') || (startsWith(matrix.image, 'pytorch') && contains(matrix.image, 'cuda'))
+        if: startsWith(matrix.image, 'nvidia')
         run: |
           source .venv/bin/activate
           python -c "
@@ -271,7 +273,7 @@ jobs:
           "
 
       - name: Inductor Worker Check
-        if: startsWith(matrix.image, 'nvidia') || (startsWith(matrix.image, 'pytorch') && contains(matrix.image, 'cuda'))
+        if: startsWith(matrix.image, 'nvidia')
         run: |
           source .venv/bin/activate
           python -c "

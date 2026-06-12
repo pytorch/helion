@@ -236,6 +236,333 @@ class IndexingStrategy:
         )
 
 
+class _PointerLoadContiguity:
+    """Derive ``tl.max_contiguous`` for a narrow blocked-gather pattern.
+
+    This targets scale-buffer layouts such as NVFP4 SWIZZLE_32_4_4, where the
+    gather is blocked-contiguous but Triton sees only pointer arithmetic.
+
+    Allowlist:
+    - Triton pointer loads from a 1-D stride-1 tensor.
+    - One computed integer gather index built from tile indices, constants,
+      broadcasts, ``+``, ``-``, constant ``*``, ``//``, ``%``, ``>> const``,
+      and ``& (2**k - 1)``.
+    - Constant block sizes and constant tile begins. Tile indices are evaluated
+      as ``begin + arange(block)`` for program 0.
+    - Uniform scalar terms that do not shift a run-varying floor/rem boundary.
+
+    Blocklist:
+    - Stores/atomics, non-pointer indexing, and multi-index gathers.
+    - Data-dependent or float indices, non-constant divisors, products of two
+      index terms, symbolic begins, arbitrary bitwise ops, and cross-axis
+      modulo patterns.
+    - Scalar, full-tile, or non-vector-width runs.
+
+    For modulo terms that vary along the run axis, the divisor must divide the
+    run extent. That keeps later program IDs from changing the run shape measured
+    in program 0.
+    """
+
+    # Byte widths worth asserting as vector runs.
+    _USEFUL_RUN_BYTES: ClassVar[tuple[int, ...]] = (4, 8, 16)
+    # Aten integer ops allowed in the gather index.
+    _ADD: ClassVar[set[str]] = {
+        "add",
+        "add.Tensor",
+        "add.Scalar",
+        "sub",
+        "sub.Tensor",
+        "sub.Scalar",
+    }
+    _MUL: ClassVar[set[str]] = {"mul", "mul.Tensor", "mul.Scalar"}
+    _DIV: ClassVar[set[str]] = {
+        "div.Tensor_mode",
+        "floor_divide",
+        "remainder",
+        "remainder.Scalar",
+        "remainder.Tensor",
+    }
+    _RSHIFT: ClassVar[set[str]] = {"__rshift__.Scalar", "rshift"}
+    _BITWISE_AND: ClassVar[set[str]] = {"bitwise_and.Scalar", "and_"}
+
+    def __init__(
+        self,
+        state: CodegenState,
+        fake_tensor: torch.Tensor,
+        subscript: list[object],
+    ) -> None:
+        self.state = state
+        self.fake_tensor = fake_tensor
+        self.subscript = subscript
+        self.extents: dict[torch.fx.Node, int] = {}
+        self.begins: dict[torch.fx.Node, int] = {}
+        self._cache: dict[torch.fx.Node, object] = {}
+        self._unknown_scalars: set[torch.fx.Node] = set()
+
+    def derive(self) -> list[int] | None:
+        """Return a per-result-dim ``tl.max_contiguous`` list, or None to emit nothing."""
+        index_node = self._gather_index_node()
+        if index_node is None:
+            return None
+
+        # Allowlisted expression shape plus every floor/rem site.
+        tiles: set[torch.fx.Node] = set()
+        divisions: list[tuple[int, object]] = []
+        if not self._walk(index_node, tiles, divisions) or not tiles:
+            return None
+        if not self._resolve_extents(tiles):
+            return None
+
+        rank = len(
+            SubscriptIndexing.compute_shape(
+                self.fake_tensor, self.subscript, self.state
+            )
+        )
+        if rank == 0:
+            return None
+
+        # Evaluate the candidate index with real integer tensors.
+        from torch._subclasses.fake_tensor import unset_fake_temporarily
+
+        with unset_fake_temporarily():
+            offset = self._eval(index_node)
+            if not isinstance(offset, torch.Tensor) or offset.ndim != rank:
+                return None
+            run_extent = offset.shape[-1]
+            for divisor, dividend in divisions:
+                if not self._run_axis_safe(divisor, dividend, offset, run_extent):
+                    return None
+            k = self._max_run(offset.to(torch.int64))
+
+        # Blocklist hints that are scalar, already full-tile, or not vector-sized.
+        if not (2 <= k < run_extent):
+            return None
+        if k * self.fake_tensor.element_size() not in self._USEFUL_RUN_BYTES:
+            return None
+
+        contiguity = [1] * rank
+        contiguity[-1] = k
+        return contiguity
+
+    def _run_axis_safe(
+        self, divisor: int, dividend: object, offset: torch.Tensor, run_extent: int
+    ) -> bool:
+        """Can one floor/rem site reuse the program-0 run for all programs?"""
+        val = self._eval(dividend)
+        if not isinstance(val, torch.Tensor):
+            return True
+        flat = val.broadcast_to(offset.shape).reshape(-1, run_extent)
+        varies_run = run_extent > 1 and not torch.equal(flat[:, 1:], flat[:, :-1])
+        if not varies_run:
+            return True
+        if self._has_unknown_scalar(dividend):
+            return False
+        varies_other = not torch.equal(flat, flat[:1].expand_as(flat))
+        return not varies_other and run_extent % divisor == 0
+
+    def _gather_index_node(self) -> torch.fx.Node | None:
+        """The single computed index of a 1-D stride-1 advanced-indexing gather."""
+        # Plain affine loads are already handled by Triton's AxisInfo.
+        if not any(isinstance(k, torch.Tensor) for k in self.subscript):
+            return None
+        # The proof is on the index, so the tensor stride must be 1.
+        if (
+            self.fake_tensor.ndim != 1
+            or self._const_int(self.fake_tensor.stride(0)) != 1
+        ):
+            return None
+        fx_node = getattr(self.state, "fx_node", None)
+        if fx_node is None or len(fx_node.args) < 2:
+            return None
+        index_args = fx_node.args[1]
+        if not isinstance(index_args, (list, tuple)):
+            return None
+        idx_nodes = [a for a in index_args if isinstance(a, torch.fx.Node)]
+        if len(idx_nodes) != 1:  # v1: single computed index
+            return None
+        return idx_nodes[0]
+
+    def _resolve_extents(self, tiles: set[torch.fx.Node]) -> bool:
+        """Resolve constexpr block sizes and begins for tile-index leaves."""
+        env = CompileEnvironment.current()
+        active_loops = self.state.codegen.active_device_loops
+        for ti in tiles:
+            val = ti.meta.get("val")
+            if not isinstance(val, torch.Tensor) or val.ndim < 1:
+                return False
+            bid = env.get_block_id(val.size(0))
+            if bid is None:
+                return False
+            loops = active_loops.get(bid)
+            info = loops[-1].block_id_to_info.get(bid) if loops else None
+            if info is None:
+                return False
+            begin = info.begin_expr
+            # Blocklist symbolic begins; the proof evaluates a concrete program-0 tile.
+            if begin is None or not begin.is_number:
+                return False
+            bs = self._const_int(env.block_sizes[bid].from_config(self.state.config))
+            if bs is None or bs <= 0:
+                return False
+            self.extents[ti] = bs
+            self.begins[ti] = int(begin)
+        return True
+
+    def _walk(
+        self,
+        node: object,
+        tiles: set[torch.fx.Node],
+        divisions: list[tuple[int, object]],
+    ) -> bool:
+        """Walk the allowlisted integer expression shape."""
+        seen: set[torch.fx.Node] = set()
+
+        def rec(n: object) -> bool:
+            if self._const_int(n) is not None:
+                return True
+            if not isinstance(n, torch.fx.Node):
+                return False
+            if n in seen:
+                return True
+            seen.add(n)
+            name = self._op_name(n)
+            if name == "tile_index":
+                tiles.add(n)
+                return True
+            if name in ("subscript", "load"):
+                src = n.args[0]
+                if not isinstance(src, torch.fx.Node) or not self._is_op(
+                    src, "tile_index"
+                ):
+                    return False
+                tiles.add(src)
+                return True
+            if name in ("sym_size.int", "_get_symnode", "sym_size"):
+                self._unknown_scalars.add(n)
+                return True
+            if name in self._DIV:
+                d = self._const_int(n.args[1])
+                if d is None or d <= 0:
+                    return False
+                divisions.append((d, n.args[0]))
+                return rec(n.args[0])
+            if name in self._RSHIFT:
+                shift = self._const_int(n.args[1])
+                if shift is None or shift < 0:
+                    return False
+                divisions.append((1 << shift, n.args[0]))
+                return rec(n.args[0])
+            if name in self._BITWISE_AND:
+                divisor, dividend = self._bitwise_and_divisor(n)
+                if divisor is None:
+                    return False
+                divisions.append((divisor, dividend))
+                return rec(dividend)
+            if name in self._MUL:
+                # Allowlist affine scaling only.
+                if not any(self._const_int(a) is not None for a in n.args):
+                    return False
+                return all(rec(a) for a in n.args)
+            if name in self._ADD:
+                return all(rec(a) for a in n.args)
+            return False
+
+        return rec(node)
+
+    def _eval(self, node: object) -> object:
+        """Evaluate an allowlisted index expression for program 0."""
+        c = self._const_int(node)
+        if c is not None:
+            return c
+        assert isinstance(node, torch.fx.Node)
+        if node in self._cache:
+            return self._cache[node]
+        name = self._op_name(node)
+        if name == "tile_index":
+            v: object = (
+                torch.arange(self.extents[node], dtype=torch.int64) + self.begins[node]
+            )
+        elif node in self._unknown_scalars:
+            v = 0
+        elif name in ("subscript", "load"):
+            base = self._eval(node.args[0])
+            assert isinstance(base, torch.Tensor)
+            index = node.args[1]
+            assert isinstance(index, (tuple, list))
+            # Replay broadcast subscripts such as ``tile.index[None, :]``.
+            v = base[tuple(index)]  # pyrefly: ignore [bad-index, bad-argument-type]
+        else:
+            args = [self._eval(a) for a in node.args]
+            assert callable(node.target)
+            v = node.target(*args, **node.kwargs)
+        self._cache[node] = v
+        return v
+
+    @staticmethod
+    def _max_run(offset: torch.Tensor) -> int:
+        """Largest power-of-two k s.t. every tile-aligned group of k along the last
+        axis is consecutive (off[..., j*k + t] == off[..., j*k] + t)."""
+        n = offset.shape[-1]
+        best = 1
+        k = 2
+        while k <= n and n % k == 0:
+            grp = offset.reshape(*offset.shape[:-1], n // k, k)
+            expect = grp[..., :1] + torch.arange(k, dtype=offset.dtype)
+            if torch.equal(grp, expect):
+                best = k
+                k *= 2
+            else:
+                break
+        return best
+
+    @staticmethod
+    def _op_name(node: object) -> str:
+        target = getattr(node, "target", None)
+        name = getattr(target, "__name__", None)
+        return name or str(target)
+
+    def _has_unknown_scalar(self, node: object) -> bool:
+        seen: set[torch.fx.Node] = set()
+
+        def rec(n: object) -> bool:
+            if not isinstance(n, torch.fx.Node) or n in seen:
+                return False
+            seen.add(n)
+            return n in self._unknown_scalars or any(rec(arg) for arg in n.args)
+
+        return rec(node)
+
+    @classmethod
+    def _bitwise_and_divisor(cls, node: torch.fx.Node) -> tuple[int | None, object]:
+        if len(node.args) != 2:
+            return None, None
+        for i, arg in enumerate(node.args):
+            mask = cls._const_int(arg)
+            if mask is None or mask <= 0:
+                continue
+            divisor = mask + 1
+            if divisor & (divisor - 1) == 0:
+                return divisor, node.args[1 - i]
+        return None, None
+
+    @classmethod
+    def _is_op(cls, node: object, name: str) -> bool:
+        return isinstance(node, torch.fx.Node) and cls._op_name(node) == name
+
+    @staticmethod
+    def _const_int(x: object) -> int | None:
+        if isinstance(x, bool):
+            return None
+        if isinstance(x, int):
+            return int(x)
+        if isinstance(x, torch.SymInt):
+            try:
+                return int(x)
+            except Exception:
+                return None
+        return None
+
+
 class PointerIndexingStrategy(IndexingStrategy):
     """Generate the original pointer math to load/store from tensors"""
 
@@ -258,10 +585,29 @@ class PointerIndexingStrategy(IndexingStrategy):
             else:
                 extra = ", other=0"
         name = state.device_function.tensor_arg(fake_tensor).name
+        # Optional hint for the allowlisted blocked-gather pattern.
+        offset_ast = indexing.index_expr
+        try:
+            contiguity = _PointerLoadContiguity(state, fake_tensor, subscript).derive()
+        except Exception:
+            contiguity = None
+        if contiguity is not None:
+            # Triton propagates the hint from ``index``, but not ``index * 1``.
+            inner_ast = offset_ast
+            if (
+                isinstance(inner_ast, ast.BinOp)
+                and isinstance(inner_ast.op, ast.Mult)
+                and isinstance(inner_ast.right, ast.Constant)
+                and inner_ast.right.value == 1
+            ):
+                inner_ast = inner_ast.left
+            offset_ast = expr_from_string(
+                f"tl.max_contiguous({{off}}, {contiguity!r})", off=inner_ast
+            )
         extra += ", eviction_policy={ev}" if eviction_policy is not None else ""
         extra += ", cache_modifier={cm}" if cache_modifier is not None else ""
         load_placeholders: dict[str, ast.AST] = {
-            "offset": indexing.index_expr,
+            "offset": offset_ast,
             "mask": indexing.mask_expr,
         }
         if eviction_policy is not None:
