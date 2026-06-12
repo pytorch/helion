@@ -15,6 +15,7 @@ if TYPE_CHECKING:
     from typing import Callable
 
     from . import ConfigSpec
+    from .config_generation import ConfigGeneration
 
 
 def integer_power_of_two(n: object) -> TypeGuard[int]:
@@ -434,3 +435,148 @@ class ListOf(ConfigSpecFragment):
         for v in value:
             encoded.extend(self.inner.encode(v))
         return encoded
+
+
+@dataclasses.dataclass
+class PerDimListOf(ConfigSpecFragment):
+    """Like ListOf but each position has its own fragment with distinct choices.
+
+    ListOf repeats a single inner fragment for every position, so all
+    dimensions share the same valid values.  PerDimListOf holds a separate
+    fragment per dimension, allowing each to have a different choice set
+    (e.g. grid folding factors filtered by per-dim num_blocks).
+    """
+
+    fragments: list[ConfigSpecFragment]
+
+    def default(self) -> list[object]:
+        return [f.default() for f in self.fragments]
+
+    def random(self) -> list[object]:
+        return [f.random() for f in self.fragments]
+
+    def pattern_neighbors(self, current: object, radius: int = 1) -> list[object]:
+        if not isinstance(current, list) or len(current) != len(self.fragments):
+            raise ValueError(
+                f"Expected list of length {len(self.fragments)}, got {current!r}"
+            )
+        neighbors: list[object] = []
+        for i, frag in enumerate(self.fragments):
+            for neighbor_value in frag.pattern_neighbors(current[i], radius):
+                neighbor = current.copy()
+                neighbor[i] = neighbor_value
+                neighbors.append(neighbor)
+        return neighbors
+
+    def differential_mutation(self, a: object, b: object, c: object) -> list[object]:
+        assert isinstance(a, list) and len(a) == len(self.fragments)
+        assert isinstance(b, list) and len(b) == len(self.fragments)
+        assert isinstance(c, list) and len(c) == len(self.fragments)
+        return [
+            self.fragments[i].differential_mutation(a[i], b[i], c[i])
+            for i in range(len(self.fragments))
+        ]
+
+    def fingerprint(self) -> tuple[int, ...]:
+        return (len(self.fragments),)
+
+    def dim(self) -> int:
+        return sum(f.dim() for f in self.fragments)
+
+    def encode(self, value: object) -> list[float]:
+        assert isinstance(value, list)
+        encoded = []
+        for v, frag in zip(value, self.fragments, strict=True):
+            encoded.extend(frag.encode(v))
+        return encoded
+
+
+@dataclasses.dataclass
+class DynamicGridFoldingFragment(ConfigSpecFragment):
+    """Grid folding fragment with generation-aware choice filtering.
+
+    This fragment dynamically filters allowed folding factors based on
+    the current search generation. Early generations are restricted to
+    conservative folding (factor 0), while later generations can explore
+    higher folding factors.
+
+    Attributes:
+        valid_factors: All possible folding factors (0, -1, 2, 4, 8, 16, 32, 64)
+        min_generation: Generation threshold before allowing non-zero factors
+        max_factor: Maximum allowed folding factor after min_generation
+        _config_gen: Reference to ConfigGeneration for accessing current generation
+    """
+
+    valid_factors: tuple[int, ...]
+    min_generation: int
+    max_factor: int
+    _config_gen: object | None = None  # ConfigGeneration, set later
+
+    def _get_allowed_choices(self) -> tuple[int, ...]:
+        """Compute allowed folding factors based on current generation."""
+
+        if self._config_gen is None:
+            # Fallback: if config_gen not set, allow all factors (shouldn't happen in normal use)
+            return self.valid_factors
+
+        config_gen = cast("ConfigGeneration", self._config_gen)
+        current_gen = config_gen.current_generation
+
+        if current_gen < self.min_generation:
+            # Early generations: only allow no folding (factor 0)
+            # Partial folding factors (2, 4, 8, ...) and full folding (-1) are restricted
+            return (0,)
+
+        # Later generations: allow factors up to max_factor
+        if self.max_factor == 0:
+            return (0,)
+        if self.max_factor == -1:
+            # No limit, use heuristics (all positive factors allowed)
+            return self.valid_factors
+        # Filter to factors <= max_factor
+        return tuple(
+            f for f in self.valid_factors if f <= 0 or (f > 0 and f <= self.max_factor)
+        )
+
+    def default(self) -> int:
+        return self._get_allowed_choices()[0]
+
+    def random(self) -> int:
+        import random
+
+        return random.choice(self._get_allowed_choices())
+
+    def pattern_neighbors(self, current: object, radius: int = 1) -> list[object]:
+        allowed = self._get_allowed_choices()
+        if current not in allowed:
+            # If current is not in allowed set, return all allowed choices
+            return list(allowed)
+        return [choice for choice in allowed if choice != current]
+
+    def differential_mutation(self, a: object, b: object, c: object) -> object:
+        import random
+
+        allowed = self._get_allowed_choices()
+        if b == c:
+            return a if a in allowed else allowed[0]
+        choices = [x for x in (b, c) if x in allowed]
+        if not choices:
+            return random.choice(allowed)
+        if a in choices:
+            choices = [x for x in allowed if x not in choices]
+            if not choices:
+                return random.choice(allowed)
+        return random.choice(choices) if choices else random.choice(allowed)
+
+    def dim(self) -> int:
+        return len(self.valid_factors)
+
+    def encode(self, value: object) -> list[float]:
+        """Encode folding factor as its index in valid_factors."""
+        try:
+            choice_idx = self.valid_factors.index(value)
+        except ValueError:
+            raise ValueError(
+                f"Invalid folding factor {value!r}. Valid factors: {self.valid_factors}"
+            ) from None
+        return [1.0 if i == choice_idx else 0.0 for i in range(len(self.valid_factors))]

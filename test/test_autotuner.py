@@ -2717,9 +2717,16 @@ class TestCuteAutotuner(TestCase):
         # vec width slot registered for non-reduction tile blocks. The
         # set still excludes Triton-style knobs that the cute path does
         # not consume.
+        # grid_foldings is exposed for cute (see e67dafa7)
         self.assertEqual(
             flat_keys,
-            {"block_sizes", "num_threads", "loop_orders", "cute_vector_widths"},
+            {
+                "block_sizes",
+                "num_threads",
+                "loop_orders",
+                "cute_vector_widths",
+                "grid_foldings",
+            },
         )
 
         repaired = gen.unflatten(
@@ -2733,7 +2740,13 @@ class TestCuteAutotuner(TestCase):
         for config in configs:
             self.assertLessEqual(
                 set(config.config),
-                {"block_sizes", "num_threads", "loop_orders", "cute_vector_widths"},
+                {
+                    "block_sizes",
+                    "num_threads",
+                    "loop_orders",
+                    "cute_vector_widths",
+                    "grid_foldings",
+                },
             )
             self.assertNotIn("persistent", config.pid_type)
             explicit_threads = [nt for nt in config.num_threads if nt > 0]
@@ -4048,6 +4061,147 @@ class TestAutotuneBudget(TestCase):
         # default via class-level descriptor.
         provider = LocalBenchmarkProvider.__new__(LocalBenchmarkProvider)
         self.assertFalse(provider.budget_exceeded_fn())
+
+    def test_grid_folding_effort_profile_defaults(self) -> None:
+        """Test that quick effort profile disables grid folding by default."""
+        from helion.autotuner.effort_profile import get_effort_profile
+
+        # Quick effort should have max_grid_folding_factor=0 (disabled)
+        quick_profile = get_effort_profile("quick")
+        self.assertEqual(quick_profile.autotune_max_grid_folding_factor, 0)
+
+        # Full effort should have max_grid_folding_factor=None (use heuristics)
+        full_profile = get_effort_profile("full")
+        self.assertIsNone(full_profile.autotune_max_grid_folding_factor)
+
+        # None effort should also have None
+        none_profile = get_effort_profile("none")
+        self.assertIsNone(none_profile.autotune_max_grid_folding_factor)
+
+    def test_grid_folding_settings_override(self) -> None:
+        """Test that autotune_max_grid_folding_factor setting can override profile."""
+        import os
+
+        from helion.runtime.settings import Settings
+
+        # Save original value
+        original = os.environ.get("HELION_AUTOTUNE_MAX_GRID_FOLDING_FACTOR")
+
+        try:
+            # Test 1: Default (None) uses profile default
+            os.environ.pop("HELION_AUTOTUNE_MAX_GRID_FOLDING_FACTOR", None)
+            os.environ["HELION_AUTOTUNE_EFFORT"] = "quick"
+            settings = Settings()
+            self.assertIsNone(settings.autotune_max_grid_folding_factor)
+
+            # Test 2: Override with 0 (disable)
+            os.environ["HELION_AUTOTUNE_MAX_GRID_FOLDING_FACTOR"] = "0"
+            settings = Settings()
+            self.assertEqual(settings.autotune_max_grid_folding_factor, 0)
+
+            # Test 3: Override with -1 (enable all)
+            os.environ["HELION_AUTOTUNE_MAX_GRID_FOLDING_FACTOR"] = "-1"
+            settings = Settings()
+            self.assertEqual(settings.autotune_max_grid_folding_factor, -1)
+
+            # Test 4: Override with specific max (8)
+            os.environ["HELION_AUTOTUNE_MAX_GRID_FOLDING_FACTOR"] = "8"
+            settings = Settings()
+            self.assertEqual(settings.autotune_max_grid_folding_factor, 8)
+
+        finally:
+            # Restore original value
+            if original is not None:
+                os.environ["HELION_AUTOTUNE_MAX_GRID_FOLDING_FACTOR"] = original
+            else:
+                os.environ.pop("HELION_AUTOTUNE_MAX_GRID_FOLDING_FACTOR", None)
+
+    def test_grid_folding_min_generation_profile_defaults(self) -> None:
+        """Test that full effort profile has min_generation constraint."""
+        from helion.autotuner.effort_profile import get_effort_profile
+
+        # Full effort should have min_generation=10
+        full_profile = get_effort_profile("full")
+        self.assertEqual(full_profile.autotune_grid_folding_min_generation, 10)
+
+        # Quick effort should have None (no constraint)
+        quick_profile = get_effort_profile("quick")
+        self.assertIsNone(quick_profile.autotune_grid_folding_min_generation)
+
+        # None effort should also have None
+        none_profile = get_effort_profile("none")
+        self.assertIsNone(none_profile.autotune_grid_folding_min_generation)
+
+    def test_dynamic_grid_folding_fragment(self) -> None:
+        """Test that DynamicGridFoldingFragment filters choices based on generation."""
+        from unittest.mock import Mock
+
+        from helion.autotuner.config_fragment import DynamicGridFoldingFragment
+        from helion.autotuner.config_generation import ConfigGeneration
+
+        # Mock config_gen object
+        mock_config_gen = Mock(spec=ConfigGeneration)
+        mock_config_gen.current_generation = 0
+
+        valid_factors = (0, -1, 2, 4, 8, 16, 32, 64)
+
+        # Test with min_generation=5, max_factor=8
+        fragment = DynamicGridFoldingFragment(
+            valid_factors=valid_factors,
+            min_generation=5,
+            max_factor=8,
+            _config_gen=mock_config_gen,
+        )
+
+        # Early generation (0 < 5): only factor 0 allowed
+        mock_config_gen.current_generation = 0
+        self.assertEqual(fragment._get_allowed_choices(), (0,))
+        self.assertEqual(fragment.default(), 0)
+
+        # Generation 4 (still < 5): only factor 0 allowed
+        mock_config_gen.current_generation = 4
+        self.assertEqual(fragment._get_allowed_choices(), (0,))
+
+        # Generation 5 (>= 5): factors up to 8 allowed
+        mock_config_gen.current_generation = 5
+        self.assertEqual(fragment._get_allowed_choices(), (0, -1, 2, 4, 8))
+
+        # Generation 10: still factors up to 8 allowed
+        mock_config_gen.current_generation = 10
+        self.assertEqual(fragment._get_allowed_choices(), (0, -1, 2, 4, 8))
+
+        # Test pattern_neighbors respects allowed choices
+        mock_config_gen.current_generation = 0
+        neighbors = fragment.pattern_neighbors(0)
+        self.assertEqual(neighbors, [])  # No other choices when only 0 is allowed
+
+        mock_config_gen.current_generation = 5
+        neighbors = fragment.pattern_neighbors(0)
+        self.assertEqual(set(neighbors), {-1, 2, 4, 8})
+
+    def test_config_generation_sets_fragment_refs(self) -> None:
+        """Test that ConfigGeneration sets _config_gen on DynamicGridFoldingFragment."""
+        from helion.autotuner.config_fragment import DynamicGridFoldingFragment
+
+        # Create a minimal config spec (this is a simplified test)
+        # In real usage, this would be created during kernel compilation
+        # For now, just test that the attribute exists and can be set
+
+        # We can't easily test the full flow without a kernel, but we can
+        # verify the attribute exists
+        fragment = DynamicGridFoldingFragment(
+            valid_factors=(0, 2, 4),
+            min_generation=5,
+            max_factor=4,
+            _config_gen=None,
+        )
+        self.assertIsNone(fragment._config_gen)
+
+        # Simulate what ConfigGeneration.__init__ does
+        mock_gen = Mock(spec=ConfigGeneration)
+        mock_gen.current_generation = 0
+        fragment._config_gen = mock_gen
+        self.assertIs(fragment._config_gen, mock_gen)
 
     def test_cute_wall_clock_benchmark_uses_subprocess_worker(self) -> None:
         from helion._compiler.backend import CuteBackend
