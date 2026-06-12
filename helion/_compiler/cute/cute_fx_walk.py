@@ -225,6 +225,21 @@ def aux_tensor_load_kind(
       row 0 of the aux to every output row. The splice site builds
       the same stride-``(0, 1)`` 2-D view as the trailing-axis
       rowvec form (row 0 reused across M).
+    - ``("broadcast", 2)``: a per-row column-vector broadcast aux
+      load (``scale_a[tile_m, tile_n]`` where ``scale_a`` is a full
+      ``(M, N)`` view with **stride 0 on the trailing (N) axis** — an
+      ``unsqueeze(1).expand(M, N)`` of a per-row ``(M,)`` vector). The
+      underlying tensor's rank is 2 with the carrier's global shape,
+      the load result shape equals the carrier tile shape, and the
+      load's two index symbols are exactly ``carrier_tile_index_nodes``
+      in order. Its value depends only on ``m``, so it is uniform over
+      each thread's N fragment in the T2R epilogue: the splice reads it
+      as a single **scalar** per subtile (``tTR_gAux[(0,0,0,s)]``)
+      rather than a vector ``.load()``, avoiding a redundant N-wide
+      read. Tried before ``("exact", None)`` because a stride-0-N aux
+      still has the full ``(M, N)`` underlying shape; a genuine 2-D
+      residual has a non-zero trailing stride and falls through to the
+      exact matcher.
 
     The classifier returns ``None`` for everything else: 3-D
     underlying tensors with a static collapse
@@ -309,6 +324,18 @@ def aux_tensor_load_kind(
     # Higher-rank carriers fall through to the loud-failure backstop.
     if len(carrier_tile_shape) != 2:
         return None
+
+    colvec = _matches_colvec_broadcast(
+        aux_shape=aux_shape,
+        aux_tensor_shape=aux_tensor_shape,
+        aux_tensor_val=aux_tensor_val,
+        index_list=index_list,
+        carrier_tile_shape=carrier_tile_shape,
+        carrier_tile_index_nodes=carrier_tile_index_nodes,
+        carrier_global_shape=carrier_global_shape,
+    )
+    if colvec is not None:
+        return colvec
 
     if _matches_exact(
         aux_shape=aux_shape,
@@ -488,6 +515,61 @@ def _matches_leading_broadcast(
         if aux_tensor_shape[1] != carrier_global_shape[1]:
             return None
     return ("broadcast", 0)
+
+
+def _matches_colvec_broadcast(
+    *,
+    aux_shape: tuple[object, ...],
+    aux_tensor_shape: tuple[object, ...],
+    aux_tensor_val: torch.Tensor,
+    index_list: Sequence[object],
+    carrier_tile_shape: tuple[object, ...],
+    carrier_tile_index_nodes: tuple[torch.fx.Node, ...] | None,
+    carrier_global_shape: tuple[object, ...] | None,
+) -> tuple[str, int] | None:
+    """Check whether a load is a per-row column-vector broadcast and
+    return ``("broadcast", 2)`` on success.
+
+    The accepted form is ``scale_a[tile_m, tile_n]`` where ``scale_a`` is a
+    full ``(M, N)`` view with **stride 0 on the trailing (N) axis** — i.e. an
+    ``unsqueeze(1).expand(M, N)`` of a per-row ``(M,)`` vector. Its value
+    depends only on ``m``, so it is *uniform over each thread's N fragment*
+    in the tcgen05 T2R epilogue. The splice therefore reads it as a single
+    **scalar** per subtile (matching CUTLASS's ``sa = tTR_gSA[(0,0,0,s)]``)
+    rather than a vector ``.load()``, avoiding a redundant N-wide read.
+
+    This must be tried *before* ``_matches_exact`` (a stride-0-N aux still
+    has the full ``(M, N)`` underlying shape, so the exact matcher would
+    otherwise claim it and emit a vector read). A genuine 2-D residual has a
+    non-zero trailing stride and falls through to ``_matches_exact``.
+    """
+    if (
+        len(aux_tensor_shape) != 2
+        or len(aux_shape) != 2
+        or len(index_list) != 2
+        or len(carrier_tile_shape) != 2
+    ):
+        return None
+    if carrier_tile_index_nodes is None or len(carrier_tile_index_nodes) != 2:
+        return None
+    for idx, expected in zip(index_list, carrier_tile_index_nodes, strict=True):
+        if idx is not expected:
+            return None
+    for aux_dim, carrier_dim in zip(aux_shape, carrier_tile_shape, strict=True):
+        if aux_dim != carrier_dim:
+            return None
+    if carrier_global_shape is not None:
+        if len(carrier_global_shape) != 2:
+            return None
+        if tuple(aux_tensor_shape) != tuple(carrier_global_shape):
+            return None
+    stride = aux_tensor_val.stride()
+    # Uniform over N (trailing stride 0) and varying over M (leading stride
+    # non-zero) — the column-vector broadcast. A real (M, N) tensor has
+    # trailing stride 1 and is left for the exact-shape matcher.
+    if len(stride) != 2 or stride[1] != 0 or stride[0] == 0:
+        return None
+    return ("broadcast", 2)
 
 
 def _matches_exact(

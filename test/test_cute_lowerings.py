@@ -13827,6 +13827,197 @@ class TestCuteLowerings(unittest.TestCase):
         )
         self.assertIsNone(_trace_mma_to_store_dtype(mma_node, []))
 
+    def _build_aux_load_node(
+        self,
+        *,
+        aux_tensor: torch.Tensor,
+        load_shape: tuple[int, ...],
+        index_nodes: tuple[torch.fx.Node, ...],
+        extra_mask: object = None,
+        eviction_policy: object = None,
+        kwargs: dict[str, object] | None = None,
+    ) -> tuple[torch.fx.Node, tuple[torch.fx.Node, ...]]:
+        """Build a synthetic ``helion.language.memory_ops.load`` FX node for
+        the aux-tensor classifier (``aux_tensor_load_kind``).
+
+        ``aux_tensor`` is the underlying tensor whose ``.shape`` / ``.stride()``
+        drive classification (use ``.expand(...)`` to get the stride-0
+        broadcast axes). ``load_shape`` is the per-tile load result shape.
+        ``index_nodes`` is the index list passed to ``load`` — pass the same
+        carrier tile-id nodes to mimic ``aux[tile_m, tile_n]``. Returns the
+        load node and the carrier tile-id index nodes.
+        """
+        from helion.language import memory_ops
+
+        graph = Graph()
+        tensor_node = graph.call_function(_tracing_ops._new_var, args=())
+        tensor_node.meta["val"] = aux_tensor
+        args: tuple[object, ...] = (
+            tensor_node,
+            list(index_nodes),
+            extra_mask,
+            eviction_policy,
+        )
+        load_node = graph.call_function(memory_ops.load, args=args, kwargs=kwargs or {})
+        load_node.meta["val"] = torch.empty(load_shape, dtype=aux_tensor.dtype)
+        return load_node, index_nodes
+
+    def _carrier_index_nodes(self) -> tuple[torch.fx.Node, ...]:
+        """Two distinct FX nodes standing in for the carrier's
+        ``(tile_m, tile_n)`` tile-id symbols."""
+        g = Graph()
+        m = g.call_function(_tracing_ops._new_var, args=())
+        n = g.call_function(_tracing_ops._new_var, args=())
+        return (m, n)
+
+    def test_aux_load_kind_colvec_stride_1_0_is_broadcast_2(self) -> None:
+        """A full ``(M, N)`` aux with trailing stride 0 (the
+        ``unsqueeze(1).expand(M, N)`` per-row column vector) classifies as
+        ``("broadcast", 2)`` so the epilogue reads it as a scalar per
+        subtile instead of a redundant N-wide vector load."""
+        from helion._compiler.cute.cute_fx_walk import aux_tensor_load_kind
+
+        idx = self._carrier_index_nodes()
+        colvec = torch.empty(4, dtype=torch.float32).unsqueeze(1).expand(4, 4)
+        self.assertEqual(colvec.stride(), (1, 0))
+        load_node, _ = self._build_aux_load_node(
+            aux_tensor=colvec,
+            load_shape=(4, 4),
+            index_nodes=idx,
+        )
+        self.assertEqual(
+            aux_tensor_load_kind(
+                load_node,
+                carrier_tile_shape=(4, 4),
+                carrier_tile_index_nodes=idx,
+                carrier_global_shape=(4, 4),
+            ),
+            ("broadcast", 2),
+        )
+
+    def test_aux_load_kind_exact_tensor_is_not_colvec(self) -> None:
+        """A genuine dense ``(M, N)`` aux (trailing stride 1) must fall
+        through the colvec matcher to ``("exact", None)`` — the colvec
+        path only claims trailing-stride-0 views."""
+        from helion._compiler.cute.cute_fx_walk import aux_tensor_load_kind
+
+        idx = self._carrier_index_nodes()
+        exact = torch.empty(4, 4, dtype=torch.float32)
+        self.assertEqual(exact.stride(), (4, 1))
+        load_node, _ = self._build_aux_load_node(
+            aux_tensor=exact,
+            load_shape=(4, 4),
+            index_nodes=idx,
+        )
+        self.assertEqual(
+            aux_tensor_load_kind(
+                load_node,
+                carrier_tile_shape=(4, 4),
+                carrier_tile_index_nodes=idx,
+                carrier_global_shape=(4, 4),
+            ),
+            ("exact", None),
+        )
+
+    def test_aux_load_kind_rowvec_1n_is_not_colvec(self) -> None:
+        """The explicit ``(1, N)`` leading-broadcast row vector (unit
+        leading axis, contiguous trailing) is ``("broadcast", 0)``, never
+        the colvec form — colvec requires a full ``(M, N)`` view with
+        trailing stride 0 and non-zero leading stride."""
+        from helion._compiler.cute.cute_fx_walk import aux_tensor_load_kind
+
+        idx = self._carrier_index_nodes()
+        # Underlying ``(1, N)`` tensor; the per-tile load result is (M, N).
+        rowvec = torch.empty(1, 4, dtype=torch.float32)
+        self.assertEqual(rowvec.stride(), (4, 1))
+        load_node, _ = self._build_aux_load_node(
+            aux_tensor=rowvec,
+            load_shape=(4, 4),
+            index_nodes=idx,
+        )
+        self.assertEqual(
+            aux_tensor_load_kind(
+                load_node,
+                carrier_tile_shape=(4, 4),
+                carrier_tile_index_nodes=idx,
+                carrier_global_shape=(4, 4),
+            ),
+            ("broadcast", 0),
+        )
+
+    def test_aux_load_kind_colvec_rejected_when_index_order_mismatches(
+        self,
+    ) -> None:
+        """The colvec matcher requires the load index list to be the
+        carrier tile-id nodes in order; a swapped/foreign index must not
+        be claimed as ``("broadcast", 2)``."""
+        from helion._compiler.cute.cute_fx_walk import aux_tensor_load_kind
+
+        idx = self._carrier_index_nodes()
+        colvec = torch.empty(4, dtype=torch.float32).unsqueeze(1).expand(4, 4)
+        # Swap the index order so it no longer matches the carrier nodes.
+        load_node, _ = self._build_aux_load_node(
+            aux_tensor=colvec,
+            load_shape=(4, 4),
+            index_nodes=(idx[1], idx[0]),
+        )
+        self.assertNotEqual(
+            aux_tensor_load_kind(
+                load_node,
+                carrier_tile_shape=(4, 4),
+                carrier_tile_index_nodes=idx,
+                carrier_global_shape=(4, 4),
+            ),
+            ("broadcast", 2),
+        )
+
+    def test_aux_load_kind_colvec_rejected_when_global_shape_mismatches(
+        self,
+    ) -> None:
+        """When the underlying ``(M, N)`` view does not match the carrier's
+        global output shape, the colvec matcher bails (returns ``None``
+        rather than ``("broadcast", 2)``)."""
+        from helion._compiler.cute.cute_fx_walk import aux_tensor_load_kind
+
+        idx = self._carrier_index_nodes()
+        colvec = torch.empty(4, dtype=torch.float32).unsqueeze(1).expand(4, 4)
+        result = aux_tensor_load_kind(
+            self._build_aux_load_node(
+                aux_tensor=colvec,
+                load_shape=(4, 4),
+                index_nodes=idx,
+            )[0],
+            carrier_tile_shape=(4, 4),
+            carrier_tile_index_nodes=idx,
+            carrier_global_shape=(8, 8),  # mismatched global shape
+        )
+        self.assertNotEqual(result, ("broadcast", 2))
+
+    def test_aux_load_kind_colvec_rejected_with_extra_mask(self) -> None:
+        """A present ``extra_mask`` arg disqualifies the load entirely
+        (the splice emits a plain ``.load()`` with no mask), so even a
+        colvec-shaped aux returns ``None``."""
+        from helion._compiler.cute.cute_fx_walk import aux_tensor_load_kind
+
+        idx = self._carrier_index_nodes()
+        colvec = torch.empty(4, dtype=torch.float32).unsqueeze(1).expand(4, 4)
+        mask_graph = Graph()
+        mask_node = mask_graph.call_function(_tracing_ops._new_var, args=())
+        load_node, _ = self._build_aux_load_node(
+            aux_tensor=colvec,
+            load_shape=(4, 4),
+            index_nodes=idx,
+            extra_mask=mask_node,
+        )
+        self.assertIsNone(
+            aux_tensor_load_kind(
+                load_node,
+                carrier_tile_shape=(4, 4),
+                carrier_tile_index_nodes=idx,
+                carrier_global_shape=(4, 4),
+            )
+        )
+
     def test_emit_sched_pipeline_setup_round_trips_pipeline_async(self) -> None:
         """``_emit_sched_pipeline_setup`` emits the
         ``cutlass.pipeline.PipelineAsync.create`` wrapper used to

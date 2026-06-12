@@ -2647,9 +2647,12 @@ def _codegen_cute_store_tcgen05_tile(
         # Broadcast aux steps need a fresh AST var for the 2-D view
         # of the rank-1 underlying tensor (stride 0 on the orthogonal
         # axis). Exact-shape aux steps leave ``aux_view2d`` as None.
+        # broadcast_axis 0/1 build a stride-0 2-D view of a rank-1 tensor;
+        # the colvec form (2) reuses the exact-shape pipeline over its own
+        # (M, N) stride-(1,0) view, so it needs no separate ``aux_view2d``.
         aux_view2d = (
             df.new_var(f"tcgen05_aux_view2d_{aux_idx}")
-            if aux_step.broadcast_axis is not None
+            if aux_step.broadcast_axis in (0, 1)
             else None
         )
         aux_step_records.append(
@@ -2826,6 +2829,10 @@ def _codegen_cute_store_tcgen05_tile(
         aux_pipeline_uses_tma_load = False
         aux_ring_smem_names = tuple(None for _ in aux_step_records)
 
+    # Row-vector aux (``bias[n]`` / rowwise ``scale_b[n]``) reads stay
+    # per-subtile (the generic ``ttr_aux_subtile.load()`` path below, placed
+    # after the c_pipeline acquire / acc ``consumer_wait`` / T2R prefix per the
+    # cycle-69 placement).
     rowvec_aux_stage_records: list[_RowvecAuxStageRecord | None] = []
     for aux_idx, rec in enumerate(aux_step_records):
         copy_bits = 128
@@ -3102,9 +3109,11 @@ def _codegen_cute_store_tcgen05_tile(
                 )
                 continue
 
-            if rec.broadcast_axis is None:
-                # Exact-shape rank-2 aux: slice the per-tile region
-                # of the underlying 2-D tensor directly.
+            if rec.broadcast_axis is None or rec.broadcast_axis == 2:
+                # Exact-shape rank-2 aux (or the colvec form, which is a full
+                # (M, N) stride-(1,0) view): slice the per-tile region of the
+                # underlying 2-D tensor directly. The colvec's per-subtile read
+                # is specialized to a scalar in ``_aux_subtile_load_source``.
                 source_for_local_tile = rec.aux_tensor_name
                 aux_tile_is_local = False
             elif rowvec_stage is not None:
@@ -3405,6 +3414,18 @@ def _codegen_cute_store_tcgen05_tile(
                     f"cute.filter_zeros({rec.ttr_aux_subtile}), "
                     f"cute.filter_zeros({rec.aux_rmem}))\n"
                     f"{prelude_indent}{rec.aux_loaded} = {rec.aux_rmem}.load()\n"
+                )
+                continue
+            if rec.broadcast_axis == 2:
+                # Column-vector (per-row) aux: uniform over each thread's N
+                # fragment, so read a single SCALAR per subtile (T2R index
+                # (0,0,0)) instead of a redundant N-wide vector ``.load()``.
+                # Matches CUTLASS's ``sa = tTR_gSA[(0,0,0,subtile)]``; the
+                # scalar broadcasts in the ``acc * aux`` chain multiply.
+                lines.append(
+                    f"{prelude_indent}{rec.aux_loaded} = "
+                    f"{rec.ttr_aux_grouped}"
+                    f"[(0, 0, 0, cutlass.Int32(_tcgen05_subtile))]\n"
                 )
                 continue
             lines.extend(
