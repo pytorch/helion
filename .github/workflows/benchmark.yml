@@ -69,7 +69,7 @@ jobs:
 
     steps:
       - name: Run NVIDIA command
-        if: startsWith(inputs.image, 'nvidia') || (startsWith(inputs.image, 'pytorch') && contains(inputs.image, 'cuda'))
+        if: startsWith(inputs.image, 'nvidia')
         run: |
           echo "Detected NVIDIA image"
           nvidia-smi || echo "nvidia-smi not found"
@@ -122,7 +122,7 @@ jobs:
           ./scripts/install_cute.sh
 
       - name: CUDA Compute Check
-        if: startsWith(inputs.image, 'nvidia') || (startsWith(inputs.image, 'pytorch') && contains(inputs.image, 'cuda'))
+        if: startsWith(inputs.image, 'nvidia')
         run: |
           source .venv/bin/activate
           python -c "

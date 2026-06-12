@@ -144,14 +144,17 @@ class TestConfigAPI(TestCase):
             pass
 
         device = torch.device("cuda:0")
-        with (
-            patch("torch.cuda.is_available", return_value=True),
-            patch("torch.cuda.get_device_capability", return_value=(9, 0)),
+        # Patch the helion seam (target_device_capability, imported into
+        # runtime.kernel) rather than torch.cuda.get_device_capability: the
+        # latter is memoized behind _target_device_capability, mirroring the
+        # is_hip / _is_hip pattern where tests mock the public wrapper, not
+        # the cached inner query.
+        with patch(
+            "helion.runtime.kernel.target_device_capability", return_value=(9, 0)
         ):
             sm90_key = device_key_kernel._base_specialization_key((device,))
-        with (
-            patch("torch.cuda.is_available", return_value=True),
-            patch("torch.cuda.get_device_capability", return_value=(10, 0)),
+        with patch(
+            "helion.runtime.kernel.target_device_capability", return_value=(10, 0)
         ):
             sm100_key = device_key_kernel._base_specialization_key((device,))
 
@@ -874,7 +877,14 @@ class TestCuteTcgen05ConfigSpecSplit(TestCase):
         with (
             patch("torch.cuda.is_available", return_value=True),
             patch("torch.cuda.current_device", return_value=0),
-            patch("torch.cuda.get_device_capability", return_value=(9, 0)),
+            # Patch the helion seam: torch.cuda.get_device_capability is
+            # memoized behind _target_device_capability (is_hip / _is_hip
+            # pattern), so config_spec's get_target_device_capability() must
+            # be patched at the wrapper, not the cached torch query.
+            patch(
+                "helion.autotuner.config_spec.get_target_device_capability",
+                return_value=(9, 0),
+            ),
         ):
             spec = self._make_cute_tcgen05_spec()
 
