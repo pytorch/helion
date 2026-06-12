@@ -51,12 +51,11 @@ _FALSE_LITERALS = frozenset({"0", "false", "no", "off"})
 
 
 def codegen_decorator_parts(static_shapes: object, index_dtype: object) -> list[str]:
-    """Settings that influence Triton codegen, as ``key=value`` decorator parts.
+    """Codegen-affecting settings as ``key=value`` decorator parts.
 
     Single source of truth shared by :meth:`BoundKernel.format_kernel_decorator`
-    (the config-reproduction decorator) and the autotune-telemetry ``run_id``
-    signature, so the two never drift: ``static_shapes`` always, ``index_dtype``
-    when set. Adding a codegen-affecting setting here updates both consumers.
+    and the telemetry ``run_id`` signature so they never drift: ``static_shapes``
+    always, ``index_dtype`` when set.
     """
     parts = [f"static_shapes={static_shapes}"]
     if index_dtype is not None:
@@ -424,6 +423,11 @@ class _Settings:
     )
     autotune_log_level: int = dataclasses.field(default_factory=_get_autotune_log_level)
     autotune_log: str | None = dataclasses.field(default_factory=_get_autotune_log_path)
+    autotune_dataset: bool = dataclasses.field(
+        default_factory=functools.partial(
+            _env_get_bool, "HELION_AUTOTUNE_DATASET", False
+        )
+    )
     autotune_compile_timeout: int = dataclasses.field(
         default_factory=functools.partial(
             _env_get_int, "HELION_AUTOTUNE_COMPILE_TIMEOUT", 60
@@ -650,6 +654,11 @@ class Settings(_Settings):
         "autotune_log": (
             "Base filename for autotune logs. Set HELION_AUTOTUNE_LOG=/tmp/run to write "
             "/tmp/run.csv and /tmp/run.log with per-config metrics and debug logs."
+        ),
+        "autotune_dataset": (
+            "Opt-in (HELION_AUTOTUNE_DATASET=1) to also write the cost-model "
+            "dataset sidecar /tmp/run.meta.jsonl (per-run kernel identity + the "
+            "configs tested, keyed by config_id). Off by default; needs autotune_log."
         ),
         "autotune_compile_timeout": "Timeout for Triton compilation in seconds used for autotuning. Default is 60 seconds.",
         "autotune_benchmark_subprocess": "Run the autotune benchmark phase in a long-lived spawn subprocess so a hung/slow kernel can be killed without losing autotune progress. Enabled by default. Set HELION_AUTOTUNE_BENCHMARK_SUBPROCESS=0 to disable.",
