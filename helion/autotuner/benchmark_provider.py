@@ -803,34 +803,29 @@ class LocalBenchmarkProvider(BenchmarkProvider):
                     process_group_name=self.kernel.env.process_group_name,
                 )
             ):
-                # Only minimize/record when telemetry is active (an active log
-                # sink). Record the minimized config (defaults dropped) so the
-                # dataset stays lean; benchmark the original config so behaviour
-                # is unchanged. ``minimized is not None`` <=> recording, and also
-                # narrows the type for AutotuneLogEntry(config=...).
-                minimized = (
-                    config.minimize(self.config_spec) if self.log.recording else None
-                )
-                if minimized is not None:
+                # config_id is None when no log sink is active (skip recording);
+                # the started and result rows share it so they join to one config.
+                config_id = self.log.register_config(config)
+                if config_id is not None:
                     self.log.record_autotune_entry(
                         AutotuneLogEntry(
                             generation=self._autotune_metrics.num_generations,
                             status="started",
                             perf_ms=None,
                             compile_time=compile_time,
-                            config=minimized,
+                            config_id=config_id,
                         )
                     )
                 perf = self._benchmark_function(config, fn)
                 status = "ok" if math.isfinite(perf) else "error"
-                if minimized is not None:
+                if config_id is not None:
                     self.log.record_autotune_entry(
                         AutotuneLogEntry(
                             generation=self._autotune_metrics.num_generations,
                             status=status,
                             perf_ms=perf if math.isfinite(perf) else None,
                             compile_time=compile_time,
-                            config=minimized,
+                            config_id=config_id,
                         )
                     )
                 results[valid_indices[index]] = BenchmarkResult(
@@ -885,7 +880,8 @@ class LocalBenchmarkProvider(BenchmarkProvider):
 
         # precompile in the current process for distributed kernels.
         # The reason we need this is due to some tricky distributed kernels
-        # like https://gist.github.com/shunting314/81f13ce00f835b21ab6466e21454b7c5 . We specialize the RANK argument for each GPU,
+        # like https://gist.github.com/shunting314/81f13ce00f835b21ab6466e21454b7c5 .
+        # We specialize the RANK argument for each GPU,
         # some rank may get out of resource errors while others don't
         # due to the specialization.
         #

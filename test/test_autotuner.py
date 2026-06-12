@@ -442,12 +442,13 @@ class TestAutotuneIgnoreErrors(TestCase):
         )
         logger = AutotuningLogger(settings)
         with logger.autotune_logging():
+            config_id = logger.register_config(helion.Config(foo=1, bar=[2, 3]))
             entry = AutotuneLogEntry(
                 generation=5,
                 status="ok",
                 perf_ms=1.234,
                 compile_time=0.5,
-                config=helion.Config(foo=1, bar=[2, 3]),
+                config_id=config_id,
             )
             logger.record_autotune_entry(entry)
             logger("finalized entry", level=logging.CRITICAL)
@@ -463,20 +464,17 @@ class TestAutotuneIgnoreErrors(TestCase):
             [
                 "run_id",
                 "timestamp_s",
-                "config_index",
+                "config_id",
                 "generation",
                 "status",
                 "perf_ms",
                 "compile_time_s",
-                "config",
             ],
         )
-        # Lean schema: no kernel_id/sample_id/decorator columns.
-        for absent in ("kernel_id", "sample_id", "decorator"):
-            self.assertNotIn(absent, header)
         # No metadata supplied here, so the run_id join key is empty.
         self.assertEqual(rows[1][header.index("run_id")], "")
-        self.assertEqual(rows[1][header.index("config_index")], "1")
+        # config_id is the content-addressed key returned by register_config.
+        self.assertEqual(rows[1][header.index("config_id")], config_id)
         self.assertEqual(rows[1][header.index("generation")], "5")
         self.assertEqual(rows[1][header.index("status")], "ok")
         self.assertEqual(rows[1][header.index("perf_ms")], "1.234000")
@@ -759,8 +757,10 @@ class TestAutotuneIgnoreErrors(TestCase):
     @skipIfXPU("maxnreg parameter not supported on XPU backend")
     def test_autotune_skips_restricted_search(self):
         """A run restricted to user-pinned configs (``configs=[...]`` without
-        ``force_autotune``) is excluded from data collection: neither the
-        ``.csv`` nor the ``.meta.jsonl`` is written (PRD FR1)."""
+        ``force_autotune``) is a biased slice excluded from the dataset: even
+        with the dataset flag on, no ``.meta.jsonl`` is written. The debug
+        ``.csv`` is still written, since it is gated only by the log path
+        (PRD FR8/FR9)."""
         configs = [
             helion.Config(block_sizes=[32], num_warps=4),
             helion.Config(block_sizes=[64], num_warps=8),
@@ -773,6 +773,7 @@ class TestAutotuneIgnoreErrors(TestCase):
             os.environ,
             {
                 "HELION_AUTOTUNE_LOG": str(base_path),
+                "HELION_AUTOTUNE_DATASET": "1",
                 "HELION_AUTOTUNE_LOG_LEVEL": "0",
             },
         ):
@@ -793,8 +794,8 @@ class TestAutotuneIgnoreErrors(TestCase):
             search = FiniteSearch(bound_kernel, args, configs=configs)
             search.autotune()
 
-        # Restricted search -> no telemetry files at all.
-        self.assertFalse(base_path.with_suffix(".csv").exists())
+        # Restricted search -> debug CSV written, but no dataset sidecar.
+        self.assertTrue(base_path.with_suffix(".csv").exists())
         self.assertFalse(base_path.with_suffix(".meta.jsonl").exists())
 
 
