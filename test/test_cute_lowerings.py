@@ -7702,6 +7702,9 @@ class TestCuteLowerings(unittest.TestCase):
     def test_tcgen05_fused_gelu_exact_runtime_correctness(self) -> None:
         """Default ``F.gelu`` maps to the exact erf-based CuTe epilogue step."""
 
+        import os
+        import tempfile
+
         import cutlass.cute as cute
 
         from helion._compiler.cute.mma_support import get_cute_mma_support
@@ -7730,7 +7733,15 @@ class TestCuteLowerings(unittest.TestCase):
             pid_type="persistent_interleaved",
         )
         bound.set_config(cfg)
+        # The packed-helper mocks only fire during CuTe DSL *tracing*: a warm
+        # on-disk compile cache reloads the cubin without tracing and the
+        # call counts stay 0 even though the kernel is correct. Redirect
+        # CUTE_DSL_CACHE_DIR to a fresh tempdir so this launch always
+        # compiles (the cache key excludes the cache *location*, so this
+        # does not perturb other tests' cache entries).
         with (
+            tempfile.TemporaryDirectory() as fresh_cache_dir,
+            patch.dict(os.environ, {"CUTE_DSL_CACHE_DIR": fresh_cache_dir}),
             patch(
                 "cutlass.cute.arch.fma_packed_f32x2",
                 wraps=cute.arch.fma_packed_f32x2,
