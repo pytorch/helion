@@ -120,6 +120,11 @@ class _AuxStepRecord:
     aux_rmem: str
     aux_loaded: str
     aux_view2d: str | None
+    # Pre-wait register hoist (bm=128 2-CTA family only): name of the
+    # whole-fragment register tensor filled by ``autovec_copy`` BEFORE the
+    # accumulator ``consumer_wait`` so the rowvec GMEM latency hides under
+    # the MMA wait. ``None`` keeps the per-subtile GMEM load.
+    aux_rmem_full: str | None = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -2821,6 +2826,30 @@ def _codegen_cute_store_tcgen05_tile(
                 aux_rmem=df.new_var(f"tcgen05_aux_rmem_{aux_idx}"),
                 aux_loaded=df.new_var(f"tcgen05_aux_loaded_{aux_idx}"),
                 aux_view2d=aux_view2d,
+                # Pre-wait whole-fragment register hoist of N-broadcast
+                # (rowvec) aux on the bm=128 2-CTA full-tile TMA-store path.
+                # The fragment there is small (2 subtiles x epi-tile N of 64
+                # at bn=128 = a handful of fp32 registers per thread), so the
+                # whole-fragment LDG fits without spills and hides its GMEM
+                # latency under the MMA wait (standalone CUTLASS does the
+                # same; ~2% on the 512x6144x2048 fp8 scaled_mm shape). It is
+                # deliberately NOT applied to the bm=256 family: its larger
+                # whole-tile fragment regressed via register spills (see the
+                # fp8_gap_v2 history of the rowvec hoist removal at bn=128/
+                # epi-32 -- 409k LDL/STL on the 4096^3 shape).
+                aux_rmem_full=(
+                    df.new_var(f"tcgen05_aux_rmem_full_{aux_idx}")
+                    if (
+                        aux_step.broadcast_axis in (0, 1)
+                        and tcgen05_is_two_cta_m128(
+                            is_two_cta=tcgen05_lifecycle.is_two_cta,
+                            bm=tcgen05_value.bm,
+                        )
+                        and tcgen05_value.use_tma_store_epilogue
+                        and not tcgen05_value.partial_output_tma_store
+                    )
+                    else None
+                ),
             )
         )
 
@@ -3346,6 +3375,26 @@ def _codegen_cute_store_tcgen05_tile(
                         f"{rec.ttr_aux_grouped} = cute.group_modes("
                         f"{rec.ttr_aux}, 3, cute.rank({rec.ttr_aux}))"
                     ),
+                    # Pre-wait hoist: one cooperative LDG of the whole rowvec
+                    # fragment, issued here (before the accumulator
+                    # consumer_wait downstream) so the GMEM latency overlaps
+                    # the MMA wait. Per-subtile reads then come from
+                    # registers. See the ``aux_rmem_full`` field docs for the
+                    # family gate.
+                    *(
+                        [
+                            (
+                                f"{rec.aux_rmem_full} = cute.make_rmem_tensor("
+                                f"{rec.ttr_aux_grouped}.shape, {rec.aux_dtype})"
+                            ),
+                            (
+                                f"cute.autovec_copy({rec.ttr_aux_grouped}, "
+                                f"{rec.aux_rmem_full})"
+                            ),
+                        ]
+                        if rec.aux_rmem_full is not None and not force_gmem_aux
+                        else []
+                    ),
                 ]
             )
         return lines
@@ -3567,6 +3616,16 @@ def _codegen_cute_store_tcgen05_tile(
                     f"{prelude_indent}{rec.aux_loaded} = "
                     f"{rec.ttr_aux_grouped}"
                     f"[(0, 0, 0, cutlass.Int32(_tcgen05_subtile))]\n"
+                )
+                continue
+            if rec.aux_rmem_full is not None:
+                # Pre-wait hoisted rowvec: the whole fragment is already in
+                # registers (loaded before the accumulator consumer_wait by
+                # ``_aux_tile_setup_lines``); slice the active subtile.
+                lines.append(
+                    f"{prelude_indent}{rec.aux_loaded} = "
+                    f"{rec.aux_rmem_full}"
+                    f"[(None, None, None, cutlass.Int32(_tcgen05_subtile))].load()\n"
                 )
                 continue
             lines.extend(
