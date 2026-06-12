@@ -283,6 +283,12 @@ class DeviceFunction:
         )
         self._variable_renames: dict[str, list[str]] = {}
         self.dce_vars: list[str] = []
+        # Names of matmul-fallback running-sum accumulators emitted as
+        # ``acc = acc + product`` inside a constexpr V-loop.  The
+        # ``hoist_warp_reduce`` pass reads this to reduce the FINAL value once
+        # (instead of building a per-lane V-fold, which would double-count the
+        # already-accumulated running sum).  See ``_emit_cute_matmul``.
+        self.cute_matmul_running_sums: set[str] = set()
         # Arg names referenced only by fusion placeholder strings
         # (<STORE_OUTPUT_*>, <LOAD_INPUT_*>), not by the AST body.
         # DCE would incorrectly strip them without this exemption.
@@ -864,7 +870,9 @@ class DeviceFunction:
             # from ~396 to ~99 (4x fewer SHFL trees).
             from .cute.hoist_warp_reduce import hoist_warp_reduce_from_vloop
 
-            kernel_body = hoist_warp_reduce_from_vloop(kernel_body)
+            kernel_body = hoist_warp_reduce_from_vloop(
+                kernel_body, running_sum_accumulators=self.cute_matmul_running_sums
+            )
             # Merge adjacent constexpr V-loops that share an identical
             # statement prefix.  Caches the last common per-V-lane value
             # into a register fragment so V-loop 2's bitcast/cast chain
