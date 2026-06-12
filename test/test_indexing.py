@@ -21,6 +21,7 @@ from helion._testing import TestCase
 from helion._testing import _get_backend
 from helion._testing import code_and_output
 from helion._testing import onlyBackends
+from helion._testing import skipIfCute
 from helion._testing import skipIfLowVRAM
 from helion._testing import skipIfNormalMode
 from helion._testing import skipIfRefEager
@@ -2704,6 +2705,42 @@ class TestIndexing(RefEagerTestBase, TestCase):
         )
         expected = torch.gather(input_tensor, 1, index_tensor)
 
+        torch.testing.assert_close(result, expected)
+
+    @skipIfTileIR("TileIR does not support gather operation")
+    @skipIfCute("Backend 'cute' does not support: torch.gather input")
+    def test_gather_with_rdim_reduction(self):
+        """torch.gather over the reduction dim of an implicitly rolled load.
+
+        Mirrors the cross_entropy pattern: ``logits[tile_n, :]`` feeds both
+        ``torch.gather(..., 1, idx)`` and ``torch.amax(..., dim=-1)``.  With
+        a rolled reduction, the gather (a non-reduction op consuming the
+        rdim) would live outside the loop and only see the last iteration's
+        chunk — Triton then rejected the generated code with
+        ``NameError: <load> is not defined``.  V is large enough that the
+        heuristic's default config picks a rolled reduction; with the
+        roller's pre-pass refusing to roll this kernel, the default falls
+        back to a persistent reduction that compiles cleanly.
+        """
+
+        @helion.kernel()
+        def gather_then_reduce(
+            x: torch.Tensor,  # [N, V]
+            idx: torch.Tensor,  # [N]
+        ) -> torch.Tensor:  # [N]
+            n, _v = x.shape
+            out = torch.empty([n], dtype=x.dtype, device=x.device)
+            for tile_n in hl.tile(n):
+                row = x[tile_n, :]
+                gathered = row.gather(1, idx[tile_n].unsqueeze(1)).squeeze(1)
+                out[tile_n] = torch.amax(row, dim=-1) - gathered
+            return out
+
+        n, v = 4, 8192
+        x = torch.randn(n, v, device=DEVICE, dtype=torch.float32)
+        idx = torch.randint(0, v, (n,), device=DEVICE, dtype=torch.int64)
+        _, result = code_and_output(gather_then_reduce, (x, idx))
+        expected = torch.amax(x, dim=-1) - x.gather(1, idx[:, None]).squeeze(1)
         torch.testing.assert_close(result, expected)
 
     @skipIfTileIR("TileIR does not support gather operation")
