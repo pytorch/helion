@@ -77,6 +77,27 @@ def _reduction_kernel(x: torch.Tensor) -> torch.Tensor:
     return out
 
 
+@helion.kernel(backend="cute", static_shapes=True)
+def _fp8_matmul_kernel(
+    x: torch.Tensor,
+    y: torch.Tensor,
+    sa2d: torch.Tensor,
+    sb1d: torch.Tensor,
+) -> torch.Tensor:
+    """A scaled fp8 matmul whose ``hl.dot`` lowers to the SIMT scalar
+    fallback for skinny M, exercising the fp8 tile-loop vec hoist for both
+    the row-major lhs (``x``) and the K-major rhs (``y``)."""
+    m, k = x.size()
+    k2, n = y.size()
+    out = torch.empty([m, n], dtype=torch.bfloat16, device=x.device)
+    for tm, tn in hl.tile([m, n]):
+        acc = hl.zeros([tm, tn], dtype=torch.float32)
+        for tk in hl.tile(k):
+            acc = hl.dot(x[tm, tk], y[tk, tn], acc=acc)
+        out[tm, tn] = (acc * sa2d[tm, tn] * sb1d[tn]).to(torch.bfloat16)
+    return out
+
+
 @onlyBackends(["cute"])
 class TestCuteTileLoopVecHoist(TestCase):
     def test_vec_hoist_fires_at_v4_fp16(self) -> None:
@@ -162,6 +183,49 @@ class TestCuteTileLoopVecHoist(TestCase):
         torch.testing.assert_close(out, ref, atol=1e-2, rtol=1e-2)
         self.assertIn("ir.VectorType.get([4]", code)
         self.assertIn("cutlass.BFloat16", code)
+
+    def test_vec_hoist_fp8_matmul_both_operands(self) -> None:
+        """fp8 matmul operands must vectorize through the tile-loop hoist as
+        raw ``Uint8`` vectors (not bf16/fp16's ``Uint16``).  Both the
+        row-major lhs and the K-major rhs (lane axis at index position 0)
+        must emit a wide ``cute.arch.load(..., VectorType([4], Uint8))``.
+        """
+        m, k, n = 16, 4096, 4096
+        x = (torch.randn(m, k, device=DEVICE) * 0.4).to(torch.float8_e4m3fn)
+        y = (
+            (torch.randn(k, n, device=DEVICE) * 0.4)
+            .to(torch.float8_e4m3fn)
+            .T.contiguous()
+            .T
+        )
+        sa = (torch.rand(m, 1, device=DEVICE) + 0.5).float()
+        sb = (torch.rand(1, n, device=DEVICE) + 0.5).float()
+        code, out = code_and_output(
+            _fp8_matmul_kernel,
+            (x, y, sa.expand(m, n), sb.reshape(n)),
+            block_sizes=[16, 64, 1024],
+            num_threads=[1, 64, 0],
+            cute_vector_widths=[1, 1, 4],
+            indexing=[
+                "pointer",
+                "pointer",
+                "pointer",
+                "tensor_descriptor",
+                "tensor_descriptor",
+            ],
+        )
+        ref = torch._scaled_mm(
+            x, y, sa, sb, use_fast_accum=False, out_dtype=torch.bfloat16
+        )
+        torch.testing.assert_close(out.float(), ref.float(), atol=1.0, rtol=0.1)
+        # fp8 V=4 loads a packed Uint32 (one LDG.32), NOT a VectorType nor the
+        # bf16/fp16 Uint16 form; lane bytes come out via shift+mask.
+        self.assertIn("cutlass.Uint32)", code)
+        self.assertNotIn("ir.VectorType", code)
+        self.assertIn("& 255", code)
+        # Both operands must be hoisted (two distinct packed-load vars).
+        self.assertIn("_tile_unroll_vec_", code)
+        self.assertGreaterEqual(code.count("cutlass.Uint32)"), 2)
 
     def test_scalar_load_when_vec_width_is_one(self) -> None:
         """When V=1 the vec hoist must NOT fire — the codegen falls back to
