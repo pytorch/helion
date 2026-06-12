@@ -396,8 +396,10 @@ def _compute_grid_and_block_sizes(
     state: CodegenState,
     block_ids: list[int],
     env: CompileEnvironment,
+    aligned_dim: dict[int, int] | None = None,
 ) -> tuple[list[str], list[str]]:
     """Compute grid dimensions and block size vars for the given block_ids."""
+    aligned_dim = aligned_dim or {}
     grid_parts: list[str] = []
     block_size_vars: list[str] = []
     for i, block_id in enumerate(block_ids):
@@ -407,7 +409,15 @@ def _compute_grid_and_block_sizes(
         block_value = state.device_function.resolved_block_size(block_id)
         if block_value is not None:
             state.device_function.constexpr_arg(block_size_var, block_value)
-        numel_expr = _get_loop_numel(state, i)
+        if block_id in aligned_dim:
+            # Aligned-enclosing span: ceil(end/S)*S - floor(begin/S)*S.
+            begin, end = _get_loop_begin_and_end(state, i)
+            sublane = aligned_dim[block_id]
+            a_start = f"(({begin}) - ({begin}) % {sublane})"
+            a_end = f"((({end}) + {sublane} - 1) // {sublane} * {sublane})"
+            numel_expr = f"({a_end} - {a_start})"
+        else:
+            numel_expr = _get_loop_numel(state, i)
         grid_parts.append(
             env.backend.cdiv_expr(numel_expr, block_size_var, is_device=True)
         )
@@ -418,8 +428,10 @@ def _pallas_loop_begin_and_step_exprs(
     state: CodegenState,
     block_ids: list[int],
     block_size_vars: list[str],
+    aligned_dim: dict[int, int] | None = None,
 ) -> tuple[list[str], list[str], list[str]]:
     """Return begin, per-iteration step, and slice-size expressions for loop dims."""
+    aligned_dim = aligned_dim or {}
     steps = state.proxy_arg(4) if len(state.proxy_args) > 4 else None
 
     if not isinstance(steps, (list, tuple)):
@@ -432,6 +444,10 @@ def _pallas_loop_begin_and_step_exprs(
     for i in range(len(block_ids)):
         step = steps[i]
         begin_expr, _ = _get_loop_begin_and_end(state, i)
+        if block_ids[i] in aligned_dim:
+            # Align the tile begin DOWN to the sublane (aligned-enclosing).
+            sublane = aligned_dim[block_ids[i]]
+            begin_expr = f"(({begin_expr}) - ({begin_expr}) % {sublane})"
         if step is None or sympy.sympify(step) in (
             sympy.Integer(0),
             sympy.Integer(1),
@@ -704,6 +720,7 @@ def _setup_inner_loop_masks(
     env: CompileEnvironment,
     body_stmts: list[ast.AST],
     offset_expr_fn: Callable[[int, str], str],
+    aligned_dim: dict[int, int] | None = None,
 ) -> bool:
     """Set up mask variables for inner-loop block_ids.
 
@@ -713,13 +730,37 @@ def _setup_inner_loop_masks(
 
     Returns True if any mask requires explicit indices.
     """
+    aligned_dim = aligned_dim or {}
     needs_explicit = False
     if hasattr(strategy, "_setup_mask"):
         for i, bid in enumerate(block_ids):
+            offset_var = state.device_function.new_var(f"offset_{bid}")
+            if bid in aligned_dim:
+                # Two-sided validity mask for an aligned-enclosing dynamic row
+                # tile: the load over-reads [a_start, begin) and [end, a_end), so
+                # mask both ends.  The relative offset is measured from a_start.
+                sublane = aligned_dim[bid]
+                begin, end = _get_loop_begin_and_end(state, i)
+                a_start = f"(({begin}) - ({begin}) % {sublane})"
+                mask_var = strategy.fn.new_var(f"mask_{bid}", dce=True)  # pyrefly: ignore[missing-attribute]
+                strategy.mask_vars[bid] = mask_var  # pyrefly: ignore[missing-attribute]
+                needs_explicit = True
+                body_stmts.extend(
+                    [
+                        statement_from_string(
+                            f"{offset_var} = {offset_expr_fn(i, block_size_vars[i])}"
+                        ),
+                        statement_from_string(
+                            f"{mask_var} = (({a_start}) + ({offset_var}) "
+                            f">= ({begin})) & (({a_start}) + ({offset_var}) "
+                            f"< ({end}))"
+                        ),
+                    ]
+                )
+                continue
             block_value = state.device_function.resolved_block_size(bid)
             assert isinstance(block_value, int)
             numel_expr = _get_loop_numel(state, i)
-            offset_var = state.device_function.new_var(f"offset_{bid}")
             mask_stmt = strategy._setup_mask(
                 state, bid, block_value, offset_var, numel_expr
             )
@@ -1436,6 +1477,107 @@ def _(state: CodegenState) -> ast.AST:
     )
 
 
+def _lane_tile(
+    state: CodegenState, fake: torch.Tensor, dim_to_bid: dict[int, int]
+) -> int | None:
+    """Access extent on ``fake``'s last dim: its block size if tiled, else width."""
+    lane_bid = dim_to_bid.get(fake.ndim - 1)
+    if lane_bid is not None:
+        rb = state.device_function.resolved_block_size(lane_bid)
+        if isinstance(rb, int):
+            return rb
+    last = fake.shape[fake.ndim - 1]
+    return last if isinstance(last, int) else None
+
+
+def _loop_dim_is_dynamic(state: CodegenState, i: int) -> bool:
+    """Whether loop dim ``i`` has a runtime begin and end (a fully-dynamic jagged
+    tile).  The tracing-time form of is_dynamic_bound_tile, used here because the
+    device loops are not registered yet.
+    """
+    begins, ends = state.proxy_args[1], state.proxy_args[2]
+    if not isinstance(begins, (list, tuple)) or not isinstance(ends, (list, tuple)):
+        return False
+    begin = begins[i] if i < len(begins) else 0
+    end = ends[i] if i < len(ends) else 0
+    return not isinstance(begin, (int, torch.SymInt)) and not isinstance(
+        end, (int, torch.SymInt)
+    )
+
+
+def _aligned_dim(
+    state: CodegenState,
+    env: CompileEnvironment,
+    block_ids: list[int],
+    loaded_tensors: dict[int, tuple[torch.Tensor, torch.fx.Node, list[object]]],
+    stored_tensors: dict[int, tuple[torch.Tensor, torch.fx.Node, list[object]]],
+) -> dict[int, int]:
+    """Jagged row tiles (runtime end) that read an aligned-enclosing window.
+
+    Maps each to the sublane S its range rounds down to.  A row aligns when a
+    tensor it slices must land on a sublane tile (bf16, or f32 spanning more than
+    one lane tile), or when a per-row map store carries its shared boundary row.
+    A DIRECT row that does not carry is omitted: it reads at the exact offset.  S
+    is the largest float-tensor sublane (bf16 forces 16); carrying rows are also
+    registered for the store fold/save.
+    """
+    from helion._compiler.backend import SliceAddressing
+    from helion._compiler.backend import _slice_addressing
+    from helion._compiler.pallas.ordered_carry import CarryRowTile
+    from helion._compiler.pallas.ordered_carry import is_row_map_axis
+    from helion._compiler.pallas.ordered_carry import needs_ordered_carry
+
+    sublanes = [
+        env.backend.sublane_tiling(t.dtype)  # pyrefly: ignore[missing-attribute]
+        for t in HostFunction.current().tensor_to_origin
+        if isinstance(t, torch.Tensor) and t.is_floating_point()
+    ]
+    if not sublanes:
+        return {}
+
+    # Strictest addressing each row needs over the tensors it slices.
+    addressing: dict[int, SliceAddressing] = {}
+    for fake, _node, sub_meta in (*loaded_tensors.values(), *stored_tensors.values()):
+        if not (isinstance(fake, torch.Tensor) and fake.is_floating_point()):
+            continue
+        dim_to_bid = _get_dim_block_ids(sub_meta, env)
+        lane_block = _lane_tile(state, fake, dim_to_bid)
+        for dim, dim_bid in dim_to_bid.items():
+            if _slice_addressing(fake, dim, lane_block) is SliceAddressing.ALIGNED:
+                addressing[dim_bid] = SliceAddressing.ALIGNED
+            else:
+                addressing.setdefault(dim_bid, SliceAddressing.DIRECT)
+
+    sublane = max(sublanes)
+    aligned_dim: dict[int, int] = {}
+    for i, bid in enumerate(block_ids):
+        if not _loop_dim_is_dynamic(state, i):
+            continue  # static begin or end: not a fully-dynamic jagged tile
+        carry = needs_ordered_carry(state, bid)
+        direct = addressing.get(bid, SliceAddressing.ALIGNED) is SliceAddressing.DIRECT
+        if direct and not carry:
+            continue  # reads any offset; a plain clamped slice suffices
+        if not carry and not is_row_map_axis(state, bid):
+            # ALIGNED but not a map axis: a bf16 reduction over the row.  Its
+            # dense bf16 output store can't be proven aligned for Mosaic (E2003),
+            # so reject it cleanly here instead.  f32 reductions are DIRECT and
+            # already skipped above.
+            raise NotImplementedError(
+                "Pallas: bf16 reduction over a jagged row is not supported yet "
+                "(its dense bf16 output store cannot be proven sublane-aligned)."
+            )
+        aligned_dim[bid] = sublane
+        if carry:
+            begin, end = _get_loop_begin_and_end(state, i)
+            state.device_function.carry_tiles[bid] = CarryRowTile(
+                block_id=bid,
+                begin_var=begin,
+                end_var=end,
+                sublane=sublane,
+            )
+    return aligned_dim
+
+
 def _codegen_emit_pipeline(state: CodegenState) -> object:
     """Emit inner device loops using pltpu.emit_pipeline.
 
@@ -1465,11 +1607,15 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
     assert isinstance(proxy_args, list)
     has_loop_state = len(args) > 0
 
-    grid_parts, block_size_vars = _compute_grid_and_block_sizes(state, block_ids, env)
-
     loaded_tensors, stored_tensors = _classify_loop_tensors(graph_info, state)
+
+    aligned_dim = _aligned_dim(state, env, block_ids, loaded_tensors, stored_tensors)
+
+    grid_parts, block_size_vars = _compute_grid_and_block_sizes(
+        state, block_ids, env, aligned_dim
+    )
     begin_exprs, iter_step_exprs, slice_size_exprs = _pallas_loop_begin_and_step_exprs(
-        state, block_ids, block_size_vars
+        state, block_ids, block_size_vars, aligned_dim
     )
     # Loop end expressions (used to clamp store extents for data-dependent begins).
     end_exprs = [_get_loop_begin_and_end(state, i)[1] for i in range(len(block_ids))]
@@ -1517,6 +1663,8 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
         dims into the BlockSpec lambda, so the full HBM tensor can be passed
         without pre-slicing.
         """
+        from helion._compiler.pallas.ordered_carry import is_dynamic_bound_tile
+
         dim_to_bid = _get_dim_block_ids(subscript_meta, env)
         shape = fake.shape
         block_shape_parts: list[str] = []
@@ -1607,6 +1755,20 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
                 else:
                     block_shape_parts.append(str(int(shape[dim_idx])))
                 lambda_parts.append(pid_var)
+            elif bid is not None and is_dynamic_bound_tile(state, bid):
+                # Jagged row tile from an inner pipeline.  pl.multiple_of is
+                # assume_multiple: it suppresses the tiled-row alignment check.
+                # Safe because the begin is rounded to the sublane in the dim's
+                # own loop, and a DIRECT f32 single-lane-tile row reads
+                # contiguously.  Always emitted, as sibling loops reference the
+                # same jagged dim.  Must precede the outer-non-grid branch.
+                block_m = state.device_function.block_size_var(bid)
+                offset_v = state.codegen.offset_var(bid)
+                sublane = env.backend.sublane_tiling(fake.dtype)  # pyrefly: ignore[missing-attribute]
+                block_shape_parts.append(f"pl.BoundedSlice({block_m})")
+                lambda_parts.append(
+                    f"pl.ds(pl.multiple_of({offset_v}, {sublane}), {block_m})"
+                )
             elif bid is not None and state.codegen.active_device_loops.get(bid):
                 # Outer non-grid device loop -- the HBM ref is pre-sliced via
                 # ``.at[pl.ds(offset, bs)]`` (see _make_hbm_slice), so the
@@ -1665,7 +1827,14 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
         and inner pipeline dims are handled by BlockSpec via the iteration
         lambda — so this only adds ``pl.ds(offset, bs)`` slices for outer
         device loops whose offset is a closure variable in this scope.
+
+        Dynamic (jagged) row tiles are skipped here: they are addressed by an
+        aligned-enclosing BoundedSlice in the BlockSpec (their group start is
+        not block-aligned, so a plain ``pl.ds`` pre-slice would be unaddressable
+        for bf16).
         """
+        from helion._compiler.pallas.ordered_carry import is_dynamic_bound_tile
+
         dim_to_bid = _get_dim_block_ids(subscript_meta, env)
         shape = fake.shape
         parts: list[str] = []
@@ -1677,6 +1846,7 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
                 and bid not in block_ids
                 and bid not in _bid_to_pid_var
                 and state.codegen.active_device_loops.get(bid)
+                and not is_dynamic_bound_tile(state, bid)
             ):
                 offset = state.codegen.offset_var(bid)
                 bs_var = state.device_function.block_size_var(bid)
@@ -1789,6 +1959,7 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
         offset_expr_fn=lambda i, bs: (
             f"_pipeline_indices[{i}] * {bs} + jnp.arange({bs})"
         ),
+        aligned_dim=aligned_dim,
     )
 
     # Emit absolute offset assignments inside the pipeline body so any
