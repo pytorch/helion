@@ -232,14 +232,17 @@ def _extract_subscript_vals(subscript: object) -> list[object]:
 def _(state: CodegenState) -> object:
     """Emit inner device loops for Pallas/TPU.
 
-    When ``pallas_loop_type="emit_pipeline"``, generates ``pltpu.emit_pipeline``
-    calls with automatic DMA pipelining.  When ``pallas_loop_type="fori_loop"``,
-    generates ``jax.lax.fori_loop`` with explicit ``pltpu.make_async_copy`` DMA.
-    Otherwise falls through to the common ``ForLoopGraphInfo.codegen`` path.
+    When ``pallas_loop_type="emit_pipeline"`` or ``"outer_pipeline"``,
+    generates ``pltpu.emit_pipeline`` calls with automatic DMA pipelining
+    (with the latter additionally folding the surrounding outer
+    ``hl.grid`` axes into the pipeline grid).  When
+    ``pallas_loop_type="fori_loop"``, generates ``jax.lax.fori_loop``
+    with explicit ``pltpu.make_async_copy`` DMA.  Otherwise falls through
+    to the common ``ForLoopGraphInfo.codegen`` path.
     """
     config = state.config
     pallas_loop_type = config.get("pallas_loop_type", "unroll")
-    if pallas_loop_type == "emit_pipeline":
+    if pallas_loop_type in ("emit_pipeline", "outer_pipeline"):
         return _codegen_emit_pipeline(state)
     if pallas_loop_type == "fori_loop":
         return _codegen_fori_loop(state)
@@ -253,7 +256,7 @@ def _(state: CodegenState) -> None:
     """Emit inner stepped device loops for Pallas/TPU."""
     config = state.config
     pallas_loop_type = config.get("pallas_loop_type", "unroll")
-    if pallas_loop_type == "emit_pipeline":
+    if pallas_loop_type in ("emit_pipeline", "outer_pipeline"):
         _codegen_emit_pipeline(state)
         return None
     if pallas_loop_type == "fori_loop":
@@ -1436,12 +1439,61 @@ def _(state: CodegenState) -> ast.AST:
     )
 
 
+def _rewrite_program_id_to_pipeline_indices(node: ast.AST) -> ast.AST:
+    """Rewrite ``pl.program_id(N)`` calls into ``_pipeline_indices[N]``.
+
+    Used by the ``outer_pipeline`` lowering to lift outer-grid body
+    statements into the inner pipeline body (where outer grid indices
+    arrive as ``_pipeline_indices[g]`` rather than as program_ids).
+    """
+
+    class _Rewriter(ast.NodeTransformer):
+        def visit_Call(self, n: ast.Call) -> ast.AST:
+            self.generic_visit(n)
+            func = n.func
+            # Match ``pl.program_id(<int>)``.
+            if (
+                isinstance(func, ast.Attribute)
+                and isinstance(func.value, ast.Name)
+                and func.value.id == "pl"
+                and func.attr == "program_id"
+                and len(n.args) == 1
+            ):
+                arg = n.args[0]
+                if isinstance(arg, ast.Constant) and isinstance(arg.value, int):
+                    idx = arg.value
+                else:
+                    # Bail out: leave non-constant program_id calls alone.
+                    return n
+                # Construct ``_pipeline_indices[idx]``.
+                return ast.copy_location(
+                    ast.Subscript(
+                        value=ast.Name(id="_pipeline_indices", ctx=ast.Load()),
+                        slice=ast.Constant(value=idx),
+                        ctx=ast.Load(),
+                    ),
+                    n,
+                )
+            return n
+
+    return ast.fix_missing_locations(_Rewriter().visit(node))
+
+
 def _codegen_emit_pipeline(state: CodegenState) -> object:
     """Emit inner device loops using pltpu.emit_pipeline.
 
     Handles both simple load->compute->store pipelines and loops with
     loop-carried state (accumulators, running max/sum) by converting
     the state into scratch VMEM buffers.
+
+    When ``pallas_loop_type='outer_pipeline'``, additionally folds the
+    surrounding outer ``hl.grid`` axes into the emit_pipeline grid as
+    leading dims.  The outer ``hl.grid`` body statements (recorded so
+    far in the host pallas_call body) are moved into the pipeline body
+    with ``pl.program_id(g)`` references rewritten to
+    ``_pipeline_indices[g]``, and the host pallas_call grid becomes
+    ``()``.  This eliminates the cross-program DMA prologue and matches
+    the canonical ``pltpu.emit_pipeline``-driven Pallas pattern.
     """
     from .._compiler.device_ir import ForLoopGraphInfo
     from .._compiler.generate_ast import GenerateAST
@@ -1455,6 +1507,23 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
 
     block_ids = graph_info.block_ids
     env = CompileEnvironment.current()
+
+    _outer_pipeline = state.config.get("pallas_loop_type") == "outer_pipeline"
+
+    # In outer_pipeline mode, capture the device-function body statements
+    # emitted by the outer ``hl.grid`` so far.  They will be lifted into
+    # the pipeline body (with ``pl.program_id(g)`` rewritten to
+    # ``_pipeline_indices[g]``) so the outer grid axes can run inside the
+    # single emit_pipeline.
+    #
+    # Snapshot index 0 means "lift everything currently in the device
+    # function body" — appropriate when this is the first emit_pipeline
+    # in the kernel.  Statements that are pure host setup (e.g. constant
+    # lifts) and don't reference the outer pid will become no-ops inside
+    # the pipeline body but still execute correctly.  A future refinement
+    # can be more selective (lift only statements that transitively
+    # depend on ``pl.program_id``).
+    _outer_body_snapshot_len = 0 if _outer_pipeline else 0
 
     args = state.ast_args[-1]
     assert isinstance(args, list)
@@ -1500,22 +1569,36 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
 
     _bid_to_pid_var: dict[int, str] = {}
     device_fn = _DF.current()
+
+    # Collect outer-grid block_ids and grid-extent expressions for
+    # outer_pipeline mode.  In standard mode these are captured as closure
+    # ``pl.program_id`` values; in outer_pipeline mode they become leading
+    # axes of the emit_pipeline grid (lambda parameters).
+    _outer_block_ids: list[int] = []
+    _outer_grid_extents: list[str] = []
     if device_fn.pid is not None:
         for g, pid in enumerate(device_fn.pid.pid_info):
-            pid_var = f"_outer_pid_{g}"
-            state.add_statement(
-                statement_from_string(f"{pid_var} = pl.program_id({g})")
-            )
-            _bid_to_pid_var[pid.block_id] = pid_var
+            if _outer_pipeline:
+                # Lambda parameter — outer dim ``g``, name kept stable so
+                # all BlockSpec lambdas in this pipeline agree.
+                _bid_to_pid_var[pid.block_id] = f"_outer_idx_{g}"
+                _outer_block_ids.append(pid.block_id)
+                _outer_grid_extents.append(pid.num_pids_expr(is_device=True))
+            else:
+                pid_var = f"_outer_pid_{g}"
+                state.add_statement(
+                    statement_from_string(f"{pid_var} = pl.program_id({g})")
+                )
+                _bid_to_pid_var[pid.block_id] = pid_var
 
     def _make_block_spec(
         fake: torch.Tensor, subscript_meta: list[object], is_store: bool = False
     ) -> str:
         """Build a BlockSpec string for a tensor accessed in the pipeline body.
 
-        Encodes BOTH outer grid dims (via pl.program_id) and inner pipeline
-        dims into the BlockSpec lambda, so the full HBM tensor can be passed
-        without pre-slicing.
+        Encodes BOTH outer grid dims (via pl.program_id, or via lambda
+        parameters in outer_pipeline mode) and inner pipeline dims into
+        the BlockSpec lambda.
         """
         dim_to_bid = _get_dim_block_ids(subscript_meta, env)
         shape = fake.shape
@@ -1523,6 +1606,16 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
         lambda_parts: list[str] = []
         lambda_params: list[str] = []
 
+        # In outer_pipeline mode, the lambda receives ``_pipeline_indices``
+        # for the merged grid (outer dims first, then inner dims).
+        # The outer pid mapping (in ``_bid_to_pid_var``) already points
+        # at the right ``_pipeline_indices[g]``, so we just need lambda
+        # parameters for the inner dims.  Total lambda arity is
+        # ``len(_outer_block_ids) + len(block_ids)`` so the call site is
+        # compatible with emit_pipeline's grid tuple.
+        n_outer = len(_outer_block_ids) if _outer_pipeline else 0
+        for i in range(n_outer):
+            lambda_params.append(f"_outer_idx_{i}")
         for i, _bid in enumerate(block_ids):
             param = f"_j{i}" if len(block_ids) > 1 else "_j"
             lambda_params.append(param)
@@ -1773,11 +1866,15 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
         block_size_vars,
         begin_exprs,
         iter_step_exprs,
-        [f"_pipeline_indices[{i}]" for i in range(len(block_ids))],
+        [
+            f"_pipeline_indices[{(len(_outer_block_ids) if _outer_pipeline else 0) + i}]"
+            for i in range(len(block_ids))
+        ],
         env,
         body_stmts,
     )
     # Set up mask variables for inner-loop block_ids (non-divisible bounds).
+    _n_outer = len(_outer_block_ids) if _outer_pipeline else 0
     _setup_inner_loop_masks(
         state,
         strategy,
@@ -1787,7 +1884,7 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
         body_stmts,
         # emit_pipeline passes indices as a single tuple arg
         offset_expr_fn=lambda i, bs: (
-            f"_pipeline_indices[{i}] * {bs} + jnp.arange({bs})"
+            f"_pipeline_indices[{_n_outer + i}] * {bs} + jnp.arange({bs})"
         ),
     )
 
@@ -1804,7 +1901,7 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
             body_stmts.append(
                 statement_from_string(
                     f"{offset_name} = ({begin_exprs[i]}) + "
-                    f"(_pipeline_indices[{i}]) * ({iter_step_exprs[i]})"
+                    f"(_pipeline_indices[{_n_outer + i}]) * ({iter_step_exprs[i]})"
                 )
             )
 
@@ -1852,10 +1949,50 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
     fn_args = "_pipeline_indices, " + ", ".join(all_body_params)
     fn_def = statement_from_string(f"def {body_fn_name}({fn_args}): pass")
     assert isinstance(fn_def, ast.FunctionDef)
-    fn_def.body = body_stmts or [ast.Pass()]  # pyrefly: ignore[bad-assignment]
 
-    # Build the emit_pipeline call
-    grid_str = ", ".join(grid_parts)
+    # In outer_pipeline mode, move outer-grid body statements (captured at
+    # entry) into the pipeline body and rewrite any ``pl.program_id(g)``
+    # references to ``_pipeline_indices[g]``.
+    prologue_stmts: list[ast.AST] = []
+    if _outer_pipeline:
+        # Lift ALL statements emitted so far on this nested
+        # ``set_statements`` scope (the outer hl.grid body) into the
+        # pipeline body.  The outer-grid pid setup statements
+        # (``pid_0 = pl.program_id(0)``, ``offset_0 = pid_0``) live one
+        # level up in ``device_function.body`` and must also be lifted /
+        # rewritten — see the ``device_function.body`` cleanup below.
+        host_body = state.codegen.statements_stack[-1]
+        lifted = list(host_body)
+        host_body.clear()
+
+        # Pull the pid-setup statements out of device_function.body too.
+        # They were prepended/appended by ``tile_strategy.codegen_grid``
+        # before this nested scope was entered.  In outer_pipeline mode
+        # ``EmptyGridProgramIDs`` will replace them at the host level.
+        outer_body = device_fn.body
+        outer_lifted = list(outer_body)
+        outer_body.clear()
+
+        prologue_stmts = [
+            _rewrite_program_id_to_pipeline_indices(s)
+            for s in outer_lifted + lifted
+        ]
+
+    fn_def.body = (prologue_stmts + body_stmts) or [ast.Pass()]  # pyrefly: ignore[bad-assignment]
+
+    # Build the emit_pipeline call.  In outer_pipeline mode the outer
+    # ``hl.grid`` axes are folded into the leading dims of this grid.
+    # The inner-tile grid extent is forced to 1 (a single BoundedSlice)
+    # because outer_pipeline only supports patterns where the inner tile
+    # spans the entire jagged range — otherwise the inner extent would
+    # depend on data flowing through the pipeline body, which can't be
+    # referenced from the host-level emit_pipeline grid tuple.
+    if _outer_pipeline:
+        inner_grid_parts = ["1"] * len(grid_parts)
+        grid_parts_combined = _outer_grid_extents + inner_grid_parts
+    else:
+        grid_parts_combined = grid_parts
+    grid_str = ", ".join(grid_parts_combined)
     in_specs_str = ", ".join(in_specs) if in_specs else ""
     out_specs_str = ", ".join(out_specs) if out_specs else ""
 
@@ -1883,6 +2020,15 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
     # Emit the function def and pipeline call into the current scope
     state.add_statement(fn_def)
     state.add_statement(statement_from_string(pipeline_call_str))
+
+    # In outer_pipeline mode, the host pallas_call grid becomes ()
+    # because the outer ``hl.grid`` is now an axis of the emit_pipeline
+    # grid.  Swap in an ``EmptyGridProgramIDs`` so the launcher launches
+    # with grid=() and no host-level program_id machinery is emitted.
+    if _outer_pipeline:
+        from .._compiler.program_id import EmptyGridProgramIDs
+
+        device_fn.pid = EmptyGridProgramIDs()
 
     # After pipeline: read final loop-carried state from scratch
     if has_loop_state:

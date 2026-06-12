@@ -557,6 +557,23 @@ class FlatProgramIDs(ProgramIDs):
         return expr_from_string(f"({self.total_pids_expr(is_device=False)},)")
 
 
+class EmptyGridProgramIDs(ProgramIDs):
+    """Single-program pallas_call with grid=().
+
+    Used by the ``outer_pipeline`` lowering (and any other Pallas mode
+    that fans out work via ``pltpu.emit_pipeline`` rather than the
+    pallas_call grid itself).  ``codegen_grid`` returns the literal
+    ``()`` expression and ``codegen`` is a no-op, since no host-level
+    program_id machinery is needed.
+    """
+
+    def codegen(self, state: CodegenState) -> None:
+        return None
+
+    def codegen_grid(self) -> ast.AST:
+        return expr_from_string("()")
+
+
 class CuteProgramIDs(FlatProgramIDs):
     """Flat PID strategy for CuTe pointwise kernels."""
 

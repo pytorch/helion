@@ -1534,6 +1534,7 @@ class PallasBackend(Backend):
             "_default_pallas_launcher": "from helion.runtime import default_pallas_launcher as _default_pallas_launcher",
             "_default_pallas_pipeline_launcher": "from helion.runtime import default_pallas_pipeline_launcher as _default_pallas_pipeline_launcher",
             "_default_pallas_fori_launcher": "from helion.runtime import default_pallas_fori_launcher as _default_pallas_fori_launcher",
+            "_default_pallas_outer_pipeline_launcher": "from helion.runtime import default_pallas_outer_pipeline_launcher as _default_pallas_outer_pipeline_launcher",
         }
 
     # Config keys that Pallas actually uses.  Everything else
@@ -2431,7 +2432,7 @@ class PallasBackend(Backend):
 
         # Pass scratch shapes for pipeline/fori_loop launcher
         pallas_loop_type = config.get("pallas_loop_type", "unroll")
-        if pallas_loop_type in ("emit_pipeline", "fori_loop"):
+        if pallas_loop_type in ("emit_pipeline", "fori_loop", "outer_pipeline"):
             scratch_shapes = [
                 (
                     s.shape,
@@ -2493,6 +2494,15 @@ class PallasBackend(Backend):
             return "_default_pallas_pipeline_launcher"
         if pallas_loop_type == "fori_loop":
             return "_default_pallas_fori_launcher"
+        if pallas_loop_type == "outer_pipeline":
+            # Outer-pipeline lowering generates a single pallas_call program
+            # (grid=()) whose body invokes pltpu.emit_pipeline over the outer
+            # ``hl.grid``.  This is significantly faster than the standard
+            # emit_pipeline lowering (which runs one program per outer grid
+            # iteration) because emit_pipeline pipelines DMAs across all
+            # iterations in a single schedule.  The launcher mirrors
+            # ``default_pallas_pipeline_launcher`` but launches with grid=().
+            return "_default_pallas_outer_pipeline_launcher"
         return self.default_launcher_name
 
     def get_launcher_name(self) -> str:
