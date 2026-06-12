@@ -2515,6 +2515,10 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
         device_ir.register_rollable_reductions()
         config_spec = CompileEnvironment.current().config_spec
         config_spec.raise_grid_block_minimums()
+        if not CompileEnvironment.current().settings.disable_autotuner_heuristics:
+            # Perf heuristic (not a validity constraint): keep it under the same
+            # opt-out as the compiler seed heuristics.
+            config_spec.raise_attention_block_minimums()
         if len(device_ir.root_ids) > 1:
             # xyz is not supported with shared program IDs. Non-tcgen05
             # persistent kernels are allowed; tcgen05 persistent has a
