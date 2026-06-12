@@ -717,6 +717,35 @@ def tcgen05_default_epilogue_tile_expr(
     )
 
 
+def tcgen05_two_cta_m128_epilogue_tile_expr(
+    bm: int, bn: int, elem_dtype: str, *, c_layout: str
+) -> str:
+    """Epilogue tile for the bm=128 CtaGroup.TWO family (per-CTA tile 64xbn).
+
+    The bm=256 2-CTA path and the bm=128 1-CTA path both build the epilogue
+    tile from the full ``(bm, bn)`` shape, where the per-CTA and full-CTA
+    conventions produce identical tiles, so the legacy form is kept there for
+    golden-output stability; at bm=128 they diverge: the per-CTA tile m of 64
+    selects the 2-CTA ``(2, 2)`` epilogue warp grid, whose tile is **N-mode
+    permuted** (e.g. ``[64:1;(16,2):(1,64)]``). Every consumer of this tile --
+    the matmul-plan ``tcgen05_epi_tile``, the store-side
+    ``tcgen05_store_epi_tile``, the SMEM staging layouts, and the host-side
+    TMA store atom in ``helion/runtime/__init__.py`` -- must use this same
+    expression; building any of them from a plain ``(m, n)`` tile silently
+    permutes the output through SMEM (wrong values + torn bf16 pairs).
+
+    The no-source form (no ``elem_ty_c``) is deliberate: this family has no
+    residual-C epilogue input, and the with-source sizing would halve
+    ``tile_n`` (32 vs 64), doubling epilogue iterations for nothing
+    (~4% measured on the 512x6144x2048 fp8 scaled_mm shape).
+    """
+    assert bm == 128, bm
+    return (
+        "cutlass.utils.blackwell_helpers.compute_epilogue_tile_shape("
+        f"({bm // 2}, {bn}), True, {c_layout}, {elem_dtype})"
+    )
+
+
 def tcgen05_explicit_d_store_tile_expr(tile_m: int, d_store_box_n: int) -> str:
     """Return the CuTe expression for a validated explicit D-store box.
 
