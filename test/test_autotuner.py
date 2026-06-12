@@ -2424,19 +2424,18 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         mutated_clones = [0]
         non_mutated_clones = [0]
 
-        original_clone = torch.Tensor.clone
+        original_copy = torch.Tensor.copy_
 
-        def tracking_clone(self, *args, **kwargs):
-            result = original_clone(self, *args, **kwargs)
-            if self.data_ptr() in mutated_ptrs:
-                mutated_ptrs.add(result.data_ptr())
+        def tracking_copy(self, src, **kwargs):
+            original_copy(self, src, **kwargs)
+            if src.data_ptr() in mutated_ptrs:
+                mutated_ptrs.add(self.data_ptr())
                 mutated_clones[0] += 1
-            if self.data_ptr() in non_mutated_ptrs:
-                non_mutated_ptrs.add(result.data_ptr())
+            if src.data_ptr() in non_mutated_ptrs:
+                non_mutated_ptrs.add(self.data_ptr())
                 non_mutated_clones[0] += 1
-            return result
 
-        with patch.object(torch.Tensor, "clone", tracking_clone):
+        with patch.object(torch.Tensor, "copy_", tracking_copy):
             inplace_add(a, b, epsilon, out)
 
         # Mutated tensor (out) should be cloned during baseline AND benchmarking:
@@ -2458,6 +2457,40 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         )
 
         expected = torch.full([128], 3.0, device=DEVICE) + epsilon
+        torch.testing.assert_close(out, expected)
+
+    def test_autotune_non_dense_tensor_cloning(self) -> None:
+        """
+        During autotune benchmarking, the cloned arg should retain
+        storage layout for non dense mutated input.
+        """
+
+        config1 = helion.Config(block_sizes=[32], num_warps=4)
+        config2 = helion.Config(block_sizes=[64], num_warps=4)
+
+        @helion.kernel(configs=[config1, config2], autotune_log_level=0)
+        def inplace_add(
+            a: torch.Tensor,
+            b: torch.Tensor,
+            epsilon: float,
+            out: torch.Tensor,
+        ):
+            # This kernel requires out tensor with padding
+            assert out.stride(0) == 2
+            for tile in hl.tile(out.size()):
+                out[tile] += a[tile] + b[tile] + epsilon
+
+        a = torch.full([128], 1.0, device=DEVICE)
+        b = torch.full([128], 2.0, device=DEVICE)
+        epsilon = 1e-6
+        out_dense = torch.zeros([256], device=DEVICE)
+        out = out_dense[::2]  # shape [128], stride [2], non-dense
+
+        # Run autotuning
+        inplace_add(a, b, epsilon, out)
+
+        # assertion inside the testing kernel should not fail
+        expected = torch.full([128], 3.0 + epsilon, device=DEVICE)
         torch.testing.assert_close(out, expected)
 
     @skipIfXPU("CUDA specific API used to check memory usage")
