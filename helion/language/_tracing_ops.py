@@ -17,6 +17,7 @@ from .._compiler.ast_extension import create
 from .._compiler.ast_extension import expr_from_string
 from .._compiler.ast_extension import statement_from_string
 from .._compiler.compile_environment import CompileEnvironment
+from .._compiler.device_function import find_block_size_symbols
 from .._compiler.dtype_utils import cast_ast
 from .._compiler.host_function import HostFunction
 from .._compiler.variable_origin import BlockSizeOrigin
@@ -520,6 +521,44 @@ def _scratch_write_stmt(state: CodegenState, sname: str, val: ast.AST) -> ast.AS
     return statement_from_string(f"{sname}[{idx}] = {{val}}", val=val)
 
 
+def _resolve_dim_size(
+    s: object,
+    env: CompileEnvironment,
+    config: Config,
+) -> int | None:
+    """Resolve a tensor-dim size to a concrete int from ``config``, else ``None``.
+
+    Handles a single tile dim via ``resolve_block_id`` and ``reshape``-merged
+    dims (a sympy product/sum/power of block symbols) by substituting each block
+    size. The ``int(s)`` fallback would otherwise return the full-extent size
+    hint and over-size loop-carried scratch.
+    """
+    bid = env.resolve_block_id(s)
+    if bid is not None:
+        bs = env.block_sizes[bid].from_config(config)
+        return bs if isinstance(bs, int) else None
+
+    if isinstance(s, int):
+        return s
+    expr = s._sympy_() if isinstance(s, torch.SymInt) else s
+    if not isinstance(expr, sympy.Expr):
+        return None
+    if expr.is_Integer:
+        return int(expr)
+
+    block_mapping, non_block_symbols = find_block_size_symbols(expr)
+    if non_block_symbols:
+        return None
+    subs: dict[sympy.Symbol, sympy.Integer] = {}
+    for symbol, block_id in block_mapping.items():
+        bs = env.block_sizes[block_id].from_config(config)
+        if not isinstance(bs, int):
+            return None
+        subs[symbol] = sympy.Integer(bs)
+    resolved = expr.xreplace(subs)
+    return int(resolved) if resolved.is_Integer else None
+
+
 def _resolve_shape(
     proxy: torch.Tensor,
     env: CompileEnvironment,
@@ -528,11 +567,9 @@ def _resolve_shape(
     """Resolve symbolic tile sizes to concrete block sizes from config."""
     resolved = []
     for s in proxy.shape:
-        bid = env.resolve_block_id(s)
-        if bid is not None:
-            bs = env.block_sizes[bid].from_config(config)
-            assert isinstance(bs, int)
-            resolved.append(bs)
+        size = _resolve_dim_size(s, env, config)
+        if size is not None:
+            resolved.append(size)
         else:
             resolved.append(int(s))
     return tuple(resolved)
