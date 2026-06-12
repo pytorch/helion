@@ -116,21 +116,23 @@ class AutotuningLogger:
 
     @contextlib.contextmanager
     def autotune_logging(
-        self, base_path: str | None = None, metadata: KernelMetadata | None = None
+        self,
+        base_path: str | None = None,
+        metadata: KernelMetadata | None = None,
+        collect_dataset: bool = False,
     ) -> Iterator[AutotuneLogSink | None]:
         """Attach an :class:`AutotuneLogSink` for the duration of a tuning run.
 
-        When ``metadata`` is provided, the kernel identity (source, shapes,
-        dtypes, hardware, settings) is appended as one record to the
-        ``<base>.meta.jsonl`` sidecar so the per-config CSV rows can be joined
-        back to it via ``run_id``.
+        ``<base>.csv``/``.log`` are written whenever a log path is set. With
+        ``collect_dataset`` and ``metadata``, a ``<base>.meta.jsonl`` record
+        (identity + configs) is also written at run end, joined via ``run_id``.
         """
 
         path = base_path or self._settings.autotune_log
         if not path:
             yield None
             return
-        with AutotuneLogSink(path, metadata) as sink:
+        with AutotuneLogSink(path, metadata, collect_dataset) as sink:
             self._attach_sink(sink)
             sink.start_run()
             try:
@@ -139,22 +141,20 @@ class AutotuningLogger:
                 sink.end_run()
                 self._detach_sink()
 
-    @property
-    def recording(self) -> bool:
-        """True when an autotune log sink is attached (telemetry is collected).
-
-        Lets callers skip building/serializing log entries (e.g. minimizing the
-        config) when telemetry is disabled — purely an optimization; the entry
-        path no-ops without a sink regardless.
-        """
-        return self._log_sink is not None
-
     def record_autotune_entry(self, entry: AutotuneLogEntry) -> None:
         """Write a structured autotune log entry when a sink is active."""
 
         if self._log_sink is None:
             return
         self._log_sink.record(entry)
+
+    def register_config(self, config: Config) -> str | None:
+        """Return the content-addressed ``config_id`` (registering it on the sink
+        for the ``.meta.jsonl`` record), or ``None`` when no sink is active."""
+
+        if self._log_sink is None:
+            return None
+        return self._log_sink.register_config(config)
 
     def _attach_sink(self, sink: AutotuneLogSink) -> None:
         self._log_sink = sink
@@ -279,7 +279,7 @@ class AutotuneLogEntry(NamedTuple):
     status: str
     perf_ms: float | None
     compile_time: float | None
-    config: Config
+    config_id: str
 
 
 class AutotuneLogSink:
@@ -287,17 +287,25 @@ class AutotuneLogSink:
     Writes autotune results to CSV and connects autotune logs to a file handler.
     """
 
-    def __init__(self, base_path: str, metadata: KernelMetadata | None = None) -> None:
+    def __init__(
+        self,
+        base_path: str,
+        metadata: KernelMetadata | None = None,
+        collect_dataset: bool = False,
+    ) -> None:
         self._base_path = Path(base_path)
         self.csv_path = self._base_path.with_suffix(".csv")
         self.log_path = self._base_path.with_suffix(".log")
         self.meta_path = self._base_path.with_suffix(".meta.jsonl")
         self._metadata = metadata
+        self._collect_dataset = collect_dataset
         self._csv_file: io.TextIOWrapper | None = None
         self._csv_writer: CsvWriter | None = None
         self._log_handler: logging.FileHandler | None = None
         self._run_start_time: float | None = None
-        self._config_counter: int = 0
+        # config_id -> full config; flushed to the .meta.jsonl record at end_run.
+        # Populated only when collecting the dataset; identical configs collapse.
+        self._configs: dict[str, dict[str, object]] = {}
 
     def __enter__(self) -> Self:
         self.open()
@@ -316,18 +324,8 @@ class AutotuneLogSink:
             return
         self.csv_path.parent.mkdir(parents=True, exist_ok=True)
         self.log_path.parent.mkdir(parents=True, exist_ok=True)
-        if self._metadata is not None:
-            # Append one identity record (JSON Lines) per run so a single log
-            # path can accumulate every (kernel, input shape) autotuned in the
-            # process without clobbering earlier runs. CSV rows join back to
-            # these records via run_id. default=str keeps the dump JSON-safe when
-            # settings carry non-serializable values (torch.dtype, enums, callables).
-            with self.meta_path.open("a", encoding="utf-8") as meta_file:
-                meta_file.write(
-                    json.dumps(self._metadata.to_dict(), default=str) + "\n"
-                )
-        # Append rather than truncate so multiple autotune runs sharing one base
-        # path accumulate; write the header only for a new or empty file.
+        # Append so runs sharing one base path accumulate; header only for a new
+        # or empty file. The .meta.jsonl record is written at end_run.
         write_header = not self.csv_path.exists() or self.csv_path.stat().st_size == 0
         self._csv_file = self.csv_path.open("a", encoding="utf-8", newline="")
         self._csv_writer = csv.writer(self._csv_file)
@@ -336,12 +334,11 @@ class AutotuneLogSink:
                 [
                     "run_id",
                     "timestamp_s",
-                    "config_index",
+                    "config_id",
                     "generation",
                     "status",
                     "perf_ms",
                     "compile_time_s",
-                    "config",
                 ]
             )
             self._csv_file.flush()
@@ -360,20 +357,41 @@ class AutotuneLogSink:
             self._log_handler.close()
         self._log_handler = None
         self._run_start_time = None
-        self._config_counter = 0
+        self._configs = {}
 
     def start_run(self) -> None:
         self._run_start_time = time.perf_counter()
-        self._config_counter = 0
+        self._configs = {}
 
     def end_run(self) -> None:
+        # Append the per-run record (identity + configs map) once every config is
+        # known. default=str keeps it JSON-safe for non-serializable settings
+        # (torch.dtype, enums, callables). CSV rows join via run_id + config_id.
+        if self._collect_dataset and self._metadata is not None:
+            record = {**self._metadata.to_dict(), "configs": self._configs}
+            with self.meta_path.open("a", encoding="utf-8") as meta_file:
+                meta_file.write(json.dumps(record, default=str) + "\n")
         self._run_start_time = None
-        self._config_counter = 0
+        self._configs = {}
+
+    def register_config(self, config: Config) -> str | None:
+        """Return a stable ``config_id`` for ``config``: ``sha256`` of the
+        canonical config JSON (sorted keys, compact), 16 hex chars -- the same
+        config always maps to the same id (the CSV<->record join key). Returns
+        ``None`` when the sink is not open. When collecting the dataset, the config
+        is stored under its id for the .meta.jsonl record (identical ids collapse).
+        """
+        if self._csv_writer is None:
+            return None
+        canonical = json.dumps(config.config, sort_keys=True, separators=(",", ":"))
+        config_id = hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:16]
+        if self._collect_dataset:
+            self._configs[config_id] = config.config
+        return config_id
 
     def record(self, entry: AutotuneLogEntry) -> None:
         if self._csv_writer is None:
             return
-        self._config_counter += 1
         timestamp_field = ""
         if self._run_start_time is not None:
             timestamp = time.perf_counter() - self._run_start_time
@@ -384,21 +402,17 @@ class AutotuneLogSink:
         compile_field = ""
         if entry.compile_time is not None:
             compile_field = f"{entry.compile_time:.2f}"
-        # run_id joins each row to exactly one .meta.jsonl record (kernel +
-        # input shape/dtype/hardware).
+        # run_id joins the row to its .meta.jsonl record; config_id to its config.
         run_id = self._metadata.run_id if self._metadata is not None else ""
         self._csv_writer.writerow(
             [
                 run_id,
                 timestamp_field,
-                self._config_counter,
+                entry.config_id,
                 entry.generation,
                 entry.status,
                 perf_field,
                 compile_field,
-                # Compact JSON (not Config.to_json()'s indent=2) keeps each CSV
-                # cell on one line; round-trips via Config.from_json.
-                json.dumps(entry.config.config, separators=(",", ":")),
             ]
         )
         if self._csv_file is not None:

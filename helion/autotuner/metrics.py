@@ -109,12 +109,6 @@ class KernelMetadata:
     dtypes: str = ""
     hardware: str = ""
     settings: dict[str, object] | None = None
-    # Full default config (all knobs at their ConfigSpec defaults) for this run.
-    # Per-config rows store the *minimized* config (defaults dropped); a consumer
-    # reconstructs the config as benchmarked via {**config_defaults, **row_config}.
-    # Stored once per run because the defaults depend on the compiled kernel and
-    # are not derivable from kernel_source alone.
-    config_defaults: dict[str, object] | None = None
     run_id: str = ""
 
     def __post_init__(self) -> None:
@@ -143,5 +137,4 @@ class KernelMetadata:
             "dtypes": self.dtypes,
             "hardware": self.hardware,
             "settings": self.settings,
-            "config_defaults": self.config_defaults,
         }
