@@ -67,6 +67,47 @@ def fp8e4m3fn_to_float32(
 
 
 @dsl_user_op
+def fp8e4m3fn_x2_to_float32(
+    value: object,
+    *,
+    loc: ir.Location | None = None,
+    ip: ir.InsertionPoint | None = None,
+) -> tuple[Float32, Float32]:
+    """Decode two packed e4m3 fp8 bytes (low 16 bits) to (lo_f32, hi_f32).
+
+    Uses a single ``cvt.rn.f16x2.e4m3x2`` to convert both bytes at once, which
+    is ~2x cheaper than two scalar ``fp8e4m3fn_to_float32`` calls.
+    """
+    value_i16 = _as_i16(value, loc=loc, ip=ip)
+    result = llvm.inline_asm(
+        llvm.StructType.get_literal(  # pyrefly: ignore[missing-attribute]
+            [Float32.mlir_type, Float32.mlir_type]
+        ),
+        [value_i16],
+        """
+        {
+          .reg .b16 v_lo, v_hi;
+          .reg .b32 v_h2;
+          cvt.rn.f16x2.e4m3x2 v_h2, $2;
+          mov.b32 {v_lo, v_hi}, v_h2;
+          cvt.f32.f16 $0, v_lo;
+          cvt.f32.f16 $1, v_hi;
+        }
+        """,
+        "=f,=f,h",
+        has_side_effects=False,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+    return (
+        Float32(llvm.extractvalue(Float32.mlir_type, result, [0], loc=loc, ip=ip)),
+        Float32(llvm.extractvalue(Float32.mlir_type, result, [1], loc=loc, ip=ip)),
+    )
+
+
+@dsl_user_op
 def float4_e2m1fn_x2_to_float32(
     value: object,
     *,
