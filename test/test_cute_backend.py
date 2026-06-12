@@ -1319,6 +1319,56 @@ class TestCuteBackend(TestCase):
         self.assertIn("(2, 1, 1)", code)  # cluster_m=2
         self.assertIn("StaticPersistentTileScheduler", code)
 
+    def test_matmul_mma_tcgen05_fp8_deep_ab_staging_6(self) -> None:
+        """Test FP8 with ab_stages=6 (mid-depth staging)."""
+        support = get_cute_mma_support()
+        if not support.tcgen05_f8:
+            self.skipTest("tcgen05 FP8 MMA is not supported on this machine")
+
+        torch.manual_seed(0)
+        x = (torch.randn(512, 1024, device=DEVICE) * 0.4).to(torch.float8_e4m3fn)
+        y = (torch.randn(1024, 1024, device=DEVICE) * 0.4).to(torch.float8_e4m3fn)
+        # cluster_m=2 requires a persistent pid_type; block_m=256 engages the
+        # validated two-CTA role-local path.
+        code, out = code_and_output(
+            cute_matmul_mma_fp8,
+            (x, y),
+            block_sizes=[256, 128, 64],
+            tcgen05_ab_stages=6,
+            tcgen05_cluster_m=2,
+            pid_type="persistent_blocked",
+        )
+        ref = x.float() @ y.float()
+        torch.testing.assert_close(out.float(), ref, atol=1.0, rtol=1e-1)
+        # Verify deep staging config is in generated code
+        self.assertIn("cutlass.Float8E4M3FN", code)
+        self.assertIn("cute.nvgpu.tcgen05", code)
+
+    def test_matmul_mma_tcgen05_fp8_deep_ab_staging_8(self) -> None:
+        """Test FP8 with ab_stages=8 (sweet spot from benchmarks)."""
+        support = get_cute_mma_support()
+        if not support.tcgen05_f8:
+            self.skipTest("tcgen05 FP8 MMA is not supported on this machine")
+
+        torch.manual_seed(0)
+        x = (torch.randn(256, 1024, device=DEVICE) * 0.4).to(torch.float8_e4m3fn)
+        y = (torch.randn(1024, 1024, device=DEVICE) * 0.4).to(torch.float8_e4m3fn)
+        # cluster_m=2 requires a persistent pid_type; block_m=256 engages the
+        # validated two-CTA role-local path.
+        code, out = code_and_output(
+            cute_matmul_mma_fp8,
+            (x, y),
+            block_sizes=[256, 128, 64],
+            tcgen05_ab_stages=8,
+            tcgen05_cluster_m=2,
+            pid_type="persistent_blocked",
+        )
+        ref = x.float() @ y.float()
+        torch.testing.assert_close(out.float(), ref, atol=1.0, rtol=1e-1)
+        # Verify deep staging is used
+        self.assertIn("cutlass.Float8E4M3FN", code)
+        self.assertIn("cute.nvgpu.tcgen05", code)
+
     def test_matmul_dot_out_dtype_falls_back_from_mma(self) -> None:
         args = (
             torch.randn(16, 64, device=DEVICE, dtype=HALF_DTYPE),

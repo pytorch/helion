@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import ast
 import builtins
-from collections.abc import Iterable
 import contextlib
 import copy
 import dataclasses

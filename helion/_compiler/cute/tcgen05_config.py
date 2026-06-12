@@ -945,6 +945,105 @@ class CuteTcgen05Config:
             and block_sizes[1] == TCGEN05_TWO_CTA_BLOCK_N
         )
 
+    @staticmethod
+    def _get_dtype_ab_stages_hard_cap(dtype_bytes: int) -> int:
+        """Get hardware-validated maximum ab_stages for a dtype.
+
+        The maximum practical ab_stages depends on dtype size because
+        smaller dtypes fit more pipeline stages in the same SMEM budget:
+        - FP8 (1 byte): 12 stages - validated on B200, fits 2x bf16
+        - FP16/BF16 (2 bytes): 6 stages - TVM-FFI seed validated
+        - FP32 (4 bytes): 3 stages - baseline for larger dtypes
+
+        Args:
+            dtype_bytes: Size of data type in bytes
+
+        Returns:
+            Maximum ab_stages for this dtype, or 0 if invalid
+        """
+        if dtype_bytes <= 0:
+            return 0
+        if dtype_bytes == 1:  # FP8
+            return 12
+        if dtype_bytes == 2:  # FP16/BF16
+            return 6
+        # FP32 or larger
+        return 3
+
+    def max_ab_stages_that_fit(
+        self,
+        *,
+        bm: int,
+        bn: int,
+        bk: int,
+        cluster_m: int,
+        hard_cap: int | None = None,
+    ) -> int:
+        """Compute maximum ab_stages that fits in per-CTA SMEM budget.
+
+        Mirrors CUTLASS's ``_compute_stages``: fill SMEM with as many AB
+        pipeline stages as fit the hardware budget. Uses direct calculation
+        since SMEM usage scales linearly with ab_stages.
+
+        For FP8 (1-byte operands), this enables ~2x deeper staging than
+        BF16 (2-byte), which is critical for hiding K-loop TMA latency
+        in compute-bound kernels.
+
+        Args:
+            bm: Block size in M dimension
+            bn: Block size in N dimension
+            bk: Block size in K dimension
+            cluster_m: CTA cluster size (1 or 2)
+            hard_cap: Optional maximum stages override. If None, uses
+                dtype-specific default (12 for FP8, 6 for FP16, 3 for FP32)
+
+        Returns:
+            Maximum valid ab_stages in [1, hard_cap], or 0 if constraints
+            are unknown or configuration is invalid (e.g., ab_stages=1
+            doesn't fit budget).
+
+        Example:
+            >>> # FP8 256x256x64 cluster_m=2
+            >>> config.max_ab_stages_that_fit(bm=256, bn=256, bk=64, cluster_m=2)
+            8  # FP8 fits 8 stages
+
+            >>> # BF16 same tile (2x larger per stage)
+            >>> config.max_ab_stages_that_fit(bm=256, bn=256, bk=64, cluster_m=2)
+            4  # BF16 fits only 4 stages
+        """
+        constraints = self.ab_stages_three_search_constraints
+        if constraints is None or bm <= 0 or bn <= 0 or bk <= 0:
+            return 0
+        if cluster_m not in (1, 2):
+            return 0
+
+        # Calculate SMEM cost for ab_stages=1 (baseline)
+        bytes_per_stage = tcgen05_ab_smem_bytes_per_cta(
+            bm=bm,
+            bn=bn,
+            bk=bk,
+            dtype_bytes=constraints.dtype_bytes,
+            ab_stages=1,
+            cluster_m=cluster_m,
+        )
+
+        # Edge cases: invalid calculation or even ab_stages=1 doesn't fit
+        if bytes_per_stage <= 0:
+            return 0
+        if bytes_per_stage > constraints.per_cta_smem_budget_bytes:
+            return 0
+
+        # Direct calculation: SMEM usage scales linearly with ab_stages
+        # Solve: N * bytes_per_stage <= budget
+        max_from_budget = constraints.per_cta_smem_budget_bytes // bytes_per_stage
+
+        # Apply hard cap (dtype-specific default if not provided)
+        if hard_cap is None:
+            hard_cap = self._get_dtype_ab_stages_hard_cap(constraints.dtype_bytes)
+
+        # Return clamped value: at least 1, at most hard_cap or budget limit
+        return max(1, min(max_from_budget, hard_cap))
+
     def _fix_ab_stages_three_search_config(self, config: dict[str, object]) -> None:
         if self.ab_stages_three_search_constraints is None:
             return
@@ -1224,10 +1323,33 @@ class CuteTcgen05Config:
             )
         ):
             return
+        # FP8 (1-byte) operands fit a deeper AB pipeline than the bf16-tuned
+        # cap of 3; admit ab_stages > 3 for fp8 as long as the AB SMEM fits the
+        # per-CTA budget. This lets Helion emit the same deeply-pipelined
+        # CtaGroup.TWO kernel CUTLASS uses for fp8 compute-bound GEMMs.
+        constraints = self.ab_stages_three_search_constraints
+        if constraints is not None and constraints.dtype_bytes == 1:  # FP8
+            block_sizes = cast("list[int]", config.get("block_sizes"))
+            cluster_m = cast("int", config.get("tcgen05_cluster_m", 1))
+            if isinstance(block_sizes, list) and len(block_sizes) >= 3:
+                fit_max = self.max_ab_stages_that_fit(
+                    bm=block_sizes[0],
+                    bn=block_sizes[1],
+                    bk=block_sizes[2],
+                    cluster_m=cluster_m,
+                )
+                if fit_max > 0 and ab_stages <= fit_max:
+                    return
+                if fix_invalid and fit_max > 0:
+                    config["tcgen05_ab_stages"] = fit_max
+                    return
         if fix_invalid:
             config["tcgen05_ab_stages"] = 3
             return
-        raise InvalidConfig("tcgen05_ab_stages > 3 is not supported")
+        raise InvalidConfig(
+            "tcgen05_ab_stages > 3 is only supported by the validated "
+            "Target1 TVM-FFI seed (or fp8 within the SMEM budget)"
+        )
 
     def _is_validated_clc_persistence_search_candidate(
         self, config: dict[str, object]
@@ -1678,6 +1800,15 @@ class CuteTcgen05Config:
             # SEARCH stays capped at 3 (budget-aware) since the generalized seed
             # runs at ab=3 and deeper pipelines are not worth searching.
             ab_stages_max = 6 if self.full_tile_direct_entry_seed_eligible() else 3
+            # FP8 (1-byte) operands fit a deeper AB pipeline than the bf16-tuned
+            # cap; admit a frozen deep-staged fp8 config on the validation
+            # surface too (``_validate_target1_ab_stage_envelope`` clamps it to
+            # the actual per-CTA SMEM budget for the chosen block sizes).
+            constraints = self.ab_stages_three_search_constraints
+            if constraints is not None and constraints.dtype_bytes == 1:  # FP8
+                ab_stages_max = self._get_dtype_ab_stages_hard_cap(
+                    constraints.dtype_bytes
+                )
         elif self.ab_stages_three_search_constraints is not None:
             # Cycle 97: make ab=3 BUDGET-AWARE-SEARCHABLE. Where the device/dtype
             # admits ab=3 at all (the SMEM-budget constraints were recorded by
@@ -1689,6 +1820,15 @@ class CuteTcgen05Config:
             # cluster_m=1 256x256 overflows bare-AB) before codegen, so admission is
             # free but an overflowing kernel is never generated.
             ab_stages_max = 3
+            # FP8 (1-byte) operands fit a deeper AB pipeline; widen the
+            # validation range so an explicit deep-staged fp8 config is
+            # accepted (``_validate_target1_ab_stage_envelope`` clamps it to
+            # the actual per-CTA SMEM budget for the chosen block sizes).
+            constraints = self.ab_stages_three_search_constraints
+            if constraints is not None and constraints.dtype_bytes == 1:  # FP8
+                ab_stages_max = self._get_dtype_ab_stages_hard_cap(
+                    constraints.dtype_bytes
+                )
         else:
             ab_stages_max = 2
         if for_search:
