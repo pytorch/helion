@@ -74,6 +74,35 @@ def jagged_sum_kernel(
     return out
 
 
+@helion.kernel(
+    backend="pallas",
+    config=helion.Config(block_sizes=[8, 16], pallas_loop_type="emit_pipeline"),
+)
+def jagged_sum_kernel_pallas(
+    x_data: torch.Tensor,
+    x_offsets: torch.Tensor,
+) -> torch.Tensor:
+    """Pallas/TPU variant of :func:`jagged_sum_kernel`.
+
+    Reduces the jagged row range ``hl.tile(s, e)`` on the 2-D tensor instead of
+    the flattened gather, which TPU has no cheap lowering for.
+    """
+    num_rows = x_offsets.size(0) - 1
+    M = x_data.size(1)
+    out = torch.zeros([num_rows, M], dtype=x_data.dtype, device=x_data.device)
+
+    for g in hl.grid(num_rows):
+        s = x_offsets[g]
+        e = x_offsets[g + 1]
+        for tile_m in hl.tile(M):
+            acc = hl.zeros([tile_m], dtype=torch.float32)
+            for st in hl.tile(s, e):
+                acc = acc + x_data[st, tile_m].to(torch.float32).sum(dim=0)
+            out[g, tile_m] = acc.to(x_data.dtype)
+
+    return out
+
+
 # %%
 # Reference Implementation
 # ------------------------

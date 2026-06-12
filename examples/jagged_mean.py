@@ -83,6 +83,42 @@ def jagged_mean_kernel(
     return out
 
 
+@helion.kernel(
+    backend="pallas",
+    config=helion.Config(block_sizes=[8, 16], pallas_loop_type="emit_pipeline"),
+)
+def jagged_mean_kernel_pallas(
+    x_data: torch.Tensor,
+    x_offsets: torch.Tensor,
+    x_feature_counts: torch.Tensor,
+    max_M: int,
+) -> torch.Tensor:
+    """Pallas/TPU variant of :func:`jagged_mean_kernel`.
+
+    Reduces the jagged row range ``hl.tile(s, e)`` on the 2-D tensor; the
+    feature count masks the output. The lane extent comes from ``x_data.size(1)``
+    so the load stays in the pipelined DMA.
+    """
+    num_rows = x_offsets.size(0) - 1
+    M = x_data.size(1)
+    out = torch.zeros([num_rows, max_M], dtype=x_data.dtype, device=x_data.device)
+
+    for g in hl.grid(num_rows):
+        s = x_offsets[g]
+        e = x_offsets[g + 1]
+        nnz = (e - s).to(torch.float32)
+        fcount = x_feature_counts[g]
+        for tile_m in hl.tile(M):
+            acc = hl.zeros([tile_m], dtype=torch.float32)
+            for st in hl.tile(s, e):
+                acc = acc + x_data[st, tile_m].to(torch.float32).sum(dim=0)
+            mean = torch.where(nnz > 0, acc / nnz, 0.0)
+            valid = tile_m.index < fcount
+            out[g, tile_m] = torch.where(valid, mean, 0.0).to(x_data.dtype)
+
+    return out
+
+
 # %%
 # Reference Implementation
 # ------------------------

@@ -114,6 +114,44 @@ def jagged_softmax_kernel(
     return out.reshape(N, M)
 
 
+@helion.kernel(
+    backend="pallas",
+    config=helion.Config(block_sizes=[8, 16, 16, 16], pallas_loop_type="emit_pipeline"),
+)
+def jagged_softmax_kernel_pallas(
+    x_data: torch.Tensor,
+    x_offsets: torch.Tensor,
+) -> torch.Tensor:
+    """Pallas/TPU variant of :func:`jagged_softmax_kernel`.
+
+    Softmax over the jagged row axis per column, in three passes over
+    ``hl.tile(s, e)`` (max, sum-exp, normalized write) instead of the flattened
+    gather.
+    """
+    M = x_data.size(1)
+    num_rows = x_offsets.size(0) - 1
+    out = torch.empty_like(x_data)
+
+    for g in hl.grid(num_rows):
+        s = x_offsets[g]
+        e = x_offsets[g + 1]
+        for tile_m in hl.tile(M):
+            row_max = hl.full([tile_m], float("-inf"), dtype=torch.float32)
+            for st in hl.tile(s, e):
+                row_max = torch.maximum(
+                    row_max, x_data[st, tile_m].to(torch.float32).amax(dim=0)
+                )
+            denom = hl.zeros([tile_m], dtype=torch.float32)
+            for st in hl.tile(s, e):
+                shifted = x_data[st, tile_m].to(torch.float32) - row_max[None, :]
+                denom = denom + torch.exp(shifted).sum(dim=0)
+            for st in hl.tile(s, e):
+                shifted = x_data[st, tile_m].to(torch.float32) - row_max[None, :]
+                out[st, tile_m] = (torch.exp(shifted) / denom[None, :]).to(x_data.dtype)
+
+    return out
+
+
 # %%
 # Benchmark Wrapper
 # -----------------
