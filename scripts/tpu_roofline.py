@@ -1176,16 +1176,19 @@ def main() -> None:
     # Fail-loud guard: refuse to predict when the LLO almost certainly
     # under-reports the runtime trip count, unless the user has either
     # supplied --inner-loop-iters / --dynamic-bundles to compensate, or
-    # opted into --lower-bound. The signal: deeply nested LB markers
-    # (depth >= 3) AND the parser couldn't extract explicit `iter bound`
-    # annotations — that pattern matches emit_pipeline / dynamic fori_loop
-    # kernels (RPA, attention with dynamic mask iters). Shallow LB
-    # (depth <= 2) with conf=False is benign because the body is typically
-    # already expanded across all iterations (e.g. GMM with statically
-    # baked tile counts), so the parsed dynamic_bundles is correct even
-    # without explicit trip annotations.
+    # opted into --lower-bound. The signal: nested LB markers (depth >= 2)
+    # where the parser could NOT resolve a trip count for every loop level
+    # (loop_inference_confident is False — see llo_parse.py, which demotes
+    # confidence when resolved levels < nesting depth). That pattern matches
+    # emit_pipeline / dynamic fori_loop kernels (RPA, attention with an inner
+    # K-loop, GMM re-read) where an inner loop's trip is missing and the single
+    # inferred trip silently under-counts. A confident parse (every level
+    # pinned) at any depth is trusted. The threshold was lowered from 3 to 2
+    # after finding depth-3 emit_pipeline kernels that pinned only the outer
+    # loop, reported confident, and under-predicted by the missing inner factor
+    # (e.g. attention lfbo_no_pb: outer 512 pinned, inner K=16 missed -> -93%).
     deep_unannotated_loops = (
-        parsed.lb_nesting_depth >= 3 and not parsed.loop_inference_confident
+        parsed.lb_nesting_depth >= 2 and not parsed.loop_inference_confident
     )
     user_provided_iter_hint = (
         args.dynamic_bundles is not None or args.inner_loop_iters > 1
@@ -1201,11 +1204,13 @@ def main() -> None:
         if deep_unannotated_loops and not user_provided_iter_hint:
             reason = [
                 (
-                    f"nested LB depth {parsed.lb_nesting_depth} with no explicit "
-                    f"`iter bound` annotations (parser heuristic returned trip="
-                    f"{parsed.inferred_trip_count}) — typical of emit_pipeline or "
-                    "dynamic-bound fori_loop kernels where the inner trip count is "
-                    "data-dependent and not derivable from LLO alone"
+                    f"nested loops (LB depth {parsed.lb_nesting_depth}) but the "
+                    f"parser resolved a trip count for fewer levels than that "
+                    f"(inferred trip={parsed.inferred_trip_count} covers only the "
+                    "level(s) it could pin) — typical of emit_pipeline / "
+                    "dynamic-bound fori_loop kernels where an inner trip count is "
+                    "missing, so the dynamic bundle count silently under-counts "
+                    "by the unresolved factor"
                 )
             ]
             msg = (

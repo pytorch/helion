@@ -157,10 +157,13 @@ def _parse_bundles(
 
 def _extract_trip_count(
     raw_instrs: dict[int, list[str]], structure: dict[int, dict]
-) -> tuple[int, int, bool]:
+) -> tuple[int, int, bool, int]:
     """Infer loop iter count from sphi/sadd/scmp annotations.
 
-    Returns (trip_count, pipeline_depth, confident).
+    Returns (trip_count, pipeline_depth, confident, n_resolved_levels), where
+    n_resolved_levels is the count of DISTINCT induction registers a trip was
+    pinned for — i.e. how many loop levels were resolved. The caller compares
+    it against the LB nesting depth to decide whether the inference is complete.
 
     Strategy:
       1. Find an `LB:` bundle and read `iter bound = N` comments off its sphi
@@ -182,7 +185,7 @@ def _extract_trip_count(
               ragged_paged_attention-style data-dependent loops).
     """
     if not structure:
-        return 1, 0, False
+        return 1, 0, False, 0
     all_addrs = sorted(structure.keys())
 
     # Find a loop body bundle (LB flag preferred, otherwise first depth > 0)
@@ -197,7 +200,7 @@ def _extract_trip_count(
                 loop_start = addr
                 break
     if loop_start is None:
-        return 1, 0, False
+        return 1, 0, False, 0
 
     # Step 1: harvest `iter bound = N` from sphi instructions
     phi_to_bound: dict[str, int] = {}
@@ -230,8 +233,15 @@ def _extract_trip_count(
                     smov_to_bound[m.group(1).lstrip("%")] = sadd_to_bound[src]
     all_tracked = {**sadd_to_bound, **smov_to_bound}
 
-    # Step 4: match scmp.ge constants to bounds
+    # Step 4: match scmp.ge constants to bounds.
+    # `resolved_regs` counts the number of DISTINCT induction registers we
+    # pinned a trip for — i.e. how many loop levels we actually resolved.
+    # `level_to_trip` (keyed by the phi iter-bound value) can collapse two
+    # real loops onto one key and keep only the max, so it is NOT a reliable
+    # level count; resolved_regs is. The caller cross-checks this against the
+    # LB nesting depth to decide whether the inference is complete.
     level_to_trip: dict[int, int] = {}
+    resolved_regs: set[str] = set()
     all_scmp_ge: list[int] = []
     for addr in all_addrs:
         for raw in raw_instrs.get(addr, []):
@@ -242,6 +252,7 @@ def _extract_trip_count(
                 const = int(m.group(2))
                 all_scmp_ge.append(const)
                 if reg in all_tracked:
+                    resolved_regs.add(reg)
                     level = all_tracked[reg]
                     if level not in level_to_trip or const > level_to_trip[level]:
                         level_to_trip[level] = const
@@ -252,7 +263,7 @@ def _extract_trip_count(
             linearized *= trip
         max_scmp = max(all_scmp_ge) if all_scmp_ge else linearized
         pipeline_depth = max(0, max_scmp - linearized)
-        return max(linearized, 1), pipeline_depth, True
+        return max(linearized, 1), pipeline_depth, True, len(resolved_regs)
 
     # Fallback: heuristic from max scmp.ge constant. The original tool
     # uses `max_scmp - 2` here, but for kernels with multi-level loops
@@ -265,9 +276,9 @@ def _extract_trip_count(
         max_val = max(all_scmp_ge)
         pipeline_depth = 2
         linearized_heuristic = max(max_val - pipeline_depth, 1)
-        return linearized_heuristic, pipeline_depth, False
+        return linearized_heuristic, pipeline_depth, False, len(resolved_regs)
 
-    return 1, 0, False
+    return 1, 0, False, 0
 
 
 def _count_mxu_vpop(raw_instrs: dict[int, list[str]]) -> tuple[int, int]:
@@ -302,7 +313,19 @@ def parse_llo_dump(dump_dir: Path) -> LloParseResult:
     bundles_file, util_file = _find_kernel_files(dump_dir)
     lane_names, capacity, util_rows = _parse_utilization(util_file)
     raw_instrs, structure, lb_depth = _parse_bundles(bundles_file)
-    trip, pipe, confident = _extract_trip_count(raw_instrs, structure)
+    trip, pipe, confident, n_resolved_levels = _extract_trip_count(
+        raw_instrs, structure
+    )
+    # Demote confidence when the schedule has nested loops (LB depth >= 2) but
+    # we resolved fewer loop levels than that — i.e. at least one inner loop's
+    # trip count was NOT pinned, so `trip` under-counts the true dynamic bundle
+    # count. (The single `inferred_trip_count` cannot represent >=2 nested
+    # loops; without this demotion an emit_pipeline kernel with an unresolved
+    # inner K-loop would report confident=True and silently under-predict by
+    # the missing factor.) The caller's fail-loud guard refuses on
+    # `lb_depth >= 2 and not confident`.
+    if lb_depth >= 2 and n_resolved_levels < lb_depth:
+        confident = False
     vmatmul_static, vpop_static = _count_mxu_vpop(raw_instrs)
     static_bundles = len(util_rows)
 
