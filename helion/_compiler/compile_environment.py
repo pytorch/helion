@@ -269,6 +269,11 @@ class CompileEnvironment:
         self._tensor_descriptor_layout_guard_source_cache: dict[int, Source | None] = {}
         self.jagged_tile_parent_ids: dict[int, list[int]] = {}
         self.jagged_tile_mask_shapes: dict[int, list[torch.SymInt]] = {}
+        # Sublane / lane bids of registered jagged-flat TensorIndexPatterns.
+        # Populated by plan_tiling; on env (not DeviceFunction) because
+        # some readers run outside the device function scope.
+        self.pallas_jagged_flat_sublane_bids: set[int] = set()
+        self.pallas_jagged_flat_lane_bids: set[int] = set()
         self._symint_cache: dict[object, torch.SymInt] = {}
         self._foreign_symint_cache: dict[
             tuple[int, sympy.Expr], int | torch.SymInt

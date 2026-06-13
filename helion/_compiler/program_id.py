@@ -561,6 +561,38 @@ class CuteProgramIDs(FlatProgramIDs):
     """Flat PID strategy for CuTe pointwise kernels."""
 
 
+class JaggedProgramIDs(FlatProgramIDs):
+    """``grid=(1,)`` + ``jax.lax.fori_loop`` over items.  ``pid_0`` is
+    the body fn parameter, not ``pl.program_id(0)``.
+    """
+
+    def codegen(self, state: CodegenState) -> None:
+        # ``pid_0`` comes from the fori_loop body fn param (see wrap_kernel_body).
+        return
+
+    def codegen_grid(self) -> ast.AST:
+        return expr_from_string("(1,)")
+
+    def wrap_kernel_body(
+        self,
+        device_function: DeviceFunction,
+        body_stmts: list[ast.AST],
+    ) -> list[ast.AST]:
+        assert len(self.pid_info) == 1, (
+            "JaggedProgramIDs currently supports single-dim jagged grid only"
+        )
+        pid = self.pid_info[0]
+        num_items = pid.num_pids_expr(is_device=True)
+        fn_name = device_function.new_var("_kernel_body")
+        fn_def = statement_from_string(f"def {fn_name}({pid.pid_var}, _): pass")
+        assert isinstance(fn_def, ast.FunctionDef)
+        fn_def.body = cast("list[ast.stmt]", body_stmts) or [ast.Pass()]
+        fori_call = statement_from_string(
+            f"jax.lax.fori_loop(0, {num_items}, {fn_name}, None)"
+        )
+        return [fn_def, fori_call]
+
+
 @dataclasses.dataclass
 class L2GroupingProgramIDs(ProgramIDs):
     """Used grouped iteration order to promote L2 cache reuse in matmuls"""

@@ -745,6 +745,18 @@ def _(
     base = TileIndexType.allocate(None, origin)
     result = JaggedTileIndexType(origin, base.block_id, parent_block_ids)
     env.register_jagged_tile(base.block_id, parent_block_ids)
+    # Set eagerly so emit_pipeline drop fires from first autotune sample;
+    # plan_tiling re-sets with the precise condition.
+    env.config_spec.has_jagged_flat_dma = True
+
+    # On Pallas the items axis is pinned to 1 (one program per item) so
+    # the per-item DMA slice can use program_id directly.
+    if env.config_spec.backend_name == "pallas":
+        for parent_bid in parent_block_ids:
+            parent_spec = env.config_spec.block_sizes.block_id_lookup(parent_bid)
+            parent_spec.min_size = 1
+            parent_spec.max_size = 1
+            parent_spec.is_hard_pin = True
 
     _add_config_choices(
         [result.block_id],

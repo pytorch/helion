@@ -30,6 +30,7 @@ from .device_function import DeviceFunction
 from .host_function import HostFunction
 from .program_id import FlatProgramIDs
 from .program_id import ForEachProgramID
+from .program_id import JaggedProgramIDs
 from .program_id import L2GroupingProgramIDs
 from .program_id import PersistentBlockedProgramIDs
 from .program_id import PersistentInterleavedProgramIDs
@@ -3230,6 +3231,15 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
         pids = self.select_pid_strategy()
         if isinstance(state.device_function.pid, ForEachProgramID):
             pids.shared_pid_var = state.device_function.pid.shared_pid_var
+        elif (
+            isinstance(pids, FlatProgramIDs)
+            and env.backend.name == "pallas"
+            and len(block_ids) == 1
+            and block_ids[0]
+            in {p for parents in env.jagged_tile_parent_ids.values() for p in parents}
+        ):
+            # Grid → (1,); fori_loop wrap applied in generate_ast.py.
+            pids = JaggedProgramIDs()
         elif (
             isinstance(pids, FlatProgramIDs)
             and env.backend.name == "pallas"

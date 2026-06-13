@@ -32,6 +32,7 @@ from .inductor_lowering import CodegenState
 from .inductor_lowering import codegen_call_with_graph
 from .output_header import get_needed_import_lines
 from .program_id import ForEachProgramID
+from .program_id import JaggedProgramIDs
 from .tile_strategy import DeviceGridState
 from .tile_strategy import DeviceLoopState
 from .tile_strategy import EmitPipelineLoopState
@@ -972,6 +973,16 @@ class GenerateAST(NodeVisitor, CodegenInterface):
                                     grid_state.wrap_body(wrapped_body)
                                 )
                             self.statements_stack[-1].extend(grid_state.outer_suffix)
+                        elif isinstance(self.device_function.pid, JaggedProgramIDs):
+                            # Wrap prologue + user body inside jax.lax.fori_loop.
+                            prologue = list(self.statements_stack[-1])
+                            self.statements_stack[-1].clear()
+                            full_body = prologue + wrapped_body
+                            self.statements_stack[-1].extend(
+                                self.device_function.pid.wrap_kernel_body(
+                                    self.device_function, full_body
+                                )
+                            )
                         else:
                             self.statements_stack[-1].extend(wrapped_body)
                     else:

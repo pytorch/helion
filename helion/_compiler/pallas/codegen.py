@@ -38,8 +38,18 @@ def load_expr(
     mask_expr = _load_mask_expr(state, subscript, tensor)
     if mask_expr is not None:
         result = expr_from_string(f"{name}[{idx_str}] * ({mask_expr})")
+    elif _is_smem_tensor(state, tensor) and _smem_needs_scalar_rewrap(state, patterns):
+        # SMEM scalar load returns 0-D; rewrap as (1,)-vector to match the
+        # user-source TilePattern contract.
+        result = expr_from_string(f"jnp.array([{name}[{idx_str}]])")
     else:
         result = expr_from_string(f"{name}[{idx_str}]")
+    # Jagged-flat: 2-D VMEM scratch but rank-expanded ``flat`` index makes
+    # the user-source load result 3-D (BB=1, BK, BM).
+    from helion._compiler.pallas.plan_tiling import TensorIndexPattern as _TIP
+
+    if any(isinstance(p, _TIP) and p.is_jagged_flat for p in patterns):
+        result = expr_from_string("jnp.expand_dims({result}, axis=0)", result=result)
     for dim in none_dims:
         result = expr_from_string(
             f"jnp.expand_dims({{result}}, axis={dim})", result=result
@@ -372,6 +382,13 @@ def _generated_index_code(
         # resident target axis instead of indexing it a second time.
         return ":"
 
+    from helion._compiler.pallas.plan_tiling import TensorIndexPattern
+
+    if isinstance(pattern, TensorIndexPattern) and pattern.is_jagged_flat:
+        # Per-item base offset is injected at the DMA slice (see
+        # ``_build_hbm_dma_slice``); body reads the full VMEM scratch.
+        return ":"
+
     raise RuntimeError(
         f"Unhandled indexing pattern type: {type(pattern).__name__}. "
         f"Pattern: {pattern}, idx: {idx}, subscript_index: {subscript_index}. "
@@ -531,6 +548,12 @@ def _ds_expr(
     block_size = state.device_function.block_size_var(block_id)
     if block_size is None:
         return ":"
+    # Pallas SMEM only loads scalars; emit bare offset and let load_expr
+    # rewrap to the (1,)-vec contract.
+    if tensor is not None and _is_smem_tensor(state, tensor):
+        resolved_bs = state.device_function.resolved_block_size(block_id)
+        if isinstance(resolved_bs, int) and resolved_bs == 1:
+            return offset
     if tensor is not None and tensor_dim is not None:
         from helion.language.memory_ops import _record_pad_info
 
@@ -622,6 +645,29 @@ def _loop_offset_alignment(
                 return None
 
     return bs_value
+
+
+def _smem_needs_scalar_rewrap(state: CodegenState, patterns: tuple) -> bool:
+    """True iff the SMEM load was scalarized by ``_ds_expr`` (block_size==1
+    TilePattern) and needs a (1,)-vec rewrap to match user-source contract.
+    """
+    from helion._compiler.pallas.plan_tiling import TileIndexWithOffsetPattern
+    from helion._compiler.pallas.plan_tiling import TilePattern
+
+    for pattern in patterns:
+        if isinstance(pattern, (TilePattern, TileIndexWithOffsetPattern)):
+            resolved_bs = state.device_function.resolved_block_size(pattern.block_id)
+            if isinstance(resolved_bs, int) and resolved_bs == 1:
+                return True
+    return False
+
+
+def _is_smem_tensor(state: CodegenState, tensor: torch.Tensor) -> bool:
+    """True iff *tensor* is classified as Pallas SMEM (scalar / offset table)."""
+    from helion._compiler.device_function import PallasMemorySpace
+
+    mem_space = state.device_function.pallas_memory_space.get(id(tensor))
+    return mem_space == PallasMemorySpace.SMEM
 
 
 def vmem_name(state: CodegenState, name: str) -> str:

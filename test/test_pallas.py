@@ -4101,6 +4101,366 @@ class TestPallas(TestCase):
         inner_min = spec.block_sizes[1].min_size
         self.assertGreaterEqual(outer_min, inner_min)
 
+    def test_jagged_tile_pins_parent_block_size_to_1(self) -> None:
+        """A jagged_tile's parent (items axis) is pinned to block_size=1 on
+        Pallas — each program owns exactly one item so the per-item DMA slice
+        + chunk_mask emission can use program_id directly as the row index.
+        """
+
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def k(x_data: torch.Tensor, x_offsets: torch.Tensor) -> torch.Tensor:
+            M = x_data.size(1)
+            num_rows = x_offsets.size(0) - 1
+            out = torch.zeros([num_rows, M], dtype=x_data.dtype, device=x_data.device)
+            x_flat = x_data.view(-1)
+            for tile_b in hl.tile(num_rows):
+                starts = x_offsets[tile_b]
+                ends = x_offsets[tile_b.index + 1]
+                nnz = ends - starts
+                for tile_m in hl.tile(M):
+                    row_sums = hl.zeros([tile_b, tile_m], dtype=x_data.dtype)
+                    for tile_k in hl.jagged_tile(nnz):
+                        base = starts[:, None] + tile_k.index[None, :]
+                        flat = base[:, :, None] * M + tile_m.index[None, None, :]
+                        row_sums = row_sums + hl.load(x_flat, [flat]).sum(dim=1)
+                    out[tile_b, tile_m] = row_sums
+            return out
+
+        x_offsets = torch.tensor([0, 3, 8, 10, 14], dtype=torch.int32)
+        x_data = torch.randn(14, 8, dtype=torch.float32)
+        spec = k.bind((x_data, x_offsets)).config_spec
+        parent_spec = spec.block_sizes[0]
+        self.assertEqual(parent_spec.min_size, 1)
+        self.assertEqual(parent_spec.max_size, 1)
+
+    def test_jagged_tile_parent_pin_survives_alignment_propagation(self) -> None:
+        """The pin sticks even when the parent indexes into a tensor that
+        would otherwise raise its alignment min via
+        ``PallasBackend.adjust_block_size_constraints``.
+        """
+
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def k(x_data: torch.Tensor, x_offsets: torch.Tensor) -> torch.Tensor:
+            M = x_data.size(1)
+            num_rows = x_offsets.size(0) - 1
+            out = torch.zeros([num_rows, M], dtype=x_data.dtype, device=x_data.device)
+            x_flat = x_data.view(-1)
+            # bfloat16 lane → 256-element alignment; pin must survive it.
+            for tile_b in hl.tile(num_rows):
+                starts = x_offsets[tile_b]
+                ends = x_offsets[tile_b.index + 1]
+                nnz = ends - starts
+                for tile_m in hl.tile(M):
+                    row_sums = hl.zeros([tile_b, tile_m], dtype=x_data.dtype)
+                    for tile_k in hl.jagged_tile(nnz):
+                        base = starts[:, None] + tile_k.index[None, :]
+                        flat = base[:, :, None] * M + tile_m.index[None, None, :]
+                        row_sums = row_sums + hl.load(x_flat, [flat]).sum(dim=1)
+                    out[tile_b, tile_m] = row_sums
+            return out
+
+        x_offsets = torch.tensor([0, 3, 8, 10, 14], dtype=torch.int32)
+        x_data = torch.randn(14, 8, dtype=torch.bfloat16)
+        spec = k.bind((x_data, x_offsets)).config_spec
+        self.assertEqual(spec.block_sizes[0].min_size, 1)
+        self.assertEqual(spec.block_sizes[0].max_size, 1)
+
+    def test_non_jagged_kernel_does_not_pin_outer_to_1(self) -> None:
+        """Regression: the jagged-parent pin must only apply in jagged kernels.
+        A regular ``hl.tile(...)``-only kernel should keep its autotuned
+        outer block-size range untouched.
+        """
+
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def k(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile in hl.tile(x.size(0)):
+                out[tile] = x[tile] * 2
+            return out
+
+        args = (torch.randn([1024], device=DEVICE, dtype=torch.float32),)
+        spec = k.bind(args).config_spec
+        self.assertGreater(spec.block_sizes[0].max_size, 1)
+
+    def test_jagged_kernel_emits_grid_1_and_fori_loop_wrapper(self) -> None:
+        """Pallas jagged kernel must launch as ``grid=(1,)`` and wrap the
+        kernel body in ``jax.lax.fori_loop(0, num_items, _kernel_body, None)``
+        with ``pid_0`` as the loop fn's iteration parameter — not
+        ``pl.program_id(0)``.
+        """
+
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def k(x_data: torch.Tensor, x_offsets: torch.Tensor) -> torch.Tensor:
+            M = x_data.size(1)
+            num_rows = x_offsets.size(0) - 1
+            out = torch.zeros([num_rows, M], dtype=x_data.dtype, device=x_data.device)
+            x_flat = x_data.view(-1)
+            for tile_b in hl.tile(num_rows):
+                starts = x_offsets[tile_b]
+                ends = x_offsets[tile_b.index + 1]
+                nnz = ends - starts
+                for tile_m in hl.tile(M):
+                    row_sums = hl.zeros([tile_b, tile_m], dtype=x_data.dtype)
+                    for tile_k in hl.jagged_tile(nnz):
+                        base = starts[:, None] + tile_k.index[None, :]
+                        flat = base[:, :, None] * M + tile_m.index[None, None, :]
+                        row_sums = row_sums + hl.load(x_flat, [flat]).sum(dim=1)
+                    out[tile_b, tile_m] = row_sums
+            return out
+
+        x_offsets = torch.tensor([0, 3, 8, 10, 14], dtype=torch.int32)
+        x_data = torch.randn(14, 8, dtype=torch.float32)
+        bound = k.bind((x_data, x_offsets))
+        code = bound.to_triton_code(bound.config_spec.default_config())
+
+        self.assertRegex(code, r"_launcher\(\s*_helion_\w+\s*,\s*\(1,\)")
+        self.assertRegex(code, r"def\s+_kernel_body\w*\s*\(\s*pid_0\s*,\s*_\s*\)\s*:")
+        self.assertRegex(
+            code, r"jax\.lax\.fori_loop\s*\(\s*0\s*,.+_kernel_body\w*\s*,\s*None\s*\)"
+        )
+        self.assertNotRegex(code, r"pid_0\s*=\s*pl\.program_id\s*\(\s*0\s*\)")
+        # x_flat at arg position 1, out at position 2 (both HBM).
+        self.assertRegex(code, r"_pipeline_arg_indices=\[\s*1\s*,\s*2\s*\]")
+        # x_offsets at arg position 0 (SMEM).
+        self.assertRegex(code, r"_smem_arg_indices=\[\s*0\s*\]")
+
+    def test_parse_flat_jagged_subscript_canonical(self) -> None:
+        """``_parse_flat_jagged_subscript`` recovers
+        ``(sublane_bid, sublane_base_fx, lane_bid, M)`` from the canonical
+        flat-1D form ``(starts + tile_k.idx) * M + tile_m.idx`` (with
+        broadcast wrappers)."""
+        import operator
+        from types import SimpleNamespace
+
+        from torch._subclasses.fake_tensor import FakeTensorMode
+        from torch.fx import Graph
+        from torch.fx.experimental.symbolic_shapes import ShapeEnv
+
+        from helion._compiler.pallas.plan_tiling import _parse_flat_jagged_subscript
+
+        shape_env = ShapeEnv()
+        mode = FakeTensorMode(shape_env=shape_env)
+        with mode:
+            k_sym = shape_env.create_unbacked_symint()
+            m_sym = shape_env.create_unbacked_symint()
+            torch._check(k_sym >= 1)
+            torch._check(m_sym >= 1)
+        bid_of = {id(k_sym): 7, id(m_sym): 8}
+        env = SimpleNamespace(
+            get_block_id=lambda s: bid_of.get(id(s)),
+            is_jagged_tile=lambda bid: bid == 7,
+            jagged_tile_parent_ids={7: [3]},
+        )
+
+        g = Graph()
+        starts = g.placeholder("starts")
+        k_idx = g.placeholder("tile_k_idx")
+        k_idx.meta["val"] = k_sym
+        m_idx = g.placeholder("tile_m_idx")
+        m_idx.meta["val"] = m_sym
+
+        inner = g.call_function(operator.add, args=(starts, k_idx))
+        inner_u = g.call_function(torch.ops.aten.unsqueeze.default, args=(inner, -1))
+        mul = g.call_function(operator.mul, args=(inner_u, 64))
+        mul_u = g.call_function(torch.ops.aten.unsqueeze.default, args=(mul, 0))
+        m_u1 = g.call_function(torch.ops.aten.unsqueeze.default, args=(m_idx, 0))
+        m_u2 = g.call_function(torch.ops.aten.unsqueeze.default, args=(m_u1, 0))
+        flat = g.call_function(operator.add, args=(mul_u, m_u2))
+        g.output(flat)
+
+        result = _parse_flat_jagged_subscript(flat, env)
+        self.assertIsNotNone(result)
+        sublane_bid, sublane_base_fx, lane_bid, lane_size = result
+        self.assertEqual(sublane_bid, 7)
+        self.assertIs(sublane_base_fx, starts)
+        self.assertEqual(lane_bid, 8)
+        self.assertEqual(lane_size, 64)
+
+    def test_parse_flat_jagged_subscript_non_canonical_returns_none(self) -> None:
+        """If the subscript doesn't match the canonical structure (e.g. a
+        bare add of two tile indices, missing the ``* M`` factor), the
+        parser returns None and the caller falls through to plain
+        ``TensorIndexPattern`` (the indirect-gather path)."""
+        import operator
+        from types import SimpleNamespace
+
+        from torch._subclasses.fake_tensor import FakeTensorMode
+        from torch.fx import Graph
+        from torch.fx.experimental.symbolic_shapes import ShapeEnv
+
+        from helion._compiler.pallas.plan_tiling import _parse_flat_jagged_subscript
+
+        shape_env = ShapeEnv()
+        mode = FakeTensorMode(shape_env=shape_env)
+        with mode:
+            k_sym = shape_env.create_unbacked_symint()
+            m_sym = shape_env.create_unbacked_symint()
+            torch._check(k_sym >= 1)
+            torch._check(m_sym >= 1)
+        bid_of = {id(k_sym): 7, id(m_sym): 8}
+        env = SimpleNamespace(
+            get_block_id=lambda s: bid_of.get(id(s)),
+            is_jagged_tile=lambda bid: bid == 7,
+            jagged_tile_parent_ids={7: [3]},
+        )
+
+        g = Graph()
+        k_idx = g.placeholder("tile_k_idx")
+        k_idx.meta["val"] = k_sym
+        m_idx = g.placeholder("tile_m_idx")
+        m_idx.meta["val"] = m_sym
+        flat = g.call_function(operator.add, args=(k_idx, m_idx))
+        g.output(flat)
+
+        self.assertIsNone(_parse_flat_jagged_subscript(flat, env))
+
+    def test_tensor_index_pattern_jagged_flat_fields(self) -> None:
+        """``TensorIndexPattern`` defaults preserve the indirect-gather emit
+        path; the jagged-flat fields opt in to the canonical jagged 2-D DMA
+        slice emit (filled by the plan_tiling producer when it parses a
+        1-D flat-form jagged subscript)."""
+        from helion._compiler.pallas.plan_tiling import TensorIndexPattern
+
+        plain = TensorIndexPattern()
+        self.assertFalse(plain.is_jagged_flat)
+        self.assertIsNone(plain.sublane_bid)
+        self.assertIsNone(plain.sublane_base_fx)
+        self.assertIsNone(plain.lane_bid)
+        self.assertIsNone(plain.lane_size)
+
+        jagged = TensorIndexPattern(
+            is_jagged_flat=True,
+            sublane_bid=7,
+            sublane_base_fx=None,
+            lane_bid=12,
+            lane_size=64,
+        )
+        self.assertTrue(jagged.is_jagged_flat)
+        self.assertEqual(jagged.sublane_bid, 7)
+        self.assertEqual(jagged.lane_bid, 12)
+        self.assertEqual(jagged.lane_size, 64)
+
+    def test_get_reduced_block_ids_carried_acc_collapses_loop_bid(self) -> None:
+        """When a fori_loop has a carried tensor accumulator whose shape
+        lacks one of the loop's iterated block_ids, that block_id is
+        considered reduced.  Mirrors the jagged_sum / jagged_mean tile_k
+        loop (row_sums [BB, BM] carried across tile_k iters)."""
+        import operator
+        from types import SimpleNamespace
+
+        from torch._subclasses.fake_tensor import FakeTensorMode
+        from torch.fx import Graph
+        from torch.fx.experimental.symbolic_shapes import ShapeEnv
+
+        from helion._compiler.pallas.plan_tiling import get_reduced_block_ids
+        from helion.language._tracing_ops import _for_loop
+        from helion.language._tracing_ops import _phi
+
+        shape_env = ShapeEnv()
+        mode = FakeTensorMode(shape_env=shape_env)
+        with mode:
+            k_sym = shape_env.create_unbacked_symint()
+            m_sym = shape_env.create_unbacked_symint()
+            torch._check(k_sym >= 1)
+            torch._check(m_sym >= 1)
+            acc_val = torch.empty((m_sym,))  # shape lacks k_sym
+        bid_of = {id(k_sym): 7, id(m_sym): 8}
+        env = SimpleNamespace(get_block_id=lambda s: bid_of.get(id(s)))
+
+        g = Graph()
+        acc = g.placeholder("acc")
+        acc.meta["val"] = acc_val
+        loop = g.call_function(_for_loop, args=(0, [0], [k_sym], [acc]))
+        out_get = g.call_function(operator.getitem, args=(loop, 0))
+        g.call_function(_phi, args=(acc, out_get))  # marks acc as carried
+
+        self.assertEqual(get_reduced_block_ids(loop, [7], env), {7})
+
+    def test_get_reduced_block_ids_no_carried_returns_empty(self) -> None:
+        """A fori_loop with no FX-phi'd accumulator is not a reduction
+        loop; the helper returns ∅ regardless of loop_block_ids."""
+        from types import SimpleNamespace
+
+        from torch.fx import Graph
+
+        from helion._compiler.pallas.plan_tiling import get_reduced_block_ids
+        from helion.language._tracing_ops import _for_loop
+
+        env = SimpleNamespace(get_block_id=lambda s: None)
+        g = Graph()
+        loop = g.call_function(_for_loop, args=(0, [0], [16], []))
+        self.assertEqual(get_reduced_block_ids(loop, [7], env), set())
+
+    def test_store_is_post_reduction_via_loop_getitem(self) -> None:
+        """If the stored value is a ``getitem(_for_loop, idx)`` (i.e. the
+        final-carry of an inner reduction loop), promotion fires: the
+        loop's reduced block_ids surface in the return set."""
+        import operator
+        from types import SimpleNamespace
+
+        from torch._subclasses.fake_tensor import FakeTensorMode
+        from torch.fx import Graph
+        from torch.fx.experimental.symbolic_shapes import ShapeEnv
+
+        from helion._compiler.pallas.plan_tiling import store_is_post_reduction
+        from helion.language._tracing_ops import _for_loop
+        from helion.language._tracing_ops import _phi
+
+        shape_env = ShapeEnv()
+        mode = FakeTensorMode(shape_env=shape_env)
+        with mode:
+            k_sym = shape_env.create_unbacked_symint()
+            m_sym = shape_env.create_unbacked_symint()
+            torch._check(k_sym >= 1)
+            torch._check(m_sym >= 1)
+            acc_val = torch.empty((m_sym,))
+        bid_of = {id(k_sym): 7, id(m_sym): 8}
+        env = SimpleNamespace(get_block_id=lambda s: bid_of.get(id(s)))
+
+        g = Graph()
+        acc = g.placeholder("acc")
+        acc.meta["val"] = acc_val
+        loop = g.call_function(_for_loop, args=(0, [0], [k_sym], [acc]))
+        out_get = g.call_function(operator.getitem, args=(loop, 0))
+        g.call_function(_phi, args=(acc, out_get))
+
+        def _store_marker(*args: object) -> None:
+            return None
+
+        tensor_ph = g.placeholder("tensor")
+        store_node = g.call_function(_store_marker, args=(tensor_ph, [], out_get, None))
+
+        self.assertEqual(store_is_post_reduction(store_node, env, {0: [7]}), {7})
+
+    def test_store_is_post_reduction_inline_value_returns_empty(self) -> None:
+        """If the stored value is computed inline (not the final-carry of
+        any loop), no promotion fires — even if upstream loop-carry
+        values are *consumed* into the inline expression, the per-iter
+        write pattern is still disjoint.  Mirrors jagged_softmax /
+        jagged_layer_norm's final-pass store of ``block_out``."""
+        import operator
+        from types import SimpleNamespace
+
+        from torch.fx import Graph
+
+        from helion._compiler.pallas.plan_tiling import store_is_post_reduction
+
+        env = SimpleNamespace(get_block_id=lambda s: None)
+        g = Graph()
+        x = g.placeholder("x")
+        y = g.placeholder("y")
+        inline_value = g.call_function(operator.add, args=(x, y))
+
+        def _store_marker(*args: object) -> None:
+            return None
+
+        tensor_ph = g.placeholder("tensor")
+        store_node = g.call_function(
+            _store_marker, args=(tensor_ph, [], inline_value, None)
+        )
+
+        self.assertEqual(store_is_post_reduction(store_node, env, {}), set())
+
 
 @skipUnlessPallas("JAX/Pallas TPU not available")
 class TestPallasIndirectGather(TestCase):

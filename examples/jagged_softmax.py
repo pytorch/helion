@@ -154,9 +154,14 @@ def main() -> None:
     num_rows, max_cols = 512, 64
     device = DEVICE
 
+    from helion._testing import LONG_INT_TYPE
+
     lengths = torch.randint(1, max_cols + 1, (num_rows,), device=device)
     x_offsets = torch.cat(
-        [torch.zeros(1, dtype=torch.long, device=device), torch.cumsum(lengths, dim=0)]
+        [
+            torch.zeros(1, dtype=LONG_INT_TYPE, device=device),
+            torch.cumsum(lengths, dim=0).to(LONG_INT_TYPE),
+        ]
     )
     nnz = int(x_offsets[-1])
     M = 128  # number of features

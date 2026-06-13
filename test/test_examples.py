@@ -1114,7 +1114,6 @@ class TestExamples(RefEagerTestBase, TestCase):
                 block_sizes=[32768, 1],
             )
 
-    @xfailIfPallas("JAX tracer error with dynamic shapes")
     @skipIfRefEager("hl.jagged_tile does not support ref mode yet")
     def test_jagged_mean(self):
         num_rows, max_cols = 32, 64
@@ -1122,8 +1121,8 @@ class TestExamples(RefEagerTestBase, TestCase):
         lengths = torch.randint(1, max_cols + 1, (num_rows,), device=DEVICE)
         x_offsets = torch.cat(
             [
-                torch.zeros(1, dtype=torch.long, device=DEVICE),
-                torch.cumsum(lengths, dim=0),
+                torch.zeros(1, dtype=LONG_INT_TYPE, device=DEVICE),
+                torch.cumsum(lengths, dim=0).to(LONG_INT_TYPE),
             ]
         )
         nnz = int(x_offsets[-1])
@@ -1400,7 +1399,6 @@ class TestExamples(RefEagerTestBase, TestCase):
             num_stages=3,
         )
 
-    @xfailIfPallas("JAX tracer error with dynamic shapes")
     @skipIfRefEager("hl.jagged_tile does not support ref mode yet")
     def test_jagged_softmax(self):
         num_rows, max_cols = 128, 64
@@ -1408,8 +1406,8 @@ class TestExamples(RefEagerTestBase, TestCase):
         lengths = torch.randint(1, max_cols + 1, (num_rows,), device=DEVICE)
         x_offsets = torch.cat(
             [
-                torch.zeros(1, dtype=torch.long, device=DEVICE),
-                torch.cumsum(lengths, dim=0),
+                torch.zeros(1, dtype=LONG_INT_TYPE, device=DEVICE),
+                torch.cumsum(lengths, dim=0).to(LONG_INT_TYPE),
             ]
         )
         nnz = int(x_offsets[-1])
@@ -1902,7 +1900,6 @@ class TestExamples(RefEagerTestBase, TestCase):
             rtol=2e-1,
         )
 
-    @xfailIfPallas("JAX tracer error")
     @skipIfRefEager("hl.jagged_tile does not support ref mode yet")
     def test_jagged_sum(self):
         num_rows, max_cols = 128, 64
@@ -1910,8 +1907,8 @@ class TestExamples(RefEagerTestBase, TestCase):
         lengths = torch.randint(1, max_cols + 1, (num_rows,), device=DEVICE)
         x_offsets = torch.cat(
             [
-                torch.zeros(1, dtype=torch.long, device=DEVICE),
-                torch.cumsum(lengths, dim=0),
+                torch.zeros(1, dtype=LONG_INT_TYPE, device=DEVICE),
+                torch.cumsum(lengths, dim=0).to(LONG_INT_TYPE),
             ]
         )
         nnz = int(x_offsets[-1])
@@ -2028,7 +2025,6 @@ class TestExamples(RefEagerTestBase, TestCase):
         )
         torch.testing.assert_close(result, expected, atol=1e-1, rtol=1e-2)
 
-    @xfailIfPallas("JAX tracer error")
     @skipIfRefEager("hl.jagged_tile does not support ref mode yet")
     def test_jagged_layer_norm(self):
         num_rows, max_cols = 128, 64
@@ -2036,8 +2032,8 @@ class TestExamples(RefEagerTestBase, TestCase):
         lengths = torch.randint(1, max_cols + 1, (num_rows,), device=DEVICE)
         x_offsets = torch.cat(
             [
-                torch.zeros(1, dtype=torch.long, device=DEVICE),
-                torch.cumsum(lengths, dim=0),
+                torch.zeros(1, dtype=LONG_INT_TYPE, device=DEVICE),
+                torch.cumsum(lengths, dim=0).to(LONG_INT_TYPE),
             ]
         )
         nnz = int(x_offsets[-1])
