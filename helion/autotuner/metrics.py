@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import dataclasses
+import hashlib
 import time
 from typing import TYPE_CHECKING
 
@@ -65,12 +66,24 @@ class AutotuneMetrics:
 class KernelMetadata:
     """Per-run identity for the kernel being autotuned.
 
-    Written once per autotuning run to the ``<autotune_log>.meta.json`` sidecar
-    that sits next to the per-config CSV telemetry. The CSV records each config
-    and its result; this provides the stable identity needed to group those rows
-    across runs. ``kernel_id`` is the stable, content-derived foreign key (a
-    hash of the kernel source and code-generation settings); ``kernel_source``
-    carries the full source text for analysis and debugging.
+    Appended (one JSON record per run) to the ``<autotune_log>.meta.jsonl``
+    sidecar that sits next to the per-config CSV telemetry. The CSV records each
+    config and its result; this provides the stable identity needed to group
+    those rows across runs.
+
+    Two content-derived ids tie the data together:
+
+    - ``kernel_id`` is the foreign key for the *kernel* (a hash of the kernel
+      source and code-generation settings); it is shape/dtype independent, so a
+      kernel autotuned at several input shapes shares one ``kernel_id``.
+    - ``run_id`` is the foreign key for a single autotune *invocation*: a hash of
+      ``(kernel_id, input_shapes, dtypes, hardware)``. Because every CSV row is
+      also stamped with ``run_id``, rows join to exactly one meta record on
+      ``run_id`` (a clean many-to-one), which lets a config's measured perf be
+      attributed to the specific shape/dtype/hardware it was measured at.
+
+    ``run_id`` is derived from the other fields in :meth:`__post_init__` when not
+    provided. ``kernel_source`` carries the full source text for analysis.
     """
 
     kernel_id: str = ""
@@ -79,9 +92,29 @@ class KernelMetadata:
     input_shapes: str = ""
     dtypes: str = ""
     hardware: str = ""
+    run_id: str = ""
+
+    def __post_init__(self) -> None:
+        if not self.run_id:
+            self.run_id = self._compute_run_id()
+
+    def _compute_run_id(self) -> str:
+        """Stable id for this ``(kernel, input shapes, dtypes, hardware)`` run.
+
+        Content-derived so the same invocation produces the same ``run_id``
+        across processes and CI runs (enabling dedup/aggregation). The fields are
+        joined with a delimiter that cannot appear inside them to avoid
+        boundary collisions.
+        """
+        payload = (
+            f"{self.kernel_id}\x00{self.input_shapes}\x00{self.dtypes}\x00"
+            f"{self.hardware}"
+        )
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
     def to_dict(self) -> dict[str, object]:
         return {
+            "run_id": self.run_id,
             "kernel_id": self.kernel_id,
             "kernel_name": self.kernel_name,
             "kernel_source": self.kernel_source,
