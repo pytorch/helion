@@ -42,7 +42,7 @@ class PatternSearch(PopulationBasedSearch):
         initial_population: int = PATTERN_SEARCH_DEFAULTS.initial_population,
         copies: int = PATTERN_SEARCH_DEFAULTS.copies,
         max_generations: int = PATTERN_SEARCH_DEFAULTS.max_generations,
-        min_improvement_delta: float = 0.001,
+        min_improvement_delta: float = 0.003,
         initial_population_strategy: InitialPopulationStrategy | None = None,
         best_available_pad_random: bool = PATTERN_SEARCH_DEFAULTS.best_available_pad_random,
         num_neighbors_cap: int = -1,
@@ -92,6 +92,7 @@ class PatternSearch(PopulationBasedSearch):
     def get_kwargs_from_profile(
         cls, profile: AutotuneEffortProfile, settings: Settings
     ) -> dict[str, object]:
+        from ..runtime.settings import _env_get_float
         from ..runtime.settings import _env_get_int
         from ..runtime.settings import _get_initial_population_strategy
 
@@ -107,6 +108,9 @@ class PatternSearch(PopulationBasedSearch):
             "initial_population_strategy": strategy,
             "best_available_pad_random": profile.pattern_search.best_available_pad_random,
             "num_neighbors_cap": _env_get_int("HELION_CAP_AUTOTUNE_NUM_NEIGHBORS", -1),
+            "min_improvement_delta": _env_get_float(
+                "HELION_AUTOTUNE_MIN_IMPROVEMENT_DELTA", 0.003
+            ),
             **super().get_kwargs_from_profile(profile, settings),
         }
 
