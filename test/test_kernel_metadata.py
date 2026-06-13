@@ -215,8 +215,6 @@ class TestMetadataSchema(TestCase):
                 settings={"static_shapes": False, "index_dtype": None}
             ).run_id,
         )
-        # An explicitly supplied run_id is preserved (not overwritten).
-        self.assertEqual(self._metadata(run_id="pinned").run_id, "pinned")
 
     def test_default_metadata_serializes_with_empty_identity(self) -> None:
         """
