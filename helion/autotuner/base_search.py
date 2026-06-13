@@ -58,6 +58,23 @@ if TYPE_CHECKING:
     from helion.autotuner.effort_profile import AutotuneEffortProfile
 
 
+_DATASET_NO_LOG_WARNED = False
+
+
+def _warn_dataset_without_log(log: AutotuningLogger) -> None:
+    """Warn once: ``autotune_dataset`` needs ``autotune_log`` (the base path the
+    ``.meta.jsonl`` sits next to) or nothing is collected."""
+    global _DATASET_NO_LOG_WARNED
+    if _DATASET_NO_LOG_WARNED:
+        return
+    _DATASET_NO_LOG_WARNED = True
+    log.warning(
+        "HELION_AUTOTUNE_DATASET is set but HELION_AUTOTUNE_LOG is not; no "
+        "autotune dataset will be collected. Set HELION_AUTOTUNE_LOG to a base "
+        "path to enable collection."
+    )
+
+
 # Use the standard do_bench effort for confirmation instead of the adaptive
 # rebenchmark repeat, which can amplify a single optimistic subprocess timing.
 _SUSPICIOUS_REBENCHMARK_WARMUP = 25
@@ -253,12 +270,10 @@ class BaseSearch(BaseAutotuner):
         if budget is not None:
             self.log(f"Autotune budget: {budget}s")
         kernel_obj = getattr(self.kernel, "kernel", None)
-        kernel_id = ""
         kernel_source = ""
         if kernel_obj is not None:
             try:
                 kernel_source = kernel_obj.kernel_source()
-                kernel_id = kernel_obj.kernel_id()
             except OSError:
                 self.log.debug("Failed to read Helion kernel source", exc_info=True)
         kernel_name = getattr(kernel_obj, "name", "")
@@ -267,7 +282,6 @@ class BaseSearch(BaseAutotuner):
         dtypes = str([str(t.dtype) for t in tensors])
         hardware = get_device_name(extract_device(self.args)) or ""
         self._autotune_metrics: AutotuneMetrics = AutotuneMetrics(
-            kernel_id=kernel_id,
             kernel_name=kernel_name,
             kernel_source=kernel_source,
             input_shapes=input_shapes,
@@ -275,15 +289,16 @@ class BaseSearch(BaseAutotuner):
             random_seed=self.settings.autotune_random_seed,
             search_algorithm=type(self).__name__,
         )
-        # Written once per run to the <autotune_log>.meta.json sidecar so the
-        # per-config CSV rows can be grouped by kernel across runs.
+        # Per-run identity for the <autotune_log>.meta.jsonl record (written when
+        # dataset collection is on); CSV rows join to it on run_id. The sink adds
+        # the configs tested.
         self._kernel_metadata: KernelMetadata = KernelMetadata(
-            kernel_id=kernel_id,
             kernel_name=kernel_name,
             kernel_source=kernel_source,
             input_shapes=input_shapes,
             dtypes=dtypes,
             hardware=hardware,
+            settings=self.settings.to_dict(),
         )
         self.benchmark_provider = self._benchmark_provider_cls(
             kernel=self.kernel,
@@ -294,6 +309,20 @@ class BaseSearch(BaseAutotuner):
             autotune_metrics=self._autotune_metrics,
         )
         self.benchmark_provider.set_budget_exceeded_fn(self._autotune_budget_exceeded)
+
+    def _is_restricted_search(self) -> bool:
+        """Whether the search space is the user's pinned configs.
+
+        A kernel decorated with ``configs=[...]`` (and not ``force_autotune``)
+        tunes only between those user-chosen configs, so its telemetry is a
+        biased, non-representative slice; such runs are excluded from data
+        collection. ``force_autotune`` searches the full space and is collected.
+        Best-effort: a missing kernel object / ``configs`` attribute reads as
+        "not restricted" so a genuine search is never dropped by accident.
+        """
+        kernel_obj = getattr(self.kernel, "kernel", None)
+        configs = getattr(kernel_obj, "configs", None)
+        return bool(configs) and not self.settings.force_autotune
 
     def _autotune_budget_exceeded(self) -> bool:
         budget = self.settings.autotune_budget_seconds
@@ -475,9 +504,19 @@ class BaseSearch(BaseAutotuner):
         exit_stack = contextlib.ExitStack()
         with exit_stack:
             if self.settings.autotune_log:
-                exit_stack.enter_context(
-                    self.log.autotune_logging(metadata=self._kernel_metadata)
+                # .csv/.log follow the log path; the dataset (.meta.jsonl) also
+                # needs opt-in and a representative (non-restricted) search.
+                collect_dataset = (
+                    self.settings.autotune_dataset and not self._is_restricted_search()
                 )
+                exit_stack.enter_context(
+                    self.log.autotune_logging(
+                        metadata=self._kernel_metadata,
+                        collect_dataset=collect_dataset,
+                    )
+                )
+            elif self.settings.autotune_dataset:
+                _warn_dataset_without_log(self.log)
             self.log.reset()
             # Autotuner triggers bugs in remote triton compile service.
             # Skip storing Triton intermediate IRs (.ttir, .ttgir, .llir, etc.)

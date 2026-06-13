@@ -50,6 +50,17 @@ _TRUE_LITERALS = frozenset({"1", "true", "yes", "on"})
 _FALSE_LITERALS = frozenset({"0", "false", "no", "off"})
 
 
+def codegen_decorator_parts(static_shapes: object, index_dtype: object) -> list[str]:
+    """Human-facing decorator parts: static_shapes always, index_dtype if set.
+    Minimal subset for readability; run_id uses full CODEGEN_AFFECTING_SETTINGS
+    separately to stay collision-free without golden churn.
+    """
+    parts = [f"static_shapes={static_shapes}"]
+    if index_dtype is not None:
+        parts.append(f"index_dtype={index_dtype}")
+    return parts
+
+
 def _resolve_warning_name(name: str) -> type[exc.BaseWarning]:
     attr = name.strip()
     if not attr:
@@ -380,26 +391,33 @@ def is_pallas_interpret() -> bool:
 @dataclasses.dataclass
 class _Settings:
     # see __slots__ below for the doc strings that show up in help(Settings)
-    backend: str = dataclasses.field(default_factory=_get_backend)
+    backend: str = dataclasses.field(
+        default_factory=_get_backend, metadata={"codegen": True}
+    )
     ignore_warnings: list[type[exc.BaseWarning]] = dataclasses.field(
         default_factory=_get_ignore_warnings
     )
     index_dtype: torch.dtype | None = dataclasses.field(
-        default_factory=_get_index_dtype
+        default_factory=_get_index_dtype, metadata={"codegen": True}
     )
-    dot_precision: DotPrecision = dataclasses.field(default_factory=_get_dot_precision)
+    dot_precision: DotPrecision = dataclasses.field(
+        default_factory=_get_dot_precision, metadata={"codegen": True}
+    )
     fast_math: bool = dataclasses.field(
-        default_factory=functools.partial(_env_get_bool, "HELION_FAST_MATH", False)
+        default_factory=functools.partial(_env_get_bool, "HELION_FAST_MATH", False),
+        metadata={"codegen": True},
     )
     static_shapes: bool = dataclasses.field(
-        default_factory=functools.partial(_env_get_bool, "HELION_STATIC_SHAPES", True)
+        default_factory=functools.partial(_env_get_bool, "HELION_STATIC_SHAPES", True),
+        metadata={"codegen": True},
     )
     persistent_reserved_sms: int = dataclasses.field(
         default_factory=functools.partial(
             _env_get_int,
             "HELION_PERSISTENT_RESERVED_SMS",
             0,
-        )
+        ),
+        metadata={"codegen": True},
     )
     autotune_force_persistent: bool = dataclasses.field(
         default_factory=functools.partial(
@@ -410,6 +428,11 @@ class _Settings:
     )
     autotune_log_level: int = dataclasses.field(default_factory=_get_autotune_log_level)
     autotune_log: str | None = dataclasses.field(default_factory=_get_autotune_log_path)
+    autotune_dataset: bool = dataclasses.field(
+        default_factory=functools.partial(
+            _env_get_bool, "HELION_AUTOTUNE_DATASET", False
+        )
+    )
     autotune_compile_timeout: int = dataclasses.field(
         default_factory=functools.partial(
             _env_get_int, "HELION_AUTOTUNE_COMPILE_TIMEOUT", 60
@@ -539,12 +562,14 @@ class _Settings:
     allow_warp_specialize: bool = dataclasses.field(
         default_factory=functools.partial(
             _env_get_bool, "HELION_ALLOW_WARP_SPECIALIZE", True
-        )
+        ),
+        metadata={"codegen": True},
     )
     debug_dtype_asserts: bool = dataclasses.field(
         default_factory=functools.partial(
             _env_get_bool, "HELION_DEBUG_DTYPE_ASSERTS", False
-        )
+        ),
+        metadata={"codegen": True},
     )
     ref_mode: RefMode = dataclasses.field(default_factory=_get_ref_mode)
     autotune_cache: str = dataclasses.field(
@@ -583,13 +608,22 @@ class _Settings:
     pallas_interpret: bool = dataclasses.field(
         default_factory=functools.partial(
             _env_get_bool, "HELION_PALLAS_INTERPRET", False
-        )
+        ),
+        metadata={"codegen": True},
     )
     triton_do_not_specialize: bool = dataclasses.field(
         default_factory=functools.partial(
             _env_get_bool, "HELION_TRITON_DO_NOT_SPECIALIZE", False
-        )
+        ),
+        metadata={"codegen": True},
     )
+
+
+# Codegen-affecting Settings fields, tagged at definition with metadata={"codegen": True}.
+# Single source of truth for run_id; sorted for stable wire format across field reorders.
+CODEGEN_AFFECTING_SETTINGS: tuple[str, ...] = tuple(
+    sorted(f.name for f in dataclasses.fields(_Settings) if f.metadata.get("codegen"))
+)
 
 
 class Settings(_Settings):
@@ -636,6 +670,11 @@ class Settings(_Settings):
         "autotune_log": (
             "Base filename for autotune logs. Set HELION_AUTOTUNE_LOG=/tmp/run to write "
             "/tmp/run.csv and /tmp/run.log with per-config metrics and debug logs."
+        ),
+        "autotune_dataset": (
+            "Opt-in (HELION_AUTOTUNE_DATASET=1) to also write the cost-model "
+            "dataset sidecar /tmp/run.meta.jsonl (per-run kernel identity + the "
+            "configs tested, keyed by config_id). Off by default; needs autotune_log."
         ),
         "autotune_compile_timeout": "Timeout for Triton compilation in seconds used for autotuning. Default is 60 seconds.",
         "autotune_benchmark_subprocess": "Run the autotune benchmark phase in a long-lived spawn subprocess so a hung/slow kernel can be killed without losing autotune progress. Enabled by default. Set HELION_AUTOTUNE_BENCHMARK_SUBPROCESS=0 to disable.",
