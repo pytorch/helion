@@ -1533,6 +1533,7 @@ class PallasBackend(Backend):
             "pltpu": "from jax.experimental.pallas import tpu as pltpu",
             "_default_pallas_launcher": "from helion.runtime import default_pallas_launcher as _default_pallas_launcher",
             "_default_pallas_pipeline_launcher": "from helion.runtime import default_pallas_pipeline_launcher as _default_pallas_pipeline_launcher",
+            "_default_pallas_outer_pipeline_launcher": "from helion.runtime import default_pallas_outer_pipeline_launcher as _default_pallas_outer_pipeline_launcher",
             "_default_pallas_fori_launcher": "from helion.runtime import default_pallas_fori_launcher as _default_pallas_fori_launcher",
         }
 
@@ -2431,7 +2432,7 @@ class PallasBackend(Backend):
 
         # Pass scratch shapes for pipeline/fori_loop launcher
         pallas_loop_type = config.get("pallas_loop_type", "unroll")
-        if pallas_loop_type in ("emit_pipeline", "fori_loop"):
+        if pallas_loop_type in ("emit_pipeline", "fori_loop", "outer_pipeline"):
             scratch_shapes = [
                 (
                     s.shape,
@@ -2491,6 +2492,8 @@ class PallasBackend(Backend):
             )
         if pallas_loop_type == "emit_pipeline":
             return "_default_pallas_pipeline_launcher"
+        if pallas_loop_type == "outer_pipeline":
+            return "_default_pallas_outer_pipeline_launcher"
         if pallas_loop_type == "fori_loop":
             return "_default_pallas_fori_launcher"
         return self.default_launcher_name

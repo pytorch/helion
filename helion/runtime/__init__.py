@@ -1363,6 +1363,7 @@ class _PallasLoopKind(enum.Enum):
 
     UNROLL = "unroll"
     EMIT_PIPELINE = "emit_pipeline"
+    OUTER_PIPELINE = "outer_pipeline"
     FORI_LOOP = "fori_loop"
 
 
@@ -1471,6 +1472,8 @@ def _pallas_compile_jit_fn(
       (no scratch)
     - :attr:`_PallasLoopKind.EMIT_PIPELINE`: ``PrefetchScalarGridSpec``
       with HBM refs for pipeline-body tensors and VMEM scratch
+    - :attr:`_PallasLoopKind.OUTER_PIPELINE`: same launcher machinery as
+      ``EMIT_PIPELINE``; codegen moves the work grid inside the pipeline call
     - :attr:`_PallasLoopKind.FORI_LOOP`: same gridspec/scratch shape as
       ``EMIT_PIPELINE``; the kernel body uses ``jax.lax.fori_loop`` with
       manual DMA
@@ -1858,6 +1861,51 @@ def default_pallas_pipeline_launcher(
         cache,
         args,
         cache_attr="_pallas_pipeline_cache",
+        _ds_pad_dims=_ds_pad_dims,
+    )
+
+
+def default_pallas_outer_pipeline_launcher(
+    pallas_kernel: object,
+    grid: tuple[int, ...],
+    *args: object,
+    _output_indices: list[int] | None = None,
+    _inplace_indices: list[int] | None = None,
+    _block_spec_info: _BlockSpecInfo | None = None,
+    _scratch_shapes: list[tuple[tuple[int, ...], str]] | None = None,
+    _pipeline_arg_indices: list[int] | None = None,
+    _ds_pad_dims: list[tuple[int, int, int, int]] | None = None,
+    _smem_arg_indices: list[int] | None = None,
+    _pallas_interpret: bool | None = None,
+    _matmul_dot_general: dict[str, object] | None = None,
+    **kwargs: object,
+) -> object:
+    """Launcher for Pallas kernels whose work grid is folded into emit_pipeline."""
+    cache = getattr(pallas_kernel, "_pallas_outer_pipeline_cache", None)
+    if cache is None or cache[0] != grid:
+        cache = _pallas_install_launcher_cache(
+            pallas_kernel,
+            grid,
+            args,
+            kind=_PallasLoopKind.OUTER_PIPELINE,
+            cache_attr="_pallas_outer_pipeline_cache",
+            trace_key_suffix="_outer_pipeline",
+            _output_indices=_output_indices,
+            _inplace_indices=_inplace_indices,
+            _block_spec_info=_block_spec_info,
+            _smem_arg_indices=_smem_arg_indices,
+            _scratch_shapes=cast("list[object] | None", _scratch_shapes),
+            _pipeline_arg_indices=_pipeline_arg_indices,
+            _ds_pad_dims=_ds_pad_dims,
+            _pallas_interpret=_pallas_interpret,
+            _matmul_dot_general=_matmul_dot_general,
+        )
+
+    return _pallas_invoke_cached_launcher(
+        pallas_kernel,
+        cache,
+        args,
+        cache_attr="_pallas_outer_pipeline_cache",
         _ds_pad_dims=_ds_pad_dims,
     )
 

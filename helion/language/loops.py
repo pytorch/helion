@@ -12,10 +12,13 @@ from typing import TypeGuard
 from typing import cast
 from typing import overload
 
+import sympy
 import torch
 from torch._inductor.runtime.triton_heuristics import (
     get_max_y_grid,  # type: ignore[import-untyped]
 )
+from torch.utils._sympy.symbol import SymT
+from torch.utils._sympy.symbol import symbol_is_type
 
 from .. import exc
 from .._compat import use_tileir_tunables
@@ -66,6 +69,8 @@ def tile(
     end_or_none: int | torch.Tensor | None = None,
     /,
     block_size: object = None,
+    *,
+    max_extent: object = None,
 ) -> Iterator[Tile]: ...
 
 
@@ -78,6 +83,8 @@ def tile(
     end_or_none: Sequence[int | torch.Tensor] | None = None,
     /,
     block_size: object = None,
+    *,
+    max_extent: object = None,
 ) -> Iterator[Sequence[Tile]]: ...
 
 
@@ -89,6 +96,8 @@ def tile(
     end_or_none: int | torch.Tensor | Sequence[int | torch.Tensor] | None = None,
     /,
     block_size: object = None,
+    *,
+    max_extent: object = None,
 ) -> Iterator[Tile] | Iterator[Sequence[Tile]]:
     """
     Break up an iteration space defined by a size or sequence of sizes into tiles.
@@ -114,6 +123,10 @@ def tile(
                       Otherwise, the end of iteration space.
         end_or_none: If 2+ positional args provided, the end of iteration space.
         block_size: Fixed block size (overrides autotuning) or None for autotuned size
+        max_extent: Statically validated upper bound for ``end - begin`` when
+                    the true tile extent is data-dependent. It is recorded as
+                    tile metadata; Pallas outer_pipeline consumes it to form a
+                    static pipeline grid.
 
     Returns:
         Iterator[Tile] or Iterator[Sequence[Tile]]: Iterator over tile objects
@@ -270,6 +283,56 @@ def _allow_static_range(begin: object, end: object, step: object) -> bool:
     return count <= 8
 
 
+def _validate_max_extent(
+    max_extent: TypeInfo | None,
+    *,
+    is_scalar_tile: bool,
+) -> int | torch.SymInt | None:
+    """Resolve ``hl.tile(..., max_extent=...)`` to a proven static int bound, or
+    ``None`` if unset. Rejects multi-dim tiles, tensors, and unbacked/runtime/
+    non-positive values so outer_pipeline can use it as a sound static
+    ``max_tiles`` bound (not an example-derived guess)."""
+    if not _not_none(max_extent):
+        return None
+    if not is_scalar_tile:
+        raise exc.IncorrectTileUsage(
+            "hl.tile(max_extent=...) currently only supports one-dimensional tile loops"
+        )
+    proxy_max_extent = _to_proxy(max_extent)
+    if isinstance(proxy_max_extent, torch.Tensor):
+        raise exc.IncorrectTileUsage(
+            "hl.tile(max_extent=...) must be a statically known integer, got Tensor"
+        )
+    if isinstance(proxy_max_extent, (list, tuple)):
+        raise exc.IncorrectTileUsage(
+            "hl.tile(max_extent=...) must be a scalar integer, got a sequence"
+        )
+    if not isinstance(proxy_max_extent, (int, torch.SymInt)):
+        raise exc.IncorrectTileUsage(
+            "hl.tile(max_extent=...) must be a statically known integer, "
+            f"got {type(proxy_max_extent).__name__}"
+        )
+
+    env = CompileEnvironment.current()
+    if env.size_hint(proxy_max_extent) <= 0:
+        raise exc.IncorrectTileUsage(
+            "hl.tile(max_extent=...) must be a positive integer"
+        )
+    if isinstance(proxy_max_extent, torch.SymInt):
+        expr = proxy_max_extent._sympy_()
+        for symbol in expr.free_symbols:
+            if (
+                isinstance(symbol, sympy.Symbol)
+                and symbol_is_type(symbol, SymT.UNBACKED_INT)  # pyrefly: ignore [bad-argument-type]
+                and symbol not in env.specialized_vars
+            ):
+                raise exc.IncorrectTileUsage(
+                    "hl.tile(max_extent=...) must be statically known. "
+                    "Use hl.specialize(max_extent) or pass a tensor dimension."
+                )
+    return proxy_max_extent
+
+
 def _normalize_begin_end(
     begin_or_end: TypeInfo,
     end_or_none: TypeInfo | None,
@@ -297,6 +360,7 @@ def _(
     /,
     block_size: TypeInfo | None = None,
     *,
+    max_extent: TypeInfo | None = None,
     origin: Origin,
 ) -> TypeInfo:
     parent = ExtendedAST.current()[-2]
@@ -329,6 +393,7 @@ def _(
             "list[int | torch.SymInt | torch.Tensor | None]", proxy_block_size
         )
     block_size_list = Tile._tiles_to_sizes(block_size_list)
+    declared_max_extent = _validate_max_extent(max_extent, is_scalar_tile=unpack)
 
     # pyrefly: ignore [unbound-name]
     if unpack:
@@ -367,6 +432,10 @@ def _(
             else:
                 results.append(TileIndexType(origin=origin, block_id=index))
                 env.block_sizes[index].mark_alternate_size(size)
+
+    if declared_max_extent is not None:
+        env = CompileEnvironment.current()
+        env.block_sizes[results[0].block_id].mark_max_extent(declared_max_extent)
 
     _add_config_choices(
         [x.block_id for x in results],
@@ -536,7 +605,9 @@ def _(
     begin_or_end: int | torch.Tensor | list[int | torch.Tensor],
     end_or_none: int | torch.Tensor | list[int | torch.Tensor] | None = None,
     block_size: int | torch.Tensor | list[int | torch.Tensor] | None = None,
+    max_extent: int | torch.Tensor | None = None,
 ) -> Iterator[RefTile | tuple[RefTile, ...]]:
+    del max_extent
     begin, end = _normalize_begin_end_ref(begin_or_end, end_or_none)
     scalar_input = not isinstance(begin, list) and not isinstance(end, list)
     begin_list = _normalize_to_list(begin)
@@ -780,6 +851,13 @@ def _codegen_loop_helper(
 
     if loop_type == LoopType.GRID:
         block_ids = [t.block_id for t in indices]
+        # ``max_extent`` is type-propagation metadata, not a runtime grid arg.
+        # Keep the existing tile-strategy codegen contract at begin/end/step.
+        if len(state.proxy_args) > 3:
+            state = state._replace(
+                proxy_args=state.proxy_args[:3],
+                ast_args=None if state.ast_args is None else state.ast_args[:3],
+            )
         state.tile_strategy.codegen_grid(state, block_ids)
         return expr_from_string("None")
     raise AssertionError(f"Expected loop type: {loop_type}")

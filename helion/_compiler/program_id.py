@@ -542,6 +542,16 @@ class XYZProgramIDs(ProgramIDs):
         )
 
 
+class EmptyGridProgramIDs(ProgramIDs):
+    """No outer launch grid; work is scheduled inside a nested Pallas primitive."""
+
+    def codegen(self, state: CodegenState) -> None:
+        return None
+
+    def codegen_grid(self) -> ast.AST:
+        return expr_from_string("()")
+
+
 class FlatProgramIDs(ProgramIDs):
     """Only use the x grid and compute other dimensions"""
 

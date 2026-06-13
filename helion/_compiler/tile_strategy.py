@@ -28,6 +28,7 @@ from .compile_environment import _has_unbacked
 from .compile_environment import _to_sympy
 from .device_function import DeviceFunction
 from .host_function import HostFunction
+from .program_id import EmptyGridProgramIDs
 from .program_id import FlatProgramIDs
 from .program_id import ForEachProgramID
 from .program_id import L2GroupingProgramIDs
@@ -2594,7 +2595,10 @@ class FlattenedTileStrategy(BlockSizeTileStrategy):
                 f"({self._expr_str(step)}) - 1) // ({self._expr_str(step)})"
             )
         if diff_expr is not None:
-            return sympy.ceiling(sympy.Mul(diff_expr, sympy.Pow(step_expr, -1)))
+            return cast(
+                "sympy.Expr",
+                sympy.ceiling(sympy.Mul(diff_expr, sympy.Pow(step_expr, -1))),
+            )
         return (
             f"((({self._expr_str(end)}) - ({self._expr_str(begin)})) + "
             f"({self._expr_str(step)}) - 1) // ({self._expr_str(step)})"
@@ -3183,6 +3187,16 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
             return [None] * len(self.block_ids)
         return self._normalize_loop_steps(state.proxy_args[2], len(self.block_ids))
 
+    def _setup_mask(
+        self,
+        state: CodegenState,
+        block_idx: int,
+        block_size: SymIntLike,
+        index_var: str,
+        end: object,
+    ) -> ast.stmt | None:
+        raise NotImplementedError
+
     def _range_numel_expr(
         self, begin: object, end: object, step: object | None
     ) -> sympy.Expr | str:
@@ -3211,7 +3225,10 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
                 f"({self._expr_str(step)}) - 1) // ({self._expr_str(step)})"
             )
         if diff_expr is not None:
-            return sympy.ceiling(sympy.Mul(diff_expr, sympy.Pow(step_expr, -1)))
+            return cast(
+                "sympy.Expr",
+                sympy.ceiling(sympy.Mul(diff_expr, sympy.Pow(step_expr, -1))),
+            )
         return (
             f"((({self._expr_str(end)}) - ({self._expr_str(begin)})) + "
             f"({self._expr_str(step)}) - 1) // ({self._expr_str(step)})"
@@ -3222,9 +3239,173 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
             return self.fn.sympy_expr(_to_sympy(value))
         return ast.unparse(self._to_ast(value))
 
+    def _codegen_outer_pipeline_grid(self, state: CodegenState) -> DeviceGridState:
+        """Record a Pallas root grid for folding into a later emit_pipeline."""
+        from .pallas.outer_pipeline import PipelineAxis
+        from .pallas.outer_pipeline import PipelineContext
+        from .pallas.outer_pipeline import PipelineExpr
+
+        block_ids = self.block_ids
+        env = CompileEnvironment.current()
+        if env.outer_pipeline_context is not None:
+            raise exc.BackendUnsupported(
+                "pallas",
+                "outer_pipeline currently supports exactly one top-level grid",
+            )
+
+        block_sizes = self.block_size
+        assert len(block_sizes) == len(block_ids)
+        pids = self.select_pid_strategy()
+        if isinstance(pids, FlatProgramIDs) and len(block_ids) >= 2:
+            pids = XYZProgramIDs()
+        if isinstance(state.device_function.pid, ForEachProgramID):
+            raise exc.BackendUnsupported(
+                "pallas",
+                "outer_pipeline currently supports exactly one top-level grid",
+            )
+
+        assert state.ast_args is None
+        assert len(state.proxy_args) == 3
+        if state.proxy_args[1] is None:
+            begins: list[object] = [0] * len(block_ids)
+            ends_arg = state.proxy_args[0]
+        else:
+            begins_arg = state.proxy_args[0]
+            ends_arg = state.proxy_args[1]
+            begins = (
+                list(begins_arg)
+                if isinstance(begins_arg, (list, tuple))
+                else [begins_arg]
+            )
+            assert len(begins) == len(block_ids)
+        ends = list(ends_arg) if isinstance(ends_arg, (list, tuple)) else [ends_arg]
+        assert len(ends) == len(block_ids)
+        steps = self._root_grid_steps(state)
+
+        tracker = ThreadAxisTracker()
+        thread_axis_offset = self._thread_axis_offset(state)
+        thread_axis_map = self._thread_axis_map()
+        prologue: list[ast.AST] = []
+        index_vars_by_block: dict[int, str] = {}
+        offset_vars_by_block: dict[int, str] = {}
+        prologue_names: set[str] = set()
+        pipeline_axes: list[PipelineAxis] = []
+
+        for i, (block_idx, block_size, begin, end, step) in enumerate(
+            reversed(
+                self._reorder(
+                    [*zip(block_ids, block_sizes, begins, ends, steps, strict=True)]
+                )
+            )
+        ):
+            numel = self._range_numel_expr(begin, end, step)
+            dtype = env.index_type()
+            offset_var = self.offset_var(block_idx)
+            index_var = self.index_var(block_idx)
+            offset_vars_by_block[block_idx] = offset_var
+            index_vars_by_block[block_idx] = index_var
+            pid_var = state.device_function.new_var(f"pid_{i}", dce=True)
+            prologue_names.update({pid_var, offset_var, index_var})
+            begin_expr = self._expr_str(begin)
+
+            if step not in (None, 1):
+                step_expr = self._expr_str(step)
+                block_size_var = "1"
+                axis_step_expr = step_expr
+                offset_expr = f"({begin_expr}) + ({pid_var}) * ({step_expr})"
+            elif block_size != 1:
+                block_size_var = self.block_size_var(block_idx)
+                assert block_size_var is not None
+                self._setup_block_size_constexpr(state, block_size_var, block_size)
+                axis_step_expr = block_size_var
+                offset_expr = f"({begin_expr}) + ({pid_var}) * ({block_size_var})"
+            else:
+                block_size_var = "1"
+                axis_step_expr = "1"
+                offset_expr = f"({begin_expr}) + ({pid_var})"
+
+            axis = thread_axis_offset + thread_axis_map[block_idx]
+            uses_thread_axis = step in (
+                None,
+                1,
+            ) and self._uses_thread_axis_for_block(block_idx, block_size)
+            bs = block_size_var if uses_thread_axis else "1"
+            idx_expr = env.backend.grid_index_expr(offset_var, bs, dtype, axis=axis)
+            if uses_thread_axis and isinstance(block_size, int):
+                tracker.record(block_idx, axis, block_size)
+            prologue.extend(
+                [
+                    statement_from_string(
+                        f"{pid_var} = _pipeline_indices[{len(pids.pid_info)}]"
+                    ),
+                    statement_from_string(f"{offset_var} = {offset_expr}"),
+                    statement_from_string(f"{index_var} = {idx_expr}"),
+                ]
+            )
+            mask_statement = self._setup_mask(
+                state, block_idx, block_size, index_var, end
+            )
+            if mask_statement is not None:
+                prologue.append(mask_statement)
+            pid_info = PIDInfo(pid_var, block_size_var, numel, block_idx)
+            lambda_param = f"_o{len(pids.pid_info)}"
+            pipeline_axes.append(
+                PipelineAxis(
+                    block_id=block_idx,
+                    kind="parallel",
+                    begin=PipelineExpr.from_string(begin_expr),
+                    end=PipelineExpr.from_string(self._expr_str(end)),
+                    max_tiles=PipelineExpr.from_string(
+                        pid_info.num_pids_expr(is_device=False)
+                    ),
+                    step=PipelineExpr.from_string(axis_step_expr),
+                    block_extent=block_size_var,
+                    lambda_param=lambda_param,
+                    pid_var=pid_var,
+                    offset_var=offset_var,
+                    index_var=index_var,
+                )
+            )
+            pids.append(pid_info)
+
+        env.outer_pipeline_context = PipelineContext(
+            axes=pipeline_axes,
+            prologue_replay_stmts=prologue,
+            prologue_defined_names=prologue_names,
+            prologue_assigns={
+                stmt.targets[0].id: stmt.value
+                for stmt in prologue
+                if isinstance(stmt, ast.Assign)
+                and len(stmt.targets) == 1
+                and isinstance(stmt.targets[0], ast.Name)
+            },
+            capturing_prologue_replay=True,
+        )
+        state.device_function.set_pid(EmptyGridProgramIDs())
+
+        has_tensor_ends = any(isinstance(e, torch.Tensor) for e in ends)
+        block_id_to_info = (
+            self._create_block_id_info_dict(
+                state, ends_override=cast("list[object]", ends)
+            )
+            if has_tensor_ends
+            else self._create_block_id_info_dict(state)
+        )
+        return DeviceGridState(
+            self,
+            block_id_to_info=block_id_to_info,
+            thread_axis_sizes=tracker.sizes,
+            block_thread_axes=tracker.block_axes,
+        )
+
     def codegen_grid(self, state: CodegenState) -> DeviceGridState:
         block_ids = self.block_ids
         env = CompileEnvironment.current()
+        if (
+            env.backend.name == "pallas"
+            and state.config.get("pallas_loop_type", "unroll") == "outer_pipeline"
+        ):
+            return self._codegen_outer_pipeline_grid(state)
         block_sizes = self.block_size
         assert len(block_sizes) == len(block_ids)
         pids = self.select_pid_strategy()
