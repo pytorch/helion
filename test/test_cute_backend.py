@@ -1392,6 +1392,52 @@ class TestCuteBackend(TestCase):
         self.assertIn("cute.nvgpu.tcgen05.CtaGroup.TWO", code)
         self.assertIn("compute_epilogue_tile_shape((64, 128), True", code)
 
+    def test_matmul_mma_tcgen05_fp8_two_cta_m128_rowvec_prewait_hoist(self) -> None:
+        """The bm=128 2-CTA family pre-hoists rowvec aux above the acc wait.
+
+        One whole-fragment ``autovec_copy`` into registers is emitted in the
+        per-tile setup (before the accumulator ``consumer_wait``) so the
+        rowvec GMEM latency hides under the MMA wait; the per-subtile loop
+        slices the register tensor instead of issuing per-subtile LDGs.
+        bm=256 must keep the per-subtile GMEM load (the whole-tile hoist
+        historically caused register spills there).
+        """
+        support = get_cute_mma_support()
+        if not support.tcgen05_f8:
+            self.skipTest("tcgen05 FP8 MMA is not supported on this machine")
+
+        torch.manual_seed(0)
+        x = (torch.randn(256, 512, device=DEVICE) * 0.4).to(torch.float8_e4m3fn)
+        y = (torch.randn(512, 256, device=DEVICE) * 0.4).to(torch.float8_e4m3fn)
+        scale_n = torch.rand(256, device=DEVICE) + 0.5
+        code, out = code_and_output(
+            cute_matmul_mma_fp8_rowvec_scale,
+            (x, y, scale_n),
+            block_sizes=[128, 128, 128],
+            tcgen05_cluster_m=2,
+            pid_type="persistent_blocked",
+        )
+        ref = (x.float() @ y.float()) * scale_n.float()
+        torch.testing.assert_close(out.float(), ref, atol=1.0, rtol=1e-1)
+        # Whole-fragment register hoist present...
+        self.assertIn("tcgen05_aux_rmem_full_", code)
+        hoist_pos = code.index("cute.autovec_copy(tcgen05_tTR_gAux_grouped_")
+        # ...and emitted before the accumulator consumer_wait.
+        acc_wait_pos = code.index(".consumer_wait(tcgen05_acc_consumer_state)")
+        self.assertLess(hoist_pos, acc_wait_pos)
+        # The subtile loop reads the register tensor, not per-subtile GMEM.
+        self.assertNotIn("tcgen05_tTR_gAux_subtile_", code)
+
+        # bm=256 keeps the per-subtile GMEM load (no whole-fragment hoist).
+        code256 = cute_matmul_mma_fp8_rowvec_scale.bind((x, y, scale_n)).to_triton_code(
+            helion.Config(
+                block_sizes=[256, 128, 128],
+                tcgen05_cluster_m=2,
+                pid_type="persistent_blocked",
+            )
+        )
+        self.assertNotIn("tcgen05_aux_rmem_full_", code256)
+
     def test_matmul_mma_tcgen05_f16_m128_cluster_m2_keeps_cta_group_one(
         self,
     ) -> None:
