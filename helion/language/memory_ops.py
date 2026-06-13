@@ -24,6 +24,7 @@ from .._compiler.cute.cute_fx_walk import reach_tcgen05_matmul_anchors
 from .._compiler.cute.cutedsl_compat import emit_pipeline_advance
 from .._compiler.cute.strategies import tcgen05_default_epilogue_tile_expr
 from .._compiler.cute.strategies import tcgen05_explicit_d_store_tile_expr
+from .._compiler.cute.strategies import tcgen05_two_cta_m128_epilogue_tile_expr
 from .._compiler.cute.tcgen05_constants import (
     TCGEN05_ACC_WAIT_PLACEMENT_BEFORE_SUBTILE_LOOP,
 )
@@ -3531,6 +3532,14 @@ def _codegen_cute_store_tcgen05_tile(
                 tcgen05_value.role_local_tile_counter,
                 increment_per_tile=not tcgen05_value.tma_store_full_tiles_only,
             )
+        # The bm=128 CtaGroup.TWO family's epilogue tile is N-mode permuted
+        # (see ``tcgen05_two_cta_m128_epilogue_tile_expr``); the host TMA-store
+        # atom must be built from this *exact* device-side expression, not from
+        # the plain ``epi_tile_m/n`` integer keys (which build an unpermuted
+        # ``(m, n)`` tile and silently scramble the output -- the correctness
+        # bug §7 in FINDINGS_512_SHAPE.md). ``epi_tile_raw_expr`` carries the
+        # verbatim device expression to the wrapper.
+        d_two_cta_m128 = tcgen05_lifecycle.is_two_cta and tcgen05_value.bm == 128
         d_tma_plan: dict[str, object] = {
             "kind": "tcgen05_d_tma",
             "d_name": tensor_name,
@@ -3542,6 +3551,18 @@ def _codegen_cute_store_tcgen05_tile(
                 tcgen05_value.tma_store_atom,
                 tcgen05_value.tma_store_tensor,
             ],
+            **(
+                {
+                    "epi_tile_raw_expr": tcgen05_two_cta_m128_epilogue_tile_expr(
+                        tcgen05_value.bm,
+                        tcgen05_value.bn,
+                        target_dtype,
+                        c_layout="cutlass.utils.layout.LayoutEnum.ROW_MAJOR",
+                    )
+                }
+                if d_two_cta_m128 and not tcgen05_value.has_explicit_epilogue_tile
+                else {}
+            ),
             **(
                 {
                     "epi_tile_m": tcgen05_value.explicit_epi_tile_m,
@@ -3561,6 +3582,13 @@ def _codegen_cute_store_tcgen05_tile(
     tcgen05_c_stage_count = tcgen05_value.c_stage_count
     tcgen05_is_two_cta = tcgen05_lifecycle.is_two_cta
     tcgen05_thr_mma = tcgen05_value.thr_mma
+    # The bm=128 CtaGroup.TWO family stores through the per-CTA epilogue tile
+    # (m of 64, ``use_2cta=True``, no-source) so the store-side
+    # ``tcgen05_store_epi_tile``, the ``kernel_desc.cta_tile_shape_mnk``, and
+    # the host TMA-store atom all match the device-side N-mode-permuted tile.
+    # See ``tcgen05_two_cta_m128_epilogue_tile_expr``.
+    tcgen05_two_cta_m128 = tcgen05_is_two_cta and tcgen05_bm == 128
+    tcgen05_store_tile_m = tcgen05_bm // 2 if tcgen05_two_cta_m128 else tcgen05_bm
     full_tile_expr = (
         f"({base_indices[0]}) + cutlass.Int32({tcgen05_bm}) <= {m_size} "
         f"and ({base_indices[1]}) + cutlass.Int32({tcgen05_bn}) <= {n_size}"
@@ -3569,18 +3597,26 @@ def _codegen_cute_store_tcgen05_tile(
     def store_common_setup(
         gmem_tensor: str, *, include_full_tile: bool
     ) -> tuple[list[str], list[str]]:
-        epi_tile_expr = tcgen05_explicit_store_tile_expr or (
-            tcgen05_default_epilogue_tile_expr(
+        if tcgen05_explicit_store_tile_expr is not None:
+            epi_tile_expr = tcgen05_explicit_store_tile_expr
+        elif tcgen05_two_cta_m128:
+            epi_tile_expr = tcgen05_two_cta_m128_epilogue_tile_expr(
                 tcgen05_bm,
                 tcgen05_bn,
                 target_dtype,
                 c_layout="cutlass.utils.layout.LayoutEnum.ROW_MAJOR",
             )
-        )
+        else:
+            epi_tile_expr = tcgen05_default_epilogue_tile_expr(
+                tcgen05_bm,
+                tcgen05_bn,
+                target_dtype,
+                c_layout="cutlass.utils.layout.LayoutEnum.ROW_MAJOR",
+            )
         static_setup = [
             (
                 f"{kernel_desc} = type('Tcgen05KernelDesc', (), {{"
-                f"'cta_tile_shape_mnk': ({tcgen05_bm}, {tcgen05_bn}, {tcgen05_bk}), "
+                f"'cta_tile_shape_mnk': ({tcgen05_store_tile_m}, {tcgen05_bn}, {tcgen05_bk}), "
                 "'c_layout': cutlass.utils.layout.LayoutEnum.ROW_MAJOR, "
                 f"'c_dtype': {target_dtype}, "
                 "'acc_dtype': cutlass.Float32, "
