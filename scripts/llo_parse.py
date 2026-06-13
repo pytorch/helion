@@ -233,15 +233,14 @@ def _extract_trip_count(
                     smov_to_bound[m.group(1).lstrip("%")] = sadd_to_bound[src]
     all_tracked = {**sadd_to_bound, **smov_to_bound}
 
-    # Step 4: match scmp.ge constants to bounds.
-    # `resolved_regs` counts the number of DISTINCT induction registers we
-    # pinned a trip for — i.e. how many loop levels we actually resolved.
-    # `level_to_trip` (keyed by the phi iter-bound value) can collapse two
-    # real loops onto one key and keep only the max, so it is NOT a reliable
-    # level count; resolved_regs is. The caller cross-checks this against the
-    # LB nesting depth to decide whether the inference is complete.
-    level_to_trip: dict[int, int] = {}
-    resolved_regs: set[str] = set()
+    # Step 4: match scmp.ge constants to loop trips, keyed by induction
+    # REGISTER (one entry per distinct loop counter). Keying by the phi
+    # iter-bound VALUE would collapse two distinct nested loops that happen to
+    # share the same bound onto one key and drop a factor from the product;
+    # register identity keeps every level. The number of distinct registers is
+    # also the count of resolved loop levels, which the caller cross-checks
+    # against the LB nesting depth to decide whether the inference is complete.
+    reg_to_trip: dict[str, int] = {}
     all_scmp_ge: list[int] = []
     for addr in all_addrs:
         for raw in raw_instrs.get(addr, []):
@@ -252,18 +251,15 @@ def _extract_trip_count(
                 const = int(m.group(2))
                 all_scmp_ge.append(const)
                 if reg in all_tracked:
-                    resolved_regs.add(reg)
-                    level = all_tracked[reg]
-                    if level not in level_to_trip or const > level_to_trip[level]:
-                        level_to_trip[level] = const
+                    reg_to_trip[reg] = max(reg_to_trip.get(reg, 0), const)
 
-    if level_to_trip:
+    if reg_to_trip:
         linearized = 1
-        for trip in level_to_trip.values():
+        for trip in reg_to_trip.values():
             linearized *= trip
         max_scmp = max(all_scmp_ge) if all_scmp_ge else linearized
         pipeline_depth = max(0, max_scmp - linearized)
-        return max(linearized, 1), pipeline_depth, True, len(resolved_regs)
+        return max(linearized, 1), pipeline_depth, True, len(reg_to_trip)
 
     # Fallback: heuristic from max scmp.ge constant. The original tool
     # uses `max_scmp - 2` here, but for kernels with multi-level loops
@@ -276,7 +272,8 @@ def _extract_trip_count(
         max_val = max(all_scmp_ge)
         pipeline_depth = 2
         linearized_heuristic = max(max_val - pipeline_depth, 1)
-        return linearized_heuristic, pipeline_depth, False, len(resolved_regs)
+        # Fallback pinned no induction register → 0 resolved levels.
+        return linearized_heuristic, pipeline_depth, False, len(reg_to_trip)
 
     return 1, 0, False, 0
 
