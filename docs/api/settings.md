@@ -144,8 +144,9 @@ def my_kernel(x: torch.Tensor) -> torch.Tensor:
 .. autoattribute:: Settings.autotune_log
 
    When set, Helion writes per-config telemetry (run id, timestamp, config id, generation, status, perf, compile time) to ``<value>.csv`` and mirrors the autotune log to ``<value>.log`` (for population-based autotuners: ``PatternSearch``, ``DifferentialEvolution``). Both append, so runs sharing one base path accumulate.
-   Each CSV row carries two content-hash join keys: ``run_id`` (the invocation -- kernel source, codegen-affecting settings, shapes, dtypes, hardware) and ``config_id`` (the config). Because both are content hashes, a config's ``started``/``ok``/``error`` rows and re-benchmarks share one ``config_id``. The config itself is not in the CSV; it lives in the ``.meta.jsonl`` sidecar keyed by ``config_id`` (see ``autotune_dataset``).
-   Controlled by ``HELION_AUTOTUNE_LOG``.
+   CSV rows join to ``.meta.jsonl`` via two hashes: ``run_id`` for the invocation — hash(kernel source, shapes, dtypes, hardware, codegen settings) — and ``config_id`` for the config. Codegen settings are Settings fields tagged metadata={"codegen":True}: backend, dot_precision, fast_math, static_shapes, index_dtype, allow_warp_specialize, triton_do_not_specialize, pallas_interpret, debug_dtype_asserts, persistent_reserved_sms. Same config_id across started/ok/error and re-benchmarks; full config stored only in sidecar configs map. Controlled by HELION_AUTOTUNE_LOG.
+
+
 
 .. autoattribute:: Settings.autotune_dataset
 

@@ -61,23 +61,19 @@ class AutotuneMetrics:
 
 
 def _codegen_signature(settings: dict[str, object] | None) -> str:
-    """Codegen-affecting settings that influence generated code (and thus perf).
+    """Join codegen-affecting settings into a stable string for run_id.
 
-    Reuses :func:`helion.runtime.settings.codegen_decorator_parts` -- the same
-    source of truth :meth:`BoundKernel.format_kernel_decorator` uses -- so the
-    ``run_id`` signature and the reproduction decorator never drift. Used only to
-    keep ``run_id`` distinct across codegen-affecting settings; the full settings
-    are stored separately. Tolerant of a missing/partial mapping (best-effort).
-    The import is local to avoid an autotuner<->runtime import cycle.
+    Iterates CODEGEN_AFFECTING_SETTINGS tagged at field definition, so any
+    codegen change alters run_id. Order is alphabetical for stability across
+    field reorders; missing keys render as None. Full settings are stored
+    separately in metadata.
     """
     if not settings:
         return ""
-    from ..runtime.settings import codegen_decorator_parts
+    from ..runtime.settings import CODEGEN_AFFECTING_SETTINGS
 
     return ", ".join(
-        codegen_decorator_parts(
-            settings.get("static_shapes"), settings.get("index_dtype")
-        )
+        f"{name}={settings.get(name)}" for name in CODEGEN_AFFECTING_SETTINGS
     )
 
 
