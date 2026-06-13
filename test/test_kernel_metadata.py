@@ -227,23 +227,62 @@ class TestMetadataSchema(TestCase):
         self.assertEqual(record["kernel_source"], "")
         json.dumps(record, default=str)
 
-    def test_run_id_signature_shares_decorator_source(self) -> None:
-        """
-        The run_id codegen signature is derived from the SAME helper that
-        BoundKernel.format_kernel_decorator uses, so the two cannot drift. A
-        parallel reimplementation would let run_id silently stop reflecting a
-        newly codegen-affecting setting.
-        """
-        from helion.autotuner.metrics import _codegen_signature
-        from helion.runtime.settings import codegen_decorator_parts
+    def test_codegen_settings_tagged(self) -> None:
+        """CODEGEN_AFFECTING_SETTINGS is exactly the 10 codegen-tagged fields, in
+        sorted order (the run_id wire format is stable across field reordering)."""
+        from helion.runtime.settings import CODEGEN_AFFECTING_SETTINGS
 
-        settings = helion.Settings(static_shapes=False, index_dtype=torch.int32)
-        expected = ", ".join(
-            codegen_decorator_parts(settings.static_shapes, settings.index_dtype)
+        self.assertEqual(
+            CODEGEN_AFFECTING_SETTINGS,
+            (
+                "allow_warp_specialize",
+                "backend",
+                "debug_dtype_asserts",
+                "dot_precision",
+                "fast_math",
+                "index_dtype",
+                "pallas_interpret",
+                "persistent_reserved_sms",
+                "static_shapes",
+                "triton_do_not_specialize",
+            ),
         )
-        self.assertEqual(_codegen_signature(settings.to_dict()), expected)
-        self.assertIn("static_shapes=False", expected)
-        self.assertIn("index_dtype=torch.int32", expected)
+
+    def test_run_id_signature_covers_codegen_settings(self) -> None:
+        """run_id signature includes every codegen field in order, no extras."""
+        from helion.autotuner.metrics import _codegen_signature
+        from helion.runtime.settings import CODEGEN_AFFECTING_SETTINGS
+
+        sig = _codegen_signature(helion.Settings().to_dict())
+        for name in CODEGEN_AFFECTING_SETTINGS:
+            self.assertIn(f"{name}=", sig)
+
+    def test_run_id_distinguishes_each_codegen_setting(self) -> None:
+        """Flipping any single codegen setting changes run_id, exercised with the
+        setting's real value type (bool/int/str/torch.dtype/None)."""
+        from helion.runtime.settings import CODEGEN_AFFECTING_SETTINGS
+
+        # (base, changed) pairs with type-accurate values per setting.
+        pairs: dict[str, tuple[object, object]] = {
+            "backend": ("triton", "cute"),
+            "dot_precision": ("tf32", "ieee"),
+            "fast_math": (False, True),
+            "static_shapes": (True, False),
+            "index_dtype": (None, torch.int64),
+            "allow_warp_specialize": (True, False),
+            "triton_do_not_specialize": (False, True),
+            "pallas_interpret": (False, True),
+            "debug_dtype_asserts": (False, True),
+            "persistent_reserved_sms": (0, 8),
+        }
+        base_settings = {n: pairs[n][0] for n in CODEGEN_AFFECTING_SETTINGS}
+        base = self._metadata(settings=base_settings)
+        for name in CODEGEN_AFFECTING_SETTINGS:
+            with self.subTest(setting=name):
+                changed = {**base_settings, name: pairs[name][1]}
+                self.assertNotEqual(
+                    base.run_id, self._metadata(settings=changed).run_id, name
+                )
 
 
 class TestAutotuneLogEntry(TestCase):
