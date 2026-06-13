@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import locale
 import operator
 import unittest
 
@@ -13,6 +14,15 @@ from helion._testing import skipIfMTIA
 from helion._testing import skipIfNotTriton
 from helion._testing import skipIfXPU
 import helion.language as hl
+
+# Triton writes its generated launcher source with the process locale encoding;
+# force a UTF-8 locale so a non-UTF-8 worker doesn't fail to encode non-ASCII bytes.
+for _utf8_locale in ("C.UTF-8", "en_US.UTF-8", "C.utf8", "en_US.utf8"):
+    try:
+        locale.setlocale(locale.LC_CTYPE, _utf8_locale)
+        break
+    except locale.Error:
+        continue
 
 
 @skipIfMTIA("autodiff not tested on MTIA")
