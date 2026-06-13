@@ -19,6 +19,7 @@ import torch
 
 import helion
 from helion._testing import DEVICE
+from helion._testing import LONG_INT_TYPE
 from helion._testing import run_example
 import helion.language as hl
 
@@ -151,13 +152,15 @@ def create_test_jagged_tensor(
     """Create test jagged tensor data."""
 
     # Generate random sequence lengths
-    seq_lengths = torch.randint(1, max_seqlen + 1, (B,), device=device)
+    seq_lengths = torch.randint(
+        1, max_seqlen + 1, (B,), dtype=LONG_INT_TYPE, device=device
+    )
 
     # Create offsets
     x_offsets = torch.cat(
         [
-            torch.zeros(1, dtype=torch.long, device=device),
-            torch.cumsum(seq_lengths, dim=0),
+            torch.zeros(1, dtype=LONG_INT_TYPE, device=device),
+            torch.cumsum(seq_lengths, dim=0, dtype=LONG_INT_TYPE),
         ]
     )
 

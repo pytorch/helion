@@ -35,6 +35,7 @@ import torch
 
 import helion
 from helion._testing import DEVICE
+from helion._testing import LONG_INT_TYPE
 from helion._testing import run_example
 import helion.language as hl
 
@@ -127,9 +128,11 @@ def random_input(
     max_seq_len: int = 3,
     dtype: torch.dtype = torch.float32,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    lengths = torch.randint(max_seq_len + 1, size=(batch_size,), device=DEVICE)
-    seq_offsets = torch.zeros((batch_size + 1,), dtype=torch.int64, device=DEVICE)
-    seq_offsets[1:] = torch.cumsum(lengths, dim=0)
+    lengths = torch.randint(
+        max_seq_len + 1, size=(batch_size,), dtype=LONG_INT_TYPE, device=DEVICE
+    )
+    seq_offsets = torch.zeros((batch_size + 1,), dtype=LONG_INT_TYPE, device=DEVICE)
+    seq_offsets[1:] = torch.cumsum(lengths, dim=0, dtype=LONG_INT_TYPE)
     jagged_size = int(seq_offsets[-1].item())
     jagged = (
         torch.empty((jagged_size, D), dtype=dtype, device=DEVICE)
