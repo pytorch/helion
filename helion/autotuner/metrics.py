@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import dataclasses
+import functools
 import hashlib
 import time
 from typing import TYPE_CHECKING
@@ -94,7 +95,7 @@ class KernelMetadata:
     Because every CSV row is also stamped with ``run_id``, rows join to exactly
     one meta record (a clean many-to-one).
 
-    ``run_id`` is derived in :meth:`__post_init__` when not provided.
+    ``run_id`` is a :func:`functools.cached_property` computed on first access.
     ``kernel_source`` carries the full source text and ``settings`` the full
     reproduction context for analysis.
     """
@@ -105,18 +106,15 @@ class KernelMetadata:
     dtypes: str = ""
     hardware: str = ""
     settings: dict[str, object] | None = None
-    run_id: str = ""
 
-    def __post_init__(self) -> None:
-        if not self.run_id:
-            self.run_id = self._compute_run_id()
+    @functools.cached_property
+    def run_id(self) -> str:
+        """Stable, content-derived id for this run, computed once and cached.
 
-    def _compute_run_id(self) -> str:
-        """Stable id for this run, hashed directly from its identity content.
-
-        Content-derived so the same invocation produces the same ``run_id``
-        across processes and CI runs. The fields are joined with a delimiter
-        that cannot appear inside them to avoid boundary collisions.
+        Hashed from ``(kernel_source, codegen-settings signature, input_shapes,
+        dtypes, hardware)`` joined with a delimiter that cannot appear inside the
+        fields (so boundaries can't collide). Content-derived, so the same
+        invocation yields the same ``run_id`` across processes and CI runs.
         """
         payload = (
             f"{self.kernel_source}\x00{_codegen_signature(self.settings)}\x00"
