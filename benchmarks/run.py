@@ -1263,20 +1263,6 @@ def check_and_setup_tritonbench() -> None:
             check=True,
         )
 
-        print("Installing tritonbench requirements...", file=sys.stderr)
-        subprocess.run(
-            [
-                sys.executable,
-                "-m",
-                "pip",
-                "install",
-                "-r",
-                "requirements.txt",
-            ],
-            cwd=tritonbench_path,
-            check=True,
-        )
-
         print("Running install.py --liger...", file=sys.stderr)
         subprocess.run(
             [sys.executable, "install.py", "--liger"],
@@ -1291,21 +1277,28 @@ def check_and_setup_tritonbench() -> None:
             check=True,
         )
 
-        importlib.invalidate_caches()
-
         try:
+            importlib.invalidate_caches()
             # pyrefly: ignore [missing-import]
             import tritonbench
 
             print("Tritonbench installed successfully.", file=sys.stderr)
-            if installing_marker.exists():
-                installing_marker.unlink()
         except ImportError:
             print(
                 "Error: Tritonbench package installation failed. The package cannot be imported.",
                 file=sys.stderr,
             )
+            if installing_marker.exists():
+                installing_marker.unlink()
             sys.exit(1)
+
+        if installing_marker.exists():
+            installing_marker.unlink()
+
+        # Re-exec so the freshly-installed package (and all its submodules)
+        # is discovered cleanly by a new Python process.
+        print("Restarting to pick up freshly-installed tritonbench...", file=sys.stderr)
+        os.execv(sys.executable, [sys.executable, *sys.argv])
 
     except subprocess.CalledProcessError as e:
         print(f"Error installing tritonbench: {e}", file=sys.stderr)
@@ -1313,6 +1306,10 @@ def check_and_setup_tritonbench() -> None:
             print(f"stdout: {e.stdout}", file=sys.stderr)
         if e.stderr:
             print(f"stderr: {e.stderr}", file=sys.stderr)
+        # Clean up the marker so the next run doesn't re-trigger a full
+        # clone cycle.  The user can re-run or install manually.
+        if installing_marker.exists():
+            installing_marker.unlink()
         sys.exit(1)
 
 
