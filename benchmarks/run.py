@@ -104,11 +104,36 @@ MAX_NUM_INPUTS = 20
 MAMBA2_LARGE_SHAPE = (64, 64, 1, 8192, 256, 64, 128)
 MAMBA2_LARGE_SHAPE_MIN_FREE_MEMORY_BYTES = 100 * 1024**3
 
+# fp8_gemm dashboard shapes (m, k, n): skinny-M FP8 decode shapes plus FP8 W8A8
+# (per-channel weight + per-token act) decoder-layer serving GEMMs, as seen by
+# vLLM's cutlass_scaled_mm. These replace TritonBench's default square sweep,
+# which is unrepresentative of the memory-bound decode / small-batch regime this
+# kernel targets.
+_FP8_GEMM_SKINNY_SHAPES = [  # (m, k, n)
+    (1, 4096, 4096),
+    (16, 4096, 14336),
+]
+# (k, n) per decoder layer; M is the token count per forward:
+# decode -> running batch size; 512 -> ~prefill chunk. lm_head excluded (bf16).
+_FP8_GEMM_LAYER_KN = [
+    (2048, 4096),  # qkv_proj      (q 2048 + k 1024 + v 1024, GQA)
+    (2048, 2048),  # o_proj
+    (2048, 12288),  # gate_up_proj  (2 x intermediate 6144, fused)
+    (6144, 2048),  # down_proj
+]
+_FP8_GEMM_LAYER_M = [64, 512]
+_FP8_GEMM_ALL_SHAPES = _FP8_GEMM_SKINNY_SHAPES + [
+    (m, k, n) for m in _FP8_GEMM_LAYER_M for (k, n) in _FP8_GEMM_LAYER_KN
+]
+# TritonBench's fp8_gemm reads external_shapes as (m, n, k), so reorder from (m, k, n).
+FP8_GEMM_EXTERNAL_SHAPES = [(m, n, k) for (m, k, n) in _FP8_GEMM_ALL_SHAPES]
+
 # These patches mutate TritonBench operator classes, so remember patched classes
 # to avoid wrapping the same methods more than once in a long benchmark process.
 _PATCHED_MAMBA_OPERATOR_CLASSES: set[type[Any]] = set()
 _PATCHED_ROPE_OPERATOR_CLASSES: set[type[Any]] = set()
 _PATCHED_GDN_OPERATOR_CLASSES: set[type[Any]] = set()
+_PATCHED_FP8_GEMM_OPERATOR_CLASSES: set[type[Any]] = set()
 
 _RopeInput = tuple[
     torch.Tensor,
@@ -193,6 +218,17 @@ def patch_mamba2_tritonbench_inputs(operator_name: str, Operator: type[Any]) -> 
 
     Operator.get_input_iter = get_input_iter
     _PATCHED_MAMBA_OPERATOR_CLASSES.add(Operator)
+
+
+def patch_fp8_gemm_tritonbench_inputs(operator_name: str, Operator: type[Any]) -> None:
+    if operator_name != "fp8_gemm":
+        return
+    if Operator in _PATCHED_FP8_GEMM_OPERATOR_CLASSES:
+        return
+    # Override the default square sweep with the skinny-M / serving shapes.
+    # The operator's get_input_iter yields these when external_shapes is set.
+    Operator.external_shapes = FP8_GEMM_EXTERNAL_SHAPES
+    _PATCHED_FP8_GEMM_OPERATOR_CLASSES.add(Operator)
 
 
 def patch_rope_tritonbench_inputs(operator_name: str, Operator: type[Any]) -> None:
@@ -433,6 +469,10 @@ KERNEL_MAPPINGS: dict[str, tuple[str, ...]] = {
         "fp8_gemm_tritonbench",
         {
             "num_inputs": 10,  # fp8_gemm takes long time on Benchmark CI, so use fewer inputs instead.
+            # examples/fp8_gemm.py applies a per-row x per-column scale, so the
+            # operator must feed it rowwise scales and compare against a rowwise
+            # baseline.
+            "scaling_pair": "RowWise,RowWise",
         },
     ),
     "flash_attention": (
@@ -1473,6 +1513,7 @@ def run_kernel_variants(
         patch_rope_tritonbench_inputs(operator_name, Operator)
         patch_mamba2_tritonbench_inputs(operator_name, Operator)
         patch_gdn_tritonbench_accuracy(operator_name, Operator)
+        patch_fp8_gemm_tritonbench_inputs(operator_name, Operator)
     except ImportError as e:
         print(
             f"Error: Could not import operator '{operator_name}' from tritonbench",
