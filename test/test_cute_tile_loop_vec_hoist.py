@@ -227,6 +227,55 @@ class TestCuteTileLoopVecHoist(TestCase):
         self.assertIn("_tile_unroll_vec_", code)
         self.assertGreaterEqual(code.count("cutlass.Uint32)"), 2)
 
+    def test_fp8_matmul_split_k_warp_reduce_vec(self) -> None:
+        """fp8 matmul with K-axis threading (split-K within a warp) MUST stay
+        numerically correct when combined with vectorized fp8 loads.
+
+        Regression for the hoist_warp_reduce double-count bug: the matmul
+        fallback feeds a loop-carried ``dot_acc`` running sum to
+        ``warp_reduction_sum``.  The pass must reduce ``dot_acc``'s FINAL
+        value once after the V-loop, not create a fresh V-fold accumulator
+        (which would sum the running ``dot_acc`` every V iter and over-count).
+        """
+        m, k, n = 1, 4096, 4096
+        x = (torch.randn(m, k, device=DEVICE) * 0.4).to(torch.float8_e4m3fn)
+        y = (
+            (torch.randn(k, n, device=DEVICE) * 0.4)
+            .to(torch.float8_e4m3fn)
+            .T.contiguous()
+            .T
+        )
+        sa = (torch.rand(m, 1, device=DEVICE) + 0.5).float()
+        sb = (torch.rand(1, n, device=DEVICE) + 0.5).float()
+        code, out = code_and_output(
+            _fp8_matmul_kernel,
+            (x, y, sa.expand(m, n), sb.reshape(n)),
+            # N-tile=1, 32 threads on the K reduction axis -> one warp per
+            # output column, warp_reduction_sum (group_span=32, pre=1).
+            block_sizes=[1, 1, 1024],
+            num_threads=[1, 1, 32],
+            cute_vector_widths=[1, 1, 4],
+            indexing=[
+                "pointer",
+                "pointer",
+                "pointer",
+                "tensor_descriptor",
+                "tensor_descriptor",
+            ],
+        )
+        ref = torch._scaled_mm(
+            x, y, sa, sb, use_fast_accum=False, out_dtype=torch.bfloat16
+        )
+        torch.testing.assert_close(out.float(), ref.float(), atol=1.0, rtol=0.1)
+        # The K reduction must use a single warp shuffle (not the 256-thread
+        # shared-memory two-stage path), and the loaded fp8 must vectorize
+        # (packed Uint32 for V=4).
+        self.assertIn("warp_reduction_sum", code)
+        self.assertIn("cutlass.Uint32)", code)
+        # The warp reduce must NOT sit inside the constexpr V-loop (it would
+        # be re-issued V times) — exactly one reduce per outer K iter.
+        self.assertNotIn("_helion_vfold_acc", code)
+
     def test_scalar_load_when_vec_width_is_one(self) -> None:
         """When V=1 the vec hoist must NOT fire — the codegen falls back to
         the scalar load path so the change is opt-in.
