@@ -2591,8 +2591,8 @@ class _CompiledCuteLauncher:
                     f,
                 )
             os.replace(tmp, meta)
-        except Exception:
-            # A failed persist only costs a recompile in a later process.
+        except (ImportError, OSError):
+            # Old cutlass or an unwritable cache dir; just recompile next time.
             log.debug(
                 "CuTe disk-cache persist failed for key %s",
                 self._cache_key,
