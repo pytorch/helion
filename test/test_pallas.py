@@ -4101,6 +4101,37 @@ class TestPallas(TestCase):
         inner_min = spec.block_sizes[1].min_size
         self.assertGreaterEqual(outer_min, inner_min)
 
+    def test_pallas_0d_tensor_arg(self) -> None:
+        """0D tensor arguments shouldn't cause positional argument shift in block specs."""
+
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def kernel_with_0d_arg(
+            x: torch.Tensor, scalar: torch.Tensor, y: torch.Tensor
+        ) -> torch.Tensor:
+            out = torch.zeros_like(x)
+            for tile_x, tile_y in hl.tile(
+                [x.size(0), x.size(1)], block_size=[128, 128]
+            ):
+                out[tile_x, tile_y] = (
+                    x[tile_x, tile_y] * hl.load(scalar, []) + y[tile_x, tile_y]
+                )
+            return out
+
+        M, N = 256, 256
+        x = torch.randn(M, N, device=DEVICE, dtype=torch.float32)
+        y = torch.randn(M, N, device=DEVICE, dtype=torch.float32)
+        scalar = torch.tensor(2.0, device=DEVICE, dtype=torch.float32)
+
+        from helion.runtime import Config
+
+        config = Config(pallas_loop_type="fori_loop")
+        code = kernel_with_0d_arg.bind((x, scalar, y)).to_code(config)
+
+        self.assertIn(
+            "_block_spec_info=[((128, 128), (0, 1)), None, ((128, 128), (0, 1)), ((128, 128), (0, 1))]",
+            code,
+        )
+
 
 @skipUnlessPallas("JAX/Pallas TPU not available")
 class TestPallasIndirectGather(TestCase):
