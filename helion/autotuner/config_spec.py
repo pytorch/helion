@@ -1602,15 +1602,15 @@ class ConfigSpec:
 
     def structural_fingerprint(
         self, *, advanced_controls_files: list[str] | None = None
-    ) -> tuple[tuple[str | int, ...], ...]:
+    ) -> tuple[tuple[object, ...], ...]:
         """Return a hashable structural description of this ConfigSpec's search space.
 
         Captures field names, sequence lengths, per-item block_ids lengths
-        (for PermutationFragment), ListOf inner lengths, and optional ACF slot
-        presence.  Two ConfigSpecs with the same fingerprint can safely exchange
+        (for PermutationFragment), ListOf inner lengths + per-slot mem-op id signatures, and
+        optional ACF slot presence.  Two ConfigSpecs with the same fingerprint can safely exchange
         FlatConfig values.
         """
-        result: list[tuple[str | int, ...]] = [
+        result: list[tuple[object, ...]] = [
             (key, *field.fingerprint()) for key, field in self._flat_fields().items()
         ]
         acf_fragment = self._advanced_controls_file_fragment(advanced_controls_files)

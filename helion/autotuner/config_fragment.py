@@ -92,8 +92,11 @@ class ConfigSpecFragment:
         """
         return (1, False)
 
-    def fingerprint(self) -> tuple[int, ...]:
-        """Return structural metadata for this fragment used in ConfigSpec fingerprinting."""
+    def fingerprint(self) -> tuple[object, ...]:
+        """Return structural metadata for this fragment used in ConfigSpec fingerprinting.
+
+        Elements are hashable + repr-able (ints, or the per-slot identity strings ``ListOf`` folds in).
+        """
         return ()
 
     def get_minimum(self) -> int:
@@ -388,6 +391,14 @@ class ListOf(ConfigSpecFragment):
 
     inner: ConfigSpecFragment
     length: int
+    # Optional ordered per-slot structural signature (one entry per slot, in slot order) folded into
+    # the cache-compatibility fingerprint. For the per-memory-op tunables each entry is the access-site
+    # buffer identity (origin path) + column span of the op at each slot, so a same-length REORDER of
+    # the slot map busts the cache hash instead of silently mis-mapping a saved config (no raw line
+    # numbers, which would churn the hash on benign edits). Excluded from dataclass eq/repr.
+    slot_signature: tuple[object, ...] | None = dataclasses.field(
+        default=None, compare=False, repr=False
+    )
 
     def default(self) -> list[object]:
         """Return a list of default values."""
@@ -422,8 +433,10 @@ class ListOf(ConfigSpecFragment):
             for i in range(self.length)
         ]
 
-    def fingerprint(self) -> tuple[int, ...]:
-        return (self.length,)
+    def fingerprint(self) -> tuple[object, ...]:
+        if self.slot_signature is None:
+            return (self.length,)
+        return (self.length, *self.slot_signature)
 
     def dim(self) -> int:
         return self.length * self.inner.dim()

@@ -180,6 +180,31 @@ class TestMemoryOpSlots(RefEagerTestBase, TestCase):
         last_l, first_l = evict_counts([16] * rl_len)
         self.assertEqual((last_l, first_l), (2, 0))
 
+    def test_aot_stale_length_guard(self):
+        """A stale (wrong-length) per-op list is detected so the AOT path falls back instead of
+        silently mis-applying it to the collapsed numbering (the AOT cache has no fingerprint check
+        and ``normalize`` does not length-validate these lists)."""
+        from helion.autotuner.aot_cache import _stale_mem_op_list
+
+        bk = reread_reduce.bind((_meta(256, 512),))
+        spec = bk.config_spec
+        good = spec.default_config()
+        self.assertIsNone(_stale_mem_op_list(good, spec))
+
+        # A union-length (stale) indexing / eviction list is flagged.
+        stale_idx = helion.Config.from_dict(
+            {**good.config, "indexing": ["pointer"] * (spec.indexing.length + 4)}
+        )
+        self.assertIsNotNone(_stale_mem_op_list(stale_idx, spec))
+        stale_ev = helion.Config.from_dict(
+            {
+                **good.config,
+                "load_eviction_policies": ["first"]
+                * (spec.load_eviction_policies.length + 3),
+            }
+        )
+        self.assertIsNotNone(_stale_mem_op_list(stale_ev, spec))
+
     def test_uniform_membership_stack_load_inert_slot(self):
         """Source-based membership: every load/store gets an indexing slot, including a stack load
         (whose slot is inert). store_strategy_slots holds only real-tensor store slots, so the inert

@@ -79,7 +79,9 @@ if TYPE_CHECKING:
     from collections.abc import Iterable
     from collections.abc import Sequence
 
+    from ..autotuner.config_fragment import ListOf
     from ..autotuner.config_spec import AccumulatorFact
+    from ..autotuner.config_spec import ConfigSpec
     from ..autotuner.config_spec import MemoryOpFact
     from .compile_environment import BlockSizeInfo
     from .cute.layout import CuTeGridExecutionPlan
@@ -2985,6 +2987,52 @@ def _register_load_store_tunables(
         )
 
 
+def _apply_mem_op_slot_signatures(config_spec: ConfigSpec) -> None:
+    """Fold the per-slot buffer-identity signature into the four mem-op ListOf fingerprints (C1).
+
+    A saved/pretuned config is accepted as cache-compatible only if the structural fingerprint
+    matches. ``ListOf.fingerprint`` was length-only, so a same-length REORDER of the id->slot map
+    would pass undetected and silently mis-map every per-op knob. We attach, per namespace, the
+    ordered access-site buffer identity (origin path) of the op at each slot; a real reorder now busts
+    the hash. Buffer identity (not raw line numbers) keeps the signature stable across benign edits.
+    """
+    smap = config_spec.mem_op_slot_map
+    if smap is None:
+        return
+
+    def apply(slot_dict: dict[MemOpId, int], listof: ListOf) -> None:
+        if listof.length == 0:
+            return
+        # Per-slot identity = buffer origin path + (line RELATIVE to the kernel's first memory op) +
+        # column span. (buffer, rel_line, colno, end_colno) uniquely identifies every distinct source
+        # op, so any reorder of the slot->op map busts the cache hash — including two ops on the SAME
+        # buffer (e.g. aligned ``a = x[...]`` / ``b = x[...]``). Using the RELATIVE line (not the raw
+        # line number) keeps the hash stable when unrelated edits shift the whole kernel up/down.
+        linenos = [
+            key[0][1]
+            for key in slot_dict
+            if key[0] is not None and key[0][1] is not None
+        ]
+        anchor = min(linenos) if linenos else 0
+
+        def sig(mem_op_id: MemOpId) -> tuple[object, ...]:
+            loc, buffer = mem_op_id
+            if loc is None:
+                return (buffer or "", -1, -1, -1)
+            rel_line = (loc[1] - anchor) if loc[1] is not None else -1
+            return (buffer or "", rel_line, loc[2], loc[4])
+
+        slot_to_sig = {slot: sig(key) for key, slot in slot_dict.items()}
+        listof.slot_signature = tuple(
+            slot_to_sig.get(i, ("", -1, -1, -1)) for i in range(listof.length)
+        )
+
+    apply(smap.indexing, config_spec.indexing)
+    apply(smap.eviction, config_spec.load_eviction_policies)
+    apply(smap.cache, config_spec.load_cache_modifiers)
+    apply(smap.atomic, config_spec.atomic_indexing)
+
+
 def _register_atomic_tunables(atomic_count: int) -> None:
     """Register atomic_indexing tunable for all atomic operations."""
     if atomic_count == 0:
@@ -3202,6 +3250,9 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
             )
             _register_atomic_tunables(_count_device_atomics(device_ir))
         _register_tensor_descriptor_layout_guards(device_ir)
+        # Fold the per-slot id signature into the tunable fingerprints so a reordered slot map busts
+        # the cache hash (C1) rather than silently mis-mapping a saved config.
+        _apply_mem_op_slot_signatures(config_spec)
 
         # Accumulator facts are a standalone, reduction-agnostic fact layer (any heuristic
         # may read them), so build them independently of the reduction facts. Must run
