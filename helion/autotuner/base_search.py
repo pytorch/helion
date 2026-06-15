@@ -29,6 +29,8 @@ from .. import exc
 from .._compat import extract_device
 from .._compat import get_device_name
 from ..runtime.settings import _env_get_int
+from ._metadata.ir_features import IrGraphRecord
+from ._metadata.ir_features import extract_ir_graph
 from .benchmark_provider import BenchmarkProvider
 from .benchmark_provider import BenchmarkResult
 from .benchmark_provider import LocalBenchmarkProvider
@@ -295,6 +297,9 @@ class BaseSearch(BaseAutotuner):
             hardware=hardware,
             settings=self.settings.to_dict(),
         )
+        # Device IR is config-independent and captured once here, onto the
+        # metadata record (a function of run_id, excluded from the run_id hash).
+        self._kernel_metadata.ir_graph = self._extract_ir_graph()
         self.benchmark_provider = self._benchmark_provider_cls(
             kernel=self.kernel,
             settings=self.settings,
@@ -318,6 +323,27 @@ class BaseSearch(BaseAutotuner):
         kernel_obj = getattr(self.kernel, "kernel", None)
         configs = getattr(kernel_obj, "configs", None)
         return bool(configs) and not self.settings.force_autotune
+
+    def _extract_ir_graph(self) -> IrGraphRecord | None:
+        """Best-effort, config-independent device-IR dump for the .meta.jsonl record.
+        Returns ``None`` unless dataset collection is on.
+        """
+        if not (
+            self.settings.autotune_log
+            and self.settings.autotune_log_details
+            and not self._is_restricted_search()
+        ):
+            return None
+        host_function = getattr(self.kernel, "host_function", None)
+        # Read the backing field, not the device_ir property
+        device_ir = getattr(host_function, "_device_ir", None)
+        if device_ir is None:
+            return None
+        try:
+            return extract_ir_graph(device_ir)
+        except Exception:
+            self.log.debug("Failed to extract device IR features", exc_info=True)
+            return None
 
     def _autotune_budget_exceeded(self) -> bool:
         budget = self.settings.autotune_budget_seconds
