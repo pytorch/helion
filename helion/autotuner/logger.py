@@ -38,6 +38,7 @@ if TYPE_CHECKING:
     from ..runtime.config import Config
     from ..runtime.settings import Settings
     from .base_search import _AutotunableKernel
+    from .ir_features import IrGraphRecord
     from .metrics import KernelMetadata
 
 else:
@@ -120,19 +121,22 @@ class AutotuningLogger:
         base_path: str | None = None,
         metadata: KernelMetadata | None = None,
         collect_dataset: bool = False,
+        ir_graph: IrGraphRecord | None = None,
     ) -> Iterator[AutotuneLogSink | None]:
         """Attach an :class:`AutotuneLogSink` for the duration of a tuning run.
 
         ``<base>.csv``/``.log`` are written whenever a log path is set. With
         ``collect_dataset`` and ``metadata``, a ``<base>.meta.jsonl`` record
-        (identity + configs) is also written at run end, joined via ``run_id``.
+        (identity + ``ir_graph`` + configs) is also written at run end, joined via
+        ``run_id``. ``ir_graph`` is the config-independent device-IR dump (or
+        ``None`` when unavailable).
         """
 
         path = base_path or self._settings.autotune_log
         if not path:
             yield None
             return
-        with AutotuneLogSink(path, metadata, collect_dataset) as sink:
+        with AutotuneLogSink(path, metadata, collect_dataset, ir_graph) as sink:
             self._attach_sink(sink)
             sink.start_run()
             try:
@@ -293,6 +297,7 @@ class AutotuneLogSink:
         base_path: str,
         metadata: KernelMetadata | None = None,
         collect_dataset: bool = False,
+        ir_graph: IrGraphRecord | None = None,
     ) -> None:
         self._base_path = Path(base_path)
         self.csv_path = self._base_path.with_suffix(".csv")
@@ -300,6 +305,8 @@ class AutotuneLogSink:
         self.meta_path = self._base_path.with_suffix(".meta.jsonl")
         self._metadata = metadata
         self._collect_dataset = collect_dataset
+        # Config-independent device-IR dump written into the per-run
+        self._ir_graph = ir_graph
         self._csv_file: io.TextIOWrapper | None = None
         self._csv_writer: CsvWriter | None = None
         self._log_handler: logging.FileHandler | None = None
@@ -370,7 +377,11 @@ class AutotuneLogSink:
         # known. default=str keeps it JSON-safe for non-serializable settings
         # (torch.dtype, enums, callables). CSV rows join via run_id + config_id.
         if self._collect_dataset and self._metadata is not None:
-            record = {**self._metadata.to_dict(), "configs": self._configs}
+            record = {
+                **self._metadata.to_dict(),
+                "ir_graph": self._ir_graph,
+                "configs": self._configs,
+            }
             with self.meta_path.open("a", encoding="utf-8") as meta_file:
                 meta_file.write(json.dumps(record, default=str) + "\n")
         self._run_start_time = None

@@ -49,8 +49,8 @@ _METADATA_DICT_KEYS = {
     "settings",
 }
 
-# Keys of one on-disk .meta.jsonl record (identity + configs).
-_SIDECAR_KEYS = _METADATA_DICT_KEYS | {"configs"}
+# Keys of one on-disk .meta.jsonl record (identity + ir_graph + configs).
+_SIDECAR_KEYS = _METADATA_DICT_KEYS | {"ir_graph", "configs"}
 
 
 @helion.kernel(config=helion.Config(block_sizes=[16]))
@@ -392,6 +392,44 @@ class TestAutotuneLogSink(TestCase):
         self.assertIn("def _add_kernel", sidecar["kernel_source"])
         self.assertEqual(sidecar["settings"]["static_shapes"], True)
         self.assertIsInstance(sidecar["configs"], dict)
+
+    def test_sidecar_includes_ir_graph_when_provided(self) -> None:
+        """The per-run record carries the ir_graph passed to the sink."""
+        ir = {
+            "schema_version": 1,
+            "directed": True,
+            "multigraph": False,
+            "graph": {
+                "num_graphs": 1,
+                "root_ids": [0],
+                "graphs": [],
+                "rolled_reductions": [],
+            },
+            "nodes": [],
+            "links": [],
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            with AutotuneLogSink(
+                f"{tmp}/run", self._metadata(), collect_dataset=True, ir_graph=ir
+            ) as sink:
+                sink.start_run()
+                self._record(sink, helion.Config(block_sizes=[16]))
+                sink.end_run()
+            sidecar = json.loads(sink.meta_path.read_text().splitlines()[0])
+        self.assertEqual(sidecar["ir_graph"], ir)
+
+    def test_ir_graph_defaults_to_null_in_record(self) -> None:
+        """With no ir_graph supplied the record still carries ir_graph=null."""
+        with tempfile.TemporaryDirectory() as tmp:
+            with AutotuneLogSink(
+                f"{tmp}/run", self._metadata(), collect_dataset=True
+            ) as sink:
+                sink.start_run()
+                self._record(sink, helion.Config(block_sizes=[16]))
+                sink.end_run()
+            sidecar = json.loads(sink.meta_path.read_text().splitlines()[0])
+        self.assertIn("ir_graph", sidecar)
+        self.assertIsNone(sidecar["ir_graph"])
 
     def test_config_resolves_by_id_against_configs_map(self) -> None:
         """
