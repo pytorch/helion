@@ -9,6 +9,8 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from collections.abc import Callable
 
+    from ._metadata.ir_features import IrGraphRecord
+
 _post_autotune_hooks: list[Callable[[AutotuneMetrics], None]] = []
 
 
@@ -96,12 +98,14 @@ def _codegen_signature(settings: dict[str, object] | None) -> str:
 
 @dataclasses.dataclass
 class KernelMetadata:
-    """Per-run identity for the kernel being autotuned.
+    """Per-run identity (and the derived ir_graph artifact) for the autotuned kernel.
 
     Appended (one JSON record per run) to the ``<autotune_log>.meta.jsonl``
     sidecar that sits next to the per-config CSV telemetry. The CSV records each
     config and its result; this record provides the kernel context (source,
-    shapes, dtypes, hardware, settings) those rows join back to.
+    shapes, dtypes, hardware, settings) those rows join back to, plus the
+    config-independent ``ir_graph`` device-IR dump. ``ir_graph`` is a derived
+    artifact (a function of ``run_id``), so it is excluded from the ``run_id`` hash.
 
     ``run_id`` is the single foreign key for an autotune *invocation*: a direct
     content hash of ``(kernel_source, codegen-settings signature, input_shapes,
@@ -122,6 +126,12 @@ class KernelMetadata:
     dtypes: str = ""
     hardware: str = ""
     settings: dict[str, object] | None = None
+    # Config-independent device-IR dump; a derived artifact, NOT part of run_id.
+    # repr/compare/hash are off: the payload is large and derived, so it must not
+    # bloat repr or participate in dataclass equality/hashing.
+    ir_graph: IrGraphRecord | None = dataclasses.field(
+        default=None, repr=False, compare=False, hash=False
+    )
 
     @functools.cached_property
     def run_id(self) -> str:
@@ -132,6 +142,9 @@ class KernelMetadata:
         fields (so boundaries can't collide). Content-derived, so the same
         invocation yields the same ``run_id`` across processes and CI runs.
         """
+        # Hash exactly these five identity fields. ir_graph is intentionally NOT
+        # included: it is a derived artifact (a function of run_id), not identity,
+        # so hashing it would be circular and wrong.
         payload = (
             f"{self.kernel_source}\x00{_codegen_signature(self.settings)}\x00"
             f"{self.input_shapes}\x00{self.dtypes}\x00{self.hardware}"
@@ -147,4 +160,5 @@ class KernelMetadata:
             "dtypes": self.dtypes,
             "hardware": self.hardware,
             "settings": self.settings,
+            "ir_graph": self.ir_graph,
         }

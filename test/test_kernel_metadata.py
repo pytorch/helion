@@ -43,8 +43,8 @@ _LEAN_CSV_HEADER = [
     "config",
 ]
 
-# Keys of one on-disk .meta.jsonl record: the KernelMetadata identity plus the
-# run's config_id -> config map.
+# Keys of one on-disk .meta.jsonl record: the KernelMetadata identity, the
+# config-independent device-IR dump, plus the run's config_id -> config map.
 _SIDECAR_KEYS = {
     "run_id",
     "kernel_name",
@@ -53,6 +53,7 @@ _SIDECAR_KEYS = {
     "dtypes",
     "hardware",
     "settings",
+    "ir_graph",
     "configs",
 }
 
@@ -178,6 +179,29 @@ class TestRunId(TestCase):
             with self.subTest(setting=name):
                 changed = {**base_settings, name: pairs[name][1]}
                 self.assertNotEqual(base_run_id, _run_id(changed), name)
+
+
+class TestKernelMetadataIrGraph(TestCase):
+    """ir_graph rides on KernelMetadata but is excluded from run_id."""
+
+    def test_run_id_excludes_ir_graph(self) -> None:
+        base = _metadata()
+        with_empty = _metadata()
+        with_empty.ir_graph = {}
+        with_populated = _metadata()
+        with_populated.ir_graph = {"schema_version": 1, "nodes": [{"id": "g0:a"}]}
+        # ir_graph (None vs {} vs populated) never changes run_id.
+        self.assertEqual(base.run_id, with_empty.run_id)
+        self.assertEqual(base.run_id, with_populated.run_id)
+        # Sanity: run_id IS sensitive to an identity field, so the test can fail.
+        changed = _metadata()
+        changed.kernel_source = base.kernel_source + " # edit"
+        self.assertNotEqual(base.run_id, changed.run_id)
+
+    def test_to_dict_includes_ir_graph_none_by_default(self) -> None:
+        d = _metadata().to_dict()
+        self.assertIn("ir_graph", d)
+        self.assertIsNone(d["ir_graph"])
 
 
 class TestAutotuneLogSink(TestCase):
@@ -311,6 +335,43 @@ class TestAutotuneDatasetE2E(TestCase):
         self.assertIn(data[0][header.index("run_id")], run_ids)
         decoded_config = helion.Config.from_json(json.dumps(configs_by_id[config_id]))
         self.assertIn(decoded_config.block_sizes, ([32], [64]))
+
+
+class TestIrGraphSidecar(TestCase):
+    def test_ir_graph_in_sidecar_schema(self) -> None:
+        """Device-free: a provided ir_graph round-trips into the .meta.jsonl record."""
+        config = helion.Config(block_sizes=[32], num_warps=4)
+        ir_graph = {
+            "schema_version": 1,
+            "directed": True,
+            "multigraph": False,
+            "graph": {"num_graphs": 0},
+            "nodes": [],
+            "edges": [],
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            metadata = _metadata()
+            metadata.ir_graph = ir_graph
+            with AutotuneLogSink(f"{tmp}/run", metadata, collect_dataset=True) as sink:
+                sink.start_run()
+                config_id = sink.register_config(config)
+                assert config_id is not None
+                sink.record(
+                    AutotuneLogEntry(
+                        generation=0,
+                        status="ok",
+                        perf_ms=1.0,
+                        compile_time=0.5,
+                        config_id=config_id,
+                        config=config,
+                    )
+                )
+                sink.end_run()
+            sidecar = json.loads(
+                sink.meta_path.read_text(encoding="utf-8").splitlines()[0]
+            )
+        self.assertIn("ir_graph", sidecar)
+        self.assertEqual(sidecar["ir_graph"], ir_graph)
 
 
 if __name__ == "__main__":
