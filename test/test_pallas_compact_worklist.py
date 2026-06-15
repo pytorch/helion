@@ -980,9 +980,13 @@ class TestCompactWorklistNumerics(unittest.TestCase):
         qo = _offsets([10, 23, 7, 40])
         lq = int(qo[-1])
         torch.manual_seed(0)
-        q = torch.randn(lq, H, D, device=DEVICE, dtype=torch.float32)
-        k = torch.randn(B, KV, H, D, device=DEVICE, dtype=torch.float32)
-        v = torch.randn(B, KV, H, D, device=DEVICE, dtype=torch.float32)
+        # bf16 (the kernels' real dtype): matmuls run at the same precision as the
+        # eager reference, so a plain assert_close at the usual jagged-attention
+        # tolerance holds. fp32 inputs would expose the TPU bf16-matmul gap vs an
+        # fp32 reference and need an unreasonably loose tolerance.
+        q = torch.randn(lq, H, D, device=DEVICE, dtype=torch.bfloat16)
+        k = torch.randn(B, KV, H, D, device=DEVICE, dtype=torch.bfloat16)
+        v = torch.randn(B, KV, H, D, device=DEVICE, dtype=torch.bfloat16)
         _, out = code_and_output(
             _dense_kv_kernel,
             (q, k, v, qo.to(DEVICE)),
@@ -990,7 +994,7 @@ class TestCompactWorklistNumerics(unittest.TestCase):
             pallas_loop_type="compact_worklist",
         )
         ref = _eager_dense_kv(q.cpu(), k.cpu(), v.cpu(), qo)
-        torch.testing.assert_close(out.cpu(), ref, atol=1e-3, rtol=1e-3)
+        torch.testing.assert_close(out.cpu(), ref, rtol=2e-2, atol=2e-2)
 
     def test_dense_kv_empty_batch_zero_grid(self):
         # total_q == 0 => num_work == 0 => dynamic grid=(0,).  End-to-end guard
@@ -1021,9 +1025,9 @@ class TestCompactWorklistNumerics(unittest.TestCase):
         kvo = _offsets([16, 5, 0, 33])
         lq, lkv = int(qo[-1]), int(kvo[-1])
         torch.manual_seed(0)
-        q = torch.randn(lq, H, D, device=DEVICE, dtype=torch.float32)
-        k = torch.randn(lkv, H, D, device=DEVICE, dtype=torch.float32)
-        v = torch.randn(lkv, H, D, device=DEVICE, dtype=torch.float32)
+        q = torch.randn(lq, H, D, device=DEVICE, dtype=torch.bfloat16)
+        k = torch.randn(lkv, H, D, device=DEVICE, dtype=torch.bfloat16)
+        v = torch.randn(lkv, H, D, device=DEVICE, dtype=torch.bfloat16)
         _, out = code_and_output(
             _fully_jagged_kernel,
             (q, k, v, qo.to(DEVICE), kvo.to(DEVICE)),
@@ -1031,7 +1035,7 @@ class TestCompactWorklistNumerics(unittest.TestCase):
             pallas_loop_type="compact_worklist",
         )
         ref = _eager_fully_jagged(q.cpu(), k.cpu(), v.cpu(), qo, kvo)
-        torch.testing.assert_close(out.cpu(), ref, atol=1e-3, rtol=1e-3)
+        torch.testing.assert_close(out.cpu(), ref, rtol=2e-2, atol=2e-2)
 
 
 @unittest.skipUnless(HAS_JAX, "jax not available")
@@ -1051,9 +1055,9 @@ class TestCompactWorklistJaxExport(unittest.TestCase):
         B, H, KV, D, block = 8, 2, 16, 16, 16
         qo = _offsets([10, 23, 7, 40, 0, 16, 33, 5])
         lq = int(qo[-1])
-        q = jax.random.normal(jax.random.PRNGKey(0), (lq, H, D), jnp.float32)
-        k = jax.random.normal(jax.random.PRNGKey(1), (B, KV, H, D), jnp.float32)
-        v = jax.random.normal(jax.random.PRNGKey(2), (B, KV, H, D), jnp.float32)
+        q = jax.random.normal(jax.random.PRNGKey(0), (lq, H, D), jnp.bfloat16)
+        k = jax.random.normal(jax.random.PRNGKey(1), (B, KV, H, D), jnp.bfloat16)
+        v = jax.random.normal(jax.random.PRNGKey(2), (B, KV, H, D), jnp.bfloat16)
         qod = jnp.asarray(qo.numpy())
         kernel = helion.kernel(
             _dense_kv_kernel.fn,
@@ -1064,14 +1068,24 @@ class TestCompactWorklistJaxExport(unittest.TestCase):
             backend="pallas",
         )
         out = jax.block_until_ready(jax.jit(kernel.jax_fn)(q, k, v, qod))
-        got = torch.from_numpy(np.asarray(out).astype(np.float32))
-        ref = _eager_dense_kv(
-            torch.from_numpy(np.asarray(q)),
-            torch.from_numpy(np.asarray(k)),
-            torch.from_numpy(np.asarray(v)),
-            qo,
+        # jnp reference (dense-KV GDPA) at the kernel's bf16 precision -- stays in
+        # JAX, no torch round-trip.
+        bounds = qo.tolist()
+        per_seq = []
+        for s in range(B):
+            a0, b0 = bounds[s], bounds[s + 1]
+            qb = jnp.swapaxes(q[a0:b0], 0, 1)  # [H, m, D]
+            kb = jnp.swapaxes(k[s], 0, 1)  # [H, KV, D]
+            vb = jnp.swapaxes(v[s], 0, 1)
+            scores = jnp.matmul(qb, jnp.swapaxes(kb, -2, -1))
+            per_seq.append(jnp.swapaxes(jnp.matmul(scores.astype(v.dtype), vb), 0, 1))
+        ref = jnp.concatenate(per_seq, axis=0)
+        np.testing.assert_allclose(
+            np.asarray(out).astype(np.float32),
+            np.asarray(ref).astype(np.float32),
+            rtol=2e-2,
+            atol=2e-2,
         )
-        torch.testing.assert_close(got, ref, atol=1e-3, rtol=1e-3)
 
 
 if __name__ == "__main__":
