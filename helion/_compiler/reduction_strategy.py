@@ -964,6 +964,13 @@ class PersistentReductionStrategy(ReductionStrategy):
     ) -> ast.AST:
         env = CompileEnvironment.current()
         backend = env.backend
+        # Record (for the CuTe backend) the branch path under which this reduction
+        # claims its thread axis, so a free ``hl.arange`` in a mutually-exclusive
+        # sibling grid branch reuses this axis instead of claiming a fresh one that
+        # would widen the launch block and race this single-axis reduction. No-op
+        # outside a dynamic ``_if`` branch.
+        if backend.name == "cute":
+            state.codegen.record_cute_strategy_axis_branch_path(self._get_thread_axis())
         numel = env.block_sizes[self.block_index].numel
         if isinstance(numel, sympy.Integer) and numel == 0:
             default = ir.Reduction.default_accumulator(reduction_type, fake_input.dtype)
@@ -1395,6 +1402,11 @@ class LoopedReductionStrategy(ReductionStrategy):
         fake_output: torch.Tensor,
     ) -> ast.AST:
         _log_cute_reduction_layout(state)
+        # See ``PersistentReductionStrategy.codegen_reduction``: record the branch
+        # path of this reduction's thread axis so a mutually-exclusive sibling
+        # branch's free ``hl.arange`` can reuse the axis (CuTe backend only).
+        if CompileEnvironment.current().backend.name == "cute":
+            state.codegen.record_cute_strategy_axis_branch_path(self._get_thread_axis())
         with install_inductor_kernel_handlers(state.codegen, {}):
             env = CompileEnvironment.current()
             backend = env.backend
