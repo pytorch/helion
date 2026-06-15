@@ -143,8 +143,8 @@ def my_kernel(x: torch.Tensor) -> torch.Tensor:
 
 .. autoattribute:: Settings.autotune_log
 
-   When set, Helion writes per-config telemetry (run id, timestamp, config id, generation, status, perf, compile time) to ``<value>.csv`` and mirrors the autotune log to ``<value>.log`` (for population-based autotuners: ``PatternSearch``, ``DifferentialEvolution``). Both append, so runs sharing one base path accumulate.
-   CSV rows join to ``.meta.jsonl`` via two hashes: ``run_id`` for the invocation — hash(kernel source, shapes, dtypes, hardware, codegen settings) — and ``config_id`` for the config. Codegen settings are Settings fields tagged metadata={"codegen":True}: backend, dot_precision, fast_math, static_shapes, index_dtype, allow_warp_specialize, triton_do_not_specialize, pallas_interpret, debug_dtype_asserts, persistent_reserved_sms. Same config_id across started/ok/error and re-benchmarks; full config stored only in sidecar configs map. Controlled by HELION_AUTOTUNE_LOG.
+   When set, Helion writes per-config telemetry (run id, timestamp, config id, generation, status, perf, compile time, config) to ``<value>.csv`` and mirrors the autotune log to ``<value>.log`` (for population-based autotuners: ``PatternSearch``, ``DifferentialEvolution``). Both append, so runs sharing one base path accumulate.
+   CSV rows join to ``.meta.jsonl`` via two hashes: ``run_id`` for the invocation — hash(kernel source, shapes, dtypes, hardware, codegen settings) — and ``config_id`` for the config. Codegen settings are Settings fields tagged metadata={"codegen":True}: backend, dot_precision, fast_math, static_shapes, index_dtype, allow_warp_specialize, triton_do_not_specialize, pallas_interpret, debug_dtype_asserts, persistent_reserved_sms. Same config_id across started/ok/error and re-benchmarks. The full config is written inline in the trailing ``config`` column of the CSV; it is also stored in the ``.meta.jsonl`` configs map, which is written only when ``autotune_dataset`` is enabled (see below). Controlled by HELION_AUTOTUNE_LOG.
 
 
 
@@ -309,12 +309,6 @@ See :class:`helion.autotuner.LocalAutotuneCache` for details on cache keys and b
 ```
 
 Built-in values for ``HELION_AUTOTUNER`` include ``"LFBOTreeSearch"`` (default), ``"LFBOPatternSearch"``, ``"DESurrogateHybrid"``, ``"PatternSearch"``, ``"DifferentialEvolutionSearch"``, ``"FiniteSearch"``, and ``"RandomSearch"``.
-
-## Functions
-
-```{eval-rst}
-
-```
 
 ## Environment Variable Reference
 
