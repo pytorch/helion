@@ -1100,6 +1100,52 @@ class TestDot(RefEagerTestBase, TestCase):
             lambda acc, a, b: acc + torch.matmul(a, b), rtol=1e-2, atol=5e-2
         )
 
+    @skipIfNotTriton("scalar-arg Triton specialization is Triton-specific")
+    @skipIfRefEager("launcher specialization not applicable in ref eager mode")
+    def test_scalar_arg_specialization_not_reused_across_values(self):
+        """A runtime scalar epilogue arg must not poison later calls.
+
+        ``s`` is a non-constexpr scalar threaded straight to the Triton
+        launcher. Triton constant-folds a scalar arg equal to ``1`` into
+        the compiled binary, but Helion reuses a single ``BoundKernel``
+        across every value of ``s`` (only dtype/shape/stride/device feed
+        the bind cache key). Whichever ``s`` value first primes a given
+        Triton spec bakes its specialized binary in; a launcher whose
+        spec key omits scalar specialization reuses that binary for
+        every later call sharing the same tensor-pointer alignment -- so
+        a kernel primed with ``s == 1`` silently returns ``x @ y + 1``
+        for ``s == 5``.
+        """
+
+        @helion.kernel(
+            config=helion.Config(block_sizes=[32, 32, 32]),
+            dot_precision=get_test_dot_precision(),
+        )
+        def scaled_dot(x: torch.Tensor, y: torch.Tensor, s: int) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=x.dtype)
+                for tile_k in hl.tile(k):
+                    acc = hl.dot(x[tile_m, tile_k], y[tile_k, tile_n], acc=acc)
+                out[tile_m, tile_n] = acc + s
+            return out
+
+        x = torch.randn(64, 64, device=DEVICE, dtype=torch.float32)
+        y = torch.randn(64, 64, device=DEVICE, dtype=torch.float32)
+        baseline = x @ y
+
+        # Prime the launcher with the ``== 1`` specialization. Same
+        # tensor alignment + knob state on both calls, so the only thing
+        # that may differ is the scalar specialization.
+        torch.testing.assert_close(
+            scaled_dot(x, y, 1), baseline + 1, rtol=1e-2, atol=1e-1
+        )
+        torch.testing.assert_close(
+            scaled_dot(x, y, 5), baseline + 5, rtol=1e-2, atol=1e-1
+        )
+
 
 # Define ref mode test failures
 REF_EAGER_TEST_FAILURES = {
