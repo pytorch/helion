@@ -4101,6 +4101,32 @@ class TestPallas(TestCase):
         inner_min = spec.block_sizes[1].min_size
         self.assertGreaterEqual(outer_min, inner_min)
 
+    @xfailIfPallasInterpret("numerical mismatch in JAX interpret mode")
+    def test_boundary_mask_with_squeezed_leading_dims(self) -> None:
+        """Boundary mask generation succeeds when leading dimensions are squeezed."""
+
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def high_rank_kernel(x: torch.Tensor) -> torch.Tensor:
+            B, H, M, D = x.size()
+            out = torch.zeros_like(x)
+            for tile_b, tile_h in hl.tile([B, H], block_size=[1, 1]):
+                b_idx = tile_b.begin
+                h_idx = tile_h.begin
+                for tile_m in hl.tile(16, M, block_size=128):
+                    slice_x = x[b_idx, h_idx, tile_m, :]
+                    out[b_idx, h_idx, tile_m, :] = slice_x
+            return out
+
+        B, H, M, D = 2, 8, 250, 128
+        x = torch.randn(B, H, M, D, device=DEVICE, dtype=torch.bfloat16)
+        _code, result = code_and_output(
+            high_rank_kernel, (x,), pallas_loop_type="fori_loop"
+        )
+
+        ref = torch.zeros_like(x)
+        ref[:, :, 16:, :] = x[:, :, 16:, :]
+        torch.testing.assert_close(result, ref)
+
     def test_pallas_0d_tensor_arg(self) -> None:
         """0D tensor arguments shouldn't cause positional argument shift in block specs."""
 

@@ -1094,7 +1094,7 @@ class CompileEnvironment:
                 BlockSizeOrigin,
             ):
                 return origin_info.origin.block_id
-            if origin_info is not None and type(origin_info.origin) is GridOrigin:
+            if origin_info is not None and isinstance(origin_info.origin, GridOrigin):
                 return origin_info.origin.block_id
         return None
 
