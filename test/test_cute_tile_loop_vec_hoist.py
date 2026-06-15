@@ -77,6 +77,51 @@ def _reduction_kernel(x: torch.Tensor) -> torch.Tensor:
     return out
 
 
+@helion.kernel(backend="cute", static_shapes=True)
+def _fp8_matmul_kernel(
+    x: torch.Tensor,
+    y: torch.Tensor,
+    sa2d: torch.Tensor,
+    sb1d: torch.Tensor,
+) -> torch.Tensor:
+    """A scaled fp8 matmul whose ``hl.dot`` lowers to the SIMT scalar
+    fallback for skinny M, exercising the fp8 tile-loop vec hoist for both
+    the row-major lhs (``x``) and the K-major rhs (``y``)."""
+    m, k = x.size()
+    k2, n = y.size()
+    out = torch.empty([m, n], dtype=torch.bfloat16, device=x.device)
+    for tm, tn in hl.tile([m, n]):
+        acc = hl.zeros([tm, tn], dtype=torch.float32)
+        for tk in hl.tile(k):
+            acc = hl.dot(x[tm, tk], y[tk, tn], acc=acc)
+        out[tm, tn] = (acc * sa2d[tm, tn] * sb1d[tn]).to(torch.bfloat16)
+    return out
+
+
+@helion.kernel(backend="cute", static_shapes=True)
+def _fp8_gemv_1dgrid_kernel(
+    x: torch.Tensor,
+    y: torch.Tensor,
+    sa2d: torch.Tensor,
+    sb1d: torch.Tensor,
+) -> torch.Tensor:
+    """Skinny-M fp8 GEMV as a 1D grid over N with an inner K reduction.
+
+    This shape triggers the warp-per-row layout (each warp owns one output
+    column, K reduced by a single warp shuffle) so the matmul fallback's
+    ``dot_acc`` running sum is hoisted out of the V-loop — the precondition
+    for the fp8 paired-decode fusion."""
+    m, k = x.size()
+    k2, n = y.size()
+    out = torch.empty([m, n], dtype=torch.bfloat16, device=x.device)
+    for tn in hl.tile(n):
+        acc = hl.zeros([m, tn], dtype=torch.float32)
+        for tk in hl.tile(k):
+            acc = hl.dot(x[:, tk], y[tk, tn], acc=acc)
+        out[:, tn] = (acc * sa2d[:, tn] * sb1d[tn]).to(torch.bfloat16)
+    return out
+
+
 @onlyBackends(["cute"])
 class TestCuteTileLoopVecHoist(TestCase):
     def test_vec_hoist_fires_at_v4_fp16(self) -> None:
@@ -162,6 +207,141 @@ class TestCuteTileLoopVecHoist(TestCase):
         torch.testing.assert_close(out, ref, atol=1e-2, rtol=1e-2)
         self.assertIn("ir.VectorType.get([4]", code)
         self.assertIn("cutlass.BFloat16", code)
+
+    def test_vec_hoist_fp8_matmul_both_operands(self) -> None:
+        """fp8 matmul operands must vectorize through the tile-loop hoist as
+        raw ``Uint8`` vectors (not bf16/fp16's ``Uint16``).  Both the
+        row-major lhs and the K-major rhs (lane axis at index position 0)
+        must emit a wide ``cute.arch.load(..., VectorType([4], Uint8))``.
+        """
+        m, k, n = 16, 4096, 4096
+        x = (torch.randn(m, k, device=DEVICE) * 0.4).to(torch.float8_e4m3fn)
+        y = (
+            (torch.randn(k, n, device=DEVICE) * 0.4)
+            .to(torch.float8_e4m3fn)
+            .T.contiguous()
+            .T
+        )
+        sa = (torch.rand(m, 1, device=DEVICE) + 0.5).float()
+        sb = (torch.rand(1, n, device=DEVICE) + 0.5).float()
+        code, out = code_and_output(
+            _fp8_matmul_kernel,
+            (x, y, sa.expand(m, n), sb.reshape(n)),
+            block_sizes=[16, 64, 1024],
+            num_threads=[1, 64, 0],
+            cute_vector_widths=[1, 1, 4],
+            indexing=[
+                "pointer",
+                "pointer",
+                "pointer",
+                "tensor_descriptor",
+                "tensor_descriptor",
+            ],
+        )
+        ref = torch._scaled_mm(
+            x, y, sa, sb, use_fast_accum=False, out_dtype=torch.bfloat16
+        )
+        torch.testing.assert_close(out.float(), ref.float(), atol=1.0, rtol=0.1)
+        # fp8 V=4 loads a packed Uint32 (one LDG.32), NOT a VectorType nor the
+        # bf16/fp16 Uint16 form; lane bytes come out via shift+mask.
+        self.assertIn("cutlass.Uint32)", code)
+        self.assertNotIn("ir.VectorType", code)
+        self.assertIn("& 255", code)
+        # Both operands must be hoisted (two distinct packed-load vars).
+        self.assertIn("_tile_unroll_vec_", code)
+        self.assertGreaterEqual(code.count("cutlass.Uint32)"), 2)
+
+    def test_fp8_matmul_split_k_warp_reduce_vec(self) -> None:
+        """fp8 matmul with K-axis threading (split-K within a warp) MUST stay
+        numerically correct when combined with vectorized fp8 loads.
+
+        Regression for the hoist_warp_reduce double-count bug: the matmul
+        fallback feeds a loop-carried ``dot_acc`` running sum to
+        ``warp_reduction_sum``.  The pass must reduce ``dot_acc``'s FINAL
+        value once after the V-loop, not create a fresh V-fold accumulator
+        (which would sum the running ``dot_acc`` every V iter and over-count).
+        """
+        m, k, n = 1, 4096, 4096
+        x = (torch.randn(m, k, device=DEVICE) * 0.4).to(torch.float8_e4m3fn)
+        y = (
+            (torch.randn(k, n, device=DEVICE) * 0.4)
+            .to(torch.float8_e4m3fn)
+            .T.contiguous()
+            .T
+        )
+        sa = (torch.rand(m, 1, device=DEVICE) + 0.5).float()
+        sb = (torch.rand(1, n, device=DEVICE) + 0.5).float()
+        code, out = code_and_output(
+            _fp8_matmul_kernel,
+            (x, y, sa.expand(m, n), sb.reshape(n)),
+            # N-tile=1, 32 threads on the K reduction axis -> one warp per
+            # output column, warp_reduction_sum (group_span=32, pre=1).
+            block_sizes=[1, 1, 1024],
+            num_threads=[1, 1, 32],
+            cute_vector_widths=[1, 1, 4],
+            indexing=[
+                "pointer",
+                "pointer",
+                "pointer",
+                "tensor_descriptor",
+                "tensor_descriptor",
+            ],
+        )
+        ref = torch._scaled_mm(
+            x, y, sa, sb, use_fast_accum=False, out_dtype=torch.bfloat16
+        )
+        torch.testing.assert_close(out.float(), ref.float(), atol=1.0, rtol=0.1)
+        # The K reduction must use a single warp shuffle (not the 256-thread
+        # shared-memory two-stage path), and the loaded fp8 must vectorize
+        # (packed Uint32 for V=4).
+        self.assertIn("warp_reduction_sum", code)
+        self.assertIn("cutlass.Uint32)", code)
+        # The warp reduce must NOT sit inside the constexpr V-loop (it would
+        # be re-issued V times) — exactly one reduce per outer K iter.
+        self.assertNotIn("_helion_vfold_acc", code)
+
+    def test_fp8_paired_decode_in_warp_per_row_gemv(self) -> None:
+        """The skinny-M fp8 GEMV (1D grid, warp-per-row) must fuse adjacent
+        per-lane fp8 decodes into one ``cvt.rn.f16x2.e4m3x2`` (paired decode).
+
+        The packed V=8 load becomes a single ``Uint64``; the V-loop runs 4
+        (not 8) iters, each decoding two e4m3 bytes per operand with
+        ``fp8e4m3fn_x2_to_float32`` and accumulating both products.
+        """
+        m, k, n = 1, 4096, 4096
+        x = (torch.randn(m, k, device=DEVICE) * 0.4).to(torch.float8_e4m3fn)
+        y = (
+            (torch.randn(k, n, device=DEVICE) * 0.4)
+            .to(torch.float8_e4m3fn)
+            .T.contiguous()
+            .T
+        )
+        sa = (torch.rand(m, 1, device=DEVICE) + 0.5).float()
+        sb = (torch.rand(1, n, device=DEVICE) + 0.5).float()
+        code, out = code_and_output(
+            _fp8_gemv_1dgrid_kernel,
+            (x, y, sa.expand(m, n), sb.reshape(n)),
+            block_sizes=[8, 1024],
+            num_threads=[8, 32],
+            cute_vector_widths=[1, 8],
+            indexing=[
+                "pointer",
+                "pointer",
+                "pointer",
+                "tensor_descriptor",
+                "tensor_descriptor",
+            ],
+        )
+        ref = torch._scaled_mm(
+            x, y, sa, sb, use_fast_accum=False, out_dtype=torch.bfloat16
+        )
+        torch.testing.assert_close(out.float(), ref.float(), atol=1.0, rtol=0.1)
+        # Packed Uint64 load (V=8), paired decode, halved V-loop.
+        self.assertIn("cutlass.Uint64)", code)
+        self.assertIn("_cute_fp8e4m3fn_x2_to_float32", code)
+        self.assertIn("cutlass.range_constexpr(4)", code)
+        # The scalar 1-byte decode must be gone from the fused loop.
+        self.assertNotIn("_cute_fp8e4m3fn_to_float32(load)", code)
 
     def test_scalar_load_when_vec_width_is_one(self) -> None:
         """When V=1 the vec hoist must NOT fire — the codegen falls back to

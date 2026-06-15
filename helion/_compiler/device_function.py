@@ -283,6 +283,12 @@ class DeviceFunction:
         )
         self._variable_renames: dict[str, list[str]] = {}
         self.dce_vars: list[str] = []
+        # Names of matmul-fallback running-sum accumulators emitted as
+        # ``acc = acc + product`` inside a constexpr V-loop.  The
+        # ``hoist_warp_reduce`` pass reads this to reduce the FINAL value once
+        # (instead of building a per-lane V-fold, which would double-count the
+        # already-accumulated running sum).  See ``_emit_cute_matmul``.
+        self.cute_matmul_running_sums: set[str] = set()
         # Arg names referenced only by fusion placeholder strings
         # (<STORE_OUTPUT_*>, <LOAD_INPUT_*>), not by the AST body.
         # DCE would incorrectly strip them without this exemption.
@@ -864,7 +870,9 @@ class DeviceFunction:
             # from ~396 to ~99 (4x fewer SHFL trees).
             from .cute.hoist_warp_reduce import hoist_warp_reduce_from_vloop
 
-            kernel_body = hoist_warp_reduce_from_vloop(kernel_body)
+            kernel_body = hoist_warp_reduce_from_vloop(
+                kernel_body, running_sum_accumulators=self.cute_matmul_running_sums
+            )
             # Merge adjacent constexpr V-loops that share an identical
             # statement prefix.  Caches the last common per-V-lane value
             # into a register fragment so V-loop 2's bitcast/cast chain
@@ -873,6 +881,13 @@ class DeviceFunction:
             from .cute.merge_sibling_v_loops import merge_sibling_v_loops
 
             kernel_body = merge_sibling_v_loops(kernel_body)
+            # Fuse adjacent per-lane fp8 decodes in the SIMT matmul V-loop
+            # into one ``cvt.rn.f16x2.e4m3x2`` (decode 2 e4m3 bytes per
+            # instruction) — halves the decode instruction count on the
+            # skinny-M fp8 GEMV path.
+            from .cute.fuse_fp8_pair_decode import fuse_fp8_pair_decode
+
+            kernel_body = fuse_fp8_pair_decode(kernel_body)
             # Hoist loop-invariant floating-point divisions out of inner
             # tile loops, replacing each ``x / scalar`` with a hoisted
             # ``inv = 1.0 / scalar`` + ``x * inv`` in the loop body.

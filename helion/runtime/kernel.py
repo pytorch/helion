@@ -402,8 +402,10 @@ class Kernel(Generic[_R]):
                 extractor = _specialization_extractors[torch.fx.GraphModule]
             elif isinstance(obj, torch.Tensor):
                 # torch.Tensor subclasses (e.g. the JAX-export adapter)
-                # share the standard tensor specialization key.
-                extractor = _specialization_extractors[torch.Tensor]
+                # share the standard tensor specialization key. Use the
+                # SymInt-safe extractor: unlike exact ``torch.Tensor``,
+                # subclasses may carry symbolic sizes/strides.
+                extractor = _specialization_extractors["tensor_subclass"]
             elif isinstance(obj, tuple) and hasattr(obj, "_fields"):
                 # this is a namedtuple
                 extractor = _specialization_extractors["namedtuple"]
@@ -1388,6 +1390,36 @@ def _hashable_dims(dims: Sequence[int | torch.SymInt]) -> tuple[Hashable, ...]:
     return tuple(_hashable_dim(s) for s in dims)
 
 
+def _concrete_tensor_key(fn: Kernel, obj: torch.Tensor) -> Hashable:
+    # Fast extractor for plain ``torch.Tensor`` / ``torch.nn.Parameter``:
+    # exact-type dispatch guarantees concrete int sizes/strides, so
+    # ``torch.Size`` and the stride tuple can be used directly (both are
+    # tuple subclasses that hash/compare identically to plain int tuples).
+    # The ``_hashable_dims`` wrap in ``_tensor_key`` exists only to
+    # normalize SymInts, which appear on FakeTensors during tracing.
+    si = getattr(obj, "_dynamo_static_indices", None)
+    static_indices = frozenset(si) if si is not None else _EMPTY_FROZENSET
+    if fn.settings.static_shapes:
+        return (obj.dtype, obj.size(), obj.stride(), static_indices)
+    bucketed = _bucketed_size(obj)
+    if fn.settings.index_dtype is None:
+        try:
+            needs_int64 = bool(obj.numel() > _INT32_INDEX_LIMIT)
+        except RuntimeError:
+            needs_int64 = True  # unbacked SymInt
+        return (
+            obj.dtype,
+            bucketed,
+            needs_int64,
+            static_indices,
+        )
+    return (
+        obj.dtype,
+        bucketed,
+        static_indices,
+    )
+
+
 def _tensor_key(fn: Kernel, obj: torch.Tensor) -> Hashable:
     si = getattr(obj, "_dynamo_static_indices", None)
     static_indices = frozenset(si) if si is not None else _EMPTY_FROZENSET
@@ -1468,9 +1500,17 @@ _specialization_extractors: dict[
     Callable[[Kernel, object], Hashable],
     # pyrefly: ignore [bad-assignment]
 ] = {
-    torch.Tensor: _tensor_key,
-    torch.nn.Parameter: _tensor_key,
+    # Exact-type dispatch (see ``_specialization_key``): plain tensors and
+    # Parameters always have concrete int sizes/strides and take the fast
+    # extractor. Subclasses (FakeTensor below, or anything hitting the
+    # ``isinstance`` fallback) go through SymInt-safe ``_tensor_key``.
+    torch.Tensor: _concrete_tensor_key,
+    torch.nn.Parameter: _concrete_tensor_key,
     FakeTensor: _tensor_key,
+    # SymInt-safe extractor for torch.Tensor subclasses reached via the
+    # isinstance fallback in ``_specialization_key`` (string key so the
+    # fallback stays loosely typed, like "namedtuple" / "dataclass").
+    "tensor_subclass": _tensor_key,
     torch.dtype: lambda fn, x: x,
     torch.device: lambda fn, x: x,
     int: _number_key,
