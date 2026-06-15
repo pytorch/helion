@@ -221,7 +221,14 @@ VALID_KEYS: frozenset[str] = frozenset(
         *_BACKEND_STRATEGY_CONFIG_KEYS,
     ]
 )
-VALID_PALLAS_LOOP_TYPES = ("emit_pipeline", "unroll", "fori_loop")
+# Loop types the autotuner searches by default for every Pallas inner loop.
+AUTOTUNED_PALLAS_LOOP_TYPES = ("emit_pipeline", "unroll", "fori_loop")
+# Full validation superset: "compact_worklist" is a tuned loop type but is only
+# *offered* to compactable kernels (owner hl.grid + jagged bounds), so it is gate
+# -appended to the search choices rather than living in the default set.  Keeping
+# AUTOTUNED_PALLAS_LOOP_TYPES first preserves `[0] == "emit_pipeline"` for the
+# setdefault below.
+VALID_PALLAS_LOOP_TYPES = (*AUTOTUNED_PALLAS_LOOP_TYPES, "compact_worklist")
 VALID_PID_TYPES = (
     "flat",
     "xyz",
@@ -1487,7 +1494,9 @@ class ConfigSpec:
         else:
             fields.update(self.backend_tunable_fragments)
         if self.has_pallas_inner_loops:
-            choices = VALID_PALLAS_LOOP_TYPES
+            # Default to the non-compact set; "compact_worklist" is gated below so
+            # it never leaks into non-jagged kernels.
+            choices = AUTOTUNED_PALLAS_LOOP_TYPES
             if self.has_symbolic_or_data_dependent_bounds:
                 # Exclude "unroll" (uses Python range(), can't handle traced
                 # bounds) and put "fori_loop" first: it handles both DMA-aligned
@@ -1496,6 +1505,13 @@ class ConfigSpec:
                 # TODO(thcmbs): Also exclude "emit_pipeline" when has_pallas_dma_unaligned
                 # is set, to avoid wasted autotuning effort. See PR #1969 review discussion.
                 choices = ("fori_loop", "emit_pipeline")
+                if self.grid_block_ids:
+                    # Owner hl.grid + jagged bounds => compaction is applicable.
+                    # Offer it as a tuned choice; detect_compact_worklist_plan
+                    # raises exc.InvalidConfig (autotuner-skippable) if the full
+                    # pattern doesn't match, so a residual mismatch is scored inf
+                    # and skipped rather than fatal.
+                    choices = (*choices, "compact_worklist")
             fields["pallas_loop_type"] = EnumFragment(choices=choices)
             if self.supports_config_key("pallas_pre_broadcast"):
                 fields["pallas_pre_broadcast"] = BooleanFragment()

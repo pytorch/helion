@@ -313,20 +313,51 @@ def default_pallas_jax_launcher(
         _device_for_jax_export(),
     )
 
-    result = _pallas_compile_jit_fn(
-        pallas_kernel,
-        grid,
-        args,
-        kind=_kind,
-        _output_indices=output_indices,
-        _inplace_indices=_inplace_indices,
-        _block_spec_info=_block_spec_info,
-        _smem_arg_indices=_smem_arg_indices,
-        _scratch_shapes=_scratch_shapes,
-        _pipeline_arg_indices=_pipeline_arg_indices,
-        _matmul_dot_general=None,
-        interpret=interpret,
-    )
+    if _kind is _LoopKind.COMPACT_WORKLIST:
+        from . import _pallas_compile_compact_jit_fn
+
+        result = _pallas_compile_compact_jit_fn(
+            pallas_kernel,
+            args,
+            _output_indices=output_indices,
+            _inplace_indices=_inplace_indices,
+            _block_spec_info=_block_spec_info,
+            _scratch_shapes=_scratch_shapes,
+            _smem_arg_indices=_smem_arg_indices,
+            _pipeline_arg_indices=_pipeline_arg_indices,
+            build_worklist=cast("Any", kwargs["_compact_build_worklist"]),
+            offset_arg_indices=cast(
+                "Any", kwargs.get("_compact_offset_arg_indices") or []
+            ),
+            metadata_fields=cast("Any", kwargs.get("_compact_metadata_fields") or []),
+            owner_ref_pos=cast("Any", kwargs.get("_compact_owner_ref_pos", 0)),
+            num_scalar_prefetch=cast(
+                "Any", kwargs.get("_compact_num_scalar_prefetch", 0)
+            ),
+            aligned_arg_indices=cast(
+                "Any", kwargs.get("_compact_aligned_arg_indices") or []
+            ),
+            tile_start_ref_pos=cast(
+                "Any", kwargs.get("_compact_tile_start_ref_pos", 1)
+            ),
+            compact_block=cast("Any", kwargs.get("_compact_block", 1)),
+            interpret=interpret,
+        )
+    else:
+        result = _pallas_compile_jit_fn(
+            pallas_kernel,
+            grid,
+            args,
+            kind=_kind,
+            _output_indices=output_indices,
+            _inplace_indices=_inplace_indices,
+            _block_spec_info=_block_spec_info,
+            _smem_arg_indices=_smem_arg_indices,
+            _scratch_shapes=_scratch_shapes,
+            _pipeline_arg_indices=_pipeline_arg_indices,
+            _matmul_dot_general=None,
+            interpret=interpret,
+        )
 
     jax_inputs = [
         cast("_JaxExportTensor", args[i])._jax_arr for i in result.tensor_arg_indices

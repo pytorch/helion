@@ -512,6 +512,29 @@ def _slice_code(
     return ":"
 
 
+def _is_compact_aligned_load(
+    state: CodegenState, block_id: int, tensor: torch.Tensor | None
+) -> bool:
+    """True if *tensor* is a compact-tile aligned-load or exact-store tensor.
+
+    Both get a per-tile ``pl.Element`` BlockSpec sliced at ``tile_start`` (Pallas
+    double-buffers the load's prefetch and the store's write-back), so the body
+    accesses the whole sliced block at local offset 0.
+    """
+    from helion._compiler.compile_environment import CompileEnvironment
+
+    if tensor is None:
+        return False
+    plan = CompileEnvironment.current().compact_worklist_plan
+    if plan is None or block_id != plan.compact_axis.block_id:
+        return False
+    host = state.device_function.tensor_arg(tensor).host_str()
+    return any(
+        p.kind in ("compact_aligned_load", "compact_exact_store") and p.arg_name == host
+        for p in plan.tensor_policies
+    )
+
+
 def _ds_expr(
     state: CodegenState,
     block_id: int,
@@ -531,6 +554,12 @@ def _ds_expr(
     block_size = state.device_function.block_size_var(block_id)
     if block_size is None:
         return ":"
+    # compact_aligned_load: the tensor is a per-tile sliced BlockSpec block (the
+    # launcher slices it to one tile at tile_start via pl.Element, so Pallas
+    # double-buffers it across work items).  The body therefore reads the whole
+    # sliced block at local offset 0, not the absolute tile_start.
+    if not tile_offset and _is_compact_aligned_load(state, block_id, tensor):
+        return f"pl.ds(0, {block_size})"
     if tensor is not None and tensor_dim is not None:
         from helion.language.memory_ops import _record_pad_info
 
