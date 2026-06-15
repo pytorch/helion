@@ -36,6 +36,8 @@ from .benchmark_provider import _clone_args
 from .benchmark_provider import _unset_fn
 from .benchmarking import clear_jit_fast_path_caches
 from .benchmarking import interleaved_bench
+from .ir_features import IrGraphRecord
+from .ir_features import extract_ir_graph
 from .logger import AutotuningLogger
 from .metrics import AutotuneMetrics
 from .metrics import KernelMetadata
@@ -300,6 +302,8 @@ class BaseSearch(BaseAutotuner):
             hardware=hardware,
             settings=self.settings.to_dict(),
         )
+        # Device IR is config-independent and captured once here
+        self._ir_graph: IrGraphRecord | None = self._extract_ir_graph()
         self.benchmark_provider = self._benchmark_provider_cls(
             kernel=self.kernel,
             settings=self.settings,
@@ -323,6 +327,27 @@ class BaseSearch(BaseAutotuner):
         kernel_obj = getattr(self.kernel, "kernel", None)
         configs = getattr(kernel_obj, "configs", None)
         return bool(configs) and not self.settings.force_autotune
+
+    def _extract_ir_graph(self) -> IrGraphRecord | None:
+        """Best-effort, config-independent device-IR dump for the .meta.jsonl record.
+        Returns ``None`` unless dataset collection is on.
+        """
+        if not (
+            self.settings.autotune_log
+            and self.settings.autotune_dataset
+            and not self._is_restricted_search()
+        ):
+            return None
+        host_function = getattr(self.kernel, "host_function", None)
+        # Read the backing field, not the device_ir property
+        device_ir = getattr(host_function, "_device_ir", None)
+        if device_ir is None:
+            return None
+        try:
+            return extract_ir_graph(device_ir)
+        except Exception:
+            self.log.debug("Failed to extract device IR features", exc_info=True)
+            return None
 
     def _autotune_budget_exceeded(self) -> bool:
         budget = self.settings.autotune_budget_seconds
@@ -513,6 +538,7 @@ class BaseSearch(BaseAutotuner):
                     self.log.autotune_logging(
                         metadata=self._kernel_metadata,
                         collect_dataset=collect_dataset,
+                        ir_graph=self._ir_graph,
                     )
                 )
             elif self.settings.autotune_dataset:

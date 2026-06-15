@@ -3,6 +3,7 @@ from __future__ import annotations
 from contextlib import contextmanager
 from contextlib import nullcontext
 import csv
+import json
 import logging
 import math
 import multiprocessing as mp
@@ -806,6 +807,113 @@ class TestAutotuneIgnoreErrors(TestCase):
         # Restricted search -> debug CSV written, but no dataset sidecar.
         self.assertTrue(base_path.with_suffix(".csv").exists())
         self.assertFalse(base_path.with_suffix(".meta.jsonl").exists())
+
+    @skipIfRefEager("Autotuning not supported in ref eager mode")
+    def test_autotune_writes_ir_graph_into_meta_record(self):
+        """A non-restricted run with the dataset on writes one ``.meta.jsonl``
+        line carrying a well-formed, config-independent ``ir_graph``."""
+        configs = [
+            helion.Config(block_sizes=[32], num_warps=4),
+            helion.Config(block_sizes=[64], num_warps=8),
+        ]
+        tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(tmpdir.cleanup)
+        base_path = Path(tmpdir.name) / "autotune_run"
+
+        with patch.dict(
+            os.environ,
+            {
+                "HELION_AUTOTUNE_LOG": str(base_path),
+                "HELION_AUTOTUNE_DATASET": "1",
+                "HELION_AUTOTUNE_LOG_LEVEL": "0",
+            },
+        ):
+
+            @helion.kernel  # no pinned configs -> not a restricted search
+            def add(a, b):
+                out = torch.empty_like(a)
+                for tile in hl.tile(out.size()):
+                    out[tile] = a[tile] + b[tile]
+                return out
+
+            args = (
+                torch.randn([64], device=DEVICE),
+                torch.randn([64], device=DEVICE),
+            )
+            bound_kernel = add.bind(args)
+            random.seed(123)
+            # FiniteSearch bounds the search to a tiny config list (fast); the
+            # kernel is unrestricted, so the dataset is collected.
+            search = FiniteSearch(bound_kernel, args, configs=configs)
+            search.autotune()
+
+        meta_path = base_path.with_suffix(".meta.jsonl")
+        self.assertTrue(meta_path.exists())
+        lines = meta_path.read_text(encoding="utf-8").splitlines()
+        self.assertTrue(lines)
+        for line in lines:
+            rec = json.loads(line)
+            self.assertIn("ir_graph", rec)
+            ir = rec["ir_graph"]
+            self.assertIsNotNone(ir)
+            self.assertEqual(ir["schema_version"], 1)
+            self.assertTrue(ir["nodes"])
+            self.assertIn("links", ir)
+            self.assertTrue(ir["directed"])
+        # ir_graph is config-independent: identical across lines sharing a run_id.
+        by_run: dict[str, str] = {}
+        for line in lines:
+            rec = json.loads(line)
+            blob = json.dumps(rec["ir_graph"], sort_keys=True)
+            self.assertEqual(by_run.setdefault(rec["run_id"], blob), blob)
+
+    @skipIfRefEager("Autotuning not supported in ref eager mode")
+    def test_ir_graph_extraction_gated_on_dataset(self):
+        """Extraction is gated on collect_dataset (NFR-3): ``_ir_graph`` is built
+        only for an unrestricted run with the dataset on -- not when the dataset is
+        off and not for a restricted search."""
+        tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(tmpdir.cleanup)
+        base_path = Path(tmpdir.name) / "run"
+        args = (
+            torch.randn([64], device=DEVICE),
+            torch.randn([64], device=DEVICE),
+        )
+        cfgs = [
+            helion.Config(block_sizes=[32]),
+            helion.Config(block_sizes=[64]),
+        ]
+
+        def make_add():
+            # Settings are captured at decoration time, so define the kernel under
+            # the active env for each case.
+            @helion.kernel  # unrestricted (no pinned configs)
+            def add(a, b):
+                out = torch.empty_like(a)
+                for tile in hl.tile(out.size()):
+                    out[tile] = a[tile] + b[tile]
+                return out
+
+            return add
+
+        # Dataset on -> extraction happens.
+        with patch.dict(
+            os.environ,
+            {"HELION_AUTOTUNE_LOG": str(base_path), "HELION_AUTOTUNE_DATASET": "1"},
+        ):
+            search = FiniteSearch(make_add().bind(args), args, configs=cfgs)
+            search._prepare()
+            self.assertIsNotNone(search._ir_graph)
+            self.assertTrue(search._ir_graph["nodes"])
+
+        # Dataset off (log set) -> no extraction (None), so nothing is built/discarded.
+        with patch.dict(
+            os.environ,
+            {"HELION_AUTOTUNE_LOG": str(base_path), "HELION_AUTOTUNE_DATASET": ""},
+        ):
+            search_off = FiniteSearch(make_add().bind(args), args, configs=cfgs)
+            search_off._prepare()
+            self.assertIsNone(search_off._ir_graph)
 
 
 @onlyBackends(["triton"])
