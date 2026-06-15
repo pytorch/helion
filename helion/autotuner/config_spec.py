@@ -53,6 +53,7 @@ if TYPE_CHECKING:
     from collections.abc import Sequence
 
     from .._compiler.backend import Backend
+    from .._compiler.memory_op_slots import MemOpSlotMap
     from ..runtime.config import IndexingLiteral
     from ..runtime.config import PidTypeLiteral
     from .config_generation import ConfigGeneration
@@ -140,7 +141,10 @@ class MemoryOpFact(NamedTuple):
     notion of which axis is "the" reduction; the builders index them by the reduction's ``block_id``).
     """
 
-    indexing_index: int  # slot in Config.indexing (== position in this list)
+    indexing_index: (
+        int  # Config.indexing slot (the map slot; -1 if the op reads no indexing slot,
+    )
+    # i.e. a tile.index / stack load or a stack store)
     kind: str  # "load" | "store"
     eviction_index: int | None  # slot in Config.load_eviction_policies, else None
     tensor_name: str | None  # host buffer name being accessed, e.g. "x", "weight"
@@ -167,6 +171,13 @@ class MemoryOpFact(NamedTuple):
     # subscript so it is reduction-AGNOSTIC; ``None`` for a plain slice). The faithful axis key for
     # the full_width_output / input_load_itemsize gates.
     subscript_block_ids: tuple[int | None, ...] = ()
+    # Number of times this source op is emitted in the ORIGINAL (pre-rolling) graphs — its static
+    # tuple-unroll factor (1 otherwise). On the triton path the facts are collapsed to one per distinct
+    # ``mem_op_id`` (rolled/split/unroll copies share one fact), so this count recovers the instruction
+    # tally ``num_load`` consumes (the ``== 1`` stream-eviction gate) without re-walking the graphs.
+    # Config-INDEPENDENT (only static unroll affects it; rolled copies live in distinct graph_ids and
+    # never reach num_load). 1 on the non-triton (uncollapsed) path.
+    static_emission_count: int = 1
 
 
 class AccumulatorFact(NamedTuple):
@@ -438,6 +449,10 @@ class ConfigSpec:
         self.accumulator_facts: list[AccumulatorFact] = []
         self.store_indices: list[int] = []
         self.memory_op_facts: list[MemoryOpFact] = []
+        # Stable mem_op_id -> tunable slot maps (indexing/eviction/cache/atomic), built at bind from
+        # node.meta['mem_op_id']; codegen resolves each emitted op's slot through this instead of a
+        # per-config emission counter (transform-invariant). None until lower_to_device_ir runs.
+        self.mem_op_slot_map: MemOpSlotMap | None = None
         self.backend_tunable_fragments = self.backend.tunable_fragments()
         unknown_tunables = set(self.backend_tunable_fragments) - BACKEND_TUNABLE_KEYS
         if unknown_tunables:

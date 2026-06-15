@@ -83,6 +83,8 @@ if TYPE_CHECKING:
     from ..autotuner.config_spec import MemoryOpFact
     from .compile_environment import BlockSizeInfo
     from .cute.layout import CuTeGridExecutionPlan
+    from .memory_op_slots import MemOpId
+    from .memory_op_slots import MemOpSlotMap
 
     class _TLS(Protocol):
         device_irs: list[DeviceIR]
@@ -1256,10 +1258,13 @@ class DeviceIR:
         (``register_user_tiled_reductions``) paths; only ``load_graph_ids`` (standard: the
         rdim's original graphs; user-tiled: every graph) differ.
         """
-        # num_load: every load in the reduction's graphs (the stream-eviction == 1 gate).
-        # Scoped by graph_id so rolled-subgraph copies of a standard rdim load are excluded.
+        # num_load: every load INSTRUCTION in the reduction's graphs (the stream-eviction == 1 gate).
+        # Scoped by graph_id so rolled-subgraph copies of a standard rdim load are excluded. On triton
+        # the facts are collapsed to one per id, so a statically-unrolled load is one fact carrying its
+        # emission count in ``static_emission_count``; summing that recovers the instruction tally
+        # (== 1 on the non-triton uncollapsed path, where each emission is already its own fact).
         num_load = sum(
-            1
+            f.static_emission_count
             for f in memory_op_facts
             if f.kind == "load" and f.graph_id in load_graph_ids
         )
@@ -1463,6 +1468,11 @@ class DeviceIR:
             for info in env.block_sizes
             if not info.reduction
         }
+        # Which store/atomic indexing slot a node reads must match codegen. On triton that is the
+        # transform-invariant mem_op_id slot (so this pre-pass and the load/store/atomic handlers
+        # agree under rolling/subtiling); the map exists only for triton, so a positional fallback
+        # covers the other backends.
+        slot_map = env.config_spec.mem_op_slot_map
         descriptor_output_nodes_by_graph: dict[int, set[torch.fx.Node]] = {}
         memory_op_index = 0
         atomic_op_index = 0
@@ -1474,16 +1484,35 @@ class DeviceIR:
                 if node.target is memory_ops.load:
                     memory_op_index += 1
                 elif node.target is memory_ops.store:
-                    if _indexing_uses_tensor_descriptor(
+                    # A stack store now carries an (inert) indexing slot under uniform membership, but
+                    # it routes to StackIndexingStrategy and is never epilogue-subtiled — so it must not
+                    # be treated as a tensor_descriptor output. (Triton-gated; non-triton unchanged.)
+                    is_stack_store = (
+                        slot_map is not None and _accessed_tensor_fake(node) is None
+                    )
+                    slot = (
+                        slot_map.indexing_slot(node.meta["mem_op_id"])
+                        if slot_map is not None
+                        else memory_op_index
+                    )
+                    # Every store has an indexing slot (uniform membership on triton; positional
+                    # counter on other backends), so the lookup always resolves.
+                    assert slot is not None
+                    if not is_stack_store and _indexing_uses_tensor_descriptor(
                         config.indexing,
-                        memory_op_index,
+                        slot,
                     ):
                         descriptor_output_nodes.add(node)
                     memory_op_index += 1
                 elif node.target in ATOMIC_OPS:
-                    if _indexing_uses_tensor_descriptor(
+                    slot = (
+                        slot_map.atomic_indexing_slot(node.meta["mem_op_id"])
+                        if slot_map is not None
+                        else atomic_op_index
+                    )
+                    if slot is not None and _indexing_uses_tensor_descriptor(
                         config.atomic_indexing,
-                        atomic_op_index,
+                        slot,
                     ):
                         descriptor_output_nodes.add(node)
                     atomic_op_index += 1
@@ -2665,6 +2694,31 @@ def _subscript_block_id(env: CompileEnvironment, sub: object) -> int | None:
     return None
 
 
+def _stamp_mem_op_ids(device_ir: DeviceIR) -> None:
+    """Stamp ``node.meta['mem_op_id']`` on every load/store/atomic node.
+
+    Runs on the ORIGINAL graphs (after ``remove_unnecessary_tile_index``, before
+    ``register_rollable_reductions``), so that the reduction roller / epilogue subtiling / static
+    unroll copies — all of which preserve ``node.meta`` — inherit the same id and therefore SHARE one
+    tunable slot (the 1:N policy). The id is the transform-invariant
+    ``(SourceLocation._key(), access-site origin.host_str())`` (see ``memory_op_slots``).
+    """
+    from ..language import atomic_ops
+    from ..language import memory_ops
+    from .memory_op_slots import compute_mem_op_id
+
+    host = HostFunction.current()
+    targets = {
+        memory_ops.load,
+        memory_ops.store,
+        *(getattr(atomic_ops, name) for name in atomic_ops.__all__),
+    }
+    for graph_info in device_ir.graphs:
+        for node in graph_info.graph.nodes:
+            if node.op == "call_function" and node.target in targets:
+                node.meta["mem_op_id"] = compute_mem_op_id(node, host.tensor_to_origin)
+
+
 def _collect_memory_op_facts(device_ir: DeviceIR) -> list[MemoryOpFact]:
     """Walk every device graph once and record per-load/store metadata.
 
@@ -2798,7 +2852,60 @@ def _collect_memory_op_facts(device_ir: DeviceIR) -> list[MemoryOpFact]:
             )
             memory_op_index += 1
 
-    return [fact._replace(matmul_operand=operands.get(node)) for node, fact in records]
+    facts_with_nodes = [
+        (node, fact._replace(matmul_operand=operands.get(node)))
+        for node, fact in records
+    ]
+    smap = env.config_spec.mem_op_slot_map
+    if smap is None:
+        # Non-triton (pallas/metal/tileir/cute): keep the legacy per-emission union facts +
+        # positional/sparse indices. Codegen on those backends still walks positional counters.
+        return [fact for _node, fact in facts_with_nodes]
+    return _collapse_memory_op_facts(facts_with_nodes, smap)
+
+
+def _collapse_memory_op_facts(
+    facts_with_nodes: list[tuple[torch.fx.Node, MemoryOpFact]],
+    smap: MemOpSlotMap,
+) -> list[MemoryOpFact]:
+    """Collapse the per-emission union facts to one fact per distinct ``mem_op_id`` (triton only).
+
+    The FIRST occurrence (the original, pre-rolling op) is the representative: every enrichment field
+    is a property of the source op, so the representative's values are authoritative (rolled copies
+    live in re-wired subgraphs whose dataflow can differ — the original is the faithful one).
+    ``indexing_index`` / ``eviction_index`` are taken from the id->slot map (the single numbering
+    source of truth). Under uniform source-based membership every load/store has an indexing slot
+    (tile.index / stack slots are inert), so ``indexing_index`` is always a real slot; the ``-1``
+    fallback is defensive only. ``eviction_index`` is the DENSE map slot for loads
+    (Fork 2), ``None`` for stores. ``static_emission_count`` is how many times the id is emitted in
+    its representative (original) graph — its static-unroll factor — so ``num_load`` keeps today's
+    instruction tally (rolled-reduction copies live in appended subgraphs with distinct ``graph_id``,
+    so they are excluded from the count automatically).
+    """
+    first: dict[MemOpId, MemoryOpFact] = {}
+    rep_graph: dict[MemOpId, int] = {}
+    emission_counts: dict[MemOpId, int] = {}
+    for node, fact in facts_with_nodes:
+        mem_op_id = node.meta["mem_op_id"]
+        if mem_op_id not in first:
+            first[mem_op_id] = fact
+            rep_graph[mem_op_id] = fact.graph_id
+            emission_counts[mem_op_id] = 0
+        if fact.graph_id == rep_graph[mem_op_id]:
+            emission_counts[mem_op_id] += 1
+
+    collapsed: list[MemoryOpFact] = []
+    for mem_op_id, fact in first.items():
+        indexing_slot = smap.indexing.get(mem_op_id)
+        eviction_slot = smap.eviction.get(mem_op_id) if fact.kind == "load" else None
+        collapsed.append(
+            fact._replace(
+                indexing_index=indexing_slot if indexing_slot is not None else -1,
+                eviction_index=eviction_slot,
+                static_emission_count=emission_counts[mem_op_id],
+            )
+        )
+    return collapsed
 
 
 def _indexing_uses_tensor_descriptor(
@@ -2828,52 +2935,53 @@ def _count_device_atomics(device_ir: DeviceIR) -> int:
 
 
 def _register_load_store_tunables(
-    total_load_count: int,
-    loads_without_eviction_policy: int,
-    loads_without_cache_modifier: int,
+    indexing_length: int,
+    eviction_length: int,
+    cache_length: int,
     store_indices: list[int],
 ) -> None:
     """Register list-based tunables for device loads and stores.
 
+    Lengths are pre-computed by the caller (so the triton/non-triton sizing rule lives in one place):
+    on triton from the ``mem_op_slot_map`` distinct-slot counts (Fork 1 collapse + Fork 2 dense
+    eviction); on every other backend from the legacy facts-union/positional counts.
+
     Args:
-        total_load_count: Total number of loads (for indexing tunable)
-        loads_without_eviction_policy: Number of loads that need eviction policy tuning
-        loads_without_cache_modifier: Number of loads that need cache modifier tuning
-        store_indices: Positions of store ops in the combined indexing list
+        indexing_length: Number of distinct ``config.indexing`` slots (loads with an indexing slot +
+            stores).
+        eviction_length: Number of ``load_eviction_policies`` slots (dense over loads on triton).
+        cache_length: Number of ``load_cache_modifiers`` slots (one per load).
+        store_indices: ``config.indexing`` slots of store ops (consumed by epilogue-subtile forcing).
     """
-    store_count = len(store_indices)
     env = CompileEnvironment.current()
     env.config_spec.store_indices = store_indices
-    if total_load_count == 0 and store_count == 0:
-        return
 
     from ..autotuner.config_fragment import EnumFragment
     from ..autotuner.config_fragment import ListOf
     from ..autotuner.config_spec import get_valid_eviction_policies
     from ..autotuner.config_spec import get_valid_load_cache_modifiers
 
-    # Register eviction policies only for loads without explicit eviction_policy
-    if loads_without_eviction_policy > 0:
+    # Register eviction policies (dense on triton: pinned loads get an inert slot, never read by
+    # codegen's ``if eviction_policy is None`` guard).
+    if eviction_length > 0:
         env.config_spec.load_eviction_policies = ListOf(
             EnumFragment(choices=get_valid_eviction_policies(env.backend_name)),
-            length=loads_without_eviction_policy,
+            length=eviction_length,
         )
 
-    # Register cache modifiers only for loads and only when the backend has
-    # a non-trivial search space.
+    # Register cache modifiers only when the backend has a non-trivial search space.
     load_cache_modifier_choices = get_valid_load_cache_modifiers(env.backend_name)
-    if loads_without_cache_modifier > 0 and len(load_cache_modifier_choices) > 1:
+    if cache_length > 0 and len(load_cache_modifier_choices) > 1:
         env.config_spec.load_cache_modifiers = ListOf(
             EnumFragment(choices=load_cache_modifier_choices),
-            length=loads_without_cache_modifier,
+            length=cache_length,
         )
 
-    # Indexing applies to ALL loads and stores
-    total_count = total_load_count + store_count
-    if total_count > 0:
+    # Indexing applies to ALL loads (with a slot) and stores.
+    if indexing_length > 0:
         env.config_spec.indexing = ListOf(
             EnumFragment(choices=env.config_spec.valid_indexing_types()),
-            length=total_count,
+            length=indexing_length,
         )
 
 
@@ -2900,6 +3008,7 @@ def _register_tensor_descriptor_layout_guards(device_ir: DeviceIR) -> None:
     from .._compat import supports_tensor_descriptor
     from ..language import atomic_ops
     from ..language import memory_ops
+    from .memory_op_slots import _is_tile_index_load
 
     if not supports_tensor_descriptor():
         return
@@ -2911,6 +3020,11 @@ def _register_tensor_descriptor_layout_guards(device_ir: DeviceIR) -> None:
             return arg.meta.get("val")
         return arg
 
+    # The layout-guard slot must be the SAME slot codegen reads, so the config-selection check
+    # (_td_layout_guard_active_for_config) lands on the right op. On triton that is the
+    # transform-invariant mem_op_id slot; the map exists only for triton, so a positional fallback
+    # covers the other backends.
+    slot_map = env.config_spec.mem_op_slot_map
     memory_op_index = 0
     atomic_op_index = 0
     for graph_info in device_ir.graphs:
@@ -2919,18 +3033,42 @@ def _register_tensor_descriptor_layout_guards(device_ir: DeviceIR) -> None:
                 continue
             if node.target in (memory_ops.load, memory_ops.store):
                 tensor = tensor_arg_value(node.args[0])
-                if isinstance(tensor, torch.Tensor) and 2 <= tensor.ndim <= 5:
+                # Under uniform membership a tile.index load now carries an (inert) indexing slot, but
+                # it materializes to arithmetic — no tensor_descriptor load — so it must NOT register a
+                # layout guard. (Triton-gated: non-triton keeps its positional path unchanged. Stack
+                # loads are already excluded by the isinstance(tensor, Tensor) check below.)
+                is_tile_index = slot_map is not None and _is_tile_index_load(node)
+                if (
+                    isinstance(tensor, torch.Tensor)
+                    and 2 <= tensor.ndim <= 5
+                    and not is_tile_index
+                ):
+                    slot = (
+                        slot_map.indexing_slot(node.meta["mem_op_id"])
+                        if slot_map is not None
+                        else memory_op_index
+                    )
+                    # Every real-tensor non-tile.index load/store has an indexing slot (uniform
+                    # membership on triton; positional counter on other backends), so it always
+                    # resolves — assert rather than silently skip a correctness guard.
+                    assert slot is not None
                     env.register_tensor_descriptor_layout_guard(
-                        tensor, memory_op_index=memory_op_index
+                        tensor, memory_op_index=slot
                     )
                 memory_op_index += 1
                 continue
             if node.target in atomic_targets:
                 tensor = tensor_arg_value(node.args[0])
                 if isinstance(tensor, torch.Tensor) and 2 <= tensor.ndim <= 5:
-                    env.register_tensor_descriptor_layout_guard(
-                        tensor, atomic_op_index=atomic_op_index
+                    slot = (
+                        slot_map.atomic_indexing_slot(node.meta["mem_op_id"])
+                        if slot_map is not None
+                        else atomic_op_index
                     )
+                    if slot is not None:
+                        env.register_tensor_descriptor_layout_guard(
+                            tensor, atomic_op_index=slot
+                        )
                 atomic_op_index += 1
 
 
@@ -2989,6 +3127,17 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
         config_spec.epilogue_subtile_k_hint = 0
         config_spec.epilogue_subtile_autotune_choices = None
 
+        # Stamp a stable mem_op_id on every memory op and build the id->slot map, BEFORE
+        # register_rollable_reductions duplicates ops (so all copies share one id/slot). Codegen
+        # resolves each emitted op's tunable slot through this map (transform-invariant) instead of a
+        # per-config emission counter. Only consumed on the triton backend; doing it only there keeps
+        # Pallas/Metal/CuTe on their existing positional bookkeeping (out of scope).
+        if CompileEnvironment.current().backend.name == "triton":
+            from .memory_op_slots import build_mem_op_slot_map
+
+            _stamp_mem_op_ids(device_ir)
+            config_spec.mem_op_slot_map = build_mem_op_slot_map(device_ir)
+
         # Phase 1 of the reduction-fact reorder: roll + register the reduction_loops spec
         # and stash the rollable (standard) rdims. ReductionFacts are built in Phase 3
         # (build_reduction_facts, after _collect_memory_op_facts) so they read the enriched
@@ -3022,15 +3171,36 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
         # from it so heuristics can map each Config.indexing slot to its graph op.
         memory_op_facts = _collect_memory_op_facts(device_ir)
         config_spec.memory_op_facts = memory_op_facts
-        load_count = sum(f.kind == "load" for f in memory_op_facts)
-        _register_load_store_tunables(
-            load_count,
-            sum(f.eviction_index is not None for f in memory_op_facts),
-            # cache_modifier is tuned for every load (no per-load override)
-            load_count,
-            [f.indexing_index for f in memory_op_facts if f.kind == "store"],
-        )
-        _register_atomic_tunables(_count_device_atomics(device_ir))
+        smap = config_spec.mem_op_slot_map
+        if smap is not None:
+            # Triton: the id->slot map is the single source of truth for numbering AND sizing —
+            # Fork 1 collapse (distinct-op counts, not the inflated union) + Fork 2 dense eviction
+            # (one slot per load; pinned loads get an inert slot) + uniform source-based membership
+            # (every load/store has an indexing slot; tile.index/stack slots are inert). store_indices
+            # = only REAL-tensor store slots (the subtile-forcing set); stack stores are excluded.
+            store_indices = sorted(smap.store_strategy_slots)
+            _register_load_store_tunables(
+                smap.indexing_count,
+                smap.eviction_count,
+                smap.cache_count,
+                store_indices,
+            )
+            _register_atomic_tunables(smap.atomic_count)
+        else:
+            # Non-triton (pallas/metal/tileir/cute): legacy facts-union / sparse-eviction / positional
+            # sizing (their codegen still walks positional counters; out of scope to migrate).
+            load_count = sum(f.kind == "load" for f in memory_op_facts)
+            store_indices = [
+                f.indexing_index for f in memory_op_facts if f.kind == "store"
+            ]
+            _register_load_store_tunables(
+                load_count + len(store_indices),
+                sum(f.eviction_index is not None for f in memory_op_facts),
+                # cache_modifier is tuned for every load (no per-load override)
+                load_count,
+                store_indices,
+            )
+            _register_atomic_tunables(_count_device_atomics(device_ir))
         _register_tensor_descriptor_layout_guards(device_ir)
 
         # Accumulator facts are a standalone, reduction-agnostic fact layer (any heuristic

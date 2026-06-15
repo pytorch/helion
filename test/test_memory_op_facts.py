@@ -42,6 +42,31 @@ def row_sum_kernel(x: torch.Tensor) -> torch.Tensor:
     return out
 
 
+@helion.kernel
+def unroll_sum_kernel(x: torch.Tensor) -> torch.Tensor:
+    """A single source load statically unrolled into 3 emissions, all feeding the reduction."""
+    m, _ = x.shape
+    out = torch.empty([m], dtype=torch.float32, device=x.device)
+    for tile_m in hl.tile(m):
+        acc = hl.zeros([tile_m], dtype=torch.float32)
+        for i in (0, 1, 2):
+            acc = acc + x[tile_m, i]
+        out[tile_m] = acc
+    return out
+
+
+@helion.kernel
+def reread_kernel(x: torch.Tensor) -> torch.Tensor:
+    """One load feeds two reductions on the same axis -> row_reread."""
+    m, _ = x.shape
+    out = torch.empty([m], dtype=torch.float32, device=x.device)
+    for tile_m in hl.tile(m):
+        v = x[tile_m, :]
+        mx = torch.amax(v, dim=1)
+        out[tile_m] = torch.sum(v - mx[:, None], dim=1)
+    return out
+
+
 @skipIfRefEager("config spec inspection is not applicable in ref eager mode")
 class TestMemoryOpFacts(RefEagerTestBase, TestCase):
     def test_specs_align_with_indexing_list(self):
@@ -66,17 +91,17 @@ class TestMemoryOpFacts(RefEagerTestBase, TestCase):
     @skipIfNotCUDA()
     @onlyBackends(["triton"])
     def test_reduction_fact_indexing_slot_invariant(self):
-        """The 3-phase reorder builds the ReductionFact AFTER _collect_memory_op_facts,
-        but the collector still runs AFTER the reduction rolling — so every rolled-
-        subgraph load/store keeps its Config.indexing slot and the
-        ``memory_op_facts[i].indexing_index == i`` invariant holds (this is the hard
-        invariant the reorder must preserve; running the collector before the rolling
-        would desync ``Config.indexing`` from codegen)."""
+        """On triton the facts are COLLAPSED to one entry per distinct ``mem_op_id`` with
+        ``indexing_index`` taken from the id->slot map (the single numbering source of
+        truth). So the rolled-reduction copy is folded into its original (no separate
+        ``graph_id>0`` fact), the ``memory_op_facts[i].indexing_index == i`` invariant is
+        restored, and ``num_load`` is recovered from ``static_emission_count`` (==1 here:
+        one streamed input row, emitted once in the original graph)."""
         x = torch.randn([256, 512], device=DEVICE, dtype=torch.float32)
         spec = row_sum_kernel.bind((x,)).config_spec
         specs = spec.memory_op_facts
 
-        # The reorder must not change the indexing-slot alignment / length.
+        # Collapse restores the slot alignment / length (one fact per distinct slot).
         self.assertEqual(len(specs), spec.indexing.length)
         self.assertEqual([s.indexing_index for s in specs], list(range(len(specs))))
         self.assertEqual(
@@ -87,15 +112,53 @@ class TestMemoryOpFacts(RefEagerTestBase, TestCase):
         # Phase 3 built exactly one ReductionFact, derived from the enriched facts.
         self.assertEqual(len(spec.reduction_facts), 1)
         fact = spec.reduction_facts[0]
-        # num_load scopes to the rdim's ORIGINAL graph(s) (one streamed input row), so the
-        # rolled-subgraph copy is not double-counted by the derived-from-facts count.
         self.assertEqual(fact.num_load, 1)
 
-        # The collector ran AFTER the rolling: the rolled reduction subgraph's load copy
-        # is accounted for, so a load fact lives in a later graph than the root (and the
-        # superset has > 1 load fact even though num_load == 1).
-        self.assertTrue(any(s.graph_id > 0 for s in specs if s.kind == "load"))
-        self.assertGreater(sum(1 for s in specs if s.kind == "load"), fact.num_load)
+        # The rolled-subgraph copy is COLLAPSED into the original first-occurrence fact:
+        # exactly one load fact (no graph_id>0 duplicate), and num_load == that load's
+        # static emission count (1).
+        load_facts = [s for s in specs if s.kind == "load"]
+        self.assertEqual(len(load_facts), 1)
+        self.assertEqual(load_facts[0].graph_id, 0)
+        self.assertEqual(load_facts[0].static_emission_count, 1)
+        self.assertEqual(
+            sum(s.static_emission_count for s in load_facts), fact.num_load
+        )
+
+    @skipIfNotCUDA()
+    @onlyBackends(["triton"])
+    def test_static_unroll_num_load_preserved(self):
+        """A single source load statically unrolled into 3 emissions collapses to ONE fact
+        carrying ``static_emission_count == 3``; ``num_load`` recovers the instruction
+        count (3), not the distinct-source count (1)."""
+        x = torch.randn([256, 3], device=DEVICE, dtype=torch.float32)
+        spec = unroll_sum_kernel.bind((x,)).config_spec
+        specs = spec.memory_op_facts
+
+        load_facts = [s for s in specs if s.kind == "load"]
+        self.assertEqual(len(load_facts), 1)  # the 3 emissions collapse to one fact
+        self.assertEqual(load_facts[0].static_emission_count, 3)
+        # indexing collapsed to one slot for the load (+ one for the store).
+        self.assertEqual([s.indexing_index for s in specs], list(range(len(specs))))
+        if spec.reduction_facts:
+            self.assertEqual(spec.reduction_facts[0].num_load, 3)
+
+    @skipIfNotCUDA()
+    @onlyBackends(["triton"])
+    def test_reread_eviction_index_is_map_slot(self):
+        """The re-read load's ``reread_eviction_index`` is the DENSE map eviction slot the
+        codegen actually reads (the unify soundness fix) — not a separate facts counter."""
+        x = torch.randn([256, 512], device=DEVICE, dtype=torch.float32)
+        spec = reread_kernel.bind((x,)).config_spec
+        self.assertEqual(len(spec.reduction_facts), 1)
+        fact = spec.reduction_facts[0]
+        self.assertTrue(fact.row_reread)
+        self.assertIsNotNone(fact.reread_eviction_index)
+        self.assertIn(
+            fact.reread_eviction_index, set(spec.mem_op_slot_map.eviction.values())
+        )
+        # And it indexes a valid slot of the (dense) eviction list.
+        self.assertLess(fact.reread_eviction_index, spec.load_eviction_policies.length)
 
     def test_load_store_metadata(self):
         x = torch.randn([256, 256], device=DEVICE, dtype=torch.float32)

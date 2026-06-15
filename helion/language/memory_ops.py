@@ -236,18 +236,7 @@ def _(state: CodegenState) -> ast.AST:
         device_fn = state.device_function
         fx_node = state.fx_node
         assert fx_node is not None
-        epilogue_subtile_group_id = fx_node.meta.get("epilogue_subtile_group_id")
-        if epilogue_subtile_group_id is None:
-            indexing_idx = device_fn.allocate_store_index()
-        elif fx_node.meta.get("epilogue_subtile_primary_output", False):
-            indexing_idx = device_fn.allocate_store_index()
-            device_fn.epilogue_subtile_store_indices[epilogue_subtile_group_id] = (
-                indexing_idx
-            )
-        else:
-            indexing_idx = device_fn.epilogue_subtile_store_indices[
-                epilogue_subtile_group_id
-            ]
+        indexing_idx = device_fn.memory_op_broker.store_indexing_slot(fx_node)
         strategy = device_fn.get_indexing_strategy(indexing_idx)
 
         if state.codegen.store_transform is not None:
@@ -6198,8 +6187,8 @@ def _(state: CodegenState) -> ast.AST:
     eviction_policy = state.ast_args[3] if len(state.ast_args) > 3 else None
 
     device_fn = state.device_function
-    load_idx = device_fn.device_load_index
-    device_fn.device_load_index += 1
+    broker = device_fn.memory_op_broker
+    load_idx = broker.load_eviction_slot(state.fx_node)
 
     # If no explicit eviction_policy and we're in device code, use tunable
     if eviction_policy is None and state.codegen.on_device:
@@ -6214,8 +6203,7 @@ def _(state: CodegenState) -> ast.AST:
 
     cache_modifier = None
     if state.codegen.on_device:
-        modifier_idx = device_fn.device_load_cache_modifier_index
-        device_fn.device_load_cache_modifier_index += 1
+        modifier_idx = broker.load_cache_slot(state.fx_node)
         modifiers = state.config.load_cache_modifiers
         if modifier_idx < len(modifiers) and modifiers[modifier_idx]:
             cache_modifier = ast.Constant(value=modifiers[modifier_idx])
@@ -6226,8 +6214,7 @@ def _(state: CodegenState) -> ast.AST:
             return tile_index_result
 
         # Use the shared memory op index for indexing strategy
-        indexing_idx = device_fn.device_memory_op_index
-        device_fn.device_memory_op_index += 1
+        indexing_idx = broker.load_indexing_slot(state.fx_node)
         strategy = device_fn.get_indexing_strategy(indexing_idx)
 
         if state.codegen.load_transform is not None:

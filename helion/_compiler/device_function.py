@@ -37,6 +37,7 @@ from .compile_environment import CompileEnvironment
 from .cute.device_state import CuteDeviceFunctionState
 from .host_function import HostFunction
 from .host_function import NoCurrentFunction
+from .memory_op_slots import MemoryOpSlotBroker
 from .output_header import reserved_names
 from .source_location import SyntheticLocation
 from .variable_origin import BlockSizeOrigin
@@ -311,16 +312,20 @@ class DeviceFunction:
         # Atomic indexing config (separate from load/store indexing)
         self._atomic_indexing_config = config.atomic_indexing
         self.atomic_indexing_strategies: list[IndexingStrategy] = []
-        self.atomic_op_index = 0
 
         self.rng_seed_count = 0
-        self.device_load_index = 0
-        self.device_load_cache_modifier_index = 0
-        self.device_store_index = 0
-        # Single counter for both loads and stores for indexing assignment
-        self.device_memory_op_index = 0
-        self.epilogue_subtile_store_indices: dict[str, int] = {}
-        self.epilogue_subtile_atomic_indices: dict[str, int] = {}
+        # All per-memory-op slot counters (indexing / eviction / cache / atomic / store-tally) and
+        # the epilogue split-store/-atomic share dicts live on the broker (single source of truth).
+        # The legacy attribute names below remain available as properties for the metal/pallas
+        # codegen paths that bump them directly; the triton handlers go through the broker.
+        # On the triton backend the broker resolves each op's slot by its stable mem_op_id (built at
+        # bind into config_spec.mem_op_slot_map) so the slot is transform-invariant; other backends
+        # keep the positional numbering (out of scope — see MEMORY_OP_IDENTITY_BRAINSTORM.md).
+        _env = CompileEnvironment.current()
+        self.memory_op_broker = MemoryOpSlotBroker(
+            _env.config_spec.mem_op_slot_map,
+            id_keyed=_env.backend.name == "triton",
+        )
         self.rng_seed_buffer_param_name = None
 
         # Pallas: id(fake_tensor) → [DimensionTiling], recorded during `plan_tiling`
@@ -338,12 +343,60 @@ class DeviceFunction:
         # using pl.ds() that may need host-side padding.
         self.pallas_pad_info: dict[int, dict[int, tuple[int, int]]] = {}
 
+    # Legacy per-memory-op counter attributes, delegated to the broker so the metal/pallas codegen
+    # paths (which bump these directly) stay in lockstep with the triton handlers (which go through
+    # the broker). See MemoryOpSlotBroker.
+    @property
+    def device_memory_op_index(self) -> int:
+        return self.memory_op_broker.indexing_counter
+
+    @device_memory_op_index.setter
+    def device_memory_op_index(self, value: int) -> None:
+        self.memory_op_broker.indexing_counter = value
+
+    @property
+    def device_load_index(self) -> int:
+        return self.memory_op_broker.eviction_counter
+
+    @device_load_index.setter
+    def device_load_index(self, value: int) -> None:
+        self.memory_op_broker.eviction_counter = value
+
+    @property
+    def device_load_cache_modifier_index(self) -> int:
+        return self.memory_op_broker.cache_counter
+
+    @device_load_cache_modifier_index.setter
+    def device_load_cache_modifier_index(self, value: int) -> None:
+        self.memory_op_broker.cache_counter = value
+
+    @property
+    def device_store_index(self) -> int:
+        return self.memory_op_broker.store_counter
+
+    @device_store_index.setter
+    def device_store_index(self, value: int) -> None:
+        self.memory_op_broker.store_counter = value
+
+    @property
+    def atomic_op_index(self) -> int:
+        return self.memory_op_broker.atomic_counter
+
+    @atomic_op_index.setter
+    def atomic_op_index(self, value: int) -> None:
+        self.memory_op_broker.atomic_counter = value
+
+    @property
+    def epilogue_subtile_store_indices(self) -> dict[str, int]:
+        return self.memory_op_broker.epilogue_store_slots
+
+    @property
+    def epilogue_subtile_atomic_indices(self) -> dict[str, int]:
+        return self.memory_op_broker.epilogue_atomic_slots
+
     def allocate_store_index(self) -> int:
         """Bump store counters and return the indexing strategy slot."""
-        self.device_store_index += 1
-        idx = self.device_memory_op_index
-        self.device_memory_op_index += 1
-        return idx
+        return self.memory_op_broker._alloc_store_indexing()
 
     def get_indexing_strategy(self, index: int) -> IndexingStrategy:
         from .indexing_strategy import IndexingStrategy
