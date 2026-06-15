@@ -31,6 +31,7 @@ from helion._compiler.pallas.compact_worklist import render_build_worklist
 from helion._compiler.pallas.compact_worklist import resolve_for_worklist
 from helion._testing import DEVICE
 from helion._testing import code_and_output
+from helion._testing import onlyBackends
 from helion._testing import skipIfPallasInterpret
 from helion._testing import skipUnlessPallas
 import helion.language as hl
@@ -82,6 +83,7 @@ def _python_flatten_reference(base, length, block, *, dep_base=None, dep_len=Non
     }
 
 
+@onlyBackends(["pallas"])
 @unittest.skipUnless(HAS_JAX, "jax not available")
 class TestCompactWorklistBuilder(unittest.TestCase):
     """Unit tests for :func:`flatten_worklist` (PR plan §5.1, design §8.1)."""
@@ -189,6 +191,7 @@ class TestCompactWorklistBuilder(unittest.TestCase):
         self.assertEqual(packed_upper_bound(0, 4, 128), 3)
 
 
+@onlyBackends(["pallas"])
 class TestResolveForWorklist(unittest.TestCase):
     """resolve_for_worklist generality + leak-check (PR plan §5.2, design §8.2).
 
@@ -256,6 +259,7 @@ def _plan(*, ordered, owner_indexed):
     )
 
 
+@onlyBackends(["pallas"])
 class TestMetadataArgNames(unittest.TestCase):
     """metadata_arg_names is policy-derived (PR plan §7)."""
 
@@ -278,6 +282,7 @@ class TestMetadataArgNames(unittest.TestCase):
                 self.assertEqual(len(metadata_arg_names(plan)), len(expected))
 
 
+@onlyBackends(["pallas"])
 class TestRenderBuilderParams(unittest.TestCase):
     """render_build_worklist param collection (feedback #3)."""
 
@@ -368,6 +373,7 @@ def _offsets(lengths):
     )
 
 
+@onlyBackends(["pallas"])
 class TestDetectAndGating(unittest.TestCase):
     """detect_compact_worklist_plan + autotuner gating over real traces.
 
@@ -475,6 +481,7 @@ class TestDetectAndGating(unittest.TestCase):
         self.assertNotIn("pallas_loop_type", fields)
 
 
+@onlyBackends(["pallas"])
 @unittest.skipUnless(HAS_JAX, "jax not available")
 class TestBuildWorklistRender(unittest.TestCase):
     """The generated jnp _build_worklist (design §3.1, PR plan Step 4).
@@ -582,6 +589,7 @@ def _dual_offset_kernel(q, lo, hi):
     return out
 
 
+@onlyBackends(["pallas"])
 @unittest.skipUnless(HAS_JAX, "jax not available")
 class TestBuilderDistinctTensors(unittest.TestCase):
     """Builder render with distinct begin/end tensors (feedback #2)."""
@@ -675,6 +683,7 @@ def _bound_axis(base_src, length_src):
     )
 
 
+@onlyBackends(["pallas"])
 class TestHostBoundValidation(unittest.TestCase):
     """detect rejects non-host-evaluable / non-offsets bounds (feedback #3, #4)."""
 
@@ -725,6 +734,7 @@ class TestHostBoundValidation(unittest.TestCase):
                 _validate_host_bounds(host_fn, axes, "seq", owners)
 
 
+@onlyBackends(["pallas"])
 class TestPolicyClassification(unittest.TestCase):
     """Unsupported compact indexing is rejected, not silently dropped (#4)."""
 
@@ -754,6 +764,7 @@ class TestPolicyClassification(unittest.TestCase):
             _classify_tensor_policies(loop, "seq", "tile_q", None, set())
 
 
+@onlyBackends(["pallas"])
 class TestNoSilentFallback(unittest.TestCase):
     """compact_worklist routes to the compact launcher, never the default (#1)."""
 
@@ -850,6 +861,7 @@ def _eager_fully_jagged(q, k, v, qo, kvo):
     return out
 
 
+@onlyBackends(["pallas"])
 class TestUpperBoundPacking(unittest.TestCase):
     """Only packed-offset bounds are accepted; non-packed is rejected (#main).
 
@@ -900,6 +912,7 @@ class TestUpperBoundPacking(unittest.TestCase):
             detect_compact_worklist_plan(bk.host_function)
 
 
+@onlyBackends(["pallas"])
 class TestConfigStateIsolation(unittest.TestCase):
     """compact plan must not leak into a later config (review #main).
 
@@ -936,6 +949,7 @@ class TestConfigStateIsolation(unittest.TestCase):
         self.assertNotIn("_build_worklist", fori)
 
 
+@onlyBackends(["pallas"])
 class TestPrologueScoping(unittest.TestCase):
     """Prologue assigns must stop at the selected loop (review #medium)."""
 
