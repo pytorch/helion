@@ -881,6 +881,13 @@ class DeviceFunction:
             from .cute.merge_sibling_v_loops import merge_sibling_v_loops
 
             kernel_body = merge_sibling_v_loops(kernel_body)
+            # Fuse adjacent per-lane fp8 decodes in the SIMT matmul V-loop
+            # into one ``cvt.rn.f16x2.e4m3x2`` (decode 2 e4m3 bytes per
+            # instruction) — halves the decode instruction count on the
+            # skinny-M fp8 GEMV path.
+            from .cute.fuse_fp8_pair_decode import fuse_fp8_pair_decode
+
+            kernel_body = fuse_fp8_pair_decode(kernel_body)
             # Hoist loop-invariant floating-point divisions out of inner
             # tile loops, replacing each ``x / scalar`` with a hoisted
             # ``inv = 1.0 / scalar`` + ``x * inv`` in the loop body.
