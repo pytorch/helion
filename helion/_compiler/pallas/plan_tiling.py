@@ -369,7 +369,19 @@ def _update_tiling_decision(
                 _disallow_tiling()
 
     if isinstance(pattern, TilePattern):
-        _try_set_tiling_block_id(pattern.block_id)
+        # Jagged-pinned parent (block_size=1, fori-driven): don't let
+        # BlockSpec carve this axis — the kernel needs the full tensor
+        # visible so each per-fori iter can slice ``pl.ds(pid_0, 1)``.
+        # Without this, 3+D tensors get block_shape=(1, ...) carving
+        # (the 2-D alignment rule below incidentally protects 2-D
+        # tensors like ``bias[tile_b, tile_k]``).
+        jagged_parent_bids = {
+            p for parents in env.jagged_tile_parent_ids.values() for p in parents
+        }
+        if pattern.block_id in jagged_parent_bids:
+            _disallow_tiling()
+        else:
+            _try_set_tiling_block_id(pattern.block_id)
 
     elif isinstance(pattern, TileIndexWithOffsetPattern):
         _disallow_tiling()
