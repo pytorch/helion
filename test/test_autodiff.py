@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import contextlib
+import functools
 import locale
 import operator
 import unittest
@@ -15,14 +17,27 @@ from helion._testing import skipIfNotTriton
 from helion._testing import skipIfXPU
 import helion.language as hl
 
-# Triton writes its generated launcher source with the process locale encoding;
-# force a UTF-8 locale so a non-UTF-8 worker doesn't fail to encode non-ASCII bytes.
-for _utf8_locale in ("C.UTF-8", "en_US.UTF-8", "C.utf8", "en_US.utf8"):
-    try:
-        locale.setlocale(locale.LC_CTYPE, _utf8_locale)
-        break
-    except locale.Error:
-        continue
+
+def _force_utf8_locale(fn):
+    # Triton writes its generated launcher with the process locale encoding; force
+    # UTF-8 for the duration of the test so a non-UTF-8 worker doesn't fail to
+    # encode non-ASCII bytes during a cold-cache kernel compile, then restore it.
+    @functools.wraps(fn)
+    def wrapper(self, *args, **kwargs):
+        prev = locale.setlocale(locale.LC_CTYPE)
+        for _loc in ("C.UTF-8", "en_US.UTF-8", "C.utf8", "en_US.utf8"):
+            try:
+                locale.setlocale(locale.LC_CTYPE, _loc)
+                break
+            except locale.Error:
+                continue
+        try:
+            return fn(self, *args, **kwargs)
+        finally:
+            with contextlib.suppress(locale.Error):
+                locale.setlocale(locale.LC_CTYPE, prev)
+
+    return wrapper
 
 
 @skipIfMTIA("autodiff not tested on MTIA")
@@ -1279,6 +1294,7 @@ class TestAutodiff(RefEagerTestDisabled, TestCase):
             atol=1e-2,
         )
 
+    @_force_utf8_locale
     def test_example_attention(self):
         from examples.attention import attention
 
@@ -1298,6 +1314,7 @@ class TestAutodiff(RefEagerTestDisabled, TestCase):
             atol=1e-2,
         )
 
+    @_force_utf8_locale
     def test_example_attention_non_divisible_seqlen(self):
         # Non-block-divisible sequence length: the scan zero-pads the key dim
         # and must re-apply the forward's OOB mask, else the softmax is
