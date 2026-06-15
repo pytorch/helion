@@ -797,37 +797,31 @@ class LocalBenchmarkProvider(BenchmarkProvider):
             status: Literal[
                 "ok", "error", "timeout", "peer_compilation_fail", "filtered"
             ]
+            # config_id is None when no log sink is active (skip recording). The
+            # started and result rows share it so they join to one config, and
+            # every config that reaches the benchmark loop is logged -- including
+            # ones that never benchmark because they (or a peer) failed to compile.
+            config_id = self.log.register_config(config)
+            if config_id is not None:
+                self.log.record_autotune_entry(
+                    AutotuneLogEntry(
+                        generation=self._autotune_metrics.num_generations,
+                        status="started",
+                        perf_ms=None,
+                        compile_time=compile_time,
+                        config_id=config_id,
+                        config=config,
+                    )
+                )
             if all(
                 all_gather_object(
                     is_working,
                     process_group_name=self.kernel.env.process_group_name,
                 )
             ):
-                # config_id is None when no log sink is active (skip recording);
-                # the started and result rows share it so they join to one config.
-                config_id = self.log.register_config(config)
-                if config_id is not None:
-                    self.log.record_autotune_entry(
-                        AutotuneLogEntry(
-                            generation=self._autotune_metrics.num_generations,
-                            status="started",
-                            perf_ms=None,
-                            compile_time=compile_time,
-                            config_id=config_id,
-                        )
-                    )
                 perf = self._benchmark_function(config, fn)
                 status = "ok" if math.isfinite(perf) else "error"
-                if config_id is not None:
-                    self.log.record_autotune_entry(
-                        AutotuneLogEntry(
-                            generation=self._autotune_metrics.num_generations,
-                            status=status,
-                            perf_ms=perf if math.isfinite(perf) else None,
-                            compile_time=compile_time,
-                            config_id=config_id,
-                        )
-                    )
+                recorded_perf = perf if math.isfinite(perf) else None
                 results[valid_indices[index]] = BenchmarkResult(
                     config=config,
                     fn=fn,
@@ -839,12 +833,24 @@ class LocalBenchmarkProvider(BenchmarkProvider):
                 status = "timeout" if reason == "timeout" else "error"
                 if is_working:
                     status = "peer_compilation_fail"
+                recorded_perf = None
                 results[valid_indices[index]] = BenchmarkResult(
                     config=config,
                     fn=fn,
                     perf=inf,
                     status=status,
                     compile_time=compile_time,
+                )
+            if config_id is not None:
+                self.log.record_autotune_entry(
+                    AutotuneLogEntry(
+                        generation=self._autotune_metrics.num_generations,
+                        status=status,
+                        perf_ms=recorded_perf,
+                        compile_time=compile_time,
+                        config_id=config_id,
+                        config=config,
+                    )
                 )
         return results
 

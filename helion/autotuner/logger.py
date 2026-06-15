@@ -280,6 +280,7 @@ class AutotuneLogEntry(NamedTuple):
     perf_ms: float | None
     compile_time: float | None
     config_id: str
+    config: Config
 
 
 class AutotuneLogSink:
@@ -339,6 +340,7 @@ class AutotuneLogSink:
                     "status",
                     "perf_ms",
                     "compile_time_s",
+                    "config",
                 ]
             )
             self._csv_file.flush()
@@ -413,6 +415,7 @@ class AutotuneLogSink:
                 entry.status,
                 perf_field,
                 compile_field,
+                str(entry.config),
             ]
         )
         if self._csv_file is not None:

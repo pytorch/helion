@@ -18,14 +18,13 @@ from helion.autotuner.logger import AutotuneLogSink
 from helion.autotuner.metrics import KernelMetadata
 import helion.language as hl
 
-# Acceptance suite for the lean kernel-artifact schema. Pins the two-file contract:
+# Acceptance suite (pure-assertion, no CUDA) pinning the two-file contract:
 #   .meta.jsonl (per run): run_id, kernel_name, kernel_source, input_shapes,
 #                          dtypes, hardware, settings, configs
 #   .csv (per entry):      run_id, timestamp_s, config_id, generation, status,
-#                          perf_ms, compile_time_s
-# Invariants: the per-config config lives only in .meta.jsonl, keyed by a
-# content-addressed config_id; the configs map dedups identical configs; settings
-# serialized JSON-safe. Pure-assertion, no CUDA.
+#                          perf_ms, compile_time_s, config
+# Rows join to a config via the content-addressed config_id; the configs map
+# dedups identical configs. Settings serialized JSON-safe.
 
 _LEAN_CSV_HEADER = [
     "run_id",
@@ -35,6 +34,7 @@ _LEAN_CSV_HEADER = [
     "status",
     "perf_ms",
     "compile_time_s",
+    "config",
 ]
 
 # Keys of KernelMetadata.to_dict() (the per-run identity). The sink augments this
@@ -284,20 +284,22 @@ class TestMetadataSchema(TestCase):
 
 
 class TestAutotuneLogEntry(TestCase):
-    def test_entry_carries_config_id_not_config(self) -> None:
+    def test_entry_carries_config_id_and_config(self) -> None:
         """
-        AutotuneLogEntry references the config by content-addressed config_id and
-        carries no config / sample_id / decorator fields.
+        AutotuneLogEntry references the config by content-addressed config_id (the
+        .meta.jsonl join key) and also carries the config to be written to the CSV.
         """
+        config = helion.Config(block_sizes=[16])
         entry = AutotuneLogEntry(
             generation=0,
             status="ok",
             perf_ms=1.0,
             compile_time=0.1,
             config_id="deadbeefdeadbeef",
+            config=config,
         )
         self.assertEqual(entry.config_id, "deadbeefdeadbeef")
-        self.assertFalse(hasattr(entry, "config"))
+        self.assertIs(entry.config, config)
         self.assertFalse(hasattr(entry, "sample_id"))
         self.assertFalse(hasattr(entry, "decorator"))
 
@@ -334,6 +336,7 @@ class TestAutotuneLogSink(TestCase):
                 perf_ms=perf_ms,
                 compile_time=0.5,
                 config_id=config_id,
+                config=config,
             )
         )
         return config_id
@@ -350,6 +353,24 @@ class TestAutotuneLogSink(TestCase):
             with sink.csv_path.open(encoding="utf-8", newline="") as f:
                 header = next(csv.reader(f))
         self.assertEqual(header, _LEAN_CSV_HEADER)
+
+    def test_csv_config_column_carries_config(self) -> None:
+        """The trailing ``config`` column is populated inline (compat with existing
+        CSV consumers)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            with AutotuneLogSink(
+                f"{tmp}/run", self._metadata(), collect_dataset=True
+            ) as sink:
+                sink.start_run()
+                self._record(sink, helion.Config(block_sizes=[32]))
+                sink.end_run()
+            with sink.csv_path.open(encoding="utf-8", newline="") as f:
+                rows = list(csv.reader(f))
+        header, data = rows[0], rows[1:]
+        self.assertEqual(len(data), 1)
+        config_cell = data[0][header.index("config")]
+        self.assertTrue(config_cell)
+        self.assertIn("32", config_cell)
 
     def test_sidecar_has_lean_keys_and_configs(self) -> None:
         """
@@ -543,6 +564,7 @@ class TestAutotuneLogSink(TestCase):
                     perf_ms=0.1,
                     compile_time=0.5,
                     config_id="abc123",
+                    config=helion.Config(block_sizes=[16]),
                 )
             )
             self.assertFalse(sink.csv_path.exists())

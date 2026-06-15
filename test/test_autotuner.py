@@ -441,14 +441,16 @@ class TestAutotuneIgnoreErrors(TestCase):
             autotune_log_level=logging.CRITICAL,
         )
         logger = AutotuningLogger(settings)
+        config = helion.Config(block_sizes=[32], num_warps=4)
         with logger.autotune_logging():
-            config_id = logger.register_config(helion.Config(foo=1, bar=[2, 3]))
+            config_id = logger.register_config(config)
             entry = AutotuneLogEntry(
                 generation=5,
                 status="ok",
                 perf_ms=1.234,
                 compile_time=0.5,
                 config_id=config_id,
+                config=config,
             )
             logger.record_autotune_entry(entry)
             logger("finalized entry", level=logging.CRITICAL)
@@ -458,7 +460,8 @@ class TestAutotuneIgnoreErrors(TestCase):
         self.assertTrue(csv_path.exists())
         self.assertTrue(log_path.exists())
         rows = list(csv.reader(csv_path.read_text().splitlines()))
-        header = rows[0]
+        self.assertEqual(len(rows), 2)  # header + exactly the one recorded entry
+        header, row = rows[0], rows[1]
         self.assertEqual(
             header,
             [
@@ -469,15 +472,21 @@ class TestAutotuneIgnoreErrors(TestCase):
                 "status",
                 "perf_ms",
                 "compile_time_s",
+                "config",
             ],
         )
+
+        def cell(name: str) -> str:
+            return row[header.index(name)]
+
         # No metadata supplied here, so the run_id join key is empty.
-        self.assertEqual(rows[1][header.index("run_id")], "")
-        # config_id is the content-addressed key returned by register_config.
-        self.assertEqual(rows[1][header.index("config_id")], config_id)
-        self.assertEqual(rows[1][header.index("generation")], "5")
-        self.assertEqual(rows[1][header.index("status")], "ok")
-        self.assertEqual(rows[1][header.index("perf_ms")], "1.234000")
+        self.assertEqual(cell("run_id"), "")
+        self.assertEqual(cell("config_id"), config_id)
+        self.assertEqual(cell("generation"), "5")
+        self.assertEqual(cell("status"), "ok")
+        self.assertEqual(cell("perf_ms"), "1.234000")
+        self.assertEqual(cell("compile_time_s"), "0.50")
+        self.assertEqual(cell("config"), str(config))
         log_text = log_path.read_text()
         self.assertIn("finalized entry", log_text)
 
