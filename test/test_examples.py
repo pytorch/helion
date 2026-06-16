@@ -1927,6 +1927,65 @@ class TestExamples(RefEagerTestBase, TestCase):
             block_sizes=[16, 8, 16],
         )
 
+    @skipIfRefEager("hl.jagged_tile does not support ref mode yet")
+    def test_jagged_amax(self):
+        """Per-row max — sum-like reduction with ``-inf`` init + ``maximum``.
+
+        Exercises the same jagged-flat pattern as ``jagged_sum`` but with a
+        non-sum accumulator, so the pattern-matcher's reduction-op recognition
+        is tested independently.
+        """
+        num_rows, max_cols = 128, 64
+        M = 8
+        lengths = torch.randint(1, max_cols + 1, (num_rows,), device=DEVICE)
+        x_offsets = torch.cat(
+            [
+                torch.zeros(1, dtype=LONG_INT_TYPE, device=DEVICE),
+                torch.cumsum(lengths, dim=0).to(LONG_INT_TYPE),
+            ]
+        )
+        nnz = int(x_offsets[-1])
+        x_data = torch.randn(nnz, M, dtype=torch.float32, device=DEVICE)
+        args = (x_data, x_offsets)
+
+        mod = import_path(EXAMPLES_DIR / "jagged_amax.py")
+        expected = mod.reference_jagged_amax_kernel_pytorch(x_data, x_offsets)
+
+        check_example(
+            "jagged_amax",
+            args,
+            expected,
+            fn_name="jagged_amax_kernel",
+            block_sizes=[16, 8, 16],
+        )
+
+    @skipIfRefEager("hl.jagged_tile does not support ref mode yet")
+    def test_jagged_amin(self):
+        """Per-row min — sum-like reduction with ``+inf`` init + ``minimum``."""
+        num_rows, max_cols = 128, 64
+        M = 8
+        lengths = torch.randint(1, max_cols + 1, (num_rows,), device=DEVICE)
+        x_offsets = torch.cat(
+            [
+                torch.zeros(1, dtype=LONG_INT_TYPE, device=DEVICE),
+                torch.cumsum(lengths, dim=0).to(LONG_INT_TYPE),
+            ]
+        )
+        nnz = int(x_offsets[-1])
+        x_data = torch.randn(nnz, M, dtype=torch.float32, device=DEVICE)
+        args = (x_data, x_offsets)
+
+        mod = import_path(EXAMPLES_DIR / "jagged_amin.py")
+        expected = mod.reference_jagged_amin_kernel_pytorch(x_data, x_offsets)
+
+        check_example(
+            "jagged_amin",
+            args,
+            expected,
+            fn_name="jagged_amin_kernel",
+            block_sizes=[16, 8, 16],
+        )
+
     @skipIfXPU("Timeout on XPU")
     def test_fused_linear_jsd(self):
         beta = 0.5
