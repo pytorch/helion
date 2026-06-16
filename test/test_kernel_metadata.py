@@ -12,6 +12,8 @@ from unittest.mock import patch
 import torch
 
 import helion
+from helion._hardware import _device_props
+from helion._hardware import collect_hardware_info
 from helion._testing import TestCase
 from helion.autotuner.logger import AutotuneLogEntry
 from helion.autotuner.logger import AutotuneLogSink
@@ -46,11 +48,54 @@ _METADATA_DICT_KEYS = {
     "input_shapes",
     "dtypes",
     "hardware",
+    "hardware_info",
     "settings",
 }
 
 # Keys of one on-disk .meta.jsonl record (identity + ir_graph + configs).
 _SIDECAR_KEYS = _METADATA_DICT_KEYS | {"ir_graph", "configs"}
+
+# Fixed key set of the hardware_info snapshot (collect_hardware_info). The
+# per-backend variation is confined to the nested ``versions`` block.
+_HARDWARE_INFO_KEYS = {
+    "device_id",
+    "device_kind",
+    "device_name",
+    "compute_capability",
+    "sm_count",
+    "max_threads_per_sm",
+    "max_threads_per_block",
+    "warp_size",
+    "shared_mem_per_block",
+    "regs_per_multiprocessor",
+    "total_mem",
+    "l2_cache_size",
+    "cpu_num_threads",
+    "versions",
+}
+
+
+def _sample_hardware_info(**overrides: object) -> dict[str, object]:
+    """Complete ``HardwareInfoRecord``-shaped dict (asserts full schema), with overrides."""
+    record: dict[str, object] = {
+        "device_id": "cuda:TestGPU:sm90",
+        "device_kind": "cuda",
+        "device_name": "TestGPU",
+        "compute_capability": "sm90",
+        "sm_count": 99,
+        "max_threads_per_sm": 2048,
+        "max_threads_per_block": 1024,
+        "warp_size": 32,
+        "shared_mem_per_block": 49152,
+        "regs_per_multiprocessor": 65536,
+        "total_mem": 1024,
+        "l2_cache_size": 512,
+        "cpu_num_threads": 8,
+        "versions": {"torch": "x", "triton": "y", "helion": "z", "cuda": "12"},
+    }
+    assert set(record) == _HARDWARE_INFO_KEYS
+    record.update(overrides)
+    return record
 
 
 @helion.kernel(config=helion.Config(block_sizes=[16]))
@@ -162,6 +207,20 @@ class TestMetadataSchema(TestCase):
         """KernelMetadata.to_dict() carries exactly the lean per-run identity fields."""
         record = self._metadata().to_dict()
         self.assertEqual(set(record), _METADATA_DICT_KEYS)
+
+    def test_to_dict_carries_hardware_info(self) -> None:
+        """hardware_info (descriptive snapshot) rides on the record verbatim."""
+        hw = _sample_hardware_info(device_name="TestGPU", sm_count=99)
+        record = self._metadata(hardware_info=hw).to_dict()
+        self.assertEqual(record["hardware_info"], hw)
+
+    def test_hardware_info_excluded_from_run_id(self) -> None:
+        """hardware_info never changes run_id (descriptive only)."""
+        base = self._metadata(hardware_info=_sample_hardware_info(device_name="A"))
+        other = self._metadata(
+            hardware_info=_sample_hardware_info(device_name="B", sm_count=7)
+        )
+        self.assertEqual(base.run_id, other.run_id)
 
     def test_settings_are_stored_and_json_safe(self) -> None:
         """
@@ -281,6 +340,90 @@ class TestMetadataSchema(TestCase):
                 self.assertNotEqual(
                     base.run_id, self._metadata(settings=changed).run_id, name
                 )
+
+
+class TestCollectHardwareInfo(TestCase):
+    """collect_hardware_info is best-effort, fixed-shape, and never raises."""
+
+    def test_has_fixed_keys_and_versions_block(self) -> None:
+        """Fixed key set; ``versions`` always carries torch/triton/helion."""
+        info = collect_hardware_info()
+        self.assertEqual(set(info), _HARDWARE_INFO_KEYS)
+        self.assertIsInstance(info["versions"], dict)
+        for name in ("torch", "triton", "helion"):
+            self.assertIn(name, info["versions"])
+
+    def test_serializes_json_safe(self) -> None:
+        """The snapshot round-trips through the record's JSON-safe dump."""
+        json.dumps(collect_hardware_info(), default=str)
+
+    def test_returns_independent_copies(self) -> None:
+        """Each call returns a fresh object; mutating one cannot poison later callers."""
+        first = collect_hardware_info()
+        second = collect_hardware_info()
+        self.assertIsNot(first, second)
+        first["device_name"] = "poisoned"
+        first["versions"]["torch"] = "poisoned"
+        third = collect_hardware_info()
+        self.assertNotEqual(third["device_name"], "poisoned")
+        self.assertNotEqual(third["versions"]["torch"], "poisoned")
+
+    def test_cpu_device_not_misreported(self) -> None:
+        """Explicit cpu device reports a cpu identity with null props, even on a GPU host."""
+        info = collect_hardware_info(torch.device("cpu"))
+        self.assertEqual(set(info), _HARDWARE_INFO_KEYS)
+        self.assertEqual(info["device_kind"], "cpu")
+        self.assertIsNone(info["sm_count"])
+        self.assertIsNone(info["total_mem"])
+        self.assertIsNone(info["l2_cache_size"])
+        self.assertIsInstance(info["versions"], dict)
+
+    def test_never_raises_on_prop_failure(self) -> None:
+        """A device-property read failure degrades to null props instead of raising."""
+        with patch(
+            "torch.cuda.get_device_properties", side_effect=RuntimeError("boom")
+        ):
+            info = collect_hardware_info(torch.device("cuda"))
+        self.assertEqual(set(info), _HARDWARE_INFO_KEYS)
+        self.assertIsNone(info["sm_count"])
+
+    def test_xpu_props_use_workgroup_fallbacks(self) -> None:
+        """XPU props fill the analogous cuda-named fields; no-analog fields stay null."""
+        fake = types.SimpleNamespace(
+            max_compute_units=512,
+            max_work_group_size=1024,
+            local_mem_size=65536,
+            total_memory=68719476736,
+            # no warp_size / max_threads_per_multi_processor / L2 / regs
+        )
+        with (
+            patch("torch.xpu.is_available", return_value=True),
+            patch("torch.xpu.get_device_properties", return_value=fake),
+        ):
+            props = _device_props(torch.device("xpu"), "xpu")
+        self.assertEqual(props["sm_count"], 512)
+        self.assertEqual(props["max_threads_per_block"], 1024)
+        self.assertEqual(props["shared_mem_per_block"], 65536)
+        self.assertEqual(props["total_mem"], 68719476736)
+        self.assertIsNone(props["warp_size"])
+        self.assertIsNone(props["max_threads_per_sm"])
+        self.assertIsNone(props["regs_per_multiprocessor"])
+        self.assertIsNone(props["l2_cache_size"])
+
+    def test_tpu_path_reports_xla_version(self) -> None:
+        """The tpu branch reports null device props and an ``xla`` runtime version."""
+        with (
+            patch(
+                "helion._hardware._hardware_identity",
+                return_value=("tpu", "TPU v5", "TPU v5"),
+            ),
+            patch("helion._hardware._tpu_runtime_version", return_value="2.7.0"),
+        ):
+            info = collect_hardware_info()
+        self.assertEqual(set(info), _HARDWARE_INFO_KEYS)
+        self.assertEqual(info["device_kind"], "tpu")
+        self.assertIsNone(info["sm_count"])
+        self.assertEqual(info["versions"]["xla"], "2.7.0")
 
 
 class TestAutotuneLogEntry(TestCase):

@@ -28,6 +28,7 @@ from torch.utils._pytree import tree_map_only
 from .. import exc
 from .._compat import extract_device
 from .._compat import get_device_name
+from .._hardware import collect_hardware_info
 from ..runtime.settings import _env_get_int
 from .benchmark_provider import BenchmarkProvider
 from .benchmark_provider import BenchmarkResult
@@ -282,7 +283,12 @@ class BaseSearch(BaseAutotuner):
         tensors = [arg for arg in self.args if isinstance(arg, torch.Tensor)]
         input_shapes = str([tuple(t.shape) for t in tensors])
         dtypes = str([str(t.dtype) for t in tensors])
-        hardware = get_device_name(extract_device(self.args)) or ""
+        device = extract_device(self.args)
+        hardware = get_device_name(device) or ""
+        # Dataset-only; skip the probing on the normal autotune path.
+        hardware_info = (
+            collect_hardware_info(device) if self._dataset_enabled() else None
+        )
         self._autotune_metrics: AutotuneMetrics = AutotuneMetrics(
             kernel_name=kernel_name,
             kernel_source=kernel_source,
@@ -300,6 +306,7 @@ class BaseSearch(BaseAutotuner):
             input_shapes=input_shapes,
             dtypes=dtypes,
             hardware=hardware,
+            hardware_info=hardware_info,
             settings=self.settings.to_dict(),
         )
         # Device IR is config-independent and captured once here
@@ -328,15 +335,19 @@ class BaseSearch(BaseAutotuner):
         configs = getattr(kernel_obj, "configs", None)
         return bool(configs) and not self.settings.force_autotune
 
+    def _dataset_enabled(self) -> bool:
+        """Whether the ``.meta.jsonl`` dataset record will be emitted this run."""
+        return bool(
+            self.settings.autotune_log
+            and self.settings.autotune_dataset
+            and not self._is_restricted_search()
+        )
+
     def _extract_ir_graph(self) -> IrGraphRecord | None:
         """Best-effort, config-independent device-IR dump for the .meta.jsonl record.
         Returns ``None`` unless dataset collection is on.
         """
-        if not (
-            self.settings.autotune_log
-            and self.settings.autotune_dataset
-            and not self._is_restricted_search()
-        ):
+        if not self._dataset_enabled():
             return None
         host_function = getattr(self.kernel, "host_function", None)
         # Read the backing field, not the device_ir property
@@ -529,15 +540,11 @@ class BaseSearch(BaseAutotuner):
         exit_stack = contextlib.ExitStack()
         with exit_stack:
             if self.settings.autotune_log:
-                # .csv/.log follow the log path; the dataset (.meta.jsonl) also
-                # needs opt-in and a representative (non-restricted) search.
-                collect_dataset = (
-                    self.settings.autotune_dataset and not self._is_restricted_search()
-                )
+                # .csv/.log follow the log path; the dataset is additionally gated.
                 exit_stack.enter_context(
                     self.log.autotune_logging(
                         metadata=self._kernel_metadata,
-                        collect_dataset=collect_dataset,
+                        collect_dataset=self._dataset_enabled(),
                         ir_graph=self._ir_graph,
                     )
                 )

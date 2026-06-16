@@ -9,6 +9,8 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from collections.abc import Callable
 
+    from .._hardware import HardwareInfoRecord
+
 _post_autotune_hooks: list[Callable[[AutotuneMetrics], None]] = []
 
 
@@ -97,7 +99,10 @@ class KernelMetadata:
 
     ``run_id`` is a :func:`functools.cached_property` computed on first access.
     ``kernel_source`` carries the full source text and ``settings`` the full
-    reproduction context for analysis.
+    reproduction context for analysis. ``hardware_info`` is a best-effort
+    structured hardware/runtime snapshot for the cost model; it is descriptive
+    only and deliberately excluded from ``run_id`` so software-version bumps do
+    not fragment the dataset.
     """
 
     kernel_name: str = ""
@@ -105,6 +110,7 @@ class KernelMetadata:
     input_shapes: str = ""
     dtypes: str = ""
     hardware: str = ""
+    hardware_info: HardwareInfoRecord | None = None
     settings: dict[str, object] | None = None
 
     @functools.cached_property
@@ -130,5 +136,6 @@ class KernelMetadata:
             "input_shapes": self.input_shapes,
             "dtypes": self.dtypes,
             "hardware": self.hardware,
+            "hardware_info": self.hardware_info,
             "settings": self.settings,
         }

@@ -860,6 +860,18 @@ class TestAutotuneIgnoreErrors(TestCase):
             self.assertTrue(ir["nodes"])
             self.assertIn("links", ir)
             self.assertTrue(ir["directed"])
+            # Structured hardware/runtime snapshot is recorded per run.
+            hw = rec["hardware_info"]
+            self.assertIsNotNone(hw)
+            self.assertTrue(hw["device_name"])
+            self.assertTrue(hw["device_id"])
+            self.assertIn(hw["device_kind"], ("cuda", "rocm", "xpu"))
+            self.assertIsNotNone(hw["sm_count"])
+            # warp_size is cuda/rocm-only; XPU has no single-value analog (null).
+            if hw["device_kind"] in ("cuda", "rocm"):
+                self.assertIsNotNone(hw["warp_size"])
+            self.assertIsInstance(hw["versions"], dict)
+            self.assertIn("torch", hw["versions"])
         # ir_graph is config-independent: identical across lines sharing a run_id.
         by_run: dict[str, str] = {}
         for line in lines:
