@@ -188,6 +188,7 @@ def _try_hoist_one_vloop(
     vloop: ast.For,
     v: int,
     acc_name_counter: list[int],
+    running_sums: set[str],
 ) -> list[ast.stmt] | None:
     """Try to hoist warp reductions out of a single constexpr V-loop.
 
@@ -375,32 +376,66 @@ def _try_hoist_one_vloop(
 
         identity = _REDUCE_IDENTITY[op]
         combine_template = _REDUCE_COMBINE[op]
-        acc_name = f"_helion_vfold_acc_{acc_name_counter[0]}"
-        acc_name_counter[0] += 1
-        acc_dtype = _infer_input_dtype(input_def_rhs)
-        if acc_dtype is None:
-            return None
-        acc_init_expr = f"{acc_dtype}({identity})"
-        new_stmts.append(statement_from_string(f"{acc_name} = {acc_init_expr}"))
+        # Decide how to hoist the reduce.  Three cases:
+        #
+        #  (b) The input is a matmul-fallback PER-THREAD RUNNING SUM, flagged
+        #      authoritatively by the producer (``_emit_cute_matmul`` records
+        #      the ``dot_acc`` var on the DeviceFunction).  Such a value
+        #      already accumulates across V-lanes inside its own
+        #      ``acc = acc + product`` def, so a per-thread partial + ONE
+        #      cross-thread sum reduce is exactly the full sum: keep the def in
+        #      the loop and reduce its FINAL value once.  V-folding it again
+        #      would double-count.
+        #
+        #  (c) The input is loop-carried (its in-loop def reads itself) but NOT
+        #      a flagged running sum — a rescaled / non-sum recurrence such as
+        #      ``di = di * alpha + ...`` or ``mi = maximum(mi, ...)``.  Neither
+        #      the V-fold (would fold the carried value) nor reduce-once (sum
+        #      identity doesn't hold) is valid, so leave the V-loop untouched.
+        #
+        #  (a) Otherwise the input is a fresh per-lane value (softmax /
+        #      layernorm ``amax``/``sum``): build a ``_helion_vfold_acc`` and
+        #      fold each lane in, then ONE warp reduce.  [the original path]
+        input_def = body_copy[input_def_idx]
+        input_is_running_sum = input_name in running_sums
+        if not input_is_running_sum and input_name in _names_read(input_def):
+            return None  # case (c): loop-carried but not a known running sum
+        input_is_loop_carried = input_is_running_sum
 
-        # V-loop body: all V-dep stmts in this reduce's closure, in original
-        # order.  When we hit input_def_idx, also emit acc combine after it.
-        # Rewrite the acc combine's input expression's cast wrapper to use
-        # the acc dtype (avoids a double cast on fp16/bf16 inputs being
-        # promoted to fp32 acc).  Keep the original input def stmt — it may
-        # be read by later V-loop stmts (the dependency closure can include
-        # paths through it), and the CuTe DSL will DCE it if unused.
         vloop_body: list[ast.stmt] = []
         v_members = sorted(v_loop_members[reduce_pos])
-        for j in v_members:
-            vloop_body.append(body_copy[j])
-            if j == input_def_idx:
-                input_rhs = _assignment_rhs(body_copy[j])
-                assert input_rhs is not None
-                promoted_rhs = _rewrite_cast_wrapper(input_rhs, acc_dtype)
-                rhs_text = ast.unparse(promoted_rhs)
-                combine_expr = combine_template.format(a=acc_name, b=rhs_text)
-                vloop_body.append(statement_from_string(f"{acc_name} = {combine_expr}"))
+        if input_is_loop_carried:
+            acc_name = input_name
+            for j in v_members:
+                vloop_body.append(body_copy[j])
+        else:
+            acc_name = f"_helion_vfold_acc_{acc_name_counter[0]}"
+            acc_name_counter[0] += 1
+            acc_dtype = _infer_input_dtype(input_def_rhs)
+            if acc_dtype is None:
+                return None
+            acc_init_expr = f"{acc_dtype}({identity})"
+            new_stmts.append(statement_from_string(f"{acc_name} = {acc_init_expr}"))
+
+            # V-loop body: all V-dep stmts in this reduce's closure, in
+            # original order.  When we hit input_def_idx, also emit acc
+            # combine after it.  Rewrite the acc combine's input expression's
+            # cast wrapper to use the acc dtype (avoids a double cast on
+            # fp16/bf16 inputs being promoted to fp32 acc).  Keep the
+            # original input def stmt — it may be read by later V-loop stmts
+            # (the dependency closure can include paths through it), and the
+            # CuTe DSL will DCE it if unused.
+            for j in v_members:
+                vloop_body.append(body_copy[j])
+                if j == input_def_idx:
+                    input_rhs = _assignment_rhs(body_copy[j])
+                    assert input_rhs is not None
+                    promoted_rhs = _rewrite_cast_wrapper(input_rhs, acc_dtype)
+                    rhs_text = ast.unparse(promoted_rhs)
+                    combine_expr = combine_template.format(a=acc_name, b=rhs_text)
+                    vloop_body.append(
+                        statement_from_string(f"{acc_name} = {combine_expr}")
+                    )
 
         target_text = ast.unparse(vloop.target)
         iter_text = ast.unparse(vloop.iter)
@@ -515,40 +550,53 @@ def _replace_reduce_input(
     return new_stmt
 
 
-def _hoist_in_body(body: list[ast.stmt], acc_counter: list[int]) -> list[ast.stmt]:
+def _hoist_in_body(
+    body: list[ast.stmt], acc_counter: list[int], running_sums: set[str]
+) -> list[ast.stmt]:
     """Walk ``body`` recursively; for each constexpr V-loop containing warp
     reductions, replace it with the V-fold + hoisted-reduce form.
     """
     new_body: list[ast.stmt] = []
     for stmt in body:
         if isinstance(stmt, ast.For):
-            stmt.body = _hoist_in_body(stmt.body, acc_counter)
-            stmt.orelse = _hoist_in_body(stmt.orelse, acc_counter)
+            stmt.body = _hoist_in_body(stmt.body, acc_counter, running_sums)
+            stmt.orelse = _hoist_in_body(stmt.orelse, acc_counter, running_sums)
             match = _is_constexpr_v_loop(stmt)
             if match is not None:
                 vloop, v = match
-                replacement = _try_hoist_one_vloop(vloop, v, acc_counter)
+                replacement = _try_hoist_one_vloop(vloop, v, acc_counter, running_sums)
                 if replacement is not None:
                     new_body.extend(replacement)
                     continue
             new_body.append(stmt)
         elif isinstance(stmt, ast.If):
-            stmt.body = _hoist_in_body(stmt.body, acc_counter)
-            stmt.orelse = _hoist_in_body(stmt.orelse, acc_counter)
+            stmt.body = _hoist_in_body(stmt.body, acc_counter, running_sums)
+            stmt.orelse = _hoist_in_body(stmt.orelse, acc_counter, running_sums)
             new_body.append(stmt)
         elif isinstance(stmt, (ast.With, ast.FunctionDef)):
-            stmt.body = _hoist_in_body(stmt.body, acc_counter)
+            stmt.body = _hoist_in_body(stmt.body, acc_counter, running_sums)
             new_body.append(stmt)
         else:
             new_body.append(stmt)
     return new_body
 
 
-def hoist_warp_reduce_from_vloop(body: list[ast.stmt]) -> list[ast.stmt]:
+def hoist_warp_reduce_from_vloop(
+    body: list[ast.stmt],
+    *,
+    running_sum_accumulators: set[str] | None = None,
+) -> list[ast.stmt]:
     """Apply the hoist pass to a list of kernel-body statements.
 
     Returns the (possibly modified) body.  Safe to call on any kernel body
     — only rewrites the well-defined "warp reduction inside constexpr V-loop"
     pattern.
+
+    ``running_sum_accumulators`` is the set of matmul-fallback per-thread
+    running-sum variable names (recorded by ``_emit_cute_matmul`` on the
+    ``DeviceFunction``).  A reduce whose input is one of these is reduced ONCE
+    after the loop rather than V-folded — the producer tells us authoritatively
+    that the value already accumulates across V-lanes, so we don't re-derive it
+    by pattern-matching the AST.
     """
-    return _hoist_in_body(body, [0])
+    return _hoist_in_body(body, [0], running_sum_accumulators or set())

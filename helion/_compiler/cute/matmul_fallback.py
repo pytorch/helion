@@ -785,6 +785,12 @@ def _emit_cute_matmul(
                 reduction_base_acc = expr_from_string(dot_acc_base)
             cg.add_statement(f"{dot_acc} = {dot_acc} + {product_name}")
             reduction_input = dot_acc
+            # Tell ``hoist_warp_reduce`` this is a per-thread running sum: it
+            # already combines across V-lanes, so its FINAL value is reduced
+            # once after the loop rather than re-folded per lane.
+            running_sums = getattr(cg.device_function, "cute_matmul_running_sums", None)
+            if isinstance(running_sums, set):
+                running_sums.add(dot_acc)
         else:
             reduction_input = cg.lift(product, dce=True, prefix="dot_product").id
         reduction_value_dtype = (

@@ -2682,7 +2682,6 @@ class TestExamples(RefEagerTestBase, TestCase):
             reduction_loops=[32768],
         )
 
-    @skipIfPallas("flex_attention requires torch.compile and closures")
     @skipIfRefEager("scalar_prefetch indexing not supported in ref interpreter")
     def test_flex_attention(self):
         z, h, n_ctx, head_dim = 2, 4, 256, 64
@@ -2742,7 +2741,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             rtol=0.1,
         )
 
-    @xfailIfPallas("BlockSpec tiling failure")
+    @xfailIfPallasTpu("BlockSpec tiling failure")
     def test_mamba2_chunk_scan(self):
         batch, nheads, ngroups, seqlen, chunk_size, headdim, dstate = (
             2,

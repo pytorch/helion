@@ -4,6 +4,7 @@ import abc
 import ast
 import base64
 import contextlib
+import enum
 import functools
 import hashlib
 from itertools import starmap
@@ -1455,6 +1456,40 @@ _TORCH_TO_JAX_DTYPE: dict[str, str] = {
 _PALLAS_UNSUPPORTED_DTYPES = frozenset({torch.int64, torch.uint64, torch.float64})
 
 
+class SliceAddressing(enum.Enum):
+    """How a dynamic-offset slice on a tensor dim must be emitted on TPU."""
+
+    DIRECT = enum.auto()  # offset used as-is -> plain pl.ds
+    ALIGNED = enum.auto()  # offset rounded to a sublane tile -> aligned-enclosing
+
+
+def _slice_addressing(
+    tensor: torch.Tensor, dim: int, lane_block: int | None = None
+) -> SliceAddressing:
+    """Whether a dynamic slice on ``dim`` can take any offset.
+
+    TPU only tiles the last two dims into (8, 128) blocks, so a slice on an
+    earlier row-major dim reads any offset (DIRECT).  A sublane-dim slice must
+    align to a tile boundary (ALIGNED), except f32 over a single lane tile
+    (``lane_block`` <= 128) stays contiguous and reads any offset too (DIRECT).
+    ``lane_block`` is the last-dim extent (block size, or full width if untiled);
+    None stays conservative (ALIGNED).
+    """
+    if dim < tensor.ndim - 2:
+        return SliceAddressing.DIRECT  # major dim: row-major, any offset
+    if dim == tensor.ndim - 2:  # 2nd-minor (sublane) dim
+        # f32 fills a lane, so a single lane tile is contiguous and reads any
+        # offset; bf16 packs two rows per sublane and always needs alignment.
+        if (
+            tensor.dtype == torch.float32
+            and isinstance(lane_block, int)
+            and lane_block <= 128
+        ):
+            return SliceAddressing.DIRECT
+        return SliceAddressing.ALIGNED
+    return SliceAddressing.ALIGNED  # TODO(tcombes): align lane dim to 128, not sublane
+
+
 class PallasBackend(Backend):
     """Pallas (JAX) code generation backend for TPU."""
 
@@ -1780,6 +1815,18 @@ class PallasBackend(Backend):
         if dim_from_end == 1:  # Second to last dimension
             return 8
         return 1  # No requirements for other dimensions
+
+    def sublane_tiling(self, dtype: torch.dtype) -> int:
+        """Native sublane (2nd-minor) tile for ``dtype``: f32->8, bf16->16, i8->32.
+
+        The jagged carry slices its emit_pipeline VMEM refs at this
+        granularity, and such a ref must be accessed as a *whole* native tile:
+        a smaller slice (e.g. 8 rows of a bf16 ref, whose tile is 16) is
+        rejected by Mosaic ("E2003: unproven memory access alignment"),
+        independent of offset.
+        """
+        bitwidth = min(dtype.itemsize * 8, 32)
+        return 8 * (32 // bitwidth)
 
     fake_tensor_loads: list[tuple[torch.Tensor, list[object]]]
 
@@ -2176,7 +2223,10 @@ class PallasBackend(Backend):
             if isinstance(arg, (SymbolArgument, TensorSizeArg, TensorStrideArg)):
                 result.append(None)  # scalars wrapped as 1-D tensors
                 continue
-            if not isinstance(arg, TensorArg) or arg.fake_value.ndim == 0:
+            if not isinstance(arg, TensorArg):
+                continue
+            if arg.fake_value.ndim == 0:
+                result.append(None)
                 continue
             tensor = arg.fake_value
             dim_tilings = device_fn.pallas_tensor_dim_tilings.get(id(tensor))
@@ -3576,6 +3626,7 @@ class CuteBackend(Backend):
             "_cute_issue_clc_query_nomulticast": "from helion._compiler.cute.clc_helpers import issue_clc_query_nomulticast as _cute_issue_clc_query_nomulticast",
             "_cute_inline_asm_elementwise": "from helion._compiler.cute.inline_asm_helpers import inline_asm_elementwise as _cute_inline_asm_elementwise",
             "_cute_fp8e4m3fn_to_float32": "from helion._compiler.cute.quantized_helpers import fp8e4m3fn_to_float32 as _cute_fp8e4m3fn_to_float32",
+            "_cute_fp8e4m3fn_x2_to_float32": "from helion._compiler.cute.quantized_helpers import fp8e4m3fn_x2_to_float32 as _cute_fp8e4m3fn_x2_to_float32",
             "_cute_float4_e2m1fn_x2_to_float32": "from helion._compiler.cute.quantized_helpers import float4_e2m1fn_x2_to_float32 as _cute_float4_e2m1fn_x2_to_float32",
             "_cute_grid_barrier": "from helion._compiler.cute.grid_barrier import grid_barrier as _cute_grid_barrier",
             "_cute_atomic_max_float32": "from helion._compiler.cute.atomic_helpers import atomic_max_float32 as _cute_atomic_max_float32",

@@ -75,6 +75,9 @@ def _load_mask_expr(
     cause a shape mismatch against the smaller ref.
     """
     from helion._compiler.compile_environment import CompileEnvironment
+    from helion._compiler.pallas.plan_tiling import ArbitraryIndexPattern
+    from helion._compiler.pallas.plan_tiling import TileBeginWithOffsetPattern
+    from helion._compiler.pallas.plan_tiling import TileIndexWithOffsetPattern
     from helion._compiler.pallas.plan_tiling import TilePattern
 
     assert state.fx_node is not None
@@ -89,6 +92,12 @@ def _load_mask_expr(
     dtype_str: str | None = None
     out_dim = 0
     tensor_dim = 0
+
+    squeezing_patterns = (
+        ArbitraryIndexPattern,
+        TileIndexWithOffsetPattern,
+        TileBeginWithOffsetPattern,
+    )
 
     for idx, pattern in zip(subscript, indexing_patterns, strict=True):
         if idx is None:
@@ -114,7 +123,8 @@ def _load_mask_expr(
 
         # TODO(dunfanlu): Do other patterns beside TilePattern require masking?
 
-        out_dim += 1
+        if not isinstance(pattern, squeezing_patterns):
+            out_dim += 1
         tensor_dim += 1
 
     if not mask_exprs:

@@ -2053,6 +2053,11 @@ def _append_cute_wrapper_plan(
         assert value is None or isinstance(value, int)
         return value
 
+    def plan_optional_str(key: str) -> str | None:
+        value = plan.get(key)
+        assert value is None or isinstance(value, str)
+        return value
+
     def require_positive_int(value: int | None, name: str) -> int:
         assert type(value) is int, name
         assert value > 0, name
@@ -2070,12 +2075,21 @@ def _append_cute_wrapper_plan(
         epi_tile_m: int | None = None,
         epi_tile_n: int | None = None,
         d_store_box_n: int | None = None,
+        epi_tile_raw_expr: str | None = None,
     ) -> None:
         assert len(kernel_args) == 2
         explicit_epi_tile = any(
             value is not None for value in (epi_tile_m, epi_tile_n, d_store_box_n)
         )
-        if explicit_epi_tile:
+        if epi_tile_raw_expr is not None:
+            # The bm=128 CtaGroup.TWO family threads the device-exact (N-mode
+            # permuted) epilogue-tile expression verbatim so the host TMA-store
+            # atom is built from the same layout the device r2s copy writes
+            # through. The plain ``epi_tile_m/n`` integer keys cannot express
+            # the permutation. See ``tcgen05_two_cta_m128_epilogue_tile_expr``.
+            assert not explicit_epi_tile
+            epi_tile_expr = epi_tile_raw_expr
+        elif explicit_epi_tile:
             checked_epi_tile_m = require_positive_int(epi_tile_m, "epi_tile_m")
             checked_epi_tile_n = require_positive_int(epi_tile_n, "epi_tile_n")
             checked_d_store_box_n = require_positive_int(d_store_box_n, "d_store_box_n")
@@ -2140,6 +2154,7 @@ def _append_cute_wrapper_plan(
             epi_tile_m=plan_optional_int("epi_tile_m"),
             epi_tile_n=plan_optional_int("epi_tile_n"),
             d_store_box_n=plan_optional_int("d_store_box_n"),
+            epi_tile_raw_expr=plan_optional_str("epi_tile_raw_expr"),
         )
         return
     if kind == "tcgen05_aux_tma":
@@ -2201,9 +2216,20 @@ def _append_cute_wrapper_plan(
     # cluster_m=2 cluster_n=1 but rejects the canonical Quack-best
     # cluster_m=2 cluster_n=2 4-CTA cluster (product=4). Use
     # ``cluster_m == 2`` directly so cluster_n=2 keeps CtaGroup.TWO.
+    #
+    # The bm=128 CtaGroup.TWO family (fp8 small-grid) cannot be derived from
+    # ``bm == 256`` here, so the device codegen records the resolved decision
+    # on the plan as ``use_2cta_instrs``. Honor it when present; fall back to
+    # the legacy bm==256 derivation for golden-stable older plans.
+    plan_use_2cta = plan.get("use_2cta_instrs")
+    if plan_use_2cta is not None:
+        assert isinstance(plan_use_2cta, bool)
+        use_2cta_instrs = plan_use_2cta
+    else:
+        use_2cta_instrs = cluster_m == 2 and bm == 256
     cta_group = (
         "cute.nvgpu.tcgen05.CtaGroup.TWO"
-        if cluster_m == 2 and bm == 256
+        if use_2cta_instrs
         else "cute.nvgpu.tcgen05.CtaGroup.ONE"
     )
     cluster_shape = f"({cluster_m}, {cluster_n}, 1)"

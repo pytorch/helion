@@ -1319,6 +1319,150 @@ class TestCuteBackend(TestCase):
         self.assertIn("(2, 1, 1)", code)  # cluster_m=2
         self.assertIn("StaticPersistentTileScheduler", code)
 
+    def test_matmul_mma_tcgen05_fp8_two_cta_m128_codegen_and_correctness(
+        self,
+    ) -> None:
+        """bm=128 + cluster_m=2 on fp8 selects the 2-CTA MMA (CTA tile 64xbn).
+
+        The epilogue must use the per-CTA tile convention throughout:
+        ``compute_epilogue_tile_shape((64, bn), True, ...)`` (whose tile is
+        N-mode permuted), a kernel_desc with ``cta_tile_shape_mnk`` of
+        ``(64, bn, bk)``, and a host TMA store atom built from the same
+        expression via the ``epi_tile_raw_expr`` wrapper-plan key. A plain
+        ``(m, n)`` tile on any side silently permutes the output.
+        """
+        support = get_cute_mma_support()
+        if not support.tcgen05_f8:
+            self.skipTest("tcgen05 FP8 MMA is not supported on this machine")
+
+        torch.manual_seed(0)
+        x = (torch.randn(256, 512, device=DEVICE) * 0.4).to(torch.float8_e4m3fn)
+        y = (torch.randn(512, 384, device=DEVICE) * 0.4).to(torch.float8_e4m3fn)
+        code, out = code_and_output(
+            cute_matmul_mma_fp8,
+            (x, y),
+            block_sizes=[128, 128, 128],
+            tcgen05_cluster_m=2,
+            pid_type="persistent_blocked",
+        )
+        ref = x.float() @ y.float()
+        torch.testing.assert_close(out.float(), ref, atol=1.0, rtol=1e-1)
+        self.assertFalse(out.float().isnan().any().item())
+        # 2-CTA MMA at the (128, bn) MMA tiler.
+        self.assertIn("cute.nvgpu.tcgen05.CtaGroup.TWO", code)
+        self.assertNotIn("cute.nvgpu.tcgen05.CtaGroup.ONE", code)
+        # Per-CTA epilogue tile convention: (64, bn) + use_2cta=True, and the
+        # kernel_desc carries the per-CTA tile.
+        self.assertIn(
+            "compute_epilogue_tile_shape((64, 128), True",
+            code,
+        )
+        self.assertIn("'cta_tile_shape_mnk': (64, 128, 128)", code)
+        self.assertIn("get_tmem_load_op((64, 128, 128)", code)
+        # Host TMA store atom is built from the device-exact tile expression.
+        self.assertIn("'epi_tile_raw_expr'", code)
+        # The resolved CtaGroup decision is recorded for the host wrapper.
+        self.assertIn("'use_2cta_instrs': True", code)
+
+    def test_matmul_mma_tcgen05_fp8_two_cta_m128_rowvec_scale(self) -> None:
+        """Fused rowvec-scale epilogue on the bm=128 2-CTA family.
+
+        The rowvec aux fragment is partitioned through the same N-mode
+        permuted epilogue tile as the accumulator; a convention mismatch
+        shows up as scrambled (not just scaled-wrong) output.
+        """
+        support = get_cute_mma_support()
+        if not support.tcgen05_f8:
+            self.skipTest("tcgen05 FP8 MMA is not supported on this machine")
+
+        torch.manual_seed(0)
+        x = (torch.randn(256, 512, device=DEVICE) * 0.4).to(torch.float8_e4m3fn)
+        y = (torch.randn(512, 256, device=DEVICE) * 0.4).to(torch.float8_e4m3fn)
+        scale_n = torch.rand(256, device=DEVICE) + 0.5
+        code, out = code_and_output(
+            cute_matmul_mma_fp8_rowvec_scale,
+            (x, y, scale_n),
+            block_sizes=[128, 128, 128],
+            tcgen05_cluster_m=2,
+            pid_type="persistent_blocked",
+        )
+        ref = (x.float() @ y.float()) * scale_n.float()
+        torch.testing.assert_close(out.float(), ref, atol=1.0, rtol=1e-1)
+        self.assertFalse(out.float().isnan().any().item())
+        self.assertIn("cute.nvgpu.tcgen05.CtaGroup.TWO", code)
+        self.assertIn("compute_epilogue_tile_shape((64, 128), True", code)
+
+    def test_matmul_mma_tcgen05_fp8_two_cta_m128_rowvec_prewait_hoist(self) -> None:
+        """The bm=128 2-CTA family pre-hoists rowvec aux above the acc wait.
+
+        One whole-fragment ``autovec_copy`` into registers is emitted in the
+        per-tile setup (before the accumulator ``consumer_wait``) so the
+        rowvec GMEM latency hides under the MMA wait; the per-subtile loop
+        slices the register tensor instead of issuing per-subtile LDGs.
+        bm=256 must keep the per-subtile GMEM load (the whole-tile hoist
+        historically caused register spills there).
+        """
+        support = get_cute_mma_support()
+        if not support.tcgen05_f8:
+            self.skipTest("tcgen05 FP8 MMA is not supported on this machine")
+
+        torch.manual_seed(0)
+        x = (torch.randn(256, 512, device=DEVICE) * 0.4).to(torch.float8_e4m3fn)
+        y = (torch.randn(512, 256, device=DEVICE) * 0.4).to(torch.float8_e4m3fn)
+        scale_n = torch.rand(256, device=DEVICE) + 0.5
+        code, out = code_and_output(
+            cute_matmul_mma_fp8_rowvec_scale,
+            (x, y, scale_n),
+            block_sizes=[128, 128, 128],
+            tcgen05_cluster_m=2,
+            pid_type="persistent_blocked",
+        )
+        ref = (x.float() @ y.float()) * scale_n.float()
+        torch.testing.assert_close(out.float(), ref, atol=1.0, rtol=1e-1)
+        # Whole-fragment register hoist present...
+        self.assertIn("tcgen05_aux_rmem_full_", code)
+        hoist_pos = code.index("cute.autovec_copy(tcgen05_tTR_gAux_grouped_")
+        # ...and emitted before the accumulator consumer_wait.
+        acc_wait_pos = code.index(".consumer_wait(tcgen05_acc_consumer_state)")
+        self.assertLess(hoist_pos, acc_wait_pos)
+        # The subtile loop reads the register tensor, not per-subtile GMEM.
+        self.assertNotIn("tcgen05_tTR_gAux_subtile_", code)
+
+        # bm=256 keeps the per-subtile GMEM load (no whole-fragment hoist).
+        code256 = cute_matmul_mma_fp8_rowvec_scale.bind((x, y, scale_n)).to_triton_code(
+            helion.Config(
+                block_sizes=[256, 128, 128],
+                tcgen05_cluster_m=2,
+                pid_type="persistent_blocked",
+            )
+        )
+        self.assertNotIn("tcgen05_aux_rmem_full_", code256)
+
+    def test_matmul_mma_tcgen05_f16_m128_cluster_m2_keeps_cta_group_one(
+        self,
+    ) -> None:
+        """f16/bf16 bm=128 + cluster_m=2 stays on the legacy CTA-local family.
+
+        That config point is owned by the guarded CtaGroup.ONE diagnostic
+        bridge and the multi-tile runtime guard; the fp8-only gate on the
+        bm=128 2-CTA family must not change f16 codegen.
+        """
+        support = get_cute_mma_support()
+        if not support.tcgen05_f16bf16:
+            self.skipTest("tcgen05 F16/BF16 MMA is not supported on this machine")
+
+        torch.manual_seed(0)
+        x = torch.randn(256, 64, device=DEVICE, dtype=torch.float16)
+        y = torch.randn(64, 256, device=DEVICE, dtype=torch.float16)
+        code = cute_matmul_mma.bind((x, y)).to_triton_code(
+            helion.Config(
+                block_sizes=[128, 128, 16],
+                tcgen05_cluster_m=2,
+                pid_type="persistent_blocked",
+            )
+        )
+        self.assertNotIn("cute.nvgpu.tcgen05.CtaGroup.TWO", code)
+
     def test_matmul_mma_tcgen05_fp8_deep_ab_staging_6(self) -> None:
         """Test FP8 with ab_stages=6 (mid-depth staging)."""
         support = get_cute_mma_support()
