@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import Counter
 from typing import TYPE_CHECKING
 from typing import Iterable
 from typing import Sequence
@@ -15,6 +16,37 @@ HardwareTarget = tuple[str, str | None]
 # Reduction op name tokens used to detect a reduction in a traced graph. Shared
 # by the Triton split/join heuristic and the LLM workload-trait detection.
 REDUCTION_TARGET_NAMES = frozenset({"amax", "sum", "softmax", "logsumexp"})
+
+# Floor the attention query/M tile to >= 64 rows: tensor cores underutilize the
+# MMA M-dimension below 64 (a hardware fact, not a shape preference), so a 32-row
+# query tile in flash-attention runs ~5x slower than 64-512 at an otherwise
+# identical config. This is the search-space floor applied by
+# ``raise_attention_block_minimums``.
+ATTENTION_MIN_QUERY_BLOCK = 64
+
+
+def attention_query_block_id(env: CompileEnvironment) -> int | None:
+    """Block id of the flash-attention query/M tile (Q@Kᵀ → softmax → P@V), else None.
+
+    Structural — keyed on the matmul dataflow, not shape/dtype/name: the query tile
+    is the M of two matmuls chained through a kv tile over an *untiled* head dim
+    (the untiled-head-dim clause excludes an ordinary X@W1 → H@W2 MLP chain).
+    """
+    facts = env.config_spec.matmul_facts
+    if len(facts) < 2:
+        return None
+    # A query tile is any block id used as the M of >= 2 matmuls.
+    m_block_counts = Counter(f.m_block_id for f in facts if f.m_block_id is not None)
+    for m_block_id, count in m_block_counts.items():
+        if count < 2:
+            continue
+        chain = [f for f in facts if f.m_block_id == m_block_id]
+        # scores GEMM has N=kv (untiled K); value GEMM has K=kv (untiled N).
+        scores_kv = {f.n_block_id for f in chain if f.k_block_id is None}
+        value_kv = {f.k_block_id for f in chain if f.n_block_id is None}
+        if scores_kv & value_kv - {None}:
+            return m_block_id
+    return None
 
 
 def op_name_parts(target: object) -> frozenset[str]:
