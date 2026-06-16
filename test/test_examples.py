@@ -1930,49 +1930,68 @@ class TestExamples(RefEagerTestBase, TestCase):
 
     @skipIfRefEager("hl.jagged_tile does not support ref mode yet")
     def test_jagged_amax(self):
-        """Per-row max — sum-like reduction with ``-inf`` init + ``maximum``.
+        # Mirrors ``test_jagged_sum`` data setup; swaps ``sum`` for ``amax``.
 
-        Same jagged-flat pattern as ``jagged_sum`` but with a non-sum
-        accumulator, so the pattern-matcher's reduction-op recognition is
-        exercised on a non-additive op (covers @AmesingFlank's PR #2616
-        comment that the canonical-form recognition shouldn't be sum-only).
-        Kernel is inlined here rather than living in ``examples/`` because
-        it is a coverage variant, not a standalone user-facing example.
-        """
-
-        @helion.kernel(static_shapes=True)
+        @helion.kernel()
         def jagged_amax_kernel(
-            x_data: torch.Tensor, x_offsets: torch.Tensor
+            x_data: torch.Tensor,
+            x_offsets: torch.Tensor,
         ) -> torch.Tensor:
             M = x_data.shape[1]
             num_rows = x_offsets.size(0) - 1
+
             out = torch.full(
                 [num_rows, M],
                 float("-inf"),
                 dtype=x_data.dtype,
                 device=x_data.device,
             )
+
             x_flat = x_data.view(-1)
+
             for tile_b in hl.tile(num_rows):
                 starts = x_offsets[tile_b]
                 ends = x_offsets[tile_b.index + 1]
-                nnz_here = ends - starts
+                nnz = ends - starts
+
                 for tile_m in hl.tile(M):
                     row_max = hl.full(
                         [tile_b, tile_m], float("-inf"), dtype=x_data.dtype
                     )
-                    for tile_k in hl.jagged_tile(nnz_here):
-                        base = starts[:, None] + tile_k.index[None, :]
-                        flat = base[:, :, None] * M + tile_m.index[None, None, :]
-                        row_max = torch.maximum(
-                            row_max, hl.load(x_flat, [flat]).amax(dim=1)
+
+                    for tile_k in hl.jagged_tile(nnz):
+                        base_indices = starts[:, None] + tile_k.index[None, :]
+                        flat_indices = (
+                            base_indices[:, :, None] * M + tile_m.index[None, None, :]
                         )
+                        x_slice = hl.load(x_flat, [flat_indices])
+                        row_max = torch.maximum(row_max, x_slice.amax(dim=1))
+
                     out[tile_b, tile_m] = row_max
+
             return out
 
-        torch.manual_seed(0)
+        def reference_jagged_amax_kernel_pytorch(
+            x_data: torch.Tensor,
+            x_offsets: torch.Tensor,
+        ) -> torch.Tensor:
+            num_rows = x_offsets.numel() - 1
+            M = x_data.size(1)
+            out = torch.full(
+                (num_rows, M),
+                float("-inf"),
+                dtype=x_data.dtype,
+                device=x_data.device,
+            )
+            for i in range(num_rows):
+                start = int(x_offsets[i])
+                end = int(x_offsets[i + 1])
+                if end > start:
+                    out[i, :] = x_data[start:end, :].amax(dim=0)
+            return out
+
         num_rows, max_cols = 128, 64
-        M = 8
+        M = 8  # number of features
         lengths = torch.randint(1, max_cols + 1, (num_rows,), device=DEVICE)
         x_offsets = torch.cat(
             [
@@ -1983,60 +2002,75 @@ class TestExamples(RefEagerTestBase, TestCase):
         nnz = int(x_offsets[-1])
         x_data = torch.randn(nnz, M, dtype=torch.float32, device=DEVICE)
 
-        expected = torch.full(
-            (num_rows, M), float("-inf"), dtype=x_data.dtype, device=DEVICE
-        )
-        for i in range(num_rows):
-            s = int(x_offsets[i])
-            e = int(x_offsets[i + 1])
-            if e > s:
-                expected[i, :] = x_data[s:e, :].amax(dim=0)
-
+        expected = reference_jagged_amax_kernel_pytorch(x_data, x_offsets)
         torch.testing.assert_close(
             jagged_amax_kernel(x_data, x_offsets), expected, atol=1e-4, rtol=1e-4
         )
 
     @skipIfRefEager("hl.jagged_tile does not support ref mode yet")
     def test_jagged_amin(self):
-        """Per-row min — sum-like reduction with ``+inf`` init + ``minimum``.
+        # Mirrors ``test_jagged_sum`` data setup; swaps ``sum`` for ``amin``.
 
-        Coverage variant of ``test_jagged_amax``; same rationale for inlining
-        the kernel instead of adding an ``examples/`` file.
-        """
-
-        @helion.kernel(static_shapes=True)
+        @helion.kernel()
         def jagged_amin_kernel(
-            x_data: torch.Tensor, x_offsets: torch.Tensor
+            x_data: torch.Tensor,
+            x_offsets: torch.Tensor,
         ) -> torch.Tensor:
             M = x_data.shape[1]
             num_rows = x_offsets.size(0) - 1
+
             out = torch.full(
                 [num_rows, M],
                 float("inf"),
                 dtype=x_data.dtype,
                 device=x_data.device,
             )
+
             x_flat = x_data.view(-1)
+
             for tile_b in hl.tile(num_rows):
                 starts = x_offsets[tile_b]
                 ends = x_offsets[tile_b.index + 1]
-                nnz_here = ends - starts
+                nnz = ends - starts
+
                 for tile_m in hl.tile(M):
                     row_min = hl.full(
                         [tile_b, tile_m], float("inf"), dtype=x_data.dtype
                     )
-                    for tile_k in hl.jagged_tile(nnz_here):
-                        base = starts[:, None] + tile_k.index[None, :]
-                        flat = base[:, :, None] * M + tile_m.index[None, None, :]
-                        row_min = torch.minimum(
-                            row_min, hl.load(x_flat, [flat]).amin(dim=1)
+
+                    for tile_k in hl.jagged_tile(nnz):
+                        base_indices = starts[:, None] + tile_k.index[None, :]
+                        flat_indices = (
+                            base_indices[:, :, None] * M + tile_m.index[None, None, :]
                         )
+                        x_slice = hl.load(x_flat, [flat_indices])
+                        row_min = torch.minimum(row_min, x_slice.amin(dim=1))
+
                     out[tile_b, tile_m] = row_min
+
             return out
 
-        torch.manual_seed(0)
+        def reference_jagged_amin_kernel_pytorch(
+            x_data: torch.Tensor,
+            x_offsets: torch.Tensor,
+        ) -> torch.Tensor:
+            num_rows = x_offsets.numel() - 1
+            M = x_data.size(1)
+            out = torch.full(
+                (num_rows, M),
+                float("inf"),
+                dtype=x_data.dtype,
+                device=x_data.device,
+            )
+            for i in range(num_rows):
+                start = int(x_offsets[i])
+                end = int(x_offsets[i + 1])
+                if end > start:
+                    out[i, :] = x_data[start:end, :].amin(dim=0)
+            return out
+
         num_rows, max_cols = 128, 64
-        M = 8
+        M = 8  # number of features
         lengths = torch.randint(1, max_cols + 1, (num_rows,), device=DEVICE)
         x_offsets = torch.cat(
             [
@@ -2047,15 +2081,7 @@ class TestExamples(RefEagerTestBase, TestCase):
         nnz = int(x_offsets[-1])
         x_data = torch.randn(nnz, M, dtype=torch.float32, device=DEVICE)
 
-        expected = torch.full(
-            (num_rows, M), float("inf"), dtype=x_data.dtype, device=DEVICE
-        )
-        for i in range(num_rows):
-            s = int(x_offsets[i])
-            e = int(x_offsets[i + 1])
-            if e > s:
-                expected[i, :] = x_data[s:e, :].amin(dim=0)
-
+        expected = reference_jagged_amin_kernel_pytorch(x_data, x_offsets)
         torch.testing.assert_close(
             jagged_amin_kernel(x_data, x_offsets), expected, atol=1e-4, rtol=1e-4
         )
