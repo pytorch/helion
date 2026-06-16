@@ -36,7 +36,9 @@ def _cute_backend_requirement_error() -> str | None:
     init = TmemAllocator.__init__
     inner = getattr(init, "__wrapped__", init)
     try:
-        params = inspect.signature(inner).parameters
+        params = inspect.signature(
+            inner  # pyrefly: ignore [bad-argument-type]
+        ).parameters
     except (TypeError, ValueError):
         params = {}
     if "initialize_mbarrier" not in params:

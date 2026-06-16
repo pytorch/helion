@@ -1724,7 +1724,7 @@ class GraphAnalyzer:
                     and isinstance(phi.args[1].args[1], int)
                 ):
                     sub_idx = phi.args[1].args[1]
-            v = sub_node_map[sub_returns[sub_idx]]
+            v = sub_node_map[sub_returns[sub_idx]]  # pyrefly: ignore [bad-index]
             # scan_op rejects combine_fns that return a placeholder
             # unchanged; clone identity carries to dodge the alias check.
             if v is carry_phs_in_cg[i]:
@@ -1807,7 +1807,7 @@ class GraphAnalyzer:
             else:
                 args = map_arg(n.args, node_map.get)
                 kwargs = map_arg(n.kwargs, node_map.get)
-                new_node = new.call_function(n.target, args, kwargs)
+                new_node = new.call_function(n.target, args, kwargs)  # pyrefly: ignore [bad-argument-type]
                 if n.meta:
                     new_node.meta = n.meta.copy()
                 node_map[n] = new_node
@@ -2123,7 +2123,7 @@ def _convert_scan_op_bw_to_helion(
         # None entries in rets represent "no gradient" for non-differentiable
         # outputs (from AOT backward combine_fn).  Use a sentinel value ``None``
         # so callers can detect and skip updating the corresponding carry or ys.
-        out_vars = [sub_node_to_var[r] if r is not None else None for r in rets]
+        out_vars = [sub_node_to_var[r] if r is not None else None for r in rets]  # pyrefly: ignore [bad-index]
         return sub_lines, out_vars
 
     out_args = out_node.args[0]
@@ -2291,13 +2291,13 @@ def _convert_scan_op_bw_to_helion(
 
         if target is _scan_op:
             combine_attr_node, init_tuple, xs_tuple, add_tuple = n.args
-            assert combine_attr_node.op == "get_attr"
-            attr_name = combine_attr_node.target
+            assert combine_attr_node.op == "get_attr"  # pyrefly: ignore [missing-attribute]
+            attr_name = combine_attr_node.target  # pyrefly: ignore [missing-attribute]
             combine_gm = getattr(bw_module, attr_name)
 
             xs_origins: list[tuple] = []
-            for x in xs_tuple:
-                x_meta = x.meta.get("val")
+            for x in xs_tuple:  # pyrefly: ignore [not-iterable]
+                x_meta = x.meta.get("val")  # pyrefly: ignore [missing-attribute]
                 if not isinstance(x_meta, torch.Tensor):
                     raise exc.AutodiffNotSupported(
                         f"xs of {attr_name!r} has no fake-tensor meta"
@@ -2318,15 +2318,15 @@ def _convert_scan_op_bw_to_helion(
             block_size = 1
             scan_dim_size = scan_n_blocks
             tile_var = fresh("tile")
-            n_carry = len(init_tuple)
+            n_carry = len(init_tuple)  # pyrefly: ignore [bad-argument-type]
             # n_blocks=1 reduces the scan to a single iteration; inline the
             # body to side-step tile.id-as-index unbacked-SymInt limitations.
             inline = scan_n_blocks == 1
 
             carry_vars: list[str] = []
             carry_ranks: list[int] = []
-            for init_node in init_tuple:
-                init_fake = init_node.meta.get("val")
+            for init_node in init_tuple:  # pyrefly: ignore [not-iterable]
+                init_fake = init_node.meta.get("val")  # pyrefly: ignore [missing-attribute]
                 rank = init_fake.dim() if isinstance(init_fake, torch.Tensor) else 0
                 carry_ranks.append(rank)
                 if inline:
@@ -2338,7 +2338,7 @@ def _convert_scan_op_bw_to_helion(
                         # Device-derived init: may reference a host tensor
                         # inside the wrapper — load via subscript first.
                         init_var = render(init_node)
-                        init_meta = init_node.meta.get("val")
+                        init_meta = init_node.meta.get("val")  # pyrefly: ignore [missing-attribute]
                         if isinstance(init_meta, torch.Tensor) and init_meta.dim() > 0:
                             loaded = fresh("init_loaded")
                             idx = ", ".join([":"] * init_meta.dim())
@@ -2438,9 +2438,9 @@ def _convert_scan_op_bw_to_helion(
             cur_carry_vars: list[str] = []
             for i, (ci, rank) in enumerate(zip(carry_vars, carry_ranks, strict=True)):
                 cv = fresh("cur_carry")
-                if (inline and init_tuple[i] in device_nodes) or rank == 0:
+                if (inline and init_tuple[i] in device_nodes) or rank == 0:  # pyrefly: ignore [bad-index, unsupported-operation]
                     body.append(f"{inner}{cv} = {ci}")
-                elif init_tuple[i] in device_nodes:
+                elif init_tuple[i] in device_nodes:  # pyrefly: ignore [bad-index, unsupported-operation]
                     # Device-derived carry: alias (already a device tensor).
                     body.append(f"{inner}{cv} = {ci}")
                 else:
@@ -2449,8 +2449,8 @@ def _convert_scan_op_bw_to_helion(
                 cur_carry_vars.append(cv)
 
             add_load_vars: list[str] = []
-            for add_node in add_tuple:
-                a_fake = add_node.meta.get("val")
+            for add_node in add_tuple:  # pyrefly: ignore [not-iterable]
+                a_fake = add_node.meta.get("val")  # pyrefly: ignore [missing-attribute]
                 a_rank = a_fake.dim() if isinstance(a_fake, torch.Tensor) else 0
                 if a_rank == 0:
                     add_load_vars.append(render(add_node))
@@ -2479,7 +2479,7 @@ def _convert_scan_op_bw_to_helion(
                     carry_vars,
                     new_carry_vars,
                     carry_ranks,
-                    init_tuple,
+                    init_tuple,  # pyrefly: ignore [bad-argument-type]
                     strict=True,
                 ):
                     if nv is None:
@@ -2578,7 +2578,7 @@ def _convert_scan_op_bw_to_helion(
                 and isinstance(dims, list)
                 and all(isinstance(d, int) and int(t_meta.shape[d]) == 1 for d in dims)
             ):
-                node_to_var[n] = node_to_var[t_arg]
+                node_to_var[n] = node_to_var[t_arg]  # pyrefly: ignore [bad-index]
                 continue
 
         v = fresh(getattr(target, "__name__", "v"))
