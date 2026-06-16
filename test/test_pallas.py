@@ -564,6 +564,30 @@ def kernel_tile_begin_plus_offset_is_elementwise(
 @onlyBackends(["triton", "pallas"])
 @skipUnlessPallas("JAX/Pallas TPU not available")
 class TestPallas(TestCase):
+    def test_slice_addressing_classification(self) -> None:
+        """_slice_addressing: major dim -> DIRECT; f32 single-lane-tile sublane
+        -> DIRECT; bf16 / wide-lane / unknown-lane sublane -> ALIGNED."""
+        from helion._compiler.backend import SliceAddressing as SA
+        from helion._compiler.backend import _slice_addressing as classify
+
+        f32_2d = torch.empty(16, 128, dtype=torch.float32)
+        bf16_2d = torch.empty(16, 128, dtype=torch.bfloat16)
+        f32_3d = torch.empty(4, 16, 128, dtype=torch.float32)
+
+        # major (leading) dim -> DIRECT regardless of the lane block
+        self.assertIs(classify(f32_3d, 0, 128), SA.DIRECT)
+        self.assertIs(classify(f32_3d, 0, None), SA.DIRECT)
+
+        # sublane dim, f32, lane block <= 128 -> DIRECT (single lane tile)
+        self.assertIs(classify(f32_2d, 0, 128), SA.DIRECT)
+        self.assertIs(classify(f32_3d, 1, 128), SA.DIRECT)
+        # sublane dim, f32, lane block > 128 -> ALIGNED (spans >1 lane tile)
+        self.assertIs(classify(f32_2d, 0, 256), SA.ALIGNED)
+        # sublane dim, f32, unknown lane block -> ALIGNED (conservative)
+        self.assertIs(classify(f32_2d, 0, None), SA.ALIGNED)
+        # sublane dim, bf16 -> ALIGNED regardless of the lane block
+        self.assertIs(classify(bf16_2d, 0, 128), SA.ALIGNED)
+
     def test_estimate_pallas_vmem_bytes(self) -> None:
         """VMEM OOM: Tests that block sizes and dtypes (fp32, bf16) are correctly estimated."""
 
@@ -4100,6 +4124,63 @@ class TestPallas(TestCase):
         outer_min = spec.block_sizes[0].min_size
         inner_min = spec.block_sizes[1].min_size
         self.assertGreaterEqual(outer_min, inner_min)
+
+    @xfailIfPallasInterpret("numerical mismatch in JAX interpret mode")
+    def test_boundary_mask_with_squeezed_leading_dims(self) -> None:
+        """Boundary mask generation succeeds when leading dimensions are squeezed."""
+
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def high_rank_kernel(x: torch.Tensor) -> torch.Tensor:
+            B, H, M, D = x.size()
+            out = torch.zeros_like(x)
+            for tile_b, tile_h in hl.tile([B, H], block_size=[1, 1]):
+                b_idx = tile_b.begin
+                h_idx = tile_h.begin
+                for tile_m in hl.tile(16, M, block_size=128):
+                    slice_x = x[b_idx, h_idx, tile_m, :]
+                    out[b_idx, h_idx, tile_m, :] = slice_x
+            return out
+
+        B, H, M, D = 2, 8, 250, 128
+        x = torch.randn(B, H, M, D, device=DEVICE, dtype=torch.bfloat16)
+        _code, result = code_and_output(
+            high_rank_kernel, (x,), pallas_loop_type="fori_loop"
+        )
+
+        ref = torch.zeros_like(x)
+        ref[:, :, 16:, :] = x[:, :, 16:, :]
+        torch.testing.assert_close(result, ref)
+
+    def test_pallas_0d_tensor_arg(self) -> None:
+        """0D tensor arguments shouldn't cause positional argument shift in block specs."""
+
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def kernel_with_0d_arg(
+            x: torch.Tensor, scalar: torch.Tensor, y: torch.Tensor
+        ) -> torch.Tensor:
+            out = torch.zeros_like(x)
+            for tile_x, tile_y in hl.tile(
+                [x.size(0), x.size(1)], block_size=[128, 128]
+            ):
+                out[tile_x, tile_y] = (
+                    x[tile_x, tile_y] * hl.load(scalar, []) + y[tile_x, tile_y]
+                )
+            return out
+
+        M, N = 256, 256
+        x = torch.randn(M, N, device=DEVICE, dtype=torch.float32)
+        y = torch.randn(M, N, device=DEVICE, dtype=torch.float32)
+        scalar = torch.tensor(2.0, device=DEVICE, dtype=torch.float32)
+
+        from helion.runtime import Config
+
+        config = Config(pallas_loop_type="fori_loop")
+        code = kernel_with_0d_arg.bind((x, scalar, y)).to_code(config)
+
+        self.assertIn(
+            "_block_spec_info=[((128, 128), (0, 1)), None, ((128, 128), (0, 1)), ((128, 128), (0, 1))]",
+            code,
+        )
 
 
 @skipUnlessPallas("JAX/Pallas TPU not available")

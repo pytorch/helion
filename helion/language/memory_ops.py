@@ -22,8 +22,10 @@ from .._compiler.cute.cute_epilogue import _AuxiliaryTensorStep
 from .._compiler.cute.cute_epilogue import analyze_tcgen05_unary_epilogue_chain
 from .._compiler.cute.cute_fx_walk import reach_tcgen05_matmul_anchors
 from .._compiler.cute.cutedsl_compat import emit_pipeline_advance
-from .._compiler.cute.strategies import tcgen05_default_epilogue_tile_expr
 from .._compiler.cute.strategies import tcgen05_explicit_d_store_tile_expr
+from .._compiler.cute.strategies import tcgen05_is_two_cta_m128
+from .._compiler.cute.strategies import tcgen05_resolve_epilogue_tile
+from .._compiler.cute.strategies import tcgen05_two_cta_m128_epilogue_tile_expr
 from .._compiler.cute.tcgen05_constants import (
     TCGEN05_ACC_WAIT_PLACEMENT_BEFORE_SUBTILE_LOOP,
 )
@@ -118,6 +120,11 @@ class _AuxStepRecord:
     aux_rmem: str
     aux_loaded: str
     aux_view2d: str | None
+    # Pre-wait register hoist (bm=128 2-CTA family only): name of the
+    # whole-fragment register tensor filled by ``autovec_copy`` BEFORE the
+    # accumulator ``consumer_wait`` so the rowvec GMEM latency hides under
+    # the MMA wait. ``None`` keeps the per-subtile GMEM load.
+    aux_rmem_full: str | None = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -343,6 +350,11 @@ def _(state: CodegenState) -> None:
         value = emit_scatter_store(
             state, scatter_patterns[0].plan, name, idx_str, value
         )
+    from .._compiler.pallas.ordered_carry import emit_carry_store
+
+    if not scatter_patterns and state.device_function.carry_tiles:
+        if emit_carry_store(state, tensor, subscript, name, idx_str, value):
+            return
     state.codegen.add_statement(
         statement_from_string(f"{name}[{idx_str}] = {{value}}", value=value)
     )
@@ -968,6 +980,103 @@ _CUTE_VECTOR_UNROLL_DTYPES: dict[torch.dtype, str] = {
     torch.bfloat16: "cutlass.BFloat16",
 }
 
+# 1-byte fp8 dtypes also use ``unroll`` mode.  Rather than a
+# ``VectorType([V], Uint8)`` load (which ICEs at V=8 in the CuTe DSL and
+# emits two LDG.32s for V=4), an fp8 vec chunk is loaded as a SINGLE packed
+# integer (``Uint32`` for V=4, ``Uint64`` for V=8) — one LDG.32 / LDG.64 —
+# and each lane byte is extracted with a shift+mask.  The extracted ``Uint8``
+# is decoded downstream by the matmul fallback's PTX helper.
+_CUTE_VECTOR_UNROLL_BYTE_DTYPES: frozenset[torch.dtype] = frozenset(
+    {torch.float8_e4m3fn}
+)
+
+# Packed-integer cutlass type per total byte width of an fp8 vec chunk.
+_CUTE_BYTE_PACK_TYPE: dict[int, str] = {
+    1: "cutlass.Uint8",
+    2: "cutlass.Uint16",
+    4: "cutlass.Uint32",
+    8: "cutlass.Uint64",
+}
+
+
+def _cute_is_byte_packed(dtype: torch.dtype) -> bool:
+    return dtype in _CUTE_VECTOR_UNROLL_BYTE_DTYPES
+
+
+def _cute_is_unroll_dtype(dtype: torch.dtype) -> bool:
+    """True for dtypes that use ``unroll`` mode: bf16/fp16 (Uint16 vector +
+    bitcast) and fp8 (packed-integer load + shift extract)."""
+    return (
+        dtype in _CUTE_VECTOR_UNROLL_DTYPES or dtype in _CUTE_VECTOR_UNROLL_BYTE_DTYPES
+    )
+
+
+def _cute_unroll_vec_elem_type(dtype: torch.dtype, vec_width: int = 1) -> str:
+    """Cutlass load type for an ``unroll``-mode hoisted vec load.
+
+    fp8 loads ``vec_width`` bytes as a single packed integer; bf16/fp16 load a
+    ``Uint16`` vector element (the ``VectorType`` width is applied by callers).
+    """
+    if _cute_is_byte_packed(dtype):
+        pack = _CUTE_BYTE_PACK_TYPE.get(vec_width)
+        assert pack is not None, f"unsupported fp8 vec_width {vec_width}"
+        return pack
+    return "cutlass.Uint16"
+
+
+def _cute_lane_axis_pos(strategy: object, block_id: int, index_exprs: list[str]) -> int:
+    """Index_exprs position of the stride-1 lane axis for a tile_unroll hoist.
+
+    Defaults to the last position (row-major lhs); the dispatcher records a
+    different position (e.g. 0 for a K-major rhs) in
+    ``_cute_lane_axis_pos_by_block``.
+    """
+    pos_by_block = getattr(strategy, "_cute_lane_axis_pos_by_block", None)
+    if isinstance(pos_by_block, dict):
+        pos = pos_by_block.get(block_id)
+        if isinstance(pos, int):
+            return pos
+    return len(index_exprs) - 1
+
+
+def _cute_unroll_vec_load_dtype_arg(dtype: torch.dtype, vec_width: int) -> str:
+    """The dtype argument to ``cute.arch.load`` for an unroll-mode hoist.
+
+    fp8 loads ``vec_width`` contiguous bytes as ONE packed scalar integer
+    (no ``VectorType`` — avoids the V=8 ``nvvm.load.ext`` ICE and emits a
+    single LDG).  bf16/fp16 load a ``Uint16`` vector of width ``vec_width``.
+    """
+    if _cute_is_byte_packed(dtype):
+        return _cute_unroll_vec_elem_type(dtype, vec_width) + ".mlir_type"
+    return f"ir.VectorType.get([{vec_width}], cutlass.Uint16.mlir_type)"
+
+
+def _cute_unroll_vec_load_expr(
+    ptr_expr: str, dtype: torch.dtype, vec_width: int
+) -> str:
+    """Build the ``cute.arch.load(...)`` RHS for an unroll-mode hoist."""
+    if _cute_is_byte_packed(dtype):
+        pack = _cute_unroll_vec_elem_type(dtype, vec_width)
+        return f"cute.arch.load({ptr_expr}, {pack})"
+    return (
+        f"cute.arch.load({ptr_expr}, "
+        f"ir.VectorType.get([{vec_width}], cutlass.Uint16.mlir_type))"
+    )
+
+
+def _cute_unroll_vec_extract(hoist_var: str, idx: str, dtype: torch.dtype) -> str:
+    """Per-lane extract expr from a hoisted ``unroll``-mode vec load.
+
+    fp8: ``hoist_var`` is a packed integer (Uint32/Uint64); byte ``idx`` is
+    extracted with a shift+mask and returned as a ``Uint8`` (decoded
+    downstream).  bf16/fp16: ``hoist_var`` is a ``Uint16`` vector; lane ``idx``
+    is bitcast back to the original dtype.
+    """
+    if dtype in _CUTE_VECTOR_UNROLL_BYTE_DTYPES:
+        return f"cutlass.Uint8(({hoist_var} >> (8 * ({idx}))) & 0xFF)"
+    elem_dtype = _CUTE_VECTOR_UNROLL_DTYPES[dtype]
+    return f"cutlass.Uint16({hoist_var}[{idx}]).bitcast({elem_dtype})"
+
 
 def _cute_vector_load_expr(
     tensor_name: str,
@@ -1065,12 +1174,12 @@ def _cute_register_tile_unroll_vec_hoist(
     """Tile-loop variant of ``_cute_register_unroll_vec_hoist`` for
     ``CuteNDTileStrategy`` lane loops.
 
-    Splices a single ``cute.arch.load(base_ptr, Uint16x V)`` into the
+    Splices a single ``cute.arch.load(base_ptr, <elem>x V)`` into the
     outer-lane body (above the constexpr V-loop) and returns the
-    per-element bitcast expression ``hoist_var[vi].bitcast(dtype)`` so
-    the existing scalar pipeline keeps working.
+    per-element extract expression so the existing scalar pipeline keeps
+    working.  bf16/fp16 load as ``Uint16`` and bitcast; fp8 loads ``vec_width``
+    bytes as one packed integer that the matmul fallback decodes downstream.
     """
-    elem_dtype = _CUTE_VECTOR_UNROLL_DTYPES[tensor.dtype]
     base_var_by_block = getattr(strategy, "_cute_lane_base_index_var_by_block", {})
     lane_body_by_block = getattr(strategy, "_cute_lane_body_by_block", {})
     vec_lane_var_by_block = getattr(strategy, "_cute_vec_lane_var_by_block", {})
@@ -1080,11 +1189,13 @@ def _cute_register_tile_unroll_vec_hoist(
     assert isinstance(base_index_var, str)
     assert isinstance(lane_body, list)
     assert isinstance(vec_lane_var, str)
-    # The inner reduction-axis index_expr is the last entry; swap it
-    # with the per-lane base so the vec load points at the start of the
-    # V-wide chunk this thread owns.
+    # The lane-axis index_expr (stride-1 dim) is swapped with the per-lane
+    # base so the vec load points at the start of the V-wide chunk this
+    # thread owns.  The position is the last entry for a row-major lhs, or
+    # the recorded position for a K-major rhs.
+    lane_pos = _cute_lane_axis_pos(strategy, block_id, index_exprs)
     base_exprs = list(index_exprs)
-    base_exprs[-1] = base_index_var
+    base_exprs[lane_pos] = base_index_var
     base_ptr_expr = _cute_scalar_pointer_expr(tensor_name, base_exprs)
     cache_key = (tensor_name, base_ptr_expr)
     cache_by_block = getattr(strategy, "_cute_lane_vec_loads_by_block", None)
@@ -1117,22 +1228,21 @@ def _cute_register_tile_unroll_vec_hoist(
         # for the very first outer-tile iter, which is always in-bounds
         # for any grid block.
         anchor_exprs = list(index_exprs)
-        anchor_exprs[-1] = "0"
+        anchor_exprs[lane_pos] = "0"
         anchor_ptr_expr = _cute_scalar_pointer_expr(tensor_name, anchor_exprs)
         guarded_ptr = (
             f"({base_ptr_expr} if {base_index_var} < {numel_expr} "
             f"else {anchor_ptr_expr})"
         )
         hoist_stmt = statement_from_string(
-            f"{hoist_var} = cute.arch.load({guarded_ptr}, "
-            f"ir.VectorType.get([{vec_width}], cutlass.Uint16.mlir_type))"
+            f"{hoist_var} = {_cute_unroll_vec_load_expr(guarded_ptr, tensor.dtype, vec_width)}"
         )
         # Insert the hoist just BEFORE the constexpr V-loop (the last
         # entry in lane_body).
         lane_body.insert(len(lane_body) - 1, hoist_stmt)
     else:
         hoist_var, _ = cache[cache_key]
-    return f"cutlass.Uint16({hoist_var}[{vec_lane_var}]).bitcast({elem_dtype})"
+    return _cute_unroll_vec_extract(hoist_var, vec_lane_var, tensor.dtype)
 
 
 def _cute_register_tile_unroll_vec_hoist_split2(
@@ -1172,7 +1282,7 @@ def _cute_register_tile_unroll_vec_hoist_split2(
         "tile_unroll_split2 expects V=8 (4+4); other widths use tile_unroll"
     )
     half = vec_width // 2
-    elem_dtype = _CUTE_VECTOR_UNROLL_DTYPES[tensor.dtype]
+    vec_elem_type = _cute_unroll_vec_elem_type(tensor.dtype)
     base_var_by_block = getattr(strategy, "_cute_lane_base_index_var_by_block", {})
     lane_body_by_block = getattr(strategy, "_cute_lane_body_by_block", {})
     vec_lane_var_by_block = getattr(strategy, "_cute_vec_lane_var_by_block", {})
@@ -1182,13 +1292,14 @@ def _cute_register_tile_unroll_vec_hoist_split2(
     assert isinstance(base_index_var, str)
     assert isinstance(lane_body, list)
     assert isinstance(vec_lane_var, str)
+    lane_pos = _cute_lane_axis_pos(strategy, block_id, index_exprs)
     base_exprs = list(index_exprs)
-    base_exprs[-1] = base_index_var
+    base_exprs[lane_pos] = base_index_var
     base_ptr_expr_a = _cute_scalar_pointer_expr(tensor_name, base_exprs)
     # The second-half pointer points 4 elements past the first.  Build
     # it by substituting ``base_index_var + half`` for the inner index.
     base_exprs_b = list(index_exprs)
-    base_exprs_b[-1] = f"({base_index_var} + {half})"
+    base_exprs_b[lane_pos] = f"({base_index_var} + {half})"
     base_ptr_expr_b = _cute_scalar_pointer_expr(tensor_name, base_exprs_b)
     cache_key = (tensor_name, base_ptr_expr_a, "split2")
     cache_by_block = getattr(strategy, "_cute_lane_vec_loads_by_block", None)
@@ -1213,7 +1324,7 @@ def _cute_register_tile_unroll_vec_hoist_split2(
         numel = env_local.block_sizes[block_id].numel
         numel_expr = state.sympy_expr(numel)
         anchor_exprs = list(index_exprs)
-        anchor_exprs[-1] = "0"
+        anchor_exprs[lane_pos] = "0"
         anchor_ptr_expr = _cute_scalar_pointer_expr(tensor_name, anchor_exprs)
         # The first-half OOB guard checks the same V-aligned base used by
         # the V=4 path; the second-half pointer is ``base + 4`` and only
@@ -1230,11 +1341,11 @@ def _cute_register_tile_unroll_vec_hoist_split2(
         )
         hoist_stmt_a = statement_from_string(
             f"{hoist_var_a} = cute.arch.load({guarded_ptr_a}, "
-            f"ir.VectorType.get([{half}], cutlass.Uint16.mlir_type))"
+            f"ir.VectorType.get([{half}], {vec_elem_type}.mlir_type))"
         )
         hoist_stmt_b = statement_from_string(
             f"{hoist_var_b} = cute.arch.load({guarded_ptr_b}, "
-            f"ir.VectorType.get([{half}], cutlass.Uint16.mlir_type))"
+            f"ir.VectorType.get([{half}], {vec_elem_type}.mlir_type))"
         )
         # Insert both hoists just BEFORE the constexpr V-loop (the last
         # entry in lane_body).  Emit them back-to-back so the SASS
@@ -1243,11 +1354,11 @@ def _cute_register_tile_unroll_vec_hoist_split2(
         lane_body.insert(len(lane_body) - 1, hoist_stmt_b)
     else:
         (hoist_var_a, hoist_var_b), _ = cache[cache_key]
-    return (
-        f"(cutlass.Uint16({hoist_var_a}[{vec_lane_var}]).bitcast({elem_dtype}) "
-        f"if {vec_lane_var} < {half} "
-        f"else cutlass.Uint16({hoist_var_b}[{vec_lane_var} - {half}]).bitcast({elem_dtype}))"
+    extract_a = _cute_unroll_vec_extract(hoist_var_a, vec_lane_var, tensor.dtype)
+    extract_b = _cute_unroll_vec_extract(
+        hoist_var_b, f"{vec_lane_var} - {half}", tensor.dtype
     )
+    return f"({extract_a} if {vec_lane_var} < {half} else {extract_b})"
 
 
 def _cute_vector_load_ctx(
@@ -1273,9 +1384,8 @@ def _cute_vector_load_ctx(
         return None
     if "None" in index_exprs:
         return None
-    if (
-        tensor.dtype not in _CUTE_VECTOR_DTYPES
-        and tensor.dtype not in _CUTE_VECTOR_UNROLL_DTYPES
+    if tensor.dtype not in _CUTE_VECTOR_DTYPES and not _cute_is_unroll_dtype(
+        tensor.dtype
     ):
         return None
     # Only enable the vec path when the load's result eventually feeds a
@@ -1312,26 +1422,46 @@ def _cute_vector_load_ctx(
     # Note: ``feeds_reduction`` is required ONLY for the ``vec`` mode below;
     # the ``unroll`` mode also applies to the consume sweep where the load
     # result feeds an elementwise pipeline (no reduction).
-    # The innermost dim of the load must be the reduction lane axis and
-    # the tensor must be stride-1 in that dim so that consecutive lane
-    # iters fetch consecutive bytes.
-    try:
-        if int(tensor.stride(-1)) != 1:
-            return None
-    except (TypeError, ValueError):
+    # The lane/vec axis must be a tensor dim that is stride-1 so that
+    # consecutive lane iters fetch consecutive bytes.  For a row-major lhs
+    # the reduction axis is the LAST subscript position; for a column-major
+    # rhs (e.g. the K-major ``y`` of a tcgen05 fp8 matmul) it is the FIRST.
+    # ``_cute_lane_axis_pos`` records the index_exprs position of that
+    # stride-1 lane axis so the hoist substitutes the per-lane base there
+    # (not blindly at ``[-1]``).
+    # Find the stride-1 dim WITHOUT forcing specialization of a symbolic
+    # stride: a contiguous dim has a concrete ``int`` stride of 1, so only
+    # accept plain ints here.  Calling ``int()`` on a ``SymInt`` stride would
+    # bake the (otherwise-dynamic) size into the kernel — see the
+    # ``test_mark_static`` regression where ``int(stride(0))`` specialized
+    # ``n``.
+    stride1_tensor_dim: int | None = None
+    for d in range(tensor.ndim):
+        s = tensor.stride(d)
+        if isinstance(s, int) and s == 1:
+            stride1_tensor_dim = d
+            break
+    if stride1_tensor_dim is None:
         return None
-    # Locate the innermost (last) non-None subscript and pull the active
-    # block_id off it.  Slices resolve to the matching tensor-dim block via
-    # the strategy that's currently active for that block.
+    # Locate the non-None subscript carrying an active lane block.  Slices
+    # resolve to the matching tensor-dim block via the strategy that's
+    # currently active for that block.  Prefer the block sitting on the
+    # stride-1 tensor dim (the true lane axis), and record its index_exprs
+    # position.
     inner_block_id: int | None = None
+    lane_axis_pos: int | None = None
+    expr_pos = -1
     tensor_dim = 0
     for idx in subscript:
         if idx is None:
             continue
+        expr_pos += 1
         if isinstance(idx, torch.SymInt):
             bid = env.get_block_id(idx)
-            if bid is not None:
-                inner_block_id = bid
+            if bid is not None and state.codegen.active_device_loops.get(bid):
+                if tensor_dim == stride1_tensor_dim or inner_block_id is None:
+                    inner_block_id = bid
+                    lane_axis_pos = expr_pos
         elif isinstance(idx, slice) and idx == slice(None):
             if tensor_dim < tensor.ndim:
                 dim_size = tensor.shape[tensor_dim]
@@ -1366,10 +1496,12 @@ def _cute_vector_load_ctx(
                     if env.known_equal(
                         bs_int, dim_int
                     ) and state.codegen.active_device_loops.get(cand_bid):
-                        inner_block_id = cand_bid
+                        if tensor_dim == stride1_tensor_dim or inner_block_id is None:
+                            inner_block_id = cand_bid
+                            lane_axis_pos = expr_pos
                         break
         tensor_dim += 1
-    if inner_block_id is None:
+    if inner_block_id is None or lane_axis_pos is None:
         return None
     loops = state.codegen.active_device_loops.get(inner_block_id)
     if not loops:
@@ -1425,10 +1557,11 @@ def _cute_vector_load_ctx(
         vec_width = vec_by_block.get(inner_block_id, 1)
         if vec_width <= 1:
             return None
-        if tensor.dtype not in _CUTE_VECTOR_UNROLL_DTYPES:
+        if not _cute_is_unroll_dtype(tensor.dtype):
             return None
-        # The CuTe DSL's ``nvvm.load.ext`` ICEs at V=8 for fp16/bf16, so
-        # widths > 4 cannot use a single ``cute.arch.load``.  V=8 still
+        # The CuTe DSL's ``nvvm.load.ext`` ICEs at V=8 for fp16/bf16 (and
+        # for the V=8 ``Uint8`` vector used by fp8), so widths > 4 cannot
+        # use a single ``cute.arch.load``.  V=8 still
         # gets full LDG.128 throughput via the ``tile_unroll_split2``
         # mode: two back-to-back ``cute.arch.load(..., V=4)`` calls
         # (covering vec lanes 0-3 and 4-7) emit as two LDG.64s that the
@@ -1460,7 +1593,20 @@ def _cute_vector_load_ctx(
         numel = env.block_sizes[inner_block_id].numel
         if not env.known_multiple(numel, vec_width):
             return None
-        if vec_width == 8:
+        # Record the index_exprs position of the stride-1 lane axis so the
+        # hoist substitutes the per-lane base there.  Row-major lhs loads
+        # use the last position; a column-major rhs (K-major ``y``) uses
+        # position 0.
+        pos_by_block = getattr(strategy, "_cute_lane_axis_pos_by_block", None)
+        if not isinstance(pos_by_block, dict):
+            pos_by_block = {}
+            # pyrefly: ignore [missing-attribute]
+            strategy._cute_lane_axis_pos_by_block = pos_by_block
+        pos_by_block[inner_block_id] = lane_axis_pos
+        # fp8 loads a packed Uint64 (V=8) / Uint32 (V=4) in the regular
+        # ``tile_unroll`` path — no ``VectorType`` so no V=8 ICE, hence no
+        # split2 needed.  bf16/fp16 V=8 still needs the 2x V=4 split.
+        if vec_width == 8 and not _cute_is_byte_packed(tensor.dtype):
             return vec_width, inner_block_id, "tile_unroll_split2"
         return vec_width, inner_block_id, "tile_unroll"
     return None
@@ -2680,6 +2826,30 @@ def _codegen_cute_store_tcgen05_tile(
                 aux_rmem=df.new_var(f"tcgen05_aux_rmem_{aux_idx}"),
                 aux_loaded=df.new_var(f"tcgen05_aux_loaded_{aux_idx}"),
                 aux_view2d=aux_view2d,
+                # Pre-wait whole-fragment register hoist of N-broadcast
+                # (rowvec) aux on the bm=128 2-CTA full-tile TMA-store path.
+                # The fragment there is small (2 subtiles x epi-tile N of 64
+                # at bn=128 = a handful of fp32 registers per thread), so the
+                # whole-fragment LDG fits without spills and hides its GMEM
+                # latency under the MMA wait (standalone CUTLASS does the
+                # same; ~2% on the 512x6144x2048 fp8 scaled_mm shape). It is
+                # deliberately NOT applied to the bm=256 family: its larger
+                # whole-tile fragment regressed via register spills (see the
+                # fp8_gap_v2 history of the rowvec hoist removal at bn=128/
+                # epi-32 -- 409k LDL/STL on the 4096^3 shape).
+                aux_rmem_full=(
+                    df.new_var(f"tcgen05_aux_rmem_full_{aux_idx}")
+                    if (
+                        aux_step.broadcast_axis in (0, 1)
+                        and tcgen05_is_two_cta_m128(
+                            is_two_cta=tcgen05_lifecycle.is_two_cta,
+                            bm=tcgen05_value.bm,
+                        )
+                        and tcgen05_value.use_tma_store_epilogue
+                        and not tcgen05_value.partial_output_tma_store
+                    )
+                    else None
+                ),
             )
         )
 
@@ -3205,6 +3375,26 @@ def _codegen_cute_store_tcgen05_tile(
                         f"{rec.ttr_aux_grouped} = cute.group_modes("
                         f"{rec.ttr_aux}, 3, cute.rank({rec.ttr_aux}))"
                     ),
+                    # Pre-wait hoist: one cooperative LDG of the whole rowvec
+                    # fragment, issued here (before the accumulator
+                    # consumer_wait downstream) so the GMEM latency overlaps
+                    # the MMA wait. Per-subtile reads then come from
+                    # registers. See the ``aux_rmem_full`` field docs for the
+                    # family gate.
+                    *(
+                        [
+                            (
+                                f"{rec.aux_rmem_full} = cute.make_rmem_tensor("
+                                f"{rec.ttr_aux_grouped}.shape, {rec.aux_dtype})"
+                            ),
+                            (
+                                f"cute.autovec_copy({rec.ttr_aux_grouped}, "
+                                f"{rec.aux_rmem_full})"
+                            ),
+                        ]
+                        if rec.aux_rmem_full is not None and not force_gmem_aux
+                        else []
+                    ),
                 ]
             )
         return lines
@@ -3428,6 +3618,16 @@ def _codegen_cute_store_tcgen05_tile(
                     f"[(0, 0, 0, cutlass.Int32(_tcgen05_subtile))]\n"
                 )
                 continue
+            if rec.aux_rmem_full is not None:
+                # Pre-wait hoisted rowvec: the whole fragment is already in
+                # registers (loaded before the accumulator consumer_wait by
+                # ``_aux_tile_setup_lines``); slice the active subtile.
+                lines.append(
+                    f"{prelude_indent}{rec.aux_loaded} = "
+                    f"{rec.aux_rmem_full}"
+                    f"[(None, None, None, cutlass.Int32(_tcgen05_subtile))].load()\n"
+                )
+                continue
             lines.extend(
                 [
                     (
@@ -3531,6 +3731,16 @@ def _codegen_cute_store_tcgen05_tile(
                 tcgen05_value.role_local_tile_counter,
                 increment_per_tile=not tcgen05_value.tma_store_full_tiles_only,
             )
+        # The bm=128 CtaGroup.TWO family's epilogue tile is N-mode permuted
+        # (see ``tcgen05_two_cta_m128_epilogue_tile_expr``); the host TMA-store
+        # atom must be built from this *exact* device-side expression, not from
+        # the plain ``epi_tile_m/n`` integer keys (which build an unpermuted
+        # ``(m, n)`` tile and silently scramble the output -- the correctness
+        # bug §7 in FINDINGS_512_SHAPE.md). ``epi_tile_raw_expr`` carries the
+        # verbatim device expression to the wrapper.
+        d_two_cta_m128 = tcgen05_is_two_cta_m128(
+            is_two_cta=tcgen05_lifecycle.is_two_cta, bm=tcgen05_value.bm
+        )
         d_tma_plan: dict[str, object] = {
             "kind": "tcgen05_d_tma",
             "d_name": tensor_name,
@@ -3542,6 +3752,18 @@ def _codegen_cute_store_tcgen05_tile(
                 tcgen05_value.tma_store_atom,
                 tcgen05_value.tma_store_tensor,
             ],
+            **(
+                {
+                    "epi_tile_raw_expr": tcgen05_two_cta_m128_epilogue_tile_expr(
+                        tcgen05_value.bm,
+                        tcgen05_value.bn,
+                        target_dtype,
+                        c_layout="cutlass.utils.layout.LayoutEnum.ROW_MAJOR",
+                    )
+                }
+                if d_two_cta_m128 and not tcgen05_value.has_explicit_epilogue_tile
+                else {}
+            ),
             **(
                 {
                     "epi_tile_m": tcgen05_value.explicit_epi_tile_m,
@@ -3561,6 +3783,20 @@ def _codegen_cute_store_tcgen05_tile(
     tcgen05_c_stage_count = tcgen05_value.c_stage_count
     tcgen05_is_two_cta = tcgen05_lifecycle.is_two_cta
     tcgen05_thr_mma = tcgen05_value.thr_mma
+    # The bm=128 CtaGroup.TWO family stores through the per-CTA epilogue tile
+    # (m of 64, ``use_2cta=True``, no-source) so the store-side
+    # ``tcgen05_store_epi_tile``, the ``kernel_desc.cta_tile_shape_mnk``, and
+    # the host TMA-store atom all match the device-side N-mode-permuted tile.
+    # Resolved through the shared helper so this ``(store_tile_m, epi_tile_expr)``
+    # pair stays identical to the layout-plan side in ``cute_mma.py``.
+    tcgen05_store_tile_m, tcgen05_store_epi_tile_expr = tcgen05_resolve_epilogue_tile(
+        bm=tcgen05_bm,
+        bn=tcgen05_bn,
+        is_two_cta=tcgen05_is_two_cta,
+        elem_dtype=target_dtype,
+        c_layout="cutlass.utils.layout.LayoutEnum.ROW_MAJOR",
+        explicit_expr=tcgen05_explicit_store_tile_expr,
+    )
     full_tile_expr = (
         f"({base_indices[0]}) + cutlass.Int32({tcgen05_bm}) <= {m_size} "
         f"and ({base_indices[1]}) + cutlass.Int32({tcgen05_bn}) <= {n_size}"
@@ -3569,18 +3805,11 @@ def _codegen_cute_store_tcgen05_tile(
     def store_common_setup(
         gmem_tensor: str, *, include_full_tile: bool
     ) -> tuple[list[str], list[str]]:
-        epi_tile_expr = tcgen05_explicit_store_tile_expr or (
-            tcgen05_default_epilogue_tile_expr(
-                tcgen05_bm,
-                tcgen05_bn,
-                target_dtype,
-                c_layout="cutlass.utils.layout.LayoutEnum.ROW_MAJOR",
-            )
-        )
+        epi_tile_expr = tcgen05_store_epi_tile_expr
         static_setup = [
             (
                 f"{kernel_desc} = type('Tcgen05KernelDesc', (), {{"
-                f"'cta_tile_shape_mnk': ({tcgen05_bm}, {tcgen05_bn}, {tcgen05_bk}), "
+                f"'cta_tile_shape_mnk': ({tcgen05_store_tile_m}, {tcgen05_bn}, {tcgen05_bk}), "
                 "'c_layout': cutlass.utils.layout.LayoutEnum.ROW_MAJOR, "
                 f"'c_dtype': {target_dtype}, "
                 "'acc_dtype': cutlass.Float32, "

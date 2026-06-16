@@ -717,6 +717,91 @@ def tcgen05_default_epilogue_tile_expr(
     )
 
 
+def tcgen05_two_cta_m128_epilogue_tile_expr(
+    bm: int, bn: int, elem_dtype: str, *, c_layout: str
+) -> str:
+    """Epilogue tile for the bm=128 CtaGroup.TWO family (per-CTA tile 64xbn).
+
+    The bm=256 2-CTA path and the bm=128 1-CTA path both build the epilogue
+    tile from the full ``(bm, bn)`` shape, where the per-CTA and full-CTA
+    conventions produce identical tiles, so the legacy form is kept there for
+    golden-output stability; at bm=128 they diverge: the per-CTA tile m of 64
+    selects the 2-CTA ``(2, 2)`` epilogue warp grid, whose tile is **N-mode
+    permuted** (e.g. ``[64:1;(16,2):(1,64)]``). Every consumer of this tile --
+    the matmul-plan ``tcgen05_epi_tile``, the store-side
+    ``tcgen05_store_epi_tile``, the SMEM staging layouts, and the host-side
+    TMA store atom in ``helion/runtime/__init__.py`` -- must use this same
+    expression; building any of them from a plain ``(m, n)`` tile silently
+    permutes the output through SMEM (wrong values + torn bf16 pairs).
+
+    The no-source form (no ``elem_ty_c``) is deliberate: this family has no
+    residual-C epilogue input, and the with-source sizing would halve
+    ``tile_n`` (32 vs 64), doubling epilogue iterations for nothing
+    (~4% measured on the 512x6144x2048 fp8 scaled_mm shape).
+    """
+    assert bm == 128, bm
+    return (
+        "cutlass.utils.blackwell_helpers.compute_epilogue_tile_shape("
+        f"({bm // 2}, {bn}), True, {c_layout}, {elem_dtype})"
+    )
+
+
+def tcgen05_is_two_cta_m128(*, is_two_cta: bool, bm: int) -> bool:
+    """True for the bm=128 CtaGroup.TWO family (per-CTA tile, N-mode permuted).
+
+    ``is_two_cta`` is True for *both* 2-CTA families -- the legacy bm=256 path
+    (full-(bm, bn) tile, per-CTA and full-CTA conventions coincide) and this
+    bm=128 small-grid path (per-CTA tile m of ``bm // 2``, N-mode permuted) --
+    so the extra ``bm == 128`` check is what separates the two from each other,
+    not the 2-CTA case from the 1-CTA case. Only this family must thread the
+    permuted ``tcgen05_two_cta_m128_epilogue_tile_expr`` to every consumer; the
+    bm=256 path keeps the legacy full-tile form. The fp8 gate that makes this
+    branch reachable lives in ``_tcgen05_use_2cta_instrs`` (the f16/bf16
+    bm=128 + cluster_m=2 point is owned by the legacy CtaGroup.ONE family), so
+    this predicate stays dtype-agnostic and tracks only the structural family.
+    """
+    return is_two_cta and bm == 128
+
+
+def tcgen05_resolve_epilogue_tile(
+    *,
+    bm: int,
+    bn: int,
+    is_two_cta: bool,
+    elem_dtype: str,
+    c_layout: str,
+    explicit_expr: str | None = None,
+) -> tuple[int, str]:
+    """Resolve ``(epi_tile_m, epi_tile_expr)`` for a tcgen05 store.
+
+    Single source of truth for the bm=128 CtaGroup.TWO per-CTA tile (m of
+    ``bm // 2``, N-mode permuted -- see
+    ``tcgen05_two_cta_m128_epilogue_tile_expr``) vs the legacy full-``(bm, bn)``
+    tile. The layout-plan setup in ``cute_mma.py`` and the store side in
+    ``memory_ops.py`` must produce identical ``epi_tile_m`` / ``epi_tile_expr``
+    pairs or the device r2s SMEM copy and the host TMA store atom disagree and
+    the output is silently scrambled, so both call here.
+
+    ``explicit_expr`` is the pre-built CuTe expression for a user-supplied
+    explicit epilogue tile (the integer-keyed
+    ``tcgen05_explicit_epilogue_tile_expr`` on the layout-plan side, the
+    plan-recorded store-tile string on the store side); when present it wins
+    over the family-derived expression but ``epi_tile_m`` still follows the
+    per-CTA convention.
+    """
+    two_cta_m128 = tcgen05_is_two_cta_m128(is_two_cta=is_two_cta, bm=bm)
+    epi_tile_m = bm // 2 if two_cta_m128 else bm
+    if explicit_expr is not None:
+        return epi_tile_m, explicit_expr
+    if two_cta_m128:
+        return epi_tile_m, tcgen05_two_cta_m128_epilogue_tile_expr(
+            bm, bn, elem_dtype, c_layout=c_layout
+        )
+    return epi_tile_m, tcgen05_default_epilogue_tile_expr(
+        bm, bn, elem_dtype, c_layout=c_layout
+    )
+
+
 def tcgen05_explicit_d_store_tile_expr(tile_m: int, d_store_box_n: int) -> str:
     """Return the CuTe expression for a validated explicit D-store box.
 
