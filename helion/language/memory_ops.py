@@ -6679,17 +6679,23 @@ def _(state: CodegenState) -> object:
     return expr_from_string(f"({load_expr} if {mask_expr} else {zero}(0))")
 
 
-@_decorators.get_masked_value(load)
+@_decorators.get_masked_value(load, "common")
+def _(node: torch.fx.Node) -> int:
+    # Loads are always masked to 0 by default.
+    return 0
+
+
+@_decorators.get_masked_value(load, "pallas")
 def _(node: torch.fx.Node) -> int | None:
     # Pallas jagged-flat loads have no implicit OOB masking (DMA copies
     # whatever bytes), so return None to keep _mask_to alive for the
     # reduction.  Detection runs before plan_tiling so we can't read
-    # ``indexing_patterns``; conservative test: pallas + tensor-valued
-    # subscript + any registered jagged_tile.
+    # ``indexing_patterns``; conservative test: any registered
+    # ``jagged_tile`` parent + a tensor-valued subscript.
     from .._compiler.compile_environment import CompileEnvironment
 
     env = CompileEnvironment.current()
-    if env.backend.name == "pallas" and env.jagged_tile_parent_ids:
+    if env.jagged_tile_parent_ids:
         subscript = node.args[1]
         if isinstance(subscript, (list, tuple)):
             for idx in subscript:
@@ -6697,7 +6703,7 @@ def _(node: torch.fx.Node) -> int | None:
                     val = idx.meta.get("val")
                     if isinstance(val, torch.Tensor):
                         return None
-    return 0  # loads are always masked to 0
+    return 0  # loads are masked to 0 outside the jagged-flat path
 
 
 # TODO(joydddd): Add support for stack tensor in ref mode.

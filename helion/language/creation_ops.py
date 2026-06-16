@@ -168,7 +168,7 @@ def _full_codegen_pallas(state: CodegenState) -> ast.AST:
     return full._codegen["common"](state)  # pyrefly: ignore[missing-attribute]
 
 
-@_decorators.get_masked_value(full)
+@_decorators.get_masked_value(full, "common")
 def _(
     node: torch.fx.Node,
 ) -> float | bool | None:

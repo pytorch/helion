@@ -2724,7 +2724,7 @@ def _(state: CodegenState) -> ast.Name:
     return lhs
 
 
-@_decorators.get_masked_value(_phi)
+@_decorators.get_masked_value(_phi, "common")
 def _(node: torch.fx.Node) -> float | bool | None:
     lhs, rhs = node.args
     assert isinstance(lhs, torch.fx.Node)
@@ -3039,7 +3039,7 @@ def _(state: CodegenState) -> ast.AST:
     )
 
 
-@_decorators.get_masked_value(_mask_to)
+@_decorators.get_masked_value(_mask_to, "common")
 def _(node: torch.fx.Node) -> float | bool:
     value = node.args[1]
     assert isinstance(value, (int, float, bool))
@@ -3084,7 +3084,7 @@ def _(state: CodegenState) -> ast.AST:
     return create(ast.Name, id=varname, ctx=ast.Load())
 
 
-@_decorators.get_masked_value(_new_var)
+@_decorators.get_masked_value(_new_var, "common")
 def _(node: torch.fx.Node) -> float | bool | None:
     from .._compiler.node_masking import cached_masked_value
 
