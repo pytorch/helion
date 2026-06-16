@@ -4,6 +4,7 @@ import abc
 import ast
 import base64
 import contextlib
+import enum
 import functools
 import hashlib
 from itertools import starmap
@@ -1455,6 +1456,40 @@ _TORCH_TO_JAX_DTYPE: dict[str, str] = {
 _PALLAS_UNSUPPORTED_DTYPES = frozenset({torch.int64, torch.uint64, torch.float64})
 
 
+class SliceAddressing(enum.Enum):
+    """How a dynamic-offset slice on a tensor dim must be emitted on TPU."""
+
+    DIRECT = enum.auto()  # offset used as-is -> plain pl.ds
+    ALIGNED = enum.auto()  # offset rounded to a sublane tile -> aligned-enclosing
+
+
+def _slice_addressing(
+    tensor: torch.Tensor, dim: int, lane_block: int | None = None
+) -> SliceAddressing:
+    """Whether a dynamic slice on ``dim`` can take any offset.
+
+    TPU only tiles the last two dims into (8, 128) blocks, so a slice on an
+    earlier row-major dim reads any offset (DIRECT).  A sublane-dim slice must
+    align to a tile boundary (ALIGNED), except f32 over a single lane tile
+    (``lane_block`` <= 128) stays contiguous and reads any offset too (DIRECT).
+    ``lane_block`` is the last-dim extent (block size, or full width if untiled);
+    None stays conservative (ALIGNED).
+    """
+    if dim < tensor.ndim - 2:
+        return SliceAddressing.DIRECT  # major dim: row-major, any offset
+    if dim == tensor.ndim - 2:  # 2nd-minor (sublane) dim
+        # f32 fills a lane, so a single lane tile is contiguous and reads any
+        # offset; bf16 packs two rows per sublane and always needs alignment.
+        if (
+            tensor.dtype == torch.float32
+            and isinstance(lane_block, int)
+            and lane_block <= 128
+        ):
+            return SliceAddressing.DIRECT
+        return SliceAddressing.ALIGNED
+    return SliceAddressing.ALIGNED  # TODO(tcombes): align lane dim to 128, not sublane
+
+
 class PallasBackend(Backend):
     """Pallas (JAX) code generation backend for TPU."""
 
@@ -1780,6 +1815,18 @@ class PallasBackend(Backend):
         if dim_from_end == 1:  # Second to last dimension
             return 8
         return 1  # No requirements for other dimensions
+
+    def sublane_tiling(self, dtype: torch.dtype) -> int:
+        """Native sublane (2nd-minor) tile for ``dtype``: f32->8, bf16->16, i8->32.
+
+        The jagged carry slices its emit_pipeline VMEM refs at this
+        granularity, and such a ref must be accessed as a *whole* native tile:
+        a smaller slice (e.g. 8 rows of a bf16 ref, whose tile is 16) is
+        rejected by Mosaic ("E2003: unproven memory access alignment"),
+        independent of offset.
+        """
+        bitwidth = min(dtype.itemsize * 8, 32)
+        return 8 * (32 // bitwidth)
 
     fake_tensor_loads: list[tuple[torch.Tensor, list[object]]]
 
