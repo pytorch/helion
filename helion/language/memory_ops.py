@@ -62,6 +62,7 @@ from .._compiler.indexing_strategy import SubscriptIndexing
 from .._compiler.indexing_strategy import TileWithOffsetInfo
 from .._compiler.indexing_strategy import _get_tile_with_offset_info
 from .._compiler.pallas import codegen as pallas_codegen
+from .._compiler.utils import compute_slice_size
 from .._compiler.variable_origin import GridOrigin
 from .._compiler.variable_origin import TileBeginOrigin
 from .._compiler.variable_origin import TileCountOrigin
@@ -907,6 +908,38 @@ def _cute_index_exprs(
                 )
             result.append(inactive_slice_expr)
             tensor_dim += 1
+        elif isinstance(idx, slice) and (idx.step is None or idx.step == 1):
+            # Partial slice (e.g. :16, 16:, or 5:20)
+            if tensor is None:
+                raise exc.BackendUnsupported(
+                    "cute", "partial slice indexing without tensor"
+                )
+            dim_size = tensor.shape[tensor_dim]
+            slice_size = compute_slice_size(idx, dim_size)
+            start = idx.start if idx.start is not None else 0
+            block_id = resolve_active_slice_block_id(slice_size, used_block_ids)
+            if block_id is not None:
+                idx_var = active_index_var(block_id)
+                assert idx_var is not None
+                used_block_ids.add(block_id)
+                if start == 0:
+                    result.append(idx_var)
+                else:
+                    start_expr = state.device_function.literal_expr(start)
+                    result.append(f"({start_expr} + {idx_var})")
+                tensor_dim += 1
+                continue
+            raise exc.BackendUnsupported(
+                "cute",
+                (
+                    "partial slice dimension is not active in this scope "
+                    f"(tensor_dim={pos}, size={slice_size})"
+                ),
+            )
+        elif isinstance(idx, slice):
+            raise exc.BackendUnsupported(
+                "cute", f"strided slices (step={idx.step}) are not supported"
+            )
         else:
             raise exc.BackendUnsupported("cute", f"index type: {type(idx)}")
     return result
@@ -2425,6 +2458,12 @@ def _cute_combined_mask(
             block_id = env.get_block_id(idx)
         elif isinstance(idx, slice) and idx == slice(None) and tensor is not None:
             for bid in _matching_block_ids(env, tensor.shape[tensor_dim]):
+                if bid not in seen and mask_var_for_block_id(bid) is not None:
+                    block_id = bid
+                    break
+        elif isinstance(idx, slice) and idx != slice(None) and tensor is not None:
+            slice_size = compute_slice_size(idx, tensor.shape[tensor_dim])
+            for bid in _matching_block_ids(env, slice_size):
                 if bid not in seen and mask_var_for_block_id(bid) is not None:
                     block_id = bid
                     break

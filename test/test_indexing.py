@@ -1860,7 +1860,6 @@ class TestIndexing(RefEagerTestBase, TestCase):
         expected = torch.zeros([N], device=DEVICE)
         torch.testing.assert_close(result, expected)
 
-    @xfailIfCute("slice-based stores not yet supported")
     @xfailIfPallas("slice-based stores not yet supported")
     def test_partial_slice(self):
         """Test both setter and getter for partial slices [:n] and [n:]"""
@@ -1878,7 +1877,6 @@ class TestIndexing(RefEagerTestBase, TestCase):
         result = kernel(src, dst)
         torch.testing.assert_close(result, src)
 
-    @xfailIfCute("slice-based stores not yet supported")
     @xfailIfPallas("slice-based stores not yet supported")
     def test_partial_slice_dim0(self):
         """Test partial slices on dim 0 (the tiled dimension)"""
@@ -1894,6 +1892,75 @@ class TestIndexing(RefEagerTestBase, TestCase):
         dst = torch.zeros([64, 32], device=DEVICE)
         result = kernel(src, dst)
         torch.testing.assert_close(result, src)
+
+    @xfailIfPallas("slice-based stores not yet supported")
+    def test_partial_slice_unaligned(self):
+        """Test non-power-of-2 slice boundary for load and store"""
+
+        @helion.kernel(autotune_effort="none")
+        def kernel(src: torch.Tensor, dst: torch.Tensor) -> torch.Tensor:
+            for tile in hl.tile(src.size(0)):
+                dst[tile, :13] = src[tile, :13]
+            return dst
+
+        src = torch.randn([16, 16], device=DEVICE)
+        dst = torch.zeros([16, 13], device=DEVICE)
+        result = kernel(src, dst)
+        torch.testing.assert_close(result, src[:, :13])
+
+    # NOTE: concat and unaligned_multi use multiple differently-sized
+    # partial slices in one kernel.  CuTe's thread axis assignment
+    # collides when two reduction blocks of different sizes map to the
+    # same axis.  Triton-only until the CuTe thread mapping is fixed.
+
+    @xfailIfCute("CuTe thread axis collision with differently-sized reduction blocks")
+    @xfailIfPallas("slice-based stores not yet supported")
+    def test_partial_slice_unaligned_multi(self):
+        """Test multiple non-power-of-2 slices in one kernel"""
+
+        @helion.kernel(autotune_effort="none")
+        def kernel(
+            src: torch.Tensor, dst: torch.Tensor, out: torch.Tensor
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            for tile in hl.tile(src.size(0)):
+                dst[tile, :13] = 1.0
+                dst[tile, 13:] = 2.0
+                out[tile, :] = src[tile, :13]
+            return dst, out
+
+        src = torch.randn([16, 16], device=DEVICE)
+        dst = torch.zeros([16, 16], device=DEVICE)
+        out = torch.zeros([16, 13], device=DEVICE)
+        dst_result, out_result = kernel(src, dst, out)
+        expected_dst = torch.zeros([16, 16], device=DEVICE)
+        expected_dst[:, :13] = 1.0
+        expected_dst[:, 13:] = 2.0
+        torch.testing.assert_close(dst_result, expected_dst)
+        torch.testing.assert_close(out_result, src[:, :13])
+
+    @xfailIfCute("CuTe thread axis collision with differently-sized reduction blocks")
+    @xfailIfPallas("slice-based stores not yet supported")
+    def test_partial_slice_concat(self):
+        """Test concat via full-slice load + partial-slice store"""
+
+        @helion.kernel(autotune_effort="none")
+        def kernel(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            out = torch.empty(
+                [x.size(0), x.size(1) + y.size(1)],
+                device=x.device,
+                dtype=x.dtype,
+            )
+            n1 = x.size(1)
+            for tile_m in hl.tile(x.size(0)):
+                out[tile_m, :n1] = x[tile_m, :]
+                out[tile_m, n1:] = y[tile_m, :]
+            return out
+
+        x = torch.randn([32, 16], device=DEVICE)
+        y = torch.randn([32, 24], device=DEVICE)
+        result = kernel(x, y)
+        expected = torch.cat([x, y], dim=1)
+        torch.testing.assert_close(result, expected)
 
     def test_broadcast(self):
         """Test both setter from scalar and getter for [:, i]"""
