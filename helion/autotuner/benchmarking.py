@@ -61,22 +61,29 @@ def _make_cudagraph_replay(fn: Callable[[], T]) -> Callable[[], T]:
     return replay
 
 
-def _maybe_cudagraph_replay(
+def _get_cudagraph_replay(
     fn: Callable[[], T], *, default_enabled: bool = False
-) -> Callable[[], T]:
+) -> tuple[Callable[[], T], bool]:
     if not _env_get_bool(_BENCHMARK_CUDAGRAPH_ENV, default=default_enabled):
-        return fn
+        return fn, False
 
     reason = _cudagraph_unavailable_reason()
     if reason is not None:
         _log.debug("Skipping CUDA graph benchmarking: %s", reason)
-        return fn
+        return fn, False
 
     try:
-        return _make_cudagraph_replay(fn)
+        return _make_cudagraph_replay(fn), True
     except Exception:
         _log.debug("CUDA graph benchmark capture failed; falling back", exc_info=True)
-        return fn
+        return fn, False
+
+
+def _maybe_cudagraph_replay(
+    fn: Callable[[], T], *, default_enabled: bool = False
+) -> Callable[[], T]:
+    replay, _captured = _get_cudagraph_replay(fn, default_enabled=default_enabled)
+    return replay
 
 
 def clear_jit_fast_path_caches(
@@ -214,28 +221,36 @@ def compute_repeat_generic(
     return max(min_repeat, min(max_repeat, max(1, repeat)))
 
 
-def interleaved_bench(
-    fns: list[Callable[[], object]],
-    *,
-    repeat: int,
-    desc: str | None = None,
-    default_cudagraph: bool = False,
-) -> list[float]:
-    """
-    Benchmark multiple functions at once, interleaving their executions to reduce
-    the impact of external factors (e.g., load, temperature) on the
-    measurements.
+def _warmup_fns(fns: list[Callable[[], object]]) -> None:
+    """Run each function once eagerly and block until it finishes.
 
-    Args:
-        fns: List of functions to benchmark
-        repeat: Number of times to repeat each benchmark
-        desc: Optional description for progress bar
+    This warms up the *original* eager launch (compilation, autotuning, lazy
+    allocations) before any CUDA-graph capture, so capture records only the
+    steady-state launch. The original ``do_bench``/``interleaved_bench`` warmed
+    up here -- before ``_maybe_cudagraph_replay`` -- so we keep that ordering.
     """
     from triton import runtime
 
-    # warmup
     for fn in fns:
         fn()
+    runtime.driver.active.get_device_interface().synchronize()  # type: ignore[attr-defined]
+
+
+def _interleaved_bench_timed(
+    benchmark_functions: list[Callable[[], object]],
+    *,
+    repeat: int,
+    desc: str | None = None,
+) -> list[float]:
+    """Event-time pre-wrapped functions, interleaving their executions.
+
+    ``benchmark_functions`` are already in their final launch form (e.g. wrapped
+    as CUDA-graph replays) and already warmed up by the caller; this helper does
+    no warmup and no further wrapping, so callers that have already captured
+    replays avoid a redundant second capture.
+    """
+    from triton import runtime
+
     clear_cache = functools.partial(
         runtime.driver.active.clear_cache,  # type: ignore[attr-defined]
         runtime.driver.active.get_empty_cache_for_benchmark(),  # type: ignore[attr-defined]
@@ -243,16 +258,15 @@ def interleaved_bench(
     clear_cache()
     di = runtime.driver.active.get_device_interface()  # type: ignore[attr-defined]
     start_events = [
-        [di.Event(enable_timing=True) for _ in range(repeat)] for _ in range(len(fns))
+        [di.Event(enable_timing=True) for _ in range(repeat)]
+        for _ in range(len(benchmark_functions))
     ]
     end_events = [
-        [di.Event(enable_timing=True) for _ in range(repeat)] for _ in range(len(fns))
+        [di.Event(enable_timing=True) for _ in range(repeat)]
+        for _ in range(len(benchmark_functions))
     ]
 
     di.synchronize()
-    benchmark_functions = [
-        _maybe_cudagraph_replay(fn, default_enabled=default_cudagraph) for fn in fns
-    ]
 
     # When a description is supplied we show a progress bar so the user can
     # track the repeated benchmarking loop.
@@ -277,8 +291,33 @@ def interleaved_bench(
                 for s, e in zip(start_events[j], end_events[j], strict=True)
             ]
         )
-        for j in range(len(fns))
+        for j in range(len(benchmark_functions))
     ]
+
+
+def interleaved_bench(
+    fns: list[Callable[[], object]],
+    *,
+    repeat: int,
+    desc: str | None = None,
+    default_cudagraph: bool = False,
+) -> list[float]:
+    """
+    Benchmark multiple functions at once, interleaving their executions to reduce
+    the impact of external factors (e.g., load, temperature) on the
+    measurements.
+
+    Args:
+        fns: List of functions to benchmark
+        repeat: Number of times to repeat each benchmark
+        desc: Optional description for progress bar
+    """
+    # Warm up the eager launches before any capture (see _warmup_fns).
+    _warmup_fns(fns)
+    benchmark_functions = [
+        _maybe_cudagraph_replay(fn, default_enabled=default_cudagraph) for fn in fns
+    ]
+    return _interleaved_bench_timed(benchmark_functions, repeat=repeat, desc=desc)
 
 
 def interleaved_bench_generic(
@@ -316,6 +355,40 @@ def interleaved_bench_generic(
             all_times[j].append((end - start) * 1000)  # convert to ms
 
     return [statistics.median(times) for times in all_times]
+
+
+def interleaved_bench_cudagraph_generic(
+    fns: list[Callable[[], object]],
+    *,
+    repeat: int,
+    desc: str | None = None,
+    default_cudagraph: bool = False,
+) -> list[float]:
+    """Interleaved benchmark that times CUDA-graph replay when available.
+
+    Used by the CuTe autotuner when ``HELION_BENCHMARK_CUDAGRAPH=1`` so replay
+    timing reflects device execution rather than Python launch overhead. When
+    capture is unavailable for any candidate, the whole comparison falls back
+    to the synchronized wall-clock path for a consistent ranking basis.
+    """
+    # Warm up the eager launches before any capture (see _warmup_fns).
+    _warmup_fns(fns)
+    benchmark_functions: list[Callable[[], object]] = []
+    for fn in fns:
+        benchmark_function, captured = _get_cudagraph_replay(
+            fn, default_enabled=default_cudagraph
+        )
+        if not captured:
+            return interleaved_bench_generic(
+                fns,
+                repeat=repeat,
+                desc=desc,
+                default_cudagraph=default_cudagraph,
+            )
+        benchmark_functions.append(benchmark_function)
+    # The replays are already captured; time them directly so we don't wrap
+    # each one in a second CUDA graph.
+    return _interleaved_bench_timed(benchmark_functions, repeat=repeat, desc=desc)
 
 
 def paired_device_micros_bench(
@@ -528,15 +601,8 @@ def do_bench(
     :param return_mode: The statistical measure to return. Options are "min", "max", "mean", "median", or "all". Default is "mean".
     :type return_mode: str
     """
-    from triton import runtime
-    from triton.testing import _summarize_statistics
-
-    assert return_mode in ["min", "max", "mean", "median", "all"]
-
-    di = runtime.driver.active.get_device_interface()  # pyrefly: ignore
-
-    fn()
-    di.synchronize()
+    # Warm up the eager launch before any capture (see _warmup_fns).
+    _warmup_fns([fn])
     # Backward benchmarks mutate grad fields between iterations, so keep their
     # existing launch path.
     benchmark_function = (
@@ -544,6 +610,40 @@ def do_bench(
         if grad_to_none is not None
         else _maybe_cudagraph_replay(fn, default_enabled=default_cudagraph)
     )
+    return _do_bench_timed(
+        benchmark_function,
+        warmup=warmup,
+        rep=rep,
+        grad_to_none=grad_to_none,
+        quantiles=quantiles,
+        return_mode=return_mode,
+        process_group_name=process_group_name,
+    )
+
+
+def _do_bench_timed(
+    benchmark_function: Callable[[], Any],
+    *,
+    warmup: int,
+    rep: int,
+    grad_to_none: torch.Tensor | None,
+    quantiles: list[float] | None,
+    return_mode: str,
+    process_group_name: str | None,
+) -> float | tuple[float, ...]:
+    """Event-time a pre-wrapped benchmark function.
+
+    ``benchmark_function`` is already in its final launch form (e.g. a captured
+    CUDA-graph replay) and already warmed up by the caller; this helper does no
+    warmup and no wrapping, so callers that already captured a replay avoid a
+    redundant second capture.
+    """
+    from triton import runtime
+    from triton.testing import _summarize_statistics
+
+    assert return_mode in ["min", "max", "mean", "median", "all"]
+
+    di = runtime.driver.active.get_device_interface()  # pyrefly: ignore
 
     cache = runtime.driver.active.get_empty_cache_for_benchmark()  # pyrefly: ignore
 
@@ -637,3 +737,64 @@ def do_bench_generic(
         t1 = time.perf_counter()
         times.append((t1 - t0) * 1000)  # convert to ms
     return _summarize_statistics_fallback(times, quantiles, return_mode)
+
+
+def do_bench_cudagraph_generic(
+    fn: Callable[[], Any],
+    warmup: int = 25,
+    rep: int = 100,
+    grad_to_none: torch.Tensor | None = None,
+    quantiles: list[float] | None = None,
+    return_mode: str = "mean",
+    process_group_name: str | None = None,
+    *,
+    default_cudagraph: bool = False,
+) -> float | tuple[float, ...]:
+    """Benchmark wall-clock backends via CUDA-graph replay when possible.
+
+    The CuTe backend needs wall-clock timing for eager launches because CUDA
+    events mis-time the Python-heavy dispatch path, but once the launch is
+    captured into a CUDA graph the replay can be timed accurately with events.
+    If capture is unavailable, this falls back to the synchronized wall-clock
+    implementation.
+    """
+    if grad_to_none is not None:
+        return do_bench_generic(
+            fn,
+            warmup=warmup,
+            rep=rep,
+            grad_to_none=grad_to_none,
+            quantiles=quantiles,
+            return_mode=return_mode,
+            process_group_name=process_group_name,
+            default_cudagraph=False,
+        )
+
+    # Warm up the eager launch before any capture (see _warmup_fns).
+    _warmup_fns([fn])
+    benchmark_function, captured = _get_cudagraph_replay(
+        fn, default_enabled=default_cudagraph
+    )
+    if not captured:
+        return do_bench_generic(
+            fn,
+            warmup=warmup,
+            rep=rep,
+            grad_to_none=grad_to_none,
+            quantiles=quantiles,
+            return_mode=return_mode,
+            process_group_name=process_group_name,
+            default_cudagraph=default_cudagraph,
+        )
+
+    # The replay is already captured; time it directly so we don't wrap it in a
+    # second CUDA graph.
+    return _do_bench_timed(
+        benchmark_function,
+        warmup=warmup,
+        rep=rep,
+        grad_to_none=grad_to_none,
+        quantiles=quantiles,
+        return_mode=return_mode,
+        process_group_name=process_group_name,
+    )

@@ -3620,18 +3620,29 @@ class CuteBackend(Backend):
         # The default Triton do_bench uses CUDA events that mis-time the CuTe
         # path on Blackwell - launches show up as ~5ms when the kernel is
         # actually 250ms+. Use synchronized wall-clock timing instead so
-        # autotune scores reflect real performance.
+        # autotune scores reflect real performance. When the user explicitly
+        # enables CUDA-graph benchmarking, replay removes the Python launch
+        # path and CUDA events become reliable again.
+        from ..autotuner.benchmarking import do_bench_cudagraph_generic
         from ..autotuner.benchmarking import do_bench_generic
+        from ..runtime.settings import _env_get_bool
 
+        if _env_get_bool("HELION_BENCHMARK_CUDAGRAPH", default=False):
+            return do_bench_cudagraph_generic
         return do_bench_generic
 
     def get_interleaved_bench(self) -> Callable[..., list[float]]:
         # Same rationale as get_do_bench: the default interleaved bench uses
         # CUDA events that mis-time the CuTe path. Use the synchronized
         # wall-clock fallback so the autotuner's interleaved compare path
-        # produces real timings.
+        # produces real timings. Under explicit CUDA-graph benchmarking, the
+        # replay path can use event timing accurately.
+        from ..autotuner.benchmarking import interleaved_bench_cudagraph_generic
         from ..autotuner.benchmarking import interleaved_bench_generic
+        from ..runtime.settings import _env_get_bool
 
+        if _env_get_bool("HELION_BENCHMARK_CUDAGRAPH", default=False):
+            return interleaved_bench_cudagraph_generic
         return interleaved_bench_generic
 
     def autotune(

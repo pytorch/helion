@@ -146,3 +146,110 @@ def test_cudagraph_auto_skips_nested_capture(monkeypatch):
         return "nested"
 
     assert benchmarking._maybe_cudagraph_replay(fn) is fn
+
+
+def test_cute_cudagraph_bench_uses_replay_timer(monkeypatch):
+    seen = []
+
+    def replay():
+        return "replay"
+
+    def fake_get_replay(fn, *, default_enabled=False):
+        seen.append(("get_replay", default_enabled))
+        return replay, True
+
+    def fake_do_bench_timed(fn, **kwargs):
+        # The timed helper takes no cudagraph flag: it never re-wraps.
+        seen.append(("do_bench_timed", fn, "default_cudagraph" in kwargs))
+        return 1.25
+
+    def fake_warmup(fns):
+        seen.append(("warmup", len(fns)))
+
+    monkeypatch.setattr(benchmarking, "_warmup_fns", fake_warmup)
+    monkeypatch.setattr(benchmarking, "_get_cudagraph_replay", fake_get_replay)
+    monkeypatch.setattr(benchmarking, "_do_bench_timed", fake_do_bench_timed)
+
+    result = benchmarking.do_bench_cudagraph_generic(
+        lambda: "plain",
+        return_mode="median",
+        default_cudagraph=True,
+    )
+
+    assert result == 1.25
+    # Eager warmup happens before capture, then the replay is timed directly.
+    assert seen == [
+        ("warmup", 1),
+        ("get_replay", True),
+        ("do_bench_timed", replay, False),
+    ]
+
+
+def test_cute_cudagraph_bench_falls_back_to_wall_clock(monkeypatch):
+    seen = []
+
+    def fake_get_replay(fn, *, default_enabled=False):
+        seen.append(("get_replay", default_enabled))
+        return fn, False
+
+    def fake_generic(fn, **kwargs):
+        seen.append(("generic", kwargs["default_cudagraph"]))
+        return 2.5
+
+    def fake_warmup(fns):
+        seen.append(("warmup", len(fns)))
+
+    monkeypatch.setattr(benchmarking, "_warmup_fns", fake_warmup)
+    monkeypatch.setattr(benchmarking, "_get_cudagraph_replay", fake_get_replay)
+    monkeypatch.setattr(benchmarking, "do_bench_generic", fake_generic)
+
+    result = benchmarking.do_bench_cudagraph_generic(
+        lambda: "plain",
+        return_mode="median",
+        default_cudagraph=True,
+    )
+
+    assert result == 2.5
+    assert seen == [
+        ("warmup", 1),
+        ("get_replay", True),
+        ("generic", True),
+    ]
+
+
+def test_cute_interleaved_cudagraph_bench_uses_replay_timer(monkeypatch):
+    seen = []
+
+    def fake_get_replay(fn, *, default_enabled=False):
+        seen.append(("get_replay", default_enabled))
+        return fn, True
+
+    def fake_interleaved_timed(fns, *, repeat, desc=None):
+        # The timed helper takes no cudagraph flag: it never re-wraps.
+        seen.append(("interleaved_timed", len(fns), repeat, desc))
+        return [1.0, 2.0]
+
+    def fake_warmup(fns):
+        seen.append(("warmup", len(fns)))
+
+    monkeypatch.setattr(benchmarking, "_warmup_fns", fake_warmup)
+    monkeypatch.setattr(benchmarking, "_get_cudagraph_replay", fake_get_replay)
+    monkeypatch.setattr(
+        benchmarking, "_interleaved_bench_timed", fake_interleaved_timed
+    )
+
+    result = benchmarking.interleaved_bench_cudagraph_generic(
+        [lambda: "a", lambda: "b"],
+        repeat=7,
+        desc="cg",
+        default_cudagraph=True,
+    )
+
+    assert result == [1.0, 2.0]
+    # All eager launches warm up before any capture.
+    assert seen == [
+        ("warmup", 2),
+        ("get_replay", True),
+        ("get_replay", True),
+        ("interleaved_timed", 2, 7, "cg"),
+    ]

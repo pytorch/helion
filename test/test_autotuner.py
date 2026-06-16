@@ -4059,6 +4059,17 @@ class TestAutotuneBudget(TestCase):
         self.assertTrue(provider._subprocess_benchmark_enabled())
         self.assertTrue(provider._subprocess_benchmark_uses_wall_clock())
 
+    def test_cute_cudagraph_benchmark_stays_in_process(self) -> None:
+        from helion._compiler.backend import CuteBackend
+
+        provider = self._make_stub_provider()
+        provider.kernel.supports_subprocess_benchmark = lambda: True
+        provider.config_spec = SimpleNamespace(backend=CuteBackend())
+
+        with patch.dict(os.environ, {"HELION_BENCHMARK_CUDAGRAPH": "1"}):
+            self.assertFalse(provider._subprocess_benchmark_enabled())
+            self.assertFalse(provider._subprocess_benchmark_uses_wall_clock())
+
     def test_non_cute_custom_benchmark_stays_in_process(self) -> None:
         from helion.autotuner.benchmarking import do_bench_generic
 
