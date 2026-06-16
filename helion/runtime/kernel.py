@@ -928,11 +928,108 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
             config: The configuration to set.
         """
         config = self._normalize_config(config)
-        self._run = self.compile_config(config)
+        compiled = self.compile_config(config)
+        # Clone the compiled function so each BoundKernel has its own
+        # ``__kwdefaults__`` to mutate. ``compile_config`` returns functions
+        # loaded via ``PyCodeCache``, which keys on source hash — two
+        # BoundKernels for the same kernel (e.g. cuda:0 vs cuda:1) can
+        # generate IDENTICAL Triton source, share a function object, and an
+        # in-place ``__kwdefaults__["_launcher"] = ...`` in
+        # :meth:`_install_fast_launcher` would clobber the earlier
+        # BoundKernel's launcher.
+        run = types.FunctionType(
+            compiled.__code__,
+            compiled.__globals__,
+            compiled.__name__,
+            compiled.__defaults__,
+            compiled.__closure__,
+        )
+        if compiled.__kwdefaults__ is not None:
+            run.__kwdefaults__ = dict(compiled.__kwdefaults__)
+        self._install_fast_launcher(run, config)
+        self._run = run
         self._config = config
         counters["best_config_decorator"][
             self.format_kernel_decorator(config, self.settings)
         ] = 1
+
+    def _install_fast_launcher(
+        self,
+        compiled: CompiledConfig,
+        config: Config,
+    ) -> None:
+        """Re-point ``compiled``'s ``_launcher`` kwarg default at a fast closure.
+
+        The generated host wrapper declares
+        ``def add(x, y, *, _launcher=_default_launcher)``; Python stores the
+        ``_default_launcher`` value in ``compiled.__kwdefaults__``. By
+        overwriting that entry with a :class:`helion.runtime._FastLauncher`
+        closure (built once with this config's ``num_warps`` / ``num_stages``
+        / etc. baked in), every direct call to ``compiled(*args)`` —
+        including from ``BoundKernel.__call__`` on the steady-state hot
+        path — uses the fast launcher with no extra Python wrapping.
+
+        The autotune trial harness and any external caller that explicitly
+        passes ``_launcher=`` overrides the kwdefault automatically, so
+        this is safe.
+
+        Non-Triton backends and any priming failure cause the kwdefault to
+        be left at :func:`default_launcher`. Setting the env var
+        ``HELION_SKIP_FAST_LAUNCHER=1`` (or ``true`` / ``yes``) is an
+        escape hatch: the fast launcher is not installed and every
+        Helion call goes through ``default_launcher`` (= Triton's
+        ``JITFunction.run``). Useful for quickly bisecting whether a
+        bug is in the fast launcher itself.
+        """
+        import os
+
+        from .._compiler.backend import TritonBackend
+        from ._fast_launcher import build_fast_launcher
+
+        if os.environ.get("HELION_SKIP_FAST_LAUNCHER", "").lower() in (
+            "1",
+            "true",
+            "yes",
+        ):
+            return
+
+        backend = self.env.backend
+        if not isinstance(backend, TritonBackend):
+            return
+        kwdefaults = getattr(compiled, "__kwdefaults__", None)
+        if not kwdefaults or "_launcher" not in kwdefaults:
+            # No ``_launcher`` kwonly default — nothing to wire up.
+            # (Should not happen for Helion-compiled Triton kernels.)
+            return
+
+        try:
+            kwargs = backend.launcher_runtime_kwargs(
+                config, has_barrier=self._env.has_barrier
+            )
+        except Exception:
+            log.debug(
+                "FastLauncher disabled: backend.launcher_runtime_kwargs raised",
+                exc_info=True,
+            )
+            return
+
+        num_warps = cast("int", kwargs.pop("num_warps"))
+        num_stages = cast("int", kwargs.pop("num_stages"))
+        launch_cooperative_grid = cast(
+            "bool", kwargs.pop("launch_cooperative_grid", False)
+        )
+        ptx_options = cast("str | None", kwargs.pop("ptx_options", None))
+        # Anything left in kwargs (backend tunable keys, maxnreg,
+        # _triton_config_*) is forwarded as ``extra_kwargs`` to be baked
+        # into the closure.
+        fast_launcher = build_fast_launcher(
+            num_warps=num_warps,
+            num_stages=num_stages,
+            launch_cooperative_grid=launch_cooperative_grid,
+            ptx_options=ptx_options,
+            extra_kwargs=kwargs or None,
+        )
+        kwdefaults["_launcher"] = fast_launcher
 
     def _specialize_extra(self) -> list[Callable[[Sequence[object]], Hashable]]:
         """
