@@ -399,7 +399,7 @@ def _get_loop_begin_and_end(
     """Extract the begin and end values from the _for_loop state args.
 
     Under ``compact_worklist`` the compact tile's begin/end are remapped to the
-    per-work-item metadata refs (the single seam from the design): begin =
+    per-work-item metadata refs: begin =
     ``tile_starts_ref[_wid]``, end =
     ``tile_starts_ref[_wid] + tile_extents_ref[_wid]`` (and likewise the ordered
     axis -> ``range_start_ref``/``range_len_ref``).  Every downstream consumer

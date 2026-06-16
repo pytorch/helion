@@ -1,7 +1,6 @@
 """Tests for the ``compact_worklist`` Pallas loop type.
 
-Layered bottom-up so each layer is tested before the next depends on it
-(PR plan §5, design §8):
+Layered bottom-up so each layer is tested before the next depends on it:
 
 1. Builder unit tests (this file, ``TestCompactWorklistBuilder``) -- pure JAX,
    CPU-only, no Helion compiler.  Assert :func:`flatten_worklist` matches a slow
@@ -86,7 +85,7 @@ def _python_flatten_reference(base, length, block, *, dep_base=None, dep_len=Non
 @onlyBackends(["pallas"])
 @unittest.skipUnless(HAS_JAX, "jax not available")
 class TestCompactWorklistBuilder(unittest.TestCase):
-    """Unit tests for :func:`flatten_worklist` (PR plan §5.1, design §8.1)."""
+    """Unit tests for :func:`flatten_worklist`."""
 
     def _check(self, lengths, block, *, dep_lengths=None):
         """Build with JAX and assert the valid range matches the reference."""
@@ -193,7 +192,7 @@ class TestCompactWorklistBuilder(unittest.TestCase):
 
 @onlyBackends(["pallas"])
 class TestResolveForWorklist(unittest.TestCase):
-    """resolve_for_worklist generality + leak-check (PR plan §5.2, design §8.2).
+    """resolve_for_worklist generality + leak-check.
 
     Proves "no +1 pattern-match": offsets[g+a] for arbitrary a, distinct
     begin/end tensors, and affine g*S forms all resolve, while a device/
@@ -261,7 +260,7 @@ def _plan(*, ordered, owner_indexed):
 
 @onlyBackends(["pallas"])
 class TestMetadataArgNames(unittest.TestCase):
-    """metadata_arg_names is policy-derived (PR plan §7)."""
+    """metadata_arg_names is policy-derived."""
 
     def test_args_by_shape(self):
         cases = [
@@ -484,7 +483,7 @@ class TestDetectAndGating(unittest.TestCase):
 @onlyBackends(["pallas"])
 @unittest.skipUnless(HAS_JAX, "jax not available")
 class TestBuildWorklistRender(unittest.TestCase):
-    """The generated jnp _build_worklist (design §3.1, PR plan Step 4).
+    """The generated jnp _build_worklist.
 
     Renders the builder from a real plan, execs it under JAX (CPU), and checks
     it matches the library flatten_worklist -- proving the resolver output drops
@@ -736,7 +735,7 @@ class TestHostBoundValidation(unittest.TestCase):
 
 @onlyBackends(["pallas"])
 class TestPolicyClassification(unittest.TestCase):
-    """Unsupported compact indexing is rejected, not silently dropped (#4)."""
+    """Unsupported compact indexing is rejected, not silently dropped."""
 
     def _grid_loop(self, src):
         return ast.parse(src).body[0]
@@ -766,7 +765,7 @@ class TestPolicyClassification(unittest.TestCase):
 
 @onlyBackends(["pallas"])
 class TestNoSilentFallback(unittest.TestCase):
-    """compact_worklist routes to the compact launcher, never the default (#1)."""
+    """compact_worklist routes to the compact launcher, never the default."""
 
     def _kernel(self, fn, **cfg):
         return helion.kernel(
@@ -863,7 +862,7 @@ def _eager_fully_jagged(q, k, v, qo, kvo):
 
 @onlyBackends(["pallas"])
 class TestUpperBoundPacking(unittest.TestCase):
-    """Only packed-offset bounds are accepted; non-packed is rejected (#main).
+    """Only packed-offset bounds are accepted; non-packed is rejected.
 
     The masked full-block store is only correct for monotonic owner offsets, so
     detection accepts only the packed-offsets idiom (begin=T[g], end=T[g+1]).
@@ -914,7 +913,7 @@ class TestUpperBoundPacking(unittest.TestCase):
 
 @onlyBackends(["pallas"])
 class TestConfigStateIsolation(unittest.TestCase):
-    """compact plan must not leak into a later config (review #main).
+    """compact plan must not leak into a later config.
 
     One CompileEnvironment is reused across all configs of a BoundKernel, and
     many lowering paths gate on ``env.compact_worklist_plan is not None``.  If a
@@ -951,7 +950,7 @@ class TestConfigStateIsolation(unittest.TestCase):
 
 @onlyBackends(["pallas"])
 class TestPrologueScoping(unittest.TestCase):
-    """Prologue assigns must stop at the selected loop (review #medium)."""
+    """Prologue assigns must stop at the selected loop."""
 
     def test_collect_stops_before_loop(self):
         from helion._compiler.pallas.compact_worklist import _collect_prologue_assigns
@@ -1057,9 +1056,8 @@ class TestCompactWorklistNumerics(unittest.TestCase):
 class TestCompactWorklistJaxExport(unittest.TestCase):
     """compact_worklist embeds in an outer ``jax.jit`` via ``Kernel.jax_fn``.
 
-    The original design said to reject compact_worklist under outer ``jax.jit``;
-    the implementation supports it (``pallas_jax_export.py``).  This guards that
-    pure-JAX export path: ``jax.jit(kernel.jax_fn)`` must match the eager result.
+    Guards the pure-JAX export path: ``jax.jit(kernel.jax_fn)`` must match the
+    eager result.
     """
 
     def test_jax_fn_under_jit_matches_eager(self):

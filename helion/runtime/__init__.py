@@ -2161,8 +2161,7 @@ def _pallas_compile_compact_jit_fn(
                 #    correct values -- and being later + serial, it deterministi-
                 #    cally wins.  With "parallel", a megacore split could place
                 #    the two adjacent sequences on different cores and race on the
-                #    shared boundary rows.  See backend.py for the full rationale
-                #    and the exact-store alternatives that were rejected.
+                #    shared boundary rows.
                 #
                 # KNOWN RISK: this rests on Mosaic running an "arbitrary" 1-D grid
                 # strictly sequentially in ascending order and never reordering or

@@ -1,9 +1,6 @@
 """JAX worklist builder for the ``compact_worklist`` Pallas loop type.
 
-This module is the *runtime* half of compact-worklist lowering (design:
-``COMPACT_WORKLIST_PLAN.md`` §3.1, PR plan §2 ``helion/runtime/compact_worklist.py``).
-It is pure JAX and unit-testable on CPU, with no dependency on the Helion
-compiler.
+Pure JAX and unit-testable on CPU, with no dependency on the Helion compiler.
 
 The generated, per-kernel ``_build_worklist(offsets...)`` (emitted by the
 compiler, see ``helion/_compiler/pallas/compact_worklist.py``) computes the

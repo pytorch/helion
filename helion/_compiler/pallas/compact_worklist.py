@@ -1,11 +1,8 @@
 """Compile-time plan + resolver for the ``compact_worklist`` Pallas loop type.
 
-This is the compiler half of compact-worklist lowering (design:
-``COMPACT_WORKLIST_PLAN.md`` §1/§4, PR plan §2
-``helion/_compiler/pallas/compact_worklist.py``).  It recognises the supported
-loop nest, captures each axis's ``(base, length)`` as resolvable host AST, and
-renders the per-kernel ``jnp`` gathers that feed the runtime
-:func:`helion.runtime.compact_worklist.flatten_worklist`.
+Recognises the supported jagged loop nest, captures each axis's ``(base,
+length)`` as resolvable host AST, and renders the per-kernel ``jnp`` gathers
+that feed :func:`helion.runtime.compact_worklist.flatten_worklist`.
 
 The pattern targeted (see ``examples/jagged_q_dense_kv_gdpa.py`` and
 ``examples/jagged_gdpa.py``)::
@@ -51,7 +48,7 @@ if TYPE_CHECKING:
 
 @dataclasses.dataclass(frozen=True)
 class Axis:
-    """One axis of the compacted loop nest (design Step 1, one type per role).
+    """One axis of the compacted loop nest (one type per role).
 
     ``base``/``length`` are host-evaluable ``ast.AST`` trees whose only free
     names are the owner loop var(s) and host tensors/constants -- they render,
@@ -69,7 +66,7 @@ class Axis:
 
 @dataclasses.dataclass(frozen=True)
 class TensorPolicy:
-    """Per-tensor access policy, derived from the indexing structure (§3).
+    """Per-tensor access policy, derived from the indexing structure.
 
     ``kind`` is one of ``compact_aligned_load`` (input indexed by the compact
     tile), ``compact_exact_store`` (output indexed by the compact tile),
@@ -77,8 +74,7 @@ class TensorPolicy:
     ``static_full`` (unaffected).  Only ``arg_name`` + ``kind`` drive lowering:
     the runtime builds BlockSpecs from launcher kwargs (``owner_ref_pos``,
     ``tile_start_ref_pos``, ``aligned_arg_indices``, ``block_spec_info``
-    ``grid_dims``), so the design-doc's richer per-policy fields (compact_dim,
-    owner_axis, sublane) are not needed and were dropped.
+    ``grid_dims``).
     """
 
     arg_name: str
@@ -154,7 +150,7 @@ def ordered_ref_names(plan: CompactWorklistPlan) -> tuple[str, str]:
 
 
 def metadata_arg_names(plan: CompactWorklistPlan) -> list[str]:
-    """THE single source of metadata arg order (PR plan §7).
+    """The single source of metadata arg order.
 
     ``owner_ids`` is always included: the owner coordinate is recovered from it
     (``work_<owner>_ref[wid]``) so the owner-grid prologue scalar loads
@@ -183,7 +179,7 @@ def metadata_field_names(plan: CompactWorklistPlan) -> list[str]:
 
 
 # ---------------------------------------------------------------------------
-# Resolver (design Step 3 [F1])
+# Resolver
 # ---------------------------------------------------------------------------
 
 
@@ -226,7 +222,7 @@ def resolve_for_worklist(
 
 
 # ---------------------------------------------------------------------------
-# Generated jnp ``_build_worklist`` (design Step 4)
+# Generated jnp ``_build_worklist``
 # ---------------------------------------------------------------------------
 
 
@@ -288,7 +284,7 @@ def render_build_worklist(
     builder_name: str = "_build_worklist",
     owner_array: str = "parent",
 ) -> tuple[str, list[str]]:
-    """Render the module-level ``jnp`` ``_build_worklist`` source (design §3.1).
+    """Render the module-level ``jnp`` ``_build_worklist`` source.
 
     Returns ``(source, offset_params)``: the function source, and the ordered
     list of offsets-tensor parameter names it takes (one per axis in PR1's
@@ -355,7 +351,7 @@ def render_build_worklist(
 
 
 # ---------------------------------------------------------------------------
-# Detection (design Step 1/2)
+# Detection
 # ---------------------------------------------------------------------------
 
 
@@ -576,7 +572,7 @@ def _classify_tensor_policies(
     ordered_var: str | None,
     bound_tensors: set[str],
 ) -> tuple[TensorPolicy, ...]:
-    """Derive per-tensor policies from how each subscript is indexed (§3).
+    """Derive per-tensor policies from how each subscript is indexed.
 
     A first-dim index by the compact var -> ``compact_aligned_load`` (read) /
     ``compact_exact_store`` (write); by the owner var -> ``owner_indexed``; by

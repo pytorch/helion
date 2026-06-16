@@ -566,7 +566,7 @@ class WorklistProgramIDs(ProgramIDs):
     _wid]``) so owner-indexed tensors slice the right owner; ``codegen_grid``
     renders the **static** ``UPPER`` (megablocks bound) as the host grid
     positional, while the compact launcher overrides it with the traced
-    ``num_work`` (design §3 Step 8 / §6).
+    ``num_work``.
     """
 
     upper_expr: str = "1"
