@@ -35,6 +35,7 @@ if TYPE_CHECKING:
 
     from ..autotuner.config_fragment import ConfigSpecFragment
     from ..autotuner.config_priors import ValuePrior
+    from ..autotuner.config_spec import BlockSizeSpec
     from ..autotuner.config_spec import ConfigSpec
     from ..runtime.config import Config
     from ..runtime.kernel import BoundKernel
@@ -2064,7 +2065,7 @@ class PallasBackend(Backend):
 
     @staticmethod
     def _update_dim_size_for_jagged_flat(
-        spec: object,
+        spec: BlockSizeSpec,
         bid: int,
         requirement_alignment: int,
         observed_dim_sizes: dict[int, int],
