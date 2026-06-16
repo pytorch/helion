@@ -2527,7 +2527,6 @@ class TestExamples(RefEagerTestBase, TestCase):
             reduction_loops=[32768],
         )
 
-    @skipIfPallas("flex_attention requires torch.compile and closures")
     @skipIfRefEager("scalar_prefetch indexing not supported in ref interpreter")
     def test_flex_attention(self):
         z, h, n_ctx, head_dim = 2, 4, 256, 64
