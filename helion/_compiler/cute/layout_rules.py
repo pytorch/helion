@@ -22,7 +22,6 @@ from .layout import MatmulOperandAxes
 from .layout import ThreadLayout
 
 if TYPE_CHECKING:
-    from ..device_ir import GraphInfo
     from ..tile_dispatch import TileStrategyDispatch
 
     SymIntLike = torch.SymInt | int
@@ -51,7 +50,6 @@ def _clamp_threads(size: SymIntLike, num_threads: SymIntLike) -> SymIntLike:
 
 def preferred_constraint_for_node(
     node: torch.fx.Node,
-    graph_info: GraphInfo,
     tile_strategy: TileStrategyDispatch,
 ) -> LayoutConstraint | None:
     """Return a LayoutConstraint for *node*, or None if unconstrained.

@@ -96,6 +96,8 @@ import os
 
 from ..ast_extension import expr_from_string
 from ..ast_extension import statement_from_string
+from ._ast_pass_utils import _assignment_lhs_name
+from ._ast_pass_utils import _names_read
 
 _PIPE_COUNTER: list[int] = [0]
 
@@ -193,32 +195,6 @@ def _const_int_value(
     return None
 
 
-def _assignment_lhs_name(stmt: ast.stmt) -> str | None:
-    """If ``stmt`` is ``LHS = RHS`` with LHS a single ``ast.Name``, return LHS.id."""
-    if (
-        isinstance(stmt, ast.Assign)
-        and len(stmt.targets) == 1
-        and isinstance(stmt.targets[0], ast.Name)
-    ):
-        return stmt.targets[0].id
-    return None
-
-
-class _NameRefCollector(ast.NodeVisitor):
-    def __init__(self) -> None:
-        self.names: set[str] = set()
-
-    def visit_Name(self, node: ast.Name) -> None:
-        if isinstance(node.ctx, ast.Load):
-            self.names.add(node.id)
-
-
-def _names_read(node: ast.AST) -> set[str]:
-    c = _NameRefCollector()
-    c.visit(node)
-    return c.names
-
-
 def _is_vec_load_call(node: ast.expr) -> bool:
     """True if ``node`` is ``cute.arch.load(<ptr>, ir.VectorType.get([V], ...))``.
 
@@ -274,11 +250,6 @@ def _deep_copy_expr(node: ast.AST) -> ast.expr:
     result = expr_from_string(text)
     assert isinstance(result, ast.expr)
     return result
-
-
-def _format_step_expr(step: ast.expr) -> str:
-    """Render a STEP expression in a form suitable for ``next_off = tile_offset + STEP``."""
-    return ast.unparse(step)
 
 
 class _AssignTargetCollector(ast.NodeVisitor):

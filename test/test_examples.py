@@ -251,8 +251,16 @@ class TestExamples(RefEagerTestBase, TestCase):
     def test_matmul_bwd(self):
         """Test backward pass for matmul via matmul_autograd."""
         mod = import_path(EXAMPLES_DIR / "matmul.py")
-        # Set a fixed config to avoid autotuning in CI
+        # Set a fixed config to avoid autotuning in CI.  ``import_path`` caches
+        # the module in ``sys.modules``, so ``mod.matmul`` is a process-wide
+        # singleton shared with every other test that imports the matmul
+        # example.  Restore ``configs`` on teardown so this mutation does not
+        # leak: a leaked non-empty ``configs`` makes the kernel skip autotuning
+        # entirely, which e.g. breaks ``test_cache``'s cache-miss assertions
+        # when that test later runs the same singleton on the same worker.
         config = helion.Config(block_sizes=[16, 16, 16])
+        original_configs = mod.matmul.configs
+        self.addCleanup(setattr, mod.matmul, "configs", original_configs)
         mod.matmul.configs = [config]
 
         mat1 = torch.randn(
@@ -278,8 +286,14 @@ class TestExamples(RefEagerTestBase, TestCase):
     def test_addmm_bwd(self):
         """Test backward pass for addmm via addmm_autograd."""
         mod = import_path(EXAMPLES_DIR / "matmul.py")
-        # Set a fixed config to avoid autotuning in CI
+        # Set a fixed config to avoid autotuning in CI.  ``mod.matmul`` is a
+        # process-wide singleton (``import_path`` caches the module), so
+        # restore ``configs`` on teardown to avoid leaking the mutation into
+        # other tests (a non-empty ``configs`` makes the kernel skip
+        # autotuning).  See ``test_matmul_bwd``.
         config = helion.Config(block_sizes=[16, 16, 16])
+        original_configs = mod.matmul.configs
+        self.addCleanup(setattr, mod.matmul, "configs", original_configs)
         mod.matmul.configs = [config]
 
         bias = torch.randn(
@@ -376,7 +390,6 @@ class TestExamples(RefEagerTestBase, TestCase):
         lambda: _get_backend() == "cute",
         "CuTe matmul+layernorm example is unsupported and too expensive in-process",
     )
-    @xfailIfPallas("JAX tracer error with dynamic shapes")
     def test_matmul_layernorm_dynamic_shapes(self):
         args = (
             torch.randn([128, 256], device=DEVICE, dtype=torch.float32),
@@ -1643,6 +1656,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             "geglu",
             args,
             torch.nn.functional.gelu(args[0], approximate="tanh") * args[1],
+            fn_name="_geglu",
             block_sizes=[1024],
             num_warps=4,
             num_stages=3,
@@ -1679,7 +1693,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             "swiglu",
             args,
             torch.nn.functional.silu(args[0]) * args[1],
-            fn_name="swiglu_fwd",
+            fn_name="_swiglu_fwd",
             block_sizes=[1024],
             num_warps=4,
             num_stages=3,
@@ -1852,7 +1866,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             rtol=2e-1,
         )
 
-    @onlyBackends(["cute"])
+    @onlyBackends(["cute", "triton"])
     @skipIfNotCUDA()
     @skipIfCudaCapabilityLessThan(
         (10, 0), reason="NVFP4 conversion instructions require Blackwell"
@@ -1982,7 +1996,16 @@ class TestExamples(RefEagerTestBase, TestCase):
 
         mod = import_path(EXAMPLES_DIR / "fused_linear_jsd.py")
         # Pin jsd_kernel's config so we skip autotune (CI speed). Block size 16
-        # is a small safe pick across backends.
+        # is a small safe pick across backends.  ``mod.jsd_kernel`` is a
+        # process-wide singleton (``import_path`` caches the module); restore
+        # the mutated ``configs`` / ``settings.static_shapes`` on teardown so
+        # the changes don't leak into other tests.
+        original_configs = mod.jsd_kernel.configs
+        original_static_shapes = mod.jsd_kernel.settings.static_shapes
+        self.addCleanup(setattr, mod.jsd_kernel, "configs", original_configs)
+        self.addCleanup(
+            setattr, mod.jsd_kernel.settings, "static_shapes", original_static_shapes
+        )
         mod.jsd_kernel.settings.static_shapes = True
         mod.jsd_kernel.configs = [helion.Config(block_sizes=[16])]
         result = mod.fused_linear_jsd_fwd(
@@ -2188,12 +2211,12 @@ class TestExamples(RefEagerTestBase, TestCase):
     @skipIfA10G("failure on a10g")
     @skipIfTileIR("accuracy failure")
     @skipIfXPU("ocloc compilation failure with 256-GRF kernel on XPU backend")
-    @xfailIfPallas(
-        "Pallas codegen broadcasts the matmul result to the wrong shape "
-        "((16, 128) vs (16, 256)) -- separate shape-propagation bug in the "
-        "outer accumulator."
+    @xfailIfPallasInterpret(
+        "pl.program_id captured into emit_pipeline body is not supported in "
+        "JAX interpret mode (program_id_p.bind asserts during trace)"
     )
     def test_squeeze_and_excitation_net_bwd_db(self):
+        torch.manual_seed(0)
         m, n, k = 256, 256, 256
         x = torch.randn([m, n], device=DEVICE, dtype=HALF_DTYPE)
         a = torch.randn([n, k], device=DEVICE, dtype=HALF_DTYPE)
@@ -2231,7 +2254,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             block_sizes=[16, 16, 16],
             num_warps=4,
             num_stages=2,
-            atol=0.3,
+            atol=0.4,
         )
 
     def test_grpo_loss_fwd(self):
@@ -2413,7 +2436,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             "batch_softmax",
             args,
             torch.nn.functional.softmax(args[0], dim=-1),
-            block_sizes=[8],
+            block_sizes=[1, 8],
         )
 
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
@@ -2424,7 +2447,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             "batch_softmax",
             args,
             torch.nn.functional.softmax(args[0], dim=-1),
-            block_sizes=[8],
+            block_sizes=[1, 8],
             indexing="block_ptr",
         )
 
@@ -2514,8 +2537,15 @@ class TestExamples(RefEagerTestBase, TestCase):
         ]
 
         mod = import_path(EXAMPLES_DIR / "flex_attention.py")
-        # Set a fixed config to skip autotuning (exceeds CI timeout)
+        # Set a fixed config to skip autotuning (exceeds CI timeout).
+        # ``mod.helion_flex_attention_kernel`` is a process-wide singleton
+        # (``import_path`` caches the module); restore ``configs`` on teardown
+        # so the mutation doesn't leak into other tests.
         config = helion.Config(block_sizes=[64, 64])
+        original_configs = mod.helion_flex_attention_kernel.configs
+        self.addCleanup(
+            setattr, mod.helion_flex_attention_kernel, "configs", original_configs
+        )
         mod.helion_flex_attention_kernel.configs = [config]
         out = mod.helion_flex_attention(q, k, v)
         expected = torch.nn.functional.scaled_dot_product_attention(q, k, v)

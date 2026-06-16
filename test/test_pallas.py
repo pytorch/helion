@@ -1,12 +1,16 @@
 from __future__ import annotations
 
+import ast
 import math
 import os
+import re
 from typing import TYPE_CHECKING
 from typing import Any
 from typing import Callable
 import unittest
 
+from examples.geglu import _geglu_pallas as _geglu_pallas_example
+from examples.swiglu import _swiglu_fwd_pallas as _swiglu_fwd_pallas_example
 import torch
 from torch.testing._internal.common_utils import instantiate_parametrized_tests
 from torch.testing._internal.common_utils import parametrize
@@ -26,6 +30,15 @@ import helion.language as hl
 if TYPE_CHECKING:
     from helion.autotuner.base_search import PopulationBasedSearch
     from helion.autotuner.base_search import PopulationMember
+
+# N-D-tiled Pallas geglu/swiglu (#2725), re-wrapped on the pallas backend so the
+# example kernels get real correctness coverage under pallas interpret / TPU CI.
+_geglu_pallas = helion.kernel(
+    _geglu_pallas_example.fn, backend="pallas", static_shapes=True
+)
+_swiglu_fwd_pallas = helion.kernel(
+    _swiglu_fwd_pallas_example.fn, backend="pallas", static_shapes=True
+)
 
 
 @helion.kernel(backend="pallas", static_shapes=True)
@@ -720,6 +733,22 @@ class TestPallas(TestCase):
         args = (torch.randn(4096, device=DEVICE), torch.randn(4096, device=DEVICE))
         code, result = code_and_output(add_kernel, args, block_size=512)
         torch.testing.assert_close(result, args[0] + args[1])
+
+    def test_geglu_pallas_nd(self) -> None:
+        # N-D-tiled GEGLU (#2725): correctness on the pallas backend.
+        a = torch.randn(64, 128, device=DEVICE, dtype=torch.float32)
+        b = torch.randn(64, 128, device=DEVICE, dtype=torch.float32)
+        code, result = code_and_output(_geglu_pallas, (a, b), block_sizes=[16, 32])
+        expected = torch.nn.functional.gelu(a, approximate="tanh") * b
+        torch.testing.assert_close(result, expected, rtol=1e-3, atol=1e-3)
+
+    def test_swiglu_pallas_nd(self) -> None:
+        # N-D-tiled SwiGLU (#2725): correctness on the pallas backend.
+        a = torch.randn(64, 128, device=DEVICE, dtype=torch.float32)
+        b = torch.randn(64, 128, device=DEVICE, dtype=torch.float32)
+        code, result = code_and_output(_swiglu_fwd_pallas, (a, b), block_sizes=[16, 32])
+        expected = torch.nn.functional.silu(a) * b
+        torch.testing.assert_close(result, expected, rtol=1e-3, atol=1e-3)
 
     def test_store_slice_1d(self) -> None:
         """Store value sliced when block_size > tensor dim (1D)."""
@@ -3194,6 +3223,30 @@ class TestPallas(TestCase):
         self.assertIn("_pipeline_arg_indices=", code)
         torch.testing.assert_close(result, x * r)
 
+    def test_pipeline_begin_aligned_skips_pad(self) -> None:
+        # A block-aligned inner begin (the outer tile's offset) needs no boundary
+        # pad, so _ds_pad_dims must report extra_pad == 0 rather than block_size-1.
+        # Locks the pad-skip optimization (would be block_size-1 if it regressed).
+        x = torch.randn(64, 128, device=DEVICE, dtype=torch.float32)
+        r = torch.randn(64, 1, device=DEVICE, dtype=torch.float32)
+        code, result = code_and_output(
+            pallas_row_scale_mul,
+            (x, r),
+            block_sizes=[8],
+            pallas_loop_type="fori_loop",
+        )
+        torch.testing.assert_close(result, x * r)
+        match = re.search(r"_ds_pad_dims=(\[[^\]]*\])", code)
+        self.assertIsNotNone(match, "expected _ds_pad_dims in the launcher call")
+        pad_dims = ast.literal_eval(
+            match.group(1)
+        )  # [(arg, dim, block_size, extra_pad)]
+        self.assertTrue(pad_dims, "expected pl.ds pad dims to be present")
+        self.assertTrue(
+            all(extra_pad == 0 for *_, extra_pad in pad_dims),
+            f"block-aligned begin should skip the pad (extra_pad==0), got {pad_dims}",
+        )
+
     def test_squeeze_slice_access(self) -> None:
         """Test for the [None, :] indexing pattern (subscript index for slice >= tensor_ndim)"""
 
@@ -4071,6 +4124,37 @@ class TestPallas(TestCase):
         outer_min = spec.block_sizes[0].min_size
         inner_min = spec.block_sizes[1].min_size
         self.assertGreaterEqual(outer_min, inner_min)
+
+    def test_pallas_0d_tensor_arg(self) -> None:
+        """0D tensor arguments shouldn't cause positional argument shift in block specs."""
+
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def kernel_with_0d_arg(
+            x: torch.Tensor, scalar: torch.Tensor, y: torch.Tensor
+        ) -> torch.Tensor:
+            out = torch.zeros_like(x)
+            for tile_x, tile_y in hl.tile(
+                [x.size(0), x.size(1)], block_size=[128, 128]
+            ):
+                out[tile_x, tile_y] = (
+                    x[tile_x, tile_y] * hl.load(scalar, []) + y[tile_x, tile_y]
+                )
+            return out
+
+        M, N = 256, 256
+        x = torch.randn(M, N, device=DEVICE, dtype=torch.float32)
+        y = torch.randn(M, N, device=DEVICE, dtype=torch.float32)
+        scalar = torch.tensor(2.0, device=DEVICE, dtype=torch.float32)
+
+        from helion.runtime import Config
+
+        config = Config(pallas_loop_type="fori_loop")
+        code = kernel_with_0d_arg.bind((x, scalar, y)).to_code(config)
+
+        self.assertIn(
+            "_block_spec_info=[((128, 128), (0, 1)), None, ((128, 128), (0, 1)), ((128, 128), (0, 1))]",
+            code,
+        )
 
 
 @skipUnlessPallas("JAX/Pallas TPU not available")

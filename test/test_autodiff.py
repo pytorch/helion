@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import locale
 import operator
 import unittest
 
@@ -14,9 +15,19 @@ from helion._testing import skipIfNotTriton
 from helion._testing import skipIfXPU
 import helion.language as hl
 
+# Triton writes its generated launcher source with the process locale encoding;
+# force a UTF-8 locale so a non-UTF-8 worker doesn't fail to encode non-ASCII bytes.
+for _utf8_locale in ("C.UTF-8", "en_US.UTF-8", "C.utf8", "en_US.utf8"):
+    try:
+        locale.setlocale(locale.LC_CTYPE, _utf8_locale)
+        break
+    except locale.Error:
+        continue
+
 
 @skipIfMTIA("autodiff not tested on MTIA")
 @skipIfNotTriton("autodiff not tested on non Triton backends")
+@skipIfXPU("autodiff scan-path backward aborts in torch scan-HOP autograd on XPU")
 class TestAutodiff(RefEagerTestDisabled, TestCase):
     def _check_backward(
         self,
@@ -51,6 +62,7 @@ class TestAutodiff(RefEagerTestDisabled, TestCase):
             grad_shape = shape
         grad_out = torch.randn(*grad_shape, device=DEVICE, dtype=torch.float32)
 
+        kernel_fn.settings.autotune_effort = autotune_effort
         kernel_fn(*[inp.clone() for inp in inputs])
         result = helion.experimental.backward(
             kernel_fn,
@@ -241,7 +253,6 @@ class TestAutodiff(RefEagerTestDisabled, TestCase):
 
         self._check_backward(kernel, lambda x: x * torch.sin(x), 1)
 
-    @skipIfXPU("Timeout on XPU")
     def test_sin_squared(self):
         @helion.kernel(autotune_effort="none")
         def kernel(x: torch.Tensor) -> torch.Tensor:
@@ -274,7 +285,6 @@ class TestAutodiff(RefEagerTestDisabled, TestCase):
 
         self._check_backward(kernel, lambda x, y: torch.exp(x) * torch.sin(y), 2)
 
-    @skipIfXPU("Timeout on XPU")
     def test_sin_x_cos_y(self):
         @helion.kernel(autotune_effort="none")
         def kernel(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
@@ -320,26 +330,238 @@ class TestAutodiff(RefEagerTestDisabled, TestCase):
 
         self._check_backward(load_store_load, lambda x: torch.sin(x * 2), 1)
 
-    def test_error_multiple_tile_loops(self):
+    def test_matmul_multi_tile_loops(self):
         @helion.kernel(autotune_effort="none")
         def kernel(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
             m, k = a.shape
             _, n = b.shape
-            c = torch.zeros([m, n], dtype=a.dtype, device=a.device)
+            out = torch.empty(
+                [m, n],
+                dtype=torch.promote_types(a.dtype, b.dtype),
+                device=a.device,
+            )
             for tile_m, tile_n in hl.tile([m, n]):
-                acc = c[tile_m, tile_n]
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
                 for tile_k in hl.tile(k):
-                    acc = acc + a[tile_m, tile_k] @ b[tile_k, tile_n]
-                c[tile_m, tile_n] = acc
-            return c
+                    acc = torch.addmm(acc, a[tile_m, tile_k], b[tile_k, tile_n])
+                out[tile_m, tile_n] = acc
+            return out
 
-        a = torch.randn(32, 64, device=DEVICE, dtype=torch.float32)
-        b = torch.randn(64, 32, device=DEVICE, dtype=torch.float32)
-        kernel(a, b)
-        grad_out = torch.randn(32, 32, device=DEVICE, dtype=torch.float32)
+        self._check_backward(
+            kernel,
+            operator.matmul,
+            2,
+            shape=(32, 32),
+            inputs_fn=lambda: [
+                torch.randn(32, 64, device=DEVICE, dtype=torch.float32),
+                torch.randn(64, 32, device=DEVICE, dtype=torch.float32),
+            ],
+            rtol=1e-2,
+            atol=1e-2,
+        )
 
-        with self.assertRaises(helion.exc.AutodiffNotSupported):
-            helion.experimental.backward(kernel, grad_out, a, b)
+    def test_single_loop_matmul(self):
+        # A matmul fused into a *single* tile loop (the weight `w` is loaded
+        # fully). Its backward must tile only `m`, keep `w` whole, and accumulate
+        # grad_w across tiles (split-reduction) — not block-slice `w`.
+        @helion.kernel(autotune_effort="none", static_shapes=True)
+        def kernel(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+            m, _k = x.size()
+            _, n = w.size()
+            out = torch.empty([m, n], dtype=torch.float32, device=x.device)
+            for tile_m in hl.tile(m):
+                out[tile_m, :] = x[tile_m, :] @ w[:, :]
+            return out
+
+        self._check_backward(
+            kernel,
+            operator.matmul,
+            2,
+            shape=(64, 32),
+            inputs_fn=lambda: [
+                torch.randn(64, 48, device=DEVICE, dtype=torch.float32),
+                torch.randn(48, 32, device=DEVICE, dtype=torch.float32),
+            ],
+            rtol=1e-2,
+            atol=1e-2,
+        )
+
+    def test_single_loop_matmul_fused_pointwise(self):
+        # Matmul fused with a (smooth) pointwise op in one tile loop — the grad
+        # flows through the pointwise op into both matmul operands. A smooth op
+        # (sigmoid) avoids relu's kink, which makes element-wise comparison flaky.
+        @helion.kernel(autotune_effort="none", static_shapes=True)
+        def kernel(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+            m, _k = x.size()
+            _, n = w.size()
+            out = torch.empty([m, n], dtype=torch.float32, device=x.device)
+            for tile_m in hl.tile(m):
+                out[tile_m, :] = torch.sigmoid(x[tile_m, :] @ w[:, :])
+            return out
+
+        self._check_backward(
+            kernel,
+            lambda x, w: torch.sigmoid(x @ w),
+            2,
+            shape=(64, 32),
+            inputs_fn=lambda: [
+                torch.randn(64, 48, device=DEVICE, dtype=torch.float32),
+                torch.randn(48, 32, device=DEVICE, dtype=torch.float32),
+            ],
+            rtol=1e-2,
+            atol=1e-2,
+        )
+
+    def test_single_loop_matmul_bias(self):
+        # Linear layer `x @ w + b` in one tile loop — the most common pattern.
+        # The bias grad sums over the tiled `m` dim, so it must be a
+        # split-reduction; it must NOT make the kernel full-slice `m` (which
+        # would mis-tile the matmul). w-grad and b-grad both reduce over `m`.
+        @helion.kernel(autotune_effort="none", static_shapes=True)
+        def kernel(x: torch.Tensor, w: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+            m, _k = x.size()
+            _, n = w.size()
+            out = torch.empty([m, n], dtype=torch.float32, device=x.device)
+            for tile_m in hl.tile(m):
+                out[tile_m, :] = x[tile_m, :] @ w[:, :] + b[:]
+            return out
+
+        self._check_backward(
+            kernel,
+            lambda x, w, b: x @ w + b,
+            3,
+            shape=(64, 32),
+            inputs_fn=lambda: [
+                torch.randn(64, 48, device=DEVICE, dtype=torch.float32),
+                torch.randn(48, 32, device=DEVICE, dtype=torch.float32),
+                torch.randn(32, device=DEVICE, dtype=torch.float32),
+            ],
+            rtol=1e-2,
+            atol=1e-2,
+        )
+
+    def test_single_loop_batched_bmm(self):
+        # Batched bmm tiled over the batch dim: both operands are tiled, so each
+        # batch element's grad is per-tile (no cross-tile reduction). Must NOT
+        # be rejected just because there's no shared full weight.
+        @helion.kernel(autotune_effort="none", static_shapes=True)
+        def kernel(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+            bsz, m, _k = a.size()
+            _, _, n = b.size()
+            out = torch.empty([bsz, m, n], dtype=torch.float32, device=a.device)
+            for tile_b in hl.tile(bsz):
+                out[tile_b, :, :] = torch.bmm(a[tile_b, :, :], b[tile_b, :, :])
+            return out
+
+        self._check_backward(
+            kernel,
+            torch.bmm,
+            2,
+            shape=(8, 16, 10),
+            grad_shape=(8, 16, 10),
+            inputs_fn=lambda: [
+                torch.randn(8, 16, 12, device=DEVICE, dtype=torch.float32),
+                torch.randn(8, 12, 10, device=DEVICE, dtype=torch.float32),
+            ],
+            rtol=1e-2,
+            atol=1e-2,
+        )
+
+    def test_single_loop_hl_dot(self):
+        # Explicit hl.dot (instead of @) in a single tile loop. The compute-graph
+        # extraction must lower it to an aten matmul without its None defaults
+        # (acc/out_dtype) being clobbered into tensors.
+        @helion.kernel(autotune_effort="none", static_shapes=True)
+        def kernel(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+            m, _k = x.size()
+            _, n = w.size()
+            out = torch.empty([m, n], dtype=torch.float32, device=x.device)
+            for tile_m in hl.tile(m):
+                out[tile_m, :] = hl.dot(x[tile_m, :], w[:, :])
+            return out
+
+        self._check_backward(
+            kernel,
+            operator.matmul,
+            2,
+            shape=(64, 32),
+            inputs_fn=lambda: [
+                torch.randn(64, 48, device=DEVICE, dtype=torch.float32),
+                torch.randn(48, 32, device=DEVICE, dtype=torch.float32),
+            ],
+            rtol=1e-2,
+            atol=1e-2,
+        )
+
+    def test_single_loop_matmul_low_precision(self):
+        # fp16/bf16 matmul: the weight gradient must accumulate in fp32 (and be
+        # zero-initialized) — accumulating in the weight's low-precision dtype
+        # previously produced NaN.
+        @helion.kernel(autotune_effort="none", static_shapes=True)
+        def kernel(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+            m, _k = x.size()
+            _, n = w.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m in hl.tile(m):
+                out[tile_m, :] = (
+                    x[tile_m, :].to(torch.float32) @ w[:, :].to(torch.float32)
+                ).to(x.dtype)
+            return out
+
+        for dtype in (torch.float16, torch.bfloat16):
+            x = torch.randn(64, 48, device=DEVICE, dtype=dtype)
+            w = torch.randn(48, 32, device=DEVICE, dtype=dtype)
+            kernel(x.clone(), w.clone())
+            out = kernel(x.clone(), w.clone())
+            grad_out = torch.randn_like(out)
+            grad_x, grad_w = helion.experimental.backward(
+                kernel, grad_out, x.clone(), w.clone(), autotune_effort="none"
+            )
+            self.assertFalse(torch.isnan(grad_x).any(), f"{dtype} grad_x has NaN")
+            self.assertFalse(torch.isnan(grad_w).any(), f"{dtype} grad_w has NaN")
+            xp = x.clone().float().requires_grad_(True)
+            wp = w.clone().float().requires_grad_(True)
+            (xp @ wp).backward(grad_out.float())
+
+            # Norm-based check: low-precision grads are correct to their dtype's
+            # precision (a few small-magnitude elements carry fp16/bf16 rounding
+            # noise, so element-wise atol is the wrong metric here).
+            def relf(a: torch.Tensor, b: torch.Tensor) -> float:
+                return (a.float() - b).norm().item() / (b.norm().item() + 1e-12)
+
+            tol = 1e-2  # well above fp16 (~3e-4) / bf16 (~2e-3), well below "wrong"
+            self.assertLess(relf(grad_x, xp.grad), tol, f"{dtype} grad_x")
+            self.assertLess(relf(grad_w, wp.grad), tol, f"{dtype} grad_w")
+
+    def test_softmax_two_pass_multi_tile_loops(self):
+        @helion.kernel(autotune_effort="none")
+        def kernel(x: torch.Tensor) -> torch.Tensor:
+            m, n = x.size()
+            out = torch.empty_like(x)
+            block_size_m = hl.register_block_size(m)
+            block_size_n = hl.register_block_size(n)
+            for tile_m in hl.tile(m, block_size=block_size_m):
+                mi = hl.full([tile_m], float("-inf"), dtype=torch.float32)
+                di = hl.zeros([tile_m], dtype=torch.float32)
+                for tile_n in hl.tile(n, block_size=block_size_n):
+                    values = x[tile_m, tile_n]
+                    local_amax = torch.amax(values, dim=1)
+                    mi_next = torch.maximum(mi, local_amax)
+                    di = di * torch.exp(mi - mi_next) + torch.exp(
+                        values - mi_next[:, None]
+                    ).sum(dim=1)
+                    mi = mi_next
+                for tile_n in hl.tile(n, block_size=block_size_n):
+                    values = x[tile_m, tile_n]
+                    out[tile_m, tile_n] = torch.exp(values - mi[:, None]) / di[:, None]
+            return out
+
+        self._check_backward(
+            kernel,
+            lambda x: torch.nn.functional.softmax(x, dim=1),
+            1,
+            shape=(64, 32),
+        )
 
     def test_sum_reduction_square_shape(self):
         @helion.kernel(autotune_effort="none")
@@ -949,6 +1171,169 @@ class TestAutodiff(RefEagerTestDisabled, TestCase):
             shape=(64, 32),
             autotune=True,
             autotune_effort="quick",
+        )
+
+    def test_example_bmm(self):
+        from examples.bmm import bmm
+
+        # examples/bmm.py uses check(16, 512, 768, 1024)
+        B, M, K, N = 4, 32, 48, 64
+        self._check_backward(
+            bmm,
+            lambda a, b: torch.bmm(a, b),
+            2,
+            inputs_fn=lambda: [
+                torch.randn(B, M, K, device=DEVICE, dtype=torch.float32),
+                torch.randn(B, K, N, device=DEVICE, dtype=torch.float32),
+            ],
+            grad_shape=(B, M, N),
+            rtol=1e-2,
+            atol=1e-2,
+        )
+
+    def test_example_bmm_square(self):
+        from examples.bmm import bmm
+
+        B, M, K, N = 2, 32, 32, 32
+        self._check_backward(
+            bmm,
+            lambda a, b: torch.bmm(a, b),
+            2,
+            inputs_fn=lambda: [
+                torch.randn(B, M, K, device=DEVICE, dtype=torch.float32),
+                torch.randn(B, K, N, device=DEVICE, dtype=torch.float32),
+            ],
+            grad_shape=(B, M, N),
+            rtol=1e-2,
+            atol=1e-2,
+        )
+
+    def test_example_softmax(self):
+        from examples.softmax import softmax
+
+        # examples/softmax.py uses check(4096, 2560)
+        self._check_backward(
+            softmax,
+            lambda x: torch.nn.functional.softmax(x, dim=-1),
+            1,
+            shape=(256, 160),
+        )
+
+    def test_example_batch_softmax(self):
+        from examples.batch_softmax import batch_softmax
+
+        # examples/batch_softmax.py uses check(16, 512, 1024)
+        self._check_backward(
+            batch_softmax,
+            lambda x: torch.nn.functional.softmax(x, dim=-1),
+            1,
+            shape=(4, 32, 64),
+            rtol=1e-2,
+            atol=1e-2,
+        )
+
+    def test_example_geglu(self):
+        from examples.geglu import geglu
+
+        # examples/geglu.py uses 1D shape from config (typically 8192)
+        self._check_backward(
+            geglu,
+            lambda a, b: torch.nn.functional.gelu(a, approximate="tanh") * b,
+            2,
+            shape=(8192,),
+            rtol=1e-5,
+            atol=1e-5,
+        )
+
+    def test_example_swiglu(self):
+        from examples.swiglu import swiglu_fwd
+
+        # examples/swiglu.py uses 1D shape from config (typically 8192)
+        self._check_backward(
+            swiglu_fwd,
+            lambda a, b: torch.nn.functional.silu(a) * b,
+            2,
+            shape=(8192,),
+            rtol=1e-5,
+            atol=1e-5,
+        )
+
+    def test_example_matmul_layernorm(self):
+        from examples.matmul_layernorm import matmul_layernorm
+
+        # examples/matmul_layernorm.py uses check(32, 64, 200);
+        # use 128 (power-of-2) for clean block_size alignment
+        M, K, N = 32, 64, 128
+        self._check_backward(
+            matmul_layernorm,
+            lambda x, y, w, b: torch.nn.functional.layer_norm(x @ y, [N], w, b),
+            4,
+            inputs_fn=lambda: [
+                torch.randn(M, K, device=DEVICE, dtype=torch.float32),
+                torch.randn(K, N, device=DEVICE, dtype=torch.float32),
+                torch.randn(N, device=DEVICE, dtype=torch.float32),
+                torch.randn(N, device=DEVICE, dtype=torch.float32),
+            ],
+            grad_shape=(M, N),
+            rtol=1e-2,
+            atol=1e-2,
+        )
+
+    def test_example_attention(self):
+        from examples.attention import attention
+
+        # examples/attention.py uses test(2, 32, 1024, 64, HALF_DTYPE)
+        B, H, M, D = 2, 2, 64, 32
+        self._check_backward(
+            attention,
+            lambda q, k, v: torch.nn.functional.scaled_dot_product_attention(q, k, v),
+            3,
+            inputs_fn=lambda: [
+                torch.randn(B, H, M, D, device=DEVICE, dtype=torch.float32),
+                torch.randn(B, H, M, D, device=DEVICE, dtype=torch.float32),
+                torch.randn(B, H, M, D, device=DEVICE, dtype=torch.float32),
+            ],
+            grad_shape=(B, H, M, D),
+            rtol=1e-2,
+            atol=1e-2,
+        )
+
+    def test_example_attention_non_divisible_seqlen(self):
+        # Non-block-divisible sequence length: the scan zero-pads the key dim
+        # and must re-apply the forward's OOB mask, else the softmax is
+        # polluted. M=100 is not a multiple of typical block sizes.
+        from examples.attention import attention
+
+        B, H, M, D = 1, 2, 100, 32
+        self._check_backward(
+            attention,
+            lambda q, k, v: torch.nn.functional.scaled_dot_product_attention(q, k, v),
+            3,
+            inputs_fn=lambda: [
+                torch.randn(B, H, M, D, device=DEVICE, dtype=torch.float32),
+                torch.randn(B, H, M, D, device=DEVICE, dtype=torch.float32),
+                torch.randn(B, H, M, D, device=DEVICE, dtype=torch.float32),
+            ],
+            grad_shape=(B, H, M, D),
+            rtol=1e-2,
+            atol=1e-2,
+        )
+
+    def test_intermediate_buffer(self):
+        @helion.kernel(autotune_effort="none")
+        def kernel(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            temp = torch.empty_like(x)
+            for tile in hl.tile(x.shape):
+                temp[tile] = x[tile] * 2
+                out[tile] = temp[tile] + 1
+            return out
+
+        self._check_backward(
+            kernel,
+            lambda x: x * 2 + 1,
+            1,
+            shape=(64, 32),
         )
 
 

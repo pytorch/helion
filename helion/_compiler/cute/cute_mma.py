@@ -118,6 +118,21 @@ _TRACE_THROUGH_TARGETS = {
     # data shuffle.  Permuted operands fall back to scalar codegen.
 }
 
+# Extra forward-trace targets used ONLY for *output dtype* inference
+# (``_trace_mma_to_store_dtype``). These are the whitelisted fused-epilogue
+# aux-binary ops (e.g. the rowwise scale ``acc * scale[...]``). Tracing
+# through them only follows the chain to the store node and reads the store
+# *target tensor's* dtype, so it never changes the inferred dtype; it just
+# lets inference reach the store past a fused scale/bias step. This is needed
+# for fp8 inputs (whose ``input_dtype`` is never a valid epilogue output
+# dtype) so the plan picks up the real bf16/f16/f32 store dtype.
+_DTYPE_TRACE_EXTRA_TARGETS = {
+    torch.ops.aten.mul.Tensor,
+    torch.ops.aten.add.Tensor,
+    torch.ops.aten.sub.Tensor,
+    torch.ops.aten.div.Tensor,
+}
+
 # Register reallocation budget for tcgen05 warp-specialized kernels.
 # Producer warps (TMA loads, scheduler) only do address arithmetic and
 # barrier ops, so they can give back registers; consumer warps (MMA
@@ -443,7 +458,12 @@ def _has_mma_operands(lhs_node: Node, rhs_node: Node) -> bool:
         return False
     lhs_load, _, lhs_fake = lhs_info
     rhs_load, _, rhs_fake = rhs_info
-    supported = {torch.float16, torch.bfloat16, torch.float32}
+    supported = {
+        torch.float16,
+        torch.bfloat16,
+        torch.float32,
+        torch.float8_e4m3fn,
+    }
     return (
         lhs_fake.dtype in supported
         and rhs_fake.dtype in supported
@@ -1726,6 +1746,7 @@ def _trace_mma_to_store_dtype(
                 or target is _tracing_ops._new_var
                 or target is operator.getitem
                 or target in _TRACE_THROUGH_TARGETS
+                or target in _DTYPE_TRACE_EXTRA_TARGETS
             ):
                 stack.append(user)
                 continue
@@ -1778,6 +1799,7 @@ def _emit_mma_pipeline(
         torch.float16: "cutlass.Float16",
         torch.bfloat16: "cutlass.BFloat16",
         torch.float32: "cutlass.Float32",
+        torch.float8_e4m3fn: "cutlass.Float8E4M3FN",
     }
     input_dtype_str = _dtype_map[input_dtype]
     acc_dtype_str = "cutlass.Float32"
@@ -1804,13 +1826,36 @@ def _emit_mma_pipeline(
     epi_elem_dtype_str = (
         _dtype_map[epi_elem_dtype] if epi_elem_dtype is not None else input_dtype_str
     )
-    tcgen05_use_tma = (
-        input_dtype in (torch.float16, torch.bfloat16)
-        and lhs_fake.is_contiguous()
-        and rhs_fake.is_contiguous()
+
+    def _tcgen05_tma_2d_major(t: torch.Tensor) -> str | None:
+        # A 2D operand is TMA-eligible if it is contiguous in EITHER axis.
+        # Returns "row" (last-dim contiguous), "col" (first-dim contiguous),
+        # or None (neither -> not TMA-eligible). Row-major contiguous returns
+        # "row"; a transposed/column-major view returns "col".
+        if t.dim() != 2:
+            return "row" if t.is_contiguous() else None
+        s = t.stride()
+        if s[1] == 1:
+            return "row"
+        if s[0] == 1:
+            return "col"
+        return None
+
+    _dtype_tma_ok = input_dtype in (
+        torch.float16,
+        torch.bfloat16,
+        torch.float8_e4m3fn,
     )
-    tcgen05_use_tma_a = tcgen05_use_tma
-    tcgen05_use_tma_b = tcgen05_use_tma
+    _lhs_major = _tcgen05_tma_2d_major(lhs_fake)
+    _rhs_major = _tcgen05_tma_2d_major(rhs_fake)
+    # A must be row-major (M,K) K-contiguous == "row"; the K-major A SMEM
+    # layout Helion emits expects the standard row-major A. Only B's major
+    # mode is made layout-aware here.
+    tcgen05_use_tma_a = _dtype_tma_ok and _lhs_major == "row"
+    tcgen05_use_tma_b = _dtype_tma_ok and _rhs_major in ("row", "col")
+    # B is K-major when its (K, N) storage is K-contiguous (column-major),
+    # i.e. stride[0] == 1 -> _rhs_major == "col".
+    tcgen05_b_k_major = _rhs_major == "col"
     tcgen05_use_tma = tcgen05_use_tma_a or tcgen05_use_tma_b
     tcgen05_use_tma_pipeline = tcgen05_use_tma_a and tcgen05_use_tma_b
     tcgen05_requested_pure_matmul_role_lifecycle = is_pure_matmul_role_lifecycle_config(
@@ -3093,6 +3138,7 @@ def _emit_mma_pipeline(
                 bm,
                 bn,
                 tcgen05_cluster_m=tcgen05_cluster_m,
+                b_k_major=tcgen05_b_k_major,
             )
         )
     else:
@@ -3268,6 +3314,7 @@ def _emit_mma_pipeline(
                     bm,
                     bn,
                     tcgen05_cluster_m=tcgen05_cluster_m,
+                    b_k_major=tcgen05_b_k_major,
                 )
             )
         else:
@@ -3285,6 +3332,7 @@ def _emit_mma_pipeline(
                     bm,
                     bn,
                     tcgen05_cluster_m=tcgen05_cluster_m,
+                    b_k_major=tcgen05_b_k_major,
                 )
             )
     if mma_impl == "tcgen05":
@@ -3313,6 +3361,7 @@ def _emit_mma_pipeline(
                 smem_swizzle_b=tcgen05_smem_swizzle_b,
                 explicit_epi_tile_m=tcgen05_explicit_epi_tile_m,
                 explicit_epi_tile_n=tcgen05_explicit_epi_tile_n,
+                b_k_major=tcgen05_b_k_major,
             )
         )
         prefix.append(
@@ -3919,6 +3968,11 @@ def _emit_mma_pipeline(
                 "k_total_size": k_total_size,
                 "kernel_args": [tma_atom_a, tma_tensor_a, tma_atom_b, tma_tensor_b],
             }
+            # K-major (column-major / K-contiguous) B. Only recorded when True
+            # so MN-major (row-major B) wrapper-plan literals stay byte-identical
+            # to the golden.
+            if tcgen05_b_k_major:
+                ab_tma_plan["b_k_major"] = True
             # ``smem_swizzle_*`` overrides are recorded only when codegen
             # selected an explicit SMEM atom kind (either from a user
             # override or the scalar-edge fallback workaround). Keeping
@@ -5187,7 +5241,12 @@ def _mma_impl_matches_problem_shape(
 ) -> bool:
     if mma_impl == "universal":
         return True
-    if input_dtype not in (torch.float16, torch.bfloat16) or bn < 8 or bn % 8 != 0:
+    is_fp8 = input_dtype == torch.float8_e4m3fn
+    if (
+        input_dtype not in (torch.float16, torch.bfloat16, torch.float8_e4m3fn)
+        or bn < 8
+        or bn % 8 != 0
+    ):
         return False
     if bn > 256 and (
         mma_impl != "tcgen05"
@@ -5201,16 +5260,21 @@ def _mma_impl_matches_problem_shape(
     ):
         return False
     if mma_impl == "warp":
-        # Warp MMA atom is fixed-K (16 elements per BF16/FP16 instruction).
+        # Warp MMA atom is fixed-K (16 elements per BF16/FP16 instruction);
+        # fp8 is only wired through tcgen05.
+        if is_fp8:
+            return False
         return bk == 16 and bm >= 16 and bm % 16 == 0 and bn == 8
     if mma_impl == "tcgen05":
-        # tcgen05 mma instruction K is 16 elements for BF16/FP16, but the
-        # tile's K can be any positive multiple of that (the inner cute.gemm
-        # loop just runs more instructions per K iteration). Larger tile_k
-        # roughly halves the per-K-iter overhead per doubling. Production
-        # remains capped at block_n=256 to keep AB SMEM staging budget sane;
-        # the explicit G4 proof key admits only the smallest 512-N candidate.
-        if bk < 16 or bk > 256 or bk % 16 != 0:
+        # tcgen05 mma instruction K is 16 elements for BF16/FP16 (32 for FP8),
+        # but the tile's K can be any positive multiple of that (the inner
+        # cute.gemm loop just runs more instructions per K iteration). Larger
+        # tile_k roughly halves the per-K-iter overhead per doubling.
+        # Production remains capped at block_n=256 to keep AB SMEM staging
+        # budget sane; the explicit G4 proof key admits only the smallest
+        # 512-N candidate.
+        mma_k = 32 if is_fp8 else 16
+        if bk < mma_k or bk > 256 or bk % mma_k != 0:
             return False
         if bm in (64, 128):
             return True
@@ -5231,33 +5295,6 @@ def _is_zero_acc_expr(acc_expr: ast.AST) -> bool:
         if isinstance(acc_expr.func, ast.Name):
             return acc_expr.func.id in {"float", "int"}
     return False
-
-
-def _is_zero_acc_node(node: Node | None) -> bool:
-    if node is None:
-        return False
-    if node.op != "call_function":
-        return False
-
-    if node.target in _TRACE_THROUGH_TARGETS:
-        src = node.args[0] if node.args else None
-        return isinstance(src, Node) and _is_zero_acc_node(src)
-
-    target_name = getattr(node.target, "__name__", "")
-    if target_name in {"clone", "detach"}:
-        src = node.args[0] if node.args else None
-        return isinstance(src, Node) and _is_zero_acc_node(src)
-    if target_name == "zeros":
-        return True
-    if target_name != "full":
-        return False
-
-    value = None
-    if len(node.args) > 1:
-        value = node.args[1]
-    elif "value" in node.kwargs:
-        value = node.kwargs["value"]
-    return value in (0, 0.0)
 
 
 def _choose_mma_impl(
@@ -5303,7 +5340,12 @@ def _choose_mma_impl(
         tcgen05_cluster_m=tcgen05_cluster_m,
         tcgen05_large_bn_proof=tcgen05_large_bn_proof,
     ):
-        if support.tcgen05_f16bf16:
+        tcgen05_ok = (
+            support.tcgen05_f8
+            if input_dtype == torch.float8_e4m3fn
+            else support.tcgen05_f16bf16
+        )
+        if tcgen05_ok:
             return "tcgen05"
     if _mma_impl_matches_problem_shape("warp", input_dtype, bm=bm, bn=bn, bk=bk):
         if support.warp_f16bf16:
@@ -5322,6 +5364,7 @@ def _make_tiled_mma_setup(
     bn: int,
     *,
     tcgen05_cluster_m: int = 1,
+    b_k_major: bool = False,
 ) -> list[ast.AST]:
     if mma_impl == "warp":
         tiled_mma_expr = (
@@ -5337,6 +5380,7 @@ def _make_tiled_mma_setup(
             bm,
             bn,
             tcgen05_cluster_m=tcgen05_cluster_m,
+            b_k_major=b_k_major,
         )
     else:
         assert mma_thread_linear
@@ -5365,16 +5409,24 @@ def _tcgen05_tiled_mma_expr(
     bn: int,
     *,
     tcgen05_cluster_m: int = 1,
+    b_k_major: bool = False,
 ) -> str:
     cta_group_expr = "cute.nvgpu.tcgen05.CtaGroup.ONE"
     if _tcgen05_use_2cta_instrs(bm=bm, cluster_m=tcgen05_cluster_m):
         cta_group_expr = "cute.nvgpu.tcgen05.CtaGroup.TWO"
+    # A is always K-major. B is MN-major for row-major (N-contiguous) B and
+    # K-major for column-major (K-contiguous) B.
+    b_major_expr = (
+        "cute.nvgpu.OperandMajorMode.K"
+        if b_k_major
+        else "cute.nvgpu.OperandMajorMode.MN"
+    )
     return (
         "cutlass.utils.blackwell_helpers.make_trivial_tiled_mma("
         f"{input_dtype_str}, "
         f"{input_dtype_str}, "
         "cute.nvgpu.OperandMajorMode.K, "
-        "cute.nvgpu.OperandMajorMode.MN, "
+        f"{b_major_expr}, "
         f"{acc_dtype_str}, "
         f"{cta_group_expr}, "
         f"({bm}, {bn}), "
@@ -5421,6 +5473,7 @@ def _make_tcgen05_layout_plan_setup(
     smem_swizzle_b: int | None = None,
     explicit_epi_tile_m: int | None = None,
     explicit_epi_tile_n: int | None = None,
+    b_k_major: bool = False,
 ) -> list[ast.AST]:
     # `compute_epilogue_tile_shape` must receive `elem_ty_d` and `elem_ty_c`
     # equal to the eventual D-output dtype so the helper takes the
@@ -5453,7 +5506,7 @@ def _make_tcgen05_layout_plan_setup(
         ),
         statement_from_string(
             f"{plan.smem_b_layout} = "
-            f"{tcgen05_smem_layout_expr(tiled_mma=tiled_mma, bm=bm, bn=bn, bk=bk, dtype_str=input_dtype_str, num_stages=ab_stage_count, operand='b', swizzle_override=smem_swizzle_b)}"
+            f"{tcgen05_smem_layout_expr(tiled_mma=tiled_mma, bm=bm, bn=bn, bk=bk, dtype_str=input_dtype_str, num_stages=ab_stage_count, operand='b', swizzle_override=smem_swizzle_b, b_k_major=b_k_major)}"
         ),
         statement_from_string(
             f"{plan.c_layout} = cutlass.utils.layout.LayoutEnum.ROW_MAJOR"
@@ -5943,13 +5996,6 @@ def _emit_tcgen05_aux_pipeline_setup(
         ]
     )
     return lines
-
-
-def _tcgen05_epilogue_dest_expr(plan: _Tcgen05LayoutPlan, tensor: str) -> str:
-    planned_layout = tensor + ".layout"
-    for _ in range(3):
-        planned_layout = f"cute.append({planned_layout}, {plan.epilogue_rest_mode})"
-    return f"cute.make_tensor({tensor}.iterator, {planned_layout})"
 
 
 def _validate_tcgen05_smem_swizzle_override(

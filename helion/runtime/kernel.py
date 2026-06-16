@@ -4,10 +4,12 @@ import ast
 import contextlib
 import dataclasses
 import functools
+import hashlib
 import inspect
 import itertools
 import logging
 import operator
+import os
 import re
 import sys
 import textwrap
@@ -98,6 +100,10 @@ def _td_layout_guard_active_for_config(
 
 _R = TypeVar("_R")
 CompiledConfig = Callable[..., _R]
+
+# Opt-in: auto-capture Pallas kernels under torch.compile (see _tpu_compile_capture).
+# Off by default so the eager dispatch path is unchanged.
+_TPU_COMPILE_CAPTURE = os.environ.get("HELION_TPU_COMPILE_CAPTURE", "0") == "1"
 
 # Cache for GraphModule hashes
 _graph_module_hash_cache: WeakIdKeyDictionary = WeakIdKeyDictionary()
@@ -224,6 +230,56 @@ class Kernel(Generic[_R]):
         self.__defaults__ = fn.__defaults__
         self.__kwdefaults__ = fn.__kwdefaults__
 
+        # Opt-in: register the torch.compile(backend="tpu") capture op now, so an
+        # annotated/functional/benchmark-free Pallas kernel is captured with zero
+        # warm-up (like a hand-written custom_op). None if it must use first-call
+        # registration (unannotated, mutating, or autotuning among configs=[...]).
+        self._capture_op: Callable[..., Any] | None = None
+        if self.settings.backend == "pallas" and _TPU_COMPILE_CAPTURE:
+            from ._tpu_compile_capture import register_decoration_op
+
+            self._capture_op = register_decoration_op(self)
+
+    def _settings_signature(self) -> str:
+        """Return a stable string of settings that influence Triton codegen.
+
+        Mirrors the settings captured by
+        :meth:`BoundKernel.format_kernel_decorator` so the kernel id reflects
+        the same code-generation-affecting knobs.
+        """
+        parts = [f"static_shapes={self.settings.static_shapes}"]
+        if self.settings.index_dtype is not None:
+            parts.append(f"index_dtype={self.settings.index_dtype}")
+        return ", ".join(parts)
+
+    @functools.cache  # noqa: B019
+    def kernel_id(self) -> str:
+        """
+        Return a stable, content-derived identifier for this kernel.
+
+        The id is the SHA-256 hash of the kernel source together with the
+        settings that influence Triton code generation (see
+        :meth:`_settings_signature`). Because it is derived purely from content,
+        it is stable across processes and runs, making it suitable as a foreign
+        key for grouping telemetry rows by kernel during analysis.
+
+        Raises ``OSError`` if the source cannot be located (e.g. functions
+        defined in an interactive REPL or generated dynamically); see
+        :meth:`kernel_source`.
+        """
+        payload = self.kernel_source() + self._settings_signature()
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+    @functools.cache  # noqa: B019
+    def kernel_source(self) -> str:
+        """
+        Return the kernel's source text.
+
+        This is the stable identifier across processes/runs, suitable for
+        grouping telemetry rows by kernel during analysis.
+        """
+        return inspect.getsource(self.fn)
+
     def _get_bound_kernel_cache_key(
         self, args: tuple[object, ...], signature: tuple[Hashable, ...]
     ) -> BoundKernelInMemoryCacheKey | None:
@@ -346,8 +402,10 @@ class Kernel(Generic[_R]):
                 extractor = _specialization_extractors[torch.fx.GraphModule]
             elif isinstance(obj, torch.Tensor):
                 # torch.Tensor subclasses (e.g. the JAX-export adapter)
-                # share the standard tensor specialization key.
-                extractor = _specialization_extractors[torch.Tensor]
+                # share the standard tensor specialization key. Use the
+                # SymInt-safe extractor: unlike exact ``torch.Tensor``,
+                # subclasses may carry symbolic sizes/strides.
+                extractor = _specialization_extractors["tensor_subclass"]
             elif isinstance(obj, tuple) and hasattr(obj, "_fields"):
                 # this is a namedtuple
                 extractor = _specialization_extractors["namedtuple"]
@@ -412,6 +470,15 @@ class Kernel(Generic[_R]):
         """
         if kwargs:
             args = self.normalize_args(*args, **kwargs)
+        if self.settings.backend == "pallas" and _TPU_COMPILE_CAPTURE:
+            # Local import: _tpu_compile_capture pulls in the dynamo HOP machinery,
+            # not ready when kernel.py first loads during ``import helion``.
+            from ._tpu_compile_capture import RUN_NORMAL
+            from ._tpu_compile_capture import auto_capture_call
+
+            result = auto_capture_call(self, args)
+            if result is not RUN_NORMAL:
+                return cast("_R", result)
         return self.bind(args)(*args)
 
     def reset(self) -> None:
@@ -1323,6 +1390,36 @@ def _hashable_dims(dims: Sequence[int | torch.SymInt]) -> tuple[Hashable, ...]:
     return tuple(_hashable_dim(s) for s in dims)
 
 
+def _concrete_tensor_key(fn: Kernel, obj: torch.Tensor) -> Hashable:
+    # Fast extractor for plain ``torch.Tensor`` / ``torch.nn.Parameter``:
+    # exact-type dispatch guarantees concrete int sizes/strides, so
+    # ``torch.Size`` and the stride tuple can be used directly (both are
+    # tuple subclasses that hash/compare identically to plain int tuples).
+    # The ``_hashable_dims`` wrap in ``_tensor_key`` exists only to
+    # normalize SymInts, which appear on FakeTensors during tracing.
+    si = getattr(obj, "_dynamo_static_indices", None)
+    static_indices = frozenset(si) if si is not None else _EMPTY_FROZENSET
+    if fn.settings.static_shapes:
+        return (obj.dtype, obj.size(), obj.stride(), static_indices)
+    bucketed = _bucketed_size(obj)
+    if fn.settings.index_dtype is None:
+        try:
+            needs_int64 = bool(obj.numel() > _INT32_INDEX_LIMIT)
+        except RuntimeError:
+            needs_int64 = True  # unbacked SymInt
+        return (
+            obj.dtype,
+            bucketed,
+            needs_int64,
+            static_indices,
+        )
+    return (
+        obj.dtype,
+        bucketed,
+        static_indices,
+    )
+
+
 def _tensor_key(fn: Kernel, obj: torch.Tensor) -> Hashable:
     si = getattr(obj, "_dynamo_static_indices", None)
     static_indices = frozenset(si) if si is not None else _EMPTY_FROZENSET
@@ -1399,12 +1496,21 @@ def _graph_module_key(fn: Kernel, obj: torch.fx.GraphModule) -> Hashable:
 
 
 _specialization_extractors: dict[
-    type[object] | str, Callable[[Kernel, object], Hashable]
+    type[object] | str,
+    Callable[[Kernel, object], Hashable],
     # pyrefly: ignore [bad-assignment]
 ] = {
-    torch.Tensor: _tensor_key,
-    torch.nn.Parameter: _tensor_key,
+    # Exact-type dispatch (see ``_specialization_key``): plain tensors and
+    # Parameters always have concrete int sizes/strides and take the fast
+    # extractor. Subclasses (FakeTensor below, or anything hitting the
+    # ``isinstance`` fallback) go through SymInt-safe ``_tensor_key``.
+    torch.Tensor: _concrete_tensor_key,
+    torch.nn.Parameter: _concrete_tensor_key,
     FakeTensor: _tensor_key,
+    # SymInt-safe extractor for torch.Tensor subclasses reached via the
+    # isinstance fallback in ``_specialization_key`` (string key so the
+    # fallback stays loosely typed, like "namedtuple" / "dataclass").
+    "tensor_subclass": _tensor_key,
     torch.dtype: lambda fn, x: x,
     torch.device: lambda fn, x: x,
     int: _number_key,
@@ -1443,6 +1549,8 @@ def _find_device(args: tuple[object, ...]) -> torch.device:
             return arg
         if isinstance(arg, torch.Tensor):
             return arg.device
+        if isinstance(arg, ConstExpr):
+            continue  # a constexpr-wrapped value carries no device; skip it
         if isinstance(arg, (tuple, list)):
             for item in arg:
                 try:

@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import ast
 import builtins
-from collections.abc import Iterable
 import contextlib
 import copy
 import dataclasses
@@ -31,6 +30,7 @@ from torch.utils import _pytree as pytree
 from .. import Config
 from .. import exc
 from .. import language as hl
+from ..autotuner.config_spec import CuteVectorWidthSpec
 from ..autotuner.config_spec import ReductionLoopSpec
 from ..language import _tracing_ops
 from ..language._decorators import args_to_proxies
@@ -837,42 +837,11 @@ class DeviceIR:
         """
         env = CompileEnvironment.current()
         rdims = [bs for bs in env.block_sizes if bs.reduction]
-        # Register cute_vector_widths slots for non-reduction tile blocks
-        # upfront — this is for kernels like softmax_two_pass that drive
-        # their own inner tile loop over the reduction axis (no rolled
-        # reductions registered).  ``CuteNDTileStrategy`` reads these
-        # slots in ``__init__`` to wire up vec-aware lane loops; if no
-        # slots are registered, the autotuner has nothing to vary and
-        # the strategy defaults to scalar loads.  Skipped when rolled
-        # reductions are present so the reduction-dim slot stays at
-        # index 0 of ``cute_vector_widths`` (matches the
-        # ``CuteReductionTileHeuristic`` seed and user-facing API).
+        # Eager tile-slot registration (see _register_cute_tile_vec_slots).
+        # A present reduction must keep its slot at index 0, so reduction
+        # kernels register their tile slots after the reduction-loop pass below.
         if env.backend_name == "cute" and not rdims:
-            from ..autotuner.config_spec import CuteVectorWidthSpec
-
-            already_registered = set(
-                env.config_spec.cute_vector_widths.valid_block_ids()
-            )
-            tile_blocks = [bs for bs in env.block_sizes if not bs.reduction]
-            for tile_bs in tile_blocks:
-                if tile_bs.block_id in already_registered:
-                    continue
-                # Skip blocks with unbound static size (e.g. jagged
-                # kernels' dynamic-extent tiles): ``size_hint()`` asserts
-                # the size is int/SymInt and the strategy's vec gate
-                # requires a static ``EPT % V == 0`` anyway.
-                if not isinstance(tile_bs.size, (int, torch.SymInt)):
-                    continue
-                try:
-                    size_hint_val = int(tile_bs.size_hint())
-                except (TypeError, ValueError, AttributeError, AssertionError):
-                    continue
-                env.config_spec.cute_vector_widths.append(
-                    CuteVectorWidthSpec(
-                        block_id=tile_bs.block_id,
-                        size_hint=size_hint_val,
-                    )
-                )
+            self._register_cute_tile_vec_slots(env)
         if not rdims:
             return
         num_original_graphs = len(self.graphs)
@@ -945,8 +914,6 @@ class DeviceIR:
                     )
                 )
                 if env.backend_name == "cute":
-                    from ..autotuner.config_spec import CuteVectorWidthSpec
-
                     env.config_spec.cute_vector_widths.append(
                         CuteVectorWidthSpec(
                             block_id=rdim.block_id,
@@ -991,6 +958,36 @@ class DeviceIR:
                             if block_id is not None:
                                 indexed_blocks.add(block_id)
             env.config_spec.cute_indexed_reduction_block_ids = indexed_blocks
+
+        # Reduction-dim slots are registered above; add the remaining
+        # non-reduction tile slots after them (keeps the rdim slot at index 0).
+        if env.backend_name == "cute":
+            self._register_cute_tile_vec_slots(env)
+
+    def _register_cute_tile_vec_slots(self, env: CompileEnvironment) -> None:
+        """Eagerly register cute_vector_widths slots for non-reduction tile blocks.
+
+        Eager (not lazy in codegen) keeps the config-spec width fixed before the
+        autotuner snapshots it; callers register reduction-dim slots first so
+        those keep index 0.
+        """
+        already_registered = set(env.config_spec.cute_vector_widths.valid_block_ids())
+        for tile_bs in env.block_sizes:
+            if tile_bs.reduction or tile_bs.block_id in already_registered:
+                continue
+            # Non-static size (jagged / AutoSize) never forms a lane loop.
+            if not isinstance(tile_bs.size, (int, torch.SymInt)):
+                continue
+            try:
+                size_hint_val = int(tile_bs.size_hint())
+            except (TypeError, ValueError, AttributeError, AssertionError):
+                continue
+            env.config_spec.cute_vector_widths.append(
+                CuteVectorWidthSpec(
+                    block_id=tile_bs.block_id,
+                    size_hint=size_hint_val,
+                )
+            )
 
     def build_codegen_graphs(self, config: Config) -> list[GraphInfo]:
         """Build and return graph copies with reduction rolling and epilogue subtiling applied.
