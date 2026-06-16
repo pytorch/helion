@@ -120,7 +120,7 @@ def copy_engine_all_gather_w_progress(
         splits_per_rank (int): The number of splits per rank for progress tracking.
         backend_stream (torch.cuda.Stream, optional): The CUDA stream to use for the operation. If None, a new stream will be created.
     """
-    backend_stream = dist._symmetric_memory._get_backend_stream(priority=-1)
+    backend_stream = dist._symmetric_memory._get_backend_stream(priority=-1)  # pyrefly: ignore [bad-assignment]
     assert inp.is_contiguous(), "Input tensor 'inp' must be contiguous"
 
     if group is None:
@@ -144,7 +144,7 @@ def copy_engine_all_gather_w_progress(
     chunks = output.chunk(world_size * splits_per_rank)
 
     # symm_mem.barrier()
-    backend_stream.wait_stream(torch.cuda.current_stream())
+    backend_stream.wait_stream(torch.cuda.current_stream())  # pyrefly: ignore [missing-attribute]
 
     with torch.cuda.stream(backend_stream):
         for step in range(world_size):
@@ -164,7 +164,7 @@ def copy_engine_all_gather_w_progress(
                 )
         # symm_mem.barrier()
 
-    return backend_stream
+    return backend_stream  # pyrefly: ignore [bad-return]
 
 
 def _helion_all_gather_fp8_matmul_runtime(
