@@ -20,6 +20,8 @@ from .registry import AutotunerHeuristic
 
 if TYPE_CHECKING:
     from ...autotuner.config_fragment import BlockSizeFragment
+    from ...autotuner.config_spec import ConfigSpec
+    from ...autotuner.config_spec import MatmulFact
     from ...autotuner.config_spec import ReductionLoopSpec
     from ..compile_environment import CompileEnvironment
     from ..device_ir import DeviceIR
@@ -425,6 +427,139 @@ class CuteTileVecWarpPerRowHeuristic(AutotunerHeuristic):
             "block_sizes": [2, block_n],
             "num_threads": [0, 32],
             "cute_vector_widths": [1, vec],
+        }
+        try:
+            return Config(**seed)
+        except Exception:
+            return None
+
+
+def _cute_block_pos_for_block_id(spec: ConfigSpec, block_id: int | None) -> int | None:
+    """Position of ``block_id`` within ``spec.block_sizes`` (the index used
+    by the positional ``block_sizes`` / ``num_threads`` config lists)."""
+    if block_id is None:
+        return None
+    for pos, bs in enumerate(spec.block_sizes):
+        ids = getattr(bs, "block_ids", None)
+        if ids and ids[0] == block_id:
+            return pos
+    return None
+
+
+# fp8 byte types the paired-decode (``cvt.f16x2.e4m3x2``) matmul-fallback
+# path supports: one Uint64 LDG carries V=8 contiguous fp8 bytes per thread.
+_CUTE_FP8_GEMV_DTYPES = (
+    torch.float8_e4m3fn,
+    torch.float8_e5m2,
+)
+_CUTE_FP8_GEMV_VEC = 8
+
+
+class CuteSkinnyFp8GemvHeuristic(AutotunerHeuristic):
+    """Seed the vectorized SIMT lattice for a skinny-M (M==1) fp8 GEMV.
+
+    The vec-load tile heuristics (``CuteTileVec*``) all bail on
+    ``spec.matmul_facts`` because the wide-tile vec lattice is wrong for a
+    real tiled GEMM — at M>=2 the validated GEMV config below is ~100x
+    slower (each grid block redundantly streams the full A row per N tile).
+    But the M==1 GEMV case lowers through the SIMT matmul fallback, whose
+    inner K-loop decodes fp8 one byte at a time under the default
+    ``cute_vector_widths=[1, 1]`` lattice — pure scalar-LDG bandwidth.
+
+    PR #2774's paired fp8 decode only fires once the K loads are packed into
+    Uint64 chunks, which requires ``cute_vector_widths=[1, 8]`` together with
+    the matching ``block_sizes=[8, 1024]`` / ``num_threads=[8, 32]`` lattice
+    (8 warps over N, a 32-lane warp over K, V=8 fp8 bytes per lane). All
+    three knobs are coupled — seeding the vec width alone leaves the kernel
+    at scalar-LDG speed (~41us vs ~8us on a 1x4096x4096 B200 GEMV) — so this
+    seeds the full lattice as one autotuner starting point. The search still
+    owns every knob; this just makes the fast basin reachable.
+
+    Fires only for the exact skinny fp8 GEMV shape: cute backend, one
+    matmul fact with ``static_m == 1`` and an M axis that is resident (not
+    tiled, ``m_block_id is None``), fp8 operands, and the N/K tile blocks
+    both vec-eligible.
+    """
+
+    name = "cute_skinny_fp8_gemv"
+    backend = "cute"
+
+    @classmethod
+    def _fact(cls, env: CompileEnvironment) -> MatmulFact | None:
+        spec = env.config_spec
+        if len(spec.matmul_facts) != 1 or spec.reduction_loops:
+            return None
+        if len(spec.block_sizes) != 2:
+            return None
+        fact = spec.matmul_facts[0]
+        if fact.static_m != 1 or fact.m_block_id is not None:
+            return None
+        if (
+            fact.lhs_dtype not in _CUTE_FP8_GEMV_DTYPES
+            or fact.rhs_dtype not in _CUTE_FP8_GEMV_DTYPES
+        ):
+            return None
+        if fact.n_block_id is None or fact.k_block_id is None:
+            return None
+        vec_blocks = spec.cute_vector_widths.valid_block_ids()
+        if fact.n_block_id not in vec_blocks or fact.k_block_id not in vec_blocks:
+            return None
+        return fact
+
+    @classmethod
+    def is_eligible(cls, env: CompileEnvironment, device_ir: DeviceIR) -> bool:
+        return cls._fact(env) is not None
+
+    @classmethod
+    def get_seed_config(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> Config | None:
+        spec = env.config_spec
+        fact = cls._fact(env)
+        if fact is None:
+            return None
+        n_pos = _cute_block_pos_for_block_id(spec, fact.n_block_id)
+        k_pos = _cute_block_pos_for_block_id(spec, fact.k_block_id)
+        if n_pos is None or k_pos is None:
+            return None
+
+        vec = _CUTE_FP8_GEMV_VEC
+        # K tile: 32-lane warp, each lane owning a vec-aligned run. 1024
+        # (== 32 lanes * V=8 * 4 chunks/lane) matches the SM100 warp + L2 hit
+        # cadence (the validated PR #2774 lattice); clamp to the K fragment's
+        # reachable high and keep it vec-aligned (and >= one full warp of vec
+        # chunks so the packed Uint64 load fires).
+        k_fragment = cast("Any", spec.block_sizes[k_pos])._fragment(spec)
+        k_high = getattr(k_fragment, "high", None)
+        block_k = 1024
+        if isinstance(k_high, int):
+            if k_high < block_k:
+                # Can't fit the full K tile; fall back to a vec-aligned tile.
+                if k_high < 32 * vec:
+                    return None
+                block_k = (k_high // vec) * vec
+        # N tile: 8 warps' worth of independent output columns per block,
+        # clamped to the N fragment's reachable high.
+        n_fragment = cast("Any", spec.block_sizes[n_pos])._fragment(spec)
+        n_high = getattr(n_fragment, "high", None)
+        block_n = 8
+        if isinstance(n_high, int):
+            block_n = min(block_n, max(1, n_high))
+
+        block_sizes: list[int] = [0, 0]
+        block_sizes[n_pos] = block_n
+        block_sizes[k_pos] = block_k
+        # num_threads: ``block_n`` warps over N, a 32-lane warp over K.
+        num_threads: list[int] = [0, 0]
+        num_threads[n_pos] = block_n
+        num_threads[k_pos] = 32
+        vector_widths: list[int] = [1, 1]
+        vector_widths[k_pos] = vec
+
+        seed: dict[str, Any] = {
+            "block_sizes": block_sizes,
+            "num_threads": num_threads,
+            "cute_vector_widths": vector_widths,
         }
         try:
             return Config(**seed)

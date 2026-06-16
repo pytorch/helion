@@ -8,6 +8,7 @@ import torch
 
 import helion
 from helion._compiler.autotuner_heuristics import compiler_seed_configs
+from helion._compiler.autotuner_heuristics.cute import CuteSkinnyFp8GemvHeuristic
 from helion._compiler.autotuner_heuristics.cute import CuteTcgen05ClusterM2Heuristic
 from helion._compiler.autotuner_heuristics.registry import AutotunerHeuristic
 from helion._compiler.autotuner_heuristics.triton import TritonReductionTileHeuristic
@@ -3170,3 +3171,106 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
                 len(seed["indexing"]),
                 bound.config_spec.indexing.length,
             )
+
+
+class TestCuteSkinnyFp8GemvHeuristic(TestCase):
+    @staticmethod
+    def _skinny_fp8_gemv(
+        x: torch.Tensor,
+        y: torch.Tensor,
+        scale_a: torch.Tensor,
+        scale_b: torch.Tensor,
+    ) -> torch.Tensor:
+        # Mirrors examples/fp8_gemm.py::fp8_gemv: full (small) M
+        # resident, tile only over N, reduce over K with hl.dot.
+        m, k = x.size()
+        _, n = y.size()
+        out = torch.empty([m, n], dtype=torch.bfloat16, device=x.device)
+        for tile_n in hl.tile(n):
+            acc = hl.zeros([m, tile_n], dtype=torch.float32)
+            for tile_k in hl.tile(k):
+                acc = hl.dot(x[:, tile_k], y[tile_k, tile_n], acc=acc)
+            acc = acc * scale_a[:, tile_n] * scale_b[tile_n]
+            out[:, tile_n] = acc.to(torch.bfloat16)
+        return out
+
+    @staticmethod
+    def _tiled_fp8_gemm(
+        x: torch.Tensor,
+        y: torch.Tensor,
+        scale_a: torch.Tensor,
+        scale_b: torch.Tensor,
+    ) -> torch.Tensor:
+        m, k = x.size()
+        _, n = y.size()
+        out = torch.empty([m, n], dtype=torch.bfloat16, device=x.device)
+        for tile_m, tile_n in hl.tile([m, n]):
+            acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+            for tile_k in hl.tile(k):
+                acc = hl.dot(x[tile_m, tile_k], y[tile_k, tile_n], acc=acc)
+            acc = acc * scale_a[tile_m, tile_n] * scale_b[tile_n]
+            out[tile_m, tile_n] = acc.to(torch.bfloat16)
+        return out
+
+    def _args(self, m: int, k: int = 4096, n: int = 4096) -> tuple[torch.Tensor, ...]:
+        x = torch.empty([m, k], device=DEVICE, dtype=torch.float8_e4m3fn)
+        # y is [k, n], column-major (stride(0) == 1) like the example.
+        y = (
+            torch.empty([k, n], device=DEVICE, dtype=torch.float8_e4m3fn)
+            .T.contiguous()
+            .T
+        )
+        scale_a = torch.ones([m, n], device=DEVICE)
+        scale_b = torch.ones([n], device=DEVICE)
+        return x, y, scale_a, scale_b
+
+    @onlyBackends(["cute"])
+    def test_skinny_fp8_gemv_seeds_validated_lattice(self) -> None:
+        kernel = helion.kernel(self._skinny_fp8_gemv, backend="cute")
+        bound = kernel.bind(self._args(1))
+
+        self.assertIn(
+            CuteSkinnyFp8GemvHeuristic.name,
+            bound.config_spec.autotuner_heuristics,
+        )
+        self.assertTrue(
+            CuteSkinnyFp8GemvHeuristic.is_eligible(
+                bound.env, bound.host_function.device_ir
+            )
+        )
+        seed = CuteSkinnyFp8GemvHeuristic.get_seed_config(
+            bound.env, bound.host_function.device_ir
+        )
+        assert seed is not None
+        # The PR #2774 validated GEMV lattice: 8 warps over N, a 32-lane warp
+        # over K, V=8 fp8 bytes per lane (one Uint64 LDG).
+        self.assertEqual(seed.config["block_sizes"], [8, 1024])
+        self.assertEqual(seed.config["num_threads"], [8, 32])
+        self.assertEqual(seed.config["cute_vector_widths"], [1, 8])
+
+    @onlyBackends(["cute"])
+    def test_skinny_fp8_gemv_not_eligible_for_non_skinny_m(self) -> None:
+        # static_m != 1: the wide-tile GEMV lattice is ~100x slower here, so
+        # the heuristic must stay out of the way for batched M.
+        kernel = helion.kernel(self._skinny_fp8_gemv, backend="cute")
+        bound = kernel.bind(self._args(8))
+        self.assertNotIn(
+            CuteSkinnyFp8GemvHeuristic.name,
+            bound.config_spec.autotuner_heuristics,
+        )
+        self.assertFalse(
+            CuteSkinnyFp8GemvHeuristic.is_eligible(
+                bound.env, bound.host_function.device_ir
+            )
+        )
+
+    @onlyBackends(["cute"])
+    def test_skinny_fp8_gemv_not_eligible_for_tiled_m(self) -> None:
+        # A real [m, n]-tiled GEMM records m_block_id (M is tiled, not
+        # resident), so the GEMV seed must not fire even at M==1.
+        kernel = helion.kernel(self._tiled_fp8_gemm, backend="cute")
+        bound = kernel.bind(self._args(1))
+        self.assertNotIn(
+            CuteSkinnyFp8GemvHeuristic.name,
+            bound.config_spec.autotuner_heuristics,
+        )

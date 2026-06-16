@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING
 from .common import dedupe_configs
 from .cute import CuteReductionTileHeuristic
 from .cute import CuteReductionWideChunkHeuristic
+from .cute import CuteSkinnyFp8GemvHeuristic
 from .cute import CuteTcgen05ClusterM2FfiHeuristic
 from .cute import CuteTcgen05ClusterM2Heuristic
 from .cute import CuteTileVecHeuristic
@@ -31,6 +32,7 @@ HEURISTICS_BY_BACKEND: dict[str, tuple[AutotunerHeuristicType, ...]] = {
         CuteTcgen05ClusterM2Heuristic,
         CuteReductionTileHeuristic,
         CuteReductionWideChunkHeuristic,
+        CuteSkinnyFp8GemvHeuristic,
         CuteTileVecHeuristic,
         CuteTileVecWarpReduceHeuristic,
         CuteTileVecWarpPerRowHeuristic,
