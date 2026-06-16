@@ -52,8 +52,8 @@ from .strategies import is_pure_matmul_role_lifecycle_config
 from .strategies import l2_swizzle_size_from_config
 from .strategies import layout_overrides_from_config
 from .strategies import smem_swizzle_min_major_mode_bytes
-from .strategies import tcgen05_default_epilogue_tile_expr
 from .strategies import tcgen05_explicit_epilogue_tile_expr
+from .strategies import tcgen05_resolve_epilogue_tile
 from .strategies import tcgen05_smem_layout_expr
 from .strategies import warp_spec_from_config
 from .tcgen05_constants import TCGEN05_AB_CONSUMER_PHASE_MODE_CONFIG_KEY
@@ -2002,7 +2002,9 @@ def _emit_mma_pipeline(
         )
     tcgen05_pid_is_persistent = _is_persistent_pid_config(df.config)
     tcgen05_requested_two_cta = _tcgen05_use_2cta_instrs(
-        bm=bm, cluster_m=tcgen05_cluster_m
+        bm=bm,
+        cluster_m=tcgen05_cluster_m,
+        input_dtype=input_dtype,
     )
     tcgen05_cluster_n_requested = _tcgen05_cluster_n(df.config)
     tcgen05_static_output_tiles = m_size % bm == 0 and n_size % bn == 0
@@ -3139,6 +3141,7 @@ def _emit_mma_pipeline(
                 bn,
                 tcgen05_cluster_m=tcgen05_cluster_m,
                 b_k_major=tcgen05_b_k_major,
+                tcgen05_use_2cta_instrs=tcgen05_is_two_cta,
             )
         )
     else:
@@ -3315,6 +3318,7 @@ def _emit_mma_pipeline(
                     bn,
                     tcgen05_cluster_m=tcgen05_cluster_m,
                     b_k_major=tcgen05_b_k_major,
+                    tcgen05_use_2cta_instrs=tcgen05_is_two_cta,
                 )
             )
         else:
@@ -3333,6 +3337,7 @@ def _emit_mma_pipeline(
                     bn,
                     tcgen05_cluster_m=tcgen05_cluster_m,
                     b_k_major=tcgen05_b_k_major,
+                    tcgen05_use_2cta_instrs=tcgen05_is_two_cta,
                 )
             )
     if mma_impl == "tcgen05":
@@ -3968,6 +3973,15 @@ def _emit_mma_pipeline(
                 "k_total_size": k_total_size,
                 "kernel_args": [tma_atom_a, tma_tensor_a, tma_atom_b, tma_tensor_b],
             }
+            # The bm=128 CtaGroup.TWO family cannot be derived from
+            # ``bm == 256`` by the host wrapper, so record the resolved 2-CTA
+            # decision on the plan. Only recorded for this family (where the
+            # wrapper's legacy ``bm == 256`` derivation would be wrong); the
+            # bm=256 path leaves the key absent so its golden wrapper-plan
+            # literal stays byte-identical and the wrapper falls back to the
+            # derivation. See ``_tcgen05_use_2cta_instrs``.
+            if tcgen05_is_two_cta and bm != TCGEN05_TWO_CTA_BLOCK_M:
+                ab_tma_plan["use_2cta_instrs"] = True
             # K-major (column-major / K-contiguous) B. Only recorded when True
             # so MN-major (row-major B) wrapper-plan literals stay byte-identical
             # to the golden.
@@ -5190,12 +5204,24 @@ def _tcgen05_large_bn_proof_shape(
     )
 
 
-def _tcgen05_use_2cta_instrs(*, bm: int, cluster_m: int) -> bool:
+def _tcgen05_use_2cta_instrs(
+    *, bm: int, cluster_m: int, input_dtype: torch.dtype | str | None = None
+) -> bool:
     # Match Quack/CUTLASS SM100: clustered kernels are not automatically the
-    # tcgen05 "CTA pair" instruction family. The special 2-CTA instructions only
-    # apply to the 256-wide M tiler. Our current legal Helion family still uses
-    # CTA-local M=128 tiles, even when the cluster shape is (2, 1, 1).
-    return cluster_m == 2 and bm == TCGEN05_TWO_CTA_BLOCK_M
+    # tcgen05 "CTA pair" instruction family. CUTLASS admits the 2-CTA MMA for
+    # mma_m in {128, 256} (CTA tile m of 64 or 128). bm=256 is the legacy
+    # validated family. bm=128 (CTA tile 64xbn) is the small-grid family
+    # validated for fp8 on the 512x6144x2048 scaled_mm shape, where it beats
+    # both the bm=256 2-CTA and every 1-CTA config; it is fp8-gated because
+    # the f16/bf16 bm=128 + cluster_m=2 config point is owned by the legacy
+    # clustered CTA-local CtaGroup.ONE family (guarded diagnostic bridge and
+    # multi-tile runtime guard).
+    if cluster_m != 2:
+        return False
+    if bm == TCGEN05_TWO_CTA_BLOCK_M:
+        return True
+    is_fp8 = input_dtype == torch.float8_e4m3fn or input_dtype == "cutlass.Float8E4M3FN"
+    return bm == 128 and is_fp8
 
 
 def _tcgen05_epi_warp_count(
@@ -5365,6 +5391,7 @@ def _make_tiled_mma_setup(
     *,
     tcgen05_cluster_m: int = 1,
     b_k_major: bool = False,
+    tcgen05_use_2cta_instrs: bool | None = None,
 ) -> list[ast.AST]:
     if mma_impl == "warp":
         tiled_mma_expr = (
@@ -5381,6 +5408,7 @@ def _make_tiled_mma_setup(
             bn,
             tcgen05_cluster_m=tcgen05_cluster_m,
             b_k_major=b_k_major,
+            use_2cta_instrs=tcgen05_use_2cta_instrs,
         )
     else:
         assert mma_thread_linear
@@ -5410,9 +5438,18 @@ def _tcgen05_tiled_mma_expr(
     *,
     tcgen05_cluster_m: int = 1,
     b_k_major: bool = False,
+    use_2cta_instrs: bool | None = None,
 ) -> str:
+    # ``use_2cta_instrs`` lets the caller thread the resolved CtaGroup decision
+    # (which depends on the input dtype, not just bm/cluster_m) instead of
+    # re-deriving it here without dtype context. When omitted, fall back to the
+    # bm/cluster_m derivation for the legacy bm=256 family and non-fp8 callers.
+    if use_2cta_instrs is None:
+        use_2cta_instrs = _tcgen05_use_2cta_instrs(
+            bm=bm, cluster_m=tcgen05_cluster_m, input_dtype=input_dtype_str
+        )
     cta_group_expr = "cute.nvgpu.tcgen05.CtaGroup.ONE"
-    if _tcgen05_use_2cta_instrs(bm=bm, cluster_m=tcgen05_cluster_m):
+    if use_2cta_instrs:
         cta_group_expr = "cute.nvgpu.tcgen05.CtaGroup.TWO"
     # A is always K-major. B is MN-major for row-major (N-contiguous) B and
     # K-major for column-major (K-contiguous) B.
@@ -5492,12 +5529,25 @@ def _make_tcgen05_layout_plan_setup(
             "cute",
             "explicit tcgen05 epilogue tile requires both tile dimensions",
         )
-    epi_tile_expr = (
+    # The bm=128 CtaGroup.TWO family uses the per-CTA epilogue tile (m of 64,
+    # ``use_2cta=True``, no-source) -- see
+    # ``tcgen05_two_cta_m128_epilogue_tile_expr``. ``get_tmem_load_op`` and the
+    # SMEM staging on this path must also see the per-CTA M of ``bm // 2``;
+    # the legacy bm=256/bm=128-1CTA paths keep the full ``bm``. Resolved through
+    # the shared helper so this device-side ``(epi_tile_m, epi_tile_expr)`` pair
+    # stays identical to the store side in ``memory_ops.py``.
+    explicit_epi_tile_expr = (
         tcgen05_explicit_epilogue_tile_expr(explicit_epi_tile_m, explicit_epi_tile_n)
         if explicit_epi_tile_m is not None and explicit_epi_tile_n is not None
-        else tcgen05_default_epilogue_tile_expr(
-            bm, bn, epi_elem_dtype_str, c_layout=plan.c_layout
-        )
+        else None
+    )
+    epi_tile_m, epi_tile_expr = tcgen05_resolve_epilogue_tile(
+        bm=bm,
+        bn=bn,
+        is_two_cta=is_two_cta,
+        elem_dtype=epi_elem_dtype_str,
+        c_layout=plan.c_layout,
+        explicit_expr=explicit_epi_tile_expr,
     )
     return [
         statement_from_string(
@@ -5514,7 +5564,7 @@ def _make_tcgen05_layout_plan_setup(
         statement_from_string(f"{plan.epi_tile} = {epi_tile_expr}"),
         statement_from_string(
             f"{plan.tmem_load_atom} = cutlass.utils.blackwell_helpers.get_tmem_load_op("
-            f"({bm}, {bn}, {bk}), {plan.c_layout}, "
+            f"({epi_tile_m}, {bn}, {bk}), {plan.c_layout}, "
             f"{acc_dtype_str}, {acc_dtype_str}, {plan.epi_tile}, {is_two_cta!s})"
         ),
         statement_from_string(
