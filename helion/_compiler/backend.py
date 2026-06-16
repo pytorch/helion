@@ -1941,8 +1941,6 @@ class PallasBackend(Backend):
         for stmt in host_func.body:
             analyzer.visit(stmt)
 
-        from torch._inductor.runtime.runtime_utils import next_power_of_2
-
         if block_sizes is not None and kernel_tensor_sizes is not None:
             for shape in kernel_tensor_sizes:
                 for bid, info in enumerate(block_sizes):
@@ -1966,9 +1964,11 @@ class PallasBackend(Backend):
         }
         jagged_tile_bids: set[int] = set(_env_for_jagged.jagged_tile_parent_ids.keys())
 
-        # ``visit_Subscript`` only sees direct subscripts; jagged-flat
-        # tensors use a constructed FX index that hides the lane indexer,
-        # so force lane=128 alignment for every non-parent non-child bid.
+        # ``visit_Subscript`` only sees direct subscripts; tensors routed
+        # through the per-item sublane/lane DMA emit use a constructed FX
+        # index (e.g. ``flat[(starts + tile_k.idx) * M + tile_m.idx]``)
+        # that hides the lane indexer from the visitor, so force lane=128
+        # alignment for every non-parent non-child bid.
         if jagged_parent_bids:
             for spec in block_specs:
                 if not isinstance(spec, BlockSizeSpec):
@@ -2033,9 +2033,10 @@ class PallasBackend(Backend):
         smaller so autotune picks reasonable block sizes on small jagged
         kernels (e.g. ``jagged_mean`` with M=8).
 
-        Bypassed when the bid is also a jagged-flat lane bid (req==128 in a
-        jagged kernel) — HBM DMA needs >=128 there, so we fall back to the
-        plain ``next_power_of_2(size_hint)`` used by the non-jagged path.
+        Bypassed when the bid is also a lane bid for the per-item sublane
+        / lane DMA emit (req==128 in a jagged kernel) — the HBM DMA needs
+        the full 128 alignment there, so we fall back to the plain
+        ``next_power_of_2(size_hint)`` used by the non-jagged path.
         """
         from torch._inductor.runtime.runtime_utils import next_power_of_2
 
@@ -2054,7 +2055,6 @@ class PallasBackend(Backend):
             spec.update_hint(observed)
 
         return min(size_hint_dim, next_power_of_2(max(observed, 1)))
-            
 
     def tunable_fragments(self) -> dict[str, ConfigSpecFragment]:
         return {}

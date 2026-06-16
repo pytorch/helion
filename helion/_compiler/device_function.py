@@ -337,8 +337,10 @@ class DeviceFunction:
         # Pallas: id(fake_tensor) → {dim: (block_id, extra_pad)} for dims
         # using pl.ds() that may need host-side padding.
         self.pallas_pad_info: dict[int, dict[int, tuple[int, int]]] = {}
-        # Pallas: id(fake_tensor) → lane_size (M) for jagged-flat tensors.
-        # Drives the launcher's view(-1, lane_size) reshape.
+        # Pallas: id(fake_tensor) → lane_size (M) for tensors that take
+        # the per-item sublane/lane DMA emit.  Drives the launcher's
+        # ``view(-1, lane_size)`` reshape so the kernel body sees a 2-D
+        # ``(total_K, M)`` ref instead of the user's flat 1-D ref.
         self.pallas_jagged_flat_lane_size: dict[int, int | torch.SymInt] = {}
 
     def allocate_store_index(self) -> int:

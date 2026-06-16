@@ -269,9 +269,11 @@ class CompileEnvironment:
         self._tensor_descriptor_layout_guard_source_cache: dict[int, Source | None] = {}
         self.jagged_tile_parent_ids: dict[int, list[int]] = {}
         self.jagged_tile_mask_shapes: dict[int, list[torch.SymInt]] = {}
-        # Sublane / lane bids of registered jagged-flat TensorIndexPatterns.
-        # Populated by plan_tiling; on env (not DeviceFunction) because
-        # some readers run outside the device function scope.
+        # Sublane / lane bids that need the per-item jagged DMA emit (no
+        # Mosaic auto-pipeline for ``starts[pid]``-based slicing).
+        # Populated by plan_tiling from any recognised entry pattern
+        # (today: ``JaggedFlatIndexPattern``); on env rather than
+        # DeviceFunction so non-device-scope readers can consult them.
         self.pallas_jagged_flat_sublane_bids: set[int] = set()
         self.pallas_jagged_flat_lane_bids: set[int] = set()
         self._symint_cache: dict[object, torch.SymInt] = {}
