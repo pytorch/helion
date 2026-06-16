@@ -2241,55 +2241,63 @@ def _codegen_fori_loop(state: CodegenState) -> object:
         _tensor_to_sem=tensor_to_sem,
     )
 
+    def _build_jagged_flat_hbm_dma_slice(
+        jpat: JaggedFlatIndexPattern, fake: torch.Tensor, hbm_name: str
+    ) -> str:
+        """Emit the canonical 2-D jagged-flat DMA slice for ``hbm_name``::
+
+            x_flat.at[pl.ds(starts[0] + k_offset, BK), pl.ds(m_offset, BM)]
+
+        The sublane base is resolved from ``jpat.sublane_base_fx`` back to
+        its outer-scope ``starts`` name via positional placeholder match.
+        """
+        slice_parts: list[str] = []
+        for axis_bid in (jpat.sublane_bid, jpat.lane_bid):
+            bs_var = state.device_function.block_size_var(axis_bid)
+            assert bs_var is not None
+            if axis_bid in block_ids:
+                ax_idx = block_ids.index(axis_bid)
+                begin_expr = begin_exprs[ax_idx]
+                iter_step_expr = iter_step_exprs[ax_idx]
+                dim_idx_expr = dim_idx_exprs[ax_idx]
+                axis_offset = f"({begin_expr}) + ({dim_idx_expr}) * ({iter_step_expr})"
+            else:
+                axis_offset = state.codegen.offset_var(axis_bid)
+            if axis_bid == jpat.sublane_bid:
+                # Resolve the inner-graph placeholder back to its
+                # outer-scope emit-time name via positional match.
+                sublane_base_fx = jpat.sublane_base_fx
+                assert sublane_base_fx is not None
+                placeholders = [
+                    n for n in graph_info.graph.nodes if n.op == "placeholder"
+                ]
+                assert isinstance(args, list)
+                if sublane_base_fx in placeholders:
+                    outer_ast = args[placeholders.index(sublane_base_fx)]
+                    starts_name = ast.unparse(outer_ast)
+                else:
+                    starts_name = sublane_base_fx.name
+                axis_offset = f"{starts_name}[0] + ({axis_offset})"
+            slice_parts.append(f"pl.ds({axis_offset}, {bs_var})")
+        # Sublane DMA over-reads by up to ``BK-1`` past the row's valid
+        # data on the last tile_k iter; without host pad, a near-tail
+        # row can read past ``x_flat`` end and fault the TPU.  The
+        # compute mask zeros the over-read so pad-to-0 is sufficient.
+        from .memory_ops import _record_pad_info
+
+        sublane_bs = state.device_function.resolved_block_size(jpat.sublane_bid)
+        if isinstance(sublane_bs, int):
+            _record_pad_info(state, fake, 0, jpat.sublane_bid, sublane_bs - 1)
+        _record_pad_info(state, fake, 1, jpat.lane_bid, 0)
+        return f"{hbm_name}.at[{', '.join(slice_parts)}]"
+
     def _build_hbm_dma_slice(
         fake: torch.Tensor, hbm_name: str, subscript_meta: list[object]
     ) -> str:
         """Build an HBM ref slicing expression for DMA with loop variable."""
-        # Jagged-flat: emit 2-D slice
-        # ``x_flat.at[pl.ds(starts[0] + k_offset, BK), pl.ds(m_offset, BM)]``.
         jpat = jagged_flat_patterns.get(id(fake))
         if jpat is not None:
-            slice_parts: list[str] = []
-            for axis_bid in (jpat.sublane_bid, jpat.lane_bid):
-                bs_var = state.device_function.block_size_var(axis_bid)
-                assert bs_var is not None
-                if axis_bid in block_ids:
-                    ax_idx = block_ids.index(axis_bid)
-                    begin_expr = begin_exprs[ax_idx]
-                    iter_step_expr = iter_step_exprs[ax_idx]
-                    dim_idx_expr = dim_idx_exprs[ax_idx]
-                    axis_offset = (
-                        f"({begin_expr}) + ({dim_idx_expr}) * ({iter_step_expr})"
-                    )
-                else:
-                    axis_offset = state.codegen.offset_var(axis_bid)
-                if axis_bid == jpat.sublane_bid:
-                    # Resolve the inner-graph placeholder back to its
-                    # outer-scope emit-time name via positional match.
-                    sublane_base_fx = jpat.sublane_base_fx
-                    assert sublane_base_fx is not None
-                    placeholders = [
-                        n for n in graph_info.graph.nodes if n.op == "placeholder"
-                    ]
-                    assert isinstance(args, list)
-                    if sublane_base_fx in placeholders:
-                        outer_ast = args[placeholders.index(sublane_base_fx)]
-                        starts_name = ast.unparse(outer_ast)
-                    else:
-                        starts_name = sublane_base_fx.name
-                    axis_offset = f"{starts_name}[0] + ({axis_offset})"
-                slice_parts.append(f"pl.ds({axis_offset}, {bs_var})")
-            # Sublane DMA over-reads by up to ``BK-1`` past the row's valid
-            # data on the last tile_k iter; without host pad, a near-tail
-            # row can read past ``x_flat`` end and fault the TPU.  The
-            # compute mask zeros the over-read so pad-to-0 is sufficient.
-            from .memory_ops import _record_pad_info
-
-            sublane_bs = state.device_function.resolved_block_size(jpat.sublane_bid)
-            if isinstance(sublane_bs, int):
-                _record_pad_info(state, fake, 0, jpat.sublane_bid, sublane_bs - 1)
-            _record_pad_info(state, fake, 1, jpat.lane_bid, 0)
-            return f"{hbm_name}.at[{', '.join(slice_parts)}]"
+            return _build_jagged_flat_hbm_dma_slice(jpat, fake, hbm_name)
 
         dim_to_bid = _get_dim_block_ids(subscript_meta, env)
         shape = fake.shape
