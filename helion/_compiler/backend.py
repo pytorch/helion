@@ -1987,25 +1987,20 @@ class PallasBackend(Backend):
             if bid in jagged_parent_bids:
                 continue
             requirement_alignment = analyzer.required_alignments[bid]
-            # Jagged_tile size_hint defaults to 8192 (parent.numel is
-            # data-dependent); cap to observed tensor dim when smaller so
-            # autotune picks reasonable block sizes (e.g. jagged_mean M=8).
-            # Skip when this bid is also a jagged-flat lane bid (req=128
-            # in a jagged kernel) — HBM DMA needs >=128 regardless.
-            apply_observed_cap = bid in jagged_tile_bids and not (
-                bool(jagged_parent_bids) and requirement_alignment == 128
+            dim_size = self._update_dim_size_for_jagged_flat(
+                spec,
+                bid,
+                requirement_alignment,
+                analyzer.observed_dim_sizes,
+                jagged_tile_bids,
+                jagged_parent_bids,
             )
-            if apply_observed_cap:
-                size_hint_dim = next_power_of_2(max(spec.size_hint, 1))
-                observed = analyzer.observed_dim_sizes.get(bid)
-                if observed is not None:
-                    dim_size = min(size_hint_dim, next_power_of_2(max(observed, 1)))
-                    if observed < spec.size_hint:
-                        spec.update_hint(observed)
-                else:
-                    dim_size = size_hint_dim
-            else:
-                dim_size = next_power_of_2(max(spec.size_hint, 1))
+            # Cap the alignment requirement by the tensor lane dim: when
+            # the dim is smaller than the requirement, the full-dim access
+            # is always aligned at offset 0 so block_size = dim_size is
+            # safe.  When the dim is at least as big as the requirement,
+            # ``min`` returns ``requirement_alignment`` and the strict
+            # floor still applies (used by aot_example.sum_aot, n=256).
             spec.update_min(min(requirement_alignment, dim_size))
 
         # Propagate alignment minimums from inner tiles to their bounding outer tiles.
@@ -2021,6 +2016,45 @@ class PallasBackend(Backend):
             outer_spec = block_specs_by_id.get(bounded_by)
             if outer_spec is not None:
                 outer_spec.update_min(spec.min_size)
+
+    @staticmethod
+    def _update_dim_size_for_jagged_flat(
+        spec: object,
+        bid: int,
+        requirement_alignment: int,
+        observed_dim_sizes: dict[int, int],
+        jagged_tile_bids: set[int],
+        jagged_parent_bids: set[int],
+    ) -> int:
+        """Pick ``dim_size`` for ``spec.update_min(min(req, dim_size))``.
+
+        Jagged_tile ``size_hint`` defaults to 8192 (the parent's ``numel`` is
+        data-dependent at trace time); cap to the observed tensor dim when
+        smaller so autotune picks reasonable block sizes on small jagged
+        kernels (e.g. ``jagged_mean`` with M=8).
+
+        Bypassed when the bid is also a jagged-flat lane bid (req==128 in a
+        jagged kernel) — HBM DMA needs >=128 there, so we fall back to the
+        plain ``next_power_of_2(size_hint)`` used by the non-jagged path.
+        """
+        from torch._inductor.runtime.runtime_utils import next_power_of_2
+
+        apply_observed_cap = bid in jagged_tile_bids and not (
+            bool(jagged_parent_bids) and requirement_alignment == 128
+        )
+        if not apply_observed_cap:
+            return next_power_of_2(max(spec.size_hint, 1))
+
+        size_hint_dim = next_power_of_2(max(spec.size_hint, 1))
+        observed = observed_dim_sizes.get(bid)
+        if observed is None:
+            return size_hint_dim
+
+        if observed < spec.size_hint:
+            spec.update_hint(observed)
+
+        return min(size_hint_dim, next_power_of_2(max(observed, 1)))
+            
 
     def tunable_fragments(self) -> dict[str, ConfigSpecFragment]:
         return {}
