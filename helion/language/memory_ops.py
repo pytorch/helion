@@ -314,6 +314,103 @@ def _maybe_get_symbol_origin(idx: object) -> SymbolOrigin | None:
     return HostFunction.current().expr_to_origin.get(expr)
 
 
+def _pallas_jagged_flat_store_value_mask(
+    state: CodegenState,
+    value: ast.AST,
+    value_proxy: torch.Tensor,
+    subscript: list[object] | tuple[object, ...],
+    patterns: list[object] | tuple[object, ...] | None,
+    name: str,
+    idx_str: str,
+    mem_space: object,
+) -> ast.AST:
+    """Wrap ``value`` with the jagged-flat / jagged-tile mask before the
+    indexed store.
+
+    Two cases:
+
+    * Jagged-flat pattern present → mask on the sublane and lane bids
+      (``jagged_tile_expand_str`` for jagged-tile axes, plain
+      ``expand_str`` for the orthogonal one); squeeze the leading
+      ``BB=1`` dim so the value fits the 2-D ``(BK, BM)`` VMEM scratch.
+    * No jagged-flat pattern → mask only jagged-tile axes referenced
+      in the subscript.  Non-jagged unaligned cases are already handled
+      by ``sliced_value_for_store``'s host-pad + host-trunc; re-masking
+      would broadcast-mismatch.
+
+    The ``jnp.where`` else-branch reads ``jnp.zeros_like(value)`` on
+    HBM-marked / jagged-flat tensors (where ``name[idx_str]`` would
+    fault) and ``name[idx_str]`` on every other VMEM-resident path so
+    masked-off lanes preserve their prior contents.
+    """
+    from .._compiler.compile_environment import CompileEnvironment
+    from .._compiler.device_function import PallasMemorySpace
+    from .._compiler.pallas.plan_tiling import JaggedFlatIndexPattern
+    from .._compiler.pallas.plan_tiling import TilePattern
+
+    env = CompileEnvironment.current()
+    jagged_flat_pattern: JaggedFlatIndexPattern | None = next(
+        (p for p in patterns or () if isinstance(p, JaggedFlatIndexPattern)), None
+    )
+    value_sizes = [*value_proxy.size()]
+    mask_exprs: list[str] = []
+    if jagged_flat_pattern is not None:
+        for axis_bid in (
+            jagged_flat_pattern.sublane_bid,
+            jagged_flat_pattern.lane_bid,
+        ):
+            mask_var = state.codegen.mask_var(axis_bid)
+            if mask_var is None:
+                continue
+            if env.is_jagged_tile(axis_bid):
+                mask_shape = env.jagged_tile_mask_shapes[axis_bid]
+                expand = state.tile_strategy.jagged_tile_expand_str(
+                    mask_shape, value_sizes
+                )
+            else:
+                axis_pos = 1 if axis_bid == jagged_flat_pattern.sublane_bid else 2
+                expand = state.tile_strategy.expand_str(value_sizes, axis_pos)
+            expr = f"({mask_var}.astype(jnp.float32){expand})"
+            if expr not in mask_exprs:
+                mask_exprs.append(expr)
+    else:
+        out_dim = 0
+        for idx, pattern in zip(subscript, patterns or (), strict=False):
+            if idx is None:
+                out_dim += 1
+                continue
+            if isinstance(pattern, TilePattern) and env.is_jagged_tile(
+                pattern.block_id
+            ):
+                mask_var = state.codegen.mask_var(pattern.block_id)
+                if mask_var is not None:
+                    mask_shape = env.jagged_tile_mask_shapes[pattern.block_id]
+                    expand = state.tile_strategy.jagged_tile_expand_str(
+                        mask_shape, value_sizes
+                    )
+                    expr = f"({mask_var}.astype(jnp.float32){expand})"
+                    if expr not in mask_exprs:
+                        mask_exprs.append(expr)
+            out_dim += 1
+    if mask_exprs:
+        mask_expr = " * ".join(mask_exprs)
+        if jagged_flat_pattern is not None or mem_space == PallasMemorySpace.HBM:
+            value = expr_from_string(
+                f"jnp.where(({mask_expr}).astype(jnp.bool_), {{value}}, "
+                f"jnp.zeros_like({{value}}))",
+                value=value,
+            )
+        else:
+            value = expr_from_string(
+                f"jnp.where(({mask_expr}).astype(jnp.bool_), {{value}}, "
+                f"{name}[{idx_str}])",
+                value=value,
+            )
+    if jagged_flat_pattern is not None and value_proxy.dim() >= 3:
+        value = expr_from_string("jnp.squeeze({value}, axis=0)", value=value)
+    return value
+
+
 @_decorators.codegen(store, "pallas")
 def _(state: CodegenState) -> None:
     tensor = state.proxy_arg(0)
@@ -346,8 +443,6 @@ def _(state: CodegenState) -> None:
     patterns = state.fx_node.meta.get("indexing_patterns") if state.fx_node else ()
     from .._compiler.pallas.gather import emit_scatter_store
     from .._compiler.pallas.plan_tiling import IndirectScatterPattern
-    from .._compiler.pallas.plan_tiling import JaggedFlatIndexPattern
-    from .._compiler.pallas.plan_tiling import TilePattern
 
     scatter_patterns = [
         pattern
@@ -362,75 +457,9 @@ def _(state: CodegenState) -> None:
             state, scatter_patterns[0].plan, name, idx_str, value
         )
     if isinstance(value_proxy, torch.Tensor):
-        from .._compiler.compile_environment import CompileEnvironment
-
-        env = CompileEnvironment.current()
-        jagged_flat_pattern: JaggedFlatIndexPattern | None = None
-        for p in patterns or ():
-            if isinstance(p, JaggedFlatIndexPattern):
-                jagged_flat_pattern = p
-                break
-        # Jagged-flat value is 3-D (BB=1, BK, BM); the leading BB dim is
-        # squeezed below to fit the 2-D (BK, BM) VMEM scratch.
-        value_sizes = [*value_proxy.size()]
-        mask_exprs: list[str] = []
-        if jagged_flat_pattern is not None:
-            for axis_bid in (
-                jagged_flat_pattern.sublane_bid,
-                jagged_flat_pattern.lane_bid,
-            ):
-                mask_var = state.codegen.mask_var(axis_bid)
-                if mask_var is None:
-                    continue
-                if env.is_jagged_tile(axis_bid):
-                    mask_shape = env.jagged_tile_mask_shapes[axis_bid]
-                    expand = state.tile_strategy.jagged_tile_expand_str(
-                        mask_shape, value_sizes
-                    )
-                else:
-                    axis_pos = 1 if axis_bid == jagged_flat_pattern.sublane_bid else 2
-                    expand = state.tile_strategy.expand_str(value_sizes, axis_pos)
-                expr = f"({mask_var}.astype(jnp.float32){expand})"
-                if expr not in mask_exprs:
-                    mask_exprs.append(expr)
-        else:
-            # Mask only jagged tiles; non-jagged unaligned cases are
-            # already handled by ``sliced_value_for_store`` host-pad +
-            # host-trunc, and re-masking would broadcast-mismatch.
-            out_dim = 0
-            for idx, pattern in zip(subscript, patterns or (), strict=False):
-                if idx is None:
-                    out_dim += 1
-                    continue
-                if isinstance(pattern, TilePattern) and env.is_jagged_tile(
-                    pattern.block_id
-                ):
-                    mask_var = state.codegen.mask_var(pattern.block_id)
-                    if mask_var is not None:
-                        mask_shape = env.jagged_tile_mask_shapes[pattern.block_id]
-                        expand = state.tile_strategy.jagged_tile_expand_str(
-                            mask_shape, value_sizes
-                        )
-                        expr = f"({mask_var}.astype(jnp.float32){expand})"
-                        if expr not in mask_exprs:
-                            mask_exprs.append(expr)
-                out_dim += 1
-        if mask_exprs:
-            mask_expr = " * ".join(mask_exprs)
-            if jagged_flat_pattern is not None or mem_space == PallasMemorySpace.HBM:
-                value = expr_from_string(
-                    f"jnp.where(({mask_expr}).astype(jnp.bool_), {{value}}, "
-                    f"jnp.zeros_like({{value}}))",
-                    value=value,
-                )
-            else:
-                value = expr_from_string(
-                    f"jnp.where(({mask_expr}).astype(jnp.bool_), {{value}}, "
-                    f"{name}[{idx_str}])",
-                    value=value,
-                )
-        if jagged_flat_pattern is not None and value_proxy.dim() >= 3:
-            value = expr_from_string("jnp.squeeze({value}, axis=0)", value=value)
+        value = _pallas_jagged_flat_store_value_mask(
+            state, value, value_proxy, subscript, patterns, name, idx_str, mem_space
+        )
     state.codegen.add_statement(
         statement_from_string(f"{name}[{idx_str}] = {{value}}", value=value)
     )
