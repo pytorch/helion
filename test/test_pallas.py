@@ -4315,30 +4315,27 @@ class TestPallas(TestCase):
         self.assertIsNone(_parse_flat_jagged_subscript(flat, env))
 
     def test_tensor_index_pattern_jagged_flat_fields(self) -> None:
-        """``TensorIndexPattern`` defaults preserve the indirect-gather emit
-        path; the jagged-flat fields opt in to the canonical jagged 2-D DMA
-        slice emit (filled by the plan_tiling producer when it parses a
-        1-D flat-form jagged subscript)."""
+        """``TensorIndexPattern`` is the indirect-gather pattern (no fields);
+        ``JaggedFlatIndexPattern`` is the canonical jagged 2-D DMA pattern
+        (filled by the plan_tiling producer when it parses a 1-D flat-form
+        jagged subscript)."""
+        from helion._compiler.pallas.plan_tiling import JaggedFlatIndexPattern
         from helion._compiler.pallas.plan_tiling import TensorIndexPattern
 
         plain = TensorIndexPattern()
-        self.assertFalse(plain.is_jagged_flat)
-        self.assertIsNone(plain.sublane_bid)
-        self.assertIsNone(plain.sublane_base_fx)
-        self.assertIsNone(plain.lane_bid)
-        self.assertIsNone(plain.lane_size)
+        self.assertIsInstance(plain, TensorIndexPattern)
+        self.assertNotIsInstance(plain, JaggedFlatIndexPattern)
 
-        jagged = TensorIndexPattern(
-            is_jagged_flat=True,
+        jagged = JaggedFlatIndexPattern(
             sublane_bid=7,
             sublane_base_fx=None,
             lane_bid=12,
             lane_size=64,
         )
-        self.assertTrue(jagged.is_jagged_flat)
         self.assertEqual(jagged.sublane_bid, 7)
         self.assertEqual(jagged.lane_bid, 12)
         self.assertEqual(jagged.lane_size, 64)
+        self.assertNotIsInstance(jagged, TensorIndexPattern)
 
     def test_get_reduced_block_ids_carried_acc_collapses_loop_bid(self) -> None:
         """When a fori_loop has a carried tensor accumulator whose shape

@@ -346,7 +346,7 @@ def _(state: CodegenState) -> None:
     patterns = state.fx_node.meta.get("indexing_patterns") if state.fx_node else ()
     from .._compiler.pallas.gather import emit_scatter_store
     from .._compiler.pallas.plan_tiling import IndirectScatterPattern
-    from .._compiler.pallas.plan_tiling import TensorIndexPattern
+    from .._compiler.pallas.plan_tiling import JaggedFlatIndexPattern
     from .._compiler.pallas.plan_tiling import TilePattern
 
     scatter_patterns = [
@@ -365,9 +365,9 @@ def _(state: CodegenState) -> None:
         from .._compiler.compile_environment import CompileEnvironment
 
         env = CompileEnvironment.current()
-        jagged_flat_pattern: TensorIndexPattern | None = None
+        jagged_flat_pattern: JaggedFlatIndexPattern | None = None
         for p in patterns or ():
-            if isinstance(p, TensorIndexPattern) and p.is_jagged_flat:
+            if isinstance(p, JaggedFlatIndexPattern):
                 jagged_flat_pattern = p
                 break
         # Jagged-flat value is 3-D (BB=1, BK, BM); the leading BB dim is
@@ -379,8 +379,6 @@ def _(state: CodegenState) -> None:
                 jagged_flat_pattern.sublane_bid,
                 jagged_flat_pattern.lane_bid,
             ):
-                if axis_bid is None:
-                    continue
                 mask_var = state.codegen.mask_var(axis_bid)
                 if mask_var is None:
                     continue

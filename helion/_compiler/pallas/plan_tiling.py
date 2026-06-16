@@ -69,17 +69,21 @@ class NonePattern(IndexingPattern):
 
 @dataclass
 class TensorIndexPattern(IndexingPattern):
-    """Tensor-valued index.  ``is_jagged_flat=False`` → indirect
-    gather/scatter.  ``is_jagged_flat=True`` → canonical flat-1D form
-    ``x_flat[(starts + tile_k.idx) * M + tile_m.idx]`` with cached
-    sublane/lane axes; launcher reshapes flat tensor by ``lane_size``.
+    """Tensor-valued index - no tiling. Resolved for indirect load/store codegen."""
+
+
+@dataclass
+class JaggedFlatIndexPattern(IndexingPattern):
+    """Canonical jagged-flat 1-D form ``x_flat[(starts + tile_k.idx) * M
+    + tile_m.idx]`` with the sublane / lane bids cached for downstream
+    DMA / VMEM-shape emit.  The launcher reshapes ``x_flat`` by
+    ``lane_size`` so the kernel body sees a 2-D ``(total_K, M)`` ref.
     """
 
-    is_jagged_flat: bool = False
-    sublane_bid: int | None = None
-    sublane_base_fx: torch.fx.Node | None = None
-    lane_bid: int | None = None
-    lane_size: int | torch.SymInt | None = None
+    sublane_bid: int
+    sublane_base_fx: torch.fx.Node | None
+    lane_bid: int
+    lane_size: int | torch.SymInt
 
 
 @dataclass
@@ -154,8 +158,7 @@ def _analyze_indexing(node: torch.fx.Node, config: Config) -> None:
     # Must capture before ``_resolve_tensor_index_patterns`` rewrites
     # TensorIndexPattern into IndirectGather/ScatterPattern.
     is_jagged_flat = any(
-        isinstance(p, TensorIndexPattern) and p.is_jagged_flat
-        for p in indexing_patterns
+        isinstance(p, JaggedFlatIndexPattern) for p in indexing_patterns
     )
     _resolve_tensor_index_patterns(
         node, tensor_val, list(subscript), indexing_patterns, config
@@ -209,12 +212,7 @@ def _analyze_indexing(node: torch.fx.Node, config: Config) -> None:
         # ``has_jagged_flat_dma`` bridges per-axis bids into ConfigSpec
         # (no live env access there).
         for p in indexing_patterns:
-            if isinstance(p, TensorIndexPattern) and p.is_jagged_flat:
-                assert (
-                    p.sublane_bid is not None
-                    and p.lane_bid is not None
-                    and p.lane_size is not None
-                )
+            if isinstance(p, JaggedFlatIndexPattern):
                 device_fn.pallas_jagged_flat_lane_size[tid] = p.lane_size
                 _env.pallas_jagged_flat_sublane_bids.add(p.sublane_bid)
                 _env.pallas_jagged_flat_lane_bids.add(p.lane_bid)
@@ -319,8 +317,7 @@ def _detect_indexing_pattern(
                 parsed = _parse_flat_jagged_subscript(idx, env)
                 if parsed is not None:
                     sublane_bid, sublane_base_fx, lane_bid, lane_size = parsed
-                    return TensorIndexPattern(
-                        is_jagged_flat=True,
+                    return JaggedFlatIndexPattern(
                         sublane_bid=sublane_bid,
                         sublane_base_fx=sublane_base_fx,
                         lane_bid=lane_bid,
@@ -484,11 +481,7 @@ def _resolve_tensor_index_patterns(
     Jagged-flat patterns are skipped — they have their own DMA emit path
     that needs the cached sublane/lane metadata.
     """
-    positions = [
-        i
-        for i, p in enumerate(patterns)
-        if isinstance(p, TensorIndexPattern) and not p.is_jagged_flat
-    ]
+    positions = [i for i, p in enumerate(patterns) if isinstance(p, TensorIndexPattern)]
     if not positions:
         return
 

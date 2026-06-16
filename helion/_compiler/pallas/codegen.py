@@ -46,9 +46,9 @@ def load_expr(
         result = expr_from_string(f"{name}[{idx_str}]")
     # Jagged-flat: 2-D VMEM scratch but rank-expanded ``flat`` index makes
     # the user-source load result 3-D (BB=1, BK, BM).
-    from helion._compiler.pallas.plan_tiling import TensorIndexPattern as _TIP
+    from helion._compiler.pallas.plan_tiling import JaggedFlatIndexPattern
 
-    if any(isinstance(p, _TIP) and p.is_jagged_flat for p in patterns):
+    if any(isinstance(p, JaggedFlatIndexPattern) for p in patterns):
         result = expr_from_string("jnp.expand_dims({result}, axis=0)", result=result)
     for dim in none_dims:
         result = expr_from_string(
@@ -382,9 +382,9 @@ def _generated_index_code(
         # resident target axis instead of indexing it a second time.
         return ":"
 
-    from helion._compiler.pallas.plan_tiling import TensorIndexPattern
+    from helion._compiler.pallas.plan_tiling import JaggedFlatIndexPattern
 
-    if isinstance(pattern, TensorIndexPattern) and pattern.is_jagged_flat:
+    if isinstance(pattern, JaggedFlatIndexPattern):
         # Per-item base offset is injected at the DMA slice (see
         # ``_build_hbm_dma_slice``); body reads the full VMEM scratch.
         return ":"
