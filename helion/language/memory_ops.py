@@ -324,26 +324,17 @@ def _pallas_jagged_flat_store_value_mask(
     idx_str: str,
     mem_space: object,
 ) -> ast.AST:
-    """Wrap ``value`` with any required jagged-tile mask before the
-    indexed store.
+    """Wrap ``value`` with any required jagged-tile mask before the store.
 
-    Two cases:
+    * Per-item jagged DMA tensor → mask on sublane + lane, squeeze the
+      leading ``BB=1`` dim so the value fits the 2-D VMEM scratch.
+    * Otherwise → mask only jagged-tile axes; non-jagged unaligned cases
+      are already covered by ``sliced_value_for_store``.
 
-    * Tensor routed through the per-item sublane/lane DMA emit (a
-      ``JaggedFlatIndexPattern`` was registered for it) → mask on the
-      sublane and lane bids (``jagged_tile_expand_str`` for jagged-tile
-      axes, plain ``expand_str`` for the orthogonal one); squeeze the
-      leading ``BB=1`` dim so the value fits the 2-D ``(BK, BM)`` VMEM
-      scratch the DMA emit produces.
-    * Otherwise → mask only jagged-tile axes referenced in the subscript.
-      Non-jagged unaligned cases are already handled by
-      ``sliced_value_for_store``'s host-pad + host-trunc; re-masking
-      would broadcast-mismatch.
-
-    The ``jnp.where`` else-branch reads ``jnp.zeros_like(value)`` on
-    HBM-marked tensors and tensors taking the per-item DMA emit (where
-    ``name[idx_str]`` would fault) and ``name[idx_str]`` on every other
-    VMEM-resident path so masked-off lanes preserve their prior contents.
+    ``jnp.where``'s else-branch reads ``jnp.zeros_like(value)`` on HBM /
+    per-item-DMA tensors (where ``name[idx_str]`` would fault) and
+    ``name[idx_str]`` on VMEM-resident paths so masked-off lanes keep
+    their prior contents.
     """
     from .._compiler.compile_environment import CompileEnvironment
     from .._compiler.device_function import PallasMemorySpace
@@ -6718,12 +6709,11 @@ def _(node: torch.fx.Node) -> int:
 
 @_decorators.get_masked_value(load, "pallas")
 def _(node: torch.fx.Node) -> int | None:
-    # Loads that take the per-item sublane/lane DMA emit have no implicit
-    # OOB masking — the manual ``pl.ds`` copy reads whatever bytes are at
-    # the slice — so return None to keep ``_mask_to`` alive for the
-    # downstream reduction.  Detection runs before plan_tiling so we
-    # can't read ``indexing_patterns``; conservative test: any registered
-    # ``jagged_tile`` parent + a tensor-valued subscript.
+    # Per-item jagged DMA loads have no implicit OOB masking (the manual
+    # ``pl.ds`` copies whatever bytes are at the slice), so return None
+    # to keep ``_mask_to`` alive for the downstream reduction. Conservative
+    # test (runs before plan_tiling, can't read ``indexing_patterns``):
+    # any registered ``jagged_tile`` parent + a tensor-valued subscript.
     from .._compiler.compile_environment import CompileEnvironment
 
     env = CompileEnvironment.current()

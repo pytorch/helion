@@ -1964,11 +1964,9 @@ class PallasBackend(Backend):
         }
         jagged_tile_bids: set[int] = set(_env_for_jagged.jagged_tile_parent_ids.keys())
 
-        # ``visit_Subscript`` only sees direct subscripts; tensors routed
-        # through the per-item sublane/lane DMA emit use a constructed FX
-        # index (e.g. ``flat[(starts + tile_k.idx) * M + tile_m.idx]``)
-        # that hides the lane indexer from the visitor, so force lane=128
-        # alignment for every non-parent non-child bid.
+        # ``visit_Subscript`` only sees direct subscripts; the per-item
+        # jagged DMA path's constructed FX index hides the lane indexer,
+        # so force lane=128 for every non-parent non-child bid.
         if jagged_parent_bids:
             for spec in block_specs:
                 if not isinstance(spec, BlockSizeSpec):
@@ -2028,15 +2026,10 @@ class PallasBackend(Backend):
     ) -> int:
         """Pick ``dim_size`` for ``spec.update_min(min(req, dim_size))``.
 
-        Jagged_tile ``size_hint`` defaults to 8192 (the parent's ``numel`` is
-        data-dependent at trace time); cap to the observed tensor dim when
-        smaller so autotune picks reasonable block sizes on small jagged
-        kernels (e.g. ``jagged_mean`` with M=8).
-
-        Bypassed when the bid is also a lane bid for the per-item sublane
-        / lane DMA emit (req==128 in a jagged kernel) — the HBM DMA needs
-        the full 128 alignment there, so we fall back to the plain
-        ``next_power_of_2(size_hint)`` used by the non-jagged path.
+        Jagged_tile ``size_hint`` defaults to 8192 (parent ``numel`` is
+        data-dependent at trace); cap to observed tensor dim when smaller
+        so autotune picks reasonable block sizes on small jagged kernels.
+        Bypassed on lane bids (req==128) — the DMA needs full 128 there.
         """
         from torch._inductor.runtime.runtime_utils import next_power_of_2
 

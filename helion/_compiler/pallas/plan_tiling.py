@@ -76,22 +76,12 @@ class TensorIndexPattern(IndexingPattern):
 class JaggedFlatIndexPattern(IndexingPattern):
     """Entry point into the per-item sublane/lane jagged DMA emit.
 
-    Mosaic's pipelined DMA doesn't natively support per-program scalar
-    ``starts[pid]`` slicing of a jagged tensor: the auto-pipeline expects
-    grid-aligned slice math, not a data-dependent base read from SMEM.
-    Helion's workaround is a manual ``pl.ds(starts[0] + offset, BK)`` DMA
-    emit inside a ``fori_loop``, with the sublane axis stepping over the
-    jagged dim and the lane axis stepping over the dense trailing dim.
-
-    This class is the *current* entry point: it recognises the canonical
-    1-D ``x_flat[(starts + tile_k.idx) * M + tile_m.idx]`` form (a common
-    way users express jagged-row reductions) and caches the resolved
-    sublane / lane bids so downstream codegen (``_build_hbm_dma_slice``,
-    ``_compute_vmem_shapes``, the jagged-flat store mask) can route to
-    the per-item DMA emit.  The DMA emit itself is independent of this
-    parse — additional indexing forms can register the same sublane /
-    lane bids and reuse it.  The launcher reshapes ``x_flat`` by
-    ``lane_size`` so the kernel body sees a 2-D ``(total_K, M)`` ref.
+    Mosaic's auto-pipeline can't slice by a per-program scalar
+    ``starts[pid]``; Helion emits ``pl.ds(starts[0] + offset, BK)``
+    manually inside a fori_loop instead.  This class names one entry
+    point — the canonical ``x_flat[(starts + tile_k.idx) * M +
+    tile_m.idx]`` form — and caches the sublane / lane bids the DMA
+    emit consumes.  Other entry points can populate the same bids.
     """
 
     sublane_bid: int
@@ -221,14 +211,10 @@ def _analyze_indexing(node: torch.fx.Node, config: Config) -> None:
     tid = id(tensor_val)
     current = device_fn.pallas_memory_space.get(tid)
     if is_jagged_flat:
-        # Per-item sublane/lane DMA: tensor lives in HBM and gets sliced
-        # by ``pl.ds(starts[0] + offset, BK)`` on each fori_loop iter.
-        # Whole-tensor VMEM staging would also OOM at realistic sizes.
+        # Per-item DMA path: HBM-resident, sliced per fori_loop iter.
         device_fn.pallas_memory_space[tid] = PallasMemorySpace.HBM
-        # Register the resolved sublane / lane bids on the env so
-        # downstream codegen can route to the per-item DMA emit without
-        # re-parsing the pattern; ``has_jagged_flat_dma`` mirrors the
-        # state into ConfigSpec (no live env access there).
+        # Cache the bids the DMA emit will consume; mirror into
+        # ConfigSpec (no live env access at config-spec time).
         for p in indexing_patterns:
             if isinstance(p, JaggedFlatIndexPattern):
                 device_fn.pallas_jagged_flat_lane_size[tid] = p.lane_size
@@ -623,21 +609,11 @@ def _maybe_get_tile_begin_with_offset_info(
     return TileBeginWithOffsetPattern(block_id=block_id, offset=offset)
 
 
-# --- Per-item sublane/lane jagged DMA — pattern recognisers ------------
-#
-# Mosaic's pipelined DMA can't slice a jagged tensor by a per-program
-# scalar ``starts[pid]``: the auto-pipeline expects grid-aligned slice
-# math, not a data-dependent base read from SMEM.  Helion emits the DMA
-# manually instead — ``pl.ds(starts[0] + offset, BK)`` inside a
-# fori_loop, with the sublane axis stepping over the jagged dim and the
-# lane axis over the dense trailing dim.
-#
-# The recogniser below covers one entry point into that DMA emit: the
-# canonical 1-D ``x_flat[(starts + tile_k.idx) * M + tile_m.idx]`` form
-# users write for jagged-row reductions.  Returns
-# ``(sublane_bid, sublane_base_fx, lane_bid, lane_size=M)``; additional
-# indexing forms can register the same sublane / lane bids and reuse the
-# downstream emit unchanged.
+# Per-item sublane/lane jagged DMA — pattern recognisers.
+# Mosaic can't slice by per-program ``starts[pid]``; the recogniser below
+# detects one indexing form that needs the manual DMA emit and returns
+# ``(sublane_bid, sublane_base_fx, lane_bid, lane_size=M)`` for it.
+# Additional forms can populate the same bids without touching the emit.
 
 
 _ADD_TARGETS = (operator.add, torch.ops.aten.add.Tensor)
@@ -769,19 +745,9 @@ def _decompose_jagged_idx(
 def _parse_flat_jagged_subscript(
     idx_fx: torch.fx.Node, env: CompileEnvironment
 ) -> tuple[int, torch.fx.Node | None, int, int | torch.SymInt] | None:
-    """Recognise the canonical 1-D form a user writes to express jagged-row
-    access::
-
-        add(
-            broadcast(mul(broadcast(add(starts, tile_k.idx)), M)), broadcast(tile_m.idx)
-        )
-
-    Returns ``(sublane_bid, sublane_base_fx, lane_bid, M)`` or ``None``.
-
-    This is one entry point into the per-item sublane/lane DMA emit; see
-    the section header above for the broader picture.  Tries both arms of
-    each ``add``/``mul`` (commutative).  Peels broadcast wrappers
-    (``aten.unsqueeze``, ``hl.subscript``, ``_new_var``).
+    """Recognise ``add(mul(add(starts, tile_k.idx), M), tile_m.idx)`` modulo
+    broadcast wrappers; return ``(sublane_bid, sublane_base_fx, lane_bid, M)``
+    or ``None``. Tries both arms of each ``add``/``mul`` (commutative).
     """
     if not (
         idx_fx.op == "call_function"

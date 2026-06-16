@@ -1895,14 +1895,9 @@ def _build_jagged_flat_pattern_map(
     graph_info: object,
 ) -> dict[int, JaggedFlatIndexPattern]:
     """Map ``id(fake_tensor)`` to its ``JaggedFlatIndexPattern`` by walking
-    the loop body's load/store nodes.
-
-    The pattern carries the sublane / lane bids that drive the per-item
-    jagged DMA emit (Mosaic's auto-pipeline can't slice by a per-program
-    scalar ``starts[pid]``).  Used by ``_compute_vmem_shapes`` to size
-    the (BK, BM) scratch and by ``_build_hbm_dma_slice`` to emit
-    ``pl.ds(starts[0] + offset, BK)`` instead of the default whole-tensor
-    slice.
+    the loop body's load/store nodes. Drives ``_compute_vmem_shapes``
+    (size the (BK, BM) scratch) and ``_build_hbm_dma_slice`` (emit
+    ``pl.ds(starts[0] + offset, BK)`` instead of the default slice).
     """
     from .._compiler.pallas.plan_tiling import JaggedFlatIndexPattern
     from .memory_ops import load as _load_op
@@ -2246,17 +2241,10 @@ def _codegen_fori_loop(state: CodegenState) -> object:
     def _build_jagged_flat_hbm_dma_slice(
         jpat: JaggedFlatIndexPattern, fake: torch.Tensor, hbm_name: str
     ) -> str:
-        """Emit the per-item sublane/lane DMA slice for ``hbm_name``::
-
-            x_flat.at[pl.ds(starts[0] + k_offset, BK), pl.ds(m_offset, BM)]
-
-        This is the work-around for Mosaic's missing native support for
-        per-program scalar ``starts[pid]`` slicing of a jagged tensor: a
-        manual ``pl.ds`` slice with the sublane axis stepping over the
-        jagged dim and the lane axis over the dense trailing dim, emitted
-        once per fori_loop iter.  The sublane base is resolved from
-        ``jpat.sublane_base_fx`` back to its outer-scope ``starts`` name
-        via positional placeholder match.
+        """Emit ``x_flat.at[pl.ds(starts[0] + k_offset, BK), pl.ds(m_offset, BM)]``
+        — the per-item jagged DMA slice (Mosaic's auto-pipeline can't do
+        this). Resolves the sublane base by positional placeholder match
+        from ``jpat.sublane_base_fx`` back to its outer-scope ``starts``.
         """
         slice_parts: list[str] = []
         for axis_bid in (jpat.sublane_bid, jpat.lane_bid):

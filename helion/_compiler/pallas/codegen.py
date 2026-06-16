@@ -44,9 +44,8 @@ def load_expr(
         result = expr_from_string(f"jnp.array([{name}[{idx_str}]])")
     else:
         result = expr_from_string(f"{name}[{idx_str}]")
-    # Per-item sublane/lane jagged DMA: scratch is the 2-D (BK, BM) slice
-    # the DMA emit produces, but the user-source ``flat`` index is rank-
-    # expanded one more dim so the load result is 3-D (BB=1, BK, BM).
+    # Per-item jagged DMA: scratch is 2-D (BK, BM), but the rank-expanded
+    # ``flat`` index makes the user-source load 3-D (BB=1, BK, BM).
     from helion._compiler.pallas.plan_tiling import JaggedFlatIndexPattern
 
     if any(isinstance(p, JaggedFlatIndexPattern) for p in patterns):
