@@ -292,19 +292,24 @@ def _record_pad_info(
 ) -> None:
     """Record that a tensor dimension uses pl.ds() and may need host-side padding.
 
-    *extra_pad* accounts for non-zero loop begins: 0 when the loop starts
-    at offset 0, ``begin % block_size`` for a constant begin, or
-    ``block_size - 1`` for a data-dependent begin.
+    *extra_pad* is 0 for begin=0, ``begin % block_size`` for a constant
+    begin, or ``block_size - 1`` for a data-dependent begin.
 
-    Note: stores one entry per (tensor, dim).  If two inner loops tile the
-    same dim with different block_ids, the last one wins.  This is fine when
-    both loops use the same block size (the common case).
+    For jagged-flat tensors we keep the max ``extra_pad`` across all
+    block_ids tiling the same (tensor, dim); last-wins would let a
+    small-BK loop clobber a big-BK loop's tail buffer and the big-BK
+    DMA over-reads HBM at runtime.  Non-jagged-flat keeps last-wins.
     """
     pad_info = state.device_function.pallas_pad_info
     tensor_id = id(tensor)
     if tensor_id not in pad_info:
         pad_info[tensor_id] = {}
-    pad_info[tensor_id][tensor_dim] = (block_id, extra_pad)
+    if tensor_id in state.device_function.pallas_jagged_flat_lane_size:
+        existing = pad_info[tensor_id].get(tensor_dim)
+        if existing is None or extra_pad > existing[1]:
+            pad_info[tensor_id][tensor_dim] = (block_id, extra_pad)
+    else:
+        pad_info[tensor_id][tensor_dim] = (block_id, extra_pad)
 
 
 def _maybe_get_symbol_origin(idx: object) -> SymbolOrigin | None:
@@ -316,15 +321,116 @@ def _maybe_get_symbol_origin(idx: object) -> SymbolOrigin | None:
     return HostFunction.current().expr_to_origin.get(expr)
 
 
+def _pallas_jagged_flat_store_value_mask(
+    state: CodegenState,
+    value: ast.AST,
+    value_proxy: torch.Tensor,
+    subscript: list[object] | tuple[object, ...],
+    patterns: list[object] | tuple[object, ...] | None,
+    name: str,
+    idx_str: str,
+    mem_space: object,
+) -> ast.AST:
+    """Wrap ``value`` with any required jagged-tile mask before the store.
+
+    * Per-item jagged DMA tensor → mask on sublane + lane, squeeze the
+      leading ``BB=1`` dim so the value fits the 2-D VMEM scratch.
+    * Otherwise → mask only jagged-tile axes; non-jagged unaligned cases
+      are already covered by ``sliced_value_for_store``.
+
+    ``jnp.where``'s else-branch reads ``jnp.zeros_like(value)`` on HBM /
+    per-item-DMA tensors (where ``name[idx_str]`` would fault) and
+    ``name[idx_str]`` on VMEM-resident paths so masked-off lanes keep
+    their prior contents.
+    """
+    from .._compiler.compile_environment import CompileEnvironment
+    from .._compiler.device_function import PallasMemorySpace
+    from .._compiler.pallas.plan_tiling import JaggedFlatIndexPattern
+    from .._compiler.pallas.plan_tiling import TilePattern
+
+    env = CompileEnvironment.current()
+    jagged_flat_pattern: JaggedFlatIndexPattern | None = next(
+        (p for p in patterns or () if isinstance(p, JaggedFlatIndexPattern)), None
+    )
+    value_sizes = [*value_proxy.size()]
+    mask_exprs: list[str] = []
+    if jagged_flat_pattern is not None:
+        for axis_bid in (
+            jagged_flat_pattern.sublane_bid,
+            jagged_flat_pattern.lane_bid,
+        ):
+            mask_var = state.codegen.mask_var(axis_bid)
+            if mask_var is None:
+                continue
+            if env.is_jagged_tile(axis_bid):
+                mask_shape = env.jagged_tile_mask_shapes[axis_bid]
+                expand = state.tile_strategy.jagged_tile_expand_str(
+                    mask_shape, value_sizes
+                )
+            else:
+                axis_pos = 1 if axis_bid == jagged_flat_pattern.sublane_bid else 2
+                expand = state.tile_strategy.expand_str(value_sizes, axis_pos)
+            expr = f"({mask_var}.astype(jnp.float32){expand})"
+            if expr not in mask_exprs:
+                mask_exprs.append(expr)
+    else:
+        out_dim = 0
+        for idx, pattern in zip(subscript, patterns or (), strict=False):
+            if idx is None:
+                out_dim += 1
+                continue
+            if isinstance(pattern, TilePattern) and env.is_jagged_tile(
+                pattern.block_id
+            ):
+                mask_var = state.codegen.mask_var(pattern.block_id)
+                if mask_var is not None:
+                    mask_shape = env.jagged_tile_mask_shapes[pattern.block_id]
+                    expand = state.tile_strategy.jagged_tile_expand_str(
+                        mask_shape, value_sizes
+                    )
+                    expr = f"({mask_var}.astype(jnp.float32){expand})"
+                    if expr not in mask_exprs:
+                        mask_exprs.append(expr)
+            out_dim += 1
+    if mask_exprs:
+        mask_expr = " * ".join(mask_exprs)
+        if jagged_flat_pattern is not None or mem_space == PallasMemorySpace.HBM:
+            value = expr_from_string(
+                f"jnp.where(({mask_expr}).astype(jnp.bool_), {{value}}, "
+                f"jnp.zeros_like({{value}}))",
+                value=value,
+            )
+        else:
+            value = expr_from_string(
+                f"jnp.where(({mask_expr}).astype(jnp.bool_), {{value}}, "
+                f"{name}[{idx_str}])",
+                value=value,
+            )
+    if jagged_flat_pattern is not None and value_proxy.dim() >= 3:
+        value = expr_from_string("jnp.squeeze({value}, axis=0)", value=value)
+    return value
+
+
 @_decorators.codegen(store, "pallas")
 def _(state: CodegenState) -> None:
     tensor = state.proxy_arg(0)
     subscript = state.proxy_arg(1)
     assert isinstance(subscript, (list, tuple))
     value = state.ast_arg(2)
+    value_proxy = state.proxy_arg(2)
     assert isinstance(tensor, torch.Tensor)
-    name = state.device_function.tensor_arg(tensor).name
-    name = pallas_codegen.vmem_name(state, name)
+    hbm_name = state.device_function.tensor_arg(tensor).name
+    name = pallas_codegen.vmem_name(state, hbm_name)
+    # HBM refs reject indexed writes; only DMA.  Raise rather than emit
+    # a write that the TPU will reject at runtime.
+    from .._compiler.device_function import PallasMemorySpace
+
+    mem_space = state.device_function.pallas_memory_space.get(id(tensor))
+    if mem_space == PallasMemorySpace.HBM and name == hbm_name:
+        raise NotImplementedError(
+            "Pallas: direct store to HBM-marked tensor is not supported; "
+            "DMA emission via tile_b epilogue is required."
+        )
     # Increment memory op index to stay in sync with triton backend
     device_fn = state.device_function
     device_fn.device_store_index += 1
@@ -355,6 +461,10 @@ def _(state: CodegenState) -> None:
     if not scatter_patterns and state.device_function.carry_tiles:
         if emit_carry_store(state, tensor, subscript, name, idx_str, value):
             return
+    if isinstance(value_proxy, torch.Tensor):
+        value = _pallas_jagged_flat_store_value_mask(
+            state, value, value_proxy, subscript, patterns, name, idx_str, mem_space
+        )
     state.codegen.add_statement(
         statement_from_string(f"{name}[{idx_str}] = {{value}}", value=value)
     )
@@ -6820,9 +6930,31 @@ def _(state: CodegenState) -> object:
     return expr_from_string(f"({load_expr} if {mask_expr} else {zero}(0))")
 
 
-@_decorators.get_masked_value(load)
+@_decorators.get_masked_value(load, "common")
 def _(node: torch.fx.Node) -> int:
-    return 0  # loads are always masked to 0
+    # Loads are always masked to 0 by default.
+    return 0
+
+
+@_decorators.get_masked_value(load, "pallas")
+def _(node: torch.fx.Node) -> int | None:
+    # Per-item jagged DMA loads have no implicit OOB masking (the manual
+    # ``pl.ds`` copies whatever bytes are at the slice), so return None
+    # to keep ``_mask_to`` alive for the downstream reduction. Conservative
+    # test (runs before plan_tiling, can't read ``indexing_patterns``):
+    # any registered ``jagged_tile`` parent + a tensor-valued subscript.
+    from .._compiler.compile_environment import CompileEnvironment
+
+    env = CompileEnvironment.current()
+    if env.jagged_tile_parent_ids:
+        subscript = node.args[1]
+        if isinstance(subscript, (list, tuple)):
+            for idx in subscript:
+                if isinstance(idx, torch.fx.Node):
+                    val = idx.meta.get("val")
+                    if isinstance(val, torch.Tensor):
+                        return None
+    return 0  # loads are masked to 0 outside the jagged-flat path
 
 
 # TODO(joydddd): Add support for stack tensor in ref mode.

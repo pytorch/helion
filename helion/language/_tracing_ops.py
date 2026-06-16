@@ -29,6 +29,7 @@ if TYPE_CHECKING:
     from collections.abc import Callable
 
     from .._compiler.inductor_lowering import CodegenState
+    from .._compiler.pallas.plan_tiling import JaggedFlatIndexPattern
     from .._compiler.tile_strategy import TileStrategy
     from ..runtime.config import Config
 
@@ -2061,6 +2062,38 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
     return None
 
 
+def _build_jagged_flat_pattern_map(
+    graph_info: object,
+) -> dict[int, JaggedFlatIndexPattern]:
+    """Map ``id(fake_tensor)`` to its ``JaggedFlatIndexPattern`` by walking
+    the loop body's load/store nodes. Drives ``_compute_vmem_shapes``
+    (size the (BK, BM) scratch) and ``_build_hbm_dma_slice`` (emit
+    ``pl.ds(starts[0] + offset, BK)`` instead of the default slice).
+    """
+    from .._compiler.pallas.plan_tiling import JaggedFlatIndexPattern
+    from .memory_ops import load as _load_op
+    from .memory_ops import store as _store_op
+
+    result: dict[int, JaggedFlatIndexPattern] = {}
+    graph = getattr(graph_info, "graph", None)
+    if graph is None:
+        return result
+    for node in graph.nodes:
+        if node.op != "call_function" or node.target not in (_load_op, _store_op):
+            continue
+        tensor_node = node.args[0]
+        if not isinstance(tensor_node, torch.fx.Node):
+            continue
+        val = tensor_node.meta.get("val")
+        if not isinstance(val, torch.Tensor):
+            continue
+        for p in node.meta.get("indexing_patterns", []) or []:
+            if isinstance(p, JaggedFlatIndexPattern):
+                result[id(val)] = p
+                break
+    return result
+
+
 def _check_dma_alignment(vmem_shape: tuple[int, ...]) -> bool:
     """Check if a VMEM buffer shape satisfies TPU DMA alignment.
 
@@ -2087,10 +2120,20 @@ def _compute_vmem_shapes(
     slice_size_exprs: list[str],
     env: CompileEnvironment,
     state: CodegenState,
+    jagged_flat_patterns: dict[int, JaggedFlatIndexPattern] | None = None,
 ) -> list[tuple[int, ...]]:
     """Compute VMEM buffer shapes for each tensor in the fori_loop body."""
     vmem_shapes: list[tuple[int, ...]] = []
     for fake, sub_meta, _direction in all_tensor_info:
+        # Jagged-flat: 1-D at FX, but launcher reshapes to 2-D (total_K, M)
+        # and the per-iter DMA chunk is (BK, BM).
+        jpat = (jagged_flat_patterns or {}).get(id(fake))
+        if jpat is not None:
+            sublane_bs = state.device_function.resolved_block_size(jpat.sublane_bid)
+            lane_bs = state.device_function.resolved_block_size(jpat.lane_bid)
+            assert isinstance(sublane_bs, int) and isinstance(lane_bs, int)
+            vmem_shapes.append((sublane_bs, lane_bs))
+            continue
         dim_to_bid = _get_dim_block_ids(sub_meta, env)
         parts: list[int] = []
         for dim_idx in range(len(fake.shape)):
@@ -2131,6 +2174,7 @@ def _classify_pipelined_tensors(
     slice_size_exprs: list[str],
     env: CompileEnvironment,
     state: CodegenState,
+    jagged_flat_patterns: dict[int, JaggedFlatIndexPattern] | None = None,
 ) -> tuple[
     list[tuple[torch.Tensor, list[object], str]], list[tuple[int, ...]], set[int]
 ]:
@@ -2166,7 +2210,7 @@ def _classify_pipelined_tensors(
     for fake, _tensor_node, sub_meta in stored_tensors.values():
         all_tensor_info.append((fake, sub_meta, "store"))
     vmem_shapes = _compute_vmem_shapes(
-        all_tensor_info, block_ids, slice_size_exprs, env, state
+        all_tensor_info, block_ids, slice_size_exprs, env, state, jagged_flat_patterns
     )
     device_ir = HostFunction.current().device_ir
 
@@ -2186,11 +2230,15 @@ def _classify_pipelined_tensors(
             if isinstance(val, torch.Tensor):
                 outer_access_tensor_ids.add(id(val))
 
+    from .._compiler.device_function import PallasMemorySpace
+
     pipelined_ids: set[int] = set()
+    mem_space = state.device_function.pallas_memory_space
     for (fake, _sub_meta, _direction), vmem_shape in zip(
         all_tensor_info, vmem_shapes, strict=True
     ):
-        if not _check_dma_alignment(vmem_shape):
+        is_hbm_marked = mem_space.get(id(fake)) == PallasMemorySpace.HBM
+        if not is_hbm_marked and not _check_dma_alignment(vmem_shape):
             continue
         if id(fake) in outer_access_tensor_ids:
             continue
@@ -2262,8 +2310,15 @@ def _codegen_fori_loop(state: CodegenState) -> object:
     # avoids forcing every tensor onto the non-DMA path when a lone
     # non-pipelined tensor is present (which would load full outer-block
     # tiles into VMEM and may OOM at large shapes).
+    jagged_flat_patterns = _build_jagged_flat_pattern_map(graph_info)
     all_tensor_info, vmem_shapes, pipelined_tensor_ids = _classify_pipelined_tensors(
-        loaded_tensors, stored_tensors, block_ids, slice_size_exprs, env, state
+        loaded_tensors,
+        stored_tensors,
+        block_ids,
+        slice_size_exprs,
+        env,
+        state,
+        jagged_flat_patterns,
     )
 
     from .._compiler.device_function import PallasMemorySpace
@@ -2354,10 +2409,62 @@ def _codegen_fori_loop(state: CodegenState) -> object:
         _tensor_to_sem=tensor_to_sem,
     )
 
+    def _build_jagged_flat_hbm_dma_slice(
+        jpat: JaggedFlatIndexPattern, fake: torch.Tensor, hbm_name: str
+    ) -> str:
+        """Emit ``x_flat.at[pl.ds(starts[0] + k_offset, BK), pl.ds(m_offset, BM)]``
+        — the per-item jagged DMA slice (Mosaic's auto-pipeline can't do
+        this). Resolves the sublane base by positional placeholder match
+        from ``jpat.sublane_base_fx`` back to its outer-scope ``starts``.
+        """
+        slice_parts: list[str] = []
+        for axis_bid in (jpat.sublane_bid, jpat.lane_bid):
+            bs_var = state.device_function.block_size_var(axis_bid)
+            assert bs_var is not None
+            if axis_bid in block_ids:
+                ax_idx = block_ids.index(axis_bid)
+                begin_expr = begin_exprs[ax_idx]
+                iter_step_expr = iter_step_exprs[ax_idx]
+                dim_idx_expr = dim_idx_exprs[ax_idx]
+                axis_offset = f"({begin_expr}) + ({dim_idx_expr}) * ({iter_step_expr})"
+            else:
+                axis_offset = state.codegen.offset_var(axis_bid)
+            if axis_bid == jpat.sublane_bid:
+                # Resolve the inner-graph placeholder back to its
+                # outer-scope emit-time name via positional match.
+                sublane_base_fx = jpat.sublane_base_fx
+                assert sublane_base_fx is not None
+                placeholders = [
+                    n for n in graph_info.graph.nodes if n.op == "placeholder"
+                ]
+                assert isinstance(args, list)
+                if sublane_base_fx in placeholders:
+                    outer_ast = args[placeholders.index(sublane_base_fx)]
+                    starts_name = ast.unparse(outer_ast)
+                else:
+                    starts_name = sublane_base_fx.name
+                axis_offset = f"{starts_name}[0] + ({axis_offset})"
+            slice_parts.append(f"pl.ds({axis_offset}, {bs_var})")
+        # Sublane DMA over-reads by up to ``BK-1`` past the row's valid
+        # data on the last tile_k iter; without host pad, a near-tail
+        # row can read past ``x_flat`` end and fault the TPU.  The
+        # compute mask zeros the over-read so pad-to-0 is sufficient.
+        from .memory_ops import _record_pad_info
+
+        sublane_bs = state.device_function.resolved_block_size(jpat.sublane_bid)
+        if isinstance(sublane_bs, int):
+            _record_pad_info(state, fake, 0, jpat.sublane_bid, sublane_bs - 1)
+        _record_pad_info(state, fake, 1, jpat.lane_bid, 0)
+        return f"{hbm_name}.at[{', '.join(slice_parts)}]"
+
     def _build_hbm_dma_slice(
         fake: torch.Tensor, hbm_name: str, subscript_meta: list[object]
     ) -> str:
         """Build an HBM ref slicing expression for DMA with loop variable."""
+        jpat = jagged_flat_patterns.get(id(fake))
+        if jpat is not None:
+            return _build_jagged_flat_hbm_dma_slice(jpat, fake, hbm_name)
+
         dim_to_bid = _get_dim_block_ids(subscript_meta, env)
         shape = fake.shape
         parts: list[str] = []
@@ -2783,7 +2890,7 @@ def _(state: CodegenState) -> ast.Name:
     return lhs
 
 
-@_decorators.get_masked_value(_phi)
+@_decorators.get_masked_value(_phi, "common")
 def _(node: torch.fx.Node) -> float | bool | None:
     lhs, rhs = node.args
     assert isinstance(lhs, torch.fx.Node)
@@ -3002,6 +3109,13 @@ def _(state: CodegenState) -> ast.AST:
             mask_var := state.codegen.mask_var(index)
         ) is not None:
             expand = state.tile_strategy.expand_str(input_sizes, dim)
+            # Jagged-tile masks are 2-D (parent_dims, block_size); the
+            # default expand_str assumes 1-D.
+            if env.is_jagged_tile(index):
+                mask_shape = env.jagged_tile_mask_shapes[index]
+                expand = state.tile_strategy.jagged_tile_expand_str(
+                    mask_shape, input_sizes
+                )
             # Cast bool mask to float before expanding — Mosaic cannot
             # reshape bool vectors (e.g. vector<32xi1> → vector<32x1xi1>).
             expr = f"({mask_var}.astype(jnp.float32){expand})"
@@ -3091,7 +3205,7 @@ def _(state: CodegenState) -> ast.AST:
     )
 
 
-@_decorators.get_masked_value(_mask_to)
+@_decorators.get_masked_value(_mask_to, "common")
 def _(node: torch.fx.Node) -> float | bool:
     value = node.args[1]
     assert isinstance(value, (int, float, bool))
@@ -3136,7 +3250,7 @@ def _(state: CodegenState) -> ast.AST:
     return create(ast.Name, id=varname, ctx=ast.Load())
 
 
-@_decorators.get_masked_value(_new_var)
+@_decorators.get_masked_value(_new_var, "common")
 def _(node: torch.fx.Node) -> float | bool | None:
     from .._compiler.node_masking import cached_masked_value
 

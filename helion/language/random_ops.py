@@ -874,7 +874,7 @@ def _rand_fake(
     )
 
 
-@_decorators.get_masked_value(rand)
+@_decorators.get_masked_value(rand, "common")
 def _(node: torch.fx.Node) -> float:
     return 0
 
@@ -957,7 +957,7 @@ def _rand4x_fake(
     )
 
 
-@_decorators.get_masked_value(rand4x)
+@_decorators.get_masked_value(rand4x, "common")
 def _(node: torch.fx.Node) -> float:
     return 0
 
@@ -1040,7 +1040,7 @@ def _randint_fake(
     )
 
 
-@_decorators.get_masked_value(randint)
+@_decorators.get_masked_value(randint, "common")
 def _(node: torch.fx.Node) -> int:
     return 0
 

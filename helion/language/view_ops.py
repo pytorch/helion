@@ -119,7 +119,7 @@ def _(tensor: torch.Tensor, indices: list[object]) -> torch.Tensor:
     return tensor[indices]
 
 
-@_decorators.get_masked_value(subscript)
+@_decorators.get_masked_value(subscript, "common")
 def _(node: torch.fx.Node) -> float | bool | None:
     from .._compiler.node_masking import cached_masked_value
 

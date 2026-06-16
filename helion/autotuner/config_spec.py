@@ -356,6 +356,9 @@ class ConfigSpec:
         self.epilogue_subtile_k_hint: int = 0
         self.has_pallas_inner_loops: bool = False
         self.has_symbolic_or_data_dependent_bounds: bool = False
+        # Narrower than "any jagged_tile" — outer-dim jagged kernels don't
+        # emit the conflicting flat DMA and stay on the emit_pipeline path.
+        self.has_jagged_flat_dma: bool = False
         self._cute_tcgen05_config = CuteTcgen05Config(self)
         self.compiler_default_config: helion.Config | None = None
         self.compiler_seed_configs: list[helion.Config] = []
@@ -1496,6 +1499,10 @@ class ConfigSpec:
                 # TODO(thcmbs): Also exclude "emit_pipeline" when has_pallas_dma_unaligned
                 # is set, to avoid wasted autotuning effort. See PR #1969 review discussion.
                 choices = ("fori_loop", "emit_pipeline")
+            # emit_pipeline's BlockSpec cannot express data-dependent
+            # ``pl.ds(starts[i] + k*BK, BK)`` per-program DMA starts.
+            if self.has_jagged_flat_dma:
+                choices = ("fori_loop",)
             fields["pallas_loop_type"] = EnumFragment(choices=choices)
             if self.supports_config_key("pallas_pre_broadcast"):
                 fields["pallas_pre_broadcast"] = BooleanFragment()
@@ -1666,6 +1673,10 @@ class BlockSizeSpec(_PowerOfTwoBlockIdItem):
         )
         # Outer block_id whose tile extent caps this block's size in normalize().
         self.bounded_by_block_id: int | None = bounded_by_block_id
+        # If True, user-supplied block_size is clamped down to max_size in
+        # _normalize.  Default leaves over-blocking unchanged so users can
+        # exercise codegen slicing intentionally.
+        self.is_hard_pin: bool = False
         if self.max_size < self.min_size:
             self.max_size = self.min_size
         assert self.min_size <= self.max_size
@@ -1686,8 +1697,14 @@ class BlockSizeSpec(_PowerOfTwoBlockIdItem):
 
     def _normalize(self, name: str, value: object) -> int | None:
         result = super()._normalize(name, value)
-        if isinstance(result, int) and result < self.min_size:
-            result = self.min_size
+        if isinstance(result, int):
+            if result < self.min_size:
+                result = self.min_size
+            # Explicit flag, not ``min_size == max_size`` — that condition
+            # also fires for matmul broadcast-dim collapse and numel=1 dims
+            # where the user value should NOT be clamped.
+            if self.is_hard_pin and result > self.max_size:
+                result = self.max_size
         return result
 
     def update_min(self, value: int) -> None:

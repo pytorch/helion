@@ -93,7 +93,7 @@ class APIFunc(Protocol):
     _codegen: CodegenDict
     _fake_fn: Callable[..., object] | None
     _prepare_args: Callable[[tuple[object, ...]], tuple[object, ...]]
-    _get_masked_value: Callable[[torch.fx.Node], float | bool | None] | None
+    _get_masked_value: dict[str, Callable[[torch.fx.Node], float | bool | None]]
     _to_device_ir: Callable[..., object] | None
     _allow_host_tensor: bool
     _signature: inspect.Signature
@@ -209,7 +209,7 @@ def api(
         api._type_function = None
         api._codegen = CodegenDict()
         api._fake_fn = None
-        api._get_masked_value = None
+        api._get_masked_value = {}
         api._to_device_ir = None
         api._allow_host_tensor = allow_host_tensor
         api._signature = signature or inspect.signature(
@@ -294,17 +294,25 @@ def codegen(
 
 def get_masked_value(
     original_fn: Callable[..., object],
+    backend: str,
 ) -> _NoReturnDecorator[object]:
+    """Register a per-backend ``get_masked_value`` policy.
+
+    Mirrors ``codegen(op, backend)``: each backend can register its own
+    mask-value resolver for an op, with ``"common"`` providing the
+    default looked up if no backend-specific entry exists.
+    """
+
     def _impl(
         mask_value_fn: Callable[[torch.fx.Node], float | bool | None],
     ) -> Callable[..., Never]:
         assert is_api_func(original_fn), (
             f"{type_propagation.__qualname__} can only be used on API functions"
         )
-        assert original_fn._get_masked_value is None, (
-            "get_masked_value can only be used once per function"
+        assert backend not in original_fn._get_masked_value, (
+            f"get_masked_value already registered for backend {backend!r}"
         )
-        original_fn._get_masked_value = mask_value_fn
+        original_fn._get_masked_value[backend] = mask_value_fn
         return _no_call
 
     # pyrefly: ignore [bad-return]

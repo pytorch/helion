@@ -269,6 +269,11 @@ class CompileEnvironment:
         self._tensor_descriptor_layout_guard_source_cache: dict[int, Source | None] = {}
         self.jagged_tile_parent_ids: dict[int, list[int]] = {}
         self.jagged_tile_mask_shapes: dict[int, list[torch.SymInt]] = {}
+        # Bids consumed by the per-item jagged DMA emit (Mosaic can't slice
+        # by ``starts[pid]``). Set by plan_tiling; on env so non-device-
+        # scope readers can consult them.
+        self.pallas_jagged_flat_sublane_bids: set[int] = set()
+        self.pallas_jagged_flat_lane_bids: set[int] = set()
         self._symint_cache: dict[object, torch.SymInt] = {}
         self._foreign_symint_cache: dict[
             tuple[int, sympy.Expr], int | torch.SymInt

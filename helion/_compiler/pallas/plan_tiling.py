@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from dataclasses import field
+import operator
 from typing import TYPE_CHECKING
 
 import sympy
@@ -69,6 +70,24 @@ class NonePattern(IndexingPattern):
 @dataclass
 class TensorIndexPattern(IndexingPattern):
     """Tensor-valued index - no tiling. Resolved for indirect load/store codegen."""
+
+
+@dataclass
+class JaggedFlatIndexPattern(IndexingPattern):
+    """Entry point into the per-item sublane/lane jagged DMA emit.
+
+    Mosaic's auto-pipeline can't slice by a per-program scalar
+    ``starts[pid]``; Helion emits ``pl.ds(starts[0] + offset, BK)``
+    manually inside a fori_loop instead.  This class names one entry
+    point — the canonical ``x_flat[(starts + tile_k.idx) * M +
+    tile_m.idx]`` form — and caches the sublane / lane bids the DMA
+    emit consumes.  Other entry points can populate the same bids.
+    """
+
+    sublane_bid: int
+    sublane_base_fx: torch.fx.Node | None
+    lane_bid: int
+    lane_size: int | torch.SymInt
 
 
 @dataclass
@@ -140,6 +159,11 @@ def _analyze_indexing(node: torch.fx.Node, config: Config) -> None:
     indexing_patterns = _analyze_subscript_patterns(
         tensor_val, list(subscript), dim_tilings, node, config
     )
+    # Must capture before ``_resolve_tensor_index_patterns`` rewrites
+    # TensorIndexPattern into IndirectGather/ScatterPattern.
+    is_jagged_flat = any(
+        isinstance(p, JaggedFlatIndexPattern) for p in indexing_patterns
+    )
     _resolve_tensor_index_patterns(
         node, tensor_val, list(subscript), indexing_patterns, config
     )
@@ -161,9 +185,50 @@ def _analyze_indexing(node: torch.fx.Node, config: Config) -> None:
         isinstance(p, (ArbitraryIndexPattern, TileBeginWithOffsetPattern, NonePattern))
         for p in indexing_patterns
     )
+    # Jagged-parent-only access fetches a single element per program
+    # (parent block_size=1), so the tensor lives in SMEM.
+    from ..compile_environment import CompileEnvironment as _CompileEnvironment
+
+    _env = _CompileEnvironment.current()
+    _jagged_parent_bids = {
+        p for parents in _env.jagged_tile_parent_ids.values() for p in parents
+    }
+    is_jagged_pinned_only = bool(_jagged_parent_bids) and all(
+        (
+            isinstance(p, (TilePattern, TileIndexWithOffsetPattern))
+            and p.block_id in _jagged_parent_bids
+        )
+        or isinstance(p, NonePattern)
+        for p in indexing_patterns
+    )
+    # In a grid=(1,) jagged kernel, the whole-tensor VMEM BlockSpec would
+    # OOM at realistic output sizes — route stored tensors through HBM.
+    from ...language import memory_ops
+
+    is_store = node.target is memory_ops.store
+    is_jagged_kernel = bool(_jagged_parent_bids)
+
     tid = id(tensor_val)
     current = device_fn.pallas_memory_space.get(tid)
-    if is_all_scalar:
+    if is_jagged_flat:
+        # Per-item DMA path: HBM-resident, sliced per fori_loop iter.
+        device_fn.pallas_memory_space[tid] = PallasMemorySpace.HBM
+        # Cache the bids the DMA emit will consume; mirror into
+        # ConfigSpec (no live env access at config-spec time).
+        for p in indexing_patterns:
+            if isinstance(p, JaggedFlatIndexPattern):
+                device_fn.pallas_jagged_flat_lane_size[tid] = p.lane_size
+                _env.pallas_jagged_flat_sublane_bids.add(p.sublane_bid)
+                _env.pallas_jagged_flat_lane_bids.add(p.lane_bid)
+                _env.config_spec.has_jagged_flat_dma = True
+                break
+    elif is_jagged_pinned_only:
+        if current != PallasMemorySpace.HBM:
+            device_fn.pallas_memory_space[tid] = PallasMemorySpace.SMEM
+    elif is_jagged_kernel and is_store and not is_all_scalar:
+        if current != PallasMemorySpace.SMEM:
+            device_fn.pallas_memory_space[tid] = PallasMemorySpace.HBM
+    elif is_all_scalar:
         # Only mark for SMEM if not already assigned to VMEM or HBM
         if current is None:
             device_fn.pallas_memory_space[tid] = PallasMemorySpace.SMEM
@@ -251,9 +316,17 @@ def _detect_indexing_pattern(
                 block_id=tile_begin_with_offset.block_id,
                 offset=tile_begin_with_offset.offset,
             )
-        # A tensor-valued index that didn't match any arithmetic-of-tile
-        # pattern is an indirect gather (e.g. table[idx, :]).
         if isinstance(idx_val, torch.Tensor):
+            if env.jagged_tile_parent_ids:
+                parsed = _parse_flat_jagged_subscript(idx, env)
+                if parsed is not None:
+                    sublane_bid, sublane_base_fx, lane_bid, lane_size = parsed
+                    return JaggedFlatIndexPattern(
+                        sublane_bid=sublane_bid,
+                        sublane_base_fx=sublane_base_fx,
+                        lane_bid=lane_bid,
+                        lane_size=lane_size,
+                    )
             return TensorIndexPattern()
         # Indices produced by other FX nodes, such as indices[tile] used in
         # tensor-indexed atomics, are legal but cannot participate in Pallas
@@ -297,7 +370,19 @@ def _update_tiling_decision(
                 _disallow_tiling()
 
     if isinstance(pattern, TilePattern):
-        _try_set_tiling_block_id(pattern.block_id)
+        # Jagged-pinned parent (block_size=1, fori-driven): don't let
+        # BlockSpec carve this axis — the kernel needs the full tensor
+        # visible so each per-fori iter can slice ``pl.ds(pid_0, 1)``.
+        # Without this, 3+D tensors get block_shape=(1, ...) carving
+        # (the 2-D alignment rule below incidentally protects 2-D
+        # tensors like ``bias[tile_b, tile_k]``).
+        jagged_parent_bids = {
+            p for parents in env.jagged_tile_parent_ids.values() for p in parents
+        }
+        if pattern.block_id in jagged_parent_bids:
+            _disallow_tiling()
+        else:
+            _try_set_tiling_block_id(pattern.block_id)
 
     elif isinstance(pattern, TileIndexWithOffsetPattern):
         _disallow_tiling()
@@ -395,7 +480,11 @@ def _resolve_tensor_index_patterns(
     patterns: list[IndexingPattern],
     config: Config,
 ) -> None:
-    """Replace TensorIndexPattern with Pallas indirect load/store patterns."""
+    """Replace TensorIndexPattern with Pallas indirect load/store patterns.
+
+    Jagged-flat patterns are skipped — they have their own DMA emit path
+    that needs the cached sublane/lane metadata.
+    """
     positions = [i for i, p in enumerate(patterns) if isinstance(p, TensorIndexPattern)]
     if not positions:
         return
@@ -518,3 +607,284 @@ def _maybe_get_tile_begin_with_offset_info(
             offset = torch.SymInt(f"{block_size} + {offset}")  # type: ignore[arg-type]
 
     return TileBeginWithOffsetPattern(block_id=block_id, offset=offset)
+
+
+# Per-item sublane/lane jagged DMA — pattern recognisers.
+# Mosaic can't slice by per-program ``starts[pid]``; the recogniser below
+# detects one indexing form that needs the manual DMA emit and returns
+# ``(sublane_bid, sublane_base_fx, lane_bid, lane_size=M)`` for it.
+# Additional forms can populate the same bids without touching the emit.
+
+
+_ADD_TARGETS = (operator.add, torch.ops.aten.add.Tensor)
+_MUL_TARGETS = (operator.mul, torch.ops.aten.mul.Tensor)
+
+
+def _transparent_wrapper_targets() -> tuple[object, ...]:
+    """FX targets that pass through args[0] unchanged.  Built lazily to
+    avoid a circular import on module load.
+    """
+    from ...language import _tracing_ops
+    from ...language import view_ops
+
+    return (
+        view_ops.subscript,
+        _tracing_ops._new_var,
+        torch.ops.aten.unsqueeze.default,
+    )
+
+
+def _peel_wrappers(node: torch.fx.Node) -> torch.fx.Node:
+    """Follow transparent wrappers (broadcast + ``_new_var``) to the
+    underlying FX node. Pure analysis — does not mutate the FX graph."""
+    wrappers = _transparent_wrapper_targets()
+    while (
+        isinstance(node, torch.fx.Node)
+        and node.op == "call_function"
+        and node.target in wrappers
+        and node.args
+        and isinstance(node.args[0], torch.fx.Node)
+    ):
+        node = node.args[0]
+    return node
+
+
+def _extract_scalar(arg: object) -> int | torch.SymInt | None:
+    """Return ``arg`` if it's an int/SymInt or extract from an FX node whose
+    ``meta['val']`` is scalar. Used to recover ``M`` from ``mul(jagged, M)``."""
+    if isinstance(arg, (int, torch.SymInt)):
+        return arg
+    if isinstance(arg, torch.fx.Node):
+        val = arg.meta.get("val")
+        if isinstance(val, (int, torch.SymInt)):
+            return val
+    return None
+
+
+def _maybe_jagged_tile_bid(node: torch.fx.Node, env: CompileEnvironment) -> int | None:
+    """Return the jagged-tile block_id if ``node`` is a jagged-tile index
+    expression (either ``hl.tile_index(tile_sym)`` or the bare tile-sym FX
+    node). None if non-jagged or non-tile.
+    """
+    from ...language.tile_ops import tile_index as _tile_index_op
+
+    if (
+        node.op == "call_function"
+        and node.target is _tile_index_op
+        and node.args
+        and isinstance(node.args[0], torch.fx.Node)
+    ):
+        tile_val = node.args[0].meta.get("val")
+    else:
+        tile_val = node.meta.get("val")
+    if not isinstance(tile_val, torch.SymInt):
+        return None
+    bid = env.get_block_id(tile_val)
+    if bid is None or not env.is_jagged_tile(bid):
+        return None
+    return bid
+
+
+def _maybe_any_tile_bid(node: torch.fx.Node, env: CompileEnvironment) -> int | None:
+    """Like ``_maybe_jagged_tile_bid`` but doesn't require jaggedness. Used
+    for the dense-arm side of the flat-form (tile_m may be plain ``hl.tile``
+    OR ``hl.jagged_tile`` host-padded to a uniform extent)."""
+    from ...language.tile_ops import tile_index as _tile_index_op
+
+    if (
+        node.op == "call_function"
+        and node.target is _tile_index_op
+        and node.args
+        and isinstance(node.args[0], torch.fx.Node)
+    ):
+        tile_val = node.args[0].meta.get("val")
+    else:
+        tile_val = node.meta.get("val")
+    if not isinstance(tile_val, torch.SymInt):
+        return None
+    return env.get_block_id(tile_val)
+
+
+def _decompose_jagged_idx(
+    idx_fx: torch.fx.Node, env: CompileEnvironment
+) -> tuple[int, torch.fx.Node | None] | None:
+    """Recognise the sublane arm ``add(starts, tile_k.idx)`` (commutative)
+    or a bare ``tile_k.idx`` and return (jagged_bid, base_fx).
+
+    ``base_fx`` is None when the bare form matches (no per-item offset).
+    """
+    bid = _maybe_jagged_tile_bid(idx_fx, env)
+    if bid is not None:
+        return bid, None
+
+    if (
+        idx_fx.op == "call_function"
+        and idx_fx.target in _ADD_TARGETS
+        and len(idx_fx.args) == 2
+    ):
+        left, right = idx_fx.args
+        left_peeled = _peel_wrappers(left) if isinstance(left, torch.fx.Node) else left
+        right_peeled = (
+            _peel_wrappers(right) if isinstance(right, torch.fx.Node) else right
+        )
+        if isinstance(left_peeled, torch.fx.Node):
+            bid = _maybe_jagged_tile_bid(left_peeled, env)
+            if bid is not None:
+                return bid, (
+                    right_peeled if isinstance(right_peeled, torch.fx.Node) else None
+                )
+        if isinstance(right_peeled, torch.fx.Node):
+            bid = _maybe_jagged_tile_bid(right_peeled, env)
+            if bid is not None:
+                return bid, (
+                    left_peeled if isinstance(left_peeled, torch.fx.Node) else None
+                )
+    return None
+
+
+def _parse_flat_jagged_subscript(
+    idx_fx: torch.fx.Node, env: CompileEnvironment
+) -> tuple[int, torch.fx.Node | None, int, int | torch.SymInt] | None:
+    """Recognise ``add(mul(add(starts, tile_k.idx), M), tile_m.idx)`` modulo
+    broadcast wrappers; return ``(sublane_bid, sublane_base_fx, lane_bid, M)``
+    or ``None``. Tries both arms of each ``add``/``mul`` (commutative).
+    """
+    if not (
+        idx_fx.op == "call_function"
+        and idx_fx.target in _ADD_TARGETS
+        and len(idx_fx.args) == 2
+    ):
+        return None
+    left, right = idx_fx.args
+    if not (isinstance(left, torch.fx.Node) and isinstance(right, torch.fx.Node)):
+        return None
+
+    for mul_arm, dense_arm in ((left, right), (right, left)):
+        peeled_mul = _peel_wrappers(mul_arm)
+        if not (
+            peeled_mul.op == "call_function"
+            and peeled_mul.target in _MUL_TARGETS
+            and len(peeled_mul.args) == 2
+        ):
+            continue
+        mul_left, mul_right = peeled_mul.args
+
+        for inner_arm, m_arm in ((mul_left, mul_right), (mul_right, mul_left)):
+            if not isinstance(inner_arm, torch.fx.Node):
+                continue
+            lane_size = _extract_scalar(m_arm)
+            if lane_size is None:
+                continue
+            peeled_inner = _peel_wrappers(inner_arm)
+            jagged_decomp = _decompose_jagged_idx(peeled_inner, env)
+            if jagged_decomp is None:
+                continue
+            sublane_bid, sublane_base_fx = jagged_decomp
+
+            peeled_dense = _peel_wrappers(dense_arm)
+            lane_bid = _maybe_any_tile_bid(peeled_dense, env)
+            if lane_bid is None:
+                continue
+            return sublane_bid, sublane_base_fx, lane_bid, lane_size
+
+    return None
+
+
+def _carried_indices_for_loop_node(for_loop_node: torch.fx.Node) -> set[int]:
+    """Positional indices into ``for_loop_node.args[3]`` that are carried
+    across iterations.
+    """
+    from ...language._tracing_ops import _phi
+
+    carried_names: set[str] = set()
+    for user in for_loop_node.users:
+        for phi_user in user.users:
+            if (
+                phi_user.op == "call_function"
+                and phi_user.target is _phi
+                and phi_user.args
+                and isinstance(phi_user.args[0], torch.fx.Node)
+            ):
+                carried_names.add(phi_user.args[0].name)
+
+    loop_args = for_loop_node.args[3]
+    assert isinstance(loop_args, list)
+    return {
+        i
+        for i, arg in enumerate(loop_args)
+        if hasattr(arg, "name") and arg.name in carried_names
+    }
+
+
+def get_reduced_block_ids(
+    for_loop_node: torch.fx.Node,
+    loop_block_ids: list[int],
+    env: CompileEnvironment,
+) -> set[int]:
+    """Block_ids iterated by this loop whose dim is NOT present in any
+    carried accumulator's shape — i.e. reduced away.
+    """
+    carried = _carried_indices_for_loop_node(for_loop_node)
+    if not carried:
+        return set()
+
+    loop_args = for_loop_node.args[3]
+    assert isinstance(loop_args, list)
+    block_ids_in_any_acc: set[int] = set()
+    for i in carried:
+        arg = loop_args[i]
+        if not isinstance(arg, torch.fx.Node):
+            continue
+        val = arg.meta.get("val")
+        if not isinstance(val, torch.Tensor):
+            continue
+        for dim_size in val.shape:
+            bid = env.get_block_id(dim_size)
+            if isinstance(bid, int):
+                block_ids_in_any_acc.add(bid)
+
+    return set(loop_block_ids) - block_ids_in_any_acc
+
+
+def store_is_post_reduction(
+    store_node: torch.fx.Node,
+    env: CompileEnvironment,
+    graph_block_ids: dict[int, list[int]],
+) -> set[int]:
+    """Block_ids reduced by any inner loop whose final-carry feeds
+    ``store_node``'s stored value.  Empty when the value is computed
+    inline (per-iter disjoint writes).
+    """
+    from ...language._tracing_ops import is_for_loop_target
+
+    if len(store_node.args) < 3 or not isinstance(store_node.args[2], torch.fx.Node):
+        return set()
+
+    reduced: set[int] = set()
+    visited: set[torch.fx.Node] = set()
+    stack: list[torch.fx.Node] = [store_node.args[2]]
+
+    while stack:
+        cur = stack.pop()
+        if cur in visited:
+            continue
+        visited.add(cur)
+
+        if cur.op == "call_function" and cur.target is operator.getitem:
+            base = cur.args[0] if cur.args else None
+            if (
+                isinstance(base, torch.fx.Node)
+                and base.op == "call_function"
+                and is_for_loop_target(base.target)
+            ):
+                graph_id = base.args[0]
+                assert isinstance(graph_id, int)
+                loop_block_ids = graph_block_ids.get(graph_id, [])
+                reduced |= get_reduced_block_ids(base, loop_block_ids, env)
+                continue
+
+        for arg in cur.all_input_nodes:
+            if arg not in visited:
+                stack.append(arg)
+
+    return reduced

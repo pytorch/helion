@@ -1035,9 +1035,17 @@ class APIFuncLowering(Lowering):
         node.kwargs = {}
 
     def get_masked_value(self, node: torch.fx.Node) -> float | bool | None:
-        if self.api_func._get_masked_value is not None:
-            return self.api_func._get_masked_value(node)
-        return None
+        if not self.api_func._get_masked_value:
+            return None
+        from .compile_environment import CompileEnvironment
+
+        backend_name = CompileEnvironment.current().backend.name
+        fn = self.api_func._get_masked_value.get(
+            backend_name
+        ) or self.api_func._get_masked_value.get("common")
+        if fn is None:
+            return None
+        return fn(node)
 
 
 @dataclasses.dataclass

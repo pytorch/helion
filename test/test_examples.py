@@ -38,6 +38,7 @@ from helion._testing import skipIfXPU
 from helion._testing import xfailIfPallas
 from helion._testing import xfailIfPallasInterpret
 from helion._testing import xfailIfPallasTpu
+import helion.language as hl
 from helion.runtime.config import Config
 from helion.runtime.ref_mode import is_ref_mode_enabled
 
@@ -1114,7 +1115,6 @@ class TestExamples(RefEagerTestBase, TestCase):
                 block_sizes=[32768, 1],
             )
 
-    @xfailIfPallas("JAX tracer error with dynamic shapes")
     @skipIfRefEager("hl.jagged_tile does not support ref mode yet")
     def test_jagged_mean(self):
         num_rows, max_cols = 32, 64
@@ -1122,8 +1122,8 @@ class TestExamples(RefEagerTestBase, TestCase):
         lengths = torch.randint(1, max_cols + 1, (num_rows,), device=DEVICE)
         x_offsets = torch.cat(
             [
-                torch.zeros(1, dtype=torch.long, device=DEVICE),
-                torch.cumsum(lengths, dim=0),
+                torch.zeros(1, dtype=LONG_INT_TYPE, device=DEVICE),
+                torch.cumsum(lengths, dim=0).to(LONG_INT_TYPE),
             ]
         )
         nnz = int(x_offsets[-1])
@@ -1400,7 +1400,6 @@ class TestExamples(RefEagerTestBase, TestCase):
             num_stages=3,
         )
 
-    @xfailIfPallas("JAX tracer error with dynamic shapes")
     @skipIfRefEager("hl.jagged_tile does not support ref mode yet")
     def test_jagged_softmax(self):
         num_rows, max_cols = 128, 64
@@ -1408,8 +1407,8 @@ class TestExamples(RefEagerTestBase, TestCase):
         lengths = torch.randint(1, max_cols + 1, (num_rows,), device=DEVICE)
         x_offsets = torch.cat(
             [
-                torch.zeros(1, dtype=torch.long, device=DEVICE),
-                torch.cumsum(lengths, dim=0),
+                torch.zeros(1, dtype=LONG_INT_TYPE, device=DEVICE),
+                torch.cumsum(lengths, dim=0).to(LONG_INT_TYPE),
             ]
         )
         nnz = int(x_offsets[-1])
@@ -1902,7 +1901,6 @@ class TestExamples(RefEagerTestBase, TestCase):
             rtol=2e-1,
         )
 
-    @xfailIfPallas("JAX tracer error")
     @skipIfRefEager("hl.jagged_tile does not support ref mode yet")
     def test_jagged_sum(self):
         num_rows, max_cols = 128, 64
@@ -1910,8 +1908,8 @@ class TestExamples(RefEagerTestBase, TestCase):
         lengths = torch.randint(1, max_cols + 1, (num_rows,), device=DEVICE)
         x_offsets = torch.cat(
             [
-                torch.zeros(1, dtype=torch.long, device=DEVICE),
-                torch.cumsum(lengths, dim=0),
+                torch.zeros(1, dtype=LONG_INT_TYPE, device=DEVICE),
+                torch.cumsum(lengths, dim=0).to(LONG_INT_TYPE),
             ]
         )
         nnz = int(x_offsets[-1])
@@ -1928,6 +1926,164 @@ class TestExamples(RefEagerTestBase, TestCase):
             expected,
             fn_name="jagged_sum_kernel",
             block_sizes=[16, 8, 16],
+        )
+
+    @skipIfRefEager("hl.jagged_tile does not support ref mode yet")
+    def test_jagged_amax(self):
+        # Mirrors ``test_jagged_sum`` data setup; swaps ``sum`` for ``amax``.
+
+        @helion.kernel()
+        def jagged_amax_kernel(
+            x_data: torch.Tensor,
+            x_offsets: torch.Tensor,
+        ) -> torch.Tensor:
+            M = x_data.shape[1]
+            num_rows = x_offsets.size(0) - 1
+
+            out = torch.full(
+                [num_rows, M],
+                float("-inf"),
+                dtype=x_data.dtype,
+                device=x_data.device,
+            )
+
+            x_flat = x_data.view(-1)
+
+            for tile_b in hl.tile(num_rows):
+                starts = x_offsets[tile_b]
+                ends = x_offsets[tile_b.index + 1]
+                nnz = ends - starts
+
+                for tile_m in hl.tile(M):
+                    row_max = hl.full(
+                        [tile_b, tile_m], float("-inf"), dtype=x_data.dtype
+                    )
+
+                    for tile_k in hl.jagged_tile(nnz):
+                        base_indices = starts[:, None] + tile_k.index[None, :]
+                        flat_indices = (
+                            base_indices[:, :, None] * M + tile_m.index[None, None, :]
+                        )
+                        x_slice = hl.load(x_flat, [flat_indices])
+                        row_max = torch.maximum(row_max, x_slice.amax(dim=1))
+
+                    out[tile_b, tile_m] = row_max
+
+            return out
+
+        def reference_jagged_amax_kernel_pytorch(
+            x_data: torch.Tensor,
+            x_offsets: torch.Tensor,
+        ) -> torch.Tensor:
+            num_rows = x_offsets.numel() - 1
+            M = x_data.size(1)
+            out = torch.full(
+                (num_rows, M),
+                float("-inf"),
+                dtype=x_data.dtype,
+                device=x_data.device,
+            )
+            for i in range(num_rows):
+                start = int(x_offsets[i])
+                end = int(x_offsets[i + 1])
+                if end > start:
+                    out[i, :] = x_data[start:end, :].amax(dim=0)
+            return out
+
+        num_rows, max_cols = 128, 64
+        M = 8  # number of features
+        lengths = torch.randint(1, max_cols + 1, (num_rows,), device=DEVICE)
+        x_offsets = torch.cat(
+            [
+                torch.zeros(1, dtype=LONG_INT_TYPE, device=DEVICE),
+                torch.cumsum(lengths, dim=0).to(LONG_INT_TYPE),
+            ]
+        )
+        nnz = int(x_offsets[-1])
+        x_data = torch.randn(nnz, M, dtype=torch.float32, device=DEVICE)
+
+        expected = reference_jagged_amax_kernel_pytorch(x_data, x_offsets)
+        torch.testing.assert_close(
+            jagged_amax_kernel(x_data, x_offsets), expected, atol=1e-4, rtol=1e-4
+        )
+
+    @skipIfRefEager("hl.jagged_tile does not support ref mode yet")
+    def test_jagged_amin(self):
+        # Mirrors ``test_jagged_sum`` data setup; swaps ``sum`` for ``amin``.
+
+        @helion.kernel()
+        def jagged_amin_kernel(
+            x_data: torch.Tensor,
+            x_offsets: torch.Tensor,
+        ) -> torch.Tensor:
+            M = x_data.shape[1]
+            num_rows = x_offsets.size(0) - 1
+
+            out = torch.full(
+                [num_rows, M],
+                float("inf"),
+                dtype=x_data.dtype,
+                device=x_data.device,
+            )
+
+            x_flat = x_data.view(-1)
+
+            for tile_b in hl.tile(num_rows):
+                starts = x_offsets[tile_b]
+                ends = x_offsets[tile_b.index + 1]
+                nnz = ends - starts
+
+                for tile_m in hl.tile(M):
+                    row_min = hl.full(
+                        [tile_b, tile_m], float("inf"), dtype=x_data.dtype
+                    )
+
+                    for tile_k in hl.jagged_tile(nnz):
+                        base_indices = starts[:, None] + tile_k.index[None, :]
+                        flat_indices = (
+                            base_indices[:, :, None] * M + tile_m.index[None, None, :]
+                        )
+                        x_slice = hl.load(x_flat, [flat_indices])
+                        row_min = torch.minimum(row_min, x_slice.amin(dim=1))
+
+                    out[tile_b, tile_m] = row_min
+
+            return out
+
+        def reference_jagged_amin_kernel_pytorch(
+            x_data: torch.Tensor,
+            x_offsets: torch.Tensor,
+        ) -> torch.Tensor:
+            num_rows = x_offsets.numel() - 1
+            M = x_data.size(1)
+            out = torch.full(
+                (num_rows, M),
+                float("inf"),
+                dtype=x_data.dtype,
+                device=x_data.device,
+            )
+            for i in range(num_rows):
+                start = int(x_offsets[i])
+                end = int(x_offsets[i + 1])
+                if end > start:
+                    out[i, :] = x_data[start:end, :].amin(dim=0)
+            return out
+
+        num_rows, max_cols = 128, 64
+        M = 8  # number of features
+        lengths = torch.randint(1, max_cols + 1, (num_rows,), device=DEVICE)
+        x_offsets = torch.cat(
+            [
+                torch.zeros(1, dtype=LONG_INT_TYPE, device=DEVICE),
+                torch.cumsum(lengths, dim=0).to(LONG_INT_TYPE),
+            ]
+        )
+        nnz = int(x_offsets[-1])
+        x_data = torch.randn(nnz, M, dtype=torch.float32, device=DEVICE)
+
+        expected = reference_jagged_amin_kernel_pytorch(x_data, x_offsets)
+        torch.testing.assert_close(
+            jagged_amin_kernel(x_data, x_offsets), expected, atol=1e-4, rtol=1e-4
         )
 
     @skipIfXPU("Timeout on XPU")
@@ -2028,7 +2184,6 @@ class TestExamples(RefEagerTestBase, TestCase):
         )
         torch.testing.assert_close(result, expected, atol=1e-1, rtol=1e-2)
 
-    @xfailIfPallas("JAX tracer error")
     @skipIfRefEager("hl.jagged_tile does not support ref mode yet")
     def test_jagged_layer_norm(self):
         num_rows, max_cols = 128, 64
@@ -2036,8 +2191,8 @@ class TestExamples(RefEagerTestBase, TestCase):
         lengths = torch.randint(1, max_cols + 1, (num_rows,), device=DEVICE)
         x_offsets = torch.cat(
             [
-                torch.zeros(1, dtype=torch.long, device=DEVICE),
-                torch.cumsum(lengths, dim=0),
+                torch.zeros(1, dtype=LONG_INT_TYPE, device=DEVICE),
+                torch.cumsum(lengths, dim=0).to(LONG_INT_TYPE),
             ]
         )
         nnz = int(x_offsets[-1])

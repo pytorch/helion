@@ -35,6 +35,7 @@ if TYPE_CHECKING:
 
     from ..autotuner.config_fragment import ConfigSpecFragment
     from ..autotuner.config_priors import ValuePrior
+    from ..autotuner.config_spec import BlockSizeSpec
     from ..autotuner.config_spec import ConfigSpec
     from ..runtime.config import Config
     from ..runtime.kernel import BoundKernel
@@ -1877,7 +1878,17 @@ class PallasBackend(Backend):
                 super().__init__()
                 self.backend = backend
                 self.required_alignments: dict[int, int] = {}
+                # Smallest static tensor dim observed via ``t[..., tile, ...]``.
+                # Needed because ``hl.jagged_tile`` defaults ``size_hint=8192``
+                # (data-dependent numel), so the cap step can't use size_hint
+                # as a stand-in for the indexed tensor dim.
+                self.observed_dim_sizes: dict[int, int] = {}
                 self.update_requirements_from_fake_tensor_loads()
+
+            def maybe_update_observed_dim_size(self, bid: int, dim_size: int) -> None:
+                prev = self.observed_dim_sizes.get(bid)
+                if prev is None or dim_size < prev:
+                    self.observed_dim_sizes[bid] = dim_size
 
             def visit_Subscript(self, node: ast.Subscript) -> None:
                 assert isinstance(node, ExtendedAST)
@@ -1929,6 +1940,10 @@ class PallasBackend(Backend):
                         dim_from_end, tensor.ndim, bitwidth
                     )
                     self.maybe_update_required_alignment(bid, required_alignment)
+                    if 0 <= accessed_dim < tensor.ndim:
+                        dim_size = tensor.shape[accessed_dim]
+                        if isinstance(dim_size, int):
+                            self.maybe_update_observed_dim_size(bid, dim_size)
 
             def maybe_update_required_alignment(
                 self, bid: int, required_alignment: int
@@ -1965,12 +1980,14 @@ class PallasBackend(Backend):
                                 self.maybe_update_required_alignment(
                                     info.block_id, required_alignment
                                 )
+                                if isinstance(tensor.shape[dim], int):
+                                    self.maybe_update_observed_dim_size(
+                                        info.block_id, tensor.shape[dim]
+                                    )
 
         analyzer = TensorTiledAccessAnalyzer(self)
         for stmt in host_func.body:
             analyzer.visit(stmt)
-
-        from torch._inductor.runtime.runtime_utils import next_power_of_2
 
         if block_sizes is not None and kernel_tensor_sizes is not None:
             for shape in kernel_tensor_sizes:
@@ -1983,14 +2000,47 @@ class PallasBackend(Backend):
                         # https://github.com/jax-ml/jax/issues/36970
                         analyzer.maybe_update_required_alignment(bid, 2)
 
+        # Jagged_tile parents are pinned to block_size=1 (one program per
+        # item); alignment propagation must not raise their minimums.
+        from .compile_environment import CompileEnvironment as _CompileEnvironment
+
+        _env_for_jagged = _CompileEnvironment.current()
+        jagged_parent_bids: set[int] = {
+            p
+            for parents in _env_for_jagged.jagged_tile_parent_ids.values()
+            for p in parents
+        }
+        jagged_tile_bids: set[int] = set(_env_for_jagged.jagged_tile_parent_ids.keys())
+
+        # ``visit_Subscript`` only sees direct subscripts; the per-item
+        # jagged DMA path's constructed FX index hides the lane indexer,
+        # so force lane=128 for every non-parent non-child bid.
+        if jagged_parent_bids:
+            for spec in block_specs:
+                if not isinstance(spec, BlockSizeSpec):
+                    continue
+                bid = spec.block_ids[0]
+                if bid in jagged_parent_bids or bid in jagged_tile_bids:
+                    continue
+                analyzer.maybe_update_required_alignment(bid, 128)
+
         for spec in block_specs:
             if not isinstance(spec, BlockSizeSpec):
                 continue
             bid = spec.block_ids[0]
             if bid not in analyzer.required_alignments:
                 continue
+            if bid in jagged_parent_bids:
+                continue
             requirement_alignment = analyzer.required_alignments[bid]
-            dim_size = next_power_of_2(max(spec.size_hint, 1))
+            dim_size = self._update_dim_size_for_jagged_flat(
+                spec,
+                bid,
+                requirement_alignment,
+                analyzer.observed_dim_sizes,
+                jagged_tile_bids,
+                jagged_parent_bids,
+            )
             # Cap the alignment requirement by the tensor lane dim: when
             # the dim is smaller than the requirement, the full-dim access
             # is always aligned at offset 0 so block_size = dim_size is
@@ -2007,11 +2057,45 @@ class PallasBackend(Backend):
         }
         for spec in block_specs_by_id.values():
             bounded_by = spec.bounded_by_block_id
-            if bounded_by is None:
+            if bounded_by is None or bounded_by in jagged_parent_bids:
                 continue
             outer_spec = block_specs_by_id.get(bounded_by)
             if outer_spec is not None:
                 outer_spec.update_min(spec.min_size)
+
+    @staticmethod
+    def _update_dim_size_for_jagged_flat(
+        spec: BlockSizeSpec,
+        bid: int,
+        requirement_alignment: int,
+        observed_dim_sizes: dict[int, int],
+        jagged_tile_bids: set[int],
+        jagged_parent_bids: set[int],
+    ) -> int:
+        """Pick ``dim_size`` for ``spec.update_min(min(req, dim_size))``.
+
+        Jagged_tile ``size_hint`` defaults to 8192 (parent ``numel`` is
+        data-dependent at trace); cap to observed tensor dim when smaller
+        so autotune picks reasonable block sizes on small jagged kernels.
+        Bypassed on lane bids (req==128) — the DMA needs full 128 there.
+        """
+        from torch._inductor.runtime.runtime_utils import next_power_of_2
+
+        apply_observed_cap = bid in jagged_tile_bids and not (
+            bool(jagged_parent_bids) and requirement_alignment == 128
+        )
+        if not apply_observed_cap:
+            return next_power_of_2(max(spec.size_hint, 1))
+
+        size_hint_dim = next_power_of_2(max(spec.size_hint, 1))
+        observed = observed_dim_sizes.get(bid)
+        if observed is None:
+            return size_hint_dim
+
+        if observed < spec.size_hint:
+            spec.update_hint(observed)
+
+        return min(size_hint_dim, next_power_of_2(max(observed, 1)))
 
     def tunable_fragments(self) -> dict[str, ConfigSpecFragment]:
         return {}
@@ -2508,6 +2592,20 @@ class PallasBackend(Backend):
                     launcher_args.append(
                         f"_pipeline_arg_indices={pipeline_arg_indices!r}"
                     )
+
+                # Host-side 1-D, kernel-side 2-D ``(total_K, M)``.
+                jagged_lane_sizes = device_fn.pallas_jagged_flat_lane_size
+                if jagged_lane_sizes:
+                    reshape_2d_indices = [
+                        (i, int(jagged_lane_sizes[id(arg.fake_value)]))
+                        for i, arg in enumerate(sorted_args)
+                        if isinstance(arg, TensorArg)
+                        and id(arg.fake_value) in jagged_lane_sizes
+                    ]
+                    if reshape_2d_indices:
+                        launcher_args.append(
+                            f"_reshape_2d_arg_indices={reshape_2d_indices!r}"
+                        )
 
         if CompileEnvironment.current().settings.pallas_interpret:
             launcher_args.append("_pallas_interpret=True")

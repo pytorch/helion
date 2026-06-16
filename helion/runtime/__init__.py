@@ -1883,6 +1883,16 @@ def default_pallas_fori_launcher(
     The kernel uses ``jax.lax.fori_loop`` with ``pltpu.make_async_copy``
     internally for DMA control.
     """
+    # Jagged-flat: reshape user-flat (total_K * M,) → 2-D (total_K, M)
+    # so the kernel can drive a 2-D DMA slice.
+    reshape_2d = kwargs.get("_reshape_2d_arg_indices")
+    if reshape_2d:
+        args_list = list(args)
+        for arg_idx, lane_size in cast("list[tuple[int, int]]", reshape_2d):
+            t = args_list[arg_idx]
+            assert isinstance(t, torch.Tensor)
+            args_list[arg_idx] = t.view(-1, lane_size)
+        args = tuple(args_list)
     cache = getattr(pallas_kernel, "_pallas_fori_cache", None)
     if cache is None or cache[0] != grid:
         cache = _pallas_install_launcher_cache(
