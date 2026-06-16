@@ -38,6 +38,7 @@ from helion._testing import skipIfXPU
 from helion._testing import xfailIfPallas
 from helion._testing import xfailIfPallasInterpret
 from helion._testing import xfailIfPallasTpu
+import helion.language as hl
 from helion.runtime.config import Config
 from helion.runtime.ref_mode import is_ref_mode_enabled
 
@@ -1931,10 +1932,45 @@ class TestExamples(RefEagerTestBase, TestCase):
     def test_jagged_amax(self):
         """Per-row max — sum-like reduction with ``-inf`` init + ``maximum``.
 
-        Exercises the same jagged-flat pattern as ``jagged_sum`` but with a
-        non-sum accumulator, so the pattern-matcher's reduction-op recognition
-        is tested independently.
+        Same jagged-flat pattern as ``jagged_sum`` but with a non-sum
+        accumulator, so the pattern-matcher's reduction-op recognition is
+        exercised on a non-additive op (covers @AmesingFlank's PR #2616
+        comment that the canonical-form recognition shouldn't be sum-only).
+        Kernel is inlined here rather than living in ``examples/`` because
+        it is a coverage variant, not a standalone user-facing example.
         """
+
+        @helion.kernel(static_shapes=True)
+        def jagged_amax_kernel(
+            x_data: torch.Tensor, x_offsets: torch.Tensor
+        ) -> torch.Tensor:
+            M = x_data.shape[1]
+            num_rows = x_offsets.size(0) - 1
+            out = torch.full(
+                [num_rows, M],
+                float("-inf"),
+                dtype=x_data.dtype,
+                device=x_data.device,
+            )
+            x_flat = x_data.view(-1)
+            for tile_b in hl.tile(num_rows):
+                starts = x_offsets[tile_b]
+                ends = x_offsets[tile_b.index + 1]
+                nnz_here = ends - starts
+                for tile_m in hl.tile(M):
+                    row_max = hl.full(
+                        [tile_b, tile_m], float("-inf"), dtype=x_data.dtype
+                    )
+                    for tile_k in hl.jagged_tile(nnz_here):
+                        base = starts[:, None] + tile_k.index[None, :]
+                        flat = base[:, :, None] * M + tile_m.index[None, None, :]
+                        row_max = torch.maximum(
+                            row_max, hl.load(x_flat, [flat]).amax(dim=1)
+                        )
+                    out[tile_b, tile_m] = row_max
+            return out
+
+        torch.manual_seed(0)
         num_rows, max_cols = 128, 64
         M = 8
         lengths = torch.randint(1, max_cols + 1, (num_rows,), device=DEVICE)
@@ -1946,22 +1982,59 @@ class TestExamples(RefEagerTestBase, TestCase):
         )
         nnz = int(x_offsets[-1])
         x_data = torch.randn(nnz, M, dtype=torch.float32, device=DEVICE)
-        args = (x_data, x_offsets)
 
-        mod = import_path(EXAMPLES_DIR / "jagged_amax.py")
-        expected = mod.reference_jagged_amax_kernel_pytorch(x_data, x_offsets)
+        expected = torch.full(
+            (num_rows, M), float("-inf"), dtype=x_data.dtype, device=DEVICE
+        )
+        for i in range(num_rows):
+            s = int(x_offsets[i])
+            e = int(x_offsets[i + 1])
+            if e > s:
+                expected[i, :] = x_data[s:e, :].amax(dim=0)
 
-        check_example(
-            "jagged_amax",
-            args,
-            expected,
-            fn_name="jagged_amax_kernel",
-            block_sizes=[16, 8, 16],
+        torch.testing.assert_close(
+            jagged_amax_kernel(x_data, x_offsets), expected, atol=1e-4, rtol=1e-4
         )
 
     @skipIfRefEager("hl.jagged_tile does not support ref mode yet")
     def test_jagged_amin(self):
-        """Per-row min — sum-like reduction with ``+inf`` init + ``minimum``."""
+        """Per-row min — sum-like reduction with ``+inf`` init + ``minimum``.
+
+        Coverage variant of ``test_jagged_amax``; same rationale for inlining
+        the kernel instead of adding an ``examples/`` file.
+        """
+
+        @helion.kernel(static_shapes=True)
+        def jagged_amin_kernel(
+            x_data: torch.Tensor, x_offsets: torch.Tensor
+        ) -> torch.Tensor:
+            M = x_data.shape[1]
+            num_rows = x_offsets.size(0) - 1
+            out = torch.full(
+                [num_rows, M],
+                float("inf"),
+                dtype=x_data.dtype,
+                device=x_data.device,
+            )
+            x_flat = x_data.view(-1)
+            for tile_b in hl.tile(num_rows):
+                starts = x_offsets[tile_b]
+                ends = x_offsets[tile_b.index + 1]
+                nnz_here = ends - starts
+                for tile_m in hl.tile(M):
+                    row_min = hl.full(
+                        [tile_b, tile_m], float("inf"), dtype=x_data.dtype
+                    )
+                    for tile_k in hl.jagged_tile(nnz_here):
+                        base = starts[:, None] + tile_k.index[None, :]
+                        flat = base[:, :, None] * M + tile_m.index[None, None, :]
+                        row_min = torch.minimum(
+                            row_min, hl.load(x_flat, [flat]).amin(dim=1)
+                        )
+                    out[tile_b, tile_m] = row_min
+            return out
+
+        torch.manual_seed(0)
         num_rows, max_cols = 128, 64
         M = 8
         lengths = torch.randint(1, max_cols + 1, (num_rows,), device=DEVICE)
@@ -1973,17 +2046,18 @@ class TestExamples(RefEagerTestBase, TestCase):
         )
         nnz = int(x_offsets[-1])
         x_data = torch.randn(nnz, M, dtype=torch.float32, device=DEVICE)
-        args = (x_data, x_offsets)
 
-        mod = import_path(EXAMPLES_DIR / "jagged_amin.py")
-        expected = mod.reference_jagged_amin_kernel_pytorch(x_data, x_offsets)
+        expected = torch.full(
+            (num_rows, M), float("inf"), dtype=x_data.dtype, device=DEVICE
+        )
+        for i in range(num_rows):
+            s = int(x_offsets[i])
+            e = int(x_offsets[i + 1])
+            if e > s:
+                expected[i, :] = x_data[s:e, :].amin(dim=0)
 
-        check_example(
-            "jagged_amin",
-            args,
-            expected,
-            fn_name="jagged_amin_kernel",
-            block_sizes=[16, 8, 16],
+        torch.testing.assert_close(
+            jagged_amin_kernel(x_data, x_offsets), expected, atol=1e-4, rtol=1e-4
         )
 
     @skipIfXPU("Timeout on XPU")
