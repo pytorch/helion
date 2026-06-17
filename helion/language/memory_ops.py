@@ -22,8 +22,10 @@ from .._compiler.cute.cute_epilogue import _AuxiliaryTensorStep
 from .._compiler.cute.cute_epilogue import analyze_tcgen05_unary_epilogue_chain
 from .._compiler.cute.cute_fx_walk import reach_tcgen05_matmul_anchors
 from .._compiler.cute.cutedsl_compat import emit_pipeline_advance
-from .._compiler.cute.strategies import tcgen05_default_epilogue_tile_expr
 from .._compiler.cute.strategies import tcgen05_explicit_d_store_tile_expr
+from .._compiler.cute.strategies import tcgen05_is_two_cta_m128
+from .._compiler.cute.strategies import tcgen05_resolve_epilogue_tile
+from .._compiler.cute.strategies import tcgen05_two_cta_m128_epilogue_tile_expr
 from .._compiler.cute.tcgen05_constants import (
     TCGEN05_ACC_WAIT_PLACEMENT_BEFORE_SUBTILE_LOOP,
 )
@@ -118,6 +120,11 @@ class _AuxStepRecord:
     aux_rmem: str
     aux_loaded: str
     aux_view2d: str | None
+    # Pre-wait register hoist (bm=128 2-CTA family only): name of the
+    # whole-fragment register tensor filled by ``autovec_copy`` BEFORE the
+    # accumulator ``consumer_wait`` so the rowvec GMEM latency hides under
+    # the MMA wait. ``None`` keeps the per-subtile GMEM load.
+    aux_rmem_full: str | None = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -343,6 +350,11 @@ def _(state: CodegenState) -> None:
         value = emit_scatter_store(
             state, scatter_patterns[0].plan, name, idx_str, value
         )
+    from .._compiler.pallas.ordered_carry import emit_carry_store
+
+    if not scatter_patterns and state.device_function.carry_tiles:
+        if emit_carry_store(state, tensor, subscript, name, idx_str, value):
+            return
     state.codegen.add_statement(
         statement_from_string(f"{name}[{idx_str}] = {{value}}", value=value)
     )
@@ -2417,6 +2429,34 @@ def _cute_combined_mask(
                     block_id = bid
                     break
         elif isinstance(idx, torch.Tensor):
+            # A free ``hl.arange`` mapped onto a synthetic thread axis carries no
+            # block id, so the loops below add no bound for it. Emit its lane
+            # bound explicitly to mask the out-of-bounds lanes a wider sibling
+            # branch can introduce on a shared axis.
+            arange_bound = _cute_synthetic_arange_lane_bound(
+                state, pos, tensor, tensor_dim
+            )
+            if arange_bound is not None and arange_bound not in terms:
+                terms.append(arange_bound)
+            # A reduction/grid dim mapped onto a thread axis can be *widened*
+            # beyond its own extent by a mutually-exclusive sibling branch that
+            # reuses the same axis (the launch block is sized to the widest
+            # user). When this access addresses such a dim per-lane, bound the
+            # lane to its own dim size so the surplus lanes a wider sibling adds
+            # do not load/store out of bounds. ``active_local_coord`` is the
+            # per-lane in-axis coordinate; ``< dim_size`` is a no-op when the
+            # axis already matches this dim.
+            if tensor is not None and tensor_dim < tensor.ndim:
+                for bid in _matching_block_ids(env, tensor.shape[tensor_dim]):
+                    local_coord = active_local_coord(bid)
+                    if local_coord is not None:
+                        lane_bound = (
+                            f"({local_coord}) < "
+                            f"{_cute_tensor_dim_size_expr(state, tensor, tensor_dim)}"
+                        )
+                        if lane_bound not in terms:
+                            terms.append(lane_bound)
+                        break
             if not include_tensor_index_masks:
                 for dim_size in idx.shape:
                     for bid in _matching_block_ids(env, dim_size):
@@ -2459,6 +2499,83 @@ def _cute_combined_mask(
     if not terms:
         return None
     return " and ".join(f"({term})" for term in terms)
+
+
+def _cute_synthetic_arange_lane_bound(
+    state: CodegenState,
+    subscript_pos: int,
+    tensor: torch.Tensor | None,
+    tensor_dim: int,
+) -> str | None:
+    """Bounds mask for a free ``hl.arange`` index mapped onto a synthetic CUDA
+    thread axis (CuTe backend).
+
+    The launch block is sized to the *widest* arange across all (mutually
+    exclusive) grid branches that share a thread axis. A narrower arange in
+    another branch -- e.g. ``hl.arange(0, 32)`` sharing a 64-wide axis with a
+    sibling's ``hl.arange(0, 64)`` -- therefore addresses lanes beyond its own
+    extent. Those extra lanes carry a coordinate ``thread_idx()[axis] >= size``
+    and, without this mask, perform out-of-bounds loads/stores. Returns the term
+    ``(thread_idx()[axis]) < length`` (a no-op when the block matches the arange
+    exactly), or ``None`` when this index is not such a synthetic arange.
+
+    The synthetic-axis coordinate is the arange's *position* ``0..length-1``
+    regardless of ``start``/``step`` (the ``start + step *`` wrapping is applied
+    separately), so the surplus lanes a wider sibling adds are exactly those with
+    position ``>= length``. Bounding to the arange's own ``length`` is therefore
+    correct for canonical and non-canonical (non-zero start / non-unit step)
+    arange dims alike.
+    """
+    if tensor is None or tensor_dim >= tensor.ndim:
+        return None
+    cg = state.codegen
+    # A free arange maps onto a synthetic thread axis either directly
+    # (``cute_synthetic_arange_axes`` key -> axis, coord ``thread_idx()[axis]``)
+    # or, when it overflows the thread budget, onto a lane loop whose coordinate
+    # is cached in ``cute_synthetic_arange_lane_exprs``.
+    axes = getattr(cg, "cute_synthetic_arange_axes", None) or {}
+    lane_exprs = getattr(cg, "cute_synthetic_arange_lane_exprs", None) or {}
+    if not axes and not lane_exprs:
+        return None
+    fx_node = getattr(state, "fx_node", None)
+    if fx_node is None or len(fx_node.args) < 2:
+        return None
+    subscript_arg = fx_node.args[1]
+    if not isinstance(subscript_arg, (list, tuple)) or subscript_pos >= len(
+        subscript_arg
+    ):
+        return None
+    idx_node = subscript_arg[subscript_pos]
+    if not isinstance(idx_node, torch.fx.Node):
+        return None
+    from .._compiler.cute.iota_utils import cute_free_arange_indexed_dim_key
+
+    dim_key = cute_free_arange_indexed_dim_key(idx_node, cg)
+    if dim_key is None:
+        return None
+
+    # ``key`` is ``(dim_key, length, start, step)``. The bound masks lanes beyond
+    # this arange's own extent, which is its ``length`` -- independent of
+    # ``start``/``step`` -- so match purely on ``dim_key``.
+    def _match(key: object) -> bool:
+        return isinstance(key, tuple) and len(key) == 4 and key[0] == dim_key
+
+    coord = None
+    length: object = None
+    for key, axis in axes.items():
+        if _match(key):
+            coord = f"cutlass.Int32(cute.arch.thread_idx()[{axis}])"
+            length = key[1]
+            break
+    if coord is None:
+        for key, expr in lane_exprs.items():
+            if _match(key):
+                coord = expr
+                length = key[1]
+                break
+    if coord is None:
+        return None
+    return f"({coord}) < {length}"
 
 
 def _cute_tensor_dim_size_expr(
@@ -2814,6 +2931,30 @@ def _codegen_cute_store_tcgen05_tile(
                 aux_rmem=df.new_var(f"tcgen05_aux_rmem_{aux_idx}"),
                 aux_loaded=df.new_var(f"tcgen05_aux_loaded_{aux_idx}"),
                 aux_view2d=aux_view2d,
+                # Pre-wait whole-fragment register hoist of N-broadcast
+                # (rowvec) aux on the bm=128 2-CTA full-tile TMA-store path.
+                # The fragment there is small (2 subtiles x epi-tile N of 64
+                # at bn=128 = a handful of fp32 registers per thread), so the
+                # whole-fragment LDG fits without spills and hides its GMEM
+                # latency under the MMA wait (standalone CUTLASS does the
+                # same; ~2% on the 512x6144x2048 fp8 scaled_mm shape). It is
+                # deliberately NOT applied to the bm=256 family: its larger
+                # whole-tile fragment regressed via register spills (see the
+                # fp8_gap_v2 history of the rowvec hoist removal at bn=128/
+                # epi-32 -- 409k LDL/STL on the 4096^3 shape).
+                aux_rmem_full=(
+                    df.new_var(f"tcgen05_aux_rmem_full_{aux_idx}")
+                    if (
+                        aux_step.broadcast_axis in (0, 1)
+                        and tcgen05_is_two_cta_m128(
+                            is_two_cta=tcgen05_lifecycle.is_two_cta,
+                            bm=tcgen05_value.bm,
+                        )
+                        and tcgen05_value.use_tma_store_epilogue
+                        and not tcgen05_value.partial_output_tma_store
+                    )
+                    else None
+                ),
             )
         )
 
@@ -3339,6 +3480,26 @@ def _codegen_cute_store_tcgen05_tile(
                         f"{rec.ttr_aux_grouped} = cute.group_modes("
                         f"{rec.ttr_aux}, 3, cute.rank({rec.ttr_aux}))"
                     ),
+                    # Pre-wait hoist: one cooperative LDG of the whole rowvec
+                    # fragment, issued here (before the accumulator
+                    # consumer_wait downstream) so the GMEM latency overlaps
+                    # the MMA wait. Per-subtile reads then come from
+                    # registers. See the ``aux_rmem_full`` field docs for the
+                    # family gate.
+                    *(
+                        [
+                            (
+                                f"{rec.aux_rmem_full} = cute.make_rmem_tensor("
+                                f"{rec.ttr_aux_grouped}.shape, {rec.aux_dtype})"
+                            ),
+                            (
+                                f"cute.autovec_copy({rec.ttr_aux_grouped}, "
+                                f"{rec.aux_rmem_full})"
+                            ),
+                        ]
+                        if rec.aux_rmem_full is not None and not force_gmem_aux
+                        else []
+                    ),
                 ]
             )
         return lines
@@ -3562,6 +3723,16 @@ def _codegen_cute_store_tcgen05_tile(
                     f"[(0, 0, 0, cutlass.Int32(_tcgen05_subtile))]\n"
                 )
                 continue
+            if rec.aux_rmem_full is not None:
+                # Pre-wait hoisted rowvec: the whole fragment is already in
+                # registers (loaded before the accumulator consumer_wait by
+                # ``_aux_tile_setup_lines``); slice the active subtile.
+                lines.append(
+                    f"{prelude_indent}{rec.aux_loaded} = "
+                    f"{rec.aux_rmem_full}"
+                    f"[(None, None, None, cutlass.Int32(_tcgen05_subtile))].load()\n"
+                )
+                continue
             lines.extend(
                 [
                     (
@@ -3665,6 +3836,16 @@ def _codegen_cute_store_tcgen05_tile(
                 tcgen05_value.role_local_tile_counter,
                 increment_per_tile=not tcgen05_value.tma_store_full_tiles_only,
             )
+        # The bm=128 CtaGroup.TWO family's epilogue tile is N-mode permuted
+        # (see ``tcgen05_two_cta_m128_epilogue_tile_expr``); the host TMA-store
+        # atom must be built from this *exact* device-side expression, not from
+        # the plain ``epi_tile_m/n`` integer keys (which build an unpermuted
+        # ``(m, n)`` tile and silently scramble the output -- the correctness
+        # bug §7 in FINDINGS_512_SHAPE.md). ``epi_tile_raw_expr`` carries the
+        # verbatim device expression to the wrapper.
+        d_two_cta_m128 = tcgen05_is_two_cta_m128(
+            is_two_cta=tcgen05_lifecycle.is_two_cta, bm=tcgen05_value.bm
+        )
         d_tma_plan: dict[str, object] = {
             "kind": "tcgen05_d_tma",
             "d_name": tensor_name,
@@ -3676,6 +3857,18 @@ def _codegen_cute_store_tcgen05_tile(
                 tcgen05_value.tma_store_atom,
                 tcgen05_value.tma_store_tensor,
             ],
+            **(
+                {
+                    "epi_tile_raw_expr": tcgen05_two_cta_m128_epilogue_tile_expr(
+                        tcgen05_value.bm,
+                        tcgen05_value.bn,
+                        target_dtype,
+                        c_layout="cutlass.utils.layout.LayoutEnum.ROW_MAJOR",
+                    )
+                }
+                if d_two_cta_m128 and not tcgen05_value.has_explicit_epilogue_tile
+                else {}
+            ),
             **(
                 {
                     "epi_tile_m": tcgen05_value.explicit_epi_tile_m,
@@ -3695,6 +3888,20 @@ def _codegen_cute_store_tcgen05_tile(
     tcgen05_c_stage_count = tcgen05_value.c_stage_count
     tcgen05_is_two_cta = tcgen05_lifecycle.is_two_cta
     tcgen05_thr_mma = tcgen05_value.thr_mma
+    # The bm=128 CtaGroup.TWO family stores through the per-CTA epilogue tile
+    # (m of 64, ``use_2cta=True``, no-source) so the store-side
+    # ``tcgen05_store_epi_tile``, the ``kernel_desc.cta_tile_shape_mnk``, and
+    # the host TMA-store atom all match the device-side N-mode-permuted tile.
+    # Resolved through the shared helper so this ``(store_tile_m, epi_tile_expr)``
+    # pair stays identical to the layout-plan side in ``cute_mma.py``.
+    tcgen05_store_tile_m, tcgen05_store_epi_tile_expr = tcgen05_resolve_epilogue_tile(
+        bm=tcgen05_bm,
+        bn=tcgen05_bn,
+        is_two_cta=tcgen05_is_two_cta,
+        elem_dtype=target_dtype,
+        c_layout="cutlass.utils.layout.LayoutEnum.ROW_MAJOR",
+        explicit_expr=tcgen05_explicit_store_tile_expr,
+    )
     full_tile_expr = (
         f"({base_indices[0]}) + cutlass.Int32({tcgen05_bm}) <= {m_size} "
         f"and ({base_indices[1]}) + cutlass.Int32({tcgen05_bn}) <= {n_size}"
@@ -3703,18 +3910,11 @@ def _codegen_cute_store_tcgen05_tile(
     def store_common_setup(
         gmem_tensor: str, *, include_full_tile: bool
     ) -> tuple[list[str], list[str]]:
-        epi_tile_expr = tcgen05_explicit_store_tile_expr or (
-            tcgen05_default_epilogue_tile_expr(
-                tcgen05_bm,
-                tcgen05_bn,
-                target_dtype,
-                c_layout="cutlass.utils.layout.LayoutEnum.ROW_MAJOR",
-            )
-        )
+        epi_tile_expr = tcgen05_store_epi_tile_expr
         static_setup = [
             (
                 f"{kernel_desc} = type('Tcgen05KernelDesc', (), {{"
-                f"'cta_tile_shape_mnk': ({tcgen05_bm}, {tcgen05_bn}, {tcgen05_bk}), "
+                f"'cta_tile_shape_mnk': ({tcgen05_store_tile_m}, {tcgen05_bn}, {tcgen05_bk}), "
                 "'c_layout': cutlass.utils.layout.LayoutEnum.ROW_MAJOR, "
                 f"'c_dtype': {target_dtype}, "
                 "'acc_dtype': cutlass.Float32, "

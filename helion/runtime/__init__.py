@@ -10,6 +10,7 @@ import importlib
 import inspect
 import json
 import linecache
+import logging
 import os
 import sys
 from typing import TYPE_CHECKING
@@ -35,6 +36,8 @@ if TYPE_CHECKING:
     from collections.abc import Iterable
 
     import jax
+
+log: logging.Logger = logging.getLogger(__name__)
 
 _CUTLASS_SHUTDOWN_PATCHED = False
 
@@ -2416,6 +2419,11 @@ def _append_cute_wrapper_plan(
         assert value is None or isinstance(value, int)
         return value
 
+    def plan_optional_str(key: str) -> str | None:
+        value = plan.get(key)
+        assert value is None or isinstance(value, str)
+        return value
+
     def require_positive_int(value: int | None, name: str) -> int:
         assert type(value) is int, name
         assert value > 0, name
@@ -2433,12 +2441,21 @@ def _append_cute_wrapper_plan(
         epi_tile_m: int | None = None,
         epi_tile_n: int | None = None,
         d_store_box_n: int | None = None,
+        epi_tile_raw_expr: str | None = None,
     ) -> None:
         assert len(kernel_args) == 2
         explicit_epi_tile = any(
             value is not None for value in (epi_tile_m, epi_tile_n, d_store_box_n)
         )
-        if explicit_epi_tile:
+        if epi_tile_raw_expr is not None:
+            # The bm=128 CtaGroup.TWO family threads the device-exact (N-mode
+            # permuted) epilogue-tile expression verbatim so the host TMA-store
+            # atom is built from the same layout the device r2s copy writes
+            # through. The plain ``epi_tile_m/n`` integer keys cannot express
+            # the permutation. See ``tcgen05_two_cta_m128_epilogue_tile_expr``.
+            assert not explicit_epi_tile
+            epi_tile_expr = epi_tile_raw_expr
+        elif explicit_epi_tile:
             checked_epi_tile_m = require_positive_int(epi_tile_m, "epi_tile_m")
             checked_epi_tile_n = require_positive_int(epi_tile_n, "epi_tile_n")
             checked_d_store_box_n = require_positive_int(d_store_box_n, "d_store_box_n")
@@ -2503,6 +2520,7 @@ def _append_cute_wrapper_plan(
             epi_tile_m=plan_optional_int("epi_tile_m"),
             epi_tile_n=plan_optional_int("epi_tile_n"),
             d_store_box_n=plan_optional_int("d_store_box_n"),
+            epi_tile_raw_expr=plan_optional_str("epi_tile_raw_expr"),
         )
         return
     if kind == "tcgen05_aux_tma":
@@ -2564,9 +2582,20 @@ def _append_cute_wrapper_plan(
     # cluster_m=2 cluster_n=1 but rejects the canonical Quack-best
     # cluster_m=2 cluster_n=2 4-CTA cluster (product=4). Use
     # ``cluster_m == 2`` directly so cluster_n=2 keeps CtaGroup.TWO.
+    #
+    # The bm=128 CtaGroup.TWO family (fp8 small-grid) cannot be derived from
+    # ``bm == 256`` here, so the device codegen records the resolved decision
+    # on the plan as ``use_2cta_instrs``. Honor it when present; fall back to
+    # the legacy bm==256 derivation for golden-stable older plans.
+    plan_use_2cta = plan.get("use_2cta_instrs")
+    if plan_use_2cta is not None:
+        assert isinstance(plan_use_2cta, bool)
+        use_2cta_instrs = plan_use_2cta
+    else:
+        use_2cta_instrs = cluster_m == 2 and bm == 256
     cta_group = (
         "cute.nvgpu.tcgen05.CtaGroup.TWO"
-        if cluster_m == 2 and bm == 256
+        if use_2cta_instrs
         else "cute.nvgpu.tcgen05.CtaGroup.ONE"
     )
     cluster_shape = f"({cluster_m}, {cluster_n}, 1)"
@@ -2909,6 +2938,17 @@ class _CompiledCuteLauncher:
             self._compiled = compiled
         return cast("Any", compiled)(*args)
 
+    def persist_compiled(self) -> None:
+        """Persist the already-compiled module into the current on-disk cache dir.
+
+        Used by ``finalize_ephemeral_cache``: the artifact written during
+        autotuning died with the ephemeral dir, but the compiled module is
+        still in memory and ``_cache_file_paths`` resolves the destination
+        from the (now restored) ``CUTE_DSL_CACHE_DIR`` at call time.
+        """
+        if self._cache_key is not None and self._compiled is not None:
+            self._persist_to_disk(self._compiled)
+
     def _cache_file_paths(self) -> tuple[str, str, str]:
         from cutlass.base_dsl.cache_helpers import get_default_generated_ir_path
 
@@ -2918,7 +2958,7 @@ class _CompiledCuteLauncher:
         return cache_dir, mlir, meta
 
     def _persist_to_disk(self, compiled: object) -> None:
-        with suppress(Exception):
+        try:
             from cutlass.base_dsl.cache_helpers import save_ir
             from cutlass.base_dsl.cache_helpers import write_bytecode_with_crc32
 
@@ -2950,6 +2990,13 @@ class _CompiledCuteLauncher:
                     f,
                 )
             os.replace(tmp, meta)
+        except (ImportError, OSError):
+            # Old cutlass or an unwritable cache dir; just recompile next time.
+            log.debug(
+                "CuTe disk-cache persist failed for key %s",
+                self._cache_key,
+                exc_info=True,
+            )
 
     def _reload_from_disk(self) -> object:
         try:
