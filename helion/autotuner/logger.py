@@ -160,6 +160,14 @@ class AutotuningLogger:
             return None
         return self._log_sink.register_config(config)
 
+    def capture_generated_code(
+        self, config_id: str, kernel: _AutotunableKernel, config: Config
+    ) -> None:
+        """Forward to the active sink, which records the config's generated kernel
+        source for the dataset (no-op if no sink is active)."""
+        if self._log_sink is not None:
+            self._log_sink.capture_generated_code(config_id, kernel, config)
+
     def _attach_sink(self, sink: AutotuneLogSink) -> None:
         self._log_sink = sink
         self.add_handler(sink.handler)
@@ -311,8 +319,14 @@ class AutotuneLogSink:
         self._csv_writer: CsvWriter | None = None
         self._log_handler: logging.FileHandler | None = None
         self._run_start_time: float | None = None
-        # config_id -> full config; flushed to the .meta.jsonl record at end_run.
-        # Populated only when collecting the dataset; identical configs collapse.
+        # config_id -> {"config": <full config>, "generated_code": <source|None>};
+        # flushed to the .meta.jsonl record at end_run. Populated only when
+        # collecting the dataset; identical configs collapse. The generated source
+        # is attached separately (capture_generated_code) since it differs per
+        # config; it is backend-specific (Triton/CuTe/Pallas/Metal -- recover which
+        # via the record's settings.backend).
+        # Every config's full source is kept on purpose (R&D cost-model dataset),
+        # so this is unbounded by design -- do not add a cap that drops sources.
         self._configs: dict[str, dict[str, object]] = {}
 
     def __enter__(self) -> Self:
@@ -398,9 +412,29 @@ class AutotuneLogSink:
             return None
         canonical = json.dumps(config.config, sort_keys=True, separators=(",", ":"))
         config_id = hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:16]
-        if self._collect_dataset:
-            self._configs[config_id] = config.config
+        if self._collect_dataset and config_id not in self._configs:
+            # Initialize once so a config re-encountered in a later generation
+            # keeps any generated source already attached to it.
+            self._configs[config_id] = {
+                "config": config.config,
+                "generated_code": None,
+            }
         return config_id
+
+    def capture_generated_code(
+        self, config_id: str, kernel: _AutotunableKernel, config: Config
+    ) -> None:
+        """Attach this config's generated kernel source (read from the on-disk file
+        compiled during the search, not a re-codegen) to its configs-map entry.
+        The source is backend-specific (Triton/CuTe/Pallas/Metal). Gated on dataset
+        collection and deduped per config_id, so each config's file is read at most
+        once and nothing happens when collection is off."""
+        entry = self._configs.get(config_id)
+        if entry is None or entry.get("generated_code") is not None:
+            return
+        path = kernel.get_cached_path(config)
+        if path is not None:
+            entry["generated_code"] = Path(path).read_text(encoding="utf-8")
 
     def record(self, entry: AutotuneLogEntry) -> None:
         if self._csv_writer is None:

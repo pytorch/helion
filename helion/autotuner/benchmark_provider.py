@@ -803,6 +803,9 @@ class LocalBenchmarkProvider(BenchmarkProvider):
             # ones that never benchmark because they (or a peer) failed to compile.
             config_id = self.log.register_config(config)
             if config_id is not None:
+                # Record this config's generated kernel source for the dataset
+                # (read from the on-disk file compiled above, not a re-codegen).
+                self.log.capture_generated_code(config_id, self.kernel, config)
                 self.log.record_autotune_entry(
                     AutotuneLogEntry(
                         generation=self._autotune_metrics.num_generations,

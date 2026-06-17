@@ -66,6 +66,7 @@ from helion.autotuner.finite_search import FiniteSearch
 from helion.autotuner.local_cache import LocalAutotuneCache
 from helion.autotuner.local_cache import StrictLocalAutotuneCache
 from helion.autotuner.logger import AutotuneLogEntry
+from helion.autotuner.logger import AutotuneLogSink
 from helion.autotuner.logger import AutotuningLogger
 from helion.autotuner.pattern_search import InitialPopulationStrategy
 from helion.autotuner.random_search import RandomSearch
@@ -491,6 +492,65 @@ class TestAutotuneIgnoreErrors(TestCase):
         log_text = log_path.read_text()
         self.assertIn("finalized entry", log_text)
 
+    def test_capture_generated_code_dedup_and_idempotent(self):
+        """A config re-registered across generations yields one configs entry, and
+        its generated source is read from disk at most once."""
+        tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(tmpdir.cleanup)
+        base_path = Path(tmpdir.name) / "autotune_run"
+        src_file = Path(tmpdir.name) / "kernel.py"
+        src_file.write_text("# generated kernel source", encoding="utf-8")
+
+        config = helion.Config(block_sizes=[32], num_warps=4)
+        reads: list[object] = []
+
+        def get_cached_path(cfg: object) -> str:
+            reads.append(cfg)
+            return str(src_file)
+
+        kernel = SimpleNamespace(get_cached_path=get_cached_path)
+
+        with AutotuneLogSink(str(base_path), collect_dataset=True) as sink:
+            sink.start_run()
+            # Same config encountered in two generations.
+            cid1 = sink.register_config(config)
+            sink.capture_generated_code(cid1, kernel, config)
+            cid2 = sink.register_config(config)
+            sink.capture_generated_code(cid2, kernel, config)
+
+            self.assertEqual(cid1, cid2)
+            self.assertEqual(len(sink._configs), 1)
+            entry = sink._configs[cid1]
+            self.assertEqual(entry["config"], config.config)
+            self.assertEqual(entry["generated_code"], "# generated kernel source")
+            # Read from disk exactly once despite two capture calls.
+            self.assertEqual(len(reads), 1)
+
+    def test_capture_generated_code_noop_when_dataset_off(self):
+        """With the dataset off, no config entry is created and the source file is
+        never read, even though register_config still returns an id for the CSV."""
+        tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(tmpdir.cleanup)
+        base_path = Path(tmpdir.name) / "autotune_run"
+
+        config = helion.Config(block_sizes=[32], num_warps=4)
+        reads: list[object] = []
+
+        def get_cached_path(cfg: object) -> str:
+            reads.append(cfg)
+            return "/should/not/be/read.py"
+
+        kernel = SimpleNamespace(get_cached_path=get_cached_path)
+
+        with AutotuneLogSink(str(base_path), collect_dataset=False) as sink:
+            sink.start_run()
+            config_id = sink.register_config(config)
+            self.assertIsNotNone(config_id)  # CSV logging still active
+            sink.capture_generated_code(config_id, kernel, config)
+
+            self.assertEqual(sink._configs, {})
+            self.assertEqual(reads, [])  # never touched the kernel / disk
+
     def test_differential_evolution_immediate_iter_uses_batch_helper(self):
         search = DifferentialEvolutionSearch.__new__(DifferentialEvolutionSearch)
         search.immediate_update = True
@@ -872,6 +932,14 @@ class TestAutotuneIgnoreErrors(TestCase):
                 self.assertIsNotNone(hw["warp_size"])
             self.assertIsInstance(hw["versions"], dict)
             self.assertIn("torch", hw["versions"])
+            # Each configs entry carries the tested config plus its generated
+            # source (captured because the generated code differs per config).
+            cfgs = rec["configs"]
+            self.assertTrue(cfgs)
+            for entry in cfgs.values():
+                self.assertIn("config", entry)
+                self.assertIsInstance(entry["generated_code"], str)
+                self.assertTrue(entry["generated_code"])
         # ir_graph is config-independent: identical across lines sharing a run_id.
         by_run: dict[str, str] = {}
         for line in lines:

@@ -594,7 +594,7 @@ class TestAutotuneLogSink(TestCase):
         header, data = rows[0], rows[1:]
         self.assertEqual(len(data), 1)
         config_id = data[0][header.index("config_id")]
-        stored = sidecar["configs"][config_id]
+        stored = sidecar["configs"][config_id]["config"]
         cfg = helion.Config.from_json(json.dumps(stored))
         self.assertEqual(cfg.block_sizes, [32])
 
