@@ -410,9 +410,9 @@ class _Settings:
     )
     autotune_log_level: int = dataclasses.field(default_factory=_get_autotune_log_level)
     autotune_log: str | None = dataclasses.field(default_factory=_get_autotune_log_path)
-    autotune_dataset: bool = dataclasses.field(
+    autotune_log_details: bool = dataclasses.field(
         default_factory=functools.partial(
-            _env_get_bool, "HELION_AUTOTUNE_DATASET", False
+            _env_get_bool, "HELION_AUTOTUNE_LOG_DETAILS", False
         )
     )
     autotune_compile_timeout: int = dataclasses.field(
@@ -642,8 +642,8 @@ class Settings(_Settings):
             "Base filename for autotune logs. Set HELION_AUTOTUNE_LOG=/tmp/run to write "
             "/tmp/run.csv and /tmp/run.log with per-config metrics and debug logs."
         ),
-        "autotune_dataset": (
-            "Opt-in (HELION_AUTOTUNE_DATASET=1) to also write the cost-model "
+        "autotune_log_details": (
+            "Opt-in (HELION_AUTOTUNE_LOG_DETAILS=1) to also write the cost-model "
             "dataset sidecar /tmp/run.meta.jsonl (per-run kernel identity + the "
             "configs tested, keyed by config_id). Off by default; needs autotune_log."
         ),
