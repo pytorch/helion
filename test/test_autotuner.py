@@ -782,7 +782,7 @@ class TestAutotuneIgnoreErrors(TestCase):
             os.environ,
             {
                 "HELION_AUTOTUNE_LOG": str(base_path),
-                "HELION_AUTOTUNE_DATASET": "1",
+                "HELION_AUTOTUNE_LOG_DETAILS": "1",
                 "HELION_AUTOTUNE_LOG_LEVEL": "0",
             },
         ):

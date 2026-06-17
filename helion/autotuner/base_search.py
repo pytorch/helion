@@ -60,11 +60,11 @@ if TYPE_CHECKING:
 
 @functools.cache
 def _warn_dataset_without_log(log: AutotuningLogger) -> None:
-    """Warn (once) that ``autotune_dataset`` needs ``autotune_log`` (the base path
+    """Warn (once) that ``autotune_log_details`` needs ``autotune_log`` (the base path
     the ``.meta.jsonl`` sits next to) or nothing is collected. Cached so the
     warning fires once per logger instead of once per config."""
     log.warning(
-        "HELION_AUTOTUNE_DATASET is set but HELION_AUTOTUNE_LOG is not; no "
+        "HELION_AUTOTUNE_LOG_DETAILS is set but HELION_AUTOTUNE_LOG is not; no "
         "autotune dataset will be collected. Set HELION_AUTOTUNE_LOG to a base "
         "path to enable collection."
     )
@@ -502,7 +502,8 @@ class BaseSearch(BaseAutotuner):
                 # .csv/.log follow the log path; the dataset (.meta.jsonl) also
                 # needs opt-in and a representative (non-restricted) search.
                 collect_dataset = (
-                    self.settings.autotune_dataset and not self._is_restricted_search()
+                    self.settings.autotune_log_details
+                    and not self._is_restricted_search()
                 )
                 exit_stack.enter_context(
                     self.log.autotune_logging(
@@ -510,7 +511,7 @@ class BaseSearch(BaseAutotuner):
                         collect_dataset=collect_dataset,
                     )
                 )
-            elif self.settings.autotune_dataset:
+            elif self.settings.autotune_log_details:
                 _warn_dataset_without_log(self.log)
             self.log.reset()
             # Autotuner triggers bugs in remote triton compile service.
