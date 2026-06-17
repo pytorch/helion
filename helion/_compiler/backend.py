@@ -43,6 +43,7 @@ if TYPE_CHECKING:
     from .device_function import DeviceFunction
     from .device_ir import GraphInfo
     from .host_function import HostFunction
+    from .pallas.compact_worklist import CompactWorklistPlan
     from .tile_dispatch import TileStrategyDispatch
     from .tile_strategy import TileStrategy
 
@@ -1572,6 +1573,7 @@ class PallasBackend(Backend):
             "_default_pallas_launcher": "from helion.runtime import default_pallas_launcher as _default_pallas_launcher",
             "_default_pallas_pipeline_launcher": "from helion.runtime import default_pallas_pipeline_launcher as _default_pallas_pipeline_launcher",
             "_default_pallas_fori_launcher": "from helion.runtime import default_pallas_fori_launcher as _default_pallas_fori_launcher",
+            "_default_pallas_compact_worklist_launcher": "from helion.runtime import default_pallas_compact_worklist_launcher as _default_pallas_compact_worklist_launcher",
         }
 
     # Config keys that Pallas actually uses.  Everything else
@@ -2484,7 +2486,7 @@ class PallasBackend(Backend):
 
         # Pass scratch shapes for pipeline/fori_loop launcher
         pallas_loop_type = config.get("pallas_loop_type", "unroll")
-        if pallas_loop_type in ("emit_pipeline", "fori_loop"):
+        if pallas_loop_type in ("emit_pipeline", "fori_loop", "compact_worklist"):
             scratch_shapes = [
                 (
                     s.shape,
@@ -2530,7 +2532,66 @@ class PallasBackend(Backend):
         if matmul_spec is not None:
             launcher_args.append(f"_matmul_dot_general={matmul_spec!r}")
 
+        if pallas_loop_type == "compact_worklist" and sorted_args is not None:
+            launcher_args.extend(self._compact_worklist_launcher_args(sorted_args))
+
         return launcher_args
+
+    def _compact_worklist_launcher_args(self, sorted_args: list[Argument]) -> list[str]:
+        """Emit the compact-worklist-specific launcher kwargs.
+
+        ``_build_worklist`` is the module-level jnp builder (emitted in
+        generate_ast); the offset arg indices map its params to host-call arg
+        positions; the metadata fields + owner-ref position drive scalar-prefetch
+        selection and the owner-indexed BlockSpec index_maps.
+        """
+        from .compile_environment import CompileEnvironment
+        from .device_function import TensorArg
+        from .pallas.compact_worklist import metadata_field_names
+
+        env = CompileEnvironment.current()
+        plan = env.compact_worklist_plan
+        assert plan is not None
+
+        name_to_index: dict[str, int] = {}
+        for i, arg in enumerate(sorted_args):
+            if isinstance(arg, TensorArg):
+                name_to_index[arg.host_str()] = i
+        offset_indices = [name_to_index[n] for n in env.compact_worklist_offset_params]
+        fields = metadata_field_names(plan)
+        # Compact-tile tensors (aligned load + exact store) both get a per-tile
+        # pl.Element BlockSpec sliced at tile_start, so Pallas double-buffers BOTH
+        # the load prefetch and the store write-back across work items.
+        #
+        # The store is a masked full-block write.  The two robust EXACT-store
+        # alternatives were both worse/unavailable here: (a) staging VMEM +
+        # make_async_copy over pl.ds(tile_start, tile_extent) serializes (~1.8x
+        # slower: 4.5ms vs 2.5ms) because a straight-line compact tile has no inner
+        # loop to overlap; (b) a pl.BoundedSlice store BlockSpec (exact + double-buffered)
+        # is rejected by this JAX's Mosaic lowering ("Unsupported block dimension
+        # type: BoundedSlice" -- it only works inside pltpu.emit_pipeline).  The
+        # full-block write's only hazard is a partial last tile overlapping the
+        # next sequence's leading rows; "arbitrary" dimension semantics serialize
+        # that grid-ordered overlap so the later, correct write wins (verified
+        # bitwise == fori_loop across uniform/partial/unaligned/jagged + 5 random
+        # seeds).  Robust+fast exact store == the deferred emit_pipeline +
+        # pl.BoundedSlice path.
+        aligned_indices = [
+            name_to_index[p.arg_name]
+            for p in plan.tensor_policies
+            if p.kind in ("compact_aligned_load", "compact_exact_store")
+            and p.arg_name in name_to_index
+        ]
+        return [
+            "_compact_build_worklist=_build_worklist",
+            f"_compact_offset_arg_indices={offset_indices!r}",
+            f"_compact_metadata_fields={fields!r}",
+            "_compact_owner_ref_pos=0",
+            f"_compact_num_scalar_prefetch={len(fields)}",
+            f"_compact_aligned_arg_indices={aligned_indices!r}",
+            f"_compact_tile_start_ref_pos={fields.index('tile_starts')}",
+            f"_compact_block={env.compact_worklist_block}",
+        ]
 
     def build_launcher_name(self, config: Config) -> str:
         """Return the launcher name to use based on ``pallas_loop_type``."""
@@ -2546,6 +2607,11 @@ class PallasBackend(Backend):
             return "_default_pallas_pipeline_launcher"
         if pallas_loop_type == "fori_loop":
             return "_default_pallas_fori_launcher"
+        if pallas_loop_type == "compact_worklist":
+            # Detection + plan stash happen in pre_codegen; route to the compact
+            # launcher (builds the worklist in-jit -> dynamic num_work grid with
+            # scalar-prefetch metadata).
+            return "_default_pallas_compact_worklist_launcher"
         return self.default_launcher_name
 
     def get_launcher_name(self) -> str:
@@ -2565,9 +2631,99 @@ class PallasBackend(Backend):
         config: Config,
         tile_strategy: TileStrategyDispatch,
     ) -> None:
+        from .compile_environment import CompileEnvironment
         from .pallas.plan_tiling import plan_tiling
 
         plan_tiling(graphs, config, tile_strategy)
+
+        # compact_worklist_* is per-CONFIG state, but one CompileEnvironment is
+        # reused across all configs of a BoundKernel (see CompileEnvironment's
+        # "no config-specific state" contract).  Reset before re-detecting so a
+        # later non-compact config never inherits a prior compact config's plan
+        # -- many lowering paths gate on ``env.compact_worklist_plan is not None``
+        # (PID strategy, loop-bound remap, fori handling, ds slicing), not on
+        # pallas_loop_type, so a stale plan would mis-lower a fori/emit config.
+        env = CompileEnvironment.current()
+        env.compact_worklist_plan = None
+        env.compact_worklist_upper = 1
+        env.compact_worklist_block = 1
+        env.compact_worklist_offset_params = []
+
+        if config.get("pallas_loop_type") == "compact_worklist":
+            self._setup_compact_worklist(config)
+
+    def _setup_compact_worklist(self, config: Config) -> None:
+        """Detect + stash the compact-worklist plan before device codegen.
+
+        Runs early (pre_codegen) so ``env.compact_worklist_plan`` is set when the
+        grid strategy selects ``WorklistProgramIDs`` and the inner loop remaps its
+        begin/end to metadata refs.  Registers the N metadata ref names as
+        ``wrapper_only_params`` (kernel-signature-only) and computes the static
+        megablocks ``UPPER``.  ``detect_*`` raises ``exc.InvalidConfig`` on a
+        non-matching kernel (autotuner-skippable).
+        """
+        from .compile_environment import CompileEnvironment
+        from .device_function import DeviceFunction
+        from .host_function import HostFunction
+        from .pallas.compact_worklist import detect_compact_worklist_plan
+        from .pallas.compact_worklist import metadata_arg_names
+
+        env = CompileEnvironment.current()
+        host_fn = HostFunction.current()
+        plan = detect_compact_worklist_plan(host_fn)
+        env.compact_worklist_plan = plan
+
+        device_fn = DeviceFunction.current()
+        for name in metadata_arg_names(plan):
+            ref = f"{name}_ref"
+            if ref not in device_fn.wrapper_only_params:
+                device_fn.wrapper_only_params.append(ref)
+
+        # Compact-axis tile block size (NOT max(block_sizes): for fully jagged
+        # with Q_BLOCK < KV_BLOCK that would undersize the worklist metadata).
+        compact_block = env.block_sizes[plan.compact_axis.block_id].from_config(config)
+        assert compact_block is not None, "compact tile has no block size"
+        env.compact_worklist_block = int(compact_block)
+        env.compact_worklist_upper = self._compact_worklist_upper(plan, config, host_fn)
+
+    def _compact_worklist_upper(
+        self, plan: CompactWorklistPlan, config: Config, host_fn: HostFunction
+    ) -> int:
+        """Static UPPER: the padded length of the worklist metadata arrays.
+
+        Must be >= the worst-case ``num_work = sum_owners cdiv(length, BLOCK)``,
+        else the dynamic Pallas grid indexes past the scalar-prefetch metadata
+        (``jnp.repeat(total_repeat_length=UPPER)`` would silently truncate the
+        worklist).  Detection only accepts the packed-offsets idiom (store
+        safety), so owner ranges are contiguous/non-overlapping
+        (``sum(length) == total``) and the tight megablocks bound
+        ``cdiv(total, BLOCK) + num_owners - 1`` provably holds.  All terms are
+        concrete ints under ``static_shapes=True``.
+        """
+        from ..runtime.compact_worklist import packed_upper_bound
+        from .compile_environment import CompileEnvironment
+
+        params = dict(host_fn.params.arguments)
+        # Owner count from the captured grid bound (e.g. q_offsets.shape[0] - 1).
+        # num_owners_expr is a codegen-derived host expression; if it references a
+        # name not in params (a source shape we failed to inline), surface it as
+        # an autotuner-skippable InvalidConfig rather than a bare exception that
+        # would abort the whole search.
+        try:
+            num_owners = int(eval(plan.num_owners_expr, {}, params))
+        except Exception as e:
+            raise exc.InvalidConfig(
+                f"compact_worklist: could not evaluate owner-count expression "
+                f"{plan.num_owners_expr!r}: {e}"
+            ) from e
+        # total_compact = leading dim of the compact_aligned_load tensor.
+        compact_arg = next(
+            p.arg_name for p in plan.tensor_policies if p.kind == "compact_aligned_load"
+        )
+        total = int(params[compact_arg].shape[0])
+        block = CompileEnvironment.current().compact_worklist_block
+        # Single source of the tight megablocks bound (also unit-tested).
+        return packed_upper_bound(total, num_owners, block)
 
 
 def _detect_mma_loop(

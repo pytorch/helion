@@ -1253,6 +1253,25 @@ if __name__ == "__main__":
     """)
 
 
+def _maybe_emit_compact_worklist_builder(codegen: GenerateAST, config: Config) -> None:
+    """Emit the module-level jnp ``_build_worklist`` for a compact-worklist kernel."""
+    if config.get("pallas_loop_type") != "compact_worklist":
+        return
+    env = CompileEnvironment.current()
+    plan = env.compact_worklist_plan
+    if plan is None:
+        return
+    from .pallas.compact_worklist import render_build_worklist
+
+    source, offset_params = render_build_worklist(
+        plan,
+        block_expr=str(env.compact_worklist_block),
+        upper_expr=str(env.compact_worklist_upper),
+    )
+    env.compact_worklist_offset_params = offset_params
+    codegen.module_statements.append(statement_from_string(source))
+
+
 def generate_ast(
     func: HostFunction,
     config: Config,
@@ -1279,6 +1298,11 @@ def generate_ast(
                 config=config,
                 tile_strategy=codegen.device_function.tile_strategy,
             )
+
+            # Emit the worklist builder + record its offset params BEFORE the host
+            # body is visited (the launcher call -- which reads the offset params
+            # via build_launcher_args -- is generated during that visit).
+            _maybe_emit_compact_worklist_builder(codegen, config)
 
             for stmt in func.body:
                 codegen.add_statement(codegen.visit(stmt))
