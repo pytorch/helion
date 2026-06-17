@@ -379,12 +379,91 @@ class TestAutotuneLogSink(TestCase):
         self.assertEqual(set(sidecar), _SIDECAR_KEYS)
         self.assertIn("def _add_kernel", sidecar["kernel_source"])
 
-        # The CSV row joins to its config via config_id ...
-        stored = sidecar["configs"][cell("config_id")]
-        cfg = helion.Config.from_json(json.dumps(stored))
+        # The CSV row joins to its config via config_id; each entry nests the
+        # tested config alongside its generated_code (None here -- this device-free
+        # sink test does not capture source).
+        entry = sidecar["configs"][cell("config_id")]
+        self.assertIsNone(entry["generated_code"])
+        cfg = helion.Config.from_json(json.dumps(entry["config"]))
         self.assertEqual(cfg.block_sizes, [32])
         # ... and to its run via run_id.
         self.assertEqual(cell("run_id"), sidecar["run_id"])
+
+    def test_capture_generated_code_attaches_per_config_source(self) -> None:
+        """``capture_generated_code`` nests each config's generated source (read
+        from the on-disk file compiled during the search) into its configs entry,
+        deduped so the file is read at most once per config_id."""
+        config = helion.Config(block_sizes=[32], num_warps=4)
+        with tempfile.TemporaryDirectory() as tmp:
+            src_path = Path(tmp) / "compiled_kernel.py"
+            src_path.write_text("# generated triton source\n", encoding="utf-8")
+            kernel = Mock()
+            kernel.get_cached_path.return_value = str(src_path)
+            with AutotuneLogSink(
+                f"{tmp}/run", _metadata(), collect_dataset=True
+            ) as sink:
+                sink.start_run()
+                config_id = sink.register_config(config)
+                assert config_id is not None
+                sink.capture_generated_code(config_id, kernel, config)
+                # A re-encounter of the same config does not re-read the file.
+                sink.capture_generated_code(config_id, kernel, config)
+                sink.record(
+                    AutotuneLogEntry(
+                        generation=0,
+                        status="ok",
+                        perf_ms=1.0,
+                        compile_time=0.5,
+                        config_id=config_id,
+                        config=config,
+                    )
+                )
+                sink.end_run()
+            sidecar = json.loads(
+                sink.meta_path.read_text(encoding="utf-8").splitlines()[0]
+            )
+        entry = sidecar["configs"][config_id]
+        self.assertEqual(entry["generated_code"], "# generated triton source\n")
+        self.assertEqual(
+            helion.Config.from_json(json.dumps(entry["config"])).block_sizes, [32]
+        )
+        kernel.get_cached_path.assert_called_once()
+
+    def test_capture_generated_code_none_when_no_cached_path(self) -> None:
+        """When the compiled file is unavailable, the entry keeps ``generated_code``
+        as ``None`` rather than failing."""
+        config = helion.Config(block_sizes=[32])
+        kernel = Mock()
+        kernel.get_cached_path.return_value = None
+        with tempfile.TemporaryDirectory() as tmp:
+            with AutotuneLogSink(
+                f"{tmp}/run", _metadata(), collect_dataset=True
+            ) as sink:
+                sink.start_run()
+                config_id = sink.register_config(config)
+                assert config_id is not None
+                sink.capture_generated_code(config_id, kernel, config)
+                sink.end_run()
+            sidecar = json.loads(
+                sink.meta_path.read_text(encoding="utf-8").splitlines()[0]
+            )
+        self.assertIsNone(sidecar["configs"][config_id]["generated_code"])
+
+    def test_capture_generated_code_noop_when_not_collecting(self) -> None:
+        """With collection off there is no configs entry, so capture is a no-op and
+        the compiled file is never read."""
+        config = helion.Config(block_sizes=[32])
+        kernel = Mock()
+        with (
+            tempfile.TemporaryDirectory() as tmp,
+            AutotuneLogSink(f"{tmp}/run", _metadata(), collect_dataset=False) as sink,
+        ):
+            sink.start_run()
+            config_id = sink.register_config(config)
+            assert config_id is not None
+            sink.capture_generated_code(config_id, kernel, config)
+            sink.end_run()
+        kernel.get_cached_path.assert_not_called()
 
 
 @onlyBackends(["triton"])
@@ -455,6 +534,13 @@ class TestAutotuneDatasetE2E(TestCase):
             if hw["device_kind"] in ("cuda", "rocm", "xpu"):
                 self.assertIsNotNone(hw["sm_count"])
             self.assertIn("torch", hw["versions"])
+            # Each configs entry nests the tested config plus its per-config
+            # generated source (real Triton on this lane), captured during the
+            # benchmark loop because the generated code differs per config.
+            for cfg_entry in record["configs"].values():
+                self.assertIn("config", cfg_entry)
+                self.assertIsInstance(cfg_entry["generated_code"], str)
+                self.assertTrue(cfg_entry["generated_code"])
             configs_by_id.update(record["configs"])
             run_ids.add(record["run_id"])
         self.assertGreater(len(configs_by_id), 0)
@@ -466,7 +552,9 @@ class TestAutotuneDatasetE2E(TestCase):
         config_id = data[0][header.index("config_id")]
         self.assertIn(config_id, configs_by_id)
         self.assertIn(data[0][header.index("run_id")], run_ids)
-        decoded_config = helion.Config.from_json(json.dumps(configs_by_id[config_id]))
+        decoded_config = helion.Config.from_json(
+            json.dumps(configs_by_id[config_id]["config"])
+        )
         self.assertIn(decoded_config.block_sizes, ([32], [64]))
 
 
