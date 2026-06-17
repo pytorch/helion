@@ -35,6 +35,7 @@ from helion._testing import skipIfRefEager
 from helion._testing import skipIfRocm
 from helion._testing import skipIfTileIR
 from helion._testing import skipIfXPU
+from helion._testing import xfailIfCute
 from helion._testing import xfailIfPallas
 from helion._testing import xfailIfPallasInterpret
 from helion._testing import xfailIfPallasTpu
@@ -974,6 +975,20 @@ class TestExamples(RefEagerTestBase, TestCase):
             mod.ref_xsa(*args),
             fn_name="xsa_kernel",
             block_sizes=[1, 64, 32],
+        )
+
+    @xfailIfCute("slice-based stores not yet supported")
+    @xfailIfPallas("slice-based stores not yet supported")
+    def test_concat_simple(self):
+        args = (
+            torch.randn(512, 500, device=DEVICE),
+            torch.randn(512, 512, device=DEVICE),
+        )
+        check_example(
+            "concatenate",
+            args,
+            torch.cat(args, dim=1),
+            fn_name="concat2d_dim1_simple",
         )
 
     def test_concat(self):
