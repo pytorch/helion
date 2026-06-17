@@ -27,6 +27,8 @@ from helion._testing import skipIfRefEager
 from helion._testing import skipIfTileIR
 from helion._testing import skipIfXPU
 from helion._testing import skipUnlessTensorDescriptor
+from helion._testing import xfailIfCute
+from helion._testing import xfailIfPallas
 import helion.language as hl
 
 _LARGE_BF16_SHAPE = (51200, 51200)
@@ -1857,6 +1859,41 @@ class TestIndexing(RefEagerTestBase, TestCase):
         result = kernel(buf.clone(), zeros)
         expected = torch.zeros([N], device=DEVICE)
         torch.testing.assert_close(result, expected)
+
+    @xfailIfCute("slice-based stores not yet supported")
+    @xfailIfPallas("slice-based stores not yet supported")
+    def test_partial_slice(self):
+        """Test both setter and getter for partial slices [:n] and [n:]"""
+
+        @helion.kernel(autotune_effort="none")
+        def kernel(src: torch.Tensor, dst: torch.Tensor) -> torch.Tensor:
+            for tile in hl.tile(src.size(0)):
+                dst[tile, :16] = src[tile, :16]
+                dst[tile, 16:] = src[tile, 16:]
+            return dst
+
+        N = 64
+        src = torch.randn([N, 32], device=DEVICE)
+        dst = torch.zeros([N, 32], device=DEVICE)
+        result = kernel(src, dst)
+        torch.testing.assert_close(result, src)
+
+    @xfailIfCute("slice-based stores not yet supported")
+    @xfailIfPallas("slice-based stores not yet supported")
+    def test_partial_slice_dim0(self):
+        """Test partial slices on dim 0 (the tiled dimension)"""
+
+        @helion.kernel(autotune_effort="none")
+        def kernel(src: torch.Tensor, dst: torch.Tensor) -> torch.Tensor:
+            for tile in hl.tile(src.size(1)):
+                dst[:32, tile] = src[:32, tile]
+                dst[32:, tile] = src[32:, tile]
+            return dst
+
+        src = torch.randn([64, 32], device=DEVICE)
+        dst = torch.zeros([64, 32], device=DEVICE)
+        result = kernel(src, dst)
+        torch.testing.assert_close(result, src)
 
     def test_broadcast(self):
         """Test both setter from scalar and getter for [:, i]"""
