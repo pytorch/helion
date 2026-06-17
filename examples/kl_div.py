@@ -70,6 +70,9 @@ def kl_div_forward(
 
     Returns:
         loss: KL divergence loss
+
+    Precision note: use bf16 or fp32, NOT fp16, at realistic vocabularies — the ~1/V target
+    probabilities underflow fp16 to 0 for V >= ~30k, so log(0) = -inf and the row goes NaN.
     """
     BT, V = y_pred.shape
     assert y_true.shape == y_pred.shape, (
