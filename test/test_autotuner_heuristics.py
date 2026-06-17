@@ -8,6 +8,7 @@ import torch
 
 import helion
 from helion._compiler.autotuner_heuristics import compiler_seed_configs
+from helion._compiler.autotuner_heuristics.cute import CuteFp8GemmSkinnyMHeuristic
 from helion._compiler.autotuner_heuristics.cute import CuteTcgen05ClusterM2Heuristic
 from helion._compiler.autotuner_heuristics.registry import AutotunerHeuristic
 from helion._compiler.autotuner_heuristics.triton import TritonSkinnyGemmHeuristic
@@ -18,6 +19,7 @@ from helion._compiler.autotuner_heuristics.triton import (
 from helion._compiler.autotuner_heuristics.triton import (
     TritonUserTiledReductionHeuristic,
 )
+from helion._compiler.backend import CuteBackend
 from helion._compiler.backend import TritonBackend
 from helion._compiler.cute.strategies import TCGEN05_LAYOUT_OVERRIDES_D_STORE_BOX_N_KEY
 from helion._compiler.cute.strategies import TCGEN05_LAYOUT_OVERRIDES_EPI_TILE_M_KEY
@@ -859,6 +861,166 @@ class TestTritonStandardReductionHeuristic(TestCase):
             TritonStandardReductionHeuristic.is_eligible(
                 mm.env, mm.host_function.device_ir
             )
+        )
+
+
+_FP8_SKINNY_M_SEED_BLOCK_SIZES = [1, 256]
+_FP8_SKINNY_M_SEED_NUM_THREADS = [0, 32]
+_FP8_SKINNY_M_SEED_VECTOR_WIDTHS = [4, 8]
+
+
+class TestCuteFp8GemmSkinnyMHeuristic(TestCase):
+    """Skinny-M FP8 GEMM heuristic: fires only for a single FP8 matmul with
+    static M <= 16 and seeds the [1, 256] / nt=[0, 32] / vec=[4, 8] config that
+    the full autotune converges to for the decode / small-batch regime.
+    """
+
+    def _make_cute_env(self) -> MagicMock:
+        spec = ConfigSpec(backend=CuteBackend())
+        env = MagicMock()
+        env.backend_name = "cute"
+        env.config_spec = spec
+        env.device = DEVICE
+        env.settings = Settings()
+        return env
+
+    def _matmul_fact(
+        self,
+        *,
+        static_m: int = 1,
+        static_n: int = 4096,
+        static_k: int = 4096,
+        lhs_dtype: torch.dtype = torch.float8_e4m3fn,
+        rhs_dtype: torch.dtype = torch.float8_e4m3fn,
+    ) -> MatmulFact:
+        return MatmulFact(
+            lhs_ndim=2,
+            rhs_ndim=2,
+            m_block_id=0,
+            n_block_id=1,
+            k_block_id=2,
+            static_m=static_m,
+            static_n=static_n,
+            static_k=static_k,
+            lhs_dtype=lhs_dtype,
+            rhs_dtype=rhs_dtype,
+        )
+
+    def test_eligibility_cases(self) -> None:
+        # (name, facts, expected_eligible)
+        cases = (
+            ("m1_fp8", [self._matmul_fact(static_m=1)], True),
+            ("m16_fp8", [self._matmul_fact(static_m=16)], True),
+            ("e5m2_fp8", [self._matmul_fact(lhs_dtype=torch.float8_e5m2)], True),
+            ("m17_too_large", [self._matmul_fact(static_m=17)], False),
+            ("m1024_gemm", [self._matmul_fact(static_m=1024)], False),
+            (
+                "bf16_not_fp8",
+                [self._matmul_fact(lhs_dtype=torch.bfloat16, rhs_dtype=torch.bfloat16)],
+                False,
+            ),
+            ("mixed_fp8_bf16", [self._matmul_fact(rhs_dtype=torch.bfloat16)], False),
+            ("dynamic_m", [self._matmul_fact(static_m=None)], False),
+            ("no_matmul", [], False),
+            ("two_matmuls", [self._matmul_fact(), self._matmul_fact()], False),
+        )
+        for name, facts, expected in cases:
+            env = self._make_cute_env()
+            env.config_spec.matmul_facts.extend(facts)
+            with self.subTest(name=name):
+                self.assertEqual(
+                    CuteFp8GemmSkinnyMHeuristic.is_eligible(env, MagicMock()),
+                    expected,
+                )
+
+    def test_seed_config_contents(self) -> None:
+        env = self._make_cute_env()
+        env.config_spec.matmul_facts.append(self._matmul_fact(static_m=1))
+        seed = CuteFp8GemmSkinnyMHeuristic.get_seed_config(env, MagicMock())
+        assert seed is not None
+        self.assertEqual(seed.config["block_sizes"], _FP8_SKINNY_M_SEED_BLOCK_SIZES)
+        self.assertEqual(seed.config["num_threads"], _FP8_SKINNY_M_SEED_NUM_THREADS)
+        self.assertEqual(
+            seed.config["cute_vector_widths"], _FP8_SKINNY_M_SEED_VECTOR_WIDTHS
+        )
+
+    def test_compiler_seed_configs_records_heuristic(self) -> None:
+        # The heuristic must be wired into the cute backend registry so the
+        # generic compiler_seed_configs() path emits its seed and records it.
+        env = self._make_cute_env()
+        env.config_spec.matmul_facts.append(self._matmul_fact(static_m=1))
+        configs = compiler_seed_configs(env, MagicMock())
+        self.assertIn(
+            _FP8_SKINNY_M_SEED_BLOCK_SIZES,
+            [config.config["block_sizes"] for config in configs],
+        )
+        self.assertIn(
+            CuteFp8GemmSkinnyMHeuristic.name,
+            env.config_spec.autotuner_heuristics,
+        )
+
+    def test_compiler_seed_configs_skips_large_m(self) -> None:
+        env = self._make_cute_env()
+        env.config_spec.matmul_facts.append(self._matmul_fact(static_m=1024))
+        configs = compiler_seed_configs(env, MagicMock())
+        self.assertNotIn(
+            CuteFp8GemmSkinnyMHeuristic.name,
+            env.config_spec.autotuner_heuristics,
+        )
+        self.assertNotIn(
+            _FP8_SKINNY_M_SEED_BLOCK_SIZES,
+            [config.config["block_sizes"] for config in configs],
+        )
+
+    @onlyBackends(["cute"])
+    @skipIfRefEager("Compiler seed configs are not generated in ref eager mode")
+    def test_seed_in_initial_population_for_skinny_m(self) -> None:
+        @helion.kernel(backend="cute", static_shapes=True)
+        def fp8_gemm_skinny_m(
+            x: torch.Tensor,
+            y: torch.Tensor,
+            scale_a: torch.Tensor,
+            scale_b: torch.Tensor,
+        ) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=torch.bfloat16, device=x.device)
+            for tile_n in hl.tile(n):
+                acc = hl.zeros([m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = hl.dot(x[:, tile_k], y[tile_k, tile_n], acc=acc)
+                acc = acc * scale_a[:, tile_n] * scale_b[tile_n]
+                out[:, tile_n] = acc.to(torch.bfloat16)
+            return out
+
+        m, k, n = 1, 4096, 4096
+        x = torch.randn([m, k], device=DEVICE, dtype=torch.float32).to(
+            torch.float8_e4m3fn
+        )
+        y = torch.randn([k, n], device=DEVICE, dtype=torch.float32).to(
+            torch.float8_e4m3fn
+        )
+        scale_a = torch.ones([m, n], device=DEVICE)
+        scale_b = torch.ones([n], device=DEVICE)
+
+        with patch_cute_mma_support():
+            bound = fp8_gemm_skinny_m.bind((x, y, scale_a, scale_b))
+
+        device_ir = bound.host_function.device_ir
+        self.assertTrue(CuteFp8GemmSkinnyMHeuristic.is_eligible(bound.env, device_ir))
+        self.assertIn(
+            CuteFp8GemmSkinnyMHeuristic.name,
+            bound.config_spec.autotuner_heuristics,
+        )
+        seed = CuteFp8GemmSkinnyMHeuristic.get_seed_config(bound.env, device_ir)
+        assert seed is not None
+        self.assertEqual(seed.config["block_sizes"], _FP8_SKINNY_M_SEED_BLOCK_SIZES)
+        self.assertIn(
+            _FP8_SKINNY_M_SEED_BLOCK_SIZES,
+            [
+                config.config["block_sizes"]
+                for config in bound.config_spec.compiler_seed_configs
+            ],
         )
 
 
