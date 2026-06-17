@@ -21,6 +21,8 @@ from helion._testing import DEVICE
 from helion._testing import HALF_DTYPE
 from helion._testing import run_example
 import helion.language as hl
+from helion.runtime.settings import _get_backend
+
 
 # Override default config to work around Triton tl.dot requirement:
 # `AssertionError: Input shapes should have M >= 16, N >= 16 and K >= 32`

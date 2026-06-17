@@ -2046,6 +2046,27 @@ def _emit_mma_pipeline(
         and not tcgen05_pid_is_persistent
         and tcgen05_cluster_m == 1
     )
+    # Flat (cluster_m=1) kernels whose ONLY partial axis is M (N and K are
+    # static-full tiles): the TMA engine zero-fills the partial M stripe of A
+    # natively, so the AB load can stay on the fast TMA path with an
+    # ``m_offset < m_size`` output-tile predicate instead of dropping every
+    # K-iteration into the scalar SMEM-staging fallback. This is the small-M
+    # decode/serving regime (e.g. M=16, block_m=64), where the scalar fallback
+    # is catastrophically slow (~100x). The partial M rows are masked out again
+    # in the SIMT epilogue store, so results stay correct. Mirrors the two-CTA
+    # ``tcgen05_role_local_m_edge_tma`` path for flat kernels -- it applies to
+    # both the non-persistent (mixed-TMA) and persistent (role-local scheduler)
+    # cluster_m=1 paths, so it is defined from the problem shape rather than the
+    # non-persistent ``tcgen05_mixed_tma_scalar_fallback`` flag.
+    tcgen05_flat_m_edge_tma = (
+        mma_impl == "tcgen05"
+        and tcgen05_use_tma_pipeline
+        and tcgen05_cluster_m == 1
+        and not tcgen05_static_full_tiles
+        and m_size % bm != 0
+        and n_size % bn == 0
+        and k_total_size % bk == 0
+    )
     tcgen05_edge_scalar_fallback_needs_inter_smem_a = (
         tcgen05_mixed_tma_scalar_fallback
         and bk >= 128
@@ -2093,6 +2114,7 @@ def _emit_mma_pipeline(
         and not tcgen05_m_edge_only
         and not tcgen05_n_edge_only
         and not tcgen05_double_edge_tma
+        and not tcgen05_flat_m_edge_tma
     ):
         # Mixed TMA full K tiles + scalar fallback tails are currently
         # validated only for flat one-CTA kernels. Persistent CtaGroup.TWO
@@ -2223,6 +2245,7 @@ def _emit_mma_pipeline(
             or tcgen05_role_local_m_edge_tma
             or tcgen05_role_local_n_edge_tma
             or tcgen05_role_local_double_edge_tma
+            or tcgen05_flat_m_edge_tma
         )
         and tcgen05_role_local_codegen_allowed
         and tcgen05_pid_is_persistent
@@ -3885,6 +3908,14 @@ def _emit_mma_pipeline(
                 f"{m_offset_var} + cutlass.Int32({bm}) <= cutlass.Int32({m_size}) "
                 f"and {n_offset_var} < cutlass.Int32({n_size}) "
             )
+        if tcgen05_flat_m_edge_tma:
+            # Flat single-CTA M-edge: TMA zero-fills the partial A stripe; only
+            # require the N tile to be full (it always is here). The SIMT
+            # epilogue masks the partial M rows on store.
+            return (
+                f"{m_offset_var} < cutlass.Int32({m_size}) "
+                f"and {n_offset_var} + cutlass.Int32({bn}) <= cutlass.Int32({n_size}) "
+            )
         return (
             f"{m_offset_var} + cutlass.Int32({bm}) <= cutlass.Int32({m_size}) "
             f"and {n_offset_var} + cutlass.Int32({bn}) <= cutlass.Int32({n_size}) "
@@ -4777,9 +4808,14 @@ def _emit_mma_pipeline(
                     cg.add_statement(
                         statement_from_string(
                             f"{tma_next_full_tile} = "
-                            f"{m_offset_var} + cutlass.Int32({bm}) <= cutlass.Int32({m_size}) "
-                            f"and {n_offset_var} + cutlass.Int32({bn}) <= cutlass.Int32({n_size}) "
-                            f"and {k_offset_var} + cutlass.Int32({bk * (tcgen05_ab_stage_count_value + 1)}) <= cutlass.Int32({k_total_size})"
+                            + _tcgen05_tma_tile_predicate(
+                                k_tile_start_expr=(
+                                    f"{k_offset_var} + cutlass.Int32({bk * tcgen05_ab_stage_count_value})"
+                                ),
+                                full_tile_end_expr=(
+                                    f"{k_offset_var} + cutlass.Int32({bk * (tcgen05_ab_stage_count_value + 1)})"
+                                ),
+                            )
                         )
                     )
                     cg.add_statement(

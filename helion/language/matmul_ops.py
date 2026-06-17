@@ -331,7 +331,7 @@ def enforce_dot_requirements(lhs: torch.Tensor, rhs: torch.Tensor) -> None:
         and static_m is not None
         and static_n is not None
         and static_k is not None
-        and static_m >= 64
+        and static_m >= 1
         and static_n >= 8
         and static_k >= mma_k
     ):
