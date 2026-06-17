@@ -450,12 +450,12 @@ class TestExamples(RefEagerTestBase, TestCase):
         x_fp8 = x.to(torch.float8_e4m3fn)
         y_fp8 = y.to(torch.float8_e4m3fn).T.contiguous().T
 
-        args = (x_fp8, y_fp8)
+        scale_a = (torch.rand([256, 1], device=DEVICE) + 0.5).expand(256, 256)
+        scale_b = torch.rand([256], device=DEVICE) + 0.5
+        args = (x_fp8, y_fp8, scale_a, scale_b)
 
         # Import the reference implementation
         mod = import_path(EXAMPLES_DIR / "fp8_gemm.py")
-        scale_a = torch.tensor(1.0, device=DEVICE)
-        scale_b = torch.tensor(1.0, device=DEVICE)
         expected = mod.reference_fp8_gemm_pytorch(x_fp8, y_fp8, scale_a, scale_b)
 
         check_example(
@@ -463,6 +463,34 @@ class TestExamples(RefEagerTestBase, TestCase):
             args,
             expected,
             block_sizes=[16, 16, 32],
+            num_warps=4,
+            num_stages=3,
+        )
+
+    @skipIfNotCUDA()
+    @skipIfCudaCapabilityLessThan((9, 0), reason="FP8 requires CUDA capability >= 9.0")
+    def test_fp8_gemm_skinny_m(self):
+        # Skinny-M variant (full M, tile over N) in examples/fp8_gemm.py
+        m, k, n = 16, 256, 256
+        x = torch.randn([m, k], device=DEVICE, dtype=torch.float32)
+        y = torch.randn([k, n], device=DEVICE, dtype=torch.float32)
+
+        x_fp8 = x.to(torch.float8_e4m3fn)
+        y_fp8 = y.to(torch.float8_e4m3fn).T.contiguous().T
+
+        scale_a = (torch.rand([m, 1], device=DEVICE) + 0.5).expand(m, n)
+        scale_b = torch.rand([n], device=DEVICE) + 0.5
+        args = (x_fp8, y_fp8, scale_a, scale_b)
+
+        mod = import_path(EXAMPLES_DIR / "fp8_gemm.py")
+        expected = mod.reference_fp8_gemm_pytorch(x_fp8, y_fp8, scale_a, scale_b)
+
+        check_example(
+            "fp8_gemm",
+            args,
+            expected,
+            fn_name="fp8_gemm_skinny_m",
+            block_sizes=[64, 64],
             num_warps=4,
             num_stages=3,
         )
