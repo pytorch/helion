@@ -557,6 +557,44 @@ class FlatProgramIDs(ProgramIDs):
         return expr_from_string(f"({self.total_pids_expr(is_device=False)},)")
 
 
+@dataclasses.dataclass
+class WorklistProgramIDs(ProgramIDs):
+    """Compact-worklist grid: one program per work item.
+
+    ``codegen`` emits ``_wid = pl.program_id(0)`` and recovers the owner
+    coordinate from the ``owner_ids`` scalar-prefetch ref (``work_<owner>_ref[
+    _wid]``) so owner-indexed tensors slice the right owner; ``codegen_grid``
+    renders the **static** ``UPPER`` (megablocks bound) as the host grid
+    positional, while the compact launcher overrides it with the traced
+    ``num_work``.
+    """
+
+    upper_expr: str = "1"
+
+    def codegen(self, state: CodegenState) -> None:
+        from .pallas.compact_worklist import owner_ref_name
+
+        env = CompileEnvironment.current()
+        plan = env.compact_worklist_plan
+        assert plan is not None
+        stmts: list[ast.stmt] = [statement_from_string(f"_wid = {typed_program_id(0)}")]
+        if self.pid_info:
+            # owner_ids is always in the metadata (see metadata_arg_names): the
+            # owner-grid prologue (q_offsets[seq]) is not DCE'd, so the owner pid
+            # must be a valid owner index, NOT the work id (which ranges over
+            # work items and would index q_offsets out of bounds).
+            owner_pid = self.pid_info[0].pid_var
+            ref = owner_ref_name(plan) + "_ref"
+            stmts.append(statement_from_string(f"{owner_pid} = {ref}[_wid]"))
+        state.codegen.statements_stack[-1][:] = [
+            *stmts,
+            *state.codegen.statements_stack[-1],
+        ]
+
+    def codegen_grid(self) -> ast.AST:
+        return expr_from_string(f"({self.upper_expr},)")
+
+
 class CuteProgramIDs(FlatProgramIDs):
     """Flat PID strategy for CuTe pointwise kernels."""
 

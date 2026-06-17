@@ -110,6 +110,15 @@ class GenerateAST(NodeVisitor, CodegenInterface):
         self._cute_synthetic_arange_axis_branch_paths: dict[
             int, list[list[tuple[int, int]]]
         ] = {}
+        # Records the branch path under which a strategy (e.g. a reduction) claimed
+        # a thread axis. A free ``hl.arange`` in a branch mutually-exclusive with
+        # every recorded user of a strategy axis may reuse that axis instead of
+        # claiming a fresh one (which would silently widen the launch block and
+        # turn the strategy's single-axis shared-memory reduction into a cross-axis
+        # race). Mirrors ``_cute_synthetic_arange_axis_branch_paths``.
+        self._cute_strategy_axis_branch_paths: dict[
+            int, list[list[tuple[int, int]]]
+        ] = {}
         # CuTe only: free ``hl.arange`` dims whose (joint) thread count would
         # exceed the 1024-thread budget are chunked onto a sequential lane loop
         # instead of claiming a fresh thread axis. Maps the per-arange ``key`` to
@@ -615,13 +624,43 @@ class GenerateAST(NodeVisitor, CodegenInterface):
         if current not in paths:
             paths.append(current)
 
+    def record_cute_strategy_axis_branch_path(self, axis: int) -> None:
+        """Remember the current branch path for a strategy (e.g. reduction) axis.
+
+        Called from reduction codegen while the dynamic ``_if`` branch scope is
+        live, so a free ``hl.arange`` in a mutually-exclusive sibling branch can
+        reuse this axis rather than claiming a fresh one. Recording only happens
+        inside a branch (an unbranched strategy axis is always co-live and must
+        never be reused).
+        """
+        if not self._cute_branch_path:
+            return
+        paths = self._cute_strategy_axis_branch_paths.setdefault(axis, [])
+        current = list(self._cute_branch_path)
+        if current not in paths:
+            paths.append(current)
+
     def _mutually_exclusive_synthetic_axis(self) -> int | None:
-        """Find a synthetic axis whose every arange is in a branch that can never
-        co-execute with the current branch path, so it can be safely reused."""
+        """Find a thread axis whose every recorded use is in a branch that can
+        never co-execute with the current branch path, so it can be safely reused.
+
+        Considers both synthetic ``hl.arange`` axes and strategy (reduction) axes:
+        a free arange in one grid branch may reuse the axis a reduction claimed in
+        a sibling branch when the two can never run together. An axis recorded in
+        BOTH maps must be mutually exclusive across all of its recorded paths.
+        """
         if not self._cute_branch_path:
             return None
         current = list(self._cute_branch_path)
-        for axis, paths in self._cute_synthetic_arange_axis_branch_paths.items():
+        candidate_axes = (
+            self._cute_synthetic_arange_axis_branch_paths.keys()
+            | self._cute_strategy_axis_branch_paths.keys()
+        )
+        for axis in sorted(candidate_axes):
+            paths = [
+                *self._cute_synthetic_arange_axis_branch_paths.get(axis, []),
+                *self._cute_strategy_axis_branch_paths.get(axis, []),
+            ]
             if paths and all(
                 self._cute_branch_paths_mutually_exclusive(current, path)
                 for path in paths
@@ -1214,6 +1253,25 @@ if __name__ == "__main__":
     """)
 
 
+def _maybe_emit_compact_worklist_builder(codegen: GenerateAST, config: Config) -> None:
+    """Emit the module-level jnp ``_build_worklist`` for a compact-worklist kernel."""
+    if config.get("pallas_loop_type") != "compact_worklist":
+        return
+    env = CompileEnvironment.current()
+    plan = env.compact_worklist_plan
+    if plan is None:
+        return
+    from .pallas.compact_worklist import render_build_worklist
+
+    source, offset_params = render_build_worklist(
+        plan,
+        block_expr=str(env.compact_worklist_block),
+        upper_expr=str(env.compact_worklist_upper),
+    )
+    env.compact_worklist_offset_params = offset_params
+    codegen.module_statements.append(statement_from_string(source))
+
+
 def generate_ast(
     func: HostFunction,
     config: Config,
@@ -1240,6 +1298,11 @@ def generate_ast(
                 config=config,
                 tile_strategy=codegen.device_function.tile_strategy,
             )
+
+            # Emit the worklist builder + record its offset params BEFORE the host
+            # body is visited (the launcher call -- which reads the offset params
+            # via build_launcher_args -- is generated during that visit).
+            _maybe_emit_compact_worklist_builder(codegen, config)
 
             for stmt in func.body:
                 codegen.add_statement(codegen.visit(stmt))

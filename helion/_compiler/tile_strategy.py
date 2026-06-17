@@ -2456,7 +2456,13 @@ class BlockSizeTileStrategy(TileStrategy):
         return reserved_reduction_axes + active_non_reduction_axes
 
     def select_pid_strategy(self) -> ProgramIDs:
-        backend_name = CompileEnvironment.current().backend.name
+        env = CompileEnvironment.current()
+        if env.compact_worklist_plan is not None:
+            # Compact worklist: the owner hl.grid becomes the work-item grid.
+            from .program_id import WorklistProgramIDs
+
+            return WorklistProgramIDs(upper_expr=str(env.compact_worklist_upper))
+        backend_name = env.backend.name
         pid_type = self.fn.config.pid_type
         if pid_type == "xyz":
             assert 1 < len(self.block_ids) <= 3

@@ -1392,6 +1392,52 @@ class TestCuteBackend(TestCase):
         self.assertIn("cute.nvgpu.tcgen05.CtaGroup.TWO", code)
         self.assertIn("compute_epilogue_tile_shape((64, 128), True", code)
 
+    def test_matmul_mma_tcgen05_fp8_two_cta_m128_rowvec_prewait_hoist(self) -> None:
+        """The bm=128 2-CTA family pre-hoists rowvec aux above the acc wait.
+
+        One whole-fragment ``autovec_copy`` into registers is emitted in the
+        per-tile setup (before the accumulator ``consumer_wait``) so the
+        rowvec GMEM latency hides under the MMA wait; the per-subtile loop
+        slices the register tensor instead of issuing per-subtile LDGs.
+        bm=256 must keep the per-subtile GMEM load (the whole-tile hoist
+        historically caused register spills there).
+        """
+        support = get_cute_mma_support()
+        if not support.tcgen05_f8:
+            self.skipTest("tcgen05 FP8 MMA is not supported on this machine")
+
+        torch.manual_seed(0)
+        x = (torch.randn(256, 512, device=DEVICE) * 0.4).to(torch.float8_e4m3fn)
+        y = (torch.randn(512, 256, device=DEVICE) * 0.4).to(torch.float8_e4m3fn)
+        scale_n = torch.rand(256, device=DEVICE) + 0.5
+        code, out = code_and_output(
+            cute_matmul_mma_fp8_rowvec_scale,
+            (x, y, scale_n),
+            block_sizes=[128, 128, 128],
+            tcgen05_cluster_m=2,
+            pid_type="persistent_blocked",
+        )
+        ref = (x.float() @ y.float()) * scale_n.float()
+        torch.testing.assert_close(out.float(), ref, atol=1.0, rtol=1e-1)
+        # Whole-fragment register hoist present...
+        self.assertIn("tcgen05_aux_rmem_full_", code)
+        hoist_pos = code.index("cute.autovec_copy(tcgen05_tTR_gAux_grouped_")
+        # ...and emitted before the accumulator consumer_wait.
+        acc_wait_pos = code.index(".consumer_wait(tcgen05_acc_consumer_state)")
+        self.assertLess(hoist_pos, acc_wait_pos)
+        # The subtile loop reads the register tensor, not per-subtile GMEM.
+        self.assertNotIn("tcgen05_tTR_gAux_subtile_", code)
+
+        # bm=256 keeps the per-subtile GMEM load (no whole-fragment hoist).
+        code256 = cute_matmul_mma_fp8_rowvec_scale.bind((x, y, scale_n)).to_triton_code(
+            helion.Config(
+                block_sizes=[256, 128, 128],
+                tcgen05_cluster_m=2,
+                pid_type="persistent_blocked",
+            )
+        )
+        self.assertNotIn("tcgen05_aux_rmem_full_", code256)
+
     def test_matmul_mma_tcgen05_f16_m128_cluster_m2_keeps_cta_group_one(
         self,
     ) -> None:
@@ -2366,6 +2412,202 @@ class TestCuteBackend(TestCase):
         self.assertIn("_cute_grouped_reduce_warp", code)
         self.assertIn("group_span=32", code)
         self.assertNotIn("_cute_grouped_reduce_shared_two_stage", code)
+
+    def test_branch_free_arange_reuses_reduction_thread_axis(self) -> None:
+        """A free ``hl.arange`` in a grid branch must reuse the thread axis a
+        reduction claimed in a mutually-exclusive sibling branch, not claim a
+        fresh one.
+
+        Branches ``pid==0`` / ``pid==1`` reduce over a free ``hl.arange`` (their
+        lane dim binds to reduction thread axis 0); the branch-only ``pid==2``
+        uses a free ``hl.arange`` with no reduction. Because the three branches
+        are mutually exclusive, ``pid==2`` can reuse axis 0. If it instead grabs
+        a second thread axis, the launch block becomes 2D (e.g. ``(64, 16, 1)``)
+        and the 16 extra lanes re-run ``pid==1``'s single-axis shared-memory
+        reduction redundantly, racing on the same SMEM slots and producing
+        intermittently wrong output (uninitialized memory leaks through on the
+        first launch). Assert the deterministic codegen decision -- a 1-D launch
+        block and the ``pid==2`` store indexing thread axis 0 -- which catches the
+        race at compile time without depending on the timing-sensitive failure.
+        """
+        t = 4
+        a = torch.randn(t, 8, 32, device=DEVICE, dtype=torch.bfloat16)
+        b = torch.randn(t, 8, 64, device=DEVICE, dtype=torch.bfloat16)
+        c = torch.randn(t, 12, 16, device=DEVICE, dtype=torch.bfloat16)
+        code, (out_a, out_b, out_c) = code_and_output(
+            cute_branch_free_arange_reduction, (a, b, c)
+        )
+
+        # Correctness: every output row must be written (a dropped/raced store
+        # leaves uninitialized memory that diverges from the reference).
+        a_ref = a.float()
+        a_scale = torch.rsqrt(
+            torch.sum(a_ref * a_ref, dim=-1, keepdim=True) / 32 + 1e-6
+        )
+        b_ref = b.float()
+        b_scale = torch.amax(torch.abs(b_ref), dim=-1, keepdim=True)
+        torch.testing.assert_close(out_a, a_ref * a_scale, rtol=1e-2, atol=1e-2)
+        torch.testing.assert_close(out_b, b_ref / b_scale, rtol=1e-2, atol=1e-2)
+        torch.testing.assert_close(out_c, c.float() + 1.0, rtol=1e-2, atol=1e-2)
+
+        # Deterministic codegen guard: the branch-only free arange reused the
+        # reduction's thread axis, so the launch block stays 1-D and every store
+        # indexes thread axis 0. A regression re-introduces a second thread axis
+        # (a 2-D ``block=(.., N, 1)`` with ``N > 1``) and a ``thread_idx()[1]``
+        # store index.
+        import re as _re
+
+        block_match = _re.search(r"block=\((\d+),\s*(\d+),\s*(\d+)\)", code)
+        self.assertIsNotNone(block_match, f"no launch block found in:\n{code}")
+        assert block_match is not None
+        bx, by, bz = (int(g) for g in block_match.groups())
+        self.assertEqual(
+            (by, bz),
+            (1, 1),
+            f"expected a 1-D launch block (free arange reused reduction axis 0) "
+            f"but got block=({bx}, {by}, {bz}); the branch-only arange claimed a "
+            f"spurious second thread axis, racing the single-axis reduction",
+        )
+        self.assertNotIn(
+            "thread_idx()[1]",
+            code,
+            "a store indexes thread axis 1; the branch-only free arange must "
+            "reuse the reduction's axis 0 in mutually-exclusive branches",
+        )
+
+        # Lane-bound guard: the launch block is sized to the widest branch
+        # (pid==1, db=64), so the narrower branches must mask their surplus
+        # thread lanes to their own dim size. Without this, pid==0's reduction
+        # store (da=32) and pid==2's free-arange store (dc=16) run lanes 32..63 /
+        # 16..63 out of bounds, corrupting the sibling pid==1 reduction's output.
+        self.assertIn(
+            "cute.arch.thread_idx()[0]) < 32",
+            code,
+            "pid==0's per-lane access (reduction dim da=32) is not bounded to its "
+            "lane extent on the shared 64-wide axis -- lanes 32..63 go OOB",
+        )
+        self.assertIn(
+            "cute.arch.thread_idx()[0]) < 16",
+            code,
+            "pid==2's per-lane free-arange access (dc=16) is not bounded to its "
+            "lane extent on the shared 64-wide axis -- lanes 16..63 go OOB",
+        )
+
+    def test_branch_noncanonical_free_arange_lane_bound(self) -> None:
+        """A non-canonical free ``hl.arange`` (non-zero start / non-unit step)
+        that reuses a wider sibling's thread axis must still mask its surplus
+        lanes to its own length.
+
+        ``pid==0`` reduces over a 64-wide free arange (claims thread axis 0);
+        ``pid==1`` uses ``hl.arange(8, 24)`` -- length 16, start 8 -- which reuses
+        axis 0 (the branches are mutually exclusive). The launch block is sized to
+        the wider branch (64), so ``pid==1``'s lanes 16..63 are surplus and must be
+        masked. The bound is on the arange's *lane position* (``thread_idx()[axis]
+        < length``), independent of the start offset -- ``< 16``, not the dim size
+        (32) and not the addressed value range (8..23). The earlier canonical-only
+        masking emitted no bound here, so those surplus lanes went out of bounds.
+        """
+        t = 4
+        a = torch.randn(t, 8, 32, device=DEVICE, dtype=torch.bfloat16)
+        b = torch.randn(t, 8, 64, device=DEVICE, dtype=torch.bfloat16)
+        code, (out_a, out_b) = code_and_output(
+            cute_branch_noncanonical_free_arange, (a, b)
+        )
+
+        # Correctness: the written slice (positions 8..23) matches the reference,
+        # and the sibling reduction output is intact (surplus lanes did not race).
+        torch.testing.assert_close(
+            out_a[:, :, 8:24], a.float()[:, :, 8:24] + 1.0, rtol=1e-2, atol=1e-2
+        )
+        b_ref = b.float()
+        b_scale = torch.amax(torch.abs(b_ref), dim=-1, keepdim=True)
+        torch.testing.assert_close(out_b, b_ref / b_scale, rtol=1e-2, atol=1e-2)
+
+        # The branch reused axis 0, so the launch block stays 1-D.
+        import re as _re
+
+        block_match = _re.search(r"block=\((\d+),\s*(\d+),\s*(\d+)\)", code)
+        self.assertIsNotNone(block_match, f"no launch block found in:\n{code}")
+        assert block_match is not None
+        bx, by, bz = (int(g) for g in block_match.groups())
+        self.assertEqual((by, bz), (1, 1), f"expected 1-D block, got {(bx, by, bz)}")
+
+        # The non-canonical arange's surplus lanes are bounded to its length (16),
+        # NOT the dim size (32). Without the generalized bound (canonical-only),
+        # this access emitted no lane mask and lanes 16..63 went out of bounds.
+        self.assertIn(
+            "cute.arch.thread_idx()[0]) < 16",
+            code,
+            "pid==1's non-canonical free arange (hl.arange(8, 24), length 16) is "
+            "not bounded to its lane extent on the shared 64-wide axis",
+        )
+        self.assertNotIn(
+            "cute.arch.thread_idx()[0]) < 32",
+            code,
+            "the non-canonical arange must be bounded by its length (16), not the "
+            "dim size (32)",
+        )
+
+
+@helion.kernel(backend="cute", static_shapes=False)
+def cute_branch_free_arange_reduction(
+    a: torch.Tensor, b: torch.Tensor, c: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    t = a.size(0)
+    ha = hl.specialize(a.shape[1])
+    hc = hl.specialize(c.shape[1])
+    hmax = hl.specialize(max(a.shape[1], c.shape[1]))
+    da = hl.specialize(a.shape[2])
+    db = hl.specialize(b.shape[2])
+    dc = hl.specialize(c.shape[2])
+    out_a = torch.empty_like(a, dtype=torch.float32)
+    out_b = torch.empty_like(b, dtype=torch.float32)
+    out_c = torch.empty_like(c, dtype=torch.float32)
+    for pid, tile_t, tile_h in hl.grid([3, t, hmax]):
+        if pid == 0:
+            if tile_h < ha:
+                ao = hl.arange(0, da)
+                av = a[tile_t, tile_h, ao].to(torch.float32)
+                asc = torch.rsqrt(torch.sum(av * av, dim=-1) / da + 1.0e-6)
+                out_a[tile_t, tile_h, ao] = av * asc
+        elif pid == 1:
+            if tile_h < ha:
+                bo = hl.arange(0, db)
+                bv = b[tile_t, tile_h, bo].to(torch.float32)
+                bsc = torch.amax(torch.abs(bv), dim=-1)
+                out_b[tile_t, tile_h, bo] = bv / bsc
+        elif pid == 2:
+            if tile_h < hc:
+                co = hl.arange(0, dc)
+                cv = c[tile_t, tile_h, co].to(torch.float32)
+                out_c[tile_t, tile_h, co] = cv + 1.0
+    return out_a, out_b, out_c
+
+
+@helion.kernel(backend="cute", static_shapes=False)
+def cute_branch_noncanonical_free_arange(
+    a: torch.Tensor, b: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    t = a.size(0)
+    ha = hl.specialize(a.shape[1])
+    hmax = hl.specialize(max(a.shape[1], b.shape[1]))
+    db = hl.specialize(b.shape[2])
+    out_a = torch.empty_like(a, dtype=torch.float32)
+    out_b = torch.empty_like(b, dtype=torch.float32)
+    for pid, tile_t, tile_h in hl.grid([2, t, hmax]):
+        if pid == 0:
+            if tile_h < ha:
+                bo = hl.arange(0, db)
+                bv = b[tile_t, tile_h, bo].to(torch.float32)
+                bsc = torch.amax(torch.abs(bv), dim=-1)
+                out_b[tile_t, tile_h, bo] = bv / bsc
+        elif pid == 1:
+            if tile_h < ha:
+                # Non-canonical free arange: start=8, length=16 (positions 8..23).
+                ao = hl.arange(8, 24)
+                av = a[tile_t, tile_h, ao].to(torch.float32)
+                out_a[tile_t, tile_h, ao] = av + 1.0
+    return out_a, out_b
 
 
 @helion.kernel(backend="cute")

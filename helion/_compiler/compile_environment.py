@@ -161,6 +161,7 @@ if TYPE_CHECKING:
     from .. import Config
     from ..runtime.settings import Settings
     from .backend import Backend
+    from .pallas.compact_worklist import CompactWorklistPlan
 
     class _TLS(Protocol):
         env: CompileEnvironment | None
@@ -269,6 +270,21 @@ class CompileEnvironment:
         self._tensor_descriptor_layout_guard_source_cache: dict[int, Source | None] = {}
         self.jagged_tile_parent_ids: dict[int, list[int]] = {}
         self.jagged_tile_mask_shapes: dict[int, list[torch.SymInt]] = {}
+        # Set by the Pallas backend when config["pallas_loop_type"] ==
+        # "compact_worklist" and detect_compact_worklist_plan succeeds; gates the
+        # whole compact-worklist codegen path (see helion/_compiler/pallas/
+        # compact_worklist.py).
+        self.compact_worklist_plan: CompactWorklistPlan | None = None
+        # Static megablocks upper bound (int) for the compact worklist grid /
+        # metadata, computed at pre_codegen from static shapes.
+        self.compact_worklist_upper: int = 1
+        # Compact-axis tile block size (int), resolved from the config at
+        # pre_codegen; used by the worklist builder and UPPER (NOT max(block_sizes)).
+        self.compact_worklist_block: int = 1
+        # Offsets-tensor parameter names the generated _build_worklist takes, in
+        # order (set when the builder is emitted); used by the launcher to map
+        # them to host-call arg positions.
+        self.compact_worklist_offset_params: list[str] = []
         self._symint_cache: dict[object, torch.SymInt] = {}
         self._foreign_symint_cache: dict[
             tuple[int, sympy.Expr], int | torch.SymInt

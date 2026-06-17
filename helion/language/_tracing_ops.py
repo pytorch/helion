@@ -243,6 +243,12 @@ def _(state: CodegenState) -> object:
         return _codegen_emit_pipeline(state)
     if pallas_loop_type == "fori_loop":
         return _codegen_fori_loop(state)
+    if pallas_loop_type == "compact_worklist":
+        # The compacted tile becomes the grid (no loop); the ordered inner tile
+        # (fully jagged) and the single-iteration compact tile both lower through
+        # the fori path with begin/end remapped to metadata refs (see
+        # _compact_worklist_bounds).
+        return _codegen_fori_loop(state)
     # unroll: fall through to common codegen path
     # pyrefly: ignore[bad-return]
     return state.get_graph(state.proxy_arg(0)).codegen(state)
@@ -256,7 +262,10 @@ def _(state: CodegenState) -> None:
     if pallas_loop_type == "emit_pipeline":
         _codegen_emit_pipeline(state)
         return None
-    if pallas_loop_type == "fori_loop":
+    if pallas_loop_type in ("fori_loop", "compact_worklist"):
+        # Route compact_worklist through the same lowering as _for_loop so the
+        # compact metadata (begin/end remap, synthetic compact tile) is applied
+        # rather than falling through to the common (non-compact) codegen.
         _codegen_fori_loop(state)
         return None
     # pyrefly: ignore[bad-return]
@@ -355,10 +364,52 @@ def _find_strategy(
     return strategy
 
 
+def _compact_worklist_bounds(
+    state: CodegenState, loop_dim_index: int
+) -> tuple[str, str] | None:
+    """Metadata-ref begin/end for a compact/ordered tile, else None."""
+    env = CompileEnvironment.current()
+    plan = env.compact_worklist_plan
+    if plan is None:
+        return None
+    from .._compiler.device_ir import ForLoopGraphInfo
+    from .._compiler.pallas.compact_worklist import compact_ref_names
+    from .._compiler.pallas.compact_worklist import ordered_ref_names
+
+    graph_info = state.get_graph(state.proxy_arg(0))
+    if not isinstance(graph_info, ForLoopGraphInfo):
+        return None
+    block_ids = graph_info.block_ids
+    if loop_dim_index >= len(block_ids):
+        return None
+    block_id = block_ids[loop_dim_index]
+    if block_id == plan.compact_axis.block_id:
+        begin_ref, extent_ref = (f"{n}_ref" for n in compact_ref_names(plan))
+        return f"{begin_ref}[_wid]", f"{begin_ref}[_wid] + {extent_ref}[_wid]"
+    ordered = plan.ordered_axis
+    if ordered is not None and block_id == ordered.block_id:
+        begin_ref, len_ref = (f"{n}_ref" for n in ordered_ref_names(plan))
+        return f"{begin_ref}[_wid]", f"{begin_ref}[_wid] + {len_ref}[_wid]"
+    return None
+
+
 def _get_loop_begin_and_end(
     state: CodegenState, loop_dim_index: int
 ) -> tuple[str, str]:
-    """Extract the begin and end values from the _for_loop state args."""
+    """Extract the begin and end values from the _for_loop state args.
+
+    Under ``compact_worklist`` the compact tile's begin/end are remapped to the
+    per-work-item metadata refs: begin =
+    ``tile_starts_ref[_wid]``, end =
+    ``tile_starts_ref[_wid] + tile_extents_ref[_wid]`` (and likewise the ordered
+    axis -> ``range_start_ref``/``range_len_ref``).  Every downstream consumer
+    (numel -> fori trip count, offset, masks) then composes unchanged, so
+    ``_codegen_fori_loop`` runs a single iteration for the compact tile
+    (``tile_extent <= BLOCK``).
+    """
+    remap = _compact_worklist_bounds(state, loop_dim_index)
+    if remap is not None:
+        return remap
     ast_begins = state.ast_args[1]
     ast_ends = state.ast_args[2]
     begins = list(ast_begins) if isinstance(ast_begins, (list, tuple)) else [ast_begins]
@@ -2266,6 +2317,28 @@ def _codegen_fori_loop(state: CodegenState) -> object:
         loaded_tensors, stored_tensors, block_ids, slice_size_exprs, env, state
     )
 
+    # Compact worklist: the compact-tile aligned_load and exact_store tensors use
+    # per-tile pl.Element BlockSpecs, which Pallas double-buffers across the
+    # work-item grid.  Keep them OUT of the manual make_async_copy DMA path: with
+    # a single straight-line compact tile there is no inner loop to overlap, so a
+    # DMA start()/wait() would run fully serial (load -> wait -> compute -> store
+    # -> wait, measured ~1.8x slower).  Excluding them lets the BlockSpec pipeline
+    # hide the latency.
+    _compact_plan = env.compact_worklist_plan
+    if _compact_plan is not None and not carried:
+        _compact_names = {
+            p.arg_name
+            for p in _compact_plan.tensor_policies
+            if p.kind in ("compact_aligned_load", "compact_exact_store")
+        }
+        _fid_to_fake = {id(f): f for f, _s, _d in all_tensor_info}
+        pipelined_tensor_ids = {
+            fid
+            for fid in pipelined_tensor_ids
+            if state.device_function.tensor_arg(_fid_to_fake[fid]).host_str()
+            not in _compact_names
+        }
+
     from .._compiler.device_function import PallasMemorySpace
 
     tensor_to_dma_scratch: dict[str, str] = {}
@@ -2473,6 +2546,26 @@ def _codegen_fori_loop(state: CodegenState) -> object:
                 statement_from_string(f"{copy_out_var}.start()")
             )
             state.codegen.add_statement(statement_from_string(f"{copy_out_var}.wait()"))
+
+    # Compact-worklist outer tile: it IS the grid (exactly one tile per work
+    # item, since the builder guarantees extent <= BLOCK), so emit the body
+    # straight-line with the loop var bound to 0 -- no fori_loop wrapper (which
+    # would add control-flow overhead and block pipelining for the common
+    # dense-KV case).  The ordered inner tile still lowers as a fori_loop.
+    plan = CompileEnvironment.current().compact_worklist_plan
+    is_compact_tile = (
+        plan is not None
+        and not carried  # the compact tile is parallel (no carried state)
+        and len(block_ids) == 1
+        and block_ids[0] == plan.compact_axis.block_id
+    )
+    if is_compact_tile:
+        # No nonlocal declarations: the body runs at kernel scope (scratch refs
+        # are kernel params, directly assignable -- nonlocal would be invalid).
+        state.add_statement(statement_from_string(f"{loop_vars[0]} = 0"))
+        for stmt in body_stmts or [ast.Pass()]:
+            state.add_statement(stmt)
+        return None
 
     _emit_nonlocal_scratch_declarations(state, body_stmts)
 
