@@ -61,21 +61,37 @@ class AutotuneMetrics:
         }
 
 
-def _codegen_signature(settings: dict[str, object] | None) -> str:
-    """Join codegen-affecting settings into a stable string for run_id.
+# Codegen/perf-affecting settings hashed into run_id, so invocations that would
+# generate different code never collide. Kept as a small local tuple (not Settings
+# field metadata) so settings.py stays untouched; the full settings are still
+# recorded verbatim in the .meta.jsonl record. Sorted for a stable wire format.
+# Every value is a scalar/enum/torch.dtype, so run_id is reproducible across
+# processes (no callables/paths/seed leak in).
+_CODEGEN_SETTINGS: tuple[str, ...] = (
+    "allow_warp_specialize",
+    "backend",
+    "debug_dtype_asserts",
+    "dot_precision",
+    "fast_math",
+    "index_dtype",
+    "pallas_interpret",
+    "persistent_reserved_sms",
+    "static_shapes",
+    "triton_do_not_specialize",
+)
 
-    Iterates CODEGEN_AFFECTING_SETTINGS tagged at field definition, so any
-    codegen change alters run_id. Order is alphabetical for stability across
-    field reorders; missing keys render as None. Full settings are stored
-    separately in metadata.
+
+def _codegen_signature(settings: dict[str, object] | None) -> str:
+    """Join codegen-affecting settings into a stable, reproducible string for run_id.
+
+    Iterates the fixed local set of codegen-affecting settings, so any codegen
+    change alters run_id. Order is the tuple's (sorted) order for a stable wire
+    format; missing keys render as None. Full settings are stored separately in
+    metadata.
     """
     if not settings:
         return ""
-    from ..runtime.settings import CODEGEN_AFFECTING_SETTINGS
-
-    return ", ".join(
-        f"{name}={settings.get(name)}" for name in CODEGEN_AFFECTING_SETTINGS
-    )
+    return ", ".join(f"{name}={settings.get(name)}" for name in _CODEGEN_SETTINGS)
 
 
 @dataclasses.dataclass

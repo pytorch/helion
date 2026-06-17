@@ -58,16 +58,11 @@ if TYPE_CHECKING:
     from helion.autotuner.effort_profile import AutotuneEffortProfile
 
 
-_DATASET_NO_LOG_WARNED = False
-
-
+@functools.cache
 def _warn_dataset_without_log(log: AutotuningLogger) -> None:
-    """Warn once: ``autotune_dataset`` needs ``autotune_log`` (the base path the
-    ``.meta.jsonl`` sits next to) or nothing is collected."""
-    global _DATASET_NO_LOG_WARNED
-    if _DATASET_NO_LOG_WARNED:
-        return
-    _DATASET_NO_LOG_WARNED = True
+    """Warn (once) that ``autotune_dataset`` needs ``autotune_log`` (the base path
+    the ``.meta.jsonl`` sits next to) or nothing is collected. Cached so the
+    warning fires once per logger instead of once per config."""
     log.warning(
         "HELION_AUTOTUNE_DATASET is set but HELION_AUTOTUNE_LOG is not; no "
         "autotune dataset will be collected. Set HELION_AUTOTUNE_LOG to a base "

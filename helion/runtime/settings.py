@@ -50,17 +50,6 @@ _TRUE_LITERALS = frozenset({"1", "true", "yes", "on"})
 _FALSE_LITERALS = frozenset({"0", "false", "no", "off"})
 
 
-def codegen_decorator_parts(static_shapes: object, index_dtype: object) -> list[str]:
-    """Human-facing decorator parts: static_shapes always, index_dtype if set.
-    Minimal subset for readability; run_id uses full CODEGEN_AFFECTING_SETTINGS
-    separately to stay collision-free without golden churn.
-    """
-    parts = [f"static_shapes={static_shapes}"]
-    if index_dtype is not None:
-        parts.append(f"index_dtype={index_dtype}")
-    return parts
-
-
 def _resolve_warning_name(name: str) -> type[exc.BaseWarning]:
     attr = name.strip()
     if not attr:
@@ -391,33 +380,26 @@ def is_pallas_interpret() -> bool:
 @dataclasses.dataclass
 class _Settings:
     # see __slots__ below for the doc strings that show up in help(Settings)
-    backend: str = dataclasses.field(
-        default_factory=_get_backend, metadata={"codegen": True}
-    )
+    backend: str = dataclasses.field(default_factory=_get_backend)
     ignore_warnings: list[type[exc.BaseWarning]] = dataclasses.field(
         default_factory=_get_ignore_warnings
     )
     index_dtype: torch.dtype | None = dataclasses.field(
-        default_factory=_get_index_dtype, metadata={"codegen": True}
+        default_factory=_get_index_dtype
     )
-    dot_precision: DotPrecision = dataclasses.field(
-        default_factory=_get_dot_precision, metadata={"codegen": True}
-    )
+    dot_precision: DotPrecision = dataclasses.field(default_factory=_get_dot_precision)
     fast_math: bool = dataclasses.field(
-        default_factory=functools.partial(_env_get_bool, "HELION_FAST_MATH", False),
-        metadata={"codegen": True},
+        default_factory=functools.partial(_env_get_bool, "HELION_FAST_MATH", False)
     )
     static_shapes: bool = dataclasses.field(
-        default_factory=functools.partial(_env_get_bool, "HELION_STATIC_SHAPES", True),
-        metadata={"codegen": True},
+        default_factory=functools.partial(_env_get_bool, "HELION_STATIC_SHAPES", True)
     )
     persistent_reserved_sms: int = dataclasses.field(
         default_factory=functools.partial(
             _env_get_int,
             "HELION_PERSISTENT_RESERVED_SMS",
             0,
-        ),
-        metadata={"codegen": True},
+        )
     )
     autotune_force_persistent: bool = dataclasses.field(
         default_factory=functools.partial(
@@ -562,14 +544,12 @@ class _Settings:
     allow_warp_specialize: bool = dataclasses.field(
         default_factory=functools.partial(
             _env_get_bool, "HELION_ALLOW_WARP_SPECIALIZE", True
-        ),
-        metadata={"codegen": True},
+        )
     )
     debug_dtype_asserts: bool = dataclasses.field(
         default_factory=functools.partial(
             _env_get_bool, "HELION_DEBUG_DTYPE_ASSERTS", False
-        ),
-        metadata={"codegen": True},
+        )
     )
     ref_mode: RefMode = dataclasses.field(default_factory=_get_ref_mode)
     autotune_cache: str = dataclasses.field(
@@ -608,22 +588,13 @@ class _Settings:
     pallas_interpret: bool = dataclasses.field(
         default_factory=functools.partial(
             _env_get_bool, "HELION_PALLAS_INTERPRET", False
-        ),
-        metadata={"codegen": True},
+        )
     )
     triton_do_not_specialize: bool = dataclasses.field(
         default_factory=functools.partial(
             _env_get_bool, "HELION_TRITON_DO_NOT_SPECIALIZE", False
-        ),
-        metadata={"codegen": True},
+        )
     )
-
-
-# Codegen-affecting Settings fields, tagged at definition with metadata={"codegen": True}.
-# Single source of truth for run_id; sorted for stable wire format across field reorders.
-CODEGEN_AFFECTING_SETTINGS: tuple[str, ...] = tuple(
-    sorted(f.name for f in dataclasses.fields(_Settings) if f.metadata.get("codegen"))
-)
 
 
 class Settings(_Settings):

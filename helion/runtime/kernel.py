@@ -61,7 +61,6 @@ from .config import Config
 from .ref_mode import RefModeContext
 from .ref_mode import is_ref_mode_enabled
 from .settings import Settings
-from .settings import codegen_decorator_parts
 
 if TYPE_CHECKING:
     from collections.abc import Hashable
@@ -670,8 +669,10 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
         """Return the @helion.kernel decorator snippet capturing configs and settings that influence Triton code generation."""
         parts = [
             f"config={config.__repr__()}",
-            *codegen_decorator_parts(settings.static_shapes, settings.index_dtype),
+            f"static_shapes={settings.static_shapes}",
         ]
+        if settings.index_dtype is not None:
+            parts.append(f"index_dtype={settings.index_dtype}")
         return f"@helion.kernel({', '.join(parts)})"
 
     def to_code(
