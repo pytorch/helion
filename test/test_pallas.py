@@ -3951,6 +3951,209 @@ class TestPallas(TestCase):
             ref[i] = (x[s:e] @ y[s:e].T).sum()
         torch.testing.assert_close(result, ref, rtol=1e-2, atol=1e-2)
 
+    @staticmethod
+    def _transpose_operand_producer(code: str) -> str | None:
+        """The source line producing the operand fed to the first
+        ``jnp.transpose(...)``, or None if there is no transpose."""
+        m = re.search(r"\b\w+ = jnp\.transpose\((\w+),", code)
+        if m is None:
+            return None
+        producer = re.search(
+            rf"^[ \t]*{re.escape(m.group(1))} = .*$", code, re.MULTILINE
+        )
+        return producer.group(0) if producer else None
+
+    def test_relayout_targets_exclude_reshape(self) -> None:
+        """Guard: ``view``/``reshape`` must NOT be deferrable relayouts.  They can
+        regroup the masked dim's elements (e.g. ``[B, 2]`` -> ``[2, B]``), so a
+        consumer-layout mask would select different lanes than the load mask; only
+        pure axis permutations are safe to defer through."""
+        from helion._compiler.node_masking import _RELAYOUT_TARGETS
+
+        self.assertIn(torch.ops.aten.permute.default, _RELAYOUT_TARGETS)
+        self.assertNotIn(torch.ops.aten.view.default, _RELAYOUT_TARGETS)
+        self.assertNotIn(torch.ops.aten.reshape.default, _RELAYOUT_TARGETS)
+
+    def test_transpose_dot_defers_pallas_load_mask(self) -> None:
+        """A masked load consumed via ``transpose`` -> dot defers its mask to the
+        consumer layout: a raw load + a post-transpose ``jnp.where``, not an eager
+        multiplicative load mask.
+
+        The deferral is an FX-graph pass, so it is independent of the pallas loop
+        type -- asserted here for both ``fori_loop`` and ``compact_worklist`` on a
+        generic (non-attention) per-token jagged projection whose partial tiles
+        make the mask load-bearing.
+        """
+
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def jagged_proj(
+            x: torch.Tensor, w: torch.Tensor, offsets: torch.Tensor
+        ) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for seg in hl.grid(offsets.size(0) - 1):
+                wb = w[:, :, :]
+                for tile in hl.tile(offsets[seg], offsets[seg + 1]):
+                    # masked load -> transpose -> dot: the deferral target.
+                    xb = x[tile, :, :].transpose(0, 1)
+                    out[tile, :, :] = torch.bmm(xb, wb).transpose(0, 1)
+            return out
+
+        H, D, block = 2, 16, 16
+        # Packed jagged offsets with partial final tiles (none a multiple of the
+        # block; one < block) so the deferred mask is load-bearing.
+        offsets = torch.tensor([0, 10, 33, 40, 80], device=DEVICE, dtype=torch.int32)
+        torch.manual_seed(0)
+        x = torch.randn(80, H, D, device=DEVICE, dtype=torch.bfloat16)
+        w = torch.randn(H, D, D, device=DEVICE, dtype=torch.bfloat16)
+
+        ref = torch.empty_like(x)
+        for i in range(offsets.size(0) - 1):
+            s, e = int(offsets[i]), int(offsets[i + 1])
+            ref[s:e] = torch.bmm(x[s:e].transpose(0, 1), w).transpose(0, 1)
+
+        for loop_type in ("fori_loop", "compact_worklist"):
+            with self.subTest(loop_type=loop_type):
+                code, out = code_and_output(
+                    jagged_proj,
+                    (x, w, offsets),
+                    block_sizes=[block],
+                    pallas_loop_type=loop_type,
+                )
+                # x's masked load is raw (no eager ``* mask``), feeds a transpose,
+                # and the mask reappears as a post-transpose ``jnp.where``.
+                producer = self._transpose_operand_producer(code)
+                self.assertIsNotNone(producer)
+                self.assertRegex(producer, r"= x\[")
+                self.assertNotIn("* mask", producer)
+                self.assertIn("jnp.where", code)
+                # compact_worklist matches the eager reference on the partial
+                # tiles.  fori_loop miscompiles jagged tiles in pallas interpret
+                # (a pre-existing, unrelated issue), so it is not a sound numeric
+                # oracle here; for it we assert only the codegen above.
+                if loop_type == "compact_worklist":
+                    torch.testing.assert_close(
+                        out.cpu(), ref.cpu(), rtol=2e-2, atol=2e-2
+                    )
+
+    def test_direct_dot_input_keeps_eager_load_mask(self) -> None:
+        """A masked load consumed directly by a dot (no relayout) is not
+        deferred: it keeps the eager multiplicative load mask."""
+
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def direct_dot(
+            y: torch.Tensor, w: torch.Tensor, offsets: torch.Tensor
+        ) -> torch.Tensor:
+            num_segs = offsets.size(0) - 1
+            d = w.size(1)
+            out = torch.zeros([num_segs, d], dtype=y.dtype, device=y.device)
+            for seg in hl.grid(num_segs):
+                start = offsets[seg]
+                end = offsets[seg + 1]
+                acc = hl.zeros([d], dtype=y.dtype)
+                for tile_j in hl.tile(start, end):
+                    # y[tile_j, :] is the lhs of the dot with no relayout.
+                    acc = acc + torch.matmul(y[tile_j, :], w[:, :]).sum(dim=0)
+                out[seg, :] = acc
+            return out
+
+        N, D, P = 128, 96, 48
+        y = torch.randn(N, D, device=DEVICE, dtype=torch.float32)
+        w = torch.randn(D, P, device=DEVICE, dtype=torch.float32)
+        offsets = torch.tensor([0, 50], device=DEVICE, dtype=torch.int32)
+
+        code, result = code_and_output(
+            direct_dot,
+            (y, w, offsets),
+            block_sizes=[32],
+            pallas_loop_type="fori_loop",
+        )
+
+        # Eager mask retained on the direct dot input; nothing to defer past.
+        self.assertRegex(code, r"= y\[[^\n]*\] \* mask_\d+\.astype")
+        self.assertNotRegex(code, r"jnp\.transpose\(")
+
+        s, e = 0, 50
+        ref = (y[s:e] @ w).sum(dim=0).reshape(1, P)
+        torch.testing.assert_close(result, ref, rtol=1e-2, atol=1e-2)
+
+    def test_multi_consumer_load_keeps_eager_mask(self) -> None:
+        """A 3-D masked load whose Q axis is major (so the positional gate would
+        otherwise allow deferral) but which ALSO feeds a non-re-masking consumer
+        (an elementwise add) must keep its eager mask: the traversal finds a use
+        that never reaches a ``_mask_to`` and refuses to defer."""
+
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def proj_plus_skip(
+            y: torch.Tensor, w: torch.Tensor, offsets: torch.Tensor
+        ) -> torch.Tensor:
+            out = torch.empty_like(y)
+            for seg in hl.grid(offsets.size(0) - 1):
+                wb = w[:, :, :]
+                for tile in hl.tile(offsets[seg], offsets[seg + 1]):
+                    yj = y[tile, :, :]  # [tile, H, D]; tile is the major axis
+                    proj = torch.bmm(yj.transpose(0, 1), wb).transpose(0, 1)
+                    # yj is used transposed (-> bmm) AND directly (elementwise add).
+                    out[tile, :, :] = (proj + yj).to(out.dtype)
+            return out
+
+        H, D = 4, 16
+        offsets = torch.tensor([0, 50], device=DEVICE, dtype=torch.int32)
+        torch.manual_seed(0)
+        y = torch.randn(50, H, D, device=DEVICE, dtype=torch.bfloat16)
+        w = torch.randn(H, D, D, device=DEVICE, dtype=torch.bfloat16)
+
+        code, out = code_and_output(
+            proj_plus_skip,
+            (y, w, offsets),
+            block_sizes=[32],
+            pallas_loop_type="fori_loop",
+        )
+        # Not deferred (the elementwise consumer doesn't re-mask) -> eager mask kept.
+        self.assertRegex(code, r"= y\[[^\n]*\] \* mask_\d+\.astype")
+
+        ref = torch.empty_like(y)
+        s, e = 0, 50
+        ref[s:e] = torch.bmm(y[s:e].transpose(0, 1), w).transpose(0, 1) + y[s:e]
+        torch.testing.assert_close(out.cpu(), ref.cpu(), rtol=2e-2, atol=2e-2)
+
+    def test_opposite_direction_transpose_keeps_eager_mask(self) -> None:
+        """Mirror image of the deferral win.  Here the masked Q axis is already in
+        the last-two (sublane) dims at the load and the transpose moves it to a
+        major dim, so deferring would relocate the mask onto the more expensive
+        axis.  The positional gate must NOT defer -- the eager (sublane) load mask
+        is kept."""
+
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def opposite(y: torch.Tensor, offsets: torch.Tensor) -> torch.Tensor:
+            h = y.size(0)
+            out = torch.empty([y.size(1), h, h], dtype=y.dtype, device=y.device)
+            for seg in hl.grid(offsets.size(0) - 1):
+                for tile in hl.tile(offsets[seg], offsets[seg + 1]):
+                    yj = y[:, tile, :]  # [H, tile, D]; tile is a last-two (sublane) dim
+                    a = yj.transpose(0, 1)  # [tile, H, D]; tile -> major
+                    b = yj.permute(1, 2, 0)  # [tile, D, H]; tile -> major
+                    out[tile, :, :] = torch.bmm(a, b).to(out.dtype)
+            return out
+
+        H, D = 4, 16
+        offsets = torch.tensor([0, 10], device=DEVICE, dtype=torch.int32)
+        torch.manual_seed(0)
+        y = torch.randn(H, 10, D, device=DEVICE, dtype=torch.bfloat16)
+
+        code, out = code_and_output(
+            opposite,
+            (y, offsets),
+            block_sizes=[16],
+            pallas_loop_type="fori_loop",
+        )
+        # Masked axis is sublane at the load -> eager mask is cheap; deferring
+        # would move it to the major axis, so the gate keeps the eager load mask.
+        self.assertRegex(code, r"= y\[[^\n]*\] \* mask_\d+\.astype")
+
+        s, e = 0, 10
+        ref = torch.bmm(y[:, s:e, :].transpose(0, 1), y[:, s:e, :].permute(1, 2, 0))
+        torch.testing.assert_close(out.cpu(), ref.cpu(), rtol=2e-2, atol=2e-2)
+
     def test_if_branch_intermediate_outputs(self) -> None:
         """Branch intermediates must survive in _if output list."""
 

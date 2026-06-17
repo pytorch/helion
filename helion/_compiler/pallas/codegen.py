@@ -78,6 +78,9 @@ def _load_mask_expr(
     indexing_patterns = _get_indexing_patterns(state, tensor)
     env = CompileEnvironment.current()
     output_sizes = [*output_val.size()]
+    # Dims whose mask has been deferred to a downstream ``_mask_to`` by
+    # ``defer_pallas_load_masks`` -- masked later in the consumer layout instead.
+    deferred = state.fx_node.meta.get("pallas_deferred_mask_block_ids") or frozenset()
     mask_exprs: list[str] = []
     dtype_str: str | None = None
     out_dim = 0
@@ -100,8 +103,10 @@ def _load_mask_expr(
             # always valid, and applying a block-sized mask would broadcast
             # the dim from 1 to block_size, causing shape mismatches.
             dim_size = tensor.shape[tensor_dim]
-            if (not isinstance(dim_size, int) or dim_size > 1) and _tile_needs_mask(
-                state, block_id, tensor, tensor_dim
+            if (
+                block_id not in deferred
+                and (not isinstance(dim_size, int) or dim_size > 1)
+                and _tile_needs_mask(state, block_id, tensor, tensor_dim)
             ):
                 mask_var = state.codegen.mask_var(block_id)
                 if mask_var is not None:
