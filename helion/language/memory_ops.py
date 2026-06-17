@@ -2429,6 +2429,34 @@ def _cute_combined_mask(
                     block_id = bid
                     break
         elif isinstance(idx, torch.Tensor):
+            # A free ``hl.arange`` mapped onto a synthetic thread axis carries no
+            # block id, so the loops below add no bound for it. Emit its lane
+            # bound explicitly to mask the out-of-bounds lanes a wider sibling
+            # branch can introduce on a shared axis.
+            arange_bound = _cute_synthetic_arange_lane_bound(
+                state, pos, tensor, tensor_dim
+            )
+            if arange_bound is not None and arange_bound not in terms:
+                terms.append(arange_bound)
+            # A reduction/grid dim mapped onto a thread axis can be *widened*
+            # beyond its own extent by a mutually-exclusive sibling branch that
+            # reuses the same axis (the launch block is sized to the widest
+            # user). When this access addresses such a dim per-lane, bound the
+            # lane to its own dim size so the surplus lanes a wider sibling adds
+            # do not load/store out of bounds. ``active_local_coord`` is the
+            # per-lane in-axis coordinate; ``< dim_size`` is a no-op when the
+            # axis already matches this dim.
+            if tensor is not None and tensor_dim < tensor.ndim:
+                for bid in _matching_block_ids(env, tensor.shape[tensor_dim]):
+                    local_coord = active_local_coord(bid)
+                    if local_coord is not None:
+                        lane_bound = (
+                            f"({local_coord}) < "
+                            f"{_cute_tensor_dim_size_expr(state, tensor, tensor_dim)}"
+                        )
+                        if lane_bound not in terms:
+                            terms.append(lane_bound)
+                        break
             if not include_tensor_index_masks:
                 for dim_size in idx.shape:
                     for bid in _matching_block_ids(env, dim_size):
@@ -2471,6 +2499,83 @@ def _cute_combined_mask(
     if not terms:
         return None
     return " and ".join(f"({term})" for term in terms)
+
+
+def _cute_synthetic_arange_lane_bound(
+    state: CodegenState,
+    subscript_pos: int,
+    tensor: torch.Tensor | None,
+    tensor_dim: int,
+) -> str | None:
+    """Bounds mask for a free ``hl.arange`` index mapped onto a synthetic CUDA
+    thread axis (CuTe backend).
+
+    The launch block is sized to the *widest* arange across all (mutually
+    exclusive) grid branches that share a thread axis. A narrower arange in
+    another branch -- e.g. ``hl.arange(0, 32)`` sharing a 64-wide axis with a
+    sibling's ``hl.arange(0, 64)`` -- therefore addresses lanes beyond its own
+    extent. Those extra lanes carry a coordinate ``thread_idx()[axis] >= size``
+    and, without this mask, perform out-of-bounds loads/stores. Returns the term
+    ``(thread_idx()[axis]) < length`` (a no-op when the block matches the arange
+    exactly), or ``None`` when this index is not such a synthetic arange.
+
+    The synthetic-axis coordinate is the arange's *position* ``0..length-1``
+    regardless of ``start``/``step`` (the ``start + step *`` wrapping is applied
+    separately), so the surplus lanes a wider sibling adds are exactly those with
+    position ``>= length``. Bounding to the arange's own ``length`` is therefore
+    correct for canonical and non-canonical (non-zero start / non-unit step)
+    arange dims alike.
+    """
+    if tensor is None or tensor_dim >= tensor.ndim:
+        return None
+    cg = state.codegen
+    # A free arange maps onto a synthetic thread axis either directly
+    # (``cute_synthetic_arange_axes`` key -> axis, coord ``thread_idx()[axis]``)
+    # or, when it overflows the thread budget, onto a lane loop whose coordinate
+    # is cached in ``cute_synthetic_arange_lane_exprs``.
+    axes = getattr(cg, "cute_synthetic_arange_axes", None) or {}
+    lane_exprs = getattr(cg, "cute_synthetic_arange_lane_exprs", None) or {}
+    if not axes and not lane_exprs:
+        return None
+    fx_node = getattr(state, "fx_node", None)
+    if fx_node is None or len(fx_node.args) < 2:
+        return None
+    subscript_arg = fx_node.args[1]
+    if not isinstance(subscript_arg, (list, tuple)) or subscript_pos >= len(
+        subscript_arg
+    ):
+        return None
+    idx_node = subscript_arg[subscript_pos]
+    if not isinstance(idx_node, torch.fx.Node):
+        return None
+    from .._compiler.cute.iota_utils import cute_free_arange_indexed_dim_key
+
+    dim_key = cute_free_arange_indexed_dim_key(idx_node, cg)
+    if dim_key is None:
+        return None
+
+    # ``key`` is ``(dim_key, length, start, step)``. The bound masks lanes beyond
+    # this arange's own extent, which is its ``length`` -- independent of
+    # ``start``/``step`` -- so match purely on ``dim_key``.
+    def _match(key: object) -> bool:
+        return isinstance(key, tuple) and len(key) == 4 and key[0] == dim_key
+
+    coord = None
+    length: object = None
+    for key, axis in axes.items():
+        if _match(key):
+            coord = f"cutlass.Int32(cute.arch.thread_idx()[{axis}])"
+            length = key[1]
+            break
+    if coord is None:
+        for key, expr in lane_exprs.items():
+            if _match(key):
+                coord = expr
+                length = key[1]
+                break
+    if coord is None:
+        return None
+    return f"({coord}) < {length}"
 
 
 def _cute_tensor_dim_size_expr(
