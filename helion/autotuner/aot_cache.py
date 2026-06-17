@@ -51,8 +51,43 @@ if TYPE_CHECKING:
     from typing import Callable
 
     from .base_search import BaseSearch
+    from .config_spec import ConfigSpec
 
 log: logging.Logger = logging.getLogger(__name__)
+
+
+def _stale_mem_op_list(config: Config, spec: ConfigSpec) -> str | None:
+    """Return a description of the first per-op tunable list whose length disagrees with ``spec``.
+
+    The per-memory-op list lengths (``indexing`` / ``load_eviction_policies`` /
+    ``load_cache_modifiers`` / ``atomic_indexing``) are shape-INDEPENDENT (one slot per distinct
+    memory op), so a length mismatch means the AOT heuristic file predates a spec change (e.g. the
+    mem-op slot collapse) and must not be applied to the current numbering. ``None`` if every
+    present list matches. Absent lists are fine (``normalize`` fills the default).
+
+    Scope: this is a LENGTH guard — it catches the collapse churn (which changes list lengths) and
+    any other op-count change. It does NOT catch a SAME-length slot REORDER (e.g. a future library
+    refactor that reorders memory ops without changing their count): the AOT heuristic file carries
+    no per-slot structural signature today (only the local cache fingerprint does, via
+    ``ConfigSpec.structural_fingerprint``). Folding that signature into the AOT file + checking it
+    here is a deferred hardening — see _lab/MEMORY_OP_IMPL_JOURNAL.md (perf-only; the eviction/cache/
+    indexing knobs are hints/strategies, never numerical correctness, which the re-keyed TD-guards
+    protect).
+    """
+    for name, fragment in (
+        ("indexing", spec.indexing),
+        ("load_eviction_policies", spec.load_eviction_policies),
+        ("load_cache_modifiers", spec.load_cache_modifiers),
+        ("atomic_indexing", spec.atomic_indexing),
+    ):
+        value = config.config.get(name)
+        if not isinstance(value, list):
+            continue
+        expected = fragment.length if fragment is not None else 0
+        if len(value) != expected:
+            return f"{name} (length {len(value)}, expected {expected})"
+    return None
+
 
 # Environment variable to control AOT mode
 AOT_MODE_ENV = "HELION_AOT_MODE"
@@ -768,6 +803,25 @@ class AOTAutotuneCache(AutotuneCacheBase):
                     # No user key: pass raw args to heuristic
                     config_dict = autotune_fn(*args)
                 config = Config(**config_dict)
+
+            # Guard against a STALE (wrong-length) per-op tunable list silently misapplying to a
+            # changed numbering (e.g. after the mem-op slot collapse). The AOT path matches by
+            # (source, name, shapes) only — no structural-fingerprint check — and normalize() does
+            # not length-validate the indexing / eviction / cache / atomic lists, so a stale list
+            # would otherwise be applied verbatim (indexing the wrong op, or silently dropping the
+            # tail). The op-list lengths are shape-INDEPENDENT, so a mismatch means the heuristic
+            # file predates a spec change: fall back (return None -> default config) instead.
+            if config is not None:
+                stale = _stale_mem_op_list(config, self.autotuner.config_spec)
+                if stale is not None:
+                    log.warning(
+                        "AOT heuristic for %s has a stale %s; falling back to the default "
+                        "config. Regenerate pretuned configs "
+                        "(python -m helion.experimental.aot_runner).",
+                        kernel_name,
+                        stale,
+                    )
+                    return None
 
             # Cache the result
             if config is not None:
