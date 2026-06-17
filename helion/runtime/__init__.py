@@ -2154,18 +2154,17 @@ def _pallas_compile_compact_jit_fn(
                 #    at unaligned offsets, so the write regions overlap even
                 #    though valid-row ownership does not).  "arbitrary" tells
                 #    Mosaic the grid iterations may have dependencies, so it runs
-                #    them sequentially in grid order and does NOT split the grid
-                #    across megacore TensorCores.  The builder emits work items in
-                #    ascending (owner, tile) order, so the next sequence's first
-                #    tile is a LATER iteration that re-writes those rows with the
-                #    correct values -- and being later + serial, it deterministi-
-                #    cally wins.  With "parallel", a megacore split could place
-                #    the two adjacent sequences on different cores and race on the
-                #    shared boundary rows.
+                #    them sequentially in grid order rather than reordering or
+                #    pipelining them.  The builder emits work items in ascending
+                #    (owner, tile) order, so the next sequence's first tile is a
+                #    LATER iteration that re-writes those rows with the correct
+                #    values -- and being later + serial, it deterministically
+                #    wins.  With "parallel", Mosaic could reorder/overlap
+                #    iterations and the spill would race the re-write.
                 #
                 # KNOWN RISK: this rests on Mosaic running an "arbitrary" 1-D grid
-                # strictly sequentially in ascending order and never reordering or
-                # megacore-chunking it.  That is the documented meaning of
+                # strictly sequentially in ascending order and never reordering
+                # it.  That is the documented meaning of
                 # "arbitrary" and is bitwise-verified vs fori today, but it is a
                 # scheduling-contract dependency -- if a future Mosaic relaxes it,
                 # the spilling store would silently corrupt.  The robust fix is the
