@@ -1602,7 +1602,7 @@ def _helion_matmul_args(
         return (a, b, ResidualAddEpilogue(residual))
     if args.epilogue == "scaled_mm":
         scale_a, scale_b = _scaled_mm_scales(args)
-        # examples/fp8_matmul.fp8_matmul takes (x, y, sa2d, sb1d) directly and
+        # examples/fp8_gemm.fp8_gemm takes (x, y, scale_a, scale_b) directly and
         # bakes the scale in itself (not via an epilogue callable): scale_a as a
         # (M, N) stride-(1,0) colvec view, scale_b as a rank-1 row vector.
         scale_a2d = scale_a.reshape(args.m, 1).expand(args.m, args.n)
@@ -1620,9 +1620,9 @@ def _prepare_helion(args: argparse.Namespace) -> _PreparedHelion:
     kernel_args = _helion_matmul_args(args, a, b, bias, residual)
 
     if args.epilogue == "scaled_mm":
-        # fp8 RowWise scaled_mm uses examples/fp8_matmul.py (hl.dot + fused
+        # fp8 RowWise scaled_mm uses examples/fp8_gemm.py (hl.dot + fused
         # rowwise scale); the example matmul's torch.addmm does not accept fp8.
-        from examples.fp8_matmul import fp8_matmul as matmul
+        from examples.fp8_gemm import fp8_gemm as matmul
     else:
         from examples.matmul import matmul
 
