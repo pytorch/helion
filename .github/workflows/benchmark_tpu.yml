@@ -41,22 +41,49 @@ jobs:
       - name: Check out code
         uses: actions/checkout@v6
 
-      - name: Set up Python
-        uses: actions/setup-python@v6
-        with:
-          python-version: "3.12"
+      - name: Install system dependencies
+        if: runner.os == 'Linux'
+        run: |
+          set -eux
+          SUDO=$(command -v sudo 2>/dev/null || true)
+          retry () {
+            "$@" || (sleep 10 && "$@") || (sleep 20 && "$@") || (sleep 40 && "$@")
+          }
+          retry $SUDO apt-get update
+          retry $SUDO apt-get install -y --fix-missing libdw1 curl wget git pkg-config zlib1g-dev build-essential
 
       - name: Install uv
         uses: astral-sh/setup-uv@v7
+        with:
+          python-version: "3.12"
+          enable-cache: true
 
       - name: Create virtual environment
         run: |
           uv venv --python 3.12
 
-      - name: Install PyTorch (CPU nightly)
+      - name: Get current month
+        id: date
+        run: echo "month=$(date +'%Y-%m')" >> $GITHUB_OUTPUT
+
+      - name: Cache dependencies
+        id: cache
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cache/uv
+            ~/.venv
+          key: 3.12-tpu-pytorch-nightly-pallas-${{ hashFiles('.github/workflows/test.yml') }}-${{ steps.date.outputs.month }}
+
+      - name: Install PyTorch
         run: |
+          set -eux
           source .venv/bin/activate
-          uv pip install -U --pre torch --index-url https://download.pytorch.org/whl/nightly/cpu
+          # TPU: install CPU-only PyTorch nightly (torch_tpu provides TPU backend).
+          # Pinned to a pre-BComplex32 nightly until torch_tpu's to_string.cc
+          # switch handles the new dtype (otherwise -Werror,-Wswitch breaks
+          # the bazel build on cache miss).
+          uv pip install -U --pre "torch==2.13.0.dev20260609" --index-url https://download.pytorch.org/whl/nightly/cpu
 
       - name: Install Helion
         run: |
@@ -73,7 +100,7 @@ jobs:
             --extra-index-url https://us-python.pkg.dev/ml-oss-artifacts-published/jax/simple/ \
             --find-links https://storage.googleapis.com/jax-releases/libtpu_releases.html \
             --pre \
-            'jax==0.10.1' 'jaxlib==0.10.1' 'libtpu==0.0.40' 'tpu-info==0.7.1' 'jaxtyping' 'frozendict'
+            'jax==0.10.1' 'jaxlib==0.10.1' 'libtpu==0.0.40' 'tpu-info==0.7.1' 'jaxtyping' 'frozendict' 'immutabledict'
           # Install Bazel
           if ! command -v bazel &> /dev/null; then
             sudo curl -L https://github.com/bazelbuild/bazelisk/releases/download/v1.27.0/bazelisk-linux-amd64 -o /usr/local/bin/bazel
@@ -81,7 +108,7 @@ jobs:
           fi
           # Install gcloud CLI if not present (needed for Secret Manager)
           if ! command -v gcloud &> /dev/null; then
-            sudo apt-get install -y apt-transport-https ca-certificates gpg curl
+            sudo apt-get install -y apt-transport-https ca-certificates gnupg curl
             curl https://packages.cloud.google.com/apt/doc/apt-key.gpg | sudo gpg --dearmor -o /usr/share/keyrings/cloud.google.gpg
             echo "deb [signed-by=/usr/share/keyrings/cloud.google.gpg] https://packages.cloud.google.com/apt cloud-sdk main" | sudo tee /etc/apt/sources.list.d/google-cloud-sdk.list
             sudo apt-get update && sudo apt-get install -y google-cloud-cli
@@ -100,9 +127,13 @@ jobs:
           cd /tmp/torch_tpu
           git checkout "${TORCH_TPU_COMMIT}"
           # Build torch_tpu wheel
+          sudo apt-get install -y libpython3-dev
           export TORCH_SOURCE=$(python -c "import torch; import os; print(os.path.dirname(os.path.dirname(torch.__file__)))")
-          export SITE_PACKAGES=$(python -c "import site; print(site.getsitepackages()[0])")
-          bazel build -c opt //ci/wheel:torch_tpu_wheel --config=helion_public_caching_readwrite --define WHEEL_VERSION=0.1.0 --define TORCH_SOURCE=local --action_env=PYTHONPATH=$TORCH_SOURCE:$SITE_PACKAGES --action_env=JAX_PLATFORMS=cpu
+          bazel build -c opt //ci/wheel:torch_tpu_wheel \
+            --config=helion_public_caching_readwrite \
+            --define TORCH_SOURCE=local \
+            --repo_env=TORCH_SOURCE=$TORCH_SOURCE \
+            --action_env=JAX_PLATFORMS=cpu
           uv pip install bazel-bin/ci/wheel/*.whl
           # torch_tpu wheel is pinned to libtpu 0.0.37, but helion requires 0.0.40 to work
           # we can remove this step as soon as torch_tpu updates its libtpu pin
