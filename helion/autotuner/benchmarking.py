@@ -12,8 +12,10 @@ import time
 from typing import TYPE_CHECKING
 from typing import Any
 from typing import Callable
+from typing import NamedTuple
 from typing import TypeVar
 
+import numpy as np
 import torch
 
 from ..runtime.settings import _env_get_bool
@@ -29,6 +31,41 @@ T = TypeVar("T")
 
 _log = logging.getLogger(__name__)
 _BENCHMARK_CUDAGRAPH_ENV = "HELION_BENCHMARK_CUDAGRAPH"
+
+
+class PerfStats(NamedTuple):
+    min: float
+    median: float
+    mean: float
+    p90: float
+    std: float
+    n_samples: int
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "min": self.min,
+            "median": self.median,
+            "mean": self.mean,
+            "p90": self.p90,
+            "std": self.std,
+            "n_samples": self.n_samples,
+        }
+
+
+def _compute_perf_stats(times: list[float]) -> PerfStats:
+    n = len(times)
+    if n == 0:
+        return PerfStats(0.0, 0.0, 0.0, 0.0, 0.0, 0)
+    sorted_times = sorted(times)
+    min_val = sorted_times[0]
+    median_val = statistics.median(sorted_times)
+    mean_val = statistics.mean(sorted_times)
+    p90_val = float(np.percentile(sorted_times, 90))
+    try:
+        std_val = statistics.stdev(sorted_times) if n > 1 else 0.0
+    except statistics.StatisticsError:
+        std_val = 0.0
+    return PerfStats(min_val, median_val, mean_val, p90_val, std_val, n)
 
 
 def _cudagraph_unavailable_reason() -> str | None:
@@ -475,7 +512,7 @@ def _summarize_statistics_fallback(
     times: list[float],
     quantiles: list[float] | None,
     return_mode: str,
-) -> float | tuple[float, ...]:
+) -> float | tuple[float, ...] | PerfStats:
     """Fallback statistics summarizer when triton.testing._summarize_statistics is unavailable."""
     if return_mode == "min":
         return min(times)
@@ -485,6 +522,8 @@ def _summarize_statistics_fallback(
         return statistics.mean(times)
     if return_mode == "median":
         return statistics.median(times)
+    if return_mode == "stats":
+        return _compute_perf_stats(times)
     # "all" mode
     if quantiles is not None:
         sorted_times = sorted(times)
@@ -510,7 +549,7 @@ def do_bench(
     process_group_name: str | None = None,
     *,
     default_cudagraph: bool = False,
-) -> float | tuple[float, ...]:
+) -> float | tuple[float, ...] | PerfStats:
     """
     Benchmark the runtime of the provided function. By default, return the median runtime of :code:`fn` along with
     the 20-th and 80-th performance percentile.
@@ -525,13 +564,13 @@ def do_bench(
     :type grad_to_none: torch.tensor, optional
     :param quantiles: Performance percentile to return in addition to the median.
     :type quantiles: list[float], optional
-    :param return_mode: The statistical measure to return. Options are "min", "max", "mean", "median", or "all". Default is "mean".
+    :param return_mode: The statistical measure to return. Options are "min", "max", "mean", "median", "all", or "stats". Default is "mean".
     :type return_mode: str
     """
     from triton import runtime
     from triton.testing import _summarize_statistics
 
-    assert return_mode in ["min", "max", "mean", "median", "all"]
+    assert return_mode in ["min", "max", "mean", "median", "all", "stats"]
 
     di = runtime.driver.active.get_device_interface()  # pyrefly: ignore
 
@@ -585,6 +624,8 @@ def do_bench(
     # Record clocks
     di.synchronize()
     times = [s.elapsed_time(e) for s, e in zip(start_event, end_event, strict=True)]
+    if return_mode == "stats":
+        return _compute_perf_stats(times)
     return _summarize_statistics(times, quantiles, return_mode)  # pyrefly: ignore
 
 
@@ -598,11 +639,11 @@ def do_bench_generic(
     process_group_name: str | None = None,
     *,
     default_cudagraph: bool = False,  # accepted for API symmetry; wall-clock timing doesn't use CG
-) -> float | tuple[float, ...]:
+) -> float | tuple[float, ...] | PerfStats:
     """
     Benchmark using wall-clock timing for backends without Triton event timing.
     """
-    assert return_mode in ["min", "max", "mean", "median", "all"]
+    assert return_mode in ["min", "max", "mean", "median", "all", "stats"]
 
     out = fn()
     synchronize_device(out)

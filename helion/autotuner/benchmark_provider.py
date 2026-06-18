@@ -33,6 +33,7 @@ from .accuracy_job import AccuracyCheckJob
 from .benchmark_job import BenchmarkJob
 from .benchmark_worker import BenchmarkSubprocessError
 from .benchmark_worker import BenchmarkWorker
+from .benchmarking import PerfStats
 from .benchmarking import clear_jit_fast_path_caches
 from .benchmarking import do_bench
 from .benchmarking import do_bench_generic
@@ -182,6 +183,26 @@ class BenchmarkResult(NamedTuple):
     perf: float
     status: Literal["ok", "error", "timeout", "peer_compilation_fail", "filtered"]
     compile_time: float | None
+    perf_stats: PerfStats | None = None
+
+
+def _null_perf_stats_dict() -> dict[str, object]:
+    return {
+        "min": None,
+        "median": None,
+        "mean": None,
+        "p90": None,
+        "std": None,
+        "n_samples": 0,
+    }
+
+
+def _perf_stats_from_dict(d: object) -> PerfStats | None:
+    """Reconstruct ``PerfStats`` from a worker-returned stats dict, or ``None``
+    when the payload isn't a dict (e.g. the subprocess returned a bare float)."""
+    if not isinstance(d, dict):
+        return None
+    return PerfStats(**d)
 
 
 def _unset_fn(*args: object) -> NoReturn:
@@ -822,27 +843,33 @@ class LocalBenchmarkProvider(BenchmarkProvider):
                     process_group_name=self.kernel.env.process_group_name,
                 )
             ):
-                perf = self._benchmark_function(config, fn)
+                perf, stats = self._benchmark_function(config, fn)
                 status = "ok" if math.isfinite(perf) else "error"
                 recorded_perf = perf if math.isfinite(perf) else None
+                perf_stats_dict = (
+                    stats.to_dict() if stats is not None else _null_perf_stats_dict()
+                )
                 results[valid_indices[index]] = BenchmarkResult(
                     config=config,
                     fn=fn,
                     perf=perf,
                     status=status,
                     compile_time=compile_time,
+                    perf_stats=stats,
                 )
             else:
                 status = "timeout" if reason == "timeout" else "error"
                 if is_working:
                     status = "peer_compilation_fail"
                 recorded_perf = None
+                perf_stats_dict = _null_perf_stats_dict()
                 results[valid_indices[index]] = BenchmarkResult(
                     config=config,
                     fn=fn,
                     perf=inf,
                     status=status,
                     compile_time=compile_time,
+                    perf_stats=None,
                 )
             if config_id is not None:
                 self.log.record_autotune_entry(
@@ -853,6 +880,7 @@ class LocalBenchmarkProvider(BenchmarkProvider):
                         compile_time=compile_time,
                         config_id=config_id,
                         config=config,
+                        perf_stats=perf_stats_dict,
                     )
                 )
         return results
@@ -866,15 +894,18 @@ class LocalBenchmarkProvider(BenchmarkProvider):
         """
         clear_jit_fast_path_caches(fn, self.log)
 
-    def _benchmark_function(self, config: Config, fn: CompiledConfig) -> float:
-        """Benchmark a single compiled function.  Returns time in ms or inf."""
+    def _benchmark_function(
+        self, config: Config, fn: CompiledConfig
+    ) -> tuple[float, PerfStats | None]:
+        """Benchmark a single compiled function.  Returns (time in ms or inf, PerfStats or None)."""
         self._autotune_metrics.num_configs_tested += 1
         self.log.debug(lambda: f"Running benchmark for {config!r}")
 
         if self._subprocess_benchmark_enabled():
             result = self._benchmark_function_subprocess(config, fn)
             if result is not None:
-                return result
+                perf, stats = result
+                return perf, stats
             # None means the subprocess path could not handle this config
             # (e.g., serialization failed); fall through to in-process.
 
@@ -916,7 +947,7 @@ class LocalBenchmarkProvider(BenchmarkProvider):
             )
 
             if not compile_success_all:
-                return inf
+                return inf, None
 
         # Defensive: if `capture_output().__enter__` itself raises, the except
         # handler below still needs `_captured_output` bound.
@@ -951,7 +982,7 @@ class LocalBenchmarkProvider(BenchmarkProvider):
                 # others don't. Skip the config if any rank fails the accuracy check.
                 # Without this synchronization, some ranks go on to call the benchmark function
                 # while other ranks return immediately, this will cause stuck jobs!
-                return inf
+                return inf, None
 
             with capture_output() as _captured_output:
                 benchmark_function = self.kernel.bench_compile_config(
@@ -966,7 +997,7 @@ class LocalBenchmarkProvider(BenchmarkProvider):
                 ) or do_bench
                 res = benchmark_runner(
                     functools.partial(benchmark_function, *working_args),
-                    return_mode="median",
+                    return_mode="stats",
                     warmup=1,  # we are already warmed up above
                     rep=50,
                     process_group_name=self.kernel.env.process_group_name,
@@ -975,12 +1006,14 @@ class LocalBenchmarkProvider(BenchmarkProvider):
                 res, process_group_name=self.kernel.env.process_group_name
             )
             t2 = time.perf_counter()
-            assert isinstance(res, float)
+            assert isinstance(res, PerfStats)
 
             self.log.debug(
-                lambda: f"result: {res:.4f}ms (took {t1 - t0:.1f}s + {t2 - t1:.1f}s)",
+                lambda: (
+                    f"result: {res.median:.4f}ms (took {t1 - t0:.1f}s + {t2 - t1:.1f}s)"
+                ),
             )
-            return res
+            return res.median, res
         except Exception as e:
             # e.__traceback__ holds references to all local variables in the call stack frames.
             # When a Triton kernel fails, the output tensors allocated by the Helion kernel function
@@ -1048,27 +1081,27 @@ class LocalBenchmarkProvider(BenchmarkProvider):
                 self.kernel.maybe_log_repro(self.log.debug, self.args, config)
 
             self._autotune_metrics.num_compile_failures += 1
-            return inf
+            return inf, None
         finally:
             self._clear_jit_fast_path_caches(fn)
 
     def _benchmark_function_subprocess(
         self, config: Config, fn: CompiledConfig
-    ) -> float | None:
+    ) -> tuple[float, PerfStats | None] | None:
         """Benchmark ``fn`` in a long-lived spawn subprocess with a per-call
-        timeout. Returns the measured latency in ms, ``inf`` for a failure
-        we classified and handled, or ``None`` if the subprocess path cannot
-        handle this config and the caller should fall back to in-process.
+        timeout. Returns (latency ms, PerfStats) or (inf, None) for failure,
+        or ``None`` if subprocess path cannot handle config.
         """
         try:
-            latency = self._run_subprocess_benchmark_job(fn, warmup=1, rep=50)
-            if latency is None:
+            result = self._run_subprocess_benchmark_job(fn, warmup=1, rep=50)
+            if result is None:
                 return None
+            latency, stats_dict = result
         except BenchmarkSubprocessError as e:
             # Timeout or unexpected worker exit; skip config and continue.
             self.log.warning(f"Benchmark subprocess failed for {config!r}: {e}")
             self._autotune_metrics.num_compile_failures += 1
-            return inf
+            return inf, None
         except Exception as e:
             e.__traceback__ = None
             if match_unrecoverable_runtime_error(e):
@@ -1082,12 +1115,12 @@ class LocalBenchmarkProvider(BenchmarkProvider):
                 )
                 self.kernel.maybe_log_repro(self.log.warning, self.args, config)
                 self._autotune_metrics.num_compile_failures += 1
-                return inf
+                return inf, None
             self.log.debug(
                 f"Benchmark subprocess raised for {config!r}: {type(e).__name__}: {e}"
             )
             self._autotune_metrics.num_compile_failures += 1
-            return inf
+            return inf, None
 
         # Run the accuracy check in the worker too: a config can pass timing and
         # still crash here, and a crash must not poison the parent CUDA context.
@@ -1100,7 +1133,7 @@ class LocalBenchmarkProvider(BenchmarkProvider):
                     f"Accuracy check subprocess failed for {config!r}: {e}"
                 )
                 self._autotune_metrics.num_compile_failures += 1
-                return inf
+                return inf, None
             except Exception as e:
                 e.__traceback__ = None
                 if match_unrecoverable_runtime_error(e):
@@ -1116,13 +1149,13 @@ class LocalBenchmarkProvider(BenchmarkProvider):
                     )
                     self.kernel.maybe_log_repro(self.log.warning, self.args, config)
                     self._autotune_metrics.num_compile_failures += 1
-                    return inf
+                    return inf, None
                 self.log.debug(
                     f"Accuracy check subprocess raised for {config!r}: "
                     f"{type(e).__name__}: {e}"
                 )
                 self._autotune_metrics.num_compile_failures += 1
-                return inf
+                return inf, None
             # None means a custom check fn can't run in the worker; validate
             # in-process instead.
             if passed is None:
@@ -1147,16 +1180,18 @@ class LocalBenchmarkProvider(BenchmarkProvider):
                         f"Accuracy check raised for {config!r}: {type(e).__name__}: {e}"
                     )
                     self._autotune_metrics.num_compile_failures += 1
-                    return inf
+                    return inf, None
                 finally:
                     # Same as the in-process path: drop JIT fast-path caches so
                     # this fn's tensors aren't pinned in GPU memory across configs.
                     self._clear_jit_fast_path_caches(fn)
             if not passed:
                 self._autotune_metrics.num_accuracy_failures += 1
-                return inf
+                return inf, None
 
-        return float(latency)
+        stats = _perf_stats_from_dict(stats_dict)
+        perf = stats.median if stats is not None else float(latency)
+        return float(perf), stats
 
     def _run_subprocess_benchmark_job(
         self,
@@ -1164,7 +1199,7 @@ class LocalBenchmarkProvider(BenchmarkProvider):
         *,
         warmup: int,
         rep: int,
-    ) -> float | None:
+    ) -> tuple[float, dict[str, object] | None] | None:
         if self._precompile_args_path is None:
             return None
         try:
@@ -1181,13 +1216,18 @@ class LocalBenchmarkProvider(BenchmarkProvider):
             warmup=warmup,
             rep=rep,
             use_wall_clock=self._subprocess_benchmark_uses_wall_clock(),
+            return_mode="stats",
         )
-        return float(
-            self._benchmark_worker.run(
-                job,
-                timeout=float(self.settings.autotune_benchmark_timeout),
-            )
+        result = self._benchmark_worker.run(
+            job,
+            timeout=float(self.settings.autotune_benchmark_timeout),
         )
+        if isinstance(result, dict):
+            # stats dict from worker
+            median = cast("float", result.get("median", inf))
+            return median, result
+        # Unreachable while the job runs return_mode="stats" (always a dict)
+        return float(result), None
 
     def _run_subprocess_accuracy_job(self, fn: CompiledConfig) -> bool | None:
         """Validate ``fn`` against the baseline inside the benchmark worker.
@@ -1241,11 +1281,16 @@ class LocalBenchmarkProvider(BenchmarkProvider):
         timings: list[float | None] = []
         for fn in fns:
             try:
-                timing = self._run_subprocess_benchmark_job(
+                result = self._run_subprocess_benchmark_job(
                     cast("CompiledConfig", fn),
                     warmup=warmup,
                     rep=rep,
                 )
+                if result is None:
+                    timing = None
+                else:
+                    timing_val, _stats = result
+                    timing = timing_val
             except BenchmarkSubprocessError as e:
                 self.log.warning(f"{desc} subprocess failed: {e}")
                 timing = None

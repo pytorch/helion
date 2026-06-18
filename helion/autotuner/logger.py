@@ -293,6 +293,18 @@ class AutotuneLogEntry(NamedTuple):
     compile_time: float | None
     config_id: str
     config: Config
+    perf_stats: dict[str, object] | None = None
+
+
+def _null_perf_stats() -> dict[str, object]:
+    return {
+        "min": None,
+        "median": None,
+        "mean": None,
+        "p90": None,
+        "std": None,
+        "n_samples": 0,
+    }
 
 
 class AutotuneLogSink:
@@ -418,6 +430,7 @@ class AutotuneLogSink:
             self._configs[config_id] = {
                 "config": config.config,
                 "generated_code": None,
+                "perf_stats": _null_perf_stats(),
             }
         return config_id
 
@@ -465,6 +478,14 @@ class AutotuneLogSink:
         )
         if self._csv_file is not None:
             self._csv_file.flush()
+        # Update configs map with perf_stats; only overwrite when stats provided or not started
+        if self._collect_dataset and entry.config_id in self._configs:
+            if entry.perf_stats is not None or entry.status != "started":
+                self._configs[entry.config_id]["perf_stats"] = (
+                    entry.perf_stats
+                    if entry.perf_stats is not None
+                    else _null_perf_stats()
+                )
 
 
 SUPPRESSED_TRITON_CODE_MSG = (

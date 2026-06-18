@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 import helion.autotuner.benchmarking as benchmarking
@@ -146,3 +147,60 @@ def test_cudagraph_auto_skips_nested_capture(monkeypatch):
         return "nested"
 
     assert benchmarking._maybe_cudagraph_replay(fn) is fn
+
+
+def test_compute_perf_stats_basic():
+    s = benchmarking._compute_perf_stats([1.0, 2.0, 3.0, 4.0])
+    assert isinstance(s, benchmarking.PerfStats)
+    assert s.min == 1.0
+    assert s.median == pytest.approx(2.5)
+    assert s.mean == pytest.approx(2.5)
+    # linear-interpolated 90th percentile, not the index-based 4.0
+    assert s.p90 == pytest.approx(3.7)
+    assert s.std == pytest.approx(1.2909944487358056)
+    assert s.n_samples == 4
+
+
+def test_compute_perf_stats_p90_interpolated_and_bounded():
+    times = [float(i) for i in range(1, 51)]  # 1..50
+    s = benchmarking._compute_perf_stats(times)
+    # interpolation never exceeds the observed max (old index could)
+    assert s.min <= s.p90 <= times[-1]
+    assert s.p90 == pytest.approx(45.1)
+    assert s.p90 < 46.0
+
+
+def test_compute_perf_stats_empty():
+    assert benchmarking._compute_perf_stats([]) == benchmarking.PerfStats(
+        0.0, 0.0, 0.0, 0.0, 0.0, 0
+    )
+
+
+def test_compute_perf_stats_single_sample():
+    s = benchmarking._compute_perf_stats([0.004])
+    assert s.min == 0.004
+    assert s.median == 0.004
+    assert s.mean == 0.004
+    assert s.p90 == pytest.approx(0.004)
+    assert s.std == 0.0
+    assert s.n_samples == 1
+
+
+def test_compute_perf_stats_all_equal():
+    s = benchmarking._compute_perf_stats([5.0, 5.0, 5.0])
+    assert s.min == s.median == s.mean == s.p90 == 5.0
+    assert s.std == 0.0
+    assert s.n_samples == 3
+
+
+def test_perf_stats_to_dict_roundtrip():
+    s = benchmarking._compute_perf_stats([1.0, 2.0, 3.0, 4.0])
+    d = s.to_dict()
+    assert set(d) == {"min", "median", "mean", "p90", "std", "n_samples"}
+    assert benchmarking.PerfStats(**d) == s
+
+
+def test_summarize_statistics_fallback_stats_mode():
+    times = [1.0, 2.0, 3.0, 4.0]
+    out = benchmarking._summarize_statistics_fallback(times, None, "stats")
+    assert out == benchmarking._compute_perf_stats(times)

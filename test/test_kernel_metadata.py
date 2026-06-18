@@ -535,6 +535,13 @@ class TestAutotuneLogSink(TestCase):
         self.assertIn("def _add_kernel", sidecar["kernel_source"])
         self.assertEqual(sidecar["settings"]["static_shapes"], True)
         self.assertIsInstance(sidecar["configs"], dict)
+        # configs map values contain perf_stats with 6 subfields
+        for cfg_val in sidecar["configs"].values():
+            self.assertIn("perf_stats", cfg_val)
+            self.assertEqual(
+                set(cfg_val["perf_stats"]),
+                {"min", "median", "mean", "p90", "std", "n_samples"},
+            )
 
     def test_sidecar_includes_ir_graph_when_provided(self) -> None:
         """The per-run record carries the ir_graph passed to the sink."""
@@ -749,6 +756,91 @@ class TestAutotuneLogSink(TestCase):
                 )
             )
             self.assertFalse(sink.csv_path.exists())
+
+
+class TestPerfStatsSchema(TestCase):
+    def _metadata(self, **overrides: object) -> KernelMetadata:
+        fields: dict[str, object] = {
+            "kernel_name": "_add_kernel",
+            "kernel_source": _add_kernel.kernel_source(),
+            "input_shapes": "[(64,)]",
+            "dtypes": "['torch.float32']",
+            "hardware": "TestGPU",
+            "settings": {"static_shapes": True, "index_dtype": None},
+        }
+        fields.update(overrides)
+        return KernelMetadata(**fields)
+
+    def test_sink_records_perf_stats(self) -> None:
+        """AutotuneLogSink stores perf_stats dict in configs map on record."""
+        with tempfile.TemporaryDirectory() as tmp:
+            with AutotuneLogSink(
+                f"{tmp}/run", self._metadata(), collect_dataset=True
+            ) as sink:
+                sink.start_run()
+                cfg = helion.Config(block_sizes=[16])
+                config_id = sink.register_config(cfg)
+                assert config_id is not None
+                stats = {
+                    "min": 0.1,
+                    "median": 0.12,
+                    "mean": 0.13,
+                    "p90": 0.15,
+                    "std": 0.01,
+                    "n_samples": 50,
+                }
+                sink.record(
+                    AutotuneLogEntry(
+                        generation=0,
+                        status="ok",
+                        perf_ms=0.12,
+                        compile_time=0.5,
+                        config_id=config_id,
+                        config=cfg,
+                        perf_stats=stats,
+                    )
+                )
+                sink.end_run()
+            sidecar = json.loads(sink.meta_path.read_text().splitlines()[0])
+        cfg_val = sidecar["configs"][config_id]
+        self.assertIn("perf_stats", cfg_val)
+        self.assertEqual(cfg_val["perf_stats"], stats)
+
+    def test_null_template_on_failure(self) -> None:
+        """Failure status results in null perf_stats template."""
+        with tempfile.TemporaryDirectory() as tmp:
+            with AutotuneLogSink(
+                f"{tmp}/run", self._metadata(), collect_dataset=True
+            ) as sink:
+                sink.start_run()
+                cfg = helion.Config(block_sizes=[16])
+                config_id = sink.register_config(cfg)
+                assert config_id is not None
+                sink.record(
+                    AutotuneLogEntry(
+                        generation=0,
+                        status="error",
+                        perf_ms=None,
+                        compile_time=0.5,
+                        config_id=config_id,
+                        config=cfg,
+                        perf_stats=None,
+                    )
+                )
+                sink.end_run()
+            sidecar = json.loads(sink.meta_path.read_text().splitlines()[0])
+        perf_stats = sidecar["configs"][config_id]["perf_stats"]
+        self.assertEqual(
+            perf_stats,
+            {
+                "min": None,
+                "median": None,
+                "mean": None,
+                "p90": None,
+                "std": None,
+                "n_samples": 0,
+            },
+        )
 
 
 if __name__ == "__main__":
