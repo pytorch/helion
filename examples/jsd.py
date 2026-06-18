@@ -67,6 +67,9 @@ def jsd_forward(
     Returns:
         loss: Scalar JSD loss
         dX: Gradient of loss wrt input
+
+    Precision note: use bf16 or fp32, NOT fp16, at realistic vocabularies — fp16 underflows
+    the ~1/V probabilities to 0, so log(M) = -inf and the row goes NaN.
     """
     BT, V = _input.shape
     assert target.shape == _input.shape, (
@@ -99,7 +102,10 @@ def jsd_forward(
                     dX[tile_bt, tile_X] = 0.0
                 continue
         intermediate_loss = hl.zeros([tile_bt, block_size_n], dtype=torch.float32)
-        intermediate_dX = hl.zeros([tile_bt, block_size_n], dtype=_input.dtype)
+        # Accumulate dX in fp32. The beta==1 branch adds the fp32 `intermediate_loss` into
+        # dX, so an _input.dtype (bf16/fp16) accumulator would mismatch the carried value at
+        # the branch merge (type propagation visits every beta branch). No-op at fp32.
+        intermediate_dX = hl.zeros([tile_bt, block_size_n], dtype=torch.float32)
         for tile_v in hl.tile(V, block_size=block_size_n):
             # Load log probabilities and convert to float32
             X = _input[tile_bt, tile_v]

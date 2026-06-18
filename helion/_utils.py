@@ -24,6 +24,14 @@ def next_power_of_2(n: int) -> int:
     return 1 << (n - 1).bit_length()
 
 
+def prev_power_of_2(n: int) -> int:
+    """Return the largest power of 2 <= n (>= 1). Use this to floor a budget to a valid
+    pow2 tile: ``next_power_of_2`` would round UP past the budget."""
+    if n <= 1:
+        return 1
+    return 1 << (n.bit_length() - 1)
+
+
 @functools.cache
 def triton_is_available() -> bool:
     """Return True if triton is installed and importable."""

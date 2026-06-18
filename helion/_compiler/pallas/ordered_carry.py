@@ -54,8 +54,29 @@ def is_row_map_axis(state: CodegenState, block_id: int) -> bool:
     never summed, scattered, or shifted; the over-read and carry are only
     correct in that case.
     """
-    # TODO(implement): the map-axis check above; for now reject every jagged tile.
-    return False
+    # TODO(tcombes): conservative.  Scans how the row is indexed and only accepts
+    # a straight store; exercised only on the bmm and elementwise forms, so
+    # revisit for completeness (aliasing, multiple stores, broadcast/expand).
+    from helion._compiler.device_ir import ReductionLoopGraphInfo
+    from helion._compiler.pallas.plan_tiling import TilePattern
+    from helion.language.memory_ops import store
+
+    has_straight_store = False
+    for ginfo in state.codegen.codegen_graphs:
+        if isinstance(ginfo, ReductionLoopGraphInfo) and block_id in ginfo.block_ids:
+            return False  # the row is summed away
+        for node in ginfo.graph.nodes:
+            patterns = node.meta.get("indexing_patterns")
+            if not patterns:
+                continue
+            for dim, pat in enumerate(patterns):
+                if getattr(pat, "block_id", None) != block_id:
+                    continue
+                if not isinstance(pat, TilePattern):
+                    return False  # the row is offset or scattered, not straight
+                if node.target is store and dim == 0:
+                    has_straight_store = True
+    return has_straight_store
 
 
 def needs_ordered_carry(state: CodegenState, block_id: int) -> bool:
