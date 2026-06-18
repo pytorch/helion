@@ -17,6 +17,7 @@ from .._compiler.ast_extension import create
 from .._compiler.ast_extension import expr_from_string
 from .._compiler.ast_extension import statement_from_string
 from .._compiler.compile_environment import CompileEnvironment
+from .._compiler.compile_environment import _symint_sympy_expr
 from .._compiler.dtype_utils import cast_ast
 from .._compiler.host_function import HostFunction
 from .._compiler.variable_origin import BlockSizeOrigin
@@ -47,6 +48,19 @@ def is_for_loop_target(target: object) -> bool:
     return target in (_for_loop, _for_loop_step)
 
 
+def _val_to_sympy(val: torch.SymInt | torch.SymFloat | torch.SymBool) -> sympy.Expr:
+    """Resolve a sym value to its sympy expression, preferring the cached node expr.
+
+    A ``SymBool`` resolves to a sympy boolean rather than an ``Expr``; that case is
+    not expected on the symnode codegen paths below but is accepted by the type.
+    """
+    sym_expr = getattr(getattr(val, "node", None), "_expr", None)
+    if isinstance(sym_expr, sympy.Expr):
+        return sym_expr
+    # pyrefly: ignore [bad-return]
+    return val._sympy_()
+
+
 @_decorators.api()
 def _get_symnode(debug_name: str) -> int:
     """FX requires a torch.SymInt to come from an op. This is a fake op is added lazily to work around this."""
@@ -63,9 +77,7 @@ def _(state: CodegenState) -> ast.AST:
         return expr_from_string(str(val))
 
     assert isinstance(val, (torch.SymInt, torch.SymFloat, torch.SymBool)), val
-    sym_expr = getattr(getattr(val, "node", None), "_expr", None)
-    if not isinstance(sym_expr, sympy.Expr):
-        sym_expr = val._sympy_()
+    sym_expr = _val_to_sympy(val)
     origin_info = HostFunction.current().expr_to_origin.get(sym_expr)
 
     if origin_info is not None and isinstance(origin_info.origin, BlockSizeOrigin):
@@ -91,9 +103,7 @@ def _(state: CodegenState) -> ast.AST:
         return expr_from_string(str(val))
 
     assert isinstance(val, (torch.SymInt, torch.SymFloat, torch.SymBool)), val
-    sym_expr = getattr(getattr(val, "node", None), "_expr", None)
-    if not isinstance(sym_expr, sympy.Expr):
-        sym_expr = val._sympy_()
+    sym_expr = _val_to_sympy(val)
     origin_info = HostFunction.current().expr_to_origin.get(sym_expr)
     if origin_info is not None and isinstance(origin_info.origin, BlockSizeOrigin):
         block_size_var = state.device_function.block_size_var(
@@ -1502,7 +1512,7 @@ def _(state: CodegenState) -> ast.AST:
     tensor_ast = state.ast_arg(0)
     target_size = state.proxy_arg(1)
     if isinstance(target_size, torch.SymInt):
-        target_expr = state.sympy_expr(target_size._sympy_())
+        target_expr = state.sympy_expr(_symint_sympy_expr(target_size))
         block_id = CompileEnvironment.current().get_block_id(target_size)
         bs_var = (
             state.device_function.block_size_var(block_id)
