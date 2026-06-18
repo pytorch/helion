@@ -4188,15 +4188,13 @@ class TestPallas(TestCase):
     @skipUnlessPallas
     def test_jagged_sum_with_post_reduction_op_bf16_wide(self) -> None:
         """bf16 counterpart of ``test_jagged_sum_with_post_reduction_op``
-        at a wider M (16) than cota's repro.
+        at wider M.
 
         Same offsets ``[0, 3, 8, 10, 14]`` so the per-item starts
-        ``starts[1] = 3``, ``starts[3] = 10`` are unchanged -- only the
-        row width (``M * itemsize`` = 16 * 2 = 32 bytes) changes.
-        Empirically passes on real TPU.  Paired with the narrow xfail
-        below, this isolates the bf16 jagged-flat limit to narrow row
-        widths (M * itemsize below the relevant HBM tile boundary), not
-        to bf16 itself.
+        ``starts[1] = 3``, ``starts[3] = 10`` are unchanged -- only M
+        changes from 8 to 16.  Empirically passes on real TPU.  Paired
+        with the narrow xfail below, this isolates the bf16 jagged-flat
+        limit to narrow M, not to bf16 itself.
         """
 
         @helion.kernel(backend="pallas", static_shapes=True)
@@ -4231,21 +4229,13 @@ class TestPallas(TestCase):
                 expected[i, :] = x_data[s:e, :].sum(dim=0) * 2.0
         torch.testing.assert_close(result, expected, atol=1e-2, rtol=1e-2)
 
-    @xfailIfPallasTpu(
-        "Narrow row width (M * itemsize < HBM tile alignment): data-dependent "
-        "starts[i] lands on non-tile-aligned offset, Mosaic rejects at "
-        "tpu.memref_slice. Fix is align-down + over-load + mask follow-up."
-    )
+    @xfailIfPallasTpu("Narrow-M jagged-flat alignment limit; tracked in follow-up.")
     def test_jagged_sum_with_post_reduction_op_bf16_narrow_xfail(self) -> None:
-        """Documents the current narrow-row-width limit (cota's exact repro
+        """Documents the current narrow-M bf16 limit (cota's exact repro
         from PR #2616 review): bf16 + M=8 with offsets ``[0, 3, 8, 10, 14]``.
 
-        Mosaic rejects at the HBM-side ``tpu.memref_slice`` view
-        construction with ``Offsets along tiled dimensions must be aligned
-        to tiles``.  The same kernel passes at fp32 + M=8 (above) and at
-        bf16 + M=16 (above), isolating the failure to narrow row widths
-        in packed dtypes.  Fix (align-down + over-load + mask) shares
-        machinery with the M>128 lane-side follow-up.
+        Same kernel passes at fp32 + M=8 (above) and at bf16 + M=16
+        (above).  Fix is in the alignment+mask follow-up alongside M>128.
         """
 
         @helion.kernel(backend="pallas", static_shapes=True)
@@ -4279,6 +4269,104 @@ class TestPallas(TestCase):
             if e > s:
                 expected[i, :] = x_data[s:e, :].sum(dim=0) * 2.0
         torch.testing.assert_close(result, expected, atol=1e-2, rtol=1e-2)
+
+    @skipUnlessPallas
+    def test_jagged_sum_with_post_reduction_op_fp8_wide(self) -> None:
+        """fp8 counterpart at wider M.
+
+        Same offsets as bf16/fp32 variants.  Compute lifted to fp32
+        internally so the test exercises the load/store dtype rather
+        than fp8 reduction math.  Pending TPU verification.
+        """
+
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def k(x_data: torch.Tensor, x_offsets: torch.Tensor) -> torch.Tensor:
+            M = x_data.size(1)
+            num_rows = x_offsets.size(0) - 1
+            out = torch.zeros([num_rows, M], dtype=x_data.dtype, device=x_data.device)
+            x_flat = x_data.view(-1)
+            for tile_b in hl.tile(num_rows):
+                starts = x_offsets[tile_b]
+                ends = x_offsets[tile_b.index + 1]
+                nnz = ends - starts
+                for tile_m in hl.tile(M):
+                    row_sums = hl.zeros([tile_b, tile_m], dtype=torch.float32)
+                    for tile_k in hl.jagged_tile(nnz):
+                        base = starts[:, None] + tile_k.index[None, :]
+                        flat = base[:, :, None] * M + tile_m.index[None, None, :]
+                        x_slice = hl.load(x_flat, [flat]).to(torch.float32)
+                        row_sums = row_sums + x_slice.sum(dim=1)
+                    out[tile_b, tile_m] = (row_sums * 2.0).to(x_data.dtype)
+            return out
+
+        torch.manual_seed(0)
+        x_offsets = torch.tensor([0, 3, 8, 10, 14], dtype=torch.int32, device=DEVICE)
+        # fp8 narrow representable range; scale before cast.
+        x_data = (torch.randn(14, 32, device=DEVICE) * 0.5).to(torch.float8_e4m3fn)
+        result = k(x_data, x_offsets)
+
+        expected = torch.zeros_like(result)
+        for i in range(x_offsets.numel() - 1):
+            s = int(x_offsets[i])
+            e = int(x_offsets[i + 1])
+            if e > s:
+                expected[i, :] = (x_data[s:e, :].to(torch.float32).sum(dim=0) * 2.0).to(
+                    torch.float8_e4m3fn
+                )
+        # fp8 precision is very loose.
+        torch.testing.assert_close(
+            result.to(torch.float32),
+            expected.to(torch.float32),
+            atol=1.0,
+            rtol=0.25,
+        )
+
+    @xfailIfPallasTpu("Narrow-M jagged-flat alignment limit; tracked in follow-up.")
+    def test_jagged_sum_with_post_reduction_op_fp8_narrow_xfail(self) -> None:
+        """fp8 mirror of the bf16 narrow xfail at M=8.  Same offsets and
+        same lifted-to-fp32 compute as the fp8 wide variant.  Expected to
+        fail on real TPU for the same reason as the bf16 narrow case.
+        """
+
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def k(x_data: torch.Tensor, x_offsets: torch.Tensor) -> torch.Tensor:
+            M = x_data.size(1)
+            num_rows = x_offsets.size(0) - 1
+            out = torch.zeros([num_rows, M], dtype=x_data.dtype, device=x_data.device)
+            x_flat = x_data.view(-1)
+            for tile_b in hl.tile(num_rows):
+                starts = x_offsets[tile_b]
+                ends = x_offsets[tile_b.index + 1]
+                nnz = ends - starts
+                for tile_m in hl.tile(M):
+                    row_sums = hl.zeros([tile_b, tile_m], dtype=torch.float32)
+                    for tile_k in hl.jagged_tile(nnz):
+                        base = starts[:, None] + tile_k.index[None, :]
+                        flat = base[:, :, None] * M + tile_m.index[None, None, :]
+                        x_slice = hl.load(x_flat, [flat]).to(torch.float32)
+                        row_sums = row_sums + x_slice.sum(dim=1)
+                    out[tile_b, tile_m] = (row_sums * 2.0).to(x_data.dtype)
+            return out
+
+        torch.manual_seed(0)
+        x_offsets = torch.tensor([0, 3, 8, 10, 14], dtype=torch.int32, device=DEVICE)
+        x_data = (torch.randn(14, 8, device=DEVICE) * 0.5).to(torch.float8_e4m3fn)
+        result = k(x_data, x_offsets)
+
+        expected = torch.zeros_like(result)
+        for i in range(x_offsets.numel() - 1):
+            s = int(x_offsets[i])
+            e = int(x_offsets[i + 1])
+            if e > s:
+                expected[i, :] = (x_data[s:e, :].to(torch.float32).sum(dim=0) * 2.0).to(
+                    torch.float8_e4m3fn
+                )
+        torch.testing.assert_close(
+            result.to(torch.float32),
+            expected.to(torch.float32),
+            atol=1.0,
+            rtol=0.25,
+        )
 
     def test_parse_flat_jagged_subscript_canonical(self) -> None:
         """``_parse_flat_jagged_subscript`` recovers
