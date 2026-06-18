@@ -4186,6 +4186,54 @@ class TestPallas(TestCase):
         torch.testing.assert_close(result, expected, atol=1e-4, rtol=1e-4)
 
     @skipUnlessPallas
+    def test_jagged_sum_with_post_reduction_op_fp32_narrow(self) -> None:
+        """fp32 at extreme narrow M (M=1).
+
+        Same offsets as the wide variants.  At M=1 the per-row byte width
+        is 4 bytes -- much narrower than the bf16 / fp8 narrow xfails.
+        No xfail decorator: outcome decides between two hypotheses for
+        the constraint underlying the narrow xfails:
+
+        * If this passes -- fp32 sneaks through regardless of row width,
+          and the constraint is bound to Mosaic's per-dtype tile choice
+          (fp32 tile dim 0 = 1 -> check is trivially satisfied).
+        * If this fails with the same Mosaic alignment error -- the
+          constraint is universal in row width and fp32 is not special.
+        """
+
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def k(x_data: torch.Tensor, x_offsets: torch.Tensor) -> torch.Tensor:
+            M = x_data.size(1)
+            num_rows = x_offsets.size(0) - 1
+            out = torch.zeros([num_rows, M], dtype=x_data.dtype, device=x_data.device)
+            x_flat = x_data.view(-1)
+            for tile_b in hl.tile(num_rows):
+                starts = x_offsets[tile_b]
+                ends = x_offsets[tile_b.index + 1]
+                nnz = ends - starts
+                for tile_m in hl.tile(M):
+                    row_sums = hl.zeros([tile_b, tile_m], dtype=x_data.dtype)
+                    for tile_k in hl.jagged_tile(nnz):
+                        base = starts[:, None] + tile_k.index[None, :]
+                        flat = base[:, :, None] * M + tile_m.index[None, None, :]
+                        row_sums = row_sums + hl.load(x_flat, [flat]).sum(dim=1)
+                    out[tile_b, tile_m] = row_sums * 2.0
+            return out
+
+        torch.manual_seed(0)
+        x_offsets = torch.tensor([0, 3, 8, 10, 14], dtype=torch.int32, device=DEVICE)
+        x_data = torch.randn(14, 1, dtype=torch.float32, device=DEVICE)
+        result = k(x_data, x_offsets)
+
+        expected = torch.zeros_like(result)
+        for i in range(x_offsets.numel() - 1):
+            s = int(x_offsets[i])
+            e = int(x_offsets[i + 1])
+            if e > s:
+                expected[i, :] = x_data[s:e, :].sum(dim=0) * 2.0
+        torch.testing.assert_close(result, expected, atol=1e-4, rtol=1e-4)
+
+    @skipUnlessPallas
     def test_jagged_sum_with_post_reduction_op_bf16_wide(self) -> None:
         """bf16 counterpart of ``test_jagged_sum_with_post_reduction_op``
         at wider M.
