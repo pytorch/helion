@@ -1091,6 +1091,21 @@ class DeviceFunction:
         self._scratch_args.append(ScratchArg(name, shape, dtype, scratch_type))
         return name
 
+    def get_scratch_arg(self, name: str) -> ScratchArg | None:
+        """Look up a registered scratch buffer by its variable name.
+
+        Returns the ``ScratchArg`` if ``name`` matches a registered scratch
+        (loop-carried state, DMA scratch on the fori_loop path, etc.); returns
+        ``None`` for tensor names that aren't backed by a registered scratch
+        (e.g. emit_pipeline / BlockSpec-auto-clamped Refs, direct VMEM
+        tensors).  Used by ``sliced_value_for_store`` to consult the actual
+        Ref shape per dim rather than assuming the BlockSpec auto-clamp rule.
+        """
+        for arg in self._scratch_args:
+            if arg.name == name:
+                return arg
+        return None
+
     def scratch_read_slice(self, name: str) -> str | None:
         """Return the index expression for reading logical data from a padded scratch.
 

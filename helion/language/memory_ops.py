@@ -445,7 +445,7 @@ def _(state: CodegenState) -> None:
     device_fn.device_memory_op_index += 1
     parts, _ = pallas_codegen.index_parts(state, subscript, tensor)
     value = pallas_codegen.sliced_value_for_store(
-        state, tensor, subscript, parts, value
+        state, tensor, subscript, parts, value, name
     )
     idx_str = ", ".join(parts)
     patterns = state.fx_node.meta.get("indexing_patterns") if state.fx_node else ()

@@ -138,17 +138,37 @@ def sliced_value_for_store(
     subscript: list[object] | tuple[object, ...],
     index_parts: list[str],
     value: ast.AST,
+    name: str | None = None,
 ) -> ast.AST:
-    """Slice the store value when the Pallas ref is smaller than the tile.
+    """Slice the store value to match the Pallas Ref's actual shape per dim.
 
-    The launcher clamps each BlockSpec dimension to
-    ``min(block_size, tensor.shape[d])``.  When ``block_size > dim_size``
-    the kernel ref is ``dim_size``-shaped but the computed value is
-    ``block_size``-shaped, so we must slice the value before storing.
+    The computed value's shape on each tiled dim is ``block_size`` -- it
+    comes from a user-side accumulator allocated as e.g.
+    ``hl.zeros([tile_b, tile_m], ...)`` whose tile-vars resolve to block
+    sizes at codegen time.  Whether the Ref shares that ``block_size`` or
+    is smaller depends on how it was allocated:
 
-    This only applies to grid-tiled dimensions that produce ``:`` in the
-    generated Pallas index.  Dimensions indexed via ``pl.ds()`` are padded
-    instead of clamped, so they must keep their full block-size value.
+    * ``emit_pipeline`` + ``BlockSpec``: the launcher auto-clamps each
+      grid-tiled dim to ``min(block_size, dim_size)`` -- when
+      ``dim_size < block_size`` the Ref is ``dim_size``-shaped and the
+      value needs to be sliced down to match.
+    * ``fori_loop`` (and any other path that registers an explicit VMEM
+      scratch via ``register_scratch``): the Ref is the scratch itself,
+      whose actual shape is whatever the caller passed in (today: the
+      block_size on each tiled dim).  Value already matches; no slice.
+    * Future per-block-clamp on ``fori_loop`` for element-wise kernels:
+      the registered scratch would be ``min(block_size, dim_size)`` and
+      the value-side slice falls back into place automatically.
+
+    The unified rule below: look up the actual ``ScratchArg.shape`` if
+    ``name`` names a registered scratch; otherwise fall back to
+    ``tensor.shape[dim]`` (the BlockSpec auto-clamp assumption).  Then
+    slice the value to whichever ``ref_dim`` is smaller than the
+    accumulator's ``block_size``.
+
+    Dimensions indexed via ``pl.ds()`` are padded instead of clamped, so
+    they keep their full block-size value -- handled by skipping any
+    ``index_part`` that isn't a plain ``:``.
     """
     from helion._compiler.compile_environment import CompileEnvironment
     from helion._compiler.pallas.plan_tiling import TilePattern
@@ -157,10 +177,11 @@ def sliced_value_for_store(
     patterns = state.fx_node.meta.get("indexing_patterns")
     if patterns is None:
         return value
-    if state.config.get("pallas_loop_type") == "fori_loop":
-        return value
 
     env = CompileEnvironment.current()
+    scratch_arg = (
+        state.device_function.get_scratch_arg(name) if name is not None else None
+    )
     slices: list[str] = []
     needs_slice = False
     tensor_dim = 0
@@ -175,13 +196,16 @@ def sliced_value_for_store(
         index_part_idx += 1
         if isinstance(pattern, TilePattern) and index_part == ":":
             block_size = env.block_sizes[pattern.block_id].from_config(state.config)
-            dim_size = tensor.shape[tensor_dim]
+            if scratch_arg is not None and tensor_dim < len(scratch_arg.shape):
+                ref_dim: object = scratch_arg.shape[tensor_dim]
+            else:
+                ref_dim = tensor.shape[tensor_dim]
             if (
                 isinstance(block_size, int)
-                and isinstance(dim_size, int)
-                and dim_size < block_size
+                and isinstance(ref_dim, int)
+                and ref_dim < block_size
             ):
-                value_slice = f":{dim_size}"
+                value_slice = f":{ref_dim}"
                 needs_slice = True
 
         slices.append(value_slice)
