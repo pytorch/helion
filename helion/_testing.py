@@ -114,6 +114,12 @@ def skipIfFn(
     wraps setUp to check the skip condition before each test runs.
     """
 
+    if not isinstance(reason, str):
+        raise TypeError(
+            f"Decorator using skipIfFn requires a reason string argument, got {type(reason).__name__}. "
+            "Make sure to call the decorator with parentheses, e.g. @decorator('reason') or @decorator()"
+        )
+
     def decorator(test_item: Callable) -> Callable:
         if isinstance(test_item, type):
             # For classes: wrap setUp to check skip condition at test execution time
