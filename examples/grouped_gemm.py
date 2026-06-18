@@ -179,7 +179,7 @@ def grouped_gemm_jagged_persistent(
                         # Convert linear tile index to 2D (M, N) tile coordinates
                         # pyrefly: ignore[unsupported-operation]
                         m_tile_idx = tile_in_group % num_m_tiles
-                        n_tile_idx = tile_in_group // num_m_tiles
+                        n_tile_idx = tile_in_group // num_m_tiles  # pyrefly: ignore[unsupported-operation]
 
                         # Compute global memory indices for current tile
                         base_row = group_start + m_tile_idx * BLOCK_M

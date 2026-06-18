@@ -240,7 +240,7 @@ class HostFunction:
         if isinstance(value, torch.Tensor):
             self.tensor_to_origin[value] = origin
         elif isinstance(value, (torch.SymInt, torch.SymFloat, torch.SymBool)):
-            self.expr_to_origin[value._sympy_()] = SymbolOrigin(origin)
+            self.expr_to_origin[value._sympy_()] = SymbolOrigin(origin)  # pyrefly: ignore[unsupported-operation]
         return value
 
     def __repr__(self) -> str:
@@ -275,7 +275,7 @@ class HostFunction:
 
     def literal_expr(self, expr: object) -> str:
         if isinstance(expr, (torch.SymInt, torch.SymFloat, torch.SymBool)):
-            return self.sympy_expr(expr._sympy_())
+            return self.sympy_expr(expr._sympy_())  # pyrefly: ignore[bad-argument-type]
         if isinstance(expr, sympy.Expr):
             return self.sympy_expr(expr)
         if isinstance(expr, list):

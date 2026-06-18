@@ -66,7 +66,7 @@ def _(state: CodegenState) -> ast.AST:
     sym_expr = getattr(getattr(val, "node", None), "_expr", None)
     if not isinstance(sym_expr, sympy.Expr):
         sym_expr = val._sympy_()
-    origin_info = HostFunction.current().expr_to_origin.get(sym_expr)
+    origin_info = HostFunction.current().expr_to_origin.get(sym_expr)  # pyrefly: ignore[bad-argument-type]
 
     if origin_info is not None and isinstance(origin_info.origin, BlockSizeOrigin):
         block_size_var = state.device_function.block_size_var(
@@ -76,8 +76,8 @@ def _(state: CodegenState) -> ast.AST:
             return expr_from_string("1")
         return expr_from_string(block_size_var)
     return state.codegen.lift_symnode(
-        expr_from_string(state.sympy_expr(sym_expr)),
-        sym_expr,
+        expr_from_string(state.sympy_expr(sym_expr)),  # pyrefly: ignore[bad-argument-type]
+        sym_expr,  # pyrefly: ignore[bad-argument-type]
         dce=True,
         prefix="symnode",
     )
@@ -94,7 +94,7 @@ def _(state: CodegenState) -> ast.AST:
     sym_expr = getattr(getattr(val, "node", None), "_expr", None)
     if not isinstance(sym_expr, sympy.Expr):
         sym_expr = val._sympy_()
-    origin_info = HostFunction.current().expr_to_origin.get(sym_expr)
+    origin_info = HostFunction.current().expr_to_origin.get(sym_expr)  # pyrefly: ignore[bad-argument-type]
     if origin_info is not None and isinstance(origin_info.origin, BlockSizeOrigin):
         block_size_var = state.device_function.block_size_var(
             origin_info.origin.block_id
@@ -103,8 +103,8 @@ def _(state: CodegenState) -> ast.AST:
             return expr_from_string("1")
         return expr_from_string(block_size_var)
     return state.codegen.lift_symnode(
-        expr_from_string(state.sympy_expr(sym_expr)),
-        sym_expr,
+        expr_from_string(state.sympy_expr(sym_expr)),  # pyrefly: ignore[bad-argument-type]
+        sym_expr,  # pyrefly: ignore[bad-argument-type]
         dce=True,
         prefix="symnode",
     )
@@ -1502,7 +1502,7 @@ def _(state: CodegenState) -> ast.AST:
     tensor_ast = state.ast_arg(0)
     target_size = state.proxy_arg(1)
     if isinstance(target_size, torch.SymInt):
-        target_expr = state.sympy_expr(target_size._sympy_())
+        target_expr = state.sympy_expr(target_size._sympy_())  # pyrefly: ignore[bad-argument-type]
         block_id = CompileEnvironment.current().get_block_id(target_size)
         bs_var = (
             state.device_function.block_size_var(block_id)

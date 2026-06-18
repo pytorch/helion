@@ -167,7 +167,7 @@ class TypeInfo:
             attr_origin = AttributeOrigin(origin, compute_unit_literal)
             # Create a symbolic integer that can be passed as kernel argument
             sym = env.create_unbacked_symint()
-            HostFunction.current().expr_to_origin[sym._sympy_()] = SymbolOrigin(
+            HostFunction.current().expr_to_origin[sym._sympy_()] = SymbolOrigin(  # pyrefly: ignore[unsupported-operation]
                 origin=attr_origin
             )
             attrs[compute_unit_literal] = SymIntType(attr_origin, sym)
@@ -846,7 +846,7 @@ class NumericType(TypeInfo):
         self.value = value
 
     def to_sympy(self) -> sympy.Expr:
-        return self.value._sympy_()
+        return self.value._sympy_()  # pyrefly: ignore[bad-return]
 
     @property
     def python_type(self) -> type[float | int | bool]:
@@ -1200,7 +1200,7 @@ class GridIndexType(SymIntType):
         block_id = env.allocate_block_size(numel, source=FixedBlockSizeSource(step))
         # assign this a new unbacked symbol since this should be treated like a scalar rather than a tile
         sym = env.create_unbacked_symint()
-        HostFunction.current().expr_to_origin[sym._sympy_()] = SymbolOrigin(
+        HostFunction.current().expr_to_origin[sym._sympy_()] = SymbolOrigin(  # pyrefly: ignore[unsupported-operation]
             origin=GridOrigin(block_id),
         )
         return GridIndexType(origin, sym, block_id)

@@ -180,7 +180,7 @@ def _make_fx(fn: Callable[..., object], *args: object) -> torch.fx.Graph:
         if isinstance(obj, proxy_tensor.py_sym_types):
             tracker = tracer.symnode_tracker
             if obj not in tracker:
-                debug_name = CompileEnvironment.current().sympy_debug(obj._sympy_())
+                debug_name = CompileEnvironment.current().sympy_debug(obj._sympy_())  # pyrefly: ignore[bad-argument-type]
                 # pyrefly: ignore [unsupported-operation]
                 tracker[obj] = proxy = tracer.create_proxy(
                     "call_function",

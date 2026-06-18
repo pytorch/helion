@@ -98,10 +98,10 @@ def _(value: TypeInfo, *, origin: Origin) -> TypeInfo:
 
     def handle_symint(symint: torch.SymInt) -> int:
         syms = symint._sympy_().free_symbols
-        env.specialized_vars.update(syms)
+        env.specialized_vars.update(syms)  # pyrefly: ignore[bad-argument-type]
         # Track stride specializations
         for sym in syms:
-            for source in env.shape_env.var_to_sources.get(sym, []):
+            for source in env.shape_env.var_to_sources.get(sym, []):  # pyrefly: ignore[no-matching-overload]
                 if (
                     isinstance(source, TensorPropertySource)
                     and source.prop == TensorProperty.STRIDE
@@ -123,9 +123,9 @@ def _(value: _T) -> _T:
 
     def handle_symint(symint: torch.SymInt) -> torch.SymInt:
         syms = symint._sympy_().free_symbols
-        env.specialized_vars.update(syms)
+        env.specialized_vars.update(syms)  # pyrefly: ignore[bad-argument-type]
         for sym in syms:
-            for source in env.shape_env.var_to_sources.get(sym, []):
+            for source in env.shape_env.var_to_sources.get(sym, []):  # pyrefly: ignore[no-matching-overload]
                 if (
                     isinstance(source, TensorPropertySource)
                     and source.prop == TensorProperty.STRIDE

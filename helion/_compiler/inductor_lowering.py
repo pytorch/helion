@@ -137,7 +137,7 @@ def prepare_node_lowering(
     if isinstance(
         val := node.meta["val"], (torch.SymInt, torch.SymFloat, torch.SymBool)
     ):
-        node.meta["lowering"] = SympyExprLowering(val._sympy_())
+        node.meta["lowering"] = SympyExprLowering(val._sympy_())  # pyrefly: ignore[bad-argument-type]
         return
 
     # Track arguments to reuse names for duplicates
@@ -368,7 +368,7 @@ def to_symint(x: object) -> torch.SymInt | int:
 
 def _unpack_symint(x: torch.SymInt | int) -> sympy.Expr:
     if isinstance(x, torch.SymInt):
-        return x._sympy_()
+        return x._sympy_()  # pyrefly: ignore[bad-return]
     if isinstance(x, int):
         # type: ignore [bad-return]
         return sympy.sympify(x)

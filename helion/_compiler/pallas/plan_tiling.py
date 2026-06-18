@@ -500,7 +500,7 @@ def _maybe_get_tile_begin_with_offset_info(
                 return None
             offset += int(f_value)
         else:
-            offset = torch.SymInt(arg)
+            offset = torch.SymInt(arg)  # pyrefly: ignore[bad-argument-type]
             break
 
     env = CompileEnvironment.current()

@@ -187,7 +187,7 @@ class TileStrategyDispatch:
             return self.strategies[0].fn.literal_expr(shape)
 
         # Try to map block symbols to their variable names
-        mapped_expr = DeviceFunction.current().try_map_block_symbols_to_vars(expr)
+        mapped_expr = DeviceFunction.current().try_map_block_symbols_to_vars(expr)  # pyrefly: ignore[bad-argument-type]
         if mapped_expr is not None:
             # Use a dedicated tl.constexpr argument for any mapped shape expression.
             # This avoids emitting helper calls (e.g., triton_helpers.div_floor_integer)

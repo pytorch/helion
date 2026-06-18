@@ -661,7 +661,7 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
                 for dim in getattr(arg, "_dynamo_static_indices", ()):
                     size = fake_arg.size(dim)
                     if isinstance(size, torch.SymInt):
-                        self.env.specialized_vars.update(size._sympy_().free_symbols)
+                        self.env.specialized_vars.update(size._sympy_().free_symbols)  # pyrefly: ignore[bad-argument-type]
 
     @property
     def env(self) -> CompileEnvironment:

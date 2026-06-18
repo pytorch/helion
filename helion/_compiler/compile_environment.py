@@ -618,7 +618,7 @@ class CompileEnvironment:
             from .host_function import HostFunction
 
             expr = size._sympy_()
-            origin_info = HostFunction.current().expr_to_origin.get(expr)
+            origin_info = HostFunction.current().expr_to_origin.get(expr)  # pyrefly: ignore[bad-argument-type]
             if origin_info and isinstance(origin_info.origin, BlockSizeOrigin):
                 block_idx = origin_info.origin.block_id
                 existing_block = self.block_sizes[block_idx]
@@ -675,9 +675,9 @@ class CompileEnvironment:
             # TODO(jansel): I was hoping the above would work, seems like some decomps require concrete values
             #               to determine zeroness.  Figure out a better way to do this.
 
-            shape_env_var_hints(self.shape_env)[sym._sympy_()] = sympy.Integer(hint)
+            shape_env_var_hints(self.shape_env)[sym._sympy_()] = sympy.Integer(hint)  # pyrefly: ignore[unsupported-operation]
         assert isinstance(sym._sympy_(), sympy.Symbol)
-        self.debug_shape_renames[sym._sympy_()] = sympy.Symbol(debug_name, integer=True)
+        self.debug_shape_renames[sym._sympy_()] = sympy.Symbol(debug_name, integer=True)  # pyrefly: ignore[unsupported-operation]
         return sym
 
     def create_unbacked_symint(self, hint: int = 8192) -> torch.SymInt:
@@ -800,7 +800,7 @@ class CompileEnvironment:
         specialized_shape: list[int | torch.SymInt] = []
         for dim in output_shape:
             if isinstance(dim, torch.SymInt):
-                expr = self.specialize_expr(dim._sympy_())
+                expr = self.specialize_expr(dim._sympy_())  # pyrefly: ignore[bad-argument-type]
                 if not expr.free_symbols:
                     with contextlib.suppress(TypeError, ValueError):
                         specialized_shape.append(int(expr))
@@ -829,7 +829,7 @@ class CompileEnvironment:
                 except NotImplementedError:
                     pass
                 else:
-                    self.shape_env.var_to_sources[sym._sympy_()] = [source]
+                    self.shape_env.var_to_sources[sym._sympy_()] = [source]  # pyrefly: ignore[unsupported-operation]
                 return sym
             if isinstance(obj, float):
                 with self.shape_env.ignore_fresh_unbacked_symbols():
@@ -910,13 +910,13 @@ class CompileEnvironment:
             return s
         expr = s.node.expr
         cache_key = (id(outer_se), expr)
-        cached = self._foreign_symint_cache.get(cache_key)
+        cached = self._foreign_symint_cache.get(cache_key)  # pyrefly: ignore[bad-argument-type]
         if cached is not None:
             return cached
         if free_unbacked_symbols(expr):
             result = self.create_unbacked_symint()
         else:
-            hint = int(shape_env_var_hints(outer_se)[expr])
+            hint = int(shape_env_var_hints(outer_se)[expr])  # pyrefly: ignore
             new_expr = self.shape_env.create_symbol(
                 hint, source, dynamic_dim=DimDynamic.DYNAMIC
             )
@@ -973,7 +973,7 @@ class CompileEnvironment:
                 if isinstance(s, torch.SymInt) and isinstance(
                     s._sympy_(), sympy.Symbol
                 ):
-                    self.debug_shape_renames[s._sympy_()] = sympy.Symbol(
+                    self.debug_shape_renames[s._sympy_()] = sympy.Symbol(  # pyrefly: ignore[unsupported-operation]
                         f"{source.local_name}_size{i}", integer=True
                     )
         return result
@@ -987,14 +987,14 @@ class CompileEnvironment:
         """
         if not isinstance(size, torch.SymInt):
             return size
-        if _has_unbacked(size._sympy_()):
+        if _has_unbacked(size._sympy_()):  # pyrefly: ignore[bad-argument-type]
             return size
         return self.size_hint(size)
 
     def size_hint(self, n: int | torch.SymInt) -> int:
         if isinstance(n, torch.SymInt):
             expr = n._sympy_()
-            if _has_unbacked(expr):
+            if _has_unbacked(expr):  # pyrefly: ignore[bad-argument-type]
                 var_hints = shape_env_var_hints(self.shape_env)
                 # For unbacked symbols, try to use the hint we stored in var_to_val
                 # when creating the symint (see create_unbacked_symint).
@@ -1343,7 +1343,7 @@ class BlockSizeInfo:
         expr = _symint_expr(self.var)
         if isinstance(expr, sympy.Symbol):
             return expr
-        return self.var._sympy_()
+        return self.var._sympy_()  # pyrefly: ignore[bad-return]
 
     def from_config(self, config: Config) -> int | torch.SymInt | None:
         value = self.block_size_source.from_config(config, self)
@@ -1441,7 +1441,7 @@ def warning(warning: exc.BaseWarning | type[exc.BaseWarning]) -> None:
 
 def _to_sympy(x: int | torch.SymInt | sympy.Expr) -> sympy.Expr:
     if isinstance(x, torch.SymInt):
-        return x._sympy_()
+        return x._sympy_()  # pyrefly: ignore[bad-return]
     if isinstance(x, int):
         return sympy.Integer(x)
     if isinstance(x, sympy.Expr):
@@ -1455,7 +1455,7 @@ def _symint_expr(x: torch.SymInt) -> sympy.Expr | None:
     if isinstance(expr, sympy.Expr):
         return expr
     with contextlib.suppress(Exception):
-        return x._sympy_()
+        return x._sympy_()  # pyrefly: ignore[bad-return]
     return None
 
 

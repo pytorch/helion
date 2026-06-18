@@ -111,7 +111,7 @@ def _explicit_offset_from_shape(
             view_shape: list[_ShapeDim] = [1] * ndim
             view_shape[dim] = shape[dim]
             index = index.reshape(view_shape)
-        offset = cast("torch.Tensor", offset + index * stride)
+        offset = cast("torch.Tensor", offset + index * stride)  # pyrefly: ignore[unsupported-operation]
     return offset
 
 

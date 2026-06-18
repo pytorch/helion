@@ -573,7 +573,7 @@ class DeviceFunction:
 
     def literal_expr(self, expr: object) -> str:
         if isinstance(expr, (torch.SymInt, torch.SymFloat, torch.SymBool)):
-            return self.sympy_expr(expr._sympy_())
+            return self.sympy_expr(expr._sympy_())  # pyrefly: ignore[bad-argument-type]
         if isinstance(expr, sympy.Expr):
             return self.sympy_expr(expr)
         if isinstance(expr, float) and not math.isfinite(expr):

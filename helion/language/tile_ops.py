@@ -32,7 +32,7 @@ def _register_tile_symbol_origin(
     origin_type: type[GridOrigin] = GridOrigin,
 ) -> None:
     """Register the origin for a tile-related symbol so it can be resolved during codegen."""
-    HostFunction.current().expr_to_origin[symbol._sympy_()] = SymbolOrigin(
+    HostFunction.current().expr_to_origin[symbol._sympy_()] = SymbolOrigin(  # pyrefly: ignore[unsupported-operation]
         origin_type(tile_index)
     )
 
@@ -106,7 +106,7 @@ def _resolve_tile_block_id(
     if not isinstance(expr, sympy.Expr):
         expr = tile._sympy_()
 
-    origin_info = HostFunction.current().expr_to_origin.get(expr)
+    origin_info = HostFunction.current().expr_to_origin.get(expr)  # pyrefly: ignore[bad-argument-type]
     if origin_info is not None and isinstance(
         origin_info.origin, GridOrigin | BlockSizeOrigin
     ):
