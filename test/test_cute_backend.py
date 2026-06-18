@@ -18,6 +18,7 @@ from helion._testing import onlyBackends
 from helion.exc import BackendUnsupported
 from helion.exc import CuteBackendUnavailable
 import helion.language as hl
+from helion.runtime import _build_cute_schema_and_args
 from helion.runtime import _cute_cluster_shape
 from helion.runtime import _cute_cluster_shape_from_wrapper_plans
 from helion.runtime import _ensure_cute_dsl_arch_env
@@ -2131,6 +2132,7 @@ class TestCuteBackend(TestCase):
 
         with (
             patch("helion.runtime._build_cute_schema_and_args", side_effect=fake_build),
+            patch("helion.runtime._cute_current_stream", return_value="stream"),
             patch(
                 "helion.runtime._get_compiled_cute_launcher",
                 return_value=FakeCompiled(),
@@ -2141,17 +2143,112 @@ class TestCuteBackend(TestCase):
             third = default_cute_launcher(cute_kernel, (2,), 8, block=(32, 1, 1))
 
         self.assertEqual(build_calls, [((7,), (2, 1, 1)), ((8,), (2, 1, 1))])
+        # The stream is appended fresh per launch (never cached), so it trails
+        # the cached launch args on every call.
         self.assertEqual(
             launched_args,
             [
-                ("launch-arg", 7, 2, 1, 1),
-                ("launch-arg", 7, 2, 1, 1),
-                ("launch-arg", 8, 2, 1, 1),
+                ("launch-arg", 7, 2, 1, 1, "stream"),
+                ("launch-arg", 7, 2, 1, 1, "stream"),
+                ("launch-arg", 8, 2, 1, 1, "stream"),
             ],
         )
-        self.assertEqual(first, ("launched", ("launch-arg", 7, 2, 1, 1)))
+        self.assertEqual(first, ("launched", ("launch-arg", 7, 2, 1, 1, "stream")))
         self.assertEqual(second, first)
-        self.assertEqual(third, ("launched", ("launch-arg", 8, 2, 1, 1)))
+        self.assertEqual(third, ("launched", ("launch-arg", 8, 2, 1, 1, "stream")))
+
+    def test_cute_launcher_samples_stream_fresh_per_launch(self) -> None:
+        # The CUDA stream must NOT be cached: on a launch-arg cache HIT the
+        # stream still has to be re-sampled, otherwise a kernel launched during
+        # CUDA graph capture would run on a stale (eager) stream and the graph
+        # would capture no work (empty-graph / no-op replay). Here the build is
+        # cached after the first call (same signature), but the current stream
+        # changes between launches and must be reflected each time.
+        cute_kernel = type("DummyCuteKernel", (), {})()
+        build_calls: list[tuple[object, ...]] = []
+        launched_args: list[tuple[object, ...]] = []
+        streams = iter(["stream-A", "stream-B", "stream-C"])
+
+        class FakeCompiled:
+            def __call__(self, *args: object) -> tuple[str, tuple[object, ...]]:
+                launched_args.append(args)
+                return ("launched", args)
+
+        def fake_build(
+            _cute_kernel: object,
+            args: tuple[object, ...],
+            _grid: tuple[int, int, int],
+        ) -> tuple[tuple[tuple[object, ...], ...], tuple[object, ...]]:
+            build_calls.append(args)
+            # Note: no stream baked into the returned launch args.
+            return (("scalar", "int"),), ("launch-arg",)
+
+        with (
+            patch("helion.runtime._build_cute_schema_and_args", side_effect=fake_build),
+            patch(
+                "helion.runtime._cute_current_stream", side_effect=lambda: next(streams)
+            ),
+            patch(
+                "helion.runtime._get_compiled_cute_launcher",
+                return_value=FakeCompiled(),
+            ),
+        ):
+            first = default_cute_launcher(cute_kernel, (1,), 7, block=(32, 1, 1))
+            second = default_cute_launcher(cute_kernel, (1,), 7, block=(32, 1, 1))
+            third = default_cute_launcher(cute_kernel, (1,), 7, block=(32, 1, 1))
+
+        # Build (and thus the cached args) happens once; the stream is appended
+        # fresh on each of the three launches.
+        self.assertEqual(build_calls, [(7,)])
+        self.assertEqual(
+            launched_args,
+            [
+                ("launch-arg", "stream-A"),
+                ("launch-arg", "stream-B"),
+                ("launch-arg", "stream-C"),
+            ],
+        )
+        self.assertEqual(first, ("launched", ("launch-arg", "stream-A")))
+        self.assertEqual(second, ("launched", ("launch-arg", "stream-B")))
+        self.assertEqual(third, ("launched", ("launch-arg", "stream-C")))
+
+    def test_cute_build_schema_excludes_stream_from_cached_args(self) -> None:
+        # The stream must never be part of the cached launch args produced by
+        # ``_build_cute_schema_and_args`` (it is appended per launch instead).
+        # Patch the cute imports so the builder runs without a real cutlass
+        # install; the sentinel stream must NOT appear in the returned args.
+        sentinel_stream = object()
+
+        def fake_imports() -> tuple[object, ...]:
+            gmem = object()
+
+            def make_ptr(*_a: object, **_k: object) -> str:
+                return "ptr"
+
+            def current_stream() -> object:
+                return sentinel_stream
+
+            return (gmem, make_ptr, current_stream)
+
+        def cute_kernel(alpha: int) -> None:
+            pass
+
+        with (
+            patch(
+                "helion.runtime._get_cute_launcher_imports", side_effect=fake_imports
+            ),
+            patch(
+                "helion.runtime._cute_kernel_param_is_constexpr", return_value=(False,)
+            ),
+        ):
+            schema, launch_args = _build_cute_schema_and_args(
+                cute_kernel, (7,), (2, 1, 1)
+            )
+
+        # Args end with the grid; the stream is not baked in.
+        self.assertEqual(launch_args, (7, 2, 1, 1))
+        self.assertNotIn(sentinel_stream, launch_args)
+        self.assertEqual(schema, (("scalar", "int"),))
 
     def test_cute_launcher_launch_arg_cache_distinguishes_signed_zero(
         self,
@@ -2175,6 +2272,7 @@ class TestCuteBackend(TestCase):
 
         with (
             patch("helion.runtime._build_cute_schema_and_args", side_effect=fake_build),
+            patch("helion.runtime._cute_current_stream", return_value="stream"),
             patch(
                 "helion.runtime._get_compiled_cute_launcher",
                 return_value=FakeCompiled(),
@@ -2184,9 +2282,9 @@ class TestCuteBackend(TestCase):
             negative = default_cute_launcher(cute_kernel, (1,), -0.0)
 
         self.assertEqual(build_calls, [(0.0,), (-0.0,)])
-        self.assertEqual(launched_args, [("float-1",), ("float-2",)])
-        self.assertEqual(positive, ("launched", ("float-1",)))
-        self.assertEqual(negative, ("launched", ("float-2",)))
+        self.assertEqual(launched_args, [("float-1", "stream"), ("float-2", "stream")])
+        self.assertEqual(positive, ("launched", ("float-1", "stream")))
+        self.assertEqual(negative, ("launched", ("float-2", "stream")))
 
     def test_cute_launcher_sets_arch_env_only_before_first_compile(self) -> None:
         cute_kernel = type("DummyCuteKernel", (), {})()
@@ -2200,6 +2298,7 @@ class TestCuteBackend(TestCase):
                 "helion.runtime._build_cute_schema_and_args",
                 return_value=((("scalar", "int"),), ("launch-arg",)),
             ),
+            patch("helion.runtime._cute_current_stream", return_value="stream"),
             patch("helion.runtime._create_cute_wrapper", return_value="jit-wrapper"),
             patch("helion.runtime._ensure_cute_dsl_arch_env") as ensure_arch,
             patch("cutlass.cute.compile", return_value=FakeCompiled()),
@@ -2208,7 +2307,7 @@ class TestCuteBackend(TestCase):
             second = default_cute_launcher(cute_kernel, (1,), 7, block=(32, 1, 1))
 
         self.assertEqual(ensure_arch.call_count, 1)
-        self.assertEqual(first, ("launched", ("launch-arg",)))
+        self.assertEqual(first, ("launched", ("launch-arg", "stream")))
         self.assertEqual(second, first)
 
     def test_cute_launcher_constexpr_float_cache_distinguishes_signed_zero(
@@ -2235,6 +2334,7 @@ class TestCuteBackend(TestCase):
             patch(
                 "helion.runtime._create_cute_wrapper", side_effect=fake_create_wrapper
             ),
+            patch("helion.runtime._cute_current_stream", return_value="stream"),
             patch("helion.runtime._ensure_cute_dsl_arch_env"),
             patch("cutlass.cute.compile", return_value=FakeCompiled()),
         ):
@@ -2245,6 +2345,8 @@ class TestCuteBackend(TestCase):
         self.assertNotEqual(created_schema_keys[0], created_schema_keys[1])
         self.assertEqual(positive[0], "launched")
         self.assertEqual(positive[1][:3], (1, 1, 1))
+        # Stream is appended fresh as the trailing launch arg.
+        self.assertEqual(positive[1][-1], "stream")
         self.assertEqual(negative, positive)
 
     def test_cute_launcher_launch_arg_cache_misses_on_tensor_pointer_change(
@@ -2272,6 +2374,7 @@ class TestCuteBackend(TestCase):
 
         with (
             patch("helion.runtime._build_cute_schema_and_args", side_effect=fake_build),
+            patch("helion.runtime._cute_current_stream", return_value="stream"),
             patch(
                 "helion.runtime._get_compiled_cute_launcher",
                 return_value=FakeCompiled(),
@@ -2282,9 +2385,12 @@ class TestCuteBackend(TestCase):
             third = default_cute_launcher(cute_kernel, (1,), other_tensor)
 
         self.assertEqual(build_calls, [tensor.data_ptr(), other_tensor.data_ptr()])
-        self.assertEqual(launched_args, [("ptr-1",), ("ptr-1",), ("ptr-2",)])
+        self.assertEqual(
+            launched_args,
+            [("ptr-1", "stream"), ("ptr-1", "stream"), ("ptr-2", "stream")],
+        )
         self.assertEqual(first, second)
-        self.assertEqual(third, ("launched", ("ptr-2",)))
+        self.assertEqual(third, ("launched", ("ptr-2", "stream")))
 
     def test_cute_cluster_shape_from_wrapper_plans(self) -> None:
         self.assertIsNone(_cute_cluster_shape_from_wrapper_plans([]))
