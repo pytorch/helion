@@ -157,6 +157,8 @@ def sliced_value_for_store(
     patterns = state.fx_node.meta.get("indexing_patterns")
     if patterns is None:
         return value
+    if state.config.get("pallas_loop_type") == "fori_loop":
+        return value
 
     env = CompileEnvironment.current()
     slices: list[str] = []
