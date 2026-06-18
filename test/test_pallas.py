@@ -4143,7 +4143,6 @@ class TestPallas(TestCase):
         spec = k.bind(args).config_spec
         self.assertGreater(spec.block_sizes[0].max_size, 1)
 
-    @skipUnlessPallas
     def test_jagged_sum_with_post_reduction_op(self) -> None:
         """Per-row sum followed by a post-reduction op (``* 2.0``).
 
@@ -4185,7 +4184,6 @@ class TestPallas(TestCase):
                 expected[i, :] = x_data[s:e, :].sum(dim=0) * 2.0
         torch.testing.assert_close(result, expected, atol=1e-4, rtol=1e-4)
 
-    @skipUnlessPallas
     def test_jagged_sum_with_post_reduction_op_fp32_narrow(self) -> None:
         """fp32 at extreme narrow M (M=1).
 
@@ -4229,7 +4227,6 @@ class TestPallas(TestCase):
                 expected[i, :] = x_data[s:e, :].sum(dim=0) * 2.0
         torch.testing.assert_close(result, expected, atol=1e-4, rtol=1e-4)
 
-    @skipUnlessPallas
     def test_jagged_sum_with_post_reduction_op_bf16_wide(self) -> None:
         """bf16 counterpart of ``test_jagged_sum_with_post_reduction_op``
         at wider M.
@@ -4314,7 +4311,6 @@ class TestPallas(TestCase):
                 expected[i, :] = x_data[s:e, :].sum(dim=0) * 2.0
         torch.testing.assert_close(result, expected, atol=1e-2, rtol=1e-2)
 
-    @skipUnlessPallas
     def test_jagged_sum_with_post_reduction_op_fp8_wide(self) -> None:
         """fp8 counterpart at wider M.
 
