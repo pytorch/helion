@@ -220,8 +220,14 @@ def patch_mamba2_tritonbench_inputs(operator_name: str, Operator: type[Any]) -> 
     _PATCHED_MAMBA_OPERATOR_CLASSES.add(Operator)
 
 
-def patch_fp8_gemm_tritonbench_inputs(operator_name: str, Operator: type[Any]) -> None:
+def patch_fp8_gemm_tritonbench_inputs(
+    operator_name: str, Operator: type[Any], disable_shape_override: bool = False
+) -> None:
     if operator_name != "fp8_gemm":
+        return
+    if disable_shape_override:
+        # Leave the operator's get_input_iter alone so native shape flags
+        # (--m/--n/--k, --llama, --input-loader) drive the input shapes.
         return
     if Operator in _PATCHED_FP8_GEMM_OPERATOR_CLASSES:
         return
@@ -1361,6 +1367,7 @@ def run_kernel(
     kernel_mappings: dict[str, tuple[str, ...]] | None = None,
     kernel_metric_mappings: dict[str, dict[str, str]] | None = None,
     measure_compile_time: bool = False,
+    fp8_gemm_native_shapes: bool = False,
 ) -> None:
     """Run a kernel benchmark, handling both single and multiple variants."""
     # Use provided mappings or default to global mappings
@@ -1420,6 +1427,7 @@ def run_kernel(
         results,
         active_metrics,
         measure_compile_time=measure_compile_time,
+        fp8_gemm_native_shapes=fp8_gemm_native_shapes,
     )
 
 
@@ -1433,6 +1441,7 @@ def run_kernel_variants(
     results: list[RunResult],
     kernel_metric_mappings: dict[str, dict[str, str]] | None = None,
     measure_compile_time: bool = False,
+    fp8_gemm_native_shapes: bool = False,
 ) -> None:
     """Run kernel variants in the same benchmark run."""
 
@@ -1513,7 +1522,9 @@ def run_kernel_variants(
         patch_rope_tritonbench_inputs(operator_name, Operator)
         patch_mamba2_tritonbench_inputs(operator_name, Operator)
         patch_gdn_tritonbench_accuracy(operator_name, Operator)
-        patch_fp8_gemm_tritonbench_inputs(operator_name, Operator)
+        patch_fp8_gemm_tritonbench_inputs(
+            operator_name, Operator, disable_shape_override=fp8_gemm_native_shapes
+        )
     except ImportError as e:
         print(
             f"Error: Could not import operator '{operator_name}' from tritonbench",
@@ -2041,6 +2052,13 @@ def main() -> None:
         help="Measure and report Helion kernel compile time (seconds) for each input shape. "
         "Results are included in JSON output as helion_compile_time_s metric.",
     )
+    parser.add_argument(
+        "--fp8-gemm-native-shapes",
+        action="store_true",
+        help="Disable the built-in fp8_gemm dashboard shape override so the "
+        "operator's native shape flags (--m/--n/--k, --llama, --input-loader) "
+        "drive the input shapes instead.",
+    )
 
     # Parse known args to get the kernel name, pass rest to tritonbench
     args, tritonbench_args = parser.parse_known_args()
@@ -2200,6 +2218,7 @@ def main() -> None:
                 active_kernel_mappings,
                 active_metric_mappings,
                 measure_compile_time=args.measure_compile_time,
+                fp8_gemm_native_shapes=args.fp8_gemm_native_shapes,
             )
         else:
             print(
@@ -2218,6 +2237,7 @@ def main() -> None:
                     active_kernel_mappings,
                     active_metric_mappings,
                     measure_compile_time=args.measure_compile_time,
+                    fp8_gemm_native_shapes=args.fp8_gemm_native_shapes,
                 )
     else:
         # Run all kernels
@@ -2236,6 +2256,7 @@ def main() -> None:
                 active_kernel_mappings,
                 active_metric_mappings,
                 measure_compile_time=args.measure_compile_time,
+                fp8_gemm_native_shapes=args.fp8_gemm_native_shapes,
             )
 
     if args.output:
