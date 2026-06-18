@@ -4189,7 +4189,7 @@ class TestPallas(TestCase):
                 expected[i, :] = x_data[s:e, :].sum(dim=0) * 2.0
         torch.testing.assert_close(result, expected, atol=1e-4, rtol=1e-4)
 
-    @parametrize("M", (13, 15))
+    @parametrize("M", (13, 17, 31, 79))
     def test_jagged_sum_with_post_reduction_op_fp32_unaligned_M(self, M) -> None:
         """fp32 at unaligned M (cota's PR #2616 review): M=13 was
         rejecting with ``Invalid shape for swap. Ref shape: (1, 16).
@@ -4197,6 +4197,15 @@ class TestPallas(TestCase):
         slicing the value down to dim_size while the scratch Ref kept
         its block_size shape.  Fixed by skipping the value slice on
         the fori_loop path (``sliced_value_for_store``).
+
+        block_sizes here pin tile_m's block_size to 16, so the four M
+        values exercise different (trip_count, last-iter partial size)
+        regimes:
+
+        * M=13 (prime, trip=1, partial=13)         -- cota's exact repro
+        * M=17 (prime, trip=2, partial=1)          -- smallest partial > 0
+        * M=31 (prime, trip=2, partial=15)         -- largest partial in trip=2
+        * M=79 (prime, trip=5, partial=15)         -- multi-iter, partial=15
         """
 
         @helion.kernel(backend="pallas", static_shapes=True)
