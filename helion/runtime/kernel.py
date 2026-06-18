@@ -44,6 +44,7 @@ from .._compiler.ast_extension import unparse
 from .._compiler.autotuner_heuristics import compiler_seed_configs
 from .._compiler.compile_environment import CompileEnvironment
 from .._compiler.compile_environment import TensorDescriptorLayoutGuard
+from .._compiler.compile_environment import _symint_free_symbols
 from .._compiler.compile_environment import (
     tensor_descriptor_layout_signature_from_strides,
 )
@@ -661,7 +662,7 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
                 for dim in getattr(arg, "_dynamo_static_indices", ()):
                     size = fake_arg.size(dim)
                     if isinstance(size, torch.SymInt):
-                        self.env.specialized_vars.update(size._sympy_().free_symbols)
+                        self.env.specialized_vars.update(_symint_free_symbols(size))
 
     @property
     def env(self) -> CompileEnvironment:
