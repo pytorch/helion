@@ -846,6 +846,8 @@ class NumericType(TypeInfo):
         self.value = value
 
     def to_sympy(self) -> sympy.Expr:
+        # value may be a SymBool whose `_sympy_()` is a boolean rather than Expr.
+        # pyrefly: ignore [bad-return]
         return self.value._sympy_()
 
     @property

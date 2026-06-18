@@ -88,7 +88,6 @@ def find_block_size_symbols(
     non_block_size_symbols = set()
 
     for symbol in expr.free_symbols:
-        # pyrefly: ignore [no-matching-overload, bad-argument-type]
         origin_info = hf.expr_to_origin.get(symbol)
         if origin_info is None or not isinstance(origin_info.origin, BlockSizeOrigin):
             # pyrefly: ignore [bad-argument-type]
@@ -573,6 +572,8 @@ class DeviceFunction:
 
     def literal_expr(self, expr: object) -> str:
         if isinstance(expr, (torch.SymInt, torch.SymFloat, torch.SymBool)):
+            # SymBool's `_sympy_()` is a boolean, not an Expr that sympy_expr wants.
+            # pyrefly: ignore [bad-argument-type]
             return self.sympy_expr(expr._sympy_())
         if isinstance(expr, sympy.Expr):
             return self.sympy_expr(expr)

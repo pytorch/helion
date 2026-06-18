@@ -7,6 +7,7 @@ import torch
 
 from .._compat import shape_env_size_hint
 from .compile_environment import CompileEnvironment
+from .compile_environment import _symint_sympy_expr
 from .cute.layout import CuTeGridExecutionPlan
 from .device_function import DeviceFunction
 from .device_ir import ForLoopGraphInfo
@@ -180,7 +181,7 @@ class TileStrategyDispatch:
         """Get string representation of a shape"""
         # Extract sympy expression
         if isinstance(shape, torch.SymInt):
-            expr = shape._sympy_()
+            expr = _symint_sympy_expr(shape)
         elif isinstance(shape, sympy.Expr):
             expr = shape
         else:

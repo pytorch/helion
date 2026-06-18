@@ -4659,7 +4659,7 @@ class CuteBackend(Backend):
             ) -> bool:
                 if known_equal is not None:
                     return known_equal(lhs, rhs)
-                return lhs == rhs
+                return bool(lhs == rhs)
 
             nd_block_size = [bs.from_config_assert(config) for bs in block_size_infos]
             original_num_threads_config = list(num_threads_config)
