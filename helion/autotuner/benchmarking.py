@@ -49,10 +49,10 @@ def _make_l2_cache_clearer() -> Callable[[], None]:
     from triton import runtime
 
     active = runtime.driver.active  # type: ignore[attr-defined]
-    cache = active.get_empty_cache_for_benchmark()
+    cache = active.get_empty_cache_for_benchmark()  # type: ignore[attr-defined]
 
     def clear() -> None:
-        active.clear_cache(cache)
+        active.clear_cache(cache)  # type: ignore[attr-defined]
 
     return clear
 
