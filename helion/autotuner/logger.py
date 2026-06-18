@@ -38,6 +38,7 @@ if TYPE_CHECKING:
     from ..runtime.config import Config
     from ..runtime.settings import Settings
     from .base_search import _AutotunableKernel
+    from .ir_features import IrGraphRecord
     from .metrics import KernelMetadata
 
 else:
@@ -116,20 +117,26 @@ class AutotuningLogger:
 
     @contextlib.contextmanager
     def autotune_logging(
-        self, base_path: str | None = None, metadata: KernelMetadata | None = None
+        self,
+        base_path: str | None = None,
+        metadata: KernelMetadata | None = None,
+        ir_graph: IrGraphRecord | None = None,
     ) -> Iterator[AutotuneLogSink | None]:
         """Attach an :class:`AutotuneLogSink` for the duration of a tuning run.
 
-        When ``metadata`` is provided, the kernel identity (source, id, shapes)
-        is written once to the ``<base>.meta.json`` sidecar so the per-config
-        CSV rows can be grouped by kernel across runs.
+        When ``metadata`` is provided, the kernel identity (source, ids, shapes)
+        is appended as one record to the ``<base>.meta.jsonl`` sidecar so the
+        per-config CSV rows can be joined back to it (via ``run_id``) and grouped
+        by kernel (via ``kernel_id``) across runs. When ``ir_graph`` is provided,
+        the device-IR node-link dump is appended to ``<base>.ir.jsonl`` (one
+        record per run, joined on ``run_id``).
         """
 
         path = base_path or self._settings.autotune_log
         if not path:
             yield None
             return
-        with AutotuneLogSink(path, metadata) as sink:
+        with AutotuneLogSink(path, metadata, ir_graph) as sink:
             self._attach_sink(sink)
             sink.start_run()
             try:
@@ -271,6 +278,9 @@ class AutotuneLogEntry(NamedTuple):
     config: Config
     # Stable per-(kernel, config) id: sha256(kernel_source + decorator(config)).
     sample_id: str = ""
+    # The @helion.kernel(...) decorator string that reproduces this config;
+    # the source artifact sample_id is derived from.
+    decorator: str = ""
 
 
 class AutotuneLogSink:
@@ -278,12 +288,19 @@ class AutotuneLogSink:
     Writes autotune results to CSV and connects autotune logs to a file handler.
     """
 
-    def __init__(self, base_path: str, metadata: KernelMetadata | None = None) -> None:
+    def __init__(
+        self,
+        base_path: str,
+        metadata: KernelMetadata | None = None,
+        ir_graph: IrGraphRecord | None = None,
+    ) -> None:
         self._base_path = Path(base_path)
         self.csv_path = self._base_path.with_suffix(".csv")
         self.log_path = self._base_path.with_suffix(".log")
-        self.meta_path = self._base_path.with_suffix(".meta.json")
+        self.meta_path = self._base_path.with_suffix(".meta.jsonl")
+        self.ir_path = self._base_path.with_suffix(".ir.jsonl")
         self._metadata = metadata
+        self._ir_graph = ir_graph
         self._csv_file: io.TextIOWrapper | None = None
         self._csv_writer: CsvWriter | None = None
         self._log_handler: logging.FileHandler | None = None
@@ -308,26 +325,40 @@ class AutotuneLogSink:
         self.csv_path.parent.mkdir(parents=True, exist_ok=True)
         self.log_path.parent.mkdir(parents=True, exist_ok=True)
         if self._metadata is not None:
-            self.meta_path.write_text(
-                json.dumps(self._metadata.to_dict(), indent=2), encoding="utf-8"
-            )
-        self._csv_file = self.csv_path.open("w", encoding="utf-8", newline="")
+            # Append one identity record (JSON Lines) per run so a single log
+            # path can accumulate every (kernel, input shape) autotuned in the
+            # process without clobbering earlier runs. CSV rows join back to
+            # these records via kernel_id.
+            with self.meta_path.open("a", encoding="utf-8") as meta_file:
+                meta_file.write(json.dumps(self._metadata.to_dict()) + "\n")
+        if self._ir_graph is not None:
+            # One device-IR node-link record per run, appended alongside the
+            # meta record; joins back to it (and the CSV rows) on run_id.
+            with self.ir_path.open("a", encoding="utf-8") as ir_file:
+                ir_file.write(json.dumps(self._ir_graph) + "\n")
+        # Append rather than truncate so multiple autotune runs sharing one base
+        # path accumulate; write the header only for a new or empty file.
+        write_header = not self.csv_path.exists() or self.csv_path.stat().st_size == 0
+        self._csv_file = self.csv_path.open("a", encoding="utf-8", newline="")
         self._csv_writer = csv.writer(self._csv_file)
-        self._csv_writer.writerow(
-            [
-                "kernel_id",
-                "sample_id",
-                "timestamp_s",
-                "config_index",
-                "generation",
-                "status",
-                "perf_ms",
-                "compile_time_s",
-                "config",
-            ]
-        )
-        self._csv_file.flush()
-        handler = logging.FileHandler(self.log_path, mode="w", encoding="utf-8")
+        if write_header:
+            self._csv_writer.writerow(
+                [
+                    "run_id",
+                    "kernel_id",
+                    "sample_id",
+                    "timestamp_s",
+                    "config_index",
+                    "generation",
+                    "status",
+                    "perf_ms",
+                    "compile_time_s",
+                    "decorator",
+                    "config",
+                ]
+            )
+            self._csv_file.flush()
+        handler = logging.FileHandler(self.log_path, mode="a", encoding="utf-8")
         handler.setLevel(logging.DEBUG)
         self._log_handler = handler
 
@@ -366,11 +397,14 @@ class AutotuneLogSink:
         compile_field = ""
         if entry.compile_time is not None:
             compile_field = f"{entry.compile_time:.2f}"
-        # kernel_id is the foreign key joining each row back to the kernel
-        # identity stored once in the .meta.json sidecar.
+        # run_id joins each row to exactly one .meta.jsonl record (kernel +
+        # input shape/dtype/hardware); kernel_id is the coarser foreign key that
+        # groups every row for the same kernel across shapes and runs.
+        run_id = self._metadata.run_id if self._metadata is not None else ""
         kernel_id = self._metadata.kernel_id if self._metadata is not None else ""
         self._csv_writer.writerow(
             [
+                run_id,
                 kernel_id,
                 entry.sample_id,
                 timestamp_field,
@@ -379,6 +413,7 @@ class AutotuneLogSink:
                 entry.status,
                 perf_field,
                 compile_field,
+                entry.decorator,
                 str(entry.config),
             ]
         )

@@ -198,7 +198,14 @@ jobs:
 
             # Single pass: autotune search + codegen + compilation happen inline,
             # so --measure-compile-time reports end-to-end user-visible compile time.
-            ${{ inputs.env-vars }} HELION_PRINT_OUTPUT_CODE=1 python benchmarks/run.py \
+            # HELION_AUTOTUNE_LOG is per-kernel so the per-config CSV / .meta.jsonl
+            # sidecars don't clobber across the kernel loop (the sink appends, so
+            # every input shape for this kernel accumulates into one file pair).
+            # --autotune-metrics-json captures the per-run kernel-level summary
+            # (kernel_id, source, shapes, hardware) and is overwrite-safe on its own.
+            ${{ inputs.env-vars }} HELION_PRINT_OUTPUT_CODE=1 \
+            HELION_AUTOTUNE_LOG="$TEST_REPORTS_DIR/autotune-$kernel" \
+            python benchmarks/run.py \
                 --op $kernel \
                 --helion-backend "${{ inputs.backend }}" \
                 --metrics speedup,accuracy,latency \
@@ -213,6 +220,7 @@ jobs:
                 --input-sample-mode equally-spaced-k \
                 --output "$TEST_REPORTS_DIR/helionbench.json" \
                 --append-to-output \
+                --autotune-metrics-json "$TEST_REPORTS_DIR/autotune-metrics-$kernel.json" \
                 --keep-going \
                 ${{ inputs.custom-args }}
 
