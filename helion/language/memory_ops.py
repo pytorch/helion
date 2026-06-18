@@ -324,7 +324,7 @@ def _maybe_get_symbol_origin(idx: object) -> SymbolOrigin | None:
 def _pallas_jagged_flat_store_value_mask(
     state: CodegenState,
     value: ast.AST,
-    value_proxy: torch.Tensor,
+    value_proxy: object,
     subscript: list[object] | tuple[object, ...],
     patterns: list[object] | tuple[object, ...] | None,
     name: str,
@@ -338,11 +338,19 @@ def _pallas_jagged_flat_store_value_mask(
     * Otherwise → mask only jagged-tile axes; non-jagged unaligned cases
       are already covered by ``sliced_value_for_store``.
 
+    Scalar ``value_proxy`` (no ``.size()``) is returned unchanged --
+    masking a scalar makes no sense.  Lets the call site invoke this
+    helper unconditionally without a Tensor-vs-scalar guard at the call
+    site.
+
     ``jnp.where``'s else-branch reads ``jnp.zeros_like(value)`` on HBM /
     per-item-DMA tensors (where ``name[idx_str]`` would fault) and
     ``name[idx_str]`` on VMEM-resident paths so masked-off lanes keep
     their prior contents.
     """
+    if not isinstance(value_proxy, torch.Tensor):
+        return value
+
     from .._compiler.compile_environment import CompileEnvironment
     from .._compiler.device_function import PallasMemorySpace
     from .._compiler.pallas.plan_tiling import JaggedFlatIndexPattern
@@ -461,10 +469,9 @@ def _(state: CodegenState) -> None:
     if not scatter_patterns and state.device_function.carry_tiles:
         if emit_carry_store(state, tensor, subscript, name, idx_str, value):
             return
-    if isinstance(value_proxy, torch.Tensor):
-        value = _pallas_jagged_flat_store_value_mask(
-            state, value, value_proxy, subscript, patterns, name, idx_str, mem_space
-        )
+    value = _pallas_jagged_flat_store_value_mask(
+        state, value, value_proxy, subscript, patterns, name, idx_str, mem_space
+    )
     state.codegen.add_statement(
         statement_from_string(f"{name}[{idx_str}] = {{value}}", value=value)
     )

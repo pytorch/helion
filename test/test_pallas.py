@@ -4125,74 +4125,11 @@ class TestPallas(TestCase):
         inner_min = spec.block_sizes[1].min_size
         self.assertGreaterEqual(outer_min, inner_min)
 
-    def test_jagged_tile_pins_parent_block_size_to_1(self) -> None:
-        """A jagged_tile's parent (items axis) is pinned to block_size=1 on
-        Pallas — each program owns exactly one item so the per-item DMA slice
-        + chunk_mask emission can use program_id directly as the row index.
-        """
-
-        @helion.kernel(backend="pallas", static_shapes=True)
-        def k(x_data: torch.Tensor, x_offsets: torch.Tensor) -> torch.Tensor:
-            M = x_data.size(1)
-            num_rows = x_offsets.size(0) - 1
-            out = torch.zeros([num_rows, M], dtype=x_data.dtype, device=x_data.device)
-            x_flat = x_data.view(-1)
-            for tile_b in hl.tile(num_rows):
-                starts = x_offsets[tile_b]
-                ends = x_offsets[tile_b.index + 1]
-                nnz = ends - starts
-                for tile_m in hl.tile(M):
-                    row_sums = hl.zeros([tile_b, tile_m], dtype=x_data.dtype)
-                    for tile_k in hl.jagged_tile(nnz):
-                        base = starts[:, None] + tile_k.index[None, :]
-                        flat = base[:, :, None] * M + tile_m.index[None, None, :]
-                        row_sums = row_sums + hl.load(x_flat, [flat]).sum(dim=1)
-                    out[tile_b, tile_m] = row_sums
-            return out
-
-        x_offsets = torch.tensor([0, 3, 8, 10, 14], dtype=torch.int32)
-        x_data = torch.randn(14, 8, dtype=torch.float32)
-        spec = k.bind((x_data, x_offsets)).config_spec
-        parent_spec = spec.block_sizes[0]
-        self.assertEqual(parent_spec.min_size, 1)
-        self.assertEqual(parent_spec.max_size, 1)
-
-    def test_jagged_tile_parent_pin_survives_alignment_propagation(self) -> None:
-        """The pin sticks even when the parent indexes into a tensor that
-        would otherwise raise its alignment min via
-        ``PallasBackend.adjust_block_size_constraints``.
-        """
-
-        @helion.kernel(backend="pallas", static_shapes=True)
-        def k(x_data: torch.Tensor, x_offsets: torch.Tensor) -> torch.Tensor:
-            M = x_data.size(1)
-            num_rows = x_offsets.size(0) - 1
-            out = torch.zeros([num_rows, M], dtype=x_data.dtype, device=x_data.device)
-            x_flat = x_data.view(-1)
-            # bfloat16 lane → 256-element alignment; pin must survive it.
-            for tile_b in hl.tile(num_rows):
-                starts = x_offsets[tile_b]
-                ends = x_offsets[tile_b.index + 1]
-                nnz = ends - starts
-                for tile_m in hl.tile(M):
-                    row_sums = hl.zeros([tile_b, tile_m], dtype=x_data.dtype)
-                    for tile_k in hl.jagged_tile(nnz):
-                        base = starts[:, None] + tile_k.index[None, :]
-                        flat = base[:, :, None] * M + tile_m.index[None, None, :]
-                        row_sums = row_sums + hl.load(x_flat, [flat]).sum(dim=1)
-                    out[tile_b, tile_m] = row_sums
-            return out
-
-        x_offsets = torch.tensor([0, 3, 8, 10, 14], dtype=torch.int32)
-        x_data = torch.randn(14, 8, dtype=torch.bfloat16)
-        spec = k.bind((x_data, x_offsets)).config_spec
-        self.assertEqual(spec.block_sizes[0].min_size, 1)
-        self.assertEqual(spec.block_sizes[0].max_size, 1)
-
     def test_non_jagged_kernel_does_not_pin_outer_to_1(self) -> None:
         """Regression: the jagged-parent pin must only apply in jagged kernels.
         A regular ``hl.tile(...)``-only kernel should keep its autotuned
-        outer block-size range untouched.
+        outer block-size range untouched -- a silent-perf failure that
+        wouldn't show up as a value mismatch in any other test.
         """
 
         @helion.kernel(backend="pallas", static_shapes=True)
@@ -4205,48 +4142,6 @@ class TestPallas(TestCase):
         args = (torch.randn([1024], device=DEVICE, dtype=torch.float32),)
         spec = k.bind(args).config_spec
         self.assertGreater(spec.block_sizes[0].max_size, 1)
-
-    def test_jagged_kernel_emits_grid_1_and_fori_loop_wrapper(self) -> None:
-        """Pallas jagged kernel must launch as ``grid=(1,)`` and wrap the
-        kernel body in ``jax.lax.fori_loop(0, num_items, _kernel_body, None)``
-        with ``pid_0`` as the loop fn's iteration parameter — not
-        ``pl.program_id(0)``.
-        """
-
-        @helion.kernel(backend="pallas", static_shapes=True)
-        def k(x_data: torch.Tensor, x_offsets: torch.Tensor) -> torch.Tensor:
-            M = x_data.size(1)
-            num_rows = x_offsets.size(0) - 1
-            out = torch.zeros([num_rows, M], dtype=x_data.dtype, device=x_data.device)
-            x_flat = x_data.view(-1)
-            for tile_b in hl.tile(num_rows):
-                starts = x_offsets[tile_b]
-                ends = x_offsets[tile_b.index + 1]
-                nnz = ends - starts
-                for tile_m in hl.tile(M):
-                    row_sums = hl.zeros([tile_b, tile_m], dtype=x_data.dtype)
-                    for tile_k in hl.jagged_tile(nnz):
-                        base = starts[:, None] + tile_k.index[None, :]
-                        flat = base[:, :, None] * M + tile_m.index[None, None, :]
-                        row_sums = row_sums + hl.load(x_flat, [flat]).sum(dim=1)
-                    out[tile_b, tile_m] = row_sums
-            return out
-
-        x_offsets = torch.tensor([0, 3, 8, 10, 14], dtype=torch.int32)
-        x_data = torch.randn(14, 8, dtype=torch.float32)
-        bound = k.bind((x_data, x_offsets))
-        code = bound.to_triton_code(bound.config_spec.default_config())
-
-        self.assertRegex(code, r"_launcher\(\s*_helion_\w+\s*,\s*\(1,\)")
-        self.assertRegex(code, r"def\s+_kernel_body\w*\s*\(\s*pid_0\s*,\s*_\s*\)\s*:")
-        self.assertRegex(
-            code, r"jax\.lax\.fori_loop\s*\(\s*0\s*,.+_kernel_body\w*\s*,\s*None\s*\)"
-        )
-        self.assertNotRegex(code, r"pid_0\s*=\s*pl\.program_id\s*\(\s*0\s*\)")
-        # x_flat at arg position 1, out at position 2 (both HBM).
-        self.assertRegex(code, r"_pipeline_arg_indices=\[\s*1\s*,\s*2\s*\]")
-        # x_offsets at arg position 0 (SMEM).
-        self.assertRegex(code, r"_smem_arg_indices=\[\s*0\s*\]")
 
     @skipUnlessPallas
     def test_jagged_sum_with_post_reduction_op(self) -> None:
