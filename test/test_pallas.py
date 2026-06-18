@@ -4189,16 +4189,12 @@ class TestPallas(TestCase):
     def test_jagged_sum_with_post_reduction_op_fp32_narrow(self) -> None:
         """fp32 at extreme narrow M (M=1).
 
-        Same offsets as the wide variants.  At M=1 the per-row byte width
-        is 4 bytes -- much narrower than the bf16 / fp8 narrow xfails.
-        No xfail decorator: outcome decides between two hypotheses for
-        the constraint underlying the narrow xfails:
-
-        * If this passes -- fp32 sneaks through regardless of row width,
-          and the constraint is bound to Mosaic's per-dtype tile choice
-          (fp32 tile dim 0 = 1 -> check is trivially satisfied).
-        * If this fails with the same Mosaic alignment error -- the
-          constraint is universal in row width and fp32 is not special.
+        Same offsets as the wide variants.  Empirically passes on real
+        TPU even at the smallest M, confirming that the bf16 / fp8
+        narrow xfails are bound to Mosaic's per-dtype tile choice
+        (packed-dtype tile dim 0 > 1 -> the check fires on non-aligned
+        offsets; fp32 tile dim 0 = 1 -> trivially satisfied), not to
+        a universal row-width constraint.
         """
 
         @helion.kernel(backend="pallas", static_shapes=True)
