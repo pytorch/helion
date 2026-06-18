@@ -56,7 +56,7 @@ jobs:
       - name: Install PyTorch (CPU nightly)
         run: |
           source .venv/bin/activate
-          uv pip install -U --pre "torch==2.14.0.dev20260616+cpu" --index-url https://download.pytorch.org/whl/nightly/cpu
+          uv pip install -U --pre "torch==2.13.0.dev20260610+cpu" --index-url https://download.pytorch.org/whl/nightly/cpu
 
       - name: Install Helion
         run: |
