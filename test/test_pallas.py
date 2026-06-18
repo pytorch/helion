@@ -4174,7 +4174,12 @@ class TestPallas(TestCase):
         torch.manual_seed(0)
         x_offsets = torch.tensor([0, 3, 8, 10, 14], dtype=torch.int32, device=DEVICE)
         x_data = torch.randn(14, 8, dtype=torch.float32, device=DEVICE)
-        result = k(x_data, x_offsets)
+        _code, result = code_and_output(
+            k,
+            (x_data, x_offsets),
+            block_sizes=[1, 8, 16],
+            pallas_loop_type="fori_loop",
+        )
 
         expected = torch.zeros_like(result)
         for i in range(x_offsets.numel() - 1):
@@ -4217,7 +4222,12 @@ class TestPallas(TestCase):
         torch.manual_seed(0)
         x_offsets = torch.tensor([0, 3, 8, 10, 14], dtype=torch.int32, device=DEVICE)
         x_data = torch.randn(14, 1, dtype=torch.float32, device=DEVICE)
-        result = k(x_data, x_offsets)
+        _code, result = code_and_output(
+            k,
+            (x_data, x_offsets),
+            block_sizes=[1, 1, 16],
+            pallas_loop_type="fori_loop",
+        )
 
         expected = torch.zeros_like(result)
         for i in range(x_offsets.numel() - 1):
@@ -4260,7 +4270,12 @@ class TestPallas(TestCase):
         torch.manual_seed(0)
         x_offsets = torch.tensor([0, 3, 8, 10, 14], dtype=torch.int32, device=DEVICE)
         x_data = torch.randn(14, 16, dtype=torch.bfloat16, device=DEVICE)
-        result = k(x_data, x_offsets)
+        _code, result = code_and_output(
+            k,
+            (x_data, x_offsets),
+            block_sizes=[1, 16, 16],
+            pallas_loop_type="fori_loop",
+        )
 
         expected = torch.zeros_like(result)
         for i in range(x_offsets.numel() - 1):
@@ -4301,7 +4316,12 @@ class TestPallas(TestCase):
         torch.manual_seed(0)
         x_offsets = torch.tensor([0, 3, 8, 10, 14], dtype=torch.int32, device=DEVICE)
         x_data = torch.randn(14, 8, dtype=torch.bfloat16, device=DEVICE)
-        result = k(x_data, x_offsets)
+        _code, result = code_and_output(
+            k,
+            (x_data, x_offsets),
+            block_sizes=[1, 8, 16],
+            pallas_loop_type="fori_loop",
+        )
 
         expected = torch.zeros_like(result)
         for i in range(x_offsets.numel() - 1):
@@ -4343,7 +4363,12 @@ class TestPallas(TestCase):
         x_offsets = torch.tensor([0, 3, 8, 10, 14], dtype=torch.int32, device=DEVICE)
         # fp8 narrow representable range; scale before cast.
         x_data = (torch.randn(14, 32, device=DEVICE) * 0.5).to(torch.float8_e4m3fn)
-        result = k(x_data, x_offsets)
+        _code, result = code_and_output(
+            k,
+            (x_data, x_offsets),
+            block_sizes=[1, 32, 16],
+            pallas_loop_type="fori_loop",
+        )
 
         expected = torch.zeros_like(result)
         for i in range(x_offsets.numel() - 1):
@@ -4391,7 +4416,12 @@ class TestPallas(TestCase):
         torch.manual_seed(0)
         x_offsets = torch.tensor([0, 3, 8, 10, 14], dtype=torch.int32, device=DEVICE)
         x_data = (torch.randn(14, 8, device=DEVICE) * 0.5).to(torch.float8_e4m3fn)
-        result = k(x_data, x_offsets)
+        _code, result = code_and_output(
+            k,
+            (x_data, x_offsets),
+            block_sizes=[1, 8, 16],
+            pallas_loop_type="fori_loop",
+        )
 
         expected = torch.zeros_like(result)
         for i in range(x_offsets.numel() - 1):
