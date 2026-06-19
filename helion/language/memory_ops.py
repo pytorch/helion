@@ -256,6 +256,13 @@ def _(state: CodegenState) -> ast.AST:
                 epilogue_subtile_group_id
             ]
         strategy = device_fn.get_indexing_strategy(indexing_idx)
+        cache_modifier = None
+        if state.codegen.on_device:
+            modifier_idx = device_fn.device_store_cache_modifier_index
+            device_fn.device_store_cache_modifier_index += 1
+            modifiers = state.config.store_cache_modifiers
+            if modifier_idx < len(modifiers) and modifiers[modifier_idx]:
+                cache_modifier = ast.Constant(value=modifiers[modifier_idx])
 
         if state.codegen.store_transform is not None:
             return state.codegen.store_transform(
@@ -264,21 +271,33 @@ def _(state: CodegenState) -> ast.AST:
                 [*subscript],
                 value,
                 extra_mask,
+                cache_modifier,
                 strategy.codegen_store,
             )
 
-        return strategy.codegen_store(state, tensor, [*subscript], value, extra_mask)
+        return strategy.codegen_store(
+            state, tensor, [*subscript], value, extra_mask, cache_modifier
+        )
     if isinstance(tensor, tuple):
         from .._compiler.indexing_strategy import StackIndexingStrategy
 
         # Fusion is not supported for stack stores (multi-tensor device pointers);
         # fall through to the unfused path regardless of store_transform.
+        device_fn = state.device_function
+        device_fn.allocate_store_index()
+        cache_modifier = None
+        if state.codegen.on_device:
+            modifier_idx = device_fn.device_store_cache_modifier_index
+            device_fn.device_store_cache_modifier_index += 1
+            modifiers = state.config.store_cache_modifiers
+            if modifier_idx < len(modifiers) and modifiers[modifier_idx]:
+                cache_modifier = ast.Constant(value=modifiers[modifier_idx])
         stack_tensor_ast = state.ast_args[0]
         assert isinstance(stack_tensor_ast, tuple)
         assert len(stack_tensor_ast) == 2
         _tensor_like_ast, dev_ptrs_ast = stack_tensor_ast
         return StackIndexingStrategy.codegen_store(
-            state, tensor, dev_ptrs_ast, [*subscript], value, extra_mask
+            state, tensor, dev_ptrs_ast, [*subscript], value, extra_mask, cache_modifier
         )
     raise NotImplementedError(f"Cannot store to type: {type(tensor)}")
 
@@ -5999,7 +6018,9 @@ def _(state: CodegenState) -> ast.AST:
         indexing_idx = device_fn.device_memory_op_index
         device_fn.device_memory_op_index += 1
         strategy = device_fn.get_indexing_strategy(indexing_idx)
-        return strategy.codegen_store(state, tensor, [*subscript], value, extra_mask)
+        return strategy.codegen_store(
+            state, tensor, [*subscript], value, extra_mask, None
+        )
     raise exc.BackendUnsupported("metal", f"store target type: {type(tensor)}")
 
 

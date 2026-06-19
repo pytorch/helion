@@ -2822,6 +2822,7 @@ def _register_load_store_tunables(
     total_load_count: int,
     loads_without_eviction_policy: int,
     loads_without_cache_modifier: int,
+    stores_without_cache_modifier: int,
     store_indices: list[int],
 ) -> None:
     """Register list-based tunables for device loads and stores.
@@ -2830,6 +2831,7 @@ def _register_load_store_tunables(
         total_load_count: Total number of loads (for indexing tunable)
         loads_without_eviction_policy: Number of loads that need eviction policy tuning
         loads_without_cache_modifier: Number of loads that need cache modifier tuning
+        stores_without_cache_modifier: Number of stores that need cache modifier tuning
         store_indices: Positions of store ops in the combined indexing list
     """
     store_count = len(store_indices)
@@ -2842,6 +2844,7 @@ def _register_load_store_tunables(
     from ..autotuner.config_fragment import ListOf
     from ..autotuner.config_spec import get_valid_eviction_policies
     from ..autotuner.config_spec import get_valid_load_cache_modifiers
+    from ..autotuner.config_spec import get_valid_store_cache_modifiers
 
     # Register eviction policies only for loads without explicit eviction_policy
     if loads_without_eviction_policy > 0:
@@ -2857,6 +2860,15 @@ def _register_load_store_tunables(
         env.config_spec.load_cache_modifiers = ListOf(
             EnumFragment(choices=load_cache_modifier_choices),
             length=loads_without_cache_modifier,
+        )
+
+    # Register cache modifiers for stores when the backend has a non-trivial
+    # search space.
+    store_cache_modifier_choices = get_valid_store_cache_modifiers(env.backend_name)
+    if stores_without_cache_modifier > 0 and len(store_cache_modifier_choices) > 1:
+        env.config_spec.store_cache_modifiers = ListOf(
+            EnumFragment(choices=store_cache_modifier_choices),
+            length=stores_without_cache_modifier,
         )
 
     # Indexing applies to ALL loads and stores
@@ -3021,6 +3033,7 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
             sum(f.eviction_index is not None for f in memory_op_facts),
             # cache_modifier is tuned for every load (no per-load override)
             load_count,
+            sum(f.kind == "store" for f in memory_op_facts),
             [f.indexing_index for f in memory_op_facts if f.kind == "store"],
         )
         _register_atomic_tunables(_count_device_atomics(device_ir))

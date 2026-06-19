@@ -323,6 +323,7 @@ class DeviceFunction:
         self.device_load_index = 0
         self.device_load_cache_modifier_index = 0
         self.device_store_index = 0
+        self.device_store_cache_modifier_index = 0
         # Single counter for both loads and stores for indexing assignment
         self.device_memory_op_index = 0
         self.epilogue_subtile_store_indices: dict[str, int] = {}
