@@ -397,12 +397,14 @@ def default_cute_mma_support(
     supported_impls: tuple[str, ...] = ("universal", "warp", "tcgen05"),
     warp_f16bf16: bool = True,
     tcgen05_f16bf16: bool = True,
+    tcgen05_f8: bool = True,
 ) -> SimpleNamespace:
     """Return a ``get_cute_mma_support()`` mock with tcgen05-on defaults."""
     return SimpleNamespace(
         supported_impls=supported_impls,
         warp_f16bf16=warp_f16bf16,
         tcgen05_f16bf16=tcgen05_f16bf16,
+        tcgen05_f8=tcgen05_f8,
     )
 
 
