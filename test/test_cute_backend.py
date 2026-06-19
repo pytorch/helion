@@ -2231,7 +2231,7 @@ class TestCuteBackend(TestCase):
         block = (32, 1, 1)
         created: list[str] = []
 
-        def make_wrapper(*_args: object) -> str:
+        def make_wrapper(*_args: object, **_kwargs: object) -> str:
             created.append("wrapper")
             return f"wrapper-{len(created)}"
 
@@ -2251,7 +2251,7 @@ class TestCuteBackend(TestCase):
         block = (32, 1, 1)
         created: list[str] = []
 
-        def make_wrapper(*_args: object) -> str:
+        def make_wrapper(*_args: object, **_kwargs: object) -> str:
             created.append("wrapper")
             return f"wrapper-{len(created)}"
 
@@ -2270,7 +2270,7 @@ class TestCuteBackend(TestCase):
         block = (32, 1, 1)
         created: list[str] = []
 
-        def make_wrapper(*_args: object) -> str:
+        def make_wrapper(*_args: object, **_kwargs: object) -> str:
             created.append("wrapper")
             return f"wrapper-{len(created)}"
 
@@ -2580,6 +2580,7 @@ class TestCuteBackend(TestCase):
             _cute_kernel: object,
             schema_key: tuple[tuple[object, ...], ...],
             _block: tuple[int, int, int],
+            num_sm: int | None = None,
         ) -> str:
             created_schema_keys.append(schema_key)
             return f"jit-wrapper-{len(created_schema_keys)}"

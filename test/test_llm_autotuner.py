@@ -312,7 +312,7 @@ class TestLLMGuidedSearch(TestCase):
                 results.append(
                     BenchmarkResult(
                         config=config,
-                        fn=lambda: None,
+                        fn=lambda *args, **kwargs: None,
                         perf=perf,
                         status="ok",
                         compile_time=0.01,
@@ -325,6 +325,12 @@ class TestLLMGuidedSearch(TestCase):
             rebenchmark_descs.append(desc)
             for member in self.population:
                 member.perfs.append(rebench_perf_by_key[repr(member.config)])
+
+        def fake_final_rebenchmark_best(self, best):
+            # The mocked provider hands back no-op benchmark fns, so the real
+            # final-verification rebench would time an empty lambda. Keep the
+            # config selected by the mocked search loop untouched.
+            return best
 
         with (
             patch.object(
@@ -350,6 +356,12 @@ class TestLLMGuidedSearch(TestCase):
                 "rebenchmark_population",
                 autospec=True,
                 side_effect=fake_rebenchmark_population,
+            ),
+            patch.object(
+                LLMGuidedSearch,
+                "final_rebenchmark_best",
+                autospec=True,
+                side_effect=fake_final_rebenchmark_best,
             ),
         ):
             best = search.autotune(skip_cache=True)

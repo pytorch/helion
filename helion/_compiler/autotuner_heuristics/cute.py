@@ -486,6 +486,158 @@ class CuteReductionWideChunkHeuristic(AutotunerHeuristic):
         return Config(**seed)
 
 
+class CuteFlashAttentionHeuristic(AutotunerHeuristic):
+    """Seed ``block_sizes=[1, 128, 128]`` for detected fp16 flash-attention.
+
+    When ``HELION_CUTE_FLASH`` is on (the default), a dense online-softmax
+    attention kernel at [tile_b=1, tile_m=128, tile_n=128], fp16, head_dim in
+    {64, 128} lowers to the fused tcgen05 flash path
+    (``cute_flash.codegen_attention_flash``) -- orders of magnitude faster than
+    the scalar fallback. The flash detector fires at EXACTLY 128x128 tiles, so
+    unless that config is in the autotuner population the fast path is never
+    measured. This seed puts it in generation 0; the search still owns every
+    other knob and benchmarks the seed against the rest, dropping it if the
+    accuracy/compile check ever fails.
+    """
+
+    name = "cute_flash_attention"
+    backend = "cute"
+    promote_seed_to_default = True
+
+    @classmethod
+    def is_eligible(cls, env: CompileEnvironment, device_ir: DeviceIR) -> bool:
+        return env.config_spec.cute_flash_search_enabled
+
+    @classmethod
+    def get_seed_config(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> Config | None:
+        spec = env.config_spec
+        if not spec.cute_flash_search_enabled:
+            return None
+        seed: dict[str, Any] = {"block_sizes": [1, 128, 128]}
+        if spec._cute_flash_small_biased_candidate:
+            from ..cute.cute_flash import FLASH_SMALL_BIASED_KEY
+
+            seed[FLASH_SMALL_BIASED_KEY] = True
+        if spec._cute_flash_requires_ws_overlap:
+            from ..cute.cute_flash import FLASH_TOPOLOGY_KEY
+
+            seed[FLASH_TOPOLOGY_KEY] = "ws_overlap"
+        elif spec._cute_flash_num_kv is not None and spec._cute_flash_num_kv % 2 == 0:
+            from ..cute.cute_flash import FLASH_TOPOLOGY_KEY
+
+            seed[FLASH_TOPOLOGY_KEY] = "fa4"
+            if (
+                not spec._cute_flash_is_causal
+                and spec._cute_flash_head_dim == 64
+                and spec._cute_flash_num_kv >= 64
+            ):
+                from ..cute.cute_flash import FLASH_DISC_PIPE_KEY
+                from ..cute.cute_flash import FLASH_E2E_OFFSET0_KEY
+                from ..cute.cute_flash import FLASH_E2E_OFFSET_KEY
+                from ..cute.cute_flash import FLASH_E2E_SCHEDULE_KEY
+                from ..cute.cute_flash import FLASH_EPI_TMA_KEY
+                from ..cute.cute_flash import FLASH_KV_STAGE_KEY
+                from ..cute.cute_flash import FLASH_PACKED_REDUCE_KEY
+                from ..cute.cute_flash import FLASH_PERSISTENT_KEY
+                from ..cute.cute_flash import FLASH_RESCALE_THRESHOLD_KEY
+                from ..cute.cute_flash import FLASH_S_STAGE_KEY
+                from ..cute.cute_flash import FLASH_SOFTMAX_REGS_KEY
+
+                seed[FLASH_S_STAGE_KEY] = 2
+                seed[FLASH_KV_STAGE_KEY] = 2
+                seed[FLASH_PERSISTENT_KEY] = True
+                seed[FLASH_E2E_SCHEDULE_KEY] = "8/2"
+                seed[FLASH_E2E_OFFSET_KEY] = 1
+                seed[FLASH_E2E_OFFSET0_KEY] = 2
+                seed[FLASH_DISC_PIPE_KEY] = 3
+                seed[FLASH_SOFTMAX_REGS_KEY] = 184
+                seed[FLASH_EPI_TMA_KEY] = False
+                seed[FLASH_RESCALE_THRESHOLD_KEY] = 8.0
+                seed[FLASH_PACKED_REDUCE_KEY] = True
+        if spec._cute_flash_is_causal:
+            if spec._cute_flash_head_dim == 64:
+                from ..cute.cute_flash import FLASH_PACKED_REDUCE_KEY
+
+                seed[FLASH_PACKED_REDUCE_KEY] = True
+            elif spec._cute_flash_head_dim == 128:
+                from ..cute.cute_flash import FLASH_KV_STAGE_KEY
+
+                seed[FLASH_KV_STAGE_KEY] = 2
+        if spec._cute_flash_has_kv_tile_pruning:
+            from ..cute.cute_flash import FLASH_PACKED_REDUCE_KEY
+
+            seed[FLASH_PACKED_REDUCE_KEY] = True
+        return Config(**seed)
+
+
+class CuteFlashAttentionCausalLptHeuristic(AutotunerHeuristic):
+    """Seed best-known causal hd64 LPT swizzle points for large-token rows."""
+
+    name = "cute_flash_attention_causal_lpt"
+    backend = "cute"
+    promote_seed_to_default = True
+
+    @classmethod
+    def is_eligible(cls, env: CompileEnvironment, device_ir: DeviceIR) -> bool:
+        from ..cute.cute_flash import _flash_causal_hd64_seed_num_kv_supported
+
+        spec = env.config_spec
+        num_kv = spec._cute_flash_num_kv
+        return (
+            spec.cute_flash_search_enabled
+            and spec._cute_flash_is_causal
+            and spec._cute_flash_head_dim == 64
+            and _flash_causal_hd64_seed_num_kv_supported(num_kv)
+        )
+
+    @classmethod
+    def get_seed_config(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> Config | None:
+        if not cls.is_eligible(env, device_ir):
+            return None
+
+        from ..cute.cute_flash import FLASH_CAUSAL_LPT_SWIZZLE_KEY
+        from ..cute.cute_flash import FLASH_DISC_PIPE_KEY
+        from ..cute.cute_flash import FLASH_E2E_OFFSET_KEY
+        from ..cute.cute_flash import FLASH_E2E_SCHEDULE_KEY
+        from ..cute.cute_flash import FLASH_EPI_TMA_KEY
+        from ..cute.cute_flash import FLASH_KV_STAGE_KEY
+        from ..cute.cute_flash import FLASH_PACKED_REDUCE_KEY
+        from ..cute.cute_flash import FLASH_PERSISTENT_KEY
+        from ..cute.cute_flash import FLASH_RESCALE_THRESHOLD_KEY
+        from ..cute.cute_flash import FLASH_S_STAGE_KEY
+        from ..cute.cute_flash import FLASH_SOFTMAX_REGS_KEY
+        from ..cute.cute_flash import FLASH_TOPOLOGY_KEY
+        from ..cute.cute_flash import _flash_causal_hd64_seed_params
+
+        spec = env.config_spec
+        num_kv = spec._cute_flash_num_kv
+        assert num_kv is not None
+        e2e_offset, disc_pipe, softmax_regs, lpt_swizzle = (
+            _flash_causal_hd64_seed_params(num_kv)
+        )
+        seed: dict[str, Any] = {"block_sizes": [1, 128, 128]}
+        seed[FLASH_TOPOLOGY_KEY] = "fa4"
+        seed[FLASH_S_STAGE_KEY] = 2
+        seed[FLASH_KV_STAGE_KEY] = 2
+        seed[FLASH_PERSISTENT_KEY] = False
+        seed[FLASH_E2E_SCHEDULE_KEY] = "16/4"
+        seed[FLASH_E2E_OFFSET_KEY] = e2e_offset
+        if num_kv >= 512:
+            seed[FLASH_SOFTMAX_REGS_KEY] = 184
+        elif softmax_regs != 200:
+            seed[FLASH_SOFTMAX_REGS_KEY] = softmax_regs
+        seed[FLASH_DISC_PIPE_KEY] = disc_pipe
+        seed[FLASH_EPI_TMA_KEY] = False
+        seed[FLASH_RESCALE_THRESHOLD_KEY] = 8.0
+        seed[FLASH_PACKED_REDUCE_KEY] = True
+        seed[FLASH_CAUSAL_LPT_SWIZZLE_KEY] = lpt_swizzle
+        return Config(**seed)
+
+
 class CuteTcgen05ClusterM2Heuristic(AutotunerHeuristic):
     name = "cute_tcgen05_cluster_m2"
     backend = "cute"

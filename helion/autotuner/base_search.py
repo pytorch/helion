@@ -35,6 +35,7 @@ from .benchmark_provider import LocalBenchmarkProvider
 from .benchmark_provider import _clone_args
 from .benchmark_provider import _unset_fn
 from .benchmarking import clear_jit_fast_path_caches
+from .benchmarking import do_bench
 from .benchmarking import interleaved_bench
 from .logger import AutotuningLogger
 from .metrics import AutotuneMetrics
@@ -74,6 +75,18 @@ def _warn_dataset_without_log(log: AutotuningLogger) -> None:
 # rebenchmark repeat, which can amplify a single optimistic subprocess timing.
 _SUSPICIOUS_REBENCHMARK_WARMUP = 25
 _SUSPICIOUS_REBENCHMARK_REP = 100
+_FINAL_REBENCHMARK_TOP_K_ENV = "HELION_AUTOTUNE_FINAL_REBENCHMARK_TOP_K"
+_FINAL_REBENCHMARK_TOP_K_DEFAULT = 8
+_FINAL_REBENCHMARK_TARGET_MS_ENV = "HELION_AUTOTUNE_FINAL_REBENCHMARK_TARGET_MS"
+_FINAL_REBENCHMARK_TARGET_MS_DEFAULT = 5000.0
+_FINAL_REBENCHMARK_TARGET_MS_MAX = 60000.0
+_FINAL_REBENCHMARK_ISOLATED_ENV = "HELION_AUTOTUNE_FINAL_REBENCHMARK_ISOLATED"
+_FINAL_REBENCHMARK_PINNED_TOLERANCE_ENV = (
+    "HELION_AUTOTUNE_FINAL_REBENCHMARK_PINNED_TOLERANCE"
+)
+_FINAL_REBENCHMARK_PINNED_TOLERANCE_DEFAULT = 0.0
+_REBENCHMARK_TARGET_MS_DEFAULT = 200.0
+_REBENCHMARK_INTERLEAVED_REPEAT_MAX = 20_000
 
 
 class _HasDeviceAndProcessGroupName(Protocol):
@@ -248,6 +261,9 @@ class BaseSearch(BaseAutotuner):
         self._prepared = False
         self._skip_cache = False
         self._autotune_budget_start: float | None = None
+        self._benchmarked_members: dict[Config, PopulationMember] = {}
+        self._pinned_finalist_configs: set[Config] = set()
+        self._pinned_finalist_members: dict[Config, PopulationMember] = {}
 
     def _prepare(self) -> None:
         """Some initialization deferred until autotuning actually runs.
@@ -914,42 +930,48 @@ class PopulationBasedSearch(BaseSearch):
         Generate initial population using default config, explicit seed configs,
         and cached configs.
 
-        Starts with the default configuration, then adds up to
-        MAX_BEST_AVAILABLE_CONFIGS matching cached configs from previous runs.
-        Explicit seed configs provided by the caller are added ahead of cached
-        configs and are not suppressed by cache-skip settings. No random configs
-        are added. Duplicate configs are discarded.
+        Starts with explicit seed configs, compiler-owned seed configs,
+        caller-provided best-available seeds, and the default configuration,
+        then adds up to MAX_BEST_AVAILABLE_CONFIGS matching cached configs from
+        previous runs. Seeds are tried before the raw default so backend-promoted
+        fast paths (for example CuTe flash attention) are benchmarked first even
+        when the seed is not also promoted to
+        ``ConfigSpec.compiler_default_config``. Explicit seed configs are not
+        suppressed by cache-skip settings. No random configs are added.
 
         Returns:
             A list of unique FlatConfig values for the initial population.
-            Minimum size is 1 (default), plus any valid unique explicit seed configs
-            and up to autotune_best_available_max_configs cached configs.
+            Minimum size is 1 (default), plus any valid unique explicit/compiler
+            seed configs and up to autotune_best_available_max_configs cached
+            configs.
         """
         max_configs = self.settings.autotune_best_available_max_configs
 
         seen: set[Config] = set()
-        default_flat = self.config_gen.default_flat()
-        default_config = self.config_gen.unflatten(default_flat)
-        seen.add(default_config)
-        result: list[FlatConfig] = [default_flat]
-        self.log("Starting with default config")
+        result: list[FlatConfig] = []
+        pinned_configs: set[Config] = set()
 
         # User seed configs are explicit requests, so try them before compiler-owned
-        # seeds and cached configs while still deduplicating normalized configs.
+        # seeds, the raw default, and cached configs while still deduplicating
+        # normalized configs.
         for flat, transferred_config in self.config_gen.user_seed_flat_config_pairs(
             self._autotune_seed_configs(), self.log
         ):
             if transferred_config not in seen:
                 seen.add(transferred_config)
+                pinned_configs.add(transferred_config)
                 result.append(flat)
 
         # Compiler-owned seeds come from ConfigSpec.compiler_seed_configs;
         # they encode backend/compiler heuristics and complement user seed configs.
+        # Keep them before the raw fragment default so expensive fallback defaults
+        # cannot starve a known fast compiler seed in FROM_BEST_AVAILABLE mode.
         for flat, transferred_config in self.config_gen.seed_flat_config_pairs(
             self.log
         ):
             if transferred_config not in seen:
                 seen.add(transferred_config)
+                pinned_configs.add(transferred_config)
                 result.append(flat)
 
         for config in self._best_available_seed_configs:
@@ -958,9 +980,19 @@ class PopulationBasedSearch(BaseSearch):
                 transferred_config = self.config_gen.unflatten(flat)
                 if transferred_config not in seen:
                     seen.add(transferred_config)
+                    pinned_configs.add(transferred_config)
                     result.append(flat)
             except (ValueError, TypeError, KeyError, AssertionError) as e:
                 self.log(f"Failed to transfer explicit seed config: {e}")
+
+        default_flat = self.config_gen.default_flat()
+        default_config = self.config_gen.unflatten(default_flat)
+        if default_config not in seen:
+            seen.add(default_config)
+            pinned_configs.add(default_config)
+            result.append(default_flat)
+        self._pinned_finalist_configs.update(pinned_configs)
+        self.log("Starting with seed/default configs")
 
         cached_entries = self._find_similar_cached_configs(max_configs)
 
@@ -1026,7 +1058,241 @@ class PopulationBasedSearch(BaseSearch):
             member.fn = result.fn
             member.status = result.status
             member.compile_time = result.compile_time
+            self._record_benchmarked_member(member)
         return members
+
+    def _record_benchmarked_member(self, member: PopulationMember) -> None:
+        """Keep successful benchmarked members available for final verification."""
+        if not member.perfs or not math.isfinite(member.perf):
+            return
+        if member.config in self._pinned_finalist_configs:
+            self._record_best_member_for_config(
+                self._pinned_finalist_members, member.config, member
+            )
+        top_k = self._final_rebenchmark_top_k()
+        if top_k <= 1:
+            return
+        self._record_best_member_for_config(
+            self._benchmarked_members, member.config, member
+        )
+        self._prune_benchmarked_members(top_k)
+
+    def _record_best_member_for_config(
+        self,
+        target: dict[Config, PopulationMember],
+        config: Config,
+        member: PopulationMember,
+    ) -> None:
+        existing = target.get(config)
+        if existing is None or self._member_low_water_perf(
+            member
+        ) < self._member_low_water_perf(existing):
+            target[config] = member
+
+    def _prune_benchmarked_members(self, top_k: int) -> None:
+        if len(self._benchmarked_members) <= top_k:
+            return
+        for config, _member in sorted(
+            self._benchmarked_members.items(),
+            key=lambda item: self._member_low_water_perf(item[1]),
+        )[top_k:]:
+            del self._benchmarked_members[config]
+
+    def pin_finalist_config(self, config: Config) -> None:
+        """Always include a seed/default config in final verification if benchmarked."""
+        self._pinned_finalist_configs.add(config)
+
+    def pin_finalist_configs(self, configs: Sequence[Config]) -> None:
+        for config in configs:
+            self.pin_finalist_config(config)
+
+    def _final_rebenchmark_top_k(self) -> int:
+        raw = os.getenv(_FINAL_REBENCHMARK_TOP_K_ENV)
+        if raw is None:
+            return _FINAL_REBENCHMARK_TOP_K_DEFAULT
+        try:
+            return max(0, int(raw))
+        except ValueError:
+            self.log.warning(
+                f"Ignoring invalid {_FINAL_REBENCHMARK_TOP_K_ENV}={raw!r}; "
+                f"using {_FINAL_REBENCHMARK_TOP_K_DEFAULT}."
+            )
+            return _FINAL_REBENCHMARK_TOP_K_DEFAULT
+
+    def _final_rebenchmark_target_ms(self) -> float:
+        raw = os.getenv(_FINAL_REBENCHMARK_TARGET_MS_ENV)
+        if raw is None:
+            return _FINAL_REBENCHMARK_TARGET_MS_DEFAULT
+        try:
+            target_ms = float(raw)
+        except ValueError:
+            self.log.warning(
+                f"Ignoring invalid {_FINAL_REBENCHMARK_TARGET_MS_ENV}={raw!r}; "
+                f"using {_FINAL_REBENCHMARK_TARGET_MS_DEFAULT}."
+            )
+            return _FINAL_REBENCHMARK_TARGET_MS_DEFAULT
+        if not math.isfinite(target_ms):
+            self.log.warning(
+                f"Ignoring non-finite {_FINAL_REBENCHMARK_TARGET_MS_ENV}={raw!r}; "
+                f"using {_FINAL_REBENCHMARK_TARGET_MS_DEFAULT}."
+            )
+            return _FINAL_REBENCHMARK_TARGET_MS_DEFAULT
+        return min(
+            _FINAL_REBENCHMARK_TARGET_MS_MAX,
+            max(_REBENCHMARK_TARGET_MS_DEFAULT, target_ms),
+        )
+
+    def _final_rebenchmark_use_isolated(self) -> bool:
+        from ..runtime.settings import _env_get_bool
+
+        try:
+            return _env_get_bool(_FINAL_REBENCHMARK_ISOLATED_ENV, False)
+        except ValueError:
+            self.log.warning(
+                f"Ignoring invalid {_FINAL_REBENCHMARK_ISOLATED_ENV}="
+                f"{os.getenv(_FINAL_REBENCHMARK_ISOLATED_ENV)!r}; using False."
+            )
+            return False
+
+    def _final_rebenchmark_pinned_tolerance(self) -> float:
+        raw = os.getenv(_FINAL_REBENCHMARK_PINNED_TOLERANCE_ENV)
+        if raw is None:
+            return _FINAL_REBENCHMARK_PINNED_TOLERANCE_DEFAULT
+        try:
+            tolerance = float(raw)
+        except ValueError:
+            self.log.warning(
+                f"Ignoring invalid {_FINAL_REBENCHMARK_PINNED_TOLERANCE_ENV}={raw!r}; "
+                f"using {_FINAL_REBENCHMARK_PINNED_TOLERANCE_DEFAULT}."
+            )
+            return _FINAL_REBENCHMARK_PINNED_TOLERANCE_DEFAULT
+        if not math.isfinite(tolerance) or tolerance < 0:
+            self.log.warning(
+                f"Ignoring invalid {_FINAL_REBENCHMARK_PINNED_TOLERANCE_ENV}={raw!r}; "
+                f"using {_FINAL_REBENCHMARK_PINNED_TOLERANCE_DEFAULT}."
+            )
+            return _FINAL_REBENCHMARK_PINNED_TOLERANCE_DEFAULT
+        return tolerance
+
+    @staticmethod
+    def _repeat_for_target_ms(target_ms: float, best_perf_so_far: float) -> int:
+        if math.isfinite(best_perf_so_far) and best_perf_so_far > 0:
+            base_repeat_float = target_ms / best_perf_so_far
+            base_repeat = (
+                _REBENCHMARK_INTERLEAVED_REPEAT_MAX
+                if not math.isfinite(base_repeat_float)
+                else int(base_repeat_float)
+            )
+        else:
+            base_repeat = 1000
+        return min(_REBENCHMARK_INTERLEAVED_REPEAT_MAX, max(3, base_repeat))
+
+    @staticmethod
+    def _repeat_reference_perf(members: list[PopulationMember]) -> float:
+        finite = [
+            member.perf
+            for member in members
+            if member.perfs and math.isfinite(member.perf) and member.perf > 0
+        ]
+        return max(finite, default=inf)
+
+    @staticmethod
+    def _isolated_rep_ms(target_ms: float, benchmark_timeout_s: int) -> int:
+        timeout_budget_ms = max(1, int(benchmark_timeout_s * 500))
+        rep_ms = min(int(target_ms), timeout_budget_ms)
+        if (capstr := os.getenv("HELION_CAP_REBENCHMARK_REPEAT")) is not None:
+            rep_ms = min(rep_ms, int(capstr))
+        return max(1, rep_ms)
+
+    @staticmethod
+    def _steady_rebenchmark_rep_ms(target_ms: float) -> int:
+        rep_ms = int(target_ms)
+        if (capstr := os.getenv("HELION_CAP_REBENCHMARK_REPEAT")) is not None:
+            rep_ms = min(rep_ms, int(capstr))
+        return max(1, rep_ms)
+
+    @staticmethod
+    def _member_low_water_perf(member: PopulationMember) -> float:
+        finite = [perf for perf in member.perfs if math.isfinite(perf)]
+        return min(finite, default=inf)
+
+    def final_rebenchmark_best(self, best: PopulationMember) -> PopulationMember:
+        """Recheck the best seen configs before returning an autotuned result.
+
+        Generation searches can end on a noisy late measurement, especially when a
+        budget expires mid-generation. Keep a small history of every compiled
+        member and perform one apples-to-apples final verification over the best
+        unique configs observed during the run.
+        """
+        if self._autotune_budget_exceeded():
+            return best
+        top_k = self._final_rebenchmark_top_k()
+        if top_k <= 1:
+            return best
+
+        by_config: dict[Config, PopulationMember] = {}
+        candidates = [
+            *self._pinned_finalist_members.values(),
+            *self._benchmarked_members.values(),
+            *getattr(self, "population", ()),
+            best,
+        ]
+        for member in candidates:
+            if not member.perfs or not math.isfinite(
+                self._member_low_water_perf(member)
+            ):
+                continue
+            existing = by_config.get(member.config)
+            if existing is None or self._member_low_water_perf(
+                member
+            ) < self._member_low_water_perf(existing):
+                by_config[member.config] = member
+
+        pinned = [
+            member
+            for config, member in by_config.items()
+            if config in self._pinned_finalist_configs
+        ]
+        pinned_configs = {member.config for member in pinned}
+        remaining = [
+            member
+            for member in by_config.values()
+            if member.config not in pinned_configs
+        ]
+        finalists = [
+            *pinned,
+            *sorted(remaining, key=self._member_low_water_perf)[:top_k],
+        ]
+        if len(finalists) < 2:
+            return best
+
+        before = min(finalists, key=performance)
+        # Finalists have already survived the normal benchmark path. Measure the
+        # last shortlist with steady per-candidate timing by default so the
+        # selected config matches standalone benchmark replay. If a user
+        # explicitly opts back into isolated finalist timing, keep suspicious
+        # confirmation enabled for the in-process fallback.
+        use_isolated = self._final_rebenchmark_use_isolated()
+        self.rebenchmark(
+            finalists,
+            desc=f"Final verification top {len(finalists)} configs",
+            target_ms=self._final_rebenchmark_target_ms(),
+            use_isolated=use_isolated,
+            confirm_suspicious=use_isolated,
+            use_interleaved=False,
+        )
+        after = min(finalists, key=performance)
+        if pinned:
+            pinned_after = min(pinned, key=performance)
+            tolerance = self._final_rebenchmark_pinned_tolerance()
+            if pinned_after.perf <= after.perf * (1.0 + tolerance):
+                after = pinned_after
+        if after.config != before.config:
+            self.log(
+                "Final verification selected a different config: "
+                f"{before.perf:.4f}ms -> {after.perf:.4f}ms"
+            )
+        return after
 
     def compare(self, a: PopulationMember, b: PopulationMember) -> int:
         """
@@ -1059,7 +1325,14 @@ class PopulationBasedSearch(BaseSearch):
         )
 
     def rebenchmark(
-        self, members: list[PopulationMember], *, desc: str = "Rebenchmarking"
+        self,
+        members: list[PopulationMember],
+        *,
+        desc: str = "Rebenchmarking",
+        target_ms: float = _REBENCHMARK_TARGET_MS_DEFAULT,
+        use_isolated: bool = True,
+        confirm_suspicious: bool = True,
+        use_interleaved: bool = True,
     ) -> None:
         """
         Re-benchmark a list of population members to avoid outliers.
@@ -1071,15 +1344,38 @@ class PopulationBasedSearch(BaseSearch):
         if len(members) < 2:
             return
 
-        # Calculate repeat count based on best performance
-        base_repeat = (
-            int(200 / self.best_perf_so_far)
-            if math.isfinite(self.best_perf_so_far) and self.best_perf_so_far > 0
-            else 1000
+        # Size the in-process repeat from the candidates being rechecked. A
+        # global optimistic outlier can be the reason we are rebenchmarking.
+        repeat = PopulationBasedSearch._repeat_for_target_ms(
+            target_ms, PopulationBasedSearch._repeat_reference_perf(members)
         )
-        repeat = min(1000, max(3, base_repeat))
         if (capstr := os.getenv("HELION_CAP_REBENCHMARK_REPEAT")) is not None:
             repeat = min(repeat, int(capstr))
+        repeat = max(1, repeat)
+
+        if use_isolated and self.settings.autotune_benchmark_fn is None:
+            isolated_timings = self.benchmark_provider.benchmark_isolated(
+                [m.fn for m in members],
+                warmup=1,
+                rep=PopulationBasedSearch._isolated_rep_ms(
+                    target_ms, self.settings.autotune_benchmark_timeout
+                ),
+                desc=desc,
+            )
+            if isolated_timings is not None:
+                new_timings = [
+                    m.perf if timing is None else timing
+                    for m, timing in zip(members, isolated_timings, strict=True)
+                ]
+                new_timings = sync_object(
+                    new_timings, process_group_name=self.kernel.env.process_group_name
+                )
+                for member, timing in zip(members, new_timings, strict=True):
+                    member.perfs.append(timing)
+                    if timing < self.best_perf_so_far:
+                        self.best_perf_so_far = timing
+                return
+
         if len(self.benchmark_provider.mutated_arg_indices) > 0:
             benchmark_args = _clone_args(
                 self.args,
@@ -1089,38 +1385,72 @@ class PopulationBasedSearch(BaseSearch):
         else:
             benchmark_args = self.args
 
-        def make_rebenchmark_callable(member: PopulationMember) -> Callable[[], object]:
+        def make_rebenchmark_callable(
+            member: PopulationMember, *, clear_each_call: bool
+        ) -> Callable[[], object]:
             run_member = functools.partial(member.fn, *benchmark_args)
 
             def wrapped() -> object:
-                try:
+                if clear_each_call:
+                    try:
+                        return run_member()
+                    finally:
+                        clear_jit_fast_path_caches(member.fn, self.log)
+                else:
                     return run_member()
-                finally:
-                    clear_jit_fast_path_caches(member.fn, self.log)
 
             return wrapped
 
-        iterator = [make_rebenchmark_callable(m) for m in members]
         _backend = getattr(getattr(self, "config_spec", None), "backend", None)
-        interleaved_benchmark = (
-            _backend.get_interleaved_bench() if _backend is not None else None
-        ) or interleaved_bench
-        benchmark_function: Callable[..., list[float]] = (
-            self.settings.autotune_benchmark_fn or interleaved_benchmark
-        )
         try:
-            if self.settings.autotune_progress_bar:
-                new_timings = benchmark_function(iterator, repeat=repeat, desc=desc)
+            if use_interleaved or self.settings.autotune_benchmark_fn is not None:
+                iterator = [
+                    make_rebenchmark_callable(m, clear_each_call=True) for m in members
+                ]
+                benchmark_function: Callable[..., list[float]]
+                if self.settings.autotune_benchmark_fn is not None:
+                    benchmark_function = self.settings.autotune_benchmark_fn
+                else:
+                    interleaved_benchmark = (
+                        _backend.get_interleaved_bench()
+                        if _backend is not None
+                        else None
+                    ) or interleaved_bench
+                    benchmark_function = interleaved_benchmark
+                if self.settings.autotune_progress_bar:
+                    new_timings = benchmark_function(iterator, repeat=repeat, desc=desc)
+                else:
+                    new_timings = benchmark_function(iterator, repeat=repeat)
             else:
-                new_timings = benchmark_function(iterator, repeat=repeat)
+                iterator = [
+                    make_rebenchmark_callable(m, clear_each_call=False) for m in members
+                ]
+                steady_bench = (
+                    _backend.get_do_bench() if _backend is not None else None
+                ) or do_bench
+                rep_ms = self._steady_rebenchmark_rep_ms(target_ms)
+                warmup_ms = min(1000, rep_ms)
+                new_timings = []
+                for fn in iterator:
+                    timing = steady_bench(
+                        fn,
+                        warmup=warmup_ms,
+                        rep=rep_ms,
+                        return_mode="median",
+                        process_group_name=self.kernel.env.process_group_name,
+                    )
+                    if isinstance(timing, tuple):
+                        timing = timing[0]
+                    new_timings.append(float(timing))
         finally:
             for m in members:
                 clear_jit_fast_path_caches(m.fn, self.log)
-        new_timings = self._confirm_suspicious_rebenchmark_timings(
-            members,
-            new_timings,
-            desc=desc,
-        )
+        if confirm_suspicious:
+            new_timings = self._confirm_suspicious_rebenchmark_timings(
+                members,
+                new_timings,
+                desc=desc,
+            )
         new_timings = sync_object(
             new_timings, process_group_name=self.kernel.env.process_group_name
         )
@@ -1377,14 +1707,16 @@ class PopulationBasedSearch(BaseSearch):
         return best_member
 
     def _finalize(self) -> Config:
-        """Finishing phase + final-pick re-rank; return the chosen config.
+        """Final verification, finishing phase, and final-pick re-rank.
 
         Shared tail of the search ``_autotune`` methods; the final-pick re-rank
         runs only on TPU/Pallas (see ``_final_pick_supported``).
         """
-        best = self.run_finishing_phase(self.best, self.finishing_rounds)
+        best = self.final_rebenchmark_best(self.best)
+        best = self.run_finishing_phase(best, self.finishing_rounds)
         if self._final_pick_supported():
             best = self.run_final_pick_verification(best)
+        self.best = best
         return best.config
 
     def _resolve_device_micros_paired_bench(
