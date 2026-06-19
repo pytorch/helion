@@ -2434,6 +2434,27 @@ def _cute_combined_mask(
             )
         return tile_terms
 
+    def tensor_index_bounds_term(pos: int, tensor_dim: int) -> str | None:
+        if tensor is None or tensor_dim >= tensor.ndim:
+            return None
+        ast_args = state.ast_args
+        if not (
+            isinstance(ast_args, list)
+            and len(ast_args) > 1
+            and isinstance(ast_args[1], (list, tuple))
+            and len(ast_args[1]) == len(subscript)
+            and isinstance(ast_args[1][pos], ast.AST)
+        ):
+            return None
+        index_var = state.codegen.lift(
+            ast_args[1][pos],
+            dce=True,
+            prefix="index_mask",
+        ).id
+        index_dtype = env.backend.dtype_str(env.index_dtype)
+        dim_size = _cute_tensor_dim_size_expr(state, tensor, tensor_dim)
+        return f"{index_dtype}({index_var}) < {dim_size}"
+
     if extra_mask is not None:
         terms.append(state.codegen.lift(extra_mask, dce=True, prefix="mask").id)
 
@@ -2468,6 +2489,7 @@ def _cute_combined_mask(
                     block_id = bid
                     break
         elif isinstance(idx, torch.Tensor):
+            added_tensor_index_mask = False
             # A free ``hl.arange`` mapped onto a synthetic thread axis carries no
             # block id, so the loops below add no bound for it. Emit its lane
             # bound explicitly to mask the out-of-bounds lanes a wider sibling
@@ -2503,10 +2525,17 @@ def _cute_combined_mask(
                             continue
                         mask_var = mask_var_for_block_id(bid)
                         if mask_var is not None:
+                            added_tensor_index_mask = True
                             seen.add(bid)
                             if mask_var not in terms:
                                 terms.append(mask_var)
                             break
+                if (
+                    not added_tensor_index_mask
+                    and (bound := tensor_index_bounds_term(pos, tensor_dim)) is not None
+                ):
+                    if bound not in terms:
+                        terms.append(bound)
                 tensor_dim += 1
                 continue
             for dim_size in idx.shape:
@@ -2515,12 +2544,19 @@ def _cute_combined_mask(
                         continue
                     mask_var = mask_var_for_block_id(bid)
                     if mask_var is not None:
+                        added_tensor_index_mask = True
                         seen.add(bid)
                         if mask_var not in terms:
                             terms.append(mask_var)
                         break
                 else:
                     continue
+            if (
+                not added_tensor_index_mask
+                and (bound := tensor_index_bounds_term(pos, tensor_dim)) is not None
+            ):
+                if bound not in terms:
+                    terms.append(bound)
             tensor_dim += 1
             continue
         else:

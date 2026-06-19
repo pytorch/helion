@@ -44,7 +44,9 @@ from .cute.matmul_utils import cute_resolve_active_matmul_k_block_id
 from .cute.matmul_utils import cute_static_k_invariant_extent
 from .cute.matmul_utils import cute_static_mn_collapse_n_block_id
 from .cute.matmul_utils import cute_static_serial_matmul_k_extent
+from .cute.matmul_utils import cute_synthetic_lane_k_extent
 from .cute.matmul_utils import emit_cute_serial_scalar_mm_from_loads
+from .cute.matmul_utils import emit_cute_synthetic_lane_fold_mm
 from .cute.strategies import is_pure_matmul_role_lifecycle_config
 from .cute.tcgen05_constants import TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY
 from .matmul_utils import _emit_pallas_matmul
@@ -1249,6 +1251,25 @@ def codegen_mm_cute(ctx: LoweringContext, node: Node) -> ast.AST:
         )
     if _requested_tcgen05_flat_role_coordinates(ctx):
         _reject_tcgen05_flat_role_coordinates_fallback()
+    lane_fold_k = cute_synthetic_lane_k_extent(ctx.cg, k_block_id)
+    if lane_fold_k is not None:
+        fold_result = emit_cute_synthetic_lane_fold_mm(
+            ctx,
+            lhs_node,
+            rhs_node,
+            k_extent=lane_fold_k,
+            acc=None,
+            out_dtype=effective_out_dtype,
+            acc_dtype=None,
+            lhs_dtype=lhs_node.meta["val"].dtype,
+            rhs_dtype=rhs_node.meta["val"].dtype,
+        )
+        if fold_result is not None:
+            return fold_result
+        raise exc.BackendUnsupported(
+            "cute",
+            "CuTe synthetic-lane K matmul fold only supports direct-load operands",
+        )
     return _emit_cute_matmul(
         ctx.cg,
         lhs,
@@ -1329,6 +1350,25 @@ def codegen_addmm_cute(ctx: LoweringContext, node: Node) -> ast.AST:
         raise exc.BackendUnsupported(
             "cute",
             "CuTe scalar matmul fallback requires an active K tile or a K-invariant static shortcut",
+        )
+    lane_fold_k = cute_synthetic_lane_k_extent(ctx.cg, k_block_id)
+    if lane_fold_k is not None:
+        fold_result = emit_cute_synthetic_lane_fold_mm(
+            ctx,
+            lhs_node,
+            rhs_node,
+            k_extent=lane_fold_k,
+            acc=acc,
+            out_dtype=node.meta["val"].dtype if "val" in node.meta else None,
+            acc_dtype=acc_node.meta["val"].dtype,
+            lhs_dtype=lhs_node.meta["val"].dtype,
+            rhs_dtype=rhs_node.meta["val"].dtype,
+        )
+        if fold_result is not None:
+            return fold_result
+        raise exc.BackendUnsupported(
+            "cute",
+            "CuTe synthetic-lane K matmul fold only supports direct-load operands",
         )
     return _emit_cute_matmul(
         ctx.cg,
@@ -1571,6 +1611,25 @@ def codegen_baddbmm_cute(ctx: LoweringContext, node: Node) -> ast.AST:
     )
     if n_collapse_result is not None:
         return n_collapse_result
+    lane_fold_k = cute_synthetic_lane_k_extent(ctx.cg, k_block_id)
+    if lane_fold_k is not None:
+        fold_result = emit_cute_synthetic_lane_fold_mm(
+            ctx,
+            lhs_node,
+            rhs_node,
+            k_extent=lane_fold_k,
+            acc=acc,
+            out_dtype=node.meta["val"].dtype if "val" in node.meta else None,
+            acc_dtype=acc_node.meta["val"].dtype,
+            lhs_dtype=lhs_node.meta["val"].dtype,
+            rhs_dtype=rhs_node.meta["val"].dtype,
+        )
+        if fold_result is not None:
+            return fold_result
+        raise exc.BackendUnsupported(
+            "cute",
+            "CuTe synthetic-lane K matmul fold only supports direct-load operands",
+        )
     return _emit_cute_matmul(
         ctx.cg,
         lhs,
