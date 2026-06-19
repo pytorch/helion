@@ -33,7 +33,7 @@ from torch.cuda import OutOfMemoryError as CudaOOMError
 from helion._dist_utils import is_master_rank
 
 if TYPE_CHECKING:
-    from _csv import _writer as CsvWriter
+    from _csv import Writer as CsvWriter
 
     from ..runtime.config import Config
     from ..runtime.settings import Settings
