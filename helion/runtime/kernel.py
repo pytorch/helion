@@ -665,7 +665,7 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
                         self.env.specialized_vars.update(_symint_free_symbols(size))
 
     @property
-    def env(self) -> CompileEnvironment:
+    def env(self) -> CompileEnvironment:  # pyrefly: ignore[bad-override]
         return self._env
 
     @property

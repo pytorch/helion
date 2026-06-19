@@ -2126,7 +2126,7 @@ def _pallas_compile_compact_jit_fn(
         num_work = metadata.num_work  # type: ignore[attr-defined]
         scalar_prefetch = [getattr(metadata, f) for f in metadata_fields]
         call = pl.pallas_call(  # type: ignore[union-attr]
-            reordered_kernel,
+            reordered_kernel,  # pyrefly: ignore[bad-argument-type]
             out_shape=out_shape_arg,
             grid_spec=pltpu.PrefetchScalarGridSpec(  # type: ignore[union-attr]
                 num_scalar_prefetch=num_scalar_prefetch,

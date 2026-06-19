@@ -849,7 +849,7 @@ class Backend(abc.ABC):
         )
 
         if block_size_infos[0].is_flattened(config):
-            block_size = functools.reduce(
+            block_size = functools.reduce(  # pyrefly: ignore[incompatible-overload-residual]
                 operator.mul, [bs.from_config_assert(config) for bs in block_size_infos]
             )
             return FlattenedTileStrategy(
@@ -4864,7 +4864,7 @@ class CuteBackend(Backend):
                 inactive_block_ids=inactive_block_ids,
             )
         nd_block_size = [bs.from_config_assert(config) for bs in block_size_infos]
-        block_size = functools.reduce(operator.mul, nd_block_size)
+        block_size = functools.reduce(operator.mul, nd_block_size)  # pyrefly: ignore[incompatible-overload-residual]
         # Resolve per-axis thread counts then flatten to a single total
         all_auto = all(nt <= 0 for nt in num_threads_config)
         flat_num_threads = functools.reduce(

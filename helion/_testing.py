@@ -1286,6 +1286,7 @@ def run_example(
                     )
 
                     if baseline_grad is not None:
+                        assert tensor.grad is not None
                         torch.testing.assert_close(
                             tensor.grad.to(torch.float32),
                             baseline_grad.to(torch.float32),

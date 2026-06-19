@@ -61,7 +61,7 @@ RUN python -m pip install \
         jax \
         packaging \
         pytest-xdist \
-        pyrefly==0.51.1 \
+        pyrefly==1.1.1 \
         ruff==0.15.0 && \
     if [ -d .git ]; then \
         pre-commit install-hooks; \
