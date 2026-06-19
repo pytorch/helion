@@ -2504,7 +2504,21 @@ def _codegen_fori_loop(state: CodegenState) -> object:
                         )
                         assert sl_bs_var is not None
                         sl_dim_idx = dim_idx_exprs[sublane_idx]
-                        numel_expr = _get_loop_numel(state, sublane_idx)
+                        # Per-row nnz comes from the same lifted jagged-tile
+                        # parent that strategy._setup_mask consults
+                        # (state.ast_args[3][0]); the original mask was
+                        # ``offset[None, :] < nnz[:, None]`` (broadcast to
+                        # ``(B_block, BK)``) and downstream code does
+                        # ``mask[:, :, None]``, so we must preserve that
+                        # shape.
+                        jagged_parents_ast = state.ast_args[3]
+                        assert isinstance(jagged_parents_ast, list)
+                        nnz_ast = jagged_parents_ast[0]
+                        nnz_str = (
+                            ast.unparse(nnz_ast)
+                            if isinstance(nnz_ast, ast.AST)
+                            else str(nnz_ast)
+                        )
                         offset_inline = state.device_function.new_var(
                             f"_jagged_sublane_offset_{jpat.sublane_bid}"
                         )
@@ -2516,9 +2530,9 @@ def _codegen_fori_loop(state: CodegenState) -> object:
                         )
                         state.codegen.add_statement(
                             statement_from_string(
-                                f"{mask_var} = ({offset_inline} >= {head_pad_var})"
-                                f" & ({offset_inline} < ({numel_expr})"
-                                f" + {head_pad_var})"
+                                f"{mask_var} = ({offset_inline}[None, :] >="
+                                f" {head_pad_var}) & ({offset_inline}[None, :]"
+                                f" < ({nnz_str} + {head_pad_var})[:, None])"
                             )
                         )
                     axis_offset = (
