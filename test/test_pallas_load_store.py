@@ -309,6 +309,36 @@ class TestPallasJaggedCarryBmm(TestCase):
         )
         torch.testing.assert_close(out, jagged * 2)
 
+    @xfailIfPallasInterpret(_XFAIL_INTERPRET)
+    def test_dynamic_rows_specialized_cols(self) -> None:
+        # static_shapes=False: the carry compiles once; grid is the runtime group count.
+        @helion.kernel(backend="pallas", static_shapes=False)
+        def jagged_scale_dyn(
+            seq_offsets: torch.Tensor, jagged: torch.Tensor
+        ) -> torch.Tensor:
+            L, D = jagged.shape
+            D = hl.specialize(D)
+            B = seq_offsets.shape[0] - 1
+            out = torch.empty((L, D), dtype=jagged.dtype, device=jagged.device)
+            for g in hl.grid(B):
+                s = seq_offsets[g]
+                e = seq_offsets[g + 1]
+                for st in hl.tile(s, e):
+                    for dt in hl.tile(0, D):
+                        out[st, dt] = jagged[st, dt] * 2.0
+            return out
+
+        seq_offsets = torch.tensor([0, 13, 25], dtype=torch.int32, device=DEVICE)
+        jagged = torch.randn((25, 128), dtype=torch.bfloat16, device=DEVICE)
+        code, out = code_and_output(
+            jagged_scale_dyn,
+            (seq_offsets, jagged),
+            block_sizes=[16, 128],
+            pallas_loop_type="emit_pipeline",
+        )
+        self.assertIn("(B,)", code)
+        torch.testing.assert_close(out, jagged * 2)
+
 
 @onlyBackends(["pallas"])
 @skipUnlessPallas("JAX/Pallas TPU not available")
