@@ -2246,6 +2246,30 @@ def _classify_pipelined_tensors(
     return all_tensor_info, vmem_shapes, pipelined_ids
 
 
+def _jagged_flat_dtype_align(dtype: torch.dtype) -> int:
+    """Required DMA-offset alignment on the sublane dim of an HBM tile,
+    in elements, for the per-item jagged-flat read.  Mosaic's
+    ``tpu.memref_slice`` verifier rejects offsets that aren't statically
+    provable as multiples of the source memref's ``first_tile.dimension
+    (0)`` (jaxlib/mosaic/dialect/tpu/tpu_ops.cc:275); the layout for
+    bf16/fp16 is ``tiled<(8,128)(2,1)>`` on older Mosaic builds and
+    ``tiled<(4,128)(2,1)>`` on newer linear-layout builds, and for fp8/
+    int8 it is ``tiled<(32,128)>``.  We over-assert to 8 for bf16/fp16
+    (satisfies both builds) and 32 for fp8/int8.  fp32 uses ``tiled<(1,
+    128)>`` so the requirement is trivially met.
+    """
+    if dtype in (torch.bfloat16, torch.float16):
+        return 8
+    if dtype in (
+        torch.float8_e4m3fn,
+        torch.float8_e5m2,
+        torch.int8,
+        torch.uint8,
+    ):
+        return 32
+    return 1
+
+
 def _codegen_fori_loop(state: CodegenState) -> object:
     """Emit inner device loops using jax.lax.fori_loop.
 
@@ -2443,7 +2467,65 @@ def _codegen_fori_loop(state: CodegenState) -> object:
                     starts_name = ast.unparse(outer_ast)
                 else:
                     starts_name = sublane_base_fx.name
-                axis_offset = f"{starts_name}[0] + ({axis_offset})"
+                starts_scalar = f"{starts_name}[0]"
+                # Mosaic's tpu.memref_slice verifier rejects unaligned
+                # offsets on tiled dims (tpu_ops.cc:275).  starts[0] is a
+                # data-dependent SMEM scalar, so we round it DOWN to the
+                # dtype tile and assert that via pl.multiple_of.  The DMA
+                # now over-reads up to (align - 1) rows at the HEAD of
+                # the row (positions [aligned_start, starts[0])); we
+                # discard them by extending the tile_k mask to (offset
+                # >= head_pad) & (offset < head_pad + nnz) -- the upper
+                # bound also subsumes the existing tail over-read mask
+                # past ``ends``.  fp32 has align=1, so we skip.
+                align = _jagged_flat_dtype_align(fake.dtype)
+                if align > 1 and jpat.sublane_bid in block_ids:
+                    aligned_var = state.device_function.new_var(
+                        f"_jagged_aligned_start_{jpat.sublane_bid}"
+                    )
+                    head_pad_var = state.device_function.new_var(
+                        f"_jagged_head_pad_{jpat.sublane_bid}"
+                    )
+                    state.codegen.add_statement(
+                        statement_from_string(
+                            f"{aligned_var} = ({starts_scalar} // {align}) * {align}"
+                        )
+                    )
+                    state.codegen.add_statement(
+                        statement_from_string(
+                            f"{head_pad_var} = {starts_scalar} - {aligned_var}"
+                        )
+                    )
+                    mask_var = strategy.mask_vars.get(jpat.sublane_bid)
+                    if mask_var is not None:
+                        sublane_idx = block_ids.index(jpat.sublane_bid)
+                        sl_bs_var = state.device_function.block_size_var(
+                            jpat.sublane_bid
+                        )
+                        assert sl_bs_var is not None
+                        sl_dim_idx = dim_idx_exprs[sublane_idx]
+                        numel_expr = _get_loop_numel(state, sublane_idx)
+                        offset_inline = state.device_function.new_var(
+                            f"_jagged_sublane_offset_{jpat.sublane_bid}"
+                        )
+                        state.codegen.add_statement(
+                            statement_from_string(
+                                f"{offset_inline} = ({sl_dim_idx}) * ({sl_bs_var})"
+                                f" + jnp.arange({sl_bs_var})"
+                            )
+                        )
+                        state.codegen.add_statement(
+                            statement_from_string(
+                                f"{mask_var} = ({offset_inline} >= {head_pad_var})"
+                                f" & ({offset_inline} < ({numel_expr})"
+                                f" + {head_pad_var})"
+                            )
+                        )
+                    axis_offset = (
+                        f"pl.multiple_of({aligned_var}, {align}) + ({axis_offset})"
+                    )
+                else:
+                    axis_offset = f"{starts_scalar} + ({axis_offset})"
             slice_parts.append(f"pl.ds({axis_offset}, {bs_var})")
         # Sublane DMA over-reads by up to ``BK-1`` past the row's valid
         # data on the last tile_k iter; without host pad, a near-tail
