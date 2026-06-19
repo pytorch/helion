@@ -119,7 +119,9 @@ class TestAutotuneIgnoreErrors(TestCase):
         )
         search.args = args
         search.log = AutotuningLogger(settings)
-        search.config_spec = SimpleNamespace(default_config=dict)
+        search.config_spec = SimpleNamespace(
+            default_config=lambda: helion.Config(block_sizes=[1])
+        )
         search._benchmark_provider_cls = LocalBenchmarkProvider
         search.best_perf_so_far = float("inf")
         search._prepared = False
@@ -439,13 +441,16 @@ class TestAutotuneIgnoreErrors(TestCase):
             autotune_log_level=logging.CRITICAL,
         )
         logger = AutotuningLogger(settings)
+        config = helion.Config(block_sizes=[32], num_warps=4)
         with logger.autotune_logging():
+            config_id = logger.register_config(config)
             entry = AutotuneLogEntry(
                 generation=5,
                 status="ok",
                 perf_ms=1.234,
                 compile_time=0.5,
-                config=helion.Config(foo=1, bar=[2, 3]),
+                config_id=config_id,
+                config=config,
             )
             logger.record_autotune_entry(entry)
             logger("finalized entry", level=logging.CRITICAL)
@@ -455,13 +460,14 @@ class TestAutotuneIgnoreErrors(TestCase):
         self.assertTrue(csv_path.exists())
         self.assertTrue(log_path.exists())
         rows = list(csv.reader(csv_path.read_text().splitlines()))
+        self.assertEqual(len(rows), 2)  # header + exactly the one recorded entry
+        header, row = rows[0], rows[1]
         self.assertEqual(
-            rows[0],
+            header,
             [
-                "kernel_id",
-                "sample_id",
+                "run_id",
                 "timestamp_s",
-                "config_index",
+                "config_id",
                 "generation",
                 "status",
                 "perf_ms",
@@ -469,13 +475,18 @@ class TestAutotuneIgnoreErrors(TestCase):
                 "config",
             ],
         )
-        # No metadata/sample_id supplied here, so the identity columns are empty.
-        self.assertEqual(rows[1][0], "")
-        self.assertEqual(rows[1][1], "")
-        self.assertEqual(rows[1][3], "1")
-        self.assertEqual(rows[1][4], "5")
-        self.assertEqual(rows[1][5], "ok")
-        self.assertEqual(rows[1][6], "1.234000")
+
+        def cell(name: str) -> str:
+            return row[header.index(name)]
+
+        # No metadata supplied here, so the run_id join key is empty.
+        self.assertEqual(cell("run_id"), "")
+        self.assertEqual(cell("config_id"), config_id)
+        self.assertEqual(cell("generation"), "5")
+        self.assertEqual(cell("status"), "ok")
+        self.assertEqual(cell("perf_ms"), "1.234000")
+        self.assertEqual(cell("compile_time_s"), "0.50")
+        self.assertEqual(cell("config"), str(config))
         log_text = log_path.read_text()
         self.assertIn("finalized entry", log_text)
 
@@ -750,6 +761,51 @@ class TestAutotuneIgnoreErrors(TestCase):
         for name, factory in search_factories:
             with self.subTest(algorithm=name):
                 self._run_autotuner_and_check_logging(factory)
+
+    @skipIfRefEager("Autotuning not supported in ref eager mode")
+    @skipIfXPU("maxnreg parameter not supported on XPU backend")
+    def test_autotune_skips_restricted_search(self):
+        """A run restricted to user-pinned configs (``configs=[...]`` without
+        ``force_autotune``) is a biased slice excluded from the dataset: even
+        with the dataset flag on, no ``.meta.jsonl`` is written. The debug
+        ``.csv`` is still written, since it is gated only by the log path
+        (PRD FR8/FR9)."""
+        configs = [
+            helion.Config(block_sizes=[32], num_warps=4),
+            helion.Config(block_sizes=[64], num_warps=8),
+        ]
+        tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(tmpdir.cleanup)
+        base_path = Path(tmpdir.name) / "autotune_run"
+
+        with patch.dict(
+            os.environ,
+            {
+                "HELION_AUTOTUNE_LOG": str(base_path),
+                "HELION_AUTOTUNE_LOG_DETAILS": "1",
+                "HELION_AUTOTUNE_LOG_LEVEL": "0",
+            },
+        ):
+
+            @helion.kernel(configs=configs)
+            def add(a, b):
+                out = torch.empty_like(a)
+                for tile in hl.tile(out.size()):
+                    out[tile] = a[tile] + b[tile]
+                return out
+
+            args = (
+                torch.randn([64], device=DEVICE),
+                torch.randn([64], device=DEVICE),
+            )
+            bound_kernel = add.bind(args)
+            random.seed(123)
+            search = FiniteSearch(bound_kernel, args, configs=configs)
+            search.autotune()
+
+        # Restricted search -> debug CSV written, but no dataset sidecar.
+        self.assertTrue(base_path.with_suffix(".csv").exists())
+        self.assertFalse(base_path.with_suffix(".meta.jsonl").exists())
 
 
 @onlyBackends(["triton"])
@@ -3679,7 +3735,9 @@ class TestAutotuneBudget(TestCase):
         )
         search.args = ()
         search.log = AutotuningLogger(settings)
-        search.config_spec = SimpleNamespace(default_config=dict)
+        search.config_spec = SimpleNamespace(
+            default_config=lambda: helion.Config(block_sizes=[1])
+        )
         search._benchmark_provider_cls = LocalBenchmarkProvider
         search.best_perf_so_far = float("inf")
         search._prepared = False

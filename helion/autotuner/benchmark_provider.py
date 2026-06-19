@@ -3,7 +3,6 @@ from __future__ import annotations
 import abc
 import datetime
 import functools
-import hashlib
 from itertools import count
 from itertools import starmap
 import math
@@ -332,19 +331,6 @@ class LocalBenchmarkProvider(BenchmarkProvider):
             self._compute_effective_tolerances()
         )
         self._jobs = self._decide_num_jobs()
-
-    def _sample_id(self, config: Config) -> str:
-        """Return a stable per-(kernel, config) id for telemetry rows.
-
-        Computed as ``sha256(kernel_source + decorator(config))`` so the same
-        kernel benchmarked with the same config produces the same id across
-        runs, enabling label aggregation/dedup for the cost-model dataset.
-        """
-        payload = (
-            self._autotune_metrics.kernel_source
-            + self.kernel.format_kernel_decorator(config, self.settings)
-        )
-        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
     def _compute_baseline(
         self,
@@ -811,35 +797,31 @@ class LocalBenchmarkProvider(BenchmarkProvider):
             status: Literal[
                 "ok", "error", "timeout", "peer_compilation_fail", "filtered"
             ]
-            if all(
-                all_gather_object(
-                    is_working,
-                    process_group_name=self.kernel.env.process_group_name,
-                )
-            ):
-                sample_id = self._sample_id(config)
+            # config_id is None when no log sink is active (skip recording). The
+            # started and result rows share it so they join to one config, and
+            # every config that reaches the benchmark loop is logged -- including
+            # ones that never benchmark because they (or a peer) failed to compile.
+            config_id = self.log.register_config(config)
+            if config_id is not None:
                 self.log.record_autotune_entry(
                     AutotuneLogEntry(
                         generation=self._autotune_metrics.num_generations,
                         status="started",
                         perf_ms=None,
                         compile_time=compile_time,
+                        config_id=config_id,
                         config=config,
-                        sample_id=sample_id,
                     )
                 )
+            if all(
+                all_gather_object(
+                    is_working,
+                    process_group_name=self.kernel.env.process_group_name,
+                )
+            ):
                 perf = self._benchmark_function(config, fn)
                 status = "ok" if math.isfinite(perf) else "error"
-                self.log.record_autotune_entry(
-                    AutotuneLogEntry(
-                        generation=self._autotune_metrics.num_generations,
-                        status=status,
-                        perf_ms=perf if math.isfinite(perf) else None,
-                        compile_time=compile_time,
-                        config=config,
-                        sample_id=sample_id,
-                    )
-                )
+                recorded_perf = perf if math.isfinite(perf) else None
                 results[valid_indices[index]] = BenchmarkResult(
                     config=config,
                     fn=fn,
@@ -851,12 +833,24 @@ class LocalBenchmarkProvider(BenchmarkProvider):
                 status = "timeout" if reason == "timeout" else "error"
                 if is_working:
                     status = "peer_compilation_fail"
+                recorded_perf = None
                 results[valid_indices[index]] = BenchmarkResult(
                     config=config,
                     fn=fn,
                     perf=inf,
                     status=status,
                     compile_time=compile_time,
+                )
+            if config_id is not None:
+                self.log.record_autotune_entry(
+                    AutotuneLogEntry(
+                        generation=self._autotune_metrics.num_generations,
+                        status=status,
+                        perf_ms=recorded_perf,
+                        compile_time=compile_time,
+                        config_id=config_id,
+                        config=config,
+                    )
                 )
         return results
 
@@ -892,7 +886,8 @@ class LocalBenchmarkProvider(BenchmarkProvider):
 
         # precompile in the current process for distributed kernels.
         # The reason we need this is due to some tricky distributed kernels
-        # like https://gist.github.com/shunting314/81f13ce00f835b21ab6466e21454b7c5 . We specialize the RANK argument for each GPU,
+        # like https://gist.github.com/shunting314/81f13ce00f835b21ab6466e21454b7c5 .
+        # We specialize the RANK argument for each GPU,
         # some rank may get out of resource errors while others don't
         # due to the specialization.
         #
