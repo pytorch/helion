@@ -31,6 +31,32 @@ _log = logging.getLogger(__name__)
 _BENCHMARK_CUDAGRAPH_ENV = "HELION_BENCHMARK_CUDAGRAPH"
 
 
+def _make_l2_cache_clearer() -> Callable[[], None]:
+    """Return a callable that flushes the GPU L2 cache, or a no-op.
+
+    The generic (wall-clock) bench used by the CuTe backend otherwise times
+    kernels with the operands resident in L2 (warm), biasing the autotuner
+    toward shallow-prefetch configs that starve the pipeline in the cold-L2 /
+    streamed-once regime that deployment and tritonbench (which clears L2 by
+    default) actually measure. Flushing L2 between timed calls makes the
+    autotune regime match the deployment regime.
+
+    Uses Triton's CUDA-only cache-clear primitive. Returns a no-op when not on
+    CUDA (e.g. TPU/Pallas backends that also use the generic bench).
+    """
+    if not torch.cuda.is_available() or getattr(torch.version, "hip", None) is not None:
+        return lambda: None
+    from triton import runtime
+
+    active = runtime.driver.active  # type: ignore[attr-defined]
+    cache = active.get_empty_cache_for_benchmark()  # type: ignore[attr-defined]
+
+    def clear() -> None:
+        active.clear_cache(cache)  # type: ignore[attr-defined]
+
+    return clear
+
+
 def _cudagraph_unavailable_reason() -> str | None:
     if getattr(torch.version, "hip", None) is not None:
         return "CUDA graph benchmarking is only enabled for NVIDIA CUDA"
@@ -200,8 +226,10 @@ def compute_repeat_generic(
     out = fn()
     synchronize_device(out)
 
+    clear_l2 = _make_l2_cache_clearer()
     start = time.perf_counter()
     for _ in range(estimate_runs):
+        clear_l2()
         out = fn()
     synchronize_device(out)
     end = time.perf_counter()
@@ -298,6 +326,7 @@ def interleaved_bench_generic(
         out = fn()
     synchronize_device(out)
 
+    clear_l2 = _make_l2_cache_clearer()
     all_times: list[list[float]] = [[] for _ in range(len(fns))]
 
     iterator = iter_with_progress(
@@ -308,6 +337,7 @@ def interleaved_bench_generic(
     )
     for _i in iterator:
         for j in range(len(fns)):
+            clear_l2()
             synchronize_device(out)
             start = time.perf_counter()
             out = fns[j]()
@@ -607,10 +637,13 @@ def do_bench_generic(
     out = fn()
     synchronize_device(out)
 
+    clear_l2 = _make_l2_cache_clearer()
+
     # Estimate the runtime of the function
     synchronize_device(out)
     start = time.perf_counter()
     for _ in range(5):
+        clear_l2()
         out = fn()
     synchronize_device(out)
     end = time.perf_counter()
@@ -630,6 +663,7 @@ def do_bench_generic(
         if grad_to_none is not None:
             for x in grad_to_none:
                 x.grad = None
+        clear_l2()
         synchronize_device(out)
         t0 = time.perf_counter()
         out = fn()
