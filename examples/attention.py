@@ -33,9 +33,138 @@ import helion.language as hl
 
 
 # %%
+def _linear_index(index: int, shape: torch.Size) -> tuple[int, ...]:
+    result = []
+    for size in reversed(shape):
+        result.append(index % size)
+        index //= size
+    return tuple(reversed(result))
+
+
+def _attention_reference_lse(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    *,
+    causal: bool,
+    bias: torch.Tensor | None,
+    base2_lse: bool,
+) -> torch.Tensor:
+    q_view = q.float().reshape(-1, q.size(-2), q.size(-1))
+    k_view = k.float().reshape(-1, k.size(-2), k.size(-1))
+    bias_float = bias.float() if bias is not None else None
+    lse = torch.empty(
+        (q_view.size(0), q_view.size(1)), device=q.device, dtype=torch.float32
+    )
+    scale = 1.0 / math.sqrt(q.size(-1))
+    query_block = 128
+    key_block = 4096
+    leading_shape = q.size()[:-2]
+    for batch_idx in range(q_view.size(0)):
+        q_batch = q_view[batch_idx]
+        k_batch_t = k_view[batch_idx].transpose(-2, -1)
+        bias_batch = None
+        if bias_float is not None:
+            q_leading_idx = _linear_index(batch_idx, leading_shape)
+            bias_leading_shape = bias_float.size()[:-2]
+            offset = len(leading_shape) - len(bias_leading_shape)
+            bias_idx = tuple(
+                0 if size == 1 else q_leading_idx[dim + offset]
+                for dim, size in enumerate(bias_leading_shape)
+            )
+            bias_batch = bias_float[(*bias_idx, slice(None), slice(None))]
+        for q_start in range(0, q_view.size(1), query_block):
+            q_stop = min(q_start + query_block, q_view.size(1))
+            q_block = q_batch[q_start:q_stop]
+            block_lse = torch.full(
+                (q_stop - q_start,), -torch.inf, device=q.device, dtype=torch.float32
+            )
+            for k_start in range(0, k_view.size(1), key_block):
+                k_stop = min(k_start + key_block, k_view.size(1))
+                scores = torch.matmul(q_block, k_batch_t[:, k_start:k_stop]) * scale
+                if bias_batch is not None:
+                    scores = scores + bias_batch[q_start:q_stop, k_start:k_stop]
+                if causal:
+                    q_idx = torch.arange(q_start, q_stop, device=q.device)
+                    k_idx = torch.arange(k_start, k_stop, device=q.device)
+                    scores = scores.masked_fill(
+                        q_idx[:, None] < k_idx[None, :], -torch.inf
+                    )
+                block_lse = torch.logaddexp(block_lse, torch.logsumexp(scores, dim=-1))
+            lse[batch_idx, q_start:q_stop] = block_lse
+    lse = lse.reshape(q.size()[:-1])
+    if base2_lse:
+        lse = lse * math.log2(math.e)
+    return lse
+
+
+def _attention_reference(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    *,
+    causal: bool = False,
+    bias: torch.Tensor | None = None,
+    base2_lse: bool = True,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    out = torch.nn.functional.scaled_dot_product_attention(
+        q,
+        k,
+        v,
+        attn_mask=bias,
+        is_causal=causal,
+    )
+    lse = _attention_reference_lse(
+        q,
+        k,
+        causal=causal,
+        bias=bias,
+        base2_lse=base2_lse,
+    )
+    return out, lse
+
+
+def _attention_baseline(
+    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return _attention_reference(q, k, v)
+
+
+def _causal_attention_baseline(
+    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return _attention_reference(q, k, v, causal=True)
+
+
+def _attention_output_baseline(
+    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor
+) -> torch.Tensor:
+    return torch.nn.functional.scaled_dot_product_attention(q, k, v)
+
+
+def _causal_attention_output_baseline(
+    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor
+) -> torch.Tensor:
+    return torch.nn.functional.scaled_dot_product_attention(q, k, v, is_causal=True)
+
+
+def _biased_attention_baseline(
+    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, bias: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return _attention_reference(q, k, v, bias=bias, base2_lse=False)
+
+
+def _biased_attention_output_baseline(
+    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, bias: torch.Tensor
+) -> torch.Tensor:
+    return torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=bias)
+
+
 @helion.kernel(
     # Static shapes provides a speedup for attention
     static_shapes=True,
+    autotune_baseline_fn=_attention_baseline,
+    autotune_baseline_atol=5e-2,
+    autotune_baseline_rtol=2e-2,
 )
 def attention(
     q_in: torch.Tensor,
@@ -103,6 +232,289 @@ def attention(
         lse[tile_b, tile_m, :] = (m_i + torch.log2(l_i))[:, :, None]
         out[tile_b, tile_m, :] = acc.to(out.dtype)
     return out.view(q_in.size()), lse.reshape(q_in.size()[:-1])
+
+
+@helion.kernel(
+    # Static shapes provides a speedup for attention
+    static_shapes=True,
+    autotune_baseline_fn=_causal_attention_baseline,
+    autotune_baseline_atol=5e-2,
+    autotune_baseline_rtol=2e-2,
+)
+def causal_attention(
+    q_in: torch.Tensor,
+    k_in: torch.Tensor,
+    v_in: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Computes causal scaled dot-product attention.
+    """
+    m_dim = q_in.size(-2)
+    n_dim = k_in.size(-2)
+    assert n_dim == v_in.size(-2)
+    head_dim = hl.specialize(q_in.size(-1))
+    assert head_dim == k_in.size(-1) == v_in.size(-1)
+    q_view = q_in.reshape([-1, m_dim, head_dim])
+    v_view = v_in.reshape([-1, n_dim, head_dim])
+    k_view = k_in.reshape([-1, n_dim, head_dim])
+    out = torch.empty_like(q_view)
+    lse = torch.empty([q_view.size(0), m_dim], device=q_in.device, dtype=torch.float32)
+    sm_scale = 1.0 / math.sqrt(head_dim)
+    qk_scale = sm_scale * 1.44269504  # 1/log(2)
+    for tile_b, tile_m in hl.tile([q_view.size(0), m_dim]):
+        m_i = hl.full([tile_b, tile_m], float("-inf"), dtype=torch.float32)
+        l_i = torch.full_like(m_i, 1.0)
+        acc = hl.zeros([tile_b, tile_m, head_dim], dtype=torch.float32)
+        q = q_view[tile_b, tile_m, :]
+        for tile_n in hl.tile(v_view.size(1)):
+            # scaling Q in-loop on-demand reduces spillage, faster than keeping pre-scaled Q
+            q_scaled = q * qk_scale
+            k = k_view[tile_b, tile_n, :]
+            qk = torch.bmm(q_scaled, k.transpose(1, 2), torch.float32)
+            qk = torch.where(
+                tile_m.index[None, :, None] >= tile_n.index[None, None, :],
+                qk,
+                float("-inf"),
+            )
+            m_ij_keepdim = torch.maximum(
+                m_i[:, :, None], torch.amax(qk, -1, keepdim=True)
+            )
+            qk = qk - m_ij_keepdim
+            m_ij = m_ij_keepdim.squeeze(-1)
+            p = torch.exp2(qk)
+            l_ij = torch.sum(p, -1)
+            alpha = torch.exp2(m_i - m_ij)
+            l_i = l_i * alpha + l_ij
+            acc = acc * alpha[:, :, None]
+            v = v_view[tile_b, tile_n, :]
+            p = p.to(v.dtype)
+            acc = torch.baddbmm(acc, p, v)
+            m_i = m_ij
+        acc = acc / l_i[:, :, None]
+        lse[tile_b, tile_m] = m_i + torch.log2(l_i)
+        out[tile_b, tile_m, :] = acc.to(out.dtype)
+    return out.view(q_in.size()), lse.view(q_in.size()[:-1])
+
+
+@helion.kernel(
+    static_shapes=True,
+    autotune_baseline_fn=_attention_output_baseline,
+    autotune_baseline_atol=5e-2,
+    autotune_baseline_rtol=2e-2,
+)
+def attention_output(
+    q_in: torch.Tensor,
+    k_in: torch.Tensor,
+    v_in: torch.Tensor,
+) -> torch.Tensor:
+    """
+    Computes scaled dot-product attention and returns only the output tensor.
+    """
+    m_dim = q_in.size(-2)
+    n_dim = k_in.size(-2)
+    assert n_dim == v_in.size(-2)
+    head_dim = hl.specialize(q_in.size(-1))
+    assert head_dim == k_in.size(-1) == v_in.size(-1)
+    q_view = q_in.reshape([-1, m_dim, head_dim])
+    v_view = v_in.reshape([-1, n_dim, head_dim])
+    k_view = k_in.reshape([-1, n_dim, head_dim])
+    out = torch.empty_like(q_view)
+    sm_scale = 1.0 / math.sqrt(head_dim)
+    qk_scale = sm_scale * 1.44269504  # 1/log(2)
+    for tile_b, tile_m in hl.tile([q_view.size(0), m_dim]):
+        m_i = hl.full([tile_b, tile_m], float("-inf"), dtype=torch.float32)
+        l_i = torch.full_like(m_i, 1.0)
+        acc = hl.zeros([tile_b, tile_m, head_dim], dtype=torch.float32)
+        q = q_view[tile_b, tile_m, :]
+        for tile_n in hl.tile(v_view.size(1)):
+            q_scaled = q * qk_scale
+            k = k_view[tile_b, tile_n, :]
+            qk = torch.bmm(q_scaled, k.transpose(1, 2), torch.float32)
+            m_ij = torch.maximum(m_i, torch.amax(qk, -1))
+            qk = qk - m_ij[:, :, None]
+            p = torch.exp2(qk)
+            l_ij = torch.sum(p, -1)
+            alpha = torch.exp2(m_i - m_ij)
+            l_i = l_i * alpha + l_ij
+            acc = acc * alpha[:, :, None]
+            v = v_view[tile_b, tile_n, :]
+            p = p.to(v.dtype)
+            acc = torch.baddbmm(acc, p, v)
+            m_i = m_ij
+        acc = acc / l_i[:, :, None]
+        out[tile_b, tile_m, :] = acc.to(out.dtype)
+    return out.view(q_in.size())
+
+
+@helion.kernel(
+    static_shapes=True,
+    autotune_baseline_fn=_causal_attention_output_baseline,
+    autotune_baseline_atol=5e-2,
+    autotune_baseline_rtol=2e-2,
+)
+def causal_attention_output(
+    q_in: torch.Tensor,
+    k_in: torch.Tensor,
+    v_in: torch.Tensor,
+) -> torch.Tensor:
+    """
+    Computes causal scaled dot-product attention and returns only the output tensor.
+    """
+    m_dim = q_in.size(-2)
+    n_dim = k_in.size(-2)
+    assert n_dim == v_in.size(-2)
+    head_dim = hl.specialize(q_in.size(-1))
+    assert head_dim == k_in.size(-1) == v_in.size(-1)
+    q_view = q_in.reshape([-1, m_dim, head_dim])
+    v_view = v_in.reshape([-1, n_dim, head_dim])
+    k_view = k_in.reshape([-1, n_dim, head_dim])
+    out = torch.empty_like(q_view)
+    sm_scale = 1.0 / math.sqrt(head_dim)
+    qk_scale = sm_scale * 1.44269504  # 1/log(2)
+    for tile_b, tile_m in hl.tile([q_view.size(0), m_dim]):
+        m_i = hl.full([tile_b, tile_m], float("-inf"), dtype=torch.float32)
+        l_i = torch.full_like(m_i, 1.0)
+        acc = hl.zeros([tile_b, tile_m, head_dim], dtype=torch.float32)
+        q = q_view[tile_b, tile_m, :]
+        for tile_n in hl.tile(v_view.size(1)):
+            q_scaled = q * qk_scale
+            k = k_view[tile_b, tile_n, :]
+            qk = torch.bmm(q_scaled, k.transpose(1, 2), torch.float32)
+            qk = torch.where(
+                tile_m.index[None, :, None] >= tile_n.index[None, None, :],
+                qk,
+                float("-inf"),
+            )
+            m_ij_keepdim = torch.maximum(
+                m_i[:, :, None], torch.amax(qk, -1, keepdim=True)
+            )
+            qk = qk - m_ij_keepdim
+            m_ij = m_ij_keepdim.squeeze(-1)
+            p = torch.exp2(qk)
+            l_ij = torch.sum(p, -1)
+            alpha = torch.exp2(m_i - m_ij)
+            l_i = l_i * alpha + l_ij
+            acc = acc * alpha[:, :, None]
+            v = v_view[tile_b, tile_n, :]
+            p = p.to(v.dtype)
+            acc = torch.baddbmm(acc, p, v)
+            m_i = m_ij
+        acc = acc / l_i[:, :, None]
+        out[tile_b, tile_m, :] = acc.to(out.dtype)
+    return out.view(q_in.size())
+
+
+@helion.kernel(
+    static_shapes=True,
+    autotune_baseline_fn=_biased_attention_baseline,
+    autotune_baseline_atol=5e-2,
+    autotune_baseline_rtol=2e-2,
+)
+def biased_attention(
+    q_in: torch.Tensor,
+    k_in: torch.Tensor,
+    v_in: torch.Tensor,
+    bias: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Computes scaled dot-product attention with an additive score bias.
+
+    The bias is exact-shape only: its leading dimensions must collapse to the
+    same batch-head product as ``q_in``/``k_in``/``v_in``.
+    """
+    m_dim = q_in.size(-2)
+    n_dim = k_in.size(-2)
+    assert n_dim == v_in.size(-2)
+    head_dim = hl.specialize(q_in.size(-1))
+    assert head_dim == k_in.size(-1) == v_in.size(-1)
+    q_view = q_in.reshape([-1, m_dim, head_dim])
+    v_view = v_in.reshape([-1, n_dim, head_dim])
+    k_view = k_in.reshape([-1, n_dim, head_dim])
+    bias_view = bias.reshape([-1, m_dim, n_dim])
+    out = torch.empty_like(q_view)
+    lse = torch.empty([q_view.size(0), m_dim], device=q_in.device, dtype=torch.float32)
+    qk_scale = 1.0 / math.sqrt(head_dim)
+    for tile_b, tile_m in hl.tile([q_view.size(0), m_dim]):
+        m_i = hl.full([tile_b, tile_m], float("-inf"), dtype=torch.float32)
+        l_i = torch.full_like(m_i, 1.0)
+        acc = hl.zeros([tile_b, tile_m, head_dim], dtype=torch.float32)
+        q = q_view[tile_b, tile_m, :]
+        for tile_n in hl.tile(v_view.size(1)):
+            q_scaled = q * qk_scale
+            k = k_view[tile_b, tile_n, :]
+            qk = torch.bmm(q_scaled, k.transpose(1, 2), torch.float32)
+            qk = qk + bias_view[tile_b, tile_m, tile_n]
+            m_ij = torch.maximum(m_i, torch.amax(qk, -1))
+            qk = qk - m_ij[:, :, None]
+            p = torch.exp(qk)
+            l_ij = torch.sum(p, -1)
+            alpha = torch.exp(m_i - m_ij)
+            l_i = l_i * alpha + l_ij
+            acc = acc * alpha[:, :, None]
+            v = v_view[tile_b, tile_n, :]
+            p = p.to(v.dtype)
+            acc = torch.baddbmm(acc, p, v)
+            m_i = m_ij
+        acc = acc / l_i[:, :, None]
+        lse[tile_b, tile_m] = m_i + torch.log(l_i)
+        out[tile_b, tile_m, :] = acc.to(out.dtype)
+    return out.view(q_in.size()), lse.view(q_in.size()[:-1])
+
+
+@helion.kernel(
+    static_shapes=True,
+    autotune_baseline_fn=_biased_attention_output_baseline,
+    autotune_baseline_atol=5e-2,
+    autotune_baseline_rtol=2e-2,
+)
+def biased_attention_output(
+    q_in: torch.Tensor,
+    k_in: torch.Tensor,
+    v_in: torch.Tensor,
+    bias: torch.Tensor,
+) -> torch.Tensor:
+    """
+    Computes scaled dot-product attention with an additive score bias and
+    returns only the output tensor.
+
+    The bias is exact-shape only: its leading dimensions must collapse to the
+    same batch-head product as ``q_in``/``k_in``/``v_in``.
+    """
+    m_dim = q_in.size(-2)
+    n_dim = k_in.size(-2)
+    assert n_dim == v_in.size(-2)
+    head_dim = hl.specialize(q_in.size(-1))
+    assert head_dim == k_in.size(-1) == v_in.size(-1)
+    q_view = q_in.reshape([-1, m_dim, head_dim])
+    v_view = v_in.reshape([-1, n_dim, head_dim])
+    k_view = k_in.reshape([-1, n_dim, head_dim])
+    bias_view = bias.reshape([-1, m_dim, n_dim])
+    out = torch.empty_like(q_view)
+    qk_scale = 1.0 / math.sqrt(head_dim)
+    for tile_b, tile_m in hl.tile([q_view.size(0), m_dim]):
+        m_i = hl.full([tile_b, tile_m], float("-inf"), dtype=torch.float32)
+        l_i = torch.full_like(m_i, 1.0)
+        acc = hl.zeros([tile_b, tile_m, head_dim], dtype=torch.float32)
+        q = q_view[tile_b, tile_m, :]
+        for tile_n in hl.tile(v_view.size(1)):
+            q_scaled = q * qk_scale
+            k = k_view[tile_b, tile_n, :]
+            qk = torch.bmm(q_scaled, k.transpose(1, 2), torch.float32)
+            qk = qk + bias_view[tile_b, tile_m, tile_n]
+            m_ij = torch.maximum(m_i, torch.amax(qk, -1))
+            qk = qk - m_ij[:, :, None]
+            p = torch.exp(qk)
+            l_ij = torch.sum(p, -1)
+            alpha = torch.exp(m_i - m_ij)
+            l_i = l_i * alpha + l_ij
+            acc = acc * alpha[:, :, None]
+            v = v_view[tile_b, tile_n, :]
+            p = p.to(v.dtype)
+            acc = torch.baddbmm(acc, p, v)
+            m_i = m_ij
+        acc = acc / l_i[:, :, None]
+        out[tile_b, tile_m, :] = acc.to(out.dtype)
+    return out.view(q_in.size())
 
 
 # %%
