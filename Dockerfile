@@ -54,15 +54,15 @@ RUN python -m pip install \
     python -m pip install -e /workspace/quack && \
     SETUPTOOLS_SCM_PRETEND_VERSION_FOR_HELION=0.0+docker \
     python -m pip install \
-        -e '.[dev,cute-cu13]' \
+        -e '.[dev]' \
         absl-py \
         cffi \
-        apache-tvm-ffi \
         jax \
         packaging \
         pytest-xdist \
         pyrefly==1.1.1 \
         ruff==0.15.0 && \
+    ./scripts/install_cute.sh && \
     if [ -d .git ]; then \
         pre-commit install-hooks; \
     else \
