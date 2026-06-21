@@ -6,6 +6,7 @@ import contextlib
 import copy
 import dataclasses
 import functools
+import logging
 import math
 import operator
 import re
@@ -90,6 +91,8 @@ if TYPE_CHECKING:
 
 
 tls: _TLS = cast("_TLS", threading.local())
+
+log = logging.getLogger(__name__)
 
 
 def _lerp_scalar_decomp(
@@ -1064,26 +1067,29 @@ class DeviceIR:
         accumulator_facts: list[AccumulatorFact],
         liveness_by_axis: dict[int, int] | None = None,
     ) -> None:
-        """Register a ReductionFact for a user-tiled inner reduction.
+        """Register a ReductionFact for an inner reduction the roller did NOT roll.
+        Owns the two non-rolled cases, keyed on whether the reduction axis is a
+        ``block_sizes`` entry:
 
-        user-tiled = a hand-written nested ``hl.tile`` over the reduction axis: no
-        ``reduction=True`` block, so both axes are ordinary ``block_sizes`` entries.
-        Caller-guarded (``if not reduction_loops``) so standard vs user-tiled are mutually
-        exclusive. Finds the axis by collecting every ``ReductionLowering.block_index`` and
-        dropping the grid axes (so a dead ``amax(dim=0)`` over the grid tile is ignored);
-        registers only if exactly one inner axis survives.
+        - **USER-TILED (-> T2):** a hand-written nested ``hl.tile`` over the
+          reduction axis -- no ``reduction=True`` block, so the axis is an ordinary
+          ``block_sizes`` entry. Routes to the user-tiled track.
+        - **MATERIALIZED FEATURE (-> standard/T1):** a ``reduction=True`` axis the
+          roller declined to roll (``should_go_in_inner_graph`` raises "mixed
+          reduction dim usage"), left full-width in NEITHER ``block_sizes`` NOR
+          ``reduction_loops``. A standard reduction that could not be rolled, so it
+          routes to the standard track (``_is_standard_reduction`` keys on "not a
+          block_sizes entry").
 
-        Built in Phase 3 (after ``_collect_memory_op_facts``), so the per-op-dataflow
-        fields are derived from ``memory_op_facts``/``accumulator_facts``.
+        Caller-guarded (``if not reduction_loops``) so standard-rollable and this
+        path are mutually exclusive. Finds the axis from every
+        ``ReductionLowering.block_index`` minus the grid axes. Built in Phase 3, so
+        per-op-dataflow fields derive from ``memory_op_facts``/``accumulator_facts``.
         """
         from .inductor_lowering import ReductionLowering
 
         env = CompileEnvironment.current()
         spec = env.config_spec
-        # A matmul kernel is out of scope (its carried 2D accumulators have a static
-        # int last-dim the reduction-axis walk does not expect). Decline before walking.
-        if spec.matmul_facts:
-            return
         grid_ids = {b for bids in self.grid_block_ids for b in bids}
 
         red_block_ids: set[int] = set()
@@ -1096,12 +1102,61 @@ class DeviceIR:
                         red_block_ids.add(bid)
         # Drop the grid axis (a dead reduction over the grid/M tile, etc.).
         inner_red = [b for b in red_block_ids if b not in grid_ids]
-        if len(inner_red) != 1:
+        bs_ids = spec.block_sizes.valid_block_ids()
+        rl_ids = spec.reduction_loops.valid_block_ids()
+        # Materialized axes (rms/ln/instance/group bwd): a ReductionLowering axis the roller left in
+        # neither block_sizes nor reduction_loops -> standard track. bias_grad/dyt have none (their [N]
+        # accumulator is never reduced over), so they fall to the block-tiled pool below.
+        materialized_reduction_axes = [
+            b
+            for b in inner_red
+            if self._is_materialized_axis(b, grid_ids, bs_ids, rl_ids)
+        ]
+        # Candidate pool: prefer the materialized reductions (-> standard track), else the
+        # remaining block-tiled inner reductions (-> user-tiled track). A pure matmul has no
+        # inner reduction so its pool is empty (declines); a matmul WITH a reduction rides
+        # the same path -- no special gate needed.
+        pool = materialized_reduction_axes or inner_red
+        # Drop dynamic-extent axes: a jagged/data-dependent reduction tile has ``size=None``
+        # (no static extent), so ``size_hint()`` would assert. The seed keys on a static
+        # resident footprint, so decline such axes here (mirrors the static-size guard below)
+        # rather than crash -- jagged kernels fall back to the default config as on main.
+        pool = [
+            b for b in pool if isinstance(env.block_sizes[b].size, (int, torch.SymInt))
+        ]
+        if not pool:
             return
-        red_block_id = inner_red[0]
-        # The reduction axis must be a user tile in the block_sizes spec.
-        if red_block_id not in spec.block_sizes.valid_block_ids():
-            return
+        # Seed the DOMINANT reduction (largest extent -- drives the resident footprint). The pick is
+        # config-invariant for today's kernels but the axis-specific fact fields are not, so warn and
+        # revisit the tie-break if a seed lever starts consuming them.
+        red_block_id = max(pool, key=lambda b: env.block_sizes[b].size_hint())
+        if len(pool) > 1:
+            log.warning(
+                "inner-reduction seed: %d candidate inner reductions %s; "
+                "recording only the dominant axis %s as the ReductionFact",
+                len(pool),
+                {b: env.block_sizes[b].size_hint() for b in pool},
+                red_block_id,
+            )
+        # Widen genuine apply/normalize loops that span the reduction extent. Do NOT decline on a
+        # non-qualifying loop: a reduction can co-occur with other non-grid loops that must stay floored
+        # (a secondary reduction, or an apply loop at a different extent) -- warn instead of declining.
+        non_reduction_loop_block_ids = self._non_reduction_loop_candidates(
+            red_block_id, grid_ids
+        )
+        qualified = set(non_reduction_loop_block_ids)
+        for bid in bs_ids:
+            # Skip the grid axes, the widened apply loops, and the dominant reduction axis itself;
+            # everything else (including a secondary reduction axis, e.g. group_norm's block 2) is
+            # floored + warned.
+            if bid in grid_ids or bid in qualified or bid == red_block_id:
+                continue
+            log.warning(
+                "inner-reduction seed: block_sizes loop %s (size %s) is floored "
+                "(no widening rule for this loop shape yet)",
+                bid,
+                env.block_sizes[bid].size,
+            )
         try:
             block_info = env.block_sizes[red_block_id]
         except (IndexError, KeyError):
@@ -1109,15 +1164,6 @@ class DeviceIR:
         # The reduction axis must have a resolvable extent: a dynamic/jagged dim has
         # ``size=None``, for which the extent-keyed lever is undefined; decline there.
         if not isinstance(block_info.size, (int, torch.SymInt)):
-            return
-
-        # Additional non-grid, non-reduction tile loop(s) (beyond the reduction axis).
-        # Each must span the reduction extent with a resolvable static size, else
-        # ``all_qualified`` is False and the structured seed is undefined (decline).
-        non_reduction_loop_block_ids, all_qualified = (
-            self._non_reduction_loop_candidates(red_block_id, grid_ids)
-        )
-        if not all_qualified:
             return
 
         # The kept (non-reduction) axes are the grid block_ids — the "rows".
@@ -1165,8 +1211,8 @@ class DeviceIR:
             grid_ids = {b for bids in self.grid_block_ids for b in bids}
             m_block_ids = tuple(sorted(grid_ids))
             static_rnumel = rdim.size if isinstance(rdim.size, int) else None
-            non_reduction_loop_block_ids, _all_qualified = (
-                self._non_reduction_loop_candidates(rdim.block_id, grid_ids)
+            non_reduction_loop_block_ids = self._non_reduction_loop_candidates(
+                rdim.block_id, grid_ids
             )
             spec.reduction_facts.append(
                 self._assemble_reduction_fact(
@@ -1200,7 +1246,6 @@ class DeviceIR:
         """
         from ..autotuner.config_spec import AccumulatorFact
 
-        env = CompileEnvironment.current()
         facts: list[AccumulatorFact] = []
         for gi in self.graphs:
             if not isinstance(gi, ForLoopGraphInfo):
@@ -1211,12 +1256,48 @@ class DeviceIR:
                     facts.append(
                         AccumulatorFact(
                             dim_block_ids=tuple(
-                                env.resolve_block_id(s) for s in val.shape
+                                self._resolve_accumulator_dim_block_id(s)
+                                for s in val.shape
                             ),
                             itemsize=val.element_size(),
                         )
                     )
         return facts
+
+    def _resolve_accumulator_dim_block_id(self, size: object) -> int | None:
+        """Resolve an accumulator dim to its block id, recovering the non-pow2 padded
+        case ``resolve_block_id`` misses. A grad-parameter buffer is padded to the
+        next power of two, so its extent matches neither the block's registered size
+        nor any block-size origin and ``resolve_block_id`` returns ``None``. Fall back
+        to matching the padded extent against a reduction block whose
+        ``next_power_of_2(size_hint)`` equals it -- but ONLY when UNIQUE. Two axes
+        padding to the same extent are indistinguishable, so DECLINE (return ``None``)
+        rather than mis-assign an identity the ``num_carried_2d_tiles`` and
+        ``per_feature_accumulator`` consumers would read.
+        """
+        from .._utils import next_power_of_2
+
+        env = CompileEnvironment.current()
+        block_id = env.resolve_block_id(size)
+        if block_id is not None:
+            return block_id
+        extent = env.size_hint(cast("int | torch.SymInt", size))
+        matches = [
+            info.block_id
+            for info in env.block_sizes
+            if info.reduction and next_power_of_2(info.size_hint()) == extent
+        ]
+        if len(matches) == 1:
+            return matches[0]
+        if len(matches) > 1:
+            log.warning(
+                "accumulator dim (padded extent %s) matches %d reduction axes %s; cannot "
+                "differentiate by extent -- left unresolved (per_feature_accumulator may miss it)",
+                extent,
+                len(matches),
+                matches,
+            )
+        return None
 
     def _reduction_input_itemsize(self, red_block_id: int) -> int:
         """Element size (bytes) of the tensor reduced over ``red_block_id`` — read from the
@@ -1336,6 +1417,35 @@ class DeviceIR:
         # the walker liveness slice for this axis (default 1).
         body_live_tiles = max(1, (liveness_by_axis or {}).get(red_block_id, 1))
 
+        # feature_footprint: resident per-row feature footprint an M-collapse byte-caps its
+        # inner tile against -- the PRODUCT (not a per-axis max, else 3-D norms spill) of the
+        # materialized full-width feature axes. 1 when none. A structural read, no graph walk.
+        env = CompileEnvironment.current()
+        bs_ids = env.config_spec.block_sizes.valid_block_ids()
+        rl_ids = env.config_spec.reduction_loops.valid_block_ids()
+        grid_ids = {b for bids in self.grid_block_ids for b in bids}
+        # Feature-footprint axes: full-width feature/output dims left materialized. NOTE
+        # bs.reduction is the dim's reduction ROLE at registration, not 'a reduction is lowered
+        # over it' (e.g. bias_grad's [N] output), so this set differs from the reduced-over set.
+        materialized_feature_axes = {
+            bs.block_id
+            for bs in env.block_sizes
+            if bs.reduction
+            and isinstance(bs.size, (int, torch.SymInt))
+            and self._is_materialized_axis(bs.block_id, grid_ids, bs_ids, rl_ids)
+        }
+        feature_footprint = 1
+        for b in materialized_feature_axes:
+            feature_footprint *= max(1, env.block_sizes[b].size_hint())
+        # per_feature_accumulator: the FAITHFUL M-collapse signature -- a loop-carried accumulator
+        # whose dims are ALL the materialized feature axis (e.g. grad_bias[N]). Per-row / 2-D
+        # accumulators (softmax/kl_div/jsd/welford/grpo) fail this test, excluded structurally.
+        per_feature_accumulator = any(
+            a.dim_block_ids
+            and all(d in materialized_feature_axes for d in a.dim_block_ids)
+            for a in accumulator_facts
+        )
+
         return ReductionFact(
             block_id=red_block_id,
             size_hint=size_hint,
@@ -1350,47 +1460,71 @@ class DeviceIR:
             full_width_output=full_width_output,
             input_load_itemsize=input_load_itemsize,
             body_live_tiles=body_live_tiles,
+            feature_footprint=feature_footprint,
+            per_feature_accumulator=per_feature_accumulator,
+        )
+
+    def _is_materialized_axis(
+        self,
+        block_id: int,
+        grid_ids: set[int],
+        bs_ids: list[int],
+        rl_ids: list[int],
+    ) -> bool:
+        """A *materialized* axis: full-width because the roller declined it -- not the
+        grid, not a ``block_sizes`` tile, not a rolled ``reduction_loops`` axis. Two
+        callers pass DIFFERENT candidate sets to this shared predicate:
+
+        - REDUCED-OVER axes (``register_user_tiled_reductions``): the axis a
+          ``ReductionLowering`` is lowered over (``red_block_id``).
+        - FEATURE-FOOTPRINT axes (``_assemble_reduction_fact``): full-width
+          feature/output dims flagged ``bs.reduction`` at REGISTRATION, including a
+          grad-param output never reduced *over* (the resident ``feature_footprint``).
+
+        bias_grad's ``[N]`` is feature-footprint but not reduced-over -- the gap that
+        makes these two sets.
+        """
+        return (
+            block_id not in grid_ids
+            and block_id not in bs_ids
+            and block_id not in rl_ids
         )
 
     def _non_reduction_loop_candidates(
         self, red_block_id: int, grid_ids: set[int]
-    ) -> tuple[tuple[int, ...], bool]:
-        """Identify non-reduction loop tiles for ``red_block_id`` — non-grid
-        ``block_sizes`` loops that are NOT the reduction axis. Shared by the standard and
-        user-tiled fact builders.
+    ) -> tuple[int, ...]:
+        """Identify non-reduction loop tiles for ``red_block_id`` -- non-grid
+        ``block_sizes`` loops that are NOT the reduction axis. Shared by the standard
+        and user-tiled fact builders.
 
-        Returns ``(qualifying, all_qualified)``: ``qualifying`` (block_sizes order) are the
-        candidate loops spanning the reduction extent with a resolvable static size — the
-        seed widens these to ``next_pow2`` of that extent. ``all_qualified`` is False iff
-        some candidate did NOT qualify (extent unresolvable or != the reduction extent),
-        where the structured seed is undefined so a caller must decline.
+        Returns ``qualifying`` (block_sizes order): candidate loops spanning the
+        reduction extent with a resolvable static size -- the seed widens these to
+        ``next_pow2``. A non-qualifying candidate (extent unresolvable or != the
+        reduction extent) is left out and floored by the caller.
         """
         try:
             red_info = CompileEnvironment.current().block_sizes[red_block_id]
         except (IndexError, KeyError):
-            return (), True
+            return ()
         if not isinstance(red_info.size, (int, torch.SymInt)):
-            return (), True
+            return ()
         red_size_hint = red_info.size_hint()
 
         env = CompileEnvironment.current()
         qualifying: list[int] = []
-        all_qualified = True
         for bid in env.config_spec.block_sizes.valid_block_ids():
             if bid in grid_ids or bid == red_block_id:
                 continue
             try:
                 info = env.block_sizes[bid]
             except (IndexError, KeyError):
-                all_qualified = False
                 continue
             if not isinstance(info.size, (int, torch.SymInt)) or (
                 info.size_hint() != red_size_hint
             ):
-                all_qualified = False
                 continue
             qualifying.append(bid)
-        return tuple(qualifying), all_qualified
+        return tuple(qualifying)
 
     def build_codegen_graphs(self, config: Config) -> list[GraphInfo]:
         """Build and return graph copies with reduction rolling and epilogue subtiling applied.
