@@ -2142,6 +2142,90 @@ def _check_dma_alignment(vmem_shape: tuple[int, ...]) -> bool:
     return True
 
 
+def _is_supported_contiguous_row_slab_dma(
+    fake: torch.Tensor,
+    sub_meta: list[object],
+    block_ids: list[int],
+    vmem_shape: tuple[int, ...],
+    env: CompileEnvironment,
+    state: CodegenState,
+) -> bool:
+    """Whether an otherwise-unaligned load is a contiguous row-slab DMA.
+
+    ``_check_dma_alignment`` is conservative for shapes like
+    ``[TOKEN_BLOCK, H=4, D=128]`` because the second-to-last logical dim is not a
+    multiple of 8.  TPU7x accepts HBM copies from arbitrary dynamic row offsets
+    for row-slab layouts: rows are page-addressed and the full suffix is
+    contiguous with an aligned lane dimension.
+
+    Keep this exception narrow: load-only caller, one dynamic-begin/end
+    current-loop row tile, only scalar-selected prefix dims, full-slice suffix,
+    no gathers/scatters/stores.
+    """
+    if not fake.is_floating_point():
+        return False
+    if fake.ndim < 2:
+        return False
+    if not fake.is_contiguous():
+        return False
+    if len(vmem_shape) != fake.ndim:
+        return False
+
+    dim_to_bid = _get_dim_block_ids(sub_meta, env)
+    inner_dims = [dim for dim, bid in dim_to_bid.items() if bid in block_ids]
+    if len(inner_dims) != 1:
+        return False
+    row_dim = inner_dims[0]
+    if row_dim == fake.ndim - 1:
+        return False
+    row_bid = dim_to_bid[row_dim]
+    if not _loop_dim_is_dynamic(state, block_ids.index(row_bid)):
+        return False
+
+    from helion._utils import is_scalar_index
+
+    for dim_idx in range(row_dim):
+        idx_meta = sub_meta[dim_idx] if dim_idx < len(sub_meta) else slice(None)
+        if vmem_shape[dim_idx] != 1:
+            return False
+        if dim_idx in dim_to_bid:
+            continue
+        if not is_scalar_index(idx_meta):
+            return False
+
+    for dim_idx in range(row_dim + 1, fake.ndim):
+        idx_meta = sub_meta[dim_idx] if dim_idx < len(sub_meta) else slice(None)
+        if idx_meta != slice(None):
+            return False
+        if dim_idx in dim_to_bid:
+            return False
+        dim_size = fake.shape[dim_idx]
+        if not isinstance(dim_size, int) or vmem_shape[dim_idx] != dim_size:
+            return False
+
+    lane_dim = fake.shape[-1]
+    return isinstance(lane_dim, int) and lane_dim % 128 == 0
+
+
+def _can_stream_inner_tile(
+    fake: torch.Tensor,
+    sub_meta: list[object],
+    direction: str,
+    block_ids: list[int],
+    vmem_shape: tuple[int, ...],
+    env: CompileEnvironment,
+    state: CodegenState,
+) -> bool:
+    """Return whether a loop-local tensor should use the inner streaming path."""
+    if _check_dma_alignment(vmem_shape):
+        return True
+    if direction != "load":
+        return False
+    return _is_supported_contiguous_row_slab_dma(
+        fake, sub_meta, block_ids, vmem_shape, env, state
+    )
+
+
 def _compute_vmem_shapes(
     all_tensor_info: list[tuple[torch.Tensor, list[object], str]],
     block_ids: list[int],
@@ -2200,8 +2284,9 @@ def _classify_pipelined_tensors(
     A tensor is eligible for the inner-DMA path (HBM ref + small VMEM scratch
     in fori_loop, or ``pl.Buffered`` BlockSpec in emit_pipeline) when:
 
-    * Its inner-block ``vmem_shape`` passes ``_check_dma_alignment`` -- a TPU
-      DMA hardware constraint.
+    * Its inner-block ``vmem_shape`` passes the standard TPU DMA alignment check,
+      or it is a load-only contiguous row-slab layout covered by
+      ``_is_supported_contiguous_row_slab_dma``.
     * It is not also accessed at outer scope (i.e. in a root graph,
       between/before/after inner loops).  Pipelining replaces the tensor's
       outer BlockSpec with ``pltpu.HBM`` so the inner loop's BlockSpec can
@@ -2248,10 +2333,12 @@ def _classify_pipelined_tensors(
                 outer_access_tensor_ids.add(id(val))
 
     pipelined_ids: set[int] = set()
-    for (fake, _sub_meta, _direction), vmem_shape in zip(
+    for (fake, sub_meta, direction), vmem_shape in zip(
         all_tensor_info, vmem_shapes, strict=True
     ):
-        if not _check_dma_alignment(vmem_shape):
+        if not _can_stream_inner_tile(
+            fake, sub_meta, direction, block_ids, vmem_shape, env, state
+        ):
             continue
         if id(fake) in outer_access_tensor_ids:
             continue

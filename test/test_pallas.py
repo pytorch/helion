@@ -366,6 +366,54 @@ def pallas_add_3d(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
 
 
 @helion.kernel(backend="pallas", static_shapes=True)
+def pallas_leading_token_sum(x: torch.Tensor) -> torch.Tensor:
+    H = hl.specialize(x.size(1))
+    D = hl.specialize(x.size(2))
+    out = torch.empty([1, H, D], dtype=torch.float32, device=x.device)
+    for owner in hl.grid(1):
+        acc = hl.zeros([H, D], dtype=torch.float32)
+        for tile in hl.tile(x.size(0)):
+            acc = acc + x[tile, :, :].to(torch.float32).sum(dim=0)
+        out[owner, :, :] = acc
+    return out
+
+
+@helion.kernel(backend="pallas", static_shapes=True)
+def pallas_owner_prefixed_row_slab_sum(
+    x: torch.Tensor, offsets: torch.Tensor
+) -> torch.Tensor:
+    G = offsets.size(0) - 1
+    H = hl.specialize(x.size(2))
+    D = hl.specialize(x.size(3))
+    out = torch.empty([G, H, D], dtype=torch.float32, device=x.device)
+    for g in hl.grid(G):
+        start = offsets[g]
+        end = offsets[g + 1]
+        acc = hl.zeros([H, D], dtype=torch.float32)
+        for tile in hl.tile(start, end):
+            acc = acc + x[g, tile, :, :].to(torch.float32).sum(dim=0)
+        out[g, :, :] = acc
+    return out
+
+
+@helion.kernel(backend="pallas", static_shapes=True)
+def pallas_literal_prefixed_row_slab_sum(
+    x: torch.Tensor, offsets: torch.Tensor
+) -> torch.Tensor:
+    H = hl.specialize(x.size(2))
+    D = hl.specialize(x.size(3))
+    out = torch.empty([1, H, D], dtype=torch.float32, device=x.device)
+    for owner in hl.grid(1):
+        start = offsets[0]
+        end = offsets[1]
+        acc = hl.zeros([H, D], dtype=torch.float32)
+        for tile in hl.tile(start, end):
+            acc = acc + x[1, tile, :, :].to(torch.float32).sum(dim=0)
+        out[owner, :, :] = acc
+    return out
+
+
+@helion.kernel(backend="pallas", static_shapes=True)
 def pallas_attention(
     q_in: torch.Tensor, k_in: torch.Tensor, v_in: torch.Tensor
 ) -> torch.Tensor:
@@ -3028,6 +3076,72 @@ class TestPallas(TestCase):
         self.assertNotIn("pltpu.make_async_copy", code)
         self.assertIn("pl.ds(", code)
         torch.testing.assert_close(result, args[0] + args[1])
+
+    def test_fori_loop_static_begin_leading_token_load_stays_resident(self) -> None:
+        """Static-begin packed-token rows keep the existing non-DMA behavior."""
+        x = torch.randn(64, 4, 128, device=DEVICE, dtype=torch.float32)
+        code, result = code_and_output(
+            pallas_leading_token_sum,
+            (x,),
+            block_sizes=[16],
+            pallas_loop_type="fori_loop",
+        )
+        self.assertNotIn("pltpu.make_async_copy", code)
+        self.assertNotIn("_pipeline_arg_indices=", code)
+        torch.testing.assert_close(
+            result, x.sum(dim=0, keepdim=True), rtol=1e-3, atol=1e-3
+        )
+
+    def test_pallas_loop_prefixed_row_slab_streams(self) -> None:
+        x = torch.randn(2, 48, 4, 128, device=DEVICE, dtype=torch.float32)
+        offsets = torch.tensor([0, 11, 37], device=DEVICE, dtype=torch.int32)
+        code, result = code_and_output(
+            pallas_owner_prefixed_row_slab_sum,
+            (x, offsets),
+            block_sizes=[8],
+            pallas_loop_type="fori_loop",
+        )
+        self.assertIn("_pipeline_arg_indices=", code)
+        self.assertIn("pltpu.make_async_copy(x.at", code)
+        ref = torch.stack(
+            [x[g, int(offsets[g]) : int(offsets[g + 1])].sum(dim=0) for g in range(2)]
+        )
+        torch.testing.assert_close(result, ref, rtol=1e-3, atol=1e-3)
+
+        code = pallas_owner_prefixed_row_slab_sum.bind((x, offsets)).to_triton_code(
+            helion.Config(block_sizes=[8], pallas_loop_type="emit_pipeline")
+        )
+        self.assertIn("pltpu.emit_pipeline", code)
+        self.assertIn("pl.BoundedSlice", code)
+        self.assertIn("pipeline_mode=pl.Buffered", code)
+        self.assertIn("_pipeline_arg_indices=[1]", code)
+        self.assertNotIn("pltpu.make_async_copy", code)
+
+        offsets = torch.tensor([3, 29], device=DEVICE, dtype=torch.int32)
+        code, result = code_and_output(
+            pallas_literal_prefixed_row_slab_sum,
+            (x, offsets),
+            block_sizes=[8],
+            pallas_loop_type="fori_loop",
+        )
+        self.assertIn("_pipeline_arg_indices=", code)
+        self.assertIn("pltpu.make_async_copy(x.at", code)
+        torch.testing.assert_close(
+            result,
+            x[1, int(offsets[0]) : int(offsets[1])].sum(dim=0, keepdim=True),
+            rtol=1e-3,
+            atol=1e-3,
+        )
+
+        code = pallas_literal_prefixed_row_slab_sum.bind((x, offsets)).to_triton_code(
+            helion.Config(block_sizes=[8], pallas_loop_type="emit_pipeline")
+        )
+        self.assertIn("pltpu.emit_pipeline", code)
+        self.assertIn("pl.BlockSpec((1, pl.BoundedSlice", code)
+        self.assertIn("lambda _j: (1, pl.ds(start + _j * _BLOCK_SIZE_1", code)
+        self.assertIn("pipeline_mode=pl.Buffered", code)
+        self.assertIn("_pipeline_arg_indices=[1]", code)
+        self.assertNotIn("pltpu.make_async_copy", code)
 
     def test_tile_id_per_block_accumulator(self) -> None:
         """Writing to ``out[tile.id, :]`` stores one row per outer grid iter.

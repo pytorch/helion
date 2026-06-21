@@ -358,6 +358,25 @@ def _fully_jagged_kernel(q, k, v, q_offsets, kv_offsets):
 
 
 @helion.kernel(backend="pallas", static_shapes=True)
+def _kv_owned_jagged_kernel(q, dO, kv_template, q_offsets, kv_offsets):
+    num_sequences = q_offsets.size(0) - 1
+    out = torch.empty_like(kv_template)
+    for seq_idx in hl.grid(num_sequences):
+        q_start = q_offsets[seq_idx]
+        q_end = q_offsets[seq_idx + 1]
+        kv_start = kv_offsets[seq_idx]
+        kv_end = kv_offsets[seq_idx + 1]
+        for tile_kv in hl.tile(kv_start, kv_end):
+            acc = kv_template[tile_kv, :, :].transpose(0, 1).to(torch.float32)
+            for tile_q in hl.tile(q_start, q_end):
+                q_blk = q[tile_q, :, :].transpose(0, 1)
+                do_blk = dO[tile_q, :, :].transpose(0, 1)
+                acc = acc + (q_blk + do_blk).sum(dim=1, keepdim=True)
+            out[tile_kv, :, :] = acc.transpose(0, 1).to(out.dtype)
+    return out
+
+
+@helion.kernel(backend="pallas", static_shapes=True)
 def _add_kernel(x, y):
     out = torch.empty_like(x)
     for tile in hl.tile(out.size()):
@@ -827,6 +846,70 @@ class TestNoSilentFallback(unittest.TestCase):
         with self.assertRaises(exc.InvalidConfig):
             bound.ensure_config_exists(args)
             bound.to_triton_code(bound._config)
+
+
+@onlyBackends(["pallas"])
+class TestStreamingClassification(unittest.TestCase):
+    def test_fully_jagged_ordered_kv_streams_without_new_launcher_api(self):
+        qo = _offsets([12, 20, 5, 30])
+        kvo = _offsets([13, 7, 19, 11])
+        lq, lkv = int(qo[-1]), int(kvo[-1])
+        args = (
+            torch.randn(lq, 4, 128),
+            torch.randn(lkv, 4, 128),
+            torch.randn(lkv, 4, 128),
+            qo,
+            kvo,
+        )
+        code = _fully_jagged_kernel.bind(args).to_triton_code(
+            helion.Config(block_sizes=[8, 8], pallas_loop_type="compact_worklist")
+        )
+
+        self.assertIn("_pipeline_arg_indices=", code)
+        self.assertIn("pltpu.make_async_copy(k.at[pl.ds(kv_begin_ref[_wid]", code)
+        self.assertIn("pltpu.make_async_copy(v.at[pl.ds(kv_begin_ref[_wid]", code)
+        self.assertIn("_compact_aligned_arg_indices=", code)
+        self.assertNotIn("pltpu.make_async_copy(q.at", code)
+        self.assertNotIn("pltpu.make_async_copy(out.at", code)
+        self.assertNotIn("pl.multiple_of(kv_begin_ref[_wid]", code)
+
+    def test_dense_kv_owner_indexed_tensors_do_not_stream(self):
+        qo = _offsets([12, 20, 5, 30])
+        lq = int(qo[-1])
+        args = (
+            torch.randn(lq, 4, 128),
+            torch.randn(4, 16, 4, 128),
+            torch.randn(4, 16, 4, 128),
+            qo,
+        )
+        code = _dense_kv_kernel.bind(args).to_triton_code(
+            helion.Config(block_sizes=[8], pallas_loop_type="compact_worklist")
+        )
+
+        self.assertNotIn("_pipeline_arg_indices=", code)
+        self.assertNotIn("pltpu.make_async_copy", code)
+
+    def test_kv_owned_backward_shape_streams_ordered_q_like_loads(self):
+        qo = _offsets([12, 20, 5, 30])
+        kvo = _offsets([13, 7, 19, 11])
+        lq, lkv = int(qo[-1]), int(kvo[-1])
+        args = (
+            torch.randn(lq, 4, 128),
+            torch.randn(lq, 4, 128),
+            torch.randn(lkv, 4, 128),
+            qo,
+            kvo,
+        )
+        code = _kv_owned_jagged_kernel.bind(args).to_triton_code(
+            helion.Config(block_sizes=[8, 8], pallas_loop_type="compact_worklist")
+        )
+
+        self.assertIn("_pipeline_arg_indices=", code)
+        self.assertIn("pltpu.make_async_copy(q.at[pl.ds(q_begin_ref[_wid]", code)
+        self.assertIn("pltpu.make_async_copy(dO.at[pl.ds(q_begin_ref[_wid]", code)
+        self.assertIn("_compact_aligned_arg_indices=", code)
+        self.assertNotIn("pltpu.make_async_copy(out.at", code)
+        self.assertNotIn("pl.multiple_of(q_begin_ref[_wid]", code)
 
 
 def _eager_dense_kv(q, k, v, qo):
