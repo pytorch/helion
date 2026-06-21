@@ -109,8 +109,8 @@ class MatmulFact(NamedTuple):
 
 
 class ReductionFact(NamedTuple):
-    """Workload facts for one inner reduction dim, recorded at compile time (analogous
-    to ``MatmulFact``) so the seed heuristic branches on workload properties, not kernel
+    """Workload facts for one inner reduction dim, recorded at compile time (like
+    ``MatmulFact``) so the seed heuristic branches on workload properties, not kernel
     identity. Exactly one per seeded kernel; built in device_ir's
     ``register_rollable_reductions`` (standard) or ``register_user_tiled_reductions``
     (user-tiled).
@@ -129,8 +129,7 @@ class ReductionFact(NamedTuple):
     - ``row_reread``: True iff the reduction-input row is live across the loop boundary
       (risks spilling). Gates the persist byte cap + re-read eviction. From ``MemoryOpFact``.
     - ``reread_eviction_index``: ``load_eviction_policies`` slot of the re-read load
-      (``None`` unless ``row_reread``), read from that load's
-      ``MemoryOpFact.eviction_index`` — no re-walk.
+      (``None`` unless ``row_reread``), read from that load's ``MemoryOpFact.eviction_index``.
     - ``full_width_output``: True iff a store writes the result back over the reduction
       axis ([M, N], e.g. layer_norm), False for a per-row scalar ([M], e.g. sum) —
       full-width is store/occupancy-bound, scalar-output reduction-tree-bound (opposite
@@ -138,27 +137,21 @@ class ReductionFact(NamedTuple):
     - ``input_load_itemsize``: element size of the HBM input row load — the dtype-faithful
       per-byte signal, distinct from ``itemsize`` (fp32-promoted = 4 at both dtypes). 0
       when no single reduction-fed row load exists.
-    - ``body_live_tiles``: peak number of simultaneously-live rdim-shaped tensor values in the
-      reduction body — the liveness signal that bounds the persistent resident footprint. A
-      heavy body (e.g. fused_linear_jsd's softmax->log_softmax->KL->grad chain holds ~7 live
-      ``[M_BLOCK, rdim]`` fp32 tiles) spills the register file when held persistent, so the
-      standard track uses it as ``footprint_factor`` to route such reductions to the looped
-      path. Derived (read off the walker liveness slice for this axis); a conservative
-      over-count (all rdim-shaped values live at a point; register rematerialization may reduce
-      true pressure) so it errs toward looping, never toward an unsafe persistent spill.
-      Defaults to 1 (single resident tile) for facts built without the liveness slice.
+    - ``body_live_tiles``: peak count of simultaneously-live rdim-shaped values in the
+      reduction body — the liveness signal bounding the persistent resident footprint. A
+      heavy body spills the register file when held persistent, so the standard track passes
+      it as ``footprint_factor`` to route such reductions to the looped path. A conservative
+      over-count (errs toward looping, never an unsafe spill); defaults to 1.
     - ``per_feature_accumulator``: the faithful M-collapse discriminator — True iff a
       loop-carried accumulator exists whose dims are ALL the materialized feature axis (the
       grad-parameter buffer, e.g. ``grad_bias[N]`` / ``grad_weight[N]``), read from
       accumulator provenance. The user-tiled seed keys ``is_m_collapse`` on it. False for
-      per-row or 2-D accumulators (softmax_two_pass/kl_div/welford/...). Populated here in
-      stage2a (the recognizer); first consumed by the M-collapse specialization in a later
-      commit. Defaults to False.
+      per-row or 2-D accumulators (softmax_two_pass/kl_div/welford/...).
     - ``feature_footprint``: the PRODUCT of the materialized feature-axis extents — the
       resident ``[inner, *features]`` per-row footprint a grad-parameter M-collapse byte-caps
       its inner reduction tile against (``feature_footprint * itemsize``). For a 2-D norm this
-      is ``N``; for a 3-D norm the full ``C*S``. Defaults to 1 when no materialized feature
-      axis exists.
+      is ``N``; for a 3-D norm the full ``C*S`` (a per-axis MAX under-counts and spills). Used
+      by both M-collapse tracks; 1 when no materialized feature axis exists.
 
     ``grid_rows`` is NOT stored — a pure function of ``m_block_ids`` + env, computed on
     demand by its one consumer (the narrow-row ``num_warps`` lever).

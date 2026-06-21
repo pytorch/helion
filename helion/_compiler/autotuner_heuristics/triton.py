@@ -370,6 +370,12 @@ class _TritonReductionSeedBase(AutotunerHeuristic):
     # Max resident bytes a PERSISTENT reduction body (body_live_tiles full-width tiles) may hold
     # before catastrophic register spill. Only REMOVES persistence from a heavy body, never grows it.
     LIVE_PERSIST_BUDGET = 3 * 245760
+    # M-COLLAPSE (grad-parameter reduction, e.g. bias_grad): max rows one CTA reduces in a single
+    # in-register inner tile, capped so the reduction tree + [rows, feature] tile don't spill.
+    M_COLLAPSE_MAX_CTA = 256
+    # M-COLLAPSE inner reduction tile byte budget: a grad-parameter collapse is memory-bound, so
+    # the inner [rows, feature] tile wants the SMALLEST footprint (~2-8 rows) for CTA occupancy.
+    M_COLLAPSE_TILE_BYTES = 32768
     # No welford "structured-combine floor": welford is memory-bound (profiler-confirmed),
     # so a wide combine tile only spills — register-residency via the reduction footprint cap
     # is what matters. The apply/normalize tile gets the SAME M_BLOCK-aware footprint cap as
@@ -655,6 +661,41 @@ class _TritonReductionSeedBase(AutotunerHeuristic):
         # (reduction_loops=[None] standard, or R_BLOCK == rdim user-tiled), never set separately.
         return r_block, r_block >= rdim
 
+    @classmethod
+    def _m_collapse_grid_block(
+        cls, env: CompileEnvironment, fact: ReductionFact, cap: int | None = None
+    ) -> int:
+        """Occupancy-sized grid M block for a grad-parameter M-collapse (rms/ln/instance/group
+        backward on the standard track; bias_grad/dyt on the user-tiled track). The
+        grad-parameter (``grad_weight[N]`` / ``grad_bias[N]``) is summed across the grid rows
+        into a per-CTA partial finalized by a cross-CTA ``sum(0)``; with the block floored to 1
+        that is a grid-wide M-way collapse (one partial/row), so size it to ~one SM wave
+        (``next_pow2(grid_rows // num_sm)``) to cut it to ~``num_sm`` partials.
+
+        ``cap`` bounds the block when it ALSO bears the reduction slab (user-tiled pure
+        collapse, capped at ``M_COLLAPSE_MAX_CTA``); the standard track leaves it uncapped
+        because the resident ``[inner, feature]`` set rides a separate inner re-tile, not this
+        block. A dynamic/unbacked grid (``grid_rows == 0``) collapses to 1.
+        """
+        from ..._utils import next_power_of_2 as _np2
+        from ...runtime import get_num_sm
+
+        grid_rows = _grid_rows(env, fact.m_block_ids)
+        num_sm = max(1, get_num_sm(env.device))
+        block = _np2(max(1, grid_rows // num_sm))
+        return max(1, block if cap is None else min(cap, block))
+
+    @classmethod
+    def _m_collapse_inner_byte_cap(cls, feat_bytes: int) -> int:
+        """Largest pow2 inner reduction tile whose resident ``[inner, feature]`` fp32 set fits
+        ``M_COLLAPSE_TILE_BYTES``, given the per-row feature footprint ``feat_bytes``. Both
+        M-collapse tracks pass ``fact.feature_footprint * itemsize`` (the PRODUCT of the
+        materialized feature axes); for a 2-D norm that product is the single feature axis.
+        """
+        from ..._utils import next_power_of_2 as _np2
+
+        return max(1, _np2(max(1, cls.M_COLLAPSE_TILE_BYTES // max(1, feat_bytes))))
+
 
 class TritonStandardReductionHeuristic(_TritonReductionSeedBase):
     """standard (Helion-rolled rdim) inner-reduction seed: Helion rolls the reduction axis
@@ -745,6 +786,40 @@ class TritonStandardReductionHeuristic(_TritonReductionSeedBase):
         block_sizes = cls._build_block_sizes(
             spec, fact, None, None, non_reduction_loop_ids=non_reduction_loop_ids
         )
+        # Dual-axis grad-parameter M-collapse (rms/ln/instance/group bwd): the grid M block is re-tiled
+        # by an inner loop and feeds a per-feature grad accumulator finalized across CTAs.
+        # _build_block_sizes floors it to 1 (leaving a grid-wide finalize); size it for occupancy so the
+        # finalize shrinks to ~num_sm partials. Gated on per_feature_accumulator, which is False for the
+        # 9 standard + 8 transfer kernels, so their seeds stay byte-identical.
+        if fact.per_feature_accumulator:
+            # The lever needs the grow-grid / byte-cap-inner decomposition to exist: a non-grid
+            # inner tile bearing residency. per_feature_accumulator implies a device carry loop
+            # (not the grid or rdim) that appears in inner_tile_ids, so an EMPTY inner_tile_ids
+            # means no inner re-tile -- skip the lever and keep the base materialized seed.
+            grid_ids = {b for bids in device_ir.grid_block_ids for b in bids}
+            inner_tile_ids = [
+                b
+                for b in spec.block_sizes.valid_block_ids()
+                if b not in grid_ids
+                and b != fact.block_id
+                and b not in non_reduction_loop_ids
+            ]
+            if inner_tile_ids:
+                # Occupancy-size the grid M block (the dominant lever), byte-cap the inner
+                # re-tile to the feature footprint, and drop the narrow-w1 warps lever: it keys
+                # on rdim extent alone, but the resident tile here is [inner, feature]-wide, so
+                # the plain extent ramp (>=4 warps) is faithful. Only instance_norm is affected.
+                m_cta = cls._m_collapse_grid_block(env, fact)
+                for mbid in fact.m_block_ids:
+                    block_sizes[spec.block_sizes.block_id_to_index(mbid)] = m_cta
+                inner = cls._m_collapse_inner_byte_cap(
+                    max(1, fact.feature_footprint) * max(1, fact.itemsize)
+                )
+                for bid in inner_tile_ids:
+                    block_sizes[spec.block_sizes.block_id_to_index(bid)] = inner
+                num_warps = cls._num_warps(
+                    fact
+                )  # num_sm/grid_rows default 0 -> no narrow-w1
         seed: dict[str, Any] = {
             "block_sizes": block_sizes,
             "reduction_loops": reduction_loops,
@@ -821,6 +896,34 @@ class TritonUserTiledReductionHeuristic(_TritonReductionSeedBase):
         # residency (single-tile footprint + the folded-in carried-2-D cap for kl_div/jsd) and returns
         # it directly; _persistent is unused on this track.
         r_block, _persistent = cls._reduction_rblock(env, fact, m_block)
+        # M-COLLAPSE (grad-parameter reduction, e.g. bias_grad/dyt): collapse the grid/row axis into a
+        # per-feature accumulator, sizing the grid CTA for occupancy instead of T2's floored grid.
+        m_collapse_block: int | None = None
+        # Faithful signature: per_feature_accumulator -- a loop-carried accumulator over ALL
+        # the materialized feature axis (bias_grad/dyt); per-row / 2-D accumulators are excluded.
+        is_m_collapse = fact.per_feature_accumulator
+        if is_m_collapse:
+            # (a) grid CTA -> OCCUPANCY (_m_collapse_grid_block), capped at M_COLLAPSE_MAX_CTA since the
+            #     grid block also bears the reduction slab (sum(0) finalize over ~num_sm partials). An
+            #     unbacked/AOT grid (grid_rows == 0) falls through to block 1 -- a worse seed, not a bug.
+            m_collapse_block = cls._m_collapse_grid_block(
+                env, fact, cap=cls.M_COLLAPSE_MAX_CTA
+            )
+            # (b) inner reduction tile: depends on whether the collapse has PER-ROW WORK,
+            #     which ``body_live_tiles`` measures (peak simultaneously-live full-width tiles).
+            if fact.body_live_tiles <= 1:
+                # PURE collapse (bias_grad: read + sum, ONE resident tile): a big inner tile is
+                # cheap and cuts loop overhead, so reduce the whole CTA wave in one slab (bounded
+                # by the grid block + 256 cap).
+                r_block = m_collapse_block
+            else:
+                # Collapse WITH per-row work (dyt: full-width grad_x store + tanh intermediates):
+                # a big inner tile spills, so byte-cap the resident [inner, feature] footprint
+                # tight (~2-8 rows) for occupancy.
+                feat_bytes = max(1, fact.feature_footprint) * max(1, fact.itemsize)
+                inner_cap = cls._m_collapse_inner_byte_cap(feat_bytes)
+                r_block = max(1, min(m_collapse_block, inner_cap))
+
         num_warps = cls._num_warps(
             fact, max(1, get_num_sm(env.device)), _grid_rows(env, fact.m_block_ids)
         )
@@ -832,6 +935,12 @@ class TritonUserTiledReductionHeuristic(_TritonReductionSeedBase):
             r_block,
             non_reduction_loop_ids=non_reduction_loop_ids,
         )
+        if m_collapse_block is not None:
+            # Raise the grid CTA tile(s) from the floor to the occupancy block (the reduction
+            # tile was already set to m_collapse_block via r_block above).
+            for mbid in fact.m_block_ids:
+                idx = spec.block_sizes.block_id_to_index(mbid)
+                block_sizes[idx] = m_collapse_block
         seed: dict[str, Any] = {
             "block_sizes": block_sizes,
             "num_warps": num_warps,
