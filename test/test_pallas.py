@@ -979,6 +979,80 @@ class TestPallas(TestCase):
         )
         torch.testing.assert_close(out, x + 3.0)
 
+    @skipIfPallasInterpret(
+        "data-dependent writeback emits a dynamic-size DMA slice (pl.ds with a "
+        "traced size) that JAX interpret mode cannot discharge"
+    )
+    def test_fori_loop_inplace_writeback_preserves_untouched(self) -> None:
+        """A pipelined (DMA-routed) in-place output preserves its untouched rows.
+
+        Regression: an HBM-backed pipeline tensor skips the wrapper's
+        input->output copy, so without pallas_call ``input_output_aliases`` the
+        unwritten regions come back garbage.  This KV-cache writeback DMAs only
+        each sequence's new token; the rest of the cache must survive.
+        """
+
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def kv_writeback(
+            cache: torch.Tensor,  # [pages*page_size, heads_x2, D] (in-place)
+            merged_kv: torch.Tensor,  # [total_q, heads_x2, D]
+            kv_lens: torch.Tensor,
+            page_indices: torch.Tensor,
+            cu_q_lens: torch.Tensor,
+            pages_per_seq: int,
+            page_size: int,
+        ) -> torch.Tensor:
+            num_seqs = kv_lens.size(0)
+            for seq_idx in hl.grid(num_seqs):
+                q_start = cu_q_lens[seq_idx]
+                q_end = cu_q_lens[seq_idx + 1]
+                q_len = q_end - q_start
+                base = kv_lens[seq_idx] - q_len  # first new token's logical pos
+                page = page_indices[seq_idx * pages_per_seq + base // page_size]
+                phys = page * page_size + base % page_size
+                for tile_dst in hl.tile(phys, phys + q_len):
+                    rel = tile_dst.index - phys
+                    cache[tile_dst, :, :] = merged_kv[q_start + rel, :, :]
+            return cache
+
+        heads_x2, hd, page_size = 16, 128, 256
+        num_seqs, pages_per_seq = 3, 4
+        total_pages = num_seqs * pages_per_seq
+        cache = torch.randn(
+            total_pages * page_size, heads_x2, hd, device=DEVICE, dtype=torch.bfloat16
+        )
+        merged = torch.randn(
+            num_seqs, heads_x2, hd, device=DEVICE, dtype=torch.bfloat16
+        )
+        kv_lens = torch.tensor([512, 256, 64], dtype=torch.int32, device=DEVICE)
+        cu_q = torch.tensor([0, 1, 2, 3], dtype=torch.int32, device=DEVICE)
+        page_indices = torch.arange(total_pages, dtype=torch.int32, device=DEVICE)
+
+        # decode (one new token per sequence) scattered into the physical slots.
+        expected = cache.clone()
+        for s in range(num_seqs):
+            base = int(kv_lens[s]) - 1
+            page = int(page_indices[s * pages_per_seq + base // page_size])
+            expected[page * page_size + base % page_size] = merged[s]
+
+        # fori_loop + the DMA-aligned [.., 16, 128] shape make the cache a
+        # pipeline (DMA-routed) tensor. It's modified in-place by the kernel.
+        code_and_output(
+            kv_writeback,
+            (
+                cache,
+                merged,
+                kv_lens,
+                page_indices,
+                cu_q,
+                pages_per_seq,
+                page_size,
+            ),
+            block_sizes=[8],
+            pallas_loop_type="fori_loop",
+        )
+        torch.testing.assert_close(cache, expected)
+
     def test_add_does_not_donate_inputs(self) -> None:
         """Verify that read-only inputs are not donated by the kernel.
 
