@@ -2186,6 +2186,17 @@ class BlockSizeSpec(_PowerOfTwoBlockIdItem):
         clamped = max(value, 1)
         self.max_size = assert_integer_power_of_two(min(clamped, self.max_size))
 
+    def raise_max(self, value: int) -> None:
+        """Raise the autotune max ABOVE the size-hint-derived ceiling.
+
+        Unlike ``update_max`` (which can only lower the ceiling), this lets a
+        block search block sizes larger than ``next_power_of_2(size_hint)``. It
+        is used only for a matmul M axis whose ``block_m`` may legally exceed the
+        (small) static M and run on a larger padded/masked tcgen05 tile; ordinary
+        tiles never call it, so the generic search space is unchanged.
+        """
+        self.max_size = assert_integer_power_of_two(max(value, self.max_size))
+
     def update_hint(self, value: int) -> None:
         self.size_hint = value
         self.update_max(next_power_of_2(max(value, 1)))

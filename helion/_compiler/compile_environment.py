@@ -1375,10 +1375,24 @@ class BlockSizeInfo:
         with contextlib.suppress(KeyError):
             spec.block_sizes.block_id_lookup(self.block_id).update_min(value)
 
-    def update_max_block(self, value: int) -> None:
+    def update_max_block(self, value: int, *, allow_raise: bool = False) -> None:
+        """Constrain this block's autotune max size.
+
+        By default ``update_max`` can only *lower* the max (it is clamped to the
+        existing ``next_power_of_2(size_hint)`` ceiling). Pass ``allow_raise=True``
+        to instead allow raising the ceiling ABOVE the size hint -- needed for a
+        matmul M axis whose ``block_m`` may legally exceed the (tiny) static M and
+        run on a larger padded/masked tcgen05 tile. This is scoped to the matmul
+        M axis by its single caller in ``matmul_ops.py``; ordinary tile dims keep
+        the size-hint ceiling so the search space does not explode.
+        """
         spec = CompileEnvironment.current().config_spec
         with contextlib.suppress(KeyError):
-            spec.block_sizes.block_id_lookup(self.block_id).update_max(value)
+            block_spec = spec.block_sizes.block_id_lookup(self.block_id)
+            if allow_raise:
+                block_spec.raise_max(value)
+            else:
+                block_spec.update_max(value)
 
 
 class BlockSizeSource:
