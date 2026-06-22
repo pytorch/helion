@@ -35,10 +35,13 @@ import textwrap
 from typing import TYPE_CHECKING
 from typing import NamedTuple
 from typing import TypeVar
+from typing import cast
 
 import torch
 
+from ...autotuner.config_fragment import ConfigSpecFragment
 from ...autotuner.config_fragment import EnumFragment
+from ...runtime.config import Config
 from ..device_function import TensorArg
 from .attention_plan import ALIBI_BIAS_KIND
 from .attention_plan import CAUSAL_MASK_KIND
@@ -923,6 +926,11 @@ class FlashAttentionConfig:
     e2e_freq: int = 8
     e2e_res: int = 2
     e2e_schedule: str = "8/2"
+    # Causal diagonal/masked tiles can use a different exp2 schedule from the
+    # fully unmasked tiles. ``inherit`` preserves the main e2e schedule.
+    masked_e2e_schedule: str = "inherit"
+    masked_e2e_freq: int = 8
+    masked_e2e_res: int = 2
     e2e_offset: int = 0
     e2e_offset0: int = 0
     tmem_plan: str = "separate"
@@ -990,6 +998,17 @@ class FlashAttentionConfig:
     # Causal FA4 launch-order swizzle. 0 keeps the shape-derived L2 heuristic;
     # positive values force the batch/head interleave group size.
     causal_lpt_swizzle: int = 0
+    # Causal FA4 KV traversal order. ``ascending`` preserves Helion's original
+    # left-to-right stream; ``descending`` matches upstream FA4's diagonal-first
+    # stream and is searchable because it is shape-sensitive.
+    causal_kv_order: str = "ascending"
+    # Warp-role assignment inside the last FA4 warpgroup. ``helion`` preserves
+    # the original transcription; ``fa4`` matches upstream's load/epilogue warp
+    # ordering.
+    role_map: str = "helion"
+    # Causal descending KV can run the short masked diagonal prefix separately
+    # from the hot unmasked suffix, removing a per-KV branch from most tiles.
+    causal_loop_split: bool = False
 
 
 def _flash_bool_env(name: str, default: bool) -> bool:
@@ -1011,27 +1030,64 @@ def _flash_causal_hd64_seed_num_kv_supported(num_kv: int | None) -> bool:
 
 def _flash_causal_hd64_seed_params(num_kv: int) -> tuple[int, int, int, int]:
     """Return best-known causal hd64 FA4 knobs as (offset, disc, regs, lpt)."""
-    if num_kv >= 512:
+    if num_kv <= 64:
         e2e_offset = 0
-    elif num_kv == 64:
-        e2e_offset = 11
-    elif num_kv == 32:
-        e2e_offset = 2
-    else:
-        e2e_offset = 4
-    disc_pipe = 3 if num_kv >= 512 else 2
-    softmax_regs = 184 if num_kv >= 512 else 200
-    if num_kv in (32, 64):
+        disc_pipe = 2
+        softmax_regs = 200
         lpt_swizzle = 8
-    elif num_kv == 128:
+    elif num_kv <= 128:
+        e2e_offset = 0
+        disc_pipe = 2
+        softmax_regs = 192
+        lpt_swizzle = 8
+    elif num_kv <= 256:
+        e2e_offset = 1
+        disc_pipe = 4
+        softmax_regs = 184
         lpt_swizzle = 4
-    elif num_kv == 256:
-        lpt_swizzle = 2
-    elif num_kv >= 512:
-        lpt_swizzle = 1
     else:
-        lpt_swizzle = 0
+        e2e_offset = 9
+        disc_pipe = 4
+        softmax_regs = 184
+        lpt_swizzle = 1
     return e2e_offset, disc_pipe, softmax_regs, lpt_swizzle
+
+
+def _flash_causal_hd64_seed_masked_schedule(num_kv: int) -> str:
+    return "inherit" if num_kv <= 64 else "16/4"
+
+
+def _flash_causal_hd64_seed_role_map(num_kv: int) -> str:
+    if num_kv == 128:
+        return "fa4"
+    return "helion"
+
+
+def _flash_causal_hd64_seed_epi_tma(num_kv: int) -> bool:
+    return num_kv <= 128
+
+
+def _flash_causal_hd64_seed_rescale_chunk_cols(num_kv: int) -> int:
+    return 16 if num_kv <= 256 else 32
+
+
+def _flash_causal_hd64_seed_offset0(num_kv: int) -> int:
+    if num_kv <= 64:
+        return 1
+    if num_kv <= 128:
+        return 0
+    if num_kv <= 256:
+        return 11
+    return 3
+
+
+def _flash_causal_hd64_kv_order_weights(num_kv: int) -> dict[str, float]:
+    return {"descending": 4.0, "ascending": 1.0}
+
+
+def _flash_causal_hd64_seed_kv_order(num_kv: int) -> str:
+    weights = _flash_causal_hd64_kv_order_weights(num_kv)
+    return "descending" if weights["descending"] > weights["ascending"] else "ascending"
 
 
 def _flash_parse_e2e_schedule(schedule: str, fallback: str) -> tuple[str, int, int]:
@@ -1066,6 +1122,54 @@ def _flash_e2e_schedule_name(exp2_impl: str, e2e_freq: int, e2e_res: int) -> str
     if exp2_impl != "split" or e2e_res == 0:
         return "xu"
     return f"{e2e_freq}/{e2e_res}"
+
+
+def _flash_masked_e2e_schedule_params(
+    schedule: str,
+    fallback_schedule: str,
+    base_e2e_freq: int,
+    base_e2e_res: int,
+) -> tuple[str, int, int]:
+    """Return canonical masked-tile schedule fields.
+
+    ``inherit`` is the default and reuses the unmasked schedule. Other accepted
+    values are intentionally the small characterized schedule set.
+    """
+    candidate = schedule.strip().lower()
+    if candidate in ("", "inherit"):
+        return "inherit", base_e2e_freq, base_e2e_res
+    if candidate not in ("xu", "16/4", "8/2"):
+        return "inherit", base_e2e_freq, base_e2e_res
+    exp2_impl, e2e_freq, e2e_res = _flash_parse_e2e_schedule(
+        candidate, fallback_schedule
+    )
+    _exp2_impl, e2e_freq, e2e_res, e2e_schedule = _flash_normalize_e2e_params(
+        exp2_impl, e2e_freq, e2e_res, fallback_schedule
+    )
+    return e2e_schedule, e2e_freq, e2e_res
+
+
+def _flash_e2e_offset_period(
+    e2e_freq: int,
+    e2e_res: int,
+    masked_e2e_freq: int,
+    masked_e2e_res: int,
+) -> int:
+    """Return the modulo period needed by all active split-exp2 pass2 paths."""
+    period = 0
+    if e2e_res > 0:
+        period = max(period, e2e_freq)
+    if masked_e2e_res > 0:
+        period = max(period, masked_e2e_freq)
+    return period
+
+
+def _flash_normalize_e2e_offset(value: int, default: int, period: int) -> int:
+    if period <= 0:
+        return 0
+    if value < 0:
+        return default % period
+    return value % period
 
 
 def _flash_normalize_e2e_params(
@@ -1204,7 +1308,11 @@ def resolve_flash_config(
     # Exp2 pipe-split schedule. The autotuner sees this as one paired schedule
     # knob so it never searches meaningless combinations like exp2_impl="xu"
     # with independent e2e cadence values, or regressive res/freq pairings.
-    e2e_schedule_default = _flash_e2e_schedule_default(topology, head_dim)
+    e2e_schedule_default = (
+        "8/2"
+        if causal_hd64_seeded_fa4
+        else _flash_e2e_schedule_default(topology, head_dim)
+    )
     e2e_schedule = os.environ.get(
         "HELION_CUTE_FLASH_E2E_SCHEDULE", e2e_schedule_default
     )
@@ -1236,11 +1344,43 @@ def resolve_flash_config(
     exp2_impl, e2e_freq, e2e_res, e2e_schedule = _flash_normalize_e2e_params(
         exp2_impl, e2e_freq, e2e_res, e2e_schedule_default
     )
-    if causal_hd64_seeded_fa4 and e2e_res > 0:
-        e2e_offset_default = causal_e2e_offset_default
+    masked_e2e_schedule_default = (
+        _flash_causal_hd64_seed_masked_schedule(num_kv)
+        if causal_hd64_seeded_fa4
+        else "inherit"
+    )
+    masked_e2e_schedule = os.environ.get(
+        "HELION_CUTE_FLASH_MASKED_E2E_SCHEDULE", masked_e2e_schedule_default
+    )
+    masked_e2e_schedule_cfg = _cfg(FLASH_MASKED_E2E_SCHEDULE_KEY)
+    if masked_e2e_schedule_cfg is not None:
+        masked_e2e_schedule = str(masked_e2e_schedule_cfg)
+    masked_e2e_schedule, masked_e2e_freq, masked_e2e_res = (
+        _flash_masked_e2e_schedule_params(
+            masked_e2e_schedule,
+            e2e_schedule_default,
+            e2e_freq,
+            e2e_res,
+        )
+    )
+    if not is_causal or topology != "fa4":
+        masked_e2e_schedule = "inherit"
+        masked_e2e_freq = e2e_freq
+        masked_e2e_res = e2e_res
+    e2e_offset_period = _flash_e2e_offset_period(
+        e2e_freq,
+        e2e_res,
+        masked_e2e_freq,
+        masked_e2e_res,
+    )
+    if causal_hd64_seeded_fa4 and e2e_offset_period > 0:
+        e2e_offset_default = causal_e2e_offset_default % e2e_offset_period
     else:
+        split_default_freq = e2e_freq if e2e_res > 0 else masked_e2e_freq
         e2e_offset_default = (
-            e2e_freq // 8 if topology == "fa4" and head_dim == 64 and e2e_res > 0 else 0
+            split_default_freq // 8
+            if topology == "fa4" and head_dim == 64 and e2e_offset_period > 0
+            else 0
         )
     e2e_offset = int(
         os.environ.get("HELION_CUTE_FLASH_E2E_OFFSET", str(e2e_offset_default))
@@ -1248,20 +1388,23 @@ def resolve_flash_config(
     e2e_offset_cfg = _cfg(FLASH_E2E_OFFSET_KEY)
     if e2e_offset_cfg is not None:
         e2e_offset = int(e2e_offset_cfg)  # type: ignore[arg-type]
-    if e2e_res == 0:
-        e2e_offset = 0
-    elif e2e_offset < 0:
-        e2e_offset = e2e_offset_default % e2e_freq
-    else:
-        e2e_offset %= e2e_freq
-    e2e_offset0 = int(os.environ.get("HELION_CUTE_FLASH_E2E_OFFSET0", "0"))
+    e2e_offset = _flash_normalize_e2e_offset(
+        e2e_offset, e2e_offset_default, e2e_offset_period
+    )
+    e2e_offset0_default = (
+        _flash_causal_hd64_seed_offset0(num_kv)
+        if causal_hd64_seeded_fa4 and e2e_offset_period > 0
+        else 0
+    )
+    e2e_offset0 = int(
+        os.environ.get("HELION_CUTE_FLASH_E2E_OFFSET0", str(e2e_offset0_default))
+    )
     e2e_offset0_cfg = _cfg(FLASH_E2E_OFFSET0_KEY)
     if e2e_offset0_cfg is not None:
         e2e_offset0 = int(e2e_offset0_cfg)  # type: ignore[arg-type]
-    if e2e_res == 0 or e2e_offset0 < 0:
-        e2e_offset0 = 0
-    else:
-        e2e_offset0 %= e2e_freq
+    e2e_offset0 = _flash_normalize_e2e_offset(
+        e2e_offset0, e2e_offset0_default, e2e_offset_period
+    )
     tmem_plan = os.environ.get("HELION_CUTE_FLASH_TMEM_PLAN", "separate")
     tmem_s_to_p_offset = int(
         os.environ.get("HELION_CUTE_FLASH_TMEM_S_TO_P_OFFSET", "0")
@@ -1302,7 +1445,11 @@ def resolve_flash_config(
     # fa4 Step 3 (Lever A): epilogue TMA-store. With a dedicated epilogue warp,
     # this is a measured hd128 win; hd64 keeps the per-thread STG path because
     # the extra smem handoff/TMA drain costs more than it saves there. fa4-only.
-    epi_tma_default = topology == "fa4" and head_dim == 128
+    epi_tma_default = (
+        _flash_causal_hd64_seed_epi_tma(num_kv)
+        if causal_hd64_seeded_fa4
+        else topology == "fa4" and head_dim == 128
+    )
     epi_tma = _flash_bool_env("HELION_CUTE_FLASH_EPI_TMA", epi_tma_default)
     epi_tma_cfg = _cfg(FLASH_EPI_TMA_KEY)
     if epi_tma_cfg is not None:
@@ -1321,7 +1468,13 @@ def resolve_flash_config(
         rescale_threshold = float(rescale_threshold_cfg)  # type: ignore[arg-type]
     if not math.isfinite(rescale_threshold):
         rescale_threshold = rescale_threshold_default
-    rescale_chunk_cols = 32 if head_dim == 64 else 16
+    rescale_chunk_cols = (
+        _flash_causal_hd64_seed_rescale_chunk_cols(num_kv)
+        if causal_hd64_seeded_fa4
+        else 32
+        if head_dim == 64
+        else 16
+    )
     softmax_regs = 200
     corr_regs = 64
     if topology == "fa4":
@@ -1375,6 +1528,45 @@ def resolve_flash_config(
         causal_lpt_swizzle = int(causal_lpt_swizzle_cfg)  # type: ignore[arg-type]
     if not is_causal:
         causal_lpt_swizzle = 0
+    causal_kv_order_default = (
+        _flash_causal_hd64_seed_kv_order(num_kv)
+        if causal_hd64_seeded_fa4
+        else "ascending"
+    )
+    causal_kv_order = os.environ.get(
+        "HELION_CUTE_FLASH_CAUSAL_KV_ORDER", causal_kv_order_default
+    )
+    causal_kv_order_cfg = _cfg(FLASH_CAUSAL_KV_ORDER_KEY)
+    if causal_kv_order_cfg is not None:
+        causal_kv_order = str(causal_kv_order_cfg)
+    if (
+        not is_causal
+        or topology != "fa4"
+        or causal_kv_order not in ("ascending", "descending")
+    ):
+        causal_kv_order = "ascending"
+    role_map_default = (
+        _flash_causal_hd64_seed_role_map(num_kv) if causal_hd64_seeded_fa4 else "helion"
+    )
+    role_map = os.environ.get("HELION_CUTE_FLASH_ROLE_MAP", role_map_default)
+    role_map_cfg = _cfg(FLASH_ROLE_MAP_KEY)
+    if role_map_cfg is not None:
+        role_map = str(role_map_cfg)
+    if role_map not in ("helion", "fa4"):
+        role_map = "helion"
+    if topology != "fa4":
+        role_map = "helion"
+    causal_loop_split_default = (
+        causal_hd64_seeded_fa4 and causal_kv_order == "descending"
+    )
+    causal_loop_split = _flash_bool_env(
+        "HELION_CUTE_FLASH_CAUSAL_LOOP_SPLIT", causal_loop_split_default
+    )
+    causal_loop_split_cfg = _cfg(FLASH_CAUSAL_LOOP_SPLIT_KEY)
+    if causal_loop_split_cfg is not None:
+        causal_loop_split = bool(causal_loop_split_cfg)
+    if not is_causal or topology != "fa4" or causal_kv_order != "descending":
+        causal_loop_split = False
     return FlashAttentionConfig(
         s_stage=s_stage,
         kv_stage=kv_stage,
@@ -1394,6 +1586,9 @@ def resolve_flash_config(
         e2e_freq=e2e_freq,
         e2e_res=e2e_res,
         e2e_schedule=e2e_schedule,
+        masked_e2e_schedule=masked_e2e_schedule,
+        masked_e2e_freq=masked_e2e_freq,
+        masked_e2e_res=masked_e2e_res,
         e2e_offset=e2e_offset,
         e2e_offset0=e2e_offset0,
         tmem_plan=tmem_plan,
@@ -1410,6 +1605,9 @@ def resolve_flash_config(
         packed_reduce=packed_reduce,
         small_biased=small_biased,
         causal_lpt_swizzle=causal_lpt_swizzle,
+        causal_kv_order=causal_kv_order,
+        role_map=role_map,
+        causal_loop_split=causal_loop_split,
     )
 
 
@@ -1433,6 +1631,7 @@ FLASH_S_STAGE_KEY = "cute_flash_s_stage"
 FLASH_KV_STAGE_KEY = "cute_flash_kv_stage"
 FLASH_PERSISTENT_KEY = "cute_flash_persistent"
 FLASH_E2E_SCHEDULE_KEY = "cute_flash_e2e_schedule"
+FLASH_MASKED_E2E_SCHEDULE_KEY = "cute_flash_masked_e2e_schedule"
 FLASH_E2E_OFFSET_KEY = "cute_flash_e2e_offset"
 FLASH_E2E_OFFSET0_KEY = "cute_flash_e2e_offset0"
 # Legacy fixed-config override keys. The autotuner uses the paired schedule key above.
@@ -1452,12 +1651,16 @@ FLASH_CORR_REGS_KEY = "cute_flash_corr_regs"
 FLASH_PACKED_REDUCE_KEY = "cute_flash_packed_reduce"
 FLASH_SMALL_BIASED_KEY = "cute_flash_small_biased"
 FLASH_CAUSAL_LPT_SWIZZLE_KEY = "cute_flash_causal_lpt_swizzle"
+FLASH_CAUSAL_KV_ORDER_KEY = "cute_flash_causal_kv_order"
+FLASH_ROLE_MAP_KEY = "cute_flash_role_map"
+FLASH_CAUSAL_LOOP_SPLIT_KEY = "cute_flash_causal_loop_split"
 
 FLASH_AUTOTUNE_CONFIG_KEYS: tuple[str, ...] = (
     FLASH_S_STAGE_KEY,
     FLASH_KV_STAGE_KEY,
     FLASH_PERSISTENT_KEY,
     FLASH_E2E_SCHEDULE_KEY,
+    FLASH_MASKED_E2E_SCHEDULE_KEY,
     FLASH_E2E_OFFSET_KEY,
     FLASH_E2E_OFFSET0_KEY,
     FLASH_TOPOLOGY_KEY,
@@ -1470,6 +1673,9 @@ FLASH_AUTOTUNE_CONFIG_KEYS: tuple[str, ...] = (
     FLASH_PACKED_REDUCE_KEY,
     FLASH_SMALL_BIASED_KEY,
     FLASH_CAUSAL_LPT_SWIZZLE_KEY,
+    FLASH_CAUSAL_KV_ORDER_KEY,
+    FLASH_ROLE_MAP_KEY,
+    FLASH_CAUSAL_LOOP_SPLIT_KEY,
 )
 
 FLASH_LEGACY_CONFIG_KEYS: tuple[str, ...] = (
@@ -1487,6 +1693,555 @@ FLASH_CONFIG_KEYS: tuple[str, ...] = (
 
 def _flash_choices_with_default(default: _T, choices: Iterable[_T]) -> tuple[_T, ...]:
     return (default, *(choice for choice in choices if choice != default))
+
+
+_FLASH_SEED_BLOCK_SIZE_TARGETS = (1, 128, 128)
+_FLASH_DENSE_HD64_MID_MIN_KV = 16
+_FLASH_DENSE_HD64_LONG_MIN_KV = 64
+
+
+def _flash_dense_hd64_seed_params(
+    num_kv: int,
+) -> tuple[int, int, int, int, bool, int, bool]:
+    """Return dense hd64 FA4 seed knobs.
+
+    The families track the configs found by full no-seed search for the
+    4K/8K/16K/32K dense sweep without baking in an exact shape-only config.
+    """
+    if num_kv < _FLASH_DENSE_HD64_LONG_MIN_KV:
+        return 3, 2, 2, 4, True, 16, False
+    if num_kv < 128:
+        return 2, 2, 2, 3, True, 16, True
+    if num_kv < 256:
+        return 2, 3, 2, 3, False, 16, True
+    return 2, 2, 2, 4, False, 32, True
+
+
+def flash_attention_value_prior_weights(
+    head_dim: int,
+    num_kv: int | None,
+    *,
+    is_causal: bool = False,
+    has_kv_tile_pruning: bool = False,
+    requires_ws_overlap: bool = False,
+) -> dict[str, dict[object, float]]:
+    """Return per-key sampling weights for flash-attention shape families.
+
+    These weights bias random search toward measured-good FA4 families without
+    injecting a complete fixed config. Exact fragment validation happens when
+    the backend converts the weights to ``ValuePrior`` objects.
+    """
+    if head_dim != 64 or num_kv is None:
+        return {}
+    if requires_ws_overlap or num_kv % 2 != 0:
+        return {}
+
+    if not is_causal and not has_kv_tile_pruning:
+        if num_kv < _FLASH_DENSE_HD64_MID_MIN_KV:
+            return {}
+        (
+            kv_stage,
+            e2e_offset,
+            e2e_offset0,
+            disc_pipe,
+            epi_tma,
+            rescale_chunk_cols,
+            packed_reduce,
+        ) = _flash_dense_hd64_seed_params(num_kv)
+        return cast(
+            "dict[str, dict[object, float]]",
+            {
+                FLASH_S_STAGE_KEY: {2: 1.0},
+                FLASH_TOPOLOGY_KEY: {"fa4": 4.0, "ws_overlap": 1.0},
+                FLASH_PERSISTENT_KEY: {True: 1.0},
+                FLASH_E2E_SCHEDULE_KEY: {"8/2": 3.0, "16/4": 2.0},
+                FLASH_DISC_PIPE_KEY: {
+                    disc_pipe: 4.0,
+                    **{depth: 2.0 for depth in (2, 3, 4) if depth != disc_pipe},
+                },
+                FLASH_RESCALE_THRESHOLD_KEY: {8.0: 1.0},
+                FLASH_RESCALE_CHUNK_COLS_KEY: {
+                    rescale_chunk_cols: 4.0,
+                    **{cols: 2.0 for cols in (16, 32) if cols != rescale_chunk_cols},
+                },
+                FLASH_CORR_REGS_KEY: {64: 1.0},
+                FLASH_EPI_TMA_KEY: {epi_tma: 4.0, not epi_tma: 1.0},
+                FLASH_SOFTMAX_REGS_KEY: {184: 3.0, 200: 2.0},
+                FLASH_KV_STAGE_KEY: {
+                    kv_stage: 4.0,
+                    **{stage: 2.0 for stage in (2, 3) if stage != kv_stage},
+                },
+                FLASH_PACKED_REDUCE_KEY: {packed_reduce: 4.0, not packed_reduce: 1.0},
+                FLASH_E2E_OFFSET_KEY: {
+                    e2e_offset: 4.0,
+                    **{offset: 2.0 for offset in (1, 2, 3, 4) if offset != e2e_offset},
+                },
+                FLASH_E2E_OFFSET0_KEY: {
+                    e2e_offset0: 4.0,
+                    **{offset: 2.0 for offset in (0, 1, 2, 3) if offset != e2e_offset0},
+                },
+            },
+        )
+
+    if (
+        is_causal
+        and not has_kv_tile_pruning
+        and _flash_causal_hd64_seed_num_kv_supported(num_kv)
+    ):
+        e2e_offset, disc_pipe, softmax_regs, lpt_swizzle = (
+            _flash_causal_hd64_seed_params(num_kv)
+        )
+        masked_schedule = _flash_causal_hd64_seed_masked_schedule(num_kv)
+        role_map = _flash_causal_hd64_seed_role_map(num_kv)
+        epi_tma = _flash_causal_hd64_seed_epi_tma(num_kv)
+        rescale_chunk_cols = _flash_causal_hd64_seed_rescale_chunk_cols(num_kv)
+        e2e_offset0 = _flash_causal_hd64_seed_offset0(num_kv)
+        secondary_offsets = {
+            offset: 2.0 for offset in (0, 1, 2, 3, 4, 7, 9, 11) if offset != e2e_offset
+        }
+        causal_offset_weights = {
+            e2e_offset: 4.0,
+            **secondary_offsets,
+            **{
+                offset: 1.0
+                for offset in range(16)
+                if offset != e2e_offset and offset not in secondary_offsets
+            },
+        }
+        causal_lpt_weights = {
+            lpt_swizzle: 4.0,
+            **{
+                swizzle: 1.0
+                for swizzle in (0, 1, 2, 4, 8, 16)
+                if swizzle != lpt_swizzle
+            },
+        }
+        causal_disc_weights = {
+            disc_pipe: 4.0,
+            **{depth: 2.0 for depth in (2, 3, 4) if depth != disc_pipe},
+        }
+        causal_softmax_weights = {
+            softmax_regs: 4.0,
+            **{regs: 2.0 for regs in (184, 200) if regs != softmax_regs},
+            **({192: 1.0} if softmax_regs != 192 else {}),
+        }
+        masked_schedule_weights = {
+            masked_schedule: 4.0,
+            **{
+                schedule: 2.0
+                for schedule in ("inherit", "xu", "16/4", "8/2")
+                if schedule != masked_schedule
+            },
+        }
+        role_map_weights = {
+            role_map: 4.0,
+            **{role: 1.0 for role in ("helion", "fa4") if role != role_map},
+        }
+        epi_tma_weights = {epi_tma: 4.0, not epi_tma: 1.0}
+        rescale_chunk_weights = {
+            rescale_chunk_cols: 4.0,
+            **{cols: 2.0 for cols in (16, 32) if cols != rescale_chunk_cols},
+        }
+        return cast(
+            "dict[str, dict[object, float]]",
+            {
+                FLASH_TOPOLOGY_KEY: {"fa4": 4.0, "ws_overlap": 1.0},
+                FLASH_PERSISTENT_KEY: {False: 1.0},
+                FLASH_KV_STAGE_KEY: {
+                    2: 4.0,
+                    3: 2.0,
+                    4: 1.0,
+                    6: 2.0,
+                    8: 2.0,
+                    10: 2.0,
+                },
+                FLASH_E2E_SCHEDULE_KEY: {"8/2": 4.0, "16/4": 2.0, "xu": 1.0},
+                FLASH_MASKED_E2E_SCHEDULE_KEY: masked_schedule_weights,
+                FLASH_PACKED_REDUCE_KEY: {True: 1.0},
+                FLASH_EPI_TMA_KEY: epi_tma_weights,
+                FLASH_RESCALE_CHUNK_COLS_KEY: rescale_chunk_weights,
+                FLASH_ROLE_MAP_KEY: role_map_weights,
+                FLASH_CAUSAL_LOOP_SPLIT_KEY: {True: 4.0, False: 1.0},
+                FLASH_CAUSAL_LPT_SWIZZLE_KEY: causal_lpt_weights,
+                FLASH_DISC_PIPE_KEY: causal_disc_weights,
+                FLASH_SOFTMAX_REGS_KEY: causal_softmax_weights,
+                FLASH_E2E_OFFSET_KEY: causal_offset_weights,
+                FLASH_E2E_OFFSET0_KEY: {
+                    e2e_offset0: 4.0,
+                    **{
+                        offset: 2.0
+                        for offset in (0, 1, 2, 3, 4, 8, 11)
+                        if offset != e2e_offset0
+                    },
+                },
+                FLASH_CAUSAL_KV_ORDER_KEY: _flash_causal_hd64_kv_order_weights(num_kv),
+            },
+        )
+
+    return {}
+
+
+def _flash_seed_set(
+    seed: dict[str, object],
+    fragments: Mapping[str, ConfigSpecFragment],
+    key: str,
+    value: object,
+) -> bool:
+    fragment = fragments[key]
+    assert isinstance(fragment, EnumFragment)
+    if value not in fragment.choices:
+        return False
+    seed[key] = value
+    return True
+
+
+def _flash_seed_set_all(
+    seed: dict[str, object],
+    fragments: Mapping[str, ConfigSpecFragment],
+    values: Mapping[str, object],
+) -> bool:
+    for key, value in values.items():
+        if not _flash_seed_set(seed, fragments, key, value):
+            return False
+    return True
+
+
+def _flash_seed_fragments(
+    head_dim: int,
+    num_kv: int,
+    *,
+    is_causal: bool,
+    has_kv_tile_pruning: bool,
+    requires_ws_overlap: bool,
+    small_biased_candidate: bool,
+    topology_override: str | None,
+) -> dict[str, ConfigSpecFragment]:
+    return flash_autotune_fragments(
+        head_dim,
+        num_kv,
+        is_causal=is_causal,
+        has_kv_tile_pruning=has_kv_tile_pruning,
+        requires_ws_overlap=requires_ws_overlap,
+        small_biased_candidate=small_biased_candidate,
+        topology_override=topology_override,
+    )
+
+
+def _flash_seed_block_sizes(block_size_targets: Sequence[int]) -> list[int] | None:
+    targets = tuple(block_size_targets)
+    if targets != _FLASH_SEED_BLOCK_SIZE_TARGETS:
+        return None
+    return [*targets]
+
+
+def _flash_default_seed_config(
+    head_dim: int,
+    num_kv: int,
+    *,
+    is_causal: bool,
+    has_kv_tile_pruning: bool,
+    requires_ws_overlap: bool,
+    small_biased_candidate: bool,
+    block_size_targets: Sequence[int],
+) -> Config | None:
+    block_sizes = _flash_seed_block_sizes(block_size_targets)
+    if block_sizes is None:
+        return None
+
+    topology = (
+        "ws_overlap" if requires_ws_overlap else "fa4" if num_kv % 2 == 0 else None
+    )
+    fragments = _flash_seed_fragments(
+        head_dim,
+        num_kv,
+        is_causal=is_causal,
+        has_kv_tile_pruning=has_kv_tile_pruning,
+        requires_ws_overlap=requires_ws_overlap,
+        small_biased_candidate=small_biased_candidate,
+        topology_override=topology,
+    )
+    seed: dict[str, object] = {"block_sizes": block_sizes}
+
+    if small_biased_candidate:
+        _flash_seed_set(seed, fragments, FLASH_SMALL_BIASED_KEY, True)
+    if topology is not None and not _flash_seed_set(
+        seed, fragments, FLASH_TOPOLOGY_KEY, topology
+    ):
+        return None
+
+    dense_hd64_fa4 = (
+        topology == "fa4"
+        and not is_causal
+        and head_dim == 64
+        and num_kv >= _FLASH_DENSE_HD64_MID_MIN_KV
+    )
+    if dense_hd64_fa4:
+        (
+            kv_stage,
+            e2e_offset,
+            e2e_offset0,
+            disc_pipe,
+            epi_tma,
+            rescale_chunk_cols,
+            packed_reduce,
+        ) = _flash_dense_hd64_seed_params(num_kv)
+        family_values = {
+            FLASH_S_STAGE_KEY: 2,
+            FLASH_KV_STAGE_KEY: kv_stage,
+            FLASH_PERSISTENT_KEY: True,
+            FLASH_E2E_SCHEDULE_KEY: "8/2",
+            FLASH_E2E_OFFSET_KEY: e2e_offset,
+            FLASH_E2E_OFFSET0_KEY: e2e_offset0,
+            FLASH_DISC_PIPE_KEY: disc_pipe,
+            FLASH_SOFTMAX_REGS_KEY: 184,
+            FLASH_EPI_TMA_KEY: epi_tma,
+            FLASH_RESCALE_THRESHOLD_KEY: 8.0,
+            FLASH_RESCALE_CHUNK_COLS_KEY: rescale_chunk_cols,
+            FLASH_PACKED_REDUCE_KEY: packed_reduce,
+        }
+        if not _flash_seed_set_all(seed, fragments, family_values):
+            return None
+
+    if is_causal:
+        if head_dim == 64:
+            _flash_seed_set(seed, fragments, FLASH_PACKED_REDUCE_KEY, True)
+        elif head_dim == 128:
+            _flash_seed_set(seed, fragments, FLASH_KV_STAGE_KEY, 2)
+    if has_kv_tile_pruning:
+        _flash_seed_set(seed, fragments, FLASH_PACKED_REDUCE_KEY, True)
+    return Config.from_dict(seed)
+
+
+def _flash_causal_lpt_seed_config(
+    head_dim: int,
+    num_kv: int,
+    *,
+    is_causal: bool,
+    has_kv_tile_pruning: bool,
+    requires_ws_overlap: bool,
+    small_biased_candidate: bool,
+    block_size_targets: Sequence[int],
+) -> Config | None:
+    if (
+        not is_causal
+        or head_dim != 64
+        or requires_ws_overlap
+        or not _flash_causal_hd64_seed_num_kv_supported(num_kv)
+    ):
+        return None
+    block_sizes = _flash_seed_block_sizes(block_size_targets)
+    if block_sizes is None:
+        return None
+
+    fragments = _flash_seed_fragments(
+        head_dim,
+        num_kv,
+        is_causal=is_causal,
+        has_kv_tile_pruning=has_kv_tile_pruning,
+        requires_ws_overlap=requires_ws_overlap,
+        small_biased_candidate=small_biased_candidate,
+        topology_override="fa4",
+    )
+    e2e_offset, disc_pipe, softmax_regs, lpt_swizzle = _flash_causal_hd64_seed_params(
+        num_kv
+    )
+    offset0 = _flash_causal_hd64_seed_offset0(num_kv)
+    seed: dict[str, object] = {"block_sizes": block_sizes}
+    family_values: dict[str, object] = {
+        FLASH_TOPOLOGY_KEY: "fa4",
+        FLASH_S_STAGE_KEY: 2,
+        FLASH_KV_STAGE_KEY: 2,
+        FLASH_PERSISTENT_KEY: False,
+        FLASH_E2E_SCHEDULE_KEY: "8/2",
+        FLASH_MASKED_E2E_SCHEDULE_KEY: _flash_causal_hd64_seed_masked_schedule(num_kv),
+        FLASH_E2E_OFFSET_KEY: e2e_offset,
+        FLASH_E2E_OFFSET0_KEY: offset0,
+        FLASH_DISC_PIPE_KEY: disc_pipe,
+        FLASH_EPI_TMA_KEY: _flash_causal_hd64_seed_epi_tma(num_kv),
+        FLASH_RESCALE_CHUNK_COLS_KEY: _flash_causal_hd64_seed_rescale_chunk_cols(
+            num_kv
+        ),
+        FLASH_ROLE_MAP_KEY: _flash_causal_hd64_seed_role_map(num_kv),
+        FLASH_CAUSAL_LOOP_SPLIT_KEY: True,
+        FLASH_RESCALE_THRESHOLD_KEY: 8.0,
+        FLASH_PACKED_REDUCE_KEY: True,
+        FLASH_CAUSAL_LPT_SWIZZLE_KEY: lpt_swizzle,
+        FLASH_CAUSAL_KV_ORDER_KEY: _flash_causal_hd64_seed_kv_order(num_kv),
+        FLASH_SOFTMAX_REGS_KEY: softmax_regs,
+    }
+    if not _flash_seed_set_all(seed, fragments, family_values):
+        return None
+    return Config.from_dict(seed)
+
+
+def _flash_causal_split_seed_config(
+    head_dim: int,
+    num_kv: int,
+    *,
+    is_causal: bool,
+    has_kv_tile_pruning: bool,
+    requires_ws_overlap: bool,
+    small_biased_candidate: bool,
+    block_size_targets: Sequence[int],
+) -> Config | None:
+    if (
+        not is_causal
+        or head_dim != 64
+        or requires_ws_overlap
+        or not _flash_causal_hd64_seed_num_kv_supported(num_kv)
+    ):
+        return None
+    block_sizes = _flash_seed_block_sizes(block_size_targets)
+    if block_sizes is None:
+        return None
+
+    fragments = _flash_seed_fragments(
+        head_dim,
+        num_kv,
+        is_causal=is_causal,
+        has_kv_tile_pruning=has_kv_tile_pruning,
+        requires_ws_overlap=requires_ws_overlap,
+        small_biased_candidate=small_biased_candidate,
+        topology_override="fa4",
+    )
+    (
+        e2e_offset,
+        _disc_pipe,
+        softmax_regs,
+        lpt_swizzle,
+    ) = _flash_causal_hd64_seed_params(num_kv)
+    split_masked_schedule = "16/4"
+    split_lpt_swizzle = 8 if num_kv <= 128 else lpt_swizzle
+    split_disc_pipe = 2 if num_kv <= 128 else 4
+    split_role_map = "fa4" if num_kv <= 128 else "helion"
+    split_offset0 = 0 if num_kv <= 128 else _flash_causal_hd64_seed_offset0(num_kv)
+    seed: dict[str, object] = {"block_sizes": block_sizes}
+    family_values: dict[str, object] = {
+        FLASH_TOPOLOGY_KEY: "fa4",
+        FLASH_S_STAGE_KEY: 2,
+        FLASH_KV_STAGE_KEY: 2,
+        FLASH_PERSISTENT_KEY: False,
+        FLASH_E2E_SCHEDULE_KEY: "8/2",
+        FLASH_MASKED_E2E_SCHEDULE_KEY: split_masked_schedule,
+        FLASH_E2E_OFFSET_KEY: e2e_offset,
+        FLASH_E2E_OFFSET0_KEY: split_offset0,
+        FLASH_DISC_PIPE_KEY: split_disc_pipe,
+        FLASH_EPI_TMA_KEY: _flash_causal_hd64_seed_epi_tma(num_kv),
+        FLASH_RESCALE_CHUNK_COLS_KEY: _flash_causal_hd64_seed_rescale_chunk_cols(
+            num_kv
+        ),
+        FLASH_ROLE_MAP_KEY: split_role_map,
+        FLASH_CAUSAL_LOOP_SPLIT_KEY: True,
+        FLASH_RESCALE_THRESHOLD_KEY: 8.0,
+        FLASH_PACKED_REDUCE_KEY: True,
+        FLASH_CAUSAL_LPT_SWIZZLE_KEY: split_lpt_swizzle,
+        FLASH_CAUSAL_KV_ORDER_KEY: _flash_causal_hd64_seed_kv_order(num_kv),
+        FLASH_SOFTMAX_REGS_KEY: softmax_regs,
+    }
+    if not _flash_seed_set_all(seed, fragments, family_values):
+        return None
+    return Config.from_dict(seed)
+
+
+def flash_attention_seed_config(
+    head_dim: int,
+    num_kv: int | None,
+    *,
+    is_causal: bool = False,
+    has_kv_tile_pruning: bool = False,
+    requires_ws_overlap: bool = False,
+    small_biased_candidate: bool = False,
+    block_size_targets: Sequence[int] = _FLASH_SEED_BLOCK_SIZE_TARGETS,
+    seed_kind: str = "default",
+) -> Config | None:
+    """Return a fragment-valid seed config for the detected flash surface.
+
+    The seed policy is shape-family based rather than exact sequence-length
+    based. ``block_size_targets`` comes from the flash detector's search-surface
+    facts; this helper only emits a seed for the fused 1x128x128 envelope.
+    """
+    if num_kv is None:
+        return None
+    if seed_kind == "default":
+        return _flash_default_seed_config(
+            head_dim,
+            num_kv,
+            is_causal=is_causal,
+            has_kv_tile_pruning=has_kv_tile_pruning,
+            requires_ws_overlap=requires_ws_overlap,
+            small_biased_candidate=small_biased_candidate,
+            block_size_targets=block_size_targets,
+        )
+    if seed_kind == "causal_lpt":
+        return _flash_causal_lpt_seed_config(
+            head_dim,
+            num_kv,
+            is_causal=is_causal,
+            has_kv_tile_pruning=has_kv_tile_pruning,
+            requires_ws_overlap=requires_ws_overlap,
+            small_biased_candidate=small_biased_candidate,
+            block_size_targets=block_size_targets,
+        )
+    if seed_kind == "causal_split":
+        return _flash_causal_split_seed_config(
+            head_dim,
+            num_kv,
+            is_causal=is_causal,
+            has_kv_tile_pruning=has_kv_tile_pruning,
+            requires_ws_overlap=requires_ws_overlap,
+            small_biased_candidate=small_biased_candidate,
+            block_size_targets=block_size_targets,
+        )
+    raise AssertionError(f"unknown flash attention seed kind: {seed_kind!r}")
+
+
+def flash_attention_seed_configs(
+    head_dim: int,
+    num_kv: int | None,
+    *,
+    is_causal: bool = False,
+    has_kv_tile_pruning: bool = False,
+    requires_ws_overlap: bool = False,
+    small_biased_candidate: bool = False,
+    block_size_targets: Sequence[int] = _FLASH_SEED_BLOCK_SIZE_TARGETS,
+) -> tuple[Config, ...]:
+    seeds: list[Config] = []
+    default_seed = flash_attention_seed_config(
+        head_dim,
+        num_kv,
+        is_causal=is_causal,
+        has_kv_tile_pruning=has_kv_tile_pruning,
+        requires_ws_overlap=requires_ws_overlap,
+        small_biased_candidate=small_biased_candidate,
+        block_size_targets=block_size_targets,
+    )
+    if default_seed is not None:
+        seeds.append(default_seed)
+    causal_lpt_seed = flash_attention_seed_config(
+        head_dim,
+        num_kv,
+        is_causal=is_causal,
+        has_kv_tile_pruning=has_kv_tile_pruning,
+        requires_ws_overlap=requires_ws_overlap,
+        small_biased_candidate=small_biased_candidate,
+        block_size_targets=block_size_targets,
+        seed_kind="causal_lpt",
+    )
+    if causal_lpt_seed is not None:
+        seeds.append(causal_lpt_seed)
+    causal_split_seed = flash_attention_seed_config(
+        head_dim,
+        num_kv,
+        is_causal=is_causal,
+        has_kv_tile_pruning=has_kv_tile_pruning,
+        requires_ws_overlap=requires_ws_overlap,
+        small_biased_candidate=small_biased_candidate,
+        block_size_targets=block_size_targets,
+        seed_kind="causal_split",
+    )
+    if causal_split_seed is not None:
+        seeds.append(causal_split_seed)
+    return tuple(seeds)
 
 
 def flash_autotune_fragments(
@@ -1541,9 +2296,9 @@ def flash_autotune_fragments(
         reductions. ``disc_pipe`` offers the small validated depth set
         {1, 2, 3, 4}; ``epi_tma`` and ``packed_reduce`` remain booleans;
         ``rescale_threshold`` uses a narrow enum around FA4's 8.0 fp16/bf16
-        constant; ``rescale_chunk_cols`` uses the characterized 16/32-column
-        set. Long dense hd64 FA4 shapes keep rescale threshold/chunk at the
-        characterized defaults in the random search; manual overrides remain
+        constant; ``rescale_chunk_cols`` searches the characterized
+        16/32-column set. Long dense hd64 FA4 shapes keep rescale threshold at
+        the characterized default in the random search; manual overrides remain
         available. Larger 64-column chunks remain available as manual overrides
         but are not searched because they can exceed ptxas register-allocation
         limits on FA4 shapes. ``resolve_flash_config`` gates ``epi_tma`` on
@@ -1552,6 +2307,11 @@ def flash_autotune_fragments(
       * ``causal_lpt_swizzle`` — causal-only launch-order/cache-locality swizzle.
         ``0`` preserves the shape-derived L2 heuristic; positive values force a
         compact set of batch/head interleave group sizes.
+      * ``causal_kv_order`` — causal-only KV traversal order. The original
+        Helion stream walks left-to-right; upstream FA4 walks diagonal-first and
+        then backward. Both orders remain accepted for manual/cache-transfer
+        configs; causal hd64 actively searches the diagonal-first descending
+        stream so split-loop candidates are meaningful rather than clamped away.
       * ``small_biased`` — enables the small contiguous biased-attention SIMT
         emitter for its validated [BH, 128, 64] envelope. Non-candidate shapes
         carry the key as a fixed default so cached configs round-trip without
@@ -1589,9 +2349,6 @@ def flash_autotune_fragments(
         is_causal=is_causal,
         prefer_packed_reduce=has_kv_tile_pruning or requires_ws_overlap,
     )
-    dense_hd64_long_fa4 = (
-        not is_causal and head_dim == 64 and num_kv >= 64 and defaults.topology == "fa4"
-    )
     dense_hd64_fa4 = not is_causal and head_dim == 64 and defaults.topology == "fa4"
     causal_hd64_seeded_fa4 = (
         is_causal
@@ -1618,7 +2375,7 @@ def flash_autotune_fragments(
     if num_kv < 2:
         s_stage_choices: tuple[int, ...] = (1,)
         s_stage_search_choices: tuple[int, ...] | None = None
-    elif dense_hd64_long_fa4 or causal_hd64_seeded_fa4:
+    elif dense_hd64_fa4 or causal_hd64_seeded_fa4:
         s_stage_choices = _flash_choices_with_default(defaults.s_stage, (1, 2))
         s_stage_search_choices = _flash_choices_with_default(defaults.s_stage, (2,))
     else:
@@ -1629,32 +2386,49 @@ def flash_autotune_fragments(
         kv_stage_choices = _flash_choices_with_default(
             defaults.kv_stage, (2, 3, 4, 6, 8, 10)
         )
-        kv_stage_search_choices: tuple[int, ...] | None = (2, 3)
+        kv_stage_search_choices: tuple[int, ...] | None = (
+            2,
+            3,
+            4,
+            6,
+            8,
+        )
     elif causal_hd64_seeded_fa4:
-        kv_stage_choices = _flash_choices_with_default(defaults.kv_stage, (2, 3))
-        kv_stage_search_choices = _flash_choices_with_default(defaults.kv_stage, (2,))
+        kv_stage_choices = _flash_choices_with_default(
+            defaults.kv_stage, (2, 3, 4, 6, 8, 10)
+        )
+        kv_stage_search_choices = _flash_choices_with_default(
+            defaults.kv_stage, (10, 8, 6, 4, 3, 2)
+        )
     else:
         kv_stage_choices = (defaults.kv_stage, 3 if defaults.kv_stage == 2 else 2)
         kv_stage_search_choices = None
 
-    if dense_hd64_long_fa4 or causal_hd64_seeded_fa4:
+    if dense_hd64_fa4:
         persistent_choices = _flash_choices_with_default(
             defaults.persistent, (True, False)
         )
         persistent_search_choices: tuple[bool, ...] | None = (
-            _flash_choices_with_default(
-                defaults.persistent, (False,) if causal_hd64_seeded_fa4 else (True,)
-            )
+            _flash_choices_with_default(defaults.persistent, (True,))
         )
         e2e_schedule_default = _flash_e2e_schedule_default(defaults.topology, head_dim)
         e2e_schedule_choices = _flash_choices_with_default(
             defaults.e2e_schedule, ("16/4", "8/2", "16/2", "xu")
         )
         e2e_schedule_search_choices: tuple[str, ...] | None = (
-            _flash_choices_with_default(
-                defaults.e2e_schedule,
-                ("16/4",) if causal_hd64_seeded_fa4 else ("16/4", "8/2"),
-            )
+            _flash_choices_with_default(defaults.e2e_schedule, ("16/4", "8/2"))
+        )
+    elif causal_hd64_seeded_fa4:
+        persistent_choices = _flash_choices_with_default(defaults.persistent, (False,))
+        persistent_search_choices = _flash_choices_with_default(
+            defaults.persistent, (False,)
+        )
+        e2e_schedule_default = _flash_e2e_schedule_default(defaults.topology, head_dim)
+        e2e_schedule_choices = _flash_choices_with_default(
+            defaults.e2e_schedule, ("16/4", "8/2", "16/2", "xu")
+        )
+        e2e_schedule_search_choices = _flash_choices_with_default(
+            defaults.e2e_schedule, ("xu", "16/4", "8/2")
         )
     else:
         persistent_choices = (
@@ -1677,6 +2451,21 @@ def flash_autotune_fragments(
             ),
         )
         e2e_schedule_search_choices = None
+    if is_causal:
+        masked_e2e_schedule_choices = _flash_choices_with_default(
+            defaults.masked_e2e_schedule, ("inherit", "xu", "16/4", "8/2")
+        )
+        masked_e2e_schedule_search_choices: tuple[str, ...] | None = (
+            _flash_choices_with_default(
+                _flash_causal_hd64_seed_masked_schedule(num_kv),
+                ("inherit", "xu", "16/4", "8/2"),
+            )
+            if causal_hd64_seeded_fa4
+            else None
+        )
+    else:
+        masked_e2e_schedule_choices = ("inherit",)
+        masked_e2e_schedule_search_choices = None
     # Topology: default to fa4 only when the shape meets the fa4 2-Q-tile envelope.
     # The fa4 device body processes a PAIR of adjacent 128-row Q-tiles per CTA, so
     # it requires ``seq % 256 == 0``. The codegen already gates seq % 128 == 0 (so
@@ -1691,12 +2480,13 @@ def flash_autotune_fragments(
     if requires_ws_overlap:
         topology_choices = ("ws_overlap",)
         topology_search_choices = None
-    elif dense_hd64_long_fa4 or causal_hd64_seeded_fa4:
+    elif dense_hd64_fa4 or causal_hd64_seeded_fa4:
         topology_choices = _flash_choices_with_default(
             defaults.topology, ("fa4", "ws_overlap")
         )
+        topology_search_defaults = ("fa4", "ws_overlap")
         topology_search_choices = _flash_choices_with_default(
-            defaults.topology, ("fa4",)
+            defaults.topology, topology_search_defaults
         )
     elif fa4_eligible:
         # Seed with the resolved default first, then the other topology.
@@ -1713,14 +2503,15 @@ def flash_autotune_fragments(
     # fa4 disc PASS2 software-pipeline depth lever. The first choice is the
     # shape-resolved default; the remaining validated depths are accepted for
     # autotune/cache transfer. They are consumed only by the fa4 emitter.
-    if dense_hd64_long_fa4 or causal_hd64_seeded_fa4:
+    if dense_hd64_fa4 or causal_hd64_seeded_fa4:
         disc_pipe_choices = _flash_choices_with_default(
-            defaults.disc_pipe_depth, (1, 2, 3, 4)
+            defaults.disc_pipe_depth,
+            (1, 2, 3, 4),
         )
         disc_pipe_search_choices: tuple[int, ...] | None = (
-            (causal_disc_pipe_search,)
+            _flash_choices_with_default(causal_disc_pipe_search, (2, 3, 4))
             if causal_hd64_seeded_fa4
-            else _flash_choices_with_default(defaults.disc_pipe_depth, (3,))
+            else _flash_choices_with_default(defaults.disc_pipe_depth, (2, 3, 4))
         )
     else:
         disc_pipe_choices = (
@@ -1736,14 +2527,17 @@ def flash_autotune_fragments(
     if max_e2e_freq > 0:
         offset_search_values: Iterable[int]
         offset_search_values = range(max_e2e_freq)
-        if dense_hd64_long_fa4:
+        if dense_hd64_fa4:
             e2e_offset_default = defaults.e2e_offset
             e2e_offset_search_choices: tuple[int, ...] | None = (
-                _flash_choices_with_default(defaults.e2e_offset, (2, 0, 1))
+                _flash_choices_with_default(defaults.e2e_offset, range(16))
             )
         elif causal_hd64_seeded_fa4:
             e2e_offset_default = defaults.e2e_offset
-            e2e_offset_search_choices = (causal_e2e_offset_search,)
+            e2e_offset_search_choices = _flash_choices_with_default(
+                causal_e2e_offset_search,
+                range(16),
+            )
         else:
             e2e_offset_default = defaults.e2e_offset
             e2e_offset_search_choices = None
@@ -1756,14 +2550,16 @@ def flash_autotune_fragments(
             ),
         )
         offset0_search_values: Iterable[int] = range(max_e2e_freq)
-        if dense_hd64_long_fa4:
+        if dense_hd64_fa4:
             e2e_offset0_default = defaults.e2e_offset0
             e2e_offset0_search_choices: tuple[int, ...] | None = (
-                _flash_choices_with_default(defaults.e2e_offset0, (0, 1, 2))
+                _flash_choices_with_default(defaults.e2e_offset0, range(16))
             )
         elif causal_hd64_seeded_fa4:
             e2e_offset0_default = defaults.e2e_offset0
-            e2e_offset0_search_choices = (0,)
+            e2e_offset0_search_choices = _flash_choices_with_default(
+                _flash_causal_hd64_seed_offset0(num_kv), range(16)
+            )
         else:
             e2e_offset0_default = defaults.e2e_offset0
             e2e_offset0_search_choices = None
@@ -1780,7 +2576,7 @@ def flash_autotune_fragments(
         e2e_offset0_choices = (defaults.e2e_offset0,)
         e2e_offset_search_choices = None
         e2e_offset0_search_choices = None
-    if dense_hd64_long_fa4 or causal_hd64_seeded_fa4:
+    if dense_hd64_fa4 or causal_hd64_seeded_fa4:
         rescale_threshold_choices = _flash_choices_with_default(
             defaults.rescale_threshold, (0.0, 4.0, 8.0, 12.0, 16.0)
         )
@@ -1792,7 +2588,12 @@ def flash_autotune_fragments(
             (cols for cols in (16, 32, 64) if head_dim % cols == 0),
         )
         rescale_chunk_cols_search_choices: tuple[int, ...] | None = (
-            _flash_choices_with_default(defaults.rescale_chunk_cols, (32,))
+            _flash_choices_with_default(
+                _flash_causal_hd64_seed_rescale_chunk_cols(num_kv)
+                if causal_hd64_seeded_fa4
+                else defaults.rescale_chunk_cols,
+                (16, 32),
+            )
         )
     else:
         rescale_threshold_choices = (
@@ -1812,7 +2613,7 @@ def flash_autotune_fragments(
             (cols for cols in (16, 32) if head_dim % cols == 0),
         )
         rescale_threshold_search_choices = None
-    if dense_hd64_long_fa4:
+    if dense_hd64_fa4:
         softmax_regs_choices = _flash_choices_with_default(
             defaults.softmax_regs, (176, 184, 192, 200)
         )
@@ -1821,7 +2622,9 @@ def flash_autotune_fragments(
         softmax_regs_choices = _flash_choices_with_default(
             defaults.softmax_regs, (176, 184, 192, 200)
         )
-        softmax_regs_search_choices = (causal_softmax_regs_search,)
+        softmax_regs_search_choices = _flash_choices_with_default(
+            causal_softmax_regs_search, (184, 192, 200)
+        )
     else:
         softmax_regs_choices = (
             defaults.softmax_regs,
@@ -1829,12 +2632,13 @@ def flash_autotune_fragments(
         )
         softmax_regs_search_choices = None
     corr_regs_manual_choices = (64, 72, 80, 88)
-    if dense_hd64_long_fa4:
+    if dense_hd64_fa4 or causal_hd64_seeded_fa4:
         corr_regs_choices = _flash_choices_with_default(
             defaults.corr_regs, corr_regs_manual_choices
         )
         corr_regs_search_choices: tuple[int, ...] | None = _flash_choices_with_default(
-            defaults.corr_regs, (64,)
+            defaults.corr_regs,
+            (64,),
         )
     else:
         corr_regs_choices = (
@@ -1845,12 +2649,17 @@ def flash_autotune_fragments(
             defaults.corr_regs,
             *(regs for regs in (64, 88) if regs != defaults.corr_regs),
         )
-    if dense_hd64_long_fa4 or causal_hd64_seeded_fa4:
+    if dense_hd64_fa4 or causal_hd64_seeded_fa4:
         packed_reduce_choices = _flash_choices_with_default(
             defaults.packed_reduce, (True, False)
         )
+        packed_reduce_search_defaults = (
+            (True,) if causal_hd64_seeded_fa4 or num_kv >= 64 else (False,)
+        )
         packed_reduce_search_choices: tuple[bool, ...] | None = (
-            _flash_choices_with_default(defaults.packed_reduce, (True,))
+            _flash_choices_with_default(
+                defaults.packed_reduce, packed_reduce_search_defaults
+            )
         )
     else:
         packed_reduce_choices = (defaults.packed_reduce, not defaults.packed_reduce)
@@ -1865,22 +2674,58 @@ def flash_autotune_fragments(
             ),
         )
         causal_lpt_swizzle_search_choices: tuple[int, ...] | None = (
-            (causal_lpt_swizzle_search,) if causal_hd64_seeded_fa4 else None
+            _flash_choices_with_default(causal_lpt_swizzle_search, (0, 1, 2, 4, 8, 16))
+            if causal_hd64_seeded_fa4
+            else None
+        )
+        causal_kv_order_choices = _flash_choices_with_default(
+            defaults.causal_kv_order, ("ascending", "descending")
+        )
+        causal_kv_order_search_choices: tuple[str, ...] | None = (
+            _flash_choices_with_default(
+                _flash_causal_hd64_seed_kv_order(num_kv),
+                ("ascending", "descending"),
+            )
+            if causal_hd64_seeded_fa4
+            else None
         )
     else:
         causal_lpt_swizzle_choices = (0,)
         causal_lpt_swizzle_search_choices = None
+        causal_kv_order_choices = ("ascending",)
+        causal_kv_order_search_choices = None
+    role_map_choices = _flash_choices_with_default(defaults.role_map, ("helion", "fa4"))
+    role_map_search_choices: tuple[str, ...] | None = (
+        _flash_choices_with_default(
+            _flash_causal_hd64_seed_role_map(num_kv), ("helion", "fa4")
+        )
+        if causal_hd64_seeded_fa4
+        else (defaults.role_map,)
+    )
+    causal_loop_split_choices = (
+        defaults.causal_loop_split,
+        not defaults.causal_loop_split,
+    )
+    causal_loop_split_search_choices: tuple[bool, ...] | None = (
+        (True, False) if causal_hd64_seeded_fa4 else (defaults.causal_loop_split,)
+    )
     small_biased_choices = _flash_choices_with_default(
         defaults.small_biased, (True, False)
     )
     small_biased_search_choices: tuple[bool, ...] | None = (
         small_biased_choices if small_biased_candidate else (defaults.small_biased,)
     )
-    # fa4 epilogue TMA-store lever (default OFF = the committed STG.E.128 epilogue).
-    if dense_hd64_long_fa4 or causal_hd64_seeded_fa4:
+    # fa4 epilogue TMA-store lever (default OFF = the committed STG.E.128
+    # epilogue). Include TMA-O in search for FA4 hd64 shape families; value
+    # priors keep the characterized default favored without making it fixed.
+    if dense_hd64_fa4 or causal_hd64_seeded_fa4:
         epi_tma_choices = _flash_choices_with_default(defaults.epi_tma, (False, True))
+        epi_tma_search_defaults = (False, True)
         epi_tma_search_choices: tuple[bool, ...] | None = _flash_choices_with_default(
-            defaults.epi_tma, (False,)
+            _flash_causal_hd64_seed_epi_tma(num_kv)
+            if causal_hd64_seeded_fa4
+            else defaults.epi_tma,
+            epi_tma_search_defaults,
         )
     else:
         epi_tma_choices = (defaults.epi_tma, not defaults.epi_tma)
@@ -1893,6 +2738,9 @@ def flash_autotune_fragments(
         ),
         FLASH_E2E_SCHEDULE_KEY: EnumFragment(
             e2e_schedule_choices, e2e_schedule_search_choices
+        ),
+        FLASH_MASKED_E2E_SCHEDULE_KEY: EnumFragment(
+            masked_e2e_schedule_choices, masked_e2e_schedule_search_choices
         ),
         FLASH_E2E_OFFSET_KEY: EnumFragment(
             e2e_offset_choices, e2e_offset_search_choices
@@ -1921,6 +2769,13 @@ def flash_autotune_fragments(
         ),
         FLASH_CAUSAL_LPT_SWIZZLE_KEY: EnumFragment(
             causal_lpt_swizzle_choices, causal_lpt_swizzle_search_choices
+        ),
+        FLASH_CAUSAL_KV_ORDER_KEY: EnumFragment(
+            causal_kv_order_choices, causal_kv_order_search_choices
+        ),
+        FLASH_ROLE_MAP_KEY: EnumFragment(role_map_choices, role_map_search_choices),
+        FLASH_CAUSAL_LOOP_SPLIT_KEY: EnumFragment(
+            causal_loop_split_choices, causal_loop_split_search_choices
         ),
     }
 
@@ -3594,7 +4449,7 @@ def emit_flash_fa4_device_body(
 
     Warp roles (one CTA processes a *pair* of adjacent 128-row Q-tiles): softmax0
     = warps 0-3 (Q-tile 0), softmax1 = warps 4-7 (Q-tile 1), correction = warps
-    8-11, MMA = warp 12, epilogue = warp 13 (no body in Stage 1), load = warp 14,
+    8-11, MMA = warp 12, load/epilogue = warps 13/14 (order is searchable),
     empty = warp 15. The two softmax warpgroups each run the single-pass
     resident-row softmax_step over the SAME K/V stream, staggered solely by the
     MMA committing ``s_full+0`` before ``s_full+1`` each iteration.
@@ -3612,6 +4467,7 @@ def emit_flash_fa4_device_body(
     is_causal = score_plan.is_causal
     if is_causal:
         assert not cfg.persistent
+    causal_desc_kv = is_causal and cfg.causal_kv_order == "descending"
     num_m_pairs = total_tiles // num_bh
     persistent = cfg.persistent
     kv_loop_bound = "flash_num_active_kv" if is_causal else "_flash_num_kv_tiles"
@@ -3639,6 +4495,8 @@ if warp_idx == 0:
     p1_store_iter = "tStS1.iterator"
     pv_p0 = "flash_s0_addr"
     pv_p1 = "flash_s1_addr"
+    load_warp = 13 if cfg.role_map == "fa4" else 14
+    epi_warp = 14 if cfg.role_map == "fa4" else 13
     # FUSED softmax body (split path): one frag-by-frag pass does scale-subtract +
     # exp2(pipe-split) + f32->f16 convert holding only one 32-elem fragment's
     # transients at a time, then a deferred packed row-sum (spike sp/fa4ip ordering).
@@ -3953,7 +4811,7 @@ flash_o_corr_chunks = {hd} // flash_o_corr_tile
     # per-work-item body, 8-space indented) runs once (flat) or in a strided
     # while loop (persistent). The raw-mbarrier phases carry across work-items.
 
-    # EMPTY (15) / EPI (13): setmaxnreg only, no work -- but under persistence they
+    # EMPTY (15) / EPI: setmaxnreg only, no work -- but under persistence they
     # MUST hit the per-work-item CTA barrier in lockstep, so they are wrapped too
     # (their inner is empty; the wrap supplies the prelude + barrier + stride).
     empty_block = _flash_fa4_wrap(
@@ -3993,7 +4851,7 @@ flash_o_corr_chunks = {hd} // flash_o_corr_tile
         epi_inner = ""
         epi_prelude = "none"
     epi_block = _flash_fa4_wrap(
-        "if warp_idx == 13:",
+        f"if warp_idx == {epi_warp}:",
         epi_head,
         epi_inner,
         persistent,
@@ -4003,20 +4861,28 @@ flash_o_corr_chunks = {hd} // flash_o_corr_tile
     )
 
     load_head = "    cute.arch.setmaxregister_decrease(48)"
+    if causal_desc_kv:
+        load_first_kv = f"{kv_loop_bound} - cutlass.Int32(1)"
+        load_next_kv = f"{kv_loop_bound} - cutlass.Int32(2) - flash_kv_load_iter"
+        load_loop_var = "flash_kv_load_iter"
+    else:
+        load_first_kv = "0"
+        load_next_kv = "flash_kv_load_iter + cutlass.Int32(1)"
+        load_loop_var = "flash_kv_load_iter"
     load_inner = f"""        flash_qe0 = flash_q_prod.acquire_and_advance()
         cute.copy(_flash_tma_q, tQgQ[None, flash_m_tile0], tQsQ[None, flash_qe0.index],
                   tma_bar_ptr=flash_qe0.barrier)
         flash_kve = flash_kv_prod.acquire_and_advance()
-        cute.copy(_flash_tma_k, tKgK[None, 0], tKsK[None, flash_kve.index],
+        cute.copy(_flash_tma_k, tKgK[None, {load_first_kv}], tKsK[None, flash_kve.index],
                   tma_bar_ptr=flash_kve.barrier)
         flash_qe1 = flash_q_prod.acquire_and_advance()
         cute.copy(_flash_tma_q, tQgQ[None, flash_m_tile1], tQsQ[None, flash_qe1.index],
                   tma_bar_ptr=flash_qe1.barrier)
         flash_kve = flash_kv_prod.acquire_and_advance()
-        cute.copy(_flash_tma_v, tVgV[None, 0], tVsV[None, flash_kve.index],
+        cute.copy(_flash_tma_v, tVgV[None, {load_first_kv}], tVsV[None, flash_kve.index],
                   tma_bar_ptr=flash_kve.barrier)
-        for flash_kv in cutlass.range({kv_loop_bound_minus_1}, unroll=1):
-            flash_kv_next = flash_kv + cutlass.Int32(1)
+        for {load_loop_var} in cutlass.range({kv_loop_bound_minus_1}, unroll=1):
+            flash_kv_next = {load_next_kv}
             flash_kve = flash_kv_prod.acquire_and_advance()
             cute.copy(_flash_tma_k, tKgK[None, flash_kv_next], tKsK[None, flash_kve.index],
                       tma_bar_ptr=flash_kve.barrier)
@@ -4024,7 +4890,7 @@ flash_o_corr_chunks = {hd} // flash_o_corr_tile
             cute.copy(_flash_tma_v, tVgV[None, flash_kv_next], tVsV[None, flash_kve.index],
                       tma_bar_ptr=flash_kve.barrier)"""
     load_block = _flash_fa4_wrap(
-        "if warp_idx == 14:",
+        f"if warp_idx == {load_warp}:",
         load_head,
         load_inner,
         persistent,
@@ -4068,7 +4934,8 @@ flash_o_corr_chunks = {hd} // flash_o_corr_tile
                 tOrP0[None, None, None, 0], tOrV[None, None, None, flash_v_full.index],
                 None, sV[None, None, None, flash_v_full.index],
                 mbar_ptr=flash_pfor2_ptr + 0, mbar_phase=flash_pfor_phase,
-                zero_init=flash_o_zero, tA_addr={pv_p0})
+                zero_init=flash_o_zero0, tA_addr={pv_p0})
+            flash_o_zero0 = cutlass.Boolean(False)
             flash_k_full = flash_kv_cons.wait_and_advance()
             _helion_flash_ptx.gemm_ptx_partial(
                 _flash_qk_mma.op, flash_s0_addr,
@@ -4084,7 +4951,8 @@ flash_o_corr_chunks = {hd} // flash_o_corr_tile
                 tOrP1[None, None, None, 0], tOrV[None, None, None, flash_v_full.index],
                 None, sV[None, None, None, flash_v_full.index],
                 mbar_ptr=flash_pfor2_ptr + 1, mbar_phase=flash_pfor_phase,
-                zero_init=flash_o_zero, tA_addr={pv_p1})
+                zero_init=flash_o_zero1, tA_addr={pv_p1})
+            flash_o_zero1 = cutlass.Boolean(False)
             flash_v_full.release()
             _helion_flash_ptx.gemm_ptx_partial(
                 _flash_qk_mma.op, flash_s1_addr,
@@ -4117,11 +4985,11 @@ flash_o_corr_chunks = {hd} // flash_o_corr_tile
 
         # STEADY: i = 0..N-2. PV(i) for both stages interleaved with QK(i+1). o_zero
         # is the per-tile zero-init Boolean (True first tile, False after).
-        flash_o_zero = cutlass.Boolean(True)
+        flash_o_zero0 = cutlass.Boolean(True)
+        flash_o_zero1 = cutlass.Boolean(True)
         for flash_i in cutlass.range({kv_loop_bound_minus_1}, unroll=1):
             flash_v_full = flash_kv_cons.wait_and_advance(){mma_steady_body}
             flash_pfor_phase ^= 1
-            flash_o_zero = cutlass.Boolean(False)
 
         flash_q0_full.release()
         flash_q1_full.release()
@@ -4134,7 +5002,7 @@ flash_o_corr_chunks = {hd} // flash_o_corr_tile
             tOrP0[None, None, None, 0], tOrV[None, None, None, flash_v_full.index],
             None, sV[None, None, None, flash_v_full.index],
             mbar_ptr=flash_pfor2_ptr + 0, mbar_phase=flash_pfor_phase,
-            zero_init=flash_o_zero, tA_addr={pv_p0})
+            zero_init=flash_o_zero0, tA_addr={pv_p0})
         with cute.arch.elect_one():
             cute_tcgen05_flash.commit(flash_o_full_ptr + 0)
         _helion_flash_rt.mbar_spin_wait(flash_pfor_ptr + 1, flash_pfor_phase)
@@ -4143,7 +5011,7 @@ flash_o_corr_chunks = {hd} // flash_o_corr_tile
             tOrP1[None, None, None, 0], tOrV[None, None, None, flash_v_full.index],
             None, sV[None, None, None, flash_v_full.index],
             mbar_ptr=flash_pfor2_ptr + 1, mbar_phase=flash_pfor_phase,
-            zero_init=flash_o_zero, tA_addr={pv_p1})
+            zero_init=flash_o_zero1, tA_addr={pv_p1})
         with cute.arch.elect_one():
             cute_tcgen05_flash.commit(flash_o_full_ptr + 1)
         flash_v_full.release()
@@ -4176,13 +5044,14 @@ flash_o_corr_chunks = {hd} // flash_o_corr_tile
         flash_k0_full.release()
 
         # STEADY: i = 0..N-2. PV(i) for both stages interleaved with QK(i+1).
-        flash_O_acc = False
+        flash_O_acc0 = False
+        flash_O_acc1 = False
         for flash_i in cutlass.range({kv_loop_bound_minus_1}, unroll=1):
             flash_v_full = flash_kv_cons.wait_and_advance()
             # stage 0: PV0(i) then QK0(i+1). STAGED-P: first 96 kv on pfor.
             _helion_flash_rt.mbar_spin_wait(flash_pfor_ptr + 0, flash_pfor_phase)
             for flash_kp in cutlass.range_constexpr(flash_pv_split):
-                _flash_pv_mma.set(cute_tcgen05_flash.Field.ACCUMULATE, flash_O_acc | (flash_kp != 0))
+                _flash_pv_mma.set(cute_tcgen05_flash.Field.ACCUMULATE, flash_O_acc0 | (flash_kp != 0))
                 cute.gemm(_flash_pv_mma, tOtO0, tOrP0[None, None, flash_kp, 0],
                           tOrV[None, None, flash_kp, flash_v_full.index], tOtO0)
             _helion_flash_rt.mbar_spin_wait(flash_pfor2_ptr + 0, flash_pfor_phase)
@@ -4190,6 +5059,7 @@ flash_o_corr_chunks = {hd} // flash_o_corr_tile
                 _flash_pv_mma.set(cute_tcgen05_flash.Field.ACCUMULATE, True)
                 cute.gemm(_flash_pv_mma, tOtO0, tOrP0[None, None, flash_kp, 0],
                           tOrV[None, None, flash_kp, flash_v_full.index], tOtO0)
+            flash_O_acc0 = True
             flash_k_full = flash_kv_cons.wait_and_advance()
             for flash_kp in cutlass.range(flash_nk, unroll_full=True):
                 _flash_qk_mma.set(cute_tcgen05_flash.Field.ACCUMULATE, flash_kp != 0)
@@ -4200,7 +5070,7 @@ flash_o_corr_chunks = {hd} // flash_o_corr_tile
             # stage 1: PV1(i) then QK1(i+1). STAGED-P: first 96 kv on pfor.
             _helion_flash_rt.mbar_spin_wait(flash_pfor_ptr + 1, flash_pfor_phase)
             for flash_kp in cutlass.range_constexpr(flash_pv_split):
-                _flash_pv_mma.set(cute_tcgen05_flash.Field.ACCUMULATE, flash_O_acc | (flash_kp != 0))
+                _flash_pv_mma.set(cute_tcgen05_flash.Field.ACCUMULATE, flash_O_acc1 | (flash_kp != 0))
                 cute.gemm(_flash_pv_mma, tOtO1, tOrP1[None, None, flash_kp, 0],
                           tOrV[None, None, flash_kp, flash_v_full.index], tOtO1)
             _helion_flash_rt.mbar_spin_wait(flash_pfor2_ptr + 1, flash_pfor_phase)
@@ -4208,6 +5078,7 @@ flash_o_corr_chunks = {hd} // flash_o_corr_tile
                 _flash_pv_mma.set(cute_tcgen05_flash.Field.ACCUMULATE, True)
                 cute.gemm(_flash_pv_mma, tOtO1, tOrP1[None, None, flash_kp, 0],
                           tOrV[None, None, flash_kp, flash_v_full.index], tOtO1)
+            flash_O_acc1 = True
             flash_v_full.release()
             for flash_kp in cutlass.range(flash_nk, unroll_full=True):
                 _flash_qk_mma.set(cute_tcgen05_flash.Field.ACCUMULATE, flash_kp != 0)
@@ -4217,7 +5088,6 @@ flash_o_corr_chunks = {hd} // flash_o_corr_tile
                 cute_tcgen05_flash.commit(flash_s_full_ptr + 1)
             flash_k_full.release()
             flash_pfor_phase ^= 1
-            flash_O_acc = True
 
         flash_q0_full.release()
         flash_q1_full.release()
@@ -4226,7 +5096,7 @@ flash_o_corr_chunks = {hd} // flash_o_corr_tile
         flash_v_full = flash_kv_cons.wait_and_advance()
         _helion_flash_rt.mbar_spin_wait(flash_pfor_ptr + 0, flash_pfor_phase)
         for flash_kp in cutlass.range_constexpr(flash_pv_split):
-            _flash_pv_mma.set(cute_tcgen05_flash.Field.ACCUMULATE, flash_O_acc | (flash_kp != 0))
+            _flash_pv_mma.set(cute_tcgen05_flash.Field.ACCUMULATE, flash_O_acc0 | (flash_kp != 0))
             cute.gemm(_flash_pv_mma, tOtO0, tOrP0[None, None, flash_kp, 0],
                       tOrV[None, None, flash_kp, flash_v_full.index], tOtO0)
         _helion_flash_rt.mbar_spin_wait(flash_pfor2_ptr + 0, flash_pfor_phase)
@@ -4238,7 +5108,7 @@ flash_o_corr_chunks = {hd} // flash_o_corr_tile
             cute_tcgen05_flash.commit(flash_o_full_ptr + 0)
         _helion_flash_rt.mbar_spin_wait(flash_pfor_ptr + 1, flash_pfor_phase)
         for flash_kp in cutlass.range_constexpr(flash_pv_split):
-            _flash_pv_mma.set(cute_tcgen05_flash.Field.ACCUMULATE, flash_O_acc | (flash_kp != 0))
+            _flash_pv_mma.set(cute_tcgen05_flash.Field.ACCUMULATE, flash_O_acc1 | (flash_kp != 0))
             cute.gemm(_flash_pv_mma, tOtO1, tOrP1[None, None, flash_kp, 0],
                       tOrV[None, None, flash_kp, flash_v_full.index], tOtO1)
         _helion_flash_rt.mbar_spin_wait(flash_pfor2_ptr + 1, flash_pfor_phase)
@@ -4276,6 +5146,13 @@ flash_o_corr_chunks = {hd} // flash_o_corr_tile
     else:
         _disc_pass2_name = "fa4_disc_exp_convert_store"
         _disc_pass2_causal_name = "fa4_disc_exp_convert_store_causal"
+    softmax_loop_var = "flash_kv_iter" if causal_desc_kv else "flash_kv"
+    softmax_actual_kv = (
+        f"\n            flash_kv = {kv_loop_bound} - cutlass.Int32(1) - flash_kv_iter"
+        if causal_desc_kv
+        else ""
+    )
+    softmax_not_first = "flash_kv_iter != 0" if causal_desc_kv else "flash_kv != 0"
 
     # FA4 rescale_threshold (alpha-pin) softmax block. When the running max grows by
     # less than the threshold (scale_log2*(old-new) >= -thresh), keep the OLD max and
@@ -4287,19 +5164,21 @@ flash_o_corr_chunks = {hd} // flash_o_corr_tile
     # codegen constant (literal), so the compare is const-folded; threshold==0.0 (fp8)
     # emits the prior always-rescale block byte-identically. Stage-parameterized, so
     # one definition covers both softmax warpgroups (0/1).
-    if cfg.rescale_threshold > 0.0:
-        _flash_rescale_thresh = cfg.rescale_threshold
-        _disc_alpha_block = f"""            flash_acc_log = _flash_scale_log2 * (flash_old_row_max - flash_row_max_safe)
+    def _disc_alpha_block_for(not_first: str) -> str:
+        if cfg.rescale_threshold > 0.0:
+            return f"""            flash_acc_log = _flash_scale_log2 * (flash_old_row_max - flash_row_max_safe)
             flash_alpha = cute.math.exp2(flash_acc_log, fastmath=True)
-            if (flash_kv != 0) & (flash_acc_log >= -{_flash_rescale_thresh}):
+            if ({not_first}) & (flash_acc_log >= -{cfg.rescale_threshold}):
                 flash_row_max = flash_old_row_max
                 flash_row_max_safe = flash_old_row_max
                 flash_alpha = cutlass.Float32(1.0)
             flash_minus_max_scale = (0.0 - flash_row_max_safe) * _flash_scale_log2"""
-    else:
-        _disc_alpha_block = """            flash_minus_max_scale = (0.0 - flash_row_max_safe) * _flash_scale_log2
+
+        return """            flash_minus_max_scale = (0.0 - flash_row_max_safe) * _flash_scale_log2
             flash_alpha = cute.math.exp2(
                 _flash_scale_log2 * (flash_old_row_max - flash_row_max_safe), fastmath=True)"""
+
+    _disc_alpha_block = _disc_alpha_block_for(softmax_not_first)
 
     # The whole-row (non-disc) body computes flash_minus_max_scale BEFORE the exp2
     # PASS (which consumes it) and flash_alpha AFTER, so the alpha-pin reorders to a
@@ -4309,7 +5188,7 @@ flash_o_corr_chunks = {hd} // flash_o_corr_tile
     if cfg.rescale_threshold > 0.0:
         _sp_alpha_pre = f"""            flash_acc_log = _flash_scale_log2 * (flash_old_row_max - flash_row_max_safe)
             flash_alpha = cute.math.exp2(flash_acc_log, fastmath=True)
-            if (flash_kv != 0) & (flash_acc_log >= -{cfg.rescale_threshold}):
+            if ({softmax_not_first}) & (flash_acc_log >= -{cfg.rescale_threshold}):
                 flash_row_max = flash_old_row_max
                 flash_row_max_safe = flash_old_row_max
                 flash_alpha = cutlass.Float32(1.0)
@@ -4333,6 +5212,15 @@ flash_o_corr_chunks = {hd} // flash_o_corr_tile
         score_stt: str,
     ) -> str:
         def _format_disc_pass2(name: str, *, causal: bool) -> str:
+            e2e_freq = cfg.masked_e2e_freq if causal else cfg.e2e_freq
+            e2e_res = cfg.masked_e2e_res if causal else cfg.e2e_res
+            e2e_offset = (
+                0
+                if e2e_res == 0
+                else str(cfg.e2e_offset0)
+                if stage == "0"
+                else str(cfg.e2e_offset)
+            )
             args = [
                 ld,
                 ldt,
@@ -4342,9 +5230,9 @@ flash_o_corr_chunks = {hd} // flash_o_corr_tile
                 "tSTcS",
                 "_flash_scale_log2",
                 "flash_minus_max_scale",
-                str(cfg.e2e_freq),
-                str(cfg.e2e_res),
-                str(cfg.e2e_offset0) if stage == "0" else str(cfg.e2e_offset),
+                str(e2e_freq),
+                str(e2e_res),
+                str(e2e_offset),
                 f"flash_pfor_ptr + {stage}",
                 f"flash_pfor2_ptr + {stage}",
                 "flash_P_STORE_SPLIT",
@@ -4359,6 +5247,21 @@ flash_o_corr_chunks = {hd} // flash_o_corr_tile
 
         pass2_call = _format_disc_pass2(_disc_pass2_name, causal=False)
         pass2_causal_call = _format_disc_pass2(_disc_pass2_causal_name, causal=True)
+        zero_pass2_call = (
+            "_helion_flash_rt.fa4_disc_zero_store("
+            + ", ".join(
+                [
+                    st,
+                    stt,
+                    "tSTcS",
+                    f"flash_pfor_ptr + {stage}",
+                    f"flash_pfor2_ptr + {stage}",
+                    "flash_P_STORE_SPLIT",
+                    "flash_P_STORE_CHUNKS",
+                ]
+            )
+            + ")"
+        )
         if has_lse:
             lse_store = _flash_lse_store(
                 f"flash_m_tile{stage} * 128 + flash_local_tidx",
@@ -4413,7 +5316,7 @@ flash_o_corr_chunks = {hd} // flash_o_corr_tile
                 pass2_block = f"            flash_p_sum = {pass2_call}"
                 return f"""        flash_row_max = cutlass.Float32(-cutlass.Float32.inf)
         flash_row_sum = cutlass.Float32(0.0)
-        for flash_kv in cutlass.range({kv_loop_bound}, unroll=1):
+        for {softmax_loop_var} in cutlass.range({kv_loop_bound}, unroll=1):{softmax_actual_kv}
             _helion_flash_rt.mbar_spin_wait(flash_s_full_ptr + {stage}, flash_s_full_phase)
             flash_s_full_phase ^= 1
             flash_old_row_max = flash_row_max
@@ -4422,7 +5325,7 @@ flash_o_corr_chunks = {hd} // flash_o_corr_tile
             if flash_row_max == -cutlass.Float32.inf:
                 flash_row_max_safe = cutlass.Float32(0.0)
 {_disc_alpha_block}
-            if flash_kv != 0:
+            if {softmax_not_first}:
 {corr_publish_alpha}
 {pass2_block}
             flash_row_sum = flash_row_sum * flash_alpha + flash_p_sum
@@ -4431,12 +5334,90 @@ flash_o_corr_chunks = {hd} // flash_o_corr_tile
                 f"_helion_flash_rt.fa4_disc_rowmax("
                 f"{ld}, {ldt}, tLDcS, flash_row_max, flash_LD_CHUNKS)"
             )
+            direct_dense_rowmax = f"            flash_row_max = {rowmax_dense_call}"
+            direct_dense_pass2 = f"            flash_p_sum = {pass2_call}"
+
+            def _format_disc_loop(
+                loop_var: str,
+                loop_bound: str,
+                actual_kv: str,
+                not_first: str,
+                loop_rowmax_block: str,
+                loop_pass2_block: str,
+                *,
+                publish_rowsum: bool = True,
+                zero_first_tile: bool = False,
+            ) -> str:
+                rowsum_publish = corr_publish_rowsum if publish_rowsum else ""
+                if zero_first_tile:
+                    loop_rowmax_block = f"""            if {not_first}:
+{textwrap.indent(loop_rowmax_block, "    ")}"""
+                    loop_pass2_block = f"""            if {not_first}:
+{textwrap.indent(loop_pass2_block, "    ")}
+            else:
+                flash_p_sum = {zero_pass2_call}"""
+                return f"""        for {loop_var} in cutlass.range({loop_bound}, unroll=1):{actual_kv}
+            _helion_flash_rt.mbar_spin_wait(flash_s_full_ptr + {stage}, flash_s_full_phase)
+            flash_s_full_phase ^= 1
+            flash_old_row_max = flash_row_max
+{loop_rowmax_block}
+            flash_row_max_safe = flash_row_max
+            if flash_row_max == -cutlass.Float32.inf:
+                flash_row_max_safe = cutlass.Float32(0.0)
+{_disc_alpha_block_for(not_first)}
+            if {not_first}:
+{corr_publish_alpha}
+            flash_p_sum = cutlass.Float32(0.0)
+{loop_pass2_block}
+            flash_row_sum = flash_row_sum * flash_alpha + flash_p_sum
+{rowsum_publish}"""
+
             if is_causal:
                 rowmax_causal_call = (
                     f"_helion_flash_rt.fa4_disc_rowmax_causal("
                     f"{ld}, {ldt}, tLDcS, flash_row_max, flash_LD_CHUNKS, "
                     f"flash_m_tile{stage}, flash_kv)"
                 )
+                direct_causal_rowmax = (
+                    f"            flash_row_max = {rowmax_causal_call}"
+                )
+                direct_causal_pass2 = f"            flash_p_sum = {pass2_causal_call}"
+                if causal_desc_kv and cfg.causal_loop_split:
+                    masked_loop = _format_disc_loop(
+                        "flash_kv_mask_iter",
+                        f"{kv_loop_bound} - flash_m_tile{stage}",
+                        (
+                            f"\n            flash_kv = {kv_loop_bound} - "
+                            "cutlass.Int32(1) - flash_kv_mask_iter"
+                        ),
+                        "flash_kv_mask_iter != 0",
+                        direct_causal_rowmax,
+                        direct_causal_pass2,
+                        publish_rowsum=False,
+                        zero_first_tile=stage == "0",
+                    )
+                    empty_unmasked_rowsum = (
+                        f"""        if flash_m_tile0 == 0:
+{textwrap.indent(corr_publish_rowsum, "    ")}"""
+                        if stage == "0"
+                        else ""
+                    )
+                    unmasked_loop = _format_disc_loop(
+                        "flash_kv_unmask_iter",
+                        f"flash_m_tile{stage}",
+                        (
+                            f"\n            flash_kv = flash_m_tile{stage} - "
+                            "cutlass.Int32(1) - flash_kv_unmask_iter"
+                        ),
+                        "flash_kv_unmask_iter >= cutlass.Int32(0)",
+                        direct_dense_rowmax,
+                        direct_dense_pass2,
+                    )
+                    return f"""        flash_row_max = cutlass.Float32(-cutlass.Float32.inf)
+        flash_row_sum = cutlass.Float32(0.0)
+{masked_loop}
+{empty_unmasked_rowsum}
+{unmasked_loop}"""
                 rowmax_block = f"""            if flash_kv >= flash_m_tile{stage}:
                 flash_row_max = {rowmax_causal_call}
             else:
@@ -4446,8 +5427,8 @@ flash_o_corr_chunks = {hd} // flash_o_corr_tile
             else:
                 flash_p_sum = {pass2_call}"""
             else:
-                rowmax_block = f"            flash_row_max = {rowmax_dense_call}"
-                pass2_block = f"            flash_p_sum = {pass2_call}"
+                rowmax_block = direct_dense_rowmax
+                pass2_block = direct_dense_pass2
             # CHUNKED-t2r ("disc") body: the spike's PROVEN zero-spill structure.
             # PASS1 t2r's each 32-elem chunk to find the row-max (never the full
             # row resident); alpha + the s_corr handoff are computed between the
@@ -4455,23 +5436,17 @@ flash_o_corr_chunks = {hd} // flash_o_corr_tile
             # scale-subtract + exp2(split) + fp16 convert + r2t-store + row-sum
             # fold + the staged-P pfor/pfor2 arrives, freeing each chunk before the
             # next. Peak live = ONE 32-elem fragment -> fits the 200-grant zero-spill.
+            loop = _format_disc_loop(
+                softmax_loop_var,
+                kv_loop_bound,
+                softmax_actual_kv,
+                softmax_not_first,
+                rowmax_block,
+                pass2_block,
+            )
             return f"""        flash_row_max = cutlass.Float32(-cutlass.Float32.inf)
         flash_row_sum = cutlass.Float32(0.0)
-        for flash_kv in cutlass.range({kv_loop_bound}, unroll=1):
-            _helion_flash_rt.mbar_spin_wait(flash_s_full_ptr + {stage}, flash_s_full_phase)
-            flash_s_full_phase ^= 1
-            flash_old_row_max = flash_row_max
-{rowmax_block}
-            flash_row_max_safe = flash_row_max
-            if flash_row_max == -cutlass.Float32.inf:
-                flash_row_max_safe = cutlass.Float32(0.0)
-{_disc_alpha_block}
-            if flash_kv != 0:
-{corr_publish_alpha}
-            flash_p_sum = cutlass.Float32(0.0)
-{pass2_block}
-            flash_row_sum = flash_row_sum * flash_alpha + flash_p_sum
-{corr_publish_rowsum}"""
+{loop}"""
         score_transform = _flash_score_transform_block(
             score_plan,
             indent="            ",
@@ -4483,7 +5458,9 @@ flash_o_corr_chunks = {hd} // flash_o_corr_tile
         )
         return f"""        flash_row_max = cutlass.Float32(-cutlass.Float32.inf)
         flash_row_sum = cutlass.Float32(0.0)
-        for flash_kv in cutlass.range({kv_loop_bound}, unroll=1):
+        for {softmax_loop_var} in cutlass.range({kv_loop_bound}, unroll=1):{
+            softmax_actual_kv
+        }
             _helion_flash_rt.mbar_spin_wait(flash_s_full_ptr + {
             stage
         }, flash_s_full_phase)
@@ -4499,7 +5476,7 @@ flash_o_corr_chunks = {hd} // flash_o_corr_tile
 {_sp_alpha_pre}
 {softmax_exp_block}
 {_sp_alpha_post}
-            if flash_kv != 0:
+            if {softmax_not_first}:
 {corr_publish_alpha}
             flash_row_sum = flash_row_sum * flash_alpha + flash_p_sum
             for flash_ci in cutlass.range_constexpr(flash_P_STORE_SPLIT):

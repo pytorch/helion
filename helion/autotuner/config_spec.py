@@ -24,17 +24,26 @@ from .._compat import supports_maxnreg
 from .._compat import supports_tensor_descriptor
 from .._compat import target_device_capability as get_target_device_capability
 from .._compat import warps_to_threads
+from .._compiler.cute.cute_flash import FLASH_CAUSAL_KV_ORDER_KEY
+from .._compiler.cute.cute_flash import FLASH_CAUSAL_LOOP_SPLIT_KEY
 from .._compiler.cute.cute_flash import FLASH_CONFIG_KEYS
 from .._compiler.cute.cute_flash import FLASH_E2E_FREQ_KEY
 from .._compiler.cute.cute_flash import FLASH_E2E_OFFSET0_KEY
 from .._compiler.cute.cute_flash import FLASH_E2E_OFFSET_KEY
 from .._compiler.cute.cute_flash import FLASH_E2E_RES_KEY
 from .._compiler.cute.cute_flash import FLASH_E2E_SCHEDULE_KEY
+from .._compiler.cute.cute_flash import FLASH_EPI_TMA_KEY
 from .._compiler.cute.cute_flash import FLASH_EXP2_IMPL_KEY
+from .._compiler.cute.cute_flash import FLASH_MASKED_E2E_SCHEDULE_KEY
+from .._compiler.cute.cute_flash import FLASH_ROLE_MAP_KEY
 from .._compiler.cute.cute_flash import FLASH_TOPOLOGY_KEY
 from .._compiler.cute.cute_flash import _flash_causal_hd64_seed_num_kv_supported
+from .._compiler.cute.cute_flash import _flash_causal_hd64_seed_offset0
 from .._compiler.cute.cute_flash import _flash_causal_hd64_seed_params
+from .._compiler.cute.cute_flash import _flash_e2e_offset_period
 from .._compiler.cute.cute_flash import _flash_e2e_schedule_default
+from .._compiler.cute.cute_flash import _flash_masked_e2e_schedule_params
+from .._compiler.cute.cute_flash import _flash_normalize_e2e_offset
 from .._compiler.cute.cute_flash import _flash_normalize_e2e_params
 from .._compiler.cute.cute_flash import _flash_parse_e2e_schedule
 from .._compiler.cute.tcgen05_config import CUTE_TCGEN05_DIAGNOSTIC_CONFIG_KEYS
@@ -689,8 +698,28 @@ class ConfigSpec:
         effective_topology = cast("str", config[FLASH_TOPOLOGY_KEY])
         if effective_topology == "fa4" and self._cute_flash_num_kv % 2 != 0:
             effective_topology = "ws_overlap"
-        e2e_schedule_default = _flash_e2e_schedule_default(
-            effective_topology, self._cute_flash_head_dim
+        if fix_invalid:
+            config[FLASH_TOPOLOGY_KEY] = effective_topology
+        if effective_topology != "fa4":
+            config[FLASH_ROLE_MAP_KEY] = "helion"
+            config[FLASH_EPI_TMA_KEY] = False
+            config[FLASH_MASKED_E2E_SCHEDULE_KEY] = "inherit"
+            config[FLASH_CAUSAL_KV_ORDER_KEY] = "ascending"
+            config[FLASH_CAUSAL_LOOP_SPLIT_KEY] = False
+        causal_kv_order = config.get(FLASH_CAUSAL_KV_ORDER_KEY)
+        if not self._cute_flash_is_causal or causal_kv_order != "descending":
+            config[FLASH_CAUSAL_LOOP_SPLIT_KEY] = False
+        e2e_schedule_default = (
+            "8/2"
+            if (
+                effective_topology == "fa4"
+                and self._cute_flash_is_causal
+                and self._cute_flash_head_dim == 64
+                and _flash_causal_hd64_seed_num_kv_supported(self._cute_flash_num_kv)
+            )
+            else _flash_e2e_schedule_default(
+                effective_topology, self._cute_flash_head_dim
+            )
         )
         exp2_impl, e2e_freq, e2e_res = _flash_parse_e2e_schedule(
             str(config[FLASH_E2E_SCHEDULE_KEY]), e2e_schedule_default
@@ -707,8 +736,26 @@ class ConfigSpec:
             e2e_res,
             e2e_schedule_default,
         )
+        masked_e2e_schedule = str(config.get(FLASH_MASKED_E2E_SCHEDULE_KEY, "inherit"))
+        _masked_schedule, masked_e2e_freq, masked_e2e_res = (
+            _flash_masked_e2e_schedule_params(
+                masked_e2e_schedule,
+                e2e_schedule_default,
+                e2e_freq,
+                e2e_res,
+            )
+        )
+        if not self._cute_flash_is_causal:
+            masked_e2e_freq = e2e_freq
+            masked_e2e_res = e2e_res
+        e2e_offset_period = _flash_e2e_offset_period(
+            e2e_freq,
+            e2e_res,
+            masked_e2e_freq,
+            masked_e2e_res,
+        )
         if (
-            e2e_res > 0
+            e2e_offset_period > 0
             and effective_topology == "fa4"
             and self._cute_flash_head_dim == 64
         ):
@@ -717,32 +764,45 @@ class ConfigSpec:
             ):
                 schedule_default_offset = (
                     _flash_causal_hd64_seed_params(self._cute_flash_num_kv)[0]
-                    % e2e_freq
+                    % e2e_offset_period
                 )
             else:
-                schedule_default_offset = e2e_freq // 8
+                split_default_freq = e2e_freq if e2e_res > 0 else masked_e2e_freq
+                schedule_default_offset = split_default_freq // 8
         else:
             schedule_default_offset = 0
         default_offset = schedule_default_offset
         env_offset = os.environ.get("HELION_CUTE_FLASH_E2E_OFFSET")
         if env_offset is not None:
             default_offset = int(env_offset)
-            if e2e_res == 0:
+            if e2e_offset_period == 0:
                 default_offset = 0
             elif default_offset < 0:
                 default_offset = schedule_default_offset
             else:
-                default_offset %= e2e_freq
+                default_offset %= e2e_offset_period
         if not e2e_offset_was_present:
             config[FLASH_E2E_OFFSET_KEY] = default_offset
-        default_offset0 = 0
+        default_offset0 = (
+            _flash_causal_hd64_seed_offset0(self._cute_flash_num_kv)
+            if (
+                e2e_offset_period > 0
+                and effective_topology == "fa4"
+                and self._cute_flash_is_causal
+                and self._cute_flash_head_dim == 64
+                and _flash_causal_hd64_seed_num_kv_supported(self._cute_flash_num_kv)
+            )
+            else 0
+        )
         env_offset0 = os.environ.get("HELION_CUTE_FLASH_E2E_OFFSET0")
         if env_offset0 is not None:
-            default_offset0 = int(env_offset0)
-            if e2e_res == 0 or default_offset0 < 0:
+            env_offset0_value = int(env_offset0)
+            if e2e_offset_period == 0:
                 default_offset0 = 0
+            elif env_offset0_value < 0:
+                default_offset0 %= e2e_offset_period
             else:
-                default_offset0 %= e2e_freq
+                default_offset0 = env_offset0_value % e2e_offset_period
         if not e2e_offset0_was_present:
             config[FLASH_E2E_OFFSET0_KEY] = default_offset0
         for key, default in (
@@ -761,14 +821,20 @@ class ConfigSpec:
             e2e_offset = e2e_offset_value
             e2e_offset_invalid = (
                 e2e_offset != 0
-                if e2e_res == 0
-                else e2e_offset < 0 or e2e_offset >= e2e_freq
+                if e2e_offset_period == 0
+                else e2e_offset < 0 or e2e_offset >= e2e_offset_period
             )
             if e2e_offset_invalid:
                 if fix_invalid:
-                    config[key] = default
+                    config[key] = _flash_normalize_e2e_offset(
+                        e2e_offset, default, e2e_offset_period
+                    )
                 else:
-                    expected = [0] if e2e_res == 0 else list(range(e2e_freq))
+                    expected = (
+                        [0]
+                        if e2e_offset_period == 0
+                        else list(range(e2e_offset_period))
+                    )
                     raise InvalidConfig(
                         f"{key} must be one of {expected!r} for "
                         f"{FLASH_E2E_SCHEDULE_KEY}={config[FLASH_E2E_SCHEDULE_KEY]!r}, "
@@ -960,7 +1026,23 @@ class ConfigSpec:
         return self._cute_tcgen05_config._c_input_seed_config()
 
     def autotune_seed_configs(self) -> list[helion.Config]:
-        return self._cute_tcgen05_config.autotune_seed_configs()
+        seeds = self._cute_tcgen05_config.autotune_seed_configs()
+        if self.backend_name == "cute" and self.cute_flash_search_enabled:
+            from .._compiler.cute.cute_flash import flash_attention_seed_configs
+
+            assert self._cute_flash_head_dim is not None
+            seeds.extend(
+                flash_attention_seed_configs(
+                    self._cute_flash_head_dim,
+                    self._cute_flash_num_kv,
+                    is_causal=self._cute_flash_is_causal,
+                    has_kv_tile_pruning=self._cute_flash_has_kv_tile_pruning,
+                    requires_ws_overlap=self._cute_flash_requires_ws_overlap,
+                    small_biased_candidate=self._cute_flash_small_biased_candidate,
+                    block_size_targets=self._cute_flash_block_size_target_list(),
+                )
+            )
+        return seeds
 
     def _fix_tcgen05_cluster_m2_search_config(self, config: dict[str, object]) -> None:
         self._cute_tcgen05_config._fix_cluster_m2_search_config(config)
