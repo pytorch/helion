@@ -35,7 +35,6 @@ from helion._testing import skipIfRefEager
 from helion._testing import skipIfRocm
 from helion._testing import skipIfTileIR
 from helion._testing import skipIfXPU
-from helion._testing import xfailIfCute
 from helion._testing import xfailIfPallas
 from helion._testing import xfailIfPallasInterpret
 from helion._testing import xfailIfPallasTpu
@@ -977,7 +976,6 @@ class TestExamples(RefEagerTestBase, TestCase):
             block_sizes=[1, 64, 32],
         )
 
-    @xfailIfCute("slice-based stores not yet supported")
     @xfailIfPallas("slice-based stores not yet supported")
     def test_concat_simple(self):
         args = (

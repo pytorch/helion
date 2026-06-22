@@ -2087,7 +2087,7 @@ class TestCuteBackend(TestCase):
         )
         with self.assertRaisesRegex(
             helion.exc.BackendUnsupported,
-            "index type: <class 'slice'>",
+            "strided slices .* are not supported",
         ):
             code_and_output(grouped_n_matmul, args)
 
