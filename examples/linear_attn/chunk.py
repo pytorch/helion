@@ -66,7 +66,7 @@ def chunk_fwd_h(
             h_all[idx, i_t, tile_d, tile_dv] = h_acc.to(h_all.dtype)
             k_i = k[idx, i_t, :, tile_d]
             v_i = v[idx, i_t, :, tile_dv]
-            h_acc = torch.addmm(h_acc, k_i.transpose(-2, -1), v_i)
+            h_acc = hl.dot(k_i.transpose(-2, -1), v_i, acc=h_acc)
 
     return h_all
 
@@ -107,15 +107,15 @@ def chunk_fwd_o(
             qt = q[tile_bhn, :, tile_d]
             kt = k[tile_bhn, :, tile_d]
             ht = h[tile_bhn, tile_d, tile_dv]
-            o_cross = torch.baddbmm(o_cross, qt, ht.to(qt.dtype))
-            attn = torch.baddbmm(attn, qt, kt.transpose(-2, -1))
+            o_cross = hl.dot(qt, ht.to(qt.dtype), acc=o_cross)
+            attn = hl.dot(qt, kt.transpose(-2, -1), acc=attn)
 
         idx = hl.arange(C)
         causal = (idx[:, None] >= idx[None, :]).float()
         attn = attn * causal
 
         vt = v[tile_bhn, :, tile_dv]
-        o_intra = torch.bmm(attn.to(vt.dtype), vt)
+        o_intra = hl.dot(attn.to(vt.dtype), vt)
         out[tile_bhn, :, tile_dv] = ((o_cross + o_intra) * scale).to(out.dtype)
 
     return out
@@ -158,7 +158,7 @@ def chunk_bwd_dh(
             dh_all[idx, i, tile_d, tile_dv] = dh_acc.to(dh_all.dtype)
             q_i = q[idx, i, :, tile_d] * scale
             do_i = do[idx, i, :, tile_dv]
-            dh_acc = torch.addmm(dh_acc, q_i.transpose(-2, -1), do_i)
+            dh_acc = hl.dot(q_i.transpose(-2, -1), do_i, acc=dh_acc)
 
     return dh_all
 
@@ -206,12 +206,12 @@ def chunk_bwd_dqk(
             ht = h[tile_bhn, tile_d, tile_dv]
             dht = dh[tile_bhn, tile_d, tile_dv]
 
-            dA_raw = torch.baddbmm(dA_raw, dot, vt.transpose(-2, -1))
-            dq_cross_acc = torch.baddbmm(
-                dq_cross_acc, dot, ht.transpose(-2, -1).to(dot.dtype)
+            dA_raw = hl.dot(dot, vt.transpose(-2, -1), acc=dA_raw)
+            dq_cross_acc = hl.dot(
+                dot, ht.transpose(-2, -1).to(dot.dtype), acc=dq_cross_acc
             )
-            dk_state_acc = torch.baddbmm(
-                dk_state_acc, vt, dht.transpose(-2, -1).to(vt.dtype)
+            dk_state_acc = hl.dot(
+                vt, dht.transpose(-2, -1).to(vt.dtype), acc=dk_state_acc
             )
 
         idx = hl.arange(C)
@@ -221,12 +221,11 @@ def chunk_bwd_dqk(
         qt = q[tile_bhn, :, tile_d]
         kt = k[tile_bhn, :, tile_d]
         # dq' (q-independent) -> dq = scale * dq'. Fuse the cross-state add into
-        # the matmul (baddbmm), then apply scale to the whole sum.
-        dq_acc = torch.baddbmm(dq_cross_acc, dA.to(kt.dtype), kt) * scale
+        # the dot accumulator, then apply scale to the whole sum.
+        dq_acc = hl.dot(dA.to(kt.dtype), kt, acc=dq_cross_acc) * scale
         # dk uses q' = scale*q; the state term carries scale via dh. The matmul
-        # is scaled before the add, which baddbmm can't express (no alpha), so
-        # this stays an explicit bmm + add.
-        dk_acc = torch.bmm(dA.transpose(-2, -1).to(qt.dtype), qt) * scale + dk_state_acc
+        # is scaled before the add, so it stays a separate dot plus the add.
+        dk_acc = hl.dot(dA.transpose(-2, -1).to(qt.dtype), qt) * scale + dk_state_acc
 
         dq_out[tile_bhn, :, tile_d] = dq_acc.to(q.dtype)
         dk_out[tile_bhn, :, tile_d] = dk_acc.to(k.dtype)
@@ -271,15 +270,15 @@ def chunk_bwd_dv(
             kt = k[tile_bhn, :, tile_d]
             dht = dh[tile_bhn, tile_d, tile_dv]
 
-            attn = torch.baddbmm(attn, qt, kt.transpose(-2, -1))
-            dv_state = torch.baddbmm(dv_state, kt, dht.to(kt.dtype))
+            attn = hl.dot(qt, kt.transpose(-2, -1), acc=attn)
+            dv_state = hl.dot(kt, dht.to(kt.dtype), acc=dv_state)
 
         idx = hl.arange(C)
         causal = (idx[:, None] >= idx[None, :]).float()
         attn = attn * (causal * scale)
 
         dot = do[tile_bhn, :, tile_dv]
-        dv_acc = torch.baddbmm(dv_state, attn.transpose(-2, -1).to(dot.dtype), dot)
+        dv_acc = hl.dot(attn.transpose(-2, -1).to(dot.dtype), dot, acc=dv_state)
         dv_out[tile_bhn, :, tile_dv] = dv_acc.to(dv_out.dtype)
 
     return dv_out
