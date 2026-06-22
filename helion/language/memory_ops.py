@@ -3391,15 +3391,27 @@ def _codegen_cute_store_tcgen05_tile(
         include_coord_setup: bool = True,
         var_prefix: str = "tcgen05_edge",
         copy_atom: str | None = None,
+        m_only_pred: bool = False,
     ) -> str:
         # Shared edge-only vector copy emitter. The make_layout(1) retile gives
         # cute.copy a per-element predicate, while var_prefix/copy_atom let the
         # same shape drive D stores or exact-aux G2R register loads.
+        #
+        # ``m_only_pred`` is the padded-M tcgen05 fast path: when N divides ``bn``
+        # cleanly the only out-of-bounds output coordinate is the M row, so the
+        # predicate collapses from the 2-D ``cute.elem_less(coord, (m, n))`` to a
+        # single ``coord[0] < m_size`` row test. Fewer live registers / scalar
+        # ops on the epilogue warps for the tiny-M streaming case.
         copy_atom = copy_atom or simt_atom
         edge_src = df.new_var(f"{var_prefix}_src")
         edge_dst = df.new_var(f"{var_prefix}_dst")
         edge_coord = df.new_var(f"{var_prefix}_coord")
         edge_pred = df.new_var(f"{var_prefix}_pred")
+        pred_rhs = (
+            f"_coord[0] < cutlass.Int32({m_size})"
+            if m_only_pred
+            else f"cute.elem_less(_coord, ({m_size}, {n_size}))"
+        )
         return (
             (_simt_edge_coord_subtile_source(indent) if include_coord_setup else "")
             + f"{indent}{edge_src} = cute.logical_divide({src}, cute.make_layout(1))\n"
@@ -3408,7 +3420,7 @@ def _codegen_cute_store_tcgen05_tile(
             f"{indent}{edge_pred} = cute.make_rmem_tensor((1, {edge_src}.shape[1]), cutlass.Boolean)\n"
             f"{indent}for _edge_i in range(cute.size({edge_src}.shape[1])):\n"
             f"{indent}    _coord = {edge_coord}[0, _edge_i]\n"
-            f"{indent}    {edge_pred}[0, _edge_i] = cute.elem_less(_coord, ({m_size}, {n_size}))\n"
+            f"{indent}    {edge_pred}[0, _edge_i] = {pred_rhs}\n"
             f"{indent}cute.copy({copy_atom}, {edge_src}, {edge_dst}, pred={edge_pred})\n"
         )
 
@@ -4176,6 +4188,21 @@ def _codegen_cute_store_tcgen05_tile(
             ttr_rd,
             ttr_gc_subtile,
             include_coord_setup=not simt_store_edge_coord_preloaded,
+        )
+    elif tcgen05_value.flat_m_edge:
+        # Padded-M tcgen05 tile (block_m > real M, N divides bn). The full-tile
+        # predicate ``m_offset + bm <= m_size`` is statically unsatisfiable here
+        # (there is a single padded M tile), so the ``if full_tile`` fast path is
+        # dead code and the scalar per-element ``elem_less``/``if`` edge loop runs
+        # every subtile -- inflating epilogue register pressure / issue overhead
+        # on the streaming warps. Emit ONLY the vectorized predicated copy with an
+        # M-only row predicate (N is in-bounds because it divides bn): one boolean
+        # mask + one ``cute.copy`` per subtile, no scalar branch per element.
+        simt_store_copy_source = _simt_edge_logical_divide_copy_source(
+            "        ",
+            ttr_rd,
+            ttr_gc_subtile,
+            m_only_pred=True,
         )
     else:
         simt_store_copy_source = (
