@@ -65,8 +65,12 @@ def attention(
     v_view = v_in.reshape([-1, n_dim, head_dim])
     k_view = k_in.reshape([-1, n_dim, head_dim])
     out = torch.empty_like(q_view)
-    # Trailing size-1 dim works around a Pallas/TPU block-size inflation
-    # triggered by 2D outputs with a tile-indexed leading dim. See PR #2743.
+    # Trailing size-1 dim sidesteps a Helion block-size inflation: a 2-D
+    # `lse[B*H, S]` with a tile-indexed leading dim forces an 8-element
+    # sublane alignment on block_b, and adjust_block_size_constraints
+    # max-propagates that requirement to Q/K/V/out (which share the
+    # block_id), inflating their block_b and blowing up scoped VMEM.
+    # Tracked in pytorch/helion#2842.
     lse = torch.empty(
         [q_view.size(0), m_dim, 1], device=q_in.device, dtype=torch.float32
     )
