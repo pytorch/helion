@@ -7,7 +7,7 @@ fi
 
 if [ "$ACTION" = "install" ]; then
   set -ex
-  pip install ruff==0.15.14 pyrefly==1.0.0
+  pip install ruff==0.15.14 pyrefly==1.1.1
   exit 0
 fi
 

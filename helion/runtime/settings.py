@@ -410,6 +410,11 @@ class _Settings:
     )
     autotune_log_level: int = dataclasses.field(default_factory=_get_autotune_log_level)
     autotune_log: str | None = dataclasses.field(default_factory=_get_autotune_log_path)
+    autotune_log_details: bool = dataclasses.field(
+        default_factory=functools.partial(
+            _env_get_bool, "HELION_AUTOTUNE_LOG_DETAILS", False
+        )
+    )
     autotune_compile_timeout: int = dataclasses.field(
         default_factory=functools.partial(
             _env_get_int, "HELION_AUTOTUNE_COMPILE_TIMEOUT", 60
@@ -636,6 +641,11 @@ class Settings(_Settings):
         "autotune_log": (
             "Base filename for autotune logs. Set HELION_AUTOTUNE_LOG=/tmp/run to write "
             "/tmp/run.csv and /tmp/run.log with per-config metrics and debug logs."
+        ),
+        "autotune_log_details": (
+            "Opt-in (HELION_AUTOTUNE_LOG_DETAILS=1) to also write the cost-model "
+            "dataset sidecar /tmp/run.meta.jsonl (per-run kernel identity + the "
+            "configs tested, keyed by config_id). Off by default; needs autotune_log."
         ),
         "autotune_compile_timeout": "Timeout for Triton compilation in seconds used for autotuning. Default is 60 seconds.",
         "autotune_benchmark_subprocess": "Run the autotune benchmark phase in a long-lived spawn subprocess so a hung/slow kernel can be killed without losing autotune progress. Enabled by default. Set HELION_AUTOTUNE_BENCHMARK_SUBPROCESS=0 to disable.",

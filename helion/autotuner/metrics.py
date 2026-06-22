@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import dataclasses
+import functools
+import hashlib
 import time
 from typing import TYPE_CHECKING
 
@@ -32,7 +34,6 @@ class AutotuneMetrics:
     num_generations: int = 0
     autotune_time: float = 0.0
     best_perf_ms: float = 0.0
-    kernel_id: str = ""
     kernel_name: str = ""
     kernel_source: str = ""
     input_shapes: str = ""
@@ -45,7 +46,6 @@ class AutotuneMetrics:
 
     def to_dict(self) -> dict[str, object]:
         return {
-            "kernel_id": self.kernel_id,
             "kernel_name": self.kernel_name,
             "kernel_source": self.kernel_source,
             "input_shapes": self.input_shapes,
@@ -61,31 +61,90 @@ class AutotuneMetrics:
         }
 
 
+# Codegen/perf-affecting settings hashed into run_id, so invocations that would
+# generate different code never collide. Kept as a small local tuple (not Settings
+# field metadata) so settings.py stays untouched; the full settings are still
+# recorded verbatim in the .meta.jsonl record. Sorted for a stable wire format.
+# Every value is a scalar/enum/torch.dtype, so run_id is reproducible across
+# processes (no callables/paths/seed leak in).
+_CODEGEN_SETTINGS: tuple[str, ...] = (
+    "allow_warp_specialize",
+    "backend",
+    "debug_dtype_asserts",
+    "dot_precision",
+    "fast_math",
+    "index_dtype",
+    "pallas_interpret",
+    "persistent_reserved_sms",
+    "static_shapes",
+    "triton_do_not_specialize",
+)
+
+
+def _codegen_signature(settings: dict[str, object] | None) -> str:
+    """Join codegen-affecting settings into a stable, reproducible string for run_id.
+
+    Iterates the fixed local set of codegen-affecting settings, so any codegen
+    change alters run_id. Order is the tuple's (sorted) order for a stable wire
+    format; missing keys render as None. Full settings are stored separately in
+    metadata.
+    """
+    if not settings:
+        return ""
+    return ", ".join(f"{name}={settings.get(name)}" for name in _CODEGEN_SETTINGS)
+
+
 @dataclasses.dataclass
 class KernelMetadata:
     """Per-run identity for the kernel being autotuned.
 
-    Written once per autotuning run to the ``<autotune_log>.meta.json`` sidecar
-    that sits next to the per-config CSV telemetry. The CSV records each config
-    and its result; this provides the stable identity needed to group those rows
-    across runs. ``kernel_id`` is the stable, content-derived foreign key (a
-    hash of the kernel source and code-generation settings); ``kernel_source``
-    carries the full source text for analysis and debugging.
+    Appended (one JSON record per run) to the ``<autotune_log>.meta.jsonl``
+    sidecar that sits next to the per-config CSV telemetry. The CSV records each
+    config and its result; this record provides the kernel context (source,
+    shapes, dtypes, hardware, settings) those rows join back to.
+
+    ``run_id`` is the single foreign key for an autotune *invocation*: a direct
+    content hash of ``(kernel_source, codegen-settings signature, input_shapes,
+    dtypes, hardware)``. The same invocation produces the same ``run_id`` across
+    processes and CI runs (enabling dedup/aggregation), and any change to the
+    kernel, codegen-affecting settings, shapes, dtypes, or hardware changes it.
+    Because every CSV row is also stamped with ``run_id``, rows join to exactly
+    one meta record (a clean many-to-one).
+
+    ``run_id`` is a :func:`functools.cached_property` computed on first access.
+    ``kernel_source`` carries the full source text and ``settings`` the full
+    reproduction context for analysis.
     """
 
-    kernel_id: str = ""
     kernel_name: str = ""
     kernel_source: str = ""
     input_shapes: str = ""
     dtypes: str = ""
     hardware: str = ""
+    settings: dict[str, object] | None = None
+
+    @functools.cached_property
+    def run_id(self) -> str:
+        """Stable, content-derived id for this run, computed once and cached.
+
+        Hashed from ``(kernel_source, codegen-settings signature, input_shapes,
+        dtypes, hardware)`` joined with a delimiter that cannot appear inside the
+        fields (so boundaries can't collide). Content-derived, so the same
+        invocation yields the same ``run_id`` across processes and CI runs.
+        """
+        payload = (
+            f"{self.kernel_source}\x00{_codegen_signature(self.settings)}\x00"
+            f"{self.input_shapes}\x00{self.dtypes}\x00{self.hardware}"
+        )
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
     def to_dict(self) -> dict[str, object]:
         return {
-            "kernel_id": self.kernel_id,
+            "run_id": self.run_id,
             "kernel_name": self.kernel_name,
             "kernel_source": self.kernel_source,
             "input_shapes": self.input_shapes,
             "dtypes": self.dtypes,
             "hardware": self.hardware,
+            "settings": self.settings,
         }

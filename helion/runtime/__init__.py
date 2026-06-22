@@ -2126,7 +2126,7 @@ def _pallas_compile_compact_jit_fn(
         num_work = metadata.num_work  # type: ignore[attr-defined]
         scalar_prefetch = [getattr(metadata, f) for f in metadata_fields]
         call = pl.pallas_call(  # type: ignore[union-attr]
-            reordered_kernel,
+            reordered_kernel,  # pyrefly: ignore[bad-argument-type]
             out_shape=out_shape_arg,
             grid_spec=pltpu.PrefetchScalarGridSpec(  # type: ignore[union-attr]
                 num_scalar_prefetch=num_scalar_prefetch,
@@ -3207,6 +3207,20 @@ def _get_cute_launcher_imports() -> tuple[object, ...]:
     return cached
 
 
+def _cute_current_stream() -> object:
+    """Sample the *current* CUDA stream for a cute kernel launch.
+
+    Must be called fresh on every launch and never cached: under CUDA graph
+    capture ``torch.cuda.current_stream()`` is redirected to a dedicated capture
+    stream, so a stream baked into the cached launch args (during eager warmup)
+    would make the kernel launch on the wrong, non-capturing stream — the graph
+    then records no work and replays as a no-op (empty-graph capture). Sampling
+    here keeps the launch on whatever stream is current at call time.
+    """
+    _gmem, _make_ptr, current_stream_obj = _get_cute_launcher_imports()
+    return cast("Any", current_stream_obj)()
+
+
 # Keep the per-kernel launch-argument cache small: production kernels normally
 # relaunch one or two stable tensor signatures, while autotune may probe many.
 _CUTE_LAUNCH_ARG_CACHE_LIMIT = 8
@@ -3291,9 +3305,14 @@ def _build_cute_schema_and_args(
     grid: tuple[int, int, int],
     bake_tensor_shapes: bool = True,
 ) -> tuple[tuple[tuple[object, ...], ...], tuple[object, ...]]:
-    gmem_space, make_ptr_obj, current_stream_obj = _get_cute_launcher_imports()
+    # NOTE: the returned launch args deliberately EXCLUDE the CUDA stream. The
+    # stream is the only launch arg that is not a pure function of
+    # (grid, tensor metadata, scalars), so it must not be baked into the cached
+    # args — the caller appends a freshly sampled ``_cute_current_stream()`` on
+    # every launch (see ``default_cute_launcher``). Caching the stream would
+    # break CUDA graph capture (empty-graph / no-op replay).
+    gmem_space, make_ptr_obj, _current_stream_obj = _get_cute_launcher_imports()
     make_ptr = cast("Any", make_ptr_obj)
-    current_stream = cast("Any", current_stream_obj)
     constexpr_flags = _cute_kernel_param_is_constexpr(cute_kernel)
     # Kernels that emit cute MMA ops (universal matmul fallback or tcgen05
     # TMA wrapper plans) need runtime tensor layouts: the wrapper's
@@ -3366,7 +3385,8 @@ def _build_cute_schema_and_args(
             launch_args.append(scalar_value)
 
     launch_args.extend(grid)
-    launch_args.append(current_stream())
+    # The stream is intentionally NOT appended here; it is sampled fresh per
+    # launch by the caller so CUDA graph capture sees the capture stream.
     return tuple(schema), tuple(launch_args)
 
 
@@ -3456,7 +3476,10 @@ def default_cute_launcher(
         compile_options=cute_compile_options,
         arch_args=args_tuple,
     )
-    return cast("Any", compiled)(*launch_args)
+    # Append the CUDA stream fresh on every launch (never cached): under CUDA
+    # graph capture the current stream is the capture stream, so the kernel must
+    # be issued there and not on a stale stream baked into the cached args.
+    return cast("Any", compiled)(*launch_args, _cute_current_stream())
 
 
 def default_metal_launcher(

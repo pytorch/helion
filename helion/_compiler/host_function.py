@@ -137,7 +137,7 @@ class HostFunction:
 
     @property
     def fn(self) -> types.FunctionType:
-        return self.definition.fn
+        return self.definition.fn  # pyrefly: ignore[bad-return]
 
     @property
     def constexpr_args(self) -> dict[str, object]:

@@ -149,8 +149,7 @@ def tile(
                         acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
                     out[tile_m, tile_n] = acc
 
-
-            return out
+                return out
 
         Fixed block size:
 

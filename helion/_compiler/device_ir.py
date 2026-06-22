@@ -54,6 +54,7 @@ from .inductor_lowering import prepare_graph_lowerings
 from .loop_dependency_checker import LoopDependencyChecker
 from .matmul_utils import tensor_matmul_replacement
 from .matmul_utils import torch_matmul_replacement
+from .node_masking import defer_pallas_load_masks
 from .node_masking import remove_unnecessary_masking
 from .roll_reduction import ReductionRoller
 from .source_location import current_location
@@ -2959,10 +2960,13 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
                 promote_cute_root_graph_host_tensors(device_ir.graphs, promotions)
         for graph in device_ir.graphs:
             prepare_graph_lowerings(graph.graph)
+        defer_load_masks = CompileEnvironment.current().backend.name == "pallas"
         for graph in device_ir.graphs:
             validate_host_tensor_usage(graph.graph)
             add_tile_with_offset_metadata(graph)
             remove_unnecessary_tile_index(graph.graph)
+            if defer_load_masks:
+                defer_pallas_load_masks(graph.graph)
             remove_unnecessary_masking(graph.graph)
 
         # TODO(hinriksnaer): extract into a separate step? everything below
