@@ -1551,6 +1551,15 @@ def _pallas_compile_jit_fn(
         )
         skip_inplace_copy = set(_pipeline_arg_indices or [])
 
+    # In-place outputs whose wrapper copy is skipped (HBM refs can't be copied
+    # directly) are instead preserved by donating the input buffer at the
+    # pallas_call level.
+    donated_inplace_aliases = {
+        in_pos: out_pos
+        for in_pos, out_pos in pallas_aliases.items()
+        if tensor_arg_indices[in_pos] in skip_inplace_copy
+    }
+
     reordered_kernel = _pallas_make_reordered_kernel(
         pallas_kernel,
         args,
@@ -1612,6 +1621,8 @@ def _pallas_compile_jit_fn(
             pallas_call_kwargs["compiler_params"] = pltpu.CompilerParams(  # pyrefly: ignore[bad-instantiation]
                 dimension_semantics=dimension_semantics,
             )
+        if donated_inplace_aliases:
+            pallas_call_kwargs["input_output_aliases"] = donated_inplace_aliases
         if interpret:
             pallas_call_kwargs["interpret"] = True
 
