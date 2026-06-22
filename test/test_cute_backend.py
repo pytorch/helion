@@ -2998,6 +2998,31 @@ def _cute_2d_tile_reduction_kernel(x: torch.Tensor) -> torch.Tensor:
     return out
 
 
+@helion.kernel(backend="cute", static_shapes=True)
+def _cute_fp8_gemm_skinny_m(
+    x: torch.Tensor,
+    y: torch.Tensor,
+    scale_a: torch.Tensor,
+    scale_b: torch.Tensor,
+) -> torch.Tensor:
+    """Skinny-M fp8 GEMM: full M kept resident, grid over N, reduce over K.
+
+    Used by the thread-budget rejection tests: an explicit ``num_threads``
+    split on the K (contraction) axis whose joint thread count exceeds the
+    1024-thread CTA budget must be rejected rather than silently miscompiled.
+    """
+    m, k = x.size()
+    _, n = y.size()
+    out = torch.empty([m, n], dtype=torch.bfloat16, device=x.device)
+    for tile_n in hl.tile(n):
+        acc = hl.zeros([m, tile_n], dtype=torch.float32)
+        for tile_k in hl.tile(k):
+            acc = hl.dot(x[:, tile_k], y[tile_k, tile_n], acc=acc)
+        acc = acc * scale_a[:, tile_n] * scale_b[tile_n]
+        out[:, tile_n] = acc.to(torch.bfloat16)
+    return out
+
+
 @onlyBackends(["cute"])
 class TestCuteThreadBudgetRejection(TestCase):
     """The CuTe launcher raises ``BackendUnsupported`` when a config
@@ -3041,6 +3066,60 @@ class TestCuteThreadBudgetRejection(TestCase):
         )
         ref = torch.nn.functional.softmax(x, dim=1)
         torch.testing.assert_close(out, ref, atol=1e-2, rtol=1e-2)
+
+    def test_skinny_fp8_gemm_overbudget_k_threads_rejected(self) -> None:
+        """A skinny-M fp8 GEMM whose ``num_threads`` splits the K
+        (contraction) axis so the joint CTA thread count exceeds 1024 MUST
+        raise ``BackendUnsupported`` instead of silently miscompiling.
+
+        Regression for the skinny-M fp8 miscompile: a config like
+        ``block_sizes=[4, 16384], num_threads=[0, 1024]`` (block_n=4,
+        K threaded by 1024) commits the grouped K-reduction to a
+        4 * 1024 = 4096-thread span, but the launcher caps at 1024 and
+        silently drops the K thread axis — the reduction then reads phantom
+        lanes and the output came out ~1e4x too large. The truncation guard
+        (in ``CuteBackend.launcher_keyword_args``) now also fires for matmul
+        kernels that lowered ``hl.dot`` to the scalar grouped-reduce path
+        (no ``cute.gemm`` intrinsic), rejecting such configs cleanly. The same
+        over-budget decomposition is reachable with an in-range block_k too.
+        """
+        torch.manual_seed(0)
+        m, k, n = 16, 4096, 512
+        x = torch.randn(m, k, device=DEVICE).to(torch.float8_e4m3fn)
+        y = torch.randn(k, n, device=DEVICE).to(torch.float8_e4m3fn)
+        scale_a = torch.ones(m, n, device=DEVICE, dtype=torch.float32)
+        scale_b = torch.ones(n, device=DEVICE, dtype=torch.float32)
+        with pytest.raises(BackendUnsupported):
+            code_and_output(
+                _cute_fp8_gemm_skinny_m,
+                (x, y, scale_a, scale_b),
+                block_sizes=[4, 16384],
+                cute_vector_widths=[8, 1],
+                epilogue_subtile=2,
+                num_threads=[0, 1024],
+            )
+
+    def test_skinny_fp8_gemm_in_budget_is_correct(self) -> None:
+        """A valid skinny-M fp8 GEMM config (joint threads within budget)
+        must compile and produce numerically correct output.
+
+        Uses identity scales and range-filling fp8 inputs so the reference
+        ``x.float() @ y.float()`` is O(1) and any miscompile is visible (the
+        original bug was masked by degenerate near-zero benchmark inputs).
+        """
+        torch.manual_seed(0)
+        m, k, n = 16, 4096, 512
+        x = torch.randn(m, k, device=DEVICE).to(torch.float8_e4m3fn)
+        y = torch.randn(k, n, device=DEVICE).to(torch.float8_e4m3fn)
+        scale_a = torch.ones(m, n, device=DEVICE, dtype=torch.float32)
+        scale_b = torch.ones(n, device=DEVICE, dtype=torch.float32)
+        _, out = code_and_output(
+            _cute_fp8_gemm_skinny_m,
+            (x, y, scale_a, scale_b),
+            block_sizes=[256, 64],
+        )
+        ref = x.float() @ y.float()
+        torch.testing.assert_close(out.float(), ref, atol=1.0, rtol=1e-1)
 
 
 @onlyBackends(["cute"])
