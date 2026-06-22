@@ -65,7 +65,15 @@ def attention(
     v_view = v_in.reshape([-1, n_dim, head_dim])
     k_view = k_in.reshape([-1, n_dim, head_dim])
     out = torch.empty_like(q_view)
-    lse = torch.empty([q_view.size(0), m_dim], device=q_in.device, dtype=torch.float32)
+    # Trailing size-1 dim sidesteps a Helion block-size inflation: a 2-D
+    # `lse[B*H, S]` with a tile-indexed leading dim forces an 8-element
+    # sublane alignment on block_b, and adjust_block_size_constraints
+    # max-propagates that requirement to Q/K/V/out (which share the
+    # block_id), inflating their block_b and blowing up scoped VMEM.
+    # Tracked in pytorch/helion#2842.
+    lse = torch.empty(
+        [q_view.size(0), m_dim, 1], device=q_in.device, dtype=torch.float32
+    )
     sm_scale = 1.0 / math.sqrt(head_dim)
     qk_scale = sm_scale * 1.44269504  # 1/log(2)
     for tile_b, tile_m in hl.tile([q_view.size(0), m_dim]):
@@ -92,9 +100,9 @@ def attention(
             acc = torch.baddbmm(acc, p, v)
             m_i = m_ij
         acc = acc / l_i[:, :, None]
-        lse[tile_b, tile_m] = m_i + torch.log2(l_i)
+        lse[tile_b, tile_m, :] = (m_i + torch.log2(l_i))[:, :, None]
         out[tile_b, tile_m, :] = acc.to(out.dtype)
-    return out.view(q_in.size()), lse.view(q_in.size()[:-1])
+    return out.view(q_in.size()), lse.reshape(q_in.size()[:-1])
 
 
 # %%
