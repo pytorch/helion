@@ -61,6 +61,12 @@ assert (
     TCGEN05_TWO_CTA_EDGE_K_TAIL_AB_STAGES
     <= TCGEN05_TWO_CTA_EDGE_TMA_STORE_MAX_AB_STAGES
 ), "edge K-tail seed must fit the full-tile TMA-store AB-stage limit"
+# fp8 small-grid CtaGroup.TWO family. The bm=256 full-tile cluster_m=2 row
+# produces only ``(M/256)*(N/256)`` output clusters, which badly underfills the
+# device on the small/wave-limited fp8 serving GEMMs this kernel targets (e.g.
+# 512x2048x4096 -> 16 clusters on a 148-SM B200).
+TCGEN05_TWO_CTA_FP8_SMALL_GRID_BLOCK_M = 128
+TCGEN05_TWO_CTA_FP8_SMALL_GRID_BLOCK_N = 128
 # Best measured seed L2 grouping for the full-tile CtaGroup.TWO row.
 TCGEN05_TWO_CTA_SEED_L2_GROUPING = 4
 # This pid order stays slightly ahead of persistent_blocked in the validated

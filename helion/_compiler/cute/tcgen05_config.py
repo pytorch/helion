@@ -117,6 +117,8 @@ from .tcgen05_constants import TCGEN05_TWO_CTA_EDGE_K_TAIL_NARROW_BLOCK_K
 from .tcgen05_constants import TCGEN05_TWO_CTA_EDGE_K_TAIL_NARROW_BLOCK_N
 from .tcgen05_constants import TCGEN05_TWO_CTA_EDGE_K_TAIL_NARROW_L2_GROUPING
 from .tcgen05_constants import TCGEN05_TWO_CTA_EDGE_K_TAIL_SCHEDULER_L2_SWIZZLE_SIZE
+from .tcgen05_constants import TCGEN05_TWO_CTA_FP8_SMALL_GRID_BLOCK_M
+from .tcgen05_constants import TCGEN05_TWO_CTA_FP8_SMALL_GRID_BLOCK_N
 from .tcgen05_constants import TCGEN05_TWO_CTA_MAX_K_TILES
 from .tcgen05_constants import TCGEN05_TWO_CTA_SEED_PID_TYPE
 from .tcgen05_constants import tcgen05_ab_smem_bytes_per_cta
@@ -140,6 +142,12 @@ class Tcgen05ClusterM2SearchConstraints(NamedTuple):
     static_k: int
     max_k_tiles: int
     allow_edge_k_tail_family: bool = False
+    # When True, a sampled bm<=128 cluster_m=2 candidate is projected onto the
+    # fp8 small-grid 2-CTA tile (bm=128/bn=128, per-CTA 64xbn) instead of the
+    # bm=256 full tile. Gated to fp8 by the caller, mirroring
+    # ``_tcgen05_use_2cta_instrs`` (``bm == 128 and is_fp8``). See the
+    # ``TCGEN05_TWO_CTA_FP8_SMALL_GRID_*`` constants.
+    allow_fp8_small_grid: bool = False
 
 
 class Tcgen05AbStagesThreeSearchConstraints(NamedTuple):
@@ -261,6 +269,7 @@ class CuteTcgen05Config:
         static_k: int,
         max_k_tiles: int = TCGEN05_TWO_CTA_MAX_K_TILES,
         allow_edge_k_tail_family: bool = False,
+        allow_fp8_small_grid: bool = False,
     ) -> None:
         assert static_k > 0, "static_k is required for cluster_m=2 K-cap checks"
         assert max_k_tiles > 0, "cluster_m=2 max K tiles must be positive"
@@ -268,6 +277,7 @@ class CuteTcgen05Config:
             static_k=static_k,
             max_k_tiles=max_k_tiles,
             allow_edge_k_tail_family=allow_edge_k_tail_family,
+            allow_fp8_small_grid=allow_fp8_small_grid,
         )
         self.restrict_cluster_m_search((1, 2))
 
@@ -737,6 +747,33 @@ class CuteTcgen05Config:
             config["tcgen05_cluster_m"] = 1
             return
         config["pid_type"] = TCGEN05_TWO_CTA_SEED_PID_TYPE
+        # The tcgen05 CtaGroup.TWO MMA path does not emit the per-block-id
+        # indices/masks that a fused epilogue subtile needs, so a sampled
+        # ``epilogue_subtile`` on a cluster_m=2 candidate raises
+        # ``BackendUnsupported`` at codegen. Drop it here (rather than letting
+        # the candidate fail to compile and waste autotune budget) -- every
+        # cluster_m=2 search candidate that survives to this point is committed
+        # to the 2-CTA path. The edge-family prefixes below also pop it for
+        # their sub-paths; doing it once here covers the full-tile and
+        # small-grid paths too.
+        config.pop("epilogue_subtile", None)
+        # fp8 small-grid family: a sampled bm<=128 routes to the fp8-validated
+        # per-CTA 64xbn 2-CTA tile (bm=128/bn=128) instead of the bm=256 full
+        # tile, which underfills the device on small/wave-limited fp8 GEMMs. The
+        # bm=256 full tile is still reachable from a sampled bm>128. The codegen
+        # + runtime own this tile via ``_tcgen05_use_2cta_instrs``
+        # (``bm == 128 and is_fp8``). Edge+K-tail candidates keep the bm=256
+        # double-edge family unconditionally.
+        if (
+            constraints.allow_fp8_small_grid
+            and not edge_k_tail_family
+            and isinstance(block_sizes[0], int)
+            and not isinstance(block_sizes[0], bool)
+            and block_sizes[0] <= TCGEN05_TWO_CTA_FP8_SMALL_GRID_BLOCK_M
+        ):
+            block_sizes[0] = TCGEN05_TWO_CTA_FP8_SMALL_GRID_BLOCK_M
+            block_sizes[1] = TCGEN05_TWO_CTA_FP8_SMALL_GRID_BLOCK_N
+            return
         block_sizes[0] = TCGEN05_TWO_CTA_BLOCK_M
         # Only the fully validated narrow-N CLC+aux-TMA seed may keep
         # block_n=128; other candidates use the canonical block_n=256.
@@ -1723,6 +1760,7 @@ class CuteTcgen05Config:
         allow_cluster_m2_search: bool = False,
         cluster_m2_static_k: int | None = None,
         allow_cluster_m2_edge_k_tail_family: bool = False,
+        allow_cluster_m2_fp8_small_grid: bool = False,
         ab_stages_three_dtype_bytes: int | None = None,
         ab_stages_three_device: torch.device | None = None,
     ) -> None:
@@ -1733,6 +1771,10 @@ class CuteTcgen05Config:
         if allow_cluster_m2_edge_k_tail_family:
             assert allow_cluster_m2_search, (
                 "cluster_m=2 edge/K-tail admission requires cluster_m=2 search"
+            )
+        if allow_cluster_m2_fp8_small_grid:
+            assert allow_cluster_m2_search, (
+                "cluster_m=2 fp8 small-grid admission requires cluster_m=2 search"
             )
         cluster_m2_static_k_int: int | None = None
         if allow_cluster_m2_search:
@@ -1759,6 +1801,7 @@ class CuteTcgen05Config:
             self.allow_cluster_m2_search(
                 static_k=cluster_m2_static_k_int,
                 allow_edge_k_tail_family=allow_cluster_m2_edge_k_tail_family,
+                allow_fp8_small_grid=allow_cluster_m2_fp8_small_grid,
             )
         else:
             self.restrict_cluster_m_search((1,))

@@ -28,6 +28,8 @@ from .._compiler.cute.tcgen05_constants import TCGEN05_FLAT_ROLE_COORDINATES_CON
 from .._compiler.cute.tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_M
 from .._compiler.cute.tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_N
 from .._compiler.cute.tcgen05_constants import TCGEN05_TWO_CTA_EDGE_K_TAIL_MIN_DIM
+from .._compiler.cute.tcgen05_constants import TCGEN05_TWO_CTA_FP8_SMALL_GRID_BLOCK_M
+from .._compiler.cute.tcgen05_constants import TCGEN05_TWO_CTA_FP8_SMALL_GRID_BLOCK_N
 from .._compiler.cute.tcgen05_constants import TCGEN05_TWO_CTA_MAX_K_TILES
 from .._compiler.matmul_utils import _compute_out_dtype
 from .._compiler.matmul_utils import _emit_pallas_matmul
@@ -405,8 +407,23 @@ def enforce_dot_requirements(lhs: torch.Tensor, rhs: torch.Tensor) -> None:
                 and two_cta_n_edge
                 and two_cta_k_tail
             )
+            # fp8 small-grid CtaGroup.TWO family: the fp8-validated bm=128
+            # (per-CTA 64xbn) 2-CTA tile keeps the 2-CTA A-multicast but needs
+            # only a 128x128 cluster tile, so it admits small/wave-limited fp8
+            # GEMMs (e.g. 512x2048x4096) that the bm=256 full tile underfills.
+            # Gated to fp8 + static-full persistent (same envelope as the full
+            # tile) and only requires the search space to reach bm/bn=128.
+            allow_fp8_small_grid_cluster_m2_search = (
+                is_fp8
+                and allow_full_tile_persistent_pid_types
+                and max_search_m >= TCGEN05_TWO_CTA_FP8_SMALL_GRID_BLOCK_M
+                and max_search_n >= TCGEN05_TWO_CTA_FP8_SMALL_GRID_BLOCK_N
+                and static_k <= max_cluster_m2_search_k
+            )
             allow_cluster_m2_search = (
-                allow_full_tile_cluster_m2_search or allow_edge_cluster_m2_search
+                allow_full_tile_cluster_m2_search
+                or allow_edge_cluster_m2_search
+                or allow_fp8_small_grid_cluster_m2_search
             )
             # Small-shape wave-quantization gate. Suppress cluster_m=2 search
             # only for genuinely tiny problems that cannot fill a meaningful
@@ -428,12 +445,24 @@ def enforce_dot_requirements(lhs: torch.Tensor, rhs: torch.Tensor) -> None:
             if allow_cluster_m2_search:
                 num_sms_for_cm2_threshold = _cuda_num_sms_or_zero(lhs.device)
                 if num_sms_for_cm2_threshold > 0:
-                    cm2_work_clusters = (static_m // TCGEN05_TWO_CTA_BLOCK_M) * (
-                        static_n // TCGEN05_TWO_CTA_BLOCK_N
+                    # Count work clusters with the smallest reachable cluster
+                    # tile so the gate reflects the actual parallelism. The fp8
+                    # small-grid family forms 128x128 clusters (4x as many tiles
+                    # as the 256x256 full tile), so a shape that underfills the
+                    # full tile can still fill the device via small-grid.
+                    if allow_fp8_small_grid_cluster_m2_search:
+                        cm2_cluster_m = TCGEN05_TWO_CTA_FP8_SMALL_GRID_BLOCK_M
+                        cm2_cluster_n = TCGEN05_TWO_CTA_FP8_SMALL_GRID_BLOCK_N
+                    else:
+                        cm2_cluster_m = TCGEN05_TWO_CTA_BLOCK_M
+                        cm2_cluster_n = TCGEN05_TWO_CTA_BLOCK_N
+                    cm2_work_clusters = (static_m // cm2_cluster_m) * (
+                        static_n // cm2_cluster_n
                     )
                     cm2_min_clusters = num_sms_for_cm2_threshold // 4
                     if cm2_work_clusters < cm2_min_clusters:
                         allow_cluster_m2_search = False
+                        allow_fp8_small_grid_cluster_m2_search = False
             # Narrow the autotune search to tcgen05 configs that have been
             # validated to compile and run correctly on B200. Static full-tile
             # single-root role-local persistent kernels have coverage, so the
@@ -470,6 +499,7 @@ def enforce_dot_requirements(lhs: torch.Tensor, rhs: torch.Tensor) -> None:
                 allow_cluster_m2_search=allow_cluster_m2_search,
                 cluster_m2_static_k=static_k if allow_cluster_m2_search else None,
                 allow_cluster_m2_edge_k_tail_family=allow_edge_cluster_m2_search,
+                allow_cluster_m2_fp8_small_grid=allow_fp8_small_grid_cluster_m2_search,
                 ab_stages_three_dtype_bytes=ab_dtype_bytes,
                 ab_stages_three_device=lhs.device,
             )

@@ -492,6 +492,65 @@ def cute_matmul_mma_fp8_rowvec_scale(
     return out
 
 
+@helion.kernel(backend="cute", static_shapes=True)
+def cute_matmul_mma_fp8_colvec_scale(
+    x: torch.Tensor, y: torch.Tensor, scale_m: torch.Tensor
+) -> torch.Tensor:
+    # fp8 GEMM with a fused per-row (column-vector ``scale_m[m]``) scale.
+    # Exercises the colvec aux chain (``broadcast_axis == 2``) on the tcgen05
+    # fp8 path, including the scalar fast-path / dense-materialize selection.
+    m, k = x.size()
+    _, n = y.size()
+    out = torch.empty([m, n], dtype=torch.bfloat16, device=x.device)
+    for tile_m, tile_n in hl.tile([m, n]):
+        acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+        for tile_k in hl.tile(k):
+            acc = hl.dot(x[tile_m, tile_k], y[tile_k, tile_n], acc=acc)
+        out[tile_m, tile_n] = (acc * scale_m[tile_m, tile_n]).to(torch.bfloat16)
+    return out
+
+
+@helion.kernel(backend="cute", static_shapes=True)
+def cute_matmul_mma_fp8_rowwise_colwise_scale(
+    x: torch.Tensor,
+    y: torch.Tensor,
+    scale_m: torch.Tensor,
+    scale_n: torch.Tensor,
+) -> torch.Tensor:
+    # fp8 GEMM with BOTH a per-row (colvec ``scale_m[m]``) and per-column
+    # (rowvec ``scale_n[n]``) fused scale in the epilogue -- the rowwise x
+    # rowwise scaling used by vLLM-style fp8 W8A8 GEMMs. Exercises both
+    # broadcast-aux directions in a single tcgen05 epilogue chain.
+    m, k = x.size()
+    _, n = y.size()
+    out = torch.empty([m, n], dtype=torch.bfloat16, device=x.device)
+    for tile_m, tile_n in hl.tile([m, n]):
+        acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+        for tile_k in hl.tile(k):
+            acc = hl.dot(x[tile_m, tile_k], y[tile_k, tile_n], acc=acc)
+        acc = acc * scale_m[tile_m, tile_n] * scale_n[tile_n]
+        out[tile_m, tile_n] = acc.to(torch.bfloat16)
+    return out
+
+
+@helion.kernel(backend="cute", static_shapes=True)
+def cute_matmul_mma_epilogue_f32_bias(
+    x: torch.Tensor, y: torch.Tensor, bias: torch.Tensor
+) -> torch.Tensor:
+    # fp8 GEMM with an exact-shape (full (m, n), non-broadcast) fused bias
+    # add in the epilogue, f32 accumulate -> bf16 out. Exercises the
+    # exact-shape aux load path (``broadcast_axis is None``).
+    m, k = x.size()
+    _, n = y.size()
+    out = torch.empty([m, n], dtype=torch.bfloat16, device=x.device)
+    for tile_m, tile_n in hl.tile([m, n]):
+        acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+        for tile_k in hl.tile(k):
+            acc = hl.dot(x[tile_m, tile_k], y[tile_k, tile_n], acc=acc)
+        out[tile_m, tile_n] = (acc + bias[tile_m, tile_n]).to(torch.bfloat16)
+    return out
+
+
 @helion.kernel(backend="cute")
 def cute_matmul_mma_epilogue(
     x: torch.Tensor, y: torch.Tensor, bias: torch.Tensor
@@ -1291,6 +1350,201 @@ class TestCuteBackend(TestCase):
         ref = (x.float() @ y.float()) * scale_n.float()
         torch.testing.assert_close(out.float(), ref, atol=1.0, rtol=1e-1)
         self.assertIn("cutlass.Float8E4M3FN", code)
+        self.assertIn("cute.nvgpu.tcgen05", code)
+
+    def test_matmul_mma_tcgen05_fp8_rowvec_scale_block_m64(self) -> None:
+        # block_m=64 is below the T2R atom's M extent, so each thread's
+        # per-subtile epilogue fragment spans MULTIPLE M rows. A rowvec aux
+        # (``scale_n[n]``) partitions with a stride-0 M mode that does not
+        # coalesce to the accumulator carrier's flat profile, so a plain
+        # ``.load()`` used to raise ``profile of input tuples doesn't match:
+        # (8, (2, 2, 2))`` at trace time. Regression guard for the
+        # broadcast-aux dense-materialization path. All existing rowvec
+        # tests use block_m>=128, where the broadcast mode is size 1 and the
+        # bug is invisible.
+        support = get_cute_mma_support()
+        if not support.tcgen05_f8:
+            self.skipTest("tcgen05 FP8 MMA is not supported on this machine")
+
+        torch.manual_seed(0)
+        x = (torch.randn(64, 256, device=DEVICE) * 0.4).to(torch.float8_e4m3fn)
+        y = (torch.randn(256, 256, device=DEVICE) * 0.4).to(torch.float8_e4m3fn)
+        scale_n = torch.rand(256, device=DEVICE) + 0.5
+        code, out = code_and_output(
+            cute_matmul_mma_fp8_rowvec_scale,
+            (x, y, scale_n),
+            block_sizes=[64, 128, 32],
+            tcgen05_strategy="role_local_monolithic",
+            tcgen05_persistence_model="non_persistent",
+            pid_type="flat",
+        )
+        ref = (x.float() @ y.float()) * scale_n.float()
+        torch.testing.assert_close(out.float(), ref, atol=1.0, rtol=1e-1)
+        self.assertFalse(out.float().isnan().any().item())
+        self.assertIn("cute.nvgpu.tcgen05", code)
+
+    def test_matmul_mma_tcgen05_fp8_rowwise_colwise_scale_block_m64(self) -> None:
+        # Both broadcast-aux directions (per-row colvec ``scale_m[m]`` AND
+        # per-column rowvec ``scale_n[n]``) in one epilogue chain at
+        # block_m=64. The colvec scalar fast-path (a single T2R read at
+        # ``(0,0,0,subtile)``) is only valid when each thread's fragment lies
+        # within a single M row; if it spans multiple rows, applying row 0's
+        # scale everywhere silently corrupts the output. This is the fp8
+        # rowwise-x-rowwise pattern that the M=512/M=64 fp8_gemm dashboard
+        # shapes hit via the autotuner's default config.
+        #
+        # Uses a STRONGLY row-dependent ``scale_m`` (row i -> i+1) so a
+        # wrong-row read is off by a large factor, not masked by a loose
+        # tolerance on a near-uniform random scale.
+        support = get_cute_mma_support()
+        if not support.tcgen05_f8:
+            self.skipTest("tcgen05 FP8 MMA is not supported on this machine")
+
+        torch.manual_seed(0)
+        m, k, n = 64, 256, 256
+        x = (torch.randn(m, k, device=DEVICE) * 0.4).to(torch.float8_e4m3fn)
+        y = (torch.randn(k, n, device=DEVICE) * 0.4).to(torch.float8_e4m3fn)
+        # Per-row scale fed as a broadcast (m, 1) -> (m, n) view, matching the
+        # fp8 rowwise GEMM operator (``scale_a.reshape(-1, 1).expand(m, n)``):
+        # this classifies as a colvec (``broadcast_axis == 2``) aux.
+        scale_m = (
+            (torch.arange(m, device=DEVICE, dtype=torch.float32) + 1.0)
+            .reshape(m, 1)
+            .expand(m, n)
+        )
+        scale_n = torch.rand(n, device=DEVICE) + 0.5
+        code, out = code_and_output(
+            cute_matmul_mma_fp8_rowwise_colwise_scale,
+            (x, y, scale_m, scale_n),
+            block_sizes=[64, 128, 32],
+            tcgen05_strategy="role_local_monolithic",
+            tcgen05_persistence_model="non_persistent",
+            pid_type="flat",
+        )
+        ref = (x.float() @ y.float()) * scale_m.float() * scale_n.float().reshape(1, -1)
+        # Relative check: a row-broadcast bug would scale row i by 1 instead of
+        # (i+1), diverging by up to m x on the later rows.
+        torch.testing.assert_close(out.float(), ref, atol=2.0, rtol=5e-2)
+        self.assertFalse(out.float().isnan().any().item())
+        self.assertIn("cute.nvgpu.tcgen05", code)
+
+    def _run_colvec_scale_row_dependent(
+        self,
+        block_sizes: list[int],
+        *,
+        m: int = 64,
+        n: int = 256,
+        **config_kwargs: object,
+    ) -> str:
+        # Shared body: per-row colvec scale with a STRONGLY row-dependent
+        # ``scale_m`` (row i -> i+1). The colvec scalar fast-path is only valid
+        # when each thread's epilogue fragment lies within one M row; if the
+        # ``tcgen05_colvec_fragment_single_m_row`` predicate (epi_tile_m >= the
+        # 128-lane TMEM datapath) were wrong, a thread spanning multiple rows
+        # would read row 0's scale for every row and diverge by up to m x.
+        # This is the runnable form of the per-thread M-extent check: a passing
+        # numeric assertion proves the fragment was single-M-row wherever the
+        # scalar arm was emitted. Returns the generated code for optional
+        # inspection.
+        k = 256
+        x = (torch.randn(m, k, device=DEVICE) * 0.4).to(torch.float8_e4m3fn)
+        y = (torch.randn(k, n, device=DEVICE) * 0.4).to(torch.float8_e4m3fn)
+        scale_m = (
+            (torch.arange(m, device=DEVICE, dtype=torch.float32) + 1.0)
+            .reshape(m, 1)
+            .expand(m, n)
+        )
+        kwargs: dict[str, object] = {
+            "tcgen05_strategy": "role_local_monolithic",
+            "tcgen05_persistence_model": "non_persistent",
+            "pid_type": "flat",
+        }
+        kwargs.update(config_kwargs)
+        code, out = code_and_output(
+            cute_matmul_mma_fp8_colvec_scale,
+            (x, y, scale_m),
+            block_sizes=block_sizes,
+            **kwargs,
+        )
+        ref = (x.float() @ y.float()) * scale_m.float()
+        torch.testing.assert_close(out.float(), ref, atol=2.0, rtol=5e-2)
+        self.assertFalse(out.float().isnan().any().item())
+        return code
+
+    def test_matmul_mma_tcgen05_fp8_colvec_scale_block_m64_row_dependent(self) -> None:
+        # block_m=64: epi_tile_m=64 < 128, so a thread's fragment spans
+        # multiple M rows and the predicate selects the dense materialize.
+        # A wrong predicate (scalar read here) would scale row i by 1 instead
+        # of (i+1); the row-dependent reference catches that.
+        support = get_cute_mma_support()
+        if not support.tcgen05_f8:
+            self.skipTest("tcgen05 FP8 MMA is not supported on this machine")
+        torch.manual_seed(0)
+        self._run_colvec_scale_row_dependent([64, 128, 32])
+
+    def test_matmul_mma_tcgen05_fp8_colvec_scale_block_m128_row_dependent(
+        self,
+    ) -> None:
+        # block_m=128: epi_tile_m=128, single-M-row fragment -- the #2742
+        # scalar fast-path regime. Confirms the per-row value stays correct
+        # under a row-dependent scale.
+        support = get_cute_mma_support()
+        if not support.tcgen05_f8:
+            self.skipTest("tcgen05 FP8 MMA is not supported on this machine")
+        torch.manual_seed(0)
+        self._run_colvec_scale_row_dependent([128, 128, 32])
+
+    def test_matmul_mma_tcgen05_fp8_colvec_scale_2cta_m256_row_dependent(
+        self,
+    ) -> None:
+        # block_m=256 + cluster_m=2 (2-CTA bm=128 family): the per-CTA epilogue
+        # tile M is bm // 2 = 128, so the fragment is single-M-row and the
+        # scalar fast-path is valid -- but only because the predicate uses
+        # epi_tile_m (bm // 2), not bm. This is the branch of
+        # ``tcgen05_colvec_fragment_single_m_row`` a plain ``bm >= 128`` would
+        # also get right but a ``bm // 2``-unaware test would not exercise;
+        # the row-dependent scale catches a wrong per-CTA tile-M derivation.
+        support = get_cute_mma_support()
+        if not support.tcgen05_f8:
+            self.skipTest("tcgen05 FP8 MMA is not supported on this machine")
+        torch.manual_seed(0)
+        self._run_colvec_scale_row_dependent(
+            [256, 256, 64],
+            m=256,
+            n=256,
+            tcgen05_cluster_m=2,
+            pid_type="persistent_blocked",
+            tcgen05_persistence_model="static_persistent",
+        )
+
+    def test_matmul_mma_tcgen05_epilogue_exact_aux_block_m64(self) -> None:
+        # Exact-shape (full (m, n), non-broadcast) fused aux at block_m=64.
+        # The per-thread fragment spans multiple M rows, so the plain
+        # ``.load()`` profile no longer matches the coalesced accumulator
+        # carrier and the chain add hit ``profile of input tuples doesn't
+        # match: (8, (2, 2, 2))``. Regression guard for the exact-shape arm
+        # of the dense-materialization fix (distinct from the broadcast
+        # rowvec/colvec arms).
+        support = get_cute_mma_support()
+        if not support.tcgen05_f8:
+            self.skipTest("tcgen05 FP8 MMA is not supported on this machine")
+
+        torch.manual_seed(0)
+        m, k, n = 64, 256, 256
+        x = (torch.randn(m, k, device=DEVICE) * 0.4).to(torch.float8_e4m3fn)
+        y = (torch.randn(k, n, device=DEVICE) * 0.4).to(torch.float8_e4m3fn)
+        bias = torch.randn(m, n, device=DEVICE)
+        code, out = code_and_output(
+            cute_matmul_mma_epilogue_f32_bias,
+            (x, y, bias),
+            block_sizes=[64, 128, 32],
+            tcgen05_strategy="role_local_monolithic",
+            tcgen05_persistence_model="non_persistent",
+            pid_type="flat",
+        )
+        ref = (x.float() @ y.float()) + bias.float()
+        torch.testing.assert_close(out.float(), ref, atol=1.0, rtol=1e-1)
+        self.assertFalse(out.float().isnan().any().item())
         self.assertIn("cute.nvgpu.tcgen05", code)
 
     def test_matmul_mma_tcgen05_fp8_cluster_m2_persistent(self) -> None:

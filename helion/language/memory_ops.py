@@ -3017,6 +3017,43 @@ def _codegen_cute_store_tcgen05_tile(
             tcgen05_value.explicit_d_store_box_n,
         )
 
+    # Per-thread epilogue M extent. The tcgen05 TMEM->register (T2R) copy
+    # distributes the epilogue tile's M dimension across the 128-lane TMEM
+    # datapath: when ``epi_tile_m >= 128`` every lane owns >= 1 full output
+    # row, so each thread's per-subtile fragment stays within a SINGLE M row;
+    # when ``epi_tile_m < 128`` (e.g. block_m=64) a lane's fragment spans
+    # multiple M rows. This decides whether the per-row colvec scalar read is
+    # valid (see the ``broadcast_axis == 2`` branch below). Mirrors the
+    # ``epi_tile_m`` computation in ``tcgen05_resolve_epilogue_tile`` /
+    # ``cute_mma``: ``bm`` for the default tile, ``bm // 2`` for the 2-CTA
+    # bm=128 family, or the user-supplied explicit tile M.
+    #
+    # Correctness of the colvec scalar fast-path rests on the invariant that
+    # the T2R atom FILLS the 128-lane M datapath before packing multiple rows
+    # per lane (a property of CUTLASS's epilogue_tmem_copy_and_partition, not
+    # enforced here). Verified geometrically by partitioning an identity
+    # coordinate tensor through the same T2R copy and reading the distinct M
+    # coordinates a lane holds: per-CTA per-thread M-extent is 1 at
+    # epi_tile_m=128 (block_m=128) and 1 at epi_tile_m=128 (block_m=256 2-CTA),
+    # but 2 at epi_tile_m=64 (block_m=64) -- matching the >= 128 threshold
+    # exactly. If a future CUTLASS changes the lane distribution only the
+    # threshold needs revisiting: the materialize fallback below is always
+    # correct, so the worst case is the fast-path mis-firing (caught by the
+    # row-dependent colvec tests).
+    _TCGEN05_TMEM_DATAPATH_M = 128
+    if tcgen05_value.has_explicit_epilogue_tile:
+        assert tcgen05_value.explicit_epi_tile_m is not None
+        tcgen05_epi_tile_m = tcgen05_value.explicit_epi_tile_m
+    elif tcgen05_is_two_cta_m128(
+        is_two_cta=tcgen05_lifecycle.is_two_cta, bm=tcgen05_value.bm
+    ):
+        tcgen05_epi_tile_m = tcgen05_value.bm // 2
+    else:
+        tcgen05_epi_tile_m = tcgen05_value.bm
+    tcgen05_colvec_fragment_single_m_row = (
+        tcgen05_epi_tile_m >= _TCGEN05_TMEM_DATAPATH_M
+    )
+
     # C-input warp productive-body gate (``cute_plan.md`` §7.5.3.2
     # cycle 2b producer + consumer flip). When the matmul plan has
     # ``has_c_input_warp`` AND a non-empty ``aux_tensor_descriptors``
@@ -3543,8 +3580,33 @@ def _codegen_cute_store_tcgen05_tile(
             )
         return lines
 
+    def _materialize_broadcast_aux_source(
+        indent: str, rec: object, carrier_name: str
+    ) -> str:
+        """Emit a per-subtile aux load that matches the accumulator carrier's
+        register profile.
+
+        Example output (``indent='    '``, ``carrier_name='tcgen05_tRS_rAcc'``)::
+
+            tcgen05_aux_rmem_0 = cute.make_rmem_tensor(
+                cute.make_layout(tcgen05_tRS_rAcc.shape), cutlass.Float32
+            )
+            cute.autovec_copy(tcgen05_tTR_gAux_subtile_0, tcgen05_aux_rmem_0)
+            tcgen05_aux_loaded_0 = tcgen05_aux_rmem_0.load()
+        """
+        return (
+            f"{indent}{rec.aux_rmem} = "  # type: ignore[attr-defined]
+            f"cute.make_rmem_tensor(cute.make_layout({carrier_name}.shape), "
+            f"{rec.aux_dtype})\n"  # type: ignore[attr-defined]
+            f"{indent}cute.autovec_copy("
+            f"{rec.ttr_aux_subtile}, {rec.aux_rmem})\n"  # type: ignore[attr-defined]
+            f"{indent}{rec.aux_loaded} = "  # type: ignore[attr-defined]
+            f"{rec.aux_rmem}.load()\n"  # type: ignore[attr-defined]
+        )
+
     def _aux_subtile_load_source(
         prelude_indent: str,
+        carrier_name: str,
         *,
         force_simt_edge_aux: bool = False,
         safe_direct_aux_with_full_tile: bool = False,
@@ -3751,16 +3813,38 @@ def _codegen_cute_store_tcgen05_tile(
                 )
                 continue
             if rec.broadcast_axis == 2:
-                # Column-vector (per-row) aux: uniform over each thread's N
-                # fragment, so read a single SCALAR per subtile (T2R index
-                # (0,0,0)) instead of a redundant N-wide vector ``.load()``.
-                # Matches CUTLASS's ``sa = tTR_gSA[(0,0,0,subtile)]``; the
-                # scalar broadcasts in the ``acc * aux`` chain multiply.
+                # Column-vector (per-row) aux: a rank-2 ``(m, n)`` operand
+                # broadcast over N (its value depends only on the row m). When
+                # a thread's fragment is within a single M row the per-row value
+                # is uniform across it, so the cheap scalar read
+                # ``tTR_gAux[(0, 0, 0, subtile)]`` is exact (PR #2742). When it
+                # spans multiple M rows the scalar applies row 0's value to
+                # every row, so materialize per element instead.
+                #
+                # Decide this at codegen time via
+                # ``tcgen05_colvec_fragment_single_m_row`` (epi_tile_m vs the
+                # 128-lane TMEM datapath). A runtime layout test cannot: after
+                # ``partition_D`` + ``group_modes`` the per-thread strides are
+                # all dynamic (nothing for ``cute.filter`` to drop, and mode 0
+                # conflates M and N), so such tests silently degrade to
+                # always-materialize.
                 lines.append(
-                    f"{prelude_indent}{rec.aux_loaded} = "
+                    f"{prelude_indent}{rec.ttr_aux_subtile} = "
                     f"{rec.ttr_aux_grouped}"
-                    f"[(0, 0, 0, cutlass.Int32(_tcgen05_subtile))]\n"
+                    f"[(None, None, None, cutlass.Int32(_tcgen05_subtile))]\n"
                 )
+                if tcgen05_colvec_fragment_single_m_row:
+                    lines.append(
+                        f"{prelude_indent}{rec.aux_loaded} = "
+                        f"{rec.ttr_aux_grouped}"
+                        f"[(0, 0, 0, cutlass.Int32(_tcgen05_subtile))]\n"
+                    )
+                else:
+                    lines.append(
+                        _materialize_broadcast_aux_source(
+                            prelude_indent, rec, carrier_name
+                        )
+                    )
                 continue
             if rec.aux_rmem_full is not None:
                 # Pre-wait hoisted rowvec: the whole fragment is already in
@@ -3772,18 +3856,21 @@ def _codegen_cute_store_tcgen05_tile(
                     f"[(None, None, None, cutlass.Int32(_tcgen05_subtile))].load()\n"
                 )
                 continue
-            lines.extend(
-                [
-                    (
-                        f"{prelude_indent}{rec.ttr_aux_subtile} = "
-                        f"{rec.ttr_aux_grouped}"
-                        f"[(None, None, None, cutlass.Int32(_tcgen05_subtile))]\n"
-                    ),
-                    (
-                        f"{prelude_indent}{rec.aux_loaded} = "
-                        f"{rec.ttr_aux_subtile}.load()\n"
-                    ),
-                ]
+            # Both remaining cases -- rowvec / leading-broadcast aux
+            # (``broadcast_axis in (0, 1)``: a per-column operand broadcast
+            # over M) and exact-shape aux (``broadcast_axis is None``: a full
+            # ``(m, n)`` operand) -- always materialize. Neither has a cheaper
+            # scalar form (the operand is a full per-thread vector either way),
+            # and both otherwise produce a nested profile that cannot combine
+            # with the flat carrier (rowvec from its stride-0 mode, exact-shape
+            # once the fragment spans multiple M rows). The materialize copy is
+            # a no-op reshape when the profile already matches (block_m >= the
+            # atom M).
+            lines.append(
+                f"{prelude_indent}{rec.ttr_aux_subtile} = "
+                f"{rec.ttr_aux_grouped}"
+                f"[(None, None, None, cutlass.Int32(_tcgen05_subtile))]\n"
+                + _materialize_broadcast_aux_source(prelude_indent, rec, carrier_name)
             )
         return "".join(lines)
 
@@ -3849,6 +3936,7 @@ def _codegen_cute_store_tcgen05_tile(
         prelude_load = f"{prelude_indent}{loaded} = {load_expr}\n"
         early_aux_prelude = _aux_subtile_load_source(
             prelude_indent,
+            carrier_name,
             force_simt_edge_aux=force_simt_edge_aux,
             safe_direct_aux_with_full_tile=safe_direct_aux_with_full_tile,
         )
