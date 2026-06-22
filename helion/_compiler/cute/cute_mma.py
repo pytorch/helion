@@ -92,6 +92,7 @@ from .tcgen05_constants import TCGEN05_LARGE_BN_PROOF_CLUSTER_M
 from .tcgen05_constants import TCGEN05_LARGE_BN_PROOF_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_LARGE_BN_PROOF_PID_TYPE
 from .tcgen05_constants import TCGEN05_LARGE_BN_PROOF_PROBLEM_SHAPE
+from .tcgen05_constants import TCGEN05_MIN_BLOCK_M
 from .tcgen05_constants import TCGEN05_SCHED_STAGE_COUNT_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_M
 from .tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_N
@@ -2030,6 +2031,26 @@ def _emit_mma_pipeline(
     tcgen05_has_k_tail = k_total_size > bk and k_total_size % bk != 0
     tcgen05_k_tail_only = tcgen05_static_output_tiles and tcgen05_has_k_tail
     tcgen05_double_edge_output = m_size % bm != 0 and n_size % bn != 0
+    # Flat (cluster_m=1, non-persistent) M-edge-only case: the M tile exceeds the
+    # real M (e.g. M=16 on a 64/128-row tile) but N and K divide cleanly. This is
+    # the tiny-M GEMM that pads/masks M onto a tcgen05 tile, the way CUTLASS' SM100
+    # fp8 kernel does. TMA's descriptor (built with the real m_size) bounds-clamps
+    # the partial A stripe, so TMA can be kept for the WHOLE mainloop instead of
+    # falling to the per-element scalar AB load on every K iteration (the
+    # ``tcgen05_mixed_tma_scalar_fallback`` path would otherwise serialize the
+    # entire B read -- ~100x slower). The store side is already SIMT-predicated for
+    # the partial M rows, so only the A/B LOAD output-tile predicate is relaxed (M
+    # term becomes ``m_offset < m_size`` instead of ``m_offset + bm <= m_size``).
+    tcgen05_flat_m_edge_tma = (
+        mma_impl == "tcgen05"
+        and tcgen05_use_tma_pipeline
+        and not tcgen05_pid_is_persistent
+        and tcgen05_cluster_m == 1
+        and tcgen05_cluster_n_requested == 1
+        and m_size % bm != 0
+        and n_size % bn == 0
+        and k_total_size % bk == 0
+    )
     tcgen05_double_edge_tma = (
         mma_impl == "tcgen05"
         and tcgen05_use_tma_pipeline
@@ -3903,6 +3924,14 @@ def _emit_mma_pipeline(
                 f"{m_offset_var} + cutlass.Int32({bm}) <= cutlass.Int32({m_size}) "
                 f"and {n_offset_var} < cutlass.Int32({n_size}) "
             )
+        if tcgen05_flat_m_edge_tma:
+            # Flat M-edge (padded-M tcgen05 tile): TMA's m_size-clamped descriptor
+            # loads the partial A stripe, N divides bn, so only the M term relaxes
+            # to ``m_offset < m_size`` -- every in-bounds tile is "full" for TMA.
+            return (
+                f"{m_offset_var} < cutlass.Int32({m_size}) "
+                f"and {n_offset_var} + cutlass.Int32({bn}) <= cutlass.Int32({n_size}) "
+            )
         return (
             f"{m_offset_var} + cutlass.Int32({bm}) <= cutlass.Int32({m_size}) "
             f"and {n_offset_var} + cutlass.Int32({bn}) <= cutlass.Int32({n_size}) "
@@ -4792,12 +4821,25 @@ def _emit_mma_pipeline(
                     if tcgen05_use_role_local_mma_exec:
                         mma_exec_role_stmts.append(exec_loop)
                 else:
+                    # Use the shared output-tile predicate so the flat M-edge
+                    # relaxation (M term ``m_offset < m_size``) reaches the
+                    # steady-state prefetch look-ahead too -- otherwise the
+                    # producer's ``and tma_next_full_tile`` gate would be
+                    # permanently false for a padded-M tile and the mainloop
+                    # would never prefetch past the prologue.
                     cg.add_statement(
                         statement_from_string(
                             f"{tma_next_full_tile} = "
-                            f"{m_offset_var} + cutlass.Int32({bm}) <= cutlass.Int32({m_size}) "
-                            f"and {n_offset_var} + cutlass.Int32({bn}) <= cutlass.Int32({n_size}) "
-                            f"and {k_offset_var} + cutlass.Int32({bk * (tcgen05_ab_stage_count_value + 1)}) <= cutlass.Int32({k_total_size})"
+                            + _tcgen05_tma_tile_predicate(
+                                k_tile_start_expr=(
+                                    f"{k_offset_var} + cutlass.Int32("
+                                    f"{bk * tcgen05_ab_stage_count_value})"
+                                ),
+                                full_tile_end_expr=(
+                                    f"{k_offset_var} + cutlass.Int32("
+                                    f"{bk * (tcgen05_ab_stage_count_value + 1)})"
+                                ),
+                            )
                         )
                     )
                     cg.add_statement(
@@ -5332,17 +5374,20 @@ def _mma_impl_matches_problem_shape(
 ) -> bool:
     if mma_impl == "universal":
         return True
-    # The autotune config-spec only registers the ``tcgen05_*`` config keys for
-    # static (real problem) shapes that pass ``tcgen05_static_shape_eligible``
-    # (see ``matmul_ops.py`` eligibility gate). ``block_m``/``block_n`` can
-    # legally exceed the static M/N for tiny GEMMs (e.g. M=16/32 with
-    # block_m=128), so selecting tcgen05 on block size alone would commit
-    # codegen to a path whose config keys were never registered -> hard
-    # ``KeyError`` in ``_emit_mma_pipeline``. Gate tcgen05 on the same shared
-    # predicate so codegen and config-spec can never diverge; below it, fall
-    # back to warp/universal.
+    # Codegen/config-spec consistency via one shared predicate
+    # (``tcgen05_static_shape_eligible``). The config-spec (matmul_ops.py)
+    # registers the ``tcgen05_*`` config keys exactly when this predicate passes;
+    # codegen must select tcgen05 on the SAME predicate or the two diverge and
+    # the warp-spec lookup in ``_emit_mma_pipeline`` hits a hard ``KeyError``.
+    # The predicate gates M on ``block_m`` (the chosen tile), NOT the static M:
+    # ``block_m`` may legally EXCEED the real problem M for tiny-M GEMMs (e.g.
+    # M=16 on a 64/128-row padded tile, masking the rows beyond the real M,
+    # exactly as CUTLASS' SM100 fp8 kernel does). A sub-tile ``block_m`` (<
+    # ``TCGEN05_MIN_BLOCK_M``) has no tcgen05 atom and falls back to
+    # warp/universal. N/K gate on their static extents. ``static_m`` is retained
+    # in the signature for callers/diagnostics but no longer gates selection.
     if mma_impl == "tcgen05" and not tcgen05_static_shape_eligible(
-        input_dtype, static_m=static_m, static_n=static_n, static_k=static_k
+        input_dtype, block_m=bm, static_n=static_n, static_k=static_k
     ):
         return False
     is_fp8 = input_dtype == torch.float8_e4m3fn

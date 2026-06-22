@@ -25,6 +25,8 @@ from .._compiler.cute.matmul_utils import cute_resolve_active_matmul_k_block_id
 from .._compiler.cute.matmul_utils import cute_static_k_invariant_extent
 from .._compiler.cute.strategies import is_pure_matmul_role_lifecycle_config
 from .._compiler.cute.tcgen05_constants import TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY
+from .._compiler.cute.tcgen05_constants import TCGEN05_MIN_BLOCK_M
+from .._compiler.cute.tcgen05_constants import TCGEN05_ONE_CTA_MAX_BLOCK_M
 from .._compiler.cute.tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_M
 from .._compiler.cute.tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_N
 from .._compiler.cute.tcgen05_constants import TCGEN05_TWO_CTA_EDGE_K_TAIL_MIN_DIM
@@ -334,8 +336,19 @@ def enforce_dot_requirements(lhs: torch.Tensor, rhs: torch.Tensor) -> None:
         and static_m is not None
         and static_n is not None
         and static_k is not None
+        # ``block_m`` may legally exceed the real problem M: a tiny-M GEMM
+        # (e.g. M=16) runs on a full 64- or 128-row tcgen05 M tile, padding /
+        # masking the rows beyond the real M (the SIMT edge epilogue and the
+        # bounds-clamped TMA loads already handle this single all-M partial
+        # tile, exactly like CUTLASS' SM100 fp8 kernel). So at config-spec time
+        # the M floor is ``1`` (any positive M can be covered by a 64/128 tile)
+        # -- the shared predicate is called with ``block_m=None`` (the tile is
+        # chosen later) and codegen re-checks the SAME predicate with the
+        # resolved ``block_m``, so the ``tcgen05_*`` keys are registered exactly
+        # when codegen will select tcgen05 (no KeyError).
+        and static_m >= 1
         and tcgen05_static_shape_eligible(
-            lhs.dtype, static_m=static_m, static_n=static_n, static_k=static_k
+            lhs.dtype, block_m=None, static_n=static_n, static_k=static_k
         )
     ):
         from .._compiler.cute.mma_support import get_cute_mma_support
@@ -354,10 +367,30 @@ def enforce_dot_requirements(lhs: torch.Tensor, rhs: torch.Tensor) -> None:
             # BF16/FP16, 32 for FP8). Cap at 128 to keep AB SMEM staging
             # budget sane.
             max_tcgen05_k = min(128, pow2_floor_at_least(static_k, mma_k))
-            max_search_m = min(max_tcgen05_m, pow2_floor_at_least(static_m, 64))
+            # ``block_m`` is allowed to exceed the real M up to a legal padded
+            # tcgen05 M tile. When the static M is below the smallest legal tile
+            # (``TCGEN05_MIN_BLOCK_M``), search the full CtaGroup.ONE tile range
+            # {64, 128} (CUTLASS' SM100 fp8 kernel uses a 64-row tile for tiny
+            # M); the partial all-M tile is padded/masked at codegen time. When
+            # the static M is large enough to floor the tile, keep the original
+            # ``pow2_floor_at_least`` sizing so normal GEMMs are unaffected.
+            small_static_m = static_m < TCGEN05_MIN_BLOCK_M
+            if small_static_m:
+                max_search_m = min(max_tcgen05_m, TCGEN05_ONE_CTA_MAX_BLOCK_M)
+            else:
+                max_search_m = min(max_tcgen05_m, pow2_floor_at_least(static_m, 64))
             max_search_n = max_tcgen05_n
             max_search_k = max_tcgen05_k
             min_search_m = 128 if max_tcgen05_m >= 256 else 64
+            if small_static_m:
+                # Do NOT force the M-block min up to a tcgen05 tile when the real
+                # M is below it: that would delete the smaller warp/universal
+                # block_m candidates (e.g. bf16 block_m=16 -> warp MmaF16BF16Op)
+                # from the search, leaving only padded tcgen05 tiles. Keep the
+                # min at the natural size so the autotuner can weigh warp /
+                # universal against the padded tcgen05 64/128 tiles. The max was
+                # already raised above so 64/128 ARE searchable.
+                min_search_m = min(min_search_m, pow2_floor_at_least(static_m, 1))
             two_cta_m_edge = static_m % TCGEN05_TWO_CTA_BLOCK_M != 0
             two_cta_n_edge = static_n % TCGEN05_TWO_CTA_BLOCK_N != 0
             two_cta_k_tail = static_k % max_search_k != 0
@@ -521,7 +554,15 @@ def enforce_dot_requirements(lhs: torch.Tensor, rhs: torch.Tensor) -> None:
                 env.block_sizes[block_idx].update_min_block(
                     min_size, allow_flattened=True
                 )
-                env.block_sizes[block_idx].update_max_block(max_size)
+                # The M axis is the only one whose search max may need to go
+                # ABOVE ``next_power_of_2(size_hint)``: for a tiny static M the
+                # legal padded tcgen05 tile (64/128) exceeds the size hint, and
+                # ``update_max`` would otherwise clamp the ceiling back down to
+                # the hint. ``allow_raise`` is scoped to the matmul M axis so the
+                # generic (N/K and non-matmul) search space is unchanged.
+                env.block_sizes[block_idx].update_max_block(
+                    max_size, allow_raise=(axis_name == "m" and small_static_m)
+                )
 
     # Triton only supports 2D dot operations.  When the operands are 3D
     # (batched matmul), constrain the batch dimension block size to 1 so

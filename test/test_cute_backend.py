@@ -4177,39 +4177,68 @@ class TestCuteBackend(TestCase):
         self.assertIn("cute.nvgpu.tcgen05", code)
         self.assertIn("cute.gemm(", code)
 
-    def test_matmul_mma_fp8_small_static_m_does_not_crash(self) -> None:
-        """Regression for the small-static-M fp8 codegen crash.
+    def test_matmul_mma_fp8_small_static_m_padded_tile(self) -> None:
+        """Small-static-M fp8 now runs on a padded/masked tcgen05 M tile.
 
-        When the real problem M is < 64 but ``block_m`` is chosen >= 64, the
-        autotune config-spec did NOT register the ``tcgen05_*`` config keys
-        (its eligibility gate requires ``static_m >= TCGEN05_MIN_STATIC_M``),
-        yet codegen's ``_choose_mma_impl`` selected the tcgen05 path purely
-        from the block sizes. That mismatch raised
+        Background: when the real problem M is < 64 but ``block_m`` is chosen
+        >= 64, the autotune config-spec once did NOT register the ``tcgen05_*``
+        config keys (its eligibility gate required ``static_m >= 64``), yet
+        codegen's ``_choose_mma_impl`` selected the tcgen05 path purely from the
+        block sizes. That mismatch raised
         ``KeyError: 'tcgen05_warp_spec_ab_load_warps'`` at codegen time.
 
-        Codegen now gates tcgen05 on the same static-M threshold, so small-M
-        fp8 matmuls compile to a working path instead of crashing. M=16 and
-        M=32 must compile, run, and be numerically correct; M=64 must still
-        reach tcgen05.
+        Both sides now key the tcgen05 decision on ``block_m`` being a legal
+        tcgen05 M tile (64/128), NOT on the static M -- so they can never
+        diverge (no KeyError) AND a tiny-M GEMM runs on a padded/masked 64- or
+        128-row M tile (rows beyond the real M are masked off by the SIMT edge
+        epilogue / bounds-clamped TMA loads), exactly like CUTLASS' SM100 fp8
+        kernel. This is the win that lets M=16 reach the tensor-core path.
+
+        Asserts: M=16 and M=32 with block_m in {64, 128} compile WITHOUT the
+        KeyError crash, select tcgen05, and produce numerically correct output
+        (only the real M rows are written). M=64 (full tile) still reaches
+        tcgen05 as the control.
         """
         support = get_cute_mma_support()
         if not support.tcgen05_f8:
             self.skipTest("tcgen05 FP8 MMA is not supported on this machine")
 
         torch.manual_seed(0)
+        # block_m > static_m (padded/masked M tile). Non-degenerate fp8 inputs
+        # spanning the e4m3 range so a masking bug is not hidden by ~0 outputs.
         for m in (16, 32):
-            x = (torch.randn(m, 128, device=DEVICE) * 0.4).to(torch.float8_e4m3fn)
-            y = (torch.randn(128, 128, device=DEVICE) * 0.4).to(torch.float8_e4m3fn)
-            # Must compile and run (no codegen crash) and be numerically correct.
-            _, out = code_and_output(
-                cute_matmul_mma_fp8, (x, y), block_sizes=[128, 128, 128]
-            )
-            ref = x.float() @ y.float()
-            torch.testing.assert_close(out.float(), ref, atol=1.0, rtol=1e-1)
+            for bm in (64, 128):
+                x = (
+                    (torch.randn(m, 128, device=DEVICE) * 4.0)
+                    .clamp(-400, 400)
+                    .to(torch.float8_e4m3fn)
+                )
+                y = (
+                    (torch.randn(128, 128, device=DEVICE) * 4.0)
+                    .clamp(-400, 400)
+                    .to(torch.float8_e4m3fn)
+                )
+                # Must not raise KeyError: 'tcgen05_warp_spec_ab_load_warps'.
+                code, out = code_and_output(
+                    cute_matmul_mma_fp8, (x, y), block_sizes=[bm, 128, 128]
+                )
+                ref = x.float() @ y.float()
+                self.assertEqual(tuple(out.shape), (m, 128))
+                torch.testing.assert_close(out.float(), ref, atol=1.0, rtol=1e-1)
+                # Padded M tile uses the validated tcgen05 tensor-core path.
+                self.assertIn("cute.nvgpu.tcgen05", code)
 
-        # Control: static M == 64 stays on the tcgen05 path.
-        x = (torch.randn(64, 128, device=DEVICE) * 0.4).to(torch.float8_e4m3fn)
-        y = (torch.randn(128, 128, device=DEVICE) * 0.4).to(torch.float8_e4m3fn)
+        # Control: static M == 64 (full tile) stays on the tcgen05 path.
+        x = (
+            (torch.randn(64, 128, device=DEVICE) * 4.0)
+            .clamp(-400, 400)
+            .to(torch.float8_e4m3fn)
+        )
+        y = (
+            (torch.randn(128, 128, device=DEVICE) * 4.0)
+            .clamp(-400, 400)
+            .to(torch.float8_e4m3fn)
+        )
         code, out = code_and_output(
             cute_matmul_mma_fp8, (x, y), block_sizes=[128, 128, 128]
         )
