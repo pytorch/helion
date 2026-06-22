@@ -2051,6 +2051,14 @@ def _emit_mma_pipeline(
         and n_size % bn == 0
         and k_total_size % bk == 0
     )
+    # The leaner SIMT-store optimization (drop the full-tile fast path, emit a
+    # single M-only predicated copy) is only valid when there is exactly ONE
+    # padded M tile -- i.e. the real M does not even fill one ``bm`` tile, so the
+    # full-tile predicate ``m_offset + bm <= m_size`` is statically unsatisfiable.
+    # When ``m_size > bm`` (multiple M tiles, the last one partial) the first M
+    # tile IS a genuine full tile and must keep its unpredicated vectorized store,
+    # so only the load-side TMA relaxation (``tcgen05_flat_m_edge_tma``) applies.
+    tcgen05_flat_m_edge_single_tile = tcgen05_flat_m_edge_tma and m_size <= bm
     tcgen05_double_edge_tma = (
         mma_impl == "tcgen05"
         and tcgen05_use_tma_pipeline
@@ -5128,6 +5136,7 @@ def _emit_mma_pipeline(
                 use_tma_store_epilogue=tcgen05_use_tma_store_epilogue,
                 tma_store_full_tiles_only=tcgen05_tma_store_full_tiles_only,
                 partial_output_tma_store=tcgen05_partial_output_tma_store,
+                flat_m_edge=tcgen05_flat_m_edge_single_tile,
                 # Mirror the value passed to `_make_tcgen05_layout_plan_setup`
                 # above; the store path compares this against `target_dtype`
                 # to enforce the kernel/store equality contract on
