@@ -12,6 +12,8 @@ from ..cute.strategies import Tcgen05PersistenceModel
 from ..cute.tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_M
 from ..cute.tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_N
 from ..cute.tcgen05_constants import TCGEN05_TWO_CTA_EDGE_K_TAIL_BLOCK_K
+from ..cute.tcgen05_constants import TCGEN05_TWO_CTA_FP8_SMALL_GRID_BLOCK_M
+from ..cute.tcgen05_constants import TCGEN05_TWO_CTA_FP8_SMALL_GRID_BLOCK_N
 from ..cute.tcgen05_constants import TCGEN05_TWO_CTA_SEED_L2_GROUPING
 from ..cute.tcgen05_constants import TCGEN05_TWO_CTA_SEED_PID_TYPE
 from ..cute.tcgen05_constants import tcgen05_two_cta_edge_k_tail_seed_overrides
@@ -20,6 +22,7 @@ from .registry import AutotunerHeuristic
 
 if TYPE_CHECKING:
     from ...autotuner.config_fragment import BlockSizeFragment
+    from ...autotuner.config_spec import ConfigSpec
     from ...autotuner.config_spec import ReductionLoopSpec
     from ..compile_environment import CompileEnvironment
     from ..device_ir import DeviceIR
@@ -511,7 +514,17 @@ class CuteTcgen05ClusterM2Heuristic(AutotunerHeuristic):
             bn_fragment.low <= TCGEN05_TWO_CTA_BLOCK_N <= bn_fragment.high
             or (edge_k_tail_family and bn_fragment.low <= TCGEN05_TWO_CTA_BLOCK_N)
         )
-        return m_tile_reachable and n_tile_reachable and cls._select_bk(env) is not None
+        full_tile_reachable = m_tile_reachable and n_tile_reachable
+        # The fp8 small-grid family seeds the bm=128/bn=128 tile, which is
+        # reachable on shapes (small M/N) where the bm=256 full tile is not.
+        small_grid_reachable = (
+            constraints.allow_fp8_small_grid
+            and not edge_k_tail_family
+            and cls._small_grid_tile_reachable(spec)
+        )
+        return (full_tile_reachable or small_grid_reachable) and cls._select_bk(
+            env
+        ) is not None
 
     @classmethod
     def get_seed_config(
@@ -522,10 +535,32 @@ class CuteTcgen05ClusterM2Heuristic(AutotunerHeuristic):
         if bk is None:
             raise AssertionError(f"{cls.name} get_seed_config called while ineligible")
 
+        constraints = spec._tcgen05_cluster_m2_search_constraints
         edge_k_tail_family = (
-            spec._tcgen05_cluster_m2_search_constraints is not None
-            and spec._tcgen05_cluster_m2_search_constraints.allow_edge_k_tail_family
+            constraints is not None and constraints.allow_edge_k_tail_family
         )
+        fp8_small_grid_family = (
+            constraints is not None
+            and constraints.allow_fp8_small_grid
+            and not edge_k_tail_family
+            and cls._small_grid_tile_reachable(spec)
+        )
+        if fp8_small_grid_family:
+            # Seed the bm=128 small-grid tile only while it is the right tile
+            # for the shape: it wins on B200 cold-L2 while its 128x128 cluster
+            # grid fits in ~one wave (1.00-1.17x at <=72 clusters / <=0.97
+            # waves) but loses from 80 clusters / 1.08 waves up (0.84-0.94x),
+            # where the larger bm=256 full tile is the better seed. Above the
+            # one-wave ceiling fall through to the full-tile seed -- but only
+            # when that tile is actually reachable; otherwise (e.g. M not a
+            # multiple of 256) keep the small-grid seed, which is still the only
+            # validated cluster_m=2 starting point. The bm=128 search candidates
+            # stay reachable regardless (the search-admission gate is unchanged);
+            # this only chooses the heuristic's starting point.
+            if cls._small_grid_within_one_wave(env) or not cls._full_tile_reachable(
+                spec
+            ):
+                return cls._fp8_small_grid_seed_config(env, bk)
         # Generalized known-good CtaGroup.TWO template (the DEFAULT-layout,
         # non-FFI config family that the hand-pinned per-shape seeds shared).
         # Pinning the full perf-critical knob set — not just the tile + cluster
@@ -606,6 +641,113 @@ class CuteTcgen05ClusterM2Heuristic(AutotunerHeuristic):
                 return bk
             bk //= 2
         return None
+
+    @staticmethod
+    def _small_grid_tile_reachable(spec: ConfigSpec) -> bool:
+        """True when the fp8 small-grid 2-CTA tile (bm=128/bn=128) is in range."""
+        if len(spec.block_sizes) != 3:
+            return False
+        bm_fragment = cast("BlockSizeFragment", spec.block_sizes[0]._fragment(spec))
+        bn_fragment = cast("BlockSizeFragment", spec.block_sizes[1]._fragment(spec))
+        return (
+            bm_fragment.low
+            <= TCGEN05_TWO_CTA_FP8_SMALL_GRID_BLOCK_M
+            <= bm_fragment.high
+            and bn_fragment.low
+            <= TCGEN05_TWO_CTA_FP8_SMALL_GRID_BLOCK_N
+            <= bn_fragment.high
+        )
+
+    @staticmethod
+    def _full_tile_reachable(spec: ConfigSpec) -> bool:
+        """True when the bm=256/bn=256 full-tile cluster_m=2 tile is in range."""
+        if len(spec.block_sizes) != 3:
+            return False
+        bm_fragment = cast("BlockSizeFragment", spec.block_sizes[0]._fragment(spec))
+        bn_fragment = cast("BlockSizeFragment", spec.block_sizes[1]._fragment(spec))
+        return (
+            bm_fragment.low <= TCGEN05_TWO_CTA_BLOCK_M <= bm_fragment.high
+            and bn_fragment.low <= TCGEN05_TWO_CTA_BLOCK_N <= bn_fragment.high
+        )
+
+    @staticmethod
+    def _small_grid_within_one_wave(env: CompileEnvironment) -> bool:
+        """True when the bm=128 small-grid cluster grid fits in ~one wave.
+
+        Each 128x128 cluster spans 2 CTAs, so the grid fills the device once at
+        ``clusters * 2 == num_sms``; the small-grid tile is the right *seed*
+        only at or below that point (B200 cold-L2: 1.00-1.17x at <=72 clusters,
+        0.84-0.94x from 80 clusters up). Mirrors the ``num_sms // 2`` ceiling
+        rationale; uses static M/N from the single matmul fact. A non-CUDA /
+        unknown SM count (0) keeps the small-grid seed (search still owns the
+        final choice), matching the wave-quantization gate's mocked-host policy.
+        """
+        facts = env.config_spec.matmul_facts
+        if len(facts) != 1:
+            return True
+        fact = facts[0]
+        if fact.static_m is None or fact.static_n is None:
+            return True
+        from ...runtime import get_num_sm
+
+        try:
+            num_sm = get_num_sm(env.device)
+        except (AssertionError, NotImplementedError):
+            return True
+        if num_sm <= 0:
+            return True
+        clusters = (fact.static_m // TCGEN05_TWO_CTA_FP8_SMALL_GRID_BLOCK_M) * (
+            fact.static_n // TCGEN05_TWO_CTA_FP8_SMALL_GRID_BLOCK_N
+        )
+        return clusters <= num_sm // 2
+
+    @classmethod
+    def _fp8_small_grid_seed_config(cls, env: CompileEnvironment, bk: int) -> Config:
+        """Seed the fp8 small-grid 2-CTA family (per-CTA 64xbn, bm=128/bn=128).
+
+        Pins the small-grid tile plus the deep-prefetch pipeline the cold-L2
+        sweeps found optimal on the small/wave-limited fp8 serving GEMMs:
+        ``ab_stages=12`` (max A/B prefetch to hide the cold DRAM read),
+        ``acc_stages=1`` and ``c_stages=2`` (lean accumulator + C ring),
+        ``l2_groupings=1`` (no scheduler swizzle). Measured cold-L2 vs
+        torch._scaled_mm on B200: 512x2048x4096 1.14x and 512x2048x2048 1.01x,
+        both ahead of the shallower ab=8/acc=2/c=4/l2=4 seed (1.02x / 0.88x).
+        The bm=256 full-tile seed underfills this regime (16 clusters), so this
+        small-grid seed is the strong starting point the autotuner needs.
+
+        ``ab_stages=12`` is the validator max and sits near the B200 SMEM optin
+        budget; on a lower-SMEM Blackwell SKU it is dropped gracefully by the
+        seed transfer (``seed_flat_config_pairs`` catches ``InvalidConfig``) and
+        the search falls back to shallower samples, so seeding the max is safe.
+        """
+        spec = env.config_spec
+        seed: dict[str, Any] = {
+            "block_sizes": [
+                TCGEN05_TWO_CTA_FP8_SMALL_GRID_BLOCK_M,
+                TCGEN05_TWO_CTA_FP8_SMALL_GRID_BLOCK_N,
+                bk,
+            ],
+            "num_warps": 8,
+            "num_stages": 4,
+            "pid_type": TCGEN05_TWO_CTA_SEED_PID_TYPE,
+            "tcgen05_cluster_m": 2,
+            "tcgen05_cluster_n": 1,
+            "tcgen05_acc_stages": 1,
+            "tcgen05_c_stages": 2,
+            "tcgen05_ab_stages": 12,
+            "tcgen05_num_epi_warps": 4,
+            "l2_groupings": [1],
+            TCGEN05_PERSISTENCE_MODEL_CONFIG_KEY: (
+                Tcgen05PersistenceModel.STATIC_PERSISTENT.value
+            ),
+        }
+        if spec.indexing.length == 3:
+            seed["indexing"] = [
+                "tensor_descriptor",
+                "tensor_descriptor",
+                "tensor_descriptor",
+            ]
+        return Config(**seed)
 
 
 class CuteFp8GemmSkinnyMHeuristic(AutotunerHeuristic):
