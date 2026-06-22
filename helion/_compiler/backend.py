@@ -2850,6 +2850,7 @@ def _detect_specialized_mma_loop(
     from .compile_environment import CompileEnvironment
     from .cute.cute_mma import _choose_mma_impl
     from .cute.cute_mma import _mma_active_n_threads
+    from .cute.cute_mma import _static_mma_shape
     from .cute.cute_mma import _tcgen05_root_m_threads
     from .cute.cute_mma import can_codegen_cute_mma_aten
     from .cute.cute_mma import can_codegen_cute_mma_dot
@@ -2940,13 +2941,27 @@ def _detect_specialized_mma_loop(
                 torch.ops.aten.baddbmm.default,
             ) and can_codegen_cute_mma_aten(node, with_acc=True):
                 lhs_node = node.args[1]
-                if not isinstance(lhs_node, torch.fx.Node):
+                rhs_node = node.args[2]
+                if not isinstance(lhs_node, torch.fx.Node) or not isinstance(
+                    rhs_node, torch.fx.Node
+                ):
                     continue
                 lhs_val = lhs_node.meta.get("val")
-                if not isinstance(lhs_val, torch.Tensor):
+                rhs_val = rhs_node.meta.get("val")
+                if not isinstance(lhs_val, torch.Tensor) or not isinstance(
+                    rhs_val, torch.Tensor
+                ):
                     continue
+                static_m, static_n, static_k = _static_mma_shape(lhs_val, rhs_val)
                 mma_impl = _choose_mma_impl(
-                    lhs_val.dtype, bm=bm, bn=bn, bk=bk, config=config
+                    lhs_val.dtype,
+                    bm=bm,
+                    bn=bn,
+                    bk=bk,
+                    static_m=static_m,
+                    static_n=static_n,
+                    static_k=static_k,
+                    config=config,
                 )
                 if mma_impl != "universal" and root_threads_support_impl(mma_impl):
                     return True
@@ -2957,13 +2972,27 @@ def _detect_specialized_mma_loop(
                 and can_codegen_cute_mma_dot(node)
             ):
                 lhs_node = node.args[0]
-                if not isinstance(lhs_node, torch.fx.Node):
+                rhs_node = node.args[1]
+                if not isinstance(lhs_node, torch.fx.Node) or not isinstance(
+                    rhs_node, torch.fx.Node
+                ):
                     continue
                 lhs_val = lhs_node.meta.get("val")
-                if not isinstance(lhs_val, torch.Tensor):
+                rhs_val = rhs_node.meta.get("val")
+                if not isinstance(lhs_val, torch.Tensor) or not isinstance(
+                    rhs_val, torch.Tensor
+                ):
                     continue
+                static_m, static_n, static_k = _static_mma_shape(lhs_val, rhs_val)
                 mma_impl = _choose_mma_impl(
-                    lhs_val.dtype, bm=bm, bn=bn, bk=bk, config=config
+                    lhs_val.dtype,
+                    bm=bm,
+                    bn=bn,
+                    bk=bk,
+                    static_m=static_m,
+                    static_n=static_n,
+                    static_k=static_k,
+                    config=config,
                 )
                 if mma_impl != "universal" and root_threads_support_impl(mma_impl):
                     return True
@@ -4905,6 +4934,7 @@ def _kernel_specialized_mma_impl(
     from ..language._decorators import is_api_func
     from .compile_environment import CompileEnvironment
     from .cute.cute_mma import _choose_mma_impl
+    from .cute.cute_mma import _static_mma_shape
     from .cute.cute_mma import can_codegen_cute_mma_aten
     from .cute.cute_mma import can_codegen_cute_mma_dot
     from .device_ir import ForLoopGraphInfo
@@ -4946,6 +4976,7 @@ def _kernel_specialized_mma_impl(
                 torch.ops.aten.baddbmm.default,
             ) and can_codegen_cute_mma_aten(node, with_acc=True):
                 lhs_node = node.args[1]
+                rhs_node = node.args[2]
             elif (
                 callable(node.target)
                 and is_api_func(node.target)
@@ -4953,15 +4984,29 @@ def _kernel_specialized_mma_impl(
                 and can_codegen_cute_mma_dot(node)
             ):
                 lhs_node = node.args[0]
+                rhs_node = node.args[1]
             else:
                 continue
-            if not isinstance(lhs_node, torch.fx.Node):
+            if not isinstance(lhs_node, torch.fx.Node) or not isinstance(
+                rhs_node, torch.fx.Node
+            ):
                 continue
             lhs_val = lhs_node.meta.get("val")
-            if not isinstance(lhs_val, torch.Tensor):
+            rhs_val = rhs_node.meta.get("val")
+            if not isinstance(lhs_val, torch.Tensor) or not isinstance(
+                rhs_val, torch.Tensor
+            ):
                 continue
+            static_m, static_n, static_k = _static_mma_shape(lhs_val, rhs_val)
             mma_impl = _choose_mma_impl(
-                lhs_val.dtype, bm=bm, bn=bn, bk=bk, config=config
+                lhs_val.dtype,
+                bm=bm,
+                bn=bn,
+                bk=bk,
+                static_m=static_m,
+                static_n=static_n,
+                static_k=static_k,
+                config=config,
             )
             if mma_impl != "universal":
                 return mma_impl
