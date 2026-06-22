@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import torch
+
 # Validated CtaGroup.TWO autotune/runtime envelope for the B200 CuTe path.
 # Re-verify the K-cap runtime and guard-boundary tests before raising the
 # K-tile threshold or broadening the tile shape.
@@ -441,3 +443,61 @@ TCGEN05_CLUSTER_M2_ONE_CTA_ROLE_LOCAL_CONFIG_KEY = (
 # CtaGroup.ONE tcgen05 MMA covers 64/128 M tiles; 256 M tiles are validated only
 # after projecting onto the CtaGroup.TWO path.
 TCGEN05_ONE_CTA_MAX_BLOCK_M = 128
+
+# Minimum static (real problem) M extent for which the autotune config-spec
+# registers the ``tcgen05_*`` config keys (see ``matmul_ops.py`` eligibility
+# gate). Codegen MMA-impl selection (``cute_mma.py`` ``_choose_mma_impl`` /
+# ``_mma_impl_matches_problem_shape``) MUST gate tcgen05 on the same threshold:
+# otherwise a kernel whose static M is below this floor but whose chosen
+# ``block_m`` is >= 64 commits codegen to the tcgen05 path while the config-spec
+# never registered the ``tcgen05_warp_spec_*`` keys, producing a hard ``KeyError``
+# at codegen time. Selecting on block size alone (which can exceed static M for
+# tiny-M GEMMs) is what let the two diverge.
+TCGEN05_MIN_STATIC_M = 64
+
+# Minimum static N for tcgen05 (the MMA N tile is a multiple of 8). Same
+# divergence risk as M: ``block_n`` can exceed the static N, so codegen must
+# gate on the static extent, not the block size.
+TCGEN05_MIN_STATIC_N = 8
+
+
+def tcgen05_mma_k(input_dtype: torch.dtype) -> int:
+    """tcgen05 MMA-K granularity: 32 elements for fp8-e4m3, 16 for fp16/bf16."""
+    return 32 if input_dtype == torch.float8_e4m3fn else 16
+
+
+def tcgen05_static_shape_eligible(
+    input_dtype: torch.dtype,
+    *,
+    static_m: int | None,
+    static_n: int | None,
+    static_k: int | None,
+) -> bool:
+    """Whether a matmul's *static* (real problem) shape admits the tcgen05 path.
+
+    Single source of truth shared by the autotune config-spec (which decides
+    whether to register the ``tcgen05_*`` config keys, in ``matmul_ops.py``) and
+    codegen MMA-impl selection (``cute_mma.py``). Both MUST agree: if codegen
+    commits to tcgen05 for a shape the config-spec rejected, the ``tcgen05_*``
+    keys were never registered and ``_emit_mma_pipeline`` dies with a hard
+    ``KeyError``.
+
+    Gates only on the *static* extents (not block sizes): ``block_m``/``block_n``
+    can legally exceed the real M/N for tiny GEMMs, so block-size checks alone
+    let the two callers diverge. A ``None`` extent is a dynamic shape and stays
+    eligible (the config-spec resolves a size hint in that case). Dtype and the
+    per-axis tcgen05 minimums (M>=64, N>=8, K>=mma_k) are checked here; block-
+    size-specific validation (e.g. ``bn % 8``, ``bm`` tile family) stays in
+    ``_mma_impl_matches_problem_shape``.
+    """
+    if input_dtype not in (
+        torch.float16,
+        torch.bfloat16,
+        torch.float8_e4m3fn,
+    ):
+        return False
+    if static_m is not None and static_m < TCGEN05_MIN_STATIC_M:
+        return False
+    if static_n is not None and static_n < TCGEN05_MIN_STATIC_N:
+        return False
+    return not (static_k is not None and static_k < tcgen05_mma_k(input_dtype))
