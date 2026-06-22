@@ -76,24 +76,7 @@ def _codegen_common(
 
     device_fn = state.device_function
     fx_node = state.fx_node
-    epilogue_subtile_group_id = (
-        None if fx_node is None else fx_node.meta.get("epilogue_subtile_group_id")
-    )
-    if epilogue_subtile_group_id is None:
-        indexing_idx = device_fn.atomic_op_index
-        device_fn.atomic_op_index += 1
-    elif fx_node is not None and fx_node.meta.get(
-        "epilogue_subtile_primary_output", False
-    ):
-        indexing_idx = device_fn.atomic_op_index
-        device_fn.atomic_op_index += 1
-        device_fn.epilogue_subtile_atomic_indices[epilogue_subtile_group_id] = (
-            indexing_idx
-        )
-    else:
-        indexing_idx = device_fn.epilogue_subtile_atomic_indices[
-            epilogue_subtile_group_id
-        ]
+    indexing_idx = device_fn.memory_op_broker.atomic_slot(fx_node)
     strategy = device_fn.get_atomic_indexing_strategy(indexing_idx)
     return strategy.codegen_atomic(op, state, target, index, value_exprs[0], sem)
 
@@ -1685,7 +1668,7 @@ def _(state: CodegenState) -> ast.AST:
     # CAS always uses pointer (not a TMA reduction op, two values),
     # but increment the counter to keep per-op atomic_indexing aligned.
     device_fn = state.device_function
-    device_fn.atomic_op_index += 1
+    device_fn.memory_op_broker.atomic_cas_advance(state.fx_node)
 
     indices = SubscriptIndexing.create(state, target, index)
     name = state.device_function.tensor_arg(target).name
