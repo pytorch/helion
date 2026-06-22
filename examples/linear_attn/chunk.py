@@ -16,7 +16,6 @@ FLA's `chunk_linear_attn` (which dispatches through `simple_gla` with g=0).
 from __future__ import annotations
 
 import math
-import os
 from typing import Any
 
 import torch
@@ -33,7 +32,6 @@ import helion.language as hl
 # Kernels split along the chunked-parallel pipeline:
 #   forward:   fwd_h  (serial state pass)  -> fwd_o  (parallel output)
 #   backward:  bwd_dh (reverse state pass) -> bwd_dqk + bwd_dv (parallel)
-# plus fwd_fused, a single-launch forward that fuses fwd_h + fwd_o (see below).
 
 
 @helion.kernel()
@@ -135,73 +133,6 @@ def chunk_fwd_o(
 
 
 @helion.kernel()
-def chunk_fwd_fused(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    scale: float,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Single-pass fused forward: serial chunk scan with inline output.
-
-    One program per (bh, dv-block). The state going *into* each chunk is held in
-    registers (h_acc, fp32) across the serial chunk loop; the chunk output is
-    emitted inline before the state is advanced. This fuses chunk_fwd_h +
-    chunk_fwd_o into ONE launch, killing the h_all HBM round-trip (write in
-    fwd_h, read in fwd_o) and a kernel launch.
-
-    Per chunk i (zero initial state):
-        o[i]   = scale * (q[i] @ h_acc + tril(q[i] @ k[i]^T) @ v[i])
-        h_acc += k[i]^T @ v[i]    (cross term reads h_acc BEFORE this update)
-
-    The per-chunk state h_all is also written to HBM as it scans, so the
-    backward gets it for free -- the store is the only added cost over a
-    state-free scan, and the backward needs it anyway (FLA recomputes it).
-
-    Args:
-        q, k: [BH, N, C, D]
-        v:    [BH, N, C, DV]
-        scale: applied to the output.
-    Returns:
-        out:   [BH, N, C, DV]
-        h_all: [BH, N, D, DV] state entering each chunk (bf16, FLA parity)
-    """
-    BH = q.size(0)
-    N = q.size(1)
-    C = hl.specialize(q.size(2))
-    D = hl.specialize(q.size(3))
-    DV = v.size(3)
-
-    out = torch.empty([BH, N, C, DV], dtype=q.dtype, device=q.device)
-    h_all = torch.empty([BH, N, D, DV], dtype=k.dtype, device=k.device)
-
-    for tile_bh, tile_dv in hl.tile([BH, DV], block_size=[1, None]):
-        idx = tile_bh.id
-        h_acc = hl.zeros([D, tile_dv], dtype=torch.float32)
-
-        for i_t in hl.grid(N):
-            q_i = q[idx, i_t, :, :]  # [C, D]
-            k_i = k[idx, i_t, :, :]  # [C, D]
-            v_i = v[idx, i_t, :, tile_dv]  # [C, bv]
-
-            # state entering chunk i (chunks < i) -> save for the backward.
-            h_all[idx, i_t, :, tile_dv] = h_acc.to(h_all.dtype)
-
-            o_cross = torch.mm(q_i, h_acc.to(q_i.dtype)).float()  # [C, bv]
-
-            attn = torch.mm(q_i, k_i.transpose(-2, -1)).float()  # [C, C]
-            cidx = hl.arange(C)
-            causal = (cidx[:, None] >= cidx[None, :]).float()
-            attn = attn * causal
-            o_intra = torch.mm(attn.to(v_i.dtype), v_i).float()  # [C, bv]
-
-            out[idx, i_t, :, tile_dv] = ((o_cross + o_intra) * scale).to(out.dtype)
-
-            h_acc = torch.addmm(h_acc, k_i.transpose(-2, -1), v_i)
-
-    return out, h_all
-
-
-@helion.kernel()
 def chunk_bwd_dh(
     q: torch.Tensor,
     do: torch.Tensor,
@@ -243,73 +174,6 @@ def chunk_bwd_dh(
             dh_acc = torch.addmm(dh_acc, q_i.transpose(-2, -1), do_i)
 
     return dh_all
-
-
-@helion.kernel()
-def chunk_bwd_dh_dv(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    do: torch.Tensor,
-    scale: float,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Fused reverse state-gradient scan that ALSO emits dV inline.
-
-    One program per (bh, dv-block) carries the full-D state gradient dh_acc
-    [D, bv] in registers across the reverse chunk scan (mirrors the forward
-    fusion). dv[i] consumes the state coming *out of* chunk i, which is exactly
-    dh_acc before it absorbs chunk i, so dv is emitted in the same pass that
-    writes dh_all -- killing the separate chunk_bwd_dv launch and its re-read of
-    dh_all + recompute of k @ dh.
-
-    Per chunk i (reverse order, zero final-state gradient):
-        dh_all[i] = dh_acc                              (state out of chunk i)
-        dv[i]     = (k[i] @ dh_acc) + tril(scale*q[i] @ k[i]^T)^T @ do[i]
-        dh_acc   += scale * q[i]^T @ do[i]
-
-    Args:
-        q, k: [BH, N, C, D]
-        do:   [BH, N, C, DV] output gradient
-        scale: folded into the q-row scaling and the intra attention.
-    Returns:
-        dh_all: [BH, N, D, DV] state gradient entering each chunk's consumers
-        dv:     [BH, N, C, DV]
-    """
-    BH = q.size(0)
-    N = q.size(1)
-    C = hl.specialize(q.size(2))
-    D = hl.specialize(q.size(3))
-    DV = do.size(3)
-
-    dh_all = torch.empty([BH, N, D, DV], dtype=q.dtype, device=q.device)
-    dv_out = torch.empty([BH, N, C, DV], dtype=do.dtype, device=do.device)
-
-    for tile_bh, tile_dv in hl.tile([BH, DV], block_size=[1, None]):
-        dh_acc = hl.zeros([D, tile_dv], dtype=torch.float32)
-        idx = tile_bh.id
-
-        for i_t in hl.grid(N):
-            i = N - 1 - i_t
-            q_i = q[idx, i, :, :]  # [C, D]
-            k_i = k[idx, i, :, :]  # [C, D]
-            do_i = do[idx, i, :, tile_dv]  # [C, bv]
-
-            # state coming out of chunk i (chunks > i) -> dh_all and dv_state.
-            dh_all[idx, i, :, tile_dv] = dh_acc.to(dh_all.dtype)
-            dv_state = torch.mm(k_i, dh_acc.to(k_i.dtype)).float()  # [C, bv]
-
-            # intra: dv_intra = tril(scale*q@k^T)^T @ do.
-            attn = torch.mm(q_i, k_i.transpose(-2, -1)).float()  # [C, C]
-            cidx = hl.arange(C)
-            causal = (cidx[:, None] >= cidx[None, :]).float()
-            attn = attn * (causal * scale)
-            dv_acc = torch.addmm(dv_state, attn.transpose(-2, -1).to(do_i.dtype), do_i)
-            dv_out[idx, i, :, tile_dv] = dv_acc.to(dv_out.dtype)
-
-            # advance state gradient for the next (earlier) chunk.
-            q_s = q_i * scale
-            dh_acc = torch.addmm(dh_acc, q_s.transpose(-2, -1), do_i)
-
-    return dh_all, dv_out
 
 
 @helion.kernel()
@@ -459,24 +323,6 @@ class _LinearAttnFn(torch.autograd.Function):
         kf = k.reshape(BH, N, C, D)
         vf = v.reshape(BH, N, C, DV)
 
-        # Two forward structures: the single-pass fused kernel (one launch, no
-        # h_all HBM round-trip; parallel over (BH, DV-block), serial N-chunk
-        # scan) and the chunk-parallel split (chunk_fwd_h + chunk_fwd_o, parallel
-        # over BH*N). Fused is the default; LINATT_NO_FUSED_FWD=1 selects split.
-        use_fused = os.environ.get("LINATT_NO_FUSED_FWD") != "1"
-
-        if use_fused:
-            qf4 = q.reshape(BH, N, C, D)
-            # Fused scan emits o and the per-chunk state h_all in one launch
-            # (state already in registers), so the backward gets h_all without a
-            # separate state pass. FLA pays that recompute in its backward; we
-            # hand the state over from the forward.
-            o, h_all = chunk_fwd_fused(qf4, kf, vf, scale)
-            ctx.save_for_backward(q, k, v, h_all)
-            ctx.C = C
-            ctx.scale = scale
-            return o.reshape(B, H, T, DV)
-
         # h_all stays fp32 (accumulator); inputs ride at native dtype. Zero
         # initial state is seeded inside the kernel, no h0 buffer needed.
         h_all = chunk_fwd_h(kf, vf)
@@ -515,7 +361,6 @@ class _LinearAttnFn(torch.autograd.Function):
         # is scale * dq'). Scale is threaded into the dh pass so q never gets
         # materialized scaled in HBM.
         qf4 = q.reshape(BH, N, C, D)
-        kf4 = k.reshape(BH, N, C, D)
         do4 = grad_output.reshape(BH, N, C, DV)
 
         qf2 = q.reshape(BHN, C, D)
@@ -524,22 +369,10 @@ class _LinearAttnFn(torch.autograd.Function):
         hf = h_all.reshape(BHN, D, DV)
         dof = do4.reshape(BHN, C, DV)
 
-        # The reverse dh scan can emit dv inline (dv consumes the state coming
-        # out of each chunk, held in registers), fusing chunk_bwd_dh +
-        # chunk_bwd_dv into one launch and killing the dh_all->dv round-trip;
-        # dqk always stays split. Fused is the default; LINATT_NO_FUSED_BWD=1
-        # selects the split dh + dv path.
-        use_fused_bwd = os.environ.get("LINATT_NO_FUSED_BWD") != "1"
-
-        if use_fused_bwd:
-            dh_all, dv = chunk_bwd_dh_dv(qf4, kf4, do4, scale)
-            dhf = dh_all.reshape(BHN, D, DV)
-            dq, dk = chunk_bwd_dqk(qf2, kf2, vf2, hf, dof, dhf, scale)
-        else:
-            dh_all = chunk_bwd_dh(qf4, do4, scale)
-            dhf = dh_all.reshape(BHN, D, DV)
-            dq, dk = chunk_bwd_dqk(qf2, kf2, vf2, hf, dof, dhf, scale)
-            dv = chunk_bwd_dv(qf2, kf2, dof, dhf, scale)
+        dh_all = chunk_bwd_dh(qf4, do4, scale)
+        dhf = dh_all.reshape(BHN, D, DV)
+        dq, dk = chunk_bwd_dqk(qf2, kf2, vf2, hf, dof, dhf, scale)
+        dv = chunk_bwd_dv(qf2, kf2, dof, dhf, scale)
 
         return (
             dq.reshape(B, H, T, D),
@@ -695,10 +528,10 @@ def test(
 
     run_example(
         helion_fn,
-        {"fla": fla_fn, "naive_recurrent": naive_fn},
+        {"naive_recurrent": naive_fn, "fla": fla_fn},
         (q, k, v),
         kernel_name="helion",
-        baseline_name="fla",
+        baseline_name="naive_recurrent",
         bwd=True,
     )
 
