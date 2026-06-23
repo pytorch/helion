@@ -912,21 +912,6 @@ class PersistentReductionStrategy(ReductionStrategy):
         group_span = self._thread_count
         if num_threads % group_span != 0:
             return None
-        # The two-stage shared-memory reduction assumes its ``lane_var`` is
-        # the linear thread index across ALL of the launch block's threads.
-        # If ``axis_sizes`` only covers a subset of the planned block dims
-        # (e.g. an inner reduction strategy contributes another thread axis
-        # that hasn't been entered yet), the emitted reduction would race
-        # across the missing axis. Bail out and fall back to the warp-level
-        # path in that case.
-        planned_dims = self._planned_thread_dims()
-        planned_block_threads = planned_dims[0] * planned_dims[1] * planned_dims[2]
-        if num_threads != planned_block_threads:
-            return None
-
-        lane_expr = backend.thread_linear_index_expr(axis_sizes)
-        if lane_expr is None:
-            return None
 
         identity_expr = backend.cast_expr(
             constant_repr(default_value), _dtype_str(dtype)
@@ -937,7 +922,51 @@ class PersistentReductionStrategy(ReductionStrategy):
         # helper's ``input if mask else identity`` selection unifies cleanly and
         # the reduction still accumulates in the wider accumulation dtype.
         input_expr = backend.cast_expr(input_name, _dtype_str(dtype))
-        group_count = num_threads // group_span
+
+        if reduction_axis == 0:
+            # ``axis_sizes`` only reflects the thread axes discovered so far. A
+            # sibling control-flow branch can still introduce a *redundant*
+            # thread axis later in codegen -- e.g. a free ``hl.arange`` that
+            # another (mutually-exclusive) branch maps onto thread axis 1/2 --
+            # which enlarges the launch block beyond ``num_threads``. Those extra
+            # threads re-run this reduction; if every redundant row keyed its
+            # shared memory on the same slots the cross-warp combine would race
+            # (producing intermittently wrong partial reductions). Key the
+            # per-group shared memory on the FULL flattened thread id (from the
+            # runtime block dims) so each redundant row reduces into its own
+            # region. When the reduction owns thread axis 0
+            # (``blockDim.x == group_span``) this is identical to the
+            # single-axis path whenever there is no redundancy; the extra
+            # groups simply go unused.
+            from .cute.thread_budget import MAX_THREADS_PER_BLOCK
+
+            index_type = backend.index_type_str(env.index_dtype)
+            tid0 = backend.cast_expr("cute.arch.thread_idx()[0]", index_type)
+            tid1 = backend.cast_expr("cute.arch.thread_idx()[1]", index_type)
+            tid2 = backend.cast_expr("cute.arch.thread_idx()[2]", index_type)
+            bdim0 = backend.cast_expr("cute.arch.block_dim()[0]", index_type)
+            bdim1 = backend.cast_expr("cute.arch.block_dim()[1]", index_type)
+            lane_expr = (
+                f"{tid0} + ({tid1}) * ({bdim0}) + ({tid2}) * ({bdim0}) * ({bdim1})"
+            )
+            group_count = (MAX_THREADS_PER_BLOCK + group_span - 1) // group_span
+        else:
+            # The two-stage shared-memory reduction assumes its ``lane_var`` is
+            # the linear thread index across ALL of the launch block's threads.
+            # If ``axis_sizes`` only covers a subset of the planned block dims
+            # (e.g. an inner reduction strategy contributes another thread axis
+            # that hasn't been entered yet), the emitted reduction would race
+            # across the missing axis. Bail out and fall back to the warp-level
+            # path in that case.
+            planned_dims = self._planned_thread_dims()
+            planned_block_threads = planned_dims[0] * planned_dims[1] * planned_dims[2]
+            if num_threads != planned_block_threads:
+                return None
+            lane_expr = backend.thread_linear_index_expr(axis_sizes)
+            if lane_expr is None:
+                return None
+            group_count = num_threads // group_span
+
         lane_var = self.fn.new_var("persistent_reduce_lane", dce=True)
         lane_in_group_var = self.fn.new_var("persistent_reduce_lane_in_group", dce=True)
         lane_mod_pre_var = self.fn.new_var("persistent_reduce_lane_mod_pre", dce=True)

@@ -2828,11 +2828,25 @@ class TestCuteBackend(TestCase):
             f"but got block=({bx}, {by}, {bz}); the branch-only arange claimed a "
             f"spurious second thread axis, racing the single-axis reduction",
         )
-        self.assertNotIn(
-            "thread_idx()[1]",
-            code,
+        # The persistent reduction's lane-flatten legitimately references all
+        # three thread axes (``thread_idx()[0] + thread_idx()[1]*block_dim()[0]
+        # + ...``) to stay race-safe if a sibling branch adds a redundant axis;
+        # for this 1-D block ``block_dim()[1]/[2]`` are 1, so those terms vanish
+        # at runtime. Exclude that defensive flatten and assert no *indexing*
+        # line claims thread axis 1 -- a regression that grabs a spurious second
+        # axis shows up as a 2-D block (caught above) and a ``thread_idx()[1]``
+        # in a load/store address, not in the reduction lane id.
+        axis1_index_lines = [
+            line
+            for line in code.splitlines()
+            if "thread_idx()[1]" in line and "persistent_reduce_lane" not in line
+        ]
+        self.assertEqual(
+            axis1_index_lines,
+            [],
             "a store indexes thread axis 1; the branch-only free arange must "
-            "reuse the reduction's axis 0 in mutually-exclusive branches",
+            "reuse the reduction's axis 0 in mutually-exclusive branches:\n"
+            + "\n".join(axis1_index_lines),
         )
 
         # Lane-bound guard: the launch block is sized to the widest branch
