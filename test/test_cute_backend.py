@@ -5,6 +5,7 @@ import importlib
 import math
 import os
 from typing import Any
+from typing import Callable
 from typing import cast
 from unittest.mock import patch
 
@@ -2141,6 +2142,38 @@ class TestCuteBackend(TestCase):
         )
         torch.testing.assert_close(out, expected, atol=1e-2, rtol=1e-2)
 
+    def test_flash_attention_causal_fa4_split_loop_matches_sdpa(self) -> None:
+        q, k, v = (
+            torch.randn(1, 1, 512, 64, dtype=torch.float16, device=DEVICE)
+            for _ in range(3)
+        )
+        code, (out, _lse) = code_and_output(
+            cute_causal_attention,
+            (q, k, v),
+            block_sizes=[1, 128, 128],
+            cute_flash_topology="fa4",
+            cute_flash_causal_kv_order="descending",
+            cute_flash_causal_loop_split=True,
+            cute_flash_masked_e2e_schedule="16/4",
+            cute_flash_e2e_schedule="8/2",
+            cute_flash_e2e_offset=0,
+            cute_flash_e2e_offset0=1,
+            cute_flash_disc_pipe=4,
+            cute_flash_role_map="fa4",
+            cute_flash_epi_tma=True,
+            cute_flash_rescale_chunk_cols=16,
+            cute_flash_softmax_regs=200,
+        )
+        self.assertTrue(_flash_fired(code))
+        self.assertIn("fa4_disc_zero_store", code)
+        expected = torch.nn.functional.scaled_dot_product_attention(
+            q,
+            k,
+            v,
+            is_causal=True,
+        )
+        torch.testing.assert_close(out, expected, atol=1e-2, rtol=1e-2)
+
     def test_flash_attention_causal_single_warpgroup_matches_sdpa(self) -> None:
         q, k, v = (
             torch.randn(1, 2, 512, 64, dtype=torch.float16, device=DEVICE)
@@ -2812,6 +2845,8 @@ class TestCuteBackend(TestCase):
             cfg128 = resolve_flash_config(128, 2)
         self.assertEqual((cfg64.e2e_freq, cfg64.e2e_res), (16, 4))
         self.assertEqual(cfg64.e2e_schedule, "16/4")
+        self.assertEqual(cfg64.masked_e2e_schedule, "inherit")
+        self.assertEqual((cfg64.masked_e2e_freq, cfg64.masked_e2e_res), (16, 4))
         self.assertEqual(cfg64.e2e_offset, 2)
         self.assertEqual((cfg128.e2e_freq, cfg128.e2e_res), (8, 2))
         self.assertEqual(cfg128.e2e_schedule, "8/2")
@@ -2829,6 +2864,8 @@ class TestCuteBackend(TestCase):
         self.assertEqual(cfg.exp2_impl, "xu")
         self.assertEqual((cfg.e2e_freq, cfg.e2e_res), (8, 0))
         self.assertEqual(cfg.e2e_schedule, "xu")
+        self.assertEqual(cfg.masked_e2e_schedule, "inherit")
+        self.assertEqual((cfg.masked_e2e_freq, cfg.masked_e2e_res), (8, 0))
         self.assertEqual(cfg.e2e_offset, 0)
 
         with patch.dict(
@@ -2883,6 +2920,63 @@ class TestCuteBackend(TestCase):
         self.assertEqual((cfg.e2e_freq, cfg.e2e_res), (16, 4))
         self.assertEqual(cfg.e2e_schedule, "16/4")
         self.assertEqual(cfg.e2e_offset, 0)
+
+        cfg = resolve_flash_config(
+            64,
+            64,
+            {
+                "cute_flash_topology": "fa4",
+                "cute_flash_e2e_schedule": "16/4",
+                "cute_flash_masked_e2e_schedule": "xu",
+            },
+            is_causal=True,
+        )
+        self.assertEqual(cfg.e2e_schedule, "16/4")
+        self.assertEqual((cfg.e2e_freq, cfg.e2e_res), (16, 4))
+        self.assertEqual(cfg.masked_e2e_schedule, "xu")
+        self.assertEqual((cfg.masked_e2e_freq, cfg.masked_e2e_res), (8, 0))
+
+        cfg = resolve_flash_config(
+            64,
+            64,
+            {
+                "cute_flash_topology": "fa4",
+                "cute_flash_e2e_schedule": "xu",
+                "cute_flash_masked_e2e_schedule": "16/4",
+                "cute_flash_e2e_offset": 15,
+                "cute_flash_e2e_offset0": 14,
+            },
+            is_causal=True,
+        )
+        self.assertEqual(cfg.e2e_schedule, "xu")
+        self.assertEqual(cfg.masked_e2e_schedule, "16/4")
+        self.assertEqual(cfg.e2e_offset, 15)
+        self.assertEqual(cfg.e2e_offset0, 14)
+
+        cfg = resolve_flash_config(
+            64,
+            64,
+            {
+                "cute_flash_topology": "fa4",
+                "cute_flash_e2e_schedule": "8/2",
+                "cute_flash_masked_e2e_schedule": "16/4",
+                "cute_flash_e2e_offset": 15,
+            },
+            is_causal=True,
+        )
+        self.assertEqual(cfg.e2e_schedule, "8/2")
+        self.assertEqual(cfg.masked_e2e_schedule, "16/4")
+        self.assertEqual(cfg.e2e_offset, 15)
+
+        cfg = resolve_flash_config(
+            64,
+            64,
+            {
+                "cute_flash_topology": "fa4",
+                "cute_flash_masked_e2e_schedule": "xu",
+            },
+        )
+        self.assertEqual(cfg.masked_e2e_schedule, "inherit")
 
         with patch.dict(
             os.environ,
@@ -2957,7 +3051,7 @@ class TestCuteBackend(TestCase):
             },
             is_causal=True,
         )
-        self.assertEqual(cfg.e2e_offset, 3)
+        self.assertEqual(cfg.e2e_offset, 0)
 
         cfg = resolve_flash_config(
             64,
@@ -5990,6 +6084,29 @@ class TestCuteConfigValuePriors(TestCase):
     that replaces the old hardcoded per-shape seeds); they bias the random half
     of the initial population toward the known-good 2-CTA matmul family."""
 
+    def _assert_prior_choices(
+        self,
+        prior: Callable[[Any, int], object],
+        fragment: Any,
+        expected_values: Any,
+    ) -> None:
+        captured_values: tuple[object, ...] | None = None
+
+        def fake_choices(values, *, weights, k):
+            nonlocal captured_values
+            self.assertEqual(k, 1)
+            captured_values = tuple(values)
+            return [values[0]]
+
+        with patch("random.choices", side_effect=fake_choices):
+            value = prior(fragment, 0)
+        self.assertIsNotNone(captured_values)
+        self.assertEqual(set(captured_values), expected_values)
+        choices = fragment.search_choices or fragment.choices
+        self.assertIn(value, choices)
+        for candidate in captured_values:
+            self.assertIn(candidate, choices)
+
     def test_priors_cover_the_template_keys(self) -> None:
         from helion._compiler.backend import CuteBackend
 
@@ -6016,6 +6133,7 @@ class TestCuteConfigValuePriors(TestCase):
         # The cute priors engage on real matmul knobs for this kernel.
         engaged = set(gen._config_value_priors) & set(gen._key_to_flat_indices)
         self.assertIn("tcgen05_cluster_m", engaged)
+        self.assertFalse(any(key.startswith("cute_flash_") for key in engaged))
         # Biased sampling must still produce only valid configs.
         self.assertEqual(len(gen.random_population(8)), 8)
 
@@ -6038,6 +6156,159 @@ class TestCuteConfigValuePriors(TestCase):
         # Prior weights tensor_descriptor 4:1 over pointer; a strict majority of
         # the biased indexing slots should pick TMA.
         self.assertGreater(tma, total // 2)
+
+    def test_flash_priors_bias_dense_hd64_fa4_values(self) -> None:
+        from helion._compiler.backend import CuteBackend
+        from helion._compiler.cute.cute_flash import FLASH_CORR_REGS_KEY
+        from helion._compiler.cute.cute_flash import FLASH_DISC_PIPE_KEY
+        from helion._compiler.cute.cute_flash import FLASH_E2E_OFFSET0_KEY
+        from helion._compiler.cute.cute_flash import FLASH_E2E_OFFSET_KEY
+        from helion._compiler.cute.cute_flash import FLASH_E2E_SCHEDULE_KEY
+        from helion._compiler.cute.cute_flash import FLASH_EPI_TMA_KEY
+        from helion._compiler.cute.cute_flash import FLASH_KV_STAGE_KEY
+        from helion._compiler.cute.cute_flash import FLASH_MASKED_E2E_SCHEDULE_KEY
+        from helion._compiler.cute.cute_flash import FLASH_PACKED_REDUCE_KEY
+        from helion._compiler.cute.cute_flash import FLASH_PERSISTENT_KEY
+        from helion._compiler.cute.cute_flash import FLASH_RESCALE_CHUNK_COLS_KEY
+        from helion._compiler.cute.cute_flash import FLASH_RESCALE_THRESHOLD_KEY
+        from helion._compiler.cute.cute_flash import FLASH_S_STAGE_KEY
+        from helion._compiler.cute.cute_flash import FLASH_SOFTMAX_REGS_KEY
+        from helion._compiler.cute.cute_flash import FLASH_TOPOLOGY_KEY
+        from helion.autotuner.config_generation import ConfigGeneration
+
+        q, k, v = (
+            torch.empty(1, 1, 8192, 64, dtype=torch.float16, device=DEVICE)
+            for _ in range(3)
+        )
+        bound = cute_dense_attention.bind((q, k, v))
+        self.assertTrue(bound.config_spec.cute_flash_search_enabled)
+        bound.config_spec.compiler_seed_configs = []
+        bound.config_spec.compiler_default_config = None
+        priors = CuteBackend().config_value_priors(bound.config_spec)
+        fragments = bound.config_spec._flat_fields()
+
+        expected = {
+            FLASH_S_STAGE_KEY: {2},
+            FLASH_TOPOLOGY_KEY: {"fa4", "ws_overlap"},
+            FLASH_PERSISTENT_KEY: {True},
+            FLASH_E2E_SCHEDULE_KEY: {"8/2", "16/4"},
+            FLASH_DISC_PIPE_KEY: {2, 3, 4},
+            FLASH_RESCALE_THRESHOLD_KEY: {8.0},
+            FLASH_RESCALE_CHUNK_COLS_KEY: {16, 32},
+            FLASH_CORR_REGS_KEY: {64},
+            FLASH_EPI_TMA_KEY: {False, True},
+            FLASH_SOFTMAX_REGS_KEY: {184, 200},
+            FLASH_KV_STAGE_KEY: {2, 3},
+            FLASH_PACKED_REDUCE_KEY: {True},
+            FLASH_E2E_OFFSET_KEY: {1, 2, 3, 4},
+            FLASH_E2E_OFFSET0_KEY: {0, 1, 2, 3},
+        }
+        for key, values in expected.items():
+            self.assertIn(key, priors)
+            self._assert_prior_choices(priors[key], fragments[key], values)
+
+        gen = ConfigGeneration(bound.config_spec)
+        with patch(
+            "random.choices", side_effect=lambda values, weights, k: [values[0]]
+        ):
+            population = [
+                gen.unflatten(flat).config for flat in gen.random_population_flat(4)
+            ]
+        self.assertEqual(len(population), 4)
+        biased_config = population[1]
+        self.assertEqual(biased_config[FLASH_TOPOLOGY_KEY], "fa4")
+        self.assertEqual(biased_config[FLASH_E2E_SCHEDULE_KEY], "8/2")
+        self.assertEqual(biased_config[FLASH_MASKED_E2E_SCHEDULE_KEY], "inherit")
+        self.assertEqual(biased_config[FLASH_KV_STAGE_KEY], 2)
+        self.assertEqual(biased_config[FLASH_E2E_OFFSET_KEY], 2)
+        self.assertEqual(biased_config[FLASH_E2E_OFFSET0_KEY], 2)
+        self.assertTrue(biased_config[FLASH_EPI_TMA_KEY])
+        self.assertEqual(biased_config[FLASH_RESCALE_CHUNK_COLS_KEY], 16)
+
+    def test_flash_priors_bias_causal_hd64_shape_family_values(self) -> None:
+        from helion._compiler.backend import CuteBackend
+        from helion._compiler.cute.cute_flash import FLASH_CAUSAL_KV_ORDER_KEY
+        from helion._compiler.cute.cute_flash import FLASH_CAUSAL_LOOP_SPLIT_KEY
+        from helion._compiler.cute.cute_flash import FLASH_CAUSAL_LPT_SWIZZLE_KEY
+        from helion._compiler.cute.cute_flash import FLASH_DISC_PIPE_KEY
+        from helion._compiler.cute.cute_flash import FLASH_E2E_OFFSET0_KEY
+        from helion._compiler.cute.cute_flash import FLASH_E2E_OFFSET_KEY
+        from helion._compiler.cute.cute_flash import FLASH_E2E_SCHEDULE_KEY
+        from helion._compiler.cute.cute_flash import FLASH_EPI_TMA_KEY
+        from helion._compiler.cute.cute_flash import FLASH_KV_STAGE_KEY
+        from helion._compiler.cute.cute_flash import FLASH_MASKED_E2E_SCHEDULE_KEY
+        from helion._compiler.cute.cute_flash import FLASH_PACKED_REDUCE_KEY
+        from helion._compiler.cute.cute_flash import FLASH_PERSISTENT_KEY
+        from helion._compiler.cute.cute_flash import FLASH_ROLE_MAP_KEY
+        from helion._compiler.cute.cute_flash import FLASH_SOFTMAX_REGS_KEY
+        from helion._compiler.cute.cute_flash import FLASH_TOPOLOGY_KEY
+        from helion.autotuner.config_generation import ConfigGeneration
+
+        q, k, v = (
+            torch.empty(1, 1, 8192, 64, dtype=torch.float16, device=DEVICE)
+            for _ in range(3)
+        )
+        bound = cute_causal_attention.bind((q, k, v))
+        self.assertTrue(bound.config_spec.cute_flash_search_enabled)
+        bound.config_spec.compiler_seed_configs = []
+        bound.config_spec.compiler_default_config = None
+        # Exercise the causal shape family through the recorded flash fact without
+        # allocating a separate long-sequence Q/K/V triple for every case.
+        for num_kv in (32, 64, 128, 256, 512):
+            with self.subTest(num_kv=num_kv):
+                bound.config_spec._cute_flash_num_kv = num_kv
+                priors = CuteBackend().config_value_priors(bound.config_spec)
+                fragments = bound.config_spec._flat_fields()
+                expected = {
+                    FLASH_TOPOLOGY_KEY: {"fa4", "ws_overlap"},
+                    FLASH_PERSISTENT_KEY: {False},
+                    FLASH_KV_STAGE_KEY: {2, 3, 4, 6, 8, 10},
+                    FLASH_E2E_SCHEDULE_KEY: {"16/4", "8/2", "xu"},
+                    FLASH_MASKED_E2E_SCHEDULE_KEY: {
+                        "inherit",
+                        "xu",
+                        "16/4",
+                        "8/2",
+                    },
+                    FLASH_PACKED_REDUCE_KEY: {True},
+                    FLASH_EPI_TMA_KEY: {False, True},
+                    FLASH_ROLE_MAP_KEY: {"fa4", "helion"},
+                    FLASH_CAUSAL_LOOP_SPLIT_KEY: {False, True},
+                    FLASH_CAUSAL_LPT_SWIZZLE_KEY: {0, 1, 2, 4, 8, 16},
+                    FLASH_CAUSAL_KV_ORDER_KEY: {"ascending", "descending"},
+                    FLASH_DISC_PIPE_KEY: {2, 3, 4},
+                    FLASH_SOFTMAX_REGS_KEY: {184, 192, 200},
+                    FLASH_E2E_OFFSET_KEY: set(range(16)),
+                    FLASH_E2E_OFFSET0_KEY: {0, 1, 2, 3, 4, 8, 11},
+                }
+                for key, values in expected.items():
+                    self.assertIn(key, priors)
+                    self._assert_prior_choices(priors[key], fragments[key], values)
+
+        bound.config_spec._cute_flash_num_kv = 96
+        unsupported_priors = CuteBackend().config_value_priors(bound.config_spec)
+        self.assertNotIn(FLASH_CAUSAL_LPT_SWIZZLE_KEY, unsupported_priors)
+        self.assertNotIn(FLASH_E2E_OFFSET_KEY, unsupported_priors)
+
+        bound.config_spec._cute_flash_num_kv = 512
+        gen = ConfigGeneration(bound.config_spec)
+        with patch(
+            "random.choices", side_effect=lambda values, weights, k: [values[0]]
+        ):
+            population = [
+                gen.unflatten(flat).config for flat in gen.random_population_flat(4)
+            ]
+        self.assertEqual(len(population), 4)
+        biased_config = population[1]
+        self.assertEqual(biased_config[FLASH_CAUSAL_LPT_SWIZZLE_KEY], 1)
+        self.assertEqual(biased_config[FLASH_CAUSAL_KV_ORDER_KEY], "descending")
+        self.assertEqual(biased_config[FLASH_MASKED_E2E_SCHEDULE_KEY], "16/4")
+        self.assertEqual(biased_config[FLASH_ROLE_MAP_KEY], "helion")
+        self.assertFalse(biased_config[FLASH_EPI_TMA_KEY])
+        self.assertEqual(biased_config[FLASH_E2E_OFFSET_KEY], 9)
+        self.assertEqual(biased_config[FLASH_E2E_OFFSET0_KEY], 3)
+        self.assertEqual(biased_config[FLASH_DISC_PIPE_KEY], 4)
+        self.assertEqual(biased_config[FLASH_SOFTMAX_REGS_KEY], 184)
 
 
 class TestCuteBackendRequirements(TestCase):

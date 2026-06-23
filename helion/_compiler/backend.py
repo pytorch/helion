@@ -5226,7 +5226,7 @@ class CuteBackend(Backend):
         from .cute.strategies import Tcgen05Strategy
         from .cute.tcgen05_constants import TCGEN05_TWO_CTA_SEED_PID_TYPE
 
-        return {
+        priors: dict[str, ValuePrior] = {
             # Generic knobs shared by every cute kernel.
             "num_warps": weighted_choice({8: 4.0, 4: 2.0, 16: 1.0}),
             "num_stages": weighted_choice({4: 3.0, 3: 2.0, 2: 1.0}),
@@ -5261,6 +5261,27 @@ class CuteBackend(Backend):
                 }
             ),
             TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY: weighted_choice({True: 3.0, False: 1.0}),
+        }
+        if config_spec is not None and config_spec.cute_flash_search_enabled:
+            priors.update(self._cute_flash_config_value_priors(config_spec))
+        return priors
+
+    @staticmethod
+    def _cute_flash_config_value_priors(
+        config_spec: ConfigSpec,
+    ) -> dict[str, ValuePrior]:
+        from ..autotuner.config_priors import weighted_choice
+        from .cute.cute_flash import flash_attention_value_prior_weights
+
+        return {
+            key: weighted_choice(weights)
+            for key, weights in flash_attention_value_prior_weights(
+                config_spec._cute_flash_head_dim or 0,
+                config_spec._cute_flash_num_kv,
+                is_causal=config_spec._cute_flash_is_causal,
+                has_kv_tile_pruning=config_spec._cute_flash_has_kv_tile_pruning,
+                requires_ws_overlap=config_spec._cute_flash_requires_ws_overlap,
+            ).items()
         }
 
     def customize_ast(self, hf: HostFunction) -> None:
@@ -5474,7 +5495,13 @@ class CuteBackend(Backend):
         **kwargs: object,
     ) -> Config:
         original_budget = bound_kernel.settings.autotune_budget_seconds
-        if bound_kernel.settings.autotune_budget_seconds is None:
+        # "full" should mean the search algorithms run to completion unless the
+        # caller explicitly provides a budget. Keep the defensive default budget
+        # only for cheaper efforts where bounded local iteration is expected.
+        if (
+            bound_kernel.settings.autotune_budget_seconds is None
+            and bound_kernel.settings.autotune_effort != "full"
+        ):
             bound_kernel.settings.autotune_budget_seconds = (
                 _CUTE_DEFAULT_AUTOTUNE_BUDGET_SECONDS
             )

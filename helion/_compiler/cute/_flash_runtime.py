@@ -328,15 +328,17 @@ def exp2_split_inplace(
 
 def mask_r2p_sm100_rank1(x: cute.Tensor, col_limit: cutlass.Int32) -> None:
     """Mask a rank-1 SM100 score fragment using FA4's R2P-friendly bit pattern."""
+    chunk_cols = 16
     ncol = cute.size(x.shape)
     x_any = cast("Any", x)
-    for s in range(cute.ceil_div(ncol, 24)):
-        col_limit_s = cutlass.max(col_limit - cutlass.Int32(s * 24), cutlass.Int32(0))
-        col_limit_s = cutlass.min(col_limit_s, cutlass.Int32(24))
+    for s in range(cute.ceil_div(ncol, chunk_cols)):
+        chunk_start = cutlass.Int32(s * chunk_cols)
+        col_limit_s = cutlass.max(col_limit - chunk_start, cutlass.Int32(0))
+        col_limit_s = cutlass.min(col_limit_s, cutlass.Int32(chunk_cols))
         mask = (cutlass.Int32(1) << col_limit_s) - cutlass.Int32(1)
-        for i in range(min(24, ncol - s * 24)):
+        for i in range(min(chunk_cols, ncol - s * chunk_cols)):
             in_bound = cutlass.Boolean(mask & (cutlass.Int32(1) << cutlass.Int32(i)))
-            c = s * 24 + i
+            c = s * chunk_cols + i
             x_any[c] = cutlass.Float32(
                 cutlass.select_(
                     in_bound, cutlass.Float32(x_any[c]), -cutlass.Float32.inf
@@ -350,20 +352,21 @@ def mask_r2p_sm100_range(
     col_limit: cutlass.Int32,
 ) -> None:
     """Mask a rank-1 score fragment to ``col_start <= col < col_limit``."""
+    chunk_cols = 16
     ncol = cute.size(x.shape)
     x_any = cast("Any", x)
-    for s in range(cute.ceil_div(ncol, 24)):
-        chunk_start = cutlass.Int32(s * 24)
+    for s in range(cute.ceil_div(ncol, chunk_cols)):
+        chunk_start = cutlass.Int32(s * chunk_cols)
         col_start_s = cutlass.max(col_start - chunk_start, cutlass.Int32(0))
-        col_start_s = cutlass.min(col_start_s, cutlass.Int32(24))
+        col_start_s = cutlass.min(col_start_s, cutlass.Int32(chunk_cols))
         col_limit_s = cutlass.max(col_limit - chunk_start, cutlass.Int32(0))
-        col_limit_s = cutlass.min(col_limit_s, cutlass.Int32(24))
+        col_limit_s = cutlass.min(col_limit_s, cutlass.Int32(chunk_cols))
         before_limit = (cutlass.Int32(1) << col_limit_s) - cutlass.Int32(1)
         before_start = (cutlass.Int32(1) << col_start_s) - cutlass.Int32(1)
         mask = before_limit & ~before_start
-        for i in range(min(24, ncol - s * 24)):
+        for i in range(min(chunk_cols, ncol - s * chunk_cols)):
             in_bound = cutlass.Boolean(mask & (cutlass.Int32(1) << cutlass.Int32(i)))
-            c = s * 24 + i
+            c = s * chunk_cols + i
             x_any[c] = cutlass.Float32(
                 cutlass.select_(
                     in_bound, cutlass.Float32(x_any[c]), -cutlass.Float32.inf
@@ -935,6 +938,30 @@ def _disc_chunk_convert_store(
     )
     pchunk_e.store(frg.load().to(io_dtype))  # pyrefly: ignore[missing-attribute]
     cute.copy(tiled_st, pchunk, tSTtS[None, None, ci])
+
+
+def fa4_disc_zero_store(
+    tiled_st: object,
+    tSTtS: cute.Tensor,
+    tSTcS: cute.Tensor,
+    pfor_ptr_stage: object,
+    pfor2_ptr_stage: object,
+    p_store_split: int,
+    p_store_chunks: int,
+) -> Float32:
+    """Store a zero P tile while preserving the staged-P MMA handshake."""
+    st_shape = tSTcS[None, None, 0].shape  # pyrefly: ignore[missing-attribute]
+    for ci in range(p_store_chunks):
+        pchunk = cute.make_rmem_tensor(st_shape, cutlass.Float32)
+        for i in range(cute.size(pchunk)):
+            pchunk[i] = cutlass.Float32(0.0)
+        cute.copy(tiled_st, pchunk, tSTtS[None, None, ci])
+        if ci == p_store_split - 1:
+            cute.arch.fence_view_async_tmem_store()
+            cute.arch.mbarrier_arrive(pfor_ptr_stage)
+    cute.arch.fence_view_async_tmem_store()
+    cute.arch.mbarrier_arrive(pfor2_ptr_stage)
+    return cutlass.Float32(0.0)
 
 
 def _disc_chunk_rowsum(frg: cute.Tensor) -> Float32:

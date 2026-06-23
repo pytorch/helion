@@ -3394,6 +3394,8 @@ class TestCuteAutotuner(TestCase):
         into the search surface.
         """
         from helion._compiler.cute.cute_flash import FLASH_AUTOTUNE_CONFIG_KEYS
+        from helion._compiler.cute.cute_flash import FLASH_CAUSAL_KV_ORDER_KEY
+        from helion._compiler.cute.cute_flash import FLASH_CAUSAL_LOOP_SPLIT_KEY
         from helion._compiler.cute.cute_flash import FLASH_CAUSAL_LPT_SWIZZLE_KEY
         from helion._compiler.cute.cute_flash import FLASH_CONFIG_KEYS
         from helion._compiler.cute.cute_flash import FLASH_CORR_REGS_KEY
@@ -3406,10 +3408,12 @@ class TestCuteAutotuner(TestCase):
         from helion._compiler.cute.cute_flash import FLASH_EPI_TMA_KEY
         from helion._compiler.cute.cute_flash import FLASH_EXP2_IMPL_KEY
         from helion._compiler.cute.cute_flash import FLASH_KV_STAGE_KEY
+        from helion._compiler.cute.cute_flash import FLASH_MASKED_E2E_SCHEDULE_KEY
         from helion._compiler.cute.cute_flash import FLASH_PACKED_REDUCE_KEY
         from helion._compiler.cute.cute_flash import FLASH_PERSISTENT_KEY
         from helion._compiler.cute.cute_flash import FLASH_RESCALE_CHUNK_COLS_KEY
         from helion._compiler.cute.cute_flash import FLASH_RESCALE_THRESHOLD_KEY
+        from helion._compiler.cute.cute_flash import FLASH_ROLE_MAP_KEY
         from helion._compiler.cute.cute_flash import FLASH_S_STAGE_KEY
         from helion._compiler.cute.cute_flash import FLASH_SMALL_BIASED_KEY
         from helion._compiler.cute.cute_flash import FLASH_SOFTMAX_REGS_KEY
@@ -3579,6 +3583,9 @@ class TestCuteAutotuner(TestCase):
         e2e_schedule_choices = flash_fragments[FLASH_E2E_SCHEDULE_KEY].choices
         self.assertEqual(e2e_schedule_choices[0], "16/4")
         self.assertEqual(set(e2e_schedule_choices), {"16/4", "8/2", "16/2", "xu"})
+        self.assertEqual(
+            flash_fragments[FLASH_MASKED_E2E_SCHEDULE_KEY].choices, ("inherit",)
+        )
         e2e_offset_choices = flash_fragments[FLASH_E2E_OFFSET_KEY].choices
         self.assertEqual(e2e_offset_choices[0], 2)
         self.assertEqual(set(e2e_offset_choices), set(range(16)))
@@ -3624,9 +3631,7 @@ class TestCuteAutotuner(TestCase):
         self.assertEqual(
             set(flash_fragments[FLASH_CORR_REGS_KEY].choices), {64, 72, 80, 88}
         )
-        self.assertEqual(
-            set(flash_fragments[FLASH_CORR_REGS_KEY].search_choices), {64, 88}
-        )
+        self.assertEqual(set(flash_fragments[FLASH_CORR_REGS_KEY].search_choices), {64})
         with unittest.mock.patch.dict(
             os.environ, {"HELION_CUTE_FLASH_CORR_REGS": "88"}
         ):
@@ -3677,13 +3682,15 @@ class TestCuteAutotuner(TestCase):
             set(env_xu_long_fragments[FLASH_E2E_OFFSET_KEY].choices), set(range(16))
         )
         self.assertEqual(
-            env_xu_long_fragments[FLASH_E2E_OFFSET_KEY].search_choices, (0, 2, 1)
+            env_xu_long_fragments[FLASH_E2E_OFFSET_KEY].search_choices,
+            tuple(range(16)),
         )
         self.assertEqual(
             set(env_xu_long_fragments[FLASH_E2E_OFFSET0_KEY].choices), set(range(16))
         )
         self.assertEqual(
-            env_xu_long_fragments[FLASH_E2E_OFFSET0_KEY].search_choices, (0, 1, 2)
+            env_xu_long_fragments[FLASH_E2E_OFFSET0_KEY].search_choices,
+            tuple(range(16)),
         )
         self.assertEqual(
             env_xu_long_fragments[FLASH_RESCALE_THRESHOLD_KEY].search_choices,
@@ -3738,22 +3745,61 @@ class TestCuteAutotuner(TestCase):
             set(long_ws_fragments[FLASH_PACKED_REDUCE_KEY].choices), {False, True}
         )
         self.assertEqual(flash_fragments[FLASH_CAUSAL_LPT_SWIZZLE_KEY].choices, (0,))
+        self.assertEqual(
+            flash_fragments[FLASH_CAUSAL_KV_ORDER_KEY].choices, ("ascending",)
+        )
+        self.assertEqual(flash_fragments[FLASH_ROLE_MAP_KEY].choices, ("helion", "fa4"))
+        self.assertEqual(
+            flash_fragments[FLASH_ROLE_MAP_KEY].search_choices, ("helion",)
+        )
         causal_fragments = flash_autotune_fragments(64, 64, is_causal=True)
         self.assertEqual(
             causal_fragments[FLASH_CAUSAL_LPT_SWIZZLE_KEY].choices,
             (8, 0, 1, 2, 4, 16, 32, 64),
         )
         self.assertEqual(
+            set(causal_fragments[FLASH_CAUSAL_KV_ORDER_KEY].choices),
+            {"ascending", "descending"},
+        )
+        self.assertEqual(
             causal_fragments[FLASH_TOPOLOGY_KEY].search_choices,
-            ("fa4",),
+            ("fa4", "ws_overlap"),
+        )
+        self.assertEqual(
+            causal_fragments[FLASH_ROLE_MAP_KEY].choices,
+            ("helion", "fa4"),
+        )
+        self.assertEqual(
+            causal_fragments[FLASH_ROLE_MAP_KEY].search_choices,
+            ("helion", "fa4"),
         )
         self.assertEqual(
             causal_fragments[FLASH_E2E_SCHEDULE_KEY].search_choices,
-            ("16/4",),
+            ("8/2", "xu", "16/4"),
+        )
+        self.assertEqual(
+            causal_fragments[FLASH_MASKED_E2E_SCHEDULE_KEY].choices,
+            ("inherit", "xu", "16/4", "8/2"),
+        )
+        self.assertEqual(
+            causal_fragments[FLASH_MASKED_E2E_SCHEDULE_KEY].search_choices,
+            ("inherit", "xu", "16/4", "8/2"),
         )
         self.assertEqual(
             causal_fragments[FLASH_E2E_OFFSET_KEY].search_choices,
-            (11,),
+            tuple(range(16)),
+        )
+        self.assertEqual(
+            causal_fragments[FLASH_E2E_OFFSET0_KEY].search_choices,
+            (1, 0, *range(2, 16)),
+        )
+        self.assertEqual(
+            causal_fragments[FLASH_KV_STAGE_KEY].search_choices,
+            (2, 10, 8, 6, 4, 3),
+        )
+        self.assertEqual(
+            set(causal_fragments[FLASH_KV_STAGE_KEY].choices),
+            {2, 3, 4, 6, 8, 10},
         )
         self.assertEqual(
             causal_fragments[FLASH_RESCALE_THRESHOLD_KEY].search_choices,
@@ -3761,15 +3807,15 @@ class TestCuteAutotuner(TestCase):
         )
         self.assertEqual(
             causal_fragments[FLASH_RESCALE_CHUNK_COLS_KEY].search_choices,
-            (32,),
+            (16, 32),
         )
         self.assertEqual(
             causal_fragments[FLASH_DISC_PIPE_KEY].search_choices,
-            (2,),
+            (2, 3, 4),
         )
         self.assertEqual(
             causal_fragments[FLASH_SOFTMAX_REGS_KEY].search_choices,
-            (200,),
+            (200, 184, 192),
         )
         self.assertEqual(
             causal_fragments[FLASH_PACKED_REDUCE_KEY].search_choices,
@@ -3777,24 +3823,55 @@ class TestCuteAutotuner(TestCase):
         )
         self.assertEqual(
             causal_fragments[FLASH_CAUSAL_LPT_SWIZZLE_KEY].search_choices,
-            (8,),
+            (8, 0, 1, 2, 4, 16),
+        )
+        self.assertEqual(
+            causal_fragments[FLASH_CAUSAL_KV_ORDER_KEY].search_choices,
+            ("descending", "ascending"),
+        )
+        self.assertEqual(
+            causal_fragments[FLASH_CAUSAL_LOOP_SPLIT_KEY].search_choices,
+            (True, False),
+        )
+        self.assertEqual(
+            set(causal_fragments[FLASH_EPI_TMA_KEY].search_choices), {False, True}
         )
         causal_long_fragments = flash_autotune_fragments(64, 512, is_causal=True)
         self.assertEqual(
             causal_long_fragments[FLASH_E2E_OFFSET_KEY].search_choices,
-            (0,),
+            (9, *range(9), *range(10, 16)),
+        )
+        self.assertEqual(
+            causal_long_fragments[FLASH_E2E_OFFSET0_KEY].search_choices,
+            (3, 0, 1, 2, *range(4, 16)),
+        )
+        self.assertEqual(
+            causal_long_fragments[FLASH_KV_STAGE_KEY].search_choices,
+            (2, 10, 8, 6, 4, 3),
         )
         self.assertEqual(
             causal_long_fragments[FLASH_DISC_PIPE_KEY].search_choices,
-            (3,),
+            (4, 2, 3),
         )
         self.assertEqual(
             causal_long_fragments[FLASH_SOFTMAX_REGS_KEY].search_choices,
-            (184,),
+            (184, 192, 200),
         )
         self.assertEqual(
             causal_long_fragments[FLASH_CAUSAL_LPT_SWIZZLE_KEY].search_choices,
-            (1,),
+            (1, 0, 2, 4, 8, 16),
+        )
+        self.assertEqual(
+            causal_long_fragments[FLASH_CAUSAL_KV_ORDER_KEY].search_choices,
+            ("descending", "ascending"),
+        )
+        self.assertEqual(
+            causal_long_fragments[FLASH_MASKED_E2E_SCHEDULE_KEY].search_choices,
+            ("16/4", "inherit", "xu", "8/2"),
+        )
+        self.assertEqual(
+            causal_long_fragments[FLASH_ROLE_MAP_KEY].search_choices,
+            ("helion", "fa4"),
         )
         long_dense_fragments = flash_autotune_fragments(64, 64, is_causal=False)
         self.assertEqual(
@@ -3803,7 +3880,11 @@ class TestCuteAutotuner(TestCase):
         )
         self.assertEqual(
             long_dense_fragments[FLASH_TOPOLOGY_KEY].search_choices,
-            ("fa4",),
+            ("fa4", "ws_overlap"),
+        )
+        self.assertEqual(
+            long_dense_fragments[FLASH_ROLE_MAP_KEY].search_choices,
+            ("helion",),
         )
         self.assertEqual(
             set(long_dense_fragments[FLASH_E2E_SCHEDULE_KEY].choices),
@@ -3817,25 +3898,31 @@ class TestCuteAutotuner(TestCase):
             set(long_dense_fragments[FLASH_E2E_OFFSET_KEY].choices), set(range(16))
         )
         self.assertEqual(
-            long_dense_fragments[FLASH_E2E_OFFSET_KEY].search_choices, (2, 0, 1)
+            long_dense_fragments[FLASH_E2E_OFFSET_KEY].search_choices,
+            (2, 0, 1, *range(3, 16)),
         )
         self.assertEqual(
             set(long_dense_fragments[FLASH_E2E_OFFSET0_KEY].choices), set(range(16))
         )
         self.assertEqual(
-            long_dense_fragments[FLASH_E2E_OFFSET0_KEY].search_choices, (0, 1, 2)
+            long_dense_fragments[FLASH_E2E_OFFSET0_KEY].search_choices,
+            tuple(range(16)),
         )
         self.assertEqual(
             long_dense_fragments[FLASH_RESCALE_THRESHOLD_KEY].search_choices,
             (8.0,),
         )
         self.assertEqual(
-            long_dense_fragments[FLASH_RESCALE_CHUNK_COLS_KEY].search_choices, (32,)
+            long_dense_fragments[FLASH_RESCALE_CHUNK_COLS_KEY].search_choices,
+            (32, 16),
         )
-        self.assertEqual(long_dense_fragments[FLASH_DISC_PIPE_KEY].search_choices, (3,))
+        self.assertEqual(
+            long_dense_fragments[FLASH_DISC_PIPE_KEY].search_choices, (3, 2, 4)
+        )
         self.assertEqual(long_dense_fragments[FLASH_S_STAGE_KEY].search_choices, (2,))
         self.assertEqual(
-            long_dense_fragments[FLASH_KV_STAGE_KEY].search_choices, (2, 3)
+            long_dense_fragments[FLASH_KV_STAGE_KEY].search_choices,
+            (2, 3, 4, 6, 8),
         )
         self.assertEqual(
             set(long_dense_fragments[FLASH_KV_STAGE_KEY].choices),
@@ -3849,10 +3936,11 @@ class TestCuteAutotuner(TestCase):
             long_dense_kv6_fragments = flash_autotune_fragments(64, 64, is_causal=False)
         self.assertEqual(long_dense_kv6_fragments[FLASH_KV_STAGE_KEY].choices[0], 6)
         self.assertEqual(
-            long_dense_kv6_fragments[FLASH_KV_STAGE_KEY].search_choices, (2, 3)
+            long_dense_kv6_fragments[FLASH_KV_STAGE_KEY].search_choices,
+            (2, 3, 4, 6, 8),
         )
         self.assertEqual(
-            long_dense_fragments[FLASH_EPI_TMA_KEY].search_choices, (False,)
+            long_dense_fragments[FLASH_EPI_TMA_KEY].search_choices, (False, True)
         )
         self.assertEqual(
             long_dense_fragments[FLASH_PERSISTENT_KEY].search_choices, (True,)
@@ -3889,7 +3977,7 @@ class TestCuteAutotuner(TestCase):
             long_dense_fragments[FLASH_TOPOLOGY_KEY].differential_mutation(
                 "ws_overlap", "fa4", "fa4"
             ),
-            "fa4",
+            "ws_overlap",
         )
         random_config = attn_bound.config_spec.flat_config(
             lambda fragment: fragment.random()
@@ -4039,15 +4127,16 @@ class TestCuteAutotuner(TestCase):
                 random_long[FLASH_E2E_SCHEDULE_KEY],
                 {"16/4", "8/2"},
             )
-            self.assertIn(random_long[FLASH_E2E_OFFSET_KEY], {0, 1, 2})
-            self.assertIn(random_long[FLASH_E2E_OFFSET0_KEY], {0, 1, 2})
-            self.assertEqual(random_long[FLASH_TOPOLOGY_KEY], "fa4")
-            self.assertEqual(random_long[FLASH_DISC_PIPE_KEY], 3)
-            self.assertFalse(random_long[FLASH_EPI_TMA_KEY])
+            self.assertEqual(random_long[FLASH_MASKED_E2E_SCHEDULE_KEY], "inherit")
+            self.assertIn(random_long[FLASH_E2E_OFFSET_KEY], set(range(16)))
+            self.assertIn(random_long[FLASH_E2E_OFFSET0_KEY], set(range(16)))
+            self.assertIn(random_long[FLASH_TOPOLOGY_KEY], {"fa4", "ws_overlap"})
+            self.assertIn(random_long[FLASH_DISC_PIPE_KEY], {2, 3, 4})
+            self.assertIn(random_long[FLASH_EPI_TMA_KEY], {False, True})
             self.assertEqual(random_long[FLASH_RESCALE_THRESHOLD_KEY], 8.0)
-            self.assertEqual(random_long[FLASH_RESCALE_CHUNK_COLS_KEY], 32)
+            self.assertIn(random_long[FLASH_RESCALE_CHUNK_COLS_KEY], {16, 32})
             self.assertEqual(random_long[FLASH_S_STAGE_KEY], 2)
-            self.assertIn(random_long[FLASH_KV_STAGE_KEY], {2, 3})
+            self.assertIn(random_long[FLASH_KV_STAGE_KEY], {2, 3, 4, 6, 8})
             self.assertTrue(random_long[FLASH_PERSISTENT_KEY])
             self.assertTrue(random_long[FLASH_PACKED_REDUCE_KEY])
         odd_fa4_without_offset = helion.Config(
@@ -4115,8 +4204,8 @@ class TestCuteAutotuner(TestCase):
             cute_flash_e2e_offset0=99,
         )
         attn_bound.config_spec.normalize(split8_config_bad_offset, _fix_invalid=True)
-        self.assertEqual(split8_config_bad_offset.config[FLASH_E2E_OFFSET_KEY], 1)
-        self.assertEqual(split8_config_bad_offset.config[FLASH_E2E_OFFSET0_KEY], 0)
+        self.assertEqual(split8_config_bad_offset.config[FLASH_E2E_OFFSET_KEY], 3)
+        self.assertEqual(split8_config_bad_offset.config[FLASH_E2E_OFFSET0_KEY], 3)
         legacy_split_config = helion.Config(
             block_sizes=[1, 128, 128],
             cute_flash_e2e_schedule="xu",
@@ -4202,7 +4291,25 @@ class TestCuteAutotuner(TestCase):
             cute_flash_e2e_schedule="8/2",
         )
         causal_8192_bound.config_spec.normalize(causal_8_2_without_offset)
-        self.assertEqual(causal_8_2_without_offset.config[FLASH_E2E_OFFSET_KEY], 3)
+        self.assertEqual(causal_8_2_without_offset.config[FLASH_E2E_OFFSET_KEY], 0)
+        causal_masked_split_offset = helion.Config(
+            block_sizes=[1, 128, 128],
+            cute_flash_e2e_schedule="xu",
+            cute_flash_masked_e2e_schedule="16/4",
+            cute_flash_e2e_offset=15,
+            cute_flash_e2e_offset0=14,
+        )
+        causal_8192_bound.config_spec.normalize(causal_masked_split_offset)
+        self.assertEqual(causal_masked_split_offset.config[FLASH_E2E_OFFSET_KEY], 15)
+        self.assertEqual(causal_masked_split_offset.config[FLASH_E2E_OFFSET0_KEY], 14)
+        causal_main8_masked16_offset = helion.Config(
+            block_sizes=[1, 128, 128],
+            cute_flash_e2e_schedule="8/2",
+            cute_flash_masked_e2e_schedule="16/4",
+            cute_flash_e2e_offset=15,
+        )
+        causal_8192_bound.config_spec.normalize(causal_main8_masked16_offset)
+        self.assertEqual(causal_main8_masked16_offset.config[FLASH_E2E_OFFSET_KEY], 15)
 
         # A plain matmul is not an attention kernel: the flash surface must
         # stay off and none of its knobs may appear.
@@ -5141,6 +5248,7 @@ class TestAutotuneBudget(TestCase):
 
         settings = Settings(
             autotune_budget_seconds=None,
+            autotune_effort="quick",
             autotune_log_level=logging.CRITICAL,
         )
         bound_kernel = SimpleNamespace(settings=settings)
@@ -5158,12 +5266,37 @@ class TestAutotuneBudget(TestCase):
         self.assertEqual(observed_budgets, [_CUTE_DEFAULT_AUTOTUNE_BUDGET_SECONDS])
         self.assertIsNone(bound_kernel.settings.autotune_budget_seconds)
 
+    def test_cute_backend_leaves_full_autotune_unbudgeted_by_default(self) -> None:
+        from helion._compiler.backend import Backend
+        from helion._compiler.backend import CuteBackend
+
+        settings = Settings(
+            autotune_budget_seconds=None,
+            autotune_effort="full",
+            autotune_log_level=logging.CRITICAL,
+        )
+        bound_kernel = SimpleNamespace(settings=settings)
+        observed_budgets: list[int | None] = []
+
+        def fake_autotune(self_, bound_kernel_, args, **kwargs):
+            observed_budgets.append(bound_kernel_.settings.autotune_budget_seconds)
+            return helion.Config()
+
+        with patch.object(
+            Backend, "autotune", autospec=True, side_effect=fake_autotune
+        ):
+            CuteBackend().autotune(bound_kernel, ())
+
+        self.assertEqual(observed_budgets, [None])
+        self.assertIsNone(bound_kernel.settings.autotune_budget_seconds)
+
     def test_cute_backend_restores_default_autotune_budget_on_error(self) -> None:
         from helion._compiler.backend import Backend
         from helion._compiler.backend import CuteBackend
 
         settings = Settings(
             autotune_budget_seconds=None,
+            autotune_effort="quick",
             autotune_log_level=logging.CRITICAL,
         )
         bound_kernel = SimpleNamespace(settings=settings)
