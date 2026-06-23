@@ -3841,47 +3841,72 @@ def _codegen_cute_store_tcgen05_tile(
                     f"{rec.aux_rmem}.load()\n"
                 )
                 continue
+            if rowvec_stage is None and tcgen05_value.flat_m_edge:
+                # Padded single-M-tile (block_m > real M, N divides bn): the
+                # ``if full_tile`` fast path is statically dead (a full M tile
+                # can never form) and the only out-of-bounds aux coordinate is
+                # the M row, so the per-element 2-D ``elem_less`` scalar loop is
+                # pure overhead. Mirror the leaner store path
+                # (``tcgen05_value.flat_m_edge`` branch in the SIMT store) and
+                # emit ONE vectorized ``logical_divide`` predicated copy with an
+                # M-only row predicate. Same masking semantics (padded rows read
+                # 0 and are dropped by the M-clamped store), far fewer scalar
+                # ops / live registers on the streaming epilogue warps.
+                #
+                # This M-row predicate is MANDATORY for the padded tile
+                # regardless of the output store mechanism: an exact-shape rank-2
+                # aux (e.g. ``scale_a[m, n]``) is allocated with only the real M
+                # rows, so an unpredicated direct ``ttr_aux_subtile.load()`` of
+                # the bm-row padded tile reads aux rows ``m_size..bm-1`` OUT OF
+                # BOUNDS. The SIMT-store path reached this branch via
+                # ``not use_tma_store_epilogue``; the flat-M-edge TMA-store path
+                # (where ``use_tma_store_epilogue`` is now True but there is no
+                # aux-TMA producer, so ``safe_direct_aux_with_full_tile`` is
+                # False) MUST take the same predicated read -- gating it on the
+                # store epilogue would fall through to the OOB direct load.
+                include_coord_setup = not force_simt_edge_coord_emitted
+                force_simt_edge_coord_emitted = True
+                flat_edge_atom = df.new_var(f"{rec.aux_rmem}_edge_atom")
+                # Size the predicated-copy destination to the CARRIER layout, not
+                # the raw ``ttr_aux_subtile`` layout. In the SIMT-store path the
+                # carrier (``ttr_racc``) and ``ttr_aux_subtile`` share the flat
+                # T2R value layout, so this is byte-identical to the prior
+                # ``ttr_aux_subtile.shape`` form. In the flat-M-edge TMA-store
+                # path the carrier is the R2S-retiled ``trs_racc`` (the aux
+                # partition is retiled via ``retile_for_r2s``), so the chain step
+                # ``acc_loaded * aux_loaded`` must see matching value profiles --
+                # building ``aux_rmem`` against the carrier shape keeps
+                # ``aux_loaded`` shaped like ``carrier.load()``. The predicated
+                # ``logical_divide(..., make_layout(1))`` copy is over the
+                # flattened value mode, so it stays valid as long as the total
+                # element counts match (they do: same per-thread T2R fragment).
+                lines.append(
+                    f"{prelude_indent}{flat_edge_atom} = "
+                    f"cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), "
+                    f"{rec.aux_dtype})\n"
+                    f"{prelude_indent}{rec.ttr_aux_subtile} = "
+                    f"{rec.ttr_aux_grouped}"
+                    f"[(None, None, None, cutlass.Int32(_tcgen05_subtile))]\n"
+                    f"{prelude_indent}{rec.aux_rmem} = "
+                    f"cute.make_rmem_tensor(cute.make_layout({carrier_name}.shape), "
+                    f"{rec.aux_dtype})\n"
+                    f"{prelude_indent}{rec.aux_rmem}.fill(0)\n"
+                    + _simt_edge_logical_divide_copy_source(
+                        prelude_indent,
+                        rec.ttr_aux_subtile,
+                        rec.aux_rmem,
+                        include_coord_setup=include_coord_setup,
+                        var_prefix=f"{rec.aux_rmem}_edge",
+                        copy_atom=flat_edge_atom,
+                        m_only_pred=True,
+                    )
+                    + f"{prelude_indent}{rec.aux_loaded} = "
+                    f"{rec.aux_rmem}.load()\n"
+                )
+                continue
             if rowvec_stage is None and (
                 safe_direct_aux_with_full_tile or not tcgen05_aux_use_tma_store_epilogue
             ):
-                if tcgen05_value.flat_m_edge:
-                    # Padded single-M-tile (block_m > real M, N divides bn): the
-                    # ``if full_tile`` fast path is statically dead (a full M tile
-                    # can never form) and the only out-of-bounds aux coordinate is
-                    # the M row, so the per-element 2-D ``elem_less`` scalar loop is
-                    # pure overhead. Mirror the leaner store path
-                    # (``tcgen05_value.flat_m_edge`` branch in the SIMT store) and
-                    # emit ONE vectorized ``logical_divide`` predicated copy with an
-                    # M-only row predicate. Same masking semantics (padded rows read
-                    # 0 and are dropped by the M-predicated store), far fewer scalar
-                    # ops / live registers on the streaming epilogue warps.
-                    include_coord_setup = not force_simt_edge_coord_emitted
-                    force_simt_edge_coord_emitted = True
-                    flat_edge_atom = df.new_var(f"{rec.aux_rmem}_edge_atom")
-                    lines.append(
-                        f"{prelude_indent}{flat_edge_atom} = "
-                        f"cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), "
-                        f"{rec.aux_dtype})\n"
-                        f"{prelude_indent}{rec.ttr_aux_subtile} = "
-                        f"{rec.ttr_aux_grouped}"
-                        f"[(None, None, None, cutlass.Int32(_tcgen05_subtile))]\n"
-                        f"{prelude_indent}{rec.aux_rmem} = "
-                        f"cute.make_rmem_tensor({rec.ttr_aux_subtile}.shape, "
-                        f"{rec.aux_dtype})\n"
-                        f"{prelude_indent}{rec.aux_rmem}.fill(0)\n"
-                        + _simt_edge_logical_divide_copy_source(
-                            prelude_indent,
-                            rec.ttr_aux_subtile,
-                            rec.aux_rmem,
-                            include_coord_setup=include_coord_setup,
-                            var_prefix=f"{rec.aux_rmem}_edge",
-                            copy_atom=flat_edge_atom,
-                            m_only_pred=True,
-                        )
-                        + f"{prelude_indent}{rec.aux_loaded} = "
-                        f"{rec.aux_rmem}.load()\n"
-                    )
-                    continue
                 lines.append(
                     f"{prelude_indent}{rec.ttr_aux_subtile} = "
                     f"{rec.ttr_aux_grouped}"

@@ -2506,6 +2506,42 @@ def _emit_mma_pipeline(
         or tcgen05_role_local_n_edge_tma
         or tcgen05_role_local_double_edge_tma
     ) and tcgen05_output_edge_tma_store_fits_smem
+    # Flat (cluster_m=1, non-persistent) tiny-M single padded tile: route the
+    # padded-M output store through the SAME coalesced SMEM-staged TMA bulk
+    # store the static-full flat path uses (T2R -> R2S into the C-ring SMEM ->
+    # ``cute.copy(CopyBulkTensorTileS2GOp, sD, gD)`` via PipelineTmaStore),
+    # instead of the uncoalesced per-thread register->global predicated SIMT
+    # store. The host TMA-store descriptor is built from the REAL output shape
+    # (``arg{d_idx}.shape``; see ``append_tcgen05_epilogue_tma_wrapper``), so the
+    # bulk store of the bm-row box at tile origin is HARDWARE bounds-clamped to
+    # the real ``m_size`` rows -- the partial M rows are never written OOB, with
+    # zero device-side row predicate. This is the exact OOB-suppression the
+    # ``tcgen05_partial_output_tma_store`` aux-TMA edge family already relies on
+    # (CuTe TMA descriptor bounds checks), applied to the no-aux flat tiny-M
+    # case. Gated to the single-padded-tile envelope (``m_size <= bm``, N%bn==0,
+    # K%bk==0, cluster_n in {1,2}, CtaGroup.ONE) where there is no genuine full
+    # M tile to regress, and to the same AB-stage SMEM budget as the role-local
+    # edge TMA store.
+    #
+    # SMEM budget: this flat one-CTA padded tile has the IDENTICAL epilogue SMEM
+    # footprint as the flat static-full path (same bm x bn block, same AB-stage
+    # count, same C-stage count, same ``make_smem_layout_epi`` D buffer), which
+    # is already validated at this shape and AB-stage count (the M=64 / M%bm==0
+    # case at the same block_sizes/ab_stages reaches the static-full TMA-store
+    # epilogue). The ``tcgen05_output_edge_tma_store_fits_smem`` cap is the
+    # 2-CTA output-edge family's separate, more constrained budget (extra D tile
+    # alongside larger 2-CTA AB stages) and does NOT bound this one-CTA path.
+    # Measured on B200: the SMEM-staged TMA-store epilogue beats the predicated
+    # SIMT register->global store for padded tiles with m_size >= 32 (it removes
+    # the uncoalesced SIMT stores whose count grows with real M), but its
+    # staging/pipeline setup is NOT amortized at the very smallest m_size=16,
+    # where the SIMT store is faster. Gate the TMA store on m_size >= 32 so the
+    # tiniest-M tile keeps the cheaper SIMT store.
+    tcgen05_flat_m_edge_tma_store = (
+        tcgen05_flat_m_edge_single_tile
+        and not tcgen05_is_two_cta
+        and m_size >= 32
+    )
     # Flat kernels process one output tile per CTA, so the c_pipeline stage is
     # just the subtile index. Persistent kernels use a role-local tile counter
     # to rotate c_pipeline stages across work tiles. Static-full CtaGroup.TWO
@@ -2521,6 +2557,7 @@ def _emit_mma_pipeline(
             tcgen05_static_full_tiles
             or tcgen05_role_local_k_tail_tma
             or tcgen05_use_output_edge_tma_store_for_full_tiles
+            or tcgen05_flat_m_edge_tma_store
         )
         and tcgen05_role_local_codegen_allowed
         and (not _is_persistent_pid_config(df.config) or tcgen05_use_role_local_epi)
@@ -3825,7 +3862,22 @@ def _emit_mma_pipeline(
                 # enabled for the output-edge family, which routes partial tiles
                 # through either the full/edge split or the bounds-checked
                 # partial-output TMA-store path.
-                tma_store_handles_partial_tiles = tcgen05_use_tma_store_epilogue
+                #
+                # The flat-M-edge TMA store (``tcgen05_flat_m_edge_tma_store``)
+                # is deliberately EXCLUDED here: it is validated only for the
+                # no-aux and SIMT-predicated-aux store paths (the aux M-row
+                # predicate in ``_codegen_cute_store_tcgen05_tile`` masks the
+                # padded rows of an exact-shape rank-2 aux read). Letting it set
+                # ``tma_store_handles_partial_tiles`` would suppress the
+                # ``aux_load_mode=tma`` + partial-output rejection below and
+                # silently route a TMA-staged aux through an uncovered combo.
+                # Keep that rejection firing exactly as on the SIMT-store
+                # baseline; the flat tiny-M store optimization does not depend on
+                # aux-TMA.
+                tma_store_handles_partial_tiles = (
+                    tcgen05_use_tma_store_epilogue
+                    and not tcgen05_flat_m_edge_tma_store
+                )
                 aux_tma_needs_edge_routing = (
                     tcgen05_aux_tma_requested
                     and not tcgen05_static_output_tiles
