@@ -17,6 +17,7 @@ from typing import TYPE_CHECKING
 from typing import Any
 from typing import cast
 import unittest
+from unittest.mock import Mock
 from unittest.mock import patch
 
 import torch
@@ -28,6 +29,7 @@ from helion._testing import onlyBackends
 from helion._testing import skipIfXPU
 from helion.autotuner.base_search import PopulationBasedSearch
 from helion.autotuner.base_search import PopulationMember
+from helion.autotuner.benchmark_job import AccuracyCheckJob
 from helion.autotuner.benchmark_job import AccuracyCheckResult
 from helion.autotuner.benchmark_job import BenchmarkJob
 from helion.autotuner.benchmark_provider import LocalBenchmarkProvider
@@ -121,6 +123,136 @@ class TestBenchmarkWorkerFailureModes(unittest.TestCase):
         load_args.assert_called_once_with("/tmp/args.pt")
         event_bench.assert_not_called()
         wall_clock_bench.assert_called_once()
+
+    def test_accuracy_check_job_passes(self) -> None:
+        fn = _ReturnValue(torch.tensor([1.0]))
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            args_path = Path(tmpdir) / "args.pt"
+            baseline_path = Path(tmpdir) / "baseline.pt"
+            torch.save((), args_path)
+            torch.save(torch.tensor([1.0]), baseline_path)
+
+            with patch(
+                "helion.autotuner.benchmark_job._load_compiled_fn",
+                return_value=fn,
+            ):
+                result = AccuracyCheckJob(
+                    fn_spec=cast("SerializedCompiledFunction", object()),
+                    args_path=str(args_path),
+                    baseline_path=str(baseline_path),
+                    atol=0.0,
+                    rtol=0.0,
+                )()
+
+        self.assertTrue(result.ok)
+        self.assertEqual(result.message, "")
+
+    def test_accuracy_check_job_reports_mismatch(self) -> None:
+        fn = _ReturnValue(torch.tensor([2.0]))
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            args_path = Path(tmpdir) / "args.pt"
+            baseline_path = Path(tmpdir) / "baseline.pt"
+            torch.save((), args_path)
+            torch.save(torch.tensor([1.0]), baseline_path)
+
+            with patch(
+                "helion.autotuner.benchmark_job._load_compiled_fn",
+                return_value=fn,
+            ):
+                result = AccuracyCheckJob(
+                    fn_spec=cast("SerializedCompiledFunction", object()),
+                    args_path=str(args_path),
+                    baseline_path=str(baseline_path),
+                    atol=0.0,
+                    rtol=0.0,
+                )()
+
+        self.assertFalse(result.ok)
+        self.assertIn("Tensor-likes are not equal", result.message)
+
+    def test_accuracy_check_job_reports_shape_mismatch(self) -> None:
+        fn = _ReturnValue(torch.zeros(2, 3))
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            args_path = Path(tmpdir) / "args.pt"
+            baseline_path = Path(tmpdir) / "baseline.pt"
+            torch.save((), args_path)
+            torch.save(torch.zeros(3, 2), baseline_path)
+
+            with patch(
+                "helion.autotuner.benchmark_job._load_compiled_fn",
+                return_value=fn,
+            ):
+                result = AccuracyCheckJob(
+                    fn_spec=cast("SerializedCompiledFunction", object()),
+                    args_path=str(args_path),
+                    baseline_path=str(baseline_path),
+                    atol=0.0,
+                    rtol=0.0,
+                )()
+
+        self.assertFalse(result.ok)
+        self.assertIn("Tensor shape mismatch", result.message)
+
+    def test_accuracy_check_job_reports_tensor_leaf_type_mismatch(self) -> None:
+        fn = _ReturnValue(torch.tensor([1.0]))
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            args_path = Path(tmpdir) / "args.pt"
+            baseline_path = Path(tmpdir) / "baseline.pt"
+            torch.save((), args_path)
+            torch.save(1.0, baseline_path)
+
+            with patch(
+                "helion.autotuner.benchmark_job._load_compiled_fn",
+                return_value=fn,
+            ):
+                result = AccuracyCheckJob(
+                    fn_spec=cast("SerializedCompiledFunction", object()),
+                    args_path=str(args_path),
+                    baseline_path=str(baseline_path),
+                    atol=0.0,
+                    rtol=0.0,
+                )()
+
+        self.assertFalse(result.ok)
+        self.assertIn("Output leaf type mismatch", result.message)
+
+    def test_subprocess_accuracy_check_uses_benchmark_timeout(self) -> None:
+        provider = LocalBenchmarkProvider.__new__(LocalBenchmarkProvider)
+        provider.settings = Settings(
+            autotune_compile_timeout=3,
+            autotune_benchmark_timeout=17,
+        )
+        provider._precompile_args_path = "/tmp/args.pt"
+        provider._precompile_baseline_path = "/tmp/baseline.pt"
+        provider._effective_atol = 0.0
+        provider._effective_rtol = 0.0
+        provider._benchmark_worker = Mock()
+        provider._benchmark_worker.run.return_value = object()
+        provider._subprocess_accuracy_check_enabled = lambda: True
+
+        with patch(
+            "helion.autotuner.benchmark_provider._serialize_compiled_fn",
+            return_value=cast("SerializedCompiledFunction", object()),
+        ):
+            provider._run_subprocess_accuracy_check_job(
+                cast("CompiledConfig", object())
+            )
+
+        provider._benchmark_worker.run.assert_called_once()
+        _, kwargs = provider._benchmark_worker.run.call_args
+        self.assertEqual(kwargs["timeout"], 17.0)
+
+    def test_subprocess_accuracy_check_skips_mutated_args(self) -> None:
+        provider = LocalBenchmarkProvider.__new__(LocalBenchmarkProvider)
+        provider.settings = Settings()
+        provider.mutated_arg_indices = [0]
+        provider._subprocess_benchmark_enabled = lambda: True
+
+        self.assertFalse(provider._subprocess_accuracy_check_enabled())
 
     def test_load_trusted_kernel_args_accepts_python_objects(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -319,6 +451,57 @@ class TestSuspiciousRebenchmark(unittest.TestCase):
         )
 
         self.assertEqual(timings, [0.92, 0.80])
+
+    def test_rebenchmark_uses_isolated_provider(self) -> None:
+        class FakeProvider:
+            def __init__(self) -> None:
+                self.mutated_arg_indices: list[int] = []
+                self.fns: list[object] | None = None
+                self.warmup: int | None = None
+                self.rep: int | None = None
+                self.desc: str | None = None
+
+            def benchmark_isolated(
+                self,
+                fns: list[object],
+                *,
+                warmup: int,
+                rep: int,
+                desc: str,
+            ) -> list[float | None]:
+                self.fns = fns
+                self.warmup = warmup
+                self.rep = rep
+                self.desc = desc
+                return [0.50, None]
+
+        def fn_a() -> None:
+            pass
+
+        def fn_b() -> None:
+            pass
+
+        provider = FakeProvider()
+        search = SimpleNamespace(
+            settings=Settings(autotune_benchmark_subprocess=True),
+            benchmark_provider=provider,
+            best_perf_so_far=1.0,
+            kernel=SimpleNamespace(env=SimpleNamespace(process_group_name=None)),
+        )
+        members = [
+            PopulationMember(fn=fn_a, perfs=[1.00], flat_values=[], config=Config()),
+            PopulationMember(fn=fn_b, perfs=[0.80], flat_values=[], config=Config()),
+        ]
+
+        PopulationBasedSearch.rebenchmark(cast("Any", search), members, desc="verify")
+
+        self.assertEqual(provider.fns, [fn_a, fn_b])
+        self.assertEqual(provider.warmup, 1)
+        self.assertEqual(provider.rep, 200)
+        self.assertEqual(provider.desc, "verify")
+        self.assertEqual(members[0].perfs, [1.00, 0.50])
+        self.assertEqual(members[1].perfs, [0.80, 0.80])
+        self.assertEqual(search.best_perf_so_far, 0.50)
 
 
 # Subprocess benchmarking depends on Backend.supports_precompile(); only the
