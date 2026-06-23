@@ -60,6 +60,7 @@ from helion.autotuner.config_fragment import NumThreadsFragment
 from helion.autotuner.config_fragment import PermutationFragment
 from helion.autotuner.config_fragment import PowerOfTwoFragment
 from helion.autotuner.config_generation import ConfigGeneration
+from helion.autotuner.config_spec import SMALL_DIM_BLOCK_SIZE_OVERSHOOT
 from helion.autotuner.effort_profile import get_effort_profile
 from helion.autotuner.finite_search import FiniteSearch
 from helion.autotuner.local_cache import LocalAutotuneCache
@@ -894,6 +895,26 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         overrides = {"range_unroll_factors": [4], "range_warp_specializes": ([True])}
         # We expect all the unroll factors to be set to 0
         configs = ConfigGeneration(spec, overrides=overrides).random_population(10)
+        self.assertExpectedJournal("\n".join(map(repr, configs)))
+
+    @patch.object(_compat, "_supports_tensor_descriptor", lambda: True)
+    @patch.object(_compat, "_min_dot_size", lambda *args: (16, 16, 16))
+    @patch.object(_compat, "_supports_maxnreg", lambda: True)
+    @patch.object(loops, "_supports_warp_specialize", lambda: True)
+    @skipIfRocm("config space differs on ROCm")
+    @skipIfXPU("maxnreg uses CUDA-specific register query")
+    @skipIfTileIR("block-size overshoot is gated to the triton backend")
+    def test_small_dim_block_size_overshoot(self):
+        # All dims are 16, smaller than SMALL_DIM_BLOCK_SIZE_OVERSHOOT, so the
+        # generated configs may use block sizes larger than the dimensions
+        # themselves (e.g. 32 or 64) -- the extra rows/cols are masked off.
+        self.assertEqual(SMALL_DIM_BLOCK_SIZE_OVERSHOOT, 64)
+        args = (
+            torch.randn([16, 16], device=DEVICE),
+            torch.randn([16, 16], device=DEVICE),
+        )
+        spec = _get_examples_matmul().bind(args).config_spec
+        configs = ConfigGeneration(spec).random_population(10)
         self.assertExpectedJournal("\n".join(map(repr, configs)))
 
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: True)
