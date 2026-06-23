@@ -1070,6 +1070,13 @@ class _PerKiterTmaArgs:
     # (cute_plan.md §6.12.7). Default 1 preserves byte-identity for the
     # validated cluster_m=2 cluster_n=1 path.
     cluster_n: int = 1
+    # When True the A ``cute.copy`` passes ``mcast_mask`` even though this is
+    # not a two-cta loop. Set by the N-only CtaGroup.ONE A-multicast cluster
+    # (cluster_m=1, cluster_n=2), where A is multicast across the 2 N-CTAs but
+    # the mainloop stays flat / owner-ungated. Defaults False so all existing
+    # non-cluster and two-cta call sites keep their byte-identical emission
+    # (the two-cta path drives the A mask via ``is_two_cta`` below).
+    use_tma_a_mcast_mask: bool = False
     # Static-full one-CTA pipelined TMA loops can drop the per-K runtime
     # full-tile branch and scalar fallback. Non-pipelined/asymmetric or two-CTA
     # TMA paths must keep the guarded fallback path.
@@ -1084,7 +1091,8 @@ def _kloop_tma_copy_a_src(args: _PerKiterTmaArgs, *, k_offset: str) -> str:
     """
     if not args.use_tma_a:
         return ""
-    mcast = f", mcast_mask={args.tma_a_mcast_mask}" if args.is_two_cta else ""
+    a_mcast = args.is_two_cta or args.use_tma_a_mcast_mask
+    mcast = f", mcast_mask={args.tma_a_mcast_mask}" if a_mcast else ""
     return (
         f"    cute.copy({args.tma_atom_a}, "
         f"{args.tma_gA}[None, {k_offset}], "
@@ -1530,6 +1538,10 @@ class _InitialPrefetchTmaArgs:
     use_tma_b_mcast_mask: bool
     skip_producer_acquire: bool
     skip_producer_advance: bool
+    # See ``_PerKiterTmaArgs.use_tma_a_mcast_mask``: drives the A multicast for
+    # the N-only CtaGroup.ONE cluster. Defaults False so two-cta and
+    # non-cluster prefetch call sites stay byte-identical.
+    use_tma_a_mcast_mask: bool = False
 
 
 def _initial_prefetch_copy_a_src(
@@ -1542,7 +1554,8 @@ def _initial_prefetch_copy_a_src(
     ``test_mcast_mask_asymmetry_between_a_and_b`` for the per-K-iter
     builders.
     """
-    mcast = f", mcast_mask={args.tma_a_mcast_mask}" if args.is_two_cta else ""
+    a_mcast = args.is_two_cta or args.use_tma_a_mcast_mask
+    mcast = f", mcast_mask={args.tma_a_mcast_mask}" if a_mcast else ""
     return (
         f"    cute.copy({args.tma_atom_a}, "
         f"{args.tma_gA}[None, {k_offset}], "
@@ -2046,7 +2059,11 @@ def _emit_mma_pipeline(
         and tcgen05_use_tma_pipeline
         and not tcgen05_pid_is_persistent
         and tcgen05_cluster_m == 1
-        and tcgen05_cluster_n_requested == 1
+        # cluster_n=1 is the plain flat path; cluster_n=2 is the N-only
+        # A-multicast cluster, which keeps the identical flat M-edge
+        # output-tile predicate (each CTA still owns one bm x bn tile and
+        # masks the padded M rows). The cluster only changes the A TMA load.
+        and tcgen05_cluster_n_requested in (1, 2)
         and m_size % bm != 0
         and n_size % bn == 0
         and k_total_size % bk == 0
@@ -2191,19 +2208,56 @@ def _emit_mma_pipeline(
     # this validated pairing demote to cluster_n=1 instead of throwing —
     # explicit user configs hit the BackendUnsupported gate, and autotune
     # stays narrowed to the validated subset.
+    # cluster_n=2 has two validated codegen envelopes:
+    #   1. cluster_m=2, use_2cta=True (V=2): the canonical Quack 4-CTA cluster.
+    #   2. cluster_m=1, CtaGroup.ONE: the N-only A-multicast cluster for the
+    #      tiny-M padded tcgen05 fp8 path. Two CTAs each own their own N output
+    #      tile and run the flat (non-persistent, monolithic) mainloop
+    #      independently; the cluster exists ONLY to TMA-multicast the shared A
+    #      operand along the N axis. This mirrors torch's ``_scaled_mm`` CUTLASS
+    #      ClusterShape<1,2,1> selection at M<=64,N>=3072 and is the right lever
+    #      for the memory-bound tiny-M shape (cluster_m=2 has nothing to share
+    #      along M). See cute_plan.md §6.12 for envelope 1.
+    # Restricted to a SINGLE M-tile (``m_size <= bm``): the flat grid maps
+    # consecutive grid_x ids to adjacent N-tiles of m_tile 0, so a 2-CTA
+    # cluster along grid_x always pairs two N-tiles that share the SAME A
+    # rows. With multiple M-tiles a cluster pair could straddle an
+    # m_tile boundary (different A rows), and each CTA's multicast A copy
+    # would clobber its peer's SMEM A -> wrong output. The target tiny-M
+    # shapes (M<=64 on a 64/128-row tile) are exactly the single-M-tile
+    # case, which is also what torch's _scaled_mm pads M to.
+    tcgen05_n_only_cluster = (
+        mma_impl == "tcgen05"
+        and tcgen05_cluster_n_requested == 2
+        and tcgen05_cluster_m == 1
+        and not tcgen05_requested_two_cta
+        and tcgen05_use_tma_pipeline
+        and not tcgen05_pid_is_persistent
+        and m_size <= bm
+        and n_size % (bn * tcgen05_cluster_n_requested) == 0
+        and k_total_size % bk == 0
+    )
     if tcgen05_cluster_n_requested > 1 and not (
-        mma_impl == "tcgen05" and tcgen05_is_two_cta and tcgen05_cluster_m == 2
+        (mma_impl == "tcgen05" and tcgen05_is_two_cta and tcgen05_cluster_m == 2)
+        or tcgen05_n_only_cluster
     ):
         if mma_impl == "tcgen05" and tcgen05_cluster_n_requested == 2:
             raise exc.BackendUnsupported(
                 "cute",
-                "tcgen05_cluster_n=2 requires tcgen05_cluster_m=2 with "
-                "use_2cta=True (bm=256). See cute_plan.md §6.12 for the "
-                "validated 4-CTA cluster envelope.",
+                "tcgen05_cluster_n=2 requires either tcgen05_cluster_m=2 with "
+                "use_2cta=True (bm=256, the 4-CTA cluster; cute_plan.md §6.12) "
+                "or tcgen05_cluster_m=1 with a flat non-persistent TMA pipeline "
+                "and an N extent divisible by 2*block_n (the N-only A-multicast "
+                "cluster). For the latter K must divide block_k.",
             )
         tcgen05_cluster_n = 1
     else:
         tcgen05_cluster_n = tcgen05_cluster_n_requested
+    # The N-only cluster reuses the same per-CTA multicast machinery as the
+    # 2-CTA path for A (mcast atom + mask + cta-layout slices + arrive count),
+    # but keeps the flat owner-ungated mainloop: each CTA is its own MMA owner
+    # (CtaGroup.ONE => every CTA is a cluster leader), so no V-leader gating.
+    tcgen05_a_mcast_cluster = tcgen05_is_two_cta or tcgen05_n_only_cluster
     tcgen05_role_local_k_tail_tma = (
         tcgen05_preserve_tma_for_two_cta_k_tail
         and tcgen05_is_two_cta
@@ -2722,7 +2776,20 @@ def _emit_mma_pipeline(
     mma_physical_m_threads = _grid_thread_extent(cg, m_block_id)
     tcgen05_cta_thread_count = _grid_cta_thread_count(cg)
     if mma_impl == "tcgen05" and tcgen05_cluster_m * tcgen05_cluster_n > 1:
-        df.cute_state.cluster_shape = (tcgen05_cluster_m, tcgen05_cluster_n, 1)
+        # The launch cluster dims map (m, n, k) -> physical grid (x, y, z).
+        # The persistent two-cta paths lay the grid out so cluster_m clusters
+        # along grid_x (e.g. (2,1,1)) and cluster_n along grid_y. The N-only
+        # flat path uses a SINGLE flat grid dimension (grid_x = total tiles,
+        # grid_y=grid_z=1) with consecutive grid_x tiles being adjacent
+        # N-tiles of the one M-tile, so its 2-CTA cluster must run ALONG
+        # grid_x: launch cluster (cluster_n, 1, 1). The kernel-internal
+        # cluster_layout_vmnk stays the logical (cluster_m, cluster_n, 1) =
+        # (1, 2, 1) so the A mcast mask (mode 2 = N) and block_idx_in_cluster
+        # -> N-coord mapping remain correct.
+        if tcgen05_n_only_cluster:
+            df.cute_state.cluster_shape = (tcgen05_cluster_n, 1, 1)
+        else:
+            df.cute_state.cluster_shape = (tcgen05_cluster_m, tcgen05_cluster_n, 1)
     tcgen05_acc_stage_count_value = _tcgen05_config_int(
         df.config, "tcgen05_acc_stages", _tcgen05_acc_stage_count(bn)
     )
@@ -2743,10 +2810,15 @@ def _emit_mma_pipeline(
     #   - cluster_m=2 cluster_n=2 V=2: 2 + 1 - 1 = 2 (the cluster_n=2 fix)
     #   - cluster_m=1 cluster_n=1 V=1 (no use_2cta): 1 (collapses to single
     #     CTA; no multicast)
-    if tcgen05_is_two_cta and tcgen05_cluster_n > 1:
+    #   - cluster_m=1 cluster_n=2 V=1 (N-only CtaGroup.ONE A-multicast):
+    #     num_mcast_ctas_a = cluster_n = 2, num_mcast_ctas_b = cluster_m / 1 =
+    #     1 -> 2 + 1 - 1 = 2. Both N-CTAs receive the multicast A and each
+    #     arrives once on the AB empty barrier; the producer waits for 2.
+    if (tcgen05_is_two_cta or tcgen05_n_only_cluster) and tcgen05_cluster_n > 1:
         # V=2 absorbs cluster_m into the cluster_layout_vmnk V dim; the
         # post-V CTAs along M (= cluster_m // V) carry the B multicast,
-        # while cluster_n CTAs along N carry the A multicast.
+        # while cluster_n CTAs along N carry the A multicast. CtaGroup.ONE
+        # keeps V=1, so cluster_m // V = cluster_m.
         v_for_mcast = 2 if tcgen05_is_two_cta else 1
         num_mcast_ctas_a = tcgen05_cluster_n
         num_mcast_ctas_b = max(1, tcgen05_cluster_m // v_for_mcast)
@@ -4160,6 +4232,10 @@ def _emit_mma_pipeline(
             tcgen05_use_tma_b_mcast_mask = (
                 tcgen05_use_tma_b_peer_mcast or tcgen05_use_tma_b_self_mcast
             )
+            # The N-only CtaGroup.ONE cluster (cluster_m=1, cluster_n=2)
+            # multicasts ONLY A across its 2 N-CTAs (mcast_mode=2). B is not
+            # multicast (cluster_m=1 => no M peers), so B keeps the plain
+            # per-CTA coord/layout (coord 0, make_layout(1)) and no B mask.
             if tcgen05_is_two_cta:
                 prefix.append(
                     statement_from_string(
@@ -4175,11 +4251,26 @@ def _emit_mma_pipeline(
                         "(0, None, 0, 0)).shape)"
                     )
                 )
+            elif tcgen05_n_only_cluster:
+                # A multicasts along the N axis (mode 2). The N-slice keeps
+                # the rank-4 (V,M,N,K) cluster_layout's N mode free; same
+                # spelling as the two-cta A path (the V mode is size 1 under
+                # CtaGroup.ONE). B uses the plain non-cluster layout.
+                prefix.append(
+                    statement_from_string(
+                        f"{tma_a_cta_layout} = cute.make_layout("
+                        f"cute.slice_({tcgen05_cluster_layout_vmnk}, "
+                        "(0, 0, None, 0)).shape)"
+                    )
+                )
+                prefix.append(
+                    statement_from_string(f"{tma_cta_layout} = cute.make_layout(1)")
+                )
             else:
                 prefix.append(
                     statement_from_string(f"{tma_cta_layout} = cute.make_layout(1)")
                 )
-            if tcgen05_cluster_m > 1 or tcgen05_is_two_cta:
+            if tcgen05_cluster_m > 1 or tcgen05_a_mcast_cluster:
                 prefix.append(
                     statement_from_string(
                         f"{tma_cta_rank_in_cluster} = cute.arch.make_warp_uniform("
@@ -4203,7 +4294,14 @@ def _emit_mma_pipeline(
                             f"{tma_b_cta_coord} = {tma_block_in_cluster_coord_vmnk}[1]"
                         )
                     )
-                if tcgen05_is_two_cta:
+                elif tcgen05_n_only_cluster:
+                    # A's coord is its N position in the cluster (mode 2).
+                    prefix.append(
+                        statement_from_string(
+                            f"{tma_a_cta_coord} = {tma_block_in_cluster_coord_vmnk}[2]"
+                        )
+                    )
+                if tcgen05_a_mcast_cluster:
                     prefix.append(
                         statement_from_string(
                             f"{tma_a_mcast_mask} = cute.nvgpu.cpasync.create_tma_multicast_mask("
@@ -4222,10 +4320,13 @@ def _emit_mma_pipeline(
                     )
             # tma_partition consumes the per-tile gA_part / gB_part, so the
             # resulting (tma_sA, tma_gA) / (tma_sB, tma_gB) are also per-tile.
-            tma_a_cta_coord_expr = tma_a_cta_coord if tcgen05_is_two_cta else "0"
+            # A uses the cluster coord/layout whenever it multicasts (two-cta
+            # OR the N-only cluster); B uses the cluster coord/layout only in
+            # the two-cta path (it is non-multicast in the N-only cluster).
+            tma_a_cta_coord_expr = tma_a_cta_coord if tcgen05_a_mcast_cluster else "0"
             tma_b_cta_coord_expr = tma_b_cta_coord if tcgen05_is_two_cta else "0"
             tma_a_cta_layout_expr = (
-                tma_a_cta_layout if tcgen05_is_two_cta else tma_cta_layout
+                tma_a_cta_layout if tcgen05_a_mcast_cluster else tma_cta_layout
             )
             tma_b_cta_layout_expr = (
                 tma_b_cta_layout if tcgen05_is_two_cta else tma_cta_layout
@@ -4341,6 +4442,7 @@ def _emit_mma_pipeline(
                     tma_b_mcast_mask=tma_b_mcast_mask,
                     is_two_cta=tcgen05_is_two_cta,
                     use_tma_b_mcast_mask=tcgen05_use_tma_b_mcast_mask,
+                    use_tma_a_mcast_mask=tcgen05_n_only_cluster,
                     skip_producer_acquire=diagnose_skip_ab_producer_acquire,
                     skip_producer_advance=diagnose_skip_ab_producer_advance,
                 )
@@ -4681,6 +4783,7 @@ def _emit_mma_pipeline(
                 scalar_load_a=scalar_load_a,
                 scalar_load_b=scalar_load_b,
                 cluster_n=tcgen05_cluster_n,
+                use_tma_a_mcast_mask=tcgen05_n_only_cluster,
                 static_full_tiles=tcgen05_static_full_tma_fast_path,
             )
             if tcgen05_use_tma_pipeline:
