@@ -59,8 +59,8 @@ def chunk_fwd_h(
     h_all = torch.empty([BH, N, D, DV], dtype=k.dtype, device=k.device)
 
     for tile_bh, tile_d, tile_dv in hl.tile([BH, D, DV], block_size=[1, None, None]):
-        h_acc = hl.zeros([tile_d, tile_dv], dtype=torch.float32)
         idx = tile_bh.id
+        h_acc = hl.zeros([tile_d, tile_dv], dtype=torch.float32)
 
         for i_t in hl.grid(N):
             h_all[idx, i_t, tile_d, tile_dv] = h_acc.to(h_all.dtype)
@@ -79,10 +79,12 @@ def chunk_fwd_o(
     h: torch.Tensor,
     scale: float,
 ) -> torch.Tensor:
-    """Per-chunk parallel output: o = scale * (q @ h + (q @ k^T).tril @ v).
+    """Per-chunk parallel output.
 
-    The output is linear in q, so scale factors out and is applied once on the
-    fp32 accumulator, letting the caller pass q unscaled.
+    o = scale * (q @ h + (q @ k^T).tril @ v).
+
+    The output is linear in q, so scale factors out and is applied once at the
+    end; q is passed unscaled.
 
     Args:
         q, k: [BHN, C, D]
@@ -150,8 +152,8 @@ def chunk_bwd_dh(
     dh_all = torch.empty([BH, N, D, DV], dtype=q.dtype, device=q.device)
 
     for tile_bh, tile_d, tile_dv in hl.tile([BH, D, DV], block_size=[1, None, None]):
-        dh_acc = hl.zeros([tile_d, tile_dv], dtype=torch.float32)
         idx = tile_bh.id
+        dh_acc = hl.zeros([tile_d, tile_dv], dtype=torch.float32)
 
         for i_t in hl.grid(N):
             i = N - 1 - i_t
