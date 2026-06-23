@@ -2110,6 +2110,25 @@ def _emit_mma_pipeline(
         and not tcgen05_pid_is_persistent
         and tcgen05_cluster_m == 1
     )
+    # For the single-padded-M-tile flat edge case the per-K full-tile predicate
+    # ``tcgen05_tma_full_tile`` is statically TRUE on every launched tile and K
+    # iteration: M is a single tile so ``m_offset`` is always 0 (``0 < m_size``),
+    # N divides ``bn`` (and ``2*bn`` under the N-only cluster) so every launched
+    # N tile is full, and K divides ``bk`` (``flat_m_edge_tma`` requires
+    # ``k_total_size % bk == 0``) so every K iter is full. The TMA descriptor is
+    # built with the real ``m_size`` and bounds-clamps the padded A stripe, so
+    # TMA carries the WHOLE mainloop. The per-K ``else:`` scalar-AB-fallback
+    # branch (a 4096/8192-element predicated scalar load loop) plus its two extra
+    # in-loop ``sync_threads()`` barriers are therefore provably DEAD code that
+    # only adds control flow and barrier stalls to the hot K-loop. Suppress that
+    # dead ``else`` emission while keeping the ``if tcgen05_tma_full_tile:`` taken
+    # path -- producer TMA (incl. the cluster_n=2 A multicast), consumer wait,
+    # MMA issue, and consumer release -- byte-identical. This does NOT switch to
+    # ``tcgen05_static_full_tma_fast_path`` (which drops the full-tile wrapper and
+    # is gated on ``tcgen05_static_full_tiles``, false here), so it leaves
+    # ``tcgen05_mixed_tma_scalar_fallback`` / the TMA-keep guard / the N-only
+    # A-multicast cluster (``tcgen05_n_only_cluster``) all untouched.
+    tcgen05_flat_m_edge_no_scalar_fallback = tcgen05_flat_m_edge_single_tile
     tcgen05_edge_scalar_fallback_needs_inter_smem_a = (
         tcgen05_mixed_tma_scalar_fallback
         and bk >= 128
@@ -2538,9 +2557,7 @@ def _emit_mma_pipeline(
     # where the SIMT store is faster. Gate the TMA store on m_size >= 32 so the
     # tiniest-M tile keeps the cheaper SIMT store.
     tcgen05_flat_m_edge_tma_store = (
-        tcgen05_flat_m_edge_single_tile
-        and not tcgen05_is_two_cta
-        and m_size >= 32
+        tcgen05_flat_m_edge_single_tile and not tcgen05_is_two_cta and m_size >= 32
     )
     # Flat kernels process one output tile per CTA, so the c_pipeline stage is
     # just the subtile index. Persistent kernels use a role-local tile counter
@@ -3875,8 +3892,7 @@ def _emit_mma_pipeline(
                 # baseline; the flat tiny-M store optimization does not depend on
                 # aux-TMA.
                 tma_store_handles_partial_tiles = (
-                    tcgen05_use_tma_store_epilogue
-                    and not tcgen05_flat_m_edge_tma_store
+                    tcgen05_use_tma_store_epilogue and not tcgen05_flat_m_edge_tma_store
                 )
                 aux_tma_needs_edge_routing = (
                     tcgen05_aux_tma_requested
@@ -5030,10 +5046,12 @@ def _emit_mma_pipeline(
                             tma_kloop_args,
                             include_scalar_fallback=(
                                 not tcgen05_static_full_tma_fast_path
+                                and not tcgen05_flat_m_edge_no_scalar_fallback
                             ),
                             sync_before_scalar_fallback=(
                                 tcgen05_sync_before_scalar_fallback
                                 and not tcgen05_static_full_tma_fast_path
+                                and not tcgen05_flat_m_edge_no_scalar_fallback
                             ),
                         )
                     )
@@ -5131,6 +5149,7 @@ def _emit_mma_pipeline(
                                 tma_kloop_args,
                                 include_scalar_fallback=(
                                     not tcgen05_static_full_tma_fast_path
+                                    and not tcgen05_flat_m_edge_no_scalar_fallback
                                 ),
                             )
                         )
