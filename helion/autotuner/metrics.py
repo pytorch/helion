@@ -3,11 +3,14 @@ from __future__ import annotations
 import dataclasses
 import functools
 import hashlib
+import logging
 import time
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from collections.abc import Callable
+
+    from .._compiler.device_ir import DeviceIR
 
 _post_autotune_hooks: list[Callable[[AutotuneMetrics], None]] = []
 
@@ -96,12 +99,16 @@ def _codegen_signature(settings: dict[str, object] | None) -> str:
 
 @dataclasses.dataclass
 class KernelMetadata:
-    """Per-run identity for the kernel being autotuned.
+    """Per-run identity for the autotuned kernel; a passive shell over its sources.
 
     Appended (one JSON record per run) to the ``<autotune_log>.meta.jsonl``
     sidecar that sits next to the per-config CSV telemetry. The CSV records each
     config and its result; this record provides the kernel context (source,
-    shapes, dtypes, hardware, settings) those rows join back to.
+    shapes, dtypes, hardware, settings) those rows join back to, plus the
+    config-independent ``ir_graph`` device-IR dump. ``ir_graph`` is extracted
+    lazily in :meth:`to_dict` from the held ``_device_ir`` (the dataset-only write
+    path), so the object itself just carries source references; it is a derived
+    artifact (a function of ``run_id``), excluded from the ``run_id`` hash.
 
     ``run_id`` is the single foreign key for an autotune *invocation*: a direct
     content hash of ``(kernel_source, codegen-settings signature, input_shapes,
@@ -122,6 +129,14 @@ class KernelMetadata:
     dtypes: str = ""
     hardware: str = ""
     settings: dict[str, object] | None = None
+    # Non-serialized source ref: the config-independent device IR. ir_graph is
+    # extracted from it lazily in to_dict() (the dataset-only write path at run
+    # end), keeping this object a passive shell. Excluded from run_id (a derived
+    # artifact, not identity); repr/compare/hash off so the large IR object never
+    # bloats repr or participates in dataclass equality/hashing.
+    _device_ir: DeviceIR | None = dataclasses.field(
+        default=None, repr=False, compare=False, hash=False
+    )
 
     @functools.cached_property
     def run_id(self) -> str:
@@ -132,6 +147,9 @@ class KernelMetadata:
         fields (so boundaries can't collide). Content-derived, so the same
         invocation yields the same ``run_id`` across processes and CI runs.
         """
+        # Hash exactly these five identity fields. The device IR (_device_ir) is
+        # intentionally NOT included: its ir_graph dump is a derived artifact (a
+        # function of run_id), not identity, so hashing it would be circular.
         payload = (
             f"{self.kernel_source}\x00{_codegen_signature(self.settings)}\x00"
             f"{self.input_shapes}\x00{self.dtypes}\x00{self.hardware}"
@@ -147,4 +165,29 @@ class KernelMetadata:
             "dtypes": self.dtypes,
             "hardware": self.hardware,
             "settings": self.settings,
+            "ir_graph": self._ir_graph(),
         }
+
+    def _ir_graph(self) -> dict[str, object] | None:
+        """Lazily extract the device-IR node-link dump (dataset-only, best-effort).
+
+        Called from :meth:`to_dict` at run end (after codegen). Safe to defer: the
+        autotune loop never mutates the original device IR -- codegen specializes
+        on copies (``DeviceIR.build_codegen_graphs``) -- so the dump matches a
+        pre-codegen extraction (block dims stay symbolic). Returns ``None`` when
+        there is no IR or extraction fails, so the telemetry write never breaks
+        autotuning.
+        """
+        if self._device_ir is None:
+            return None
+        from ._metadata.ir_features import extract_ir_graph
+
+        try:
+            return extract_ir_graph(self._device_ir)
+        except Exception:
+            # Best-effort: never break autotuning. Visible at HELION_AUTOTUNE_LOG_LEVEL
+            # =DEBUG so silent degradation (e.g. a changed _compiler API) is traceable.
+            logging.getLogger(__name__).debug(
+                "device-IR extraction failed; recording ir_graph=None", exc_info=True
+            )
+            return None
