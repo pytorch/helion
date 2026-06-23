@@ -865,13 +865,20 @@ class TestStreamingClassification(unittest.TestCase):
             helion.Config(block_sizes=[8, 8], pallas_loop_type="compact_worklist")
         )
 
+        # Ordered K/V stream from HBM via a nested emit_pipeline with double
+        # buffering -- reusing _pipeline_arg_indices, no new launcher API.
         self.assertIn("_pipeline_arg_indices=", code)
-        self.assertIn("pltpu.make_async_copy(k.at[pl.ds(kv_begin_ref[_wid]", code)
-        self.assertIn("pltpu.make_async_copy(v.at[pl.ds(kv_begin_ref[_wid]", code)
+        self.assertIn("pltpu.emit_pipeline(", code)
+        self.assertIn("pl.ds(kv_begin_ref[_wid]", code)
+        self.assertIn("pl.BoundedSlice(", code)
+        self.assertIn("pl.Buffered(buffer_count=2)", code)
         self.assertIn("_compact_aligned_arg_indices=", code)
-        self.assertNotIn("pltpu.make_async_copy(q.at", code)
-        self.assertNotIn("pltpu.make_async_copy(out.at", code)
-        self.assertNotIn("pl.multiple_of(kv_begin_ref[_wid]", code)
+        # The pipeline streams exactly the ordered K/V tensors (q/out are the
+        # compact tile -- aligned load / exact store -- and stay out of it).
+        self.assertIn(")(k, v)", code)
+        # No manual fori DMA, and the compact tile stays straight-line.
+        self.assertNotIn("pltpu.make_async_copy", code)
+        self.assertNotIn("lax.fori_loop", code)
 
     def test_dense_kv_owner_indexed_tensors_do_not_stream(self):
         qo = _offsets([12, 20, 5, 30])
@@ -888,6 +895,8 @@ class TestStreamingClassification(unittest.TestCase):
 
         self.assertNotIn("_pipeline_arg_indices=", code)
         self.assertNotIn("pltpu.make_async_copy", code)
+        # Dense-KV has no ordered axis, so no inner pipeline either.
+        self.assertNotIn("pltpu.emit_pipeline", code)
 
     def test_kv_owned_backward_shape_streams_ordered_q_like_loads(self):
         qo = _offsets([12, 20, 5, 30])
@@ -904,12 +913,16 @@ class TestStreamingClassification(unittest.TestCase):
             helion.Config(block_sizes=[8, 8], pallas_loop_type="compact_worklist")
         )
 
+        # Here the ordered axis is the q-like loop, so q and dO stream via the
+        # nested emit_pipeline; out is the compact exact-store and stays out.
         self.assertIn("_pipeline_arg_indices=", code)
-        self.assertIn("pltpu.make_async_copy(q.at[pl.ds(q_begin_ref[_wid]", code)
-        self.assertIn("pltpu.make_async_copy(dO.at[pl.ds(q_begin_ref[_wid]", code)
+        self.assertIn("pltpu.emit_pipeline(", code)
+        self.assertIn("pl.ds(q_begin_ref[_wid]", code)
+        self.assertIn("pl.Buffered(buffer_count=2)", code)
         self.assertIn("_compact_aligned_arg_indices=", code)
-        self.assertNotIn("pltpu.make_async_copy(out.at", code)
-        self.assertNotIn("pl.multiple_of(q_begin_ref[_wid]", code)
+        self.assertIn(")(q, dO)", code)
+        self.assertNotIn("pltpu.make_async_copy", code)
+        self.assertNotIn("lax.fori_loop", code)
 
 
 def _eager_dense_kv(q, k, v, qo):
@@ -1057,15 +1070,15 @@ class TestCompactWorklistNumerics(unittest.TestCase):
     """Device/interpret numerics for compact_worklist vs an eager ground truth.
 
     These are the device-side guards the host tests can't give: compact_worklist's
-    masked full-block ordered-overwrite store and its ordered inner ``fori`` loop
-    must reproduce the exact result of a plain per-sequence torch computation.
-    Runs on real TPU in CI and, via ``@skipUnlessPallas``, in pallas interpret
-    mode on CPU.
+    masked full-block ordered-overwrite store and its ordered inner loop (lowered
+    via ``emit_pipeline``) must reproduce the exact result of a plain per-sequence
+    torch computation.  Dense-KV (no ordered axis) runs in pallas interpret on
+    CPU; the fully-jagged ordered-loop cases are TPU-only (see per-test skips).
 
-    NB: the comparison is against an INDEPENDENT eager reference, not the
-    ``fori_loop`` lowering -- ``fori_loop`` miscompiles these jagged patterns in
-    interpret mode (verified: ~64.0 abs error vs eager), so it is not a sound
-    oracle here.  compact_worklist matches eager to float32 roundoff.
+    NB: the comparison is against an INDEPENDENT eager reference.  The ordered
+    inner loop's lowering miscompiles these jagged patterns in interpret mode
+    (verified: large abs error vs eager), so interpret is not a sound oracle for
+    it.  On real TPU, compact_worklist matches eager to bf16-matmul roundoff.
     """
 
     def test_dense_kv_unaligned_matches_eager(self):
@@ -1110,8 +1123,8 @@ class TestCompactWorklistNumerics(unittest.TestCase):
         self.assertEqual(tuple(out.shape), (0, H, D))
 
     @skipIfPallasInterpret(
-        "fori inner-loop (used by the ordered KV axis) miscompiles in pallas "
-        "interpret mode; this path is validated on real TPU"
+        "the ordered KV axis (emit_pipeline) miscompiles in pallas interpret "
+        "mode; this path is validated on real TPU"
     )
     def test_fully_jagged_with_empty_kv_matches_eager(self):
         # Ordered inner KV loop + an empty KV range (seq 2: kv_len==0) to exercise
@@ -1132,6 +1145,39 @@ class TestCompactWorklistNumerics(unittest.TestCase):
         )
         ref = _eager_fully_jagged(q.cpu(), k.cpu(), v.cpu(), qo, kvo)
         torch.testing.assert_close(out.cpu(), ref, rtol=2e-2, atol=2e-2)
+
+    @skipIfPallasInterpret(
+        "the ordered KV axis (emit_pipeline) miscompiles in pallas interpret "
+        "mode; this path is validated on real TPU"
+    )
+    def test_fully_jagged_long_kv_matches_eager(self):
+        # Long, jagged KV with several kvblock trips and non-divisible final
+        # tiles per sequence: exercises the double-buffered emit_pipeline
+        # accumulating carried state across many ordered iterations, with K/V
+        # streamed from HBM ([total_kv, H, D], D=128 lane-aligned).
+        #
+        # Compared by RELATIVE L2 (not element-wise assert_close): the long
+        # accumulation makes the output large-magnitude, so individual bf16
+        # elements drift O(1) in absolute terms and near-zero outputs blow up the
+        # pointwise rtol, while the normalized error stays at the bf16-matmul
+        # floor (~0.003).  A structural bug would be O(1) relative, not ~1e-3.
+        H, D, qblock, kvblock = 4, 128, 128, 64
+        qo = _offsets([130, 257, 64, 400])
+        kvo = _offsets([300, 191, 512, 33])  # 5/3/8/1 kvblock trips
+        lq, lkv = int(qo[-1]), int(kvo[-1])
+        torch.manual_seed(0)
+        q = torch.randn(lq, H, D, device=DEVICE, dtype=torch.bfloat16)
+        k = torch.randn(lkv, H, D, device=DEVICE, dtype=torch.bfloat16)
+        v = torch.randn(lkv, H, D, device=DEVICE, dtype=torch.bfloat16)
+        _, out = code_and_output(
+            _fully_jagged_kernel,
+            (q, k, v, qo.to(DEVICE), kvo.to(DEVICE)),
+            block_sizes=[qblock, kvblock],
+            pallas_loop_type="compact_worklist",
+        )
+        ref = _eager_fully_jagged(q.cpu(), k.cpu(), v.cpu(), qo, kvo).float()
+        rel_l2 = ((out.cpu().float() - ref).norm() / ref.norm()).item()
+        self.assertLess(rel_l2, 1e-2, f"relative L2 {rel_l2} exceeds 1e-2")
 
 
 @unittest.skipUnless(HAS_JAX, "jax not available")
