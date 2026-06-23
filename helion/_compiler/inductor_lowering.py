@@ -52,6 +52,7 @@ from .aten_lowering import aten_lowering_dispatch
 from .compile_environment import CompileEnvironment
 from .compile_environment import FixedBlockSizeSource
 from .compile_environment import _symint_expr
+from .compile_environment import _symint_sympy_expr
 from .device_function import VarInfo
 from .device_function import contains_only_block_size_symbols
 from .node_masking import inductor_masked_value
@@ -137,6 +138,8 @@ def prepare_node_lowering(
     if isinstance(
         val := node.meta["val"], (torch.SymInt, torch.SymFloat, torch.SymBool)
     ):
+        # SymBool's `_sympy_()` is a boolean rather than the Expr the field holds.
+        # pyrefly: ignore [bad-argument-type]
         node.meta["lowering"] = SympyExprLowering(val._sympy_())
         return
 
@@ -368,7 +371,7 @@ def to_symint(x: object) -> torch.SymInt | int:
 
 def _unpack_symint(x: torch.SymInt | int) -> sympy.Expr:
     if isinstance(x, torch.SymInt):
-        return x._sympy_()
+        return _symint_sympy_expr(x)
     if isinstance(x, int):
         # type: ignore [bad-return]
         return sympy.sympify(x)

@@ -312,7 +312,7 @@ class TestLLMGuidedSearch(TestCase):
                 results.append(
                     BenchmarkResult(
                         config=config,
-                        fn=lambda: None,
+                        fn=lambda *args, **kwargs: None,
                         perf=perf,
                         status="ok",
                         compile_time=0.01,
@@ -320,10 +320,32 @@ class TestLLMGuidedSearch(TestCase):
                 )
             return results
 
-        def fake_rebenchmark_population(self, members=None, *, desc="Rebenchmarking"):
-            del members
+        def fake_rebenchmark_population(
+            self,
+            members=None,
+            *,
+            desc="Rebenchmarking",
+            target_ms=200.0,
+            use_isolated=True,
+            confirm_suspicious=True,
+            use_interleaved=True,
+        ):
             rebenchmark_descs.append(desc)
             for member in self.population:
+                member.perfs.append(rebench_perf_by_key[repr(member.config)])
+
+        def fake_rebenchmark(
+            self,
+            members,
+            *,
+            desc="Rebenchmarking",
+            target_ms=200.0,
+            use_isolated=True,
+            confirm_suspicious=True,
+            use_interleaved=True,
+        ):
+            rebenchmark_descs.append(desc)
+            for member in members:
                 member.perfs.append(rebench_perf_by_key[repr(member.config)])
 
         with (
@@ -351,6 +373,12 @@ class TestLLMGuidedSearch(TestCase):
                 autospec=True,
                 side_effect=fake_rebenchmark_population,
             ),
+            patch.object(
+                LLMGuidedSearch,
+                "rebenchmark",
+                autospec=True,
+                side_effect=fake_rebenchmark,
+            ),
         ):
             best = search.autotune(skip_cache=True)
 
@@ -372,11 +400,16 @@ class TestLLMGuidedSearch(TestCase):
         self.assertEqual(benchmark_batches[2][1], [round1_sparse])
         self.assertEqual(
             rebenchmark_descs,
-            ["Round 0: verifying top configs", "Round 1: verifying top configs"],
+            [
+                "Round 0: verifying top configs",
+                "Round 1: verifying top configs",
+                "Final verification top 3 configs",
+            ],
         )
         self.assertEqual(search._autotune_metrics.num_configs_tested, 3)
         self.assertEqual(len(search._all_benchmark_results), 3)
         self.assertEqual(len(search.population), 3)
+        self.assertEqual(len(search._benchmarked_members), 3)
         self.assertEqual(search.best.perf, 2.5)
         self.assertEqual(dict(best), dict(round1_cfg))
         self.assertEqual(dict(search.best.config), dict(round1_cfg))

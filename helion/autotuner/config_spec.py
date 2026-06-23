@@ -6,6 +6,7 @@ import itertools
 import logging
 import math
 import operator
+import os
 from typing import TYPE_CHECKING
 from typing import Any
 from typing import Callable
@@ -23,6 +24,28 @@ from .._compat import supports_maxnreg
 from .._compat import supports_tensor_descriptor
 from .._compat import target_device_capability as get_target_device_capability
 from .._compat import warps_to_threads
+from .._compiler.cute.cute_flash import FLASH_CAUSAL_KV_ORDER_KEY
+from .._compiler.cute.cute_flash import FLASH_CAUSAL_LOOP_SPLIT_KEY
+from .._compiler.cute.cute_flash import FLASH_CONFIG_KEYS
+from .._compiler.cute.cute_flash import FLASH_E2E_FREQ_KEY
+from .._compiler.cute.cute_flash import FLASH_E2E_OFFSET0_KEY
+from .._compiler.cute.cute_flash import FLASH_E2E_OFFSET_KEY
+from .._compiler.cute.cute_flash import FLASH_E2E_RES_KEY
+from .._compiler.cute.cute_flash import FLASH_E2E_SCHEDULE_KEY
+from .._compiler.cute.cute_flash import FLASH_EPI_TMA_KEY
+from .._compiler.cute.cute_flash import FLASH_EXP2_IMPL_KEY
+from .._compiler.cute.cute_flash import FLASH_MASKED_E2E_SCHEDULE_KEY
+from .._compiler.cute.cute_flash import FLASH_ROLE_MAP_KEY
+from .._compiler.cute.cute_flash import FLASH_TOPOLOGY_KEY
+from .._compiler.cute.cute_flash import _flash_causal_hd64_seed_num_kv_supported
+from .._compiler.cute.cute_flash import _flash_causal_hd64_seed_offset0
+from .._compiler.cute.cute_flash import _flash_causal_hd64_seed_params
+from .._compiler.cute.cute_flash import _flash_e2e_offset_period
+from .._compiler.cute.cute_flash import _flash_e2e_schedule_default
+from .._compiler.cute.cute_flash import _flash_masked_e2e_schedule_params
+from .._compiler.cute.cute_flash import _flash_normalize_e2e_offset
+from .._compiler.cute.cute_flash import _flash_normalize_e2e_params
+from .._compiler.cute.cute_flash import _flash_parse_e2e_schedule
 from .._compiler.cute.tcgen05_config import CUTE_TCGEN05_DIAGNOSTIC_CONFIG_KEYS
 from .._compiler.cute.tcgen05_config import CUTE_TCGEN05_STRATEGY_CONFIG_KEYS
 from .._compiler.cute.tcgen05_config import CUTE_TCGEN05_TUNABLE_KEYS
@@ -256,6 +279,7 @@ BACKEND_SPECIFIC_KEYS: frozenset[str] = (
     BACKEND_TUNABLE_KEYS
     | _BACKEND_DIAGNOSTIC_CONFIG_KEYS
     | _BACKEND_STRATEGY_CONFIG_KEYS
+    | frozenset(FLASH_CONFIG_KEYS)
     | {
         "num_threads",
         "cute_vector_widths",
@@ -295,6 +319,7 @@ VALID_KEYS: frozenset[str] = frozenset(
         "epilogue_subtile",
         *_BACKEND_DIAGNOSTIC_CONFIG_KEYS,
         *_BACKEND_STRATEGY_CONFIG_KEYS,
+        *FLASH_CONFIG_KEYS,
     ]
 )
 # Loop types the autotuner searches by default for every Pallas inner loop.
@@ -440,6 +465,19 @@ class ConfigSpec:
         self.has_pallas_inner_loops: bool = False
         self.has_symbolic_or_data_dependent_bounds: bool = False
         self._cute_tcgen05_config = CuteTcgen05Config(self)
+        # CuTe flash-attention autotune surface gating (Tasks #25 + #28).
+        # Default False so the flash knobs never appear in the search surface
+        # and behavior is byte-identical to the env-only path. Set True when the
+        # flash detector fires (see ``lower_to_device_ir``). The shape needed to
+        # build the fragments (head_dim / num_kv) is captured at the same time.
+        self.cute_flash_search_enabled: bool = False
+        self._cute_flash_head_dim: int | None = None
+        self._cute_flash_num_kv: int | None = None
+        self._cute_flash_is_causal: bool = False
+        self._cute_flash_has_kv_tile_pruning: bool = False
+        self._cute_flash_requires_ws_overlap: bool = False
+        self._cute_flash_small_biased_candidate: bool = False
+        self._cute_flash_block_size_targets: dict[int, int] = {}
         self.compiler_default_config: helion.Config | None = None
         self.compiler_seed_configs: list[helion.Config] = []
         self.autotuner_heuristics: list[str] = []
@@ -587,6 +625,320 @@ class ConfigSpec:
     def cute_tcgen05_matmul_has_non_tcgen05_operand(self, value: bool) -> None:
         self._cute_tcgen05_config.matmul_has_non_tcgen05_operand = value
 
+    def _normalize_cute_flash(
+        self, config: dict[str, object], *, fix_invalid: bool
+    ) -> None:
+        """Normalize the flash-attention knobs (Tasks #25 + #28).
+
+        Only runs when ``cute_flash_search_enabled`` is set (the flash detector
+        fired). Mirrors ``CuteTcgen05Config.normalize_strategy``: each key in
+        ``FLASH_CONFIG_KEYS`` is validated against its fragment's choices and
+        defaulted (to the fragment default = env/shape-resolved current value)
+        when absent. When the flag is off this is a no-op so configs never grow
+        the flash keys and behavior is byte-identical to today.
+        """
+        if not self.cute_flash_search_enabled:
+            return
+        assert self._cute_flash_head_dim is not None
+        assert self._cute_flash_num_kv is not None
+        from .._compiler.cute.cute_flash import flash_autotune_fragments
+
+        block_size_targets = self._cute_flash_block_size_target_list()
+        if fix_invalid:
+            config["block_sizes"] = list(block_size_targets)
+            config["pid_type"] = "flat"
+            self._normalize_cute_flash_default_sequence(config, "l2_groupings", 1)
+            self._normalize_cute_flash_default_sequence(config, "num_threads", 0)
+            self._normalize_cute_flash_default_sequence(config, "cute_vector_widths", 1)
+            self._normalize_cute_flash_default_loop_orders(config)
+            config.pop("epilogue_subtile", None)
+        elif not self._is_cute_flash_config_envelope(config, block_size_targets):
+            return
+
+        if self._cute_flash_requires_ws_overlap:
+            config[FLASH_TOPOLOGY_KEY] = "ws_overlap"
+            topology_override = "ws_overlap"
+        else:
+            valid_manual_topologies = {"fa4", "ws_overlap"}
+            topology_value = config.get(FLASH_TOPOLOGY_KEY)
+            topology_override = (
+                topology_value if topology_value in valid_manual_topologies else None
+            )
+        fragments = flash_autotune_fragments(
+            self._cute_flash_head_dim,
+            self._cute_flash_num_kv,
+            is_causal=self._cute_flash_is_causal,
+            has_kv_tile_pruning=self._cute_flash_has_kv_tile_pruning,
+            requires_ws_overlap=self._cute_flash_requires_ws_overlap,
+            small_biased_candidate=self._cute_flash_small_biased_candidate,
+            topology_override=cast("str | None", topology_override),
+        )
+        e2e_offset_was_present = FLASH_E2E_OFFSET_KEY in config
+        e2e_offset0_was_present = FLASH_E2E_OFFSET0_KEY in config
+        e2e_offset_keys = (FLASH_E2E_OFFSET_KEY, FLASH_E2E_OFFSET0_KEY)
+        for key, fragment in fragments.items():
+            choices = cast("EnumFragment", fragment).choices
+            if key in config:
+                if config[key] not in choices:
+                    if key in e2e_offset_keys:
+                        # Legacy explicit e2e frequency overrides can make offsets
+                        # outside the autotune fragment valid. Validate the effective
+                        # cadence after the e2e keys have been normalized below.
+                        pass
+                    elif fix_invalid:
+                        config[key] = fragment.default()
+                    else:
+                        raise InvalidConfig(
+                            f"{key} must be one of {list(choices)!r}, "
+                            f"got {config[key]!r}"
+                        )
+            else:
+                if key not in e2e_offset_keys:
+                    config[key] = fragment.default()
+        effective_topology = cast("str", config[FLASH_TOPOLOGY_KEY])
+        if effective_topology == "fa4" and self._cute_flash_num_kv % 2 != 0:
+            effective_topology = "ws_overlap"
+        if fix_invalid:
+            config[FLASH_TOPOLOGY_KEY] = effective_topology
+        if effective_topology != "fa4":
+            config[FLASH_ROLE_MAP_KEY] = "helion"
+            config[FLASH_EPI_TMA_KEY] = False
+            config[FLASH_MASKED_E2E_SCHEDULE_KEY] = "inherit"
+            config[FLASH_CAUSAL_KV_ORDER_KEY] = "ascending"
+            config[FLASH_CAUSAL_LOOP_SPLIT_KEY] = False
+        causal_kv_order = config.get(FLASH_CAUSAL_KV_ORDER_KEY)
+        if not self._cute_flash_is_causal or causal_kv_order != "descending":
+            config[FLASH_CAUSAL_LOOP_SPLIT_KEY] = False
+        e2e_schedule_default = (
+            "8/2"
+            if (
+                effective_topology == "fa4"
+                and self._cute_flash_is_causal
+                and self._cute_flash_head_dim == 64
+                and _flash_causal_hd64_seed_num_kv_supported(self._cute_flash_num_kv)
+            )
+            else _flash_e2e_schedule_default(
+                effective_topology, self._cute_flash_head_dim
+            )
+        )
+        exp2_impl, e2e_freq, e2e_res = _flash_parse_e2e_schedule(
+            str(config[FLASH_E2E_SCHEDULE_KEY]), e2e_schedule_default
+        )
+        if FLASH_EXP2_IMPL_KEY in config:
+            exp2_impl = str(config[FLASH_EXP2_IMPL_KEY])
+        if FLASH_E2E_FREQ_KEY in config:
+            e2e_freq = cast("int", config[FLASH_E2E_FREQ_KEY])
+        if FLASH_E2E_RES_KEY in config:
+            e2e_res = cast("int", config[FLASH_E2E_RES_KEY])
+        _impl, e2e_freq, e2e_res, _schedule = _flash_normalize_e2e_params(
+            exp2_impl,
+            e2e_freq,
+            e2e_res,
+            e2e_schedule_default,
+        )
+        masked_e2e_schedule = str(config.get(FLASH_MASKED_E2E_SCHEDULE_KEY, "inherit"))
+        _masked_schedule, masked_e2e_freq, masked_e2e_res = (
+            _flash_masked_e2e_schedule_params(
+                masked_e2e_schedule,
+                e2e_schedule_default,
+                e2e_freq,
+                e2e_res,
+            )
+        )
+        if not self._cute_flash_is_causal:
+            masked_e2e_freq = e2e_freq
+            masked_e2e_res = e2e_res
+        e2e_offset_period = _flash_e2e_offset_period(
+            e2e_freq,
+            e2e_res,
+            masked_e2e_freq,
+            masked_e2e_res,
+        )
+        if (
+            e2e_offset_period > 0
+            and effective_topology == "fa4"
+            and self._cute_flash_head_dim == 64
+        ):
+            if self._cute_flash_is_causal and _flash_causal_hd64_seed_num_kv_supported(
+                self._cute_flash_num_kv
+            ):
+                schedule_default_offset = (
+                    _flash_causal_hd64_seed_params(self._cute_flash_num_kv)[0]
+                    % e2e_offset_period
+                )
+            else:
+                split_default_freq = e2e_freq if e2e_res > 0 else masked_e2e_freq
+                schedule_default_offset = split_default_freq // 8
+        else:
+            schedule_default_offset = 0
+        default_offset = schedule_default_offset
+        env_offset = os.environ.get("HELION_CUTE_FLASH_E2E_OFFSET")
+        if env_offset is not None:
+            default_offset = int(env_offset)
+            if e2e_offset_period == 0:
+                default_offset = 0
+            elif default_offset < 0:
+                default_offset = schedule_default_offset
+            else:
+                default_offset %= e2e_offset_period
+        if not e2e_offset_was_present:
+            config[FLASH_E2E_OFFSET_KEY] = default_offset
+        default_offset0 = (
+            _flash_causal_hd64_seed_offset0(self._cute_flash_num_kv)
+            if (
+                e2e_offset_period > 0
+                and effective_topology == "fa4"
+                and self._cute_flash_is_causal
+                and self._cute_flash_head_dim == 64
+                and _flash_causal_hd64_seed_num_kv_supported(self._cute_flash_num_kv)
+            )
+            else 0
+        )
+        env_offset0 = os.environ.get("HELION_CUTE_FLASH_E2E_OFFSET0")
+        if env_offset0 is not None:
+            env_offset0_value = int(env_offset0)
+            if e2e_offset_period == 0:
+                default_offset0 = 0
+            elif env_offset0_value < 0:
+                default_offset0 %= e2e_offset_period
+            else:
+                default_offset0 = env_offset0_value % e2e_offset_period
+        if not e2e_offset0_was_present:
+            config[FLASH_E2E_OFFSET0_KEY] = default_offset0
+        for key, default in (
+            (FLASH_E2E_OFFSET_KEY, default_offset),
+            (FLASH_E2E_OFFSET0_KEY, default_offset0),
+        ):
+            e2e_offset_value = config[key]
+            if not isinstance(e2e_offset_value, int):
+                if fix_invalid:
+                    config[key] = default
+                    e2e_offset_value = default
+                else:
+                    raise InvalidConfig(
+                        f"{key} must be an integer, got {e2e_offset_value!r}"
+                    )
+            e2e_offset = e2e_offset_value
+            e2e_offset_invalid = (
+                e2e_offset != 0
+                if e2e_offset_period == 0
+                else e2e_offset < 0 or e2e_offset >= e2e_offset_period
+            )
+            if e2e_offset_invalid:
+                if fix_invalid:
+                    config[key] = _flash_normalize_e2e_offset(
+                        e2e_offset, default, e2e_offset_period
+                    )
+                else:
+                    expected = (
+                        [0]
+                        if e2e_offset_period == 0
+                        else list(range(e2e_offset_period))
+                    )
+                    raise InvalidConfig(
+                        f"{key} must be one of {expected!r} for "
+                        f"{FLASH_E2E_SCHEDULE_KEY}={config[FLASH_E2E_SCHEDULE_KEY]!r}, "
+                        f"got {e2e_offset!r}"
+                    )
+
+    def enable_cute_flash_search(
+        self,
+        *,
+        head_dim: int,
+        num_kv: int,
+        block_size_targets: Mapping[int, int],
+        is_causal: bool = False,
+        has_kv_tile_pruning: bool = False,
+        requires_ws_overlap: bool = False,
+        small_biased_candidate: bool = False,
+    ) -> None:
+        self.cute_flash_search_enabled = True
+        self._cute_flash_head_dim = head_dim
+        self._cute_flash_num_kv = num_kv
+        self._cute_flash_is_causal = is_causal
+        self._cute_flash_has_kv_tile_pruning = has_kv_tile_pruning
+        self._cute_flash_requires_ws_overlap = requires_ws_overlap
+        self._cute_flash_small_biased_candidate = small_biased_candidate
+        self._cute_flash_block_size_targets = dict(block_size_targets)
+        for block_id, target in block_size_targets.items():
+            spec = self.block_sizes.block_id_lookup(block_id)
+            spec.autotuner_min = target
+            spec.max_size = target
+
+    def _pre_normalize_cute_flash_block_sizes(self, config: dict[str, object]) -> None:
+        if not self.cute_flash_search_enabled or "block_sizes" not in config:
+            return
+        block_size_targets = self._cute_flash_block_size_target_list()
+        value = config["block_sizes"]
+        raw_block_sizes = [*value] if isinstance(value, (list, tuple)) else [value]
+        if raw_block_sizes == block_size_targets:
+            return
+        config["block_sizes"] = list(block_size_targets)
+
+    def _cute_flash_block_size_target_list(self) -> list[int]:
+        targets: list[int | None] = [None] * len(self.block_sizes)
+        for block_id, target in self._cute_flash_block_size_targets.items():
+            targets[self.block_sizes.block_id_to_index(block_id)] = target
+        if any(target is None for target in targets):
+            raise InvalidConfig(
+                "CuTe flash attention search has incomplete block sizes"
+            )
+        return [target for target in targets if target is not None]
+
+    def _normalize_cute_flash_default_sequence(
+        self,
+        config: dict[str, object],
+        key: str,
+        default: object,
+    ) -> None:
+        value = config.get(key)
+        if not value:
+            config.pop(key, None)
+            return
+        if not isinstance(value, list) or any(item != default for item in value):
+            config.pop(key, None)
+            return
+        config.pop(key, None)
+
+    def _normalize_cute_flash_default_loop_orders(
+        self, config: dict[str, object]
+    ) -> None:
+        value = config.get("loop_orders")
+        if not value:
+            config.pop("loop_orders", None)
+            return
+        defaults = [spec._fill_missing() for spec in self.loop_orders]
+        if value != defaults:
+            config.pop("loop_orders", None)
+            return
+        config.pop("loop_orders", None)
+
+    def _is_cute_flash_config_envelope(
+        self, config: dict[str, object], block_size_targets: list[int]
+    ) -> bool:
+        if config.get("block_sizes") != block_size_targets:
+            return False
+        if config.get("pid_type", "flat") != "flat":
+            return False
+        if "epilogue_subtile" in config:
+            return False
+        for key, default in (
+            ("l2_groupings", 1),
+            ("num_threads", 0),
+            ("cute_vector_widths", 1),
+        ):
+            value = config.get(key)
+            if value and (
+                not isinstance(value, list) or any(item != default for item in value)
+            ):
+                return False
+        loop_orders = config.get("loop_orders")
+        if loop_orders:
+            defaults = [spec._fill_missing() for spec in self.loop_orders]
+            if loop_orders != defaults:
+                return False
+        return True
+
     @property
     def _tcgen05_cluster_m_search_choices(self) -> tuple[int, ...] | None:
         return self._cute_tcgen05_config.cluster_m_search_choices
@@ -674,7 +1026,23 @@ class ConfigSpec:
         return self._cute_tcgen05_config._c_input_seed_config()
 
     def autotune_seed_configs(self) -> list[helion.Config]:
-        return self._cute_tcgen05_config.autotune_seed_configs()
+        seeds = self._cute_tcgen05_config.autotune_seed_configs()
+        if self.backend_name == "cute" and self.cute_flash_search_enabled:
+            from .._compiler.cute.cute_flash import flash_attention_seed_configs
+
+            assert self._cute_flash_head_dim is not None
+            seeds.extend(
+                flash_attention_seed_configs(
+                    self._cute_flash_head_dim,
+                    self._cute_flash_num_kv,
+                    is_causal=self._cute_flash_is_causal,
+                    has_kv_tile_pruning=self._cute_flash_has_kv_tile_pruning,
+                    requires_ws_overlap=self._cute_flash_requires_ws_overlap,
+                    small_biased_candidate=self._cute_flash_small_biased_candidate,
+                    block_size_targets=self._cute_flash_block_size_target_list(),
+                )
+            )
+        return seeds
 
     def _fix_tcgen05_cluster_m2_search_config(self, config: dict[str, object]) -> None:
         self._cute_tcgen05_config._fix_cluster_m2_search_config(config)
@@ -739,6 +1107,7 @@ class ConfigSpec:
         allow_cluster_m2_search: bool = False,
         cluster_m2_static_k: int | None = None,
         allow_cluster_m2_edge_k_tail_family: bool = False,
+        allow_cluster_m2_fp8_small_grid: bool = False,
         ab_stages_three_dtype_bytes: int | None = None,
         ab_stages_three_device: torch.device | None = None,
     ) -> None:
@@ -747,6 +1116,7 @@ class ConfigSpec:
             allow_cluster_m2_search=allow_cluster_m2_search,
             cluster_m2_static_k=cluster_m2_static_k,
             allow_cluster_m2_edge_k_tail_family=allow_cluster_m2_edge_k_tail_family,
+            allow_cluster_m2_fp8_small_grid=allow_cluster_m2_fp8_small_grid,
             ab_stages_three_dtype_bytes=ab_stages_three_dtype_bytes,
             ab_stages_three_device=ab_stages_three_device,
         )
@@ -882,6 +1252,8 @@ class ConfigSpec:
                         f"Unsupported config keys for backend {self.backend_name!r}: {backend_specific}"
                     )
         provided_keys = set(config)
+        if _fix_invalid:
+            self._pre_normalize_cute_flash_block_sizes(config)
 
         for name, mapping, flatten in [
             ("block_sizes", self.block_sizes, True),
@@ -1178,6 +1550,7 @@ class ConfigSpec:
                 config,
                 fix_invalid=_fix_invalid,
             )
+            self._normalize_cute_flash(config, fix_invalid=_fix_invalid)
 
         if self.supports_config_key("num_sm_multiplier"):
             # Validate num_sm_multiplier is a power of two in range
@@ -1474,6 +1847,23 @@ class ConfigSpec:
         if self.backend_name == "cute":
             if self.cute_tcgen05_search_enabled:
                 fields.update(self._cute_tcgen05_config.flat_fields())
+            elif self.cute_flash_search_enabled:
+                from .._compiler.cute.cute_flash import flash_autotune_fragments
+
+                assert self._cute_flash_head_dim is not None
+                assert self._cute_flash_num_kv is not None
+                fields.update(
+                    flash_autotune_fragments(
+                        self._cute_flash_head_dim,
+                        self._cute_flash_num_kv,
+                        is_causal=self._cute_flash_is_causal,
+                        has_kv_tile_pruning=self._cute_flash_has_kv_tile_pruning,
+                        requires_ws_overlap=self._cute_flash_requires_ws_overlap,
+                        small_biased_candidate=(
+                            self._cute_flash_small_biased_candidate
+                        ),
+                    )
+                )
             elif self.supports_config_key("num_threads"):
                 fields["num_threads"] = self.num_threads
                 # Universal pid emission honors ``loop_orders`` (the
@@ -1503,7 +1893,10 @@ class ConfigSpec:
                     and len(self.cute_vector_widths) > 0
                 ):
                     fields["cute_vector_widths"] = self.cute_vector_widths
-            if self.epilogue_subtile_autotune_choices is not None:
+            if (
+                not self.cute_flash_search_enabled
+                and self.epilogue_subtile_autotune_choices is not None
+            ):
                 fields["epilogue_subtile"] = EnumFragment(
                     choices=self.epilogue_subtile_autotune_choices
                 )

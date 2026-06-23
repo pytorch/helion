@@ -4,7 +4,6 @@ import ast
 import contextlib
 import dataclasses
 import functools
-import hashlib
 import inspect
 import itertools
 import logging
@@ -44,6 +43,7 @@ from .._compiler.ast_extension import unparse
 from .._compiler.autotuner_heuristics import compiler_seed_configs
 from .._compiler.compile_environment import CompileEnvironment
 from .._compiler.compile_environment import TensorDescriptorLayoutGuard
+from .._compiler.compile_environment import _symint_free_symbols
 from .._compiler.compile_environment import (
     tensor_descriptor_layout_signature_from_strides,
 )
@@ -239,36 +239,6 @@ class Kernel(Generic[_R]):
             from ._tpu_compile_capture import register_decoration_op
 
             self._capture_op = register_decoration_op(self)
-
-    def _settings_signature(self) -> str:
-        """Return a stable string of settings that influence Triton codegen.
-
-        Mirrors the settings captured by
-        :meth:`BoundKernel.format_kernel_decorator` so the kernel id reflects
-        the same code-generation-affecting knobs.
-        """
-        parts = [f"static_shapes={self.settings.static_shapes}"]
-        if self.settings.index_dtype is not None:
-            parts.append(f"index_dtype={self.settings.index_dtype}")
-        return ", ".join(parts)
-
-    @functools.cache  # noqa: B019
-    def kernel_id(self) -> str:
-        """
-        Return a stable, content-derived identifier for this kernel.
-
-        The id is the SHA-256 hash of the kernel source together with the
-        settings that influence Triton code generation (see
-        :meth:`_settings_signature`). Because it is derived purely from content,
-        it is stable across processes and runs, making it suitable as a foreign
-        key for grouping telemetry rows by kernel during analysis.
-
-        Raises ``OSError`` if the source cannot be located (e.g. functions
-        defined in an interactive REPL or generated dynamically); see
-        :meth:`kernel_source`.
-        """
-        payload = self.kernel_source() + self._settings_signature()
-        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
     @functools.cache  # noqa: B019
     def kernel_source(self) -> str:
@@ -661,10 +631,10 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
                 for dim in getattr(arg, "_dynamo_static_indices", ()):
                     size = fake_arg.size(dim)
                     if isinstance(size, torch.SymInt):
-                        self.env.specialized_vars.update(size._sympy_().free_symbols)
+                        self.env.specialized_vars.update(_symint_free_symbols(size))
 
     @property
-    def env(self) -> CompileEnvironment:
+    def env(self) -> CompileEnvironment:  # pyrefly: ignore[bad-override]
         return self._env
 
     @property

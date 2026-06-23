@@ -2508,7 +2508,7 @@ class FlattenedTileStrategy(BlockSizeTileStrategy):
         super().__init__(fn, block_ids, block_size, loop_order)
         env = CompileEnvironment.current()
         if not env.backend.force_tile_mask() and env.known_multiple(
-            functools.reduce(
+            functools.reduce(  # pyrefly: ignore[incompatible-overload-residual]
                 operator.mul, [env.block_sizes[i].numel for i in block_ids]
             ),
             block_size,

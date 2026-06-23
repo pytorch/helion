@@ -114,6 +114,12 @@ def skipIfFn(
     wraps setUp to check the skip condition before each test runs.
     """
 
+    if not isinstance(reason, str):
+        raise TypeError(
+            f"Decorator using skipIfFn requires a reason string argument, got {type(reason).__name__}. "
+            "Make sure to call the decorator with parentheses, e.g. @decorator('reason') or @decorator()"
+        )
+
     def decorator(test_item: Callable) -> Callable:
         if isinstance(test_item, type):
             # For classes: wrap setUp to check skip condition at test execution time
@@ -391,12 +397,14 @@ def default_cute_mma_support(
     supported_impls: tuple[str, ...] = ("universal", "warp", "tcgen05"),
     warp_f16bf16: bool = True,
     tcgen05_f16bf16: bool = True,
+    tcgen05_f8: bool = True,
 ) -> SimpleNamespace:
     """Return a ``get_cute_mma_support()`` mock with tcgen05-on defaults."""
     return SimpleNamespace(
         supported_impls=supported_impls,
         warp_f16bf16=warp_f16bf16,
         tcgen05_f16bf16=tcgen05_f16bf16,
+        tcgen05_f8=tcgen05_f8,
     )
 
 
@@ -1280,6 +1288,7 @@ def run_example(
                     )
 
                     if baseline_grad is not None:
+                        assert tensor.grad is not None
                         torch.testing.assert_close(
                             tensor.grad.to(torch.float32),
                             baseline_grad.to(torch.float32),

@@ -3,7 +3,6 @@ from __future__ import annotations
 import abc
 import datetime
 import functools
-import hashlib
 from itertools import count
 from itertools import starmap
 import math
@@ -28,9 +27,10 @@ from .. import exc
 from ..runtime.precompile_shim import already_compiled
 from ..runtime.precompile_shim import already_compiled_fail
 from ..runtime.precompile_shim import make_precompiler
-from .accuracy import _FP8_DTYPES
-from .accuracy import _assert_close
-from .accuracy_job import AccuracyCheckJob
+from .accuracy import assert_close as _assert_close
+from .accuracy import is_fp8_dtype
+from .benchmark_job import AccuracyCheckJob
+from .benchmark_job import AccuracyCheckResult
 from .benchmark_job import BenchmarkJob
 from .benchmark_worker import BenchmarkSubprocessError
 from .benchmark_worker import BenchmarkWorker
@@ -333,19 +333,6 @@ class LocalBenchmarkProvider(BenchmarkProvider):
         )
         self._jobs = self._decide_num_jobs()
 
-    def _sample_id(self, config: Config) -> str:
-        """Return a stable per-(kernel, config) id for telemetry rows.
-
-        Computed as ``sha256(kernel_source + decorator(config))`` so the same
-        kernel benchmarked with the same config produces the same id across
-        runs, enabling label aggregation/dedup for the cost-model dataset.
-        """
-        payload = (
-            self._autotune_metrics.kernel_source
-            + self.kernel.format_kernel_decorator(config, self.settings)
-        )
-        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
-
     def _compute_baseline(
         self,
     ) -> tuple[object, Sequence[int], Sequence[object] | None]:
@@ -454,7 +441,7 @@ class LocalBenchmarkProvider(BenchmarkProvider):
 
         # Only apply strict tolerances if ALL dtypes are fp8
         # Mixed dtypes (fp8 + fp32) would be too strict with atol=0.0, rtol=0.0
-        all_dtypes_are_fp8 = dtypes and all(dtype in _FP8_DTYPES for dtype in dtypes)
+        all_dtypes_are_fp8 = dtypes and all(is_fp8_dtype(dtype) for dtype in dtypes)
 
         if all_dtypes_are_fp8:
             # All dtypes are fp8 - use bitwise comparison
@@ -542,21 +529,10 @@ class LocalBenchmarkProvider(BenchmarkProvider):
             args_path = os.path.join(self._precompile_tmpdir.name, "args.pt")
             torch.save(self.args, args_path)
             self._precompile_args_path = args_path
-            # Only the worker accuracy job reads the baseline, so skip writing it
-            # unless that job will run: subprocess benchmarking on, the check on,
-            # and no custom fn forcing the in-process path.
-            if (
-                self._subprocess_benchmark_enabled()
-                and self.settings.autotune_accuracy_check
-                and self.settings.autotune_baseline_accuracy_check_fn is None
-            ):
-                baseline_path = os.path.join(
-                    self._precompile_tmpdir.name, "baseline.pt"
-                )
-                torch.save(self._baseline_output, baseline_path)
-                self._precompile_baseline_path = baseline_path
-            else:
-                self._precompile_baseline_path = None
+        if self._subprocess_accuracy_check_enabled():
+            baseline_path = os.path.join(self._precompile_tmpdir.name, "baseline.pt")
+            torch.save(self._baseline_output, baseline_path)
+            self._precompile_baseline_path = baseline_path
 
     def _next_precompile_result_path(self) -> str:
         """Return a fresh path for a precompile result file."""
@@ -619,6 +595,19 @@ class LocalBenchmarkProvider(BenchmarkProvider):
         if backend is None or backend.get_do_bench() is None:
             return True
         return self._subprocess_benchmark_uses_wall_clock()
+
+    def _subprocess_accuracy_check_enabled(self) -> bool:
+        """Default accuracy checks can run in the same killable worker.
+
+        Custom accuracy callbacks and mutated-argument checks can close over
+        arbitrary process-local state, so those remain on the in-process path.
+        """
+        return (
+            self.settings.autotune_accuracy_check
+            and self.settings.autotune_baseline_accuracy_check_fn is None
+            and len(self.mutated_arg_indices) == 0
+            and self._subprocess_benchmark_enabled()
+        )
 
     def _validate_against_baseline(
         self, config: Config, output: object, args: Sequence[object]
@@ -811,35 +800,31 @@ class LocalBenchmarkProvider(BenchmarkProvider):
             status: Literal[
                 "ok", "error", "timeout", "peer_compilation_fail", "filtered"
             ]
-            if all(
-                all_gather_object(
-                    is_working,
-                    process_group_name=self.kernel.env.process_group_name,
-                )
-            ):
-                sample_id = self._sample_id(config)
+            # config_id is None when no log sink is active (skip recording). The
+            # started and result rows share it so they join to one config, and
+            # every config that reaches the benchmark loop is logged -- including
+            # ones that never benchmark because they (or a peer) failed to compile.
+            config_id = self.log.register_config(config)
+            if config_id is not None:
                 self.log.record_autotune_entry(
                     AutotuneLogEntry(
                         generation=self._autotune_metrics.num_generations,
                         status="started",
                         perf_ms=None,
                         compile_time=compile_time,
+                        config_id=config_id,
                         config=config,
-                        sample_id=sample_id,
                     )
                 )
+            if all(
+                all_gather_object(
+                    is_working,
+                    process_group_name=self.kernel.env.process_group_name,
+                )
+            ):
                 perf = self._benchmark_function(config, fn)
                 status = "ok" if math.isfinite(perf) else "error"
-                self.log.record_autotune_entry(
-                    AutotuneLogEntry(
-                        generation=self._autotune_metrics.num_generations,
-                        status=status,
-                        perf_ms=perf if math.isfinite(perf) else None,
-                        compile_time=compile_time,
-                        config=config,
-                        sample_id=sample_id,
-                    )
-                )
+                recorded_perf = perf if math.isfinite(perf) else None
                 results[valid_indices[index]] = BenchmarkResult(
                     config=config,
                     fn=fn,
@@ -851,12 +836,24 @@ class LocalBenchmarkProvider(BenchmarkProvider):
                 status = "timeout" if reason == "timeout" else "error"
                 if is_working:
                     status = "peer_compilation_fail"
+                recorded_perf = None
                 results[valid_indices[index]] = BenchmarkResult(
                     config=config,
                     fn=fn,
                     perf=inf,
                     status=status,
                     compile_time=compile_time,
+                )
+            if config_id is not None:
+                self.log.record_autotune_entry(
+                    AutotuneLogEntry(
+                        generation=self._autotune_metrics.num_generations,
+                        status=status,
+                        perf_ms=recorded_perf,
+                        compile_time=compile_time,
+                        config_id=config_id,
+                        config=config,
+                    )
                 )
         return results
 
@@ -892,7 +889,8 @@ class LocalBenchmarkProvider(BenchmarkProvider):
 
         # precompile in the current process for distributed kernels.
         # The reason we need this is due to some tricky distributed kernels
-        # like https://gist.github.com/shunting314/81f13ce00f835b21ab6466e21454b7c5 . We specialize the RANK argument for each GPU,
+        # like https://gist.github.com/shunting314/81f13ce00f835b21ab6466e21454b7c5 .
+        # We specialize the RANK argument for each GPU,
         # some rank may get out of resource errors while others don't
         # due to the specialization.
         #
@@ -1091,13 +1089,10 @@ class LocalBenchmarkProvider(BenchmarkProvider):
             self._autotune_metrics.num_compile_failures += 1
             return inf
 
-        # Run the accuracy check in the worker too: a config can pass timing and
-        # still crash here, and a crash must not poison the parent CUDA context.
         if self.settings.autotune_accuracy_check:
             try:
-                passed = self._run_subprocess_accuracy_job(fn)
+                accuracy_result = self._run_subprocess_accuracy_check_job(fn)
             except BenchmarkSubprocessError as e:
-                # Timeout or unexpected worker exit; skip config and continue.
                 self.log.warning(
                     f"Accuracy check subprocess failed for {config!r}: {e}"
                 )
@@ -1125,40 +1120,82 @@ class LocalBenchmarkProvider(BenchmarkProvider):
                 )
                 self._autotune_metrics.num_compile_failures += 1
                 return inf
-            # None means a custom check fn can't run in the worker; validate
-            # in-process instead.
-            if passed is None:
-                try:
+
+            if accuracy_result is not None:
+                if not accuracy_result.ok:
+                    if not self.settings.autotune_ignore_errors:
+                        self.log.warning(
+                            f"Skipping config with accuracy mismatch: {config!r}\n"
+                            f"{accuracy_result.message}\n"
+                            "Use HELION_AUTOTUNE_ACCURACY_CHECK=0 to disable this check.\n"
+                        )
+                    self._autotune_metrics.num_accuracy_failures += 1
+                    return inf
+                return float(latency)
+
+            # None means a custom check fn or uncommon kernel can't run in the
+            # worker; validate in-process instead.
+            try:
+                with capture_output():
                     output = fn(*self.args)
                     synchronize_device(output)
-                    passed = self._validate_against_baseline(config, output, self.args)
-                except Exception as e:
-                    e.__traceback__ = None
-                    if match_unrecoverable_runtime_error(e):
-                        # This ran in the parent process, so the IMA poisoned
-                        # the parent CUDA context; the search cannot continue.
-                        self.kernel.maybe_log_repro(self.log.error, self.args, config)
-                        raise exc.TritonUnrecoverableRuntimeError(
-                            reason=str(e),
-                            decorator=self.kernel.format_kernel_decorator(
-                                config, self.settings
-                            ),
-                            error=f"{type(e).__qualname__}: {e}",
-                        ) from e
-                    self.log.debug(
-                        f"Accuracy check raised for {config!r}: {type(e).__name__}: {e}"
-                    )
-                    self._autotune_metrics.num_compile_failures += 1
+                if not self._validate_against_baseline(config, output, self.args):
+                    self._autotune_metrics.num_accuracy_failures += 1
                     return inf
-                finally:
-                    # Same as the in-process path: drop JIT fast-path caches so
-                    # this fn's tensors aren't pinned in GPU memory across configs.
-                    self._clear_jit_fast_path_caches(fn)
-            if not passed:
-                self._autotune_metrics.num_accuracy_failures += 1
+            except Exception as e:
+                e.__traceback__ = None
+                if match_unrecoverable_runtime_error(e):
+                    # This ran in the parent process, so the IMA poisoned
+                    # the parent CUDA context; the search cannot continue.
+                    self.kernel.maybe_log_repro(self.log.error, self.args, config)
+                    raise exc.TritonUnrecoverableRuntimeError(
+                        reason=str(e),
+                        decorator=self.kernel.format_kernel_decorator(
+                            config, self.settings
+                        ),
+                        error=f"{type(e).__qualname__}: {e}",
+                    ) from e
+                self.log.debug(
+                    f"Accuracy check raised for {config!r}: {type(e).__name__}: {e}"
+                )
+                self._autotune_metrics.num_compile_failures += 1
                 return inf
+            finally:
+                # Same as the in-process path: drop JIT fast-path caches so
+                # this fn's tensors aren't pinned in GPU memory across configs.
+                self._clear_jit_fast_path_caches(fn)
 
         return float(latency)
+
+    def _run_subprocess_accuracy_check_job(
+        self, fn: CompiledConfig
+    ) -> AccuracyCheckResult | None:
+        if not self._subprocess_accuracy_check_enabled():
+            return None
+        if self._precompile_args_path is None or self._precompile_baseline_path is None:
+            return None
+        try:
+            fn_spec = _serialize_compiled_fn(fn)
+        except RuntimeError:
+            return None
+
+        if self._benchmark_worker is None:
+            self._benchmark_worker = BenchmarkWorker(device=None)
+
+        job = AccuracyCheckJob(
+            fn_spec=fn_spec,
+            args_path=self._precompile_args_path,
+            baseline_path=self._precompile_baseline_path,
+            atol=self._effective_atol,
+            rtol=self._effective_rtol,
+        )
+        return cast(
+            "AccuracyCheckResult",
+            self._benchmark_worker.run(
+                job,
+                timeout=float(self.settings.autotune_benchmark_timeout),
+            ),
+        )
 
     def _run_subprocess_benchmark_job(
         self,
@@ -1185,42 +1222,6 @@ class LocalBenchmarkProvider(BenchmarkProvider):
             use_wall_clock=self._subprocess_benchmark_uses_wall_clock(),
         )
         return float(
-            self._benchmark_worker.run(
-                job,
-                timeout=float(self.settings.autotune_benchmark_timeout),
-            )
-        )
-
-    def _run_subprocess_accuracy_job(self, fn: CompiledConfig) -> bool | None:
-        """Validate ``fn`` against the baseline inside the benchmark worker.
-
-        Returns whether the output matched, or ``None`` when a custom check fn
-        can't run in the worker and the caller should validate in-process.
-        """
-        if (
-            self._precompile_args_path is None
-            or self._precompile_baseline_path is None
-            or self.settings.autotune_baseline_accuracy_check_fn is not None
-        ):
-            return None
-        try:
-            fn_spec = _serialize_compiled_fn(fn)
-        except RuntimeError:
-            return None
-
-        if self._benchmark_worker is None:
-            self._benchmark_worker = BenchmarkWorker(device=None)
-
-        # Only checks the output; mutated-arg kernels disable the subprocess
-        # path (see _subprocess_benchmark_enabled), so they never reach here.
-        job = AccuracyCheckJob(
-            fn_spec=fn_spec,
-            args_path=self._precompile_args_path,
-            baseline_path=self._precompile_baseline_path,
-            atol=self._effective_atol,
-            rtol=self._effective_rtol,
-        )
-        return bool(
             self._benchmark_worker.run(
                 job,
                 timeout=float(self.settings.autotune_benchmark_timeout),

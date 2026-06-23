@@ -110,7 +110,7 @@ class _JaxExportTensor(torch.Tensor):
         )
         out = torch.Tensor._make_subclass(_JaxExportTensor, meta, require_grad=False)
         out._jax_arr = jax_arr
-        out._declared_device = device
+        out._declared_device = device  # pyrefly: ignore[read-only]
         return out
 
     @property

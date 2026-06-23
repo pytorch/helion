@@ -17,6 +17,7 @@ from .._compiler.ast_extension import create
 from .._compiler.ast_extension import expr_from_string
 from .._compiler.ast_extension import statement_from_string
 from .._compiler.compile_environment import CompileEnvironment
+from .._compiler.compile_environment import _symint_sympy_expr
 from .._compiler.dtype_utils import cast_ast
 from .._compiler.host_function import HostFunction
 from .._compiler.variable_origin import BlockSizeOrigin
@@ -47,6 +48,19 @@ def is_for_loop_target(target: object) -> bool:
     return target in (_for_loop, _for_loop_step)
 
 
+def _val_to_sympy(val: torch.SymInt | torch.SymFloat | torch.SymBool) -> sympy.Expr:
+    """Resolve a sym value to its sympy expression, preferring the cached node expr.
+
+    A ``SymBool`` resolves to a sympy boolean rather than an ``Expr``; that case is
+    not expected on the symnode codegen paths below but is accepted by the type.
+    """
+    sym_expr = getattr(getattr(val, "node", None), "_expr", None)
+    if isinstance(sym_expr, sympy.Expr):
+        return sym_expr
+    # pyrefly: ignore [bad-return]
+    return val._sympy_()
+
+
 @_decorators.api()
 def _get_symnode(debug_name: str) -> int:
     """FX requires a torch.SymInt to come from an op. This is a fake op is added lazily to work around this."""
@@ -63,9 +77,7 @@ def _(state: CodegenState) -> ast.AST:
         return expr_from_string(str(val))
 
     assert isinstance(val, (torch.SymInt, torch.SymFloat, torch.SymBool)), val
-    sym_expr = getattr(getattr(val, "node", None), "_expr", None)
-    if not isinstance(sym_expr, sympy.Expr):
-        sym_expr = val._sympy_()
+    sym_expr = _val_to_sympy(val)
     origin_info = HostFunction.current().expr_to_origin.get(sym_expr)
 
     if origin_info is not None and isinstance(origin_info.origin, BlockSizeOrigin):
@@ -91,9 +103,7 @@ def _(state: CodegenState) -> ast.AST:
         return expr_from_string(str(val))
 
     assert isinstance(val, (torch.SymInt, torch.SymFloat, torch.SymBool)), val
-    sym_expr = getattr(getattr(val, "node", None), "_expr", None)
-    if not isinstance(sym_expr, sympy.Expr):
-        sym_expr = val._sympy_()
+    sym_expr = _val_to_sympy(val)
     origin_info = HostFunction.current().expr_to_origin.get(sym_expr)
     if origin_info is not None and isinstance(origin_info.origin, BlockSizeOrigin):
         block_size_var = state.device_function.block_size_var(
@@ -1502,7 +1512,7 @@ def _(state: CodegenState) -> ast.AST:
     tensor_ast = state.ast_arg(0)
     target_size = state.proxy_arg(1)
     if isinstance(target_size, torch.SymInt):
-        target_expr = state.sympy_expr(target_size._sympy_())
+        target_expr = state.sympy_expr(_symint_sympy_expr(target_size))
         block_id = CompileEnvironment.current().get_block_id(target_size)
         bs_var = (
             state.device_function.block_size_var(block_id)
@@ -2132,6 +2142,90 @@ def _check_dma_alignment(vmem_shape: tuple[int, ...]) -> bool:
     return True
 
 
+def _is_supported_contiguous_row_slab_dma(
+    fake: torch.Tensor,
+    sub_meta: list[object],
+    block_ids: list[int],
+    vmem_shape: tuple[int, ...],
+    env: CompileEnvironment,
+    state: CodegenState,
+) -> bool:
+    """Whether an otherwise-unaligned load is a contiguous row-slab DMA.
+
+    ``_check_dma_alignment`` is conservative for shapes like
+    ``[TOKEN_BLOCK, H=4, D=128]`` because the second-to-last logical dim is not a
+    multiple of 8.  TPU7x accepts HBM copies from arbitrary dynamic row offsets
+    for row-slab layouts: rows are page-addressed and the full suffix is
+    contiguous with an aligned lane dimension.
+
+    Keep this exception narrow: load-only caller, one dynamic-begin/end
+    current-loop row tile, only scalar-selected prefix dims, full-slice suffix,
+    no gathers/scatters/stores.
+    """
+    if not fake.is_floating_point():
+        return False
+    if fake.ndim < 2:
+        return False
+    if not fake.is_contiguous():
+        return False
+    if len(vmem_shape) != fake.ndim:
+        return False
+
+    dim_to_bid = _get_dim_block_ids(sub_meta, env)
+    inner_dims = [dim for dim, bid in dim_to_bid.items() if bid in block_ids]
+    if len(inner_dims) != 1:
+        return False
+    row_dim = inner_dims[0]
+    if row_dim == fake.ndim - 1:
+        return False
+    row_bid = dim_to_bid[row_dim]
+    if not _loop_dim_is_dynamic(state, block_ids.index(row_bid)):
+        return False
+
+    from helion._utils import is_scalar_index
+
+    for dim_idx in range(row_dim):
+        idx_meta = sub_meta[dim_idx] if dim_idx < len(sub_meta) else slice(None)
+        if vmem_shape[dim_idx] != 1:
+            return False
+        if dim_idx in dim_to_bid:
+            continue
+        if not is_scalar_index(idx_meta):
+            return False
+
+    for dim_idx in range(row_dim + 1, fake.ndim):
+        idx_meta = sub_meta[dim_idx] if dim_idx < len(sub_meta) else slice(None)
+        if idx_meta != slice(None):
+            return False
+        if dim_idx in dim_to_bid:
+            return False
+        dim_size = fake.shape[dim_idx]
+        if not isinstance(dim_size, int) or vmem_shape[dim_idx] != dim_size:
+            return False
+
+    lane_dim = fake.shape[-1]
+    return isinstance(lane_dim, int) and lane_dim % 128 == 0
+
+
+def _can_stream_inner_tile(
+    fake: torch.Tensor,
+    sub_meta: list[object],
+    direction: str,
+    block_ids: list[int],
+    vmem_shape: tuple[int, ...],
+    env: CompileEnvironment,
+    state: CodegenState,
+) -> bool:
+    """Return whether a loop-local tensor should use the inner streaming path."""
+    if _check_dma_alignment(vmem_shape):
+        return True
+    if direction != "load":
+        return False
+    return _is_supported_contiguous_row_slab_dma(
+        fake, sub_meta, block_ids, vmem_shape, env, state
+    )
+
+
 def _compute_vmem_shapes(
     all_tensor_info: list[tuple[torch.Tensor, list[object], str]],
     block_ids: list[int],
@@ -2190,8 +2284,9 @@ def _classify_pipelined_tensors(
     A tensor is eligible for the inner-DMA path (HBM ref + small VMEM scratch
     in fori_loop, or ``pl.Buffered`` BlockSpec in emit_pipeline) when:
 
-    * Its inner-block ``vmem_shape`` passes ``_check_dma_alignment`` -- a TPU
-      DMA hardware constraint.
+    * Its inner-block ``vmem_shape`` passes the standard TPU DMA alignment check,
+      or it is a load-only contiguous row-slab layout covered by
+      ``_is_supported_contiguous_row_slab_dma``.
     * It is not also accessed at outer scope (i.e. in a root graph,
       between/before/after inner loops).  Pipelining replaces the tensor's
       outer BlockSpec with ``pltpu.HBM`` so the inner loop's BlockSpec can
@@ -2238,10 +2333,12 @@ def _classify_pipelined_tensors(
                 outer_access_tensor_ids.add(id(val))
 
     pipelined_ids: set[int] = set()
-    for (fake, _sub_meta, _direction), vmem_shape in zip(
+    for (fake, sub_meta, direction), vmem_shape in zip(
         all_tensor_info, vmem_shapes, strict=True
     ):
-        if not _check_dma_alignment(vmem_shape):
+        if not _can_stream_inner_tile(
+            fake, sub_meta, direction, block_ids, vmem_shape, env, state
+        ):
             continue
         if id(fake) in outer_access_tensor_ids:
             continue
@@ -2427,14 +2524,31 @@ def _codegen_fori_loop(state: CodegenState) -> object:
         _tensor_to_sem=tensor_to_sem,
     )
 
-    def _build_hbm_dma_slice(
-        fake: torch.Tensor, hbm_name: str, subscript_meta: list[object]
-    ) -> str:
-        """Build an HBM ref slicing expression for DMA with loop variable."""
+    def _build_dma_slices(
+        fake: torch.Tensor,
+        vmem_name: str,
+        hbm_name: str,
+        subscript_meta: list[object],
+        *,
+        clamp: bool,
+    ) -> tuple[str, str]:
+        """Build (vmem_ref, hbm_ref) ref slices for a DMA copy with loop variable.
+
+        The HBM ref is sliced to this iteration's tile.  With ``clamp=True``
+        (ragged stores) a leading tiled dim is trimmed to its live extent
+        ``min(block_size, end - offset)`` and the VMEM side sliced to match, so
+        only live rows are written instead of overrunning adjacent regions
+        packed in the same tensor; with ``clamp=False`` (loads, dense stores)
+        the VMEM side stays the bare buffer.
+        """
+        from helion._compiler.pallas.ordered_carry import is_dynamic_bound_tile
+
         dim_to_bid = _get_dim_block_ids(subscript_meta, env)
         shape = fake.shape
-        parts: list[str] = []
-        needs_slice = False
+        hbm_parts: list[str] = []
+        vmem_parts: list[str] = []
+        hbm_needs_slice = False
+        vmem_needs_slice = False
         for dim_idx in range(len(shape)):
             bid = dim_to_bid.get(dim_idx)
             if bid is not None and bid in block_ids:
@@ -2443,10 +2557,29 @@ def _codegen_fori_loop(state: CodegenState) -> object:
                 iter_step_expr = iter_step_exprs[bid_idx]
                 slice_size_expr = slice_size_exprs[bid_idx]
                 dim_idx_expr = dim_idx_exprs[bid_idx]
-                parts.append(
-                    f"pl.ds(({begin_expr}) + ({dim_idx_expr}) * ({iter_step_expr}), {slice_size_expr})"
-                )
-                needs_slice = True
+                offset_expr = f"({begin_expr}) + ({dim_idx_expr}) * ({iter_step_expr})"
+                # Mosaic requires the lane (/128) and sublane (/8) VMEM dims to
+                # stay tile-aligned, so only clamp dims outside the last two; a
+                # ragged store on a last-two dim can't clamp and is rejected.
+                if clamp and dim_idx < len(shape) - 2:
+                    end_expr = _get_loop_begin_and_end(state, bid_idx)[1]
+                    slice_size_expr = f"jnp.minimum({slice_size_expr}, ({end_expr}) - ({offset_expr}))"
+                    vmem_parts.append(f"pl.ds(0, {slice_size_expr})")
+                    vmem_needs_slice = True
+                elif clamp and is_dynamic_bound_tile(state, bid):
+                    raise NotImplementedError(
+                        "Pallas: a ragged (data-dependent) store whose tiled "
+                        "dimension is one of the last two (lane/sublane) "
+                        "dimensions is not supported. Mosaic tile alignment "
+                        "forbids clamping there, so a partial tile would "
+                        "silently overrun adjacent rows. Move the ragged "
+                        "dimension to a leading position, e.g. "
+                        "[tokens, heads, head_dim]."
+                    )
+                else:
+                    vmem_parts.append(":")
+                hbm_parts.append(f"pl.ds({offset_expr}, {slice_size_expr})")
+                hbm_needs_slice = True
                 from .memory_ops import _record_pad_info
 
                 extra_pad = _compute_pipeline_or_dma_extra_pad(
@@ -2460,12 +2593,13 @@ def _codegen_fori_loop(state: CodegenState) -> object:
                     offset = state.codegen.offset_var(bid)
                     bs_var = state.device_function.block_size_var(bid)
                     if bs_var:
-                        parts.append(f"pl.ds({offset}, {bs_var})")
-                        needs_slice = True
+                        hbm_parts.append(f"pl.ds({offset}, {bs_var})")
+                        hbm_needs_slice = True
                     else:
-                        parts.append(":")
+                        hbm_parts.append(":")
                 else:
-                    parts.append(":")
+                    hbm_parts.append(":")
+                vmem_parts.append(":")
             else:
                 idx_meta = (
                     subscript_meta[dim_idx]
@@ -2476,13 +2610,21 @@ def _codegen_fori_loop(state: CodegenState) -> object:
 
                 if is_scalar_index(idx_meta):
                     offset_expr = state.device_function.literal_expr(idx_meta)
-                    parts.append(f"pl.ds({offset_expr}, 1)")
-                    needs_slice = True
+                    hbm_parts.append(f"pl.ds({offset_expr}, 1)")
+                    hbm_needs_slice = True
                 else:
-                    parts.append(":")
-        if not needs_slice:
-            return hbm_name
-        return f"{hbm_name}.at[{', '.join(parts)}]"
+                    hbm_parts.append(":")
+                vmem_parts.append(":")
+        # ``.at[]`` (Ref transform), not ``[]`` which would materialize a
+        # dynamically-shaped array; make_async_copy operates on Refs.  Each side
+        # falls back to the bare ref when it has no slices.
+        hbm = f"{hbm_name}.at[{', '.join(hbm_parts)}]" if hbm_needs_slice else hbm_name
+        vmem = (
+            f"{vmem_name}.at[{', '.join(vmem_parts)}]"
+            if vmem_needs_slice
+            else vmem_name
+        )
+        return vmem, hbm
 
     # For loop-carried state, remap args to scratch reads inside the body
     body_args = (
@@ -2495,7 +2637,7 @@ def _codegen_fori_loop(state: CodegenState) -> object:
     with state.codegen.add_fori_loop(fori_state):
         # Non-DMA tensors keep their outer BlockSpec (whole-shape VMEM ref)
         # and need an absolute offset for ``pl.ds()`` indexing in the body.
-        # DMA copies build their own absolute slice via _build_hbm_dma_slice,
+        # DMA copies build their own absolute slice via _build_dma_slices,
         # so this offset is dead when every tensor is DMA'd.
         if len(tensor_to_dma_scratch) < len(all_tensor_info):
             for i, bid in enumerate(block_ids):
@@ -2512,11 +2654,13 @@ def _codegen_fori_loop(state: CodegenState) -> object:
                 continue
             vmem_name = tensor_to_dma_scratch[hbm_name]
             sem_name = tensor_to_sem[hbm_name]
-            src_slice = _build_hbm_dma_slice(fake, hbm_name, sub_meta)
+            vmem_ref, hbm_ref = _build_dma_slices(
+                fake, vmem_name, hbm_name, sub_meta, clamp=False
+            )
             copy_var = state.device_function.new_var("_copy")
             state.codegen.add_statement(
                 statement_from_string(
-                    f"{copy_var} = pltpu.make_async_copy({src_slice}, {vmem_name}, {sem_name})"
+                    f"{copy_var} = pltpu.make_async_copy({hbm_ref}, {vmem_ref}, {sem_name})"
                 )
             )
             state.codegen.add_statement(statement_from_string(f"{copy_var}.start()"))
@@ -2535,11 +2679,13 @@ def _codegen_fori_loop(state: CodegenState) -> object:
                 continue
             vmem_name = tensor_to_dma_scratch[hbm_name]
             sem_name = tensor_to_sem[hbm_name]
-            dst_slice = _build_hbm_dma_slice(fake, hbm_name, sub_meta)
+            vmem_ref, hbm_ref = _build_dma_slices(
+                fake, vmem_name, hbm_name, sub_meta, clamp=True
+            )
             copy_out_var = state.device_function.new_var("_copy_out")
             state.codegen.add_statement(
                 statement_from_string(
-                    f"{copy_out_var} = pltpu.make_async_copy({vmem_name}, {dst_slice}, {sem_name})"
+                    f"{copy_out_var} = pltpu.make_async_copy({vmem_ref}, {hbm_ref}, {sem_name})"
                 )
             )
             state.codegen.add_statement(

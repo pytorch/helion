@@ -62,6 +62,7 @@ from .._compiler.indexing_strategy import SubscriptIndexing
 from .._compiler.indexing_strategy import TileWithOffsetInfo
 from .._compiler.indexing_strategy import _get_tile_with_offset_info
 from .._compiler.pallas import codegen as pallas_codegen
+from .._compiler.utils import compute_slice_size
 from .._compiler.variable_origin import GridOrigin
 from .._compiler.variable_origin import TileBeginOrigin
 from .._compiler.variable_origin import TileCountOrigin
@@ -907,6 +908,38 @@ def _cute_index_exprs(
                 )
             result.append(inactive_slice_expr)
             tensor_dim += 1
+        elif isinstance(idx, slice) and (idx.step is None or idx.step == 1):
+            # Partial slice (e.g. :16, 16:, or 5:20)
+            if tensor is None:
+                raise exc.BackendUnsupported(
+                    "cute", "partial slice indexing without tensor"
+                )
+            dim_size = tensor.shape[tensor_dim]
+            slice_size = compute_slice_size(idx, dim_size)
+            start = idx.start if idx.start is not None else 0
+            block_id = resolve_active_slice_block_id(slice_size, used_block_ids)
+            if block_id is not None:
+                idx_var = active_index_var(block_id)
+                assert idx_var is not None
+                used_block_ids.add(block_id)
+                if start == 0:
+                    result.append(idx_var)
+                else:
+                    start_expr = state.device_function.literal_expr(start)
+                    result.append(f"({start_expr} + {idx_var})")
+                tensor_dim += 1
+                continue
+            raise exc.BackendUnsupported(
+                "cute",
+                (
+                    "partial slice dimension is not active in this scope "
+                    f"(tensor_dim={pos}, size={slice_size})"
+                ),
+            )
+        elif isinstance(idx, slice):
+            raise exc.BackendUnsupported(
+                "cute", f"strided slices (step={idx.step}) are not supported"
+            )
         else:
             raise exc.BackendUnsupported("cute", f"index type: {type(idx)}")
     return result
@@ -2401,6 +2434,27 @@ def _cute_combined_mask(
             )
         return tile_terms
 
+    def tensor_index_bounds_term(pos: int, tensor_dim: int) -> str | None:
+        if tensor is None or tensor_dim >= tensor.ndim:
+            return None
+        ast_args = state.ast_args
+        if not (
+            isinstance(ast_args, list)
+            and len(ast_args) > 1
+            and isinstance(ast_args[1], (list, tuple))
+            and len(ast_args[1]) == len(subscript)
+            and isinstance(ast_args[1][pos], ast.AST)
+        ):
+            return None
+        index_var = state.codegen.lift(
+            ast_args[1][pos],
+            dce=True,
+            prefix="index_mask",
+        ).id
+        index_dtype = env.backend.dtype_str(env.index_dtype)
+        dim_size = _cute_tensor_dim_size_expr(state, tensor, tensor_dim)
+        return f"{index_dtype}({index_var}) < {dim_size}"
+
     if extra_mask is not None:
         terms.append(state.codegen.lift(extra_mask, dce=True, prefix="mask").id)
 
@@ -2428,7 +2482,14 @@ def _cute_combined_mask(
                 if bid not in seen and mask_var_for_block_id(bid) is not None:
                     block_id = bid
                     break
+        elif isinstance(idx, slice) and idx != slice(None) and tensor is not None:
+            slice_size = compute_slice_size(idx, tensor.shape[tensor_dim])
+            for bid in _matching_block_ids(env, slice_size):
+                if bid not in seen and mask_var_for_block_id(bid) is not None:
+                    block_id = bid
+                    break
         elif isinstance(idx, torch.Tensor):
+            added_tensor_index_mask = False
             # A free ``hl.arange`` mapped onto a synthetic thread axis carries no
             # block id, so the loops below add no bound for it. Emit its lane
             # bound explicitly to mask the out-of-bounds lanes a wider sibling
@@ -2464,10 +2525,17 @@ def _cute_combined_mask(
                             continue
                         mask_var = mask_var_for_block_id(bid)
                         if mask_var is not None:
+                            added_tensor_index_mask = True
                             seen.add(bid)
                             if mask_var not in terms:
                                 terms.append(mask_var)
                             break
+                if (
+                    not added_tensor_index_mask
+                    and (bound := tensor_index_bounds_term(pos, tensor_dim)) is not None
+                ):
+                    if bound not in terms:
+                        terms.append(bound)
                 tensor_dim += 1
                 continue
             for dim_size in idx.shape:
@@ -2476,12 +2544,19 @@ def _cute_combined_mask(
                         continue
                     mask_var = mask_var_for_block_id(bid)
                     if mask_var is not None:
+                        added_tensor_index_mask = True
                         seen.add(bid)
                         if mask_var not in terms:
                             terms.append(mask_var)
                         break
                 else:
                     continue
+            if (
+                not added_tensor_index_mask
+                and (bound := tensor_index_bounds_term(pos, tensor_dim)) is not None
+            ):
+                if bound not in terms:
+                    terms.append(bound)
             tensor_dim += 1
             continue
         else:
@@ -2977,6 +3052,43 @@ def _codegen_cute_store_tcgen05_tile(
             tcgen05_value.explicit_epi_tile_m,
             tcgen05_value.explicit_d_store_box_n,
         )
+
+    # Per-thread epilogue M extent. The tcgen05 TMEM->register (T2R) copy
+    # distributes the epilogue tile's M dimension across the 128-lane TMEM
+    # datapath: when ``epi_tile_m >= 128`` every lane owns >= 1 full output
+    # row, so each thread's per-subtile fragment stays within a SINGLE M row;
+    # when ``epi_tile_m < 128`` (e.g. block_m=64) a lane's fragment spans
+    # multiple M rows. This decides whether the per-row colvec scalar read is
+    # valid (see the ``broadcast_axis == 2`` branch below). Mirrors the
+    # ``epi_tile_m`` computation in ``tcgen05_resolve_epilogue_tile`` /
+    # ``cute_mma``: ``bm`` for the default tile, ``bm // 2`` for the 2-CTA
+    # bm=128 family, or the user-supplied explicit tile M.
+    #
+    # Correctness of the colvec scalar fast-path rests on the invariant that
+    # the T2R atom FILLS the 128-lane M datapath before packing multiple rows
+    # per lane (a property of CUTLASS's epilogue_tmem_copy_and_partition, not
+    # enforced here). Verified geometrically by partitioning an identity
+    # coordinate tensor through the same T2R copy and reading the distinct M
+    # coordinates a lane holds: per-CTA per-thread M-extent is 1 at
+    # epi_tile_m=128 (block_m=128) and 1 at epi_tile_m=128 (block_m=256 2-CTA),
+    # but 2 at epi_tile_m=64 (block_m=64) -- matching the >= 128 threshold
+    # exactly. If a future CUTLASS changes the lane distribution only the
+    # threshold needs revisiting: the materialize fallback below is always
+    # correct, so the worst case is the fast-path mis-firing (caught by the
+    # row-dependent colvec tests).
+    _TCGEN05_TMEM_DATAPATH_M = 128
+    if tcgen05_value.has_explicit_epilogue_tile:
+        assert tcgen05_value.explicit_epi_tile_m is not None
+        tcgen05_epi_tile_m = tcgen05_value.explicit_epi_tile_m
+    elif tcgen05_is_two_cta_m128(
+        is_two_cta=tcgen05_lifecycle.is_two_cta, bm=tcgen05_value.bm
+    ):
+        tcgen05_epi_tile_m = tcgen05_value.bm // 2
+    else:
+        tcgen05_epi_tile_m = tcgen05_value.bm
+    tcgen05_colvec_fragment_single_m_row = (
+        tcgen05_epi_tile_m >= _TCGEN05_TMEM_DATAPATH_M
+    )
 
     # C-input warp productive-body gate (``cute_plan.md`` §7.5.3.2
     # cycle 2b producer + consumer flip). When the matmul plan has
@@ -3504,8 +3616,33 @@ def _codegen_cute_store_tcgen05_tile(
             )
         return lines
 
+    def _materialize_broadcast_aux_source(
+        indent: str, rec: object, carrier_name: str
+    ) -> str:
+        """Emit a per-subtile aux load that matches the accumulator carrier's
+        register profile.
+
+        Example output (``indent='    '``, ``carrier_name='tcgen05_tRS_rAcc'``)::
+
+            tcgen05_aux_rmem_0 = cute.make_rmem_tensor(
+                cute.make_layout(tcgen05_tRS_rAcc.shape), cutlass.Float32
+            )
+            cute.autovec_copy(tcgen05_tTR_gAux_subtile_0, tcgen05_aux_rmem_0)
+            tcgen05_aux_loaded_0 = tcgen05_aux_rmem_0.load()
+        """
+        return (
+            f"{indent}{rec.aux_rmem} = "  # type: ignore[attr-defined]
+            f"cute.make_rmem_tensor(cute.make_layout({carrier_name}.shape), "
+            f"{rec.aux_dtype})\n"  # type: ignore[attr-defined]
+            f"{indent}cute.autovec_copy("
+            f"{rec.ttr_aux_subtile}, {rec.aux_rmem})\n"  # type: ignore[attr-defined]
+            f"{indent}{rec.aux_loaded} = "  # type: ignore[attr-defined]
+            f"{rec.aux_rmem}.load()\n"  # type: ignore[attr-defined]
+        )
+
     def _aux_subtile_load_source(
         prelude_indent: str,
+        carrier_name: str,
         *,
         force_simt_edge_aux: bool = False,
         safe_direct_aux_with_full_tile: bool = False,
@@ -3712,16 +3849,38 @@ def _codegen_cute_store_tcgen05_tile(
                 )
                 continue
             if rec.broadcast_axis == 2:
-                # Column-vector (per-row) aux: uniform over each thread's N
-                # fragment, so read a single SCALAR per subtile (T2R index
-                # (0,0,0)) instead of a redundant N-wide vector ``.load()``.
-                # Matches CUTLASS's ``sa = tTR_gSA[(0,0,0,subtile)]``; the
-                # scalar broadcasts in the ``acc * aux`` chain multiply.
+                # Column-vector (per-row) aux: a rank-2 ``(m, n)`` operand
+                # broadcast over N (its value depends only on the row m). When
+                # a thread's fragment is within a single M row the per-row value
+                # is uniform across it, so the cheap scalar read
+                # ``tTR_gAux[(0, 0, 0, subtile)]`` is exact (PR #2742). When it
+                # spans multiple M rows the scalar applies row 0's value to
+                # every row, so materialize per element instead.
+                #
+                # Decide this at codegen time via
+                # ``tcgen05_colvec_fragment_single_m_row`` (epi_tile_m vs the
+                # 128-lane TMEM datapath). A runtime layout test cannot: after
+                # ``partition_D`` + ``group_modes`` the per-thread strides are
+                # all dynamic (nothing for ``cute.filter`` to drop, and mode 0
+                # conflates M and N), so such tests silently degrade to
+                # always-materialize.
                 lines.append(
-                    f"{prelude_indent}{rec.aux_loaded} = "
+                    f"{prelude_indent}{rec.ttr_aux_subtile} = "
                     f"{rec.ttr_aux_grouped}"
-                    f"[(0, 0, 0, cutlass.Int32(_tcgen05_subtile))]\n"
+                    f"[(None, None, None, cutlass.Int32(_tcgen05_subtile))]\n"
                 )
+                if tcgen05_colvec_fragment_single_m_row:
+                    lines.append(
+                        f"{prelude_indent}{rec.aux_loaded} = "
+                        f"{rec.ttr_aux_grouped}"
+                        f"[(0, 0, 0, cutlass.Int32(_tcgen05_subtile))]\n"
+                    )
+                else:
+                    lines.append(
+                        _materialize_broadcast_aux_source(
+                            prelude_indent, rec, carrier_name
+                        )
+                    )
                 continue
             if rec.aux_rmem_full is not None:
                 # Pre-wait hoisted rowvec: the whole fragment is already in
@@ -3733,18 +3892,21 @@ def _codegen_cute_store_tcgen05_tile(
                     f"[(None, None, None, cutlass.Int32(_tcgen05_subtile))].load()\n"
                 )
                 continue
-            lines.extend(
-                [
-                    (
-                        f"{prelude_indent}{rec.ttr_aux_subtile} = "
-                        f"{rec.ttr_aux_grouped}"
-                        f"[(None, None, None, cutlass.Int32(_tcgen05_subtile))]\n"
-                    ),
-                    (
-                        f"{prelude_indent}{rec.aux_loaded} = "
-                        f"{rec.ttr_aux_subtile}.load()\n"
-                    ),
-                ]
+            # Both remaining cases -- rowvec / leading-broadcast aux
+            # (``broadcast_axis in (0, 1)``: a per-column operand broadcast
+            # over M) and exact-shape aux (``broadcast_axis is None``: a full
+            # ``(m, n)`` operand) -- always materialize. Neither has a cheaper
+            # scalar form (the operand is a full per-thread vector either way),
+            # and both otherwise produce a nested profile that cannot combine
+            # with the flat carrier (rowvec from its stride-0 mode, exact-shape
+            # once the fragment spans multiple M rows). The materialize copy is
+            # a no-op reshape when the profile already matches (block_m >= the
+            # atom M).
+            lines.append(
+                f"{prelude_indent}{rec.ttr_aux_subtile} = "
+                f"{rec.ttr_aux_grouped}"
+                f"[(None, None, None, cutlass.Int32(_tcgen05_subtile))]\n"
+                + _materialize_broadcast_aux_source(prelude_indent, rec, carrier_name)
             )
         return "".join(lines)
 
@@ -3810,6 +3972,7 @@ def _codegen_cute_store_tcgen05_tile(
         prelude_load = f"{prelude_indent}{loaded} = {load_expr}\n"
         early_aux_prelude = _aux_subtile_load_source(
             prelude_indent,
+            carrier_name,
             force_simt_edge_aux=force_simt_edge_aux,
             safe_direct_aux_with_full_tile=safe_direct_aux_with_full_tile,
         )

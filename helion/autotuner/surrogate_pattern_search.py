@@ -484,7 +484,7 @@ class LFBOPatternSearch(PatternSearch):
                 # Fit model
                 self._fit_surrogate()
 
-        # Finishing phase + (TPU-only) final-pick re-rank.
+        # Final verification, finishing phase, and (TPU-only) final-pick re-rank.
         return self._finalize()
 
     def _generate_neighbors(self, base: FlatConfig) -> list[FlatConfig]:

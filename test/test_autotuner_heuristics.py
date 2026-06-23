@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import os
 from unittest.mock import MagicMock
 from unittest.mock import patch
@@ -8,6 +9,11 @@ import torch
 
 import helion
 from helion._compiler.autotuner_heuristics import compiler_seed_configs
+from helion._compiler.autotuner_heuristics.cute import (
+    CuteFlashAttentionCausalLptHeuristic,
+)
+from helion._compiler.autotuner_heuristics.cute import CuteFlashAttentionHeuristic
+from helion._compiler.autotuner_heuristics.cute import CuteFp8GemmSkinnyMHeuristic
 from helion._compiler.autotuner_heuristics.cute import CuteTcgen05ClusterM2Heuristic
 from helion._compiler.autotuner_heuristics.registry import AutotunerHeuristic
 from helion._compiler.autotuner_heuristics.triton import TritonSkinnyGemmHeuristic
@@ -18,7 +24,33 @@ from helion._compiler.autotuner_heuristics.triton import (
 from helion._compiler.autotuner_heuristics.triton import (
     TritonUserTiledReductionHeuristic,
 )
+from helion._compiler.backend import CuteBackend
 from helion._compiler.backend import TritonBackend
+from helion._compiler.cute.cute_flash import FLASH_CAUSAL_KV_ORDER_KEY
+from helion._compiler.cute.cute_flash import FLASH_CAUSAL_LOOP_SPLIT_KEY
+from helion._compiler.cute.cute_flash import FLASH_CAUSAL_LPT_SWIZZLE_KEY
+from helion._compiler.cute.cute_flash import FLASH_CONFIG_KEYS
+from helion._compiler.cute.cute_flash import FLASH_CORR_REGS_KEY
+from helion._compiler.cute.cute_flash import FLASH_DISC_PIPE_KEY
+from helion._compiler.cute.cute_flash import FLASH_E2E_OFFSET0_KEY
+from helion._compiler.cute.cute_flash import FLASH_E2E_OFFSET_KEY
+from helion._compiler.cute.cute_flash import FLASH_E2E_SCHEDULE_KEY
+from helion._compiler.cute.cute_flash import FLASH_EPI_TMA_KEY
+from helion._compiler.cute.cute_flash import FLASH_KV_STAGE_KEY
+from helion._compiler.cute.cute_flash import FLASH_MASKED_E2E_SCHEDULE_KEY
+from helion._compiler.cute.cute_flash import FLASH_MMA_INTERLEAVE_KEY
+from helion._compiler.cute.cute_flash import FLASH_PACKED_REDUCE_KEY
+from helion._compiler.cute.cute_flash import FLASH_PERSISTENT_KEY
+from helion._compiler.cute.cute_flash import FLASH_Q_TILE_COUNT_KEY
+from helion._compiler.cute.cute_flash import FLASH_RESCALE_CHUNK_COLS_KEY
+from helion._compiler.cute.cute_flash import FLASH_RESCALE_THRESHOLD_KEY
+from helion._compiler.cute.cute_flash import FLASH_ROLE_MAP_KEY
+from helion._compiler.cute.cute_flash import FLASH_S_STAGE_KEY
+from helion._compiler.cute.cute_flash import FLASH_SMALL_BIASED_KEY
+from helion._compiler.cute.cute_flash import FLASH_SOFTMAX_REGS_KEY
+from helion._compiler.cute.cute_flash import FLASH_TOPOLOGY_KEY
+from helion._compiler.cute.cute_flash import flash_attention_seed_config
+from helion._compiler.cute.cute_flash import flash_attention_seed_configs
 from helion._compiler.cute.strategies import TCGEN05_LAYOUT_OVERRIDES_D_STORE_BOX_N_KEY
 from helion._compiler.cute.strategies import TCGEN05_LAYOUT_OVERRIDES_EPI_TILE_M_KEY
 from helion._compiler.cute.strategies import TCGEN05_LAYOUT_OVERRIDES_EPI_TILE_N_KEY
@@ -107,6 +139,7 @@ from helion._testing import onlyBackends
 from helion._testing import patch_cute_mma_support
 from helion._testing import skipIfRefEager
 from helion.autotuner import IntegerFragment
+from helion.autotuner.config_generation import ConfigGeneration
 from helion.autotuner.config_spec import BlockSizeSpec
 from helion.autotuner.config_spec import ConfigSpec
 from helion.autotuner.config_spec import MatmulFact
@@ -240,6 +273,36 @@ class TestAutotunerHeuristic(TestCase):
 
         self.assertEqual(configs, [])
         self.assertEqual(env.config_spec.autotuner_heuristics, [])
+
+    def test_cute_flash_disable_heuristics_keeps_value_priors(self) -> None:
+        spec = ConfigSpec(backend=CuteBackend())
+        for block_id, size_hint in enumerate((1, 128, 128)):
+            spec.block_sizes.append(
+                BlockSizeSpec(block_id=block_id, size_hint=size_hint)
+            )
+        spec.enable_cute_flash_search(
+            head_dim=64,
+            num_kv=64,
+            block_size_targets={0: 1, 1: 128, 2: 128},
+            is_causal=True,
+        )
+        env = MagicMock()
+        env.backend_name = "cute"
+        env.config_spec = spec
+        env.settings = Settings(disable_autotuner_heuristics=True)
+
+        self.assertEqual(compiler_seed_configs(env, MagicMock()), [])
+        self.assertEqual(spec.compiler_seed_configs, [])
+        self.assertEqual(spec.autotuner_heuristics, [])
+        self.assertTrue(spec.autotune_seed_configs())
+
+        config_gen = spec.create_config_generation()
+        self.assertIn(FLASH_TOPOLOGY_KEY, config_gen._config_value_priors)
+        self.assertIn(FLASH_CAUSAL_KV_ORDER_KEY, config_gen._config_value_priors)
+        population = config_gen.random_population(4)
+
+        self.assertGreaterEqual(len(population), 4)
+        self.assertIn(spec.default_config(), population)
 
     def test_seed_flat_config_pairs_skips_invalid_compiler_seed(self) -> None:
         spec = ConfigSpec(backend=TritonBackend())
@@ -862,6 +925,166 @@ class TestTritonStandardReductionHeuristic(TestCase):
         )
 
 
+_FP8_SKINNY_M_SEED_BLOCK_SIZES = [1, 256]
+_FP8_SKINNY_M_SEED_NUM_THREADS = [0, 32]
+_FP8_SKINNY_M_SEED_VECTOR_WIDTHS = [4, 8]
+
+
+class TestCuteFp8GemmSkinnyMHeuristic(TestCase):
+    """Skinny-M FP8 GEMM heuristic: fires only for a single FP8 matmul with
+    static M <= 16 and seeds the [1, 256] / nt=[0, 32] / vec=[4, 8] config that
+    the full autotune converges to for the decode / small-batch regime.
+    """
+
+    def _make_cute_env(self) -> MagicMock:
+        spec = ConfigSpec(backend=CuteBackend())
+        env = MagicMock()
+        env.backend_name = "cute"
+        env.config_spec = spec
+        env.device = DEVICE
+        env.settings = Settings()
+        return env
+
+    def _matmul_fact(
+        self,
+        *,
+        static_m: int = 1,
+        static_n: int = 4096,
+        static_k: int = 4096,
+        lhs_dtype: torch.dtype = torch.float8_e4m3fn,
+        rhs_dtype: torch.dtype = torch.float8_e4m3fn,
+    ) -> MatmulFact:
+        return MatmulFact(
+            lhs_ndim=2,
+            rhs_ndim=2,
+            m_block_id=0,
+            n_block_id=1,
+            k_block_id=2,
+            static_m=static_m,
+            static_n=static_n,
+            static_k=static_k,
+            lhs_dtype=lhs_dtype,
+            rhs_dtype=rhs_dtype,
+        )
+
+    def test_eligibility_cases(self) -> None:
+        # (name, facts, expected_eligible)
+        cases = (
+            ("m1_fp8", [self._matmul_fact(static_m=1)], True),
+            ("m16_fp8", [self._matmul_fact(static_m=16)], True),
+            ("e5m2_fp8", [self._matmul_fact(lhs_dtype=torch.float8_e5m2)], True),
+            ("m17_too_large", [self._matmul_fact(static_m=17)], False),
+            ("m1024_gemm", [self._matmul_fact(static_m=1024)], False),
+            (
+                "bf16_not_fp8",
+                [self._matmul_fact(lhs_dtype=torch.bfloat16, rhs_dtype=torch.bfloat16)],
+                False,
+            ),
+            ("mixed_fp8_bf16", [self._matmul_fact(rhs_dtype=torch.bfloat16)], False),
+            ("dynamic_m", [self._matmul_fact(static_m=None)], False),
+            ("no_matmul", [], False),
+            ("two_matmuls", [self._matmul_fact(), self._matmul_fact()], False),
+        )
+        for name, facts, expected in cases:
+            env = self._make_cute_env()
+            env.config_spec.matmul_facts.extend(facts)
+            with self.subTest(name=name):
+                self.assertEqual(
+                    CuteFp8GemmSkinnyMHeuristic.is_eligible(env, MagicMock()),
+                    expected,
+                )
+
+    def test_seed_config_contents(self) -> None:
+        env = self._make_cute_env()
+        env.config_spec.matmul_facts.append(self._matmul_fact(static_m=1))
+        seed = CuteFp8GemmSkinnyMHeuristic.get_seed_config(env, MagicMock())
+        assert seed is not None
+        self.assertEqual(seed.config["block_sizes"], _FP8_SKINNY_M_SEED_BLOCK_SIZES)
+        self.assertEqual(seed.config["num_threads"], _FP8_SKINNY_M_SEED_NUM_THREADS)
+        self.assertEqual(
+            seed.config["cute_vector_widths"], _FP8_SKINNY_M_SEED_VECTOR_WIDTHS
+        )
+
+    def test_compiler_seed_configs_records_heuristic(self) -> None:
+        # The heuristic must be wired into the cute backend registry so the
+        # generic compiler_seed_configs() path emits its seed and records it.
+        env = self._make_cute_env()
+        env.config_spec.matmul_facts.append(self._matmul_fact(static_m=1))
+        configs = compiler_seed_configs(env, MagicMock())
+        self.assertIn(
+            _FP8_SKINNY_M_SEED_BLOCK_SIZES,
+            [config.config["block_sizes"] for config in configs],
+        )
+        self.assertIn(
+            CuteFp8GemmSkinnyMHeuristic.name,
+            env.config_spec.autotuner_heuristics,
+        )
+
+    def test_compiler_seed_configs_skips_large_m(self) -> None:
+        env = self._make_cute_env()
+        env.config_spec.matmul_facts.append(self._matmul_fact(static_m=1024))
+        configs = compiler_seed_configs(env, MagicMock())
+        self.assertNotIn(
+            CuteFp8GemmSkinnyMHeuristic.name,
+            env.config_spec.autotuner_heuristics,
+        )
+        self.assertNotIn(
+            _FP8_SKINNY_M_SEED_BLOCK_SIZES,
+            [config.config["block_sizes"] for config in configs],
+        )
+
+    @onlyBackends(["cute"])
+    @skipIfRefEager("Compiler seed configs are not generated in ref eager mode")
+    def test_seed_in_initial_population_for_skinny_m(self) -> None:
+        @helion.kernel(backend="cute", static_shapes=True)
+        def fp8_gemm_skinny_m(
+            x: torch.Tensor,
+            y: torch.Tensor,
+            scale_a: torch.Tensor,
+            scale_b: torch.Tensor,
+        ) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=torch.bfloat16, device=x.device)
+            for tile_n in hl.tile(n):
+                acc = hl.zeros([m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = hl.dot(x[:, tile_k], y[tile_k, tile_n], acc=acc)
+                acc = acc * scale_a[:, tile_n] * scale_b[tile_n]
+                out[:, tile_n] = acc.to(torch.bfloat16)
+            return out
+
+        m, k, n = 1, 4096, 4096
+        x = torch.randn([m, k], device=DEVICE, dtype=torch.float32).to(
+            torch.float8_e4m3fn
+        )
+        y = torch.randn([k, n], device=DEVICE, dtype=torch.float32).to(
+            torch.float8_e4m3fn
+        )
+        scale_a = torch.ones([m, n], device=DEVICE)
+        scale_b = torch.ones([n], device=DEVICE)
+
+        with patch_cute_mma_support():
+            bound = fp8_gemm_skinny_m.bind((x, y, scale_a, scale_b))
+
+        device_ir = bound.host_function.device_ir
+        self.assertTrue(CuteFp8GemmSkinnyMHeuristic.is_eligible(bound.env, device_ir))
+        self.assertIn(
+            CuteFp8GemmSkinnyMHeuristic.name,
+            bound.config_spec.autotuner_heuristics,
+        )
+        seed = CuteFp8GemmSkinnyMHeuristic.get_seed_config(bound.env, device_ir)
+        assert seed is not None
+        self.assertEqual(seed.config["block_sizes"], _FP8_SKINNY_M_SEED_BLOCK_SIZES)
+        self.assertIn(
+            _FP8_SKINNY_M_SEED_BLOCK_SIZES,
+            [
+                config.config["block_sizes"]
+                for config in bound.config_spec.compiler_seed_configs
+            ],
+        )
+
+
 class TestCuteTcgen05ClusterM2Heuristic(TestCase):
     def _assert_cute_tcgen05_cluster_m2_seeded(
         self,
@@ -1023,6 +1246,461 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
             )
             self.assertNotIn(
                 CuteTcgen05ClusterM2Heuristic.name,
+                unsupported_bound.config_spec.autotuner_heuristics,
+            )
+
+    def test_cute_flash_accepts_extra_knobs(self) -> None:
+        self.assertIn(FLASH_MMA_INTERLEAVE_KEY, FLASH_CONFIG_KEYS)
+        self.assertIn(FLASH_Q_TILE_COUNT_KEY, FLASH_CONFIG_KEYS)
+        self.assertIn(FLASH_RESCALE_CHUNK_COLS_KEY, FLASH_CONFIG_KEYS)
+        self.assertIn(FLASH_SOFTMAX_REGS_KEY, FLASH_CONFIG_KEYS)
+        self.assertIn(FLASH_CORR_REGS_KEY, FLASH_CONFIG_KEYS)
+        self.assertIn(FLASH_MASKED_E2E_SCHEDULE_KEY, FLASH_CONFIG_KEYS)
+        self.assertIn(FLASH_ROLE_MAP_KEY, FLASH_CONFIG_KEYS)
+        self.assertIn(FLASH_SMALL_BIASED_KEY, FLASH_CONFIG_KEYS)
+
+    def test_cute_flash_seed_helper_dense_hd64_families(self) -> None:
+        for num_kv in (16, 32, 62):
+            seed = flash_attention_seed_config(64, num_kv)
+            assert seed is not None
+            config = seed.config
+            self.assertEqual(config["block_sizes"], [1, 128, 128])
+            self.assertEqual(config[FLASH_TOPOLOGY_KEY], "fa4")
+            self.assertEqual(config[FLASH_S_STAGE_KEY], 2)
+            self.assertEqual(config[FLASH_KV_STAGE_KEY], 3)
+            self.assertTrue(config[FLASH_PERSISTENT_KEY])
+            self.assertEqual(config[FLASH_E2E_SCHEDULE_KEY], "8/2")
+            self.assertEqual(config[FLASH_E2E_OFFSET_KEY], 2)
+            self.assertEqual(config[FLASH_E2E_OFFSET0_KEY], 2)
+            self.assertEqual(config[FLASH_DISC_PIPE_KEY], 4)
+            self.assertEqual(config[FLASH_SOFTMAX_REGS_KEY], 184)
+            self.assertTrue(config[FLASH_EPI_TMA_KEY])
+            self.assertEqual(config[FLASH_RESCALE_CHUNK_COLS_KEY], 16)
+            self.assertEqual(config[FLASH_RESCALE_THRESHOLD_KEY], 8.0)
+            self.assertFalse(config[FLASH_PACKED_REDUCE_KEY])
+
+        for num_kv, offset, disc_pipe, epi_tma, rescale_chunk_cols in (
+            (64, 2, 3, True, 16),
+            (128, 3, 3, False, 16),
+            (512, 2, 4, False, 32),
+        ):
+            seed = flash_attention_seed_config(64, num_kv)
+            assert seed is not None
+            config = seed.config
+            self.assertEqual(config["block_sizes"], [1, 128, 128])
+            self.assertEqual(config[FLASH_TOPOLOGY_KEY], "fa4")
+            self.assertEqual(config[FLASH_S_STAGE_KEY], 2)
+            self.assertEqual(config[FLASH_KV_STAGE_KEY], 2)
+            self.assertEqual(config[FLASH_E2E_OFFSET0_KEY], 2)
+            self.assertEqual(config[FLASH_E2E_OFFSET_KEY], offset)
+            self.assertEqual(config[FLASH_DISC_PIPE_KEY], disc_pipe)
+            self.assertEqual(config[FLASH_SOFTMAX_REGS_KEY], 184)
+            self.assertEqual(config[FLASH_EPI_TMA_KEY], epi_tma)
+            self.assertEqual(config[FLASH_RESCALE_CHUNK_COLS_KEY], rescale_chunk_cols)
+            self.assertTrue(config[FLASH_PACKED_REDUCE_KEY])
+
+        short_seed = flash_attention_seed_config(64, 8)
+        assert short_seed is not None
+        self.assertEqual(short_seed.config[FLASH_TOPOLOGY_KEY], "fa4")
+        self.assertNotIn(FLASH_E2E_OFFSET_KEY, short_seed.config)
+
+        sparse_seed = flash_attention_seed_config(
+            64,
+            64,
+            has_kv_tile_pruning=True,
+            requires_ws_overlap=True,
+        )
+        assert sparse_seed is not None
+        self.assertEqual(sparse_seed.config[FLASH_TOPOLOGY_KEY], "ws_overlap")
+        self.assertTrue(sparse_seed.config[FLASH_PACKED_REDUCE_KEY])
+        self.assertNotIn(FLASH_E2E_OFFSET_KEY, sparse_seed.config)
+
+        small_seed = flash_attention_seed_config(
+            64,
+            1,
+            small_biased_candidate=True,
+        )
+        assert small_seed is not None
+        self.assertTrue(small_seed.config[FLASH_SMALL_BIASED_KEY])
+
+    def test_cute_flash_seed_helper_causal_lpt_family(self) -> None:
+        expected = {
+            32: (0, 2, 200, 8, "inherit", "helion", True, 16),
+            64: (0, 2, 200, 8, "inherit", "helion", True, 16),
+            128: (0, 2, 192, 8, "16/4", "fa4", True, 16),
+            256: (1, 4, 184, 4, "16/4", "helion", False, 16),
+            512: (9, 4, 184, 1, "16/4", "helion", False, 32),
+            1024: (9, 4, 184, 1, "16/4", "helion", False, 32),
+            4096: (9, 4, 184, 1, "16/4", "helion", False, 32),
+        }
+        for (
+            num_kv,
+            (
+                offset,
+                disc_pipe,
+                softmax_regs,
+                swizzle,
+                masked_schedule,
+                role_map,
+                epi_tma,
+                rescale_chunk_cols,
+            ),
+        ) in expected.items():
+            seed = flash_attention_seed_config(
+                64,
+                num_kv,
+                is_causal=True,
+                seed_kind="causal_lpt",
+            )
+            assert seed is not None
+            config = seed.config
+            self.assertEqual(config["block_sizes"], [1, 128, 128])
+            self.assertEqual(config[FLASH_TOPOLOGY_KEY], "fa4")
+            self.assertEqual(config[FLASH_S_STAGE_KEY], 2)
+            self.assertEqual(config[FLASH_KV_STAGE_KEY], 2)
+            self.assertFalse(config[FLASH_PERSISTENT_KEY])
+            self.assertEqual(config[FLASH_E2E_SCHEDULE_KEY], "8/2")
+            self.assertEqual(config[FLASH_MASKED_E2E_SCHEDULE_KEY], masked_schedule)
+            self.assertEqual(config[FLASH_ROLE_MAP_KEY], role_map)
+            self.assertEqual(config[FLASH_E2E_OFFSET_KEY], offset)
+            self.assertEqual(config[FLASH_DISC_PIPE_KEY], disc_pipe)
+            self.assertEqual(config[FLASH_EPI_TMA_KEY], epi_tma)
+            self.assertEqual(config[FLASH_RESCALE_CHUNK_COLS_KEY], rescale_chunk_cols)
+            self.assertEqual(config[FLASH_RESCALE_THRESHOLD_KEY], 8.0)
+            self.assertTrue(config[FLASH_PACKED_REDUCE_KEY])
+            self.assertEqual(config[FLASH_CAUSAL_LPT_SWIZZLE_KEY], swizzle)
+            self.assertEqual(config[FLASH_CAUSAL_KV_ORDER_KEY], "descending")
+            self.assertEqual(config[FLASH_SOFTMAX_REGS_KEY], softmax_regs)
+
+        self.assertIsNone(
+            flash_attention_seed_config(64, 16, is_causal=True, seed_kind="causal_lpt")
+        )
+        self.assertIsNone(
+            flash_attention_seed_config(64, 96, is_causal=True, seed_kind="causal_lpt")
+        )
+        self.assertIsNone(
+            flash_attention_seed_config(
+                64,
+                64,
+                is_causal=True,
+                requires_ws_overlap=True,
+                seed_kind="causal_lpt",
+            )
+        )
+        split_seed = flash_attention_seed_config(
+            64, 64, is_causal=True, seed_kind="causal_split"
+        )
+        assert split_seed is not None
+        lpt_seed = flash_attention_seed_config(
+            64, 64, is_causal=True, seed_kind="causal_lpt"
+        )
+        assert lpt_seed is not None
+        self.assertNotEqual(split_seed, lpt_seed)
+        self.assertEqual(split_seed.config[FLASH_KV_STAGE_KEY], 2)
+        self.assertEqual(split_seed.config[FLASH_E2E_SCHEDULE_KEY], "8/2")
+        self.assertEqual(split_seed.config[FLASH_MASKED_E2E_SCHEDULE_KEY], "16/4")
+        self.assertEqual(split_seed.config[FLASH_ROLE_MAP_KEY], "fa4")
+        self.assertTrue(split_seed.config[FLASH_CAUSAL_LOOP_SPLIT_KEY])
+        self.assertEqual(split_seed.config[FLASH_E2E_OFFSET_KEY], 0)
+        self.assertEqual(split_seed.config[FLASH_E2E_OFFSET0_KEY], 0)
+        self.assertEqual(split_seed.config[FLASH_RESCALE_CHUNK_COLS_KEY], 16)
+        self.assertEqual(split_seed.config[FLASH_CAUSAL_LPT_SWIZZLE_KEY], 8)
+        split_seed_256 = flash_attention_seed_config(
+            64, 256, is_causal=True, seed_kind="causal_split"
+        )
+        assert split_seed_256 is not None
+        self.assertEqual(split_seed_256.config[FLASH_MASKED_E2E_SCHEDULE_KEY], "16/4")
+        self.assertEqual(split_seed_256.config[FLASH_E2E_OFFSET0_KEY], 11)
+        self.assertEqual(split_seed_256.config[FLASH_RESCALE_CHUNK_COLS_KEY], 16)
+        self.assertEqual(split_seed_256.config[FLASH_CAUSAL_LPT_SWIZZLE_KEY], 4)
+        self.assertEqual(len(flash_attention_seed_configs(64, 64, is_causal=True)), 3)
+
+    @onlyBackends(["cute"])
+    def test_cute_flash_attention_seed_heuristic(self) -> None:
+        # The flash seed promotes block_sizes=[1, 128, 128] for a detected
+        # fp16 dense/causal online-softmax attention kernels so the autotuner
+        # exercises the fused tcgen05 flash path. fp32 attention is NOT eligible
+        # and keeps the scalar path.
+        @helion.kernel(backend="cute", static_shapes=True)
+        def flash_attn(
+            q_in: torch.Tensor, k_in: torch.Tensor, v_in: torch.Tensor
+        ) -> torch.Tensor:
+            m_dim = q_in.size(-2)
+            n_dim = k_in.size(-2)
+            head_dim = hl.specialize(q_in.size(-1))
+            q_view = q_in.reshape([-1, m_dim, head_dim])
+            v_view = v_in.reshape([-1, n_dim, head_dim])
+            k_view = k_in.reshape([-1, n_dim, head_dim])
+            out = torch.empty_like(q_view)
+            qk_scale = (1.0 / math.sqrt(head_dim)) * 1.44269504
+            for tile_b, tile_m in hl.tile([q_view.size(0), m_dim]):
+                m_i = hl.full([tile_b, tile_m], float("-inf"), dtype=torch.float32)
+                l_i = torch.full_like(m_i, 1.0)
+                acc = hl.zeros([tile_b, tile_m, head_dim], dtype=torch.float32)
+                qt = q_view[tile_b, tile_m, :]
+                for tile_n in hl.tile(v_view.size(1)):
+                    kt = k_view[tile_b, tile_n, :]
+                    qk = torch.bmm(qt * qk_scale, kt.transpose(1, 2), torch.float32)
+                    m_ij = torch.maximum(m_i, torch.amax(qk, -1))
+                    qk = qk - m_ij[:, :, None]
+                    p = torch.exp2(qk)
+                    l_ij = torch.sum(p, -1)
+                    alpha = torch.exp2(m_i - m_ij)
+                    l_i = l_i * alpha + l_ij
+                    acc = acc * alpha[:, :, None]
+                    vt = v_view[tile_b, tile_n, :]
+                    acc = torch.baddbmm(acc, p.to(vt.dtype), vt)
+                    m_i = m_ij
+                acc = acc / l_i[:, :, None]
+                out[tile_b, tile_m, :] = acc.to(out.dtype)
+            return out.view(q_in.size())
+
+        @helion.kernel(backend="cute", static_shapes=True)
+        def causal_flash_attn(
+            q_in: torch.Tensor, k_in: torch.Tensor, v_in: torch.Tensor
+        ) -> torch.Tensor:
+            m_dim = q_in.size(-2)
+            n_dim = k_in.size(-2)
+            head_dim = hl.specialize(q_in.size(-1))
+            q_view = q_in.reshape([-1, m_dim, head_dim])
+            v_view = v_in.reshape([-1, n_dim, head_dim])
+            k_view = k_in.reshape([-1, n_dim, head_dim])
+            out = torch.empty_like(q_view)
+            qk_scale = (1.0 / math.sqrt(head_dim)) * 1.44269504
+            for tile_b, tile_m in hl.tile([q_view.size(0), m_dim]):
+                m_i = hl.full([tile_b, tile_m], float("-inf"), dtype=torch.float32)
+                l_i = torch.full_like(m_i, 1.0)
+                acc = hl.zeros([tile_b, tile_m, head_dim], dtype=torch.float32)
+                qt = q_view[tile_b, tile_m, :]
+                for tile_n in hl.tile(v_view.size(1)):
+                    kt = k_view[tile_b, tile_n, :]
+                    qk = torch.bmm(qt * qk_scale, kt.transpose(1, 2), torch.float32)
+                    qk = torch.where(
+                        tile_m.index[None, :, None] >= tile_n.index[None, None, :],
+                        qk,
+                        float("-inf"),
+                    )
+                    m_ij_keepdim = torch.maximum(
+                        m_i[:, :, None], torch.amax(qk, -1, keepdim=True)
+                    )
+                    qk = qk - m_ij_keepdim
+                    m_ij = m_ij_keepdim.squeeze(-1)
+                    p = torch.exp2(qk)
+                    l_ij = torch.sum(p, -1)
+                    alpha = torch.exp2(m_i - m_ij)
+                    l_i = l_i * alpha + l_ij
+                    acc = acc * alpha[:, :, None]
+                    vt = v_view[tile_b, tile_n, :]
+                    acc = torch.baddbmm(acc, p.to(vt.dtype), vt)
+                    m_i = m_ij
+                acc = acc / l_i[:, :, None]
+                out[tile_b, tile_m, :] = acc.to(out.dtype)
+            return out.view(q_in.size())
+
+        heuristic = CuteFlashAttentionHeuristic
+        fp16_args = tuple(
+            torch.randn(2, 32, 1024, 64, dtype=torch.float16, device=DEVICE)
+            for _ in range(3)
+        )
+        bound = flash_attn.bind(fp16_args)
+        self.assertIn(
+            CuteFlashAttentionHeuristic.name,
+            bound.config_spec.autotuner_heuristics,
+        )
+        self.assertTrue(heuristic.is_eligible(bound.env, bound.host_function.device_ir))
+        seed = heuristic.get_seed_config(bound.env, bound.host_function.device_ir)
+        assert seed is not None
+        self.assertEqual(seed.config["block_sizes"], [1, 128, 128])
+        self.assertEqual(seed.config[FLASH_TOPOLOGY_KEY], "fa4")
+        self.assertNotIn(FLASH_E2E_OFFSET_KEY, seed.config)
+        self.assertIn(seed, bound.config_spec.compiler_seed_configs)
+        self.assertIsNone(bound.config_spec.compiler_default_config)
+
+        dense_2048_args = tuple(
+            torch.empty(1, 1, 2048, 64, dtype=torch.float16, device=DEVICE)
+            for _ in range(3)
+        )
+        dense_2048_bound = flash_attn.bind(dense_2048_args)
+        dense_2048_seed = heuristic.get_seed_config(
+            dense_2048_bound.env, dense_2048_bound.host_function.device_ir
+        )
+        assert dense_2048_seed is not None
+        self.assertEqual(dense_2048_seed.config[FLASH_S_STAGE_KEY], 2)
+        self.assertEqual(dense_2048_seed.config[FLASH_KV_STAGE_KEY], 3)
+        self.assertTrue(dense_2048_seed.config[FLASH_PERSISTENT_KEY])
+        self.assertEqual(dense_2048_seed.config[FLASH_E2E_SCHEDULE_KEY], "8/2")
+        self.assertEqual(dense_2048_seed.config[FLASH_E2E_OFFSET_KEY], 2)
+        self.assertEqual(dense_2048_seed.config[FLASH_E2E_OFFSET0_KEY], 2)
+        self.assertEqual(dense_2048_seed.config[FLASH_DISC_PIPE_KEY], 4)
+        self.assertTrue(dense_2048_seed.config[FLASH_EPI_TMA_KEY])
+        self.assertEqual(dense_2048_seed.config[FLASH_RESCALE_CHUNK_COLS_KEY], 16)
+        self.assertFalse(dense_2048_seed.config[FLASH_PACKED_REDUCE_KEY])
+        self.assertIn(
+            dense_2048_seed, dense_2048_bound.config_spec.compiler_seed_configs
+        )
+        self.assertIsNone(dense_2048_bound.config_spec.compiler_default_config)
+
+        dense_8192_args = tuple(
+            torch.empty(1, 1, 8192, 64, dtype=torch.float16, device=DEVICE)
+            for _ in range(3)
+        )
+        dense_8192_bound = flash_attn.bind(dense_8192_args)
+        dense_8192_seed = heuristic.get_seed_config(
+            dense_8192_bound.env, dense_8192_bound.host_function.device_ir
+        )
+        assert dense_8192_seed is not None
+        self.assertEqual(dense_8192_seed.config[FLASH_E2E_SCHEDULE_KEY], "8/2")
+        self.assertEqual(dense_8192_seed.config[FLASH_E2E_OFFSET_KEY], 2)
+        self.assertEqual(dense_8192_seed.config[FLASH_E2E_OFFSET0_KEY], 2)
+        self.assertEqual(dense_8192_seed.config[FLASH_DISC_PIPE_KEY], 3)
+        self.assertEqual(dense_8192_seed.config[FLASH_SOFTMAX_REGS_KEY], 184)
+        self.assertNotIn(FLASH_CORR_REGS_KEY, dense_8192_seed.config)
+        self.assertTrue(dense_8192_seed.config[FLASH_EPI_TMA_KEY])
+        self.assertEqual(dense_8192_seed.config[FLASH_RESCALE_CHUNK_COLS_KEY], 16)
+        self.assertEqual(dense_8192_seed.config[FLASH_RESCALE_THRESHOLD_KEY], 8.0)
+        self.assertTrue(dense_8192_seed.config[FLASH_PACKED_REDUCE_KEY])
+        self.assertNotIn(FLASH_CAUSAL_LPT_SWIZZLE_KEY, dense_8192_seed.config)
+        dense_8192_gen = ConfigGeneration(dense_8192_bound.config_spec)
+        dense_8192_roundtrip = dense_8192_gen.unflatten(
+            dense_8192_gen.flatten(dense_8192_seed)
+        )
+        self.assertEqual(
+            dense_8192_roundtrip.config[FLASH_SOFTMAX_REGS_KEY],
+            184,
+        )
+        self.assertEqual(
+            dense_8192_roundtrip.config[FLASH_CORR_REGS_KEY],
+            64,
+        )
+
+        causal_hd64_bound = causal_flash_attn.bind(fp16_args)
+        causal_hd64_seed = heuristic.get_seed_config(
+            causal_hd64_bound.env, causal_hd64_bound.host_function.device_ir
+        )
+        assert causal_hd64_seed is not None
+        self.assertEqual(causal_hd64_seed.config["block_sizes"], [1, 128, 128])
+        self.assertEqual(causal_hd64_seed.config[FLASH_TOPOLOGY_KEY], "fa4")
+        self.assertTrue(causal_hd64_seed.config[FLASH_PACKED_REDUCE_KEY])
+        self.assertIn(
+            causal_hd64_seed, causal_hd64_bound.config_spec.compiler_seed_configs
+        )
+        self.assertIsNone(causal_hd64_bound.config_spec.compiler_default_config)
+
+        causal_8192_args = tuple(
+            torch.empty(1, 1, 8192, 64, dtype=torch.float16, device=DEVICE)
+            for _ in range(3)
+        )
+        causal_8192_bound = causal_flash_attn.bind(causal_8192_args)
+        self.assertIn(
+            CuteFlashAttentionCausalLptHeuristic.name,
+            causal_8192_bound.config_spec.autotuner_heuristics,
+        )
+        causal_lpt_seed = CuteFlashAttentionCausalLptHeuristic.get_seed_config(
+            causal_8192_bound.env, causal_8192_bound.host_function.device_ir
+        )
+        assert causal_lpt_seed is not None
+        self.assertEqual(causal_lpt_seed.config[FLASH_CAUSAL_LPT_SWIZZLE_KEY], 8)
+        self.assertEqual(
+            causal_lpt_seed.config[FLASH_CAUSAL_KV_ORDER_KEY], "descending"
+        )
+        self.assertEqual(
+            causal_lpt_seed.config[FLASH_MASKED_E2E_SCHEDULE_KEY], "inherit"
+        )
+        self.assertEqual(causal_lpt_seed.config[FLASH_ROLE_MAP_KEY], "helion")
+        self.assertEqual(causal_lpt_seed.config[FLASH_E2E_OFFSET_KEY], 0)
+        self.assertEqual(causal_lpt_seed.config[FLASH_SOFTMAX_REGS_KEY], 200)
+        self.assertTrue(causal_lpt_seed.config[FLASH_PACKED_REDUCE_KEY])
+        self.assertIn(
+            causal_lpt_seed, causal_8192_bound.config_spec.compiler_seed_configs
+        )
+        causal_split_seed = flash_attention_seed_config(
+            64, 64, is_causal=True, seed_kind="causal_split"
+        )
+        assert causal_split_seed is not None
+        self.assertIn(
+            causal_split_seed, causal_8192_bound.config_spec.compiler_seed_configs
+        )
+        self.assertIsNone(causal_8192_bound.config_spec.compiler_default_config)
+
+        causal_65536_args = tuple(
+            torch.empty(1, 1, 65536, 64, dtype=torch.float16, device=DEVICE)
+            for _ in range(3)
+        )
+        causal_65536_bound = causal_flash_attn.bind(causal_65536_args)
+        self.assertIn(
+            CuteFlashAttentionCausalLptHeuristic.name,
+            causal_65536_bound.config_spec.autotuner_heuristics,
+        )
+        causal_65536_seed = CuteFlashAttentionCausalLptHeuristic.get_seed_config(
+            causal_65536_bound.env, causal_65536_bound.host_function.device_ir
+        )
+        assert causal_65536_seed is not None
+        self.assertEqual(causal_65536_seed.config[FLASH_CAUSAL_LPT_SWIZZLE_KEY], 1)
+        self.assertEqual(causal_65536_seed.config[FLASH_E2E_OFFSET_KEY], 9)
+        self.assertEqual(causal_65536_seed.config[FLASH_SOFTMAX_REGS_KEY], 184)
+        self.assertEqual(causal_65536_seed.config[FLASH_DISC_PIPE_KEY], 4)
+        self.assertTrue(causal_65536_seed.config[FLASH_PACKED_REDUCE_KEY])
+        self.assertIn(
+            causal_65536_seed, causal_65536_bound.config_spec.compiler_seed_configs
+        )
+        self.assertIsNone(causal_65536_bound.config_spec.compiler_default_config)
+        causal_65536_gen = ConfigGeneration(causal_65536_bound.config_spec)
+        causal_65536_default = causal_65536_gen.unflatten(
+            causal_65536_gen.default_flat()
+        )
+        self.assertEqual(
+            causal_65536_default.config[FLASH_SOFTMAX_REGS_KEY],
+            184,
+        )
+        self.assertEqual(causal_65536_default.config[FLASH_E2E_OFFSET_KEY], 9)
+        causal_65536_roundtrip = causal_65536_gen.unflatten(
+            causal_65536_gen.flatten(causal_65536_seed)
+        )
+        self.assertEqual(
+            causal_65536_roundtrip.config[FLASH_SOFTMAX_REGS_KEY],
+            184,
+        )
+
+        causal_hd128_args = tuple(
+            torch.randn(2, 32, 1024, 128, dtype=torch.float16, device=DEVICE)
+            for _ in range(3)
+        )
+        causal_hd128_bound = causal_flash_attn.bind(causal_hd128_args)
+        causal_hd128_seed = heuristic.get_seed_config(
+            causal_hd128_bound.env, causal_hd128_bound.host_function.device_ir
+        )
+        assert causal_hd128_seed is not None
+        self.assertEqual(causal_hd128_seed.config[FLASH_TOPOLOGY_KEY], "fa4")
+        self.assertEqual(causal_hd128_seed.config[FLASH_KV_STAGE_KEY], 2)
+
+        # fp32 attention is not flash-eligible (the kernel hardcodes fp16).
+        fp32_args = tuple(
+            torch.randn(2, 32, 1024, 64, dtype=torch.float32, device=DEVICE)
+            for _ in range(3)
+        )
+        fp32_bound = flash_attn.bind(fp32_args)
+        self.assertFalse(
+            heuristic.is_eligible(fp32_bound.env, fp32_bound.host_function.device_ir)
+        )
+        self.assertNotIn(
+            CuteFlashAttentionHeuristic.name,
+            fp32_bound.config_spec.autotuner_heuristics,
+        )
+
+        with patch_cute_mma_support(default_cute_mma_support(tcgen05_f16bf16=False)):
+            unsupported_args = tuple(
+                torch.randn(1, 16, 512, 64, dtype=torch.float16, device=DEVICE)
+                for _ in range(3)
+            )
+            unsupported_bound = flash_attn.bind(unsupported_args)
+            self.assertFalse(
+                heuristic.is_eligible(
+                    unsupported_bound.env,
+                    unsupported_bound.host_function.device_ir,
+                )
+            )
+            self.assertNotIn(
+                CuteFlashAttentionHeuristic.name,
                 unsupported_bound.config_spec.autotuner_heuristics,
             )
 

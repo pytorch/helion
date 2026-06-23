@@ -2126,7 +2126,7 @@ def _pallas_compile_compact_jit_fn(
         num_work = metadata.num_work  # type: ignore[attr-defined]
         scalar_prefetch = [getattr(metadata, f) for f in metadata_fields]
         call = pl.pallas_call(  # type: ignore[union-attr]
-            reordered_kernel,
+            reordered_kernel,  # pyrefly: ignore[bad-argument-type]
             out_shape=out_shape_arg,
             grid_spec=pltpu.PrefetchScalarGridSpec(  # type: ignore[union-attr]
                 num_scalar_prefetch=num_scalar_prefetch,
@@ -2408,6 +2408,7 @@ def _append_cute_wrapper_plan(
     body: list[str],
     call_args: list[str],
     plan: dict[str, object],
+    num_sm: int | None = None,
 ) -> None:
     def plan_int(key: str, default: int | None = None) -> int:
         value = plan.get(key, default) if default is not None else plan[key]
@@ -2502,6 +2503,206 @@ def _append_cute_wrapper_plan(
         call_args.extend(kernel_args)
 
     kind = plan["kind"]
+    if kind == "helion_small_biased_attention":
+        batch = plan_int("batch")
+        seq = plan_int("seq")
+        body.extend(
+            [
+                f"    grid_x = cutlass.Int32({seq})",
+                f"    grid_y = cutlass.Int32({batch})",
+                "    grid_z = cutlass.Int32(1)",
+            ]
+        )
+        return
+
+    if kind == "helion_flash":
+        # Fused tcgen05 flash-attention host setup: reorder Helion's (B, S, D)
+        # tensors to the reference (S, D, B) / (D, S, B) layouts, build the two
+        # tiled_mma (QK from SMEM, PV with OperandSource.TMEM) and the three TMA
+        # atoms, then append all kernel args. Mirrors
+        # ``.notes/spikes/fa_tcgen05_spike.py`` host_function (3D-batched variant
+        # validated standalone).
+        q_idx = plan_int("q_idx")
+        k_idx = plan_int("k_idx")
+        v_idx = plan_int("v_idx")
+        o_idx = plan_int("o_idx")
+        lse_idx = plan_optional_int("lse_idx")
+        bias_idx = plan_optional_int("bias_idx")
+        alibi_idx = plan_optional_int("alibi_idx")
+        document_idx = plan_optional_int("document_idx")
+        seq = plan_int("seq")
+        head_dim = plan_int("head_dim")
+        batch = plan_int("batch")
+        scale_log2 = plan["scale_log2"]
+        assert isinstance(scale_log2, float)
+        score_bias_scale = plan.get("score_bias_scale", 0.0)
+        assert isinstance(score_bias_scale, float)
+        alibi_count = plan_int("alibi_count", default=batch)
+        document_batch = plan_int("document_batch", default=batch)
+        document_heads_per_batch = plan_int("document_heads_per_batch", default=1)
+        kv_stage = plan_int("kv_stage")
+        q_stage = plan_int("q_stage", default=1)
+        num_kv = (seq + 127) // 128
+        # Static-persistent scheduler: total_tiles = num_bh * num_m_tiles (the
+        # flat tile-id space the device-body strided while loop walks). When
+        # persistent, the host clamps grid_x down to min(total_tiles, num_SMs)
+        # so each SM gets one CTA that strides over many work tiles.
+        persistent = bool(plan.get("persistent"))
+        total_tiles = plan_int("total_tiles", default=batch * (seq // 128))
+        pass_dynamic_tile_counts = plan.get("topology") != "fa4"
+        hd = head_dim
+        dtype = str(plan.get("dtype", "cutlass.Float16"))
+        assert dtype in ("cutlass.Float16", "cutlass.BFloat16")
+        # (S, D, B) views over the existing (B, S, D) row-major buffers.
+        bw = "cutlass.utils.blackwell_helpers"
+        qkd = f"(128, 128, {hd})"
+        pvd = f"(128, {hd}, 128)"
+        sdb = f"cute.make_layout(({seq}, {hd}, {batch}), stride=({hd}, 1, {seq * hd}))"
+        dsb = f"cute.make_layout(({hd}, {seq}, {batch}), stride=(1, {hd}, {seq * hd}))"
+        ssb = (
+            f"cute.make_layout(({seq}, {seq}, {batch}), stride=({seq}, 1, {seq * seq}))"
+        )
+        sb = f"cute.make_layout(({seq}, {batch}), stride=(1, {seq}))"
+        majk = "cute.nvgpu.OperandMajorMode.K"
+        cg1 = "cute.nvgpu.tcgen05.CtaGroup.ONE"
+        sel = "cute.select"
+        flash_lines = [
+            f"_flash_mQ = cute.make_tensor(arg{q_idx}.iterator, {sdb})",
+            f"_flash_mK = cute.make_tensor(arg{k_idx}.iterator, {sdb})",
+            # V is MN-major: (D, S, B).
+            f"_flash_mV = cute.make_tensor(arg{v_idx}.iterator, {dsb})",
+            f"_flash_mO = cute.make_tensor(arg{o_idx}.iterator, {sdb})",
+            f"_flash_qk_mma = {bw}.make_trivial_tiled_mma({dtype}, {dtype}, {majk}, {majk}, cutlass.Float32, {cg1}, (128, 128))",
+            f"_flash_pv_mma = {bw}.make_trivial_tiled_mma({dtype}, {dtype}, {majk}, cute.nvgpu.OperandMajorMode.MN, cutlass.Float32, {cg1}, (128, {hd}), cute.nvgpu.tcgen05.OperandSource.TMEM)",
+            f"_flash_qsl = {bw}.make_smem_layout_a(_flash_qk_mma, {qkd}, {dtype}, {q_stage})",
+            # K/V are multi-stage TMA rings (Stage 3); the stage count must match
+            # the device-body kv_stage + the SharedStorage MemRange depths.
+            f"_flash_ksl = {bw}.make_smem_layout_b(_flash_qk_mma, {qkd}, {dtype}, {kv_stage})",
+            f"_flash_vsl = {bw}.make_smem_layout_b(_flash_pv_mma, {pvd}, {dtype}, {kv_stage})",
+            f"_flash_ptl = {bw}.make_smem_layout_a(_flash_pv_mma, {pvd}, {dtype}, 1)",
+            f"_flash_op = cute.nvgpu.cpasync.CopyBulkTensorTileG2SOp({cg1})",
+            f"_flash_tma_q, _flash_mQt = cute.nvgpu.make_tiled_tma_atom_A(_flash_op, _flash_mQ, {sel}(_flash_qsl, mode=[0, 1, 2]), {qkd}, _flash_qk_mma)",
+            f"_flash_tma_k, _flash_mKt = cute.nvgpu.make_tiled_tma_atom_B(_flash_op, _flash_mK, {sel}(_flash_ksl, mode=[0, 1, 2]), {qkd}, _flash_qk_mma)",
+            f"_flash_tma_v, _flash_mVt = cute.nvgpu.make_tiled_tma_atom_B(_flash_op, _flash_mV, {sel}(_flash_vsl, mode=[0, 1, 2]), {pvd}, _flash_pv_mma)",
+            f"_flash_scale_log2 = cutlass.Float32({scale_log2!r})",
+            f"_flash_num_kv_tiles = cutlass.Int32({num_kv})",
+        ]
+        if bias_idx is not None:
+            flash_lines.extend(
+                [
+                    f"_flash_mBias = cute.make_tensor(arg{bias_idx}.iterator, {ssb})",
+                    f"_flash_score_bias_scale = cutlass.Float32({score_bias_scale!r})",
+                ]
+            )
+        if alibi_idx is not None:
+            flash_lines.extend(
+                [
+                    (
+                        f"_flash_mAlibi = cute.make_tensor(arg{alibi_idx}.iterator, "
+                        f"cute.make_layout(({alibi_count},), stride=(1,)))"
+                    ),
+                    f"_flash_num_alibi = cutlass.Int32({alibi_count})",
+                ]
+            )
+        if document_idx is not None:
+            sdoc = f"cute.make_layout(({seq}, {document_batch}), stride=(1, {seq}))"
+            flash_lines.extend(
+                [
+                    f"_flash_mDoc = cute.make_tensor(arg{document_idx}.iterator, {sdoc})",
+                    (
+                        "_flash_doc_heads_per_batch = "
+                        f"cutlass.Int32({document_heads_per_batch})"
+                    ),
+                ]
+            )
+        if pass_dynamic_tile_counts:
+            flash_lines.extend(
+                [
+                    f"_flash_num_bh = cutlass.Int32({batch})",
+                    f"_flash_total_tiles = cutlass.Int32({total_tiles})",
+                ]
+            )
+        if lse_idx is not None:
+            flash_lines.append(
+                f"_flash_mLSE = cute.make_tensor(arg{lse_idx}.iterator, {sb})"
+            )
+        epi_tma = bool(plan.get("epi_tma"))
+        if epi_tma:
+            # Lever A: build the O TMA STORE atom (fa4-only). The O smem layout is
+            # the per-Q-tile (128, hd) epilogue tile, 2-staged so BOTH adjacent
+            # Q-tiles' outputs fit (matches the fa4 q_stage=2 sQ region the corr
+            # epilogue reuses). ``make_tiled_tma_atom(S2G, ...)`` returns the
+            # TMA-adjusted mO as ``_flash_mOt`` (mirrors the Q/K/V load atoms).
+            otile = f"(128, {hd})"
+            flash_lines.extend(
+                [
+                    (
+                        f"_flash_osl = {bw}.make_smem_layout_epi("
+                        f"{dtype}, cutlass.utils.layout.LayoutEnum.ROW_MAJOR, {otile}, 2)"
+                    ),
+                    (
+                        f"_flash_o_cta_v = cute.composition("
+                        f"cute.make_identity_layout(_flash_mO.shape), {otile})"
+                    ),
+                    (
+                        "_flash_tma_o, _flash_mOt = "
+                        "cute.nvgpu.cpasync.make_tiled_tma_atom("
+                        "cute.nvgpu.cpasync.CopyBulkTensorTileS2GOp(), _flash_mO, "
+                        "cute.select(_flash_osl, mode=[0, 1]), _flash_o_cta_v)"
+                    ),
+                ]
+            )
+        else:
+            # mO stays the (S, D, B) view (no TMA atom; the epilogue uses
+            # autovec_copy straight to gmem).
+            flash_lines.append("_flash_mOt = _flash_mO")
+        body.extend(f"    {line}" for line in flash_lines)
+        if persistent:
+            # Cap the flat grid at num_SMs (computed host-side from the q tensor's
+            # device at wrapper-build time and baked as a literal). grid_y/grid_z
+            # stay 1 (already true for the flat flash grid). The device-body
+            # strided while loop then covers all total_tiles work items.
+            assert num_sm is not None and num_sm > 0
+            grid_cap = min(total_tiles, num_sm)
+            body.append(f"    grid_x = cutlass.Int32({grid_cap})")
+        elif plan.get("topology") == "fa4":
+            # The fa4 topology processes a PAIR of adjacent 128-row Q-tiles per
+            # CTA, so it needs exactly total_tiles (= batch * seq // 256) CTAs.
+            # The default root grid would launch batch * seq // 128; override it
+            # to the halved fa4 tile count.
+            body.append(f"    grid_x = cutlass.Int32({total_tiles})")
+        call_args.extend(
+            [
+                "_flash_qk_mma",
+                "_flash_pv_mma",
+                "_flash_tma_q",
+                "_flash_mQt",
+                "_flash_tma_k",
+                "_flash_mKt",
+                "_flash_tma_v",
+                "_flash_mVt",
+                "_flash_mOt",
+                "_flash_qsl",
+                "_flash_ksl",
+                "_flash_vsl",
+                "_flash_ptl",
+                "_flash_scale_log2",
+                "_flash_num_kv_tiles",
+            ]
+        )
+        if pass_dynamic_tile_counts:
+            call_args.extend(["_flash_num_bh", "_flash_total_tiles"])
+        if lse_idx is not None:
+            call_args.append("_flash_mLSE")
+        if bias_idx is not None:
+            call_args.extend(["_flash_mBias", "_flash_score_bias_scale"])
+        if alibi_idx is not None:
+            call_args.extend(["_flash_mAlibi", "_flash_num_alibi"])
+        if document_idx is not None:
+            call_args.extend(["_flash_mDoc", "_flash_doc_heads_per_batch"])
+        if epi_tma:
+            call_args.extend(["_flash_tma_o", "_flash_osl"])
+        return
     if kind == "tcgen05_d_tma":
         d_idx = plan_int("d_idx")
         bm = plan_int("bm")
@@ -2741,6 +2942,7 @@ def _create_cute_wrapper(
     cute_kernel: object,
     schema_key: tuple[tuple[object, ...], ...],
     block: tuple[int, int, int],
+    num_sm: int | None = None,
 ) -> object:
     _patch_cutlass_jit_shutdown_unload()
     import cutlass
@@ -2836,7 +3038,7 @@ def _create_cute_wrapper(
         for plan in getattr(cast("Any", cute_kernel), "_helion_cute_wrapper_plans", [])
     ]
     for plan in wrapper_plans:
-        _append_cute_wrapper_plan(body, call_args, plan)
+        _append_cute_wrapper_plan(body, call_args, plan, num_sm=num_sm)
     launch_suffix = f", block={block!r}"
     cluster_shape = _cute_cluster_shape(cute_kernel, wrapper_plans)
     if cluster_shape is not None:
@@ -2850,6 +3052,19 @@ def _create_cute_wrapper(
     # mirrors how ``cluster_m``/``cluster_n`` flow through this layer.
     if any(plan.get("use_pdl") for plan in wrapper_plans):
         launch_suffix += ", use_pdl=True"
+    # The fa4 flash topology (16-warp/512-thread) uses ``cute.arch.setmaxregister``
+    # for per-warp register reallocation (softmax warps inc to 200; mma/corr/load/empty
+    # dec). ptxas only emits the ``EIATTR_REG_RECONFIG`` that HONORS those ``setmaxnreg``
+    # ops when the kernel declares ``min_blocks_per_mp`` (>= 1); WITHOUT it ptxas
+    # SILENTLY DROPS every setmaxnreg and all warps are stuck at the static uniform
+    # split -- so the softmax warp never reaches its 200-reg grant and spills its
+    # resident row to local memory. fa4 already pins 1 CTA/SM (512 threads + TMEM = 1
+    # tcgen05 unit/SM + smem near the cap), so ``min_blocks_per_mp=1`` matches its real
+    # occupancy and enables the reallocation (=1 avoids the smem-carveout path >1 would
+    # trigger). NOT applied to ws_overlap (256-thread): forcing 1 CTA/SM there cuts its
+    # 2-blocks/SM occupancy and regresses it ~4pp.
+    if any(plan.get("topology") == "fa4" for plan in wrapper_plans):
+        launch_suffix += ", min_blocks_per_mp=1"
     body.extend(
         (
             f"    _helion_cute_kernel_tag = {kernel_tag!r}",
@@ -3099,12 +3314,22 @@ def _get_compiled_cute_launcher(
     cluster_shape = getattr(
         cast("Any", cute_kernel), "_helion_cute_cluster_shape", None
     )
+    # Persistent flash kernels bake the device SM count into the wrapper grid
+    # clamp; resolve it from the first tensor arg's device so the cache key (and
+    # the baked literal) stay device-correct across GPUs.
+    num_sm: int | None = None
+    if arch_args is not None:
+        for arg in arch_args:
+            if isinstance(arg, torch.Tensor) and arg.device.type == "cuda":
+                num_sm = get_num_sm(arg.device)
+                break
     cache_key = (
         schema_key,
         block,
         wrapper_plans,
         repr(cluster_shape),
         compile_options,
+        num_sm,
     )
     cached = cache.get(cache_key)
     if cached is not None:
@@ -3112,9 +3337,15 @@ def _get_compiled_cute_launcher(
 
     if arch_args is not None:
         _ensure_cute_dsl_arch_env(arch_args)
-    jit_func = _create_cute_wrapper(cute_kernel, schema_key, block)
+    jit_func = _create_cute_wrapper(cute_kernel, schema_key, block, num_sm=num_sm)
     disk_cache_key = _cute_disk_cache_key(
-        cute_kernel, schema_key, block, wrapper_plans, cluster_shape, compile_options
+        cute_kernel,
+        schema_key,
+        block,
+        wrapper_plans,
+        cluster_shape,
+        compile_options,
+        num_sm,
     )
     launcher = _CompiledCuteLauncher(
         jit_func, compile_options, cache_key=disk_cache_key
@@ -3151,6 +3382,7 @@ def _cute_disk_cache_key(
     wrapper_plans: tuple[object, ...],
     cluster_shape: object,
     compile_options: str | None,
+    num_sm: int | None = None,
 ) -> str | None:
     """Compute a stable cross-process key for the on-disk CuTe compile cache.
 
@@ -3162,6 +3394,15 @@ def _cute_disk_cache_key(
     baked shapes/strides, constexpr values), launch shape (block/cluster), CuTe
     compile options, the IR-affecting ``CUTE_DSL_*`` env vars (target SM arch
     among them), and the cutlass version.
+
+    ``num_sm`` is the device SM count the persistent flash wrapper bakes into
+    its grid clamp as a literal (``cute.compile`` lowers that literal into the
+    persisted ``ir_module``).  The env-var arch capture only distinguishes the
+    target *arch*, not the SM *count*, so two same-arch GPUs with different SM
+    counts would otherwise collide on one on-disk artifact carrying the wrong
+    grid clamp.  It is included unconditionally to match the in-memory cache
+    key; for non-persistent kernels num_sm does not affect codegen, so it only
+    costs an occasional cross-GPU miss, never a wrong-kernel reload.
     """
     source_hash = getattr(cute_kernel, "_helion_cute_source_hash", None)
     if source_hash is None:
@@ -3183,6 +3424,7 @@ def _cute_disk_cache_key(
             compile_options or "",
             _cute_cache_relevant_env(),
             cutlass_version,
+            num_sm,
         )
     )
     digest = hashlib.sha256(payload.encode("utf-8")).digest()
@@ -3205,6 +3447,20 @@ def _get_cute_launcher_imports() -> tuple[object, ...]:
     cached = (cute.AddressSpace.gmem, make_ptr, cutlass_torch.current_stream)
     _CUTE_LAUNCHER_IMPORTS = cached
     return cached
+
+
+def _cute_current_stream() -> object:
+    """Sample the *current* CUDA stream for a cute kernel launch.
+
+    Must be called fresh on every launch and never cached: under CUDA graph
+    capture ``torch.cuda.current_stream()`` is redirected to a dedicated capture
+    stream, so a stream baked into the cached launch args (during eager warmup)
+    would make the kernel launch on the wrong, non-capturing stream — the graph
+    then records no work and replays as a no-op (empty-graph capture). Sampling
+    here keeps the launch on whatever stream is current at call time.
+    """
+    _gmem, _make_ptr, current_stream_obj = _get_cute_launcher_imports()
+    return cast("Any", current_stream_obj)()
 
 
 # Keep the per-kernel launch-argument cache small: production kernels normally
@@ -3291,9 +3547,14 @@ def _build_cute_schema_and_args(
     grid: tuple[int, int, int],
     bake_tensor_shapes: bool = True,
 ) -> tuple[tuple[tuple[object, ...], ...], tuple[object, ...]]:
-    gmem_space, make_ptr_obj, current_stream_obj = _get_cute_launcher_imports()
+    # NOTE: the returned launch args deliberately EXCLUDE the CUDA stream. The
+    # stream is the only launch arg that is not a pure function of
+    # (grid, tensor metadata, scalars), so it must not be baked into the cached
+    # args — the caller appends a freshly sampled ``_cute_current_stream()`` on
+    # every launch (see ``default_cute_launcher``). Caching the stream would
+    # break CUDA graph capture (empty-graph / no-op replay).
+    gmem_space, make_ptr_obj, _current_stream_obj = _get_cute_launcher_imports()
     make_ptr = cast("Any", make_ptr_obj)
-    current_stream = cast("Any", current_stream_obj)
     constexpr_flags = _cute_kernel_param_is_constexpr(cute_kernel)
     # Kernels that emit cute MMA ops (universal matmul fallback or tcgen05
     # TMA wrapper plans) need runtime tensor layouts: the wrapper's
@@ -3303,9 +3564,14 @@ def _build_cute_schema_and_args(
     # silently miscompiles those paths.
     if bake_tensor_shapes:
         any_obj = cast("Any", cute_kernel)
+        wrapper_plans = getattr(any_obj, "_helion_cute_wrapper_plans", None)
+        wrapper_plans_disable_bake = bool(wrapper_plans) and not all(
+            plan.get("kind") == "helion_small_biased_attention"
+            for plan in wrapper_plans
+        )
         disable_bake = bool(
             getattr(any_obj, "_helion_cute_disable_bake_tensor_shapes", False)
-            or getattr(any_obj, "_helion_cute_wrapper_plans", None)
+            or wrapper_plans_disable_bake
         )
         if disable_bake:
             bake_tensor_shapes = False
@@ -3366,7 +3632,8 @@ def _build_cute_schema_and_args(
             launch_args.append(scalar_value)
 
     launch_args.extend(grid)
-    launch_args.append(current_stream())
+    # The stream is intentionally NOT appended here; it is sampled fresh per
+    # launch by the caller so CUDA graph capture sees the capture stream.
     return tuple(schema), tuple(launch_args)
 
 
@@ -3456,7 +3723,10 @@ def default_cute_launcher(
         compile_options=cute_compile_options,
         arch_args=args_tuple,
     )
-    return cast("Any", compiled)(*launch_args)
+    # Append the CUDA stream fresh on every launch (never cached): under CUDA
+    # graph capture the current stream is the capture stream, so the kernel must
+    # be issued there and not on a stale stream baked into the cached args.
+    return cast("Any", compiled)(*launch_args, _cute_current_stream())
 
 
 def default_metal_launcher(

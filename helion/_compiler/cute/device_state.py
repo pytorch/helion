@@ -14,6 +14,7 @@ if TYPE_CHECKING:
     from torch.fx.node import Node
 
     from ..tile_strategy import DeviceLoopState
+    from .attention_plan import AttentionScorePlan
     from .aux_tensor import Tcgen05AuxTensorDescriptor
     from .cute_mma import _Tcgen05AuxPipelinePlan
     from .cute_mma import _Tcgen05SchedPipelinePlan
@@ -331,6 +332,16 @@ class CuteDeviceFunctionState:
         # masking for that axis (the serial loop already covers exactly [0, C)).
         # Empty except while re-materializing such an operand load.
         self.matmul_operand_index_override: dict[int, str] = {}
+        # Set by the backend's flash-attention detector when the fused
+        # tcgen05 QK->softmax->PV path is active (HELION_CUTE_FLASH). Holds the
+        # tile_n device-loop block ids. The dedicated flash codegen emits the
+        # whole device body and host launch, mirroring
+        # ``.notes/spikes/fa_tcgen05_spike.py``.
+        self.attention_flash_block_ids: list[int] | None = None
+        self.attention_flash_score_plan: AttentionScorePlan | None = None
+        # Launch block thread count for the flash path: 128 (single-warpgroup
+        # Stage-3) or 256 (Stage-4 warp-spec, double-buffered-S overlap).
+        self.attention_flash_threads: int = 128
 
     def register_tcgen05_store_value(
         self, name: str, value: CuteTcgen05StoreValue

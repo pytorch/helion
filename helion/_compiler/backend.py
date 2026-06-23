@@ -4,6 +4,7 @@ import abc
 import ast
 import base64
 import contextlib
+import dataclasses
 import enum
 import functools
 import hashlib
@@ -18,6 +19,7 @@ from typing import TYPE_CHECKING
 from typing import Any
 from typing import Callable
 from typing import ClassVar
+from typing import NamedTuple
 from typing import Sequence
 
 import sympy
@@ -25,6 +27,16 @@ import torch
 
 from .. import exc
 from .ast_extension import expr_from_string
+from .cute.attention_plan import ALIBI_BIAS_KIND
+from .cute.attention_plan import CAUSAL_MASK_KIND
+from .cute.attention_plan import DOCUMENT_MASK_KIND
+from .cute.attention_plan import PREFIX_LM_MASK_KIND
+from .cute.attention_plan import RELATIVE_BIAS_KIND
+from .cute.attention_plan import SLIDING_WINDOW_MASK_KIND
+from .cute.attention_plan import SOFTCAP_KIND
+from .cute.attention_plan import TENSOR_BIAS_KIND
+from .cute.attention_plan import AttentionScoreModifier
+from .cute.attention_plan import AttentionScorePlan
 from .cute.tcgen05_constants import TCGEN05_CUBIN_LINEINFO_CONFIG_KEY
 from .cute.tcgen05_constants import TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY
 
@@ -41,6 +53,7 @@ if TYPE_CHECKING:
     from ..runtime.settings import DotPrecision
     from .device_function import Argument
     from .device_function import DeviceFunction
+    from .device_ir import DeviceIR
     from .device_ir import GraphInfo
     from .host_function import HostFunction
     from .pallas.compact_worklist import CompactWorklistPlan
@@ -50,6 +63,28 @@ if TYPE_CHECKING:
     InductorOpOverrides = OpsHandler[Any]
 
 log: logging.Logger = logging.getLogger(__name__)
+
+
+class FlashSearchSurface(NamedTuple):
+    head_dim: int
+    num_kv: int
+    block_size_targets: dict[int, int]
+    is_causal: bool
+    has_kv_tile_pruning: bool
+    requires_ws_overlap: bool
+    small_biased_candidate: bool
+
+
+class AttentionSoftmaxPattern(NamedTuple):
+    score_plan: AttentionScorePlan
+
+    @property
+    def head_dim(self) -> int:
+        return self.score_plan.head_dim
+
+    @property
+    def is_causal(self) -> bool:
+        return self.score_plan.is_causal
 
 
 @functools.cache
@@ -849,7 +884,7 @@ class Backend(abc.ABC):
         )
 
         if block_size_infos[0].is_flattened(config):
-            block_size = functools.reduce(
+            block_size = functools.reduce(  # pyrefly: ignore[incompatible-overload-residual]
                 operator.mul, [bs.from_config_assert(config) for bs in block_size_infos]
             )
             return FlattenedTileStrategy(
@@ -2935,6 +2970,1802 @@ def _detect_specialized_mma_loop(
     return False
 
 
+def _attention_flash_gate_enabled() -> bool:
+    """Gate for the fused tcgen05 flash-attention path.
+
+    The fused QK->softmax->PV tcgen05 codegen (mirrors
+    ``.notes/spikes/fa_tcgen05_spike.py``) is ON by default: a detected fp16/bf16,
+    128x128, dense or canonical-causal, seq%128==0 attention kernel runs on the
+    tensor cores. Set ``HELION_CUTE_FLASH=0`` to force the scalar-fallback path.
+    The detector (``_attention_loop_shape`` plus graph-metadata output
+    validation) is strict, so any config outside the envelope (fp32, unsupported
+    score masks, head_dim not in {64,128}, non-128 tiles, seq%128!=0) falls back
+    to the scalar path with no behavior change.
+    """
+    return os.environ.get("HELION_CUTE_FLASH", "1").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
+
+def _attention_flash_supported() -> bool:
+    from .cute.mma_support import get_cute_mma_support
+
+    return bool(get_cute_mma_support().tcgen05_f16bf16)
+
+
+def _attention_loop_carried_arg(
+    graph: torch.fx.Graph,
+    index: int,
+) -> torch.fx.Node | None:
+    placeholders = [node for node in graph.nodes if node.op == "placeholder"]
+    if index >= len(placeholders):
+        return None
+    return placeholders[index]
+
+
+def _attention_new_var_source(node: torch.fx.Node) -> torch.fx.Node | None:
+    from ..language._tracing_ops import _new_var
+
+    if node.op != "call_function" or node.target is not _new_var:
+        return None
+    if not node.args or not isinstance(node.args[0], torch.fx.Node):
+        return None
+    return node.args[0]
+
+
+def _attention_is_loop_carried_value(
+    node: torch.fx.Node,
+    placeholder: torch.fx.Node,
+) -> bool:
+    return node is placeholder or _attention_new_var_source(node) is placeholder
+
+
+def _attention_is_full_slice(value: object) -> bool:
+    return (
+        isinstance(value, slice)
+        and value.start is None
+        and value.stop is None
+        and value.step is None
+    )
+
+
+def _attention_is_block_symnode(node: torch.fx.Node, block_id: int) -> bool:
+    from ..language._tracing_ops import _get_symnode
+
+    return (
+        node.op == "call_function"
+        and node.target is _get_symnode
+        and len(node.args) >= 1
+        and node.args[0] == f"block_size_{block_id}"
+    )
+
+
+def _attention_is_inner_batch_index(node: torch.fx.Node) -> bool:
+    return (
+        node.op == "call_function"
+        and node.target is torch.ops.aten.sym_size.int
+        and len(node.args) >= 2
+        and isinstance(node.args[1], int)
+        and node.args[1] == 0
+    )
+
+
+def _attention_arg_is_scaled_q(
+    node: torch.fx.Node,
+    expected_scale: float,
+    q_placeholder: torch.fx.Node,
+) -> bool:
+    scale = _attention_arg_scaled_q_factor(node, q_placeholder)
+    return scale is not None and math.isclose(
+        scale, expected_scale, rel_tol=1e-5, abs_tol=1e-7
+    )
+
+
+def _attention_arg_scaled_q_factor(
+    node: torch.fx.Node,
+    q_placeholder: torch.fx.Node,
+) -> float | None:
+    if node.op != "call_function" or node.target is not torch.ops.aten.mul.Tensor:
+        return None
+    if len(node.args) < 2:
+        return None
+    tensor_arg = None
+    scale_arg = None
+    for arg in node.args[:2]:
+        if isinstance(arg, torch.fx.Node):
+            tensor_arg = arg
+        elif isinstance(arg, (int, float)):
+            scale_arg = float(arg)
+    if (
+        tensor_arg is None
+        or scale_arg is None
+        or not _attention_is_loop_carried_value(tensor_arg, q_placeholder)
+    ):
+        return None
+    return scale_arg
+
+
+def _attention_pv_p_arg_base(node: torch.fx.Node) -> torch.fx.Node:
+    from ..language._tracing_ops import _mask_to
+
+    while (
+        node.op == "call_function"
+        and node.target
+        in (
+            _mask_to,
+            torch.ops.prims.convert_element_type.default,
+        )
+        and node.args
+        and isinstance(node.args[0], torch.fx.Node)
+    ):
+        node = node.args[0]
+    return node
+
+
+def _attention_is_negative_infinity(node: object) -> bool:
+    if isinstance(node, (float, int)):
+        return float(node) == float("-inf")
+    if not isinstance(node, torch.fx.Node):
+        return False
+    if (
+        node.op == "call_function"
+        and node.target is torch.ops.aten.scalar_tensor.default
+    ):
+        value = node.args[0] if node.args else None
+        return isinstance(value, (float, int)) and float(value) == float("-inf")
+    return False
+
+
+def _attention_tile_index_source(node: object) -> torch.fx.Node | None:
+    from ..language import memory_ops
+    from ..language import tile_ops
+    from ..language import view_ops
+
+    while isinstance(node, torch.fx.Node):
+        if node.op != "call_function":
+            return None
+        if node.target in (memory_ops.load, view_ops.subscript):
+            if not node.args or not isinstance(node.args[0], torch.fx.Node):
+                return None
+            node = node.args[0]
+            continue
+        if node.target is tile_ops.tile_index:
+            source = node.args[0] if node.args else None
+            return source if isinstance(source, torch.fx.Node) else None
+        return None
+    return None
+
+
+def _attention_is_q_tile_index(
+    node: object,
+    q_placeholder: torch.fx.Node,
+) -> bool:
+    source = _attention_tile_index_source(node)
+    if source is None or len(source.args) < 2:
+        return False
+    dim = source.args[1]
+    return (
+        source.op == "call_function"
+        and source.target is torch.ops.aten.sym_size.int
+        and source.args[0] is q_placeholder
+        and isinstance(dim, int)
+        and dim == 1
+    )
+
+
+def _attention_is_kv_tile_index(node: object, kv_block_id: int | None) -> bool:
+    source = _attention_tile_index_source(node)
+    if source is None:
+        return False
+    if kv_block_id is None:
+        return True
+    return _attention_is_block_symnode(source, int(kv_block_id))
+
+
+def _attention_causal_score_node(
+    qk_node: torch.fx.Node,
+    q_placeholder: torch.fx.Node,
+    *,
+    kv_block_id: int | None,
+) -> torch.fx.Node | None:
+    """Return the canonical causal ``where(tile_m >= tile_n, qk, -inf)`` node."""
+    users = [
+        user
+        for user in qk_node.users
+        if user.op == "call_function" and user.target is torch.ops.aten.where.self
+    ]
+    if len(users) != 1 or set(qk_node.users) != {users[0]}:
+        return None
+    where_node = users[0]
+    if len(where_node.args) < 3 or where_node.args[1] is not qk_node:
+        return None
+    if not _attention_is_negative_infinity(where_node.args[2]):
+        return None
+    pred = where_node.args[0]
+    if (
+        not isinstance(pred, torch.fx.Node)
+        or pred.op != "call_function"
+        or pred.target is not torch.ops.aten.ge.Tensor
+        or len(pred.args) < 2
+    ):
+        return None
+    lhs, rhs = pred.args[:2]
+    if not _attention_is_q_tile_index(lhs, q_placeholder):
+        return None
+    if not _attention_is_kv_tile_index(rhs, kv_block_id):
+        return None
+    return where_node
+
+
+def _attention_load_host_tensor_name(node: torch.fx.Node) -> str | None:
+    from ..language import memory_ops
+    from ..language._tracing_ops import _host_tensor
+
+    if node.op != "call_function" or node.target is not memory_ops.load:
+        return None
+    tensor = node.args[0] if node.args else None
+    if (
+        isinstance(tensor, torch.fx.Node)
+        and tensor.op == "call_function"
+        and tensor.target is _host_tensor
+        and tensor.args
+        and isinstance(tensor.args[0], str)
+    ):
+        return tensor.args[0]
+    return None
+
+
+def _attention_is_q_block_index(
+    node: torch.fx.Node,
+    q_placeholder: torch.fx.Node,
+) -> bool:
+    return (
+        node.op == "call_function"
+        and node.target is torch.ops.aten.sym_size.int
+        and len(node.args) >= 2
+        and node.args[0] is q_placeholder
+        and isinstance(node.args[1], int)
+        and node.args[1] == 1
+    )
+
+
+def _attention_tensor_bias_score_node(
+    score_node: torch.fx.Node,
+    q_placeholder: torch.fx.Node,
+    *,
+    kv_block_id: int | None,
+) -> tuple[torch.fx.Node, AttentionScoreModifier] | None:
+    """Return ``score + bias[tile_b, tile_m, tile_n]`` as a score modifier."""
+    from ..language import memory_ops
+
+    users = [
+        user
+        for user in score_node.users
+        if user.op == "call_function" and user.target is torch.ops.aten.add.Tensor
+    ]
+    if len(users) != 1 or set(score_node.users) != {users[0]}:
+        return None
+    add_node = users[0]
+    if add_node.kwargs.get("alpha", 1) != 1 or len(add_node.args) < 2:
+        return None
+    if add_node.args[0] is score_node and isinstance(add_node.args[1], torch.fx.Node):
+        bias_node = add_node.args[1]
+    elif add_node.args[1] is score_node and isinstance(add_node.args[0], torch.fx.Node):
+        bias_node = add_node.args[0]
+    else:
+        return None
+    if bias_node.op != "call_function" or bias_node.target is not memory_ops.load:
+        return None
+    tensor_name = _attention_load_host_tensor_name(bias_node)
+    if tensor_name is None:
+        return None
+    if (
+        len(bias_node.args) < 4
+        or bias_node.args[2] is not None
+        or bias_node.args[3] is not None
+    ):
+        return None
+    indices = bias_node.args[1]
+    if not isinstance(indices, (list, tuple)) or len(indices) != 3:
+        return None
+    batch_idx, q_idx, kv_idx = indices
+    if not isinstance(batch_idx, torch.fx.Node) or not isinstance(q_idx, torch.fx.Node):
+        return None
+    if not _attention_is_inner_batch_index(batch_idx):
+        return None
+    if not _attention_is_q_block_index(q_idx, q_placeholder):
+        return None
+    if not isinstance(kv_idx, torch.fx.Node):
+        return None
+    if kv_block_id is not None and not _attention_is_block_symnode(
+        kv_idx, int(kv_block_id)
+    ):
+        return None
+    return add_node, AttentionScoreModifier(TENSOR_BIAS_KIND, tensor_name=tensor_name)
+
+
+def _attention_add_score_user(
+    score_node: torch.fx.Node,
+) -> tuple[torch.fx.Node, torch.fx.Node] | None:
+    users = [
+        user
+        for user in score_node.users
+        if user.op == "call_function" and user.target is torch.ops.aten.add.Tensor
+    ]
+    if len(users) != 1 or set(score_node.users) != {users[0]}:
+        return None
+    add_node = users[0]
+    if add_node.kwargs.get("alpha", 1) != 1 or len(add_node.args) < 2:
+        return None
+    if add_node.args[0] is score_node and isinstance(add_node.args[1], torch.fx.Node):
+        return add_node, add_node.args[1]
+    if add_node.args[1] is score_node and isinstance(add_node.args[0], torch.fx.Node):
+        return add_node, add_node.args[0]
+    return None
+
+
+def _attention_scalar_value(node: object) -> float | None:
+    if isinstance(node, (int, float)):
+        return float(node)
+    if not isinstance(node, torch.fx.Node):
+        return None
+    if (
+        node.op == "call_function"
+        and node.target is torch.ops.aten.scalar_tensor.default
+        and node.args
+        and isinstance(node.args[0], (int, float))
+    ):
+        return float(node.args[0])
+    return None
+
+
+class _AttentionLinearIndex(NamedTuple):
+    q_coeff: float
+    k_coeff: float
+    constant: float
+
+
+def _attention_index_linear_coeffs(
+    node: object,
+    q_placeholder: torch.fx.Node,
+    *,
+    kv_block_id: int | None,
+) -> _AttentionLinearIndex | None:
+    """Return ``query_coeff * q + key_coeff * k + constant`` for ``node``."""
+    scalar = _attention_scalar_value(node)
+    if scalar is not None:
+        return _AttentionLinearIndex(0.0, 0.0, scalar)
+    if not isinstance(node, torch.fx.Node) or node.op != "call_function":
+        return None
+    if _attention_is_q_tile_index(node, q_placeholder):
+        return _AttentionLinearIndex(1.0, 0.0, 0.0)
+    if _attention_is_kv_tile_index(node, kv_block_id):
+        return _AttentionLinearIndex(0.0, 1.0, 0.0)
+    if node.target in (torch.ops.aten.sub.Tensor, torch.ops.aten.add.Tensor):
+        if len(node.args) < 2:
+            return None
+        lhs = _attention_index_linear_coeffs(
+            node.args[0],
+            q_placeholder,
+            kv_block_id=kv_block_id,
+        )
+        rhs = _attention_index_linear_coeffs(
+            node.args[1],
+            q_placeholder,
+            kv_block_id=kv_block_id,
+        )
+        if lhs is None or rhs is None:
+            return None
+        if node.target is torch.ops.aten.sub.Tensor:
+            return _AttentionLinearIndex(
+                lhs.q_coeff - rhs.q_coeff,
+                lhs.k_coeff - rhs.k_coeff,
+                lhs.constant - rhs.constant,
+            )
+        return _AttentionLinearIndex(
+            lhs.q_coeff + rhs.q_coeff,
+            lhs.k_coeff + rhs.k_coeff,
+            lhs.constant + rhs.constant,
+        )
+    if node.target is torch.ops.aten.mul.Tensor and len(node.args) >= 2:
+        lhs_scalar = _attention_scalar_value(node.args[0])
+        rhs_scalar = _attention_scalar_value(node.args[1])
+        if lhs_scalar is not None:
+            rhs = _attention_index_linear_coeffs(
+                node.args[1],
+                q_placeholder,
+                kv_block_id=kv_block_id,
+            )
+            return (
+                None
+                if rhs is None
+                else _AttentionLinearIndex(
+                    lhs_scalar * rhs.q_coeff,
+                    lhs_scalar * rhs.k_coeff,
+                    lhs_scalar * rhs.constant,
+                )
+            )
+        if rhs_scalar is not None:
+            lhs = _attention_index_linear_coeffs(
+                node.args[0],
+                q_placeholder,
+                kv_block_id=kv_block_id,
+            )
+            return (
+                None
+                if lhs is None
+                else _AttentionLinearIndex(
+                    rhs_scalar * lhs.q_coeff,
+                    rhs_scalar * lhs.k_coeff,
+                    rhs_scalar * lhs.constant,
+                )
+            )
+    return None
+
+
+def _attention_index_delta_factor(
+    node: object,
+    q_placeholder: torch.fx.Node,
+    *,
+    kv_block_id: int | None,
+) -> float | None:
+    """Return the coefficient of ``(query_index - key_index)`` in ``node``."""
+    coeffs = _attention_index_linear_coeffs(
+        node,
+        q_placeholder,
+        kv_block_id=kv_block_id,
+    )
+    if coeffs is None:
+        return None
+    if not math.isclose(coeffs.q_coeff + coeffs.k_coeff, 0.0, abs_tol=1e-7):
+        return None
+    if not math.isclose(coeffs.constant, 0.0, abs_tol=1e-7):
+        return None
+    return coeffs.q_coeff
+
+
+def _attention_product_terms(node: object) -> list[object]:
+    if (
+        isinstance(node, torch.fx.Node)
+        and node.op == "call_function"
+        and node.target is torch.ops.aten.mul.Tensor
+        and len(node.args) >= 2
+    ):
+        return _attention_product_terms(node.args[0]) + _attention_product_terms(
+            node.args[1]
+        )
+    return [node]
+
+
+class _AttentionBatchIndex(NamedTuple):
+    mode: str
+    divisor: int | None = None
+
+
+def _attention_alibi_slope_tensor_name(
+    node: object,
+) -> tuple[str, _AttentionBatchIndex] | None:
+    if not isinstance(node, torch.fx.Node):
+        return None
+    tensor_name = _attention_load_host_tensor_name(node)
+    if tensor_name is None:
+        return None
+    if len(node.args) < 4 or node.args[2] is not None or node.args[3] is not None:
+        return None
+    indices = node.args[1]
+    if not isinstance(indices, (list, tuple)) or len(indices) != 1:
+        return None
+    index = indices[0]
+    index_mode = _attention_collapsed_batch_index_mode(
+        index,
+        allow_mod=True,
+        allow_floordiv=False,
+    )
+    if index_mode is None:
+        return None
+    return tensor_name, index_mode
+
+
+def _attention_positive_int_scalar(node: object) -> int | None:
+    value = _attention_scalar_value(node)
+    if value is None:
+        return None
+    int_value = int(value)
+    if int_value <= 0 or not math.isclose(value, float(int_value), abs_tol=1e-7):
+        return None
+    return int_value
+
+
+def _attention_collapsed_batch_index_mode(
+    node: object,
+    *,
+    allow_mod: bool,
+    allow_floordiv: bool,
+) -> _AttentionBatchIndex | None:
+    if not isinstance(node, torch.fx.Node):
+        return None
+    if _attention_is_inner_batch_index(node):
+        return _AttentionBatchIndex("identity")
+    source = _attention_tile_index_source(node)
+    if source is not None and _attention_is_inner_batch_index(source):
+        return _AttentionBatchIndex("identity")
+    if node.op != "call_function" or len(node.args) < 2:
+        return None
+    if node.target in (
+        operator.mod,
+        torch.ops.aten.remainder.Scalar,
+    ):
+        lhs, rhs = node.args[:2]
+        divisor = _attention_positive_int_scalar(rhs)
+        if not allow_mod or divisor is None:
+            return None
+        lhs_mode = _attention_collapsed_batch_index_mode(
+            lhs,
+            allow_mod=False,
+            allow_floordiv=False,
+        )
+        if lhs_mode is None or lhs_mode.mode != "identity":
+            return None
+        return _AttentionBatchIndex("mod", divisor)
+    if node.target in (
+        operator.floordiv,
+        torch.ops.aten.floor_divide.default,
+        torch.ops.aten.floor_divide.Scalar,
+    ):
+        lhs, rhs = node.args[:2]
+        divisor = _attention_positive_int_scalar(rhs)
+        if not allow_floordiv or divisor is None:
+            return None
+        lhs_mode = _attention_collapsed_batch_index_mode(
+            lhs,
+            allow_mod=False,
+            allow_floordiv=False,
+        )
+        if lhs_mode is None or lhs_mode.mode != "identity":
+            return None
+        return _AttentionBatchIndex("floordiv", divisor)
+    if (
+        node.target is torch.ops.aten.div.Tensor_mode
+        and node.kwargs.get("rounding_mode") == "floor"
+    ):
+        lhs, rhs = node.args[:2]
+        divisor = _attention_positive_int_scalar(rhs)
+        if not allow_floordiv or divisor is None:
+            return None
+        lhs_mode = _attention_collapsed_batch_index_mode(
+            lhs,
+            allow_mod=False,
+            allow_floordiv=False,
+        )
+        if lhs_mode is None or lhs_mode.mode != "identity":
+            return None
+        return _AttentionBatchIndex("floordiv", divisor)
+    return None
+
+
+def _attention_alibi_bias_modifier(
+    bias_node: torch.fx.Node,
+    q_placeholder: torch.fx.Node,
+    *,
+    kv_block_id: int | None,
+) -> AttentionScoreModifier | None:
+    terms = _attention_product_terms(bias_node)
+    scalar = 1.0
+    slope_name: str | None = None
+    slope_index: _AttentionBatchIndex | None = None
+    delta_factor: float | None = None
+    for term in terms:
+        term_scalar = _attention_scalar_value(term)
+        if term_scalar is not None:
+            scalar *= term_scalar
+            continue
+        term_slope = _attention_alibi_slope_tensor_name(term)
+        if term_slope is not None:
+            if slope_name is not None:
+                return None
+            slope_name, slope_index = term_slope
+            continue
+        term_delta = _attention_index_delta_factor(
+            term,
+            q_placeholder,
+            kv_block_id=kv_block_id,
+        )
+        if term_delta is None or math.isclose(term_delta, 0.0, abs_tol=1e-12):
+            return None
+        if delta_factor is not None:
+            return None
+        delta_factor = term_delta
+    if slope_name is None or delta_factor is None:
+        return None
+    # Runtime lowers ALiBi as ``(key - query) * slope * scale``.
+    return AttentionScoreModifier(
+        ALIBI_BIAS_KIND,
+        tensor_name=slope_name,
+        scale_log2=-scalar * delta_factor,
+        index_mode=slope_index.mode if slope_index is not None else None,
+        index_divisor=slope_index.divisor if slope_index is not None else None,
+    )
+
+
+def _attention_relative_or_alibi_score_node(
+    score_node: torch.fx.Node,
+    q_placeholder: torch.fx.Node,
+    *,
+    kv_block_id: int | None,
+) -> tuple[torch.fx.Node, AttentionScoreModifier] | None:
+    add = _attention_add_score_user(score_node)
+    if add is None:
+        return None
+    add_node, bias_node = add
+    alibi = _attention_alibi_bias_modifier(
+        bias_node,
+        q_placeholder,
+        kv_block_id=kv_block_id,
+    )
+    if alibi is not None:
+        return add_node, alibi
+    factor = _attention_index_delta_factor(
+        bias_node,
+        q_placeholder,
+        kv_block_id=kv_block_id,
+    )
+    if factor is None or math.isclose(factor, 0.0, abs_tol=1e-12):
+        return None
+    return add_node, AttentionScoreModifier(RELATIVE_BIAS_KIND, scale_log2=factor)
+
+
+def _attention_doc_id_load(
+    node: object,
+    q_placeholder: torch.fx.Node,
+    *,
+    kv_block_id: int | None,
+) -> tuple[str, str, _AttentionBatchIndex] | None:
+    from ..language import view_ops
+
+    while (
+        isinstance(node, torch.fx.Node)
+        and node.op == "call_function"
+        and node.target is view_ops.subscript
+        and node.args
+        and isinstance(node.args[0], torch.fx.Node)
+    ):
+        node = node.args[0]
+    if not isinstance(node, torch.fx.Node):
+        return None
+    tensor_name = _attention_load_host_tensor_name(node)
+    if tensor_name is None:
+        return None
+    if len(node.args) < 4 or node.args[2] is not None or node.args[3] is not None:
+        return None
+    indices = node.args[1]
+    if not isinstance(indices, (list, tuple)) or len(indices) != 2:
+        return None
+    batch_idx, seq_idx = indices
+    index_mode = _attention_collapsed_batch_index_mode(
+        batch_idx,
+        allow_mod=False,
+        allow_floordiv=True,
+    )
+    if index_mode is None:
+        return None
+    if not isinstance(seq_idx, torch.fx.Node):
+        return None
+    if _attention_is_q_block_index(seq_idx, q_placeholder):
+        return tensor_name, "q", index_mode
+    if kv_block_id is not None and _attention_is_block_symnode(
+        seq_idx, int(kv_block_id)
+    ):
+        return tensor_name, "kv", index_mode
+    return None
+
+
+def _attention_bool_terms(node: object, targets: frozenset[object]) -> list[object]:
+    if (
+        isinstance(node, torch.fx.Node)
+        and node.op == "call_function"
+        and node.target in targets
+        and len(node.args) >= 2
+    ):
+        return _attention_bool_terms(node.args[0], targets) + _attention_bool_terms(
+            node.args[1], targets
+        )
+    return [node]
+
+
+_ATTENTION_AND_TARGETS: frozenset[object] = frozenset(
+    {
+        operator.and_,
+        torch.ops.aten.bitwise_and.Tensor,
+        torch.ops.aten.logical_and.default,
+    }
+)
+_ATTENTION_OR_TARGETS: frozenset[object] = frozenset(
+    {
+        operator.or_,
+        torch.ops.aten.bitwise_or.Tensor,
+        torch.ops.aten.logical_or.default,
+    }
+)
+
+
+def _attention_is_causal_predicate(
+    node: object,
+    q_placeholder: torch.fx.Node,
+    *,
+    kv_block_id: int | None,
+) -> bool:
+    if not isinstance(node, torch.fx.Node) or node.op != "call_function":
+        return False
+    if node.target is torch.ops.aten.ge.Tensor and len(node.args) >= 2:
+        lhs, rhs = node.args[:2]
+        if _attention_is_q_tile_index(
+            lhs, q_placeholder
+        ) and _attention_is_kv_tile_index(rhs, kv_block_id):
+            return True
+    if node.target in (torch.ops.aten.ge.Tensor, torch.ops.aten.ge.Scalar):
+        if len(node.args) < 2:
+            return False
+        delta = _attention_index_delta_factor(
+            node.args[0],
+            q_placeholder,
+            kv_block_id=kv_block_id,
+        )
+        bound = _attention_scalar_value(node.args[1])
+        return (
+            delta is not None
+            and bound is not None
+            and math.isclose(delta, 1.0, rel_tol=1e-6, abs_tol=1e-7)
+            and math.isclose(bound, 0.0, abs_tol=1e-7)
+        )
+    return False
+
+
+def _attention_sliding_window_bound(
+    node: object,
+    q_placeholder: torch.fx.Node,
+    *,
+    kv_block_id: int | None,
+) -> int | None:
+    if not isinstance(node, torch.fx.Node) or node.op != "call_function":
+        return None
+    if node.target not in (torch.ops.aten.le.Tensor, torch.ops.aten.le.Scalar):
+        return None
+    if len(node.args) < 2:
+        return None
+    delta = _attention_index_delta_factor(
+        node.args[0],
+        q_placeholder,
+        kv_block_id=kv_block_id,
+    )
+    bound = _attention_scalar_value(node.args[1])
+    if (
+        delta is None
+        or bound is None
+        or not math.isclose(delta, 1.0, rel_tol=1e-6, abs_tol=1e-7)
+    ):
+        return None
+    window = int(bound)
+    if not math.isclose(bound, float(window), abs_tol=1e-7) or window < 0:
+        return None
+    return window
+
+
+def _attention_prefix_length(
+    node: object,
+    q_placeholder: torch.fx.Node,
+    *,
+    kv_block_id: int | None,
+) -> int | None:
+    if not isinstance(node, torch.fx.Node) or node.op != "call_function":
+        return None
+    if node.target not in (torch.ops.aten.lt.Tensor, torch.ops.aten.lt.Scalar):
+        return None
+    if len(node.args) < 2:
+        return None
+    if not _attention_is_kv_tile_index(node.args[0], kv_block_id):
+        return None
+    bound = _attention_scalar_value(node.args[1])
+    if bound is None:
+        return None
+    prefix = int(bound)
+    if not math.isclose(bound, float(prefix), abs_tol=1e-7) or prefix < 0:
+        return None
+    return prefix
+
+
+def _attention_document_mask_name(
+    node: object,
+    q_placeholder: torch.fx.Node,
+    *,
+    kv_block_id: int | None,
+) -> tuple[str, _AttentionBatchIndex] | None:
+    if (
+        not isinstance(node, torch.fx.Node)
+        or node.op != "call_function"
+        or node.target is not torch.ops.aten.eq.Tensor
+        or len(node.args) < 2
+    ):
+        return None
+    lhs = _attention_doc_id_load(
+        node.args[0],
+        q_placeholder,
+        kv_block_id=kv_block_id,
+    )
+    rhs = _attention_doc_id_load(
+        node.args[1],
+        q_placeholder,
+        kv_block_id=kv_block_id,
+    )
+    if lhs is None or rhs is None or lhs[0] != rhs[0] or lhs[2] != rhs[2]:
+        return None
+    return (lhs[0], lhs[2]) if {lhs[1], rhs[1]} == {"q", "kv"} else None
+
+
+def _attention_mask_modifier_from_predicate(
+    pred: torch.fx.Node,
+    q_placeholder: torch.fx.Node,
+    *,
+    kv_block_id: int | None,
+) -> AttentionScoreModifier | None:
+    if _attention_is_causal_predicate(
+        pred,
+        q_placeholder,
+        kv_block_id=kv_block_id,
+    ):
+        return AttentionScoreModifier(CAUSAL_MASK_KIND)
+
+    or_terms = _attention_bool_terms(pred, _ATTENTION_OR_TARGETS)
+    if len(or_terms) == 2:
+        prefix = None
+        has_causal = False
+        for term in or_terms:
+            if _attention_is_causal_predicate(
+                term,
+                q_placeholder,
+                kv_block_id=kv_block_id,
+            ):
+                has_causal = True
+                continue
+            term_prefix = _attention_prefix_length(
+                term,
+                q_placeholder,
+                kv_block_id=kv_block_id,
+            )
+            if term_prefix is not None:
+                prefix = term_prefix
+        if prefix is not None and has_causal:
+            return AttentionScoreModifier(PREFIX_LM_MASK_KIND, prefix_length=prefix)
+
+    and_terms = _attention_bool_terms(pred, _ATTENTION_AND_TARGETS)
+    if len(and_terms) >= 2:
+        has_causal = False
+        window = None
+        document_name = None
+        document_index: _AttentionBatchIndex | None = None
+        for term in and_terms:
+            if _attention_is_causal_predicate(
+                term,
+                q_placeholder,
+                kv_block_id=kv_block_id,
+            ):
+                has_causal = True
+                continue
+            term_window = _attention_sliding_window_bound(
+                term,
+                q_placeholder,
+                kv_block_id=kv_block_id,
+            )
+            if term_window is not None:
+                if window is not None:
+                    return None
+                window = term_window
+                continue
+            term_document = _attention_document_mask_name(
+                term,
+                q_placeholder,
+                kv_block_id=kv_block_id,
+            )
+            if term_document is not None:
+                if document_name is not None:
+                    return None
+                document_name, document_index = term_document
+                continue
+            return None
+        if has_causal and window is not None and document_name is None:
+            return AttentionScoreModifier(
+                SLIDING_WINDOW_MASK_KIND,
+                window_size=window,
+            )
+        if has_causal and document_name is not None and window is None:
+            return AttentionScoreModifier(
+                DOCUMENT_MASK_KIND,
+                tensor_name=document_name,
+                index_mode=document_index.mode if document_index is not None else None,
+                index_divisor=document_index.divisor
+                if document_index is not None
+                else None,
+            )
+    return None
+
+
+def _attention_mask_score_node(
+    score_node: torch.fx.Node,
+    q_placeholder: torch.fx.Node,
+    *,
+    kv_block_id: int | None,
+) -> tuple[torch.fx.Node, AttentionScoreModifier] | None:
+    users = [
+        user
+        for user in score_node.users
+        if user.op == "call_function" and user.target is torch.ops.aten.where.self
+    ]
+    if len(users) != 1 or set(score_node.users) != {users[0]}:
+        return None
+    where_node = users[0]
+    if len(where_node.args) < 3 or where_node.args[1] is not score_node:
+        return None
+    if not _attention_is_negative_infinity(where_node.args[2]):
+        return None
+    pred = where_node.args[0]
+    if not isinstance(pred, torch.fx.Node):
+        return None
+    modifier = _attention_mask_modifier_from_predicate(
+        pred,
+        q_placeholder,
+        kv_block_id=kv_block_id,
+    )
+    if modifier is None:
+        return None
+    return where_node, modifier
+
+
+def _attention_softcap_score_node(
+    score_node: torch.fx.Node,
+) -> tuple[torch.fx.Node, AttentionScoreModifier] | None:
+    div_users = [
+        user
+        for user in score_node.users
+        if user.op == "call_function" and user.target is torch.ops.aten.div.Tensor
+    ]
+    if len(div_users) != 1 or set(score_node.users) != {div_users[0]}:
+        return None
+    div_node = div_users[0]
+    if len(div_node.args) < 2 or div_node.args[0] is not score_node:
+        return None
+    softcap = _attention_scalar_value(div_node.args[1])
+    if softcap is None or softcap <= 0.0:
+        return None
+    tanh_users = [
+        user
+        for user in div_node.users
+        if user.op == "call_function" and user.target is torch.ops.aten.tanh.default
+    ]
+    if len(tanh_users) != 1 or set(div_node.users) != {tanh_users[0]}:
+        return None
+    tanh_node = tanh_users[0]
+    mul_users = [
+        user
+        for user in tanh_node.users
+        if user.op == "call_function" and user.target is torch.ops.aten.mul.Tensor
+    ]
+    if len(mul_users) != 1 or set(tanh_node.users) != {mul_users[0]}:
+        return None
+    mul_node = mul_users[0]
+    if len(mul_node.args) < 2:
+        return None
+    if mul_node.args[0] is tanh_node:
+        cap_arg = mul_node.args[1]
+    elif mul_node.args[1] is tanh_node:
+        cap_arg = mul_node.args[0]
+    else:
+        return None
+    if not math.isclose(
+        _attention_scalar_value(cap_arg) or float("nan"),
+        softcap,
+        rel_tol=1e-6,
+        abs_tol=1e-7,
+    ):
+        return None
+    return mul_node, AttentionScoreModifier(SOFTCAP_KIND, value_log2=softcap)
+
+
+def _attention_score_modifiers(
+    qk_node: torch.fx.Node,
+    q_placeholder: torch.fx.Node,
+    *,
+    kv_block_id: int | None,
+) -> tuple[torch.fx.Node, tuple[AttentionScoreModifier, ...]] | None:
+    score_node = qk_node
+    modifiers: list[AttentionScoreModifier] = []
+    while True:
+        bias = _attention_tensor_bias_score_node(
+            score_node,
+            q_placeholder,
+            kv_block_id=kv_block_id,
+        )
+        if bias is not None:
+            score_node, modifier = bias
+            modifiers.append(modifier)
+            continue
+        index_bias = _attention_relative_or_alibi_score_node(
+            score_node,
+            q_placeholder,
+            kv_block_id=kv_block_id,
+        )
+        if index_bias is not None:
+            score_node, modifier = index_bias
+            modifiers.append(modifier)
+            continue
+        softcap = _attention_softcap_score_node(score_node)
+        if softcap is not None:
+            score_node, modifier = softcap
+            modifiers.append(modifier)
+            continue
+        mask = _attention_mask_score_node(
+            score_node,
+            q_placeholder,
+            kv_block_id=kv_block_id,
+        )
+        if mask is not None:
+            score_node, modifier = mask
+            modifiers.append(modifier)
+            continue
+        return score_node, tuple(modifiers)
+
+
+def _attention_canonical_kv_load_indices(
+    node: torch.fx.Node,
+    *,
+    kv_block_id: int | None,
+) -> tuple[torch.fx.Node, torch.fx.Node] | None:
+    from ..language import memory_ops
+
+    if node.op != "call_function" or node.target is not memory_ops.load:
+        return None
+    if len(node.args) < 4 or node.args[2] is not None or node.args[3] is not None:
+        return None
+    indices = node.args[1]
+    if not isinstance(indices, (list, tuple)) or len(indices) != 3:
+        return None
+    if not isinstance(indices[0], torch.fx.Node) or not isinstance(
+        indices[1], torch.fx.Node
+    ):
+        return None
+    if not _attention_is_full_slice(indices[2]):
+        return None
+    if not _attention_is_inner_batch_index(indices[0]):
+        return None
+    if kv_block_id is not None and not _attention_is_block_symnode(
+        indices[1], int(kv_block_id)
+    ):
+        return None
+    return indices[0], indices[1]
+
+
+def _attention_k_load_indices(
+    node: torch.fx.Node,
+    *,
+    kv_block_id: int | None,
+) -> tuple[torch.fx.Node, torch.fx.Node] | None:
+    if node.op != "call_function":
+        return None
+    if node.target is torch.ops.aten.permute.default:
+        if len(node.args) < 2 or node.args[1] != [0, 2, 1]:
+            return None
+        source = node.args[0]
+    elif node.target is torch.ops.aten.transpose.int:
+        if len(node.args) < 3 or node.args[1] != 1 or node.args[2] != 2:
+            return None
+        source = node.args[0]
+    else:
+        return None
+    if not isinstance(source, torch.fx.Node):
+        return None
+    return _attention_canonical_kv_load_indices(source, kv_block_id=kv_block_id)
+
+
+def _attention_v_load_indices(
+    node: torch.fx.Node,
+    *,
+    kv_block_id: int | None,
+) -> tuple[torch.fx.Node, torch.fx.Node] | None:
+    return _attention_canonical_kv_load_indices(node, kv_block_id=kv_block_id)
+
+
+def _attention_exact_online_softmax_chain(
+    score_node: torch.fx.Node, pv_node: torch.fx.Node
+) -> bool:
+    from ..language import view_ops
+    from ..language._tracing_ops import _mask_to
+
+    def broadcast_row_vector_source(node: torch.fx.Node) -> torch.fx.Node | None:
+        if node.op != "call_function" or node.target is not view_ops.subscript:
+            return None
+        if not node.args or not isinstance(node.args[0], torch.fx.Node):
+            return None
+        indices = node.args[1] if len(node.args) > 1 else None
+        if not isinstance(indices, (list, tuple)) or len(indices) != 3:
+            return None
+        if (
+            not _attention_is_full_slice(indices[0])
+            or not _attention_is_full_slice(indices[1])
+            or indices[2] is not None
+        ):
+            return None
+        return node.args[0]
+
+    def is_broadcast_row_vector(node: torch.fx.Node, source: torch.fx.Node) -> bool:
+        return broadcast_row_vector_source(node) is source
+
+    def is_squeeze_last_dim(node: torch.fx.Node, source: torch.fx.Node) -> bool:
+        dim = node.args[1] if len(node.args) >= 2 else None
+        return (
+            node.op == "call_function"
+            and node.target is torch.ops.aten.squeeze.dim
+            and len(node.args) >= 2
+            and node.args[0] is source
+            and isinstance(dim, int)
+            and dim == -1
+        )
+
+    def binary_node_has_args(
+        node: torch.fx.Node,
+        target: object,
+        lhs: torch.fx.Node,
+        rhs: torch.fx.Node,
+        *,
+        ordered: bool,
+    ) -> bool:
+        if node.op != "call_function" or node.target is not target:
+            return False
+        if len(node.args) < 2:
+            return False
+        if ordered:
+            return node.args[0] is lhs and node.args[1] is rhs
+        return (node.args[0] is lhs and node.args[1] is rhs) or (
+            node.args[0] is rhs and node.args[1] is lhs
+        )
+
+    def unwrap_new_var(node: object) -> object:
+        if isinstance(node, torch.fx.Node):
+            return _attention_new_var_source(node) or node
+        return node
+
+    def loop_body_returns(
+        max_node: torch.fx.Node,
+        l_update: torch.fx.Node,
+        acc_update: torch.fx.Node,
+    ) -> bool:
+        for node in score_node.graph.nodes:
+            if node.op != "output":
+                continue
+            if len(node.args) != 1 or not isinstance(node.args[0], (list, tuple)):
+                return False
+            outputs = node.args[0]
+            if len(outputs) != 3:
+                return False
+            return (
+                unwrap_new_var(outputs[0]) is max_node
+                and unwrap_new_var(outputs[1]) is l_update
+                and unwrap_new_var(outputs[2]) is acc_update
+            )
+        return False
+
+    prev_m_placeholder = _attention_loop_carried_arg(score_node.graph, 1)
+    prev_l_placeholder = _attention_loop_carried_arg(score_node.graph, 2)
+    prev_acc_placeholder = _attention_loop_carried_arg(score_node.graph, 3)
+    if (
+        prev_m_placeholder is None
+        or prev_l_placeholder is None
+        or prev_acc_placeholder is None
+    ):
+        return False
+
+    qk_mask_users = [
+        user
+        for user in score_node.users
+        if user.op == "call_function" and user.target is _mask_to
+    ]
+    qk_sub_users = [
+        user
+        for user in score_node.users
+        if user.op == "call_function" and user.target is torch.ops.aten.sub.Tensor
+    ]
+    if len(qk_mask_users) != 1 or len(qk_sub_users) != 1:
+        return False
+    if set(score_node.users) != {qk_mask_users[0], qk_sub_users[0]}:
+        return False
+
+    qk_mask = qk_mask_users[0]
+    if len(qk_mask.args) < 2 or qk_mask.args[0] is not score_node:
+        return False
+    if qk_mask.args[1] != float("-inf"):
+        return False
+    amax_users = [
+        user
+        for user in qk_mask.users
+        if user.op == "call_function" and user.target is torch.ops.aten.amax.default
+    ]
+    if len(amax_users) != 1 or set(qk_mask.users) != {amax_users[0]}:
+        return False
+    amax_node = amax_users[0]
+    if len(amax_node.args) < 2 or amax_node.args[1] != [-1]:
+        return False
+    amax_keepdim = len(amax_node.args) >= 3 and bool(amax_node.args[2])
+    maximum_users = [
+        user
+        for user in amax_node.users
+        if user.op == "call_function" and user.target is torch.ops.aten.maximum.default
+    ]
+    if len(maximum_users) != 1:
+        return False
+    max_node = maximum_users[0]
+    if len(max_node.args) < 2:
+        return False
+    if max_node.args[0] is amax_node and isinstance(max_node.args[1], torch.fx.Node):
+        prev_m_arg = max_node.args[1]
+    elif max_node.args[1] is amax_node and isinstance(max_node.args[0], torch.fx.Node):
+        prev_m_arg = max_node.args[0]
+    else:
+        return False
+    if amax_keepdim:
+        prev_m = broadcast_row_vector_source(prev_m_arg)
+        if prev_m is None:
+            return False
+        max_state_users = [
+            user for user in max_node.users if is_squeeze_last_dim(user, max_node)
+        ]
+        if len(max_state_users) != 1:
+            return False
+        max_state_node = max_state_users[0]
+    else:
+        prev_m = prev_m_arg
+        max_state_node = max_node
+    if not _attention_is_loop_carried_value(prev_m, prev_m_placeholder):
+        return False
+
+    centered = qk_sub_users[0]
+    if len(centered.args) < 2 or centered.args[0] is not score_node:
+        return False
+    max_view = centered.args[1]
+    if not isinstance(max_view, torch.fx.Node):
+        return False
+    if amax_keepdim:
+        if max_view is not max_node:
+            return False
+    else:
+        if not is_broadcast_row_vector(max_view, max_node):
+            return False
+
+    p_users = [
+        user
+        for user in centered.users
+        if user.op == "call_function"
+        and user.target in (torch.ops.aten.exp.default, torch.ops.aten.exp2.default)
+    ]
+    if len(p_users) != 1 or set(centered.users) != {p_users[0]}:
+        return False
+    p_node = p_users[0]
+
+    p_mask_users = [
+        user
+        for user in p_node.users
+        if user.op == "call_function"
+        and user.target is _mask_to
+        and len(user.args) >= 2
+        and user.args[0] is p_node
+        and user.args[1] == 0
+    ]
+    p_sum_users = [
+        user
+        for p_mask in p_mask_users
+        for user in p_mask.users
+        if user.op == "call_function"
+        and user.target is torch.ops.aten.sum.dim_IntList
+        and len(user.args) >= 2
+        and user.args[1] == [-1]
+    ]
+    if len(p_sum_users) != 1:
+        return False
+    l_ij = p_sum_users[0]
+
+    alpha_sub_users = [
+        user
+        for user in max_state_node.users
+        if binary_node_has_args(
+            user,
+            torch.ops.aten.sub.Tensor,
+            prev_m,
+            max_state_node,
+            ordered=True,
+        )
+    ]
+    if len(alpha_sub_users) != 1:
+        return False
+    alpha_sub = alpha_sub_users[0]
+    alpha_users = [
+        user
+        for user in alpha_sub.users
+        if user.op == "call_function" and user.target is p_node.target
+    ]
+    if len(alpha_users) != 1 or set(alpha_sub.users) != {alpha_users[0]}:
+        return False
+    alpha = alpha_users[0]
+
+    l_mul_candidates = [
+        user
+        for user in alpha.users
+        if user.op == "call_function"
+        and user.target is torch.ops.aten.mul.Tensor
+        and len(user.args) >= 2
+        and alpha in user.args[:2]
+        and any(
+            isinstance(arg, torch.fx.Node)
+            and _attention_is_loop_carried_value(arg, prev_l_placeholder)
+            for arg in user.args[:2]
+        )
+    ]
+    l_update_candidates = [
+        user
+        for l_mul in l_mul_candidates
+        for user in l_mul.users
+        if binary_node_has_args(
+            user,
+            torch.ops.aten.add.Tensor,
+            l_mul,
+            l_ij,
+            ordered=False,
+        )
+    ]
+    if len(l_update_candidates) != 1:
+        return False
+    l_update = l_update_candidates[0]
+
+    alpha_views = [user for user in alpha.users if is_broadcast_row_vector(user, alpha)]
+    if len(alpha_views) != 1:
+        return False
+    alpha_view = alpha_views[0]
+    acc_rescale_candidates = [
+        user
+        for user in alpha_view.users
+        if user.op == "call_function"
+        and user.target is torch.ops.aten.mul.Tensor
+        and len(user.args) >= 2
+        and alpha_view in user.args[:2]
+        and any(
+            isinstance(arg, torch.fx.Node)
+            and _attention_is_loop_carried_value(arg, prev_acc_placeholder)
+            for arg in user.args[:2]
+        )
+    ]
+    if len(acc_rescale_candidates) != 1:
+        return False
+    acc_rescaled = acc_rescale_candidates[0]
+
+    if len(pv_node.args) < 3 or not isinstance(pv_node.args[1], torch.fx.Node):
+        return False
+    if pv_node.args[0] is not acc_rescaled:
+        return False
+    if _attention_pv_p_arg_base(pv_node.args[1]) is not p_node:
+        return False
+    return loop_body_returns(max_state_node, l_update, pv_node)
+
+
+def _attention_online_softmax_exp_base(score_node: torch.fx.Node) -> str | None:
+    for centered in score_node.users:
+        if (
+            centered.op != "call_function"
+            or centered.target is not torch.ops.aten.sub.Tensor
+            or len(centered.args) < 2
+            or centered.args[0] is not score_node
+        ):
+            continue
+        for user in centered.users:
+            if user.op != "call_function":
+                continue
+            if user.target is torch.ops.aten.exp2.default:
+                return "exp2"
+            if user.target is torch.ops.aten.exp.default:
+                return "exp"
+    return None
+
+
+def _attention_softmax_pattern_head_dim(
+    graph: torch.fx.Graph,
+    *,
+    kv_block_id: int | None = None,
+) -> AttentionSoftmaxPattern | None:
+    """Config-independent online-softmax attention detector.
+
+    Returns the head_dim (in {64, 128}) and whether the canonical causal mask is
+    present when ``graph`` is a flash body -- a QK ``bmm`` + PV ``baddbmm``
+    feeding an ``amax``/``exp2``/``sum`` online softmax with either no score
+    masking or exactly ``where(tile_m.index >= tile_n.index, qk, -inf)``. Shared
+    by ``_attention_loop_shape`` (the codegen detector) and the autotuner flash
+    seed heuristic so the two never diverge on what counts as a flash kernel.
+    """
+    qk_nodes: list[torch.fx.Node] = []
+    pv_nodes: list[torch.fx.Node] = []
+    has_amax = has_exp = has_sum = False
+    for node in graph.nodes:
+        if node.op != "call_function":
+            continue
+        target = node.target
+        if target is torch.ops.aten.bmm.dtype:
+            qk_nodes.append(node)
+        elif target is torch.ops.aten.baddbmm.default:
+            pv_nodes.append(node)
+        elif target is torch.ops.aten.amax.default:
+            has_amax = True
+        elif target in (torch.ops.aten.exp.default, torch.ops.aten.exp2.default):
+            has_exp = True
+        elif target is torch.ops.aten.sum.dim_IntList:
+            has_sum = True
+    if len(qk_nodes) != 1 or len(pv_nodes) != 1:
+        return None
+    qk_node = qk_nodes[0]
+    pv_node = pv_nodes[0]
+    if not (has_amax and has_exp and has_sum):
+        return None
+    qk_val = qk_node.meta.get("val")
+    pv_val = pv_node.meta.get("val")
+    if not isinstance(qk_val, torch.Tensor) or not isinstance(pv_val, torch.Tensor):
+        return None
+    # QK score block: (batch, tile_m, tile_n); PV output: (batch, tile_m, head_dim).
+    if qk_val.ndim != 3 or pv_val.ndim != 3:
+        return None
+    if qk_val.dtype != torch.float32 or pv_val.dtype != torch.float32:
+        return None
+    # The emitted kernel supports 16-bit floating Q/K/V operands. Checked via FX
+    # node metadata (available at detection time, unlike the device-function
+    # arguments).
+    operand_nodes = [qk_node.args[0], qk_node.args[1]]
+    if len(pv_node.args) > 2:
+        operand_nodes.append(pv_node.args[2])
+    operand_dtype: torch.dtype | None = None
+    for arg in operand_nodes:
+        if not isinstance(arg, torch.fx.Node):
+            return None
+        operand_val = arg.meta.get("val")
+        if not isinstance(operand_val, torch.Tensor) or operand_val.dtype not in (
+            torch.float16,
+            torch.bfloat16,
+        ):
+            return None
+        if operand_dtype is None:
+            operand_dtype = operand_val.dtype
+        elif operand_val.dtype != operand_dtype:
+            return None
+    head_dim = pv_val.shape[2]
+    if not isinstance(head_dim, int) or head_dim not in (64, 128):
+        return None
+    if not isinstance(qk_node.args[1], torch.fx.Node):
+        return None
+    k_indices = _attention_k_load_indices(qk_node.args[1], kv_block_id=kv_block_id)
+    if k_indices is None:
+        return None
+    if len(pv_node.args) < 3 or not isinstance(pv_node.args[2], torch.fx.Node):
+        return None
+    v_indices = _attention_v_load_indices(pv_node.args[2], kv_block_id=kv_block_id)
+    if v_indices is None:
+        return None
+    if k_indices[0] is not v_indices[0] or k_indices[1] is not v_indices[1]:
+        return None
+    q_placeholder = _attention_loop_carried_arg(graph, 0)
+    if q_placeholder is None:
+        return None
+    if not isinstance(qk_node.args[0], torch.fx.Node):
+        return None
+    q_scale = _attention_arg_scaled_q_factor(qk_node.args[0], q_placeholder)
+    if q_scale is None:
+        return None
+    modifiers_result = _attention_score_modifiers(
+        qk_node,
+        q_placeholder,
+        kv_block_id=kv_block_id,
+    )
+    if modifiers_result is None:
+        return None
+    score_node, modifiers = modifiers_result
+    if not _attention_exact_online_softmax_chain(score_node, pv_node):
+        return None
+    exp_base = _attention_online_softmax_exp_base(score_node)
+    if exp_base == "exp2":
+        expected_scale = math.log2(math.e) / math.sqrt(head_dim)
+        qk_scale_log2 = expected_scale
+        bias_scale_log2 = 1.0
+        lse_scale = 1.0
+    elif exp_base == "exp":
+        expected_scale = 1.0 / math.sqrt(head_dim)
+        qk_scale_log2 = math.log2(math.e) / math.sqrt(head_dim)
+        bias_scale_log2 = math.log2(math.e)
+        lse_scale = math.log(2.0)
+    else:
+        return None
+    if not math.isclose(q_scale, expected_scale, rel_tol=1e-5, abs_tol=1e-7):
+        return None
+    additive_modifier_kinds = {
+        TENSOR_BIAS_KIND,
+        RELATIVE_BIAS_KIND,
+        ALIBI_BIAS_KIND,
+    }
+    scaled_modifiers = tuple(
+        dataclasses.replace(
+            modifier,
+            scale_log2=modifier.scale_log2 * bias_scale_log2,
+        )
+        if modifier.kind in additive_modifier_kinds
+        else dataclasses.replace(
+            modifier,
+            value_log2=(
+                None
+                if modifier.value_log2 is None
+                else modifier.value_log2 * bias_scale_log2
+            ),
+        )
+        if modifier.kind == SOFTCAP_KIND
+        else modifier
+        for modifier in modifiers
+    )
+    score_plan = AttentionScorePlan(
+        head_dim=head_dim,
+        qk_scale_log2=qk_scale_log2,
+        lse_scale=lse_scale,
+        modifiers=scaled_modifiers,
+    )
+    if not score_plan.has_lowering():
+        return None
+    return AttentionSoftmaxPattern(score_plan=score_plan)
+
+
+def detect_flash_search_surface(device_ir: DeviceIR) -> FlashSearchSurface | None:
+    """Config-independent flash detector for the autotune search surface.
+
+    Returns the flash head_dim, KV tile count, and block-size targets when
+    ``device_ir`` is inside the same static shape envelope as the fused tcgen05
+    path: square fp16/bf16 self-attention, concrete ``seq % 128 == 0``, and reachable
+    ``block_sizes=[1, 128, 128]`` for ``(tile_b, tile_m, tile_n)``. Keeping this
+    strict prevents the autotuner from benchmarking configs that can only fall
+    back to the scalar path after the flash knobs have been added.
+    """
+    from ..autotuner.config_fragment import BlockSizeFragment
+    from .compile_environment import CompileEnvironment
+    from .device_ir import ForLoopGraphInfo
+
+    if not _attention_flash_gate_enabled() or not _attention_flash_supported():
+        return None
+    # Attention binds to a 2-axis root grid (tile_b, tile_m) plus one inner
+    # tile_n device loop.
+    if len(device_ir.grid_block_ids) != 1:
+        return None
+    root_grid_ids = device_ir.grid_block_ids[0]
+    if len(root_grid_ids) != 2:
+        return None
+    env = CompileEnvironment.current()
+    for graph_info in device_ir.graphs:
+        if not isinstance(graph_info, ForLoopGraphInfo):
+            continue
+        block_ids = graph_info.block_ids
+        if len(block_ids) != 1 or any(bid in root_grid_ids for bid in block_ids):
+            continue
+        pattern = _attention_softmax_pattern_head_dim(
+            graph_info.graph,
+            kv_block_id=block_ids[0],
+        )
+        if pattern is None:
+            continue
+        from .cute.cute_flash import flash_attention_graph_lse_plan_valid_from_graphs
+        from .cute.cute_flash import (
+            flash_attention_graph_small_biased_candidate_from_graphs,
+        )
+
+        if not flash_attention_graph_lse_plan_valid_from_graphs(
+            device_ir.graphs,
+            root_block_ids=root_grid_ids,
+            kv_block_id=block_ids[0],
+            score_plan=pattern.score_plan,
+        ):
+            continue
+        small_biased_candidate = (
+            flash_attention_graph_small_biased_candidate_from_graphs(
+                device_ir.graphs,
+                root_block_ids=root_grid_ids,
+                kv_block_id=block_ids[0],
+                score_plan=pattern.score_plan,
+            )
+        )
+        q_seq = env.block_sizes[root_grid_ids[1]].size
+        kv_seq = env.block_sizes[block_ids[0]].size
+        if not (isinstance(q_seq, int) and isinstance(kv_seq, int) and q_seq == kv_seq):
+            continue
+        if q_seq % 128 != 0:
+            continue
+        block_size_targets = {
+            root_grid_ids[0]: 1,
+            root_grid_ids[1]: 128,
+            block_ids[0]: 128,
+        }
+        if set(env.config_spec.block_sizes.valid_block_ids()) != set(
+            block_size_targets
+        ):
+            continue
+        reachable = True
+        for block_id, target in block_size_targets.items():
+            try:
+                block_spec = env.config_spec.block_sizes.block_id_lookup(block_id)
+            except KeyError:
+                reachable = False
+                break
+            fragment = block_spec._fragment(env.config_spec)
+            assert isinstance(fragment, BlockSizeFragment)
+            if not fragment.low <= target <= fragment.high:
+                reachable = False
+                break
+        if not reachable:
+            continue
+        return FlashSearchSurface(
+            head_dim=pattern.head_dim,
+            num_kv=(kv_seq + 127) // 128,
+            block_size_targets=block_size_targets,
+            is_causal=pattern.is_causal,
+            has_kv_tile_pruning=pattern.score_plan.has_kv_tile_pruning,
+            requires_ws_overlap=pattern.score_plan.requires_ws_overlap,
+            small_biased_candidate=small_biased_candidate,
+        )
+    return None
+
+
+def _attention_loop_shape(
+    fn: DeviceFunction,
+    block_ids: list[int],
+    *,
+    config: Config,
+) -> tuple[int, int, AttentionScorePlan] | None:
+    """Recognize the flash-attention dataflow in a tile_n device loop.
+
+    Matches BY SHAPE (not exclusivity), mirroring the spike sequence: a
+    ``ForLoopGraphInfo`` over the key tile whose body holds a QK matmul
+    (``aten.bmm.dtype``) feeding the online-softmax chain
+    (``amax -> maximum -> sub -> exp2 -> sum``) and a ``baddbmm.default``
+    (P@V) whose acc is the loop-carried output.
+
+    Returns ``(bm, bn, score_plan)`` derived from the operand shapes -- bm =
+    tile_m (query rows), bn = tile_n (key tile), score_plan = tile-local
+    QK-score transforms plus head_dim -- or None when the loop is not the
+    attention pattern or the validated config envelope is not met.
+
+    This is deliberately strict so single-GEMM detection
+    (``_detect_specialized_mma_loop``) is 100% untouched.
+    """
+    from .compile_environment import CompileEnvironment
+    from .device_ir import ForLoopGraphInfo
+    from .host_function import HostFunction
+
+    device_ir = HostFunction.current().device_ir
+    # Attention binds to a 2-axis root grid (tile_b, tile_m) plus one inner
+    # tile_n device loop.
+    if len(device_ir.grid_block_ids) != 1:
+        return None
+    root_grid_ids = device_ir.grid_block_ids[0]
+    if len(root_grid_ids) != 2:
+        return None
+    if len(block_ids) != 1 or any(bid in root_grid_ids for bid in block_ids):
+        return None
+
+    graph_info = None
+    for candidate in fn.codegen.codegen_graphs:
+        if isinstance(candidate, ForLoopGraphInfo) and candidate.block_ids == block_ids:
+            graph_info = candidate
+            break
+    if graph_info is None:
+        return None
+
+    pattern = _attention_softmax_pattern_head_dim(
+        graph_info.graph,
+        kv_block_id=block_ids[0],
+    )
+    if pattern is None:
+        return None
+
+    env = CompileEnvironment.current()
+
+    # The flash kernel walks full 128-row/128-col tiles, so BOTH the query
+    # (tile_m) and key/value (tile_n) sequence lengths must be exact multiples of
+    # 128. ``known_multiple`` is conservative under dynamic shapes (False unless
+    # PROVABLY divisible), so a runtime-variable seq keeps the scalar path. This
+    # mirrors the codegen's seq%128 gate at detection time, where the device
+    # function arguments are not yet populated -- so the detector never sets
+    # ``mma_mode`` / forces ``block=(128,1,1)`` on a config codegen would reject.
+    if not env.block_sizes[root_grid_ids[1]].known_multiple(128):
+        return None
+    if not env.block_sizes[block_ids[0]].known_multiple(128):
+        return None
+    # The flash codegen derives num_kv from the QUERY length, so it only handles
+    # SQUARE self-attention (query seq == key/value seq). Cross-attention
+    # (q seq != kv seq, e.g. the 1024-query/512-kv test_attention_block_pointer
+    # shape) would iterate the wrong number of KV tiles -> keep the scalar path.
+    # Require statically-equal concrete sizes: a dynamic (SymInt) seq is rejected
+    # conservatively (size hints can collide for distinct unbacked symbols).
+    q_seq = env.block_sizes[root_grid_ids[1]].size
+    kv_seq = env.block_sizes[block_ids[0]].size
+    if not (isinstance(q_seq, int) and isinstance(kv_seq, int) and q_seq == kv_seq):
+        return None
+    # The flash kernel emits its OWN (batch*head, query-tile) program mapping; it
+    # is only valid for the default flat pid with no L2 reordering. Persistent /
+    # interleaved pids and l2_grouping remap program ids, so the emitted tile
+    # indexing would address the wrong (batch, head, query-tile) -> reject.
+    if config.pid_type != "flat":
+        return None
+    if any(grouping != 1 for grouping in config.l2_groupings):
+        return None
+    if any(order != [*range(len(order))] for order in config.loop_orders):
+        return None
+    if any(thread_count != 0 for thread_count in config.num_threads):
+        return None
+    cute_vector_widths = config.config.get("cute_vector_widths", [])
+    if isinstance(cute_vector_widths, list) and any(
+        width != 1 for width in cute_vector_widths
+    ):
+        return None
+
+    # bm/bn from the config block sizes for tile_m (root grid axis 1) and tile_n
+    # (the device loop block), NOT from the grid sizes.
+    bm = env.block_sizes[root_grid_ids[1]].from_config(config)
+    (bn,) = (env.block_sizes[bid].from_config(config) for bid in block_ids)
+    if not isinstance(bm, int) or not isinstance(bn, int):
+        return None
+    # tile_b must be one (batch, head) per CTA -- the flash kernel maps the
+    # b*h flatten one row per program. A tile_b block > 1 would pack multiple
+    # (batch, head) rows per CTA and miscompute. Enforce what the docstrings
+    # claim (previously unchecked).
+    tile_b = env.block_sizes[root_grid_ids[0]].from_config(config)
+    if not isinstance(tile_b, int) or tile_b != 1:
+        return None
+    return bm, bn, pattern.score_plan
+
+
+def _detect_attention_mma_loop(
+    fn: DeviceFunction,
+    block_ids: list[int],
+    *,
+    config: Config,
+) -> bool:
+    """True when the tile_n loop is a fused tcgen05 flash-attention body.
+
+    Gated behind ``HELION_CUTE_FLASH`` and the validated config envelope
+    (tile_b block = 1, mma_tiler 128x128, head_dim in {64, 128}, fp16/bf16) so the
+    default scalar-fallback path is unchanged while the path is incomplete.
+    """
+    if not _attention_flash_gate_enabled() or not _attention_flash_supported():
+        return False
+    shape = _attention_loop_shape(fn, block_ids, config=config)
+    if shape is None:
+        return False
+    from .host_function import HostFunction
+
+    device_ir = HostFunction.current().device_ir
+    root_block_ids = device_ir.grid_block_ids[0]
+    bm, bn, score_plan = shape
+    from .cute.cute_flash import flash_attention_graph_lse_plan_valid
+
+    if not flash_attention_graph_lse_plan_valid(
+        fn,
+        root_block_ids=root_block_ids,
+        kv_block_id=block_ids[0],
+        score_plan=score_plan,
+    ):
+        return False
+    bk = score_plan.head_dim
+    # Validated envelope mirrors the spike: 128x128 mma_tiler, head_dim 64/128.
+    if bm == 128 and bn == 128 and bk in (64, 128):
+        fn.cute_state.attention_flash_score_plan = score_plan
+        return True
+    return False
+
+
 def _is_mma_candidate_loop(
     fn: DeviceFunction,
     block_ids: list[int],
@@ -3395,7 +5226,7 @@ class CuteBackend(Backend):
         from .cute.strategies import Tcgen05Strategy
         from .cute.tcgen05_constants import TCGEN05_TWO_CTA_SEED_PID_TYPE
 
-        return {
+        priors: dict[str, ValuePrior] = {
             # Generic knobs shared by every cute kernel.
             "num_warps": weighted_choice({8: 4.0, 4: 2.0, 16: 1.0}),
             "num_stages": weighted_choice({4: 3.0, 3: 2.0, 2: 1.0}),
@@ -3431,6 +5262,27 @@ class CuteBackend(Backend):
             ),
             TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY: weighted_choice({True: 3.0, False: 1.0}),
         }
+        if config_spec is not None and config_spec.cute_flash_search_enabled:
+            priors.update(self._cute_flash_config_value_priors(config_spec))
+        return priors
+
+    @staticmethod
+    def _cute_flash_config_value_priors(
+        config_spec: ConfigSpec,
+    ) -> dict[str, ValuePrior]:
+        from ..autotuner.config_priors import weighted_choice
+        from .cute.cute_flash import flash_attention_value_prior_weights
+
+        return {
+            key: weighted_choice(weights)
+            for key, weights in flash_attention_value_prior_weights(
+                config_spec._cute_flash_head_dim or 0,
+                config_spec._cute_flash_num_kv,
+                is_causal=config_spec._cute_flash_is_causal,
+                has_kv_tile_pruning=config_spec._cute_flash_has_kv_tile_pruning,
+                requires_ws_overlap=config_spec._cute_flash_requires_ws_overlap,
+            ).items()
+        }
 
     def customize_ast(self, hf: HostFunction) -> None:
         """CuTe-specific AST rewrites that rewrite high-level patterns into
@@ -3463,7 +5315,7 @@ class CuteBackend(Backend):
         if (
             key == "num_threads"
             or key == "cute_vector_widths"
-            or key.startswith("tcgen05_")
+            or key.startswith(("tcgen05_", "cute_flash_"))
         ):
             return True
         return super().supports_config_key(key)
@@ -3643,7 +5495,13 @@ class CuteBackend(Backend):
         **kwargs: object,
     ) -> Config:
         original_budget = bound_kernel.settings.autotune_budget_seconds
-        if bound_kernel.settings.autotune_budget_seconds is None:
+        # "full" should mean the search algorithms run to completion unless the
+        # caller explicitly provides a budget. Keep the defensive default budget
+        # only for cheaper efforts where bounded local iteration is expected.
+        if (
+            bound_kernel.settings.autotune_budget_seconds is None
+            and bound_kernel.settings.autotune_effort != "full"
+        ):
             bound_kernel.settings.autotune_budget_seconds = (
                 _CUTE_DEFAULT_AUTOTUNE_BUDGET_SECONDS
             )
@@ -4157,6 +6015,14 @@ class CuteBackend(Backend):
                 )
             return launcher_args
 
+        # Fused tcgen05 flash-attention: 128 threads (single-warpgroup Stage-3)
+        # or 256 threads (Stage-4 warp-spec producer/consumer split). The custom
+        # flash codegen owns the whole device body, so the SIMT thread-axis
+        # heuristics below do not apply.
+        if device_function.cute_state.attention_flash_block_ids is not None:
+            flash_threads = device_function.cute_state.attention_flash_threads
+            return launcher_args_with_compile_options(f"block=({flash_threads}, 1, 1)")
+
         block_size_values = {
             name: int(value)
             for name, value in re.findall(
@@ -4468,39 +6334,30 @@ class CuteBackend(Backend):
         # from the SIMT thread-axis counts (the latter being how many
         # threads the user-visible per-element loops would expect). The
         # tcgen05 code paths know which lanes are alive on their own.
-        # Also skip when the kernel has any matmul / MMA call (addmm,
-        # baddbmm, mm, bmm, or hl.dot): those paths cooperate within a
-        # warp through CUTLASS MMA intrinsics that don't depend on the
-        # SIMT axis layout, so the strategy can intentionally launch
-        # fewer threads on a reduction axis (e.g. K) than the codegen
-        # "references" through the strategy's per-block thread count.
-        from ..language._decorators import is_api_func
+        # Also skip when the kernel has any matmul / MMA call (checks for
+        # cute.gemm calls): those paths cooperate within a warp through
+        # CUTLASS MMA intrinsics that don't depend on the SIMT axis layout,
+        # so the strategy can intentionally launch fewer threads on a
+        # reduction axis (e.g. K) than the codegen "references" through the
+        # strategy's per-block thread count.
         from .cute.thread_budget import check_thread_limit
 
-        _matmul_targets = {
-            torch.ops.aten.mm.default,
-            torch.ops.aten.addmm.default,
-            torch.ops.aten.bmm.default,
-            torch.ops.aten.baddbmm.default,
-        }
-
-        def _has_matmul_call() -> bool:
-            for graph_info in device_function.codegen.codegen_graphs:
-                graph = getattr(graph_info, "graph", None)
-                if not isinstance(graph, torch.fx.Graph):
-                    continue
-                for node in graph.nodes:
-                    if node.op != "call_function":
-                        continue
-                    if node.target in _matmul_targets:
-                        return True
-                    if is_api_func(node.target) and (
-                        getattr(node.target, "__name__", "") == "dot"
-                    ):
-                        return True
+        def _emits_cute_gemm(stmt: ast.AST) -> bool:
+            for sub in ast.walk(stmt):
+                if (
+                    isinstance(sub, ast.Call)
+                    and isinstance(sub.func, ast.Attribute)
+                    and sub.func.attr == "gemm"
+                    and isinstance(sub.func.value, ast.Name)
+                    and sub.func.value.id == "cute"
+                ):
+                    return True
             return False
 
-        kernel_has_mma = _has_matmul_call()
+        kernel_has_mma = any(
+            _emits_cute_gemm(stmt)
+            for stmt in [*device_function.preamble, *device_function.body]
+        )
         if (
             tcgen05_compact_dims is None
             and not specialized_root_tcgen05
@@ -4659,7 +6516,7 @@ class CuteBackend(Backend):
             ) -> bool:
                 if known_equal is not None:
                     return known_equal(lhs, rhs)
-                return lhs == rhs
+                return bool(lhs == rhs)
 
             nd_block_size = [bs.from_config_assert(config) for bs in block_size_infos]
             original_num_threads_config = list(num_threads_config)
@@ -4825,6 +6682,17 @@ class CuteBackend(Backend):
                     block_sizes=nd_block_size,
                     config=config,
                 )
+                if not mma_mode and _detect_attention_mma_loop(
+                    fn,
+                    block_ids,
+                    config=config,
+                ):
+                    # Fused tcgen05 flash-attention: suppress synthetic lane
+                    # loops (mma_mode) and run a single 128-thread warpgroup
+                    # like the spike. The dedicated flash codegen emits the
+                    # whole device body; the FX-graph statement walk is bypassed.
+                    mma_mode = True
+                    fn.cute_state.attention_flash_block_ids = list(block_ids)
             elif (
                 len(device_ir.grid_block_ids) == 1
                 and block_ids == device_ir.grid_block_ids[0]
@@ -4864,7 +6732,7 @@ class CuteBackend(Backend):
                 inactive_block_ids=inactive_block_ids,
             )
         nd_block_size = [bs.from_config_assert(config) for bs in block_size_infos]
-        block_size = functools.reduce(operator.mul, nd_block_size)
+        block_size = functools.reduce(operator.mul, nd_block_size)  # pyrefly: ignore[incompatible-overload-residual]
         # Resolve per-axis thread counts then flatten to a single total
         all_auto = all(nt <= 0 for nt in num_threads_config)
         flat_num_threads = functools.reduce(

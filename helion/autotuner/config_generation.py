@@ -571,11 +571,15 @@ class ConfigGeneration:
         if n <= 0:
             return [self.default_flat()]
         default_flat = self.default_flat()
-        result = [default_flat]
+        result: list[FlatConfig] = []
+        default_first = not self.config_spec.cute_flash_search_enabled
+        if default_first:
+            result.append(default_flat)
 
-        # Initial population order is default -> user seed configs -> compiler seeds
-        # -> random.  This preserves user seed priority without dropping built-in
-        # backend/compiler seeds from ConfigSpec.compiler_seed_configs.
+        # Initial population order is normally default -> user seed configs ->
+        # compiler seeds -> random.  Flash attention has backend-shaped compiler
+        # seeds that are materially better anchors than the raw fragment default,
+        # so try those seeds before the default when that search surface is active.
         for flat, _config in self.user_seed_flat_config_pairs(
             user_seed_configs, log_func
         ):
@@ -591,6 +595,12 @@ class ConfigGeneration:
             result.append(flat)
             if len(result) >= n:
                 return result[:n]
+
+        if not default_first:
+            if not any(default_flat == existing for existing in result):
+                result.append(default_flat)
+                if len(result) >= n:
+                    return result[:n]
 
         # Fill the remainder with random configs. When the backend supplies
         # value priors, half the random fill is drawn from those priors (biased
