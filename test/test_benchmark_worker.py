@@ -28,6 +28,7 @@ from helion._testing import onlyBackends
 from helion._testing import skipIfXPU
 from helion.autotuner.base_search import PopulationBasedSearch
 from helion.autotuner.base_search import PopulationMember
+from helion.autotuner.benchmark_job import AccuracyCheckResult
 from helion.autotuner.benchmark_job import BenchmarkJob
 from helion.autotuner.benchmark_provider import LocalBenchmarkProvider
 from helion.autotuner.benchmark_worker import BenchmarkSubprocessError
@@ -399,13 +400,13 @@ class TestSubprocessBenchmarkIntegration(RefEagerTestDisabled, unittest.TestCase
         if not torch.cuda.is_available():
             self.skipTest("requires CUDA")
 
-        original = LocalBenchmarkProvider._run_subprocess_accuracy_job
+        original = LocalBenchmarkProvider._run_subprocess_accuracy_check_job
         call_count = [0, 0]  # [total, simulated_crashes]
 
         def maybe_crash(
             self: LocalBenchmarkProvider,
             fn: CompiledConfig,
-        ) -> bool | None:
+        ) -> AccuracyCheckResult | None:
             call_count[0] += 1
             if call_count[0] % 3 == 0:
                 call_count[1] += 1
@@ -435,7 +436,7 @@ class TestSubprocessBenchmarkIntegration(RefEagerTestDisabled, unittest.TestCase
         random.seed(123)
         with patch.object(
             LocalBenchmarkProvider,
-            "_run_subprocess_accuracy_job",
+            "_run_subprocess_accuracy_check_job",
             maybe_crash,
         ):
             best = RandomSearch(bound_kernel, args, 20).autotune()

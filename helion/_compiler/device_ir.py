@@ -80,6 +80,7 @@ if TYPE_CHECKING:
     from collections.abc import Sequence
 
     from ..autotuner.config_spec import AccumulatorFact
+    from ..autotuner.config_spec import ConfigSpec
     from ..autotuner.config_spec import MemoryOpFact
     from .compile_environment import BlockSizeInfo
     from .cute.layout import CuTeGridExecutionPlan
@@ -2925,6 +2926,43 @@ def _register_tensor_descriptor_layout_guards(device_ir: DeviceIR) -> None:
                 atomic_op_index += 1
 
 
+def _register_cute_lane_vector_width_specs(config_spec: ConfigSpec) -> None:
+    """Pre-register CuTe vector-width slots for every lane-loop-eligible block.
+
+    On the CuTe backend a tile block whose configured ``block_size`` exceeds
+    its ``num_threads`` is traversed by a synthetic lane loop, and the tile
+    strategy lazily registers a ``cute_vector_widths`` slot for it during
+    codegen. That lazy append happens *per config* and is config dependent
+    (whether a lane loop appears depends on the config's block sizes and
+    num_threads), so the shared ``config_spec`` would grow after
+    ``ConfigGeneration`` has already captured its ``flat_spec`` — leaving the
+    flat layout stale and causing ``unflatten`` to over-walk the spec.
+
+    Registering the slots once here (config independently) keeps the lazy
+    append idempotent: any block that *could* be lane-looped under some config
+    already owns its slot, so the per-config append is a no-op and the spec
+    stays a fixed size for the lifetime of autotuning. Blocks that never end up
+    lane-looped simply keep ``V=1`` (the slot's default), which the tile
+    strategy ignores.
+    """
+    from ..autotuner.config_spec import CuteVectorWidthSpec
+
+    num_thread_block_ids = set(config_spec.num_threads.valid_block_ids())
+    existing = set(config_spec.cute_vector_widths.valid_block_ids())
+    for spec in config_spec.block_sizes:
+        block_id = spec.block_id
+        if block_id not in num_thread_block_ids or block_id in existing:
+            continue
+        # ``max_size`` bounds the largest block_size the autotuner may pick;
+        # only blocks that can exceed a single thread can ever be lane-looped.
+        if spec.max_size <= 1:
+            continue
+        config_spec.cute_vector_widths.append(
+            CuteVectorWidthSpec(block_id=block_id, size_hint=spec.size_hint)
+        )
+        existing.add(block_id)
+
+
 def lower_to_device_ir(func: HostFunction) -> DeviceIR:
     device_ir = DeviceIR()
     device_ir.host_function = func
@@ -2987,6 +3025,26 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
         # (standard) rdims. ReductionFacts are built in Phase 3 (build_reduction_facts,
         # after _collect_memory_op_facts) so they read the enriched memory_op_facts.
         device_ir.register_rollable_reductions()
+        if CompileEnvironment.current().backend.name == "cute":
+            _register_cute_lane_vector_width_specs(config_spec)
+            # Enable the flash-attention autotune surface (Tasks #25 + #28) when
+            # the dense flash dataflow is detected, analogous to how a matmul
+            # detection sets ``cute_tcgen05_search_enabled``. Default-off
+            # otherwise so the flash knobs never widen the search surface for
+            # ordinary cute kernels.
+            from .backend import detect_flash_search_surface
+
+            flash_shape = detect_flash_search_surface(device_ir)
+            if flash_shape is not None:
+                config_spec.enable_cute_flash_search(
+                    head_dim=flash_shape.head_dim,
+                    num_kv=flash_shape.num_kv,
+                    block_size_targets=flash_shape.block_size_targets,
+                    is_causal=flash_shape.is_causal,
+                    has_kv_tile_pruning=flash_shape.has_kv_tile_pruning,
+                    requires_ws_overlap=flash_shape.requires_ws_overlap,
+                    small_biased_candidate=flash_shape.small_biased_candidate,
+                )
         config_spec.raise_grid_block_minimums()
         if len(device_ir.root_ids) > 1:
             # xyz is not supported with shared program IDs. Non-tcgen05
