@@ -5496,8 +5496,20 @@ def _codegen_cute_store_tcgen05_tile(
                 sync_after_stmt,
             ]
     else:
+        # The matmul-loop suffix (`acc_pipeline.producer_commit` + advance)
+        # ends with a CTA-wide `cute.arch.sync_threads()` (the `sync_stmt`
+        # emitted in `_emit_mma_pipeline`), and only dead scalar epilogue
+        # ops + the acc-stage-index read sit between that barrier and this
+        # store block. A leading `sync_threads()` here is therefore a
+        # redundant back-to-back CTA barrier: the MMA->epi data dependency
+        # is carried by the acc_pipeline mbarrier (`consumer_wait` inside the
+        # store body), not by sync_threads, and the whole CTA already
+        # rendezvoused at the suffix barrier. Dropping it removes one of the
+        # per-tile CTA syncs that dominate the tiny-M barrier stall without
+        # weakening any ordering. The trailing `sync_threads()` is kept: it
+        # fences all epi warps' TMEM reads before the one-shot teardown frees
+        # the accumulator TMEM.
         store_body = [
-            "cute.arch.sync_threads()",
             *store_body_core,
             "cute.arch.sync_threads()",
         ]
