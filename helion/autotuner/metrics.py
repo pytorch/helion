@@ -10,7 +10,10 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from collections.abc import Callable
 
+    import torch
+
     from .._compiler.device_ir import DeviceIR
+    from ._metadata.hardware import HardwareInfoRecord
 
 log = logging.getLogger(__name__)
 
@@ -106,9 +109,9 @@ class KernelMetadata:
     Appended (one JSON record per run) to the ``<autotune_log>.meta.jsonl``
     sidecar that sits next to the per-config CSV telemetry. The CSV records each
     config and its result; this record provides the kernel context (source,
-    shapes, dtypes, hardware, settings) those rows join back to, plus the
-    config-independent ``ir_graph`` device-IR dump (extracted lazily in
-    :meth:`_ir_graph`).
+    shapes, dtypes, hardware, settings) those rows join back to, plus a
+    ``hardware_info`` snapshot and the config-independent ``ir_graph`` device-IR
+    dump (both extracted lazily in :meth:`to_dict`).
 
     ``run_id`` is the single foreign key for an autotune *invocation*: a direct
     content hash of ``(kernel_source, codegen-settings signature, input_shapes,
@@ -134,6 +137,10 @@ class KernelMetadata:
     _device_ir: DeviceIR | None = dataclasses.field(
         default=None, repr=False, compare=False, hash=False
     )
+    # Source ref for the lazy ``hardware_info`` snapshot; repr/compare/hash off.
+    _device: torch.device | None = dataclasses.field(
+        default=None, repr=False, compare=False, hash=False
+    )
 
     @functools.cached_property
     def run_id(self) -> str:
@@ -144,9 +151,10 @@ class KernelMetadata:
         fields (so boundaries can't collide). Content-derived, so the same
         invocation yields the same ``run_id`` across processes and CI runs.
         """
-        # Hash exactly these five identity fields. The device IR (_device_ir) is
-        # intentionally NOT included: its ir_graph dump is a derived artifact (a
-        # function of run_id), not identity, so hashing it would be circular.
+        # Hash exactly these five identity fields. The non-serialized source refs
+        # are intentionally NOT included: _device_ir's ir_graph dump is a derived
+        # artifact (a function of run_id), and _device's hardware_info is
+        # descriptive -- so driver/software changes don't fragment the dataset.
         payload = (
             f"{self.kernel_source}\x00{_codegen_signature(self.settings)}\x00"
             f"{self.input_shapes}\x00{self.dtypes}\x00{self.hardware}"
@@ -161,9 +169,26 @@ class KernelMetadata:
             "input_shapes": self.input_shapes,
             "dtypes": self.dtypes,
             "hardware": self.hardware,
+            "hardware_info": self._hardware_info(),
             "settings": self.settings,
             "ir_graph": self._ir_graph(),
         }
+
+    def _hardware_info(self) -> HardwareInfoRecord | None:
+        """Collect the snapshot lazily (dataset-only write path). Safe to defer: the
+        device is time-invariant. Mirrors :meth:`_ir_graph` -- collect_hardware_info
+        never raises, but an unexpected failure records ``hardware_info=None`` rather
+        than breaking autotuning."""
+        from ._metadata.hardware import collect_hardware_info
+
+        try:
+            return collect_hardware_info(self._device)
+        except Exception:
+            logging.getLogger(__name__).debug(
+                "hardware_info collection failed; recording hardware_info=None",
+                exc_info=True,
+            )
+            return None
 
     def _ir_graph(self) -> dict[str, object] | None:
         """Lazily extract the device-IR node-link dump (dataset-only, best-effort).
