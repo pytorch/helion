@@ -4468,39 +4468,30 @@ class CuteBackend(Backend):
         # from the SIMT thread-axis counts (the latter being how many
         # threads the user-visible per-element loops would expect). The
         # tcgen05 code paths know which lanes are alive on their own.
-        # Also skip when the kernel has any matmul / MMA call (addmm,
-        # baddbmm, mm, bmm, or hl.dot): those paths cooperate within a
-        # warp through CUTLASS MMA intrinsics that don't depend on the
-        # SIMT axis layout, so the strategy can intentionally launch
-        # fewer threads on a reduction axis (e.g. K) than the codegen
-        # "references" through the strategy's per-block thread count.
-        from ..language._decorators import is_api_func
+        # Also skip when the kernel has any matmul / MMA call (checks for
+        # cute.gemm calls): those paths cooperate within a warp through
+        # CUTLASS MMA intrinsics that don't depend on the SIMT axis layout,
+        # so the strategy can intentionally launch fewer threads on a
+        # reduction axis (e.g. K) than the codegen "references" through the
+        # strategy's per-block thread count.
         from .cute.thread_budget import check_thread_limit
 
-        _matmul_targets = {
-            torch.ops.aten.mm.default,
-            torch.ops.aten.addmm.default,
-            torch.ops.aten.bmm.default,
-            torch.ops.aten.baddbmm.default,
-        }
-
-        def _has_matmul_call() -> bool:
-            for graph_info in device_function.codegen.codegen_graphs:
-                graph = getattr(graph_info, "graph", None)
-                if not isinstance(graph, torch.fx.Graph):
-                    continue
-                for node in graph.nodes:
-                    if node.op != "call_function":
-                        continue
-                    if node.target in _matmul_targets:
-                        return True
-                    if is_api_func(node.target) and (
-                        getattr(node.target, "__name__", "") == "dot"
-                    ):
-                        return True
+        def _emits_cute_gemm(stmt: ast.AST) -> bool:
+            for sub in ast.walk(stmt):
+                if (
+                    isinstance(sub, ast.Call)
+                    and isinstance(sub.func, ast.Attribute)
+                    and sub.func.attr == "gemm"
+                    and isinstance(sub.func.value, ast.Name)
+                    and sub.func.value.id == "cute"
+                ):
+                    return True
             return False
 
-        kernel_has_mma = _has_matmul_call()
+        kernel_has_mma = any(
+            _emits_cute_gemm(stmt)
+            for stmt in [*device_function.preamble, *device_function.body]
+        )
         if (
             tcgen05_compact_dims is None
             and not specialized_root_tcgen05
