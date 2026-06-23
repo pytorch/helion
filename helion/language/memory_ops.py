@@ -3825,6 +3825,44 @@ def _codegen_cute_store_tcgen05_tile(
             if rowvec_stage is None and (
                 safe_direct_aux_with_full_tile or not tcgen05_aux_use_tma_store_epilogue
             ):
+                if tcgen05_value.flat_m_edge:
+                    # Padded single-M-tile (block_m > real M, N divides bn): the
+                    # ``if full_tile`` fast path is statically dead (a full M tile
+                    # can never form) and the only out-of-bounds aux coordinate is
+                    # the M row, so the per-element 2-D ``elem_less`` scalar loop is
+                    # pure overhead. Mirror the leaner store path
+                    # (``tcgen05_value.flat_m_edge`` branch in the SIMT store) and
+                    # emit ONE vectorized ``logical_divide`` predicated copy with an
+                    # M-only row predicate. Same masking semantics (padded rows read
+                    # 0 and are dropped by the M-predicated store), far fewer scalar
+                    # ops / live registers on the streaming epilogue warps.
+                    include_coord_setup = not force_simt_edge_coord_emitted
+                    force_simt_edge_coord_emitted = True
+                    flat_edge_atom = df.new_var(f"{rec.aux_rmem}_edge_atom")
+                    lines.append(
+                        f"{prelude_indent}{flat_edge_atom} = "
+                        f"cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), "
+                        f"{rec.aux_dtype})\n"
+                        f"{prelude_indent}{rec.ttr_aux_subtile} = "
+                        f"{rec.ttr_aux_grouped}"
+                        f"[(None, None, None, cutlass.Int32(_tcgen05_subtile))]\n"
+                        f"{prelude_indent}{rec.aux_rmem} = "
+                        f"cute.make_rmem_tensor({rec.ttr_aux_subtile}.shape, "
+                        f"{rec.aux_dtype})\n"
+                        f"{prelude_indent}{rec.aux_rmem}.fill(0)\n"
+                        + _simt_edge_logical_divide_copy_source(
+                            prelude_indent,
+                            rec.ttr_aux_subtile,
+                            rec.aux_rmem,
+                            include_coord_setup=include_coord_setup,
+                            var_prefix=f"{rec.aux_rmem}_edge",
+                            copy_atom=flat_edge_atom,
+                            m_only_pred=True,
+                        )
+                        + f"{prelude_indent}{rec.aux_loaded} = "
+                        f"{rec.aux_rmem}.load()\n"
+                    )
+                    continue
                 lines.append(
                     f"{prelude_indent}{rec.ttr_aux_subtile} = "
                     f"{rec.ttr_aux_grouped}"
