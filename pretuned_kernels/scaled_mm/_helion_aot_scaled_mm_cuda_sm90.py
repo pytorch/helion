@@ -11,6 +11,15 @@ Pretuned on NVIDIA H100 (sm90) for FP8 scaled matmul across the
 Config selection mirrors the vLLM pick_config strategy: closest K,
 then closest N, then the smallest tuned M >= the input M (falling back
 to the largest tuned M).
+
+H100 variant note: these configs deliver the documented speedup over
+torch._scaled_mm on a lower-memory-bandwidth H100 -- the validation
+machine reports as "NVIDIA H100" 96GB with a max memory clock of ~1593
+MHz (HBM3, 700W). On a higher-bandwidth "NVIDIA H100 80GB HBM3" SXM5 part
+(max memory clock ~2619 MHz, ~3.35 TB/s) the small-M decode shapes
+instead lose to torch's adaptive cuBLAS/cuTLASS (large bandwidth-bound
+shapes stay faster). Re-tune for the target H100 SKU if the small-M
+shapes matter.
 """
 
 # Tuned (K, N, M) keys, parallel to the config list in autotune_scaled_mm.

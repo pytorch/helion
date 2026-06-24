@@ -3,6 +3,11 @@
 Pretuned for the small-token-count (decode) FP8 GEMM shapes used by vLLM
 serving.  The kernel and its checked-in heuristic are ported from
 https://github.com/vllm-project/vllm/pull/46522.
+
+The checked-in sm90 configs were validated on a lower-memory-bandwidth
+H100 ("NVIDIA H100" 96GB, ~1593 MHz max memory clock); on a faster
+"NVIDIA H100 80GB HBM3" SXM5 part the small-M shapes regress vs
+torch._scaled_mm.  See ``_helion_aot_scaled_mm_cuda_sm90.py`` for details.
 """
 
 from __future__ import annotations
