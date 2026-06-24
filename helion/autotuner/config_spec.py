@@ -284,6 +284,7 @@ BACKEND_SPECIFIC_KEYS: frozenset[str] = (
         "num_threads",
         "cute_vector_widths",
         "load_cache_modifiers",
+        "store_cache_modifiers",
         "pallas_loop_type",
         "pallas_pre_broadcast",
     }
@@ -311,6 +312,7 @@ VALID_KEYS: frozenset[str] = frozenset(
         "atomic_indexing",
         "load_eviction_policies",
         "load_cache_modifiers",
+        "store_cache_modifiers",
         "pallas_loop_type",
         "pallas_pre_broadcast",
         "cute_vector_widths",
@@ -386,6 +388,12 @@ def get_valid_load_cache_modifiers(backend_name: str) -> tuple[str, ...]:
     return ("",)
 
 
+def get_valid_store_cache_modifiers(backend_name: str) -> tuple[str, ...]:
+    if backend_name == "triton" and supports_amd_cdna_tunables():
+        return ("", ".cs", ".wt")
+    return ("",)
+
+
 class ConfigSpec:
     def __init__(
         self,
@@ -449,6 +457,10 @@ class ConfigSpec:
         )
         self.load_cache_modifiers = ListOf(
             EnumFragment(choices=get_valid_load_cache_modifiers(self.backend_name)),
+            length=0,
+        )
+        self.store_cache_modifiers = ListOf(
+            EnumFragment(choices=get_valid_store_cache_modifiers(self.backend_name)),
             length=0,
         )
         self.indexing = ListOf(
@@ -1476,6 +1488,7 @@ class ConfigSpec:
             "static_ranges",
             "load_eviction_policies",
             "load_cache_modifiers",
+            "store_cache_modifiers",
             "indexing",
             "atomic_indexing",
         ):
@@ -1488,6 +1501,7 @@ class ConfigSpec:
             "num_stages",
             "load_eviction_policies",
             "load_cache_modifiers",
+            "store_cache_modifiers",
             "indexing",
             "atomic_indexing",
             "pid_type",
@@ -1511,6 +1525,13 @@ class ConfigSpec:
         ):
             config.setdefault(
                 "load_cache_modifiers", self.load_cache_modifiers.default()
+            )
+        if (
+            self.supports_config_key("store_cache_modifiers")
+            and self.store_cache_modifiers.length > 0
+        ):
+            config.setdefault(
+                "store_cache_modifiers", self.store_cache_modifiers.default()
             )
         if self.supports_config_key("indexing"):
             config.setdefault("indexing", self.indexing.default())
@@ -1957,6 +1978,11 @@ class ConfigSpec:
             and self.load_cache_modifiers.length > 0
         ):
             fields["load_cache_modifiers"] = self.load_cache_modifiers
+        if (
+            self.supports_config_key("store_cache_modifiers")
+            and self.store_cache_modifiers.length > 0
+        ):
+            fields["store_cache_modifiers"] = self.store_cache_modifiers
         if self.supports_config_key("num_threads"):
             fields["num_threads"] = self.num_threads
         if is_tileir:
@@ -2084,6 +2110,7 @@ class ConfigSpec:
             "static_ranges",
             "load_eviction_policies",
             "load_cache_modifiers",
+            "store_cache_modifiers",
             "indexing",
             "atomic_indexing",
         ):

@@ -208,6 +208,7 @@ class IndexingStrategy:
         subscript: list[object],
         value: ast.AST,
         extra_mask: ast.AST | None,
+        cache_modifier: ast.AST | None,
     ) -> ast.AST:
         raise NotImplementedError
 
@@ -635,6 +636,7 @@ class PointerIndexingStrategy(IndexingStrategy):
         subscript: list[object],
         value: ast.AST,
         extra_mask: ast.AST | None,
+        cache_modifier: ast.AST | None,
     ) -> ast.AST:
         indexing = SubscriptIndexing.create(state, fake_tensor, subscript, extra_mask)
         name = state.device_function.tensor_arg(fake_tensor).name
@@ -707,11 +709,17 @@ class PointerIndexingStrategy(IndexingStrategy):
             broadcast = backend.broadcast_to_expr("{offset}", shape_str)
             offset_expr = expr_from_string(broadcast, offset=offset_expr)
 
+        extra = ", cache_modifier={cm}" if cache_modifier is not None else ""
+        store_placeholders: dict[str, ast.AST] = {
+            "value": value,
+            "offset": offset_expr,
+            "mask": indexing.mask_expr,
+        }
+        if cache_modifier is not None:
+            store_placeholders["cm"] = cache_modifier
         return expr_from_string(
-            f"tl.store({name} + {{offset}}, {{value}}, {{mask}})",
-            value=value,
-            offset=offset_expr,
-            mask=indexing.mask_expr,
+            f"tl.store({name} + {{offset}}, {{value}}, {{mask}}{extra})",
+            **store_placeholders,
         )
 
     def codegen_atomic(
@@ -790,20 +798,27 @@ class BlockPtrIndexingStrategy(IndexingStrategy):
         subscript: list[object],
         value: ast.AST,
         extra_mask: ast.AST | None,
+        cache_modifier: ast.AST | None,
     ) -> ast.AST:
         if extra_mask is not None or not BlockedSubscriptIndexing.is_supported(
             state, fake_tensor, subscript
         ):
             return PointerIndexingStrategy().codegen_store(
-                state, fake_tensor, subscript, value, extra_mask
+                state, fake_tensor, subscript, value, extra_mask, cache_modifier
             )
         indexing = BlockedSubscriptIndexing.create(state, fake_tensor, subscript)
         store_value = indexing.reshape_store(state, value)
         store_value = cast_ast(store_value, fake_tensor.dtype)
+        extra = ", cache_modifier={cm}" if cache_modifier is not None else ""
+        placeholders: dict[str, ast.AST] = {
+            "block_ptr": indexing.make_block_ptr(state),
+            "value": store_value,
+        }
+        if cache_modifier is not None:
+            placeholders["cm"] = cache_modifier
         return expr_from_string(
-            f"tl.store({{block_ptr}}, {{value}}, boundary_check={indexing.boundary_check(state)})",
-            block_ptr=indexing.make_block_ptr(state),
-            value=store_value,
+            f"tl.store({{block_ptr}}, {{value}}, boundary_check={indexing.boundary_check(state)}{extra})",
+            **placeholders,
         )
 
 
@@ -999,12 +1014,13 @@ class TensorDescriptorIndexingStrategy(IndexingStrategy):
         subscript: list[object],
         value: ast.AST,
         extra_mask: ast.AST | None,
+        cache_modifier: ast.AST | None,
     ) -> ast.AST:
         if extra_mask is not None or not self.is_supported(
             state, fake_tensor, subscript
         ):
             return PointerIndexingStrategy().codegen_store(
-                state, fake_tensor, subscript, value, extra_mask
+                state, fake_tensor, subscript, value, extra_mask, cache_modifier
             )
         indexing = BlockedSubscriptIndexing.create(state, fake_tensor, subscript)
 
@@ -1209,6 +1225,7 @@ class StackIndexingStrategy:
         subscript: list[object],
         value: ast.AST,
         extra_mask: ast.AST | None,
+        cache_modifier: ast.AST | None,
     ) -> ast.AST:
         tensor_like, dev_ptrs = stack_tensor
         indexing = SubscriptIndexing.create(state, tensor_like, subscript, extra_mask)
@@ -1228,12 +1245,18 @@ class StackIndexingStrategy:
         )
 
         dtype = triton_type(tensor_like.dtype)
+        extra = ", cache_modifier={cm}" if cache_modifier is not None else ""
+        placeholders: dict[str, ast.AST] = {
+            "base": dev_ptrs_ast,
+            "value": value,
+            "offset": indexing.index_expr,
+            "mask": mask_expr,
+        }
+        if cache_modifier is not None:
+            placeholders["cm"] = cache_modifier
         return expr_from_string(
-            f"tl.store({{base}}.to(tl.pointer_type({dtype})){stack_broadcast} + ({{offset}}){tensor_broadcast}, {{value}}, {{mask}})",
-            base=dev_ptrs_ast,
-            value=value,
-            offset=indexing.index_expr,
-            mask=mask_expr,
+            f"tl.store({{base}}.to(tl.pointer_type({dtype})){stack_broadcast} + ({{offset}}){tensor_broadcast}, {{value}}, {{mask}}{extra})",
+            **placeholders,
         )
 
 
