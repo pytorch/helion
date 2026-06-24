@@ -2506,8 +2506,10 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
         )
         self.assertEqual(errors, [], msg=str(errors))
 
-        # cluster_n=2 with cluster_m=1: rejected (requires the 4-CTA
-        # V=2 cluster).
+        # cluster_n=2 with cluster_m=1 under a PERSISTENT pid: rejected
+        # (the N-only A-multicast cluster only lowers on the flat
+        # NON_PERSISTENT grid; persistent grids have no cluster_m=1
+        # cluster_n=2 path).
         errors = validate_tcgen05_strategy_invariants(
             strategy=Tcgen05Strategy.ROLE_LOCAL_MONOLITHIC,
             persistence_model=Tcgen05PersistenceModel.STATIC_PERSISTENT,
@@ -2522,6 +2524,23 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
             any("requires tcgen05_cluster_m=2" in e for e in errors),
             msg=str(errors),
         )
+
+        # cluster_n=2 with cluster_m=1 under the flat NON_PERSISTENT grid:
+        # ACCEPTED. This is the N-only A-multicast cluster for the tiny-M
+        # padded tcgen05 fp8 path (mirrors torch's _scaled_mm
+        # ClusterShape<1,2,1> at M<=64,N>=3072). Two CtaGroup.ONE CTAs each
+        # own their own N output tile and TMA-multicast the shared A operand.
+        errors = validate_tcgen05_strategy_invariants(
+            strategy=Tcgen05Strategy.ROLE_LOCAL_MONOLITHIC,
+            persistence_model=Tcgen05PersistenceModel.NON_PERSISTENT,
+            layout_strategy=Tcgen05LayoutStrategy.DEFAULT,
+            warp_spec=ROLE_LOCAL_MONOLITHIC_DEFAULT_WARP_SPEC,
+            layout_overrides=Tcgen05LayoutOverrides(),
+            pid_type="flat",
+            cluster_m=1,
+            cluster_n=2,
+        )
+        self.assertEqual(errors, [], msg=str(errors))
 
         # cluster_n=2 under ROLE_LOCAL_WITH_SCHEDULER: ACCEPTED
         # in cycle 33 (the scheduler-broadcast topology generalizes

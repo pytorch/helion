@@ -1236,11 +1236,32 @@ def validate_tcgen05_strategy_invariants(
             f"at tcgen05_cluster_n in {sorted(supported_cluster_n)!r}; "
             f"got tcgen05_cluster_n={cluster_n}"
         )
-    if cluster_n > 1 and cluster_m != 2:
+    # cluster_n=2 has two validated envelopes:
+    #   - cluster_m=2 use_2cta=True: the canonical Quack-best 4-CTA cluster
+    #     (cute_plan.md §6.12).
+    #   - cluster_m=1 CtaGroup.ONE: the N-only A-multicast cluster for the
+    #     tiny-M padded tcgen05 fp8 path. Two CTAs each own their own N
+    #     output tile; the cluster exists only to TMA-multicast the shared A
+    #     operand along the N axis (mcast_mode=2). This is what torch's
+    #     ``_scaled_mm`` CUTLASS kernel selects at M<=64,N>=3072
+    #     (ClusterShape<1,2,1>). Only ``ROLE_LOCAL_MONOLITHIC`` with the flat
+    #     NON_PERSISTENT grid lowers this shape today (the WITH_SCHEDULER / CLC
+    #     and persistent topologies have not been generalized to the N-only
+    #     multicast, so they stay on the cluster_m=2 envelope). The flat grid
+    #     is what makes consecutive grid_x CTAs adjacent N-tiles of the single
+    #     padded M-tile, which is the cluster's A-sharing precondition.
+    n_only_cluster_ok = (
+        cluster_m == 1
+        and strategy is Tcgen05Strategy.ROLE_LOCAL_MONOLITHIC
+        and persistence_model is Tcgen05PersistenceModel.NON_PERSISTENT
+    )
+    if cluster_n > 1 and cluster_m != 2 and not n_only_cluster_ok:
         errors.append(
             f"tcgen05_cluster_n={cluster_n} requires tcgen05_cluster_m=2 "
             f"with use_2cta=True (the validated 4-CTA cluster envelope; "
-            f"cute_plan.md §6.12); got tcgen05_cluster_m={cluster_m}"
+            f"cute_plan.md §6.12) or tcgen05_cluster_m=1 with "
+            f"ROLE_LOCAL_MONOLITHIC (the N-only A-multicast cluster); "
+            f"got tcgen05_cluster_m={cluster_m}, strategy={strategy.value!r}"
         )
 
     # (strategy, persistence_model) paired cluster_n accept set.
