@@ -33,6 +33,7 @@ from .accuracy_job import AccuracyCheckJob
 from .benchmark_job import BenchmarkJob
 from .benchmark_worker import BenchmarkSubprocessError
 from .benchmark_worker import BenchmarkWorker
+from .benchmarking import PerfStats
 from .benchmarking import clear_jit_fast_path_caches
 from .benchmarking import do_bench
 from .benchmarking import do_bench_generic
@@ -182,6 +183,19 @@ class BenchmarkResult(NamedTuple):
     perf: float
     status: Literal["ok", "error", "timeout", "peer_compilation_fail", "filtered"]
     compile_time: float | None
+    perf_stats: PerfStats | None = None
+
+
+def _split_worker_result(
+    result: dict[str, object] | float,
+) -> tuple[float, PerfStats | None]:
+    # Worker returns a stats dict (return_mode="stats", dataset on) or a bare float.
+    if isinstance(result, dict):
+        # dict values are typed ``object`` across the worker boundary but are the
+        # numeric fields PerfStats.to_dict produced.
+        stats = PerfStats(**cast("Any", result))
+        return stats.median, stats
+    return float(result), None
 
 
 def _unset_fn(*args: object) -> NoReturn:
@@ -821,7 +835,7 @@ class LocalBenchmarkProvider(BenchmarkProvider):
                     process_group_name=self.kernel.env.process_group_name,
                 )
             ):
-                perf = self._benchmark_function(config, fn)
+                perf, stats = self._benchmark_function(config, fn)
                 status = "ok" if math.isfinite(perf) else "error"
                 recorded_perf = perf if math.isfinite(perf) else None
                 results[valid_indices[index]] = BenchmarkResult(
@@ -830,18 +844,21 @@ class LocalBenchmarkProvider(BenchmarkProvider):
                     perf=perf,
                     status=status,
                     compile_time=compile_time,
+                    perf_stats=stats,
                 )
             else:
                 status = "timeout" if reason == "timeout" else "error"
                 if is_working:
                     status = "peer_compilation_fail"
                 recorded_perf = None
+                stats = None
                 results[valid_indices[index]] = BenchmarkResult(
                     config=config,
                     fn=fn,
                     perf=inf,
                     status=status,
                     compile_time=compile_time,
+                    perf_stats=None,
                 )
             if config_id is not None:
                 self.log.record_autotune_entry(
@@ -852,6 +869,7 @@ class LocalBenchmarkProvider(BenchmarkProvider):
                         compile_time=compile_time,
                         config_id=config_id,
                         config=config,
+                        perf_stats=stats.to_dict() if stats is not None else None,
                     )
                 )
         return results
@@ -865,8 +883,11 @@ class LocalBenchmarkProvider(BenchmarkProvider):
         """
         clear_jit_fast_path_caches(fn, self.log)
 
-    def _benchmark_function(self, config: Config, fn: CompiledConfig) -> float:
-        """Benchmark a single compiled function.  Returns time in ms or inf."""
+    def _benchmark_function(
+        self, config: Config, fn: CompiledConfig
+    ) -> tuple[float, PerfStats | None]:
+        """Benchmark a single compiled function. Returns ``(time in ms or inf,
+        PerfStats or None)``; stats are collected only when the dataset is on."""
         self._autotune_metrics.num_configs_tested += 1
         self.log.debug(lambda: f"Running benchmark for {config!r}")
 
@@ -915,7 +936,7 @@ class LocalBenchmarkProvider(BenchmarkProvider):
             )
 
             if not compile_success_all:
-                return inf
+                return inf, None
 
         # Defensive: if `capture_output().__enter__` itself raises, the except
         # handler below still needs `_captured_output` bound.
@@ -950,8 +971,11 @@ class LocalBenchmarkProvider(BenchmarkProvider):
                 # others don't. Skip the config if any rank fails the accuracy check.
                 # Without this synchronization, some ranks go on to call the benchmark function
                 # while other ranks return immediately, this will cause stuck jobs!
-                return inf
+                return inf, None
 
+            # Richer "stats" mode only when the dataset is being collected; the
+            # default path stays on the scalar "median" with no extra work.
+            collect = self.log.collecting_dataset
             with capture_output() as _captured_output:
                 benchmark_function = self.kernel.bench_compile_config(
                     config, allow_print=False
@@ -965,7 +989,7 @@ class LocalBenchmarkProvider(BenchmarkProvider):
                 ) or do_bench
                 res = benchmark_runner(
                     functools.partial(benchmark_function, *working_args),
-                    return_mode="median",
+                    return_mode="stats" if collect else "median",
                     warmup=1,  # we are already warmed up above
                     rep=50,
                     process_group_name=self.kernel.env.process_group_name,
@@ -974,12 +998,17 @@ class LocalBenchmarkProvider(BenchmarkProvider):
                 res, process_group_name=self.kernel.env.process_group_name
             )
             t2 = time.perf_counter()
-            assert isinstance(res, float)
+            if collect:
+                assert isinstance(res, PerfStats)
+                perf, stats = res.median, res
+            else:
+                assert isinstance(res, float)
+                perf, stats = res, None
 
             self.log.debug(
-                lambda: f"result: {res:.4f}ms (took {t1 - t0:.1f}s + {t2 - t1:.1f}s)",
+                lambda: f"result: {perf:.4f}ms (took {t1 - t0:.1f}s + {t2 - t1:.1f}s)",
             )
-            return res
+            return perf, stats
         except Exception as e:
             # e.__traceback__ holds references to all local variables in the call stack frames.
             # When a Triton kernel fails, the output tensors allocated by the Helion kernel function
@@ -1047,27 +1076,27 @@ class LocalBenchmarkProvider(BenchmarkProvider):
                 self.kernel.maybe_log_repro(self.log.debug, self.args, config)
 
             self._autotune_metrics.num_compile_failures += 1
-            return inf
+            return inf, None
         finally:
             self._clear_jit_fast_path_caches(fn)
 
     def _benchmark_function_subprocess(
         self, config: Config, fn: CompiledConfig
-    ) -> float | None:
+    ) -> tuple[float, PerfStats | None] | None:
         """Benchmark ``fn`` in a long-lived spawn subprocess with a per-call
-        timeout. Returns the measured latency in ms, ``inf`` for a failure
-        we classified and handled, or ``None`` if the subprocess path cannot
-        handle this config and the caller should fall back to in-process.
+        timeout. Returns ``(latency in ms, PerfStats or None)``, ``(inf, None)`` for
+        a failure we classified and handled, or ``None`` if the subprocess path
+        cannot handle this config and the caller should fall back to in-process.
         """
         try:
-            latency = self._run_subprocess_benchmark_job(fn, warmup=1, rep=50)
-            if latency is None:
+            result = self._run_subprocess_benchmark_job(fn, warmup=1, rep=50)
+            if result is None:
                 return None
         except BenchmarkSubprocessError as e:
             # Timeout or unexpected worker exit; skip config and continue.
             self.log.warning(f"Benchmark subprocess failed for {config!r}: {e}")
             self._autotune_metrics.num_compile_failures += 1
-            return inf
+            return inf, None
         except Exception as e:
             e.__traceback__ = None
             if match_unrecoverable_runtime_error(e):
@@ -1081,12 +1110,14 @@ class LocalBenchmarkProvider(BenchmarkProvider):
                 )
                 self.kernel.maybe_log_repro(self.log.warning, self.args, config)
                 self._autotune_metrics.num_compile_failures += 1
-                return inf
+                return inf, None
             self.log.debug(
                 f"Benchmark subprocess raised for {config!r}: {type(e).__name__}: {e}"
             )
             self._autotune_metrics.num_compile_failures += 1
-            return inf
+            return inf, None
+
+        latency, stats = _split_worker_result(result)
 
         # Run the accuracy check in the worker too: a config can pass timing and
         # still crash here, and a crash must not poison the parent CUDA context.
@@ -1099,7 +1130,7 @@ class LocalBenchmarkProvider(BenchmarkProvider):
                     f"Accuracy check subprocess failed for {config!r}: {e}"
                 )
                 self._autotune_metrics.num_compile_failures += 1
-                return inf
+                return inf, None
             except Exception as e:
                 e.__traceback__ = None
                 if match_unrecoverable_runtime_error(e):
@@ -1115,13 +1146,13 @@ class LocalBenchmarkProvider(BenchmarkProvider):
                     )
                     self.kernel.maybe_log_repro(self.log.warning, self.args, config)
                     self._autotune_metrics.num_compile_failures += 1
-                    return inf
+                    return inf, None
                 self.log.debug(
                     f"Accuracy check subprocess raised for {config!r}: "
                     f"{type(e).__name__}: {e}"
                 )
                 self._autotune_metrics.num_compile_failures += 1
-                return inf
+                return inf, None
             # None means a custom check fn can't run in the worker; validate
             # in-process instead.
             if passed is None:
@@ -1146,16 +1177,16 @@ class LocalBenchmarkProvider(BenchmarkProvider):
                         f"Accuracy check raised for {config!r}: {type(e).__name__}: {e}"
                     )
                     self._autotune_metrics.num_compile_failures += 1
-                    return inf
+                    return inf, None
                 finally:
                     # Same as the in-process path: drop JIT fast-path caches so
                     # this fn's tensors aren't pinned in GPU memory across configs.
                     self._clear_jit_fast_path_caches(fn)
             if not passed:
                 self._autotune_metrics.num_accuracy_failures += 1
-                return inf
+                return inf, None
 
-        return float(latency)
+        return latency, stats
 
     def _run_subprocess_benchmark_job(
         self,
@@ -1163,7 +1194,7 @@ class LocalBenchmarkProvider(BenchmarkProvider):
         *,
         warmup: int,
         rep: int,
-    ) -> float | None:
+    ) -> dict[str, object] | float | None:
         if self._precompile_args_path is None:
             return None
         try:
@@ -1174,18 +1205,18 @@ class LocalBenchmarkProvider(BenchmarkProvider):
         if self._benchmark_worker is None:
             self._benchmark_worker = BenchmarkWorker(device=None)
 
+        # "stats" returns a dict only when the dataset is collected; else a float.
         job = BenchmarkJob(
             fn_spec=fn_spec,
             args_path=self._precompile_args_path,
             warmup=warmup,
             rep=rep,
             use_wall_clock=self._subprocess_benchmark_uses_wall_clock(),
+            return_mode="stats" if self.log.collecting_dataset else "median",
         )
-        return float(
-            self._benchmark_worker.run(
-                job,
-                timeout=float(self.settings.autotune_benchmark_timeout),
-            )
+        return self._benchmark_worker.run(
+            job,
+            timeout=float(self.settings.autotune_benchmark_timeout),
         )
 
     def _run_subprocess_accuracy_job(self, fn: CompiledConfig) -> bool | None:
@@ -1259,5 +1290,10 @@ class LocalBenchmarkProvider(BenchmarkProvider):
                 else:
                     self.log.debug(f"{desc} subprocess raised: {type(e).__name__}: {e}")
                     timing = None
-            timings.append(None if timing is None else float(timing))
+            if timing is None:
+                timings.append(None)
+            else:
+                # The job returns a stats dict when collecting, else a float; here we
+                # only need the scalar median.
+                timings.append(_split_worker_result(timing)[0])
         return timings

@@ -171,7 +171,7 @@ class TestAutotuneIgnoreErrors(TestCase):
             sync.return_value = None
             result = search.benchmark_provider._benchmark_function("cfg", bad_fn)
 
-        self.assertEqual(result, float("inf"))
+        self.assertEqual(result, (float("inf"), None))
         self.assertEqual(search._autotune_metrics.num_compile_failures, 1)
 
     def test_cuda_oom_skips_config(self):
@@ -188,7 +188,7 @@ class TestAutotuneIgnoreErrors(TestCase):
             sync.return_value = None
             result = search.benchmark_provider._benchmark_function("cfg", bad_fn)
 
-        self.assertEqual(result, float("inf"))
+        self.assertEqual(result, (float("inf"), None))
         self.assertEqual(search._autotune_metrics.num_compile_failures, 1)
 
     def test_ignore_errors_skips_logging_and_raise(self):
@@ -206,7 +206,7 @@ class TestAutotuneIgnoreErrors(TestCase):
             with patch.object(search.log, "warning") as warn:
                 result = search.benchmark_provider._benchmark_function("cfg", bad_fn)
 
-        self.assertEqual(result, float("inf"))
+        self.assertEqual(result, (float("inf"), None))
         warn.assert_not_called()
 
     def test_clear_jit_fast_path_caches(self):
@@ -311,7 +311,7 @@ class TestAutotuneIgnoreErrors(TestCase):
             sync.return_value = None
             result = search.benchmark_provider._benchmark_function("cfg", compiled_fn)
 
-        self.assertEqual(result, 1.25)
+        self.assertEqual(result, (1.25, None))
         clear.assert_called_once_with(compiled_fn)
 
     def test_benchmark_function_clears_jit_fast_path_caches_on_error(self):
@@ -333,7 +333,7 @@ class TestAutotuneIgnoreErrors(TestCase):
             sync.return_value = None
             result = search.benchmark_provider._benchmark_function("cfg", bad_fn)
 
-        self.assertEqual(result, float("inf"))
+        self.assertEqual(result, (float("inf"), None))
         clear.assert_called_once_with(bad_fn)
 
     def test_traceback_cleared_str(self):
@@ -421,7 +421,7 @@ class TestAutotuneIgnoreErrors(TestCase):
             patch.object(
                 search.benchmark_provider,
                 "_benchmark_function",
-                return_value=1.0,
+                return_value=(1.0, None),
             ),
         ):
             results = search.benchmark_batch(configs, desc="test")
@@ -4026,7 +4026,7 @@ class TestAutotuneBudget(TestCase):
         with patch.object(
             LocalBenchmarkProvider,
             "_benchmark_function",
-            return_value=0.001,
+            return_value=(0.001, None),
         ):
             results = provider.benchmark(configs)
 
@@ -4064,7 +4064,7 @@ class TestAutotuneBudget(TestCase):
 
         def counting_benchmark(self_, config, fn):
             benchmark_count[0] += 1
-            return 0.001
+            return 0.001, None
 
         from helion.runtime.config import Config
 

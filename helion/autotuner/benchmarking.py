@@ -12,6 +12,7 @@ import time
 from typing import TYPE_CHECKING
 from typing import Any
 from typing import Callable
+from typing import NamedTuple
 from typing import TypeVar
 
 import torch
@@ -55,6 +56,47 @@ def _make_l2_cache_clearer() -> Callable[[], None]:
         active.clear_cache(cache)  # type: ignore[attr-defined]
 
     return clear
+
+
+class PerfStats(NamedTuple):
+    min: float
+    median: float
+    mean: float
+    p90: float
+    std: float
+    n_samples: int
+
+    def to_dict(self) -> dict[str, object]:
+        return dict(self._asdict())
+
+
+def _percentile(sorted_vals: list[float], q: float) -> float:
+    # Linear interpolation (numpy "type-7"), matching the prior np.percentile call.
+    if not sorted_vals:
+        return 0.0
+    if len(sorted_vals) == 1:
+        return sorted_vals[0]
+    rank = (q / 100.0) * (len(sorted_vals) - 1)
+    lo = math.floor(rank)
+    hi = math.ceil(rank)
+    if lo == hi:
+        return sorted_vals[lo]
+    return sorted_vals[lo] + (sorted_vals[hi] - sorted_vals[lo]) * (rank - lo)
+
+
+def _compute_perf_stats(times: list[float]) -> PerfStats:
+    n = len(times)
+    if n == 0:
+        return PerfStats(0.0, 0.0, 0.0, 0.0, 0.0, 0)
+    sorted_times = sorted(times)
+    return PerfStats(
+        min=sorted_times[0],
+        median=statistics.median(sorted_times),
+        mean=statistics.mean(sorted_times),
+        p90=_percentile(sorted_times, 90.0),
+        std=statistics.stdev(sorted_times) if n > 1 else 0.0,
+        n_samples=n,
+    )
 
 
 def _cudagraph_unavailable_reason() -> str | None:
@@ -505,7 +547,7 @@ def _summarize_statistics_fallback(
     times: list[float],
     quantiles: list[float] | None,
     return_mode: str,
-) -> float | tuple[float, ...]:
+) -> float | tuple[float, ...] | PerfStats:
     """Fallback statistics summarizer when triton.testing._summarize_statistics is unavailable."""
     if return_mode == "min":
         return min(times)
@@ -515,6 +557,8 @@ def _summarize_statistics_fallback(
         return statistics.mean(times)
     if return_mode == "median":
         return statistics.median(times)
+    if return_mode == "stats":
+        return _compute_perf_stats(times)
     # "all" mode
     if quantiles is not None:
         sorted_times = sorted(times)
@@ -540,7 +584,7 @@ def do_bench(
     process_group_name: str | None = None,
     *,
     default_cudagraph: bool = False,
-) -> float | tuple[float, ...]:
+) -> float | tuple[float, ...] | PerfStats:
     """
     Benchmark the runtime of the provided function. By default, return the median runtime of :code:`fn` along with
     the 20-th and 80-th performance percentile.
@@ -555,13 +599,13 @@ def do_bench(
     :type grad_to_none: torch.tensor, optional
     :param quantiles: Performance percentile to return in addition to the median.
     :type quantiles: list[float], optional
-    :param return_mode: The statistical measure to return. Options are "min", "max", "mean", "median", or "all". Default is "mean".
+    :param return_mode: The statistical measure to return. Options are "min", "max", "mean", "median", "all", or "stats". Default is "mean".
     :type return_mode: str
     """
     from triton import runtime
     from triton.testing import _summarize_statistics
 
-    assert return_mode in ["min", "max", "mean", "median", "all"]
+    assert return_mode in ["min", "max", "mean", "median", "all", "stats"]
 
     di = runtime.driver.active.get_device_interface()  # pyrefly: ignore
 
@@ -615,6 +659,9 @@ def do_bench(
     # Record clocks
     di.synchronize()
     times = [s.elapsed_time(e) for s, e in zip(start_event, end_event, strict=True)]
+    # "stats" precedes triton's helper, which doesn't know that mode.
+    if return_mode == "stats":
+        return _compute_perf_stats(times)
     return _summarize_statistics(times, quantiles, return_mode)  # pyrefly: ignore
 
 
@@ -628,11 +675,11 @@ def do_bench_generic(
     process_group_name: str | None = None,
     *,
     default_cudagraph: bool = False,  # accepted for API symmetry; wall-clock timing doesn't use CG
-) -> float | tuple[float, ...]:
+) -> float | tuple[float, ...] | PerfStats:
     """
     Benchmark using wall-clock timing for backends without Triton event timing.
     """
-    assert return_mode in ["min", "max", "mean", "median", "all"]
+    assert return_mode in ["min", "max", "mean", "median", "all", "stats"]
 
     out = fn()
     synchronize_device(out)

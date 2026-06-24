@@ -42,6 +42,7 @@ from helion.runtime.config import Config
 from helion.runtime.settings import Settings
 
 if TYPE_CHECKING:
+    from helion.autotuner.benchmarking import PerfStats
     from helion.runtime.kernel import CompiledConfig
 
 
@@ -359,12 +360,12 @@ class TestSubprocessBenchmarkIntegration(RefEagerTestDisabled, unittest.TestCase
             self: LocalBenchmarkProvider,
             config: Config,
             fn: CompiledConfig,
-        ) -> float | None:
+        ) -> tuple[float, PerfStats | None] | None:
             call_count[0] += 1
             if call_count[0] % 3 == 0:
                 call_count[1] += 1
                 self._autotune_metrics.num_compile_failures += 1
-                return math.inf
+                return math.inf, None
             return original(self, config, fn)
 
         examples_dir = Path(__file__).parent.parent / "examples"

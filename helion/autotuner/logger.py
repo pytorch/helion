@@ -163,6 +163,12 @@ class AutotuningLogger:
         if self._log_sink is not None:
             self._log_sink.capture_generated_code(config_id, kernel, config)
 
+    @property
+    def collecting_dataset(self) -> bool:
+        # The single gate the benchmark provider reads to enable perf_stats
+        # (return_mode="stats"): a sink is attached AND it collects the dataset.
+        return self._log_sink is not None and self._log_sink._collect_dataset
+
     def _attach_sink(self, sink: AutotuneLogSink) -> None:
         self._log_sink = sink
         self.add_handler(sink.handler)
@@ -288,6 +294,18 @@ class AutotuneLogEntry(NamedTuple):
     compile_time: float | None
     config_id: str
     config: Config
+    perf_stats: dict[str, object] | None = None
+
+
+def _null_perf_stats() -> dict[str, object]:
+    return {
+        "min": None,
+        "median": None,
+        "mean": None,
+        "p90": None,
+        "std": None,
+        "n_samples": 0,
+    }
 
 
 class AutotuneLogSink:
@@ -399,6 +417,7 @@ class AutotuneLogSink:
             self._configs[config_id] = {
                 "config": config.config,
                 "generated_code": None,
+                "perf_stats": _null_perf_stats(),
             }
         return config_id
 
@@ -443,6 +462,14 @@ class AutotuneLogSink:
         )
         if self._csv_file is not None:
             self._csv_file.flush()
+        # Only overwrite with real stats: a later failed re-benchmark (perf_stats
+        # None) must not clobber a config's good stats with nulls.
+        if (
+            self._collect_dataset
+            and entry.perf_stats is not None
+            and entry.config_id in self._configs
+        ):
+            self._configs[entry.config_id]["perf_stats"] = entry.perf_stats
 
 
 SUPPRESSED_TRITON_CODE_MSG = (

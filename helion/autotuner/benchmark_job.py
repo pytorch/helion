@@ -7,6 +7,7 @@ import functools
 from typing import TYPE_CHECKING
 from typing import cast
 
+from .benchmarking import PerfStats
 from .benchmarking import do_bench
 from .benchmarking import do_bench_generic
 from .kernel_args import load_trusted_kernel_args
@@ -24,21 +25,23 @@ class BenchmarkJob:
     warmup: int = 1
     rep: int = 50
     use_wall_clock: bool = False
+    return_mode: str = "median"
 
-    def __call__(self) -> float:
+    def __call__(self) -> float | dict[str, object]:
         # Subprocess inherits parent stderr; capture so Triton runtime
         # diagnostics don't leak to the user's terminal.
         with capture_output():
             fn = _load_compiled_fn(self.fn_spec)
             args = load_trusted_kernel_args(self.args_path)
             bench = do_bench_generic if self.use_wall_clock else do_bench
-            # return_mode="median" guarantees a float return (not the tuple variant).
-            return cast(
-                "float",
-                bench(
-                    functools.partial(fn, *args),
-                    return_mode="median",
-                    warmup=self.warmup,
-                    rep=self.rep,
-                ),
+            result = bench(
+                functools.partial(fn, *args),
+                return_mode=self.return_mode,
+                warmup=self.warmup,
+                rep=self.rep,
             )
+            # Cross the worker boundary as a plain dict; only "stats" is non-float.
+            if self.return_mode == "stats":
+                assert isinstance(result, PerfStats)
+                return result.to_dict()
+            return cast("float", result)

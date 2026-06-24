@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 import helion.autotuner.benchmarking as benchmarking
@@ -146,3 +147,46 @@ def test_cudagraph_auto_skips_nested_capture(monkeypatch):
         return "nested"
 
     assert benchmarking._maybe_cudagraph_replay(fn) is fn
+
+
+def test_compute_perf_stats_values():
+    stats = benchmarking._compute_perf_stats([float(i) for i in range(1, 11)])
+    assert stats.min == 1.0
+    assert stats.median == 5.5
+    assert stats.mean == 5.5
+    # numpy "type-7" linear percentile: rank 0.9*(10-1)=8.1 -> 9.0 + 0.1*(10-9)
+    assert stats.p90 == pytest.approx(9.1)
+    assert stats.std == pytest.approx(3.0276503540974917)
+    assert stats.n_samples == 10
+
+
+def test_compute_perf_stats_empty_is_zeros():
+    assert benchmarking._compute_perf_stats([]) == benchmarking.PerfStats(
+        0.0, 0.0, 0.0, 0.0, 0.0, 0
+    )
+
+
+def test_compute_perf_stats_single_sample_has_zero_std():
+    stats = benchmarking._compute_perf_stats([4.0])
+    assert stats.min == stats.median == stats.mean == stats.p90 == 4.0
+    assert stats.std == 0.0
+    assert stats.n_samples == 1
+
+
+def test_perf_stats_to_dict_keys():
+    stats = benchmarking.PerfStats(1.0, 2.0, 3.0, 4.0, 5.0, 6)
+    assert stats.to_dict() == {
+        "min": 1.0,
+        "median": 2.0,
+        "mean": 3.0,
+        "p90": 4.0,
+        "std": 5.0,
+        "n_samples": 6,
+    }
+
+
+def test_summarize_statistics_fallback_stats_mode():
+    res = benchmarking._summarize_statistics_fallback([1.0, 2.0, 3.0], None, "stats")
+    assert isinstance(res, benchmarking.PerfStats)
+    assert res.min == 1.0
+    assert res.n_samples == 3

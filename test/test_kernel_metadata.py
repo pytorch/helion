@@ -27,6 +27,7 @@ from helion.autotuner.base_search import _warn_dataset_without_log
 from helion.autotuner.finite_search import FiniteSearch
 from helion.autotuner.logger import AutotuneLogEntry
 from helion.autotuner.logger import AutotuneLogSink
+from helion.autotuner.logger import AutotuningLogger
 from helion.autotuner.metrics import KernelMetadata
 import helion.language as hl
 
@@ -466,6 +467,115 @@ class TestAutotuneLogSink(TestCase):
         kernel.get_cached_path.assert_not_called()
 
 
+_PERF_STATS_KEYS = {"min", "median", "mean", "p90", "std", "n_samples"}
+_PERF_STATS = {
+    "min": 1.0,
+    "median": 1.1,
+    "mean": 1.2,
+    "p90": 1.3,
+    "std": 0.1,
+    "n_samples": 50,
+}
+
+
+class TestPerfStats(TestCase):
+    """perf_stats rides in the meta configs map; last *successful* benchmark wins."""
+
+    def _record(self, entries: object) -> tuple[str, dict[str, object]]:
+        config = helion.Config(block_sizes=[32], num_warps=4)
+        with tempfile.TemporaryDirectory() as tmp:
+            with AutotuneLogSink(
+                f"{tmp}/run", _metadata(), collect_dataset=True
+            ) as sink:
+                sink.start_run()
+                config_id = sink.register_config(config)
+                assert config_id is not None
+                for entry in entries(config_id, config):
+                    sink.record(entry)
+                sink.end_run()
+            record = json.loads(
+                sink.meta_path.read_text(encoding="utf-8").splitlines()[0]
+            )
+        return config_id, record["configs"][config_id]
+
+    def test_perf_stats_recorded_per_config(self) -> None:
+        _cid, entry = self._record(
+            lambda cid, cfg: [
+                AutotuneLogEntry(
+                    generation=0,
+                    status="ok",
+                    perf_ms=1.1,
+                    compile_time=0.5,
+                    config_id=cid,
+                    config=cfg,
+                    perf_stats=_PERF_STATS,
+                )
+            ]
+        )
+        self.assertEqual(set(entry["perf_stats"]), _PERF_STATS_KEYS)
+        self.assertEqual(entry["perf_stats"], _PERF_STATS)
+
+    def test_started_only_config_has_null_perf_stats(self) -> None:
+        _cid, entry = self._record(
+            lambda cid, cfg: [
+                AutotuneLogEntry(
+                    generation=0,
+                    status="started",
+                    perf_ms=None,
+                    compile_time=None,
+                    config_id=cid,
+                    config=cfg,
+                )
+            ]
+        )
+        self.assertEqual(set(entry["perf_stats"]), _PERF_STATS_KEYS)
+        self.assertEqual(entry["perf_stats"]["n_samples"], 0)
+        self.assertIsNone(entry["perf_stats"]["median"])
+
+    def test_failed_rebenchmark_keeps_good_perf_stats(self) -> None:
+        _cid, entry = self._record(
+            lambda cid, cfg: [
+                AutotuneLogEntry(
+                    generation=0,
+                    status="ok",
+                    perf_ms=1.1,
+                    compile_time=0.5,
+                    config_id=cid,
+                    config=cfg,
+                    perf_stats=_PERF_STATS,
+                ),
+                AutotuneLogEntry(
+                    generation=1,
+                    status="error",
+                    perf_ms=None,
+                    compile_time=None,
+                    config_id=cid,
+                    config=cfg,
+                    perf_stats=None,
+                ),
+            ]
+        )
+        self.assertEqual(entry["perf_stats"], _PERF_STATS)
+
+    def test_collecting_dataset_gate(self) -> None:
+        log = AutotuningLogger(helion.Settings())
+        self.assertFalse(log.collecting_dataset)
+        with tempfile.TemporaryDirectory() as tmp:
+            with AutotuneLogSink(
+                f"{tmp}/on", _metadata(), collect_dataset=True
+            ) as sink:
+                log._attach_sink(sink)
+                self.assertTrue(log.collecting_dataset)
+                log._detach_sink()
+            self.assertFalse(log.collecting_dataset)
+            with AutotuneLogSink(
+                f"{tmp}/off", _metadata(), collect_dataset=False
+            ) as sink:
+                log._attach_sink(sink)
+                self.assertFalse(log.collecting_dataset)
+                log._detach_sink()
+
+
 @onlyBackends(["triton"])
 class TestAutotuneDatasetE2E(TestCase):
     @skipIfRefEager("Autotuning not supported in ref eager mode")
@@ -541,9 +651,14 @@ class TestAutotuneDatasetE2E(TestCase):
                 self.assertIn("config", cfg_entry)
                 self.assertIsInstance(cfg_entry["generated_code"], str)
                 self.assertTrue(cfg_entry["generated_code"])
+                self.assertEqual(set(cfg_entry["perf_stats"]), _PERF_STATS_KEYS)
             configs_by_id.update(record["configs"])
             run_ids.add(record["run_id"])
         self.assertGreater(len(configs_by_id), 0)
+        # At least one benchmarked config carries real latency samples.
+        self.assertTrue(
+            any(e["perf_stats"]["n_samples"] for e in configs_by_id.values())
+        )
 
         # A CSV row joins to a stored config via config_id and to its run via run_id.
         rows = list(csv.reader(csv_path.read_text().splitlines()))
