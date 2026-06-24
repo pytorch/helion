@@ -10,6 +10,7 @@ import contextlib
 from dataclasses import dataclass
 import importlib.util
 import io
+import math
 import os
 import re
 import sys
@@ -336,6 +337,14 @@ _EXPECTED_PERF: dict[str, dict[str, ExpectedPerf]] = {
             wins_slack=1,
         ),
     },
+    "scaled_mm": {
+        "sm90": ExpectedPerf(
+            helion_wins=24,
+            total=24,
+            geomean=1.16,
+            wins_slack=3,
+        ),
+    },
 }
 
 # Geomean must stay within this fraction below expected. Catches regressions
@@ -382,6 +391,30 @@ class TestPretunedKernelsCorrectness(TestCase):
 
     def test_rope_bwd(self):
         self._run_correctness("rope_bwd")
+
+    def test_scaled_mm(self):
+        if not is_cuda():
+            self.skipTest("Pretuned kernels require CUDA / ROCm.")
+        if torch.cuda.get_device_capability() < (8, 9):
+            self.skipTest("scaled_mm requires FP8 support (SM89+).")
+        module = _import_pretuned_kernel_module("scaled_mm")
+        kernel = module.scaled_mm
+        fp8_dtype = torch.float8_e4m3fn
+        for M, K, N in [(16, 4096, 4096), (64, 2048, 2048)]:
+            with self.subTest(shape=(M, K, N)):
+                scale = 1.0 / math.sqrt(K)
+                a = (scale * (0.5 + torch.rand(M, K, device=DEVICE))).to(fp8_dtype)
+                b = (scale * (0.5 + torch.rand(N, K, device=DEVICE))).to(fp8_dtype).t()
+                c = torch.empty((M, N), dtype=torch.bfloat16, device=DEVICE)
+                scale_a = torch.rand((1, 1), device=DEVICE) + 0.5
+                scale_b = torch.rand((1, 1), device=DEVICE) + 0.5
+                bias = torch.rand(N, dtype=torch.bfloat16, device=DEVICE) - 0.5
+                kernel(c, a, b, scale_a, scale_b, bias)
+                # Reference dequantizes to fp32, matching the kernel's bias-after-cast.
+                ref = ((a.float() @ b.float()) * scale_a * scale_b).to(
+                    torch.bfloat16
+                ) + bias
+                torch.testing.assert_close(c, ref, atol=1e-1, rtol=1e-1)
 
 
 @onlyBackends(["triton"])
@@ -460,6 +493,10 @@ class TestPretunedKernelsPerformance(TestCase):
     @pytest.mark.timeout(120)
     def test_rope(self):
         self._run_pretuned_kernel_perf("rope")
+
+    @pytest.mark.timeout(120)
+    def test_scaled_mm(self):
+        self._run_pretuned_kernel_perf("scaled_mm")
 
 
 if __name__ == "__main__":
