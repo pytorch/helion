@@ -363,6 +363,35 @@ jobs:
           fi
           pytest $PARALLEL -rf --timeout=$TIMEOUT --reruns=2 --timeout-method=thread $EXTRA_FLAGS $TEST_PATH | tee >(eval $SKIP_CHECK)
 
+      # TEMPORARY: dump GPU hardware details to compare CI runners against the
+      # machine the pretuned heuristics were tuned on (SXM vs PCIe, clocks,
+      # bandwidth, SM count). Remove once perf differences are understood.
+      - name: Dump GPU hardware info (temporary)
+        if: ${{ !cancelled() && matrix.backend == 'triton' && (matrix.alias == 'h100' || matrix.alias == 'b200') }}
+        run: |
+          source .venv/bin/activate
+          nvidia-smi --query-gpu=name,memory.total,clocks.max.sm,clocks.max.memory,power.max_limit,pcie.link.gen.max,pcie.link.width.max --format=csv || true
+          nvidia-smi -q | grep -iE "Product Name|Product Brand|Bus Type|Memory Bus Width|Max .*Clock|SM .*Clock|Memory .*Clock" || true
+          python -c "import torch; p=torch.cuda.get_device_properties(0); print('torch:', p.name, '| cc', f'{p.major}.{p.minor}', '| SMs', p.multi_processor_count, '| mem', round(p.total_memory/1e9,1), 'GB')"
+
+      # Perf gating for pretuned kernels is skipped under pytest-xdist (GPU
+      # contention makes timings unreliable), so the main "Run Tests" step above
+      # never exercises it. Run it here serially on the Triton GPUs that have
+      # checked-in heuristics (H100/sm90, B200/sm100); each test self-skips
+      # unless the running GPU matches a heuristic's compute capability.
+      # Non-blocking: pretuned configs are machine-specific, so a perf miss on a
+      # CI GPU that differs from the tuning machine surfaces in logs without
+      # failing the build.
+      - name: Run pretuned kernel perf tests
+        if: ${{ !cancelled() && matrix.backend == 'triton' && (matrix.alias == 'h100' || matrix.alias == 'b200') }}
+        continue-on-error: true
+        run: |
+          set -o pipefail
+          source .venv/bin/activate
+          export HELION_BACKEND=${{ matrix.backend }}
+          pytest -rf --timeout=300 --reruns=2 --timeout-method=thread \
+            test/test_pretuned_kernels.py -k Performance
+
   test-notebooks:
     name: test-notebooks-cu130-py3.12-pytorch-2.9-a10g
 
