@@ -475,6 +475,64 @@ def supports_amd_cdna_tunables() -> bool:
         return False
 
 
+# CUs per XCD by base CDNA architecture.  Used to derive the live,
+# partition-visible XCD count from the observed CU count (see get_num_xcd).
+_CUS_PER_XCD: dict[str, int] = {
+    "gfx942": 38,  # CDNA3 (MI300)
+    "gfx950": 32,  # CDNA4 (MI350)
+    "gfx951": 32,  # CDNA4 (MI355)
+}
+
+
+def get_num_xcd(device: torch.device | int | None = None) -> int:
+    """Number of XCDs visible for ``device`` on AMD CDNA, else ``1``.
+
+    Derived from the live, partition-visible compute-unit count rather than the
+    architecture name, so MI300A (6 XCDs) and compute-partition modes such as CPX
+    (which expose a single XCD) are handled correctly.  Returns ``1`` -- which
+    disables xcd_remap -- for unknown architectures or a CU count that does not
+    look like an integer number of XCDs.
+    """
+    if not torch.cuda.is_available():
+        return 1
+    try:
+        props = torch.cuda.get_device_properties(
+            device if device is not None else torch.cuda.current_device()
+        )
+    except Exception:
+        return 1
+    arch = getattr(props, "gcnArchName", None)
+    if not arch:
+        return 1
+    cus_per_xcd = _CUS_PER_XCD.get(arch.split(":")[0])
+    if cus_per_xcd is None:
+        return 1
+    cu_count = props.multi_processor_count
+    num_xcd = round(cu_count / cus_per_xcd)
+    # Tolerate harvested parts, but bail out (return 1) if the live CU count does
+    # not look like an integer number of XCDs.
+    if num_xcd < 1 or abs(num_xcd * cus_per_xcd - cu_count) > cus_per_xcd // 4:
+        return 1
+    return num_xcd
+
+
+def device_num_sm(device: torch.device | int | None = None) -> int:
+    """SM/CU count for ``device`` (or the current device), or 1 if unavailable.
+
+    Used as the default for ``ConfigSpec.num_sm`` so direct ConfigSpec
+    constructions derive a value consistent with ``get_num_xcd`` instead of
+    assuming 1.  The real compile path passes the reserved-adjusted count.
+    """
+    if not torch.cuda.is_available():
+        return 1
+    try:
+        return torch.cuda.get_device_properties(
+            device if device is not None else torch.cuda.current_device()
+        ).multi_processor_count
+    except Exception:
+        return 1
+
+
 def supports_mtia_tunables() -> bool:
     """Check if running on MTIA hardware.
 
