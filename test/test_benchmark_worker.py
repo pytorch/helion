@@ -360,13 +360,15 @@ class TestSubprocessBenchmarkIntegration(RefEagerTestDisabled, unittest.TestCase
             self: LocalBenchmarkProvider,
             config: Config,
             fn: CompiledConfig,
-        ) -> tuple[float, PerfStats | None] | None:
+            *,
+            perf_stats_out: list[PerfStats] | None = None,
+        ) -> float | None:
             call_count[0] += 1
             if call_count[0] % 3 == 0:
                 call_count[1] += 1
                 self._autotune_metrics.num_compile_failures += 1
-                return math.inf, None
-            return original(self, config, fn)
+                return math.inf
+            return original(self, config, fn, perf_stats_out=perf_stats_out)
 
         examples_dir = Path(__file__).parent.parent / "examples"
         matmul = import_path(examples_dir / "matmul.py").matmul

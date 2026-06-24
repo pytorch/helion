@@ -52,6 +52,7 @@ from helion.autotuner.base_search import BaseSearch
 from helion.autotuner.base_search import PopulationBasedSearch
 from helion.autotuner.base_search import PopulationMember
 from helion.autotuner.benchmark_provider import LocalBenchmarkProvider
+from helion.autotuner.benchmarking import PerfStats
 from helion.autotuner.config_fragment import BooleanFragment
 from helion.autotuner.config_fragment import EnumFragment
 from helion.autotuner.config_fragment import IntegerFragment
@@ -171,7 +172,7 @@ class TestAutotuneIgnoreErrors(TestCase):
             sync.return_value = None
             result = search.benchmark_provider._benchmark_function("cfg", bad_fn)
 
-        self.assertEqual(result, (float("inf"), None))
+        self.assertEqual(result, float("inf"))
         self.assertEqual(search._autotune_metrics.num_compile_failures, 1)
 
     def test_cuda_oom_skips_config(self):
@@ -188,7 +189,7 @@ class TestAutotuneIgnoreErrors(TestCase):
             sync.return_value = None
             result = search.benchmark_provider._benchmark_function("cfg", bad_fn)
 
-        self.assertEqual(result, (float("inf"), None))
+        self.assertEqual(result, float("inf"))
         self.assertEqual(search._autotune_metrics.num_compile_failures, 1)
 
     def test_ignore_errors_skips_logging_and_raise(self):
@@ -206,7 +207,7 @@ class TestAutotuneIgnoreErrors(TestCase):
             with patch.object(search.log, "warning") as warn:
                 result = search.benchmark_provider._benchmark_function("cfg", bad_fn)
 
-        self.assertEqual(result, (float("inf"), None))
+        self.assertEqual(result, float("inf"))
         warn.assert_not_called()
 
     def test_clear_jit_fast_path_caches(self):
@@ -311,7 +312,7 @@ class TestAutotuneIgnoreErrors(TestCase):
             sync.return_value = None
             result = search.benchmark_provider._benchmark_function("cfg", compiled_fn)
 
-        self.assertEqual(result, (1.25, None))
+        self.assertEqual(result, 1.25)
         clear.assert_called_once_with(compiled_fn)
 
     def test_benchmark_function_clears_jit_fast_path_caches_on_error(self):
@@ -333,7 +334,7 @@ class TestAutotuneIgnoreErrors(TestCase):
             sync.return_value = None
             result = search.benchmark_provider._benchmark_function("cfg", bad_fn)
 
-        self.assertEqual(result, (float("inf"), None))
+        self.assertEqual(result, float("inf"))
         clear.assert_called_once_with(bad_fn)
 
     def test_traceback_cleared_str(self):
@@ -421,7 +422,7 @@ class TestAutotuneIgnoreErrors(TestCase):
             patch.object(
                 search.benchmark_provider,
                 "_benchmark_function",
-                return_value=(1.0, None),
+                return_value=1.0,
             ),
         ):
             results = search.benchmark_batch(configs, desc="test")
@@ -806,6 +807,236 @@ class TestAutotuneIgnoreErrors(TestCase):
         # Restricted search -> debug CSV written, but no dataset sidecar.
         self.assertTrue(base_path.with_suffix(".csv").exists())
         self.assertFalse(base_path.with_suffix(".meta.jsonl").exists())
+
+
+def _make_stub_benchmark_provider() -> LocalBenchmarkProvider:
+    """A minimal ``LocalBenchmarkProvider`` for benchmark-loop tests, without
+    standing up a real kernel/config_spec."""
+    provider = LocalBenchmarkProvider.__new__(LocalBenchmarkProvider)
+    provider.kernel = SimpleNamespace(
+        compile_config=lambda config, allow_print: lambda *a, **kw: None,
+        format_kernel_decorator=lambda config, s: "decorator",
+        env=SimpleNamespace(process_group_name=None),
+    )
+    provider.settings = Settings(autotune_log_level=logging.CRITICAL)
+    # CuteBackend.supports_precompile() is False, which clears autotune_precompile.
+    provider.settings.autotune_precompile = None
+    provider.config_spec = SimpleNamespace()
+    provider.args = ()
+    provider.log = AutotuningLogger(provider.settings)
+    provider._autotune_metrics = SimpleNamespace(
+        num_configs_tested=0,
+        num_compile_failures=0,
+        num_accuracy_failures=0,
+        num_generations=0,
+        kernel_source="",
+    )
+    provider.mutated_arg_indices = ()
+    provider._benchmark_worker = None
+    provider._precompile_args_path = None
+    provider._precompile_tmpdir = None
+    return provider
+
+
+class TestPerfStatsGating(TestCase):
+    """Perf-stats collection must be byte-identical to the no-perf-stats
+    baseline at runtime when ``autotune_log_details`` is off.
+
+    Maps to .spec/PRD.md FR-1..FR-8. Stats are delivered only through an
+    optional ``perf_stats_out`` collector the caller supplies when collecting;
+    with no collector the benchmark functions return bare floats and construct
+    no ``PerfStats``.
+    """
+
+    def _make_search(
+        self, settings: Settings, *, args: tuple[object, ...] = ()
+    ) -> BaseSearch:
+        search = BaseSearch.__new__(BaseSearch)
+        search.settings = settings
+        search.kernel = SimpleNamespace(
+            format_kernel_decorator=lambda config, s: "decorator",
+            to_triton_code=lambda config: "code",
+            maybe_log_repro=lambda log_func, args, config=None: None,
+            supports_subprocess_benchmark=lambda: False,
+        )
+        search.args = args
+        search.log = AutotuningLogger(settings)
+        search.config_spec = SimpleNamespace(
+            default_config=lambda: helion.Config(block_sizes=[1])
+        )
+        search._benchmark_provider_cls = LocalBenchmarkProvider
+        search.best_perf_so_far = float("inf")
+        search._prepared = False
+        with patch.object(
+            LocalBenchmarkProvider,
+            "_compute_baseline",
+            return_value=(None, [], None),
+        ):
+            search._prepare()
+        return search
+
+    def _make_inprocess_search(self) -> BaseSearch:
+        """A search whose in-process benchmark path can run with ``do_bench``
+        mocked out (no real kernel launch)."""
+        settings = Settings(autotune_log_level=logging.CRITICAL)
+        search = self._make_search(settings, args=("arg0",))
+        search.kernel.env = SimpleNamespace(process_group_name=None)
+        search.kernel.bench_compile_config = Mock(return_value=Mock(return_value=None))
+        return search
+
+    @staticmethod
+    def _perf_stats() -> PerfStats:
+        return PerfStats(min=1.0, median=1.25, mean=1.3, p90=1.5, std=0.1, n_samples=50)
+
+    # --- FR-1: off-path returns a bare float -----------------------------
+
+    def test_off_path_success_returns_bare_float(self):
+        search = self._make_inprocess_search()
+        with (
+            patch("torch.accelerator.synchronize", autospec=True) as sync,
+            patch(
+                "helion.autotuner.benchmark_provider.do_bench",
+                return_value=1.25,
+            ),
+            patch.object(search.benchmark_provider, "_clear_jit_fast_path_caches"),
+        ):
+            sync.return_value = None
+            result = search.benchmark_provider._benchmark_function(
+                "cfg", lambda *_a: None
+            )
+
+        self.assertIsInstance(result, float)
+        self.assertEqual(result, 1.25)
+
+    def test_off_path_error_returns_bare_inf(self):
+        settings = Settings(
+            autotune_ignore_errors=True,
+            autotune_log_level=logging.CRITICAL,
+        )
+        search = self._make_search(settings)
+
+        def bad_fn(*_args):
+            raise RuntimeError("boom")
+
+        with patch("torch.accelerator.synchronize", autospec=True) as sync:
+            sync.return_value = None
+            result = search.benchmark_provider._benchmark_function("cfg", bad_fn)
+
+        self.assertIsInstance(result, float)
+        self.assertEqual(result, float("inf"))
+
+    # --- FR-3: off-path uses return_mode="median", builds no PerfStats ----
+
+    def test_off_path_requests_median_mode(self):
+        search = self._make_inprocess_search()
+        captured: dict[str, object] = {}
+
+        def fake_do_bench(_fn, **kwargs):
+            captured["return_mode"] = kwargs.get("return_mode")
+            return 1.25
+
+        with (
+            patch("torch.accelerator.synchronize", autospec=True) as sync,
+            patch(
+                "helion.autotuner.benchmark_provider.do_bench",
+                side_effect=fake_do_bench,
+            ),
+            patch.object(search.benchmark_provider, "_clear_jit_fast_path_caches"),
+        ):
+            sync.return_value = None
+            result = search.benchmark_provider._benchmark_function(
+                "cfg", lambda *_a: None
+            )
+
+        self.assertEqual(captured["return_mode"], "median")
+        self.assertIsInstance(result, float)
+
+    # --- FR-6: on-path collects PerfStats through the collector -----------
+
+    def test_on_path_collects_perf_stats_in_process(self):
+        search = self._make_inprocess_search()
+        stats = self._perf_stats()
+        captured: dict[str, object] = {}
+
+        def fake_do_bench(_fn, **kwargs):
+            captured["return_mode"] = kwargs.get("return_mode")
+            return stats
+
+        collector: list[PerfStats] = []
+        with (
+            patch("torch.accelerator.synchronize", autospec=True) as sync,
+            patch(
+                "helion.autotuner.benchmark_provider.do_bench",
+                side_effect=fake_do_bench,
+            ),
+            patch.object(search.benchmark_provider, "_clear_jit_fast_path_caches"),
+        ):
+            sync.return_value = None
+            result = search.benchmark_provider._benchmark_function(
+                "cfg", lambda *_a: None, perf_stats_out=collector
+            )
+
+        self.assertEqual(captured["return_mode"], "stats")
+        self.assertIsInstance(result, float)
+        self.assertEqual(result, stats.median)
+        self.assertEqual(collector, [stats])
+
+    # --- FR-2 / FR-7: subprocess path mirrors the off/on contract ---------
+
+    def test_subprocess_off_path_returns_bare_float(self):
+        settings = Settings(
+            autotune_accuracy_check=False,
+            autotune_log_level=logging.CRITICAL,
+        )
+        search = self._make_search(settings)
+        with patch.object(
+            search.benchmark_provider,
+            "_run_subprocess_benchmark_job",
+            return_value=2.0,
+        ):
+            result = search.benchmark_provider._benchmark_function_subprocess(
+                "cfg", lambda *_a: None
+            )
+
+        self.assertIsInstance(result, float)
+        self.assertEqual(result, 2.0)
+
+    def test_subprocess_on_path_collects_perf_stats(self):
+        settings = Settings(
+            autotune_accuracy_check=False,
+            autotune_log_level=logging.CRITICAL,
+        )
+        search = self._make_search(settings)
+        stats = self._perf_stats()
+        collector: list[PerfStats] = []
+        with patch.object(
+            search.benchmark_provider,
+            "_run_subprocess_benchmark_job",
+            return_value=stats.to_dict(),
+        ):
+            result = search.benchmark_provider._benchmark_function_subprocess(
+                "cfg", lambda *_a: None, perf_stats_out=collector
+            )
+
+        self.assertIsInstance(result, float)
+        self.assertEqual(result, stats.median)
+        self.assertEqual(collector, [stats])
+
+    # --- FR-4: benchmark() leaves perf_stats None on every off-path result -
+
+    def test_benchmark_off_path_results_have_no_perf_stats(self):
+        provider = _make_stub_benchmark_provider()
+        configs = [helion.Config(block_sizes=[1]) for _ in range(3)]
+        with patch.object(
+            LocalBenchmarkProvider,
+            "_benchmark_function",
+            return_value=0.001,
+        ):
+            results = provider.benchmark(configs)
+
+        self.assertEqual(len(results), len(configs))
+        for result in results:
+            self.assertIsNone(result.perf_stats)
 
 
 @onlyBackends(["triton"])
@@ -3960,36 +4191,7 @@ class TestAutotuneBudget(TestCase):
         )
 
     def _make_stub_provider(self):
-        """Construct a minimal ``LocalBenchmarkProvider`` for budget-loop
-        tests without standing up a real kernel/config_spec.
-        """
-        from helion.autotuner.benchmark_provider import LocalBenchmarkProvider
-
-        provider = LocalBenchmarkProvider.__new__(LocalBenchmarkProvider)
-        provider.kernel = SimpleNamespace(
-            compile_config=lambda config, allow_print: lambda *a, **kw: None,
-            format_kernel_decorator=lambda config, s: "decorator",
-            env=SimpleNamespace(process_group_name=None),
-        )
-        provider.settings = Settings(autotune_log_level=logging.CRITICAL)
-        # Match the cute backend's path: CuteBackend.supports_precompile()
-        # is False, which clears autotune_precompile in autotune setup.
-        provider.settings.autotune_precompile = None
-        provider.config_spec = SimpleNamespace()
-        provider.args = ()
-        provider.log = AutotuningLogger(provider.settings)
-        provider._autotune_metrics = SimpleNamespace(
-            num_configs_tested=0,
-            num_compile_failures=0,
-            num_accuracy_failures=0,
-            num_generations=0,
-            kernel_source="",
-        )
-        provider.mutated_arg_indices = ()
-        provider._benchmark_worker = None
-        provider._precompile_args_path = None
-        provider._precompile_tmpdir = None
-        return provider
+        return _make_stub_benchmark_provider()
 
     def test_benchmark_provider_short_circuits_compile_loop(self) -> None:
         """``LocalBenchmarkProvider.benchmark`` must stop compiling
@@ -4026,7 +4228,7 @@ class TestAutotuneBudget(TestCase):
         with patch.object(
             LocalBenchmarkProvider,
             "_benchmark_function",
-            return_value=(0.001, None),
+            return_value=0.001,
         ):
             results = provider.benchmark(configs)
 
@@ -4062,9 +4264,9 @@ class TestAutotuneBudget(TestCase):
 
         provider.set_budget_exceeded_fn(budget_check)
 
-        def counting_benchmark(self_, config, fn):
+        def counting_benchmark(self_, config, fn, *, perf_stats_out=None):
             benchmark_count[0] += 1
-            return 0.001, None
+            return 0.001
 
         from helion.runtime.config import Config
 
