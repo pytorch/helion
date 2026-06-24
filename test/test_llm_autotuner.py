@@ -524,6 +524,106 @@ class TestLLMTransport(TestCase):
             return {"output": [{"content": [{"type": "text", "text": text}]}]}
         return {"content": [{"type": "text", "text": text}]}
 
+    def test_vertex_provider_request_shape(self):
+        """The vertex provider posts a model-less Anthropic body to the Vertex
+        publisher rawPredict URL, and extra headers parse from JSON / lines."""
+        from helion.autotuner.llm.transport import _extra_headers
+        from helion.autotuner.llm.transport import call_provider
+        from helion.autotuner.llm.transport import infer_provider
+        from helion.autotuner.llm.transport import normalize_provider
+
+        self.assertEqual(normalize_provider("vertex"), "vertex")
+        self.assertEqual(infer_provider("vertex/claude-sonnet-4-5"), "vertex")
+
+        captured = {}
+
+        def fake_post_json(url, payload, headers, *, request_timeout_s):
+            del request_timeout_s
+            captured.update(url=url, payload=payload, headers=headers)
+            return self._response_payload("anthropic")
+
+        env = {
+            "HELION_LLM_VERTEX_PROJECT": "proj-123",
+            "HELION_LLM_VERTEX_LOCATION": "us-east5",
+            "HELION_LLM_EXTRA_HEADERS": '{"X-Gateway": "abc"}',
+        }
+        with patch.dict(os.environ, env, clear=False):
+            with patch(
+                "helion.autotuner.llm.transport._post_json",
+                side_effect=fake_post_json,
+            ):
+                text = call_provider(
+                    "vertex",
+                    model="vertex/claude-sonnet-4-5",
+                    api_base="https://gw.example/v1",
+                    api_key="tok",
+                    messages=[{"role": "user", "content": "suggest configs"}],
+                    max_output_tokens=256,
+                    request_timeout_s=60.0,
+                )
+            self.assertEqual(text, '{"configs": []}')
+            self.assertEqual(
+                captured["url"],
+                "https://gw.example/v1/projects/proj-123/locations/us-east5"
+                "/publishers/anthropic/models/claude-sonnet-4-5:rawPredict",
+            )
+            self.assertNotIn("model", captured["payload"])
+            self.assertEqual(
+                captured["payload"]["anthropic_version"], "vertex-2023-10-16"
+            )
+            self.assertEqual(captured["headers"]["Authorization"], "Bearer tok")
+            self.assertEqual(_extra_headers(), {"X-Gateway": "abc"})
+
+        with patch.dict(
+            os.environ,
+            {"HELION_LLM_EXTRA_HEADERS": "X-One: 1\nX-Two: two"},
+            clear=False,
+        ):
+            self.assertEqual(_extra_headers(), {"X-One": "1", "X-Two": "two"})
+
+    def test_vertex_provider_standard_env_fallback(self):
+        """With the helion-specific knobs unset, the vertex provider resolves the
+        endpoint/project/location from the standard Anthropic-on-Vertex SDK env
+        vars (so a pre-configured environment needs no extra setup)."""
+        from helion.autotuner.llm.transport import call_provider
+
+        captured = {}
+
+        def fake_post_json(url, payload, headers, *, request_timeout_s):
+            captured.update(url=url, payload=payload, headers=headers)
+            return self._response_payload("anthropic")
+
+        env = {
+            "ANTHROPIC_VERTEX_BASE_URL": "https://std.example/v1",
+            "ANTHROPIC_VERTEX_PROJECT_ID": "std-proj",
+            "CLOUD_ML_REGION": "global",
+        }
+        with patch.dict(os.environ, env, clear=False):
+            for stale in (
+                "HELION_LLM_API_BASE",
+                "HELION_LLM_VERTEX_PROJECT",
+                "HELION_LLM_VERTEX_LOCATION",
+            ):
+                os.environ.pop(stale, None)
+            with patch(
+                "helion.autotuner.llm.transport._post_json",
+                side_effect=fake_post_json,
+            ):
+                call_provider(
+                    "vertex",
+                    model="vertex/claude-sonnet-4-5",
+                    api_base=None,
+                    api_key=None,
+                    messages=[{"role": "user", "content": "suggest configs"}],
+                    max_output_tokens=256,
+                    request_timeout_s=60.0,
+                )
+            self.assertEqual(
+                captured["url"],
+                "https://std.example/v1/projects/std-proj/locations/global"
+                "/publishers/anthropic/models/claude-sonnet-4-5:rawPredict",
+            )
+
     def test_transport_helpers_and_http_request_shapes(self):
         """Provider helpers build the expected request/response shapes for each backend."""
         from helion.autotuner.llm.transport import _resolve_api_base
