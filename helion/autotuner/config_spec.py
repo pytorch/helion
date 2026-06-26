@@ -234,6 +234,23 @@ class MemoryOpFact(NamedTuple):
     # subscript so it is reduction-AGNOSTIC; ``None`` for a plain slice). The faithful axis key for
     # the full_width_output / input_load_itemsize gates.
     subscript_block_ids: tuple[int | None, ...] = ()
+    # ELEMENT STRIDE of the accessed tensor along each non-bare-int subscript position, aligned 1:1
+    # with ``subscript_block_ids``/``indexed_block_ids`` (same ``positions``). Raw stride provenance
+    # straight from the accessed fake tensor's ``.stride()`` (never a guess). A stride-1 position is
+    # the CONTIGUOUS (coalescing) axis; for a row-major tensor that is the last subscript, but for a
+    # ``.t()`` / transposed / strided VIEW the stride-1 axis is a DIFFERENT (non-last) subscript. The
+    # faithful signal a coalescing/vectorization heuristic reads to place a wide tile on a stride-1
+    # axis rather than the last logical one (the derived fact picks the contiguous block-id slice).
+    subscript_strides: tuple[int, ...] = ()
+    # DISTINCT HBM elements the op's accessed tensor touches: product of its size-hinted shape dims
+    # over NON-broadcast dims (``stride != 0``); a stride-0 dim contributes factor 1 (``0`` if no
+    # resolvable fake tensor). A FULL-EXTENT op has ``accessed_numel`` == the problem numel; a
+    # BROADCAST operand has a STRICTLY SMALLER count — whether it is a small tensor (``bias[N]``,
+    # ``[M,1]``, ``[1,N]``) OR a full-SIZE ``.expand()``/``broadcast_tensors`` view with a stride-0
+    # dim. The faithful signal for per-element HBM traffic at ANY rank/stride, unlike a bare ``ndim``
+    # check (a full-rank ``[M,1]`` broadcast passes ndim) or a shape-only product (a stride-0 expand
+    # passes shape).
+    accessed_numel: int = 0
 
 
 class AccumulatorFact(NamedTuple):
@@ -246,6 +263,71 @@ class AccumulatorFact(NamedTuple):
 
     dim_block_ids: tuple[int | None, ...]
     itemsize: int
+
+
+class PointwiseElementwiseFact(NamedTuple):
+    """Workload facts for a PURE elementwise/pointwise kernel — a tiled map that reads its
+    inputs, computes, and writes its outputs with NO reduction, NO matmul, and NO
+    loop-carried accumulator. The fact is DEFINED by their absence (the disjointness rule):
+    a reduction/matmul/accumulator fact firing routes the kernel to that family, and this
+    fact is never built. Bandwidth-bound; the compiler default tiles it at ``block_size=32``
+    (``BlockSizeSpec._fragment``: ``total_ndim <= 2 and reduction_numel <= 128``), which
+    starves HBM. The pointwise seed sizes a saturating tile from these fields.
+
+    DERIVED: ``total_numel`` / ``bandwidth_bytes_per_elem`` / ``register_bytes_per_elem`` are derivations over
+    the walker ``MemoryOpFact`` list + block-size specs; ``register_bytes_per_elem`` additionally reads
+    the widest COMPUTE dtype via one cheap single-pass walk of the device graphs (needed because a
+    memory op only knows its STORAGE dtype, not the fp32 the value is promoted to for the math).
+    The fact carries only the scalars the seed branches on (the tile-rank / per-dim extents the
+    distributor needs are read live off ``ConfigSpec.block_sizes``, never snapshotted here).
+
+    ``bandwidth_bytes_per_elem`` and ``register_bytes_per_elem`` both count, per tiled iteration-space element,
+    the UNTILED inner slab each op drags: ``(accessed_numel // total_numel) * width``. For a
+    FULLY-TILED (flat) kernel every op has ``accessed_numel == total_numel`` so the quotient is 1;
+    for a PARTIALLY-TILED kernel (rope tiles only ``[batch, seq]`` but loads the whole
+    ``[heads, head_dim]`` slab per program) the quotient is that inner extent.
+
+    - ``total_numel``: product of the tiled block dims' ``size_hint``s (= the static problem
+      element count, M*N); the occupancy / grid-saturation input.
+    - ``bandwidth_bytes_per_elem``: the per-tiled-element HBM byte traffic (read + write), width =
+      ``MemoryOpFact.dtype.itemsize`` (the STORAGE width, NOT an op name or dtype literal):
+      traffic-3 gated acts (swiglu = 2 bf16 loads + 1 store = 6) vs traffic-2 unary ops
+      (relu_squared = 4). Drives the BANDWIDTH budget (how big a coalesced program should be).
+      A BROADCAST operand (``bias[N]``, ``[M,1]``, any size-1 / stride-0 dim) has strictly FEWER
+      distinct elements than the iteration space (``accessed_numel < total_numel``) → amortized →
+      excluded. An OVERSIZED operand (padded / over-allocated / sliced, read sub-indexed) has
+      ``accessed_numel > total_numel`` but still touches the full problem → counted (hence ``>=``).
+    - ``register_bytes_per_elem``: the same per-tiled-element slab, but at the widest COMPUTE dtype
+      (the fp32 the kernel promotes to). Drives the REGISTER/occupancy budget — the constraint that
+      makes a heavy partially-tiled program (rope's fp32 slab) spill or overflow the block-numel
+      cap if the outer dim is tiled past ~1. Equals ``bandwidth_bytes_per_elem`` scaled by
+      compute/storage width for a promoting kernel; used only for the register cap, so it never
+      changes the (storage-width) bandwidth sizing that the flat family is tuned for.
+    - ``contig_block_ids``: the set of TILED block-ids that are the CONTIGUOUS (stride-1) axis for
+      at least one FULL-EXTENT memory op (same ``accessed_numel >= total_numel`` filter as the byte
+      fields — a broadcast operand's coalescing is amortized, excluded). Derived (NO graph walk) from
+      each op's ``subscript_strides`` aligned with ``subscript_block_ids``. A coalesced tile must give
+      WIDTH to a stride-1 axis; for a row-major kernel that is the LAST block dim (so this equals the
+      last block-id and the seed's innermost-first distribution is unchanged), but for a transposed /
+      strided VIEW it is a DIFFERENT block dim, so the seed must not pin it to width 1. Two or more
+      entries = a CONFLICT (e.g. a transposed load + a contiguous store want different axes) → the
+      seed emits a BALANCED tile so every contiguous axis keeps a coalescing run.
+    - ``sfu_ops``: count of high-latency SPECIAL-FUNCTION-UNIT (transcendental) compute ops in the
+      kernel body — ``sin``/``cos``/``tan(h)``/``exp``/``log``/``sqrt``/``rsqrt``/``sigmoid``/``erf``/
+      ``pow`` etc. Counted in the SAME single graph walk as the compute dtype (no new walk). This is a
+      HARDWARE property (an op's execution unit + its ~4-8x-FMA latency), NOT an op-name identity fence:
+      a program with many SFU ops is LATENCY-bound and needs more warps to hide that latency, while a
+      program of the same op-COUNT that is all cheap FMA (a Horner polynomial: many ops, 0 SFU) is not
+      — so ``sfu_ops`` (not total op count) is the faithful num_warps signal. The seed leaves
+      ``num_warps`` at the default (4) when ``sfu_ops`` is low (the flat GLU/activation family, 0-1 SFU)
+      and ramps it up for transcendental-heavy tiles (measured: 12 SFU wants w16, 4 SFU wants w8).
+    """
+
+    total_numel: int
+    bandwidth_bytes_per_elem: int
+    register_bytes_per_elem: int
+    contig_block_ids: tuple[int, ...] = ()
+    sfu_ops: int = 0
 
 
 def shrink_block_sizes_for_numel_constraints(
@@ -538,6 +620,7 @@ class ConfigSpec:
         self.reduction_facts: list[ReductionFact] = []
         self.matmul_reduction_epilogue_facts: list[MatmulWithReductionEpilogueFact] = []
         self.accumulator_facts: list[AccumulatorFact] = []
+        self.pointwise_facts: list[PointwiseElementwiseFact] = []
         self.store_indices: list[int] = []
         self.memory_op_facts: list[MemoryOpFact] = []
         self.backend_tunable_fragments = self.backend.tunable_fragments()

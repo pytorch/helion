@@ -422,8 +422,13 @@ class TestMatmulFacts(TestCase):
 
             self.assertEqual(len(bound.config_spec.matmul_facts), expected_facts)
             if expected_facts == 0:
-                self.assertEqual(bound.config_spec.compiler_seed_configs, [])
-                self.assertEqual(bound.config_spec.autotuner_heuristics, [])
+                # No matmul fact: a pure-pointwise kernel (triton_add) is instead seeded by
+                # TritonPointwiseSeedHeuristic. Assert it routes there (one seed config), not
+                # the pre-pointwise-heuristic expectation of no seed at all.
+                self.assertEqual(
+                    bound.config_spec.autotuner_heuristics, ["triton_pointwise"]
+                )
+                self.assertEqual(len(bound.config_spec.compiler_seed_configs), 1)
             for fact in bound.config_spec.matmul_facts:
                 self.assertEqual(fact.lhs_ndim, 2)
                 self.assertEqual(fact.rhs_ndim, 2)

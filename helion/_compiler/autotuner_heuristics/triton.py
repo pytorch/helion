@@ -298,6 +298,213 @@ class TritonSplitJoinRotateHeuristic(AutotunerHeuristic):
         return Config(block_sizes=[1] * len(env.config_spec.block_sizes))
 
 
+class TritonPointwiseSeedHeuristic(AutotunerHeuristic):
+    """Seed a bandwidth-saturating tile for PURE elementwise/pointwise kernels.
+
+    A pointwise kernel reads its inputs, computes, and writes its outputs with no
+    reduction / matmul / loop-carried accumulator — it is BANDWIDTH-bound. The compiler
+    default tiles it at ``block_size=32`` (``BlockSizeSpec._fragment``: ``total_ndim <= 2
+    and reduction_numel <= 128``), moving only ~10% of HBM (~5-7x slower than a saturating
+    tile; measured headroom in ``_lab/pointwise``). This seed sizes the tile to (a) a byte
+    budget that saturates HBM and (b) the grid occupancy (size_hint-aware), keyed on the
+    derived ``PointwiseElementwiseFact`` (bytes/elem + total numel) — NEVER on the
+    activation identity or a dtype literal. Fires on the presence of that fact, which is
+    built only on the ABSENCE of the reduction/matmul/accumulator facts (disjointness rule),
+    so it never claws a reducing kernel into the pointwise track.
+    """
+
+    name = "triton_pointwise"
+    backend = "triton"
+
+    # Hill-climbed constants (see _lab/pointwise/NOTEBOOK.md). TILE_BYTES=8192 gives a ~1024-elem
+    # tile for traffic-3 (swiglu/geglu/residual_add) and ~2048 for traffic-2 (relu²/bias_gelu) —
+    # the robust zone: 1-D kernels are flat across 1-8K, but N-D/traffic-2 kernels (bias_gelu) lose
+    # ~5-25% at 4096 vs 2048, so the smaller budget lifts the worst kernel with no 1-D regression.
+    TILE_BYTES = 8192  # target HBM bytes moved per tile
+    MIN_WAVES = 8  # grid >= num_sm * MIN_WAVES (size_hint-aware grid floor)
+    BLOCK_FLOOR = 256  # never regress toward the bs=32 default
+    # Per-program register/working-set ceiling (fp32-compute bytes of the resident tile) before it
+    # spills / overflows Triton's block-numel cap. Not hill-climbed — bounded by two constraints
+    # with a wide safe window: it must NOT bind the flat family (flat reg_bytes/elem ~ 12-16 * its
+    # budget tile ~2048 => stay above ~32 KB) and it MUST bind a heavy partially-tiled slab (rope's
+    # fp32 slab is ~80+ KB/elem => stay below ~170 KB). 64 KB sits in the middle and matches the
+    # measured spill cliff (~block 8-16 at head_dim=256). Only the register cap reads it.
+    REGISTER_BYTES = 65536
+    # num_warps ramp (arithmetic-intensity keyed). The compiler default is 4; a transcendental-heavy
+    # tile is latency-bound and wants more warps to hide the SFU latency (MEASURED: 4 SFU ops -> w8,
+    # >=9 SFU -> w16; the flat GLU/activation family has 0-1 SFU -> stays w4, byte-identical). Over-
+    # warping a SMALL tile starves each warp of work and regresses ([1,256] w16 = 0.5x measured), so
+    # the ramp is capped at tile_numel // ELEMS_PER_WARP warps.
+    DEFAULT_WARPS = 4
+    MAX_WARPS = 16
+    SFU_W8 = 3  # >= this many SFU ops -> >= 8 warps
+    SFU_W16 = 9  # >= this many SFU ops -> 16 warps
+    ELEMS_PER_WARP = (
+        64  # each warp needs at least this many tile elements to be worth spawning
+    )
+
+    @classmethod
+    def is_eligible(cls, env: CompileEnvironment, device_ir: DeviceIR) -> bool:
+        return bool(env.config_spec.pointwise_facts)
+
+    @classmethod
+    def get_seed_config(cls, env: CompileEnvironment, device_ir: DeviceIR) -> Config:
+        from ...runtime import get_num_sm
+
+        spec = env.config_spec
+        fact = spec.pointwise_facts[0]
+        num_sm = max(1, get_num_sm(env.device))
+        bandwidth_bytes_per_elem = max(1, fact.bandwidth_bytes_per_elem)
+        register_bytes_per_elem = max(1, fact.register_bytes_per_elem)
+        # Two orthogonal per-program caps, both counting the FULL per-tiled-element cost (the untiled
+        # inner slab folded in via accessed_numel//total_numel):
+        #  - budget_target: HBM bandwidth — how many tiled elements make a coalesced, saturating
+        #    program (storage-width bytes). This is what the flat family is tuned on.
+        #  - reg_cap: register/occupancy — how many fit before the fp32-compute working set spills
+        #    or overflows Triton's block-numel cap (compute-width bytes).
+        # For a flat kernel both are large (small slab) so the tile is bandwidth-sized as before; for
+        # a partially-tiled kernel (rope: seq tiled but the whole heads*head_dim slab is fp32-resident
+        # per program) reg_cap (and budget_target) collapse to ~1, so it is not tiled past ~1 instead
+        # of the old model's [1, 256] that overflowed the block/register cap.
+        budget_target = max(1, cls.TILE_BYTES // bandwidth_bytes_per_elem)
+        reg_cap = max(1, cls.REGISTER_BYTES // register_bytes_per_elem)
+        # size_hint-aware: cap the tile so the grid keeps the SMs busy on small problems.
+        occ_cap = max(1, fact.total_numel // (num_sm * cls.MIN_WAVES))
+        target = max(1, min(budget_target, reg_cap, occ_cap))
+        # Anti-undershoot floor, capped by the REGISTER budget only (NOT budget_target, NOT the
+        # occ-capped target). The floor exists to keep a coalesced per-operand run; it must yield
+        # ONLY when the program is genuinely too heavy to hold BLOCK_FLOOR elements — i.e. when an
+        # untiled slab makes reg_cap tiny (rope: reg_cap≈1 → floor 1). It must NOT yield merely
+        # because budget_target is small: a HIGH-FAN-IN kernel (many cheap full-extent operands)
+        # has a small budget_target (TILE_BYTES split across all operands) but a LARGE reg_cap and
+        # NO slab, so it can and should hold a BLOCK_FLOOR tile for per-operand coalescing — capping
+        # the floor by budget_target there starved it to [1,16] (measured 1.83x SLOWER than default,
+        # vs 1.48x faster at the [1,256] floor). For any flat kernel reg_cap is large, so this stays
+        # 256 — byte-identical to the old hardcoded floor.
+        inner_floor = min(cls.BLOCK_FLOOR, cls._pow2_floor(reg_cap))
+        # A coalescing CONFLICT (>1 contiguous axis: a transposed load + a contiguous store) IGNORES
+        # the bandwidth byte budget — it is wasted on the strided operand — and fills a BALANCED tile
+        # up to the REGISTER limit (reg_cap) only. It does NOT apply occ_cap: a strided access needs a
+        # long coalescing run to amortize the wasted cache-line bandwidth MORE than the grid needs many
+        # programs, so under-saturating a small conflict shape with a bigger tile is faster (measured:
+        # transposed_out_add [2048,512] [16,16]=0.84 -> [64,64]=1.02; large shapes are unchanged since
+        # reg_cap bounds the run to ~64 either way). Single-contig / flat kernels use `target` (occ-capped).
+        balance_cap = max(1, reg_cap)
+        block_sizes = cls._seed_block_sizes(
+            spec, target, inner_floor, fact.contig_block_ids, balance_cap
+        )
+        # num_warps ramp — keyed on arithmetic INTENSITY (SFU op count), tile-size-aware. Emitted only
+        # when it exceeds the default (so the bandwidth-bound flat family stays block_sizes-only, the
+        # dead-knob rule + byte-identical). num_stages/pid_type stay at defaults (1 / 'flat').
+        tile_numel = 1
+        for b in block_sizes:
+            tile_numel *= b
+        num_warps = cls._warps_for(fact.sfu_ops, tile_numel)
+        if num_warps > cls.DEFAULT_WARPS:
+            return Config(block_sizes=block_sizes, num_warps=num_warps)
+        return Config(block_sizes=block_sizes)
+
+    @classmethod
+    def _warps_for(cls, sfu_ops: int, tile_numel: int) -> int:
+        """num_warps from arithmetic intensity (SFU op count), capped by tile size. A transcendental-
+        heavy program is latency-bound (more warps hide the SFU latency); a small tile cannot feed many
+        warps (each warp needs >= ELEMS_PER_WARP elements, else it starves — measured regression)."""
+        if sfu_ops >= cls.SFU_W16:
+            target = cls.MAX_WARPS
+        elif sfu_ops >= cls.SFU_W8:
+            target = 8
+        else:
+            target = cls.DEFAULT_WARPS
+        cap = cls._pow2_floor(max(1, tile_numel // cls.ELEMS_PER_WARP))
+        return max(cls.DEFAULT_WARPS, min(cls.MAX_WARPS, target, cap))
+
+    @staticmethod
+    def _pow2_floor(value: int) -> int:
+        return 1 << (value.bit_length() - 1) if value >= 1 else 1
+
+    @classmethod
+    def _clamp_dim(cls, target: int, bs_spec: BlockSizeSpec, floor: int) -> int:
+        # Round DOWN to a pow2 within [floor (and the spec's correctness min), max_size]. max_size
+        # is next_pow2(extent), so capping there (rather than pre-capping at the raw size_hint) lets
+        # the inner tile COVER a short row in one masked tile (extent 768 -> 1024, not floored to
+        # 512). autotuner_min is the AUTOTUNER's search floor, NOT a seed constraint (the reduction
+        # and split-join seeds emit block=1 below it), so it is intentionally not applied here.
+        cand = cls._pow2_floor(max(1, target))
+        cand = max(cand, floor, bs_spec.min_size)
+        cand = min(cand, bs_spec.max_size)
+        return max(1, cand)
+
+    @classmethod
+    def _seed_block_sizes(
+        cls,
+        spec: ConfigSpec,
+        target: int,
+        inner_floor: int = BLOCK_FLOOR,
+        contig_block_ids: tuple[int, ...] = (),
+        balance_cap: int = 1 << 30,
+    ) -> list[int]:
+        """Distribute the target tile (in elements) across the block dims so the wide part lands on a
+        CONTIGUOUS (stride-1) axis — the coalesced run. The contiguous axis is read from the fact's
+        ``contig_block_ids`` (stride provenance), NOT assumed to be the last dim:
+
+        - **Flat / single contiguous axis** (the common case — a row-major kernel's stride-1 axis IS
+          the last block dim): distribute INNERMOST-first from the contiguous axis, spilling the
+          leftover budget outward. Rooted at the last dim this is byte-identical to the prior seed:
+          a WIDE row gives ``[1, 1024]``; a short-inner (tall-skinny) tensor spills outward to
+          ``[128, 8]`` (a coalesced ``R*N`` block) instead of a starved ``[1, 8]``. For a TRANSPOSED
+          view whose single contiguous axis is dim 0 (``xT = base.t()``), it roots the wide tile there
+          → ``[1024, 1]`` instead of the uncoalesced ``[1, 1024]`` (measured 5.3x slower).
+        - **Coalescing CONFLICT** (>1 contiguous axis — a transposed load wants dim 0, a contiguous
+          store wants dim 1): no single wide axis coalesces every operand (``[2048,1]`` strides the
+          store, measured 0.13x), so emit a BALANCED tile giving every contiguous axis an equal run.
+
+        The floor (``inner_floor``, register-capped) applies to the primary contiguous axis so it keeps
+        a ``BLOCK_FLOOR`` coalescing run except when a heavy untiled slab shrinks reg_cap (rope→1)."""
+        n = len(spec.block_sizes)
+        specs = [cast("BlockSizeSpec", spec.block_sizes[i]) for i in range(n)]
+        # Positions whose block-id is a contiguous (stride-1) axis for some full-extent op.
+        contig_pos = [i for i in range(n) if specs[i].block_id in contig_block_ids]
+        if len(contig_pos) >= 2:
+            return cls._balanced_block_sizes(specs, contig_pos, balance_cap)
+        block = [1] * n
+        # Root the wide tile at the single contiguous axis; fall back to the last (innermost) dim when
+        # contiguity is unknown or already the last dim (the flat family — byte-identical).
+        primary = contig_pos[0] if contig_pos else (n - 1)
+        order = [primary] + [i for i in reversed(range(n)) if i != primary]
+        remaining = max(1, target)
+        for (
+            i
+        ) in order:  # contiguous axis first (gets the floor), spill the rest outward
+            floor = inner_floor if i == primary else 1
+            block[i] = cls._clamp_dim(remaining, specs[i], floor)
+            remaining = max(1, remaining // block[i])
+            if remaining <= 1:
+                break
+        return block
+
+    @classmethod
+    def _balanced_block_sizes(
+        cls, specs: list[BlockSizeSpec], contig_pos: list[int], balance_cap: int
+    ) -> list[int]:
+        """Balanced (square-ish) pow2 tile for a coalescing CONFLICT: several tiled axes are each the
+        contiguous axis for some operand (a transposed load + a contiguous store). Give every
+        contiguous axis an EQUAL coalescing run — a single wide axis would stride the other operand
+        (the ``[2048,1]`` disaster, 0.13x) — sized to fill the register/occupancy budget (balance_cap
+        = min(reg_cap, occ_cap)); the bandwidth byte budget does not apply (it is wasted on the
+        strided operand). Non-contiguous axes stay 1 (a wide tile on a strided axis cannot coalesce)."""
+        n = len(specs)
+        block = [1] * n
+        k = len(contig_pos)
+        run = 1
+        while (
+            run * 2
+        ) ** k <= balance_cap:  # largest pow2 run with run**k within the budget
+            run *= 2
+        for i in contig_pos:
+            block[i] = cls._clamp_dim(run, specs[i], 1)
+        return block
+
+
 def _triton_reduction_eligible(env: CompileEnvironment, device_ir: DeviceIR) -> bool:
     """Gate: exactly one ``ReductionFact`` and no ``matmul_facts``. Admits both tracks
     (standard rollable, user-tiled); excludes GEMMs and multi-axis manual reductions."""
