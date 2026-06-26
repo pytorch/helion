@@ -10,7 +10,10 @@ import torch
 from helion._compiler.ast_extension import expr_from_string
 
 if TYPE_CHECKING:
+    from collections.abc import Iterator
+
     from helion._compiler.inductor_lowering import CodegenState
+    from helion._compiler.tile_strategy import DeviceLoopOrGridState
 
 
 def load_expr(
@@ -65,6 +68,9 @@ def _load_mask_expr(
     cause a shape mismatch against the smaller ref.
     """
     from helion._compiler.compile_environment import CompileEnvironment
+    from helion._compiler.pallas.plan_tiling import ArbitraryIndexPattern
+    from helion._compiler.pallas.plan_tiling import TileBeginWithOffsetPattern
+    from helion._compiler.pallas.plan_tiling import TileIndexWithOffsetPattern
     from helion._compiler.pallas.plan_tiling import TilePattern
 
     assert state.fx_node is not None
@@ -75,10 +81,19 @@ def _load_mask_expr(
     indexing_patterns = _get_indexing_patterns(state, tensor)
     env = CompileEnvironment.current()
     output_sizes = [*output_val.size()]
+    # Dims whose mask has been deferred to a downstream ``_mask_to`` by
+    # ``defer_pallas_load_masks`` -- masked later in the consumer layout instead.
+    deferred = state.fx_node.meta.get("pallas_deferred_mask_block_ids") or frozenset()
     mask_exprs: list[str] = []
     dtype_str: str | None = None
     out_dim = 0
     tensor_dim = 0
+
+    squeezing_patterns = (
+        ArbitraryIndexPattern,
+        TileIndexWithOffsetPattern,
+        TileBeginWithOffsetPattern,
+    )
 
     for idx, pattern in zip(subscript, indexing_patterns, strict=True):
         if idx is None:
@@ -91,8 +106,10 @@ def _load_mask_expr(
             # always valid, and applying a block-sized mask would broadcast
             # the dim from 1 to block_size, causing shape mismatches.
             dim_size = tensor.shape[tensor_dim]
-            if (not isinstance(dim_size, int) or dim_size > 1) and _tile_needs_mask(
-                state, block_id, tensor, tensor_dim
+            if (
+                block_id not in deferred
+                and (not isinstance(dim_size, int) or dim_size > 1)
+                and _tile_needs_mask(state, block_id, tensor, tensor_dim)
             ):
                 mask_var = state.codegen.mask_var(block_id)
                 if mask_var is not None:
@@ -104,12 +121,63 @@ def _load_mask_expr(
 
         # TODO(dunfanlu): Do other patterns beside TilePattern require masking?
 
-        out_dim += 1
+        if not isinstance(pattern, squeezing_patterns):
+            out_dim += 1
         tensor_dim += 1
 
     if not mask_exprs:
         return None
     return "*".join(mask_exprs)
+
+
+def _iter_dma_scratch_loops(
+    state: CodegenState, name: str
+) -> Iterator[tuple[DeviceLoopOrGridState, str]]:
+    """Yield ``(loop, scratch_ref_name)`` for every active loop that DMA-routes
+    ``name`` through a VMEM scratch."""
+    from helion._compiler.tile_strategy import EmitPipelineLoopState
+    from helion._compiler.tile_strategy import ForiLoopState
+
+    for loops in state.codegen.active_device_loops.values():
+        for loop in loops:
+            if isinstance(loop, (EmitPipelineLoopState, ForiLoopState)):
+                mapping = getattr(loop, "_tensor_to_dma_scratch", None)
+                if mapping and name in mapping:
+                    yield loop, mapping[name]
+
+
+def _find_dma_scratch_loop(
+    state: CodegenState, name: str
+) -> tuple[DeviceLoopOrGridState | None, str]:
+    """Find the active loop that DMA-routes ``name`` and its scratch ref.
+
+    Returns ``(loop, scratch_ref_name)`` for the first matching active loop, or
+    ``(None, name)`` when the tensor is not scratch-routed.
+
+    TODO: this returns the *first* matching active loop, which is wrong
+    when nested fori_loops scratch-route the *same* tensor at multiple levels --
+    a body access should resolve to the innermost (current) loop's scratch, not
+    the first.  It silently miscompiles e.g.::
+
+        for tile_m in hl.tile(m):
+            out[tile_m, :] = x[tile_m, :] + 1.0
+            for tile_n in hl.tile(n):
+                out[tile_m, tile_n] = out[tile_m, tile_n] + 2.0
+
+    where the inner RMW's load/store bind to the outer loop's scratch while its
+    DMA uses the inner loop's scratch, producing wrong results with no error.
+    This can be fixed by resolving against the current loop instead of first-match.
+    """
+    return next(_iter_dma_scratch_loops(state, name), (None, name))
+
+
+def _tensor_routed_to_fori_scratch(state: CodegenState, tensor: torch.Tensor) -> bool:
+    """True if ``tensor``'s store destination ref is a fori_loop DMA scratch."""
+    from helion._compiler.tile_strategy import ForiLoopState
+
+    name = state.codegen.device_function.tensor_arg(tensor).name
+    loop, _ref = _find_dma_scratch_loop(state, name)
+    return isinstance(loop, ForiLoopState)
 
 
 def sliced_value_for_store(
@@ -129,6 +197,10 @@ def sliced_value_for_store(
     This only applies to grid-tiled dimensions that produce ``:`` in the
     generated Pallas index.  Dimensions indexed via ``pl.ds()`` are padded
     instead of clamped, so they must keep their full block-size value.
+
+    fori_loop-scratch stores are exempt: their destination is a block-sized
+    VMEM scratch (not a clamped ref), so the value stays block-shaped and the
+    writeback DMA clamps the extent instead (see ``_build_dma_slices``).
     """
     from helion._compiler.compile_environment import CompileEnvironment
     from helion._compiler.pallas.plan_tiling import TilePattern
@@ -136,6 +208,9 @@ def sliced_value_for_store(
     assert state.fx_node is not None
     patterns = state.fx_node.meta.get("indexing_patterns")
     if patterns is None:
+        return value
+
+    if _tensor_routed_to_fori_scratch(state, tensor):
         return value
 
     env = CompileEnvironment.current()
@@ -244,9 +319,6 @@ def index_parts(
     Also returns positions of ``None`` indices so the caller can apply
     ``jnp.expand_dims`` after loading.
     """
-    from helion._compiler.tile_strategy import EmitPipelineLoopState
-    from helion._compiler.tile_strategy import ForiLoopState
-
     if not subscript:
         return ["..."], []
 
@@ -258,14 +330,9 @@ def index_parts(
     tensor_name = state.codegen.device_function.tensor_arg(tensor).name
     in_pipeline = False
     pipeline_block_ids: set[int] = set()
-    for loops in state.codegen.active_device_loops.values():
-        for loop in loops:
-            if (
-                isinstance(loop, (EmitPipelineLoopState, ForiLoopState))
-                and tensor_name in loop._tensor_to_dma_scratch
-            ):
-                in_pipeline = True
-                pipeline_block_ids.update(loop.block_ids)
+    for loop, _ref in _iter_dma_scratch_loops(state, tensor_name):
+        in_pipeline = True
+        pipeline_block_ids.update(loop.block_ids)
 
     # Use pre-computed indexing patterns from plan_tiling analysis
     indexing_patterns = _get_indexing_patterns(state, tensor)
@@ -512,6 +579,29 @@ def _slice_code(
     return ":"
 
 
+def _is_compact_aligned_load(
+    state: CodegenState, block_id: int, tensor: torch.Tensor | None
+) -> bool:
+    """True if *tensor* is a compact-tile aligned-load or exact-store tensor.
+
+    Both get a per-tile ``pl.Element`` BlockSpec sliced at ``tile_start`` (Pallas
+    double-buffers the load's prefetch and the store's write-back), so the body
+    accesses the whole sliced block at local offset 0.
+    """
+    from helion._compiler.compile_environment import CompileEnvironment
+
+    if tensor is None:
+        return False
+    plan = CompileEnvironment.current().compact_worklist_plan
+    if plan is None or block_id != plan.compact_axis.block_id:
+        return False
+    host = state.device_function.tensor_arg(tensor).host_str()
+    return any(
+        p.kind in ("compact_aligned_load", "compact_exact_store") and p.arg_name == host
+        for p in plan.tensor_policies
+    )
+
+
 def _ds_expr(
     state: CodegenState,
     block_id: int,
@@ -531,6 +621,12 @@ def _ds_expr(
     block_size = state.device_function.block_size_var(block_id)
     if block_size is None:
         return ":"
+    # compact_aligned_load: the tensor is a per-tile sliced BlockSpec block (the
+    # launcher slices it to one tile at tile_start via pl.Element, so Pallas
+    # double-buffers it across work items).  The body therefore reads the whole
+    # sliced block at local offset 0, not the absolute tile_start.
+    if not tile_offset and _is_compact_aligned_load(state, block_id, tensor):
+        return f"pl.ds(0, {block_size})"
     if tensor is not None and tensor_dim is not None:
         from helion.language.memory_ops import _record_pad_info
 
@@ -626,13 +722,5 @@ def _loop_offset_alignment(
 
 def vmem_name(state: CodegenState, name: str) -> str:
     """Remap a tensor name to its VMEM ref name when inside emit_pipeline or fori_loop."""
-    from helion._compiler.tile_strategy import EmitPipelineLoopState
-    from helion._compiler.tile_strategy import ForiLoopState
-
-    for loops in state.codegen.active_device_loops.values():
-        for loop in loops:
-            if isinstance(loop, (EmitPipelineLoopState, ForiLoopState)):
-                mapping = getattr(loop, "_tensor_to_dma_scratch", None)
-                if mapping and name in mapping:
-                    return mapping[name]
-    return name
+    _loop, ref = _find_dma_scratch_loop(state, name)
+    return ref

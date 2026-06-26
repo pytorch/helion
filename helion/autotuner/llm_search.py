@@ -431,7 +431,7 @@ class LLMGuidedSearch(PopulationBasedSearch):
         """Store raw results and keep a bounded set of top configs for rebenchmarking."""
         # Retain full results for prompts while keeping only a small top-config set in memory.
         self._store_latest_results(results)
-        self.population.extend(
+        members = [
             PopulationMember(
                 fn=result.fn,
                 perfs=[result.perf],
@@ -441,7 +441,10 @@ class LLMGuidedSearch(PopulationBasedSearch):
                 compile_time=result.compile_time,
             )
             for result in results
-        )
+        ]
+        for member in members:
+            self._record_benchmarked_member(member)
+        self.population.extend(members)
         self._trim_population()
 
     def _trim_population(self) -> None:
@@ -634,7 +637,8 @@ class LLMGuidedSearch(PopulationBasedSearch):
             if self._run_refinement_round(round_num, state):
                 break
 
-        best = self.run_finishing_phase(self.best, self.finishing_rounds)
+        best = self.final_rebenchmark_best(self.best)
+        best = self.run_finishing_phase(best, self.finishing_rounds)
         return best.config
 
     def _log_search_stats(self) -> None:

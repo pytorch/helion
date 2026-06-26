@@ -162,6 +162,19 @@ def fp8_attention_tritonbench(
 
 
 # %%
+def fp8_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+    """End-to-end FP8 attention: preprocess bf16 (q,k,v) and run the kernel.
+
+    Tensor-returning entry point used by `benchmarks/run_tpu.py` (the
+    harness expects `fn(*args) -> Tensor`, while `fp8_attention_tritonbench`
+    returns a callable factory).
+    """
+    batch, heads, *_ = q.shape
+    q_fp8, k_fp8, v_fp8 = preprocess_fp8_attention_inputs(q, k, v)
+    return fp8_attention_kernel(q_fp8, k_fp8, v_fp8, batch, heads)
+
+
+# %%
 def _fp8_attention_pytorch_impl(
     q_fp8: torch.Tensor,
     k_fp8: torch.Tensor,

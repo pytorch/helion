@@ -6,8 +6,8 @@ from typing import TYPE_CHECKING
 from .. import exc
 from .._compiler.ast_extension import expr_from_string
 from .._compiler.compile_environment import CompileEnvironment
-from .._compiler.type_propagation import BarrierResultType
-from .._compiler.type_propagation import LiteralType
+from .._compiler.type_info import BarrierResultType
+from .._compiler.type_info import LiteralType
 from . import _decorators
 
 if TYPE_CHECKING:

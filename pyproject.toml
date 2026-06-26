@@ -109,6 +109,16 @@ exclude = ["test/data/*", ".github/*", "notebooks/**/*.ipynb", "_helion_aot_*.py
 
 [tool.ruff.lint.per-file-ignores]
 "test/*" = ["ANN"]
+# This module's @cute.struct field annotations must NOT be stringified by
+# `from __future__ import annotations` (it breaks CuTe MemRange/Align field-type
+# resolution -> runtime TypeError). It is imported by generated kernels at
+# runtime, not type-checked, so the forced future import (I002) is exempted.
+"helion/_compiler/cute/_flash_runtime.py" = ["I002"]
+# Same: the vendored @cute.jit gemm_ptx_partial here must NOT have its annotations
+# stringified by `from __future__ import annotations`. Imported by generated
+# kernels at runtime, not type-checked, so I002 is exempted. The remaining codes
+# (ANN/F841/FURB) are verbatim-vendored-FA4 style nits kept for diff fidelity.
+"helion/_compiler/cute/_flash_gemm_ptx.py" = ["I002", "ANN001", "ANN202", "F841", "FURB113"]
 
 [tool.ruff.lint.isort]
 extra-standard-library = ["typing_extensions"]
@@ -125,6 +135,7 @@ packages = ["helion"]
 include = [
   "helion/**/*.py",
   "helion/**/*.pyi",
+  "helion/**/*.json",
   "LICENSE",
 ]
 exclude = [
@@ -139,7 +150,10 @@ source = "vcs"
 
 [tool.pyrefly]
 project-includes = ["helion", "benchmarks", "docs", "examples"]
-project-excludes = ["test", "_helion_aot_*.py"]
+# _flash_gemm_ptx.py is verbatim-vendored FA4 code (gemm_ptx_partial +
+# mma_sm100_desc) that indexes cute Tensor .shape/.stride dynamically -- pyrefly
+# cannot model those cute-internal types and flags ~90 false bad-index errors.
+project-excludes = ["test", "_helion_aot_*.py", "helion/_compiler/cute/_flash_gemm_ptx.py"]
 python-version = "3.10"
 search-path = ["../pytorch"]
 

@@ -18,7 +18,7 @@ if TYPE_CHECKING:
     import ast
 
     from .._compiler.inductor_lowering import CodegenState
-    from .._compiler.type_propagation import TypeInfo
+    from .._compiler.type_info import TypeInfo
     from .._compiler.variable_origin import Origin
 
     _T = TypeVar("_T")
@@ -89,6 +89,7 @@ def specialize(value: _T) -> _T:
 @_decorators.type_propagation(specialize)
 def _(value: TypeInfo, *, origin: Origin) -> TypeInfo:
     from .._compiler.compile_environment import CompileEnvironment
+    from .._compiler.compile_environment import _symint_free_symbols
 
     if origin.is_device():
         raise exc.SpecializeOnDevice
@@ -97,7 +98,7 @@ def _(value: TypeInfo, *, origin: Origin) -> TypeInfo:
     env = CompileEnvironment.current()
 
     def handle_symint(symint: torch.SymInt) -> int:
-        syms = symint._sympy_().free_symbols
+        syms = _symint_free_symbols(symint)
         env.specialized_vars.update(syms)
         # Track stride specializations
         for sym in syms:
@@ -118,11 +119,12 @@ def _(value: TypeInfo, *, origin: Origin) -> TypeInfo:
 @_decorators.register_fake(specialize)
 def _(value: _T) -> _T:
     from .._compiler.compile_environment import CompileEnvironment
+    from .._compiler.compile_environment import _symint_free_symbols
 
     env = CompileEnvironment.current()
 
     def handle_symint(symint: torch.SymInt) -> torch.SymInt:
-        syms = symint._sympy_().free_symbols
+        syms = _symint_free_symbols(symint)
         env.specialized_vars.update(syms)
         for sym in syms:
             for source in env.shape_env.var_to_sources.get(sym, []):

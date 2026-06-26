@@ -28,22 +28,27 @@ from .cute.indexing import CuteShapeChainView
 from .cute.indexing import CuteSortableLoad
 from .cute.indexing import is_cute_shape_chain_target
 from .cute.indexing import match_cute_affine_range_iota
+from .cute.iota_utils import cute_free_arange_indexed_dim_key
 from .cute.iota_utils import cute_iota_has_atomic_tensor_index_only_users
+from .cute.iota_utils import cute_iota_is_free_memory_index
 from .cute.matmul_fallback import _emit_cute_matmul
+from .cute.matmul_fallback import _emit_cute_matmul_n_collapse
 from .cute.matmul_utils import cute_lower_rhs_for_matmul
 from .cute.matmul_utils import cute_outer_accumulates_result
 from .cute.matmul_utils import cute_outer_accumulator_dtype
 from .cute.matmul_utils import cute_outer_accumulator_out_dtype
+from .cute.matmul_utils import cute_rematerialize_rhs_at_contraction_block
+from .cute.matmul_utils import cute_rematerialize_rhs_at_index_override
 from .cute.matmul_utils import cute_resolve_active_block_id
 from .cute.matmul_utils import cute_resolve_active_matmul_k_block_id
 from .cute.matmul_utils import cute_static_k_invariant_extent
+from .cute.matmul_utils import cute_static_mn_collapse_n_block_id
 from .cute.matmul_utils import cute_static_serial_matmul_k_extent
+from .cute.matmul_utils import cute_synthetic_lane_k_extent
 from .cute.matmul_utils import emit_cute_serial_scalar_mm_from_loads
+from .cute.matmul_utils import emit_cute_synthetic_lane_fold_mm
 from .cute.strategies import is_pure_matmul_role_lifecycle_config
-from .cute.tcgen05_constants import TCGEN05_DIRECT_ENTRY_PLAN_CONFIG_KEY
 from .cute.tcgen05_constants import TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY
-from .cute.tcgen05_constants import TCGEN05_PURE_CLC_SCHEDULER_OBJECT_CONFIG_KEY
-from .cute.tcgen05_constants import TCGEN05_PURE_DYNAMIC_SCHEDULER_OBJECT_CONFIG_KEY
 from .matmul_utils import _emit_pallas_matmul
 from .matmul_utils import _needs_f32_accumulator
 from .matmul_utils import emit_tl_dot_with_padding
@@ -52,6 +57,7 @@ from .node_masking import cached_masked_value
 from .node_masking import getitem_masked_value
 
 if TYPE_CHECKING:
+    from .generate_ast import GenerateAST
     from .helper_function import CodegenInterface
 
 
@@ -75,57 +81,11 @@ def _requested_tcgen05_flat_role_coordinates(ctx: LoweringContext) -> bool:
     )
 
 
-def _requested_tcgen05_pure_clc_scheduler_object(ctx: LoweringContext) -> bool:
-    return bool(
-        ctx.cg.device_function.config.get(
-            TCGEN05_PURE_CLC_SCHEDULER_OBJECT_CONFIG_KEY, False
-        )
-    )
-
-
-def _requested_tcgen05_pure_dynamic_scheduler_object(ctx: LoweringContext) -> bool:
-    return bool(
-        ctx.cg.device_function.config.get(
-            TCGEN05_PURE_DYNAMIC_SCHEDULER_OBJECT_CONFIG_KEY, False
-        )
-    )
-
-
-def _requested_tcgen05_direct_entry_plan(ctx: LoweringContext) -> bool:
-    return bool(
-        ctx.cg.device_function.config.get(TCGEN05_DIRECT_ENTRY_PLAN_CONFIG_KEY, False)
-    )
-
-
 def _reject_tcgen05_flat_role_coordinates_fallback() -> None:
     raise exc.BackendUnsupported(
         "cute",
         f"{TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY}=True requires "
         "active-K-loop tcgen05 MMA lowering",
-    )
-
-
-def _reject_tcgen05_pure_clc_scheduler_object_fallback() -> None:
-    raise exc.BackendUnsupported(
-        "cute",
-        f"{TCGEN05_PURE_CLC_SCHEDULER_OBJECT_CONFIG_KEY}=True requires "
-        "active-K-loop tcgen05 MMA lowering",
-    )
-
-
-def _reject_tcgen05_pure_dynamic_scheduler_object_fallback() -> None:
-    raise exc.BackendUnsupported(
-        "cute",
-        f"{TCGEN05_PURE_DYNAMIC_SCHEDULER_OBJECT_CONFIG_KEY}=True requires "
-        "active-K-loop tcgen05 MMA lowering",
-    )
-
-
-def _reject_tcgen05_direct_entry_plan_fallback() -> None:
-    raise exc.BackendUnsupported(
-        "cute",
-        f"{TCGEN05_DIRECT_ENTRY_PLAN_CONFIG_KEY}=True requires active-K-loop "
-        "tcgen05 MMA lowering",
     )
 
 
@@ -896,9 +856,31 @@ def codegen_stack_cute(ctx: LoweringContext, node: Node) -> object:
         raise exc.BackendUnsupported("cute", "stack inputs")
     if _shape_chain_only_users(node):
         return CuteShapeChainView(node)
-    raise exc.BackendUnsupported(
-        "cute", "virtual shape-chain direct consumers are not yet supported"
-    )
+    # A stack materialized to a per-thread scalar is only correct when every
+    # consumer reads it element-wise (each output element is one stacked
+    # element), e.g. a direct store. A reduction or matmul that contracts over
+    # the virtual stacked dimension cannot gather the stacked operands from a
+    # single per-thread scalar and would silently produce wrong values, so only
+    # materialize when the direct consumers are stores (or further shape-chain
+    # ops); otherwise keep rejecting the pattern.
+    from ..language import memory_ops
+
+    if not all(
+        user.op == "call_function"
+        and (user.target is memory_ops.store or is_cute_shape_chain_target(user.target))
+        for user in node.users
+    ):
+        raise exc.BackendUnsupported(
+            "cute", "virtual shape-chain direct consumers are not yet supported"
+        )
+    from .cute.cute_reshape import resolve_cute_shape_chain_value
+
+    materialized = resolve_cute_shape_chain_value(ctx, node)
+    if materialized is None:
+        raise exc.BackendUnsupported(
+            "cute", "virtual shape-chain direct consumers are not yet supported"
+        )
+    return materialized
 
 
 expand_lowering = register_lowering(
@@ -909,21 +891,23 @@ expand_lowering = register_lowering(
 
 @expand_lowering.register_codegen("triton")
 def codegen_expand(ctx: LoweringContext, node: Node) -> object:
-    assert not node.kwargs, "getitem kwargs not supported"
+    assert not node.kwargs, "expand kwargs not supported"
     tensor, _ = map_arg(node.args, lambda arg: _env_arg(ctx, arg))
     assert isinstance(tensor, ast.AST)
     val = node.meta["val"]
     assert isinstance(val, torch.Tensor)
     shape = [*val.size()]
     # pyrefly: ignore [missing-attribute]
-    if node.args[0].meta["val"].ndim != len(shape):
-        broadcasting = [":"] * len(shape)
-        # pyrefly: ignore [missing-attribute]
-        for i in range(len(shape) - node.args[0].meta["val"].ndim):
-            broadcasting[i] = "None"
-        tensor = expr_from_string(
-            f"{{tensor}}[{', '.join(broadcasting)}]", tensor=tensor
+    input_val = node.args[0].meta["val"]
+    if input_val.ndim != len(shape):
+        tile_strategy = ctx.cg.device_function.tile_strategy
+        broadcasting = tile_strategy.broadcast_expand_dims(
+            tuple(input_val.shape), tuple(shape)
         )
+        if broadcasting:
+            tensor = expr_from_string(
+                f"{{tensor}}[{', '.join(broadcasting)}]", tensor=tensor
+            )
     shape_str = ctx.cg.device_function.tile_strategy.shape_str(shape)
     return expr_from_string(
         f"tl.broadcast_to({{tensor}}, {shape_str})",
@@ -939,14 +923,16 @@ def codegen_expand_pallas(ctx: LoweringContext, node: Node) -> object:
     assert isinstance(val, torch.Tensor)
     shape = [*val.size()]
     # pyrefly: ignore [missing-attribute]
-    if node.args[0].meta["val"].ndim != len(shape):
-        broadcasting = [":"] * len(shape)
-        # pyrefly: ignore [missing-attribute]
-        for i in range(len(shape) - node.args[0].meta["val"].ndim):
-            broadcasting[i] = "None"
-        tensor = expr_from_string(
-            f"{{tensor}}[{', '.join(broadcasting)}]", tensor=tensor
+    input_val = node.args[0].meta["val"]
+    if input_val.ndim != len(shape):
+        tile_strategy = ctx.cg.device_function.tile_strategy
+        broadcasting = tile_strategy.broadcast_expand_dims(
+            tuple(input_val.shape), tuple(shape)
         )
+        if broadcasting:
+            tensor = expr_from_string(
+                f"{{tensor}}[{', '.join(broadcasting)}]", tensor=tensor
+            )
     shape_str = ctx.cg.device_function.tile_strategy.shape_str(shape)
     return expr_from_string(
         f"jnp.broadcast_to({{tensor}}, {shape_str})",
@@ -1179,6 +1165,10 @@ def codegen_mm_cute(ctx: LoweringContext, node: Node) -> ast.AST:
         k_block_id = cute_resolve_active_block_id(
             ctx.cg, packed_node.meta["val"].shape[0]
         )
+    if k_block_id is None and packed_rhs is None:
+        remat = cute_rematerialize_rhs_at_contraction_block(ctx, lhs_node, rhs_node)
+        if remat is not None:
+            rhs, k_block_id = remat
     static_k_extent = (
         None
         if k_block_id is not None
@@ -1228,12 +1218,6 @@ def codegen_mm_cute(ctx: LoweringContext, node: Node) -> ast.AST:
     if direct_mma_result is not None:
         if _requested_tcgen05_flat_role_coordinates(ctx):
             _reject_tcgen05_flat_role_coordinates_fallback()
-        if _requested_tcgen05_pure_clc_scheduler_object(ctx):
-            _reject_tcgen05_pure_clc_scheduler_object_fallback()
-        if _requested_tcgen05_pure_dynamic_scheduler_object(ctx):
-            _reject_tcgen05_pure_dynamic_scheduler_object_fallback()
-        if _requested_tcgen05_direct_entry_plan(ctx):
-            _reject_tcgen05_direct_entry_plan_fallback()
         if _requested_pure_matmul_role_lifecycle(ctx):
             raise exc.BackendUnsupported(
                 "cute",
@@ -1251,12 +1235,6 @@ def codegen_mm_cute(ctx: LoweringContext, node: Node) -> ast.AST:
     if serial_result is not None:
         if _requested_tcgen05_flat_role_coordinates(ctx):
             _reject_tcgen05_flat_role_coordinates_fallback()
-        if _requested_tcgen05_pure_clc_scheduler_object(ctx):
-            _reject_tcgen05_pure_clc_scheduler_object_fallback()
-        if _requested_tcgen05_pure_dynamic_scheduler_object(ctx):
-            _reject_tcgen05_pure_dynamic_scheduler_object_fallback()
-        if _requested_tcgen05_direct_entry_plan(ctx):
-            _reject_tcgen05_direct_entry_plan_fallback()
         if _requested_pure_matmul_role_lifecycle(ctx):
             raise exc.BackendUnsupported(
                 "cute",
@@ -1277,12 +1255,25 @@ def codegen_mm_cute(ctx: LoweringContext, node: Node) -> ast.AST:
         )
     if _requested_tcgen05_flat_role_coordinates(ctx):
         _reject_tcgen05_flat_role_coordinates_fallback()
-    if _requested_tcgen05_pure_clc_scheduler_object(ctx):
-        _reject_tcgen05_pure_clc_scheduler_object_fallback()
-    if _requested_tcgen05_pure_dynamic_scheduler_object(ctx):
-        _reject_tcgen05_pure_dynamic_scheduler_object_fallback()
-    if _requested_tcgen05_direct_entry_plan(ctx):
-        _reject_tcgen05_direct_entry_plan_fallback()
+    lane_fold_k = cute_synthetic_lane_k_extent(ctx.cg, k_block_id)
+    if lane_fold_k is not None:
+        fold_result = emit_cute_synthetic_lane_fold_mm(
+            ctx,
+            lhs_node,
+            rhs_node,
+            k_extent=lane_fold_k,
+            acc=None,
+            out_dtype=effective_out_dtype,
+            acc_dtype=None,
+            lhs_dtype=lhs_node.meta["val"].dtype,
+            rhs_dtype=rhs_node.meta["val"].dtype,
+        )
+        if fold_result is not None:
+            return fold_result
+        raise exc.BackendUnsupported(
+            "cute",
+            "CuTe synthetic-lane K matmul fold only supports direct-load operands",
+        )
     return _emit_cute_matmul(
         ctx.cg,
         lhs,
@@ -1311,12 +1302,6 @@ def codegen_addmm_cute(ctx: LoweringContext, node: Node) -> ast.AST:
         return result
     if _requested_tcgen05_flat_role_coordinates(ctx):
         _reject_tcgen05_flat_role_coordinates_fallback()
-    if _requested_tcgen05_pure_clc_scheduler_object(ctx):
-        _reject_tcgen05_pure_clc_scheduler_object_fallback()
-    if _requested_tcgen05_pure_dynamic_scheduler_object(ctx):
-        _reject_tcgen05_pure_dynamic_scheduler_object_fallback()
-    if _requested_tcgen05_direct_entry_plan(ctx):
-        _reject_tcgen05_direct_entry_plan_fallback()
     if _requested_pure_matmul_role_lifecycle(ctx):
         raise exc.BackendUnsupported(
             "cute",
@@ -1370,12 +1355,25 @@ def codegen_addmm_cute(ctx: LoweringContext, node: Node) -> ast.AST:
             "cute",
             "CuTe scalar matmul fallback requires an active K tile or a K-invariant static shortcut",
         )
-    if _requested_tcgen05_pure_clc_scheduler_object(ctx):
-        _reject_tcgen05_pure_clc_scheduler_object_fallback()
-    if _requested_tcgen05_pure_dynamic_scheduler_object(ctx):
-        _reject_tcgen05_pure_dynamic_scheduler_object_fallback()
-    if _requested_tcgen05_direct_entry_plan(ctx):
-        _reject_tcgen05_direct_entry_plan_fallback()
+    lane_fold_k = cute_synthetic_lane_k_extent(ctx.cg, k_block_id)
+    if lane_fold_k is not None:
+        fold_result = emit_cute_synthetic_lane_fold_mm(
+            ctx,
+            lhs_node,
+            rhs_node,
+            k_extent=lane_fold_k,
+            acc=acc,
+            out_dtype=node.meta["val"].dtype if "val" in node.meta else None,
+            acc_dtype=acc_node.meta["val"].dtype,
+            lhs_dtype=lhs_node.meta["val"].dtype,
+            rhs_dtype=rhs_node.meta["val"].dtype,
+        )
+        if fold_result is not None:
+            return fold_result
+        raise exc.BackendUnsupported(
+            "cute",
+            "CuTe synthetic-lane K matmul fold only supports direct-load operands",
+        )
     return _emit_cute_matmul(
         ctx.cg,
         lhs,
@@ -1392,6 +1390,155 @@ def codegen_addmm_cute(ctx: LoweringContext, node: Node) -> ast.AST:
     )
 
 
+def _cute_baddbmm_result_reduced_over_block(
+    node: Node,
+    n_block_id: int,
+) -> bool:
+    """Whether *node*'s collapsed result is summed away over *n_block_id*.
+
+    The matmul's M (lhs free) and N (rhs free) axes collapse to ``n_block_id``,
+    so the standard fallback would compute only the diagonal.  Folding the N
+    reduction into the matmul (layout A) is correct *only* when N is genuinely
+    reduced out downstream.  This guard requires:
+
+    * ``n_block_id`` is a reduction block (allocated for a ``sum`` /
+      reduction), and a reduction node over it exists somewhere in the device
+      IR (the ``.sum(-1)``), and
+    * the baddbmm result does not escape to any non-passthrough consumer in its
+      own graph - either it is consumed only by a same-graph reduction over the
+      block, or it is purely loop-carried (its only users are the graph output
+      and/or pure casts), so the carried value reaches the downstream reduction.
+
+    Returns ``False`` otherwise, leaving the (unchanged) standard path.
+    """
+    from ..language._tracing_ops import _new_var
+    from .host_function import HostFunction
+    from .inductor_lowering import ReductionLowering
+
+    env = CompileEnvironment.current()
+    canonical_block_id = getattr(env, "canonical_block_id", lambda block_id: block_id)
+    target_canonical = canonical_block_id(n_block_id)
+
+    if not env.block_sizes[n_block_id].reduction:
+        return False
+
+    # A reduction over the (canonical) N block must exist in the device IR.
+    device_ir = HostFunction.current().device_ir
+    has_block_reduction = False
+    for graph_info in getattr(device_ir, "graphs", ()):
+        graph = getattr(graph_info, "graph", None)
+        if not isinstance(graph, torch.fx.Graph):
+            continue
+        for other in graph.nodes:
+            lowering = other.meta.get("lowering")
+            if (
+                isinstance(lowering, ReductionLowering)
+                and canonical_block_id(lowering.block_index) == target_canonical
+            ):
+                has_block_reduction = True
+                break
+        if has_block_reduction:
+            break
+    if not has_block_reduction:
+        return False
+
+    passthrough = {
+        torch.ops.aten.clone.default,
+        torch.ops.aten.detach.default,
+        torch.ops.aten.to.dtype,
+        torch.ops.prims.convert_element_type.default,
+        _new_var,
+    }
+
+    # Walk forward inside the baddbmm's own graph; the result must not reach any
+    # non-passthrough consumer other than a reduction over the block or the
+    # graph output (loop carry).
+    seen: set[Node] = set()
+    stack: list[Node] = [node]
+    while stack:
+        cur = stack.pop()
+        for user in cur.users:
+            if not isinstance(user, Node) or user in seen:
+                continue
+            seen.add(user)
+            if len(seen) > 64:
+                return False
+            if user.op == "output":
+                continue
+            lowering = user.meta.get("lowering")
+            if (
+                isinstance(lowering, ReductionLowering)
+                and canonical_block_id(lowering.block_index) == target_canonical
+            ):
+                continue
+            if user.op == "call_function" and user.target in passthrough:
+                stack.append(user)
+                continue
+            return False
+    return True
+
+
+def _maybe_codegen_cute_baddbmm_n_collapse(
+    ctx: LoweringContext,
+    node: Node,
+    *,
+    lhs: ast.AST | CutePackedAffineLoad,
+    acc: ast.AST,
+    lhs_node: Node,
+    rhs_node: Node,
+    acc_node: Node,
+    k_block_id: int | None,
+    static_k_extent: int | None,
+) -> ast.AST | None:
+    """Layout (A) for a static-M==N-collapse baddbmm reduced over N.
+
+    See ``cute_static_mn_collapse_n_block_id`` /
+    ``_emit_cute_matmul_n_collapse``.  Returns ``None`` (caller keeps the
+    standard path) unless the tightly-gated pattern holds: the lhs M axis and
+    rhs N axis share a block id and the result is summed away over that block.
+    """
+    if not isinstance(lhs, ast.AST):
+        return None
+    n_block_id = cute_static_mn_collapse_n_block_id(ctx.cg, lhs_node, rhs_node)
+    if n_block_id is None:
+        return None
+    if not _cute_baddbmm_result_reduced_over_block(node, n_block_id):
+        return None
+    env = CompileEnvironment.current()
+    size_hint = getattr(env, "size_hint", None)
+    n_size = rhs_node.meta["val"].shape[-1]
+    n_extent = size_hint(n_size) if callable(size_hint) else int(n_size)
+    if not isinstance(n_extent, int) or n_extent <= 0:
+        return None
+
+    def rhs_at_n(n_var: str) -> ast.AST:
+        rematerialized = cute_rematerialize_rhs_at_index_override(
+            ctx, rhs_node, n_block_id, n_var
+        )
+        if rematerialized is None:
+            raise exc.BackendUnsupported(
+                "cute",
+                "CuTe static-MN-collapse baddbmm could not re-materialize the rhs "
+                "at the serial N index",
+            )
+        return rematerialized
+
+    return _emit_cute_matmul_n_collapse(
+        ctx.cg,
+        lhs,
+        rhs_at_n=rhs_at_n,
+        n_extent=n_extent,
+        k_block_id=k_block_id,
+        static_k_extent=static_k_extent,
+        acc=acc,
+        acc_dtype=acc_node.meta["val"].dtype,
+        lhs_dtype=lhs_node.meta["val"].dtype,
+        rhs_dtype=rhs_node.meta["val"].dtype,
+        lhs_node=lhs_node,
+        rhs_node=rhs_node,
+    )
+
+
 @baddbmm_lowering.register_codegen("cute")
 def codegen_baddbmm_cute(ctx: LoweringContext, node: Node) -> ast.AST:
     assert not node.kwargs, "baddbmm kwargs not supported"
@@ -1402,12 +1549,6 @@ def codegen_baddbmm_cute(ctx: LoweringContext, node: Node) -> ast.AST:
         return result
     if _requested_tcgen05_flat_role_coordinates(ctx):
         _reject_tcgen05_flat_role_coordinates_fallback()
-    if _requested_tcgen05_pure_clc_scheduler_object(ctx):
-        _reject_tcgen05_pure_clc_scheduler_object_fallback()
-    if _requested_tcgen05_pure_dynamic_scheduler_object(ctx):
-        _reject_tcgen05_pure_dynamic_scheduler_object_fallback()
-    if _requested_tcgen05_direct_entry_plan(ctx):
-        _reject_tcgen05_direct_entry_plan_fallback()
     if _requested_pure_matmul_role_lifecycle(ctx):
         raise exc.BackendUnsupported(
             "cute",
@@ -1460,6 +1601,38 @@ def codegen_baddbmm_cute(ctx: LoweringContext, node: Node) -> ast.AST:
         raise exc.BackendUnsupported(
             "cute",
             "CuTe scalar matmul fallback requires an active K tile or a K-invariant static shortcut",
+        )
+    n_collapse_result = _maybe_codegen_cute_baddbmm_n_collapse(
+        ctx,
+        node,
+        lhs=lhs,
+        acc=acc,
+        lhs_node=lhs_node,
+        rhs_node=rhs_node,
+        acc_node=acc_node,
+        k_block_id=k_block_id,
+        static_k_extent=static_k_extent,
+    )
+    if n_collapse_result is not None:
+        return n_collapse_result
+    lane_fold_k = cute_synthetic_lane_k_extent(ctx.cg, k_block_id)
+    if lane_fold_k is not None:
+        fold_result = emit_cute_synthetic_lane_fold_mm(
+            ctx,
+            lhs_node,
+            rhs_node,
+            k_extent=lane_fold_k,
+            acc=acc,
+            out_dtype=node.meta["val"].dtype if "val" in node.meta else None,
+            acc_dtype=acc_node.meta["val"].dtype,
+            lhs_dtype=lhs_node.meta["val"].dtype,
+            rhs_dtype=rhs_node.meta["val"].dtype,
+        )
+        if fold_result is not None:
+            return fold_result
+        raise exc.BackendUnsupported(
+            "cute",
+            "CuTe synthetic-lane K matmul fold only supports direct-load operands",
         )
     return _emit_cute_matmul(
         ctx.cg,
@@ -1563,6 +1736,112 @@ def codegen_iota_pallas(ctx: LoweringContext, node: Node) -> object:
         start=node.kwargs.get("start", 0),
         step=node.kwargs.get("step", 1),
         dtype=_node_dtype_kwarg(node),
+    )
+
+
+def _cute_compacted_tile_begin_lane_expr(
+    ctx: LoweringContext,
+    source_node: Node,
+    start: object,
+    step: object,
+    dtype: torch.dtype,
+) -> ast.AST | None:
+    """Resolve ``hl.arange(block // F)`` to the tile-local lane ``lane // F``.
+
+    Handles the compacted sub-block store ``out[tile.begin + hl.arange(block //
+    F)] = split_result`` where the value is a spread/compacted tile whose element
+    on lane ``t`` is the ``t // F`` piece. The arange must contribute only the
+    tile-local coordinate ``lane // F`` because ``tile.begin`` is added
+    explicitly; resolving it to the global ``index_var // F`` would fold the
+    tile's offset in twice. Returns ``None`` unless the pattern matches.
+    """
+    from .cute.cute_reshape import _get_block_local_coord
+    from .cute.iota_utils import cute_free_arange_compacted_tile_begin_factor
+    from .generate_ast import GenerateAST
+
+    assert isinstance(ctx.cg, GenerateAST)
+    cg = ctx.cg
+    match = cute_free_arange_compacted_tile_begin_factor(source_node, cg)
+    if match is None:
+        return None
+    block_id, factor = match
+    local_coord = _get_block_local_coord(cg, block_id)
+    if local_coord is None:
+        return None
+    expr = f"({local_coord}) // cutlass.Int32({factor})"
+    return _wrap_iota_coord_expr(ctx, expr, start, step, dtype)
+
+
+def _cute_free_arange_axis_expr(
+    cg: GenerateAST,
+    source_node: Node,
+    length_hint: int | None,
+    start: object,
+    step: object,
+) -> str | None:
+    """Map a free/unbound ``hl.arange`` index dim onto a synthetic thread axis.
+
+    Returns the per-thread coordinate expression (``thread_idx()[axis]``) when
+    ``source_node`` is an iota that flows into a load/store index but is bound
+    to no tile/reduction/grid axis. Returns ``None`` otherwise so the caller
+    keeps its existing (raising) behavior — this keeps the synthetic-axis path
+    a strict no-op for every already-supported arange.
+    """
+    if not isinstance(length_hint, int) or length_hint <= 0:
+        return None
+    if not cute_iota_is_free_memory_index(source_node, cg):
+        return None
+    # The synthetic axis is keyed by the size of the tensor dimension this
+    # arange indexes. Two arange dims that address the same logical dimension (the
+    # load and store ``hl.arange(k)`` over a K-sized axis) share one axis so a
+    # value loaded on a lane is stored back on that lane, while a cartesian
+    # ``row``/``col`` pair addressing differently-sized dims gets distinct axes.
+    # ``length``/``start``/``step`` round out the key so two distinct arange dims
+    # that happen to index equal-sized dims still separate.
+    dim_key = cute_free_arange_indexed_dim_key(source_node, cg)
+    if dim_key is None:
+        return None
+    key = (
+        dim_key,
+        length_hint,
+        _arange_endpoint_key(start),
+        _arange_endpoint_key(step),
+    )
+    return cg.allocate_cute_synthetic_arange_coord(key, length_hint)
+
+
+def _arange_endpoint_key(value: object) -> object:
+    if isinstance(value, int):
+        return value
+    if isinstance(value, torch.SymInt):
+        return str(value._sympy_())
+    return repr(value)
+
+
+def _wrap_iota_coord_expr(
+    ctx: LoweringContext,
+    coord_expr: str,
+    start: object,
+    step: object,
+    dtype: torch.dtype,
+) -> ast.AST:
+    """Apply ``start``/``step``/``dtype`` to a per-thread iota coordinate.
+
+    Mirrors the trailing wrapping ``_cute_iota_expr`` applies to a resolved
+    block-id coordinate so the synthetic-axis path produces identical
+    ``start + step * coord`` arithmetic.
+    """
+    expr = coord_expr
+    if step != 1:
+        expr = f"{{step}} * ({expr})"
+    if start != 0:
+        expr = f"{{start}} + ({expr})"
+    if dtype != torch.int32:
+        expr = f"{CompileEnvironment.current().backend.dtype_str(dtype)}({expr})"
+    return expr_from_string(
+        expr,
+        start=ctx.to_ast(start),
+        step=ctx.to_ast(step),
     )
 
 
@@ -1732,6 +2011,12 @@ def _cute_iota_expr(
     if block_id is None:
         if (affine_range := match_cute_affine_range_iota(source_node)) is not None:
             return affine_range
+    if (
+        compacted := _cute_compacted_tile_begin_lane_expr(
+            ctx, source_node, start, step, dtype
+        )
+    ) is not None:
+        return compacted
     if "val" in source_node.meta:
         fake_val = source_node.meta["val"]
         if isinstance(fake_val, torch.Tensor) and fake_val.ndim == 1:
@@ -1778,6 +2063,12 @@ def _cute_iota_expr(
                 "cute.make_identity_tensor({length})",
                 length=ctx.to_ast(length_arg),
             )
+        if (
+            synthetic := _cute_free_arange_axis_expr(
+                cg, source_node, length_hint, start, step
+            )
+        ) is not None:
+            return _wrap_iota_coord_expr(ctx, synthetic, start, step, dtype)
         raise exc.BackendUnsupported(
             "cute",
             "hl.arange() requires an active tile/reduction axis in cute kernels",
@@ -1834,6 +2125,12 @@ def _cute_iota_expr(
                 "cute.make_identity_tensor({length})",
                 length=ctx.to_ast(length_arg),
             )
+        elif (
+            synthetic := _cute_free_arange_axis_expr(
+                cg, source_node, length_hint, start, step
+            )
+        ) is not None:
+            return _wrap_iota_coord_expr(ctx, synthetic, start, step, dtype)
         else:
             raise exc.BackendUnsupported(
                 "cute",

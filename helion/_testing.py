@@ -16,6 +16,7 @@ from types import SimpleNamespace
 from typing import TYPE_CHECKING
 from typing import Callable
 from typing import Generator
+from typing import NamedTuple
 from typing import ParamSpec
 from typing import Sequence
 from typing import TypeVar
@@ -26,6 +27,7 @@ from unittest.mock import patch
 import pytest
 import torch
 import torch.distributed as dist
+import torch.nn.functional
 from torch.utils._pytree import tree_map
 
 from ._compat import get_mtia_tunable_fragments
@@ -64,6 +66,11 @@ if TYPE_CHECKING:
 
 _R = TypeVar("_R")
 _P = ParamSpec("_P")
+
+
+class CosSimilarity(NamedTuple):
+    dim: int
+    min_similarity: float
 
 
 def _strip_launcher_args(value: str) -> str:
@@ -106,6 +113,12 @@ def skipIfFn(
     Works on both test methods and test classes. When applied to a class,
     wraps setUp to check the skip condition before each test runs.
     """
+
+    if not isinstance(reason, str):
+        raise TypeError(
+            f"Decorator using skipIfFn requires a reason string argument, got {type(reason).__name__}. "
+            "Make sure to call the decorator with parentheses, e.g. @decorator('reason') or @decorator()"
+        )
 
     def decorator(test_item: Callable) -> Callable:
         if isinstance(test_item, type):
@@ -384,12 +397,14 @@ def default_cute_mma_support(
     supported_impls: tuple[str, ...] = ("universal", "warp", "tcgen05"),
     warp_f16bf16: bool = True,
     tcgen05_f16bf16: bool = True,
+    tcgen05_f8: bool = True,
 ) -> SimpleNamespace:
     """Return a ``get_cute_mma_support()`` mock with tcgen05-on defaults."""
     return SimpleNamespace(
         supported_impls=supported_impls,
         warp_f16bf16=warp_f16bf16,
         tcgen05_f16bf16=tcgen05_f16bf16,
+        tcgen05_f8=tcgen05_f8,
     )
 
 
@@ -414,6 +429,23 @@ def patch_cute_mma_support(
         ),
     ):
         yield support
+
+
+@contextlib.contextmanager
+def float32_matmul_precision(precision: str) -> Generator[None, None, None]:
+    """Context manager to temporarily set the float32 matrix multiplication precision.
+
+    The original `torch.float32_matmul_precision` setting is restored upon exiting the context.
+
+    Args:
+        precision: The precision level to set ("highest", "high", or "medium").
+    """
+    original_precision = torch.get_float32_matmul_precision()
+    torch.set_float32_matmul_precision(precision)
+    try:
+        yield
+    finally:
+        torch.set_float32_matmul_precision(original_precision)
 
 
 def skipIfNotTriton(reason: str) -> Callable[[Callable], Callable]:
@@ -1256,6 +1288,7 @@ def run_example(
                     )
 
                     if baseline_grad is not None:
+                        assert tensor.grad is not None
                         torch.testing.assert_close(
                             tensor.grad.to(torch.float32),
                             baseline_grad.to(torch.float32),
@@ -1347,6 +1380,7 @@ def _assert_example_result_close(
     skip_accuracy: bool,
     atol: float,
     rtol: float,
+    cos_sim: CosSimilarity | tuple[int, float] | None = None,
 ) -> None:
     if skip_accuracy:
         return
@@ -1362,9 +1396,19 @@ def _assert_example_result_close(
         assert isinstance(got, torch.Tensor) and isinstance(exp, torch.Tensor), (
             f"Type mismatch: got {type(got)}, expected {type(exp)}"
         )
+        got_f32 = got.to(torch.float32)
+        exp_f32 = exp.to(torch.float32)
+
+        if cos_sim is not None:
+            dim, min_sim = cos_sim
+            sim = torch.nn.functional.cosine_similarity(got_f32, exp_f32, dim=dim)
+            assert sim.mean().item() >= min_sim, (
+                f"Cosine similarity {sim.mean().item()} is less than {min_sim}"
+            )
+
         torch.testing.assert_close(
-            got.to(torch.float32),
-            exp.to(torch.float32),
+            got_f32,
+            exp_f32,
             atol=atol,
             rtol=rtol,
         )
@@ -1394,6 +1438,7 @@ def check_example(
     atol: float = 1e-1,
     rtol: float = 1e-2,
     emit_code: bool = True,
+    cos_sim: CosSimilarity | tuple[int, float] | None = None,
     **kwargs: object,
 ) -> str:
     """Helper used in unit tests to run a single example kernel and check its output."""
@@ -1413,7 +1458,12 @@ def check_example(
             **kwargs,
         )
     _assert_example_result_close(
-        result, expected, skip_accuracy=skip_accuracy, atol=atol, rtol=rtol
+        result,
+        expected,
+        skip_accuracy=skip_accuracy,
+        atol=atol,
+        rtol=rtol,
+        cos_sim=cos_sim,
     )
     return code
 

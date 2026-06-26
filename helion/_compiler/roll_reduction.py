@@ -22,6 +22,7 @@ from ..language._tracing_ops import _if
 from ..language._tracing_ops import is_for_loop_target
 from ..language.matmul_ops import dot as hl_dot
 from ..language.matmul_ops import dot_scaled as hl_dot_scaled
+from ..language.memory_ops import load
 from ..language.memory_ops import store
 from ..language.reduce_ops import _reduce
 from ..language.view_ops import join as hl_join
@@ -394,6 +395,69 @@ class ReductionRoller:
             return False
 
         return any(is_matmul_with_rdim(node) for node in graph.nodes)
+
+    def has_unrollable_reduction(self, graph: torch.fx.Graph) -> bool:
+        """Check if a graph reduces over the rdim along a non-tile axis.
+
+        A reduction can only be rolled into a loop when the dimension being
+        reduced is indexed by a re-bindable block index var (e.g. a ``hl.tile``
+        axis or a ``[..., :]`` slice), so the producing load can be re-indexed
+        in ``_REDUCTION_BLOCK``-sized chunks inside the loop. A dimension
+        indexed by ``hl.arange(n)`` instead carries a fixed full-extent
+        ``iota`` index that cannot be re-bound per loop iteration, so rolling
+        would leave the full-extent load outside the loop and emit a shape
+        mismatch (issue #2643). Such reductions must stay persistent.
+
+        Detected by walking back from each reduction over ``self.rdim`` to the
+        loads feeding it and checking whether any is indexed by an ``iota``
+        node sized to the rdim. The output-shape of the load is not a reliable
+        signal: when the arange size coincides with another reduction of the
+        same size, ``allocate_reduction_dimension`` unifies them and the load
+        axis surfaces as the rdim symbol rather than a concrete int.
+        """
+        env = CompileEnvironment.current()
+        rdim_block_id = self.rdim.block_id
+
+        def is_rdim_iota(node: object) -> bool:
+            if not (
+                isinstance(node, torch.fx.Node)
+                and node.op == "call_function"
+                and node.target is torch.ops.prims.iota.default
+            ):
+                return False
+            val = node.meta.get("val", None)
+            return isinstance(val, torch.Tensor) and any(
+                env.resolve_block_id(size) == rdim_block_id for size in val.size()
+            )
+
+        def is_iota_indexed_load(node: torch.fx.Node) -> bool:
+            if node.target is not load:
+                return False
+            # load(tensor, index_list, ...): an iota in the index list cannot
+            # be re-indexed in chunks inside the reduction loop.
+            for arg in node.args:
+                entries = arg if isinstance(arg, (list, tuple)) else (arg,)
+                if any(is_rdim_iota(entry) for entry in entries):
+                    return True
+            return False
+
+        def depends_on_iota_indexed_load(reduction: torch.fx.Node) -> bool:
+            seen: set[torch.fx.Node] = set()
+            stack = list(reduction.all_input_nodes)
+            while stack:
+                node = stack.pop()
+                if node in seen:
+                    continue
+                seen.add(node)
+                if node.op == "call_function" and is_iota_indexed_load(node):
+                    return True
+                stack.extend(node.all_input_nodes)
+            return False
+
+        return any(
+            self.is_reduction(node) and depends_on_iota_indexed_load(node)
+            for node in graph.nodes
+        )
 
     def has_stack_tensor_with_rdim(self, graph: torch.fx.Graph) -> bool:
         """Check if a graph contains stack tensors with rdim inputs."""

@@ -13,6 +13,7 @@ from .local_cache import StrictLocalAutotuneCache
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
+    from typing import Callable
 
     from .base_search import BaseSearch
 
@@ -92,8 +93,13 @@ class RemoteAutotuneCache(LocalAutotuneCache):
     On *put*: write to both local and remote.
     """
 
-    def __init__(self, autotuner: BaseSearch) -> None:
-        super().__init__(autotuner)
+    def __init__(
+        self,
+        autotuner: BaseSearch,
+        *,
+        autotuner_factory: Callable[[], BaseSearch] | None = None,
+    ) -> None:
+        super().__init__(autotuner, autotuner_factory=autotuner_factory)
         self._backend = _load_remote_backend()
 
     def get(self) -> Config | None:
@@ -124,8 +130,13 @@ class RemoteAutotuneCache(LocalAutotuneCache):
 class StrictRemoteAutotuneCache(StrictLocalAutotuneCache):
     """Strict local cache extended with a remote read-through / write-through layer."""
 
-    def __init__(self, autotuner: BaseSearch) -> None:
-        super().__init__(autotuner)
+    def __init__(
+        self,
+        autotuner: BaseSearch,
+        *,
+        autotuner_factory: Callable[[], BaseSearch] | None = None,
+    ) -> None:
+        super().__init__(autotuner, autotuner_factory=autotuner_factory)
         self._backend = _load_remote_backend()
 
     def get(self) -> Config | None:

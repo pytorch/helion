@@ -23,15 +23,15 @@ from .._compiler.ast_extension import ExtendedAST
 from .._compiler.ast_extension import LoopType
 from .._compiler.ast_extension import expr_from_string
 from .._compiler.compile_environment import CompileEnvironment
-from .._compiler.type_propagation import GridIndexType
-from .._compiler.type_propagation import IterType
-from .._compiler.type_propagation import JaggedTileIndexType
-from .._compiler.type_propagation import LiteralType
-from .._compiler.type_propagation import Origin
-from .._compiler.type_propagation import SequenceType
-from .._compiler.type_propagation import TensorType
-from .._compiler.type_propagation import TileIndexType
-from .._compiler.type_propagation import TypeInfo
+from .._compiler.type_info import GridIndexType
+from .._compiler.type_info import IterType
+from .._compiler.type_info import JaggedTileIndexType
+from .._compiler.type_info import LiteralType
+from .._compiler.type_info import Origin
+from .._compiler.type_info import SequenceType
+from .._compiler.type_info import TensorType
+from .._compiler.type_info import TileIndexType
+from .._compiler.type_info import TypeInfo
 from .._compiler.variable_origin import GetItemOrigin
 from ..autotuner.config_spec import ConfigSpec
 from ..autotuner.config_spec import FlattenLoopSpec
@@ -150,8 +150,7 @@ def tile(
                         acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
                     out[tile_m, tile_n] = acc
 
-
-            return out
+                return out
 
         Fixed block size:
 

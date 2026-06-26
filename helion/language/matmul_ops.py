@@ -24,17 +24,12 @@ from .._compiler.cute.matmul_utils import cute_resolve_active_block_id
 from .._compiler.cute.matmul_utils import cute_resolve_active_matmul_k_block_id
 from .._compiler.cute.matmul_utils import cute_static_k_invariant_extent
 from .._compiler.cute.strategies import is_pure_matmul_role_lifecycle_config
-from .._compiler.cute.tcgen05_constants import TCGEN05_DIRECT_ENTRY_PLAN_CONFIG_KEY
 from .._compiler.cute.tcgen05_constants import TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY
-from .._compiler.cute.tcgen05_constants import (
-    TCGEN05_PURE_CLC_SCHEDULER_OBJECT_CONFIG_KEY,
-)
-from .._compiler.cute.tcgen05_constants import (
-    TCGEN05_PURE_DYNAMIC_SCHEDULER_OBJECT_CONFIG_KEY,
-)
 from .._compiler.cute.tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_M
 from .._compiler.cute.tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_N
 from .._compiler.cute.tcgen05_constants import TCGEN05_TWO_CTA_EDGE_K_TAIL_MIN_DIM
+from .._compiler.cute.tcgen05_constants import TCGEN05_TWO_CTA_FP8_SMALL_GRID_BLOCK_M
+from .._compiler.cute.tcgen05_constants import TCGEN05_TWO_CTA_FP8_SMALL_GRID_BLOCK_N
 from .._compiler.cute.tcgen05_constants import TCGEN05_TWO_CTA_MAX_K_TILES
 from .._compiler.matmul_utils import _compute_out_dtype
 from .._compiler.matmul_utils import _emit_pallas_matmul
@@ -79,28 +74,6 @@ def _requested_tcgen05_flat_role_coordinates(state: CodegenState) -> bool:
         state.device_function.config.get(
             TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY, False
         )
-    )
-
-
-def _requested_tcgen05_pure_clc_scheduler_object(state: CodegenState) -> bool:
-    return bool(
-        state.device_function.config.get(
-            TCGEN05_PURE_CLC_SCHEDULER_OBJECT_CONFIG_KEY, False
-        )
-    )
-
-
-def _requested_tcgen05_pure_dynamic_scheduler_object(state: CodegenState) -> bool:
-    return bool(
-        state.device_function.config.get(
-            TCGEN05_PURE_DYNAMIC_SCHEDULER_OBJECT_CONFIG_KEY, False
-        )
-    )
-
-
-def _requested_tcgen05_direct_entry_plan(state: CodegenState) -> bool:
-    return bool(
-        state.device_function.config.get(TCGEN05_DIRECT_ENTRY_PLAN_CONFIG_KEY, False)
     )
 
 
@@ -347,22 +320,28 @@ def enforce_dot_requirements(lhs: torch.Tensor, rhs: torch.Tensor) -> None:
             rhs_dtype=rhs.dtype,
         )
     )
+    # tcgen05 MMA-K is 16 elements for BF16/FP16 but 32 for FP8 (e4m3); the
+    # block_k search granularity and minimum must follow the active dtype.
+    is_fp8 = lhs.dtype == torch.float8_e4m3fn
+    mma_k = 32 if is_fp8 else 16
     if (
         env.backend_name == "cute"
         and lhs.ndim == 2
         and rhs.ndim == 2
-        and lhs.dtype in (torch.float16, torch.bfloat16)
+        and lhs.dtype in (torch.float16, torch.bfloat16, torch.float8_e4m3fn)
         and rhs.dtype == lhs.dtype
         and static_m is not None
         and static_n is not None
         and static_k is not None
         and static_m >= 64
         and static_n >= 8
-        and static_k >= 16
+        and static_k >= mma_k
     ):
         from .._compiler.cute.mma_support import get_cute_mma_support
 
-        if get_cute_mma_support().tcgen05_f16bf16:
+        support = get_cute_mma_support()
+        tcgen05_supported = support.tcgen05_f8 if is_fp8 else support.tcgen05_f16bf16
+        if tcgen05_supported:
 
             def pow2_floor_at_least(value: int, minimum: int) -> int:
                 return 1 << (max(minimum, value).bit_length() - 1)
@@ -371,8 +350,9 @@ def enforce_dot_requirements(lhs: torch.Tensor, rhs: torch.Tensor) -> None:
             max_tcgen05_m = 256 if max_tcgen05_n >= 128 and static_m >= 256 else 128
             # Larger tile_k packs more cute.gemm instructions per K loop
             # iteration on tcgen05 (mma instruction K is fixed at 16 for
-            # BF16/FP16). Cap at 128 to keep AB SMEM staging budget sane.
-            max_tcgen05_k = min(128, pow2_floor_at_least(static_k, 16))
+            # BF16/FP16, 32 for FP8). Cap at 128 to keep AB SMEM staging
+            # budget sane.
+            max_tcgen05_k = min(128, pow2_floor_at_least(static_k, mma_k))
             max_search_m = min(max_tcgen05_m, pow2_floor_at_least(static_m, 64))
             max_search_n = max_tcgen05_n
             max_search_k = max_tcgen05_k
@@ -427,24 +407,62 @@ def enforce_dot_requirements(lhs: torch.Tensor, rhs: torch.Tensor) -> None:
                 and two_cta_n_edge
                 and two_cta_k_tail
             )
-            allow_cluster_m2_search = (
-                allow_full_tile_cluster_m2_search or allow_edge_cluster_m2_search
+            # fp8 small-grid CtaGroup.TWO family: the fp8-validated bm=128
+            # (per-CTA 64xbn) 2-CTA tile keeps the 2-CTA A-multicast but needs
+            # only a 128x128 cluster tile, so it admits small/wave-limited fp8
+            # GEMMs (e.g. 512x2048x4096) that the bm=256 full tile underfills.
+            # Gated to fp8 + static-full persistent (same envelope as the full
+            # tile) and only requires the search space to reach bm/bn=128.
+            allow_fp8_small_grid_cluster_m2_search = (
+                is_fp8
+                and allow_full_tile_persistent_pid_types
+                and max_search_m >= TCGEN05_TWO_CTA_FP8_SMALL_GRID_BLOCK_M
+                and max_search_n >= TCGEN05_TWO_CTA_FP8_SMALL_GRID_BLOCK_N
+                and static_k <= max_cluster_m2_search_k
             )
-            # Small-shape wave-quantization gate. Suppress cluster_m=2
-            # search when the cluster_m=2 work-cluster count cannot fill
-            # one wave of cluster slots (``num_sms // 2``); the persistent
-            # warp-spec prologue dominates and cluster_m=1 wins. ``num_sms
-            # == 0`` (non-CUDA / mocked) keeps search live. See
-            # cute_plan.md §7.6.3.2 for the NCU rationale and B200 numbers.
+            allow_cluster_m2_search = (
+                allow_full_tile_cluster_m2_search
+                or allow_edge_cluster_m2_search
+                or allow_fp8_small_grid_cluster_m2_search
+            )
+            # Small-shape wave-quantization gate. Suppress cluster_m=2 search
+            # only for genuinely tiny problems that cannot fill a meaningful
+            # fraction of the device; below that the persistent warp-spec
+            # prologue dominates and cluster_m=1 wins. The original gate used
+            # ``num_sms // 2`` (one full wave of 2-SM cluster slots), but that
+            # was calibrated for the DEFAULT-layout cluster_m=2 path. The
+            # generalized TVM-FFI direct entry (see
+            # ``CuteTcgen05ClusterM2FfiHeuristic``) has a much lower launch +
+            # epilogue overhead, which shifts the cluster_m=1/2 crossover well
+            # below one wave: full-autotune A/B on B200 shows cluster_m=2 + FFI
+            # winning at 64 work clusters (1024x4096x1024 and 2048^3, ~64
+            # clusters on the 148-SM B200 = 0.86 of a wave) by 7-21% over
+            # cluster_m=1. Use ``num_sms // 4`` so those validated shapes are
+            # admitted on current and larger Blackwell SKUs while still
+            # suppressing the truly tiny shapes (fewer than a quarter-wave of
+            # cluster slots) that have no FFI coverage. ``num_sms == 0`` (non-CUDA / mocked) keeps search
+            # live. See cute_plan.md §7.6.3.2 for the original NCU rationale.
             if allow_cluster_m2_search:
                 num_sms_for_cm2_threshold = _cuda_num_sms_or_zero(lhs.device)
                 if num_sms_for_cm2_threshold > 0:
-                    cm2_work_clusters = (static_m // TCGEN05_TWO_CTA_BLOCK_M) * (
-                        static_n // TCGEN05_TWO_CTA_BLOCK_N
+                    # Count work clusters with the smallest reachable cluster
+                    # tile so the gate reflects the actual parallelism. The fp8
+                    # small-grid family forms 128x128 clusters (4x as many tiles
+                    # as the 256x256 full tile), so a shape that underfills the
+                    # full tile can still fill the device via small-grid.
+                    if allow_fp8_small_grid_cluster_m2_search:
+                        cm2_cluster_m = TCGEN05_TWO_CTA_FP8_SMALL_GRID_BLOCK_M
+                        cm2_cluster_n = TCGEN05_TWO_CTA_FP8_SMALL_GRID_BLOCK_N
+                    else:
+                        cm2_cluster_m = TCGEN05_TWO_CTA_BLOCK_M
+                        cm2_cluster_n = TCGEN05_TWO_CTA_BLOCK_N
+                    cm2_work_clusters = (static_m // cm2_cluster_m) * (
+                        static_n // cm2_cluster_n
                     )
-                    cm2_one_wave_slots = num_sms_for_cm2_threshold // 2
-                    if cm2_work_clusters < cm2_one_wave_slots:
+                    cm2_min_clusters = num_sms_for_cm2_threshold // 4
+                    if cm2_work_clusters < cm2_min_clusters:
                         allow_cluster_m2_search = False
+                        allow_fp8_small_grid_cluster_m2_search = False
             # Narrow the autotune search to tcgen05 configs that have been
             # validated to compile and run correctly on B200. Static full-tile
             # single-root role-local persistent kernels have coverage, so the
@@ -481,6 +499,7 @@ def enforce_dot_requirements(lhs: torch.Tensor, rhs: torch.Tensor) -> None:
                 allow_cluster_m2_search=allow_cluster_m2_search,
                 cluster_m2_static_k=static_k if allow_cluster_m2_search else None,
                 allow_cluster_m2_edge_k_tail_family=allow_edge_cluster_m2_search,
+                allow_cluster_m2_fp8_small_grid=allow_fp8_small_grid_cluster_m2_search,
                 ab_stages_three_dtype_bytes=ab_dtype_bytes,
                 ab_stages_three_device=lhs.device,
             )
@@ -493,7 +512,7 @@ def enforce_dot_requirements(lhs: torch.Tensor, rhs: torch.Tensor) -> None:
                 if block_idx is None:
                     continue
                 if axis_name == "k":
-                    min_size = 16
+                    min_size = mma_k
                 elif axis_name == "m":
                     min_size = min_search_m
                 else:
@@ -699,24 +718,6 @@ def _(state: CodegenState) -> object:
             "cute",
             f"{TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY}=True requires "
             "hl.dot to lower through the tcgen05 K-loop path",
-        )
-    if _requested_tcgen05_pure_clc_scheduler_object(state):
-        raise exc.BackendUnsupported(
-            "cute",
-            f"{TCGEN05_PURE_CLC_SCHEDULER_OBJECT_CONFIG_KEY}=True requires "
-            "hl.dot to lower through the tcgen05 K-loop path",
-        )
-    if _requested_tcgen05_pure_dynamic_scheduler_object(state):
-        raise exc.BackendUnsupported(
-            "cute",
-            f"{TCGEN05_PURE_DYNAMIC_SCHEDULER_OBJECT_CONFIG_KEY}=True "
-            "requires hl.dot to lower through the tcgen05 K-loop path",
-        )
-    if _requested_tcgen05_direct_entry_plan(state):
-        raise exc.BackendUnsupported(
-            "cute",
-            f"{TCGEN05_DIRECT_ENTRY_PLAN_CONFIG_KEY}=True requires hl.dot "
-            "to lower through the tcgen05 K-loop path",
         )
     dot_lhs_node = (
         state.fx_node.args[0]

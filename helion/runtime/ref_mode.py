@@ -488,23 +488,29 @@ class RefModeTorchFunctionMode(BaseTorchFunctionMode):
         is_tuple = isinstance(indices, tuple)
         indices_list = list(indices) if is_tuple else [indices]
 
-        valid_mask: torch.Tensor | None = None
+        # Clamp int-tensor indices and record which were in bounds
+        bounds_mask: torch.Tensor | None = None
+        mask_out_pos = 0
         for dim, idx in enumerate(indices_list):
+            if isinstance(idx, int):
+                continue
             if self._is_int_tensor(idx):
                 max_idx = tensor.size(dim) - 1
-                dim_valid = (idx >= 0) & (idx <= max_idx)
-                valid_mask = (
-                    dim_valid if valid_mask is None else (valid_mask & dim_valid)
+                dim_mask = (idx >= 0) & (idx <= max_idx)
+                bounds_mask = (
+                    dim_mask if bounds_mask is None else (bounds_mask & dim_mask)
                 )
                 indices_list[dim] = torch.clamp(idx, min=0, max=max_idx)
+            elif bounds_mask is None:
+                mask_out_pos += 1
 
+        # Preserve original values at out-of-bounds positions
         final_indices = tuple(indices_list) if is_tuple else indices_list[0]
-        if valid_mask is not None and type(value) is torch.Tensor:
+        if bounds_mask is not None and type(value) is torch.Tensor:
             current = tensor[final_indices]
-            mask: torch.Tensor = valid_mask
-            while mask.dim() < value.dim():
-                mask = mask.unsqueeze(-1)
-            value = torch.where(mask, value, current)
+            n_trailing = current.dim() - bounds_mask.dim() - mask_out_pos
+            shape = (1,) * mask_out_pos + bounds_mask.shape + (1,) * n_trailing
+            value = torch.where(bounds_mask.view(shape), value, current)
 
         tensor[final_indices] = value
 

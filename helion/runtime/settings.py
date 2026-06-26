@@ -14,6 +14,7 @@ from typing import Protocol
 from typing import Sequence
 from typing import TypeVar
 from typing import cast
+from typing import get_args
 
 import torch
 from torch._environment import is_fbcode
@@ -29,6 +30,7 @@ from .ref_mode import RefMode
 
 if TYPE_CHECKING:
     from ..autotuner.base_search import BaseAutotuner
+    from ..autotuner.base_search import BaseSearch
     from ..autotuner.pattern_search import InitialPopulationStrategy
     from .config import Config
     from .kernel import BoundKernel
@@ -42,7 +44,7 @@ if TYPE_CHECKING:
         ) -> BaseAutotuner: ...
 
 
-DotPrecision = Literal["tf32", "tf32x3", "ieee"]
+DotPrecision = Literal["tf32", "tf32x3", "ieee", "default", "high", "highest"]
 PrecompileMode = Literal["spawn", "fork"] | None
 _TRUE_LITERALS = frozenset({"1", "true", "yes", "on"})
 _FALSE_LITERALS = frozenset({"0", "false", "no", "off"})
@@ -284,8 +286,14 @@ def default_autotuner_fn(
         if k not in kwargs and k in parameters:
             kwargs[k] = v
 
-    # pyrefly: ignore [bad-argument-type]
-    autotuner = autotuner_cls(bound_kernel, args, **kwargs)
+    def autotuner_factory() -> BaseSearch:
+        """Build a fresh inner BaseSearch instance.
+
+        Used by the best-of-K cache layer to construct K independent
+        autotuner instances, one per trial.
+        """
+        # pyrefly: ignore [bad-argument-type]
+        return autotuner_cls(bound_kernel, args, **kwargs)
 
     cache_name = bound_kernel.settings.autotune_cache
     cache_cls = cache_classes.get(cache_name)
@@ -295,7 +303,11 @@ def default_autotuner_fn(
             f"{', '.join(cache_classes.keys())}"
         )
 
-    return cache_cls(autotuner)
+    # The cache layer's best-of-K loop calls ``autotuner_factory`` once per
+    # trial. The first construction here is the autotuner the cache wraps
+    # for the K=1 path; the factory is also passed through so K>1 trials can
+    # build additional fresh autotuners.
+    return cache_cls(autotuner_factory(), autotuner_factory=autotuner_factory)
 
 
 def _get_autotune_random_seed() -> int:
@@ -314,9 +326,24 @@ def _get_ref_mode() -> RefMode:
 
 def _get_dot_precision() -> DotPrecision:
     """
-    Get the dot precision setting from TRITON_F32_DEFAULT environment variable.
+    Gets the dot precision setting from the TRITON_F32_DEFAULT environment variable.
     Defaults to 'tf32', 'ieee' if rocm and not CDNA.
+    For Pallas, gets the precision setting from the JAX_DEFAULT_MATMUL_PRECISION environment variable, defaulting to 'default'.
     """
+    if _get_backend() == "pallas":
+        return _env_get_literal(
+            "JAX_DEFAULT_MATMUL_PRECISION",
+            cast("DotPrecision", "default"),
+            mapping={
+                "default": "default",
+                "high": "high",
+                "highest": "highest",
+                "bfloat16": "default",
+                "tensorfloat32": "high",
+                "float32": "highest",
+            },
+        )
+
     if is_hip():
         default_precision = "tf32" if supports_tf32_precision_on_amd() else "ieee"
     else:
@@ -325,7 +352,7 @@ def _get_dot_precision() -> DotPrecision:
     return _env_get_literal(
         "TRITON_F32_DEFAULT",
         cast("DotPrecision", default_precision),
-        mapping={k: k for k in ("tf32", "tf32x3", "ieee")},
+        mapping={k: k for k in get_args(DotPrecision)},
     )
 
 
@@ -383,6 +410,11 @@ class _Settings:
     )
     autotune_log_level: int = dataclasses.field(default_factory=_get_autotune_log_level)
     autotune_log: str | None = dataclasses.field(default_factory=_get_autotune_log_path)
+    autotune_log_details: bool = dataclasses.field(
+        default_factory=functools.partial(
+            _env_get_bool, "HELION_AUTOTUNE_LOG_DETAILS", False
+        )
+    )
     autotune_compile_timeout: int = dataclasses.field(
         default_factory=functools.partial(
             _env_get_int, "HELION_AUTOTUNE_COMPILE_TIMEOUT", 60
@@ -423,6 +455,9 @@ class _Settings:
     )
     autotune_random_seed: int = dataclasses.field(
         default_factory=_get_autotune_random_seed
+    )
+    autotune_best_of_k: int = dataclasses.field(
+        default_factory=functools.partial(_env_get_int, "HELION_AUTOTUNE_BEST_OF_K", 1)
     )
     autotune_accuracy_check: bool = dataclasses.field(
         default_factory=functools.partial(
@@ -594,7 +629,7 @@ class Settings(_Settings):
             "The dtype to use for index variables. Default auto-selects torch.int32 or torch.int64 based on input sizes. "
             "Override with HELION_INDEX_DTYPE=<dtype> (or set to 'auto')."
         ),
-        "dot_precision": "Precision for dot products, see `triton.language.dot`. Can be 'tf32', 'tf32x3', or 'ieee'.",
+        "dot_precision": "Precision for dot products. For Triton backend, see `triton.language.dot` (can be 'tf32', 'tf32x3', 'ieee'). For JAX/Pallas backend, can be 'default', 'high', 'highest' (mapped to JAX precision). Unified mappings exist so that any value can be used on any backend.",
         "fast_math": (
             "If True, enable fast math approximations (Helion-level and Inductor-level). "
             "May reduce numerical precision. Set HELION_FAST_MATH=1 to enable."
@@ -619,12 +654,27 @@ class Settings(_Settings):
             "Base filename for autotune logs. Set HELION_AUTOTUNE_LOG=/tmp/run to write "
             "/tmp/run.csv and /tmp/run.log with per-config metrics and debug logs."
         ),
+        "autotune_log_details": (
+            "Opt-in (HELION_AUTOTUNE_LOG_DETAILS=1) to also write the cost-model "
+            "dataset sidecar /tmp/run.meta.jsonl (per-run kernel identity + the "
+            "configs tested, keyed by config_id). Off by default; needs autotune_log."
+        ),
         "autotune_compile_timeout": "Timeout for Triton compilation in seconds used for autotuning. Default is 60 seconds.",
         "autotune_benchmark_subprocess": "Run the autotune benchmark phase in a long-lived spawn subprocess so a hung/slow kernel can be killed without losing autotune progress. Enabled by default. Set HELION_AUTOTUNE_BENCHMARK_SUBPROCESS=0 to disable.",
         "autotune_benchmark_timeout": "Per-config wall-clock timeout in seconds for the subprocess benchmark phase. Only applies when autotune_benchmark_subprocess is enabled. Default 30 seconds, raised automatically on environments with a heavier subprocess cold-start.",
         "autotune_precompile": "Autotuner precompile mode: 'fork', 'spawn', or falsy/None to disable. Defaults to 'fork' on non-Windows platforms.",
         "autotune_precompile_jobs": "Maximum concurrent Triton precompile processes, default to cpu count.",
         "autotune_random_seed": "Seed used for autotuner random number generation. Defaults to HELION_AUTOTUNE_RANDOM_SEED or a time-based seed.",
+        "autotune_best_of_k": (
+            "When > 1, run autotuning K times with different random seeds and "
+            "keep the config with the best benchmark performance. Each trial "
+            "uses ``seed = autotune_random_seed + i`` for i in range(K), so two "
+            "runs with the same base seed produce the same K configs. Cost is "
+            "K× the autotune wall time. Cache entries are keyed on K, so a "
+            "K≥2 result will not be overwritten by a later K=1 run and "
+            "vice versa. Default 1 (current single-trial behavior). Set "
+            "HELION_AUTOTUNE_BEST_OF_K=N to override."
+        ),
         "autotune_accuracy_check": "If True, validate candidate configs against the baseline kernel output before accepting them during autotuning.",
         "autotune_rebenchmark_threshold": "If a config is within threshold*best_perf, re-benchmark it to avoid outliers. Defaults to effort profile value. Set HELION_REBENCHMARK_THRESHOLD to override.",
         "autotune_suspicious_rebenchmark_ratio": "When subprocess benchmarking is enabled, recheck rebenchmark timings below ratio*previous_timing before accepting them. Defaults to 0.9. Set HELION_AUTOTUNE_SUSPICIOUS_REBENCHMARK_RATIO=0 to disable.",
@@ -793,6 +843,13 @@ class Settings(_Settings):
 
         if self.backend == "tileir" and os.environ.get("ENABLE_TILE", "0") != "1":
             raise exc.MissingEnableTile
+
+        if self.autotune_best_of_k < 1:
+            raise ValueError(
+                f"autotune_best_of_k must be >= 1, got {self.autotune_best_of_k!r}; "
+                f"set HELION_AUTOTUNE_BEST_OF_K to a positive integer "
+                f"(default 1 = single-trial behavior)"
+            )
 
         self._check_ref_eager_mode_before_print_output_code()
 

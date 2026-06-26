@@ -19,6 +19,8 @@ from helion.autotuner.base_cache import LooseAutotuneCacheKey
 from helion.autotuner.base_search import PopulationBasedSearch
 from helion.autotuner.base_search import _normalize_spec_key_str
 from helion.autotuner.config_fragment import Category
+from helion.autotuner.config_fragment import EnumFragment
+from helion.autotuner.config_fragment import ListOf
 from helion.autotuner.config_generation import ConfigGeneration
 from helion.autotuner.config_spec import BlockSizeSpec
 from helion.autotuner.config_spec import ConfigSpec
@@ -323,6 +325,63 @@ class TestBestAvailable(unittest.TestCase):
 
         roundtripped = config_gen.flatten(config)
         self.assertEqual(roundtripped, default_flat)
+
+    def test_flatten_persistent_reduction_loop_roundtrip_large_rnumel(self):
+        """Persistent (None) must round-trip through flatten/unflatten for rnumel>4096.
+
+        Regression guard: the encode sentinel must be the fragment max
+        (``.high`` == next_power_of_2(size_hint)) so it decodes back to None for every
+        size_hint. The fragment default is capped at max_reduction_loop (4096), which is
+        < size_hint when rnumel>4096 and would degrade [None] to a looped chunk. The
+        <=4096 cases guard that the fix keeps the already-working path.
+        """
+        # rnumel>4096: the broken cases (encode default capped at 4096 < hint).
+        for size_hint in (8192, 65536, 262144):
+            config_spec = ConfigSpec(backend=TritonBackend())
+            config_spec.block_sizes.append(
+                BlockSizeSpec(block_id=0, size_hint=64, min_size=16, max_size=256)
+            )
+            config_spec.reduction_loops.append(
+                ReductionLoopSpec(block_id=1, size_hint=size_hint)
+            )
+            config_gen = ConfigGeneration(config_spec)
+
+            config = config_spec.default_config()
+            config.config["reduction_loops"] = [None]  # persistent
+            config_spec.normalize(config.config)
+
+            flat = config_gen.flatten(config)
+            restored = config_gen.unflatten(flat)
+            self.assertEqual(
+                restored.config["reduction_loops"],
+                [None],
+                f"persistent must round-trip for rnumel={size_hint} "
+                f"(got {restored.config['reduction_loops']})",
+            )
+            # flatten/unflatten is idempotent at the flat level too.
+            self.assertEqual(config_gen.flatten(restored), flat)
+
+        # rnumel<=4096: guard that the fix keeps the already-working path.
+        for size_hint in (256, 4096):
+            config_spec = ConfigSpec(backend=TritonBackend())
+            config_spec.block_sizes.append(
+                BlockSizeSpec(block_id=0, size_hint=64, min_size=16, max_size=256)
+            )
+            config_spec.reduction_loops.append(
+                ReductionLoopSpec(block_id=1, size_hint=size_hint)
+            )
+            config_gen = ConfigGeneration(config_spec)
+
+            config = config_spec.default_config()
+            config.config["reduction_loops"] = [None]
+            config_spec.normalize(config.config)
+
+            restored = config_gen.unflatten(config_gen.flatten(config))
+            self.assertEqual(
+                restored.config["reduction_loops"],
+                [None],
+                f"persistent must still round-trip for rnumel={size_hint}",
+            )
 
 
 class TestCacheMatching(unittest.TestCase):
@@ -1172,6 +1231,33 @@ class TestStructuralFingerprint(unittest.TestCase):
             spec_a.structural_fingerprint(), spec_b.structural_fingerprint()
         )
 
+    def test_enum_choices_change_fingerprint(self):
+        """Enum search-space changes should invalidate exact-cache entries."""
+        spec_a = ConfigSpec(backend=TritonBackend())
+        spec_a.user_defined_tunables["mode"] = EnumFragment(("a", "b"))
+        spec_a.user_defined_tunables["indexed_mode"] = ListOf(
+            EnumFragment((1, 2)), length=2
+        )
+
+        spec_b = ConfigSpec(backend=TritonBackend())
+        spec_b.user_defined_tunables["mode"] = EnumFragment(("a", "b", "c"))
+        spec_b.user_defined_tunables["indexed_mode"] = ListOf(
+            EnumFragment((1, 2)), length=2
+        )
+
+        spec_c = ConfigSpec(backend=TritonBackend())
+        spec_c.user_defined_tunables["mode"] = EnumFragment(("a", "b"))
+        spec_c.user_defined_tunables["indexed_mode"] = ListOf(
+            EnumFragment((1, 2, 3)), length=2
+        )
+
+        self.assertNotEqual(
+            spec_a.structural_fingerprint(), spec_b.structural_fingerprint()
+        )
+        self.assertNotEqual(
+            spec_a.structural_fingerprint(), spec_c.structural_fingerprint()
+        )
+
     def test_different_range_fields_count(self):
         """ConfigSpecs with different range field counts have different fingerprints."""
         spec_a = ConfigSpec(backend=TritonBackend())
@@ -1291,6 +1377,9 @@ class TestGenerateBestAvailablePopulation(unittest.TestCase):
         mock_search.settings = Settings()
         mock_search.log = MagicMock()
         mock_search.log.debug = MagicMock()
+        mock_search.args = ()
+        mock_search.kernel = None
+        mock_search._autotune_seed_configs = MagicMock(return_value=[])
         mock_search._find_similar_cached_configs = MagicMock(return_value=entries)
         return mock_search
 
@@ -1307,7 +1396,7 @@ class TestGenerateBestAvailablePopulation(unittest.TestCase):
         self.assertEqual(result[0], config_gen.default_flat())
 
     def test_cached_configs_added(self):
-        """Cached configs are added after default."""
+        """Cached configs are added after seed/default configs."""
         config_gen = self._make_config_gen()
         cached = [
             Config(block_sizes=[32, 64], num_warps=8, num_stages=2),
@@ -1325,6 +1414,43 @@ class TestGenerateBestAvailablePopulation(unittest.TestCase):
         num_warps_idx = config_gen._key_to_flat_indices["num_warps"][0][0]
         self.assertEqual(result[1][num_warps_idx], 8)
         self.assertEqual(result[2][num_warps_idx], 2)
+
+    def test_compiler_seed_precedes_default(self):
+        """Compiler seeds are benchmarked before the raw fragment default.
+
+        This keeps FROM_BEST_AVAILABLE from spending a long time on a slow raw
+        default when a backend heuristic has supplied a known fast seed but the
+        seed was not promoted to compiler_default_config.
+        """
+        config_gen = self._make_config_gen()
+        seed = Config(block_sizes=[32, 64], num_warps=8, num_stages=2)
+        config_gen.config_spec.compiler_seed_configs = [seed]
+        mock_search = self._make_mock_search(config_gen, cached_configs=[])
+
+        result = PopulationBasedSearch._generate_best_available_population_flat(
+            mock_search
+        )
+
+        self.assertEqual(len(result), 2)
+        normalized_seed = config_gen.unflatten(config_gen.flatten(seed))
+        self.assertEqual(config_gen.unflatten(result[0]), normalized_seed)
+        self.assertEqual(result[1], config_gen.default_flat())
+
+    def test_best_available_seed_precedes_default(self):
+        """Caller-provided best-available seeds also precede the raw default."""
+        config_gen = self._make_config_gen()
+        seed = Config(block_sizes=[32, 64], num_warps=8, num_stages=2)
+        mock_search = self._make_mock_search(config_gen, cached_configs=[])
+        mock_search._best_available_seed_configs = [seed]
+
+        result = PopulationBasedSearch._generate_best_available_population_flat(
+            mock_search
+        )
+
+        self.assertEqual(len(result), 2)
+        normalized_seed = config_gen.unflatten(config_gen.flatten(seed))
+        self.assertEqual(config_gen.unflatten(result[0]), normalized_seed)
+        self.assertEqual(result[1], config_gen.default_flat())
 
     def test_duplicate_configs_deduplicated(self):
         """Duplicate cached configs are discarded."""

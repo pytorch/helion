@@ -52,6 +52,7 @@ from .aten_lowering import aten_lowering_dispatch
 from .compile_environment import CompileEnvironment
 from .compile_environment import FixedBlockSizeSource
 from .compile_environment import _symint_expr
+from .compile_environment import _symint_sympy_expr
 from .device_function import VarInfo
 from .device_function import contains_only_block_size_symbols
 from .node_masking import inductor_masked_value
@@ -106,6 +107,13 @@ def prepare_graph_lowerings(graph: torch.fx.Graph) -> None:
                 if node.op == "call_function":
                     with node.meta["location"]:
                         prepare_node_lowering(graph_lowering, node)
+                        lowering = node.meta.get("lowering")
+                        if isinstance(lowering, PointwiseLowering):
+                            # Catch the missing-keepdim broadcast bug at graph
+                            # build time (backend- and config-independent) so it
+                            # is rejected consistently on every backend, before
+                            # any config-specific validation or codegen.
+                            lowering._check_reduction_broadcast_keepdim(node)
 
 
 def prepare_node_lowering(
@@ -130,6 +138,8 @@ def prepare_node_lowering(
     if isinstance(
         val := node.meta["val"], (torch.SymInt, torch.SymFloat, torch.SymBool)
     ):
+        # SymBool's `_sympy_()` is a boolean rather than the Expr the field holds.
+        # pyrefly: ignore [bad-argument-type]
         node.meta["lowering"] = SympyExprLowering(val._sympy_())
         return
 
@@ -361,7 +371,7 @@ def to_symint(x: object) -> torch.SymInt | int:
 
 def _unpack_symint(x: torch.SymInt | int) -> sympy.Expr:
     if isinstance(x, torch.SymInt):
-        return x._sympy_()
+        return _symint_sympy_expr(x)
     if isinstance(x, int):
         # type: ignore [bad-return]
         return sympy.sympify(x)
@@ -379,16 +389,15 @@ class InductorLowering(Lowering):
             if isinstance(fake_val := n.meta["val"], torch.Tensor):
                 # Don't expand scalars (0-D tensors) - let Triton handle broadcasting naturally
                 # Expanding scalars with [None, None] creates incorrect broadcast shapes
-                if (
-                    ctx.cg.device_function.tile_strategy.supports_index_rank_expansion()
-                    and fake_val.ndim < ndim
-                    and fake_val.ndim > 0
-                ):
-                    # Broadcast to force ranks to match (but only for non-scalar tensors)
-                    expand = ["None"] * (ndim - fake_val.ndim) + [":"] * fake_val.ndim
-                    ast_val = expr_from_string(
-                        "{tensor}[" + ", ".join(expand) + "]", tensor=ast_val
+                if fake_val.ndim < ndim and fake_val.ndim > 0:
+                    expand = tile_strategy.broadcast_expand_dims(
+                        tuple(fake_val.shape), output_shape
                     )
+                    if expand:
+                        ast_val = expr_from_string(
+                            "{tensor}[" + ", ".join(expand) + "]",
+                            tensor=ast_val,
+                        )
             if (
                 isinstance(ast_val, ast.Name)
                 and ast_val.id in device_function._constexpr_args
@@ -405,7 +414,11 @@ class InductorLowering(Lowering):
                 input_asts.append(ast_val)
 
         device_function: DeviceFunction = ctx.cg.device_function
-        ndim: int = max([x.ndim for x in self.input_fake_tensors(node)] or (0,))
+        tile_strategy = device_function.tile_strategy
+        output_shape: tuple[int | torch.SymInt, ...] = tuple(
+            map(to_symint, self.buffer.get_size())
+        )
+        ndim: int = len(output_shape)
         input_asts: list[ast.AST] = []
         # _extra_deps should not be included in the inductor node inputs
         map_arg((node.args, {**node.kwargs, "_extra_deps": None}), visit)
@@ -654,6 +667,77 @@ class PointwiseLowering(InductorLowering):
                 else:
                     exprs.add(size_i)
             if len(exprs) >= 2:
+                raise exc.ShapeMismatch(
+                    str(shapes[0]),
+                    ", ".join(map(str, shapes[1:])),
+                )
+
+    def _check_reduction_broadcast_keepdim(self, node: torch.fx.Node) -> None:
+        """Reject a reduction result broadcast against a *different* tile axis.
+
+        This is the missing-``keepdim`` bug: e.g.
+        ``x[tile_m, :] - torch.amax(x[tile_m, :], dim=1)`` drops the reduced N
+        axis, then the surviving M axis is right-aligned onto N (``[M, N] - [M]``).
+        It is rejected on **every** backend at graph-build time (so the error is
+        config- and backend-independent), unlike the size-coincidence leniency in
+        :meth:`_check_block_broadcast_compatibility` which would otherwise let
+        ``[M, N] - [M]`` through whenever the M and N block sizes happen to match.
+
+        The check is gated on an operand actually being a reduction result, so it
+        does **not** touch structurally-identical but legitimately-handled
+        patterns such as matmul-epilogue column-vector / aux-tensor broadcasts
+        (``acc + colvec[tile_m]``), which the backend's epilogue classifier owns
+        and rejects with its own actionable diagnostics.
+        """
+        env = CompileEnvironment.current()
+        if not any(
+            isinstance(inp.meta.get("lowering"), ReductionLowering)
+            for inp in node.all_input_nodes
+        ):
+            return
+        inputs = self.input_fake_tensors(node)
+        if len(inputs) < 2:
+            return
+
+        shapes: list[list[int | torch.SymInt]] = [[*t.size()] for t in inputs]
+        max_rank = max((len(s) for s in shapes), default=0)
+        for i, s in enumerate(shapes):
+            pad = max_rank - len(s)
+            if pad > 0:
+                shapes[i] = [1] * pad + s
+
+        def is_one(x: int | torch.SymInt) -> bool:
+            if isinstance(x, int):
+                return x == 1
+            expr = _symint_expr(x)
+            if isinstance(expr, sympy.Integer):
+                return int(expr) == 1
+            block_id = env.get_block_id(x)
+            if block_id is not None:
+                bs = env.block_sizes[block_id]
+                if isinstance(bs.block_size_source, FixedBlockSizeSource):
+                    val = bs.block_size_source.value
+                    if isinstance(val, int):
+                        return val == 1
+                    vexpr = _symint_expr(val) if isinstance(val, torch.SymInt) else None
+                    return isinstance(vexpr, sympy.Integer) and int(vexpr) == 1
+            return False
+
+        for dim in range(max_rank):
+            symbols: set[object] = set()
+            for s in shapes:
+                size_i = s[dim]
+                if is_one(size_i):
+                    continue
+                block_id = env.resolve_block_id(size_i)
+                if block_id is not None:
+                    symbols.add(
+                        env.block_sizes[env.canonical_block_id(block_id)].symbol()
+                    )
+            # Two *distinct* tile axes aligned in the same broadcast position is a
+            # wrong-axis (missing-keepdim) reduction broadcast, even when their
+            # current sizes coincide.
+            if len(symbols) >= 2:
                 raise exc.ShapeMismatch(
                     str(shapes[0]),
                     ", ".join(map(str, shapes[1:])),

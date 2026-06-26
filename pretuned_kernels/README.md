@@ -27,7 +27,8 @@ pretuned_kernels/
 ├── layer_norm/
 ├── rms_norm/
 ├── cross_entropy/
-└── rope/
+├── rope/
+└── scaled_mm/
 ```
 
 Each kernel ships with one heuristic file per supported compute capability.
@@ -41,6 +42,7 @@ At runtime Helion picks the file matching the current GPU.
 | `rms_norm` | TritonBench `(M=2048, H)` default + NPOT shapes + realistic LLM hidden-size and production-style shapes | `F.rms_norm` |
 | `cross_entropy` | TritonBench/Liger token-vocab sweep + realistic LLM vocabulary shapes | `F.cross_entropy` |
 | `rope` | TritonBench RoPE `(H, T)` defaults with exact shape buckets and `H8192_T2048` fallback | eager RoPE reference |
+| `scaled_mm` | vLLM Qwen3 FP8 `(K, N)` weight shapes at small token counts `M in {16, 64}` | `torch._scaled_mm` |
 
 ## Scope
 

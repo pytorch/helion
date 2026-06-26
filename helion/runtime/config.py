@@ -17,6 +17,8 @@ PidTypeLiteral = Literal[
     "persistent_interleaved",
 ]
 EvictionPolicyLiteral = Literal["", "first", "last"]
+LoadCacheModifierLiteral = Literal["", ".cg"]
+StoreCacheModifierLiteral = Literal["", ".cs", ".wt"]
 NumSmMultiplierLiteral = Literal[1, 2, 4, 8]
 MaxnregLiteral = Literal[32, 64, 128, 256] | None
 
@@ -42,6 +44,8 @@ class Config(Mapping[str, object]):
         range_flattens: list[bool | None] | None = None,
         static_ranges: list[bool] | None = None,
         load_eviction_policies: list[EvictionPolicyLiteral] | None = None,
+        load_cache_modifiers: list[LoadCacheModifierLiteral] | None = None,
+        store_cache_modifiers: list[StoreCacheModifierLiteral] | None = None,
         num_warps: int | None = None,
         num_stages: int | None = None,
         pid_type: PidTypeLiteral | None = None,
@@ -70,6 +74,8 @@ class Config(Mapping[str, object]):
             range_flattens: Controls flatten parameter for tl.range calls.
             static_ranges: Whether to use tl.static_range instead tl.range.
             load_eviction_policies: Eviction policies for load operations ("", "first", "last").
+            load_cache_modifiers: Cache modifiers for load operations ("", ".cg").
+            store_cache_modifiers: Cache modifiers for store operations ("", ".cs", ".wt").
             num_warps: Number of warps per block.
             num_stages: Number of stages for software pipelining.
             pid_type: Program ID type strategy ("flat", "xyz", "persistent_blocked", "persistent_interleaved").
@@ -109,6 +115,8 @@ class Config(Mapping[str, object]):
             "range_flattens": range_flattens,
             "static_ranges": static_ranges,
             "load_eviction_policies": load_eviction_policies,
+            "load_cache_modifiers": load_cache_modifiers,
+            "store_cache_modifiers": store_cache_modifiers,
             "num_warps": num_warps,
             "num_stages": num_stages,
             "indexing": indexing,
@@ -317,6 +325,20 @@ class Config(Mapping[str, object]):
     def load_eviction_policies(self) -> list[EvictionPolicyLiteral]:
         return cast(
             "list[EvictionPolicyLiteral]", self.config.get("load_eviction_policies", [])
+        )
+
+    @property
+    def load_cache_modifiers(self) -> list[LoadCacheModifierLiteral]:
+        return cast(
+            "list[LoadCacheModifierLiteral]",
+            self.config.get("load_cache_modifiers", []),
+        )
+
+    @property
+    def store_cache_modifiers(self) -> list[StoreCacheModifierLiteral]:
+        return cast(
+            "list[StoreCacheModifierLiteral]",
+            self.config.get("store_cache_modifiers", []),
         )
 
     @property

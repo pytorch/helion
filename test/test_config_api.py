@@ -25,6 +25,7 @@ from helion._compiler.cute.tcgen05_constants import (
 from helion._testing import TestCase
 from helion._testing import onlyBackends
 from helion._testing import skipIfXPU
+from helion._testing import skipUnlessCuteAvailable
 import helion.language as hl
 
 
@@ -84,6 +85,10 @@ def _known_keys_strategy() -> st.SearchStrategy[dict[str, Any]]:
             "load_eviction_policies": st.lists(
                 st.sampled_from(["", "first", "last"]), max_size=4
             ),
+            "load_cache_modifiers": st.lists(st.sampled_from(["", ".cg"]), max_size=4),
+            "store_cache_modifiers": st.lists(
+                st.sampled_from(["", ".cs", ".wt"]), max_size=4
+            ),
             "num_warps": st.integers(min_value=1, max_value=64),
             "num_stages": st.integers(min_value=1, max_value=16),
             "pid_type": st.sampled_from(
@@ -115,6 +120,8 @@ def _unknown_keys_strategy() -> st.SearchStrategy[dict[str, Any]]:
                     "range_flattens",
                     "static_ranges",
                     "load_eviction_policies",
+                    "load_cache_modifiers",
+                    "store_cache_modifiers",
                     "num_warps",
                     "num_stages",
                     "pid_type",
@@ -141,14 +148,17 @@ class TestConfigAPI(TestCase):
             pass
 
         device = torch.device("cuda:0")
-        with (
-            patch("torch.cuda.is_available", return_value=True),
-            patch("torch.cuda.get_device_capability", return_value=(9, 0)),
+        # Patch the helion seam (target_device_capability, imported into
+        # runtime.kernel) rather than torch.cuda.get_device_capability: the
+        # latter is memoized behind _target_device_capability, mirroring the
+        # is_hip / _is_hip pattern where tests mock the public wrapper, not
+        # the cached inner query.
+        with patch(
+            "helion.runtime.kernel.target_device_capability", return_value=(9, 0)
         ):
             sm90_key = device_key_kernel._base_specialization_key((device,))
-        with (
-            patch("torch.cuda.is_available", return_value=True),
-            patch("torch.cuda.get_device_capability", return_value=(10, 0)),
+        with patch(
+            "helion.runtime.kernel.target_device_capability", return_value=(10, 0)
         ):
             sm100_key = device_key_kernel._base_specialization_key((device,))
 
@@ -172,6 +182,8 @@ class TestConfigAPI(TestCase):
             "range_flattens",
             "static_ranges",
             "load_eviction_policies",
+            "load_cache_modifiers",
+            "store_cache_modifiers",
             "num_warps",
             "num_stages",
             "pid_type",
@@ -378,12 +390,14 @@ class TestSettingsEnv(TestCase):
             settings = helion.Settings()
         self.assertEqual(settings.backend, "tileir")
 
+    @skipUnlessCuteAvailable("Constructs a cute CompileEnvironment")
     def test_compile_environment_selects_cute_backend(self) -> None:
         settings = helion.Settings(backend="cute")
         env = CompileEnvironment(torch.device("cpu"), settings)
         self.assertEqual(env.backend_name, "cute")
         self.assertEqual(env.backend.default_launcher_name, "_default_cute_launcher")
 
+    @skipUnlessCuteAvailable("Constructs a cute CompileEnvironment")
     def test_num_threads_support_is_backend_specific(self) -> None:
         triton_env = CompileEnvironment(
             torch.device("cpu"), helion.Settings(backend="triton")
@@ -514,7 +528,7 @@ class TestSettingsEnv(TestCase):
         import sympy
 
         from helion._compiler.host_function import SymbolOrigin
-        from helion._compiler.type_propagation import _detect_outer_block_bound
+        from helion._compiler.type_info import _detect_outer_block_bound
         from helion._compiler.variable_origin import TileBeginOrigin
         from helion._compiler.variable_origin import TileEndOrigin
 
@@ -530,11 +544,11 @@ class TestSettingsEnv(TestCase):
 
         with (
             patch(
-                "helion._compiler.type_propagation.HostFunction.current",
+                "helion._compiler.type_info.HostFunction.current",
                 return_value=fake_host,
             ),
             patch(
-                "helion._compiler.type_propagation._symint_expr",
+                "helion._compiler.type_info._symint_expr",
                 side_effect=lambda expr: expr,
             ),
         ):
@@ -544,7 +558,7 @@ class TestSettingsEnv(TestCase):
     def test_detect_outer_block_bound_accepts_direct_block_size(self) -> None:
         from types import SimpleNamespace
 
-        from helion._compiler.type_propagation import _detect_outer_block_bound
+        from helion._compiler.type_info import _detect_outer_block_bound
 
         numel = object()
         fake_env = SimpleNamespace(
@@ -552,7 +566,7 @@ class TestSettingsEnv(TestCase):
         )
 
         with patch(
-            "helion._compiler.type_propagation._symint_expr",
+            "helion._compiler.type_info._symint_expr",
             side_effect=AssertionError("_symint_expr should not be called"),
         ):
             self.assertEqual(_detect_outer_block_bound(numel, fake_env), 5)
@@ -726,6 +740,47 @@ class TestHardwareConfigSpecRanges(TestCase):
             ("", "first", "last"),
         )
 
+    def test_load_cache_modifier_choices_do_not_leak_mocked_amd_state(self) -> None:
+        """Mocked AMD capability detection should not poison later Triton specs."""
+        from helion._compiler.backend import TritonBackend
+        from helion.autotuner.config_spec import ConfigSpec
+
+        with patch(
+            "helion.autotuner.config_spec.supports_amd_cdna_tunables",
+            return_value=True,
+        ):
+            amd_spec = ConfigSpec(backend=TritonBackend())
+        self.assertEqual(amd_spec.load_cache_modifiers.inner.choices, ("", ".cg"))
+
+        with patch(
+            "helion.autotuner.config_spec.supports_amd_cdna_tunables",
+            return_value=False,
+        ):
+            nvidia_spec = ConfigSpec(backend=TritonBackend())
+        self.assertEqual(nvidia_spec.load_cache_modifiers.inner.choices, ("",))
+
+    def test_store_cache_modifier_choices_do_not_leak_mocked_amd_state(self) -> None:
+        """Mocked AMD capability detection should not poison later Triton specs."""
+        from helion._compiler.backend import TritonBackend
+        from helion.autotuner.config_spec import ConfigSpec
+
+        with patch(
+            "helion.autotuner.config_spec.supports_amd_cdna_tunables",
+            return_value=True,
+        ):
+            amd_spec = ConfigSpec(backend=TritonBackend())
+        self.assertEqual(
+            amd_spec.store_cache_modifiers.inner.choices,
+            ("", ".cs", ".wt"),
+        )
+
+        with patch(
+            "helion.autotuner.config_spec.supports_amd_cdna_tunables",
+            return_value=False,
+        ):
+            nvidia_spec = ConfigSpec(backend=TritonBackend())
+        self.assertEqual(nvidia_spec.store_cache_modifiers.inner.choices, ("",))
+
 
 class TestCuteTcgen05ConfigSpecSplit(TestCase):
     @staticmethod
@@ -849,7 +904,14 @@ class TestCuteTcgen05ConfigSpecSplit(TestCase):
         with (
             patch("torch.cuda.is_available", return_value=True),
             patch("torch.cuda.current_device", return_value=0),
-            patch("torch.cuda.get_device_capability", return_value=(9, 0)),
+            # Patch the helion seam: torch.cuda.get_device_capability is
+            # memoized behind _target_device_capability (is_hip / _is_hip
+            # pattern), so config_spec's get_target_device_capability() must
+            # be patched at the wrapper, not the cached torch query.
+            patch(
+                "helion.autotuner.config_spec.get_target_device_capability",
+                return_value=(9, 0),
+            ),
         ):
             spec = self._make_cute_tcgen05_spec()
 

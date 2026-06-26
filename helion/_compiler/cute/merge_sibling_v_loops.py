@@ -50,6 +50,8 @@ import os
 import re
 
 from ..ast_extension import statement_from_string
+from ._ast_pass_utils import _assignment_lhs_name
+from ._ast_pass_utils import _names_read
 
 
 def _is_constexpr_v_loop(node: ast.stmt) -> tuple[ast.For, str, int] | None:
@@ -77,15 +79,6 @@ def _is_constexpr_v_loop(node: ast.stmt) -> tuple[ast.For, str, int] | None:
     return node, node.target.id, arg.value
 
 
-def _assignment_lhs_name(stmt: ast.stmt) -> str | None:
-    """If ``stmt`` is ``LHS = RHS`` with LHS a single Name, return LHS.id."""
-    if isinstance(stmt, ast.Assign) and len(stmt.targets) == 1:
-        target = stmt.targets[0]
-        if isinstance(target, ast.Name):
-            return target.id
-    return None
-
-
 def _names_written(stmt: ast.stmt) -> set[str]:
     written: set[str] = set()
     if isinstance(stmt, ast.Assign):
@@ -93,21 +86,6 @@ def _names_written(stmt: ast.stmt) -> set[str]:
             if isinstance(target, ast.Name):
                 written.add(target.id)
     return written
-
-
-class _NameRefCollector(ast.NodeVisitor):
-    def __init__(self) -> None:
-        self.names: set[str] = set()
-
-    def visit_Name(self, node: ast.Name) -> None:
-        if isinstance(node.ctx, ast.Load):
-            self.names.add(node.id)
-
-
-def _names_read(node: ast.AST) -> set[str]:
-    collector = _NameRefCollector()
-    collector.visit(node)
-    return collector.names
 
 
 def _infer_cache_dtype(rhs: ast.expr) -> str | None:

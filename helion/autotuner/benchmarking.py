@@ -1,10 +1,15 @@
 from __future__ import annotations
 
+import contextlib
 import functools
+import glob
 import logging
 import math
+import os
 import statistics
+import tempfile
 import time
+from typing import TYPE_CHECKING
 from typing import Any
 from typing import Callable
 from typing import TypeVar
@@ -17,10 +22,39 @@ from ..runtime.settings import is_pallas_interpret
 from .progress_bar import iter_with_progress
 from helion._dist_utils import sync_object
 
+if TYPE_CHECKING:
+    from .logger import AutotuningLogger
+
 T = TypeVar("T")
 
 _log = logging.getLogger(__name__)
 _BENCHMARK_CUDAGRAPH_ENV = "HELION_BENCHMARK_CUDAGRAPH"
+
+
+def _make_l2_cache_clearer() -> Callable[[], None]:
+    """Return a callable that flushes the GPU L2 cache, or a no-op.
+
+    The generic (wall-clock) bench used by the CuTe backend otherwise times
+    kernels with the operands resident in L2 (warm), biasing the autotuner
+    toward shallow-prefetch configs that starve the pipeline in the cold-L2 /
+    streamed-once regime that deployment and tritonbench (which clears L2 by
+    default) actually measure. Flushing L2 between timed calls makes the
+    autotune regime match the deployment regime.
+
+    Uses Triton's CUDA-only cache-clear primitive. Returns a no-op when not on
+    CUDA (e.g. TPU/Pallas backends that also use the generic bench).
+    """
+    if not torch.cuda.is_available() or getattr(torch.version, "hip", None) is not None:
+        return lambda: None
+    from triton import runtime
+
+    active = runtime.driver.active  # type: ignore[attr-defined]
+    cache = active.get_empty_cache_for_benchmark()  # type: ignore[attr-defined]
+
+    def clear() -> None:
+        active.clear_cache(cache)  # type: ignore[attr-defined]
+
+    return clear
 
 
 def _cudagraph_unavailable_reason() -> str | None:
@@ -69,6 +103,25 @@ def _maybe_cudagraph_replay(
     except Exception:
         _log.debug("CUDA graph benchmark capture failed; falling back", exc_info=True)
         return fn
+
+
+def clear_jit_fast_path_caches(
+    fn: Callable[..., object],
+    log: logging.Logger | AutotuningLogger | None = None,
+) -> None:
+    """Clear Triton JIT fast-path caches for a generated Helion wrapper."""
+    try:
+        fn_name = getattr(fn, "__name__", None)
+        fn_globals = getattr(fn, "__globals__", None)
+        if fn_name is None or fn_globals is None:
+            return
+        triton_jit_fn = fn_globals.get(f"_helion_{fn_name}")
+        clear = getattr(triton_jit_fn, "clear_fast_path_caches", None)
+        if clear is not None:
+            clear()
+    except Exception:
+        if log is not None:
+            log.debug("Failed to clear Triton JIT fast-path cache.", exc_info=True)
 
 
 def _get_tpu_tensors(result: object) -> list[torch.Tensor]:
@@ -173,8 +226,10 @@ def compute_repeat_generic(
     out = fn()
     synchronize_device(out)
 
+    clear_l2 = _make_l2_cache_clearer()
     start = time.perf_counter()
     for _ in range(estimate_runs):
+        clear_l2()
         out = fn()
     synchronize_device(out)
     end = time.perf_counter()
@@ -271,6 +326,7 @@ def interleaved_bench_generic(
         out = fn()
     synchronize_device(out)
 
+    clear_l2 = _make_l2_cache_clearer()
     all_times: list[list[float]] = [[] for _ in range(len(fns))]
 
     iterator = iter_with_progress(
@@ -281,6 +337,7 @@ def interleaved_bench_generic(
     )
     for _i in iterator:
         for j in range(len(fns)):
+            clear_l2()
             synchronize_device(out)
             start = time.perf_counter()
             out = fns[j]()
@@ -289,6 +346,159 @@ def interleaved_bench_generic(
             all_times[j].append((end - start) * 1000)  # convert to ms
 
     return [statistics.median(times) for times in all_times]
+
+
+def paired_device_micros_bench(
+    fns: list[Callable[..., object]],
+    reference_fn: Callable[..., object],
+    *,
+    device_micros_fn: Callable[[Callable[[], object]], float],
+    desc: str | None = None,
+) -> list[tuple[float, float]]:
+    """Paired device-µs timing for the final-pick re-rank.
+
+    Times each candidate and ``reference_fn`` via ``device_micros_fn`` and returns
+    ``(candidate_micros, candidate_micros - reference_micros)`` per candidate (negative delta
+    = faster on-device). Unlike single-call wall-clock µs, which on small Pallas
+    matmuls is ~96-98% dispatch overhead, ``device_micros_fn`` reports on-chip µs so
+    configs differing by a few µs are separable. An unusable trace yields
+    ``(inf, inf)`` so the caller deranks it.
+    """
+    iterator = iter_with_progress(
+        range(len(fns)),
+        total=len(fns),
+        description=desc,
+        enabled=desc is not None,
+    )
+    results: list[tuple[float, float]] = []
+    for j in iterator:
+        candidate_micros = device_micros_fn(fns[j])
+        reference_micros = device_micros_fn(reference_fn)
+        if math.isfinite(candidate_micros) and math.isfinite(reference_micros):
+            results.append((candidate_micros, candidate_micros - reference_micros))
+        else:
+            results.append((math.inf, math.inf))
+    return results
+
+
+# 100 calls/trace keeps the per-event average stable to ~0.1µs (measured), well
+# below the multi-µs deltas the re-rank separates.
+_PALLAS_AUTOTUNE_DEVICE_MICROS_DEFAULT_N_CALLS = 100
+_PALLAS_AUTOTUNE_DEVICE_MICROS_DEFAULT_N_WARMUP = 5
+# Min event count for a ``/device:TPU:0`` line to count as a kernel sample: above
+# the DVFS counter lines (<=~17 events), below the kernel band (>=~40). Per-call
+# us divides by the actual count, so partial-flush traces stay unbiased.
+_PALLAS_AUTOTUNE_DEVICE_MICROS_MIN_TRACE_EVENTS = 20
+
+
+def _autotune_rank_by_device_micros() -> bool:
+    """True unless ``HELION_AUTOTUNE_PALLAS_RANK_BY`` opts out of device-µs ranking.
+
+    Default ``device_time``; any other value (e.g. ``wall_time``) falls back to the
+    legacy wall-clock paired-sample ranking. Pallas-only (the device-µs path is
+    jax.profiler-based); inert on other backends.
+    """
+    value = (
+        os.environ.get("HELION_AUTOTUNE_PALLAS_RANK_BY", "device_time").strip().lower()
+    )
+    return value == "device_time"
+
+
+def _pallas_device_micros_for_fn(
+    fn: Callable[[], object],
+    *,
+    n_calls: int,
+    n_warmup: int,
+) -> float:
+    """Per-call on-device µs for ``fn`` under a single ``jax.profiler`` trace.
+
+    Wraps ``n_calls`` invocations in one ``start_trace``/``stop_trace`` window,
+    parses the ``.xplane.pb``, and returns ``total_ns / count / 1000`` for the
+    dominant ``/device:TPU:0`` event (count >=
+    ``_PALLAS_AUTOTUNE_DEVICE_MICROS_MIN_TRACE_EVENTS``, which excludes the DVFS
+    counter line). Returns ``+inf`` when the trace is unusable (no ``jax``, no
+    xplane/TPU plane, too few events). Kernel exceptions from ``fn`` propagate.
+    """
+    try:
+        import jax  # pyrefly: ignore[missing-module-attribute]
+    except ImportError:
+        return math.inf
+
+    # Warmup outside the trace window so first-call compile doesn't pollute it.
+    for _ in range(n_warmup):
+        fn()
+
+    with tempfile.TemporaryDirectory(prefix="helion_autotune_device_micros_") as td:
+        jax.profiler.start_trace(td)
+        last_out: object = None
+        try:
+            for _ in range(n_calls):
+                last_out = fn()
+        finally:
+            # Block on the last output so stop_trace sees every device event.
+            if last_out is not None:
+                with contextlib.suppress(TypeError, AttributeError):
+                    jax.block_until_ready(last_out)
+            jax.profiler.stop_trace()
+
+        matches = glob.glob(os.path.join(td, "**", "*.xplane.pb"), recursive=True)
+        if not matches:
+            return math.inf
+
+        pd = jax.profiler.ProfileData.from_file(matches[0])
+        best_total_ns = 0
+        best_count = 0
+        for plane in pd.planes:
+            if plane.name != "/device:TPU:0":
+                continue
+            for line in plane.lines:
+                totals: dict[str, int] = {}
+                counts: dict[str, int] = {}
+                for ev in line.events:
+                    totals[ev.name] = totals.get(ev.name, 0) + ev.duration_ns
+                    counts[ev.name] = counts.get(ev.name, 0) + 1
+                for name, total in totals.items():
+                    if (
+                        counts[name] >= _PALLAS_AUTOTUNE_DEVICE_MICROS_MIN_TRACE_EVENTS
+                        and total > best_total_ns
+                    ):
+                        best_total_ns, best_count = total, counts[name]
+        if best_total_ns == 0:
+            return math.inf
+        return best_total_ns / best_count / 1000.0
+
+
+def make_pallas_paired_device_micros_bench(
+    *,
+    n_calls: int = _PALLAS_AUTOTUNE_DEVICE_MICROS_DEFAULT_N_CALLS,
+    n_warmup: int = _PALLAS_AUTOTUNE_DEVICE_MICROS_DEFAULT_N_WARMUP,
+) -> Callable[..., list[tuple[float, float]]] | None:
+    """Paired device-µs bench closure for the Pallas backend, or None.
+
+    Returns None when the user opted out via ``HELION_AUTOTUNE_PALLAS_RANK_BY=wall_time``.
+    Otherwise the closure has the :func:`paired_device_micros_bench` signature and
+    captures ``n_calls`` / ``n_warmup``.
+    """
+    if not _autotune_rank_by_device_micros():
+        return None
+
+    def _bench(
+        fns: list[Callable[..., object]],
+        reference_fn: Callable[..., object],
+        *,
+        desc: str | None = None,
+    ) -> list[tuple[float, float]]:
+        def _device_micros_fn(fn: Callable[[], object]) -> float:
+            return _pallas_device_micros_for_fn(fn, n_calls=n_calls, n_warmup=n_warmup)
+
+        return paired_device_micros_bench(
+            fns,
+            reference_fn,
+            device_micros_fn=_device_micros_fn,
+            desc=desc,
+        )
+
+    return _bench
 
 
 def _summarize_statistics_fallback(
@@ -427,10 +637,13 @@ def do_bench_generic(
     out = fn()
     synchronize_device(out)
 
+    clear_l2 = _make_l2_cache_clearer()
+
     # Estimate the runtime of the function
     synchronize_device(out)
     start = time.perf_counter()
     for _ in range(5):
+        clear_l2()
         out = fn()
     synchronize_device(out)
     end = time.perf_counter()
@@ -450,6 +663,7 @@ def do_bench_generic(
         if grad_to_none is not None:
             for x in grad_to_none:
                 x.grad = None
+        clear_l2()
         synchronize_device(out)
         t0 = time.perf_counter()
         out = fn()

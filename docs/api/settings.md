@@ -88,7 +88,17 @@ def my_kernel(x: torch.Tensor) -> torch.Tensor:
 
 .. autoattribute:: Settings.dot_precision
 
-   Precision mode for dot product operations. Default is ``"tf32"``. Controlled by ``TRITON_F32_DEFAULT`` environment variable.
+   Precision mode for dot product operations.
+   - For Triton backend, this is initialized from the ``TRITON_F32_DEFAULT`` environment variable (defaulting to ``"tf32"``).
+   - For Pallas backend, this is initialized from the ``JAX_DEFAULT_MATMUL_PRECISION`` environment variable (defaulting to ``"default"``).
+
+   Supported values depend on the backend:
+   - Triton (GPU): ``"tf32"``, ``"tf32x3"``, ``"ieee"``
+   - Pallas (TPU): ``"default"`` (forces JAX default, typically bfloat16), ``"high"``, ``"highest"`` (float32 emulation).
+
+   However, unified mappings exist so you can use any value on any backend. They map to the closest equivalent of equal or higher precision:
+   - On Triton: ``"default"`` maps to ``"tf32"``, ``"high"`` maps to ``"tf32x3"``, and ``"highest"`` maps to ``"ieee"``.
+   - On Pallas: ``"tf32"``, ``"tf32x3"`` and ``"ieee"`` all map to ``"highest"``.
 
 .. autoattribute:: Settings.static_shapes
 
@@ -133,8 +143,16 @@ def my_kernel(x: torch.Tensor) -> torch.Tensor:
 
 .. autoattribute:: Settings.autotune_log
 
-   When set, Helion writes per-config autotuning telemetry (config index, generation, status, perf, compile time, timestamp, config JSON) to ``<value>.csv`` and mirrors the autotune log output to ``<value>.log`` for population-based autotuners (currently ``PatternSearch`` and ``DifferentialEvolution``).
-   Controlled by ``HELION_AUTOTUNE_LOG``.
+   When set, Helion writes per-config telemetry (run id, timestamp, config id, generation, status, perf, compile time, config) to ``<value>.csv`` and mirrors the autotune log to ``<value>.log`` (for population-based autotuners: ``PatternSearch``, ``DifferentialEvolution``). Both append, so runs sharing one base path accumulate.
+   CSV rows join to ``.meta.jsonl`` via two hashes: ``run_id`` for the invocation — hash(kernel source, shapes, dtypes, hardware, codegen settings) — and ``config_id`` for the config. The codegen settings hashed into ``run_id`` are: backend, dot_precision, fast_math, static_shapes, index_dtype, allow_warp_specialize, triton_do_not_specialize, pallas_interpret, debug_dtype_asserts, persistent_reserved_sms (the full settings are recorded in ``.meta.jsonl``). Same config_id across started/ok/error and re-benchmarks. The full config is written inline in the trailing ``config`` column of the CSV; it is also stored in the ``.meta.jsonl`` configs map, which is written only when ``autotune_log_details`` is enabled (see below). Controlled by HELION_AUTOTUNE_LOG.
+
+
+
+.. autoattribute:: Settings.autotune_log_details
+
+   Opt-in to the cost-model dataset sidecar. When enabled (``HELION_AUTOTUNE_LOG_DETAILS=1``) and ``autotune_log`` is set, Helion appends one JSON record per run to ``<autotune_log>.meta.jsonl``: the kernel identity (``run_id``, name, source, shapes, dtypes, hardware), the full ``helion.settings`` (JSON-safe via ``json.dumps(default=str)``, so ``torch.dtype``/callables become strings), and a ``configs`` map from ``config_id`` to the config tested.
+   Recover a measured ``(config, perf)`` sample by joining a CSV row to its record: ``meta[run_id]["configs"][row["config_id"]]``. ``run_id`` may recur (re-runs, processes, ``autotune_best_of_k``), but the ``configs`` maps are union-safe (same ``config_id`` implies the same config), so de-duplicating on ``run_id`` is lossless. Searches restricted to user-pinned ``configs`` (without ``force_autotune``) are excluded as a biased slice (``.csv``/``.log`` still written); setting this without ``autotune_log`` collects nothing and warns once.
+   Controlled by ``HELION_AUTOTUNE_LOG_DETAILS``.
 
 .. autoattribute:: Settings.autotune_compile_timeout
 
@@ -232,7 +250,7 @@ Helion stores the best-performing configs discovered during autotuning in an on-
 - `HELION_CACHE_DIR`: Override the directory used to store cache entries. Defaults to PyTorch’s `torch._inductor` cache path (typically `/tmp/torchinductor_$USER/helion`).
 - `HELION_SKIP_CACHE`: Set to `1` to skip both reading and writing the autotuning cache. Useful for one-off experiments that should not affect cached state. To re-tune and save the result, use `HELION_FORCE_AUTOTUNE=1` instead.
 - `TRITON_STORE_BINARY_ONLY`: During autotuning, Helion sets this Triton environment variable to `1` by default, skipping storage of intermediate representations (`.ttir`, `.ttgir`, `.llir`, etc.) and keeping only compiled binaries and metadata. This reduces Triton cache disk usage by approximately 40%. To retain IRs for debugging, set `TRITON_STORE_BINARY_ONLY=0` before running.
-- `HELION_KEEP_TRITON_CACHE`: Set to `1` to keep the Triton cache entries for all candidate configs evaluated during autotuning. By default, Helion uses an ephemeral Triton cache directory during autotuning and only preserves the winning config's cache entry, avoiding significant disk bloat. Enable this if you need to inspect the compiled artifacts of non-winning configs for debugging.
+- `HELION_KEEP_CACHE`: Set to `1` to keep the backend compile-cache entries for all candidate configs evaluated during autotuning. By default, Helion uses an ephemeral cache directory during autotuning (`TRITON_CACHE_DIR` for the Triton backend, `CUTE_DSL_CACHE_DIR` for the CuTe backend) and only preserves the winning config's cache entry, avoiding significant disk bloat. Enable this if you need to inspect the compiled artifacts of non-winning configs for debugging. (`HELION_KEEP_TRITON_CACHE` is a deprecated alias that still works for the Triton backend.)
 
 See :class:`helion.autotuner.LocalAutotuneCache` for details on cache keys and behavior.
 
@@ -292,17 +310,12 @@ See :class:`helion.autotuner.LocalAutotuneCache` for details on cache keys and b
 
 Built-in values for ``HELION_AUTOTUNER`` include ``"LFBOTreeSearch"`` (default), ``"LFBOPatternSearch"``, ``"DESurrogateHybrid"``, ``"PatternSearch"``, ``"DifferentialEvolutionSearch"``, ``"FiniteSearch"``, and ``"RandomSearch"``.
 
-## Functions
-
-```{eval-rst}
-
-```
-
 ## Environment Variable Reference
 
 | Environment Variable | Maps To | Description |
 |----------------------|---------|-------------|
-| ``TRITON_F32_DEFAULT`` | ``dot_precision`` | Sets default floating-point precision for Triton dot products (``"tf32"``, ``"tf32x3"``, ``"ieee"``). |
+| ``TRITON_F32_DEFAULT`` | ``dot_precision`` | Sets default floating-point precision for Triton dot products (``"tf32"``, ``"tf32x3"``, ``"ieee"``). This variable does not apply to the Pallas backend. |
+| ``JAX_DEFAULT_MATMUL_PRECISION`` | ``dot_precision`` | Sets default matmul precision for Pallas dot products (JAX values: ``"default"``, ``"high"``, ``"highest"``, etc., mapped to Helion ``DotPrecision``). This variable does not apply to the Triton backend. |
 | ``HELION_INDEX_DTYPE`` | ``index_dtype`` | Choose the index dtype (accepts any ``torch.<dtype>`` name, e.g. ``int64``), or set to ``auto``/unset to allow Helion to pick ``int32`` vs ``int64`` based on input sizes. |
 | ``HELION_STATIC_SHAPES`` | ``static_shapes`` | Set to ``0``/``false`` to disable global static shape specialization. |
 | ``HELION_FAST_MATH`` | ``fast_math`` | Set to ``1`` to enable fast math approximations (Helion-level and Inductor-level). May reduce numerical precision. |

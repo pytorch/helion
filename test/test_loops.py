@@ -10,7 +10,6 @@ import torch
 
 import helion
 from helion import _compat
-from helion import exc
 from helion._compat import use_tileir_tunables
 from helion._compiler.static_loop_unroller import StaticLoopUnroller
 from helion._testing import DEVICE
@@ -338,11 +337,6 @@ class TestLoops(RefEagerTestBase, TestCase):
             return out
 
         x = torch.arange(37, device=DEVICE, dtype=torch.float32)
-        if _get_backend() == "cute":
-            with self.assertRaises(exc.Base):
-                code_and_output(copy_blockwise, (x,), block_sizes=[16])
-            return
-
         code, result = code_and_output(copy_blockwise, (x,), block_sizes=[16])
         torch.testing.assert_close(result, x)
         if _get_backend() == "triton":
@@ -414,7 +408,7 @@ class TestLoops(RefEagerTestBase, TestCase):
         else:
             torch.testing.assert_close(result, expected)
 
-    @xfailIfPallas("data-dependent bounds hit JAX tracing issues on pallas")
+    @xfailIfPallas("int64 index dtype not supported on Pallas")
     @skipIfXPU("worker crash on XPU")
     def test_data_dependent_bounds3(self):
         @helion.kernel()

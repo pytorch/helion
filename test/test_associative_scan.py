@@ -11,7 +11,6 @@ from helion._testing import TestCase
 from helion._testing import code_and_output
 from helion._testing import onlyBackends
 from helion._testing import skipIfRefEager
-from helion._testing import xfailIfCute
 import helion.language as hl
 from helion.runtime.settings import _get_backend
 
@@ -428,6 +427,10 @@ class TestAssociativeScan(RefEagerTestBase, TestCase):
         self.assertEqual(result.shape, x.shape)
         self.assertEqual(result.dtype, x.dtype)
 
+    @skipIfRefEager(
+        "torch._higher_order_ops.associative_scan maps to hl.associative_scan only during tracing; "
+        "ref eager mode runs the raw torch HOP, which is unsupported"
+    )
     def test_associative_scan_torch_hops_mapping(self):
         """Test that torch._higher_order_ops.associative_scan automatically maps to hl.associative_scan."""
 
@@ -521,7 +524,6 @@ class TestAssociativeScan(RefEagerTestBase, TestCase):
         # Verify @helion.kernel decorator doesn't appear in generated code
         self.assertNotIn("@helion.kernel", code)
 
-    @xfailIfCute("CUTe does not support tuple associative_scan yet")
     @skipIfRefEager(
         "torch._higher_order_ops.associative_scan with tuple arg is not supported by ref eager mode yet"
     )
@@ -573,10 +575,10 @@ class TestAssociativeScan(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result, expected, rtol=1e-4, atol=1e-4)
 
         # Verify the generated code structure
-        self.assertIn("def helion_combine_fn_", code)
-        self.assertIn("tl.associative_scan", code)
+        if _get_backend() == "triton":
+            self.assertIn("def helion_combine_fn_", code)
+            self.assertIn("tl.associative_scan", code)
 
-    @xfailIfCute("CUTe does not support tuple associative_scan yet")
     @skipIfRefEager(
         "torch._higher_order_ops.associative_scan with tuple arg is not supported by ref eager mode yet"
     )
@@ -633,10 +635,10 @@ class TestAssociativeScan(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result, expected, rtol=1e-4, atol=1e-4)
 
         # Verify the generated code structure
-        self.assertIn("def segmented_combine_fn_", code)
-        self.assertIn("tl.associative_scan", code)
+        if _get_backend() == "triton":
+            self.assertIn("def segmented_combine_fn_", code)
+            self.assertIn("tl.associative_scan", code)
 
-    @xfailIfCute("CUTe does not support tuple associative_scan yet")
     @skipIfRefEager(
         "torch._higher_order_ops.associative_scan with tuple arg is not supported by ref eager mode yet"
     )
@@ -705,10 +707,10 @@ class TestAssociativeScan(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result_indices, expected_indices)
 
         # Verify the generated code structure
-        self.assertIn("def argmax_combine_fn_", code)
-        self.assertIn("tl.associative_scan", code)
+        if _get_backend() == "triton":
+            self.assertIn("def argmax_combine_fn_", code)
+            self.assertIn("tl.associative_scan", code)
 
-    @xfailIfCute("CUTe associative_scan supports only last-dimension scans")
     def test_associative_scan_in_helper_function(self):
         """Test calling a function that internally uses hl.associative_scan."""
 
@@ -933,7 +935,6 @@ class TestAssociativeScan(RefEagerTestBase, TestCase):
             self.assertIn("param_0 + param_1", code)
             self.assertIn("param_0 * param_1", code)
 
-    @xfailIfCute("CUTe does not support tuple associative_scan yet")
     @skipIfRefEager(
         "torch._higher_order_ops.associative_scan with tuple arg is not supported by ref eager mode yet"
     )
@@ -984,10 +985,10 @@ class TestAssociativeScan(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result, expected)
 
         # Verify the generated code structure
-        self.assertIn("def helion_combine_tuple_fn_", code)
-        self.assertIn("tl.associative_scan", code)
+        if _get_backend() == "triton":
+            self.assertIn("def helion_combine_tuple_fn_", code)
+            self.assertIn("tl.associative_scan", code)
 
-    @xfailIfCute("CUTe does not support tuple associative_scan yet")
     def test_associative_scan_argmax_tuple_format(self):
         """Test cumulative argmax using tuple format combine function."""
 
@@ -1053,8 +1054,9 @@ class TestAssociativeScan(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result_indices, expected_indices)
 
         # Verify the generated code structure
-        self.assertIn("def argmax_combine_tuple_fn_", code)
-        self.assertIn("tl.associative_scan", code)
+        if _get_backend() == "triton":
+            self.assertIn("def argmax_combine_tuple_fn_", code)
+            self.assertIn("tl.associative_scan", code)
 
 
 if __name__ == "__main__":

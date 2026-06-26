@@ -1,11 +1,16 @@
 from __future__ import annotations
 
+import base64
 from contextlib import suppress
 import contextvars
 from dataclasses import dataclass
+import enum
+import hashlib
 import importlib
 import inspect
+import json
 import linecache
+import logging
 import os
 import sys
 from typing import TYPE_CHECKING
@@ -20,14 +25,6 @@ from .. import exc
 from .._compiler.cute.strategies import tcgen05_default_epilogue_tile_expr
 from .._compiler.cute.strategies import tcgen05_explicit_d_store_tile_expr
 from .._compiler.cute.strategies import tcgen05_smem_layout_expr
-from .._compiler.cute.tcgen05_constants import TCGEN05_DIRECT_ENTRY_CLUSTER_M
-from .._compiler.cute.tcgen05_constants import (
-    TCGEN05_DIRECT_ENTRY_SHAPE_SETS_BY_BK as _DIRECT_ENTRY_SHAPE_SETS_BY_BK,
-)
-from .._compiler.cute.tcgen05_constants import (
-    TCGEN05_DIRECT_ENTRY_STAGE_TUPLES_BY_BK as _DIRECT_ENTRY_STAGE_TUPLES_BY_BK,
-)
-from .._compiler.cute.tcgen05_constants import TCGEN05_DIRECT_ENTRY_TOTAL_WORK_CLUSTERS
 from .._utils import triton_is_available
 from .config import Config as Config
 from .kernel import Kernel as Kernel
@@ -39,6 +36,8 @@ if TYPE_CHECKING:
     from collections.abc import Iterable
 
     import jax
+
+log: logging.Logger = logging.getLogger(__name__)
 
 _CUTLASS_SHUTDOWN_PATCHED = False
 
@@ -744,6 +743,45 @@ def _make_helion_static_jax_callable_class() -> type:
     return _HelionStaticJaxCallable
 
 
+def _pallas_output_only_descriptors(
+    _output_indices: list[int],
+    arg_to_tensor_pos: dict[int, int],
+) -> tuple[tuple[int, int], ...]:
+    """Return ``((out_idx, orig_pos), ...)`` for write-only outputs.
+
+    These positions appear in ``_output_indices`` but not in
+    ``arg_to_tensor_pos`` — i.e. the kernel produces them as fresh
+    buffers rather than aliasing back into an input tensor.  Both the
+    torch fast-path (``_LauncherFastPath``) and the JAX-export
+    launcher iterate this tuple to pick output-only results out of
+    the full ``pallas_call`` result list.
+    """
+    return tuple(
+        (out_idx, orig_pos)
+        for out_idx, orig_pos in enumerate(_output_indices)
+        if orig_pos not in arg_to_tensor_pos
+    )
+
+
+def _pallas_padded_output_dims_by_arg(
+    _ds_pad_dims: list[tuple[int, int, int, int]],
+    output_arg_set: frozenset[int] | set[int],
+) -> dict[int, list[int]]:
+    """Group ``_ds_pad_dims`` entries (arg_idx → padded dims) for output args.
+
+    ``_ds_pad_dims`` carries ``(arg_idx, dim, block_size, extra_pad)``
+    tuples for every padded position; this filter keeps only the ones
+    whose ``arg_idx`` is in ``output_arg_set`` so callers can slice
+    those outputs back to their original shapes.  Both the torch path
+    (via ``_LauncherFastPath``) and the JAX-export launcher use this.
+    """
+    padded_dims_by_arg: dict[int, list[int]] = {}
+    for arg_idx, dim, _bs, _extra in _ds_pad_dims:
+        if arg_idx in output_arg_set:
+            padded_dims_by_arg.setdefault(arg_idx, []).append(dim)
+    return padded_dims_by_arg
+
+
 class _LauncherFastPath:
     """Precomputed per-call state stored on the cached launcher entry."""
 
@@ -767,31 +805,25 @@ class _LauncherFastPath:
         # Tuple iteration is faster than list in the hot-path comprehension.
         self.tensor_arg_indices_tuple: tuple[int, ...] = tuple(tensor_arg_indices)
 
-        descriptors: list[tuple[int, int]] = [
-            (out_idx, orig_pos)
-            for out_idx, orig_pos in enumerate(_output_indices)
-            if orig_pos not in arg_to_tensor_pos
-        ]
-        self.output_only_descriptors: tuple[tuple[int, int], ...] = tuple(descriptors)
-        self.output_only_count: int = len(descriptors)
+        self.output_only_descriptors: tuple[tuple[int, int], ...] = (
+            _pallas_output_only_descriptors(_output_indices, arg_to_tensor_pos)
+        )
+        self.output_only_count: int = len(self.output_only_descriptors)
 
         # ``None`` sentinel: filled in on the first call once we know if any pad is non-zero.
         self.ds_pad_required: bool | None = None
 
         if _ds_pad_dims:
-            output_arg_set = set(_output_indices)
-            padded_dims_by_arg: dict[int, list[int]] = {}
-            padded_output_arg_indices: set[int] = set()
-            for arg_idx, dim, _bs, _extra in _ds_pad_dims:
-                if arg_idx in output_arg_set:
-                    padded_dims_by_arg.setdefault(arg_idx, []).append(dim)
-                    padded_output_arg_indices.add(arg_idx)
-            self.padded_output_dims_by_arg: dict[int, list[int]] = padded_dims_by_arg
+            self.padded_output_dims_by_arg: dict[int, list[int]] = (
+                _pallas_padded_output_dims_by_arg(_ds_pad_dims, set(_output_indices))
+            )
             self.padded_output_arg_indices: frozenset[int] = frozenset(
-                padded_output_arg_indices
+                self.padded_output_dims_by_arg.keys()
             )
             self.ds_pad_orig_output_arg_indices: frozenset[int] = frozenset(
-                idx for idx in padded_output_arg_indices if idx in arg_to_tensor_pos
+                idx
+                for idx in self.padded_output_arg_indices
+                if idx in arg_to_tensor_pos
             )
         else:
             self.padded_output_dims_by_arg = {}
@@ -1281,6 +1313,455 @@ def _pallas_apply_ds_padding(
     return tuple(args_list), orig_output_tensors
 
 
+def _build_matmul_dot_general_jit_fn(
+    spec: dict[str, object],
+) -> Callable[..., object]:
+    """Build a ``jax.jit(lax.dot_general)`` wrapper replacing the
+    ``pl.pallas_call`` for a single-launch (no-tiling) Pallas matmul.
+
+    Same call signature as the ``pl.pallas_call`` it replaces, so torch_tpu's
+    dispatch is unchanged.  XLA sees a plain ``dot_general`` op (so
+    ``cross_program_prefetch_index`` is reachable), bypassing the Pallas
+    ``custom_call`` opacity that blocks the prefetch planner.  ``spec`` (from
+    ``_detect_matmul_dot_general_lowering``) carries the lhs/rhs arg positions
+    and the f32-accumulator flag.
+    """
+    import jax
+    import jax.lax as lax
+    import jax.numpy as jnp
+
+    out_dtype_str = cast("str", spec["out_dtype"])
+    out_jnp_dtype = cast("Any", _pallas_jnp_dtype_map().get(out_dtype_str, jnp.float32))
+    f32_accumulator = bool(spec.get("f32_accumulator"))
+    lhs_idx = int(cast("int", spec["lhs_tensor_arg_index"]))
+    rhs_idx = int(cast("int", spec["rhs_tensor_arg_index"]))
+
+    # Accumulate in f32 and cast back only when the output is narrower than f32
+    # (bf16/fp16 out); otherwise accumulate straight into the output dtype.
+    needs_cast = f32_accumulator and out_jnp_dtype is not jnp.float32
+    preferred = jnp.float32 if needs_cast else out_jnp_dtype
+
+    def matmul_fn(*tensor_inputs: Any) -> Any:  # noqa: ANN401
+        result = lax.dot_general(
+            tensor_inputs[lhs_idx],
+            tensor_inputs[rhs_idx],
+            dimension_numbers=(((1,), (0,)), ((), ())),
+            preferred_element_type=preferred,
+        )
+        if needs_cast:
+            result = lax.convert_element_type(result, out_jnp_dtype)
+        return result
+
+    return cast("Callable[..., object]", jax.jit(matmul_fn))
+
+
+class _PallasLoopKind(enum.Enum):
+    """Which ``pallas_loop_type`` flavour a launcher is compiling for.
+
+    Drives the spec-build / scratch / kernel-wrap branches inside
+    :func:`_pallas_compile_jit_fn`; the values match the
+    ``pallas_loop_type`` strings codegen emits so the JAX-export path
+    can resolve them straight from the bound kernel's config.
+    """
+
+    UNROLL = "unroll"
+    EMIT_PIPELINE = "emit_pipeline"
+    FORI_LOOP = "fori_loop"
+    COMPACT_WORKLIST = "compact_worklist"
+
+
+def _pallas_build_scratch_shapes(
+    pltpu: object,
+    jnp: object,
+    scratch_entries: list[object],
+) -> list[object]:
+    """Translate codegen scratch-shape descriptors into ``pltpu`` objects.
+
+    Each entry is either ``(shape, dtype_str, scratch_type)`` or the
+    legacy 2-tuple ``(shape, dtype_str)`` form (``scratch_type``
+    defaults to ``"vmem"``).  Supported scratch types: ``"vmem"`` and
+    ``"dma_semaphore"``.
+    """
+    _jnp_dtype_map = _pallas_jnp_dtype_map()
+    scratch_shapes: list[object] = []
+    for entry in scratch_entries:
+        if len(entry) == 3:  # type: ignore[arg-type]
+            shape, dtype_str, scratch_type = entry  # type: ignore[misc]
+        else:
+            shape, dtype_str = entry  # type: ignore[misc]
+            scratch_type = "vmem"
+        if scratch_type == "dma_semaphore":
+            scratch_shapes.append(pltpu.SemaphoreType.DMA(()))  # type: ignore[union-attr]
+        else:
+            assert dtype_str is not None
+            jnp_dtype = _jnp_dtype_map.get(dtype_str, jnp.float32)  # type: ignore[union-attr]
+            scratch_shapes.append(
+                pltpu.VMEM(shape, jnp_dtype)  # type: ignore[union-attr]  # pyrefly: ignore[bad-argument-type]
+            )
+    return scratch_shapes
+
+
+def _pallas_check_vmem_or_raise(
+    pl: object,
+    pltpu: object,
+    in_specs: list[object] | None,
+    out_specs: list[object] | object | None,
+    scratch_shapes: list[object] | None,
+    args: tuple[object, ...],
+    tensor_arg_indices: list[int],
+    output_indices: list[int],
+    pallas_aliases: dict[int, int] | None,
+) -> None:
+    """Estimate the kernel's VMEM footprint and raise if it exceeds the limit."""
+    estimated_vmem = _estimate_pallas_vmem_bytes(
+        pl,
+        pltpu,
+        in_specs,
+        out_specs,
+        scratch_shapes,
+        args,
+        tensor_arg_indices,
+        output_indices,
+        pallas_aliases,
+    )
+    vmem_limit_bytes = _get_vmem_limit_bytes(pltpu)
+    if estimated_vmem > vmem_limit_bytes:
+        raise RuntimeError(
+            f"XLA:TPU compile permanent error. Ran out of memory in memory space vmem. "
+            f"Estimated {estimated_vmem / 1e6:.2f}MB exceeds {vmem_limit_bytes / 1e6:.2f}MB vmem capacity."
+        )
+
+
+@dataclass(slots=True)
+class _PallasCompileResult:
+    """Bundle returned by :func:`_pallas_compile_jit_fn`.
+
+    Carries the compiled ``pl.pallas_call`` plus all per-arg metadata
+    that downstream consumers (``_pallas_build_callable``,
+    ``_LauncherFastPath`` setup, the JAX-export launcher) need to wire
+    inputs and outputs.  The fields mirror the named portion of the
+    ``_pallas_prepare_args`` return tuple so consumers can use them
+    directly without re-running argument prep.
+    """
+
+    jit_fn: object
+    tensor_arg_indices: list[int]
+    output_only_indices: list[int]
+    arg_to_tensor_pos: dict[int, int]
+    inplace_positions: set[int]
+    pallas_aliases: dict[int, int]
+
+
+def _pallas_compile_jit_fn(
+    pallas_kernel: object,
+    grid: tuple[int, ...],
+    args: tuple[object, ...],
+    *,
+    kind: _PallasLoopKind,
+    _output_indices: list[int],
+    _inplace_indices: list[int] | None,
+    _block_spec_info: _BlockSpecInfo | None,
+    _smem_arg_indices: list[int] | None,
+    _scratch_shapes: list[object] | None,
+    _pipeline_arg_indices: list[int] | None,
+    _matmul_dot_general: dict[str, object] | None,
+    interpret: bool,
+) -> _PallasCompileResult:
+    """Build the ``pl.pallas_call`` jit_fn shared by all Pallas launchers.
+
+    ``kind`` selects the loop-spec flavour:
+
+    - :attr:`_PallasLoopKind.UNROLL`: simple grid + ``BlockSpec`` per arg
+      (no scratch)
+    - :attr:`_PallasLoopKind.EMIT_PIPELINE`: ``PrefetchScalarGridSpec``
+      with HBM refs for pipeline-body tensors and VMEM scratch
+    - :attr:`_PallasLoopKind.FORI_LOOP`: same gridspec/scratch shape as
+      ``EMIT_PIPELINE``; the kernel body uses ``jax.lax.fori_loop`` with
+      manual DMA
+
+    When ``_matmul_dot_general`` is provided (only on ``UNROLL`` and
+    ``EMIT_PIPELINE`` no-tiling matmul configs), substitutes
+    ``jax.jit(lax.dot_general)`` for ``pl.pallas_call`` and skips the
+    VMEM check; XLA's planner streams the contraction so the
+    pallas_call lowering's VMEM estimate doesn't apply.
+
+    ``args`` must already have any ds-padding applied — this helper
+    builds specs from the post-pad shapes.  Returns a
+    :class:`_PallasCompileResult` so launchers can wrap the jit_fn in a
+    JaxCallable while the JAX-export path can call it directly.
+    """
+    from jax.experimental import pallas as pl
+    from jax.experimental.pallas import tpu as pltpu
+    import jax.numpy as jnp
+
+    (
+        tensor_arg_indices,
+        output_only_indices,
+        non_tensor_args,
+        n_tensor_inputs,
+        arg_to_tensor_pos,
+        inplace_positions,
+        out_shapes,
+        pallas_aliases,
+    ) = _pallas_prepare_args(
+        args, _output_indices, _inplace_indices, interpret=interpret
+    )
+
+    copy_guards, dimension_semantics = _pallas_shared_output_plan(
+        grid,
+        tensor_arg_indices,
+        output_only_indices,
+        _output_indices,
+        inplace_positions,
+        _block_spec_info,
+    )
+
+    if kind is _PallasLoopKind.UNROLL:
+        in_specs, out_specs = _pallas_build_block_specs(
+            pl,
+            jnp,
+            pltpu,
+            grid,
+            args,
+            tensor_arg_indices,
+            _output_indices,
+            _block_spec_info,
+            _smem_arg_indices,
+            output_only_indices,
+        )
+        scratch_shapes: list[object] = []
+        skip_inplace_copy: set[int] = set()
+    else:
+        assert _block_spec_info is not None, (
+            f"{kind.value!r} launcher requires _block_spec_info from codegen"
+        )
+        scratch_shapes = _pallas_build_scratch_shapes(pltpu, jnp, _scratch_shapes or [])
+        in_specs, out_specs = _pallas_build_pipeline_specs(
+            pl,
+            jnp,
+            pltpu,
+            grid,
+            args,
+            tensor_arg_indices,
+            _output_indices,
+            _block_spec_info,
+            _pipeline_arg_indices,
+            output_only_indices,
+            smem_arg_indices=_smem_arg_indices,
+        )
+        skip_inplace_copy = set(_pipeline_arg_indices or [])
+
+    reordered_kernel = _pallas_make_reordered_kernel(
+        pallas_kernel,
+        args,
+        tensor_arg_indices,
+        non_tensor_args,
+        n_tensor_inputs,
+        _output_indices,
+        inplace_positions,
+        arg_to_tensor_pos,
+        n_extra_refs=len(scratch_shapes),
+        skip_inplace_copy=skip_inplace_copy,
+        _smem_arg_indices=_smem_arg_indices,
+        _copy_guards=copy_guards,
+    )
+
+    out_shape_arg = out_shapes if len(out_shapes) > 1 else out_shapes[0]
+
+    # The VMEM estimate only applies to the ``pl.pallas_call`` lowering.
+    # The ``jax.jit(lax.dot_general)`` substitution streams the
+    # contraction through XLA's planner, so the pallas_call estimate
+    # doesn't apply — skip the check there.
+    if _matmul_dot_general is None:
+        _pallas_check_vmem_or_raise(
+            pl,
+            pltpu,
+            in_specs,
+            out_specs,
+            scratch_shapes if kind is not _PallasLoopKind.UNROLL else None,
+            args,
+            tensor_arg_indices,
+            _output_indices,
+            pallas_aliases,
+        )
+
+    if _matmul_dot_general is not None:
+        # Substitute ``lax.dot_general`` for ``pl.pallas_call`` on
+        # no-tiling matmul configs so XLA sees a regular ``dot`` and
+        # can attach ``cross_program_prefetch_index``.
+        jit_fn = _build_matmul_dot_general_jit_fn(_matmul_dot_general)
+    else:
+        pallas_call_kwargs: dict[str, object] = {"out_shape": out_shape_arg}
+        if kind is _PallasLoopKind.UNROLL:
+            pallas_call_kwargs["grid"] = grid
+            if in_specs is not None:
+                pallas_call_kwargs["in_specs"] = in_specs
+                pallas_call_kwargs["out_specs"] = out_specs
+            if any(sem != "parallel" for sem in dimension_semantics):
+                pallas_call_kwargs["compiler_params"] = pltpu.CompilerParams(  # pyrefly: ignore[bad-instantiation]
+                    dimension_semantics=dimension_semantics,
+                )
+        else:
+            pallas_call_kwargs["grid_spec"] = pltpu.PrefetchScalarGridSpec(  # pyrefly: ignore[missing-attribute]
+                num_scalar_prefetch=0,
+                in_specs=in_specs,
+                out_specs=out_specs,
+                scratch_shapes=scratch_shapes,  # pyrefly: ignore[bad-argument-type]
+                grid=grid,
+            )
+            pallas_call_kwargs["compiler_params"] = pltpu.CompilerParams(  # pyrefly: ignore[bad-instantiation]
+                dimension_semantics=dimension_semantics,
+            )
+        if interpret:
+            pallas_call_kwargs["interpret"] = True
+
+        jit_fn = pl.pallas_call(  # type: ignore[union-attr]
+            reordered_kernel,  # pyrefly: ignore[bad-argument-type]
+            **pallas_call_kwargs,  # type: ignore[arg-type]
+        )
+
+    return _PallasCompileResult(
+        jit_fn=jit_fn,
+        tensor_arg_indices=tensor_arg_indices,
+        output_only_indices=output_only_indices,
+        arg_to_tensor_pos=arg_to_tensor_pos,
+        inplace_positions=inplace_positions,
+        pallas_aliases=pallas_aliases,
+    )
+
+
+def _pallas_install_launcher_cache(
+    pallas_kernel: object,
+    grid: tuple[int, ...],
+    args: tuple[object, ...],
+    *,
+    kind: _PallasLoopKind,
+    cache_attr: str,
+    trace_key_suffix: str,
+    _output_indices: list[int] | None,
+    _inplace_indices: list[int] | None,
+    _block_spec_info: _BlockSpecInfo | None,
+    _smem_arg_indices: list[int] | None,
+    _scratch_shapes: list[object] | None,
+    _pipeline_arg_indices: list[int] | None,
+    _ds_pad_dims: list[tuple[int, int, int, int]] | None,
+    _pallas_interpret: bool | None,
+    _matmul_dot_general: dict[str, object] | None = None,
+) -> tuple[object, ...]:
+    """Cache-miss path shared by all three torch-tensor Pallas launchers.
+
+    Builds the ``pl.pallas_call`` jit_fn via :func:`_pallas_compile_jit_fn`,
+    wraps it in a ``JaxCallable`` (or interpret-mode shim), seeds the
+    ``_LauncherFastPath`` slot, stores the result on
+    ``pallas_kernel.<cache_attr>``, and returns the freshly-installed cache
+    tuple so the caller can fall straight through to the shared invoke.
+    """
+    interpret = (
+        _pallas_interpret
+        if _pallas_interpret is not None
+        else _module_is_pallas_interpret()
+    )
+    if interpret:
+        _ensure_cpu_tpu_info()
+
+    output_indices = _output_indices if _output_indices is not None else []
+
+    # Build the pallas specs from ds-padded shapes on a throwaway copy so
+    # ``args`` stays unpadded for the shared invoke below to pad fresh.
+    spec_args = args
+    if _ds_pad_dims:
+        spec_args, _ = _pallas_apply_ds_padding(args, output_indices, _ds_pad_dims)
+
+    _pallas_check_dtypes(spec_args)
+
+    result = _pallas_compile_jit_fn(
+        pallas_kernel,
+        grid,
+        spec_args,
+        kind=kind,
+        _output_indices=output_indices,
+        _inplace_indices=_inplace_indices,
+        _block_spec_info=_block_spec_info,
+        _smem_arg_indices=_smem_arg_indices,
+        _scratch_shapes=_scratch_shapes,
+        _pipeline_arg_indices=_pipeline_arg_indices,
+        _matmul_dot_general=_matmul_dot_general,
+        interpret=interpret,
+    )
+
+    jax_callable = _pallas_build_callable(
+        pallas_kernel,
+        grid,
+        cast("Callable[..., object]", result.jit_fn),
+        output_indices,
+        result.arg_to_tensor_pos,
+        result.tensor_arg_indices,
+        cache_attr=cache_attr,
+        call_aliases=result.pallas_aliases,
+        trace_key_suffix=trace_key_suffix,
+        interpret=interpret,
+    )
+
+    fast_path = _LauncherFastPath(
+        result.tensor_arg_indices,
+        result.arg_to_tensor_pos,
+        output_indices,
+        _ds_pad_dims,
+    )
+    cache = (
+        grid,
+        jax_callable,
+        result.tensor_arg_indices,
+        result.arg_to_tensor_pos,
+        fast_path,
+        None,
+    )
+    setattr(pallas_kernel, cache_attr, cache)
+    return cache
+
+
+def _pallas_invoke_cached_launcher(
+    pallas_kernel: object,
+    cache: tuple[object, ...],
+    args: tuple[object, ...],
+    *,
+    cache_attr: str,
+    _ds_pad_dims: list[tuple[int, int, int, int]] | None,
+) -> object:
+    """Shared fast-invoke tail: lift direct-call snapshot, ds-pad, dispatch."""
+    _grid = cache[0]
+    jax_callable = cache[1]
+    tensor_arg_indices = cast("list[int]", cache[2])
+    arg_to_tensor_pos = cast("dict[int, int]", cache[3])
+    fast_path = cast("_LauncherFastPath", cache[4])
+    direct_call = cast("_DirectCallKernel | None", cache[5])
+    if direct_call is None:
+        # Lazily lift the direct-call kernel off the JaxCallable subclass.
+        direct_call = getattr(jax_callable, "_helion_direct_call", None)
+        if direct_call is not None:
+            cache = (
+                _grid,
+                jax_callable,
+                tensor_arg_indices,
+                arg_to_tensor_pos,
+                fast_path,
+                direct_call,
+            )
+            setattr(pallas_kernel, cache_attr, cache)
+
+    _orig_output_tensors: dict[int, torch.Tensor] | None = None
+    if _ds_pad_dims and fast_path.ds_pad_required is not False:
+        args, _orig_output_tensors, _ = _pallas_apply_ds_padding_fast(
+            args,
+            _ds_pad_dims,
+            fast_path,
+            fast_path.padded_output_arg_indices,
+        )
+    return _pallas_invoke_and_return_fast(
+        jax_callable, args, fast_path, _orig_output_tensors, direct_call
+    )
+
+
 def default_pallas_launcher(
     pallas_kernel: object,
     grid: tuple[int, ...],
@@ -1291,6 +1772,7 @@ def default_pallas_launcher(
     _smem_arg_indices: list[int] | None = None,
     _ds_pad_dims: list[tuple[int, int, int, int]] | None = None,
     _pallas_interpret: bool | None = None,
+    _matmul_dot_general: dict[str, object] | None = None,
     **kwargs: object,
 ) -> object:
     """Default launcher for Pallas kernels on TPU (or CPU with interpret=True).
@@ -1307,178 +1789,30 @@ def default_pallas_launcher(
     """
     cache = getattr(pallas_kernel, "_pallas_cache", None)
     if cache is None or cache[0] != grid:
-        # Cold path: build the JaxCallable + ``_LauncherFastPath``, cache them,
-        # and fall through to the shared fast invoke below (so the first call
-        # exercises it too).  ``interpret`` is only needed here.
-        interpret = (
-            _pallas_interpret
-            if _pallas_interpret is not None
-            else _module_is_pallas_interpret()
-        )
-        if interpret:
-            _ensure_cpu_tpu_info()
-
-        if _output_indices is None:
-            _output_indices = []
-
-        # Build the pallas specs from ds-padded shapes on a throwaway copy so
-        # ``args`` stays unpadded for the shared invoke below to pad fresh.
-        spec_args = args
-        if _ds_pad_dims:
-            spec_args, _ = _pallas_apply_ds_padding(args, _output_indices, _ds_pad_dims)
-
-        _pallas_check_dtypes(spec_args)
-
-        from jax.experimental import pallas as pl
-        from jax.experimental.pallas import tpu as pltpu
-        import jax.numpy as jnp
-
-        (
-            tensor_arg_indices,
-            output_only_indices,
-            non_tensor_args,
-            n_tensor_inputs,
-            arg_to_tensor_pos,
-            inplace_positions,
-            out_shapes,
-            pallas_aliases,
-        ) = _pallas_prepare_args(
-            spec_args, _output_indices, _inplace_indices, interpret=interpret
-        )
-
-        copy_guards, dimension_semantics = _pallas_shared_output_plan(
-            grid,
-            tensor_arg_indices,
-            output_only_indices,
-            _output_indices,
-            inplace_positions,
-            _block_spec_info,
-        )
-        in_specs, out_specs = _pallas_build_block_specs(
-            pl,
-            jnp,
-            pltpu,
-            grid,
-            spec_args,
-            tensor_arg_indices,
-            _output_indices,
-            _block_spec_info,
-            _smem_arg_indices,
-            output_only_indices,
-        )
-
-        reordered_kernel = _pallas_make_reordered_kernel(
-            pallas_kernel,
-            spec_args,
-            tensor_arg_indices,
-            non_tensor_args,
-            n_tensor_inputs,
-            _output_indices,
-            inplace_positions,
-            arg_to_tensor_pos,
-            _smem_arg_indices=_smem_arg_indices,
-            _copy_guards=copy_guards,
-        )
-
-        out_shape_arg = out_shapes if len(out_shapes) > 1 else out_shapes[0]
-
-        estimated_vmem = _estimate_pallas_vmem_bytes(
-            pl,
-            pltpu,
-            in_specs,
-            out_specs,
-            None,
-            spec_args,
-            tensor_arg_indices,
-            _output_indices,
-            pallas_aliases,
-        )
-        vmem_limit_bytes = _get_vmem_limit_bytes(pltpu)
-        if estimated_vmem > vmem_limit_bytes:
-            raise RuntimeError(
-                f"XLA:TPU compile permanent error. Ran out of memory in memory space vmem. "
-                f"Estimated {estimated_vmem / 1e6:.2f}MB exceeds {vmem_limit_bytes / 1e6:.2f}MB vmem capacity."
-            )
-
-        pallas_call_kwargs: dict[str, object] = {
-            "out_shape": out_shape_arg,
-            "grid": grid,
-        }
-        if interpret:
-            pallas_call_kwargs["interpret"] = True
-        if in_specs is not None:
-            pallas_call_kwargs["in_specs"] = in_specs
-            pallas_call_kwargs["out_specs"] = out_specs
-        if any(sem != "parallel" for sem in dimension_semantics):
-            pallas_call_kwargs["compiler_params"] = pltpu.CompilerParams(  # pyrefly: ignore[bad-instantiation]
-                dimension_semantics=dimension_semantics,
-            )
-
-        jit_fn = pl.pallas_call(
-            reordered_kernel,  # pyrefly: ignore[bad-argument-type]
-            **pallas_call_kwargs,  # type: ignore[arg-type]
-        )
-
-        jax_callable = _pallas_build_callable(
+        cache = _pallas_install_launcher_cache(
             pallas_kernel,
             grid,
-            jit_fn,
-            _output_indices,
-            arg_to_tensor_pos,
-            tensor_arg_indices,
-            cache_attr="_pallas_cache",
-            call_aliases=pallas_aliases,
-            interpret=interpret,
-        )
-
-        fast_path = _LauncherFastPath(
-            tensor_arg_indices,
-            arg_to_tensor_pos,
-            _output_indices,
-            _ds_pad_dims,
-        )
-        pallas_kernel._pallas_cache = (  # pyrefly: ignore[missing-attribute]
-            grid,
-            jax_callable,
-            tensor_arg_indices,
-            arg_to_tensor_pos,
-            fast_path,
-            None,
-        )
-        cache = pallas_kernel._pallas_cache  # pyrefly: ignore[missing-attribute]
-
-    # Shared fast invoke: first call (just-built cache) and every warm call.
-    (
-        _,
-        jax_callable,
-        tensor_arg_indices,
-        arg_to_tensor_pos,
-        fast_path,
-        direct_call,
-    ) = cache
-    if direct_call is None:
-        # Lazily lift the direct-call kernel off the JaxCallable subclass.
-        direct_call = getattr(jax_callable, "_helion_direct_call", None)
-        if direct_call is not None:
-            pallas_kernel._pallas_cache = (  # pyrefly: ignore[missing-attribute]
-                cache[0],
-                jax_callable,
-                tensor_arg_indices,
-                arg_to_tensor_pos,
-                fast_path,
-                direct_call,
-            )
-
-    _orig_output_tensors: dict[int, torch.Tensor] | None = None
-    if _ds_pad_dims and fast_path.ds_pad_required is not False:
-        args, _orig_output_tensors, _ = _pallas_apply_ds_padding_fast(
             args,
-            _ds_pad_dims,
-            fast_path,
-            fast_path.padded_output_arg_indices,
+            kind=_PallasLoopKind.UNROLL,
+            cache_attr="_pallas_cache",
+            trace_key_suffix="",
+            _output_indices=_output_indices,
+            _inplace_indices=_inplace_indices,
+            _block_spec_info=_block_spec_info,
+            _smem_arg_indices=_smem_arg_indices,
+            _scratch_shapes=None,
+            _pipeline_arg_indices=None,
+            _ds_pad_dims=_ds_pad_dims,
+            _pallas_interpret=_pallas_interpret,
+            _matmul_dot_general=_matmul_dot_general,
         )
-    return _pallas_invoke_and_return_fast(
-        jax_callable, args, fast_path, _orig_output_tensors, direct_call
+
+    return _pallas_invoke_cached_launcher(
+        pallas_kernel,
+        cache,
+        args,
+        cache_attr="_pallas_cache",
+        _ds_pad_dims=_ds_pad_dims,
     )
 
 
@@ -1494,6 +1828,7 @@ def default_pallas_pipeline_launcher(
     _ds_pad_dims: list[tuple[int, int, int, int]] | None = None,
     _smem_arg_indices: list[int] | None = None,
     _pallas_interpret: bool | None = None,
+    _matmul_dot_general: dict[str, object] | None = None,
     **kwargs: object,
 ) -> object:
     """Launcher for Pallas kernels using PrefetchScalarGridSpec with scratch memory.
@@ -1504,206 +1839,30 @@ def default_pallas_pipeline_launcher(
     """
     cache = getattr(pallas_kernel, "_pallas_pipeline_cache", None)
     if cache is None or cache[0] != grid:
-        interpret = (
-            _pallas_interpret
-            if _pallas_interpret is not None
-            else _module_is_pallas_interpret()
-        )
-        if interpret:
-            _ensure_cpu_tpu_info()
-
-        if _output_indices is None:
-            _output_indices = []
-        if _scratch_shapes is None:
-            _scratch_shapes = []
-
-        # Build the pallas specs from ds-padded shapes on a throwaway copy so
-        # ``args`` stays unpadded for the shared invoke below to pad fresh.
-        spec_args = args
-        if _ds_pad_dims:
-            spec_args, _ = _pallas_apply_ds_padding(args, _output_indices, _ds_pad_dims)
-
-        _pallas_check_dtypes(spec_args)
-
-        from jax.experimental import pallas as pl
-        from jax.experimental.pallas import tpu as pltpu
-        import jax.numpy as jnp
-
-        (
-            tensor_arg_indices,
-            output_only_indices,
-            non_tensor_args,
-            n_tensor_inputs,
-            arg_to_tensor_pos,
-            inplace_positions,
-            out_shapes,
-            pallas_aliases,
-        ) = _pallas_prepare_args(
-            spec_args, _output_indices, _inplace_indices, interpret=interpret
-        )
-
-        # Build scratch shapes for VMEM
-        _jnp_dtype_map = _pallas_jnp_dtype_map()
-        scratch_shapes = []
-        for scratch_entry in _scratch_shapes:
-            if len(scratch_entry) == 3:
-                shape, dtype_str, scratch_type = scratch_entry
-            else:
-                shape, dtype_str = scratch_entry  # type: ignore[misc]
-                scratch_type = "vmem"
-            if scratch_type == "dma_semaphore":
-                scratch_shapes.append(pltpu.SemaphoreType.DMA(()))
-            else:
-                jnp_dtype = _jnp_dtype_map.get(dtype_str, jnp.float32)
-                scratch_shapes.append(
-                    pltpu.VMEM(shape, jnp_dtype)  # pyrefly: ignore[bad-argument-type]
-                )
-
-        assert _block_spec_info is not None, (
-            "emit_pipeline launcher requires _block_spec_info from codegen"
-        )
-        copy_guards, dimension_semantics = _pallas_shared_output_plan(
-            grid,
-            tensor_arg_indices,
-            output_only_indices,
-            _output_indices,
-            inplace_positions,
-            _block_spec_info,
-        )
-
-        in_specs_list, out_specs = _pallas_build_pipeline_specs(
-            pl,
-            jnp,
-            pltpu,
-            grid,
-            spec_args,
-            tensor_arg_indices,
-            _output_indices,
-            _block_spec_info,
-            _pipeline_arg_indices,
-            output_only_indices,
-            smem_arg_indices=_smem_arg_indices,
-        )
-
-        _pipeline_set = set(_pipeline_arg_indices or [])
-        reordered_kernel = _pallas_make_reordered_kernel(
-            pallas_kernel,
-            spec_args,
-            tensor_arg_indices,
-            non_tensor_args,
-            n_tensor_inputs,
-            _output_indices,
-            inplace_positions,
-            arg_to_tensor_pos,
-            n_extra_refs=len(scratch_shapes),
-            skip_inplace_copy=_pipeline_set,
-            _smem_arg_indices=_smem_arg_indices,
-            _copy_guards=copy_guards,
-        )
-
-        out_shape_arg = out_shapes if len(out_shapes) > 1 else out_shapes[0]
-
-        grid_spec = pltpu.PrefetchScalarGridSpec(
-            num_scalar_prefetch=0,
-            in_specs=in_specs_list,
-            out_specs=out_specs,
-            scratch_shapes=scratch_shapes,
-            grid=grid,
-        )
-
-        estimated_vmem = _estimate_pallas_vmem_bytes(
-            pl,
-            pltpu,
-            in_specs_list,
-            out_specs,
-            scratch_shapes,
-            spec_args,
-            tensor_arg_indices,
-            _output_indices,
-            pallas_aliases,
-        )
-        vmem_limit_bytes = _get_vmem_limit_bytes(pltpu)
-        if estimated_vmem > vmem_limit_bytes:
-            raise RuntimeError(
-                f"XLA:TPU compile permanent error. Ran out of memory in memory space vmem. "
-                f"Estimated {estimated_vmem / 1e6:.2f}MB exceeds {vmem_limit_bytes / 1e6:.2f}MB vmem capacity."
-            )
-
-        pallas_call_kwargs: dict[str, object] = {
-            "out_shape": out_shape_arg,
-            "grid_spec": grid_spec,
-            "compiler_params": pltpu.CompilerParams(  # pyrefly: ignore[bad-instantiation]
-                dimension_semantics=dimension_semantics,
-            ),
-        }
-        if interpret:
-            pallas_call_kwargs["interpret"] = True
-
-        jit_fn = pl.pallas_call(
-            reordered_kernel,  # pyrefly: ignore[bad-argument-type]
-            **pallas_call_kwargs,  # type: ignore[arg-type]
-        )
-
-        jax_callable = _pallas_build_callable(
+        cache = _pallas_install_launcher_cache(
             pallas_kernel,
             grid,
-            jit_fn,
-            _output_indices,
-            arg_to_tensor_pos,
-            tensor_arg_indices,
-            cache_attr="_pallas_pipeline_cache",
-            call_aliases=pallas_aliases,
-            trace_key_suffix="_pipeline",
-            interpret=interpret,
-        )
-
-        fast_path = _LauncherFastPath(
-            tensor_arg_indices,
-            arg_to_tensor_pos,
-            _output_indices,
-            _ds_pad_dims,
-        )
-        pallas_kernel._pallas_pipeline_cache = (  # pyrefly: ignore[missing-attribute]
-            grid,
-            jax_callable,
-            tensor_arg_indices,
-            arg_to_tensor_pos,
-            fast_path,
-            None,
-        )
-        cache = pallas_kernel._pallas_pipeline_cache  # pyrefly: ignore[missing-attribute]
-
-    # Shared fast invoke: first call (just-built cache) and every warm call.
-    (
-        _,
-        jax_callable,
-        tensor_arg_indices,
-        arg_to_tensor_pos,
-        fast_path,
-        direct_call,
-    ) = cache
-    if direct_call is None:
-        direct_call = getattr(jax_callable, "_helion_direct_call", None)
-        if direct_call is not None:
-            pallas_kernel._pallas_pipeline_cache = (  # pyrefly: ignore[missing-attribute]
-                cache[0],
-                jax_callable,
-                tensor_arg_indices,
-                arg_to_tensor_pos,
-                fast_path,
-                direct_call,
-            )
-
-    _orig_output_tensors: dict[int, torch.Tensor] | None = None
-    if _ds_pad_dims and fast_path.ds_pad_required is not False:
-        args, _orig_output_tensors, _ = _pallas_apply_ds_padding_fast(
             args,
-            _ds_pad_dims,
-            fast_path,
-            fast_path.padded_output_arg_indices,
+            kind=_PallasLoopKind.EMIT_PIPELINE,
+            cache_attr="_pallas_pipeline_cache",
+            trace_key_suffix="_pipeline",
+            _output_indices=_output_indices,
+            _inplace_indices=_inplace_indices,
+            _block_spec_info=_block_spec_info,
+            _smem_arg_indices=_smem_arg_indices,
+            _scratch_shapes=cast("list[object] | None", _scratch_shapes),
+            _pipeline_arg_indices=_pipeline_arg_indices,
+            _ds_pad_dims=_ds_pad_dims,
+            _pallas_interpret=_pallas_interpret,
+            _matmul_dot_general=_matmul_dot_general,
         )
-    return _pallas_invoke_and_return_fast(
-        jax_callable, args, fast_path, _orig_output_tensors, direct_call
+
+    return _pallas_invoke_cached_launcher(
+        pallas_kernel,
+        cache,
+        args,
+        cache_attr="_pallas_pipeline_cache",
+        _ds_pad_dims=_ds_pad_dims,
     )
 
 
@@ -1730,205 +1889,403 @@ def default_pallas_fori_launcher(
     """
     cache = getattr(pallas_kernel, "_pallas_fori_cache", None)
     if cache is None or cache[0] != grid:
+        cache = _pallas_install_launcher_cache(
+            pallas_kernel,
+            grid,
+            args,
+            kind=_PallasLoopKind.FORI_LOOP,
+            cache_attr="_pallas_fori_cache",
+            trace_key_suffix="_fori",
+            _output_indices=_output_indices,
+            _inplace_indices=_inplace_indices,
+            _block_spec_info=_block_spec_info,
+            _smem_arg_indices=_smem_arg_indices,
+            _scratch_shapes=cast("list[object] | None", _scratch_shapes),
+            _pipeline_arg_indices=cast(
+                "list[int] | None", kwargs.get("_pipeline_arg_indices")
+            ),
+            _ds_pad_dims=_ds_pad_dims,
+            _pallas_interpret=_pallas_interpret,
+        )
+
+    return _pallas_invoke_cached_launcher(
+        pallas_kernel,
+        cache,
+        args,
+        cache_attr="_pallas_fori_cache",
+        _ds_pad_dims=_ds_pad_dims,
+    )
+
+
+def _pallas_compact_in_out_specs(
+    pl: object,
+    jnp: object,
+    pltpu: object,
+    args: tuple[object, ...],
+    tensor_arg_indices: list[int],
+    output_indices: list[int],
+    block_spec_info: _BlockSpecInfo | None,
+    smem_set: set[int],
+    pipeline_set: set[int],
+    owner_ref_pos: int,
+    aligned_set: set[int] | None = None,
+    tile_start_ref_pos: int = 1,
+    compact_block: int = 1,
+) -> tuple[list[object], object]:
+    """Build in/out BlockSpecs for the compact-worklist PrefetchScalarGridSpec.
+
+    Like ``_pallas_build_pipeline_specs`` but: pipelined tensors -> HBM; an
+    owner-indexed tensor (its ``grid_dims`` carry the owner grid dim ``0``) gets
+    an ``index_map`` that reads ``owner_ids[wid]`` (a scalar-prefetch ref); a
+    compact-aligned-load tensor (``aligned_set``) gets a per-tile
+    ``pl.Element`` slice at ``tile_start`` so Pallas double-buffers it across work
+    items; everything else is full/SMEM.  Under ``PrefetchScalarGridSpec`` every
+    ``index_map`` receives ``(wid, *scalar_refs)``.
+    """
+    aligned_set = aligned_set or set()
+    all_positions = sorted(set(tensor_arg_indices) | set(output_indices))
+    arg_to_tpos = {orig: tpos for tpos, orig in enumerate(all_positions)}
+
+    def _spec_for(idx: int) -> object:
+        if idx in pipeline_set:
+            return pl.BlockSpec(memory_space=pltpu.HBM)  # type: ignore[union-attr]
+        t = args[idx]
+        assert isinstance(t, torch.Tensor)
+        if idx in aligned_set:
+            # compact_aligned_load: slice dim 0 to one tile at tile_start via
+            # pl.Element so Pallas prefetches/double-buffers it; other dims full.
+            # Use the FULL compact_block (not min with the tensor length): the
+            # body slices ``pl.ds(0, compact_block)``, and the ``padding=(0,
+            # compact_block)`` lets the read overshoot the tensor end (handles
+            # total_q < block).  Clamping the block here would mismatch the
+            # body's pl.ds size and slice out of bounds.
+            #
+            # tile_start is the RAW owner offset (q_offsets[seq] + k*block), NOT
+            # sublane-aligned-down: sequences pack contiguously at arbitrary
+            # offsets.  pl.Element is exactly the mechanism that tolerates a
+            # dynamic, possibly-unaligned start -- Mosaic lowers an element-indexed
+            # block to a dynamic-offset (un)masked access, where a plain int block
+            # dim would require an aligned, fixed-grid block.  Verified bitwise ==
+            # fori_loop on unaligned/random offsets; this holds for both the load
+            # and the full-block store.
+            block = compact_block
+            elt = pl.Element(block, padding=(0, block))  # type: ignore[union-attr]
+            block_shape = (elt, *(pl.Element(s) for s in t.shape[1:]))  # type: ignore[union-attr]
+
+            def aligned_index_map(
+                wid: object,
+                *scalar_refs: object,
+                _pos: int = tile_start_ref_pos,
+                _nd: int = t.ndim,
+            ) -> tuple[object, ...]:
+                tile_start = scalar_refs[_pos][wid]  # type: ignore[index]
+                return (tile_start, *(jnp.int32(0) for _ in range(_nd - 1)))  # type: ignore[union-attr]
+
+            return pl.BlockSpec(block_shape, aligned_index_map)  # type: ignore[union-attr]
+        entry = block_spec_info[arg_to_tpos[idx]] if block_spec_info else None
+        if entry is not None:
+            block_shape_template, grid_dims = entry
+            if any(isinstance(g, int) for g in grid_dims):
+                block_shape = tuple(
+                    min(bs, t.shape[d]) if bs is not None else t.shape[d]
+                    for d, bs in enumerate(block_shape_template)
+                )
+
+                def index_map(
+                    wid: object,
+                    *scalar_refs: object,
+                    _gd: tuple[object, ...] = grid_dims,
+                    _pos: int = owner_ref_pos,
+                ) -> tuple[object, ...]:
+                    owner = scalar_refs[_pos][wid]  # type: ignore[index]
+                    return tuple(
+                        owner if g == 0 else jnp.int32(0)  # type: ignore[union-attr]
+                        for g in _gd
+                    )
+
+                mem = pltpu.SMEM if idx in smem_set else None  # type: ignore[union-attr]
+                return pl.BlockSpec(block_shape, index_map, memory_space=mem)  # type: ignore[union-attr]
+        return _pallas_make_block_spec(pl, jnp, pltpu, t, entry, idx in smem_set)
+
+    in_specs = [_spec_for(idx) for idx in tensor_arg_indices]
+    out_list = [_spec_for(idx) for idx in output_indices]
+    out_specs = out_list if len(out_list) > 1 else out_list[0]
+    return in_specs, out_specs
+
+
+def _pallas_make_compact_reordered_kernel(
+    pallas_kernel: object,
+    args: tuple[object, ...],
+    tensor_arg_indices: list[int],
+    non_tensor_args: dict[int, object],
+    n_tensor_inputs: int,
+    _output_indices: list[int],
+    n_scalar_prefetch: int,
+) -> object:
+    """Reordered kernel for PrefetchScalarGridSpec.
+
+    Pallas passes refs as ``[scalar_refs..., inputs..., outputs..., scratch...]``;
+    the generated device function expects
+    ``(inputs..., outputs..., scratch..., metadata_refs...)`` (the metadata refs
+    are ``wrapper_only_params``, appended last).  Strip the N leading scalar refs
+    and re-append them after scratch.
+    """
+
+    def reordered_kernel(*refs: object) -> None:
+        scalar_refs = refs[:n_scalar_prefetch]
+        body_refs = refs[n_scalar_prefetch:]
+        n_kernel_params = len(args)
+        original_order: list[object] = [None] * n_kernel_params
+        for tensor_pos, orig_pos in enumerate(tensor_arg_indices):
+            original_order[orig_pos] = body_refs[tensor_pos]
+        for orig_pos, value in non_tensor_args.items():
+            original_order[orig_pos] = value
+        for out_idx, orig_pos in enumerate(_output_indices):
+            original_order[orig_pos] = body_refs[n_tensor_inputs + out_idx]
+        scratch_refs = body_refs[n_tensor_inputs + len(_output_indices) :]
+        pallas_kernel(*original_order, *scratch_refs, *scalar_refs)  # type: ignore[operator]
+
+    return reordered_kernel
+
+
+def _pallas_compile_compact_jit_fn(
+    pallas_kernel: object,
+    args: tuple[object, ...],
+    *,
+    _output_indices: list[int],
+    _inplace_indices: list[int] | None,
+    _block_spec_info: _BlockSpecInfo | None,
+    _scratch_shapes: list[object] | None,
+    _smem_arg_indices: list[int] | None,
+    _pipeline_arg_indices: list[int] | None,
+    build_worklist: Callable[..., object],
+    offset_arg_indices: list[int],
+    metadata_fields: list[str],
+    owner_ref_pos: int,
+    num_scalar_prefetch: int,
+    aligned_arg_indices: list[int] | None = None,
+    tile_start_ref_pos: int = 1,
+    compact_block: int = 1,
+    interpret: bool = False,
+) -> _PallasCompileResult:
+    """Build the compact-worklist jit_fn: build metadata in-jit -> dynamic grid."""
+    from jax.experimental import pallas as pl
+    from jax.experimental.pallas import tpu as pltpu
+    import jax.numpy as jnp
+
+    (
+        tensor_arg_indices,
+        output_only_indices,
+        non_tensor_args,
+        n_tensor_inputs,
+        arg_to_tensor_pos,
+        inplace_positions,
+        out_shapes,
+        pallas_aliases,
+    ) = _pallas_prepare_args(
+        args, _output_indices, _inplace_indices, interpret=interpret
+    )
+
+    scratch_shapes = _pallas_build_scratch_shapes(pltpu, jnp, _scratch_shapes or [])
+    smem_set = set(_smem_arg_indices or [])
+    pipeline_set = set(_pipeline_arg_indices or [])
+    in_specs, out_specs = _pallas_compact_in_out_specs(
+        pl,
+        jnp,
+        pltpu,
+        args,
+        tensor_arg_indices,
+        _output_indices,
+        _block_spec_info,
+        smem_set,
+        pipeline_set,
+        owner_ref_pos,
+        set(aligned_arg_indices or []),
+        tile_start_ref_pos,
+        compact_block,
+    )
+    reordered_kernel = _pallas_make_compact_reordered_kernel(
+        pallas_kernel,
+        args,
+        tensor_arg_indices,
+        non_tensor_args,
+        n_tensor_inputs,
+        _output_indices,
+        num_scalar_prefetch,
+    )
+    out_shape_arg = out_shapes if len(out_shapes) > 1 else out_shapes[0]
+    # NOTE: the shared _pallas_check_vmem_or_raise estimator does not yet
+    # understand pl.Element block shapes (compact_aligned_load), so it is not
+    # applied here; adding pl.Element support to the estimator is a follow-up.
+    # Offsets-tensor positions within the tensor-arg list (jit_fn input order).
+    offset_tpos = [arg_to_tensor_pos[i] for i in offset_arg_indices]
+
+    def jit_fn(*jax_inputs: object) -> object:
+        offsets = [jax_inputs[tp] for tp in offset_tpos]
+        metadata = build_worklist(*offsets)
+        num_work = metadata.num_work  # type: ignore[attr-defined]
+        scalar_prefetch = [getattr(metadata, f) for f in metadata_fields]
+        call = pl.pallas_call(  # type: ignore[union-attr]
+            reordered_kernel,  # pyrefly: ignore[bad-argument-type]
+            out_shape=out_shape_arg,
+            grid_spec=pltpu.PrefetchScalarGridSpec(  # type: ignore[union-attr]
+                num_scalar_prefetch=num_scalar_prefetch,
+                # num_work is a traced scalar; for an empty batch (total == 0) it
+                # is 0, i.e. a dynamic grid=(0,).  Verified that Mosaic accepts the
+                # zero-grid launch and returns the empty output (no special-case
+                # skip needed).
+                grid=(num_work,),
+                in_specs=in_specs,
+                out_specs=out_specs,
+                scratch_shapes=scratch_shapes,  # pyrefly: ignore[bad-argument-type]
+            ),
+            compiler_params=pltpu.CompilerParams(  # pyrefly: ignore[bad-instantiation]
+                # "arbitrary" (NOT "parallel") is load-bearing for correctness,
+                # for two reasons:
+                #
+                # 1. Input reuse: Pallas reuses an unchanged owner-indexed input
+                #    block (k[seq]/v[seq]) across consecutive same-owner work
+                #    items -- the builder orders work items by owner, so a
+                #    sequence's q-tiles share one k/v fetch (matching
+                #    emit_pipeline's per-seq reuse).
+                #
+                # 2. Ordered-overwrite store (the precondition the whole kernel
+                #    rests on): each work item's VALID output rows are disjoint,
+                #    BUT the store is a masked FULL-block pl.Element write, so a
+                #    partial last tile overwrites the next sequence's leading rows
+                #    with masked-zero padding (sequences are packed contiguously
+                #    at unaligned offsets, so the write regions overlap even
+                #    though valid-row ownership does not).  "arbitrary" tells
+                #    Mosaic the grid iterations may have dependencies, so it runs
+                #    them sequentially in grid order rather than reordering or
+                #    pipelining them.  The builder emits work items in ascending
+                #    (owner, tile) order, so the next sequence's first tile is a
+                #    LATER iteration that re-writes those rows with the correct
+                #    values -- and being later + serial, it deterministically
+                #    wins.  With "parallel", Mosaic could reorder/overlap
+                #    iterations and the spill would race the re-write.
+                #
+                # KNOWN RISK: this rests on Mosaic running an "arbitrary" 1-D grid
+                # strictly sequentially in ascending order and never reordering
+                # it.  That is the documented meaning of
+                # "arbitrary" and is bitwise-verified vs fori today, but it is a
+                # scheduling-contract dependency -- if a future Mosaic relaxes it,
+                # the spilling store would silently corrupt.  The robust fix is the
+                # deferred exact pl.ds(tile_start, tile_extent) / emit_pipeline +
+                # BoundedSlice store; a future correctness-mode toggle could select
+                # it for validation.  Detection also now restricts to packed (so
+                # work order == row order); see detect_compact_worklist_plan.
+                dimension_semantics=("arbitrary",),
+            ),
+            interpret=interpret,
+        )
+        return call(*scalar_prefetch, *jax_inputs)
+
+    return _PallasCompileResult(
+        jit_fn=jit_fn,
+        tensor_arg_indices=tensor_arg_indices,
+        output_only_indices=output_only_indices,
+        arg_to_tensor_pos=arg_to_tensor_pos,
+        inplace_positions=inplace_positions,
+        pallas_aliases=pallas_aliases,
+    )
+
+
+def default_pallas_compact_worklist_launcher(
+    pallas_kernel: object,
+    grid: tuple[int, ...],
+    *args: object,
+    _output_indices: list[int] | None = None,
+    _inplace_indices: list[int] | None = None,
+    _block_spec_info: _BlockSpecInfo | None = None,
+    _scratch_shapes: list[object] | None = None,
+    _pipeline_arg_indices: list[int] | None = None,
+    _ds_pad_dims: list[tuple[int, int, int, int]] | None = None,
+    _smem_arg_indices: list[int] | None = None,
+    _pallas_interpret: bool | None = None,
+    _compact_build_worklist: Callable[..., object] | None = None,
+    _compact_offset_arg_indices: list[int] | None = None,
+    _compact_metadata_fields: list[str] | None = None,
+    _compact_owner_ref_pos: int = 0,
+    _compact_num_scalar_prefetch: int = 0,
+    _compact_aligned_arg_indices: list[int] | None = None,
+    _compact_tile_start_ref_pos: int = 1,
+    _compact_block: int = 1,
+    **kwargs: object,
+) -> object:
+    """Launcher for ``pallas_loop_type="compact_worklist"``.
+
+    Builds the worklist metadata in-jit from the offset args, feeds the traced
+    ``num_work`` to a dynamic ``grid=(num_work,)`` with scalar-prefetch metadata,
+    and reuses the shared JaxCallable / caching / invoke path.
+    """
+    assert _compact_build_worklist is not None
+    cache = getattr(pallas_kernel, "_pallas_compact_cache", None)
+    if cache is None or cache[0] != grid:
         interpret = (
             _pallas_interpret
             if _pallas_interpret is not None
             else _module_is_pallas_interpret()
         )
-        if interpret:
-            _ensure_cpu_tpu_info()
-
-        if _output_indices is None:
-            _output_indices = []
-        if _scratch_shapes is None:
-            _scratch_shapes = []
-
-        # Build the pallas specs from ds-padded shapes on a throwaway copy so
-        # ``args`` stays unpadded for the shared invoke below to pad fresh.
+        output_indices = _output_indices if _output_indices is not None else []
         spec_args = args
         if _ds_pad_dims:
-            spec_args, _ = _pallas_apply_ds_padding(args, _output_indices, _ds_pad_dims)
-
+            spec_args, _ = _pallas_apply_ds_padding(args, output_indices, _ds_pad_dims)
         _pallas_check_dtypes(spec_args)
-
-        from jax.experimental import pallas as pl
-        from jax.experimental.pallas import tpu as pltpu
-        import jax.numpy as jnp
-
-        (
-            tensor_arg_indices,
-            output_only_indices,
-            non_tensor_args,
-            n_tensor_inputs,
-            arg_to_tensor_pos,
-            inplace_positions,
-            out_shapes,
-            pallas_aliases,
-        ) = _pallas_prepare_args(
-            spec_args, _output_indices, _inplace_indices, interpret=interpret
-        )
-
-        # Build scratch shapes: VMEM buffers + DMA semaphores
-        _jnp_dtype_map = _pallas_jnp_dtype_map()
-        scratch_shapes = []
-        for shape, dtype_str, scratch_type in _scratch_shapes:
-            if scratch_type == "dma_semaphore":
-                scratch_shapes.append(pltpu.SemaphoreType.DMA(()))
-            else:  # "vmem"
-                assert dtype_str is not None
-                jnp_dtype = _jnp_dtype_map.get(dtype_str, jnp.float32)
-                scratch_shapes.append(
-                    pltpu.VMEM(shape, jnp_dtype)  # pyrefly: ignore[bad-argument-type]
-                )
-
-        # Build in_specs/out_specs: proper BlockSpecs for outer grid dims,
-        # HBM refs for tensors used in the fori_loop body (DMA handles tiling).
-        _fori_pipeline_indices = kwargs.get("_pipeline_arg_indices")
-        assert _block_spec_info is not None, (
-            "fori_loop launcher requires _block_spec_info from codegen"
-        )
-        copy_guards, dimension_semantics = _pallas_shared_output_plan(
-            grid,
-            tensor_arg_indices,
-            output_only_indices,
-            _output_indices,
-            inplace_positions,
-            _block_spec_info,
-        )
-
-        in_specs_list, out_specs = _pallas_build_pipeline_specs(
-            pl,
-            jnp,
-            pltpu,
-            grid,
-            spec_args,
-            tensor_arg_indices,
-            _output_indices,
-            _block_spec_info,
-            _fori_pipeline_indices,  # type: ignore[arg-type]
-            output_only_indices,
-            smem_arg_indices=_smem_arg_indices,
-        )
-
-        _fori_pipeline_set = set(_fori_pipeline_indices or [])  # type: ignore[arg-type]
-        reordered_kernel = _pallas_make_reordered_kernel(
+        result = _pallas_compile_compact_jit_fn(
             pallas_kernel,
             spec_args,
-            tensor_arg_indices,
-            non_tensor_args,
-            n_tensor_inputs,
-            _output_indices,
-            inplace_positions,
-            arg_to_tensor_pos,
-            n_extra_refs=len(scratch_shapes),
-            skip_inplace_copy=_fori_pipeline_set,
+            _output_indices=output_indices,
+            _inplace_indices=_inplace_indices,
+            _block_spec_info=_block_spec_info,
+            _scratch_shapes=_scratch_shapes,
             _smem_arg_indices=_smem_arg_indices,
-            _copy_guards=copy_guards,
+            _pipeline_arg_indices=_pipeline_arg_indices,
+            build_worklist=_compact_build_worklist,
+            offset_arg_indices=_compact_offset_arg_indices or [],
+            metadata_fields=_compact_metadata_fields or [],
+            owner_ref_pos=_compact_owner_ref_pos,
+            num_scalar_prefetch=_compact_num_scalar_prefetch,
+            aligned_arg_indices=_compact_aligned_arg_indices or [],
+            tile_start_ref_pos=_compact_tile_start_ref_pos,
+            compact_block=_compact_block,
+            interpret=interpret,
         )
-
-        out_shape_arg = out_shapes if len(out_shapes) > 1 else out_shapes[0]
-
-        grid_spec = pltpu.PrefetchScalarGridSpec(
-            num_scalar_prefetch=0,
-            in_specs=in_specs_list,
-            out_specs=out_specs,
-            scratch_shapes=scratch_shapes,
-            grid=grid,
-        )
-
-        estimated_vmem = _estimate_pallas_vmem_bytes(
-            pl,
-            pltpu,
-            in_specs_list,
-            out_specs,
-            scratch_shapes,
-            spec_args,
-            tensor_arg_indices,
-            _output_indices,
-            pallas_aliases,
-        )
-        vmem_limit_bytes = _get_vmem_limit_bytes(pltpu)
-        if estimated_vmem > vmem_limit_bytes:
-            raise RuntimeError(
-                f"XLA:TPU compile permanent error. Ran out of memory in memory space vmem. "
-                f"Estimated {estimated_vmem / 1e6:.2f}MB exceeds {vmem_limit_bytes / 1e6:.2f}MB vmem capacity."
-            )
-
-        pallas_call_kwargs: dict[str, object] = {
-            "out_shape": out_shape_arg,
-            "grid_spec": grid_spec,
-            "compiler_params": pltpu.CompilerParams(  # pyrefly: ignore[bad-instantiation]
-                dimension_semantics=dimension_semantics,
-            ),
-        }
-        if interpret:
-            pallas_call_kwargs["interpret"] = True
-
-        jit_fn = pl.pallas_call(
-            reordered_kernel,  # pyrefly: ignore[bad-argument-type]
-            **pallas_call_kwargs,  # type: ignore[arg-type]
-        )
-
+        cache_attr = "_pallas_compact_cache"
         jax_callable = _pallas_build_callable(
             pallas_kernel,
             grid,
-            jit_fn,
-            _output_indices,
-            arg_to_tensor_pos,
-            tensor_arg_indices,
-            cache_attr="_pallas_fori_cache",
-            call_aliases=pallas_aliases,
-            trace_key_suffix="_fori",
+            cast("Callable[..., object]", result.jit_fn),
+            output_indices,
+            result.arg_to_tensor_pos,
+            result.tensor_arg_indices,
+            cache_attr=cache_attr,
+            call_aliases=result.pallas_aliases,
+            trace_key_suffix="_compact",
             interpret=interpret,
         )
-
         fast_path = _LauncherFastPath(
-            tensor_arg_indices,
-            arg_to_tensor_pos,
-            _output_indices,
+            result.tensor_arg_indices,
+            result.arg_to_tensor_pos,
+            output_indices,
             _ds_pad_dims,
         )
-        pallas_kernel._pallas_fori_cache = (  # pyrefly: ignore[missing-attribute]
+        cache = (
             grid,
             jax_callable,
-            tensor_arg_indices,
-            arg_to_tensor_pos,
+            result.tensor_arg_indices,
+            result.arg_to_tensor_pos,
             fast_path,
             None,
         )
-        cache = pallas_kernel._pallas_fori_cache  # pyrefly: ignore[missing-attribute]
+        setattr(pallas_kernel, cache_attr, cache)
 
-    # Shared fast invoke: first call (just-built cache) and every warm call.
-    (
-        _,
-        jax_callable,
-        tensor_arg_indices,
-        arg_to_tensor_pos,
-        fast_path,
-        direct_call,
-    ) = cache
-    if direct_call is None:
-        direct_call = getattr(jax_callable, "_helion_direct_call", None)
-        if direct_call is not None:
-            pallas_kernel._pallas_fori_cache = (  # pyrefly: ignore[missing-attribute]
-                cache[0],
-                jax_callable,
-                tensor_arg_indices,
-                arg_to_tensor_pos,
-                fast_path,
-                direct_call,
-            )
-
-    _orig_output_tensors: dict[int, torch.Tensor] | None = None
-    if _ds_pad_dims and fast_path.ds_pad_required is not False:
-        args, _orig_output_tensors, _ = _pallas_apply_ds_padding_fast(
-            args,
-            _ds_pad_dims,
-            fast_path,
-            fast_path.padded_output_arg_indices,
-        )
-    return _pallas_invoke_and_return_fast(
-        jax_callable, args, fast_path, _orig_output_tensors, direct_call
+    return _pallas_invoke_cached_launcher(
+        pallas_kernel,
+        cache,
+        args,
+        cache_attr="_pallas_compact_cache",
+        _ds_pad_dims=_ds_pad_dims,
     )
 
 
@@ -2051,6 +2408,7 @@ def _append_cute_wrapper_plan(
     body: list[str],
     call_args: list[str],
     plan: dict[str, object],
+    num_sm: int | None = None,
 ) -> None:
     def plan_int(key: str, default: int | None = None) -> int:
         value = plan.get(key, default) if default is not None else plan[key]
@@ -2060,6 +2418,11 @@ def _append_cute_wrapper_plan(
     def plan_optional_int(key: str) -> int | None:
         value = plan.get(key)
         assert value is None or isinstance(value, int)
+        return value
+
+    def plan_optional_str(key: str) -> str | None:
+        value = plan.get(key)
+        assert value is None or isinstance(value, str)
         return value
 
     def require_positive_int(value: int | None, name: str) -> int:
@@ -2079,12 +2442,21 @@ def _append_cute_wrapper_plan(
         epi_tile_m: int | None = None,
         epi_tile_n: int | None = None,
         d_store_box_n: int | None = None,
+        epi_tile_raw_expr: str | None = None,
     ) -> None:
         assert len(kernel_args) == 2
         explicit_epi_tile = any(
             value is not None for value in (epi_tile_m, epi_tile_n, d_store_box_n)
         )
-        if explicit_epi_tile:
+        if epi_tile_raw_expr is not None:
+            # The bm=128 CtaGroup.TWO family threads the device-exact (N-mode
+            # permuted) epilogue-tile expression verbatim so the host TMA-store
+            # atom is built from the same layout the device r2s copy writes
+            # through. The plain ``epi_tile_m/n`` integer keys cannot express
+            # the permutation. See ``tcgen05_two_cta_m128_epilogue_tile_expr``.
+            assert not explicit_epi_tile
+            epi_tile_expr = epi_tile_raw_expr
+        elif explicit_epi_tile:
             checked_epi_tile_m = require_positive_int(epi_tile_m, "epi_tile_m")
             checked_epi_tile_n = require_positive_int(epi_tile_n, "epi_tile_n")
             checked_d_store_box_n = require_positive_int(d_store_box_n, "d_store_box_n")
@@ -2131,6 +2503,206 @@ def _append_cute_wrapper_plan(
         call_args.extend(kernel_args)
 
     kind = plan["kind"]
+    if kind == "helion_small_biased_attention":
+        batch = plan_int("batch")
+        seq = plan_int("seq")
+        body.extend(
+            [
+                f"    grid_x = cutlass.Int32({seq})",
+                f"    grid_y = cutlass.Int32({batch})",
+                "    grid_z = cutlass.Int32(1)",
+            ]
+        )
+        return
+
+    if kind == "helion_flash":
+        # Fused tcgen05 flash-attention host setup: reorder Helion's (B, S, D)
+        # tensors to the reference (S, D, B) / (D, S, B) layouts, build the two
+        # tiled_mma (QK from SMEM, PV with OperandSource.TMEM) and the three TMA
+        # atoms, then append all kernel args. Mirrors
+        # ``.notes/spikes/fa_tcgen05_spike.py`` host_function (3D-batched variant
+        # validated standalone).
+        q_idx = plan_int("q_idx")
+        k_idx = plan_int("k_idx")
+        v_idx = plan_int("v_idx")
+        o_idx = plan_int("o_idx")
+        lse_idx = plan_optional_int("lse_idx")
+        bias_idx = plan_optional_int("bias_idx")
+        alibi_idx = plan_optional_int("alibi_idx")
+        document_idx = plan_optional_int("document_idx")
+        seq = plan_int("seq")
+        head_dim = plan_int("head_dim")
+        batch = plan_int("batch")
+        scale_log2 = plan["scale_log2"]
+        assert isinstance(scale_log2, float)
+        score_bias_scale = plan.get("score_bias_scale", 0.0)
+        assert isinstance(score_bias_scale, float)
+        alibi_count = plan_int("alibi_count", default=batch)
+        document_batch = plan_int("document_batch", default=batch)
+        document_heads_per_batch = plan_int("document_heads_per_batch", default=1)
+        kv_stage = plan_int("kv_stage")
+        q_stage = plan_int("q_stage", default=1)
+        num_kv = (seq + 127) // 128
+        # Static-persistent scheduler: total_tiles = num_bh * num_m_tiles (the
+        # flat tile-id space the device-body strided while loop walks). When
+        # persistent, the host clamps grid_x down to min(total_tiles, num_SMs)
+        # so each SM gets one CTA that strides over many work tiles.
+        persistent = bool(plan.get("persistent"))
+        total_tiles = plan_int("total_tiles", default=batch * (seq // 128))
+        pass_dynamic_tile_counts = plan.get("topology") != "fa4"
+        hd = head_dim
+        dtype = str(plan.get("dtype", "cutlass.Float16"))
+        assert dtype in ("cutlass.Float16", "cutlass.BFloat16")
+        # (S, D, B) views over the existing (B, S, D) row-major buffers.
+        bw = "cutlass.utils.blackwell_helpers"
+        qkd = f"(128, 128, {hd})"
+        pvd = f"(128, {hd}, 128)"
+        sdb = f"cute.make_layout(({seq}, {hd}, {batch}), stride=({hd}, 1, {seq * hd}))"
+        dsb = f"cute.make_layout(({hd}, {seq}, {batch}), stride=(1, {hd}, {seq * hd}))"
+        ssb = (
+            f"cute.make_layout(({seq}, {seq}, {batch}), stride=({seq}, 1, {seq * seq}))"
+        )
+        sb = f"cute.make_layout(({seq}, {batch}), stride=(1, {seq}))"
+        majk = "cute.nvgpu.OperandMajorMode.K"
+        cg1 = "cute.nvgpu.tcgen05.CtaGroup.ONE"
+        sel = "cute.select"
+        flash_lines = [
+            f"_flash_mQ = cute.make_tensor(arg{q_idx}.iterator, {sdb})",
+            f"_flash_mK = cute.make_tensor(arg{k_idx}.iterator, {sdb})",
+            # V is MN-major: (D, S, B).
+            f"_flash_mV = cute.make_tensor(arg{v_idx}.iterator, {dsb})",
+            f"_flash_mO = cute.make_tensor(arg{o_idx}.iterator, {sdb})",
+            f"_flash_qk_mma = {bw}.make_trivial_tiled_mma({dtype}, {dtype}, {majk}, {majk}, cutlass.Float32, {cg1}, (128, 128))",
+            f"_flash_pv_mma = {bw}.make_trivial_tiled_mma({dtype}, {dtype}, {majk}, cute.nvgpu.OperandMajorMode.MN, cutlass.Float32, {cg1}, (128, {hd}), cute.nvgpu.tcgen05.OperandSource.TMEM)",
+            f"_flash_qsl = {bw}.make_smem_layout_a(_flash_qk_mma, {qkd}, {dtype}, {q_stage})",
+            # K/V are multi-stage TMA rings (Stage 3); the stage count must match
+            # the device-body kv_stage + the SharedStorage MemRange depths.
+            f"_flash_ksl = {bw}.make_smem_layout_b(_flash_qk_mma, {qkd}, {dtype}, {kv_stage})",
+            f"_flash_vsl = {bw}.make_smem_layout_b(_flash_pv_mma, {pvd}, {dtype}, {kv_stage})",
+            f"_flash_ptl = {bw}.make_smem_layout_a(_flash_pv_mma, {pvd}, {dtype}, 1)",
+            f"_flash_op = cute.nvgpu.cpasync.CopyBulkTensorTileG2SOp({cg1})",
+            f"_flash_tma_q, _flash_mQt = cute.nvgpu.make_tiled_tma_atom_A(_flash_op, _flash_mQ, {sel}(_flash_qsl, mode=[0, 1, 2]), {qkd}, _flash_qk_mma)",
+            f"_flash_tma_k, _flash_mKt = cute.nvgpu.make_tiled_tma_atom_B(_flash_op, _flash_mK, {sel}(_flash_ksl, mode=[0, 1, 2]), {qkd}, _flash_qk_mma)",
+            f"_flash_tma_v, _flash_mVt = cute.nvgpu.make_tiled_tma_atom_B(_flash_op, _flash_mV, {sel}(_flash_vsl, mode=[0, 1, 2]), {pvd}, _flash_pv_mma)",
+            f"_flash_scale_log2 = cutlass.Float32({scale_log2!r})",
+            f"_flash_num_kv_tiles = cutlass.Int32({num_kv})",
+        ]
+        if bias_idx is not None:
+            flash_lines.extend(
+                [
+                    f"_flash_mBias = cute.make_tensor(arg{bias_idx}.iterator, {ssb})",
+                    f"_flash_score_bias_scale = cutlass.Float32({score_bias_scale!r})",
+                ]
+            )
+        if alibi_idx is not None:
+            flash_lines.extend(
+                [
+                    (
+                        f"_flash_mAlibi = cute.make_tensor(arg{alibi_idx}.iterator, "
+                        f"cute.make_layout(({alibi_count},), stride=(1,)))"
+                    ),
+                    f"_flash_num_alibi = cutlass.Int32({alibi_count})",
+                ]
+            )
+        if document_idx is not None:
+            sdoc = f"cute.make_layout(({seq}, {document_batch}), stride=(1, {seq}))"
+            flash_lines.extend(
+                [
+                    f"_flash_mDoc = cute.make_tensor(arg{document_idx}.iterator, {sdoc})",
+                    (
+                        "_flash_doc_heads_per_batch = "
+                        f"cutlass.Int32({document_heads_per_batch})"
+                    ),
+                ]
+            )
+        if pass_dynamic_tile_counts:
+            flash_lines.extend(
+                [
+                    f"_flash_num_bh = cutlass.Int32({batch})",
+                    f"_flash_total_tiles = cutlass.Int32({total_tiles})",
+                ]
+            )
+        if lse_idx is not None:
+            flash_lines.append(
+                f"_flash_mLSE = cute.make_tensor(arg{lse_idx}.iterator, {sb})"
+            )
+        epi_tma = bool(plan.get("epi_tma"))
+        if epi_tma:
+            # Lever A: build the O TMA STORE atom (fa4-only). The O smem layout is
+            # the per-Q-tile (128, hd) epilogue tile, 2-staged so BOTH adjacent
+            # Q-tiles' outputs fit (matches the fa4 q_stage=2 sQ region the corr
+            # epilogue reuses). ``make_tiled_tma_atom(S2G, ...)`` returns the
+            # TMA-adjusted mO as ``_flash_mOt`` (mirrors the Q/K/V load atoms).
+            otile = f"(128, {hd})"
+            flash_lines.extend(
+                [
+                    (
+                        f"_flash_osl = {bw}.make_smem_layout_epi("
+                        f"{dtype}, cutlass.utils.layout.LayoutEnum.ROW_MAJOR, {otile}, 2)"
+                    ),
+                    (
+                        f"_flash_o_cta_v = cute.composition("
+                        f"cute.make_identity_layout(_flash_mO.shape), {otile})"
+                    ),
+                    (
+                        "_flash_tma_o, _flash_mOt = "
+                        "cute.nvgpu.cpasync.make_tiled_tma_atom("
+                        "cute.nvgpu.cpasync.CopyBulkTensorTileS2GOp(), _flash_mO, "
+                        "cute.select(_flash_osl, mode=[0, 1]), _flash_o_cta_v)"
+                    ),
+                ]
+            )
+        else:
+            # mO stays the (S, D, B) view (no TMA atom; the epilogue uses
+            # autovec_copy straight to gmem).
+            flash_lines.append("_flash_mOt = _flash_mO")
+        body.extend(f"    {line}" for line in flash_lines)
+        if persistent:
+            # Cap the flat grid at num_SMs (computed host-side from the q tensor's
+            # device at wrapper-build time and baked as a literal). grid_y/grid_z
+            # stay 1 (already true for the flat flash grid). The device-body
+            # strided while loop then covers all total_tiles work items.
+            assert num_sm is not None and num_sm > 0
+            grid_cap = min(total_tiles, num_sm)
+            body.append(f"    grid_x = cutlass.Int32({grid_cap})")
+        elif plan.get("topology") == "fa4":
+            # The fa4 topology processes a PAIR of adjacent 128-row Q-tiles per
+            # CTA, so it needs exactly total_tiles (= batch * seq // 256) CTAs.
+            # The default root grid would launch batch * seq // 128; override it
+            # to the halved fa4 tile count.
+            body.append(f"    grid_x = cutlass.Int32({total_tiles})")
+        call_args.extend(
+            [
+                "_flash_qk_mma",
+                "_flash_pv_mma",
+                "_flash_tma_q",
+                "_flash_mQt",
+                "_flash_tma_k",
+                "_flash_mKt",
+                "_flash_tma_v",
+                "_flash_mVt",
+                "_flash_mOt",
+                "_flash_qsl",
+                "_flash_ksl",
+                "_flash_vsl",
+                "_flash_ptl",
+                "_flash_scale_log2",
+                "_flash_num_kv_tiles",
+            ]
+        )
+        if pass_dynamic_tile_counts:
+            call_args.extend(["_flash_num_bh", "_flash_total_tiles"])
+        if lse_idx is not None:
+            call_args.append("_flash_mLSE")
+        if bias_idx is not None:
+            call_args.extend(["_flash_mBias", "_flash_score_bias_scale"])
+        if alibi_idx is not None:
+            call_args.extend(["_flash_mAlibi", "_flash_num_alibi"])
+        if document_idx is not None:
+            call_args.extend(["_flash_mDoc", "_flash_doc_heads_per_batch"])
+        if epi_tma:
+            call_args.extend(["_flash_tma_o", "_flash_osl"])
+        return
     if kind == "tcgen05_d_tma":
         d_idx = plan_int("d_idx")
         bm = plan_int("bm")
@@ -2149,6 +2721,7 @@ def _append_cute_wrapper_plan(
             epi_tile_m=plan_optional_int("epi_tile_m"),
             epi_tile_n=plan_optional_int("epi_tile_n"),
             d_store_box_n=plan_optional_int("d_store_box_n"),
+            epi_tile_raw_expr=plan_optional_str("epi_tile_raw_expr"),
         )
         return
     if kind == "tcgen05_aux_tma":
@@ -2196,6 +2769,9 @@ def _append_cute_wrapper_plan(
     smem_swizzle_b: int | None = (
         int(smem_swizzle_b_raw) if isinstance(smem_swizzle_b_raw, int) else None
     )
+    # K-major (column-major / K-contiguous) B. Absent on the MN-major
+    # (row-major B) default path.
+    b_k_major = bool(plan.get("b_k_major"))
     kernel_args = [str(arg) for arg in cast("list[object]", plan["kernel_args"])]
     assert len(kernel_args) == 4
     tma_atom_a, tma_tensor_a, tma_atom_b, tma_tensor_b = kernel_args
@@ -2207,9 +2783,20 @@ def _append_cute_wrapper_plan(
     # cluster_m=2 cluster_n=1 but rejects the canonical Quack-best
     # cluster_m=2 cluster_n=2 4-CTA cluster (product=4). Use
     # ``cluster_m == 2`` directly so cluster_n=2 keeps CtaGroup.TWO.
+    #
+    # The bm=128 CtaGroup.TWO family (fp8 small-grid) cannot be derived from
+    # ``bm == 256`` here, so the device codegen records the resolved decision
+    # on the plan as ``use_2cta_instrs``. Honor it when present; fall back to
+    # the legacy bm==256 derivation for golden-stable older plans.
+    plan_use_2cta = plan.get("use_2cta_instrs")
+    if plan_use_2cta is not None:
+        assert isinstance(plan_use_2cta, bool)
+        use_2cta_instrs = plan_use_2cta
+    else:
+        use_2cta_instrs = cluster_m == 2 and bm == 256
     cta_group = (
         "cute.nvgpu.tcgen05.CtaGroup.TWO"
-        if cluster_m == 2 and bm == 256
+        if use_2cta_instrs
         else "cute.nvgpu.tcgen05.CtaGroup.ONE"
     )
     cluster_shape = f"({cluster_m}, {cluster_n}, 1)"
@@ -2237,15 +2824,21 @@ def _append_cute_wrapper_plan(
         num_stages=ab_stage_count,
         operand="b",
         swizzle_override=smem_swizzle_b,
+        b_k_major=b_k_major,
     )
     body.extend(
         (
             (
                 f"    {tiled_mma} = cutlass.utils.blackwell_helpers.make_trivial_tiled_mma("
                 f"{input_dtype}, "
-                "cute.nvgpu.tcgen05.OperandMajorMode.K, "
-                "cute.nvgpu.tcgen05.OperandMajorMode.MN, "
-                f"{acc_dtype}, "
+                f"{input_dtype}, "
+                "cute.nvgpu.OperandMajorMode.K, "
+                + (
+                    "cute.nvgpu.OperandMajorMode.K, "
+                    if b_k_major
+                    else "cute.nvgpu.OperandMajorMode.MN, "
+                )
+                + f"{acc_dtype}, "
                 f"{cta_group}, "
                 f"({bm}, {bn}), "
                 "cute.nvgpu.tcgen05.OperandSource.SMEM)"
@@ -2263,7 +2856,10 @@ def _append_cute_wrapper_plan(
                 f"(arg{rhs_idx}_shape1, arg{rhs_idx}_shape0), "
                 f"stride=(arg{rhs_idx}_stride1, arg{rhs_idx}_stride0)))"
             ),
-            f"    {rhs_tma}.mark_layout_dynamic(leading_dim=0)",
+            # B is viewed as (N, K). For row-major B (MN-major) the N axis
+            # (position 0) is contiguous; for column-major B (K-major, native
+            # fp8 layout) the K axis (position 1) is contiguous.
+            f"    {rhs_tma}.mark_layout_dynamic(leading_dim={1 if b_k_major else 0})",
             # ``make_tiled_tma_atom_A`` vs ``_B`` asymmetry:
             # - ``_B`` always passes ``cluster_layout_vmnk.shape`` as
             #   its trailing arg (CuTe's signature for B requires the
@@ -2346,6 +2942,7 @@ def _create_cute_wrapper(
     cute_kernel: object,
     schema_key: tuple[tuple[object, ...], ...],
     block: tuple[int, int, int],
+    num_sm: int | None = None,
 ) -> object:
     _patch_cutlass_jit_shutdown_unload()
     import cutlass
@@ -2441,7 +3038,7 @@ def _create_cute_wrapper(
         for plan in getattr(cast("Any", cute_kernel), "_helion_cute_wrapper_plans", [])
     ]
     for plan in wrapper_plans:
-        _append_cute_wrapper_plan(body, call_args, plan)
+        _append_cute_wrapper_plan(body, call_args, plan, num_sm=num_sm)
     launch_suffix = f", block={block!r}"
     cluster_shape = _cute_cluster_shape(cute_kernel, wrapper_plans)
     if cluster_shape is not None:
@@ -2455,6 +3052,19 @@ def _create_cute_wrapper(
     # mirrors how ``cluster_m``/``cluster_n`` flow through this layer.
     if any(plan.get("use_pdl") for plan in wrapper_plans):
         launch_suffix += ", use_pdl=True"
+    # The fa4 flash topology (16-warp/512-thread) uses ``cute.arch.setmaxregister``
+    # for per-warp register reallocation (softmax warps inc to 200; mma/corr/load/empty
+    # dec). ptxas only emits the ``EIATTR_REG_RECONFIG`` that HONORS those ``setmaxnreg``
+    # ops when the kernel declares ``min_blocks_per_mp`` (>= 1); WITHOUT it ptxas
+    # SILENTLY DROPS every setmaxnreg and all warps are stuck at the static uniform
+    # split -- so the softmax warp never reaches its 200-reg grant and spills its
+    # resident row to local memory. fa4 already pins 1 CTA/SM (512 threads + TMEM = 1
+    # tcgen05 unit/SM + smem near the cap), so ``min_blocks_per_mp=1`` matches its real
+    # occupancy and enables the reallocation (=1 avoids the smem-carveout path >1 would
+    # trigger). NOT applied to ws_overlap (256-thread): forcing 1 CTA/SM there cuts its
+    # 2-blocks/SM occupancy and regresses it ~4pp.
+    if any(plan.get("topology") == "fa4" for plan in wrapper_plans):
+        launch_suffix += ", min_blocks_per_mp=1"
     body.extend(
         (
             f"    _helion_cute_kernel_tag = {kernel_tag!r}",
@@ -2489,438 +3099,6 @@ def _create_cute_wrapper(
     return namespace[func_name]
 
 
-# Per-``bk`` stage tuple and tensor shape sets for the TVM-FFI
-# direct-entry fast launch path. The validator imports these from
-# ``tcgen05_constants`` (see top of file) so the codegen-side
-# direct-entry source builder and the runtime-side validator cannot
-# drift out of sync.
-
-
-def _target1_direct_entry_plan(
-    cute_kernel: object,
-) -> dict[str, object] | None:
-    direct_plans = [
-        cast("dict[str, object]", plan)
-        for plan in getattr(
-            cast("Any", cute_kernel), "_helion_cute_direct_entry_plans", []
-        )
-    ]
-    if not direct_plans:
-        return None
-    if len(direct_plans) != 1:
-        raise exc.BackendUnsupported(
-            "cute",
-            "tcgen05 direct entry requires exactly one direct-entry plan",
-        )
-    plan = direct_plans[0]
-    if plan.get("kind") != "tcgen05_target1_direct_entry":
-        raise exc.BackendUnsupported(
-            "cute",
-            f"unsupported direct-entry plan kind: {plan.get('kind')!r}",
-        )
-    return plan
-
-
-def _plan_int(plan: dict[str, object], key: str) -> int:
-    value = plan[key]
-    if not isinstance(value, int):
-        raise exc.BackendUnsupported(
-            "cute",
-            f"invalid direct-entry plan {key}: {value!r}",
-        )
-    return value
-
-
-def _target1_direct_entry_arg_indices(
-    plan: dict[str, object],
-) -> tuple[int, ...]:
-    # T2 adds a 4th index for the rowvec bias tensor when the plan
-    # carries ``bias_idx``. T1/T3/T4/T5 keep the 3-index lhs/rhs/output
-    # signature.
-    indices: tuple[int, ...] = (
-        _plan_int(plan, "lhs_idx"),
-        _plan_int(plan, "rhs_idx"),
-        _plan_int(plan, "d_idx"),
-    )
-    if "bias_idx" in plan:
-        indices = (*indices, _plan_int(plan, "bias_idx"))
-    return indices
-
-
-def _direct_entry_clustered_grid_k(device: torch.device) -> tuple[int, ...]:
-    """Return the accepted ``grid[2]`` set for the clustered direct-entry launch.
-
-    The clustered grid is ``(cluster_m, cluster_n, min(total_clusters,
-    num_sms // cluster_m))`` (see the codegen at ``program_id.py``).
-    Both the unconstrained ``total_clusters`` value (when ``num_sms``
-    is large enough) and the cap ``num_sms // cluster_m`` are valid
-    runtime values; the accept set is the union for the validated
-    ``total_clusters`` envelope.
-
-    On B200 with 148 SMs and ``cluster_m=2``: T1 yields ``min(64, 74)
-    = 64``; T2/T3/T4/T5 each yield ``min(128, 74) = 74``; T6 yields
-    ``min(256, 74) = 74``. The validator derives this set from the
-    actual CUDA device so different Blackwell SKUs with a different
-    ``num_sms`` extend automatically — on a hypothetical larger SKU
-    with ``num_sms // cluster_m >= 256`` the T6 runtime ``grid[2] =
-    256`` is in the accept set because
-    ``TCGEN05_DIRECT_ENTRY_TOTAL_WORK_CLUSTERS`` includes 256.
-    """
-    if device.type != "cuda" or not torch.cuda.is_available():
-        # Fall back to the B200 set; tests that mock device access never
-        # hit launch-time validation.
-        return (64, 74)
-    sm_count = int(torch.cuda.get_device_properties(device).multi_processor_count)
-    cap = sm_count // TCGEN05_DIRECT_ENTRY_CLUSTER_M
-    accepted: set[int] = {cap}
-    accepted.update(
-        min(total, cap) for total in TCGEN05_DIRECT_ENTRY_TOTAL_WORK_CLUSTERS
-    )
-    return tuple(sorted(accepted))
-
-
-def _validate_target1_direct_entry_args(
-    plan: dict[str, object],
-    args: tuple[object, ...],
-    grid: tuple[int, int, int],
-    block: tuple[int, int, int],
-    compile_options: str | None,
-) -> tuple[int, ...]:
-    if compile_options is None or "--enable-tvm-ffi" not in compile_options.split():
-        raise exc.BackendUnsupported(
-            "cute",
-            "tcgen05 direct entry requires --enable-tvm-ffi",
-        )
-    # The clustered grid is ``(cluster_m, cluster_n, K)`` for some
-    # device/shape-dependent ``K``: Target 1 yields ``K = 64`` (matches
-    # total work clusters at the T1 shape) and Target 4 caps at
-    # ``K = num_sms // cluster_m`` (= 74 on B200). The x-linear
-    # ``(128, 1, 1)`` is the legacy generated direct-entry form used
-    # inside the compiler-emitted entry point. We pin the accepted
-    # ``grid[2]`` set to the two validated values so a runtime grid that
-    # diverges from the validated envelope is rejected loudly.
-    if block != (256, 1, 1):
-        raise exc.BackendUnsupported(
-            "cute",
-            f"tcgen05 direct entry requires block=(256, 1, 1), got {block}",
-        )
-    # A4 (cycle-2 review): the clustered ``grid[2]`` accept set is
-    # derived from the target tensor's CUDA device's SM count via
-    # ``_direct_entry_clustered_grid_k`` so different Blackwell SKUs
-    # extend automatically instead of being silently rejected by a
-    # B200-hardcoded literal.
-    first_tensor = next(
-        (a for a in args if isinstance(a, torch.Tensor)),
-        None,
-    )
-    if first_tensor is None:
-        raise exc.BackendUnsupported(
-            "cute",
-            "tcgen05 direct entry requires at least one tensor argument",
-        )
-    accepted_clustered_grid_k = _direct_entry_clustered_grid_k(first_tensor.device)
-    if not (
-        (grid[0] == 2 and grid[1] == 1 and grid[2] in accepted_clustered_grid_k)
-        or grid == (128, 1, 1)
-    ):
-        raise exc.BackendUnsupported(
-            "cute",
-            f"tcgen05 direct entry requires the validated cluster_m=2 "
-            f"launch geometry (clustered grid[2] in "
-            f"{accepted_clustered_grid_k!r}), got {grid}",
-        )
-    bm = _plan_int(plan, "bm")
-    bn = _plan_int(plan, "bn")
-    bk = _plan_int(plan, "bk")
-    cluster_m = _plan_int(plan, "cluster_m")
-    cluster_n = _plan_int(plan, "cluster_n")
-    ab_stage_count = _plan_int(plan, "ab_stage_count")
-    c_stage_count = _plan_int(plan, "c_stage_count")
-    if (bm, bn, cluster_m, cluster_n) != (256, 256, 2, 1):
-        raise exc.BackendUnsupported(
-            "cute",
-            "tcgen05 direct entry requires bm=bn=256 cluster_m=2 cluster_n=1, "
-            f"got bm={bm} bn={bn} cluster_m={cluster_m} cluster_n={cluster_n}",
-        )
-    if (ab_stage_count, c_stage_count) not in _DIRECT_ENTRY_STAGE_TUPLES_BY_BK.get(
-        bk, ()
-    ):
-        raise exc.BackendUnsupported(
-            "cute",
-            "tcgen05 direct entry requires a validated stage tuple, got "
-            f"bk={bk} (ab,c)=({ab_stage_count},{c_stage_count})",
-        )
-    if (
-        plan.get("input_dtype") != "cutlass.BFloat16"
-        or plan.get("output_dtype") != "cutlass.BFloat16"
-    ):
-        raise exc.BackendUnsupported(
-            "cute",
-            "tcgen05 direct entry requires bf16 input/output dtypes",
-        )
-
-    indices = _target1_direct_entry_arg_indices(plan)
-    # T1/T3/T4/T5 keep the 3-tensor (lhs/rhs/output) signature; T2 adds
-    # a 4th rank-1 trailing-axis bias tensor signalled by the plan's
-    # ``bias_idx`` (= ``indices[3]``).
-    has_bias = len(indices) == 4
-    if not has_bias and (indices != (0, 1, 2) or len(args) != 3):
-        raise exc.BackendUnsupported(
-            "cute",
-            "tcgen05 direct entry currently supports exactly lhs/rhs/output args",
-        )
-    if has_bias and (indices != (0, 1, 2, 3) or len(args) != 4):
-        raise exc.BackendUnsupported(
-            "cute",
-            "tcgen05 direct entry with bias requires exactly lhs/rhs/output/bias args",
-        )
-    matmul_args = args[:3]
-    arg_shapes: list[tuple[int, ...]] = []
-    for arg in matmul_args:
-        if not isinstance(arg, torch.Tensor):
-            raise exc.BackendUnsupported(
-                "cute",
-                "tcgen05 direct entry requires tensor arguments",
-            )
-        _validate_cute_launcher_tensor(arg)
-        if arg.dtype is not torch.bfloat16:
-            raise exc.BackendUnsupported(
-                "cute",
-                "tcgen05 direct entry requires bf16 tensor arguments",
-            )
-        if arg.ndim != 2 or int(arg.stride(1)) != 1:
-            raise exc.BackendUnsupported(
-                "cute",
-                "tcgen05 direct entry requires row-major rank-2 tensors",
-            )
-        arg_shapes.append(tuple(int(arg.size(dim)) for dim in range(arg.ndim)))
-    observed_shapes = tuple(arg_shapes)
-    # B1 (cycle-3 review): each direct-entry plan carries its
-    # validated problem shape so the validator can dispatch on the
-    # exact (M, N, K) envelope baked into the plan. T4 and T5 share
-    # ``bk=128`` (and the same ``(ab,c)`` stage tuple and cluster
-    # geometry), so the bk-keyed shape-set alone cannot distinguish
-    # a T4-plan from a T5-plan — the plan-carried ``validated_shape``
-    # is what keeps them apart at the validator boundary. The legacy
-    # bk-keyed shape-set (``_DIRECT_ENTRY_SHAPE_SETS_BY_BK``) remains
-    # as defense-in-depth: the per-plan check below additionally
-    # asserts that the plan's ``validated_shape`` is one of the
-    # bk-allowed shapes (so a future plan-construction-site bug that
-    # forged an off-envelope shape into a plan still gets caught).
-    validated_shape_raw = plan.get("validated_shape")
-    if not (
-        isinstance(validated_shape_raw, (list, tuple))
-        and len(validated_shape_raw) == 3
-        and all(isinstance(v, int) for v in validated_shape_raw)
-    ):
-        raise exc.BackendUnsupported(
-            "cute",
-            f"tcgen05 direct entry plan requires validated_shape, got "
-            f"{validated_shape_raw!r}",
-        )
-    plan_m, plan_n, plan_k = (int(v) for v in validated_shape_raw)
-    bk_allowed_shapes = _DIRECT_ENTRY_SHAPE_SETS_BY_BK.get(bk, ())
-    expected_lhs = (plan_m, plan_k)
-    expected_rhs = (plan_k, plan_n)
-    expected_d = (plan_m, plan_n)
-    expected_shapes = (expected_lhs, expected_rhs, expected_d)
-    if expected_shapes not in bk_allowed_shapes:
-        raise exc.BackendUnsupported(
-            "cute",
-            f"tcgen05 direct entry plan bk={bk} carries unvalidated "
-            f"validated_shape={plan_m, plan_n, plan_k}; bk-allowed shape "
-            f"envelopes are {bk_allowed_shapes!r}",
-        )
-    if observed_shapes != expected_shapes:
-        raise exc.BackendUnsupported(
-            "cute",
-            f"tcgen05 direct entry plan validated_shape="
-            f"{plan_m, plan_n, plan_k} (bk={bk}) requires shapes "
-            f"{expected_shapes!r}, got {observed_shapes!r}",
-        )
-    if has_bias:
-        # The arity check above already required ``len(args) == 4`` when
-        # ``has_bias`` is set; pyrefly cannot narrow the tuple type
-        # across the conditional, so index the args by ``cast`` below.
-        bias_arg = cast("tuple[object, ...]", args)[3]
-        if not isinstance(bias_arg, torch.Tensor):
-            raise exc.BackendUnsupported(
-                "cute",
-                "tcgen05 direct entry bias requires a tensor argument",
-            )
-        _validate_cute_launcher_tensor(bias_arg)
-        if bias_arg.dtype is not torch.bfloat16:
-            raise exc.BackendUnsupported(
-                "cute",
-                "tcgen05 direct entry bias requires a bf16 tensor",
-            )
-        # The bias tensor for T2 is rank-1 with N elements (trailing-axis
-        # rowvec broadcast); stride must be 1 so the GMEM load uses
-        # contiguous reads. The N-extent matches the matmul's N to keep
-        # the bias broadcast aligned with the output tile columns.
-        if (
-            bias_arg.ndim != 1
-            or int(bias_arg.stride(0)) != 1
-            or int(bias_arg.size(0)) != plan_n
-        ):
-            raise exc.BackendUnsupported(
-                "cute",
-                "tcgen05 direct entry bias requires a contiguous rank-1 "
-                f"bf16 tensor of shape ({plan_n},), got shape "
-                f"{tuple(int(bias_arg.size(d)) for d in range(bias_arg.ndim))!r} "
-                f"stride {tuple(int(bias_arg.stride(d)) for d in range(bias_arg.ndim))!r}",
-            )
-    return indices
-
-
-def _wrapper_plans_for_direct_entry(
-    cute_kernel: object,
-    direct_plan: dict[str, object],
-) -> list[dict[str, object]]:
-    wrapper_plans = [
-        cast("dict[str, object]", plan)
-        for plan in getattr(cast("Any", cute_kernel), "_helion_cute_wrapper_plans", [])
-    ]
-    if [plan.get("kind") for plan in wrapper_plans] != [
-        "tcgen05_ab_tma",
-        "tcgen05_d_tma",
-    ]:
-        raise exc.BackendUnsupported(
-            "cute",
-            "tcgen05 direct entry requires A/B and D TMA wrapper plans",
-        )
-    ab_plan, d_plan = wrapper_plans
-    expected_ab_fields = {
-        "lhs_idx": _plan_int(direct_plan, "lhs_idx"),
-        "rhs_idx": _plan_int(direct_plan, "rhs_idx"),
-        "bm": _plan_int(direct_plan, "bm"),
-        "bn": _plan_int(direct_plan, "bn"),
-        "bk": _plan_int(direct_plan, "bk"),
-        "cluster_m": _plan_int(direct_plan, "cluster_m"),
-        "cluster_n": _plan_int(direct_plan, "cluster_n"),
-        "ab_stage_count": _plan_int(direct_plan, "ab_stage_count"),
-        "input_dtype": direct_plan.get("input_dtype"),
-        "acc_dtype": "cutlass.Float32",
-    }
-    expected_d_fields = {
-        "d_idx": _plan_int(direct_plan, "d_idx"),
-        "bm": _plan_int(direct_plan, "bm"),
-        "bn": _plan_int(direct_plan, "bn"),
-        "c_stage_count": _plan_int(direct_plan, "c_stage_count"),
-        "output_dtype": direct_plan.get("output_dtype"),
-        "epi_tile_m": 128,
-        "epi_tile_n": 32,
-        "d_store_box_n": 32,
-    }
-    for key, expected in expected_ab_fields.items():
-        if ab_plan.get(key) != expected:
-            raise exc.BackendUnsupported(
-                "cute",
-                f"tcgen05 direct entry wrapper A/B plan mismatch for {key}",
-            )
-    for key, expected in expected_d_fields.items():
-        if d_plan.get(key) != expected:
-            raise exc.BackendUnsupported(
-                "cute",
-                f"tcgen05 direct entry wrapper D plan mismatch for {key}",
-            )
-    if "smem_swizzle_a" in ab_plan or "smem_swizzle_b" in ab_plan:
-        raise exc.BackendUnsupported(
-            "cute",
-            "tcgen05 direct entry requires default A/B SMEM wrapper layouts",
-        )
-    if list(cast("list[object]", direct_plan["ab_kernel_args"])) != list(
-        cast("list[object]", ab_plan["kernel_args"])
-    ) or list(cast("list[object]", direct_plan["d_kernel_args"])) != list(
-        cast("list[object]", d_plan["kernel_args"])
-    ):
-        raise exc.BackendUnsupported(
-            "cute",
-            "tcgen05 direct entry plan does not match wrapper TMA args",
-        )
-    return wrapper_plans
-
-
-def _create_cute_direct_entry(
-    cute_kernel: object,
-    direct_plan: dict[str, object],
-    grid: tuple[int, int, int],
-    block: tuple[int, int, int],
-) -> object:
-    _patch_cutlass_jit_shutdown_unload()
-    import cutlass
-    import cutlass.cute as cute
-
-    wrapper_plans = _wrapper_plans_for_direct_entry(cute_kernel, direct_plan)
-    body: list[str] = []
-    arg_indices = _target1_direct_entry_arg_indices(direct_plan)
-    # The lhs/rhs/output tensors are rank-2; the optional bias tensor
-    # for T2 is rank-1 and only contributes a single shape/stride pair.
-    for index in arg_indices[:3]:
-        body.extend(
-            (
-                f"    arg{index}_shape0 = arg{index}.shape[0]",
-                f"    arg{index}_shape1 = arg{index}.shape[1]",
-                f"    arg{index}_stride0 = arg{index}.stride[0]",
-                f"    arg{index}_stride1 = arg{index}.stride[1]",
-            )
-        )
-    has_bias = len(arg_indices) == 4
-    if has_bias:
-        bias_index = arg_indices[3]
-        body.extend(
-            (
-                f"    arg{bias_index}_shape0 = arg{bias_index}.shape[0]",
-                f"    arg{bias_index}_stride0 = arg{bias_index}.stride[0]",
-            )
-        )
-    call_args = ["arg0", "arg1", "arg2"]
-    if has_bias:
-        call_args.append(f"arg{arg_indices[3]}")
-    for plan in wrapper_plans:
-        _append_cute_wrapper_plan(body, call_args, plan)
-
-    launch_suffix = f", block={block!r}"
-    cluster_shape = _cute_cluster_shape(cute_kernel, wrapper_plans)
-    if cluster_shape is not None:
-        launch_suffix += f", cluster={list(cluster_shape)!r}"
-    if any(plan.get("use_pdl") for plan in wrapper_plans):
-        launch_suffix += ", use_pdl=True"
-    body.extend(
-        (
-            f"    _helion_cute_kernel_tag = {getattr(cast('Any', cute_kernel), '__name__', 'cute_kernel')!r}",
-            "    _kernel("
-            + ", ".join(call_args)
-            + f").launch(grid={grid!r}{launch_suffix})",
-        )
-    )
-
-    kernel_name = getattr(cast("Any", cute_kernel), "__name__", "cute_kernel")
-    func_name = f"_helion_cute_direct_entry_{kernel_name}_{id(cute_kernel):x}"
-    entry_params = ", ".join(f"arg{i}" for i in range(len(arg_indices)))
-    source = "\n".join(
-        [
-            "@cute.jit",
-            f"def {func_name}({entry_params}) -> None:",
-            *body,
-        ]
-    )
-    namespace: dict[str, Any] = {
-        "cutlass": cutlass,
-        "cute": cute,
-        "_kernel": cute_kernel,
-    }
-    filename = f"<helion_cute_direct_entry:{kernel_name}:{id(cute_kernel):x}>"
-    linecache.cache[filename] = (
-        len(source),
-        None,
-        [line + "\n" for line in source.splitlines()],
-        filename,
-    )
-    exec(compile(source, filename, "exec"), namespace)
-    return namespace[func_name]
-
-
 class _CompiledCuteLauncher:
     """Lazily compile a Helion ``@cute.jit`` wrapper via ``cute.compile``.
 
@@ -2929,160 +3107,182 @@ class _CompiledCuteLauncher:
     bypasses the per-launch ``@cute.jit`` argument-handling/dispatch path,
     matching Quack's pattern (see ``gemm_tvm_ffi_utils.py``). On B200 this
     collapses ~200ms of per-launch host overhead into ~0.1ms.
+
+    When ``cache_key`` is provided, the lowered IR module of the compiled
+    kernel is persisted under ``CUTE_DSL_CACHE_DIR`` and reloaded on a later
+    process, skipping recompilation.  ``cute.compile`` forces the CuTe DSL's
+    own ``no_cache=True`` path, so Helion drives the on-disk cache itself: it
+    writes the post-pass ``ir_module`` bytecode (plus a small JSON sidecar
+    holding the mangled entry symbol) and, on a hit, reconstructs a runnable
+    ``CudaDialectJitCompiledFunction`` by JIT-loading the stored module.
+    Any failure in the cache layer falls back to a plain ``cute.compile``.
     """
 
-    __slots__ = ("_compile_options", "_compiled", "_jit_func")
-
-    def __init__(self, jit_func: object, compile_options: str | None) -> None:
-        self._jit_func = jit_func
-        self._compile_options = compile_options
-        self._compiled: object = None
-
-    def __call__(self, *args: object) -> object:
-        compiled = self._compiled
-        if compiled is None:
-            import cutlass.cute as cute
-
-            if self._compile_options is None:
-                compiled = cute.compile(self._jit_func, *args)
-            else:
-                compiled = cute.compile(
-                    self._jit_func,
-                    *args,
-                    options=self._compile_options,
-                )
-            self._compiled = compiled
-        return cast("Any", compiled)(*args)
-
-
-class _CompiledCuteDirectEntryLauncher:
-    """Compile a Target1 direct tensor-entry wrapper with fake tensor args."""
-
-    __slots__ = (
-        "_compile_args",
-        "_compile_options",
-        "_compiled",
-        "_jit_func",
-        "_runtime_arg_indices",
-    )
+    __slots__ = ("_cache_key", "_compile_options", "_compiled", "_jit_func")
 
     def __init__(
         self,
         jit_func: object,
-        compile_args: tuple[object, ...],
-        runtime_arg_indices: tuple[int, ...],
-        compile_options: str,
+        compile_options: str | None,
+        cache_key: str | None = None,
     ) -> None:
         self._jit_func = jit_func
-        self._compile_args = compile_args
-        self._runtime_arg_indices = runtime_arg_indices
         self._compile_options = compile_options
         self._compiled: object = None
+        self._cache_key = cache_key
 
     def __call__(self, *args: object) -> object:
         compiled = self._compiled
         if compiled is None:
-            _patch_cutlass_jit_shutdown_unload()
             import cutlass.cute as cute
 
-            compiled = cute.compile(
-                self._jit_func,
-                *self._compile_args,
-                options=self._compile_options,
-            )
+            compiled = None
+            if self._cache_key is not None:
+                compiled = self._reload_from_disk()
+            if compiled is None:
+                if self._compile_options is None:
+                    compiled = cute.compile(self._jit_func, *args)
+                else:
+                    compiled = cute.compile(
+                        self._jit_func,
+                        *args,
+                        options=self._compile_options,
+                    )
+                if self._cache_key is not None:
+                    self._persist_to_disk(compiled)
             self._compiled = compiled
-        launch_args = tuple(args[index] for index in self._runtime_arg_indices)
-        return cast("Any", compiled)(*launch_args)
+        return cast("Any", compiled)(*args)
+
+    def persist_compiled(self) -> None:
+        """Persist the already-compiled module into the current on-disk cache dir.
+
+        Used by ``finalize_ephemeral_cache``: the artifact written during
+        autotuning died with the ephemeral dir, but the compiled module is
+        still in memory and ``_cache_file_paths`` resolves the destination
+        from the (now restored) ``CUTE_DSL_CACHE_DIR`` at call time.
+        """
+        if self._cache_key is not None and self._compiled is not None:
+            self._persist_to_disk(self._compiled)
+
+    def _cache_file_paths(self) -> tuple[str, str, str]:
+        from cutlass.base_dsl.cache_helpers import get_default_generated_ir_path
+
+        cache_dir = get_default_generated_ir_path("CUTE_DSL")
+        mlir = os.path.join(cache_dir, f"cute_dsl_{self._cache_key}.mlir")
+        meta = os.path.join(cache_dir, f"cute_dsl_{self._cache_key}.json")
+        return cache_dir, mlir, meta
+
+    def _persist_to_disk(self, compiled: object) -> None:
+        try:
+            from cutlass.base_dsl.cache_helpers import save_ir
+            from cutlass.base_dsl.cache_helpers import write_bytecode_with_crc32
+
+            ir_module = getattr(compiled, "ir_module", None)
+            function_name = getattr(compiled, "function_name", None)
+            if ir_module is None or function_name is None:
+                return
+            cache_dir, _mlir, meta = self._cache_file_paths()
+            os.makedirs(cache_dir, exist_ok=True)
+            save_ir(
+                "CUTE_DSL",
+                ir_module,
+                str(self._cache_key),
+                output_dir=cache_dir,
+                as_bytecode=True,
+                bytecode_writer=lambda f: write_bytecode_with_crc32(f, ir_module),
+            )
+            # Atomic sidecar with the mangled entry symbol (process-dependent,
+            # so it cannot be recomputed and must be stored alongside the IR).
+            tmp = f"{meta}.tmp.{os.getpid()}"
+            with open(tmp, "w") as f:
+                json.dump(
+                    {
+                        "function_name": function_name,
+                        "has_gpu_module": bool(
+                            getattr(compiled, "has_gpu_module", True)
+                        ),
+                    },
+                    f,
+                )
+            os.replace(tmp, meta)
+        except (ImportError, OSError):
+            # Old cutlass or an unwritable cache dir; just recompile next time.
+            log.debug(
+                "CuTe disk-cache persist failed for key %s",
+                self._cache_key,
+                exc_info=True,
+            )
+
+    def _reload_from_disk(self) -> object:
+        try:
+            from cutlass.base_dsl.cache_helpers import load_ir
+            from cutlass.base_dsl.cache_helpers import read_bytecode_and_check_crc32
+            from cutlass.cutlass_dsl.cuda_jit_executor import (
+                CudaDialectJitCompiledFunction,
+            )
+            from cutlass.cutlass_dsl.cutlass import CuTeDSL
+
+            _cache_dir, mlir, meta = self._cache_file_paths()
+            if not (os.path.exists(mlir) and os.path.exists(meta)):
+                return None
+            with open(meta) as f:
+                metadata = json.load(f)
+            function_name = metadata["function_name"]
+            # The parsed Module holds an internal reference to the ir.Context
+            # that load_ir opened, so it stays valid after load_ir returns even
+            # though its ``with ir.Context()`` block has already exited.
+            _, module = load_ir(
+                mlir,
+                asBytecode=True,
+                bytecode_reader=read_bytecode_and_check_crc32,
+            )
+            dsl = CuTeDSL._get_dsl()
+            engine = dsl.compiler_provider.jit(
+                module, shared_libs=dsl.get_shared_libs()
+            )
+            capi_func = engine.lookup(function_name)
+            # The signature is reconstructable from the wrapper, so it does not
+            # need to be persisted.
+            wrapped = getattr(self._jit_func, "__wrapped__", self._jit_func)
+            signature = inspect.signature(cast("Any", wrapped), eval_str=True)
+            # Empty kernel_info / default extra-arg state is correct only for the
+            # non-experimental ``cute.compile`` path Helion uses here; the
+            # experimental DSL would populate these from module attributes.
+            return CudaDialectJitCompiledFunction(
+                module,
+                engine,
+                capi_func,
+                signature,
+                function_name,
+                {},
+                False,
+                None,
+                has_gpu_module=bool(metadata.get("has_gpu_module", True)),
+            )
+        except Exception:
+            # Any cutlass-internal change or corrupt artifact -> recompile.
+            return None
 
 
-def _make_cute_direct_entry_fake_tensor(arg: torch.Tensor) -> object:
-    import cutlass.cute as cute
-
-    dtype = cast("type[Any]", _torch_dtype_to_cutlass(arg.dtype))
-    assert dtype is not None
-    shape = tuple(cute.sym_int() for _ in range(arg.ndim))
-    leading_dim = arg.ndim - 1
-    divisibility = max(1, 16 // max(1, arg.element_size()))
-    stride = tuple(
-        1 if dim == leading_dim else cute.sym_int64(divisibility=divisibility)
-        for dim in range(arg.ndim)
-    )
-    return cute.runtime.make_fake_tensor(
-        dtype,
-        shape,
-        stride=stride,
-        assumed_align=16,
-    )
+_TVM_FFI_COMPILE_OPTION = "--enable-tvm-ffi"
 
 
-def _get_compiled_cute_direct_entry_launcher(
-    cute_kernel: object,
-    direct_plan: dict[str, object],
-    args: tuple[object, ...],
-    grid: tuple[int, int, int],
-    block: tuple[int, int, int],
-    compile_options: str,
-) -> object:
-    runtime_arg_indices = _validate_target1_direct_entry_args(
-        direct_plan,
-        args,
-        grid,
-        block,
-        compile_options,
-    )
-    try:
-        # pyrefly: ignore [missing-attribute]
-        cache = cute_kernel._helion_cute_direct_entry_launchers
-    except AttributeError:
-        cache = {}
-        # pyrefly: ignore [missing-attribute]
-        cute_kernel._helion_cute_direct_entry_launchers = cache
-    wrapper_plans = tuple(
-        repr(plan)
-        for plan in getattr(cast("Any", cute_kernel), "_helion_cute_wrapper_plans", [])
-    )
-    cluster_shape = getattr(
-        cast("Any", cute_kernel), "_helion_cute_cluster_shape", None
-    )
-    generated_direct_entry = getattr(
-        cast("Any", cute_kernel), "_helion_cute_generated_direct_entry", None
-    )
-    # The compiler-emitted direct entry hard-codes an x-linear
-    # ``grid=(128,1,1)`` launch. The validator above also admits the
-    # clustered ``(2,1,64)`` form for the runtime descriptor fallback;
-    # only the x-linear launch may reuse the generated direct entry.
-    if generated_direct_entry is not None and grid != (128, 1, 1):
-        generated_direct_entry = None
-    cache_key = (
-        repr(direct_plan),
-        wrapper_plans,
-        repr(cluster_shape),
-        grid,
-        block,
-        compile_options,
-        id(generated_direct_entry) if generated_direct_entry is not None else None,
-    )
-    cached = cache.get(cache_key)
-    if cached is not None:
-        return cached
-    _ensure_cute_dsl_arch_env(args)
-    jit_func = (
-        generated_direct_entry
-        if generated_direct_entry is not None
-        else _create_cute_direct_entry(cute_kernel, direct_plan, grid, block)
-    )
-    compile_args = tuple(
-        _make_cute_direct_entry_fake_tensor(cast("torch.Tensor", args[index]))
-        for index in runtime_arg_indices
-    )
-    launcher = _CompiledCuteDirectEntryLauncher(
-        jit_func,
-        compile_args,
-        runtime_arg_indices,
-        compile_options,
-    )
-    cache[cache_key] = launcher
-    return launcher
+def _merge_tvm_ffi_compile_option(compile_options: str | None) -> str:
+    """Ensure ``--enable-tvm-ffi`` is present in *compile_options*.
+
+    The generic launcher always benefits from the FFI bridge (it skips
+    CUTLASS-DSL's per-arg cast/pointer work). Other flags such as
+    ``--generate-line-info`` may already be present (e.g. when the
+    autotuner picks ``tcgen05_cubin_lineinfo=True``), so we splice rather
+    than replace.
+    """
+    if compile_options is None:
+        return _TVM_FFI_COMPILE_OPTION
+    tokens = compile_options.split()
+    if _TVM_FFI_COMPILE_OPTION in tokens:
+        return compile_options
+    tokens.append(_TVM_FFI_COMPILE_OPTION)
+    return " ".join(tokens)
 
 
 def _get_compiled_cute_launcher(
@@ -3092,6 +3292,14 @@ def _get_compiled_cute_launcher(
     compile_options: str | None = None,
     arch_args: tuple[object, ...] | None = None,
 ) -> object:
+    # Always ensure ``--enable-tvm-ffi`` is present on the generic launcher
+    # path: the generated wrapper signature (``cute.Pointer`` + scalars) is
+    # TVM-FFI compatible and the FFI bridge bypasses CUTLASS-DSL's per-arg
+    # cast/pointer work in ``generate_execution_args``. We merge rather
+    # than replace because other flags (e.g. ``--generate-line-info`` when
+    # ``tcgen05_cubin_lineinfo`` is True) can already be in
+    # ``compile_options``.
+    compile_options = _merge_tvm_ffi_compile_option(compile_options)
     try:
         # pyrefly: ignore [missing-attribute]
         cache = cute_kernel._helion_cute_compiled_launchers
@@ -3106,12 +3314,22 @@ def _get_compiled_cute_launcher(
     cluster_shape = getattr(
         cast("Any", cute_kernel), "_helion_cute_cluster_shape", None
     )
+    # Persistent flash kernels bake the device SM count into the wrapper grid
+    # clamp; resolve it from the first tensor arg's device so the cache key (and
+    # the baked literal) stay device-correct across GPUs.
+    num_sm: int | None = None
+    if arch_args is not None:
+        for arg in arch_args:
+            if isinstance(arg, torch.Tensor) and arg.device.type == "cuda":
+                num_sm = get_num_sm(arg.device)
+                break
     cache_key = (
         schema_key,
         block,
         wrapper_plans,
         repr(cluster_shape),
         compile_options,
+        num_sm,
     )
     cached = cache.get(cache_key)
     if cached is not None:
@@ -3119,10 +3337,98 @@ def _get_compiled_cute_launcher(
 
     if arch_args is not None:
         _ensure_cute_dsl_arch_env(arch_args)
-    jit_func = _create_cute_wrapper(cute_kernel, schema_key, block)
-    launcher = _CompiledCuteLauncher(jit_func, compile_options)
+    jit_func = _create_cute_wrapper(cute_kernel, schema_key, block, num_sm=num_sm)
+    disk_cache_key = _cute_disk_cache_key(
+        cute_kernel,
+        schema_key,
+        block,
+        wrapper_plans,
+        cluster_shape,
+        compile_options,
+        num_sm,
+    )
+    launcher = _CompiledCuteLauncher(
+        jit_func, compile_options, cache_key=disk_cache_key
+    )
     cache[cache_key] = launcher
     return launcher
+
+
+def _cute_cache_relevant_env() -> tuple[tuple[str, str], ...]:
+    """Return CuTe DSL env vars that can change the compiled IR.
+
+    The CuTe DSL folds *every* one of its ``CUTE_DSL_*`` env vars into its own
+    module hash (e.g. ``CUTE_DSL_ENABLE_ASSERTIONS``, ``CUTE_DSL_LINEINFO``,
+    ``CUTE_DSL_KEEP``, the tvm-ffi flags), so any of them can alter the
+    persisted artifact.  We snapshot the whole set (so future flags are covered
+    too) and only exclude the cache *location* ``CUTE_DSL_CACHE_DIR`` — that
+    selects where artifacts live (autotuning uses an ephemeral dir) and must not
+    affect the key.  Including an env var that does not actually affect codegen
+    only costs an occasional missed cache hit, never a wrong-kernel reload.
+    """
+    return tuple(
+        sorted(
+            (k, v)
+            for k, v in os.environ.items()
+            if k.startswith("CUTE_DSL_") and k != "CUTE_DSL_CACHE_DIR"
+        )
+    )
+
+
+def _cute_disk_cache_key(
+    cute_kernel: object,
+    schema_key: tuple[tuple[object, ...], ...],
+    block: tuple[int, int, int],
+    wrapper_plans: tuple[object, ...],
+    cluster_shape: object,
+    compile_options: str | None,
+    num_sm: int | None = None,
+) -> str | None:
+    """Compute a stable cross-process key for the on-disk CuTe compile cache.
+
+    Returns ``None`` (disabling the on-disk cache) when the generated-source
+    hash is unavailable.  The key must be computable *before* the kernel is
+    compiled (so a hit can skip recompilation), so it is derived from the
+    inputs that determine the lowered IR rather than from the IR itself:
+    generated device-kernel source, full input specialization (dtypes, ranks,
+    baked shapes/strides, constexpr values), launch shape (block/cluster), CuTe
+    compile options, the IR-affecting ``CUTE_DSL_*`` env vars (target SM arch
+    among them), and the cutlass version.
+
+    ``num_sm`` is the device SM count the persistent flash wrapper bakes into
+    its grid clamp as a literal (``cute.compile`` lowers that literal into the
+    persisted ``ir_module``).  The env-var arch capture only distinguishes the
+    target *arch*, not the SM *count*, so two same-arch GPUs with different SM
+    counts would otherwise collide on one on-disk artifact carrying the wrong
+    grid clamp.  It is included unconditionally to match the in-memory cache
+    key; for non-persistent kernels num_sm does not affect codegen, so it only
+    costs an occasional cross-GPU miss, never a wrong-kernel reload.
+    """
+    source_hash = getattr(cute_kernel, "_helion_cute_source_hash", None)
+    if source_hash is None:
+        return None
+    try:
+        import cutlass
+
+        cutlass_version = getattr(cutlass, "__version__", "")
+    except Exception:
+        cutlass_version = ""
+    payload = repr(
+        (
+            "helion-cute-cache-v1",
+            source_hash,
+            schema_key,
+            block,
+            wrapper_plans,
+            repr(cluster_shape),
+            compile_options or "",
+            _cute_cache_relevant_env(),
+            cutlass_version,
+            num_sm,
+        )
+    )
+    digest = hashlib.sha256(payload.encode("utf-8")).digest()
+    return base64.b32encode(digest).decode().rstrip("=")
 
 
 _CUTE_LAUNCHER_IMPORTS: tuple[object, ...] | None = None
@@ -3141,6 +3447,20 @@ def _get_cute_launcher_imports() -> tuple[object, ...]:
     cached = (cute.AddressSpace.gmem, make_ptr, cutlass_torch.current_stream)
     _CUTE_LAUNCHER_IMPORTS = cached
     return cached
+
+
+def _cute_current_stream() -> object:
+    """Sample the *current* CUDA stream for a cute kernel launch.
+
+    Must be called fresh on every launch and never cached: under CUDA graph
+    capture ``torch.cuda.current_stream()`` is redirected to a dedicated capture
+    stream, so a stream baked into the cached launch args (during eager warmup)
+    would make the kernel launch on the wrong, non-capturing stream — the graph
+    then records no work and replays as a no-op (empty-graph capture). Sampling
+    here keeps the launch on whatever stream is current at call time.
+    """
+    _gmem, _make_ptr, current_stream_obj = _get_cute_launcher_imports()
+    return cast("Any", current_stream_obj)()
 
 
 # Keep the per-kernel launch-argument cache small: production kernels normally
@@ -3227,9 +3547,14 @@ def _build_cute_schema_and_args(
     grid: tuple[int, int, int],
     bake_tensor_shapes: bool = True,
 ) -> tuple[tuple[tuple[object, ...], ...], tuple[object, ...]]:
-    gmem_space, make_ptr_obj, current_stream_obj = _get_cute_launcher_imports()
+    # NOTE: the returned launch args deliberately EXCLUDE the CUDA stream. The
+    # stream is the only launch arg that is not a pure function of
+    # (grid, tensor metadata, scalars), so it must not be baked into the cached
+    # args — the caller appends a freshly sampled ``_cute_current_stream()`` on
+    # every launch (see ``default_cute_launcher``). Caching the stream would
+    # break CUDA graph capture (empty-graph / no-op replay).
+    gmem_space, make_ptr_obj, _current_stream_obj = _get_cute_launcher_imports()
     make_ptr = cast("Any", make_ptr_obj)
-    current_stream = cast("Any", current_stream_obj)
     constexpr_flags = _cute_kernel_param_is_constexpr(cute_kernel)
     # Kernels that emit cute MMA ops (universal matmul fallback or tcgen05
     # TMA wrapper plans) need runtime tensor layouts: the wrapper's
@@ -3239,9 +3564,14 @@ def _build_cute_schema_and_args(
     # silently miscompiles those paths.
     if bake_tensor_shapes:
         any_obj = cast("Any", cute_kernel)
+        wrapper_plans = getattr(any_obj, "_helion_cute_wrapper_plans", None)
+        wrapper_plans_disable_bake = bool(wrapper_plans) and not all(
+            plan.get("kind") == "helion_small_biased_attention"
+            for plan in wrapper_plans
+        )
         disable_bake = bool(
             getattr(any_obj, "_helion_cute_disable_bake_tensor_shapes", False)
-            or getattr(any_obj, "_helion_cute_wrapper_plans", None)
+            or wrapper_plans_disable_bake
         )
         if disable_bake:
             bake_tensor_shapes = False
@@ -3302,7 +3632,8 @@ def _build_cute_schema_and_args(
             launch_args.append(scalar_value)
 
     launch_args.extend(grid)
-    launch_args.append(current_stream())
+    # The stream is intentionally NOT appended here; it is sampled fresh per
+    # launch by the caller so CUDA graph capture sees the capture stream.
     return tuple(schema), tuple(launch_args)
 
 
@@ -3382,23 +3713,6 @@ def default_cute_launcher(
         return None
 
     args_tuple = tuple(args)
-    direct_plan = _target1_direct_entry_plan(cute_kernel)
-    if direct_plan is not None:
-        if cute_compile_options is None:
-            raise exc.BackendUnsupported(
-                "cute",
-                "tcgen05 direct entry requires explicit CuTe compile options",
-            )
-        direct_launcher = _get_compiled_cute_direct_entry_launcher(
-            cute_kernel,
-            direct_plan,
-            args_tuple,
-            grid_xyz,
-            block_xyz,
-            cute_compile_options,
-        )
-        return cast("Any", direct_launcher)(*args_tuple)
-
     schema_key, launch_args = _build_cached_cute_schema_and_args(
         cute_kernel, args_tuple, grid_xyz
     )
@@ -3409,7 +3723,10 @@ def default_cute_launcher(
         compile_options=cute_compile_options,
         arch_args=args_tuple,
     )
-    return cast("Any", compiled)(*launch_args)
+    # Append the CUDA stream fresh on every launch (never cached): under CUDA
+    # graph capture the current stream is the capture stream, so the kernel must
+    # be issued there and not on a stale stream baked into the cached args.
+    return cast("Any", compiled)(*launch_args, _cute_current_stream())
 
 
 def default_metal_launcher(

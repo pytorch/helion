@@ -23,7 +23,7 @@ if TYPE_CHECKING:
     from collections.abc import Callable
 
     from .._compiler.inductor_lowering import CodegenState
-    from .._compiler.type_propagation import TypeInfo
+    from .._compiler.type_info import TypeInfo
     from .._compiler.variable_origin import Origin
 
     _T = TypeVar("_T")
@@ -349,7 +349,7 @@ def _default_type_function(
     def type_prop_with_fake_fn(
         *args: object, origin: Origin, **kwargs: object
     ) -> TypeInfo:
-        from .._compiler.type_propagation import TypeInfo
+        from .._compiler.type_info import TypeInfo
         from .tile_proxy import Tile
 
         args, kwargs = tree_map_only(TypeInfo, _to_proxy, (args, kwargs))

@@ -399,6 +399,9 @@ KERNEL_MAPPINGS: dict[str, tuple[str, ...]] = {
         "tritonbench.operators.rope.operator",
         "examples.rope",
         "rope_tritonbench",
+        {
+            "num_inputs": 5,  # rope autotune takes long time on Benchmark CI, so use fewer inputs instead.
+        },
     ),
     "rope-bwd": (
         "tritonbench.operators.rope.operator",
@@ -1263,20 +1266,6 @@ def check_and_setup_tritonbench() -> None:
             check=True,
         )
 
-        print("Installing tritonbench requirements...", file=sys.stderr)
-        subprocess.run(
-            [
-                sys.executable,
-                "-m",
-                "pip",
-                "install",
-                "-r",
-                "requirements.txt",
-            ],
-            cwd=tritonbench_path,
-            check=True,
-        )
-
         print("Running install.py --liger...", file=sys.stderr)
         subprocess.run(
             [sys.executable, "install.py", "--liger"],
@@ -1291,21 +1280,28 @@ def check_and_setup_tritonbench() -> None:
             check=True,
         )
 
-        importlib.invalidate_caches()
-
         try:
+            importlib.invalidate_caches()
             # pyrefly: ignore [missing-import]
             import tritonbench
 
             print("Tritonbench installed successfully.", file=sys.stderr)
-            if installing_marker.exists():
-                installing_marker.unlink()
         except ImportError:
             print(
                 "Error: Tritonbench package installation failed. The package cannot be imported.",
                 file=sys.stderr,
             )
+            if installing_marker.exists():
+                installing_marker.unlink()
             sys.exit(1)
+
+        if installing_marker.exists():
+            installing_marker.unlink()
+
+        # Re-exec so the freshly-installed package (and all its submodules)
+        # is discovered cleanly by a new Python process.
+        print("Restarting to pick up freshly-installed tritonbench...", file=sys.stderr)
+        os.execv(sys.executable, [sys.executable, *sys.argv])
 
     except subprocess.CalledProcessError as e:
         print(f"Error installing tritonbench: {e}", file=sys.stderr)
@@ -1313,6 +1309,10 @@ def check_and_setup_tritonbench() -> None:
             print(f"stdout: {e.stdout}", file=sys.stderr)
         if e.stderr:
             print(f"stderr: {e.stderr}", file=sys.stderr)
+        # Clean up the marker so the next run doesn't re-trigger a full
+        # clone cycle.  The user can re-run or install manually.
+        if installing_marker.exists():
+            installing_marker.unlink()
         sys.exit(1)
 
 
@@ -1552,8 +1552,11 @@ def run_kernel_variants(
                 if isinstance(kfunc, Kernel):
                     # Helion kernel - we call it in a lambda to delay execution until measurement
                     if operator_name == "flash_attention":
+                        # examples.attention.attention returns (out, lse); the
+                        # tritonbench flash_attention operator only compares the
+                        # output tensor, so unwrap it before wrapping in a list.
                         measured_func_callable = lambda: [  # noqa: E731
-                            kfunc(*args, **kwargs)
+                            kfunc(*args, **kwargs)[0]
                         ]
                     else:
                         measured_func_callable = lambda: kfunc(*args, **kwargs)  # noqa: E731

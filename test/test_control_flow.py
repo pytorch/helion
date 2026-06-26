@@ -12,7 +12,6 @@ from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
 from helion._testing import code_and_output
 from helion._testing import onlyBackends
-from helion._testing import skipIfCute
 from helion._testing import skipIfPallas
 from helion._testing import skipIfRefEager
 from helion._testing import skipIfTileIR
@@ -343,7 +342,6 @@ class TestControlFlow(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result, expected)
 
     @skipIfPallas("Pallas gather supports only dim-0 indirect indexing")
-    @skipIfCute("Cute requires hl.arange() to use an active tile/reduction axis")
     def test_grid_if_reduction_rolling_branch_graph_ids(self):
         """Test for reductions under branch-by-grid control flow.
 
@@ -414,7 +412,6 @@ class TestControlFlow(RefEagerTestBase, TestCase):
             )
 
     @skipIfPallas("Pallas gather supports only dim-0 indirect indexing")
-    @skipIfCute("Cute requires hl.arange() to use an active tile/reduction axis")
     def test_grid_if_reduction_keepdim_true(self):
         @helion.kernel(static_shapes=False)
         def fn(x: torch.Tensor) -> torch.Tensor:

@@ -44,6 +44,10 @@ jobs:
     env:
       HELION_AUTOTUNE_LOG_LEVEL: INFO
       HELION_BACKEND: ${{ inputs.backend }}
+      # Per-shape autotune convergence cutoff (90 min): healthy searches finish
+      # well under it (slowest ~69 min); non-converging runaways are stopped with
+      # best-so-far.
+      HELION_AUTOTUNE_BUDGET_SECONDS: "5400"
 
     container:
       image: ${{ inputs.image }}
@@ -65,7 +69,7 @@ jobs:
 
     steps:
       - name: Run NVIDIA command
-        if: startsWith(inputs.image, 'nvidia') || (startsWith(inputs.image, 'pytorch') && contains(inputs.image, 'cuda'))
+        if: startsWith(inputs.image, 'nvidia')
         run: |
           echo "Detected NVIDIA image"
           nvidia-smi || echo "nvidia-smi not found"
@@ -83,7 +87,7 @@ jobs:
           apt-get install -y git
 
       - name: Check out code
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: Set up Python
         uses: actions/setup-python@v6
@@ -118,7 +122,7 @@ jobs:
           ./scripts/install_cute.sh
 
       - name: CUDA Compute Check
-        if: startsWith(inputs.image, 'nvidia') || (startsWith(inputs.image, 'pytorch') && contains(inputs.image, 'cuda'))
+        if: startsWith(inputs.image, 'nvidia')
         run: |
           source .venv/bin/activate
           python -c "
@@ -192,9 +196,18 @@ jobs:
             echo "Using baseline: $BASELINE"
             echo "Available implementations for $kernel: $IMPLS"
 
-            # Single pass: autotune search + codegen + compilation happen inline,
-            # so --measure-compile-time reports end-to-end user-visible compile time.
-            ${{ inputs.env-vars }} HELION_PRINT_OUTPUT_CODE=1 python benchmarks/run.py \
+            # Single inline pass (autotune + codegen + compile), so
+            # --measure-compile-time is end-to-end. HELION_AUTOTUNE_LOG is
+            # per-kernel (the sink appends, accumulating input shapes) and sits
+            # under $TEST_REPORTS_DIR, so its .csv/.log ride out in the
+            # artifact. The detailed dataset .meta.jsonl (identity + configs
+            # keyed by config_id) is opt-in via HELION_AUTOTUNE_LOG_DETAILS=1;
+            # set it manually when collecting the cost-model dataset. It is
+            # intentionally left off here to keep CI artifacts small.
+            # --autotune-metrics-json: per-run summary, overwrite-safe.
+            ${{ inputs.env-vars }} HELION_PRINT_OUTPUT_CODE=1 \
+            HELION_AUTOTUNE_LOG="$TEST_REPORTS_DIR/autotune-$kernel" \
+            python benchmarks/run.py \
                 --op $kernel \
                 --helion-backend "${{ inputs.backend }}" \
                 --metrics speedup,accuracy,latency \
@@ -209,6 +222,7 @@ jobs:
                 --input-sample-mode equally-spaced-k \
                 --output "$TEST_REPORTS_DIR/helionbench.json" \
                 --append-to-output \
+                --autotune-metrics-json "$TEST_REPORTS_DIR/autotune-metrics-$kernel.json" \
                 --keep-going \
                 ${{ inputs.custom-args }}
 

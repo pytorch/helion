@@ -169,6 +169,61 @@ class TestReductions(RefEagerTestBase, TestCase):
                 if _get_backend() == "cute":
                     self.assertIn("_cute_grouped_reduce_shared_two_stage", code)
 
+    def test_2d_tile_inner_dim_reduction_to_scalar(self):
+        """Reduce the inner dim of a single 2D ``hl.tile([o, d])`` into a per-row scalar.
+
+        Unlike ``test_cross_warp_reduction_non_sum_ops`` (which uses a separate
+        inner ``hl.tile(m)`` loop), this tiles both dims together in ONE
+        ``hl.tile([o, d])`` and reduces the inner dim (``dim=-1``) into a scalar
+        ``out[tile_o]``. That routes to ``BlockReductionStrategy`` with a runtime
+        lane loop over the block-resident inner dim. This form previously emitted
+        a per-thread partial with NO cross-thread reduction (the stride-32 reduce
+        group is spread across warps), so the threads owning a row raced to store
+        their partial sums -> silently wrong output. The fix folds the lane loop
+        into a per-thread partial and then combines across warps via
+        ``_cute_grouped_reduce_shared_two_stage`` (group_span=128, >32 and %32==0).
+
+        ``d_block`` is forced to the full power-of-2 extent so the reduction stays
+        block-resident (the well-posed form). D=128 makes the reduce group span
+        4 warps, exercising the cross-warp two-stage path on CuTe.
+        """
+
+        @helion.kernel(static_shapes=True, autotune_effort="none")
+        def sum_kernel(w: torch.Tensor) -> torch.Tensor:
+            o, d = w.shape
+            d = hl.specialize(d)
+            out = torch.empty([o], dtype=torch.float32, device=w.device)
+            d_block = hl.register_block_size(
+                helion.next_power_of_2(d), helion.next_power_of_2(d)
+            )
+            for tile_o, tile_d in hl.tile([o, d], block_size=[None, d_block]):
+                out[tile_o] = torch.sum(w[tile_o, tile_d].to(torch.float32), dim=-1)
+            return out
+
+        @helion.kernel(static_shapes=True, autotune_effort="none")
+        def amax_kernel(w: torch.Tensor) -> torch.Tensor:
+            o, d = w.shape
+            d = hl.specialize(d)
+            out = torch.empty([o], dtype=torch.float32, device=w.device)
+            d_block = hl.register_block_size(
+                helion.next_power_of_2(d), helion.next_power_of_2(d)
+            )
+            for tile_o, tile_d in hl.tile([o, d], block_size=[None, d_block]):
+                out[tile_o] = torch.amax(w[tile_o, tile_d].to(torch.float32), dim=-1)
+            return out
+
+        w = torch.randn([512, 128], device=DEVICE, dtype=torch.float32)
+        cases = [
+            (sum_kernel, lambda t: t.sum(-1)),
+            (amax_kernel, lambda t: t.amax(-1)),
+        ]
+        for kernel, ref_fn in cases:
+            with self.subTest(kernel=kernel.__name__):
+                code, out = code_and_output(kernel, (w,))
+                torch.testing.assert_close(out, ref_fn(w), rtol=1e-4, atol=1e-4)
+                if _get_backend() == "cute":
+                    self.assertIn("_cute_grouped_reduce_shared_two_stage", code)
+
     def test_sum_constant_inner_dim(self):
         """Sum over a known-constant inner dimension (e.g., 2) should work.
 
@@ -413,6 +468,103 @@ class TestReductions(RefEagerTestBase, TestCase):
         code, _ = code_and_output(
             layer_norm_reduction, args, block_size=32, reduction_loop=4
         )
+
+    def test_reduction_over_arange_dim_stays_persistent(self):
+        """Issue #2643: a reduction over an ``hl.arange()`` axis must not be
+        registered as a rollable (looped) reduction.
+
+        The arange axis is a concrete size with no block index var to re-bind
+        per loop iteration, so the producing load cannot be sliced inside the
+        reduction loop. Rolling it emitted a shape mismatch during codegen, so
+        the autotuner must never offer a ``reduction_loop`` for it -- the
+        reduction stays persistent.
+        """
+
+        @helion.kernel(static_shapes=True)
+        def rms_over_arange(qkv: torch.Tensor) -> torch.Tensor:
+            num_tokens, qk_heads, head_dim = qkv.shape
+            out = torch.empty(
+                [num_tokens, qk_heads], dtype=torch.float32, device=qkv.device
+            )
+            for tile_m, tile_gn in hl.tile(
+                [num_tokens, qk_heads], block_size=[1, None]
+            ):
+                tile_n = hl.arange(head_dim)
+                x_blk = qkv[tile_m, tile_gn, tile_n].to(dtype=torch.float32)
+                out[tile_m, tile_gn] = x_blk.pow(2).sum(dim=-1)
+            return out
+
+        qkv = torch.randn([64, 8, 128], device=DEVICE, dtype=HALF_DTYPE)
+
+        # The arange reduction axis must not be offered as a looped reduction,
+        # otherwise the autotuner could pick a reduction_loop value that
+        # produced a shape mismatch (issue #2643).
+        bound = rms_over_arange.bind((qkv,))
+        self.assertEqual(bound.env.config_spec.reduction_loops.valid_block_ids(), [])
+
+        _code, output = code_and_output(rms_over_arange, (qkv,))
+        expected = qkv.to(torch.float32).pow(2).sum(dim=-1)
+        torch.testing.assert_close(output, expected, rtol=1e-2, atol=1e-2)
+
+    def test_reduction_over_arange_dim_size_coincides_with_slice(self):
+        """Issue #2643 variant: an ``hl.arange()`` reduction whose size
+        coincides with a slice reduction of the same size in the same loop.
+
+        ``allocate_reduction_dimension`` unifies the two same-size reduction
+        dimensions, so the arange load's reduced axis surfaces as the rdim
+        symbol (not a concrete int) and an output-shape check would be fooled
+        into thinking it is rollable. The arange axis is still indexed by an
+        ``iota`` node that cannot be re-indexed inside a reduction loop, so the
+        reduction must stay persistent.
+        """
+
+        @helion.kernel(static_shapes=True)
+        def mixed(x: torch.Tensor) -> torch.Tensor:
+            m, n = x.shape
+            out = torch.empty([m], dtype=torch.float32, device=x.device)
+            for tile_m in hl.tile(m):
+                slice_sum = x[tile_m, :].to(torch.float32).sum(-1)
+                tile_n = hl.arange(n)
+                arange_sum = x[tile_m, tile_n].to(torch.float32).pow(2).sum(-1)
+                out[tile_m] = slice_sum + arange_sum
+            return out
+
+        x = torch.randn([64, 128], device=DEVICE, dtype=HALF_DTYPE)
+
+        # The unified rdim must not be offered as a looped reduction: rolling
+        # it cannot re-index the iota-indexed arange load (issue #2643).
+        bound = mixed.bind((x,))
+        self.assertEqual(bound.env.config_spec.reduction_loops.valid_block_ids(), [])
+
+        _code, output = code_and_output(mixed, (x,))
+        expected = x.to(torch.float32).sum(-1) + x.to(torch.float32).pow(2).sum(-1)
+        torch.testing.assert_close(output, expected, rtol=1e-2, atol=1e-2)
+
+    def test_arange_reduction_with_synthetic_lanes(self):
+        """A persistent ``hl.arange()`` reduction whose extent exceeds the live
+        thread count must accumulate across synthetic lanes.
+
+        On CuTe, when the reduction extent is wider than the threads available
+        for it, the body runs inside a synthetic lane loop. The per-thread
+        value must be carried across lanes so the final warp reduction sees
+        every element; otherwise only the last lane's slice is reduced and the
+        result is silently wrong (issue #2643). ``block_size=16`` splits the
+        CuTe thread budget so the 128-wide reduction needs that lane loop.
+        """
+
+        @helion.kernel(static_shapes=True)
+        def arange_reduce(x: torch.Tensor) -> torch.Tensor:
+            m, n = x.shape
+            out = torch.empty([m], dtype=torch.float32, device=x.device)
+            for tile_m in hl.tile(m):
+                tile_n = hl.arange(n)
+                out[tile_m] = x[tile_m, tile_n].to(torch.float32).pow(2).sum(-1)
+            return out
+
+        x = torch.randn([64, 128], device=DEVICE, dtype=HALF_DTYPE)
+        _code, output = code_and_output(arange_reduce, (x,), block_size=16)
+        expected = x.to(torch.float32).pow(2).sum(-1)
+        torch.testing.assert_close(output, expected, rtol=1e-2, atol=1e-2)
 
     def test_fp16_var_mean(self):
         @helion.kernel(static_shapes=True)

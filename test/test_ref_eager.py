@@ -176,6 +176,48 @@ class TestRefEagerMisc(TestCase):
                 result.to(torch.float32), x.to(torch.float32), atol=1e-2, rtol=1e-2
             )
 
+    def test_store_with_offset_index_on_non_leading_dim(self):
+        """Test that storing with tile.index + offset on a non-leading dimension works."""
+
+        @helion.kernel(ref_mode=helion.RefMode.EAGER)
+        def kernel(x: torch.Tensor, offset: int) -> torch.Tensor:
+            m, n = x.shape
+            out = torch.zeros([m, n + offset], dtype=x.dtype, device=x.device)
+            for tile_row, tile_col in hl.tile([m, n]):
+                out[tile_row, tile_col.index + offset] = x[tile_row, tile_col]
+            return out
+
+        with assert_ref_eager_mode():
+            x = torch.tensor([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]], device=DEVICE)
+            result = kernel(x, 2)
+            expected = torch.tensor(
+                [[0.0, 0.0, 1.0, 2.0, 3.0], [0.0, 0.0, 4.0, 5.0, 6.0]],
+                device=DEVICE,
+            )
+            torch.testing.assert_close(result, expected)
+
+    def test_store_with_scalar_and_int_tensor_indices(self):
+        """Multiple scalar (tile.begin) + int-tensor + tile indices must
+        broadcast the mask correctly.  Mirrors the mamba2_chunk_scan pattern
+        of [scalar, int_tensor, scalar, tile]."""
+
+        @helion.kernel(ref_mode=helion.RefMode.EAGER)
+        def kernel(x: torch.Tensor) -> torch.Tensor:
+            batch, seq, heads, feat = x.shape
+            out = torch.zeros_like(x)
+            for tile_b in hl.tile(batch, block_size=1):
+                for tile_h in hl.tile(heads, block_size=1):
+                    for tile_s, tile_f in hl.tile([seq, feat]):
+                        out[tile_b.begin, tile_s.index, tile_h.begin, tile_f] = x[
+                            tile_b.begin, tile_s.index, tile_h.begin, tile_f
+                        ]
+            return out
+
+        with assert_ref_eager_mode():
+            x = torch.randn(2, 8, 2, 4, device=DEVICE)
+            result = kernel(x)
+            torch.testing.assert_close(result, x)
+
     def test_load_2d_indexing_without_extra_mask(self):
         """Test that hl.load with two 1D tensor indices produces 2D output in ref eager mode."""
 

@@ -23,7 +23,6 @@ from helion._testing import skipIfRefEager
 from helion._testing import skipIfRocm
 from helion._testing import skipIfXPU
 from helion._testing import skipUnlessCuteAvailable
-from helion._testing import xfailIfCute
 from helion._testing import xfailIfPallas
 import helion.language as hl
 from helion.runtime.config import Config
@@ -928,9 +927,6 @@ class TestRNG(RefEagerTestBase, TestCase):
         self.assertFalse(torch.allclose(result, result3))
         _assert_uses_philox(self, code)
 
-    @xfailIfCute(
-        "CuTe still rejects nested RNG tiles that require a fourth thread axis"
-    )
     @xfailIfPallas("nested rand_like tiles hit TPU MLIR refinement mismatch")
     @skipIfRefEager("compiled codegen inspection is not applicable in ref eager mode")
     def test_rand_like_nested_tiles_issue_1208(self):

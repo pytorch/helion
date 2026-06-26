@@ -6,11 +6,6 @@ boolean knobs. Within a chosen strategy the autotuner explores
 structured records (``Tcgen05WarpSpec``, ``Tcgen05LayoutOverrides``).
 This file is the single source of truth for what those types look
 like and what their per-strategy invariants are.
-
-See ``cute_plan.md`` §3 (three-axis framing) and §4 (data model).
-G2-A introduces these types and wires them through ``ConfigSpec``
-without changing generated code; later G2 sub-steps consume the
-fields in codegen.
 """
 
 from __future__ import annotations
@@ -146,6 +141,18 @@ ROLE_LOCAL_MONOLITHIC_SCHEDULER_WARPS = 0
 # narrowed to 0 until the productive TMA producer body lands and perf
 # is characterized.
 ROLE_LOCAL_MONOLITHIC_C_INPUT_WARPS = 0
+# ``store_warps`` slot for the dedicated epilogue store/drain warp that
+# Workstream A Stage 4 (``cute_plan.md`` §4.2) will eventually use to take
+# the two epilog_sync barriers + warp-0 TMA-D store off the 4-warp epi
+# critical path. Default 0 keeps the historical inert-padding behavior under
+# ``ROLE_LOCAL_WITH_SCHEDULER``. Cycle 91 (Workstream A Stage 3) widens the
+# validator to accept the value 1 under ``ROLE_LOCAL_WITH_SCHEDULER`` so the
+# foundation lift is reachable; the codegen body remains inert (the warp
+# occupies what was previously the inert padding slot under the 7-role-warp /
+# 8-launched shape, so launched-warp accounting is unchanged — see
+# ``CuteTcgen05MatmulPlan.launched_warp_count``). The autotune surface stays
+# narrowed to 0 until the productive store body lands and perf is characterized.
+ROLE_LOCAL_MONOLITHIC_STORE_WARPS = 0
 # Today's role-local lowering uses a (decrease, increase) register split of
 # (120, 256). The decrease side runs on TMA-load + scheduler warps; the
 # increase side runs on MMA-exec + epilogue + epilogue-load warps.
@@ -195,6 +202,17 @@ class Tcgen05WarpSpec:
       ``_tcgen05_strategy_autotune_fragments`` until the productive
       body lands and perf is characterized; only the user-config
       validation surface accepts ``{0, 1}``.
+    - ``store_warps``: dedicated epilogue store/drain warp count.
+      Workstream A Stage 3 (cycle 91, ``cute_plan.md`` §4.2) widens the
+      ``ROLE_LOCAL_WITH_SCHEDULER`` accept set to ``{0, 1}`` (foundation
+      lift, mirror of ``c_input_warps``). Setting this to 1 under
+      WITH_SCHEDULER reuses the inert padding warp: with 4 epi + 1 exec
+      + 1 ab_load + 1 sched + 1 store, ``role_warp_count`` equals 8 and
+      ``launched_warp_count`` (warpgroup-aligned) stays at 8 — no extra
+      warp is launched. The codegen body of the store warp is inert in
+      cycle 91; the productive R2S->TMA-D drain is Stage 4. The autotune
+      surface stays narrowed to ``0``; only user-config validation
+      accepts ``{0, 1}``. ``ROLE_LOCAL_MONOLITHIC`` stays at ``{0}``.
     - ``register_split``: ``(decrease, increase)`` ``setmaxregister``
       counts. The current 6-warp shape uses ``(120, 256)``. Each
       entry's range is enforced by its per-field fragment in
@@ -216,6 +234,19 @@ class Tcgen05WarpSpec:
     # lowering use the field name, not position.
     _: dataclasses.KW_ONLY
     c_input_warps: int = 0
+    # ``store_warps``: dedicated epilogue store/drain warp count.
+    # Workstream A Stage 3 (cycle 91, ``cute_plan.md`` §4.2) widens the
+    # validator to admit ``{0, 1}`` under ``ROLE_LOCAL_WITH_SCHEDULER`` so
+    # an explicit ``helion.Config(tcgen05_warp_spec_store_warps=1)``
+    # round-trips end-to-end and the launched-warp accounting recognizes
+    # the slot. Like ``c_input_warps``, a 1 here under WITH_SCHEDULER reuses
+    # the inert padding warp (4 epi + 1 exec + 1 ab + 1 sched + 1 store = 8
+    # role warps = the warpgroup-aligned launch envelope, so no extra warp
+    # is launched). The codegen body of the store warp is inert in cycle 91;
+    # the productive R2S->TMA-D drain is Stage 4. The autotune surface stays
+    # narrowed to ``0``; only the user-config validation surface accepts
+    # ``{0, 1}``.
+    store_warps: int = 0
 
     @property
     def total_warps(self) -> int:
@@ -226,6 +257,7 @@ class Tcgen05WarpSpec:
             + self.epi_load_warps
             + self.scheduler_warps
             + self.c_input_warps
+            + self.store_warps
         )
 
 
@@ -240,6 +272,7 @@ ROLE_LOCAL_MONOLITHIC_DEFAULT_WARP_SPEC = Tcgen05WarpSpec(
     scheduler_warps=ROLE_LOCAL_MONOLITHIC_SCHEDULER_WARPS,
     register_split=ROLE_LOCAL_MONOLITHIC_REGISTER_SPLIT,
     c_input_warps=ROLE_LOCAL_MONOLITHIC_C_INPUT_WARPS,
+    store_warps=ROLE_LOCAL_MONOLITHIC_STORE_WARPS,
 )
 
 
@@ -356,6 +389,7 @@ def tcgen05_smem_layout_expr(
     num_stages: int,
     operand: str,
     swizzle_override: int | None,
+    b_k_major: bool = False,
 ) -> str:
     """Emit the CuTe expression that builds the staged SMEM layout for A or B.
 
@@ -406,6 +440,17 @@ def tcgen05_smem_layout_expr(
             "order=(1, 2, 3))"
         )
     assert operand == "b", f"unexpected operand {operand!r}"
+    if b_k_major:
+        # K-major (column-major / K-contiguous) B. Delegate to CuTe's helper
+        # with ``is_k_major=True`` so the SMEM atom selection mirrors the
+        # K-major A path exactly; the smem_swizzle_b override knob is not
+        # plumbed through this path (correctness-first), which is fine
+        # since the fp8 default path uses swizzle_override=None.
+        return (
+            "cutlass.utils.blackwell_helpers.make_smem_layout_b("
+            f"{tiled_mma}, ({bm}, {bn}, {bk}), {dtype_str}, {num_stages}, "
+            "is_k_major=True)"
+        )
     if swizzle_override is None:
         return (
             "cutlass.utils.blackwell_helpers.make_smem_layout_b("
@@ -469,6 +514,11 @@ TCGEN05_WARP_SPEC_SCHEDULER_WARPS_KEY = "tcgen05_warp_spec_scheduler_warps"
 # the autotune surface, validated to ``{0, 1}`` only under
 # ``ROLE_LOCAL_WITH_SCHEDULER`` in the user-config validation surface.
 TCGEN05_WARP_SPEC_C_INPUT_WARPS_KEY = "tcgen05_warp_spec_c_input_warps"
+# ``store_warps``: dedicated epilogue store/drain warp count. Workstream A
+# Stage 3 (cycle 91, ``cute_plan.md`` §4.2); today narrowed to 0 in the
+# autotune surface, validated to ``{0, 1}`` only under
+# ``ROLE_LOCAL_WITH_SCHEDULER`` in the user-config validation surface.
+TCGEN05_WARP_SPEC_STORE_WARPS_KEY = "tcgen05_warp_spec_store_warps"
 # Register-split is exposed as two scalar keys (decrease, increase)
 # rather than a tuple value because flat config values are scalars.
 TCGEN05_WARP_SPEC_REGISTER_DECREASE_KEY = "tcgen05_warp_spec_register_decrease"
@@ -507,6 +557,7 @@ TCGEN05_WARP_SPEC_KEYS: tuple[str, ...] = (
     TCGEN05_WARP_SPEC_EPI_LOAD_WARPS_KEY,
     TCGEN05_WARP_SPEC_SCHEDULER_WARPS_KEY,
     TCGEN05_WARP_SPEC_C_INPUT_WARPS_KEY,
+    TCGEN05_WARP_SPEC_STORE_WARPS_KEY,
     TCGEN05_WARP_SPEC_REGISTER_DECREASE_KEY,
     TCGEN05_WARP_SPEC_REGISTER_INCREASE_KEY,
 )
@@ -567,6 +618,7 @@ TCGEN05_WARP_SPEC_DEFAULTS_BY_KEY: dict[str, int] = {
     TCGEN05_WARP_SPEC_EPI_LOAD_WARPS_KEY: ROLE_LOCAL_MONOLITHIC_EPI_LOAD_WARPS,
     TCGEN05_WARP_SPEC_SCHEDULER_WARPS_KEY: ROLE_LOCAL_MONOLITHIC_SCHEDULER_WARPS,
     TCGEN05_WARP_SPEC_C_INPUT_WARPS_KEY: ROLE_LOCAL_MONOLITHIC_C_INPUT_WARPS,
+    TCGEN05_WARP_SPEC_STORE_WARPS_KEY: ROLE_LOCAL_MONOLITHIC_STORE_WARPS,
     TCGEN05_WARP_SPEC_REGISTER_DECREASE_KEY: ROLE_LOCAL_MONOLITHIC_REGISTER_SPLIT[0],
     TCGEN05_WARP_SPEC_REGISTER_INCREASE_KEY: ROLE_LOCAL_MONOLITHIC_REGISTER_SPLIT[1],
 }
@@ -609,6 +661,12 @@ def warp_spec_from_config(config: Mapping[str, object]) -> Tcgen05WarpSpec:
         # never carry the key) round-trip via ``ConfigSpec.normalize``
         # picking up ``ROLE_LOCAL_MONOLITHIC_C_INPUT_WARPS``.
         c_input_warps=_as_int(config[TCGEN05_WARP_SPEC_C_INPUT_WARPS_KEY]),
+        # ``store_warps`` added in cycle 91 (Workstream A Stage 3) as the
+        # foundation for the Stage-4 store-warp split. The validator below
+        # restricts its accept set per-strategy; the default is 0 so configs
+        # serialized before cycle 91 (which never carry the key) round-trip
+        # via ``ConfigSpec.normalize`` picking up the monolithic default.
+        store_warps=_as_int(config[TCGEN05_WARP_SPEC_STORE_WARPS_KEY]),
     )
 
 
@@ -656,6 +714,91 @@ def tcgen05_default_epilogue_tile_expr(
         "cutlass.utils.blackwell_helpers.compute_epilogue_tile_shape("
         f"({bm}, {bn}), False, {c_layout}, {elem_dtype}, "
         f"layout_c={c_layout}, elem_ty_c={elem_dtype})"
+    )
+
+
+def tcgen05_two_cta_m128_epilogue_tile_expr(
+    bm: int, bn: int, elem_dtype: str, *, c_layout: str
+) -> str:
+    """Epilogue tile for the bm=128 CtaGroup.TWO family (per-CTA tile 64xbn).
+
+    The bm=256 2-CTA path and the bm=128 1-CTA path both build the epilogue
+    tile from the full ``(bm, bn)`` shape, where the per-CTA and full-CTA
+    conventions produce identical tiles, so the legacy form is kept there for
+    golden-output stability; at bm=128 they diverge: the per-CTA tile m of 64
+    selects the 2-CTA ``(2, 2)`` epilogue warp grid, whose tile is **N-mode
+    permuted** (e.g. ``[64:1;(16,2):(1,64)]``). Every consumer of this tile --
+    the matmul-plan ``tcgen05_epi_tile``, the store-side
+    ``tcgen05_store_epi_tile``, the SMEM staging layouts, and the host-side
+    TMA store atom in ``helion/runtime/__init__.py`` -- must use this same
+    expression; building any of them from a plain ``(m, n)`` tile silently
+    permutes the output through SMEM (wrong values + torn bf16 pairs).
+
+    The no-source form (no ``elem_ty_c``) is deliberate: this family has no
+    residual-C epilogue input, and the with-source sizing would halve
+    ``tile_n`` (32 vs 64), doubling epilogue iterations for nothing
+    (~4% measured on the 512x6144x2048 fp8 scaled_mm shape).
+    """
+    assert bm == 128, bm
+    return (
+        "cutlass.utils.blackwell_helpers.compute_epilogue_tile_shape("
+        f"({bm // 2}, {bn}), True, {c_layout}, {elem_dtype})"
+    )
+
+
+def tcgen05_is_two_cta_m128(*, is_two_cta: bool, bm: int) -> bool:
+    """True for the bm=128 CtaGroup.TWO family (per-CTA tile, N-mode permuted).
+
+    ``is_two_cta`` is True for *both* 2-CTA families -- the legacy bm=256 path
+    (full-(bm, bn) tile, per-CTA and full-CTA conventions coincide) and this
+    bm=128 small-grid path (per-CTA tile m of ``bm // 2``, N-mode permuted) --
+    so the extra ``bm == 128`` check is what separates the two from each other,
+    not the 2-CTA case from the 1-CTA case. Only this family must thread the
+    permuted ``tcgen05_two_cta_m128_epilogue_tile_expr`` to every consumer; the
+    bm=256 path keeps the legacy full-tile form. The fp8 gate that makes this
+    branch reachable lives in ``_tcgen05_use_2cta_instrs`` (the f16/bf16
+    bm=128 + cluster_m=2 point is owned by the legacy CtaGroup.ONE family), so
+    this predicate stays dtype-agnostic and tracks only the structural family.
+    """
+    return is_two_cta and bm == 128
+
+
+def tcgen05_resolve_epilogue_tile(
+    *,
+    bm: int,
+    bn: int,
+    is_two_cta: bool,
+    elem_dtype: str,
+    c_layout: str,
+    explicit_expr: str | None = None,
+) -> tuple[int, str]:
+    """Resolve ``(epi_tile_m, epi_tile_expr)`` for a tcgen05 store.
+
+    Single source of truth for the bm=128 CtaGroup.TWO per-CTA tile (m of
+    ``bm // 2``, N-mode permuted -- see
+    ``tcgen05_two_cta_m128_epilogue_tile_expr``) vs the legacy full-``(bm, bn)``
+    tile. The layout-plan setup in ``cute_mma.py`` and the store side in
+    ``memory_ops.py`` must produce identical ``epi_tile_m`` / ``epi_tile_expr``
+    pairs or the device r2s SMEM copy and the host TMA store atom disagree and
+    the output is silently scrambled, so both call here.
+
+    ``explicit_expr`` is the pre-built CuTe expression for a user-supplied
+    explicit epilogue tile (the integer-keyed
+    ``tcgen05_explicit_epilogue_tile_expr`` on the layout-plan side, the
+    plan-recorded store-tile string on the store side); when present it wins
+    over the family-derived expression but ``epi_tile_m`` still follows the
+    per-CTA convention.
+    """
+    two_cta_m128 = tcgen05_is_two_cta_m128(is_two_cta=is_two_cta, bm=bm)
+    epi_tile_m = bm // 2 if two_cta_m128 else bm
+    if explicit_expr is not None:
+        return epi_tile_m, explicit_expr
+    if two_cta_m128:
+        return epi_tile_m, tcgen05_two_cta_m128_epilogue_tile_expr(
+            bm, bn, elem_dtype, c_layout=c_layout
+        )
+    return epi_tile_m, tcgen05_default_epilogue_tile_expr(
+        bm, bn, elem_dtype, c_layout=c_layout
     )
 
 
@@ -710,26 +853,6 @@ def derive_persistence_model_from_pid_type(
     if pid_type in ("persistent_blocked", "persistent_interleaved"):
         return Tcgen05PersistenceModel.STATIC_PERSISTENT
     return Tcgen05PersistenceModel.NON_PERSISTENT
-
-
-def _persistence_model_pid_type_compatible(
-    persistence_model: Tcgen05PersistenceModel, pid_type: object
-) -> bool:
-    """Return whether ``persistence_model`` is consistent with ``pid_type``.
-
-    ``CLC_PERSISTENT`` overlays a runtime CLC query on a
-    ``pid_type=persistent_*`` launch (the kernel still runs in
-    persistent-grid mode; CLC just replaces the static launch-grid
-    distribution with a hardware-driven canceller). So the agreement
-    is "CLC and STATIC both require ``pid_type=persistent_*``", not
-    "the persistence model derived from pid_type matches exactly".
-    """
-    derived = derive_persistence_model_from_pid_type(pid_type)
-    if persistence_model == derived:
-        return True
-    if persistence_model is Tcgen05PersistenceModel.CLC_PERSISTENT:
-        return derived is Tcgen05PersistenceModel.STATIC_PERSISTENT
-    return False
 
 
 # ---------------------------------------------------------------------------
@@ -808,6 +931,23 @@ _STRATEGY_REQUIRED_SCHEDULER_WARPS: dict[Tcgen05Strategy, int] = {
 # body lands and perf is characterized; only the user-config
 # validation surface accepts ``(0, 1)``.
 _STRATEGY_SUPPORTED_C_INPUT_WARPS: dict[Tcgen05Strategy, frozenset[int]] = {
+    Tcgen05Strategy.ROLE_LOCAL_MONOLITHIC: frozenset({0}),
+    Tcgen05Strategy.ROLE_LOCAL_WITH_SCHEDULER: frozenset({0, 1}),
+    Tcgen05Strategy.PURE_MATMUL_ROLE_LIFECYCLE: frozenset({0}),
+}
+
+# Strategy-conditional ``store_warps`` accept set. Workstream A Stage 3
+# (cycle 91, ``cute_plan.md`` §4.2): only ``ROLE_LOCAL_WITH_SCHEDULER`` can
+# host the dedicated epilogue store/drain warp (the inert padding warp under
+# the WITH_SCHEDULER 8-warp shape becomes the store warp). Non-scheduler
+# strategies keep this at zero because their 6-warp shapes are fully populated.
+# Exactly mirrors ``_STRATEGY_SUPPORTED_C_INPUT_WARPS``: the data-model slot is
+# plumbed through normalize / round-trip / launch accounting so the accept set
+# can widen without config-shape churn, while the codegen body stays inert in
+# cycle 91 (the productive R2S->TMA-D drain is Stage 4). Values outside the
+# per-strategy accept set are rejected so user configs cannot reach an
+# unsupported combination silently.
+_STRATEGY_SUPPORTED_STORE_WARPS: dict[Tcgen05Strategy, frozenset[int]] = {
     Tcgen05Strategy.ROLE_LOCAL_MONOLITHIC: frozenset({0}),
     Tcgen05Strategy.ROLE_LOCAL_WITH_SCHEDULER: frozenset({0, 1}),
     Tcgen05Strategy.PURE_MATMUL_ROLE_LIFECYCLE: frozenset({0}),
@@ -965,10 +1105,14 @@ def validate_tcgen05_strategy_invariants(
     # ``pid_type=persistent_*`` implies ``STATIC_PERSISTENT`` (or
     # ``CLC_PERSISTENT`` when the user explicitly opts in — CLC
     # overlays the same persistent-grid launch with a runtime CLC
-    # query). ``DYNAMIC_PERSISTENT`` has no codegen path so it never
-    # agrees with any current ``pid_type`` value.
-    if not _persistence_model_pid_type_compatible(persistence_model, pid_type):
-        derived = derive_persistence_model_from_pid_type(pid_type)
+    # query, so it is compatible with the STATIC-derived pid_type).
+    # ``DYNAMIC_PERSISTENT`` has no codegen path so it never agrees
+    # with any current ``pid_type`` value.
+    derived = derive_persistence_model_from_pid_type(pid_type)
+    if persistence_model != derived and not (
+        persistence_model is Tcgen05PersistenceModel.CLC_PERSISTENT
+        and derived is Tcgen05PersistenceModel.STATIC_PERSISTENT
+    ):
         errors.append(
             f"tcgen05_persistence_model={persistence_model.value!r} "
             f"contradicts pid_type={pid_type!r} (which implies "
@@ -1011,6 +1155,40 @@ def validate_tcgen05_strategy_invariants(
             f"tcgen05 strategy {strategy.value!r} only accepts "
             f"c_input_warps in {sorted(supported_c_input)!r}; got "
             f"c_input_warps={warp_spec.c_input_warps}"
+        )
+
+    # ``store_warps`` accept set is per-strategy; only the scheduler-backed
+    # path currently admits the optional epilogue store/drain warp. Mirrors
+    # the ``c_input_warps`` check above (cycle 91, Workstream A Stage 3).
+    supported_store = _STRATEGY_SUPPORTED_STORE_WARPS.get(strategy, frozenset())
+    if supported_store and warp_spec.store_warps not in supported_store:
+        errors.append(
+            f"tcgen05 strategy {strategy.value!r} only accepts "
+            f"store_warps in {sorted(supported_store)!r}; got "
+            f"store_warps={warp_spec.store_warps}"
+        )
+
+    # Cross-field guard: ``c_input_warps`` and ``store_warps`` each
+    # independently admit 1 under ``ROLE_LOCAL_WITH_SCHEDULER`` (both reuse
+    # the single inert padding slot under the 7-role-warp / 8-launched
+    # shape), but they cannot BOTH be 1 at once: ``role_warp_count`` would
+    # sum to 9 (4 epi + 1 exec + 1 ab_load + 1 sched + 1 c_input + 1 store),
+    # rounding ``launched_warp_count`` up to 12 (= 384 threads), which
+    # overflows the validated 1024-thread / 8-warp CTA launch envelope and
+    # surfaces only as a late, confusing ``BackendUnsupported`` at codegen.
+    # The intended Stage-3 path is store=1 with c_input=0; Stage 4 has the
+    # store warp SUBSUME the aux/epi-load role rather than run alongside a
+    # separate c_input warp, so this guard is forward-compatible.
+    if (
+        strategy is Tcgen05Strategy.ROLE_LOCAL_WITH_SCHEDULER
+        and warp_spec.c_input_warps + warp_spec.store_warps > 1
+    ):
+        errors.append(
+            f"tcgen05 strategy {strategy.value!r} cannot run a C-input warp "
+            f"and a store warp at the same time (they share the single "
+            f"warpgroup-padding slot): got "
+            f"c_input_warps={warp_spec.c_input_warps} + "
+            f"store_warps={warp_spec.store_warps} > 1. Set at most one to 1."
         )
 
     # ``epi_warps`` is intentionally NOT checked here — its accept-

@@ -12,6 +12,49 @@ if TYPE_CHECKING:
 
 HardwareTarget = tuple[str, str | None]
 
+# Reduction op name tokens used to detect a reduction in a traced graph. Shared
+# by the Triton split/join heuristic and the LLM workload-trait detection.
+REDUCTION_TARGET_NAMES = frozenset({"amax", "sum", "softmax", "logsumexp"})
+
+
+def op_name_parts(target: object) -> frozenset[str]:
+    """Coarse name fragments for a traced FX call target.
+
+    Collects the target's ``__name__``/``name``/``str()`` and their dot-split
+    pieces, so callers can match a node against a set of op names.
+    """
+    parts: set[str] = set()
+    for raw in (
+        getattr(target, "__name__", None),
+        getattr(target, "name", None),
+        str(target),
+    ):
+        if not isinstance(raw, str):
+            continue
+        parts.add(raw)
+        parts.update(piece for piece in raw.split(".") if piece)
+    return frozenset(parts)
+
+
+def is_canonical_row_reduction(env: CompileEnvironment) -> bool:
+    """Whether the kernel is a canonical single-tile row reduction.
+
+    A single non-reduction tile + a single reduction loop, with no matmul facts,
+    and an M-axis that admits one row per program. Shared by the CuTe and Triton
+    reduction heuristics so the structural gate cannot drift between backends.
+    """
+    spec = env.config_spec
+    # Single non-reduction tile + single reduction dim.
+    if len(spec.block_sizes) != 1 or len(spec.reduction_loops) != 1:
+        return False
+    # No matmul facts (this seeds reduction kernels, not GEMMs, and not a fused
+    # matmul+reduction, which keeps its own tiling).
+    if spec.matmul_facts:
+        return False
+    bs_spec = spec.block_sizes[0]
+    # M-axis must accept block_size=1 (one row per program).
+    return max(bs_spec.min_size, bs_spec.autotuner_min) <= 1
+
 
 def dedupe_configs(configs: Iterable[Config]) -> list[Config]:
     result: list[Config] = []

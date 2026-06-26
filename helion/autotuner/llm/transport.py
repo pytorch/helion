@@ -34,6 +34,12 @@ _ANTHROPIC_ADAPTIVE_MIN_VERSIONS: dict[str, tuple[int, int]] = {
     "opus": (4, 5),
     "sonnet": (4, 6),
 }
+# Per-family minimum (major, minor) at/after which the `temperature` knob is
+# deprecated and rejected (HTTP 400 on the API, ValidationException on Bedrock).
+# Opus 4.7+ rejects it. Below-minimum / unlisted families still accept it.
+_ANTHROPIC_TEMPERATURE_DEPRECATED_MIN_VERSIONS: dict[str, tuple[int, int]] = {
+    "opus": (4, 7),
+}
 # Minor capped at 2 digits + non-digit lookahead so 8-digit date suffixes (e.g.
 # `claude-opus-4-20250514`) don't get mis-parsed as the minor version.
 _ANTHROPIC_MODEL_VERSION_RE = re.compile(
@@ -48,6 +54,13 @@ _PROVIDER_ALIASES = {
     "openai": "openai_responses",
     "openai_responses": "openai_responses",
     "openai-responses": "openai_responses",
+    "bedrock": "bedrock",
+    "aws_bedrock": "bedrock",
+    "aws-bedrock": "bedrock",
+    "vertex": "vertex",
+    "vertex_anthropic": "vertex",
+    "vertex-anthropic": "vertex",
+    "google_vertex": "vertex",
 }
 
 
@@ -58,7 +71,7 @@ def normalize_provider(provider: str) -> str:
         return resolved
     raise ValueError(
         f"Unsupported LLM provider {provider!r}. "
-        "Valid providers are: anthropic, openai, openai_responses."
+        "Valid providers are: anthropic, openai, openai_responses, bedrock, vertex."
     )
 
 
@@ -67,6 +80,13 @@ def infer_provider(model: str, provider: str | None = None) -> str:
     if provider is not None:
         return normalize_provider(provider)
     normalized = model.lower()
+    # Bedrock and Vertex serve the same Anthropic model ids as the direct API, so
+    # they must be opted into explicitly with a `bedrock/` / `vertex/` prefix
+    # (e.g. `vertex/claude-sonnet-4-5`) or via HELION_LLM_PROVIDER.
+    if normalized.startswith("bedrock/"):
+        return "bedrock"
+    if normalized.startswith("vertex/"):
+        return "vertex"
     if normalized.startswith(("claude", "anthropic/")):
         return "anthropic"
     if normalized.startswith(
@@ -78,7 +98,7 @@ def infer_provider(model: str, provider: str | None = None) -> str:
 
 def strip_provider_prefix(model: str) -> str:
     """Remove a provider prefix before sending the model name to the API."""
-    for prefix in ("anthropic/", "openai/"):
+    for prefix in ("anthropic/", "openai/", "bedrock/", "vertex/"):
         if model.startswith(prefix):
             return model.removeprefix(prefix)
     return model
@@ -158,15 +178,38 @@ def _anthropic_thinking_budget_tokens(effort_level: str | None) -> int | None:
     return _ANTHROPIC_THINKING_BUDGET_BY_EFFORT[normalized]
 
 
-def _supports_anthropic_adaptive(model: str) -> bool:
-    match = _ANTHROPIC_MODEL_VERSION_RE.match(model.lower())
+def _anthropic_version_at_least(
+    model: str, minimums: dict[str, tuple[int, int]]
+) -> bool:
+    """Return True if `model`'s (family, version) meets the per-family minimum.
+
+    Tolerates Bedrock-style IDs (e.g. `us.anthropic.claude-opus-4-8`) by matching
+    the `claude-...` segment anywhere in the string, not just at the start.
+    """
+    normalized = model.lower()
+    # Bedrock prefixes the model with a region/partition + `anthropic.`; drop
+    # everything up to and including that so the `claude-...` regex can match.
+    if "anthropic." in normalized:
+        normalized = normalized.rsplit("anthropic.", 1)[1]
+    match = _ANTHROPIC_MODEL_VERSION_RE.match(normalized)
     if match is None:
         return False
     family, major_str, minor_str = match.groups()
-    minimum = _ANTHROPIC_ADAPTIVE_MIN_VERSIONS.get(family)
+    minimum = minimums.get(family)
     if minimum is None:
         return False
     return (int(major_str), int(minor_str) if minor_str else 0) >= minimum
+
+
+def _supports_anthropic_adaptive(model: str) -> bool:
+    return _anthropic_version_at_least(model, _ANTHROPIC_ADAPTIVE_MIN_VERSIONS)
+
+
+def _temperature_deprecated(model: str) -> bool:
+    """Whether the model rejects the `temperature` knob (Opus 4.7+)."""
+    return _anthropic_version_at_least(
+        model, _ANTHROPIC_TEMPERATURE_DEPRECATED_MIN_VERSIONS
+    )
 
 
 def _anthropic_max_tokens(
@@ -272,11 +315,11 @@ def _anthropic_payload(
             "type": "enabled",
             "budget_tokens": thinking_token_budget,
         }
-    # Claude Opus 4.7, extended thinking, and fast mode each reject `temperature`.
+    # Claude Opus 4.7+, extended thinking, and fast mode each reject `temperature`.
     if (
         not enable_thinking
         and not fast_mode
-        and not normalized_model.lower().startswith("claude-opus-4-7")
+        and not _temperature_deprecated(normalized_model)
     ):
         payload["temperature"] = DEFAULT_ANTHROPIC_TEMPERATURE
     if system_prompt:
@@ -485,6 +528,29 @@ def _load_json_response(
         return json.load(response)
 
 
+def _extra_headers() -> dict[str, str]:
+    """Optional extra HTTP headers for gateways/proxies that require them.
+
+    Read from ``HELION_LLM_EXTRA_HEADERS`` as either a JSON object
+    (``{"X-Header": "value"}``) or newline-separated ``Header: value`` lines.
+    Useful when an API-compatible gateway needs custom routing/identity headers
+    on top of the standard auth headers.
+    """
+    raw = os.environ.get("HELION_LLM_EXTRA_HEADERS")
+    if not raw:
+        return {}
+    raw = raw.strip()
+    if raw.startswith("{"):
+        parsed = json.loads(raw)
+        return {str(k): str(v) for k, v in parsed.items()}
+    headers: dict[str, str] = {}
+    for line in raw.splitlines():
+        if ":" in line:
+            name, value = line.split(":", 1)
+            headers[name.strip()] = value.strip()
+    return headers
+
+
 def _post_json(
     url: str,
     payload: dict[str, Any],
@@ -496,7 +562,7 @@ def _post_json(
     request = urllib_request.Request(
         url=url,
         data=json.dumps(payload).encode("utf-8"),
-        headers=headers,
+        headers={**headers, **_extra_headers()},
         method="POST",
     )
     try:
@@ -516,6 +582,168 @@ def _post_json(
     raise RuntimeError(f"Unexpected JSON payload from {url}: {type(body).__name__}")
 
 
+# Anthropic-on-Bedrock requires this version string in the request body and
+# forbids the `model` field (the model is named by `modelId` on the API call).
+_BEDROCK_ANTHROPIC_VERSION = "bedrock-2023-05-31"
+
+
+def _resolve_bedrock_region(api_base: str | None) -> str | None:
+    """Pick the AWS region for Bedrock from the api_base override or env."""
+    # Allow `api_base` to carry the region (e.g. "us-east-1") for parity with
+    # the other providers' single knob; otherwise fall back to the standard
+    # AWS env vars, then let boto3's own config/role resolution take over.
+    return (
+        api_base or os.environ.get("AWS_REGION") or os.environ.get("AWS_DEFAULT_REGION")
+    )
+
+
+def _call_bedrock(
+    *,
+    model: str,
+    api_base: str | None,
+    messages: list[dict[str, str]],
+    max_output_tokens: int,
+    request_timeout_s: float,
+    effort_level: str | None,
+    fast_mode: bool,
+) -> str:
+    """Invoke Anthropic-on-Bedrock via boto3, reusing the Anthropic codecs.
+
+    Auth is handled by boto3's default credential chain (IAM role, env creds,
+    or profile) -- no API key is read. The request body is the same Anthropic
+    Messages payload used by the direct API, minus `model` and plus the Bedrock
+    `anthropic_version`.
+
+    Request/response format and the boto3 ``invoke_model`` usage follow the AWS
+    reference example:
+    https://docs.aws.amazon.com/bedrock/latest/userguide/bedrock-runtime_example_bedrock-runtime_InvokeModel_AnthropicClaude_section.html
+    """
+    try:
+        # boto3 is an optional dependency: only required when the Bedrock
+        # provider is actually used, so it isn't a Helion install requirement.
+        import boto3  # pyrefly: ignore [missing-import]
+        import botocore.config  # pyrefly: ignore [missing-import]
+    except ImportError as e:
+        raise RuntimeError(
+            "Bedrock provider requested but boto3 is not installed. "
+            "Install it with `pip install boto3`."
+        ) from e
+
+    payload = _anthropic_payload(
+        model,
+        messages,
+        max_output_tokens,
+        effort_level,
+        fast_mode,
+    )
+    # On Bedrock the model is named by `modelId`, not in the body.
+    model_id = payload.pop("model")
+    payload["anthropic_version"] = _BEDROCK_ANTHROPIC_VERSION
+
+    client = boto3.client(
+        "bedrock-runtime",
+        region_name=_resolve_bedrock_region(api_base),
+        config=botocore.config.Config(
+            read_timeout=request_timeout_s,
+            connect_timeout=request_timeout_s,
+            retries={"max_attempts": 2, "mode": "standard"},
+        ),
+    )
+    try:
+        response = client.invoke_model(modelId=model_id, body=json.dumps(payload))
+    except Exception as e:  # botocore.exceptions.ClientError and friends
+        raise RuntimeError(f"Bedrock invoke_model failed for {model_id!r}: {e}") from e
+
+    body = json.loads(response["body"].read())
+    if not isinstance(body, dict):
+        raise RuntimeError(
+            f"Unexpected Bedrock payload from {model_id!r}: {type(body).__name__}"
+        )
+    return extract_anthropic_text(body)
+
+
+# Anthropic-on-Vertex-AI names the model in the URL (not the body) and requires
+# this version string in the request body, mirroring the Bedrock convention.
+_VERTEX_ANTHROPIC_VERSION = "vertex-2023-10-16"
+_DEFAULT_VERTEX_LOCATION = "global"
+
+
+def _call_vertex(
+    *,
+    model: str,
+    api_base: str | None,
+    api_key: str | None,
+    messages: list[dict[str, str]],
+    max_output_tokens: int,
+    request_timeout_s: float,
+    effort_level: str | None,
+    fast_mode: bool,
+) -> str:
+    """Invoke Anthropic-on-Vertex-AI over HTTPS, reusing the Anthropic codecs.
+
+    Vertex AI hosts Anthropic models under the publisher ``rawPredict`` endpoint.
+    The request body is the same Anthropic Messages payload used by the direct
+    API, but the model is named in the URL (not the body) and a Vertex
+    ``anthropic_version`` replaces it. Auth is carried by the SSL context (mTLS)
+    and/or an ``Authorization: Bearer`` token, so an API key is optional --
+    useful behind a gateway that authenticates the caller by client identity.
+
+    Configure with ``HELION_LLM_PROVIDER=vertex``, ``HELION_LLM_API_BASE`` (the
+    endpoint base), ``HELION_LLM_VERTEX_PROJECT`` (project id), and optionally
+    ``HELION_LLM_VERTEX_LOCATION`` (default ``global``). Each falls back to the
+    standard Anthropic-on-Vertex SDK variable when its helion-specific knob is
+    unset: ``ANTHROPIC_VERTEX_BASE_URL``, ``ANTHROPIC_VERTEX_PROJECT_ID``, and
+    ``CLOUD_ML_REGION`` respectively -- so an environment already set up for
+    Anthropic-on-Vertex needs only ``HELION_LLM_PROVIDER=vertex`` and a model.
+
+    Request/response format follows the Anthropic-on-Vertex reference:
+    https://docs.anthropic.com/en/api/claude-on-vertex-ai
+    """
+    # Resolve endpoint/project/location from helion's own knobs first, then fall
+    # back to the standard Anthropic-on-Vertex SDK variables so an environment
+    # already configured for Anthropic-on-Vertex works without extra setup.
+    base = (
+        api_base
+        or os.environ.get("HELION_LLM_API_BASE")
+        or os.environ.get("ANTHROPIC_VERTEX_BASE_URL")
+    )
+    if not base:
+        raise RuntimeError(
+            "Vertex provider requires the endpoint base URL via api_base, "
+            "HELION_LLM_API_BASE, or ANTHROPIC_VERTEX_BASE_URL."
+        )
+    project = os.environ.get("HELION_LLM_VERTEX_PROJECT") or os.environ.get(
+        "ANTHROPIC_VERTEX_PROJECT_ID"
+    )
+    if not project:
+        raise RuntimeError(
+            "Vertex provider requires the project id via "
+            "HELION_LLM_VERTEX_PROJECT or ANTHROPIC_VERTEX_PROJECT_ID."
+        )
+    location = (
+        os.environ.get("HELION_LLM_VERTEX_LOCATION")
+        or os.environ.get("CLOUD_ML_REGION")
+        or _DEFAULT_VERTEX_LOCATION
+    )
+    named_model = strip_provider_prefix(model)
+    url = (
+        f"{base.rstrip('/')}/projects/{project}/locations/{location}"
+        f"/publishers/anthropic/models/{named_model}:rawPredict"
+    )
+    payload = _anthropic_payload(
+        model, messages, max_output_tokens, effort_level, fast_mode
+    )
+    # The model is in the URL on Vertex; the body carries the version instead.
+    payload.pop("model", None)
+    payload["anthropic_version"] = _VERTEX_ANTHROPIC_VERSION
+    headers = {"content-type": "application/json"}
+    key = api_key or os.environ.get("HELION_LLM_API_KEY")
+    if key:
+        headers["Authorization"] = f"Bearer {key}"
+    response = _post_json(url, payload, headers, request_timeout_s=request_timeout_s)
+    return extract_anthropic_text(response)
+
+
 def call_provider(
     provider: str,
     *,
@@ -530,6 +758,31 @@ def call_provider(
 ) -> str:
     """Resolve credentials, send one request, and extract text from the response."""
     normalized_provider = normalize_provider(provider)
+    if normalized_provider == "vertex":
+        # Vertex names the model in the URL and authenticates by SSL/bearer, so
+        # it bypasses the api-key-required _ProviderConfig path (like Bedrock).
+        return _call_vertex(
+            model=model,
+            api_base=api_base,
+            api_key=api_key,
+            messages=messages,
+            max_output_tokens=max_output_tokens,
+            request_timeout_s=request_timeout_s,
+            effort_level=effort_level,
+            fast_mode=fast_mode,
+        )
+    if normalized_provider == "bedrock":
+        # Bedrock uses boto3/SigV4 instead of an HTTP+api-key transport, so it
+        # bypasses the _ProviderConfig path entirely.
+        return _call_bedrock(
+            model=model,
+            api_base=api_base,
+            messages=messages,
+            max_output_tokens=max_output_tokens,
+            request_timeout_s=request_timeout_s,
+            effort_level=effort_level,
+            fast_mode=fast_mode,
+        )
     config = _provider_config(normalized_provider)
     resolved_api_key = _resolve_api_key(normalized_provider, api_key)
     response = _post_json(

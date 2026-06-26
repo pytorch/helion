@@ -22,7 +22,6 @@ from .layout import MatmulOperandAxes
 from .layout import ThreadLayout
 
 if TYPE_CHECKING:
-    from ..device_ir import GraphInfo
     from ..tile_dispatch import TileStrategyDispatch
 
     SymIntLike = torch.SymInt | int
@@ -30,11 +29,14 @@ if TYPE_CHECKING:
 _SYMBOLIC_STRIDE_SORT_KEY = 2**62
 
 
-def _clamp_threads(size: int, num_threads: int) -> int:
+def _clamp_threads(size: SymIntLike, num_threads: SymIntLike) -> SymIntLike:
     """Clamp *num_threads* to the largest value <= size that divides *size*.
 
     num_threads is always a power of 2, so halving finds the answer quickly.
+    Symbolic sizes or thread counts pass through unchanged.
     """
+    if not isinstance(size, int) or not isinstance(num_threads, int):
+        return num_threads
     num_threads = min(num_threads, size)
     while num_threads > 1 and size % num_threads != 0:
         num_threads //= 2
@@ -48,7 +50,6 @@ def _clamp_threads(size: int, num_threads: int) -> int:
 
 def preferred_constraint_for_node(
     node: torch.fx.Node,
-    graph_info: GraphInfo,
     tile_strategy: TileStrategyDispatch,
 ) -> LayoutConstraint | None:
     """Return a LayoutConstraint for *node*, or None if unconstrained.
@@ -169,8 +170,7 @@ def _constraint_for_reduce(
         return None
 
     # Clamp threads to largest divisor of reduce_size
-    if isinstance(reduce_size, int) and isinstance(num_threads, int):
-        num_threads = _clamp_threads(reduce_size, num_threads)
+    num_threads = _clamp_threads(reduce_size, num_threads)
 
     # Build a simple layout: threads along dim, values along other dims
     # For a 2D (M, K) reduce(dim=1):
@@ -206,14 +206,13 @@ def _constraint_for_matmul(
     val = node.meta.get("val")
     if not isinstance(val, torch.Tensor) or val.ndim < 2:
         return None
+    num_threads = _clamp_threads(
+        val.shape[-1], _total_threads_from_strategy(tile_strategy)
+    )
     layout = ThreadLayout.make_row_major(
         val.shape[-2],
         val.shape[-1],
-        num_threads=_clamp_threads(
-            val.shape[-1], _total_threads_from_strategy(tile_strategy)
-        )
-        if isinstance(val.shape[-1], int)
-        else _total_threads_from_strategy(tile_strategy),
+        num_threads=num_threads,
         tag=LayoutTag.MMA_ACCUMULATOR,
     )
     return LayoutConstraint(
@@ -303,13 +302,9 @@ def _matmul_operand_layout(
     if len(node.users) != 1:
         return None
     (user,) = tuple(node.users)
-    if user.op != "call_function":
-        return None
-    if user.target not in {
+    if user.op != "call_function" or user.target not in {
         torch.ops.aten.mm.default,
         torch.ops.aten.addmm.default,
-        torch.ops.aten.bmm.default,
-        torch.ops.aten.baddbmm.default,
     }:
         return None
     tensor = node.meta.get("val")
@@ -317,47 +312,25 @@ def _matmul_operand_layout(
         return None
     if len(user.args) < 2:
         return None
-    lhs_arg = (
-        user.args[1]
-        if user.target
-        in {
-            torch.ops.aten.addmm.default,
-            torch.ops.aten.baddbmm.default,
-        }
-        else user.args[0]
-    )
-    rhs_arg = (
-        user.args[2]
-        if user.target
-        in {
-            torch.ops.aten.addmm.default,
-            torch.ops.aten.baddbmm.default,
-        }
-        else user.args[1]
-    )
+    if user.target is torch.ops.aten.addmm.default:
+        lhs_arg, rhs_arg = user.args[1], user.args[2]
+    else:
+        lhs_arg, rhs_arg = user.args[0], user.args[1]
     num_threads = _total_threads_from_strategy(tile_strategy)
-    if user.target in {
-        torch.ops.aten.mm.default,
-        torch.ops.aten.addmm.default,
-    }:
-        if node is lhs_arg:
-            return ThreadLayout.make_row_major(
-                tensor.shape[0],
-                tensor.shape[1],
-                num_threads=_clamp_threads(tensor.shape[1], num_threads)
-                if isinstance(tensor.shape[1], int)
-                else num_threads,
-                tag=LayoutTag.MMA_OPERAND_A,
-            )
-        if node is rhs_arg:
-            return ThreadLayout.make_row_major(
-                tensor.shape[1],
-                tensor.shape[0],
-                num_threads=_clamp_threads(tensor.shape[0], num_threads)
-                if isinstance(tensor.shape[0], int)
-                else num_threads,
-                tag=LayoutTag.MMA_OPERAND_B,
-            )
+    if node is lhs_arg:
+        return ThreadLayout.make_row_major(
+            tensor.shape[0],
+            tensor.shape[1],
+            num_threads=_clamp_threads(tensor.shape[1], num_threads),
+            tag=LayoutTag.MMA_OPERAND_A,
+        )
+    if node is rhs_arg:
+        return ThreadLayout.make_row_major(
+            tensor.shape[1],
+            tensor.shape[0],
+            num_threads=_clamp_threads(tensor.shape[0], num_threads),
+            tag=LayoutTag.MMA_OPERAND_B,
+        )
     return None
 
 
@@ -444,8 +417,7 @@ def _layout_from_tensor_strides(
         _, size, _ = dim_info[0]
         if isinstance(size, int) and size == 0:
             return None
-        if isinstance(size, int) and isinstance(num_threads, int):
-            num_threads = _clamp_threads(size, num_threads)
+        num_threads = _clamp_threads(size, num_threads)
         return ThreadLayout.make_1d(size, num_threads=num_threads, tag=tag)
 
     if len(dim_info) >= 2:
@@ -455,8 +427,7 @@ def _layout_from_tensor_strides(
 
         if isinstance(contiguous_size, int) and contiguous_size == 0:
             return None
-        if isinstance(contiguous_size, int) and isinstance(num_threads, int):
-            num_threads = _clamp_threads(contiguous_size, num_threads)
+        num_threads = _clamp_threads(contiguous_size, num_threads)
 
         if contiguous_tensor_dim > other_tensor_dim:
             # Contiguous dim is a later tensor dimension → row-major

@@ -8,6 +8,8 @@ from typing import Callable
 import unittest
 
 import torch
+from torch.testing._internal.common_utils import instantiate_parametrized_tests
+from torch.testing._internal.common_utils import parametrize
 
 from helion.runtime.settings import _get_backend
 
@@ -27,6 +29,7 @@ from helion._testing import onlyBackends
 from helion._testing import skipIfFn
 from helion._testing import skipIfNotTriton
 from helion._testing import skipIfRefEager
+from helion._testing import skipIfRocm
 from helion._testing import skipIfXPU
 import helion.language as hl
 
@@ -102,15 +105,6 @@ def make_test_function(input_dtype, acc_dtype, static_shapes_option):
     combo = (input_dtype, input_dtype, acc_dtype)
 
     def test_impl(self):
-        # CuTe backend limitations
-        if _get_backend() == "cute":
-            # Truly unsupported dtypes — CuTe DSL has no int8/fp8 support
-            if input_dtype == torch.int8 or input_dtype in (
-                torch.float8_e4m3fn,
-                torch.float8_e5m2,
-            ):
-                self.skipTest(f"cute: no {input_dtype} support in CuTe DSL")
-
         # Skip FP8 tests if GPU doesn't support it
         def _is_cuda_fp8_supported():
             if not is_cuda():
@@ -1106,6 +1100,50 @@ class TestDot(RefEagerTestBase, TestCase):
             lambda acc, a, b: acc + torch.matmul(a, b), rtol=1e-2, atol=5e-2
         )
 
+    def test_scalar_arg_specialization_not_reused_across_values(self):
+        """A runtime scalar epilogue arg must not poison later calls.
+
+        ``s`` is a non-constexpr scalar threaded straight to the Triton
+        launcher. Triton constant-folds a scalar arg equal to ``1`` into
+        the compiled binary, but Helion reuses a single ``BoundKernel``
+        across every value of ``s`` (only dtype/shape/stride/device feed
+        the bind cache key). Whichever ``s`` value first primes a given
+        Triton spec bakes its specialized binary in; a launcher whose
+        spec key omits scalar specialization reuses that binary for
+        every later call sharing the same tensor-pointer alignment -- so
+        a kernel primed with ``s == 1`` silently returns ``x @ y + 1``
+        for ``s == 5``.
+        """
+
+        @helion.kernel(
+            config=helion.Config(block_sizes=[32, 32, 32]),
+            dot_precision=get_test_dot_precision(),
+        )
+        def scaled_dot(x: torch.Tensor, y: torch.Tensor, s: int) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=x.dtype)
+                for tile_k in hl.tile(k):
+                    acc = hl.dot(x[tile_m, tile_k], y[tile_k, tile_n], acc=acc)
+                out[tile_m, tile_n] = acc + s
+            return out
+
+        x = torch.randn(64, 64, device=DEVICE, dtype=torch.float32)
+        y = torch.randn(64, 64, device=DEVICE, dtype=torch.float32)
+        baseline = x @ y
+
+        # Prime the launcher with the ``== 1`` specialization. Same
+        # tensor alignment + knob state on both calls, so the only thing
+        # that may differ is the scalar specialization.
+        torch.testing.assert_close(
+            scaled_dot(x, y, 1), baseline + 1, rtol=1e-2, atol=1e-1
+        )
+        torch.testing.assert_close(
+            scaled_dot(x, y, 5), baseline + 5, rtol=1e-2, atol=1e-1
+        )
+
 
 # Define ref mode test failures
 REF_EAGER_TEST_FAILURES = {
@@ -1198,6 +1236,110 @@ for input_dtype, acc_dtype, static_shapes_option in itertools.product(
         )(_test_func)
 
     setattr(TestDot, test_name, _test_func)
+
+
+@onlyBackends(["triton", "pallas"])
+class TestDotPrecision(TestCase):
+    @parametrize(
+        "backend, env_var, env_val, expected",
+        [
+            ("triton", "TRITON_F32_DEFAULT", "default", "default"),
+            ("triton", "TRITON_F32_DEFAULT", "high", "high"),
+            ("triton", "TRITON_F32_DEFAULT", "highest", "highest"),
+            ("triton", "TRITON_F32_DEFAULT", "tf32", "tf32"),
+            ("triton", "TRITON_F32_DEFAULT", "tf32x3", "tf32x3"),
+            ("triton", "TRITON_F32_DEFAULT", "ieee", "ieee"),
+            ("pallas", "JAX_DEFAULT_MATMUL_PRECISION", "default", "default"),
+            ("pallas", "JAX_DEFAULT_MATMUL_PRECISION", "high", "high"),
+            ("pallas", "JAX_DEFAULT_MATMUL_PRECISION", "highest", "highest"),
+            ("pallas", "JAX_DEFAULT_MATMUL_PRECISION", "bfloat16", "default"),
+            ("pallas", "JAX_DEFAULT_MATMUL_PRECISION", "tensorfloat32", "high"),
+            ("pallas", "JAX_DEFAULT_MATMUL_PRECISION", "float32", "highest"),
+        ],
+    )
+    def test_env_var_overrides(
+        self, backend: str, env_var: str, env_val: str, expected: str
+    ) -> None:
+        from unittest.mock import patch
+
+        with patch.dict(os.environ, {env_var: env_val, "HELION_BACKEND": backend}):
+            settings = helion.Settings()
+            self.assertEqual(settings.dot_precision, expected)
+
+    def test_env_var_overrides_invalid(self) -> None:
+        from unittest.mock import patch
+
+        with (
+            patch.dict(
+                os.environ,
+                {"TRITON_F32_DEFAULT": "invalid", "HELION_BACKEND": "triton"},
+            ),
+            self.assertRaises(ValueError),
+        ):
+            helion.Settings()
+
+        with (
+            patch.dict(
+                os.environ,
+                {"JAX_DEFAULT_MATMUL_PRECISION": "invalid", "HELION_BACKEND": "pallas"},
+            ),
+            self.assertRaises(ValueError),
+        ):
+            helion.Settings()
+
+    _PR_TF32 = "input_precision='tf32'"
+    _PR_TF32x3 = "input_precision='tf32x3'"
+    _PR_IEEE = "input_precision='ieee'"
+    _PR_DEFAULT = "precision='default'"
+    _PR_HIGHEST = "precision='highest'"
+
+    @skipIfRocm("No support for tf32x3 and no tf32 in some ROCm hardware")
+    @skipIfRefEager("Codegen inspection not applicable in ref eager mode")
+    @parametrize(
+        "helion_precision, expected_triton, expected_pallas",
+        [
+            ("default", _PR_TF32, _PR_DEFAULT),
+            ("high", _PR_TF32x3, _PR_HIGHEST),
+            ("highest", _PR_IEEE, _PR_HIGHEST),
+            ("tf32", _PR_TF32, _PR_HIGHEST),
+            ("tf32x3", _PR_TF32x3, _PR_HIGHEST),
+            ("ieee", _PR_IEEE, _PR_HIGHEST),
+        ],
+    )
+    def test_dot_precision_codegen(
+        self, helion_precision: str, expected_triton: str, expected_pallas: str
+    ) -> None:
+        backend = _get_backend()
+
+        x = torch.randn(32, 32, device=DEVICE, dtype=torch.float32)
+        y = torch.randn(32, 32, device=DEVICE, dtype=torch.float32)
+
+        def make_kernel(precision: str):
+            @helion.kernel(
+                config=helion.Config(block_sizes=[32, 32, 32]),
+                dot_precision=precision,
+            )
+            def matmul_kernel(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+                m, k = x.size()
+                _, n = y.size()
+                out = torch.empty([m, n], dtype=torch.float32, device=x.device)
+                for tile_m, tile_n in hl.tile([m, n]):
+                    acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                    for tile_k in hl.tile(k):
+                        acc = hl.dot(x[tile_m, tile_k], y[tile_k, tile_n], acc=acc)
+                    out[tile_m, tile_n] = acc
+                return out
+
+            return matmul_kernel
+
+        code, _ = code_and_output(make_kernel(helion_precision), (x, y))
+        if backend == "triton":
+            self.assertIn(expected_triton, code)
+        elif backend == "pallas":
+            self.assertIn(expected_pallas, code)
+
+
+instantiate_parametrized_tests(TestDotPrecision)
 
 
 if __name__ == "__main__":

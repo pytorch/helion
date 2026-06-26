@@ -151,31 +151,10 @@ def _get_dim_local_coord(
     preserves lane-loop coordinates as well as CUDA thread coordinates.
     """
     block_id = _resolve_dim_block_id(cg, fake_tensor, dim)
-
     if block_id is None:
         return "cutlass.Int32(0)"
-
-    loops = cg.active_device_loops.get(block_id)
-    if loops:
-        loop_state = loops[-1]
-        if _strategy_aliases_index_and_offset(loop_state.strategy, block_id):
-            thread_axis = _get_dim_thread_axis(cg, fake_tensor, dim)
-            if thread_axis is not None:
-                return _grid_local_coord_expr(cg, block_id, thread_axis)
-        try:
-            offset_var = cg.offset_var(block_id)
-        except NotImplementedError:
-            thread_axis = _get_dim_thread_axis(cg, fake_tensor, dim)
-            if thread_axis is not None:
-                return _grid_local_coord_expr(cg, block_id, thread_axis)
-            return f"({cg.index_var(block_id)})"
-        return f"(({cg.index_var(block_id)}) - ({offset_var}))"
-
-    thread_axis = _get_dim_thread_axis(cg, fake_tensor, dim)
-    if thread_axis is not None:
-        return _grid_local_coord_expr(cg, block_id, thread_axis)
-
-    return "cutlass.Int32(0)"
+    coord = _get_block_local_coord(cg, block_id)
+    return coord if coord is not None else "cutlass.Int32(0)"
 
 
 def _get_node_dim_local_coord(
@@ -266,32 +245,6 @@ def _grid_local_coord_expr(
     if elements_per_thread == 1:
         return f"{coord} + cutlass.Int32({lane_var})"
     return f"{coord} * cutlass.Int32({elements_per_thread}) + cutlass.Int32({lane_var})"
-
-
-def _get_dim_thread_axis(
-    cg: GenerateAST,
-    fake_tensor: torch.Tensor,
-    dim: int,
-) -> int | None:
-    """Return the thread axis for a tile dimension, if one exists."""
-    block_id = _resolve_dim_block_id(cg, fake_tensor, dim)
-
-    if block_id is None:
-        return None
-
-    loops = cg.active_device_loops.get(block_id)
-    if loops:
-        state = loops[-1]
-        thread_axis = state.block_thread_axes.get(block_id)
-        if thread_axis is not None:
-            return thread_axis
-
-    if cg.current_grid_state is not None:
-        thread_axis = cg.current_grid_state.block_thread_axes.get(block_id)
-        if thread_axis is not None:
-            return thread_axis
-
-    return None
 
 
 def _dim_has_active_local_coord(
@@ -392,10 +345,6 @@ def _shape_op_needs_materialization(node: Node) -> bool:
 
     visited: set[Node] = set()
     return any(_consumer_needs_materialization(user, visited) for user in node.users)
-
-
-def _permute_needs_materialization(node: Node) -> bool:
-    return _shape_op_needs_materialization(node)
 
 
 def _flat_index_from_coords(
@@ -541,6 +490,67 @@ def _stack_choice_expr(
     return selected
 
 
+def _permute_node_perm(node: Node, value: torch.Tensor) -> list[int] | None:
+    """Return the explicit permutation for a permute/transpose/t node."""
+    if node.target is torch.ops.aten.permute.default:
+        dims = node.args[1] if len(node.args) > 1 else node.kwargs.get("dims")
+        if not isinstance(dims, (list, tuple)):
+            return None
+        perm = [dim for dim in dims if isinstance(dim, int)]
+        return perm if len(perm) == len(dims) else None
+    if node.target is torch.ops.aten.transpose.int:
+        dim0 = node.args[1] if len(node.args) > 1 else node.kwargs.get("dim0")
+        dim1 = node.args[2] if len(node.args) > 2 else node.kwargs.get("dim1")
+        if not isinstance(dim0, int) or not isinstance(dim1, int):
+            return None
+        ndim = len(value.shape)
+        dim0 %= ndim
+        dim1 %= ndim
+        perm = list(range(ndim))
+        perm[dim0], perm[dim1] = perm[dim1], perm[dim0]
+        return perm
+    if node.target is torch.ops.aten.t.default:
+        if len(value.shape) != 2:
+            return None
+        return [1, 0]
+    return None
+
+
+def _materialized_permute_value(
+    ctx: LoweringContext,
+    node: Node,
+    value: torch.Tensor,
+) -> ast.AST | None:
+    """Return the already-materialized AST for a permute/transpose/t node.
+
+    ``codegen_cute_permute`` materializes a permute to a concrete scalar (via a
+    shared-memory shuffle) whenever it reorders active thread dims *and* a
+    downstream consumer needs values. When a later shape op folds back through
+    such a node we must reuse that materialized value instead of re-folding the
+    coordinate swap all the way to the raw source (which would silently drop the
+    already-emitted shuffle).
+    """
+    if not node.args:
+        return None
+    source = node.args[0]
+    if not isinstance(source, Node):
+        return None
+    source_val = source.meta.get("val")
+    if not isinstance(source_val, torch.Tensor):
+        return None
+    perm = _permute_node_perm(node, value)
+    if perm is None:
+        return None
+    cg = cast("GenerateAST", ctx.cg)
+    if not (
+        _permute_reorders_active_dims(cg, source_val, perm)
+        and _shape_op_needs_materialization(node)
+    ):
+        return None
+    resolved = ctx.env.get(node)
+    return resolved if isinstance(resolved, ast.AST) else None
+
+
 def _resolve_shape_chain_expr(
     ctx: LoweringContext,
     node: Node,
@@ -554,6 +564,16 @@ def _resolve_shape_chain_expr(
         resolved = ctx.env.get(node)
         return resolved if isinstance(resolved, ast.AST) else None
 
+    # A permute/transpose/t node that was already materialized to a concrete
+    # per-thread scalar must not be folded again: doing so would silently drop
+    # the shuffle that already applied its coordinate swap and recurse to the raw
+    # source, collapsing two transposes into one. The materialized value already
+    # holds the correct element for the current thread (just like a load), so we
+    # return it directly as a chain leaf.
+    materialized = _materialized_permute_value(ctx, node, value)
+    if materialized is not None:
+        return materialized
+
     if node.target in (
         torch.ops.aten.reshape.default,
         torch.ops.aten._unsafe_view.default,
@@ -564,6 +584,18 @@ def _resolve_shape_chain_expr(
             return None
         return _resolve_shape_chain_expr(ctx, source, flat_index)
 
+    def _recurse(source: Node, source_coords: list[str]) -> ast.AST | None:
+        source_val = source.meta.get("val")
+        if not isinstance(source_val, torch.Tensor):
+            return None
+        source_flat = _flat_index_from_coords(
+            source_coords, _get_tile_shape(source_val, env, config)
+        )
+        return _resolve_shape_chain_expr(ctx, source, source_flat)
+
+    def _coords() -> list[str]:
+        return _coords_from_flat_index(flat_index, _get_tile_shape(value, env, config))
+
     if node.target is torch.ops.aten.permute.default:
         source = node.args[0]
         dims = node.args[1] if len(node.args) > 1 else node.kwargs.get("dims")
@@ -572,17 +604,7 @@ def _resolve_shape_chain_expr(
         perm = [dim for dim in dims if isinstance(dim, int)]
         if len(perm) != len(dims):
             return None
-        coords = _coords_from_flat_index(
-            flat_index, _get_tile_shape(value, env, config)
-        )
-        source_coords = _inverse_permute_coords(coords, perm)
-        source_val = source.meta.get("val")
-        if not isinstance(source_val, torch.Tensor):
-            return None
-        source_flat = _flat_index_from_coords(
-            source_coords, _get_tile_shape(source_val, env, config)
-        )
-        return _resolve_shape_chain_expr(ctx, source, source_flat)
+        return _recurse(source, _inverse_permute_coords(_coords(), perm))
 
     if node.target is torch.ops.aten.expand.default:
         source = node.args[0]
@@ -619,52 +641,23 @@ def _resolve_shape_chain_expr(
         dim1 %= ndim
         perm = list(range(ndim))
         perm[dim0], perm[dim1] = perm[dim1], perm[dim0]
-        coords = _coords_from_flat_index(
-            flat_index, _get_tile_shape(value, env, config)
-        )
-        source_coords = _inverse_permute_coords(coords, perm)
-        source_val = source.meta.get("val")
-        if not isinstance(source_val, torch.Tensor):
-            return None
-        source_flat = _flat_index_from_coords(
-            source_coords, _get_tile_shape(source_val, env, config)
-        )
-        return _resolve_shape_chain_expr(ctx, source, source_flat)
+        return _recurse(source, _inverse_permute_coords(_coords(), perm))
 
     if node.target is torch.ops.aten.t.default:
         source = node.args[0]
         if not isinstance(source, Node) or len(value.shape) != 2:
             return None
-        coords = _coords_from_flat_index(
-            flat_index, _get_tile_shape(value, env, config)
-        )
-        source_coords = [coords[1], coords[0]]
-        source_val = source.meta.get("val")
-        if not isinstance(source_val, torch.Tensor):
-            return None
-        source_flat = _flat_index_from_coords(
-            source_coords, _get_tile_shape(source_val, env, config)
-        )
-        return _resolve_shape_chain_expr(ctx, source, source_flat)
+        coords = _coords()
+        return _recurse(source, [coords[1], coords[0]])
 
     if node.target is torch.ops.aten.unsqueeze.default:
         source = node.args[0]
         dim = node.args[1] if len(node.args) > 1 else node.kwargs.get("dim", 0)
         if not isinstance(source, Node) or not isinstance(dim, int):
             return None
-        ndim = len(value.shape)
-        dim %= ndim
-        coords = _coords_from_flat_index(
-            flat_index, _get_tile_shape(value, env, config)
-        )
-        source_coords = coords[:dim] + coords[dim + 1 :]
-        source_val = source.meta.get("val")
-        if not isinstance(source_val, torch.Tensor):
-            return None
-        source_flat = _flat_index_from_coords(
-            source_coords, _get_tile_shape(source_val, env, config)
-        )
-        return _resolve_shape_chain_expr(ctx, source, source_flat)
+        dim %= len(value.shape)
+        coords = _coords()
+        return _recurse(source, coords[:dim] + coords[dim + 1 :])
 
     if node.target is torch.ops.aten.squeeze.dim:
         source = node.args[0]
@@ -675,17 +668,12 @@ def _resolve_shape_chain_expr(
         if not isinstance(source_val, torch.Tensor):
             return None
         dim %= source_val.ndim
-        coords = _coords_from_flat_index(
-            flat_index, _get_tile_shape(value, env, config)
-        )
+        coords = _coords()
         if int(source_val.shape[dim]) != 1:
             source_coords = coords
         else:
             source_coords = [*coords[:dim], "cutlass.Int32(0)", *coords[dim:]]
-        source_flat = _flat_index_from_coords(
-            source_coords, _get_tile_shape(source_val, env, config)
-        )
-        return _resolve_shape_chain_expr(ctx, source, source_flat)
+        return _recurse(source, source_coords)
 
     if node.target is torch.ops.aten.stack.default:
         tensors = node.args[0]
@@ -695,9 +683,7 @@ def _resolve_shape_chain_expr(
         if not all(isinstance(tensor, Node) for tensor in tensors):
             return None
         dim %= len(value.shape)
-        coords = _coords_from_flat_index(
-            flat_index, _get_tile_shape(value, env, config)
-        )
+        coords = _coords()
         selector = coords[dim]
         input_exprs: list[ast.AST] = []
         for tensor in tensors:
@@ -747,6 +733,26 @@ def resolve_cute_shape_chain_value(
     )
 
 
+def resolve_cute_shape_chain_value_at(
+    state: CodegenState,
+    node: Node,
+    flat_index: str,
+) -> ast.AST | None:
+    """Resolve a shape-chain value (reshape/stack/...) at an explicit flat index.
+
+    The store path holds a ``CodegenState`` rather than the ``GraphInterpreter``
+    ``LoweringContext`` that the regular value-lowering path uses, but the shape
+    chain resolver only needs the ``GenerateAST`` codegen object and the
+    fx-node -> argument map, both of which ``CodegenState`` already carries.
+    """
+    from ..aten_lowering import LoweringContext
+
+    ctx = LoweringContext.__new__(LoweringContext)
+    ctx.cg = state.codegen
+    ctx.env = state.env
+    return _resolve_shape_chain_expr(ctx, node, flat_index)
+
+
 def codegen_cute_reshape(ctx: LoweringContext, node: Node) -> object:
     """Codegen for view/reshape on CuTe tiles."""
     from ..generate_ast import GenerateAST
@@ -769,7 +775,6 @@ def codegen_cute_reshape(ctx: LoweringContext, node: Node) -> object:
     output_shape = _get_tile_shape(output_val, env, config)
 
     if input_shape == output_shape and isinstance(tensor, ast.AST):
-        assert isinstance(tensor, ast.AST)
         return tensor
 
     source_node = shape_chain.node if shape_chain is not None else node.args[0]
@@ -791,14 +796,12 @@ def codegen_cute_reshape(ctx: LoweringContext, node: Node) -> object:
         and not _shape_op_needs_materialization(node)
         and isinstance(tensor, ast.AST)
     ):
-        assert isinstance(tensor, ast.AST)
         return tensor
 
     # Adding/removing unit dimensions is a no-op
     input_non_unit = [s for s in input_shape if s != 1]
     output_non_unit = [s for s in output_shape if s != 1]
     if input_non_unit == output_non_unit and isinstance(tensor, ast.AST):
-        assert isinstance(tensor, ast.AST)
         return tensor
 
     input_numel = 1
@@ -872,10 +875,9 @@ def codegen_cute_permute(ctx: LoweringContext, node: Node) -> object:
     assert len(perm) == ndim
     needs_materialization = _permute_reorders_active_dims(
         ctx.cg, input_val, perm
-    ) and _permute_needs_materialization(node)
+    ) and _shape_op_needs_materialization(node)
 
     if perm == list(range(ndim)) and isinstance(tensor, ast.AST):
-        assert isinstance(tensor, ast.AST)
         return tensor
 
     source_node = shape_chain.node if shape_chain is not None else node.args[0]
@@ -934,7 +936,7 @@ def codegen_cute_store_permute(
     if not isinstance(state.codegen, GenerateAST):
         return None
 
-    if _permute_needs_materialization(permute_node):
+    if _shape_op_needs_materialization(permute_node):
         return None
 
     info = _store_permute_info(permute_node)

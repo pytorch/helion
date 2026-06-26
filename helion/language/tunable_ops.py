@@ -11,9 +11,9 @@ from .._compiler.ast_extension import ExtendedAST
 from .._compiler.ast_extension import expr_from_string
 from .._compiler.compile_environment import AutoSize
 from .._compiler.compile_environment import CompileEnvironment
-from .._compiler.type_propagation import TileIndexType
-from .._compiler.type_propagation import TypeInfo
-from .._compiler.type_propagation import _to_proxy
+from .._compiler.type_info import TileIndexType
+from .._compiler.type_info import TypeInfo
+from .._compiler.type_info import _to_proxy
 from ..autotuner.config_fragment import BaseIntegerFragment
 from ..autotuner.config_fragment import ConfigSpecFragment
 from ..autotuner.config_fragment import assert_integer_power_of_two
@@ -65,7 +65,7 @@ def _(min_or_max: int, max_or_none: int | None = None, /) -> int:
 def _(
     min_or_max: TypeInfo, max_or_none: TypeInfo | None = None, /, *, origin: Origin
 ) -> TypeInfo:
-    from .._compiler.type_propagation import BlockSizeType
+    from .._compiler.type_info import BlockSizeType
 
     min_type, max_type = _normalize_begin_end(min_or_max, max_or_none, origin=origin)
     min_proxy = _to_proxy(min_type)
@@ -95,8 +95,8 @@ def _(
 
 def _block_id_from_state(state: CodegenState) -> int:
     """Extract the block_id from the current state for nodes hl.register_block_size."""
-    from .._compiler.type_propagation import BlockSizeType
-    from .._compiler.type_propagation import SymIntType
+    from .._compiler.type_info import BlockSizeType
+    from .._compiler.type_info import SymIntType
 
     env = CompileEnvironment.current()
     if state.fx_node is not None:
@@ -151,7 +151,7 @@ def _register_tunable_type(
 ) -> TypeInfo:
     # During type propagation, register the tunable parameter and return unbacked symint
     from .._compiler.compile_environment import CompileEnvironment
-    from .._compiler.type_propagation import NumericType
+    from .._compiler.type_info import NumericType
 
     env = CompileEnvironment.current()
 

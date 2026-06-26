@@ -1,9 +1,16 @@
 from __future__ import annotations
 
+import ast
 import math
+import os
+import re
+from typing import TYPE_CHECKING
+from typing import Any
 from typing import Callable
 import unittest
 
+from examples.geglu import _geglu_pallas as _geglu_pallas_example
+from examples.swiglu import _swiglu_fwd_pallas as _swiglu_fwd_pallas_example
 import torch
 from torch.testing._internal.common_utils import instantiate_parametrized_tests
 from torch.testing._internal.common_utils import parametrize
@@ -19,6 +26,19 @@ from helion._testing import xfailIfPallas
 from helion._testing import xfailIfPallasInterpret
 from helion._testing import xfailIfPallasTpu
 import helion.language as hl
+
+if TYPE_CHECKING:
+    from helion.autotuner.base_search import PopulationBasedSearch
+    from helion.autotuner.base_search import PopulationMember
+
+# N-D-tiled Pallas geglu/swiglu (#2725), re-wrapped on the pallas backend so the
+# example kernels get real correctness coverage under pallas interpret / TPU CI.
+_geglu_pallas = helion.kernel(
+    _geglu_pallas_example.fn, backend="pallas", static_shapes=True
+)
+_swiglu_fwd_pallas = helion.kernel(
+    _swiglu_fwd_pallas_example.fn, backend="pallas", static_shapes=True
+)
 
 
 @helion.kernel(backend="pallas", static_shapes=True)
@@ -96,6 +116,26 @@ def pallas_matmul_broadcast_bias(
         for tile_k in hl.tile(k):
             acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
         out[tile_m, tile_n] = acc + bias[tile_m, tile_n]
+    return out
+
+
+@helion.kernel(backend="pallas", static_shapes=True)
+def pallas_matmul_bf16(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    """bf16 matmul kernel mirroring the perf harness's helion variant.
+
+    Used by ``test_pallas_matmul_bf16_no_tiling_seed_covers_large_cubes`` to
+    exercise the no-tiling ``lax.dot_general`` lowering on bf16 square matmuls.
+    """
+    m, k = x.size()
+    _, n = y.size()
+    out = torch.empty(
+        [m, n], device=x.device, dtype=torch.promote_types(x.dtype, y.dtype)
+    )
+    for tile_m, tile_n in hl.tile([m, n]):
+        acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+        for tile_k in hl.tile(k):
+            acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+        out[tile_m, tile_n] = acc
     return out
 
 
@@ -297,6 +337,22 @@ def pallas_inner_loop_add_with_scalar_access(
 
 
 @helion.kernel(backend="pallas", static_shapes=True)
+def pallas_jagged_segment_add(x: torch.Tensor, offsets: torch.Tensor) -> torch.Tensor:
+    """Outer grid over jagged segments + an inner ``hl.tile(start, end)`` loop
+    whose begin (``offsets[g]``) is an arbitrary runtime offset. A
+    block-aligned BlockSpec index can only address starts that are multiples of
+    the block size, so the emit_pipeline path must slice the segment with a
+    dynamic ``pl.ds`` (``pl.BoundedSlice`` block)."""
+    out = torch.empty_like(x)
+    for g in hl.grid(offsets.size(0) - 1):
+        start = offsets[g]
+        end = offsets[g + 1]
+        for tile in hl.tile(start, end):
+            out[tile, :] = x[tile, :] + 1.0
+    return out
+
+
+@helion.kernel(backend="pallas", static_shapes=True)
 def pallas_add_3d(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     """Kernel with an outer grid loop and a 2D inner device loop."""
     b, m, n = x.size()
@@ -306,6 +362,54 @@ def pallas_add_3d(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
             out[tile_b, tile_m, tile_n] = (
                 x[tile_b, tile_m, tile_n] + y[tile_b, tile_m, tile_n]
             )
+    return out
+
+
+@helion.kernel(backend="pallas", static_shapes=True)
+def pallas_leading_token_sum(x: torch.Tensor) -> torch.Tensor:
+    H = hl.specialize(x.size(1))
+    D = hl.specialize(x.size(2))
+    out = torch.empty([1, H, D], dtype=torch.float32, device=x.device)
+    for owner in hl.grid(1):
+        acc = hl.zeros([H, D], dtype=torch.float32)
+        for tile in hl.tile(x.size(0)):
+            acc = acc + x[tile, :, :].to(torch.float32).sum(dim=0)
+        out[owner, :, :] = acc
+    return out
+
+
+@helion.kernel(backend="pallas", static_shapes=True)
+def pallas_owner_prefixed_row_slab_sum(
+    x: torch.Tensor, offsets: torch.Tensor
+) -> torch.Tensor:
+    G = offsets.size(0) - 1
+    H = hl.specialize(x.size(2))
+    D = hl.specialize(x.size(3))
+    out = torch.empty([G, H, D], dtype=torch.float32, device=x.device)
+    for g in hl.grid(G):
+        start = offsets[g]
+        end = offsets[g + 1]
+        acc = hl.zeros([H, D], dtype=torch.float32)
+        for tile in hl.tile(start, end):
+            acc = acc + x[g, tile, :, :].to(torch.float32).sum(dim=0)
+        out[g, :, :] = acc
+    return out
+
+
+@helion.kernel(backend="pallas", static_shapes=True)
+def pallas_literal_prefixed_row_slab_sum(
+    x: torch.Tensor, offsets: torch.Tensor
+) -> torch.Tensor:
+    H = hl.specialize(x.size(2))
+    D = hl.specialize(x.size(3))
+    out = torch.empty([1, H, D], dtype=torch.float32, device=x.device)
+    for owner in hl.grid(1):
+        start = offsets[0]
+        end = offsets[1]
+        acc = hl.zeros([H, D], dtype=torch.float32)
+        for tile in hl.tile(start, end):
+            acc = acc + x[1, tile, :, :].to(torch.float32).sum(dim=0)
+        out[owner, :, :] = acc
     return out
 
 
@@ -508,6 +612,30 @@ def kernel_tile_begin_plus_offset_is_elementwise(
 @onlyBackends(["triton", "pallas"])
 @skipUnlessPallas("JAX/Pallas TPU not available")
 class TestPallas(TestCase):
+    def test_slice_addressing_classification(self) -> None:
+        """_slice_addressing: major dim -> DIRECT; f32 single-lane-tile sublane
+        -> DIRECT; bf16 / wide-lane / unknown-lane sublane -> ALIGNED."""
+        from helion._compiler.backend import SliceAddressing as SA
+        from helion._compiler.backend import _slice_addressing as classify
+
+        f32_2d = torch.empty(16, 128, dtype=torch.float32)
+        bf16_2d = torch.empty(16, 128, dtype=torch.bfloat16)
+        f32_3d = torch.empty(4, 16, 128, dtype=torch.float32)
+
+        # major (leading) dim -> DIRECT regardless of the lane block
+        self.assertIs(classify(f32_3d, 0, 128), SA.DIRECT)
+        self.assertIs(classify(f32_3d, 0, None), SA.DIRECT)
+
+        # sublane dim, f32, lane block <= 128 -> DIRECT (single lane tile)
+        self.assertIs(classify(f32_2d, 0, 128), SA.DIRECT)
+        self.assertIs(classify(f32_3d, 1, 128), SA.DIRECT)
+        # sublane dim, f32, lane block > 128 -> ALIGNED (spans >1 lane tile)
+        self.assertIs(classify(f32_2d, 0, 256), SA.ALIGNED)
+        # sublane dim, f32, unknown lane block -> ALIGNED (conservative)
+        self.assertIs(classify(f32_2d, 0, None), SA.ALIGNED)
+        # sublane dim, bf16 -> ALIGNED regardless of the lane block
+        self.assertIs(classify(bf16_2d, 0, 128), SA.ALIGNED)
+
     def test_estimate_pallas_vmem_bytes(self) -> None:
         """VMEM OOM: Tests that block sizes and dtypes (fp32, bf16) are correctly estimated."""
 
@@ -654,6 +782,22 @@ class TestPallas(TestCase):
         code, result = code_and_output(add_kernel, args, block_size=512)
         torch.testing.assert_close(result, args[0] + args[1])
 
+    def test_geglu_pallas_nd(self) -> None:
+        # N-D-tiled GEGLU (#2725): correctness on the pallas backend.
+        a = torch.randn(64, 128, device=DEVICE, dtype=torch.float32)
+        b = torch.randn(64, 128, device=DEVICE, dtype=torch.float32)
+        code, result = code_and_output(_geglu_pallas, (a, b), block_sizes=[16, 32])
+        expected = torch.nn.functional.gelu(a, approximate="tanh") * b
+        torch.testing.assert_close(result, expected, rtol=1e-3, atol=1e-3)
+
+    def test_swiglu_pallas_nd(self) -> None:
+        # N-D-tiled SwiGLU (#2725): correctness on the pallas backend.
+        a = torch.randn(64, 128, device=DEVICE, dtype=torch.float32)
+        b = torch.randn(64, 128, device=DEVICE, dtype=torch.float32)
+        code, result = code_and_output(_swiglu_fwd_pallas, (a, b), block_sizes=[16, 32])
+        expected = torch.nn.functional.silu(a) * b
+        torch.testing.assert_close(result, expected, rtol=1e-3, atol=1e-3)
+
     def test_store_slice_1d(self) -> None:
         """Store value sliced when block_size > tensor dim (1D)."""
 
@@ -716,6 +860,125 @@ class TestPallas(TestCase):
         self.assertNotIn("[:64, :32]", code)
         torch.testing.assert_close(result, torch.ones_like(x))
 
+    @skipIfPallasInterpret(
+        "data-dependent writeback clamp emits a dynamic-size DMA slice "
+        "(pl.ds with a traced size) that JAX interpret mode cannot discharge"
+    )
+    def test_fori_loop_ragged_sub_block_store(self) -> None:
+        """fori_loop store from a data-dependent ``hl.tile(start, end)`` whose
+        per-sequence extent is smaller than the block, with several sequences
+        packed into one output (the ragged/paged-attention decode shape).
+
+        Regression test for two coupled issues in the fori_loop store path:
+
+        * ``sliced_value_for_store`` clamped the value to ``out.shape[0]`` (the
+          whole token dim) on the block-sized VMEM scratch store, so when total
+          tokens < block the in-body store raised
+          ``Invalid shape for `swap``` (block-sized ref vs sliced value).
+        * the writeback DMA copied a full block from each sequence's
+          data-dependent begin, overrunning into adjacent sequences' rows; the
+          fix clamps the writeback to the per-tile extent.
+
+        The store dim is the *leading* (outer) dim of a 3D tensor, matching the
+        ``[tokens, heads, head_dim]`` layout where clamping is alignment-legal.
+        """
+
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def ragged_add1(x: torch.Tensor, cu_seqlens: torch.Tensor) -> torch.Tensor:
+            n_seq = cu_seqlens.size(0) - 1
+            out = torch.empty_like(x)
+            for s in hl.grid(n_seq):
+                start = cu_seqlens[s]
+                end = cu_seqlens[s + 1]
+                for tile in hl.tile(start, end):
+                    out[tile, :, :] = x[tile, :, :] + 1.0
+            return out
+
+        # Sequence lengths 1, 7, 4, 13 -> total 25 < block 32, so every tile is
+        # a sub-block partial that exercises the scratch-store + writeback clamp.
+        cu = torch.tensor([0, 1, 8, 12, 25], dtype=torch.int32, device=DEVICE)
+        total = int(cu[-1].item())
+        x = torch.randn(total, 8, 128, device=DEVICE, dtype=torch.float32)
+        code, result = code_and_output(
+            ragged_add1,
+            (x, cu),
+            block_sizes=[32],
+            pallas_loop_type="fori_loop",
+        )
+        self.assertIn("jax.lax.fori_loop", code)
+        self.assertIn("pltpu.make_async_copy", code)
+        torch.testing.assert_close(result, x + 1.0)
+
+    def test_fori_loop_last_two_dim_ragged_store_rejected(self) -> None:
+        """A ragged (data-dependent) store whose tiled dim is one of the last two
+        (lane/sublane) dims is rejected with a clear error.
+
+        Mosaic tile alignment forbids a dynamic-size clamp on the last two dims,
+        so such a store would fall back to a full-block writeback from the
+        data-dependent begin and silently overrun adjacent rows. Rather than
+        emit that, codegen raises; the user should move the ragged dimension
+        to a leading position, e.g. ``[tokens, heads, head_dim]``.
+        """
+
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def ragged_last_two_dim(
+            x: torch.Tensor, starts: torch.Tensor, ends: torch.Tensor
+        ) -> torch.Tensor:
+            out = torch.empty_like(x)
+            n = starts.size(0)
+            for g in hl.grid(n):
+                st = starts[g]
+                en = ends[g]
+                for tile in hl.tile(st, en):
+                    out[tile, :] = x[tile, :] + 1.0
+            return out
+
+        # 2D tensor -> dim 0 is len(shape)-2 (a last-two dim), and the tile bounds
+        # are loaded at runtime (data-dependent), so the store is rejected.
+        x = torch.randn(8, 128, device=DEVICE, dtype=torch.float32)
+        starts = torch.tensor([0, 4], dtype=torch.int32, device=DEVICE)
+        ends = torch.tensor([4, 8], dtype=torch.int32, device=DEVICE)
+        with self.assertRaisesRegex(Exception, "lane/sublane"):
+            code_and_output(
+                ragged_last_two_dim,
+                (x, starts, ends),
+                block_sizes=[8],
+                pallas_loop_type="fori_loop",
+            )
+
+    @unittest.expectedFailure  # nested-scratch resolution bug; see _find_dma_scratch_loop TODO
+    def test_fori_loop_nested_same_tensor_scratch_miscompiles(self) -> None:
+        """Nested fori_loops that scratch-route the same tensor miscompile.
+
+        ``out`` is DMA-routed by both the outer ``tile_m`` loop (full row) and
+        the inner ``tile_n`` loop (column slice).  The inner RMW's load/store
+        bind to the *first* matching scratch (the outer loop's) via
+        ``_find_dma_scratch_loop``, while its DMA uses the inner loop's scratch,
+        so each inner iteration adds to the whole-row buffer -- producing a wrong
+        result (x + 5 instead of x + 3) with no error.  xpasses once scratch
+        resolution picks the innermost (current) loop instead of first-match.
+        """
+
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def nested_same_output(x: torch.Tensor) -> torch.Tensor:
+            m, n = x.size()
+            out = torch.empty_like(x)
+            for _ in hl.grid(1):
+                for tile_m in hl.tile(m):
+                    out[tile_m, :] = x[tile_m, :] + 1.0
+                    for tile_n in hl.tile(n):
+                        out[tile_m, tile_n] = out[tile_m, tile_n] + 2.0
+            return out
+
+        x = torch.randn(128, 256, device=DEVICE, dtype=torch.float32)
+        _, out = code_and_output(
+            nested_same_output,
+            (x,),
+            block_sizes=[128, 128],
+            pallas_loop_type="fori_loop",
+        )
+        torch.testing.assert_close(out, x + 3.0)
+
     def test_add_does_not_donate_inputs(self) -> None:
         """Verify that read-only inputs are not donated by the kernel.
 
@@ -736,6 +999,49 @@ class TestPallas(TestCase):
         # The original inputs must still be accessible (not donated).
         torch.testing.assert_close(x, x_copy)
         torch.testing.assert_close(y, y_copy)
+
+    def test_wrapper_gather_before_loop_is_read_only_input(self) -> None:
+        """A tensor created by eager wrapper code and only read by Pallas is not output."""
+
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def gather_then_tile(x: torch.Tensor, idx: torch.Tensor) -> torch.Tensor:
+            gathered = x[idx]
+            out = torch.empty_like(gathered)
+            for tile in hl.tile(out.size()):
+                out[tile] = gathered[tile] + 1.0
+            return out
+
+        x = torch.randn(128, device=DEVICE, dtype=torch.float32)
+        idx = torch.arange(127, -1, -1, device=DEVICE, dtype=torch.int32)
+        code, result = code_and_output(gather_then_tile, (x, idx), block_sizes=[128])
+        torch.testing.assert_close(result, x[idx] + 1.0)
+        self.assertIn("_output_indices=[1]", code)
+        self.assertIn("_inplace_indices=[]", code)
+
+    def test_wrapper_gather_and_scatter_around_loop(self) -> None:
+        """Eager prologue gather and epilogue scatter compose around Pallas."""
+
+        @helion.kernel(
+            backend="pallas",
+            static_shapes=True,
+            ignore_warnings=[helion.exc.TensorOperationInWrapper],
+        )
+        def gather_tile_scatter(x: torch.Tensor, idx: torch.Tensor) -> torch.Tensor:
+            gathered = x[idx]
+            out = torch.empty_like(gathered)
+            for tile in hl.tile(out.size()):
+                out[tile] = gathered[tile] + 1.0
+            scattered = torch.empty_like(out)
+            scattered[idx] = out
+            return scattered
+
+        x = torch.randn(128, device=DEVICE, dtype=torch.float32)
+        idx = torch.arange(127, -1, -1, device=DEVICE, dtype=torch.int32)
+        code, result = code_and_output(gather_tile_scatter, (x, idx), block_sizes=[128])
+        expected = torch.empty_like(x)
+        expected[idx] = x[idx] + 1.0
+        torch.testing.assert_close(result, expected)
+        self.assertIn("_inplace_indices=[]", code)
 
     def test_add_2d(self) -> None:
         args = (
@@ -1343,6 +1649,405 @@ class TestPallas(TestCase):
             f"{(reference.float() - baseline_result.float()).abs().max().item()}).",
         )
 
+    def test_pallas_autotuner_final_pick_picks_true_best_on_noisy_initial_rank(
+        self,
+    ) -> None:
+        """Final-pick re-ranks past a noisy initial measurement.
+
+        ``[512, 1024, 512]`` looks fastest on its noisy initial ``perf`` but
+        rebenches slower than ``[512, 512, 512]``, so
+        ``run_final_pick_verification`` must re-pick ``[512, 512, 512]``.
+        """
+        from unittest.mock import patch
+
+        from helion.autotuner.base_search import PopulationBasedSearch
+        from helion.autotuner.base_search import PopulationMember
+        from helion.runtime.config import Config
+
+        def member(block_sizes: list[int], noisy_ms: float) -> PopulationMember:
+            return PopulationMember(
+                fn=lambda *a, **kw: None,
+                perfs=[noisy_ms],
+                flat_values=block_sizes,
+                config=Config(block_sizes=block_sizes),
+                status="ok",
+                compile_time=0.0,
+            )
+
+        # noisy_best wins the noisy initial rank (0.220) but rebenches slowest
+        # (0.232); true_best looks slower initially (0.232) but is truly fastest
+        # (0.180).  true_ms is what the rebenchmark reveals.
+        noisy_best = member([512, 1024, 512], 0.220)
+        true_best = member([512, 512, 512], 0.232)
+        true_ms = {id(noisy_best): 0.232, id(true_best): 0.180}
+
+        search = PopulationBasedSearch.__new__(PopulationBasedSearch)
+        search.population = [noisy_best, true_best]
+        search.best_perf_so_far = min(m.perf for m in search.population)
+        search.log = lambda *a, **kw: None  # pyrefly: ignore[bad-assignment]
+
+        def fake_rebenchmark(
+            to_bench: list[PopulationMember], *, desc: str = ""
+        ) -> None:
+            for m in to_bench:
+                m.perfs.append(true_ms[id(m)])
+
+        with patch.object(search, "rebenchmark", side_effect=fake_rebenchmark):
+            final = search.run_final_pick_verification(noisy_best, top_k=5)
+        self.assertEqual(list(final.config["block_sizes"]), [512, 512, 512])
+
+    def test_pallas_matmul_bf16_no_tiling_seed_covers_large_cubes(self) -> None:
+        """No-tiling seed fires on each bf16 cube in ``_PALLAS_NO_TILING_DIMS``.
+
+        Per cube N, ``PallasMatmulNoTilingSeedHeuristic`` is eligible and plants
+        the ``[N, N, N] unroll pb=True`` compiler seed; a cube outside the set
+        (256) is refused so the seed stays scoped to ablation-validated shapes.
+        """
+        from helion._compiler.autotuner_heuristics.pallas import _PALLAS_NO_TILING_DIMS
+        from helion._compiler.autotuner_heuristics.pallas import (
+            PallasMatmulNoTilingSeedHeuristic,
+        )
+
+        self.assertEqual(sorted(_PALLAS_NO_TILING_DIMS), [1024, 2048, 4096])
+
+        for dim in sorted(_PALLAS_NO_TILING_DIMS):
+            x = torch.empty(dim, dim, device=DEVICE, dtype=torch.bfloat16)
+            y = torch.empty(dim, dim, device=DEVICE, dtype=torch.bfloat16)
+            bound = pallas_matmul_bf16.bind((x, y))
+
+            self.assertTrue(
+                PallasMatmulNoTilingSeedHeuristic.is_eligible(
+                    bound.env, bound.host_function.device_ir
+                ),
+                f"heuristic must fire on bf16 {dim}-cube",
+            )
+            seeded = [
+                (
+                    tuple(cfg.config.get("block_sizes", ())),
+                    cfg.config.get("pallas_loop_type"),
+                    cfg.config.get("pallas_pre_broadcast"),
+                )
+                for cfg in bound.config_spec.compiler_seed_configs
+            ]
+            self.assertIn(
+                ((dim, dim, dim), "unroll", True),
+                seeded,
+                f"compiler seeds must include the no-tiling entry on bf16 {dim}-cube",
+            )
+
+        # 256-cube is outside the set, so the heuristic must refuse it.
+        small_x = torch.empty(256, 256, device=DEVICE, dtype=torch.bfloat16)
+        small_y = torch.empty(256, 256, device=DEVICE, dtype=torch.bfloat16)
+        small_bound = pallas_matmul_bf16.bind((small_x, small_y))
+        self.assertFalse(
+            PallasMatmulNoTilingSeedHeuristic.is_eligible(
+                small_bound.env, small_bound.host_function.device_ir
+            ),
+            "heuristic must refuse cubes outside _PALLAS_NO_TILING_DIMS",
+        )
+
+    def test_pallas_autotuner_compiler_seed_survives_final_pick(self) -> None:
+        """Compiler-seeded members are re-considered during final-pick.
+
+        The search prunes a seed that looked average on its noisy initial bench;
+        ``capture_compiler_seed_members`` snapshots it and merges it back into the
+        final-pick pool so it is re-benched against the search's best.
+        """
+        from unittest.mock import patch
+
+        from helion.autotuner.base_search import PopulationBasedSearch
+        from helion.autotuner.base_search import PopulationMember
+        from helion.runtime.config import Config
+
+        # Last-gen survivors (~0.205 ms) plus a compiler seed that scored a noisy
+        # 0.215 ms initially (so the search dropped it) but rebenches at a
+        # true-fastest 0.190 ms.  (config, noisy initial ms, true rebench ms):
+        last_gen = [
+            (Config(block_sizes=[1024, 256, 1024]), 0.205, 0.204),
+            (Config(block_sizes=[256, 256, 256]), 0.210, 0.209),
+        ]
+        compiler_seed = (
+            Config(
+                block_sizes=[512, 512, 512],
+                pallas_loop_type="emit_pipeline",
+                pallas_pre_broadcast=False,
+            ),
+            0.215,
+            0.190,
+        )
+
+        def make_member(config: Config, noisy_perf: float) -> PopulationMember:
+            return PopulationMember(
+                fn=lambda *a, **kw: None,
+                perfs=[noisy_perf],
+                flat_values=[id(config)],  # opaque -- never read by the test
+                config=config,
+                status="ok",
+                compile_time=0.0,
+            )
+
+        last_gen_members = [make_member(cfg, noisy) for cfg, noisy, _true in last_gen]
+        seed_member = make_member(compiler_seed[0], compiler_seed[1])
+        true_perf_by_id = {
+            id(m): true
+            for m, (_cfg, _noisy, true) in zip(last_gen_members, last_gen, strict=True)
+        }
+        true_perf_by_id[id(seed_member)] = compiler_seed[2]
+
+        search = PopulationBasedSearch.__new__(PopulationBasedSearch)
+        search.population = last_gen_members  # seed NOT in last-gen population
+        search.best_perf_so_far = min(m.perf for m in last_gen_members)
+        search._compiler_seed_members = [seed_member]
+        search.log = lambda *a, **kw: None  # pyrefly: ignore[bad-assignment]
+
+        def fake_rebenchmark(
+            members: list[PopulationMember], *, desc: str = ""
+        ) -> None:
+            for member in members:
+                member.perfs.append(true_perf_by_id[id(member)])
+
+        with patch.object(search, "rebenchmark", side_effect=fake_rebenchmark):
+            initial_best = min(last_gen_members, key=lambda m: m.perf)
+            self.assertEqual(
+                list(initial_best.config["block_sizes"]),
+                [1024, 256, 1024],
+                "Precondition: search's running best is one of the last-gen members.",
+            )
+            final_best = search.run_final_pick_verification(initial_best, top_k=10)
+
+        self.assertEqual(
+            list(final_best.config["block_sizes"]),
+            [512, 512, 512],
+            "Compiler-seeded [512, 512, 512] must be re-benched and re-rank "
+            "ahead of the last-gen best once its true 0.190 ms perf is measured.",
+        )
+
+    def _make_device_micros_search(
+        self,
+        specs: list[tuple[str, list[int], float, float]],
+    ) -> tuple[PopulationBasedSearch, dict[str, PopulationMember]]:
+        """Device-µs final-pick scaffold from ``(key, block_sizes, wall_ms,
+        device_micros)`` specs, with a fake Pallas backend reporting the scripted
+        device µs.
+        """
+        from helion.autotuner.base_search import PopulationBasedSearch
+        from helion.autotuner.base_search import PopulationMember
+        from helion.runtime.config import Config
+
+        def _new_fn() -> Callable[..., object]:
+            def _fn() -> None:
+                return None
+
+            return _fn
+
+        device_micros_by_fn: dict[int, float] = {}
+        members: dict[str, PopulationMember] = {}
+        for key, block_sizes, wall_ms, device_micros in specs:
+            fn = _new_fn()
+            cfg = Config(block_sizes=block_sizes)
+            device_micros_by_fn[id(fn)] = device_micros
+            members[key] = PopulationMember(
+                fn=fn,
+                perfs=[wall_ms],
+                flat_values=[id(cfg)],
+                config=cfg,
+                status="ok",
+                compile_time=0.0,
+            )
+
+        def fake_device_micros_bench(
+            fns: list[Callable[..., object]],
+            reference_fn: Callable[..., object],
+            *,
+            desc: str | None = None,
+        ) -> list[tuple[float, float]]:
+            ref = device_micros_by_fn[id(getattr(reference_fn, "func", reference_fn))]
+            vals = [device_micros_by_fn[id(getattr(fn, "func", fn))] for fn in fns]
+            return [(v, v - ref) for v in vals]
+
+        class _Backend:
+            @staticmethod
+            def get_paired_device_micros_bench() -> Callable[
+                ..., list[tuple[float, float]]
+            ]:
+                return fake_device_micros_bench
+
+        class _ConfigSpec:
+            backend = _Backend()
+
+        class _Settings:
+            autotune_benchmark_fn: Callable[..., list[float]] | None = None
+            autotune_progress_bar: bool = False
+            static_shapes: bool = True
+
+        class _Kernel:
+            class env:
+                process_group_name: str | None = None
+
+        class _BenchProvider:
+            mutated_arg_indices: tuple[int, ...] = ()
+
+        search = PopulationBasedSearch.__new__(PopulationBasedSearch)
+        search.population = list(members.values())
+        search.best_perf_so_far = min(m.perf for m in search.population)
+        search.log = lambda *a, **kw: None  # pyrefly: ignore[bad-assignment]
+        search.args = ()
+        search.kernel = _Kernel()  # pyrefly: ignore[bad-assignment]
+        search.benchmark_provider = _BenchProvider()  # pyrefly: ignore[bad-assignment]
+        search.settings = _Settings()  # pyrefly: ignore[bad-assignment]
+        search.config_spec = _ConfigSpec()  # pyrefly: ignore[bad-assignment]
+        search._compiler_seed_members = []
+        return search, members
+
+    def test_pallas_autotuner_final_pick_reranks_by_device_micros(self) -> None:
+        """Final-pick ranks by on-device µs, not wall-clock.
+
+        ``fast`` is 10µs on-device but 125µs wall-clock; ``slow`` is 30µs
+        on-device but 124µs wall-clock (1µs "faster"). The re-rank must pick
+        ``fast`` despite its slower wall-clock.
+        """
+        from unittest.mock import patch
+
+        search, m = self._make_device_micros_search(
+            [
+                ("fast", [1024, 1024, 1024], 0.125, 10.0),
+                ("slow", [128, 1024, 1024], 0.124, 30.0),
+            ]
+        )
+        with patch.dict(os.environ, {"HELION_AUTOTUNE_PALLAS_RANK_BY": "device_time"}):
+            final = search.run_final_pick_verification(m["slow"], top_k=5)
+        self.assertEqual(list(final.config["block_sizes"]), [1024, 1024, 1024])
+
+    @skipIfPallasInterpret(
+        "device-µs ranking needs a real TPU; CPU-interpret has no /device:TPU events"
+    )
+    def test_pallas_paired_device_micros_bench_finite_on_large_compute_bound_shape(
+        self,
+    ) -> None:
+        """``paired_device_micros_bench`` stays finite on a 4096³ compute-bound shape.
+
+        Guards the ``count >= _MIN_TRACE_EVENTS`` predicate (vs an exact
+        ``== n_calls``): on large shapes the ``stop_trace`` flush drops a few tail
+        events, so an exact match would return ``+inf`` and silently route the
+        autotuner to its wall-clock fallback. Two structurally-identical jit_fns
+        must yield finite device µs and a near-zero paired delta.
+        """
+        import jax
+        import jax.numpy as jnp
+
+        from helion.autotuner.benchmarking import _pallas_device_micros_for_fn
+        from helion.autotuner.benchmarking import paired_device_micros_bench
+
+        m = k = n = 4096
+        k1, k2 = jax.random.split(jax.random.PRNGKey(0))
+        x = jax.random.normal(k1, (m, k), dtype=jnp.bfloat16)
+        y = jax.random.normal(k2, (k, n), dtype=jnp.bfloat16)
+
+        @jax.jit
+        def matmul(a: object, b: object) -> object:
+            return jax.lax.dot_general(a, b, dimension_numbers=(((1,), (0,)), ((), ())))
+
+        def _device_micros_fn(fn: Callable[[], object]) -> float:
+            return _pallas_device_micros_for_fn(fn, n_calls=50, n_warmup=2)
+
+        results = paired_device_micros_bench(
+            [lambda: matmul(x, y)],
+            lambda: matmul(x, y),
+            device_micros_fn=_device_micros_fn,
+        )
+        median_micros, delta_micros = results[0]
+        self.assertTrue(
+            math.isfinite(median_micros) and median_micros > 0,
+            f"candidate device µs must be finite + positive on 4096³; got {median_micros!r}",
+        )
+        self.assertTrue(
+            math.isfinite(delta_micros),
+            f"paired delta must be finite on 4096³; got {delta_micros!r}",
+        )
+        self.assertLess(
+            abs(delta_micros),
+            5.0,
+            f"identical jit_fns should give a near-zero paired delta; got {delta_micros!r}",
+        )
+
+    def test_pallas_matmul_dot_general_lowering_fires_on_no_tiling(self) -> None:
+        """No-tiling 2-input matmul emits ``lax.dot_general``, not ``pl.pallas_call``.
+
+        Spies on ``_build_matmul_dot_general_jit_fn``: it runs once on first
+        compile (not on cache-hit repeats) and the output matches the
+        ``pl.pallas_call`` path.
+        """
+        from unittest.mock import patch
+
+        from helion import runtime as helion_runtime
+        from helion.runtime.config import Config
+
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def _matmul_dot_general_pin(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty(
+                [m, n],
+                device=x.device,
+                dtype=torch.promote_types(x.dtype, y.dtype),
+            )
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = acc
+            return out
+
+        torch.manual_seed(0)
+        x = torch.randn(256, 256, device=DEVICE, dtype=torch.bfloat16)
+        torch.manual_seed(1)
+        y = torch.randn(256, 256, device=DEVICE, dtype=torch.bfloat16)
+
+        # Force the no-tiling config (block_sizes match input dims).
+        bound = _matmul_dot_general_pin.bind((x, y))
+        no_tiling_cfg = Config(block_sizes=[256, 256, 256])
+
+        with patch.object(
+            helion_runtime,
+            "_build_matmul_dot_general_jit_fn",
+            wraps=helion_runtime._build_matmul_dot_general_jit_fn,
+        ) as build_spy:
+            compiled_fn = bound.compile_config(no_tiling_cfg)
+            result_no_tiling = compiled_fn(x, y)
+            for _ in range(3):
+                compiled_fn(x, y)
+        self.assertEqual(
+            build_spy.call_count,
+            1,
+            "Pure matmul + no-tiling config must lower via ``lax.dot_general`` "
+            "exactly once (first cache-build); cache hits must not rebuild.",
+        )
+
+        # Tiled config must keep the pl.pallas_call path (builder not run), and
+        # its output must match the no-tiling dot_general path within bf16 tol.
+        bound_ref = _matmul_dot_general_pin.bind((x, y))
+        tiled_cfg = Config(block_sizes=[128, 128, 128])
+        with patch.object(
+            helion_runtime,
+            "_build_matmul_dot_general_jit_fn",
+            wraps=helion_runtime._build_matmul_dot_general_jit_fn,
+        ) as build_spy_tiled:
+            compiled_ref = bound_ref.compile_config(tiled_cfg)
+            result_tiled = compiled_ref(x, y)
+        self.assertEqual(
+            build_spy_tiled.call_count,
+            0,
+            "tiled config (block_size < input_dim) must not run the dot_general builder",
+        )
+        max_abs_diff = (
+            (result_no_tiling.float() - result_tiled.float()).abs().max().item()
+        )
+        self.assertLess(
+            max_abs_diff,
+            5e-2,
+            f"dot_general output diverged from pallas_call by {max_abs_diff}",
+        )
+
     def test_bmm(self) -> None:
         """Test BMM with default config — exercises size_matches fix.
 
@@ -1440,6 +2145,60 @@ class TestPallas(TestCase):
         # out is output-only, excluded from pallas_call inputs
         self.assertIn("_inplace_indices=[]", code)
 
+    @xfailIfPallasInterpret(
+        "dynamic pl.ds / pl.BoundedSlice BlockSpecs are not supported by JAX's "
+        "Pallas interpret mode (concrete-shape requirement); runs on real TPU."
+    )
+    def test_emit_pipeline_data_dependent_begin_uses_dynamic_ds(self) -> None:
+        """A data-dependent ``hl.tile(start, end)`` inner loop under
+        ``pallas_loop_type='emit_pipeline'`` must address the jagged segment
+        with a dynamic ``pl.ds`` slice + ``pl.BoundedSlice`` block, not a
+        block-aligned ``// block_size`` index (which only addresses starts that
+        are exact multiples of the block size). Regression test for the
+        "emit_pipeline fails on unaligned dims" limitation.
+        """
+        # Arbitrary, deliberately non-block-aligned segment bounds covering
+        # [0, 48) so the output is fully written (out = x + 1 everywhere).
+        offsets = torch.tensor([0, 10, 31, 48], device=DEVICE, dtype=torch.int32)
+        x = torch.randn(48, 128, device=DEVICE, dtype=torch.float32)
+        code, result = code_and_output(
+            pallas_jagged_segment_add,
+            (x, offsets),
+            block_sizes=[16],
+            pallas_loop_type="emit_pipeline",
+        )
+        self.assertIn("pltpu.emit_pipeline", code)
+        # The fix: dynamic ds slice + BoundedSlice block for the runtime begin.
+        self.assertIn("pl.BoundedSlice", code)
+        self.assertIn("pl.ds(", code)
+        # Load/store asymmetry: the input spec reads a full block (the over-read
+        # past ``end`` is zeroed by the mask), while the output spec clamps its
+        # extent to min(block, end - offset) so a short final tile writes only
+        # its valid rows instead of overrunning into the next segment.
+        in_part, _, out_part = code.partition("out_specs=")
+        self.assertIn("in_specs=", in_part)
+        self.assertNotIn("jnp.minimum", in_part)  # input: full block
+        self.assertIn("jnp.minimum", out_part)  # output: clamped extent
+        torch.testing.assert_close(result, x + 1.0, rtol=1e-5, atol=1e-5)
+
+    def test_emit_pipeline_static_begin_keeps_block_index(self) -> None:
+        """Control: a static (zero-begin) inner loop must NOT switch to the
+        dynamic ds/BoundedSlice path, so aligned/static kernels are unchanged.
+        """
+        args = (
+            torch.randn(64, 128, device=DEVICE, dtype=torch.float32),
+            torch.randn(64, 128, device=DEVICE, dtype=torch.float32),
+        )
+        code, result = code_and_output(
+            pallas_inner_loop_add,
+            args,
+            block_sizes=[8, 128],
+            pallas_loop_type="emit_pipeline",
+        )
+        self.assertIn("pltpu.emit_pipeline", code)
+        self.assertNotIn("pl.BoundedSlice", code)
+        torch.testing.assert_close(result, args[0] + args[1])
+
     def _check_scalar_lookup_in_pipeline(self, loop_type: str) -> None:
         torch.manual_seed(0)
         x = torch.randn(256, device=DEVICE, dtype=torch.float32)
@@ -1478,6 +2237,46 @@ class TestPallas(TestCase):
         """Same kernel as :meth:`test_scalar_lookup_with_emit_pipeline`
         compiled under ``pallas_loop_type='fori_loop'``."""
         self._check_scalar_lookup_in_pipeline("fori_loop")
+
+    @xfailIfPallasInterpret(
+        "pl.program_id captured into emit_pipeline body is not supported in "
+        "JAX interpret mode (program_id_p.bind asserts during trace)"
+    )
+    def test_nested_non_grid_outer_loop_emit_pipeline(self) -> None:
+        """Grid (``tile_m``) → non-grid device loop (``tile_n``) wrapping
+        an inner emit_pipeline (``tile_k``) whose body reads
+        ``w[tile_k, tile_n]`` compiles and produces correct matmul output.
+        Mirrors the epilogue structure of ``squeeze_and_excitation_net``.
+
+        ``n`` must exceed the effective ``bs_n`` (128 lanes on TPU) so the
+        inner BlockSpec for ``w`` is actually block-sized rather than
+        coincidentally equalling the full ``n`` dim.
+        """
+
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def kernel(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+            m, k = x.size()
+            n = w.size(1)
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m in hl.tile(m):
+                for tile_n in hl.tile(n):
+                    acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                    for tile_k in hl.tile(k):
+                        acc = torch.addmm(acc, x[tile_m, tile_k], w[tile_k, tile_n])
+                    out[tile_m, tile_n] = acc.to(x.dtype)
+            return out
+
+        m, k, n = 32, 256, 256
+        x = torch.randn(m, k, device=DEVICE, dtype=torch.float32)
+        w = torch.randn(k, n, device=DEVICE, dtype=torch.float32)
+        code, result = code_and_output(
+            kernel,
+            (x, w),
+            block_sizes=[16, 128, 128],
+            pallas_loop_type="emit_pipeline",
+        )
+        self.assertIn("pltpu.emit_pipeline", code)
+        torch.testing.assert_close(result, x @ w, rtol=1e-2, atol=1e-2)
 
     def test_two_pass_reduction_emit_pipeline(self) -> None:
         """Two inner reduction loops over the same dim compile and run under
@@ -2397,6 +3196,72 @@ class TestPallas(TestCase):
         self.assertIn("pl.ds(", code)
         torch.testing.assert_close(result, args[0] + args[1])
 
+    def test_fori_loop_static_begin_leading_token_load_stays_resident(self) -> None:
+        """Static-begin packed-token rows keep the existing non-DMA behavior."""
+        x = torch.randn(64, 4, 128, device=DEVICE, dtype=torch.float32)
+        code, result = code_and_output(
+            pallas_leading_token_sum,
+            (x,),
+            block_sizes=[16],
+            pallas_loop_type="fori_loop",
+        )
+        self.assertNotIn("pltpu.make_async_copy", code)
+        self.assertNotIn("_pipeline_arg_indices=", code)
+        torch.testing.assert_close(
+            result, x.sum(dim=0, keepdim=True), rtol=1e-3, atol=1e-3
+        )
+
+    def test_pallas_loop_prefixed_row_slab_streams(self) -> None:
+        x = torch.randn(2, 48, 4, 128, device=DEVICE, dtype=torch.float32)
+        offsets = torch.tensor([0, 11, 37], device=DEVICE, dtype=torch.int32)
+        code, result = code_and_output(
+            pallas_owner_prefixed_row_slab_sum,
+            (x, offsets),
+            block_sizes=[8],
+            pallas_loop_type="fori_loop",
+        )
+        self.assertIn("_pipeline_arg_indices=", code)
+        self.assertIn("pltpu.make_async_copy(x.at", code)
+        ref = torch.stack(
+            [x[g, int(offsets[g]) : int(offsets[g + 1])].sum(dim=0) for g in range(2)]
+        )
+        torch.testing.assert_close(result, ref, rtol=1e-3, atol=1e-3)
+
+        code = pallas_owner_prefixed_row_slab_sum.bind((x, offsets)).to_triton_code(
+            helion.Config(block_sizes=[8], pallas_loop_type="emit_pipeline")
+        )
+        self.assertIn("pltpu.emit_pipeline", code)
+        self.assertIn("pl.BoundedSlice", code)
+        self.assertIn("pipeline_mode=pl.Buffered", code)
+        self.assertIn("_pipeline_arg_indices=[1]", code)
+        self.assertNotIn("pltpu.make_async_copy", code)
+
+        offsets = torch.tensor([3, 29], device=DEVICE, dtype=torch.int32)
+        code, result = code_and_output(
+            pallas_literal_prefixed_row_slab_sum,
+            (x, offsets),
+            block_sizes=[8],
+            pallas_loop_type="fori_loop",
+        )
+        self.assertIn("_pipeline_arg_indices=", code)
+        self.assertIn("pltpu.make_async_copy(x.at", code)
+        torch.testing.assert_close(
+            result,
+            x[1, int(offsets[0]) : int(offsets[1])].sum(dim=0, keepdim=True),
+            rtol=1e-3,
+            atol=1e-3,
+        )
+
+        code = pallas_literal_prefixed_row_slab_sum.bind((x, offsets)).to_triton_code(
+            helion.Config(block_sizes=[8], pallas_loop_type="emit_pipeline")
+        )
+        self.assertIn("pltpu.emit_pipeline", code)
+        self.assertIn("pl.BlockSpec((1, pl.BoundedSlice", code)
+        self.assertIn("lambda _j: (1, pl.ds(start + _j * _BLOCK_SIZE_1", code)
+        self.assertIn("pipeline_mode=pl.Buffered", code)
+        self.assertIn("_pipeline_arg_indices=[1]", code)
+        self.assertNotIn("pltpu.make_async_copy", code)
+
     def test_tile_id_per_block_accumulator(self) -> None:
         """Writing to ``out[tile.id, :]`` stores one row per outer grid iter.
 
@@ -2590,6 +3455,30 @@ class TestPallas(TestCase):
         self.assertIn("pl.ds(", code)
         self.assertIn("_pipeline_arg_indices=", code)
         torch.testing.assert_close(result, x * r)
+
+    def test_pipeline_begin_aligned_skips_pad(self) -> None:
+        # A block-aligned inner begin (the outer tile's offset) needs no boundary
+        # pad, so _ds_pad_dims must report extra_pad == 0 rather than block_size-1.
+        # Locks the pad-skip optimization (would be block_size-1 if it regressed).
+        x = torch.randn(64, 128, device=DEVICE, dtype=torch.float32)
+        r = torch.randn(64, 1, device=DEVICE, dtype=torch.float32)
+        code, result = code_and_output(
+            pallas_row_scale_mul,
+            (x, r),
+            block_sizes=[8],
+            pallas_loop_type="fori_loop",
+        )
+        torch.testing.assert_close(result, x * r)
+        match = re.search(r"_ds_pad_dims=(\[[^\]]*\])", code)
+        self.assertIsNotNone(match, "expected _ds_pad_dims in the launcher call")
+        pad_dims = ast.literal_eval(
+            match.group(1)
+        )  # [(arg, dim, block_size, extra_pad)]
+        self.assertTrue(pad_dims, "expected pl.ds pad dims to be present")
+        self.assertTrue(
+            all(extra_pad == 0 for *_, extra_pad in pad_dims),
+            f"block-aligned begin should skip the pad (extra_pad==0), got {pad_dims}",
+        )
 
     def test_squeeze_slice_access(self) -> None:
         """Test for the [None, :] indexing pattern (subscript index for slice >= tensor_ndim)"""
@@ -3090,16 +3979,19 @@ class TestPallas(TestCase):
         _code2, result2 = code_and_output(sum_with_dynamic_offset, (data, offsets))
         torch.testing.assert_close(result2, ref, rtol=1e-3, atol=1e-3)
 
-    @xfailIfPallas(
-        "emit_pipeline BlockSpec index_map drops the tile.begin offset, "
-        "so a non-zero start in hl.tile(start, end, ...) reads from offset 0 "
-        "instead and produces wrong results."
+    @xfailIfPallasInterpret(
+        "emit_pipeline now includes tile.begin via a dynamic pl.ds BlockSpec, "
+        "but JAX's Pallas interpret mode does not support dynamic pl.ds / "
+        "pl.BoundedSlice (concrete-shape requirement). Expected to pass on real "
+        "TPU; xfail only under interpret."
     )
     def test_non_zero_tile_begin_emit_pipeline(self) -> None:
         """Same kernel as ``test_non_zero_tile_begin`` but pinned to emit_pipeline.
 
-        Documents the known emit_pipeline tile.begin bug.  Will start passing
-        once the BlockSpec ``index_map`` is taught to include ``tile.begin``.
+        The non-zero ``tile.begin`` is now carried by a dynamic ``pl.ds``
+        BlockSpec index_map, so this produces correct results on TPU. It still
+        xfails under JAX Pallas interpret, which cannot execute dynamic
+        ``pl.ds`` / ``pl.BoundedSlice`` BlockSpecs.
         """
         sum_with_constant_offset, _ = self._non_zero_tile_begin_kernels()
         N, A, B = 128, 8, 256
@@ -3292,6 +4184,209 @@ class TestPallas(TestCase):
             ref[i] = (x[s:e] @ y[s:e].T).sum()
         torch.testing.assert_close(result, ref, rtol=1e-2, atol=1e-2)
 
+    @staticmethod
+    def _transpose_operand_producer(code: str) -> str | None:
+        """The source line producing the operand fed to the first
+        ``jnp.transpose(...)``, or None if there is no transpose."""
+        m = re.search(r"\b\w+ = jnp\.transpose\((\w+),", code)
+        if m is None:
+            return None
+        producer = re.search(
+            rf"^[ \t]*{re.escape(m.group(1))} = .*$", code, re.MULTILINE
+        )
+        return producer.group(0) if producer else None
+
+    def test_relayout_targets_exclude_reshape(self) -> None:
+        """Guard: ``view``/``reshape`` must NOT be deferrable relayouts.  They can
+        regroup the masked dim's elements (e.g. ``[B, 2]`` -> ``[2, B]``), so a
+        consumer-layout mask would select different lanes than the load mask; only
+        pure axis permutations are safe to defer through."""
+        from helion._compiler.node_masking import _RELAYOUT_TARGETS
+
+        self.assertIn(torch.ops.aten.permute.default, _RELAYOUT_TARGETS)
+        self.assertNotIn(torch.ops.aten.view.default, _RELAYOUT_TARGETS)
+        self.assertNotIn(torch.ops.aten.reshape.default, _RELAYOUT_TARGETS)
+
+    def test_transpose_dot_defers_pallas_load_mask(self) -> None:
+        """A masked load consumed via ``transpose`` -> dot defers its mask to the
+        consumer layout: a raw load + a post-transpose ``jnp.where``, not an eager
+        multiplicative load mask.
+
+        The deferral is an FX-graph pass, so it is independent of the pallas loop
+        type -- asserted here for both ``fori_loop`` and ``compact_worklist`` on a
+        generic (non-attention) per-token jagged projection whose partial tiles
+        make the mask load-bearing.
+        """
+
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def jagged_proj(
+            x: torch.Tensor, w: torch.Tensor, offsets: torch.Tensor
+        ) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for seg in hl.grid(offsets.size(0) - 1):
+                wb = w[:, :, :]
+                for tile in hl.tile(offsets[seg], offsets[seg + 1]):
+                    # masked load -> transpose -> dot: the deferral target.
+                    xb = x[tile, :, :].transpose(0, 1)
+                    out[tile, :, :] = torch.bmm(xb, wb).transpose(0, 1)
+            return out
+
+        H, D, block = 2, 16, 16
+        # Packed jagged offsets with partial final tiles (none a multiple of the
+        # block; one < block) so the deferred mask is load-bearing.
+        offsets = torch.tensor([0, 10, 33, 40, 80], device=DEVICE, dtype=torch.int32)
+        torch.manual_seed(0)
+        x = torch.randn(80, H, D, device=DEVICE, dtype=torch.bfloat16)
+        w = torch.randn(H, D, D, device=DEVICE, dtype=torch.bfloat16)
+
+        ref = torch.empty_like(x)
+        for i in range(offsets.size(0) - 1):
+            s, e = int(offsets[i]), int(offsets[i + 1])
+            ref[s:e] = torch.bmm(x[s:e].transpose(0, 1), w).transpose(0, 1)
+
+        for loop_type in ("fori_loop", "compact_worklist"):
+            with self.subTest(loop_type=loop_type):
+                code, out = code_and_output(
+                    jagged_proj,
+                    (x, w, offsets),
+                    block_sizes=[block],
+                    pallas_loop_type=loop_type,
+                )
+                # x's masked load is raw (no eager ``* mask``), feeds a transpose,
+                # and the mask reappears as a post-transpose ``jnp.where``.
+                producer = self._transpose_operand_producer(code)
+                self.assertIsNotNone(producer)
+                self.assertRegex(producer, r"= x\[")
+                self.assertNotIn("* mask", producer)
+                self.assertIn("jnp.where", code)
+                # compact_worklist matches the eager reference on the partial
+                # tiles.  fori_loop miscompiles jagged tiles in pallas interpret
+                # (a pre-existing, unrelated issue), so it is not a sound numeric
+                # oracle here; for it we assert only the codegen above.
+                if loop_type == "compact_worklist":
+                    torch.testing.assert_close(
+                        out.cpu(), ref.cpu(), rtol=2e-2, atol=2e-2
+                    )
+
+    def test_direct_dot_input_keeps_eager_load_mask(self) -> None:
+        """A masked load consumed directly by a dot (no relayout) is not
+        deferred: it keeps the eager multiplicative load mask."""
+
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def direct_dot(
+            y: torch.Tensor, w: torch.Tensor, offsets: torch.Tensor
+        ) -> torch.Tensor:
+            num_segs = offsets.size(0) - 1
+            d = w.size(1)
+            out = torch.zeros([num_segs, d], dtype=y.dtype, device=y.device)
+            for seg in hl.grid(num_segs):
+                start = offsets[seg]
+                end = offsets[seg + 1]
+                acc = hl.zeros([d], dtype=y.dtype)
+                for tile_j in hl.tile(start, end):
+                    # y[tile_j, :] is the lhs of the dot with no relayout.
+                    acc = acc + torch.matmul(y[tile_j, :], w[:, :]).sum(dim=0)
+                out[seg, :] = acc
+            return out
+
+        N, D, P = 128, 96, 48
+        y = torch.randn(N, D, device=DEVICE, dtype=torch.float32)
+        w = torch.randn(D, P, device=DEVICE, dtype=torch.float32)
+        offsets = torch.tensor([0, 50], device=DEVICE, dtype=torch.int32)
+
+        code, result = code_and_output(
+            direct_dot,
+            (y, w, offsets),
+            block_sizes=[32],
+            pallas_loop_type="fori_loop",
+        )
+
+        # Eager mask retained on the direct dot input; nothing to defer past.
+        self.assertRegex(code, r"= y\[[^\n]*\] \* mask_\d+\.astype")
+        self.assertNotRegex(code, r"jnp\.transpose\(")
+
+        s, e = 0, 50
+        ref = (y[s:e] @ w).sum(dim=0).reshape(1, P)
+        torch.testing.assert_close(result, ref, rtol=1e-2, atol=1e-2)
+
+    def test_multi_consumer_load_keeps_eager_mask(self) -> None:
+        """A 3-D masked load whose Q axis is major (so the positional gate would
+        otherwise allow deferral) but which ALSO feeds a non-re-masking consumer
+        (an elementwise add) must keep its eager mask: the traversal finds a use
+        that never reaches a ``_mask_to`` and refuses to defer."""
+
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def proj_plus_skip(
+            y: torch.Tensor, w: torch.Tensor, offsets: torch.Tensor
+        ) -> torch.Tensor:
+            out = torch.empty_like(y)
+            for seg in hl.grid(offsets.size(0) - 1):
+                wb = w[:, :, :]
+                for tile in hl.tile(offsets[seg], offsets[seg + 1]):
+                    yj = y[tile, :, :]  # [tile, H, D]; tile is the major axis
+                    proj = torch.bmm(yj.transpose(0, 1), wb).transpose(0, 1)
+                    # yj is used transposed (-> bmm) AND directly (elementwise add).
+                    out[tile, :, :] = (proj + yj).to(out.dtype)
+            return out
+
+        H, D = 4, 16
+        offsets = torch.tensor([0, 50], device=DEVICE, dtype=torch.int32)
+        torch.manual_seed(0)
+        y = torch.randn(50, H, D, device=DEVICE, dtype=torch.bfloat16)
+        w = torch.randn(H, D, D, device=DEVICE, dtype=torch.bfloat16)
+
+        code, out = code_and_output(
+            proj_plus_skip,
+            (y, w, offsets),
+            block_sizes=[32],
+            pallas_loop_type="fori_loop",
+        )
+        # Not deferred (the elementwise consumer doesn't re-mask) -> eager mask kept.
+        self.assertRegex(code, r"= y\[[^\n]*\] \* mask_\d+\.astype")
+
+        ref = torch.empty_like(y)
+        s, e = 0, 50
+        ref[s:e] = torch.bmm(y[s:e].transpose(0, 1), w).transpose(0, 1) + y[s:e]
+        torch.testing.assert_close(out.cpu(), ref.cpu(), rtol=2e-2, atol=2e-2)
+
+    def test_opposite_direction_transpose_keeps_eager_mask(self) -> None:
+        """Mirror image of the deferral win.  Here the masked Q axis is already in
+        the last-two (sublane) dims at the load and the transpose moves it to a
+        major dim, so deferring would relocate the mask onto the more expensive
+        axis.  The positional gate must NOT defer -- the eager (sublane) load mask
+        is kept."""
+
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def opposite(y: torch.Tensor, offsets: torch.Tensor) -> torch.Tensor:
+            h = y.size(0)
+            out = torch.empty([y.size(1), h, h], dtype=y.dtype, device=y.device)
+            for seg in hl.grid(offsets.size(0) - 1):
+                for tile in hl.tile(offsets[seg], offsets[seg + 1]):
+                    yj = y[:, tile, :]  # [H, tile, D]; tile is a last-two (sublane) dim
+                    a = yj.transpose(0, 1)  # [tile, H, D]; tile -> major
+                    b = yj.permute(1, 2, 0)  # [tile, D, H]; tile -> major
+                    out[tile, :, :] = torch.bmm(a, b).to(out.dtype)
+            return out
+
+        H, D = 4, 16
+        offsets = torch.tensor([0, 10], device=DEVICE, dtype=torch.int32)
+        torch.manual_seed(0)
+        y = torch.randn(H, 10, D, device=DEVICE, dtype=torch.bfloat16)
+
+        code, out = code_and_output(
+            opposite,
+            (y, offsets),
+            block_sizes=[16],
+            pallas_loop_type="fori_loop",
+        )
+        # Masked axis is sublane at the load -> eager mask is cheap; deferring
+        # would move it to the major axis, so the gate keeps the eager load mask.
+        self.assertRegex(code, r"= y\[[^\n]*\] \* mask_\d+\.astype")
+
+        s, e = 0, 10
+        ref = torch.bmm(y[:, s:e, :].transpose(0, 1), y[:, s:e, :].permute(1, 2, 0))
+        torch.testing.assert_close(out.cpu(), ref.cpu(), rtol=2e-2, atol=2e-2)
+
     def test_if_branch_intermediate_outputs(self) -> None:
         """Branch intermediates must survive in _if output list."""
 
@@ -3465,6 +4560,63 @@ class TestPallas(TestCase):
         outer_min = spec.block_sizes[0].min_size
         inner_min = spec.block_sizes[1].min_size
         self.assertGreaterEqual(outer_min, inner_min)
+
+    @xfailIfPallasInterpret("numerical mismatch in JAX interpret mode")
+    def test_boundary_mask_with_squeezed_leading_dims(self) -> None:
+        """Boundary mask generation succeeds when leading dimensions are squeezed."""
+
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def high_rank_kernel(x: torch.Tensor) -> torch.Tensor:
+            B, H, M, D = x.size()
+            out = torch.zeros_like(x)
+            for tile_b, tile_h in hl.tile([B, H], block_size=[1, 1]):
+                b_idx = tile_b.begin
+                h_idx = tile_h.begin
+                for tile_m in hl.tile(16, M, block_size=128):
+                    slice_x = x[b_idx, h_idx, tile_m, :]
+                    out[b_idx, h_idx, tile_m, :] = slice_x
+            return out
+
+        B, H, M, D = 2, 8, 250, 128
+        x = torch.randn(B, H, M, D, device=DEVICE, dtype=torch.bfloat16)
+        _code, result = code_and_output(
+            high_rank_kernel, (x,), pallas_loop_type="fori_loop"
+        )
+
+        ref = torch.zeros_like(x)
+        ref[:, :, 16:, :] = x[:, :, 16:, :]
+        torch.testing.assert_close(result, ref)
+
+    def test_pallas_0d_tensor_arg(self) -> None:
+        """0D tensor arguments shouldn't cause positional argument shift in block specs."""
+
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def kernel_with_0d_arg(
+            x: torch.Tensor, scalar: torch.Tensor, y: torch.Tensor
+        ) -> torch.Tensor:
+            out = torch.zeros_like(x)
+            for tile_x, tile_y in hl.tile(
+                [x.size(0), x.size(1)], block_size=[128, 128]
+            ):
+                out[tile_x, tile_y] = (
+                    x[tile_x, tile_y] * hl.load(scalar, []) + y[tile_x, tile_y]
+                )
+            return out
+
+        M, N = 256, 256
+        x = torch.randn(M, N, device=DEVICE, dtype=torch.float32)
+        y = torch.randn(M, N, device=DEVICE, dtype=torch.float32)
+        scalar = torch.tensor(2.0, device=DEVICE, dtype=torch.float32)
+
+        from helion.runtime import Config
+
+        config = Config(pallas_loop_type="fori_loop")
+        code = kernel_with_0d_arg.bind((x, scalar, y)).to_code(config)
+
+        self.assertIn(
+            "_block_spec_info=[((128, 128), (0, 1)), None, ((128, 128), (0, 1)), ((128, 128), (0, 1))]",
+            code,
+        )
 
 
 @skipUnlessPallas("JAX/Pallas TPU not available")
@@ -3689,6 +4841,189 @@ class TestPallasIndirectGather(TestCase):
 
 
 instantiate_parametrized_tests(TestPallasIndirectGather)
+
+
+@skipUnlessPallas("JAX/Pallas TPU not available")
+class TestPallasJaxFn(TestCase):
+    """End-to-end tests for the ``Kernel.jax_fn`` pure-JAX export path.
+
+    Covers all three ``pallas_loop_type`` flavours plus a multi-kernel
+    composition test, each exercising the kernel inside a ``jax.jit``
+    boundary with non-trivial pure-JAX prologue / epilogue around it.
+    """
+
+    def _import_jax(self) -> tuple[Any, Any]:
+        import jax
+        import jax.numpy as jnp
+
+        return jax, jnp
+
+    def test_jax_fn_emit_pipeline(self) -> None:
+        """jax_fn drives an emit_pipeline kernel inside ``jax.jit``."""
+        jax, jnp = self._import_jax()
+
+        @helion.kernel(
+            backend="pallas",
+            static_shapes=True,
+            config=helion.Config(
+                block_sizes=[128, 128], pallas_loop_type="emit_pipeline"
+            ),
+        )
+        def add_kernel(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile in hl.tile(out.size()):
+                out[tile] = x[tile] + y[tile]
+            return out
+
+        jax_kernel = add_kernel.jax_fn
+
+        @jax.jit
+        def f(a: Any, b: Any, scale: float) -> Any:
+            # prologue (pure jax)
+            a = a * scale
+            b = jnp.tanh(b)
+            # kernel
+            c = jax_kernel(a, b)
+            # epilogue (pure jax)
+            return jnp.sum(c) + jnp.mean(c) * 0.5
+
+        a = jnp.ones((128, 128), dtype=jnp.float32)
+        b = jnp.full((128, 128), 0.5, dtype=jnp.float32)
+        scale = 2.0
+
+        result = float(f(a, b, scale))
+
+        # Reference: same prologue/epilogue, eager addition
+        ref_a = a * scale
+        ref_b = jnp.tanh(b)
+        ref_c = ref_a + ref_b
+        ref = float(jnp.sum(ref_c) + jnp.mean(ref_c) * 0.5)
+        self.assertAlmostEqual(result, ref, places=2)
+
+    def test_jax_fn_unroll(self) -> None:
+        """jax_fn drives an unroll kernel inside ``jax.jit``."""
+        jax, jnp = self._import_jax()
+
+        @helion.kernel(
+            backend="pallas",
+            static_shapes=True,
+            config=helion.Config(block_sizes=[128, 128], pallas_loop_type="unroll"),
+        )
+        def relu_add_kernel(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile in hl.tile(out.size()):
+                out[tile] = torch.relu(x[tile]) + y[tile]
+            return out
+
+        jax_kernel = relu_add_kernel.jax_fn
+
+        @jax.jit
+        def f(a: Any, b: Any) -> Any:
+            a = a - 0.25
+            b = b * b
+            c = jax_kernel(a, b)
+            return jnp.sum(c * c)
+
+        a = jnp.linspace(-1.0, 1.0, 128 * 128, dtype=jnp.float32).reshape((128, 128))
+        b = jnp.full((128, 128), 0.3, dtype=jnp.float32)
+
+        result = float(f(a, b))
+
+        ref_a = a - 0.25
+        ref_b = b * b
+        ref_c = jnp.maximum(ref_a, 0.0) + ref_b
+        ref = float(jnp.sum(ref_c * ref_c))
+        self.assertAlmostEqual(result, ref, places=1)
+
+    def test_jax_fn_fori_loop(self) -> None:
+        """jax_fn drives a fori_loop kernel inside ``jax.jit``."""
+        jax, jnp = self._import_jax()
+
+        @helion.kernel(
+            backend="pallas",
+            static_shapes=True,
+            config=helion.Config(block_sizes=[128, 128], pallas_loop_type="fori_loop"),
+        )
+        def mul_add_kernel(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile_m in hl.tile(x.size(0)):
+                for tile_n in hl.tile(x.size(1)):
+                    out[tile_m, tile_n] = x[tile_m, tile_n] * 1.5 + y[tile_m, tile_n]
+            return out
+
+        jax_kernel = mul_add_kernel.jax_fn
+
+        @jax.jit
+        def f(a: Any, b: Any) -> Any:
+            a = a * 0.5 + 1.0
+            b = jnp.exp(b * 0.1)
+            c = jax_kernel(a, b)
+            return jnp.mean(c)
+
+        a = jnp.full((128, 128), 2.0, dtype=jnp.float32)
+        b = jnp.zeros((128, 128), dtype=jnp.float32)
+
+        result = float(f(a, b))
+
+        ref_a = a * 0.5 + 1.0
+        ref_b = jnp.exp(b * 0.1)
+        ref_c = ref_a * 1.5 + ref_b
+        ref = float(jnp.mean(ref_c))
+        self.assertAlmostEqual(result, ref, places=2)
+
+    def test_jax_fn_multi_kernel_in_one_jit(self) -> None:
+        """A single ``jax.jit`` function uses two distinct Helion kernels."""
+        jax, jnp = self._import_jax()
+
+        @helion.kernel(
+            backend="pallas",
+            static_shapes=True,
+            config=helion.Config(block_sizes=[128, 128]),
+        )
+        def add_kernel(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile in hl.tile(out.size()):
+                out[tile] = x[tile] + y[tile]
+            return out
+
+        @helion.kernel(
+            backend="pallas",
+            static_shapes=True,
+            config=helion.Config(block_sizes=[128, 128]),
+        )
+        def mul_kernel(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile in hl.tile(out.size()):
+                out[tile] = x[tile] * y[tile]
+            return out
+
+        add_jax = add_kernel.jax_fn
+        mul_jax = mul_kernel.jax_fn
+
+        @jax.jit
+        def f(a: Any, b: Any, c: Any) -> Any:
+            # prologue
+            a = a + 1.0
+            # first kernel: a + b
+            ab = add_jax(a, b)
+            # middle pure-jax transform
+            ab = jnp.tanh(ab)
+            # second kernel: (tanh result) * c
+            out = mul_jax(ab, c)
+            # epilogue
+            return jnp.sum(out)
+
+        a = jnp.full((128, 128), 0.5, dtype=jnp.float32)
+        b = jnp.full((128, 128), 0.25, dtype=jnp.float32)
+        c = jnp.full((128, 128), 2.0, dtype=jnp.float32)
+
+        result = float(f(a, b, c))
+
+        ref_a = a + 1.0
+        ref_ab = jnp.tanh(ref_a + b)
+        ref_out = ref_ab * c
+        ref = float(jnp.sum(ref_out))
+        self.assertAlmostEqual(result, ref, places=2)
 
 
 class TestPallasPrinter(TestCase):

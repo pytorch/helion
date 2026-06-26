@@ -353,11 +353,22 @@ def target_device_capability(
     """Return CUDA compute capability, or None for non-CUDA/unavailable targets."""
     if device is not None and device.type != "cuda":
         return None
+    if device is not None and device.index is not None:
+        return _target_device_capability(device.index)
     if not torch.cuda.is_available():
         return None
-    if device is None:
-        return torch.cuda.get_device_capability(torch.cuda.current_device())
-    return torch.cuda.get_device_capability(device)
+    # device=None means the current device; resolve it per call so a later
+    # set_device is not frozen under one cache key.
+    return _target_device_capability(torch.cuda.current_device())
+
+
+@functools.cache
+def _target_device_capability(index: int) -> tuple[int, int] | None:
+    # Memoize per index (capability is fixed per device). Tests patch the
+    # public wrapper above, mirroring is_hip / _is_hip.
+    if not torch.cuda.is_available():
+        return None
+    return torch.cuda.get_device_capability(index)
 
 
 def min_dot_size(
@@ -598,7 +609,7 @@ def requires_cuda_version(min_version: str) -> bool:
 
 @functools.cache
 def supports_torch_compile_fusion() -> bool:
-    """Check whether this PyTorch build exposes Helion's fusion entrypoint."""
+    """Check whether this PyTorch build exposes Helion's fusion entrypoints."""
     if torch.xpu.is_available():
         return False
     if not requires_torch_version("2.11"):
@@ -612,6 +623,7 @@ def supports_torch_compile_fusion() -> bool:
         init_names = TemplateBuffer.__init__.__code__.co_names
         assert "allow_prologue_fusion" in init_names
         assert "allow_epilogue_fusion" in init_names
+        assert hasattr(TemplateBuffer, "has_aliasing_or_mutation_for_prologue_fusion")
     except (ImportError, AttributeError, AssertionError):
         return False
     return True

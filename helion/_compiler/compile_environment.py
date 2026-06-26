@@ -161,6 +161,7 @@ if TYPE_CHECKING:
     from .. import Config
     from ..runtime.settings import Settings
     from .backend import Backend
+    from .pallas.compact_worklist import CompactWorklistPlan
 
     class _TLS(Protocol):
         env: CompileEnvironment | None
@@ -232,6 +233,7 @@ class CompileEnvironment:
         )
         self.process_group_name = None
         self._backend = get_backend_class(settings.backend)()
+        self._backend.validate_environment()
         if self._backend.experimental:
             from torch._dynamo.utils import warn_once
 
@@ -249,7 +251,7 @@ class CompileEnvironment:
         self.fake_mode = FakeTensorMode(shape_env=self.shape_env)
         self.input_sources: dict[torch.Tensor, Source] = {}
         self.block_sizes: list[BlockSizeInfo] = []
-        self.debug_shape_renames: dict[sympy.Expr, sympy.Expr] = {}
+        self.debug_shape_renames: dict[sympy.Basic, sympy.Basic] = {}
         self.config_spec = ConfigSpec(
             backend=self.backend,
             target_device_capability=target_device_capability(device),
@@ -268,6 +270,21 @@ class CompileEnvironment:
         self._tensor_descriptor_layout_guard_source_cache: dict[int, Source | None] = {}
         self.jagged_tile_parent_ids: dict[int, list[int]] = {}
         self.jagged_tile_mask_shapes: dict[int, list[torch.SymInt]] = {}
+        # Set by the Pallas backend when config["pallas_loop_type"] ==
+        # "compact_worklist" and detect_compact_worklist_plan succeeds; gates the
+        # whole compact-worklist codegen path (see helion/_compiler/pallas/
+        # compact_worklist.py).
+        self.compact_worklist_plan: CompactWorklistPlan | None = None
+        # Static megablocks upper bound (int) for the compact worklist grid /
+        # metadata, computed at pre_codegen from static shapes.
+        self.compact_worklist_upper: int = 1
+        # Compact-axis tile block size (int), resolved from the config at
+        # pre_codegen; used by the worklist builder and UPPER (NOT max(block_sizes)).
+        self.compact_worklist_block: int = 1
+        # Offsets-tensor parameter names the generated _build_worklist takes, in
+        # order (set when the builder is emitted); used by the launcher to map
+        # them to host-call arg positions.
+        self.compact_worklist_offset_params: list[str] = []
         self._symint_cache: dict[object, torch.SymInt] = {}
         self._foreign_symint_cache: dict[
             tuple[int, sympy.Expr], int | torch.SymInt
@@ -658,7 +675,9 @@ class CompileEnvironment:
             # TODO(jansel): I was hoping the above would work, seems like some decomps require concrete values
             #               to determine zeroness.  Figure out a better way to do this.
 
-            shape_env_var_hints(self.shape_env)[sym._sympy_()] = sympy.Integer(hint)
+            shape_env_var_hints(self.shape_env)[_symint_sympy_symbol(sym)] = (
+                sympy.Integer(hint)
+            )
         assert isinstance(sym._sympy_(), sympy.Symbol)
         self.debug_shape_renames[sym._sympy_()] = sympy.Symbol(debug_name, integer=True)
         return sym
@@ -715,7 +734,7 @@ class CompileEnvironment:
             index: The full index list (may contain torch.Tensor or TensorType)
         """
         # Import here to avoid circular import
-        from .type_propagation import TensorType
+        from .type_info import TensorType
 
         positions = [
             i for i, k in enumerate(index) if isinstance(k, (torch.Tensor, TensorType))
@@ -783,7 +802,7 @@ class CompileEnvironment:
         specialized_shape: list[int | torch.SymInt] = []
         for dim in output_shape:
             if isinstance(dim, torch.SymInt):
-                expr = self.specialize_expr(dim._sympy_())
+                expr = self.specialize_expr(_symint_sympy_expr(dim))
                 if not expr.free_symbols:
                     with contextlib.suppress(TypeError, ValueError):
                         specialized_shape.append(int(expr))
@@ -812,7 +831,7 @@ class CompileEnvironment:
                 except NotImplementedError:
                     pass
                 else:
-                    self.shape_env.var_to_sources[sym._sympy_()] = [source]
+                    self.shape_env.var_to_sources[_symint_sympy_symbol(sym)] = [source]
                 return sym
             if isinstance(obj, float):
                 with self.shape_env.ignore_fresh_unbacked_symbols():
@@ -891,7 +910,9 @@ class CompileEnvironment:
         outer_se = s.node.shape_env
         if outer_se is self.shape_env:
             return s
+        assert outer_se is not None
         expr = s.node.expr
+        assert isinstance(expr, sympy.Expr)
         cache_key = (id(outer_se), expr)
         cached = self._foreign_symint_cache.get(cache_key)
         if cached is not None:
@@ -899,6 +920,7 @@ class CompileEnvironment:
         if free_unbacked_symbols(expr):
             result = self.create_unbacked_symint()
         else:
+            assert isinstance(expr, sympy.Symbol)
             hint = int(shape_env_var_hints(outer_se)[expr])
             new_expr = self.shape_env.create_symbol(
                 hint, source, dynamic_dim=DimDynamic.DYNAMIC
@@ -906,7 +928,6 @@ class CompileEnvironment:
             result = self.shape_env.create_symintnode(
                 new_expr, hint=hint, source=source
             )
-        # pyrefly: ignore [unsupported-operation]
         self._foreign_symint_cache[cache_key] = result
         return result
 
@@ -960,6 +981,19 @@ class CompileEnvironment:
                         f"{source.local_name}_size{i}", integer=True
                     )
         return result
+
+    def try_concretize_symint(self, size: int | torch.SymInt) -> int | torch.SymInt:
+        """Convert a SymInt to a plain int when the value is provably concrete.
+
+        Backed SymInts (whose values are determined by input shapes) are
+        concretized via their size hint.  Unbacked SymInts (e.g. block-size
+        variables) are left symbolic.
+        """
+        if not isinstance(size, torch.SymInt):
+            return size
+        if _has_unbacked(size._sympy_()):
+            return size
+        return self.size_hint(size)
 
     def size_hint(self, n: int | torch.SymInt) -> int:
         if isinstance(n, torch.SymInt):
@@ -1017,7 +1051,7 @@ class CompileEnvironment:
         """Deprecated alias for index_type()."""
         return self.index_type()
 
-    def sympy_debug(self, expr: sympy.Expr) -> str:
+    def sympy_debug(self, expr: sympy.Basic) -> str:
         return str(expr.xreplace(self.debug_shape_renames))
 
     def __enter__(self) -> Self:
@@ -1080,7 +1114,7 @@ class CompileEnvironment:
                 BlockSizeOrigin,
             ):
                 return origin_info.origin.block_id
-            if origin_info is not None and type(origin_info.origin) is GridOrigin:
+            if origin_info is not None and isinstance(origin_info.origin, GridOrigin):
                 return origin_info.origin.block_id
         return None
 
@@ -1313,7 +1347,7 @@ class BlockSizeInfo:
         expr = _symint_expr(self.var)
         if isinstance(expr, sympy.Symbol):
             return expr
-        return self.var._sympy_()
+        return _symint_sympy_symbol(self.var)
 
     def from_config(self, config: Config) -> int | torch.SymInt | None:
         value = self.block_size_source.from_config(config, self)
@@ -1409,9 +1443,33 @@ def warning(warning: exc.BaseWarning | type[exc.BaseWarning]) -> None:
         print(f"WARNING[{type(warning).__name__}]: {warning.args[0]}", file=sys.stderr)
 
 
+def _symint_sympy_expr(x: torch.SymInt) -> sympy.Expr:
+    """Narrow ``x._sympy_()`` to ``sympy.Expr``.
+
+    A ``torch.SymInt`` is always backed by a ``sympy.Expr`` at runtime.  Newer
+    torch annotates ``_sympy_()`` as returning the wider ``sympy.Basic``, so this
+    re-establishes the narrower type the rest of the compiler relies on.
+    """
+    expr = x._sympy_()
+    assert isinstance(expr, sympy.Expr)
+    return expr
+
+
+def _symint_sympy_symbol(x: torch.SymInt) -> sympy.Symbol:
+    """Narrow ``x._sympy_()`` to ``sympy.Symbol`` for sites keyed by a bare symbol."""
+    sym = x._sympy_()
+    assert isinstance(sym, sympy.Symbol)
+    return sym
+
+
+def _symint_free_symbols(x: torch.SymInt) -> set[sympy.Symbol]:
+    """Return the free symbols of ``x._sympy_()`` narrowed to ``set[sympy.Symbol]``."""
+    return {s for s in x._sympy_().free_symbols if isinstance(s, sympy.Symbol)}
+
+
 def _to_sympy(x: int | torch.SymInt | sympy.Expr) -> sympy.Expr:
     if isinstance(x, torch.SymInt):
-        return x._sympy_()
+        return _symint_sympy_expr(x)
     if isinstance(x, int):
         return sympy.Integer(x)
     if isinstance(x, sympy.Expr):
@@ -1425,11 +1483,11 @@ def _symint_expr(x: torch.SymInt) -> sympy.Expr | None:
     if isinstance(expr, sympy.Expr):
         return expr
     with contextlib.suppress(Exception):
-        return x._sympy_()
+        return _symint_sympy_expr(x)
     return None
 
 
-def _has_unbacked(expr: sympy.Expr) -> bool:
+def _has_unbacked(expr: sympy.Basic) -> bool:
     # pyrefly: ignore [missing-attribute]
     return any(n.name.startswith("u") for n in expr.free_symbols)
 

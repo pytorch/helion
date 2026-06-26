@@ -7,6 +7,7 @@ import torch
 
 from .._compat import shape_env_size_hint
 from .compile_environment import CompileEnvironment
+from .compile_environment import _symint_sympy_expr
 from .cute.layout import CuTeGridExecutionPlan
 from .device_function import DeviceFunction
 from .device_ir import ForLoopGraphInfo
@@ -180,7 +181,7 @@ class TileStrategyDispatch:
         """Get string representation of a shape"""
         # Extract sympy expression
         if isinstance(shape, torch.SymInt):
-            expr = shape._sympy_()
+            expr = _symint_sympy_expr(shape)
         elif isinstance(shape, sympy.Expr):
             expr = shape
         else:
@@ -315,7 +316,8 @@ class TileStrategyDispatch:
         grid_strategies = self.strategies[:num_grids]
 
         if num_grids <= 1:
-            return [self.strategies]
+            branched = self._branch_by_control_flow()
+            return branched if branched is not None else [self.strategies]
 
         loop_strategies = self.strategies[num_grids:]
         branches: list[list[TileStrategy]] = []
@@ -332,6 +334,67 @@ class TileStrategyDispatch:
                     branch.append(ls)
             branches.append(branch)
         return branches
+
+    def _branch_by_control_flow(self) -> list[list[TileStrategy]] | None:
+        """Split strategies into mutually-exclusive control-flow branches.
+
+        Handles the single-grid branch-by-pid pattern: a kernel whose body is
+        ``if pid == 0: ... elif pid == 1: ...`` where each branch carries its own
+        reduction (and free ``hl.arange``) over a distinct dimension. Such
+        reductions never co-execute, so they may share a CUDA thread axis instead
+        of each claiming a fresh one and blowing the per-block thread budget.
+
+        Returns ``None`` (caller falls back to the single-branch default) unless
+        at least one pair of reductions lives in mutually-exclusive branches.
+        """
+        from .device_ir import DeviceIR
+
+        if CompileEnvironment.current().backend.name != "cute":
+            return None
+        device_ir = HostFunction.current().device_ir
+        red_paths = device_ir.reduction_block_id_branch_paths()
+        if len(red_paths) < 2:
+            return None
+
+        def block_path(strategy: TileStrategy) -> list[tuple[int, int]] | None:
+            for block_id in strategy.block_ids:
+                paths = red_paths.get(block_id)
+                if paths:
+                    return paths[0]
+            return None
+
+        # Collect reduction strategies that carry a branch path.
+        branched_strategies = [s for s in self.strategies if block_path(s) is not None]
+        if len(branched_strategies) < 2:
+            return None
+        # Require at least one mutually-exclusive pair, else nothing is shared.
+        if not any(
+            DeviceIR.branch_paths_mutually_exclusive(block_path(a), block_path(b))
+            for i, a in enumerate(branched_strategies)
+            for b in branched_strategies[i + 1 :]
+        ):
+            return None
+
+        shared = [s for s in self.strategies if block_path(s) is None]
+        # Group branched strategies so that every pair within a group can
+        # co-execute (paths not mutually exclusive); distinct groups are
+        # mutually exclusive and become separate branches that share axes.
+        groups: list[list[TileStrategy]] = []
+        for candidate in branched_strategies:
+            placed = False
+            for group in groups:
+                if all(
+                    not DeviceIR.branch_paths_mutually_exclusive(
+                        block_path(candidate), block_path(member)
+                    )
+                    for member in group
+                ):
+                    group.append(candidate)
+                    placed = True
+                    break
+            if not placed:
+                groups.append([candidate])
+        return [[*shared, *group] for group in groups]
 
     def thread_axis_for_strategy(self, target: TileStrategy) -> int | None:
         """Return the starting thread-axis index for a strategy in its branch.
@@ -575,6 +638,83 @@ class TileStrategyDispatch:
             parts.append(f"[{', '.join(index_parts)}]")
 
         return "".join(parts)
+
+    def broadcast_expand_dims(
+        self,
+        input_shape: ShapeLike,
+        output_shape: ShapeLike,
+    ) -> list[str]:
+        """Return subscript list to broadcast input_shape into output_shape.
+
+        Examples:
+            (bid=0,)    -> (bid=0, bid=1)    => [":", "None"]
+            (bid=1,)    -> (bid=0, bid=1)    => ["None", ":"]
+            (bid=0, K)  -> (bid=0, bid=1, K) => [":", "None", ":"]
+        """
+        if not self.supports_index_rank_expansion():
+            return []
+        if len(input_shape) == 0 or len(input_shape) == len(output_shape):
+            return []
+
+        env = CompileEnvironment.current()
+        src_compacted = self._compact_shape(input_shape)
+        dst_compacted = self._compact_shape(output_shape)
+
+        # Map each source compacted dim to a destination compacted dim.
+        src_to_dst: list[int] = []
+        used_dst: set[int] = set()
+        for src_dim in src_compacted:
+            match: int | None = None
+            src_bids = [env.canonical_block_id(bid) for bid in src_dim.block_ids]
+            if src_bids:
+                # Tile dim: match by canonical block_id
+                for dst_i, dst_dim in enumerate(dst_compacted):
+                    if dst_i in used_dst:
+                        continue
+                    dst_bids = [
+                        env.canonical_block_id(bid) for bid in dst_dim.block_ids
+                    ]
+                    if src_bids == dst_bids:
+                        match = dst_i
+                        break
+            else:
+                # Non-tile dim: match by size using known_equal on the
+                # original (non-compacted) shape elements.
+                for dst_i, dst_dim in enumerate(dst_compacted):
+                    if dst_i in used_dst:
+                        continue
+                    if dst_dim.block_ids:
+                        continue
+                    if len(src_dim.user_indices) == len(dst_dim.user_indices):
+                        if all(
+                            env.known_equal(input_shape[si], output_shape[di])
+                            for si, di in zip(
+                                src_dim.user_indices,
+                                dst_dim.user_indices,
+                                strict=True,
+                            )
+                        ):
+                            match = dst_i
+                            break
+            if match is None:
+                # Fallback: right-align unmatched non-tile dims
+                for dst_i in range(len(dst_compacted) - 1, -1, -1):
+                    if dst_i not in used_dst:
+                        match = dst_i
+                        break
+            assert match is not None, (
+                f"Cannot map input dim (block_ids={src_dim.block_ids}, "
+                f"size={src_dim.size_str}) into output shape {output_shape} "
+                f"from input shape {input_shape}"
+            )
+            src_to_dst.append(match)
+            used_dst.add(match)
+
+        keep = set(src_to_dst)
+        result = [":" if i in keep else "None" for i in range(len(dst_compacted))]
+        if all(r == ":" for r in result):
+            return []
+        return result
 
     def expand_dims_str(self, shape: ShapeLike, start_idx: int, num_dims: int) -> str:
         """Generate expansion string for multi-dimensional tensor indexers.

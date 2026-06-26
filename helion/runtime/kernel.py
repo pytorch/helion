@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import ast
-import base64
 import contextlib
 import dataclasses
 import functools
@@ -12,10 +11,10 @@ import operator
 import os
 import re
 import sys
-import tempfile
 import textwrap
 import types
 from typing import TYPE_CHECKING
+from typing import Any
 from typing import Callable
 from typing import Generic
 from typing import Hashable
@@ -42,9 +41,9 @@ from .._compat import target_device_capability
 from .._compile_time import measure
 from .._compiler.ast_extension import unparse
 from .._compiler.autotuner_heuristics import compiler_seed_configs
-from .._compiler.backend import TritonBackend
 from .._compiler.compile_environment import CompileEnvironment
 from .._compiler.compile_environment import TensorDescriptorLayoutGuard
+from .._compiler.compile_environment import _symint_free_symbols
 from .._compiler.compile_environment import (
     tensor_descriptor_layout_signature_from_strides,
 )
@@ -65,7 +64,6 @@ from .ref_mode import is_ref_mode_enabled
 from .settings import Settings
 
 if TYPE_CHECKING:
-    from collections.abc import Generator
     from collections.abc import Hashable
     from collections.abc import Sequence
 
@@ -102,6 +100,10 @@ def _td_layout_guard_active_for_config(
 
 _R = TypeVar("_R")
 CompiledConfig = Callable[..., _R]
+
+# Opt-in: auto-capture Pallas kernels under torch.compile (see _tpu_compile_capture).
+# Off by default so the eager dispatch path is unchanged.
+_TPU_COMPILE_CAPTURE = os.environ.get("HELION_TPU_COMPILE_CAPTURE", "0") == "1"
 
 # Cache for GraphModule hashes
 _graph_module_hash_cache: WeakIdKeyDictionary = WeakIdKeyDictionary()
@@ -228,6 +230,26 @@ class Kernel(Generic[_R]):
         self.__defaults__ = fn.__defaults__
         self.__kwdefaults__ = fn.__kwdefaults__
 
+        # Opt-in: register the torch.compile(backend="tpu") capture op now, so an
+        # annotated/functional/benchmark-free Pallas kernel is captured with zero
+        # warm-up (like a hand-written custom_op). None if it must use first-call
+        # registration (unannotated, mutating, or autotuning among configs=[...]).
+        self._capture_op: Callable[..., Any] | None = None
+        if self.settings.backend == "pallas" and _TPU_COMPILE_CAPTURE:
+            from ._tpu_compile_capture import register_decoration_op
+
+            self._capture_op = register_decoration_op(self)
+
+    @functools.cache  # noqa: B019
+    def kernel_source(self) -> str:
+        """
+        Return the kernel's source text.
+
+        This is the stable identifier across processes/runs, suitable for
+        grouping telemetry rows by kernel during analysis.
+        """
+        return inspect.getsource(self.fn)
+
     def _get_bound_kernel_cache_key(
         self, args: tuple[object, ...], signature: tuple[Hashable, ...]
     ) -> BoundKernelInMemoryCacheKey | None:
@@ -348,6 +370,12 @@ class Kernel(Generic[_R]):
             if isinstance(obj, torch.fx.GraphModule):
                 # GraphModule subclasses need special handling
                 extractor = _specialization_extractors[torch.fx.GraphModule]
+            elif isinstance(obj, torch.Tensor):
+                # torch.Tensor subclasses (e.g. the JAX-export adapter)
+                # share the standard tensor specialization key. Use the
+                # SymInt-safe extractor: unlike exact ``torch.Tensor``,
+                # subclasses may carry symbolic sizes/strides.
+                extractor = _specialization_extractors["tensor_subclass"]
             elif isinstance(obj, tuple) and hasattr(obj, "_fields"):
                 # this is a namedtuple
                 extractor = _specialization_extractors["namedtuple"]
@@ -412,6 +440,15 @@ class Kernel(Generic[_R]):
         """
         if kwargs:
             args = self.normalize_args(*args, **kwargs)
+        if self.settings.backend == "pallas" and _TPU_COMPILE_CAPTURE:
+            # Local import: _tpu_compile_capture pulls in the dynamo HOP machinery,
+            # not ready when kernel.py first loads during ``import helion``.
+            from ._tpu_compile_capture import RUN_NORMAL
+            from ._tpu_compile_capture import auto_capture_call
+
+            result = auto_capture_call(self, args)
+            if result is not RUN_NORMAL:
+                return cast("_R", result)
         return self.bind(args)(*args)
 
     def reset(self) -> None:
@@ -420,6 +457,28 @@ class Kernel(Generic[_R]):
         recompile and re-autotune.
         """
         self._bound_kernels.clear()
+
+    @property
+    def jax_fn(self) -> Callable[..., Any]:
+        """A pure-JAX callable view of this Helion kernel.
+
+        Pallas-backend kernels can be called directly with JAX arrays
+        or tracers (i.e. inside ``jax.jit``) by going through this
+        property.  The kernel's compile/specialize path runs the first
+        time the callable is invoked; subsequent calls reuse the
+        cached compilation just like ``__call__``.
+
+        This only supports kernels compiled for the Pallas backend.
+        """
+        from .pallas_jax_export import make_jax_fn
+
+        cached = getattr(self, "_jax_fn_callable", None)
+        if cached is not None:
+            return cast("Callable[..., Any]", cached)
+        rv = make_jax_fn(self)
+        # pyrefly: ignore [unsupported-attribute-set]
+        self._jax_fn_callable = rv
+        return rv
 
 
 class BoundKernel(_AutotunableKernel, Generic[_R]):
@@ -506,7 +565,8 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
 
                 self.env.config_spec.configure_epilogue_subtile_autotune(args)
                 self.env.config_spec.compiler_seed_configs = compiler_seed_configs(
-                    self.env, self.host_function.device_ir
+                    self.env,
+                    self.host_function.device_ir,
                 )
 
                 # Post-compile FX-graph scan to detect kernels
@@ -532,19 +592,10 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
                     host_function_has_tcgen05_aux_kernel_pattern,
                 )
                 from .._compiler.cute.aux_tensor import (
-                    host_function_has_tcgen05_bias_matmul_store_pattern,
-                )
-                from .._compiler.cute.aux_tensor import (
-                    host_function_has_tcgen05_bias_relu_matmul_store_pattern,
-                )
-                from .._compiler.cute.aux_tensor import (
                     host_function_has_tcgen05_exact_shape_aux_kernel_pattern,
                 )
                 from .._compiler.cute.aux_tensor import (
-                    host_function_has_tcgen05_identity_matmul_store_pattern,
-                )
-                from .._compiler.cute.aux_tensor import (
-                    host_function_has_tcgen05_relu_matmul_store_pattern,
+                    host_function_matmul_has_non_tcgen05_operand,
                 )
 
                 self.env.config_spec.cute_tcgen05_aux_kernel_detected = (
@@ -555,67 +606,9 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
                         self.host_function
                     )
                 )
-                self.env.config_spec.cute_tcgen05_identity_matmul_store_detected = (
-                    host_function_has_tcgen05_identity_matmul_store_pattern(
-                        self.host_function
-                    )
+                self.env.config_spec.cute_tcgen05_matmul_has_non_tcgen05_operand = (
+                    host_function_matmul_has_non_tcgen05_operand(self.host_function)
                 )
-                self.env.config_spec.cute_tcgen05_relu_matmul_store_detected = (
-                    host_function_has_tcgen05_relu_matmul_store_pattern(
-                        self.host_function
-                    )
-                )
-                self.env.config_spec.cute_tcgen05_bias_matmul_store_detected = (
-                    host_function_has_tcgen05_bias_matmul_store_pattern(
-                        self.host_function
-                    )
-                )
-                self.env.config_spec.cute_tcgen05_bias_relu_matmul_store_detected = (
-                    host_function_has_tcgen05_bias_relu_matmul_store_pattern(
-                        self.host_function
-                    )
-                )
-                if self.env.config_spec.cute_tcgen05_identity_matmul_store_detected:
-                    # T1, T3, T5, and T7 all gate on identity-store
-                    # detection and write into the same cluster_m=2
-                    # search constraints + pid_type allowlist. Mutual
-                    # exclusion is via shape facts (T1 = 1024x4096x1024,
-                    # T3 = 2048x4096x2048, T5 = 1024x8192x1024,
-                    # T7 = 2048x8192x2048) so at most one seed is
-                    # non-``None`` per host function; the values
-                    # written here must stay equal across the four
-                    # ``allow_target{1,3,5,7}_tvm_ffi_seed`` paths.
-                    self.env.config_spec.allow_tcgen05_target1_tvm_ffi_seed()
-                    self.env.config_spec.allow_tcgen05_target3_tvm_ffi_seed()
-                    self.env.config_spec.allow_tcgen05_target5_tvm_ffi_seed()
-                    self.env.config_spec.allow_tcgen05_target7_tvm_ffi_seed()
-                if self.env.config_spec.cute_tcgen05_relu_matmul_store_detected:
-                    self.env.config_spec.allow_tcgen05_target4_tvm_ffi_seed()
-                if self.env.config_spec.cute_tcgen05_bias_matmul_store_detected:
-                    # T2 gates on the bias-store detection (rank-1
-                    # trailing-axis ``acc + bias[n]``) and writes into the
-                    # same cluster_m=2 search constraints + pid_type
-                    # allowlist used by the T1/T3/T5 identity-store and
-                    # T4 relu-store seeds. The bias-store detector is
-                    # mutually exclusive with both identity and relu
-                    # store walkers (rejected by the chain shape), and
-                    # T2's shape gate (4096x2048x2048) keeps it
-                    # mutually exclusive on the matmul fact.
-                    self.env.config_spec.allow_tcgen05_target2_tvm_ffi_seed()
-                if self.env.config_spec.cute_tcgen05_bias_relu_matmul_store_detected:
-                    # T6 gates on the bias-relu-store detection
-                    # (``relu(acc + bias[n])``) and writes into the
-                    # same cluster_m=2 search constraints + pid_type
-                    # allowlist used by the T1/T3/T5 identity-store,
-                    # T4 relu-store, and T2 bias-store seeds. The
-                    # bias-relu-store detector is mutually exclusive
-                    # with identity (no binary op), relu (no add), and
-                    # bias (no relu) walkers via the chain shape, and
-                    # T6's shape gate (8192x2048x2048) keeps it
-                    # mutually exclusive on the matmul fact (T2 shares
-                    # bias but has a different shape; T4 shares relu
-                    # but a different shape and no bias).
-                    self.env.config_spec.allow_tcgen05_target6_tvm_ffi_seed()
                 if not self.env.settings.disable_autotuner_heuristics:
                     for seed_config in self.env.config_spec.autotune_seed_configs():
                         if (
@@ -638,10 +631,10 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
                 for dim in getattr(arg, "_dynamo_static_indices", ()):
                     size = fake_arg.size(dim)
                     if isinstance(size, torch.SymInt):
-                        self.env.specialized_vars.update(size._sympy_().free_symbols)
+                        self.env.specialized_vars.update(_symint_free_symbols(size))
 
     @property
-    def env(self) -> CompileEnvironment:
+    def env(self) -> CompileEnvironment:  # pyrefly: ignore[bad-override]
         return self._env
 
     @property
@@ -776,24 +769,19 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
         )
         if (rv := self._compile_cache.get(config)) is not None:
             return rv
-        if (
-            isinstance(self.env.backend, TritonBackend)
-            and "TRITON_CACHE_DIR" not in os.environ
-        ):
-            from ..autotuner.local_cache import helion_triton_cache_dir
-
-            device_index = (
-                self._env.device.index if self._env.device.index is not None else 0
-            )
-            triton_dir = helion_triton_cache_dir(device_index)
-            os.environ["TRITON_CACHE_DIR"] = triton_dir
-            log.debug("Set TRITON_CACHE_DIR=%s", triton_dir)
+        device_index = (
+            self._env.device.index if self._env.device.index is not None else 0
+        )
+        self.env.backend.setup_compile_cache_dir(device_index)
         try:
             triton_code = self.to_triton_code(
                 config, emit_repro_caller=self.settings.print_output_code
             )
             with measure("BoundKernel.PyCodeCache.load"):
                 module = PyCodeCache.load(triton_code)
+            self.env.backend.annotate_compiled_module(
+                module, triton_code, self.kernel.name
+            )
         except Exception:
             log.warning(
                 "Helion compiler triton codegen error for %s",
@@ -867,50 +855,6 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
         with self.env:
             return self.host_function.debug_str()
 
-    @contextlib.contextmanager
-    def _ephemeral_triton_cache(
-        self,
-    ) -> Generator[None, None, None]:
-        """Redirect Triton cache to a temporary dir during autotuning.
-
-        All candidate compilations write to an ephemeral directory that is
-        deleted on exit.  The winning config is recompiled afterward into the
-        real cache by the caller.
-        """
-        saved = os.environ.get("TRITON_CACHE_DIR")
-        with tempfile.TemporaryDirectory(prefix="helion_autotune_") as ephemeral:
-            os.environ["TRITON_CACHE_DIR"] = ephemeral
-            log.debug("Ephemeral Triton cache: %s", ephemeral)
-            try:
-                yield
-            finally:
-                if saved is not None:
-                    os.environ["TRITON_CACHE_DIR"] = saved
-                else:
-                    os.environ.pop("TRITON_CACHE_DIR", None)
-
-    def _clear_triton_jit_cache(self, config: Config) -> None:
-        """Clear Triton's in-memory JIT cache for the compiled kernel.
-
-        After autotuning in an ephemeral cache dir, device_caches on the
-        JITFunction still holds the compiled binary.  Clearing it forces
-        Triton to recompile (and write to TRITON_CACHE_DIR) on the next call.
-
-        If the config was minimized by the autotuner, the lookup is retried
-        with the full config (defaults merged back in).
-        """
-        compiled_fn = self._compile_cache.get(config)
-        if compiled_fn is None:
-            default = self.config_spec.default_config()
-            # pyrefly: ignore [bad-argument-type]
-            full_config = Config(**(default.config | config.config))
-            compiled_fn = self._compile_cache.get(full_config)
-        if compiled_fn is None:
-            return
-        triton_jit_fn = compiled_fn.__globals__.get(f"_helion_{self.kernel.name}")
-        if triton_jit_fn is not None and hasattr(triton_jit_fn, "device_caches"):
-            triton_jit_fn.device_caches.clear()
-
     def autotune(
         self,
         args: Sequence[object],
@@ -935,26 +879,12 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
         Returns:
             Config: The best configuration found during autotuning.
         """
-        use_ephemeral = (
-            isinstance(self.env.backend, TritonBackend)
-            and os.environ.get("HELION_KEEP_TRITON_CACHE", "") != "1"
-        )
-        ctx = (
-            self._ephemeral_triton_cache()
-            if use_ephemeral
-            else contextlib.nullcontext()
-        )
+        ephemeral = self.env.backend.make_ephemeral_cache()
+        ctx = ephemeral if ephemeral is not None else contextlib.nullcontext()
         with ctx:
             config = self.env.backend.autotune(self, args, force=force, **kwargs)
-        if use_ephemeral:
-            self._clear_triton_jit_cache(config)
-            evict = config
-            if self._compile_cache.pop(evict, None) is None:
-                default = self.config_spec.default_config()
-                # pyrefly: ignore [bad-argument-type]
-                evict = Config(**(default.config | config.config))
-                self._compile_cache.pop(evict, None)
-            self._cache_path_map.pop(evict, None)
+        if ephemeral is not None:
+            self.env.backend.finalize_ephemeral_cache(self, config)
         self.set_config(config)
         return config
 
@@ -1109,7 +1039,7 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
             if not is_ref_mode_enabled(self.kernel.settings):
                 kernel_decorator = self.format_kernel_decorator(config, self.settings)
                 print(
-                    f"Using default config:\n\t{kernel_decorator}",
+                    f"Using implicit config: {kernel_decorator}",
                     file=sys.stderr,
                 )
             return config
@@ -1193,7 +1123,9 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
 
         For the Triton backend, this is the base32 encoding of the SHA-256
         hash that Triton uses to cache compiled GPU binaries under
-        ``TRITON_CACHE_DIR/<key>/``.
+        ``TRITON_CACHE_DIR/<key>/``.  For the CuTe backend, it is the base32
+        encoding of the SHA-256 hash of the compiled IR module, which names the
+        ``CUTE_DSL_CACHE_DIR/<key>.mlir`` artifact.
 
         Args:
             config: The configuration to look up. Defaults to the implicit config.
@@ -1202,34 +1134,13 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
             str | None: The cache key, or None if the kernel hasn't been
             JIT-compiled yet or the backend doesn't support cache keys.
         """
-        if not isinstance(self.env.backend, TritonBackend):
-            return None
-
         if config is None:
             config = self._require_implicit_config()
         config = self._normalize_config(config)
         compiled_fn = self._compile_cache.get(config)
         if compiled_fn is None:
             return None
-
-        # Get the jit_fn that - for helion - starts with _helion_
-        triton_jit_fn = compiled_fn.__globals__.get(f"_helion_{self.kernel.name}")
-        if triton_jit_fn is None:
-            return None
-
-        try:
-            for cache_tuple in triton_jit_fn.device_caches.values():
-                compiled_kernels = cache_tuple[0]
-                for compiled_kernel in compiled_kernels.values():
-                    h = getattr(compiled_kernel, "hash", None)
-                    if h is not None:
-                        return base64.b32encode(bytes.fromhex(h)).decode().rstrip("=")
-        except (AttributeError, IndexError, TypeError, ValueError):
-            # device_caches, cache-tuple layout, and CompiledKernel.hash are
-            # Triton-internal details that may change across Triton versions
-            # return None gracefully if this fails
-            return None
-        return None
+        return self.env.backend.compiled_cache_key(self, compiled_fn)
 
     def maybe_log_repro(
         self,
@@ -1449,6 +1360,36 @@ def _hashable_dims(dims: Sequence[int | torch.SymInt]) -> tuple[Hashable, ...]:
     return tuple(_hashable_dim(s) for s in dims)
 
 
+def _concrete_tensor_key(fn: Kernel, obj: torch.Tensor) -> Hashable:
+    # Fast extractor for plain ``torch.Tensor`` / ``torch.nn.Parameter``:
+    # exact-type dispatch guarantees concrete int sizes/strides, so
+    # ``torch.Size`` and the stride tuple can be used directly (both are
+    # tuple subclasses that hash/compare identically to plain int tuples).
+    # The ``_hashable_dims`` wrap in ``_tensor_key`` exists only to
+    # normalize SymInts, which appear on FakeTensors during tracing.
+    si = getattr(obj, "_dynamo_static_indices", None)
+    static_indices = frozenset(si) if si is not None else _EMPTY_FROZENSET
+    if fn.settings.static_shapes:
+        return (obj.dtype, obj.size(), obj.stride(), static_indices)
+    bucketed = _bucketed_size(obj)
+    if fn.settings.index_dtype is None:
+        try:
+            needs_int64 = bool(obj.numel() > _INT32_INDEX_LIMIT)
+        except RuntimeError:
+            needs_int64 = True  # unbacked SymInt
+        return (
+            obj.dtype,
+            bucketed,
+            needs_int64,
+            static_indices,
+        )
+    return (
+        obj.dtype,
+        bucketed,
+        static_indices,
+    )
+
+
 def _tensor_key(fn: Kernel, obj: torch.Tensor) -> Hashable:
     si = getattr(obj, "_dynamo_static_indices", None)
     static_indices = frozenset(si) if si is not None else _EMPTY_FROZENSET
@@ -1525,12 +1466,21 @@ def _graph_module_key(fn: Kernel, obj: torch.fx.GraphModule) -> Hashable:
 
 
 _specialization_extractors: dict[
-    type[object] | str, Callable[[Kernel, object], Hashable]
+    type[object] | str,
+    Callable[[Kernel, object], Hashable],
     # pyrefly: ignore [bad-assignment]
 ] = {
-    torch.Tensor: _tensor_key,
-    torch.nn.Parameter: _tensor_key,
+    # Exact-type dispatch (see ``_specialization_key``): plain tensors and
+    # Parameters always have concrete int sizes/strides and take the fast
+    # extractor. Subclasses (FakeTensor below, or anything hitting the
+    # ``isinstance`` fallback) go through SymInt-safe ``_tensor_key``.
+    torch.Tensor: _concrete_tensor_key,
+    torch.nn.Parameter: _concrete_tensor_key,
     FakeTensor: _tensor_key,
+    # SymInt-safe extractor for torch.Tensor subclasses reached via the
+    # isinstance fallback in ``_specialization_key`` (string key so the
+    # fallback stays loosely typed, like "namedtuple" / "dataclass").
+    "tensor_subclass": _tensor_key,
     torch.dtype: lambda fn, x: x,
     torch.device: lambda fn, x: x,
     int: _number_key,
@@ -1569,6 +1519,8 @@ def _find_device(args: tuple[object, ...]) -> torch.device:
             return arg
         if isinstance(arg, torch.Tensor):
             return arg.device
+        if isinstance(arg, ConstExpr):
+            continue  # a constexpr-wrapped value carries no device; skip it
         if isinstance(arg, (tuple, list)):
             for item in arg:
                 try:

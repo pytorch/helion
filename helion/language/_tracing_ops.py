@@ -17,6 +17,7 @@ from .._compiler.ast_extension import create
 from .._compiler.ast_extension import expr_from_string
 from .._compiler.ast_extension import statement_from_string
 from .._compiler.compile_environment import CompileEnvironment
+from .._compiler.compile_environment import _symint_sympy_expr
 from .._compiler.dtype_utils import cast_ast
 from .._compiler.host_function import HostFunction
 from .._compiler.variable_origin import BlockSizeOrigin
@@ -47,6 +48,19 @@ def is_for_loop_target(target: object) -> bool:
     return target in (_for_loop, _for_loop_step)
 
 
+def _val_to_sympy(val: torch.SymInt | torch.SymFloat | torch.SymBool) -> sympy.Expr:
+    """Resolve a sym value to its sympy expression, preferring the cached node expr.
+
+    A ``SymBool`` resolves to a sympy boolean rather than an ``Expr``; that case is
+    not expected on the symnode codegen paths below but is accepted by the type.
+    """
+    sym_expr = getattr(getattr(val, "node", None), "_expr", None)
+    if isinstance(sym_expr, sympy.Expr):
+        return sym_expr
+    # pyrefly: ignore [bad-return]
+    return val._sympy_()
+
+
 @_decorators.api()
 def _get_symnode(debug_name: str) -> int:
     """FX requires a torch.SymInt to come from an op. This is a fake op is added lazily to work around this."""
@@ -63,9 +77,7 @@ def _(state: CodegenState) -> ast.AST:
         return expr_from_string(str(val))
 
     assert isinstance(val, (torch.SymInt, torch.SymFloat, torch.SymBool)), val
-    sym_expr = getattr(getattr(val, "node", None), "_expr", None)
-    if not isinstance(sym_expr, sympy.Expr):
-        sym_expr = val._sympy_()
+    sym_expr = _val_to_sympy(val)
     origin_info = HostFunction.current().expr_to_origin.get(sym_expr)
 
     if origin_info is not None and isinstance(origin_info.origin, BlockSizeOrigin):
@@ -91,9 +103,7 @@ def _(state: CodegenState) -> ast.AST:
         return expr_from_string(str(val))
 
     assert isinstance(val, (torch.SymInt, torch.SymFloat, torch.SymBool)), val
-    sym_expr = getattr(getattr(val, "node", None), "_expr", None)
-    if not isinstance(sym_expr, sympy.Expr):
-        sym_expr = val._sympy_()
+    sym_expr = _val_to_sympy(val)
     origin_info = HostFunction.current().expr_to_origin.get(sym_expr)
     if origin_info is not None and isinstance(origin_info.origin, BlockSizeOrigin):
         block_size_var = state.device_function.block_size_var(
@@ -243,6 +253,15 @@ def _(state: CodegenState) -> object:
         return _codegen_emit_pipeline(state)
     if pallas_loop_type == "fori_loop":
         return _codegen_fori_loop(state)
+    if pallas_loop_type == "compact_worklist":
+        # The compact tile becomes the grid (no loop).  The ordered inner tile
+        # (fully jagged carried reduction) lowers via emit_pipeline for
+        # pl.Buffered double-buffering; the single-iteration compact tile lowers
+        # through the fori path.  Both have begin/end remapped to metadata refs
+        # (see _compact_worklist_bounds).
+        if _is_compact_ordered_inner_loop(state):
+            return _codegen_emit_pipeline(state)
+        return _codegen_fori_loop(state)
     # unroll: fall through to common codegen path
     # pyrefly: ignore[bad-return]
     return state.get_graph(state.proxy_arg(0)).codegen(state)
@@ -256,7 +275,16 @@ def _(state: CodegenState) -> None:
     if pallas_loop_type == "emit_pipeline":
         _codegen_emit_pipeline(state)
         return None
-    if pallas_loop_type == "fori_loop":
+    if pallas_loop_type in ("fori_loop", "compact_worklist"):
+        # Route compact_worklist through the same lowering as _for_loop so the
+        # compact metadata (begin/end remap, synthetic compact tile) is applied
+        # rather than falling through to the common (non-compact) codegen.  The
+        # ordered inner tile uses emit_pipeline for double-buffering.
+        if pallas_loop_type == "compact_worklist" and _is_compact_ordered_inner_loop(
+            state
+        ):
+            _codegen_emit_pipeline(state)
+            return None
         _codegen_fori_loop(state)
         return None
     # pyrefly: ignore[bad-return]
@@ -355,10 +383,90 @@ def _find_strategy(
     return strategy
 
 
+def _compact_axis_kind(state: CodegenState, loop_dim_index: int) -> str | None:
+    """Classify a loop dim under ``compact_worklist`` as the compact tile, the
+    ordered inner (carried) tile, or neither.
+
+    Single source of truth shared by the loop-type dispatch
+    (:func:`_is_compact_ordered_inner_loop`) and the begin/end remap
+    (:func:`_compact_worklist_bounds`), so the two can never disagree on which
+    axis a loop is.
+    """
+    env = CompileEnvironment.current()
+    plan = env.compact_worklist_plan
+    if plan is None:
+        return None
+    from .._compiler.device_ir import ForLoopGraphInfo
+
+    graph_info = state.get_graph(state.proxy_arg(0))
+    if not isinstance(graph_info, ForLoopGraphInfo):
+        return None
+    block_ids = graph_info.block_ids
+    if loop_dim_index >= len(block_ids):
+        return None
+    block_id = block_ids[loop_dim_index]
+    if block_id == plan.compact_axis.block_id:
+        return "compact"
+    ordered = plan.ordered_axis
+    if ordered is not None and block_id == ordered.block_id:
+        return "ordered"
+    return None
+
+
+def _is_compact_ordered_inner_loop(state: CodegenState) -> bool:
+    """True if this ``_for_loop`` is the compact-worklist ordered inner tile.
+
+    The ordered tile is the carried inner reduction (e.g. the KV loop in fully
+    jagged attention); it is the only compact-worklist loop routed to
+    ``_codegen_emit_pipeline`` (for ``pl.Buffered`` double-buffering).  The owner
+    grid and the single-iteration compact tile stay on the fori path.
+    """
+    from .._compiler.device_ir import ForLoopGraphInfo
+
+    graph_info = state.get_graph(state.proxy_arg(0))
+    if not isinstance(graph_info, ForLoopGraphInfo):
+        return False
+    return any(
+        _compact_axis_kind(state, i) == "ordered"
+        for i in range(len(graph_info.block_ids))
+    )
+
+
+def _compact_worklist_bounds(
+    state: CodegenState, loop_dim_index: int
+) -> tuple[str, str] | None:
+    """Metadata-ref begin/end for a compact/ordered tile, else None."""
+    kind = _compact_axis_kind(state, loop_dim_index)
+    if kind is None:
+        return None
+    from .._compiler.pallas.compact_worklist import compact_ref_names
+    from .._compiler.pallas.compact_worklist import ordered_ref_names
+
+    plan = CompileEnvironment.current().compact_worklist_plan
+    assert plan is not None
+    ref_names = compact_ref_names if kind == "compact" else ordered_ref_names
+    begin_ref, extent_ref = (f"{n}_ref" for n in ref_names(plan))
+    return f"{begin_ref}[_wid]", f"{begin_ref}[_wid] + {extent_ref}[_wid]"
+
+
 def _get_loop_begin_and_end(
     state: CodegenState, loop_dim_index: int
 ) -> tuple[str, str]:
-    """Extract the begin and end values from the _for_loop state args."""
+    """Extract the begin and end values from the _for_loop state args.
+
+    Under ``compact_worklist`` the compact tile's begin/end are remapped to the
+    per-work-item metadata refs: begin =
+    ``tile_starts_ref[_wid]``, end =
+    ``tile_starts_ref[_wid] + tile_extents_ref[_wid]`` (and likewise the ordered
+    axis -> ``range_start_ref``/``range_len_ref``).  Every downstream consumer
+    (trip count, offset, masks) then composes unchanged: ``_codegen_fori_loop``
+    runs a single iteration for the compact tile (``tile_extent <= BLOCK``),
+    while the ordered axis -- lowered via ``_codegen_emit_pipeline`` -- uses the
+    same remapped bounds for its pipeline grid and per-iteration offsets.
+    """
+    remap = _compact_worklist_bounds(state, loop_dim_index)
+    if remap is not None:
+        return remap
     ast_begins = state.ast_args[1]
     ast_ends = state.ast_args[2]
     begins = list(ast_begins) if isinstance(ast_begins, (list, tuple)) else [ast_begins]
@@ -377,12 +485,29 @@ def _get_loop_numel(state: CodegenState, loop_dim_index: int) -> str:
     return f"(({end}) - ({begin}))"
 
 
+def _is_static_int(expr: str) -> bool:
+    """True if a begin/end expression string is a compile-time integer constant.
+
+    Used to decide whether a tile loop's ``[begin, end)`` extent is statically
+    known. When it is not (data-dependent bounds — a jagged ``hl.tile(start,
+    end)`` or even ``hl.tile(0, dynamic_end)``), the final tile may be a partial
+    sub-range of the backing tensor, so an output store must clamp its extent.
+    """
+    try:
+        int(expr)
+    except (TypeError, ValueError):
+        return False
+    return True
+
+
 def _compute_grid_and_block_sizes(
     state: CodegenState,
     block_ids: list[int],
     env: CompileEnvironment,
+    aligned_dim: dict[int, int] | None = None,
 ) -> tuple[list[str], list[str]]:
     """Compute grid dimensions and block size vars for the given block_ids."""
+    aligned_dim = aligned_dim or {}
     grid_parts: list[str] = []
     block_size_vars: list[str] = []
     for i, block_id in enumerate(block_ids):
@@ -392,7 +517,15 @@ def _compute_grid_and_block_sizes(
         block_value = state.device_function.resolved_block_size(block_id)
         if block_value is not None:
             state.device_function.constexpr_arg(block_size_var, block_value)
-        numel_expr = _get_loop_numel(state, i)
+        if block_id in aligned_dim:
+            # Aligned-enclosing span: ceil(end/S)*S - floor(begin/S)*S.
+            begin, end = _get_loop_begin_and_end(state, i)
+            sublane = aligned_dim[block_id]
+            a_start = f"(({begin}) - ({begin}) % {sublane})"
+            a_end = f"((({end}) + {sublane} - 1) // {sublane} * {sublane})"
+            numel_expr = f"({a_end} - {a_start})"
+        else:
+            numel_expr = _get_loop_numel(state, i)
         grid_parts.append(
             env.backend.cdiv_expr(numel_expr, block_size_var, is_device=True)
         )
@@ -403,8 +536,10 @@ def _pallas_loop_begin_and_step_exprs(
     state: CodegenState,
     block_ids: list[int],
     block_size_vars: list[str],
+    aligned_dim: dict[int, int] | None = None,
 ) -> tuple[list[str], list[str], list[str]]:
     """Return begin, per-iteration step, and slice-size expressions for loop dims."""
+    aligned_dim = aligned_dim or {}
     steps = state.proxy_arg(4) if len(state.proxy_args) > 4 else None
 
     if not isinstance(steps, (list, tuple)):
@@ -417,6 +552,10 @@ def _pallas_loop_begin_and_step_exprs(
     for i in range(len(block_ids)):
         step = steps[i]
         begin_expr, _ = _get_loop_begin_and_end(state, i)
+        if block_ids[i] in aligned_dim:
+            # Align the tile begin DOWN to the sublane (aligned-enclosing).
+            sublane = aligned_dim[block_ids[i]]
+            begin_expr = f"(({begin_expr}) - ({begin_expr}) % {sublane})"
         if step is None or sympy.sympify(step) in (
             sympy.Integer(0),
             sympy.Integer(1),
@@ -433,6 +572,31 @@ def _pallas_loop_begin_and_step_exprs(
     return begin_exprs, iter_step_exprs, slice_size_exprs
 
 
+def _pipeline_begin_alignment(
+    begin_expr: str,
+    state: CodegenState,
+) -> int | None:
+    """Return a proven divisor of ``begin_expr``, or ``None``.
+
+    A nested-tile inner loop's begin is its outer loop's ``offset_var``, which is
+    a multiple of the outer block size when that outer loop begins at 0 — so it
+    needs no extra pad. Returns that block size in that case.
+    """
+    for block_id, loops in state.codegen.active_device_loops.items():
+        if not loops:
+            continue
+        if state.codegen.offset_var(block_id) != begin_expr:
+            continue
+        info = loops[-1].block_id_to_info.get(block_id)
+        # Only sound when the outer loop begins at 0, so the offset is a clean
+        # multiple of the outer block size.
+        if info is None or info.begin_expr not in (0, sympy.Integer(0)):
+            return None
+        outer_bs = state.device_function.resolved_block_size(block_id)
+        return outer_bs if isinstance(outer_bs, int) else None
+    return None
+
+
 def _compute_pipeline_or_dma_extra_pad(
     begin_expr: str,
     bid: int,
@@ -444,17 +608,19 @@ def _compute_pipeline_or_dma_extra_pad(
     When ``pl.ds(offset, block_size)`` reads from a tensor whose loop starts
     at a non-zero begin, the last block can overshoot the tensor boundary
     beyond what ``(-shape) % block_size`` accounts for.  The worst case is
-    ``block_size - 1`` extra elements when the begin is data-dependent.
-
-    # TODO(dunfanlu): if begin isn't "0" but is another constexpr int,
-    # we should be able to use a smaller padding than bs-1?
+    ``block_size - 1`` extra elements when the begin is data-dependent, but a
+    begin that is provably a multiple of ``block_size`` (e.g. an outer tile's
+    aligned offset) needs no extra padding at all.
     """
     if begin_expr == "0":
         return 0
     bs_val = state.device_function.resolved_block_size(bid)
-    if isinstance(bs_val, int):
-        return bs_val - 1
-    return 0
+    if not isinstance(bs_val, int):
+        return 0
+    alignment = _pipeline_begin_alignment(begin_expr, state)
+    if alignment is not None and alignment % bs_val == 0:
+        return 0
+    return bs_val - 1
 
 
 def _scratch_read(state: CodegenState, sname: str) -> str:
@@ -662,6 +828,7 @@ def _setup_inner_loop_masks(
     env: CompileEnvironment,
     body_stmts: list[ast.AST],
     offset_expr_fn: Callable[[int, str], str],
+    aligned_dim: dict[int, int] | None = None,
 ) -> bool:
     """Set up mask variables for inner-loop block_ids.
 
@@ -671,13 +838,37 @@ def _setup_inner_loop_masks(
 
     Returns True if any mask requires explicit indices.
     """
+    aligned_dim = aligned_dim or {}
     needs_explicit = False
     if hasattr(strategy, "_setup_mask"):
         for i, bid in enumerate(block_ids):
+            offset_var = state.device_function.new_var(f"offset_{bid}")
+            if bid in aligned_dim:
+                # Two-sided validity mask for an aligned-enclosing dynamic row
+                # tile: the load over-reads [a_start, begin) and [end, a_end), so
+                # mask both ends.  The relative offset is measured from a_start.
+                sublane = aligned_dim[bid]
+                begin, end = _get_loop_begin_and_end(state, i)
+                a_start = f"(({begin}) - ({begin}) % {sublane})"
+                mask_var = strategy.fn.new_var(f"mask_{bid}", dce=True)  # pyrefly: ignore[missing-attribute]
+                strategy.mask_vars[bid] = mask_var  # pyrefly: ignore[missing-attribute]
+                needs_explicit = True
+                body_stmts.extend(
+                    [
+                        statement_from_string(
+                            f"{offset_var} = {offset_expr_fn(i, block_size_vars[i])}"
+                        ),
+                        statement_from_string(
+                            f"{mask_var} = (({a_start}) + ({offset_var}) "
+                            f">= ({begin})) & (({a_start}) + ({offset_var}) "
+                            f"< ({end}))"
+                        ),
+                    ]
+                )
+                continue
             block_value = state.device_function.resolved_block_size(bid)
             assert isinstance(block_value, int)
             numel_expr = _get_loop_numel(state, i)
-            offset_var = state.device_function.new_var(f"offset_{bid}")
             mask_stmt = strategy._setup_mask(
                 state, bid, block_value, offset_var, numel_expr
             )
@@ -1368,7 +1559,7 @@ def _(state: CodegenState) -> ast.AST:
     tensor_ast = state.ast_arg(0)
     target_size = state.proxy_arg(1)
     if isinstance(target_size, torch.SymInt):
-        target_expr = state.sympy_expr(target_size._sympy_())
+        target_expr = state.sympy_expr(_symint_sympy_expr(target_size))
         block_id = CompileEnvironment.current().get_block_id(target_size)
         bs_var = (
             state.device_function.block_size_var(block_id)
@@ -1392,6 +1583,107 @@ def _(state: CodegenState) -> ast.AST:
         f"jnp.tile({{tensor}}, {factor})",
         tensor=tensor_ast,
     )
+
+
+def _lane_tile(
+    state: CodegenState, fake: torch.Tensor, dim_to_bid: dict[int, int]
+) -> int | None:
+    """Access extent on ``fake``'s last dim: its block size if tiled, else width."""
+    lane_bid = dim_to_bid.get(fake.ndim - 1)
+    if lane_bid is not None:
+        rb = state.device_function.resolved_block_size(lane_bid)
+        if isinstance(rb, int):
+            return rb
+    last = fake.shape[fake.ndim - 1]
+    return last if isinstance(last, int) else None
+
+
+def _loop_dim_is_dynamic(state: CodegenState, i: int) -> bool:
+    """Whether loop dim ``i`` has a runtime begin and end (a fully-dynamic jagged
+    tile).  The tracing-time form of is_dynamic_bound_tile, used here because the
+    device loops are not registered yet.
+    """
+    begins, ends = state.proxy_args[1], state.proxy_args[2]
+    if not isinstance(begins, (list, tuple)) or not isinstance(ends, (list, tuple)):
+        return False
+    begin = begins[i] if i < len(begins) else 0
+    end = ends[i] if i < len(ends) else 0
+    return not isinstance(begin, (int, torch.SymInt)) and not isinstance(
+        end, (int, torch.SymInt)
+    )
+
+
+def _aligned_dim(
+    state: CodegenState,
+    env: CompileEnvironment,
+    block_ids: list[int],
+    loaded_tensors: dict[int, tuple[torch.Tensor, torch.fx.Node, list[object]]],
+    stored_tensors: dict[int, tuple[torch.Tensor, torch.fx.Node, list[object]]],
+) -> dict[int, int]:
+    """Jagged row tiles (runtime end) that read an aligned-enclosing window.
+
+    Maps each to the sublane S its range rounds down to.  A row aligns when a
+    tensor it slices must land on a sublane tile (bf16, or f32 spanning more than
+    one lane tile), or when a per-row map store carries its shared boundary.
+    A DIRECT row that does not carry is omitted: it reads at the exact offset.  S
+    is the largest float-tensor sublane (bf16 forces 16); tiles that carry are
+    also registered for the store fold/save.
+    """
+    from helion._compiler.backend import SliceAddressing
+    from helion._compiler.backend import _slice_addressing
+    from helion._compiler.pallas.ordered_carry import CarryBoundaryTile
+    from helion._compiler.pallas.ordered_carry import is_row_map_axis
+    from helion._compiler.pallas.ordered_carry import needs_ordered_carry
+
+    sublanes = [
+        env.backend.sublane_tiling(t.dtype)  # pyrefly: ignore[missing-attribute]
+        for t in HostFunction.current().tensor_to_origin
+        if isinstance(t, torch.Tensor) and t.is_floating_point()
+    ]
+    if not sublanes:
+        return {}
+
+    # Strictest addressing each row needs over the tensors it slices.
+    addressing: dict[int, SliceAddressing] = {}
+    for fake, _node, sub_meta in (*loaded_tensors.values(), *stored_tensors.values()):
+        if not (isinstance(fake, torch.Tensor) and fake.is_floating_point()):
+            continue
+        dim_to_bid = _get_dim_block_ids(sub_meta, env)
+        lane_block = _lane_tile(state, fake, dim_to_bid)
+        for dim, dim_bid in dim_to_bid.items():
+            if _slice_addressing(fake, dim, lane_block) is SliceAddressing.ALIGNED:
+                addressing[dim_bid] = SliceAddressing.ALIGNED
+            else:
+                addressing.setdefault(dim_bid, SliceAddressing.DIRECT)
+
+    sublane = max(sublanes)
+    aligned_dim: dict[int, int] = {}
+    for i, bid in enumerate(block_ids):
+        if not _loop_dim_is_dynamic(state, i):
+            continue  # static begin or end: not a fully-dynamic jagged tile
+        carry = needs_ordered_carry(state, bid)
+        direct = addressing.get(bid, SliceAddressing.ALIGNED) is SliceAddressing.DIRECT
+        if direct and not carry:
+            continue  # reads any offset; a plain clamped slice suffices
+        if not carry and not is_row_map_axis(state, bid):
+            # ALIGNED but not a map axis: a bf16 reduction over the row.  Its
+            # dense bf16 output store can't be proven aligned for Mosaic (E2003),
+            # so reject it cleanly here instead.  f32 reductions are DIRECT and
+            # already skipped above.
+            raise NotImplementedError(
+                "Pallas: bf16 reduction over a jagged row is not supported yet "
+                "(its dense bf16 output store cannot be proven sublane-aligned)."
+            )
+        aligned_dim[bid] = sublane
+        if carry:
+            begin, end = _get_loop_begin_and_end(state, i)
+            state.device_function.carry_tiles[bid] = CarryBoundaryTile(
+                block_id=bid,
+                begin_var=begin,
+                end_var=end,
+                sublane=sublane,
+            )
+    return aligned_dim
 
 
 def _codegen_emit_pipeline(state: CodegenState) -> object:
@@ -1423,12 +1715,18 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
     assert isinstance(proxy_args, list)
     has_loop_state = len(args) > 0
 
-    grid_parts, block_size_vars = _compute_grid_and_block_sizes(state, block_ids, env)
-
     loaded_tensors, stored_tensors = _classify_loop_tensors(graph_info, state)
-    begin_exprs, iter_step_exprs, slice_size_exprs = _pallas_loop_begin_and_step_exprs(
-        state, block_ids, block_size_vars
+
+    aligned_dim = _aligned_dim(state, env, block_ids, loaded_tensors, stored_tensors)
+
+    grid_parts, block_size_vars = _compute_grid_and_block_sizes(
+        state, block_ids, env, aligned_dim
     )
+    begin_exprs, iter_step_exprs, slice_size_exprs = _pallas_loop_begin_and_step_exprs(
+        state, block_ids, block_size_vars, aligned_dim
+    )
+    # Loop end expressions (used to clamp store extents for data-dependent begins).
+    end_exprs = [_get_loop_begin_and_end(state, i)[1] for i in range(len(block_ids))]
 
     # Pipelined tensors flow through emit_pipeline's per-iter Buffered
     # BlockSpec; the rest stay on the outer pallas_call BlockSpec
@@ -1464,13 +1762,17 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
             )
             _bid_to_pid_var[pid.block_id] = pid_var
 
-    def _make_block_spec(fake: torch.Tensor, subscript_meta: list[object]) -> str:
+    def _make_block_spec(
+        fake: torch.Tensor, subscript_meta: list[object], is_store: bool = False
+    ) -> str:
         """Build a BlockSpec string for a tensor accessed in the pipeline body.
 
         Encodes BOTH outer grid dims (via pl.program_id) and inner pipeline
         dims into the BlockSpec lambda, so the full HBM tensor can be passed
         without pre-slicing.
         """
+        from helion._compiler.pallas.ordered_carry import is_dynamic_bound_tile
+
         dim_to_bid = _get_dim_block_ids(subscript_meta, env)
         shape = fake.shape
         block_shape_parts: list[str] = []
@@ -1489,19 +1791,69 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
                 slice_size_expr = slice_size_exprs[bid_idx]
                 begin_expr = begin_exprs[bid_idx]
                 iter_step_expr = iter_step_exprs[bid_idx]
-                block_shape_parts.append(slice_size_expr)
                 from .memory_ops import _record_pad_info
 
                 extra_pad = _compute_pipeline_or_dma_extra_pad(
                     begin_expr, bid, env, state
                 )
                 _record_pad_info(state, fake, dim_idx, bid, extra_pad)
-                if begin_expr == "0" and iter_step_expr == slice_size_expr:
-                    lambda_parts.append(lambda_params[bid_idx])
-                else:
-                    lambda_parts.append(
-                        f"(({begin_expr}) + ({lambda_params[bid_idx]}) * ({iter_step_expr})) // ({slice_size_expr})"
+                begin_is_zero = begin_expr == "0"
+                end_expr = end_exprs[bid_idx]
+                dim_size = shape[dim_idx]
+                # Whether this loop spans the ENTIRE backing tensor dim, i.e.
+                # ``[0, dim_size)`` with a compile-time-constant extent. Only
+                # then is a full-block store safe: a partial final tile overruns
+                # past ``dim_size`` into padding, which the host-side pad handles.
+                # For any sub-range -- a jagged ``hl.tile(start, end)``, a
+                # ``hl.tile(0, dynamic_end)``, or even a static ``hl.tile(0, k)``
+                # with ``k < dim_size`` -- a full-block store would overrun into
+                # live rows of the tensor, so the extent must be clamped.
+                covers_full_dim = (
+                    begin_is_zero
+                    and _is_static_int(end_expr)
+                    and isinstance(dim_size, int)
+                    and int(end_expr) == dim_size
+                )
+                # Loads need a dynamic ``pl.ds`` only for a non-zero begin (a
+                # block-aligned index can't express an arbitrary start; the
+                # over-read past ``end`` is zeroed by the inner-loop mask).
+                # Stores need it whenever they target a sub-range (not the full
+                # dim), so the extent can be clamped and a partial final tile
+                # does not overrun live rows. Full-dim, from-zero loops keep the
+                # original block-index codegen (no change).
+                if not begin_is_zero or (is_store and not covers_full_dim):
+                    # Dynamic ``pl.ds`` at the true element offset, with a
+                    # ``pl.BoundedSlice`` block shape (required for ds-style
+                    # index maps). Lifts the "emit_pipeline fails on unaligned
+                    # dims" limitation so data-dependent tile loops can pipeline.
+                    block_shape_parts.append(f"pl.BoundedSlice({slice_size_expr})")
+                    start_expr = (
+                        f"({begin_expr}) + ({lambda_params[bid_idx]}) "
+                        f"* ({iter_step_expr})"
                     )
+                    if is_store:
+                        # Clamp the store extent to min(block, end - offset) so a
+                        # short final tile writes only its valid rows
+                        # [begin, end) instead of overrunning into the next
+                        # sub-range (which would corrupt it under cross-iteration
+                        # double-buffering, and is wasteful for large blocks).
+                        size_expr = (
+                            f"jnp.minimum({slice_size_expr}, "
+                            f"({end_exprs[bid_idx]}) - ({start_expr}))"
+                        )
+                    else:
+                        size_expr = slice_size_expr
+                    lambda_parts.append(f"pl.ds({start_expr}, {size_expr})")
+                else:
+                    # Static, from-zero loop: a block-aligned index is exact.
+                    # Identical to the pre-existing codegen.
+                    block_shape_parts.append(slice_size_expr)
+                    if iter_step_expr == slice_size_expr:
+                        lambda_parts.append(lambda_params[bid_idx])
+                    else:
+                        lambda_parts.append(
+                            f"(({begin_expr}) + ({lambda_params[bid_idx]}) * ({iter_step_expr})) // ({slice_size_expr})"
+                        )
             elif bid is not None and bid in _bid_to_pid_var:
                 # Outer grid dim -- select via captured program_id variable
                 pid_var = _bid_to_pid_var[bid]
@@ -1511,6 +1863,31 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
                 else:
                     block_shape_parts.append(str(int(shape[dim_idx])))
                 lambda_parts.append(pid_var)
+            elif bid is not None and is_dynamic_bound_tile(state, bid):
+                # Jagged row tile from an inner pipeline.  pl.multiple_of is
+                # assume_multiple: it suppresses the tiled-row alignment check.
+                # Safe because the begin is rounded to the sublane in the dim's
+                # own loop, and a DIRECT f32 single-lane-tile row reads
+                # contiguously.  Always emitted, as sibling loops reference the
+                # same jagged dim.  Must precede the outer-non-grid branch.
+                block_m = state.device_function.block_size_var(bid)
+                offset_v = state.codegen.offset_var(bid)
+                sublane = env.backend.sublane_tiling(fake.dtype)  # pyrefly: ignore[missing-attribute]
+                block_shape_parts.append(f"pl.BoundedSlice({block_m})")
+                lambda_parts.append(
+                    f"pl.ds(pl.multiple_of({offset_v}, {sublane}), {block_m})"
+                )
+            elif bid is not None and state.codegen.active_device_loops.get(bid):
+                # Outer non-grid device loop -- the HBM ref is pre-sliced via
+                # ``.at[pl.ds(offset, bs)]`` (see _make_hbm_slice), so the
+                # BlockSpec sees an already-sliced ref of size ``bs`` along
+                # this dim. Use the full sliced size with a constant index.
+                bs_var = state.device_function.block_size_var(bid)
+                if bs_var:
+                    block_shape_parts.append(bs_var)
+                else:
+                    block_shape_parts.append(str(int(shape[dim_idx])))
+                lambda_parts.append("0")
             else:
                 idx_meta = (
                     subscript_meta[dim_idx]
@@ -1541,26 +1918,49 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
             f"pipeline_mode=pl.Buffered(buffer_count=2))"
         )
 
+    def _make_load_block_spec(fake: torch.Tensor, subscript_meta: list[object]) -> str:
+        """BlockSpec for a pipelined input (full-block ``pl.ds``; mask zeroes over-read)."""
+        return _make_block_spec(fake, subscript_meta, is_store=False)
+
+    def _make_store_block_spec(fake: torch.Tensor, subscript_meta: list[object]) -> str:
+        """BlockSpec for a pipelined output (clamped ``pl.ds`` extent on dynamic bounds)."""
+        return _make_block_spec(fake, subscript_meta, is_store=True)
+
     def _make_hbm_slice(
         fake: torch.Tensor, hbm_name: str, subscript_meta: list[object]
     ) -> str:
-        """Build an HBM ref slicing expression for outer grid dims."""
+        """Slice the HBM ref for outer non-grid device loop dims.
+
+        Outer grid dims are handled by BlockSpec via captured ``program_id``,
+        and inner pipeline dims are handled by BlockSpec via the iteration
+        lambda — so this only adds ``pl.ds(offset, bs)`` slices for outer
+        device loops whose offset is a closure variable in this scope.
+
+        Dynamic (jagged) row tiles are skipped here: they are addressed by an
+        aligned-enclosing BoundedSlice in the BlockSpec (their group start is
+        not block-aligned, so a plain ``pl.ds`` pre-slice would be unaddressable
+        for bf16).
+        """
+        from helion._compiler.pallas.ordered_carry import is_dynamic_bound_tile
+
         dim_to_bid = _get_dim_block_ids(subscript_meta, env)
         shape = fake.shape
         parts: list[str] = []
         needs_slice = False
         for dim_idx in range(len(shape)):
             bid = dim_to_bid.get(dim_idx)
-            if bid is not None and bid not in block_ids:
-                grid_loops = state.codegen.active_device_loops.get(bid)
-                if grid_loops:
-                    offset = state.codegen.offset_var(bid)
-                    bs_var = state.device_function.block_size_var(bid)
-                    if bs_var:
-                        parts.append(f"pl.ds({offset}, {bs_var})")
-                        needs_slice = True
-                    else:
-                        parts.append(":")
+            if (
+                bid is not None
+                and bid not in block_ids
+                and bid not in _bid_to_pid_var
+                and state.codegen.active_device_loops.get(bid)
+                and not is_dynamic_bound_tile(state, bid)
+            ):
+                offset = state.codegen.offset_var(bid)
+                bs_var = state.device_function.block_size_var(bid)
+                if bs_var:
+                    parts.append(f"pl.ds({offset}, {bs_var})")
+                    needs_slice = True
                 else:
                     parts.append(":")
             else:
@@ -1611,9 +2011,9 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
             hbm_name.replace("_hbm", "") + "_vmem"
         )
         in_tensors.append((fake, hbm_name))
-        in_specs.append(_make_block_spec(fake, sub_meta))
+        in_specs.append(_make_load_block_spec(fake, sub_meta))
         body_params.append(vmem_name)
-        pipeline_in_args.append(hbm_name)
+        pipeline_in_args.append(_make_hbm_slice(fake, hbm_name, sub_meta))
 
     for fake, _tensor_node, sub_meta in stored_tensors.values():
         if id(fake) not in pipelined_tensor_ids:
@@ -1623,9 +2023,9 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
             hbm_name.replace("_hbm", "") + "_vmem"
         )
         out_tensors.append((fake, hbm_name))
-        out_specs.append(_make_block_spec(fake, sub_meta))
+        out_specs.append(_make_store_block_spec(fake, sub_meta))
         body_params.append(vmem_name)
-        pipeline_out_args.append(hbm_name)
+        pipeline_out_args.append(_make_hbm_slice(fake, hbm_name, sub_meta))
 
     # Build the body function
     body_fn_name = state.device_function.new_var("_pipeline_body")
@@ -1667,6 +2067,7 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
         offset_expr_fn=lambda i, bs: (
             f"_pipeline_indices[{i}] * {bs} + jnp.arange({bs})"
         ),
+        aligned_dim=aligned_dim,
     )
 
     # Emit absolute offset assignments inside the pipeline body so any
@@ -1788,6 +2189,90 @@ def _check_dma_alignment(vmem_shape: tuple[int, ...]) -> bool:
     return True
 
 
+def _is_supported_contiguous_row_slab_dma(
+    fake: torch.Tensor,
+    sub_meta: list[object],
+    block_ids: list[int],
+    vmem_shape: tuple[int, ...],
+    env: CompileEnvironment,
+    state: CodegenState,
+) -> bool:
+    """Whether an otherwise-unaligned load is a contiguous row-slab DMA.
+
+    ``_check_dma_alignment`` is conservative for shapes like
+    ``[TOKEN_BLOCK, H=4, D=128]`` because the second-to-last logical dim is not a
+    multiple of 8.  TPU7x accepts HBM copies from arbitrary dynamic row offsets
+    for row-slab layouts: rows are page-addressed and the full suffix is
+    contiguous with an aligned lane dimension.
+
+    Keep this exception narrow: load-only caller, one dynamic-begin/end
+    current-loop row tile, only scalar-selected prefix dims, full-slice suffix,
+    no gathers/scatters/stores.
+    """
+    if not fake.is_floating_point():
+        return False
+    if fake.ndim < 2:
+        return False
+    if not fake.is_contiguous():
+        return False
+    if len(vmem_shape) != fake.ndim:
+        return False
+
+    dim_to_bid = _get_dim_block_ids(sub_meta, env)
+    inner_dims = [dim for dim, bid in dim_to_bid.items() if bid in block_ids]
+    if len(inner_dims) != 1:
+        return False
+    row_dim = inner_dims[0]
+    if row_dim == fake.ndim - 1:
+        return False
+    row_bid = dim_to_bid[row_dim]
+    if not _loop_dim_is_dynamic(state, block_ids.index(row_bid)):
+        return False
+
+    from helion._utils import is_scalar_index
+
+    for dim_idx in range(row_dim):
+        idx_meta = sub_meta[dim_idx] if dim_idx < len(sub_meta) else slice(None)
+        if vmem_shape[dim_idx] != 1:
+            return False
+        if dim_idx in dim_to_bid:
+            continue
+        if not is_scalar_index(idx_meta):
+            return False
+
+    for dim_idx in range(row_dim + 1, fake.ndim):
+        idx_meta = sub_meta[dim_idx] if dim_idx < len(sub_meta) else slice(None)
+        if idx_meta != slice(None):
+            return False
+        if dim_idx in dim_to_bid:
+            return False
+        dim_size = fake.shape[dim_idx]
+        if not isinstance(dim_size, int) or vmem_shape[dim_idx] != dim_size:
+            return False
+
+    lane_dim = fake.shape[-1]
+    return isinstance(lane_dim, int) and lane_dim % 128 == 0
+
+
+def _can_stream_inner_tile(
+    fake: torch.Tensor,
+    sub_meta: list[object],
+    direction: str,
+    block_ids: list[int],
+    vmem_shape: tuple[int, ...],
+    env: CompileEnvironment,
+    state: CodegenState,
+) -> bool:
+    """Return whether a loop-local tensor should use the inner streaming path."""
+    if _check_dma_alignment(vmem_shape):
+        return True
+    if direction != "load":
+        return False
+    return _is_supported_contiguous_row_slab_dma(
+        fake, sub_meta, block_ids, vmem_shape, env, state
+    )
+
+
 def _compute_vmem_shapes(
     all_tensor_info: list[tuple[torch.Tensor, list[object], str]],
     block_ids: list[int],
@@ -1846,8 +2331,9 @@ def _classify_pipelined_tensors(
     A tensor is eligible for the inner-DMA path (HBM ref + small VMEM scratch
     in fori_loop, or ``pl.Buffered`` BlockSpec in emit_pipeline) when:
 
-    * Its inner-block ``vmem_shape`` passes ``_check_dma_alignment`` -- a TPU
-      DMA hardware constraint.
+    * Its inner-block ``vmem_shape`` passes the standard TPU DMA alignment check,
+      or it is a load-only contiguous row-slab layout covered by
+      ``_is_supported_contiguous_row_slab_dma``.
     * It is not also accessed at outer scope (i.e. in a root graph,
       between/before/after inner loops).  Pipelining replaces the tensor's
       outer BlockSpec with ``pltpu.HBM`` so the inner loop's BlockSpec can
@@ -1894,10 +2380,12 @@ def _classify_pipelined_tensors(
                 outer_access_tensor_ids.add(id(val))
 
     pipelined_ids: set[int] = set()
-    for (fake, _sub_meta, _direction), vmem_shape in zip(
+    for (fake, sub_meta, direction), vmem_shape in zip(
         all_tensor_info, vmem_shapes, strict=True
     ):
-        if not _check_dma_alignment(vmem_shape):
+        if not _can_stream_inner_tile(
+            fake, sub_meta, direction, block_ids, vmem_shape, env, state
+        ):
             continue
         if id(fake) in outer_access_tensor_ids:
             continue
@@ -1972,6 +2460,28 @@ def _codegen_fori_loop(state: CodegenState) -> object:
     all_tensor_info, vmem_shapes, pipelined_tensor_ids = _classify_pipelined_tensors(
         loaded_tensors, stored_tensors, block_ids, slice_size_exprs, env, state
     )
+
+    # Compact worklist: the compact-tile aligned_load and exact_store tensors use
+    # per-tile pl.Element BlockSpecs, which Pallas double-buffers across the
+    # work-item grid.  Keep them OUT of the manual make_async_copy DMA path: with
+    # a single straight-line compact tile there is no inner loop to overlap, so a
+    # DMA start()/wait() would run fully serial (load -> wait -> compute -> store
+    # -> wait, measured ~1.8x slower).  Excluding them lets the BlockSpec pipeline
+    # hide the latency.
+    _compact_plan = env.compact_worklist_plan
+    if _compact_plan is not None and not carried:
+        _compact_names = {
+            p.arg_name
+            for p in _compact_plan.tensor_policies
+            if p.kind in ("compact_aligned_load", "compact_exact_store")
+        }
+        _fid_to_fake = {id(f): f for f, _s, _d in all_tensor_info}
+        pipelined_tensor_ids = {
+            fid
+            for fid in pipelined_tensor_ids
+            if state.device_function.tensor_arg(_fid_to_fake[fid]).host_str()
+            not in _compact_names
+        }
 
     from .._compiler.device_function import PallasMemorySpace
 
@@ -2061,14 +2571,31 @@ def _codegen_fori_loop(state: CodegenState) -> object:
         _tensor_to_sem=tensor_to_sem,
     )
 
-    def _build_hbm_dma_slice(
-        fake: torch.Tensor, hbm_name: str, subscript_meta: list[object]
-    ) -> str:
-        """Build an HBM ref slicing expression for DMA with loop variable."""
+    def _build_dma_slices(
+        fake: torch.Tensor,
+        vmem_name: str,
+        hbm_name: str,
+        subscript_meta: list[object],
+        *,
+        clamp: bool,
+    ) -> tuple[str, str]:
+        """Build (vmem_ref, hbm_ref) ref slices for a DMA copy with loop variable.
+
+        The HBM ref is sliced to this iteration's tile.  With ``clamp=True``
+        (ragged stores) a leading tiled dim is trimmed to its live extent
+        ``min(block_size, end - offset)`` and the VMEM side sliced to match, so
+        only live rows are written instead of overrunning adjacent regions
+        packed in the same tensor; with ``clamp=False`` (loads, dense stores)
+        the VMEM side stays the bare buffer.
+        """
+        from helion._compiler.pallas.ordered_carry import is_dynamic_bound_tile
+
         dim_to_bid = _get_dim_block_ids(subscript_meta, env)
         shape = fake.shape
-        parts: list[str] = []
-        needs_slice = False
+        hbm_parts: list[str] = []
+        vmem_parts: list[str] = []
+        hbm_needs_slice = False
+        vmem_needs_slice = False
         for dim_idx in range(len(shape)):
             bid = dim_to_bid.get(dim_idx)
             if bid is not None and bid in block_ids:
@@ -2077,10 +2604,29 @@ def _codegen_fori_loop(state: CodegenState) -> object:
                 iter_step_expr = iter_step_exprs[bid_idx]
                 slice_size_expr = slice_size_exprs[bid_idx]
                 dim_idx_expr = dim_idx_exprs[bid_idx]
-                parts.append(
-                    f"pl.ds(({begin_expr}) + ({dim_idx_expr}) * ({iter_step_expr}), {slice_size_expr})"
-                )
-                needs_slice = True
+                offset_expr = f"({begin_expr}) + ({dim_idx_expr}) * ({iter_step_expr})"
+                # Mosaic requires the lane (/128) and sublane (/8) VMEM dims to
+                # stay tile-aligned, so only clamp dims outside the last two; a
+                # ragged store on a last-two dim can't clamp and is rejected.
+                if clamp and dim_idx < len(shape) - 2:
+                    end_expr = _get_loop_begin_and_end(state, bid_idx)[1]
+                    slice_size_expr = f"jnp.minimum({slice_size_expr}, ({end_expr}) - ({offset_expr}))"
+                    vmem_parts.append(f"pl.ds(0, {slice_size_expr})")
+                    vmem_needs_slice = True
+                elif clamp and is_dynamic_bound_tile(state, bid):
+                    raise NotImplementedError(
+                        "Pallas: a ragged (data-dependent) store whose tiled "
+                        "dimension is one of the last two (lane/sublane) "
+                        "dimensions is not supported. Mosaic tile alignment "
+                        "forbids clamping there, so a partial tile would "
+                        "silently overrun adjacent rows. Move the ragged "
+                        "dimension to a leading position, e.g. "
+                        "[tokens, heads, head_dim]."
+                    )
+                else:
+                    vmem_parts.append(":")
+                hbm_parts.append(f"pl.ds({offset_expr}, {slice_size_expr})")
+                hbm_needs_slice = True
                 from .memory_ops import _record_pad_info
 
                 extra_pad = _compute_pipeline_or_dma_extra_pad(
@@ -2094,12 +2640,13 @@ def _codegen_fori_loop(state: CodegenState) -> object:
                     offset = state.codegen.offset_var(bid)
                     bs_var = state.device_function.block_size_var(bid)
                     if bs_var:
-                        parts.append(f"pl.ds({offset}, {bs_var})")
-                        needs_slice = True
+                        hbm_parts.append(f"pl.ds({offset}, {bs_var})")
+                        hbm_needs_slice = True
                     else:
-                        parts.append(":")
+                        hbm_parts.append(":")
                 else:
-                    parts.append(":")
+                    hbm_parts.append(":")
+                vmem_parts.append(":")
             else:
                 idx_meta = (
                     subscript_meta[dim_idx]
@@ -2110,13 +2657,21 @@ def _codegen_fori_loop(state: CodegenState) -> object:
 
                 if is_scalar_index(idx_meta):
                     offset_expr = state.device_function.literal_expr(idx_meta)
-                    parts.append(f"pl.ds({offset_expr}, 1)")
-                    needs_slice = True
+                    hbm_parts.append(f"pl.ds({offset_expr}, 1)")
+                    hbm_needs_slice = True
                 else:
-                    parts.append(":")
-        if not needs_slice:
-            return hbm_name
-        return f"{hbm_name}.at[{', '.join(parts)}]"
+                    hbm_parts.append(":")
+                vmem_parts.append(":")
+        # ``.at[]`` (Ref transform), not ``[]`` which would materialize a
+        # dynamically-shaped array; make_async_copy operates on Refs.  Each side
+        # falls back to the bare ref when it has no slices.
+        hbm = f"{hbm_name}.at[{', '.join(hbm_parts)}]" if hbm_needs_slice else hbm_name
+        vmem = (
+            f"{vmem_name}.at[{', '.join(vmem_parts)}]"
+            if vmem_needs_slice
+            else vmem_name
+        )
+        return vmem, hbm
 
     # For loop-carried state, remap args to scratch reads inside the body
     body_args = (
@@ -2129,7 +2684,7 @@ def _codegen_fori_loop(state: CodegenState) -> object:
     with state.codegen.add_fori_loop(fori_state):
         # Non-DMA tensors keep their outer BlockSpec (whole-shape VMEM ref)
         # and need an absolute offset for ``pl.ds()`` indexing in the body.
-        # DMA copies build their own absolute slice via _build_hbm_dma_slice,
+        # DMA copies build their own absolute slice via _build_dma_slices,
         # so this offset is dead when every tensor is DMA'd.
         if len(tensor_to_dma_scratch) < len(all_tensor_info):
             for i, bid in enumerate(block_ids):
@@ -2146,11 +2701,13 @@ def _codegen_fori_loop(state: CodegenState) -> object:
                 continue
             vmem_name = tensor_to_dma_scratch[hbm_name]
             sem_name = tensor_to_sem[hbm_name]
-            src_slice = _build_hbm_dma_slice(fake, hbm_name, sub_meta)
+            vmem_ref, hbm_ref = _build_dma_slices(
+                fake, vmem_name, hbm_name, sub_meta, clamp=False
+            )
             copy_var = state.device_function.new_var("_copy")
             state.codegen.add_statement(
                 statement_from_string(
-                    f"{copy_var} = pltpu.make_async_copy({src_slice}, {vmem_name}, {sem_name})"
+                    f"{copy_var} = pltpu.make_async_copy({hbm_ref}, {vmem_ref}, {sem_name})"
                 )
             )
             state.codegen.add_statement(statement_from_string(f"{copy_var}.start()"))
@@ -2169,17 +2726,40 @@ def _codegen_fori_loop(state: CodegenState) -> object:
                 continue
             vmem_name = tensor_to_dma_scratch[hbm_name]
             sem_name = tensor_to_sem[hbm_name]
-            dst_slice = _build_hbm_dma_slice(fake, hbm_name, sub_meta)
+            vmem_ref, hbm_ref = _build_dma_slices(
+                fake, vmem_name, hbm_name, sub_meta, clamp=True
+            )
             copy_out_var = state.device_function.new_var("_copy_out")
             state.codegen.add_statement(
                 statement_from_string(
-                    f"{copy_out_var} = pltpu.make_async_copy({vmem_name}, {dst_slice}, {sem_name})"
+                    f"{copy_out_var} = pltpu.make_async_copy({vmem_ref}, {hbm_ref}, {sem_name})"
                 )
             )
             state.codegen.add_statement(
                 statement_from_string(f"{copy_out_var}.start()")
             )
             state.codegen.add_statement(statement_from_string(f"{copy_out_var}.wait()"))
+
+    # Compact-worklist outer tile: it IS the grid (exactly one tile per work
+    # item, since the builder guarantees extent <= BLOCK), so emit the body
+    # straight-line with the loop var bound to 0 -- no fori_loop wrapper (which
+    # would add control-flow overhead and block pipelining for the common
+    # dense-KV case).  The ordered inner tile does not reach here: it lowers
+    # separately via emit_pipeline (see the _for_loop pallas dispatch).
+    plan = CompileEnvironment.current().compact_worklist_plan
+    is_compact_tile = (
+        plan is not None
+        and not carried  # the compact tile is parallel (no carried state)
+        and len(block_ids) == 1
+        and block_ids[0] == plan.compact_axis.block_id
+    )
+    if is_compact_tile:
+        # No nonlocal declarations: the body runs at kernel scope (scratch refs
+        # are kernel params, directly assignable -- nonlocal would be invalid).
+        state.add_statement(statement_from_string(f"{loop_vars[0]} = 0"))
+        for stmt in body_stmts or [ast.Pass()]:
+            state.add_statement(stmt)
+        return None
 
     _emit_nonlocal_scratch_declarations(state, body_stmts)
 
@@ -2391,8 +2971,16 @@ def _(state: CodegenState) -> list[object]:
     assert all(isinstance(x, ast.AST) for x in if_args)
     assert all(isinstance(x, ast.AST) for x in else_args)
 
+    # Tag each branch with the dynamic ``_if`` node identity so synthetic
+    # ``hl.arange`` axes allocated in mutually-exclusive branches can share a
+    # single thread axis (only one branch runs per program instance).
+    if_node_id = id(state.fx_node)
+
     if_body_stmts: list[ast.AST] = []
-    with state.codegen.set_statements(if_body_stmts):
+    with (
+        state.codegen.set_statements(if_body_stmts),
+        state.codegen.cute_branch_scope(if_node_id, 0),
+    ):
         if_outputs = codegen_call_with_graph(
             state.codegen, graph_info.graph, [*if_args]
         )
@@ -2401,7 +2989,10 @@ def _(state: CodegenState) -> list[object]:
     else_graph = state.get_graph(graph_info.else_branch)
     assert isinstance(else_graph, ElseGraphInfo)
     else_body_stmts: list[ast.AST] = []
-    with state.codegen.set_statements(else_body_stmts):
+    with (
+        state.codegen.set_statements(else_body_stmts),
+        state.codegen.cute_branch_scope(if_node_id, 1),
+    ):
         else_outputs = codegen_call_with_graph(
             state.codegen, else_graph.graph, [*else_args]
         )

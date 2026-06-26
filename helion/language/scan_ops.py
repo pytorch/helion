@@ -16,9 +16,11 @@ from . import _decorators
 if TYPE_CHECKING:
     from .._compiler.device_ir import HelperFunctionGraphInfo
     from .._compiler.helper_function import CombineFunction
+    from .._compiler.helper_function import CombineFunctionBasic
+    from .._compiler.helper_function import CombineFunctionTuple
     from .._compiler.inductor_lowering import CodegenState
-    from .._compiler.type_propagation import Origin
-    from .._compiler.type_propagation import TypeInfo
+    from .._compiler.type_info import Origin
+    from .._compiler.type_info import TypeInfo
 
 
 __all__ = ["associative_scan", "cumprod", "cumsum"]
@@ -107,9 +109,34 @@ def _(
     dim: int,
     reverse: bool = False,
 ) -> torch.Tensor | tuple[torch.Tensor, ...]:
-    return higher_order_ops.associative_scan(
-        combine_fn, input_tensor, dim, reverse=reverse
+    # Eager inclusive scan. Ref mode must not call torch's associative_scan HOP: it
+    # runs Dynamo, which breaks under Helion's active RefMode TorchFunctionMode.
+    from .._compiler.helper_function import create_combine_function_wrapper
+
+    is_tuple = isinstance(input_tensor, (tuple, list))
+    leaves = tuple(input_tensor) if is_tuple else (input_tensor,)
+    combine = create_combine_function_wrapper(
+        combine_fn, is_tuple_input=is_tuple, target_format="tuple"
     )
+
+    scan_dim = dim % leaves[0].ndim
+    length = leaves[0].size(scan_dim)
+    order = reversed(range(length)) if reverse else range(length)
+
+    acc: tuple[torch.Tensor, ...] | None = None
+    out: list[tuple[torch.Tensor, ...]] = [()] * length
+    for k in order:
+        cur = tuple(leaf.select(scan_dim, k) for leaf in leaves)
+        if acc is None:
+            acc = cur
+        elif is_tuple:
+            acc = tuple(cast("CombineFunctionTuple", combine)(acc, cur))
+        else:
+            acc = (cast("CombineFunctionBasic", combine)(acc[0], cur[0]),)
+        out[k] = acc
+
+    result = tuple(torch.stack(col, dim=scan_dim) for col in zip(*out, strict=True))
+    return result if is_tuple else result[0]
 
 
 @_decorators.register_to_device_ir(associative_scan)
@@ -217,9 +244,9 @@ def _(
     origin: Origin,
 ) -> TypeInfo:
     """Type propagation for associative_scan - output has same type as input."""
-    from .._compiler.type_propagation import CallableType
-    from .._compiler.type_propagation import SequenceType
-    from .._compiler.type_propagation import TensorType
+    from .._compiler.type_info import CallableType
+    from .._compiler.type_info import SequenceType
+    from .._compiler.type_info import TensorType
 
     # Validate that combine_fn is callable
     if not isinstance(combine_fn, CallableType):
@@ -380,7 +407,13 @@ def _(state: CodegenState) -> ast.AST | list[ast.AST]:
     if dim < 0:
         dim += input_tensor.ndim
     if dim != input_tensor.ndim - 1:
-        raise exc.BackendUnsupported("cute", "associative_scan non-last dimension")
+        # A non-last-dim scalar scan is a single-stream serial scan; reuse the
+        # dim-agnostic machinery the tuple path already relies on (it folds the
+        # combine graph over global rows along an arbitrary scan dimension).
+        (result,) = _cute_codegen_serial_scan(
+            state, helper_graph_info, [input_node], dim, reverse
+        )
+        return result
 
     scan_source = state.ast_args[1]
     sorted_source: tuple[CuteSortableLoad, bool] | None = None
@@ -653,7 +686,10 @@ def _cute_inline_combine_graph(
 
     output_nodes = next(n for n in graph.nodes if n.op == "output")
     outputs = output_nodes.args[0]
-    assert isinstance(outputs, (tuple, list))
+    # A scalar (single-tensor) combine graph returns one value directly; a tuple
+    # combine graph returns a tuple/list.  Normalize to a list of outputs.
+    if not isinstance(outputs, (tuple, list)):
+        outputs = [outputs]
     out_exprs = [operand(o) for o in outputs]
     return lines, out_exprs
 
@@ -674,12 +710,6 @@ def _cute_codegen_tuple_scan(
     segmented reduction).  Correctness, not performance, is the goal: the loop
     is O(n) per lane.
     """
-    from torch.fx.node import Node
-
-    from .._compiler.ast_extension import expr_from_string
-    from .._compiler.ast_extension import statement_from_string
-    from .._compiler.compile_environment import CompileEnvironment
-    from .._compiler.cute.indexing import CuteSortableLoad
     from .._compiler.device_ir import HelperFunctionGraphInfo
 
     helper_graph_info = state.get_graph(combine_graph_id)
@@ -691,6 +721,34 @@ def _cute_codegen_tuple_scan(
     input_nodes = fx_node.args[1]
     if not isinstance(input_nodes, (tuple, list)):
         raise exc.BackendUnsupported("cute", "tuple associative_scan input")
+
+    return _cute_codegen_serial_scan(
+        state, helper_graph_info, list(input_nodes), dim, reverse
+    )
+
+
+def _cute_codegen_serial_scan(
+    state: CodegenState,
+    helper_graph_info: object,
+    input_nodes: list[object],
+    dim: int,
+    reverse: bool,
+) -> list[ast.AST]:
+    """Dim-agnostic serial per-lane inclusive scan shared by the scalar and
+    tuple CuTe scan paths.
+
+    ``input_nodes`` is one FX node per scanned stream (a single element for a
+    scalar scan, multiple for a tuple scan).  For each output position along the
+    scan dimension this folds the user's combine graph over the global rows
+    ``0..out_pos`` (inclusive), carrying one accumulator per stream.  Returns one
+    output expression per stream.
+    """
+    from torch.fx.node import Node
+
+    from .._compiler.ast_extension import expr_from_string
+    from .._compiler.ast_extension import statement_from_string
+    from .._compiler.compile_environment import CompileEnvironment
+    from .._compiler.cute.indexing import CuteSortableLoad
 
     # Fake-tensor metadata lives on the per-stream input nodes (the scan node
     # itself produces a tuple and may carry no ``val``).
@@ -706,23 +764,38 @@ def _cute_codegen_tuple_scan(
     from .memory_ops import _cute_active_index_var
     from .memory_ops import _cute_tensor_dim_size_expr
 
-    # The scan loops over the *block-local* positions of the scan dimension.
-    # ``first_val.shape[dim]`` is the per-tile block size (the fake tensor has
-    # block-sized dims), which gives both the loop bound and the block id.
-    extent = first_val.shape[dim]
-    n_hint = env.size_hint(extent) if isinstance(extent, torch.SymInt) else extent
-    if not isinstance(n_hint, int):
-        raise exc.BackendUnsupported("cute", "dynamic associative_scan extent")
-
     scan_block_id = _resolve_dim_block_id(state.codegen, first_val, dim)
     if scan_block_id is None:
         raise exc.BackendUnsupported("cute", "associative_scan scan-dim block id")
+
+    # The scan loops over the *block-local* positions of the scan dimension; the
+    # loop bound is the scan dim's block (tile) size.  Prefer the concrete block
+    # size from config (the fake tensor's scan dim may be a fresh symbol that
+    # ``size_hint`` cannot resolve to the tile size), falling back to the fake
+    # extent's size hint.
+    block_size = env.block_sizes[scan_block_id].from_config(
+        state.device_function.config
+    )
+    if isinstance(block_size, int):
+        n_hint = block_size
+    else:
+        extent = first_val.shape[dim]
+        n_hint = env.size_hint(extent) if isinstance(extent, torch.SymInt) else extent
+    if not isinstance(n_hint, int):
+        raise exc.BackendUnsupported("cute", "dynamic associative_scan extent")
+
     # The current lane's block-local position along the scan dim.
     out_pos_expr = _get_dim_local_coord(state.codegen, first_val, dim)
-    # The tile's global offset along the scan dim, so a local ``scan_i`` maps to
-    # the global row ``offset + scan_i``.
-    offset_expr = state.codegen.offset_var(scan_block_id)
+    # The tile's global base along the scan dim, so a local ``scan_i`` maps to the
+    # global row ``base + scan_i``.  ``offset_var`` aliases the per-thread global
+    # index when the scan dim is split across threads (it equals
+    # ``global_index``), so derive the base as ``global_index - local_coord``
+    # which is the genuine tile base in both the looped and thread-split cases.
     scan_global_index_var = _cute_active_index_var(state, scan_block_id)
+    if scan_global_index_var is not None:
+        offset_expr = f"({scan_global_index_var}) - ({out_pos_expr})"
+    else:
+        offset_expr = state.codegen.offset_var(scan_block_id)
 
     # Recover a scalar load per tuple element and the index position that
     # corresponds to the scan dimension within that load.

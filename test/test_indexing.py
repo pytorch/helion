@@ -28,6 +28,7 @@ from helion._testing import skipIfTileIR
 from helion._testing import skipIfXPU
 from helion._testing import skipUnlessTensorDescriptor
 from helion._testing import xfailIfCute
+from helion._testing import xfailIfPallas
 import helion.language as hl
 
 _LARGE_BF16_SHAPE = (51200, 51200)
@@ -124,6 +125,245 @@ class TestIndexing(RefEagerTestBase, TestCase):
         torch.testing.assert_close(
             result, torch.arange(0, 100, device=DEVICE, dtype=torch.int32)
         )
+
+    @onlyBackends(["triton"])
+    @skipIfTileIR("hint is emitted by the Triton pointer indexing strategy")
+    @skipIfRefEager("asserts on generated Triton code")
+    def test_contiguity_hint_fires_on_swizzle_gather(self):
+        # Allowlist: swizzled 1-D gathers with four-element contiguous runs.
+        @helion.kernel(static_shapes=True)
+        def swizzle_gather(scale: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
+            (n,) = out.shape
+            for tg in hl.tile(n):
+                idx = (tg.index // 4) * 512 + tg.index % 4
+                out[tg] = scale[idx]
+            return out
+
+        @helion.kernel(static_shapes=True)
+        def bitwise_swizzle_gather(
+            scale: torch.Tensor, out: torch.Tensor
+        ) -> torch.Tensor:
+            (n,) = out.shape
+            for tg in hl.tile(n):
+                idx = (tg.index >> 2) * 512 + (tg.index & 3)
+                out[tg] = scale[idx]
+            return out
+
+        n = 64
+        scale = torch.randn(8192, device=DEVICE, dtype=torch.float32)
+        out = torch.empty(n, device=DEVICE, dtype=torch.float32)
+        for fn in (swizzle_gather, bitwise_swizzle_gather):
+            code, result = code_and_output(
+                fn, (scale, out), indexing="pointer", block_size=[16]
+            )
+            self.assertIn("tl.max_contiguous(", code)
+            self.assertIn(", [4])", code)
+            i = torch.arange(n, device=DEVICE)
+            torch.testing.assert_close(result, scale[(i // 4) * 512 + i % 4])
+
+    @onlyBackends(["triton"])
+    @skipIfTileIR("hint is emitted by the Triton pointer indexing strategy")
+    @skipIfRefEager("asserts on generated Triton code")
+    def test_contiguity_hint_ignores_outer_axis_modulus(self):
+        # Allowlist: outer-axis modulo is constant along the inner run axis.
+        @helion.kernel(static_shapes=True)
+        def swizzle_2d(scale: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
+            rows, cols = out.shape
+            for tr, tc in hl.tile([rows, cols]):
+                idx = (
+                    (tc.index[None, :] // 4) * 512
+                    + (tr.index[:, None] % 8) * 16
+                    + tc.index[None, :] % 4
+                )
+                out[tr, tc] = scale[idx]
+            return out
+
+        rows, cols = 2, 32
+        scale = torch.randn(8192, device=DEVICE, dtype=torch.float32)
+        out = torch.empty(rows, cols, device=DEVICE, dtype=torch.float32)
+        code, result = code_and_output(
+            swizzle_2d, (scale, out), indexing="pointer", block_size=[2, 32]
+        )
+        self.assertIn("tl.max_contiguous(", code)
+        self.assertIn(", [1, 4])", code)
+        r = torch.arange(rows, device=DEVICE)[:, None]
+        c = torch.arange(cols, device=DEVICE)[None, :]
+        torch.testing.assert_close(result, scale[(c // 4) * 512 + (r % 8) * 16 + c % 4])
+
+    @onlyBackends(["triton"])
+    @skipIfTileIR("hint is emitted by the Triton pointer indexing strategy")
+    @skipIfRefEager("asserts on generated Triton code")
+    def test_contiguity_hint_allows_scalar_outer_terms(self):
+        # Allowlist: scalar row swizzle terms are uniform across the inner run.
+        @helion.kernel(static_shapes=True)
+        def swizzle_scalar_row(scale: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
+            rows, cols = out.shape
+            for tr in hl.tile(rows, block_size=1):
+                row = tr.begin
+                for tc in hl.tile(cols, block_size=16):
+                    idx = (
+                        ((row >> 7) * 1 + (tc.index >> 2)) * 512
+                        + (row & 31) * 16
+                        + ((row >> 5) & 3) * 4
+                        + (tc.index & 3)
+                    )
+                    out[row, tc] = scale[idx]
+            return out
+
+        rows, cols = 2, 32
+        scale = torch.randn(8192, device=DEVICE, dtype=torch.float32)
+        out = torch.empty(rows, cols, device=DEVICE, dtype=torch.float32)
+        code, result = code_and_output(
+            swizzle_scalar_row, (scale, out), indexing="pointer"
+        )
+        self.assertIn("tl.max_contiguous(", code)
+        self.assertIn(", [4])", code)
+        r = torch.arange(rows, device=DEVICE)[:, None]
+        c = torch.arange(cols, device=DEVICE)[None, :]
+        expected = scale[
+            ((r >> 7) * 1 + (c >> 2)) * 512
+            + (r & 31) * 16
+            + ((r >> 5) & 3) * 4
+            + (c & 3)
+        ]
+        torch.testing.assert_close(result, expected)
+
+    @onlyBackends(["triton"])
+    @skipIfTileIR("hint is emitted by the Triton pointer indexing strategy")
+    @skipIfRefEager("asserts on generated Triton code")
+    def test_contiguity_hint_does_not_fire_outside_swizzle(self):
+        # Blocklist: plain loads, data gathers, permutations, and non-vectorizable widths.
+        @helion.kernel(static_shapes=True)
+        def affine_load(scale: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
+            (n,) = out.shape
+            for tg in hl.tile(n):
+                out[tg] = scale[tg]  # plain affine tile load (no gather)
+            return out
+
+        @helion.kernel(static_shapes=True)
+        def clean_gather(scale: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
+            (n,) = out.shape
+            for tg in hl.tile(n):
+                out[tg] = scale[tg.index]  # contiguous gather: run == block (no win)
+            return out
+
+        @helion.kernel(static_shapes=True)
+        def data_gather(
+            scale: torch.Tensor, idxbuf: torch.Tensor, out: torch.Tensor
+        ) -> torch.Tensor:
+            (n,) = out.shape
+            for tg in hl.tile(n):
+                out[tg] = scale[idxbuf[tg]]  # data-dependent index: purity bail
+            return out
+
+        @helion.kernel(static_shapes=True)
+        def permute_gather(scale: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
+            (n,) = out.shape
+            for tg in hl.tile(n):
+                idx = (tg.index % 4) * 512 + tg.index // 4  # permutation: run == 1
+                out[tg] = scale[idx]
+            return out
+
+        @helion.kernel(static_shapes=True)
+        def swizzle_gather_wide(scale: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
+            (n,) = out.shape
+            for tg in hl.tile(n):
+                idx = (tg.index // 4) * 512 + tg.index % 4  # swizzle, but 8-byte elt
+                out[tg] = scale[idx]  # k(4) * 8 bytes == 32, not a vectorizable width
+            return out
+
+        @helion.kernel(static_shapes=True)
+        def unsupported_bitwise_mask(
+            scale: torch.Tensor, out: torch.Tensor
+        ) -> torch.Tensor:
+            (n,) = out.shape
+            for tg in hl.tile(n):
+                idx = (tg.index & 5) * 512 + (tg.index & 3)
+                out[tg] = scale[idx]
+            return out
+
+        @helion.kernel(static_shapes=True)
+        def scalar_shifted_mask(scale: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
+            rows, cols = out.shape
+            for tr in hl.tile(rows, block_size=1):
+                row = tr.begin
+                for tc in hl.tile(cols, block_size=16):
+                    idx = ((tc.index + row) >> 2) * 512 + ((tc.index + row) & 3)
+                    out[row, tc] = scale[idx]
+            return out
+
+        n = 64
+        f32 = torch.randn(8192, device=DEVICE, dtype=torch.float32)
+        small = f32[:n].contiguous()
+        out = torch.empty(n, device=DEVICE, dtype=torch.float32)
+        idxbuf = torch.randint(0, 8192, (n,), device=DEVICE, dtype=torch.int64)
+        i64 = torch.randint(0, 1000, (8192,), device=DEVICE, dtype=torch.int64)
+        out64 = torch.empty(n, device=DEVICE, dtype=torch.int64)
+
+        cases = [
+            (affine_load, (small, out)),
+            (clean_gather, (small, out)),
+            (data_gather, (f32, idxbuf, out)),
+            (permute_gather, (f32, out)),
+            (swizzle_gather_wide, (i64, out64)),
+            (unsupported_bitwise_mask, (f32, out)),
+        ]
+        for fn, args in cases:
+            code, _ = code_and_output(fn, args, indexing="pointer", block_size=[16])
+            self.assertNotIn(
+                "tl.max_contiguous", code, f"{fn.fn.__name__} should get no hint"
+            )
+
+        out2d = torch.empty(2, 32, device=DEVICE)
+        code, _ = code_and_output(scalar_shifted_mask, (f32, out2d), indexing="pointer")
+        self.assertNotIn("tl.max_contiguous", code)
+
+    @onlyBackends(["triton"])
+    @skipIfTileIR("hint is emitted by the Triton pointer indexing strategy")
+    @skipIfRefEager("asserts on generated Triton code")
+    def test_contiguity_hint_does_not_fire_on_shifted_tile(self):
+        # Blocklist: begin=1 breaks the four-element swizzle run.
+        @helion.kernel(static_shapes=True)
+        def shifted_swizzle(scale: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
+            (n,) = out.shape
+            for tg in hl.tile(1, n):
+                idx = (tg.index >> 2) * 512 + (tg.index & 3)
+                out[tg] = scale[idx]
+            return out
+
+        n = 64
+        scale = torch.randn(8192, device=DEVICE, dtype=torch.float32)
+        out = torch.zeros(n, device=DEVICE, dtype=torch.float32)
+        code, result = code_and_output(
+            shifted_swizzle, (scale, out), indexing="pointer", block_size=[16]
+        )
+        self.assertNotIn("tl.max_contiguous", code)
+        i = torch.arange(1, n, device=DEVICE)
+        torch.testing.assert_close(result[1:], scale[(i // 4) * 512 + i % 4])
+
+    @onlyBackends(["triton"])
+    @skipIfTileIR("hint is emitted by the Triton pointer indexing strategy")
+    @skipIfRefEager("asserts on generated Triton code")
+    def test_contiguity_hint_fires_on_aligned_begin(self):
+        # Allowlist: begin=4 keeps the four-element swizzle run aligned.
+        @helion.kernel(static_shapes=True)
+        def aligned_swizzle(scale: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
+            (n,) = out.shape
+            for tg in hl.tile(4, n):
+                idx = (tg.index >> 2) * 512 + (tg.index & 3)
+                out[tg] = scale[idx]
+            return out
+
+        n = 64
+        scale = torch.randn(8192, device=DEVICE, dtype=torch.float32)
+        out = torch.zeros(n, device=DEVICE, dtype=torch.float32)
+        code, result = code_and_output(
+            aligned_swizzle, (scale, out), indexing="pointer", block_size=[16]
+        )
+        self.assertIn("tl.max_contiguous(", code)
+        self.assertIn(", [4])", code)
+        i = torch.arange(4, n, device=DEVICE)
+        torch.testing.assert_close(result[4:], scale[(i // 4) * 512 + i % 4])
 
     @pytest.mark.xfail(
         _get_backend() == "cute",
@@ -271,7 +511,6 @@ class TestIndexing(RefEagerTestBase, TestCase):
             result, torch.where(torch.arange(200, device=DEVICE) % 2 == 0, x, 0)
         )
 
-    @xfailIfCute("CuTe does not yet lower untiled cartesian hl.arange store indices")
     def test_mask_store_cartesian(self):
         @helion.kernel(autotune_effort="none")
         def cartesian_masked_store_kernel(
@@ -346,7 +585,6 @@ class TestIndexing(RefEagerTestBase, TestCase):
         result = cartesian_masked_store_kernel(packed, shared_b, offsets)
         torch.testing.assert_close(result, expected)
 
-    @xfailIfCute("CuTe does not yet lower untiled 3D cartesian hl.arange store indices")
     def test_mask_store_cartesian_3d(self):
         @helion.kernel(autotune_effort="none")
         def cartesian_masked_store_kernel_3d(
@@ -1622,6 +1860,108 @@ class TestIndexing(RefEagerTestBase, TestCase):
         expected = torch.zeros([N], device=DEVICE)
         torch.testing.assert_close(result, expected)
 
+    @xfailIfPallas("slice-based stores not yet supported")
+    def test_partial_slice(self):
+        """Test both setter and getter for partial slices [:n] and [n:]"""
+
+        @helion.kernel(autotune_effort="none")
+        def kernel(src: torch.Tensor, dst: torch.Tensor) -> torch.Tensor:
+            for tile in hl.tile(src.size(0)):
+                dst[tile, :16] = src[tile, :16]
+                dst[tile, 16:] = src[tile, 16:]
+            return dst
+
+        N = 64
+        src = torch.randn([N, 32], device=DEVICE)
+        dst = torch.zeros([N, 32], device=DEVICE)
+        result = kernel(src, dst)
+        torch.testing.assert_close(result, src)
+
+    @xfailIfPallas("slice-based stores not yet supported")
+    def test_partial_slice_dim0(self):
+        """Test partial slices on dim 0 (the tiled dimension)"""
+
+        @helion.kernel(autotune_effort="none")
+        def kernel(src: torch.Tensor, dst: torch.Tensor) -> torch.Tensor:
+            for tile in hl.tile(src.size(1)):
+                dst[:32, tile] = src[:32, tile]
+                dst[32:, tile] = src[32:, tile]
+            return dst
+
+        src = torch.randn([64, 32], device=DEVICE)
+        dst = torch.zeros([64, 32], device=DEVICE)
+        result = kernel(src, dst)
+        torch.testing.assert_close(result, src)
+
+    @xfailIfPallas("slice-based stores not yet supported")
+    def test_partial_slice_unaligned(self):
+        """Test non-power-of-2 slice boundary for load and store"""
+
+        @helion.kernel(autotune_effort="none")
+        def kernel(src: torch.Tensor, dst: torch.Tensor) -> torch.Tensor:
+            for tile in hl.tile(src.size(0)):
+                dst[tile, :13] = src[tile, :13]
+            return dst
+
+        src = torch.randn([16, 16], device=DEVICE)
+        dst = torch.zeros([16, 13], device=DEVICE)
+        result = kernel(src, dst)
+        torch.testing.assert_close(result, src[:, :13])
+
+    # NOTE: concat and unaligned_multi use multiple differently-sized
+    # partial slices in one kernel.  CuTe's thread axis assignment
+    # collides when two reduction blocks of different sizes map to the
+    # same axis.  Triton-only until the CuTe thread mapping is fixed.
+
+    @xfailIfCute("CuTe thread axis collision with differently-sized reduction blocks")
+    @xfailIfPallas("slice-based stores not yet supported")
+    def test_partial_slice_unaligned_multi(self):
+        """Test multiple non-power-of-2 slices in one kernel"""
+
+        @helion.kernel(autotune_effort="none")
+        def kernel(
+            src: torch.Tensor, dst: torch.Tensor, out: torch.Tensor
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            for tile in hl.tile(src.size(0)):
+                dst[tile, :13] = 1.0
+                dst[tile, 13:] = 2.0
+                out[tile, :] = src[tile, :13]
+            return dst, out
+
+        src = torch.randn([16, 16], device=DEVICE)
+        dst = torch.zeros([16, 16], device=DEVICE)
+        out = torch.zeros([16, 13], device=DEVICE)
+        dst_result, out_result = kernel(src, dst, out)
+        expected_dst = torch.zeros([16, 16], device=DEVICE)
+        expected_dst[:, :13] = 1.0
+        expected_dst[:, 13:] = 2.0
+        torch.testing.assert_close(dst_result, expected_dst)
+        torch.testing.assert_close(out_result, src[:, :13])
+
+    @xfailIfCute("CuTe thread axis collision with differently-sized reduction blocks")
+    @xfailIfPallas("slice-based stores not yet supported")
+    def test_partial_slice_concat(self):
+        """Test concat via full-slice load + partial-slice store"""
+
+        @helion.kernel(autotune_effort="none")
+        def kernel(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            out = torch.empty(
+                [x.size(0), x.size(1) + y.size(1)],
+                device=x.device,
+                dtype=x.dtype,
+            )
+            n1 = x.size(1)
+            for tile_m in hl.tile(x.size(0)):
+                out[tile_m, :n1] = x[tile_m, :]
+                out[tile_m, n1:] = y[tile_m, :]
+            return out
+
+        x = torch.randn([32, 16], device=DEVICE)
+        y = torch.randn([32, 24], device=DEVICE)
+        result = kernel(x, y)
+        expected = torch.cat([x, y], dim=1)
+        torch.testing.assert_close(result, expected)
+
     def test_broadcast(self):
         """Test both setter from scalar and getter for [:, i]"""
 
@@ -2335,9 +2675,6 @@ class TestIndexing(RefEagerTestBase, TestCase):
 
         torch.testing.assert_close(result, expected)
 
-    @xfailIfCute(
-        "CuTe does not yet support static hl.arange tensor indexers mixed with non-consecutive tensor indexers"
-    )
     def test_non_consecutive_tensor_indexers_no_broadcast(self):
         """Test that non-consecutive tensor indexers don't get incorrectly broadcast.
 
@@ -2394,9 +2731,6 @@ class TestIndexing(RefEagerTestBase, TestCase):
             )
         torch.testing.assert_close(result, expected)
 
-    @xfailIfCute(
-        "CuTe layout propagation does not yet resolve mixed scalar/block stores with size-1 dimensions"
-    )
     def test_mixed_scalar_block_store_size1_dim(self):
         """Test store with mixed scalar/block indexing when block dimension has size 1.
 
@@ -2600,9 +2934,6 @@ class TestIndexing(RefEagerTestBase, TestCase):
         expected = data[index_source, :, :]
         torch.testing.assert_close(result, expected)
 
-    @xfailIfCute(
-        "CuTe batched matmul lowering for full-slice loads in reduction loops is incorrect"
-    )
     def test_full_slice_in_reduction_loop(self):
         """Full slice between two tiled dims: q[tile_n, :, tile_d]
 
@@ -2632,7 +2963,8 @@ class TestIndexing(RefEagerTestBase, TestCase):
             torch.zeros(16, 16, 16, device=DEVICE), q, q.transpose(-2, -1)
         ).sum(-1)
         torch.testing.assert_close(result, expected, atol=0.2, rtol=0.01)
-        self.assertIn("tl.dot", code)
+        if _get_backend() == "triton":
+            self.assertIn("tl.dot", code)
 
     def test_symbolic_index_in_host_block(self):
         """Regression test for https://github.com/pytorch/helion/issues/1339.

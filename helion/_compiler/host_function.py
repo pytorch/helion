@@ -33,7 +33,7 @@ if TYPE_CHECKING:
 
     from .device_ir import DeviceIR
     from .source_location import SourceLocation
-    from .type_propagation import TypeInfo
+    from .type_info import TypeInfo
 
     class _TLS(Protocol):
         functions: list[HostFunction]
@@ -95,7 +95,7 @@ class CompilerState:
     consumed by code generation.
     """
 
-    expr_to_origin: dict[sympy.Expr, SymbolOrigin] = dataclasses.field(
+    expr_to_origin: dict[sympy.Basic, SymbolOrigin] = dataclasses.field(
         default_factory=dict
     )
     tensor_to_origin: dict[torch.Tensor, Origin] = dataclasses.field(
@@ -137,7 +137,7 @@ class HostFunction:
 
     @property
     def fn(self) -> types.FunctionType:
-        return self.definition.fn
+        return self.definition.fn  # pyrefly: ignore[bad-return]
 
     @property
     def constexpr_args(self) -> dict[str, object]:
@@ -173,7 +173,7 @@ class HostFunction:
         self._device_ir = value
 
     @property
-    def expr_to_origin(self) -> dict[sympy.Expr, SymbolOrigin]:
+    def expr_to_origin(self) -> dict[sympy.Basic, SymbolOrigin]:
         return self.compiler_state.expr_to_origin
 
     @property
@@ -275,6 +275,8 @@ class HostFunction:
 
     def literal_expr(self, expr: object) -> str:
         if isinstance(expr, (torch.SymInt, torch.SymFloat, torch.SymBool)):
+            # SymBool's `_sympy_()` is a boolean, not an Expr that sympy_expr wants.
+            # pyrefly: ignore [bad-argument-type]
             return self.sympy_expr(expr._sympy_())
         if isinstance(expr, sympy.Expr):
             return self.sympy_expr(expr)

@@ -159,22 +159,14 @@ def _vec_width(node: ast.AST) -> int | None:
     return None
 
 
-def offset_var_for(loop: ast.For) -> str:
-    """Return the for-loop target variable name."""
-    assert isinstance(loop.target, ast.Name)
-    return loop.target.id
-
-
 def _dtype_from_default(node: ast.expr) -> str | None:
     """Extract dtype from the else branch of a masked load.
 
     For ``... if mask else cutlass.Float32(0)``, the else expression is
     ``cutlass.Float32(0)`` and the dtype is ``cutlass.Float32``.
     """
-    if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+    if isinstance(node, ast.Call) and isinstance(node.func, (ast.Attribute, ast.Name)):
         return ast.unparse(node.func)
-    if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
-        return node.func.id
     return None
 
 
@@ -274,7 +266,7 @@ def _canonical_load_text(node: ast.AST, lane_var_alias: dict[str, str]) -> str:
     return text
 
 
-class _CuteFuseTwoPassLoads(ast.NodeTransformer):
+class _CuteFuseTwoPassLoads:
     """See module docstring."""
 
     def __init__(
@@ -326,9 +318,9 @@ class _CuteFuseTwoPassLoads(ast.NodeTransformer):
              vec_for); index is ``(offset - start) // step * K + lane``.
         """
         body = outer_loop.body
-        offset_var = offset_var_for(outer_loop)
+        assert isinstance(outer_loop.target, ast.Name)
         cache_index_outer = (
-            f"({offset_var} - ({_node_text(start)})) // ({_node_text(step)})"
+            f"({outer_loop.target.id} - ({_node_text(start)})) // ({_node_text(step)})"
         )
         for_children = [s for s in body if isinstance(s, ast.For)]
         if not for_children:
@@ -585,7 +577,7 @@ class _CuteFuseTwoPassLoads(ast.NodeTransformer):
             # (the ``unroll`` mode's U16 vec hoist) cache via a *scalar*
             # fragment of ``cache_size * V`` slots — one slot per
             # extracted lane — because the CUTLASS DSL's
-            # ``cute.make_fragment(N, dtype)`` does not currently accept a
+            # ``cute.make_rmem_tensor(N, dtype)`` does not currently accept a
             # vec element type.  Scalar (masked / unmasked) loads cache as
             # the existing fast path.
             tracked: dict[str, tuple[int, str, str, str | None, int | None]] = {}
@@ -686,7 +678,7 @@ class _CuteFuseTwoPassLoads(ast.NodeTransformer):
                     cache_total = cache_total_per_thread
                     cache_decls.append(
                         statement_from_string(
-                            f"{cache} = cute.make_fragment({cache_total}, {dtype})"
+                            f"{cache} = cute.make_rmem_tensor({cache_total}, {dtype})"
                         )
                     )
             if not cache_names:
@@ -850,13 +842,6 @@ class _CuteFuseTwoPassLoads(ast.NodeTransformer):
         if not any_fused:
             return None
         return new_body
-
-    def visit_FunctionDef(self, node: ast.FunctionDef) -> ast.FunctionDef:
-        new_body = self._try_fuse(node.body)
-        if new_body is not None:
-            node.body = new_body
-        # Recurse for nested functions (unlikely in our kernels).
-        return self.generic_visit(node)  # type: ignore[return-value]
 
 
 def fuse_two_pass_loads(

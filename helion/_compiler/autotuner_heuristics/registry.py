@@ -14,6 +14,7 @@ class AutotunerHeuristic:
 
     name: ClassVar[str]
     backend: ClassVar[str]
+    promote_seed_to_default: ClassVar[bool] = False
 
     @classmethod
     def is_eligible(cls, env: CompileEnvironment, device_ir: DeviceIR) -> bool:

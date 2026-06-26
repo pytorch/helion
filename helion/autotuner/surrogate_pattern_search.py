@@ -406,6 +406,9 @@ class LFBOPatternSearch(PatternSearch):
         check_population_consistency(
             self.population, process_group_name=self.kernel.env.process_group_name
         )
+        # Snapshot compiler-seeded members so they survive the search-loop
+        # pruning into the final-pick verification candidate pool.
+        self.capture_compiler_seed_members(self.population)
         self.population.sort(key=performance)
         starting_points = []
         for member in self.population[: self.copies]:
@@ -485,9 +488,8 @@ class LFBOPatternSearch(PatternSearch):
                 # Fit model
                 self._fit_surrogate()
 
-        # Run finishing phase to simplify the best configuration
-        best = self.run_finishing_phase(self.best, self.finishing_rounds)
-        return best.config
+        # Final verification, finishing phase, and (TPU-only) final-pick re-rank.
+        return self._finalize()
 
     def _generate_neighbors(self, base: FlatConfig) -> list[FlatConfig]:
         """

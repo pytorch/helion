@@ -217,6 +217,9 @@ class TestBarrier(RefEagerTestBase, TestCase):
         class _FakeRDim:
             block_id = 7
             reduction = True
+            # A static reduction extent so register_rollable_reductions can build a
+            # ReductionFact (static_rnumel reads rdim.size).
+            size = 16
 
             def size_hint(self) -> int:
                 return 16
@@ -239,6 +242,9 @@ class TestBarrier(RefEagerTestBase, TestCase):
             def has_stack_tensor_with_rdim(self, graph: torch.fx.Graph) -> bool:
                 return False
 
+            def has_unrollable_reduction(self, graph: torch.fx.Graph) -> bool:
+                return False
+
             def process(self, graph: torch.fx.Graph) -> torch.fx.Graph:
                 reduction_graph = torch.fx.Graph()
                 reduction_graph.output(())
@@ -258,7 +264,7 @@ class TestBarrier(RefEagerTestBase, TestCase):
 
         fake_env = SimpleNamespace(
             block_sizes=[_FakeRDim()],
-            config_spec=SimpleNamespace(reduction_loops=[]),
+            config_spec=SimpleNamespace(reduction_loops=[], reduction_facts=[]),
             backend_name="triton",
         )
 
@@ -280,7 +286,7 @@ class TestBarrier(RefEagerTestBase, TestCase):
             device_ir.register_rollable_reductions()
 
         # Sub-graphs (ReductionLoopGraphInfo) are kept so that
-        # _count_device_loads_and_stores can account for their loads/stores.
+        # _collect_memory_op_facts can account for their loads/stores.
         self.assertEqual(len(device_ir.graphs), original_graph_count + 1)
         self.assertEqual(len(device_ir.rolled_reductions), 1)
         self.assertEqual(len(fake_env.config_spec.reduction_loops), 1)

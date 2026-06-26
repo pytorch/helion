@@ -7,6 +7,7 @@ import functools
 import itertools
 import math
 import operator
+import re
 from typing import TYPE_CHECKING
 from typing import NamedTuple
 from typing import TypeVar
@@ -113,10 +114,28 @@ def _lane_reduce_marker_expr(
     reduction_type: str,
     identity_expr: str,
     threads_in_group: int,
+    *,
+    group_pre: int = 1,
+    group_span: int = 0,
+    group_lane_expr: str = "",
+    group_count: int = 1,
 ) -> str:
+    # ``group_*`` (optional) carry the parameters of a strided grouped
+    # reduction. They are required when the reduction's live thread axis is
+    # interleaved with an unrelated sibling thread axis. ``group_lane_expr`` is
+    # base64-free but may contain commas/parens, so it is passed as a string
+    # literal that the post-pass re-parses.
+    #
+    # When ``group_span <= 32`` the de-interleaving fits in a single warp and
+    # the finalize uses ``_cute_grouped_reduce_warp``. When ``group_span > 32``
+    # (and a multiple of 32) the reduction group is spread across warps, so the
+    # finalize uses the cross-warp ``_cute_grouped_reduce_shared_two_stage``;
+    # ``group_count`` (the number of independent groups in the CTA) is needed
+    # only by that two-stage helper.
     return (
         f"{_HELION_LANE_REDUCE_MARKER}({input_name}, {reduction_type!r}, "
-        f"{identity_expr}, {threads_in_group})"
+        f"{identity_expr}, {threads_in_group}, {group_pre}, {group_span}, "
+        f"{group_lane_expr!r}, {group_count})"
     )
 
 
@@ -131,6 +150,17 @@ class _LaneReduceMarker:
     # ``{finalized}``; ``finalize_expr(x)`` substitutes ``x`` to re-apply any
     # surrounding dtype cast / reshape to the finalized reduced scalar.
     wrap_template: str
+    # Optional strided grouped reduction (the reduction's live thread axis
+    # shares a warp / CTA with an unrelated sibling axis). When ``group_span``
+    # > 0 the finalize uses a grouped reduction keyed on ``group_lane_expr``
+    # instead of a plain consecutive-lane ``cute.arch.warp_reduction_*``:
+    # ``_cute_grouped_reduce_warp`` when ``group_span <= 32`` (single warp),
+    # ``_cute_grouped_reduce_shared_two_stage`` when ``group_span`` is a
+    # multiple of 32 greater than 32 (cross-warp, ``group_count`` groups).
+    group_pre: int = 1
+    group_span: int = 0
+    group_lane_expr: str = ""
+    group_count: int = 1
 
     def finalize_expr(self, reduced: str) -> str:
         return self.wrap_template.replace("__HELION_FINALIZED__", f"({reduced})")
@@ -175,13 +205,26 @@ def _is_lane_reduce_marker_assign(stmt: ast.AST) -> _LaneReduceMarker | None:
     if not isinstance(target, ast.Name):
         return None
     call = _find_lane_reduce_call(stmt.value)
-    if call is None or len(call.args) != 4:
+    if call is None or len(call.args) != 8:
         return None
-    input_node, type_node, identity_node, threads_node = call.args
+    (
+        input_node,
+        type_node,
+        identity_node,
+        threads_node,
+        group_pre_node,
+        group_span_node,
+        group_lane_node,
+        group_count_node,
+    ) = call.args
     input_name = ast.unparse(input_node)
     reduction_type = ast.literal_eval(type_node)
     identity_expr = ast.unparse(identity_node)
     threads_in_group = int(ast.literal_eval(threads_node))
+    group_pre = int(ast.literal_eval(group_pre_node))
+    group_span = int(ast.literal_eval(group_span_node))
+    group_lane_expr = ast.literal_eval(group_lane_node)
+    group_count = int(ast.literal_eval(group_count_node))
     # Build the wrap template by replacing the marker call with a sentinel.
     wrapped = _ReplaceLaneReduceCall().visit(ast.parse(ast.unparse(stmt.value)).body[0])
     assert isinstance(wrapped, ast.Expr)
@@ -193,6 +236,10 @@ def _is_lane_reduce_marker_assign(stmt: ast.AST) -> _LaneReduceMarker | None:
         identity_expr=identity_expr,
         threads_in_group=threads_in_group,
         wrap_template=wrap_template,
+        group_pre=group_pre,
+        group_span=group_span,
+        group_lane_expr=group_lane_expr,
+        group_count=group_count,
     )
 
 
@@ -219,6 +266,123 @@ def _dtype_ctor_from_identity(identity_expr: str) -> str | None:
     if isinstance(node, ast.Call):
         return ast.unparse(node.func)
     return None
+
+
+def _grouped_warp_reduce_expr(
+    reduction_type: str,
+    acc: str,
+    identity_expr: str,
+    lane_expr: str,
+    *,
+    pre: int,
+    group_span: int,
+) -> str:
+    """Strided grouped warp reduction over a single warp.
+
+    Reduces ``acc`` across the ``group_span`` lanes that share the same
+    ``lane % pre`` within each ``group_span``-lane block, so an interleaved
+    sibling thread axis (occupying the low ``pre`` strides) stays distinct.
+    """
+    return (
+        "_cute_grouped_reduce_warp("
+        f"{acc}, {reduction_type!r}, {identity_expr}, {lane_expr}, "
+        f"pre={pre}, group_span={group_span})"
+    )
+
+
+def _grouped_two_stage_reduce_stmts(
+    result_acc: str,
+    reduction_type: str,
+    acc: str,
+    identity_expr: str,
+    lane_expr: str,
+    *,
+    pre: int,
+    group_span: int,
+    group_count: int,
+) -> list[ast.AST]:
+    """Cross-warp grouped reduction over ``group_span`` (> 32) lanes.
+
+    Mirrors ``BlockReductionStrategy._strided_thread_reduction_expr``'s
+    ``group_span > 32`` branch: the reduce group is spread across warps, so a
+    single ``cute.arch.warp_reduction_*`` cannot fold it. The two-stage shared
+    helper reduces each warp, stages the per-warp partials in shared memory, and
+    combines them, keeping the ``pre`` interleaved sibling lanes distinct.
+
+    Unlike that reference emitter this path has no shared-memory-budget fallback,
+    but it does not need one: it only fires for a block-resident reduced tile
+    whose live thread count is bounded by ``MAX_THREADS_PER_BLOCK`` (<= 1024, so
+    <= 32 staged per-warp partials), which cannot overflow the reduction SMEM
+    budget.
+
+    Returns the (lane-index setup + reduce) statements that define
+    ``result_acc`` (used in place of the single-shuffle ``reduced`` scalar).
+    """
+    lane_var = f"{result_acc}_lane"
+    lane_in_group_var = f"{result_acc}_lane_in_group"
+    lane_mod_pre_var = f"{result_acc}_lane_mod_pre"
+    return [
+        statement_from_string(f"{lane_var} = {lane_expr}"),
+        statement_from_string(f"{lane_in_group_var} = ({lane_var}) % {group_span}"),
+        statement_from_string(f"{lane_mod_pre_var} = ({lane_in_group_var}) % {pre}"),
+        statement_from_string(
+            f"{result_acc} = _cute_grouped_reduce_shared_two_stage("
+            f"{acc}, {reduction_type!r}, {identity_expr}, "
+            f"{lane_var}, {lane_in_group_var}, {lane_mod_pre_var}, "
+            f"pre={pre}, group_span={group_span}, group_count={group_count})"
+        ),
+    ]
+
+
+def _finalize_lane_reduce_marker(m: _LaneReduceMarker, acc_var: str) -> list[ast.AST]:
+    """Combine a marker's per-lane accumulator ``acc_var`` across the live
+    thread axis and assign the finalized scalar to ``m.result_var``.
+
+    Picks the cross-thread combine that matches the marker's thread layout:
+
+    * a cross-warp two-stage shared reduction when the reduce group spans more
+      than one warp (``group_span`` a multiple of 32 > 32);
+    * a single-warp strided grouped reduction when the reduce axis shares a warp
+      with an unrelated sibling axis (``1 < group_span <= 32`` with ``pre`` > 1);
+    * a plain consecutive-lane warp reduction otherwise;
+    * the accumulator unchanged when there is no live thread axis to combine.
+    """
+    if m.group_span > 32 and m.group_span % 32 == 0 and m.group_lane_expr:
+        # Cross-warp: the reduce group is spread across warps, so fold the
+        # per-lane accumulator with the two-stage shared-memory reduction.
+        stmts = _grouped_two_stage_reduce_stmts(
+            f"{acc_var}_reduced",
+            m.reduction_type,
+            acc_var,
+            m.identity_expr,
+            m.group_lane_expr,
+            pre=m.group_pre,
+            group_span=m.group_span,
+            group_count=m.group_count,
+        )
+        stmts.append(
+            statement_from_string(
+                f"{m.result_var} = {m.finalize_expr(f'{acc_var}_reduced')}"
+            )
+        )
+        return stmts
+    if m.group_span > 1 and m.group_pre > 1 and m.group_lane_expr:
+        # Strided grouped reduction: the reduce axis shares a warp with an
+        # unrelated sibling axis, so combine only the lanes that share the
+        # current lane's sibling coordinate.
+        reduced = _grouped_warp_reduce_expr(
+            m.reduction_type,
+            acc_var,
+            m.identity_expr,
+            m.group_lane_expr,
+            pre=m.group_pre,
+            group_span=m.group_span,
+        )
+    elif m.threads_in_group > 1:
+        reduced = _warp_reduce_expr(m.reduction_type, acc_var, m.threads_in_group)
+    else:
+        reduced = acc_var
+    return [statement_from_string(f"{m.result_var} = {m.finalize_expr(reduced)}")]
 
 
 def _warp_reduce_expr(reduction_type: str, acc: str, threads_in_group: int) -> str:
@@ -340,13 +504,37 @@ def _split_one_lane_loop(loop: ast.For, lane_var: str) -> list[ast.AST]:
     if not markers:
         return [loop]
 
+    marker_indices = {i for i, _ in markers}
+
+    # A matmul whose *output* is reduced over a lane-distributed axis (e.g.
+    # matmul_layernorm's ``acc.sum(-1)`` over the synthetic-lane N output) cannot
+    # be handled by the per-lane / two-pass paths below: each lane owns a
+    # distinct output column, so the reduction must combine DIFFERENT lanes, and
+    # the matmul (an unduplicatable cross-thread shared-memory reduction) cannot
+    # be re-run in a second lane pass.  The register-stash lowering runs the
+    # matmul once, stashes each lane's output in a per-thread fragment, and
+    # re-derives every downstream reduction / consumer from the stash.
+    #
+    # This is gated narrowly so it does NOT disturb kernels the existing paths
+    # already handle correctly:
+    #   * an unduplicatable op must feed the reduction, and
+    #   * the marker results must NOT be consumed by a cross-lane loop-carried
+    #     accumulator.  Online-softmax attention carries ``mi``/``di`` across the
+    #     lane loop (``di = di * alpha + sum``); there the per-lane restore is
+    #     correct, so the stash path must stay out of the way.
+    if any(
+        _contains_unduplicatable_op(stmt) for stmt in body
+    ) and not _markers_feed_cross_lane_carry(body, lane_var, markers):
+        stashed = _split_lane_loop_with_register_stash(loop, lane_var, markers)
+        if stashed is not None:
+            return stashed
+
     # Safety: the two-pass split is only valid when the reduction marker is the
     # ONLY cross-lane carried value in this lane loop. If the body has another
     # loop-carried accumulator across the lanes (e.g. a matmul ``dot_acc`` or a
     # plain ``extra += per_lane`` sum that already accumulates over the lanes),
     # splitting would drop or double-count it. Fall back to the original
     # single-pass per-lane behavior by replacing each marker with its raw input.
-    marker_indices = {i for i, _ in markers}
     if _has_extra_cross_lane_carry(body, lane_var, marker_indices):
         return [_restore_per_lane_markers(loop, markers)]
 
@@ -366,7 +554,9 @@ def _split_one_lane_loop(loop: ast.For, lane_var: str) -> list[ast.AST]:
     # reduction-input producers. That is only safe for side-effect-free
     # producers. A matmul / collective in the slice (cross-thread shared-memory
     # reductions, ``cute.gemm``, ``dot``) cannot be duplicated without racing on
-    # shared memory, so fall back to per-lane behavior in that case.
+    # shared memory, so fall back to per-lane behavior in that case (the
+    # register-stash path above handles the cases where the per-lane restore
+    # would be numerically wrong).
     if any(_contains_unduplicatable_op(body[i]) for i in phase1_indices):
         return [_restore_per_lane_markers(loop, markers)]
 
@@ -388,13 +578,7 @@ def _split_one_lane_loop(loop: ast.For, lane_var: str) -> list[ast.AST]:
                 f"{acc_var} = {_combine_expr(m.reduction_type, acc_var, combine_val)}"
             )
         )
-        if m.threads_in_group > 1:
-            reduced = _warp_reduce_expr(m.reduction_type, acc_var, m.threads_in_group)
-        else:
-            reduced = acc_var
-        finalize.append(
-            statement_from_string(f"{m.result_var} = {m.finalize_expr(reduced)}")
-        )
+        finalize.extend(_finalize_lane_reduce_marker(m, acc_var))
 
     # Phase 2: everything except the marker assignments themselves; the
     # reduced scalar is already finalized so consumers read it directly.
@@ -430,6 +614,479 @@ def _split_one_lane_loop(loop: ast.For, lane_var: str) -> list[ast.AST]:
     if lane_varying_tail:
         result.append(_create_lane_loop(lane_var, extent, lane_varying_tail))
     return result
+
+
+_LANE_STASH_COUNTER = itertools.count()
+
+
+def _stash_dtype_for_value(
+    value_name: str, body: list[ast.AST], markers: list[tuple[int, _LaneReduceMarker]]
+) -> str:
+    """Pick a CuTe scalar dtype constructor for a stashed lane value.
+
+    Prefer the accumulator dtype of a marker whose input transitively reads the
+    stashed value (matmul outputs feed an fp32 ``sum``), then any cast that
+    wraps the value's defining assignment, then ``cutlass.Float32``.
+    """
+    from .ast_read_writes import ReadWrites
+
+    for _idx, m in markers:
+        slice_indices, _ = _backward_slice(body, {m.input_name})
+        reads_value = any(
+            value_name in ReadWrites.from_ast(body[i]).reads for i in slice_indices
+        )
+        if reads_value:
+            ctor = _dtype_ctor_from_identity(m.identity_expr)
+            if ctor is not None:
+                return ctor
+    for stmt in body:
+        if (
+            isinstance(stmt, ast.Assign)
+            and len(stmt.targets) == 1
+            and isinstance(stmt.targets[0], ast.Name)
+            and stmt.targets[0].id == value_name
+            and isinstance(stmt.value, ast.Call)
+            and isinstance(stmt.value.func, ast.Attribute)
+            and isinstance(stmt.value.func.value, ast.Name)
+            and stmt.value.func.value.id == "cutlass"
+        ):
+            return f"cutlass.{stmt.value.func.attr}"
+    return "cutlass.Float32"
+
+
+def _strip_ssa_suffix(name: str) -> str:
+    """Strip Helion's SSA / loop-carry suffixes from a variable name.
+
+    ``acc_1`` / ``acc_copy`` / ``acc_copy_0`` all collapse to ``acc`` so a
+    loop-carried accumulator can be matched to its per-iteration rewrites.
+    """
+    base = re.sub(r"(_copy)(_\d+)*$", "", name)
+    return re.sub(r"(_\d+)+$", "", base)
+
+
+def _assigns_simple_name(stmt: ast.AST, names: set[str]) -> bool:
+    """Return True when ``stmt`` is ``X = ...`` for some ``X`` in ``names``."""
+    return (
+        isinstance(stmt, ast.Assign)
+        and len(stmt.targets) == 1
+        and isinstance(stmt.targets[0], ast.Name)
+        and stmt.targets[0].id in names
+    )
+
+
+def _undup_stmt_rederives(stmt: ast.AST, name: str) -> bool:
+    """Return True when ``stmt`` (an unduplicatable statement, typically the
+    matmul K ``for`` loop) re-derives the loop-carried accumulator ``name``.
+
+    The statement re-derives ``name`` when it both reads ``name`` (the live-in
+    accumulator) and writes a value transitively dependent on ``name`` whose
+    SSA-stripped name equals ``name`` (e.g. ``acc_1 = acc_copy_0 + ...``).  A
+    plain input the matmul only reads (``indices_2``) is not re-derived.
+    """
+    from .ast_read_writes import ReadWrites
+
+    if not isinstance(stmt, ast.For):
+        rw = ReadWrites.from_ast(stmt)
+        return name in rw.reads and any(_strip_ssa_suffix(w) == name for w in rw.writes)
+    if name not in ReadWrites.from_ast(stmt).reads:
+        return False
+    # Forward slice from ``name`` within the loop body; True when it reaches a
+    # write whose stripped name is ``name``.
+    inner = list(stmt.body)
+    tainted = {name}
+    changed = True
+    while changed:
+        changed = False
+        for s in inner:
+            rw = ReadWrites.from_ast(s)
+            if set(rw.reads) & tainted:
+                for w in rw.writes:
+                    if w not in tainted:
+                        tainted.add(w)
+                        changed = True
+    return any(_strip_ssa_suffix(w) == name for w in tainted if w != name)
+
+
+def _store_value_and_addr_reads(stmt: ast.AST) -> tuple[set[str], set[str]] | None:
+    """For a statement containing a single ``(ADDR).store(VALUE)`` call, return
+    ``(value_reads, addr_reads)`` — the names read in the stored VALUE and the
+    names read in the ADDRESS expression (plus any guarding condition).
+
+    Returns ``None`` when the statement has no ``.store(...)`` call (or has more
+    than one, which this analysis does not attempt to characterize)."""
+    stores = [
+        node
+        for node in ast.walk(stmt)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "store"
+        and len(node.args) == 1
+    ]
+    if len(stores) != 1:
+        return None
+    store = stores[0]
+    value_reads = {n.id for n in ast.walk(store.args[0]) if isinstance(n, ast.Name)}
+    # Everything read in the statement that is not part of the stored value
+    # belongs to the address expression / guard (e.g. an enclosing ``if mask:``).
+    all_reads = {n.id for n in ast.walk(stmt) if isinstance(n, ast.Name)}
+    addr_reads = all_reads - value_reads
+    return value_reads, addr_reads
+
+
+def _lane_axis_wrongly_collapsed(
+    tail: list[ast.AST],
+    lane_var: str,
+    lane_varying: set[str],
+    stash_set: set[str],
+    marker_result_names: set[str],
+) -> bool:
+    """Return True when the register-stash lowering would collapse the lane axis
+    incorrectly.
+
+    The stash lowering reduces each marker over the lane axis, which is only
+    correct when the lane-distributed axis IS the reduced axis (matmul_layernorm:
+    the reduced output free dim is broadcast back into a per-lane store whose
+    VALUE still depends on the per-lane stash output).  When a side-effecting
+    store writes to a lane-varying ADDRESS but its stored VALUE depends only on
+    the reduced marker scalars (never on a per-lane stash output), each lane is a
+    distinct, preserved output element that the lane reduction wrongly collapses
+    (e.g. ``baddbmm(...).sum(-1)`` with the reduced dim folded into the matmul).
+
+    ``lane_varying`` is the set of lane-derived names over the FULL lane-loop body
+    (the per-lane output index, e.g. ``indices_2``, lives in the compute region
+    rather than the tail, so it must be supplied by the caller).
+    """
+    # Names in the tail that (transitively) depend on a stashed per-lane value,
+    # WITHOUT crossing a marker reduction.  A reduction marker collapses the lane
+    # axis: its result is a cross-lane reduced scalar, no longer a per-lane value,
+    # so the taint must STOP at marker results (a store of the reduced scalar is
+    # exactly the collapse-bug signature, and must not count as stash-dependent).
+    stash_tainted = _forward_taint_excluding_markers(
+        tail, stash_set, marker_result_names
+    )
+    for stmt in tail:
+        parsed = _store_value_and_addr_reads(stmt)
+        if parsed is None:
+            continue
+        value_reads, addr_reads = parsed
+        addr_lane_varying = lane_var in addr_reads or bool(addr_reads & lane_varying)
+        value_depends_on_stash = bool(value_reads & stash_tainted)
+        value_depends_on_marker = bool(value_reads & marker_result_names)
+        if addr_lane_varying and value_depends_on_marker and not value_depends_on_stash:
+            return True
+    return False
+
+
+def _forward_taint_excluding_markers(
+    body: list[ast.AST], roots: set[str], marker_result_names: set[str]
+) -> set[str]:
+    """Forward-slice taint of ``roots`` through ``body`` that does NOT propagate
+    across a lane-reduce marker.
+
+    A marker assigns a cross-lane reduced scalar (``R = ..._helion_lane_reduce``);
+    its result no longer depends on a single lane's value, so a statement that
+    only writes a marker result must not inherit the taint even when its reduction
+    input was tainted.
+    """
+    from .ast_read_writes import ReadWrites
+
+    tainted = set(roots)
+    changed = True
+    while changed:
+        changed = False
+        for stmt in body:
+            rw = ReadWrites.from_ast(stmt)
+            if not (set(rw.reads) & tainted):
+                continue
+            for w in rw.writes:
+                # A marker result is a reduction boundary: never taint it.
+                if w in marker_result_names:
+                    continue
+                if w not in tainted:
+                    tainted.add(w)
+                    changed = True
+    return tainted
+
+
+def _split_lane_loop_with_register_stash(
+    loop: ast.For,
+    lane_var: str,
+    markers: list[tuple[int, _LaneReduceMarker]],
+) -> list[ast.AST] | None:
+    """Lower a lane loop whose reduction inputs depend on an unduplicatable op.
+
+    The standard two-pass split re-runs the reduction-input producers in a
+    second pass, which is unsafe when a matmul / cross-thread reduction is in
+    the slice.  Instead, run the matmul-bearing *compute region* (the prefix of
+    the body up to and including the last unduplicatable statement) exactly
+    once, stashing each lane's unduplicatable-derived live-out values into
+    per-thread register fragments.  Every downstream reduction marker and
+    consumer is then re-derived from the stash (a plain register read, safely
+    duplicatable), one accumulate/finalize pass per marker in dependency order,
+    plus a final consume pass for the side-effecting statements.
+
+    Returns the replacement statement list, or ``None`` when the pattern does
+    not apply (caller then falls back to the per-lane single-pass behavior).
+    """
+    from .ast_read_writes import ReadWrites
+
+    body: list[ast.AST] = list(loop.body)
+    marker_indices = {i for i, _ in markers}
+    extent = _lane_loop_extent(loop)
+
+    # Compute region: prefix of the body up to (and including) the last
+    # unduplicatable statement.  Everything after it must be free of
+    # unduplicatable ops so it can be re-derived from the stash.
+    undup_indices = [
+        i for i in range(len(body)) if _contains_unduplicatable_op(body[i])
+    ]
+    if not undup_indices:
+        return None
+    region_end = max(undup_indices)
+    region = body[: region_end + 1]
+    tail = body[region_end + 1 :]
+    tail_offset = region_end + 1
+    if any(_contains_unduplicatable_op(s) for s in tail):
+        return None
+    # A marker inside the compute region cannot be re-derived from the stash
+    # (its reduction would have to run before the matmul finishes).
+    if any(i <= region_end for i in marker_indices):
+        return None
+
+    if extent <= 0 or extent > 256:
+        return None
+
+    lane_varying = _lane_varying_names(body, lane_var)
+
+    tail_reads: set[str] = set()
+    for stmt in tail:
+        tail_reads |= set(ReadWrites.from_ast(stmt).reads)
+
+    # Identify the loop-carried accumulators produced by the unduplicatable
+    # statements — values whose post-region magnitude depends on the matmul and
+    # therefore cannot be recomputed.  These are exactly the names that MUST be
+    # stashed.  Helion emits a matmul K loop as
+    # ``acc = 0; for k: acc_copy = acc; ...; acc_<n> = acc_copy_0 + reduce`` and
+    # an implicit phi makes the post-loop ``acc`` equal the loop output
+    # ``acc_<n>`` (collapsed by a later rename pass).  A name X is carried when:
+    #   * X is written by a non-unduplicatable region statement (its ``acc = 0``
+    #     seed) and read after the region (lane-varying), and
+    #   * an unduplicatable statement's body re-derives X — its forward slice
+    #     from X reaches a write whose SSA-stripped name equals X (``acc_1`` /
+    #     ``acc_copy`` -> ``acc``).
+    # The forward-slice condition distinguishes a true accumulator (``acc``,
+    # rewritten each K step) from a plain input that the matmul merely reads
+    # (``indices_2``, unchanged through the loop).
+    seed_writes: set[str] = set()
+    for i, stmt in enumerate(region):
+        if i in undup_indices:
+            continue
+        seed_writes |= set(ReadWrites.from_ast(stmt).writes)
+    # The carried accumulator's *name* (``acc`` from ``acc = 0``) is not itself
+    # lane-varying — only the loop output alias (``acc_1``) is — so do NOT filter
+    # candidates by ``lane_varying`` here.  The re-derives check confirms the
+    # matmul transforms the accumulator, and below we require the re-deriving
+    # statement to be lane-varying so a genuinely lane-invariant accumulator is
+    # left alone.
+    candidate_carried = seed_writes & tail_reads
+    carried: set[str] = set()
+    for name in candidate_carried:
+        for i in undup_indices:
+            if not _undup_stmt_rederives(body[i], name):
+                continue
+            stmt_reads = set(ReadWrites.from_ast(body[i]).reads)
+            if lane_var in stmt_reads or bool(stmt_reads & lane_varying):
+                carried.add(name)
+                break
+    # Also stash any value DIRECTLY produced by an unduplicatable statement that
+    # is read by the tail (e.g. a matmul whose output is a fresh name rather than
+    # an accumulator phi).
+    undup_writes: set[str] = set()
+    for i in undup_indices:
+        undup_writes |= set(ReadWrites.from_ast(body[i]).writes)
+    direct = undup_writes & lane_varying & tail_reads
+    stash_names = sorted(carried | direct)
+    if not stash_names:
+        return None
+
+    stash_set = set(stash_names)
+
+    # Correctness gate: the register-stash lowering reduces each marker OVER THE
+    # LANE axis (stash per lane, then sum lanes + warp-reduce).  That is only
+    # valid when the lane-distributed axis IS the reduced axis — i.e. the genuine
+    # matmul_layernorm pattern, where the matmul OUTPUT free dim is split across
+    # the lane and the layernorm reduces exactly that dim, then broadcasts the
+    # reduced scalar back into a *per-lane* normalize+store (each lane keeps a
+    # distinct, stash-derived output value).
+    #
+    # A different pattern — e.g. ``baddbmm(...).sum(-1)`` over a small static dim
+    # — folds the reduced axis into the matmul itself, leaving each lane holding a
+    # COMPLETE, distinct output element.  There the lane axis is a *preserved*
+    # output dim, the spurious marker reduces over the wrong (lane) axis, and the
+    # store writes the single reduced scalar to lane-varying addresses (every lane
+    # storing the same collapsed value).  Detect that here and bail to the
+    # correct per-lane path: a side-effecting store whose ADDRESS depends on the
+    # lane var but whose stored VALUE depends only on reduced marker results (no
+    # per-lane stash output) means the lane axis was wrongly collapsed.
+    marker_result_names = {m.result_var for _, m in markers}
+    if _lane_axis_wrongly_collapsed(
+        tail, lane_var, lane_varying, stash_set, marker_result_names
+    ):
+        return None
+    # Region statements that are *duplicatable* and can be recomputed cheaply in
+    # the later passes (e.g. ``indices_2 = thread_idx[0] + lane * 4``).  Drop the
+    # unduplicatable statements and any statement that produces a stashed name.
+    recompute: list[ast.AST] = []
+    for i, stmt in enumerate(region):
+        if i in undup_indices:
+            continue
+        writes = set(ReadWrites.from_ast(stmt).writes)
+        if writes & stash_set:
+            continue
+        recompute.append(stmt)
+    # Keep only the recompute statements that (transitively) feed the tail.
+    recompute_keep_idx, _ = _backward_slice(recompute, tail_reads)
+    recompute_kept = [recompute[i] for i in recompute_keep_idx]
+    # The recompute slice must not pull in an unduplicatable op or reference a
+    # stashed name (which is only available from the fragment, not recomputable).
+    for s in recompute_kept:
+        if _contains_unduplicatable_op(s):
+            return None
+
+    # Allocate one register fragment per stashed value.
+    uid = next(_LANE_STASH_COUNTER)
+    frag_by_name: dict[str, str] = {}
+    decls: list[ast.AST] = []
+    for name in stash_names:
+        frag = f"_lane_stash_{uid}_{name}"
+        frag_by_name[name] = frag
+        dtype = _stash_dtype_for_value(name, body, markers)
+        decls.append(
+            statement_from_string(f"{frag} = cute.make_fragment({extent}, {dtype})")
+        )
+
+    def read_stash_stmts() -> list[ast.AST]:
+        return [
+            statement_from_string(f"{name} = {frag_by_name[name]}[{lane_var}]")
+            for name in stash_names
+        ]
+
+    # Phase 0: run the compute region once and stash the live-out values.
+    phase0_body: list[ast.AST] = list(region)
+    for name in stash_names:
+        phase0_body.append(
+            statement_from_string(f"{frag_by_name[name]}[{lane_var}] = {name}")
+        )
+
+    # The marker assignments within the tail produce already-finalized scalars
+    # (computed once after each reduction pass), so they must NOT be re-run as
+    # per-lane passthroughs inside any later pass.  Build the re-derivable tail
+    # (every non-marker statement) and the set of finalized marker result vars
+    # that downstream slices treat as pre-defined boundaries.
+    marker_result_vars = {m.result_var for _, m in markers}
+    rederivable_tail = [s for s in tail if _is_lane_reduce_marker_assign(s) is None]
+
+    result: list[ast.AST] = []
+    result.extend(decls)
+    result.append(_create_lane_loop(lane_var, extent, phase0_body))
+
+    # Process each marker in source order (they are sequentially dependent: a
+    # later marker's input may read an earlier marker's finalized scalar).
+    for _idx, m in markers:
+        acc_var = f"{m.result_var}_lane_acc"
+        result.append(statement_from_string(f"{acc_var} = {m.identity_expr}"))
+        # Accumulate pass: recompute cheap region producers, read the stash,
+        # then re-derive this marker's input and fold it into the accumulator.
+        # The slice runs over the re-derivable tail only; references to other
+        # markers' results stop at those finalized scalars.
+        input_slice_idx, _ = _backward_slice(rederivable_tail, {m.input_name})
+        input_stmts = [
+            rederivable_tail[i]
+            for i in input_slice_idx
+            if not _assigns_simple_name(rederivable_tail[i], marker_result_vars)
+        ]
+        acc_body: list[ast.AST] = []
+        acc_body.extend(_clone_stmt(s) for s in recompute_kept)
+        acc_body.extend(read_stash_stmts())
+        acc_body.extend(_clone_stmt(s) for s in input_stmts)
+        ctor = _dtype_ctor_from_identity(m.identity_expr)
+        combine_val = f"{ctor}({m.input_name})" if ctor is not None else m.input_name
+        acc_body.append(
+            statement_from_string(
+                f"{acc_var} = {_combine_expr(m.reduction_type, acc_var, combine_val)}"
+            )
+        )
+        result.append(_create_lane_loop(lane_var, extent, acc_body))
+        result.extend(_finalize_lane_reduce_marker(m, acc_var))
+
+    # Final consume pass: everything in the tail except the marker assignments,
+    # re-derived from the stash + finalized scalars.  Only keep statements that
+    # feed a side effect (a store / in-place write).
+    consume_candidates = [s for i, s in enumerate(body) if i >= tail_offset]
+    consume_candidates = [
+        s for s in consume_candidates if _is_lane_reduce_marker_assign(s) is None
+    ]
+    keep_idx = _live_phase2_indices(consume_candidates)
+    consume_kept = [s for i, s in enumerate(consume_candidates) if i in keep_idx]
+    if consume_kept:
+        consume_body: list[ast.AST] = []
+        consume_body.extend(_clone_stmt(s) for s in recompute_kept)
+        consume_body.extend(read_stash_stmts())
+        consume_body.extend(_clone_stmt(s) for s in consume_kept)
+        result.append(_create_lane_loop(lane_var, extent, consume_body))
+    return result
+
+
+def _markers_feed_cross_lane_carry(
+    body: list[ast.AST],
+    lane_var: str,
+    markers: list[tuple[int, _LaneReduceMarker]],
+) -> bool:
+    """Return True when the lane loop carries an accumulator across the lanes
+    that a marker result feeds (online-softmax attention's ``m_i`` / ``l_i`` /
+    ``acc`` recurrence).
+
+    Helion represents a loop-carried value with a phi ``X_copy = X`` read at the
+    TOP of the loop body (before the value is rewritten) and a corresponding
+    output assignment renamed back to ``X`` by a later pass.  Such an
+    accumulating lane loop must keep the existing per-lane restore lowering, so
+    the register-stash path (which assumes each marker result is consumed only by
+    per-lane / store consumers, never carried across lanes) must not fire.
+
+    matmul_layernorm's N-output lane loop has no such top-level ``X_copy = X``
+    carry (its ``acc`` is the matmul accumulator, carried by the *inner* K loop,
+    not across the lane iterations), so this returns False and the stash path is
+    free to run.
+    """
+    from .ast_read_writes import ReadWrites
+
+    if not markers:
+        return False
+
+    # Live-in names of the lane body (read before written), excluding the lane
+    # var.  A loop-carried accumulator phi is live-in.
+    written_so_far: set[str] = set()
+    live_in: set[str] = set()
+    for stmt in body:
+        rw = ReadWrites.from_ast(stmt)
+        for name in rw.reads:
+            if name != lane_var and name not in written_so_far:
+                live_in.add(name)
+        written_so_far |= set(rw.writes)
+
+    # Detect top-level phi copies ``X_copy = X`` of a live-in accumulator.
+    for stmt in body:
+        if (
+            isinstance(stmt, ast.Assign)
+            and len(stmt.targets) == 1
+            and isinstance(stmt.targets[0], ast.Name)
+            and isinstance(stmt.value, ast.Name)
+        ):
+            src = stmt.value.id
+            dst = stmt.targets[0].id
+            if src in live_in and _strip_ssa_suffix(dst) == _strip_ssa_suffix(src):
+                return True
+    return False
 
 
 def _has_extra_cross_lane_carry(
@@ -606,6 +1263,22 @@ def _lane_varying_names(body: list[ast.AST], lane_var: str) -> set[str]:
                         changed = True
     varying.discard(lane_var)
     return varying
+
+
+def _lane_body_live_in(body: list[ast.AST], lane_var: str) -> set[str]:
+    """Names read in ``body`` before they are written (live-in), excluding the
+    lane var.  A loop-carried accumulator phi is live-in to the lane body."""
+    from .ast_read_writes import ReadWrites
+
+    written: set[str] = set()
+    live_in: set[str] = set()
+    for stmt in body:
+        rw = ReadWrites.from_ast(stmt)
+        for name in rw.reads:
+            if name != lane_var and name not in written:
+                live_in.add(name)
+        written |= set(rw.writes)
+    return live_in
 
 
 def _is_serial_for(stmt: ast.AST) -> bool:
@@ -825,6 +1498,306 @@ def _interchange_one_lane_loop(loop: ast.For, lane_var: str) -> list[ast.AST]:
     nest_b = loop
 
     return [nest_b, *nest_a]
+
+
+# ---------------------------------------------------------------------------
+# Chunked-recurrence (GDN) lane-invariant accumulator hoist.
+#
+# A chunked recurrence such as gdn_fwd_h carries an accumulator ``b_h`` across a
+# SERIAL chunk loop and, inside each chunk, contracts a matmul over the
+# within-chunk position ``c`` (lowered as an inner lane loop).  ``matmul_fallback``
+# emits the running-sum ``dot_acc`` form for this matmul (because the per-chunk
+# rescale is lane-invariant), producing inside the lane loop:
+#
+#       dot_acc_base = <lane-invariant rescale of b_h>      # e.g. b_h * decay
+#       dot_acc = dot_acc + <product(c)>                    # accumulate over c
+#       b_h = dot_acc_base + dot_acc                        # WRONG: per-lane reassign
+#
+# with ``dot_acc = <identity>`` reset OUTSIDE the chunk loop.  Reassigning ``b_h``
+# every lane iteration corrupts the recurrence (and any lane-invariant op that
+# must read the chunk-ENTRY ``b_h``, e.g. the store of ``b_h`` and the matmul
+# operand ``c_h = b_h``).  This pass restructures the nest to apply the rescale
+# and the final add once per chunk:
+#
+#   for chunk:
+#       dot_acc = <identity>                  # reset per chunk
+#       <lane-invariant chunk-entry stores using b_h>
+#       dot_acc_base = <rescale of frozen b_h>
+#       for lane:
+#           <producers; dot_acc = dot_acc + product(c)>
+#       b_h = dot_acc_base + dot_acc          # once per chunk
+# ---------------------------------------------------------------------------
+
+
+def _find_dot_acc_recurrence(
+    lane_loop: ast.For, lane_var: str
+) -> tuple[str, str, str] | None:
+    """If ``lane_loop`` ends with the chunked-recurrence ``dot_acc`` triple,
+    return ``(acc_var, dot_acc_base_var, dot_acc_var)``; else ``None``.
+
+    The triple (emitted by ``_emit_cute_matmul``'s lane-invariant ``dot_acc``
+    path) is, as the LAST three statements of the lane-loop body:
+
+        dot_acc_base = <expr>             # lane-invariant rescale of acc
+        dot_acc = dot_acc + <product>    # running sum over the lane axis
+        acc = dot_acc_base + dot_acc     # final combine
+    """
+    body = lane_loop.body
+    if len(body) < 3:
+        return None
+    base_stmt, sum_stmt, final_stmt = body[-3], body[-2], body[-1]
+
+    def assign_name(stmt: ast.AST) -> str | None:
+        if (
+            isinstance(stmt, ast.Assign)
+            and len(stmt.targets) == 1
+            and isinstance(stmt.targets[0], ast.Name)
+        ):
+            return stmt.targets[0].id
+        return None
+
+    base_var = assign_name(base_stmt)
+    dot_acc_var = assign_name(sum_stmt)
+    acc_var = assign_name(final_stmt)
+    if base_var is None or dot_acc_var is None or acc_var is None:
+        return None
+    if not (base_var.startswith("dot_acc_base") and dot_acc_var.startswith("dot_acc")):
+        return None
+    # ``dot_acc = dot_acc + product``: a running self-sum over the lane axis.
+    assert isinstance(sum_stmt, ast.Assign)
+    if not (
+        isinstance(sum_stmt.value, ast.BinOp)
+        and isinstance(sum_stmt.value.op, ast.Add)
+        and isinstance(sum_stmt.value.left, ast.Name)
+        and sum_stmt.value.left.id == dot_acc_var
+    ):
+        return None
+    # ``acc = dot_acc_base + dot_acc``: the final per-chunk combine.
+    assert isinstance(final_stmt, ast.Assign)
+    final_reads = {n.id for n in ast.walk(final_stmt.value) if isinstance(n, ast.Name)}
+    if final_reads != {base_var, dot_acc_var}:
+        return None
+    # The rescale (``dot_acc_base``) must be lane-INVARIANT: it must not read the
+    # lane var nor any value derived from it within the lane body.
+    lane_body: list[ast.AST] = list(body)
+    lane_varying = _lane_varying_names(lane_body, lane_var)
+    from .ast_read_writes import ReadWrites
+
+    base_reads = set(ReadWrites.from_ast(base_stmt).reads)
+    if lane_var in base_reads or (base_reads & lane_varying):
+        return None
+    return acc_var, base_var, dot_acc_var
+
+
+def _single_lane_loop_in_body(
+    body: list[ast.AST],
+) -> tuple[int, ast.For, str] | None:
+    """If ``body`` contains exactly one direct lane loop, return its index, the
+    loop node, and its lane var; else ``None``."""
+    found: tuple[int, ast.For, str] | None = None
+    for idx, stmt in enumerate(body):
+        lane_var = getattr(stmt, HELION_LANE_LOOP_VAR_ATTR, None)
+        if (
+            lane_var is not None
+            and isinstance(stmt, ast.For)
+            and isinstance(stmt.target, ast.Name)
+            and stmt.target.id == lane_var
+        ):
+            if found is not None:
+                return None
+            found = (idx, stmt, lane_var)
+    return found
+
+
+def _find_reset_assign(body: list[ast.AST], var: str) -> int | None:
+    """Index of the last ``var = <expr>`` plain assignment in ``body`` (the
+    ``dot_acc`` reset emitted before the chunk loop), or ``None``."""
+    for idx in range(len(body) - 1, -1, -1):
+        stmt = body[idx]
+        if (
+            isinstance(stmt, ast.Assign)
+            and len(stmt.targets) == 1
+            and isinstance(stmt.targets[0], ast.Name)
+            and stmt.targets[0].id == var
+        ):
+            return idx
+    return None
+
+
+def hoist_lane_invariant_chunk_recurrence(
+    body: list[ast.AST],
+) -> list[ast.AST]:
+    """Restructure ``for chunk: for lane: <dot_acc recurrence>`` nests so the
+    lane-invariant rescale, chunk-entry stores, and final accumulator combine
+    run once per chunk (see the module comment above).
+
+    Tightly gated: only fires on a serial chunk loop whose single inner lane
+    loop ends with the ``dot_acc`` triple and whose ``dot_acc`` reset sits in
+    the same statement list before the chunk loop.
+    """
+    new_body: list[ast.AST] = []
+    for stmt in body:
+        # Recurse into nested statement-bearing fields first.
+        for field in ("body", "orelse", "finalbody"):
+            old = getattr(stmt, field, None)
+            if isinstance(old, list) and all(isinstance(s, ast.stmt) for s in old):
+                setattr(stmt, field, hoist_lane_invariant_chunk_recurrence(old))
+
+        info = _detect_chunk_recurrence(stmt)
+        if info is None:
+            new_body.append(stmt)
+            continue
+        dot_acc_var = info[0]
+        reset_idx = _find_reset_assign(new_body, dot_acc_var)
+        if reset_idx is None:
+            # No relocatable reset found: bail out (leave nest unchanged).
+            new_body.append(stmt)
+            continue
+        reset_stmt = new_body.pop(reset_idx)
+        assert isinstance(stmt, ast.For)
+        new_body.append(_rewrite_chunk_recurrence(stmt, info, reset_stmt))
+    return new_body
+
+
+def _detect_chunk_recurrence(
+    stmt: ast.AST,
+) -> tuple[str, int, ast.For, str, str, str, str] | None:
+    """Return ``(dot_acc_var, lane_idx, lane_loop, lane_var, acc_var, base_var,
+    dot_acc_var)`` when ``stmt`` is a serial chunk loop carrying the ``dot_acc``
+    recurrence, else ``None``."""
+    if not _is_serial_for(stmt) or not isinstance(stmt, ast.For):
+        return None
+    found = _single_lane_loop_in_body(list(stmt.body))
+    if found is None:
+        return None
+    lane_idx, lane_loop, lane_var = found
+    triple = _find_dot_acc_recurrence(lane_loop, lane_var)
+    if triple is None:
+        return None
+    acc_var, base_var, dot_acc_var = triple
+    return dot_acc_var, lane_idx, lane_loop, lane_var, acc_var, base_var, dot_acc_var
+
+
+def _rewrite_chunk_recurrence(
+    stmt: ast.For,
+    info: tuple[str, int, ast.For, str, str, str, str],
+    reset_stmt: ast.AST,
+) -> ast.For:
+    """Build the restructured chunk loop (see module comment)."""
+    from .ast_read_writes import ReadWrites
+
+    _dot_acc, lane_idx, lane_loop, lane_var, acc_var, _base_var, _dot_acc2 = info
+    chunk_body: list[ast.AST] = list(stmt.body)
+    lane_body: list[ast.AST] = list(lane_loop.body)
+    base_stmt = lane_body[-3]
+    sum_stmt = lane_body[-2]
+    final_stmt = lane_body[-1]
+    producers: list[ast.AST] = lane_body[:-3]
+
+    lane_varying = _lane_varying_names(lane_body, lane_var)
+
+    def reads_lane(s: ast.AST) -> bool:
+        reads = set(ReadWrites.from_ast(s).reads)
+        return lane_var in reads or bool(reads & lane_varying)
+
+    # The "accumulator family": the names that all hold the chunk-ENTRY
+    # accumulator value.  Helion may capture the loop-carried phi through a chain
+    # of plain copy-aliases (``b_h_copy = b_h``; ``b_h_copy_0 = b_h_copy``) and
+    # the rescale / chunk-entry store read those copies, not ``acc_var`` (which
+    # is the chunk-EXIT result).  Build the copy-alias closure over the chunk
+    # prefix and the lane producers, seeded from the loop-carried phi: a name
+    # that is live-in to the lane body (read before written) and feeds the
+    # lane-invariant rescale ``base_stmt``.
+    chunk_prefix = chunk_body[:lane_idx]
+    copy_src: dict[str, str] = {}
+    for s in (*chunk_prefix, *producers):
+        if (
+            isinstance(s, ast.Assign)
+            and len(s.targets) == 1
+            and isinstance(s.targets[0], ast.Name)
+            and isinstance(s.value, ast.Name)
+        ):
+            copy_src[s.targets[0].id] = s.value.id
+
+    def copy_root(name: str) -> str:
+        seen: set[str] = set()
+        while name in copy_src and name not in seen:
+            seen.add(name)
+            name = copy_src[name]
+        return name
+
+    base_slice_indices, _ = _backward_slice(
+        producers, set(ReadWrites.from_ast(base_stmt).reads)
+    )
+    base_slice_reads = set(ReadWrites.from_ast(base_stmt).reads)
+    for i in base_slice_indices:
+        base_slice_reads |= set(ReadWrites.from_ast(producers[i]).reads)
+    lane_live_in = _lane_body_live_in(producers, lane_var)
+    phi_roots = {
+        copy_root(name) for name in base_slice_reads if copy_root(name) in lane_live_in
+    }
+    acc_family = set(phi_roots)
+    for name in (*copy_src.keys(),):
+        if copy_root(name) in phi_roots:
+            acc_family.add(name)
+
+    # Backward slice feeding the lane-invariant rescale ``base_stmt``: those
+    # producers are lane-invariant and hoist before the lane loop with it.
+    base_seed = set(ReadWrites.from_ast(base_stmt).reads)
+    hoist_indices, _ = _backward_slice(producers, base_seed)
+    hoist_set = set(hoist_indices)
+
+    # Lane-invariant side-effecting statements whose backward slice reaches the
+    # (frozen) chunk-ENTRY accumulator (the store of ``b_h``) must hoist before
+    # the lane loop so they run once per chunk on the frozen value; bring their
+    # producers along.  A store that does NOT read the accumulator stays in the
+    # lane loop (it is a genuinely per-lane side effect).
+    entry_indices: list[int] = []
+    for idx, prod in enumerate(producers):
+        if idx in hoist_set or reads_lane(prod) or not _has_side_effect(prod):
+            continue
+        slice_indices, _ = _backward_slice(
+            producers[:idx], set(ReadWrites.from_ast(prod).reads)
+        )
+        slice_reads = set(ReadWrites.from_ast(prod).reads)
+        for i in slice_indices:
+            slice_reads |= set(ReadWrites.from_ast(producers[i]).reads)
+        if not (acc_family & slice_reads):
+            continue
+        # The store + its lane-invariant producer slice all hoist.
+        if any(reads_lane(producers[i]) for i in slice_indices):
+            continue
+        entry_indices.append(idx)
+        hoist_set.update(slice_indices)
+
+    hoist_pre = sorted(hoist_set | set(entry_indices))
+    pre_lane = [producers[i] for i in hoist_pre]
+    lane_kept = [
+        producers[i]
+        for i in range(len(producers))
+        if i not in hoist_set and i not in set(entry_indices)
+    ]
+
+    new_lane_loop = _create_lane_loop(
+        lane_var, _lane_loop_extent(lane_loop), [*lane_kept, sum_stmt]
+    )
+    new_chunk_body: list[ast.AST] = [
+        *chunk_body[:lane_idx],
+        reset_stmt,
+        *pre_lane,
+        base_stmt,
+        new_lane_loop,
+        final_stmt,
+        *chunk_body[lane_idx + 1 :],
+    ]
+    return create(
+        ast.For,
+        target=stmt.target,
+        iter=stmt.iter,
+        body=new_chunk_body,
+        orelse=stmt.orelse,
+        type_comment=None,
+    )
 
 
 @dataclasses.dataclass
@@ -1517,6 +2490,12 @@ class BlockSizeTileStrategy(TileStrategy):
         return reserved_reduction_axes + active_non_reduction_axes
 
     def select_pid_strategy(self) -> ProgramIDs:
+        env = CompileEnvironment.current()
+        if env.compact_worklist_plan is not None:
+            # Compact worklist: the owner hl.grid becomes the work-item grid.
+            from .program_id import WorklistProgramIDs
+
+            return WorklistProgramIDs(upper_expr=str(env.compact_worklist_upper))
         return self._select_pid_strategy_for_dims(len(self.block_ids))
 
     def _select_pid_strategy_for_dims(self, effective_dims: int) -> ProgramIDs:
@@ -1582,7 +2561,9 @@ class FlattenedTileStrategy(BlockSizeTileStrategy):
             if i not in self._folded_block_ids
         ]
         if not env.backend.force_tile_mask() and env.known_multiple(
-            functools.reduce(operator.mul, unfolded_numels),
+            functools.reduce(  # pyrefly: ignore[incompatible-overload-residual]
+                operator.mul, unfolded_numels
+            ),
             block_size,
         ):
             self._mask_var = None
@@ -1812,11 +2793,16 @@ class FlattenedTileStrategy(BlockSizeTileStrategy):
         mask_var = self.mask_var(-1)
         if mask_var is not None:
             mask_terms = [f"{offsets_var} < ({self._numel_str(state, total_numel)})"]
-            thread_mask = env.backend.thread_in_tile_mask_expr(
-                block_size_var, axis=self._flat_thread_axis()
-            )
-            if thread_mask is not None:
-                mask_terms.insert(0, f"({thread_mask})")
+            # Skip the ``thread_idx[axis] < block_size`` term for a CuTe
+            # block-size-1 axis (see ``codegen_grid``): the axis is not a thread
+            # axis, so this term would otherwise pin the launch dim to 1 and
+            # block a synthetic free-``hl.arange`` axis from reusing it.
+            if not (env.backend.name == "cute" and not self._uses_thread_axis()):
+                thread_mask = env.backend.thread_in_tile_mask_expr(
+                    block_size_var, axis=self._flat_thread_axis()
+                )
+                if thread_mask is not None:
+                    mask_terms.insert(0, f"({thread_mask})")
             mask_expr = " and ".join(mask_terms)
             statements.append(statement_from_string(f"{mask_var} = {mask_expr}"))
         # pyrefly: ignore [bad-return]
@@ -1833,9 +2819,9 @@ class FlattenedTileStrategy(BlockSizeTileStrategy):
         assert state.ast_args is None
 
         from .ast_extension import ExtendedAST
-        from .type_propagation import GridIndexType
-        from .type_propagation import IterType
-        from .type_propagation import SequenceType
+        from .type_info import GridIndexType
+        from .type_info import IterType
+        from .type_info import SequenceType
 
         type_info = ExtendedAST.current()[-1]._type_info
         scalar_grid_loop = False
@@ -1962,15 +2948,27 @@ class FlattenedTileStrategy(BlockSizeTileStrategy):
 
         pids.append(PIDInfo(pid_var, block_size_var, total_numel, self.block_ids[0]))
 
-        state.add_statement(
-            env.backend.arange_expr(
-                offsets_var,
-                pid_var,
-                block_size_var,
-                dtype,
-                axis=self._flat_thread_axis(),
+        # A CuTe grid whose block size is 1 does not claim a thread axis: its
+        # ``offsets = pid * 1 + thread_idx[axis]`` term is always 0 (launch dim
+        # for the axis is 1). Emit ``offsets = pid * 1`` instead so the axis is
+        # genuinely free for a synthetic free-``hl.arange`` thread axis to reuse
+        # without the grid's ``thread_idx[axis] < 1`` mask filtering its lanes.
+        if env.backend.name == "cute" and not self._uses_thread_axis():
+            state.add_statement(
+                statement_from_string(
+                    f"{offsets_var} = ({pid_var}) * ({block_size_var})"
+                )
             )
-        )
+        else:
+            state.add_statement(
+                env.backend.arange_expr(
+                    offsets_var,
+                    pid_var,
+                    block_size_var,
+                    dtype,
+                    axis=self._flat_thread_axis(),
+                )
+            )
         state.codegen.statements_stack[-1].extend(statements)
 
         pids.codegen(state)
@@ -2022,9 +3020,16 @@ class FlattenedTileStrategy(BlockSizeTileStrategy):
         lid = self.new_var("lid")
         numel_str = self._numel_str(state, total_numel)
         end_var = env.backend.cdiv_expr(numel_str, block_size_var, is_device=True)
-        arange_expr = env.backend.arange_expr(
-            offsets_var, lid, block_size_var, dtype, axis=self._flat_thread_axis()
-        )
+        # Mirror ``codegen_grid``: a CuTe block-size-1 loop axis does not claim a
+        # thread axis, so drop the always-zero ``+ thread_idx[axis]`` term so the
+        # axis stays free (and consistent with the mask emitted by
+        # ``_codegen_common``, which also drops its thread term for this case).
+        if env.backend.name == "cute" and not self._uses_thread_axis():
+            arange_expr = f"{offsets_var} = ({lid}) * ({block_size_var})"
+        else:
+            arange_expr = env.backend.arange_expr(
+                offsets_var, lid, block_size_var, dtype, axis=self._flat_thread_axis()
+            )
         for_node = create(
             ast.For,
             target=create(ast.Name, id=lid, ctx=ast.Store()),
@@ -2235,9 +3240,9 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
 
     def _root_grid_steps(self, state: CodegenState) -> list[object | None]:
         from .ast_extension import ExtendedAST
-        from .type_propagation import GridIndexType
-        from .type_propagation import IterType
-        from .type_propagation import SequenceType
+        from .type_info import GridIndexType
+        from .type_info import IterType
+        from .type_info import SequenceType
 
         type_info = ExtendedAST.current()[-1]._type_info
         assert isinstance(type_info, IterType)
@@ -2873,8 +3878,6 @@ class CuteNDTileStrategy(NDTileStrategy):
         # ``LoopedReductionStrategy._cute_lane_vec_loads``.
         self._cute_lane_vec_loads_by_block: dict[int, dict] = {}
         if not mma_mode:
-            from ..autotuner.config_spec import CuteVectorWidthSpec
-
             env_local = CompileEnvironment.current()
             cute_vec_widths_cfg = cast(
                 "list[int]",
@@ -2895,38 +3898,37 @@ class CuteNDTileStrategy(NDTileStrategy):
                     self._lane_var_by_block[block_id] = self.fn.new_var(
                         f"lane_{block_id}"
                     )
-                    # Register a cute_vector_widths slot for this lane
-                    # block if not already present (rolled reductions
-                    # register their own via device_ir).  We add idempotently
-                    # so the autotuner can explore V in {1,2,4,8}.
+                    elements_per_thread = static_bs // nt
+                    # Vec slot is registered eagerly in device-IR analysis; read
+                    # the tuned V.  Never append here — growing the spec during
+                    # codegen breaks the autotuner's fixed-width unflatten.
                     if (
                         block_id
-                        not in env_local.config_spec.cute_vector_widths.valid_block_ids()
+                        in env_local.config_spec.cute_vector_widths.valid_block_ids()
                     ):
-                        import contextlib
-
-                        # Silently skip when append fails (e.g.
-                        # config_spec frozen) — the lane loop just
-                        # runs in scalar mode in that case.
-                        with contextlib.suppress(Exception):
-                            env_local.config_spec.cute_vector_widths.append(
-                                CuteVectorWidthSpec(
-                                    block_id=block_id,
-                                    size_hint=static_bs,
-                                )
-                            )
-                    elements_per_thread = static_bs // nt
-                    vec_width = env_local.config_spec.cute_vector_widths.config_get(
-                        cute_vec_widths_cfg,
-                        block_id,
-                        1,
-                    )
-                    if (
-                        isinstance(vec_width, int)
-                        and vec_width > 1
-                        and elements_per_thread % vec_width == 0
-                    ):
-                        self._cute_lane_vec_width_by_block[block_id] = vec_width
+                        vec_width = env_local.config_spec.cute_vector_widths.config_get(
+                            cute_vec_widths_cfg,
+                            block_id,
+                            1,
+                        )
+                        if (
+                            isinstance(vec_width, int)
+                            and vec_width > 1
+                            and elements_per_thread % vec_width == 0
+                        ):
+                            self._cute_lane_vec_width_by_block[block_id] = vec_width
+                    else:
+                        # Metal shares this strategy without vec-width tuning,
+                        # and non-static sizes are eager-skipped — both run
+                        # scalar.  A missing static slot on cute is a bug.
+                        assert env_local.backend_name != "cute" or not isinstance(
+                            env_local.block_sizes[block_id].size,
+                            (int, torch.SymInt),
+                        ), (
+                            f"cute_vector_widths slot missing for static-size "
+                            f"block_id={block_id}; it must be registered during "
+                            f"device-IR analysis, not lazily during codegen"
+                        )
 
     def _configured_block_size_int(self, block_size: SymIntLike) -> int | None:
         if isinstance(block_size, int):

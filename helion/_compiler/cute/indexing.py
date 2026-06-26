@@ -18,8 +18,6 @@ if TYPE_CHECKING:
 class CuteAffineRangeIndex:
     base: object
     factor: int
-    start: object
-    length: object
     step: object
     dtype: torch.dtype
 
@@ -66,15 +64,11 @@ def is_cute_shape_chain_target(target: object) -> bool:
     return target in _CUTE_SHAPE_CHAIN_TARGETS
 
 
-def _match_constant_multiple(value: object) -> tuple[object, int] | None:
+def _match_constant_multiple(value: object) -> tuple[object, int]:
     if (
         isinstance(value, Node)
         and value.op == "call_function"
-        and value.target
-        in (
-            operator.mul,
-            torch.ops.aten.mul.Tensor,
-        )
+        and value.target in (operator.mul, torch.ops.aten.mul.Tensor)
     ):
         lhs, rhs = value.args
         if isinstance(lhs, int) and lhs > 0:
@@ -97,12 +91,8 @@ def match_cute_affine_range_iota(node: Node) -> CuteAffineRangeIndex | None:
         return None
 
     (length_arg,) = node.args
-    length_base_factor = _match_constant_multiple(length_arg)
-    start_base_factor = _match_constant_multiple(start)
-    if length_base_factor is None or start_base_factor is None:
-        return None
-    length_base, length_factor = length_base_factor
-    start_base, start_factor = start_base_factor
+    length_base, length_factor = _match_constant_multiple(length_arg)
+    start_base, start_factor = _match_constant_multiple(start)
     if length_factor <= 1 or length_factor != start_factor:
         return None
     if not (
@@ -117,17 +107,9 @@ def match_cute_affine_range_iota(node: Node) -> CuteAffineRangeIndex | None:
     return CuteAffineRangeIndex(
         base=length_base,
         factor=length_factor,
-        start=start,
-        length=length_arg,
         step=step,
         dtype=dtype,
     )
-
-
-def unwrap_cute_affine_range_index(value: object) -> CuteAffineRangeIndex | None:
-    if isinstance(value, CuteAffineRangeIndex):
-        return value
-    return None
 
 
 def match_cute_stack_reshape_rhs(node: Node) -> tuple[tuple[Node, ...], int] | None:

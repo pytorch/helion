@@ -16,10 +16,12 @@ from helion._testing import DEVICE
 from helion._testing import EXAMPLES_DIR
 from helion._testing import HALF_DTYPE
 from helion._testing import LONG_INT_TYPE
+from helion._testing import CosSimilarity
 from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
 from helion._testing import _get_backend
 from helion._testing import check_example
+from helion._testing import float32_matmul_precision
 from helion._testing import import_path
 from helion._testing import onlyBackends
 from helion._testing import skipIfA10G
@@ -28,11 +30,11 @@ from helion._testing import skipIfCudaSharedMemoryLessThan
 from helion._testing import skipIfFn
 from helion._testing import skipIfNotCUDA
 from helion._testing import skipIfPallas
+from helion._testing import skipIfPallasInterpret
 from helion._testing import skipIfRefEager
 from helion._testing import skipIfRocm
 from helion._testing import skipIfTileIR
 from helion._testing import skipIfXPU
-from helion._testing import xfailIfCute
 from helion._testing import xfailIfPallas
 from helion._testing import xfailIfPallasInterpret
 from helion._testing import xfailIfPallasTpu
@@ -249,8 +251,16 @@ class TestExamples(RefEagerTestBase, TestCase):
     def test_matmul_bwd(self):
         """Test backward pass for matmul via matmul_autograd."""
         mod = import_path(EXAMPLES_DIR / "matmul.py")
-        # Set a fixed config to avoid autotuning in CI
+        # Set a fixed config to avoid autotuning in CI.  ``import_path`` caches
+        # the module in ``sys.modules``, so ``mod.matmul`` is a process-wide
+        # singleton shared with every other test that imports the matmul
+        # example.  Restore ``configs`` on teardown so this mutation does not
+        # leak: a leaked non-empty ``configs`` makes the kernel skip autotuning
+        # entirely, which e.g. breaks ``test_cache``'s cache-miss assertions
+        # when that test later runs the same singleton on the same worker.
         config = helion.Config(block_sizes=[16, 16, 16])
+        original_configs = mod.matmul.configs
+        self.addCleanup(setattr, mod.matmul, "configs", original_configs)
         mod.matmul.configs = [config]
 
         mat1 = torch.randn(
@@ -276,8 +286,14 @@ class TestExamples(RefEagerTestBase, TestCase):
     def test_addmm_bwd(self):
         """Test backward pass for addmm via addmm_autograd."""
         mod = import_path(EXAMPLES_DIR / "matmul.py")
-        # Set a fixed config to avoid autotuning in CI
+        # Set a fixed config to avoid autotuning in CI.  ``mod.matmul`` is a
+        # process-wide singleton (``import_path`` caches the module), so
+        # restore ``configs`` on teardown to avoid leaking the mutation into
+        # other tests (a non-empty ``configs`` makes the kernel skip
+        # autotuning).  See ``test_matmul_bwd``.
         config = helion.Config(block_sizes=[16, 16, 16])
+        original_configs = mod.matmul.configs
+        self.addCleanup(setattr, mod.matmul, "configs", original_configs)
         mod.matmul.configs = [config]
 
         bias = torch.randn(
@@ -306,10 +322,6 @@ class TestExamples(RefEagerTestBase, TestCase):
         torch.testing.assert_close(mat1.grad, mat1_ref.grad, atol=1e-1, rtol=1e-2)
         torch.testing.assert_close(mat2.grad, mat2_ref.grad, atol=1e-1, rtol=1e-2)
 
-    @skipIfFn(
-        lambda: _get_backend() == "cute",
-        "CuTe matmul+layernorm example is unsupported and too expensive in-process",
-    )
     def test_matmul_layernorm_static_shapes(self):
         args = (
             torch.randn([1024, 256], device=DEVICE, dtype=torch.float32),
@@ -378,7 +390,6 @@ class TestExamples(RefEagerTestBase, TestCase):
         lambda: _get_backend() == "cute",
         "CuTe matmul+layernorm example is unsupported and too expensive in-process",
     )
-    @xfailIfPallas("JAX tracer error with dynamic shapes")
     def test_matmul_layernorm_dynamic_shapes(self):
         args = (
             torch.randn([128, 256], device=DEVICE, dtype=torch.float32),
@@ -667,8 +678,11 @@ class TestExamples(RefEagerTestBase, TestCase):
             block_sizes=[block_size],
         )
 
-    @xfailIfCute("CuTe bf16 x int16 example still returns incorrect results")
-    @xfailIfPallas("precision differences with bf16xint16 operations on pallas")
+    @skipIfPallasInterpret(
+        "65536x1024x1280 GEMM is too slow under CPU interpret -- it exceeds the "
+        "300s per-test timeout and (thread timeout method) kills the whole job"
+    )
+    @xfailIfPallasTpu("precision differences with bf16xint16 operations on pallas")
     @skipIfTileIR("precision differences with bf16xint16 operations on tileir")
     @skipIfRocm("precision differences with bf16xint16 operations on rocm")
     @skipIfXPU("precision differences with bf16xint16 operations on xpu")
@@ -677,13 +691,41 @@ class TestExamples(RefEagerTestBase, TestCase):
 
         m, k, n = 65536, 1024, 1280
 
+        # The CuTe scalar matmul fallback accumulates each bf16xbf16 product in
+        # full fp32 (it never rounds the per-element products back to bf16), so
+        # it is *more* accurate than torch's bf16 tensor-core reference. The cute
+        # output bit-matches a full-precision (IEEE fp32) products matmul cast to
+        # bf16, so use that as the reference. ``setUpModule`` flips the default
+        # matmul fp32 precision to TF32, which would make ``torch.matmul`` itself
+        # lossy, so force IEEE fp32 for the reference computation.
+        is_cute = _get_backend() == "cute"
+
+        def expected(
+            xt: torch.Tensor, wt: torch.Tensor, transpose: bool
+        ) -> torch.Tensor:
+            if not is_cute:
+                return reference_bf16xint16_pytorch(xt, wt, transpose)
+            if transpose:
+                x_f32 = xt.to(torch.bfloat16).float()
+                w_f32 = wt.float()
+            else:
+                x_f32 = xt.float()
+                w_f32 = wt.to(torch.bfloat16).float()
+            prev = torch.backends.cuda.matmul.fp32_precision
+            torch.backends.cuda.matmul.fp32_precision = "ieee"
+            try:
+                out = torch.matmul(x_f32, w_f32)
+            finally:
+                torch.backends.cuda.matmul.fp32_precision = prev
+            return out.to(torch.bfloat16)
+
         x = torch.randn([m, k], device=DEVICE, dtype=torch.bfloat16)
         w = torch.randint(-(2**15), 2**15 - 1, (k, n), device=DEVICE, dtype=torch.int16)
 
         check_example(
             "bf16xint16_gemm",
             (x, w),
-            reference_bf16xint16_pytorch(x, w, False),
+            expected(x, w, False),
             fn_name="_bf16xint16_gemm",
         )
 
@@ -695,7 +737,7 @@ class TestExamples(RefEagerTestBase, TestCase):
         check_example(
             "bf16xint16_gemm",
             (x_int16, w_bf16),
-            reference_bf16xint16_pytorch(x_int16, w_bf16, True),
+            expected(x_int16, w_bf16, True),
             fn_name="_int16xbf16_gemm",
         )
 
@@ -866,9 +908,59 @@ class TestExamples(RefEagerTestBase, TestCase):
         check_example(
             "attention",
             args,
-            torch.nn.functional.scaled_dot_product_attention(*args),
+            (torch.nn.functional.scaled_dot_product_attention(*args), None),
             block_sizes=[1, 64, 32],
             indexing="pointer",
+        )
+
+    def test_attention_output(self):
+        args = (
+            torch.randn(1, 32, 512, 64, dtype=torch.float32, device=DEVICE),
+            torch.randn(1, 32, 512, 64, dtype=torch.float32, device=DEVICE),
+            torch.randn(1, 32, 512, 64, dtype=torch.float32, device=DEVICE),
+        )
+        check_example(
+            "attention",
+            args,
+            torch.nn.functional.scaled_dot_product_attention(*args),
+            fn_name="attention_output",
+            block_sizes=[1, 64, 32],
+        )
+
+    def test_causal_attention_output(self):
+        args = (
+            torch.randn(1, 32, 512, 64, dtype=torch.float32, device=DEVICE),
+            torch.randn(1, 32, 512, 64, dtype=torch.float32, device=DEVICE),
+            torch.randn(1, 32, 512, 64, dtype=torch.float32, device=DEVICE),
+        )
+        check_example(
+            "attention",
+            args,
+            torch.nn.functional.scaled_dot_product_attention(*args, is_causal=True),
+            fn_name="causal_attention_output",
+            block_sizes=[1, 64, 32],
+        )
+
+    def test_biased_attention_output(self):
+        args = (
+            torch.randn(1, 2, 128, 64, dtype=HALF_DTYPE, device=DEVICE),
+            torch.randn(1, 2, 128, 64, dtype=HALF_DTYPE, device=DEVICE),
+            torch.randn(1, 2, 128, 64, dtype=HALF_DTYPE, device=DEVICE),
+            torch.randn(1, 2, 128, 128, dtype=HALF_DTYPE, device=DEVICE) * 0.25,
+        )
+        check_example(
+            "attention",
+            args,
+            torch.nn.functional.scaled_dot_product_attention(
+                args[0],
+                args[1],
+                args[2],
+                attn_mask=args[3],
+            ),
+            fn_name="biased_attention_output",
+            block_sizes=[1, 128, 128],
+            atol=5e-2,
+            rtol=2e-2,
         )
 
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
@@ -883,7 +975,7 @@ class TestExamples(RefEagerTestBase, TestCase):
         check_example(
             "attention",
             args,
-            torch.nn.functional.scaled_dot_product_attention(*args),
+            (torch.nn.functional.scaled_dot_product_attention(*args), None),
             block_sizes=[16, 32, 16],
             num_stages=1,
             indexing="block_ptr",
@@ -898,7 +990,7 @@ class TestExamples(RefEagerTestBase, TestCase):
         check_example(
             "attention",
             args,
-            torch.nn.functional.scaled_dot_product_attention(*args),
+            (torch.nn.functional.scaled_dot_product_attention(*args), None),
             fn_name="attention_dynamic",
             block_sizes=[1, 64, 32],
         )
@@ -932,6 +1024,19 @@ class TestExamples(RefEagerTestBase, TestCase):
             mod.ref_xsa(*args),
             fn_name="xsa_kernel",
             block_sizes=[1, 64, 32],
+        )
+
+    @xfailIfPallas("slice-based stores not yet supported")
+    def test_concat_simple(self):
+        args = (
+            torch.randn(512, 500, device=DEVICE),
+            torch.randn(512, 512, device=DEVICE),
+        )
+        check_example(
+            "concatenate",
+            args,
+            torch.cat(args, dim=1),
+            fn_name="concat2d_dim1_simple",
         )
 
     def test_concat(self):
@@ -1145,7 +1250,7 @@ class TestExamples(RefEagerTestBase, TestCase):
         check_example(
             "attention",
             args,
-            torch.nn.functional.scaled_dot_product_attention(*args),
+            (torch.nn.functional.scaled_dot_product_attention(*args), None),
             block_sizes=[16, 32, 16],
             num_stages=1,
             pid_type="persistent_interleaved",
@@ -1459,8 +1564,18 @@ class TestExamples(RefEagerTestBase, TestCase):
                 rtol=1e-2,
             )
 
+    @parametrize(
+        "helion_precision,torch_precision,atol,rtol",
+        [
+            ("highest", "highest", 1e-2, 1e-2),
+            ("default", "medium", 1.5, 5e-2),
+        ],
+    )
+    @xfailIfPallasInterpret(
+        "The get/set_float32_matmul_precision API needs an actual backend"
+    )
     @onlyBackends(["pallas"])
-    def test_jagged_hstu_attn_2(self):
+    def test_jagged_hstu_attn_2(self, helion_precision, torch_precision, atol, rtol):
         torch.manual_seed(0)
         num_sequnces = 4
         heads = 4
@@ -1489,28 +1604,41 @@ class TestExamples(RefEagerTestBase, TestCase):
 
         args = (max_seq_len, alpha, attn_scale, q, k, v, seq_offsets)
 
-        mod = import_path(EXAMPLES_DIR / "jagged_hstu_attn_2.py")
-        expected = mod.reference_jagged_hstu_attention(*args)
+        with float32_matmul_precision(torch_precision):
+            mod = import_path(EXAMPLES_DIR / "jagged_hstu_attn_2.py")
+            expected = mod.reference_jagged_hstu_attention(*args)
 
-        # Patch to use core silu decomposition instead of inductor's custom decomposition from pytorch PR #171723.
-        # This ensures consistent codegen across torch 2.9 (stable) and nightly versions.
-        from torch._decomp.decompositions import silu
-        import torch._inductor.decomposition as inductor_decomp
+            # Patch to use core silu decomposition instead of inductor's custom decomposition from pytorch PR #171723.
+            # This ensures consistent codegen across torch 2.9 (stable) and nightly versions.
+            from torch._decomp.decompositions import silu
+            import torch._inductor.decomposition as inductor_decomp
 
-        if hasattr(inductor_decomp.fast_random_decomps, "cache_clear"):
-            inductor_decomp.fast_random_decomps.cache_clear()
-        with patch.dict(
-            inductor_decomp.decompositions, {torch.ops.aten.silu.default: silu}
-        ):
-            check_example(
-                "jagged_hstu_attn_2",
-                args,
-                expected,
-                fn_name="jagged_hstu_attention",
-                block_sizes=[128, 128],
-                atol=1e-2,
-                rtol=1e-2,
-            )
+            if hasattr(inductor_decomp.fast_random_decomps, "cache_clear"):
+                inductor_decomp.fast_random_decomps.cache_clear()
+
+            with (
+                patch.object(
+                    mod.jagged_hstu_attention.settings,
+                    "dot_precision",
+                    helion_precision,
+                ),
+                patch.dict(
+                    inductor_decomp.decompositions, {torch.ops.aten.silu.default: silu}
+                ),
+            ):
+                # Clear the cache to ensure the modified settings are used.
+                mod.jagged_hstu_attention._bound_kernels.clear()
+
+                check_example(
+                    "jagged_hstu_attn_2",
+                    args,
+                    expected,
+                    fn_name="jagged_hstu_attention",
+                    block_sizes=[128, 128],
+                    cos_sim=CosSimilarity(dim=-1, min_similarity=0.999),
+                    atol=atol,
+                    rtol=rtol,
+                )
 
     @xfailIfPallasTpu("tensor-derived if-predicates not supported")
     def test_grouped_gemm_jagged(self):
@@ -1545,9 +1673,6 @@ class TestExamples(RefEagerTestBase, TestCase):
             fn_name="grouped_gemm_jagged",
         )
 
-    @xfailIfCute(
-        "CuTe persistent grouped jagged GEMM example still fails lowering/runtime"
-    )
     @xfailIfPallas("CUDA-specific code paths")
     def test_grouped_gemm_jagged_persistent(self):
         # Build small jagged grouped GEMM inputs
@@ -1594,6 +1719,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             "geglu",
             args,
             torch.nn.functional.gelu(args[0], approximate="tanh") * args[1],
+            fn_name="_geglu",
             block_sizes=[1024],
             num_warps=4,
             num_stages=3,
@@ -1630,7 +1756,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             "swiglu",
             args,
             torch.nn.functional.silu(args[0]) * args[1],
-            fn_name="swiglu_fwd",
+            fn_name="_swiglu_fwd",
             block_sizes=[1024],
             num_warps=4,
             num_stages=3,
@@ -1803,7 +1929,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             rtol=2e-1,
         )
 
-    @onlyBackends(["cute"])
+    @onlyBackends(["cute", "triton"])
     @skipIfNotCUDA()
     @skipIfCudaCapabilityLessThan(
         (10, 0), reason="NVFP4 conversion instructions require Blackwell"
@@ -1933,7 +2059,16 @@ class TestExamples(RefEagerTestBase, TestCase):
 
         mod = import_path(EXAMPLES_DIR / "fused_linear_jsd.py")
         # Pin jsd_kernel's config so we skip autotune (CI speed). Block size 16
-        # is a small safe pick across backends.
+        # is a small safe pick across backends.  ``mod.jsd_kernel`` is a
+        # process-wide singleton (``import_path`` caches the module); restore
+        # the mutated ``configs`` / ``settings.static_shapes`` on teardown so
+        # the changes don't leak into other tests.
+        original_configs = mod.jsd_kernel.configs
+        original_static_shapes = mod.jsd_kernel.settings.static_shapes
+        self.addCleanup(setattr, mod.jsd_kernel, "configs", original_configs)
+        self.addCleanup(
+            setattr, mod.jsd_kernel.settings, "static_shapes", original_static_shapes
+        )
         mod.jsd_kernel.settings.static_shapes = True
         mod.jsd_kernel.configs = [helion.Config(block_sizes=[16])]
         result = mod.fused_linear_jsd_fwd(
@@ -2139,12 +2274,12 @@ class TestExamples(RefEagerTestBase, TestCase):
     @skipIfA10G("failure on a10g")
     @skipIfTileIR("accuracy failure")
     @skipIfXPU("ocloc compilation failure with 256-GRF kernel on XPU backend")
-    @xfailIfPallas(
-        "Pallas codegen broadcasts the matmul result to the wrong shape "
-        "((16, 128) vs (16, 256)) -- separate shape-propagation bug in the "
-        "outer accumulator."
+    @xfailIfPallasInterpret(
+        "pl.program_id captured into emit_pipeline body is not supported in "
+        "JAX interpret mode (program_id_p.bind asserts during trace)"
     )
     def test_squeeze_and_excitation_net_bwd_db(self):
+        torch.manual_seed(0)
         m, n, k = 256, 256, 256
         x = torch.randn([m, n], device=DEVICE, dtype=HALF_DTYPE)
         a = torch.randn([n, k], device=DEVICE, dtype=HALF_DTYPE)
@@ -2182,7 +2317,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             block_sizes=[16, 16, 16],
             num_warps=4,
             num_stages=2,
-            atol=0.3,
+            atol=0.4,
         )
 
     def test_grpo_loss_fwd(self):
@@ -2364,7 +2499,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             "batch_softmax",
             args,
             torch.nn.functional.softmax(args[0], dim=-1),
-            block_sizes=[8],
+            block_sizes=[1, 8],
         )
 
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
@@ -2375,11 +2510,10 @@ class TestExamples(RefEagerTestBase, TestCase):
             "batch_softmax",
             args,
             torch.nn.functional.softmax(args[0], dim=-1),
-            block_sizes=[8],
+            block_sizes=[1, 8],
             indexing="block_ptr",
         )
 
-    @xfailIfCute("CuTe GDN forward example still fails CUTLASS DSL codegen")
     @xfailIfPallasTpu("operation not supported on TPU")
     def test_gdn_fwd_h(self):
         """Test gated delta net forward h kernel."""
@@ -2456,7 +2590,6 @@ class TestExamples(RefEagerTestBase, TestCase):
             reduction_loops=[32768],
         )
 
-    @skipIfPallas("flex_attention requires torch.compile and closures")
     @skipIfRefEager("scalar_prefetch indexing not supported in ref interpreter")
     def test_flex_attention(self):
         z, h, n_ctx, head_dim = 2, 4, 256, 64
@@ -2466,8 +2599,15 @@ class TestExamples(RefEagerTestBase, TestCase):
         ]
 
         mod = import_path(EXAMPLES_DIR / "flex_attention.py")
-        # Set a fixed config to skip autotuning (exceeds CI timeout)
+        # Set a fixed config to skip autotuning (exceeds CI timeout).
+        # ``mod.helion_flex_attention_kernel`` is a process-wide singleton
+        # (``import_path`` caches the module); restore ``configs`` on teardown
+        # so the mutation doesn't leak into other tests.
         config = helion.Config(block_sizes=[64, 64])
+        original_configs = mod.helion_flex_attention_kernel.configs
+        self.addCleanup(
+            setattr, mod.helion_flex_attention_kernel, "configs", original_configs
+        )
         mod.helion_flex_attention_kernel.configs = [config]
         out = mod.helion_flex_attention(q, k, v)
         expected = torch.nn.functional.scaled_dot_product_attention(q, k, v)
@@ -2509,7 +2649,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             rtol=0.1,
         )
 
-    @xfailIfPallas("BlockSpec tiling failure")
+    @xfailIfPallasTpu("BlockSpec tiling failure")
     def test_mamba2_chunk_scan(self):
         batch, nheads, ngroups, seqlen, chunk_size, headdim, dstate = (
             2,

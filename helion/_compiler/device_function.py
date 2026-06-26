@@ -50,6 +50,8 @@ if TYPE_CHECKING:
     from .generate_ast import GenerateAST
     from .indexing_strategy import IndexingStrategy
     from .program_id import ProgramIDs
+    from helion._compiler.pallas.ordered_carry import CarryBoundaryTile
+    from helion._compiler.pallas.ordered_carry import CarryScratchKey
     from helion._compiler.pallas.plan_tiling import DimensionTiling
 
     _P = TypeVar("_P", bound="TensorPropertyArg")
@@ -87,7 +89,6 @@ def find_block_size_symbols(
     non_block_size_symbols = set()
 
     for symbol in expr.free_symbols:
-        # pyrefly: ignore [no-matching-overload, bad-argument-type]
         origin_info = hf.expr_to_origin.get(symbol)
         if origin_info is None or not isinstance(origin_info.origin, BlockSizeOrigin):
             # pyrefly: ignore [bad-argument-type]
@@ -283,6 +284,12 @@ class DeviceFunction:
         )
         self._variable_renames: dict[str, list[str]] = {}
         self.dce_vars: list[str] = []
+        # Names of matmul-fallback running-sum accumulators emitted as
+        # ``acc = acc + product`` inside a constexpr V-loop.  The
+        # ``hoist_warp_reduce`` pass reads this to reduce the FINAL value once
+        # (instead of building a per-lane V-fold, which would double-count the
+        # already-accumulated running sum).  See ``_emit_cute_matmul``.
+        self.cute_matmul_running_sums: set[str] = set()
         # Arg names referenced only by fusion placeholder strings
         # (<STORE_OUTPUT_*>, <LOAD_INPUT_*>), not by the AST body.
         # DCE would incorrectly strip them without this exemption.
@@ -315,7 +322,9 @@ class DeviceFunction:
 
         self.rng_seed_count = 0
         self.device_load_index = 0
+        self.device_load_cache_modifier_index = 0
         self.device_store_index = 0
+        self.device_store_cache_modifier_index = 0
         # Single counter for both loads and stores for indexing assignment
         self.device_memory_op_index = 0
         self.epilogue_subtile_store_indices: dict[str, int] = {}
@@ -336,6 +345,14 @@ class DeviceFunction:
         # Pallas: id(fake_tensor) → {dim: (block_id, extra_pad)} for dims
         # using pl.ds() that may need host-side padding.
         self.pallas_pad_info: dict[int, dict[int, tuple[int, int]]] = {}
+        # Pallas ordered carry: jagged row block_id -> CarryBoundaryTile.  Filled by
+        # the emit_pipeline codegen when the tile is a legal map axis; read by
+        # the store codegen to stitch the boundary across neighbouring groups.
+        self.carry_tiles: dict[int, CarryBoundaryTile] = {}
+        # CarryScratchKey(row block_id, output name) -> carry scratch var name.
+        # One scratch per output buffer (a tile may feed several stores),
+        # allocated at the store.
+        self.carry_scratch: dict[CarryScratchKey, str] = {}
 
     def allocate_store_index(self) -> int:
         """Bump store counters and return the indexing strategy slot."""
@@ -559,6 +576,8 @@ class DeviceFunction:
 
     def literal_expr(self, expr: object) -> str:
         if isinstance(expr, (torch.SymInt, torch.SymFloat, torch.SymBool)):
+            # SymBool's `_sympy_()` is a boolean, not an Expr that sympy_expr wants.
+            # pyrefly: ignore [bad-argument-type]
             return self.sympy_expr(expr._sympy_())
         if isinstance(expr, sympy.Expr):
             return self.sympy_expr(expr)
@@ -863,7 +882,9 @@ class DeviceFunction:
             # from ~396 to ~99 (4x fewer SHFL trees).
             from .cute.hoist_warp_reduce import hoist_warp_reduce_from_vloop
 
-            kernel_body = hoist_warp_reduce_from_vloop(kernel_body)
+            kernel_body = hoist_warp_reduce_from_vloop(
+                kernel_body, running_sum_accumulators=self.cute_matmul_running_sums
+            )
             # Merge adjacent constexpr V-loops that share an identical
             # statement prefix.  Caches the last common per-V-lane value
             # into a register fragment so V-loop 2's bitcast/cast chain
@@ -872,6 +893,13 @@ class DeviceFunction:
             from .cute.merge_sibling_v_loops import merge_sibling_v_loops
 
             kernel_body = merge_sibling_v_loops(kernel_body)
+            # Fuse adjacent per-lane fp8 decodes in the SIMT matmul V-loop
+            # into one ``cvt.rn.f16x2.e4m3x2`` (decode 2 e4m3 bytes per
+            # instruction) — halves the decode instruction count on the
+            # skinny-M fp8 GEMV path.
+            from .cute.fuse_fp8_pair_decode import fuse_fp8_pair_decode
+
+            kernel_body = fuse_fp8_pair_decode(kernel_body)
             # Hoist loop-invariant floating-point divisions out of inner
             # tile loops, replacing each ``x / scalar`` with a hoisted
             # ``inv = 1.0 / scalar`` + ``x * inv`` in the loop body.

@@ -48,6 +48,7 @@ from .base_cache import LooseAutotuneCacheKey
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
+    from typing import Callable
 
     from .base_search import BaseSearch
 
@@ -303,8 +304,13 @@ class AOTAutotuneCache(AutotuneCacheBase):
         cls._mode_announced.clear()
         log.debug("Cleared AOTAutotuneCache caches")
 
-    def __init__(self, autotuner: BaseSearch) -> None:
-        super().__init__(autotuner)
+    def __init__(
+        self,
+        autotuner: BaseSearch,
+        *,
+        autotuner_factory: Callable[[], BaseSearch] | None = None,
+    ) -> None:
+        super().__init__(autotuner, autotuner_factory=autotuner_factory)
         self.mode = get_aot_mode()
         self.hardware_id = get_hardware_info().hardware_id
         self.data_dir = get_aot_data_dir()

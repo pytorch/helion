@@ -16,6 +16,9 @@ from helion.autotuner.config_fragment import IntegerFragment
 from helion.autotuner.config_fragment import ListOf
 from helion.autotuner.config_fragment import PowerOfTwoFragment
 from helion.autotuner.effort_profile import get_effort_profile
+from helion.autotuner.llm.prompting import build_author_seed_section
+from helion.autotuner.llm.prompting import build_compiler_analysis_section
+from helion.autotuner.llm.workload import compute_workload_hints
 from helion.autotuner.logger import AutotuningLogger
 from helion.autotuner.metrics import AutotuneMetrics
 import helion.language as hl
@@ -309,7 +312,7 @@ class TestLLMGuidedSearch(TestCase):
                 results.append(
                     BenchmarkResult(
                         config=config,
-                        fn=lambda: None,
+                        fn=lambda *args, **kwargs: None,
                         perf=perf,
                         status="ok",
                         compile_time=0.01,
@@ -317,10 +320,32 @@ class TestLLMGuidedSearch(TestCase):
                 )
             return results
 
-        def fake_rebenchmark_population(self, members=None, *, desc="Rebenchmarking"):
-            del members
+        def fake_rebenchmark_population(
+            self,
+            members=None,
+            *,
+            desc="Rebenchmarking",
+            target_ms=200.0,
+            use_isolated=True,
+            confirm_suspicious=True,
+            use_interleaved=True,
+        ):
             rebenchmark_descs.append(desc)
             for member in self.population:
+                member.perfs.append(rebench_perf_by_key[repr(member.config)])
+
+        def fake_rebenchmark(
+            self,
+            members,
+            *,
+            desc="Rebenchmarking",
+            target_ms=200.0,
+            use_isolated=True,
+            confirm_suspicious=True,
+            use_interleaved=True,
+        ):
+            rebenchmark_descs.append(desc)
+            for member in members:
                 member.perfs.append(rebench_perf_by_key[repr(member.config)])
 
         with (
@@ -348,6 +373,12 @@ class TestLLMGuidedSearch(TestCase):
                 autospec=True,
                 side_effect=fake_rebenchmark_population,
             ),
+            patch.object(
+                LLMGuidedSearch,
+                "rebenchmark",
+                autospec=True,
+                side_effect=fake_rebenchmark,
+            ),
         ):
             best = search.autotune(skip_cache=True)
 
@@ -369,11 +400,16 @@ class TestLLMGuidedSearch(TestCase):
         self.assertEqual(benchmark_batches[2][1], [round1_sparse])
         self.assertEqual(
             rebenchmark_descs,
-            ["Round 0: verifying top configs", "Round 1: verifying top configs"],
+            [
+                "Round 0: verifying top configs",
+                "Round 1: verifying top configs",
+                "Final verification top 3 configs",
+            ],
         )
         self.assertEqual(search._autotune_metrics.num_configs_tested, 3)
         self.assertEqual(len(search._all_benchmark_results), 3)
         self.assertEqual(len(search.population), 3)
+        self.assertEqual(len(search._benchmarked_members), 3)
         self.assertEqual(search.best.perf, 2.5)
         self.assertEqual(dict(best), dict(round1_cfg))
         self.assertEqual(dict(search.best.config), dict(round1_cfg))
@@ -389,6 +425,127 @@ class TestLLMGuidedSearch(TestCase):
             search._wait_for_initial_llm_response(future)
 
 
+class TestAuthorSeedConfigPrompt(TestCase):
+    """Author-provided autotune_seed_configs surface in the initial prompt."""
+
+    def test_renders_all_seed_config_values(self):
+        kernel = SimpleNamespace(
+            settings=Settings(
+                autotune_seed_configs=[
+                    helion.Config(block_sizes=[1, 1]),
+                    helion.Config(block_sizes=[16, 16], num_warps=8),
+                ]
+            )
+        )
+        section = build_author_seed_section(kernel)
+        self.assertIn("Author Seed Configs", section)
+        self.assertIn('"block_sizes":[1,1]', section)
+        self.assertIn('"block_sizes":[16,16]', section)
+        self.assertIn('"num_warps":8', section)
+
+    def test_empty_when_no_author_seeds(self):
+        kernel = SimpleNamespace(settings=Settings())
+        self.assertEqual(build_author_seed_section(kernel), "")
+
+
+class TestCompilerAnalysisPrompt(TestCase):
+    """Compiler-fired heuristics + analytical seed configs surface in the prompt."""
+
+    def test_renders_heuristic_name_purpose_and_seed(self):
+        config_spec = SimpleNamespace(
+            autotuner_heuristics=["triton_skinny_gemm"],
+            compiler_seed_configs=[helion.Config(block_sizes=[64, 64, 256])],
+        )
+        section = build_compiler_analysis_section(config_spec)
+        self.assertIn("Compiler Analysis", section)
+        self.assertIn("triton_skinny_gemm", section)
+        self.assertIn("skinny GEMM", section)
+        self.assertIn('"block_sizes":[64,64,256]', section)
+        self.assertIn("structural prior", section.lower())
+
+    def test_empty_when_nothing_fired(self):
+        config_spec = SimpleNamespace(autotuner_heuristics=[], compiler_seed_configs=[])
+        self.assertEqual(build_compiler_analysis_section(config_spec), "")
+
+
+def _meta_tensor(shape: list[int]) -> torch.Tensor:
+    """Shape/dtype-only tensor for workload-hint tests (no real device needed)."""
+    return torch.randn(shape, device="meta", dtype=torch.float16)  # @ignore-device-lint
+
+
+class TestReductionWorkloadHints(TestCase):
+    """Pure (non-attention, non-matmul) reductions get cache-eviction guidance."""
+
+    def test_reduction_gets_eviction_hint_family_general(self):
+        args = (_meta_tensor([1024, 1024]),)
+        hints = compute_workload_hints(args, workload_traits=frozenset({"reduction"}))
+        self.assertIn("load_eviction_policies", hints)
+        self.assertIn("last", hints.lower())
+        # Family-general: no specific kernel name or shape.
+        self.assertNotIn("softmax", hints.lower())
+        self.assertNotIn("1024", hints)
+
+    def test_not_emitted_for_matmul_attention_or_non_reduction(self):
+        sentence = "memory-bound reduction/normalization that streams"
+        for traits in (
+            frozenset({"matmul", "reduction"}),
+            frozenset({"matmul", "reduction", "attention_reduction"}),
+            frozenset(),
+        ):
+            with self.subTest(traits=sorted(traits)):
+                args = (
+                    _meta_tensor([1024, 1024]),
+                    _meta_tensor([1024, 1024]),
+                )
+                hints = compute_workload_hints(args, workload_traits=traits)
+                self.assertNotIn(sentence, hints)
+
+
+class TestLargeMatmulWorkloadHints(TestCase):
+    """Large standalone 2D GEMMs get coherent flat + small-K guidance.
+
+    The default matmul guidance is counterproductive for a large GEMM (it pushes
+    persistent and caps K-tile at 64); the large branch suppresses it and
+    recommends flat pid + K-tile 32. Double-gated to a rank-2 pure-matmul
+    workload so it cannot leak to fused or batched (SSM-style) kernels.
+    """
+
+    _PERSISTENT_PUSH = "try pid_type='persistent_blocked' with l2_groupings"
+    _DEFAULT_START_TILE = "as starting point"
+
+    @staticmethod
+    def _hints(shapes, traits=frozenset({"matmul"})):
+        args = tuple(_meta_tensor(s) for s in shapes)
+        return compute_workload_hints(args, workload_traits=frozenset(traits))
+
+    def test_large_2d_gemm_gets_flat_k32_and_suppresses_default(self):
+        hints = self._hints([[4096, 4096], [4096, 4096]])
+        self.assertIn("large compute-bound GEMM", hints)
+        self.assertIn("K-tile 32", hints)
+        self.assertIn("pid_type='flat'", hints)
+        self.assertNotIn(self._PERSISTENT_PUSH, hints)
+        self.assertNotIn(self._DEFAULT_START_TILE, hints)
+
+    def test_medium_gemm_keeps_default_guidance(self):
+        hints = self._hints([[2048, 2048], [2048, 2048]])
+        self.assertNotIn("large compute-bound GEMM", hints)
+        self.assertIn(self._DEFAULT_START_TILE, hints)
+
+    def test_does_not_leak_to_fused_batched_or_non_matmul(self):
+        # Fused matmul+reduction, batched (rank-3) operands, and non-matmul
+        # workloads must never get the standalone large-GEMM hint.
+        cases = (
+            ([[4096, 4096], [4096, 4096]], frozenset({"matmul", "reduction"})),
+            ([[8, 4096, 4096], [8, 4096, 4096]], frozenset({"matmul"})),
+            ([[4096, 4096]], frozenset()),
+        )
+        for shapes, traits in cases:
+            with self.subTest(traits=sorted(traits), rank=len(shapes[0])):
+                self.assertNotIn(
+                    "large compute-bound GEMM", self._hints(shapes, traits)
+                )
+
+
 class TestLLMTransport(TestCase):
     """Tests for provider selection and HTTP payload translation."""
 
@@ -399,6 +556,106 @@ class TestLLMTransport(TestCase):
         if provider == "openai_responses":
             return {"output": [{"content": [{"type": "text", "text": text}]}]}
         return {"content": [{"type": "text", "text": text}]}
+
+    def test_vertex_provider_request_shape(self):
+        """The vertex provider posts a model-less Anthropic body to the Vertex
+        publisher rawPredict URL, and extra headers parse from JSON / lines."""
+        from helion.autotuner.llm.transport import _extra_headers
+        from helion.autotuner.llm.transport import call_provider
+        from helion.autotuner.llm.transport import infer_provider
+        from helion.autotuner.llm.transport import normalize_provider
+
+        self.assertEqual(normalize_provider("vertex"), "vertex")
+        self.assertEqual(infer_provider("vertex/claude-sonnet-4-5"), "vertex")
+
+        captured = {}
+
+        def fake_post_json(url, payload, headers, *, request_timeout_s):
+            del request_timeout_s
+            captured.update(url=url, payload=payload, headers=headers)
+            return self._response_payload("anthropic")
+
+        env = {
+            "HELION_LLM_VERTEX_PROJECT": "proj-123",
+            "HELION_LLM_VERTEX_LOCATION": "us-east5",
+            "HELION_LLM_EXTRA_HEADERS": '{"X-Gateway": "abc"}',
+        }
+        with patch.dict(os.environ, env, clear=False):
+            with patch(
+                "helion.autotuner.llm.transport._post_json",
+                side_effect=fake_post_json,
+            ):
+                text = call_provider(
+                    "vertex",
+                    model="vertex/claude-sonnet-4-5",
+                    api_base="https://gw.example/v1",
+                    api_key="tok",
+                    messages=[{"role": "user", "content": "suggest configs"}],
+                    max_output_tokens=256,
+                    request_timeout_s=60.0,
+                )
+            self.assertEqual(text, '{"configs": []}')
+            self.assertEqual(
+                captured["url"],
+                "https://gw.example/v1/projects/proj-123/locations/us-east5"
+                "/publishers/anthropic/models/claude-sonnet-4-5:rawPredict",
+            )
+            self.assertNotIn("model", captured["payload"])
+            self.assertEqual(
+                captured["payload"]["anthropic_version"], "vertex-2023-10-16"
+            )
+            self.assertEqual(captured["headers"]["Authorization"], "Bearer tok")
+            self.assertEqual(_extra_headers(), {"X-Gateway": "abc"})
+
+        with patch.dict(
+            os.environ,
+            {"HELION_LLM_EXTRA_HEADERS": "X-One: 1\nX-Two: two"},
+            clear=False,
+        ):
+            self.assertEqual(_extra_headers(), {"X-One": "1", "X-Two": "two"})
+
+    def test_vertex_provider_standard_env_fallback(self):
+        """With the helion-specific knobs unset, the vertex provider resolves the
+        endpoint/project/location from the standard Anthropic-on-Vertex SDK env
+        vars (so a pre-configured environment needs no extra setup)."""
+        from helion.autotuner.llm.transport import call_provider
+
+        captured = {}
+
+        def fake_post_json(url, payload, headers, *, request_timeout_s):
+            captured.update(url=url, payload=payload, headers=headers)
+            return self._response_payload("anthropic")
+
+        env = {
+            "ANTHROPIC_VERTEX_BASE_URL": "https://std.example/v1",
+            "ANTHROPIC_VERTEX_PROJECT_ID": "std-proj",
+            "CLOUD_ML_REGION": "global",
+        }
+        with patch.dict(os.environ, env, clear=False):
+            for stale in (
+                "HELION_LLM_API_BASE",
+                "HELION_LLM_VERTEX_PROJECT",
+                "HELION_LLM_VERTEX_LOCATION",
+            ):
+                os.environ.pop(stale, None)
+            with patch(
+                "helion.autotuner.llm.transport._post_json",
+                side_effect=fake_post_json,
+            ):
+                call_provider(
+                    "vertex",
+                    model="vertex/claude-sonnet-4-5",
+                    api_base=None,
+                    api_key=None,
+                    messages=[{"role": "user", "content": "suggest configs"}],
+                    max_output_tokens=256,
+                    request_timeout_s=60.0,
+                )
+            self.assertEqual(
+                captured["url"],
+                "https://std.example/v1/projects/std-proj/locations/global"
+                "/publishers/anthropic/models/claude-sonnet-4-5:rawPredict",
+            )
 
     def test_transport_helpers_and_http_request_shapes(self):
         """Provider helpers build the expected request/response shapes for each backend."""
@@ -808,6 +1065,199 @@ class TestLLMTransport(TestCase):
             )
         self.assertNotIn("anthropic-beta", captured["headers"])
         self.assertNotIn("speed", captured["payload"])
+
+
+class TestBedrockTransport(TestCase):
+    """Tests for the AWS Bedrock provider (boto3/SigV4, no API key)."""
+
+    def test_infer_provider_requires_explicit_bedrock_prefix(self):
+        """Bedrock must be opted into with an explicit `bedrock/` prefix (or the
+        HELION_LLM_PROVIDER override). Bare region-prefixed Bedrock model IDs are
+        NOT auto-routed, since the same string can be served by the direct API."""
+        from helion.autotuner.llm.transport import infer_provider
+
+        cases = {
+            # Explicit bedrock/ prefix -> bedrock.
+            "bedrock/us.anthropic.claude-sonnet-4-6": "bedrock",
+            "bedrock/us.anthropic.claude-opus-4-8": "bedrock",
+            # Bare region-prefixed Bedrock IDs are NOT auto-detected.
+            "us.anthropic.claude-sonnet-4-6": "unsupported",
+            "apac.anthropic.claude-3-5-haiku-20241022-v1:0": "unsupported",
+            # Bare Anthropic / OpenAI IDs keep their existing providers.
+            "claude-opus-4-7": "anthropic",
+            "anthropic/claude-3-5-sonnet": "anthropic",
+            "gpt-5.5": "openai_responses",
+            "custom/model": "unsupported",
+            # Explicit provider override still routes a bare id to bedrock.
+            ("us.anthropic.claude-sonnet-4-6", "bedrock"): "bedrock",
+        }
+        for model, expected in cases.items():
+            with self.subTest(model=model):
+                if isinstance(model, tuple):
+                    self.assertEqual(infer_provider(model[0], model[1]), expected)
+                else:
+                    self.assertEqual(infer_provider(model), expected)
+
+    def test_normalize_provider_aliases_and_error(self):
+        """Bedrock provider aliases canonicalize; bedrock joins the error message."""
+        from helion.autotuner.llm.transport import normalize_provider
+
+        for alias in ("bedrock", "aws_bedrock", "aws-bedrock"):
+            with self.subTest(alias=alias):
+                self.assertEqual(normalize_provider(alias), "bedrock")
+        with self.assertRaisesRegex(ValueError, "bedrock"):
+            normalize_provider("bogus")
+
+    def test_strip_provider_prefix_drops_bedrock(self):
+        """The bedrock/ prefix is stripped like anthropic/ and openai/."""
+        from helion.autotuner.llm.transport import strip_provider_prefix
+
+        self.assertEqual(
+            strip_provider_prefix("bedrock/us.anthropic.claude-opus-4-8"),
+            "us.anthropic.claude-opus-4-8",
+        )
+        self.assertEqual(
+            strip_provider_prefix("us.anthropic.claude-opus-4-8"),
+            "us.anthropic.claude-opus-4-8",
+        )
+
+    def test_temperature_deprecated_version_matrix(self):
+        """`temperature` deprecation follows per-family minimum versions and
+        tolerates Bedrock-prefixed IDs."""
+        from helion.autotuner.llm.transport import _temperature_deprecated
+
+        cases = {
+            # Opus 4.7+ rejects temperature (both bare and Bedrock-prefixed forms).
+            "claude-opus-4-7": True,
+            "claude-opus-4-8": True,
+            "us.anthropic.claude-opus-4-7": True,
+            "us.anthropic.claude-opus-4-8": True,
+            "us.anthropic.claude-opus-5-0": True,
+            # Opus 4.6 and earlier still accept temperature.
+            "claude-opus-4-6": False,
+            "us.anthropic.claude-opus-4-6-v1": False,
+            "us.anthropic.claude-opus-4-5-20251101-v1:0": False,
+            # Sonnet has no temperature-deprecation entry -> always accepts it.
+            "claude-sonnet-4-6": False,
+            "us.anthropic.claude-sonnet-4-6": False,
+            "us.anthropic.claude-sonnet-4-5-20250929-v1:0": False,
+            # Non-Anthropic / unknown strings fall through.
+            "gpt-5.5": False,
+            "custom-model": False,
+        }
+        for model, expected in cases.items():
+            with self.subTest(model=model):
+                self.assertEqual(_temperature_deprecated(model), expected)
+
+    def test_resolve_bedrock_region_precedence(self):
+        """Region comes from api_base override first, then AWS_REGION,
+        then AWS_DEFAULT_REGION."""
+        from helion.autotuner.llm.transport import _resolve_bedrock_region
+
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(_resolve_bedrock_region("us-west-2"), "us-west-2")
+            self.assertIsNone(_resolve_bedrock_region(None))
+        with patch.dict(os.environ, {"AWS_REGION": "us-east-1"}, clear=True):
+            self.assertEqual(_resolve_bedrock_region(None), "us-east-1")
+            # Explicit api_base still wins over the env var.
+            self.assertEqual(_resolve_bedrock_region("eu-west-1"), "eu-west-1")
+        with patch.dict(os.environ, {"AWS_DEFAULT_REGION": "ap-south-1"}, clear=True):
+            self.assertEqual(_resolve_bedrock_region(None), "ap-south-1")
+
+    def test_call_provider_bedrock_invokes_boto3_and_extracts_text(self):
+        """call_provider('bedrock', ...) builds the Anthropic body, moves the
+        model to modelId, adds anthropic_version, and parses the response."""
+        import json
+
+        from helion.autotuner.llm.transport import call_provider
+
+        captured = {}
+
+        class FakeBody:
+            def __init__(self, payload: bytes) -> None:
+                self._payload = payload
+
+            def read(self) -> bytes:
+                return self._payload
+
+        class FakeBedrockClient:
+            def invoke_model(self, *, modelId, body):
+                captured["modelId"] = modelId
+                captured["body"] = json.loads(body)
+                resp = {"content": [{"type": "text", "text": '{"configs": []}'}]}
+                return {"body": FakeBody(json.dumps(resp).encode("utf-8"))}
+
+        def fake_boto3_client(service, *, region_name=None, config=None):
+            captured["service"] = service
+            captured["region_name"] = region_name
+            return FakeBedrockClient()
+
+        fake_boto3 = SimpleNamespace(client=fake_boto3_client)
+        fake_botocore_config = SimpleNamespace(
+            config=SimpleNamespace(Config=lambda **kw: ("config", kw))
+        )
+        messages = [
+            {"role": "system", "content": "tune kernels"},
+            {"role": "user", "content": "suggest configs"},
+        ]
+        with (
+            patch.dict(os.environ, {"AWS_REGION": "us-east-2"}, clear=True),
+            patch.dict(
+                "sys.modules",
+                {
+                    "boto3": fake_boto3,
+                    "botocore": SimpleNamespace(config=fake_botocore_config.config),
+                    "botocore.config": fake_botocore_config.config,
+                },
+            ),
+        ):
+            response = call_provider(
+                "bedrock",
+                model="us.anthropic.claude-sonnet-4-6",
+                api_base=None,
+                api_key=None,
+                messages=messages,
+                max_output_tokens=512,
+                request_timeout_s=120.0,
+            )
+
+        self.assertEqual(response, '{"configs": []}')
+        self.assertEqual(captured["service"], "bedrock-runtime")
+        self.assertEqual(captured["region_name"], "us-east-2")
+        # The model is named via modelId, not in the request body.
+        self.assertEqual(captured["modelId"], "us.anthropic.claude-sonnet-4-6")
+        self.assertNotIn("model", captured["body"])
+        # Bedrock requires the version string and the standard Anthropic fields.
+        self.assertEqual(captured["body"]["anthropic_version"], "bedrock-2023-05-31")
+        self.assertEqual(captured["body"]["system"], "tune kernels")
+        self.assertEqual(captured["body"]["messages"][0]["role"], "user")
+
+    def test_call_provider_bedrock_missing_boto3_raises_clear_error(self):
+        """A helpful error is raised when boto3 is not installed."""
+        import builtins
+
+        from helion.autotuner.llm.transport import call_provider
+
+        real_import = builtins.__import__
+
+        def fake_import(name, *args, **kwargs):
+            if name == "boto3" or name.startswith("botocore"):
+                raise ImportError(f"No module named {name!r}")
+            return real_import(name, *args, **kwargs)
+
+        with (
+            patch.object(builtins, "__import__", side_effect=fake_import),
+            self.assertRaisesRegex(RuntimeError, "boto3 is not installed"),
+        ):
+            call_provider(
+                "bedrock",
+                model="us.anthropic.claude-sonnet-4-6",
+                api_base=None,
+                api_key=None,
+                messages=[{"role": "user", "content": "hi"}],
+                max_output_tokens=64,
+                request_timeout_s=120.0,
+            )
 
 
 class TestLLMSeededLFBOTreeSearch(TestCase):

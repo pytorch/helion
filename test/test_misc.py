@@ -300,8 +300,6 @@ class TestMisc(RefEagerTestBase, TestCase):
         Previously, the cast could be hoisted/ignored leading to FP32 p fed into BF16 v.
         This test ensures kernel runs and matches reference with BF16 inputs.
         """
-        if _get_backend() == "cute":
-            pytest.xfail("CUTe reduction codegen exceeds shared memory")
 
         @helion.kernel(autotune_effort="none", dot_precision=get_test_dot_precision())
         def kernel(
@@ -1251,6 +1249,169 @@ class TestHelionTritonPrinter(TestCase):
             expr = FloorDiv(x, 2)
             result = printer.doprint(expr)
             self.assertIn("div_floor_integer", result)
+
+
+@onlyBackends(["triton"])
+class TestLauncher(TestCase):
+    """Launcher-agnostic contract tests — every launcher
+    implementation must satisfy these regardless of which Triton
+    dispatch path it uses. Currently exercises whichever launcher
+    Helion installs by default; the same scenarios are pinned down
+    against the static-kernel launcher in
+    ``test/test_static_launcher.py``.
+    """
+
+    def test_unaligned_input_produces_correct_output(self) -> None:
+        """An unaligned tensor (e.g. ``x[1:]`` on fp32) primed after
+        an aligned call must still produce the correct numeric output:
+        the launcher either falls back to Triton's full path or
+        otherwise handles the new alignment cleanly."""
+
+        @helion.kernel(
+            static_shapes=True,
+            config=helion.Config(block_sizes=[1024], num_warps=4, num_stages=2),
+        )
+        def add(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for i in hl.tile(out.size(0)):
+                out[i] = x[i] + y[i]
+            return out
+
+        n = 1024
+        base = torch.randn(n + 4, device=DEVICE, dtype=torch.float32)
+        aligned = base[:n]
+        unaligned = base[1 : n + 1]
+        self.assertEqual(aligned.data_ptr() % 16, 0)
+        self.assertNotEqual(unaligned.data_ptr() % 16, 0)
+
+        add(aligned, aligned)
+        torch.accelerator.synchronize()
+        out = add(unaligned, unaligned)
+        torch.accelerator.synchronize()
+        torch.testing.assert_close(out, unaligned + unaligned)
+
+    def test_unaligned_writes_to_user_out_arg_land_on_original(self) -> None:
+        """If the kernel writes to an unaligned user-supplied output
+        buffer, those writes must land on the user's tensor (not on
+        a clone)."""
+
+        @helion.kernel(
+            static_shapes=True,
+            config=helion.Config(block_sizes=[1024], num_warps=4, num_stages=2),
+        )
+        def add_write_out(
+            x: torch.Tensor, y: torch.Tensor, out: torch.Tensor
+        ) -> torch.Tensor:
+            for i in hl.tile(out.size(0)):
+                out[i] = x[i] + y[i]
+            return out
+
+        n = 1024
+        x_aligned = torch.randn(n, device=DEVICE, dtype=torch.float32)
+        y_aligned = torch.randn(n, device=DEVICE, dtype=torch.float32)
+        base_out = torch.zeros(n + 4, device=DEVICE, dtype=torch.float32)
+
+        # Prime with aligned slices, then call with only ``out``
+        # unaligned so the test isolates the write-to-unaligned case.
+        add_write_out(x_aligned, y_aligned, base_out[:n])
+        torch.accelerator.synchronize()
+
+        out_unaligned = base_out[1 : n + 1]
+        self.assertEqual(x_aligned.data_ptr() % 16, 0)
+        self.assertEqual(y_aligned.data_ptr() % 16, 0)
+        self.assertNotEqual(out_unaligned.data_ptr() % 16, 0)
+        out_unaligned.fill_(0.0)
+        add_write_out(x_aligned, y_aligned, out_unaligned)
+        torch.accelerator.synchronize()
+        torch.testing.assert_close(out_unaligned, x_aligned + y_aligned)
+
+    @skipIfRefEager(
+        "Inspects the bound kernel's Triton JITFunction, which doesn't "
+        "exist in ref-eager mode"
+    )
+    def test_used_global_vals_mutation_raises(self) -> None:
+        """Mutating a tracked global (e.g. a ``_BLOCK_SIZE_*``
+        constexpr captured via ``used_global_vals``) between calls
+        must trigger ``RuntimeError`` from Triton's own guard."""
+
+        @helion.kernel(
+            static_shapes=True,
+            config=helion.Config(block_sizes=[1024], num_warps=4, num_stages=2),
+        )
+        def add(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for i in hl.tile(out.size(0)):
+                out[i] = x[i] + y[i]
+            return out
+
+        x = torch.randn(1024, device=DEVICE, dtype=torch.float32)
+        add(x, x)
+        torch.accelerator.synchronize()
+
+        from triton.runtime.jit import JITFunction
+
+        bound = next(iter(add._bound_kernels.values()))  # type: ignore[attr-defined]
+        jit_fn = next(
+            v for v in bound._run.__globals__.values() if isinstance(v, JITFunction)
+        )
+        ugv = getattr(jit_fn, "used_global_vals", None)
+        if not ugv:
+            self.skipTest("This kernel has no used_global_vals to mutate")
+
+        (name, _gid), (val, gdict) = next(iter(ugv.items()))
+        original = gdict[name]
+        gdict[name] = "MUTATED_NOPE"
+        try:
+            with self.assertRaises(RuntimeError):
+                add(x, x)
+                torch.accelerator.synchronize()
+        finally:
+            gdict[name] = original
+
+    def test_correct_result_on_each_cuda_device(self) -> None:
+        """The same kernel called on ``cuda:0`` then ``cuda:1`` must
+        yield correct numeric results landing on each device. Whether
+        the two calls share a ``BoundKernel`` (cache key collapses on
+        ``device.type``) or get distinct entries (key includes the
+        full ``torch.device``) is an implementation detail covered in
+        ``test_static_launcher.py``; this contract test only pins
+        down per-device correctness.
+
+        Triton's launcher requires the current CUDA context to match
+        the tensor's device — like raw Triton, Helion expects the
+        caller to set the device via ``torch.cuda.device(N)`` (or
+        ``torch.cuda.set_device(N)``) before launching on a
+        non-default device."""
+        if torch.cuda.device_count() < 2:
+            self.skipTest("requires >= 2 CUDA devices")
+
+        @helion.kernel(
+            static_shapes=True,
+            config=helion.Config(block_sizes=[1024], num_warps=4, num_stages=2),
+        )
+        def add(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for i in hl.tile(out.size(0)):
+                out[i] = x[i] + y[i]
+            return out
+
+        device0 = torch.device(DEVICE.type, 0)
+        device1 = torch.device(DEVICE.type, 1)
+
+        x0 = torch.randn(1024, device=device0, dtype=torch.float32)
+        with torch.cuda.device(device0.index):
+            out0 = add(x0, x0)
+        torch.cuda.synchronize(0)
+
+        x1 = torch.randn(1024, device=device1, dtype=torch.float32)
+        with torch.cuda.device(device1.index):
+            out1 = add(x1, x1)
+        torch.cuda.synchronize(1)
+
+        self.assertEqual(out0.device, device0)
+        self.assertEqual(out1.device, device1)
+        torch.testing.assert_close(out0, 2 * x0)
+        torch.testing.assert_close(out1, 2 * x1)
 
 
 if __name__ == "__main__":

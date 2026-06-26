@@ -22,7 +22,7 @@ if TYPE_CHECKING:
     from collections.abc import Sequence
     import types
 
-    from .type_propagation import TypeInfo
+    from .type_info import TypeInfo
 
     _T = TypeVar("_T", bound=ast.AST)
     _R = TypeVar("_R")
