@@ -18,9 +18,7 @@ of the sweep still reports.
 from __future__ import annotations
 
 import argparse
-import contextlib
 import importlib.util
-import io
 import json
 from pathlib import Path
 import re
@@ -44,26 +42,48 @@ KERNELS = [
     "softmax",
     "scaled_mm",
     "cross_entropy",
+    # Ported from vLLM (vllm/kernels/helion/ops); torch-native baselines.
+    "silu_mul_fp8",
+    "dynamic_per_token_scaled_fp8_quant",
+    "per_token_group_fp8_quant",
+    "rms_norm_dynamic_per_token_quant",
+    "rms_norm_per_block_quant",
+    "silu_and_mul_per_block_quant",
+    "fused_qk_norm_rope",
 ]
 
-_SUMMARY_RE = re.compile(
-    r"^SUMMARY:\s+helion_wins=(?P<wins>\d+)\s+total=(?P<total>\d+)\s+"
-    r"geomean=(?P<geomean>[\d.]+)\s+best_speedup=(?P<best>[\d.]+)\s*$",
-    re.MULTILINE,
-)
-
-# Map the running GPU's compute capability to the hardware alias each kernel
-# declares via pretuned_hardware(). The nightly runs one GPU per alias.
+# Map a compute capability (heuristic file suffix) to a hardware alias. The
+# nightly runs one GPU per alias.
 _HARDWARE_BY_COMPUTE = {"sm90": "h100", "sm100": "b200"}
 
 
+def _supported_hardware(name: str) -> set[str]:
+    """Hardware a kernel is pretuned for, inferred from its checked-in heuristics.
+
+    Each ``_helion_aot_<name>_cuda_sm<NN>.py`` file declares a compute capability
+    the kernel ships a config for; map those to hardware aliases. This is the
+    single source of truth -- no per-kernel declaration to keep in sync.
+    """
+    hardware = set()
+    for path in (PRETUNED_KERNELS_DIR / name).glob(f"_helion_aot_{name}_cuda_sm*.py"):
+        match = re.search(r"_cuda_(sm\d+)\.py$", path.name)
+        if match:
+            hardware.add(_HARDWARE_BY_COMPUTE.get(match.group(1), match.group(1)))
+    return hardware
+
+
 def _import_kernel_module(name: str) -> ModuleType:
-    # Private module name avoids clashing with examples/<name>.py.
-    module_name = f"_helion_pretuned_run.{name}"
+    # Flat private module name (no dotted parent package, which Helion's
+    # global-scope resolution would try to import) that avoids clashing with
+    # examples/<name>.py.
+    module_name = f"_helion_pretuned_run_{name}"
     file_path = PRETUNED_KERNELS_DIR / name / f"{name}.py"
     spec = importlib.util.spec_from_file_location(module_name, file_path)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
+    # Register before exec so Helion can resolve kernels that reference
+    # module-level globals (global_scope_origin does sys.modules[__name__]).
+    sys.modules[module_name] = module
     spec.loader.exec_module(module)
     return module
 
@@ -75,36 +95,31 @@ def _compute_capability() -> str:
 
 def run_kernel(name: str, current_hardware: str) -> dict:
     record: dict[str, object] = {"kernel": name}
+    # Only benchmark a kernel on the hardware its checked-in heuristics target.
+    supported = sorted(_supported_hardware(name))
+    record["pretuned_hardware"] = supported
+    if current_hardware not in supported:
+        record["skipped"] = (
+            f"pretuned for {supported}; current hardware is {current_hardware}"
+        )
+        print(f"Skipping {name}: {record['skipped']}")
+        return record
     try:
         module = _import_kernel_module(name)
-        # Only benchmark a kernel on the hardware its checked-in config targets.
-        hardware = module.pretuned_hardware()
-        record["pretuned_hardware"] = hardware
-        if hardware != current_hardware:
-            record["skipped"] = (
-                f"pretuned for {hardware}; current hardware is {current_hardware}"
-            )
-            print(f"Skipping {name}: {record['skipped']}")
-            return record
-        buf = io.StringIO()
-        with contextlib.redirect_stdout(buf):
-            module.main()
-        output = buf.getvalue()
-        # Relay so CI logs show the per-shape table.
-        print(output)
-        match = _SUMMARY_RE.search(output)
-        if match is None:
-            record["error"] = "no SUMMARY line in output"
-            return record
+        # main(verbose=True) prints the per-shape table (relayed to CI logs) and
+        # returns the metrics dict directly -- no stdout scraping.
+        metrics = module.main(verbose=True)
         record.update(
-            helion_wins=int(match["wins"]),
-            total=int(match["total"]),
-            geomean=float(match["geomean"]),
-            best_speedup=float(match["best"]),
-            # Each kernel module declares its benchmark method; far more robust
-            # than scraping a token out of the printed SUMMARY line.
+            helion_wins=int(metrics["helion_wins"]),
+            total=int(metrics["total"]),
+            geomean=float(metrics["geomean"]),
+            best_speedup=float(metrics["best_speedup"]),
             cudagraph=bool(module.use_cudagraph()),
         )
+        # Optional per-baseline breakdown (helion vs each specific baseline),
+        # for the dashboard's per-kernel dropdown.
+        if metrics.get("baselines"):
+            record["baselines"] = metrics["baselines"]
     except (
         Exception
     ) as exc:  # Keep going: one kernel's failure shouldn't sink the report.
@@ -124,8 +139,8 @@ def main() -> None:
     parser.add_argument(
         "--hardware",
         default="",
-        help="Hardware alias to match against each kernel's pretuned_hardware() "
-        "(default: derived from the GPU's compute capability).",
+        help="Hardware alias to match against each kernel's checked-in heuristic "
+        "files (default: derived from the GPU's compute capability).",
     )
     args = parser.parse_args()
 

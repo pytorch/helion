@@ -6,13 +6,10 @@ the hardware where each kernel's checked-in heuristics apply.
 
 from __future__ import annotations
 
-import contextlib
 from dataclasses import dataclass
 import importlib.util
-import io
 import math
 import os
-import re
 import sys
 import unittest
 
@@ -42,45 +39,33 @@ def _current_compute_capability() -> str | None:
 
 
 def _import_pretuned_kernel_module(name):
-    # Private module name avoids clashing with ``examples/<name>.py``.
-    module_name = f"_helion_pretuned_kernels_test.{name}"
+    # Flat private module name (no dotted parent package, which Helion's
+    # global-scope resolution would try to import) avoids clashing with
+    # ``examples/<name>.py``.
+    module_name = f"_helion_pretuned_kernels_test_{name}"
     if module_name not in sys.modules:
         file_path = PRETUNED_KERNELS_DIR / name / f"{name}.py"
         spec = importlib.util.spec_from_file_location(module_name, file_path)
         assert spec is not None
         assert spec.loader is not None
         module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
+        # Register before exec so Helion can resolve kernels that reference
+        # module-level globals (global_scope_origin does sys.modules[__name__]).
         sys.modules[module_name] = module
+        spec.loader.exec_module(module)
     return sys.modules[module_name]
 
 
-_SUMMARY_RE = re.compile(
-    r"^SUMMARY:\s+helion_wins=(?P<wins>\d+)\s+total=(?P<total>\d+)\s+"
-    r"geomean=(?P<geomean>[\d.]+)\s+best_speedup=(?P<best>[\d.]+)\s*$",
-    re.MULTILINE,
-)
-
-
 def _run_pretuned_kernel_main_and_parse_summary(name):
+    # main(verbose=False) returns the metrics dict directly (helion vs the best
+    # available baseline) without printing the per-shape table.
     module = _import_pretuned_kernel_module(name)
-    buf = io.StringIO()
-    with contextlib.redirect_stdout(buf):
-        module.main()
-    output = buf.getvalue()
-    # Relay output so CI logs show the per-shape table on failure.
-    print(output)
-    match = _SUMMARY_RE.search(output)
-    if match is None:
-        raise AssertionError(
-            f"Could not find SUMMARY line in pretuned kernel output for {name}.\n"
-            f"Output was:\n{output}"
-        )
+    metrics = module.main(verbose=False)
     return {
-        "helion_wins": int(match["wins"]),
-        "total": int(match["total"]),
-        "geomean": float(match["geomean"]),
-        "best_speedup": float(match["best"]),
+        "helion_wins": int(metrics["helion_wins"]),
+        "total": int(metrics["total"]),
+        "geomean": float(metrics["geomean"]),
+        "best_speedup": float(metrics["best_speedup"]),
     }
 
 
@@ -350,6 +335,32 @@ _EXPECTED_PERF: dict[str, dict[str, ExpectedPerf]] = {
             wins_slack=4,
         ),
     },
+    # vLLM-ported kernels (vllm/kernels/helion/ops): each benchmarks its fused
+    # Helion kernel under CUDA graphs against a torch-native (unfused, eager)
+    # reference, so speedups are large. sm90 numbers measured on H100; sm100
+    # gating is added once a B200 nightly has calibrated it (the perf test
+    # skips compute capabilities absent from this map).
+    "silu_mul_fp8": {
+        "sm90": ExpectedPerf(helion_wins=36, total=36, geomean=6.0, wins_slack=3),
+    },
+    "dynamic_per_token_scaled_fp8_quant": {
+        "sm90": ExpectedPerf(helion_wins=24, total=24, geomean=13.9, wins_slack=2),
+    },
+    "per_token_group_fp8_quant": {
+        "sm90": ExpectedPerf(helion_wins=24, total=24, geomean=12.3, wins_slack=2),
+    },
+    "rms_norm_dynamic_per_token_quant": {
+        "sm90": ExpectedPerf(helion_wins=36, total=36, geomean=18.0, wins_slack=3),
+    },
+    "rms_norm_per_block_quant": {
+        "sm90": ExpectedPerf(helion_wins=24, total=24, geomean=18.0, wins_slack=2),
+    },
+    "silu_and_mul_per_block_quant": {
+        "sm90": ExpectedPerf(helion_wins=24, total=24, geomean=16.1, wins_slack=2),
+    },
+    "fused_qk_norm_rope": {
+        "sm90": ExpectedPerf(helion_wins=21, total=21, geomean=25.5, wins_slack=2),
+    },
 }
 
 # Geomean must stay within this fraction below expected. Catches regressions
@@ -420,6 +431,37 @@ class TestPretunedKernelsCorrectness(TestCase):
                     torch.bfloat16
                 ) + bias
                 torch.testing.assert_close(c, ref, atol=1e-1, rtol=1e-1)
+
+    def _run_vllm_ported_correctness(self, name: str, needs_fp8: bool = True) -> None:
+        # vLLM-ported kernels self-verify via the module's correctness_check(),
+        # which runs the kernel and its torch-native reference on one shape.
+        if not is_cuda():
+            self.skipTest("Pretuned kernels require CUDA / ROCm.")
+        if needs_fp8 and torch.cuda.get_device_capability() < (8, 9):
+            self.skipTest(f"{name} requires FP8 support (SM89+).")
+        module = _import_pretuned_kernel_module(name)
+        module.correctness_check()
+
+    def test_silu_mul_fp8(self):
+        self._run_vllm_ported_correctness("silu_mul_fp8")
+
+    def test_dynamic_per_token_scaled_fp8_quant(self):
+        self._run_vllm_ported_correctness("dynamic_per_token_scaled_fp8_quant")
+
+    def test_per_token_group_fp8_quant(self):
+        self._run_vllm_ported_correctness("per_token_group_fp8_quant")
+
+    def test_rms_norm_dynamic_per_token_quant(self):
+        self._run_vllm_ported_correctness("rms_norm_dynamic_per_token_quant")
+
+    def test_rms_norm_per_block_quant(self):
+        self._run_vllm_ported_correctness("rms_norm_per_block_quant")
+
+    def test_silu_and_mul_per_block_quant(self):
+        self._run_vllm_ported_correctness("silu_and_mul_per_block_quant")
+
+    def test_fused_qk_norm_rope(self):
+        self._run_vllm_ported_correctness("fused_qk_norm_rope", needs_fp8=False)
 
 
 @onlyBackends(["triton"])
@@ -502,6 +544,34 @@ class TestPretunedKernelsPerformance(TestCase):
     @pytest.mark.timeout(120)
     def test_scaled_mm(self):
         self._run_pretuned_kernel_perf("scaled_mm")
+
+    @pytest.mark.timeout(180)
+    def test_silu_mul_fp8(self):
+        self._run_pretuned_kernel_perf("silu_mul_fp8")
+
+    @pytest.mark.timeout(180)
+    def test_dynamic_per_token_scaled_fp8_quant(self):
+        self._run_pretuned_kernel_perf("dynamic_per_token_scaled_fp8_quant")
+
+    @pytest.mark.timeout(180)
+    def test_per_token_group_fp8_quant(self):
+        self._run_pretuned_kernel_perf("per_token_group_fp8_quant")
+
+    @pytest.mark.timeout(180)
+    def test_rms_norm_dynamic_per_token_quant(self):
+        self._run_pretuned_kernel_perf("rms_norm_dynamic_per_token_quant")
+
+    @pytest.mark.timeout(180)
+    def test_rms_norm_per_block_quant(self):
+        self._run_pretuned_kernel_perf("rms_norm_per_block_quant")
+
+    @pytest.mark.timeout(180)
+    def test_silu_and_mul_per_block_quant(self):
+        self._run_pretuned_kernel_perf("silu_and_mul_per_block_quant")
+
+    @pytest.mark.timeout(180)
+    def test_fused_qk_norm_rope(self):
+        self._run_pretuned_kernel_perf("fused_qk_norm_rope")
 
 
 if __name__ == "__main__":

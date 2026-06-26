@@ -600,7 +600,7 @@ function renderSpeedup() {
   html += '</div>';
   // Speedup trend over time (Plotly)
   const runs = DATA.runs;
-  if (runs.length >= 1) {
+  if (runs.length >= 2) {
     html += '<div style="background:var(--bg);border-radius:8px;padding:16px;margin-bottom:20px">';
     html += '<div style="font-size:14px;font-weight:600;margin-bottom:8px">Geomean Speedup Over Time</div>';
     html += `<div id="speedup-trend-chart" style="width:100%;height:${TREND_CHART_HEIGHT}px"></div>`;
@@ -646,7 +646,7 @@ function renderSpeedup() {
     renderSpeedup();
     renderOverviewGrid();
   });
-  if (runs.length >= 1) {
+  if (runs.length >= 2) {
     setTimeout(() => renderSpeedupTrendChart(), 50);
   }
 }
@@ -1153,7 +1153,7 @@ function renderPretuned() {
   html += summaryCard('Platforms', `${new Set(entries.map(e => e.platform_short)).size}`, 'GPU architectures');
   html += '</div>';
   const runs = D.runs || [];
-  if (runs.length >= 1) {
+  if (runs.length >= 2) {
     html += '<div style="background:var(--bg);border-radius:8px;padding:16px;margin-bottom:20px">';
     html += '<div style="font-size:14px;font-weight:600;margin-bottom:8px">Geomean Speedup Over Time</div>';
     html += `<div id="pt-trend-chart" style="width:100%;height:${TREND_CHART_HEIGHT}px"></div>`;
@@ -1164,8 +1164,12 @@ function renderPretuned() {
     const latest = e.history && e.history.length > 0 ? e.history[e.history.length - 1] : null;
     const commitLink = latest ? `<a href="${commitUrl(latest.full_sha)}" target="_blank" style="font-family:monospace;font-size:12px">${escHtml(latest.sha)}</a>` : '--';
     const gmColor = e.geomean >= 1.0 ? 'var(--green)' : 'var(--red)';
+    const hasBaselines = e.baselines && Object.keys(e.baselines).length > 0;
+    const kernelCell = hasBaselines
+      ? `<a href="#" onclick="showPretunedBaselines('${escHtml(e.kernel)}','${escHtml(e.platform_short)}');return false" title="speedup vs each baseline" style="color:var(--blue)">${escHtml(e.kernel)} ▾</a>`
+      : escHtml(e.kernel);
     html += `<tr>
-      <td>${escHtml(e.kernel)}</td>
+      <td>${kernelCell}</td>
       <td>${cudagraphBadge(e.cudagraph)}</td>
       <td>${platBadge(e.platform_short)}</td>
       <td>${commitLink}</td>
@@ -1186,7 +1190,27 @@ function renderPretuned() {
     pretunedPlatform = ev.target.value;
     renderPretuned();
   });
-  if (runs.length >= 1) setTimeout(renderPretunedTrendChart, 50);
+  if (runs.length >= 2) setTimeout(renderPretunedTrendChart, 50);
+}
+function showPretunedBaselines(kernel, ps) {
+  const e = (PRETUNED_DATA && PRETUNED_DATA.summary || []).find(
+    s => s.kernel === kernel && s.platform_short === ps);
+  if (!e || !e.baselines) return;
+  let html = modalHeader(
+    `${escHtml(kernel)} — speedup vs each baseline`,
+    `${platName(ps)} · helion's geomean / wins / best over each baseline (headline row uses the fastest)`);
+  html += '<div class="table-scroll"><table class="data-table"><thead><tr>'
+    + '<th>Baseline</th><th>Geomean</th><th>Wins</th><th>Best</th></tr></thead><tbody>';
+  Object.keys(e.baselines).forEach(name => {
+    const m = e.baselines[name];
+    const c = m.geomean >= 1.0 ? 'var(--green)' : 'var(--red)';
+    html += `<tr><td>${escHtml(name)}</td>`
+      + `<td style="color:${c}">${formatSpeedup(m.geomean)}</td>`
+      + `<td>${m.wins}/${m.total}</td>`
+      + `<td style="color:var(--green)">${formatSpeedup(m.best_speedup)}</td></tr>`;
+  });
+  html += '</tbody></table></div>';
+  openModal(html);
 }
 function renderPretunedTrendChart() {
   const el = document.getElementById('pt-trend-chart');

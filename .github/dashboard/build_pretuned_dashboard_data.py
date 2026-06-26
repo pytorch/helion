@@ -168,6 +168,9 @@ def parse_run(run_dir, active_platforms=None):
                     "helion_wins": rec.get("helion_wins", 0),
                     "total": rec.get("total", 0),
                     "best_speedup": rec.get("best_speedup", 0.0),
+                    # Per-baseline breakdown for the dashboard dropdown (or None
+                    # for single-baseline kernels).
+                    "baselines": rec.get("baselines"),
                 }
             )
     return kernels
@@ -186,6 +189,7 @@ def build_history_entry(run, k):
         "helion_wins": k["helion_wins"],
         "total": k["total"],
         "best_speedup": round(k["best_speedup"], 4),
+        "baselines": k.get("baselines"),
     }
 
 
@@ -309,6 +313,7 @@ def build_dashboard_data(cache_dir, runs_meta, existing_data=None, active_platfo
                 "helion_wins": latest["helion_wins"] if latest else 0,
                 "total": latest["total"] if latest else 0,
                 "best_speedup": latest["best_speedup"] if latest else 0,
+                "baselines": latest.get("baselines") if latest else None,
                 "last_seen_date": latest["date"] if latest else None,
                 "history": entry["history"],
             }

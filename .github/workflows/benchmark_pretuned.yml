@@ -101,6 +101,26 @@ jobs:
           SETUPTOOLS_SCM_PRETEND_VERSION="0.0.0" uv pip install -e .'[dev]'
           python -c "import helion; print(helion.__name__)"
 
+      - name: Install vLLM (optional baseline)
+        # vLLM supplies the production baselines the pretuned kernels compare
+        # against (torch.ops._C.* quant ops, cutlass_scaled_mm). vLLM's nightly
+        # wheel pins torch==2.11.0, matching the torch installed above. This is
+        # non-fatal: if it fails, pretuned_kernels/run.py falls back to the
+        # torch-native baselines.
+        if: startsWith(inputs.image, 'nvidia')
+        continue-on-error: true
+        run: |
+          source .venv/bin/activate
+          # --index-strategy unsafe-best-match: vLLM nightly pins exact dep
+          # versions (e.g. outlines-core==0.2.14) that live on PyPI, not on the
+          # vLLM/pytorch nightly indexes; uv's default first-index-only strategy
+          # then can't resolve them. unsafe-best-match lets uv pick the matching
+          # version from any configured index.
+          uv pip install -U vllm --pre \
+            --index-strategy unsafe-best-match \
+            --extra-index-url https://wheels.vllm.ai/nightly
+          python -c "import vllm, torch; print('vllm', vllm.__version__, '| torch', torch.__version__)"
+
       - name: CUDA Compute Check
         if: startsWith(inputs.image, 'nvidia')
         run: |

@@ -37,12 +37,11 @@ def use_cudagraph() -> bool:
     return False
 
 
-def pretuned_hardware() -> str:
-    """GPU the checked-in heuristic is tuned for (read by pretuned_kernels/run.py)."""
-    return "b200"
+def main(verbose: bool = True) -> dict:
+    def _p(*args: object) -> None:
+        if verbose:
+            print(*args)
 
-
-def main() -> None:
     tritonbench_shapes = [
         (2048, 1024),
         (2048, 2048),
@@ -83,12 +82,12 @@ def main() -> None:
         dict.fromkeys(tritonbench_shapes + tritonbench_npot_shapes + realistic_shapes)
     )
 
-    print(f"GPU: {torch.cuda.get_device_name()}")
-    print(
+    _p(f"GPU: {torch.cuda.get_device_name()}")
+    _p(
         f"{'M':>8s}  {'N':>6s}  {'helion (us)':>12s}  "
         f"{'torch (us)':>12s}  {'speedup':>8s}"
     )
-    print("-" * 63)
+    _p("-" * 63)
 
     speedups: list[float] = []
     helion_wins = 0
@@ -117,7 +116,7 @@ def main() -> None:
         if speedup > best_speedup:
             best_speedup = speedup
             best_shape = (M, N)
-        print(
+        _p(
             f"{M:>8d}  {N:>6d}  {ms_helion * 1000:>12.2f}  "
             f"{ms_torch * 1000:>12.2f}  {speedup:>7.2f}x"
         )
@@ -125,15 +124,17 @@ def main() -> None:
     geomean = math.exp(
         sum(math.log(s) for s in speedups if s > 0) / max(len(speedups), 1)
     )
-    print(
+    _p(
         f"\nHelion faster on {helion_wins}/{len(shapes)} shapes; "
         f"geomean speedup {geomean:.3f}x; "
         f"best speedup {best_speedup:.2f}x at (M, N)={best_shape}."
     )
-    print(
-        f"SUMMARY: helion_wins={helion_wins} total={len(shapes)} "
-        f"geomean={geomean:.4f} best_speedup={best_speedup:.4f}"
-    )
+    return {
+        "helion_wins": helion_wins,
+        "total": len(shapes),
+        "geomean": round(geomean, 4),
+        "best_speedup": round(best_speedup, 4),
+    }
 
 
 if __name__ == "__main__":

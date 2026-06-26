@@ -105,6 +105,44 @@ def _scaled_mm_torch(
     c.copy_(out)
 
 
+# Optional vLLM CUTLASS baseline (the production FP8 GEMM this is benchmarked
+# against). The pretuned test env has only torch + helion (guarded import); the
+# nightly benchmark workflow installs vLLM, so main() then compares against it.
+try:
+    from vllm import _custom_ops as _vllm_ops
+
+    _HAS_VLLM = hasattr(_vllm_ops, "cutlass_scaled_mm")
+except ImportError:
+    _vllm_ops = None
+    _HAS_VLLM = False
+
+
+def _scaled_mm_cutlass(
+    c: torch.Tensor,
+    a: torch.Tensor,
+    b: torch.Tensor,
+    scale_a: torch.Tensor,
+    scale_b: torch.Tensor,
+    bias: torch.Tensor | None = None,
+) -> None:
+    """vLLM CUTLASS baseline (ops.cutlass_scaled_mm)."""
+    out = _vllm_ops.cutlass_scaled_mm(a, b, scale_a, scale_b, c.dtype, bias)
+    c.copy_(out)
+
+
+def _baselines() -> list[tuple[str, object]]:
+    """Baselines main() benchmarks helion against.
+
+    torch._scaled_mm is always available; vLLM's CUTLASS kernel is added when
+    vLLM is installed (the nightly benchmark env). The SUMMARY speedup is helion
+    vs the best (fastest) available baseline.
+    """
+    baselines: list[tuple[str, object]] = [("torch", _scaled_mm_torch)]
+    if _HAS_VLLM:
+        baselines.append(("cutlass", _scaled_mm_cutlass))
+    return baselines
+
+
 def use_cudagraph() -> bool:
     """Whether main() benchmarks under CUDA graphs (read by pretuned_kernels/run.py).
 
@@ -114,12 +152,11 @@ def use_cudagraph() -> bool:
     return True
 
 
-def pretuned_hardware() -> str:
-    """GPU the checked-in heuristic is tuned for (read by pretuned_kernels/run.py)."""
-    return "h100"
+def main(verbose: bool = True) -> dict:
+    def _p(*args: object) -> None:
+        if verbose:
+            print(*args)
 
-
-def main() -> None:
     # (K, N) weight shapes pulled from the vLLM Qwen3 FP8 sweep (TP=1).
     kn_shapes = [
         (2048, 4096),
@@ -141,14 +178,21 @@ def main() -> None:
     fp8_dtype = torch.float8_e4m3fn
     out_dtype = torch.bfloat16
 
-    print(f"GPU: {torch.cuda.get_device_name()}")
-    print(
-        f"{'M':>6s}  {'K':>6s}  {'N':>6s}  {'helion (us)':>12s}  "
-        f"{'torch (us)':>12s}  {'speedup':>8s}"
+    baselines = _baselines()
+    names = [n for n, _ in baselines]
+    _p(
+        f"GPU: {torch.cuda.get_device_name()} "
+        f"(baselines: {', '.join(names)}; SUMMARY vs best/fastest baseline)"
     )
-    print("-" * 63)
+    base_hdr = "  ".join(f"{n + ' (us)':>12s}" for n in names)
+    _p(
+        f"{'M':>6s}  {'K':>6s}  {'N':>6s}  {'helion (us)':>12s}  "
+        f"{base_hdr}  {'speedup':>8s}"
+    )
+    _p("-" * (45 + 14 * len(names)))
 
-    speedups: list[float] = []
+    speedups_by_base: dict[str, list[float]] = {n: [] for n in names}
+    best_speedups: list[float] = []  # helion vs the fastest baseline each shape
     helion_wins = 0
     best_speedup = 0.0
     best_shape = (0, 0, 0)
@@ -162,10 +206,8 @@ def main() -> None:
         bias = 0.5 * (torch.rand(N, dtype=out_dtype, device="cuda") - 0.5)
 
         scaled_mm(c, a, b, scale_a, scale_b, bias)  # warmup / compile
-        # Benchmark under CUDA graphs: this is how vLLM invokes the kernel, and
-        # it removes per-call host launch/dispatch overhead so the timing
-        # reflects GPU work rather than the eager Python dispatch path (which
-        # can dominate these tiny decode GEMMs and varies by torch version).
+        # Benchmark under CUDA graphs (how vLLM invokes the kernel): removes
+        # per-call host launch overhead so timing reflects GPU work.
         ms_helion = tt.do_bench_cudagraph(
             lambda c=c, a=a, b=b, sa=scale_a, sb=scale_b, bias=bias: scaled_mm(
                 c, a, b, sa, sb, bias
@@ -173,37 +215,68 @@ def main() -> None:
             rep=100,
             return_mode="median",
         )
-        ms_torch = tt.do_bench_cudagraph(
-            lambda c=c, a=a, b=b, sa=scale_a, sb=scale_b, bias=bias: _scaled_mm_torch(
-                c, a, b, sa, sb, bias
-            ),
-            rep=100,
-            return_mode="median",
-        )
-        speedup = ms_torch / ms_helion if ms_helion > 0 else float("nan")
-        speedups.append(speedup)
+        base_ms: dict[str, float] = {}
+        for name, fn in baselines:
+            base_ms[name] = tt.do_bench_cudagraph(
+                lambda fn=fn, c=c, a=a, b=b, sa=scale_a, sb=scale_b, bias=bias: fn(
+                    c, a, b, sa, sb, bias
+                ),
+                rep=100,
+                return_mode="median",
+            )
+            speedups_by_base[name].append(
+                base_ms[name] / ms_helion if ms_helion > 0 else float("nan")
+            )
+        best_base = min(base_ms, key=base_ms.get)  # fastest baseline this shape
+        speedup = base_ms[best_base] / ms_helion if ms_helion > 0 else float("nan")
+        best_speedups.append(speedup)
         if speedup > 1.0:
             helion_wins += 1
         if speedup > best_speedup:
             best_speedup = speedup
             best_shape = (M, K, N)
-        print(
+        base_cols = "  ".join(f"{base_ms[n] * 1000:>12.2f}" for n in names)
+        _p(
             f"{M:>6d}  {K:>6d}  {N:>6d}  {ms_helion * 1000:>12.2f}  "
-            f"{ms_torch * 1000:>12.2f}  {speedup:>7.2f}x"
+            f"{base_cols}  {speedup:>7.2f}x  (vs {best_base})"
         )
 
-    geomean = math.exp(
-        sum(math.log(s) for s in speedups if s > 0) / max(len(speedups), 1)
-    )
-    print(
-        f"\nHelion faster on {helion_wins}/{len(shapes)} shapes; "
-        f"geomean speedup {geomean:.3f}x; "
+    def _geomean(vals: list[float]) -> float:
+        pos = [s for s in vals if s > 0]
+        return math.exp(sum(math.log(s) for s in pos) / max(len(pos), 1))
+
+    # Per-baseline breakdown (helion speedup over each specific baseline),
+    # consumed by pretuned_kernels/run.py for the dashboard's per-kernel dropdown.
+    per_baseline = {
+        name: {
+            "wins": sum(1 for s in speedups_by_base[name] if s > 1.0),
+            "total": len(speedups_by_base[name]),
+            "geomean": round(_geomean(speedups_by_base[name]), 4),
+            "best_speedup": round(max(speedups_by_base[name], default=0.0), 4),
+        }
+        for name in names
+    }
+    for name in names:
+        m = per_baseline[name]
+        _p(
+            f"vs {name}: wins={m['wins']}/{m['total']} "
+            f"geomean={m['geomean']:.3f}x best={m['best_speedup']:.2f}x"
+        )
+    geomean = _geomean(best_speedups)
+    _p(
+        f"\nHelion faster on {helion_wins}/{len(shapes)} shapes vs the best "
+        f"baseline; geomean speedup {geomean:.3f}x; "
         f"best speedup {best_speedup:.2f}x at (M, K, N)={best_shape}."
     )
-    print(
-        f"SUMMARY: helion_wins={helion_wins} total={len(shapes)} "
-        f"geomean={geomean:.4f} best_speedup={best_speedup:.4f}"
-    )
+    # Metrics vs the best (fastest) baseline per shape + per-baseline breakdown,
+    # returned to the caller (pretuned_kernels/run.py).
+    return {
+        "helion_wins": helion_wins,
+        "total": len(shapes),
+        "geomean": round(geomean, 4),
+        "best_speedup": round(best_speedup, 4),
+        "baselines": per_baseline,
+    }
 
 
 if __name__ == "__main__":
