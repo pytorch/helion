@@ -389,15 +389,16 @@ class InductorLowering(Lowering):
             if isinstance(fake_val := n.meta["val"], torch.Tensor):
                 # Don't expand scalars (0-D tensors) - let Triton handle broadcasting naturally
                 # Expanding scalars with [None, None] creates incorrect broadcast shapes
-                if fake_val.ndim < ndim and fake_val.ndim > 0:
-                    expand = tile_strategy.broadcast_expand_dims(
-                        tuple(fake_val.shape), output_shape
+                if (
+                    ctx.cg.device_function.tile_strategy.supports_index_rank_expansion()
+                    and fake_val.ndim < ndim
+                    and fake_val.ndim > 0
+                ):
+                    # Broadcast to force ranks to match (but only for non-scalar tensors)
+                    expand = ["None"] * (ndim - fake_val.ndim) + [":"] * fake_val.ndim
+                    ast_val = expr_from_string(
+                        "{tensor}[" + ", ".join(expand) + "]", tensor=ast_val
                     )
-                    if expand:
-                        ast_val = expr_from_string(
-                            "{tensor}[" + ", ".join(expand) + "]",
-                            tensor=ast_val,
-                        )
             if (
                 isinstance(ast_val, ast.Name)
                 and ast_val.id in device_function._constexpr_args
@@ -414,11 +415,7 @@ class InductorLowering(Lowering):
                 input_asts.append(ast_val)
 
         device_function: DeviceFunction = ctx.cg.device_function
-        tile_strategy = device_function.tile_strategy
-        output_shape: tuple[int | torch.SymInt, ...] = tuple(
-            map(to_symint, self.buffer.get_size())
-        )
-        ndim: int = len(output_shape)
+        ndim: int = max([x.ndim for x in self.input_fake_tensors(node)] or (0,))
         input_asts: list[ast.AST] = []
         # _extra_deps should not be included in the inductor node inputs
         map_arg((node.args, {**node.kwargs, "_extra_deps": None}), visit)
