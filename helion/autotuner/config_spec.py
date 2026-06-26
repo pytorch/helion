@@ -234,6 +234,19 @@ class MemoryOpFact(NamedTuple):
     # subscript so it is reduction-AGNOSTIC; ``None`` for a plain slice). The faithful axis key for
     # the full_width_output / input_load_itemsize gates.
     subscript_block_ids: tuple[int | None, ...] = ()
+    # Element stride of the accessed tensor along each subscript position, aligned 1:1 with
+    # ``subscript_block_ids`` (from ``.stride()``). A stride-1 position is the contiguous (coalescing)
+    # axis — the last subscript for a row-major tensor, a different one for a transposed/strided view.
+    subscript_strides: tuple[int, ...] = ()
+    # DISTINCT HBM elements the op's accessed tensor touches: product of its size-hinted shape dims
+    # over NON-broadcast dims (``stride != 0``); a stride-0 dim contributes factor 1 (``0`` if no
+    # resolvable fake tensor). A FULL-EXTENT op has ``accessed_numel`` == the problem numel; a
+    # BROADCAST operand has a STRICTLY SMALLER count — whether it is a small tensor (``bias[N]``,
+    # ``[M,1]``, ``[1,N]``) OR a full-SIZE ``.expand()``/``broadcast_tensors`` view with a stride-0
+    # dim. The faithful signal for per-element HBM traffic at ANY rank/stride, unlike a bare ``ndim``
+    # check (a full-rank ``[M,1]`` broadcast passes ndim) or a shape-only product (a stride-0 expand
+    # passes shape).
+    accessed_numel: int = 0
 
 
 class AccumulatorFact(NamedTuple):
@@ -246,6 +259,42 @@ class AccumulatorFact(NamedTuple):
 
     dim_block_ids: tuple[int | None, ...]
     itemsize: int
+
+
+class PointwiseElementwiseFact(NamedTuple):
+    """Workload facts for a PURE elementwise/pointwise kernel — DEFINED by the absence of any
+    reduction/matmul/accumulator fact (the disjointness rule): if one of those fired, the kernel
+    belongs to that family and this fact is never built. Bandwidth-bound; the compiler defaults it to
+    ``block_size=32`` (which starves HBM), so the seed sizes a saturating tile from these fields
+    (derived from the walker ``MemoryOpFact`` list + block-size specs, plus one graph walk).
+
+    - ``total_numel``: product of the tiled block dims' ``size_hint``s (the problem element count,
+      M*N); the occupancy / grid-saturation input.
+    - ``slab_numel``: the untiled inner slab, in ELEMENTS, that full-extent ops drag per tiled element
+      = ``sum(accessed_numel // total_numel)`` over those ops (flat kernel: 1 per op; rope:
+      heads*head_dim). A BROADCAST operand (``bias[N]``, ``[M,1]``, stride-0) has
+      ``accessed_numel < total_numel`` → amortized → excluded; an OVERSIZED operand still touches the
+      full problem → counted (hence ``>=``).
+    - ``storage_itemsize`` / ``compute_itemsize``: the STORAGE (HBM) and widest COMPUTE (fp32) byte
+      widths that scale slab_numel into the two budgets — ``slab_numel * storage`` = bandwidth traffic,
+      ``slab_numel * compute`` = register cap (compute reads the promoted dtype; a memory op knows only
+      storage). NOTE: the register cap is a COARSE proxy (blind to compute temporaries), but benign —
+      pointwise is memory-bound; its only jobs are relaxing the floor for a heavy slab and capping the
+      transpose-conflict tile. (Mixed-dtype storage uses the max width — a minor seed approximation.)
+    - ``contig_block_ids``: TILED block-ids that are the stride-1 axis of some full-extent op (from
+      ``subscript_strides``, no graph walk). Row-major → the last dim (seed unchanged); transposed →
+      a different dim; two+ entries = a load-vs-store CONFLICT → the seed emits a BALANCED tile.
+    - ``sfu_ops``: count of transcendental (SFU) ops. SFU ops are latency-bound on a distinct unit, so
+      a transcendental-heavy tile wants more warps while an all-FMA tile of the same op count does not
+      — so SFU count (not total op count) drives the num_warps ramp.
+    """
+
+    total_numel: int
+    slab_numel: int
+    storage_itemsize: int
+    compute_itemsize: int
+    contig_block_ids: tuple[int, ...] = ()
+    sfu_ops: int = 0
 
 
 def shrink_block_sizes_for_numel_constraints(
@@ -538,6 +587,7 @@ class ConfigSpec:
         self.reduction_facts: list[ReductionFact] = []
         self.matmul_reduction_epilogue_facts: list[MatmulWithReductionEpilogueFact] = []
         self.accumulator_facts: list[AccumulatorFact] = []
+        self.pointwise_facts: list[PointwiseElementwiseFact] = []
         self.store_indices: list[int] = []
         self.memory_op_facts: list[MemoryOpFact] = []
         self.backend_tunable_fragments = self.backend.tunable_fragments()

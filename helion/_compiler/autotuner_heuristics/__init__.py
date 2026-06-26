@@ -18,8 +18,8 @@ from .pallas import PallasMatmulF32NoTilingSeedHeuristic
 from .pallas import PallasMatmulNoTilingSeedHeuristic
 from .triton import TritonB200MatmulHeuristic
 from .triton import TritonMatmulReductionEpilogueHeuristic
+from .triton import TritonPointwiseSeedHeuristic
 from .triton import TritonSkinnyGemmHeuristic
-from .triton import TritonSplitJoinRotateHeuristic
 from .triton import TritonStandardReductionHeuristic
 from .triton import TritonUserTiledReductionHeuristic
 
@@ -47,9 +47,9 @@ HEURISTICS_BY_BACKEND: dict[str, tuple[AutotunerHeuristicType, ...]] = {
         TritonSkinnyGemmHeuristic,
         TritonB200MatmulHeuristic,
         TritonMatmulReductionEpilogueHeuristic,
-        TritonSplitJoinRotateHeuristic,
         TritonStandardReductionHeuristic,
         TritonUserTiledReductionHeuristic,
+        TritonPointwiseSeedHeuristic,
     ),
     "pallas": (
         PallasMatmulNoTilingSeedHeuristic,
