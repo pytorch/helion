@@ -152,10 +152,12 @@ a:hover{text-decoration:underline}
   <button class="tab-btn active" data-tab="overview">Overview</button>
   <button class="tab-btn" data-tab="speedup">Speedup</button>
   <button class="tab-btn" data-tab="compare">Compare</button>
+  <button class="tab-btn" data-tab="pretuned">Pretuned</button>
 </div>
 <div id="tab-overview" class="tab-content active"></div>
 <div id="tab-speedup" class="tab-content"></div>
 <div id="tab-compare" class="tab-content"></div>
+<div id="tab-pretuned" class="tab-content"></div>
 <div class="modal-overlay" id="modal-overlay">
   <div class="modal" id="modal-content"></div>
 </div>
@@ -196,6 +198,11 @@ function platName(ps) { return PLAT_NAMES[ps] || ps.toUpperCase(); }
 function platBadge(ps) {
   const c = platColor(ps);
   return `<span class="plat-badge" style="background:${c}22;color:${c}">${platName(ps)}</span>`;
+}
+function cudagraphBadge(on) {
+  return on
+    ? '<span class="plat-badge" style="background:#bc8cff22;color:#bc8cff" title="Benchmarked under CUDA graphs (do_bench_cudagraph)">CUDA Graph</span>'
+    : '<span class="plat-badge" style="background:#8b949e22;color:#8b949e" title="Benchmarked with do_bench (no CUDA graph)">do_bench</span>';
 }
 function escHtml(s) { return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
 // -------- Helper: status card (overview row) --------
@@ -593,7 +600,7 @@ function renderSpeedup() {
   html += '</div>';
   // Speedup trend over time (Plotly)
   const runs = DATA.runs;
-  if (runs.length >= 2) {
+  if (runs.length >= 1) {
     html += '<div style="background:var(--bg);border-radius:8px;padding:16px;margin-bottom:20px">';
     html += '<div style="font-size:14px;font-weight:600;margin-bottom:8px">Geomean Speedup Over Time</div>';
     html += `<div id="speedup-trend-chart" style="width:100%;height:${TREND_CHART_HEIGHT}px"></div>`;
@@ -639,7 +646,7 @@ function renderSpeedup() {
     renderSpeedup();
     renderOverviewGrid();
   });
-  if (runs.length >= 2) {
+  if (runs.length >= 1) {
     setTimeout(() => renderSpeedupTrendChart(), 50);
   }
 }
@@ -1095,8 +1102,132 @@ document.querySelectorAll('.tab-btn').forEach(btn => {
     if (btn.dataset.tab === 'speedup') {
       renderSpeedup();
     } else if (btn.dataset.tab === 'compare') renderCompare();
+    else if (btn.dataset.tab === 'pretuned') renderPretuned();
   });
 });
+// -------- Pretuned Kernels Tab --------
+// Lazily fetches pretuned-dashboard-data.json (built by
+// build_pretuned_dashboard_data.py from the Benchmark Pretuned Dispatch nightly).
+// Aggregate-only: each pretuned kernel reports geomean speedup vs PyTorch eager,
+// win count, and best speedup across its checked-in shape sweep.
+let PRETUNED_DATA = null;
+let PRETUNED_LOADED = false;
+let pretunedPlatform = 'all';
+function renderPretuned() {
+  const root = document.getElementById('tab-pretuned');
+  if (!PRETUNED_LOADED) {
+    root.innerHTML = '<div style="padding:60px;text-align:center;color:var(--text-dim)">Loading pretuned kernel results…</div>';
+    fetch('pretuned-dashboard-data.json')
+      .then(r => { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); })
+      .then(json => { PRETUNED_DATA = json; PRETUNED_LOADED = true; renderPretuned(); })
+      .catch(() => {
+        PRETUNED_LOADED = true;
+        root.innerHTML = '<div style="padding:60px;text-align:center"><h2 style="color:var(--red);margin-bottom:12px">Data Not Loaded</h2><p style="color:var(--text-dim)">Could not load pretuned-dashboard-data.json. The first nightly Benchmark Pretuned Dispatch run may not have completed yet.</p></div>';
+      });
+    return;
+  }
+  const D = PRETUNED_DATA;
+  if (!D || !D.summary || D.summary.length === 0) {
+    root.innerHTML = '<div style="padding:60px;text-align:center"><h2 style="color:var(--text-dim)">No pretuned kernel data yet</h2></div>';
+    return;
+  }
+  const shorts = D.platform_shorts || [];
+  const entries = D.summary.filter(s =>
+    s.has_nightly_data && (pretunedPlatform === 'all' || s.platform_short === pretunedPlatform)
+  );
+  entries.sort((a, b) => a.platform_short.localeCompare(b.platform_short) || a.kernel.localeCompare(b.kernel));
+  const gmVals = entries.map(e => e.geomean).filter(v => v > 0);
+  const overallGM = geomean(gmVals, null);
+  const wins = entries.filter(e => e.geomean > 1.0).length;
+  const sub = `${entries.length} kernel/platform combos`;
+  let html = '';
+  html += '<h2 style="margin-bottom:4px">Pretuned Kernels vs PyTorch Eager</h2>';
+  html += '<p style="font-size:13px;color:var(--text-dim);margin-bottom:16px">Nightly run of every kernel under <code>pretuned_kernels/</code> against its checked-in heuristic. Speedup is geomean over each kernel\'s shape sweep; higher = faster than eager.</p>';
+  html += '<div class="filter-bar"><select id="pt-plat-filter"><option value="all">All Platforms</option>';
+  shorts.forEach(p => { html += `<option value="${p}"${p === pretunedPlatform ? ' selected' : ''}>${platName(p)}</option>`; });
+  html += '</select></div>';
+  html += '<div class="summary-row">';
+  html += summaryCard('Geomean Speedup', formatSpeedup(overallGM), sub, { valueColor: 'var(--green)' });
+  html += summaryCard('Helion Wins', wins, `of ${entries.length} combos faster than eager`, { valueColor: 'var(--green)' });
+  html += summaryCard('Kernels', `${new Set(entries.map(e => e.kernel)).size}`, 'pretuned kernels covered');
+  html += summaryCard('Platforms', `${new Set(entries.map(e => e.platform_short)).size}`, 'GPU architectures');
+  html += '</div>';
+  const runs = D.runs || [];
+  if (runs.length >= 1) {
+    html += '<div style="background:var(--bg);border-radius:8px;padding:16px;margin-bottom:20px">';
+    html += '<div style="font-size:14px;font-weight:600;margin-bottom:8px">Geomean Speedup Over Time</div>';
+    html += `<div id="pt-trend-chart" style="width:100%;height:${TREND_CHART_HEIGHT}px"></div>`;
+    html += '</div>';
+  }
+  html += '<div class="table-wrap"><table class="data-table"><thead><tr><th>Kernel</th><th>Bench</th><th>Platform</th><th>Commit</th><th>Geomean</th><th>Wins</th><th>Best</th><th>Δ vs prev</th></tr></thead><tbody>';
+  entries.forEach(e => {
+    const latest = e.history && e.history.length > 0 ? e.history[e.history.length - 1] : null;
+    const commitLink = latest ? `<a href="${commitUrl(latest.full_sha)}" target="_blank" style="font-family:monospace;font-size:12px">${escHtml(latest.sha)}</a>` : '--';
+    const gmColor = e.geomean >= 1.0 ? 'var(--green)' : 'var(--red)';
+    html += `<tr>
+      <td>${escHtml(e.kernel)}</td>
+      <td>${cudagraphBadge(e.cudagraph)}</td>
+      <td>${platBadge(e.platform_short)}</td>
+      <td>${commitLink}</td>
+      <td style="color:${gmColor}">${formatSpeedup(e.geomean)}</td>
+      <td>${e.helion_wins}/${e.total}</td>
+      <td style="color:var(--green)">${formatSpeedup(e.best_speedup)}</td>
+      <td>${formatDelta(e.geomean_delta_pct, false)}</td>
+    </tr>`;
+  });
+  html += `</tbody><tfoot><tr>
+    <td colspan="4" class="gm-label">${entries.length} pretuned rows</td>
+    <td style="color:var(--green)">${formatSpeedup(overallGM)}</td>
+    <td colspan="3"></td>
+  </tr></tfoot></table></div>`;
+  root.innerHTML = html;
+  root.querySelectorAll('.data-table').forEach(makeSortable);
+  document.getElementById('pt-plat-filter').addEventListener('change', ev => {
+    pretunedPlatform = ev.target.value;
+    renderPretuned();
+  });
+  if (runs.length >= 1) setTimeout(renderPretunedTrendChart, 50);
+}
+function renderPretunedTrendChart() {
+  const el = document.getElementById('pt-trend-chart');
+  if (!el || !PRETUNED_DATA) return;
+  const D = PRETUNED_DATA;
+  const shorts = (pretunedPlatform === 'all') ? (D.platform_shorts || []) : [pretunedPlatform];
+  const runs = D.runs;
+  const traces = shorts.map(ps => {
+    const entries = D.summary.filter(s => s.platform_short === ps);
+    const y = runs.map(r => {
+      const vals = [];
+      entries.forEach(e => {
+        const h = (e.history || []).find(x => x.run_id === r.run_id);
+        if (h && h.geomean > 0) vals.push(h.geomean);
+      });
+      return geomean(vals, null);
+    });
+    return {
+      x: runs.map(r => r.sha + '\n' + formatDate(r.date)), y,
+      name: platName(ps), mode: 'lines+markers',
+      line: { color: platColor(ps), width: 2 }, marker: { size: 6 }, connectgaps: false,
+    };
+  });
+  const allVals = traces.flatMap(t => t.y).filter(v => v != null && v > 0);
+  const rawMin = allVals.length ? Math.min(...allVals) : 0;
+  const rawMax = allVals.length ? Math.max(...allVals) : 2;
+  const pad = (rawMax - rawMin) * 0.15 || 0.1;
+  const minY = Math.max(0, rawMin - pad), maxY = rawMax + pad;
+  const xLabels = runs.map(r => r.sha + '\n' + formatDate(r.date));
+  const shapes = (minY < 1 && maxY > 1) ? [{
+    type: 'line', x0: xLabels[0], x1: xLabels[xLabels.length - 1],
+    y0: 1, y1: 1, line: { color: '#f85149', width: 1, dash: 'dash' }
+  }] : [];
+  const layout = Object.assign({}, plotlyDark, {
+    xaxis: Object.assign({}, plotlyDark.xaxis, { tickangle: -40 }),
+    yaxis: Object.assign({}, plotlyDark.yaxis, { title: 'Geomean Speedup', range: [minY, maxY] }),
+    shapes, legend: { font: { color: '#e6edf3', size: 11 }, bgcolor: 'rgba(0,0,0,0)' },
+    height: TREND_CHART_HEIGHT
+  });
+  Plotly.newPlot(el, traces, layout, { responsive: true, displayModeBar: false });
+}
 // -------- Init --------
 function initDashboard() {
   buildMaps();
@@ -1104,14 +1235,22 @@ function initDashboard() {
   renderSpeedup();
   renderCompare();
 }
+// dashboard-data.json (main benchmark suite) is independent of the Pretuned tab,
+// which loads its own JSON lazily. If the main data is empty/missing, show a
+// placeholder in the main tabs but keep the page (and Pretuned tab) working.
+function hasMainData(d) {
+  return d && Array.isArray(d.summary) && d.summary.length > 0 && d.latest_run && d.stats;
+}
+function showMainDataMissing() {
+  const msg = '<div style="padding:60px;text-align:center"><h2 style="color:var(--text-dim);margin-bottom:12px">No benchmark data yet</h2><p style="color:var(--text-dim)">dashboard-data.json is empty or has not been generated. The Pretuned Kernels tab still works independently.</p></div>';
+  ['tab-overview', 'tab-speedup', 'tab-compare'].forEach(id => { document.getElementById(id).innerHTML = msg; });
+}
 function init() {
-  if (DATA) { initDashboard(); return; }
+  if (hasMainData(DATA)) { initDashboard(); return; }
   fetch('dashboard-data.json')
     .then(r => { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); })
-    .then(json => { DATA = json; initDashboard(); })
-    .catch(() => {
-      document.getElementById('tab-overview').innerHTML = '<div style="padding:60px;text-align:center"><h2 style="color:var(--red);margin-bottom:12px">Data Not Loaded</h2><p style="color:var(--text-dim)">Could not load dashboard-data.json.</p></div>';
-    });
+    .then(json => { DATA = json; if (hasMainData(DATA)) initDashboard(); else showMainDataMissing(); })
+    .catch(() => { showMainDataMissing(); });
 }
 init();
 </script>

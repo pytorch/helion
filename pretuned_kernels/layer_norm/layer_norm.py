@@ -31,6 +31,16 @@ def layer_norm(
     return out
 
 
+def use_cudagraph() -> bool:
+    """Whether main() benchmarks under CUDA graphs (read by pretuned_kernels/run.py)."""
+    return False
+
+
+def pretuned_hardware() -> str:
+    """GPU the checked-in heuristic is tuned for (read by pretuned_kernels/run.py)."""
+    return "b200"
+
+
 def main() -> None:
     triton_tutorial_shapes = [(4096, 512 * i) for i in range(2, 32)]
     realistic_shapes = [

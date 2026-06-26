@@ -43,6 +43,16 @@ def cross_entropy(
     return losses.mean()
 
 
+def use_cudagraph() -> bool:
+    """Whether main() benchmarks under CUDA graphs (read by pretuned_kernels/run.py)."""
+    return False
+
+
+def pretuned_hardware() -> str:
+    """GPU the checked-in heuristic is tuned for (read by pretuned_kernels/run.py)."""
+    return "b200"
+
+
 def main() -> None:
     tritonbench_shapes = [
         (2048, 32000),

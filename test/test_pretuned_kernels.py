@@ -338,11 +338,16 @@ _EXPECTED_PERF: dict[str, dict[str, ExpectedPerf]] = {
         ),
     },
     "scaled_mm": {
+        # Measured under CUDA graphs (scaled_mm's main() uses do_bench_cudagraph),
+        # which is how vLLM invokes the kernel and removes per-call host launch
+        # overhead -- so these numbers reflect GPU work and are portable across
+        # H100 SKUs/torch versions (unlike eager do_bench, where host overhead
+        # dominated the tiny decode GEMMs and varied wildly by machine).
         "sm90": ExpectedPerf(
-            helion_wins=24,
+            helion_wins=23,
             total=24,
-            geomean=1.16,
-            wins_slack=3,
+            geomean=1.15,
+            wins_slack=4,
         ),
     },
 }

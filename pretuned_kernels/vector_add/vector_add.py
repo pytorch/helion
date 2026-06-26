@@ -19,6 +19,16 @@ def vector_add(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     return out
 
 
+def use_cudagraph() -> bool:
+    """Whether main() benchmarks under CUDA graphs (read by pretuned_kernels/run.py)."""
+    return False
+
+
+def pretuned_hardware() -> str:
+    """GPU the checked-in heuristic is tuned for (read by pretuned_kernels/run.py)."""
+    return "b200"
+
+
 def main() -> None:
     shapes = [2**i for i in range(19, 29)]
 

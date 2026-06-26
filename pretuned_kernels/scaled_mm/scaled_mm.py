@@ -105,6 +105,20 @@ def _scaled_mm_torch(
     c.copy_(out)
 
 
+def use_cudagraph() -> bool:
+    """Whether main() benchmarks under CUDA graphs (read by pretuned_kernels/run.py).
+
+    True: main() times these tiny decode GEMMs with do_bench_cudagraph (how vLLM
+    invokes the kernel), which removes per-call host launch overhead.
+    """
+    return True
+
+
+def pretuned_hardware() -> str:
+    """GPU the checked-in heuristic is tuned for (read by pretuned_kernels/run.py)."""
+    return "h100"
+
+
 def main() -> None:
     # (K, N) weight shapes pulled from the vLLM Qwen3 FP8 sweep (TP=1).
     kn_shapes = [
@@ -147,20 +161,22 @@ def main() -> None:
         scale_b = torch.rand((1, 1), dtype=torch.float32, device="cuda") + 0.5
         bias = 0.5 * (torch.rand(N, dtype=out_dtype, device="cuda") - 0.5)
 
-        scaled_mm(c, a, b, scale_a, scale_b, bias)  # warmup
-        ms_helion = tt.do_bench(
+        scaled_mm(c, a, b, scale_a, scale_b, bias)  # warmup / compile
+        # Benchmark under CUDA graphs: this is how vLLM invokes the kernel, and
+        # it removes per-call host launch/dispatch overhead so the timing
+        # reflects GPU work rather than the eager Python dispatch path (which
+        # can dominate these tiny decode GEMMs and varies by torch version).
+        ms_helion = tt.do_bench_cudagraph(
             lambda c=c, a=a, b=b, sa=scale_a, sb=scale_b, bias=bias: scaled_mm(
                 c, a, b, sa, sb, bias
             ),
-            warmup=25,
             rep=100,
             return_mode="median",
         )
-        ms_torch = tt.do_bench(
+        ms_torch = tt.do_bench_cudagraph(
             lambda c=c, a=a, b=b, sa=scale_a, sb=scale_b, bias=bias: _scaled_mm_torch(
                 c, a, b, sa, sb, bias
             ),
-            warmup=25,
             rep=100,
             return_mode="median",
         )
