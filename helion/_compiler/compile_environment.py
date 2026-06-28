@@ -289,6 +289,7 @@ class CompileEnvironment:
         self._foreign_symint_cache: dict[
             tuple[int, sympy.Expr], int | torch.SymInt
         ] = {}
+        self.tunable_symbols: dict[sympy.Symbol, str] = {}
         if settings.autotune_force_persistent or dist.is_initialized():
             for pid_type in (
                 "flat",

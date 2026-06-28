@@ -213,6 +213,25 @@ def _carry_store_plan(
     )
 
 
+def _dma_ref_block_ids_for_name(state: CodegenState, name: str) -> set[int]:
+    """Block IDs already made local by the DMA/Buffered ref named ``name``."""
+    block_ids: set[int] = set()
+    for loops in state.codegen.active_device_loops.values():
+        for loop in loops:
+            mapping = getattr(loop, "_tensor_to_dma_scratch", None)
+            if not mapping:
+                continue
+            for hbm_name, ref_name in mapping.items():
+                if ref_name != name:
+                    continue
+                block_id_mapping = getattr(loop, "_tensor_to_dma_block_ids", None)
+                if block_id_mapping and hbm_name in block_id_mapping:
+                    block_ids.update(block_id_mapping[hbm_name])
+                else:
+                    block_ids.update(loop.block_ids)
+    return block_ids
+
+
 def emit_carry_store(
     state: CodegenState,
     tensor: torch.Tensor,
@@ -274,9 +293,22 @@ def emit_carry_store(
     save_guard = f"(({row_off} + {block_row} >= {a_end}) & ({end} % {S} != 0))"
     col_sub = f"pl.multiple_of(({col_off}) // {block_col} * {S}, {S})"
     carry_slice = f"{carry}[pl.ds({col_sub}, {S}), :]"
-    # Group's last row block: S-aligned, within [0, block_row - S].
-    last_off = f"pl.multiple_of({a_end} - {S} - ({row_off}), {S})"
-    out_last = f"{name}[pl.ds({last_off}, {S}), :]"
+    # Save only the current column tile; the carry scratch stores one
+    # [S, block_col] boundary per column tile.  If the output was routed through
+    # emit_pipeline/fori_loop DMA, ``name`` is a local VMEM ref, so the save slice
+    # must be relative to this iteration's row/column tile.  Otherwise it is the
+    # full output ref and absolute slices are correct.
+    local_block_ids = _dma_ref_block_ids_for_name(state, name)
+    raw_last_off = f"({a_end} - {S})"
+    last_off = f"pl.multiple_of({raw_last_off}, {S})"
+    if row_block_id in local_block_ids:
+        last_off = f"pl.multiple_of(({raw_last_off}) - ({row_off}), {S})"
+    out_col = (
+        ":"
+        if col_block_id in local_block_ids
+        else f"pl.ds(pl.multiple_of({col_off}, {block_col}), {block_col})"
+    )
+    out_last = f"{name}[pl.ds({last_off}, {S}), {out_col}]"
 
     # Pad the [S, block_col] carry to a full [block_row, block_col] tile (carry on
     # top, zeros below): Pallas rejects a partial write to the double-buffered out.

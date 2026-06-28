@@ -21,12 +21,14 @@ from .ast_extension import NodeVisitor
 from .ast_extension import create
 from .ast_extension import expr_from_string
 from .ast_extension import statement_from_string
+from .ast_read_writes import ReadWrites
 from .ast_read_writes import dead_assignment_elimination
 from .ast_read_writes import dead_expression_elimination
 from .ast_read_writes import definitely_does_not_have_side_effects
 from .compile_environment import CompileEnvironment
 from .device_function import ConstExprArg
 from .device_function import DeviceFunction
+from .device_function import SymbolArgument
 from .helper_function import CodegenInterface
 from .inductor_lowering import CodegenState
 from .inductor_lowering import codegen_call_with_graph
@@ -137,6 +139,24 @@ class GenerateAST(NodeVisitor, CodegenInterface):
             self,
         )
         CodegenInterface.__init__(self, self.device_function)
+        self._pallas_barrier_phase_arg: str | None = None
+        self._pallas_barrier_phase_host_var: str | None = None
+        if (
+            CompileEnvironment.current().backend.name == "pallas"
+            and len(func.device_ir.phases) > 1
+        ):
+            self._pallas_barrier_phase_arg = self.device_function.new_var(
+                "helion_phase"
+            )
+            self._pallas_barrier_phase_host_var = self.device_function.new_var(
+                "helion_phase_host"
+            )
+            self.device_function.arguments.append(
+                SymbolArgument(
+                    self._pallas_barrier_phase_arg,
+                    self._pallas_barrier_phase_host_var,
+                )
+            )
 
         # Decide once which sibling for-loops need a tl.debug_barrier()
         # to make global writes visible to subsequent reads.
@@ -159,6 +179,53 @@ class GenerateAST(NodeVisitor, CodegenInterface):
     def _phase_checker(self, root_id: int) -> LoopDependencyChecker:
         phase_idx = self.host_function.device_ir.phase_for_root(root_id)
         return self.host_function.device_ir.phases[phase_idx].loop_dependency_checker
+
+    def _wrap_pallas_barrier_phase_body(
+        self,
+        root_id: int,
+        body: list[ast.AST],
+    ) -> None:
+        if self._pallas_barrier_phase_arg is None:
+            return
+        phase = self.host_function.device_ir.phase_for_root(root_id)
+        fn_name = self.device_function.new_var(f"helion_phase_{phase}_root_{root_id}")
+        phase_body = list(body) or [create(ast.Pass)]
+        condition = f"({self._pallas_barrier_phase_arg} == {phase})"
+        pid = self.device_function.pid
+        if isinstance(pid, ForEachProgramID) and root_id < len(pid.cases):
+            cdivs = [case.total_pids_expr(is_device=True) for case in pid.cases]
+            start = "0" if root_id == 0 else " + ".join(cdivs[:root_id])
+            end = " + ".join(cdivs[: root_id + 1])
+            condition = (
+                f"({condition}) & ({pid.shared_pid_var} >= ({start})) "
+                f"& ({pid.shared_pid_var} < ({end}))"
+            )
+            if pid.shared_pid_var in ReadWrites.from_list(phase_body).writes:
+                phase_body = [
+                    create(ast.Nonlocal, names=[pid.shared_pid_var]),
+                    *phase_body,
+                ]
+        body[:] = [
+            create(
+                ast.FunctionDef,
+                name=fn_name,
+                args=create(
+                    ast.arguments,
+                    posonlyargs=[],
+                    args=[],
+                    vararg=None,
+                    kwonlyargs=[],
+                    kw_defaults=[],
+                    kwarg=None,
+                    defaults=[],
+                ),
+                body=phase_body,
+                decorator_list=[expr_from_string(f"pl.when({condition})")],
+                type_comment=None,
+                returns=None,
+                type_params=[],
+            )
+        ]
 
     def _compute_inter_loop_barriers(self) -> None:
         """Walk every codegen graph; for each pair of consecutive sibling
@@ -923,6 +990,7 @@ class GenerateAST(NodeVisitor, CodegenInterface):
             else:
                 assert len(self.host_function.device_ir.root_ids) > 1
                 # Multiple top level for loops
+                pallas_phase_launch = self._pallas_barrier_phase_arg is not None
 
                 if node._root_id == 0:
                     self.device_function.set_pid(
@@ -934,7 +1002,10 @@ class GenerateAST(NodeVisitor, CodegenInterface):
                         # pyrefly: ignore [missing-attribute]
                         self.device_function.pid.codegen_pid_init()
                     )
-                if node._root_id < len(self.host_function.device_ir.root_ids) - 1:
+                if (
+                    pallas_phase_launch
+                    or node._root_id < len(self.host_function.device_ir.root_ids) - 1
+                ):
                     body = []
                 else:
                     # This is the last top level for, dont emit more if statements
@@ -1027,9 +1098,13 @@ class GenerateAST(NodeVisitor, CodegenInterface):
                         self.host_function.device_ir.phase_for_root(node._root_id)
                     )
 
+                self._wrap_pallas_barrier_phase_body(node._root_id, body)
+
                 # If we are in a multi top level loop, for all loops except for the last one
                 # emit ifthenelse blocks
-                if node._root_id < len(self.host_function.device_ir.root_ids) - 1:
+                if self._pallas_barrier_phase_arg is not None:
+                    self.device_function.body.extend(body)
+                elif node._root_id < len(self.host_function.device_ir.root_ids) - 1:
                     block = (
                         self.device_function.body
                         if self.next_else_block is None
@@ -1300,7 +1375,9 @@ def generate_ast(
 ) -> ast.Module:
     with func:
         if len(func.device_ir.phases) > 1:
-            if not str(config.pid_type).startswith("persistent"):
+            if CompileEnvironment.current().backend.name != "pallas" and not str(
+                config.pid_type
+            ).startswith("persistent"):
                 raise exc.BarrierRequiresPersistent(config.pid_type)
         codegen = GenerateAST(
             func,

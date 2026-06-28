@@ -1884,7 +1884,20 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
     # BlockSpec; the rest stay on the outer pallas_call BlockSpec
     # (escape clause `bs == as`) and are closure-read from the body.
     all_tensor_info, _vmem_shapes, pipelined_tensor_ids = _classify_pipelined_tensors(
-        loaded_tensors, stored_tensors, block_ids, slice_size_exprs, env, state
+        loaded_tensors,
+        stored_tensors,
+        block_ids,
+        begin_exprs,
+        iter_step_exprs,
+        slice_size_exprs,
+        env,
+        state,
+        allow_row_slab_store=True,
+    )
+    # RMW pipeline args use HBM refs and skip the wrapper's initial in-place
+    # copy, so their output ref may not contain the old tensor contents.
+    pipelined_tensor_ids.difference_update(
+        loaded_tensors.keys() & stored_tensors.keys()
     )
 
     # Build in_specs and out_specs
@@ -2200,10 +2213,16 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
         block_size = env.block_sizes[block_id]
         # when the block_size.size is None, we cannot form a SymPy expr for the numel
         sympy_end_expr = block_size.numel if block_size.size is not None else None
+        offset_alignment: int | None = None
+        if block_id in aligned_dim and _expr_proven_multiple(
+            iter_step_exprs[i], aligned_dim[block_id], state, block_id=block_id
+        ):
+            offset_alignment = aligned_dim[block_id]
         block_id_to_info[block_id] = LoopDimInfo(
             begin_expr=_static_loop_begin_expr(begin_exprs[i]),
             end_var_name=None,
             end_expr=sympy_end_expr,
+            offset_alignment=offset_alignment,
         )
 
     strategy = _find_strategy(state, block_ids)
@@ -2362,7 +2381,7 @@ def _is_supported_contiguous_row_slab_dma(
     env: CompileEnvironment,
     state: CodegenState,
 ) -> bool:
-    """Whether an otherwise-unaligned load is a contiguous row-slab DMA.
+    """Whether an otherwise-unaligned access is a contiguous row-slab transfer.
 
     ``_check_dma_alignment`` is conservative for shapes like
     ``[TOKEN_BLOCK, H=4, D=128]`` because the second-to-last logical dim is not a
@@ -2370,9 +2389,11 @@ def _is_supported_contiguous_row_slab_dma(
     for row-slab layouts: rows are page-addressed and the full suffix is
     contiguous with an aligned lane dimension.
 
-    Keep this exception narrow: load-only caller, one dynamic-begin/end
-    current-loop row tile, only scalar-selected prefix dims, full-slice suffix,
-    no gathers/scatters/stores.
+    Keep this exception narrow: one dynamic-begin/end current-loop row tile,
+    only scalar-selected prefix dims, full-slice suffix, no gathers/scatters.
+    ``fori_loop``/manual DMA uses it for loads only; emit_pipeline also opts
+    output row-slab stores into the Buffered BlockSpec path so its out_spec can
+    clamp the live extent.
     """
     if not fake.is_floating_point():
         return False
@@ -2419,19 +2440,117 @@ def _is_supported_contiguous_row_slab_dma(
     return isinstance(lane_dim, int) and lane_dim % 128 == 0
 
 
+def _dma_dim_required_alignment(vmem_shape: tuple[int, ...], dim_idx: int) -> int:
+    if len(vmem_shape) >= 2:
+        if dim_idx == len(vmem_shape) - 1:
+            return 128
+        if dim_idx == len(vmem_shape) - 2:
+            return 8
+    elif len(vmem_shape) == 1 and dim_idx == 0:
+        return 128
+    return 1
+
+
+def _expr_proven_multiple(
+    expr: str,
+    required: int,
+    state: CodegenState,
+    *,
+    block_id: int | None = None,
+) -> bool:
+    if required <= 1 or expr == "0":
+        return True
+    try:
+        value = sympy.sympify(expr)
+    except (sympy.SympifyError, TypeError):
+        value = None
+    if isinstance(value, sympy.Integer):
+        return int(value) % required == 0
+    if isinstance(value, sympy.Expr):
+        try:
+            remainder = sympy.simplify(sympy.Mod(value, required))
+        except TypeError:
+            remainder = None
+        if remainder == 0:
+            return True
+    if block_id is not None and expr == state.device_function.block_size_var(block_id):
+        block_value = state.device_function.resolved_block_size(block_id)
+        return isinstance(block_value, int) and block_value % required == 0
+    alignment = _pipeline_begin_alignment(expr, state)
+    return alignment is not None and alignment % required == 0
+
+
+def _dma_offsets_are_aligned(
+    fake: torch.Tensor,
+    sub_meta: list[object],
+    block_ids: list[int],
+    vmem_shape: tuple[int, ...],
+    begin_exprs: list[str],
+    iter_step_exprs: list[str],
+    env: CompileEnvironment,
+    state: CodegenState,
+) -> bool:
+    dim_to_bid = _get_dim_block_ids(sub_meta, env)
+    for dim_idx in range(fake.ndim):
+        required = _dma_dim_required_alignment(vmem_shape, dim_idx)
+        if required <= 1:
+            continue
+        bid = dim_to_bid.get(dim_idx)
+        if bid is not None and bid in block_ids:
+            bid_idx = block_ids.index(bid)
+            if not _expr_proven_multiple(
+                begin_exprs[bid_idx], required, state, block_id=bid
+            ):
+                return False
+            if not _expr_proven_multiple(
+                iter_step_exprs[bid_idx], required, state, block_id=bid
+            ):
+                return False
+            continue
+        if bid is not None:
+            grid_loops = state.codegen.active_device_loops.get(bid)
+            if grid_loops and not _expr_proven_multiple(
+                state.codegen.offset_var(bid), required, state, block_id=bid
+            ):
+                return False
+            continue
+
+        idx_meta = sub_meta[dim_idx] if dim_idx < len(sub_meta) else slice(None)
+        from helion._utils import is_scalar_index
+
+        if is_scalar_index(idx_meta):
+            offset_expr = state.device_function.literal_expr(idx_meta)
+            if not _expr_proven_multiple(offset_expr, required, state):
+                return False
+    return True
+
+
 def _can_stream_inner_tile(
     fake: torch.Tensor,
     sub_meta: list[object],
     direction: str,
     block_ids: list[int],
     vmem_shape: tuple[int, ...],
+    begin_exprs: list[str],
+    iter_step_exprs: list[str],
     env: CompileEnvironment,
     state: CodegenState,
+    *,
+    allow_row_slab_store: bool = False,
 ) -> bool:
     """Return whether a loop-local tensor should use the inner streaming path."""
     if _check_dma_alignment(vmem_shape):
-        return True
-    if direction != "load":
+        return _dma_offsets_are_aligned(
+            fake,
+            sub_meta,
+            block_ids,
+            vmem_shape,
+            begin_exprs,
+            iter_step_exprs,
+            env,
+            state,
+        )
+    if direction != "load" and not (allow_row_slab_store and direction == "store"):
         return False
     return _is_supported_contiguous_row_slab_dma(
         fake, sub_meta, block_ids, vmem_shape, env, state
@@ -2485,9 +2604,13 @@ def _classify_pipelined_tensors(
     loaded_tensors: dict[int, tuple[torch.Tensor, torch.fx.Node, list[object]]],
     stored_tensors: dict[int, tuple[torch.Tensor, torch.fx.Node, list[object]]],
     block_ids: list[int],
+    begin_exprs: list[str],
+    iter_step_exprs: list[str],
     slice_size_exprs: list[str],
     env: CompileEnvironment,
     state: CodegenState,
+    *,
+    allow_row_slab_store: bool = False,
 ) -> tuple[
     list[tuple[torch.Tensor, list[object], str]], list[tuple[int, ...]], set[int]
 ]:
@@ -2497,8 +2620,9 @@ def _classify_pipelined_tensors(
     in fori_loop, or ``pl.Buffered`` BlockSpec in emit_pipeline) when:
 
     * Its inner-block ``vmem_shape`` passes the standard TPU DMA alignment check,
-      or it is a load-only contiguous row-slab layout covered by
-      ``_is_supported_contiguous_row_slab_dma``.
+      or it is a contiguous row-slab layout covered by
+      ``_is_supported_contiguous_row_slab_dma`` (loads by default; stores only
+      when the caller opts in).
     * It is not also accessed at outer scope (i.e. in a root graph,
       between/before/after inner loops).  Pipelining replaces the tensor's
       outer BlockSpec with ``pltpu.HBM`` so the inner loop's BlockSpec can
@@ -2551,7 +2675,16 @@ def _classify_pipelined_tensors(
         all_tensor_info, vmem_shapes, strict=True
     ):
         if not _can_stream_inner_tile(
-            fake, sub_meta, direction, block_ids, vmem_shape, env, state
+            fake,
+            sub_meta,
+            direction,
+            block_ids,
+            vmem_shape,
+            begin_exprs,
+            iter_step_exprs,
+            env,
+            state,
+            allow_row_slab_store=allow_row_slab_store,
         ):
             continue
         if id(fake) in outer_access_tensor_ids:
@@ -2626,7 +2759,14 @@ def _codegen_fori_loop(state: CodegenState) -> object:
     # non-pipelined tensor is present (which would load full outer-block
     # tiles into VMEM and may OOM at large shapes).
     all_tensor_info, vmem_shapes, pipelined_tensor_ids = _classify_pipelined_tensors(
-        loaded_tensors, stored_tensors, block_ids, slice_size_exprs, env, state
+        loaded_tensors,
+        stored_tensors,
+        block_ids,
+        begin_exprs,
+        iter_step_exprs,
+        slice_size_exprs,
+        env,
+        state,
     )
 
     # Compact worklist: the compact-tile aligned_load and exact_store tensors use
