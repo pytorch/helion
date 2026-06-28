@@ -326,6 +326,12 @@ class ForEachProgramID(ProgramIDs):
     pid_info: list[PIDInfo] = dataclasses.field(default_factory=list, init=False)
     barrier_after_root: set[int] = dataclasses.field(default_factory=set)
 
+    def _uses_pallas_host_phases(self) -> bool:
+        return (
+            CompileEnvironment.current().backend.name == "pallas"
+            and len(set(self.case_phases)) > 1
+        )
+
     def codegen_pid_init(self) -> list[ast.stmt]:
         # Check if persistent kernels are enabled in config - if so, skip regular initialization
         # as it will be handled by the persistent loop wrapper
@@ -333,7 +339,11 @@ class ForEachProgramID(ProgramIDs):
 
         current_device_fn = DeviceFunction.current()
         pid_type = current_device_fn.config.get("pid_type", "flat")
-        if isinstance(pid_type, str) and pid_type.startswith("persistent"):
+        if (
+            isinstance(pid_type, str)
+            and pid_type.startswith("persistent")
+            and not self._uses_pallas_host_phases()
+        ):
             return []
         return [statement_from_string(f"{self.shared_pid_var} = {typed_program_id(0)}")]
 
@@ -359,6 +369,8 @@ class ForEachProgramID(ProgramIDs):
         total_expr = self.total_pids_expr(is_device=True)
         # If there is only one phase, fall back to existing behavior.
         has_phases = len(set(self.case_phases)) > 1
+        if has_phases and CompileEnvironment.current().backend.name == "pallas":
+            return None
 
         def _base_strategy(pid: ProgramIDs) -> ProgramIDs:
             from .tile_strategy import L2GroupingProgramIDs
@@ -406,7 +418,7 @@ class ForEachProgramID(ProgramIDs):
 
     def codegen_grid(self) -> ast.AST:
         # Check if any of the pids is a persistent strategy
-        if self.cases[0]._is_persistent():
+        if self.cases[0]._is_persistent() and not self._uses_pallas_host_phases():
             # Use SM count grid for persistent kernels
             return self.cases[0].codegen_grid()
 

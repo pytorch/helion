@@ -766,6 +766,10 @@ class ReductionLowering(InductorLowering):
         env = CompileEnvironment.current()
         if isinstance(reduction_size, sympy.Symbol):
             block_index: int | None = env.get_block_id(reduction_size)
+            if block_index is None and reduction_size in env.tunable_symbols:
+                block_index = env.allocate_reduction_dimension(
+                    to_symint(reduction_size)
+                ).block_id
         elif isinstance(reduction_size, (int, sympy.Integer)):
             # Allocate or find a reduction dimension matching this size.
             # Convert to a SymInt when needed.

@@ -28,6 +28,7 @@ from helion._testing import onlyBackends
 from helion._testing import skipIfA10G
 from helion._testing import skipIfCudaCapabilityLessThan
 from helion._testing import skipIfCudaSharedMemoryLessThan
+from helion._testing import skipIfCute
 from helion._testing import skipIfFn
 from helion._testing import skipIfNotCUDA
 from helion._testing import skipIfPallas
@@ -186,7 +187,8 @@ class TestExamples(RefEagerTestBase, TestCase):
             block_sizes=[64, 64, 32],
         )
 
-    @xfailIfPallas("missing barrier implementation")
+    @xfailIfPallasInterpret("barrier phase launches require TPU Pallas runtime")
+    @skipIfCute("split-K barrier config is Triton/Pallas-specific")
     @skipIfTileIR("PassManager::run failed")
     @skipIfXPU("Split-K barrier not supported on XPU backend")
     def test_split_k_barrier(self):
@@ -205,7 +207,8 @@ class TestExamples(RefEagerTestBase, TestCase):
             split_k=64,
         )
 
-    @xfailIfPallas("missing barrier implementation")
+    @xfailIfPallasInterpret("barrier phase launches require TPU Pallas runtime")
+    @skipIfCute("split-K barrier config is Triton/Pallas-specific")
     @skipIfTileIR("PassManager::run failed")
     @skipIfRefEager("Test requires compiled kernel with specific config")
     def test_split_k_barrier_accuracy(self):
