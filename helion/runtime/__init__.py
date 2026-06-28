@@ -126,6 +126,13 @@ def get_num_sm(device: torch.device, *, reserved_sms: int = 0) -> int:
         for any reserved SMs. Always at least 1.
     """
     available_sms: int
+    if device.type == "cpu":
+        if not _module_is_pallas_interpret():
+            raise AssertionError("TODO: implement for other devices")
+        return 1
+    if device.type == "tpu":
+        return 1
+
     assert device.type in [
         "cuda",
         "xpu",
