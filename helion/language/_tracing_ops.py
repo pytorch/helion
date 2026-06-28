@@ -643,6 +643,12 @@ def _pallas_loop_begin_and_step_exprs(
     return begin_exprs, iter_step_exprs, slice_size_exprs
 
 
+def _static_loop_begin_expr(begin_expr: str) -> sympy.Expr | None:
+    if begin_expr.lstrip("-").isdigit():
+        return sympy.Integer(int(begin_expr))
+    return None
+
+
 def _pipeline_begin_alignment(
     begin_expr: str,
     state: CodegenState,
@@ -2190,11 +2196,12 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
 
     # Build block_id_to_info for the pipeline state
     block_id_to_info: dict[int, LoopDimInfo] = {}
-    for block_id in block_ids:
+    for i, block_id in enumerate(block_ids):
         block_size = env.block_sizes[block_id]
         # when the block_size.size is None, we cannot form a SymPy expr for the numel
         sympy_end_expr = block_size.numel if block_size.size is not None else None
         block_id_to_info[block_id] = LoopDimInfo(
+            begin_expr=_static_loop_begin_expr(begin_exprs[i]),
             end_var_name=None,
             end_expr=sympy_end_expr,
         )
@@ -2694,11 +2701,12 @@ def _codegen_fori_loop(state: CodegenState) -> object:
 
     # Build block_id_to_info
     block_id_to_info: dict[int, LoopDimInfo] = {}
-    for block_id in block_ids:
+    for i, block_id in enumerate(block_ids):
         block_size = env.block_sizes[block_id]
         # when the block_size.size is None, we cannot form a SymPy expr for the numel
         sympy_end_expr = block_size.numel if block_size.size is not None else None
         block_id_to_info[block_id] = LoopDimInfo(
+            begin_expr=_static_loop_begin_expr(begin_exprs[i]),
             end_var_name=None,
             end_expr=sympy_end_expr,
         )
@@ -2997,8 +3005,12 @@ def _(state: CodegenState) -> list[object]:
 
     JAX's tracing model does not support Python ``if`` on traced values.
     We use ``lax.cond(pred, true_fn, false_fn)`` which requires a scalar
-    predicate. Tensor-derived predicates (from tensor loads) are unsupported
-    because TPU block shapes make them vectors at runtime.
+    predicate. Tensor-derived predicates are accepted only when Helion proves
+    they have one element; already-scalar predicates are passed through, and
+    one-element arrays are indexed to scalar form. Bool arrays are widened before
+    indexing because Mosaic cannot squeeze bool vectors directly. Multi-element
+    tensor predicates are rejected because ``lax.cond`` cannot branch
+    elementwise.
     """
     from .._compiler.ast_extension import statement_from_string
     from .._compiler.device_ir import ElseGraphInfo
@@ -3021,13 +3033,28 @@ def _(state: CodegenState) -> list[object]:
     assert isinstance(state.codegen, GenerateAST)
 
     if graph_info.predicate_is_tensor:
-        raise BackendUnsupported(
-            "pallas",
-            "if-statements with tensor-derived predicates. "
-            "lax.cond requires a scalar predicate, but tensor loads produce "
-            "vectors on TPU due to hardware tiling constraints. "
-            "Use a scalar kernel argument for the condition instead.",
-        )
+        predicate_tensor_numel = graph_info.predicate_tensor_numel
+        assert predicate_tensor_numel is not None
+        if not CompileEnvironment.current().known_equal(predicate_tensor_numel, 1):
+            raise BackendUnsupported(
+                "pallas",
+                "if-statements with multi-element tensor-derived predicates "
+                f"(numel={predicate_tensor_numel}). "
+                "lax.cond requires a scalar predicate.",
+            )
+        predicate_value = state.proxy_arg(0)
+        assert isinstance(predicate_value, torch.Tensor)
+        if predicate_value.ndim > 0:
+            index = ", ".join("0" for _ in range(predicate_value.ndim))
+            if predicate_value.dtype is torch.bool:
+                test = expr_from_string(
+                    f"({{test}}).astype(jnp.int32)[{index}] != 0",
+                    test=test,
+                )
+            else:
+                test = expr_from_string(f"{{test}}[{index}]", test=test)
+        if predicate_value.dtype is not torch.bool:
+            test = expr_from_string("({test}) != 0", test=test)
 
     if_body_stmts: list[ast.AST] = []
     with state.codegen.set_statements(if_body_stmts):

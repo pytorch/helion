@@ -9,6 +9,8 @@ import torch
 
 from helion._compiler.ast_extension import expr_from_string
 
+_FULL_LOAD_SELECT_MAX_BYTES = 256 << 10
+
 if TYPE_CHECKING:
     from collections.abc import Iterator
 
@@ -35,9 +37,20 @@ def load_expr(
     patterns = state.fx_node.meta.get("indexing_patterns") or ()
     for pattern in patterns:
         if isinstance(pattern, IndirectGatherPattern):
-            return emit_gather(state, pattern.plan, name)
+            result = emit_gather(state, pattern.plan, name)
+            if (mask_expr := _indirect_gather_mask_expr(state, tensor)) is not None:
+                dtype_str = _pallas_dtype_str(tensor)
+                result = expr_from_string(
+                    f"jnp.where(({mask_expr}) != 0, {{result}}, "
+                    f"jnp.array(0, dtype={dtype_str}))",
+                    result=result,
+                )
+            return result
 
     parts, none_dims = index_parts(state, subscript, tensor)
+    parts, post_load_takes = _widen_unaligned_tile_load_indices(
+        state, subscript, tensor, parts
+    )
     parts, post_load_selects, post_load_rank = _widen_small_aligned_scalar_load_indices(
         state, subscript, tensor, parts
     )
@@ -45,9 +58,13 @@ def load_expr(
     mask_expr = _load_mask_expr(state, subscript, tensor)
     result = expr_from_string(f"{name}[{idx_str}]")
     result = _pad_clamped_load_expr(state, subscript, tensor, parts, result)
-    result = _select_widened_scalar_load_indices(
-        result, post_load_selects, post_load_rank
+    promoted_scalar_dtype = _widened_scalar_load_promotion_dtype(
+        state, tensor, post_load_selects, post_load_rank
     )
+    result = _select_widened_scalar_load_indices(
+        result, post_load_selects, post_load_rank, promoted_scalar_dtype
+    )
+    result = _select_unaligned_tile_load_indices(result, post_load_takes)
     if mask_expr is not None:
         result = expr_from_string(f"{{result}} * ({mask_expr})", result=result)
     for dim in none_dims:
@@ -55,6 +72,248 @@ def load_expr(
             f"jnp.expand_dims({{result}}, axis={dim})", result=result
         )
     return result
+
+
+def _widen_unaligned_tile_load_indices(
+    state: CodegenState,
+    subscript: list[object],
+    tensor: torch.Tensor,
+    index_parts: list[str],
+) -> tuple[list[str], list[tuple[int, str, str, int]]]:
+    """Load small leading-axis unaligned tiles as full refs, then select lanes."""
+    if _tensor_routed_to_dma_scratch(state, tensor):
+        return index_parts, []
+
+    from helion._compiler.device_function import PallasMemorySpace
+
+    if (
+        state.device_function.pallas_memory_space.get(id(tensor))
+        == PallasMemorySpace.SMEM
+    ):
+        return index_parts, []
+
+    from helion._compiler.pallas.plan_tiling import TileBeginWithOffsetPattern
+    from helion._compiler.pallas.plan_tiling import TileIndexWithOffsetPattern
+    from helion._compiler.pallas.plan_tiling import TilePattern
+
+    adjusted = list(index_parts)
+    takes: list[tuple[int, str]] = []
+    value_dim = 0
+    tensor_dim = 0
+    index_part_idx = 0
+
+    for idx, pattern in zip(
+        subscript, _get_indexing_patterns(state, tensor), strict=True
+    ):
+        if idx is None:
+            continue
+
+        index_part = adjusted[index_part_idx]
+        should_widen_unaligned = (
+            not takes
+            and isinstance(
+                pattern,
+                (TilePattern, TileIndexWithOffsetPattern, TileBeginWithOffsetPattern),
+            )
+            and _should_select_unaligned_tile_axis_from_full_load(
+                state, tensor, tensor_dim, pattern, index_part
+            )
+        )
+        if should_widen_unaligned:
+            adjusted[index_part_idx] = ":"
+            takes.append((value_dim, _tile_lane_index_expr(state, pattern)))
+
+        if _index_part_produces_value_dim(adjusted[index_part_idx]):
+            value_dim += 1
+        tensor_dim += 1
+        index_part_idx += 1
+
+    dtype_str = _pallas_dtype_str(tensor)
+    return adjusted, [(axis, index, dtype_str, value_dim) for axis, index in takes]
+
+
+def _should_select_unaligned_tile_axis_from_full_load(
+    state: CodegenState,
+    tensor: torch.Tensor,
+    tensor_dim: int,
+    pattern: object,
+    index_part: str,
+) -> bool:
+    """True when a small full-ref load can avoid an unaligned ``pl.ds``.
+
+    Mosaic only needs extra proof for the last two VMEM dimensions.  When a
+    dynamic ``pl.ds`` offset on such a dimension is not provably aligned, a
+    small full-tensor load plus a register select is safer than asserting an
+    alignment Helion cannot prove.
+    """
+
+    if not index_part.startswith("pl.ds("):
+        return False
+
+    from helion._compiler.backend import PallasBackend
+    from helion._compiler.compile_environment import CompileEnvironment
+    from helion._compiler.pallas.plan_tiling import TileBeginWithOffsetPattern
+    from helion._compiler.pallas.plan_tiling import TileIndexWithOffsetPattern
+    from helion._compiler.pallas.plan_tiling import TilePattern
+
+    assert isinstance(
+        pattern, (TilePattern, TileIndexWithOffsetPattern, TileBeginWithOffsetPattern)
+    )
+    dim_size = tensor.shape[tensor_dim]
+    if not isinstance(dim_size, int):
+        return False
+
+    env = CompileEnvironment.current()
+    block_size = env.block_sizes[pattern.block_id].from_config(state.config)
+    if not isinstance(block_size, int) or block_size <= 0:
+        return False
+
+    backend = env.backend
+    assert isinstance(backend, PallasBackend)
+    dim_from_end = tensor.ndim - tensor_dim - 1
+    bitwidth = tensor.dtype.itemsize * 8
+    required = backend._get_pallas_required_alignment(
+        dim_from_end, tensor.ndim, bitwidth
+    )
+    if required <= 1:
+        return False
+    alignment = _loop_offset_alignment(pattern.block_id, state)
+    if (
+        isinstance(pattern, (TileIndexWithOffsetPattern, TileBeginWithOffsetPattern))
+        and pattern.offset != 0
+    ):
+        alignment = None
+    if alignment is not None and alignment % required == 0:
+        return False
+
+    expanded_elements = _full_load_selected_elements(state, dim_size, block_size)
+    return (
+        expanded_elements is not None
+        and expanded_elements * tensor.dtype.itemsize <= _FULL_LOAD_SELECT_MAX_BYTES
+    )
+
+
+def _full_load_selected_elements(
+    state: CodegenState, dim_size: int, block_size: int
+) -> int | None:
+    from helion._compiler.compile_environment import CompileEnvironment
+
+    assert state.fx_node is not None
+    output_val = state.fx_node.meta.get("val")
+    if not isinstance(output_val, torch.Tensor):
+        return None
+
+    env = CompileEnvironment.current()
+    elements = 1
+    for size in output_val.size():
+        if not isinstance(size, int):
+            block_id = env.resolve_block_id(size)
+            if block_id is None:
+                return None
+            resolved = env.block_sizes[block_id].from_config(state.config)
+            if not isinstance(resolved, int):
+                return None
+            size = resolved
+        elements *= size
+    if elements % block_size != 0:
+        return None
+    return elements // block_size * dim_size
+
+
+def _tile_lane_index_expr(state: CodegenState, pattern: object) -> str:
+    from helion._compiler.pallas.plan_tiling import TileBeginWithOffsetPattern
+    from helion._compiler.pallas.plan_tiling import TileIndexWithOffsetPattern
+    from helion._compiler.pallas.plan_tiling import TilePattern
+
+    assert isinstance(
+        pattern, (TilePattern, TileIndexWithOffsetPattern, TileBeginWithOffsetPattern)
+    )
+    index = state.codegen.index_var(pattern.block_id)
+    if (
+        isinstance(pattern, (TileIndexWithOffsetPattern, TileBeginWithOffsetPattern))
+        and pattern.offset != 0
+    ):
+        offset = state.device_function.literal_expr(pattern.offset)
+        return f"{index} + {offset}"
+    return index
+
+
+def _select_unaligned_tile_load_indices(
+    value: ast.AST, takes: list[tuple[int, str, str, int]]
+) -> ast.AST:
+    result = value
+    for axis, index_expr, dtype_str, rank in takes:
+        if axis == 0:
+            mask_expr = (
+                f"(({index_expr})[..., None] == "
+                f"jnp.arange({{result}}.shape[0], dtype=({index_expr}).dtype))"
+                f".astype({dtype_str})"
+            )
+            for _ in range(rank - 1):
+                mask_expr = f"jnp.expand_dims({mask_expr}, axis=-1)"
+            result = expr_from_string(
+                f"jnp.sum(jnp.where(({mask_expr}) != 0, {{result}}, "
+                f"jnp.array(0, dtype={dtype_str})), axis=jnp.ndim({index_expr}))"
+                f".astype({dtype_str})",
+                result=result,
+            )
+            continue
+        mask_expr = (
+            f"(({index_expr})[:, None] == "
+            f"jnp.arange({{result}}.shape[{axis}], dtype=({index_expr}).dtype))"
+            f".astype({dtype_str})"
+        )
+        for _ in range(axis):
+            mask_expr = f"jnp.expand_dims({mask_expr}, axis=0)"
+        for _ in range(rank - axis - 1):
+            mask_expr = f"jnp.expand_dims({mask_expr}, axis=-1)"
+        result = expr_from_string(
+            f"jnp.sum(jnp.where(({mask_expr}) != 0, "
+            f"jnp.expand_dims({{result}}, axis={axis}), "
+            f"jnp.array(0, dtype={dtype_str})), axis={axis + 1})"
+            f".astype({dtype_str})",
+            result=result,
+        )
+    return result
+
+
+def _pallas_dtype_str(tensor: torch.Tensor) -> str:
+    from helion._compiler.compile_environment import CompileEnvironment
+
+    return CompileEnvironment.current().backend.dtype_str(tensor.dtype)
+
+
+def _indirect_gather_mask_expr(state: CodegenState, tensor: torch.Tensor) -> str | None:
+    """Mask tensor-indexed gather outputs in their result layout."""
+    from helion._compiler.compile_environment import CompileEnvironment
+
+    assert state.fx_node is not None
+    output_val = state.fx_node.meta.get("val")
+    if not isinstance(output_val, torch.Tensor):
+        return None
+
+    env = CompileEnvironment.current()
+    output_sizes = [*output_val.size()]
+    dtype_str = _pallas_dtype_str(tensor)
+    mask_exprs: list[str] = []
+    for dim, size in enumerate(output_sizes):
+        block_id = env.resolve_block_id(size)
+        if block_id is None or (mask_var := state.codegen.mask_var(block_id)) is None:
+            continue
+        if env.is_jagged_tile(block_id):
+            mask_shape = env.jagged_tile_mask_shapes[block_id]
+            expand = state.tile_strategy.jagged_tile_expand_str(
+                mask_shape, output_sizes
+            )
+        else:
+            expand = state.tile_strategy.expand_str(output_sizes, dim)
+        expr = f"({mask_var}.astype({dtype_str}){expand})"
+        if expr not in mask_exprs:
+            mask_exprs.append(expr)
+
+    if not mask_exprs:
+        return None
+    return "*".join(mask_exprs)
 
 
 def _index_part_produces_value_dim(index_part: str) -> bool:
@@ -107,7 +366,7 @@ def _widen_small_aligned_scalar_load_indices(
         if (
             is_scalar
             and isinstance(dim_size, int)
-            and dim_size > 1
+            and dim_size > 0
             and isinstance(pattern, (ArbitraryIndexPattern, TileBeginWithOffsetPattern))
         ):
             dim_from_end = tensor.ndim - tensor_dim - 1
@@ -150,9 +409,15 @@ def _select_widened_scalar_load_indices(
     value: ast.AST,
     widened_selects: list[tuple[int, str, int]],
     rank: int,
+    scalar_result_dtype: str | None = None,
 ) -> ast.AST:
     result = value
     for axis, index_expr, dim_size in sorted(widened_selects, reverse=True):
+        if rank == 1 and scalar_result_dtype is not None:
+            result = expr_from_string(
+                f"{{result}}.astype({scalar_result_dtype})",
+                result=result,
+            )
         lane_index = [":"] * rank
         lane_index[axis] = "0"
         selected = expr_from_string(
@@ -173,6 +438,42 @@ def _select_widened_scalar_load_indices(
         result = selected
         rank -= 1
     return result
+
+
+def _widened_scalar_load_promotion_dtype(
+    state: CodegenState,
+    tensor: torch.Tensor,
+    widened_selects: list[tuple[int, str, int]],
+    rank: int,
+) -> str | None:
+    """Return fp32 when a widened sub-32-bit scalar load feeds only fp32 casts."""
+    if tensor.dtype.itemsize >= 4 or rank != len(widened_selects):
+        return None
+    if not _load_feeds_only_immediate_fp32_converts(state):
+        return None
+    from helion._compiler.compile_environment import CompileEnvironment
+
+    return CompileEnvironment.current().backend.dtype_str(torch.float32)
+
+
+def _load_feeds_only_immediate_fp32_converts(state: CodegenState) -> bool:
+    node = state.fx_node
+    if node is None:
+        return False
+    users = list(node.users)
+    if not users:
+        return False
+    convert = torch.ops.prims.convert_element_type.default
+    for user in users:
+        if (
+            user.op != "call_function"
+            or user.target is not convert
+            or len(user.args) < 2
+            or user.args[0] is not node
+            or user.args[1] is not torch.float32
+        ):
+            return False
+    return True
 
 
 def _pad_clamped_load_expr(
@@ -841,25 +1142,30 @@ def _ds_expr(
         # means the full expression may not be a multiple of block_size.
         if not tile_offset:
             alignment = _loop_offset_alignment(block_id, state)
-            if alignment is not None:
-                # Workaround for JAX <= 0.10.0 where AssumeMultipleOp
-                # short-circuits divisibility analysis (fixed in
-                # jax-ml/jax@33c38f50b): only apply when alignment meets
-                # Mosaic's requirement, otherwise the hint could replace
-                # a stronger proof Mosaic already has.
-                from helion._compiler.backend import PallasBackend
-                from helion._compiler.compile_environment import CompileEnvironment
+            # Workaround for JAX <= 0.10.0 where AssumeMultipleOp
+            # short-circuits divisibility analysis (fixed in
+            # jax-ml/jax@33c38f50b): only apply when the hint meets Mosaic's
+            # requirement, otherwise it could replace a stronger proof Mosaic
+            # already has.
+            from helion._compiler.backend import PallasBackend
+            from helion._compiler.compile_environment import CompileEnvironment
 
-                backend = CompileEnvironment.current().backend
-                assert isinstance(backend, PallasBackend)
-                dim_from_end = tensor.ndim - 1 - tensor_dim
-                bitwidth = tensor.dtype.itemsize * 8
-                required = backend._get_pallas_required_alignment(
-                    dim_from_end, tensor.ndim, bitwidth
-                )
-                if alignment % required == 0:
-                    # e.g. pl.ds(pl.multiple_of(offset_3, _BLOCK_SIZE_3), _BLOCK_SIZE_3)
-                    offset = f"pl.multiple_of({offset}, {block_size})"
+            backend = CompileEnvironment.current().backend
+            assert isinstance(backend, PallasBackend)
+            dim_from_end = tensor.ndim - 1 - tensor_dim
+            bitwidth = tensor.dtype.itemsize * 8
+            required = backend._get_pallas_required_alignment(
+                dim_from_end, tensor.ndim, bitwidth
+            )
+            if alignment is not None and alignment % required == 0:
+                hint = required
+                bs_value = state.device_function.resolved_block_size(block_id)
+                if isinstance(bs_value, int) and alignment % bs_value == 0:
+                    hint = block_size
+                # e.g. pl.ds(pl.multiple_of(offset_3, _BLOCK_SIZE_3), _BLOCK_SIZE_3)
+                offset = f"pl.multiple_of({offset}, {hint})"
+            elif _is_zero_begin_single_tile_dim(block_id, state, tensor, tensor_dim):
+                offset = f"pl.multiple_of({offset}, {required})"
 
     return f"pl.ds({offset}, {block_size})"
 
@@ -914,14 +1220,55 @@ def _loop_offset_alignment(
     loops = state.codegen.active_device_loops.get(block_id)
     if loops:
         info = loops[-1].block_id_to_info.get(block_id)
-        if info is not None and info.begin_expr is not None:
-            begin = info.begin_expr
-            if not isinstance(begin, (int, sympy.Integer)):
-                return None  # symbolic begin — can't prove alignment
-            if int(begin) % bs_value != 0:
-                return None
+        if info is None or info.begin_expr is None:
+            return None
+        begin = info.begin_expr
+        if not isinstance(begin, (int, sympy.Integer)):
+            return None  # symbolic begin — can't prove alignment
+        if int(begin) % bs_value != 0:
+            return None
 
     return bs_value
+
+
+def _is_zero_begin_single_tile_dim(
+    block_id: int,
+    state: CodegenState,
+    tensor: torch.Tensor,
+    tensor_dim: int,
+) -> bool:
+    """True when a zero-begin loop has only one in-bounds concrete tensor tile."""
+    import sympy
+
+    from helion._compiler.compile_environment import CompileEnvironment
+
+    bs_value = state.device_function.resolved_block_size(block_id)
+    if not isinstance(bs_value, int):
+        return False
+
+    loops = state.codegen.active_device_loops.get(block_id)
+    if not loops:
+        return False
+
+    info = loops[-1].block_id_to_info.get(block_id)
+    if info is None or info.begin_expr not in (0, sympy.Integer(0)):
+        return False
+
+    env = CompileEnvironment.current()
+    dim_size = tensor.shape[tensor_dim]
+    if isinstance(dim_size, int):
+        return env.settings.static_shapes and dim_size <= bs_value
+    if not isinstance(dim_size, torch.SymInt):
+        return False
+
+    dim_expr = env.shape_env.replace(dim_size._sympy_())
+    if not dim_expr.free_symbols <= env.specialized_vars:
+        return False
+    dim_expr = env.specialize_expr(dim_expr)
+    if dim_expr.free_symbols or getattr(dim_expr, "is_integer", None) is not True:
+        return False
+    dim_value = int(dim_expr)
+    return dim_value <= bs_value
 
 
 def vmem_name(state: CodegenState, name: str) -> str:

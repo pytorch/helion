@@ -1176,7 +1176,6 @@ class TestExamples(RefEagerTestBase, TestCase):
                 block_sizes=[32768, 1],
             )
 
-    @xfailIfPallas("JAX tracer error with dynamic shapes")
     @skipIfRefEager("hl.jagged_tile does not support ref mode yet")
     def test_jagged_mean(self):
         num_rows, max_cols = 32, 64
@@ -1184,8 +1183,8 @@ class TestExamples(RefEagerTestBase, TestCase):
         lengths = torch.randint(1, max_cols + 1, (num_rows,), device=DEVICE)
         x_offsets = torch.cat(
             [
-                torch.zeros(1, dtype=torch.long, device=DEVICE),
-                torch.cumsum(lengths, dim=0),
+                torch.zeros(1, dtype=LONG_INT_TYPE, device=DEVICE),
+                torch.cumsum(lengths, dim=0).to(LONG_INT_TYPE),
             ]
         )
         nnz = int(x_offsets[-1])
@@ -1490,7 +1489,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             block_sizes=[16, 8, 16, 16],
         )
 
-    @xfailIfPallas("tensor-derived if-predicates not supported")
+    @xfailIfPallas("Mosaic unsupported mask shape cast in HSTU")
     @skipIfXPU("Jagged tensor operations not fully supported on XPU")
     def test_jagged_hstu_attn(self):
         batch_size = 4
@@ -1636,7 +1635,6 @@ class TestExamples(RefEagerTestBase, TestCase):
                     rtol=rtol,
                 )
 
-    @xfailIfPallasTpu("tensor-derived if-predicates not supported")
     def test_grouped_gemm_jagged(self):
         # Build small jagged grouped GEMM inputs
         torch.manual_seed(0)
@@ -1961,7 +1959,6 @@ class TestExamples(RefEagerTestBase, TestCase):
             rtol=2e-1,
         )
 
-    @xfailIfPallas("JAX tracer error")
     @skipIfRefEager("hl.jagged_tile does not support ref mode yet")
     def test_jagged_sum(self):
         num_rows, max_cols = 128, 64
@@ -1969,8 +1966,8 @@ class TestExamples(RefEagerTestBase, TestCase):
         lengths = torch.randint(1, max_cols + 1, (num_rows,), device=DEVICE)
         x_offsets = torch.cat(
             [
-                torch.zeros(1, dtype=torch.long, device=DEVICE),
-                torch.cumsum(lengths, dim=0),
+                torch.zeros(1, dtype=LONG_INT_TYPE, device=DEVICE),
+                torch.cumsum(lengths, dim=0).to(LONG_INT_TYPE),
             ]
         )
         nnz = int(x_offsets[-1])
@@ -2596,9 +2593,6 @@ class TestExamples(RefEagerTestBase, TestCase):
         expected = torch.nn.functional.scaled_dot_product_attention(q, k, v)
         torch.testing.assert_close(out, expected, atol=1e-1, rtol=1e-1)
 
-    @xfailIfPallasTpu(
-        "dA_cumsum has mixed scalar+slice access (VMEM), but Mosaic requires 32-bit for VMEM scalar extracts"
-    )
     def test_mamba2_chunk_state(self):
         batch, nheads, ngroups, seqlen, chunk_size, headdim, dstate = (
             2,
