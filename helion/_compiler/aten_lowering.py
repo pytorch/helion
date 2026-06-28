@@ -846,6 +846,34 @@ def codegen_stack(ctx: LoweringContext, node: Node) -> object:
     return expr_from_string(result)
 
 
+@stack_lowering.register_codegen("pallas")
+def codegen_stack_pallas(ctx: LoweringContext, node: Node) -> object:
+    tensors = node.args[0]
+    dim = node.args[1] if len(node.args) > 1 else node.kwargs.get("dim", 0)
+
+    assert isinstance(tensors, (list, tuple))
+    if not tensors:
+        raise ValueError("Cannot stack empty tensor list")
+    if not all(isinstance(tensor, Node) for tensor in tensors):
+        raise exc.BackendUnsupported("pallas", "stack inputs")
+    assert isinstance(dim, int)
+
+    tensor_nodes = cast("list[Node] | tuple[Node, ...]", tensors)
+    tensor_asts = [ctx.env[tensor] for tensor in tensor_nodes]
+    args: dict[str, ast.AST] = {}
+    items: list[str] = []
+    for i, tensor in enumerate(tensor_asts):
+        assert isinstance(tensor, ast.AST)
+        name = f"tensor_{i}"
+        args[name] = tensor
+        items.append(f"{{{name}}}")
+
+    return expr_from_string(
+        f"jnp.stack([{', '.join(items)}], axis={dim})",
+        **args,
+    )
+
+
 @stack_lowering.register_codegen("cute")
 def codegen_stack_cute(ctx: LoweringContext, node: Node) -> object:
     tensors = node.args[0]
