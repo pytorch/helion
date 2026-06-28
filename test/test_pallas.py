@@ -4056,6 +4056,70 @@ class TestPallas(TestCase):
             f"block-aligned begin should skip the pad (extra_pad==0), got {pad_dims}",
         )
 
+    def test_bounded_inner_tile_uses_outer_blockspec_local_ds(self) -> None:
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def fn(x: torch.Tensor) -> torch.Tensor:
+            m = x.size(0)
+            m_block = hl.register_block_size(m)
+            out = torch.empty_like(x)
+            for mb_cta in hl.tile(m, block_size=m_block):
+                for mb in hl.tile(mb_cta.begin, mb_cta.end):
+                    out[mb, :] = x[mb, :] * 2
+            return out
+
+        x = torch.randn(128, 16, device=DEVICE, dtype=torch.float32)
+        code, result = code_and_output(
+            fn,
+            (x,),
+            block_sizes=[64, 32],
+            pallas_loop_type="fori_loop",
+        )
+        match = re.search(r"_block_spec_info=(\[[^\]]*\])", code)
+        self.assertIsNotNone(match, "expected _block_spec_info in launcher call")
+        block_spec_info = ast.literal_eval(match.group(1))
+        self.assertEqual(
+            block_spec_info,
+            [((64, None), (0, None)), ((64, None), (0, None))],
+        )
+        self.assertRegex(
+            code,
+            r"pl\.ds\(pl\.multiple_of\(offset_\d+ - offset_\d+, "
+            r"_BLOCK_SIZE_\d+\), _BLOCK_SIZE_\d+\)",
+        )
+        torch.testing.assert_close(result, x * 2)
+
+    def test_extent_bounded_inner_tile_is_not_owner_relative(self) -> None:
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def fn(x: torch.Tensor) -> torch.Tensor:
+            m, n = x.shape
+            m_block = hl.register_block_size(m)
+            num_blocks = (m + m_block - 1) // m_block
+            out = x.new_empty([num_blocks, 64, n])
+            for mb_cta in hl.tile(m, block_size=m_block):
+                for mb in hl.tile(m_block):
+                    out[mb_cta.id, mb, :] = x[mb, :]
+            return out
+
+        x = torch.randn(128, 16, device=DEVICE, dtype=torch.float32)
+        code, result = code_and_output(
+            fn,
+            (x,),
+            block_sizes=[64, 32],
+            pallas_loop_type="fori_loop",
+        )
+        match = re.search(r"_block_spec_info=(\[[^\]]*\])", code)
+        self.assertIsNotNone(match, "expected _block_spec_info in launcher call")
+        block_spec_info = ast.literal_eval(match.group(1))
+        self.assertEqual(block_spec_info[0], ((None, None), (None, None)))
+        self.assertEqual(block_spec_info[1], ((None, None, None), (None, None, None)))
+        self.assertNotRegex(
+            code,
+            r"pl\.ds\(pl\.multiple_of\(offset_\d+ - offset_\d+, "
+            r"_BLOCK_SIZE_\d+\)",
+        )
+        expected = torch.stack([x[:64], x[:64]])
+        torch.testing.assert_close(result, expected)
+
     def test_squeeze_slice_access(self) -> None:
         """Test for the [None, :] indexing pattern (subscript index for slice >= tensor_ndim)"""
 

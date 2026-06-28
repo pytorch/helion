@@ -177,7 +177,14 @@ def _should_select_unaligned_tile_axis_from_full_load(
     )
     if required <= 1:
         return False
-    alignment = _loop_offset_alignment(pattern.block_id, state)
+    local_owner = _bounded_local_owner_block_id(
+        state, pattern.block_id, tensor, tensor_dim
+    )
+    alignment = (
+        state.device_function.resolved_block_size(pattern.block_id)
+        if local_owner is not None
+        else _loop_offset_alignment(pattern.block_id, state)
+    )
     if (
         isinstance(pattern, (TileIndexWithOffsetPattern, TileBeginWithOffsetPattern))
         and pattern.offset != 0
@@ -1132,16 +1139,32 @@ def _ds_expr(
     # sliced block at local offset 0, not the absolute tile_start.
     if not tile_offset and _is_compact_aligned_load(state, block_id, tensor):
         return f"pl.ds(0, {block_size})"
+    local_owner_block_id = (
+        _bounded_local_owner_block_id(state, block_id, tensor, tensor_dim)
+        if tensor is not None and tensor_dim is not None
+        else None
+    )
+    if local_owner_block_id is not None:
+        owner_offset = state.codegen.offset_var(local_owner_block_id)
+        offset = f"({offset}) - ({owner_offset})"
     if tensor is not None and tensor_dim is not None:
         from helion.language.memory_ops import _record_pad_info
 
-        extra_pad = _loop_begin_extra_pad(block_id, state)
+        extra_pad = (
+            0
+            if local_owner_block_id is not None
+            else _loop_begin_extra_pad(block_id, state)
+        )
         _record_pad_info(state, tensor, tensor_dim, block_id, extra_pad)
 
         # Skip when tile_offset is set (e.g. offset + 64) — the shift
         # means the full expression may not be a multiple of block_size.
         if not tile_offset:
-            alignment = _loop_offset_alignment(block_id, state)
+            alignment = (
+                state.device_function.resolved_block_size(block_id)
+                if local_owner_block_id is not None
+                else _loop_offset_alignment(block_id, state)
+            )
             # Workaround for JAX <= 0.10.0 where AssumeMultipleOp
             # short-circuits divisibility analysis (fixed in
             # jax-ml/jax@33c38f50b): only apply when the hint meets Mosaic's
@@ -1168,6 +1191,52 @@ def _ds_expr(
                 offset = f"pl.multiple_of({offset}, {required})"
 
     return f"pl.ds({offset}, {block_size})"
+
+
+def _bounded_local_owner_block_id(
+    state: CodegenState,
+    block_id: int,
+    tensor: torch.Tensor | None,
+    tensor_dim: int | None,
+) -> int | None:
+    """Return the outer grid block that owns a bounded inner tile's BlockSpec."""
+    if tensor is None or tensor_dim is None:
+        return None
+
+    from helion._compiler.compile_environment import CompileEnvironment
+    from helion._compiler.device_function import PallasMemorySpace
+    from helion._compiler.tile_strategy import DeviceGridState
+
+    if (
+        state.device_function.pallas_memory_space.get(id(tensor))
+        == PallasMemorySpace.HBM
+    ):
+        return None
+
+    dim_tilings = state.device_function.pallas_tensor_dim_tilings.get(id(tensor))
+    if dim_tilings is None or tensor_dim >= len(dim_tilings):
+        return None
+    dim_tiling = dim_tilings[tensor_dim]
+    if not dim_tiling.can_tile or dim_tiling.block_ids != [block_id]:
+        return None
+
+    env = CompileEnvironment.current()
+    seen: set[int] = set()
+    current = block_id
+    while current not in seen:
+        seen.add(current)
+        try:
+            spec = env.config_spec.block_sizes.block_id_lookup(current)
+        except KeyError:
+            return None
+        parent = spec.owner_relative_bounded_by_block_id
+        if parent is None:
+            return None
+        loops = state.codegen.active_device_loops.get(parent)
+        if loops and any(isinstance(loop, DeviceGridState) for loop in loops):
+            return parent
+        current = parent
+    return None
 
 
 def _loop_begin_extra_pad(block_id: int, state: CodegenState) -> int:

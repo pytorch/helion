@@ -2201,6 +2201,23 @@ class PallasBackend(Backend):
         block_id_to_grid_dim = {bid: g for g, bid in enumerate(flat_grid_block_ids)}
         known_block_ids = set(block_id_to_grid_dim)
 
+        def block_spec_grid_block_id(block_id: int) -> int | None:
+            """Map an indexed block id to the pallas_call grid block that owns it."""
+            seen: set[int] = set()
+            while block_id not in seen:
+                if block_id in known_block_ids:
+                    return block_id
+                seen.add(block_id)
+                try:
+                    spec = env.config_spec.block_sizes.block_id_lookup(block_id)
+                except KeyError:
+                    return None
+                bounded_by = spec.owner_relative_bounded_by_block_id
+                if bounded_by is None:
+                    return None
+                block_id = bounded_by
+            return None
+
         # FlattenedTileStrategy collapses all block_ids into a single
         # pid_info entry, but the full set lives in device_ir.grid_block_ids.
         # Recover them so we can build flat decomposition and so downstream
@@ -2263,8 +2280,9 @@ class PallasBackend(Backend):
                     continue
                 assert len(dim_tiling.block_ids) == 1
                 bid = dim_tiling.block_ids[0]
-                if bid is not None and bid in known_block_ids:
-                    bs = env.block_sizes[bid].from_config(config)
+                grid_bid = block_spec_grid_block_id(bid)
+                if grid_bid is not None:
+                    bs = env.block_sizes[grid_bid].from_config(config)
                     if isinstance(bs, int):
                         block_shape.append(bs)
                         dim_size = tensor.shape[d]
@@ -2275,10 +2293,10 @@ class PallasBackend(Backend):
                         # block_size > 1).
                         if isinstance(dim_size, int) and dim_size <= bs:
                             grid_dims.append(None)
-                        elif flat_decomp is not None and bid in flat_decomp:
-                            grid_dims.append(flat_decomp[bid])
+                        elif flat_decomp is not None and grid_bid in flat_decomp:
+                            grid_dims.append(flat_decomp[grid_bid])
                         else:
-                            grid_dims.append(block_id_to_grid_dim[bid])
+                            grid_dims.append(block_id_to_grid_dim[grid_bid])
                         continue
                 block_shape.append(None)
                 grid_dims.append(None)
