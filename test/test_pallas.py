@@ -676,6 +676,22 @@ def kernel_tile_begin_plus_offset_is_elementwise(
 @onlyBackends(["triton", "pallas"])
 @skipUnlessPallas("JAX/Pallas TPU not available")
 class TestPallas(TestCase):
+    def _assert_numeric_mask_reshape(self, code: str, shape_pattern: str) -> None:
+        bool_to_int = r"[^\n,]+\.astype\(jnp\.int32\)"
+        one_int32 = r"jnp\.array\(1, dtype=jnp\.int32\)"
+        patterns = [
+            rf"jnp\.reshape\({bool_to_int}, {shape_pattern}",
+            (
+                rf"jnp\.reshape\(jnp\.minimum\({bool_to_int}, {one_int32}\), "
+                rf"{shape_pattern}"
+            ),
+        ]
+        if not any(re.search(pattern, code) for pattern in patterns):
+            self.fail(
+                "expected numeric mask reshape to use direct bool-to-int "
+                "conversion, optionally clamped with jnp.minimum"
+            )
+
     def test_slice_addressing_classification(self) -> None:
         """_slice_addressing: major dim -> DIRECT; f32 single-lane-tile sublane
         -> DIRECT; bf16 / wide-lane / unknown-lane sublane -> ALIGNED."""
@@ -1406,6 +1422,76 @@ class TestPallas(TestCase):
         expected = torch.where(x[:, :1] > 0, x, torch.zeros_like(x))
         torch.testing.assert_close(result, expected)
         self.assertIn("astype(jnp.int32)", code)
+
+    def test_bool_expand_inserted_broadcast_dim_where(self) -> None:
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def pallas_bool_expand_inserted_broadcast_dim_where(
+            x: torch.Tensor,
+        ) -> torch.Tensor:
+            m, n = x.size()
+            out = torch.empty_like(x)
+            for tile_m, tile_n in hl.tile([m, n]):
+                mask = (x[0, tile_n] < 0).expand(tile_m.block_size, tile_n.block_size)
+                out[tile_m, tile_n] = torch.where(mask, x[tile_m, tile_n], 0.0)
+            return out
+
+        x = torch.randn(16, 128, device=DEVICE, dtype=torch.float32)
+        code, result = code_and_output(
+            pallas_bool_expand_inserted_broadcast_dim_where,
+            (x,),
+            block_sizes=[16, 128],
+        )
+
+        expected = torch.where(x[:1, :] < 0, x, torch.zeros_like(x))
+        torch.testing.assert_close(result, expected)
+        self.assertIn("jnp.broadcast_to", code)
+        self.assertIn("astype(jnp.int32)[None, :]", code)
+
+    def test_bool_subscript_broadcast_where(self) -> None:
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def pallas_bool_subscript_broadcast_where(x: torch.Tensor) -> torch.Tensor:
+            m, n = x.size()
+            out = torch.empty_like(x)
+            for tile_m, tile_n in hl.tile([m, n]):
+                row_mask = x[tile_m, 0] > 0
+                col_mask = x[0, tile_n] < 0
+                mask = row_mask[:, None] & col_mask[None, :]
+                out[tile_m, tile_n] = torch.where(mask, x[tile_m, tile_n], 0.0)
+            return out
+
+        x = torch.randn(16, 128, device=DEVICE, dtype=torch.float32)
+        code, result = code_and_output(
+            pallas_bool_subscript_broadcast_where,
+            (x,),
+            block_sizes=[16, 128],
+        )
+
+        expected_mask = (x[:, :1] > 0) & (x[:1, :] < 0)
+        expected = torch.where(expected_mask, x, torch.zeros_like(x))
+        torch.testing.assert_close(result, expected)
+        self._assert_numeric_mask_reshape(code, r"\[[^\]]*, 1\]")
+        self._assert_numeric_mask_reshape(code, r"\[1,")
+
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def pallas_bool_unsqueeze_broadcast_where(x: torch.Tensor) -> torch.Tensor:
+            m, n = x.size()
+            out = torch.empty_like(x)
+            for tile_m, tile_n in hl.tile([m, n]):
+                row_mask = x[tile_m, 0] > 0
+                col_mask = x[0, tile_n] < 0
+                mask = row_mask.unsqueeze(1) & col_mask.unsqueeze(0)
+                out[tile_m, tile_n] = torch.where(mask, x[tile_m, tile_n], 0.0)
+            return out
+
+        code, result = code_and_output(
+            pallas_bool_unsqueeze_broadcast_where,
+            (x,),
+            block_sizes=[16, 128],
+        )
+
+        torch.testing.assert_close(result, expected)
+        self._assert_numeric_mask_reshape(code, r"\[[^\]]*, 1\]")
+        self._assert_numeric_mask_reshape(code, r"\[1,")
 
     def test_indirect_gather_with_tiled_dim(self) -> None:
         @helion.kernel(backend="pallas", static_shapes=True)
