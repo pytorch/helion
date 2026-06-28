@@ -42,6 +42,7 @@ import helion
 from helion._testing import DEVICE
 from helion._testing import run_example
 import helion.language as hl
+from helion.runtime.settings import _get_backend
 
 # %%
 # Grouped GEMM Kernel - Basic Implementation
@@ -111,7 +112,7 @@ def grouped_gemm_jagged(
 
 # %%
 @helion.kernel(static_shapes=False)
-def grouped_gemm_jagged_persistent(
+def _grouped_gemm_jagged_persistent(
     A_packed: torch.Tensor,  # [total_M, K]
     B: torch.Tensor,  # [K, N]
     group_offsets: torch.Tensor,  # [G+1], row offsets into A_packed
@@ -223,6 +224,15 @@ def grouped_gemm_jagged_persistent(
                         )
 
     return out
+
+
+# Keep the manually scheduled persistent GPU kernel for Triton/CuTe, and select
+# the structural variant on Pallas to avoid unsupported multi-indirect scatter.
+grouped_gemm_jagged_persistent = (
+    grouped_gemm_jagged
+    if _get_backend() == "pallas"
+    else _grouped_gemm_jagged_persistent
+)
 
 
 # %%
