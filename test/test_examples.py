@@ -1206,7 +1206,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             block_sizes=[16, 8, 16],
         )
 
-    @xfailIfPallas("requires triton module")
+    @skipIfPallasInterpret("CPU Pallas interpret job does not install Triton")
     @skipIfRefEager(
         "torch._higher_order_ops.associative_scan with tuple arg is not supported by ref eager mode yet"
     )
@@ -1217,7 +1217,9 @@ class TestExamples(RefEagerTestBase, TestCase):
         dtype = torch.float32
 
         # Create sorted indices for segmented reduction
-        indices = torch.randint(0, num_nodes, (num_edges,), device=DEVICE).sort()[0]
+        indices = torch.randint(
+            0, num_nodes, (num_edges,), device=DEVICE, dtype=LONG_INT_TYPE
+        ).sort()[0]
         input_data = torch.randn(num_edges, num_features, device=DEVICE, dtype=dtype)
 
         args = (indices, input_data, num_nodes)
