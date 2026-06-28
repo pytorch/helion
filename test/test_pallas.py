@@ -569,6 +569,59 @@ def pallas_chunked_add(x: torch.Tensor) -> torch.Tensor:
 
 
 @helion.kernel(backend="pallas", static_shapes=True)
+def pallas_chunked_major_dim_sum(x: torch.Tensor) -> torch.Tensor:
+    batch, seqlen, nheads, headdim = x.shape
+    chunk_size = 64
+    nchunks = seqlen // chunk_size
+    out = torch.empty([batch, nchunks, nheads, headdim], dtype=x.dtype, device=x.device)
+    for tile_b, tile_c, tile_h, tile_m in hl.tile(
+        [batch, nchunks, nheads, headdim], block_size=[1, 1, 1, None]
+    ):
+        acc = hl.zeros([tile_m], dtype=torch.float32)
+        for tile_k in hl.tile(chunk_size, block_size=64):
+            row = tile_k.index + tile_c.begin * chunk_size
+            values = x[tile_b.begin, row, tile_h.begin, tile_m]
+            acc = acc + values.to(torch.float32).sum(dim=0)
+        out[tile_b.begin, tile_c.begin, tile_h.begin, tile_m] = acc.to(x.dtype)
+    return out
+
+
+@helion.kernel(backend="pallas", static_shapes=True)
+def pallas_promoted_mixed_scalar_slice(x: torch.Tensor) -> torch.Tensor:
+    batch, nheads, nchunks, chunk_size = x.shape
+    out = torch.empty_like(x)
+    for tile_b, tile_h, tile_c in hl.tile(
+        [batch, nheads, nchunks], block_size=[1, 1, 1]
+    ):
+        last = x[tile_b.begin, tile_h.begin, tile_c.begin, chunk_size - 1].to(
+            torch.float32
+        )
+        for tile_k in hl.tile(chunk_size, block_size=64):
+            values = x[tile_b.begin, tile_h.begin, tile_c.begin, tile_k].to(
+                torch.float32
+            )
+            out[tile_b.begin, tile_h.begin, tile_c.begin, tile_k] = (last - values).to(
+                x.dtype
+            )
+    return out
+
+
+@helion.kernel(backend="pallas", static_shapes=True)
+def pallas_indirect_gather_small_head_dim(
+    x: torch.Tensor, offsets: torch.Tensor
+) -> torch.Tensor:
+    _tokens, nheads, dhead = x.shape
+    nrows = offsets.size(0)
+    out = torch.empty([nheads, nrows, dhead], dtype=x.dtype, device=x.device)
+    for tile_h, tile_m, tile_d in hl.tile(
+        [nheads, nrows, dhead], block_size=[1, None, None]
+    ):
+        rows = offsets[tile_m]
+        out[tile_h.begin, tile_m, tile_d] = x[rows, tile_h.begin, tile_d]
+    return out
+
+
+@helion.kernel(backend="pallas", static_shapes=True)
 def pallas_rand_add(x: torch.Tensor, seed: int) -> torch.Tensor:
     """Kernel that uses hl.rand to generate random values and add them to x."""
     out = torch.empty_like(x)
@@ -3199,6 +3252,34 @@ class TestPallas(TestCase):
         )
         torch.testing.assert_close(result, x + 1.0)
 
+    def test_chunked_major_dim_offset_load_keeps_dynamic_ds(self) -> None:
+        x = torch.empty(2, 256, 8, 32, device=DEVICE, dtype=torch.bfloat16)
+        code = pallas_chunked_major_dim_sum.bind((x,)).to_triton_code(
+            helion.Config(block_sizes=[32], pallas_loop_type="emit_pipeline")
+        )
+        assert code is not None
+        self.assertRegex(code, r"x\[0, pl\.ds\([^)]*, _BLOCK_SIZE_\d+\), :, :\]")
+        self.assertNotIn("x[0, :, :, :]", code)
+
+    def test_promoted_mixed_scalar_slice_vmem_load(self) -> None:
+        x = torch.empty(2, 8, 4, 64, device=DEVICE, dtype=torch.bfloat16)
+        code = pallas_promoted_mixed_scalar_slice.bind((x,)).to_triton_code(
+            helion.Config(pallas_loop_type="fori_loop")
+        )
+        assert code is not None
+        self.assertNotIn("_smem_arg_indices=[0", code)
+        self.assertIn(".astype(jnp.float32)[", code)
+
+    def test_indirect_gather_widens_small_scalar_head_dim(self) -> None:
+        x = torch.empty(32, 8, 32, device=DEVICE, dtype=torch.bfloat16)
+        offsets = torch.arange(16, device=DEVICE, dtype=torch.int32)
+        code = pallas_indirect_gather_small_head_dim.bind((x, offsets)).to_triton_code(
+            helion.Config(block_sizes=[16, 32])
+        )
+        assert code is not None
+        self.assertIn("x[:, :, :]", code)
+        self.assertIsNone(re.search(r"x\[:, offset_\d+, :\]", code))
+
     def test_mixed_scalar_and_slice_access(self) -> None:
         """Tensor accessed both as scalar and slice should not be placed in SMEM.
 
@@ -3637,9 +3718,33 @@ class TestPallas(TestCase):
         self.assertIn("jax.lax.fori_loop", code)
         self.assertNotIn("pltpu.make_async_copy", code)
         self.assertIn("pl.ds(", code)
-        # Block size 64 < 128 alignment — hint should NOT be applied
-        self.assertNotIn("pl.multiple_of(", code)
+        # The last dim is a one-tile dense slice, so its dynamic fori offset is
+        # provably zero and can carry the 128-element Mosaic alignment hint.
+        self.assertIn("pl.ds(pl.multiple_of(offset_1, 128), _BLOCK_SIZE_1)", code)
         torch.testing.assert_close(result, args[0] + args[1])
+
+    def test_fori_loop_dynamic_dim_no_single_tile_alignment_hint(self) -> None:
+        """Dynamic shape reuse must not infer a one-tile dim from size hints."""
+
+        @helion.kernel(backend="pallas", static_shapes=False)
+        def dynamic_inner_loop_add(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            m, n = x.size()
+            out = torch.empty_like(x)
+            for tile_m in hl.tile(m):
+                for tile_n in hl.tile(n):
+                    out[tile_m, tile_n] = x[tile_m, tile_n] + y[tile_m, tile_n]
+            return out
+
+        args = (
+            torch.randn(64, 64, device=DEVICE, dtype=torch.float32),
+            torch.randn(64, 64, device=DEVICE, dtype=torch.float32),
+        )
+        code = dynamic_inner_loop_add.bind(args).to_code(
+            helion.Config(block_sizes=[8, 64], pallas_loop_type="fori_loop")
+        )
+        self.assertIn("jax.lax.fori_loop", code)
+        self.assertIn("pl.ds(offset_1, _BLOCK_SIZE_1)", code)
+        self.assertNotIn("pl.ds(pl.multiple_of(offset_1, 128), _BLOCK_SIZE_1)", code)
 
     def test_fori_loop_no_dma_multidim_unaligned(self) -> None:
         """Nested fori_loop with a DMA-unaligned inner block.
@@ -4563,6 +4668,59 @@ class TestPallas(TestCase):
         )
         torch.testing.assert_close(result, ref, rtol=1e-3, atol=1e-3)
 
+    def test_unaligned_small_vector_load_selects_from_full_ref(self) -> None:
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def shifted_offsets(offsets: torch.Tensor) -> torch.Tensor:
+            n = offsets.size(0) - 1
+            out = torch.empty([n], dtype=offsets.dtype, device=offsets.device)
+            for tile in hl.tile(n):
+                out[tile] = offsets[tile.index + 1] - offsets[tile]
+            return out
+
+        offsets = torch.arange(129, device=DEVICE, dtype=torch.int32)
+        _code, result = code_and_output(shifted_offsets, (offsets,), block_sizes=[16])
+        expected = torch.ones([128], device=DEVICE, dtype=torch.int32)
+        torch.testing.assert_close(result, expected)
+
+    def test_unaligned_small_vector_load_ignores_unselected_nan(self) -> None:
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def shifted_values(values: torch.Tensor) -> torch.Tensor:
+            n = values.size(0) - 1
+            out = torch.empty([n], dtype=values.dtype, device=values.device)
+            for tile in hl.tile(n):
+                out[tile] = values[tile.index + 1]
+            return out
+
+        values = torch.arange(129, device=DEVICE, dtype=torch.float32)
+        values[0] = float("nan")
+        _code, result = code_and_output(shifted_values, (values,), block_sizes=[16])
+        torch.testing.assert_close(result, values[1:])
+
+    def test_indirect_gather_masks_jagged_lanes(self) -> None:
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def jagged_first_row_sum(
+            values: torch.Tensor, offsets: torch.Tensor
+        ) -> torch.Tensor:
+            out = torch.zeros([1], dtype=values.dtype, device=values.device)
+            for tile_b in hl.tile(1):
+                start = offsets[tile_b]
+                end = offsets[tile_b.index + 1]
+                nnz = end - start
+                acc = hl.zeros([tile_b], dtype=values.dtype)
+                for tile_k in hl.jagged_tile(nnz):
+                    idx = start[:, None] + tile_k.index[None, :]
+                    acc = acc + hl.load(values, [idx]).sum(dim=1)
+                out[tile_b] = acc
+            return out
+
+        values = torch.arange(16, device=DEVICE, dtype=torch.float32) + 100.0
+        values[0] = 7.0
+        offsets = torch.tensor([0, 1], device=DEVICE, dtype=torch.int32)
+        _code, result = code_and_output(
+            jagged_first_row_sum, (values, offsets), block_sizes=[1, 8]
+        )
+        torch.testing.assert_close(result, torch.tensor([7.0], device=DEVICE))
+
     def test_nested_fori_loop_scratch_scoping(self) -> None:
         """Nested hl.tile(start, end) with inner accumulator"""
 
@@ -4899,6 +5057,213 @@ class TestPallas(TestCase):
         )
         torch.testing.assert_close(result, torch.sum(x * 2 + 1, dim=1))
 
+    def test_scalar_tensor_predicate_if(self) -> None:
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def scalar_tensor_predicate_if(
+            x: torch.Tensor, y: torch.Tensor, gates: torch.Tensor
+        ) -> torch.Tensor:
+            (n,) = x.shape
+            block_n = hl.register_block_size(n)
+            out = torch.empty_like(x)
+            for tile_n in hl.tile(n, block_size=block_n):
+                if gates[0]:
+                    out[tile_n] = x[tile_n]
+                else:
+                    out[tile_n] = y[tile_n]
+            return out
+
+        x = torch.arange(8, device=DEVICE, dtype=torch.float32)
+        y = x + 10.0
+        gates = torch.tensor([True], device=DEVICE)
+
+        code, result = code_and_output(
+            scalar_tensor_predicate_if,
+            (x, y, gates),
+            block_sizes=[8],
+        )
+        self.assertNotIn("lax.cond(jnp.reshape", code)
+        self.assertIn("lax.cond", code)
+        torch.testing.assert_close(result, x)
+
+        gates = torch.tensor([False], device=DEVICE)
+        _, result = code_and_output(
+            scalar_tensor_predicate_if,
+            (x, y, gates),
+            block_sizes=[8],
+        )
+        torch.testing.assert_close(result, y)
+
+    def test_single_element_vector_tensor_predicate_if(self) -> None:
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def single_element_vector_predicate_if(
+            x: torch.Tensor, y: torch.Tensor, gates: torch.Tensor
+        ) -> torch.Tensor:
+            (n,) = x.shape
+            block_n = hl.register_block_size(n)
+            out = torch.empty_like(x)
+            for tile_n in hl.tile(n, block_size=block_n):
+                if gates[:1]:
+                    out[tile_n] = x[tile_n]
+                else:
+                    out[tile_n] = y[tile_n]
+            return out
+
+        x = torch.arange(8, device=DEVICE, dtype=torch.float32)
+        y = x + 10.0
+        gates = torch.tensor([True], device=DEVICE)
+
+        code, result = code_and_output(
+            single_element_vector_predicate_if,
+            (x, y, gates),
+            block_sizes=[8],
+        )
+        self.assertIn(".astype(jnp.int32)[0] != 0", code)
+        torch.testing.assert_close(result, x)
+
+        gates = torch.tensor([False], device=DEVICE)
+        _, result = code_and_output(
+            single_element_vector_predicate_if,
+            (x, y, gates),
+            block_sizes=[8],
+        )
+        torch.testing.assert_close(result, y)
+
+    def test_numeric_single_element_tensor_predicate_if(self) -> None:
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def scalar_numeric_predicate_if(
+            x: torch.Tensor, y: torch.Tensor, gates: torch.Tensor
+        ) -> torch.Tensor:
+            (n,) = x.shape
+            block_n = hl.register_block_size(n)
+            out = torch.empty_like(x)
+            for tile_n in hl.tile(n, block_size=block_n):
+                if gates[0]:
+                    out[tile_n] = x[tile_n]
+                else:
+                    out[tile_n] = y[tile_n]
+            return out
+
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def vector_numeric_predicate_if(
+            x: torch.Tensor, y: torch.Tensor, gates: torch.Tensor
+        ) -> torch.Tensor:
+            (n,) = x.shape
+            block_n = hl.register_block_size(n)
+            out = torch.empty_like(x)
+            for tile_n in hl.tile(n, block_size=block_n):
+                if gates[:1]:
+                    out[tile_n] = x[tile_n]
+                else:
+                    out[tile_n] = y[tile_n]
+            return out
+
+        x = torch.arange(8, device=DEVICE, dtype=torch.float32)
+        y = x + 10.0
+
+        gate = torch.tensor([2], device=DEVICE, dtype=torch.int32)
+        code, result = code_and_output(
+            scalar_numeric_predicate_if,
+            (x, y, gate),
+            block_sizes=[8],
+        )
+        self.assertRegex(code, r"lax\.cond\([^\n]*!= 0")
+        torch.testing.assert_close(result, x)
+
+        gate = torch.tensor([0], device=DEVICE, dtype=torch.int32)
+        _, result = code_and_output(
+            scalar_numeric_predicate_if,
+            (x, y, gate),
+            block_sizes=[8],
+        )
+        torch.testing.assert_close(result, y)
+
+        gates = torch.tensor([2.0], device=DEVICE, dtype=torch.float32)
+        code, result = code_and_output(
+            vector_numeric_predicate_if,
+            (x, y, gates),
+            block_sizes=[8],
+        )
+        self.assertRegex(code, r"lax\.cond\([^\n]*\[0\] != 0")
+        torch.testing.assert_close(result, x)
+
+        gates = torch.tensor([0.0], device=DEVICE, dtype=torch.float32)
+        _, result = code_and_output(
+            vector_numeric_predicate_if,
+            (x, y, gates),
+            block_sizes=[8],
+        )
+        torch.testing.assert_close(result, y)
+
+    def test_scalar_tensor_predicate_dynamic_extent_guarded_tile(self) -> None:
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def grouped_extent_sum(
+            x: torch.Tensor, w: torch.Tensor, offsets: torch.Tensor
+        ) -> torch.Tensor:
+            num_groups = offsets.size(0) - 1
+            d = x.size(1)
+            out = torch.empty([num_groups], device=x.device, dtype=x.dtype)
+            for g in hl.grid(num_groups):
+                start = offsets[g]
+                end = offsets[g + 1]
+                extent = end - start
+                out[g] = -1.0
+                if extent != 0:
+                    acc = hl.zeros([1], dtype=x.dtype)
+                    for tile_m in hl.tile(start, end, block_size=2):
+                        for tile_d in hl.tile(d, block_size=4):
+                            acc = acc + (x[tile_m, tile_d] * w[tile_d]).sum(dim=0).sum(
+                                dim=0
+                            ).unsqueeze(0)
+                    out[g] = acc.squeeze(0)
+            return out
+
+        x = torch.arange(32, device=DEVICE, dtype=torch.float32).reshape(8, 4)
+        w = torch.arange(4, device=DEVICE, dtype=torch.float32) + 1.0
+        offsets = torch.tensor([0, 4, 4, 8], device=DEVICE, dtype=torch.int32)
+
+        code, result = code_and_output(
+            grouped_extent_sum,
+            (x, w, offsets),
+            pallas_loop_type="fori_loop",
+        )
+        self.assertNotIn("lax.cond(jnp.reshape", code)
+        self.assertIn("lax.cond", code)
+
+        expected = torch.empty([3], device=DEVICE, dtype=x.dtype)
+        expected[0] = (x[:4] * w).sum()
+        expected[1] = -1.0
+        expected[2] = (x[4:8] * w).sum()
+        torch.testing.assert_close(result, expected)
+
+    def test_multi_element_tensor_predicate_if_unsupported(self) -> None:
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def multi_element_tensor_predicate_if(
+            x: torch.Tensor, masks: torch.Tensor
+        ) -> torch.Tensor:
+            (n,) = x.shape
+            block_n = hl.register_block_size(n)
+            out = torch.empty_like(x)
+            for tile_n in hl.tile(n, block_size=block_n):
+                value = x[tile_n]
+                if masks[tile_n]:
+                    value = value + 1.0
+                else:
+                    value = value - 1.0
+                out[tile_n] = value
+            return out
+
+        x = torch.arange(4, device=DEVICE, dtype=torch.float32)
+        masks = torch.tensor([True, False, True, False], device=DEVICE)
+        with self.assertRaisesRegex(
+            helion.exc.BackendUnsupported,
+            "multi-element tensor-derived predicates",
+        ):
+            code_and_output(
+                multi_element_tensor_predicate_if,
+                (x, masks),
+                block_sizes=[4],
+            )
+
     def test_branch_nonlocal_write(self) -> None:
         """Branch intermediates must survive in _if output list."""
 
@@ -5032,6 +5397,78 @@ class TestPallas(TestCase):
         outer_min = spec.block_sizes[0].min_size
         inner_min = spec.block_sizes[1].min_size
         self.assertGreaterEqual(outer_min, inner_min)
+
+    def test_jagged_tile_alignment_caps_to_accessed_tensor_dim(self) -> None:
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def k(feature_counts: torch.Tensor, max_m: int) -> torch.Tensor:
+            B = feature_counts.size(0)
+            out = torch.zeros(
+                [B, max_m], dtype=torch.float32, device=feature_counts.device
+            )
+            for tile_b in hl.tile(B):
+                counts = feature_counts[tile_b]
+                for tile_m in hl.jagged_tile(counts):
+                    out[tile_b, tile_m] = hl.zeros(
+                        [tile_b, tile_m], dtype=torch.float32
+                    )
+            return out
+
+        def normalized_block_sizes_and_code(max_m: int) -> tuple[list[int], str]:
+            feature_counts = torch.randint(
+                1, max_m + 1, (32,), device=DEVICE, dtype=torch.int32
+            )
+            bound = k.bind((feature_counts, max_m))
+            config = helion.Config(block_sizes=[16, 8])
+            bound.config_spec.normalize(config)
+            try:
+                code = bound.to_triton_code(config)
+            except Exception as error:
+                if "torch._inductor.codegen.pallas" not in str(error):
+                    raise
+                code = ""
+            block_sizes = config["block_sizes"]
+            assert isinstance(block_sizes, list)
+            return cast("list[int]", block_sizes), code
+
+        small_block_sizes, small_code = normalized_block_sizes_and_code(8)
+        self.assertEqual(small_block_sizes, [32, 8])
+        if small_code:
+            self.assertIn(
+                "pl.ds(pl.multiple_of(offset_1, 128), _BLOCK_SIZE_1)",
+                small_code,
+            )
+
+        large_block_sizes, _large_code = normalized_block_sizes_and_code(256)
+        self.assertEqual(large_block_sizes, [32, 128])
+
+    def test_jagged_tile_alignment_cap_specializes_symbolic_host_dim(self) -> None:
+        @helion.kernel(backend="pallas", static_shapes=False)
+        def k(feature_counts: torch.Tensor, max_m: int) -> torch.Tensor:
+            B = feature_counts.size(0)
+            out = torch.zeros(
+                [B, max_m], dtype=torch.float32, device=feature_counts.device
+            )
+            for tile_b in hl.tile(B):
+                counts = feature_counts[tile_b]
+                for tile_m in hl.jagged_tile(counts):
+                    out[tile_b, tile_m] = hl.zeros(
+                        [tile_b, tile_m], dtype=torch.float32
+                    )
+            return out
+
+        small_counts = torch.randint(1, 9, (32,), device=DEVICE, dtype=torch.int32)
+        small_bound = k.bind((small_counts, 8))
+        small_config = helion.Config(block_sizes=[16, 8])
+        small_bound.config_spec.normalize(small_config)
+
+        large_counts = torch.randint(1, 257, (32,), device=DEVICE, dtype=torch.int32)
+        large_bound = k.bind((large_counts, 256))
+        large_config = helion.Config(block_sizes=[16, 8])
+        large_bound.config_spec.normalize(large_config)
+
+        self.assertIsNot(small_bound, large_bound)
+        self.assertEqual(small_config["block_sizes"], [32, 8])
+        self.assertEqual(large_config["block_sizes"], [32, 128])
 
     def test_boundary_mask_with_squeezed_leading_dims(self) -> None:
         """Boundary mask generation succeeds when leading dimensions are squeezed."""
