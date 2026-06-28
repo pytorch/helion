@@ -297,7 +297,7 @@ class TestViews(RefEagerTestBase, TestCase):
         expected = torch.matmul(x, y)
         torch.testing.assert_close(result, expected, rtol=1e-2, atol=1e-2)
 
-    @xfailIfPallas("triton.next_power_of_2 in generated host code crashes pallas")
+    @xfailIfPallas("Pallas pads tiles before reshape until tiled loads land")
     def test_reshape_sum(self):
         @helion.kernel(static_shapes=True)
         def fn(x: torch.Tensor) -> torch.Tensor:

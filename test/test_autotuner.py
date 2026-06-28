@@ -128,6 +128,42 @@ class RecordingRandomSearch(RandomSearch):
         return super()._autotune()
 
 
+class TestMismatchTolerance(TestCase):
+    def test_assert_close_with_mismatch_tolerance_rejects_nonfinite(self) -> None:
+        with self.assertRaisesRegex(AssertionError, "Non-finite values found"):
+            assert_close_with_mismatch_tolerance(
+                torch.tensor([float("nan"), 1.0], device=DEVICE),
+                torch.tensor([1.0, 1.0], device=DEVICE),
+                max_mismatch_pct=1.0,
+            )
+
+        with self.assertRaisesRegex(AssertionError, "Non-finite values found"):
+            assert_close_with_mismatch_tolerance(
+                torch.tensor([float("inf")], device=DEVICE),
+                torch.tensor([float("inf")], device=DEVICE),
+                max_mismatch_pct=1.0,
+            )
+
+    def test_assert_close_with_mismatch_tolerance_rejects_shape_mismatch(self) -> None:
+        with self.assertRaises(AssertionError):
+            assert_close_with_mismatch_tolerance(
+                torch.ones([2, 1], device=DEVICE),
+                torch.ones([2], device=DEVICE),
+                max_mismatch_pct=1.0,
+            )
+
+    def test_assert_close_with_mismatch_tolerance_bounds_mismatches(self) -> None:
+        with self.assertRaisesRegex(
+            AssertionError, "Mismatched absolute diff too large"
+        ):
+            assert_close_with_mismatch_tolerance(
+                torch.tensor([10.0, 1.0, 1.0, 1.0], device=DEVICE),
+                torch.tensor([1.0, 1.0, 1.0, 1.0], device=DEVICE),
+                max_mismatch_pct=0.5,
+                max_mismatched_abs_diff=5.0,
+            )
+
+
 @onlyBackends(["triton"])
 class TestAutotuneIgnoreErrors(TestCase):
     def _make_search(
