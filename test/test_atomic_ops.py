@@ -306,7 +306,6 @@ class TestAtomicOperations(RefEagerTestBase, TestCase):
         expected = torch.ones(8, device=DEVICE)
         torch.testing.assert_close(result, expected)
 
-    @xfailIfPallas("Integer indexing not supported on Pallas")
     def test_atomic_add_1d_tensor(self):
         M, N = 32, 64
         x = torch.randn(M, N, device=DEVICE, dtype=torch.float32)

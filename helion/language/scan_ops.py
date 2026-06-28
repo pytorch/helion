@@ -498,6 +498,261 @@ def _(state: CodegenState) -> ast.AST | list[ast.AST]:
     return expr_from_string(acc)
 
 
+@_decorators.codegen(_associative_scan, "pallas")
+def _(state: CodegenState) -> ast.AST | list[ast.AST]:
+    """Generate a conservative static serial Pallas/JAX scan."""
+    from .._compiler.device_ir import HelperFunctionGraphInfo
+
+    combine_graph_id = cast("int", state.proxy_arg(0))
+    dim = cast("int", state.proxy_arg(2))
+    reverse = bool(state.proxy_arg(3))
+    is_tuple_input = bool(state.proxy_arg(4))
+    if reverse:
+        raise exc.BackendUnsupported("pallas", "reverse associative_scan")
+
+    helper_graph_info = state.get_graph(combine_graph_id)
+    assert isinstance(helper_graph_info, HelperFunctionGraphInfo)
+
+    input_values, input_asts = _pallas_scan_inputs(state, is_tuple_input)
+    result_exprs = _pallas_emit_serial_scan(
+        state,
+        helper_graph_info,
+        input_values,
+        input_asts,
+        dim,
+    )
+    return result_exprs if is_tuple_input else result_exprs[0]
+
+
+def _pallas_scan_inputs(
+    state: CodegenState, is_tuple_input: bool
+) -> tuple[list[torch.Tensor], list[ast.AST]]:
+    input_proxy = state.proxy_arg(1)
+    raw_input_ast = state.ast_args[1]
+
+    if is_tuple_input:
+        if not isinstance(input_proxy, (tuple, list)) or not isinstance(
+            raw_input_ast, (tuple, list)
+        ):
+            raise exc.BackendUnsupported("pallas", "tuple associative_scan input")
+        input_values = list(input_proxy)
+        input_asts = list(raw_input_ast)
+    else:
+        input_values = [input_proxy]
+        input_asts = [state.ast_arg(1)]
+
+    if not input_values or not all(isinstance(t, torch.Tensor) for t in input_values):
+        raise exc.BackendUnsupported("pallas", "associative_scan input")
+    if not all(isinstance(arg, ast.AST) for arg in input_asts):
+        raise exc.BackendUnsupported("pallas", "associative_scan input expression")
+    return (
+        cast("list[torch.Tensor]", input_values),
+        cast("list[ast.AST]", input_asts),
+    )
+
+
+def _pallas_emit_serial_scan(
+    state: CodegenState,
+    helper_graph_info: HelperFunctionGraphInfo,
+    input_values: list[torch.Tensor],
+    input_asts: list[ast.AST],
+    dim: int,
+) -> list[ast.AST]:
+    from .._compiler.ast_extension import expr_from_string
+    from .._compiler.ast_extension import statement_from_string
+    from .._compiler.compile_environment import CompileEnvironment
+
+    first = input_values[0]
+    ndim = first.ndim
+    if ndim == 0:
+        raise exc.BackendUnsupported("pallas", "scalar associative_scan input")
+    if dim < 0:
+        dim += ndim
+    if not (0 <= dim < ndim):
+        raise exc.BackendUnsupported("pallas", "associative_scan dim")
+
+    first_shape = tuple(str(s) for s in first.shape)
+    for value in input_values:
+        if value.ndim != ndim or tuple(str(s) for s in value.shape) != first_shape:
+            raise exc.BackendUnsupported("pallas", "tuple associative_scan shapes")
+
+    env = CompileEnvironment.current()
+    fake_extent: object = first.shape[dim]
+    if isinstance(fake_extent, torch.SymInt):
+        fake_extent = env.size_hint(fake_extent)
+    if not isinstance(fake_extent, int) or fake_extent <= 0:
+        raise exc.BackendUnsupported("pallas", "dynamic associative_scan extent")
+
+    input_names = [
+        state.codegen.lift(input_ast, dce=True, prefix="scan_input").id
+        for input_ast in input_asts
+    ]
+    result_vars = [state.device_function.new_var("scan_out") for _ in input_names]
+    acc_vars = [state.device_function.new_var("scan_acc") for _ in input_names]
+    item_vars = [state.device_function.new_var("scan_items") for _ in input_names]
+    extent_var = state.device_function.new_var("scan_extent")
+
+    state.codegen.add_statement(
+        statement_from_string(f"{extent_var} = {input_names[0]}.shape[{dim}]")
+    )
+    for item_var in item_vars:
+        state.codegen.add_statement(
+            statement_from_string(f"{item_var} = [None] * {extent_var}")
+        )
+
+    seed_index = _pallas_scan_index(ndim, dim, "0")
+    for acc_var, item_var, input_name in zip(
+        acc_vars, item_vars, input_names, strict=True
+    ):
+        state.codegen.add_statement(
+            statement_from_string(f"{acc_var} = {input_name}[{seed_index}]")
+        )
+        state.codegen.add_statement(statement_from_string(f"{item_var}[0] = {acc_var}"))
+
+    scan_i = state.device_function.new_var("scan_i")
+    value_index = _pallas_scan_index(ndim, dim, scan_i)
+    value_exprs = [f"{input_name}[{value_index}]" for input_name in input_names]
+    combine_exprs = _pallas_combine_result_expressions(
+        helper_graph_info, [*acc_vars, *value_exprs]
+    )
+    if len(combine_exprs) != len(acc_vars):
+        raise exc.BackendUnsupported("pallas", "associative_scan combine output")
+    next_vars = [state.device_function.new_var("scan_next") for _ in acc_vars]
+    lines = [f"for {scan_i} in range(1, {extent_var}):"]
+    lines.extend(
+        f"    {next_var} = {combine_expr}"
+        for next_var, combine_expr in zip(next_vars, combine_exprs, strict=True)
+    )
+    lines.extend(
+        f"    {acc_var} = {next_var}"
+        for acc_var, next_var in zip(acc_vars, next_vars, strict=True)
+    )
+    lines.extend(
+        f"    {item_var}[{scan_i}] = {acc_var}"
+        for item_var, acc_var in zip(item_vars, acc_vars, strict=True)
+    )
+    state.codegen.add_statement(statement_from_string("\n".join(lines)))
+
+    for result_var, item_var in zip(result_vars, item_vars, strict=True):
+        state.codegen.add_statement(
+            statement_from_string(f"{result_var} = jnp.stack({item_var}, axis={dim})")
+        )
+
+    return [expr_from_string(result_var) for result_var in result_vars]
+
+
+def _pallas_scan_index(ndim: int, dim: int, pos: str) -> str:
+    parts = [":" for _ in range(ndim)]
+    parts[dim] = pos
+    return ", ".join(parts)
+
+
+def _pallas_combine_result_expressions(
+    helper_graph_info: HelperFunctionGraphInfo,
+    arg_exprs: list[str],
+) -> list[str]:
+    """Inline the combine graph as JAX expressions for Pallas serial scan."""
+    import operator as operator_mod
+
+    graph = helper_graph_info.graph
+    placeholders = [n for n in graph.nodes if n.op == "placeholder"]
+    if len(placeholders) != len(arg_exprs):
+        raise exc.BackendUnsupported("pallas", "associative_scan combine arity")
+
+    binary_ops: dict[object, str] = {
+        operator_mod.add: "+",
+        torch.add: "+",
+        torch.ops.aten.add.Tensor: "+",
+        torch.ops.aten.add.Scalar: "+",
+        operator_mod.sub: "-",
+        torch.sub: "-",
+        torch.ops.aten.sub.Tensor: "-",
+        torch.ops.aten.sub.Scalar: "-",
+        operator_mod.mul: "*",
+        torch.mul: "*",
+        torch.ops.aten.mul.Tensor: "*",
+        torch.ops.aten.mul.Scalar: "*",
+        operator_mod.eq: "==",
+        torch.ops.aten.eq.Tensor: "==",
+        torch.ops.aten.eq.Scalar: "==",
+        operator_mod.ne: "!=",
+        torch.ops.aten.ne.Tensor: "!=",
+        torch.ops.aten.ne.Scalar: "!=",
+        operator_mod.lt: "<",
+        torch.ops.aten.lt.Tensor: "<",
+        torch.ops.aten.lt.Scalar: "<",
+        operator_mod.gt: ">",
+        torch.ops.aten.gt.Tensor: ">",
+        torch.ops.aten.gt.Scalar: ">",
+        operator_mod.le: "<=",
+        torch.ops.aten.le.Tensor: "<=",
+        torch.ops.aten.le.Scalar: "<=",
+        operator_mod.ge: ">=",
+        torch.ops.aten.ge.Tensor: ">=",
+        torch.ops.aten.ge.Scalar: ">=",
+    }
+    min_ops = (torch.minimum, torch.ops.aten.minimum.default)
+    max_ops = (torch.maximum, torch.ops.aten.maximum.default)
+    where_ops = (torch.where, torch.ops.aten.where.self)
+
+    env_map: dict[object, str] = dict(zip(placeholders, arg_exprs, strict=True))
+
+    def operand(value: object) -> str:
+        if isinstance(value, torch.fx.Node):
+            if value not in env_map:
+                raise exc.BackendUnsupported(
+                    "pallas", f"associative_scan combine dependency: {value}"
+                )
+            return env_map[value]
+        if isinstance(value, bool):
+            return "True" if value else "False"
+        if isinstance(value, (int, float)):
+            return repr(value)
+        raise exc.BackendUnsupported(
+            "pallas", f"associative_scan combine operand {value!r}"
+        )
+
+    for node in graph.nodes:
+        if node.op in ("placeholder", "output"):
+            continue
+        if node.op != "call_function":
+            raise exc.BackendUnsupported(
+                "pallas", f"associative_scan combine op {node.op}"
+            )
+        target = node.target
+        if target in binary_ops:
+            lhs = operand(node.args[0])
+            rhs = operand(node.args[1])
+            env_map[node] = f"(({lhs}) {binary_ops[target]} ({rhs}))"
+        elif target in where_ops:
+            cond = operand(node.args[0])
+            tval = operand(node.args[1])
+            fval = operand(node.args[2])
+            env_map[node] = f"jnp.where({cond}, {tval}, {fval})"
+        elif target in min_ops:
+            lhs = operand(node.args[0])
+            rhs = operand(node.args[1])
+            env_map[node] = f"jnp.minimum({lhs}, {rhs})"
+        elif target in max_ops:
+            lhs = operand(node.args[0])
+            rhs = operand(node.args[1])
+            env_map[node] = f"jnp.maximum({lhs}, {rhs})"
+        elif target is torch.ops.prims.convert_element_type.default:
+            env_map[node] = operand(node.args[0])
+        else:
+            raise exc.BackendUnsupported(
+                "pallas", f"associative_scan combine function: {target}"
+            )
+
+    output_nodes = [n for n in graph.nodes if n.op == "output"]
+    if len(output_nodes) != 1:
+        raise exc.BackendUnsupported("pallas", "associative_scan combine output")
+    outputs = output_nodes[0].args[0]
+    if not isinstance(outputs, (tuple, list)):
+        outputs = [outputs]
+    return [operand(o) for o in outputs]
+
+
 def _cute_recover_scan_load(node: object) -> tuple[object, object] | None:
     """Walk back from a scan tuple-element node to its ``CuteSortableLoad``.
 
