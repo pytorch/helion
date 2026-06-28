@@ -18,6 +18,8 @@ import dataclasses
 from typing import TYPE_CHECKING
 from typing import NamedTuple
 
+from helion._compiler.tile_strategy import EmitPipelineLoopState
+
 if TYPE_CHECKING:
     import torch
 
@@ -213,12 +215,51 @@ def _carry_store_plan(
     )
 
 
+def _dma_ref_block_ids_for_name(state: CodegenState, name: str) -> set[int]:
+    """Block IDs already made local by the DMA/Buffered ref named ``name``."""
+    block_ids: set[int] = set()
+    for loops in state.codegen.active_device_loops.values():
+        for loop in loops:
+            mapping = getattr(loop, "_tensor_to_dma_scratch", None)
+            if not mapping:
+                continue
+            for hbm_name, ref_name in mapping.items():
+                if ref_name != name:
+                    continue
+                block_id_mapping = getattr(loop, "_tensor_to_dma_block_ids", None)
+                if block_id_mapping and hbm_name in block_id_mapping:
+                    block_ids.update(block_id_mapping[hbm_name])
+                else:
+                    block_ids.update(loop.block_ids)
+    return block_ids
+
+
+def _zero_begin_emit_pipeline_index(state: CodegenState, block_id: int) -> str | None:
+    """Return ``_pipeline_indices[i]`` when it is the tile ordinal for block_id."""
+    seen: set[int] = set()
+    for loops in state.codegen.active_device_loops.values():
+        for loop in loops:
+            if id(loop) in seen:
+                continue
+            seen.add(id(loop))
+            if not isinstance(loop, EmitPipelineLoopState):
+                continue
+            ordered_block_ids = list(loop.block_id_to_info)
+            if block_id not in ordered_block_ids:
+                continue
+            info = loop.block_id_to_info.get(block_id)
+            if info is None or info.begin_expr != 0:
+                continue
+            return f"_pipeline_indices[{ordered_block_ids.index(block_id)}]"
+    return None
+
+
 def emit_carry_store(
     state: CodegenState,
     tensor: torch.Tensor,
     subscript: list[object] | tuple[object, ...],
     name: str,
-    idx_str: str,
+    idx_parts: list[str],
     value: object,
 ) -> bool:
     """Store a jagged row tile, stitching the boundary two groups share.
@@ -272,11 +313,30 @@ def emit_carry_store(
         f"(({row_off} == {a_start}) & ({begin} % {S} != 0) & (pl.program_id(0) != 0))"
     )
     save_guard = f"(({row_off} + {block_row} >= {a_end}) & ({end} % {S} != 0))"
-    col_sub = f"pl.multiple_of(({col_off}) // {block_col} * {S}, {S})"
+    col_index = _zero_begin_emit_pipeline_index(state, col_block_id)
+    if col_index is None:
+        col_index = f"({col_off}) // {block_col}"
+    col_sub = f"pl.multiple_of(({col_index}) * {S}, {S})"
     carry_slice = f"{carry}[pl.ds({col_sub}, {S}), :]"
-    # Group's last row block: S-aligned, within [0, block_row - S].
-    last_off = f"pl.multiple_of({a_end} - {S} - ({row_off}), {S})"
-    out_last = f"{name}[pl.ds({last_off}, {S}), :]"
+    local_block_ids = _dma_ref_block_ids_for_name(state, name)
+    local_row_ref = row_block_id in local_block_ids
+    store_parts = [*idx_parts]
+    store_parts[0] = (
+        f"pl.ds(0, {block_row})"
+        if local_row_ref
+        else f"pl.ds(pl.multiple_of({row_off}, {S}), {block_row})"
+    )
+    idx_str = ", ".join(store_parts)
+    raw_last_off = f"({a_end} - {S})"
+    last_off = f"pl.multiple_of({raw_last_off}, {S})"
+    if local_row_ref:
+        last_off = f"pl.multiple_of(({raw_last_off}) - ({row_off}), {S})"
+    out_col = (
+        ":"
+        if col_block_id in local_block_ids
+        else f"pl.ds(pl.multiple_of({col_off}, {block_col}), {block_col})"
+    )
+    out_last = f"{name}[pl.ds({last_off}, {S}), {out_col}]"
 
     # Pad the [S, block_col] carry to a full [block_row, block_col] tile (carry on
     # top, zeros below): Pallas rejects a partial write to the double-buffered out.
