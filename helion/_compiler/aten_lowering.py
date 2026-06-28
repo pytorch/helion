@@ -300,6 +300,23 @@ unsqueeze_lowering = register_lowering(
 )
 
 
+def _pallas_bool_safe_singleton_index(
+    tensor: ast.AST, input_val: torch.Tensor, args: list[str]
+) -> ast.AST:
+    index = ", ".join(args)
+    if input_val.dtype is torch.bool and "None" in args:
+        # Mosaic cannot reshape bool vectors directly:
+        # https://github.com/jax-ml/jax/issues/37370
+        return expr_from_string(
+            f"(({{tensor}}).astype(jnp.int32)[{index}] != 0)",
+            tensor=tensor,
+        )
+    return expr_from_string(
+        f"{{tensor}}[{index}]",
+        tensor=tensor,
+    )
+
+
 @unsqueeze_lowering.register_codegen("common")
 def codegen_unsqueeze(ctx: LoweringContext, node: Node) -> object:
     assert not node.kwargs, "getitem kwargs not supported"
@@ -317,6 +334,25 @@ def codegen_unsqueeze(ctx: LoweringContext, node: Node) -> object:
         f"{{tensor}}[{', '.join(args)}]",
         tensor=tensor,
     )
+
+
+@unsqueeze_lowering.register_codegen("pallas")
+def codegen_unsqueeze_pallas(ctx: LoweringContext, node: Node) -> object:
+    assert not node.kwargs, "unsqueeze kwargs not supported"
+    tensor, dim = map_arg(node.args, lambda arg: _env_arg(ctx, arg))
+    assert isinstance(tensor, ast.AST)
+    assert isinstance(dim, int)
+    input_node = node.args[0]
+    assert isinstance(input_node, Node)
+    input_val = input_node.meta["val"]
+    assert isinstance(input_val, torch.Tensor)
+    ndim = input_val.ndim
+    if dim < 0:
+        dim += ndim + 1
+    assert 0 <= dim <= ndim, f"Invalid dim {dim} for tensor with {ndim} dims"
+    args = [":"] * ndim
+    args.insert(dim, "None")
+    return _pallas_bool_safe_singleton_index(tensor, input_val, args)
 
 
 @unsqueeze_lowering.register_codegen("cute")
@@ -952,15 +988,14 @@ def codegen_expand_pallas(ctx: LoweringContext, node: Node) -> object:
     shape = [*val.size()]
     # pyrefly: ignore [missing-attribute]
     input_val = node.args[0].meta["val"]
+    assert isinstance(input_val, torch.Tensor)
     if input_val.ndim != len(shape):
         tile_strategy = ctx.cg.device_function.tile_strategy
         broadcasting = tile_strategy.broadcast_expand_dims(
             tuple(input_val.shape), tuple(shape)
         )
         if broadcasting:
-            tensor = expr_from_string(
-                f"{{tensor}}[{', '.join(broadcasting)}]", tensor=tensor
-            )
+            tensor = _pallas_bool_safe_singleton_index(tensor, input_val, broadcasting)
     shape_str = ctx.cg.device_function.tile_strategy.shape_str(shape)
     return expr_from_string(
         f"jnp.broadcast_to({{tensor}}, {shape_str})",
