@@ -130,15 +130,8 @@ def grouped_gemm_jagged_persistent(
     Returns:
         Output tensor of shape ``[sum(M_i), N]``.
     """
-    # Set worker count to match GPU streaming multiprocessor count
-    device = A_packed.device
-    if device.type == "xpu":
-        # TODO(EikanWang): gpu_subslice_count is an out-of-date term. we will update it to XeCore number.
-        num_workers = torch.xpu.get_device_properties(device.index).gpu_subslice_count
-    else:
-        num_workers = torch.cuda.get_device_properties(
-            device.index
-        ).multi_processor_count
+    # Set worker count to match the backend's persistent worker abstraction.
+    num_workers = helion.runtime.get_num_sm(A_packed.device)
 
     # Define tunable block sizes for M, N dimensions (auto-tuned at runtime)
     BLOCK_M = hl.register_block_size(32, 128)
