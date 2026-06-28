@@ -38,7 +38,6 @@ from helion._testing import skipIfTileIR
 from helion._testing import skipIfXPU
 from helion._testing import xfailIfPallas
 from helion._testing import xfailIfPallasInterpret
-from helion._testing import xfailIfPallasTpu
 from helion.runtime.config import Config
 from helion.runtime.ref_mode import is_ref_mode_enabled
 
@@ -2626,7 +2625,6 @@ class TestExamples(RefEagerTestBase, TestCase):
             rtol=0.1,
         )
 
-    @xfailIfPallasTpu("BlockSpec tiling failure")
     def test_mamba2_chunk_scan(self):
         batch, nheads, ngroups, seqlen, chunk_size, headdim, dstate = (
             2,
