@@ -345,6 +345,10 @@ class DeviceFunction:
         # Pallas: id(fake_tensor) → {dim: (block_id, extra_pad)} for dims
         # using pl.ds() that may need host-side padding.
         self.pallas_pad_info: dict[int, dict[int, tuple[int, int]]] = {}
+        # Pallas tensor-index atomic_add targets use a local RMW update.  Their
+        # indirect output dimensions must be covered by shared-output
+        # serialization in the launcher.
+        self.pallas_tensor_index_atomic_target_ids: set[int] = set()
         # Pallas ordered carry: jagged row block_id -> CarryBoundaryTile.  Filled by
         # the emit_pipeline codegen when the tile is a legal map axis; read by
         # the store codegen to stitch the boundary across neighbouring groups.
