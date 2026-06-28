@@ -339,8 +339,8 @@ def _get_dot_precision() -> DotPrecision:
                 "high": "high",
                 "highest": "highest",
                 "bfloat16": "default",
-                "tensorfloat32": "high",
-                "float32": "highest",
+                "tensorfloat32": "default",
+                "float32": "default",
             },
         )
 
@@ -617,7 +617,7 @@ class Settings(_Settings):
             "The dtype to use for index variables. Default auto-selects torch.int32 or torch.int64 based on input sizes. "
             "Override with HELION_INDEX_DTYPE=<dtype> (or set to 'auto')."
         ),
-        "dot_precision": "Precision for dot products. For Triton backend, see `triton.language.dot` (can be 'tf32', 'tf32x3', 'ieee'). For JAX/Pallas backend, can be 'default', 'high', 'highest' (mapped to JAX precision). Unified mappings exist so that any value can be used on any backend.",
+        "dot_precision": "Precision for dot products. For Triton backend, see `triton.language.dot` (can be 'tf32', 'tf32x3', 'ieee'). For JAX/Pallas backend, accepted values emit Pallas default precision on TPU. Unified mappings exist so that any value can be used on any backend.",
         "fast_math": (
             "If True, enable fast math approximations (Helion-level and Inductor-level). "
             "May reduce numerical precision. Set HELION_FAST_MATH=1 to enable."
