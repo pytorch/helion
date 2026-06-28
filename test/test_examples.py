@@ -38,7 +38,6 @@ from helion._testing import skipIfTileIR
 from helion._testing import skipIfXPU
 from helion._testing import xfailIfPallas
 from helion._testing import xfailIfPallasInterpret
-from helion._testing import xfailIfPallasTpu
 from helion.runtime.config import Config
 from helion.runtime.ref_mode import is_ref_mode_enabled
 
@@ -1414,8 +1413,8 @@ class TestExamples(RefEagerTestBase, TestCase):
         """Test combined backward pass for layer norm with bias."""
         self._run_layernorm_bwd(batch_size=32, dim=64)
 
-    @xfailIfPallas("VMEM OOM: untiled block specs load full tensors")
     @skipIfA10G("accuracy check fails on A10G GPUs")
+    @xfailIfPallasInterpret("large-batch backward has interpret-mode drift")
     def test_layernorm_bwd_large_batch(self):
         """Regression test: large batch, small dim."""
         self._run_layernorm_bwd(batch_size=1152 * 1000, dim=16, seed=1)
@@ -2626,7 +2625,6 @@ class TestExamples(RefEagerTestBase, TestCase):
             rtol=0.1,
         )
 
-    @xfailIfPallasTpu("BlockSpec tiling failure")
     def test_mamba2_chunk_scan(self):
         batch, nheads, ngroups, seqlen, chunk_size, headdim, dstate = (
             2,

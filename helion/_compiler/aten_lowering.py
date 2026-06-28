@@ -203,7 +203,30 @@ scalar_tensor_lowering = register_lowering(
 )
 
 
-where_lowering = register_lowering(torch.ops.aten.where.self)
+_UNKNOWN_MASKED_VALUE = object()
+
+
+def _where_masked_value(node: Node) -> float | bool | None:
+    def branch_value(arg: object) -> object:
+        if isinstance(arg, Node):
+            value = cached_masked_value(arg)
+            return _UNKNOWN_MASKED_VALUE if value is None else value
+        if isinstance(arg, (int, float, bool)):
+            return arg
+        return _UNKNOWN_MASKED_VALUE
+
+    x_value = branch_value(node.args[1])
+    y_value = branch_value(node.args[2])
+    if x_value is not _UNKNOWN_MASKED_VALUE and x_value == y_value:
+        assert isinstance(x_value, (int, float, bool))
+        return x_value
+    return None
+
+
+where_lowering = register_lowering(
+    torch.ops.aten.where.self,
+    masked_value_fn=_where_masked_value,
+)
 
 
 @where_lowering.register_codegen("common")
@@ -247,6 +270,91 @@ def codegen_where_cute(ctx: LoweringContext, node: Node) -> object:
     return expr_from_string(
         env.backend.where_expr("{cond}", "{x}", "{y}"),
         cond=ensure_ast(cond),
+        x=x_ast,
+        y=y_ast,
+    )
+
+
+@where_lowering.register_codegen("pallas")
+def codegen_where_pallas(ctx: LoweringContext, node: Node) -> object:
+    env = CompileEnvironment.current()
+    cond, x, y = map_arg(node.args, lambda arg: _env_arg(ctx, arg))
+
+    def ensure_ast(value: object) -> ast.AST:
+        if isinstance(value, ast.AST):
+            return value
+        if isinstance(value, (int, float, bool)):
+            return expr_from_string(constant_repr(value))
+        raise AssertionError(f"unsupported where operand: {type(value)!r}")
+
+    cond_ast = ensure_ast(cond)
+    x_ast = ensure_ast(x)
+    y_ast = ensure_ast(y)
+
+    ShapeDim = int | torch.SymInt
+
+    def tensor_shape(arg: object) -> tuple[ShapeDim, ...] | None:
+        if isinstance(arg, Node):
+            value = arg.meta.get("val")
+            if isinstance(value, torch.Tensor):
+                return cast("tuple[ShapeDim, ...]", tuple(value.size()))
+        return None
+
+    def shapes_match(
+        lhs: tuple[ShapeDim, ...] | None, rhs: tuple[ShapeDim, ...]
+    ) -> bool:
+        if lhs is None or len(lhs) != len(rhs):
+            return False
+        for left, right in zip(lhs, rhs, strict=True):
+            if not env.known_equal(left, right):
+                return False
+        return True
+
+    cond_arg = node.args[0]
+    output_val = node.meta.get("val")
+    if isinstance(cond_arg, Node) and isinstance(output_val, torch.Tensor):
+        cond_val = cond_arg.meta.get("val")
+        # Anchor boolean tensor layout before lowering to a numeric-mask select.
+        if isinstance(cond_val, torch.Tensor) and cond_val.dtype is torch.bool:
+            from .pallas import codegen as pallas_codegen
+
+            output_shape = cast("tuple[ShapeDim, ...]", tuple(output_val.size()))
+            branch_asts = ((node.args[1], x_ast), (node.args[2], y_ast))
+            layout_anchor = x_ast
+            for branch_arg, branch_ast in branch_asts:
+                if shapes_match(tensor_shape(branch_arg), output_shape):
+                    layout_anchor = branch_ast
+                    break
+            else:
+                for branch_arg, branch_ast in branch_asts:
+                    if tensor_shape(branch_arg) is not None:
+                        layout_anchor = branch_ast
+                        break
+
+            numeric_select = pallas_codegen.numeric_where_expr(
+                cond_ast,
+                x_ast,
+                y_ast,
+                output_val.dtype,
+                layout_anchor,
+            )
+            if numeric_select is not None:
+                return numeric_select
+            if not shapes_match(tuple(cond_val.size()), output_shape):
+                cond_ast = pallas_codegen.layout_tied_bf16_mask_expr(
+                    cond_ast,
+                    layout_anchor,
+                )
+                cond_ast = expr_from_string(
+                    "({cond}) == jnp.array(1, dtype=jnp.bfloat16)",
+                    cond=cond_ast,
+                )
+            else:
+                cond_ast = expr_from_string("({cond}) != 0", cond=cond_ast)
+
+    return expr_from_string(
+        env.backend.where_expr("{cond}", "{x}", "{y}"),
+        cond=cond_ast,
         x=x_ast,
         y=y_ast,
     )
@@ -301,20 +409,40 @@ unsqueeze_lowering = register_lowering(
 
 
 def _pallas_bool_safe_singleton_index(
-    tensor: ast.AST, input_val: torch.Tensor, args: list[str]
+    tensor: ast.AST,
+    input_val: torch.Tensor,
+    args: list[str],
+    singleton_shape: str | None = None,
 ) -> ast.AST:
     index = ", ".join(args)
     if input_val.dtype is torch.bool and "None" in args:
+        from .pallas import codegen as pallas_codegen
+
         # Mosaic cannot reshape bool vectors directly:
         # https://github.com/jax-ml/jax/issues/37370
+        if singleton_shape is not None:
+            return pallas_codegen.numeric_mask_reshape_expr(tensor, singleton_shape)
+        tensor = pallas_codegen.numeric_mask_expr(tensor)
         return expr_from_string(
-            f"(({{tensor}}).astype(jnp.int32)[{index}] != 0)",
+            f"{{tensor}}[{index}]",
             tensor=tensor,
         )
     return expr_from_string(
         f"{{tensor}}[{index}]",
         tensor=tensor,
     )
+
+
+def _pallas_singleton_shape(
+    input_val: torch.Tensor,
+    args: list[str],
+    ctx: LoweringContext,
+) -> str:
+    input_dims = iter(input_val.size())
+    shape: list[int | torch.SymInt] = []
+    for arg in args:
+        shape.append(1 if arg == "None" else next(input_dims))
+    return ctx.cg.device_function.tile_strategy.shape_str(shape)
 
 
 @unsqueeze_lowering.register_codegen("common")
@@ -352,7 +480,8 @@ def codegen_unsqueeze_pallas(ctx: LoweringContext, node: Node) -> object:
     assert 0 <= dim <= ndim, f"Invalid dim {dim} for tensor with {ndim} dims"
     args = [":"] * ndim
     args.insert(dim, "None")
-    return _pallas_bool_safe_singleton_index(tensor, input_val, args)
+    singleton_shape = _pallas_singleton_shape(input_val, args, ctx)
+    return _pallas_bool_safe_singleton_index(tensor, input_val, args, singleton_shape)
 
 
 @unsqueeze_lowering.register_codegen("cute")
@@ -662,10 +791,13 @@ def codegen_view_pallas(ctx: LoweringContext, node: Node) -> object:
     if isinstance(input_node, Node):
         input_val = input_node.meta.get("val")
         if isinstance(input_val, torch.Tensor) and input_val.dtype is torch.bool:
+            from .pallas import codegen as pallas_codegen
+
             # Mosaic cannot reshape bool vectors directly:
             # https://github.com/jax-ml/jax/issues/37370
+            tensor = pallas_codegen.numeric_mask_expr(tensor)
             return expr_from_string(
-                f"(jnp.reshape(({{tensor}}).astype(jnp.int32), {shape_str}) != 0)",
+                f"jnp.reshape({{tensor}}, {shape_str})",
                 tensor=tensor,
             )
     return expr_from_string(f"jnp.reshape({{tensor}}, {shape_str})", tensor=tensor)
@@ -995,7 +1127,14 @@ def codegen_expand_pallas(ctx: LoweringContext, node: Node) -> object:
             tuple(input_val.shape), tuple(shape)
         )
         if broadcasting:
-            tensor = _pallas_bool_safe_singleton_index(tensor, input_val, broadcasting)
+            singleton_shape = _pallas_singleton_shape(input_val, broadcasting, ctx)
+            tensor = _pallas_bool_safe_singleton_index(
+                tensor, input_val, broadcasting, singleton_shape
+            )
+    elif input_val.dtype is torch.bool:
+        from .pallas import codegen as pallas_codegen
+
+        tensor = pallas_codegen.numeric_mask_expr(tensor)
     shape_str = ctx.cg.device_function.tile_strategy.shape_str(shape)
     return expr_from_string(
         f"jnp.broadcast_to({{tensor}}, {shape_str})",
