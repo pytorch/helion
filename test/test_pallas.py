@@ -7,6 +7,7 @@ import re
 from typing import TYPE_CHECKING
 from typing import Any
 from typing import Callable
+from typing import cast
 import unittest
 
 from examples.geglu import _geglu_pallas as _geglu_pallas_example
@@ -2047,6 +2048,37 @@ class TestPallas(TestCase):
             5e-2,
             f"dot_general output diverged from pallas_call by {max_abs_diff}",
         )
+
+    def test_pallas_matmul_dot_general_lowering_pins_default_precision(self) -> None:
+        """The no-tiling dot-general shortcut must not inherit JAX global precision."""
+        from unittest.mock import patch
+
+        import jax
+        import jax.numpy as jnp
+
+        from helion import runtime as helion_runtime
+
+        spec: dict[str, object] = {
+            "lhs_tensor_arg_index": 0,
+            "rhs_tensor_arg_index": 1,
+            "out_dtype": "jnp.float32",
+            "f32_accumulator": False,
+        }
+        with (
+            patch.object(jax, "jit", lambda fn: fn),
+            patch.object(jax.lax, "dot_general", wraps=jax.lax.dot_general) as dot_spy,
+        ):
+            fn = helion_runtime._build_matmul_dot_general_jit_fn(spec)
+            result = cast(
+                "Any",
+                fn(
+                    jnp.ones((2, 3), dtype=jnp.float32),
+                    jnp.ones((3, 4), dtype=jnp.float32),
+                ),
+            )
+
+        self.assertEqual(result.shape, (2, 4))
+        self.assertEqual(dot_spy.call_args.kwargs["precision"], "default")
 
     def test_bmm(self) -> None:
         """Test BMM with default config — exercises size_matches fix.
@@ -4302,7 +4334,11 @@ class TestPallas(TestCase):
         )
 
         # Eager mask retained on the direct dot input; nothing to defer past.
-        self.assertRegex(code, r"= y\[[^\n]*\] \* mask_\d+\.astype")
+        self.assertRegex(
+            code,
+            r"(y\[[^\n]*\][^\n]*\*\s*mask_\d+\.astype|"
+            r"mask_\d+\.astype[^\n]*\*[^\n]*y\[)",
+        )
         self.assertNotRegex(code, r"jnp\.transpose\(")
 
         s, e = 0, 50

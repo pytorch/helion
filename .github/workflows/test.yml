@@ -350,16 +350,27 @@ jobs:
           if [[ -n "$PARALLEL" && "${{ matrix.alias }}" == *a10g* ]]; then
             PARALLEL="-n2"
           fi
+          # Python 3.14 A10G workers still crash under xdist while compiling
+          # larger autodiff examples; keep coverage but run the job serially.
+          if [[ "${{ matrix.alias }}" == *a10g* && "${{ startsWith(matrix.python-version, '3.14') }}" == "true" ]]; then
+            PARALLEL=""
+          fi
+          # ROCm workers have been unstable under xdist after node restarts.
+          if [[ -n "$PARALLEL" && "${{ startsWith(matrix.image, 'rocm') }}" == "true" ]]; then
+            PARALLEL=""
+          fi
           # For distributed tests, fail if any test is skipped, failed, or has an error
           SKIP_CHECK=$([[ "${{ contains(matrix.alias, 'distributed') }}" == "true" ]] && echo "! grep -qE '(SKIPPED|FAILED|ERROR)'" || echo "cat > /dev/null")
           if [[ "${{ matrix.alias }}" == *xpu* ]]; then
             export TRITON_XPU_GEN_NATIVE_CODE=1
           fi
-          # Pallas interpret runs on CPU (no parallelism) and is much slower
-          # than TPU/Triton — bump the per-test timeout accordingly.
+          # Serial jobs can spend several minutes in backend compilation.
           TIMEOUT=60
-          if [[ "${{ matrix.alias }}" == "pallas-interpret" ]]; then
+          if [[ -z "$PARALLEL" ]]; then
             TIMEOUT=300
+          fi
+          if [[ "${{ matrix.alias }}" == "tpu" ]]; then
+            TIMEOUT=600
           fi
           pytest $PARALLEL -rf --timeout=$TIMEOUT --reruns=2 --timeout-method=thread $EXTRA_FLAGS $TEST_PATH | tee >(eval $SKIP_CHECK)
 

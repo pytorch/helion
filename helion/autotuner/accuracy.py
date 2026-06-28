@@ -4,24 +4,14 @@ import torch
 from torch.utils._pytree import tree_flatten
 from torch.utils._pytree import tree_map_only
 
-_FP8_DTYPES = {
-    torch.float8_e4m3fn,
-    torch.float8_e5m2,
-    torch.float8_e4m3fnuz,
-    torch.float8_e5m2fnuz,
-    torch.float8_e8m0fnu,
-}
-
-
-def is_fp8_dtype(dtype: torch.dtype) -> bool:
-    return dtype in _FP8_DTYPES
+from .._compiler.dtype_utils import is_fp8_dtype
 
 
 def assert_close(actual: object, expected: object, atol: float, rtol: float) -> None:
     """Like torch.testing.assert_close, with fp8 and large tensor handling."""
 
     def convert(t: torch.Tensor) -> torch.Tensor:
-        return t.view(torch.uint8) if t.dtype in _FP8_DTYPES else t
+        return t.view(torch.uint8) if is_fp8_dtype(t.dtype) else t
 
     actual_flat, actual_spec = tree_flatten(
         tree_map_only(torch.Tensor, convert, actual)

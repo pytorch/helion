@@ -145,6 +145,7 @@ def check(m: int, k: int, n: int) -> None:
     # fp32, while torch.matmul uses a single full-K dot. The different
     # accumulation order can move a few outputs across a bf16 rounding boundary.
     max_mismatch_pct = 1e-4 if _get_backend() == "pallas" else None
+    max_mismatched_abs_diff = 0.5 if max_mismatch_pct is not None else None
 
     x = torch.randn([m, k], device=DEVICE, dtype=torch.bfloat16)
     w = torch.randint(-(2**15), 2**15 - 1, (k, n), device=DEVICE, dtype=torch.int16)
@@ -155,6 +156,7 @@ def check(m: int, k: int, n: int) -> None:
         rtol=1e-2,
         atol=1e-2,
         max_mismatch_pct=max_mismatch_pct,
+        max_mismatched_abs_diff=max_mismatched_abs_diff,
     )
 
     x_int16 = torch.randint(
@@ -168,6 +170,7 @@ def check(m: int, k: int, n: int) -> None:
         rtol=1e-2,
         atol=1e-2,
         max_mismatch_pct=max_mismatch_pct,
+        max_mismatched_abs_diff=max_mismatched_abs_diff,
     )
 
 
