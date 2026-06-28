@@ -25,8 +25,10 @@ import torch
 
 import helion
 from helion._testing import DEVICE
+from helion._testing import LONG_INT_TYPE
 from helion._testing import run_example
 import helion.language as hl
+from helion.runtime.settings import _get_backend
 
 # %%
 # Jagged Layer Norm Kernel
@@ -35,7 +37,7 @@ import helion.language as hl
 
 # %%
 @helion.kernel(autotune_effort="none")
-def jagged_layer_norm_kernel(
+def _jagged_layer_norm_kernel_default(
     x_values: torch.Tensor,  # [total_L, M] - compressed values
     x_offsets: torch.Tensor,  # [B+1] - sequence start offsets
     eps: float = 1e-6,
@@ -117,6 +119,64 @@ def jagged_layer_norm_kernel(
     return out.reshape(total_L, M)
 
 
+@helion.kernel(autotune_effort="none")
+def _jagged_layer_norm_kernel_pallas(
+    x_values: torch.Tensor,  # [total_L, M] - compressed values
+    x_offsets: torch.Tensor,  # [B+1] - sequence start offsets
+    eps: float = 1e-6,
+) -> torch.Tensor:
+    """
+    Compute jagged layer normalization with structural Pallas stores.
+
+    Pallas does not support the flat scatter pattern used by the default
+    implementation, so this variant tiles each packed sequence directly.
+    """
+    _total_L, M = x_values.shape
+    B = x_offsets.size(0) - 1
+    out = torch.empty_like(x_values)
+
+    for b in hl.grid(B):
+        start = x_offsets[b]
+        end = x_offsets[b + 1]
+        seq_len = end - start
+
+        if seq_len != 0:
+            count = (seq_len * M).to(torch.float32)
+
+            mean_acc = hl.zeros([1], dtype=torch.float32)
+            for tile_k in hl.tile(start, end, block_size=16):
+                for tile_m in hl.tile(0, M):
+                    x_slice = x_values[tile_k, tile_m].to(torch.float32)
+                    mean_acc = mean_acc + x_slice.sum(dim=0).sum(dim=0).unsqueeze(0)
+            mean = mean_acc / count
+
+            var_acc = hl.zeros([1], dtype=torch.float32)
+            for tile_k in hl.tile(start, end, block_size=16):
+                for tile_m in hl.tile(0, M):
+                    x_slice = x_values[tile_k, tile_m].to(torch.float32)
+                    centered = x_slice - mean
+                    var_acc = var_acc + (centered * centered).sum(dim=0).sum(
+                        dim=0
+                    ).unsqueeze(0)
+            variance = var_acc / count
+            rstd = torch.rsqrt(variance + eps)
+
+            for tile_k in hl.tile(start, end, block_size=1):
+                for tile_m in hl.tile(0, M):
+                    x_slice = x_values[tile_k, tile_m].to(torch.float32)
+                    normalized = (x_slice - mean) * rstd
+                    out[tile_k, tile_m] = normalized.to(x_values.dtype)
+
+    return out
+
+
+jagged_layer_norm_kernel = (
+    _jagged_layer_norm_kernel_pallas
+    if _get_backend() == "pallas"
+    else _jagged_layer_norm_kernel_default
+)
+
+
 # %%
 # Reference Implementation
 # ------------------------
@@ -191,13 +251,15 @@ def create_test_jagged_tensor(
     """Create test jagged tensor data."""
 
     # Generate random sequence lengths
-    seq_lengths = torch.randint(1, max_seqlen + 1, (B,), device=device)
+    seq_lengths = torch.randint(
+        1, max_seqlen + 1, (B,), dtype=LONG_INT_TYPE, device=device
+    )
 
     # Create offsets
     x_offsets = torch.cat(
         [
-            torch.zeros(1, dtype=torch.long, device=device),
-            torch.cumsum(seq_lengths, dim=0),
+            torch.zeros(1, dtype=LONG_INT_TYPE, device=device),
+            torch.cumsum(seq_lengths, dim=0).to(LONG_INT_TYPE),
         ]
     )
 
