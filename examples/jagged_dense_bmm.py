@@ -35,12 +35,14 @@ import torch
 
 import helion
 from helion._testing import DEVICE
+from helion._testing import LONG_INT_TYPE
 from helion._testing import run_example
 import helion.language as hl
+from helion.runtime.settings import _get_backend
 
 
 @helion.kernel()
-def jagged_dense_bmm(
+def _jagged_dense_bmm(
     seq_offsets: torch.Tensor,
     jagged: torch.Tensor,
     dense: torch.Tensor,
@@ -88,6 +90,44 @@ def jagged_dense_bmm(
     return output.reshape(L, K)
 
 
+@helion.kernel()
+def _jagged_dense_bmm_pallas(
+    seq_offsets: torch.Tensor,
+    jagged: torch.Tensor,
+    dense: torch.Tensor,
+    bias: torch.Tensor | None,
+) -> torch.Tensor:
+    """Tile real packed row ranges directly to avoid flat jagged scatter on Pallas."""
+    L, D = jagged.shape
+    B, D, K = dense.shape
+    dtype = torch.promote_types(jagged.dtype, dense.dtype)
+    device = jagged.device
+
+    output = torch.empty((L, K), dtype=dtype, device=device)
+    for b in hl.grid(B):
+        start = seq_offsets[b]
+        end = seq_offsets[b + 1]
+
+        for tile_rows in hl.tile(start, end):
+            for tile_k in hl.tile(0, K):
+                acc = hl.zeros([tile_rows, tile_k], dtype=dtype, device=device)
+                for tile_d in hl.tile(0, D):
+                    jagged_data = jagged[tile_rows, tile_d]
+                    dense_data = dense[b, tile_d, tile_k]
+                    acc = acc + torch.matmul(jagged_data, dense_data)
+
+                if bias is not None:
+                    acc = acc + bias[b, tile_k].unsqueeze(0)
+
+                output[tile_rows, tile_k] = acc
+    return output
+
+
+jagged_dense_bmm = (
+    _jagged_dense_bmm_pallas if _get_backend() == "pallas" else _jagged_dense_bmm
+)
+
+
 def jagged_dense_bmm_reference(
     seq_offsets: torch.Tensor,
     jagged: torch.Tensor,
@@ -127,9 +167,11 @@ def random_input(
     max_seq_len: int = 3,
     dtype: torch.dtype = torch.float32,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    lengths = torch.randint(max_seq_len + 1, size=(batch_size,), device=DEVICE)
-    seq_offsets = torch.zeros((batch_size + 1,), dtype=torch.int64, device=DEVICE)
-    seq_offsets[1:] = torch.cumsum(lengths, dim=0)
+    lengths = torch.randint(
+        max_seq_len + 1, size=(batch_size,), device=DEVICE, dtype=LONG_INT_TYPE
+    )
+    seq_offsets = torch.zeros((batch_size + 1,), dtype=LONG_INT_TYPE, device=DEVICE)
+    seq_offsets[1:] = torch.cumsum(lengths, dim=0, dtype=LONG_INT_TYPE)
     jagged_size = int(seq_offsets[-1].item())
     jagged = (
         torch.empty((jagged_size, D), dtype=dtype, device=DEVICE)
