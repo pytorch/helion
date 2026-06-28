@@ -19,13 +19,14 @@ from helion._testing import DEVICE
 from helion._testing import HALF_DTYPE
 from helion._testing import run_example
 import helion.language as hl
+from helion.runtime.settings import _get_backend
 
 
 # %%
 # Helion Kernel Implementation
 # ----------------------------
 @helion.kernel()
-def helion_mamba2_chunk_scan_kernel(
+def _helion_mamba2_chunk_scan_kernel_scalar(
     cb: torch.Tensor,
     x: torch.Tensor,
     dt: torch.Tensor,
@@ -141,6 +142,151 @@ def helion_mamba2_chunk_scan_kernel(
         ] = acc_o.to(dtype=dtype)
 
     return out
+
+
+@helion.kernel()
+def _helion_mamba2_chunk_scan_kernel_pallas(
+    cb: torch.Tensor,
+    x: torch.Tensor,
+    dt: torch.Tensor,
+    dA_cumsum: torch.Tensor,
+    C: torch.Tensor,
+    prev_states: torch.Tensor,
+    D: torch.Tensor,
+) -> torch.Tensor:
+    """
+    Pallas implementation that computes an aligned block of heads per program.
+
+    TPU Mosaic cannot lower bf16 stores to a scalar middle ``nheads`` lane.
+    Owning a head block keeps the output store structural while preserving the
+    scalar-head implementation for non-Pallas backends.
+    """
+
+    batch, nchunks, ngroups, chunk_size, _ = cb.shape
+    _, seqlen, nheads, headdim = x.shape
+    _, _, _, dstate = C.shape
+    assert nchunks == (seqlen + chunk_size - 1) // chunk_size
+    assert nheads % ngroups == 0
+
+    nheads = hl.specialize(nheads)
+    ngroups = hl.specialize(ngroups)
+    heads_per_group = hl.specialize(nheads // ngroups)
+    block_h_value = min(8, heads_per_group)
+    assert ngroups == 1 or heads_per_group % 8 == 0
+
+    block_h = hl.register_block_size(block_h_value)
+    block_m = hl.register_block_size(chunk_size)
+    block_n = hl.register_block_size(headdim)
+    block_k = hl.register_block_size(64, 64)
+    dstate = hl.specialize(dstate)
+
+    assert cb.shape == (batch, nchunks, ngroups, chunk_size, chunk_size)
+    assert x.shape == (batch, seqlen, nheads, headdim)
+    assert dt.shape == (batch, nheads, nchunks, chunk_size)
+    assert dA_cumsum.shape == (batch, nheads, nchunks, chunk_size)
+    assert C.shape == (batch, seqlen, ngroups, dstate)
+    assert prev_states.shape == (batch, nchunks, nheads, headdim, dstate)
+    assert D.shape == (nheads,)
+
+    dtype = cb.dtype
+    accum_dtype = torch.float32
+    assert (
+        x.dtype
+        == dt.dtype
+        == dA_cumsum.dtype
+        == C.dtype
+        == prev_states.dtype
+        == D.dtype
+        == dtype
+    )
+
+    out = torch.empty_like(x)
+
+    p = 1.44269504
+
+    for tile_g, tile_h, tile_m, tile_n, tile_b, tile_c in hl.tile(
+        [ngroups, heads_per_group, chunk_size, headdim, batch, nchunks],
+        block_size=[1, block_h, block_m, block_n, 1, 1],
+    ):
+        heads = tile_g.begin * heads_per_group + tile_h.index
+        acc_o = hl.zeros([tile_h, tile_m, tile_n], dtype=accum_dtype)
+        dA_cumsum_local_m = dA_cumsum[tile_b.begin, heads, tile_c.begin, tile_m].to(
+            accum_dtype
+        )
+        scale_m_local = torch.exp2(dA_cumsum_local_m * p)
+
+        C_local = C[
+            tile_b.begin,
+            tile_m.index + tile_c.begin * chunk_size,
+            tile_g.begin,
+            :,
+        ]
+        C_local = C_local[None, :, :] + hl.zeros([tile_h, tile_m, dstate], dtype=dtype)
+        prev_states_local = prev_states[tile_b.begin, tile_c.begin, heads, tile_n, :]
+        acc_o = acc_o + torch.bmm(
+            C_local.to(accum_dtype),
+            prev_states_local.transpose(1, 2).to(accum_dtype),
+        )
+        acc_o *= scale_m_local[:, :, None]
+
+        for tile_k in hl.tile((tile_m.id + 1) * block_m, block_size=block_k):
+            cb_local = cb[
+                tile_b.begin,
+                tile_c.begin,
+                tile_g.begin,
+                tile_m,
+                tile_k,
+            ]
+            cb_local = cb_local[None, :, :] + hl.zeros(
+                [tile_h, tile_m, tile_k], dtype=dtype
+            )
+            dA_cumsum_local_k = dA_cumsum[tile_b.begin, heads, tile_c.begin, tile_k].to(
+                accum_dtype
+            )
+            cb_local *= torch.exp2(
+                dA_cumsum_local_m[:, :, None] * p - dA_cumsum_local_k[:, None, :] * p
+            )
+            dt_local = dt[tile_b.begin, heads, tile_c.begin, tile_k].to(accum_dtype)
+            cb_local = (cb_local * dt_local[:, None, :]).to(dtype)
+            pred = (tile_m.index + 0)[:, None] >= (tile_k.index + 0)[None, :]
+            cb_local = torch.where(
+                pred[None, :, :], cb_local, torch.zeros_like(cb_local)
+            )
+            x_local = x[
+                tile_b.begin,
+                tile_c.begin * chunk_size + tile_k.index,
+                heads,
+                tile_n,
+            ].transpose(0, 1)
+            acc_o = acc_o + torch.bmm(cb_local.to(accum_dtype), x_local.to(accum_dtype))
+
+        D_local = D[heads].to(accum_dtype)
+        x_residual = (
+            x[
+                tile_b.begin,
+                tile_c.begin * chunk_size + tile_m.index,
+                heads,
+                tile_n,
+            ]
+            .transpose(0, 1)
+            .to(accum_dtype)
+        )
+        acc_o += x_residual * D_local[:, None, None]
+        out[
+            tile_b.begin,
+            tile_c.begin * chunk_size + tile_m.index,
+            heads,
+            tile_n,
+        ] = acc_o.transpose(0, 1).to(dtype=dtype)
+
+    return out
+
+
+helion_mamba2_chunk_scan_kernel = (
+    _helion_mamba2_chunk_scan_kernel_pallas
+    if _get_backend() == "pallas"
+    else _helion_mamba2_chunk_scan_kernel_scalar
+)
 
 
 # %%
