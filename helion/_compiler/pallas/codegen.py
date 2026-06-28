@@ -37,17 +37,200 @@ def load_expr(
         if isinstance(pattern, IndirectGatherPattern):
             return emit_gather(state, pattern.plan, name)
 
-    idx_str, none_dims = index_str(state, subscript, tensor)
+    parts, none_dims = index_parts(state, subscript, tensor)
+    parts, post_load_selects, post_load_rank = _widen_small_aligned_scalar_load_indices(
+        state, subscript, tensor, parts
+    )
+    idx_str = ", ".join(parts)
     mask_expr = _load_mask_expr(state, subscript, tensor)
+    result = expr_from_string(f"{name}[{idx_str}]")
+    result = _pad_clamped_load_expr(state, subscript, tensor, parts, result)
+    result = _select_widened_scalar_load_indices(
+        result, post_load_selects, post_load_rank
+    )
     if mask_expr is not None:
-        result = expr_from_string(f"{name}[{idx_str}] * ({mask_expr})")
-    else:
-        result = expr_from_string(f"{name}[{idx_str}]")
+        result = expr_from_string(f"{{result}} * ({mask_expr})", result=result)
     for dim in none_dims:
         result = expr_from_string(
             f"jnp.expand_dims({{result}}, axis={dim})", result=result
         )
     return result
+
+
+def _index_part_produces_value_dim(index_part: str) -> bool:
+    return index_part == ":" or index_part.startswith(("pl.ds(", "slice("))
+
+
+def _widen_small_aligned_scalar_load_indices(
+    state: CodegenState,
+    subscript: list[object],
+    tensor: torch.Tensor,
+    index_parts: list[str],
+) -> tuple[list[str], list[tuple[int, str, int]], int]:
+    """Load small scalar-indexed VMEM dims as full dims, then select in registers."""
+    value_rank = sum(
+        _index_part_produces_value_dim(index_part) for index_part in index_parts
+    )
+    if _tensor_routed_to_dma_scratch(state, tensor):
+        return index_parts, [], value_rank
+
+    from helion._compiler.device_function import PallasMemorySpace
+
+    if (
+        state.device_function.pallas_memory_space.get(id(tensor))
+        == PallasMemorySpace.SMEM
+    ):
+        return index_parts, [], value_rank
+
+    from helion._compiler.backend import PallasBackend
+    from helion._compiler.compile_environment import CompileEnvironment
+    from helion._compiler.pallas.plan_tiling import ArbitraryIndexPattern
+    from helion._compiler.pallas.plan_tiling import TileBeginWithOffsetPattern
+
+    backend = CompileEnvironment.current().backend
+    assert isinstance(backend, PallasBackend)
+    patterns = _get_indexing_patterns(state, tensor)
+    adjusted = list(index_parts)
+    widened_selects: list[tuple[int, str, int]] = []
+    value_dim = 0
+    tensor_dim = 0
+    index_part_idx = 0
+
+    for idx, pattern in zip(subscript, patterns, strict=True):
+        if idx is None:
+            continue
+
+        index_part = adjusted[index_part_idx]
+        dim_size = tensor.shape[tensor_dim]
+        is_scalar = not _index_part_produces_value_dim(index_part)
+        can_widen = False
+        if (
+            is_scalar
+            and isinstance(dim_size, int)
+            and dim_size > 1
+            and isinstance(pattern, (ArbitraryIndexPattern, TileBeginWithOffsetPattern))
+        ):
+            dim_from_end = tensor.ndim - tensor_dim - 1
+            bitwidth = tensor.dtype.itemsize * 8
+            required_alignment = backend._get_pallas_required_alignment(
+                dim_from_end, tensor.ndim, bitwidth
+            )
+            can_widen = required_alignment > 1 and dim_size <= required_alignment
+            if can_widen:
+                index_part = _normalize_static_scalar_index(index_part, dim_size)
+                can_widen = index_part is not None
+
+        if can_widen:
+            adjusted[index_part_idx] = ":"
+            assert index_part is not None
+            widened_selects.append((value_dim, index_part, dim_size))
+            value_dim += 1
+        elif index_part is not None and _index_part_produces_value_dim(index_part):
+            value_dim += 1
+
+        tensor_dim += 1
+        index_part_idx += 1
+
+    return adjusted, widened_selects, value_dim
+
+
+def _normalize_static_scalar_index(index_part: str, dim_size: int) -> str | None:
+    try:
+        index = int(index_part)
+    except ValueError:
+        return index_part
+    if index < 0:
+        index += dim_size
+    if 0 <= index < dim_size:
+        return str(index)
+    return None
+
+
+def _select_widened_scalar_load_indices(
+    value: ast.AST,
+    widened_selects: list[tuple[int, str, int]],
+    rank: int,
+) -> ast.AST:
+    result = value
+    for axis, index_expr, dim_size in sorted(widened_selects, reverse=True):
+        lane_index = [":"] * rank
+        lane_index[axis] = "0"
+        selected = expr_from_string(
+            f"{{result}}[{', '.join(lane_index)}]",
+            result=result,
+        )
+        for lane in range(1, dim_size):
+            lane_index[axis] = str(lane)
+            lane_value = expr_from_string(
+                f"{{result}}[{', '.join(lane_index)}]",
+                result=result,
+            )
+            selected = expr_from_string(
+                f"jnp.where(({index_expr}) == {lane}, {{lane_value}}, {{selected}})",
+                lane_value=lane_value,
+                selected=selected,
+            )
+        result = selected
+        rank -= 1
+    return result
+
+
+def _pad_clamped_load_expr(
+    state: CodegenState,
+    subscript: list[object],
+    tensor: torch.Tensor,
+    index_parts: list[str],
+    value: ast.AST,
+) -> ast.AST:
+    """Pad BlockSpec-clamped Pallas loads back to their logical tile shape."""
+    from helion._compiler.compile_environment import CompileEnvironment
+    from helion._compiler.pallas.plan_tiling import ArbitraryIndexPattern
+    from helion._compiler.pallas.plan_tiling import TileBeginWithOffsetPattern
+    from helion._compiler.pallas.plan_tiling import TilePattern
+
+    if _tensor_routed_to_dma_scratch(state, tensor):
+        return value
+
+    env = CompileEnvironment.current()
+    indexing_patterns = _get_indexing_patterns(state, tensor)
+    pads: list[tuple[int, int]] = []
+    needs_pad = False
+    tensor_dim = 0
+    index_part_idx = 0
+
+    for idx, pattern in zip(subscript, indexing_patterns, strict=True):
+        if idx is None:
+            continue
+
+        index_part = index_parts[index_part_idx]
+        index_part_idx += 1
+
+        if isinstance(pattern, TilePattern) and index_part == ":":
+            block_size = env.block_sizes[pattern.block_id].from_config(state.config)
+            dim_size = tensor.shape[tensor_dim]
+            if (
+                isinstance(block_size, int)
+                and isinstance(dim_size, int)
+                and 1 < dim_size < block_size
+            ):
+                pads.append((0, block_size - dim_size))
+                needs_pad = True
+            else:
+                pads.append((0, 0))
+        else:
+            produces_value_dim = index_part == ":" or index_part.startswith("pl.ds(")
+            produces_value_dim = produces_value_dim or not isinstance(
+                pattern, (ArbitraryIndexPattern, TileBeginWithOffsetPattern)
+            )
+            if produces_value_dim:
+                pads.append((0, 0))
+
+        tensor_dim += 1
+
+    if not needs_pad:
+        return value
+
+    return expr_from_string(f"jnp.pad({{value}}, {pads!r})", value=value)
 
 
 def _load_mask_expr(
@@ -171,13 +354,10 @@ def _find_dma_scratch_loop(
     return next(_iter_dma_scratch_loops(state, name), (None, name))
 
 
-def _tensor_routed_to_fori_scratch(state: CodegenState, tensor: torch.Tensor) -> bool:
-    """True if ``tensor``'s store destination ref is a fori_loop DMA scratch."""
-    from helion._compiler.tile_strategy import ForiLoopState
-
+def _tensor_routed_to_dma_scratch(state: CodegenState, tensor: torch.Tensor) -> bool:
     name = state.codegen.device_function.tensor_arg(tensor).name
     loop, _ref = _find_dma_scratch_loop(state, name)
-    return isinstance(loop, ForiLoopState)
+    return loop is not None
 
 
 def sliced_value_for_store(
@@ -198,9 +378,9 @@ def sliced_value_for_store(
     generated Pallas index.  Dimensions indexed via ``pl.ds()`` are padded
     instead of clamped, so they must keep their full block-size value.
 
-    fori_loop-scratch stores are exempt: their destination is a block-sized
+    Pipeline/DMA scratch stores are exempt: their destination is a block-sized
     VMEM scratch (not a clamped ref), so the value stays block-shaped and the
-    writeback DMA clamps the extent instead (see ``_build_dma_slices``).
+    writeback path clamps the HBM extent instead.
     """
     from helion._compiler.compile_environment import CompileEnvironment
     from helion._compiler.pallas.plan_tiling import TilePattern
@@ -210,7 +390,7 @@ def sliced_value_for_store(
     if patterns is None:
         return value
 
-    if _tensor_routed_to_fori_scratch(state, tensor):
+    if _tensor_routed_to_dma_scratch(state, tensor):
         return value
 
     env = CompileEnvironment.current()
@@ -329,10 +509,14 @@ def index_parts(
     # their outer BlockSpec and fall through to pl.ds().
     tensor_name = state.codegen.device_function.tensor_arg(tensor).name
     in_pipeline = False
-    pipeline_block_ids: set[int] = set()
+    dma_block_ids: set[int] = set()
     for loop, _ref in _iter_dma_scratch_loops(state, tensor_name):
         in_pipeline = True
-        pipeline_block_ids.update(loop.block_ids)
+        block_id_mapping = getattr(loop, "_tensor_to_dma_block_ids", None)
+        if block_id_mapping and tensor_name in block_id_mapping:
+            dma_block_ids.update(block_id_mapping[tensor_name])
+        else:
+            dma_block_ids.update(loop.block_ids)
 
     # Use pre-computed indexing patterns from plan_tiling analysis
     indexing_patterns = _get_indexing_patterns(state, tensor)
@@ -351,7 +535,7 @@ def index_parts(
 
         # Generate code based on the pattern type
         index_code = _generated_index_code(
-            pattern, idx, state, tensor, i, tensor_dim, in_pipeline, pipeline_block_ids
+            pattern, idx, state, tensor, i, tensor_dim, in_pipeline, dma_block_ids
         )
         parts.append(index_code)
 
@@ -393,7 +577,7 @@ def _generated_index_code(
     subscript_index: int,
     tensor_dim: int,
     in_pipeline: bool,
-    pipeline_block_ids: set[int],
+    dma_block_ids: set[int],
 ) -> str:
     """Generate index code based on the indexing pattern."""
     from helion._compiler.pallas.plan_tiling import ArbitraryIndexPattern
@@ -406,17 +590,17 @@ def _generated_index_code(
 
     if isinstance(pattern, TilePattern):
         return _tile_pattern_code(
-            pattern, idx, state, tensor, tensor_dim, in_pipeline, pipeline_block_ids
+            pattern, idx, state, tensor, tensor_dim, in_pipeline, dma_block_ids
         )
 
     if isinstance(pattern, TileIndexWithOffsetPattern):
         return _tile_index_with_offset_pattern_code(
-            pattern, state, tensor, tensor_dim, in_pipeline, pipeline_block_ids
+            pattern, state, tensor, tensor_dim, in_pipeline, dma_block_ids
         )
 
     if isinstance(pattern, TileBeginWithOffsetPattern):
         return _tile_begin_with_offset_pattern_code(
-            pattern, state, subscript_index, tensor_dim, in_pipeline, pipeline_block_ids
+            pattern, state, subscript_index, tensor_dim, in_pipeline, dma_block_ids
         )
 
     if isinstance(pattern, ArbitrarySlicePattern):
@@ -453,7 +637,7 @@ def _tile_pattern_code(
     tensor: torch.Tensor,
     tensor_dim: int,
     in_pipeline: bool,
-    pipeline_block_ids: set[int],
+    dma_block_ids: set[int],
 ) -> str:
     from helion._compiler.pallas.plan_tiling import TilePattern
     from helion._compiler.tile_strategy import DeviceLoopState
@@ -470,7 +654,7 @@ def _tile_pattern_code(
     # TODO(yifeixu): the long-term fix is making ``can_tile`` per-loop-scope
     # instead of per-tensor-dim so the planner doesn't mark this dim
     # untileable in pipeline mode in the first place.
-    if in_pipeline:
+    if in_pipeline and block_id in dma_block_ids:
         return ":"
 
     can_tile = _can_tile_dimension(state, tensor_dim)
@@ -495,7 +679,7 @@ def _tile_index_with_offset_pattern_code(
     tensor: torch.Tensor,
     tensor_dim: int,
     in_pipeline: bool,
-    pipeline_block_ids: set[int],
+    dma_block_ids: set[int],
 ) -> str:
     from helion._compiler.pallas.plan_tiling import TileIndexWithOffsetPattern
 
@@ -512,7 +696,7 @@ def _tile_begin_with_offset_pattern_code(
     subscript_index: int,
     tensor_dim: int,
     in_pipeline: bool,
-    pipeline_block_ids: set[int],
+    dma_block_ids: set[int],
 ) -> str:
     from helion._compiler.pallas.plan_tiling import TileBeginWithOffsetPattern
     from helion._compiler.tile_strategy import DeviceLoopState
@@ -522,7 +706,7 @@ def _tile_begin_with_offset_pattern_code(
     block_id = pattern.block_id
     offset_str = state.device_function.literal_expr(pattern.offset)
 
-    if in_pipeline and block_id in pipeline_block_ids:
+    if in_pipeline and block_id in dma_block_ids:
         return offset_str
 
     can_tile = _can_tile_dimension(state, tensor_dim)
@@ -563,20 +747,40 @@ def _slice_code(
     from helion._compiler.tile_strategy import DeviceLoopState
 
     assert isinstance(pattern, ArbitrarySlicePattern)
+    slice_idx = pattern.slice
 
-    if idx != slice(None):
+    if slice_idx.step not in (None, 1):
         raise AssertionError(
-            f"Arbitrary slice expr {slice} not supported in Pallas backend yet"
+            f"Only unit-step slices are supported in Pallas, got {slice_idx}"
         )
+    full_slice = slice_idx.start is None and slice_idx.stop is None
 
     env = CompileEnvironment.current()
     block_id = env.resolve_block_id(tensor.shape[tensor_dim])
-    if block_id is not None:
+    if full_slice and block_id is not None:
         loops = state.codegen.active_device_loops.get(block_id)
         if loops and any(isinstance(loop, DeviceLoopState) for loop in loops):
             return _ds_expr(state, block_id, tensor=tensor, tensor_dim=tensor_dim)
 
-    return ":"
+    if full_slice:
+        return ":"
+
+    def bound_expr(value: object) -> str:
+        if value is None:
+            return "None"
+        if isinstance(value, int) and value >= 0:
+            return repr(value)
+        if isinstance(value, torch.SymInt):
+            expr = env.specialize_expr(env.shape_env.replace(value._sympy_()))
+            if not expr.free_symbols and getattr(expr, "is_integer", None) is True:
+                concrete = int(expr)
+                if concrete >= 0:
+                    return repr(concrete)
+        raise AssertionError(
+            f"Only static slice bounds are supported in Pallas, got {slice_idx}"
+        )
+
+    return f"slice({bound_expr(slice_idx.start)}, {bound_expr(slice_idx.stop)})"
 
 
 def _is_compact_aligned_load(

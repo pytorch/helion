@@ -49,6 +49,10 @@ if TYPE_CHECKING:
     ShapeLike = Sequence[SymIntLike]
 
 
+def _ceil_sympy_expr(expr: sympy.Expr) -> sympy.Expr:
+    return cast("sympy.Expr", sympy.ceiling(expr))
+
+
 class ThreadAxisTracker:
     """Tracks thread axis assignments for block dimensions during codegen."""
 
@@ -1861,6 +1865,9 @@ class EmitPipelineLoopState(DeviceLoopOrGridState):
     outer_prefix: list[ast.AST] = dataclasses.field(default_factory=list)
     outer_suffix: list[ast.AST] = dataclasses.field(default_factory=list)
     _tensor_to_dma_scratch: dict[str, str] = dataclasses.field(default_factory=dict)
+    _tensor_to_dma_block_ids: dict[str, set[int]] = dataclasses.field(
+        default_factory=dict
+    )
 
 
 @dataclasses.dataclass
@@ -1879,6 +1886,9 @@ class ForiLoopState(DeviceLoopOrGridState):
     outer_prefix: list[ast.AST] = dataclasses.field(default_factory=list)
     outer_suffix: list[ast.AST] = dataclasses.field(default_factory=list)
     _tensor_to_dma_scratch: dict[str, str] = dataclasses.field(default_factory=dict)
+    _tensor_to_dma_block_ids: dict[str, set[int]] = dataclasses.field(
+        default_factory=dict
+    )
     _tensor_to_sem: dict[str, str] = dataclasses.field(default_factory=dict)
 
 
@@ -2600,7 +2610,7 @@ class FlattenedTileStrategy(BlockSizeTileStrategy):
                 f"({self._expr_str(step)}) - 1) // ({self._expr_str(step)})"
             )
         if diff_expr is not None:
-            return sympy.ceiling(sympy.Mul(diff_expr, sympy.Pow(step_expr, -1)))
+            return _ceil_sympy_expr(sympy.Mul(diff_expr, sympy.Pow(step_expr, -1)))
         return (
             f"((({self._expr_str(end)}) - ({self._expr_str(begin)})) + "
             f"({self._expr_str(step)}) - 1) // ({self._expr_str(step)})"
@@ -3217,7 +3227,7 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
                 f"({self._expr_str(step)}) - 1) // ({self._expr_str(step)})"
             )
         if diff_expr is not None:
-            return sympy.ceiling(sympy.Mul(diff_expr, sympy.Pow(step_expr, -1)))
+            return _ceil_sympy_expr(sympy.Mul(diff_expr, sympy.Pow(step_expr, -1)))
         return (
             f"((({self._expr_str(end)}) - ({self._expr_str(begin)})) + "
             f"({self._expr_str(step)}) - 1) // ({self._expr_str(step)})"

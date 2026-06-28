@@ -947,6 +947,73 @@ class TestPallas(TestCase):
                 pallas_loop_type="fori_loop",
             )
 
+    def test_emit_pipeline_last_two_dim_ragged_store_rejected(self) -> None:
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def ragged_last_two_dim(
+            x: torch.Tensor, starts: torch.Tensor, ends: torch.Tensor
+        ) -> torch.Tensor:
+            out = torch.empty_like(x)
+            n = starts.size(0)
+            for g in hl.grid(n):
+                st = starts[g]
+                en = ends[g]
+                for tile in hl.tile(st, en):
+                    out[tile, :] = x[tile, :] + 1.0
+            return out
+
+        x = torch.randn(8, 128, device=DEVICE, dtype=torch.float32)
+        starts = torch.tensor([0, 4], dtype=torch.int32, device=DEVICE)
+        ends = torch.tensor([4, 8], dtype=torch.int32, device=DEVICE)
+        with self.assertRaisesRegex(Exception, "lane/sublane"):
+            code_and_output(
+                ragged_last_two_dim,
+                (x, starts, ends),
+                block_sizes=[8],
+                pallas_loop_type="emit_pipeline",
+            )
+
+    def test_emit_pipeline_last_two_dim_static_begin_dynamic_end_store_rejected(
+        self,
+    ) -> None:
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def static_begin_dynamic_end(
+            x: torch.Tensor, lengths: torch.Tensor
+        ) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for seg in hl.grid(lengths.size(0)):
+                end = lengths[seg]
+                for tile in hl.tile(0, end):
+                    out[tile, :] = x[tile, :] + 1.0
+            return out
+
+        x = torch.randn(8, 128, device=DEVICE, dtype=torch.float32)
+        lengths = torch.tensor([4], dtype=torch.int32, device=DEVICE)
+        with self.assertRaisesRegex(Exception, "lane/sublane"):
+            code_and_output(
+                static_begin_dynamic_end,
+                (x, lengths),
+                block_sizes=[8],
+                pallas_loop_type="emit_pipeline",
+            )
+
+    def test_emit_pipeline_last_two_dim_static_subrange_store_rejected(self) -> None:
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def static_subrange(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for _seg in hl.grid(1):
+                for tile in hl.tile(0, 8):
+                    out[tile, :] = x[tile, :] + 1.0
+            return out
+
+        x = torch.randn(16, 128, device=DEVICE, dtype=torch.float32)
+        with self.assertRaisesRegex(Exception, "lane/sublane"):
+            code_and_output(
+                static_subrange,
+                (x,),
+                block_sizes=[8],
+                pallas_loop_type="emit_pipeline",
+            )
+
     @unittest.expectedFailure  # nested-scratch resolution bug; see _find_dma_scratch_loop TODO
     def test_fori_loop_nested_same_tensor_scratch_miscompiles(self) -> None:
         """Nested fori_loops that scratch-route the same tensor miscompile.
@@ -2121,6 +2188,109 @@ class TestPallas(TestCase):
         expected = torch.bmm(a.float(), b.float()).to(torch.bfloat16)
         torch.testing.assert_close(result, expected, rtol=1e-2, atol=1e-2)
 
+    @xfailIfPallasInterpret("emit_pipeline dynamic slices need real TPU Pallas")
+    def test_emit_pipeline_store_keeps_block_sized_outer_tile(self) -> None:
+        x = torch.randn(2, 8, 128, device=DEVICE, dtype=torch.float32)
+        y = torch.randn(2, 8, 128, device=DEVICE, dtype=torch.float32)
+        code, result = code_and_output(
+            pallas_add_3d,
+            (x, y),
+            block_sizes=[4, 8, 128],
+            pallas_loop_type="emit_pipeline",
+        )
+        self.assertIn("pltpu.emit_pipeline", code)
+        torch.testing.assert_close(result, x + y)
+
+    def test_full_slice_and_tile_share_dimension(self) -> None:
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def fn(x: torch.Tensor) -> torch.Tensor:
+            m, n = x.size()
+            out = torch.empty_like(x)
+            for tile_m, tile_n in hl.tile([m, n]):
+                out[tile_m, tile_n] = x[tile_m, tile_n] + x[tile_m, :].sum(
+                    dim=1,
+                    keepdim=True,
+                )
+            return out
+
+        x = torch.randn(32, 256, device=DEVICE, dtype=torch.float32)
+        _code, result = code_and_output(fn, (x,), block_sizes=[16, 128])
+        torch.testing.assert_close(result, x + x.sum(dim=1, keepdim=True))
+
+    def test_emit_pipeline_full_slice_and_outer_tile_share_dimension(self) -> None:
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def fn(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            m, n = x.size()
+            k = y.size(1)
+            out = torch.empty([n, k], dtype=torch.float32, device=x.device)
+            for tile_n, tile_k in hl.tile([n, k]):
+                acc = hl.zeros([tile_n, tile_k], dtype=torch.float32)
+                for tile_m in hl.tile(m):
+                    row_sum = x[tile_m, :].sum(dim=1, keepdim=True)
+                    weighted = y[tile_m, tile_k] * row_sum
+                    acc = torch.addmm(acc, x[tile_m, tile_n].T, weighted)
+                out[tile_n, tile_k] = acc
+            return out
+
+        x = torch.randn(128, 256, device=DEVICE, dtype=torch.float32)
+        y = torch.randn(128, 128, device=DEVICE, dtype=torch.float32)
+        code, result = code_and_output(
+            fn,
+            (x, y),
+            block_sizes=[128, 128, 64],
+            pallas_loop_type="emit_pipeline",
+        )
+        self.assertIn("pltpu.emit_pipeline", code)
+        expected = x.T @ (y * x.sum(dim=1, keepdim=True))
+        torch.testing.assert_close(result, expected, rtol=1e-2, atol=0.3)
+
+    def test_emit_pipeline_tile_first_then_full_slice_same_dimension(self) -> None:
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def fn(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            m, n = x.size()
+            k = y.size(1)
+            out = torch.empty([n, k], dtype=torch.float32, device=x.device)
+            for tile_n, tile_k in hl.tile([n, k]):
+                acc = hl.zeros([tile_n, tile_k], dtype=torch.float32)
+                for tile_m in hl.tile(m):
+                    x_tile = x[tile_m, tile_n]
+                    row_sum = x[tile_m, :].sum(dim=1, keepdim=True)
+                    acc = torch.addmm(acc, x_tile.T, y[tile_m, tile_k] * row_sum)
+                out[tile_n, tile_k] = acc
+            return out
+
+        x = torch.randn(128, 256, device=DEVICE, dtype=torch.float32)
+        y = torch.randn(128, 128, device=DEVICE, dtype=torch.float32)
+        code, result = code_and_output(
+            fn,
+            (x, y),
+            block_sizes=[128, 128, 64],
+            pallas_loop_type="emit_pipeline",
+        )
+        self.assertIn("pltpu.emit_pipeline", code)
+        expected = x.T @ (y * x.sum(dim=1, keepdim=True))
+        torch.testing.assert_close(result, expected, rtol=1e-2, atol=0.3)
+
+    def test_emit_pipeline_rmw_merges_full_slice_metadata(self) -> None:
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def fn(x: torch.Tensor) -> torch.Tensor:
+            m, n = x.size()
+            for tile_m in hl.tile(m):
+                for tile_n in hl.tile(n):
+                    x_tile = x[tile_m, tile_n]
+                    row_zero = x[tile_m, :].sum(dim=1, keepdim=True) * 0.0
+                    x[tile_m, tile_n] = x_tile + row_zero
+            return x
+
+        x = torch.randn(32, 256, device=DEVICE, dtype=torch.float32)
+        code, _ = code_and_output(
+            fn,
+            (x,),
+            block_sizes=[16, 128],
+            pallas_loop_type="emit_pipeline",
+        )
+        self.assertIn("pltpu.emit_pipeline", code)
+
     @xfailIfPallas("Non-zero begin K reduction: DMA offset not tile-aligned")
     def test_bmm_nonzero_k_begin(self) -> None:
         """BMM with K reduction starting at non-zero offset, across all loop types."""
@@ -2338,7 +2508,6 @@ class TestPallas(TestCase):
         expected = x - x.mean(dim=-1, keepdim=True)
         torch.testing.assert_close(result, expected, rtol=1e-4, atol=1e-4)
 
-    @xfailIfPallas("Pipeline + scalar access codegen not yet supported")
     def test_pipeline_tensor_with_scalar_access(self) -> None:
         """A pipeline tensor with scalar access should keep HBM, not be overridden to SMEM."""
         args = (
@@ -2844,6 +3013,57 @@ class TestPallas(TestCase):
         self.assertNotIn("_smem_arg_indices", code)
         expected = x + x[:, -1:]
         torch.testing.assert_close(result, expected)
+
+    def _check_small_middle_scalar_load_in_loop(self, loop_type: str) -> None:
+        """Small scalar-indexed middle dims load aligned and select in registers."""
+
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def middle_scalar_load(x: torch.Tensor) -> torch.Tensor:
+            batch, seqlen, nheads, _dhead = x.shape
+            out = torch.empty(
+                [batch, nheads, seqlen, _dhead], dtype=x.dtype, device=x.device
+            )
+            for tile_b, tile_h in hl.tile([batch, nheads], block_size=[1, 1]):
+                i_b = tile_b.id
+                i_h = tile_h.id
+                for tile_s in hl.tile(seqlen, block_size=64):
+                    out[i_b, i_h, tile_s, :] = x[i_b, tile_s, i_h, :] + 1.0
+            return out
+
+        x = torch.randn(2, 128, 4, 16, device=DEVICE, dtype=torch.bfloat16)
+        _code, result = code_and_output(
+            middle_scalar_load,
+            (x,),
+            pallas_loop_type=loop_type,
+        )
+        torch.testing.assert_close(result, (x + 1.0).permute(0, 2, 1, 3))
+
+    def test_small_middle_scalar_load_in_emit_pipeline(self) -> None:
+        self._check_small_middle_scalar_load_in_loop("emit_pipeline")
+
+    def test_small_middle_scalar_load_in_fori_loop(self) -> None:
+        self._check_small_middle_scalar_load_in_loop("fori_loop")
+
+    def test_small_middle_negative_scalar_load(self) -> None:
+        """Static negative scalar indices preserve Python indexing semantics."""
+
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def negative_scalar_load(x: torch.Tensor) -> torch.Tensor:
+            batch, seqlen, _nheads, dhead = x.shape
+            out = torch.empty([batch, seqlen, dhead], dtype=x.dtype, device=x.device)
+            for tile_b in hl.tile(batch, block_size=1):
+                i_b = tile_b.id
+                for tile_s in hl.tile(seqlen, block_size=64):
+                    out[i_b, tile_s, :] = x[i_b, tile_s, -1, :]
+            return out
+
+        x = torch.randn(2, 128, 4, 16, device=DEVICE, dtype=torch.bfloat16)
+        _code, result = code_and_output(
+            negative_scalar_load,
+            (x,),
+            pallas_loop_type="emit_pipeline",
+        )
+        torch.testing.assert_close(result, x[:, :, -1, :])
 
     @xfailIfPallasTpu(
         "Mixed scalar write + slice needs tensor duplication into SMEM and VMEM"

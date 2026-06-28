@@ -326,9 +326,16 @@ def _classify_loop_tensors(
             ):
                 fake = host_tensor_nodes[tensor_node]
                 key = id(fake)
+                sub_vals = _extract_subscript_vals(subscript)
                 if key not in loaded_tensors:
-                    sub_vals = _extract_subscript_vals(subscript)
                     loaded_tensors[key] = (fake, tensor_node, sub_vals)
+                else:
+                    prev_fake, prev_node, prev_sub_vals = loaded_tensors[key]
+                    loaded_tensors[key] = (
+                        prev_fake,
+                        prev_node,
+                        _merge_subscript_meta(prev_fake, prev_sub_vals, sub_vals),
+                    )
         elif node.target is _store_op:
             tensor_node = node.args[0]
             subscript = node.args[1]
@@ -338,9 +345,23 @@ def _classify_loop_tensors(
             ):
                 fake = host_tensor_nodes[tensor_node]
                 key = id(fake)
+                sub_vals = _extract_subscript_vals(subscript)
                 if key not in stored_tensors:
-                    sub_vals = _extract_subscript_vals(subscript)
                     stored_tensors[key] = (fake, tensor_node, sub_vals)
+                else:
+                    prev_fake, prev_node, prev_sub_vals = stored_tensors[key]
+                    stored_tensors[key] = (
+                        prev_fake,
+                        prev_node,
+                        _merge_subscript_meta(prev_fake, prev_sub_vals, sub_vals),
+                    )
+
+    for key in loaded_tensors.keys() & stored_tensors.keys():
+        loaded_fake, loaded_node, loaded_sub_vals = loaded_tensors[key]
+        stored_fake, stored_node, stored_sub_vals = stored_tensors[key]
+        merged = _merge_subscript_meta(loaded_fake, loaded_sub_vals, stored_sub_vals)
+        loaded_tensors[key] = (loaded_fake, loaded_node, merged)
+        stored_tensors[key] = (stored_fake, stored_node, merged)
 
     return loaded_tensors, stored_tensors
 
@@ -361,6 +382,71 @@ def _get_dim_block_ids(
         elif isinstance(idx, slice) and idx == slice(None):
             pass
     return dim_to_bid
+
+
+def _merge_subscript_meta(
+    fake: torch.Tensor,
+    lhs: list[object],
+    rhs: list[object],
+) -> list[object]:
+    """Merge multiple accesses into one conservative DMA/BlockSpec shape."""
+    env = CompileEnvironment.current()
+
+    def idx_at(meta: list[object], dim: int) -> object:
+        return meta[dim] if dim < len(meta) else slice(None)
+
+    def is_full_slice(idx: object) -> bool:
+        return isinstance(idx, slice) and idx == slice(None)
+
+    def block_id(idx: object) -> int | None:
+        if isinstance(idx, torch.SymInt):
+            return env.get_block_id(idx)
+        return None
+
+    merged: list[object] = []
+    for dim in range(fake.ndim):
+        lidx = idx_at(lhs, dim)
+        ridx = idx_at(rhs, dim)
+        if is_full_slice(lidx) or is_full_slice(ridx):
+            merged.append(slice(None))
+            continue
+        lbid = block_id(lidx)
+        rbid = block_id(ridx)
+        if lbid is not None and rbid is not None and lbid == rbid:
+            merged.append(lidx)
+            continue
+        if lbid is not None or rbid is not None:
+            merged.append(slice(None))
+            continue
+        if isinstance(lidx, (int, slice)) and lidx == ridx:
+            merged.append(lidx)
+        else:
+            merged.append(slice(None))
+    return merged
+
+
+def _dma_ref_block_ids(
+    subscript_meta: list[object],
+    block_ids: list[int],
+    env: CompileEnvironment,
+    state: CodegenState,
+    extra_block_ids: set[int] | None = None,
+) -> set[int]:
+    """Block IDs already handled by a DMA/Buffered ref for this subscript."""
+    from helion._compiler.pallas.ordered_carry import is_dynamic_bound_tile
+
+    extra = extra_block_ids or set()
+    handled: set[int] = set()
+    dim_to_bid = _get_dim_block_ids(subscript_meta, env)
+    for bid in dim_to_bid.values():
+        if (
+            bid in block_ids
+            or bid in extra
+            or is_dynamic_bound_tile(state, bid)
+            or state.codegen.active_device_loops.get(bid)
+        ):
+            handled.add(bid)
+    return handled
 
 
 def _find_strategy(
@@ -483,21 +569,6 @@ def _get_loop_begin_and_end(
 def _get_loop_numel(state: CodegenState, loop_dim_index: int) -> str:
     begin, end = _get_loop_begin_and_end(state, loop_dim_index)
     return f"(({end}) - ({begin}))"
-
-
-def _is_static_int(expr: str) -> bool:
-    """True if a begin/end expression string is a compile-time integer constant.
-
-    Used to decide whether a tile loop's ``[begin, end)`` extent is statically
-    known. When it is not (data-dependent bounds — a jagged ``hl.tile(start,
-    end)`` or even ``hl.tile(0, dynamic_end)``), the final tile may be a partial
-    sub-range of the backing tensor, so an output store must clamp its extent.
-    """
-    try:
-        int(expr)
-    except (TypeError, ValueError):
-        return False
-    return True
 
 
 def _compute_grid_and_block_sizes(
@@ -1598,19 +1669,91 @@ def _lane_tile(
     return last if isinstance(last, int) else None
 
 
+def _loop_bound_value(
+    state: CodegenState,
+    bounds_arg_index: int,
+    loop_dim_index: int,
+    default: object,
+) -> object:
+    if len(state.proxy_args) <= bounds_arg_index:
+        return default
+    bounds = state.proxy_args[bounds_arg_index]
+    if isinstance(bounds, (list, tuple)):
+        return bounds[loop_dim_index] if loop_dim_index < len(bounds) else default
+    if loop_dim_index == 0:
+        return bounds
+    return default
+
+
 def _loop_dim_is_dynamic(state: CodegenState, i: int) -> bool:
     """Whether loop dim ``i`` has a runtime begin and end (a fully-dynamic jagged
     tile).  The tracing-time form of is_dynamic_bound_tile, used here because the
     device loops are not registered yet.
     """
-    begins, ends = state.proxy_args[1], state.proxy_args[2]
-    if not isinstance(begins, (list, tuple)) or not isinstance(ends, (list, tuple)):
-        return False
-    begin = begins[i] if i < len(begins) else 0
-    end = ends[i] if i < len(ends) else 0
+    begin = _loop_bound_value(state, 1, i, 0)
+    end = _loop_bound_value(state, 2, i, 0)
     return not isinstance(begin, (int, torch.SymInt)) and not isinstance(
         end, (int, torch.SymInt)
     )
+
+
+def _loop_dim_covers_full_tensor_dim(
+    state: CodegenState,
+    loop_dim_index: int,
+    dim_size: object,
+    env: CompileEnvironment,
+) -> bool:
+    """Whether loop dim ``i`` is proven to cover exactly ``[0, dim_size)``."""
+    if not isinstance(dim_size, (int, torch.SymInt)):
+        return False
+    begin = _loop_bound_value(state, 1, loop_dim_index, 0)
+    end = _loop_bound_value(state, 2, loop_dim_index, 0)
+    if not isinstance(begin, (int, torch.SymInt)) or not env.known_equal(begin, 0):
+        return False
+    return isinstance(end, (int, torch.SymInt)) and env.known_equal(end, dim_size)
+
+
+def _store_dim_requires_extent_clamp(
+    state: CodegenState,
+    loop_dim_index: int,
+    dim_size: object,
+    env: CompileEnvironment,
+) -> bool:
+    """True when a tiled store cannot prove it writes the full backing dim."""
+    return not _loop_dim_covers_full_tensor_dim(state, loop_dim_index, dim_size, env)
+
+
+def _partial_last_two_store_error() -> NotImplementedError:
+    return NotImplementedError(
+        "Pallas: a partial store whose tiled dimension is one of "
+        "the last two (lane/sublane) dimensions is not supported. "
+        "Mosaic tile alignment forbids clamping there, so a "
+        "partial tile would silently overrun adjacent rows. Move "
+        "the partial dimension to a leading position, e.g. "
+        "[tokens, heads, head_dim]."
+    )
+
+
+def _reject_partial_last_two_dim_stores(
+    state: CodegenState,
+    stored_tensors: dict[int, tuple[torch.Tensor, torch.fx.Node, list[object]]],
+    block_ids: list[int],
+    env: CompileEnvironment,
+    aligned_dim: dict[int, int] | None = None,
+) -> None:
+    aligned_dim = aligned_dim or {}
+    for fake, _tensor_node, sub_meta in stored_tensors.values():
+        dim_to_bid = _get_dim_block_ids(sub_meta, env)
+        for dim_idx, bid in dim_to_bid.items():
+            if bid not in block_ids or dim_idx < fake.ndim - 2:
+                continue
+            if bid in aligned_dim and bid in state.device_function.carry_tiles:
+                # emit_pipeline's aligned-enclosing row path handles this case.
+                continue
+            if _store_dim_requires_extent_clamp(
+                state, block_ids.index(bid), fake.shape[dim_idx], env
+            ):
+                raise _partial_last_two_store_error()
 
 
 def _aligned_dim(
@@ -1718,6 +1861,9 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
     loaded_tensors, stored_tensors = _classify_loop_tensors(graph_info, state)
 
     aligned_dim = _aligned_dim(state, env, block_ids, loaded_tensors, stored_tensors)
+    _reject_partial_last_two_dim_stores(
+        state, stored_tensors, block_ids, env, aligned_dim
+    )
 
     grid_parts, block_size_vars = _compute_grid_and_block_sizes(
         state, block_ids, env, aligned_dim
@@ -1743,6 +1889,7 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
     body_params: list[str] = []
     pipeline_in_args: list[str] = []
     pipeline_out_args: list[str] = []
+    tensor_to_dma_block_ids: dict[str, set[int]] = {}
 
     # Map outer grid block_ids to program_id variable names.
     # Compute program_ids before emit_pipeline so the BlockSpec lambda
@@ -1798,7 +1945,6 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
                 )
                 _record_pad_info(state, fake, dim_idx, bid, extra_pad)
                 begin_is_zero = begin_expr == "0"
-                end_expr = end_exprs[bid_idx]
                 dim_size = shape[dim_idx]
                 # Whether this loop spans the ENTIRE backing tensor dim, i.e.
                 # ``[0, dim_size)`` with a compile-time-constant extent. Only
@@ -1808,11 +1954,8 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
                 # ``hl.tile(0, dynamic_end)``, or even a static ``hl.tile(0, k)``
                 # with ``k < dim_size`` -- a full-block store would overrun into
                 # live rows of the tensor, so the extent must be clamped.
-                covers_full_dim = (
-                    begin_is_zero
-                    and _is_static_int(end_expr)
-                    and isinstance(dim_size, int)
-                    and int(end_expr) == dim_size
+                covers_full_dim = _loop_dim_covers_full_tensor_dim(
+                    state, bid_idx, dim_size, env
                 )
                 # Loads need a dynamic ``pl.ds`` only for a non-zero begin (a
                 # block-aligned index can't express an arbitrary start; the
@@ -2014,6 +2157,13 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
         in_specs.append(_make_load_block_spec(fake, sub_meta))
         body_params.append(vmem_name)
         pipeline_in_args.append(_make_hbm_slice(fake, hbm_name, sub_meta))
+        tensor_to_dma_block_ids[hbm_name] = _dma_ref_block_ids(
+            sub_meta,
+            block_ids,
+            env,
+            state,
+            set(_bid_to_pid_var),
+        )
 
     for fake, _tensor_node, sub_meta in stored_tensors.values():
         if id(fake) not in pipelined_tensor_ids:
@@ -2026,6 +2176,13 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
         out_specs.append(_make_store_block_spec(fake, sub_meta))
         body_params.append(vmem_name)
         pipeline_out_args.append(_make_hbm_slice(fake, hbm_name, sub_meta))
+        tensor_to_dma_block_ids[hbm_name] = _dma_ref_block_ids(
+            sub_meta,
+            block_ids,
+            env,
+            state,
+            set(_bid_to_pid_var),
+        )
 
     # Build the body function
     body_fn_name = state.device_function.new_var("_pipeline_body")
@@ -2104,6 +2261,7 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
         body_fn_name=body_fn_name,
         inner_statements=body_stmts,
         _tensor_to_dma_scratch=tensor_to_dma_scratch,
+        _tensor_to_dma_block_ids=tensor_to_dma_block_ids,
     )
 
     # For loop-carried state, remap args to scratch reads inside the body
@@ -2356,7 +2514,9 @@ def _classify_pipelined_tensors(
     for key, (fake, _tensor_node, sub_meta) in loaded_tensors.items():
         if key not in stored_tensors:
             all_tensor_info.append((fake, sub_meta, "load"))
-    for fake, _tensor_node, sub_meta in stored_tensors.values():
+    for key, (fake, _tensor_node, sub_meta) in stored_tensors.items():
+        if key in loaded_tensors:
+            sub_meta = _merge_subscript_meta(fake, loaded_tensors[key][2], sub_meta)
         all_tensor_info.append((fake, sub_meta, "store"))
     vmem_shapes = _compute_vmem_shapes(
         all_tensor_info, block_ids, slice_size_exprs, env, state
@@ -2428,6 +2588,7 @@ def _codegen_fori_loop(state: CodegenState) -> object:
     begin_exprs, iter_step_exprs, slice_size_exprs = _pallas_loop_begin_and_step_exprs(
         state, block_ids, block_size_vars
     )
+    _reject_partial_last_two_dim_stores(state, stored_tensors, block_ids, env)
 
     # --- Handle loop-carried state as scratch VMEM buffers ---
     scratch_names: list[str] = []
@@ -2486,6 +2647,7 @@ def _codegen_fori_loop(state: CodegenState) -> object:
     from .._compiler.device_function import PallasMemorySpace
 
     tensor_to_dma_scratch: dict[str, str] = {}
+    tensor_to_dma_block_ids: dict[str, set[int]] = {}
     tensor_to_sem: dict[str, str] = {}
     for (fake, _sub_meta, _direction), vmem_shape in zip(
         all_tensor_info, vmem_shapes, strict=True
@@ -2503,6 +2665,12 @@ def _codegen_fori_loop(state: CodegenState) -> object:
             name_hint=hbm_name.replace("_hbm", "") + "_sem",
         )
         tensor_to_dma_scratch[hbm_name] = vmem_name
+        tensor_to_dma_block_ids[hbm_name] = _dma_ref_block_ids(
+            _sub_meta,
+            block_ids,
+            env,
+            state,
+        )
         tensor_to_sem[hbm_name] = sem_name
 
     # Build the body function
@@ -2568,6 +2736,7 @@ def _codegen_fori_loop(state: CodegenState) -> object:
         loop_var_name=loop_vars[0],
         inner_statements=body_stmts,
         _tensor_to_dma_scratch=tensor_to_dma_scratch,
+        _tensor_to_dma_block_ids=tensor_to_dma_block_ids,
         _tensor_to_sem=tensor_to_sem,
     )
 
@@ -2588,8 +2757,6 @@ def _codegen_fori_loop(state: CodegenState) -> object:
         packed in the same tensor; with ``clamp=False`` (loads, dense stores)
         the VMEM side stays the bare buffer.
         """
-        from helion._compiler.pallas.ordered_carry import is_dynamic_bound_tile
-
         dim_to_bid = _get_dim_block_ids(subscript_meta, env)
         shape = fake.shape
         hbm_parts: list[str] = []
@@ -2613,16 +2780,10 @@ def _codegen_fori_loop(state: CodegenState) -> object:
                     slice_size_expr = f"jnp.minimum({slice_size_expr}, ({end_expr}) - ({offset_expr}))"
                     vmem_parts.append(f"pl.ds(0, {slice_size_expr})")
                     vmem_needs_slice = True
-                elif clamp and is_dynamic_bound_tile(state, bid):
-                    raise NotImplementedError(
-                        "Pallas: a ragged (data-dependent) store whose tiled "
-                        "dimension is one of the last two (lane/sublane) "
-                        "dimensions is not supported. Mosaic tile alignment "
-                        "forbids clamping there, so a partial tile would "
-                        "silently overrun adjacent rows. Move the ragged "
-                        "dimension to a leading position, e.g. "
-                        "[tokens, heads, head_dim]."
-                    )
+                elif clamp and _store_dim_requires_extent_clamp(
+                    state, bid_idx, shape[dim_idx], env
+                ):
+                    raise _partial_last_two_store_error()
                 else:
                     vmem_parts.append(":")
                 hbm_parts.append(f"pl.ds({offset_expr}, {slice_size_expr})")
