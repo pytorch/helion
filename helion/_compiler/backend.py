@@ -2838,6 +2838,40 @@ class PallasBackend(Backend):
         )
 
         block_spec_info = self._compute_block_spec_info(sorted_args, config)
+        target_ids = device_fn.pallas_tensor_index_atomic_target_ids
+        if target_ids:
+            # Tensor-index atomic_add lowers to a local one-hot accumulation
+            # plus RMW store.  It is correct across Pallas programs only when
+            # the runtime can derive shared-output serialization from
+            # BlockSpec metadata for the in-place output.
+            if sorted_args is None or block_spec_info is None:
+                raise NotImplementedError(
+                    "Pallas tensor-indexed atomic_add requires block spec info "
+                    "for shared-output serialization"
+                )
+            target_positions = [
+                i
+                for i, arg in enumerate(sorted_args)
+                if isinstance(arg, TensorArg) and id(arg.fake_value) in target_ids
+            ]
+            if len(target_positions) != len(target_ids):
+                raise NotImplementedError(
+                    "Pallas tensor-indexed atomic_add target was not found in "
+                    "launcher arguments"
+                )
+            output_set = set(output_indices)
+            inplace_set = set(inplace_indices)
+            for pos in target_positions:
+                if pos not in output_set or pos not in inplace_set:
+                    raise NotImplementedError(
+                        "Pallas tensor-indexed atomic_add requires an in-place "
+                        "output so shared-output serialization can guard the RMW"
+                    )
+                if pos >= len(block_spec_info) or block_spec_info[pos] is None:
+                    raise NotImplementedError(
+                        "Pallas tensor-indexed atomic_add requires block spec info "
+                        "for shared-output serialization"
+                    )
         if block_spec_info is not None:
             if has_rng_ops:
                 block_spec_info.append(None)  # RNG seed buffer is untiled
