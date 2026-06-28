@@ -293,6 +293,52 @@ def _scatter_one_hot_name(
     )
 
 
+def _scatter_source_mask_expr(
+    state: CodegenState,
+    plan: ScatterPlan,
+) -> str | None:
+    """Return a float mask for valid tensor-index source lanes."""
+    from ..compile_environment import CompileEnvironment
+
+    subscript = state.proxy_arg(1)
+    assert isinstance(subscript, (list, tuple))
+    index = subscript[plan.indirect_pos]
+    if not isinstance(index, torch.Tensor):
+        return None
+
+    env = CompileEnvironment.current()
+    index_shape = [*index.size()]
+    mask_exprs: list[str] = []
+    for dim, size in enumerate(index_shape):
+        block_id = env.resolve_block_id(size)
+        if block_id is None or (mask_var := state.codegen.mask_var(block_id)) is None:
+            continue
+        if env.is_jagged_tile(block_id):
+            mask_shape = env.jagged_tile_mask_shapes[block_id]
+            expand = state.tile_strategy.jagged_tile_expand_str(mask_shape, index_shape)
+        else:
+            expand = state.tile_strategy.expand_str(index_shape, dim)
+        expr = f"({mask_var}.astype(jnp.float32){expand})"
+        if expr not in mask_exprs:
+            mask_exprs.append(expr)
+
+    if not mask_exprs:
+        return None
+    return "*".join(mask_exprs)
+
+
+def _scatter_masked_one_hot(
+    state: CodegenState,
+    plan: ScatterPlan,
+    name: str,
+) -> str:
+    oh = _scatter_one_hot_name(state, plan, name)
+    source_mask = _scatter_source_mask_expr(state, plan)
+    if source_mask is None:
+        return oh
+    return f"({oh}) * (({source_mask})[..., None])"
+
+
 def emit_scatter_store(
     state: CodegenState,
     plan: ScatterPlan,
@@ -319,7 +365,7 @@ def emit_scatter_store(
     this Pallas program; duplicate writes from different programs have the same
     unspecified winner semantics as regular parallel stores in other backends.
     """
-    oh = _scatter_one_hot_name(state, plan, name)
+    oh = _scatter_masked_one_hot(state, plan, name)
     m = f"jnp.shape({oh})[0]"
     eye = f"jnp.eye({m}, dtype=jnp.float32)"
     is_lane_j_after_i = f"jnp.triu(jnp.ones(({m}, {m}), dtype=jnp.float32), k=1)"
@@ -354,4 +400,37 @@ def emit_scatter_store(
         f"jnp.where({mask_expr}, {{updates}}, {name}[{base_index}])",
         updates=updates,
         value=value,
+    )
+
+
+def emit_scatter_add(
+    state: CodegenState,
+    plan: ScatterPlan,
+    name: str,
+    base_index: str,
+    value: ast.AST,
+) -> ast.AST:
+    """Emit one Pallas program's tensor-indexed add update block.
+
+    ``base_index`` is the target block with the indirect dimension replaced by
+    ``:``. The lowering projects all source lanes to target rows with
+    ``one_hot(idx).T @ value``. Duplicate source indices within this program are
+    summed by the dot, unlike scatter-store's last-writer-wins projection.
+    """
+    oh = _scatter_masked_one_hot(state, plan, name)
+    updates = expr_from_string(
+        "jax.lax.dot_general("
+        f"jnp.swapaxes({oh}, 0, 1), "
+        "{value}.astype(jnp.float32), "
+        "(((1,), (0,)), "
+        "((), ())), "
+        "preferred_element_type=jnp.float32, "
+        "precision=jax.lax.Precision.HIGHEST"
+        ")",
+        value=value,
+    )
+    return expr_from_string(
+        f"({name}[{base_index}].astype(jnp.float32) + {{updates}}).astype("
+        f"{plan.jnp_dtype})",
+        updates=updates,
     )
