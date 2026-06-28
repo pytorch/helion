@@ -314,7 +314,6 @@ class TestViews(RefEagerTestBase, TestCase):
         expected = x.sum(dim=(1, 2))
         torch.testing.assert_close(result, expected)
 
-    @xfailIfPallasInterpret("torch.stack lowering needs real TPU Pallas")
     def test_stack_power_of_2(self):
         @helion.kernel(autotune_effort="none", static_shapes=True)
         def test_stack_power_of_2_kernel(

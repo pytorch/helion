@@ -1489,27 +1489,23 @@ class TestExamples(RefEagerTestBase, TestCase):
             block_sizes=[16, 8, 16, 16],
         )
 
-    @xfailIfPallas("Mosaic unsupported mask shape cast in HSTU")
     @skipIfXPU("Jagged tensor operations not fully supported on XPU")
     def test_jagged_hstu_attn(self):
-        batch_size = 4
+        torch.manual_seed(0)
         max_seq_len = 64
         heads = 8
         head_dim = 32
 
-        # Generate random sequence lengths
-        min_seq_len = max_seq_len // 2
-        seq_lengths = torch.randint(
-            min_seq_len,
-            max_seq_len + 1,
-            (batch_size,),
+        # Fixed partial tiles ensure padded lanes would overlap following sequences.
+        seq_lengths = torch.tensor(
+            [33, 34, 35, 36],
             dtype=torch.int32,
             device=DEVICE,
         )
         seq_offsets = torch.cat(
             [
                 torch.tensor([0], dtype=torch.int32, device=DEVICE),
-                torch.cumsum(seq_lengths, dim=0),
+                torch.cumsum(seq_lengths, dim=0).to(torch.int32),
             ]
         )
         total_seq_len = int(seq_offsets[-1].item())
