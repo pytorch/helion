@@ -243,6 +243,22 @@ def _triton_jit_supports_do_not_specialize() -> bool:
     return "do_not_specialize" in params and "do_not_specialize_on_alignment" in params
 
 
+def _pallas_empty_allocated_vars(body: list[ast.stmt]) -> set[str]:
+    """Return names allocated by top-level empty/empty_like/new_empty calls."""
+    result: set[str] = set()
+    for stmt in body:
+        if (
+            isinstance(stmt, ast.Assign)
+            and len(stmt.targets) == 1
+            and isinstance(stmt.targets[0], ast.Name)
+            and isinstance(stmt.value, ast.Call)
+            and isinstance(stmt.value.func, ast.Attribute)
+            and stmt.value.func.attr in ("empty", "empty_like", "new_empty")
+        ):
+            result.add(stmt.targets[0].id)
+    return result
+
+
 class Backend(abc.ABC):
     """Abstract base class for Helion code generation backends.
 
@@ -2761,26 +2777,6 @@ class PallasBackend(Backend):
 
         device_fn = DeviceFunction.current()
 
-        def _empty_allocated_vars(body: list[ast.stmt]) -> set[str]:
-            """Return names of variables allocated with torch.empty/empty_like/new_empty.
-
-            Only checks top-level assignments; allocations nested inside
-            if/with/try are conservatively missed (treated as needing input,
-            which is correct but suboptimal).
-            """
-            result: set[str] = set()
-            for stmt in body:
-                if (
-                    isinstance(stmt, ast.Assign)
-                    and len(stmt.targets) == 1
-                    and isinstance(stmt.targets[0], ast.Name)
-                    and isinstance(stmt.value, ast.Call)
-                    and isinstance(stmt.value.func, ast.Attribute)
-                    and stmt.value.func.attr in ("empty", "empty_like", "new_empty")
-                ):
-                    result.add(stmt.targets[0].id)
-            return result
-
         output_indices: list[int] = []
         # Indices of output tensors that are also read by the kernel
         # (inplace-mutated params or body-created tensors the kernel reads).
@@ -2798,7 +2794,7 @@ class PallasBackend(Backend):
             # to use HBM BlockSpecs.  Tensors allocated with torch.zeros_like,
             # torch.full, etc. have meaningful initial values that must be
             # preserved via VMEM BlockSpecs.
-            empty_vars = _empty_allocated_vars(host_fn.body)
+            empty_vars = _pallas_empty_allocated_vars(host_fn.body)
             for i, arg in enumerate(sorted_args):
                 if not isinstance(arg, TensorArg):
                     continue

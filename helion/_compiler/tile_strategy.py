@@ -49,6 +49,10 @@ if TYPE_CHECKING:
     ShapeLike = Sequence[SymIntLike]
 
 
+def _ceil_sympy_expr(expr: sympy.Expr) -> sympy.Expr:
+    return cast("sympy.Expr", sympy.ceiling(expr))
+
+
 class ThreadAxisTracker:
     """Tracks thread axis assignments for block dimensions during codegen."""
 
@@ -2607,7 +2611,7 @@ class FlattenedTileStrategy(BlockSizeTileStrategy):
                 f"({self._expr_str(step)}) - 1) // ({self._expr_str(step)})"
             )
         if diff_expr is not None:
-            return sympy.ceiling(sympy.Mul(diff_expr, sympy.Pow(step_expr, -1)))
+            return _ceil_sympy_expr(sympy.Mul(diff_expr, sympy.Pow(step_expr, -1)))
         return (
             f"((({self._expr_str(end)}) - ({self._expr_str(begin)})) + "
             f"({self._expr_str(step)}) - 1) // ({self._expr_str(step)})"
@@ -3224,7 +3228,7 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
                 f"({self._expr_str(step)}) - 1) // ({self._expr_str(step)})"
             )
         if diff_expr is not None:
-            return sympy.ceiling(sympy.Mul(diff_expr, sympy.Pow(step_expr, -1)))
+            return _ceil_sympy_expr(sympy.Mul(diff_expr, sympy.Pow(step_expr, -1)))
         return (
             f"((({self._expr_str(end)}) - ({self._expr_str(begin)})) + "
             f"({self._expr_str(step)}) - 1) // ({self._expr_str(step)})"
