@@ -30,7 +30,8 @@ if TYPE_CHECKING:
 
 @triton.jit
 def _wait_progress_at_idx(progress: tl.tensor, idx: int) -> None:
-    triton_wait_signal(progress + idx, 1, 0, "acquire", "gpu", "ld", False)  # pyrefly: ignore [bad-argument-type]
+    # pyrefly: ignore[bad-argument-type]
+    triton_wait_signal(progress + idx, 1, 0, "acquire", "gpu", "ld", False)
 
 
 # Use hardcoded config in CI to avoid autotuning overhead.

@@ -154,8 +154,14 @@ def _symm_mem_sync_cuda(
         tl.debug_barrier()
 
     if flat_tid < world_size:
-        _send_signal(send_addrs, "release" if hasPreviousMemAccess else "relaxed")  # pyrefly: ignore [bad-argument-type]
-        _wait_signal(wait_addrs, "acquire" if hasSubsequentMemAccess else "relaxed")  # pyrefly: ignore [bad-argument-type]
+        if hasPreviousMemAccess:
+            _send_signal(send_addrs, "release")  # pyrefly: ignore[bad-argument-type]
+        else:
+            _send_signal(send_addrs, "relaxed")  # pyrefly: ignore[bad-argument-type]
+        if hasSubsequentMemAccess:
+            _wait_signal(wait_addrs, "acquire")  # pyrefly: ignore[bad-argument-type]
+        else:
+            _wait_signal(wait_addrs, "relaxed")  # pyrefly: ignore[bad-argument-type]
 
     if hasSubsequentMemAccess:
         tl.debug_barrier()

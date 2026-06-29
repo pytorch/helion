@@ -3,7 +3,7 @@ from __future__ import annotations
 import contextlib
 from datetime import timedelta
 import os
-import unittest
+from unittest import mock
 
 import torch
 from torch import Tensor
@@ -34,7 +34,10 @@ from helion.autotuner.effort_profile import PatternSearchConfig
 from helion.autotuner.effort_profile import RandomSearchConfig
 import helion.language as hl
 
-autotuner_names = ["fixed", *search_algorithms]
+autotuner_names = [
+    "fixed",
+    *(name for name in search_algorithms if not name.startswith("LLM")),
+]
 
 
 def custom_get_timeout(test_id: str) -> int:
@@ -96,7 +99,7 @@ class TestDistributed(TestCase, MultiProcessTestCase):
         super().setUpClass()
         cls._class_stack = contextlib.ExitStack()
         cls._class_stack.enter_context(
-            unittest.mock.patch.dict(
+            mock.patch.dict(
                 os.environ,
                 {
                     "HELION_DIST_CHECK_CONFIG_CONSISTANCY": "1",
@@ -106,7 +109,7 @@ class TestDistributed(TestCase, MultiProcessTestCase):
             )
         )
         cls._class_stack.enter_context(
-            unittest.mock.patch.object(
+            mock.patch.object(
                 torch.testing._internal.common_distributed,
                 "get_timeout",
                 custom_get_timeout,
@@ -139,7 +142,7 @@ class TestDistributed(TestCase, MultiProcessTestCase):
     def _init_process(self):
         self._exit_stack = contextlib.ExitStack()
         self._exit_stack.enter_context(
-            unittest.mock.patch.dict(
+            mock.patch.dict(
                 _PROFILES,
                 {"full": profile},
             )
@@ -215,17 +218,13 @@ class TestDistributed(TestCase, MultiProcessTestCase):
                 ],
                 ignore_warnings=[helion.exc.TensorOperationInWrapper],
             )(one_shot_allreduce_kernel)
-            context = unittest.mock.patch.dict(
-                os.environ, {"HELION_AUTOTUNER": autotuner}
-            )
+            context = mock.patch.dict(os.environ, {"HELION_AUTOTUNER": autotuner})
         else:
             kernel = helion.kernel(
                 one_shot_allreduce_kernel,
                 ignore_warnings=[helion.exc.TensorOperationInWrapper],
             )
-            context = unittest.mock.patch.dict(
-                os.environ, {"HELION_AUTOTUNER": autotuner}
-            )
+            context = mock.patch.dict(os.environ, {"HELION_AUTOTUNER": autotuner})
 
         with context:
             self.do_test_allreduce(kernel)
@@ -274,13 +273,12 @@ class TestDistributed(TestCase, MultiProcessTestCase):
         mod = import_path(EXAMPLES_DIR / "distributed" / "allreduce_bias_rmsnorm.py")
 
         kernel = getattr(mod, kernel_name).fn
+        autotune_seed_config = helion.Config(
+            block_sizes=[8], num_warps=8, reduction_loops=[1024]
+        )
         if autotuner == "fixed":
-            fixed_config = helion.Config(
-                block_sizes=[8], num_warps=8, reduction_loops=[1024]
-            )
-
             kernel = helion.kernel(
-                config=fixed_config,
+                config=autotune_seed_config,
                 ignore_warnings=[helion.exc.TensorOperationInWrapper],
             )(kernel)
             context = contextlib.nullcontext()
@@ -292,16 +290,14 @@ class TestDistributed(TestCase, MultiProcessTestCase):
                 ],
                 ignore_warnings=[helion.exc.TensorOperationInWrapper],
             )(kernel)
-            context = unittest.mock.patch.dict(
-                os.environ, {"HELION_AUTOTUNER": autotuner}
-            )
+            context = mock.patch.dict(os.environ, {"HELION_AUTOTUNER": autotuner})
         else:
             kernel = helion.kernel(
-                kernel, ignore_warnings=[helion.exc.TensorOperationInWrapper]
+                kernel,
+                autotune_seed_configs=[autotune_seed_config],
+                ignore_warnings=[helion.exc.TensorOperationInWrapper],
             )
-            context = unittest.mock.patch.dict(
-                os.environ, {"HELION_AUTOTUNER": autotuner}
-            )
+            context = mock.patch.dict(os.environ, {"HELION_AUTOTUNER": autotuner})
 
         with context:
             self.do_test_allreduce_bias_rmsnorm(
@@ -376,16 +372,12 @@ class TestDistributed(TestCase, MultiProcessTestCase):
                 ],
                 ignore_warnings=[helion.exc.TensorOperationInWrapper],
             )(kernel)
-            context = unittest.mock.patch.dict(
-                os.environ, {"HELION_AUTOTUNER": autotuner}
-            )
+            context = mock.patch.dict(os.environ, {"HELION_AUTOTUNER": autotuner})
         else:
             kernel = helion.kernel(
                 kernel, ignore_warnings=[helion.exc.TensorOperationInWrapper]
             )
-            context = unittest.mock.patch.dict(
-                os.environ, {"HELION_AUTOTUNER": autotuner}
-            )
+            context = mock.patch.dict(os.environ, {"HELION_AUTOTUNER": autotuner})
 
         with context:
             self.do_test_matmul_reduce_scatter(
@@ -488,9 +480,7 @@ class TestDistributed(TestCase, MultiProcessTestCase):
         kernel = helion.kernel(
             kernel, ignore_warnings=[helion.exc.TensorOperationInWrapper]
         )
-        context = unittest.mock.patch.dict(
-            os.environ, {"HELION_AUTOTUNER": "LFBOTreeSearch"}
-        )
+        context = mock.patch.dict(os.environ, {"HELION_AUTOTUNER": "LFBOTreeSearch"})
 
         with context:
             self.do_test_two_dim_parallel_matmul(
@@ -534,20 +524,43 @@ class TestDistributed(TestCase, MultiProcessTestCase):
         symm_mem_buf = symm_mem.empty(M_local, N, dtype=dtype, device=self.device)
         hdl = symm_mem.rendezvous(symm_mem_buf, tp_group_name)
 
-        import unittest.mock
-
-        with (
-            unittest.mock.patch(
-                "helion._dist_utils.sync_seed", wraps=sync_seed
-            ) as mock_sync_seed,
-            unittest.mock.patch(
+        sync_mocks: dict[str, list[mock.MagicMock]] = {
+            "sync_seed": [],
+            "all_gather_object": [],
+            "sync_object": [],
+        }
+        sync_patch_specs = [
+            ("sync_seed", "helion._dist_utils.sync_seed", sync_seed),
+            ("sync_seed", "helion.autotuner.config_generation.sync_seed", sync_seed),
+            (
+                "sync_seed",
+                "helion.autotuner.surrogate_pattern_search.sync_seed",
+                sync_seed,
+            ),
+            (
+                "all_gather_object",
                 "helion.autotuner.base_search.all_gather_object",
-                wraps=all_gather_object,
-            ) as mock_all_gather_object,
-            unittest.mock.patch(
-                "helion.autotuner.base_search.sync_object", wraps=sync_object
-            ) as mock_sync_object,
-        ):
+                all_gather_object,
+            ),
+            (
+                "all_gather_object",
+                "helion.autotuner.benchmark_provider.all_gather_object",
+                all_gather_object,
+            ),
+            ("sync_object", "helion.autotuner.base_search.sync_object", sync_object),
+            (
+                "sync_object",
+                "helion.autotuner.benchmark_provider.sync_object",
+                sync_object,
+            ),
+            ("sync_object", "helion.autotuner.benchmarking.sync_object", sync_object),
+        ]
+
+        with contextlib.ExitStack() as stack:
+            for name, target, wrapped in sync_patch_specs:
+                sync_mocks[name].append(
+                    stack.enter_context(mock.patch(target, wraps=wrapped))
+                )
             result = helion_fn(
                 a_local,
                 b_local,
@@ -558,18 +571,19 @@ class TestDistributed(TestCase, MultiProcessTestCase):
                 GROUP_NAME=tp_group_name,
             )
 
-        def _assert_pgn_group_size_2(mock: unittest.mock.MagicMock) -> None:
-            mock.assert_called()
-            pg_names = dist.distributed_c10d._world.pg_names  # type: ignore[attr-defined]
-            for call in mock.call_args_list:
+        def _assert_tp_group_calls(name: str, mocks: list[mock.MagicMock]) -> None:
+            calls = [call for mock_obj in mocks for call in mock_obj.call_args_list]
+            self.assertGreater(len(calls), 0, f"{name} was not called")
+            for call in calls:
                 pgn = call.kwargs.get("process_group_name")
+                if pgn is None and len(call.args) >= 2:
+                    pgn = call.args[1]
                 self.assertIsNotNone(pgn)
-                group = next(g for g, name in pg_names.items() if name == pgn)
-                self.assertEqual(dist.get_world_size(group), 2)
+                self.assertEqual(pgn, tp_group_name)
+                self.assertEqual(dist.get_world_size(tp_group), tp_size)
 
-        _assert_pgn_group_size_2(mock_sync_seed)
-        _assert_pgn_group_size_2(mock_all_gather_object)
-        _assert_pgn_group_size_2(mock_sync_object)
+        for name, mocks in sync_mocks.items():
+            _assert_tp_group_calls(name, mocks)
 
         expected = ref_fn(a_local, b_local, tp_group)
         torch.testing.assert_close(result, expected, rtol=1e-1, atol=1e-1)

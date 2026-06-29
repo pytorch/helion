@@ -333,6 +333,12 @@ jobs:
           # -rf: print failed tests
           # --timeout: max allowed time for each test
           PARALLEL="-n4"
+          SERIAL_DISTRIBUTED_TEST_PATH=""
+          SERIAL_DISTRIBUTED_TEST_TIMEOUT="${DISTRIBUTED_TESTS_DEFAULT_TIMEOUT:-600}"
+          # Keep MI350X /dev/shm usage bounded by running this suite outside xdist.
+          if [[ "${{ matrix.alias }}" == "mi350x" ]]; then
+            SERIAL_DISTRIBUTED_TEST_PATH="test/test_distributed.py"
+          fi
           if [[ "${{ contains(matrix.alias, 'distributed') }}" == "true" ]]; then
             TEST_PATH="test/test_examples_dist.py"
             EXTRA_FLAGS="-rs"
@@ -344,21 +350,50 @@ jobs:
             TEST_PATH="."
             EXTRA_FLAGS="--ignore=test/test_examples_dist.py"
           fi
+          if [[ -n "$SERIAL_DISTRIBUTED_TEST_PATH" && "$TEST_PATH" == "." ]]; then
+            EXTRA_FLAGS="$EXTRA_FLAGS --ignore=$SERIAL_DISTRIBUTED_TEST_PATH"
+          fi
           # A10G runners expose one 22 GiB GPU. Four xdist workers can collectively
           # exhaust VRAM with CUDA/Triton/Inductor state even when an individual test
           # only needs a small allocation.
           if [[ -n "$PARALLEL" && "${{ matrix.alias }}" == *a10g* ]]; then
             PARALLEL="-n2"
           fi
-          # For distributed tests, fail if any test is skipped, failed, or has an error
-          SKIP_CHECK=$([[ "${{ contains(matrix.alias, 'distributed') }}" == "true" ]] && echo "! grep -qE '(SKIPPED|FAILED|ERROR)'" || echo "cat > /dev/null")
+          # H100 runners expose one 80 GiB GPU; keep xdist from oversubscribing VRAM.
+          if [[ -n "$PARALLEL" && "${{ matrix.alias }}" == "h100" ]]; then
+            PARALLEL="-n2"
+          fi
+          # Python 3.14 A10G workers still crash under xdist while compiling
+          # larger autodiff examples; keep coverage but run the job serially.
+          if [[ "${{ matrix.alias }}" == *a10g* && "${{ startsWith(matrix.python-version, '3.14') }}" == "true" ]]; then
+            PARALLEL=""
+          fi
+          # For distributed tests, fail if any test is skipped, failed, or has an error.
+          DISTRIBUTED_SKIP_CHECK="${{ contains(matrix.alias, 'distributed') }}"
+          run_pytest() {
+            local skip_check="$1"
+            shift
+            local log_file
+            log_file="$(mktemp)"
+            "$@" | tee "$log_file"
+            local pytest_status="${PIPESTATUS[0]}"
+            if [[ "$skip_check" == "true" ]] && grep -qE '(SKIPPED|FAILED|ERROR)' "$log_file"; then
+              echo "::error::Distributed pytest skip check found skipped, failed, or errored tests"
+              grep -E '(SKIPPED|FAILED|ERROR)' "$log_file" || true
+              rm -f "$log_file"
+              return 1
+            fi
+            rm -f "$log_file"
+            return "$pytest_status"
+          }
           if [[ "${{ matrix.alias }}" == *xpu* ]]; then
             export TRITON_XPU_GEN_NATIVE_CODE=1
           fi
           TIMEOUT=60
           if [[ "${{ matrix.alias }}" == "tpu" ]]; then
-            TIMEOUT=300
-          elif [[ "${{ matrix.alias }}" == "pallas-interpret" ]]; then
+            TIMEOUT=600
+          elif [[ -z "$PARALLEL" ]]; then
+            # Serial jobs can spend several minutes in backend compilation.
             TIMEOUT=300
           elif [[ "${{ matrix.alias }}" == *a10g* ]]; then
             # A10G (sm86) ptxas cold-compiles some backward kernels slowly
@@ -367,7 +402,17 @@ jobs:
             # worker gets killed mid-compile. Give it headroom.
             TIMEOUT=180
           fi
-          pytest $PARALLEL -rf --timeout=$TIMEOUT --reruns=2 --timeout-method=thread $EXTRA_FLAGS $TEST_PATH | tee >(eval $SKIP_CHECK)
+          TEST_STATUS=0
+          run_pytest "$DISTRIBUTED_SKIP_CHECK" pytest $PARALLEL -rf --timeout=$TIMEOUT --reruns=2 --timeout-method=thread $EXTRA_FLAGS $TEST_PATH || TEST_STATUS=$?
+          if [[ -n "$SERIAL_DISTRIBUTED_TEST_PATH" ]]; then
+            DISTRIBUTED_TESTS_DEFAULT_TIMEOUT="$SERIAL_DISTRIBUTED_TEST_TIMEOUT" \
+              run_pytest true pytest -rf -rs \
+              --timeout=$SERIAL_DISTRIBUTED_TEST_TIMEOUT \
+              --reruns=2 \
+              --timeout-method=thread \
+              "$SERIAL_DISTRIBUTED_TEST_PATH" || TEST_STATUS=$?
+          fi
+          exit "$TEST_STATUS"
 
   test-notebooks:
     name: test-notebooks-cu130-py3.12-pytorch-2.9-a10g

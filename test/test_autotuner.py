@@ -2043,8 +2043,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
             search = FiniteSearch(bound, (a, b), configs=[cfg1, cfg2])
 
             if expect_reject:
-                # FiniteSearch currently raises AssertionError if every config fails validation
-                with self.assertRaises(AssertionError):
+                with self.assertRaises(helion.exc.NoConfigFound):
                     search.autotune()
                 # All configs should have tripped the accuracy mismatch counter
                 self.assertEqual(
@@ -3435,7 +3434,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         bound = add.bind((a, b))
         search = FiniteSearch(bound, (a, b), configs=[cfg1, cfg2])
 
-        with self.assertRaises(AssertionError):
+        with self.assertRaises(helion.exc.NoConfigFound):
             search.autotune()
         self.assertEqual(
             search._autotune_metrics.num_accuracy_failures, len(search.configs)

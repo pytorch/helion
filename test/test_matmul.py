@@ -15,6 +15,8 @@ from helion._testing import TestCase
 from helion._testing import code_and_output
 from helion._testing import import_path
 from helion._testing import onlyBackends
+from helion._testing import skipIfCudaCapabilityLessThan
+from helion._testing import skipIfNotCUDA
 from helion._testing import skipIfNotTriton
 from helion._testing import skipIfRefEager
 from helion._testing import skipIfTileIR
@@ -22,21 +24,23 @@ from helion._testing import skipUnlessTensorDescriptor
 import helion.language as hl
 from helion.runtime.settings import _get_backend
 
-_orig_matmul_fp32_precision: str = "none"
 _orig_cudnn_fp32_precision: str = "none"
+_orig_float32_matmul_precision: str = "none"
 
 
 def setUpModule() -> None:
-    global _orig_matmul_fp32_precision, _orig_cudnn_fp32_precision
-    _orig_matmul_fp32_precision = torch.backends.cuda.matmul.fp32_precision
-    _orig_cudnn_fp32_precision = torch.backends.cudnn.conv.fp32_precision
-    torch.backends.cuda.matmul.fp32_precision = "tf32"
-    torch.backends.cudnn.conv.fp32_precision = "tf32"
+    global _orig_cudnn_fp32_precision, _orig_float32_matmul_precision
+    cudnn_conv = torch.backends.cudnn.conv  # pyrefly: ignore[missing-attribute]
+    _orig_cudnn_fp32_precision = cudnn_conv.fp32_precision
+    _orig_float32_matmul_precision = torch.get_float32_matmul_precision()
+    torch.set_float32_matmul_precision("high")
+    cudnn_conv.fp32_precision = "tf32"
 
 
 def tearDownModule() -> None:
-    torch.backends.cuda.matmul.fp32_precision = _orig_matmul_fp32_precision
-    torch.backends.cudnn.conv.fp32_precision = _orig_cudnn_fp32_precision
+    cudnn_conv = torch.backends.cudnn.conv  # pyrefly: ignore[missing-attribute]
+    torch.set_float32_matmul_precision(_orig_float32_matmul_precision)
+    cudnn_conv.fp32_precision = _orig_cudnn_fp32_precision
 
 
 examples_dir = Path(__file__).parent.parent / "examples"
@@ -90,6 +94,20 @@ def matmul_static_shapes(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
         for tile_k in hl.tile(k):
             acc += torch.matmul(x[tile_m, tile_k], y[tile_k, tile_n])
         out[tile_m, tile_n] = acc
+    return out
+
+
+@helion.kernel(static_shapes=True)
+def matmul_fp8_bf16(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    m, k = x.size()
+    k2, n = y.size()
+    assert k == k2, f"size mismatch {k} != {k2}"
+    out = torch.empty([m, n], dtype=torch.bfloat16, device=x.device)
+    for tile_m, tile_n in hl.tile([m, n]):
+        acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+        for tile_k in hl.tile(k):
+            acc = hl.dot(x[tile_m, tile_k], y[tile_k, tile_n], acc=acc)
+        out[tile_m, tile_n] = acc.to(torch.bfloat16)
     return out
 
 
@@ -273,6 +291,7 @@ class TestMatmul(RefEagerTestBase, TestCase):
 
     @skipIfNotTriton("block_ptr is triton-only")
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
+    @skipIfRefEager("checks generated Triton code")
     @skipIfTileIR("TileIR does not support block_ptr indexing")
     def test_matmul_block_ptr(self):
         args = (
@@ -288,6 +307,78 @@ class TestMatmul(RefEagerTestBase, TestCase):
         )
         torch.testing.assert_close(output, args[0] @ args[1], atol=1e-1, rtol=1e-2)
         self.assertIn("tl.make_block_ptr", code)
+        self.assertNotIn("boundary_check=None", code)
+        block_ptr_load_lines = [
+            line for line in code.splitlines() if "tl.load(tl.make_block_ptr" in line
+        ]
+        self.assertGreater(len(block_ptr_load_lines), 0)
+        for line in block_ptr_load_lines:
+            self.assertNotIn("boundary_check=", line)
+        block_ptr_store_lines = [
+            line for line in code.splitlines() if "tl.store(tl.make_block_ptr" in line
+        ]
+        self.assertGreater(len(block_ptr_store_lines), 0)
+        for line in block_ptr_store_lines:
+            self.assertNotIn("boundary_check=", line)
+
+    @skipIfNotTriton("block_ptr is triton-only")
+    @skipIfNotCUDA()
+    @skipIfCudaCapabilityLessThan((9, 0), reason="FP8 requires CUDA capability >= 9.0")
+    @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
+    @skipIfRefEager("checks generated Triton code")
+    @skipIfTileIR("TileIR does not support block_ptr indexing")
+    def test_fp8_matmul_block_ptr_omits_zero_padding(self):
+        args = (
+            torch.randn([128, 128], device=DEVICE, dtype=torch.float32).to(
+                torch.float8_e4m3fn
+            ),
+            torch.randn([128, 256], device=DEVICE, dtype=torch.float32)
+            .to(torch.float8_e4m3fn)
+            .T.contiguous()
+            .T,
+        )
+        code, output = code_and_output(
+            matmul_fp8_bf16,
+            args,
+            block_sizes=[128, 256, 128],
+            indexing="block_ptr",
+        )
+        expected = (args[0].to(torch.float32) @ args[1].to(torch.float32)).to(
+            torch.bfloat16
+        )
+        torch.testing.assert_close(output, expected, atol=1.0, rtol=1e-1)
+        self.assertIn("tl.make_block_ptr", code)
+        self.assertNotIn("padding_option='zero'", code)
+
+    @skipIfNotTriton("block_ptr is triton-only")
+    @skipIfNotCUDA()
+    @skipIfCudaCapabilityLessThan((9, 0), reason="FP8 requires CUDA capability >= 9.0")
+    @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
+    @skipIfRefEager("checks generated Triton code")
+    @skipIfTileIR("TileIR does not support block_ptr indexing")
+    def test_fp8_matmul_block_ptr_uses_pointer_for_padded_edges(self):
+        args = (
+            torch.randn([130, 128], device=DEVICE, dtype=torch.float32).to(
+                torch.float8_e4m3fn
+            ),
+            torch.randn([128, 256], device=DEVICE, dtype=torch.float32)
+            .to(torch.float8_e4m3fn)
+            .T.contiguous()
+            .T,
+        )
+        code, output = code_and_output(
+            matmul_fp8_bf16,
+            args,
+            block_sizes=[128, 256, 128],
+            indexing="block_ptr",
+        )
+        expected = (args[0].to(torch.float32) @ args[1].to(torch.float32)).to(
+            torch.bfloat16
+        )
+        torch.testing.assert_close(output, expected, atol=1.0, rtol=1e-1)
+        self.assertIn("tl.make_block_ptr", code)
+        self.assertIn("other=0.0", code)
+        self.assertNotIn("padding_option='zero'", code)
 
     @skipIfNotTriton("tensor_descriptor is triton-only")
     @skipUnlessTensorDescriptor("TensorDescriptor not supported")

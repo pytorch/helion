@@ -1805,6 +1805,18 @@ class LoopDimInfo:
     end_var_name: str | None = None
     end_expr: sympy.Expr | None = None
 
+    def is_end_proven_matching(self, size: int | torch.SymInt | sympy.Expr) -> bool:
+        """Return True only when ``size`` is proven equal to the loop end.
+
+        This is for safety decisions where equal size hints are not enough.
+        """
+        if self.end_expr is None:
+            return False
+        expected = _to_sympy(size)
+        if expected == self.end_expr:
+            return True
+        return sympy.Eq(expected, self.end_expr) == sympy.true
+
     def is_end_matching(self, size: int | torch.SymInt) -> bool:
         expected = _to_sympy(size)
         if expected == self.end_expr:

@@ -30,7 +30,6 @@ from helion._testing import skipIfXPU
 from helion.autotuner.base_search import PopulationBasedSearch
 from helion.autotuner.base_search import PopulationMember
 from helion.autotuner.benchmark_job import AccuracyCheckJob
-from helion.autotuner.benchmark_job import AccuracyCheckResult
 from helion.autotuner.benchmark_job import BenchmarkJob
 from helion.autotuner.benchmark_provider import LocalBenchmarkProvider
 from helion.autotuner.benchmark_worker import BenchmarkSubprocessError
@@ -38,6 +37,7 @@ from helion.autotuner.benchmark_worker import BenchmarkTimeout
 from helion.autotuner.benchmark_worker import BenchmarkWorker
 from helion.autotuner.benchmark_worker import BenchmarkWorkerDied
 from helion.autotuner.kernel_args import load_trusted_kernel_args
+from helion.autotuner.metrics import AutotuneMetrics
 from helion.autotuner.precompile_future import SerializedCompiledFunction
 from helion.autotuner.precompile_future import _run_kernel_in_subprocess_spawn
 from helion.autotuner.random_search import RandomSearch
@@ -324,6 +324,44 @@ class TestBenchmarkWorkerFailureModes(unittest.TestCase):
         finally:
             worker.shutdown()
 
+    def test_accuracy_check_subprocess_sticky_error_returns_inf(self) -> None:
+        provider = cast("Any", object.__new__(LocalBenchmarkProvider))
+        provider.settings = Settings(
+            autotune_accuracy_check=True,
+            autotune_benchmark_timeout=60,
+        )
+        provider._autotune_metrics = AutotuneMetrics()
+        provider.log = Mock()
+        provider.kernel = Mock()
+        provider.kernel.format_kernel_decorator.return_value = "@helion.kernel(...)"
+        provider.args = ()
+        config = Config()
+        fn = cast("CompiledConfig", lambda: None)
+
+        with (
+            patch.object(
+                provider,
+                "_run_subprocess_benchmark_job",
+                return_value=1.0,
+            ) as benchmark_job,
+            patch.object(
+                provider,
+                "_run_subprocess_accuracy_check_job",
+                side_effect=RuntimeError("an illegal memory access was encountered"),
+            ) as accuracy_job,
+        ):
+            perf = provider._benchmark_function_subprocess(config, fn)
+
+        self.assertEqual(perf, math.inf)
+        self.assertEqual(provider._autotune_metrics.num_compile_failures, 1)
+        benchmark_job.assert_called_once_with(fn, warmup=1, rep=50)
+        accuracy_job.assert_called_once_with(fn)
+        provider.kernel.maybe_log_repro.assert_called_once_with(
+            provider.log.warning,
+            provider.args,
+            config,
+        )
+
     def test_worker_crash_raises_died(self) -> None:
         worker = BenchmarkWorker()
         try:
@@ -571,60 +609,6 @@ class TestSubprocessBenchmarkIntegration(RefEagerTestDisabled, unittest.TestCase
         ):
             RandomSearch(bound_kernel, args, 20).autotune()
 
-        self.assertGreaterEqual(call_count[0], 6)
-        self.assertGreaterEqual(call_count[1], 2)
-
-    @skipIfXPU("matmul config space includes maxnreg, unsupported on XPU")
-    def test_autotune_continues_when_accuracy_check_crashes(self) -> None:
-        # A config can pass the timed run and then crash in the accuracy
-        # check. Patches the accuracy job to raise a sticky CUDA error for a
-        # fraction of configs; the worker dies and respawns, and autotune must
-        # still pick a best config from the rest instead of aborting.
-        if not torch.cuda.is_available():
-            self.skipTest("requires CUDA")
-
-        original = LocalBenchmarkProvider._run_subprocess_accuracy_check_job
-        call_count = [0, 0]  # [total, simulated_crashes]
-
-        def maybe_crash(
-            self: LocalBenchmarkProvider,
-            fn: CompiledConfig,
-        ) -> AccuracyCheckResult | None:
-            call_count[0] += 1
-            if call_count[0] % 3 == 0:
-                call_count[1] += 1
-                if self._benchmark_worker is None:
-                    self._benchmark_worker = BenchmarkWorker(device=None)
-                # Run a job that raises a sticky error inside the worker, so the
-                # worker is killed and a sticky error propagates from the
-                # accuracy step, as a real accuracy-check crash would.
-                self._benchmark_worker.run(
-                    _RaiseRuntimeError("an illegal memory access was encountered"),
-                    timeout=float(self.settings.autotune_benchmark_timeout),
-                )
-            return original(self, fn)
-
-        examples_dir = Path(__file__).parent.parent / "examples"
-        matmul = import_path(examples_dir / "matmul.py").matmul
-
-        args = (
-            torch.randn([512, 512], device=DEVICE),
-            torch.randn([512, 512], device=DEVICE),
-        )
-        bound_kernel = matmul.bind(args)
-        bound_kernel.settings.autotune_benchmark_subprocess = True
-        bound_kernel.settings.autotune_benchmark_timeout = 60
-        bound_kernel.settings.autotune_precompile = None
-
-        random.seed(123)
-        with patch.object(
-            LocalBenchmarkProvider,
-            "_run_subprocess_accuracy_check_job",
-            maybe_crash,
-        ):
-            best = RandomSearch(bound_kernel, args, 20).autotune()
-
-        self.assertIsNotNone(best)
         self.assertGreaterEqual(call_count[0], 6)
         self.assertGreaterEqual(call_count[1], 2)
 
