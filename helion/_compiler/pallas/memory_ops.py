@@ -58,6 +58,9 @@ def _(state: CodegenState) -> None:
         if emit_carry_store(state, tensor, subscript, name, parts, value):
             pallas_codegen.mark_dma_scratch_initialized(state, tensor)
             return
+    pallas_codegen.reject_partial_last_two_dim_direct_store(
+        state, tensor, subscript, parts
+    )
     if tensor.dtype is torch.bool:
         value = CompileEnvironment.current().backend.cast_ast(value, torch.bool)
     state.codegen.add_statement(
