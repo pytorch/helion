@@ -1837,12 +1837,24 @@ class PallasBackend(Backend):
         if isinstance(arg, (SymbolArgument, TensorSizeArg, TensorStrideArg)):
             from .compile_environment import CompileEnvironment
 
+            fallback_device = (
+                "'cpu'"
+                if CompileEnvironment.current().settings.pallas_interpret
+                else "'tpu'"
+            )
             if tensor_host_args:
-                device_expr = f"{tensor_host_args[0]}.device"
-            elif CompileEnvironment.current().settings.pallas_interpret:
-                device_expr = "'cpu'"
+                tensor_devices = ", ".join(
+                    f"{tensor_arg}.device" for tensor_arg in tensor_host_args
+                )
+                if len(tensor_host_args) == 1:
+                    tensor_devices += ","
+                device_expr = (
+                    "next((device for device in "
+                    f"({tensor_devices}) if device.type != 'meta'), "
+                    f"{fallback_device})"
+                )
             else:
-                device_expr = "'tpu'"
+                device_expr = fallback_device
             # Scalars are passed as 1-dim tensors (shape [1]) rather than
             # 0-dim tensors (shape []) because TPU Pallas Mosaic lowering
             # requires rank >= 1 for all block specs.  A 0-dim input causes:
@@ -2048,9 +2060,13 @@ class PallasBackend(Backend):
         ``min(block_size, tensor_dim)`` which equals the full array
         dimension -- always valid per TPU rules.
         """
+        from torch._inductor.runtime.runtime_utils import next_power_of_2
+
         from ..autotuner.config_spec import BlockSizeSpec
         from .ast_extension import ExtendedAST
         from .compile_environment import BlockSizeInfo
+        from .compile_environment import CompileEnvironment
+        from .compile_environment import _symint_free_symbols
         from helion._compiler.compile_environment import _to_sympy
         from helion._compiler.host_function import HostFunction
         from helion._compiler.type_info import SequenceType
@@ -2115,6 +2131,9 @@ class PallasBackend(Backend):
                     required_alignment = self.backend._get_pallas_required_alignment(
                         dim_from_end, tensor.ndim, bitwidth
                     )
+                    required_alignment = self.cap_alignment_to_tensor_dim(
+                        tensor, accessed_dim, required_alignment
+                    )
                     self.maybe_update_required_alignment(bid, required_alignment)
 
             def maybe_update_required_alignment(
@@ -2126,6 +2145,55 @@ class PallasBackend(Backend):
                     self.required_alignments[bid] = max(
                         self.required_alignments[bid], required_alignment
                     )
+
+            def cap_alignment_to_tensor_dim(
+                self,
+                tensor: torch.Tensor,
+                accessed_dim: int,
+                required_alignment: int,
+            ) -> int:
+                from torch._dynamo.source import TensorProperty
+                from torch._dynamo.source import TensorPropertySource
+
+                if accessed_dim < 0 or accessed_dim >= tensor.ndim:
+                    return required_alignment
+                dim = tensor.size(accessed_dim)
+                env = CompileEnvironment.current()
+                if isinstance(dim, int):
+                    dim_size = next_power_of_2(max(dim, 1))
+                    if dim_size < required_alignment and not env.settings.static_shapes:
+                        return required_alignment
+                    return min(required_alignment, dim_size)
+                if not isinstance(dim, torch.SymInt):
+                    return required_alignment
+                dim_expr = env.shape_env.replace(dim._sympy_())
+                specialized = env.specialize_expr(dim_expr)
+                if (
+                    not specialized.free_symbols
+                    and getattr(specialized, "is_integer", None) is True
+                ):
+                    dim_size = next_power_of_2(max(int(specialized), 1))
+                    return min(required_alignment, dim_size)
+                symbols = _symint_free_symbols(dim)
+                sources_by_symbol = [
+                    env.shape_env.var_to_sources.get(symbol, ()) for symbol in symbols
+                ]
+                if not symbols or any(not sources for sources in sources_by_symbol):
+                    return required_alignment
+                if any(
+                    isinstance(source, TensorPropertySource)
+                    and source.prop == TensorProperty.SIZE
+                    for sources in sources_by_symbol
+                    for source in sources
+                ):
+                    return required_alignment
+                if not env._is_static_kernel_shape_expr(dim_expr):
+                    return required_alignment
+                dim_hint = env.size_hint(dim)
+                dim_size = next_power_of_2(max(dim_hint, 1))
+                if dim_size < required_alignment:
+                    env.specialized_vars.update(symbols)
+                return min(required_alignment, dim_size)
 
             def update_requirements_from_fake_tensor_loads(self) -> None:
                 # When tensors are indexed within external lambdas called by the kernel,
@@ -2149,6 +2217,9 @@ class PallasBackend(Backend):
                                         dim_from_end, tensor.ndim, bitwidth
                                     )
                                 )
+                                required_alignment = self.cap_alignment_to_tensor_dim(
+                                    tensor, dim, required_alignment
+                                )
                                 self.maybe_update_required_alignment(
                                     info.block_id, required_alignment
                                 )
@@ -2156,8 +2227,6 @@ class PallasBackend(Backend):
         analyzer = TensorTiledAccessAnalyzer(self)
         for stmt in host_func.body:
             analyzer.visit(stmt)
-
-        from torch._inductor.runtime.runtime_utils import next_power_of_2
 
         if block_sizes is not None and kernel_tensor_sizes is not None:
             for shape in kernel_tensor_sizes:

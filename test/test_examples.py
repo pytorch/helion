@@ -129,10 +129,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             args[0] @ args[1],
         )
 
-    @xfailIfPallas(
-        "Pallas TPU clamps the N block to the lane width (128) which does"
-        " not match the test's N=96 bias dimension"
-    )
+    @xfailIfPallasInterpret("dynamic epilogue bias slices need real TPU Pallas")
     def test_matmul_bias_epilogue_wrapper(self):
         from typing import Any
         from typing import Callable
@@ -1056,7 +1053,6 @@ class TestExamples(RefEagerTestBase, TestCase):
             fn_name="concat2d_dim1",
         )
 
-    @xfailIfPallas("BlockSpec tiling failure")
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
     @skipIfTileIR("TileIR does not support block_ptr indexing")
     def test_concat_block_ptr(self):
@@ -1642,7 +1638,6 @@ class TestExamples(RefEagerTestBase, TestCase):
                     rtol=rtol,
                 )
 
-    @xfailIfPallasTpu("requires padded scalar/tile load widening")
     def test_grouped_gemm_jagged(self):
         # Build small jagged grouped GEMM inputs
         torch.manual_seed(0)
@@ -2516,7 +2511,6 @@ class TestExamples(RefEagerTestBase, TestCase):
             indexing="block_ptr",
         )
 
-    @xfailIfPallasTpu("operation not supported on TPU")
     def test_gdn_fwd_h(self):
         """Test gated delta net forward h kernel."""
         batch = 2
@@ -2539,13 +2533,8 @@ class TestExamples(RefEagerTestBase, TestCase):
             dtype=torch.float32,
             device=DEVICE,
         )
-        wu, ws, wv = torch.linalg.svd(w.permute(0, 1, 3, 2, 4), full_matrices=False)
-        w = torch.einsum("bnhik,bnhkj->bnhij", wu, wv)
-        w = (
-            w.permute(0, 1, 3, 2, 4)
-            .reshape(batch, seqlen, nheads, dhead)
-            .to(torch.bfloat16)
-        )
+        mod = import_path(EXAMPLES_DIR / "gdn_fwd_h.py")
+        w = mod._orthogonalize_w(w)
         u = torch.randn(
             batch, seqlen, nheads, dstate, dtype=torch.bfloat16, device=DEVICE
         )
@@ -2559,8 +2548,6 @@ class TestExamples(RefEagerTestBase, TestCase):
 
         args = (k, w, u, g, chunk_size)
 
-        # Import and use the reference implementation
-        mod = import_path(EXAMPLES_DIR / "gdn_fwd_h.py")
         expected = mod.ref_gdn_fwd_h(*args)
 
         check_example(
@@ -2593,10 +2580,6 @@ class TestExamples(RefEagerTestBase, TestCase):
         )
 
     @skipIfRefEager("scalar_prefetch indexing not supported in ref interpreter")
-    @xfailIfPallasTpu(
-        "unaligned data-dependent tile load; fixed later in the stack by Pallas "
-        "padded-load support (#2944)"
-    )
     def test_flex_attention(self):
         z, h, n_ctx, head_dim = 2, 4, 256, 64
         q, k, v = [
@@ -2619,9 +2602,6 @@ class TestExamples(RefEagerTestBase, TestCase):
         expected = torch.nn.functional.scaled_dot_product_attention(q, k, v)
         torch.testing.assert_close(out, expected, atol=1e-1, rtol=1e-1)
 
-    @xfailIfPallasTpu(
-        "dA_cumsum has mixed scalar+slice access (VMEM), but Mosaic requires 32-bit for VMEM scalar extracts"
-    )
     def test_mamba2_chunk_state(self):
         batch, nheads, ngroups, seqlen, chunk_size, headdim, dstate = (
             2,
