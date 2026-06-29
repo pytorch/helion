@@ -74,10 +74,14 @@ def _resident_extent(state: CodegenState, tensor: torch.Tensor, dim: int) -> int
 
     tiling = state.device_function.pallas_tensor_dim_tilings[id(tensor)][dim]
     if tiling.can_tile and len(tiling.block_ids) == 1:
+        block_id = tiling.block_ids[0]
+        from helion._compiler.pallas.codegen import _bounded_local_owner_block_id
+
+        owner_block_id = _bounded_local_owner_block_id(state, block_id, tensor, dim)
+        if owner_block_id is not None:
+            block_id = owner_block_id
         block_size = (
-            CompileEnvironment.current()
-            .block_sizes[tiling.block_ids[0]]
-            .from_config(state.config)
+            CompileEnvironment.current().block_sizes[block_id].from_config(state.config)
         )
         if not isinstance(block_size, int):
             raise NotImplementedError(

@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
+from unittest.mock import patch
+
 import torch
 from torch.testing._internal.common_utils import instantiate_parametrized_tests
 from torch.testing._internal.common_utils import parametrize
@@ -618,6 +621,51 @@ class TestPallasVmemScalarLoad(TestCase):
         code, result = code_and_output(row_flip_load, (source.to(DEVICE),))
         self.assertNotIn("pltpu.roll", code)
         torch.testing.assert_close(result, source.flip(0).to(DEVICE))
+
+    def test_runtime_negative_row_index_32bit(self) -> None:
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def negative_row_load(x: torch.Tensor) -> torch.Tensor:
+            rows, _cols = x.shape
+            out = torch.empty_like(x)
+            for row in hl.grid(rows):
+                out[row, :] = x[row - rows, :]
+            return out
+
+        source = torch.arange(17 * 65, dtype=torch.float32).reshape(17, 65)
+        code, result = code_and_output(negative_row_load, (source.to(DEVICE),))
+        self.assertNotIn("pltpu.roll", code)
+        self.assertIn("jnp.where", code)
+        torch.testing.assert_close(result, source.to(DEVICE))
+
+    def test_bounded_owner_sets_resident_extent(self) -> None:
+        from helion._compiler.compile_environment import CompileEnvironment
+        from helion._compiler.pallas.vmem_scalar_load import _resident_extent
+
+        tensor = torch.empty((128, 64), dtype=torch.bfloat16)
+        dim_tilings = [
+            SimpleNamespace(can_tile=True, block_ids=[1]),
+            SimpleNamespace(can_tile=False, block_ids=[]),
+        ]
+        state = SimpleNamespace(
+            config=object(),
+            device_function=SimpleNamespace(
+                pallas_tensor_dim_tilings={id(tensor): dim_tilings}
+            ),
+        )
+        env = SimpleNamespace(
+            block_sizes=[
+                SimpleNamespace(from_config=lambda config: 64),
+                SimpleNamespace(from_config=lambda config: 32),
+            ]
+        )
+        with (
+            patch.object(CompileEnvironment, "current", return_value=env),
+            patch(
+                "helion._compiler.pallas.codegen._bounded_local_owner_block_id",
+                return_value=0,
+            ),
+        ):
+            self.assertEqual(_resident_extent(state, tensor, 0), 64)  # type: ignore[arg-type]
 
     @parametrize(
         "dtype",
