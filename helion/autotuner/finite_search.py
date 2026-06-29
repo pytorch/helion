@@ -45,7 +45,8 @@ class FiniteSearch(BaseSearch):
             if result.perf < best_time:
                 best_time = result.perf
                 best_config = result.config
-        assert best_config is not None
+        if best_config is None:
+            raise exc.NoConfigFound
         return best_config
 
 

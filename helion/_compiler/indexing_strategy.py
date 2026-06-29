@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 import collections
+import contextlib
 import dataclasses
 import logging
 from typing import TYPE_CHECKING
@@ -22,6 +23,7 @@ from .compile_environment import CompileEnvironment
 from .compile_environment import _symint_expr
 from .device_function import DeviceFunction
 from .dtype_utils import cast_ast
+from .dtype_utils import is_fp8_dtype
 from .host_function import HostFunction
 from .tile_strategy import DeviceLoopState
 from .utils import compute_slice_size
@@ -55,6 +57,18 @@ class TileWithOffsetInfo(NamedTuple):
             if self.block_size is not None
             else env.block_sizes[env.canonical_block_id(self.block_id)].var
         )
+
+
+def _zero_literal_for_dtype(dtype: torch.dtype) -> str:
+    if is_fp8_dtype(dtype):
+        return "0.0"
+    return "0"
+
+
+def _block_ptr_boundary_check_kwarg(boundary_check: str) -> str:
+    if boundary_check == "None":
+        return ""
+    return f", boundary_check={boundary_check}"
 
 
 def _get_padded_iota_original_length(
@@ -584,12 +598,8 @@ class PointerIndexingStrategy(IndexingStrategy):
         indexing = SubscriptIndexing.create(state, fake_tensor, subscript, extra_mask)
         extra = ""
         if indexing.has_mask():
-            # For FP8 dtypes, use other=0.0 (float literal) instead of other=0 (int literal)
-            # because Triton cannot cast integer 0 to FP8 types
-            if fake_tensor.dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
-                extra = ", other=0.0"
-            else:
-                extra = ", other=0"
+            # Triton cannot cast an integer zero literal to FP8 types.
+            extra = f", other={_zero_literal_for_dtype(fake_tensor.dtype)}"
         name = state.device_function.tensor_arg(fake_tensor).name
         # Optional hint for the allowlisted blocked-gather pattern.
         offset_ast = indexing.index_expr
@@ -789,7 +799,20 @@ class BlockPtrIndexingStrategy(IndexingStrategy):
                 cache_modifier,
             )
         indexing = BlockedSubscriptIndexing.create(state, fake_tensor, subscript)
+        boundary_check = indexing.boundary_check(state)
+        if boundary_check != "None" and is_fp8_dtype(fake_tensor.dtype):
+            return PointerIndexingStrategy().codegen_load(
+                state,
+                fake_tensor,
+                subscript,
+                extra_mask,
+                eviction_policy,
+                cache_modifier,
+            )
         extra = ""
+        boundary_check_kwarg = _block_ptr_boundary_check_kwarg(boundary_check)
+        if boundary_check != "None":
+            extra += ", padding_option='zero'"
         extra += ", eviction_policy={ev}" if eviction_policy is not None else ""
         extra += ", cache_modifier={cm}" if cache_modifier is not None else ""
         load_placeholders: dict[str, ast.AST] = {
@@ -802,14 +825,15 @@ class BlockPtrIndexingStrategy(IndexingStrategy):
         result = indexing.reshape_load(
             state,
             expr_from_string(
-                f"tl.load({{block_ptr}}, boundary_check={indexing.boundary_check(state)}, padding_option='zero'{extra})",
+                f"tl.load({{block_ptr}}{boundary_check_kwarg}{extra})",
                 **load_placeholders,
             ),
         )
 
         if extra_mask is not None:
+            zero = _zero_literal_for_dtype(fake_tensor.dtype)
             result = expr_from_string(
-                "tl.where({extra_mask}, {value}, 0)",
+                f"tl.where({{extra_mask}}, {{value}}, {zero})",
                 extra_mask=extra_mask,
                 value=result,
             )
@@ -834,6 +858,9 @@ class BlockPtrIndexingStrategy(IndexingStrategy):
         indexing = BlockedSubscriptIndexing.create(state, fake_tensor, subscript)
         store_value = indexing.reshape_store(state, value)
         store_value = cast_ast(store_value, fake_tensor.dtype)
+        boundary_check_kwarg = _block_ptr_boundary_check_kwarg(
+            indexing.boundary_check(state)
+        )
         extra = ", cache_modifier={cm}" if cache_modifier is not None else ""
         placeholders: dict[str, ast.AST] = {
             "block_ptr": indexing.make_block_ptr(state),
@@ -842,7 +869,7 @@ class BlockPtrIndexingStrategy(IndexingStrategy):
         if cache_modifier is not None:
             placeholders["cm"] = cache_modifier
         return expr_from_string(
-            f"tl.store({{block_ptr}}, {{value}}, boundary_check={indexing.boundary_check(state)}{extra})",
+            f"tl.store({{block_ptr}}, {{value}}{boundary_check_kwarg}{extra})",
             **placeholders,
         )
 
@@ -1825,11 +1852,26 @@ class BlockedSubscriptIndexing:
 
     def boundary_check(self, state: CodegenState) -> str:
         result = []
+        env = CompileEnvironment.current()
         for order, size in enumerate(self.block_shape):
             if not (isinstance(size, int) and size == 1):
-                # TODO(jansel): we should be able to filter with something like:
-                # block_idx = TileStrategy.get_block_index(size)
-                # if block_idx is None or state.tile_strategy.need_mask(block_idx):
+                block_idx = env.get_block_id(size)
+                if block_idx is not None:
+                    block_idx = _resolve_codegen_block_id(state, block_idx)
+                    loops = state.codegen.active_device_loops.get(block_idx)
+                    offset_var = None
+                    if loops:
+                        with contextlib.suppress(NotImplementedError):
+                            offset_var = state.codegen.offset_var(block_idx)
+                    if loops and self.offsets[order] == offset_var:
+                        loop_state = loops[-1]
+                        loop_info = loop_state.block_id_to_info.get(block_idx)
+                        if (
+                            loop_info is not None
+                            and loop_info.is_end_proven_matching(self.base.size(order))
+                            and loop_state.strategy.mask_var(block_idx) is None
+                        ):
+                            continue
                 result.append(order)
         if result:
             return repr(result)

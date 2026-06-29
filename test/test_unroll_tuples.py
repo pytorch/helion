@@ -14,6 +14,7 @@ from helion._testing import TestCase
 from helion._testing import _get_backend
 from helion._testing import code_and_output
 from helion._testing import onlyBackends
+from helion._testing import skipIfA10G
 from helion._testing import skipIfCute
 from helion._testing import skipIfRefEager
 from helion._testing import skipIfRocm
@@ -982,6 +983,7 @@ class TestUnrollTuples(RefEagerTestBase, TestCase):
 
     @largeTensorTest("12GB", device=DEVICE)
     @skipIfRefEager("Benchmark not applicable in ref eager mode")
+    @skipIfA10G("Benchmark timing unreliable on A10G")
     @skipIfRocm("Benchmark timing unreliable on ROCm")
     @skipIfXPU("Benchmark timing unreliable on XPU")
     @unittest.skipIf(
