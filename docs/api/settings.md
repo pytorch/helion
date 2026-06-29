@@ -94,11 +94,11 @@ def my_kernel(x: torch.Tensor) -> torch.Tensor:
 
    Supported values depend on the backend:
    - Triton (GPU): ``"tf32"``, ``"tf32x3"``, ``"ieee"``
-   - Pallas (TPU): ``"default"`` (forces JAX default, typically bfloat16), ``"high"``, ``"highest"`` (float32 emulation).
+   - Pallas (TPU): ``"default"``, ``"high"``, ``"highest"`` and portable Triton aliases are accepted.
 
-   However, unified mappings exist so you can use any value on any backend. They map to the closest equivalent of equal or higher precision:
+   However, unified mappings exist so you can use any value on any backend:
    - On Triton: ``"default"`` maps to ``"tf32"``, ``"high"`` maps to ``"tf32x3"``, and ``"highest"`` maps to ``"ieee"``.
-   - On Pallas: ``"tf32"``, ``"tf32x3"`` and ``"ieee"`` all map to ``"highest"``.
+   - On Pallas/TPU: all values currently emit JAX default precision. JAX ``"high"``/``"highest"`` fp32 dot precision is not used because it is less compatible with PyTorch eager references on the supported TPU stack.
 
 .. autoattribute:: Settings.static_shapes
 
@@ -316,7 +316,7 @@ Built-in values for ``HELION_AUTOTUNER`` include ``"LFBOTreeSearch"`` (default),
 | Environment Variable | Maps To | Description |
 |----------------------|---------|-------------|
 | ``TRITON_F32_DEFAULT`` | ``dot_precision`` | Sets default floating-point precision for Triton dot products (``"tf32"``, ``"tf32x3"``, ``"ieee"``). This variable does not apply to the Pallas backend. |
-| ``JAX_DEFAULT_MATMUL_PRECISION`` | ``dot_precision`` | Sets default matmul precision for Pallas dot products (JAX values: ``"default"``, ``"high"``, ``"highest"``, etc., mapped to Helion ``DotPrecision``). This variable does not apply to the Triton backend. |
+| ``JAX_DEFAULT_MATMUL_PRECISION`` | ``dot_precision`` | Accepts JAX matmul precision values for Pallas dot products (``"default"``, ``"high"``, ``"highest"``, etc., mapped to Helion ``DotPrecision``). On TPU these values emit Pallas default precision. This variable does not apply to the Triton backend. |
 | ``HELION_INDEX_DTYPE`` | ``index_dtype`` | Choose the index dtype (accepts any ``torch.<dtype>`` name, e.g. ``int64``), or set to ``auto``/unset to allow Helion to pick ``int32`` vs ``int64`` based on input sizes. |
 | ``HELION_STATIC_SHAPES`` | ``static_shapes`` | Set to ``0``/``false`` to disable global static shape specialization. |
 | ``HELION_FAST_MATH`` | ``fast_math`` | Set to ``1`` to enable fast math approximations (Helion-level and Inductor-level). May reduce numerical precision. |
