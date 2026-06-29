@@ -28,6 +28,7 @@ from helion._compiler.tile_strategy import DeviceGridState
 from helion._compiler.tile_strategy import DeviceLoopState
 from helion._compiler.tile_strategy import EmitPipelineLoopState
 from helion._compiler.tile_strategy import ForiLoopState
+from helion._utils import is_scalar_index
 
 _FULL_LOAD_SELECT_MAX_BYTES = 256 << 10
 
@@ -1177,8 +1178,6 @@ def _arbitrary_index_pattern_code(
     subscript_index: int,
     in_pipeline: bool,
 ) -> str:
-    from helion._utils import is_scalar_index
-
     if in_pipeline and is_scalar_index(idx):
         return "0"
     if isinstance(idx, int):

@@ -46,6 +46,7 @@ from .ast_extension import create
 from .ast_extension import expr_from_string
 from .ast_read_writes import ReadWrites
 from .compile_environment import CompileEnvironment
+from .compile_environment import _symint_free_symbols
 from .host_function import HostFunction
 from .inductor_lowering import APIFuncLowering
 from .inductor_lowering import CodegenState
@@ -2697,7 +2698,6 @@ def _maybe_specialize_pallas_matmul_alignment_dim(
         return
 
     from .backend import PallasBackend
-    from .compile_environment import _symint_free_symbols
 
     backend = env.backend
     assert isinstance(backend, PallasBackend)

@@ -653,42 +653,40 @@ def _pallas_combine_result_expressions(
     arg_exprs: list[str],
 ) -> list[str]:
     """Inline the combine graph as JAX expressions for Pallas serial scan."""
-    import operator as operator_mod
-
     graph = helper_graph_info.graph
     placeholders = [n for n in graph.nodes if n.op == "placeholder"]
     if len(placeholders) != len(arg_exprs):
         raise exc.BackendUnsupported("pallas", "associative_scan combine arity")
 
     binary_ops: dict[object, str] = {
-        operator_mod.add: "+",
+        operator.add: "+",
         torch.add: "+",
         torch.ops.aten.add.Tensor: "+",
         torch.ops.aten.add.Scalar: "+",
-        operator_mod.sub: "-",
+        operator.sub: "-",
         torch.sub: "-",
         torch.ops.aten.sub.Tensor: "-",
         torch.ops.aten.sub.Scalar: "-",
-        operator_mod.mul: "*",
+        operator.mul: "*",
         torch.mul: "*",
         torch.ops.aten.mul.Tensor: "*",
         torch.ops.aten.mul.Scalar: "*",
-        operator_mod.eq: "==",
+        operator.eq: "==",
         torch.ops.aten.eq.Tensor: "==",
         torch.ops.aten.eq.Scalar: "==",
-        operator_mod.ne: "!=",
+        operator.ne: "!=",
         torch.ops.aten.ne.Tensor: "!=",
         torch.ops.aten.ne.Scalar: "!=",
-        operator_mod.lt: "<",
+        operator.lt: "<",
         torch.ops.aten.lt.Tensor: "<",
         torch.ops.aten.lt.Scalar: "<",
-        operator_mod.gt: ">",
+        operator.gt: ">",
         torch.ops.aten.gt.Tensor: ">",
         torch.ops.aten.gt.Scalar: ">",
-        operator_mod.le: "<=",
+        operator.le: "<=",
         torch.ops.aten.le.Tensor: "<=",
         torch.ops.aten.le.Scalar: "<=",
-        operator_mod.ge: ">=",
+        operator.ge: ">=",
         torch.ops.aten.ge.Tensor: ">=",
         torch.ops.aten.ge.Scalar: ">=",
     }
@@ -838,8 +836,6 @@ def _cute_inline_combine_graph(
     assignment statements (to be spliced inside the scan ``for`` loop) and
     ``out_exprs`` are the output expression strings, one per tuple element.
     """
-    import operator as operator_mod
-
     from .._compiler.compile_environment import CompileEnvironment
     from .._compiler.device_ir import HelperFunctionGraphInfo
 
@@ -856,15 +852,15 @@ def _cute_inline_combine_graph(
     arg_vars = [*left_vars, *right_vars]
 
     binary_ops: dict[object, str] = {
-        operator_mod.add: "+",
+        operator.add: "+",
         torch.add: "+",
         torch.ops.aten.add.Tensor: "+",
         torch.ops.aten.add.Scalar: "+",
-        operator_mod.sub: "-",
+        operator.sub: "-",
         torch.sub: "-",
         torch.ops.aten.sub.Tensor: "-",
         torch.ops.aten.sub.Scalar: "-",
-        operator_mod.mul: "*",
+        operator.mul: "*",
         torch.mul: "*",
         torch.ops.aten.mul.Tensor: "*",
         torch.ops.aten.mul.Scalar: "*",
@@ -1198,21 +1194,19 @@ def _get_input_tensor_ast(state: CodegenState, is_tuple_input: bool) -> ast.AST:
 
 
 def _scan_combine_operator(helper_graph_info: HelperFunctionGraphInfo) -> str:
-    import operator as operator_mod
-
     graph = helper_graph_info.graph
     for node in graph.nodes:
         if node.op != "call_function":
             continue
         if node.target in (
-            operator_mod.add,
+            operator.add,
             torch.add,
             torch.ops.aten.add.Tensor,
             torch.ops.aten.add.Scalar,
         ):
             return "add"
         if node.target in (
-            operator_mod.mul,
+            operator.mul,
             torch.mul,
             torch.ops.aten.mul.Tensor,
             torch.ops.aten.mul.Scalar,
