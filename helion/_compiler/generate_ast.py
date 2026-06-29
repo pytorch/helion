@@ -28,6 +28,7 @@ from .ast_read_writes import definitely_does_not_have_side_effects
 from .compile_environment import CompileEnvironment
 from .device_function import ConstExprArg
 from .device_function import DeviceFunction
+from .device_function import SymbolArgument
 from .helper_function import CodegenInterface
 from .inductor_lowering import CodegenState
 from .inductor_lowering import codegen_call_with_graph
@@ -48,7 +49,6 @@ if TYPE_CHECKING:
     from ..runtime import Config
     from .device_ir import GraphInfo
     from .host_function import HostFunction
-    from .loop_dependency_checker import LoopDependencyChecker
     from .pallas.compact_worklist import ResidentPrepHoist
     from .tile_strategy import DeviceLoopOrGridState
     from .type_info import TensorType
@@ -172,6 +172,21 @@ class GenerateAST(NodeVisitor, CodegenInterface):
             CompileEnvironment.current().backend.name == "pallas"
             and len(func.device_ir.root_ids) > 1
         )
+        self._pallas_barrier_phase_arg: str | None = None
+        self._pallas_barrier_phase_host_var: str | None = None
+        if self._pallas_direct_cases and len(func.device_ir.phases) > 1:
+            self._pallas_barrier_phase_arg = self.device_function.new_var(
+                "helion_phase"
+            )
+            self._pallas_barrier_phase_host_var = self.device_function.new_var(
+                "helion_phase_host"
+            )
+            self.device_function.arguments.append(
+                SymbolArgument(
+                    self._pallas_barrier_phase_arg,
+                    self._pallas_barrier_phase_host_var,
+                )
+            )
 
         # Decide once which sibling for-loops need a tl.debug_barrier()
         # to make global writes visible to subsequent reads.
@@ -224,10 +239,15 @@ class GenerateAST(NodeVisitor, CodegenInterface):
         root_id: int,
         body: list[ast.AST],
     ) -> None:
-        """Guard each Pallas root body by its immutable launch PID range."""
+        """Guard each Pallas root body by its launch case and optional phase."""
         if not self._pallas_direct_cases:
             return
-        fn_name = self.device_function.new_var(f"helion_case_root_{root_id}")
+        phase = self.host_function.device_ir.phase_for_root(root_id)
+        fn_name = self.device_function.new_var(
+            f"helion_phase_{phase}_root_{root_id}"
+            if self._pallas_barrier_phase_arg is not None
+            else f"helion_case_root_{root_id}"
+        )
         pid = self.device_function.pid
         assert isinstance(pid, ForEachProgramID)
         assert root_id < len(pid.cases), "missing Pallas direct case PID metadata"
@@ -245,6 +265,8 @@ class GenerateAST(NodeVisitor, CodegenInterface):
         condition = (
             f"({pid.shared_pid_var} >= ({start})) & ({pid.shared_pid_var} < ({end}))"
         )
+        if self._pallas_barrier_phase_arg is not None:
+            condition = f"({self._pallas_barrier_phase_arg} == {phase}) & ({condition})"
         body[:] = [
             create(
                 ast.FunctionDef,
@@ -266,10 +288,6 @@ class GenerateAST(NodeVisitor, CodegenInterface):
                 type_params=[],
             )
         ]
-
-    def _phase_checker(self, root_id: int) -> LoopDependencyChecker:
-        phase_idx = self.host_function.device_ir.phase_for_root(root_id)
-        return self.host_function.device_ir.phases[phase_idx].loop_dependency_checker
 
     def _compute_inter_loop_barriers(self) -> None:
         """Walk every codegen graph; for each pair of consecutive sibling
@@ -1074,15 +1092,12 @@ class GenerateAST(NodeVisitor, CodegenInterface):
             assert not node.orelse
 
             assert node._root_id is not None
-            # Loop dependency checks were already run during lowering; phase checker kept for symmetry/debug.
-            self._phase_checker(node._root_id)
 
             if len(self.host_function.device_ir.root_ids) == 1:
                 body = self.device_function.body
             else:
                 assert len(self.host_function.device_ir.root_ids) > 1
                 # Multiple top level for loops
-
                 if node._root_id == 0:
                     self.device_function.set_pid(
                         ForEachProgramID(
@@ -1459,7 +1474,9 @@ def generate_ast(
         env = CompileEnvironment.current()
         env.cute_resolved_wrapper_plans = []
         if len(func.device_ir.phases) > 1:
-            if not str(config.pid_type).startswith("persistent"):
+            if CompileEnvironment.current().backend.name != "pallas" and not str(
+                config.pid_type
+            ).startswith("persistent"):
                 raise exc.BarrierRequiresPersistent(config.pid_type)
         codegen = GenerateAST(
             func,

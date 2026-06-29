@@ -1328,6 +1328,56 @@ class PallasBackend(Backend):
             result.append((tuple(block_shape), tuple(grid_dims)))
         return result
 
+    def _pallas_phase_case_metadata(
+        self,
+        sorted_args: list[Argument] | None,
+        config: Config,
+    ) -> (
+        tuple[int, tuple[tuple[int, _PallasLaunchScalar, _PallasLaunchScalar], ...]]
+        | None
+    ):
+        """Return the phase argument position and each Pallas case PID range."""
+        if sorted_args is None:
+            return None
+
+        from ..device_function import DeviceFunction
+        from ..device_function import SymbolArgument
+        from ..program_id import ForEachProgramID
+
+        device_fn = DeviceFunction.current()
+        phase_arg = getattr(device_fn.codegen, "_pallas_barrier_phase_arg", None)
+        if phase_arg is None or not isinstance(device_fn.pid, ForEachProgramID):
+            return None
+
+        phase_arg_index = next(
+            (
+                i
+                for i, arg in enumerate(sorted_args)
+                if isinstance(arg, SymbolArgument) and arg.name == phase_arg
+            ),
+            None,
+        )
+        if phase_arg_index is None:
+            raise NotImplementedError(
+                "Pallas direct case launches require the phase argument in "
+                "launcher args"
+            )
+        if len(device_fn.pid.case_phases) != len(device_fn.pid.cases):
+            raise NotImplementedError(
+                "Pallas direct case launches require one phase entry per ForEach case"
+            )
+
+        ranges: list[tuple[int, _PallasLaunchScalar, _PallasLaunchScalar]] = []
+        start: _PallasLaunchScalar = 0
+        for phase, case in zip(
+            device_fn.pid.case_phases, device_fn.pid.cases, strict=True
+        ):
+            total = _PallasLaunchExpr(case.total_pids_expr(is_device=False))
+            end = _pallas_add_launch_values(start, total)
+            ranges.append((phase, start, end))
+            start = end
+        return phase_arg_index, tuple(ranges)
+
     def _compute_pad_info(
         self,
         sorted_args: list[Argument] | None,
@@ -1340,8 +1390,9 @@ class PallasBackend(Backend):
         empty resident operand needs (see :meth:`_zero_row_resident_pad_info`).
 
         Returns ``[(arg_index, tensor_dim, block_size, extra_pad), ...]``
-        or ``None``.  The launcher computes the actual pad amount at runtime
-        as ``(-tensor.shape[dim]) % block_size + extra_pad``.
+        or ``None``.  The launcher computes each requirement at runtime as
+        ``(-tensor.shape[dim]) % block_size + extra_pad`` and applies the
+        maximum required pad per ``(arg_index, tensor_dim)``.
 
         ``extra_pad`` is 0 when the tile loop starts at offset 0,
         ``begin % block_size`` for a constant begin offset, or
@@ -1357,19 +1408,26 @@ class PallasBackend(Backend):
         env = CompileEnvironment.current()
         device_fn = DeviceFunction.current()
 
-        result: list[tuple[int, int, int, int]] = []
-        if device_fn.pallas_pad_info:
-            for i, arg in enumerate(sorted_args):
-                if not isinstance(arg, TensorArg):
-                    continue
-                dims_info = device_fn.pallas_pad_info.get(id(arg.fake_value))
-                if dims_info is not None:
-                    for dim, (block_id, extra_pad) in dims_info.items():
+        result_by_key: dict[tuple[int, int, int], int] = {}
+        for i, arg in enumerate(sorted_args):
+            if not isinstance(arg, TensorArg):
+                continue
+            dims_info = device_fn.pallas_pad_info.get(id(arg.fake_value))
+            if dims_info is not None:
+                for dim, entries in dims_info.items():
+                    for block_id, extra_pad in entries:
                         bsi = env.block_sizes[block_id]
                         bs = bsi.from_config(config)
                         if isinstance(bs, int) and bs > 1:
-                            result.append((i, dim, bs, extra_pad))
+                            key = (i, dim, bs)
+                            result_by_key[key] = max(
+                                result_by_key.get(key, 0), extra_pad
+                            )
 
+        result = [
+            (arg_index, dim, bs, extra_pad)
+            for (arg_index, dim, bs), extra_pad in result_by_key.items()
+        ]
         result.extend(self._zero_row_resident_pad_info(sorted_args))
         return result or None
 
@@ -1576,7 +1634,9 @@ class PallasBackend(Backend):
         if sorted_args is not None:
             env = CompileEnvironment.current()
             host_fn = HostFunction.current()
-            read_names, write_names = device_fn.get_tensor_read_write_names()
+            read_names, write_names = device_fn.get_tensor_read_write_names(
+                register_missing=False
+            )
             mutated_params = write_names & {a.arg for a in host_fn.args.args}
             input_storages = {id(t.untyped_storage()) for t in env.input_sources}
             # Only tensors allocated with torch.empty/empty_like/new_empty can be
@@ -1603,7 +1663,7 @@ class PallasBackend(Backend):
                     output_indices.append(i)
                     inplace_indices.append(i)
 
-        if isinstance(device_fn.pid, ForEachProgramID):
+        if has_barrier or isinstance(device_fn.pid, ForEachProgramID):
             # A ForEach launch flattens disjoint case ranges. Programs outside
             # an output's case must preserve its current tile.
             inplace_indices = list(output_indices)
@@ -1679,6 +1739,13 @@ class PallasBackend(Backend):
                 block_spec_info.append(None)  # RNG seed buffer is untiled
             launcher_args.append(
                 f"_block_spec_info={_format_pallas_launch_value(block_spec_info)}"
+            )
+
+        phase_case_metadata = self._pallas_phase_case_metadata(sorted_args, config)
+        if phase_case_metadata is not None:
+            launcher_args.append(
+                "_pallas_phase_case_metadata="
+                f"{_format_pallas_launch_value(phase_case_metadata)}"
             )
 
         pad_info = self._compute_pad_info(sorted_args, config)
@@ -1899,6 +1966,8 @@ class PallasBackend(Backend):
     ) -> None:
         from ...autotuner.config_spec import VALID_PALLAS_WORKLIST_GROUPINGS
         from ..compile_environment import CompileEnvironment
+        from ..device_function import DeviceFunction
+        from ..host_function import HostFunction
         from .plan_tiling import plan_tiling
         from .tensorcore_plan import build_tensorcore_plans
 
@@ -1916,6 +1985,55 @@ class PallasBackend(Backend):
         plan_tiling(graphs, config, tile_strategy)
         _disable_partial_initialized_store_tiling(graphs)
         build_tensorcore_plans(graphs, config)
+
+        device_ir = HostFunction.current().device_ir
+        if len(device_ir.grid_block_ids) > 1:
+            for block_ids in device_ir.grid_block_ids:
+                if len(block_ids) > 1 and env.block_sizes[block_ids[0]].is_flattened(
+                    config
+                ):
+                    raise exc.InvalidConfig(
+                        "Pallas ForEach launches do not support multi-axis "
+                        "flattened grids; set flatten_loops=False"
+                    )
+
+            block_id_root_counts: dict[int, int] = {}
+            for block_ids in device_ir.grid_block_ids:
+                for block_id in set(block_ids):
+                    block_id_root_counts[block_id] = (
+                        block_id_root_counts.get(block_id, 0) + 1
+                    )
+            reused_block_ids = {
+                block_id
+                for block_id, count in block_id_root_counts.items()
+                if count > 1
+            }
+            if reused_block_ids:
+
+                def is_owned_by_reused_grid(block_id: int) -> bool:
+                    seen: set[int] = set()
+                    while block_id not in seen:
+                        if block_id in reused_block_ids:
+                            return True
+                        seen.add(block_id)
+                        try:
+                            spec = env.config_spec.block_sizes.block_id_lookup(block_id)
+                        except KeyError:
+                            return False
+                        owner = spec.owner_relative_bounded_by_block_id
+                        if owner is None:
+                            return False
+                        block_id = owner
+                    return False
+
+                device_fn = DeviceFunction.current()
+                for dim_tilings in device_fn.pallas_tensor_dim_tilings.values():
+                    for dim_tiling in dim_tilings:
+                        if any(
+                            is_owned_by_reused_grid(block_id)
+                            for block_id in dim_tiling.block_ids
+                        ):
+                            dim_tiling.can_tile = False
 
         # compact_worklist_* is per-CONFIG state, but one CompileEnvironment is
         # reused across all configs of a BoundKernel (see CompileEnvironment's
