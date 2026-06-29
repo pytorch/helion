@@ -676,9 +676,8 @@ class PersistentReductionStrategy(ReductionStrategy):
         # This is true when numel is a power of 2 (Triton doesn't round),
         # or when the backend uses exact RDIM sizes (e.g., Pallas).
         needs_mask = True
-        # Guard numel > 0: on PyTorch 2.9, next_power_of_2(0) returns 0
-        # (the n <= 0 guard was added later), so static_rdim_size(0) == 0
-        # would incorrectly skip the mask for zero-size reductions.
+        # Guard numel > 0 so zero-size reductions keep a false mask even on
+        # backends that use an exact physical reduction extent.
         if isinstance(numel, (int, sympy.Integer)) and int(numel) > 0:
             needs_mask = env.backend.static_rdim_size(int(numel)) != int(numel)
         mask_var: str | None = (
