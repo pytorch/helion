@@ -81,6 +81,11 @@ def select_tensorcore_plan(
         return _one_hot_gather(access, positions, config)
     if access.kind is MemoryAccessKind.STORE:
         return _one_hot_scatter(access, positions, config)
+    if access.kind is MemoryAccessKind.ATOMIC:
+        from ...language.atomic_ops import atomic_add
+
+        if access.node.target is atomic_add:
+            return _one_hot_scatter(access, positions, config)
     op = access.node.target
     op_name = getattr(op, "__name__", str(op))
     raise NotImplementedError(

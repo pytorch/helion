@@ -1612,6 +1612,54 @@ class PallasBackend(Backend):
         )
 
         block_spec_info = self._compute_block_spec_info(sorted_args, config)
+        target_ids = device_fn.pallas_tensor_index_atomic_target_ids
+        if target_ids:
+            # Tensor-index atomic_add lowers to a local read/modify/write. It is
+            # correct across programs only when the launcher can serialize every
+            # program sharing the target BlockSpec tile.
+            if any(config.flatten_loops):
+                raise NotImplementedError(
+                    "Pallas tensor-indexed atomic_add does not support flattened "
+                    "loops without shared-output BlockSpec metadata"
+                )
+            if sorted_args is None or block_spec_info is None:
+                raise NotImplementedError(
+                    "Pallas tensor-indexed atomic_add requires block spec info "
+                    "for shared-output serialization"
+                )
+            target_positions = [
+                i
+                for i, arg in enumerate(sorted_args)
+                if isinstance(arg, TensorArg) and id(arg.fake_value) in target_ids
+            ]
+            if len(target_positions) != len(target_ids):
+                raise NotImplementedError(
+                    "Pallas tensor-indexed atomic_add target was not found in "
+                    "launcher arguments"
+                )
+            output_set = set(output_indices)
+            inplace_set = set(inplace_indices)
+            for pos in target_positions:
+                if pos not in output_set or pos not in inplace_set:
+                    raise NotImplementedError(
+                        "Pallas tensor-indexed atomic_add requires an in-place "
+                        "output so shared-output serialization can guard the RMW"
+                    )
+                block_info = (
+                    block_spec_info[pos] if pos < len(block_spec_info) else None
+                )
+                if block_info is None:
+                    raise NotImplementedError(
+                        "Pallas tensor-indexed atomic_add requires block spec info "
+                        "for shared-output serialization"
+                    )
+                _block_shape, grid_dims = block_info
+                if any(isinstance(grid_dim, tuple) for grid_dim in grid_dims):
+                    raise NotImplementedError(
+                        "Pallas tensor-indexed atomic_add does not support "
+                        "ForEach or flattened grid decompositions without "
+                        "shared-output BlockSpec metadata"
+                    )
         if block_spec_info is not None:
             if has_rng_ops:
                 block_spec_info.append(None)  # RNG seed buffer is untiled
