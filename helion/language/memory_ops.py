@@ -374,7 +374,7 @@ def _(state: CodegenState) -> None:
     from .._compiler.pallas.ordered_carry import emit_carry_store
 
     if not scatter_patterns and state.device_function.carry_tiles:
-        if emit_carry_store(state, tensor, subscript, name, idx_str, value):
+        if emit_carry_store(state, tensor, subscript, name, parts, value):
             return
     if tensor.dtype is torch.bool:
         value = CompileEnvironment.current().backend.cast_ast(value, torch.bool)
