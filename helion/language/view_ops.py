@@ -123,12 +123,14 @@ def _(state: CodegenState) -> ast.AST:
     output_index = ", ".join(output_keys)
     tensor = state.proxy_arg(0)
     if has_new_axis and isinstance(tensor, torch.Tensor) and tensor.dtype is torch.bool:
-        # Mosaic cannot reshape bool vectors directly. Cast before adding the
-        # broadcast axis, then convert the shaped mask back to bool.
-        return expr_from_string(
-            f"(({{base}}).astype(jnp.int32)[{output_index}] != 0)",
-            base=state.ast_arg(0),
-        )
+        from .._compiler.pallas import codegen as pallas_codegen
+
+        # Mosaic cannot reshape bool vectors directly. Keep shaped masks numeric
+        # until a predicate consumer needs bool.
+        output = state.fake_value
+        assert isinstance(output, torch.Tensor)
+        shape = state.tile_strategy.shape_str([*output.size()])
+        return pallas_codegen.numeric_mask_reshape_expr(state.ast_arg(0), shape)
 
     return expr_from_string(
         f"{{base}}[{output_index}]",

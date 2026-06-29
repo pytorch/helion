@@ -727,6 +727,49 @@ def kernel_tile_begin_plus_offset_is_elementwise(
 @onlyBackends(["triton", "pallas"])
 @skipUnlessPallas("JAX/Pallas TPU not available")
 class TestPallas(TestCase):
+    def _assert_shape_safe_numeric_mask(self, code: str) -> None:
+        self.assertNotRegex(
+            code,
+            r"jnp\.where\([^\n]*(?:"
+            r"jnp\.ones_like[^\n]*jnp\.zeros_like|"
+            r"jnp\.zeros_like[^\n]*jnp\.ones_like"
+            r")",
+        )
+        self.assertNotRegex(
+            code,
+            r"\.astype\(jnp\.int32\)\[[^\]]*\bNone\b",
+        )
+        self.assertNotRegex(
+            code,
+            r"lax\.convert_element_type\([^\n]*\)\[None",
+        )
+        self.assertNotIn("optimization_barrier", code)
+
+    def _assert_numeric_mask_reshape(self, code: str, shape_pattern: str) -> None:
+        bool_to_int = r"[^\n,]+\.astype\(jnp\.int32\)"
+        one_int32 = r"jnp\.array\(1, dtype=jnp\.int32\)"
+        patterns = [
+            rf"jnp\.reshape\({bool_to_int}, {shape_pattern}",
+            (
+                rf"jnp\.reshape\(jnp\.minimum\({bool_to_int}, {one_int32}\), "
+                rf"{shape_pattern}"
+            ),
+        ]
+        if not any(re.search(pattern, code) for pattern in patterns):
+            self.fail(
+                "expected numeric mask reshape to use direct bool-to-int "
+                "conversion, optionally clamped with jnp.minimum"
+            )
+
+    def _assert_layout_tied_numeric_mask_bits(self, code: str) -> None:
+        self.assertRegex(
+            code,
+            r"lax\.convert_element_type\("
+            r"jnp\.ones_like\([^\n]+,\s*dtype=jnp\.bfloat16\)\s*\*\s*"
+            r"lax\.convert_element_type\([^\n]+,\s*jnp\.bfloat16\),\s*"
+            r"jnp\.(?:u?int(?:8|16|32))\)",
+        )
+
     def test_slice_addressing_classification(self) -> None:
         """_slice_addressing: major dim -> DIRECT; f32 single-lane-tile sublane
         -> DIRECT; bf16 / wide-lane / unknown-lane sublane -> ALIGNED."""
@@ -1024,15 +1067,13 @@ class TestPallas(TestCase):
         self.assertIn("pltpu.make_async_copy", code)
         torch.testing.assert_close(result, x + 1.0)
 
-    def test_fori_loop_last_two_dim_ragged_store_rejected(self) -> None:
-        """A ragged (data-dependent) store whose tiled dim is one of the last two
-        (lane/sublane) dims is rejected with a clear error.
+    def test_fori_loop_last_two_dim_ragged_store_uses_masked_hbm(self) -> None:
+        """A fori_loop ragged store in a lane/sublane dim must not rely on
+        VMEM BlockSpec writeback.
 
-        Mosaic tile alignment forbids a dynamic-size clamp on the last two dims,
-        so such a store would fall back to a full-block writeback from the
-        data-dependent begin and silently overrun adjacent rows. Rather than
-        emit that, codegen raises; the user should move the ragged dimension
-        to a leading position, e.g. ``[tokens, heads, head_dim]``.
+        The fori_loop lowering routes eligible output-only tensors through a
+        VMEM scratch buffer and writes only the live row extent back to HBM via
+        ``pltpu.make_async_copy``.
         """
 
         @helion.kernel(backend="pallas", static_shapes=True)
@@ -1048,8 +1089,144 @@ class TestPallas(TestCase):
                     out[tile, :] = x[tile, :] + 1.0
             return out
 
-        # 2D tensor -> dim 0 is len(shape)-2 (a last-two dim), and the tile bounds
-        # are loaded at runtime (data-dependent), so the store is rejected.
+        x = torch.randn(8, 128, device=DEVICE, dtype=torch.float32)
+        starts = torch.tensor([0, 4], dtype=torch.int32, device=DEVICE)
+        ends = torch.tensor([4, 8], dtype=torch.int32, device=DEVICE)
+        code, result = code_and_output(
+            ragged_last_two_dim,
+            (x, starts, ends),
+            block_sizes=[8],
+            pallas_loop_type="fori_loop",
+        )
+        self.assertIn("pltpu.make_async_copy", code)
+        self.assertIn("_pipeline_arg_indices=", code)
+        self.assertNotIn("pltpu.store", code)
+        self.assertNotIn("_pallas_store", code)
+        torch.testing.assert_close(result, x + 1.0)
+
+    def test_fori_loop_unaligned_dynamic_begin_ds_load_gets_extra_pad(self) -> None:
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def ragged_copy(
+            x: torch.Tensor, starts: torch.Tensor, ends: torch.Tensor
+        ) -> torch.Tensor:
+            out = torch.empty_like(x)
+            n = starts.size(0)
+            m = x.size(1)
+            for g in hl.grid(n):
+                st = starts[g]
+                en = ends[g]
+                for tile_m in hl.tile(0, m):
+                    for tile in hl.tile(st, en):
+                        out[tile, tile_m] = x[tile, tile_m] + 1.0
+            return out
+
+        x = torch.arange(527 * 8, device=DEVICE, dtype=torch.float32).reshape(527, 8)
+        starts = torch.tensor([0, 520], dtype=torch.int32, device=DEVICE)
+        ends = torch.tensor([520, 527], dtype=torch.int32, device=DEVICE)
+        code, result = code_and_output(
+            ragged_copy,
+            (x, starts, ends),
+            block_sizes=[8, 16],
+            pallas_loop_type="fori_loop",
+        )
+
+        self.assertIn("pltpu.make_async_copy(x.at", code)
+        self.assertIn("pltpu.make_async_copy(out_buf", code)
+        self.assertIn("_pipeline_arg_indices=", code)
+        self.assertNotIn("pltpu.store", code)
+        self.assertNotIn("_pallas_store", code)
+        self.assertIn("(2, 0, 16, 15)", code)
+        self.assertIn("(3, 0, 16, 15)", code)
+        torch.testing.assert_close(result, x + 1.0)
+
+    def test_fori_loop_last_two_dim_rmw_store_rejected(self) -> None:
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def ragged_last_two_dim(
+            x: torch.Tensor, starts: torch.Tensor, ends: torch.Tensor
+        ) -> torch.Tensor:
+            n = starts.size(0)
+            for g in hl.grid(n):
+                st = starts[g]
+                en = ends[g]
+                for tile in hl.tile(st, en):
+                    x[tile, :] = x[tile, :] + 1.0
+            return x
+
+        x = torch.randn(8, 128, device=DEVICE, dtype=torch.float32)
+        starts = torch.tensor([0, 4], dtype=torch.int32, device=DEVICE)
+        ends = torch.tensor([4, 8], dtype=torch.int32, device=DEVICE)
+        with self.assertRaisesRegex(Exception, "lane/sublane"):
+            code_and_output(
+                ragged_last_two_dim,
+                (x, starts, ends),
+                block_sizes=[8],
+                pallas_loop_type="fori_loop",
+            )
+
+    def test_fori_loop_last_two_dim_initialized_store_rejected(self) -> None:
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def ragged_last_two_dim(
+            x: torch.Tensor, starts: torch.Tensor, ends: torch.Tensor
+        ) -> torch.Tensor:
+            out = torch.zeros_like(x)
+            n = starts.size(0)
+            for g in hl.grid(n):
+                st = starts[g]
+                en = ends[g]
+                for tile in hl.tile(st, en):
+                    out[tile, :] = x[tile, :] + 1.0
+            return out
+
+        x = torch.randn(8, 128, device=DEVICE, dtype=torch.float32)
+        starts = torch.tensor([0, 4], dtype=torch.int32, device=DEVICE)
+        ends = torch.tensor([4, 8], dtype=torch.int32, device=DEVICE)
+        with self.assertRaisesRegex(Exception, "lane/sublane"):
+            code_and_output(
+                ragged_last_two_dim,
+                (x, starts, ends),
+                block_sizes=[8],
+                pallas_loop_type="fori_loop",
+            )
+
+    def test_fori_loop_last_two_dim_scalar_store_rejected(self) -> None:
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def ragged_last_two_dim(
+            x: torch.Tensor, starts: torch.Tensor, ends: torch.Tensor
+        ) -> torch.Tensor:
+            out = torch.empty_like(x)
+            n = starts.size(0)
+            for g in hl.grid(n):
+                st = starts[g]
+                en = ends[g]
+                for tile in hl.tile(st, en):
+                    out[tile, :] = 1.0
+            return out
+
+        x = torch.randn(8, 128, device=DEVICE, dtype=torch.float32)
+        starts = torch.tensor([0, 4], dtype=torch.int32, device=DEVICE)
+        ends = torch.tensor([4, 8], dtype=torch.int32, device=DEVICE)
+        with self.assertRaisesRegex(Exception, "lane/sublane"):
+            code_and_output(
+                ragged_last_two_dim,
+                (x, starts, ends),
+                block_sizes=[8],
+                pallas_loop_type="fori_loop",
+            )
+
+    def test_fori_loop_last_two_dim_broadcast_store_rejected(self) -> None:
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def ragged_last_two_dim(
+            x: torch.Tensor, starts: torch.Tensor, ends: torch.Tensor
+        ) -> torch.Tensor:
+            out = torch.empty_like(x)
+            n = starts.size(0)
+            for g in hl.grid(n):
+                st = starts[g]
+                en = ends[g]
+                for tile in hl.tile(st, en):
+                    out[tile, :] = x[tile, :].sum(dim=0, keepdim=True)
+            return out
+
         x = torch.randn(8, 128, device=DEVICE, dtype=torch.float32)
         starts = torch.tensor([0, 4], dtype=torch.int32, device=DEVICE)
         ends = torch.tensor([4, 8], dtype=torch.int32, device=DEVICE)
@@ -1262,7 +1439,11 @@ class TestPallas(TestCase):
 
         expected = torch.where(x[:, :1] > 0, x, torch.zeros_like(x))
         torch.testing.assert_close(result, expected)
-        self.assertIn("astype(jnp.int32)", code)
+        self.assertIn(".astype(jnp.int32)", code)
+        self.assertIn("jnp.int32", code)
+        self._assert_shape_safe_numeric_mask(code)
+        self._assert_layout_tied_numeric_mask_bits(code)
+        self.assertNotIn("optimization_barrier", code)
 
     def test_bool_expand_inserted_broadcast_dim_where(self) -> None:
         @helion.kernel(backend="pallas", static_shapes=True)
@@ -1286,7 +1467,42 @@ class TestPallas(TestCase):
         expected = torch.where(x[:1, :] < 0, x, torch.zeros_like(x))
         torch.testing.assert_close(result, expected)
         self.assertIn("jnp.broadcast_to", code)
-        self.assertIn("astype(jnp.int32)[None, :]", code)
+        self._assert_numeric_mask_reshape(code, r"\[1,")
+        self.assertNotRegex(
+            code,
+            r"\.astype\(jnp\.int32\)\[None",
+        )
+        self._assert_shape_safe_numeric_mask(code)
+        self._assert_layout_tied_numeric_mask_bits(code)
+        self.assertNotIn("optimization_barrier", code)
+
+    def test_bool_broadcast_where_preserves_inactive_nan(self) -> None:
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def pallas_bool_broadcast_where_preserves_inactive_nan(
+            x: torch.Tensor, gates: torch.Tensor
+        ) -> torch.Tensor:
+            m, n = x.size()
+            out = torch.empty_like(x)
+            for tile_m, tile_n in hl.tile([m, n]):
+                mask = (gates[0, tile_n] > 0).expand(
+                    tile_m.block_size, tile_n.block_size
+                )
+                out[tile_m, tile_n] = torch.where(mask, x[tile_m, tile_n], 0.0)
+            return out
+
+        x = torch.full((16, 128), float("nan"), device=DEVICE, dtype=torch.bfloat16)
+        gates = torch.full((1, 128), -1.0, device=DEVICE, dtype=torch.float32)
+        code, result = code_and_output(
+            pallas_bool_broadcast_where_preserves_inactive_nan,
+            (x, gates),
+            block_sizes=[16, 128],
+        )
+
+        torch.testing.assert_close(result, torch.zeros_like(x))
+        self.assertIn("jnp.bitwise_and", code)
+        self.assertIn("lax.bitcast_convert_type", code)
+        self._assert_shape_safe_numeric_mask(code)
+        self._assert_layout_tied_numeric_mask_bits(code)
 
     def test_bool_subscript_broadcast_where(self) -> None:
         @helion.kernel(backend="pallas", static_shapes=True)
@@ -1310,8 +1526,15 @@ class TestPallas(TestCase):
         expected_mask = (x[:, :1] > 0) & (x[:1, :] < 0)
         expected = torch.where(expected_mask, x, torch.zeros_like(x))
         torch.testing.assert_close(result, expected)
-        self.assertIn("astype(jnp.int32)[:, None]", code)
-        self.assertIn("astype(jnp.int32)[None, :]", code)
+        self._assert_numeric_mask_reshape(code, r"\[[^\]]*, 1\]")
+        self._assert_numeric_mask_reshape(code, r"\[1,")
+        self.assertNotRegex(
+            code,
+            r"\.astype\(jnp\.int32\)\[(None|:)",
+        )
+        self._assert_shape_safe_numeric_mask(code)
+        self._assert_layout_tied_numeric_mask_bits(code)
+        self.assertNotIn("optimization_barrier", code)
 
         @helion.kernel(backend="pallas", static_shapes=True)
         def pallas_bool_unsqueeze_broadcast_where(x: torch.Tensor) -> torch.Tensor:
@@ -1331,8 +1554,192 @@ class TestPallas(TestCase):
         )
 
         torch.testing.assert_close(result, expected)
-        self.assertIn("astype(jnp.int32)[:, None]", code)
-        self.assertIn("astype(jnp.int32)[None, :]", code)
+        self._assert_numeric_mask_reshape(code, r"\[[^\]]*, 1\]")
+        self._assert_numeric_mask_reshape(code, r"\[1,")
+        self.assertNotRegex(
+            code,
+            r"\.astype\(jnp\.int32\)\[(None|:)",
+        )
+        self._assert_shape_safe_numeric_mask(code)
+        self._assert_layout_tied_numeric_mask_bits(code)
+        self.assertNotIn("optimization_barrier", code)
+
+    def test_bool_leading_singleton_broadcast_where(self) -> None:
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def pallas_bool_leading_singleton_broadcast_where(
+            x: torch.Tensor,
+        ) -> torch.Tensor:
+            h, m, n = x.size()
+            out = torch.empty_like(x)
+            for tile_h, tile_m, tile_n in hl.tile([h, m, n]):
+                mask = tile_m.index[:, None] >= tile_n.index[None, :]
+                value = x[tile_h, tile_m, tile_n]
+                out[tile_h, tile_m, tile_n] = torch.where(
+                    mask[None, :, :],
+                    value,
+                    torch.zeros_like(value),
+                )
+            return out
+
+        x = torch.randn(8, 64, 128, device=DEVICE, dtype=torch.float32)
+        code, result = code_and_output(
+            pallas_bool_leading_singleton_broadcast_where,
+            (x,),
+            block_sizes=[8, 64, 128],
+        )
+
+        rows = torch.arange(64, device=DEVICE)[:, None]
+        cols = torch.arange(128, device=DEVICE)[None, :]
+        expected = torch.where((rows >= cols)[None, :, :], x, torch.zeros_like(x))
+        torch.testing.assert_close(result, expected)
+        self._assert_numeric_mask_reshape(code, r"\[1,")
+        self.assertNotRegex(
+            code,
+            r"\.astype\(jnp\.int32\)\[None",
+        )
+        self._assert_shape_safe_numeric_mask(code)
+        self._assert_layout_tied_numeric_mask_bits(code)
+        self.assertNotIn("jnp.where(subscript != 0", code)
+        self.assertNotIn("optimization_barrier", code)
+
+    def test_bool_leading_singleton_broadcast_where_fori_loop(self) -> None:
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def pallas_bool_leading_singleton_broadcast_where_fori_loop(
+            x: torch.Tensor,
+        ) -> torch.Tensor:
+            h, m, n = x.size()
+            out = torch.empty_like(x)
+            for tile_h in hl.tile(h):
+                for tile_m, tile_n in hl.tile([m, n]):
+                    mask = tile_m.index[:, None] >= tile_n.index[None, :]
+                    value = x[tile_h, tile_m, tile_n]
+                    out[tile_h, tile_m, tile_n] = torch.where(
+                        mask[None, :, :],
+                        value,
+                        torch.zeros_like(value),
+                    )
+            return out
+
+        x = torch.randn(8, 128, 128, device=DEVICE, dtype=torch.float32)
+        code, result = code_and_output(
+            pallas_bool_leading_singleton_broadcast_where_fori_loop,
+            (x,),
+            block_sizes=[8, 64, 128],
+            pallas_loop_type="fori_loop",
+        )
+
+        rows = torch.arange(128, device=DEVICE)[:, None]
+        cols = torch.arange(128, device=DEVICE)[None, :]
+        expected = torch.where((rows >= cols)[None, :, :], x, torch.zeros_like(x))
+        torch.testing.assert_close(result, expected)
+        self.assertIn("jax.lax.fori_loop", code)
+        self._assert_numeric_mask_reshape(code, r"\[1,")
+        self.assertNotRegex(
+            code,
+            r"\.astype\(jnp\.int32\)\[None",
+        )
+        self._assert_shape_safe_numeric_mask(code)
+        self._assert_layout_tied_numeric_mask_bits(code)
+        self.assertNotIn("jnp.where(subscript != 0", code)
+        self.assertNotIn("optimization_barrier", code)
+
+    def test_bool_leading_singleton_broadcast_where_bf16_fori_loop(self) -> None:
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def pallas_bool_leading_singleton_broadcast_where_bf16_fori_loop(
+            x: torch.Tensor,
+        ) -> torch.Tensor:
+            h, m, n = x.size()
+            out = torch.empty_like(x)
+            for tile_h in hl.tile(h):
+                for tile_m, tile_n in hl.tile([m, n]):
+                    mask = tile_m.index[:, None] >= tile_n.index[None, :]
+                    value = x[tile_h, tile_m, tile_n]
+                    out[tile_h, tile_m, tile_n] = torch.where(
+                        mask[None, :, :],
+                        value,
+                        torch.zeros_like(value),
+                    )
+            return out
+
+        x = torch.randn(8, 128, 128, device=DEVICE, dtype=torch.bfloat16)
+        code, result = code_and_output(
+            pallas_bool_leading_singleton_broadcast_where_bf16_fori_loop,
+            (x,),
+            block_sizes=[8, 64, 128],
+            pallas_loop_type="fori_loop",
+        )
+
+        rows = torch.arange(128, device=DEVICE)[:, None]
+        cols = torch.arange(128, device=DEVICE)[None, :]
+        expected = torch.where((rows >= cols)[None, :, :], x, torch.zeros_like(x))
+        torch.testing.assert_close(result, expected)
+        self.assertIn("jax.lax.fori_loop", code)
+        self._assert_numeric_mask_reshape(code, r"\[1,")
+        self.assertNotRegex(
+            code,
+            r"\.astype\(jnp\.int32\)\[None",
+        )
+        self._assert_shape_safe_numeric_mask(code)
+        self._assert_layout_tied_numeric_mask_bits(code)
+        self.assertNotIn("jnp.where(subscript != 0", code)
+        self.assertNotIn("optimization_barrier", code)
+
+    def test_bool_leading_singleton_broadcast_where_bf16_broadcast_value_fori_loop(
+        self,
+    ) -> None:
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def pallas_bool_leading_singleton_broadcast_where_bf16_broadcast_value_fori_loop(
+            rows: torch.Tensor,
+            cols: torch.Tensor,
+        ) -> torch.Tensor:
+            h, m = rows.size()
+            n = cols.size(1)
+            out = torch.empty([h, m, n], device=rows.device, dtype=rows.dtype)
+            for tile_h in hl.tile(h):
+                for tile_m, tile_n in hl.tile([m, n]):
+                    row_values = rows[tile_h, tile_m].to(torch.float32)
+                    col_values = cols[tile_h, tile_n].to(torch.float32)
+                    value = torch.exp2(
+                        row_values[:, :, None] - col_values[:, None, :]
+                    ).to(rows.dtype)
+                    mask = tile_m.index[:, None] >= tile_n.index[None, :]
+                    out[tile_h, tile_m, tile_n] = torch.where(
+                        mask[None, :, :],
+                        value,
+                        torch.zeros_like(value),
+                    )
+            return out
+
+        rows_arg = torch.randn(8, 64, device=DEVICE, dtype=torch.bfloat16)
+        cols_arg = torch.randn(8, 128, device=DEVICE, dtype=torch.bfloat16)
+        code, result = code_and_output(
+            pallas_bool_leading_singleton_broadcast_where_bf16_broadcast_value_fori_loop,
+            (rows_arg, cols_arg),
+            block_sizes=[8, 64, 128],
+            pallas_loop_type="fori_loop",
+        )
+
+        row_values = rows_arg.float()[:, :, None]
+        col_values = cols_arg.float()[:, None, :]
+        rows = torch.arange(64, device=DEVICE)[:, None]
+        cols = torch.arange(128, device=DEVICE)[None, :]
+        expected = torch.where(
+            (rows >= cols)[None, :, :],
+            torch.exp2(row_values - col_values).to(rows_arg.dtype),
+            torch.zeros([8, 64, 128], device=DEVICE, dtype=rows_arg.dtype),
+        )
+        torch.testing.assert_close(result, expected)
+        self.assertIn("jax.lax.fori_loop", code)
+        self._assert_numeric_mask_reshape(code, r"\[1,")
+        self._assert_shape_safe_numeric_mask(code)
+        self._assert_layout_tied_numeric_mask_bits(code)
+        self.assertNotRegex(
+            code,
+            r"jnp\.sum\(jnp\.where\([^\n]*\.astype\(jnp\.bfloat16\)"
+            r"[^\n]*!= 0",
+        )
+        self.assertNotIn("jnp.where(subscript != 0", code)
+        self.assertNotIn("optimization_barrier", code)
 
     def test_indirect_gather_with_tiled_dim(self) -> None:
         @helion.kernel(backend="pallas", static_shapes=True)
@@ -5054,8 +5461,8 @@ class TestPallas(TestCase):
 
     def test_transpose_dot_defers_pallas_load_mask(self) -> None:
         """A masked load consumed via ``transpose`` -> dot defers its mask to the
-        consumer layout: a raw load + a post-transpose ``jnp.where``, not an eager
-        multiplicative load mask.
+        consumer layout: a raw load + a post-transpose mask, not an eager load
+        mask.
 
         The deferral is an FX-graph pass, so it is independent of the pallas loop
         type -- asserted here for both ``fori_loop`` and ``compact_worklist`` on a
@@ -5097,13 +5504,13 @@ class TestPallas(TestCase):
                     block_sizes=[block],
                     pallas_loop_type=loop_type,
                 )
-                # x's masked load is raw (no eager ``* mask``), feeds a transpose,
-                # and the mask reappears as a post-transpose ``jnp.where``.
+                # x's masked load is raw, feeds a transpose, and the mask
+                # reappears in the post-transpose layout.
                 producer = self._transpose_operand_producer(code)
                 self.assertIsNotNone(producer)
                 self.assertRegex(producer, r"= x\[")
                 self.assertNotIn("* mask", producer)
-                self.assertIn("jnp.where", code)
+                self.assertRegex(code, r"_mask_to = .*bitcast_convert_type")
                 # compact_worklist matches the eager reference on the partial
                 # tiles.  fori_loop miscompiles jagged tiles in pallas interpret
                 # (a pre-existing, unrelated issue), so it is not a sound numeric
@@ -5149,8 +5556,8 @@ class TestPallas(TestCase):
         # Eager mask retained on the direct dot input; nothing to defer past.
         self.assertRegex(
             code,
-            r"(y\[[^\n]*\][^\n]*\*\s*mask_\d+\.astype|"
-            r"mask_\d+\.astype[^\n]*\*[^\n]*y\[)",
+            r"(\by(?:_buf)?\[[^\n]*\][^\n]*\*\s*mask_\d+\.astype|"
+            r"mask_\d+\.astype[^\n]*\*[^\n]*\by(?:_buf)?\[)",
         )
         self.assertNotRegex(code, r"jnp\.transpose\(")
 

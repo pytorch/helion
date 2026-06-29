@@ -112,6 +112,22 @@ def _pallas_launch_code(value: _PallasLaunchValue) -> str:
     return repr(value)
 
 
+def _pallas_empty_allocated_vars(body: list[ast.stmt]) -> set[str]:
+    """Return names allocated by top-level empty/empty_like/new_empty calls."""
+    result: set[str] = set()
+    for stmt in body:
+        if (
+            isinstance(stmt, ast.Assign)
+            and len(stmt.targets) == 1
+            and isinstance(stmt.targets[0], ast.Name)
+            and isinstance(stmt.value, ast.Call)
+            and isinstance(stmt.value.func, ast.Attribute)
+            and stmt.value.func.attr in ("empty", "empty_like", "new_empty")
+        ):
+            result.add(stmt.targets[0].id)
+    return result
+
+
 def _pallas_mul_launch_values(
     lhs: _PallasLaunchValue, rhs: _PallasLaunchValue
 ) -> _PallasLaunchValue:
@@ -2749,26 +2765,6 @@ class PallasBackend(Backend):
 
         device_fn = DeviceFunction.current()
 
-        def _empty_allocated_vars(body: list[ast.stmt]) -> set[str]:
-            """Return names of variables allocated with torch.empty/empty_like/new_empty.
-
-            Only checks top-level assignments; allocations nested inside
-            if/with/try are conservatively missed (treated as needing input,
-            which is correct but suboptimal).
-            """
-            result: set[str] = set()
-            for stmt in body:
-                if (
-                    isinstance(stmt, ast.Assign)
-                    and len(stmt.targets) == 1
-                    and isinstance(stmt.targets[0], ast.Name)
-                    and isinstance(stmt.value, ast.Call)
-                    and isinstance(stmt.value.func, ast.Attribute)
-                    and stmt.value.func.attr in ("empty", "empty_like", "new_empty")
-                ):
-                    result.add(stmt.targets[0].id)
-            return result
-
         output_indices: list[int] = []
         # Indices of output tensors that are also read by the kernel
         # (inplace-mutated params or body-created tensors the kernel reads).
@@ -2786,7 +2782,7 @@ class PallasBackend(Backend):
             # to use HBM BlockSpecs.  Tensors allocated with torch.zeros_like,
             # torch.full, etc. have meaningful initial values that must be
             # preserved via VMEM BlockSpecs.
-            empty_vars = _empty_allocated_vars(host_fn.body)
+            empty_vars = _pallas_empty_allocated_vars(host_fn.body)
             for i, arg in enumerate(sorted_args):
                 if not isinstance(arg, TensorArg):
                     continue
@@ -2932,8 +2928,13 @@ class PallasBackend(Backend):
         if CompileEnvironment.current().settings.pallas_interpret:
             launcher_args.append("_pallas_interpret=True")
 
+        arbitrary_grid_dims: set[int] = set()
         if device_fn.carry_scratch:
-            launcher_args.append("_pallas_arbitrary_grid_dims=(0,)")
+            arbitrary_grid_dims.add(0)
+        if arbitrary_grid_dims:
+            launcher_args.append(
+                f"_pallas_arbitrary_grid_dims={tuple(sorted(arbitrary_grid_dims))!r}"
+            )
 
         # No-tiling pure 2D matmul: emit ``_matmul_dot_general=...`` so the
         # launcher uses ``jax.jit(lax.dot_general(...))`` instead of

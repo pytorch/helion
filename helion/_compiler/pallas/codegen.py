@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import math
 from typing import TYPE_CHECKING
 from typing import cast
 
@@ -38,6 +39,146 @@ if TYPE_CHECKING:
     from helion._compiler.tile_strategy import DeviceLoopOrGridState
 
 
+def _select_mask_dtype(dtype: torch.dtype) -> str | None:
+    if dtype.is_floating_point:
+        if dtype is torch.float64:
+            return None
+        if dtype.itemsize == 1:
+            return "jnp.uint8"
+        if dtype.itemsize == 2:
+            return "jnp.uint16"
+        if dtype.itemsize == 4:
+            return "jnp.uint32"
+        return None
+    if dtype is torch.int8:
+        return "jnp.int8"
+    if dtype is torch.int16:
+        return "jnp.int16"
+    if dtype is torch.int32:
+        return "jnp.int32"
+    if dtype is torch.uint8:
+        return "jnp.uint8"
+    if dtype is torch.uint32:
+        return "jnp.uint32"
+    return None
+
+
+def layout_tied_bf16_mask_expr(
+    mask: ast.AST,
+    layout_anchor: ast.AST,
+) -> ast.AST:
+    """Expand a numeric predicate through a value whose layout Mosaic already knows."""
+
+    mask_value = expr_from_string(
+        "lax.convert_element_type({mask}, jnp.bfloat16)",
+        mask=mask,
+    )
+    return expr_from_string(
+        "jnp.ones_like({layout_anchor}, dtype=jnp.bfloat16) * ({mask_value})",
+        mask_value=mask_value,
+        layout_anchor=layout_anchor,
+    )
+
+
+def numeric_mask_expr(mask: ast.AST, dtype: str = "jnp.int32") -> ast.AST:
+    """Materialize a predicate as a numeric 0/1 tensor before shape relayouts."""
+
+    return expr_from_string(
+        f"jnp.minimum(({{mask}}).astype({dtype}), jnp.array(1, dtype={dtype}))",
+        mask=mask,
+    )
+
+
+def numeric_mask_reshape_expr(
+    mask: ast.AST, shape: str, dtype: str = "jnp.int32"
+) -> ast.AST:
+    """Cast a predicate to numeric, then add singleton dimensions by reshape."""
+
+    return expr_from_string(
+        f"jnp.reshape({{mask}}, {shape})",
+        mask=numeric_mask_expr(mask, dtype),
+    )
+
+
+def numeric_where_expr(
+    mask: ast.AST,
+    true_value: ast.AST,
+    false_value: ast.AST,
+    output_dtype: torch.dtype,
+    layout_anchor: ast.AST | None = None,
+) -> ast.AST | None:
+    """Select with a layout-tied numeric bit mask on TPU."""
+
+    mask_dtype = _select_mask_dtype(output_dtype)
+    if mask_dtype is None:
+        return None
+    value_dtype = CompileEnvironment.current().backend.dtype_str(output_dtype)
+    if layout_anchor is None:
+        layout_anchor = true_value
+    mask_value = (
+        "lax.convert_element_type("
+        "jnp.ones_like({layout_anchor}, dtype=jnp.bfloat16) * "
+        "lax.convert_element_type({mask}, jnp.bfloat16), "
+        f"{mask_dtype})"
+    )
+    mask_bits = (
+        f"(jnp.zeros_like({{layout_anchor}}, dtype={mask_dtype}) - {mask_value})"
+    )
+    if output_dtype.is_floating_point:
+        true_bits = (
+            "lax.bitcast_convert_type("
+            f"lax.convert_element_type({{true_value}}, {value_dtype}), {mask_dtype})"
+        )
+        false_bits = (
+            "lax.bitcast_convert_type("
+            f"lax.convert_element_type({{false_value}}, {value_dtype}), {mask_dtype})"
+        )
+        return expr_from_string(
+            "lax.bitcast_convert_type("
+            "jnp.bitwise_or("
+            f"jnp.bitwise_and({mask_bits}, {true_bits}), "
+            f"jnp.bitwise_and(jnp.bitwise_not({mask_bits}), {false_bits})"
+            f"), {value_dtype})",
+            mask=mask,
+            layout_anchor=layout_anchor,
+            true_value=true_value,
+            false_value=false_value,
+        )
+    return expr_from_string(
+        "lax.convert_element_type("
+        "jnp.bitwise_or("
+        f"jnp.bitwise_and({mask_bits}, "
+        f"lax.convert_element_type({{true_value}}, {value_dtype})), "
+        f"jnp.bitwise_and(jnp.bitwise_not({mask_bits}), "
+        f"lax.convert_element_type({{false_value}}, {value_dtype}))"
+        f"), {value_dtype})",
+        mask=mask,
+        layout_anchor=layout_anchor,
+        true_value=true_value,
+        false_value=false_value,
+    )
+
+
+def numeric_mask_select_expr(
+    mask: ast.AST,
+    true_value: ast.AST,
+    false_value: ast.AST,
+    output_dtype: torch.dtype,
+    layout_anchor: ast.AST | None = None,
+) -> ast.AST:
+    selected = numeric_where_expr(
+        mask, true_value, false_value, output_dtype, layout_anchor
+    )
+    if selected is not None:
+        return selected
+    return expr_from_string(
+        "jnp.where(({mask}) != 0, {true_value}, {false_value})",
+        mask=mask,
+        true_value=true_value,
+        false_value=false_value,
+    )
+
+
 def load_expr(
     state: CodegenState,
     subscript: list[object],
@@ -58,10 +199,11 @@ def load_expr(
             result = emit_gather(state, pattern.plan, name)
             if (mask_expr := _indirect_gather_mask_expr(state, tensor)) is not None:
                 dtype_str = _pallas_dtype_str(tensor)
-                result = expr_from_string(
-                    f"jnp.where(({mask_expr}) != 0, {{result}}, "
-                    f"jnp.array(0, dtype={dtype_str}))",
-                    result=result,
+                result = numeric_mask_select_expr(
+                    expr_from_string(mask_expr),
+                    result,
+                    expr_from_string(f"jnp.array(0, dtype={dtype_str})"),
+                    tensor.dtype,
                 )
             return result
 
@@ -97,7 +239,7 @@ def _widen_unaligned_tile_load_indices(
     subscript: list[object],
     tensor: torch.Tensor,
     index_parts: list[str],
-) -> tuple[list[str], list[tuple[int, str, str, int]]]:
+) -> tuple[list[str], list[tuple[int, str, str, torch.dtype, int]]]:
     """Load small unaligned tile dims as full refs, then select lanes."""
     if _tensor_routed_to_dma_scratch(state, tensor):
         return index_parts, []
@@ -141,7 +283,9 @@ def _widen_unaligned_tile_load_indices(
         index_part_idx += 1
 
     dtype_str = _pallas_dtype_str(tensor)
-    return adjusted, [(axis, index, dtype_str, value_dim) for axis, index in takes]
+    return adjusted, [
+        (axis, index, dtype_str, tensor.dtype, value_dim) for axis, index in takes
+    ]
 
 
 def _should_select_unaligned_tile_axis_from_full_load(
@@ -199,17 +343,17 @@ def _should_select_unaligned_tile_axis_from_full_load(
     if alignment is not None and alignment % required == 0:
         return False
 
-    expanded_elements = _full_load_selected_elements(state, dim_size, block_size)
+    expanded_elements = _full_load_selection_budget_elements(state, dim_size)
     return (
         expanded_elements is not None
         and expanded_elements * tensor.dtype.itemsize <= _FULL_LOAD_SELECT_MAX_BYTES
     )
 
 
-def _full_load_selected_elements(
-    state: CodegenState, dim_size: int, block_size: int
+def _full_load_selection_budget_elements(
+    state: CodegenState, dim_size: int
 ) -> int | None:
-
+    """Return a conservative VMEM budget for full-ref selection, in elements."""
     assert state.fx_node is not None
     output_val = state.fx_node.meta.get("val")
     if not isinstance(output_val, torch.Tensor):
@@ -227,9 +371,11 @@ def _full_load_selected_elements(
                 return None
             size = resolved
         elements *= size
-    if elements % block_size != 0:
-        return None
-    return elements // block_size * dim_size
+    # The exact widened value often replaces one block axis with ``dim_size``.
+    # Mosaic may also keep broadcast select masks and relayout operands live in
+    # scoped VMEM, so use the original tile size times the full dimension as a
+    # cheap upper bound before choosing this fallback path.
+    return elements * dim_size
 
 
 def _tile_lane_index_expr(state: CodegenState, pattern: object) -> str:
@@ -247,10 +393,10 @@ def _tile_lane_index_expr(state: CodegenState, pattern: object) -> str:
 
 
 def _select_unaligned_tile_load_indices(
-    value: ast.AST, takes: list[tuple[int, str, str, int]]
+    value: ast.AST, takes: list[tuple[int, str, str, torch.dtype, int]]
 ) -> ast.AST:
     result = value
-    for axis, index_expr, dtype_str, rank in takes:
+    for axis, index_expr, dtype_str, dtype, rank in takes:
         if axis == 0:
             mask_expr = (
                 f"(({index_expr})[..., None] == "
@@ -259,11 +405,18 @@ def _select_unaligned_tile_load_indices(
             )
             for _ in range(rank - 1):
                 mask_expr = f"jnp.expand_dims({mask_expr}, axis=-1)"
+            selected = numeric_mask_select_expr(
+                expr_from_string(mask_expr, result=result),
+                result,
+                expr_from_string(f"jnp.array(0, dtype={dtype_str})"),
+                dtype,
+            )
             result = expr_from_string(
-                f"jnp.sum(jnp.where(({mask_expr}) != 0, {{result}}, "
-                f"jnp.array(0, dtype={dtype_str})), axis=jnp.ndim({index_expr}))"
-                f".astype({dtype_str})",
-                result=result,
+                (
+                    "jnp.sum({selected}, axis=jnp.ndim("
+                    f"{index_expr})).astype({dtype_str})"
+                ),
+                selected=selected,
             )
             continue
         mask_expr = (
@@ -275,12 +428,20 @@ def _select_unaligned_tile_load_indices(
             mask_expr = f"jnp.expand_dims({mask_expr}, axis=0)"
         for _ in range(rank - axis - 1):
             mask_expr = f"jnp.expand_dims({mask_expr}, axis=-1)"
-        result = expr_from_string(
-            f"jnp.sum(jnp.where(({mask_expr}) != 0, "
-            f"jnp.expand_dims({{result}}, axis={axis}), "
-            f"jnp.array(0, dtype={dtype_str})), axis={axis + 1})"
-            f".astype({dtype_str})",
+        true_value = expr_from_string(
+            f"jnp.expand_dims({{result}}, axis={axis})",
             result=result,
+        )
+        selected = numeric_mask_select_expr(
+            expr_from_string(mask_expr, result=result),
+            true_value,
+            expr_from_string(f"jnp.array(0, dtype={dtype_str})"),
+            dtype,
+            true_value,
+        )
+        result = expr_from_string(
+            f"jnp.sum({{selected}}, axis={axis + 1}).astype({dtype_str})",
+            selected=selected,
         )
     return result
 
@@ -549,10 +710,12 @@ def widen_barrier_temp_store_indices(
         mask = f"jnp.expand_dims({mask}, axis=0)"
     for _ in range(value_dim - axis - 1):
         mask = f"jnp.expand_dims({mask}, axis=-1)"
-    value = expr_from_string(
-        f"jnp.where(({mask}) != 0, {{store_value}}, {{current}})",
-        store_value=store_value,
-        current=current,
+    value = numeric_mask_select_expr(
+        expr_from_string(mask),
+        store_value,
+        current,
+        tensor.dtype,
+        store_value,
     )
     return adjusted, value
 
@@ -1368,10 +1531,15 @@ def _loop_begin_extra_pad(block_id: int, state: CodegenState) -> int:
         return 0
 
     info = loops[-1].block_id_to_info.get(block_id)
-    if info is None or info.begin_expr is None:
+    if info is None:
         return 0
 
     begin = info.begin_expr
+    if begin is None:
+        alignment = info.offset_alignment
+        if isinstance(alignment, int) and alignment > 0:
+            return (bs_value - math.gcd(bs_value, alignment)) % bs_value
+        return bs_value - 1
     if isinstance(begin, (int, sympy.Integer)):
         return int(begin) % bs_value
 
