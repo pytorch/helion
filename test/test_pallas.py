@@ -2121,6 +2121,19 @@ class TestPallas(TestCase):
         expected = torch.bmm(a.float(), b.float()).to(torch.bfloat16)
         torch.testing.assert_close(result, expected, rtol=1e-2, atol=1e-2)
 
+    @xfailIfPallasInterpret("emit_pipeline dynamic slices need real TPU Pallas")
+    def test_emit_pipeline_store_keeps_block_sized_outer_tile(self) -> None:
+        x = torch.randn(2, 8, 128, device=DEVICE, dtype=torch.float32)
+        y = torch.randn(2, 8, 128, device=DEVICE, dtype=torch.float32)
+        code, result = code_and_output(
+            pallas_add_3d,
+            (x, y),
+            block_sizes=[4, 8, 128],
+            pallas_loop_type="emit_pipeline",
+        )
+        self.assertIn("pltpu.emit_pipeline", code)
+        torch.testing.assert_close(result, x + y)
+
     def test_full_slice_and_tile_share_dimension(self) -> None:
         @helion.kernel(backend="pallas", static_shapes=True)
         def fn(x: torch.Tensor) -> torch.Tensor:
