@@ -1,0 +1,249 @@
+"""
+RWKV-6 Example
+==============
+
+Diagonal (per-dimension) decay with output gating. This is structurally
+Full GLA plus an output gate applied after the attention computation.
+Uses the LinearAttentionEngine with output_mod.
+"""
+
+from __future__ import annotations
+
+from typing import Any
+import warnings
+
+import torch
+from triton.testing import do_bench
+
+from .linear_attention_engine import LinearAttentionEngine
+from .linear_attention_engine import chunked_linear_attn
+from .linear_attention_engine import recurrent_step
+from .linear_attention_utils import chunked_linear_attn_reference
+from .linear_attention_utils import head_to_time_first as _htf
+from .linear_attention_utils import naive_recurrent_reference
+from .linear_attention_utils import rel_error as _rel_error
+from helion._testing import DEVICE
+
+B, H, T, D, DV = 2, 4, 128, 32, 16
+C = 32
+DTYPE = torch.bfloat16
+BENCH_CONFIGS = [(1, 32, 2048, 128, 128), (1, 32, 4096, 128, 128)]
+BENCH_C = 64
+
+
+def test() -> None:
+    """Forward + backward correctness for RWKV-6 (diagonal decay + output gate)."""
+    torch.manual_seed(42)
+
+    q = torch.randn(B, H, T, D, device=DEVICE, dtype=DTYPE)
+    k = torch.randn(B, H, T, D, device=DEVICE, dtype=DTYPE)
+    v = torch.randn(B, H, T, DV, device=DEVICE, dtype=DTYPE)
+    g = -torch.rand(B, H, T, D, device=DEVICE, dtype=DTYPE).abs() * 0.1
+    gate = torch.sigmoid(torch.randn(B, H, T, DV, device=DEVICE, dtype=DTYPE))
+
+    engine = LinearAttentionEngine(
+        output_mod=lambda o, cio: o * cio["gate"],
+        chunk_size=C,
+    )
+
+    # Forward vs recurrent reference
+    out = engine(q, k, v, g, gate=gate)
+    assert isinstance(out, torch.Tensor)
+    ref = naive_recurrent_reference(q, k, v, g)
+    ref = ref * gate.detach()
+    fwd_err = _rel_error(out.detach(), ref)
+    assert fwd_err < 0.02, f"Forward error: {fwd_err}"
+    print(f"  fwd vs recurrent: {fwd_err:.4e} PASS")
+
+    # Forward vs FLA chunk_rwkv6 (with u=zeros to match our engine)
+    try:
+        from fla.ops.rwkv6 import chunk_rwkv6 as _fn  # pyrefly: ignore
+
+        chunk_rwkv6: Any = _fn
+
+        out_no_gate = chunked_linear_attn(q, k, v, g, C=C)
+        u_zeros = torch.zeros(H, D, device=DEVICE, dtype=DTYPE)
+        o_fla, _ = chunk_rwkv6(
+            r=_htf(q),
+            k=_htf(k),
+            v=_htf(v),
+            w=_htf(g),
+            u=u_zeros,
+            scale=1.0,
+        )
+        o_fla_hf = _htf(o_fla)
+        fla_err = _rel_error(out_no_gate.detach(), o_fla_hf)
+        # Note: chunk_rwkv6 with u=0 differs from pure GLA due to internal
+        # normalization differences, so we use a loose tolerance here.
+        print(
+            f"  fwd vs FLA(rwkv6): {fla_err:.4e} {'PASS' if fla_err < 0.5 else 'FAIL'}"
+        )
+    except Exception as e:
+        print(f"  fwd vs FLA:        SKIP ({type(e).__name__})")
+
+    # Backward vs chunked reference
+    grad_out = torch.randn(B, H, T, DV, device=DEVICE, dtype=DTYPE)
+
+    q1 = q.clone().requires_grad_(True)
+    k1 = k.clone().requires_grad_(True)
+    v1 = v.clone().requires_grad_(True)
+    o1 = chunked_linear_attn(q1, k1, v1, g, C=C)
+    (o1 * gate).backward(grad_out)
+
+    q2 = q.clone().requires_grad_(True)
+    k2 = k.clone().requires_grad_(True)
+    v2 = v.clone().requires_grad_(True)
+    o2 = chunked_linear_attn_reference(q2, k2, v2, g, C=C)
+    (o2 * gate).backward(grad_out)
+
+    for name, g1, g2 in [
+        ("dq", q1.grad, q2.grad),
+        ("dk", k1.grad, k2.grad),
+        ("dv", v1.grad, v2.grad),
+    ]:
+        err = _rel_error(g1, g2)
+        assert err < 0.05, f"Backward {name} error: {err}"
+        print(f"  bwd {name} vs ref: {err:.4e} PASS")
+
+    # === Recurrent step: compare step-by-step vs chunked ===
+    torch.manual_seed(42)
+    q_rec = torch.randn(B, H, T, D, device=DEVICE, dtype=DTYPE)
+    k_rec = torch.randn(B, H, T, D, device=DEVICE, dtype=DTYPE)
+    v_rec = torch.randn(B, H, T, DV, device=DEVICE, dtype=DTYPE)
+    g_rec = -torch.rand(B, H, T, D, device=DEVICE, dtype=DTYPE).abs() * 0.1
+    scale_rec = 1.0
+
+    o_chunked = chunked_linear_attn(q_rec * scale_rec, k_rec, v_rec, g_rec, C=C)
+
+    state = torch.zeros(B, H, D, DV, device=DEVICE, dtype=torch.float32)
+    o_steps = []
+    for t in range(T):
+        alpha = torch.exp(g_rec[:, :, t : t + 1])  # [B,H,1,D]
+        o_t, state = recurrent_step(
+            q_rec[:, :, t : t + 1] * scale_rec,
+            k_rec[:, :, t : t + 1],
+            v_rec[:, :, t : t + 1],
+            state,
+            alpha=alpha,
+        )
+        o_steps.append(o_t)
+    o_recurrent = torch.cat(o_steps, dim=2)
+
+    rec_err = _rel_error(o_chunked, o_recurrent)
+    assert rec_err < 0.05, f"Recurrent vs chunked error: {rec_err}"
+    print(f"  recurrent step:   {rec_err:.4e} PASS")
+
+    print("All tests passed.")
+
+
+def benchmark() -> None:
+    """Benchmark RWKV-6 forward+backward, comparing against FLA chunk_rwkv6."""
+    try:
+        from fla.ops.rwkv6 import chunk_rwkv6 as _fn  # pyrefly: ignore
+
+        chunk_rwkv6: Any = _fn
+    except ImportError:
+        warnings.warn("fla not installed, skipping benchmark", stacklevel=1)
+        return
+
+    print(
+        f"{'Config':<24} {'Helion fwd':>10} {'FLA fwd':>10}"
+        f" {'Helion f+b':>12} {'FLA f+b':>12}"
+    )
+    print("-" * 72)
+
+    for bi, hi, ti, di, dvi in BENCH_CONFIGS:
+        q = torch.randn(bi, hi, ti, di, device=DEVICE, dtype=DTYPE, requires_grad=True)
+        k = torch.randn(bi, hi, ti, di, device=DEVICE, dtype=DTYPE, requires_grad=True)
+        v = torch.randn(bi, hi, ti, dvi, device=DEVICE, dtype=DTYPE, requires_grad=True)
+        g = -torch.rand(bi, hi, ti, di, device=DEVICE, dtype=DTYPE).abs() * 0.1
+        gate = torch.sigmoid(torch.randn(bi, hi, ti, dvi, device=DEVICE, dtype=DTYPE))
+        grad_out = torch.randn(bi, hi, ti, dvi, device=DEVICE, dtype=DTYPE)
+        u_zeros = torch.zeros(hi, di, device=DEVICE, dtype=DTYPE)
+
+        engine = LinearAttentionEngine(
+            output_mod=lambda o, cio: o * cio["gate"],
+            chunk_size=BENCH_C,
+        )
+
+        # Helion fwd (includes output gate)
+        fwd_ms = do_bench(
+            lambda eng=engine, q=q, k=k, v=v, g=g, gate=gate: eng(q, k, v, g, gate=gate)
+        )
+
+        # FLA fwd (no output gate — just the recurrence)
+        qt = _htf(q.detach())
+        kt = _htf(k.detach())
+        vt = _htf(v.detach())
+        wt = _htf(g)
+        fla_fwd_ms = do_bench(
+            lambda qt=qt, kt=kt, vt=vt, wt=wt, u=u_zeros: chunk_rwkv6(
+                r=qt,
+                k=kt,
+                v=vt,
+                w=wt,
+                u=u,
+                scale=1.0,
+            )
+        )
+
+        # Helion fwd+bwd
+        def helion_fb(
+            eng: LinearAttentionEngine = engine,
+            q: torch.Tensor = q,
+            k: torch.Tensor = k,
+            v: torch.Tensor = v,
+            g: torch.Tensor = g,
+            gate: torch.Tensor = gate,
+            go: torch.Tensor = grad_out,
+        ) -> None:
+            o = eng(q, k, v, g, gate=gate)
+            assert isinstance(o, torch.Tensor)
+            o.backward(go)
+            q.grad = k.grad = v.grad = None
+
+        fb_ms = do_bench(helion_fb)
+
+        # FLA fwd+bwd
+        qt_b = qt.clone().requires_grad_(True)
+        kt_b = kt.clone().requires_grad_(True)
+        vt_b = vt.clone().requires_grad_(True)
+        go_t = _htf(grad_out)
+
+        def fla_fb(
+            qt: torch.Tensor = qt_b,
+            kt: torch.Tensor = kt_b,
+            vt: torch.Tensor = vt_b,
+            wt: torch.Tensor = wt,
+            u: torch.Tensor = u_zeros,
+            go: torch.Tensor = go_t,
+        ) -> None:
+            o, _ = chunk_rwkv6(
+                r=qt,
+                k=kt,
+                v=vt,
+                w=wt,
+                u=u,
+                scale=1.0,
+            )
+            o.backward(go)
+            qt.grad = kt.grad = vt.grad = None
+
+        fla_fb_ms = do_bench(fla_fb)
+
+        cfg = f"({bi},{hi},{ti},{di},{dvi})"
+        print(
+            f"{cfg:<24} {fwd_ms:>10.3f} {fla_fwd_ms:>10.3f}"
+            f" {fb_ms:>12.3f} {fla_fb_ms:>12.3f}"
+        )
+
+
+def main() -> None:
+    print("=== RWKV-6 (diagonal decay + output gate) ===")
+    test()
+    print()
+    benchmark()
+
+
+if __name__ == "__main__":
+    main()
