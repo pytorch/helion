@@ -3401,6 +3401,103 @@ class TestPallas(TestCase):
         ):
             fn.bind((x,)).to_code(helion.Config(pallas_loop_type="emit_pipeline"))
 
+    def test_stack_lowering_axes_and_predicates(self) -> None:
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def stack_dim0(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            m, n = x.size()
+            for tile_m, tile_n in hl.tile([m, n]):
+                stacked = torch.stack([x[tile_m, tile_n], y[tile_m, tile_n]], dim=0)
+                out[tile_m, tile_n] = torch.sum(stacked, dim=0)
+            return out
+
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def stack_dim1(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            m, n = x.size()
+            for tile_m, tile_n in hl.tile([m, n]):
+                stacked = torch.stack([x[tile_m, tile_n], y[tile_m, tile_n]], dim=1)
+                out[tile_m, tile_n] = torch.sum(stacked, dim=1)
+            return out
+
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def stack_negative_dim(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            m, n = x.size()
+            for tile_m, tile_n in hl.tile([m, n]):
+                stacked = torch.stack([x[tile_m, tile_n], y[tile_m, tile_n]], dim=-1)
+                out[tile_m, tile_n] = torch.sum(stacked, dim=-1)
+            return out
+
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def stack_predicates(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            m, n = x.size()
+            for tile_m, tile_n in hl.tile([m, n]):
+                stacked = torch.stack(
+                    [x[tile_m, tile_n] > 0, y[tile_m, tile_n] > 0], dim=1
+                )
+                out[tile_m, tile_n] = torch.where(stacked, 1.0, 0.0).sum(dim=1)
+            return out
+
+        x = torch.randn(8, 128, device=DEVICE, dtype=torch.float32)
+        y = torch.randn(8, 128, device=DEVICE, dtype=torch.float32)
+        cases = (
+            (stack_dim0, "axis=0", x + y),
+            (stack_dim1, "axis=1", x + y),
+            (stack_negative_dim, "axis=-1", x + y),
+            (
+                stack_predicates,
+                "axis=1",
+                (x > 0).to(torch.float32) + (y > 0).to(torch.float32),
+            ),
+        )
+        for kernel, axis, expected in cases:
+            with self.subTest(axis=axis):
+                code, result = code_and_output(
+                    kernel,
+                    (x, y),
+                    block_sizes=[8, 128],
+                )
+                self.assertIn("jnp.stack", code)
+                self.assertIn(axis, code)
+                torch.testing.assert_close(result, expected)
+
+    def test_int4_unpack_all_bytes(self) -> None:
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def unpack_int4(packed: torch.Tensor) -> torch.Tensor:
+            m, n = packed.size()
+            out = torch.empty([m, 2, n], dtype=torch.float32, device=packed.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                value = packed[tile_m, tile_n].to(torch.int32)
+                low_raw = value & 0xF
+                low = torch.where(low_raw >= 8, low_raw - 16, low_raw)
+                high = value >> 4
+                stacked = torch.stack([low, high], dim=1)
+                out[tile_m, :, tile_n] = stacked.to(torch.float32)
+            return out
+
+        packed = torch.arange(-128, 128, device=DEVICE, dtype=torch.int16).to(
+            torch.int8
+        )
+        packed = packed.repeat(4).reshape(8, 128)
+        value = packed.to(torch.int32)
+        low_raw = value & 0xF
+        low = torch.where(low_raw >= 8, low_raw - 16, low_raw)
+        expected = torch.stack([low, value >> 4], dim=1).to(torch.float32)
+
+        code, result = code_and_output(
+            unpack_int4,
+            (packed,),
+            block_sizes=[8, 128],
+        )
+        self.assertIn("jnp.stack", code)
+        self.assertRegex(
+            code,
+            r"(?:\.astype\(jnp\.int32\)|lax\.convert_element_type\([^\n]+,\s*jnp\.int32\))",
+        )
+        torch.testing.assert_close(result, expected)
+
     @xfailIfPallas("Non-zero begin K reduction: DMA offset not tile-aligned")
     def test_bmm_nonzero_k_begin(self) -> None:
         """BMM with K reduction starting at non-zero offset, across all loop types."""

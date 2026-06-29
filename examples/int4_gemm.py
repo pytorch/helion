@@ -77,9 +77,10 @@ def matmul_bf16_int4(A: Tensor, B: Tensor) -> Tensor:
             # subtract 16 when the sign bit is set) rather than via ``(x << 4) >> 4``;
             # the explicit arithmetic form is portable across backends and avoids
             # relying on narrow-int (int8) shift truncation semantics.
-            b_lo_raw = (b_tile & 0xF).to(torch.int32)
+            b_i32 = b_tile.to(torch.int32)
+            b_lo_raw = b_i32 & 0xF
             b_lo = torch.where(b_lo_raw >= 8, b_lo_raw - 16, b_lo_raw)  # low 4 bits
-            b_hi = (b_tile >> 4).to(torch.int32)  # high 4 bits (arithmetic >>)
+            b_hi = b_i32 >> 4  # high 4 bits (arithmetic >>)
 
             # Stack and reshape to interleave low and high bits.
             # Stack along a new dimension to get [BLOCK_SIZE_K//2, 2, BLOCK_SIZE_N],

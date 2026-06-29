@@ -15,9 +15,11 @@ from helion._testing import onlyBackends
 from helion._testing import skipIfRefEager
 from helion._testing import skipUnlessTensorDescriptor
 from helion._testing import xfailIfPallas
+from helion._testing import xfailIfPallasInterpret
 from helion._testing import xfailIfPallasTpu
 import helion.language as hl
 from helion.runtime.settings import _get_backend
+from helion.runtime.settings import is_pallas_interpret
 
 
 @onlyBackends(["triton", "pallas", "cute"])
@@ -330,7 +332,6 @@ class TestViews(RefEagerTestBase, TestCase):
         expected = x.sum(dim=(1, 2))
         torch.testing.assert_close(result, expected)
 
-    @xfailIfPallas("torch.stack not supported on pallas")
     def test_stack_power_of_2(self):
         @helion.kernel(autotune_effort="none", static_shapes=True)
         def test_stack_power_of_2_kernel(
@@ -363,13 +364,23 @@ class TestViews(RefEagerTestBase, TestCase):
         a = torch.randn(M, N, dtype=torch.float32, device=device)
         b = torch.randn(M, N, dtype=torch.float32, device=device)
 
-        result = test_stack_power_of_2_kernel(a, b)
+        if _get_backend() == "pallas" and is_pallas_interpret():
+            _code, result = code_and_output(
+                test_stack_power_of_2_kernel,
+                (a, b),
+                block_sizes=[32, 128],
+                pallas_loop_type="unroll",
+            )
+        else:
+            result = test_stack_power_of_2_kernel(a, b)
         expected = torch.zeros(M * 2, N, dtype=torch.float32, device=device)
         expected[0::2] = a  # Every 2nd row starting from 0
         expected[1::2] = b  # Every 2nd row starting from 1
         torch.testing.assert_close(result, expected, rtol=1e-5, atol=1e-5)
 
-    @xfailIfPallas("torch.stack not supported on pallas")
+    @xfailIfPallasInterpret(
+        "Pallas interpret cannot execute this non-power-of-2 padded stack store"
+    )
     def test_stack_non_power_of_2(self):
         @helion.kernel(autotune_effort="none", static_shapes=True)
         def test_stack_non_power_of_2_kernel(
@@ -451,7 +462,7 @@ class TestViews(RefEagerTestBase, TestCase):
         expected = x.view(x.numel() // 2, 2).sum(-1)
         torch.testing.assert_close(result, expected, rtol=1e-3, atol=1e-3)
 
-    @xfailIfPallas("torch.stack not supported on pallas")
+    @xfailIfPallas("Pallas dynamic/padded store for stack(dim=0) still fails")
     def test_stack_dim0(self):
         with torch._inductor.config.patch(
             {"use_static_cuda_launcher": False} if use_tileir_tunables() else {}

@@ -1896,7 +1896,7 @@ class TestExamples(RefEagerTestBase, TestCase):
     def test_gather_gemv_half(self):
         self._check_gather_gemv(HALF_DTYPE, atol=0.2, rtol=0.2)
 
-    @xfailIfPallas("int4 unpacking not supported on pallas")
+    @xfailIfPallasInterpret("Pallas interpret does not support the int4 dot path")
     def test_int4_gemm(self):
         # Matrix dimensions
         M, K, N = 256, 512, 256
