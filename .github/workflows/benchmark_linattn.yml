@@ -1,0 +1,160 @@
+name: Benchmark Linear Attention
+
+on:
+  workflow_call:
+    inputs:
+      runner:
+        required: true
+        type: string
+      image:
+        required: true
+        type: string
+      runtime-version:
+        required: true
+        type: string
+      container-options:
+        required: true
+        type: string
+      alias:
+        required: true
+        type: string
+      kernels:
+        required: true
+        type: string
+      env-vars:
+        required: false
+        type: string
+        default: ""
+
+jobs:
+  benchmark:
+    name: benchmark-${{ inputs.alias }}
+
+    env:
+      HELION_AUTOTUNE_LOG_LEVEL: INFO
+      HELION_BACKEND: triton
+      # Per-shape autotune time ceiling (90 min); non-converging searches are
+      # stopped with best-so-far.
+      HELION_AUTOTUNE_BUDGET_SECONDS: "5400"
+
+    container:
+      image: ${{ inputs.image }}
+      options: ${{ inputs.container-options }}
+
+    runs-on: ${{ inputs.runner }}
+    permissions:
+      contents: read
+
+    defaults:
+      run:
+        shell: bash -l {0}
+
+    steps:
+      - name: Run NVIDIA command
+        if: startsWith(inputs.image, 'nvidia')
+        run: |
+          echo "Detected NVIDIA image"
+          nvidia-smi || echo "nvidia-smi not found"
+
+      - name: Setup toolchain
+        run: |
+          set -x
+          apt-get update
+          apt-get install -y git
+
+      - name: Check out code
+        uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+
+      - name: Create virtual environment
+        run: |
+          uv venv --python 3.12
+
+      - name: Install PyTorch
+        run: |
+          source .venv/bin/activate
+
+          # On OSDC, route through the pypi-cache /whl proxy (deps stay reachable behind the egress firewall) and clear the cache index vars so it wins over the cache default; off OSDC PYPI_CACHE_WHL_URL is unset so we hit download.pytorch.org.
+          PYTORCH_INDEX="${PYPI_CACHE_WHL_URL:-https://download.pytorch.org/whl/cpu}"
+          UV_DEFAULT_INDEX= UV_INDEX= uv pip install -U "torch==2.11.*" --index-url "${PYTORCH_INDEX%/whl/*}/whl/${{ inputs.runtime-version }}"
+
+      - name: Install Helion
+        run: |
+          source .venv/bin/activate
+          SETUPTOOLS_SCM_PRETEND_VERSION="0.0.0" uv pip install -e .'[dev]'
+          python -c "import helion; print(helion.__name__)"
+
+      - name: CUDA Compute Check
+        if: startsWith(inputs.image, 'nvidia')
+        run: |
+          source .venv/bin/activate
+          python -c "
+          import torch, sys
+
+          assert torch.cuda.is_available(), 'FATAL: CUDA not available'
+          n = torch.cuda.device_count()
+          assert n > 0, 'FATAL: No CUDA devices found'
+          print(f'CUDA devices: {n}')
+
+          for i in range(n):
+              dev = torch.device('cuda', i)
+              a = torch.randn(256, 256, device=dev)
+              b = (a @ a).sum().item()
+              print(f'  Device {i} ({torch.cuda.get_device_name(i)}): OK')
+
+          print(f'All {n} devices healthy')
+          "
+
+      - name: Install FLA
+        run: |
+          set -x
+          source .venv/bin/activate
+          uv pip install einops
+          uv pip install "git+https://github.com/sustcsonglin/flash-linear-attention@v0.5.0" --no-deps
+          python -c "import fla; print('fla', fla.__name__)"
+
+      - name: Run Linear-Attention Benchmark
+        run: |
+          rm -rf /tmp/torchinductor_*/ || true
+          source .venv/bin/activate
+
+          TEST_REPORTS_DIR=$(pwd)/test/test-reports
+          mkdir -p "$TEST_REPORTS_DIR"
+          echo "$TEST_REPORTS_DIR"
+
+          KERNELS="${{ inputs.kernels }}"
+          if [[ "$KERNELS" == "all" || -z "$KERNELS" ]]; then
+            KERNEL_FLAG=()
+          else
+            KERNEL_FLAG=(--kernel "$KERNELS")
+          fi
+          echo "=========================================="
+          echo "Linear-Attention Benchmark (vs FLA)"
+          echo "Kernels: ${KERNELS:-all}"
+          echo "=========================================="
+
+          # Run as a module so the repo root is on sys.path and the shared
+          # engine under examples.linear resolves regardless of cwd.
+          ${{ inputs.env-vars }} HELION_PRINT_OUTPUT_CODE=1 \
+            python -m benchmarks.run_linattn \
+              "${KERNEL_FLAG[@]}" \
+              --output "$TEST_REPORTS_DIR/helionbench.json"
+
+          if [[ ! -s "$TEST_REPORTS_DIR/helionbench.json" ]]; then
+            echo "❌ helionbench.json is missing or empty"
+            exit 1
+          fi
+          cat "$TEST_REPORTS_DIR/helionbench.json"
+
+      - name: Upload the benchmark results to GitHub
+        uses: actions/upload-artifact@v7
+        with:
+          name: benchmark-results-${{ inputs.alias }}
+          path: test/test-reports
