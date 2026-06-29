@@ -354,6 +354,9 @@ def _(state: CodegenState) -> None:
     value = pallas_codegen.sliced_value_for_store(
         state, tensor, subscript, parts, value
     )
+    parts, value = pallas_codegen.widen_barrier_temp_store_indices(
+        state, tensor, subscript, parts, value, name
+    )
     idx_str = ", ".join(parts)
     patterns = state.fx_node.meta.get("indexing_patterns") if state.fx_node else ()
     from .._compiler.pallas.gather import emit_scatter_store
