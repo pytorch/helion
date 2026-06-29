@@ -1195,6 +1195,7 @@ def _pallas_prepare_args(
     - arg_to_tensor_pos: mapping from original position to tensor-only position
     - inplace_positions: positions that are both input and output
     - out_shapes: JAX placeholders for output shapes
+    - pallas_aliases: mapping from tensor input positions to output tuple indices
     """
     # Default to the torch-free jax placeholder; the torch launcher injects its
     # torch_tpu placeholder. ``interpret`` is retained for signature stability.
