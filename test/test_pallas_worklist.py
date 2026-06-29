@@ -2525,7 +2525,7 @@ class TestResidentPrepHoistCodegen(unittest.TestCase):
                 score_masks = [
                     line
                     for line in code.splitlines()
-                    if "jnp.where" in line and ", scores" in line
+                    if "_mask_to_" in line and "zeros_like(scores" in line
                 ]
                 self.assertEqual(score_masks, [])
                 self.assertEqual(code.count("lax.dot_general(scores"), grouping)
@@ -2537,16 +2537,17 @@ class TestResidentPrepHoistCodegen(unittest.TestCase):
         score_masks = [
             line
             for line in code.splitlines()
-            if "jnp.where" in line and ", scores" in line
+            if "_mask_to_" in line and "zeros_like(scores" in line
         ]
         self.assertEqual(len(score_masks), 1)
+        self.assertIn("jnp.full([], 0, jnp.float32)", score_masks[0])
         self.assertNotIn("lax.dot_general(scores", code)
 
     def test_flash_resident_prep_keeps_softmax_neg_inf_mask(self):
         # Flash's fill-0 K/V load masks elide (prep cache zeroed), but the amax
         # reduction's softmax mask fills -inf (!= the cache's 0 tail) and is downstream
-        # of the dot, so it is preserved.  Assert the score mask specifically: a
-        # jnp.where whose fill is a -inf full (not merely the m_i init's -inf full).
+        # of the dot, so it is preserved. Assert that the numeric mask feeding amax
+        # contains the -inf fill (not merely the m_i init's -inf full).
         kernel = helion.kernel(
             _flash_prep_kernel.fn,
             backend="pallas",
@@ -2557,13 +2558,17 @@ class TestResidentPrepHoistCodegen(unittest.TestCase):
             _worklist_config([8, 8])
         )
         self.assertIn("_rc_prep_refill", code)  # prep cache installed
-        self.assertRegex(code, r"jnp\.where\([^\n]*jnp\.full\(\[\], float\('-inf'\)")
+        self.assertRegex(
+            code,
+            r"(_mask_to_\d+) = [^\n]*jnp\.full\(\[\], float\('-inf'\)[^\n]*"
+            r"\n\s*amax = [^\n]*jnp\.max\(\1,",
+        )
 
     def test_prep_fallback_leaves_load_masks_intact(self):
         # If prep lowerings are not installed (a fallback), elision must not fire: no
         # cache is zero-filled, so the per-tile masks are still required.  Patch the
         # prep-lowering install to return [] (the shape of every fallback branch) and
-        # confirm no prep cache is read and the reduction keeps its jnp.where masks.
+        # confirm no prep cache is read and the reduction keeps its numeric masks.
         with patch(
             "helion._compiler.pallas.tracing_ops._prepare_resident_prep_lowerings",
             return_value=[],
@@ -2572,7 +2577,11 @@ class TestResidentPrepHoistCodegen(unittest.TestCase):
                 _worklist_config([8, 8])
             )
         self.assertNotIn("_prep[", code)  # no prep cache installed -> none read
-        self.assertIn("jnp.where", code)  # per-tile masks preserved
+        self.assertRegex(
+            code,
+            r"_mask_to_\d+ = [^\n]*mask_2\.astype\(jnp\.float32\)[^\n]*"
+            r"jnp\.full\(\[\], 0,",
+        )
 
     def test_four_dim_resident_prep_tail_mask_tracks_ordered_axis(self):
         qo = _offsets([12, 20, 5, 30])

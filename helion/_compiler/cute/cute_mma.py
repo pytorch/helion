@@ -1434,7 +1434,7 @@ def _trace_to_mma_operand(
     unwrapped_node, mask_to_node = _unwrap_zero_mask_to(node)
     grouped_k_mask = None
     collective_dependency_nodes: tuple[Node, ...] = ()
-    if allow_grouped_k_mask and unwrapped_node is not node:
+    if allow_grouped_k_mask:
         if (
             unwrapped_node.op == "call_function"
             and unwrapped_node.target is torch.ops.aten.where.self
@@ -1458,8 +1458,6 @@ def _trace_to_mma_operand(
                         k_index_node=indices[1],
                     )
                     if grouped_k_mask is not None:
-                        if mask_to_node is None:
-                            return None
                         collective_dependency_nodes = (
                             *grouped_k_mask.k_sizes_value_nodes,
                             grouped_k_mask.k_sizes_load,
@@ -1467,7 +1465,7 @@ def _trace_to_mma_operand(
                             grouped_k_mask.condition,
                             grouped_k_mask.zero,
                             grouped_k_mask.where,
-                            mask_to_node,
+                            *(() if mask_to_node is None else (mask_to_node,)),
                         )
                         return _MmaOperandInfo(
                             load=load_node,
