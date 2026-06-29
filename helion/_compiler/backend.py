@@ -1228,7 +1228,12 @@ class TritonBackend(Backend):
         return f"tl.arange(0, {block_size_var}).to({dtype})"
 
     def reduction_index_zero_expr(self, dtype: str) -> str:
-        return f"tl.zeros([0], {dtype})"
+        # Triton requires block shapes to be powers of 2. As of triton 3.8.0
+        # (triton-lang/triton#10687, 2026-06), is_power_of_two(0) returns False,
+        # so validate_block_shape rejects a length-0 tensor. Emit a length-1
+        # index instead -- the accompanying ``index < 0`` mask is all-False, so
+        # nothing is ever loaded/stored for the empty reduction dimension.
+        return f"tl.zeros([1], {dtype})"
 
     def next_power_of_2_host_expr(self, expr: str) -> str:
         return f"triton.next_power_of_2({expr})"
