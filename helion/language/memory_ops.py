@@ -376,6 +376,9 @@ def _(state: CodegenState) -> None:
     if not scatter_patterns and state.device_function.carry_tiles:
         if emit_carry_store(state, tensor, subscript, name, parts, value):
             return
+    pallas_codegen.reject_partial_last_two_dim_direct_store(
+        state, tensor, subscript, parts
+    )
     if tensor.dtype is torch.bool:
         value = CompileEnvironment.current().backend.cast_ast(value, torch.bool)
     state.codegen.add_statement(

@@ -2180,7 +2180,10 @@ class TestExamples(RefEagerTestBase, TestCase):
             atol=0.15,
         )
 
-    @xfailIfPallas("conflicting tiling patterns")
+    @xfailIfPallasInterpret(
+        "pl.program_id captured into emit_pipeline body is not supported in "
+        "JAX interpret mode (program_id_p.bind asserts during trace)"
+    )
     @skipIfA10G("failure on a10g")
     @skipIfXPU("Squeeze-and-excitation network not supported on XPU")
     @skipIfTileIR("accuracy failure")
@@ -2201,17 +2204,10 @@ class TestExamples(RefEagerTestBase, TestCase):
         # Create gradient for backward pass
         grad_out = torch.randn([m, n], device=DEVICE, dtype=HALF_DTYPE)
 
-        # Compute expected gradients with PyTorch autograd
-        x_torch = x.detach().clone().requires_grad_(True)
-        a_torch = a.detach().clone().requires_grad_(True)
-        b_torch = b.detach().clone().requires_grad_(True)
-        out_torch = torch.mul(
-            x_torch, torch.sigmoid(torch.relu(x_torch @ a_torch) @ b_torch)
-        )
-        out_torch.backward(grad_out)
-
         args = (grad_out, x, a, b, c, d)
-        expected = x_torch.grad
+        grad_to_d = grad_out * x * d * (1.0 - d)
+        grad_to_c = (grad_to_d @ b.T) * (c > 0)
+        expected = grad_out * d + grad_to_c @ a.T
 
         check_example(
             "squeeze_and_excitation_net",
@@ -2248,17 +2244,10 @@ class TestExamples(RefEagerTestBase, TestCase):
         # Create gradient for backward pass
         grad_out = torch.randn([m, n], device=DEVICE, dtype=HALF_DTYPE)
 
-        # Compute expected gradients with PyTorch autograd
-        x_torch = x.detach().clone().requires_grad_(True)
-        a_torch = a.detach().clone().requires_grad_(True)
-        b_torch = b.detach().clone().requires_grad_(True)
-        out_torch = torch.mul(
-            x_torch, torch.sigmoid(torch.relu(x_torch @ a_torch) @ b_torch)
-        )
-        out_torch.backward(grad_out)
-
         args = (grad_out, x, b, c, d)
-        expected = a_torch.grad
+        grad_to_d = grad_out * x * d * (1.0 - d)
+        grad_to_c = (grad_to_d @ b.T) * (c > 0)
+        expected = x.T @ grad_to_c
 
         check_example(
             "squeeze_and_excitation_net",
@@ -2384,7 +2373,9 @@ class TestExamples(RefEagerTestBase, TestCase):
             block_sizes=[4, 16, 16],
         )
 
-    @xfailIfPallas("InductorLoweringError")
+    @xfailIfPallasInterpret(
+        "emit_pipeline BlockSpec with dynamic shapes is unsupported in interpret mode"
+    )
     def test_grpo_loss_bwd(self):
         """Test backward pass for GRPO loss."""
         B, L, V = 2, 64, 128
@@ -2398,6 +2389,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             [B, L + 1, V], device=DEVICE, dtype=torch.bfloat16, requires_grad=True
         )
         completion_ids = torch.randint(0, V, (B, L), device=DEVICE, dtype=torch.int64)
+        completion_ids_kernel = completion_ids.to(LONG_INT_TYPE)
         old_logp = torch.randn(B, L, device=DEVICE, dtype=torch.float32)
         ref_logp = torch.randn(B, L, device=DEVICE, dtype=torch.float32)
         advantages = torch.randn(B, device=DEVICE, dtype=torch.float32)
@@ -2456,7 +2448,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             grad_output,
             logits,
             selected_logits,
-            completion_ids,
+            completion_ids_kernel,
             old_logp,
             ref_logp,
             advantages,
