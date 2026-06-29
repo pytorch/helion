@@ -16,6 +16,8 @@ from typing import TYPE_CHECKING
 import torch
 
 from ..ast_extension import expr_from_string
+from ..compile_environment import CompileEnvironment
+from .plan_tiling import resident_block_elements
 
 if TYPE_CHECKING:
     from ...runtime.config import Config
@@ -55,8 +57,6 @@ def build_gather_plan(
     config: Config,
 ) -> GatherPlan:
     """Validate the gather site and return its plan. Runs during plan_tiling."""
-    from ..compile_environment import CompileEnvironment
-    from .plan_tiling import resident_block_elements
 
     if len(indirect_positions) > 1:
         raise NotImplementedError(
@@ -110,7 +110,6 @@ def build_scatter_plan(
     indirect_positions: list[int],
 ) -> ScatterPlan:
     """Validate a Pallas scatter site and return its one-hot plan."""
-    from ..compile_environment import CompileEnvironment
 
     if not tensor.dtype.is_floating_point:
         raise NotImplementedError(
@@ -298,7 +297,6 @@ def _scatter_source_mask_expr(
     plan: ScatterPlan,
 ) -> str | None:
     """Return a float mask for valid tensor-index source lanes."""
-    from ..compile_environment import CompileEnvironment
 
     subscript = state.proxy_arg(1)
     assert isinstance(subscript, (list, tuple))
