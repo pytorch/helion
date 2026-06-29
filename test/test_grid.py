@@ -345,10 +345,6 @@ class TestGrid(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result, expected)
 
     @skipIfMetal("Metal does not support loop_index_expr for grid loops")
-    @xfailIfPallas(
-        "range(begin, end, step) lowers to _for_loop_step which has no "
-        "emit_pipeline codegen"
-    )
     def test_range_with_step(self):
         """Test that range(begin, end, step) works as alias for hl.grid(begin, end, step)."""
 

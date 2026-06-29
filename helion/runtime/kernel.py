@@ -72,6 +72,7 @@ from .settings import Settings
 if TYPE_CHECKING:
     from collections.abc import Generator
     from collections.abc import Hashable
+    from collections.abc import Iterator
 
     from torch._guards import Source
 
@@ -82,6 +83,81 @@ if TYPE_CHECKING:
     ConfigLike = Config | dict[str, object]
 
 log: logging.Logger = logging.getLogger(__name__)
+
+
+def _iter_argument_tensor_paths(
+    obj: object,
+    path: str = "",
+    *,
+    include_function_closures: bool = False,
+) -> Iterator[tuple[str, torch.Tensor]]:
+    """Yield tensor paths in the deterministic order used by specialization."""
+    if isinstance(obj, torch.Tensor):
+        yield path, obj
+    elif type(obj) is list or type(obj) is tuple:
+        for index, item in enumerate(obj):
+            yield from _iter_argument_tensor_paths(
+                item,
+                f"{path}[{index}]",
+                include_function_closures=include_function_closures,
+            )
+    elif type(obj) is dict:
+        for key in sorted(obj):
+            yield from _iter_argument_tensor_paths(
+                obj[key],
+                f"{path}[{key!r}]",
+                include_function_closures=include_function_closures,
+            )
+    elif isinstance(obj, tuple) and hasattr(obj, "_fields"):
+        # pyrefly: ignore[missing-attribute]
+        for key, value in sorted(obj._asdict().items()):
+            yield from _iter_argument_tensor_paths(
+                value,
+                f"{path}[{key!r}]",
+                include_function_closures=include_function_closures,
+            )
+    elif dataclasses.is_dataclass(obj) and not isinstance(obj, type):
+        for field in sorted(dataclasses.fields(obj), key=lambda field: field.name):
+            yield from _iter_argument_tensor_paths(
+                getattr(obj, field.name),
+                f"{path}[{field.name!r}]",
+                include_function_closures=include_function_closures,
+            )
+    elif include_function_closures and isinstance(obj, types.FunctionType):
+        for index, cell in enumerate(obj.__closure__ or ()):
+            yield from _iter_argument_tensor_paths(
+                cell.cell_contents,
+                f"{path}.__closure__[{index}].cell_contents",
+                include_function_closures=True,
+            )
+
+
+def _iter_argument_tensors(
+    obj: object,
+    *,
+    include_function_closures: bool = False,
+) -> Iterator[torch.Tensor]:
+    for _path, tensor in _iter_argument_tensor_paths(
+        obj, include_function_closures=include_function_closures
+    ):
+        yield tensor
+
+
+def _tensor_alias_signature(args: Sequence[object]) -> tuple[int, ...]:
+    """Canonical storage-alias groups for tensor leaves in specialization order."""
+    representatives: list[torch.Tensor] = []
+    result: list[int] = []
+    for tensor in _iter_argument_tensors(tuple(args), include_function_closures=True):
+        for group, representative in enumerate(representatives):
+            if torch._C._is_alias_of(  # pyrefly: ignore[missing-attribute]
+                tensor, representative
+            ):
+                result.append(group)
+                break
+        else:
+            result.append(len(representatives))
+            representatives.append(tensor)
+    return tuple(result)
 
 
 def _indexing_config_uses_tensor_descriptor(indexing: object, index: int) -> bool:
@@ -414,6 +490,14 @@ class Kernel(Generic[_R]):
             and (self.settings.distributed or self._declares_process_group)
         )
 
+    def _input_alias_signature(self, args: Sequence[object]) -> tuple[int, ...]:
+        # Only Pallas DMA planning consumes input alias metadata. Keeping it out
+        # of other backends' keys also avoids tracing storage introspection in
+        # their torch.compile fast path.
+        if self.settings.backend != "pallas":
+            return ()
+        return _tensor_alias_signature(args)
+
     def _fast_dispatch_key(self, args: tuple[object, ...]) -> Hashable | None:
         """
         Build a cheap dispatch key for the fast-path cache in ``__call__``.
@@ -460,7 +544,9 @@ class Kernel(Generic[_R]):
                 return None
         if not has_tensor:
             return None
-        key.append(self._compute_is_distributed(args))
+        key.extend(
+            (self._compute_is_distributed(args), self._input_alias_signature(args))
+        )
         signature = (
             self._base_specialization_key(args)
             if self._has_specialization_extras
@@ -500,18 +586,15 @@ class Kernel(Generic[_R]):
                 raise TypeError(
                     f"Too many arguments passed to the kernel, expected: {self._num_params} got: {len(args)}."
                 )
+            if len(args) < self._num_params:
+                args = self.normalize_args(*args)
             signature = self._base_specialization_key(args)
             cache_key = self._get_bound_kernel_cache_key(args, signature)
             bound_kernel = (
                 None if cache_key is None else self._bound_kernels.get(cache_key, None)
             )
             if bound_kernel is None:
-                normalized_args: tuple[object, ...] = self.normalize_args(*args)
-                if len(normalized_args) != len(args):
-                    # we had default args that needed to be applied
-                    bound_kernel = self.bind(normalized_args)
-                else:
-                    bound_kernel = BoundKernel(self, args)
+                bound_kernel = BoundKernel(self, args)
                 if cache_key is None:
                     cache_key = self._create_bound_kernel_cache_key(
                         bound_kernel, args, signature
@@ -537,15 +620,23 @@ class Kernel(Generic[_R]):
                 result.append(self._specialization_key(value))
         device_type, device_capability = _device_specialization_key(args)
         is_distributed = self._compute_is_distributed(args)
+        alias_signature = self._input_alias_signature(args)
         if self._key_fn is not None:
             return (
                 *result,
                 device_type,
                 device_capability,
                 is_distributed,
+                alias_signature,
                 self._key_fn(*args),
             )
-        return (*result, device_type, device_capability, is_distributed)
+        return (
+            *result,
+            device_type,
+            device_capability,
+            is_distributed,
+            alias_signature,
+        )
 
     def specialization_key(self, args: Sequence[object]) -> tuple[Hashable, ...]:
         """
@@ -910,7 +1001,9 @@ class Kernel(Generic[_R]):
         """
         if kwargs:
             args = self.normalize_args(*args, **kwargs)
-        elif self._dispatch_cache:
+        elif len(args) < self._num_params:
+            args = self.normalize_args(*args)
+        if self._dispatch_cache:
             # Fast path: repeat call with argument metadata seen before. The
             # cache is only populated by calls that already took the slow
             # path below, so hitting it cannot skip autotuning/compilation.
@@ -1039,6 +1132,9 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
             assert len(args) == len(self.kernel.signature.parameters)
             self.fake_args: list[object] = []
             constexpr_args = {}
+            real_storage_to_fake_storages: dict[int, list[int]] = {}
+            real_storage_member_counts: dict[int, int] = {}
+            real_storage_tracked_counts: dict[int, int] = {}
             for name, arg, annotation in zip(
                 self.kernel.signature.parameters,
                 args,
@@ -1058,7 +1154,49 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
                     self.fake_args.append(arg)
                     constexpr_args[name] = arg
                 else:
-                    self.fake_args.append(self.env.to_fake(arg, ArgumentOrigin(name)))
+                    for tensor in _iter_argument_tensors(
+                        arg, include_function_closures=True
+                    ):
+                        storage_id = id(tensor.untyped_storage())
+                        real_storage_member_counts[storage_id] = (
+                            real_storage_member_counts.get(storage_id, 0) + 1
+                        )
+                    fake_arg = self.env.to_fake(arg, ArgumentOrigin(name))
+                    # Lifted helper closures are populated lazily during tracing,
+                    # so their tensor leaves cannot be paired at bind time.
+                    real_tensors = (
+                        []
+                        if isinstance(fake_arg, types.FunctionType)
+                        else list(_iter_argument_tensors(arg))
+                    )
+                    fake_tensors = list(_iter_argument_tensors(fake_arg))
+                    assert len(real_tensors) == len(fake_tensors)
+                    for real_tensor, fake_tensor in zip(
+                        real_tensors, fake_tensors, strict=True
+                    ):
+                        real_storage_to_fake_storages.setdefault(
+                            id(real_tensor.untyped_storage()), []
+                        ).append(id(fake_tensor.untyped_storage()))
+                        real_storage_id = id(real_tensor.untyped_storage())
+                        real_storage_tracked_counts[real_storage_id] = (
+                            real_storage_tracked_counts.get(real_storage_id, 0) + 1
+                        )
+                    self.fake_args.append(fake_arg)
+
+            for real_storage_id, fake_storages in real_storage_to_fake_storages.items():
+                if len(fake_storages) < 2:
+                    continue
+                group = frozenset(fake_storages)
+                group_size = real_storage_member_counts[real_storage_id]
+                for storage_id in group:
+                    self.env.input_alias_groups[storage_id] = group
+                    self.env.input_alias_group_sizes[storage_id] = group_size
+
+            self.env.disable_pallas_dma_for_untracked_aliases = any(
+                member_count > 1
+                and real_storage_tracked_counts.get(real_storage_id, 0) < member_count
+                for real_storage_id, member_count in real_storage_member_counts.items()
+            )
 
             self._apply_mark_static(args)
 

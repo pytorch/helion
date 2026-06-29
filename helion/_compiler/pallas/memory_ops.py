@@ -55,13 +55,16 @@ def _(state: CodegenState) -> None:
     from .ordered_carry import emit_carry_store
 
     if not is_scatter and state.device_function.carry_tiles:
-        if emit_carry_store(state, tensor, subscript, name, idx_str, value):
+        if emit_carry_store(state, tensor, subscript, name, parts, value):
+            pallas_codegen.mark_dma_scratch_initialized(state, tensor)
             return
     if tensor.dtype is torch.bool:
         value = CompileEnvironment.current().backend.cast_ast(value, torch.bool)
     state.codegen.add_statement(
         statement_from_string(f"{name}[{idx_str}] = {{value}}", value=value)
     )
+    if not is_scatter:
+        pallas_codegen.mark_dma_scratch_initialized(state, tensor)
 
 
 @_decorators.codegen(load, "pallas")

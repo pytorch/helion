@@ -38,6 +38,7 @@ from ..compile_environment import CompileEnvironment
 from ..compile_environment import _symint_sympy_expr
 from ..device_function import find_block_size_symbols
 from ..host_function import HostFunction
+from .plan_tiling import _is_full_slice
 
 log = logging.getLogger(__name__)
 
@@ -49,6 +50,8 @@ if TYPE_CHECKING:
     from ...runtime.config import Config
     from ..generate_ast import ResidentPrepLowering
     from ..inductor_lowering import CodegenState
+    from ..tile_strategy import EmitPipelineLoopState
+    from ..tile_strategy import ForiLoopState
     from ..tile_strategy import LoopDimInfo
     from ..tile_strategy import TileStrategy
     from .compact_worklist import ResidentPrepHoist
@@ -236,36 +239,29 @@ def _(state: CodegenState) -> object:
 
 
 @_decorators.codegen(_for_loop_step, "pallas")
-def _(state: CodegenState) -> None:
+def _(state: CodegenState) -> object:
     """Emit inner stepped device loops for Pallas/TPU."""
     config = state.config
     pallas_loop_type = config.get("pallas_loop_type", "unroll")
     if CompileEnvironment.current().compact_worklist_plan is not None:
         if _is_compact_ordered_inner_loop(state):
             if pallas_loop_type == "unroll":
-                _codegen_resident_cache(state)
-                return None
+                return _codegen_resident_cache(state)
             if pallas_loop_type == "emit_pipeline":
-                _codegen_emit_pipeline(state)
-                return None
+                return _codegen_emit_pipeline(state)
             assert pallas_loop_type == "fori_loop"
         if _is_compact_tile_loop(state):
             plan = CompileEnvironment.current().compact_worklist_plan
             assert plan is not None
             if plan.grouping == 2:
-                _codegen_grouped_compact_tile(state)
-                return None
-        _codegen_fori_loop(state)
-        return None
+                return _codegen_grouped_compact_tile(state)
+        return _codegen_fori_loop(state)
     if pallas_loop_type == "emit_pipeline":
-        _codegen_emit_pipeline(state)
-        return None
+        return _codegen_emit_pipeline(state)
     if pallas_loop_type == "fori_loop":
-        _codegen_fori_loop(state)
-        return None
+        return _codegen_fori_loop(state)
     if _has_supported_dependent_tile_end(state):
-        _codegen_dynamic_unroll(state)
-        return None
+        return _codegen_dynamic_unroll(state)
     if _has_dynamic_unroll_bound(state):
         _raise_unsupported_dynamic_unroll()
     # pyrefly: ignore[bad-return]
@@ -552,12 +548,21 @@ def _emit_resident_prep_refill_once(
     state.codegen.grouped_resident_prep_refill_cache[refill_key] = "emitted"
 
 
+LoadedTensorInfo = tuple[torch.Tensor, torch.fx.Node, list[object]]
+StoredTensorInfo = tuple[
+    torch.Tensor,
+    torch.fx.Node,
+    list[object],
+    list[list[object]],
+]
+
+
 def _classify_loop_tensors(
     graph_info: object,
     state: object,
 ) -> tuple[
-    dict[int, tuple[torch.Tensor, torch.fx.Node, list[object]]],
-    dict[int, tuple[torch.Tensor, torch.fx.Node, list[object]]],
+    dict[int, LoadedTensorInfo],
+    dict[int, StoredTensorInfo],
 ]:
     """Classify tensors accessed in an inner loop body into loaded/stored.
 
@@ -565,6 +570,7 @@ def _classify_loop_tensors(
     """
     from ...language.memory_ops import load as _load_op
     from ...language.memory_ops import store as _store_op
+    from .plan_tiling import TensorIndexPattern
 
     host_tensor_nodes: dict[torch.fx.Node, torch.Tensor] = {}
     for node in graph_info.graph.nodes:  # type: ignore[union-attr]
@@ -572,8 +578,8 @@ def _classify_loop_tensors(
             if "val" in node.meta and isinstance(node.meta["val"], torch.Tensor):
                 host_tensor_nodes[node] = node.meta["val"]
 
-    loaded_tensors: dict[int, tuple[torch.Tensor, torch.fx.Node, list[object]]] = {}
-    stored_tensors: dict[int, tuple[torch.Tensor, torch.fx.Node, list[object]]] = {}
+    loaded_tensors: dict[int, LoadedTensorInfo] = {}
+    stored_tensors: dict[int, StoredTensorInfo] = {}
 
     for node in graph_info.graph.nodes:  # type: ignore[union-attr]
         if node.op != "call_function":
@@ -587,9 +593,16 @@ def _classify_loop_tensors(
             ):
                 fake = host_tensor_nodes[tensor_node]
                 key = id(fake)
+                sub_vals = _extract_subscript_vals(subscript)
                 if key not in loaded_tensors:
-                    sub_vals = _extract_subscript_vals(subscript)
                     loaded_tensors[key] = (fake, tensor_node, sub_vals)
+                else:
+                    prev_fake, prev_node, prev_sub_vals = loaded_tensors[key]
+                    loaded_tensors[key] = (
+                        prev_fake,
+                        prev_node,
+                        _merge_subscript_meta(prev_fake, prev_sub_vals, sub_vals),
+                    )
         elif node.target is _store_op:
             tensor_node = node.args[0]
             subscript = node.args[1]
@@ -599,9 +612,41 @@ def _classify_loop_tensors(
             ):
                 fake = host_tensor_nodes[tensor_node]
                 key = id(fake)
+                sub_vals = _extract_subscript_vals(subscript)
                 if key not in stored_tensors:
-                    sub_vals = _extract_subscript_vals(subscript)
-                    stored_tensors[key] = (fake, tensor_node, sub_vals)
+                    stored_tensors[key] = (fake, tensor_node, sub_vals, [sub_vals])
+                else:
+                    prev_fake, prev_node, prev_sub_vals, prev_store_sub_vals = (
+                        stored_tensors[key]
+                    )
+                    stored_tensors[key] = (
+                        prev_fake,
+                        prev_node,
+                        _merge_subscript_meta(prev_fake, prev_sub_vals, sub_vals),
+                        [*prev_store_sub_vals, sub_vals],
+                    )
+                # Scatter preserves untouched target rows by reading the old
+                # block, so it is a read-modify-write rather than store-only.
+                if any(
+                    isinstance(pattern, TensorIndexPattern)
+                    for pattern in node.meta.get("indexing_patterns", ())
+                ):
+                    if key not in loaded_tensors:
+                        loaded_tensors[key] = (fake, tensor_node, sub_vals)
+                    else:
+                        prev_fake, prev_node, prev_sub_vals = loaded_tensors[key]
+                        loaded_tensors[key] = (
+                            prev_fake,
+                            prev_node,
+                            _merge_subscript_meta(prev_fake, prev_sub_vals, sub_vals),
+                        )
+
+    for key in loaded_tensors.keys() & stored_tensors.keys():
+        loaded_fake, loaded_node, loaded_sub_vals = loaded_tensors[key]
+        stored_fake, stored_node, stored_sub_vals, store_sub_vals = stored_tensors[key]
+        merged = _merge_subscript_meta(loaded_fake, loaded_sub_vals, stored_sub_vals)
+        loaded_tensors[key] = (loaded_fake, loaded_node, merged)
+        stored_tensors[key] = (stored_fake, stored_node, merged, store_sub_vals)
 
     return loaded_tensors, stored_tensors
 
@@ -613,6 +658,95 @@ def _tensor_dim_subscripts(subscript_meta: list[object]) -> list[object]:
 
 def _subscript_at_dim(subscripts: list[object], dim: int) -> object:
     return subscripts[dim] if dim < len(subscripts) else slice(None)
+
+
+def _same_subscript_index(
+    left: object,
+    right: object,
+    env: CompileEnvironment,
+) -> bool:
+    if left is right:
+        return True
+    if isinstance(left, int) and isinstance(right, int):
+        return left == right
+    if isinstance(left, torch.SymInt) and isinstance(right, torch.SymInt):
+        return env.known_equal(left, right)
+    if isinstance(left, slice) and isinstance(right, slice):
+        return all(
+            lpart is None
+            and rpart is None
+            or lpart is not None
+            and rpart is not None
+            and _same_subscript_index(lpart, rpart, env)
+            for lpart, rpart in zip(
+                (left.start, left.stop, left.step),
+                (right.start, right.stop, right.step),
+                strict=True,
+            )
+        )
+    return False
+
+
+def _subscript_meta_equal(
+    fake: torch.Tensor,
+    lhs: list[object],
+    rhs: list[object],
+) -> bool:
+    env = CompileEnvironment.current()
+    lhs_dims = _tensor_dim_subscripts(lhs)
+    rhs_dims = _tensor_dim_subscripts(rhs)
+    return all(
+        _same_subscript_index(
+            _subscript_at_dim(lhs_dims, dim),
+            _subscript_at_dim(rhs_dims, dim),
+            env,
+        )
+        for dim in range(fake.ndim)
+    )
+
+
+def _subscript_meta_contains(
+    fake: torch.Tensor,
+    outer: list[object],
+    inner: list[object],
+) -> bool:
+    """Whether an enclosing DMA window contains every inner access dimension."""
+    env = CompileEnvironment.current()
+    outer_dims = _tensor_dim_subscripts(outer)
+    inner_dims = _tensor_dim_subscripts(inner)
+    for dim in range(fake.ndim):
+        outer_index = _subscript_at_dim(outer_dims, dim)
+        inner_index = _subscript_at_dim(inner_dims, dim)
+        if _is_full_slice(outer_index):
+            continue
+        if not _same_subscript_index(outer_index, inner_index, env):
+            return False
+    return True
+
+
+def _merge_subscript_meta(
+    fake: torch.Tensor,
+    lhs: list[object],
+    rhs: list[object],
+) -> list[object]:
+    """Merge accesses into a conservative per-tensor-dimension DMA shape."""
+    env = CompileEnvironment.current()
+    lhs_dims = _tensor_dim_subscripts(lhs)
+    rhs_dims = _tensor_dim_subscripts(rhs)
+
+    merged: list[object] = []
+    for dim in range(fake.ndim):
+        left = _subscript_at_dim(lhs_dims, dim)
+        right = _subscript_at_dim(rhs_dims, dim)
+        if _is_full_slice(left) or _is_full_slice(right):
+            merged.append(slice(None))
+        elif _same_subscript_index(left, right, env):
+            merged.append(left)
+        else:
+            # Sharing symbolic provenance is insufficient: accesses using the
+            # same tile with different offsets cover different HBM regions.
+            merged.append(slice(None))
+    return merged
 
 
 def _get_dim_block_ids(
@@ -631,6 +765,47 @@ def _get_dim_block_ids(
         elif isinstance(idx, slice) and idx == slice(None):
             pass
     return dim_to_bid
+
+
+def _dma_ref_block_ids(
+    subscript_meta: list[object],
+    block_ids: list[int],
+    env: CompileEnvironment,
+    state: CodegenState,
+    extra_block_ids: set[int] | None = None,
+) -> set[int]:
+    """Return block IDs whose slicing is already handled by a DMA-backed ref."""
+    from helion._compiler.pallas.ordered_carry import is_dynamic_bound_tile
+
+    extra = extra_block_ids or set()
+    return {
+        block_id
+        for block_id in _get_dim_block_ids(subscript_meta, env).values()
+        if block_id in block_ids
+        or block_id in extra
+        or is_dynamic_bound_tile(state, block_id)
+        or state.codegen.active_device_loops.get(block_id)
+    }
+
+
+def _active_dma_route(
+    state: CodegenState,
+    tensor_name: str,
+    storage_id: int,
+) -> tuple[EmitPipelineLoopState | ForiLoopState, str] | None:
+    """Return the innermost enclosing route for this tensor or its storage."""
+    from ..tile_strategy import EmitPipelineLoopState
+    from ..tile_strategy import ForiLoopState
+
+    for loop in reversed(state.codegen._active_loop_stack()):
+        if not isinstance(loop, (EmitPipelineLoopState, ForiLoopState)):
+            continue
+        if tensor_name in loop._tensor_to_dma_scratch:
+            return loop, tensor_name
+        for owner_name, owner_storage_id in loop._tensor_to_dma_storage_id.items():
+            if owner_storage_id == storage_id:
+                return loop, owner_name
+    return None
 
 
 def _find_strategy(
@@ -713,7 +888,7 @@ def _is_compact_tile_loop(state: CodegenState) -> bool:
         return False
     if graph_info.block_ids != [plan.compact_axis.block_id]:
         return False
-    args = state.proxy_args[-1]
+    args = state.proxy_args[3]
     return isinstance(args, list) and not _loop_carried_indices(state, len(args))
 
 
@@ -2180,8 +2355,8 @@ def _aligned_dim(
     state: CodegenState,
     env: CompileEnvironment,
     block_ids: list[int],
-    loaded_tensors: dict[int, tuple[torch.Tensor, torch.fx.Node, list[object]]],
-    stored_tensors: dict[int, tuple[torch.Tensor, torch.fx.Node, list[object]]],
+    loaded_tensors: dict[int, LoadedTensorInfo],
+    stored_tensors: dict[int, StoredTensorInfo],
 ) -> dict[int, int]:
     """Jagged row tiles (runtime end) that read an aligned-enclosing window.
 
@@ -2208,7 +2383,14 @@ def _aligned_dim(
 
     # Strictest addressing each row needs over the tensors it slices.
     addressing: dict[int, SliceAddressing] = {}
-    for fake, _node, sub_meta in (*loaded_tensors.values(), *stored_tensors.values()):
+    tensor_accesses = [
+        *loaded_tensors.values(),
+        *(
+            (fake, node, sub_meta)
+            for fake, node, sub_meta, _store_sub_metas in stored_tensors.values()
+        ),
+    ]
+    for fake, _node, sub_meta in tensor_accesses:
         if not (isinstance(fake, torch.Tensor) and fake.is_floating_point()):
             continue
         dim_to_bid = _get_dim_block_ids(sub_meta, env)
@@ -2268,12 +2450,12 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
     block_ids = graph_info.block_ids
     env = CompileEnvironment.current()
 
-    args = state.ast_args[-1]
+    args = state.ast_args[3]
     assert isinstance(args, list)
     assert all(isinstance(x, ast.AST) for x in args)
 
     # Check if we have loop-carried state (accumulators etc.)
-    proxy_args = state.proxy_args[-1]
+    proxy_args = state.proxy_args[3]
     assert isinstance(proxy_args, list)
     has_loop_state = len(args) > 0
 
@@ -2294,7 +2476,13 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
     # BlockSpec; the rest stay on the outer pallas_call BlockSpec
     # (escape clause `bs == as`) and are closure-read from the body.
     all_tensor_info, _vmem_shapes, pipelined_tensor_ids = _classify_pipelined_tensors(
-        loaded_tensors, stored_tensors, block_ids, slice_size_exprs, env, state
+        loaded_tensors,
+        stored_tensors,
+        block_ids,
+        slice_size_exprs,
+        env,
+        state,
+        copy_in_read_write=False,
     )
 
     # Build in_specs and out_specs
@@ -2305,6 +2493,11 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
     body_params: list[str] = []
     pipeline_in_args: list[str] = []
     pipeline_out_args: list[str] = []
+    tensor_to_dma_block_ids: dict[str, set[int]] = {}
+    tensor_to_dma_subscript_meta: dict[str, list[object]] = {}
+    tensor_to_dma_storage_id: dict[str, int] = {}
+    tensor_to_dma_access: dict[str, str] = {}
+    initialized_dma_scratch: set[str] = set()
 
     # Map outer grid block_ids to program_id variable names.
     # Compute program_ids before emit_pipeline so the BlockSpec lambda
@@ -2570,7 +2763,7 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
     for fake, _tensor_node, _sub_meta in loaded_tensors.values():
         if id(fake) in pipelined_tensor_ids:
             state.device_function.pallas_memory_space[id(fake)] = PallasMemorySpace.HBM
-    for fake, _tensor_node, _sub_meta in stored_tensors.values():
+    for fake, _tensor_node, _sub_meta, _store_sub_metas in stored_tensors.values():
         if id(fake) in pipelined_tensor_ids:
             state.device_function.pallas_memory_space[id(fake)] = PallasMemorySpace.HBM
 
@@ -2587,8 +2780,19 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
         in_specs.append(_make_load_block_spec(fake, sub_meta))
         body_params.append(vmem_name)
         pipeline_in_args.append(_make_hbm_slice(fake, hbm_name, sub_meta))
+        tensor_to_dma_block_ids[hbm_name] = _dma_ref_block_ids(
+            sub_meta,
+            block_ids,
+            env,
+            state,
+            set(_bid_to_pid_var),
+        )
+        tensor_to_dma_subscript_meta[hbm_name] = sub_meta
+        tensor_to_dma_storage_id[hbm_name] = id(fake.untyped_storage())
+        tensor_to_dma_access[hbm_name] = "load"
+        initialized_dma_scratch.add(hbm_name)
 
-    for fake, _tensor_node, sub_meta in stored_tensors.values():
+    for fake, _tensor_node, sub_meta, _store_sub_metas in stored_tensors.values():
         if id(fake) not in pipelined_tensor_ids:
             continue
         hbm_name = state.device_function.tensor_arg(fake).name
@@ -2599,6 +2803,16 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
         out_specs.append(_make_store_block_spec(fake, sub_meta))
         body_params.append(vmem_name)
         pipeline_out_args.append(_make_hbm_slice(fake, hbm_name, sub_meta))
+        tensor_to_dma_block_ids[hbm_name] = _dma_ref_block_ids(
+            sub_meta,
+            block_ids,
+            env,
+            state,
+            set(_bid_to_pid_var),
+        )
+        tensor_to_dma_subscript_meta[hbm_name] = sub_meta
+        tensor_to_dma_storage_id[hbm_name] = id(fake.untyped_storage())
+        tensor_to_dma_access[hbm_name] = "store"
 
     # Build the body function
     body_fn_name = state.device_function.new_var("_pipeline_body")
@@ -2679,6 +2893,10 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
     for _fake, hbm_name in out_tensors:
         tensor_to_dma_scratch[hbm_name] = body_params[idx]
         idx += 1
+    assert tensor_to_dma_scratch.keys() == tensor_to_dma_block_ids.keys()
+    assert tensor_to_dma_scratch.keys() == tensor_to_dma_subscript_meta.keys()
+    assert tensor_to_dma_scratch.keys() == tensor_to_dma_storage_id.keys()
+    assert tensor_to_dma_scratch.keys() == tensor_to_dma_access.keys()
 
     # Create the pipeline loop state
     pipeline_state = EmitPipelineLoopState(
@@ -2687,6 +2905,11 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
         body_fn_name=body_fn_name,
         inner_statements=body_stmts,
         _tensor_to_dma_scratch=tensor_to_dma_scratch,
+        _tensor_to_dma_block_ids=tensor_to_dma_block_ids,
+        _tensor_to_dma_subscript_meta=tensor_to_dma_subscript_meta,
+        _tensor_to_dma_storage_id=tensor_to_dma_storage_id,
+        _tensor_to_dma_access=tensor_to_dma_access,
+        _initialized_dma_scratch=initialized_dma_scratch,
     )
 
     # For loop-carried state, remap args to scratch reads inside the body
@@ -2900,13 +3123,154 @@ def _compute_vmem_shapes(
     return vmem_shapes
 
 
+def _storage_has_globally_compatible_loop_accesses(
+    storage_id: int,
+    env: CompileEnvironment,
+    state: CodegenState,
+    *,
+    copy_in_read_write: bool,
+) -> bool:
+    """Whether every graph using a shared storage can use one global HBM route."""
+    from ..device_ir import ForLoopGraphInfo
+
+    if env.disable_pallas_dma_for_untracked_aliases:
+        return False
+
+    device_ir = HostFunction.current().device_ir
+    loop_candidates: list[bool] = []
+    alias_storages = env.input_alias_groups.get(storage_id, frozenset((storage_id,)))
+    alias_group_size = env.input_alias_group_sizes.get(storage_id, 1)
+    accessed_alias_storages: set[int] = set()
+    has_stores = False
+    has_non_loop_access = False
+    matching_loop_count = 0
+    has_read_write = False
+
+    def matches_storage(fake: torch.Tensor) -> bool:
+        return id(fake.untyped_storage()) in alias_storages
+
+    for graph_info in device_ir.graphs:
+        loaded, stored = _classify_loop_tensors(graph_info, state)
+        matching_loaded = {
+            key: info for key, info in loaded.items() if matches_storage(info[0])
+        }
+        matching_stored = {
+            key: info for key, info in stored.items() if matches_storage(info[0])
+        }
+        if not matching_loaded and not matching_stored:
+            continue
+        accessed_alias_storages.update(
+            id(info[0].untyped_storage()) for info in matching_loaded.values()
+        )
+        accessed_alias_storages.update(
+            id(info[0].untyped_storage()) for info in matching_stored.values()
+        )
+        has_stores = has_stores or bool(matching_stored)
+        if not isinstance(graph_info, ForLoopGraphInfo):
+            has_non_loop_access = True
+            continue
+        matching_loop_count += 1
+        if len(matching_loaded.keys() | matching_stored.keys()) != 1:
+            loop_candidates.append(False)
+            continue
+
+        all_tensor_info: list[tuple[torch.Tensor, list[object], str]] = []
+        for key, (fake, _node, sub_meta) in matching_loaded.items():
+            if key not in matching_stored:
+                all_tensor_info.append((fake, sub_meta, "load"))
+        for key, (fake, _node, sub_meta, store_metas) in matching_stored.items():
+            widened_store = any(
+                not _subscript_meta_equal(fake, sub_meta, store_meta)
+                for store_meta in store_metas
+            )
+            unsafe_read_write = key in matching_loaded and not copy_in_read_write
+            has_read_write = has_read_write or key in matching_loaded
+            if widened_store or unsafe_read_write:
+                loop_candidates.append(False)
+                continue
+            all_tensor_info.append((fake, sub_meta, "store"))
+
+        block_sizes: list[int] = []
+        for block_id in graph_info.block_ids:
+            block_size = state.device_function.resolved_block_size(block_id)
+            if not isinstance(block_size, int):
+                loop_candidates.append(False)
+                break
+            block_sizes.append(block_size)
+        else:
+            step_variants: list[list[object]] = []
+            for caller_info in device_ir.graphs:
+                for node in caller_info.graph.nodes:
+                    if (
+                        node.op != "call_function"
+                        or node.target not in (_for_loop, _for_loop_step)
+                        or not node.args
+                        or node.args[0] != graph_info.graph_id
+                    ):
+                        continue
+                    if node.target is _for_loop:
+                        step_variants.append([None] * len(graph_info.block_ids))
+                    else:
+                        step_variants.append(_extract_subscript_vals(node.args[4]))
+            if not step_variants:
+                step_variants.append([None] * len(graph_info.block_ids))
+
+            for steps in step_variants:
+                if len(steps) != len(graph_info.block_ids):
+                    loop_candidates.append(False)
+                    continue
+                slice_size_exprs = [
+                    str(block_size) if _is_default_pallas_loop_step(step) else "1"
+                    for block_size, step in zip(block_sizes, steps, strict=True)
+                ]
+                vmem_shapes = _compute_vmem_shapes(
+                    all_tensor_info,
+                    graph_info.block_ids,
+                    slice_size_exprs,
+                    env,
+                    state,
+                )
+                loop_candidates.extend(map(_check_dma_alignment, vmem_shapes))
+
+    if alias_group_size > 1 and has_stores:
+        raise BackendUnsupported(
+            "pallas",
+            "mutating aliased tensor arguments across device loops is not supported",
+        )
+    if len(accessed_alias_storages) > 1 or has_non_loop_access:
+        return False
+    if (
+        env.compact_worklist_plan is not None
+        and matching_loop_count > 1
+        and has_read_write
+    ):
+        return False
+    # A single loop can still use the current call's row-slab exception. Shared
+    # storage needs the standard alignment in every loop so routing is global.
+    return len(loop_candidates) <= 1 or all(loop_candidates)
+
+
+def _is_default_pallas_loop_step(step: object) -> bool:
+    if isinstance(step, torch.fx.Node):
+        step = step.meta.get("val", step)
+    if step is None:
+        return True
+    try:
+        value = sympy.sympify(step)
+    except (TypeError, ValueError, sympy.SympifyError):
+        return False
+    return value in (sympy.Integer(0), sympy.Integer(1))
+
+
 def _classify_pipelined_tensors(
-    loaded_tensors: dict[int, tuple[torch.Tensor, torch.fx.Node, list[object]]],
-    stored_tensors: dict[int, tuple[torch.Tensor, torch.fx.Node, list[object]]],
+    loaded_tensors: dict[int, LoadedTensorInfo],
+    stored_tensors: dict[int, StoredTensorInfo],
     block_ids: list[int],
     slice_size_exprs: list[str],
     env: CompileEnvironment,
     state: CodegenState,
+    *,
+    copy_in_read_write: bool,
 ) -> tuple[
     list[tuple[torch.Tensor, list[object], str]], list[tuple[int, ...]], set[int]
 ]:
@@ -2945,7 +3309,7 @@ def _classify_pipelined_tensors(
     # Walk all root graphs (outer pallas_call body) for load/store/atomic
     # nodes; any tensor accessed there is read/written outside the inner
     # loop and must keep its outer BlockSpec.
-    outer_access_tensor_ids: set[int] = set()
+    outer_access_storages: set[int] = set()
     for root_id in device_ir.root_ids:
         root_graph = device_ir.graphs[root_id].graph
         for node in root_graph.nodes:
@@ -2956,7 +3320,36 @@ def _classify_pipelined_tensors(
                 continue
             val = tensor_node.meta.get("val")
             if isinstance(val, torch.Tensor):
-                outer_access_tensor_ids.add(id(val))
+                outer_access_storages.add(id(val.untyped_storage()))
+    outer_access_storages = {
+        alias_storage
+        for storage in outer_access_storages
+        for alias_storage in env.input_alias_groups.get(storage, (storage,))
+    }
+
+    # emit_pipeline outputs are not copied in before their body runs. Its
+    # read-modify-write tensors must therefore remain on their outer refs. Manual
+    # fori DMA does copy them in, so widening there is initialized and safe.
+    unsafe_store_ids = {
+        key
+        for key, (fake, _node, merged_meta, store_metas) in stored_tensors.items()
+        if (key in loaded_tensors and not copy_in_read_write)
+        or any(
+            not _subscript_meta_equal(fake, merged_meta, store_meta)
+            for store_meta in store_metas
+        )
+    }
+
+    inner_ids_by_storage: dict[int, set[int]] = {}
+    for key, (fake, _node, _sub_meta) in loaded_tensors.items():
+        inner_ids_by_storage.setdefault(id(fake.untyped_storage()), set()).add(key)
+    for key, (fake, _node, _sub_meta, _store_sub_metas) in stored_tensors.items():
+        inner_ids_by_storage.setdefault(id(fake.untyped_storage()), set()).add(key)
+    aliased_inner_storages = {
+        storage
+        for storage, fake_ids in inner_ids_by_storage.items()
+        if len(fake_ids) > 1
+    }
 
     # Pallas lowers atomics as direct load/compute/store operations on their
     # tensor ref. Such a tensor cannot simultaneously be remapped to the
@@ -2972,26 +3365,80 @@ def _classify_pipelined_tensors(
             val = tensor_node.meta.get("val")
             if isinstance(val, torch.Tensor):
                 atomic_storages.add(id(val.untyped_storage()))
+    atomic_storages = {
+        alias_storage
+        for storage in atomic_storages
+        for alias_storage in env.input_alias_groups.get(storage, (storage,))
+    }
 
     pipelined_ids: set[int] = set()
     for (fake, sub_meta, direction), vmem_shape in zip(
         all_tensor_info, vmem_shapes, strict=True
     ):
+        tensor_name = state.device_function.tensor_arg(fake).name
+        storage_id = id(fake.untyped_storage())
+        enclosing_route = _active_dma_route(state, tensor_name, storage_id)
+        if enclosing_route is not None:
+            enclosing_loop, owner_name = enclosing_route
+            if owner_name != tensor_name:
+                raise BackendUnsupported(
+                    "pallas",
+                    "a nested device loop accesses an enclosing DMA tensor "
+                    "through a different alias or view",
+                )
+            enclosing_meta = enclosing_loop._tensor_to_dma_subscript_meta[owner_name]
+            if not _subscript_meta_contains(fake, enclosing_meta, sub_meta):
+                raise BackendUnsupported(
+                    "pallas",
+                    "a nested device loop accesses a tensor outside its enclosing "
+                    "DMA scratch window",
+                )
+            current_reads = direction == "load" or id(fake) in loaded_tensors
+            current_writes = direction == "store"
+            enclosing_access = enclosing_loop._tensor_to_dma_access[owner_name]
+            if (
+                current_reads
+                and owner_name not in enclosing_loop._initialized_dma_scratch
+            ):
+                raise BackendUnsupported(
+                    "pallas",
+                    "a nested device loop reads an enclosing output scratch "
+                    "before it is initialized",
+                )
+            if current_writes and enclosing_access not in ("store", "read_write"):
+                raise BackendUnsupported(
+                    "pallas",
+                    "a nested device loop writes an enclosing input-only DMA scratch",
+                )
+            # Reuse the enclosing scratch. This preserves pending writes and lets
+            # its owner perform the single HBM writeback after the nested loop.
+            continue
         if not _can_stream_inner_tile(
             fake, sub_meta, direction, block_ids, vmem_shape, env, state
         ):
             continue
-        if id(fake) in outer_access_tensor_ids:
+        if not _storage_has_globally_compatible_loop_accesses(
+            storage_id,
+            env,
+            state,
+            copy_in_read_write=copy_in_read_write,
+        ):
             continue
-        if id(fake.untyped_storage()) in atomic_storages:
+        if id(fake) in unsafe_store_ids:
+            continue
+        if storage_id in outer_access_storages:
+            continue
+        if storage_id in aliased_inner_storages:
+            continue
+        if storage_id in atomic_storages:
             continue
         pipelined_ids.add(id(fake))
     return all_tensor_info, vmem_shapes, pipelined_ids
 
 
 def _resident_loop_tensor_info(
-    loaded_tensors: dict[int, tuple[torch.Tensor, torch.fx.Node, list[object]]],
-    stored_tensors: dict[int, tuple[torch.Tensor, torch.fx.Node, list[object]]],
+    loaded_tensors: dict[int, LoadedTensorInfo],
+    stored_tensors: dict[int, StoredTensorInfo],
 ) -> list[tuple[torch.Tensor, list[object], str]]:
     """Tensor access records needed by optional resident prep lowering."""
     result = [
@@ -3001,7 +3448,7 @@ def _resident_loop_tensor_info(
     ]
     result.extend(
         (fake, sub_meta, "store")
-        for fake, _tensor_node, sub_meta in stored_tensors.values()
+        for fake, _tensor_node, sub_meta, _store_sub_metas in stored_tensors.values()
     )
     return result
 
@@ -3022,7 +3469,7 @@ def _codegen_dynamic_unroll(state: CodegenState) -> object:
             "dynamic pallas unroll currently supports one inner tile dimension"
         )
 
-    args = state.ast_args[-1]
+    args = state.ast_args[3]
     assert isinstance(args, list)
     assert all(isinstance(arg, ast.AST) for arg in args)
 
@@ -3158,11 +3605,11 @@ def _codegen_fori_loop(state: CodegenState) -> object:
     block_ids = graph_info.block_ids
     env = CompileEnvironment.current()
 
-    args = state.ast_args[-1]
+    args = state.ast_args[3]
     assert isinstance(args, list)
     assert all(isinstance(x, ast.AST) for x in args)
 
-    proxy_args = state.proxy_args[-1]
+    proxy_args = state.proxy_args[3]
     assert isinstance(proxy_args, list)
     has_loop_state = len(args) > 0
 
@@ -3202,7 +3649,13 @@ def _codegen_fori_loop(state: CodegenState) -> object:
     # non-pipelined tensor is present (which would load full outer-block
     # tiles into VMEM and may OOM at large shapes).
     all_tensor_info, vmem_shapes, pipelined_tensor_ids = _classify_pipelined_tensors(
-        loaded_tensors, stored_tensors, block_ids, slice_size_exprs, env, state
+        loaded_tensors,
+        stored_tensors,
+        block_ids,
+        slice_size_exprs,
+        env,
+        state,
+        copy_in_read_write=True,
     )
 
     # Compact worklist: the compact-tile aligned_load and exact_store tensors use
@@ -3251,6 +3704,11 @@ def _codegen_fori_loop(state: CodegenState) -> object:
     from ..device_function import PallasMemorySpace
 
     tensor_to_dma_scratch: dict[str, str] = {}
+    tensor_to_dma_block_ids: dict[str, set[int]] = {}
+    tensor_to_dma_subscript_meta: dict[str, list[object]] = {}
+    tensor_to_dma_storage_id: dict[str, int] = {}
+    tensor_to_dma_access: dict[str, str] = {}
+    initialized_dma_scratch: set[str] = set()
     tensor_to_sem: dict[str, str] = {}
     prefetched_load_tensors: set[str] = set()
     prefetched_loads: list[tuple[torch.Tensor, list[object], str, str]] = []
@@ -3270,7 +3728,8 @@ def _codegen_fori_loop(state: CodegenState) -> object:
             id(input_tensor.untyped_storage()), []
         ).append(input_slot)
     stored_tensor_storages = {
-        id(fake.untyped_storage()) for fake, _node, _sub_meta in stored_tensors.values()
+        id(fake.untyped_storage())
+        for fake, _node, _sub_meta, _store_sub_metas in stored_tensors.values()
     }
 
     for (fake, sub_meta, direction), vmem_shape in zip(
@@ -3326,10 +3785,30 @@ def _codegen_fori_loop(state: CodegenState) -> object:
         else:
             vmem_name, sem_name = cached_resource
         tensor_to_dma_scratch[hbm_name] = vmem_name
+        tensor_to_dma_block_ids[hbm_name] = _dma_ref_block_ids(
+            sub_meta,
+            block_ids,
+            env,
+            state,
+        )
+        tensor_to_dma_subscript_meta[hbm_name] = sub_meta
+        tensor_to_dma_storage_id[hbm_name] = storage_id
+        access = (
+            "read_write"
+            if direction == "store" and id(fake) in loaded_tensors
+            else direction
+        )
+        tensor_to_dma_access[hbm_name] = access
+        if access != "store":
+            initialized_dma_scratch.add(hbm_name)
         tensor_to_sem[hbm_name] = sem_name
         if uses_load_prefetch:
             prefetched_load_tensors.add(hbm_name)
             prefetched_loads.append((fake, sub_meta, vmem_name, sem_name))
+    assert tensor_to_dma_scratch.keys() == tensor_to_dma_block_ids.keys()
+    assert tensor_to_dma_scratch.keys() == tensor_to_dma_subscript_meta.keys()
+    assert tensor_to_dma_scratch.keys() == tensor_to_dma_storage_id.keys()
+    assert tensor_to_dma_scratch.keys() == tensor_to_dma_access.keys()
 
     # Build the body function
     body_stmts: list[ast.AST] = []
@@ -3390,6 +3869,11 @@ def _codegen_fori_loop(state: CodegenState) -> object:
         loop_var_name=loop_vars[-1],
         inner_statements=body_stmts,
         _tensor_to_dma_scratch=tensor_to_dma_scratch,
+        _tensor_to_dma_block_ids=tensor_to_dma_block_ids,
+        _tensor_to_dma_subscript_meta=tensor_to_dma_subscript_meta,
+        _tensor_to_dma_storage_id=tensor_to_dma_storage_id,
+        _tensor_to_dma_access=tensor_to_dma_access,
+        _initialized_dma_scratch=initialized_dma_scratch,
         _tensor_to_sem=tensor_to_sem,
         _prefetched_load_tensors=prefetched_load_tensors,
     )
@@ -3652,7 +4136,7 @@ def _codegen_fori_loop(state: CodegenState) -> object:
         if has_loop_state:
             _write_back_loop_carried(state, scratch_names, carried, graph_results)
 
-        for fake, _tensor_node, sub_meta in stored_tensors.values():
+        for fake, _tensor_node, sub_meta, _store_sub_metas in stored_tensors.values():
             hbm_name = state.device_function.tensor_arg(fake).name
             if hbm_name not in tensor_to_dma_scratch:
                 continue

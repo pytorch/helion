@@ -17,6 +17,7 @@ These tests pin down:
 3. The documented ``None`` returns: unhandled argument types and the
    no-tensor-to-pin-the-device case.
 4. ``key=`` functions feed into the fast key.
+5. Pallas tensor alias relationships participate in both specialization paths.
 
 The key is pure argument-metadata bookkeeping, so it needs no compilation and
 runs on CPU-only bots.
@@ -24,7 +25,9 @@ runs on CPU-only bots.
 
 from __future__ import annotations
 
+import dataclasses
 import unittest
+from unittest.mock import Mock
 
 import torch
 
@@ -53,6 +56,14 @@ def _dynamic_add_scalar(x: torch.Tensor, s: int) -> torch.Tensor:
     out = torch.empty_like(x)
     for tile in hl.tile(x.size(0)):
         out[tile] = x[tile] + s
+    return out
+
+
+@helion.kernel(backend="pallas", static_shapes=True)
+def _pallas_static_add_tensors(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tile in hl.tile(x.size(0)):
+        out[tile] = x[tile] + y[tile]
     return out
 
 
@@ -121,6 +132,133 @@ class TestFastDispatchKey(unittest.TestCase):
             _dynamic_add1._fast_dispatch_key(a),
             _dynamic_add1._fast_dispatch_key(b),
         )
+
+    def test_tensor_aliasing_is_part_of_both_keys(self) -> None:
+        x = torch.empty(64, dtype=torch.float32)
+        alias = x.view_as(x)
+        independent = torch.empty_like(x)
+        aliased_args = (x, alias)
+        independent_args = (x, independent)
+        fresh_x = torch.empty_like(x)
+        fresh_aliased_args = (fresh_x, fresh_x.view_as(fresh_x))
+        fresh_independent_args = (fresh_x, torch.empty_like(fresh_x))
+
+        aliased_full = _pallas_static_add_tensors.specialization_key(aliased_args)
+        independent_full = _pallas_static_add_tensors.specialization_key(
+            independent_args
+        )
+        aliased_fast = _pallas_static_add_tensors._fast_dispatch_key(aliased_args)
+        independent_fast = _pallas_static_add_tensors._fast_dispatch_key(
+            independent_args
+        )
+        self.assertNotEqual(aliased_full, independent_full)
+        self.assertNotEqual(aliased_fast, independent_fast)
+        self.assertEqual(
+            aliased_full,
+            _pallas_static_add_tensors.specialization_key(fresh_aliased_args),
+        )
+        self.assertEqual(
+            independent_full,
+            _pallas_static_add_tensors.specialization_key(fresh_independent_args),
+        )
+        self.assertEqual(
+            aliased_fast,
+            _pallas_static_add_tensors._fast_dispatch_key(fresh_aliased_args),
+        )
+        self.assertEqual(
+            independent_fast,
+            _pallas_static_add_tensors._fast_dispatch_key(fresh_independent_args),
+        )
+
+    def test_container_aliasing_uses_specialization_order(self) -> None:
+        @dataclasses.dataclass
+        class TensorBundle:
+            a: torch.Tensor
+            b: torch.Tensor
+            c: torch.Tensor
+
+        x = torch.empty(64, dtype=torch.float32)
+        y = torch.empty_like(x)
+        containers = (
+            (
+                {"a": x, "b": x, "c": y},
+                {"a": x, "c": x, "b": y},
+            ),
+            (
+                TensorBundle(a=x, b=x, c=y),
+                TensorBundle(a=x, b=y, c=x),
+            ),
+        )
+        for first, second in containers:
+            with self.subTest(container_type=type(first).__name__):
+                self.assertNotEqual(
+                    _pallas_static_add_tensors.specialization_key((first,)),
+                    _pallas_static_add_tensors.specialization_key((second,)),
+                )
+
+    def test_tensor_aliasing_does_not_require_view_base(self) -> None:
+        x = torch.empty(64, dtype=torch.float32)
+        detached = x.detach()
+        explicit_storage_alias = torch.empty(0, dtype=x.dtype).set_(
+            x.untyped_storage(), 0, x.size(), x.stride()
+        )
+        expected_full = _pallas_static_add_tensors.specialization_key((x, x.view_as(x)))
+        expected_fast = _pallas_static_add_tensors._fast_dispatch_key((x, x.view_as(x)))
+
+        for alias in (detached, explicit_storage_alias):
+            with self.subTest(alias=alias):
+                self.assertIsNone(alias._base)
+                self.assertEqual(
+                    _pallas_static_add_tensors.specialization_key((x, alias)),
+                    expected_full,
+                )
+                self.assertEqual(
+                    _pallas_static_add_tensors._fast_dispatch_key((x, alias)),
+                    expected_fast,
+                )
+
+    def test_tensor_aliasing_in_function_closure_is_specialized(self) -> None:
+        def make_helper(captured: torch.Tensor):
+            def helper(value: torch.Tensor) -> torch.Tensor:
+                return value + captured
+
+            return helper
+
+        x = torch.empty(64, dtype=torch.float32)
+        independent = torch.empty_like(x)
+        self.assertNotEqual(
+            _pallas_static_add_tensors.specialization_key((x, make_helper(x))),
+            _pallas_static_add_tensors.specialization_key(
+                (x, make_helper(independent))
+            ),
+        )
+
+    def test_tensor_default_is_normalized_before_fast_dispatch(self) -> None:
+        default = torch.empty(64, dtype=torch.float32)
+
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def with_default(x: torch.Tensor, y: torch.Tensor = default) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile in hl.tile(x.size(0)):
+                out[tile] = x[tile] + y[tile]
+            return out
+
+        independent = torch.empty_like(default)
+        independent_args = with_default.normalize_args(independent)
+        aliased_args = with_default.normalize_args(default)
+        self.assertNotEqual(
+            with_default.specialization_key(independent_args),
+            with_default.specialization_key(aliased_args),
+        )
+
+        fast_key = with_default._fast_dispatch_key(independent_args)
+        assert fast_key is not None
+        sentinel = object()
+        bound = Mock()
+        bound._run = Mock(return_value=sentinel)
+        with_default._dispatch_cache[fast_key] = bound
+        self.assertIs(with_default(independent), sentinel)
+        bound._run.assert_called_once_with(*independent_args)
 
     def test_fast_key_records_exact_tensor_metadata(self) -> None:
         """The per-tensor entry is exactly (dtype, shape, stride, device,

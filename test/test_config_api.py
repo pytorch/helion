@@ -276,8 +276,8 @@ class TestConfigAPI(TestCase):
         ):
             sm100_key = device_key_kernel._base_specialization_key((device,))
 
-        self.assertEqual(sm90_key[-3:], ("cuda", (9, 0), False))
-        self.assertEqual(sm100_key[-3:], ("cuda", (10, 0), False))
+        self.assertEqual(sm90_key[-4:], ("cuda", (9, 0), False, ()))
+        self.assertEqual(sm100_key[-4:], ("cuda", (10, 0), False, ()))
         self.assertNotEqual(sm90_key, sm100_key)
 
     def test_config_constructor_signature_contains_expected_kwargs(self) -> None:

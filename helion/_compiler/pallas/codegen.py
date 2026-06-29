@@ -13,6 +13,7 @@ from helion._compiler.ast_extension import expr_from_string
 from helion._compiler.compile_environment import CompileEnvironment
 from helion._compiler.pallas.vmem_scalar_load import classify_vmem_scalar_load
 from helion._compiler.pallas.vmem_scalar_load import emit_vmem_scalar_load
+from helion._utils import is_scalar_index
 
 _FULL_LOAD_SELECT_MAX_BYTES = 256 << 10
 
@@ -23,7 +24,8 @@ if TYPE_CHECKING:
 
     from helion._compiler.aten_lowering import LoweringContext
     from helion._compiler.inductor_lowering import CodegenState
-    from helion._compiler.tile_strategy import DeviceLoopOrGridState
+    from helion._compiler.tile_strategy import EmitPipelineLoopState
+    from helion._compiler.tile_strategy import ForiLoopState
 
 
 def _select_mask_dtype(dtype: torch.dtype) -> str | None:
@@ -884,41 +886,25 @@ def _load_mask_expr(
 
 def _iter_dma_scratch_loops(
     state: CodegenState, name: str
-) -> Iterator[tuple[DeviceLoopOrGridState, str]]:
-    """Yield ``(loop, scratch_ref_name)`` for every active loop that DMA-routes
-    ``name`` through a VMEM scratch."""
+) -> Iterator[tuple[EmitPipelineLoopState | ForiLoopState, str]]:
+    """Yield active DMA routes for ``name``, innermost loop first."""
     from helion._compiler.tile_strategy import EmitPipelineLoopState
     from helion._compiler.tile_strategy import ForiLoopState
 
-    for loops in state.codegen.active_device_loops.values():
-        for loop in loops:
-            if isinstance(loop, (EmitPipelineLoopState, ForiLoopState)):
-                mapping = getattr(loop, "_tensor_to_dma_scratch", None)
-                if mapping and name in mapping:
-                    yield loop, mapping[name]
+    for loop in reversed(state.codegen._active_loop_stack()):
+        if isinstance(loop, (EmitPipelineLoopState, ForiLoopState)):
+            mapping = loop._tensor_to_dma_scratch
+            if name in mapping:
+                yield loop, mapping[name]
 
 
 def _find_dma_scratch_loop(
     state: CodegenState, name: str
-) -> tuple[DeviceLoopOrGridState | None, str]:
+) -> tuple[EmitPipelineLoopState | ForiLoopState | None, str]:
     """Find the active loop that DMA-routes ``name`` and its scratch ref.
 
-    Returns ``(loop, scratch_ref_name)`` for the first matching active loop, or
+    Returns ``(loop, scratch_ref_name)`` for the innermost matching loop, or
     ``(None, name)`` when the tensor is not scratch-routed.
-
-    TODO: this returns the *first* matching active loop, which is wrong
-    when nested fori_loops scratch-route the *same* tensor at multiple levels --
-    a body access should resolve to the innermost (current) loop's scratch, not
-    the first.  It silently miscompiles e.g.::
-
-        for tile_m in hl.tile(m):
-            out[tile_m, :] = x[tile_m, :] + 1.0
-            for tile_n in hl.tile(n):
-                out[tile_m, tile_n] = out[tile_m, tile_n] + 2.0
-
-    where the inner RMW's load/store bind to the outer loop's scratch while its
-    DMA uses the inner loop's scratch, producing wrong results with no error.
-    This can be fixed by resolving against the current loop instead of first-match.
     """
     return next(_iter_dma_scratch_loops(state, name), (None, name))
 
@@ -927,6 +913,17 @@ def _tensor_routed_to_dma_scratch(state: CodegenState, tensor: torch.Tensor) -> 
     name = state.codegen.device_function.tensor_arg(tensor).name
     loop, _ref = _find_dma_scratch_loop(state, name)
     return loop is not None
+
+
+def mark_dma_scratch_initialized(
+    state: CodegenState,
+    tensor: torch.Tensor,
+) -> None:
+    """Record that codegen emitted a full store into the active tensor scratch."""
+    name = state.codegen.device_function.tensor_arg(tensor).name
+    loop, _ref = _find_dma_scratch_loop(state, name)
+    if loop is not None:
+        loop._initialized_dma_scratch.add(name)
 
 
 def sliced_value_for_store(
@@ -1081,11 +1078,18 @@ def index_parts(
     # routed through the inner DMA / Buffered BlockSpec.  Others stay on
     # their outer BlockSpec and fall through to pl.ds().
     tensor_name = state.codegen.device_function.tensor_arg(tensor).name
-    in_pipeline = False
-    pipeline_block_ids: set[int] = set()
-    for loop, _ref in _iter_dma_scratch_loops(state, tensor_name):
-        in_pipeline = True
-        pipeline_block_ids.update(loop.block_ids)
+    dma_loop, _ref = _find_dma_scratch_loop(state, tensor_name)
+    in_pipeline = dma_loop is not None
+    dma_block_ids = (
+        dma_loop._tensor_to_dma_block_ids[tensor_name]
+        if dma_loop is not None
+        else set()
+    )
+    dma_subscript_meta = (
+        dma_loop._tensor_to_dma_subscript_meta[tensor_name]
+        if dma_loop is not None
+        else None
+    )
 
     # Use pre-computed indexing patterns from plan_tiling analysis
     indexing_patterns = _get_indexing_patterns(state, tensor)
@@ -1104,7 +1108,15 @@ def index_parts(
 
         # Generate code based on the pattern type
         index_code = _generated_index_code(
-            pattern, idx, state, tensor, i, tensor_dim, in_pipeline, pipeline_block_ids
+            pattern,
+            idx,
+            state,
+            tensor,
+            i,
+            tensor_dim,
+            in_pipeline,
+            dma_block_ids,
+            dma_subscript_meta,
         )
         parts.append(index_code)
 
@@ -1123,16 +1135,32 @@ def _get_indexing_patterns(state: CodegenState, tensor: torch.Tensor) -> list[ob
     return patterns
 
 
+def _pipeline_scalar_dim_is_local(
+    dma_subscript_meta: list[object],
+    tensor_dim: int,
+) -> bool:
+    """Whether a DMA/Buffered ref shrank this scalar dimension to extent one."""
+    tensor_subscripts = [idx for idx in dma_subscript_meta if idx is not None]
+    merged_index = (
+        tensor_subscripts[tensor_dim]
+        if tensor_dim < len(tensor_subscripts)
+        else slice(None)
+    )
+    return is_scalar_index(merged_index)
+
+
 def _arbitrary_index_pattern_code(
-    pattern: object,
     idx: object,
     state: CodegenState,
     subscript_index: int,
-    in_pipeline: bool,
+    tensor_dim: int,
+    dma_subscript_meta: list[object] | None,
 ) -> str:
-    from helion._utils import is_scalar_index
-
-    if in_pipeline and is_scalar_index(idx):
+    if (
+        dma_subscript_meta is not None
+        and is_scalar_index(idx)
+        and _pipeline_scalar_dim_is_local(dma_subscript_meta, tensor_dim)
+    ):
         return "0"
     if isinstance(idx, int):
         return str(idx)
@@ -1147,7 +1175,8 @@ def _generated_index_code(
     subscript_index: int,
     tensor_dim: int,
     in_pipeline: bool,
-    pipeline_block_ids: set[int],
+    dma_block_ids: set[int],
+    dma_subscript_meta: list[object] | None,
 ) -> str:
     """Generate index code based on the indexing pattern."""
     from helion._compiler.pallas.plan_tiling import ArbitraryIndexPattern
@@ -1159,17 +1188,17 @@ def _generated_index_code(
 
     if isinstance(pattern, TilePattern):
         return _tile_pattern_code(
-            pattern, idx, state, tensor, tensor_dim, in_pipeline, pipeline_block_ids
+            pattern, idx, state, tensor, tensor_dim, in_pipeline, dma_block_ids
         )
 
     if isinstance(pattern, TileIndexWithOffsetPattern):
         return _tile_index_with_offset_pattern_code(
-            pattern, state, tensor, tensor_dim, in_pipeline, pipeline_block_ids
+            pattern, state, tensor, tensor_dim, in_pipeline, dma_block_ids
         )
 
     if isinstance(pattern, TileBeginWithOffsetPattern):
         return _tile_begin_with_offset_pattern_code(
-            pattern, state, subscript_index, tensor_dim, in_pipeline, pipeline_block_ids
+            pattern, state, subscript_index, tensor_dim, in_pipeline, dma_block_ids
         )
 
     if isinstance(pattern, ArbitrarySlicePattern):
@@ -1177,7 +1206,7 @@ def _generated_index_code(
 
     if isinstance(pattern, ArbitraryIndexPattern):
         return _arbitrary_index_pattern_code(
-            pattern, idx, state, subscript_index, in_pipeline
+            idx, state, subscript_index, tensor_dim, dma_subscript_meta
         )
 
     if isinstance(pattern, TensorIndexPattern):
@@ -1208,7 +1237,7 @@ def _tile_pattern_code(
     tensor: torch.Tensor,
     tensor_dim: int,
     in_pipeline: bool,
-    pipeline_block_ids: set[int],
+    dma_block_ids: set[int],
 ) -> str:
     from helion._compiler.pallas.plan_tiling import TilePattern
     from helion._compiler.tile_strategy import DeviceLoopState
@@ -1225,7 +1254,7 @@ def _tile_pattern_code(
     # TODO(yifeixu): the long-term fix is making ``can_tile`` per-loop-scope
     # instead of per-tensor-dim so the planner doesn't mark this dim
     # untileable in pipeline mode in the first place.
-    if in_pipeline:
+    if in_pipeline and block_id in dma_block_ids:
         return ":"
 
     can_tile = _can_tile_dimension(state, tensor_dim)
@@ -1250,7 +1279,7 @@ def _tile_index_with_offset_pattern_code(
     tensor: torch.Tensor,
     tensor_dim: int,
     in_pipeline: bool,
-    pipeline_block_ids: set[int],
+    dma_block_ids: set[int],
 ) -> str:
     from helion._compiler.pallas.plan_tiling import TileIndexWithOffsetPattern
 
@@ -1267,7 +1296,7 @@ def _tile_begin_with_offset_pattern_code(
     subscript_index: int,
     tensor_dim: int,
     in_pipeline: bool,
-    pipeline_block_ids: set[int],
+    dma_block_ids: set[int],
 ) -> str:
     from helion._compiler.pallas.plan_tiling import TileBeginWithOffsetPattern
     from helion._compiler.tile_strategy import DeviceLoopState
@@ -1277,7 +1306,7 @@ def _tile_begin_with_offset_pattern_code(
     block_id = pattern.block_id
     offset_str = state.device_function.literal_expr(pattern.offset)
 
-    if in_pipeline and block_id in pipeline_block_ids:
+    if in_pipeline and block_id in dma_block_ids:
         return offset_str
 
     can_tile = _can_tile_dimension(state, tensor_dim)

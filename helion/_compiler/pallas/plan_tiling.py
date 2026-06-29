@@ -56,8 +56,13 @@ class ArbitrarySlicePattern(IndexingPattern):
     slice: slice
 
 
-def _is_full_slice(idx: slice) -> bool:
-    return idx.start is None and idx.stop is None and idx.step in (None, 1)
+def _is_full_slice(idx: object) -> bool:
+    return (
+        isinstance(idx, slice)
+        and idx.start is None
+        and idx.stop is None
+        and idx.step in (None, 1)
+    )
 
 
 @dataclass
