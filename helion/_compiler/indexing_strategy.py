@@ -3,6 +3,7 @@ from __future__ import annotations
 import ast
 import collections
 import dataclasses
+import logging
 from typing import TYPE_CHECKING
 from typing import ClassVar
 from typing import NamedTuple
@@ -37,6 +38,9 @@ if TYPE_CHECKING:
 
     SymIntLike = torch.SymInt | int
     ShapeLike = Sequence[SymIntLike]
+
+
+log = logging.getLogger(__name__)
 
 
 class TileWithOffsetInfo(NamedTuple):
@@ -769,6 +773,13 @@ class BlockPtrIndexingStrategy(IndexingStrategy):
             not BlockedSubscriptIndexing.is_supported(state, fake_tensor, subscript)
             or fp8_block_ptr_unsupported
         ):
+            log.debug(
+                "block_ptr indexing requested but unsupported for this load (%s); "
+                "falling back to pointer indexing",
+                "FP8 block-pointer padding broken on this Triton version"
+                if fp8_block_ptr_unsupported
+                else "unsupported access pattern",
+            )
             return PointerIndexingStrategy().codegen_load(
                 state,
                 fake_tensor,
