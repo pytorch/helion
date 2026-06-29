@@ -24,8 +24,7 @@ import torch
 
 from .linear_attention_utils import prepare_wy_repr_bwd
 from .linear_attention_utils import solve_tril_inv
-import helion  # noqa: F401
-import helion.experimental
+import helion
 import helion.language as hl
 
 # ════════════════════════════════════════════════════════════════════════════════
@@ -115,7 +114,7 @@ class LinearAttentionEngine:
 # ════════════════════════════════════════════════════════════════════════════════
 
 
-@helion.experimental.aot_kernel()
+@helion.kernel()
 def recurrent_step_fused(
     q: torch.Tensor,  # [BH, D]
     k: torch.Tensor,  # [BH, D]
@@ -168,7 +167,7 @@ def recurrent_step_fused(
     return out
 
 
-@helion.experimental.aot_kernel()
+@helion.kernel()
 def recurrent_step_correction_fused(
     q: torch.Tensor,  # [BH, D]
     k: torch.Tensor,  # [BH, D]   (correction direction, or key)
@@ -292,7 +291,7 @@ def recurrent_step(
 # ════════════════════════════════════════════════════════════════════════════════
 
 
-@helion.experimental.aot_kernel()
+@helion.kernel()
 def chunk_fwd_prescale_diag(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -327,7 +326,7 @@ def chunk_fwd_prescale_diag(
     return q_scaled, k_intra, k_state, g_last_out
 
 
-@helion.experimental.aot_kernel()
+@helion.kernel()
 def chunk_fwd_h_diag_fused(
     k_state: torch.Tensor,
     v: torch.Tensor,
@@ -361,7 +360,7 @@ def chunk_fwd_h_diag_fused(
     return h_all
 
 
-@helion.experimental.aot_kernel()
+@helion.kernel()
 def chunk_fwd_wy_diag_helion(
     a: torch.Tensor,
     v: torch.Tensor,
@@ -403,7 +402,7 @@ def chunk_fwd_wy_diag_helion(
     return w, u, A_buf
 
 
-@helion.experimental.aot_kernel()
+@helion.kernel()
 def chunk_fwd_phase1_diag_fused(
     w: torch.Tensor,
     u: torch.Tensor,
@@ -443,7 +442,7 @@ def chunk_fwd_phase1_diag_fused(
     return h_all, v_new_all
 
 
-@helion.experimental.aot_kernel()
+@helion.kernel()
 def chunk_fwd_o_helion(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -485,7 +484,7 @@ def chunk_fwd_o_helion(
     return out
 
 
-@helion.experimental.aot_kernel()
+@helion.kernel()
 def chunk_bwd_dh_diag_fused(
     q_scaled: torch.Tensor,
     do: torch.Tensor,
@@ -519,7 +518,7 @@ def chunk_bwd_dh_diag_fused(
     return dh_all
 
 
-@helion.experimental.aot_kernel()
+@helion.kernel()
 def chunk_bwd_dh_correction_diag_fused(
     w: torch.Tensor,
     a_scaled: torch.Tensor,
@@ -565,7 +564,7 @@ def chunk_bwd_dh_correction_diag_fused(
     return dh_all, dv_new_all
 
 
-@helion.experimental.aot_kernel()
+@helion.kernel()
 def chunk_bwd_dqkg_helion(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -629,7 +628,7 @@ def chunk_bwd_dqkg_helion(
     return dq_out, dk_out, dg_out
 
 
-@helion.experimental.aot_kernel()
+@helion.kernel()
 def chunk_bwd_dv_helion(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -675,7 +674,7 @@ def chunk_bwd_dv_helion(
     return dv_out
 
 
-@helion.experimental.aot_kernel()
+@helion.kernel()
 def chunk_bwd_dqkg_diag_helion(
     q: torch.Tensor,
     k_intra: torch.Tensor,
@@ -729,7 +728,7 @@ def chunk_bwd_dqkg_diag_helion(
     return dq_out, dk_intra_out, dk_state_out
 
 
-@helion.experimental.aot_kernel()
+@helion.kernel()
 def chunk_bwd_dg_scalar_helion(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -808,7 +807,7 @@ def chunk_bwd_dg_scalar_helion(
     return dg_out
 
 
-@helion.experimental.aot_kernel()
+@helion.kernel()
 def chunk_bwd_dg_diag_helion(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -886,7 +885,7 @@ def chunk_bwd_dg_diag_helion(
     return dq_out, dk_out, dg_out
 
 
-@helion.experimental.aot_kernel()
+@helion.kernel()
 def chunk_fwd_correction_helion(
     q: torch.Tensor,
     a: torch.Tensor,
