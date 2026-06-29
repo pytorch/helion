@@ -413,6 +413,7 @@ _PallasFlatCopyGuard = tuple[int, int, int, tuple[tuple[int, int], ...]]
 _PallasCopyGuard = tuple[tuple[int, ...], tuple[_PallasFlatCopyGuard, ...]]
 _PallasCopyGuards = dict[int, _PallasCopyGuard]
 _PallasDimensionSemantic = Literal["parallel", "arbitrary"]
+_PallasPhaseCaseMetadata = tuple[int, tuple[tuple[int, int, int], ...]]
 
 
 def _pallas_tensor_pos_map(
@@ -853,7 +854,9 @@ def _pallas_padded_output_dims_by_arg(
     padded_dims_by_arg: dict[int, list[int]] = {}
     for arg_idx, dim, _bs, _extra in _ds_pad_dims:
         if arg_idx in output_arg_set:
-            padded_dims_by_arg.setdefault(arg_idx, []).append(dim)
+            dims = padded_dims_by_arg.setdefault(arg_idx, [])
+            if dim not in dims:
+                dims.append(dim)
     return padded_dims_by_arg
 
 
@@ -976,6 +979,26 @@ def _pallas_collect_outputs(
     return tuple(output_only_results)
 
 
+def _pallas_ds_pad_amounts(
+    args: tuple[object, ...],
+    _ds_pad_dims: list[tuple[int, int, int, int]],
+) -> list[tuple[int, int, int]]:
+    """Compute max required ds-padding per ``(arg, dim)`` from original shapes."""
+    pad_by_key: dict[tuple[int, int], int] = {}
+    for arg_idx, dim, block_size, extra_pad in _ds_pad_dims:
+        a = args[arg_idx]
+        if not isinstance(a, torch.Tensor):
+            continue
+        pad_amount = (-a.shape[dim]) % block_size + extra_pad
+        if pad_amount == 0:
+            continue
+        key = (arg_idx, dim)
+        pad_by_key[key] = max(pad_by_key.get(key, 0), pad_amount)
+    return [
+        (arg_idx, dim, pad_amount) for (arg_idx, dim), pad_amount in pad_by_key.items()
+    ]
+
+
 def _pallas_apply_ds_padding_fast(
     args: tuple[object, ...],
     _ds_pad_dims: list[tuple[int, int, int, int]],
@@ -986,12 +1009,9 @@ def _pallas_apply_ds_padding_fast(
     args_list: list[object] | None = None
     orig_output_tensors: dict[int, torch.Tensor] | None = None
     any_padding = False
-    for arg_idx, dim, block_size, extra_pad in _ds_pad_dims:
+    for arg_idx, dim, pad_amount in _pallas_ds_pad_amounts(args, _ds_pad_dims):
         a = args[arg_idx] if args_list is None else args_list[arg_idx]
         if not isinstance(a, torch.Tensor):
-            continue
-        pad_amount = (-a.shape[dim]) % block_size + extra_pad
-        if pad_amount == 0:
             continue
         any_padding = True
         if args_list is None:
@@ -1160,13 +1180,45 @@ def _pallas_inplace_copy(in_ref: object, out_ref: object, *, is_smem: bool) -> N
         out_ref[...] = in_ref[...]  # type: ignore[index]
 
 
-def _pallas_copy_guard(guard: _PallasCopyGuard) -> bool | jax.Array:
+def _pallas_phase_case_leader_guard(
+    metadata: _PallasPhaseCaseMetadata,
+    refs: tuple[object, ...],
+    arg_to_tensor_pos: dict[int, int],
+) -> bool | jax.Array:
+    from jax.experimental import pallas as pl
+
+    phase_arg_index, case_ranges = metadata
+    phase_ref_pos = arg_to_tensor_pos.get(phase_arg_index)
+    if phase_ref_pos is None:
+        raise RuntimeError("Pallas phase argument is missing from tensor refs")
+    phase_value = refs[phase_ref_pos][0]  # type: ignore[index]
+    pid0 = pl.program_id(0)
+    is_leader = False
+    for phase, start, _end in case_ranges:
+        is_leader = is_leader | ((phase_value == phase) & (pid0 == start))
+    return is_leader
+
+
+def _pallas_copy_guard(
+    guard: _PallasCopyGuard,
+    phase_case_metadata: _PallasPhaseCaseMetadata | None,
+    refs: tuple[object, ...],
+    arg_to_tensor_pos: dict[int, int],
+) -> bool | jax.Array:
     from jax.experimental import pallas as pl
 
     direct_dims, flat_guards = guard
     should_copy = True
+    phase_leader_guard = None
     for dim in direct_dims:
-        should_copy = should_copy & (pl.program_id(dim) == 0)
+        if dim == 0 and phase_case_metadata is not None:
+            if phase_leader_guard is None:
+                phase_leader_guard = _pallas_phase_case_leader_guard(
+                    phase_case_metadata, refs, arg_to_tensor_pos
+                )
+            should_copy = should_copy & phase_leader_guard
+        else:
+            should_copy = should_copy & (pl.program_id(dim) == 0)
     flat_dim_guards: dict[int, bool | jax.Array] = {}
     for dim, start, total, used_dims in flat_guards:
         local_pid = pl.program_id(dim) - start
@@ -1191,6 +1243,28 @@ def _pallas_copy_guard(guard: _PallasCopyGuard) -> bool | jax.Array:
     return should_copy
 
 
+def _pallas_phase_case_guard(
+    metadata: _PallasPhaseCaseMetadata | None,
+    refs: tuple[object, ...],
+    arg_to_tensor_pos: dict[int, int],
+) -> bool | jax.Array | None:
+    if metadata is None:
+        return None
+
+    from jax.experimental import pallas as pl
+
+    phase_arg_index, case_ranges = metadata
+    phase_ref_pos = arg_to_tensor_pos.get(phase_arg_index)
+    if phase_ref_pos is None:
+        raise RuntimeError("Pallas phase argument is missing from tensor refs")
+    phase_value = refs[phase_ref_pos][0]  # type: ignore[index]
+    pid0 = pl.program_id(0)
+    active = False
+    for phase, start, end in case_ranges:
+        active = active | ((phase_value == phase) & (pid0 >= start) & (pid0 < end))
+    return active
+
+
 def _pallas_make_reordered_kernel(
     pallas_kernel: object,
     args: tuple[object, ...],
@@ -1204,6 +1278,7 @@ def _pallas_make_reordered_kernel(
     skip_inplace_copy: set[int] | None = None,
     _smem_arg_indices: list[int] | None = None,
     _copy_guards: _PallasCopyGuards | None = None,
+    _phase_case_metadata: _PallasPhaseCaseMetadata | None = None,
 ) -> object:
     """Create a wrapper kernel that reorders pallas_call refs to the original arg order.
 
@@ -1227,6 +1302,9 @@ def _pallas_make_reordered_kernel(
     def reordered_kernel(*refs: object) -> None:
         from jax.experimental import pallas as pl
 
+        active_guard = _pallas_phase_case_guard(
+            _phase_case_metadata, refs, arg_to_tensor_pos
+        )
         n_kernel_params = len(args)
         original_order: list[object] = [None] * n_kernel_params
         for tensor_pos, orig_pos in enumerate(tensor_arg_indices):
@@ -1241,8 +1319,18 @@ def _pallas_make_reordered_kernel(
                     _smem_arg_indices is not None and orig_pos in _smem_arg_indices
                 )
                 copy_guard_dims = copy_guards.get(orig_pos)
+                should_copy = active_guard
                 if copy_guard_dims:
-                    should_copy = _pallas_copy_guard(copy_guard_dims)
+                    dims_guard = _pallas_copy_guard(
+                        copy_guard_dims,
+                        _phase_case_metadata,
+                        refs,
+                        arg_to_tensor_pos,
+                    )
+                    should_copy = (
+                        dims_guard if should_copy is None else should_copy & dims_guard
+                    )
+                if should_copy is not None:
 
                     @pl.when(should_copy)
                     def _copy_inplace_output(
@@ -1256,7 +1344,17 @@ def _pallas_make_reordered_kernel(
                     _pallas_inplace_copy(in_ref, out_ref, is_smem=is_smem)
             original_order[orig_pos] = out_ref
         extra_refs = refs[n_tensor_inputs + len(_output_indices) :]
-        pallas_kernel(*original_order, *extra_refs)  # type: ignore[operator]
+        if active_guard is not None:
+
+            @pl.when(active_guard)
+            def _run_active_phase_case(
+                original_order: list[object] = original_order,
+                extra_refs: tuple[object, ...] = extra_refs,
+            ) -> None:
+                pallas_kernel(*original_order, *extra_refs)  # type: ignore[operator]
+
+        else:
+            pallas_kernel(*original_order, *extra_refs)  # type: ignore[operator]
 
     return reordered_kernel
 
@@ -1386,8 +1484,8 @@ def _pallas_apply_ds_padding(
     """Pad tensor args so ``pl.ds(offset, block_size)`` never reads OOB.
 
     ``_ds_pad_dims`` contains ``(arg_index, dim, block_size, extra_pad)``
-    tuples.  The pad amount is ``(-tensor.shape[dim]) % block_size +
-    extra_pad``, where *extra_pad* accounts for non-zero loop begins.
+    tuples.  Multiple requirements for one ``(arg, dim)`` are canonicalized
+    against the original tensor shape before padding is applied.
 
     Returns the padded args tuple and a dict mapping output arg indices
     to their original (unpadded) tensors for post-call copy-back.
@@ -1395,12 +1493,9 @@ def _pallas_apply_ds_padding(
     args_list = list(args)
     orig_output_tensors: dict[int, torch.Tensor] = {}
     output_set = set(_output_indices)
-    for arg_idx, dim, block_size, extra_pad in _ds_pad_dims:
+    for arg_idx, dim, pad_amount in _pallas_ds_pad_amounts(args, _ds_pad_dims):
         a = args_list[arg_idx]
         if not isinstance(a, torch.Tensor):
-            continue
-        pad_amount = (-a.shape[dim]) % block_size + extra_pad
-        if pad_amount == 0:
             continue
         if arg_idx in output_set and arg_idx not in orig_output_tensors:
             orig_output_tensors[arg_idx] = a
@@ -1563,6 +1658,7 @@ def _pallas_compile_jit_fn(
     _scratch_shapes: list[object] | None,
     _pipeline_arg_indices: list[int] | None,
     _matmul_dot_general: dict[str, object] | None,
+    _pallas_phase_case_metadata: _PallasPhaseCaseMetadata | None,
     interpret: bool,
     _pallas_arbitrary_grid_dims: tuple[int, ...] | None = None,
 ) -> _PallasCompileResult:
@@ -1666,6 +1762,7 @@ def _pallas_compile_jit_fn(
         skip_inplace_copy=skip_inplace_copy,
         _smem_arg_indices=_smem_arg_indices,
         _copy_guards=copy_guards,
+        _phase_case_metadata=_pallas_phase_case_metadata,
     )
 
     out_shape_arg = out_shapes if len(out_shapes) > 1 else out_shapes[0]
@@ -1749,6 +1846,7 @@ def _pallas_install_launcher_cache(
     _ds_pad_dims: list[tuple[int, int, int, int]] | None,
     _pallas_interpret: bool | None,
     _matmul_dot_general: dict[str, object] | None = None,
+    _pallas_phase_case_metadata: _PallasPhaseCaseMetadata | None = None,
     _pallas_arbitrary_grid_dims: tuple[int, ...] | None = None,
 ) -> tuple[object, ...]:
     """Cache-miss path shared by all three torch-tensor Pallas launchers.
@@ -1789,6 +1887,7 @@ def _pallas_install_launcher_cache(
         _scratch_shapes=_scratch_shapes,
         _pipeline_arg_indices=_pipeline_arg_indices,
         _matmul_dot_general=_matmul_dot_general,
+        _pallas_phase_case_metadata=_pallas_phase_case_metadata,
         interpret=interpret,
         _pallas_arbitrary_grid_dims=_pallas_arbitrary_grid_dims,
     )
@@ -1877,6 +1976,7 @@ def default_pallas_launcher(
     _ds_pad_dims: list[tuple[int, int, int, int]] | None = None,
     _pallas_interpret: bool | None = None,
     _matmul_dot_general: dict[str, object] | None = None,
+    _pallas_phase_case_metadata: _PallasPhaseCaseMetadata | None = None,
     _pallas_arbitrary_grid_dims: tuple[int, ...] | None = None,
     **kwargs: object,
 ) -> object:
@@ -1910,6 +2010,7 @@ def default_pallas_launcher(
             _ds_pad_dims=_ds_pad_dims,
             _pallas_interpret=_pallas_interpret,
             _matmul_dot_general=_matmul_dot_general,
+            _pallas_phase_case_metadata=_pallas_phase_case_metadata,
             _pallas_arbitrary_grid_dims=_pallas_arbitrary_grid_dims,
         )
 
@@ -1935,6 +2036,7 @@ def default_pallas_pipeline_launcher(
     _smem_arg_indices: list[int] | None = None,
     _pallas_interpret: bool | None = None,
     _matmul_dot_general: dict[str, object] | None = None,
+    _pallas_phase_case_metadata: _PallasPhaseCaseMetadata | None = None,
     _pallas_arbitrary_grid_dims: tuple[int, ...] | None = None,
     **kwargs: object,
 ) -> object:
@@ -1962,6 +2064,7 @@ def default_pallas_pipeline_launcher(
             _ds_pad_dims=_ds_pad_dims,
             _pallas_interpret=_pallas_interpret,
             _matmul_dot_general=_matmul_dot_general,
+            _pallas_phase_case_metadata=_pallas_phase_case_metadata,
             _pallas_arbitrary_grid_dims=_pallas_arbitrary_grid_dims,
         )
 
@@ -1985,6 +2088,7 @@ def default_pallas_fori_launcher(
     _ds_pad_dims: list[tuple[int, int, int, int]] | None = None,
     _smem_arg_indices: list[int] | None = None,
     _pallas_interpret: bool | None = None,
+    _pallas_phase_case_metadata: _PallasPhaseCaseMetadata | None = None,
     _pallas_arbitrary_grid_dims: tuple[int, ...] | None = None,
     **kwargs: object,
 ) -> object:
@@ -2015,6 +2119,7 @@ def default_pallas_fori_launcher(
             ),
             _ds_pad_dims=_ds_pad_dims,
             _pallas_interpret=_pallas_interpret,
+            _pallas_phase_case_metadata=_pallas_phase_case_metadata,
             _pallas_arbitrary_grid_dims=_pallas_arbitrary_grid_dims,
         )
 

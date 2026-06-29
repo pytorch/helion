@@ -20,6 +20,7 @@ from torch.testing._internal.common_utils import instantiate_parametrized_tests
 from torch.testing._internal.common_utils import parametrize
 
 import helion
+from helion._compiler.backend import PallasBackend
 from helion._testing import DEVICE
 from helion._testing import TestCase
 from helion._testing import code_and_output
@@ -35,6 +36,10 @@ from helion.autotuner import PowerOfTwoFragment
 import helion.language as hl
 from helion.runtime import _pallas_copy_guard
 from helion.runtime import _pallas_shared_output_plan
+from helion.runtime import _PallasCompileResult
+from helion.runtime import _PallasLoopKind
+from helion.runtime.pallas_jax_export import _JaxExportTensor
+from helion.runtime.pallas_jax_export import default_pallas_jax_launcher
 from helion.runtime.settings import is_pallas_interpret
 
 if TYPE_CHECKING:
@@ -623,6 +628,24 @@ def pallas_integer_tunable_prefix_reduction(x: torch.Tensor) -> torch.Tensor:
     return out
 
 
+@helion.kernel(backend="pallas", static_shapes=True)
+def pallas_barrier_scalar_minor_temp(x: torch.Tensor) -> torch.Tensor:
+    m = x.size(0)
+    n = hl.specialize(x.size(1))
+    width = hl.register_tunable("width", PowerOfTwoFragment(4, 16, 8))
+    tmp = torch.zeros([m, n, width], dtype=x.dtype, device=x.device)
+    out = torch.empty_like(x)
+
+    for tile_m, tile_w in hl.tile([m, width], block_size=[None, 1]):
+        tmp[tile_m, :, tile_w.id] = x[tile_m, :] + tile_w.id
+
+    hl.barrier()
+
+    for tile_m in hl.tile(m, block_size=4):
+        out[tile_m, :] = torch.sum(tmp[tile_m, :, :], dim=-1)
+    return out
+
+
 def _cumsum_broadcast_ref(
     a: torch.Tensor, b: torch.Tensor, block_k: int = 128
 ) -> torch.Tensor:
@@ -848,7 +871,7 @@ class TestPallasSharedOutputPlan(TestCase):
                 "jax.experimental.pallas": pallas_mod,
             },
         ):
-            return bool(_pallas_copy_guard(guard))
+            return bool(_pallas_copy_guard(guard, None, (), {}))
 
 
 class TestPallasBoolExpandCodegen(TestCase):
@@ -4108,6 +4131,45 @@ class TestPallas(TestCase):
         torch.testing.assert_close(result, x * 7)
         self.assertIn("width = 7", code)
 
+    def test_barrier_phase_codegen_initializes_shared_pid_for_persistent_phase_launch(
+        self,
+    ) -> None:
+        original_supports_config_key = PallasBackend.supports_config_key
+
+        def supports_pid_type(backend: PallasBackend, key: str) -> bool:
+            return key == "pid_type" or original_supports_config_key(backend, key)
+
+        x = torch.empty((17, 128), dtype=torch.float32)
+        config = helion.Config(
+            block_sizes=[16],
+            pid_type="persistent_blocked",
+            width=8,
+        )
+        with patch.object(PallasBackend, "supports_config_key", supports_pid_type):
+            code = pallas_barrier_scalar_minor_temp.bind((x,)).to_code(config)
+
+        init = "pid_shared = pl.program_id(0)"
+        self.assertIn(init, code)
+        self.assertLess(code.index(init), code.index("@pl.when"))
+
+    @xfailIfPallasInterpret("barrier phase launches require TPU Pallas runtime")
+    def test_barrier_scalar_minor_temp_repeated_calls(self) -> None:
+        width = 8
+        config = helion.Config(
+            block_sizes=[16],
+            pid_type="persistent_blocked",
+            width=width,
+        )
+        x0 = torch.randn(17, 128, device=DEVICE, dtype=torch.float32)
+        compiled = pallas_barrier_scalar_minor_temp.bind((x0,)).compile_config(config)
+
+        for seed in range(3):
+            torch.manual_seed(seed)
+            x = torch.randn(17, 128, device=DEVICE, dtype=torch.float32)
+            result = compiled(x)
+            expected = x * width + (width * (width - 1) // 2)
+            torch.testing.assert_close(result, expected)
+
     def test_scalar_access_1D_constexpr(self) -> None:
         @helion.kernel(backend="pallas", static_shapes=True, config=helion.Config())
         def fn(x: torch.Tensor) -> torch.Tensor:
@@ -7050,6 +7112,175 @@ class TestPallasJaxFn(TestCase):
         import jax.numpy as jnp
 
         return jax, jnp
+
+    def test_jax_export_launcher_accepts_generated_scalar_tensors(self) -> None:
+        jax, jnp = self._import_jax()
+
+        adapter = _JaxExportTensor.from_jax(
+            jnp.ones((1,), dtype=jnp.float32), device=torch.device("cpu")
+        )
+        phase = torch.tensor([1], dtype=torch.int32)
+
+        def fake_compile(*_args: object, **_kwargs: object) -> _PallasCompileResult:
+            def fake_jit_fn(data: Any, phase_arg: Any) -> Any:
+                return data + phase_arg.astype(data.dtype)
+
+            return _PallasCompileResult(
+                jit_fn=fake_jit_fn,
+                tensor_arg_indices=[0, 1],
+                output_only_indices=[],
+                arg_to_tensor_pos={0: 0, 1: 1},
+                inplace_positions={0},
+                pallas_aliases={0: 0},
+            )
+
+        with patch("helion.runtime._pallas_compile_jit_fn", fake_compile):
+            result = default_pallas_jax_launcher(
+                object(),
+                (1,),
+                adapter,
+                phase,
+                _output_indices=[0],
+                _inplace_indices=[0],
+                _kind=_PallasLoopKind.UNROLL,
+                _pallas_interpret=True,
+            )
+
+        self.assertIsInstance(result, _JaxExportTensor)
+        out = jax.block_until_ready(result._jax_arr)
+        carried = jax.block_until_ready(adapter._jax_arr)
+        self.assertEqual(float(out[0]), 2.0)
+        self.assertEqual(float(carried[0]), 2.0)
+
+    def test_jax_export_like_allocations_honor_dtype(self) -> None:
+        _jax, jnp = self._import_jax()
+
+        adapter = _JaxExportTensor.from_jax(
+            jnp.ones((4,), dtype=jnp.float32), device=torch.device("cpu")
+        )
+
+        empty = torch.empty_like(adapter, dtype=torch.int32)
+        zeros = torch.zeros_like(adapter, dtype=torch.int32)
+
+        self.assertIsInstance(empty, _JaxExportTensor)
+        self.assertIsInstance(zeros, _JaxExportTensor)
+        self.assertEqual(empty._jax_arr.dtype, jnp.int32)
+        self.assertEqual(zeros._jax_arr.dtype, jnp.int32)
+        self.assertEqual(zeros.dtype, torch.int32)
+
+    def test_jax_export_updates_alias_with_fresh_output(self) -> None:
+        jax, jnp = self._import_jax()
+
+        adapter = _JaxExportTensor.from_jax(
+            jnp.ones((2,), dtype=jnp.float32), device=torch.device("cpu")
+        )
+        fresh = _JaxExportTensor.from_jax(
+            jnp.zeros((2,), dtype=jnp.float32), device=torch.device("cpu")
+        )
+
+        def fake_compile(*_args: object, **_kwargs: object) -> _PallasCompileResult:
+            def fake_jit_fn(data: Any) -> Any:
+                return data + 1, data + 2
+
+            return _PallasCompileResult(
+                jit_fn=fake_jit_fn,
+                tensor_arg_indices=[0],
+                output_only_indices=[1],
+                arg_to_tensor_pos={0: 0},
+                inplace_positions={0},
+                pallas_aliases={0: 0},
+            )
+
+        with patch("helion.runtime._pallas_compile_jit_fn", fake_compile):
+            result = default_pallas_jax_launcher(
+                object(),
+                (1,),
+                adapter,
+                fresh,
+                _output_indices=[0, 1],
+                _inplace_indices=[0],
+                _kind=_PallasLoopKind.UNROLL,
+                _pallas_interpret=True,
+            )
+
+        self.assertIsInstance(result, _JaxExportTensor)
+        returned = jax.block_until_ready(result._jax_arr)
+        carried = jax.block_until_ready(adapter._jax_arr)
+        self.assertTrue(bool(jnp.allclose(returned, jnp.full((2,), 3.0))))
+        self.assertTrue(bool(jnp.allclose(carried, jnp.full((2,), 2.0))))
+
+    def test_jax_export_updates_pre_padding_adapter(self) -> None:
+        jax, jnp = self._import_jax()
+
+        adapter = _JaxExportTensor.from_jax(
+            jnp.ones((3,), dtype=jnp.float32), device=torch.device("cpu")
+        )
+
+        def fake_compile(
+            *compile_args: object, **_kwargs: object
+        ) -> _PallasCompileResult:
+            padded = cast("tuple[object, ...]", compile_args[2])
+            self.assertEqual(cast("_JaxExportTensor", padded[0])._jax_arr.shape, (4,))
+
+            def fake_jit_fn(data: Any) -> Any:
+                return data + 1
+
+            return _PallasCompileResult(
+                jit_fn=fake_jit_fn,
+                tensor_arg_indices=[0],
+                output_only_indices=[],
+                arg_to_tensor_pos={0: 0},
+                inplace_positions={0},
+                pallas_aliases={0: 0},
+            )
+
+        with patch("helion.runtime._pallas_compile_jit_fn", fake_compile):
+            result = default_pallas_jax_launcher(
+                object(),
+                (1,),
+                adapter,
+                _output_indices=[0],
+                _inplace_indices=[0],
+                _ds_pad_dims=[(0, 0, 4, 0)],
+                _kind=_PallasLoopKind.UNROLL,
+                _pallas_interpret=True,
+            )
+
+        self.assertIsInstance(result, _JaxExportTensor)
+        returned = jax.block_until_ready(result._jax_arr)
+        carried = jax.block_until_ready(adapter._jax_arr)
+        self.assertEqual(returned.shape, (3,))
+        self.assertEqual(carried.shape, (3,))
+        self.assertTrue(bool(jnp.allclose(returned, jnp.full((3,), 2.0))))
+        self.assertTrue(bool(jnp.allclose(carried, jnp.full((3,), 2.0))))
+
+    @skipIfPallasInterpret("barrier phase launches require TPU Pallas runtime")
+    def test_jax_fn_barrier_kernel(self) -> None:
+        jax, jnp = self._import_jax()
+        width = 8
+        config = helion.Config(
+            block_sizes=[16],
+            pid_type="persistent_blocked",
+            width=width,
+        )
+        barrier_kernel = helion.kernel(
+            pallas_barrier_scalar_minor_temp.fn,
+            backend="pallas",
+            static_shapes=True,
+            config=config,
+        )
+
+        original_supports_config_key = PallasBackend.supports_config_key
+
+        def supports_pid_type(backend: PallasBackend, key: str) -> bool:
+            return key == "pid_type" or original_supports_config_key(backend, key)
+
+        x = jnp.arange(17 * 128, dtype=jnp.float32).reshape(17, 128)
+        with patch.object(PallasBackend, "supports_config_key", supports_pid_type):
+            result = jax.block_until_ready(jax.jit(barrier_kernel.jax_fn)(x))
+
+        expected = x * width + (width * (width - 1) // 2)
+        self.assertTrue(bool(jnp.allclose(result, expected)))
 
     def test_jax_fn_emit_pipeline(self) -> None:
         """jax_fn drives an emit_pipeline kernel inside ``jax.jit``."""

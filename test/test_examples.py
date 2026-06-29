@@ -187,7 +187,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             block_sizes=[64, 64, 32],
         )
 
-    @xfailIfPallas("missing barrier implementation")
+    @xfailIfPallasInterpret("barrier phase launches require TPU Pallas runtime")
     @xfailIfCute("CuTe split-K symbolic reduction config has no thread budget")
     @skipIfTileIR("PassManager::run failed")
     @skipIfXPU("Split-K barrier not supported on XPU backend")
@@ -207,7 +207,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             split_k=64,
         )
 
-    @xfailIfPallas("missing barrier implementation")
+    @xfailIfPallasInterpret("barrier phase launches require TPU Pallas runtime")
     @xfailIfCute("CuTe split-K symbolic reduction config has no thread budget")
     @skipIfTileIR("PassManager::run failed")
     @skipIfRefEager("Test requires compiled kernel with specific config")
