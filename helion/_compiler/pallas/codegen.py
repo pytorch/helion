@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import ast
+import math
 from typing import TYPE_CHECKING
+from typing import Any
+from typing import cast
 
 import torch
 
@@ -563,20 +566,40 @@ def _slice_code(
     from helion._compiler.tile_strategy import DeviceLoopState
 
     assert isinstance(pattern, ArbitrarySlicePattern)
+    slice_idx = pattern.slice
 
-    if idx != slice(None):
+    if slice_idx.step not in (None, 1):
         raise AssertionError(
-            f"Arbitrary slice expr {slice} not supported in Pallas backend yet"
+            f"Only unit-step slices are supported in Pallas, got {slice_idx}"
         )
+    full_slice = slice_idx.start is None and slice_idx.stop is None
 
     env = CompileEnvironment.current()
     block_id = env.resolve_block_id(tensor.shape[tensor_dim])
-    if block_id is not None:
+    if full_slice and block_id is not None:
         loops = state.codegen.active_device_loops.get(block_id)
         if loops and any(isinstance(loop, DeviceLoopState) for loop in loops):
             return _ds_expr(state, block_id, tensor=tensor, tensor_dim=tensor_dim)
 
-    return ":"
+    if full_slice:
+        return ":"
+
+    def bound_expr(value: object) -> str:
+        if value is None:
+            return "None"
+        if isinstance(value, int) and value >= 0:
+            return repr(value)
+        if isinstance(value, torch.SymInt):
+            expr = env.specialize_expr(env.shape_env.replace(value._sympy_()))
+            if not expr.free_symbols and cast("Any", expr).is_integer is True:
+                concrete = int(expr)
+                if concrete >= 0:
+                    return repr(concrete)
+        raise AssertionError(
+            f"Only static slice bounds are supported in Pallas, got {slice_idx}"
+        )
+
+    return f"slice({bound_expr(slice_idx.start)}, {bound_expr(slice_idx.stop)})"
 
 
 def _is_compact_aligned_load(
@@ -627,37 +650,103 @@ def _ds_expr(
     # sliced block at local offset 0, not the absolute tile_start.
     if not tile_offset and _is_compact_aligned_load(state, block_id, tensor):
         return f"pl.ds(0, {block_size})"
+    local_owner_block_id = (
+        _bounded_local_owner_block_id(state, block_id, tensor, tensor_dim)
+        if tensor is not None and tensor_dim is not None
+        else None
+    )
+    if local_owner_block_id is not None:
+        owner_offset = state.codegen.offset_var(local_owner_block_id)
+        offset = f"({offset}) - ({owner_offset})"
     if tensor is not None and tensor_dim is not None:
         from helion.language.memory_ops import _record_pad_info
 
-        extra_pad = _loop_begin_extra_pad(block_id, state)
-        _record_pad_info(state, tensor, tensor_dim, block_id, extra_pad)
+        pad_block_id = (
+            local_owner_block_id if local_owner_block_id is not None else block_id
+        )
+        extra_pad = _loop_begin_extra_pad(pad_block_id, state)
+        _record_pad_info(state, tensor, tensor_dim, pad_block_id, extra_pad)
 
         # Skip when tile_offset is set (e.g. offset + 64) — the shift
         # means the full expression may not be a multiple of block_size.
         if not tile_offset:
-            alignment = _loop_offset_alignment(block_id, state)
-            if alignment is not None:
-                # Workaround for JAX <= 0.10.0 where AssumeMultipleOp
-                # short-circuits divisibility analysis (fixed in
-                # jax-ml/jax@33c38f50b): only apply when alignment meets
-                # Mosaic's requirement, otherwise the hint could replace
-                # a stronger proof Mosaic already has.
-                from helion._compiler.backend import PallasBackend
-                from helion._compiler.compile_environment import CompileEnvironment
+            alignment = (
+                state.device_function.resolved_block_size(block_id)
+                if local_owner_block_id is not None
+                else _loop_offset_alignment(block_id, state)
+            )
+            # Workaround for JAX <= 0.10.0 where AssumeMultipleOp
+            # short-circuits divisibility analysis (fixed in
+            # jax-ml/jax@33c38f50b): only apply when the hint meets Mosaic's
+            # requirement, otherwise it could replace a stronger proof Mosaic
+            # already has.
+            from helion._compiler.backend import PallasBackend
+            from helion._compiler.compile_environment import CompileEnvironment
 
-                backend = CompileEnvironment.current().backend
-                assert isinstance(backend, PallasBackend)
-                dim_from_end = tensor.ndim - 1 - tensor_dim
-                bitwidth = tensor.dtype.itemsize * 8
-                required = backend._get_pallas_required_alignment(
-                    dim_from_end, tensor.ndim, bitwidth
-                )
-                if alignment % required == 0:
-                    # e.g. pl.ds(pl.multiple_of(offset_3, _BLOCK_SIZE_3), _BLOCK_SIZE_3)
-                    offset = f"pl.multiple_of({offset}, {block_size})"
+            backend = CompileEnvironment.current().backend
+            assert isinstance(backend, PallasBackend)
+            dim_from_end = tensor.ndim - 1 - tensor_dim
+            bitwidth = tensor.dtype.itemsize * 8
+            required = backend._get_pallas_required_alignment(
+                dim_from_end, tensor.ndim, bitwidth
+            )
+            if alignment is not None and alignment % required == 0:
+                hint = required
+                bs_value = state.device_function.resolved_block_size(block_id)
+                if isinstance(bs_value, int) and alignment % bs_value == 0:
+                    hint = block_size
+                # e.g. pl.ds(pl.multiple_of(offset_3, _BLOCK_SIZE_3), _BLOCK_SIZE_3)
+                offset = f"pl.multiple_of({offset}, {hint})"
+            elif _is_zero_begin_single_tile_dim(block_id, state, tensor, tensor_dim):
+                offset = f"pl.multiple_of({offset}, {required})"
 
     return f"pl.ds({offset}, {block_size})"
+
+
+def _bounded_local_owner_block_id(
+    state: CodegenState,
+    block_id: int,
+    tensor: torch.Tensor | None,
+    tensor_dim: int | None,
+) -> int | None:
+    """Return the outer grid block that owns a bounded inner tile's BlockSpec."""
+    if tensor is None or tensor_dim is None:
+        return None
+
+    from helion._compiler.compile_environment import CompileEnvironment
+    from helion._compiler.device_function import PallasMemorySpace
+    from helion._compiler.tile_strategy import DeviceGridState
+
+    if (
+        state.device_function.pallas_memory_space.get(id(tensor))
+        == PallasMemorySpace.HBM
+    ):
+        return None
+
+    dim_tilings = state.device_function.pallas_tensor_dim_tilings.get(id(tensor))
+    if dim_tilings is None or tensor_dim >= len(dim_tilings):
+        return None
+    dim_tiling = dim_tilings[tensor_dim]
+    if not dim_tiling.can_tile or dim_tiling.block_ids != [block_id]:
+        return None
+
+    env = CompileEnvironment.current()
+    seen: set[int] = set()
+    current = block_id
+    while current not in seen:
+        seen.add(current)
+        try:
+            spec = env.config_spec.block_sizes.block_id_lookup(current)
+        except KeyError:
+            return None
+        parent = spec.owner_relative_bounded_by_block_id
+        if parent is None:
+            return None
+        loops = state.codegen.active_device_loops.get(parent)
+        if loops and any(isinstance(loop, DeviceGridState) for loop in loops):
+            return parent
+        current = parent
+    return None
 
 
 def _loop_begin_extra_pad(block_id: int, state: CodegenState) -> int:
@@ -680,10 +769,15 @@ def _loop_begin_extra_pad(block_id: int, state: CodegenState) -> int:
         return 0
 
     info = loops[-1].block_id_to_info.get(block_id)
-    if info is None or info.begin_expr is None:
+    if info is None:
         return 0
 
     begin = info.begin_expr
+    if begin is None:
+        alignment = info.offset_alignment
+        if isinstance(alignment, int) and alignment > 0:
+            return (bs_value - math.gcd(bs_value, alignment)) % bs_value
+        return bs_value - 1
     if isinstance(begin, (int, sympy.Integer)):
         return int(begin) % bs_value
 
@@ -696,9 +790,8 @@ def _loop_offset_alignment(
 ) -> int | None:
     """Return the proven alignment of a loop's offset for *block_id*, or ``None``.
 
-    A loop with step ``block_size`` produces offsets ``begin + i * block_size``,
-    which are multiples of ``block_size`` iff ``begin`` is.  Returns
-    ``block_size`` (int) when provable, ``None`` otherwise.
+    A loop with step ``block_size`` produces offsets ``begin + i * block_size``.
+    Returns a proven divisor of that offset expression when available.
     """
     import sympy
 
@@ -706,18 +799,62 @@ def _loop_offset_alignment(
     if not isinstance(bs_value, int):
         return None
 
-    # Check that the loop begins at a multiple of block_size.
     loops = state.codegen.active_device_loops.get(block_id)
     if loops:
         info = loops[-1].block_id_to_info.get(block_id)
-        if info is not None and info.begin_expr is not None:
-            begin = info.begin_expr
-            if not isinstance(begin, (int, sympy.Integer)):
-                return None  # symbolic begin — can't prove alignment
-            if int(begin) % bs_value != 0:
-                return None
+        if info is None:
+            return None
+        offset_alignment = info.offset_alignment
+        if isinstance(offset_alignment, int) and offset_alignment > 0:
+            return offset_alignment
+        begin = info.begin_expr
+        if begin is None:
+            return None
+        if not isinstance(begin, (int, sympy.Integer)):
+            return None  # symbolic begin — can't prove alignment
+        return math.gcd(abs(int(begin)), bs_value)
 
     return bs_value
+
+
+def _is_zero_begin_single_tile_dim(
+    block_id: int,
+    state: CodegenState,
+    tensor: torch.Tensor,
+    tensor_dim: int,
+) -> bool:
+    """True when a zero-begin loop has only one in-bounds concrete tensor tile."""
+    import sympy
+
+    from helion._compiler.compile_environment import CompileEnvironment
+
+    bs_value = state.device_function.resolved_block_size(block_id)
+    if not isinstance(bs_value, int):
+        return False
+
+    loops = state.codegen.active_device_loops.get(block_id)
+    if not loops:
+        return False
+
+    info = loops[-1].block_id_to_info.get(block_id)
+    if info is None or info.begin_expr not in (0, sympy.Integer(0)):
+        return False
+
+    env = CompileEnvironment.current()
+    dim_size = tensor.shape[tensor_dim]
+    if isinstance(dim_size, int):
+        return env.settings.static_shapes and dim_size <= bs_value
+    if not isinstance(dim_size, torch.SymInt):
+        return False
+
+    dim_expr = env.shape_env.replace(dim_size._sympy_())
+    if not dim_expr.free_symbols <= env.specialized_vars:
+        return False
+    dim_expr = env.specialize_expr(dim_expr)
+    if dim_expr.free_symbols or getattr(dim_expr, "is_integer", None) is not True:
+        return False
+    dim_value = int(dim_expr)
+    return dim_value <= bs_value
 
 
 def vmem_name(state: CodegenState, name: str) -> str:

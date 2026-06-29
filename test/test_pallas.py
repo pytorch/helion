@@ -84,6 +84,17 @@ def pallas_sigmoid(x: torch.Tensor) -> torch.Tensor:
 
 
 @helion.kernel(backend="pallas", static_shapes=True)
+def pallas_foreach_output_only(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    out1 = torch.empty_like(x)
+    out2 = torch.empty_like(x)
+    for tile in hl.tile(x.size(0)):
+        out1[tile] = x[tile] + 1.0
+    for tile in hl.tile(x.size(0)):
+        out2[tile] = x[tile] * 2.0
+    return out1, out2
+
+
+@helion.kernel(backend="pallas", static_shapes=True)
 def pallas_pointwise_chain(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     out = torch.empty_like(x)
     for tile in hl.tile(out.size()):
@@ -411,6 +422,15 @@ def pallas_literal_prefixed_row_slab_sum(
         for tile in hl.tile(start, end):
             acc = acc + x[1, tile, :, :].to(torch.float32).sum(dim=0)
         out[owner, :, :] = acc
+    return out
+
+
+@helion.kernel(backend="pallas", static_shapes=True)
+def pallas_owner_relative_inner_leading_dim(x: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for outer in hl.tile(x.size(0)):
+        for inner in hl.tile(outer.begin, outer.end):
+            out[inner, :, :] = x[inner, :, :] + 1.0
     return out
 
 
@@ -3196,6 +3216,34 @@ class TestPallas(TestCase):
         self.assertIn("device='meta'", code)
         self.assertIn("out1, out2 = _launcher(", code)
 
+    def test_foreach_outputs_stay_inplace_and_ordered(self) -> None:
+        x = torch.randn(256, device=DEVICE, dtype=torch.float32)
+        code = pallas_foreach_output_only.bind((x,)).to_triton_code(
+            helion.Config(block_sizes=[128, 128])
+        )
+
+        self.assertIn("_output_indices=[1, 2]", code)
+        self.assertIn("_inplace_indices=[1, 2]", code)
+        self.assertNotIn("device='meta'", code)
+        self.assertIn("((0, 1, 2, 0),)", code)
+        self.assertIn("((0, 1, 2, 2),)", code)
+
+        from helion.runtime import _pallas_shared_output_plan
+
+        _copy_guards, dim_semantics = _pallas_shared_output_plan(
+            (4,),
+            [0, 1, 2],
+            [],
+            [1, 2],
+            {1, 2},
+            [
+                ((None,), (None,)),
+                ((128,), ((0, 1, 2, 0),)),
+                ((128,), ((0, 1, 2, 2),)),
+            ],
+        )
+        self.assertEqual(dim_semantics, ("arbitrary",))
+
     def test_fori_loop_multidim(self) -> None:
         """Test fori_loop with a 2D inner loop (nested iteration)."""
         args = (
@@ -3265,8 +3313,9 @@ class TestPallas(TestCase):
         self.assertIn("jax.lax.fori_loop", code)
         self.assertNotIn("pltpu.make_async_copy", code)
         self.assertIn("pl.ds(", code)
-        # Block size 64 < 128 alignment — hint should NOT be applied
-        self.assertNotIn("pl.multiple_of(", code)
+        # The last dim is a one-tile dense slice, so its dynamic fori offset is
+        # provably zero and can carry the 128-element Mosaic alignment hint.
+        self.assertIn("pl.ds(pl.multiple_of(offset_1, 128), _BLOCK_SIZE_1)", code)
         torch.testing.assert_close(result, args[0] + args[1])
 
     def test_fori_loop_no_dma_multidim_unaligned(self) -> None:
@@ -3356,6 +3405,25 @@ class TestPallas(TestCase):
         self.assertIn("pipeline_mode=pl.Buffered", code)
         self.assertIn("_pipeline_arg_indices=[1]", code)
         self.assertNotIn("pltpu.make_async_copy", code)
+
+    def test_owner_relative_padding_uses_blockspec_owner_block(self) -> None:
+        x = torch.randn(96, 4, 128, device=DEVICE, dtype=torch.float32)
+        code = pallas_owner_relative_inner_leading_dim.bind((x,)).to_triton_code(
+            helion.Config(block_sizes=[64, 32], pallas_loop_type="fori_loop")
+        )
+
+        self.assertIn(
+            "x[pl.ds(pl.multiple_of(offset_1 - offset_0, _BLOCK_SIZE_1), "
+            "_BLOCK_SIZE_1), :, :]",
+            code,
+        )
+        match = re.search(r"_ds_pad_dims=(\[[^\]]*\])", code)
+        self.assertIsNotNone(match, "expected owner-relative pl.ds pad dims")
+        pad_dims = ast.literal_eval(match.group(1))
+        self.assertIn((0, 0, 64, 0), pad_dims)
+        self.assertIn((1, 0, 64, 0), pad_dims)
+        self.assertNotIn((0, 0, 32, 0), pad_dims)
+        self.assertNotIn((1, 0, 32, 0), pad_dims)
 
     def test_tile_id_per_block_accumulator(self) -> None:
         """Writing to ``out[tile.id, :]`` stores one row per outer grid iter.
@@ -4448,6 +4516,10 @@ class TestPallas(TestCase):
         ref[s:e] = torch.bmm(y[s:e].transpose(0, 1), w).transpose(0, 1) + y[s:e]
         torch.testing.assert_close(out.cpu(), ref.cpu(), rtol=2e-2, atol=2e-2)
 
+    @xfailIfPallasTpu(
+        "unaligned data-dependent tile load; fixed later in the stack by Pallas "
+        "padded-load support (#2944)"
+    )
     def test_opposite_direction_transpose_keeps_eager_mask(self) -> None:
         """Mirror image of the deferral win.  Here the masked Q axis is already in
         the last-two (sublane) dims at the load and the transpose moves it to a

@@ -65,6 +65,148 @@ if TYPE_CHECKING:
 log: logging.Logger = logging.getLogger(__name__)
 
 
+@dataclasses.dataclass(frozen=True)
+class _PallasLaunchExpr:
+    code: str
+
+
+_PallasLaunchValue = int | None | _PallasLaunchExpr
+_PallasFlatDecompValue = (
+    _PallasLaunchValue
+    | tuple[_PallasLaunchValue, _PallasLaunchValue, _PallasLaunchValue]
+    | tuple[
+        _PallasLaunchValue,
+        _PallasLaunchValue,
+        _PallasLaunchValue,
+        _PallasLaunchValue,
+    ]
+    | None
+)
+_PallasBlockSpecInfo = list[
+    tuple[tuple[_PallasLaunchValue, ...], tuple[_PallasFlatDecompValue, ...]] | None
+]
+
+
+def _format_pallas_launch_value(value: object) -> str:
+    if isinstance(value, _PallasLaunchExpr):
+        return value.code
+    if isinstance(value, tuple):
+        trailing = "," if len(value) == 1 else ""
+        return (
+            "("
+            + ", ".join(_format_pallas_launch_value(item) for item in value)
+            + trailing
+            + ")"
+        )
+    if isinstance(value, list):
+        return (
+            "[" + ", ".join(_format_pallas_launch_value(item) for item in value) + "]"
+        )
+    return repr(value)
+
+
+def _pallas_launch_code(value: _PallasLaunchValue) -> str:
+    if isinstance(value, _PallasLaunchExpr):
+        return value.code
+    return repr(value)
+
+
+def _pallas_mul_launch_values(
+    lhs: _PallasLaunchValue, rhs: _PallasLaunchValue
+) -> _PallasLaunchValue:
+    if isinstance(lhs, int) and isinstance(rhs, int):
+        return lhs * rhs
+    if lhs == 1:
+        return rhs
+    if rhs == 1:
+        return lhs
+    return _PallasLaunchExpr(
+        f"({_pallas_launch_code(lhs)}) * ({_pallas_launch_code(rhs)})"
+    )
+
+
+def _pallas_add_launch_values(
+    lhs: _PallasLaunchValue, rhs: _PallasLaunchValue
+) -> _PallasLaunchValue:
+    if isinstance(lhs, int) and isinstance(rhs, int):
+        return lhs + rhs
+    if lhs == 0:
+        return rhs
+    if rhs == 0:
+        return lhs
+    return _PallasLaunchExpr(
+        f"({_pallas_launch_code(lhs)}) + ({_pallas_launch_code(rhs)})"
+    )
+
+
+def _pallas_cdiv_launch_values(
+    numerator: _PallasLaunchValue, denominator: _PallasLaunchValue
+) -> _PallasLaunchValue:
+    if isinstance(numerator, int) and isinstance(denominator, int):
+        return -(-numerator // denominator)
+    n_code = _pallas_launch_code(numerator)
+    d_code = _pallas_launch_code(denominator)
+    return _PallasLaunchExpr(f"(({n_code}) + ({d_code}) - 1) // ({d_code})")
+
+
+def _pallas_host_launch_value(
+    value: int | torch.SymInt | sympy.Expr,
+    config: Config,
+) -> _PallasLaunchValue:
+    if isinstance(value, int):
+        return value
+
+    from .compile_environment import CompileEnvironment
+    from .host_function import HostFunction
+
+    env = CompileEnvironment.current()
+    expr = value._sympy_() if isinstance(value, torch.SymInt) else value
+    assert isinstance(expr, sympy.Expr)
+    substitutions = {
+        symbol: config[tunable_name]
+        for symbol, tunable_name in env.tunable_symbols.items()
+        if isinstance(config.get(tunable_name), int)
+    }
+    if substitutions:
+        expr = expr.subs(substitutions)
+        assert isinstance(expr, sympy.Expr)
+    if not expr.free_symbols:
+        return int(expr)
+    return _PallasLaunchExpr(HostFunction.current().sympy_expr(expr))
+
+
+def _pallas_configured_block_size(
+    block_id: int,
+    config: Config,
+    *,
+    launch_context: str = "Pallas launch",
+) -> _PallasLaunchValue:
+    from .compile_environment import CompileEnvironment
+
+    env = CompileEnvironment.current()
+    value = env.block_sizes[block_id].from_config(config)
+    if isinstance(value, int):
+        return value
+    if isinstance(value, torch.SymInt):
+        return _pallas_host_launch_value(value, config)
+    raise NotImplementedError(f"{launch_context} requires concrete block sizes")
+
+
+def _pallas_block_numel(
+    block_id: int,
+    config: Config,
+    *,
+    launch_context: str = "Pallas launch",
+) -> _PallasLaunchValue:
+    from .compile_environment import CompileEnvironment
+
+    env = CompileEnvironment.current()
+    size = env.block_sizes[block_id].size
+    if isinstance(size, (int, torch.SymInt)):
+        return _pallas_host_launch_value(size, config)
+    raise NotImplementedError(f"{launch_context} requires concrete block extents")
+
+
 class FlashSearchSurface(NamedTuple):
     head_dim: int
     num_kv: int
@@ -2104,16 +2246,7 @@ class PallasBackend(Backend):
         self,
         sorted_args: list[Argument] | None,
         config: Config,
-    ) -> (
-        list[
-            tuple[
-                tuple[int | None, ...],
-                tuple[int | tuple[int, int, int] | None, ...],
-            ]
-            | None
-        ]
-        | None
-    ):
+    ) -> _PallasBlockSpecInfo | None:
         """Compute per-tensor ``(block_shape, grid_dims)`` from codegen tiling info.
 
         Uses ``DeviceFunction.pallas_tensor_dim_tilings`` (recorded during
@@ -2131,6 +2264,7 @@ class PallasBackend(Backend):
         from .device_function import TensorStrideArg
         from .host_function import HostFunction
         from .program_id import FlatProgramIDs
+        from .program_id import ForEachProgramID
 
         env = CompileEnvironment.current()
         device_fn = DeviceFunction.current()
@@ -2140,15 +2274,39 @@ class PallasBackend(Backend):
         # so pid_info[g].block_id is the block_id assigned to grid dim g.
         if device_fn.pid is None:
             return None
-        flat_grid_block_ids = [pid.block_id for pid in device_fn.pid.pid_info]
+        if isinstance(device_fn.pid, ForEachProgramID):
+            flat_grid_block_ids = [
+                pid_info.block_id
+                for case in device_fn.pid.cases
+                for pid_info in case.pid_info
+            ]
+        else:
+            flat_grid_block_ids = [pid.block_id for pid in device_fn.pid.pid_info]
         block_id_to_grid_dim = {bid: g for g, bid in enumerate(flat_grid_block_ids)}
         known_block_ids = set(block_id_to_grid_dim)
+
+        def block_spec_grid_block_id(block_id: int) -> int | None:
+            """Map an indexed block id to the pallas_call grid block that owns it."""
+            seen: set[int] = set()
+            while block_id not in seen:
+                if block_id in known_block_ids:
+                    return block_id
+                seen.add(block_id)
+                try:
+                    spec = env.config_spec.block_sizes.block_id_lookup(block_id)
+                except KeyError:
+                    return None
+                bounded_by = spec.owner_relative_bounded_by_block_id
+                if bounded_by is None:
+                    return None
+                block_id = bounded_by
+            return None
 
         # FlattenedTileStrategy collapses all block_ids into a single
         # pid_info entry, but the full set lives in device_ir.grid_block_ids.
         # Recover them so we can build flat decomposition and so downstream
         # checks (e.g. 1D tensor validation) see every block_id.
-        flat_decomp: dict[int, tuple[int, int, int]] | None = None
+        flat_decomp: dict[int, _PallasFlatDecompValue] | None = None
         if isinstance(device_fn.pid, FlatProgramIDs):
             device_ir = HostFunction.current().device_ir
             all_grid_block_ids = [
@@ -2157,29 +2315,42 @@ class PallasBackend(Backend):
             known_block_ids.update(all_grid_block_ids)
 
             if len(all_grid_block_ids) > 1:
-                import sympy
-
                 stride = 1
                 flat_decomp = {}
                 for bid in all_grid_block_ids:
-                    bs = env.block_sizes[bid].from_config(config)
-                    numel = env.block_sizes[bid].numel
-                    if not isinstance(bs, int) or isinstance(numel, str):
-                        return None
-                    try:
-                        numel_val = (
-                            int(numel) if isinstance(numel, sympy.Expr) else numel
-                        )
-                    except (TypeError, ValueError):
-                        return None
-                    num_blocks = -(-numel_val // bs)  # cdiv
+                    bs = _pallas_configured_block_size(bid, config)
+                    num_blocks = _pallas_cdiv_launch_values(
+                        _pallas_block_numel(bid, config), bs
+                    )
                     flat_decomp[bid] = (0, stride, num_blocks)
-                    stride *= num_blocks
+                    stride = _pallas_mul_launch_values(stride, num_blocks)
+        elif isinstance(device_fn.pid, ForEachProgramID):
+            flat_decomp = {}
+            case_start: _PallasLaunchValue = 0
+            for case in device_fn.pid.cases:
+                stride: _PallasLaunchValue = 1
+                case_entries: list[
+                    tuple[int, _PallasLaunchValue, _PallasLaunchValue]
+                ] = []
+                for pid_info in case.pid_info:
+                    bid = pid_info.block_id
+                    bs = _pallas_configured_block_size(bid, config)
+                    num_blocks = _pallas_cdiv_launch_values(
+                        _pallas_block_numel(bid, config), bs
+                    )
+                    case_entries.append((bid, stride, num_blocks))
+                    stride = _pallas_mul_launch_values(stride, num_blocks)
+                case_total = stride
+                for bid, bid_stride, num_blocks in case_entries:
+                    flat_decomp[bid] = (
+                        0,
+                        bid_stride,
+                        num_blocks,
+                        case_start,
+                    )
+                case_start = _pallas_add_launch_values(case_start, case_total)
 
-        result: list[
-            tuple[tuple[int | None, ...], tuple[int | tuple[int, int, int] | None, ...]]
-            | None
-        ] = []
+        result: _PallasBlockSpecInfo = []
 
         for arg in sorted_args:
             if isinstance(arg, (SymbolArgument, TensorSizeArg, TensorStrideArg)):
@@ -2195,9 +2366,9 @@ class PallasBackend(Backend):
             if dim_tilings is None:
                 # this means this tensor isn't accessed at all in the kernel
                 result.append(None)
-                return None
-            block_shape: list[int | None] = []
-            grid_dims: list[int | tuple[int, int, int] | None] = []
+                continue
+            block_shape: list[_PallasLaunchValue] = []
+            grid_dims: list[_PallasFlatDecompValue] = []
             for d in range(tensor.ndim):
                 dim_tiling = dim_tilings[d]
                 if not dim_tiling.can_tile or len(dim_tiling.block_ids) == 0:
@@ -2206,23 +2377,29 @@ class PallasBackend(Backend):
                     continue
                 assert len(dim_tiling.block_ids) == 1
                 bid = dim_tiling.block_ids[0]
-                if bid is not None and bid in known_block_ids:
-                    bs = env.block_sizes[bid].from_config(config)
-                    if isinstance(bs, int):
-                        block_shape.append(bs)
-                        dim_size = tensor.shape[d]
-                        # When the block covers the entire tensor
-                        # dimension there is only one tile, so the grid
-                        # index must be constant 0 — iterating would
-                        # read out-of-bounds (e.g. bias [1, N] with
-                        # block_size > 1).
-                        if isinstance(dim_size, int) and dim_size <= bs:
-                            grid_dims.append(None)
-                        elif flat_decomp is not None and bid in flat_decomp:
-                            grid_dims.append(flat_decomp[bid])
-                        else:
-                            grid_dims.append(block_id_to_grid_dim[bid])
-                        continue
+                grid_bid = block_spec_grid_block_id(bid)
+                bs = (
+                    _pallas_configured_block_size(grid_bid, config)
+                    if grid_bid is not None
+                    else None
+                )
+                # Only emit an explicit tiled block shape when the block size is
+                # a concrete int.  A symbolic (runtime-arg) block size can resolve
+                # to a value Pallas TPU rejects for rank-1/small blocks (e.g.
+                # block_size=32 on a 1024 array), so fall back to a full-dimension
+                # BlockSpec (constant grid index 0) in that case.
+                if grid_bid is not None and isinstance(bs, int):
+                    block_shape.append(bs)
+                    dim_size = tensor.shape[d]
+                    # When the block covers the entire tensor dimension there
+                    # is only one tile, so the grid index must be constant 0.
+                    if isinstance(dim_size, int) and dim_size <= bs:
+                        grid_dims.append(None)
+                    elif flat_decomp is not None and grid_bid in flat_decomp:
+                        grid_dims.append(flat_decomp[grid_bid])
+                    else:
+                        grid_dims.append(block_id_to_grid_dim[grid_bid])
+                    continue
                 block_shape.append(None)
                 grid_dims.append(None)
             result.append((tuple(block_shape), tuple(grid_dims)))
@@ -2423,6 +2600,7 @@ class PallasBackend(Backend):
         from .device_function import DeviceFunction
         from .device_function import TensorArg
         from .host_function import HostFunction
+        from .program_id import ForEachProgramID
 
         device_fn = DeviceFunction.current()
 
@@ -2482,6 +2660,13 @@ class PallasBackend(Backend):
                     output_indices.append(i)
                     inplace_indices.append(i)
 
+        if has_barrier or isinstance(device_fn.pid, ForEachProgramID):
+            # ForEach flattens disjoint case ranges onto one launch dimension.
+            # Keep outputs in-place so programs outside an output's case copy
+            # through the current tile instead of writing an uninitialized
+            # output-only ref via the wrapped BlockSpec index map.
+            inplace_indices = list(output_indices)
+
         # Collect output-only tensor names so codegen can retarget their
         # allocations to ``device='meta'`` and capture the launcher return.
         output_only_set = set(output_indices) - set(inplace_indices)
@@ -2505,7 +2690,9 @@ class PallasBackend(Backend):
         if block_spec_info is not None:
             if has_rng_ops:
                 block_spec_info.append(None)  # RNG seed buffer is untiled
-            launcher_args.append(f"_block_spec_info={block_spec_info!r}")
+            launcher_args.append(
+                f"_block_spec_info={_format_pallas_launch_value(block_spec_info)}"
+            )
 
         pad_info = self._compute_pad_info(sorted_args, config)
         if pad_info:
