@@ -2663,6 +2663,53 @@ def _subscript_block_id(env: CompileEnvironment, sub: object) -> int | None:
     return None
 
 
+def _maybe_specialize_pallas_matmul_alignment_dim(
+    fake: torch.Tensor,
+    tensor_dim: int,
+    subscript: object,
+    env: CompileEnvironment,
+) -> None:
+    """Specialize small dynamic matmul dims that need Pallas one-tile alignment."""
+    if env.backend_name != "pallas":
+        return
+    dim_size = fake.shape[tensor_dim]
+    if not isinstance(dim_size, torch.SymInt):
+        return
+    block_id = _subscript_block_id(env, subscript)
+    if block_id is None:
+        return
+    block_info = env.block_sizes[block_id]
+    block_size = block_info.size
+    if not isinstance(block_size, torch.SymInt):
+        return
+    if env.shape_env.replace(block_size._sympy_()) != env.shape_env.replace(
+        dim_size._sympy_()
+    ):
+        return
+
+    try:
+        block_spec = env.config_spec.block_sizes.block_id_lookup(block_id)
+    except KeyError:
+        return
+
+    dim_hint = env.size_hint(dim_size)
+    if dim_hint <= 0 or dim_hint > block_spec.max_size:
+        return
+
+    from .backend import PallasBackend
+    from .compile_environment import _symint_free_symbols
+
+    backend = env.backend
+    assert isinstance(backend, PallasBackend)
+    dim_from_end = fake.ndim - tensor_dim - 1
+    bitwidth = fake.dtype.itemsize * 8
+    required = backend._get_pallas_required_alignment(dim_from_end, fake.ndim, bitwidth)
+    if dim_hint >= required:
+        return
+
+    env.specialized_vars.update(_symint_free_symbols(dim_size))
+
+
 def _collect_memory_op_facts(device_ir: DeviceIR) -> list[MemoryOpFact]:
     """Walk every device graph once and record per-load/store metadata.
 
@@ -2795,6 +2842,18 @@ def _collect_memory_op_facts(device_ir: DeviceIR) -> list[MemoryOpFact]:
                 )
             )
             memory_op_index += 1
+
+    for node, _fact in records:
+        if operands.get(node) is None:
+            continue
+        fake = _accessed_tensor_fake(node)
+        index_list = node.args[1] if len(node.args) >= 2 else None
+        if fake is None or not isinstance(index_list, (list, tuple)):
+            continue
+        for pos, sub in enumerate(index_list):
+            if isinstance(sub, int) or pos >= fake.ndim:
+                continue
+            _maybe_specialize_pallas_matmul_alignment_dim(fake, pos, sub, env)
 
     return [fact._replace(matmul_operand=operands.get(node)) for node, fact in records]
 
