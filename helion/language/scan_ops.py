@@ -1278,21 +1278,19 @@ def _get_input_tensor_ast(state: CodegenState, is_tuple_input: bool) -> ast.AST:
 
 
 def _scan_combine_operator(helper_graph_info: HelperFunctionGraphInfo) -> str:
-    import operator as operator_mod
-
     graph = helper_graph_info.graph
     for node in graph.nodes:
         if node.op != "call_function":
             continue
         if node.target in (
-            operator_mod.add,
+            operator.add,
             torch.add,
             torch.ops.aten.add.Tensor,
             torch.ops.aten.add.Scalar,
         ):
             return "add"
         if node.target in (
-            operator_mod.mul,
+            operator.mul,
             torch.mul,
             torch.ops.aten.mul.Tensor,
             torch.ops.aten.mul.Scalar,

@@ -39,6 +39,8 @@ from .variable_origin import GetItemOrigin
 from .variable_origin import GridOrigin
 from .variable_origin import Origin
 from .variable_origin import TensorSizeOrigin
+from .variable_origin import TileBeginOrigin
+from .variable_origin import TileEndOrigin
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -1004,9 +1006,6 @@ def _detect_outer_block_bound(
     that tile's block_id.  Used to cap inner-tile block sizes to the enclosing
     outer tile's extent (e.g. ``hl.tile(outer.begin, outer.end)``).
     """
-    from .variable_origin import TileBeginOrigin
-    from .variable_origin import TileEndOrigin
-
     # Direct match: numel is another block's var.
     direct = env.get_block_id(numel)
     if direct is not None:
@@ -1060,8 +1059,6 @@ def _detect_owner_relative_outer_block_bound(
     end: object,
 ) -> int | None:
     """Return the owner block when bounds are exactly ``owner.begin/end``."""
-    from .variable_origin import TileBeginOrigin
-    from .variable_origin import TileEndOrigin
 
     def exact_origin(value: object) -> Origin | None:
         if not isinstance(value, torch.SymInt):
