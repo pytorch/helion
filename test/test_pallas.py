@@ -2848,6 +2848,57 @@ class TestPallas(TestCase):
         expected = x + x[:, -1:]
         torch.testing.assert_close(result, expected)
 
+    def _check_small_middle_scalar_load_in_loop(self, loop_type: str) -> None:
+        """Small scalar-indexed middle dims load aligned and select in registers."""
+
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def middle_scalar_load(x: torch.Tensor) -> torch.Tensor:
+            batch, seqlen, nheads, _dhead = x.shape
+            out = torch.empty(
+                [batch, nheads, seqlen, _dhead], dtype=x.dtype, device=x.device
+            )
+            for tile_b, tile_h in hl.tile([batch, nheads], block_size=[1, 1]):
+                i_b = tile_b.id
+                i_h = tile_h.id
+                for tile_s in hl.tile(seqlen, block_size=64):
+                    out[i_b, i_h, tile_s, :] = x[i_b, tile_s, i_h, :] + 1.0
+            return out
+
+        x = torch.randn(2, 128, 4, 16, device=DEVICE, dtype=torch.bfloat16)
+        _code, result = code_and_output(
+            middle_scalar_load,
+            (x,),
+            pallas_loop_type=loop_type,
+        )
+        torch.testing.assert_close(result, (x + 1.0).permute(0, 2, 1, 3))
+
+    def test_small_middle_scalar_load_in_emit_pipeline(self) -> None:
+        self._check_small_middle_scalar_load_in_loop("emit_pipeline")
+
+    def test_small_middle_scalar_load_in_fori_loop(self) -> None:
+        self._check_small_middle_scalar_load_in_loop("fori_loop")
+
+    def test_small_middle_negative_scalar_load(self) -> None:
+        """Static negative scalar indices preserve Python indexing semantics."""
+
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def negative_scalar_load(x: torch.Tensor) -> torch.Tensor:
+            batch, seqlen, _nheads, dhead = x.shape
+            out = torch.empty([batch, seqlen, dhead], dtype=x.dtype, device=x.device)
+            for tile_b in hl.tile(batch, block_size=1):
+                i_b = tile_b.id
+                for tile_s in hl.tile(seqlen, block_size=64):
+                    out[i_b, tile_s, :] = x[i_b, tile_s, -1, :]
+            return out
+
+        x = torch.randn(2, 128, 4, 16, device=DEVICE, dtype=torch.bfloat16)
+        _code, result = code_and_output(
+            negative_scalar_load,
+            (x,),
+            pallas_loop_type="emit_pipeline",
+        )
+        torch.testing.assert_close(result, x[:, :, -1, :])
+
     @xfailIfPallasTpu(
         "Mixed scalar write + slice needs tensor duplication into SMEM and VMEM"
     )
@@ -3205,8 +3256,9 @@ class TestPallas(TestCase):
         self.assertIn("jax.lax.fori_loop", code)
         self.assertNotIn("pltpu.make_async_copy", code)
         self.assertIn("pl.ds(", code)
-        # Block size 64 < 128 alignment — hint should NOT be applied
-        self.assertNotIn("pl.multiple_of(", code)
+        # The last dim is a one-tile dense slice, so its dynamic fori offset is
+        # provably zero and can carry the 128-element Mosaic alignment hint.
+        self.assertIn("pl.ds(pl.multiple_of(offset_1, 128), _BLOCK_SIZE_1)", code)
         torch.testing.assert_close(result, args[0] + args[1])
 
     def test_fori_loop_no_dma_multidim_unaligned(self) -> None:
@@ -4247,8 +4299,8 @@ class TestPallas(TestCase):
 
     def test_transpose_dot_defers_pallas_load_mask(self) -> None:
         """A masked load consumed via ``transpose`` -> dot defers its mask to the
-        consumer layout: a raw load + a post-transpose ``jnp.where``, not an eager
-        multiplicative load mask.
+        consumer layout: a raw load + a post-transpose mask, not an eager load
+        mask.
 
         The deferral is an FX-graph pass, so it is independent of the pallas loop
         type -- asserted here for both ``fori_loop`` and ``compact_worklist`` on a
@@ -4391,7 +4443,6 @@ class TestPallas(TestCase):
         ref[s:e] = torch.bmm(y[s:e].transpose(0, 1), w).transpose(0, 1) + y[s:e]
         torch.testing.assert_close(out.cpu(), ref.cpu(), rtol=2e-2, atol=2e-2)
 
-    @xfailIfPallasTpu("opposite-direction transpose needs padded-load widening")
     def test_opposite_direction_transpose_keeps_eager_mask(self) -> None:
         """Mirror image of the deferral win.  Here the masked Q axis is already in
         the last-two (sublane) dims at the load and the transpose moves it to a
@@ -4422,9 +4473,10 @@ class TestPallas(TestCase):
             block_sizes=[16],
             pallas_loop_type="fori_loop",
         )
-        # Masked axis is sublane at the load -> eager mask is cheap; deferring
-        # would move it to the major axis, so the gate keeps the eager load mask.
-        self.assertRegex(code, r"= y\[[^\n]*\] \* mask_\d+\.astype")
+        # Masked axis is sublane at the load -> eager mask is cheap; even when
+        # the load is widened for Mosaic alignment, the mask stays on yj before
+        # the transpose/bmm path can move that axis to a major dimension.
+        self.assertRegex(code, r"yj = [^\n]*\* mask_\d+\.astype")
 
         s, e = 0, 10
         ref = torch.bmm(y[:, s:e, :].transpose(0, 1), y[:, s:e, :].permute(1, 2, 0))
