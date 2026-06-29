@@ -1804,6 +1804,7 @@ class LoopDimInfo:
     begin_expr: sympy.Expr | None = None
     end_var_name: str | None = None
     end_expr: sympy.Expr | None = None
+    offset_alignment: int | None = None
 
     def is_end_matching(self, size: int | torch.SymInt) -> bool:
         expected = _to_sympy(size)

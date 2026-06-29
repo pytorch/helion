@@ -32,6 +32,7 @@ from .._compiler.type_info import SequenceType
 from .._compiler.type_info import TensorType
 from .._compiler.type_info import TileIndexType
 from .._compiler.type_info import TypeInfo
+from .._compiler.type_info import _detect_owner_relative_outer_block_bound
 from .._compiler.variable_origin import GetItemOrigin
 from ..autotuner.config_spec import ConfigSpec
 from ..autotuner.config_spec import FlattenLoopSpec
@@ -355,7 +356,15 @@ def _(
         if isinstance(begin_part, torch.SymInt) or isinstance(end_part, torch.SymInt):
             has_symbolic_bounds = True
         if bs is None:
-            results.append(TileIndexType.allocate(size, origin))
+            results.append(
+                TileIndexType.allocate(
+                    size,
+                    origin,
+                    owner_relative_bounded_by_block_id=(
+                        _detect_owner_relative_outer_block_bound(begin_part, end_part)
+                    ),
+                )
+            )
         elif isinstance(bs, int):
             results.append(TileIndexType.allocate(size, origin, bs))
         elif isinstance(bs, torch.SymInt):
