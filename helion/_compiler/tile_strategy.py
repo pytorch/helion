@@ -1862,6 +1862,9 @@ class EmitPipelineLoopState(DeviceLoopOrGridState):
     outer_prefix: list[ast.AST] = dataclasses.field(default_factory=list)
     outer_suffix: list[ast.AST] = dataclasses.field(default_factory=list)
     _tensor_to_dma_scratch: dict[str, str] = dataclasses.field(default_factory=dict)
+    _tensor_to_dma_block_ids: dict[str, set[int]] = dataclasses.field(
+        default_factory=dict
+    )
 
 
 @dataclasses.dataclass
@@ -1880,6 +1883,9 @@ class ForiLoopState(DeviceLoopOrGridState):
     outer_prefix: list[ast.AST] = dataclasses.field(default_factory=list)
     outer_suffix: list[ast.AST] = dataclasses.field(default_factory=list)
     _tensor_to_dma_scratch: dict[str, str] = dataclasses.field(default_factory=dict)
+    _tensor_to_dma_block_ids: dict[str, set[int]] = dataclasses.field(
+        default_factory=dict
+    )
     _tensor_to_sem: dict[str, str] = dataclasses.field(default_factory=dict)
 
 

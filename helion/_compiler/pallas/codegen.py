@@ -993,10 +993,14 @@ def index_parts(
     # their outer BlockSpec and fall through to pl.ds().
     tensor_name = state.codegen.device_function.tensor_arg(tensor).name
     in_pipeline = False
-    pipeline_block_ids: set[int] = set()
+    dma_block_ids: set[int] = set()
     for loop, _ref in _iter_dma_scratch_loops(state, tensor_name):
         in_pipeline = True
-        pipeline_block_ids.update(loop.block_ids)
+        block_id_mapping = getattr(loop, "_tensor_to_dma_block_ids", None)
+        if block_id_mapping and tensor_name in block_id_mapping:
+            dma_block_ids.update(block_id_mapping[tensor_name])
+        else:
+            dma_block_ids.update(loop.block_ids)
 
     # Use pre-computed indexing patterns from plan_tiling analysis
     indexing_patterns = _get_indexing_patterns(state, tensor)
@@ -1015,7 +1019,7 @@ def index_parts(
 
         # Generate code based on the pattern type
         index_code = _generated_index_code(
-            pattern, idx, state, tensor, i, tensor_dim, in_pipeline, pipeline_block_ids
+            pattern, idx, state, tensor, i, tensor_dim, in_pipeline, dma_block_ids
         )
         parts.append(index_code)
 
@@ -1057,7 +1061,7 @@ def _generated_index_code(
     subscript_index: int,
     tensor_dim: int,
     in_pipeline: bool,
-    pipeline_block_ids: set[int],
+    dma_block_ids: set[int],
 ) -> str:
     """Generate index code based on the indexing pattern."""
     from helion._compiler.pallas.plan_tiling import ArbitraryIndexPattern
@@ -1070,17 +1074,17 @@ def _generated_index_code(
 
     if isinstance(pattern, TilePattern):
         return _tile_pattern_code(
-            pattern, idx, state, tensor, tensor_dim, in_pipeline, pipeline_block_ids
+            pattern, idx, state, tensor, tensor_dim, in_pipeline, dma_block_ids
         )
 
     if isinstance(pattern, TileIndexWithOffsetPattern):
         return _tile_index_with_offset_pattern_code(
-            pattern, state, tensor, tensor_dim, in_pipeline, pipeline_block_ids
+            pattern, state, tensor, tensor_dim, in_pipeline, dma_block_ids
         )
 
     if isinstance(pattern, TileBeginWithOffsetPattern):
         return _tile_begin_with_offset_pattern_code(
-            pattern, state, subscript_index, tensor_dim, in_pipeline, pipeline_block_ids
+            pattern, state, subscript_index, tensor_dim, in_pipeline, dma_block_ids
         )
 
     if isinstance(pattern, ArbitrarySlicePattern):
@@ -1117,7 +1121,7 @@ def _tile_pattern_code(
     tensor: torch.Tensor,
     tensor_dim: int,
     in_pipeline: bool,
-    pipeline_block_ids: set[int],
+    dma_block_ids: set[int],
 ) -> str:
     from helion._compiler.pallas.plan_tiling import TilePattern
     from helion._compiler.tile_strategy import DeviceLoopState
@@ -1134,7 +1138,7 @@ def _tile_pattern_code(
     # TODO(yifeixu): the long-term fix is making ``can_tile`` per-loop-scope
     # instead of per-tensor-dim so the planner doesn't mark this dim
     # untileable in pipeline mode in the first place.
-    if in_pipeline:
+    if in_pipeline and block_id in dma_block_ids:
         return ":"
 
     can_tile = _can_tile_dimension(state, tensor_dim)
@@ -1159,7 +1163,7 @@ def _tile_index_with_offset_pattern_code(
     tensor: torch.Tensor,
     tensor_dim: int,
     in_pipeline: bool,
-    pipeline_block_ids: set[int],
+    dma_block_ids: set[int],
 ) -> str:
     from helion._compiler.pallas.plan_tiling import TileIndexWithOffsetPattern
 
@@ -1176,7 +1180,7 @@ def _tile_begin_with_offset_pattern_code(
     subscript_index: int,
     tensor_dim: int,
     in_pipeline: bool,
-    pipeline_block_ids: set[int],
+    dma_block_ids: set[int],
 ) -> str:
     from helion._compiler.pallas.plan_tiling import TileBeginWithOffsetPattern
     from helion._compiler.tile_strategy import DeviceLoopState
@@ -1186,7 +1190,7 @@ def _tile_begin_with_offset_pattern_code(
     block_id = pattern.block_id
     offset_str = state.device_function.literal_expr(pattern.offset)
 
-    if in_pipeline and block_id in pipeline_block_ids:
+    if in_pipeline and block_id in dma_block_ids:
         return offset_str
 
     can_tile = _can_tile_dimension(state, tensor_dim)
