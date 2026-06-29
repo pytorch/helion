@@ -33,6 +33,7 @@ _PLATFORM_KERNELS_INPUT = {
     "b200_cute": "kernels_cute",
     "mi350x": "kernels",
     "tpu": "kernels_tpu",
+    "b200_fla": "kernels_linattn",
 }
 
 
