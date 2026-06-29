@@ -2846,7 +2846,9 @@ class FlattenedTileStrategy(BlockSizeTileStrategy):
                 self._setup_block_size_constexpr(state, block_size_var, self.block_size)
                 pids = self.select_pid_strategy()
                 if isinstance(state.device_function.pid, ForEachProgramID):
-                    pids.shared_pid_var = state.device_function.pid.shared_pid_var
+                    pids.shared_pid_var = state.device_function.pid.case_pid_var(
+                        state.device_function
+                    )
                 pids.append(PIDInfo(pid_var, block_size_var, trip_count, block_id))
                 state.add_statement(
                     env.backend.arange_expr(
@@ -2907,7 +2909,9 @@ class FlattenedTileStrategy(BlockSizeTileStrategy):
         pid_var = state.device_function.new_var("pid_flat", dce=True)
         pids = self.select_pid_strategy()
         if isinstance(state.device_function.pid, ForEachProgramID):
-            pids.shared_pid_var = state.device_function.pid.shared_pid_var
+            pids.shared_pid_var = state.device_function.pid.case_pid_var(
+                state.device_function
+            )
 
         pids.append(PIDInfo(pid_var, block_size_var, total_numel, self.block_ids[0]))
 
@@ -3261,7 +3265,9 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
         assert len(block_sizes) == len(block_ids)
         pids = self.select_pid_strategy()
         if isinstance(state.device_function.pid, ForEachProgramID):
-            pids.shared_pid_var = state.device_function.pid.shared_pid_var
+            pids.shared_pid_var = state.device_function.pid.case_pid_var(
+                state.device_function
+            )
         elif (
             isinstance(pids, FlatProgramIDs)
             and env.backend.name == "pallas"
@@ -3853,7 +3859,9 @@ class CuteNDTileStrategy(NDTileStrategy):
         assert len(block_sizes) == len(block_ids)
         pids = self.select_pid_strategy()
         if isinstance(state.device_function.pid, ForEachProgramID):
-            pids.shared_pid_var = state.device_function.pid.shared_pid_var
+            pids.shared_pid_var = state.device_function.pid.case_pid_var(
+                state.device_function
+            )
 
         assert state.ast_args is None
         assert len(state.proxy_args) == 3
@@ -4318,7 +4326,9 @@ class CuteFlattenedTileStrategy(FlattenedTileStrategy):
         pid_var = state.device_function.new_var("pid_flat", dce=True)
         pids = self.select_pid_strategy()
         if isinstance(state.device_function.pid, ForEachProgramID):
-            pids.shared_pid_var = state.device_function.pid.shared_pid_var
+            pids.shared_pid_var = state.device_function.pid.case_pid_var(
+                state.device_function
+            )
         pids.append(PIDInfo(pid_var, block_size_var, total_numel, self.block_ids[0]))
         axis = self._flat_thread_axis()
         state.add_statement(

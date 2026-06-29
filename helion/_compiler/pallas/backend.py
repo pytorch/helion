@@ -108,6 +108,13 @@ _PallasFlatDecompValue = (
         _PallasLaunchScalar,
         _PallasLaunchScalar,
     ]
+    | tuple[
+        _PallasLaunchScalar,
+        _PallasLaunchScalar,
+        _PallasLaunchScalar,
+        _PallasLaunchScalar,
+        _PallasLaunchScalar,
+    ]
 )
 
 
@@ -1265,6 +1272,7 @@ class PallasBackend(Backend):
                         bid_stride,
                         safe_num_blocks,
                         case_start,
+                        case_total,
                     )
                 case_start = _pallas_add_launch_values(case_start, case_total)
 
@@ -1623,11 +1631,6 @@ class PallasBackend(Backend):
             # Tensor-index atomic_add lowers to a local read/modify/write. It is
             # correct across programs only when the launcher can serialize every
             # program sharing the target BlockSpec tile.
-            if any(config.flatten_loops):
-                raise NotImplementedError(
-                    "Pallas tensor-indexed atomic_add does not support flattened "
-                    "loops without shared-output BlockSpec metadata"
-                )
             if sorted_args is None or block_spec_info is None:
                 raise NotImplementedError(
                     "Pallas tensor-indexed atomic_add requires block spec info "
@@ -1660,11 +1663,14 @@ class PallasBackend(Backend):
                         "for shared-output serialization"
                     )
                 _block_shape, grid_dims = block_info
-                if any(isinstance(grid_dim, tuple) for grid_dim in grid_dims):
+                if any(
+                    isinstance(grid_dim, tuple) and len(grid_dim) >= 4
+                    for grid_dim in grid_dims
+                ):
                     raise NotImplementedError(
                         "Pallas tensor-indexed atomic_add does not support "
-                        "ForEach or flattened grid decompositions without "
-                        "shared-output BlockSpec metadata"
+                        "ForEach grids because the current launcher cannot "
+                        "isolate case-specific output stores"
                     )
         if block_spec_info is not None:
             if has_rng_ops:
