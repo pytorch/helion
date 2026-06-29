@@ -30,6 +30,7 @@ if TYPE_CHECKING:
 
 @triton.jit
 def _wait_progress_at_idx(progress: tl.tensor, idx: int) -> None:
+    # pyrefly: ignore[bad-argument-type]
     triton_wait_signal(progress + idx, 1, 0, "acquire", "gpu", "ld", False)
 
 

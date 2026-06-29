@@ -540,7 +540,7 @@ class Backend(abc.ABC):
         """Return the RDIM block size for a statically known reduction dimension."""
         from torch._inductor.runtime.runtime_utils import next_power_of_2
 
-        return next_power_of_2(numel)
+        return max(1, next_power_of_2(numel))
 
     def dynamic_rdim_size_expr(self, expr: str) -> str:
         """Generate a host-side expression for RDIM size from a dynamic dimension.
@@ -987,6 +987,17 @@ class Backend(abc.ABC):
 class TritonBackend(Backend):
     """Triton code generation backend."""
 
+    @staticmethod
+    def _nonzero_block_shape_dims(shape_dims: Sequence[str]) -> list[str]:
+        return ["1" if dim == "0" else dim for dim in shape_dims]
+
+    @classmethod
+    def _nonzero_block_shape(cls, shape: str) -> str:
+        if not shape.startswith("[") or not shape.endswith("]"):
+            return shape
+        dims = [dim.strip() for dim in shape[1:-1].split(",") if dim.strip()]
+        return f"[{', '.join(cls._nonzero_block_shape_dims(dims))}]"
+
     @property
     def name(self) -> str:
         return "triton"
@@ -1199,6 +1210,7 @@ class TritonBackend(Backend):
         return f"tl.arange(0, {block_size_var}).to({dtype})"
 
     def zeros_expr(self, shape: str, dtype: str) -> str:
+        shape = self._nonzero_block_shape(shape)
         return f"tl.zeros({shape}, {dtype})"
 
     def reshape_expr(self, expr: str, shape: str) -> str:
@@ -1228,7 +1240,7 @@ class TritonBackend(Backend):
         return f"tl.arange(0, {block_size_var}).to({dtype})"
 
     def reduction_index_zero_expr(self, dtype: str) -> str:
-        return f"tl.zeros([0], {dtype})"
+        return f"tl.zeros([1], {dtype})"
 
     def next_power_of_2_host_expr(self, expr: str) -> str:
         return f"triton.next_power_of_2({expr})"
@@ -1368,6 +1380,7 @@ class TritonBackend(Backend):
     def full_expr(
         self, shape_dims: list[str], value_expr: str, dtype: torch.dtype
     ) -> str:
+        shape_dims = self._nonzero_block_shape_dims(shape_dims)
         return (
             f"tl.full([{', '.join(shape_dims)}], {value_expr}, {self.dtype_str(dtype)})"
         )
