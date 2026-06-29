@@ -1491,43 +1491,35 @@ class TestExamples(RefEagerTestBase, TestCase):
             block_sizes=[16, 8, 16, 16],
         )
 
-    @xfailIfPallas("Mosaic unsupported mask shape cast in HSTU")
     @skipIfXPU("Jagged tensor operations not fully supported on XPU")
     def test_jagged_hstu_attn(self):
-        batch_size = 4
+        torch.manual_seed(0)
         max_seq_len = 64
         heads = 8
         head_dim = 32
 
-        # Generate random sequence lengths
-        min_seq_len = max_seq_len // 2
-        seq_lengths = torch.randint(
-            min_seq_len,
-            max_seq_len + 1,
-            (batch_size,),
+        # Fixed partial tiles ensure padded lanes would overlap following sequences.
+        seq_lengths = torch.tensor(
+            [33, 34, 35, 36],
             dtype=torch.int32,
             device=DEVICE,
         )
         seq_offsets = torch.cat(
             [
                 torch.tensor([0], dtype=torch.int32, device=DEVICE),
-                torch.cumsum(seq_lengths, dim=0),
+                torch.cumsum(seq_lengths, dim=0).to(torch.int32),
             ]
         )
         total_seq_len = int(seq_offsets[-1].item())
 
-        # Create input tensors: [total_seq_len, heads, head_dim]
-        q = torch.randn(
+        # Use k=q and scaled values so the inclusive diagonal term is measurable.
+        q = 4 * torch.randn(
             (total_seq_len, heads, head_dim),
             dtype=torch.bfloat16,
             device=DEVICE,
         )
-        k = torch.randn(
-            (total_seq_len, heads, head_dim),
-            dtype=torch.bfloat16,
-            device=DEVICE,
-        )
-        v = torch.randn(
+        k = q.clone()
+        v = 8 * torch.randn(
             (total_seq_len, heads, head_dim),
             dtype=torch.bfloat16,
             device=DEVICE,
@@ -1536,12 +1528,28 @@ class TestExamples(RefEagerTestBase, TestCase):
         # The kernel expects: max_seq_len, alpha, q, k, v, seq_offsets
         alpha = 1.0 / v.size(2) ** 2
         args = (max_seq_len, alpha, q, k, v, seq_offsets)
+        atol = 5e-3
+        rtol = 1e-2
 
         # Import and use the reference implementation
         mod = import_path(EXAMPLES_DIR / "jagged_hstu_attn.py")
         expected = mod.reference_jagged_hstu_kernel_pytorch(
             q, k, v, seq_offsets, None, max_seq_len
         )
+        diagonal_scores = F.silu((q * k).sum(dim=-1) * alpha) / max_seq_len
+        strict_expected = expected - diagonal_scores.unsqueeze(-1).to(v.dtype) * v
+        assert not torch.allclose(
+            expected.float(),
+            torch.zeros_like(expected).float(),
+            atol=atol,
+            rtol=rtol,
+        ), "test data must fail an all-zero implementation"
+        assert not torch.allclose(
+            expected.float(),
+            strict_expected.float(),
+            atol=atol,
+            rtol=rtol,
+        ), "test data must fail an exclusive causal mask"
 
         # Patch to use core silu decomposition instead of inductor's custom decomposition from pytorch PR #171723.
         # This ensures consistent codegen both torch 2.9 (stable) and nightly versions.
@@ -1560,8 +1568,9 @@ class TestExamples(RefEagerTestBase, TestCase):
                 expected,
                 fn_name="_helion_jagged_attention_kernel",
                 block_sizes=[16, 16],
-                atol=1e-2,
-                rtol=1e-2,
+                cos_sim=CosSimilarity(dim=-1, min_similarity=0.999),
+                atol=atol,
+                rtol=rtol,
             )
 
     @parametrize(
