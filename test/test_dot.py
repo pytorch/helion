@@ -1253,8 +1253,8 @@ class TestDotPrecision(TestCase):
             ("pallas", "JAX_DEFAULT_MATMUL_PRECISION", "high", "high"),
             ("pallas", "JAX_DEFAULT_MATMUL_PRECISION", "highest", "highest"),
             ("pallas", "JAX_DEFAULT_MATMUL_PRECISION", "bfloat16", "default"),
-            ("pallas", "JAX_DEFAULT_MATMUL_PRECISION", "tensorfloat32", "high"),
-            ("pallas", "JAX_DEFAULT_MATMUL_PRECISION", "float32", "highest"),
+            ("pallas", "JAX_DEFAULT_MATMUL_PRECISION", "tensorfloat32", "default"),
+            ("pallas", "JAX_DEFAULT_MATMUL_PRECISION", "float32", "default"),
         ],
     )
     def test_env_var_overrides(
@@ -1291,7 +1291,6 @@ class TestDotPrecision(TestCase):
     _PR_TF32x3 = "input_precision='tf32x3'"
     _PR_IEEE = "input_precision='ieee'"
     _PR_DEFAULT = "precision='default'"
-    _PR_HIGHEST = "precision='highest'"
 
     @skipIfRocm("No support for tf32x3 and no tf32 in some ROCm hardware")
     @skipIfRefEager("Codegen inspection not applicable in ref eager mode")
@@ -1299,11 +1298,11 @@ class TestDotPrecision(TestCase):
         "helion_precision, expected_triton, expected_pallas",
         [
             ("default", _PR_TF32, _PR_DEFAULT),
-            ("high", _PR_TF32x3, _PR_HIGHEST),
-            ("highest", _PR_IEEE, _PR_HIGHEST),
-            ("tf32", _PR_TF32, _PR_HIGHEST),
-            ("tf32x3", _PR_TF32x3, _PR_HIGHEST),
-            ("ieee", _PR_IEEE, _PR_HIGHEST),
+            ("high", _PR_TF32x3, _PR_DEFAULT),
+            ("highest", _PR_IEEE, _PR_DEFAULT),
+            ("tf32", _PR_TF32, _PR_DEFAULT),
+            ("tf32x3", _PR_TF32x3, _PR_DEFAULT),
+            ("ieee", _PR_IEEE, _PR_DEFAULT),
         ],
     )
     def test_dot_precision_codegen(
