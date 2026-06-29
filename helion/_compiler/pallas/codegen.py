@@ -923,9 +923,13 @@ def sliced_value_for_store(
         if idx is None:
             continue
 
-        value_slice = ":"
         index_part = index_parts[index_part_idx]
         index_part_idx += 1
+        if not _index_part_produces_value_dim(index_part):
+            tensor_dim += 1
+            continue
+
+        value_slice = ":"
         if isinstance(pattern, TilePattern) and index_part == ":":
             block_size = env.block_sizes[pattern.block_id].from_config(state.config)
             dim_size = tensor.shape[tensor_dim]

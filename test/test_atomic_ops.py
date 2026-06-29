@@ -157,6 +157,38 @@ def atomic_add_tensor_index_kernel(
     return out
 
 
+@helion.kernel()
+def atomic_add_tensor_index_clamped_feature_kernel(
+    values: torch.Tensor, indices: torch.Tensor, num_nodes: int
+) -> torch.Tensor:
+    num_features = values.size(1)
+    out = torch.zeros(
+        [num_nodes, num_features], dtype=values.dtype, device=values.device
+    )
+    for tile_m, tile_n in hl.tile(values.size()):
+        hl.atomic_add(out, [indices[tile_m], tile_n], values[tile_m, tile_n])
+    return out
+
+
+def _scatter_add_dim0_expected(
+    values: torch.Tensor, indices: torch.Tensor, num_rows: int
+) -> torch.Tensor:
+    ref_values = values.cpu() if values.device.type == "tpu" else values
+    ref_indices = indices.cpu() if values.device.type == "tpu" else indices
+    output = torch.zeros(
+        (num_rows, *values.shape[1:]),
+        device=ref_values.device,
+        dtype=values.dtype,
+    )
+    scatter_indices = (
+        ref_indices.to(torch.int64)
+        .reshape(-1, *([1] * (values.ndim - 1)))
+        .expand_as(ref_values)
+    )
+    output.scatter_add_(0, scatter_indices, ref_values)
+    return output.to(values.device) if values.device.type == "tpu" else output
+
+
 # New kernels for other atomics
 
 
@@ -305,7 +337,6 @@ class TestAtomicOperations(RefEagerTestBase, TestCase):
         expected = torch.ones(8, device=DEVICE)
         torch.testing.assert_close(result, expected)
 
-    @xfailIfPallas("Integer indexing not supported on Pallas")
     def test_atomic_add_1d_tensor(self):
         M, N = 32, 64
         x = torch.randn(M, N, device=DEVICE, dtype=torch.float32)
@@ -322,8 +353,6 @@ class TestAtomicOperations(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result, expected)
 
     def test_atomic_add_tensor_index(self):
-        if _get_backend() == "pallas":
-            self.skipTest("Pallas/TPU does not support integer tensor indexing")
         values = torch.randn(64, device=DEVICE, dtype=torch.float32)
         indices = torch.randperm(64, device=DEVICE, dtype=LONG_INT_TYPE)
 
@@ -333,9 +362,43 @@ class TestAtomicOperations(RefEagerTestBase, TestCase):
             block_sizes=[32],
         )
 
-        expected = torch.zeros(64, device=DEVICE, dtype=values.dtype)
-        expected.scatter_add_(0, indices, values)
+        expected = _scatter_add_dim0_expected(values, indices, 64)
         torch.testing.assert_close(result, expected)
+
+    @onlyBackends(["pallas"])
+    def test_pallas_atomic_add_tensor_index_clamped_feature_value(self):
+        values = torch.randn(16, 17, device=DEVICE, dtype=torch.float32)
+        indices = torch.randint(0, 12, (16,), device=DEVICE, dtype=LONG_INT_TYPE)
+
+        code, result = code_and_output(
+            atomic_add_tensor_index_clamped_feature_kernel,
+            (values, indices, 12),
+            block_sizes=[16, 32],
+        )
+
+        expected = _scatter_add_dim0_expected(values, indices, 12)
+        torch.testing.assert_close(result, expected)
+        self.assertIn("one_hot", code)
+        self.assertIn("dot_general", code)
+
+    @onlyBackends(["pallas"])
+    @skipIfRefEager("Pallas-specific codegen inspection")
+    def test_pallas_tensor_index_atomic_add_one_hot_dot_lowering(self):
+        values = torch.randn(64, device=DEVICE, dtype=torch.float32)
+        indices = torch.arange(64, device=DEVICE, dtype=LONG_INT_TYPE) // 2
+
+        code, result = code_and_output(
+            atomic_add_tensor_index_kernel,
+            (values, indices),
+            block_sizes=[32],
+            pallas_loop_type="fori_loop",
+        )
+
+        expected = _scatter_add_dim0_expected(values, indices, 64)
+        torch.testing.assert_close(result, expected)
+        self.assertIn("_default_pallas_fori_launcher", code)
+        self.assertIn("one_hot", code)
+        self.assertIn("dot_general", code)
 
     def test_atomic_add_1d_tensor_with_offset_arange(self):
         if _get_backend() != "cute":

@@ -293,6 +293,34 @@ def pallas_scatter_store(values: torch.Tensor, indices: torch.Tensor) -> torch.T
     return out
 
 
+def pallas_segmented_scan_combine(
+    left_values: torch.Tensor,
+    left_indices: torch.Tensor,
+    right_values: torch.Tensor,
+    right_indices: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    same_segment = left_indices == right_indices
+    combined_values = torch.where(
+        same_segment, left_values + right_values, right_values
+    )
+    return combined_values, right_indices
+
+
+@helion.kernel(backend="pallas", static_shapes=True)
+def pallas_tuple_associative_scan(
+    values: torch.Tensor, indices: torch.Tensor
+) -> torch.Tensor:
+    out = torch.empty_like(values)
+    for tile_m, tile_n in hl.tile(values.size()):
+        vals = values[tile_m, tile_n]
+        idxs = indices[tile_m].float().unsqueeze(1).expand_as(vals)
+        out_vals, _ = hl.associative_scan(
+            pallas_segmented_scan_combine, (vals, idxs), dim=0
+        )
+        out[tile_m, tile_n] = out_vals
+    return out
+
+
 @helion.kernel(backend="pallas", static_shapes=True)
 def pallas_inner_loop_add(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     """Kernel with an outer grid loop and an inner device loop."""
@@ -531,6 +559,47 @@ def pallas_reduce_non_pow2(x: torch.Tensor) -> torch.Tensor:
         max_val = torch.amax(row, dim=-1, keepdim=True)
         exp_val = torch.exp(row - max_val)
         out[tile_n, :] = exp_val / torch.sum(exp_val, dim=-1, keepdim=True)
+    return out
+
+
+def _scatter_add_dim0_expected(
+    values: torch.Tensor, indices: torch.Tensor, num_rows: int
+) -> torch.Tensor:
+    ref_values = values.cpu() if values.device.type == "tpu" else values
+    ref_indices = indices.cpu() if values.device.type == "tpu" else indices
+    output = torch.zeros(
+        (num_rows, *values.shape[1:]),
+        device=ref_values.device,
+        dtype=values.dtype,
+    )
+    scatter_indices = (
+        ref_indices.to(torch.int64)
+        .reshape(-1, *([1] * (values.ndim - 1)))
+        .expand_as(ref_values)
+    )
+    output.scatter_add_(0, scatter_indices, ref_values)
+    return output.to(values.device) if values.device.type == "tpu" else output
+
+
+def pallas_scan_cast_kwargs_combine(
+    left_values: torch.Tensor,
+    right_values: torch.Tensor,
+) -> torch.Tensor:
+    right_values_f32 = right_values.to(torch.float32)
+    return (
+        torch.add(left_values.to(torch.float32), right_values_f32, alpha=2)
+        .sub(right_values_f32)
+        .to(torch.int32)
+    )
+
+
+@helion.kernel(backend="pallas", static_shapes=True)
+def pallas_associative_scan_cast_kwargs(x: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tile_m, tile_n in hl.tile(x.size()):
+        out[tile_m, tile_n] = hl.associative_scan(
+            pallas_scan_cast_kwargs_combine, x[tile_m, tile_n], dim=0
+        )
     return out
 
 
@@ -1663,7 +1732,7 @@ class TestPallas(TestCase):
         expected[indices.to(torch.int64)] = values
         torch.testing.assert_close(result, expected)
 
-    def test_tensor_index_atomic_add_raises(self) -> None:
+    def test_tensor_index_atomic_add(self) -> None:
         @helion.kernel(backend="pallas", static_shapes=True)
         def atomic_add_tensor_index(
             values: torch.Tensor, indices: torch.Tensor
@@ -1674,17 +1743,161 @@ class TestPallas(TestCase):
             return out
 
         values = torch.randn(16, device=DEVICE, dtype=torch.float32)
-        indices = torch.randperm(16, device=DEVICE).to(torch.int32)
+        indices = torch.tensor(
+            [0, 1, 1, 2, 4, 4, 4, 8, 8, 9, 10, 10, 12, 13, 14, 14],
+            device=DEVICE,
+            dtype=torch.int32,
+        )
+
+        code, result = code_and_output(
+            atomic_add_tensor_index,
+            (values, indices),
+            block_size=16,
+        )
+
+        expected = _scatter_add_dim0_expected(values, indices, values.size(0))
+        torch.testing.assert_close(result, expected)
+        self.assertIn("one_hot", code)
+        self.assertIn("swapaxes", code)
+        self.assertIn("dot_general", code)
+
+    def test_tensor_index_atomic_add_shared_output_tiles(self) -> None:
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def atomic_add_shared_output_tiles(
+            values: torch.Tensor, indices: torch.Tensor
+        ) -> torch.Tensor:
+            out = torch.zeros(
+                [1, values.size(1)], device=values.device, dtype=values.dtype
+            )
+            for tile_m, tile_n in hl.tile(values.size()):
+                hl.atomic_add(out, [indices[tile_m], tile_n], values[tile_m, tile_n])
+            return out
+
+        values = torch.randn(64, 8, device=DEVICE, dtype=torch.float32)
+        indices = torch.zeros(64, device=DEVICE, dtype=torch.int32)
+
+        code, result = code_and_output(
+            atomic_add_shared_output_tiles,
+            (values, indices),
+            block_sizes=[16, 8],
+        )
+
+        torch.testing.assert_close(result, values.sum(dim=0, keepdim=True))
+        self.assertIn("one_hot", code)
+        self.assertIn("_inplace_indices=", code)
+
+    def test_tensor_index_atomic_add_scalar_middle_dim(self) -> None:
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def atomic_add_scalar_middle_dim(
+            values: torch.Tensor, indices: torch.Tensor
+        ) -> torch.Tensor:
+            out = torch.zeros(
+                [12, 1, values.size(1)], device=values.device, dtype=values.dtype
+            )
+            for tile_m, tile_n in hl.tile(values.size()):
+                hl.atomic_add(
+                    out,
+                    [indices[tile_m], 0, tile_n],
+                    values[tile_m, tile_n],
+                )
+            return out
+
+        values = torch.randn(16, 17, device=DEVICE, dtype=torch.float32)
+        indices = torch.randint(0, 12, (16,), device=DEVICE, dtype=torch.int32)
+
+        code, result = code_and_output(
+            atomic_add_scalar_middle_dim,
+            (values, indices),
+            block_sizes=[16, 32],
+        )
+
+        expected = _scatter_add_dim0_expected(values.unsqueeze(1), indices, 12)
+        torch.testing.assert_close(result, expected)
+        self.assertIn("one_hot", code)
+        self.assertIn("dot_general", code)
+        self.assertNotIn("value[:, :, :17]", code)
+
+    def test_tensor_index_atomic_add_value_shape_raises(self) -> None:
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def atomic_add_bad_value_shape(
+            values: torch.Tensor, indices: torch.Tensor
+        ) -> torch.Tensor:
+            out = torch.zeros_like(values)
+            for tile_m, tile_n in hl.tile(values.size()):
+                hl.atomic_add(out, [indices[tile_m], tile_n], values[tile_m, 0])
+            return out
+
+        values = torch.randn(16, 4, device=DEVICE, dtype=torch.float32)
+        indices = torch.arange(16, device=DEVICE, dtype=torch.int32)
 
         with self.assertRaisesRegex(
-            NotImplementedError,
-            "tensor-indexed memory op is not supported for op=atomic_add",
+            helion.exc.BackendUnsupported,
+            "value shape must match indexed target shape",
         ):
             code_and_output(
-                atomic_add_tensor_index,
+                atomic_add_bad_value_shape,
                 (values, indices),
-                block_size=16,
+                block_sizes=[16, 4],
             )
+
+    def test_associative_scan_reverse_raises(self) -> None:
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def reverse_scan(values: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(values)
+            for tile_m, tile_n in hl.tile(values.size()):
+                out[tile_m, tile_n] = hl.associative_scan(
+                    torch.add, values[tile_m, tile_n], dim=0, reverse=True
+                )
+            return out
+
+        values = torch.randn(16, 4, device=DEVICE, dtype=torch.float32)
+
+        with self.assertRaisesRegex(
+            helion.exc.BackendUnsupported,
+            "reverse associative_scan",
+        ):
+            code_and_output(reverse_scan, (values,), block_sizes=[16, 4])
+
+    def test_tuple_associative_scan_segmented(self) -> None:
+        values = torch.randn(16, 4, device=DEVICE, dtype=torch.float32)
+        indices = torch.tensor(
+            [0, 0, 1, 1, 1, 3, 4, 4, 6, 7, 7, 7, 8, 10, 10, 11],
+            device=DEVICE,
+            dtype=torch.int32,
+        )
+
+        code, result = code_and_output(
+            pallas_tuple_associative_scan,
+            (values, indices),
+            block_sizes=[16, 4],
+        )
+
+        expected = torch.empty_like(values)
+        host_indices = indices.cpu()
+        for i in range(values.size(0)):
+            if i == 0 or host_indices[i].item() != host_indices[i - 1].item():
+                expected[i] = values[i]
+            else:
+                expected[i] = expected[i - 1] + values[i]
+        torch.testing.assert_close(result, expected)
+        self.assertIn("jnp.stack", code)
+        self.assertIn(".shape[0]", code)
+        self.assertNotIn(".at[", code)
+        self.assertIn("jnp.where", code)
+
+    def test_associative_scan_combine_preserves_casts_and_kwargs(self) -> None:
+        values = torch.arange(1, 65, device=DEVICE, dtype=torch.int32).reshape(16, 4)
+
+        code, result = code_and_output(
+            pallas_associative_scan_cast_kwargs,
+            (values,),
+            block_sizes=[16, 4],
+        )
+
+        expected = torch.cumsum(values, dim=0).to(values.dtype)
+        torch.testing.assert_close(result, expected)
+        self.assertIn("lax.convert_element_type", code)
+        self.assertIn("* 2", code)
 
     def test_scatter_store_multiple_tensor_indices_raises(self) -> None:
         @helion.kernel(backend="pallas", static_shapes=True)
