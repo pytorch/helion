@@ -1693,7 +1693,6 @@ class TestExamples(RefEagerTestBase, TestCase):
                     rtol=rtol,
                 )
 
-    @xfailIfPallasTpu("requires padded scalar/tile load widening")
     def test_grouped_gemm_jagged(self):
         # Build small jagged grouped GEMM inputs
         torch.manual_seed(0)
@@ -2599,7 +2598,6 @@ class TestExamples(RefEagerTestBase, TestCase):
             indexing="block_ptr",
         )
 
-    @xfailIfPallasTpu("operation not supported on TPU")
     def test_gdn_fwd_h(self):
         """Test gated delta net forward h kernel."""
         batch = 2
@@ -2622,13 +2620,8 @@ class TestExamples(RefEagerTestBase, TestCase):
             dtype=torch.float32,
             device=DEVICE,
         )
-        wu, ws, wv = torch.linalg.svd(w.permute(0, 1, 3, 2, 4), full_matrices=False)
-        w = torch.einsum("bnhik,bnhkj->bnhij", wu, wv)
-        w = (
-            w.permute(0, 1, 3, 2, 4)
-            .reshape(batch, seqlen, nheads, dhead)
-            .to(torch.bfloat16)
-        )
+        mod = import_path(EXAMPLES_DIR / "gdn_fwd_h.py")
+        w = mod._orthogonalize_w(w)
         u = torch.randn(
             batch, seqlen, nheads, dstate, dtype=torch.bfloat16, device=DEVICE
         )
@@ -2642,8 +2635,6 @@ class TestExamples(RefEagerTestBase, TestCase):
 
         args = (k, w, u, g, chunk_size)
 
-        # Import and use the reference implementation
-        mod = import_path(EXAMPLES_DIR / "gdn_fwd_h.py")
         expected = mod.ref_gdn_fwd_h(*args)
 
         check_example(
@@ -2676,10 +2667,6 @@ class TestExamples(RefEagerTestBase, TestCase):
         )
 
     @skipIfRefEager("scalar_prefetch indexing not supported in ref interpreter")
-    @xfailIfPallasTpu(
-        "unaligned data-dependent tile load; fixed later in the stack by Pallas "
-        "padded-load support (#2944)"
-    )
     def test_flex_attention(self):
         z, h, n_ctx, head_dim = 2, 4, 256, 64
         q, k, v = [

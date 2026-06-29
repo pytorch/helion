@@ -3506,6 +3506,27 @@ def _collect_memory_op_facts(
             )
             memory_op_index += 1
 
+    for node, _fact in records:
+        if operands.get(node) is None:
+            continue
+        fake = _accessed_tensor_fake(node)
+        index_list = node.args[1] if len(node.args) >= 2 else None
+        if fake is None or not isinstance(index_list, (list, tuple)):
+            continue
+        tensor_dim = 0
+        for sub in index_list:
+            if sub is None:
+                continue
+            if tensor_dim >= fake.ndim:
+                break
+            if isinstance(sub, int):
+                tensor_dim += 1
+                continue
+            env.backend.maybe_specialize_matmul_alignment_dim(
+                fake, tensor_dim, _subscript_block_id(env, sub), env
+            )
+            tensor_dim += 1
+
     facts = [fact._replace(matmul_operand=operands.get(node)) for node, fact in records]
     return facts, liveness_by_axis
 

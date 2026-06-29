@@ -31,7 +31,7 @@ _GATHER_VMEM_THRESHOLD_BYTES: int = 16 << 20  # 16 MiB
 @dataclass(frozen=True)
 class GatherPlan:
     indirect_pos: int
-    none_dims: tuple[int, ...]
+    indirect_tensor_dim: int
     jnp_dtype: str
     table_ndim: int
     index_ndim: int
@@ -42,6 +42,7 @@ class GatherPlan:
 @dataclass(frozen=True)
 class ScatterPlan:
     indirect_pos: int
+    indirect_tensor_dim: int
     jnp_dtype: str
     target_ndim: int
     index_ndim: int
@@ -63,8 +64,9 @@ def build_gather_plan(
             "Pallas gather: multiple indirect dims are not supported"
         )
     indirect_pos = indirect_positions[0]
+    indirect_tensor_dim = _tensor_dim_for_subscript_position(subscript, indirect_pos)
     emit_select = not tensor.dtype.is_floating_point
-    if emit_select and indirect_pos != 0:
+    if emit_select and indirect_tensor_dim != 0:
         raise NotImplementedError(
             "Pallas gather: integer table gather on non-zero dim is not yet supported"
         )
@@ -88,14 +90,13 @@ def build_gather_plan(
     # MXU truncates fp32 to bf16 without HIGHEST. For bf16/fp16 the truncation is a no-op.
     use_highest = tensor.dtype not in (torch.bfloat16, torch.float16)
 
-    none_dims = tuple(i for i, idx in enumerate(subscript) if idx is None)
     jnp_dtype = CompileEnvironment.current().backend.dtype_str(tensor.dtype)
     idx_element = subscript[indirect_pos]
     index_ndim = idx_element.meta["val"].ndim  # type: ignore[union-attr]
 
     return GatherPlan(
         indirect_pos=indirect_pos,
-        none_dims=none_dims,
+        indirect_tensor_dim=indirect_tensor_dim,
         jnp_dtype=jnp_dtype,
         table_ndim=tensor.ndim,
         index_ndim=index_ndim,
@@ -122,7 +123,8 @@ def build_scatter_plan(
             "Pallas scatter: multiple indirect dims are not supported"
         )
     indirect_pos = indirect_positions[0]
-    if indirect_pos != 0:
+    indirect_tensor_dim = _tensor_dim_for_subscript_position(subscript, indirect_pos)
+    if indirect_tensor_dim != 0:
         raise NotImplementedError("Pallas scatter: only indirect dim 0 is supported")
     idx_element = subscript[indirect_pos]
     index_ndim = idx_element.meta["val"].ndim  # type: ignore[union-attr]
@@ -133,6 +135,7 @@ def build_scatter_plan(
     jnp_dtype = CompileEnvironment.current().backend.dtype_str(tensor.dtype)
     return ScatterPlan(
         indirect_pos=indirect_pos,
+        indirect_tensor_dim=indirect_tensor_dim,
         jnp_dtype=jnp_dtype,
         target_ndim=tensor.ndim,
         index_ndim=index_ndim,
@@ -164,7 +167,25 @@ def emit_gather(
 
     from . import codegen as pallas_codegen
 
-    parts, _ = pallas_codegen.index_parts(state, subscript, tensor)
+    parts, none_dims = pallas_codegen.index_parts(state, subscript, tensor)
+    none_dims = [
+        dim + (plan.index_ndim - 1 if pos > plan.indirect_pos else 0)
+        for pos, dim in zip(
+            (pos for pos, index in enumerate(subscript) if index is None),
+            none_dims,
+            strict=True,
+        )
+    ]
+    parts, widened_selects, table_rank = (
+        pallas_codegen._widen_small_aligned_scalar_load_indices(
+            state, list(subscript), tensor, parts
+        )
+    )
+    table_indirect_axis = _table_indirect_axis(subscript, parts, plan.indirect_pos)
+    gather_rank = table_rank + plan.index_ndim - 1
+    widened_selects = _remap_widened_selects_after_gather(
+        widened_selects, table_indirect_axis, plan.index_ndim
+    )
     base_index = ", ".join(parts)
     table_expr = f"{name}[{base_index}]"
 
@@ -172,14 +193,19 @@ def emit_gather(
         mask_expr = (
             f"jax.nn.one_hot({idx_name}[...], {name}.shape[0], dtype={plan.jnp_dtype})"
         )
-        for _ in range(plan.table_ndim - 1):
+        for _ in range(table_rank - 1):
             mask_expr = f"jnp.expand_dims({mask_expr}, axis=-1)"
         result = expr_from_string(
             f"jnp.sum({table_expr} * {mask_expr}, "
             f"axis=jnp.ndim({idx_name}[...])"
             f").astype({plan.jnp_dtype})"
         )
-        for dim in plan.none_dims:
+        if widened_selects:
+            result = state.codegen.lift(result, dce=True, prefix="gather")
+        result = pallas_codegen._select_widened_scalar_load_indices(
+            result, widened_selects, gather_rank
+        )
+        for dim in none_dims:
             result = expr_from_string(
                 f"jnp.expand_dims({{result}}, axis={dim})", result=result
             )
@@ -194,28 +220,77 @@ def emit_gather(
         table_dot_expr = table_expr
         precision_arg = ""
 
-    p = plan.indirect_pos
     result = expr_from_string(
         "jax.lax.dot_general("
-        f"jax.nn.one_hot({idx_name}[...], {name}.shape[{p}], dtype={oh_dtype}), "
+        f"jax.nn.one_hot({idx_name}[...], "
+        f"({table_expr}).shape[{table_indirect_axis}], dtype={oh_dtype}), "
         f"{table_dot_expr}, "
-        f"(((jnp.ndim({idx_name}[...]),), ({p},)), ((), ())), "
+        f"(((jnp.ndim({idx_name}[...]),), ({table_indirect_axis},)), ((), ())), "
         "preferred_element_type=jnp.float32, "
         f"{precision_arg}"
         f").astype({plan.jnp_dtype})"
     )
-    if p > 0:
+    if table_indirect_axis > 0:
         n = plan.index_ndim
-        src = tuple(range(n, n + p))
-        dst = tuple(range(p))
+        src = tuple(range(n, n + table_indirect_axis))
+        dst = tuple(range(table_indirect_axis))
         result = expr_from_string(
             f"jnp.moveaxis({{result}}, {src}, {dst})", result=result
         )
-    for dim in plan.none_dims:
+    if widened_selects:
+        result = state.codegen.lift(result, dce=True, prefix="gather")
+    result = pallas_codegen._select_widened_scalar_load_indices(
+        result, widened_selects, gather_rank
+    )
+    for dim in none_dims:
         result = expr_from_string(
             f"jnp.expand_dims({{result}}, axis={dim})", result=result
         )
     return result
+
+
+def _table_indirect_axis(
+    subscript: list[object] | tuple[object, ...],
+    parts: list[str],
+    indirect_pos: int,
+) -> int:
+    from . import codegen as pallas_codegen
+
+    axis = 0
+    part_idx = 0
+    for pos, idx in enumerate(subscript):
+        if idx is None:
+            continue
+        part = parts[part_idx]
+        if pos == indirect_pos:
+            return axis
+        if pallas_codegen._index_part_produces_value_dim(part):
+            axis += 1
+        part_idx += 1
+    raise AssertionError(f"indirect position {indirect_pos} not found in subscript")
+
+
+def _tensor_dim_for_subscript_position(
+    subscript: list[object] | tuple[object, ...], position: int
+) -> int:
+    """Map a subscript-list position to the consumed tensor dimension."""
+    return sum(index is not None for index in subscript[:position])
+
+
+def _remap_widened_selects_after_gather(
+    widened_selects: list[tuple[int, str, int]],
+    table_indirect_axis: int,
+    index_ndim: int,
+) -> list[tuple[int, str, int]]:
+    remapped: list[tuple[int, str, int]] = []
+    for axis, index_expr, dim_size in widened_selects:
+        assert axis != table_indirect_axis
+        if axis < table_indirect_axis:
+            remapped_axis = axis
+        else:
+            remapped_axis = axis + index_ndim - 1
+        remapped.append((remapped_axis, index_expr, dim_size))
+    return remapped
 
 
 def _scatter_one_hot_name(
@@ -231,7 +306,8 @@ def _scatter_one_hot_name(
     # TODO(tcombes): investigate making the metadata into dtype,
     # currently hitting Mosaic issues with bf16 mask.
     return (
-        f"jax.nn.one_hot({idx_name}[...], {name}.shape[{plan.indirect_pos}], "
+        f"jax.nn.one_hot({idx_name}[...], "
+        f"{name}.shape[{plan.indirect_tensor_dim}], "
         "dtype=jnp.float32)"
     )
 
@@ -242,6 +318,7 @@ def emit_scatter_store(
     name: str,
     base_index: str,
     value: ast.AST,
+    none_dims: list[int],
 ) -> ast.AST:
     """Emit one Pallas program's tensor-indexed store block.
 
@@ -262,6 +339,8 @@ def emit_scatter_store(
     this Pallas program; duplicate writes from different programs have the same
     unspecified winner semantics as regular parallel stores in other backends.
     """
+    for dim in reversed(none_dims):
+        value = expr_from_string(f"jnp.squeeze({{value}}, axis={dim})", value=value)
     oh = _scatter_one_hot_name(state, plan, name)
     m = f"jnp.shape({oh})[0]"
     eye = f"jnp.eye({m}, dtype=jnp.float32)"

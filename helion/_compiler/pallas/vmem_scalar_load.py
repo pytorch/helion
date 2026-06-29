@@ -5,8 +5,8 @@ project a runtime scalar index out of either one directly. For 32-bit dtypes
 a dynamic index on the second-minor dimension is legal in the ref subscript
 itself (``ref[i, :]``); the lane dimension is then selected with a static
 index after the load. Packed dtypes and dynamic lane indices instead load
-the window, pad it to the physical tile, rotate the requested element to
-index zero, widen to a 32-bit register type, and extract statically.
+the window, widen to a 32-bit register type, pad it to the physical tile,
+rotate the requested element to index zero, and extract statically.
 
 ``classify_vmem_scalar_load`` decides whether a load needs this lowering;
 ``emit_vmem_scalar_load`` generates it.
@@ -95,6 +95,11 @@ def _static_index(index: str, extent: int) -> int | None:
         return None
 
 
+def _normalized_runtime_index(index: str, extent: int) -> str:
+    """Normalize a runtime negative index against its logical extent."""
+    return f"jnp.where(({index}) < 0, ({index}) + {extent}, {index})"
+
+
 def classify_vmem_scalar_load(
     state: CodegenState,
     tensor: torch.Tensor,
@@ -161,6 +166,9 @@ def _sublane_load_expr(
     """Emit the ref load with the runtime sublane index in the subscript."""
     lane = tensor.ndim - 1
     parts = [*index_parts]
+    for dim in load.scalar_dims:
+        if load.static_indices[dim] is None:
+            parts[dim] = _normalized_runtime_index(parts[dim], load.extents[dim])
     lane_index = load.static_indices.get(lane)
     if lane_index is not None:
         parts[lane] = ":"
@@ -176,7 +184,7 @@ def _roll_load_expr(
     index_parts: list[str],
     load: VmemScalarLoad,
 ) -> ast.AST:
-    """Emit load, pad, roll to index zero, widen, and static extraction."""
+    """Emit load, widen, pad, roll to index zero, and static extraction."""
     from helion._compiler.backend import PallasBackend
     from helion._compiler.compile_environment import CompileEnvironment
 
@@ -204,6 +212,9 @@ def _roll_load_expr(
     # operations instead of treating predicates as packed 8-bit values.
     if tensor.dtype == torch.bool:
         value = f"lax.convert_element_type({value}, jnp.int32)"
+    elif tensor.dtype.itemsize < 4:
+        widen_dtype = "jnp.float32" if tensor.dtype.is_floating_point else "jnp.int32"
+        value = f"lax.convert_element_type({value}, {widen_dtype})"
 
     selectors = [":"] * (len(window_dims) + axis_offset)
     pads = [(0, 0)] * len(selectors)
@@ -219,7 +230,8 @@ def _roll_load_expr(
         alignment = 128 if dim == tensor.ndim - 1 else sublane_tiling
         padded_extent = load.extents[dim] + (-load.extents[dim]) % alignment
         pads[axis] = (0, padded_extent - load.extents[dim])
-        rolls.append((axis, f"-({index_parts[dim]}) % {padded_extent}"))
+        index = _normalized_runtime_index(index_parts[dim], load.extents[dim])
+        rolls.append((axis, f"-({index}) % {padded_extent}"))
         selectors[axis] = "0"
     if expand_leading and rolls:
         pads[0] = (0, sublane_tiling - 1)
@@ -228,9 +240,6 @@ def _roll_load_expr(
         value = f"jnp.pad({value}, {tuple(pads)!r})"
     for axis, shift in rolls:
         value = f"pltpu.roll({value}, {shift}, axis={axis})"
-    if tensor.dtype != torch.bool and tensor.dtype.itemsize < 4:
-        widen_dtype = "jnp.float32" if tensor.dtype.is_floating_point else "jnp.int32"
-        value = f"lax.convert_element_type({value}, {widen_dtype})"
 
     result = f"{value}[{', '.join(selectors)}]"
     if _is_32bit(tensor.dtype):
