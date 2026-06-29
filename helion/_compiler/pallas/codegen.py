@@ -17,6 +17,148 @@ if TYPE_CHECKING:
     from helion._compiler.tile_strategy import DeviceLoopOrGridState
 
 
+def _select_mask_dtype(dtype: torch.dtype) -> str | None:
+    if dtype.is_floating_point:
+        if dtype is torch.float64:
+            return None
+        if dtype.itemsize == 1:
+            return "jnp.uint8"
+        if dtype.itemsize == 2:
+            return "jnp.uint16"
+        if dtype.itemsize == 4:
+            return "jnp.uint32"
+        return None
+    if dtype is torch.int8:
+        return "jnp.int8"
+    if dtype is torch.int16:
+        return "jnp.int16"
+    if dtype is torch.int32:
+        return "jnp.int32"
+    if dtype is torch.uint8:
+        return "jnp.uint8"
+    if dtype is torch.uint32:
+        return "jnp.uint32"
+    return None
+
+
+def layout_tied_bf16_mask_expr(
+    mask: ast.AST,
+    layout_anchor: ast.AST,
+) -> ast.AST:
+    """Expand a numeric predicate through a value whose layout Mosaic already knows."""
+
+    mask_value = expr_from_string(
+        "lax.convert_element_type({mask}, jnp.bfloat16)",
+        mask=mask,
+    )
+    return expr_from_string(
+        "jnp.ones_like({layout_anchor}, dtype=jnp.bfloat16) * ({mask_value})",
+        mask_value=mask_value,
+        layout_anchor=layout_anchor,
+    )
+
+
+def numeric_mask_expr(mask: ast.AST, dtype: str = "jnp.int32") -> ast.AST:
+    """Materialize a predicate as a numeric 0/1 tensor before shape relayouts."""
+
+    return expr_from_string(
+        f"jnp.minimum(({{mask}}).astype({dtype}), jnp.array(1, dtype={dtype}))",
+        mask=mask,
+    )
+
+
+def numeric_mask_reshape_expr(
+    mask: ast.AST, shape: str, dtype: str = "jnp.int32"
+) -> ast.AST:
+    """Cast a predicate to numeric, then add singleton dimensions by reshape."""
+
+    return expr_from_string(
+        f"jnp.reshape({{mask}}, {shape})",
+        mask=numeric_mask_expr(mask, dtype),
+    )
+
+
+def numeric_where_expr(
+    mask: ast.AST,
+    true_value: ast.AST,
+    false_value: ast.AST,
+    output_dtype: torch.dtype,
+    layout_anchor: ast.AST | None = None,
+) -> ast.AST | None:
+    """Select with a layout-tied numeric bit mask on TPU."""
+
+    from helion._compiler.compile_environment import CompileEnvironment
+
+    mask_dtype = _select_mask_dtype(output_dtype)
+    if mask_dtype is None:
+        return None
+    value_dtype = CompileEnvironment.current().backend.dtype_str(output_dtype)
+    if layout_anchor is None:
+        layout_anchor = true_value
+    mask_value = (
+        "lax.convert_element_type("
+        "jnp.ones_like({layout_anchor}, dtype=jnp.bfloat16) * "
+        "lax.convert_element_type({mask}, jnp.bfloat16), "
+        f"{mask_dtype})"
+    )
+    mask_bits = (
+        f"(jnp.zeros_like({{layout_anchor}}, dtype={mask_dtype}) - {mask_value})"
+    )
+    if output_dtype.is_floating_point:
+        true_bits = (
+            "lax.bitcast_convert_type("
+            f"lax.convert_element_type({{true_value}}, {value_dtype}), {mask_dtype})"
+        )
+        false_bits = (
+            "lax.bitcast_convert_type("
+            f"lax.convert_element_type({{false_value}}, {value_dtype}), {mask_dtype})"
+        )
+        return expr_from_string(
+            "lax.bitcast_convert_type("
+            "jnp.bitwise_or("
+            f"jnp.bitwise_and({mask_bits}, {true_bits}), "
+            f"jnp.bitwise_and(jnp.bitwise_not({mask_bits}), {false_bits})"
+            f"), {value_dtype})",
+            mask=mask,
+            layout_anchor=layout_anchor,
+            true_value=true_value,
+            false_value=false_value,
+        )
+    return expr_from_string(
+        "lax.convert_element_type("
+        "jnp.bitwise_or("
+        f"jnp.bitwise_and({mask_bits}, "
+        f"lax.convert_element_type({{true_value}}, {value_dtype})), "
+        f"jnp.bitwise_and(jnp.bitwise_not({mask_bits}), "
+        f"lax.convert_element_type({{false_value}}, {value_dtype}))"
+        f"), {value_dtype})",
+        mask=mask,
+        layout_anchor=layout_anchor,
+        true_value=true_value,
+        false_value=false_value,
+    )
+
+
+def numeric_mask_select_expr(
+    mask: ast.AST,
+    true_value: ast.AST,
+    false_value: ast.AST,
+    output_dtype: torch.dtype,
+    layout_anchor: ast.AST | None = None,
+) -> ast.AST:
+    selected = numeric_where_expr(
+        mask, true_value, false_value, output_dtype, layout_anchor
+    )
+    if selected is not None:
+        return selected
+    return expr_from_string(
+        "jnp.where(({mask}) != 0, {true_value}, {false_value})",
+        mask=mask,
+        true_value=true_value,
+        false_value=false_value,
+    )
+
+
 def load_expr(
     state: CodegenState,
     subscript: list[object],

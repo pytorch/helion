@@ -61,7 +61,6 @@ from .._compiler.host_function import HostFunction
 from .._compiler.indexing_strategy import SubscriptIndexing
 from .._compiler.indexing_strategy import TileWithOffsetInfo
 from .._compiler.indexing_strategy import _get_tile_with_offset_info
-from .._compiler.pallas import codegen as pallas_codegen
 from .._compiler.utils import compute_slice_size
 from .._compiler.variable_origin import GridOrigin
 from .._compiler.variable_origin import TileBeginOrigin
@@ -338,6 +337,8 @@ def _maybe_get_symbol_origin(idx: object) -> SymbolOrigin | None:
 
 @_decorators.codegen(store, "pallas")
 def _(state: CodegenState) -> None:
+    from .._compiler.pallas import codegen as pallas_codegen
+
     tensor = state.proxy_arg(0)
     subscript = state.proxy_arg(1)
     assert isinstance(subscript, (list, tuple))
@@ -375,6 +376,8 @@ def _(state: CodegenState) -> None:
     if not scatter_patterns and state.device_function.carry_tiles:
         if emit_carry_store(state, tensor, subscript, name, idx_str, value):
             return
+    if tensor.dtype is torch.bool:
+        value = CompileEnvironment.current().backend.cast_ast(value, torch.bool)
     state.codegen.add_statement(
         statement_from_string(f"{name}[{idx_str}] = {{value}}", value=value)
     )
@@ -6806,6 +6809,8 @@ def _(state: CodegenState) -> ast.AST:
 
 @_decorators.codegen(load, "pallas")
 def _(state: CodegenState) -> ast.AST:
+    from .._compiler.pallas import codegen as pallas_codegen
+
     tensor = state.proxy_arg(0)
     subscript = state.proxy_arg(1)
     assert isinstance(tensor, torch.Tensor)

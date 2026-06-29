@@ -4284,13 +4284,13 @@ class TestPallas(TestCase):
                     block_sizes=[block],
                     pallas_loop_type=loop_type,
                 )
-                # x's masked load is raw (no eager ``* mask``), feeds a transpose,
-                # and the mask reappears as a post-transpose ``jnp.where``.
+                # x's masked load is raw, feeds a transpose, and the mask
+                # reappears in the post-transpose layout.
                 producer = self._transpose_operand_producer(code)
                 self.assertIsNotNone(producer)
                 self.assertRegex(producer, r"= x\[")
                 self.assertNotIn("* mask", producer)
-                self.assertIn("jnp.where", code)
+                self.assertRegex(code, r"_mask_to = .*bitcast_convert_type")
                 # compact_worklist matches the eager reference on the partial
                 # tiles.  fori_loop miscompiles jagged tiles in pallas interpret
                 # (a pre-existing, unrelated issue), so it is not a sound numeric
@@ -4597,7 +4597,6 @@ class TestPallas(TestCase):
         inner_min = spec.block_sizes[1].min_size
         self.assertGreaterEqual(outer_min, inner_min)
 
-    @xfailIfPallasInterpret("numerical mismatch in JAX interpret mode")
     def test_boundary_mask_with_squeezed_leading_dims(self) -> None:
         """Boundary mask generation succeeds when leading dimensions are squeezed."""
 
