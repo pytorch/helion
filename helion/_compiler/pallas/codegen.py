@@ -13,6 +13,7 @@ import torch
 from helion import exc
 from helion._compiler.ast_extension import expr_from_string
 from helion._compiler.compile_environment import CompileEnvironment
+from helion._utils import is_scalar_index
 
 _FULL_LOAD_SELECT_MAX_BYTES = 256 << 10
 
@@ -20,7 +21,8 @@ if TYPE_CHECKING:
     from collections.abc import Iterator
 
     from helion._compiler.inductor_lowering import CodegenState
-    from helion._compiler.tile_strategy import DeviceLoopOrGridState
+    from helion._compiler.tile_strategy import EmitPipelineLoopState
+    from helion._compiler.tile_strategy import ForiLoopState
 
 
 def _select_mask_dtype(dtype: torch.dtype) -> str | None:
@@ -832,7 +834,7 @@ def _load_mask_expr(
 
 def _iter_dma_scratch_loops(
     state: CodegenState, name: str
-) -> Iterator[tuple[DeviceLoopOrGridState, str]]:
+) -> Iterator[tuple[EmitPipelineLoopState | ForiLoopState, str]]:
     """Yield ``(loop, scratch_ref_name)`` for every active loop that DMA-routes
     ``name`` through a VMEM scratch."""
     from helion._compiler.tile_strategy import EmitPipelineLoopState
@@ -841,14 +843,14 @@ def _iter_dma_scratch_loops(
     for loops in state.codegen.active_device_loops.values():
         for loop in loops:
             if isinstance(loop, (EmitPipelineLoopState, ForiLoopState)):
-                mapping = getattr(loop, "_tensor_to_dma_scratch", None)
-                if mapping and name in mapping:
+                mapping = loop._tensor_to_dma_scratch
+                if name in mapping:
                     yield loop, mapping[name]
 
 
 def _find_dma_scratch_loop(
     state: CodegenState, name: str
-) -> tuple[DeviceLoopOrGridState | None, str]:
+) -> tuple[EmitPipelineLoopState | ForiLoopState | None, str]:
     """Find the active loop that DMA-routes ``name`` and its scratch ref.
 
     Returns ``(loop, scratch_ref_name)`` for the first matching active loop, or
@@ -1026,10 +1028,10 @@ def index_parts(
     # their outer BlockSpec and fall through to pl.ds().
     tensor_name = state.codegen.device_function.tensor_arg(tensor).name
     in_pipeline = False
-    pipeline_block_ids: set[int] = set()
+    dma_block_ids: set[int] = set()
     for loop, _ref in _iter_dma_scratch_loops(state, tensor_name):
         in_pipeline = True
-        pipeline_block_ids.update(loop.block_ids)
+        dma_block_ids.update(loop._tensor_to_dma_block_ids[tensor_name])
 
     # Use pre-computed indexing patterns from plan_tiling analysis
     indexing_patterns = _get_indexing_patterns(state, tensor)
@@ -1048,7 +1050,7 @@ def index_parts(
 
         # Generate code based on the pattern type
         index_code = _generated_index_code(
-            pattern, idx, state, tensor, i, tensor_dim, in_pipeline, pipeline_block_ids
+            pattern, idx, state, tensor, i, tensor_dim, in_pipeline, dma_block_ids
         )
         parts.append(index_code)
 
@@ -1066,16 +1068,97 @@ def _get_indexing_patterns(state: CodegenState, tensor: torch.Tensor) -> list[ob
     return patterns
 
 
+def _pipeline_scalar_dim_is_local(
+    state: CodegenState,
+    tensor: torch.Tensor,
+    tensor_dim: int,
+) -> bool:
+    """Whether a pipelined ref made this scalar tensor dimension local.
+
+    Pipeline BlockSpecs / DMA copies can shrink an arbitrary scalar dimension
+    to extent 1, in which case the body must index that local ref at 0.  If the
+    same dimension is also accessed through a tile or full slice in this loop,
+    the merged DMA ref keeps a non-scalar extent and the original scalar index
+    must be preserved.
+    """
+
+    if state.fx_node is None:
+        return False
+
+    access_count = 0
+    dynamic_scalar_count = 0
+    static_index: int | None = None
+    for node in state.fx_node.graph.nodes:
+        if not node.meta.get("indexing_patterns"):
+            continue
+        if not _node_indexes_tensor(node, tensor):
+            continue
+        idx = _node_tensor_dim_index(node, tensor_dim)
+        if idx is _MISSING_INDEX:
+            return False
+        if not is_scalar_index(idx):
+            return False
+        access_count += 1
+        if isinstance(idx, int):
+            if static_index is None:
+                static_index = idx
+            elif static_index != idx:
+                return False
+        else:
+            dynamic_scalar_count += 1
+
+    if access_count == 0:
+        return False
+    if dynamic_scalar_count:
+        return access_count == 1
+    return True
+
+
+_MISSING_INDEX = object()
+
+
+def _node_indexes_tensor(node: torch.fx.Node, tensor: torch.Tensor) -> bool:
+    if len(node.args) < 2:
+        return False
+    tensor_node = node.args[0]
+    if not isinstance(tensor_node, torch.fx.Node):
+        return False
+    tensor_val = tensor_node.meta.get("val")
+    return isinstance(tensor_val, torch.Tensor) and id(tensor_val) == id(tensor)
+
+
+def _node_tensor_dim_index(
+    node: torch.fx.Node,
+    tensor_dim: int,
+) -> object:
+    subscript = node.args[1]
+    if not isinstance(subscript, (list, tuple)):
+        return _MISSING_INDEX
+    current_dim = 0
+    for idx in subscript:
+        if isinstance(idx, torch.fx.Node):
+            idx = idx.meta.get("val", idx)
+        if idx is None:
+            continue
+        if current_dim == tensor_dim:
+            return idx
+        current_dim += 1
+    return _MISSING_INDEX
+
+
 def _arbitrary_index_pattern_code(
-    pattern: object,
     idx: object,
     state: CodegenState,
+    tensor: torch.Tensor,
     subscript_index: int,
+    tensor_dim: int,
     in_pipeline: bool,
 ) -> str:
-    from helion._utils import is_scalar_index
-
-    if in_pipeline and is_scalar_index(idx):
+    if (
+        in_pipeline
+        and is_scalar_index(idx)
+        and _pipeline_scalar_dim_is_local(state, tensor, tensor_dim)
+    ):
         return "0"
     if isinstance(idx, int):
         return str(idx)
@@ -1090,7 +1173,7 @@ def _generated_index_code(
     subscript_index: int,
     tensor_dim: int,
     in_pipeline: bool,
-    pipeline_block_ids: set[int],
+    dma_block_ids: set[int],
 ) -> str:
     """Generate index code based on the indexing pattern."""
     from helion._compiler.pallas.plan_tiling import ArbitraryIndexPattern
@@ -1103,17 +1186,17 @@ def _generated_index_code(
 
     if isinstance(pattern, TilePattern):
         return _tile_pattern_code(
-            pattern, idx, state, tensor, tensor_dim, in_pipeline, pipeline_block_ids
+            pattern, idx, state, tensor, tensor_dim, in_pipeline, dma_block_ids
         )
 
     if isinstance(pattern, TileIndexWithOffsetPattern):
         return _tile_index_with_offset_pattern_code(
-            pattern, state, tensor, tensor_dim, in_pipeline, pipeline_block_ids
+            pattern, state, tensor, tensor_dim, in_pipeline, dma_block_ids
         )
 
     if isinstance(pattern, TileBeginWithOffsetPattern):
         return _tile_begin_with_offset_pattern_code(
-            pattern, state, subscript_index, tensor_dim, in_pipeline, pipeline_block_ids
+            pattern, state, subscript_index, tensor_dim, in_pipeline, dma_block_ids
         )
 
     if isinstance(pattern, ArbitrarySlicePattern):
@@ -1121,7 +1204,7 @@ def _generated_index_code(
 
     if isinstance(pattern, ArbitraryIndexPattern):
         return _arbitrary_index_pattern_code(
-            pattern, idx, state, subscript_index, in_pipeline
+            idx, state, tensor, subscript_index, tensor_dim, in_pipeline
         )
 
     if isinstance(pattern, IndirectGatherPattern):
@@ -1150,7 +1233,7 @@ def _tile_pattern_code(
     tensor: torch.Tensor,
     tensor_dim: int,
     in_pipeline: bool,
-    pipeline_block_ids: set[int],
+    dma_block_ids: set[int],
 ) -> str:
     from helion._compiler.pallas.plan_tiling import TilePattern
     from helion._compiler.tile_strategy import DeviceLoopState
@@ -1167,7 +1250,7 @@ def _tile_pattern_code(
     # TODO(yifeixu): the long-term fix is making ``can_tile`` per-loop-scope
     # instead of per-tensor-dim so the planner doesn't mark this dim
     # untileable in pipeline mode in the first place.
-    if in_pipeline:
+    if in_pipeline and block_id in dma_block_ids:
         return ":"
 
     can_tile = _can_tile_dimension(state, tensor_dim)
@@ -1192,7 +1275,7 @@ def _tile_index_with_offset_pattern_code(
     tensor: torch.Tensor,
     tensor_dim: int,
     in_pipeline: bool,
-    pipeline_block_ids: set[int],
+    dma_block_ids: set[int],
 ) -> str:
     from helion._compiler.pallas.plan_tiling import TileIndexWithOffsetPattern
 
@@ -1209,7 +1292,7 @@ def _tile_begin_with_offset_pattern_code(
     subscript_index: int,
     tensor_dim: int,
     in_pipeline: bool,
-    pipeline_block_ids: set[int],
+    dma_block_ids: set[int],
 ) -> str:
     from helion._compiler.pallas.plan_tiling import TileBeginWithOffsetPattern
     from helion._compiler.tile_strategy import DeviceLoopState
@@ -1219,7 +1302,7 @@ def _tile_begin_with_offset_pattern_code(
     block_id = pattern.block_id
     offset_str = state.device_function.literal_expr(pattern.offset)
 
-    if in_pipeline and block_id in pipeline_block_ids:
+    if in_pipeline and block_id in dma_block_ids:
         return offset_str
 
     can_tile = _can_tile_dimension(state, tensor_dim)
