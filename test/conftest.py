@@ -1,7 +1,27 @@
 from __future__ import annotations
 
+import glob
 import os
+from pathlib import Path
 import warnings
+
+
+def pytest_sessionfinish(session: object, exitstatus: object) -> None:
+    # TEMPORARY DEBUG (DO NOT MERGE): surface the per-worker softmax crash logs
+    # written by test/test_autodiff.py so they appear in CI output even when an
+    # xdist worker dies without returning its captured output. Remove with the
+    # debug block in test_autodiff.py once the flaky crash is root-caused.
+    debug_dir = os.environ.get("HELION_SOFTMAX_DEBUG_DIR", "/tmp")
+    for pattern in ("helion_softmax_debug_*.log", "helion_softmax_fault_*.log"):
+        for path in sorted(glob.glob(os.path.join(debug_dir, pattern))):
+            try:
+                data = Path(path).read_text().strip()
+            except OSError:
+                continue
+            if data:
+                print(
+                    f"\n===== {path} =====\n{data}\n===== end {path} =====", flush=True
+                )
 
 
 def pytest_configure() -> None:

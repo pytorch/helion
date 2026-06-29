@@ -25,6 +25,65 @@ for _utf8_locale in ("C.UTF-8", "en_US.UTF-8", "C.utf8", "en_US.utf8"):
         continue
 
 
+# ===========================================================================
+# TEMPORARY DEBUG (DO NOT MERGE): diagnose the flaky xdist worker crash in
+# test_example_softmax on Python 3.14 / A10G. The worker dies with no traceback
+# ("node down: Not properly terminated"); we suspect an unsafe fork() from a
+# multi-threaded, CUDA-initialized process. This instrumentation:
+#   * dumps the native + all-thread Python stack on a fatal signal (SIGSEGV/...)
+#   * logs every os.fork() with thread count, CUDA-init state, and the call stack
+# Output is written to per-pid files under HELION_SOFTMAX_DEBUG_DIR (default /tmp)
+# AND to fd 2 (bypassing pytest capture). conftest.pytest_sessionfinish prints
+# the files so they survive a worker crash. Tracking: <fill in issue>.
+# Remove this whole block (and the conftest hook) once root-caused.
+# ===========================================================================
+import contextlib as _contextlib  # noqa: E402
+import faulthandler as _faulthandler  # noqa: E402
+import os as _os  # noqa: E402
+import threading as _threading  # noqa: E402
+import traceback as _traceback  # noqa: E402
+
+_SOFTMAX_DEBUG_DIR = _os.environ.get("HELION_SOFTMAX_DEBUG_DIR", "/tmp")
+
+
+def _softmax_debug(msg: str) -> None:
+    line = f"[SOFTMAX-DEBUG pid={_os.getpid()}] {msg}\n"
+    path = _os.path.join(_SOFTMAX_DEBUG_DIR, f"helion_softmax_debug_{_os.getpid()}.log")
+    with _contextlib.suppress(OSError), open(path, "a") as f:
+        f.write(line)
+        f.flush()
+    with _contextlib.suppress(OSError):
+        _os.write(2, line.encode())  # bypass pytest output capture
+
+
+try:
+    _softmax_fault_fp = open(
+        _os.path.join(_SOFTMAX_DEBUG_DIR, f"helion_softmax_fault_{_os.getpid()}.log"),
+        "w",
+    )
+    _faulthandler.enable(file=_softmax_fault_fp, all_threads=True)
+except OSError:
+    _faulthandler.enable(all_threads=True)
+
+
+def _softmax_debug_at_fork() -> None:
+    try:
+        import torch
+
+        cuda_state = f"initialized={torch.cuda.is_initialized()}"
+    except Exception as e:
+        cuda_state = f"unknown({e!r})"
+    threads = [t.name for t in _threading.enumerate()]
+    _softmax_debug(
+        f"os.fork() BEFORE: nthreads={len(threads)} cuda_{cuda_state} threads={threads}"
+    )
+    _softmax_debug("fork call stack:\n" + "".join(_traceback.format_stack()))
+
+
+_os.register_at_fork(before=_softmax_debug_at_fork)
+# ===================== END TEMPORARY DEBUG =====================
+
+
 @skipIfMTIA("autodiff not tested on MTIA")
 @skipIfNotTriton("autodiff not tested on non Triton backends")
 @skipIfXPU("autodiff scan-path backward aborts in torch scan-HOP autograd on XPU")
@@ -1211,13 +1270,23 @@ class TestAutodiff(RefEagerTestDisabled, TestCase):
     def test_example_softmax(self):
         from examples.softmax import softmax
 
-        # examples/softmax.py uses check(4096, 2560)
-        self._check_backward(
-            softmax,
-            lambda x: torch.nn.functional.softmax(x, dim=-1),
-            1,
-            shape=(256, 160),
+        # TEMPORARY DEBUG (DO NOT MERGE): see block at top of file.
+        _softmax_debug(
+            f"ENTER test_example_softmax: nthreads={_threading.active_count()} "
+            f"cuda_initialized={torch.cuda.is_initialized()} "
+            f"TORCHINDUCTOR_COMPILE_THREADS={_os.environ.get('TORCHINDUCTOR_COMPILE_THREADS')!r} "
+            f"start_method={__import__('multiprocessing').get_start_method(allow_none=True)!r}"
         )
+        try:
+            # examples/softmax.py uses check(4096, 2560)
+            self._check_backward(
+                softmax,
+                lambda x: torch.nn.functional.softmax(x, dim=-1),
+                1,
+                shape=(256, 160),
+            )
+        finally:
+            _softmax_debug("EXIT test_example_softmax (reached finally)")
 
     def test_example_batch_softmax(self):
         from examples.batch_softmax import batch_softmax
