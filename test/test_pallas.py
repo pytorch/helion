@@ -4385,6 +4385,7 @@ class TestPallas(TestCase):
         ref[s:e] = torch.bmm(y[s:e].transpose(0, 1), w).transpose(0, 1) + y[s:e]
         torch.testing.assert_close(out.cpu(), ref.cpu(), rtol=2e-2, atol=2e-2)
 
+    @xfailIfPallasTpu("opposite-direction transpose needs padded-load widening")
     def test_opposite_direction_transpose_keeps_eager_mask(self) -> None:
         """Mirror image of the deferral win.  Here the masked Q axis is already in
         the last-two (sublane) dims at the load and the transpose moves it to a

@@ -56,6 +56,30 @@ class ArbitrarySlicePattern(IndexingPattern):
     slice: slice
 
 
+def _is_full_slice(idx: slice) -> bool:
+    return idx.start is None and idx.stop is None and idx.step in (None, 1)
+
+
+def _static_slice_bound(value: object, env: CompileEnvironment) -> int | None:
+    if value is None:
+        return None
+    if isinstance(value, int):
+        return value if value >= 0 else None
+    if isinstance(value, torch.SymInt):
+        expr = env.specialize_expr(env.shape_env.replace(value._sympy_()))
+        if isinstance(expr, sympy.Integer) and expr >= 0:
+            return int(expr)
+    return None
+
+
+def _is_static_contiguous_slice(idx: slice, env: CompileEnvironment) -> bool:
+    if idx.step not in (None, 1):
+        return False
+    return (idx.start is None or _static_slice_bound(idx.start, env) is not None) and (
+        idx.stop is None or _static_slice_bound(idx.stop, env) is not None
+    )
+
+
 @dataclass
 class ArbitraryIndexPattern(IndexingPattern):
     index: int | torch.SymInt | object | None
@@ -91,10 +115,12 @@ class DimensionTiling:
 
     can_tile: whether or not we can tile this dimension
     block_ids: which which block_ids we are indexing this dimension (there can be multiple, in which case we mustn't tile)
+    needs_full_slice: whether this dimension is also read as a full slice
     """
 
     can_tile: bool = True
     block_ids: list[int] = field(default_factory=list)
+    needs_full_slice: bool = False
 
 
 def plan_tiling(
@@ -261,9 +287,9 @@ def _detect_indexing_pattern(
         return ArbitraryIndexPattern(idx)
 
     if isinstance(idx, slice):
-        if idx != slice(None):
+        if not _is_static_contiguous_slice(idx, env):
             raise AssertionError(
-                f"Arbitrary slice expr {slice} not supported in Pallas backend yet"
+                f"Only static contiguous slices are supported in Pallas backend, got {idx}"
             )
         return ArbitrarySlicePattern(idx)
 
@@ -295,6 +321,13 @@ def _update_tiling_decision(
                 # we already need to tile this dim using a different block_id
                 # so fallback to no-tiling so that we can access using both tiles
                 _disallow_tiling()
+        if curr_dim_tiling.needs_full_slice:
+            _disallow_tiling()
+
+    def _record_full_slice() -> None:
+        curr_dim_tiling.needs_full_slice = True
+        if curr_dim_tiling.block_ids:
+            _disallow_tiling()
 
     if isinstance(pattern, TilePattern):
         _try_set_tiling_block_id(pattern.block_id)
@@ -313,7 +346,9 @@ def _update_tiling_decision(
                 _disallow_tiling()
 
     elif isinstance(pattern, ArbitrarySlicePattern):
-        if pattern.slice != slice(None):
+        if _is_full_slice(pattern.slice):
+            _record_full_slice()
+        else:
             # fow now we only support the `[:]` slice pattern
             _disallow_tiling()
 

@@ -1055,6 +1055,34 @@ def _detect_outer_block_bound(
     return None
 
 
+def _detect_owner_relative_outer_block_bound(
+    begin: object,
+    end: object,
+) -> int | None:
+    """Return the owner block when bounds are exactly ``owner.begin/end``."""
+    from .variable_origin import TileBeginOrigin
+    from .variable_origin import TileEndOrigin
+
+    def exact_origin(value: object) -> Origin | None:
+        if not isinstance(value, torch.SymInt):
+            return None
+        expr = _symint_expr(value)
+        if expr is None:
+            return None
+        symbol_origin = HostFunction.current().expr_to_origin.get(expr)
+        return symbol_origin.origin if symbol_origin is not None else None
+
+    begin_origin = exact_origin(begin)
+    end_origin = exact_origin(end)
+    if (
+        isinstance(begin_origin, TileBeginOrigin)
+        and isinstance(end_origin, TileEndOrigin)
+        and begin_origin.block_id == end_origin.block_id
+    ):
+        return begin_origin.block_id
+    return None
+
+
 class TileIndexType(TypeInfo):
     block_id: int
 
@@ -1082,12 +1110,14 @@ class TileIndexType(TypeInfo):
         numel: int | torch.SymInt | AutoSize | None,
         origin: Origin,
         block_size: int | torch.SymInt | None = None,
+        owner_relative_bounded_by_block_id: int | None = None,
     ) -> TileIndexType:
         env = CompileEnvironment.current()
         if block_size is None:
             block_id = env.allocate_block_size(numel, source=LoopSpecBlockSizeSource())
             outer_max: int | None = None
             bounded_by: int | None = None
+            owner_relative_bounded_by: int | None = None
             if isinstance(numel, torch.SymInt):
                 maybe_bounded_by = _detect_outer_block_bound(numel, env)
                 if maybe_bounded_by is not None:
@@ -1100,12 +1130,15 @@ class TileIndexType(TypeInfo):
                     else:
                         bounded_by = maybe_bounded_by
                         outer_max = outer_spec.max_size
+                        if owner_relative_bounded_by_block_id == maybe_bounded_by:
+                            owner_relative_bounded_by = maybe_bounded_by
             env.config_spec.block_sizes.append(
                 BlockSizeSpec(
                     block_id=block_id,
                     size_hint=_get_hint(numel),
                     max_size=outer_max,
                     bounded_by_block_id=bounded_by,
+                    owner_relative_bounded_by_block_id=owner_relative_bounded_by,
                 )
             )
             if env.config_spec.supports_config_key("num_threads"):
