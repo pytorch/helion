@@ -22,6 +22,7 @@ from helion._testing import TestCase
 from helion._testing import code_and_output
 from helion._testing import onlyBackends
 from helion._testing import skipIfPallasInterpret
+from helion._testing import skipIfRefEager
 from helion._testing import skipUnlessPallas
 from helion._testing import xfailIfPallas
 from helion._testing import xfailIfPallasInterpret
@@ -630,6 +631,43 @@ def kernel_tile_begin_plus_offset_is_elementwise(
     return out
 
 
+class TestPallasBoolExpandCodegen(TestCase):
+    @skipIfRefEager("Pallas codegen inspection requires compilation")
+    @skipUnlessPallas("JAX/Pallas not available")
+    def test_bool_expand_leading_singleton_uses_compacted_source_shape(self) -> None:
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def pallas_bool_expand_leading_singleton_where(
+            x: torch.Tensor, y: torch.Tensor
+        ) -> torch.Tensor:
+            m, n, k_dim = x.size()
+            out = torch.empty_like(y)
+            for tile_m, tile_n in hl.tile([m, n]):
+                mask = x[tile_m, tile_n, :] > 0
+                mask = mask.expand(
+                    y.size(0), tile_m.block_size, tile_n.block_size, k_dim
+                )
+                out[:, tile_m, tile_n, :] = torch.where(
+                    mask, y[:, tile_m, tile_n, :], 0.0
+                )
+            return out
+
+        x = torch.randn(16, 128, 4)
+        y = torch.randn(2, 16, 128, 4)
+
+        code = pallas_bool_expand_leading_singleton_where.bind((x, y)).to_code(
+            helion.Config(block_sizes=[16, 128], flatten_loop=True)
+        )
+
+        self.assertRegex(
+            code,
+            r"jnp\.reshape\([^\n]+, \[1, _BLOCK_SIZE_0_1, 4\]\)",
+        )
+        self.assertNotRegex(
+            code,
+            r"jnp\.reshape\([^\n]+, \[1, _BLOCK_SIZE_0_1\]\)",
+        )
+
+
 @onlyBackends(["triton", "pallas"])
 @skipUnlessPallas("JAX/Pallas TPU not available")
 class TestPallas(TestCase):
@@ -1101,7 +1139,10 @@ class TestPallas(TestCase):
 
         expected = torch.where(x[:, :1] > 0, x, torch.zeros_like(x))
         torch.testing.assert_close(result, expected)
-        self.assertIn("astype(jnp.int32)", code)
+        self.assertRegex(
+            code,
+            r"(?:\.astype\(jnp\.int32\)|lax\.convert_element_type\([^\n]+,\s*jnp\.int32\))",
+        )
 
     def test_indirect_gather_with_tiled_dim(self) -> None:
         @helion.kernel(backend="pallas", static_shapes=True)
@@ -4415,13 +4456,13 @@ class TestPallas(TestCase):
                     block_sizes=[block],
                     pallas_loop_type=loop_type,
                 )
-                # x's masked load is raw (no eager ``* mask``), feeds a transpose,
-                # and the mask reappears as a post-transpose ``jnp.where``.
+                # x's masked load is raw, feeds a transpose, and the mask
+                # reappears in the post-transpose layout.
                 producer = self._transpose_operand_producer(code)
                 self.assertIsNotNone(producer)
                 self.assertRegex(producer, r"= x\[")
                 self.assertNotIn("* mask", producer)
-                self.assertIn("jnp.where", code)
+                self.assertRegex(code, r"_mask_to = .*bitcast_convert_type")
                 # compact_worklist matches the eager reference on the partial
                 # tiles.  fori_loop miscompiles jagged tiles in pallas interpret
                 # (a pre-existing, unrelated issue), so it is not a sound numeric

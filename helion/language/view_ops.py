@@ -106,6 +106,39 @@ def _(state: CodegenState) -> ast.AST:
     )
 
 
+@_decorators.codegen(subscript, "pallas")
+def _(state: CodegenState) -> ast.AST:
+    output_keys = []
+    has_new_axis = False
+    # pyrefly: ignore [not-iterable]
+    for val in state.proxy_arg(1):
+        if val is None:
+            output_keys.append("None")
+            has_new_axis = True
+        elif isinstance(val, slice) and repr(val) == "slice(None, None, None)":
+            output_keys.append(":")
+        else:
+            raise exc.InvalidIndexingType(repr(val))
+
+    output_index = ", ".join(output_keys)
+    tensor = state.proxy_arg(0)
+    if has_new_axis and isinstance(tensor, torch.Tensor) and tensor.dtype is torch.bool:
+        from .._compiler.pallas import codegen as pallas_codegen
+
+        # Mosaic cannot reshape bool vectors directly. Keep shaped masks numeric
+        # until a predicate consumer needs bool; those consumers compare the
+        # numeric 0/1 mask with != 0 at the boundary.
+        output = state.fake_value
+        assert isinstance(output, torch.Tensor)
+        shape = state.tile_strategy.shape_str([*output.size()])
+        return pallas_codegen.numeric_mask_reshape_expr(state.ast_arg(0), shape)
+
+    return expr_from_string(
+        f"{{base}}[{output_index}]",
+        base=state.ast_arg(0),
+    )
+
+
 @_decorators.codegen(subscript, "cute")
 def _(state: CodegenState) -> ast.AST:
     # CuTe kernels currently execute scalarized pointwise code, so shape-only
