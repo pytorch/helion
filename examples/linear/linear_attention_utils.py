@@ -30,6 +30,12 @@ def rel_error(a: torch.Tensor | None, b: torch.Tensor | None) -> float:
     ).item()
 
 
+# Thresholds for the dashboard's helion_accuracy gate: Helion's relative L2
+# error vs the fp32 PyTorch reference. 
+ACC_FWD_TOL = 0.02
+ACC_BWD_TOL = 0.05
+
+
 def head_to_time_first(x: torch.Tensor) -> torch.Tensor:
     """Head-first [B,H,T,...] -> time-first [B,T,H,...] for FLA."""
     return x.transpose(1, 2).contiguous()

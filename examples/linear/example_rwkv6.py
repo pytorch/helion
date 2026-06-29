@@ -18,6 +18,8 @@ from triton.testing import do_bench
 from .linear_attention_engine import LinearAttentionEngine
 from .linear_attention_engine import chunked_linear_attn
 from .linear_attention_engine import recurrent_step
+from .linear_attention_utils import ACC_BWD_TOL
+from .linear_attention_utils import ACC_FWD_TOL
 from .linear_attention_utils import chunked_linear_attn_reference
 from .linear_attention_utils import head_to_time_first as _htf
 from .linear_attention_utils import naive_recurrent_reference
@@ -136,15 +138,22 @@ def test() -> None:
     print("All tests passed.")
 
 
-def benchmark() -> None:
-    """Benchmark RWKV-6 forward+backward, comparing against FLA chunk_rwkv6."""
+def benchmark(
+    configs: list | None = None,
+) -> list[tuple[str, float, float, float, float]]:
+    """Benchmark RWKV-6 forward+backward, comparing against FLA chunk_rwkv6.
+
+    Returns one (config, helion_fwd_ms, fla_fwd_ms, helion_fb_ms, fla_fb_ms)
+    row per config; empty when fla is unavailable.
+    """
+    rows: list[tuple[str, float, float, float, float]] = []
     try:
         from fla.ops.rwkv6 import chunk_rwkv6 as _fn  # pyrefly: ignore
 
         chunk_rwkv6: Any = _fn
     except ImportError:
         warnings.warn("fla not installed, skipping benchmark", stacklevel=1)
-        return
+        return rows
 
     print(
         f"{'Config':<24} {'Helion fwd':>10} {'FLA fwd':>10}"
@@ -152,7 +161,7 @@ def benchmark() -> None:
     )
     print("-" * 72)
 
-    for bi, hi, ti, di, dvi in BENCH_CONFIGS:
+    for bi, hi, ti, di, dvi in configs if configs is not None else BENCH_CONFIGS:
         q = torch.randn(bi, hi, ti, di, device=DEVICE, dtype=DTYPE, requires_grad=True)
         k = torch.randn(bi, hi, ti, di, device=DEVICE, dtype=DTYPE, requires_grad=True)
         v = torch.randn(bi, hi, ti, dvi, device=DEVICE, dtype=DTYPE, requires_grad=True)
@@ -236,6 +245,55 @@ def benchmark() -> None:
             f"{cfg:<24} {fwd_ms:>10.3f} {fla_fwd_ms:>10.3f}"
             f" {fb_ms:>12.3f} {fla_fb_ms:>12.3f}"
         )
+        rows.append((cfg, fwd_ms, fla_fwd_ms, fb_ms, fla_fb_ms))
+
+    return rows
+
+
+def accuracy(
+    configs: list | None = None,
+) -> list[tuple[bool, bool]]:
+    """Per-config (fwd_ok, bwd_ok) verdicts vs the fp32 PyTorch reference.
+
+    RWKV-6 applies an output gate, so both forward and backward compare the
+    gated output (chunked_linear_attn(...) * gate) against the gated reference,
+    matching the engine. Backward compares autograd gradients against the
+    chunked reference. Drives the dashboard's helion_accuracy metric, so it runs
+    at the benchmark shapes.
+    """
+    verdicts: list[tuple[bool, bool]] = []
+    for bi, hi, ti, di, dvi in configs if configs is not None else BENCH_CONFIGS:
+        q = torch.randn(bi, hi, ti, di, device=DEVICE, dtype=DTYPE)
+        k = torch.randn(bi, hi, ti, di, device=DEVICE, dtype=DTYPE)
+        v = torch.randn(bi, hi, ti, dvi, device=DEVICE, dtype=DTYPE)
+        g = -torch.rand(bi, hi, ti, di, device=DEVICE, dtype=DTYPE).abs() * 0.1
+        gate = torch.sigmoid(torch.randn(bi, hi, ti, dvi, device=DEVICE, dtype=DTYPE))
+
+        out = chunked_linear_attn(q, k, v, g, C=BENCH_C) * gate
+        ref = naive_recurrent_reference(q, k, v, g) * gate
+        fwd_ok = _rel_error(out, ref) < ACC_FWD_TOL
+
+        # Backward is isolated so a backward failure leaves the forward verdict
+        # intact (bwd_ok stays False, the "<variant>-bwd" row reports it).
+        bwd_ok = False
+        try:
+            grad_out = torch.randn(bi, hi, ti, dvi, device=DEVICE, dtype=DTYPE)
+            hl = [x.detach().requires_grad_(True) for x in (q, k, v)]
+            (chunked_linear_attn(hl[0], hl[1], hl[2], g, C=BENCH_C) * gate).backward(
+                grad_out
+            )
+            rl = [x.detach().requires_grad_(True) for x in (q, k, v)]
+            (
+                chunked_linear_attn_reference(rl[0], rl[1], rl[2], g, C=BENCH_C) * gate
+            ).backward(grad_out)
+            bwd_ok = all(
+                _rel_error(h.grad, r.grad) < ACC_BWD_TOL
+                for h, r in zip(hl, rl, strict=True)
+            )
+        except Exception:
+            torch.cuda.empty_cache()
+        verdicts.append((fwd_ok, bwd_ok))
+    return verdicts
 
 
 def main() -> None:
