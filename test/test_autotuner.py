@@ -571,6 +571,50 @@ class TestAutotuneIgnoreErrors(TestCase):
         self.assertEqual(calls, [[0, 1]])
         self.assertEqual([idx for idx, _ in candidates], [0, 1])
 
+    def test_benchmarked_members_survive_config_mutation(self):
+        # Regression test: _benchmarked_members / _pinned_finalist_members must
+        # not be keyed by Config objects. Config is mutable and hashes on its
+        # contents, so mutating a recorded config in place (as normalize /
+        # neighbor generation does during the search) corrupted the bookkeeping
+        # -> _prune_benchmarked_members raised KeyError, and final verification
+        # could select a config that was never accuracy-validated.
+        search = DifferentialEvolutionSearch.__new__(DifferentialEvolutionSearch)
+        search._benchmarked_members = {}
+        search._pinned_finalist_configs = set()
+        search._pinned_finalist_members = {}
+
+        def make_member(perf: float, num_warps: int) -> PopulationMember:
+            return PopulationMember(
+                lambda *a, **k: None,
+                [perf],
+                [],
+                helion.Config(block_sizes=[64], num_warps=num_warps),
+                status="ok",
+            )
+
+        fast = make_member(1.0, num_warps=4)
+        slow = make_member(2.0, num_warps=8)
+        search._record_best_member_for_config(
+            search._benchmarked_members, fast.config, fast
+        )
+        search._record_best_member_for_config(
+            search._benchmarked_members, slow.config, slow
+        )
+
+        # Mutate the original configs in place *after* they were recorded.
+        fast.config.config["num_warps"] = 999
+        slow.config.config["num_warps"] = 999
+
+        # Pruning to the single fastest config must not raise (the old code did
+        # `del dict[config]` on a config whose hash had changed -> KeyError) and
+        # must keep the fast member with the config it was actually benchmarked
+        # with (snapshot), not the later in-place mutation.
+        search._prune_benchmarked_members(top_k=1)
+        self.assertEqual(len(search._benchmarked_members), 1)
+        kept = next(iter(search._benchmarked_members.values()))
+        self.assertEqual(kept.perfs[0], 1.0)
+        self.assertEqual(kept.config["num_warps"], 4)
+
     @pytest.mark.skipif(
         "fork" not in mp.get_all_start_methods(),
         reason="fork start method is unavailable on this platform",
@@ -2920,7 +2964,8 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
             search._record_benchmarked_member(member_b)
             search._record_benchmarked_member(member_c)
 
-        self.assertIs(search._benchmarked_members[config_a], fast_a)
+        # A snapshot of the faster member for config_a is retained (deduped).
+        self.assertEqual(search._benchmarked_members[config_a].perfs, fast_a.perfs)
         self.assertNotIn(config_b, search._benchmarked_members)
         self.assertEqual(set(search._benchmarked_members), {config_a, config_c})
 
@@ -2949,7 +2994,11 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
             search._record_benchmarked_member(faster)
             search._record_benchmarked_member(slow)
 
-        self.assertIs(search._pinned_finalist_members[pinned_config], pinned)
+        # The pinned config survives pruning (kept as a snapshot in the map).
+        self.assertIn(pinned_config, search._pinned_finalist_members)
+        self.assertEqual(
+            search._pinned_finalist_members[pinned_config].perfs, pinned.perfs
+        )
         self.assertEqual(set(search._benchmarked_members), {fast_config, faster_config})
 
     def test_autotune_configuration_cloning(self) -> None:
