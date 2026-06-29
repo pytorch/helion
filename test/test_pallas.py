@@ -910,15 +910,13 @@ class TestPallas(TestCase):
         self.assertIn("pltpu.make_async_copy", code)
         torch.testing.assert_close(result, x + 1.0)
 
-    def test_fori_loop_last_two_dim_ragged_store_rejected(self) -> None:
-        """A ragged (data-dependent) store whose tiled dim is one of the last two
-        (lane/sublane) dims is rejected with a clear error.
+    def test_fori_loop_last_two_dim_ragged_store_uses_masked_hbm(self) -> None:
+        """A fori_loop ragged store in a lane/sublane dim must not rely on
+        VMEM BlockSpec writeback.
 
-        Mosaic tile alignment forbids a dynamic-size clamp on the last two dims,
-        so such a store would fall back to a full-block writeback from the
-        data-dependent begin and silently overrun adjacent rows. Rather than
-        emit that, codegen raises; the user should move the ragged dimension
-        to a leading position, e.g. ``[tokens, heads, head_dim]``.
+        The fori_loop lowering routes eligible output-only tensors through a
+        VMEM scratch buffer and writes only the live row extent back to HBM via
+        ``pltpu.make_async_copy``.
         """
 
         @helion.kernel(backend="pallas", static_shapes=True)
@@ -934,8 +932,70 @@ class TestPallas(TestCase):
                     out[tile, :] = x[tile, :] + 1.0
             return out
 
-        # 2D tensor -> dim 0 is len(shape)-2 (a last-two dim), and the tile bounds
-        # are loaded at runtime (data-dependent), so the store is rejected.
+        x = torch.randn(8, 128, device=DEVICE, dtype=torch.float32)
+        starts = torch.tensor([0, 4], dtype=torch.int32, device=DEVICE)
+        ends = torch.tensor([4, 8], dtype=torch.int32, device=DEVICE)
+        code, result = code_and_output(
+            ragged_last_two_dim,
+            (x, starts, ends),
+            block_sizes=[8],
+            pallas_loop_type="fori_loop",
+        )
+        self.assertIn("pltpu.make_async_copy", code)
+        self.assertIn("_pipeline_arg_indices=", code)
+        self.assertNotIn("pltpu.store", code)
+        self.assertNotIn("_pallas_store", code)
+        self.assertIn("(2, 0, 8, 7)", code)
+        torch.testing.assert_close(result, x + 1.0)
+
+    def test_fori_loop_unaligned_dynamic_begin_ds_load_gets_extra_pad(self) -> None:
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def ragged_copy(
+            x: torch.Tensor, starts: torch.Tensor, ends: torch.Tensor
+        ) -> torch.Tensor:
+            out = torch.empty_like(x)
+            n = starts.size(0)
+            m = x.size(1)
+            for g in hl.grid(n):
+                st = starts[g]
+                en = ends[g]
+                for tile_m in hl.tile(0, m):
+                    for tile in hl.tile(st, en):
+                        out[tile, tile_m] = x[tile, tile_m] + 1.0
+            return out
+
+        x = torch.arange(527 * 8, device=DEVICE, dtype=torch.float32).reshape(527, 8)
+        starts = torch.tensor([0, 520], dtype=torch.int32, device=DEVICE)
+        ends = torch.tensor([520, 527], dtype=torch.int32, device=DEVICE)
+        code, result = code_and_output(
+            ragged_copy,
+            (x, starts, ends),
+            block_sizes=[8, 16],
+            pallas_loop_type="fori_loop",
+        )
+
+        self.assertNotIn("pltpu.make_async_copy(x.at", code)
+        self.assertIn("pltpu.make_async_copy(out_buf", code)
+        self.assertIn("_pipeline_arg_indices=", code)
+        self.assertNotIn("pltpu.store", code)
+        self.assertNotIn("_pallas_store", code)
+        self.assertIn("(2, 0, 16, 15)", code)
+        self.assertIn("(3, 0, 16, 15)", code)
+        torch.testing.assert_close(result, x + 1.0)
+
+    def test_fori_loop_last_two_dim_rmw_store_rejected(self) -> None:
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def ragged_last_two_dim(
+            x: torch.Tensor, starts: torch.Tensor, ends: torch.Tensor
+        ) -> torch.Tensor:
+            n = starts.size(0)
+            for g in hl.grid(n):
+                st = starts[g]
+                en = ends[g]
+                for tile in hl.tile(st, en):
+                    x[tile, :] = x[tile, :] + 1.0
+            return x
+
         x = torch.randn(8, 128, device=DEVICE, dtype=torch.float32)
         starts = torch.tensor([0, 4], dtype=torch.int32, device=DEVICE)
         ends = torch.tensor([4, 8], dtype=torch.int32, device=DEVICE)
@@ -946,6 +1006,207 @@ class TestPallas(TestCase):
                 block_sizes=[8],
                 pallas_loop_type="fori_loop",
             )
+
+    def test_fori_loop_last_two_dim_initialized_store_rejected(self) -> None:
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def ragged_last_two_dim(
+            x: torch.Tensor, starts: torch.Tensor, ends: torch.Tensor
+        ) -> torch.Tensor:
+            out = torch.zeros_like(x)
+            n = starts.size(0)
+            for g in hl.grid(n):
+                st = starts[g]
+                en = ends[g]
+                for tile in hl.tile(st, en):
+                    out[tile, :] = x[tile, :] + 1.0
+            return out
+
+        x = torch.randn(8, 128, device=DEVICE, dtype=torch.float32)
+        starts = torch.tensor([0, 4], dtype=torch.int32, device=DEVICE)
+        ends = torch.tensor([4, 8], dtype=torch.int32, device=DEVICE)
+        with self.assertRaisesRegex(Exception, "lane/sublane"):
+            code_and_output(
+                ragged_last_two_dim,
+                (x, starts, ends),
+                block_sizes=[8],
+                pallas_loop_type="fori_loop",
+            )
+
+    def test_fori_loop_partial_multi_store_preserves_initialized_output(
+        self,
+    ) -> None:
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def partial_multi_store(x: torch.Tensor) -> torch.Tensor:
+            out = torch.zeros_like(x)
+            m = x.size(0)
+            for _program in hl.grid(1):
+                for tile in hl.tile(m):
+                    base = x[tile, 0] * 0.0
+                    out[tile, 0] = base + 1.0
+                    out[tile, 1] = base + 2.0
+            return out
+
+        x = torch.randn(16, 128, device=DEVICE, dtype=torch.float32)
+        expected = torch.zeros_like(x)
+        expected[:, 0] = 1.0
+        expected[:, 1] = 2.0
+
+        code, result = code_and_output(
+            partial_multi_store,
+            (x,),
+            block_sizes=[8],
+            pallas_loop_type="fori_loop",
+        )
+
+        self.assertIn("jax.lax.fori_loop", code)
+        torch.testing.assert_close(result, expected)
+
+    def test_fori_loop_last_two_dim_scalar_store_rejected(self) -> None:
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def ragged_last_two_dim(
+            x: torch.Tensor, starts: torch.Tensor, ends: torch.Tensor
+        ) -> torch.Tensor:
+            out = torch.empty_like(x)
+            n = starts.size(0)
+            for g in hl.grid(n):
+                st = starts[g]
+                en = ends[g]
+                for tile in hl.tile(st, en):
+                    out[tile, :] = 1.0
+            return out
+
+        x = torch.randn(8, 128, device=DEVICE, dtype=torch.float32)
+        starts = torch.tensor([0, 4], dtype=torch.int32, device=DEVICE)
+        ends = torch.tensor([4, 8], dtype=torch.int32, device=DEVICE)
+        with self.assertRaisesRegex(Exception, "lane/sublane"):
+            code_and_output(
+                ragged_last_two_dim,
+                (x, starts, ends),
+                block_sizes=[8],
+                pallas_loop_type="fori_loop",
+            )
+
+    def test_fori_loop_last_two_dim_broadcast_store_rejected(self) -> None:
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def ragged_last_two_dim(
+            x: torch.Tensor, starts: torch.Tensor, ends: torch.Tensor
+        ) -> torch.Tensor:
+            out = torch.empty_like(x)
+            n = starts.size(0)
+            for g in hl.grid(n):
+                st = starts[g]
+                en = ends[g]
+                for tile in hl.tile(st, en):
+                    out[tile, :] = x[tile, :].sum(dim=0, keepdim=True)
+            return out
+
+        x = torch.randn(8, 128, device=DEVICE, dtype=torch.float32)
+        starts = torch.tensor([0, 4], dtype=torch.int32, device=DEVICE)
+        ends = torch.tensor([4, 8], dtype=torch.int32, device=DEVICE)
+        with self.assertRaisesRegex(Exception, "lane/sublane"):
+            code_and_output(
+                ragged_last_two_dim,
+                (x, starts, ends),
+                block_sizes=[8],
+                pallas_loop_type="fori_loop",
+            )
+
+    @xfailIfPallasInterpret(
+        "dynamic output pl.ds / pl.BoundedSlice BlockSpecs require real TPU Pallas."
+    )
+    def test_emit_pipeline_last_two_dim_ragged_store_uses_clamped_out_spec(
+        self,
+    ) -> None:
+        """Historical rejection case: emit_pipeline accepts this on real TPU."""
+
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def ragged_last_two_dim(
+            x: torch.Tensor,
+            starts: torch.Tensor,
+            ends: torch.Tensor,
+            values: torch.Tensor,
+        ) -> torch.Tensor:
+            out = torch.empty_like(x)
+            n = starts.size(0)
+            for g in hl.grid(n):
+                st = starts[g]
+                en = ends[g]
+                value = values[g]
+                for tile in hl.tile(st, en):
+                    out[tile, :] = x[tile, :] + value
+            return out
+
+        x = torch.randn(8, 128, device=DEVICE, dtype=torch.float32)
+        starts = torch.tensor([0, 4], dtype=torch.int32, device=DEVICE)
+        ends = torch.tensor([4, 8], dtype=torch.int32, device=DEVICE)
+        values = torch.tensor([1.0, 3.0], device=DEVICE, dtype=torch.float32)
+        code, result = code_and_output(
+            ragged_last_two_dim,
+            (x, starts, ends, values),
+            block_sizes=[8],
+            pallas_loop_type="emit_pipeline",
+        )
+
+        self.assertIn("pltpu.emit_pipeline", code)
+        self.assertIn("pl.BoundedSlice", code)
+        self.assertIn("out_specs=", code)
+        out_specs = code.split("out_specs=", 1)[1].split("compiler_params=", 1)[0]
+        self.assertIn("pl.BoundedSlice", out_specs)
+        self.assertIn("pl.ds(", out_specs)
+        self.assertIn("jnp.minimum(", out_specs)
+        self.assertRegex(out_specs.split("jnp.minimum(", 1)[1], r"\w+\s*-\s*\(")
+        expected = x.clone()
+        expected[0:4] = x[0:4] + values[0]
+        expected[4:8] = x[4:8] + values[1]
+        torch.testing.assert_close(result, expected)
+
+    def test_emit_pipeline_static_begin_dynamic_end_store_uses_buffered_output(
+        self,
+    ) -> None:
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def static_begin_dynamic_end(
+            x: torch.Tensor, lengths: torch.Tensor
+        ) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for seg in hl.grid(lengths.size(0)):
+                end = lengths[seg]
+                for tile in hl.tile(0, end):
+                    out[tile, :] = x[tile, :] + 1.0
+            return out
+
+        x = torch.randn(8, 128, device=DEVICE, dtype=torch.float32)
+        lengths = torch.tensor([4], dtype=torch.int32, device=DEVICE)
+        code = static_begin_dynamic_end.bind((x, lengths)).to_code(
+            helion.Config(block_sizes=[8], pallas_loop_type="emit_pipeline")
+        )
+
+        self.assertIn("pltpu.emit_pipeline", code)
+        self.assertIn("out_specs=", code)
+        out_specs = code.split("out_specs=", 1)[1].split("compiler_params=", 1)[0]
+        self.assertIn("pl.BoundedSlice", out_specs)
+        self.assertIn("jnp.minimum(", out_specs)
+
+    def test_emit_pipeline_last_two_dim_static_subrange_store_uses_buffered_output(
+        self,
+    ) -> None:
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def static_subrange(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for _seg in hl.grid(1):
+                for tile in hl.tile(0, 8):
+                    out[tile, :] = x[tile, :] + 1.0
+            return out
+
+        x = torch.randn(16, 128, device=DEVICE, dtype=torch.float32)
+        code = static_subrange.bind((x,)).to_code(
+            helion.Config(block_sizes=[8], pallas_loop_type="emit_pipeline")
+        )
+
+        self.assertIn("pltpu.emit_pipeline", code)
+        self.assertIn("out_specs=", code)
+        out_specs = code.split("out_specs=", 1)[1].split("compiler_params=", 1)[0]
+        self.assertIn("pl.BoundedSlice", out_specs)
+        self.assertIn("jnp.minimum(", out_specs)
 
     @unittest.expectedFailure  # nested-scratch resolution bug; see _find_dma_scratch_loop TODO
     def test_fori_loop_nested_same_tensor_scratch_miscompiles(self) -> None:

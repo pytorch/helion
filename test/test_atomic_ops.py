@@ -274,6 +274,7 @@ def atomic_xchg_2d_td_kernel(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
 
 @onlyBackends(["triton", "cute", "pallas"])
 class TestAtomicOperations(RefEagerTestBase, TestCase):
+    @xfailIfPallas("Pallas atomic_add does not model partial-tile RMW masks")
     def test_basic_atomic_add(self):
         x = torch.zeros(10, device=DEVICE)
         y = torch.ones(10, device=DEVICE)
@@ -403,6 +404,7 @@ class TestAtomicOperations(RefEagerTestBase, TestCase):
         expected = torch.ones(5, device=DEVICE) * 2
         torch.testing.assert_close(result, expected)
 
+    @xfailIfPallas("Pallas atomic_add does not model partial-tile RMW masks")
     def test_2d_atomic_add(self):
         """Test atomic_add with 2D tensor indexing."""
         x = torch.zeros(3, 4, device=DEVICE)
@@ -580,6 +582,7 @@ class TestAtomicOperations(RefEagerTestBase, TestCase):
         )
         torch.testing.assert_close(result_min, expected_min)
 
+    @xfailIfPallas("Pallas atomic_add does not model partial-tile RMW masks")
     def test_atomic_add_code_generation(self):
         """Test that the generated code contains atomic_add."""
         x = torch.zeros(10, device=DEVICE)
