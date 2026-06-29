@@ -787,11 +787,13 @@ class PallasBackend(Backend):
 
     def static_rdim_size(self, numel: int) -> int:
         # Pallas block refs use exact tensor dimensions, so RDIM_SIZE must
-        # match (no power-of-2 rounding that would exceed the block ref).
-        return numel
+        # match (no power-of-2 rounding that would exceed the block ref). Empty
+        # refs are the exception: the runtime represents them with one masked
+        # lane because Pallas cannot construct a zero-sized block.
+        return max(numel, 1)
 
     def dynamic_rdim_size_expr(self, expr: str) -> str:
-        return expr
+        return f"max({expr}, 1)"
 
     def _get_pallas_required_alignment(
         self, dim_from_end: int, tensor_ndim: int, bitwidth: int

@@ -693,7 +693,22 @@ class PersistentReductionStrategy(ReductionStrategy):
         self.offset_vars[block_index] = "0"
         # Compute thread count for warp-level reductions
         max_threads = env.backend.max_reduction_threads()
+        size_hint = 0
         if max_threads is not None:
+            block_info = env.block_sizes[block_index]
+            hint_numel: int | sympy.Expr = numel
+            if numel.free_symbols & set(env.tunable_symbols):
+                # Shape-env hints use a tunable's default, but thread groups and
+                # synthetic lanes must follow the value selected by this config.
+                configured_numel = block_info.from_config(fn.config)
+                if isinstance(configured_numel, int):
+                    hint_numel = configured_numel
+            if isinstance(hint_numel, (int, sympy.Integer)):
+                size_hint = int(hint_numel)
+            elif isinstance(hint_numel, sympy.Expr):
+                size_hint = shape_env_size_hint(env.shape_env, hint_numel)
+            else:
+                size_hint = env.size_hint(hint_numel)
             if env.backend.name == "cute":
                 max_threads = cute_live_reduction_threads(max_threads)
                 # Indexed reductions (argmin/argmax) on CuTe only have a
@@ -703,12 +718,6 @@ class PersistentReductionStrategy(ReductionStrategy):
                 # ``cute.arch.warp_reduction`` is correct.
                 if _block_has_indexed_reduction(fn, block_index):
                     max_threads = min(max_threads, _CUTE_WARP_REDUCTION_THREADS)
-            if isinstance(numel, (int, sympy.Integer)):
-                size_hint = int(numel)
-            elif isinstance(numel, sympy.Expr):
-                size_hint = shape_env_size_hint(env.shape_env, numel)
-            else:
-                size_hint = env.size_hint(numel)
             self._thread_count = next_power_of_2(min(size_hint, max_threads))
         else:
             self._thread_count = 0
@@ -738,12 +747,6 @@ class PersistentReductionStrategy(ReductionStrategy):
             for graph in fn.codegen.codegen_graphs
         )
         if self._thread_count > 0:
-            if isinstance(numel, (int, sympy.Integer)):
-                size_hint = int(numel)
-            elif isinstance(numel, sympy.Expr):
-                size_hint = shape_env_size_hint(env.shape_env, numel)
-            else:
-                size_hint = env.size_hint(numel)
             # For a non-graph-reduction dim we always try to recover the
             # full extent through a synthetic lane loop. For a graph
             # reduction dim we only need the synthetic lane loop when

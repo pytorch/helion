@@ -617,7 +617,7 @@ class Backend(abc.ABC):
         """Return the RDIM block size for a statically known reduction dimension."""
         from torch._inductor.runtime.runtime_utils import next_power_of_2
 
-        return next_power_of_2(numel)
+        return max(next_power_of_2(numel), 1)
 
     def dynamic_rdim_size_expr(self, expr: str) -> str:
         """Generate a host-side expression for RDIM size from a dynamic dimension.
@@ -625,7 +625,7 @@ class Backend(abc.ABC):
         By default delegates to next_power_of_2_host_expr. Backends like Pallas
         that need exact sizes can override to return the expression unchanged.
         """
-        return self.next_power_of_2_host_expr(expr)
+        return f"max({self.next_power_of_2_host_expr(expr)}, 1)"
 
     def lane_index_expr(
         self, offset_var: str, elements_per_thread: int, *, axis: int

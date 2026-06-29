@@ -207,6 +207,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             expected,
             fn_name="split_k_matmul",
             block_sizes=[16, 8, 16, 16, 16],
+            reduction_loops=[4],
             pid_type="persistent_blocked",
             split_k=64,
         )
@@ -226,6 +227,7 @@ class TestExamples(RefEagerTestBase, TestCase):
         m, k, n = 64, 33, 64
         config = helion.Config(
             block_sizes=[16, 8, 16, 16, 16],
+            reduction_loops=[4],
             pid_type="persistent_blocked",
             split_k=32,
         )

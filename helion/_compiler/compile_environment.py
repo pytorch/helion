@@ -30,8 +30,6 @@ import torch.distributed as dist
 from torch.fx.experimental.symbolic_shapes import DimDynamic
 from torch.fx.experimental.symbolic_shapes import ShapeEnv
 from torch.fx.experimental.symbolic_shapes import free_unbacked_symbols
-from torch.utils._sympy.symbol import SymT
-from torch.utils._sympy.symbol import symbol_is_type
 
 from .. import exc
 from .._compat import shape_env_size_hint
@@ -842,19 +840,16 @@ class CompileEnvironment:
                 block_idx = origin_info.origin.block_id
                 existing_block = self.block_sizes[block_idx]
 
-        def _is_unbacked_symint(x: int | torch.SymInt) -> bool:
+        def _has_unbacked_symint(x: int | torch.SymInt) -> bool:
             if not isinstance(x, torch.SymInt):
                 return False
-            expr = x._sympy_()
-            if isinstance(expr, sympy.Symbol):
-                return symbol_is_type(expr, SymT.UNBACKED_INT)
-            return False
+            return bool(free_unbacked_symbols(x._sympy_()))
 
         # Check for existing reduction dimensions with the same size
         for rdim in self.block_sizes:
             if not rdim.reduction or not isinstance(rdim.size, (int, torch.SymInt)):
                 continue
-            if _is_unbacked_symint(rdim.size) and _is_unbacked_symint(size):
+            if _has_unbacked_symint(rdim.size) or _has_unbacked_symint(size):
                 if self.known_equal(rdim.size, size):
                     return rdim
             elif rdim.size == size:
@@ -1251,6 +1246,10 @@ class CompileEnvironment:
                 # This preserves the original value passed to the kernel.
                 if expr in var_hints:
                     return int(var_hints[expr])
+                with contextlib.suppress(TypeError, ValueError):
+                    hinted_expr = expr.xreplace(var_hints)
+                    if not hinted_expr.free_symbols:
+                        return int(typing.cast("typing.SupportsInt", hinted_expr))
                 # Fall back to default hint if not found
                 return 8192
 
@@ -1667,12 +1666,50 @@ class ReductionLoopBlockSizeSource(BlockSizeSource):
             len(config.reduction_loops) <= self.reduction_loop
             or config.reduction_loops[self.reduction_loop] is None
         ):
-            size = max(1, block_size_info.size_hint())
             # Backends override static_rdim_size to control whether the
             # persistent-reduction extent is rounded up to a power of two
             # (Triton/CuTe) or kept exact (Pallas).
-            return CompileEnvironment.current().backend.static_rdim_size(size)
+            env = CompileEnvironment.current()
+            size = _size_hint_with_tunable_config(block_size_info.size, config, env)
+            return env.backend.static_rdim_size(size)
         return config.reduction_loops[self.reduction_loop]
+
+
+def _size_hint_with_tunable_config(
+    size: int | torch.SymInt | AutoSize | None,
+    config: Config,
+    env: CompileEnvironment,
+) -> int:
+    if not isinstance(size, (int, torch.SymInt)):
+        return 1
+    if isinstance(size, int):
+        return max(1, size)
+
+    expr = _symint_sympy_expr(size)
+    substitutions: dict[sympy.Symbol, int | sympy.Expr] = {
+        symbol: value
+        for symbol, tunable_name in env.tunable_symbols.items()
+        if type(value := config.get(tunable_name)) is int
+    }
+    for block_size_info in env.block_sizes:
+        if block_size_info.reduction:
+            continue
+        symbol = block_size_info.symbol()
+        if symbol not in expr.free_symbols:
+            continue
+        value = block_size_info.from_config(config)
+        if type(value) is int:
+            substitutions[symbol] = value
+        elif isinstance(value, torch.SymInt):
+            substitutions[symbol] = _symint_sympy_expr(value)
+    if substitutions:
+        substituted_expr = expr.subs(substitutions)
+        assert isinstance(substituted_expr, sympy.Expr)
+        expr = substituted_expr
+    extent = shape_env_size_hint(env.shape_env, expr)
+    if extent < 0:
+        raise exc.InvalidConfig(f"Tunable reduction extent evaluated to {extent}")
+    return max(1, extent)
 
 
 def warning(warning: exc.BaseWarning | type[exc.BaseWarning]) -> None:

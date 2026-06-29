@@ -715,6 +715,178 @@ class TestSettingsEnv(TestCase):
         self.assertEqual(config["block_sizes"][:2], [64, 64])
         self.assertEqual(config["num_threads"][:2], [64, 64])
 
+    def test_cute_tunable_reduction_uses_selected_extent(self) -> None:
+        import sympy
+
+        from helion._compiler.backend import CuteBackend
+        from helion.autotuner import PowerOfTwoFragment
+        from helion.autotuner.config_generation import ConfigGeneration
+        from helion.autotuner.config_spec import BlockSizeSpec
+        from helion.autotuner.config_spec import NumThreadsSpec
+        from helion.autotuner.config_spec import ReductionLoopSpec
+        from helion.autotuner.config_spec import TunableReductionExtent
+
+        width = sympy.Symbol("width", integer=True)
+        spec = ConfigSpec(
+            backend=CuteBackend(),
+            user_defined_tunables={
+                "width": PowerOfTwoFragment(16, 512, 64),
+            },
+        )
+        for block_id, size_hint in enumerate((1, 1, 16, 1, 1)):
+            spec.block_sizes.append(
+                BlockSizeSpec(block_id=block_id, size_hint=size_hint)
+            )
+            spec.num_threads.append(
+                NumThreadsSpec(block_id=block_id, size_hint=size_hint)
+            )
+        reduction_spec = ReductionLoopSpec(
+            block_id=5,
+            size_hint=64,
+            max_size_hint=512,
+            tunable_extent=TunableReductionExtent(
+                width,
+                ((width, "width"),),
+                (),
+            ),
+        )
+        spec.reduction_loops.append(reduction_spec)
+
+        fragment = reduction_spec._flat_fragment(spec)
+        self.assertEqual(fragment.default(), 512)
+        self.assertEqual(fragment.high, 512)
+        self.assertEqual(reduction_spec._flat_config(spec, lambda _: 128), 128)
+        self.assertIsNone(reduction_spec._flat_config(spec, lambda _: 512))
+        config_generation = ConfigGeneration(spec)
+        default_flat = config_generation.default_flat()
+        self.assertEqual(
+            config_generation.flatten(config_generation.unflatten(default_flat)),
+            default_flat,
+        )
+        partial = helion.Config(
+            block_sizes=[1, 1, 16, 1, 1],
+            width=512,
+        )
+        partial_flat = config_generation.flatten(partial)
+        self.assertEqual(
+            config_generation.flatten(config_generation.unflatten(partial_flat)),
+            partial_flat,
+        )
+
+        selected_large = {
+            "block_sizes": [1, 1, 16, 1, 1],
+            "reduction_loops": [None],
+            "width": 512,
+        }
+        spec.normalize(selected_large)
+        self.assertEqual(selected_large["reduction_loops"], [64])
+
+        explicit_loop = {
+            "block_sizes": [1, 1, 16, 1, 1],
+            "reduction_loops": [64],
+            "width": 128,
+        }
+        spec.normalize(explicit_loop)
+        self.assertEqual(explicit_loop["reduction_loops"], [64])
+
+        selected_small = {
+            "block_sizes": [1, 1, 16, 1, 1],
+            "reduction_loops": [64],
+            "width": 32,
+        }
+        spec.normalize(selected_small)
+        self.assertEqual(selected_small["reduction_loops"], [None])
+
+        out_of_range = {
+            "block_sizes": [1, 1, 16, 1, 1],
+            "reduction_loops": [None],
+            "width": 1024,
+        }
+        with self.assertRaisesRegex(helion.exc.InvalidConfig, "width.*16, 512"):
+            spec.normalize(out_of_range)
+
+    def test_tunable_reduction_uses_clamped_inner_block_size(self) -> None:
+        import sympy
+
+        from helion.autotuner import IntegerFragment
+        from helion.autotuner.config_spec import BlockSizeSpec
+        from helion.autotuner.config_spec import ReductionLoopSpec
+        from helion.autotuner.config_spec import TunableReductionExtent
+
+        width = sympy.Symbol("width", integer=True)
+        inner = sympy.Symbol("inner", integer=True)
+        spec = ConfigSpec(
+            backend=TritonBackend(),
+            user_defined_tunables={"width": IntegerFragment(2, 8, 4)},
+        )
+        spec.block_sizes.append(BlockSizeSpec(block_id=0, size_hint=16, max_size=16))
+        spec.block_sizes.append(
+            BlockSizeSpec(
+                block_id=1,
+                size_hint=64,
+                max_size=64,
+                bounded_by_block_id=0,
+            )
+        )
+        spec.reduction_loops.append(
+            ReductionLoopSpec(
+                block_id=2,
+                size_hint=68,
+                max_size_hint=72,
+                tunable_extent=TunableReductionExtent(
+                    inner + width,
+                    ((width, "width"),),
+                    ((inner, 1),),
+                ),
+            )
+        )
+
+        config = {
+            "block_sizes": [16, 64],
+            "reduction_loops": [32],
+            "width": 4,
+        }
+        spec.normalize(config)
+        self.assertEqual(config["block_sizes"], [16, 16])
+        self.assertEqual(config["reduction_loops"], [None])
+
+    def test_flatten_tunable_reduction_accepts_singular_aliases(self) -> None:
+        import sympy
+
+        from helion.autotuner import IntegerFragment
+        from helion.autotuner.config_generation import ConfigGeneration
+        from helion.autotuner.config_spec import BlockSizeSpec
+        from helion.autotuner.config_spec import ReductionLoopSpec
+        from helion.autotuner.config_spec import TunableReductionExtent
+
+        block = sympy.Symbol("block", integer=True)
+        width = sympy.Symbol("width", integer=True)
+        spec = ConfigSpec(
+            backend=TritonBackend(),
+            user_defined_tunables={"width": IntegerFragment(2, 8, 4)},
+        )
+        spec.block_sizes.append(BlockSizeSpec(block_id=0, size_hint=2, max_size=8))
+        spec.reduction_loops.append(
+            ReductionLoopSpec(
+                block_id=1,
+                size_hint=6,
+                max_size_hint=16,
+                tunable_extent=TunableReductionExtent(
+                    block + width,
+                    ((width, "width"),),
+                    ((block, 0),),
+                ),
+            )
+        )
+        generation = ConfigGeneration(spec)
+
+        for config in (
+            helion.Config(block_size=2, width=4),
+            helion.Config(block_size=8, reduction_loop=8, width=4),
+        ):
+            flat = generation.flatten(config)
+            self.assertEqual(generation.flatten(generation.unflatten(flat)), flat)
+
     def test_detect_outer_block_bound_requires_end_minus_begin(self) -> None:
         from types import SimpleNamespace
 
