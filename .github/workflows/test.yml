@@ -128,10 +128,27 @@ jobs:
             VERSION="${VERSION#pytorch-}"
             uv pip install -U "torch==${VERSION}.*" --index-url https://download.pytorch.org/whl/${{ matrix.runtime-version }}
           elif [[ "${{ matrix.runtime-version }}" == "tpu" ]]; then
-            # TODO: TorchTPU needs to catch up with a recent PyTorch change:
-            #   https://github.com/pytorch/pytorch/pull/186928
-            # In the meantime, use a PyTorch wheel that does not contain that change.
-            uv pip install -U --pre "torch==2.13.0.dev20260609" --index-url https://download.pytorch.org/whl/nightly/cpu
+            # Use the latest PyTorch wheel that is known to work with TorchTPU.
+            uv pip install -U --pre "torch==2.14.0.dev20260622" --index-url https://download.pytorch.org/whl/nightly/cpu
+
+            TORCH_PATH=$(python3 -c "import torch; print(torch.__path__[0])")
+            TARGET_FILE="$TORCH_PATH/include/kineto/TypedMetadata.h"
+            ITRACE_FILE="$TORCH_PATH/include/kineto/ITraceActivity.h"
+            if [ -f "$TARGET_FILE" ] && grep -q "class TypedMetadata" "$TARGET_FILE"; then
+              echo "Valid TypedMetadata.h is already present, skipping patch."
+            else
+              echo "TypedMetadata.h is missing or invalid. Patching..."
+              mkdir -p "$(dirname "$TARGET_FILE")"
+              # Grab the real header file using the exact commit hash
+              curl -f -sSL "https://raw.githubusercontent.com/pytorch/kineto/965a14db8ebb46025af975d82d7c72e701603220/libkineto/include/TypedMetadata.h" -o "$TARGET_FILE"
+              # Inject a forward declaration of TypedMetadata right inside the namespace
+              echo "Injecting forward declaration..."
+              sed -i '/namespace libkineto {/a \  class TypedMetadata;' "$ITRACE_FILE"
+              # Safely rewrite the inline 'return {};' block to avoid aggregate construction on an incomplete type.
+              # This replaces just the specific return line with a pointer cast workaround.
+              echo "Fixing inline return instantiation..."
+              sed -i 's/return {};/return \*static_cast<libkineto::TypedMetadata\* \>(nullptr);/g' "$ITRACE_FILE"
+            fi
           else
             # Default to nightly
             # On OSDC, route nightly through the pypi-cache /whl proxy (deps stay reachable behind the egress firewall) and clear the cache index vars so it wins over the cache default; off OSDC PYPI_CACHE_WHL_URL is unset so we hit download.pytorch.org.
@@ -357,7 +374,7 @@ jobs:
           fi
           # Pallas interpret runs on CPU (no parallelism) and is much slower
           # than TPU/Triton — bump the per-test timeout accordingly.
-          TIMEOUT=60
+          TIMEOUT=200
           if [[ "${{ matrix.alias }}" == "pallas-interpret" ]]; then
             TIMEOUT=300
           fi

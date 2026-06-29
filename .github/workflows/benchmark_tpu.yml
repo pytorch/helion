@@ -56,7 +56,27 @@ jobs:
       - name: Install PyTorch (CPU nightly)
         run: |
           source .venv/bin/activate
-          uv pip install -U --pre "torch==2.13.0.dev20260609" --index-url https://download.pytorch.org/whl/nightly/cpu
+          # Use the latest PyTorch wheel that is known to work with TorchTPU.
+          uv pip install -U --pre "torch==2.14.0.dev20260622" --index-url https://download.pytorch.org/whl/nightly/cpu
+
+          TORCH_PATH=$(python3 -c "import torch; print(torch.__path__[0])")
+          TARGET_FILE="$TORCH_PATH/include/kineto/TypedMetadata.h"
+          ITRACE_FILE="$TORCH_PATH/include/kineto/ITraceActivity.h"
+          if [ -f "$TARGET_FILE" ] && grep -q "class TypedMetadata" "$TARGET_FILE"; then
+            echo "Valid TypedMetadata.h is already present, skipping patch."
+          else
+            echo "TypedMetadata.h is missing or invalid. Patching..."
+            mkdir -p "$(dirname "$TARGET_FILE")"
+            # Grab the real header file using the exact commit hash
+            curl -f -sSL "https://raw.githubusercontent.com/pytorch/kineto/965a14db8ebb46025af975d82d7c72e701603220/libkineto/include/TypedMetadata.h" -o "$TARGET_FILE"
+            # Inject a forward declaration of TypedMetadata right inside the namespace
+            echo "Injecting forward declaration..."
+            sed -i '/namespace libkineto {/a \  class TypedMetadata;' "$ITRACE_FILE"
+            # Safely rewrite the inline 'return {};' block to avoid aggregate construction on an incomplete type.
+            # This replaces just the specific return line with a pointer cast workaround.
+            echo "Fixing inline return instantiation..."
+            sed -i 's/return {};/return \*static_cast<libkineto::TypedMetadata\* \>(nullptr);/g' "$ITRACE_FILE"
+          fi
 
       - name: Install Helion
         run: |
