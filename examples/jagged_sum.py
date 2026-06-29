@@ -1,9 +1,8 @@
 """
-Jagged Mean Example
-===================
+Jagged Sum Example
+==================
 
-This example demonstrates how to compute the mean of each row in a jagged tensor
-with variable features per row using Helion.
+This example demonstrates how to sum each row in a jagged tensor with Helion.
 """
 
 # %%
@@ -19,22 +18,24 @@ import torch
 
 import helion
 from helion._testing import DEVICE
+from helion._testing import LONG_INT_TYPE
 from helion._testing import run_example
 import helion.language as hl
+from helion.runtime.settings import _get_backend
 
 # %%
-# Jagged Mean Kernel
-# ------------------
+# Jagged Sum Kernel
+# -----------------
 
 
 # %%
 @helion.kernel()
-def jagged_sum_kernel(
+def _jagged_sum_kernel_default(
     x_data: torch.Tensor,
     x_offsets: torch.Tensor,
 ) -> torch.Tensor:
     """
-    Compute the mean of each row in a jagged tensor with variable features per row.
+    Compute the sum of each row in a jagged tensor.
 
     Args:
         x_data: 2-D tensor of shape (total_elements, M) holding all elements
@@ -74,6 +75,35 @@ def jagged_sum_kernel(
     return out
 
 
+@helion.kernel()
+def _jagged_sum_kernel_pallas(
+    x_data: torch.Tensor,
+    x_offsets: torch.Tensor,
+) -> torch.Tensor:
+    """Compute jagged sums with one packed row per Pallas grid program."""
+    M = x_data.size(1)
+    num_rows = x_offsets.size(0) - 1
+    out = torch.empty([num_rows, M], dtype=x_data.dtype, device=x_data.device)
+
+    for b in hl.grid(num_rows):
+        start = x_offsets[b]
+        end = x_offsets[b + 1]
+        for tile_m in hl.tile(M):
+            row_sum = hl.zeros([tile_m], dtype=x_data.dtype)
+            for tile_k in hl.tile(start, end):
+                row_sum += x_data[tile_k, tile_m].sum(dim=0)
+            out[b, tile_m] = row_sum
+
+    return out
+
+
+jagged_sum_kernel = (
+    _jagged_sum_kernel_pallas
+    if _get_backend() == "pallas"
+    else _jagged_sum_kernel_default
+)
+
+
 # %%
 # Reference Implementation
 # ------------------------
@@ -85,14 +115,14 @@ def reference_jagged_sum_kernel_pytorch(
     x_offsets: torch.Tensor,
 ) -> torch.Tensor:
     """
-    PyTorch reference implementation for jagged mean with variable features.
+    PyTorch reference implementation for jagged sum.
 
     Args:
         x_data: 2-D tensor holding all elements
         x_offsets: Offsets tensor for row indexing
 
     Returns:
-        Tensor containing the mean of each row
+        Tensor containing the sum of each row
     """
     num_rows = x_offsets.numel() - 1
     M = x_data.size(1)
@@ -126,11 +156,11 @@ def jagged_sum_tritonbench(
         sparsity: Sparsity factor (not used)
 
     Returns:
-        Callable that returns tensor of shape (B, M) with mean values per row and feature
+        Callable that returns tensor of shape (B, M) with sums per row and feature
     """
     x_values = x._values
     # pyrefly: ignore [missing-attribute]
-    x_offsets = x._offsets
+    x_offsets = x._offsets.to(LONG_INT_TYPE)
 
     return lambda: jagged_sum_kernel(x_values, x_offsets)
 
@@ -151,13 +181,15 @@ def create_test_jagged_tensor(
     """Create test jagged tensor data."""
 
     # Generate random sequence lengths
-    seq_lengths = torch.randint(1, max_seqlen + 1, (B,), device=device)
+    seq_lengths = torch.randint(
+        1, max_seqlen + 1, (B,), dtype=LONG_INT_TYPE, device=device
+    )
 
     # Create offsets
     x_offsets = torch.cat(
         [
-            torch.zeros(1, dtype=torch.long, device=device),
-            torch.cumsum(seq_lengths, dim=0),
+            torch.zeros(1, dtype=LONG_INT_TYPE, device=device),
+            torch.cumsum(seq_lengths, dim=0, dtype=LONG_INT_TYPE),
         ]
     )
 
@@ -176,7 +208,7 @@ def create_test_jagged_tensor(
 # %%
 def main() -> None:
     """
-    Main entry point that runs the jagged mean kernel verification.
+    Main entry point that runs the jagged sum kernel verification.
 
     Creates test data with random jagged tensors and feature counts, then compares
     the kernel implementation against the PyTorch reference implementation.
