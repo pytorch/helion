@@ -1353,6 +1353,7 @@ def _build_matmul_dot_general_jit_fn(
             tensor_inputs[lhs_idx],
             tensor_inputs[rhs_idx],
             dimension_numbers=(((1,), (0,)), ((), ())),
+            precision="default",
             preferred_element_type=preferred,
         )
         if needs_cast:
