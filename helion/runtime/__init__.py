@@ -409,7 +409,9 @@ _BlockSpecInfo = list[
     ]
     | None
 ]
-_PallasCopyGuards = dict[int, tuple[int, ...]]
+_PallasFlatCopyGuard = tuple[int, int, int, tuple[tuple[int, int], ...]]
+_PallasCopyGuard = tuple[tuple[int, ...], tuple[_PallasFlatCopyGuard, ...]]
+_PallasCopyGuards = dict[int, _PallasCopyGuard]
 _PallasDimensionSemantic = Literal["parallel", "arbitrary"]
 
 
@@ -437,19 +439,38 @@ def _pallas_grid_dims_used_by_block_spec(
     return used
 
 
-def _pallas_foreach_grid_dims_by_block_spec(
+def _pallas_flat_shared_groups(
+    grid: tuple[int, ...],
     block_info: tuple[
         tuple[int | None, ...],
         tuple[int | _PallasFlatGridDim | None, ...],
     ],
-) -> set[int]:
-    """Return flat launch dims whose index map is limited to one ForEach case."""
-    used: set[int] = set()
+) -> tuple[tuple[int, int, int, tuple[tuple[int, int], ...]], ...]:
+    """Return flat grid groups whose logical subdimensions are only partly tiled."""
     _, grid_dims = block_info
+    groups: dict[tuple[int, int, int], set[tuple[int, int]]] = {}
     for grid_dim in grid_dims:
-        if isinstance(grid_dim, tuple) and len(grid_dim) == 4:
-            used.add(grid_dim[0])
-    return used
+        if not isinstance(grid_dim, tuple):
+            continue
+        dim, stride, num_blocks, *range_info = grid_dim
+        if len(range_info) >= 2:
+            start, total = range_info[:2]
+        elif range_info:
+            start = range_info[0]
+            total = grid[dim] - start
+        else:
+            start = 0
+            total = grid[dim]
+        groups.setdefault((dim, start, total), set()).add((stride, num_blocks))
+
+    result: list[tuple[int, int, int, tuple[tuple[int, int], ...]]] = []
+    for (dim, _start, total), used_dims in groups.items():
+        used = 1
+        for _stride, num_blocks in used_dims:
+            used *= num_blocks
+        if _start != 0 or used < total:
+            result.append((dim, _start, total, tuple(sorted(used_dims))))
+    return tuple(result)
 
 
 def _pallas_shared_output_plan(
@@ -478,21 +499,33 @@ def _pallas_shared_output_plan(
         block_info = block_spec_info[tensor_pos]
         if block_info is None:
             continue
-        for dim in _pallas_foreach_grid_dims_by_block_spec(block_info):
-            if dim < len(grid) and grid[dim] > 1:
-                dim_semantics[dim] = "arbitrary"
         used_dims = _pallas_grid_dims_used_by_block_spec(block_info)
         # These programs update the same output tile and must observe one
         # shared accumulator, not a freshly preloaded copy per program.
         shared_dims = tuple(
             dim for dim, size in enumerate(grid) if size > 1 and dim not in used_dims
         )
-        if not shared_dims:
-            continue
-        copy_guards[orig_pos] = shared_dims
+        flat_groups = _pallas_flat_shared_groups(grid, block_info)
+        if shared_dims or flat_groups:
+            copy_guards[orig_pos] = (shared_dims, flat_groups)
         for dim in shared_dims:
             dim_semantics[dim] = "arbitrary"
+        for dim, _start, _total, _used_dims in flat_groups:
+            dim_semantics[dim] = "arbitrary"
     return copy_guards, tuple(dim_semantics)
+
+
+def _pallas_apply_arbitrary_grid_dims(
+    dimension_semantics: tuple[_PallasDimensionSemantic, ...],
+    arbitrary_grid_dims: tuple[int, ...] | None,
+) -> tuple[_PallasDimensionSemantic, ...]:
+    if not arbitrary_grid_dims:
+        return dimension_semantics
+    result: list[_PallasDimensionSemantic] = list(dimension_semantics)
+    for dim in arbitrary_grid_dims:
+        if 0 <= dim < len(result):
+            result[dim] = "arbitrary"
+    return tuple(result)
 
 
 def _pallas_build_block_specs(
@@ -1127,12 +1160,34 @@ def _pallas_inplace_copy(in_ref: object, out_ref: object, *, is_smem: bool) -> N
         out_ref[...] = in_ref[...]  # type: ignore[index]
 
 
-def _pallas_copy_guard(dims: tuple[int, ...]) -> bool | jax.Array:
+def _pallas_copy_guard(guard: _PallasCopyGuard) -> bool | jax.Array:
     from jax.experimental import pallas as pl
 
+    direct_dims, flat_guards = guard
     should_copy = True
-    for dim in dims:
+    for dim in direct_dims:
         should_copy = should_copy & (pl.program_id(dim) == 0)
+    flat_dim_guards: dict[int, bool | jax.Array] = {}
+    for dim, start, total, used_dims in flat_guards:
+        local_pid = pl.program_id(dim) - start
+        rebuilt_pid = 0
+        for stride, num_blocks in used_dims:
+            coord = local_pid
+            if stride > 1:
+                coord = coord // stride  # type: ignore[operator]
+            coord = coord % num_blocks  # type: ignore[operator]
+            if stride > 1:
+                coord = coord * stride  # type: ignore[operator]
+            rebuilt_pid = rebuilt_pid + coord
+        in_group = (local_pid >= 0) & (local_pid < total)
+        flat_guard = in_group & (local_pid == rebuilt_pid)
+        flat_dim_guards[dim] = (
+            flat_guard
+            if dim not in flat_dim_guards
+            else flat_dim_guards[dim] | flat_guard
+        )
+    for flat_guard in flat_dim_guards.values():
+        should_copy = should_copy & flat_guard
     return should_copy
 
 
@@ -1190,7 +1245,7 @@ def _pallas_make_reordered_kernel(
                     should_copy = _pallas_copy_guard(copy_guard_dims)
 
                     @pl.when(should_copy)
-                    def _copy_shared_output(
+                    def _copy_inplace_output(
                         out_ref: object = out_ref,
                         in_ref: object = in_ref,
                         is_smem: bool = is_smem,
@@ -1509,6 +1564,7 @@ def _pallas_compile_jit_fn(
     _pipeline_arg_indices: list[int] | None,
     _matmul_dot_general: dict[str, object] | None,
     interpret: bool,
+    _pallas_arbitrary_grid_dims: tuple[int, ...] | None = None,
 ) -> _PallasCompileResult:
     """Build the ``pl.pallas_call`` jit_fn shared by all Pallas launchers.
 
@@ -1557,6 +1613,9 @@ def _pallas_compile_jit_fn(
         _output_indices,
         inplace_positions,
         _block_spec_info,
+    )
+    dimension_semantics = _pallas_apply_arbitrary_grid_dims(
+        dimension_semantics, _pallas_arbitrary_grid_dims
     )
 
     if kind is _PallasLoopKind.UNROLL:
@@ -1690,6 +1749,7 @@ def _pallas_install_launcher_cache(
     _ds_pad_dims: list[tuple[int, int, int, int]] | None,
     _pallas_interpret: bool | None,
     _matmul_dot_general: dict[str, object] | None = None,
+    _pallas_arbitrary_grid_dims: tuple[int, ...] | None = None,
 ) -> tuple[object, ...]:
     """Cache-miss path shared by all three torch-tensor Pallas launchers.
 
@@ -1730,6 +1790,7 @@ def _pallas_install_launcher_cache(
         _pipeline_arg_indices=_pipeline_arg_indices,
         _matmul_dot_general=_matmul_dot_general,
         interpret=interpret,
+        _pallas_arbitrary_grid_dims=_pallas_arbitrary_grid_dims,
     )
 
     jax_callable = _pallas_build_callable(
@@ -1816,6 +1877,7 @@ def default_pallas_launcher(
     _ds_pad_dims: list[tuple[int, int, int, int]] | None = None,
     _pallas_interpret: bool | None = None,
     _matmul_dot_general: dict[str, object] | None = None,
+    _pallas_arbitrary_grid_dims: tuple[int, ...] | None = None,
     **kwargs: object,
 ) -> object:
     """Default launcher for Pallas kernels on TPU (or CPU with interpret=True).
@@ -1848,6 +1910,7 @@ def default_pallas_launcher(
             _ds_pad_dims=_ds_pad_dims,
             _pallas_interpret=_pallas_interpret,
             _matmul_dot_general=_matmul_dot_general,
+            _pallas_arbitrary_grid_dims=_pallas_arbitrary_grid_dims,
         )
 
     return _pallas_invoke_cached_launcher(
@@ -1872,6 +1935,7 @@ def default_pallas_pipeline_launcher(
     _smem_arg_indices: list[int] | None = None,
     _pallas_interpret: bool | None = None,
     _matmul_dot_general: dict[str, object] | None = None,
+    _pallas_arbitrary_grid_dims: tuple[int, ...] | None = None,
     **kwargs: object,
 ) -> object:
     """Launcher for Pallas kernels using PrefetchScalarGridSpec with scratch memory.
@@ -1898,6 +1962,7 @@ def default_pallas_pipeline_launcher(
             _ds_pad_dims=_ds_pad_dims,
             _pallas_interpret=_pallas_interpret,
             _matmul_dot_general=_matmul_dot_general,
+            _pallas_arbitrary_grid_dims=_pallas_arbitrary_grid_dims,
         )
 
     return _pallas_invoke_cached_launcher(
@@ -1920,6 +1985,7 @@ def default_pallas_fori_launcher(
     _ds_pad_dims: list[tuple[int, int, int, int]] | None = None,
     _smem_arg_indices: list[int] | None = None,
     _pallas_interpret: bool | None = None,
+    _pallas_arbitrary_grid_dims: tuple[int, ...] | None = None,
     **kwargs: object,
 ) -> object:
     """Launcher for Pallas kernels using fori_loop with manual DMA.
@@ -1949,6 +2015,7 @@ def default_pallas_fori_launcher(
             ),
             _ds_pad_dims=_ds_pad_dims,
             _pallas_interpret=_pallas_interpret,
+            _pallas_arbitrary_grid_dims=_pallas_arbitrary_grid_dims,
         )
 
     return _pallas_invoke_cached_launcher(

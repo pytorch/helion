@@ -4,11 +4,14 @@ import ast
 import math
 import os
 import re
+import sys
+import types
 from typing import TYPE_CHECKING
 from typing import Any
 from typing import Callable
 from typing import cast
 import unittest
+from unittest.mock import patch
 
 from examples.geglu import _geglu_pallas as _geglu_pallas_example
 from examples.swiglu import _swiglu_fwd_pallas as _swiglu_fwd_pallas_example
@@ -28,6 +31,8 @@ from helion._testing import xfailIfPallas
 from helion._testing import xfailIfPallasInterpret
 from helion._testing import xfailIfPallasTpu
 import helion.language as hl
+from helion.runtime import _pallas_copy_guard
+from helion.runtime import _pallas_shared_output_plan
 from helion.runtime.settings import is_pallas_interpret
 
 if TYPE_CHECKING:
@@ -402,22 +407,6 @@ def pallas_stack_sum(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
 
 
 @helion.kernel(backend="pallas", static_shapes=True)
-def pallas_jagged_segment_add(x: torch.Tensor, offsets: torch.Tensor) -> torch.Tensor:
-    """Outer grid over jagged segments + an inner ``hl.tile(start, end)`` loop
-    whose begin (``offsets[g]``) is an arbitrary runtime offset. A
-    block-aligned BlockSpec index can only address starts that are multiples of
-    the block size, so the emit_pipeline path must slice the segment with a
-    dynamic ``pl.ds`` (``pl.BoundedSlice`` block)."""
-    out = torch.empty_like(x)
-    for g in hl.grid(offsets.size(0) - 1):
-        start = offsets[g]
-        end = offsets[g + 1]
-        for tile in hl.tile(start, end):
-            out[tile, :] = x[tile, :] + 1.0
-    return out
-
-
-@helion.kernel(backend="pallas", static_shapes=True)
 def pallas_add_3d(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     """Kernel with an outer grid loop and a 2D inner device loop."""
     b, m, n = x.size()
@@ -775,6 +764,60 @@ def kernel_tile_begin_plus_offset_is_elementwise(
     for tile_m in hl.tile(seq_len):
         out[tile_m.begin + 5] = x[tile_m.begin + 5] + 1.0
     return out
+
+
+class TestPallasSharedOutputPlan(TestCase):
+    def test_shared_output_plan_normalizes_three_tuple_flat_groups(self) -> None:
+        copy_guards, dimension_semantics = _pallas_shared_output_plan(
+            grid=(8,),
+            tensor_arg_indices=[0],
+            output_only_indices=[],
+            output_indices=[0],
+            inplace_indices={0},
+            block_spec_info=[((1,), ((0, 1, 2),))],
+        )
+
+        self.assertEqual(copy_guards, {0: ((), ((0, 0, 8, ((1, 2),)),))})
+        self.assertEqual(dimension_semantics, ("arbitrary",))
+
+    def test_copy_guard_ors_same_dim_groups_and_rejects_out_of_group(self) -> None:
+        guard = (
+            (),
+            (
+                (0, 0, 4, ((1, 2),)),
+                (0, 4, 4, ((1, 2),)),
+            ),
+        )
+
+        self.assertTrue(self._copy_guard_value(guard, {0: 1}))
+        self.assertTrue(self._copy_guard_value(guard, {0: 5}))
+        self.assertFalse(self._copy_guard_value(guard, {0: 2}))
+        self.assertFalse(self._copy_guard_value(guard, {0: 8}))
+
+    def _copy_guard_value(self, guard: Any, pid_by_dim: dict[int, int]) -> bool:
+        jax_mod = types.ModuleType("jax")
+        experimental_mod = types.ModuleType("jax.experimental")
+        pallas_mod = types.ModuleType("jax.experimental.pallas")
+
+        def program_id(dim: int) -> int:
+            return pid_by_dim[dim]
+
+        pallas_module = cast("Any", pallas_mod)
+        experimental_module = cast("Any", experimental_mod)
+        jax_module = cast("Any", jax_mod)
+        pallas_module.program_id = program_id
+        experimental_module.pallas = pallas_mod
+        jax_module.experimental = experimental_mod
+
+        with patch.dict(
+            sys.modules,
+            {
+                "jax": jax_mod,
+                "jax.experimental": experimental_mod,
+                "jax.experimental.pallas": pallas_mod,
+            },
+        ):
+            return bool(_pallas_copy_guard(guard))
 
 
 class TestPallasBoolExpandCodegen(TestCase):
@@ -3229,13 +3272,15 @@ class TestPallas(TestCase):
             return x
 
         x = torch.randn(32, 256, device=DEVICE, dtype=torch.float32)
-        code, _ = code_and_output(
+        expected = x.cpu().clone()
+        code, result = code_and_output(
             fn,
             (x,),
             block_sizes=[16, 128],
             pallas_loop_type="emit_pipeline",
         )
         self.assertIn("pltpu.emit_pipeline", code)
+        torch.testing.assert_close(result.cpu(), expected)
 
     def test_stack_lowering(self) -> None:
         x = torch.randn(8, 128, device=DEVICE, dtype=torch.float32)
@@ -3316,29 +3361,118 @@ class TestPallas(TestCase):
         are exact multiples of the block size). Regression test for the
         "emit_pipeline fails on unaligned dims" limitation.
         """
+
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def segment_add(
+            x: torch.Tensor, offsets: torch.Tensor, values: torch.Tensor
+        ) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for g in hl.grid(offsets.size(0) - 1):
+                start = offsets[g]
+                end = offsets[g + 1]
+                value = values[g]
+                for tile in hl.tile(start, end):
+                    out[tile, :, :] = x[tile, :, :] + value
+            return out
+
         # Arbitrary, deliberately non-block-aligned segment bounds covering
-        # [0, 48) so the output is fully written (out = x + 1 everywhere).
-        offsets = torch.tensor([0, 10, 31, 48], device=DEVICE, dtype=torch.int32)
-        x = torch.randn(48, 128, device=DEVICE, dtype=torch.float32)
+        # [0, 48). Segment-specific values make an overrun observable.
+        offset_values = [0, 10, 31, 48]
+        offsets = torch.tensor(offset_values, device=DEVICE, dtype=torch.int32)
+        values = torch.tensor([1.0, 3.0, 7.0], device=DEVICE, dtype=torch.float32)
+        x = torch.randn(48, 4, 128, device=DEVICE, dtype=torch.float32)
         code, result = code_and_output(
-            pallas_jagged_segment_add,
-            (x, offsets),
+            segment_add,
+            (x, offsets, values),
             block_sizes=[16],
             pallas_loop_type="emit_pipeline",
         )
         self.assertIn("pltpu.emit_pipeline", code)
-        # The fix: dynamic ds slice + BoundedSlice block for the runtime begin.
+        # Dynamic begin stays in the output BlockSpec, and its extent is
+        # clamped so a short final tile cannot overrun into the next segment.
         self.assertIn("pl.BoundedSlice", code)
-        self.assertIn("pl.ds(", code)
-        # Load/store asymmetry: the input spec reads a full block (the over-read
-        # past ``end`` is zeroed by the mask), while the output spec clamps its
-        # extent to min(block, end - offset) so a short final tile writes only
-        # its valid rows instead of overrunning into the next segment.
-        in_part, _, out_part = code.partition("out_specs=")
-        self.assertIn("in_specs=", in_part)
-        self.assertNotIn("jnp.minimum", in_part)  # input: full block
-        self.assertIn("jnp.minimum", out_part)  # output: clamped extent
-        torch.testing.assert_close(result, x + 1.0, rtol=1e-5, atol=1e-5)
+        self.assertIn("out_specs=", code)
+        out_specs = code.split("out_specs=", 1)[1].split("compiler_params=", 1)[0]
+        self.assertIn("pl.ds(", out_specs)
+        self.assertIn("jnp.minimum(", out_specs)
+        self.assertRegex(out_specs.split("jnp.minimum(", 1)[1], r"end\s*-")
+        self.assertRegex(code, r"\bout_vmem(?:\[[^\n]*\])?\s*=")
+        self.assertNotRegex(code, r"out\[\s*pl\.ds\(")
+        expected = x.clone()
+        for g in range(len(offset_values) - 1):
+            start, end = offset_values[g], offset_values[g + 1]
+            expected[start:end] = x[start:end] + values[g]
+        torch.testing.assert_close(result, expected, rtol=1e-5, atol=1e-5)
+
+    def test_ordered_carry_marks_group_grid_arbitrary(self) -> None:
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def jagged_bmm(
+            offsets: torch.Tensor, x: torch.Tensor, w: torch.Tensor
+        ) -> torch.Tensor:
+            length, d = x.size()
+            k = w.size(1)
+            out = torch.empty([length, k], dtype=x.dtype, device=x.device)
+            for group in hl.grid(offsets.size(0) - 1):
+                start = offsets[group]
+                end = offsets[group + 1]
+                for rows in hl.tile(start, end):
+                    for cols in hl.tile(k):
+                        acc = hl.zeros([rows, cols], dtype=torch.float32)
+                        for reduction in hl.tile(d):
+                            acc = acc + torch.matmul(
+                                x[rows, reduction], w[reduction, cols]
+                            )
+                        out[rows, cols] = acc.to(out.dtype)
+            return out
+
+        offsets = torch.tensor([0, 10, 33, 40], device=DEVICE, dtype=torch.int32)
+        x = torch.randn(40, 16, device=DEVICE, dtype=torch.float32)
+        w = torch.randn(16, 16, device=DEVICE, dtype=torch.float32)
+        bound = jagged_bmm.bind((offsets, x, w))
+        code = bound.to_code(
+            helion.Config(block_sizes=[16, 16, 16], pallas_loop_type="emit_pipeline")
+        )
+
+        self.assertIn("_scratch_shapes=", code)
+        self.assertIn("_pallas_arbitrary_grid_dims=(0,)", code)
+
+    def test_ordered_carry_dma_aligned_output_uses_vmem_relative_save(self) -> None:
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def jagged_bmm(
+            offsets: torch.Tensor, x: torch.Tensor, w: torch.Tensor
+        ) -> torch.Tensor:
+            length, d = x.size()
+            k = w.size(1)
+            out = torch.empty([length, k], dtype=x.dtype, device=x.device)
+            for group in hl.grid(offsets.size(0) - 1):
+                start = offsets[group]
+                end = offsets[group + 1]
+                for rows, cols in hl.tile([start, 0], [end, k]):
+                    acc = hl.zeros([rows, cols], dtype=torch.float32)
+                    for reduction in hl.tile(d):
+                        acc = acc + torch.matmul(x[rows, reduction], w[reduction, cols])
+                    out[rows, cols] = acc.to(out.dtype)
+            return out
+
+        offsets = torch.tensor([0, 10, 33, 40], device=DEVICE, dtype=torch.int32)
+        x = torch.randn(40, 16, device=DEVICE, dtype=torch.float32)
+        w = torch.randn(16, 128, device=DEVICE, dtype=torch.float32)
+        code = jagged_bmm.bind((offsets, x, w)).to_code(
+            helion.Config(block_sizes=[16, 128, 16], pallas_loop_type="emit_pipeline")
+        )
+
+        self.assertIn("out_vmem", code)
+        self.assertIn("_pallas_arbitrary_grid_dims=(0,)", code)
+        carry_save_lines = [
+            line
+            for line in code.splitlines()
+            if "jnp.where" in line and "out_vmem[" in line
+        ]
+        self.assertTrue(carry_save_lines, "expected carry save from out_vmem")
+        self.assertTrue(
+            any(" - offset_" in line and "), :]" in line for line in carry_save_lines),
+            "\n".join(carry_save_lines),
+        )
 
     def test_emit_pipeline_static_begin_keeps_block_index(self) -> None:
         """Control: a static (zero-begin) inner loop must NOT switch to the
@@ -6470,33 +6604,34 @@ class TestPallas(TestCase):
                     )
             return out
 
-        def normalized_block_sizes_and_code(max_m: int) -> tuple[list[int], str]:
+        def normalized_config(max_m: int) -> tuple[Any, helion.Config]:
             feature_counts = torch.randint(
                 1, max_m + 1, (32,), device=DEVICE, dtype=torch.int32
             )
             bound = k.bind((feature_counts, max_m))
             config = helion.Config(block_sizes=[16, 8])
             bound.config_spec.normalize(config)
-            try:
-                code = bound.to_triton_code(config)
-            except Exception as error:
-                if "torch._inductor.codegen.pallas" not in str(error):
-                    raise
-                code = ""
+            return bound, config
+
+        def normalized_block_sizes(config: helion.Config) -> list[int]:
             block_sizes = config["block_sizes"]
             assert isinstance(block_sizes, list)
-            return cast("list[int]", block_sizes), code
+            return cast("list[int]", block_sizes)
 
-        small_block_sizes, small_code = normalized_block_sizes_and_code(8)
+        small_bound, small_config = normalized_config(8)
+        small_block_sizes = normalized_block_sizes(small_config)
         self.assertEqual(small_block_sizes, [32, 8])
-        if small_code:
-            self.assertIn(
-                "pl.ds(pl.multiple_of(offset_1, 128), _BLOCK_SIZE_1)",
-                small_code,
-            )
+        small_code = small_bound.to_triton_code(small_config)
+        self.assertIn(
+            "pl.ds(pl.multiple_of(offset_1, 128), _BLOCK_SIZE_1)",
+            small_code,
+        )
 
-        large_block_sizes, _large_code = normalized_block_sizes_and_code(256)
+        large_bound, large_config = normalized_config(256)
+        large_block_sizes = normalized_block_sizes(large_config)
         self.assertEqual(large_block_sizes, [32, 128])
+        large_code = large_bound.to_triton_code(large_config)
+        self.assertIsInstance(large_code, str)
 
     def test_jagged_tile_alignment_cap_specializes_symbolic_host_dim(self) -> None:
         @helion.kernel(backend="pallas", static_shapes=False)
@@ -6604,10 +6739,15 @@ class TestPallas(TestCase):
         config = Config(pallas_loop_type="fori_loop")
         code = kernel_with_0d_arg.bind((x, scalar, y)).to_code(config)
 
-        self.assertIn(
-            "_block_spec_info=[((128, 128), (0, 1)), None, ((128, 128), (0, 1)), ((128, 128), (0, 1))]",
-            code,
-        )
+        match = re.search(r"_block_spec_info=(\[[^\]]*\])", code)
+        self.assertIsNotNone(match, "expected _block_spec_info in launcher call")
+        block_spec_info = ast.literal_eval(match.group(1))
+        tensor_block_spec = ((128, 128), (0, 1))
+        self.assertEqual(len(block_spec_info), 4)
+        self.assertEqual(block_spec_info[0], tensor_block_spec)
+        self.assertIsNone(block_spec_info[1])
+        self.assertEqual(block_spec_info[2], tensor_block_spec)
+        self.assertEqual(block_spec_info[3], tensor_block_spec)
 
 
 @skipUnlessPallas("JAX/Pallas TPU not available")
