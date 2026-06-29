@@ -42,6 +42,7 @@ import helion
 from helion._testing import DEVICE
 from helion._testing import run_example
 import helion.language as hl
+from helion.runtime.settings import _get_backend
 
 # %%
 # Grouped GEMM Kernel - Basic Implementation
@@ -111,7 +112,7 @@ def grouped_gemm_jagged(
 
 # %%
 @helion.kernel(static_shapes=False)
-def grouped_gemm_jagged_persistent(
+def _grouped_gemm_jagged_persistent(
     A_packed: torch.Tensor,  # [total_M, K]
     B: torch.Tensor,  # [K, N]
     group_offsets: torch.Tensor,  # [G+1], row offsets into A_packed
@@ -223,6 +224,72 @@ def grouped_gemm_jagged_persistent(
                         )
 
     return out
+
+
+@helion.kernel(static_shapes=False)
+def _grouped_gemm_jagged_persistent_pallas(
+    A_packed: torch.Tensor,  # [total_M, K]
+    B: torch.Tensor,  # [K, N]
+    group_offsets: torch.Tensor,  # [G+1], row offsets into A_packed
+) -> torch.Tensor:
+    """
+    Pallas persistent grouped GEMM with structural output tiles.
+
+    Pallas does not support Cartesian tensor-indexed stores today, so this keeps
+    persistent worker assignment while using one indirect row dimension.
+    """
+    num_workers = helion.runtime.get_num_sm(A_packed.device)
+
+    BLOCK_M = hl.register_block_size(32, 128)
+    BLOCK_N = hl.register_block_size(32, 128)
+    total_M, K = A_packed.shape
+    K2, N = B.shape
+    assert K == K2
+
+    out = torch.zeros(
+        total_M,
+        N,
+        dtype=torch.promote_types(A_packed.dtype, B.dtype),
+        device=A_packed.device,
+    )
+
+    G = group_offsets.size(0) - 1
+
+    for worker_id in hl.grid(num_workers):
+        for g in hl.grid(G):
+            group_start = group_offsets[g]
+            group_end = group_offsets[g + 1]
+            m_size = group_end - group_start
+
+            if m_size > 0:
+                num_n_tiles = (N + BLOCK_N - 1) // BLOCK_N
+
+                for tile_m, tile_n in hl.tile(
+                    [m_size, N], block_size=[BLOCK_M, BLOCK_N]
+                ):
+                    # pyrefly: ignore[unsupported-operation]
+                    tile_in_group = tile_m.id * num_n_tiles + tile_n.id
+                    # pyrefly: ignore[unsupported-operation]
+                    rows = group_start + tile_m.index
+                    # pyrefly: ignore[unsupported-operation]
+                    if tile_in_group % num_workers == worker_id:
+                        acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+
+                        for k_tile in hl.tile(K):
+                            a_blk = A_packed[rows, k_tile]
+                            b_blk = B[k_tile, tile_n]
+                            acc = torch.addmm(acc, a_blk, b_blk)
+
+                        out[rows, tile_n] = acc.to(out.dtype)
+
+    return out
+
+
+grouped_gemm_jagged_persistent = (
+    _grouped_gemm_jagged_persistent_pallas
+    if _get_backend() == "pallas"
+    else _grouped_gemm_jagged_persistent
+)
 
 
 # %%
