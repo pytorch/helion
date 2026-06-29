@@ -1016,6 +1016,23 @@ class DeviceFunction:
         assert isinstance(call_statement, ExtendedAST)
         # Mark the kernel call so we can find it in codegen_precompile_def
         call_statement._is_kernel_call = True
+        phase_host_var = getattr(self.codegen, "_pallas_barrier_phase_host_var", None)
+        if (
+            env.backend.name == "pallas"
+            and env.has_barrier
+            and phase_host_var is not None
+            and len(self.codegen.host_function.device_ir.phases) > 1
+        ):
+            return create(
+                ast.For,
+                target=create(ast.Name, id=phase_host_var, ctx=ast.Store()),
+                iter=expr_from_string(
+                    f"range({len(self.codegen.host_function.device_ir.phases)})"
+                ),
+                body=[call_statement],
+                orelse=[],
+                type_comment=None,
+            )
         return call_statement
 
     def dead_code_elimination(self) -> None:

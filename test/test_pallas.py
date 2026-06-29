@@ -9,6 +9,7 @@ from typing import Any
 from typing import Callable
 from typing import cast
 import unittest
+from unittest.mock import patch
 
 from examples.geglu import _geglu_pallas as _geglu_pallas_example
 from examples.swiglu import _swiglu_fwd_pallas as _swiglu_fwd_pallas_example
@@ -17,6 +18,7 @@ from torch.testing._internal.common_utils import instantiate_parametrized_tests
 from torch.testing._internal.common_utils import parametrize
 
 import helion
+from helion._compiler.backend import PallasBackend
 from helion._testing import DEVICE
 from helion._testing import TestCase
 from helion._testing import code_and_output
@@ -529,6 +531,24 @@ def pallas_tunable_prefix_reduction(x: torch.Tensor) -> torch.Tensor:
     out = torch.empty([x.size(0)], dtype=x.dtype, device=x.device)
     for tile_m in hl.tile(x.size(0)):
         out[tile_m] = torch.sum(tmp[tile_m, :] + x[tile_m, None], dim=-1)
+    return out
+
+
+@helion.kernel(backend="pallas", static_shapes=True)
+def pallas_barrier_scalar_minor_temp(x: torch.Tensor) -> torch.Tensor:
+    m = x.size(0)
+    n = hl.specialize(x.size(1))
+    width = hl.register_tunable("width", PowerOfTwoFragment(4, 16, 8))
+    tmp = torch.zeros([m, n, width], dtype=x.dtype, device=x.device)
+    out = torch.empty_like(x)
+
+    for tile_m, tile_w in hl.tile([m, width], block_size=[None, 1]):
+        tmp[tile_m, :, tile_w.id] = x[tile_m, :] + tile_w.id
+
+    hl.barrier()
+
+    for tile_m in hl.tile(m, block_size=4):
+        out[tile_m, :] = torch.sum(tmp[tile_m, :, :], dim=-1)
     return out
 
 
@@ -3746,6 +3766,45 @@ class TestPallas(TestCase):
             width=8,
         )
         torch.testing.assert_close(result, x * 8)
+
+    def test_barrier_phase_codegen_initializes_shared_pid_for_persistent_phase_launch(
+        self,
+    ) -> None:
+        original_supports_config_key = PallasBackend.supports_config_key
+
+        def supports_pid_type(backend: PallasBackend, key: str) -> bool:
+            return key == "pid_type" or original_supports_config_key(backend, key)
+
+        x = torch.empty((17, 128), dtype=torch.float32)
+        config = helion.Config(
+            block_sizes=[16],
+            pid_type="persistent_blocked",
+            width=8,
+        )
+        with patch.object(PallasBackend, "supports_config_key", supports_pid_type):
+            code = pallas_barrier_scalar_minor_temp.bind((x,)).to_code(config)
+
+        init = "pid_shared = pl.program_id(0)"
+        self.assertIn(init, code)
+        self.assertLess(code.index(init), code.index("@pl.when"))
+
+    @xfailIfPallasInterpret("barrier phase launches require TPU Pallas runtime")
+    def test_barrier_scalar_minor_temp_repeated_calls(self) -> None:
+        width = 8
+        config = helion.Config(
+            block_sizes=[16],
+            pid_type="persistent_blocked",
+            width=width,
+        )
+        x0 = torch.randn(17, 128, device=DEVICE, dtype=torch.float32)
+        compiled = pallas_barrier_scalar_minor_temp.bind((x0,)).compile_config(config)
+
+        for seed in range(3):
+            torch.manual_seed(seed)
+            x = torch.randn(17, 128, device=DEVICE, dtype=torch.float32)
+            result = compiled(x)
+            expected = x * width + (width * (width - 1) // 2)
+            torch.testing.assert_close(result, expected)
 
     def test_scalar_access_1D_constexpr(self) -> None:
         @helion.kernel(backend="pallas", static_shapes=True, config=helion.Config())

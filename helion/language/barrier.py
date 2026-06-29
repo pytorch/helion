@@ -57,6 +57,12 @@ def _(state: CodegenState) -> object:
     return expr_from_string("None")
 
 
+@_decorators.codegen(barrier, "pallas")
+def _(state: CodegenState) -> object:
+    # Pallas uses host-side multi-launch phase splitting for grid barriers.
+    return expr_from_string("None")
+
+
 @_decorators.ref(barrier)
 def _() -> None:
     # No-op in ref/interpret mode
