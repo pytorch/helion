@@ -2809,6 +2809,9 @@ class PallasBackend(Backend):
         if CompileEnvironment.current().settings.pallas_interpret:
             launcher_args.append("_pallas_interpret=True")
 
+        if device_fn.carry_scratch:
+            launcher_args.append("_pallas_arbitrary_grid_dims=(0,)")
+
         # No-tiling pure 2D matmul: emit ``_matmul_dot_general=...`` so the
         # launcher uses ``jax.jit(lax.dot_general(...))`` instead of
         # ``pl.pallas_call(...)``. XLA can then attach cross_program_prefetch,
