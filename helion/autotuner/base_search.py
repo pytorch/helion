@@ -309,13 +309,12 @@ class BaseSearch(BaseAutotuner):
         )
         # Analyze search space if logging is enabled
         if self.settings.autotune_log_search_space:
-            from .search_space_logger import (
-                FeatureExplorationTracker,
-                SearchSpaceSummary,
-                analyze_search_space,
-            )
+            from .search_space_logger import FeatureExplorationTracker
+            from .search_space_logger import analyze_search_space
 
-            hardware_spec, specialization_key = self._get_current_hardware_and_specialization()
+            hardware_spec, specialization_key = (
+                self._get_current_hardware_and_specialization()
+            )
             self._search_summary = analyze_search_space(
                 self.config_spec,
                 kernel_name=kernel_name,
@@ -594,11 +593,8 @@ class BaseSearch(BaseAutotuner):
             )
         # Log search space analysis
         if self.settings.autotune_log_search_space and self._search_summary is not None:
-            from .search_space_logger import (
-                ExplorationReport,
-                log_search_space_comparison,
-                save_search_space_summary,
-            )
+            from .search_space_logger import log_search_space_comparison
+            from .search_space_logger import save_search_space_summary
 
             log_search_space_comparison(
                 self.log._logger,

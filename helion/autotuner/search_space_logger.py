@@ -20,10 +20,8 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping
-    from ..runtime.config import Config
     from ..autotuner.config_spec import ConfigSpec
-    from ..autotuner.block_id_sequence import BlockIdSequence
+    from ..runtime.config import Config
 
 log = logging.getLogger(__name__)
 
@@ -99,7 +97,9 @@ class SearchSpaceSummary:
             else "infinite"
         )
         logger.log(level, f"Search space for {self.kernel_name}:")
-        logger.log(level, f"  Backend: {self.backend}, Hardware: {self.hardware or 'unknown'}")
+        logger.log(
+            level, f"  Backend: {self.backend}, Hardware: {self.hardware or 'unknown'}"
+        )
         logger.log(level, f"  Total search space size: {size_str}")
         logger.log(level, f"  Search dimensions: {len(self.dimensions)}")
         if self.disabled_features:
@@ -107,7 +107,9 @@ class SearchSpaceSummary:
             for feat in self.disabled_features[:10]:
                 logger.log(level, f"    - {feat}")
             if len(self.disabled_features) > 10:
-                logger.log(level, f"    ... and {len(self.disabled_features) - 10} more")
+                logger.log(
+                    level, f"    ... and {len(self.disabled_features) - 10} more"
+                )
         if self.shape_constraints:
             logger.log(level, f"  Shape constraints ({len(self.shape_constraints)}):")
             for constraint in self.shape_constraints[:5]:
@@ -183,15 +185,26 @@ class ExplorationReport:
         logger.log(level, f"\nFeature Exploration Report for {self.kernel_name}:")
         logger.log(level, f"  Backend: {self.backend}")
         logger.log(level, f"  Search algorithm: {self.search_algorithm}")
-        logger.log(level, f"  Time: {self.elapsed_seconds:.1f}s, Configs tested: {self.configs_tested:,}")
+        logger.log(
+            level,
+            f"  Time: {self.elapsed_seconds:.1f}s, Configs tested: {self.configs_tested:,}",
+        )
 
         if self.total_search_space_size is not None:
-            overall_coverage = (self.configs_tested / self.total_search_space_size) * 100
-            logger.log(level, f"  Overall search space coverage: {overall_coverage:.6f}%")
+            overall_coverage = (
+                self.configs_tested / self.total_search_space_size
+            ) * 100
+            logger.log(
+                level, f"  Overall search space coverage: {overall_coverage:.6f}%"
+            )
 
-        logger.log(level, f"  Per-feature exploration:")
-        logger.log(level, f"    Average feature coverage: {self.avg_feature_coverage:.1f}%")
-        logger.log(level, f"    Minimum feature coverage: {self.min_feature_coverage:.1f}%")
+        logger.log(level, "  Per-feature exploration:")
+        logger.log(
+            level, f"    Average feature coverage: {self.avg_feature_coverage:.1f}%"
+        )
+        logger.log(
+            level, f"    Minimum feature coverage: {self.min_feature_coverage:.1f}%"
+        )
 
         # List all features with their exploration stats
         for stats in sorted(self.feature_stats, key=lambda s: s.coverage_percent):
@@ -200,10 +213,13 @@ class ExplorationReport:
         # Highlight poorly explored features
         poor_coverage = [s for s in self.feature_stats if s.coverage_percent < 50.0]
         if poor_coverage:
-            logger.log(level, f"\n  Features with <50% exploration:")
+            logger.log(level, "\n  Features with <50% exploration:")
             for stats in poor_coverage:
-                logger.log(level, f"    - {stats.feature_name}: only {len(stats.tested_values)} "
-                          f"of {len(stats.all_possible_values)} values tested")
+                logger.log(
+                    level,
+                    f"    - {stats.feature_name}: only {len(stats.tested_values)} "
+                    f"of {len(stats.all_possible_values)} values tested",
+                )
 
 
 class FeatureExplorationTracker:
@@ -250,16 +266,20 @@ class FeatureExplorationTracker:
             else:
                 coverage = 0.0
 
-            feature_stats.append(FeatureExplorationStats(
-                feature_name=dim.name,
-                all_possible_values=all_values,
-                tested_values=tested_values,
-                coverage_percent=coverage,
-            ))
+            feature_stats.append(
+                FeatureExplorationStats(
+                    feature_name=dim.name,
+                    all_possible_values=all_values,
+                    tested_values=tested_values,
+                    coverage_percent=coverage,
+                )
+            )
 
         # Calculate aggregate metrics
         if feature_stats:
-            avg_coverage = sum(s.coverage_percent for s in feature_stats) / len(feature_stats)
+            avg_coverage = sum(s.coverage_percent for s in feature_stats) / len(
+                feature_stats
+            )
             min_coverage = min(s.coverage_percent for s in feature_stats)
         else:
             avg_coverage = 0.0
@@ -378,7 +398,9 @@ def analyze_search_space(
                 )
 
     if config_spec.cute_flash_search_enabled:
-        shape_constraints.append("CuTe flash attention search enabled (restricted surface)")
+        shape_constraints.append(
+            "CuTe flash attention search enabled (restricted surface)"
+        )
 
     if config_spec.epilogue_subtile_autotune_choices is not None:
         shape_constraints.append(
@@ -414,19 +436,10 @@ def _analyze_dimension_size(
     key: str,
 ) -> SearchSpaceDimension | None:
     """Analyze the size of one config dimension."""
-    from ..autotuner.config_spec import (
-        VALID_PID_TYPES,
-        VALID_MAXNREG,
-        AUTOTUNED_PALLAS_LOOP_TYPES,
-        VALID_PALLAS_LOOP_TYPES,
-    )
-    from ..autotuner.config_fragment import (
-        IntegerFragment,
-        PowerOfTwoFragment,
-        EnumFragment,
-        BooleanFragment,
-        ListOf,
-    )
+    from ..autotuner.config_fragment import IntegerFragment
+    from ..autotuner.config_spec import AUTOTUNED_PALLAS_LOOP_TYPES
+    from ..autotuner.config_spec import VALID_MAXNREG
+    from ..autotuner.config_spec import VALID_PALLAS_LOOP_TYPES
 
     # Handle special cases
     if key == "block_sizes":
@@ -439,10 +452,12 @@ def _analyze_dimension_size(
             name="block_sizes",
             dim_type="discrete",
             size=total,
-            constrained_by="tensor numel constraints" if config_spec.tensor_numel_constraints else None,
+            constrained_by="tensor numel constraints"
+            if config_spec.tensor_numel_constraints
+            else None,
         )
 
-    elif key == "pid_type":
+    if key == "pid_type":
         return SearchSpaceDimension(
             name="pid_type",
             dim_type="categorical",
@@ -450,7 +465,7 @@ def _analyze_dimension_size(
             values=list(config_spec.allowed_pid_types),
         )
 
-    elif key == "num_warps":
+    if key == "num_warps":
         # num_warps is typically [1, 32] power-of-two
         return SearchSpaceDimension(
             name="num_warps",
@@ -459,7 +474,7 @@ def _analyze_dimension_size(
             values=[1, 2, 4, 8, 16, 32],
         )
 
-    elif key == "num_stages":
+    if key == "num_stages":
         frag = config_spec._num_stages_fragment()
         if isinstance(frag, IntegerFragment):
             size = frag.max_value - frag.min_value + 1
@@ -467,7 +482,9 @@ def _analyze_dimension_size(
                 name="num_stages",
                 dim_type="discrete",
                 size=size,
-                values=list(range(frag.min_value, frag.max_value + 1)) if size <= 20 else None,
+                values=list(range(frag.min_value, frag.max_value + 1))
+                if size <= 20
+                else None,
             )
 
     elif key == "maxnreg":
@@ -496,7 +513,11 @@ def _analyze_dimension_size(
 
     elif key == "pallas_loop_type":
         if config_spec.has_pallas_inner_loops:
-            choices = VALID_PALLAS_LOOP_TYPES if config_spec.has_symbolic_or_data_dependent_bounds else AUTOTUNED_PALLAS_LOOP_TYPES
+            choices = (
+                VALID_PALLAS_LOOP_TYPES
+                if config_spec.has_symbolic_or_data_dependent_bounds
+                else AUTOTUNED_PALLAS_LOOP_TYPES
+            )
             return SearchSpaceDimension(
                 name="pallas_loop_type",
                 dim_type="categorical",
@@ -535,7 +556,7 @@ def _analyze_dimension_size(
         return SearchSpaceDimension(
             name="l2_groupings",
             dim_type="discrete",
-            size=per_slot_size ** num_specs,
+            size=per_slot_size**num_specs,
             constrained_by=f"{num_specs} loop(s)",
         )
 
@@ -547,7 +568,7 @@ def _analyze_dimension_size(
         return SearchSpaceDimension(
             name="flatten_loops",
             dim_type="discrete",
-            size=2 ** num_specs,
+            size=2**num_specs,
             constrained_by=f"{num_specs} loop(s)",
         )
 
@@ -600,6 +621,7 @@ def _get_disable_reason(config_spec: ConfigSpec, key: str) -> str:
 
     # Check if it's a backend-specific key
     from ..autotuner.config_spec import BACKEND_SPECIFIC_KEYS
+
     if key in BACKEND_SPECIFIC_KEYS:
         return f"Not supported by {backend_name} backend"
 
@@ -628,20 +650,25 @@ def log_search_space_comparison(
 
     summary.log_summary(logger, logging.INFO)
 
-    if summary.total_search_space_size is not None and summary.total_search_space_size > 0:
+    if (
+        summary.total_search_space_size is not None
+        and summary.total_search_space_size > 0
+    ):
         coverage = (configs_tested / summary.total_search_space_size) * 100
-        logger.info(f"\nSearch Coverage:")
+        logger.info("\nSearch Coverage:")
         logger.info(f"  Configs tested: {configs_tested:,}")
         logger.info(f"  Total space: {summary.total_search_space_size:,}")
         logger.info(f"  Coverage: {coverage:.6f}%")
         logger.info(f"  Search algorithm: {search_algorithm}")
         logger.info(f"  Time elapsed: {elapsed_seconds:.1f}s")
         if coverage < 0.01:
-            logger.info(f"  Note: Very low coverage - consider increasing autotune_budget_seconds")
+            logger.info(
+                "  Note: Very low coverage - consider increasing autotune_budget_seconds"
+            )
     else:
-        logger.info(f"\nSearch Coverage:")
+        logger.info("\nSearch Coverage:")
         logger.info(f"  Configs tested: {configs_tested:,}")
-        logger.info(f"  Total space: too large to enumerate")
+        logger.info("  Total space: too large to enumerate")
         logger.info(f"  Search algorithm: {search_algorithm}")
         logger.info(f"  Time elapsed: {elapsed_seconds:.1f}s")
 
