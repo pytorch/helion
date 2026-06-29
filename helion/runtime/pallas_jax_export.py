@@ -42,6 +42,7 @@ if TYPE_CHECKING:
 
     from . import _BlockSpecInfo
     from . import _PallasLoopKind
+    from . import _PallasPhaseCaseMetadata
     from .kernel import Kernel
 
 
@@ -264,6 +265,7 @@ def default_pallas_jax_launcher(
     _ds_pad_dims: list[tuple[int, int, int, int]] | None = None,
     _smem_arg_indices: list[int] | None = None,
     _pallas_interpret: bool | None = None,
+    _pallas_phase_case_metadata: _PallasPhaseCaseMetadata | None = None,
     _pallas_arbitrary_grid_dims: tuple[int, ...] | None = None,
     _kind: _PallasLoopKind | None = None,
     **kwargs: object,
@@ -357,6 +359,7 @@ def default_pallas_jax_launcher(
             _scratch_shapes=_scratch_shapes,
             _pipeline_arg_indices=_pipeline_arg_indices,
             _matmul_dot_general=None,
+            _pallas_phase_case_metadata=_pallas_phase_case_metadata,
             interpret=interpret,
             _pallas_arbitrary_grid_dims=_pallas_arbitrary_grid_dims,
         )
