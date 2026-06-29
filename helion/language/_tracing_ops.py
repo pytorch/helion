@@ -2860,13 +2860,28 @@ def _(state: CodegenState) -> list[object]:
     assert isinstance(state.codegen, GenerateAST)
 
     if graph_info.predicate_is_tensor:
-        raise BackendUnsupported(
-            "pallas",
-            "if-statements with tensor-derived predicates. "
-            "lax.cond requires a scalar predicate, but tensor loads produce "
-            "vectors on TPU due to hardware tiling constraints. "
-            "Use a scalar kernel argument for the condition instead.",
-        )
+        predicate_tensor_numel = graph_info.predicate_tensor_numel
+        assert predicate_tensor_numel is not None
+        if not CompileEnvironment.current().known_equal(predicate_tensor_numel, 1):
+            raise BackendUnsupported(
+                "pallas",
+                "if-statements with multi-element tensor-derived predicates "
+                f"(numel={predicate_tensor_numel}). "
+                "lax.cond requires a scalar predicate.",
+            )
+        predicate_value = state.proxy_arg(0)
+        assert isinstance(predicate_value, torch.Tensor)
+        if predicate_value.ndim > 0:
+            index = ", ".join("0" for _ in range(predicate_value.ndim))
+            if predicate_value.dtype is torch.bool:
+                test = expr_from_string(
+                    f"({{test}}).astype(jnp.int32)[{index}] != 0",
+                    test=test,
+                )
+            else:
+                test = expr_from_string(f"{{test}}[{index}]", test=test)
+        if predicate_value.dtype is not torch.bool:
+            test = expr_from_string("({test}) != 0", test=test)
 
     if_body_stmts: list[ast.AST] = []
     with state.codegen.set_statements(if_body_stmts):
@@ -3298,15 +3313,22 @@ def _(state: CodegenState) -> ast.AST:
         return state.ast_arg(0)
     # Combine float masks via multiplication (equivalent to bool AND).
     mask_expr = " * ".join(mask_exprs)
-    if len(mask_exprs) < len(input_sizes):
-        mask_expr = backend.broadcast_to_expr(
-            mask_expr, state.tile_strategy.shape_str(input_sizes)
-        )
-    # Ensure the masked value literal matches the tensor dtype
     input_dtype = tensor.dtype
+    # Ensure the masked value literal matches the tensor dtype
     other_typed = expr_from_string(
         backend.full_expr([], constant_repr(other), input_dtype)
     )
+    from .._compiler.pallas import codegen as pallas_codegen
+
+    numeric_select = pallas_codegen.numeric_where_expr(
+        expr_from_string(mask_expr),
+        state.ast_arg(0),
+        other_typed,
+        input_dtype,
+    )
+    if numeric_select is not None:
+        return numeric_select
+    mask_expr = f"({mask_expr}) != 0"
     return expr_from_string(
         backend.where_expr(mask_expr, "{expr}", "{other}"),
         expr=state.ast_arg(0),

@@ -363,6 +363,7 @@ class ReductionLoopGraphInfo(ForLoopGraphInfo):
 @dataclasses.dataclass
 class IfGraphInfo(NodeArgsGraphInfo):
     predicate_is_tensor: bool = False
+    predicate_tensor_numel: int | torch.SymInt | None = None
     else_branch: ElseGraphInfo | None = None
 
     if_arg_names: list[str] | None = None
@@ -382,6 +383,7 @@ class IfGraphInfo(NodeArgsGraphInfo):
         return {
             **super().kwargs(),
             "predicate_is_tensor": self.predicate_is_tensor,
+            "predicate_tensor_numel": self.predicate_tensor_numel,
             "else_branch": self.else_branch,
             "if_arg_names": self.if_arg_names,
             "else_arg_names": self.else_arg_names,
@@ -2015,10 +2017,13 @@ class WalkDeviceAST(NodeVisitor):
         body: list[ast.stmt],
         orelse: list[ast.stmt],
     ) -> int:
-        # Track whether the predicate is a tensor with numel > 1
-        predicate_is_tensor = (
-            isinstance(test_proxy, torch.Tensor) and math.prod(test_proxy.shape) > 1
+        predicate_tensor_numel: int | torch.SymInt | None
+        predicate_tensor_numel = (
+            math.prod(test_proxy.shape)
+            if isinstance(test_proxy, torch.Tensor)
+            else None
         )
+        predicate_is_tensor = predicate_tensor_numel is not None
 
         if_branch_rw: ReadWrites = ReadWrites.from_list(body)
         else_branch_rw: ReadWrites = ReadWrites.from_list(orelse)
@@ -2048,6 +2053,7 @@ class WalkDeviceAST(NodeVisitor):
             functools.partial(build_body, stmts=body, rw=if_branch_rw),
             graph_info_cls=IfGraphInfo,
             predicate_is_tensor=predicate_is_tensor,
+            predicate_tensor_numel=predicate_tensor_numel,
             else_branch=else_graph_idx,
         )
         if_graph = cast("IfGraphInfo", self.device_ir.graphs[if_graph_idx])
