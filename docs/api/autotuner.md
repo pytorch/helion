@@ -201,5 +201,59 @@ out = matmul(torch.randn([2048, 2048], device="cuda"),
 
 ```{eval-rst}
 .. automodule:: helion.autotuner.local_cache
-   :members:
+    :members:
 ```
+
+### Search Space Logger
+
+The `search_space_logger` module provides tools to analyze and log the valid search space during autotuning, including which features are enabled/disabled, total search space size, coverage metrics, and per-feature exploration tracking.
+
+```{eval-rst}
+.. automodule:: helion.autotuner.search_space_logger
+    :members:
+    :undoc-members:
+    :show-inheritance:
+```
+
+#### Search Space Analysis Example
+
+When search space logging is enabled (default), you'll see output like:
+
+```
+============================================================
+Autotune Search Space Analysis
+============================================================
+Search space for flash_attention_fwd:
+  Backend: cute, Hardware: NVIDIA H100
+  Total search space size: 2,457,600
+  Search dimensions: 8
+  Disabled features (12):
+    - num_warps: CuTe backend (uses num_threads)
+    - pallas_loop_type: CuTe backend (no Pallas loops)
+    ...
+
+Search Coverage:
+  Configs tested: 128
+  Total space: 2,457,600
+  Coverage: 0.005208%
+  Search algorithm: DifferentialEvolutionSearch
+  Time elapsed: 245.3s
+
+Feature Exploration Report for flash_attention_fwd:
+  Backend: cute
+  Search algorithm: DifferentialEvolutionSearch
+  Time: 245.3s, Configs tested: 128
+  Overall search space coverage: 0.0052%
+  Per-feature exploration:
+    Average feature coverage: 31.2%
+    Minimum feature coverage: 8.3%
+    - loop_orders: 12/120 options tested (10.0%)
+    - pid_type: 2/8 options tested (25.0%)
+    - num_threads: 128/256 options tested (50.0%)
+
+  Features with <50% exploration:
+    - loop_orders: only 12 of 120 values tested
+    - pid_type: only 2 of 8 values tested
+```
+
+This helps identify if the search algorithm is properly exploring the space or getting stuck in local optima.

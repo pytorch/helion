@@ -207,6 +207,87 @@ The budget is checked between generations and during the finishing
 phase. In-flight compiling and benchmarking completes before the
 search stops. The default is ``None`` (no budget).
 
+## Search Space Analysis
+
+Helion automatically logs search space analysis after each autotune run (enabled by default). This feature helps you understand:
+
+- **Which features are being searched** — Shows enabled/disabled config keys and why (backend constraints, hardware limits, kernel properties)
+- **Total search space size** — Calculates the combinatorial space from all search dimensions
+- **Coverage metrics** — How many configs were tested vs. total space
+- **Per-feature exploration** — Exactly how many options of each feature were tested (e.g., "pid_type: 2/8 options tested (25.0%)")
+
+### Example Output
+
+```
+============================================================
+Autotune Search Space Analysis
+============================================================
+Search space for flash_attention_fwd:
+  Backend: cute, Hardware: NVIDIA H100
+  Total search space size: 2,457,600
+  Search dimensions: 8
+  Disabled features (12):
+    - num_warps: CuTe backend (uses num_threads)
+    - pallas_loop_type: CuTe backend (no Pallas loops)
+    - epilogue_subtile: flash attention search (disabled)
+
+Search Coverage:
+  Configs tested: 128
+  Total space: 2,457,600
+  Coverage: 0.005208%
+  Search algorithm: DifferentialEvolutionSearch
+  Time elapsed: 245.3s
+
+Feature Exploration Report for flash_attention_fwd:
+  Backend: cute
+  Search algorithm: DifferentialEvolutionSearch
+  Time: 245.3s, Configs tested: 128
+  Per-feature exploration:
+    Average feature coverage: 31.2%
+    Minimum feature coverage: 8.3%
+    - loop_orders: 12/120 options tested (10.0%)
+    - pid_type: 2/8 options tested (25.0%)
+    - num_threads: 128/256 options tested (50.0%)
+
+  Features with <50% exploration:
+    - loop_orders: only 12 of 120 values tested
+    - pid_type: only 2 of 8 values tested
+```
+
+### Configuration
+
+Control via environment variables or settings:
+
+```bash
+# Disable search space logging (default is enabled)
+export HELION_AUTOTUNE_LOG_SEARCH_SPACE=0
+
+# Save analysis to JSON files
+export HELION_AUTOTUNE_LOG_SEARCH_SPACE_PATH=/tmp/analysis.json
+# Creates: /tmp/analysis.json (search space summary)
+#          /tmp/analysis_exploration.json (per-feature stats)
+```
+
+Or via decorator:
+
+```python
+@helion.kernel(
+    autotune_log_search_space=True,
+    autotune_log_search_space_path="/tmp/analysis.json",
+)
+def my_kernel(x: torch.Tensor) -> torch.Tensor:
+    ...
+```
+
+### Use Cases
+
+1. **Debugging search quality** — Identify if the search algorithm is getting stuck (e.g., only testing 2 of 8 PID types)
+2. **Budget tuning** — Low overall coverage suggests increasing `autotune_budget_seconds`
+3. **Backend comparison** — Compare search spaces across different backends or hardware
+4. **Constraint validation** — Verify that shape-dependent constraints are working as expected
+
+See :py:mod:`helion.autotuner.search_space_logger` for API details.
+
 ## Remote Autotune Cache
 
 Helion ships an ABC, `RemoteCacheBackend`, so the autotune cache can

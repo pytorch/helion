@@ -5,10 +5,12 @@ import collections
 import contextlib
 import dataclasses
 import functools
+import json
 import logging
 import math
 from math import inf
 import os
+from pathlib import Path
 import random
 import re
 import sys
@@ -56,6 +58,8 @@ if TYPE_CHECKING:
     from .config_generation import ConfigGeneration
     from .config_generation import FlatConfig
     from .local_cache import SavedBestConfig
+    from .search_space_logger import FeatureExplorationTracker
+    from .search_space_logger import SearchSpaceSummary
     from helion.autotuner.effort_profile import AutotuneEffortProfile
 
 
@@ -264,6 +268,8 @@ class BaseSearch(BaseAutotuner):
         self._benchmarked_members: dict[Config, PopulationMember] = {}
         self._pinned_finalist_configs: set[Config] = set()
         self._pinned_finalist_members: dict[Config, PopulationMember] = {}
+        self._search_summary: SearchSpaceSummary | None = None
+        self._exploration_tracker: FeatureExplorationTracker | None = None
 
     def _prepare(self) -> None:
         """Some initialization deferred until autotuning actually runs.
@@ -296,10 +302,27 @@ class BaseSearch(BaseAutotuner):
             kernel_name=kernel_name,
             kernel_source=kernel_source,
             input_shapes=input_shapes,
+            dtypes=dtypes,
             hardware=hardware,
             random_seed=self.settings.autotune_random_seed,
             search_algorithm=type(self).__name__,
         )
+        # Analyze search space if logging is enabled
+        if self.settings.autotune_log_search_space:
+            from .search_space_logger import (
+                FeatureExplorationTracker,
+                SearchSpaceSummary,
+                analyze_search_space,
+            )
+
+            hardware_spec, specialization_key = self._get_current_hardware_and_specialization()
+            self._search_summary = analyze_search_space(
+                self.config_spec,
+                kernel_name=kernel_name,
+                specialization_key=specialization_key,
+                hardware=hardware_spec,
+            )
+            self._exploration_tracker = FeatureExplorationTracker(self._search_summary)
         # Per-run identity for the <autotune_log>.meta.jsonl record (written when
         # dataset collection is on); CSV rows join to it on run_id. The sink adds
         # the configs tested.
@@ -455,6 +478,10 @@ class BaseSearch(BaseAutotuner):
             A list of BenchmarkResult entries, one per input config.
         """
         passing_configs, passing_indices = self._apply_config_filter(configs)
+        # Record configs for exploration tracking
+        if self._exploration_tracker is not None:
+            for config in passing_configs:
+                self._exploration_tracker.record_config(config)
         inner_results = self.benchmark_provider.benchmark(passing_configs, desc=desc)
 
         if len(passing_indices) == len(configs):
@@ -565,6 +592,45 @@ class BaseSearch(BaseAutotuner):
                 f"{self._autotune_metrics.num_configs_tested} configs failed due "
                 "to compile failures."
             )
+        # Log search space analysis
+        if self.settings.autotune_log_search_space and self._search_summary is not None:
+            from .search_space_logger import (
+                ExplorationReport,
+                log_search_space_comparison,
+                save_search_space_summary,
+            )
+
+            log_search_space_comparison(
+                self.log._logger,
+                self._search_summary,
+                self._autotune_metrics.num_configs_tested,
+                type(self).__name__,
+                end - start,
+            )
+            if self._exploration_tracker is not None:
+                report = self._exploration_tracker.generate_report(
+                    search_algorithm=type(self).__name__,
+                    elapsed_seconds=end - start,
+                )
+                report.log_summary(self.log._logger)
+            if self.settings.autotune_log_search_space_path:
+                saved_path = save_search_space_summary(
+                    self._search_summary,
+                    self._autotune_metrics.num_configs_tested,
+                    type(self).__name__,
+                    end - start,
+                    self.settings.autotune_log_search_space_path,
+                )
+                self.log(f"Search space analysis saved to: {saved_path}")
+                if self._exploration_tracker is not None:
+                    report_path = self.settings.autotune_log_search_space_path.replace(
+                        ".json", "_exploration.json"
+                    )
+                    Path(report_path).parent.mkdir(parents=True, exist_ok=True)
+                    Path(report_path).write_text(
+                        json.dumps(report.to_dict(), indent=2, default=str)
+                    )
+                    self.log(f"Feature exploration report saved to: {report_path}")
         cached_path = self.kernel.get_cached_path(best)
         if cached_path is not None and is_master_rank():
             self.log(f"Code of selected kernel: {cached_path}")

@@ -595,6 +595,16 @@ class _Settings:
             _env_get_bool, "HELION_TRITON_DO_NOT_SPECIALIZE", False
         )
     )
+    autotune_log_search_space: bool = dataclasses.field(
+        default_factory=functools.partial(
+            _env_get_bool, "HELION_AUTOTUNE_LOG_SEARCH_SPACE", True
+        )
+    )
+    autotune_log_search_space_path: str | None = dataclasses.field(
+        default_factory=functools.partial(
+            _env_get_str, "HELION_AUTOTUNE_LOG_SEARCH_SPACE_PATH", None
+        )
+    )
 
 
 class Settings(_Settings):
@@ -805,6 +815,15 @@ class Settings(_Settings):
             "to pick configs optimal for the actual fused workload. Default False. "
             "Has no effect unless torch_compile_fusion is also True. "
             "Set HELION_AUTOTUNE_WITH_TORCH_COMPILE_FUSION=1 to enable globally."
+        ),
+        "autotune_log_search_space": (
+            "If True, log search space analysis after autotuning including which features "
+            "were enabled/disabled, total search space size, and coverage metrics. "
+            "Set HELION_AUTOTUNE_LOG_SEARCH_SPACE=0 to disable."
+        ),
+        "autotune_log_search_space_path": (
+            "Optional path to save search space analysis JSON. "
+            "Set HELION_AUTOTUNE_LOG_SEARCH_SPACE_PATH=/path/to/analysis.json to save."
         ),
     }
 
