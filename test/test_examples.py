@@ -1640,7 +1640,6 @@ class TestExamples(RefEagerTestBase, TestCase):
                     rtol=rtol,
                 )
 
-    @xfailIfPallasTpu("tensor-derived if-predicates not supported")
     def test_grouped_gemm_jagged(self):
         # Build small jagged grouped GEMM inputs
         torch.manual_seed(0)
