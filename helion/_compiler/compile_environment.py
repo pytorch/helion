@@ -215,6 +215,8 @@ class CompileEnvironment:
     No config or codegen specific state should be stored here.
     """
 
+    tunable_symbols: dict[sympy.Symbol, str]
+
     def __init__(
         self,
         device: torch.device,
@@ -289,6 +291,7 @@ class CompileEnvironment:
         self._foreign_symint_cache: dict[
             tuple[int, sympy.Expr], int | torch.SymInt
         ] = {}
+        self.tunable_symbols = {}
         if settings.autotune_force_persistent or dist.is_initialized():
             for pid_type in (
                 "flat",
