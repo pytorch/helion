@@ -246,7 +246,11 @@ class FeatureExplorationTracker:
         for feature_name in self._feature_value_sets.keys():
             value = _extract_feature_value(config, feature_name)
             if value is not None:
-                self._feature_value_sets[feature_name].add(value)
+                try:
+                    self._feature_value_sets[feature_name].add(value)
+                except TypeError:
+                    # unhashable (e.g. nested list) — coerce to repr for tracking
+                    self._feature_value_sets[feature_name].add(repr(value))
 
     def generate_report(
         self,
@@ -477,12 +481,12 @@ def _analyze_dimension_size(
     if key == "num_stages":
         frag = config_spec._num_stages_fragment()
         if isinstance(frag, IntegerFragment):
-            size = frag.max_value - frag.min_value + 1
+            size = frag.high - frag.low + 1
             return SearchSpaceDimension(
                 name="num_stages",
                 dim_type="discrete",
                 size=size,
-                values=list(range(frag.min_value, frag.max_value + 1))
+                values=list(range(frag.low, frag.high + 1))
                 if size <= 20
                 else None,
             )
