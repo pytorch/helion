@@ -111,7 +111,7 @@
       "ref-eager": false,
       "image": "rocm/dev-ubuntu-24.04:7.0-complete",
       "runtime-version": "rocm7.0",
-      "container-options": "--device=/dev/kfd --device=/dev/dri",
+      "container-options": "--device=/dev/kfd --device=/dev/dri -e HIP_VISIBLE_DEVICES=0 -e ROCR_VISIBLE_DEVICES=0",
       "pytorch-version": "pytorch-nightly",
       "alias": "mi350x",
       "backend": "triton"
