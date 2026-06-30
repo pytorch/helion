@@ -59,7 +59,7 @@ on:
         description: 'Comma-separated list of linear-attention kernels (vs FLA), or `all` for every kernel in benchmarks/run_linattn.py::KERNEL_MAPPINGS.'
         required: false
         type: string
-        default: "linear_attn,retention,simple_gla,gla"
+        default: "linear_attn,linear_attn-bwd,retention,retention-bwd,simple_gla,simple_gla-bwd,gla,gla-bwd"
       env_vars:
         description: 'Environment variables for benchmark runner'
         required: false

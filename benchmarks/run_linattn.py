@@ -3,8 +3,9 @@
 Times the chunked linear-attention kernels in KERNEL_MAPPINGS against FLA and
 reports results in the same JSON format as the GPU benchmark runner
 (benchmarks/run.py). These kernels have no TritonBench operator, so FLA is the
-baseline and helion_speedup is Helion vs FLA. Accuracy gates Helion's drift
-from the fp32 ref_* recurrence to within ACC_FACTOR of FLA's own drift.
+baseline and helion_speedup is Helion vs FLA. Per-shape helion_accuracy reports
+whether Helion's relative error vs the fp32 ref_* recurrence stays within
+ACC_FWD_TOL (forward) and ACC_BWD_TOL (gradients).
 
 Usage:
     python benchmarks/run_linattn.py --output helionbench.json
@@ -33,12 +34,10 @@ if TYPE_CHECKING:
 from helion._testing import DEVICE
 from helion._testing import do_bench
 
-# Helion passes a shape if its drift from the fp32 reference is within
-# ACC_FACTOR of FLA's, so the gate tracks FLA's own bf16 accuracy. The floor
-# keeps the check from being absurdly strict where FLA is near-exact.
-# TODO: 2.0 is a guess; set ACC_FACTOR from measured Helion/FLA drift.
-ACC_FACTOR = 2.0
-ACC_FLOOR = 1e-3
+# Helion passes a shape if its relative error vs the fp32 reference stays under
+# these tolerances. Looser on the backward, which accumulates more bf16 drift.
+ACC_FWD_TOL = 0.02
+ACC_BWD_TOL = 0.05
 
 # bf16 matches FLA's production baseline.
 DTYPE = torch.bfloat16
@@ -84,10 +83,17 @@ KERNEL_MAPPINGS: dict[str, tuple[str, str, str, str | None]] = {
 @dataclass
 class ShapeResult:
     shape: str
-    passed: bool
+    # Forward: accuracy then timings.
+    passed: bool  # forward relative error vs the fp32 ref under ACC_FWD_TOL.
     kernel_time_ms: float = 0.0
     fla_time_ms: float = 0.0
     speedup: float = 0.0  # Helion vs FLA (fla_ms / helion_ms).
+    # Backward: accuracy then timings (0.0 when the backward path could not run).
+    bwd_attempted: bool = False  # backward accuracy/timing was run for this shape.
+    bwd_passed: bool = False  # gradients vs the fp32 ref under ACC_BWD_TOL.
+    fb_kernel_time_ms: float = 0.0
+    fb_fla_time_ms: float = 0.0
+    fb_speedup: float = 0.0
     error: str | None = None
 
 
@@ -122,21 +128,24 @@ def _to_fla_layout(t: torch.Tensor, gate: str | None, is_gate: bool) -> torch.Te
     return t.transpose(1, 2).contiguous()
 
 
+def _rel_error(a: torch.Tensor, b: torch.Tensor) -> float:
+    """Relative L2 error between two tensors (computed in fp32)."""
+    return (a.float() - b.float()).norm().item() / b.float().norm().clamp(
+        min=1e-8
+    ).item()
+
+
 def _accuracy(
     ref_fn: Callable[..., torch.Tensor],
     helion_fn: Callable[..., torch.Tensor],
-    fla_fn: Callable[..., torch.Tensor],
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
     g: torch.Tensor | None,
-    gate: str | None,
     scale: float,
 ) -> bool:
-    """Pass if Helion's forward drift vs the fp32 reference is within
-    ACC_FACTOR of FLA's."""
-    from fla.utils import get_err_ratio  # pyrefly: ignore
-
+    """Pass if Helion's forward relative error vs the fp32 reference is under
+    ACC_FWD_TOL."""
     ref_args = [q.float(), k.float(), v.float()]
     if g is not None:
         ref_args.append(g.float())
@@ -145,19 +154,45 @@ def _accuracy(
 
     h_args = [q, k, v] + ([g] if g is not None else [])
     h_out = helion_fn(*h_args, scale=scale)
+    return _rel_error(h_out, ref) < ACC_FWD_TOL
 
-    f_args = [
-        _to_fla_layout(q, None, False),
-        _to_fla_layout(k, None, False),
-        _to_fla_layout(v, None, False),
-    ]
-    if g is not None:
-        f_args.append(_to_fla_layout(g, gate, True))
-    f_out = fla_fn(*f_args, scale=scale).transpose(1, 2)
 
-    h_ratio = get_err_ratio(h_out, ref)
-    f_ratio = get_err_ratio(f_out, ref)
-    return h_ratio <= max(ACC_FACTOR * f_ratio, ACC_FLOOR)
+def _bwd_accuracy(
+    ref_fn: Callable[..., torch.Tensor],
+    helion_fn: Callable[..., torch.Tensor],
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    g: torch.Tensor | None,
+    scale: float,
+) -> bool:
+    """Pass if every Helion input gradient is within ACC_BWD_TOL relative error
+    of the fp32 reference's gradients (autograd through ref_fn)."""
+    grad_out = torch.randn_like(v)
+
+    def grads(
+        fn: Callable[..., torch.Tensor],
+        args: list[torch.Tensor],
+        go: torch.Tensor,
+    ) -> list[torch.Tensor | None]:
+        leaves = [a.detach().requires_grad_(True) for a in args]
+        fn(*leaves, scale=scale).backward(go)
+        return [lf.grad for lf in leaves]
+
+    ref_args = [q.float(), k.float(), v.float()] + (
+        [g.float()] if g is not None else []
+    )
+    ref_grads = grads(ref_fn, ref_args, grad_out.float())
+
+    h_args = [q, k, v] + ([g] if g is not None else [])
+    h_grads = grads(helion_fn, h_args, grad_out)
+
+    for hg, rg in zip(h_grads, ref_grads, strict=True):
+        if hg is None or rg is None:
+            return False  # every input should be differentiated on both sides.
+        if _rel_error(hg, rg) > ACC_BWD_TOL:
+            return False
+    return True
 
 
 def run_shape(
@@ -183,7 +218,7 @@ def run_shape(
     v = torch.randn(b, h, t, d, dtype=DTYPE, device=DEVICE)
     g = _make_gate(b, t, h, d, gate)
 
-    passed = _accuracy(ref, entry, fla, q, k, v, g, gate, scale)
+    passed = _accuracy(ref, entry, q, k, v, g, scale)
 
     # Transpose to FLA's layout off the timer so FLA isn't charged a tax the
     # head-first Helion kernel does not pay.
@@ -209,7 +244,57 @@ def run_shape(
     h_ms = cast("float", do_bench(helion_fwd))
     f_ms = cast("float", do_bench(fla_fwd))
     speedup = f_ms / h_ms if h_ms > 0 else 0.0
-    return ShapeResult(label, passed, h_ms, f_ms, speedup)
+
+    # Isolated so a backward failure leaves the forward results intact;
+    # bwd_attempted keeps the shape on the "<kernel>-bwd" row as a failure.
+    bwd_attempted = True
+    bwd_passed = False
+    fb_h_ms = fb_f_ms = fb_speedup = 0.0
+    try:
+        bwd_passed = _bwd_accuracy(ref, entry, q, k, v, g, scale)
+
+        # Forward+backward: rebuild the args as grad-enabled leaves (transpose
+        # still off-timer), then time forward + backward through a fixed
+        # grad_out, clearing grads each iteration. Each side gets its own leaves
+        # so neither is charged the other's setup.
+        h_leaves = [a.detach().requires_grad_(True) for a in h_args]
+        f_leaves = [a.detach().requires_grad_(True) for a in f_args]
+        grad_out = torch.randn(b, h, t, d, dtype=DTYPE, device=DEVICE)
+        # FLA's output is token-first; its grad must match. Transpose off-timer.
+        fla_grad_out = _to_fla_layout(grad_out, None, False)
+
+        def helion_fb() -> None:
+            for a in h_leaves:
+                a.grad = None
+            entry(*h_leaves, scale=scale).backward(grad_out)
+
+        def fla_fb() -> None:
+            for a in f_leaves:
+                a.grad = None
+            fla(*f_leaves, scale=scale).backward(fla_grad_out)
+
+        helion_fb()
+        fla_fb()
+        torch.cuda.empty_cache()
+
+        fb_h_ms = cast("float", do_bench(helion_fb))
+        fb_f_ms = cast("float", do_bench(fla_fb))
+        fb_speedup = fb_f_ms / fb_h_ms if fb_h_ms > 0 else 0.0
+    except Exception:
+        torch.cuda.empty_cache()
+
+    return ShapeResult(
+        shape=label,
+        passed=passed,
+        kernel_time_ms=h_ms,
+        fla_time_ms=f_ms,
+        speedup=speedup,
+        fb_kernel_time_ms=fb_h_ms,
+        fb_fla_time_ms=fb_f_ms,
+        fb_speedup=fb_speedup,
+        bwd_attempted=bwd_attempted,
+        bwd_passed=bwd_passed,
+    )
 
 
 def run_kernel(name: str, num_shapes: int | None) -> KernelResult:
@@ -226,11 +311,14 @@ def run_kernel(name: str, num_shapes: int | None) -> KernelResult:
         except Exception as exc:
             sr = ShapeResult(label, passed=False, error=str(exc))
         result.shape_results.append(sr)
-        status = "ok" if sr.passed else f"FAIL ({sr.error})" if sr.error else "FAIL"
+        if sr.error:
+            status = f"FAIL ({sr.error})"
+        else:
+            status = f"fwd {'ok' if sr.passed else 'FAIL'}/bwd {'ok' if sr.bwd_passed else 'FAIL'}"
         print(
-            f"  {name:<12} {sr.shape:<22} {status:<14} "
-            f"helion {sr.kernel_time_ms:>8.3f}ms  fla {sr.fla_time_ms:>8.3f}ms  "
-            f"{sr.speedup * 100:>7.1f}% FLA"
+            f"  {name:<12} {sr.shape:<22} {status:<16} "
+            f"fwd {sr.speedup * 100:>7.1f}% FLA  "
+            f"fwd+bwd {sr.fb_speedup * 100:>7.1f}% FLA"
         )
     return result
 
@@ -262,6 +350,7 @@ def write_results_json(output: str, results: list[KernelResult]) -> None:
         runnable = [sr for sr in result.shape_results if sr.error is None]
         if not runnable:
             continue
+        # helion_accuracy carries the 0/1 pass/fail; speedup/latency are raw.
         shapes = [sr.shape for sr in runnable]
         add_metric(
             result.name,
@@ -276,11 +365,40 @@ def write_results_json(output: str, results: list[KernelResult]) -> None:
             [sr.kernel_time_ms for sr in runnable],
         )
         add_metric(
-            result.name, "helion_speedup", shapes, [sr.speedup for sr in runnable]
+            result.name,
+            "helion_speedup",
+            shapes,
+            [sr.speedup for sr in runnable],
         )
         # FLA is the Triton reference; report it at 1.0 so the dashboard's
         # Triton column reflects the comparison baseline.
         add_metric(result.name, "triton_speedup", shapes, [1.0 for _ in runnable])
+
+        # Forward+backward goes on a separate "<kernel>-bwd" row, over every
+        # shape that attempted backward so failures stay visible.
+        bwd = f"{result.name}-bwd"
+        attempted = [sr for sr in runnable if sr.bwd_attempted]
+        if attempted:
+            bwd_shapes = [sr.shape for sr in attempted]
+            add_metric(
+                bwd,
+                "helion_accuracy",
+                bwd_shapes,
+                [1.0 if sr.bwd_passed else 0.0 for sr in attempted],
+            )
+            add_metric(
+                bwd,
+                "helion_latency_ms",
+                bwd_shapes,
+                [sr.fb_kernel_time_ms for sr in attempted],
+            )
+            add_metric(
+                bwd,
+                "helion_speedup",
+                bwd_shapes,
+                [sr.fb_speedup for sr in attempted],
+            )
+            add_metric(bwd, "triton_speedup", bwd_shapes, [1.0 for _ in attempted])
 
     if os.path.exists(output):
         try:
@@ -310,7 +428,11 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    names = [n.strip() for n in args.kernel.split(",") if n.strip()]
+    # Each kernel emits both a forward and a "<kernel>-bwd" row, so the dispatch
+    # kernel list names both; strip the -bwd suffix back to the base kernel and
+    # de-duplicate before running.
+    requested = [n.strip() for n in args.kernel.split(",") if n.strip()]
+    names = list(dict.fromkeys(n.removesuffix("-bwd") for n in requested))
     unknown = [n for n in names if n not in KERNEL_MAPPINGS]
     if unknown:
         raise SystemExit(
