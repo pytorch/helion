@@ -8,7 +8,7 @@ reference **and** [flash-linear-attention](https://github.com/fla-org/flash-line
 comparing Helion kernel performance against those libraries.
 
 This work builds on ideas from the
-[Attention Engine](https://github.com/fla-org/attention-engine) project.
+Attention Engine project.
 
 ## Dependencies
 
@@ -103,6 +103,5 @@ python -m helion.experimental.aot_runner --phase all \
   Tri Dao -- the Mamba-2 SSD Triton kernel used as baseline for the
   Mamba-2 example.
 
-- [Attention Engine](https://github.com/fla-org/attention-engine) --
-  a DSL-based approach to generating chunked linear attention kernels
-  that inspired the generalized engine design.
+- Attention Engine -- a DSL-based approach to generating chunked linear attention
+  kernels that inspired the generalized engine design.

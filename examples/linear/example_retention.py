@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import math
 from typing import Any
+from typing import cast
 import warnings
 
 import torch
@@ -54,7 +55,9 @@ def test() -> None:
 
     # === Forward: vs FLA ===
     try:
-        from fla.ops.retention import chunk_retention as _fn  # pyrefly: ignore
+        from fla.ops.retention import (  # pyrefly: ignore[missing-import]
+            chunk_retention as _fn,
+        )
 
         chunk_retention: Any = _fn
 
@@ -95,7 +98,9 @@ def test() -> None:
 
     # === Backward: vs FLA (dq comparison) ===
     if _has_fla:
-        from fla.ops.retention import chunk_retention as _fn  # pyrefly: ignore
+        from fla.ops.retention import (  # pyrefly: ignore[missing-import]
+            chunk_retention as _fn,
+        )
 
         chunk_retention: Any = _fn
 
@@ -163,7 +168,9 @@ def benchmark(
     """
     rows: list[tuple[str, float, float, float, float]] = []
     try:
-        from fla.ops.retention import chunk_retention as _fn  # pyrefly: ignore
+        from fla.ops.retention import (  # pyrefly: ignore[missing-import]
+            chunk_retention as _fn,
+        )
 
         chunk_retention: Any = _fn
     except ImportError:
@@ -240,7 +247,15 @@ def benchmark(
             f"{cfg:<24} {fwd_ms:>10.3f} {fla_fwd_ms:>10.3f}"
             f" {fb_ms:>12.3f} {fla_fb_ms:>12.3f}"
         )
-        rows.append((cfg, fwd_ms, fla_fwd_ms, fb_ms, fla_fb_ms))
+        rows.append(
+            (
+                cfg,
+                cast("float", fwd_ms),
+                cast("float", fla_fwd_ms),
+                cast("float", fb_ms),
+                cast("float", fla_fb_ms),
+            )
+        )
 
     return rows
 

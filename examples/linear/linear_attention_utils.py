@@ -31,7 +31,7 @@ def rel_error(a: torch.Tensor | None, b: torch.Tensor | None) -> float:
 
 
 # Thresholds for the dashboard's helion_accuracy gate: Helion's relative L2
-# error vs the fp32 PyTorch reference. 
+# error vs the fp32 PyTorch reference.
 ACC_FWD_TOL = 0.02
 ACC_BWD_TOL = 0.05
 

@@ -45,7 +45,9 @@ def _import_mamba() -> Callable[..., torch.Tensor] | None:
         if m not in sys.modules:
             sys.modules[m] = types.ModuleType(m)
     try:
-        from mamba_ssm.ops.triton.ssd_combined import mamba_chunk_scan_combined
+        from mamba_ssm.ops.triton.ssd_combined import (  # pyrefly: ignore[missing-import]
+            mamba_chunk_scan_combined,
+        )
     except ImportError:
         warnings.warn(
             "mamba_ssm not installed, skipping mamba comparisons", stacklevel=2
@@ -90,17 +92,15 @@ def test() -> None:
     print(f"  fwd vs recurrent: {fwd_err:.4e} PASS")
 
     # === Forward: vs mamba_ssm ===
+    # Build mamba-native inputs and the matching q/k/v/g unconditionally so they
+    # stay bound for the backward comparison below; only the comparison itself is
+    # gated on mamba_ssm being importable.
+    x, dt, A, B_mat, C_mat = _make_mamba_native_inputs(B, H, T, D, DV, DTYPE, DEVICE)
+    q_m = C_mat.transpose(1, 2).contiguous()
+    k_m = B_mat.transpose(1, 2).contiguous()
+    v_m = (x * dt.unsqueeze(-1)).transpose(1, 2).contiguous()
+    g_m = (A[None, None, :] * dt).transpose(1, 2).contiguous()
     if _has_mamba:
-        # Build mamba-native inputs matching the same data
-        x, dt, A, B_mat, C_mat = _make_mamba_native_inputs(
-            B, H, T, D, DV, DTYPE, DEVICE
-        )
-        # Recompute q/k/v/g from mamba inputs for a fair comparison
-        q_m = C_mat.transpose(1, 2).contiguous()
-        k_m = B_mat.transpose(1, 2).contiguous()
-        v_m = (x * dt.unsqueeze(-1)).transpose(1, 2).contiguous()
-        g_m = (A[None, None, :] * dt).transpose(1, 2).contiguous()
-
         out_m = chunked_linear_attn(q_m, k_m, v_m, g_m, C=C)
         o_mamba = mamba_chunk_scan_combined(
             x, dt, A, B_mat, C_mat, chunk_size=C, D=None, dt_softplus=False
