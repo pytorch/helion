@@ -825,6 +825,33 @@ def _kl_div_shapes(
     return out
 
 
+def _xsa_shapes(
+    num_shapes: int | None = None,
+) -> list[tuple[str, tuple[Any, ...]]]:
+    # (B, H, T, D). One shape only: larger shapes default-config-OOM the
+    # scoped VMEM at this kernel's structure (head_dim=64 < 128-element
+    # lane rule keeps inputs on the VMEM-resident block_spec path).
+    configs = [(2, 32, 1024, 64)]
+    if num_shapes is not None:
+        configs = configs[:num_shapes]
+    out: list[tuple[str, tuple[Any, ...]]] = []
+    for b, h, t, d in configs:
+        q = torch.randn(b, h, t, d, device=DEVICE, dtype=torch.float16)
+        k = torch.randn(b, h, t, d, device=DEVICE, dtype=torch.float16)
+        v = torch.randn(b, h, t, d, device=DEVICE, dtype=torch.float16)
+        out.append((f"[{b},{h},{t},{d}]", (q, k, v)))
+    return out
+
+
+def _xsa_baseline(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+    # Lazy import so collection works without torch_tpu present at module
+    # load. ref_xsa is the manual matmul+softmax+epilogue reference; matches
+    # what test_examples checks against.
+    from examples.xsa import ref_xsa
+
+    return ref_xsa(q, k, v)
+
+
 # Kernel mappings for TPU/Pallas benchmarks.
 # Format: kernel_name -> (module_file, kernel_fn_name, baseline_fn, shapes_fn,
 #                         max_mismatch_pct)
@@ -1047,6 +1074,13 @@ KERNEL_MAPPINGS: dict[str, KernelMapping] = {
         "matmul_bias_residual_gelu_cast",
         _epilogue_subtiling_residual_gelu_baseline,
         _epilogue_subtiling_shapes,
+        None,
+    ),
+    "xsa": (
+        "xsa",
+        "xsa_kernel",
+        _xsa_baseline,
+        _xsa_shapes,
         None,
     ),
 }
