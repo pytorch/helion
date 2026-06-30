@@ -426,3 +426,6 @@ Questions or feedback? Join us on the [GPU MODE Discord](https://discord.gg/gpum
 ## License
 
 Helion is BSD-style licensed, as found in the LICENSE file.
+
+<!-- dummy change to test cancel-on-close CI workflow -->
+
