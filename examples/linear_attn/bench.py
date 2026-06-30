@@ -130,10 +130,6 @@ def main() -> None:
     for name, b, t, h, d in SHAPES:
         scale = 1.0 / math.sqrt(d)
 
-        acc = (
-            "skip" if args.no_accuracy else _accuracy(b, t, h, d, scale, args.fwd_only)
-        )
-
         # Transpose to FLA's token-first layout off the timer, so FLA isn't
         # charged a transpose tax our head-first kernel doesn't pay.
         q, k, v = _make_inputs(b, t, h, d, requires_grad=False)
@@ -157,12 +153,16 @@ def main() -> None:
         ) -> torch.Tensor:
             return fla_chunk_linear_attn_native(q, k, v, scale)
 
+        # Warm up so each kernel autotunes on a clean GPU before the timed region.
+        helion_fwd()
+        fla_fwd()
+        torch.cuda.empty_cache()
+
         h_fwd_ms = do_bench(helion_fwd)
         f_fwd_ms = do_bench(fla_fwd)
         fwd_pct = 100.0 * f_fwd_ms / h_fwd_ms  # pyrefly: ignore [unsupported-operation]
 
-        row = f"{name:<22} {acc:>20} {h_fwd_ms:>10.3f}ms {f_fwd_ms:>10.3f}ms {fwd_pct:>9.1f}%"
-
+        fb_cols = ""
         if not args.fwd_only:
             q_g, k_g, v_g = _make_inputs(b, t, h, d, requires_grad=True)
             grad_out = torch.randn(b, h, t, d, dtype=DTYPE, device=DEVICE)
@@ -193,8 +193,6 @@ def main() -> None:
                 fla_chunk_linear_attn_native(q, k, v, scale).backward(go)
                 q.grad = k.grad = v.grad = None
 
-            # Warm up so the backward kernels autotune here and free the memory
-            # before the timed region (else the autotune OOMs: NoConfigFound).
             helion_fb()
             fla_fb()
             torch.cuda.empty_cache()
@@ -202,8 +200,16 @@ def main() -> None:
             h_fb_ms = do_bench(helion_fb)
             f_fb_ms = do_bench(fla_fb)
             fb_pct = 100.0 * f_fb_ms / h_fb_ms  # pyrefly: ignore [unsupported-operation]
-            row += f" {h_fb_ms:>10.3f}ms {f_fb_ms:>10.3f}ms {fb_pct:>9.1f}%"
+            fb_cols = f" {h_fb_ms:>10.3f}ms {f_fb_ms:>10.3f}ms {fb_pct:>9.1f}%"
 
+        acc = (
+            "skip" if args.no_accuracy else _accuracy(b, t, h, d, scale, args.fwd_only)
+        )
+
+        row = (
+            f"{name:<22} {acc:>20} "
+            f"{h_fwd_ms:>10.3f}ms {f_fwd_ms:>10.3f}ms {fwd_pct:>9.1f}%" + fb_cols
+        )
         rows.append(row)
 
     header = (
