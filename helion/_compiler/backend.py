@@ -1235,6 +1235,14 @@ class TritonBackend(Backend):
         # nothing is ever loaded/stored for the empty reduction dimension.
         return f"tl.zeros([1], {dtype})"
 
+    def static_rdim_size(self, numel: int) -> int:
+        # Pair with reduction_index_zero_expr: an empty (length-0) axis uses a
+        # length-1 index, so its block extent must also be 1, not 0. Triton
+        # rejects length-0 block shapes (is_power_of_two(0) is False), and a
+        # 0-extent value would also mismatch the length-1 index shape in the
+        # generated tl.store/tl.load. The all-False mask keeps it a no-op.
+        return max(super().static_rdim_size(numel), 1)
+
     def next_power_of_2_host_expr(self, expr: str) -> str:
         return f"triton.next_power_of_2({expr})"
 
