@@ -639,6 +639,83 @@ class TileStrategyDispatch:
 
         return "".join(parts)
 
+    def broadcast_expand_dims(
+        self,
+        input_shape: ShapeLike,
+        output_shape: ShapeLike,
+    ) -> list[str]:
+        """Return subscript list to broadcast input_shape into output_shape.
+
+        Examples:
+            (bid=0,)    -> (bid=0, bid=1)    => [":", "None"]
+            (bid=1,)    -> (bid=0, bid=1)    => ["None", ":"]
+            (bid=0, K)  -> (bid=0, bid=1, K) => [":", "None", ":"]
+        """
+        if not self.supports_index_rank_expansion():
+            return []
+        if len(input_shape) == 0 or len(input_shape) == len(output_shape):
+            return []
+
+        env = CompileEnvironment.current()
+        src_compacted = self._compact_shape(input_shape)
+        dst_compacted = self._compact_shape(output_shape)
+
+        # Map each source compacted dim to a destination compacted dim.
+        src_to_dst: list[int] = []
+        used_dst: set[int] = set()
+        for src_dim in src_compacted:
+            match: int | None = None
+            src_bids = [env.canonical_block_id(bid) for bid in src_dim.block_ids]
+            if src_bids:
+                # Tile dim: match by canonical block_id
+                for dst_i, dst_dim in enumerate(dst_compacted):
+                    if dst_i in used_dst:
+                        continue
+                    dst_bids = [
+                        env.canonical_block_id(bid) for bid in dst_dim.block_ids
+                    ]
+                    if src_bids == dst_bids:
+                        match = dst_i
+                        break
+            else:
+                # Non-tile dim: match by size using known_equal on the
+                # original (non-compacted) shape elements.
+                for dst_i, dst_dim in enumerate(dst_compacted):
+                    if dst_i in used_dst:
+                        continue
+                    if dst_dim.block_ids:
+                        continue
+                    if len(src_dim.user_indices) == len(dst_dim.user_indices):
+                        if all(
+                            env.known_equal(input_shape[si], output_shape[di])
+                            for si, di in zip(
+                                src_dim.user_indices,
+                                dst_dim.user_indices,
+                                strict=True,
+                            )
+                        ):
+                            match = dst_i
+                            break
+            if match is None:
+                # Fallback: right-align unmatched non-tile dims
+                for dst_i in range(len(dst_compacted) - 1, -1, -1):
+                    if dst_i not in used_dst:
+                        match = dst_i
+                        break
+            assert match is not None, (
+                f"Cannot map input dim (block_ids={src_dim.block_ids}, "
+                f"size={src_dim.size_str}) into output shape {output_shape} "
+                f"from input shape {input_shape}"
+            )
+            src_to_dst.append(match)
+            used_dst.add(match)
+
+        keep = set(src_to_dst)
+        result = [":" if i in keep else "None" for i in range(len(dst_compacted))]
+        if all(r == ":" for r in result):
+            return []
+        return result
+
     def expand_dims_str(self, shape: ShapeLike, start_idx: int, num_dims: int) -> str:
         """Generate expansion string for multi-dimensional tensor indexers.
 

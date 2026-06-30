@@ -399,6 +399,9 @@ KERNEL_MAPPINGS: dict[str, tuple[str, ...]] = {
         "tritonbench.operators.rope.operator",
         "examples.rope",
         "rope_tritonbench",
+        {
+            "num_inputs": 5,  # rope autotune takes long time on Benchmark CI, so use fewer inputs instead.
+        },
     ),
     "rope-bwd": (
         "tritonbench.operators.rope.operator",

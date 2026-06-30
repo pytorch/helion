@@ -1,0 +1,154 @@
+name: Benchmark Pretuned
+
+# Reusable workflow: runs every kernel under pretuned_kernels/ against its
+# checked-in heuristic on a single GPU runner and uploads the aggregate
+# SUMMARY metrics as a pretuned-results-<alias> artifact. The Pretuned tab of
+# the dashboard is built from these artifacts by
+# .github/dashboard/build_pretuned_dashboard_data.py.
+
+on:
+  workflow_call:
+    inputs:
+      runner:
+        required: true
+        type: string
+      python-version:
+        required: true
+        type: string
+      image:
+        required: true
+        type: string
+      runtime-version:
+        required: true
+        type: string
+      container-options:
+        required: true
+        type: string
+      alias:
+        required: true
+        type: string
+      kernels:
+        required: false
+        type: string
+        default: ""
+      env-vars:
+        required: false
+        type: string
+        default: ""
+
+jobs:
+  benchmark:
+    name: pretuned-${{ inputs.runtime-version }}-py${{ inputs.python-version }}-${{ inputs.alias }}
+
+    container:
+      image: ${{ inputs.image }}
+      options: ${{ inputs.container-options }}
+
+    runs-on: ${{ inputs.runner }}
+    permissions:
+      id-token: write
+      contents: read
+
+    defaults:
+      run:
+        shell: bash -l {0}
+
+    steps:
+      - name: Run NVIDIA command
+        if: startsWith(inputs.image, 'nvidia')
+        run: |
+          echo "Detected NVIDIA image"
+          nvidia-smi || echo "nvidia-smi not found"
+
+      - name: Run ROCm command
+        if: startsWith(inputs.image, 'rocm')
+        run: |
+          echo "Detected ROCm image"
+          rocminfo || echo "rocminfo not found"
+
+      - name: Setup toolchain
+        run: |
+          set -x
+          apt-get update
+          apt-get install -y git
+
+      - name: Check out code
+        uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: ${{ inputs.python-version }}
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+
+      - name: Create virtual environment
+        run: |
+          uv venv --python ${{ inputs.python-version }}
+
+      - name: Install PyTorch
+        run: |
+          source .venv/bin/activate
+
+          # On OSDC, route through the pypi-cache /whl proxy (deps stay reachable behind the egress firewall) and clear the cache index vars so it wins over the cache default; off OSDC PYPI_CACHE_WHL_URL is unset so we hit download.pytorch.org.
+          PYTORCH_INDEX="${PYPI_CACHE_WHL_URL:-https://download.pytorch.org/whl/cpu}"
+          UV_DEFAULT_INDEX= UV_INDEX= uv pip install -U "torch==2.11.*" --index-url "${PYTORCH_INDEX%/whl/*}/whl/${{ inputs.runtime-version }}"
+
+      - name: Install Helion
+        run: |
+          source .venv/bin/activate
+          uv pip install setuptools ninja
+          SETUPTOOLS_SCM_PRETEND_VERSION="0.0.0" uv pip install -e .'[dev]'
+          python -c "import helion; print(helion.__name__)"
+
+      - name: Install vLLM (optional baseline)
+        # vLLM supplies the production baselines the pretuned kernels compare
+        # against (torch.ops._C.* quant ops, cutlass_scaled_mm). vLLM's nightly
+        # wheel pins torch==2.11.0, matching the torch installed above. This is
+        # non-fatal: if it fails, pretuned_kernels/run.py falls back to the
+        # torch-native baselines.
+        if: startsWith(inputs.image, 'nvidia')
+        continue-on-error: true
+        run: |
+          source .venv/bin/activate
+          # --index-strategy unsafe-best-match: vLLM nightly pins exact dep
+          # versions (e.g. outlines-core==0.2.14) that live on PyPI, not on the
+          # vLLM/pytorch nightly indexes; uv's default first-index-only strategy
+          # then can't resolve them. unsafe-best-match lets uv pick the matching
+          # version from any configured index.
+          uv pip install -U vllm --pre \
+            --index-strategy unsafe-best-match \
+            --extra-index-url https://wheels.vllm.ai/nightly
+          python -c "import vllm, torch; print('vllm', vllm.__version__, '| torch', torch.__version__)"
+
+      - name: CUDA Compute Check
+        if: startsWith(inputs.image, 'nvidia')
+        run: |
+          source .venv/bin/activate
+          python -c "
+          import torch
+          assert torch.cuda.is_available(), 'FATAL: CUDA not available'
+          print(f'Device: {torch.cuda.get_device_name(0)}')
+          "
+
+      - name: Run pretuned kernel benchmarks
+        run: |
+          source .venv/bin/activate
+
+          TEST_REPORTS_DIR=$(pwd)/test/test-reports
+          mkdir -p "$TEST_REPORTS_DIR"
+
+          ${{ inputs.env-vars }} python pretuned_kernels/run.py \
+            --output "$TEST_REPORTS_DIR/pretuned-bench.json" \
+            --hardware "${{ inputs.alias }}" \
+            ${{ inputs.kernels != '' && format('--kernels {0}', inputs.kernels) || '' }}
+
+          echo "----- pretuned-bench.json -----"
+          cat "$TEST_REPORTS_DIR/pretuned-bench.json"
+
+      - name: Upload the pretuned benchmark results to GitHub
+        uses: actions/upload-artifact@v7
+        with:
+          name: pretuned-results-${{ inputs.alias }}
+          path: test/test-reports

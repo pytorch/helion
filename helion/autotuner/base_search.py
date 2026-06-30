@@ -3,6 +3,7 @@ from __future__ import annotations
 import abc
 import collections
 import contextlib
+import copy
 import dataclasses
 import functools
 import logging
@@ -991,7 +992,9 @@ class PopulationBasedSearch(BaseSearch):
             seen.add(default_config)
             pinned_configs.add(default_config)
             result.append(default_flat)
-        self._pinned_finalist_configs.update(pinned_configs)
+        self._pinned_finalist_configs.update(
+            copy.deepcopy(config) for config in pinned_configs
+        )
         self.log("Starting with seed/default configs")
 
         cached_entries = self._find_similar_cached_configs(max_configs)
@@ -1087,7 +1090,13 @@ class PopulationBasedSearch(BaseSearch):
         if existing is None or self._member_low_water_perf(
             member
         ) < self._member_low_water_perf(existing):
-            target[config] = member
+            # Config is mutable and hashes on its contents, and the autotuner
+            # mutates configs in place (normalize / neighbor generation). Store
+            # a private snapshot so a later mutation of the original config
+            # cannot change this key's hash (-> KeyError on prune / orphaned
+            # entries) or the config recompiled during final verification.
+            snapshot = copy.deepcopy(config)
+            target[snapshot] = dataclasses.replace(member, config=snapshot)
 
     def _prune_benchmarked_members(self, top_k: int) -> None:
         if len(self._benchmarked_members) <= top_k:
@@ -1100,7 +1109,9 @@ class PopulationBasedSearch(BaseSearch):
 
     def pin_finalist_config(self, config: Config) -> None:
         """Always include a seed/default config in final verification if benchmarked."""
-        self._pinned_finalist_configs.add(config)
+        # Snapshot: configs are mutated in place after being added (see
+        # _record_best_member_for_config), which would corrupt this set.
+        self._pinned_finalist_configs.add(copy.deepcopy(config))
 
     def pin_finalist_configs(self, configs: Sequence[Config]) -> None:
         for config in configs:

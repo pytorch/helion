@@ -891,21 +891,23 @@ expand_lowering = register_lowering(
 
 @expand_lowering.register_codegen("triton")
 def codegen_expand(ctx: LoweringContext, node: Node) -> object:
-    assert not node.kwargs, "getitem kwargs not supported"
+    assert not node.kwargs, "expand kwargs not supported"
     tensor, _ = map_arg(node.args, lambda arg: _env_arg(ctx, arg))
     assert isinstance(tensor, ast.AST)
     val = node.meta["val"]
     assert isinstance(val, torch.Tensor)
     shape = [*val.size()]
     # pyrefly: ignore [missing-attribute]
-    if node.args[0].meta["val"].ndim != len(shape):
-        broadcasting = [":"] * len(shape)
-        # pyrefly: ignore [missing-attribute]
-        for i in range(len(shape) - node.args[0].meta["val"].ndim):
-            broadcasting[i] = "None"
-        tensor = expr_from_string(
-            f"{{tensor}}[{', '.join(broadcasting)}]", tensor=tensor
+    input_val = node.args[0].meta["val"]
+    if input_val.ndim != len(shape):
+        tile_strategy = ctx.cg.device_function.tile_strategy
+        broadcasting = tile_strategy.broadcast_expand_dims(
+            tuple(input_val.shape), tuple(shape)
         )
+        if broadcasting:
+            tensor = expr_from_string(
+                f"{{tensor}}[{', '.join(broadcasting)}]", tensor=tensor
+            )
     shape_str = ctx.cg.device_function.tile_strategy.shape_str(shape)
     return expr_from_string(
         f"tl.broadcast_to({{tensor}}, {shape_str})",
@@ -921,14 +923,16 @@ def codegen_expand_pallas(ctx: LoweringContext, node: Node) -> object:
     assert isinstance(val, torch.Tensor)
     shape = [*val.size()]
     # pyrefly: ignore [missing-attribute]
-    if node.args[0].meta["val"].ndim != len(shape):
-        broadcasting = [":"] * len(shape)
-        # pyrefly: ignore [missing-attribute]
-        for i in range(len(shape) - node.args[0].meta["val"].ndim):
-            broadcasting[i] = "None"
-        tensor = expr_from_string(
-            f"{{tensor}}[{', '.join(broadcasting)}]", tensor=tensor
+    input_val = node.args[0].meta["val"]
+    if input_val.ndim != len(shape):
+        tile_strategy = ctx.cg.device_function.tile_strategy
+        broadcasting = tile_strategy.broadcast_expand_dims(
+            tuple(input_val.shape), tuple(shape)
         )
+        if broadcasting:
+            tensor = expr_from_string(
+                f"{{tensor}}[{', '.join(broadcasting)}]", tensor=tensor
+            )
     shape_str = ctx.cg.device_function.tile_strategy.shape_str(shape)
     return expr_from_string(
         f"jnp.broadcast_to({{tensor}}, {shape_str})",

@@ -3,6 +3,7 @@ from __future__ import annotations
 import ast
 import collections
 import dataclasses
+import logging
 from typing import TYPE_CHECKING
 from typing import ClassVar
 from typing import NamedTuple
@@ -13,6 +14,7 @@ from torch._inductor.utils import triton_type
 from torch._prims_common import compute_required_storage_length
 
 from .. import exc
+from .._compat import fp8_block_ptr_padding_broken
 from .._compat import get_tensor_descriptor_fn_name
 from .._utils import next_power_of_2
 from .ast_extension import expr_from_string
@@ -36,6 +38,9 @@ if TYPE_CHECKING:
 
     SymIntLike = torch.SymInt | int
     ShapeLike = Sequence[SymIntLike]
+
+
+log = logging.getLogger(__name__)
 
 
 class TileWithOffsetInfo(NamedTuple):
@@ -754,7 +759,27 @@ class BlockPtrIndexingStrategy(IndexingStrategy):
         eviction_policy: ast.AST | None,
         cache_modifier: ast.AST | None,
     ) -> ast.AST:
-        if not BlockedSubscriptIndexing.is_supported(state, fake_tensor, subscript):
+        # Triton's python-only block-pointer rewrite (triton-lang/triton#9668,
+        # in the triton 3.8 series) lowers a block-pointer load with
+        # padding_option='zero' to a masked load whose `other` is the integer
+        # literal 0, which Triton cannot cast to FP8 (triton-lang/triton#10751).
+        # Fall back to pointer indexing, which uses other=0.0 for FP8. Gated on the
+        # affected Triton version so the fallback drops once upstream is fixed.
+        fp8_block_ptr_unsupported = (
+            fake_tensor.dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
+            and fp8_block_ptr_padding_broken()
+        )
+        if (
+            not BlockedSubscriptIndexing.is_supported(state, fake_tensor, subscript)
+            or fp8_block_ptr_unsupported
+        ):
+            log.debug(
+                "block_ptr indexing requested but unsupported for this load (%s); "
+                "falling back to pointer indexing",
+                "FP8 block-pointer padding broken on this Triton version"
+                if fp8_block_ptr_unsupported
+                else "unsupported access pattern",
+            )
             return PointerIndexingStrategy().codegen_load(
                 state,
                 fake_tensor,
