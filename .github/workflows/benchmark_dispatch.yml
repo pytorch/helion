@@ -28,6 +28,11 @@ on:
         required: false
         type: boolean
         default: false
+      run_b200_fla:
+        description: 'Run linear-attention benchmark (vs FLA) on B200'
+        required: false
+        type: boolean
+        default: false
       kernels:
         description: 'Comma-separated list of kernels to benchmark on GPU runners'
         required: false
@@ -50,6 +55,11 @@ on:
         required: false
         type: string
         default: "vector_add,layer_norm,rms_norm,vector_exp,sum"
+      kernels_linattn:
+        description: 'Comma-separated list of linear-attention kernels (vs FLA), or `all` for every kernel in benchmarks/run_linattn.py::KERNEL_MAPPINGS.'
+        required: false
+        type: string
+        default: "linear_attn,retention,simple_gla,gla"
       env_vars:
         description: 'Environment variables for benchmark runner'
         required: false
@@ -181,9 +191,23 @@ jobs:
       kernels: ${{ github.event.inputs.kernels_tpu }}
       env-vars: ${{ github.event.inputs.env_vars }}
 
+  run-b200-fla:
+    if: ${{ github.event.inputs.run_b200_fla == 'true' }}
+    uses: ./.github/workflows/benchmark_linattn.yml
+    permissions:
+      contents: read
+    with:
+      runner: linux.dgx.b200
+      image: nvidia/cuda:13.1.0-devel-ubuntu24.04
+      runtime-version: cu130
+      container-options: --gpus all
+      alias: b200_fla
+      kernels: ${{ github.event.inputs.kernels_linattn }}
+      env-vars: ${{ github.event.inputs.env_vars }}
+
   trigger-docs-deploy:
     if: always()
-    needs: [run-b200, run-b200-cute, run-h100, run-mi350x, run-tpu]
+    needs: [run-b200, run-b200-cute, run-h100, run-mi350x, run-tpu, run-b200-fla]
     runs-on: ubuntu-latest
     permissions:
       actions: write

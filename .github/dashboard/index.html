@@ -164,8 +164,8 @@ a:hover{text-decoration:underline}
 <script>
 const REPO = 'pytorch/helion';
 let DATA = typeof EMBEDDED_DATA !== 'undefined' ? EMBEDDED_DATA : null;
-const PLAT_COLORS = { h100: '#3fb950', b200: '#58a6ff', b200_cute: '#39c5cf', mi325x: '#f0883e', mi350x: '#bc8cff', tpu: '#d29922' };
-const PLAT_NAMES = { h100: 'H100', b200: 'B200', b200_cute: 'B200 CuTe', mi325x: 'MI325X', mi350x: 'MI350X', tpu: 'TPU v7' };
+const PLAT_COLORS = { h100: '#3fb950', b200: '#58a6ff', b200_cute: '#39c5cf', b200_fla: '#f778ba', mi325x: '#f0883e', mi350x: '#bc8cff', tpu: '#d29922' };
+const PLAT_NAMES = { h100: 'H100', b200: 'B200', b200_cute: 'B200 CuTe', b200_fla: 'B200 (vs FLA)', mi325x: 'MI325X', mi350x: 'MI350X', tpu: 'TPU v7' };
 const plotlyDark = {
   paper_bgcolor: '#0d1117', plot_bgcolor: '#0d1117',
   font: { color: '#e6edf3', size: 11 },
@@ -613,7 +613,7 @@ function renderSpeedup() {
   html += '<div class="table-wrap"><table class="data-table"><thead><tr><th>Kernel</th><th>Platform</th><th>Commit</th><th>Helion</th><th>torch.compile</th><th>Triton</th><th>Compile Time</th><th>Best</th></tr></thead><tbody>';
   entries.forEach(e => {
     const vals = [e.helion_speedup_geomean, e.torch_compile_speedup_geomean, e.triton_speedup_geomean];
-    const names = ['Helion', 'torch.compile', 'Triton'];
+    const names = ['Helion', 'torch.compile', e.platform_short === 'b200_fla' ? 'FLA' : 'Triton'];
     const colors = ['var(--green)', 'var(--blue)', 'var(--purple)'];
     let bestIdx = 0;
     vals.forEach((v, i) => { if ((v || 0) > (vals[bestIdx] || 0)) bestIdx = i; });
@@ -1049,7 +1049,8 @@ function showDetailModal(kernel, platform_short) {
         barTraces.push({ x: shapes, y: ps.torch_compile_speedup, name: 'torch.compile', type: 'bar', marker: { color: '#58a6ff' } });
       }
       if (ps.triton_speedup && ps.triton_speedup.length > 0) {
-        barTraces.push({ x: shapes, y: ps.triton_speedup, name: 'Triton', type: 'bar', marker: { color: '#bc8cff' } });
+        const baselineLabel = platform_short === 'b200_fla' ? 'FLA' : 'Triton';
+        barTraces.push({ x: shapes, y: ps.triton_speedup, name: baselineLabel, type: 'bar', marker: { color: '#bc8cff' } });
       }
       if (barTraces.length > 0) {
         const allBarVals = barTraces.flatMap(t => t.y).filter(v => v > 0);
