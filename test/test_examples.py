@@ -2596,7 +2596,7 @@ class TestExamples(RefEagerTestBase, TestCase):
         # importlib.import_module keys on the full dotted path; the kernels all
         # live in a ``chunk.py``, so import_path's bare-stem cache would alias
         # them to a single module.
-        mod = importlib.import_module(f"examples.{module}.chunk")
+        mod = importlib.import_module(f"examples.fla.{module}.chunk")
         for value in vars(mod).values():
             if isinstance(value, helion.Kernel):
                 original = value.settings.autotune_effort

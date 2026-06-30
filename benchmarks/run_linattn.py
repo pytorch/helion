@@ -299,7 +299,7 @@ def run_shape(
 
 def run_kernel(name: str, num_shapes: int | None) -> KernelResult:
     entry_name, ref_name, fla_name, gate = KERNEL_MAPPINGS[name]
-    mod = importlib.import_module(f"examples.{name}.chunk")
+    mod = importlib.import_module(f"examples.fla.{name}.chunk")
     result = KernelResult(name=name)
     shapes = SHAPES if num_shapes is None else SHAPES[:num_shapes]
     for label, b, t, h, d in shapes:
