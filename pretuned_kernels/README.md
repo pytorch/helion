@@ -28,7 +28,14 @@ pretuned_kernels/
 ├── rms_norm/
 ├── cross_entropy/
 ├── rope/
-└── scaled_mm/
+├── scaled_mm/
+├── silu_mul_fp8/                     # ported from vLLM (vllm/kernels/helion/ops)
+├── dynamic_per_token_scaled_fp8_quant/
+├── per_token_group_fp8_quant/
+├── rms_norm_dynamic_per_token_quant/
+├── rms_norm_per_block_quant/
+├── silu_and_mul_per_block_quant/
+└── fused_qk_norm_rope/
 ```
 
 Each kernel ships with one heuristic file per supported compute capability.
@@ -43,6 +50,18 @@ At runtime Helion picks the file matching the current GPU.
 | `cross_entropy` | TritonBench/Liger token-vocab sweep + realistic LLM vocabulary shapes | `F.cross_entropy` |
 | `rope` | TritonBench RoPE `(H, T)` defaults with exact shape buckets and `H8192_T2048` fallback | eager RoPE reference |
 | `scaled_mm` | vLLM Qwen3 FP8 `(K, N)` weight shapes at small token counts `M in {16, 64}` | `torch._scaled_mm` |
+| `silu_mul_fp8` | vLLM `(num_tokens, intermediate)` decode shapes | torch-native silu-and-mul + fp8 quant |
+| `dynamic_per_token_scaled_fp8_quant` | vLLM `(num_tokens, hidden)` shapes | torch-native per-token fp8 quant |
+| `per_token_group_fp8_quant` | vLLM `(num_tokens, hidden, group)` shapes | torch-native per-group fp8 quant |
+| `rms_norm_dynamic_per_token_quant` | vLLM `(num_tokens, hidden)` shapes | torch-native RMSNorm + per-token fp8 quant |
+| `rms_norm_per_block_quant` | vLLM `(num_tokens, hidden, group)` shapes | torch-native RMSNorm + per-block fp8 quant |
+| `silu_and_mul_per_block_quant` | vLLM `(num_tokens, intermediate, group)` shapes | torch-native silu-and-mul + per-block fp8 quant |
+| `fused_qk_norm_rope` | vLLM `(num_tokens, q_heads, kv_heads)` shapes | torch-native fused QK-RMSNorm + RoPE |
+
+The kernels ported from vLLM (`vllm/kernels/helion/ops`) benchmark each fused
+Helion kernel under CUDA graphs against a torch-native (unfused, eager)
+reference; `silu_mul_fp8` ships an `sm90` heuristic only, the rest ship both
+`sm90` and `sm100`.
 
 ## Scope
 

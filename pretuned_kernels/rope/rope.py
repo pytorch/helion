@@ -264,7 +264,16 @@ def _make_inputs(
     return q, k, torch.cos(angles), torch.sin(angles)
 
 
-def main() -> None:
+def use_cudagraph() -> bool:
+    """Whether main() benchmarks under CUDA graphs (read by pretuned_kernels/run.py)."""
+    return False
+
+
+def main(verbose: bool = True) -> dict:
+    def _p(*args: object) -> None:
+        if verbose:
+            print(*args)
+
     shapes = [
         (8192, 1024),
         (8192, 2048),
@@ -275,12 +284,12 @@ def main() -> None:
         (2048, 2048),
     ]
 
-    print(f"GPU: {torch.cuda.get_device_name()}")
-    print(
+    _p(f"GPU: {torch.cuda.get_device_name()}")
+    _p(
         f"{'H':>6s}  {'T':>6s}  {'helion (us)':>12s}  "
         f"{'torch (us)':>12s}  {'speedup':>8s}"
     )
-    print("-" * 60)
+    _p("-" * 60)
 
     speedups: list[float] = []
     helion_wins = 0
@@ -312,7 +321,7 @@ def main() -> None:
         if speedup > best_speedup:
             best_speedup = speedup
             best_shape = (hidden_size, seq_length)
-        print(
+        _p(
             f"{hidden_size:>6d}  {seq_length:>6d}  {ms_helion * 1000:>12.2f}  "
             f"{ms_torch * 1000:>12.2f}  {speedup:>7.2f}x"
         )
@@ -320,15 +329,17 @@ def main() -> None:
     geomean = math.exp(
         sum(math.log(s) for s in speedups if s > 0) / max(len(speedups), 1)
     )
-    print(
+    _p(
         f"\nHelion faster on {helion_wins}/{len(shapes)} shapes; "
         f"geomean speedup {geomean:.3f}x; "
         f"best speedup {best_speedup:.2f}x at (H, T)={best_shape}."
     )
-    print(
-        f"SUMMARY: helion_wins={helion_wins} total={len(shapes)} "
-        f"geomean={geomean:.4f} best_speedup={best_speedup:.4f}"
-    )
+    return {
+        "helion_wins": helion_wins,
+        "total": len(shapes),
+        "geomean": round(geomean, 4),
+        "best_speedup": round(best_speedup, 4),
+    }
 
 
 if __name__ == "__main__":
