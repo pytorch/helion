@@ -397,7 +397,7 @@ def chunk_linear_attn(
 # -------------------------
 
 
-def naive_recurrent_linear_attn(
+def ref_linear_attn(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
@@ -504,7 +504,7 @@ def test(
         return fla_chunk_linear_attn(q, k, v, scale=scale)
 
     def naive_fn(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
-        return naive_recurrent_linear_attn(q, k, v, scale=scale)
+        return ref_linear_attn(q, k, v, scale=scale)
 
     run_example(
         helion_fn,

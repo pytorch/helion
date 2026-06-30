@@ -670,7 +670,7 @@ def chunk_gla(
 # -------------------------
 
 
-def naive_recurrent_gla(
+def ref_gla(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
@@ -807,7 +807,7 @@ def test(
         v: torch.Tensor,
         g: torch.Tensor,
     ) -> torch.Tensor:
-        return naive_recurrent_gla(q, k, v, g, scale=scale)
+        return ref_gla(q, k, v, g, scale=scale)
 
     # 1. fwd+bwd vs the naive recurrence.
     run_example(

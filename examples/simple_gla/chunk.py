@@ -541,7 +541,7 @@ def chunk_simple_gla(
 # -------------------------
 
 
-def naive_recurrent_simple_gla(
+def ref_simple_gla(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
@@ -666,7 +666,7 @@ def test(
     def naive_fn(
         q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, g: torch.Tensor
     ) -> torch.Tensor:
-        return naive_recurrent_simple_gla(q, k, v, g, scale=scale)
+        return ref_simple_gla(q, k, v, g, scale=scale)
 
     run_example(
         helion_fn,

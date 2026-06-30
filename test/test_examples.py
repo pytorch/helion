@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import importlib
 import math
 import unittest
 from unittest.mock import patch
@@ -20,6 +21,7 @@ from helion._testing import CosSimilarity
 from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
 from helion._testing import _get_backend
+from helion._testing import assert_close_with_mismatch_tolerance
 from helion._testing import check_example
 from helion._testing import float32_matmul_precision
 from helion._testing import import_path
@@ -2567,6 +2569,100 @@ class TestExamples(RefEagerTestBase, TestCase):
             expected,
             fn_name="helion_gdn_fwd_h",
         )
+
+    def _check_chunk_linattn(
+        self,
+        module,
+        entry_name,
+        ref_name,
+        gate,
+    ):
+        """Forward+backward correctness for a chunked linear-attention kernel.
+
+        Compares the autograd entry point against the module's fp32 ``ref_*``
+        recurrence on a small fixed shape. Each kernel is a stack of several
+        ``@helion.kernel`` functions behind a ``torch.autograd.Function``; pin
+        every one to its default config so the test never autotunes in CI, and
+        restore the originals on teardown since the imported module is cached
+        in ``sys.modules`` process-wide.
+
+        ``gate`` selects the decay input the kernel takes: ``None`` (no gate),
+        ``"scalar"`` (per-head log-decay, token-first [B, T, H]), or ``"vector"``
+        (per-channel log-decay, head-first [B, H, T, D]). Outputs and gradients
+        match the fp32 reference at ``atol``/``rtol`` = 0.1, allowing the small
+        fraction of bf16 reduction-order outliers ``assert_close_with_mismatch_tolerance``
+        tolerates by default.
+        """
+        # importlib.import_module keys on the full dotted path; the kernels all
+        # live in a ``chunk.py``, so import_path's bare-stem cache would alias
+        # them to a single module.
+        mod = importlib.import_module(f"examples.{module}.chunk")
+        for value in vars(mod).values():
+            if isinstance(value, helion.Kernel):
+                original = value.settings.autotune_effort
+                self.addCleanup(setattr, value.settings, "autotune_effort", original)
+                value.settings.autotune_effort = "none"
+
+        entry = getattr(mod, entry_name)
+        ref = getattr(mod, ref_name)
+
+        b, h, t, d = 2, 4, 512, 64
+        scale = 1.0 / math.sqrt(d)
+
+        def randn(*shape, dtype=torch.bfloat16):
+            return torch.randn(*shape, dtype=dtype, device=DEVICE, requires_grad=True)
+
+        inputs = [randn(b, h, t, d), randn(b, h, t, d), randn(b, h, t, d)]
+        if gate == "scalar":
+            inputs.append(
+                F.logsigmoid(
+                    torch.randn(b, t, h, dtype=torch.float32, device=DEVICE)
+                ).requires_grad_(True)
+            )
+        elif gate == "vector":
+            inputs.append(
+                F.logsigmoid(torch.randn(b, h, t, d, device=DEVICE))
+                .clamp_min(-5.0)
+                .to(torch.bfloat16)
+                .requires_grad_(True)
+            )
+        ref_inputs = [a.detach().float().requires_grad_(True) for a in inputs]
+
+        ref_out = ref(*ref_inputs, scale=scale)
+        grad_out = torch.randn_like(ref_out)
+        ref_out.backward(grad_out)
+
+        out = entry(*inputs, scale=scale)
+        out.backward(grad_out.to(out.dtype))
+
+        def close(actual, expected):
+            assert_close_with_mismatch_tolerance(
+                actual.float(),
+                expected.float(),
+                atol=1e-1,
+                rtol=1e-1,
+                max_mismatch_pct=0.001,
+            )
+
+        close(out, ref_out)
+        for tensor, ref_tensor in zip(inputs, ref_inputs, strict=True):
+            close(tensor.grad, ref_tensor.grad)
+
+    def test_linear_attn(self):
+        self._check_chunk_linattn(
+            "linear_attn", "chunk_linear_attn", "ref_linear_attn", None
+        )
+
+    def test_retention(self):
+        self._check_chunk_linattn("retention", "chunk_retention", "ref_retention", None)
+
+    def test_simple_gla(self):
+        self._check_chunk_linattn(
+            "simple_gla", "chunk_simple_gla", "ref_simple_gla", "scalar"
+        )
+
+    def test_gla(self):
+        self._check_chunk_linattn("gla", "chunk_gla", "ref_gla", "vector")
 
     @skipIfRocm("default config exceeds thread limit on ROCm")
     @skipIfTileIR("PassManager::run failed on TileIR backend")

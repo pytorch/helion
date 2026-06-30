@@ -509,7 +509,7 @@ def chunk_retention(
 # -------------------------
 
 
-def naive_recurrent_retention(
+def ref_retention(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
@@ -621,7 +621,7 @@ def test(
         return fla_chunk_retention(q, k, v, scale=scale)
 
     def naive_fn(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
-        return naive_recurrent_retention(q, k, v, scale=scale)
+        return ref_retention(q, k, v, scale=scale)
 
     run_example(
         helion_fn,
