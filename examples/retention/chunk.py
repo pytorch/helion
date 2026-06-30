@@ -79,7 +79,8 @@ def chunk_fwd_h(
             h_all[idx, i_t, tile_d, tile_dv] = h_acc.to(h_all.dtype)
             k_i = (k[idx, i_t, :, tile_d].float() * k_decay[:, None]).to(v.dtype)
             v_i = v[idx, i_t, :, tile_dv]
-            h_acc = gamma_chunk * h_acc + hl.dot(k_i.transpose(-2, -1), v_i)
+            h_acc = gamma_chunk * h_acc
+            h_acc = hl.dot(k_i.transpose(-2, -1), v_i, acc=h_acc)
 
     return h_all
 
@@ -197,7 +198,8 @@ def chunk_bwd_dh(
             dh_all[idx, i, tile_d, tile_dv] = dh_acc.to(dh_all.dtype)
             q_i = q[idx, i, :, tile_d].float() * (scale * q_decay)[:, None]
             do_i = do[idx, i, :, tile_dv]
-            dh_acc = gamma_chunk * dh_acc + hl.dot(q_i.transpose(-2, -1), do_i.float())
+            dh_acc = gamma_chunk * dh_acc
+            dh_acc = hl.dot(q_i.transpose(-2, -1), do_i.float(), acc=dh_acc)
 
     return dh_all
 
