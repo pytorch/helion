@@ -19,11 +19,11 @@ import argparse
 import math
 
 import torch
-from triton.testing import do_bench
 
 from .chunk import chunk_linear_attn
-from .chunk import fla_chunk_linear_attn
+from .chunk import fla_chunk_linear_attn_native
 from helion._testing import DEVICE
+from helion._testing import do_bench
 
 # (name, B, T, H, D)  — D is both query/key dim and value dim (D=DV) per FLA registry.
 # Shapes from flash-linear-attention/benchmarks/ops/registry.py:184.
@@ -61,7 +61,15 @@ def main() -> None:
     for name, b, t, h, d in SHAPES:
         scale = 1.0 / math.sqrt(d)
 
+        # Each side gets its NATIVE layout, built outside the timed region, so the
+        # benchmark measures pure kernel work and not layout conversion. Our kernel
+        # is head-first [B,H,T,D]; FLA is token-first [B,T,H,D]. Pre-transposing
+        # FLA's inputs here (instead of inside the timed call) removes a transpose
+        # tax that would otherwise be charged unfairly to FLA.
         q, k, v = _make_inputs(b, t, h, d, requires_grad=False)
+        q_fla = q.transpose(1, 2).contiguous()  # token-first [B,T,H,D] for FLA
+        k_fla = k.transpose(1, 2).contiguous()
+        v_fla = v.transpose(1, 2).contiguous()
 
         def helion_fwd(
             q: torch.Tensor = q,
@@ -72,22 +80,28 @@ def main() -> None:
             return chunk_linear_attn(q, k, v, scale=scale)
 
         def fla_fwd(
-            q: torch.Tensor = q,
-            k: torch.Tensor = k,
-            v: torch.Tensor = v,
+            q: torch.Tensor = q_fla,
+            k: torch.Tensor = k_fla,
+            v: torch.Tensor = v_fla,
             scale: float = scale,
         ) -> torch.Tensor:
-            return fla_chunk_linear_attn(q, k, v, scale=scale)
+            return fla_chunk_linear_attn_native(q, k, v, scale)
 
         h_fwd_ms = do_bench(helion_fwd)
         f_fwd_ms = do_bench(fla_fwd)
-        fwd_pct = 100.0 * f_fwd_ms / h_fwd_ms
+        fwd_pct = 100.0 * f_fwd_ms / h_fwd_ms  # pyrefly: ignore [unsupported-operation]
 
         row = f"{name:<22} {h_fwd_ms:>10.3f}ms {f_fwd_ms:>10.3f}ms {fwd_pct:>9.1f}%"
 
         if not args.fwd_only:
+            # Native-layout leaves for each side (transpose done here, off the timer).
             q_g, k_g, v_g = _make_inputs(b, t, h, d, requires_grad=True)
             grad_out = torch.randn(b, h, t, d, dtype=DTYPE, device=DEVICE)
+            # FLA-layout grad leaves: transpose off the timer, then mark as leaves.
+            q_fla_g = q_g.detach().transpose(1, 2).contiguous().requires_grad_(True)
+            k_fla_g = k_g.detach().transpose(1, 2).contiguous().requires_grad_(True)
+            v_fla_g = v_g.detach().transpose(1, 2).contiguous().requires_grad_(True)
+            grad_out_fla = grad_out.transpose(1, 2).contiguous()
 
             def helion_fb(
                 q: torch.Tensor = q_g,
@@ -101,19 +115,18 @@ def main() -> None:
                 q.grad = k.grad = v.grad = None
 
             def fla_fb(
-                q: torch.Tensor = q_g,
-                k: torch.Tensor = k_g,
-                v: torch.Tensor = v_g,
-                go: torch.Tensor = grad_out,
+                q: torch.Tensor = q_fla_g,
+                k: torch.Tensor = k_fla_g,
+                v: torch.Tensor = v_fla_g,
+                go: torch.Tensor = grad_out_fla,
                 scale: float = scale,
             ) -> None:
-                o = fla_chunk_linear_attn(q, k, v, scale=scale)
-                o.backward(go)
+                fla_chunk_linear_attn_native(q, k, v, scale).backward(go)
                 q.grad = k.grad = v.grad = None
 
             h_fb_ms = do_bench(helion_fb)
             f_fb_ms = do_bench(fla_fb)
-            fb_pct = 100.0 * f_fb_ms / h_fb_ms
+            fb_pct = 100.0 * f_fb_ms / h_fb_ms  # pyrefly: ignore [unsupported-operation]
             row += f" {h_fb_ms:>10.3f}ms {f_fb_ms:>10.3f}ms {fb_pct:>9.1f}%"
 
         rows.append(row)

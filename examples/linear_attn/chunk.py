@@ -366,6 +366,24 @@ def naive_recurrent_linear_attn(
     return out.to(v.dtype)
 
 
+def fla_chunk_linear_attn_native(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    scale: float | None = None,
+) -> torch.Tensor:
+    """FLA's chunk_linear_attn on its NATIVE token-first [B,T,H,D] layout.
+
+    No transpose: callers that already hold token-first tensors use this directly 
+    so the layout conversion is not charged to FLA's measured time. Unwraps FLA's
+    (output, final_state) tuple.
+    """
+    from fla.ops.linear_attn import chunk_linear_attn as _fla  # pyrefly: ignore
+
+    o = _fla(q, k, v, scale=scale, normalize=False)
+    return o[0] if isinstance(o, tuple) else o
+
+
 def fla_chunk_linear_attn(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -373,15 +391,16 @@ def fla_chunk_linear_attn(
     scale: float | None = None,
     C: int = 64,
 ) -> torch.Tensor:
-    """FLA's chunk_linear_attn wrapped to accept head-first [B,H,T,D]."""
-    from fla.ops.linear_attn import chunk_linear_attn as _fla  # pyrefly: ignore
+    """FLA's chunk_linear_attn wrapped to accept head-first [B,H,T,D].
 
+    Transposes to FLA's native layout and back; used by ``test()`` for
+    correctness. For timing, use ``fla_chunk_linear_attn_native`` and transpose
+    outside the timed region.
+    """
     qt = q.transpose(1, 2).contiguous()
     kt = k.transpose(1, 2).contiguous()
     vt = v.transpose(1, 2).contiguous()
-    o = _fla(qt, kt, vt, scale=scale, normalize=False)
-    if isinstance(o, tuple):
-        o = o[0]
+    o = fla_chunk_linear_attn_native(qt, kt, vt, scale=scale)
     return o.transpose(1, 2).contiguous()
 
 
