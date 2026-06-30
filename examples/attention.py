@@ -159,10 +159,18 @@ def _biased_attention_output_baseline(
     return torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=bias)
 
 
+def _baseline_unless_tpu(fn: Callable[..., Any]) -> Callable[..., Any] | None:
+    # These baselines run SDPA plus a log-sum-exp loop in PyTorch; some of those
+    # ops don't execute on the TPU/XLA backend, which hard-fails autotuning.
+    # Fall back to Helion's default-config baseline on TPU (the path attention
+    # used before custom baselines were added in #2833).
+    return None if DEVICE.type == "tpu" else fn
+
+
 @helion.kernel(
     # Static shapes provides a speedup for attention
     static_shapes=True,
-    autotune_baseline_fn=_attention_baseline,
+    autotune_baseline_fn=_baseline_unless_tpu(_attention_baseline),
     autotune_baseline_atol=5e-2,
     autotune_baseline_rtol=2e-2,
 )
@@ -237,7 +245,7 @@ def attention(
 @helion.kernel(
     # Static shapes provides a speedup for attention
     static_shapes=True,
-    autotune_baseline_fn=_causal_attention_baseline,
+    autotune_baseline_fn=_baseline_unless_tpu(_causal_attention_baseline),
     autotune_baseline_atol=5e-2,
     autotune_baseline_rtol=2e-2,
 )
@@ -298,7 +306,7 @@ def causal_attention(
 
 @helion.kernel(
     static_shapes=True,
-    autotune_baseline_fn=_attention_output_baseline,
+    autotune_baseline_fn=_baseline_unless_tpu(_attention_output_baseline),
     autotune_baseline_atol=5e-2,
     autotune_baseline_rtol=2e-2,
 )
@@ -348,7 +356,7 @@ def attention_output(
 
 @helion.kernel(
     static_shapes=True,
-    autotune_baseline_fn=_causal_attention_output_baseline,
+    autotune_baseline_fn=_baseline_unless_tpu(_causal_attention_output_baseline),
     autotune_baseline_atol=5e-2,
     autotune_baseline_rtol=2e-2,
 )
