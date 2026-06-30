@@ -104,11 +104,30 @@ class SearchSpaceSummary:
         logger.log(level, f"  Search dimensions: {len(self.dimensions)}")
         if self.disabled_features:
             logger.log(level, f"  Disabled features ({len(self.disabled_features)}):")
-            for feat in self.disabled_features[:10]:
+            # Collapse features disabled solely because they aren't supported by
+            # the selected backend (the backend is already printed above) into a
+            # single summary line, and list feature-specific reasons explicitly.
+            generic_reason = f"Not supported by {self.backend} backend"
+            generic_suffix = f": {generic_reason}"
+            backend_specific = [
+                feat[: -len(generic_suffix)]
+                for feat in self.disabled_features
+                if feat.endswith(generic_suffix)
+            ]
+            other = [
+                feat
+                for feat in self.disabled_features
+                if not feat.endswith(generic_suffix)
+            ]
+            for feat in other[:10]:
                 logger.log(level, f"    - {feat}")
-            if len(self.disabled_features) > 10:
+            if len(other) > 10:
+                logger.log(level, f"    ... and {len(other) - 10} more")
+            if backend_specific:
                 logger.log(
-                    level, f"    ... and {len(self.disabled_features) - 10} more"
+                    level,
+                    f"    - {len(backend_specific)} feature(s) not supported by "
+                    f"{self.backend} backend (e.g. {', '.join(backend_specific[:3])})",
                 )
         if self.shape_constraints:
             logger.log(level, f"  Shape constraints ({len(self.shape_constraints)}):")
@@ -126,13 +145,21 @@ class FeatureExplorationStats:
     all_possible_values: list[object]  # All values in the search space
     tested_values: list[object]  # Values that were actually tested
     coverage_percent: float  # (tested / all) * 100
+    # Total number of possible values. May be larger than
+    # len(all_possible_values) when the values aren't explicitly enumerated
+    # (e.g. block_sizes, loop_orders); falls back to len(all_possible_values).
+    total_options: int | None = None
+
+    def __post_init__(self) -> None:
+        if self.total_options is None:
+            self.total_options = len(self.all_possible_values)
 
     def to_dict(self) -> dict[str, object]:
         return {
             "feature_name": self.feature_name,
             "all_possible_values": self.all_possible_values,
             "tested_values": self.tested_values,
-            "total_options": len(self.all_possible_values),
+            "total_options": self.total_options,
             "tested_options": len(self.tested_values),
             "coverage_percent": round(self.coverage_percent, 2),
         }
@@ -140,7 +167,7 @@ class FeatureExplorationStats:
     def to_summary_line(self) -> str:
         """Single-line summary: 'pid_type: 2/8 options tested (25.0%)'."""
         return (
-            f"{self.feature_name}: {len(self.tested_values)}/{len(self.all_possible_values)} "
+            f"{self.feature_name}: {len(self.tested_values)}/{self.total_options} "
             f"options tested ({self.coverage_percent:.1f}%)"
         )
 
@@ -218,7 +245,7 @@ class ExplorationReport:
                 logger.log(
                     level,
                     f"    - {stats.feature_name}: only {len(stats.tested_values)} "
-                    f"of {len(stats.all_possible_values)} values tested",
+                    f"of {stats.total_options} values tested",
                 )
 
 
@@ -265,8 +292,18 @@ class FeatureExplorationTracker:
             all_values = dim.values if dim.values is not None else []
             tested_values = sorted(self._feature_value_sets.get(dim.name, set()))
 
-            if len(all_values) > 0:
-                coverage = (len(tested_values) / len(all_values)) * 100
+            # Some dimensions (e.g. block_sizes, loop_orders, l2_groupings,
+            # flatten_loops) don't enumerate explicit `values` but do compute a
+            # `size`. Use `size` as the denominator so coverage isn't divided by
+            # zero. Clamp tested count to the total so coverage never exceeds
+            # 100% (the recorded tested set can include configs the size
+            # estimate doesn't cover exactly).
+            total_options = len(all_values) if all_values else dim.size
+
+            if total_options > 0:
+                coverage = (
+                    min(len(tested_values), total_options) / total_options
+                ) * 100
             else:
                 coverage = 0.0
 
@@ -275,6 +312,7 @@ class FeatureExplorationTracker:
                     feature_name=dim.name,
                     all_possible_values=all_values,
                     tested_values=tested_values,
+                    total_options=total_options,
                     coverage_percent=coverage,
                 )
             )
@@ -397,8 +435,9 @@ def analyze_search_space(
         for i, spec in enumerate(config_spec.block_sizes):
             if spec.autotuner_min != spec.min_size:
                 shape_constraints.append(
-                    f"block_size[{i}] constrained to [{spec.autotuner_min}, {spec.max_size}] "
-                    f"(flash attention target)"
+                    f"block_size[{i}] autotuner range constrained to "
+                    f"[{spec.autotuner_min}, {spec.max_size}] "
+                    f"(natural min_size={spec.min_size})"
                 )
 
     if config_spec.cute_flash_search_enabled:
