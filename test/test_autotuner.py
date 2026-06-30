@@ -1680,6 +1680,77 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         run_mode("fork", expect_error=False)
         run_mode("spawn", expect_error=True)
 
+    def test_autotune_noncontiguous_arg(self) -> None:
+        """Autotuning a kernel bound on a non-contiguous arg must succeed.
+
+        A kernel bound on a non-contiguous arg hardcodes that arg's load strides
+        into the compiled kernel as compile-time constants. The autotuner reruns
+        that compiled kernel on a clone of the args to compute its accuracy
+        baseline, so the clone must keep the same layout. If the clone is made
+        contiguous, those hardcoded strides address the wrong (or out-of-bounds)
+        memory and read garbage, so every config mismatches the baseline and
+        autotuning fails to select one.
+
+        The arg is a strided slice (``buf[::2]``): its contiguous clone compacts
+        the storage, so the hardcoded stride-2 loads read the wrong elements.
+        """
+        config_a = helion.Config(block_sizes=[32], num_warps=4)
+        config_b = helion.Config(block_sizes=[64], num_warps=4)
+
+        @helion.kernel(configs=[config_a, config_b], autotune_log_level=0)
+        def double(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile in hl.tile(x.size(0)):
+                out[tile] = x[tile] * 2.0
+            return out
+
+        # Strided 1-D view: size 1024, stride 2 over a 2048-element buffer.
+        x = torch.arange(2048, device=DEVICE, dtype=torch.float32)[::2]
+        self.assertFalse(x.is_contiguous())
+        self.assertEqual(x.stride(), (2,))
+
+        bound_kernel = double.bind((x,))
+        search = FiniteSearch(bound_kernel, (x,), configs=[config_a, config_b])
+        best = search.autotune()
+        self.assertIn(best, (config_a, config_b))
+
+        torch.testing.assert_close(double(x), x * 2.0)
+
+    def test_autotune_broadcast_arg(self) -> None:
+        """Autotuning a kernel bound on a broadcast/expanded arg must succeed.
+
+        Same accuracy-baseline issue as the strided-slice case, but for a
+        ``stride-0`` view from ``expand``. Here ``b`` is ``[M, 1]`` expanded to
+        ``[M, N]`` (stride ``(1, 0)``); the kernel indexes ``b[ti, tj]`` so the
+        stride-0 column load is hardcoded into the compiled kernel. A clone that
+        materialized ``b`` to a contiguous ``[M, N]`` (stride ``(N, 1)``) would
+        make that hardcoded load read a different element per column, so the
+        baseline diverges and every config is rejected.
+        """
+        config_a = helion.Config(block_sizes=[32, 32], num_warps=4)
+        config_b = helion.Config(block_sizes=[64, 64], num_warps=4)
+
+        @helion.kernel(configs=[config_a, config_b], autotune_log_level=0)
+        def add_bias(x: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile_i, tile_j in hl.tile(x.size()):
+                out[tile_i, tile_j] = x[tile_i, tile_j] + b[tile_i, tile_j]
+            return out
+
+        m, n = 128, 128
+        x = torch.randn(m, n, device=DEVICE)
+        # Broadcast/expanded view: [m, 1] -> [m, n], stride (1, 0).
+        b = torch.randn(m, 1, device=DEVICE).expand(m, n)
+        self.assertFalse(b.is_contiguous())
+        self.assertEqual(b.stride(), (1, 0))
+
+        bound_kernel = add_bias.bind((x, b))
+        search = FiniteSearch(bound_kernel, (x, b), configs=[config_a, config_b])
+        best = search.autotune()
+        self.assertIn(best, (config_a, config_b))
+
+        torch.testing.assert_close(add_bias(x, b), x + b)
+
     def test_accuracy_check_filters_bad_config_wrong_arg_mutation(self) -> None:
         bad_config = helion.Config(block_sizes=[1], num_warps=8)
         good_config = helion.Config(block_sizes=[1], num_warps=4)

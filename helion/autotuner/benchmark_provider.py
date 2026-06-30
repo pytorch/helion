@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import abc
+import copy
 import datetime
 import functools
 from itertools import count
@@ -102,7 +103,19 @@ def _clone_args(
         if not isinstance(arg, torch.Tensor):
             continue
         if _should_clone(i):
-            clone = arg.detach().clone()
+            if arg.is_contiguous():
+                clone = arg.detach().clone()
+            else:
+                # A kernel bound on a non-contiguous arg hardcodes that arg's
+                # load strides into the compiled kernel as compile-time
+                # constants. ``arg.detach().clone()`` returns a contiguous
+                # tensor with a different layout and smaller storage, so those
+                # hardcoded strides would address the wrong (or out-of-bounds)
+                # memory when the autotuner accuracy baseline reruns the kernel
+                # on the clone. ``copy.deepcopy`` does a storage-level copy that
+                # reproduces the original size, stride, and offset, and also
+                # handles broadcast/expanded views.
+                clone = copy.deepcopy(arg.detach())
             clone.requires_grad_(arg.requires_grad)
             args_flat[i] = clone
 
