@@ -193,6 +193,12 @@ def main() -> None:
                 fla_chunk_linear_attn_native(q, k, v, scale).backward(go)
                 q.grad = k.grad = v.grad = None
 
+            # Warm up so the backward kernels autotune here and free the memory
+            # before the timed region (else the autotune OOMs: NoConfigFound).
+            helion_fb()
+            fla_fb()
+            torch.cuda.empty_cache()
+
             h_fb_ms = do_bench(helion_fb)
             f_fb_ms = do_bench(fla_fb)
             fb_pct = 100.0 * f_fb_ms / h_fb_ms  # pyrefly: ignore [unsupported-operation]
