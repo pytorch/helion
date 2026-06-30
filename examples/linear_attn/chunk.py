@@ -8,9 +8,8 @@ Recurrence (per timestep):
     S_t = S_{t-1} + k_t^T @ v_t
     o_t = q_t @ S_t
 
-Chunked form parallelizes intra-chunk attention while sequentializing the
-state pass across chunks. Validated against a naive recurrent reference and
-FLA's `chunk_linear_attn` (which dispatches through `simple_gla` with g=0).
+The chunked form parallelizes intra-chunk attention and sequentializes the
+state pass across chunks.
 """
 
 from __future__ import annotations
@@ -39,16 +38,11 @@ def chunk_fwd_h(
     k: torch.Tensor,
     v: torch.Tensor,
 ) -> torch.Tensor:
-    """Serial state accumulation across chunks (zero initial state).
+    """Serial state accumulation across chunks, from a zero initial state.
 
-    h_all[i] holds the state going *into* chunk i:
+    h_all[i] holds the state going into chunk i:
         h_all[0] = 0
         h_all[i] = h_all[i-1] + k[i-1]^T @ v[i-1]
-
-    The initial state is always zero in the forward pass, so we seed the
-    accumulator with hl.zeros in-register instead of reading an h0 buffer from
-    HBM. This matches FLA's USE_INITIAL_STATE=False path and removes a host-side
-    new_zeros fill kernel that would otherwise launch every forward.
 
     Args:
         k:  [BH, N, C, D]
@@ -61,10 +55,7 @@ def chunk_fwd_h(
     D = k.size(3)
     DV = v.size(3)
 
-    # State buffer rides at the INPUT dtype (bf16), matching FLA's
-    # states_in_fp32=False: chunk_fwd_o casts h down to q.dtype anyway, so an
-    # fp32 store wastes HBM bandwidth on both the write here and the per-chunk
-    # read in the output pass. The accumulator h_acc stays fp32.
+    # The stored state rides at the input dtype; only the accumulator is fp32.
     h_all = torch.empty([BH, N, D, DV], dtype=k.dtype, device=k.device)
 
     for tile_bh, tile_d, tile_dv in hl.tile([BH, D, DV], block_size=[1, None, None]):
@@ -90,10 +81,8 @@ def chunk_fwd_o(
 ) -> torch.Tensor:
     """Per-chunk parallel output: o = scale * (q @ h + (q @ k^T).tril @ v).
 
-    The output is linear in q, so the 1/sqrt(D) scale factors out of the whole
-    expression and is applied once here on the fp32 accumulator. This lets the
-    caller pass q unscaled and avoids a full-tensor `q * scale` elementwise
-    kernel on every forward (FLA likewise folds scale into the output dot).
+    The output is linear in q, so scale factors out and is applied once on the
+    fp32 accumulator, letting the caller pass q unscaled.
 
     Args:
         q, k: [BHN, C, D]
@@ -138,15 +127,13 @@ def chunk_bwd_dh(
     do: torch.Tensor,
     scale: float,
 ) -> torch.Tensor:
-    """Serial reverse state-gradient pass (zero final-state gradient).
+    """Serial reverse state-gradient pass, from a zero final-state gradient.
 
-    dh_all[i] holds the gradient *coming out of* chunk i:
+    dh_all[i] holds the gradient coming out of chunk i:
         dh_all[N-1] = 0
         dh_all[i]   = dh_all[i+1] + scale * q[i+1]^T @ do[i+1]
 
-    q is the *unscaled* query; the forward folds scale into the output, so the
-    state gradient carries that scale (q' = scale*q). The zero final-state
-    gradient is seeded in-register, dropping a host new_zeros fill.
+    q is passed unscaled; scale folds into the q-row term here.
 
     Args:
         q:  [BH, N, C, D]
@@ -188,9 +175,8 @@ def chunk_bwd_dqk(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Per-chunk parallel dQ, dK (q passed unscaled; scale folded here).
 
-    With q' = scale*q the forward query, dq is the gradient w.r.t. the unscaled
-    q, i.e. scale * dq'. dq' has no q dependence, so we scale it once at the
-    end. dk uses q' = scale*q directly; the state term carries scale through dh.
+    dq is the gradient w.r.t. the unscaled q, so it is scaled once at the end;
+    dk carries scale through the q-term and the state gradient dh.
 
     Args:
         q, k: [BHN, C, D]
@@ -323,8 +309,6 @@ class _LinearAttnFn(torch.autograd.Function):
         kf = k.reshape(BH, N, C, D)
         vf = v.reshape(BH, N, C, DV)
 
-        # h_all stays fp32 (accumulator); inputs ride at native dtype. Zero
-        # initial state is seeded inside the kernel, no h0 buffer needed.
         h_all = chunk_fwd_h(kf, vf)
 
         qf = q.reshape(BHN, C, D)
@@ -332,8 +316,7 @@ class _LinearAttnFn(torch.autograd.Function):
         vf2 = vf.reshape(BHN, C, DV)
         hf = h_all.reshape(BHN, D, DV)
 
-        # scale is folded into the output (q passed unscaled) so we skip a
-        # full-tensor q*scale elementwise launch on the forward.
+        # q is passed unscaled; scale is folded into the output.
         o = chunk_fwd_o(qf, kf2, vf2, hf, scale)
 
         ctx.save_for_backward(q, k, v, h_all)
@@ -355,11 +338,7 @@ class _LinearAttnFn(torch.autograd.Function):
         BH = B * H
         BHN = BH * N
 
-        # The forward folds scale into the output, equivalent to using q' =
-        # scale * q. The backward kernels are written for that scaled query, so
-        # we scale q here (and dq is the gradient w.r.t. the *unscaled* q, which
-        # is scale * dq'). Scale is threaded into the dh pass so q never gets
-        # materialized scaled in HBM.
+        # q is passed unscaled; the backward kernels fold scale in themselves.
         qf4 = q.reshape(BH, N, C, D)
         do4 = grad_output.reshape(BH, N, C, DV)
 

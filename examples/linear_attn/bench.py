@@ -61,11 +61,8 @@ def main() -> None:
     for name, b, t, h, d in SHAPES:
         scale = 1.0 / math.sqrt(d)
 
-        # Each side gets its NATIVE layout, built outside the timed region, so the
-        # benchmark measures pure kernel work and not layout conversion. Our kernel
-        # is head-first [B,H,T,D]; FLA is token-first [B,T,H,D]. Pre-transposing
-        # FLA's inputs here (instead of inside the timed call) removes a transpose
-        # tax that would otherwise be charged unfairly to FLA.
+        # Pre-transpose FLA's inputs to its token-first layout off the timer, so
+        # FLA isn't charged a transpose tax our head-first kernel doesn't pay.
         q, k, v = _make_inputs(b, t, h, d, requires_grad=False)
         q_fla = q.transpose(1, 2).contiguous()  # token-first [B,T,H,D] for FLA
         k_fla = k.transpose(1, 2).contiguous()
@@ -94,7 +91,6 @@ def main() -> None:
         row = f"{name:<22} {h_fwd_ms:>10.3f}ms {f_fwd_ms:>10.3f}ms {fwd_pct:>9.1f}%"
 
         if not args.fwd_only:
-            # Native-layout leaves for each side (transpose done here, off the timer).
             q_g, k_g, v_g = _make_inputs(b, t, h, d, requires_grad=True)
             grad_out = torch.randn(b, h, t, d, dtype=DTYPE, device=DEVICE)
             # FLA-layout grad leaves: transpose off the timer, then mark as leaves.
