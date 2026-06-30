@@ -1382,6 +1382,11 @@ def run_kernel_inner(name: str) -> KernelResult:
                     attr = getattr(mod, attr_name)
                     if isinstance(attr, _HelionKernel):
                         attr.reset()
+                        # A custom autotune_baseline_fn (e.g. attention's, added
+                        # in #2833) can fail on TPU/XLA and hard-fail autotune.
+                        # Clear it so TPU uses the default-config baseline;
+                        # final accuracy is still checked below.
+                        attr.settings.autotune_baseline_fn = None
                         if os.environ.get("HELION_AUTOTUNE_EFFORT", "") != "none":
                             if not attr.configs:
                                 attr.settings.force_autotune = True
