@@ -240,85 +240,63 @@ class ExpectedPerf:
     wins_slack: int | None
 
 
-# Sampled on B200 with the checked-in heuristic. ``wins_slack`` lets that
-# many near-noise-band shapes flip without failing; ``None`` disables the
-# wins gate for kernels with several expected near-parity shapes.
+# helion-vs-best-baseline targets. Every kernel's baselines now include
+# ``torch_compile`` (torch.compile of the torch reference), which competes to be
+# the fastest baseline -- so these numbers are helion vs the best of {torch,
+# torch_compile} (the perf test env has no vLLM). ``wins_slack`` lets that many
+# near-noise-band shapes flip without failing; ``None`` disables the wins gate
+# for kernels with several expected near-parity shapes.
+#
+# sm90 sampled on H100. sm100 perf gating is deferred until a B200 nightly
+# recalibrates it against the torch_compile baseline (the perf test skips
+# compute capabilities absent from this map -- so sm100 runs correctness only
+# for now).
 _EXPECTED_PERF: dict[str, dict[str, ExpectedPerf]] = {
     "vector_add": {
-        "sm100": ExpectedPerf(
-            helion_wins=5,
-            total=10,
-            geomean=1.009,
-            wins_slack=None,
-        ),
         "sm90": ExpectedPerf(
             helion_wins=5,
             total=10,
-            geomean=0.99,
+            geomean=0.97,
             wins_slack=None,
         ),
     },
     "softmax": {
-        "sm100": ExpectedPerf(
-            helion_wins=100,
-            total=100,
-            geomean=2.304,
-            wins_slack=2,
-        ),
         "sm90": ExpectedPerf(
-            helion_wins=97,
+            helion_wins=99,
             total=100,
-            geomean=1.78,
+            geomean=1.50,
             wins_slack=7,
         ),
     },
     "layer_norm": {
-        "sm100": ExpectedPerf(
-            helion_wins=38,
-            total=38,
-            geomean=1.55,
-            wins_slack=1,
-        ),
         "sm90": ExpectedPerf(
             helion_wins=37,
             total=38,
-            geomean=1.39,
+            geomean=1.29,
             wins_slack=2,
         ),
     },
     "rms_norm": {
-        "sm100": ExpectedPerf(
-            helion_wins=30,
-            total=30,
-            geomean=1.605,
-            wins_slack=6,
-        ),
         "sm90": ExpectedPerf(
-            helion_wins=23,
+            helion_wins=28,
             total=30,
-            geomean=1.17,
+            geomean=1.18,
             wins_slack=5,
         ),
     },
     "cross_entropy": {
-        "sm100": ExpectedPerf(
-            helion_wins=21,
-            total=21,
-            geomean=1.698,
-            wins_slack=1,
-        ),
         "sm90": ExpectedPerf(
             helion_wins=21,
             total=21,
-            geomean=2.35,
+            geomean=1.68,
             wins_slack=1,
         ),
     },
     "rope": {
         "sm90": ExpectedPerf(
-            helion_wins=7,
+            helion_wins=6,
             total=7,
-            geomean=5.0,
+            geomean=1.45,
             wins_slack=1,
         ),
     },
@@ -336,30 +314,31 @@ _EXPECTED_PERF: dict[str, dict[str, ExpectedPerf]] = {
         ),
     },
     # vLLM-ported kernels (vllm/kernels/helion/ops): each benchmarks its fused
-    # Helion kernel under CUDA graphs against a torch-native (unfused, eager)
-    # reference, so speedups are large. sm90 numbers measured on H100; sm100
-    # gating is added once a B200 nightly has calibrated it (the perf test
-    # skips compute capabilities absent from this map).
+    # Helion kernel under CUDA graphs against a torch-native reference and its
+    # torch.compile, so speedups are still large vs the best of the two. sm90
+    # numbers measured on H100; sm100 gating is added once a B200 nightly has
+    # calibrated it (the perf test skips compute capabilities absent from this
+    # map).
     "silu_mul_fp8": {
-        "sm90": ExpectedPerf(helion_wins=36, total=36, geomean=6.0, wins_slack=3),
+        "sm90": ExpectedPerf(helion_wins=21, total=36, geomean=1.15, wins_slack=3),
     },
     "dynamic_per_token_scaled_fp8_quant": {
-        "sm90": ExpectedPerf(helion_wins=24, total=24, geomean=13.9, wins_slack=2),
+        "sm90": ExpectedPerf(helion_wins=24, total=24, geomean=1.67, wins_slack=2),
     },
     "per_token_group_fp8_quant": {
-        "sm90": ExpectedPerf(helion_wins=24, total=24, geomean=12.3, wins_slack=2),
+        "sm90": ExpectedPerf(helion_wins=24, total=24, geomean=2.95, wins_slack=2),
     },
     "rms_norm_dynamic_per_token_quant": {
-        "sm90": ExpectedPerf(helion_wins=36, total=36, geomean=18.0, wins_slack=3),
+        "sm90": ExpectedPerf(helion_wins=36, total=36, geomean=1.70, wins_slack=3),
     },
     "rms_norm_per_block_quant": {
-        "sm90": ExpectedPerf(helion_wins=24, total=24, geomean=18.0, wins_slack=2),
+        "sm90": ExpectedPerf(helion_wins=24, total=24, geomean=3.95, wins_slack=2),
     },
     "silu_and_mul_per_block_quant": {
-        "sm90": ExpectedPerf(helion_wins=24, total=24, geomean=16.1, wins_slack=2),
+        "sm90": ExpectedPerf(helion_wins=24, total=24, geomean=3.55, wins_slack=2),
     },
     "fused_qk_norm_rope": {
-        "sm90": ExpectedPerf(helion_wins=21, total=21, geomean=25.5, wins_slack=2),
+        "sm90": ExpectedPerf(helion_wins=21, total=21, geomean=8.6, wins_slack=2),
     },
 }
 
