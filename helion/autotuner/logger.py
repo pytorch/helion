@@ -23,6 +23,7 @@ from typing import Iterator
 from typing import Literal
 from typing import NamedTuple
 from typing import TypeAlias
+from typing import TypedDict
 from typing import TypeVar
 from typing_extensions import Self
 
@@ -158,6 +159,14 @@ class AutotuningLogger:
             return None
         return self._log_sink.register_config(config)
 
+    def capture_generated_code(
+        self, config_id: str, kernel: _AutotunableKernel, config: Config
+    ) -> None:
+        """Capture the config's generated source onto the sink for the
+        ``.meta.jsonl`` record; no-op when no sink is active."""
+        if self._log_sink is not None:
+            self._log_sink.capture_generated_code(config_id, kernel, config)
+
     def _attach_sink(self, sink: AutotuneLogSink) -> None:
         self._log_sink = sink
         self.add_handler(sink.handler)
@@ -285,6 +294,13 @@ class AutotuneLogEntry(NamedTuple):
     config: Config
 
 
+class ConfigEntry(TypedDict):
+    """One per-config entry in the dataset's ``configs`` map."""
+
+    config: dict[str, object]
+    generated_code: str | None
+
+
 class AutotuneLogSink:
     """
     Writes autotune results to CSV and connects autotune logs to a file handler.
@@ -306,9 +322,9 @@ class AutotuneLogSink:
         self._csv_writer: CsvWriter | None = None
         self._log_handler: logging.FileHandler | None = None
         self._run_start_time: float | None = None
-        # config_id -> full config; flushed to the .meta.jsonl record at end_run.
-        # Populated only when collecting the dataset; identical configs collapse.
-        self._configs: dict[str, dict[str, object]] = {}
+        # Per-config dataset entries, flushed to .meta.jsonl at end_run. Unbounded
+        # by design (the R&D dataset keeps every config's full source) -- never cap.
+        self._configs: dict[str, ConfigEntry] = {}
 
     def __enter__(self) -> Self:
         self.open()
@@ -389,9 +405,27 @@ class AutotuneLogSink:
             return None
         canonical = json.dumps(config.config, sort_keys=True, separators=(",", ":"))
         config_id = hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:16]
-        if self._collect_dataset:
-            self._configs[config_id] = config.config
+        if self._collect_dataset and config_id not in self._configs:
+            # Don't overwrite: a re-encountered config keeps its attached source.
+            self._configs[config_id] = {
+                "config": config.config,
+                "generated_code": None,
+            }
         return config_id
+
+    def capture_generated_code(
+        self, config_id: str, kernel: _AutotunableKernel, config: Config
+    ) -> None:
+        """Attach the config's already-compiled source from disk (no re-codegen)."""
+        entry = self._configs.get(config_id)
+        if entry is None or entry.get("generated_code") is not None:
+            return
+        path = kernel.get_cached_path(config)
+        if path is None:
+            return
+        # generated_code is null only when no cached path exists. A read failure
+        # of a known artifact surfaces (probe/IO errors are not swallowed here).
+        entry["generated_code"] = Path(path).read_text(encoding="utf-8")
 
     def record(self, entry: AutotuneLogEntry) -> None:
         if self._csv_writer is None:
