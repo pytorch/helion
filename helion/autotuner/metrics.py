@@ -6,8 +6,12 @@ import hashlib
 import time
 from typing import TYPE_CHECKING
 
+from .._compat import get_device_name
+
 if TYPE_CHECKING:
     from collections.abc import Callable
+
+    import torch
 
     from .._compiler.device_ir import DeviceIR
 
@@ -94,42 +98,48 @@ def _codegen_signature(settings: dict[str, object] | None) -> str:
 
 @dataclasses.dataclass
 class KernelMetadata:
-    """A metadata record containing the full context (source, shapes, dtypes, hardware,
-    settings) for an autotune run computed lazily on first access. Saved as a single JSON
-    line in <autotune_log>.meta.jsonl, acting as a sidecar to the configuration CSV.
-    Telemetry CSV rows map many-to-one to this metadata record using run_id as the foreign
-    key.
-    """
+    """Per-run identity for the autotuned kernel: the ``.meta.jsonl`` sidecar record
+    that per-config CSV rows join back to via ``run_id``. Carries a ``hardware_info``
+    snapshot and the config-independent ``ir_graph`` dump (both lazy in ``to_dict``)."""
 
     kernel_name: str = ""
     kernel_source: str = ""
     input_shapes: str = ""
     dtypes: str = ""
-    hardware: str = ""
     settings: dict[str, object] | None = None
     # Derived artifact source; never part of dataclass identity or run_id.
     _device_ir: DeviceIR | None = dataclasses.field(
         default=None, repr=False, compare=False, hash=False
     )
+    # Source ref for the lazy ``hardware_info`` snapshot; repr/compare/hash off.
+    _device: torch.device | None = dataclasses.field(
+        default=None, repr=False, compare=False, hash=False
+    )
 
     @functools.cached_property
     def run_id(self) -> str:
-        """Stable content hash for joining CSV rows to sidecar metadata."""
-        # _device_ir is derived from these fields, so it must stay out of identity.
+        """Stable content hash joining CSV rows to sidecar metadata."""
+        # hardware_info (descriptive) and _device_ir's ir_graph (derived) stay OUT of
+        # run_id, so driver/software changes don't fragment the dataset.
         payload = (
             f"{self.kernel_source}\x00{_codegen_signature(self.settings)}\x00"
-            f"{self.input_shapes}\x00{self.dtypes}\x00{self.hardware}"
+            f"{self.input_shapes}\x00{self.dtypes}\x00"
+            f"{get_device_name(self._device) or ''}"
         )
         return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
     def to_dict(self) -> dict[str, object]:
+        # Lazy (dataset-only path). collect_hardware_info may raise on a real probe;
+        # the sink (end_run) guards it so a failure never crashes a good tune.
+        from ._metadata.hardware import collect_hardware_info
+
         return {
             "run_id": self.run_id,
             "kernel_name": self.kernel_name,
             "kernel_source": self.kernel_source,
             "input_shapes": self.input_shapes,
             "dtypes": self.dtypes,
-            "hardware": self.hardware,
+            "hardware_info": collect_hardware_info(self._device),
             "settings": self.settings,
             "ir_graph": self.ir_graph,
         }

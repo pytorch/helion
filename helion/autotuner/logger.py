@@ -43,6 +43,8 @@ if TYPE_CHECKING:
 else:
     CsvWriter = Any  # type: ignore[assignment]
 
+logger = logging.getLogger(__name__)
+
 SinkSelf = TypeVar("SinkSelf", bound="AutotuneLogSink")
 ExcInfoParam: TypeAlias = (
     bool
@@ -369,10 +371,18 @@ class AutotuneLogSink:
         # Append the per-run record (identity + configs map) once every config is
         # known. default=str keeps it JSON-safe for non-serializable settings
         # (torch.dtype, enums, callables). CSV rows join via run_id + config_id.
+        # Best-effort: end_run runs in an un-catching finally, so a probe failure here
+        # must not crash a successful autotune (log and skip).
         if self._collect_dataset and self._metadata is not None:
-            record = {**self._metadata.to_dict(), "configs": self._configs}
-            with self.meta_path.open("a", encoding="utf-8") as meta_file:
-                meta_file.write(json.dumps(record, default=str) + "\n")
+            try:
+                record = {**self._metadata.to_dict(), "configs": self._configs}
+                with self.meta_path.open("a", encoding="utf-8") as meta_file:
+                    meta_file.write(json.dumps(record, default=str) + "\n")
+            except Exception:
+                logger.warning(
+                    "autotune dataset record skipped (hardware/metadata probe failed)",
+                    exc_info=True,
+                )
         self._run_start_time = None
         self._configs = {}
 
