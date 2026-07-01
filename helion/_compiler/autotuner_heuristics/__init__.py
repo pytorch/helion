@@ -17,6 +17,7 @@ from .cute import CuteTileVecWarpReduceHeuristic
 from .pallas import PallasMatmulF32NoTilingSeedHeuristic
 from .pallas import PallasMatmulNoTilingSeedHeuristic
 from .triton import TritonB200MatmulHeuristic
+from .triton import TritonMatmulReductionEpilogueHeuristic
 from .triton import TritonSkinnyGemmHeuristic
 from .triton import TritonSplitJoinRotateHeuristic
 from .triton import TritonStandardReductionHeuristic
@@ -45,6 +46,7 @@ HEURISTICS_BY_BACKEND: dict[str, tuple[AutotunerHeuristicType, ...]] = {
     "triton": (
         TritonSkinnyGemmHeuristic,
         TritonB200MatmulHeuristic,
+        TritonMatmulReductionEpilogueHeuristic,
         TritonSplitJoinRotateHeuristic,
         TritonStandardReductionHeuristic,
         TritonUserTiledReductionHeuristic,

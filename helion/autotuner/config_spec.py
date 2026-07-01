@@ -174,6 +174,30 @@ class ReductionFact(NamedTuple):
     per_feature_accumulator: bool = False
 
 
+class MatmulWithReductionEpilogueFact(NamedTuple):
+    """A fused matmul + reduction-over-output-axis epilogue, recorded when a ``MatmulFact`` and
+    a register-resident epilogue ``ReductionFact`` co-occur in one kernel (e.g.
+    ``matmul_rms_norm``: ``acc = x @ y`` then a reduction over N on the carried ``[M_BLOCK,
+    N]`` accumulator, then write-back). A COMPOSED fact: it holds the two existing facts plus
+    the few derived fields the seed keys on. ``TritonMatmulReductionEpilogueHeuristic``
+    branches on it.
+
+    - ``matmul`` / ``reduction``: the composed sub-facts (the matmul + the epilogue reduction).
+    - ``n_extent``: the specialized output width N (= ``reduction.size_hint``); N is
+      ``hl.specialize``'d (never tiled), so both the ``[M_BLOCK, N]`` accumulator and the
+      ``[K_BLOCK, N]`` operand tile scale with N — the resident-footprint signal the
+      footprint-aware tile chooser keys on.
+    - ``m_block_id`` / ``k_block_id``: the grid M tile and the K tile the seed sizes
+      (there is no ``n_block_id`` — N is specialized, not a block_size).
+    """
+
+    matmul: MatmulFact
+    reduction: ReductionFact
+    n_extent: int
+    m_block_id: int | None
+    k_block_id: int | None
+
+
 class MemoryOpFact(NamedTuple):
     """Metadata linking one ``Config.indexing`` slot to its graph memory op, one entry per
     load/store in graph-traversal order (so ``memory_op_facts[i]`` describes ``config.indexing[i]``).
@@ -512,6 +536,7 @@ class ConfigSpec:
         self.autotuner_heuristics: list[str] = []
         self.matmul_facts: list[MatmulFact] = []
         self.reduction_facts: list[ReductionFact] = []
+        self.matmul_reduction_epilogue_facts: list[MatmulWithReductionEpilogueFact] = []
         self.accumulator_facts: list[AccumulatorFact] = []
         self.store_indices: list[int] = []
         self.memory_op_facts: list[MemoryOpFact] = []
