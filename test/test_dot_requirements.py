@@ -1097,16 +1097,27 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
 
     @onlyBackends(["cute"])
     def test_cute_universal_matmul_lane_loop_correctness(self) -> None:
-        """Universal-MMA SMEM-load guards stay correct under a lane loop.
+        """Universal-MMA SMEM staging stays correct under a lane loop.
 
         Binds a CuTe matmul with a lane-loop configuration
         (``elements_per_thread=2``) on either the M or the N axis and
         asserts both the launch dim (recovery must divide by ``epT``)
-        and ``allclose`` against ``x @ y`` (SMEM-load guards must use
-        the physical thread coord so every lane iteration re-populates
-        sA / sB). The fix is symmetric across M and N — see the
-        ``_local_mma_coord_expr`` → ``_physical_mma_coord_expr``
-        switch in ``cute_mma._codegen_cute_mma``.
+        and ``allclose`` against ``x @ y``. Two invariants are covered,
+        both symmetric across M and N:
+
+        1. SMEM-load guards use the *physical* thread coord so every
+           lane iteration re-populates sA / sB — the
+           ``_local_mma_coord_expr`` → ``_physical_mma_coord_expr``
+           switch in ``cute_mma._codegen_cute_mma``.
+        2. The universal-MMA K-loop emits a trailing
+           ``cute.arch.sync_threads()`` after ``cute.gemm`` so this
+           iteration's SMEM reads complete before the next iteration
+           overwrites sA / sB. Without it a thread that finishes its
+           gemm early races ahead and clobbers the tile a sibling is
+           still reading (write-after-read hazard), producing
+           nondeterministic wrong values — see ``_emit_mma_pipeline``.
+           The single-run assert below caught this only intermittently;
+           the repeat loop makes the race a hard failure.
         """
         torch.manual_seed(0)
         x = torch.randn([1024, 1024], device=DEVICE, dtype=torch.float32)
@@ -1128,17 +1139,6 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
         )
         for case_name, config in cases:
             with self.subTest(case=case_name):
-                if case_name == "n_axis_lane":
-                    # CuTe DSL 4.5.1 regressed the SMEM-load guards on the
-                    # N-axis lane-loop path: ``x @ y`` mismatches at ~0.05%
-                    # of elements with a >10 absolute diff. M-axis still
-                    # passes, so the asymmetry needs investigation in the
-                    # upstream cute release before this case can be
-                    # re-enabled.
-                    self.skipTest(
-                        "CuTe 4.5.1 regression: n_axis_lane SMEM-load guard "
-                        "produces wrong values; see _codegen_cute_mma."
-                    )
                 # Fresh bind cache: the in-memory bind cache is keyed
                 # by args and other subTest iterations populate it.
                 _cute_strategy_matmul_kernel._bound_kernels.clear()
@@ -1152,8 +1152,14 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
                 with patch_cute_mma_support():
                     bound = _cute_strategy_matmul_kernel.bind((x, y))
                 bound.set_config(config)
-                result = bound(x, y)
-                torch.testing.assert_close(result, x @ y, atol=1e-1, rtol=1e-2)
+                # Repeat: the SMEM write-after-read race is timing
+                # dependent, so a single launch passes intermittently.
+                # Several launches make a missing trailing barrier a
+                # deterministic failure.
+                expected = x @ y
+                for _ in range(8):
+                    result = bound(x, y)
+                    torch.testing.assert_close(result, expected, atol=1e-1, rtol=1e-2)
 
                 code = bound.to_triton_code(config)
                 for ln in code.splitlines():
