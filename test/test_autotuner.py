@@ -1453,6 +1453,45 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
             # Check boolean
             self.assertIn(neighbor[4], [True, False])
 
+    def test_lfbo_tree_search_generate_neighbors_cap(self):
+        """LFBOTreeSearch applies num_neighbors_cap in the tree-guided path."""
+
+        class MockEstimator:
+            tree_ = SimpleNamespace(feature=np.array([0], dtype=int))
+
+            def decision_path(self, _x):
+                return SimpleNamespace(indices=np.array([0], dtype=int))
+
+            def predict_proba(self, x):
+                scores = np.asarray(x)[:, 0]
+                probas = scores / np.max(scores)
+                return np.column_stack((1.0 - probas, probas))
+
+        spec = PowerOfTwoFragment(16, 128, 32)
+        search = LFBOTreeSearch.__new__(LFBOTreeSearch)
+        search.num_neighbors = 10
+        search.num_neighbors_cap = 3
+        search.radius = 2
+        search.surrogate = SimpleNamespace(estimators_=[MockEstimator()])
+        search._autotune_metrics = SimpleNamespace(num_generations=2)
+        search._encoded_to_flat_mapping = None
+        search.config_gen = SimpleNamespace(
+            flat_spec=[spec],
+            block_size_indices=[0],
+            num_warps_index=-1,
+            overridden_flat_indices=set(),
+            encode_config=lambda flat: spec.encode(flat[0]),
+        )
+
+        capped_neighbors = search._generate_neighbors([32])
+
+        search.num_neighbors_cap = -1
+        uncapped_neighbors = search._generate_neighbors([32])
+
+        self.assertEqual(len(capped_neighbors), 3)
+        self.assertEqual(len(uncapped_neighbors), 10)
+        self.assertTrue(all(neighbor != [32] for neighbor in capped_neighbors))
+
     def test_lfbo_pattern_search_surrogate_select_matches_legacy_prefix(self):
         """Top-k LFBO selection should match the legacy full-ranking implementation."""
 
@@ -2314,7 +2353,10 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         bound = add.bind(args)
 
         # Default: -1 (no cap)
-        with patch.dict(os.environ, {"HELION_AUTOTUNER": "PatternSearch"}):
+        with (
+            without_env_var("HELION_CAP_AUTOTUNE_NUM_NEIGHBORS"),
+            patch.dict(os.environ, {"HELION_AUTOTUNER": "PatternSearch"}),
+        ):
             autotuner = bound.settings.autotuner_fn(bound, args)
             self.assertEqual(autotuner.autotuner.num_neighbors_cap, -1)
 
@@ -2329,11 +2371,33 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
             autotuner = bound.settings.autotuner_fn(bound, args)
             self.assertEqual(autotuner.autotuner.num_neighbors_cap, 50)
 
+        # Env var also applies to LFBO-based pattern search.
+        with patch.dict(
+            os.environ,
+            {
+                "HELION_AUTOTUNER": "LFBOTreeSearch",
+                "HELION_CAP_AUTOTUNE_NUM_NEIGHBORS": "50",
+            },
+        ):
+            autotuner = bound.settings.autotuner_fn(bound, args)
+            self.assertEqual(autotuner.autotuner.num_neighbors_cap, 50)
+
         # Explicit constructor arg wins over env var
         with patch.dict(
             os.environ,
             {
                 "HELION_AUTOTUNER": "PatternSearch",
+                "HELION_CAP_AUTOTUNE_NUM_NEIGHBORS": "50",
+            },
+        ):
+            autotuner = bound.settings.autotuner_fn(bound, args, num_neighbors_cap=10)
+            self.assertEqual(autotuner.autotuner.num_neighbors_cap, 10)
+
+        # Explicit constructor arg wins over env var for LFBO-based search too.
+        with patch.dict(
+            os.environ,
+            {
+                "HELION_AUTOTUNER": "LFBOTreeSearch",
                 "HELION_CAP_AUTOTUNE_NUM_NEIGHBORS": "50",
             },
         ):
