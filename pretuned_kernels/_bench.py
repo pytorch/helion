@@ -31,11 +31,26 @@ def geomean(values: Iterable[float]) -> float:
     return math.exp(sum(math.log(v) for v in pos) / max(len(pos), 1))
 
 
+def bench_cudagraph(call: Callable[[], object], rep: int = 100) -> float:
+    """Median CUDA-graph latency (ms), clearing the L2 cache each iteration.
+
+    Uses tritonbench's cudagraph timer, which zeroes the L2 cache before every
+    replay and subtracts the clear cost. ``triton.testing.do_bench_cudagraph``
+    does *not* clear L2, so a graph replaying the same inputs reuses cached data
+    and under-reports latency. tritonbench is required (no fallback) so pretuned
+    numbers are always measured with cache clearing -- install it before running
+    a cudagraph kernel's ``main()`` (the nightly benchmark workflow does).
+    """
+    from tritonbench.components.do_bench.run import _do_bench_cudagraph_with_cache_clear
+
+    return _do_bench_cudagraph_with_cache_clear(call, rep=rep, return_mode="median")
+
+
 def _bench(
     call: Callable[[], object], use_cudagraph: bool, warmup: int, rep: int
 ) -> float:
     if use_cudagraph:
-        return tt.do_bench_cudagraph(call, rep=rep, return_mode="median")
+        return bench_cudagraph(call, rep=rep)
     return tt.do_bench(call, warmup=warmup, rep=rep, return_mode="median")
 
 

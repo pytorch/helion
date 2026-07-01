@@ -10,7 +10,6 @@ from __future__ import annotations
 import math
 
 import torch
-import triton.testing as tt
 
 import helion
 import helion.experimental
@@ -157,6 +156,12 @@ def use_cudagraph() -> bool:
 
 
 def main(verbose: bool = True) -> dict:
+    import os
+    import sys
+
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    from _bench import bench_cudagraph
+
     def _p(*args: object) -> None:
         if verbose:
             print(*args)
@@ -211,22 +216,21 @@ def main(verbose: bool = True) -> dict:
 
         scaled_mm(c, a, b, scale_a, scale_b, bias)  # warmup / compile
         # Benchmark under CUDA graphs (how vLLM invokes the kernel): removes
-        # per-call host launch overhead so timing reflects GPU work.
-        ms_helion = tt.do_bench_cudagraph(
+        # per-call host launch overhead so timing reflects GPU work. Clears the
+        # L2 cache each iteration (see _bench.bench_cudagraph).
+        ms_helion = bench_cudagraph(
             lambda c=c, a=a, b=b, sa=scale_a, sb=scale_b, bias=bias: scaled_mm(
                 c, a, b, sa, sb, bias
             ),
             rep=100,
-            return_mode="median",
         )
         base_ms: dict[str, float] = {}
         for name, fn in baselines:
-            base_ms[name] = tt.do_bench_cudagraph(
+            base_ms[name] = bench_cudagraph(
                 lambda fn=fn, c=c, a=a, b=b, sa=scale_a, sb=scale_b, bias=bias: fn(
                     c, a, b, sa, sb, bias
                 ),
                 rep=100,
-                return_mode="median",
             )
             speedups_by_base[name].append(
                 base_ms[name] / ms_helion if ms_helion > 0 else float("nan")
