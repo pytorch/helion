@@ -453,9 +453,11 @@ def chunk_fwd_o_helion(
     g_cs: torch.Tensor,
     h: torch.Tensor,
     use_g: hl.constexpr = True,  # pyrefly: ignore[bad-function-definition]
+    scale: float = 1.0,
 ) -> torch.Tensor:
     """Output computation for all chunks in parallel (no correction). With
-    use_g=False the decay is compiled out, for variants with no decay."""
+    use_g=False the decay is compiled out, for variants with no decay; scale
+    then folds into the output so q can be passed unscaled."""
     BHN = q.size(0)
     C = hl.specialize(q.size(1))
     D = q.size(2)
@@ -486,8 +488,12 @@ def chunk_fwd_o_helion(
             attn = attn * causal
 
         vt = v[tile_bhn, :, tile_dv]
-        o_intra = hl.dot(attn.to(vt.dtype), vt, acc=o_cross)
-        out[tile_bhn, :, tile_dv] = o_intra.to(out.dtype)
+        # o_intra = attn @ v accumulated onto o_cross
+        o = hl.dot(attn.to(vt.dtype), vt, acc=o_cross)
+        if use_g:
+            out[tile_bhn, :, tile_dv] = o.to(out.dtype)
+        else:
+            out[tile_bhn, :, tile_dv] = (o * scale).to(out.dtype)
 
     return out
 
@@ -499,10 +505,12 @@ def chunk_bwd_dh_diag_fused(
     g_last: torch.Tensor,
     dh_init: torch.Tensor,
     use_g: hl.constexpr = True,  # pyrefly: ignore[bad-function-definition]
+    scale: float = 1.0,
 ) -> torch.Tensor:
     """Fused state gradient propagation over N chunks in reverse (diagonal decay).
 
-    Tiles [BH, D, DV] to parallelize over both key and value dimensions.
+    Tiles [BH, D, DV] to parallelize over both key and value dimensions. On the
+    no-decay path q is unscaled, so scale folds into the q-row term here.
     """
     BH = q_scaled.size(0)
     N = q_scaled.size(1)
@@ -521,9 +529,11 @@ def chunk_bwd_dh_diag_fused(
             if use_g:
                 gl_d = g_last[idx, i, tile_d]
                 dh_acc = dh_acc * torch.exp(gl_d)[:, None]
-            q_i = q_scaled[idx, i, :, tile_d]
+                q_i = q_scaled[idx, i, :, tile_d]
+            else:
+                q_i = q_scaled[idx, i, :, tile_d] * scale
             do_i = do[idx, i, :, tile_dv]
-            dh_acc = dh_acc + torch.mm(q_i.transpose(-2, -1), do_i.float())
+            dh_acc = hl.dot(q_i.transpose(-2, -1), do_i, acc=dh_acc)
 
     return dh_all
 
@@ -585,9 +595,11 @@ def chunk_bwd_dqk_helion(
     do: torch.Tensor,
     dh: torch.Tensor,
     use_g: hl.constexpr = True,  # pyrefly: ignore[bad-function-definition]
+    scale: float = 1.0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Compute dQ, dK for all chunks in parallel (no correction). With
-    use_g=False the decay is compiled out, for variants with no decay."""
+    use_g=False the decay is compiled out, for variants with no decay; q is
+    then unscaled, so scale folds into dq and the dk q-term here."""
     BHN = q.size(0)
     C = hl.specialize(q.size(1))
     D = q.size(2)
@@ -626,17 +638,20 @@ def chunk_bwd_dqk_helion(
             gc = g_cs[tile_bhn, :]
             decay_ij = torch.exp(gc[:, :, None] - gc[:, None, :])
             dA = dA_raw * decay_ij * causal
-            dq_acc = hl.dot(dA.to(kt.dtype), kt)
-            dk_acc = hl.dot(dA.transpose(-2, -1).to(qt.dtype), qt)
-            exp_gc = torch.exp(gc)[:, :, None]
-            dq_acc = dq_acc + dq_cross_acc * exp_gc
             gl = g_last[tile_bhn]
+            exp_gc = torch.exp(gc)[:, :, None]
             exp_gl_minus_gc = torch.exp(gl[:, None] - gc)[:, :, None]
-            dk_acc = dk_acc + dk_state_acc * exp_gl_minus_gc
+            # Decay the cross/state terms, then fold the add into the accumulator.
+            dq_acc = hl.dot(dA.to(kt.dtype), kt, acc=dq_cross_acc * exp_gc)
+            dk_acc = hl.dot(
+                dA.transpose(-2, -1).to(qt.dtype), qt, acc=dk_state_acc * exp_gl_minus_gc
+            )
         else:
             dA = dA_raw * causal
-            dq_acc = hl.dot(dA.to(kt.dtype), kt) + dq_cross_acc
-            dk_acc = hl.dot(dA.transpose(-2, -1).to(qt.dtype), qt) + dk_state_acc
+            dq_acc = hl.dot(dA.to(kt.dtype), kt, acc=dq_cross_acc) * scale
+            dk_acc = hl.dot(
+                dA.transpose(-2, -1).to(qt.dtype), (qt * scale).to(qt.dtype), acc=dk_state_acc
+            )
 
         dq_out[tile_bhn, :, tile_d] = dq_acc.to(q.dtype)
         dk_out[tile_bhn, :, tile_d] = dk_acc.to(k.dtype)
@@ -653,9 +668,11 @@ def chunk_bwd_dv_helion(
     do: torch.Tensor,
     dh: torch.Tensor,
     use_g: hl.constexpr = True,  # pyrefly: ignore[bad-function-definition]
+    scale: float = 1.0,
 ) -> torch.Tensor:
     """Compute dV for all chunks in parallel (no correction). With use_g=False
-    the decay is compiled out, for variants with no decay."""
+    the decay is compiled out, for variants with no decay; the intra attention
+    uses q' = scale*q, so scale folds into the masked attention here."""
     BHN = q.size(0)
     C = hl.specialize(q.size(1))
     D = q.size(2)
@@ -684,7 +701,7 @@ def chunk_bwd_dv_helion(
             decay_ij = torch.exp(gc[:, :, None] - gc[:, None, :])
             attn = attn * decay_ij * causal
         else:
-            attn = attn * causal
+            attn = attn * (causal * scale)
 
         dot = do[tile_bhn, :, tile_dv]
         dv_acc = hl.dot(attn.transpose(-2, -1).to(dot.dtype), dot, acc=dv_acc)
@@ -964,11 +981,13 @@ class ChunkedLinearAttnFn(torch.autograd.Function):
         C: int,
         initial_state: torch.Tensor | None,
         return_final_state: bool,
+        scale: float = 1.0,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         tensors = [q, k, v]
         ctx.has_g = g is not None
         ctx.has_beta = beta is not None
         ctx.has_a = a is not None
+        ctx.scale = scale
         if g is not None:
             tensors.append(g)
         if beta is not None:
@@ -1016,6 +1035,7 @@ class ChunkedLinearAttnFn(torch.autograd.Function):
                 C,
                 initial_state=initial_state,
                 return_final_state=return_final_state,
+                scale=scale,
             )
             ctx.h_all = h_all
             ctx.v_new_all = None
@@ -1034,6 +1054,7 @@ class ChunkedLinearAttnFn(torch.autograd.Function):
         torch.Tensor | None,
         torch.Tensor | None,
         torch.Tensor | None,
+        None,
         None,
         None,
         None,
@@ -1061,8 +1082,9 @@ class ChunkedLinearAttnFn(torch.autograd.Function):
                 grad_output,
                 C,
                 h_all=h_all,
+                scale=ctx.scale,
             )
-            return dq, dk, dv, dg, None, None, None, None, None
+            return dq, dk, dv, dg, None, None, None, None, None, None
 
         A_inv = ctx.A_inv
         w_wy = ctx.w_wy
@@ -1081,7 +1103,7 @@ class ChunkedLinearAttnFn(torch.autograd.Function):
             A_inv=A_inv,
             w_wy=w_wy,
         )
-        return dq, dk, dv, dg, dbeta, da, None, None, None
+        return dq, dk, dv, dg, dbeta, da, None, None, None, None
 
 
 # ════════════════════════════════════════════════════════════════════════════════
@@ -1132,6 +1154,7 @@ def _helion_chunked_fwd(
     C: int,
     initial_state: torch.Tensor | None = None,
     return_final_state: bool = False,
+    scale: float = 1.0,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
     B, H, T, D = q.shape
     DV = v.shape[-1]
@@ -1150,7 +1173,7 @@ def _helion_chunked_fwd(
         kf = k.reshape(BHN, C, D)
         vf2 = v_flat.reshape(BHN, C, DV)
         hf2 = h_all.reshape(BHN, D, DV)
-        o = chunk_fwd_o_helion(qf, kf, vf2, None, hf2, use_g=False)
+        o = chunk_fwd_o_helion(qf, kf, vf2, None, hf2, use_g=False, scale=scale)
 
         h_all._scalar_bwd_cache = None  # pyrefly: ignore
         final_state = None
@@ -1320,6 +1343,7 @@ def _helion_chunked_bwd(
     grad_output: torch.Tensor,
     C: int,
     h_all: torch.Tensor | None = None,
+    scale: float = 1.0,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
     B, H, T, D = q.shape
     DV = v.shape[-1]
@@ -1333,8 +1357,8 @@ def _helion_chunked_bwd(
         # No-decay backward: no g_cs/q_scaled prescale, decay compiled out of
         # the kernels, and no dg gradient.
         v_flat = v.reshape(BH, N, C, DV)
-        do_flat = grad_output_f.reshape(BH, N, C, DV)
-        q_4d = q.float().reshape(BH, N, C, D)
+        do_flat = grad_output.reshape(BH, N, C, DV)
+        q_4d = q.reshape(BH, N, C, D)
 
         if h_all is None:
             k_state_4d = k.reshape(BH, N, C, D)
@@ -1342,7 +1366,9 @@ def _helion_chunked_bwd(
             h_all = chunk_fwd_h_diag_fused(k_state_4d, v_flat, None, state, use_g=False)
 
         dstate = q.new_zeros(BH, D, DV, dtype=torch.float32)
-        dh_all = chunk_bwd_dh_diag_fused(q_4d, do_flat, None, dstate, use_g=False)
+        dh_all = chunk_bwd_dh_diag_fused(
+            q_4d, do_flat, None, dstate, use_g=False, scale=scale
+        )
 
         g_csf2 = q.new_zeros(BHN, C, dtype=torch.float32)
         g_lastf2 = q.new_zeros(BHN, dtype=torch.float32)
@@ -1354,9 +1380,11 @@ def _helion_chunked_bwd(
         hb = h_all.reshape(BHN, D, DV)
 
         dq_raw, dk_raw = chunk_bwd_dqk_helion(
-            qb, kb, vb, g_csf2, g_lastf2, hb, dob, dhf2, use_g=False
+            qb, kb, vb, g_csf2, g_lastf2, hb, dob, dhf2, use_g=False, scale=scale
         )
-        dv_raw = chunk_bwd_dv_helion(qb, kb, kb, g_csf2, dob, dhf2, use_g=False)
+        dv_raw = chunk_bwd_dv_helion(
+            qb, kb, kb, g_csf2, dob, dhf2, use_g=False, scale=scale
+        )
 
         return (
             dq_raw.reshape(B, H, T, D),
@@ -1765,6 +1793,7 @@ def chunked_linear_attn(
     initial_state: torch.Tensor | None = ...,
     return_final_state: Literal[False] = ...,
     head_first: bool = ...,
+    scale: float = ...,
 ) -> torch.Tensor: ...
 
 
@@ -1780,6 +1809,7 @@ def chunked_linear_attn(
     initial_state: torch.Tensor | None = ...,
     return_final_state: Literal[True] = ...,
     head_first: bool = ...,
+    scale: float = ...,
 ) -> tuple[torch.Tensor, torch.Tensor]: ...
 
 
@@ -1794,8 +1824,12 @@ def chunked_linear_attn(
     initial_state: torch.Tensor | None = None,
     return_final_state: bool = False,
     head_first: bool = True,
+    scale: float = 1.0,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-    """Public entry point for chunked linear attention. g=None means no decay."""
+    """Public entry point for chunked linear attention. g=None means no decay.
+
+    scale folds into the kernels (no-decay path only); pass q unscaled with it.
+    Defaults to 1.0 so callers that pre-scale q are unaffected."""
     if not head_first:
         q = q.transpose(1, 2).contiguous()
         k = k.transpose(1, 2).contiguous()
@@ -1836,7 +1870,7 @@ def chunked_linear_attn(
             a = torch.nn.functional.pad(a, [0, 0, 0, pad])
 
     o, final_state = ChunkedLinearAttnFn.apply(
-        q, k, v, g, beta, a, C, initial_state, return_final_state
+        q, k, v, g, beta, a, C, initial_state, return_final_state, scale
     )
 
     if pad > 0:
