@@ -1991,6 +1991,22 @@ def _emit_mma_pipeline(
         mma_impl = "universal"
     if mma_impl != "universal" and zero_acc_expr:
         acc_expr = None
+    # cute 4.5.2 (cu13) miscompiles the universal MMA for small tiles (bm/bn<32),
+    # returning wrong results at scale. Reject only when the problem is >=32 on
+    # both axes -- a genuinely small matmul needs a small tile and its tiny output
+    # stays in tolerance. Remove when upstream fixes it (cf. NVIDIA/cutlass
+    # #3240/#3241).
+    if (
+        mma_impl == "universal"
+        and (bm < 32 or bn < 32)
+        and m_size >= 32
+        and n_size >= 32
+    ):
+        raise exc.BackendUnsupported(
+            "cute",
+            "universal MMA requires block_size_m and block_size_n >= 32 for "
+            "M,N>=32 problems (cute 4.5.2 cu13 miscompiles smaller tiles)",
+        )
     tcgen05_requested_flat_role_coordinates = bool(
         df.config.get(TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY, False)
     )

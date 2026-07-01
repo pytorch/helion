@@ -39,6 +39,7 @@ from helion._testing import skipIfMTIA
 from helion.autotuner import PowerOfTwoFragment
 from helion.autotuner.config_generation import ConfigGeneration
 from helion.autotuner.config_spec import MatmulFact
+from helion.exc import BackendUnsupported
 from helion.exc import InvalidConfig
 import helion.language as hl
 
@@ -1096,72 +1097,61 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
             self.assertEqual(seed["tcgen05_ab_stages"], 3)
 
     @onlyBackends(["cute"])
-    def test_cute_universal_matmul_lane_loop_correctness(self) -> None:
-        """Universal-MMA SMEM-load guards stay correct under a lane loop.
+    def test_cute_universal_matmul_small_tile_guard(self) -> None:
+        """Universal MMA rejects small tiles; valid lane configs still work.
 
-        Binds a CuTe matmul with a lane-loop configuration
-        (``elements_per_thread=2``) on either the M or the N axis and
-        asserts both the launch dim (recovery must divide by ``epT``)
-        and ``allclose`` against ``x @ y`` (SMEM-load guards must use
-        the physical thread coord so every lane iteration re-populates
-        sA / sB). The fix is symmetric across M and N — see the
-        ``_local_mma_coord_expr`` → ``_physical_mma_coord_expr``
-        switch in ``cute_mma._codegen_cute_mma``.
+        cute 4.5.2 (cu13) miscompiles the universal MMA for output tiles
+        with ``block_size_m`` or ``block_size_n`` < 32 — silent wrong
+        results (bm=16 deterministically, a 16-wide partner flakily). So
+        ``_codegen_cute_mma`` raises ``BackendUnsupported`` for that
+        regime, pruning it from autotune and failing explicit configs
+        loudly instead of returning wrong output.
+
+        A lane-loop config (``elements_per_thread=2``) with bm,bn>=32
+        stays legal: it still exercises the ``_local_mma_coord_expr`` →
+        ``_physical_mma_coord_expr`` switch, keeps the ``block=(16, 16, 1)``
+        launch dim, and is numerically correct.
         """
         torch.manual_seed(0)
         x = torch.randn([1024, 1024], device=DEVICE, dtype=torch.float32)
         y = torch.randn([1024, 1024], device=DEVICE, dtype=torch.float32)
-        # Both variants force the universal MMA path (fp32 inputs) with
-        # a 2-element lane loop on the named axis. Expected launch dim
-        # is ``block=(16, 16, 1)`` in both cases: the non-laned axis
-        # carries its ``num_threads`` value directly, the laned axis
-        # carries ``block_size // elements_per_thread``.
-        cases = (
-            (
-                "n_axis_lane",
-                helion.Config(block_sizes=[16, 32, 32], num_threads=[16, 16, 32]),
-            ),
-            (
-                "m_axis_lane",
-                helion.Config(block_sizes=[32, 16, 32], num_threads=[16, 16, 32]),
-            ),
+
+        # Small-tile universal configs (bm=16 / bn=16) are rejected.
+        rejected = (
+            ("bm16", helion.Config(block_sizes=[16, 32, 32], num_threads=[16, 16, 32])),
+            ("bn16", helion.Config(block_sizes=[32, 16, 32], num_threads=[16, 16, 32])),
         )
-        for case_name, config in cases:
+        for case_name, config in rejected:
             with self.subTest(case=case_name):
-                if case_name == "n_axis_lane":
-                    # CuTe DSL 4.5.1 regressed the SMEM-load guards on the
-                    # N-axis lane-loop path: ``x @ y`` mismatches at ~0.05%
-                    # of elements with a >10 absolute diff. M-axis still
-                    # passes, so the asymmetry needs investigation in the
-                    # upstream cute release before this case can be
-                    # re-enabled.
-                    self.skipTest(
-                        "CuTe 4.5.1 regression: n_axis_lane SMEM-load guard "
-                        "produces wrong values; see _codegen_cute_mma."
-                    )
-                # Fresh bind cache: the in-memory bind cache is keyed
-                # by args and other subTest iterations populate it.
+                # Fresh bind cache: it is keyed by args and other subTest
+                # iterations populate it.
                 _cute_strategy_matmul_kernel._bound_kernels.clear()
-                # ``patch_cute_mma_support`` makes the lowering
-                # decision deterministic across hosts — on a
-                # tcgen05-capable host these shapes fall to universal
-                # MMA via the precondition-check path anyway, but
-                # wrapping matches the convention used by every other
-                # ``_cute_strategy_matmul_kernel`` binding in this
-                # class.
+                # ``patch_cute_mma_support`` makes the lowering decision
+                # deterministic across hosts.
                 with patch_cute_mma_support():
                     bound = _cute_strategy_matmul_kernel.bind((x, y))
-                bound.set_config(config)
-                result = bound(x, y)
-                torch.testing.assert_close(result, x @ y, atol=1e-1, rtol=1e-2)
+                # ``set_config`` already triggers cute codegen (and so does
+                # ``to_triton_code``); the small-tile guard raises in either.
+                with self.assertRaises(BackendUnsupported):
+                    bound.set_config(config)
+                    bound.to_triton_code(config)
 
-                code = bound.to_triton_code(config)
-                for ln in code.splitlines():
-                    if "_launcher(" in ln and "block=(" in ln:
-                        self.assertIn("block=(16, 16, 1)", ln)
-                        break
-                else:
-                    self.fail("could not locate launcher block=(...) in generated code")
+        # A valid lane config (bm=bn=32, epT=2 on both axes) is accepted:
+        # the laned launch dim is block=(16, 16, 1) and x @ y is correct.
+        config = helion.Config(block_sizes=[32, 32, 32], num_threads=[16, 16, 32])
+        _cute_strategy_matmul_kernel._bound_kernels.clear()
+        with patch_cute_mma_support():
+            bound = _cute_strategy_matmul_kernel.bind((x, y))
+        bound.set_config(config)
+        code = bound.to_triton_code(config)
+        for ln in code.splitlines():
+            if "_launcher(" in ln and "block=(" in ln:
+                self.assertIn("block=(16, 16, 1)", ln)
+                break
+        else:
+            self.fail("could not locate launcher block=(...) in generated code")
+        result = bound(x, y)
+        torch.testing.assert_close(result, x @ y, atol=1e-1, rtol=1e-2)
 
     @onlyBackends(["cute"])
     def test_cute_inactive_grid_block_id_does_not_claim_thread_axis(self) -> None:
