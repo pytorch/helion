@@ -109,9 +109,17 @@ def _dynamic_per_token_scaled_fp8_quant_vllm(
 
 
 def _baselines() -> list[tuple[str, object]]:
-    """Baselines main() benchmarks against (torch always; vLLM when installed)."""
+    """Baselines main() benchmarks against (torch always; vLLM when installed).
+
+    ``torch_compile`` is ``torch.compile`` of the torch reference -- a
+    speedup-comparison baseline only (not checked for accuracy).
+    """
     out: list[tuple[str, object]] = [
-        ("torch", _dynamic_per_token_scaled_fp8_quant_torch)
+        ("torch", _dynamic_per_token_scaled_fp8_quant_torch),
+        (
+            "torch_compile",
+            torch.compile(_dynamic_per_token_scaled_fp8_quant_torch),
+        ),
     ]
     if _HAS_VLLM:
         out.append(("vllm", _dynamic_per_token_scaled_fp8_quant_vllm))

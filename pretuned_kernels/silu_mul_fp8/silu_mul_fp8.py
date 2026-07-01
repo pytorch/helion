@@ -78,8 +78,15 @@ def _silu_mul_fp8_vllm(input: torch.Tensor, scale: torch.Tensor) -> torch.Tensor
 
 
 def _baselines() -> list[tuple[str, object]]:
-    """Baselines main() benchmarks against (torch always; vLLM when installed)."""
-    out: list[tuple[str, object]] = [("torch", _silu_mul_fp8_torch)]
+    """Baselines main() benchmarks against (torch always; vLLM when installed).
+
+    ``torch_compile`` is ``torch.compile`` of the torch reference -- a
+    speedup-comparison baseline only (not checked for accuracy).
+    """
+    out: list[tuple[str, object]] = [
+        ("torch", _silu_mul_fp8_torch),
+        ("torch_compile", torch.compile(_silu_mul_fp8_torch)),
+    ]
     if _HAS_VLLM:
         out.append(("vllm", _silu_mul_fp8_vllm))
     return out

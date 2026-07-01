@@ -58,6 +58,13 @@ At runtime Helion picks the file matching the current GPU.
 | `silu_and_mul_per_block_quant` | vLLM `(num_tokens, intermediate, group)` shapes | torch-native silu-and-mul + per-block fp8 quant |
 | `fused_qk_norm_rope` | vLLM `(num_tokens, q_heads, kv_heads)` shapes | torch-native fused QK-RMSNorm + RoPE |
 
+Every kernel additionally benchmarks against `torch.compile` of the listed
+PyTorch baseline (a speedup-comparison baseline only -- correctness is checked
+against the eager reference). The headline speedup is Helion vs the *fastest*
+available baseline, and the dashboard's per-kernel dropdown breaks down Helion's
+speedup over each baseline (`torch`, `torch_compile`, and the vLLM op when
+installed in the nightly).
+
 The kernels ported from vLLM (`vllm/kernels/helion/ops`) benchmark each fused
 Helion kernel under CUDA graphs against a torch-native (unfused, eager)
 reference; `silu_mul_fp8` ships an `sm90` heuristic only, the rest ship both

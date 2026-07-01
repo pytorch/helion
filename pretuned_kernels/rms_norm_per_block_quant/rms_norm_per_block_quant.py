@@ -220,8 +220,15 @@ def _rms_norm_per_block_quant_vllm(
 
 
 def _baselines() -> list[tuple[str, object]]:
-    """Baselines main() benchmarks against (torch always; vLLM when installed)."""
-    out: list[tuple[str, object]] = [("torch", _rms_norm_per_block_quant_torch)]
+    """Baselines main() benchmarks against (torch always; vLLM when installed).
+
+    ``torch_compile`` is ``torch.compile`` of the torch reference -- a
+    speedup-comparison baseline only (not checked for accuracy).
+    """
+    out: list[tuple[str, object]] = [
+        ("torch", _rms_norm_per_block_quant_torch),
+        ("torch_compile", torch.compile(_rms_norm_per_block_quant_torch)),
+    ]
     if _HAS_VLLM:
         out.append(("vllm", _rms_norm_per_block_quant_vllm))
     return out

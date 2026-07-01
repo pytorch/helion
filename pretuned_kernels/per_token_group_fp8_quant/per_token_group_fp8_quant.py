@@ -126,8 +126,15 @@ def _per_token_group_fp8_quant_vllm(
 
 
 def _baselines() -> list[tuple[str, object]]:
-    """Baselines main() benchmarks against (torch always; vLLM when installed)."""
-    out: list[tuple[str, object]] = [("torch", _per_token_group_fp8_quant_torch)]
+    """Baselines main() benchmarks against (torch always; vLLM when installed).
+
+    ``torch_compile`` is ``torch.compile`` of the torch reference -- a
+    speedup-comparison baseline only (not checked for accuracy).
+    """
+    out: list[tuple[str, object]] = [
+        ("torch", _per_token_group_fp8_quant_torch),
+        ("torch_compile", torch.compile(_per_token_group_fp8_quant_torch)),
+    ]
     if _HAS_VLLM:
         out.append(("vllm", _per_token_group_fp8_quant_vllm))
     return out

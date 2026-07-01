@@ -228,8 +228,15 @@ def _fused_qk_norm_rope_vllm(
 
 
 def _baselines() -> list[tuple[str, object]]:
-    """Baselines main() benchmarks against (torch always; vLLM when installed)."""
-    out: list[tuple[str, object]] = [("torch", _fused_qk_norm_rope_torch)]
+    """Baselines main() benchmarks against (torch always; vLLM when installed).
+
+    ``torch_compile`` is ``torch.compile`` of the torch reference -- a
+    speedup-comparison baseline only (not checked for accuracy).
+    """
+    out: list[tuple[str, object]] = [
+        ("torch", _fused_qk_norm_rope_torch),
+        ("torch_compile", torch.compile(_fused_qk_norm_rope_torch)),
+    ]
     if _HAS_VLLM:
         out.append(("vllm", _fused_qk_norm_rope_vllm))
     return out

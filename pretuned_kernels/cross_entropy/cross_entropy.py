@@ -2,11 +2,8 @@
 
 from __future__ import annotations
 
-import math
-
 import torch
 import torch.nn.functional as F
-import triton.testing as tt
 
 import helion
 import helion.experimental
@@ -43,15 +40,33 @@ def cross_entropy(
     return losses.mean()
 
 
+def _cross_entropy_torch(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+    return F.cross_entropy(logits, labels)
+
+
+def _baselines() -> list[tuple[str, object]]:
+    """Baselines main() benchmarks against.
+
+    ``torch_compile`` is ``torch.compile`` of the torch reference -- a
+    speedup-comparison baseline only (not checked for accuracy).
+    """
+    return [
+        ("torch", _cross_entropy_torch),
+        ("torch_compile", torch.compile(_cross_entropy_torch)),
+    ]
+
+
 def use_cudagraph() -> bool:
     """Whether main() benchmarks under CUDA graphs (read by pretuned_kernels/run.py)."""
     return False
 
 
 def main(verbose: bool = True) -> dict:
-    def _p(*args: object) -> None:
-        if verbose:
-            print(*args)
+    import os
+    import sys
+
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    from _bench import run_sweep
 
     tritonbench_shapes = [
         (2048, 32000),
@@ -79,60 +94,28 @@ def main(verbose: bool = True) -> dict:
         (2048, 256000),
     ]
     shapes = list(dict.fromkeys(tritonbench_shapes + realistic_shapes))
+    baselines = _baselines()
 
-    _p(f"GPU: {torch.cuda.get_device_name()}")
-    _p(
-        f"{'tokens':>8s}  {'vocab':>8s}  {'helion (ms)':>12s}  "
-        f"{'torch (ms)':>12s}  {'speedup':>8s}"
-    )
-    _p("-" * 67)
-
-    speedups: list[float] = []
-    helion_wins = 0
-    best_speedup = 0.0
-    best_shape = (0, 0)
-    for tokens, vocab in shapes:
+    def make_calls(shape: tuple[int, int]) -> tuple:
+        tokens, vocab = shape
         logits = torch.randn([tokens, vocab], device="cuda", dtype=torch.bfloat16)
         labels = torch.randint(0, vocab, [tokens], device="cuda", dtype=torch.int64)
-        cross_entropy(logits, labels)  # warmup
-        ms_helion = tt.do_bench(
-            lambda logits=logits, labels=labels: cross_entropy(logits, labels),
-            warmup=25,
-            rep=100,
-            return_mode="median",
-        )
-        ms_torch = tt.do_bench(
-            lambda logits=logits, labels=labels: F.cross_entropy(logits, labels),
-            warmup=25,
-            rep=100,
-            return_mode="median",
-        )
-        speedup = ms_torch / ms_helion if ms_helion > 0 else float("nan")
-        speedups.append(speedup)
-        if speedup > 1.0:
-            helion_wins += 1
-        if speedup > best_speedup:
-            best_speedup = speedup
-            best_shape = (tokens, vocab)
-        _p(
-            f"{tokens:>8d}  {vocab:>8d}  {ms_helion:>12.4f}  "
-            f"{ms_torch:>12.4f}  {speedup:>7.2f}x"
-        )
 
-    geomean = math.exp(
-        sum(math.log(s) for s in speedups if s > 0) / max(len(speedups), 1)
+        def helion_call() -> torch.Tensor:
+            return cross_entropy(logits, labels)
+
+        base_calls = [
+            (name, (lambda fn=fn: fn(logits, labels))) for name, fn in baselines
+        ]
+        return helion_call, base_calls, f"{tokens:>8d}  {vocab:>8d}"
+
+    return run_sweep(
+        shapes,
+        make_calls,
+        use_cudagraph=use_cudagraph(),
+        verbose=verbose,
+        shape_header=f"{'tokens':>8s}  {'vocab':>8s}",
     )
-    _p(
-        f"\nHelion faster on {helion_wins}/{len(shapes)} shapes; "
-        f"geomean speedup {geomean:.3f}x; "
-        f"best speedup {best_speedup:.2f}x at (tokens, vocab)={best_shape}."
-    )
-    return {
-        "helion_wins": helion_wins,
-        "total": len(shapes),
-        "geomean": round(geomean, 4),
-        "best_speedup": round(best_speedup, 4),
-    }
 
 
 if __name__ == "__main__":

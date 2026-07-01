@@ -136,6 +136,10 @@ def _baselines() -> list[tuple[str, object]]:
     torch._scaled_mm is always available; vLLM's CUTLASS kernel is added when
     vLLM is installed (the nightly benchmark env). The SUMMARY speedup is helion
     vs the best (fastest) available baseline.
+
+    No torch.compile baseline here: the torch reference is a single opaque GEMM
+    (torch._scaled_mm -> cuBLAS/cutlass), which torch.compile just re-dispatches
+    to the same kernel -- a redundant, not-faster baseline.
     """
     baselines: list[tuple[str, object]] = [("torch", _scaled_mm_torch)]
     if _HAS_VLLM:
