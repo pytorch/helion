@@ -486,8 +486,8 @@ def chunk_fwd_o_helion(
             attn = attn * causal
 
         vt = v[tile_bhn, :, tile_dv]
-        o_intra = torch.bmm(attn.to(vt.dtype), vt)
-        out[tile_bhn, :, tile_dv] = (o_cross + o_intra).to(out.dtype)
+        o_intra = hl.dot(attn.to(vt.dtype), vt, acc=o_cross)
+        out[tile_bhn, :, tile_dv] = o_intra.to(out.dtype)
 
     return out
 
