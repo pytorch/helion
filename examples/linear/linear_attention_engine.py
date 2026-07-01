@@ -332,11 +332,13 @@ def chunk_fwd_h_diag_fused(
     v: torch.Tensor,
     g_last: torch.Tensor,
     h0: torch.Tensor,
+    use_g: hl.constexpr = True,  # pyrefly: ignore[bad-function-definition]
 ) -> torch.Tensor:
     """Fused state accumulation over N chunks (diagonal decay).
 
     Tiles [BH, D, DV] to parallelize over both key and value dimensions,
-    matching FLA's grid=(K_blocks, V_blocks, BH) strategy.
+    matching FLA's grid=(K_blocks, V_blocks, BH) strategy. With use_g=False the
+    decay is compiled out, for variants with no decay.
     """
     BH = k_state.size(0)
     N = k_state.size(1)
@@ -351,8 +353,9 @@ def chunk_fwd_h_diag_fused(
 
         for i_t in hl.grid(N):
             h_all[idx, i_t, tile_d, tile_dv] = h_acc.to(h_all.dtype)
-            gl_d = g_last[idx, i_t, tile_d]
-            h_acc = h_acc * torch.exp(gl_d)[:, None]
+            if use_g:
+                gl_d = g_last[idx, i_t, tile_d]
+                h_acc = h_acc * torch.exp(gl_d)[:, None]
             k_i = k_state[idx, i_t, :, tile_d]
             v_i = v[idx, i_t, :, tile_dv]
             h_acc = hl.dot(k_i.transpose(-2, -1), v_i, acc=h_acc)
@@ -449,8 +452,10 @@ def chunk_fwd_o_helion(
     v: torch.Tensor,
     g_cs: torch.Tensor,
     h: torch.Tensor,
+    use_g: hl.constexpr = True,  # pyrefly: ignore[bad-function-definition]
 ) -> torch.Tensor:
-    """Output computation for all chunks in parallel (no correction)."""
+    """Output computation for all chunks in parallel (no correction). With
+    use_g=False the decay is compiled out, for variants with no decay."""
     BHN = q.size(0)
     C = hl.specialize(q.size(1))
     D = q.size(2)
@@ -470,12 +475,15 @@ def chunk_fwd_o_helion(
             o_cross = hl.dot(qt, ht, acc=o_cross)
             attn = hl.dot(qt, kt.transpose(-2, -1), acc=attn)
 
-        gc = g_cs[tile_bhn, :]
-        decay_ij = torch.exp(gc[:, :, None] - gc[:, None, :])
         idx = hl.arange(C)
         causal = (idx[:, None] >= idx[None, :]).float()
-        attn = attn * decay_ij * causal
-        o_cross = o_cross * torch.exp(gc)[:, :, None]
+        if use_g:
+            gc = g_cs[tile_bhn, :]
+            decay_ij = torch.exp(gc[:, :, None] - gc[:, None, :])
+            attn = attn * decay_ij * causal
+            o_cross = o_cross * torch.exp(gc)[:, :, None]
+        else:
+            attn = attn * causal
 
         vt = v[tile_bhn, :, tile_dv]
         o_intra = torch.bmm(attn.to(vt.dtype), vt)
@@ -948,9 +956,12 @@ class ChunkedLinearAttnFn(torch.autograd.Function):
         initial_state: torch.Tensor | None,
         return_final_state: bool,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        tensors = [q, k, v, g]
+        tensors = [q, k, v]
+        ctx.has_g = g is not None
         ctx.has_beta = beta is not None
         ctx.has_a = a is not None
+        if g is not None:
+            tensors.append(g)
         if beta is not None:
             tensors.append(beta)
         if a is not None:
@@ -1019,8 +1030,11 @@ class ChunkedLinearAttnFn(torch.autograd.Function):
         None,
     ]:
         tensors = ctx.saved_tensors
-        q, k, v, g = tensors[:4]
-        idx = 4
+        q, k, v = tensors[:3]
+        idx = 3
+        g = tensors[idx] if ctx.has_g else None
+        if ctx.has_g:
+            idx += 1
         beta = tensors[idx] if ctx.has_beta else None
         if ctx.has_beta:
             idx += 1
@@ -1081,13 +1095,17 @@ def _final_state_from_h_all(
     h_all: torch.Tensor,
     k_state_4d: torch.Tensor,
     v_flat: torch.Tensor,
-    g_last_4d: torch.Tensor,
+    g_last_4d: torch.Tensor | None,
     B: int,
     H: int,
+    use_g: bool = True,
 ) -> torch.Tensor:
     h_last = h_all[:, -1].float()
-    gl = g_last_4d[:, -1]
-    h_final = h_last * torch.exp(gl).unsqueeze(-1)
+    if use_g:
+        gl = g_last_4d[:, -1]
+        h_final = h_last * torch.exp(gl).unsqueeze(-1)
+    else:
+        h_final = h_last
     h_final = h_final + torch.bmm(
         k_state_4d[:, -1].float().transpose(-2, -1),
         v_flat[:, -1].float(),
@@ -1109,6 +1127,27 @@ def _helion_chunked_fwd(
     N = T // C
     BH = B * H
     BHN = BH * N
+
+    if g is None:
+        # No-decay path: the in-kernel decay ops are skipped and compiled out via use_g=False.
+        k_state_4d = k.reshape(BH, N, C, D)
+        v_flat = v.reshape(BH, N, C, DV)
+        state = _init_state(initial_state, BH, D, DV, q)
+        h_all = chunk_fwd_h_diag_fused(k_state_4d, v_flat, None, state, use_g=False)
+
+        qf = q.reshape(BHN, C, D)
+        kf = k.reshape(BHN, C, D)
+        vf2 = v_flat.reshape(BHN, C, DV)
+        hf2 = h_all.reshape(BHN, D, DV)
+        o = chunk_fwd_o_helion(qf, kf, vf2, None, hf2, use_g=False)
+
+        h_all._scalar_bwd_cache = None  # pyrefly: ignore
+        final_state = None
+        if return_final_state:
+            final_state = _final_state_from_h_all(
+                h_all, k_state_4d, v_flat, None, B, H, use_g=False
+            )
+        return o.reshape(B, H, T, DV), h_all, final_state
 
     scalar_decay = g.dim() == 3
 
@@ -1700,7 +1739,7 @@ def chunked_linear_attn(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
-    g: torch.Tensor,
+    g: torch.Tensor | None,
     beta: torch.Tensor | None = None,
     a: torch.Tensor | None = None,
     C: int = 64,
@@ -1708,12 +1747,13 @@ def chunked_linear_attn(
     return_final_state: bool = False,
     head_first: bool = True,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-    """Public entry point for chunked linear attention."""
+    """Public entry point for chunked linear attention. g=None means no decay."""
     if not head_first:
         q = q.transpose(1, 2).contiguous()
         k = k.transpose(1, 2).contiguous()
         v = v.transpose(1, 2).contiguous()
-        g = g.transpose(1, 2).contiguous()
+        if g is not None:
+            g = g.transpose(1, 2).contiguous()
         if beta is not None:
             beta = beta.transpose(1, 2).contiguous() if beta.dim() >= 3 else beta
         if a is not None:
@@ -1734,10 +1774,11 @@ def chunked_linear_attn(
         q = torch.nn.functional.pad(q, [0, 0, 0, pad])
         k = torch.nn.functional.pad(k, [0, 0, 0, pad])
         v = torch.nn.functional.pad(v, [0, 0, 0, pad])
-        if g.dim() == 3:
-            g = torch.nn.functional.pad(g, [0, pad])
-        else:
-            g = torch.nn.functional.pad(g, [0, 0, 0, pad])
+        if g is not None:
+            if g.dim() == 3:
+                g = torch.nn.functional.pad(g, [0, pad])
+            else:
+                g = torch.nn.functional.pad(g, [0, 0, 0, pad])
         if beta is not None:
             if beta.dim() == 3:
                 beta = torch.nn.functional.pad(beta, [0, pad])
