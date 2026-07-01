@@ -211,7 +211,7 @@ def benchmark(
             gi: torch.Tensor = g,
             sc: float = scale,
         ) -> torch.Tensor:
-            return chunked_linear_attn(q * sc, ki, vi, gi, C=BENCH_C)
+            return chunked_linear_attn(q * sc, ki, vi, None, C=BENCH_C)
 
         fwd_ms = do_bench(helion_fwd)
 
@@ -242,7 +242,7 @@ def benchmark(
             go: torch.Tensor = grad_out,
             sc: float = scale,
         ) -> None:
-            o = chunked_linear_attn(q * sc, ki, vi, gi, C=BENCH_C)
+            o = chunked_linear_attn(q * sc, ki, vi, None, C=BENCH_C)
             o.backward(go)
             q.grad = ki.grad = vi.grad = None
 
@@ -301,7 +301,7 @@ def accuracy(
         q, k, v, g, scale = make_vanilla_linear_attn_inputs(
             bi, hi, ti, di, dvi, dtype=DTYPE, device=DEVICE
         )
-        out = chunked_linear_attn(q * scale, k, v, g, C=BENCH_C)
+        out = chunked_linear_attn(q * scale, k, v, None, C=BENCH_C)
         ref = naive_recurrent_reference(q, k, v, g, q_scale=scale)
         fwd_ok = _rel_error(out, ref) < ACC_FWD_TOL
 
@@ -311,7 +311,7 @@ def accuracy(
         try:
             grad_out = torch.randn(bi, hi, ti, dvi, device=DEVICE, dtype=DTYPE)
             hl = [x.detach().requires_grad_(True) for x in (q, k, v)]
-            chunked_linear_attn(hl[0] * scale, hl[1], hl[2], g, C=BENCH_C).backward(
+            chunked_linear_attn(hl[0] * scale, hl[1], hl[2], None, C=BENCH_C).backward(
                 grad_out
             )
             rl = [x.detach().requires_grad_(True) for x in (q, k, v)]
