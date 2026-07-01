@@ -154,6 +154,7 @@ def my_kernel(x: torch.Tensor) -> torch.Tensor:
 
    - ``config``: the config tested;
    - ``generated_code``: the full generated kernel source, captured because it differs per config (``null`` when the compiled artifact is unavailable; can be large for big search spaces). Backend-specific — Triton on the default backend, CuTe/Pallas/Metal on those backends — so read the record's ``settings.backend`` to interpret it.
+   - ``perf_stats``: ``{min, median, mean, p90, std, n_samples}`` (latency in ms; ``p90`` is the 90th percentile via ``numpy.percentile``, i.e. linear/type-7 interpolation) — a richer description than the scalar the autotuner selects on. Holds the last *successful* benchmark of the config (a later failed re-benchmark does not overwrite it); all-``null`` with ``n_samples: 0`` for a config that never benchmarked. Collected only on this opt-in path and descriptive — not an input to selection or ``run_id``.
 
    ``hardware_info`` is a best-effort structured snapshot, collected lazily when the record is written (it never affects the autotune path). It covers cuda/rocm/xpu/tpu/cpu; absent numeric props are ``null`` and the GPU-only ``device_props`` block is omitted entirely on tpu/cpu; it is descriptive only and excluded from ``run_id``. Fields:
 

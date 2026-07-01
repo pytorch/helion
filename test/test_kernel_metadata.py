@@ -25,6 +25,7 @@ from helion.autotuner._metadata.hardware import HardwareInfoRecord
 from helion.autotuner._metadata.hardware import collect_hardware_info
 from helion.autotuner._metadata.ir_features import _has_networkx_node_link
 from helion.autotuner.base_search import _warn_dataset_without_log
+from helion.autotuner.benchmarking import PerfStats
 from helion.autotuner.finite_search import FiniteSearch
 from helion.autotuner.logger import AutotuneLogEntry
 from helion.autotuner.logger import AutotuneLogSink
@@ -32,7 +33,10 @@ from helion.autotuner.metrics import KernelMetadata
 import helion.language as hl
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from helion._compiler.device_ir import DeviceIR
+    from helion.autotuner.logger import ConfigEntry
 
 _LEAN_CSV_HEADER = [
     "run_id",
@@ -366,6 +370,100 @@ class TestAutotuneLogSink(TestCase):
         kernel.get_cached_path.assert_not_called()
 
 
+_PERF_STATS_KEYS = {"min", "median", "mean", "p90", "std", "n_samples"}
+_PERF_STATS = PerfStats(
+    min=1.0,
+    median=1.1,
+    mean=1.2,
+    p90=1.3,
+    std=0.1,
+    n_samples=50,
+)
+
+
+class TestPerfStats(TestCase):
+    """perf_stats rides in the meta configs map; last *successful* benchmark wins."""
+
+    def _record(
+        self,
+        entries: Callable[[str, helion.Config], list[AutotuneLogEntry]],
+    ) -> tuple[str, dict[str, object]]:
+        config = helion.Config(block_sizes=[32], num_warps=4)
+        with tempfile.TemporaryDirectory() as tmp:
+            with AutotuneLogSink(
+                f"{tmp}/run", _metadata(), collect_dataset=True
+            ) as sink:
+                sink.start_run()
+                config_id = sink.register_config(config)
+                assert config_id is not None
+                for entry in entries(config_id, config):
+                    sink.record(entry)
+                sink.end_run()
+            record = json.loads(
+                sink.meta_path.read_text(encoding="utf-8").splitlines()[0]
+            )
+        return config_id, record["configs"][config_id]
+
+    def test_perf_stats_recorded_per_config(self) -> None:
+        _cid, entry = self._record(
+            lambda cid, cfg: [
+                AutotuneLogEntry(
+                    generation=0,
+                    status="ok",
+                    perf_ms=1.1,
+                    compile_time=0.5,
+                    config_id=cid,
+                    config=cfg,
+                    perf_stats=_PERF_STATS,
+                )
+            ]
+        )
+        self.assertEqual(set(entry["perf_stats"]), _PERF_STATS_KEYS)
+        self.assertEqual(entry["perf_stats"], _PERF_STATS.to_dict())
+
+    def test_started_only_config_has_null_perf_stats(self) -> None:
+        _cid, entry = self._record(
+            lambda cid, cfg: [
+                AutotuneLogEntry(
+                    generation=0,
+                    status="started",
+                    perf_ms=None,
+                    compile_time=None,
+                    config_id=cid,
+                    config=cfg,
+                )
+            ]
+        )
+        self.assertEqual(set(entry["perf_stats"]), _PERF_STATS_KEYS)
+        self.assertEqual(entry["perf_stats"]["n_samples"], 0)
+        self.assertIsNone(entry["perf_stats"]["median"])
+
+    def test_failed_rebenchmark_keeps_good_perf_stats(self) -> None:
+        _cid, entry = self._record(
+            lambda cid, cfg: [
+                AutotuneLogEntry(
+                    generation=0,
+                    status="ok",
+                    perf_ms=1.1,
+                    compile_time=0.5,
+                    config_id=cid,
+                    config=cfg,
+                    perf_stats=_PERF_STATS,
+                ),
+                AutotuneLogEntry(
+                    generation=1,
+                    status="error",
+                    perf_ms=None,
+                    compile_time=None,
+                    config_id=cid,
+                    config=cfg,
+                    perf_stats=None,
+                ),
+            ]
+        )
+        self.assertEqual(entry["perf_stats"], _PERF_STATS.to_dict())
+
+
 @onlyBackends(["triton"])
 class TestAutotuneDatasetE2E(TestCase):
     @skipIfRefEager("Autotuning not supported in ref eager mode")
@@ -408,7 +506,10 @@ class TestAutotuneDatasetE2E(TestCase):
         self.assertTrue(csv_path.exists())
         self.assertTrue(meta_path.exists())
 
-        configs_by_id: dict[str, object] = {}
+        # Union the per-run configs maps and run_ids from the sidecar records, and
+        # keep a per-run-id view so CSV rows can be joined to their own record.
+        configs_by_id: dict[str, ConfigEntry] = {}
+        configs_by_run_id: dict[str, dict[str, ConfigEntry]] = {}
         run_ids: set[str] = set()
         meta_lines = [
             line for line in meta_path.read_text().splitlines() if line.strip()
@@ -432,13 +533,16 @@ class TestAutotuneDatasetE2E(TestCase):
                 sm_attr = _DEVICE_PROPS_ATTRS[hw["device_kind"]][0]
                 self.assertIsNotNone(hw["device_props"][sm_attr])
                 self.assertIsNotNone(hw["versions"]["triton"])
+            record_configs = cast("dict[str, ConfigEntry]", record["configs"])
             # Each configs entry nests the tested config and its per-config generated
             # source; generated_code is null when the config has no cached artifact
             # path (a config that failed to compile is still registered).
-            for cfg_entry in record["configs"].values():
+            for cfg_entry in record_configs.values():
                 self.assertIn("config", cfg_entry)
                 self.assertIsInstance(cfg_entry["generated_code"], (str, type(None)))
-            configs_by_id.update(record["configs"])
+                self.assertEqual(set(cfg_entry["perf_stats"]), _PERF_STATS_KEYS)
+            configs_by_id.update(record_configs)
+            configs_by_run_id.setdefault(record["run_id"], {}).update(record_configs)
             run_ids.add(record["run_id"])
             if _HAS_NETWORKX:
                 ir = record["ir_graph"]
@@ -463,6 +567,27 @@ class TestAutotuneDatasetE2E(TestCase):
             json.dumps(configs_by_id[config_id]["config"])
         )
         self.assertIn(decoded_config.block_sizes, ([32], [64]))
+
+        # Every successful (status="ok") CSV row must join -- within its OWN run_id
+        # record -- to a config entry with real benchmark stats. The contract is
+        # that a successful benchmark always yields a PerfStats (n_samples >= 1,
+        # non-None median), never the null sentinel. This is the e2e proof of
+        # return_mode="stats"; it is stronger than "some config has a sample" and
+        # the device-free sink tests (which inject _PERF_STATS) cannot prove it.
+        # Keying by (run_id, config_id) -- not the unioned map -- ensures a broken
+        # per-run join isn't masked by another record carrying the same config.
+        status_idx = header.index("status")
+        cfg_idx = header.index("config_id")
+        run_idx = header.index("run_id")
+        ok_rows = [row for row in data if row[status_idx] == "ok"]
+        self.assertTrue(ok_rows)
+        for row in ok_rows:
+            row_run_id, row_cfg_id = row[run_idx], row[cfg_idx]
+            self.assertIn(row_run_id, configs_by_run_id)
+            self.assertIn(row_cfg_id, configs_by_run_id[row_run_id])
+            stats = configs_by_run_id[row_run_id][row_cfg_id]["perf_stats"]
+            self.assertGreaterEqual(stats["n_samples"], 1)
+            self.assertIsNotNone(stats["median"])
 
 
 class TestIrGraphDegradation(TestCase):

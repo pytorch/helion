@@ -31,6 +31,7 @@ from torch._inductor.runtime.triton_compat import OutOfResources
 from torch._inductor.runtime.triton_compat import PTXASError
 from torch.cuda import OutOfMemoryError as CudaOOMError
 
+from .benchmarking import PerfStats
 from helion._dist_utils import is_master_rank
 
 if TYPE_CHECKING:
@@ -292,6 +293,7 @@ class AutotuneLogEntry(NamedTuple):
     compile_time: float | None
     config_id: str
     config: Config
+    perf_stats: PerfStats | None = None
 
 
 class ConfigEntry(TypedDict):
@@ -299,6 +301,7 @@ class ConfigEntry(TypedDict):
 
     config: dict[str, object]
     generated_code: str | None
+    perf_stats: dict[str, object]
 
 
 class AutotuneLogSink:
@@ -410,6 +413,7 @@ class AutotuneLogSink:
             self._configs[config_id] = {
                 "config": config.config,
                 "generated_code": None,
+                "perf_stats": PerfStats().to_dict(),
             }
         return config_id
 
@@ -456,6 +460,14 @@ class AutotuneLogSink:
         )
         if self._csv_file is not None:
             self._csv_file.flush()
+        # Only overwrite with real stats: a later failed re-benchmark (perf_stats
+        # None) must not clobber a config's good stats with nulls.
+        if (
+            self._collect_dataset
+            and entry.perf_stats is not None
+            and entry.config_id in self._configs
+        ):
+            self._configs[entry.config_id]["perf_stats"] = entry.perf_stats.to_dict()
 
 
 SUPPRESSED_TRITON_CODE_MSG = (
