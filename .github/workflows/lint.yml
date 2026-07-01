@@ -2,6 +2,9 @@ name: Lint
 
 on:
   pull_request:
+    # `labeled`/`unlabeled` so adding the `no-ci` label skips CI and removing
+    # it re-runs CI.
+    types: [opened, synchronize, reopened, labeled, unlabeled]
   push:
     branches:
       - main
@@ -12,6 +15,8 @@ permissions:
 
 jobs:
   lint:
+    # Skip CI when the PR carries the `no-ci` label.
+    if: ${{ !(github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'no-ci')) }}
     runs-on: ubuntu-latest
 
     strategy:
