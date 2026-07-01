@@ -306,11 +306,12 @@ def _triton_reduction_eligible(env: CompileEnvironment, device_ir: DeviceIR) -> 
 
 
 def _is_standard_reduction(spec: ConfigSpec, fact: ReductionFact) -> bool:
-    """standard vs user-tiled discriminator: standard iff the rdim is a rollable
-    ``reduction_loops`` entry, else user-tiled (a ``block_sizes`` entry). Exhaustive over
-    eligible reductions (the two device_ir populators are mutually exclusive).
+    """standard vs user-tiled discriminator: standard iff the rdim is NOT a ``block_sizes``
+    entry. Covers a roller-rolled rdim (a ``reduction_loops`` entry) AND a MATERIALIZED rdim
+    (an inner ``reduction=True`` axis the roller declined to roll, in NEITHER spec --
+    rms/ln/instance backward); user-tiled is the rdim-is-a-block_sizes case.
     """
-    return fact.block_id in spec.reduction_loops.valid_block_ids()
+    return fact.block_id not in spec.block_sizes.valid_block_ids()
 
 
 def _grid_rows(env: CompileEnvironment, m_block_ids: tuple[int, ...]) -> int:
@@ -731,14 +732,21 @@ class TritonStandardReductionHeuristic(_TritonReductionSeedBase):
         # correctness), so emit and let the autotuner refine.
         non_reduction_loop_ids = set(fact.non_reduction_loop_block_ids)
 
-        # red_block_id=None: the rdim is not a block_sizes entry, so every entry is a
-        # grid axis (floored) or a normalize loop tile (sized to the reduction tile). None
-        # loop => the single grid block at its floor, as before.
-        reduction_loops: list[int | None] = [None] if persistent else [r_block]
+        # red_block_id=None: rdim is not a block_sizes entry, so every entry is a grid axis (floored)
+        # or a normalize-loop tile. MATERIALIZED rdim (rms/ln/instance bwd, the roller declined to roll
+        # it): emit an EMPTY reduction_loops -- already full-width persistent, and a length-1 list would
+        # fail normalize against the 0-length spec.
+        is_materialized = fact.block_id not in spec.reduction_loops.valid_block_ids()
+        reduction_loops: list[int | None]
+        if is_materialized:
+            reduction_loops = []
+        else:
+            reduction_loops = [None] if persistent else [r_block]
+        block_sizes = cls._build_block_sizes(
+            spec, fact, None, None, non_reduction_loop_ids=non_reduction_loop_ids
+        )
         seed: dict[str, Any] = {
-            "block_sizes": cls._build_block_sizes(
-                spec, fact, None, None, non_reduction_loop_ids=non_reduction_loop_ids
-            ),
+            "block_sizes": block_sizes,
             "reduction_loops": reduction_loops,
             "num_warps": num_warps,
             "num_stages": 1,
@@ -817,14 +825,15 @@ class TritonUserTiledReductionHeuristic(_TritonReductionSeedBase):
             fact, max(1, get_num_sm(env.device)), _grid_rows(env, fact.m_block_ids)
         )
 
+        block_sizes = cls._build_block_sizes(
+            spec,
+            fact,
+            fact.block_id,
+            r_block,
+            non_reduction_loop_ids=non_reduction_loop_ids,
+        )
         seed: dict[str, Any] = {
-            "block_sizes": cls._build_block_sizes(
-                spec,
-                fact,
-                fact.block_id,
-                r_block,
-                non_reduction_loop_ids=non_reduction_loop_ids,
-            ),
+            "block_sizes": block_sizes,
             "num_warps": num_warps,
             "num_stages": 1,
             "pid_type": "flat",  # see the standard branch.
