@@ -355,10 +355,10 @@ jobs:
           if [[ "${{ matrix.alias }}" == *xpu* ]]; then
             export TRITON_XPU_GEN_NATIVE_CODE=1
           fi
-          # Pallas interpret runs on CPU (no parallelism) and is much slower
-          # than TPU/Triton — bump the per-test timeout accordingly.
           TIMEOUT=60
-          if [[ "${{ matrix.alias }}" == "pallas-interpret" ]]; then
+          if [[ "${{ matrix.alias }}" == "tpu" ]]; then
+            TIMEOUT=300
+          elif [[ "${{ matrix.alias }}" == "pallas-interpret" ]]; then
             TIMEOUT=300
           elif [[ "${{ matrix.alias }}" == *a10g* ]]; then
             # A10G (sm86) ptxas cold-compiles some backward kernels slowly
@@ -366,9 +366,6 @@ jobs:
             # per-test timeout false-positives on a cold Triton cache and the
             # worker gets killed mid-compile. Give it headroom.
             TIMEOUT=180
-          fi
-          if [[ "${{ matrix.alias }}" == "tpu" ]]; then
-            TIMEOUT=300
           fi
           pytest $PARALLEL -rf --timeout=$TIMEOUT --reruns=2 --timeout-method=thread $EXTRA_FLAGS $TEST_PATH | tee >(eval $SKIP_CHECK)
 
