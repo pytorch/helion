@@ -138,6 +138,15 @@ class ReductionFact(NamedTuple):
     - ``input_load_itemsize``: element size of the HBM input row load — the dtype-faithful
       per-byte signal, distinct from ``itemsize`` (fp32-promoted = 4 at both dtypes). 0
       when no single reduction-fed row load exists.
+    - ``body_live_tiles``: peak number of simultaneously-live rdim-shaped tensor values in the
+      reduction body — the liveness signal that bounds the persistent resident footprint. A
+      heavy body (e.g. fused_linear_jsd's softmax->log_softmax->KL->grad chain holds ~7 live
+      ``[M_BLOCK, rdim]`` fp32 tiles) spills the register file when held persistent, so the
+      standard track uses it as ``footprint_factor`` to route such reductions to the looped
+      path. Derived (read off the walker liveness slice for this axis); a conservative
+      over-count (all rdim-shaped values live at a point; register rematerialization may reduce
+      true pressure) so it errs toward looping, never toward an unsafe persistent spill.
+      Defaults to 1 (single resident tile) for facts built without the liveness slice.
 
     ``grid_rows`` is NOT stored — a pure function of ``m_block_ids`` + env, computed on
     demand by its one consumer (the narrow-row ``num_warps`` lever).
@@ -155,6 +164,7 @@ class ReductionFact(NamedTuple):
     reread_eviction_index: int | None = None
     full_width_output: bool = True
     input_load_itemsize: int = 0
+    body_live_tiles: int = 1
 
 
 class MemoryOpFact(NamedTuple):

@@ -761,6 +761,7 @@ class TestTritonStandardReductionHeuristic(TestCase):
         reduction_size_hint: int,
         num_load: int = 1,
         itemsize: int = 4,
+        row_reread: bool = False,
     ) -> ConfigSpec:
         spec = ConfigSpec(backend=TritonBackend())
         spec.block_sizes.append(BlockSizeSpec(block_id=0, size_hint=1024))
@@ -778,6 +779,7 @@ class TestTritonStandardReductionHeuristic(TestCase):
                 static_rnumel=reduction_size_hint,
                 itemsize=itemsize,
                 num_load=num_load,
+                row_reread=row_reread,
             )
         )
         return spec
@@ -843,9 +845,11 @@ class TestTritonStandardReductionHeuristic(TestCase):
         # a wide reduction (size_hint 32000) a sentinel < size_hint would decode
         # back to the SLOW looped family this heuristic exists to avoid; the
         # config_spec fix encodes None as the fragment's ``high`` (>= size_hint).
+        # row_reread=True makes the wide reduction persist under the read-once persist
+        # gate (read-once reductions deliberately loop), so there is a [None] to round-trip.
         from helion.autotuner.config_generation import ConfigGeneration
 
-        spec = self._reduction_spec(reduction_size_hint=32000)
+        spec = self._reduction_spec(reduction_size_hint=32000, row_reread=True)
         env = self._reduction_env(spec)
         # The mock env has no real GPU device, so patch hardware info / SM count (this
         # heuristic only fires on GPU in production and the SM count is irrelevant here).
@@ -4013,10 +4017,10 @@ class TestTritonReductionHeuristic(TestCase):
         self.assertEqual(len(seeds), 1)
         seed = seeds[0].config
         # Derive the expected R_BLOCK from the heuristic's OWN helper so the test tracks
-        # the real rule (pow2 of BANDB_R_BLOCK_BYTES / (itemsize * num_carried_2d_tiles)),
+        # the real rule (pow2 of CARRIED_TILE_MAX_BYTES / (itemsize * num_carried_2d_tiles)),
         # not a hand-rolled formula that drops `* num_carried_2d_tiles` and the next_pow2
         # rounding (it would mis-predict jsd, which carries 2 tiles).
-        expected_cap = TritonUserTiledReductionHeuristic._bandb_r_block_cap(fact)
+        expected_cap = TritonUserTiledReductionHeuristic._carried_tile_r_block_cap(fact)
         # Concrete anchor: kl_div carries 1 fp32 tile -> 16384 // 4 = 4096 (already pow2).
         self.assertEqual(expected_cap, 4096)
         # block_sizes is [R_BLOCK, M_BLOCK]; the reduction axis is capped well
@@ -4026,7 +4030,7 @@ class TestTritonReductionHeuristic(TestCase):
         # rnumel 131072 > the 16384 warps-32 breakpoint -> 32 warps.
         self.assertEqual(seed["num_warps"], 32)
         self.assertEqual(seed["num_stages"], 1)
-        # Band B must NOT use the standard reduction_loops knob.
+        # The carried-tile path must NOT use the standard reduction_loops knob.
         self.assertNotIn("reduction_loops", seed)
 
     @onlyBackends(["triton"])

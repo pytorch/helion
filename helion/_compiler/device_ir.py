@@ -1062,6 +1062,7 @@ class DeviceIR:
         self,
         memory_op_facts: list[MemoryOpFact],
         accumulator_facts: list[AccumulatorFact],
+        liveness_by_axis: dict[int, int] | None = None,
     ) -> None:
         """Register a ReductionFact for a user-tiled inner reduction.
 
@@ -1137,20 +1138,25 @@ class DeviceIR:
                 all_graph_ids,
                 memory_op_facts,
                 accumulator_facts,
+                liveness_by_axis or {},
             )
         )
 
-    def build_reduction_facts(self, memory_op_facts: list[MemoryOpFact]) -> None:
-        """Phase 3: build the ``ReductionFact``s now that ``_collect_memory_op_facts`` has
-        produced the enriched ``memory_op_facts``.
+    def build_reduction_facts(
+        self,
+        memory_op_facts: list[MemoryOpFact],
+        liveness_by_axis: dict[int, int] | None = None,
+    ) -> None:
+        """Phase 3: build the ``ReductionFact``s now that ``_collect_memory_op_facts``
+        produced the enriched ``memory_op_facts`` (and the per-axis liveness slice).
 
-        Reads the already-built ``spec.accumulator_facts``, then builds each stashed
-        standard fact, then — only when no standard rollable reduction was registered —
-        the user-tiled fact.
+        Reads ``spec.accumulator_facts``, builds each stashed standard fact, then --
+        only when no standard rollable reduction was registered -- the user-tiled fact.
         """
         env = CompileEnvironment.current()
         spec = env.config_spec
         accumulator_facts = spec.accumulator_facts
+        liveness_by_axis = liveness_by_axis or {}
         # standard (rollable): one fact per stashed (rdim, used_graphs). num_load scopes
         # to the rdim's ORIGINAL graphs (used_graphs), so the rolled-subgraph copies of a
         # standard rdim load are not double-counted (device_ir.graphs is a superset of any
@@ -1172,12 +1178,15 @@ class DeviceIR:
                     used_graphs,
                     memory_op_facts,
                     accumulator_facts,
+                    liveness_by_axis,
                 )
             )
         # user-tiled: mutually exclusive with standard — only when no reduction_loops spec
         # was registered.
         if not spec.reduction_loops:
-            self.register_user_tiled_reductions(memory_op_facts, accumulator_facts)
+            self.register_user_tiled_reductions(
+                memory_op_facts, accumulator_facts, liveness_by_axis
+            )
 
     def build_accumulator_facts(self) -> list[AccumulatorFact]:
         """One ``AccumulatorFact`` per loop-carried tensor accumulator in any loop —
@@ -1243,11 +1252,12 @@ class DeviceIR:
         load_graph_ids: set[int],
         memory_op_facts: list[MemoryOpFact],
         accumulator_facts: list[AccumulatorFact],
+        liveness_by_axis: dict[int, int] | None = None,
     ) -> ReductionFact:
         """Build one ``ReductionFact`` for axis ``red_block_id`` from the enriched
-        ``memory_op_facts`` + ``accumulator_facts`` (no bespoke graph walk). Shared by the
-        standard and user-tiled paths; only ``load_graph_ids`` differs (standard: the
-        rdim's original graphs; user-tiled: every graph).
+        ``memory_op_facts`` + ``accumulator_facts`` + per-axis liveness slice. Shared
+        by the standard and user-tiled paths; only ``load_graph_ids`` differs
+        (standard: the rdim's original graphs; user-tiled: every graph).
         """
         # num_load: every load in the reduction's graphs (the stream-eviction == 1 gate).
         # Scoped by graph_id so rolled-subgraph copies of a standard rdim load are excluded.
@@ -1322,6 +1332,10 @@ class DeviceIR:
             ]
             input_load_itemsize = min(row_sizes) if row_sizes else 0
 
+        # body_live_tiles: peak simultaneously-live rdim-shaped tiles in the reduction body, read off
+        # the walker liveness slice for this axis (default 1).
+        body_live_tiles = max(1, (liveness_by_axis or {}).get(red_block_id, 1))
+
         return ReductionFact(
             block_id=red_block_id,
             size_hint=size_hint,
@@ -1335,6 +1349,7 @@ class DeviceIR:
             reread_eviction_index=reread_eviction_index,
             full_width_output=full_width_output,
             input_load_itemsize=input_load_itemsize,
+            body_live_tiles=body_live_tiles,
         )
 
     def _non_reduction_loop_candidates(
@@ -2657,19 +2672,68 @@ def _subscript_block_id(env: CompileEnvironment, sub: object) -> int | None:
     return None
 
 
-def _collect_memory_op_facts(device_ir: DeviceIR) -> list[MemoryOpFact]:
+def _graph_peak_live_by_axis(
+    graph: torch.fx.Graph, env: CompileEnvironment
+) -> dict[int, int]:
+    """Peak count of simultaneously-live tensor values whose shape spans each
+    block-id axis, over ONE graph -- a liveness sweep in FX topo order.
+    Consumer-AGNOSTIC per-axis provenance keyed by block_id; the derived
+    ``ReductionFact`` reads its own axis slice (``body_live_tiles``).
+
+    A value is live from definition through its last use in the graph. At each
+    step the sweep counts live values whose ``meta['val'].shape`` includes an axis
+    and tracks the per-axis peak. A CONSERVATIVE over-count of register pressure
+    (no remat / reuse beyond last-use modeled), so a heavy body is never
+    under-counted into an unsafe persistent spill.
+    """
+    nodes = list(graph.nodes)
+    last_use: dict[torch.fx.Node, int] = {}
+    for i, node in enumerate(nodes):
+        for inp in node.all_input_nodes:
+            last_use[inp] = i
+    axes_of: dict[torch.fx.Node, frozenset[int]] = {}
+    for node in nodes:
+        val = node.meta.get("val")
+        if isinstance(val, torch.Tensor):
+            axes = {
+                bid for s in val.shape if (bid := env.resolve_block_id(s)) is not None
+            }
+            if axes:
+                axes_of[node] = frozenset(axes)
+    peak: dict[int, int] = {}
+    live: set[torch.fx.Node] = set()
+    for i, node in enumerate(nodes):
+        if node in axes_of:
+            live.add(node)
+        per_axis: dict[int, int] = {}
+        for v in live:
+            for a in axes_of[v]:
+                per_axis[a] = per_axis.get(a, 0) + 1
+        for a, c in per_axis.items():
+            if c > peak.get(a, 0):
+                peak[a] = c
+        live = {v for v in live if last_use.get(v, -1) > i}
+    return peak
+
+
+def _collect_memory_op_facts(
+    device_ir: DeviceIR,
+) -> tuple[list[MemoryOpFact], dict[int, int]]:
     """Walk every device graph once and record per-load/store metadata.
 
-    Produces one ``MemoryOpFact`` per load/store in the same order used to size
-    ``Config.indexing``, so ``memory_op_facts[i]`` describes
-    ``config.indexing[i]``. This is the single source of truth for load/store
-    counts, eviction slots, and ``store_indices`` (all derived from the result).
+    Produces one ``MemoryOpFact`` per load/store in the order used to size
+    ``Config.indexing``, so ``memory_op_facts[i]`` describes ``config.indexing[i]``.
+    Single source of truth for load/store counts, eviction slots, and
+    ``store_indices`` (all derived from the result).
 
-    The per-op enrichment fields (``reductions_fed``/``stores_fed``/
+    Per-op enrichment fields (``reductions_fed``/``stores_fed``/
     ``indexed_block_ids``/``inner_extent``/``graph_id``) are computed here so the
-    reduction-fact builders can derive their per-op-dataflow properties without a
-    bespoke graph walk. ``reductions_fed`` runs ``_classify_load_dataflow`` once over ALL
-    reduction axes, grouped by axis.
+    reduction-fact builders need no bespoke walk. ``reductions_fed`` runs
+    ``_classify_load_dataflow`` once over ALL reduction axes, grouped by axis.
+
+    Returns ``(memory_op_facts, liveness_by_axis)`` -- the second is the per-axis
+    peak simultaneously-live rdim-shaped tile count (max over graphs), computed in
+    this SAME pass so ``ReductionFact.body_live_tiles`` reads a slice.
     """
     from ..autotuner.config_spec import MemoryOpFact
     from ..language import memory_ops
@@ -2687,9 +2751,15 @@ def _collect_memory_op_facts(device_ir: DeviceIR) -> list[MemoryOpFact]:
     records: list[tuple[torch.fx.Node, MemoryOpFact]] = []
     memory_op_index = 0
     eviction_index = 0
+    liveness_by_axis: dict[int, int] = {}
 
     for graph_info in device_ir.graphs:
         graph = graph_info.graph
+        # Reduction-body liveness (per-axis peak live tiles), merged max over graphs — part of
+        # this single collect pass, not a second traversal.
+        for axis, peak in _graph_peak_live_by_axis(graph, env).items():
+            if peak > liveness_by_axis.get(axis, 0):
+                liveness_by_axis[axis] = peak
         # Axis (block_index) of every ReductionLowering node in this graph — the cut set
         # for the dataflow classification, so a fed reduction maps to its axis.
         red_axis_by_id: dict[int, int] = {
@@ -2790,7 +2860,8 @@ def _collect_memory_op_facts(device_ir: DeviceIR) -> list[MemoryOpFact]:
             )
             memory_op_index += 1
 
-    return [fact._replace(matmul_operand=operands.get(node)) for node, fact in records]
+    facts = [fact._replace(matmul_operand=operands.get(node)) for node, fact in records]
+    return facts, liveness_by_axis
 
 
 def _indexing_uses_tensor_descriptor(
@@ -3081,9 +3152,9 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
                     )
                 config_spec.allowed_pid_types = non_persistent_pid_types
 
-        # Collect per-load/store metadata once; derive the load/store tunables
-        # from it so heuristics can map each Config.indexing slot to its graph op.
-        memory_op_facts = _collect_memory_op_facts(device_ir)
+        # Collect per-load/store metadata once so heuristics can map each Config.indexing slot to its
+        # graph op; the same pass returns the reduction-body liveness (per-axis peak live tiles).
+        memory_op_facts, liveness_by_axis = _collect_memory_op_facts(device_ir)
         config_spec.memory_op_facts = memory_op_facts
         load_count = sum(f.kind == "load" for f in memory_op_facts)
         _register_load_store_tunables(
@@ -3101,10 +3172,9 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
         # may read them), so build them independently of the reduction facts. Must run
         # after the rolling (it walks the rolled loop subgraphs).
         config_spec.accumulator_facts = device_ir.build_accumulator_facts()
-        # Phase 3: build the ReductionFacts (standard from the stashed rollable rdims, then
-        # user-tiled when no standard fired) now that memory_op_facts + accumulator_facts
-        # exist.
-        device_ir.build_reduction_facts(memory_op_facts)
+        # Phase 3: build the ReductionFacts (standard from the stashed rollable rdims, then user-tiled
+        # if none fired); liveness_by_axis supplies each fact's body_live_tiles slice.
+        device_ir.build_reduction_facts(memory_op_facts, liveness_by_axis)
 
         return device_ir
 
