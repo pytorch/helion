@@ -12,15 +12,28 @@ import torch
 import helion
 from helion._testing import DEVICE
 from helion._testing import skipIfNotCUDA
+from helion._testing import skipUnlessCuteAvailable
 import helion.autotuner.benchmarking as benchmarking
 import helion.language as hl
 
 
-@helion.kernel(config=helion.Config(block_sizes=[1024]))
-def _bench_add(x, y):
-    out = torch.empty_like(x)
-    for tile in hl.tile(x.size()):
-        out[tile] = x[tile] + y[tile]
+# CuTe launches on the current torch stream, so it is the backend
+# ``do_bench(current_stream=True)`` exists for. Time this kernel to validate
+# the current-stream event path against a CUDA-graph replay ground truth.
+@helion.kernel(
+    backend="cute",
+    config=helion.Config(block_sizes=[128, 128, 32], num_warps=8),
+    autotune_log_level=0,
+)
+def _bench_matmul_cute(x, y):
+    m, k = x.size()
+    _, n = y.size()
+    out = torch.empty([m, n], dtype=torch.float32, device=x.device)
+    for tm, tn in hl.tile([m, n]):
+        acc = hl.zeros([tm, tn], dtype=torch.float32)
+        for tk in hl.tile(k):
+            acc = hl.dot(x[tm, tk], y[tk, tn], acc=acc)
+        out[tm, tn] = acc
     return out
 
 
@@ -414,18 +427,19 @@ class _RecordingStream:
         self.sync_count += 1
 
 
-def test_cuda_events_bench_records_on_current_stream_single_sync(monkeypatch):
-    """The event bench must record on the current torch stream and sync once
-    per timed batch (no per-iteration double sync)."""
+@skipIfNotCUDA()
+def test_do_bench_current_stream_records_on_current_stream_single_sync(monkeypatch):
+    """do_bench(current_stream=True) must record on the current torch stream
+    and sync once per timed batch (no per-iteration double sync)."""
     stream = _RecordingStream()
     fake_cuda = SimpleNamespace(
         current_stream=lambda: stream,
         Event=_RecordingEvent,
         is_available=lambda: True,
     )
+    # Fake torch so events/stream are captured deterministically; the real
+    # Triton runtime still provides the L2-clear buffer (harmless on GPU).
     monkeypatch.setattr(benchmarking, "torch", _fake_torch(fake_cuda))
-    # No-op L2 clearer so we don't touch the real device.
-    monkeypatch.setattr(benchmarking, "_make_l2_cache_clearer", lambda: lambda: None)
     # Force a small, deterministic n_repeat regardless of the fake timings.
     monkeypatch.setattr(benchmarking, "sync_object", lambda v, **k: 1.0)
 
@@ -441,7 +455,9 @@ def test_cuda_events_bench_records_on_current_stream_single_sync(monkeypatch):
     def fn():
         pass
 
-    benchmarking.do_bench_cuda_events(fn, warmup=1, rep=1, return_mode="median")
+    benchmarking.do_bench(
+        fn, warmup=1, rep=1, return_mode="median", current_stream=True
+    )
 
     # Every event was recorded on the current torch stream, never the default.
     assert recorded_streams, "no events were recorded"
@@ -452,27 +468,66 @@ def test_cuda_events_bench_records_on_current_stream_single_sync(monkeypatch):
 
 
 @skipIfNotCUDA()
-def test_cuda_events_bench_measures_device_time():
-    """On a real kernel the event bench should report device time close to
-    Triton's do_bench and well below wall-clock (which folds in launch OH)."""
-    x = torch.randn(4096, device=DEVICE)
-    y = torch.randn(4096, device=DEVICE)
-    bound = _bench_add.bind((x, y))
-    bound.set_config(helion.Config(block_sizes=[1024]))
+def test_interleaved_bench_current_stream_records_on_current_stream(monkeypatch):
+    """interleaved_bench(current_stream=True) must record on the current torch
+    stream (not Triton's driver stream)."""
+    stream = _RecordingStream()
+    fake_cuda = SimpleNamespace(
+        current_stream=lambda: stream,
+        Event=_RecordingEvent,
+        is_available=lambda: True,
+    )
+    monkeypatch.setattr(benchmarking, "torch", _fake_torch(fake_cuda))
+
+    recorded_streams: list[object] = []
+    real_record = _RecordingEvent.record
+
+    def spy_record(self, s=None):
+        recorded_streams.append(s)
+        return real_record(self, s)
+
+    monkeypatch.setattr(_RecordingEvent, "record", spy_record)
+
+    benchmarking.interleaved_bench(
+        [lambda: None, lambda: None], repeat=2, current_stream=True
+    )
+
+    assert recorded_streams, "no events were recorded"
+    assert all(s is stream for s in recorded_streams)
+
+
+@skipIfNotCUDA()
+@skipUnlessCuteAvailable("CUTLASS CuTe Python DSL is not available")
+def test_cute_do_bench_time_matches_cudagraph_time():
+    """For the CuTe backend, the autotuner's timer (do_bench with
+    current_stream=True, since CuTe launches on the current torch stream) must
+    measure the kernel's true device time: its result must be close to the same
+    CuTe kernel benchmarked under a CUDA-graph replay, which eliminates
+    per-launch CPU overhead entirely.
+
+    Uses a matmul with enough device work that per-launch overhead is a small
+    fraction, so the current-stream event bench and the cudagraph replay should
+    agree to within a modest tolerance."""
+    a = torch.randn(1024, 1024, device=DEVICE)
+    b = torch.randn(1024, 1024, device=DEVICE)
+    bound = _bench_matmul_cute.bind((a, b))
+    bound.set_config(helion.Config(block_sizes=[128, 128, 32], num_warps=8))
     run = bound._run
     for _ in range(5):
-        run(x, y)
+        run(a, b)
     torch.cuda.synchronize()
-    fn = functools.partial(run, x, y)
+    fn = functools.partial(run, a, b)
 
-    events = benchmarking.do_bench_cuda_events(
-        fn, warmup=25, rep=50, return_mode="median"
+    # The exact timer the CuTe backend hands the autotuner.
+    cute_do_bench = bound.env.backend.get_do_bench()
+
+    cute_time = cute_do_bench(fn, warmup=25, rep=50, return_mode="median")
+    cudagraph = benchmarking.do_bench(
+        fn, warmup=25, rep=50, return_mode="median", default_cudagraph=True
     )
-    triton = benchmarking.do_bench(fn, warmup=25, rep=50, return_mode="median")
-    wall = benchmarking.do_bench_generic(fn, warmup=25, rep=50, return_mode="median")
 
-    # Device-time regimes agree closely; both are far below wall-clock, which
-    # carries per-call CPU launch overhead.
-    assert events > 0
-    assert abs(events - triton) <= 0.5 * triton + 5e-3
-    assert events < wall
+    assert cute_time > 0
+    assert cudagraph > 0
+    # The CuTe current-stream timer must land within 25% of the cudagraph time —
+    # i.e. it is measuring device time, not launch overhead.
+    assert abs(cute_time - cudagraph) <= 0.25 * cudagraph

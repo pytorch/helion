@@ -5824,17 +5824,21 @@ class TestAutotuneBudget(TestCase):
         provider = LocalBenchmarkProvider.__new__(LocalBenchmarkProvider)
         self.assertFalse(provider.budget_exceeded_fn())
 
-    def test_cute_wall_clock_benchmark_uses_subprocess_worker(self) -> None:
+    def test_cute_custom_timer_benchmarks_in_process(self) -> None:
+        """CuTe supplies a custom timer (current-stream events), so it must
+        benchmark in-process rather than in the do_bench-only subprocess."""
         from helion._compiler.backend import CuteBackend
 
         provider = self._make_stub_provider()
         provider.kernel.supports_subprocess_benchmark = lambda: True
         provider.config_spec = SimpleNamespace(backend=CuteBackend())
 
-        self.assertTrue(provider._subprocess_benchmark_enabled())
-        self.assertTrue(provider._subprocess_benchmark_uses_wall_clock())
+        # CuTe returns a custom get_do_bench(), so the subprocess worker (which
+        # only times with do_bench) must not be used.
+        self.assertIsNotNone(provider.config_spec.backend.get_do_bench())
+        self.assertFalse(provider._subprocess_benchmark_enabled())
 
-    def test_non_cute_custom_benchmark_stays_in_process(self) -> None:
+    def test_custom_timer_backend_stays_in_process(self) -> None:
         from helion.autotuner.benchmarking import do_bench_generic
 
         class OtherBackend:
@@ -5850,7 +5854,24 @@ class TestAutotuneBudget(TestCase):
         provider.config_spec = SimpleNamespace(backend=OtherBackend())
 
         self.assertFalse(provider._subprocess_benchmark_enabled())
-        self.assertFalse(provider._subprocess_benchmark_uses_wall_clock())
+
+    def test_default_timer_backend_uses_subprocess_worker(self) -> None:
+        """A backend with no custom timer (get_do_bench() is None, e.g. Triton)
+        runs in the do_bench-based subprocess worker."""
+
+        class DefaultTimerBackend:
+            @property
+            def name(self) -> str:
+                return "triton"
+
+            def get_do_bench(self):
+                return None
+
+        provider = self._make_stub_provider()
+        provider.kernel.supports_subprocess_benchmark = lambda: True
+        provider.config_spec = SimpleNamespace(backend=DefaultTimerBackend())
+
+        self.assertTrue(provider._subprocess_benchmark_enabled())
 
 
 class TestConfigValuePriors(TestCase):

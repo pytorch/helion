@@ -5482,33 +5482,24 @@ class CuteBackend(Backend):
         return None
 
     def get_do_bench(self) -> Callable[..., float | tuple[float, ...]]:
-        # The default Triton do_bench uses CUDA events that mis-time the CuTe
-        # path on Blackwell - launches show up as ~5ms when the kernel is
-        # actually 250ms+. That happens because Triton records events on its
-        # own driver device-interface stream, not the stream CuTe launches on.
-        # Recording torch.cuda.Events on the current torch stream (the CuTe
-        # launch stream) restores correct device-time timing while excluding
-        # CPU launch overhead; opt in via HELION_AUTOTUNE_CUTE_CUDA_EVENTS.
-        # Otherwise fall back to synchronized wall-clock timing.
-        from ..runtime.settings import _env_get_bool
+        # Triton's default do_bench records timing events on its own driver
+        # device-interface stream, not the stream CuTe launches on (the current
+        # torch stream). On Blackwell those differ, so end.record() completes
+        # before the kernel does and a 250us kernel mis-times as ~5us. Timing
+        # with events on the current torch stream fixes that while keeping the
+        # launch-overhead-free property of event timing, so use it for CuTe.
+        from ..autotuner.benchmarking import do_bench
 
-        if _env_get_bool("HELION_AUTOTUNE_CUTE_CUDA_EVENTS", False):
-            from ..autotuner.benchmarking import do_bench_cuda_events
-
-            return do_bench_cuda_events
-
-        from ..autotuner.benchmarking import do_bench_generic
-
-        return do_bench_generic
+        return functools.partial(do_bench, current_stream=True)
 
     def get_interleaved_bench(self) -> Callable[..., list[float]]:
-        # Same rationale as get_do_bench: the default interleaved bench uses
-        # CUDA events that mis-time the CuTe path. Use the synchronized
-        # wall-clock fallback so the autotuner's interleaved compare path
-        # produces real timings.
-        from ..autotuner.benchmarking import interleaved_bench_generic
+        # Same rationale as get_do_bench: the default interleaved bench records
+        # events on Triton's driver stream, which mis-times the CuTe path.
+        # Record events on the current torch stream (the CuTe launch stream)
+        # instead, keeping event timing's launch-overhead-free property.
+        from ..autotuner.benchmarking import interleaved_bench
 
-        return interleaved_bench_generic
+        return functools.partial(interleaved_bench, current_stream=True)
 
     def autotune(
         self,
