@@ -92,6 +92,14 @@ _KEYS_scale_mm_cute = [
     (64, 2048, 2048),
     (64, 2048, 12288),
     (64, 6144, 2048),
+    (64, 4096, 6144),
+    (64, 4096, 4096),
+    (64, 4096, 24576),
+    (64, 12288, 4096),
+    (64, 5120, 10240),
+    (64, 5120, 5120),
+    (64, 5120, 51200),
+    (64, 25600, 5120),
 ]
 
 _CONFIGS_scale_mm_cute = [
@@ -131,6 +139,32 @@ _CONFIGS_scale_mm_cute = [
     {'block_sizes': [64, 128, 128], 'l2_groupings': [2], 'indexing': ['tensor_descriptor', 'pointer', 'tensor_descriptor', 'pointer', 'pointer'], 'pid_type': 'flat', 'tcgen05_cluster_m': 1, 'tcgen05_cluster_n': 1, 'tcgen05_ab_stages': 8, 'tcgen05_acc_stages': 2, 'tcgen05_c_stages': 4, 'tcgen05_num_epi_warps': 4, 'tcgen05_l2_swizzle_size': 1, 'tcgen05_strategy': 'role_local_with_scheduler', 'tcgen05_warp_spec_scheduler_warps': 1, 'tcgen05_persistence_model': 'non_persistent'},
     # (M, K, N) = (64, 6144, 2048) -- bn=16 (128 tiles), bk=256; 0.96x vs cutlass.
     {'block_sizes': [64, 16, 256], 'l2_groupings': [1], 'indexing': ['tensor_descriptor', 'pointer', 'tensor_descriptor', 'pointer', 'tensor_descriptor'], 'pid_type': 'flat', 'tcgen05_cluster_m': 1, 'tcgen05_cluster_n': 1, 'tcgen05_ab_stages': 8, 'tcgen05_acc_stages': 1, 'tcgen05_c_stages': 2, 'tcgen05_num_epi_warps': 4, 'tcgen05_l2_swizzle_size': 1, 'tcgen05_persistence_model': 'non_persistent'},
+    # Larger M=64 vLLM Qwen3 (K, N) weight shapes. Same picture as the 2048-K rows
+    # (latency-bound, one M-tile): device-filling small bn + deep bk when the SMEM
+    # budget allows (bk=256 caps ab at 8), else bn=32/64/128 at bk=128 with the
+    # scheduler role. Deep bk wins when N/bn keeps enough tiles AND bn is small
+    # enough to fit ab>=8 at bk=256; on the large-K / very-wide-N rows the shallower
+    # bk=128 + scheduler config is faster. Cold-L2 cudagraph vs best baseline below.
+    # (M, K, N) = (64, 4096, 6144) -- bn=64 bk=128 + scheduler; 0.81x vs cutlass.
+    {'block_sizes': [64, 64, 128], 'l2_groupings': [1], 'indexing': ['tensor_descriptor', 'pointer', 'tensor_descriptor', 'pointer', 'tensor_descriptor'], 'pid_type': 'flat', 'tcgen05_cluster_m': 1, 'tcgen05_cluster_n': 1, 'tcgen05_ab_stages': 10, 'tcgen05_acc_stages': 2, 'tcgen05_c_stages': 4, 'tcgen05_num_epi_warps': 4, 'tcgen05_l2_swizzle_size': 1, 'tcgen05_strategy': 'role_local_with_scheduler', 'tcgen05_warp_spec_scheduler_warps': 1, 'tcgen05_persistence_model': 'non_persistent'},
+    # (M, K, N) = (64, 4096, 4096) -- bn=32 bk=256 deep-K; 0.91x vs cutlass.
+    {'block_sizes': [64, 32, 256], 'l2_groupings': [1], 'indexing': ['tensor_descriptor', 'pointer', 'tensor_descriptor', 'pointer', 'tensor_descriptor'], 'pid_type': 'flat', 'tcgen05_cluster_m': 1, 'tcgen05_cluster_n': 1, 'tcgen05_ab_stages': 8, 'tcgen05_acc_stages': 1, 'tcgen05_c_stages': 4, 'tcgen05_num_epi_warps': 4, 'tcgen05_l2_swizzle_size': 1, 'tcgen05_persistence_model': 'non_persistent'},
+    # (M, K, N) = (64, 4096, 24576) -- very wide N. bn=256 (96 tiles) all-TMA halves
+    # inst/warp vs the bn=128 config; ncu still shows barrier-dominated (~613/1265
+    # samples) + 3.8x more global loads than cutlass (per-tile scale reads), a
+    # codegen limit not reachable by config. bk capped at ab=3 by SMEM at bn=256.
+    # 0.69x -> 0.75x vs cutlass.
+    {'block_sizes': [64, 256, 128], 'l2_groupings': [2], 'indexing': ['tensor_descriptor', 'tensor_descriptor', 'tensor_descriptor', 'tensor_descriptor', 'tensor_descriptor'], 'pid_type': 'flat', 'tcgen05_cluster_m': 1, 'tcgen05_cluster_n': 1, 'tcgen05_ab_stages': 3, 'tcgen05_acc_stages': 2, 'tcgen05_c_stages': 2, 'tcgen05_num_epi_warps': 4, 'tcgen05_l2_swizzle_size': 1, 'tcgen05_persistence_model': 'non_persistent'},
+    # (M, K, N) = (64, 12288, 4096) -- deep K, bn=32 bk=256; 0.99x vs cutlass.
+    {'block_sizes': [64, 32, 256], 'l2_groupings': [1], 'indexing': ['tensor_descriptor', 'pointer', 'tensor_descriptor', 'pointer', 'tensor_descriptor'], 'pid_type': 'flat', 'tcgen05_cluster_m': 1, 'tcgen05_cluster_n': 1, 'tcgen05_ab_stages': 8, 'tcgen05_acc_stages': 1, 'tcgen05_c_stages': 4, 'tcgen05_num_epi_warps': 4, 'tcgen05_l2_swizzle_size': 1, 'tcgen05_persistence_model': 'non_persistent'},
+    # (M, K, N) = (64, 5120, 10240) -- bn=128 bk=128 + scheduler; 0.91x vs cutlass.
+    {'block_sizes': [64, 128, 128], 'l2_groupings': [1], 'indexing': ['tensor_descriptor', 'pointer', 'tensor_descriptor', 'pointer', 'tensor_descriptor'], 'pid_type': 'flat', 'tcgen05_cluster_m': 1, 'tcgen05_cluster_n': 1, 'tcgen05_ab_stages': 8, 'tcgen05_acc_stages': 2, 'tcgen05_c_stages': 4, 'tcgen05_num_epi_warps': 4, 'tcgen05_l2_swizzle_size': 1, 'tcgen05_strategy': 'role_local_with_scheduler', 'tcgen05_warp_spec_scheduler_warps': 1, 'tcgen05_persistence_model': 'non_persistent'},
+    # (M, K, N) = (64, 5120, 5120) -- bn=64 bk=128 + scheduler; 0.80x vs cutlass.
+    {'block_sizes': [64, 64, 128], 'l2_groupings': [1], 'indexing': ['tensor_descriptor', 'pointer', 'tensor_descriptor', 'pointer', 'tensor_descriptor'], 'pid_type': 'flat', 'tcgen05_cluster_m': 1, 'tcgen05_cluster_n': 1, 'tcgen05_ab_stages': 10, 'tcgen05_acc_stages': 2, 'tcgen05_c_stages': 4, 'tcgen05_num_epi_warps': 4, 'tcgen05_l2_swizzle_size': 1, 'tcgen05_strategy': 'role_local_with_scheduler', 'tcgen05_warp_spec_scheduler_warps': 1, 'tcgen05_persistence_model': 'non_persistent'},
+    # (M, K, N) = (64, 5120, 51200) -- very wide N: bn=128 bk=128 + scheduler; 0.85x vs cutlass.
+    {'block_sizes': [64, 128, 128], 'l2_groupings': [1], 'indexing': ['tensor_descriptor', 'pointer', 'tensor_descriptor', 'pointer', 'tensor_descriptor'], 'pid_type': 'flat', 'tcgen05_cluster_m': 1, 'tcgen05_cluster_n': 1, 'tcgen05_ab_stages': 8, 'tcgen05_acc_stages': 2, 'tcgen05_c_stages': 4, 'tcgen05_num_epi_warps': 4, 'tcgen05_l2_swizzle_size': 1, 'tcgen05_strategy': 'role_local_with_scheduler', 'tcgen05_warp_spec_scheduler_warps': 1, 'tcgen05_persistence_model': 'non_persistent'},
+    # (M, K, N) = (64, 25600, 5120) -- deep K, bn=64 bk=128 + scheduler; 0.82x vs cutlass.
+    {'block_sizes': [64, 64, 128], 'l2_groupings': [1], 'indexing': ['tensor_descriptor', 'pointer', 'tensor_descriptor', 'pointer', 'tensor_descriptor'], 'pid_type': 'flat', 'tcgen05_cluster_m': 1, 'tcgen05_cluster_n': 1, 'tcgen05_ab_stages': 10, 'tcgen05_acc_stages': 2, 'tcgen05_c_stages': 4, 'tcgen05_num_epi_warps': 4, 'tcgen05_l2_swizzle_size': 1, 'tcgen05_strategy': 'role_local_with_scheduler', 'tcgen05_warp_spec_scheduler_warps': 1, 'tcgen05_persistence_model': 'non_persistent'},
 ]
 
 
