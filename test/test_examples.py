@@ -963,6 +963,48 @@ class TestExamples(RefEagerTestBase, TestCase):
             rtol=2e-2,
         )
 
+    def test_causal_attention(self):
+        args = (
+            torch.randn(1, 32, 512, 64, dtype=torch.float32, device=DEVICE),
+            torch.randn(1, 32, 512, 64, dtype=torch.float32, device=DEVICE),
+            torch.randn(1, 32, 512, 64, dtype=torch.float32, device=DEVICE),
+        )
+        check_example(
+            "attention",
+            args,
+            (
+                torch.nn.functional.scaled_dot_product_attention(*args, is_causal=True),
+                None,
+            ),
+            fn_name="causal_attention",
+            block_sizes=[1, 64, 32],
+        )
+
+    def test_biased_attention(self):
+        args = (
+            torch.randn(1, 2, 128, 64, dtype=HALF_DTYPE, device=DEVICE),
+            torch.randn(1, 2, 128, 64, dtype=HALF_DTYPE, device=DEVICE),
+            torch.randn(1, 2, 128, 64, dtype=HALF_DTYPE, device=DEVICE),
+            torch.randn(1, 2, 128, 128, dtype=HALF_DTYPE, device=DEVICE) * 0.25,
+        )
+        check_example(
+            "attention",
+            args,
+            (
+                torch.nn.functional.scaled_dot_product_attention(
+                    args[0],
+                    args[1],
+                    args[2],
+                    attn_mask=args[3],
+                ),
+                None,
+            ),
+            fn_name="biased_attention",
+            block_sizes=[1, 128, 128],
+            atol=5e-2,
+            rtol=2e-2,
+        )
+
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
     @skipIfXPU("failure on XPU")
     @skipIfTileIR("TileIR does not support block_ptr indexing")
