@@ -79,6 +79,10 @@ _KEYS_scale_mm_cute = [
     (4096, 4096, 4096),
     (512, 2048, 4096),
     (512, 2048, 2048),
+    (16, 2048, 4096),
+    (16, 2048, 12288),
+    (16, 4096, 6144),
+    (16, 4096, 24576),
 ]
 
 _CONFIGS_scale_mm_cute = [
@@ -96,6 +100,18 @@ _CONFIGS_scale_mm_cute = [
     # cluster_m=2 + A-multicast + deep ab=12 beats the old cluster_m=1 bn=64 tile.
     # Cold-L2 cudagraph vs best baseline (torch): 0.86x -> 0.91x on B200.
     {'block_sizes': [128, 128, 128], 'l2_groupings': [1], 'num_warps': 8, 'num_stages': 4, 'indexing': ['tensor_descriptor', 'tensor_descriptor', 'tensor_descriptor', 'tensor_descriptor', 'tensor_descriptor'], 'pid_type': 'persistent_interleaved', 'tcgen05_cluster_m': 2, 'tcgen05_cluster_n': 1, 'tcgen05_acc_stages': 2, 'tcgen05_c_stages': 2, 'tcgen05_ab_stages': 12, 'tcgen05_num_epi_warps': 4, 'tcgen05_persistence_model': 'static_persistent'},
+    # (M, K, N) = (16, 2048, 4096)
+    # Tiny-M (M=16) normal-kernel autotune (full effort, ~640 configs, cold-L2
+    # cudagraph). Collapses to tiny tiles (block_m<=4) because the pre-#2840 CuTe
+    # backend crashed on any block_m>=64 tcgen05 config at static M<64, so the
+    # real MMA path was unreachable -- ~0.13x vs torch. Checkpoint before #2840.
+    {'block_sizes': [4, 64, 2048], 'num_threads': [0, 64, 1], 'loop_orders': [[0, 1]], 'cute_vector_widths': [2, 4, 8]},
+    # (M, K, N) = (16, 2048, 12288)  (~0.06x vs torch)
+    {'block_sizes': [2, 64, 2048], 'num_threads': [2, 0, 1], 'loop_orders': [[0, 1]], 'cute_vector_widths': [2, 4, 8]},
+    # (M, K, N) = (16, 4096, 6144)  (~0.06x vs torch)
+    {'block_sizes': [1, 32, 4096], 'num_threads': [1, 0, 1], 'loop_orders': [[0, 1]], 'epilogue_subtile': 2, 'cute_vector_widths': [8, 1, 8]},
+    # (M, K, N) = (16, 4096, 24576)  (~0.05x vs torch)
+    {'block_sizes': [2, 64, 1024], 'num_threads': [2, 0, 1], 'loop_orders': [[0, 1]], 'epilogue_subtile': 2, 'cute_vector_widths': [1, 2, 8]},
 ]
 
 
