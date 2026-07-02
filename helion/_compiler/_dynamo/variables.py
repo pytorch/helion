@@ -28,7 +28,7 @@ from helion.runtime.kernel import Kernel
 _SYM_SCALAR_TYPES = (torch.SymInt, torch.SymFloat)
 
 if TYPE_CHECKING:
-    from torch._dynamo.symbolic_convert import InstructionTranslator
+    from torch._dynamo.symbolic_convert import InstructionTranslatorBase
 
 
 def _detect_mutated_inputs(body: list[ast.stmt], param_names: set[str]) -> list[str]:
@@ -326,7 +326,7 @@ class HelionKernelVariable(VariableTracker):
 
     def call_function(
         self,
-        tx: InstructionTranslator,
+        tx: InstructionTranslatorBase,
         args: Sequence[VariableTracker],
         kwargs: dict[str, VariableTracker],
     ) -> VariableTracker:
