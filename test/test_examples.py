@@ -38,7 +38,6 @@ from helion._testing import skipIfTileIR
 from helion._testing import skipIfXPU
 from helion._testing import xfailIfPallas
 from helion._testing import xfailIfPallasInterpret
-from helion._testing import xfailIfPallasTpu
 from helion.runtime.config import Config
 from helion.runtime.ref_mode import is_ref_mode_enabled
 
@@ -2644,7 +2643,6 @@ class TestExamples(RefEagerTestBase, TestCase):
             rtol=0.1,
         )
 
-    @xfailIfPallasTpu("BlockSpec tiling failure")
     def test_mamba2_chunk_scan(self):
         batch, nheads, ngroups, seqlen, chunk_size, headdim, dstate = (
             2,
@@ -2656,7 +2654,11 @@ class TestExamples(RefEagerTestBase, TestCase):
             16,
         )
         nchunks = seqlen // chunk_size
-        cb = torch.zeros(
+        torch.manual_seed(0)
+        causal_mask = torch.tril(
+            torch.ones(chunk_size, chunk_size, dtype=torch.bool, device=DEVICE)
+        )
+        cb = 0.05 + 0.05 * torch.rand(
             batch,
             nchunks,
             ngroups,
@@ -2665,18 +2667,23 @@ class TestExamples(RefEagerTestBase, TestCase):
             dtype=HALF_DTYPE,
             device=DEVICE,
         )
-        torch.manual_seed(0)
-        x = torch.zeros(batch, seqlen, nheads, headdim, dtype=HALF_DTYPE, device=DEVICE)
-        dt = torch.zeros(
+        # Broadcast the mask; TPU tensor backend does not support this indexing.
+        assert torch.all((cb != 0) | causal_mask).item(), (
+            "test data must exercise the causal mask"
+        )
+        x = 0.25 + 0.25 * torch.rand(
+            batch, seqlen, nheads, headdim, dtype=HALF_DTYPE, device=DEVICE
+        )
+        dt = 0.4 + 0.2 * torch.rand(
             batch, nheads, nchunks, chunk_size, dtype=HALF_DTYPE, device=DEVICE
         )
-        dA_cumsum = torch.zeros(
+        dA_cumsum = 0.02 * torch.randn(
             batch, nheads, nchunks, chunk_size, dtype=HALF_DTYPE, device=DEVICE
         )
-        # Keep the recurrence path deterministic and non-zero so backend bugs
-        # cannot hide behind allocator state when output buffers are recycled.
-        C = torch.randn(batch, seqlen, ngroups, dstate, dtype=HALF_DTYPE, device=DEVICE)
-        prev_states = torch.randn(
+        C = 0.1 * torch.randn(
+            batch, seqlen, ngroups, dstate, dtype=HALF_DTYPE, device=DEVICE
+        )
+        prev_states = 0.1 * torch.randn(
             batch,
             nchunks,
             nheads,
@@ -2685,19 +2692,51 @@ class TestExamples(RefEagerTestBase, TestCase):
             dtype=HALF_DTYPE,
             device=DEVICE,
         )
-        D_param = torch.zeros(nheads, dtype=HALF_DTYPE, device=DEVICE)
+        D_param = torch.linspace(0.6, 1.0, nheads, dtype=HALF_DTYPE, device=DEVICE)
         args = (cb, x, dt, dA_cumsum, C, prev_states, D_param)
 
         mod = import_path(EXAMPLES_DIR / "mamba2_chunk_scan.py")
         expected = mod.ref_chunk_scan(*args)
+        atol = 0.1
+        rtol = 0.1
+        expected_without_scan = mod.ref_chunk_scan(
+            torch.zeros_like(cb),
+            x,
+            dt,
+            dA_cumsum,
+            C,
+            prev_states,
+            D_param,
+        )
+        expected_without_residual = mod.ref_chunk_scan(
+            cb,
+            x,
+            dt,
+            dA_cumsum,
+            C,
+            prev_states,
+            torch.zeros_like(D_param),
+        )
+        assert not torch.allclose(
+            expected.float(),
+            expected_without_scan.float(),
+            atol=atol,
+            rtol=rtol,
+        ), "test data must fail when the chunk scan contribution is zeroed"
+        assert not torch.allclose(
+            expected.float(),
+            expected_without_residual.float(),
+            atol=atol,
+            rtol=rtol,
+        ), "test data must fail when the residual contribution is zeroed"
 
         check_example(
             "mamba2_chunk_scan",
             args,
             expected,
             fn_name="helion_mamba2_chunk_scan_kernel",
-            atol=0.1,
-            rtol=0.1,
+            atol=atol,
+            rtol=rtol,
         )
 
     @skipIfRocm("failure on rocm")
