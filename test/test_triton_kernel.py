@@ -82,6 +82,30 @@ def side_effect_noop(x):
     tl.debug_barrier()
 
 
+# --- Heuristics test kernels ---
+
+
+@triton.heuristics(
+    values={
+        "BLOCK_SIZE": lambda args: 128,
+        "USE_FAST_PATH": lambda args: True,
+    }
+)
+@triton.jit
+def heuristic_scale_kernel(x, BLOCK_SIZE: tl.constexpr, USE_FAST_PATH: tl.constexpr):
+    """Kernel whose constexpr params are computed by heuristics."""
+    if USE_FAST_PATH:
+        return x * 2.0
+    return x + x
+
+
+@triton.heuristics(values={"A": lambda args: 2, "B": lambda args: 10})
+@triton.heuristics(values={"C": lambda args: args["A"] + args["B"]})
+@triton.jit
+def nested_heuristic_wrapped(x, A: tl.constexpr, B: tl.constexpr, C: tl.constexpr):
+    return x * A + B + C
+
+
 @helion.kernel(autotune_effort="none")
 def triton_kernel_add_pairs(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     out = torch.empty_like(x)
@@ -285,6 +309,138 @@ class TestTritonKernel(RefEagerTestDisabled, TestCase):
         self.assertIn("_helper_add_one", code)
         # Expected: (x * 2.0) + 1.0
         torch.testing.assert_close(result, x * 2.0 + 1.0)
+
+    def test_triton_kernel_heuristics_fn_object(self) -> None:
+        """Test that triton_kernel accepts @triton.heuristics-decorated functions."""
+
+        @helion.kernel(autotune_effort="none")
+        def k(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile in hl.tile(x.shape):
+                x_val = x[tile]
+                out[tile] = hl.triton_kernel(
+                    heuristic_scale_kernel,
+                    args=(x_val,),
+                    output_like=x_val,
+                )
+            return out
+
+        x = torch.randn(128, device=DEVICE, dtype=torch.float32)
+        code, result = code_and_output(k, (x,))
+        # Verify the unwrapped kernel function is in generated code
+        self.assertIn("heuristic_scale_kernel", code)
+        # Verify heuristic-computed values are injected as kwargs
+        self.assertIn("BLOCK_SIZE=128", code)
+        self.assertIn("USE_FAST_PATH=True", code)
+        # Verify numerical correctness (USE_FAST_PATH=True -> x * 2.0)
+        torch.testing.assert_close(result, x * 2.0)
+
+    def test_triton_kernel_heuristics_string_name(self) -> None:
+        """Test that triton_kernel resolves string names to @triton.heuristics-decorated functions."""
+
+        @helion.kernel(autotune_effort="none")
+        def k(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile in hl.tile(x.shape):
+                x_val = x[tile]
+                out[tile] = hl.triton_kernel(
+                    "heuristic_scale_kernel",
+                    args=(x_val,),
+                    output_like=x_val,
+                )
+            return out
+
+        x = torch.randn(128, device=DEVICE, dtype=torch.float32)
+        code, result = code_and_output(k, (x,))
+        self.assertIn("heuristic_scale_kernel", code)
+        self.assertIn("BLOCK_SIZE=128", code)
+        self.assertIn("USE_FAST_PATH=True", code)
+        torch.testing.assert_close(result, x * 2.0)
+
+    def test_triton_kernel_nested_heuristics(self) -> None:
+        """Test that triton_kernel handles nested @triton.heuristics decorators."""
+
+        @helion.kernel(autotune_effort="none")
+        def k(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile in hl.tile(x.shape):
+                x_val = x[tile]
+                out[tile] = hl.triton_kernel(
+                    nested_heuristic_wrapped,
+                    args=(x_val,),
+                    output_like=x_val,
+                )
+            return out
+
+        x = torch.randn(128, device=DEVICE, dtype=torch.float32)
+        code, result = code_and_output(k, (x,))
+        self.assertIn("nested_heuristic_wrapped", code)
+        # A=2, B=10 (outer heuristic), C=12 (inner: A + B)
+        self.assertIn("A=2", code)
+        self.assertIn("B=10", code)
+        self.assertIn("C=12", code)
+        # Result: x * 2 + 10 + 12
+        torch.testing.assert_close(result, x * 2.0 + 10.0 + 12.0)
+
+    def test_triton_kernel_heuristics_in_source_string(self) -> None:
+        """Test that triton_kernel handles @triton.heuristics in inline source strings."""
+
+        @helion.kernel(autotune_effort="none")
+        def k(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile in hl.tile(x.shape):
+                x_val = x[tile]
+                out[tile] = hl.triton_kernel(
+                    """
+                    @triton.heuristics({"SCALE": lambda args: 3})
+                    @triton.jit
+                    def source_heuristic_fn(x, SCALE: tl.constexpr):
+                        return x * SCALE
+                    """,
+                    args=(x_val,),
+                    output_like=x_val,
+                )
+            return out
+
+        x = torch.randn(128, device=DEVICE, dtype=torch.float32)
+        code, result = code_and_output(k, (x,))
+        self.assertIn("source_heuristic_fn", code)
+        # The function definition should only have @triton.jit, not @triton.heuristics
+        # (source comments may still reference the original decorator text)
+        self.assertIn("@triton.jit\ndef source_heuristic_fn", code)
+        # The computed value should be injected at the call site
+        self.assertIn("SCALE=3", code)
+        # Verify numerical correctness (SCALE=3 -> x * 3)
+        torch.testing.assert_close(result, x * 3.0)
+
+    def test_triton_kernel_nested_heuristics_in_source_string(self) -> None:
+        """Test nested @triton.heuristics decorators in inline source strings."""
+
+        @helion.kernel(autotune_effort="none")
+        def k(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile in hl.tile(x.shape):
+                x_val = x[tile]
+                out[tile] = hl.triton_kernel(
+                    """
+                    @triton.heuristics({"A": lambda args: 2, "B": lambda args: 10})
+                    @triton.heuristics({"C": lambda args: args["A"] + args["B"]})
+                    @triton.jit
+                    def nested_source_fn(x, A: tl.constexpr, B: tl.constexpr, C: tl.constexpr):
+                        return x * A + B + C
+                    """,
+                    args=(x_val,),
+                    output_like=x_val,
+                )
+            return out
+
+        x = torch.randn(128, device=DEVICE, dtype=torch.float32)
+        code, result = code_and_output(k, (x,))
+        self.assertIn("@triton.jit\ndef nested_source_fn", code)
+        self.assertIn("A=2", code)
+        self.assertIn("B=10", code)
+        self.assertIn("C=12", code)
+        torch.testing.assert_close(result, x * 2.0 + 10.0 + 12.0)
 
 
 if __name__ == "__main__":
