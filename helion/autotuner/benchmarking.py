@@ -671,3 +671,85 @@ def do_bench_generic(
         t1 = time.perf_counter()
         times.append((t1 - t0) * 1000)  # convert to ms
     return _summarize_statistics_fallback(times, quantiles, return_mode)
+
+
+def do_bench_cuda_events(
+    fn: Callable[[], Any],
+    warmup: int = 25,
+    rep: int = 100,
+    grad_to_none: torch.Tensor | None = None,
+    quantiles: list[float] | None = None,
+    return_mode: str = "mean",
+    process_group_name: str | None = None,
+    *,
+    default_cudagraph: bool = False,  # accepted for API symmetry; single-launch event timing doesn't use CG
+) -> float | tuple[float, ...]:
+    """Device-time benchmark using ``torch.cuda.Event`` on the current stream.
+
+    This measures *pure GPU kernel time*, excluding both the CPU launch
+    overhead and the L2-clear, and syncs only once at the end (no per-call
+    double sync like :func:`do_bench_generic`).
+
+    It differs from :func:`do_bench` in one load-bearing way: the timing
+    events are ``torch.cuda.Event`` recorded on ``torch.cuda.current_stream()``
+    — the same stream the CuTe launcher issues the kernel on
+    (``cutlass.torch.current_stream()`` wraps ``torch.cuda.current_stream()``).
+    Triton's ``do_bench`` records events via its own driver device-interface,
+    which on Blackwell can sit on a *different* stream than CuTe launches on,
+    so ``end.record()`` completes before the kernel does and a 250us kernel
+    mis-times as ~5us. Recording on the launch stream fixes that while keeping
+    the launch-overhead-free property of event timing.
+    """
+    assert return_mode in ["min", "max", "mean", "median", "all"]
+    from triton.testing import _summarize_statistics
+
+    stream = torch.cuda.current_stream()
+
+    def event() -> torch.cuda.Event:
+        return torch.cuda.Event(enable_timing=True)
+
+    fn()
+    stream.synchronize()
+
+    clear_l2 = _make_l2_cache_clearer()
+
+    # Estimate per-call device time with a small event-timed batch. The L2
+    # clear is issued between the timed pairs but excluded from every pair, so
+    # the estimate reflects kernel time only.
+    est_start = [event() for _ in range(5)]
+    est_end = [event() for _ in range(5)]
+    for i in range(5):
+        clear_l2()
+        est_start[i].record(stream)
+        fn()
+        est_end[i].record(stream)
+    stream.synchronize()
+    estimate_ms = sync_object(
+        sum(s.elapsed_time(e) for s, e in zip(est_start, est_end, strict=True)) / 5,
+        process_group_name=process_group_name,
+    )
+    if estimate_ms <= 0:
+        estimate_ms = 1e-3
+
+    n_warmup = max(1, int(warmup / estimate_ms))
+    n_repeat = max(1, int(rep / estimate_ms))
+
+    for _ in range(n_warmup):
+        fn()
+
+    start_events = [event() for _ in range(n_repeat)]
+    end_events = [event() for _ in range(n_repeat)]
+    for i in range(n_repeat):
+        if grad_to_none is not None:
+            for x in grad_to_none:
+                x.grad = None
+        # Clear L2 BETWEEN timed regions; the start event is recorded after
+        # the clear so the clear is never inside the measured interval.
+        clear_l2()
+        start_events[i].record(stream)
+        fn()
+        end_events[i].record(stream)
+    # Single sync for the whole batch — no per-iteration double sync.
+    stream.synchronize()
+    times = [s.elapsed_time(e) for s, e in zip(start_events, end_events, strict=True)]
+    return _summarize_statistics(times, quantiles, return_mode)  # pyrefly: ignore

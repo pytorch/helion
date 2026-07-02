@@ -5484,8 +5484,19 @@ class CuteBackend(Backend):
     def get_do_bench(self) -> Callable[..., float | tuple[float, ...]]:
         # The default Triton do_bench uses CUDA events that mis-time the CuTe
         # path on Blackwell - launches show up as ~5ms when the kernel is
-        # actually 250ms+. Use synchronized wall-clock timing instead so
-        # autotune scores reflect real performance.
+        # actually 250ms+. That happens because Triton records events on its
+        # own driver device-interface stream, not the stream CuTe launches on.
+        # Recording torch.cuda.Events on the current torch stream (the CuTe
+        # launch stream) restores correct device-time timing while excluding
+        # CPU launch overhead; opt in via HELION_AUTOTUNE_CUTE_CUDA_EVENTS.
+        # Otherwise fall back to synchronized wall-clock timing.
+        from ..runtime.settings import _env_get_bool
+
+        if _env_get_bool("HELION_AUTOTUNE_CUTE_CUDA_EVENTS", False):
+            from ..autotuner.benchmarking import do_bench_cuda_events
+
+            return do_bench_cuda_events
+
         from ..autotuner.benchmarking import do_bench_generic
 
         return do_bench_generic

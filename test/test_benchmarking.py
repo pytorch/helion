@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import functools
+import itertools
 import os
 from types import SimpleNamespace
 
@@ -7,7 +9,19 @@ from benchmarks.cute import compare_attention_backends
 import pytest
 import torch
 
+import helion
+from helion._testing import DEVICE
+from helion._testing import skipIfNotCUDA
 import helion.autotuner.benchmarking as benchmarking
+import helion.language as hl
+
+
+@helion.kernel(config=helion.Config(block_sizes=[1024]))
+def _bench_add(x, y):
+    out = torch.empty_like(x)
+    for tile in hl.tile(x.size()):
+        out[tile] = x[tile] + y[tile]
+    return out
 
 
 class _FakeStream:
@@ -371,3 +385,94 @@ def test_cudagraph_auto_skips_nested_capture(monkeypatch):
         return "nested"
 
     assert benchmarking._maybe_cudagraph_replay(fn) is fn
+
+
+_FAKE_EVENT_CLOCK = itertools.count(1)
+
+
+class _RecordingEvent:
+    """torch.cuda.Event stand-in that records which stream it was fired on."""
+
+    def __init__(self, enable_timing=False):
+        self.recorded_on = None
+        self._t = None
+
+    def record(self, stream=None):
+        self.recorded_on = stream
+        # Monotonic fake timestamps so elapsed_time is positive and stable.
+        self._t = float(next(_FAKE_EVENT_CLOCK))
+
+    def elapsed_time(self, other):
+        return abs(other._t - self._t)
+
+
+class _RecordingStream:
+    def __init__(self):
+        self.sync_count = 0
+
+    def synchronize(self):
+        self.sync_count += 1
+
+
+def test_cuda_events_bench_records_on_current_stream_single_sync(monkeypatch):
+    """The event bench must record on the current torch stream and sync once
+    per timed batch (no per-iteration double sync)."""
+    stream = _RecordingStream()
+    fake_cuda = SimpleNamespace(
+        current_stream=lambda: stream,
+        Event=_RecordingEvent,
+        is_available=lambda: True,
+    )
+    monkeypatch.setattr(benchmarking, "torch", _fake_torch(fake_cuda))
+    # No-op L2 clearer so we don't touch the real device.
+    monkeypatch.setattr(benchmarking, "_make_l2_cache_clearer", lambda: lambda: None)
+    # Force a small, deterministic n_repeat regardless of the fake timings.
+    monkeypatch.setattr(benchmarking, "sync_object", lambda v, **k: 1.0)
+
+    recorded_streams: list[object] = []
+    real_record = _RecordingEvent.record
+
+    def spy_record(self, s=None):
+        recorded_streams.append(s)
+        return real_record(self, s)
+
+    monkeypatch.setattr(_RecordingEvent, "record", spy_record)
+
+    def fn():
+        pass
+
+    benchmarking.do_bench_cuda_events(fn, warmup=1, rep=1, return_mode="median")
+
+    # Every event was recorded on the current torch stream, never the default.
+    assert recorded_streams, "no events were recorded"
+    assert all(s is stream for s in recorded_streams)
+    # Warmup sync + estimate-batch sync + one final timed-batch sync == 3 total,
+    # and crucially zero syncs inside the timing loop.
+    assert stream.sync_count == 3
+
+
+@skipIfNotCUDA()
+def test_cuda_events_bench_measures_device_time():
+    """On a real kernel the event bench should report device time close to
+    Triton's do_bench and well below wall-clock (which folds in launch OH)."""
+    x = torch.randn(4096, device=DEVICE)
+    y = torch.randn(4096, device=DEVICE)
+    bound = _bench_add.bind((x, y))
+    bound.set_config(helion.Config(block_sizes=[1024]))
+    run = bound._run
+    for _ in range(5):
+        run(x, y)
+    torch.cuda.synchronize()
+    fn = functools.partial(run, x, y)
+
+    events = benchmarking.do_bench_cuda_events(
+        fn, warmup=25, rep=50, return_mode="median"
+    )
+    triton = benchmarking.do_bench(fn, warmup=25, rep=50, return_mode="median")
+    wall = benchmarking.do_bench_generic(fn, warmup=25, rep=50, return_mode="median")
+
+    # Device-time regimes agree closely; both are far below wall-clock, which
+    # carries per-call CPU launch overhead.
+    assert events > 0
+    assert abs(events - triton) <= 0.5 * triton + 5e-3
+    assert events < wall

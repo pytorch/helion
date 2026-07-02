@@ -425,6 +425,11 @@ class _Settings:
             _env_get_bool, "HELION_AUTOTUNE_BENCHMARK_SUBPROCESS", True
         )
     )
+    autotune_cute_cuda_events: bool = dataclasses.field(
+        default_factory=functools.partial(
+            _env_get_bool, "HELION_AUTOTUNE_CUTE_CUDA_EVENTS", False
+        )
+    )
     autotune_benchmark_timeout: int = dataclasses.field(
         default_factory=functools.partial(
             _env_get_int,
@@ -650,6 +655,7 @@ class Settings(_Settings):
         "autotune_compile_timeout": "Timeout for Triton compilation in seconds used for autotuning. Default is 60 seconds.",
         "autotune_benchmark_subprocess": "Run the autotune benchmark phase in a long-lived spawn subprocess so a hung/slow kernel can be killed without losing autotune progress. Enabled by default. Set HELION_AUTOTUNE_BENCHMARK_SUBPROCESS=0 to disable.",
         "autotune_benchmark_timeout": "Per-config wall-clock timeout in seconds for the subprocess benchmark phase. Only applies when autotune_benchmark_subprocess is enabled. Default 30 seconds, raised automatically on environments with a heavier subprocess cold-start.",
+        "autotune_cute_cuda_events": "For the CuTe backend, time configs with CUDA events recorded on the current torch stream (the stream CuTe launches on) instead of synchronized wall-clock timing. Measures pure GPU kernel time excluding CPU launch overhead and the L2 clear, and syncs only once per batch (no per-call double sync). Off by default; the CuTe backend uses wall-clock timing unless this is set, because Triton's own event path mis-times CuTe on Blackwell. Set HELION_AUTOTUNE_CUTE_CUDA_EVENTS=1 to enable.",
         "autotune_precompile": "Autotuner precompile mode: 'fork', 'spawn', or falsy/None to disable. Defaults to 'fork' on non-Windows platforms.",
         "autotune_precompile_jobs": "Maximum concurrent Triton precompile processes, default to cpu count.",
         "autotune_random_seed": "Seed used for autotuner random number generation. Defaults to HELION_AUTOTUNE_RANDOM_SEED or a time-based seed.",
