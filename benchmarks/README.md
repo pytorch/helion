@@ -16,3 +16,14 @@ To run against another Helion backend, pass `--helion-backend` or set `HELION_BA
 For example, to benchmark the CuTe backend:
 
 `$ python benchmarks/run.py --helion-backend cute --metrics speedup,accuracy --kernel gemm`
+
+### CUDA Graph Benchmarking
+
+For more accurate kernel performance measurements, especially during autotuning, you can enable CUDA graph benchmarking:
+
+```bash
+export HELION_BENCHMARK_CUDAGRAPH=1
+python benchmarks/run.py --metrics speedup --kernel <kernel_name>
+```
+
+CUDA graph benchmarking reduces kernel launch overhead and provides timing that better represents deployment scenarios where cuda graph is used.

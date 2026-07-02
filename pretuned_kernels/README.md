@@ -103,6 +103,12 @@ you commit alongside the existing one(s).  Helion picks the right one at
 runtime based on the running GPU's compute capability (with fallback to
 older compatible capabilities, e.g. `sm120` → `sm100`).
 
+For a kernel whose `main()` benchmarks under CUDA graphs (`use_cudagraph()`
+returns `True`, e.g. `scaled_mm` and the vLLM-ported ops), set
+`HELION_BENCHMARK_CUDAGRAPH=1` for the autotune run so the autotuner benchmarks
+candidate configs the same way — matching the deployment/benchmark timing
+regime.
+
 See the [Ahead-of-Time (AOT) Heuristic Tuning](../docs/deployment_autotuning.md#ahead-of-time-aot-heuristic-tuning)
 section of `docs/deployment_autotuning.md` for the end-to-end workflow,
 runner CLI, generated artifacts, and runtime fallback rules — including

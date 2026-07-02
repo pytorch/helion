@@ -320,9 +320,10 @@ _EXPECTED_PERF: dict[str, dict[str, ExpectedPerf]] = {
     # sm100 gating is added once a B200 nightly has calibrated it (the perf test
     # skips compute capabilities absent from this map).
     "silu_mul_fp8": {
-        # Bandwidth-bound: with L2 cleared, torch.compile beats helion on most
-        # shapes, so the wins gate is disabled and only a regression floor is set.
-        "sm90": ExpectedPerf(helion_wins=2, total=36, geomean=0.72, wins_slack=None),
+        # Bandwidth-bound. Re-tuned on H100 with Helion's autotuner under
+        # cudagraph timing (see the kernel's heuristic header); helion now wins
+        # the majority of shapes vs the best of {torch, torch.compile}.
+        "sm90": ExpectedPerf(helion_wins=22, total=36, geomean=1.15, wins_slack=8),
     },
     "dynamic_per_token_scaled_fp8_quant": {
         "sm90": ExpectedPerf(helion_wins=18, total=24, geomean=1.22, wins_slack=5),
