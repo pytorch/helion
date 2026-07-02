@@ -982,15 +982,13 @@ class TestPallas(TestCase):
         self.assertIn("pltpu.make_async_copy", code)
         torch.testing.assert_close(result, x + 1.0)
 
-    def test_fori_loop_last_two_dim_ragged_store_rejected(self) -> None:
-        """A ragged (data-dependent) store whose tiled dim is one of the last two
-        (lane/sublane) dims is rejected with a clear error.
+    def test_fori_loop_last_two_dim_ragged_store_uses_masked_hbm(self) -> None:
+        """A fori_loop ragged store in a lane/sublane dim must not rely on
+        VMEM BlockSpec writeback.
 
-        Mosaic tile alignment forbids a dynamic-size clamp on the last two dims,
-        so such a store would fall back to a full-block writeback from the
-        data-dependent begin and silently overrun adjacent rows. Rather than
-        emit that, codegen raises; the user should move the ragged dimension
-        to a leading position, e.g. ``[tokens, heads, head_dim]``.
+        The fori_loop lowering routes eligible output-only tensors through a
+        VMEM scratch buffer and writes only the live row extent back to HBM via
+        ``pltpu.make_async_copy``.
         """
 
         @helion.kernel(backend="pallas", static_shapes=True)
@@ -1006,8 +1004,70 @@ class TestPallas(TestCase):
                     out[tile, :] = x[tile, :] + 1.0
             return out
 
-        # 2D tensor -> dim 0 is len(shape)-2 (a last-two dim), and the tile bounds
-        # are loaded at runtime (data-dependent), so the store is rejected.
+        x = torch.randn(8, 128, device=DEVICE, dtype=torch.float32)
+        starts = torch.tensor([0, 4], dtype=torch.int32, device=DEVICE)
+        ends = torch.tensor([4, 8], dtype=torch.int32, device=DEVICE)
+        code, result = code_and_output(
+            ragged_last_two_dim,
+            (x, starts, ends),
+            block_sizes=[8],
+            pallas_loop_type="fori_loop",
+        )
+        self.assertIn("pltpu.make_async_copy", code)
+        self.assertIn("_pipeline_arg_indices=", code)
+        self.assertNotIn("pltpu.store", code)
+        self.assertNotIn("_pallas_store", code)
+        self.assertIn("(2, 0, 8, 7)", code)
+        torch.testing.assert_close(result, x + 1.0)
+
+    def test_fori_loop_unaligned_dynamic_begin_ds_load_gets_extra_pad(self) -> None:
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def ragged_copy(
+            x: torch.Tensor, starts: torch.Tensor, ends: torch.Tensor
+        ) -> torch.Tensor:
+            out = torch.empty_like(x)
+            n = starts.size(0)
+            m = x.size(1)
+            for g in hl.grid(n):
+                st = starts[g]
+                en = ends[g]
+                for tile_m in hl.tile(0, m):
+                    for tile in hl.tile(st, en):
+                        out[tile, tile_m] = x[tile, tile_m] + 1.0
+            return out
+
+        x = torch.arange(527 * 8, device=DEVICE, dtype=torch.float32).reshape(527, 8)
+        starts = torch.tensor([0, 520], dtype=torch.int32, device=DEVICE)
+        ends = torch.tensor([520, 527], dtype=torch.int32, device=DEVICE)
+        code, result = code_and_output(
+            ragged_copy,
+            (x, starts, ends),
+            block_sizes=[8, 16],
+            pallas_loop_type="fori_loop",
+        )
+
+        self.assertNotIn("pltpu.make_async_copy(x.at", code)
+        self.assertIn("pltpu.make_async_copy(out_buf", code)
+        self.assertIn("_pipeline_arg_indices=", code)
+        self.assertNotIn("pltpu.store", code)
+        self.assertNotIn("_pallas_store", code)
+        self.assertIn("(2, 0, 16, 15)", code)
+        self.assertIn("(3, 0, 16, 15)", code)
+        torch.testing.assert_close(result, x + 1.0)
+
+    def test_fori_loop_last_two_dim_rmw_store_rejected(self) -> None:
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def ragged_last_two_dim(
+            x: torch.Tensor, starts: torch.Tensor, ends: torch.Tensor
+        ) -> torch.Tensor:
+            n = starts.size(0)
+            for g in hl.grid(n):
+                st = starts[g]
+                en = ends[g]
+                for tile in hl.tile(st, en):
+                    x[tile, :] = x[tile, :] + 1.0
+            return x
+
         x = torch.randn(8, 128, device=DEVICE, dtype=torch.float32)
         starts = torch.tensor([0, 4], dtype=torch.int32, device=DEVICE)
         ends = torch.tensor([4, 8], dtype=torch.int32, device=DEVICE)
