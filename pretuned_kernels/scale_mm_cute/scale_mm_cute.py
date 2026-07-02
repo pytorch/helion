@@ -158,12 +158,18 @@ def use_cudagraph() -> bool:
 
 # Skinny-M (decode / small-batch) + small decoder-layer FP8 W8A8 serving shapes
 # that back the nightly B200 CuTe dashboard (benchmarks/run.py, PR #2788).
+# The M=64 rows mirror the vLLM Qwen3 FP8 serving (K, N) weight shapes at a
+# small-batch token count.
 SHAPES = [  # (M, K, N)
     (1, 4096, 4096),
     (4096, 4096, 4096),
     (1, 4096, 256),
     (512, 2048, 4096),
     (512, 2048, 2048),
+    (64, 2048, 4096),
+    (64, 2048, 2048),
+    (64, 2048, 12288),
+    (64, 6144, 2048),
 ]
 
 
