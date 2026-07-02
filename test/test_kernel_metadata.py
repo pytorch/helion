@@ -19,10 +19,9 @@ from helion._testing import DEVICE
 from helion._testing import TestCase
 from helion._testing import onlyBackends
 from helion._testing import skipIfRefEager
+from helion.autotuner._metadata.hardware import _DEVICE_PROPS_ATTRS
 from helion.autotuner._metadata.hardware import _GPU_BACKENDS
-from helion.autotuner._metadata.hardware import DevicePropsRecord
 from helion.autotuner._metadata.hardware import HardwareInfoRecord
-from helion.autotuner._metadata.hardware import _device_id
 from helion.autotuner._metadata.hardware import collect_hardware_info
 from helion.autotuner._metadata.ir_features import _has_networkx_node_link
 from helion.autotuner.base_search import _warn_dataset_without_log
@@ -63,7 +62,6 @@ _HARDWARE_INFO_KEYS = set(HardwareInfoRecord.__annotations__)
 
 # Always-present subset (device_props is GPU-only/optional); TPU/CPU carry exactly these.
 _HARDWARE_INFO_REQUIRED_KEYS = set(HardwareInfoRecord.__required_keys__)
-_DEVICE_PROPS_KEYS = set(DevicePropsRecord.__annotations__)
 
 # Mirrors the extractor gate: missing networkx should degrade to None, not fail E2E.
 _HAS_NETWORKX = _has_networkx_node_link()
@@ -194,15 +192,20 @@ class TestCollectHardwareInfo(TestCase):
         self.assertLessEqual(set(info), _HARDWARE_INFO_KEYS)
         self.assertIsNotNone(info["device_kind"])
         self.assertIsNotNone(info["device_name"])
-        self.assertIsNotNone(info["device_id"])
         self.assertIsNotNone(info["cpu_num_threads"])
         self.assertEqual(info["versions"]["torch"], torch.__version__)
         self.assertIn("helion", info["versions"])
 
         if info["device_kind"] in _GPU_BACKENDS:
             self.assertIn("device_props", info)
-            self.assertEqual(set(info["device_props"]), _DEVICE_PROPS_KEYS)
-            self.assertIsNotNone(info["device_props"]["sm_count"])
+            self.assertEqual(
+                set(info["device_props"]), set(_DEVICE_PROPS_ATTRS[info["device_kind"]])
+            )
+            # First attr is the backend's compute-unit count (multi_processor_count on
+            # cuda/rocm, max_compute_units on xpu); a populated value proves the probe
+            # ran, not the all-None miss fallback.
+            sm_attr = _DEVICE_PROPS_ATTRS[info["device_kind"]][0]
+            self.assertIsNotNone(info["device_props"][sm_attr])
             self.assertIsNotNone(info["versions"]["triton"])
 
     def test_cpu_device_not_misreported(self) -> None:
@@ -213,15 +216,6 @@ class TestCollectHardwareInfo(TestCase):
         self.assertEqual(info["device_kind"], "cpu")
         self.assertNotIn("device_props", info)
         self.assertEqual(set(info["versions"]), {"torch", "helion"})
-
-    def test_device_id_sanitizes_name(self) -> None:
-        """device_id stays kind:name:cap-parseable: spaces and reserved punctuation
-        in the device name collapse to ``_``; a missing name yields None."""
-        self.assertEqual(
-            _device_id("cuda", "NVIDIA H100", "sm90"), "cuda:NVIDIA_H100:sm90"
-        )
-        self.assertIsNone(_device_id("cuda", "", "sm90"))
-        self.assertIsNone(_device_id("cuda", None, "sm90"))
 
 
 class TestKernelMetadataHardwareInfo(TestCase):
@@ -356,7 +350,9 @@ class TestAutotuneDatasetE2E(TestCase):
             # tolerate a triton CPU-fallback or TPU backend.
             if hw["device_kind"] in _GPU_BACKENDS:
                 self.assertIn("device_props", hw)
-                self.assertIsNotNone(hw["device_props"]["sm_count"])
+                # Backend's compute-unit count (see collect_hardware_info test above).
+                sm_attr = _DEVICE_PROPS_ATTRS[hw["device_kind"]][0]
+                self.assertIsNotNone(hw["device_props"][sm_attr])
                 self.assertIsNotNone(hw["versions"]["triton"])
             configs_by_id.update(record["configs"])
             run_ids.add(record["run_id"])
