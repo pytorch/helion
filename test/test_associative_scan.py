@@ -35,6 +35,10 @@ def min_combine_fn(x, y):
     return torch.minimum(x, y)
 
 
+def cast_add_combine_fn(x, y):
+    return (x.to(torch.int32) + y.to(torch.int32)).to(torch.float32)
+
+
 def helion_combine_fn(left_values, left_indices, right_values, right_indices):
     """Tuple combine function with unpacked arguments (matching GitHub issue example)."""
     # Segmented scan: if indices are the same, add values; otherwise, take right values (reset)
@@ -134,6 +138,37 @@ class TestAssociativeScan(RefEagerTestBase, TestCase):
             self.assertIn("def add_combine_fn_", code)
             self.assertIn("param_0 + param_1", code)
             self.assertIn("tl.associative_scan", code)
+
+    @skipIfRefEager("CuTe codegen regression")
+    def test_cute_associative_scan_combine_casts(self):
+        if _get_backend() != "cute":
+            self.skipTest("CuTe-specific combine cast regression")
+
+        @helion.kernel(autotune_effort="none")
+        def scan_cast_kernel(x: torch.Tensor) -> torch.Tensor:
+            result = torch.empty_like(x)
+            for tile_m, tile_n in hl.tile(x.size()):
+                result[tile_m, tile_n] = hl.associative_scan(
+                    cast_add_combine_fn, x[tile_m, tile_n], dim=0
+                )
+            return result
+
+        x = torch.tensor(
+            [
+                [1.0, 2.0, 3.0, 4.0],
+                [2.6, 3.6, 4.6, 5.6],
+                [3.6, 4.6, 5.6, 6.6],
+                [4.6, 5.6, 6.6, 7.6],
+            ],
+            device=DEVICE,
+            dtype=torch.float32,
+        )
+        code, result = code_and_output(scan_cast_kernel, (x,), block_sizes=[4, 4])
+
+        expected = torch.cumsum(x.to(torch.int32).to(torch.float32), dim=0)
+        torch.testing.assert_close(result, expected)
+        self.assertIn("cutlass.Int32", code)
+        self.assertIn("cutlass.Float32", code)
 
     def test_associative_scan_maximum(self):
         """Test associative_scan with maximum combine function."""

@@ -453,6 +453,16 @@ def _resolve_tensor_index_patterns(
             patterns[i] = IndirectScatterPattern(plan=plan)
         return
 
+    from ...language.atomic_ops import atomic_add
+
+    if node.target is atomic_add:
+        from .gather import build_scatter_plan
+
+        plan = build_scatter_plan(tensor, subscript, positions)
+        for i in positions:
+            patterns[i] = IndirectScatterPattern(plan=plan)
+        return
+
     op_name = getattr(node.target, "__name__", str(node.target))
     raise NotImplementedError(
         f"Pallas: tensor-indexed memory op is not supported for op={op_name}."

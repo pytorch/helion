@@ -15,13 +15,21 @@ Code based on https://github.com/pytorch/helion/issues/237
 from __future__ import annotations
 
 import torch
-import triton
-import triton.language as tl
 
 import helion
 from helion._testing import DEVICE
+from helion._testing import LONG_INT_TYPE
 from helion._testing import run_example
 import helion.language as hl
+
+try:
+    import triton
+    import triton.language as tl
+except ModuleNotFoundError as exc:
+    if exc.name not in {"triton", "triton.language"}:
+        raise
+    triton = None
+    tl = None
 
 # %%
 # Helion Implementation
@@ -98,119 +106,132 @@ def segmented_reduction_helion(
 
 
 # %%
-@triton.jit
-def combine_fn_triton(
-    left_values: tl.tensor,
-    left_indices: tl.tensor,
-    right_values: tl.tensor,
-    right_indices: tl.tensor,
-) -> tuple[tl.tensor, tl.tensor]:
-    """
-    Combine function for associative scan in Triton implementation.
+if triton is not None and tl is not None:
+    _HAS_TRITON = True
 
-    Adds values when indices match (same segment), otherwise takes the right value.
+    @triton.jit
+    def combine_fn_triton(
+        left_values: tl.tensor,
+        left_indices: tl.tensor,
+        right_values: tl.tensor,
+        right_indices: tl.tensor,
+    ) -> tuple[tl.tensor, tl.tensor]:
+        """
+        Combine function for associative scan in Triton implementation.
 
-    Args:
-        left_values: Values from the left side of the scan
-        left_indices: Indices from the left side of the scan
-        right_values: Values from the right side of the scan
-        right_indices: Indices from the right side of the scan
+        Adds values when indices match (same segment), otherwise takes the right value.
 
-    Returns:
-        Tuple of (combined_values, combined_indices)
-    """
-    same_segment = left_indices == right_indices
-    combined_values = tl.where(same_segment, left_values + right_values, right_values)
-    combined_indices = right_indices
-    return combined_values, combined_indices
+        Args:
+            left_values: Values from the left side of the scan
+            left_indices: Indices from the left side of the scan
+            right_values: Values from the right side of the scan
+            right_indices: Indices from the right side of the scan
 
-
-@triton.autotune(
-    configs=[
-        triton.Config(
-            {"BLOCK_SIZE": bs},
+        Returns:
+            Tuple of (combined_values, combined_indices)
+        """
+        same_segment = left_indices == right_indices
+        combined_values = tl.where(
+            same_segment, left_values + right_values, right_values
         )
-        for bs in [8, 16, 32, 64, 128]
-    ],
-    key=["C"],
-    restore_value=["out_ptr"],
-)
-@triton.jit
-def _segmented_reduction_triton(
-    index: tl.tensor,  # the input index tensor
-    in_ptr: tl.tensor,  # the input tensor
-    out_ptr: tl.tensor,  # the output value tensor
-    E: tl.constexpr,  # Number of elements in the input tensor (1d)
-    C: tl.constexpr,  # Number of features in the input tensor (2d)
-    BLOCK_SIZE: tl.constexpr,  # Block size for the scan
-) -> None:
-    """
-    Triton kernel for segmented reduction.
+        combined_indices = right_indices
+        return combined_values, combined_indices
 
-    Uses associative scan to efficiently perform segmented reduction.
-
-    Args:
-        index: Input index tensor
-        in_ptr: Input data tensor
-        out_ptr: Output tensor
-        E: Number of elements in the input tensor
-        C: Number of features in the input tensor
-        BLOCK_SIZE: Block size for the scan
-    """
-    # Triton version adapted from
-    # https://github.com/fishmingyu/GeoT/blob/main/geot/triton/seg_reduction.py
-    pid = tl.program_id(axis=0)
-    offset_pid = pid // C
-    feature_id = pid % C
-    offsets = offset_pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-    mask = offsets < E
-
-    # Load input data
-    vals = tl.load(in_ptr + offsets * C + feature_id, mask=mask)
-    idxs = tl.load(index + offsets, mask=mask)
-    idxs_next = tl.load(index + offsets + 1, offsets < E - 1)
-
-    # Perform an inclusive scan using tl.associative_scan
-    result_values, _ = tl.associative_scan(
-        (
-            vals,
-            idxs,
-        ),
-        axis=0,
-        combine_fn=combine_fn_triton,
+    @triton.autotune(
+        configs=[
+            triton.Config(
+                {"BLOCK_SIZE": bs},
+            )
+            for bs in [8, 16, 32, 64, 128]
+        ],
+        key=["C"],
+        restore_value=["out_ptr"],
     )
-    # if offset % BLOCK_SIZE == -1, it means the last element of the segment
-    segment_start = (idxs != idxs_next) | (offsets % BLOCK_SIZE == BLOCK_SIZE - 1)
-    tl.atomic_add(out_ptr + idxs * C + feature_id, result_values, mask & segment_start)
+    @triton.jit
+    def _segmented_reduction_triton(
+        index: tl.tensor,  # the input index tensor
+        in_ptr: tl.tensor,  # the input tensor
+        out_ptr: tl.tensor,  # the output value tensor
+        E: tl.constexpr,  # Number of elements in the input tensor (1d)
+        C: tl.constexpr,  # Number of features in the input tensor (2d)
+        BLOCK_SIZE: tl.constexpr,  # Block size for the scan
+    ) -> None:
+        """
+        Triton kernel for segmented reduction.
 
+        Uses associative scan to efficiently perform segmented reduction.
 
-def segmented_reduction_triton(
-    indices: torch.Tensor, input_data: torch.Tensor, num_nodes: int
-) -> torch.Tensor:
-    """
-    Performs segmented reduction using Triton.
+        Args:
+            index: Input index tensor
+            in_ptr: Input data tensor
+            out_ptr: Output tensor
+            E: Number of elements in the input tensor
+            C: Number of features in the input tensor
+            BLOCK_SIZE: Block size for the scan
+        """
+        # Triton version adapted from
+        # https://github.com/fishmingyu/GeoT/blob/main/geot/triton/seg_reduction.py
+        pid = tl.program_id(axis=0)
+        offset_pid = pid // C
+        feature_id = pid % C
+        offsets = offset_pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+        mask = offsets < E
 
-    Wrapper function for the Triton kernel implementation.
+        # Load input data
+        vals = tl.load(in_ptr + offsets * C + feature_id, mask=mask)
+        idxs = tl.load(index + offsets, mask=mask)
+        idxs_next = tl.load(index + offsets + 1, offsets < E - 1)
 
-    Args:
-        indices: Tensor of segment indices for each element
-        input_data: Input tensor of shape [num_elements, num_features]
-        num_nodes: Number of output nodes/segments
+        # Perform an inclusive scan using tl.associative_scan
+        result_values, _ = tl.associative_scan(
+            (
+                vals,
+                idxs,
+            ),
+            axis=0,
+            combine_fn=combine_fn_triton,
+        )
+        # if offset % BLOCK_SIZE == -1, it means the last element of the segment
+        segment_start = (idxs != idxs_next) | (offsets % BLOCK_SIZE == BLOCK_SIZE - 1)
+        tl.atomic_add(
+            out_ptr + idxs * C + feature_id, result_values, mask & segment_start
+        )
 
-    Returns:
-        Output tensor of shape [num_nodes, num_features] with reduced values
-    """
-    E, C = input_data.shape
-    output = torch.zeros(
-        (num_nodes, C), dtype=input_data.dtype, device=input_data.device
-    )
+    def segmented_reduction_triton(
+        indices: torch.Tensor, input_data: torch.Tensor, num_nodes: int
+    ) -> torch.Tensor:
+        """
+        Performs segmented reduction using Triton.
 
-    def grid(META: dict[str, int]) -> tuple[int, ...]:
-        # Cast to int to satisfy type checker; Triton may return constexpr
-        return (int(triton.cdiv(E, META["BLOCK_SIZE"]) * C),)
+        Wrapper function for the Triton kernel implementation.
 
-    _segmented_reduction_triton[grid](indices, input_data, output, E, C)
-    return output
+        Args:
+            indices: Tensor of segment indices for each element
+            input_data: Input tensor of shape [num_elements, num_features]
+            num_nodes: Number of output nodes/segments
+
+        Returns:
+            Output tensor of shape [num_nodes, num_features] with reduced values
+        """
+        E, C = input_data.shape
+        output = torch.zeros(
+            (num_nodes, C), dtype=input_data.dtype, device=input_data.device
+        )
+
+        def grid(META: dict[str, int]) -> tuple[int, ...]:
+            # Cast to int to satisfy type checker; Triton may return constexpr
+            return (int(triton.cdiv(E, META["BLOCK_SIZE"]) * C),)
+
+        _segmented_reduction_triton[grid](indices, input_data, output, E, C)
+        return output
+
+else:
+    _HAS_TRITON = False
+
+    def segmented_reduction_triton(
+        indices: torch.Tensor, input_data: torch.Tensor, num_nodes: int
+    ) -> torch.Tensor:
+        raise RuntimeError("Triton is required for the Triton reference")
 
 
 # %%
@@ -237,11 +258,26 @@ def segmented_reduction_pytorch(
     """
     # Run PyTorch reference (scatter_add equivalent)
     num_features = input_data.size(1)
+    if input_data.device.type == "tpu":
+        host_input = input_data.cpu()
+        host_indices = indices.cpu()
+        host_output = torch.zeros(
+            num_nodes,
+            num_features,
+            device=host_input.device,
+            dtype=input_data.dtype,
+        )
+        host_output.scatter_add_(
+            0,
+            host_indices.to(torch.int64).unsqueeze(1).expand(-1, num_features),
+            host_input,
+        )
+        return host_output.to(input_data.device)
     pytorch_output = torch.zeros(
         num_nodes, num_features, device=input_data.device, dtype=input_data.dtype
     )
     pytorch_output.scatter_add_(
-        0, indices.unsqueeze(1).expand(-1, num_features), input_data
+        0, indices.to(torch.int64).unsqueeze(1).expand(-1, num_features), input_data
     )
     return pytorch_output
 
@@ -266,16 +302,17 @@ def main() -> None:
     dtype = torch.float32
 
     # Create sorted indices for segmented reduction
-    indices = torch.randint(0, num_nodes, (num_edges,), device=DEVICE).sort()[0]
+    indices = torch.randint(
+        0, num_nodes, (num_edges,), device=DEVICE, dtype=LONG_INT_TYPE
+    ).sort()[0]
     input_data = torch.randn(num_edges, num_features, device=DEVICE, dtype=dtype)
 
+    reference_fns = {"pytorch": segmented_reduction_pytorch}
+    if _HAS_TRITON:
+        reference_fns["triton"] = segmented_reduction_triton
+
     run_example(
-        segmented_reduction_helion,
-        {
-            "triton": segmented_reduction_triton,
-            "pytorch": segmented_reduction_pytorch,
-        },
-        (indices, input_data, num_nodes),
+        segmented_reduction_helion, reference_fns, (indices, input_data, num_nodes)
     )
 
 
