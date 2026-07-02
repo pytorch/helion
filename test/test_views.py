@@ -61,6 +61,24 @@ class TestViews(RefEagerTestBase, TestCase):
             result, torch.nn.functional.softmax(x, dim=1), rtol=1e-2, atol=1e-1
         )
 
+    @onlyBackends(["pallas"])
+    def test_pallas_bool_unsqueeze_where_mask(self):
+        @helion.kernel(static_shapes=True)
+        def row_mask(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile_m, tile_n in hl.tile(x.size()):
+                mask = (x[tile_m, 0] > 0).unsqueeze(1)
+                out[tile_m, tile_n] = torch.where(mask, x[tile_m, tile_n], 0.0)
+            return out
+
+        x = torch.arange(-8, 8, device=DEVICE, dtype=torch.float32).reshape(4, 4)
+        code, result = code_and_output(row_mask, (x,), block_sizes=[4, 4])
+
+        self.assertIn("jnp.reshape(lax.convert_element_type", code)
+        self.assertIn("!= 0", code)
+        expected = torch.where((x[:, 0] > 0)[:, None], x, torch.zeros_like(x))
+        torch.testing.assert_close(result, expected)
+
     def test_softmax_view_reshape(self):
         @helion.kernel(config={"block_size": 1})
         def softmax(x: torch.Tensor) -> torch.Tensor:
