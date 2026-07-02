@@ -41,6 +41,23 @@ def _linear_index(index: int, shape: torch.Size) -> tuple[int, ...]:
     return tuple(reversed(result))
 
 
+def _logaddexp(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    """``torch.logaddexp`` with a TPU-only decomposition fallback.
+
+    ``aten::logaddexp.out`` is not implemented on the ``torch_tpu`` backend
+    and raises ``RuntimeError`` at reference-compute time. Only on TPU,
+    substitute the standard ``max + log1p(exp(-|a-b|))`` decomposition (with
+    a ``torch.where`` guard so ``-inf, -inf`` stays ``-inf``). Other backends
+    keep the native op.
+    """
+    if a.device.type != "tpu":
+        return torch.logaddexp(a, b)
+    m = torch.maximum(a, b)
+    finite = m != float("-inf")
+    diff = torch.where(finite, torch.abs(a - b), torch.zeros_like(m))
+    return torch.where(finite, m + torch.log1p(torch.exp(-diff)), m)
+
+
 def _attention_reference_lse(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -89,7 +106,7 @@ def _attention_reference_lse(
                     scores = scores.masked_fill(
                         q_idx[:, None] < k_idx[None, :], -torch.inf
                     )
-                block_lse = torch.logaddexp(block_lse, torch.logsumexp(scores, dim=-1))
+                block_lse = _logaddexp(block_lse, torch.logsumexp(scores, dim=-1))
             lse[batch_idx, q_start:q_stop] = block_lse
     lse = lse.reshape(q.size()[:-1])
     if base2_lse:
