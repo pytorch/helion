@@ -106,8 +106,10 @@ _CONFIGS_scale_mm_cute = [
     # (pre-autotune) from the full-stack sweep -- ~14.9us cold-L2 cudagraph =
     # 0.60x vs torch (was 68us / 0.13x on the pre-stack tiny-tile path).
     {'block_sizes': [128, 128, 128], 'cute_vector_widths': [1, 1, 1], 'loop_orders': [[0, 1]], 'tcgen05_cluster_m': 1, 'tcgen05_cluster_n': 2, 'tcgen05_ab_stages': 6, 'tcgen05_acc_stages': 2, 'tcgen05_c_stages': 2, 'tcgen05_num_epi_warps': 4},
-    # (M, K, N) = (16, 2048, 12288)  padded-M tcgen05 seed; ~19.9us (0.55x vs torch)
-    {'block_sizes': [64, 256, 128], 'cute_vector_widths': [1, 1, 1], 'loop_orders': [[0, 1]], 'tcgen05_cluster_m': 1, 'tcgen05_cluster_n': 2, 'tcgen05_ab_stages': 3, 'tcgen05_acc_stages': 2, 'tcgen05_c_stages': 2, 'tcgen05_num_epi_warps': 4},
+    # (M, K, N) = (16, 2048, 12288)  hand-tuned padded-M tcgen05; ~15.9us (0.67x
+    # vs torch, 1.6 TB/s). block_n=128 is the CTA-count sweet spot (96 CTAs);
+    # smaller bn adds CTAs but loses tile efficiency, larger bn under-fills SMs.
+    {'block_sizes': [64, 128, 128], 'cute_vector_widths': [1, 1, 1], 'loop_orders': [[0, 1]], 'tcgen05_cluster_m': 1, 'tcgen05_cluster_n': 2, 'tcgen05_ab_stages': 6, 'tcgen05_acc_stages': 2, 'tcgen05_c_stages': 2, 'tcgen05_num_epi_warps': 4},
     # (M, K, N) = (16, 4096, 6144)  padded-M tcgen05 seed; ~26.6us (0.47x vs torch)
     {'block_sizes': [64, 256, 128], 'cute_vector_widths': [1, 1, 1], 'loop_orders': [[0, 1]], 'tcgen05_cluster_m': 1, 'tcgen05_cluster_n': 2, 'tcgen05_ab_stages': 3, 'tcgen05_acc_stages': 2, 'tcgen05_c_stages': 2, 'tcgen05_num_epi_warps': 4},
     # (M, K, N) = (16, 4096, 24576)  padded-M tcgen05 seed; ~37.8us (0.79x vs torch)
