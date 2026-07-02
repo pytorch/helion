@@ -1132,6 +1132,7 @@ def codegen_expand_pallas(ctx: LoweringContext, node: Node) -> object:
     shape = [*val.size()]
     # pyrefly: ignore [missing-attribute]
     input_val = node.args[0].meta["val"]
+    assert isinstance(input_val, torch.Tensor)
     if input_val.ndim != len(shape):
         tile_strategy = ctx.cg.device_function.tile_strategy
         broadcasting = tile_strategy.broadcast_expand_dims(
