@@ -101,17 +101,17 @@ _CONFIGS_scale_mm_cute = [
     # Cold-L2 cudagraph vs best baseline (torch): 0.86x -> 0.91x on B200.
     {'block_sizes': [128, 128, 128], 'l2_groupings': [1], 'num_warps': 8, 'num_stages': 4, 'indexing': ['tensor_descriptor', 'tensor_descriptor', 'tensor_descriptor', 'tensor_descriptor', 'tensor_descriptor'], 'pid_type': 'persistent_interleaved', 'tcgen05_cluster_m': 2, 'tcgen05_cluster_n': 1, 'tcgen05_acc_stages': 2, 'tcgen05_c_stages': 2, 'tcgen05_ab_stages': 12, 'tcgen05_num_epi_warps': 4, 'tcgen05_persistence_model': 'static_persistent'},
     # (M, K, N) = (16, 2048, 4096)
-    # Tiny-M (M=16) normal-kernel autotune (full effort, ~640 configs, cold-L2
-    # cudagraph). Collapses to tiny tiles (block_m<=4) because the pre-#2840 CuTe
-    # backend crashed on any block_m>=64 tcgen05 config at static M<64, so the
-    # real MMA path was unreachable -- ~0.13x vs torch. Checkpoint before #2840.
-    {'block_sizes': [4, 64, 2048], 'num_threads': [0, 64, 1], 'loop_orders': [[0, 1]], 'cute_vector_widths': [2, 4, 8]},
-    # (M, K, N) = (16, 2048, 12288)  (~0.06x vs torch)
-    {'block_sizes': [2, 64, 2048], 'num_threads': [2, 0, 1], 'loop_orders': [[0, 1]], 'cute_vector_widths': [2, 4, 8]},
-    # (M, K, N) = (16, 4096, 6144)  (~0.06x vs torch)
-    {'block_sizes': [1, 32, 4096], 'num_threads': [1, 0, 1], 'loop_orders': [[0, 1]], 'epilogue_subtile': 2, 'cute_vector_widths': [8, 1, 8]},
-    # (M, K, N) = (16, 4096, 24576)  (~0.05x vs torch)
-    {'block_sizes': [2, 64, 1024], 'num_threads': [2, 0, 1], 'loop_orders': [[0, 1]], 'epilogue_subtile': 2, 'cute_vector_widths': [1, 2, 8]},
+    # Padded-M tcgen05 (stack #2840-#2854): block_m=128 padded from the real
+    # M=16 with N-axis cluster_n=2 A-multicast (#2843/#2845). Seed-level config
+    # (pre-autotune) from the full-stack sweep -- ~14.9us cold-L2 cudagraph =
+    # 0.60x vs torch (was 68us / 0.13x on the pre-stack tiny-tile path).
+    {'block_sizes': [128, 128, 128], 'cute_vector_widths': [1, 1, 1], 'loop_orders': [[0, 1]], 'tcgen05_cluster_m': 1, 'tcgen05_cluster_n': 2, 'tcgen05_ab_stages': 6, 'tcgen05_acc_stages': 2, 'tcgen05_c_stages': 2, 'tcgen05_num_epi_warps': 4},
+    # (M, K, N) = (16, 2048, 12288)  padded-M tcgen05 seed; ~19.9us (0.55x vs torch)
+    {'block_sizes': [64, 256, 128], 'cute_vector_widths': [1, 1, 1], 'loop_orders': [[0, 1]], 'tcgen05_cluster_m': 1, 'tcgen05_cluster_n': 2, 'tcgen05_ab_stages': 3, 'tcgen05_acc_stages': 2, 'tcgen05_c_stages': 2, 'tcgen05_num_epi_warps': 4},
+    # (M, K, N) = (16, 4096, 6144)  padded-M tcgen05 seed; ~26.6us (0.47x vs torch)
+    {'block_sizes': [64, 256, 128], 'cute_vector_widths': [1, 1, 1], 'loop_orders': [[0, 1]], 'tcgen05_cluster_m': 1, 'tcgen05_cluster_n': 2, 'tcgen05_ab_stages': 3, 'tcgen05_acc_stages': 2, 'tcgen05_c_stages': 2, 'tcgen05_num_epi_warps': 4},
+    # (M, K, N) = (16, 4096, 24576)  padded-M tcgen05 seed; ~37.8us (0.79x vs torch)
+    {'block_sizes': [64, 256, 128], 'cute_vector_widths': [1, 1, 1], 'loop_orders': [[0, 1]], 'tcgen05_cluster_m': 1, 'tcgen05_cluster_n': 2, 'tcgen05_ab_stages': 3, 'tcgen05_acc_stages': 2, 'tcgen05_c_stages': 2, 'tcgen05_num_epi_warps': 4},
 ]
 
 
