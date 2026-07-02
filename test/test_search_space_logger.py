@@ -8,6 +8,7 @@ from helion.autotuner.search_space_logger import FeatureExplorationStats
 from helion.autotuner.search_space_logger import FeatureExplorationTracker
 from helion.autotuner.search_space_logger import SearchSpaceDimension
 from helion.autotuner.search_space_logger import SearchSpaceSummary
+from helion.autotuner.search_space_logger import _analyze_dimension_size
 
 
 class _FakeConfig:
@@ -23,10 +24,12 @@ class _FakeConfig:
         block_sizes: list[int],
         loop_orders: list[int],
         num_warps: int,
+        epilogue_subtile: object = None,
     ) -> None:
         self.block_sizes = block_sizes
         self.loop_orders = loop_orders
         self.num_warps = num_warps
+        self.epilogue_subtile = epilogue_subtile
 
 
 def _summary(
@@ -60,6 +63,33 @@ class TestFeatureExplorationStats(unittest.TestCase):
         )
         self.assertEqual(stats.total_options, 6)
         self.assertEqual(stats.to_summary_line(), "num_warps: 3/6 options tested (50.0%)")
+
+    def test_zero_options_renders_not_applicable(self) -> None:
+        """A feature with no autotunable choices renders text, not '0/0'."""
+        stats = FeatureExplorationStats(
+            feature_name="epilogue_subtile",
+            all_possible_values=[],
+            tested_values=[],
+            coverage_percent=0.0,
+            total_options=0,
+        )
+        line = stats.to_summary_line()
+        self.assertNotIn("0/0", line)
+        self.assertIn("no autotunable choices", line)
+
+    def test_displayed_tested_count_clamped_to_total(self) -> None:
+        """The displayed numerator never exceeds the denominator (no '7/4')."""
+        stats = FeatureExplorationStats(
+            feature_name="l2_groupings",
+            all_possible_values=[],
+            tested_values=[1, 2, 4, 8, 16, 32, 64],  # 7 distinct
+            coverage_percent=100.0,
+            total_options=4,  # deliberately-too-small estimate
+        )
+        self.assertEqual(stats.displayed_tested_count, 4)
+        self.assertEqual(
+            stats.to_summary_line(), "l2_groupings: 4/4 options tested (100.0%)"
+        )
 
 
 class TestFeatureExplorationTracker(unittest.TestCase):
@@ -125,6 +155,30 @@ class TestFeatureExplorationTracker(unittest.TestCase):
         stats = report.feature_stats[0]
         self.assertEqual(stats.total_options, 0)
         self.assertEqual(stats.coverage_percent, 0.0)
+
+    def test_zero_option_feature_excluded_from_aggregates(self) -> None:
+        """A feature with no available choices (0/0) must not drag avg/min to 0%."""
+        dims = [
+            # epilogue_subtile is inapplicable to this kernel (size 0).
+            SearchSpaceDimension(
+                name="epilogue_subtile", dim_type="categorical", size=0
+            ),
+            SearchSpaceDimension(
+                name="num_warps",
+                dim_type="discrete",
+                size=6,
+                values=[1, 2, 4, 8, 16, 32],
+            ),
+        ]
+        tracker = FeatureExplorationTracker(_summary(dimensions=dims))
+        for w in (1, 2, 4, 8, 16, 32):
+            tracker.record_config(
+                _FakeConfig(block_sizes=[32], loop_orders=[0], num_warps=w)
+            )
+        report = tracker.generate_report("LFBOTreeSearch", 1.0)
+        # Only num_warps (fully covered) contributes to the aggregates.
+        self.assertEqual(report.avg_feature_coverage, 100.0)
+        self.assertEqual(report.min_feature_coverage, 100.0)
 
 
 class _ListHandler(logging.Handler):
@@ -216,6 +270,74 @@ class TestExplorationReportSummary(unittest.TestCase):
         # Denominator is 4096 (total_options), never 0.
         self.assertIn("block_sizes: 1/4096 options tested", joined)
         self.assertIn("only 1 of 4096 values tested", joined)
+
+
+class _FakeSpec:
+    """Duck-typed ConfigSpec exposing only what a branch under test reads."""
+
+    def __init__(self, **attrs: object) -> None:
+        self.__dict__.update(attrs)
+
+
+class _FakeLoopSpec:
+    def __init__(self, block_ids: list[int]) -> None:
+        self.block_ids = block_ids
+
+
+class TestAnalyzeDimensionSize(unittest.TestCase):
+    def test_loop_orders_uses_factorial_of_block_ids_per_spec(self) -> None:
+        """A single spec permuting 3 block_ids => 3! = 6 orderings, not 1."""
+        spec = _FakeSpec(loop_orders=[_FakeLoopSpec([0, 1, 2])])
+        dim = _analyze_dimension_size(spec, "loop_orders")
+        assert dim is not None
+        self.assertEqual(dim.size, 6)
+        self.assertIn("1 permutable loop", dim.constrained_by or "")
+
+    def test_loop_orders_product_across_specs(self) -> None:
+        """Two specs (3! and 2!) => 6 * 2 = 12; single-id specs contribute 1."""
+        spec = _FakeSpec(
+            loop_orders=[
+                _FakeLoopSpec([0, 1, 2]),
+                _FakeLoopSpec([3, 4]),
+                _FakeLoopSpec([5]),  # single id: only one ordering
+            ]
+        )
+        dim = _analyze_dimension_size(spec, "loop_orders")
+        assert dim is not None
+        self.assertEqual(dim.size, 12)
+        self.assertIn("2 permutable loop", dim.constrained_by or "")
+
+    def test_l2_groupings_seven_values_per_slot(self) -> None:
+        """PowerOfTwoFragment(1, 64, 1) => {1,2,4,8,16,32,64} = 7 per slot."""
+        spec = _FakeSpec(l2_groupings=[object(), object()])
+        dim = _analyze_dimension_size(spec, "l2_groupings")
+        assert dim is not None
+        self.assertEqual(dim.size, 7**2)
+
+    def test_pid_type_reports_disabled_values(self) -> None:
+        spec = _FakeSpec(allowed_pid_types=("flat", "xyz"))
+        dim = _analyze_dimension_size(spec, "pid_type")
+        assert dim is not None
+        self.assertEqual(dim.size, 2)
+        self.assertEqual(dim.values, ["flat", "xyz"])
+        # The two persistent pid_types are reported as disabled.
+        self.assertIn("2 pid_type(s) disabled", dim.constrained_by or "")
+        self.assertIn("persistent_blocked", dim.constrained_by or "")
+        self.assertIn("persistent_interleaved", dim.constrained_by or "")
+
+    def test_pid_type_no_constraint_when_all_allowed(self) -> None:
+        spec = _FakeSpec(
+            allowed_pid_types=(
+                "flat",
+                "xyz",
+                "persistent_blocked",
+                "persistent_interleaved",
+            )
+        )
+        dim = _analyze_dimension_size(spec, "pid_type")
+        assert dim is not None
+        self.assertEqual(dim.size, 4)
+        self.assertIsNone(dim.constrained_by)
 
 
 if __name__ == "__main__":

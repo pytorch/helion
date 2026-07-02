@@ -154,20 +154,37 @@ class FeatureExplorationStats:
         if self.total_options is None:
             self.total_options = len(self.all_possible_values)
 
+    @property
+    def displayed_tested_count(self) -> int:
+        """Number of tested values, clamped to ``total_options``.
+
+        The recorded tested set can occasionally exceed a dimension's size
+        estimate (the estimate bounds a projected space, while tracking counts
+        distinct observed values). Clamp so the displayed fraction is never
+        nonsensical (e.g. ``7/4``).
+        """
+        if not self.total_options:
+            return len(self.tested_values)
+        return min(len(self.tested_values), self.total_options)
+
     def to_dict(self) -> dict[str, object]:
         return {
             "feature_name": self.feature_name,
             "all_possible_values": self.all_possible_values,
             "tested_values": self.tested_values,
             "total_options": self.total_options,
-            "tested_options": len(self.tested_values),
+            "tested_options": self.displayed_tested_count,
             "coverage_percent": round(self.coverage_percent, 2),
         }
 
     def to_summary_line(self) -> str:
         """Single-line summary: 'pid_type: 2/8 options tested (25.0%)'."""
+        if not self.total_options:
+            # No choices are available for this kernel (e.g. epilogue_subtile on
+            # a non-matmul kernel). Report it as inapplicable rather than 0/0.
+            return f"{self.feature_name}: no autotunable choices for this kernel"
         return (
-            f"{self.feature_name}: {len(self.tested_values)}/{self.total_options} "
+            f"{self.feature_name}: {self.displayed_tested_count}/{self.total_options} "
             f"options tested ({self.coverage_percent:.1f}%)"
         )
 
@@ -237,14 +254,20 @@ class ExplorationReport:
         for stats in sorted(self.feature_stats, key=lambda s: s.coverage_percent):
             logger.log(level, f"    - {stats.to_summary_line()}")
 
-        # Highlight poorly explored features
-        poor_coverage = [s for s in self.feature_stats if s.coverage_percent < 50.0]
+        # Highlight poorly explored features. Skip features with no available
+        # choices for this kernel (total_options == 0) — those are inapplicable,
+        # not under-explored.
+        poor_coverage = [
+            s
+            for s in self.feature_stats
+            if s.total_options and s.coverage_percent < 50.0
+        ]
         if poor_coverage:
             logger.log(level, "\n  Features with <50% exploration:")
             for stats in poor_coverage:
                 logger.log(
                     level,
-                    f"    - {stats.feature_name}: only {len(stats.tested_values)} "
+                    f"    - {stats.feature_name}: only {stats.displayed_tested_count} "
                     f"of {stats.total_options} values tested",
                 )
 
@@ -317,12 +340,16 @@ class FeatureExplorationTracker:
                 )
             )
 
-        # Calculate aggregate metrics
-        if feature_stats:
-            avg_coverage = sum(s.coverage_percent for s in feature_stats) / len(
-                feature_stats
+        # Calculate aggregate metrics. Only features that actually have
+        # autotunable choices (total_options > 0) contribute; a feature with no
+        # available options (e.g. epilogue_subtile on a non-matmul kernel) is
+        # inapplicable, not under-explored, so it must not drag coverage to 0%.
+        applicable_stats = [s for s in feature_stats if s.total_options]
+        if applicable_stats:
+            avg_coverage = sum(s.coverage_percent for s in applicable_stats) / len(
+                applicable_stats
             )
-            min_coverage = min(s.coverage_percent for s in feature_stats)
+            min_coverage = min(s.coverage_percent for s in applicable_stats)
         else:
             avg_coverage = 0.0
             min_coverage = 0.0
@@ -409,6 +436,7 @@ def analyze_search_space(
         A SearchSpaceSummary describing the valid search space
     """
     from ..autotuner.config_spec import VALID_KEYS
+    from ..autotuner.config_spec import VALID_PID_TYPES
 
     dimensions: list[SearchSpaceDimension] = []
     enabled_features: list[str] = []
@@ -439,6 +467,19 @@ def analyze_search_space(
                     f"[{spec.autotuner_min}, {spec.max_size}] "
                     f"(natural min_size={spec.min_size})"
                 )
+
+    # Surface pid_types that were disabled for this kernel. pid_type stays an
+    # enabled feature (some values remain), so this won't appear in
+    # disabled_features; report it as a constraint instead.
+    if config_spec.supports_config_key("pid_type"):
+        disabled_pid_types = [
+            pt for pt in VALID_PID_TYPES if pt not in config_spec.allowed_pid_types
+        ]
+        if disabled_pid_types:
+            shape_constraints.append(
+                f"pid_type restricted to {list(config_spec.allowed_pid_types)} "
+                f"(disabled: {', '.join(disabled_pid_types)})"
+            )
 
     if config_spec.cute_flash_search_enabled:
         shape_constraints.append(
@@ -501,11 +542,21 @@ def _analyze_dimension_size(
         )
 
     if key == "pid_type":
+        from ..autotuner.config_spec import VALID_PID_TYPES
+
+        allowed = list(config_spec.allowed_pid_types)
+        disabled = [pt for pt in VALID_PID_TYPES if pt not in allowed]
         return SearchSpaceDimension(
             name="pid_type",
             dim_type="categorical",
-            size=len(config_spec.allowed_pid_types),
-            values=list(config_spec.allowed_pid_types),
+            size=len(allowed),
+            values=allowed,
+            constrained_by=(
+                f"{len(disabled)} pid_type(s) disabled by kernel "
+                f"({', '.join(disabled)})"
+                if disabled
+                else None
+            ),
         )
 
     if key == "num_warps":
@@ -539,19 +590,25 @@ def _analyze_dimension_size(
         )
 
     elif key == "loop_orders":
-        # Loop orders are permutations - factorial growth
-        num_loops = len(config_spec.loop_orders)
-        if num_loops <= 1:
-            size = 1
-        elif num_loops <= 6:
-            size = math.factorial(num_loops)
-        else:
-            size = 720  # Cap at 6!
+        # ``config.loop_orders`` is a list[list[int]]: one permutation per loop
+        # spec. Each spec permutes ``len(spec.block_ids)`` block_ids, so the
+        # number of distinct orderings for that spec is
+        # ``factorial(len(spec.block_ids))`` and the total is their product.
+        size = 1
+        permuted_specs = 0
+        for spec in config_spec.loop_orders:
+            n = len(spec.block_ids)
+            if n <= 1:
+                continue  # A single (or empty) block_id has only one ordering.
+            permuted_specs += 1
+            size *= math.factorial(min(n, 6))  # Cap per-spec at 6! to bound size.
         return SearchSpaceDimension(
             name="loop_orders",
             dim_type="discrete",
             size=size,
-            constrained_by=f"{num_loops} loops" if num_loops > 1 else None,
+            constrained_by=f"{permuted_specs} permutable loop(s)"
+            if permuted_specs
+            else None,
         )
 
     elif key == "pallas_loop_type":
@@ -590,12 +647,13 @@ def _analyze_dimension_size(
         )
 
     elif key == "l2_groupings":
-        # L2 groupings is a ListOf with typically small integer values
+        # ``config.l2_groupings`` is a list[int]: one power-of-two value per
+        # spec. Each slot uses PowerOfTwoFragment(1, 64, 1) → {1, 2, 4, 8, 16,
+        # 32, 64} = 7 values.
         num_specs = len(config_spec.l2_groupings)
         if num_specs == 0:
             return None
-        # Each slot can be 1, 2, 4, 8 typically
-        per_slot_size = 4
+        per_slot_size = _count_power_of_two_values(1, 64)
         return SearchSpaceDimension(
             name="l2_groupings",
             dim_type="discrete",
