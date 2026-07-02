@@ -14,7 +14,7 @@ Two kernels ship:
 * :func:`scale_mm_cute_skinny_m` keeps the full (small) M resident and tiles
   only over N, which the CuTe backend runs faster for tiny M.
 
-:func:`_scale_mm_cute` dispatches to the skinny-M kernel when ``M <= 16``.
+:func:`_scale_mm_cute` dispatches to the skinny-M kernel when ``M <= 1``.
 """
 
 from __future__ import annotations
@@ -27,7 +27,7 @@ import helion.experimental
 import helion.language as hl
 
 # M at or below this uses the skinny-M kernel (mirrors examples/fp8_gemm.py).
-_SKINNY_M_MAX = 16
+_SKINNY_M_MAX = 1
 
 
 @helion.experimental.aot_kernel(backend="cute", static_shapes=True)
