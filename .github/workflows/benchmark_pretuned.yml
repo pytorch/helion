@@ -132,6 +132,25 @@ jobs:
           print(f'Device: {torch.cuda.get_device_name(0)}')
           "
 
+      - name: Install tritonbench
+        # The cudagraph-timed kernels (scaled_mm + fp8/quant ports) use
+        # tritonbench's _do_bench_cudagraph_with_cache_clear, which clears the L2
+        # cache each iteration (triton.testing.do_bench_cudagraph does not, so it
+        # under-reports latency for graphs that replay the same inputs). Only the
+        # do_bench component is needed, so install the package alone (--no-deps).
+        # Required (no fallback): pretuned_kernels/_bench.py errors without it, so
+        # this step must succeed for cudagraph kernels to benchmark.
+        if: startsWith(inputs.image, 'nvidia')
+        run: |
+          source .venv/bin/activate
+          mkdir -p benchmarks/ && pushd benchmarks/
+          git clone https://github.com/pytorch-labs/tritonbench/
+          pushd tritonbench/
+          git checkout $(cat $GITHUB_WORKSPACE/.github/ci_commit_pins/tritonbench.txt)
+          uv pip install -e . --no-deps
+          popd && popd
+          python -c "from tritonbench.components.do_bench.run import _do_bench_cudagraph_with_cache_clear; print('tritonbench cudagraph timer OK')"
+
       - name: Run pretuned kernel benchmarks
         run: |
           source .venv/bin/activate

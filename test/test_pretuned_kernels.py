@@ -300,45 +300,48 @@ _EXPECTED_PERF: dict[str, dict[str, ExpectedPerf]] = {
             wins_slack=1,
         ),
     },
+    # CUDA-graph-timed kernels (scaled_mm + the vLLM-ported ops below). These use
+    # tritonbench's L2-cache-clearing cudagraph timer, so numbers reflect cold-L2
+    # (realistic) latency -- lower than a cache-warm timer, since torch.compile's
+    # fused kernels win more of the memory-bound shapes when L2 is cleared.
     "scaled_mm": {
-        # Measured under CUDA graphs (scaled_mm's main() uses do_bench_cudagraph),
-        # which is how vLLM invokes the kernel and removes per-call host launch
-        # overhead -- so these numbers reflect GPU work and are portable across
-        # H100 SKUs/torch versions (unlike eager do_bench, where host overhead
-        # dominated the tiny decode GEMMs and varied wildly by machine).
+        # Small decode GEMMs; helion vs the best of {torch._scaled_mm}. Portable
+        # across H100 SKUs/torch versions (cudagraph removes host launch overhead).
         "sm90": ExpectedPerf(
             helion_wins=23,
             total=24,
-            geomean=1.15,
+            geomean=1.14,
             wins_slack=4,
         ),
     },
     # vLLM-ported kernels (vllm/kernels/helion/ops): each benchmarks its fused
     # Helion kernel under CUDA graphs against a torch-native reference and its
-    # torch.compile, so speedups are still large vs the best of the two. sm90
-    # numbers measured on H100; sm100 gating is added once a B200 nightly has
-    # calibrated it (the perf test skips compute capabilities absent from this
-    # map).
+    # torch.compile (best of the two). sm90 measured on H100 with L2 clearing;
+    # sm100 gating is added once a B200 nightly has calibrated it (the perf test
+    # skips compute capabilities absent from this map).
     "silu_mul_fp8": {
-        "sm90": ExpectedPerf(helion_wins=21, total=36, geomean=1.15, wins_slack=3),
+        # Bandwidth-bound. Re-tuned on H100 with Helion's autotuner under
+        # cudagraph timing (see the kernel's heuristic header); helion now wins
+        # the majority of shapes vs the best of {torch, torch.compile}.
+        "sm90": ExpectedPerf(helion_wins=22, total=36, geomean=1.15, wins_slack=8),
     },
     "dynamic_per_token_scaled_fp8_quant": {
-        "sm90": ExpectedPerf(helion_wins=24, total=24, geomean=1.67, wins_slack=2),
+        "sm90": ExpectedPerf(helion_wins=18, total=24, geomean=1.22, wins_slack=5),
     },
     "per_token_group_fp8_quant": {
-        "sm90": ExpectedPerf(helion_wins=24, total=24, geomean=2.95, wins_slack=2),
+        "sm90": ExpectedPerf(helion_wins=22, total=24, geomean=2.45, wins_slack=4),
     },
     "rms_norm_dynamic_per_token_quant": {
-        "sm90": ExpectedPerf(helion_wins=36, total=36, geomean=1.70, wins_slack=3),
+        "sm90": ExpectedPerf(helion_wins=35, total=36, geomean=1.34, wins_slack=4),
     },
     "rms_norm_per_block_quant": {
-        "sm90": ExpectedPerf(helion_wins=24, total=24, geomean=3.95, wins_slack=2),
+        "sm90": ExpectedPerf(helion_wins=24, total=24, geomean=3.30, wins_slack=2),
     },
     "silu_and_mul_per_block_quant": {
-        "sm90": ExpectedPerf(helion_wins=24, total=24, geomean=3.55, wins_slack=2),
+        "sm90": ExpectedPerf(helion_wins=24, total=24, geomean=2.68, wins_slack=2),
     },
     "fused_qk_norm_rope": {
-        "sm90": ExpectedPerf(helion_wins=21, total=21, geomean=8.6, wins_slack=2),
+        "sm90": ExpectedPerf(helion_wins=21, total=21, geomean=7.2, wins_slack=2),
     },
 }
 
@@ -520,35 +523,40 @@ class TestPretunedKernelsPerformance(TestCase):
     def test_rope(self):
         self._run_pretuned_kernel_perf("rope")
 
-    @pytest.mark.timeout(120)
+    # The cudagraph-timed kernels below use tritonbench's L2-cache-clearing
+    # timer, which is ~9x slower per measurement than triton's do_bench_cudagraph
+    # (it captures/replays a large graph and zeroes L2 each iteration), so these
+    # get a generous timeout. These perf tests are local-only (skipped under CI
+    # xdist), so the long runtime does not affect CI.
+    @pytest.mark.timeout(600)
     def test_scaled_mm(self):
         self._run_pretuned_kernel_perf("scaled_mm")
 
-    @pytest.mark.timeout(180)
+    @pytest.mark.timeout(600)
     def test_silu_mul_fp8(self):
         self._run_pretuned_kernel_perf("silu_mul_fp8")
 
-    @pytest.mark.timeout(180)
+    @pytest.mark.timeout(600)
     def test_dynamic_per_token_scaled_fp8_quant(self):
         self._run_pretuned_kernel_perf("dynamic_per_token_scaled_fp8_quant")
 
-    @pytest.mark.timeout(180)
+    @pytest.mark.timeout(600)
     def test_per_token_group_fp8_quant(self):
         self._run_pretuned_kernel_perf("per_token_group_fp8_quant")
 
-    @pytest.mark.timeout(180)
+    @pytest.mark.timeout(600)
     def test_rms_norm_dynamic_per_token_quant(self):
         self._run_pretuned_kernel_perf("rms_norm_dynamic_per_token_quant")
 
-    @pytest.mark.timeout(180)
+    @pytest.mark.timeout(600)
     def test_rms_norm_per_block_quant(self):
         self._run_pretuned_kernel_perf("rms_norm_per_block_quant")
 
-    @pytest.mark.timeout(180)
+    @pytest.mark.timeout(600)
     def test_silu_and_mul_per_block_quant(self):
         self._run_pretuned_kernel_perf("silu_and_mul_per_block_quant")
 
-    @pytest.mark.timeout(180)
+    @pytest.mark.timeout(600)
     def test_fused_qk_norm_rope(self):
         self._run_pretuned_kernel_perf("fused_qk_norm_rope")
 
