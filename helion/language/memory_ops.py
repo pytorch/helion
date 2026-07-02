@@ -62,6 +62,7 @@ from .._compiler.indexing_strategy import SubscriptIndexing
 from .._compiler.indexing_strategy import TileWithOffsetInfo
 from .._compiler.indexing_strategy import _get_tile_with_offset_info
 from .._compiler.pallas import codegen as pallas_codegen
+from .._compiler.utils import compute_slice_size
 from .._compiler.variable_origin import GridOrigin
 from .._compiler.variable_origin import TileBeginOrigin
 from .._compiler.variable_origin import TileCountOrigin
@@ -256,6 +257,13 @@ def _(state: CodegenState) -> ast.AST:
                 epilogue_subtile_group_id
             ]
         strategy = device_fn.get_indexing_strategy(indexing_idx)
+        cache_modifier = None
+        if state.codegen.on_device:
+            modifier_idx = device_fn.device_store_cache_modifier_index
+            device_fn.device_store_cache_modifier_index += 1
+            modifiers = state.config.store_cache_modifiers
+            if modifier_idx < len(modifiers) and modifiers[modifier_idx]:
+                cache_modifier = ast.Constant(value=modifiers[modifier_idx])
 
         if state.codegen.store_transform is not None:
             return state.codegen.store_transform(
@@ -264,21 +272,33 @@ def _(state: CodegenState) -> ast.AST:
                 [*subscript],
                 value,
                 extra_mask,
+                cache_modifier,
                 strategy.codegen_store,
             )
 
-        return strategy.codegen_store(state, tensor, [*subscript], value, extra_mask)
+        return strategy.codegen_store(
+            state, tensor, [*subscript], value, extra_mask, cache_modifier
+        )
     if isinstance(tensor, tuple):
         from .._compiler.indexing_strategy import StackIndexingStrategy
 
         # Fusion is not supported for stack stores (multi-tensor device pointers);
         # fall through to the unfused path regardless of store_transform.
+        device_fn = state.device_function
+        device_fn.allocate_store_index()
+        cache_modifier = None
+        if state.codegen.on_device:
+            modifier_idx = device_fn.device_store_cache_modifier_index
+            device_fn.device_store_cache_modifier_index += 1
+            modifiers = state.config.store_cache_modifiers
+            if modifier_idx < len(modifiers) and modifiers[modifier_idx]:
+                cache_modifier = ast.Constant(value=modifiers[modifier_idx])
         stack_tensor_ast = state.ast_args[0]
         assert isinstance(stack_tensor_ast, tuple)
         assert len(stack_tensor_ast) == 2
         _tensor_like_ast, dev_ptrs_ast = stack_tensor_ast
         return StackIndexingStrategy.codegen_store(
-            state, tensor, dev_ptrs_ast, [*subscript], value, extra_mask
+            state, tensor, dev_ptrs_ast, [*subscript], value, extra_mask, cache_modifier
         )
     raise NotImplementedError(f"Cannot store to type: {type(tensor)}")
 
@@ -907,6 +927,38 @@ def _cute_index_exprs(
                 )
             result.append(inactive_slice_expr)
             tensor_dim += 1
+        elif isinstance(idx, slice) and (idx.step is None or idx.step == 1):
+            # Partial slice (e.g. :16, 16:, or 5:20)
+            if tensor is None:
+                raise exc.BackendUnsupported(
+                    "cute", "partial slice indexing without tensor"
+                )
+            dim_size = tensor.shape[tensor_dim]
+            slice_size = compute_slice_size(idx, dim_size)
+            start = idx.start if idx.start is not None else 0
+            block_id = resolve_active_slice_block_id(slice_size, used_block_ids)
+            if block_id is not None:
+                idx_var = active_index_var(block_id)
+                assert idx_var is not None
+                used_block_ids.add(block_id)
+                if start == 0:
+                    result.append(idx_var)
+                else:
+                    start_expr = state.device_function.literal_expr(start)
+                    result.append(f"({start_expr} + {idx_var})")
+                tensor_dim += 1
+                continue
+            raise exc.BackendUnsupported(
+                "cute",
+                (
+                    "partial slice dimension is not active in this scope "
+                    f"(tensor_dim={pos}, size={slice_size})"
+                ),
+            )
+        elif isinstance(idx, slice):
+            raise exc.BackendUnsupported(
+                "cute", f"strided slices (step={idx.step}) are not supported"
+            )
         else:
             raise exc.BackendUnsupported("cute", f"index type: {type(idx)}")
     return result
@@ -2401,6 +2453,27 @@ def _cute_combined_mask(
             )
         return tile_terms
 
+    def tensor_index_bounds_term(pos: int, tensor_dim: int) -> str | None:
+        if tensor is None or tensor_dim >= tensor.ndim:
+            return None
+        ast_args = state.ast_args
+        if not (
+            isinstance(ast_args, list)
+            and len(ast_args) > 1
+            and isinstance(ast_args[1], (list, tuple))
+            and len(ast_args[1]) == len(subscript)
+            and isinstance(ast_args[1][pos], ast.AST)
+        ):
+            return None
+        index_var = state.codegen.lift(
+            ast_args[1][pos],
+            dce=True,
+            prefix="index_mask",
+        ).id
+        index_dtype = env.backend.dtype_str(env.index_dtype)
+        dim_size = _cute_tensor_dim_size_expr(state, tensor, tensor_dim)
+        return f"{index_dtype}({index_var}) < {dim_size}"
+
     if extra_mask is not None:
         terms.append(state.codegen.lift(extra_mask, dce=True, prefix="mask").id)
 
@@ -2428,7 +2501,14 @@ def _cute_combined_mask(
                 if bid not in seen and mask_var_for_block_id(bid) is not None:
                     block_id = bid
                     break
+        elif isinstance(idx, slice) and idx != slice(None) and tensor is not None:
+            slice_size = compute_slice_size(idx, tensor.shape[tensor_dim])
+            for bid in _matching_block_ids(env, slice_size):
+                if bid not in seen and mask_var_for_block_id(bid) is not None:
+                    block_id = bid
+                    break
         elif isinstance(idx, torch.Tensor):
+            added_tensor_index_mask = False
             # A free ``hl.arange`` mapped onto a synthetic thread axis carries no
             # block id, so the loops below add no bound for it. Emit its lane
             # bound explicitly to mask the out-of-bounds lanes a wider sibling
@@ -2464,10 +2544,17 @@ def _cute_combined_mask(
                             continue
                         mask_var = mask_var_for_block_id(bid)
                         if mask_var is not None:
+                            added_tensor_index_mask = True
                             seen.add(bid)
                             if mask_var not in terms:
                                 terms.append(mask_var)
                             break
+                if (
+                    not added_tensor_index_mask
+                    and (bound := tensor_index_bounds_term(pos, tensor_dim)) is not None
+                ):
+                    if bound not in terms:
+                        terms.append(bound)
                 tensor_dim += 1
                 continue
             for dim_size in idx.shape:
@@ -2476,12 +2563,19 @@ def _cute_combined_mask(
                         continue
                     mask_var = mask_var_for_block_id(bid)
                     if mask_var is not None:
+                        added_tensor_index_mask = True
                         seen.add(bid)
                         if mask_var not in terms:
                             terms.append(mask_var)
                         break
                 else:
                     continue
+            if (
+                not added_tensor_index_mask
+                and (bound := tensor_index_bounds_term(pos, tensor_dim)) is not None
+            ):
+                if bound not in terms:
+                    terms.append(bound)
             tensor_dim += 1
             continue
         else:
@@ -6087,7 +6181,9 @@ def _(state: CodegenState) -> ast.AST:
         indexing_idx = device_fn.device_memory_op_index
         device_fn.device_memory_op_index += 1
         strategy = device_fn.get_indexing_strategy(indexing_idx)
-        return strategy.codegen_store(state, tensor, [*subscript], value, extra_mask)
+        return strategy.codegen_store(
+            state, tensor, [*subscript], value, extra_mask, None
+        )
     raise exc.BackendUnsupported("metal", f"store target type: {type(tensor)}")
 
 

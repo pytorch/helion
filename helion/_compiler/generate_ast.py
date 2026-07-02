@@ -1062,6 +1062,23 @@ class GenerateAST(NodeVisitor, CodegenInterface):
                         self.device_function.body = self.device_function.cute_state.move_tcgen05_post_loop_stmts_to_end(
                             list(self.device_function.body)
                         )
+                # Fused tcgen05 flash-attention (HELION_CUTE_FLASH): the
+                # detector set ``attention_flash_block_ids``; replace the
+                # FX-derived scalar body with the dedicated tensor-core flash
+                # kernel that mirrors ``.notes/spikes/fa_tcgen05_spike.py``.
+                if (
+                    self.device_function.cute_state.attention_flash_block_ids
+                    is not None
+                ):
+                    from .cute.cute_flash import codegen_attention_flash
+
+                    if not codegen_attention_flash(self):
+                        # Codegen declined a config the detector could not fully
+                        # vet before the device-function arguments were populated
+                        # (e.g. non-contiguous operands). Clear the flash state so
+                        # the launch override does not force block=(N,1,1) onto
+                        # the scalar fallback body that stays in df.body.
+                        self.device_function.cute_state.attention_flash_block_ids = None
                 # Mark extra params as placeholder args — they appear only in
                 # placeholder strings, not in the AST body, so DCE would
                 # otherwise remove them.
@@ -1373,7 +1390,13 @@ def generate_ast(
                 else []
             )
             final_host_statements = rng_statements + codegen.host_statements
-            if codegen.cute_uses_matmul or codegen.cute_wrapper_plans:
+            small_biased_wrapper_only = codegen.cute_wrapper_plans and all(
+                plan.get("kind") == "helion_small_biased_attention"
+                for plan in codegen.cute_wrapper_plans
+            )
+            if (
+                codegen.cute_uses_matmul or codegen.cute_wrapper_plans
+            ) and not small_biased_wrapper_only:
                 final_host_statements = [
                     statement_from_string(
                         f"{codegen.device_function.name}._helion_cute_disable_bake_tensor_shapes = True"
@@ -1411,6 +1434,14 @@ def generate_ast(
                         "rhs_name",
                         "c_name",
                         "d_name",
+                        "q_name",
+                        "k_name",
+                        "v_name",
+                        "o_name",
+                        "lse_name",
+                        "bias_name",
+                        "alibi_name",
+                        "document_name",
                     ):
                         if key in resolved:
                             resolved[key[:-5] + "_idx"] = launcher_arg_positions[

@@ -18,6 +18,7 @@ from .._compiler.ast_extension import expr_from_string
 from .._compiler.ast_extension import statement_from_string
 from .._compiler.compile_environment import CompileEnvironment
 from .._compiler.compile_environment import _symint_sympy_expr
+from .._compiler.device_function import find_block_size_symbols
 from .._compiler.dtype_utils import cast_ast
 from .._compiler.host_function import HostFunction
 from .._compiler.variable_origin import BlockSizeOrigin
@@ -254,10 +255,13 @@ def _(state: CodegenState) -> object:
     if pallas_loop_type == "fori_loop":
         return _codegen_fori_loop(state)
     if pallas_loop_type == "compact_worklist":
-        # The compacted tile becomes the grid (no loop); the ordered inner tile
-        # (fully jagged) and the single-iteration compact tile both lower through
-        # the fori path with begin/end remapped to metadata refs (see
-        # _compact_worklist_bounds).
+        # The compact tile becomes the grid (no loop).  The ordered inner tile
+        # (fully jagged carried reduction) lowers via emit_pipeline for
+        # pl.Buffered double-buffering; the single-iteration compact tile lowers
+        # through the fori path.  Both have begin/end remapped to metadata refs
+        # (see _compact_worklist_bounds).
+        if _is_compact_ordered_inner_loop(state):
+            return _codegen_emit_pipeline(state)
         return _codegen_fori_loop(state)
     # unroll: fall through to common codegen path
     # pyrefly: ignore[bad-return]
@@ -275,7 +279,13 @@ def _(state: CodegenState) -> None:
     if pallas_loop_type in ("fori_loop", "compact_worklist"):
         # Route compact_worklist through the same lowering as _for_loop so the
         # compact metadata (begin/end remap, synthetic compact tile) is applied
-        # rather than falling through to the common (non-compact) codegen.
+        # rather than falling through to the common (non-compact) codegen.  The
+        # ordered inner tile uses emit_pipeline for double-buffering.
+        if pallas_loop_type == "compact_worklist" and _is_compact_ordered_inner_loop(
+            state
+        ):
+            _codegen_emit_pipeline(state)
+            return None
         _codegen_fori_loop(state)
         return None
     # pyrefly: ignore[bad-return]
@@ -374,17 +384,20 @@ def _find_strategy(
     return strategy
 
 
-def _compact_worklist_bounds(
-    state: CodegenState, loop_dim_index: int
-) -> tuple[str, str] | None:
-    """Metadata-ref begin/end for a compact/ordered tile, else None."""
+def _compact_axis_kind(state: CodegenState, loop_dim_index: int) -> str | None:
+    """Classify a loop dim under ``compact_worklist`` as the compact tile, the
+    ordered inner (carried) tile, or neither.
+
+    Single source of truth shared by the loop-type dispatch
+    (:func:`_is_compact_ordered_inner_loop`) and the begin/end remap
+    (:func:`_compact_worklist_bounds`), so the two can never disagree on which
+    axis a loop is.
+    """
     env = CompileEnvironment.current()
     plan = env.compact_worklist_plan
     if plan is None:
         return None
     from .._compiler.device_ir import ForLoopGraphInfo
-    from .._compiler.pallas.compact_worklist import compact_ref_names
-    from .._compiler.pallas.compact_worklist import ordered_ref_names
 
     graph_info = state.get_graph(state.proxy_arg(0))
     if not isinstance(graph_info, ForLoopGraphInfo):
@@ -394,13 +407,47 @@ def _compact_worklist_bounds(
         return None
     block_id = block_ids[loop_dim_index]
     if block_id == plan.compact_axis.block_id:
-        begin_ref, extent_ref = (f"{n}_ref" for n in compact_ref_names(plan))
-        return f"{begin_ref}[_wid]", f"{begin_ref}[_wid] + {extent_ref}[_wid]"
+        return "compact"
     ordered = plan.ordered_axis
     if ordered is not None and block_id == ordered.block_id:
-        begin_ref, len_ref = (f"{n}_ref" for n in ordered_ref_names(plan))
-        return f"{begin_ref}[_wid]", f"{begin_ref}[_wid] + {len_ref}[_wid]"
+        return "ordered"
     return None
+
+
+def _is_compact_ordered_inner_loop(state: CodegenState) -> bool:
+    """True if this ``_for_loop`` is the compact-worklist ordered inner tile.
+
+    The ordered tile is the carried inner reduction (e.g. the KV loop in fully
+    jagged attention); it is the only compact-worklist loop routed to
+    ``_codegen_emit_pipeline`` (for ``pl.Buffered`` double-buffering).  The owner
+    grid and the single-iteration compact tile stay on the fori path.
+    """
+    from .._compiler.device_ir import ForLoopGraphInfo
+
+    graph_info = state.get_graph(state.proxy_arg(0))
+    if not isinstance(graph_info, ForLoopGraphInfo):
+        return False
+    return any(
+        _compact_axis_kind(state, i) == "ordered"
+        for i in range(len(graph_info.block_ids))
+    )
+
+
+def _compact_worklist_bounds(
+    state: CodegenState, loop_dim_index: int
+) -> tuple[str, str] | None:
+    """Metadata-ref begin/end for a compact/ordered tile, else None."""
+    kind = _compact_axis_kind(state, loop_dim_index)
+    if kind is None:
+        return None
+    from .._compiler.pallas.compact_worklist import compact_ref_names
+    from .._compiler.pallas.compact_worklist import ordered_ref_names
+
+    plan = CompileEnvironment.current().compact_worklist_plan
+    assert plan is not None
+    ref_names = compact_ref_names if kind == "compact" else ordered_ref_names
+    begin_ref, extent_ref = (f"{n}_ref" for n in ref_names(plan))
+    return f"{begin_ref}[_wid]", f"{begin_ref}[_wid] + {extent_ref}[_wid]"
 
 
 def _get_loop_begin_and_end(
@@ -413,9 +460,10 @@ def _get_loop_begin_and_end(
     ``tile_starts_ref[_wid]``, end =
     ``tile_starts_ref[_wid] + tile_extents_ref[_wid]`` (and likewise the ordered
     axis -> ``range_start_ref``/``range_len_ref``).  Every downstream consumer
-    (numel -> fori trip count, offset, masks) then composes unchanged, so
-    ``_codegen_fori_loop`` runs a single iteration for the compact tile
-    (``tile_extent <= BLOCK``).
+    (trip count, offset, masks) then composes unchanged: ``_codegen_fori_loop``
+    runs a single iteration for the compact tile (``tile_extent <= BLOCK``),
+    while the ordered axis -- lowered via ``_codegen_emit_pipeline`` -- uses the
+    same remapped bounds for its pipeline grid and per-iteration offsets.
     """
     remap = _compact_worklist_bounds(state, loop_dim_index)
     if remap is not None:
@@ -597,6 +645,44 @@ def _scratch_write_stmt(state: CodegenState, sname: str, val: ast.AST) -> ast.AS
     return statement_from_string(f"{sname}[{idx}] = {{val}}", val=val)
 
 
+def _resolve_dim_size(
+    s: object,
+    env: CompileEnvironment,
+    config: Config,
+) -> int | None:
+    """Resolve a tensor-dim size to a concrete int from ``config``, else ``None``.
+
+    Handles a single tile dim via ``resolve_block_id`` and ``reshape``-merged
+    dims (a sympy product/sum/power of block symbols) by substituting each block
+    size. The ``int(s)`` fallback would otherwise return the full-extent size
+    hint and over-size loop-carried scratch.
+    """
+    bid = env.resolve_block_id(s)
+    if bid is not None:
+        bs = env.block_sizes[bid].from_config(config)
+        return bs if isinstance(bs, int) else None
+
+    if isinstance(s, int):
+        return s
+    expr = _symint_sympy_expr(s) if isinstance(s, torch.SymInt) else s
+    if not isinstance(expr, sympy.Expr):
+        return None
+    if expr.is_Integer:
+        return int(expr)
+
+    block_mapping, non_block_symbols = find_block_size_symbols(expr)
+    if non_block_symbols:
+        return None
+    subs: dict[sympy.Symbol, sympy.Integer] = {}
+    for symbol, block_id in block_mapping.items():
+        bs = env.block_sizes[block_id].from_config(config)
+        if not isinstance(bs, int):
+            return None
+        subs[symbol] = sympy.Integer(bs)
+    resolved = expr.xreplace(subs)
+    return int(resolved) if resolved.is_Integer else None
+
+
 def _resolve_shape(
     proxy: torch.Tensor,
     env: CompileEnvironment,
@@ -605,11 +691,9 @@ def _resolve_shape(
     """Resolve symbolic tile sizes to concrete block sizes from config."""
     resolved = []
     for s in proxy.shape:
-        bid = env.resolve_block_id(s)
-        if bid is not None:
-            bs = env.block_sizes[bid].from_config(config)
-            assert isinstance(bs, int)
-            resolved.append(bs)
+        size = _resolve_dim_size(s, env, config)
+        if size is not None:
+            resolved.append(size)
         else:
             resolved.append(int(s))
     return tuple(resolved)
@@ -2697,7 +2781,8 @@ def _codegen_fori_loop(state: CodegenState) -> object:
     # item, since the builder guarantees extent <= BLOCK), so emit the body
     # straight-line with the loop var bound to 0 -- no fori_loop wrapper (which
     # would add control-flow overhead and block pipelining for the common
-    # dense-KV case).  The ordered inner tile still lowers as a fori_loop.
+    # dense-KV case).  The ordered inner tile does not reach here: it lowers
+    # separately via emit_pipeline (see the _for_loop pallas dispatch).
     plan = CompileEnvironment.current().compact_worklist_plan
     is_compact_tile = (
         plan is not None

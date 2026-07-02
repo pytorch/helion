@@ -565,6 +565,30 @@ def _supports_maxnreg() -> bool:
     )
 
 
+def fp8_block_ptr_padding_broken() -> bool:
+    # call private func we can patch in testing
+    return _fp8_block_ptr_padding_broken()
+
+
+@functools.cache
+def _fp8_block_ptr_padding_broken() -> bool:
+    """Whether a block-pointer ``tl.load`` with ``padding_option='zero'`` fails to
+    compile for FP8 tensors.
+
+    Regression from triton-lang/triton#9668 ("Rewrite block pointer to be
+    python-only"), tracked in triton-lang/triton#10751: the python lowering emits
+    an ``int`` zero for ``other``, which Triton cannot cast to FP8. Present in the
+    triton 3.8 series; gated by version so the workaround drops automatically once
+    a fix ships in a later release. See ``BlockPtrIndexingStrategy.codegen_load``.
+    """
+    if not triton_is_available():
+        return False
+    import triton
+
+    triton_version = version.parse(triton.__version__)
+    return version.parse("3.8.0") <= triton_version < version.parse("3.9.0")
+
+
 @functools.cache
 def _regs_per_block() -> int:
     """Max 32-bit registers per block on the current CUDA device."""

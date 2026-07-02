@@ -306,11 +306,12 @@ def _triton_reduction_eligible(env: CompileEnvironment, device_ir: DeviceIR) -> 
 
 
 def _is_standard_reduction(spec: ConfigSpec, fact: ReductionFact) -> bool:
-    """standard vs user-tiled discriminator: standard iff the rdim is a rollable
-    ``reduction_loops`` entry, else user-tiled (a ``block_sizes`` entry). Exhaustive over
-    eligible reductions (the two device_ir populators are mutually exclusive).
+    """standard vs user-tiled discriminator: standard iff the rdim is NOT a ``block_sizes``
+    entry. Covers a roller-rolled rdim (a ``reduction_loops`` entry) AND a MATERIALIZED rdim
+    (an inner ``reduction=True`` axis the roller declined to roll, in NEITHER spec --
+    rms/ln/instance backward); user-tiled is the rdim-is-a-block_sizes case.
     """
-    return fact.block_id in spec.reduction_loops.valid_block_ids()
+    return fact.block_id not in spec.block_sizes.valid_block_ids()
 
 
 def _grid_rows(env: CompileEnvironment, m_block_ids: tuple[int, ...]) -> int:
@@ -331,18 +332,17 @@ def _grid_rows(env: CompileEnvironment, m_block_ids: tuple[int, ...]) -> int:
 class _TritonReductionSeedBase(AutotunerHeuristic):
     """Shared base for the two Triton inner-reduction seed heuristics. Both share the
     workload facts (``ReductionFact``), the M_BLOCK-aware reduction-block lever
-    (``_reduction_rblock``, from which each track derives ``persistent``), the
-    ``num_warps`` ramp, eviction provenance, and the block-size builders; the subclasses
-    differ only in mapping that decision onto knobs:
+    (``_reduction_rblock``, from which each track derives ``persistent``), the ``num_warps``
+    ramp, eviction provenance, and the block-size builders; the subclasses differ only in
+    mapping that decision onto knobs:
 
-    - **standard** (:class:`TritonStandardReductionHeuristic`): Helion rolls the rdim
-      into a ``reduction_loops`` loop.
-    - **user-tiled** (:class:`TritonUserTiledReductionHeuristic`): the user hand-writes
-      the ``hl.tile`` loop, so the reduction axis is a ``block_sizes`` entry (plain
-      user-tiled softmax, Band-B kl_div/jsd, Band-C welford).
+    - **standard** (:class:`TritonStandardReductionHeuristic`): Helion rolls the rdim into
+      a ``reduction_loops`` loop.
+    - **user-tiled** (:class:`TritonUserTiledReductionHeuristic`): the user hand-writes the
+      ``hl.tile`` loop, so the reduction axis is a ``block_sizes`` entry (plain user-tiled
+      softmax, carried-2-D-tile kl_div/jsd, reduce-then-apply welford).
 
-    Cloned from ``cute.CuteReductionTileHeuristic`` for triton (drops the CuTe-only
-    knobs, adds ``num_warps`` / ``num_stages``). Not registered; only the subclasses are.
+    Not registered; only the subclasses are.
     """
 
     backend = "triton"
@@ -352,10 +352,9 @@ class _TritonReductionSeedBase(AutotunerHeuristic):
     # residency budget. ``_reduction_rblock`` shrinks it when a raised M_BLOCK divides the
     # footprint budget below it; at M_BLOCK==1 it is used as-is.
     LOOPED_CHUNK = 16384
-    # Band-B (user-tiled, carrying [M_BLOCK, R_BLOCK] 2-D accumulators: kl_div, jsd) R_BLOCK
-    # cap, as a per-program footprint R_BLOCK * itemsize * n_carried; in bytes (via itemsize)
-    # for dtype-generality.
-    BANDB_R_BLOCK_BYTES = 16384
+    # Per-program byte budget for LOOP-CARRIED 2-D accumulator tiles ([M_BLOCK, R_BLOCK], e.g.
+    # kl_div/jsd): caps R_BLOCK via num_carried_2d_tiles. Tightest budget -- resident the whole loop.
+    CARRIED_TILE_MAX_BYTES = 16384
     # Per-program persistent byte ceiling. The resident reduction tile is [M_BLOCK, R_BLOCK]
     # in BOTH tracks (the persistent load and the looped accumulator both carry the M_BLOCK
     # dim), so the per-program footprint is ``m_block * r_block * itemsize`` and every cap
@@ -368,6 +367,15 @@ class _TritonReductionSeedBase(AutotunerHeuristic):
     # M_BLOCK-aware; gates only full_width_output rows, steering half-precision full-width
     # standard rows onto the looped path.
     FULL_WIDTH_PERSIST_MAX_ELEMS = 81920
+    # Max resident bytes a PERSISTENT reduction body (body_live_tiles full-width tiles) may hold
+    # before catastrophic register spill. Only REMOVES persistence from a heavy body, never grows it.
+    LIVE_PERSIST_BUDGET = 3 * 245760
+    # M-COLLAPSE (grad-parameter reduction, e.g. bias_grad): max rows one CTA reduces in a single
+    # in-register inner tile, capped so the reduction tree + [rows, feature] tile don't spill.
+    M_COLLAPSE_MAX_CTA = 256
+    # M-COLLAPSE inner reduction tile byte budget: a grad-parameter collapse is memory-bound, so
+    # the inner [rows, feature] tile wants the SMALLEST footprint (~2-8 rows) for CTA occupancy.
+    M_COLLAPSE_TILE_BYTES = 32768
     # No welford "structured-combine floor": welford is memory-bound (profiler-confirmed),
     # so a wide combine tile only spills — register-residency via the reduction footprint cap
     # is what matters. The apply/normalize tile gets the SAME M_BLOCK-aware footprint cap as
@@ -387,14 +395,15 @@ class _TritonReductionSeedBase(AutotunerHeuristic):
     NARROW_W1_OCC_BYTE_LIMIT = 262144
 
     @classmethod
-    def _bandb_r_block_cap(cls, fact: ReductionFact) -> int:
-        """Pow2 R_BLOCK ceiling for a Band-B (carried 2-D tile) reduction: the per-program
-        footprint ``BANDB_R_BLOCK_BYTES`` split across the accumulator itemsize and the
-        carried-tile count. ``max(1, ..)`` guards a zero itemsize / tile count.
+    def _carried_tile_r_block_cap(cls, fact: ReductionFact) -> int:
+        """Pow2 R_BLOCK ceiling for a reduction carrying loop-resident 2-D accumulator tiles
+        (kl_div, jsd): the per-program byte budget ``CARRIED_TILE_MAX_BYTES`` split across the
+        accumulator itemsize and the carried-tile count. ``max(1, ..)`` guards a zero itemsize
+        or tile count.
         """
         from ..._utils import next_power_of_2 as _np2
 
-        cap = cls.BANDB_R_BLOCK_BYTES // (
+        cap = cls.CARRIED_TILE_MAX_BYTES // (
             max(1, fact.itemsize) * max(1, fact.num_carried_2d_tiles)
         )
         return _np2(max(1, cap))
@@ -424,7 +433,8 @@ class _TritonReductionSeedBase(AutotunerHeuristic):
         if have_enough_information:
             occ = grid_rows // num_sm
             if (
-                fact.num_carried_2d_tiles == 0  # not Band-B (kl_div/jsd)
+                fact.num_carried_2d_tiles
+                == 0  # not a carried-2-D-tile reduction (kl_div/jsd)
                 and row_bytes <= cls.NARROW_W1_MAX_BYTES
                 and occ * row_bytes <= cls.NARROW_W1_OCC_BYTE_LIMIT
             ):
@@ -448,16 +458,45 @@ class _TritonReductionSeedBase(AutotunerHeuristic):
         return max(1, bs_spec.min_size, bs_spec.autotuner_min)
 
     @classmethod
+    def _m_block_cap(cls, fact: ReductionFact) -> int:
+        """Upper bound on M_BLOCK (rows/program) for a FULL-WIDTH-output reduction, so a huge-M
+        grid-size ``autotuner_min`` raise cannot force an occupancy-starving M_BLOCK on a
+        memory-bound held-row reduction. A seed below ``autotuner_min`` (raised only to cap the
+        grid) is still valid -- it survives ``normalize``.
+
+        The cap keeps the resident ``[M_BLOCK, rdim]`` live set inside the per-program register
+        budget: ``M_BLOCK <= ROW_PERSIST_MAX_BYTES / (rdim * itemsize * body_live_tiles)``.
+        Applied only via ``min`` with ``_block_floor`` (only ever LOWERS an over-raised floor)
+        and only for full-width output -- streamed/scalar reductions ride occupancy on the
+        chunk, not M_BLOCK, so they are uncapped.
+        """
+        from ..._utils import prev_power_of_2
+
+        if not fact.full_width_output:
+            return (
+                1 << 30
+            )  # no cap: scalar/streamed occupancy rides the reduction chunk
+        live = max(1, fact.body_live_tiles)
+        isz = max(1, fact.itemsize)
+        sh = max(1, fact.size_hint)
+        return max(
+            1, prev_power_of_2(max(1, cls.ROW_PERSIST_MAX_BYTES // (sh * isz * live)))
+        )
+
+    @classmethod
     def _m_block_product(cls, spec: ConfigSpec, fact: ReductionFact) -> int:
-        """Product of the seed's floored M-axis (grid) block sizes — the number of rows each
-        program processes (1 unless a huge-M shape raised ``autotuner_min``). Shared by the
-        apply-loop stream cap (``_build_block_sizes``) and the Band-C combine cap so they read
-        the same M_BLOCK.
+        """Product of the seed's floored M-axis (grid) block sizes -- the number of rows each
+        program processes (1 unless a huge-M shape raised ``autotuner_min``, capped by
+        ``_m_block_cap`` for full-width reductions). Shared by the apply-loop stream cap
+        (``_build_block_sizes``) and the Band-C combine cap so they read the same M_BLOCK.
         """
         m_block = 1
+        cap = cls._m_block_cap(fact)
         for mbid in fact.m_block_ids:
             m_idx = spec.block_sizes.block_id_to_index(mbid)
-            m_block *= cls._block_floor(cast("BlockSizeSpec", spec.block_sizes[m_idx]))
+            m_block *= min(
+                cls._block_floor(cast("BlockSizeSpec", spec.block_sizes[m_idx])), cap
+            )
         return m_block
 
     @classmethod
@@ -510,6 +549,10 @@ class _TritonReductionSeedBase(AutotunerHeuristic):
                 out.append(cast("int", red_value))
             elif bs_spec.block_id in non_reduction_loop_ids and loop_block is not None:
                 out.append(loop_block)
+            elif bs_spec.block_id in fact.m_block_ids:
+                # M (grid) axis: floor it, but cap a full-width reduction's M_BLOCK by the
+                # register budget (_m_block_cap) so a huge-M grid raise can't starve occupancy.
+                out.append(min(cls._block_floor(bs_spec), cls._m_block_cap(fact)))
             else:
                 out.append(cls._block_floor(bs_spec))
         return out
@@ -552,19 +595,26 @@ class _TritonReductionSeedBase(AutotunerHeuristic):
         env: CompileEnvironment,
         fact: ReductionFact,
         m_block: int,
-    ) -> int:
-        """The reduction-axis chunk (pow2), shared by both tracks, using the M_BLOCK-aware
-        footprint cap (see ``ROW_PERSIST_MAX_BYTES``).
+        footprint_factor: int = 1,
+    ) -> tuple[int, bool]:
+        """The reduction-axis chunk (pow2) AND the persistent verdict, decided together in one
+        budgeted formula and shared by both tracks. Returns ``(r_block, persistent)``.
 
-        Returns the full pow2 rdim when that footprint fits the residency budget (the caller
-        derives ``persistent := r_block >= next_pow2(size_hint)``), else the byte-preserving
-        looped chunk ``min(LOOPED_CHUNK, budget // m_block)`` — exactly ``LOOPED_CHUNK`` at
-        M_BLOCK==1, shrunk only when a raised M_BLOCK tightens the budget (huge-M).
+        ``footprint_factor`` = how many resident rdim-shaped tiles one program holds live at
+        the peak (1 = a single result tile). It bounds the decision two ways:
+        - PERSISTENT additionally requires (besides ``row_reread`` and no carried 2-D tile) the
+          single resident tile to fit ``ROW_PERSIST_MAX_BYTES`` AND the full
+          ``footprint_factor``-tile resident set to fit ``LIVE_PERSIST_BUDGET`` (the multi-tile
+          spill ceiling). This liveness term only ever REMOVES persistence from a heavy body.
+        - the LOOPED chunk is shrunk by ``footprint_factor`` so a heavy body gets a smaller
+          chunk, keeping the looped resident set inside the register budget.
 
-        No welford "structured-combine floor": keeping the chunk register-resident (the
-        footprint cap) is what matters. welford is memory-bound and a wide combine tile only
-        spills register/SMEM (profiler-confirmed; the count/mean/M2 recurrence is off the
-        critical path).
+        The standard track passes ``footprint_factor=body_live_tiles``; the user-tiled track
+        keeps the default ``1`` (where ``LIVE_PERSIST_BUDGET`` collapses to the base byte cap,
+        a no-op). The carried-2-D-tile cap (kl_div/jsd) is folded into the chunk decision.
+
+        No welford "structured-combine floor": register-residency via the footprint cap is what
+        matters; welford is memory-bound and a wide combine tile only spills.
         """
         from ..._utils import next_power_of_2 as _np2
         from ..._utils import prev_power_of_2
@@ -572,27 +622,79 @@ class _TritonReductionSeedBase(AutotunerHeuristic):
         rdim = _np2(fact.size_hint)
         itemsize = max(1, fact.itemsize)
         m = max(1, m_block)
-        # Persistent iff the full-rdim [M_BLOCK, rdim] tile fits ALL footprint caps: the element
-        # compile limit, the per-program byte ceiling, AND — for a full_width_output row — the
-        # fp32-promoted element ceiling (the input-byte cap undercounts it 2x at half precision).
+        ff = max(1, footprint_factor)
+        # Persistent iff (a) a SINGLE result tile fits the per-program caps (the element compile
+        # limit element_cap AND the ROW_PERSIST_MAX_BYTES single-tile byte cap), AND (b) the full
+        # ff-tile resident set fits LIVE_PERSIST_BUDGET. (b) is the liveness ceiling: it only
+        # removes persistence from a heavy body, never grants it (no-op at ff==1).
         element_cap = env.backend.max_tensor_numel
-        can_persist = (
-            (element_cap is None or fact.size_hint <= element_cap)
+        # Hold the full extent one-shot iff it clears every per-program ceiling (element compile
+        # limit element_cap, ROW_PERSIST_MAX_BYTES byte cap, LIVE_PERSIST_BUDGET live-set cap) AND
+        # there is NO carried 2-D accumulator -- a [M_BLOCK, R_BLOCK] tile carried across the loop
+        # is too heavy to hold, so stream.
+        extent_held = (
+            # Persist captures a re-read prize iff looping would RE-READ the row: a full-width apply
+            # (rms/layer_norm/softmax/welford) or a second reduction needing the first's result
+            # (cross_entropy's logsumexp -- which full_width_output misses). row_reread catches both;
+            # num_carried_2d_tiles == 0 keeps kl_div/jsd off persist (they re-read regardless).
+            fact.row_reread
+            and fact.num_carried_2d_tiles == 0
+            and (element_cap is None or fact.size_hint <= element_cap)
             and (m * fact.size_hint * itemsize <= cls.ROW_PERSIST_MAX_BYTES)
-            and (
-                not fact.full_width_output
-                or m * fact.size_hint <= cls.FULL_WIDTH_PERSIST_MAX_ELEMS
-            )
+            and (ff * m * fact.size_hint * itemsize <= cls.LIVE_PERSIST_BUDGET)
         )
-        if can_persist:
-            rblock = rdim
+        if extent_held:
+            r_block = rdim
         else:
-            # Looped: LOOPED_CHUNK, shrunk to the largest pow2 the M_BLOCK-aware byte budget
-            # allows. At M_BLOCK==1 the budget exceeds LOOPED_CHUNK -> chunk == LOOPED_CHUNK;
-            # a raised M_BLOCK divides the budget below it.
-            budget = cls.ROW_PERSIST_MAX_BYTES // (m * itemsize)
-            rblock = min(cls.LOOPED_CHUNK, prev_power_of_2(budget))
-        return max(1, rblock)
+            # Can't hold the extent -> stream it at the occupancy-optimal LOOPED_CHUNK (M_BLOCK- and
+            # liveness-shrunk); a capacity-sized chunk would re-read AND lower occupancy.
+            budget = cls.ROW_PERSIST_MAX_BYTES // (m * itemsize * ff)
+            r_block = min(cls.LOOPED_CHUNK, prev_power_of_2(budget))
+            # Carried 2-D accumulators (kl_div, jsd) always reach this branch; cap R_BLOCK by its tighter
+            # byte budget to avoid catastrophic register spills. No-op when num_carried_2d_tiles == 0.
+            if fact.num_carried_2d_tiles >= 1:
+                r_block = min(r_block, cls._carried_tile_r_block_cap(fact))
+        # Never size the chunk past the (padded) extent: clamp to rdim so a sub-cap-N carried reduction
+        # matches the old held branch and keeps `persistent` below correct.
+        r_block = max(1, min(r_block, rdim))
+        # `persistent` is READ OFF the final chunk -- held iff the chunk reached the extent
+        # (reduction_loops=[None] standard, or R_BLOCK == rdim user-tiled), never set separately.
+        return r_block, r_block >= rdim
+
+    @classmethod
+    def _m_collapse_grid_block(
+        cls, env: CompileEnvironment, fact: ReductionFact, cap: int | None = None
+    ) -> int:
+        """Occupancy-sized grid M block for a grad-parameter M-collapse (rms/ln/instance/group
+        backward on the standard track; bias_grad/dyt on the user-tiled track). The
+        grad-parameter (``grad_weight[N]`` / ``grad_bias[N]``) is summed across the grid rows
+        into a per-CTA partial finalized by a cross-CTA ``sum(0)``; with the block floored to 1
+        that is a grid-wide M-way collapse (one partial/row), so size it to ~one SM wave
+        (``next_pow2(grid_rows // num_sm)``) to cut it to ~``num_sm`` partials.
+
+        ``cap`` bounds the block when it ALSO bears the reduction slab (user-tiled pure
+        collapse, capped at ``M_COLLAPSE_MAX_CTA``); the standard track leaves it uncapped
+        because the resident ``[inner, feature]`` set rides a separate inner re-tile, not this
+        block. A dynamic/unbacked grid (``grid_rows == 0``) collapses to 1.
+        """
+        from ..._utils import next_power_of_2 as _np2
+        from ...runtime import get_num_sm
+
+        grid_rows = _grid_rows(env, fact.m_block_ids)
+        num_sm = max(1, get_num_sm(env.device))
+        block = _np2(max(1, grid_rows // num_sm))
+        return max(1, block if cap is None else min(cap, block))
+
+    @classmethod
+    def _m_collapse_inner_byte_cap(cls, feat_bytes: int) -> int:
+        """Largest pow2 inner reduction tile whose resident ``[inner, feature]`` fp32 set fits
+        ``M_COLLAPSE_TILE_BYTES``, given the per-row feature footprint ``feat_bytes``. Both
+        M-collapse tracks pass ``fact.feature_footprint * itemsize`` (the PRODUCT of the
+        materialized feature axes); for a 2-D norm that product is the single feature axis.
+        """
+        from ..._utils import next_power_of_2 as _np2
+
+        return max(1, _np2(max(1, cls.M_COLLAPSE_TILE_BYTES // max(1, feat_bytes))))
 
 
 class TritonStandardReductionHeuristic(_TritonReductionSeedBase):
@@ -647,18 +749,20 @@ class TritonStandardReductionHeuristic(_TritonReductionSeedBase):
         if not matches_hardware(env, cls.HARDWARE_TARGETS):
             # Off the H100-validated target: keep the upstream conservative seed.
             return cls._narrow_seed(env)
-        from ..._utils import next_power_of_2 as _np2
         from ...runtime import get_num_sm
 
         spec = env.config_spec
         fact = spec.reduction_facts[0]
-        # standard rides persistent-vs-looped on `reduction_loops`. The shared lever sizes the
-        # reduction chunk (M_BLOCK-aware footprint); `persistent` is derived from it. num_sm +
-        # grid_rows feed the occupancy-gated narrow-row w1 branch in _num_warps (grid_rows =
-        # product of static M extents, a pure fn of m_block_ids + env).
+        # standard rides persistent-vs-looped on reduction_loops (sized by the shared _reduction_rblock).
+        # footprint_factor=body_live_tiles routes a heavy body that would overflow the register file
+        # persistent (e.g. fused_linear_jsd) to the looped path instead.
         m_block = cls._m_block_product(spec, fact)
-        r_block = cls._reduction_rblock(env, fact, m_block)
-        persistent = r_block >= _np2(fact.size_hint)
+        r_block, persistent = cls._reduction_rblock(
+            env,
+            fact,
+            m_block,
+            footprint_factor=fact.body_live_tiles,
+        )
         num_warps = cls._num_warps(
             fact, max(1, get_num_sm(env.device)), _grid_rows(env, fact.m_block_ids)
         )
@@ -669,14 +773,55 @@ class TritonStandardReductionHeuristic(_TritonReductionSeedBase):
         # correctness), so emit and let the autotuner refine.
         non_reduction_loop_ids = set(fact.non_reduction_loop_block_ids)
 
-        # red_block_id=None: the rdim is not a block_sizes entry, so every entry is a
-        # grid axis (floored) or a normalize loop tile (sized to the reduction tile). None
-        # loop => the single grid block at its floor, as before.
-        reduction_loops: list[int | None] = [None] if persistent else [r_block]
+        # red_block_id=None: rdim is not a block_sizes entry, so every entry is a grid axis (floored)
+        # or a normalize-loop tile. MATERIALIZED rdim (rms/ln/instance bwd, the roller declined to roll
+        # it): emit an EMPTY reduction_loops -- already full-width persistent, and a length-1 list would
+        # fail normalize against the 0-length spec.
+        is_materialized = fact.block_id not in spec.reduction_loops.valid_block_ids()
+        reduction_loops: list[int | None]
+        if is_materialized:
+            reduction_loops = []
+        else:
+            reduction_loops = [None] if persistent else [r_block]
+        block_sizes = cls._build_block_sizes(
+            spec, fact, None, None, non_reduction_loop_ids=non_reduction_loop_ids
+        )
+        # Dual-axis grad-parameter M-collapse (rms/ln/instance/group bwd): the grid M block is re-tiled
+        # by an inner loop and feeds a per-feature grad accumulator finalized across CTAs.
+        # _build_block_sizes floors it to 1 (leaving a grid-wide finalize); size it for occupancy so the
+        # finalize shrinks to ~num_sm partials. Gated on per_feature_accumulator, which is False for the
+        # 9 standard + 8 transfer kernels, so their seeds stay byte-identical.
+        if fact.per_feature_accumulator:
+            # The lever needs the grow-grid / byte-cap-inner decomposition to exist: a non-grid
+            # inner tile bearing residency. per_feature_accumulator implies a device carry loop
+            # (not the grid or rdim) that appears in inner_tile_ids, so an EMPTY inner_tile_ids
+            # means no inner re-tile -- skip the lever and keep the base materialized seed.
+            grid_ids = {b for bids in device_ir.grid_block_ids for b in bids}
+            inner_tile_ids = [
+                b
+                for b in spec.block_sizes.valid_block_ids()
+                if b not in grid_ids
+                and b != fact.block_id
+                and b not in non_reduction_loop_ids
+            ]
+            if inner_tile_ids:
+                # Occupancy-size the grid M block (the dominant lever), byte-cap the inner
+                # re-tile to the feature footprint, and drop the narrow-w1 warps lever: it keys
+                # on rdim extent alone, but the resident tile here is [inner, feature]-wide, so
+                # the plain extent ramp (>=4 warps) is faithful. Only instance_norm is affected.
+                m_cta = cls._m_collapse_grid_block(env, fact)
+                for mbid in fact.m_block_ids:
+                    block_sizes[spec.block_sizes.block_id_to_index(mbid)] = m_cta
+                inner = cls._m_collapse_inner_byte_cap(
+                    max(1, fact.feature_footprint) * max(1, fact.itemsize)
+                )
+                for bid in inner_tile_ids:
+                    block_sizes[spec.block_sizes.block_id_to_index(bid)] = inner
+                num_warps = cls._num_warps(
+                    fact
+                )  # num_sm/grid_rows default 0 -> no narrow-w1
         seed: dict[str, Any] = {
-            "block_sizes": cls._build_block_sizes(
-                spec, fact, None, None, non_reduction_loop_ids=non_reduction_loop_ids
-            ),
+            "block_sizes": block_sizes,
             "reduction_loops": reduction_loops,
             "num_warps": num_warps,
             "num_stages": 1,
@@ -703,23 +848,21 @@ class TritonStandardReductionHeuristic(_TritonReductionSeedBase):
 
 
 class TritonUserTiledReductionHeuristic(_TritonReductionSeedBase):
-    """user-tiled inner-reduction seed: fires on a user-tiled reduction (the user
-    hand-writes the ``hl.tile`` loop over the reduction axis, so the rdim is an ordinary
-    ``block_sizes`` entry, i.e. a user ``hl.tile(n, block_size=R_BLOCK)``), which the
-    upstream gate rejects entirely.
+    """user-tiled inner-reduction seed: fires when the user hand-writes the ``hl.tile`` loop
+    over the reduction axis (so the rdim is an ordinary ``block_sizes`` entry, e.g.
+    ``hl.tile(n, block_size=R_BLOCK)``), which the upstream gate rejects entirely.
     R_BLOCK starts at the shared ``_reduction_rblock`` (M_BLOCK-aware footprint cap), then
     INDEPENDENT band predicates layer on via ``min`` (a kernel gets every cap it matches;
     today's kernels each match exactly one):
 
-    - **plain user-tiled** (softmax_two_pass): no extra cap — persistent full-pow2 R_BLOCK,
+    - **plain user-tiled** (softmax_two_pass): no extra cap -- persistent full-pow2 R_BLOCK,
       standard-style reread-eviction for wide looped rows.
-    - **Band B** (kl_div, jsd): carries ``[M_BLOCK, R_BLOCK]`` 2-D tiles, so a full-N
-      R_BLOCK spills — cap by ``BANDB_R_BLOCK_BYTES / (itemsize * num_carried_2d_tiles)``.
-    - **Band C** (welford, ``non_reduction_loop_block_ids`` non-empty): reduce-then-apply — no
-      combine floor (welford is memory-bound; a wide combine only spills). Its normalize/apply
-      tile starts at the reduction tile and gets the SAME M_BLOCK-aware footprint cap (NOT a
-      flat per-row cap, which needlessly narrowed the memory-bound apply pass); see
-      ``_build_block_sizes``.
+    - **carried 2-D tiles** (kl_div, jsd): carry ``[M_BLOCK, R_BLOCK]`` accumulator tiles
+      across the loop, so R_BLOCK is capped by ``CARRIED_TILE_MAX_BYTES / (itemsize *
+      num_carried_2d_tiles)`` -- folded into the shared ``_reduction_rblock`` decision.
+    - **reduce-then-apply** (welford, ``non_reduction_loop_block_ids`` non-empty): no combine
+      floor. Its normalize/apply tile starts at the reduction tile and gets the SAME
+      M_BLOCK-aware footprint cap; see ``_build_block_sizes``.
 
     TODO(reductions): as more structured families land, promote each band into its own
     fact-keyed ``AutotunerHeuristic`` subclass rather than growing this method.
@@ -748,29 +891,58 @@ class TritonUserTiledReductionHeuristic(_TritonReductionSeedBase):
         non_reduction_loop_ids = set(fact.non_reduction_loop_block_ids)
         m_block = cls._m_block_product(spec, fact)
 
-        # user-tiled: the rdim IS a block_sizes entry (no reduction_loops knob); persistent ==
-        # R_BLOCK >= next_pow2(N). Other axes stay at floor (keeps Band-B M_BLOCK at 1, required
-        # by the u0*u1 <= 2**20 constraint). The band caps are INDEPENDENT predicates composed
-        # by min: the shared lever applies the M_BLOCK-aware footprint cap; the carried-2D cap
-        # (Band B) layers on top. welford (Band C) needs no extra cap — the footprint cap
-        # already keeps its combine tile register-resident (a wider tile only spills).
-        r_block = cls._reduction_rblock(env, fact, m_block)
-        if fact.num_carried_2d_tiles >= 1:
-            # Band B (kl_div, jsd): a carried [M_BLOCK, R_BLOCK] tile spills a full-N R_BLOCK, so
-            # cap the footprint (R_BLOCK * itemsize * n_carried) via _bandb_r_block_cap.
-            r_block = min(r_block, cls._bandb_r_block_cap(fact))
+        # user-tiled: rdim IS a block_sizes entry (no reduction_loops knob); persistent == R_BLOCK >=
+        # next_pow2(N), other axes floored (u0*u1 <= 2**20). The shared lever sizes R_BLOCK from
+        # residency (single-tile footprint + the folded-in carried-2-D cap for kl_div/jsd) and returns
+        # it directly; _persistent is unused on this track.
+        r_block, _persistent = cls._reduction_rblock(env, fact, m_block)
+        # M-COLLAPSE (grad-parameter reduction, e.g. bias_grad/dyt): collapse the grid/row axis into a
+        # per-feature accumulator, sizing the grid CTA for occupancy instead of T2's floored grid.
+        m_collapse_block: int | None = None
+        # Faithful signature: per_feature_accumulator -- a loop-carried accumulator over ALL
+        # the materialized feature axis (bias_grad/dyt); per-row / 2-D accumulators are excluded.
+        is_m_collapse = fact.per_feature_accumulator
+        if is_m_collapse:
+            # (a) grid CTA -> OCCUPANCY (_m_collapse_grid_block), capped at M_COLLAPSE_MAX_CTA since the
+            #     grid block also bears the reduction slab (sum(0) finalize over ~num_sm partials). An
+            #     unbacked/AOT grid (grid_rows == 0) falls through to block 1 -- a worse seed, not a bug.
+            m_collapse_block = cls._m_collapse_grid_block(
+                env, fact, cap=cls.M_COLLAPSE_MAX_CTA
+            )
+            # (b) inner reduction tile: depends on whether the collapse has PER-ROW WORK,
+            #     which ``body_live_tiles`` measures (peak simultaneously-live full-width tiles).
+            if fact.body_live_tiles <= 1:
+                # PURE collapse (bias_grad: read + sum, ONE resident tile): a big inner tile is
+                # cheap and cuts loop overhead, so reduce the whole CTA wave in one slab (bounded
+                # by the grid block + 256 cap).
+                r_block = m_collapse_block
+            else:
+                # Collapse WITH per-row work (dyt: full-width grad_x store + tanh intermediates):
+                # a big inner tile spills, so byte-cap the resident [inner, feature] footprint
+                # tight (~2-8 rows) for occupancy.
+                feat_bytes = max(1, fact.feature_footprint) * max(1, fact.itemsize)
+                inner_cap = cls._m_collapse_inner_byte_cap(feat_bytes)
+                r_block = max(1, min(m_collapse_block, inner_cap))
+
         num_warps = cls._num_warps(
             fact, max(1, get_num_sm(env.device)), _grid_rows(env, fact.m_block_ids)
         )
 
+        block_sizes = cls._build_block_sizes(
+            spec,
+            fact,
+            fact.block_id,
+            r_block,
+            non_reduction_loop_ids=non_reduction_loop_ids,
+        )
+        if m_collapse_block is not None:
+            # Raise the grid CTA tile(s) from the floor to the occupancy block (the reduction
+            # tile was already set to m_collapse_block via r_block above).
+            for mbid in fact.m_block_ids:
+                idx = spec.block_sizes.block_id_to_index(mbid)
+                block_sizes[idx] = m_collapse_block
         seed: dict[str, Any] = {
-            "block_sizes": cls._build_block_sizes(
-                spec,
-                fact,
-                fact.block_id,
-                r_block,
-                non_reduction_loop_ids=non_reduction_loop_ids,
-            ),
+            "block_sizes": block_sizes,
             "num_warps": num_warps,
             "num_stages": 1,
             "pid_type": "flat",  # see the standard branch.
@@ -786,4 +958,130 @@ class TritonUserTiledReductionHeuristic(_TritonReductionSeedBase):
             ev = cls._eviction_policies(env, "reread", fact.reread_eviction_index)
             if ev is not None:
                 seed["load_eviction_policies"] = ev
+        return Config(**seed)
+
+
+class TritonMatmulReductionEpilogueHeuristic(AutotunerHeuristic):
+    """Seed for a fused matmul + reduction-over-output-axis epilogue (matmul_rms_norm /
+    matmul_layernorm / matmul_softmax / matmul_l2_normalize / matmul_sum / ...): a single
+    grid loop over M does an inner K-loop ``addmm`` into a register-resident ``[M_BLOCK, N]``
+    fp32 accumulator, then reduces over the matmul's N (output) axis on that accumulator. N
+    is ``hl.specialize``'d (never tiled), so BOTH the ``[M_BLOCK, N]`` accumulator AND the
+    ``[K_BLOCK, N]`` y-operand tile scale with N -> the kernel is SMEM/register-footprint
+    bound and the win regime is small N (where a productive tile fits).
+
+    Fires on the composed ``MatmulWithReductionEpilogueFact`` (a MatmulFact + an epilogue
+    ReductionFact in one kernel) -- never on a pure matmul or a pure reduction, so those stay
+    byte-identical. This sizes M_BLOCK by the resident fp32-accumulator footprint.
+    """
+
+    name = "triton_matmul_reduction_epilogue"
+    backend = "triton"
+    HARDWARE_TARGETS = (("cuda", "sm90"),)
+
+    # The resident [M_BLOCK, N] fp32 accumulator must fit a per-program byte budget; M_BLOCK is the
+    # largest pow2 under it, capped at MAX_M_BLOCK (an occupancy/register ceiling). ~128 KiB gives
+    # the answer-key tile: M_BLOCK=64 at N<=512, 32 at N=1024, 16 at N=2048 (where the win vanishes).
+    ACC_BUDGET_BYTES = 131072
+    MAX_M_BLOCK = 64
+    # Inner K tile (min 16 by the matmul min_dot_size; normalize clamps to <=K).
+    K_BLOCK = 32
+    # num_stages: pipeline the K-loop addmm (a matmul knob; the answer key uses 3).
+    NUM_STAGES = 3
+    # num_warps ramps with the resident accumulator elements (M_BLOCK * N).
+    NUM_WARPS_ELEM_BREAK = 16384
+    # Staged matmul-operand SMEM budget (sm90/H100 has ~227 KiB/SM). The [K_BLOCK, N]
+    # y-operand x num_stages must fit this; past it the shipped [.,32]/st3 OOMs.
+    # Calibrated to the measured feasibility boundary (KB=32/st3 fits N<=1024 bf16 /
+    # N<=512 fp32; KB=16/st3 fits N<=2048 / N<=1024). The byte-cap (get_seed_config)
+    # drops K_BLOCK 32->16 FIRST -- it halves the staged bytes AND avoids the measured
+    # non-monotonic KB=32 ptxas cliffs -- keeping full stages; only past KB=16/st3 does
+    # it drop num_stages (cliff-free once KB=16).
+    SMEM_STAGED_BUDGET_BYTES = 196608  # 192 KiB
+
+    @classmethod
+    def is_eligible(cls, env: CompileEnvironment, device_ir: DeviceIR) -> bool:
+        if not matches_hardware(env, cls.HARDWARE_TARGETS):
+            return False
+        # Resident-only: fire when the composed fact's N axis is hl.specialize'd
+        # (n_block_id is None). The looped/tiled-N shape is left to the default config.
+        facts = env.config_spec.matmul_reduction_epilogue_facts
+        return len(facts) == 1 and facts[0].matmul.n_block_id is None
+
+    @classmethod
+    def get_seed_config(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> Config | None:
+        if not matches_hardware(env, cls.HARDWARE_TARGETS):
+            return None
+        from ..._utils import prev_power_of_2
+
+        spec = env.config_spec
+        fact = spec.matmul_reduction_epilogue_facts[0]
+        n = max(1, fact.n_extent)
+        # Per-program row ceiling: MAX_M_BLOCK at 2 bytes (bf16/fp16 tensor core),
+        # scaled DOWN as the input dtype widens (fp32 = ~2x regs/elem -> //2 -> 32).
+        # The factor only lowers the ceiling; MAX_M_BLOCK is the hard occupancy cap,
+        # so a 1-byte dtype (fp8) is pinned to it by min(), not pushed above it.
+        input_itemsize = fact.matmul.lhs_dtype.itemsize
+        max_m = max(1, min(cls.MAX_M_BLOCK, cls.MAX_M_BLOCK * 2 // input_itemsize))
+
+        # Resident N (hl.specialize'd, n_block_id is None -- guaranteed by is_eligible):
+        # M_BLOCK = largest pow2 [M_BLOCK, N] fp32 accumulator under the ACC budget, capped
+        # at max_m. The staged [K_BLOCK, N] operand is bounded separately by the SMEM
+        # byte-cap below, which is what sets the feasible-N ceiling.
+        m_block = max(
+            1, min(max_m, prev_power_of_2(max(1, cls.ACC_BUDGET_BYTES // (n * 4))))
+        )
+        num_warps = 4 if m_block * n <= cls.NUM_WARPS_ELEM_BREAK else 8
+
+        # K_BLOCK + num_stages via a priority-ordered footprint byte-cap. The staged
+        # [K_BLOCK, N] y-operand (x num_stages) must fit SMEM; in the shipped small-N
+        # regime [K_BLOCK=32, num_stages=3] fits, but past it (large N) it overflows.
+        # Reduce K_BLOCK 32->16 FIRST -- it halves the staged bytes AND avoids the measured
+        # non-monotonic K_BLOCK=32 ptxas cliffs, while keeping full stages -- then, only if
+        # [16, st=3] still overflows (very large N), drop num_stages (cliff-free once
+        # K_BLOCK=16). This EXTENDS the feasible N (KB=32/st3 to N<=1024 bf16, then KB=16/st3
+        # to N<=2048) instead of OOMing into the bad default; small-N stays byte-identical.
+        k_hint = next(
+            (
+                cast("BlockSizeSpec", spec.block_sizes[i]).size_hint
+                for i in range(len(spec.block_sizes))
+                if cast("BlockSizeSpec", spec.block_sizes[i]).block_id
+                == fact.k_block_id
+            ),
+            cls.K_BLOCK,
+        )
+        k_block = min(cls.K_BLOCK, k_hint)
+        num_stages = cls.NUM_STAGES
+        if num_stages * k_block * n * input_itemsize > cls.SMEM_STAGED_BUDGET_BYTES:
+            k_block = min(k_block, 16)
+            while (
+                num_stages > 1
+                and num_stages * k_block * n * input_itemsize
+                > cls.SMEM_STAGED_BUDGET_BYTES
+            ):
+                num_stages -= 1
+
+        block_sizes: list[int] = []
+        for i in range(len(spec.block_sizes)):
+            bs_spec = cast("BlockSizeSpec", spec.block_sizes[i])
+            bid = bs_spec.block_id
+            if bid == fact.m_block_id:
+                block_sizes.append(max(bs_spec.min_size, m_block))
+            elif bid == fact.k_block_id:
+                block_sizes.append(
+                    max(bs_spec.min_size, min(k_block, bs_spec.size_hint))
+                )
+            else:
+                block_sizes.append(max(1, bs_spec.min_size, bs_spec.autotuner_min))
+
+        seed: dict[str, Any] = {
+            "block_sizes": block_sizes,
+            # The epilogue reduction is materialized on the resident accumulator, so
+            # there is no reduction_loops knob to set.
+            "reduction_loops": [],
+            "num_warps": num_warps,
+            "num_stages": num_stages,
+        }
         return Config(**seed)

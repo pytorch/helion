@@ -1,0 +1,32 @@
+name: Cancel CI on PR close
+
+on:
+  pull_request:
+    types: [closed]
+
+permissions:
+  actions: write
+
+jobs:
+  cancel:
+    # Only cancel for PRs that were closed without merging. Merged PRs delete
+    # their branch and let in-flight runs finish on their own.
+    if: github.event.pull_request.merged == false
+    runs-on: ubuntu-latest
+    steps:
+      - name: Cancel in-progress runs for this PR's branch
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BRANCH: ${{ github.event.pull_request.head.ref }}
+          REPO: ${{ github.repository }}
+        run: |
+          for wf in test.yml lint.yml docs-test.yml; do
+            for status in in_progress queued; do
+              gh run list --repo "$REPO" --workflow "$wf" --branch "$BRANCH" \
+                --status "$status" --json databaseId -q '.[].databaseId' |
+              while read -r id; do
+                echo "Cancelling run $id ($wf, $status)"
+                gh run cancel "$id" --repo "$REPO" || true
+              done
+            done
+          done

@@ -486,6 +486,98 @@ class CuteReductionWideChunkHeuristic(AutotunerHeuristic):
         return Config(**seed)
 
 
+class CuteFlashAttentionHeuristic(AutotunerHeuristic):
+    """Seed ``block_sizes=[1, 128, 128]`` for detected fp16 flash-attention.
+
+    When ``HELION_CUTE_FLASH`` is on (the default), a dense online-softmax
+    attention kernel at [tile_b=1, tile_m=128, tile_n=128], fp16, head_dim in
+    {64, 128} lowers to the fused tcgen05 flash path
+    (``cute_flash.codegen_attention_flash``) -- orders of magnitude faster than
+    the scalar fallback. The flash detector fires at EXACTLY 128x128 tiles, so
+    unless that config is in the autotuner population the fast path is never
+    measured. This seed puts it in generation 0; the search still owns every
+    other knob and benchmarks the seed against the rest, dropping it if the
+    accuracy/compile check ever fails.
+    """
+
+    name = "cute_flash_attention"
+    backend = "cute"
+
+    @classmethod
+    def is_eligible(cls, env: CompileEnvironment, device_ir: DeviceIR) -> bool:
+        return env.config_spec.cute_flash_search_enabled
+
+    @classmethod
+    def get_seed_config(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> Config | None:
+        spec = env.config_spec
+        if not spec.cute_flash_search_enabled:
+            return None
+        from ..cute.cute_flash import flash_attention_seed_config
+
+        assert spec._cute_flash_head_dim is not None
+        return flash_attention_seed_config(
+            spec._cute_flash_head_dim,
+            spec._cute_flash_num_kv,
+            is_causal=spec._cute_flash_is_causal,
+            has_kv_tile_pruning=spec._cute_flash_has_kv_tile_pruning,
+            requires_ws_overlap=spec._cute_flash_requires_ws_overlap,
+            small_biased_candidate=spec._cute_flash_small_biased_candidate,
+            block_size_targets=spec._cute_flash_block_size_target_list(),
+        )
+
+
+class CuteFlashAttentionCausalLptHeuristic(AutotunerHeuristic):
+    """Seed best-known causal hd64 LPT swizzle points for large-token rows."""
+
+    name = "cute_flash_attention_causal_lpt"
+    backend = "cute"
+
+    @classmethod
+    def is_eligible(cls, env: CompileEnvironment, device_ir: DeviceIR) -> bool:
+        from ..cute.cute_flash import flash_attention_seed_config
+
+        spec = env.config_spec
+        if not spec.cute_flash_search_enabled or spec._cute_flash_head_dim is None:
+            return False
+        return (
+            flash_attention_seed_config(
+                spec._cute_flash_head_dim,
+                spec._cute_flash_num_kv,
+                is_causal=spec._cute_flash_is_causal,
+                has_kv_tile_pruning=spec._cute_flash_has_kv_tile_pruning,
+                requires_ws_overlap=spec._cute_flash_requires_ws_overlap,
+                small_biased_candidate=spec._cute_flash_small_biased_candidate,
+                block_size_targets=spec._cute_flash_block_size_target_list(),
+                seed_kind="causal_lpt",
+            )
+            is not None
+        )
+
+    @classmethod
+    def get_seed_config(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> Config | None:
+        if not cls.is_eligible(env, device_ir):
+            return None
+
+        from ..cute.cute_flash import flash_attention_seed_config
+
+        spec = env.config_spec
+        assert spec._cute_flash_head_dim is not None
+        return flash_attention_seed_config(
+            spec._cute_flash_head_dim,
+            spec._cute_flash_num_kv,
+            is_causal=spec._cute_flash_is_causal,
+            has_kv_tile_pruning=spec._cute_flash_has_kv_tile_pruning,
+            requires_ws_overlap=spec._cute_flash_requires_ws_overlap,
+            small_biased_candidate=spec._cute_flash_small_biased_candidate,
+            block_size_targets=spec._cute_flash_block_size_target_list(),
+            seed_kind="causal_lpt",
+        )
+
+
 class CuteTcgen05ClusterM2Heuristic(AutotunerHeuristic):
     name = "cute_tcgen05_cluster_m2"
     backend = "cute"

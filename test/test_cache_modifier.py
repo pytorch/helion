@@ -47,6 +47,32 @@ class TestCacheModifier(RefEagerTestBase, TestCase):
 
     @skipIfRefEager("Config spec inspection not applicable in ref eager mode")
     @skipIfTileIR("tileir backend will ignore `cache_modifier` hint")
+    def test_autotune_store_cache_modifier_registered_for_amd(self):
+        @helion.kernel
+        def kernel_with_stores(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            out0 = torch.empty_like(x)
+            out1 = torch.empty_like(x)
+            for tile in hl.tile(x.size(0)):
+                val = hl.load(x, [tile]) + hl.load(y, [tile])
+                hl.store(out0, [tile], val)
+                hl.store(out1, [tile], val)
+            return out0 + out1
+
+        x = torch.randn([128], device=DEVICE, dtype=torch.float32)
+        y = torch.randn([128], device=DEVICE, dtype=torch.float32)
+
+        with mock.patch(
+            "helion.autotuner.config_spec.supports_amd_cdna_tunables",
+            return_value=True,
+        ):
+            bound_kernel = kernel_with_stores.bind((x, y))
+
+        fragment = bound_kernel.config_spec.store_cache_modifiers
+        self.assertEqual(fragment.length, 2)
+        self.assertEqual(fragment.inner.choices, ("", ".cs", ".wt"))
+
+    @skipIfRefEager("Config spec inspection not applicable in ref eager mode")
+    @skipIfTileIR("tileir backend will ignore `cache_modifier` hint")
     def test_load_cache_modifier_not_registered_without_backend_choices(self):
         @helion.kernel
         def kernel_with_loads(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
@@ -97,6 +123,38 @@ class TestCacheModifier(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result, x + y)
         self.assertIn("cache_modifier", code)
         self.assertIn(".cg", code)
+        self.assertNotIn("cache_modifier=''", code)
+
+    @skipIfTileIR("tileir backend will ignore `cache_modifier` hint")
+    def test_configured_store_cache_modifier_emitted(self):
+        @helion.kernel(
+            config={
+                "block_size": 16,
+                "indexing": "pointer",
+                "store_cache_modifiers": [".cs", ".wt"],
+            }
+        )
+        def kernel_with_configured_store_modifier(x: torch.Tensor) -> torch.Tensor:
+            out0 = torch.empty_like(x)
+            out1 = torch.empty_like(x)
+            for tile in hl.tile(x.size(0)):
+                val = hl.load(x, [tile])
+                hl.store(out0, [tile], val)
+                hl.store(out1, [tile], val)
+            return out0 + out1
+
+        x = torch.randn([128], device=DEVICE, dtype=torch.float32)
+
+        with mock.patch(
+            "helion.autotuner.config_spec.supports_amd_cdna_tunables",
+            return_value=True,
+        ):
+            code, result = code_and_output(kernel_with_configured_store_modifier, (x,))
+
+        torch.testing.assert_close(result, x + x)
+        self.assertIn("cache_modifier", code)
+        self.assertIn(".cs", code)
+        self.assertIn(".wt", code)
         self.assertNotIn("cache_modifier=''", code)
 
     @skipIfTileIR("tileir backend will ignore `cache_modifier` hint")

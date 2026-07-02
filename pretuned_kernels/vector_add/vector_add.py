@@ -2,10 +2,7 @@
 
 from __future__ import annotations
 
-import math
-
 import torch
-import triton.testing as tt
 
 import helion.experimental
 import helion.language as hl
@@ -19,61 +16,53 @@ def vector_add(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     return out
 
 
-def main() -> None:
+def _vector_add_torch(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    return torch.add(x, y)
+
+
+def _baselines() -> list[tuple[str, object]]:
+    """Baselines main() benchmarks against.
+
+    No torch.compile baseline: the reference is a single memory-bandwidth-bound
+    elementwise add, which torch.compile cannot fuse or speed up -- a redundant,
+    not-faster baseline.
+    """
+    return [("torch", _vector_add_torch)]
+
+
+def use_cudagraph() -> bool:
+    """Whether main() benchmarks under CUDA graphs (read by pretuned_kernels/run.py)."""
+    return False
+
+
+def main(verbose: bool = True) -> dict:
+    import os
+    import sys
+
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    from _bench import run_sweep
+
     shapes = [2**i for i in range(19, 29)]
+    baselines = _baselines()
 
-    print(f"GPU: {torch.cuda.get_device_name()}")
-    print(
-        f"{'N':>10s}  {'helion (us)':>12s}  {'torch (us)':>12s}  "
-        f"{'speedup':>8s}  {'winner':>8s}"
-    )
-    print("-" * 60)
-
-    speedups: list[float] = []
-    helion_wins = 0
-    best_speedup = 0.0
-    best_n = 0
-    for n in shapes:
+    def make_calls(n: int) -> tuple:
         x = torch.randn(n, device="cuda", dtype=torch.float32)
         y = torch.randn(n, device="cuda", dtype=torch.float32)
-        vector_add(x, y)  # warmup
-        ms_helion = tt.do_bench(
-            lambda x=x, y=y: vector_add(x, y),
-            warmup=50,
-            rep=200,
-            return_mode="median",
-        )
-        ms_torch = tt.do_bench(
-            lambda x=x, y=y: x + y,
-            warmup=50,
-            rep=200,
-            return_mode="median",
-        )
-        speedup = ms_torch / ms_helion if ms_helion > 0 else float("nan")
-        speedups.append(speedup)
-        winner = "helion" if speedup > 1.0 else "torch" if speedup < 1.0 else "tie"
-        if speedup > 1.0:
-            helion_wins += 1
-        if speedup > best_speedup:
-            best_speedup = speedup
-            best_n = n
-        print(
-            f"{n:>10d}  {ms_helion * 1000:>12.2f}  "
-            f"{ms_torch * 1000:>12.2f}  {speedup:>7.3f}x  {winner:>8s}"
-        )
 
-    geomean = math.exp(
-        sum(math.log(s) for s in speedups if s > 0) / max(len(speedups), 1)
-    )
-    print(
-        f"\nHelion faster on {helion_wins}/{len(shapes)} shapes; "
-        f"geomean speedup {geomean:.3f}x; "
-        f"best speedup {best_speedup:.2f}x at N={best_n}."
-    )
-    # Machine-parseable summary line consumed by test/test_pretuned_kernels.py.
-    print(
-        f"SUMMARY: helion_wins={helion_wins} total={len(shapes)} "
-        f"geomean={geomean:.4f} best_speedup={best_speedup:.4f}"
+        def helion_call() -> torch.Tensor:
+            return vector_add(x, y)
+
+        base_calls = [(name, (lambda fn=fn: fn(x, y))) for name, fn in baselines]
+        return helion_call, base_calls, f"{n:>10d}"
+
+    return run_sweep(
+        shapes,
+        make_calls,
+        use_cudagraph=use_cudagraph(),
+        warmup=50,
+        rep=200,
+        verbose=verbose,
+        shape_header=f"{'N':>10s}",
     )
 
 

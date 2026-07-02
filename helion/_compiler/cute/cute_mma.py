@@ -4860,6 +4860,21 @@ def _emit_mma_pipeline(
                 f"cute.gemm({tiled_mma}, {acc_frag}, {rA}, {rB}, {acc_frag})"
             )
         )
+        # Order this iteration's SMEM reads before the next iteration's
+        # stores into sA / sB. The universal SMEM-load guards funnel the
+        # WRITES through a thin thread slice (``thread_y == 0`` for sA,
+        # ``thread_x == 0`` for sB) while the MmaUniversalOp register copy
+        # above READS the staged tile with every CTA thread. Writer set !=
+        # reader set, spanning multiple warps, so across the barrier-free
+        # K-loop back-edge a thread that finishes its gemm early overwrites
+        # sA / sB while a sibling in another warp is still reading the
+        # current K tile -- a cross-warp write-after-read hazard that yields
+        # nondeterministic wrong values (confirmed via compute-sanitizer
+        # racecheck). The ``warp`` and ``tcgen05`` paths gate both the loads
+        # and the MMA over the same active-thread set (and tcgen05 adds
+        # pipeline/mbarrier ordering), so they never open this cross-warp
+        # window and do not need the barrier here.
+        cg.add_statement(statement_from_string("cute.arch.sync_threads()"))
     else:
         assert mma_active is not None
         if mma_impl == "warp":

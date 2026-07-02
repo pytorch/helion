@@ -960,6 +960,270 @@ def cute_outer_accumulator_out_dtype(
     return resolved_out_dtype
 
 
+@dataclass(frozen=True)
+class CuteFoldLoad:
+    """A matmul operand traced back to a direct memory load.
+
+    The contraction (K) axis is always the load's last dimension and
+    ``free_sizes`` are the symbolic sizes of the load's leading dimensions in
+    storage order. ``scale`` folds in any scalar multipliers seen on the way to
+    the load. A ``permute`` that only swaps the trailing two dims (turning a
+    ``[..., n, k]`` load into the ``[..., k, n]`` view a bmm contracts) is a
+    no-op for the underlying load, so it is accepted and ignored.
+    """
+
+    load_node: torch.fx.Node
+    tensor: torch.Tensor
+    free_sizes: tuple[int | torch.SymInt, ...]
+    k_size: int | torch.SymInt
+    scale: float
+
+
+def _cute_trace_matmul_operand_load(
+    cg: CodegenInterface,
+    node: torch.fx.Node,
+) -> CuteFoldLoad | None:
+    """Trace a matmul operand back to a single direct ``load``.
+
+    Follows ``mul``-by-scalar (scaling), a trailing-dim ``permute`` (the
+    transpose a bmm contracts over), element-type conversions and
+    ``_new_var``/placeholder pass-throughs, crossing subgraph boundaries via
+    ``placeholder_to_outer_arg``. Returns None when the operand is not a simple
+    scaled/transposed direct load whose contraction axis is the load's trailing
+    dimension.
+    """
+    from ...language._tracing_ops import _new_var
+    from ..device_ir import NodeArgsGraphInfo
+
+    def graph_info_for(graph: torch.fx.Graph) -> object | None:
+        for graph_info in getattr(cg, "codegen_graphs", ()):
+            if getattr(graph_info, "graph", None) is graph:
+                return graph_info
+        return None
+
+    scale = 1.0
+    current: object = node
+    seen: set[int] = set()
+    while isinstance(current, torch.fx.Node) and id(current) not in seen:
+        seen.add(id(current))
+        target = current.target
+        if target is load:
+            val = current.meta.get("val")
+            source = current.args[0]
+            source_val = (
+                source.meta.get("val") if isinstance(source, torch.fx.Node) else source
+            )
+            if not isinstance(val, torch.Tensor) or not isinstance(
+                source_val, torch.Tensor
+            ):
+                return None
+            if val.ndim < 2 or val.ndim != source_val.ndim:
+                return None
+            return CuteFoldLoad(
+                load_node=current,
+                tensor=source_val,
+                free_sizes=tuple(val.shape[: val.ndim - 1]),
+                k_size=val.shape[-1],
+                scale=scale,
+            )
+        if target is torch.ops.aten.mul.Tensor and len(current.args) == 2:
+            lhs_arg, rhs_arg = current.args
+            if isinstance(lhs_arg, (int, float)) and isinstance(rhs_arg, torch.fx.Node):
+                scale *= float(lhs_arg)
+                current = rhs_arg
+                continue
+            if isinstance(rhs_arg, (int, float)) and isinstance(lhs_arg, torch.fx.Node):
+                scale *= float(rhs_arg)
+                current = lhs_arg
+                continue
+            return None
+        if target is torch.ops.aten.permute.default and len(current.args) == 2:
+            order = current.args[1]
+            ndim = current.meta["val"].ndim
+            if not isinstance(order, (list, tuple)):
+                return None
+            normalized = [o % ndim for o in order]
+            # Only a trailing-dim swap (the bmm's K/N transpose) leaves the
+            # underlying load's storage order — and thus its trailing K axis —
+            # untouched. Anything else would move the contraction axis.
+            if normalized != [*range(ndim - 2), ndim - 1, ndim - 2]:
+                return None
+            current = current.args[0]
+            continue
+        if target is torch.ops.prims.convert_element_type.default or target is _new_var:
+            current = current.args[0]
+            continue
+        if current.op == "placeholder":
+            graph_info = graph_info_for(current.graph)
+            if isinstance(graph_info, NodeArgsGraphInfo):
+                current = graph_info.placeholder_to_outer_arg(current)
+                continue
+            return None
+        return None
+    return None
+
+
+def cute_synthetic_lane_k_extent(
+    cg: CodegenInterface,
+    k_block_id: int | None,
+) -> int | None:
+    """Return the static K extent when ``k_block_id`` is reduced by a synthetic
+    lane loop (i.e. the K axis is split across a Python lane loop rather than
+    fully mapped to threads).
+
+    A cross-thread warp reduction over such a K only covers the live-thread
+    fraction of K, so a matmul that reduces over it must instead fold the full
+    extent itself (see ``emit_cute_synthetic_lane_fold_mm``).
+    """
+    if k_block_id is None:
+        return None
+    cg_any = cast("Any", cg)
+    loops = cg_any.active_device_loops.get(k_block_id)
+    loop_state = loops[-1] if loops else None
+    strategy = getattr(loop_state, "strategy", None)
+    if strategy is None:
+        return None
+    lane_var = getattr(strategy, "_synthetic_cute_lane_var", None)
+    lane_extent = getattr(strategy, "_synthetic_cute_lane_extent", 1)
+    if lane_var is None or not isinstance(lane_extent, int) or lane_extent <= 1:
+        return None
+    env = CompileEnvironment.current()
+    numel = env.block_sizes[k_block_id].numel
+    return _cute_static_int_extent(numel)
+
+
+def emit_cute_synthetic_lane_fold_mm(
+    ctx: LoweringContext,
+    lhs_node: torch.fx.Node,
+    rhs_node: torch.fx.Node,
+    *,
+    k_extent: int,
+    acc: ast.AST | None,
+    out_dtype: torch.dtype | None,
+    acc_dtype: torch.dtype | None,
+    lhs_dtype: torch.dtype,
+    rhs_dtype: torch.dtype,
+) -> ast.AST | None:
+    """Lower a matmul whose K axis is reduced by a synthetic lane loop.
+
+    The default cute scalar fallback reduces the matmul's K across live threads
+    only; when K is split into a wrapping per-thread lane loop that warp
+    reduction silently drops every lane but the current one. Instead emit a
+    self-contained serial loop over the full K extent that re-reads both
+    operands directly from their tensors, so each (free-dim) thread computes the
+    complete dot product. Returns None when either operand is not a simple
+    scaled/transposed direct load that can be re-read this way.
+    """
+    cg = ctx.cg
+    lhs_fold = _cute_trace_matmul_operand_load(cg, lhs_node)
+    rhs_fold = _cute_trace_matmul_operand_load(cg, rhs_node)
+    if lhs_fold is None or rhs_fold is None:
+        return None
+    if _cute_static_int_extent(lhs_fold.k_size) != k_extent:
+        return None
+    if _cute_static_int_extent(rhs_fold.k_size) != k_extent:
+        return None
+
+    def free_index_and_mask(
+        fold: CuteFoldLoad,
+    ) -> tuple[list[str], list[str]] | None:
+        indices: list[str] = []
+        masks: list[str] = []
+        for size in fold.free_sizes:
+            block_id = cute_resolve_active_block_id(cg, size)
+            if block_id is None:
+                return None
+            index_var = _cute_active_index_var(cg, block_id)
+            if index_var is None:
+                return None
+            indices.append(index_var)
+            mask_var = _cute_active_mask_var(cg, block_id)
+            if mask_var is not None:
+                masks.append(mask_var)
+        return indices, masks
+
+    lhs_indexed = free_index_and_mask(lhs_fold)
+    rhs_indexed = free_index_and_mask(rhs_fold)
+    if lhs_indexed is None or rhs_indexed is None:
+        return None
+    lhs_indices, lhs_masks = lhs_indexed
+    rhs_indices, rhs_masks = rhs_indexed
+
+    backend = CompileEnvironment.current().backend
+    reduction_dtype = acc_dtype or out_dtype or torch.float32
+    if _needs_f32_accumulator(lhs_dtype, rhs_dtype):
+        reduction_dtype = torch.float32
+    k_var = cg.device_function.new_var("mm_fold_k", dce=False)
+
+    def load_expr(fold: CuteFoldLoad, indices: list[str]) -> str:
+        tensor_name = cg.device_function.tensor_arg(fold.tensor).name
+        terms = [f"{tensor_name}.iterator"]
+        ndim = fold.tensor.ndim
+        for index_var, dim in zip(indices, range(ndim - 1), strict=True):
+            terms.append(
+                f"cutlass.Int32({index_var}) "
+                f"* cutlass.Int32({tensor_name}.layout.stride[{dim}])"
+            )
+        terms.append(
+            f"cutlass.Int32({k_var}) "
+            f"* cutlass.Int32({tensor_name}.layout.stride[{ndim - 1}])"
+        )
+        return "(" + " + ".join(terms) + ").load()"
+
+    lhs_load = load_expr(lhs_fold, lhs_indices)
+    rhs_load = load_expr(rhs_fold, rhs_indices)
+    fold_scale = lhs_fold.scale * rhs_fold.scale
+    reduction_str = backend.dtype_str(reduction_dtype)
+    term = f"{reduction_str}({lhs_load}) * {reduction_str}({rhs_load})"
+    if fold_scale != 1.0:
+        term = f"{term} * {reduction_str}({fold_scale!r})"
+    mask_vars = list(dict.fromkeys([*lhs_masks, *rhs_masks]))
+    acc_var = cg.device_function.new_var("mm_fold_acc")
+    cg.add_statement(f"{acc_var} = {reduction_str}(0.0)")
+    body = f"{acc_var} = {acc_var} + {term}"
+    if mask_vars:
+        guard = " and ".join(mask_vars)
+        loop = f"for {k_var} in range({k_extent}):\n    if {guard}:\n        {body}"
+    else:
+        loop = f"for {k_var} in range({k_extent}):\n    {body}"
+    cg.add_statement(statement_from_string(loop))
+
+    result: ast.AST = expr_from_string(acc_var)
+    if acc is not None:
+        base = acc
+        if acc_dtype is not None and acc_dtype != reduction_dtype:
+            base = cast_ast(base, reduction_dtype)
+        result = expr_from_string("{acc} + {prod}", acc=base, prod=result)
+        final_dtype = acc_dtype
+    else:
+        final_dtype = out_dtype
+    if final_dtype is not None and final_dtype != reduction_dtype:
+        result = cast_ast(result, final_dtype)
+    return result
+
+
+def _cute_active_index_var(cg: CodegenInterface, block_id: int) -> str | None:
+    cg_any = cast("Any", cg)
+    loops = cg_any.active_device_loops.get(block_id)
+    if loops:
+        return loops[-1].strategy.index_var(block_id)
+    grid_state = cg_any.current_grid_state
+    if grid_state is not None and block_id in grid_state.block_ids:
+        return grid_state.strategy.index_var(block_id)
+    return None
+
+
+def _cute_active_mask_var(cg: CodegenInterface, block_id: int) -> str | None:
+    cg_any = cast("Any", cg)
+    loops = cg_any.active_device_loops.get(block_id)
+    if loops:
+        return loops[-1].strategy.mask_var(block_id)
+    grid_state = cg_any.current_grid_state
+    if grid_state is not None and block_id in grid_state.block_ids:
+        return grid_state.strategy.mask_var(block_id)
+    return None
+
+
 def cute_lower_rhs_for_matmul(
     env: Mapping[torch.fx.Node, object],
     lhs: ast.AST | CutePackedAffineLoad,

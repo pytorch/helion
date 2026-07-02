@@ -57,6 +57,10 @@ _PROVIDER_ALIASES = {
     "bedrock": "bedrock",
     "aws_bedrock": "bedrock",
     "aws-bedrock": "bedrock",
+    "vertex": "vertex",
+    "vertex_anthropic": "vertex",
+    "vertex-anthropic": "vertex",
+    "google_vertex": "vertex",
 }
 
 
@@ -67,7 +71,7 @@ def normalize_provider(provider: str) -> str:
         return resolved
     raise ValueError(
         f"Unsupported LLM provider {provider!r}. "
-        "Valid providers are: anthropic, openai, openai_responses, bedrock."
+        "Valid providers are: anthropic, openai, openai_responses, bedrock, vertex."
     )
 
 
@@ -76,12 +80,13 @@ def infer_provider(model: str, provider: str | None = None) -> str:
     if provider is not None:
         return normalize_provider(provider)
     normalized = model.lower()
-    # Bedrock must be opted into explicitly with a `bedrock/` prefix (e.g.
-    # `bedrock/us.anthropic.claude-sonnet-4-6`), or via HELION_LLM_PROVIDER=bedrock.
-    # A bare region-prefixed id like `us.anthropic.claude-...` is NOT auto-routed
-    # to Bedrock, since the same model string can be served by the direct API.
+    # Bedrock and Vertex serve the same Anthropic model ids as the direct API, so
+    # they must be opted into explicitly with a `bedrock/` / `vertex/` prefix
+    # (e.g. `vertex/claude-sonnet-4-5`) or via HELION_LLM_PROVIDER.
     if normalized.startswith("bedrock/"):
         return "bedrock"
+    if normalized.startswith("vertex/"):
+        return "vertex"
     if normalized.startswith(("claude", "anthropic/")):
         return "anthropic"
     if normalized.startswith(
@@ -93,7 +98,7 @@ def infer_provider(model: str, provider: str | None = None) -> str:
 
 def strip_provider_prefix(model: str) -> str:
     """Remove a provider prefix before sending the model name to the API."""
-    for prefix in ("anthropic/", "openai/", "bedrock/"):
+    for prefix in ("anthropic/", "openai/", "bedrock/", "vertex/"):
         if model.startswith(prefix):
             return model.removeprefix(prefix)
     return model
@@ -523,6 +528,29 @@ def _load_json_response(
         return json.load(response)
 
 
+def _extra_headers() -> dict[str, str]:
+    """Optional extra HTTP headers for gateways/proxies that require them.
+
+    Read from ``HELION_LLM_EXTRA_HEADERS`` as either a JSON object
+    (``{"X-Header": "value"}``) or newline-separated ``Header: value`` lines.
+    Useful when an API-compatible gateway needs custom routing/identity headers
+    on top of the standard auth headers.
+    """
+    raw = os.environ.get("HELION_LLM_EXTRA_HEADERS")
+    if not raw:
+        return {}
+    raw = raw.strip()
+    if raw.startswith("{"):
+        parsed = json.loads(raw)
+        return {str(k): str(v) for k, v in parsed.items()}
+    headers: dict[str, str] = {}
+    for line in raw.splitlines():
+        if ":" in line:
+            name, value = line.split(":", 1)
+            headers[name.strip()] = value.strip()
+    return headers
+
+
 def _post_json(
     url: str,
     payload: dict[str, Any],
@@ -534,7 +562,7 @@ def _post_json(
     request = urllib_request.Request(
         url=url,
         data=json.dumps(payload).encode("utf-8"),
-        headers=headers,
+        headers={**headers, **_extra_headers()},
         method="POST",
     )
     try:
@@ -634,6 +662,88 @@ def _call_bedrock(
     return extract_anthropic_text(body)
 
 
+# Anthropic-on-Vertex-AI names the model in the URL (not the body) and requires
+# this version string in the request body, mirroring the Bedrock convention.
+_VERTEX_ANTHROPIC_VERSION = "vertex-2023-10-16"
+_DEFAULT_VERTEX_LOCATION = "global"
+
+
+def _call_vertex(
+    *,
+    model: str,
+    api_base: str | None,
+    api_key: str | None,
+    messages: list[dict[str, str]],
+    max_output_tokens: int,
+    request_timeout_s: float,
+    effort_level: str | None,
+    fast_mode: bool,
+) -> str:
+    """Invoke Anthropic-on-Vertex-AI over HTTPS, reusing the Anthropic codecs.
+
+    Vertex AI hosts Anthropic models under the publisher ``rawPredict`` endpoint.
+    The request body is the same Anthropic Messages payload used by the direct
+    API, but the model is named in the URL (not the body) and a Vertex
+    ``anthropic_version`` replaces it. Auth is carried by the SSL context (mTLS)
+    and/or an ``Authorization: Bearer`` token, so an API key is optional --
+    useful behind a gateway that authenticates the caller by client identity.
+
+    Configure with ``HELION_LLM_PROVIDER=vertex``, ``HELION_LLM_API_BASE`` (the
+    endpoint base), ``HELION_LLM_VERTEX_PROJECT`` (project id), and optionally
+    ``HELION_LLM_VERTEX_LOCATION`` (default ``global``). Each falls back to the
+    standard Anthropic-on-Vertex SDK variable when its helion-specific knob is
+    unset: ``ANTHROPIC_VERTEX_BASE_URL``, ``ANTHROPIC_VERTEX_PROJECT_ID``, and
+    ``CLOUD_ML_REGION`` respectively -- so an environment already set up for
+    Anthropic-on-Vertex needs only ``HELION_LLM_PROVIDER=vertex`` and a model.
+
+    Request/response format follows the Anthropic-on-Vertex reference:
+    https://docs.anthropic.com/en/api/claude-on-vertex-ai
+    """
+    # Resolve endpoint/project/location from helion's own knobs first, then fall
+    # back to the standard Anthropic-on-Vertex SDK variables so an environment
+    # already configured for Anthropic-on-Vertex works without extra setup.
+    base = (
+        api_base
+        or os.environ.get("HELION_LLM_API_BASE")
+        or os.environ.get("ANTHROPIC_VERTEX_BASE_URL")
+    )
+    if not base:
+        raise RuntimeError(
+            "Vertex provider requires the endpoint base URL via api_base, "
+            "HELION_LLM_API_BASE, or ANTHROPIC_VERTEX_BASE_URL."
+        )
+    project = os.environ.get("HELION_LLM_VERTEX_PROJECT") or os.environ.get(
+        "ANTHROPIC_VERTEX_PROJECT_ID"
+    )
+    if not project:
+        raise RuntimeError(
+            "Vertex provider requires the project id via "
+            "HELION_LLM_VERTEX_PROJECT or ANTHROPIC_VERTEX_PROJECT_ID."
+        )
+    location = (
+        os.environ.get("HELION_LLM_VERTEX_LOCATION")
+        or os.environ.get("CLOUD_ML_REGION")
+        or _DEFAULT_VERTEX_LOCATION
+    )
+    named_model = strip_provider_prefix(model)
+    url = (
+        f"{base.rstrip('/')}/projects/{project}/locations/{location}"
+        f"/publishers/anthropic/models/{named_model}:rawPredict"
+    )
+    payload = _anthropic_payload(
+        model, messages, max_output_tokens, effort_level, fast_mode
+    )
+    # The model is in the URL on Vertex; the body carries the version instead.
+    payload.pop("model", None)
+    payload["anthropic_version"] = _VERTEX_ANTHROPIC_VERSION
+    headers = {"content-type": "application/json"}
+    key = api_key or os.environ.get("HELION_LLM_API_KEY")
+    if key:
+        headers["Authorization"] = f"Bearer {key}"
+    response = _post_json(url, payload, headers, request_timeout_s=request_timeout_s)
+    return extract_anthropic_text(response)
+
+
 def call_provider(
     provider: str,
     *,
@@ -648,6 +758,19 @@ def call_provider(
 ) -> str:
     """Resolve credentials, send one request, and extract text from the response."""
     normalized_provider = normalize_provider(provider)
+    if normalized_provider == "vertex":
+        # Vertex names the model in the URL and authenticates by SSL/bearer, so
+        # it bypasses the api-key-required _ProviderConfig path (like Bedrock).
+        return _call_vertex(
+            model=model,
+            api_base=api_base,
+            api_key=api_key,
+            messages=messages,
+            max_output_tokens=max_output_tokens,
+            request_timeout_s=request_timeout_s,
+            effort_level=effort_level,
+            fast_mode=fast_mode,
+        )
     if normalized_provider == "bedrock":
         # Bedrock uses boto3/SigV4 instead of an HTTP+api-key transport, so it
         # bypasses the _ProviderConfig path entirely.

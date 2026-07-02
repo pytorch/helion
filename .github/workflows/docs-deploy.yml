@@ -60,11 +60,21 @@ jobs:
             --existing-url https://helionlang.com/dashboard/dashboard-data.json \
             --output ./dashboard-data.json
 
+      - name: Build pretuned dashboard data
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          python3 .github/dashboard/build_pretuned_dashboard_data.py \
+            --repo ${{ github.repository }} \
+            --existing-url https://helionlang.com/dashboard/pretuned-dashboard-data.json \
+            --output ./pretuned-dashboard-data.json
+
       - name: Add dashboard to site
         run: |
           mkdir -p ./site/dashboard
           cp .github/dashboard/index.html ./site/dashboard/index.html
           cp ./dashboard-data.json ./site/dashboard/dashboard-data.json
+          cp ./pretuned-dashboard-data.json ./site/dashboard/pretuned-dashboard-data.json
 
       - name: Upload artifact
         uses: actions/upload-pages-artifact@v5

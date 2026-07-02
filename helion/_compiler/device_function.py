@@ -51,6 +51,7 @@ if TYPE_CHECKING:
     from .indexing_strategy import IndexingStrategy
     from .program_id import ProgramIDs
     from helion._compiler.pallas.ordered_carry import CarryBoundaryTile
+    from helion._compiler.pallas.ordered_carry import CarryScratchKey
     from helion._compiler.pallas.plan_tiling import DimensionTiling
 
     _P = TypeVar("_P", bound="TensorPropertyArg")
@@ -323,6 +324,7 @@ class DeviceFunction:
         self.device_load_index = 0
         self.device_load_cache_modifier_index = 0
         self.device_store_index = 0
+        self.device_store_cache_modifier_index = 0
         # Single counter for both loads and stores for indexing assignment
         self.device_memory_op_index = 0
         self.epilogue_subtile_store_indices: dict[str, int] = {}
@@ -347,8 +349,10 @@ class DeviceFunction:
         # the emit_pipeline codegen when the tile is a legal map axis; read by
         # the store codegen to stitch the boundary across neighbouring groups.
         self.carry_tiles: dict[int, CarryBoundaryTile] = {}
-        # row block_id -> carry scratch var name (allocated lazily at the store).
-        self.carry_scratch: dict[int, str] = {}
+        # CarryScratchKey(row block_id, output name) -> carry scratch var name.
+        # One scratch per output buffer (a tile may feed several stores),
+        # allocated at the store.
+        self.carry_scratch: dict[CarryScratchKey, str] = {}
 
     def allocate_store_index(self) -> int:
         """Bump store counters and return the indexing strategy slot."""

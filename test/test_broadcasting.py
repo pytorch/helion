@@ -161,6 +161,90 @@ class TestBroadcasting(RefEagerTestBase, TestCase):
         code, out = code_and_output(fn, args, block_sizes=[16, 16])
         torch.testing.assert_close(out, expected)
 
+    @skipIfRefEager("ref-eager does not support non-last-dim implicit broadcast")
+    def test_implicit_broadcast_first_dim(self):
+        """b[tile0] in a 2D tile should broadcast as b[:, None]."""
+
+        @helion.kernel
+        def fn(a, b):
+            out = torch.empty_like(a)
+            for tile0, tile1 in hl.tile(a.size()):
+                out[tile0, tile1] = a[tile0, tile1] + b[tile0]
+            return out
+
+        args = (torch.randn(512, 512, device=DEVICE), torch.randn(512, device=DEVICE))
+        code, out = code_and_output(fn, args, block_sizes=[16, 16])
+        torch.testing.assert_close(out, args[0] + args[1][:, None])
+
+    @skipIfRefEager("ref-eager does not support non-last-dim implicit broadcast")
+    def test_implicit_broadcast_both_dims(self):
+        """row_bias[tile0] + col_scale[tile1] in same expression."""
+
+        @helion.kernel
+        def fn(a, row_bias, col_scale):
+            out = torch.empty_like(a)
+            for tile0, tile1 in hl.tile(a.size()):
+                out[tile0, tile1] = a[tile0, tile1] * col_scale[tile1] + row_bias[tile0]
+            return out
+
+        a = torch.randn(128, 256, device=DEVICE)
+        row_bias = torch.randn(128, device=DEVICE)
+        col_scale = torch.randn(256, device=DEVICE)
+        code, out = code_and_output(fn, (a, row_bias, col_scale), block_sizes=[64, 64])
+        torch.testing.assert_close(out, a * col_scale + row_bias[:, None])
+
+    @skipIfRefEager("ref-eager does not support non-last-dim implicit broadcast")
+    def test_implicit_broadcast_3d_middle_dim(self):
+        """b[tile1] in 3D tile should broadcast along the middle dimension."""
+
+        @helion.kernel
+        def fn(a, b):
+            out = torch.empty_like(a)
+            for tile0, tile1, tile2 in hl.tile(a.size()):
+                out[tile0, tile1, tile2] = a[tile0, tile1, tile2] + b[tile1]
+            return out
+
+        a = torch.randn(4, 32, 32, device=DEVICE)
+        b = torch.randn(32, device=DEVICE)
+        code, out = code_and_output(fn, (a, b), block_sizes=[4, 32, 32])
+        torch.testing.assert_close(out, a + b[None, :, None])
+
+    @skipIfRefEager("ref-eager does not support non-last-dim implicit broadcast")
+    @xfailIfPallas("scatter: only indirect dim 0 is supported")
+    def test_implicit_broadcast_mixed_tile_and_slice(self):
+        """b[tile0, 0:K] broadcast into a[tile0, tile1, 0:K]."""
+
+        @helion.kernel
+        def fn(a, b):
+            k = a.size(2)
+            out = torch.empty_like(a)
+            for tile0, tile1 in hl.tile([a.size(0), a.size(1)]):
+                out[tile0, tile1, 0:k] = a[tile0, tile1, 0:k] + b[tile0, 0:k]
+            return out
+
+        a = torch.randn(8, 16, 2, device=DEVICE)
+        b = torch.randn(8, 4, device=DEVICE)
+        code, out = code_and_output(fn, (a, b), block_sizes=[8, 16])
+        torch.testing.assert_close(out, a + b[:, 0:2].unsqueeze(1))
+
+    @skipIfRefEager("ref-eager does not support non-last-dim implicit broadcast")
+    def test_expand_as_first_dim(self):
+        """scale[tile0].expand_as(a) exercises codegen_expand path."""
+
+        @helion.kernel
+        def fn(a, scale):
+            out = torch.empty_like(a)
+            for tile0, tile1 in hl.tile(a.size()):
+                loaded = a[tile0, tile1]
+                s = scale[tile0].expand_as(loaded)
+                out[tile0, tile1] = loaded * s
+            return out
+
+        a = torch.randn(256, 128, device=DEVICE)
+        scale = torch.randn(256, device=DEVICE)
+        code, out = code_and_output(fn, (a, scale), block_sizes=[64, 64])
+        torch.testing.assert_close(out, a * scale[:, None])
+
 
 if __name__ == "__main__":
     unittest.main()

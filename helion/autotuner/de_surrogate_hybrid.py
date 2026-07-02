@@ -191,6 +191,7 @@ class DESurrogateHybrid(DifferentialEvolutionSearch):
         self.log(f"Total evaluations: {len(self.all_observations)}")
         self.log("=" * 70)
 
+        best = self.final_rebenchmark_best(best)
         best = self.run_finishing_phase(best, self.finishing_rounds)
         return best.config
 

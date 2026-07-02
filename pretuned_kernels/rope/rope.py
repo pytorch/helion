@@ -2,13 +2,10 @@
 
 from __future__ import annotations
 
-import math
 from typing import Any
 from typing import Callable
-from typing import cast
 
 import torch
-import triton.testing as tt
 
 import helion.experimental
 import helion.language as hl
@@ -264,7 +261,30 @@ def _make_inputs(
     return q, k, torch.cos(angles), torch.sin(angles)
 
 
-def main() -> None:
+def _baselines() -> list[tuple[str, object]]:
+    """Baselines main() benchmarks against.
+
+    ``torch_compile`` is ``torch.compile`` of the torch reference -- a
+    speedup-comparison baseline only (not checked for accuracy).
+    """
+    return [
+        ("torch", rope_pytorch),
+        ("torch_compile", torch.compile(rope_pytorch)),
+    ]
+
+
+def use_cudagraph() -> bool:
+    """Whether main() benchmarks under CUDA graphs (read by pretuned_kernels/run.py)."""
+    return False
+
+
+def main(verbose: bool = True) -> dict:
+    import os
+    import sys
+
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    from _bench import run_sweep
+
     shapes = [
         (8192, 1024),
         (8192, 2048),
@@ -274,60 +294,26 @@ def main() -> None:
         (512, 2048),
         (2048, 2048),
     ]
+    baselines = _baselines()
 
-    print(f"GPU: {torch.cuda.get_device_name()}")
-    print(
-        f"{'H':>6s}  {'T':>6s}  {'helion (us)':>12s}  "
-        f"{'torch (us)':>12s}  {'speedup':>8s}"
-    )
-    print("-" * 60)
-
-    speedups: list[float] = []
-    helion_wins = 0
-    best_speedup = 0.0
-    best_shape = (0, 0)
-    for hidden_size, seq_length in shapes:
+    def make_calls(shape: tuple[int, int]) -> tuple:
+        hidden_size, seq_length = shape
         q, k, cos, sin = _make_inputs(hidden_size, seq_length)
-        rope(q, k, cos, sin)
-        ms_helion = cast(
-            "float",
-            tt.do_bench(
-                lambda q=q, k=k, cos=cos, sin=sin: rope(q, k, cos, sin),
-                warmup=25,
-                rep=100,
-            ),
-        )
-        ms_torch = cast(
-            "float",
-            tt.do_bench(
-                lambda q=q, k=k, cos=cos, sin=sin: rope_pytorch(q, k, cos, sin),
-                warmup=25,
-                rep=100,
-            ),
-        )
-        speedup = ms_torch / ms_helion if ms_helion > 0 else float("nan")
-        speedups.append(speedup)
-        if speedup > 1.0:
-            helion_wins += 1
-        if speedup > best_speedup:
-            best_speedup = speedup
-            best_shape = (hidden_size, seq_length)
-        print(
-            f"{hidden_size:>6d}  {seq_length:>6d}  {ms_helion * 1000:>12.2f}  "
-            f"{ms_torch * 1000:>12.2f}  {speedup:>7.2f}x"
-        )
 
-    geomean = math.exp(
-        sum(math.log(s) for s in speedups if s > 0) / max(len(speedups), 1)
-    )
-    print(
-        f"\nHelion faster on {helion_wins}/{len(shapes)} shapes; "
-        f"geomean speedup {geomean:.3f}x; "
-        f"best speedup {best_speedup:.2f}x at (H, T)={best_shape}."
-    )
-    print(
-        f"SUMMARY: helion_wins={helion_wins} total={len(shapes)} "
-        f"geomean={geomean:.4f} best_speedup={best_speedup:.4f}"
+        def helion_call() -> tuple[torch.Tensor, torch.Tensor]:
+            return rope(q, k, cos, sin)
+
+        base_calls = [
+            (name, (lambda fn=fn: fn(q, k, cos, sin))) for name, fn in baselines
+        ]
+        return helion_call, base_calls, f"{hidden_size:>6d}  {seq_length:>6d}"
+
+    return run_sweep(
+        shapes,
+        make_calls,
+        use_cudagraph=use_cudagraph(),
+        verbose=verbose,
+        shape_header=f"{'H':>6s}  {'T':>6s}",
     )
 
 

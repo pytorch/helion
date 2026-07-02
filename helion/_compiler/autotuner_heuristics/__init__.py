@@ -4,6 +4,8 @@ import logging
 from typing import TYPE_CHECKING
 
 from .common import dedupe_configs
+from .cute import CuteFlashAttentionCausalLptHeuristic
+from .cute import CuteFlashAttentionHeuristic
 from .cute import CuteFp8GemmSkinnyMHeuristic
 from .cute import CuteReductionTileHeuristic
 from .cute import CuteReductionWideChunkHeuristic
@@ -15,6 +17,7 @@ from .cute import CuteTileVecWarpReduceHeuristic
 from .pallas import PallasMatmulF32NoTilingSeedHeuristic
 from .pallas import PallasMatmulNoTilingSeedHeuristic
 from .triton import TritonB200MatmulHeuristic
+from .triton import TritonMatmulReductionEpilogueHeuristic
 from .triton import TritonSkinnyGemmHeuristic
 from .triton import TritonSplitJoinRotateHeuristic
 from .triton import TritonStandardReductionHeuristic
@@ -30,6 +33,8 @@ if TYPE_CHECKING:
 HEURISTICS_BY_BACKEND: dict[str, tuple[AutotunerHeuristicType, ...]] = {
     "cute": (
         CuteFp8GemmSkinnyMHeuristic,
+        CuteFlashAttentionHeuristic,
+        CuteFlashAttentionCausalLptHeuristic,
         CuteTcgen05ClusterM2FfiHeuristic,
         CuteTcgen05ClusterM2Heuristic,
         CuteReductionTileHeuristic,
@@ -41,6 +46,7 @@ HEURISTICS_BY_BACKEND: dict[str, tuple[AutotunerHeuristicType, ...]] = {
     "triton": (
         TritonSkinnyGemmHeuristic,
         TritonB200MatmulHeuristic,
+        TritonMatmulReductionEpilogueHeuristic,
         TritonSplitJoinRotateHeuristic,
         TritonStandardReductionHeuristic,
         TritonUserTiledReductionHeuristic,
