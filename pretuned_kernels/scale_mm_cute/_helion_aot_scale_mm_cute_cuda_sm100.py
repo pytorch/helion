@@ -18,8 +18,12 @@ across the CTA pair (halving its cold DRAM read), lifting 512x2048x4096 from
 
 The four M=64 shapes were added via ncu-seeded autotune (from_best_available,
 cudagraph). With one M-tile the grid == the N-tile count, so a cluster_m=1 bm=64
-tile with a small N tile (device-filling) plus deep A/B prefetch is 2.4-3.4x
-faster than the nearest-neighbor 512-M fallback (0.24-0.41x -> 0.82-0.89x).
+tile with a small N tile (device-filling) beats the nearest-neighbor 512-M
+fallback (0.24-0.41x) by ~2.4-3.4x. These shapes are latency-bound on the
+per-K-step pipeline handshake (not the epilogue -- verified by ncu), so a deep
+bk=256 K-tile that halves the K-loop step count lifts the narrow-N shapes to
+0.96-0.97x vs cutlass. The wide-N (12288) shape keeps bk=128 because bn=128
+leaves no SMEM for a deep pipeline at bk=256.
 
 Each tuned (M, K, N) maps to its own config; an unseen shape falls back to the
 nearest tuned (M, K, N) (smallest sum of absolute log-ratios over M, K, N).
@@ -105,21 +109,28 @@ _CONFIGS_scale_mm_cute = [
     # cluster_m=2 + A-multicast + deep ab=12 beats the old cluster_m=1 bn=64 tile.
     # Cold-L2 cudagraph vs best baseline (torch): 0.86x -> 0.91x on B200.
     {'block_sizes': [128, 128, 128], 'l2_groupings': [1], 'num_warps': 8, 'num_stages': 4, 'indexing': ['tensor_descriptor', 'tensor_descriptor', 'tensor_descriptor', 'tensor_descriptor', 'tensor_descriptor'], 'pid_type': 'persistent_interleaved', 'tcgen05_cluster_m': 2, 'tcgen05_cluster_n': 1, 'tcgen05_acc_stages': 2, 'tcgen05_c_stages': 2, 'tcgen05_ab_stages': 12, 'tcgen05_num_epi_warps': 4, 'tcgen05_persistence_model': 'static_persistent'},
-    # M=64 decode / small-batch shapes (ncu-guided seed + HELION_AUTOTUNER_INITIAL_
-    # POPULATION=from_best_available search, cudagraph). With M=64 there is only one
-    # M-tile, so the N-tile count == the grid: the cluster_m=2 512-M configs (bm>=128)
-    # waste most of the tile and run the device at ~0.2 waves (nearest-neighbor
-    # fallback measured 0.24-0.41x). A cluster_m=1 bm=64 tile with a SMALL N tile
-    # (bn=16/32/128 so N/bn tiles fill the 148-SM B200) and a deep ab prefetch is
-    # ~2.4-3.4x faster than that fallback. Cold-L2 cudagraph vs best baseline below.
-    # (M, K, N) = (64, 2048, 4096) -- bn=32 (128 tiles ~= 0.87 waves); 0.88x vs cutlass.
-    {'block_sizes': [64, 32, 128], 'l2_groupings': [1], 'indexing': ['tensor_descriptor', 'pointer', 'tensor_descriptor', 'pointer', 'tensor_descriptor'], 'pid_type': 'flat', 'tcgen05_cluster_m': 1, 'tcgen05_cluster_n': 1, 'tcgen05_ab_stages': 10, 'tcgen05_acc_stages': 2, 'tcgen05_c_stages': 4, 'tcgen05_num_epi_warps': 4, 'tcgen05_l2_swizzle_size': 1, 'tcgen05_persistence_model': 'non_persistent'},
-    # (M, K, N) = (64, 2048, 2048) -- bn=16 (128 tiles) + scheduler role; 0.89x vs cutlass.
-    {'block_sizes': [64, 16, 128], 'l2_groupings': [1], 'indexing': ['tensor_descriptor', 'pointer', 'pointer', 'tensor_descriptor', 'tensor_descriptor'], 'pid_type': 'flat', 'tcgen05_cluster_m': 1, 'tcgen05_cluster_n': 1, 'tcgen05_ab_stages': 11, 'tcgen05_acc_stages': 2, 'tcgen05_c_stages': 4, 'tcgen05_num_epi_warps': 4, 'tcgen05_l2_swizzle_size': 1, 'tcgen05_strategy': 'role_local_with_scheduler', 'tcgen05_warp_spec_scheduler_warps': 1, 'tcgen05_persistence_model': 'non_persistent'},
-    # (M, K, N) = (64, 2048, 12288) -- wide N already fills the device, so bn=128; 0.82x vs cutlass.
+    # M=64 decode / small-batch shapes. With M=64 there is only one M-tile, so the
+    # N-tile count == the grid: the cluster_m=2 512-M configs (bm>=128) waste most of
+    # the tile and run the device at ~0.2 waves (nearest-neighbor fallback measured
+    # 0.24-0.41x). A cluster_m=1 bm=64 tile with a SMALL N tile (bn=16/32 so N/bn
+    # tiles fill the 148-SM B200) beats that fallback by ~2.4-3.4x.
+    #
+    # These are latency-bound (~0.86 waves, tensor pipe <5%): the dominant cost is
+    # the per-K-step producer/consumer pipeline handshake, NOT the epilogue (ncu:
+    # ~120 barrier-stall samples, unchanged when epilogue barriers are removed).
+    # A DEEP K tile (bk=256) halves the K-loop step count (K/bk) and so halves those
+    # handshakes -- the single biggest lever here, lifting 0.88x -> 0.97x. bk=256
+    # caps ab_stages at 8 (SMEM budget); acc=1/c=2 keep the accumulator+C rings lean.
+    # (M, K, N) = (64, 2048, 4096) -- bn=32 (128 tiles), bk=256; 0.97x vs cutlass.
+    {'block_sizes': [64, 32, 256], 'l2_groupings': [1], 'indexing': ['tensor_descriptor', 'pointer', 'tensor_descriptor', 'pointer', 'tensor_descriptor'], 'pid_type': 'flat', 'tcgen05_cluster_m': 1, 'tcgen05_cluster_n': 1, 'tcgen05_ab_stages': 8, 'tcgen05_acc_stages': 1, 'tcgen05_c_stages': 2, 'tcgen05_num_epi_warps': 4, 'tcgen05_l2_swizzle_size': 1, 'tcgen05_persistence_model': 'non_persistent'},
+    # (M, K, N) = (64, 2048, 2048) -- bn=16 (128 tiles), bk=256; 0.96x vs cutlass.
+    {'block_sizes': [64, 16, 256], 'l2_groupings': [1], 'indexing': ['tensor_descriptor', 'pointer', 'tensor_descriptor', 'pointer', 'tensor_descriptor'], 'pid_type': 'flat', 'tcgen05_cluster_m': 1, 'tcgen05_cluster_n': 1, 'tcgen05_ab_stages': 8, 'tcgen05_acc_stages': 1, 'tcgen05_c_stages': 2, 'tcgen05_num_epi_warps': 4, 'tcgen05_l2_swizzle_size': 1, 'tcgen05_persistence_model': 'non_persistent'},
+    # (M, K, N) = (64, 2048, 12288) -- wide N: bn=128 (96 tiles) already fills the
+    # device, and at bn=128 the SMEM budget forces ab<=3 with bk=256, so the shallow
+    # deep-K variant loses; keep the bn=128/bk=128/ab=8 tune. 0.82x vs cutlass.
     {'block_sizes': [64, 128, 128], 'l2_groupings': [2], 'indexing': ['tensor_descriptor', 'pointer', 'tensor_descriptor', 'pointer', 'pointer'], 'pid_type': 'flat', 'tcgen05_cluster_m': 1, 'tcgen05_cluster_n': 1, 'tcgen05_ab_stages': 8, 'tcgen05_acc_stages': 2, 'tcgen05_c_stages': 4, 'tcgen05_num_epi_warps': 4, 'tcgen05_l2_swizzle_size': 1, 'tcgen05_strategy': 'role_local_with_scheduler', 'tcgen05_warp_spec_scheduler_warps': 1, 'tcgen05_persistence_model': 'non_persistent'},
-    # (M, K, N) = (64, 6144, 2048) -- bn=16 (128 tiles), deep K; 0.82x vs cutlass.
-    {'block_sizes': [64, 16, 128], 'l2_groupings': [2], 'indexing': ['tensor_descriptor', 'pointer', 'pointer', 'tensor_descriptor', 'pointer'], 'pid_type': 'flat', 'tcgen05_cluster_m': 1, 'tcgen05_cluster_n': 1, 'tcgen05_ab_stages': 8, 'tcgen05_acc_stages': 2, 'tcgen05_c_stages': 2, 'tcgen05_num_epi_warps': 4, 'tcgen05_l2_swizzle_size': 1, 'tcgen05_persistence_model': 'non_persistent'},
+    # (M, K, N) = (64, 6144, 2048) -- bn=16 (128 tiles), bk=256; 0.96x vs cutlass.
+    {'block_sizes': [64, 16, 256], 'l2_groupings': [1], 'indexing': ['tensor_descriptor', 'pointer', 'tensor_descriptor', 'pointer', 'tensor_descriptor'], 'pid_type': 'flat', 'tcgen05_cluster_m': 1, 'tcgen05_cluster_n': 1, 'tcgen05_ab_stages': 8, 'tcgen05_acc_stages': 1, 'tcgen05_c_stages': 2, 'tcgen05_num_epi_warps': 4, 'tcgen05_l2_swizzle_size': 1, 'tcgen05_persistence_model': 'non_persistent'},
 ]
 
 
