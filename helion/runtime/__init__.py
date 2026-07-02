@@ -1114,6 +1114,7 @@ def _pallas_prepare_args(
     - arg_to_tensor_pos: mapping from original position to tensor-only position
     - inplace_positions: positions that are both input and output
     - out_shapes: JAX placeholders for output shapes
+    - pallas_aliases: mapping from tensor input positions to output tuple indices
     """
     if interpret:
         placeholder_fn = _jax_placeholder_for_tensor

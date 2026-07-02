@@ -389,8 +389,6 @@ def _store_value_matches_destination_shape(
     if not isinstance(subscript_meta, (list, tuple)):
         return False
 
-    from helion._utils import is_scalar_index
-
     expected: list[int | torch.SymInt] = []
     tensor_dim = 0
     for idx in subscript_meta:
@@ -2065,8 +2063,6 @@ def _store_access_covers_full_tensor(
     env: CompileEnvironment,
 ) -> bool:
     """Whether all elements of ``fake`` are overwritten by this store family."""
-    from helion._utils import is_scalar_index
-
     dim_to_bid = _get_dim_block_ids(sub_meta, env)
     for dim_idx, dim_size in enumerate(fake.shape):
         bid = dim_to_bid.get(dim_idx)
@@ -2672,8 +2668,6 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
                     if dim_idx < len(subscript_meta)
                     else slice(None)
                 )
-                from helion._utils import is_scalar_index
-
                 if is_scalar_index(idx_meta):
                     block_shape_parts.append("1")
                     if isinstance(idx_meta, torch.Tensor):
@@ -3044,8 +3038,6 @@ def _is_supported_contiguous_row_slab_dma(
     if not _loop_dim_is_dynamic(state, block_ids.index(row_bid)):
         return False
 
-    from helion._utils import is_scalar_index
-
     for dim_idx in range(row_dim):
         idx_meta = sub_meta[dim_idx] if dim_idx < len(sub_meta) else slice(None)
         if vmem_shape[dim_idx] != 1:
@@ -3130,8 +3122,6 @@ def _dma_offsets_are_aligned(
             continue
 
         idx_meta = sub_meta[dim_idx] if dim_idx < len(sub_meta) else slice(None)
-        from helion._utils import is_scalar_index
-
         if is_scalar_index(idx_meta):
             offset_expr = state.device_function.literal_expr(idx_meta)
             if not _expr_proven_multiple(offset_expr, required, state):
@@ -3233,8 +3223,6 @@ def _compute_vmem_shapes(
                     parts.append(int(fake.shape[dim_idx]))
             else:
                 idx_meta = sub_meta[dim_idx] if dim_idx < len(sub_meta) else slice(None)
-                from helion._utils import is_scalar_index
-
                 if is_scalar_index(idx_meta):
                     parts.append(1)
                 else:
@@ -3681,8 +3669,6 @@ def _codegen_fori_loop(state: CodegenState) -> object:
                     if dim_idx < len(subscript_meta)
                     else slice(None)
                 )
-                from helion._utils import is_scalar_index
-
                 if is_scalar_index(idx_meta):
                     offset_expr = state.device_function.literal_expr(idx_meta)
                     hbm_parts.append(f"pl.ds({offset_expr}, 1)")
