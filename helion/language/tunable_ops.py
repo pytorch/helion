@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+import sympy
 import torch
 from torch._inductor.codegen.simd import constant_repr
 from torch._inductor.runtime.runtime_utils import next_power_of_2
@@ -175,9 +176,19 @@ def _register_tunable_type(
     # register the value for tuning
     env.config_spec.user_defined_tunables[name_val] = fragment_val
 
-    python_type = type(fragment_val.default())
+    default = fragment_val.default()
+    python_type = type(default)
     if not issubclass(python_type, (int, float, bool)):
         raise exc.TunableTypeNotSupported(python_type)
+    if python_type is int:
+        from .._compiler.type_info import SymIntType
+
+        assert isinstance(default, int)
+        value = env.create_unbacked_symint(hint=default)
+        expr = value._sympy_()
+        if isinstance(expr, sympy.Symbol):
+            env.tunable_symbols[expr] = name_val
+        return SymIntType(origin, value)
     return NumericType.subtype(python_type).new_unbacked(origin)
 
 

@@ -36,6 +36,7 @@ from helion._testing import skipIfRefEager
 from helion._testing import skipIfRocm
 from helion._testing import skipIfTileIR
 from helion._testing import skipIfXPU
+from helion._testing import xfailIfCute
 from helion._testing import xfailIfPallas
 from helion._testing import xfailIfPallasInterpret
 from helion.runtime.config import Config
@@ -187,6 +188,7 @@ class TestExamples(RefEagerTestBase, TestCase):
         )
 
     @xfailIfPallas("missing barrier implementation")
+    @xfailIfCute("CuTe split-K symbolic reduction config has no thread budget")
     @skipIfTileIR("PassManager::run failed")
     @skipIfXPU("Split-K barrier not supported on XPU backend")
     def test_split_k_barrier(self):
@@ -206,6 +208,7 @@ class TestExamples(RefEagerTestBase, TestCase):
         )
 
     @xfailIfPallas("missing barrier implementation")
+    @xfailIfCute("CuTe split-K symbolic reduction config has no thread budget")
     @skipIfTileIR("PassManager::run failed")
     @skipIfRefEager("Test requires compiled kernel with specific config")
     def test_split_k_barrier_accuracy(self):

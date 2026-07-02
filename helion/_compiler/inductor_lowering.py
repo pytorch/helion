@@ -55,6 +55,7 @@ from .compile_environment import _symint_expr
 from .compile_environment import _symint_sympy_expr
 from .device_function import VarInfo
 from .device_function import contains_only_block_size_symbols
+from .device_function import find_block_size_symbols
 from .node_masking import inductor_masked_value
 from .node_masking import mask_node_inputs
 
@@ -376,6 +377,13 @@ def _unpack_symint(x: torch.SymInt | int) -> sympy.Expr:
         # type: ignore [bad-return]
         return sympy.sympify(x)
     raise TypeError(f"Expected SymInt or int, got {type(x)}")
+
+
+def _contains_only_block_size_or_tunable_symbols(
+    expr: sympy.Expr, env: CompileEnvironment
+) -> bool:
+    _, non_block_symbols = find_block_size_symbols(expr)
+    return non_block_symbols <= set(env.tunable_symbols)
 
 
 @dataclasses.dataclass
@@ -766,14 +774,18 @@ class ReductionLowering(InductorLowering):
         env = CompileEnvironment.current()
         if isinstance(reduction_size, sympy.Symbol):
             block_index: int | None = env.get_block_id(reduction_size)
+            if block_index is None and reduction_size in env.tunable_symbols:
+                block_index = env.allocate_reduction_dimension(
+                    to_symint(reduction_size)
+                ).block_id
         elif isinstance(reduction_size, (int, sympy.Integer)):
             # Allocate or find a reduction dimension matching this size.
             # Convert to a SymInt when needed.
             size_symint_or_int = to_symint(reduction_size)
             block_index = env.allocate_reduction_dimension(size_symint_or_int).block_id
         elif isinstance(reduction_size, sympy.Expr):
-            # Handle symbolic expressions (including those with only block size symbols)
-            if contains_only_block_size_symbols(reduction_size):
+            # Handle symbolic expressions whose free symbols are config-time values.
+            if _contains_only_block_size_or_tunable_symbols(reduction_size, env):
                 size_symint = to_symint(reduction_size)
                 block_index = env.allocate_reduction_dimension(size_symint).block_id
             else:

@@ -1008,6 +1008,10 @@ class CompileEnvironment:
                 # This preserves the original value passed to the kernel.
                 if expr in var_hints:
                     return int(var_hints[expr])
+                with contextlib.suppress(TypeError, ValueError):
+                    hinted_expr = expr.xreplace(var_hints)
+                    if not hinted_expr.free_symbols:
+                        return int(typing.cast("typing.SupportsInt", hinted_expr))
                 # Fall back to default hint if not found
                 return 8192
 
@@ -1424,12 +1428,35 @@ class ReductionLoopBlockSizeSource(BlockSizeSource):
             len(config.reduction_loops) <= self.reduction_loop
             or config.reduction_loops[self.reduction_loop] is None
         ):
-            size = max(1, block_size_info.size_hint())
             # Backends override static_rdim_size to control whether the
             # persistent-reduction extent is rounded up to a power of two
             # (Triton/CuTe) or kept exact (Pallas).
-            return CompileEnvironment.current().backend.static_rdim_size(size)
+            env = CompileEnvironment.current()
+            size = _size_hint_with_tunable_config(block_size_info.size, config, env)
+            return env.backend.static_rdim_size(size)
         return config.reduction_loops[self.reduction_loop]
+
+
+def _size_hint_with_tunable_config(
+    size: int | torch.SymInt | AutoSize | None,
+    config: Config,
+    env: CompileEnvironment,
+) -> int:
+    if not isinstance(size, (int, torch.SymInt)):
+        return 1
+    if isinstance(size, int):
+        return max(1, size)
+
+    expr = size._sympy_()
+    substitutions = {
+        symbol: value
+        for symbol, tunable_name in env.tunable_symbols.items()
+        if isinstance((value := config.get(tunable_name)), int)
+    }
+    if substitutions:
+        expr = expr.subs(substitutions)
+        assert isinstance(expr, sympy.Expr)
+    return max(1, shape_env_size_hint(env.shape_env, expr))
 
 
 def warning(warning: exc.BaseWarning | type[exc.BaseWarning]) -> None:

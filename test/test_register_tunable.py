@@ -74,6 +74,38 @@ class TestRegisterTunable(RefEagerTestBase, TestCase):
         )
         self.assertIn("multiplier=3", default_config)
 
+    def test_tunable_reduction_extent_expressions(self):
+        @helion.kernel(autotune_effort="none")
+        def reduction_width_plus_one(x: torch.Tensor) -> torch.Tensor:
+            width = hl.register_tunable("width", IntegerFragment(2, 8, 4))
+            tmp = torch.zeros([x.size(0), width + 1], dtype=x.dtype, device=x.device)
+            out = torch.empty_like(x)
+            for tile_m in hl.tile(x.size(0)):
+                out[tile_m] = torch.sum(tmp[tile_m, :] + x[tile_m, None], dim=-1)
+            return out
+
+        @helion.kernel(autotune_effort="none")
+        def reduction_twice_width(x: torch.Tensor) -> torch.Tensor:
+            width = hl.register_tunable("width", IntegerFragment(2, 8, 4))
+            tmp = torch.zeros([x.size(0), 2 * width], dtype=x.dtype, device=x.device)
+            out = torch.empty_like(x)
+            for tile_m in hl.tile(x.size(0)):
+                out[tile_m] = torch.sum(tmp[tile_m, :] + x[tile_m, None], dim=-1)
+            return out
+
+        x = torch.randn(16, device=DEVICE, dtype=torch.float32)
+        selected_width = 6
+        cases = (
+            ("width_plus_one", reduction_width_plus_one, selected_width + 1),
+            ("twice_width", reduction_twice_width, 2 * selected_width),
+        )
+        for name, kernel, scale in cases:
+            with self.subTest(kernel=name):
+                _code, result = code_and_output(
+                    kernel, (x,), block_size=8, width=selected_width
+                )
+                torch.testing.assert_close(result, x * scale)
+
     def test_enum_fragment(self):
         @helion.kernel(config={"operation": 2})
         def kernel_with_enum(x: torch.Tensor) -> torch.Tensor:
