@@ -22,7 +22,6 @@ from __future__ import annotations
 import math
 
 import torch
-import triton.testing as tt
 
 import helion.experimental
 import helion.language as hl
@@ -150,8 +149,9 @@ def _baselines() -> list[tuple[str, object]]:
 def use_cudagraph() -> bool:
     """Whether main() benchmarks under CUDA graphs (read by pretuned_kernels/run.py).
 
-    True: main() times these decode / small-batch GEMMs with do_bench_cudagraph
-    (how vLLM invokes the kernel), which removes per-call host launch overhead.
+    True: main() times these decode / small-batch GEMMs under CUDA graphs (how
+    vLLM invokes the kernel), which removes per-call host launch overhead. The
+    shared _bench loop clears the L2 cache before every replay (cold L2).
     """
     return True
 
@@ -182,95 +182,37 @@ def _make_inputs(
 
 
 def main(verbose: bool = True) -> dict:
-    def _p(*args: object) -> None:
-        if verbose:
-            print(*args)
+    import os
+    import sys
+
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    from _bench import run_sweep
 
     baselines = _baselines()
-    names = [n for n, _ in baselines]
-    _p(
-        f"GPU: {torch.cuda.get_device_name()} "
-        f"(baselines: {', '.join(names)}; SUMMARY vs best/fastest baseline)"
-    )
-    base_hdr = "  ".join(f"{n + ' (us)':>12s}" for n in names)
-    _p(
-        f"{'M':>6s}  {'K':>6s}  {'N':>6s}  {'helion (us)':>12s}  "
-        f"{base_hdr}  {'speedup':>8s}"
-    )
-    _p("-" * (45 + 14 * len(names)))
 
-    speedups_by_base: dict[str, list[float]] = {n: [] for n in names}
-    best_speedups: list[float] = []  # helion vs the fastest baseline each shape
-    helion_wins = 0
-    best_speedup = 0.0
-    best_shape = (0, 0, 0)
-    for M, K, N in SHAPES:
+    def make_calls(shape: tuple[int, int, int]) -> tuple:
+        M, K, N = shape
         x, y, scale_a, scale_b = _make_inputs(M, K, N)
 
-        _scale_mm_cute(x, y, scale_a, scale_b)  # warmup / compile
-        ms_helion = tt.do_bench_cudagraph(
-            lambda x=x, y=y, sa=scale_a, sb=scale_b: _scale_mm_cute(x, y, sa, sb),
-            rep=100,
-            return_mode="median",
-        )
-        base_ms: dict[str, float] = {}
-        for name, fn in baselines:
-            base_ms[name] = tt.do_bench_cudagraph(
-                lambda fn=fn, x=x, y=y, sa=scale_a, sb=scale_b: fn(x, y, sa, sb),
-                rep=100,
-                return_mode="median",
-            )
-            speedups_by_base[name].append(
-                base_ms[name] / ms_helion if ms_helion > 0 else float("nan")
-            )
-        best_base = min(base_ms, key=base_ms.get)  # fastest baseline this shape
-        speedup = base_ms[best_base] / ms_helion if ms_helion > 0 else float("nan")
-        best_speedups.append(speedup)
-        if speedup > 1.0:
-            helion_wins += 1
-        if speedup > best_speedup:
-            best_speedup = speedup
-            best_shape = (M, K, N)
-        base_cols = "  ".join(f"{base_ms[n] * 1000:>12.2f}" for n in names)
-        _p(
-            f"{M:>6d}  {K:>6d}  {N:>6d}  {ms_helion * 1000:>12.2f}  "
-            f"{base_cols}  {speedup:>7.2f}x  (vs {best_base})"
-        )
+        def helion_call() -> None:
+            _scale_mm_cute(x, y, scale_a, scale_b)
 
-    def _geomean(vals: list[float]) -> float:
-        pos = [s for s in vals if s > 0]
-        return math.exp(sum(math.log(s) for s in pos) / max(len(pos), 1))
+        base_calls = [
+            (name, (lambda fn=fn: fn(x, y, scale_a, scale_b))) for name, fn in baselines
+        ]
+        return helion_call, base_calls, f"{M:>6d}  {K:>6d}  {N:>6d}"
 
-    # Per-baseline breakdown (helion speedup over each specific baseline),
-    # consumed by pretuned_kernels/run.py for the dashboard's per-kernel dropdown.
-    per_baseline = {
-        name: {
-            "wins": sum(1 for s in speedups_by_base[name] if s > 1.0),
-            "total": len(speedups_by_base[name]),
-            "geomean": round(_geomean(speedups_by_base[name]), 4),
-            "best_speedup": round(max(speedups_by_base[name], default=0.0), 4),
-        }
-        for name in names
-    }
-    for name in names:
-        m = per_baseline[name]
-        _p(
-            f"vs {name}: wins={m['wins']}/{m['total']} "
-            f"geomean={m['geomean']:.3f}x best={m['best_speedup']:.2f}x"
-        )
-    geomean = _geomean(best_speedups)
-    _p(
-        f"\nHelion faster on {helion_wins}/{len(SHAPES)} shapes vs the best "
-        f"baseline; geomean speedup {geomean:.3f}x; "
-        f"best speedup {best_speedup:.2f}x at (M, K, N)={best_shape}."
+    # run_sweep benchmarks under CUDA graphs (how these decode / small-batch GEMMs
+    # are invoked; removes per-call host launch overhead) with L2 cache clearing
+    # before every replay (see _bench) -- the fp8 configs are tuned for this
+    # cold-L2 regime (PR #2821: the 2-CTA A-multicast win only shows cold).
+    return run_sweep(
+        SHAPES,
+        make_calls,
+        use_cudagraph=use_cudagraph(),
+        verbose=verbose,
+        shape_header=f"{'M':>6s}  {'K':>6s}  {'N':>6s}",
     )
-    return {
-        "helion_wins": helion_wins,
-        "total": len(SHAPES),
-        "geomean": round(geomean, 4),
-        "best_speedup": round(best_speedup, 4),
-        "baselines": per_baseline,
-    }
 
 
 if __name__ == "__main__":
