@@ -2703,6 +2703,27 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         ):
             self.assertEqual(search._final_rebenchmark_pinned_tolerance(), 0.0)
 
+    def test_final_rebenchmark_top_k_default_scoped_to_cute(self) -> None:
+        settings = Settings(autotune_log_level=logging.CRITICAL)
+        search = PopulationBasedSearch.__new__(PopulationBasedSearch)
+        search.settings = settings
+        search.log = AutotuningLogger(settings)
+
+        with clean_final_rebenchmark_env():
+            # The larger finalist set is scoped to cute; other backends use the
+            # cheaper default so autotune wall-time is not inflated.
+            search.config_spec = SimpleNamespace(backend_name="cute")
+            self.assertEqual(search._final_rebenchmark_top_k(), 32)
+            search.config_spec = SimpleNamespace(backend_name="triton")
+            self.assertEqual(search._final_rebenchmark_top_k(), 8)
+            search.config_spec = SimpleNamespace(backend_name="pallas")
+            self.assertEqual(search._final_rebenchmark_top_k(), 8)
+
+        # An explicit env override wins regardless of backend.
+        with clean_final_rebenchmark_env(HELION_AUTOTUNE_FINAL_REBENCHMARK_TOP_K="2"):
+            search.config_spec = SimpleNamespace(backend_name="cute")
+            self.assertEqual(search._final_rebenchmark_top_k(), 2)
+
     def test_final_rebenchmark_prefers_faster_generated_config_by_default(
         self,
     ) -> None:
