@@ -2203,6 +2203,7 @@ class BlockSizeSpec(_PowerOfTwoBlockIdItem):
         min_size: int = 1,
         max_size: int | None = None,
         bounded_by_block_id: int | None = None,
+        owner_relative_bounded_by_block_id: int | None = None,
     ) -> None:
         super().__init__([block_id])
         self.size_hint = size_hint
@@ -2222,6 +2223,10 @@ class BlockSizeSpec(_PowerOfTwoBlockIdItem):
         )
         # Outer block_id whose tile extent caps this block's size in normalize().
         self.bounded_by_block_id: int | None = bounded_by_block_id
+        # Outer block_id whose tile begin/end are this tile's actual address base.
+        self.owner_relative_bounded_by_block_id: int | None = (
+            owner_relative_bounded_by_block_id
+        )
         if self.max_size < self.min_size:
             self.max_size = self.min_size
         assert self.min_size <= self.max_size
@@ -2234,6 +2239,7 @@ class BlockSizeSpec(_PowerOfTwoBlockIdItem):
             ("min_size", 1),
             ("max_size", next_power_of_2(self.size_hint)),
             ("bounded_by_block_id", None),
+            ("owner_relative_bounded_by_block_id", None),
         ):
             value = getattr(self, field)
             if value != default:

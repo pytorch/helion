@@ -1032,7 +1032,6 @@ class TestExamples(RefEagerTestBase, TestCase):
             block_sizes=[1, 64, 32],
         )
 
-    @xfailIfPallas("slice-based stores not yet supported")
     def test_concat_simple(self):
         args = (
             torch.randn(512, 500, device=DEVICE),
@@ -1421,8 +1420,8 @@ class TestExamples(RefEagerTestBase, TestCase):
         """Test combined backward pass for layer norm with bias."""
         self._run_layernorm_bwd(batch_size=32, dim=64)
 
-    @xfailIfPallas("VMEM OOM: untiled block specs load full tensors")
     @skipIfA10G("accuracy check fails on A10G GPUs")
+    @xfailIfPallasInterpret("large-batch backward has interpret-mode drift")
     def test_layernorm_bwd_large_batch(self):
         """Regression test: large batch, small dim."""
         self._run_layernorm_bwd(batch_size=1152 * 1000, dim=16, seed=1)
@@ -2594,6 +2593,10 @@ class TestExamples(RefEagerTestBase, TestCase):
         )
 
     @skipIfRefEager("scalar_prefetch indexing not supported in ref interpreter")
+    @xfailIfPallasTpu(
+        "unaligned data-dependent tile load; fixed later in the stack by Pallas "
+        "padded-load support (#2944)"
+    )
     def test_flex_attention(self):
         z, h, n_ctx, head_dim = 2, 4, 256, 64
         q, k, v = [

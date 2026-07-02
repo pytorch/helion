@@ -208,7 +208,10 @@ def _pallas_make_block_spec(
     jnp: object,
     pltpu: object,
     tensor: torch.Tensor,
-    entry: tuple[tuple[int | None, ...], tuple[int | tuple[int, int, int] | None, ...]]
+    entry: tuple[
+        tuple[int | None, ...],
+        tuple[int | _PallasFlatGridDim | None, ...],
+    ]
     | None,
     should_use_smem: bool = False,
 ) -> object:
@@ -237,15 +240,23 @@ def _pallas_make_block_spec(
 
     def _index_for_dim(
         grid_args: tuple[object, ...],
-        g: int | tuple[int, int, int] | None,
+        g: int | _PallasFlatGridDim | None,
         jnp: object = jnp,
     ) -> object:
         if g is None:
             return jnp.int32(0)  # pyrefly: ignore[missing-attribute]
         if isinstance(g, tuple):
-            # Flat grid decomposition: (grid_dim, stride, num_blocks)
-            grid_dim, stride, num_blocks = g
+            # Flat grid decomposition:
+            # (grid_dim, stride, num_blocks) or
+            # (grid_dim, stride, num_blocks, case_start)
+            if len(g) == 3:
+                grid_dim, stride, num_blocks = g
+                case_start = 0
+            else:
+                grid_dim, stride, num_blocks, case_start = g
             val = grid_args[grid_dim]
+            if case_start:
+                val = val - case_start  # type: ignore[operator]
             if stride > 1:
                 val = val // stride  # type: ignore[operator]
             val = val % num_blocks  # type: ignore[operator]
@@ -254,7 +265,7 @@ def _pallas_make_block_spec(
 
     def index_map(
         *grid_args: object,
-        _grid_dims: tuple[int | tuple[int, int, int] | None, ...] = grid_dims,
+        _grid_dims: tuple[int | _PallasFlatGridDim | None, ...] = grid_dims,
     ) -> tuple[object, ...]:
         return tuple(_index_for_dim(grid_args, g) for g in _grid_dims)
 
@@ -390,8 +401,13 @@ def _estimate_pallas_vmem_bytes(
 # Per-tensor block spec info: see ``_pallas_make_block_spec``.
 # grid_dims entries are int (direct grid dim), tuple (flat decomposition),
 # or None (untiled dim).
+_PallasFlatGridDim = tuple[int, int, int] | tuple[int, int, int, int]
 _BlockSpecInfo = list[
-    tuple[tuple[int | None, ...], tuple[int | tuple[int, int, int] | None, ...]] | None
+    tuple[
+        tuple[int | None, ...],
+        tuple[int | _PallasFlatGridDim | None, ...],
+    ]
+    | None
 ]
 _PallasCopyGuards = dict[int, tuple[int, ...]]
 _PallasDimensionSemantic = Literal["parallel", "arbitrary"]
@@ -407,7 +423,8 @@ def _pallas_tensor_pos_map(
 
 def _pallas_grid_dims_used_by_block_spec(
     block_info: tuple[
-        tuple[int | None, ...], tuple[int | tuple[int, int, int] | None, ...]
+        tuple[int | None, ...],
+        tuple[int | _PallasFlatGridDim | None, ...],
     ],
 ) -> set[int]:
     used: set[int] = set()
@@ -416,6 +433,21 @@ def _pallas_grid_dims_used_by_block_spec(
         if isinstance(grid_dim, int):
             used.add(grid_dim)
         elif isinstance(grid_dim, tuple):
+            used.add(grid_dim[0])
+    return used
+
+
+def _pallas_foreach_grid_dims_by_block_spec(
+    block_info: tuple[
+        tuple[int | None, ...],
+        tuple[int | _PallasFlatGridDim | None, ...],
+    ],
+) -> set[int]:
+    """Return flat launch dims whose index map is limited to one ForEach case."""
+    used: set[int] = set()
+    _, grid_dims = block_info
+    for grid_dim in grid_dims:
+        if isinstance(grid_dim, tuple) and len(grid_dim) == 4:
             used.add(grid_dim[0])
     return used
 
@@ -446,6 +478,9 @@ def _pallas_shared_output_plan(
         block_info = block_spec_info[tensor_pos]
         if block_info is None:
             continue
+        for dim in _pallas_foreach_grid_dims_by_block_spec(block_info):
+            if dim < len(grid) and grid[dim] > 1:
+                dim_semantics[dim] = "arbitrary"
         used_dims = _pallas_grid_dims_used_by_block_spec(block_info)
         # These programs update the same output tile and must observe one
         # shared accumulator, not a freshly preloaded copy per program.
