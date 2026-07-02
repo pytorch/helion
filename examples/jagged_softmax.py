@@ -19,8 +19,10 @@ import torch
 
 import helion
 from helion._testing import DEVICE
+from helion._testing import LONG_INT_TYPE
 from helion._testing import run_example
 import helion.language as hl
+from helion.runtime.settings import _get_backend
 
 # %%
 # Reference Implementation
@@ -56,7 +58,7 @@ def reference_jagged_softmax_pytorch(
 
 # %%
 @helion.kernel()
-def jagged_softmax_kernel(
+def _jagged_softmax_kernel_default(
     x_data: torch.Tensor,
     x_offsets: torch.Tensor,
 ) -> torch.Tensor:
@@ -114,6 +116,57 @@ def jagged_softmax_kernel(
     return out.reshape(N, M)
 
 
+@helion.kernel()
+def _jagged_softmax_kernel_pallas(
+    x_data: torch.Tensor,
+    x_offsets: torch.Tensor,
+) -> torch.Tensor:
+    """
+    Compute jagged softmax with structural row/column stores for Pallas.
+
+    Pallas does not support the flat multi-dimensional scatter pattern used by
+    the default kernel, so this variant tiles each packed sequence directly.
+    """
+    _N, M = x_data.shape
+    num_rows = x_offsets.size(0) - 1
+    out = torch.empty_like(x_data)
+
+    for b in hl.grid(num_rows):
+        start = x_offsets[b]
+        end = x_offsets[b + 1]
+        seq_len = end - start
+
+        if seq_len != 0:
+            for tile_m in hl.tile(0, M):
+                block_max = hl.full([tile_m], float("-inf"), dtype=x_data.dtype)
+                block_new_max = hl.full([tile_m], float("-inf"), dtype=x_data.dtype)
+                block_L = hl.full([tile_m], 0.0, dtype=x_data.dtype)
+
+                for tile_k in hl.tile(start, end):
+                    x_slice = x_data[tile_k, tile_m]
+                    slice_max = x_slice.amax(dim=0)
+                    block_new_max = torch.maximum(block_max, slice_max)
+                    block_L *= torch.exp(block_max - block_new_max)
+                    block_L += torch.exp(x_slice - block_new_max[None, :]).sum(dim=0)
+                    block_max = block_new_max
+
+                for tile_k in hl.tile(start, end):
+                    x_slice = x_data[tile_k, tile_m]
+                    block_out = (
+                        torch.exp(x_slice - block_max[None, :]) / block_L[None, :]
+                    )
+                    out[tile_k, tile_m] = block_out
+
+    return out
+
+
+jagged_softmax_kernel = (
+    _jagged_softmax_kernel_pallas
+    if _get_backend() == "pallas"
+    else _jagged_softmax_kernel_default
+)
+
+
 # %%
 # Benchmark Wrapper
 # -----------------
@@ -154,9 +207,14 @@ def main() -> None:
     num_rows, max_cols = 512, 64
     device = DEVICE
 
-    lengths = torch.randint(1, max_cols + 1, (num_rows,), device=device)
+    lengths = torch.randint(
+        1, max_cols + 1, (num_rows,), dtype=LONG_INT_TYPE, device=device
+    )
     x_offsets = torch.cat(
-        [torch.zeros(1, dtype=torch.long, device=device), torch.cumsum(lengths, dim=0)]
+        [
+            torch.zeros(1, dtype=LONG_INT_TYPE, device=device),
+            torch.cumsum(lengths, dim=0).to(LONG_INT_TYPE),
+        ]
     )
     nnz = int(x_offsets[-1])
     M = 128  # number of features
