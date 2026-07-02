@@ -836,7 +836,7 @@ def _emit_inner_loop_offset_indices(
 
     Args:
         loop_index_exprs: Per-block-id expression for the inner-loop iteration
-            index (``_pipeline_indices[i]`` for emit_pipeline; the fori_loop
+            index (``_helion_compat_pipeline_indices[i]`` for emit_pipeline; the fori_loop
             variable like ``_j`` for fori_loop).  Combined with ``begin_exprs``
             and ``iter_step_exprs`` to form the absolute start of the tile.
     """
@@ -2066,7 +2066,18 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
 
     # Build the body function
     body_fn_name = state.device_function.new_var("_pipeline_body")
-    body_stmts: list[ast.AST] = []
+    body_stmts: list[ast.AST] = [
+        # JAX commit 6cc8faf8 (https://github.com/jax-ml/jax/commit/6cc8faf8) introduced
+        # a PipelineStep object to wrap emit_pipeline's indices, which originally were
+        # just a tuple.
+        # TODO(cota): Eventually remove _helion_compat_pipeline_indices once older JAX
+        # versions without PipelineStep are no longer supported.
+        statement_from_string(
+            "_helion_compat_pipeline_indices = _pipeline_indices "
+            "if isinstance(_pipeline_indices, (tuple, list)) "
+            "else _pipeline_indices.index"
+        )
+    ]
 
     # Build block_id_to_info for the pipeline state
     block_id_to_info: dict[int, LoopDimInfo] = {}
@@ -2088,7 +2099,7 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
         block_size_vars,
         begin_exprs,
         iter_step_exprs,
-        [f"_pipeline_indices[{i}]" for i in range(len(block_ids))],
+        [f"_helion_compat_pipeline_indices[{i}]" for i in range(len(block_ids))],
         env,
         body_stmts,
     )
@@ -2102,7 +2113,7 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
         body_stmts,
         # emit_pipeline passes indices as a single tuple arg
         offset_expr_fn=lambda i, bs: (
-            f"_pipeline_indices[{i}] * {bs} + jnp.arange({bs})"
+            f"_helion_compat_pipeline_indices[{i}] * {bs} + jnp.arange({bs})"
         ),
         aligned_dim=aligned_dim,
     )
@@ -2120,7 +2131,7 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
             body_stmts.append(
                 statement_from_string(
                     f"{offset_name} = ({begin_exprs[i]}) + "
-                    f"(_pipeline_indices[{i}]) * ({iter_step_exprs[i]})"
+                    f"(_helion_compat_pipeline_indices[{i}]) * ({iter_step_exprs[i]})"
                 )
             )
 
