@@ -2490,6 +2490,75 @@ class PallasBackend(Backend):
             result.append((tuple(block_shape), tuple(grid_dims)))
         return result
 
+    def _pallas_phase_case_metadata(
+        self,
+        sorted_args: list[Argument] | None,
+        config: Config,
+    ) -> (
+        tuple[int, tuple[tuple[int, _PallasLaunchValue, _PallasLaunchValue], ...]]
+        | None
+    ):
+        """Return phase arg position plus global PID ranges for Pallas phases."""
+        if sorted_args is None:
+            return None
+
+        from .device_function import DeviceFunction
+        from .device_function import SymbolArgument
+        from .program_id import ForEachProgramID
+
+        device_fn = DeviceFunction.current()
+        # pyrefly: ignore[missing-attribute]
+        phase_arg: str | None = device_fn.codegen._pallas_barrier_phase_arg
+        if (
+            phase_arg is None
+            or not isinstance(device_fn.pid, ForEachProgramID)
+            or len(set(device_fn.pid.case_phases)) <= 1
+        ):
+            return None
+
+        phase_arg_index = next(
+            (
+                i
+                for i, arg in enumerate(sorted_args)
+                if isinstance(arg, SymbolArgument) and arg.name == phase_arg
+            ),
+            None,
+        )
+        if phase_arg_index is None:
+            raise NotImplementedError(
+                "Pallas phase launches require the phase argument in launcher args"
+            )
+        if len(device_fn.pid.case_phases) != len(device_fn.pid.cases):
+            raise NotImplementedError(
+                "Pallas phase launches require one phase entry per ForEach case"
+            )
+
+        ranges: list[tuple[int, _PallasLaunchValue, _PallasLaunchValue]] = []
+        start: _PallasLaunchValue = 0
+        for phase, case in zip(
+            device_fn.pid.case_phases, device_fn.pid.cases, strict=True
+        ):
+            total: _PallasLaunchValue = 1
+            for pid_info in case.pid_info:
+                bs = _pallas_configured_block_size(
+                    pid_info.block_id,
+                    config,
+                    launch_context="Pallas phase launches",
+                )
+                num_blocks = _pallas_cdiv_launch_values(
+                    _pallas_block_numel(
+                        pid_info.block_id,
+                        config,
+                        launch_context="Pallas phase launches",
+                    ),
+                    bs,
+                )
+                total = _pallas_mul_launch_values(total, num_blocks)
+            end = _pallas_add_launch_values(start, total)
+            ranges.append((phase, start, end))
+            start = end
+        return phase_arg_index, tuple(ranges)
+
     def _compute_pad_info(
         self,
         sorted_args: list[Argument] | None,
@@ -2501,8 +2570,9 @@ class PallasBackend(Backend):
         tensor dimensions use ``pl.ds()`` slicing.
 
         Returns ``[(arg_index, tensor_dim, block_size, extra_pad), ...]``
-        or ``None``.  The launcher computes the actual pad amount at runtime
-        as ``(-tensor.shape[dim]) % block_size + extra_pad``.
+        or ``None``.  The launcher computes each requirement at runtime as
+        ``(-tensor.shape[dim]) % block_size + extra_pad`` and applies the
+        max required pad per ``(arg_index, tensor_dim)``.
 
         ``extra_pad`` is 0 when the tile loop starts at offset 0,
         ``begin % block_size`` for a constant begin offset, or
@@ -2520,19 +2590,28 @@ class PallasBackend(Backend):
         if not device_fn.pallas_pad_info:
             return None
 
-        result: list[tuple[int, int, int, int]] = []
+        result_by_key: dict[tuple[int, int, int], int] = {}
         for i, arg in enumerate(sorted_args):
             if not isinstance(arg, TensorArg):
                 continue
             dims_info = device_fn.pallas_pad_info.get(id(arg.fake_value))
             if dims_info is not None:
-                for dim, (block_id, extra_pad) in dims_info.items():
-                    bsi = env.block_sizes[block_id]
-                    bs = bsi.from_config(config)
-                    if isinstance(bs, int) and bs > 1:
-                        result.append((i, dim, bs, extra_pad))
+                for dim, entries in dims_info.items():
+                    for block_id, extra_pad in entries:
+                        bsi = env.block_sizes[block_id]
+                        bs = bsi.from_config(config)
+                        if isinstance(bs, int) and bs > 1:
+                            key = (i, dim, bs)
+                            result_by_key[key] = max(
+                                result_by_key.get(key, 0), extra_pad
+                            )
 
-        return result or None
+        if not result_by_key:
+            return None
+        return [
+            (arg_index, dim, bs, extra_pad)
+            for (arg_index, dim, bs), extra_pad in result_by_key.items()
+        ]
 
     def _detect_matmul_dot_general_lowering(
         self,
@@ -2791,6 +2870,17 @@ class PallasBackend(Backend):
                 block_spec_info.append(None)  # RNG seed buffer is untiled
             launcher_args.append(
                 f"_block_spec_info={_format_pallas_launch_value(block_spec_info)}"
+            )
+
+        phase_case_metadata = (
+            self._pallas_phase_case_metadata(sorted_args, config)
+            if has_barrier
+            else None
+        )
+        if phase_case_metadata is not None:
+            launcher_args.append(
+                "_pallas_phase_case_metadata="
+                f"{_format_pallas_launch_value(phase_case_metadata)}"
             )
 
         pad_info = self._compute_pad_info(sorted_args, config)

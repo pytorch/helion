@@ -13,11 +13,22 @@ from typing import TYPE_CHECKING
 import sympy
 import torch
 
+from helion._compiler.backend import PallasBackend
+from helion._compiler.compile_environment import CompileEnvironment
+from helion._compiler.compile_environment import _symint_expr
+from helion._compiler.device_function import DeviceFunction
+from helion._compiler.device_function import PallasMemorySpace
+from helion._compiler.host_function import HostFunction
+from helion._compiler.host_function import SymbolOrigin
+from helion._compiler.indexing_strategy import _get_tile_with_offset_info
+from helion._compiler.variable_origin import GridOrigin
+from helion._compiler.variable_origin import TileBeginOrigin
+from helion._compiler.variable_origin import TileEndOrigin
+from helion._compiler.variable_origin import TileIdOrigin
+
 if TYPE_CHECKING:
     from ...runtime.config import Config
-    from ..compile_environment import CompileEnvironment
     from ..device_ir import GraphInfo
-    from ..host_function import SymbolOrigin
     from ..tile_dispatch import TileStrategyDispatch
     from .gather import GatherPlan
     from .gather import ScatterPlan
@@ -153,8 +164,6 @@ def _analyze_indexing(node: torch.fx.Node, config: Config) -> None:
     tensor_val = tensor_arg.meta.get("val")
     assert isinstance(tensor_val, torch.Tensor)
 
-    from helion._compiler.device_function import DeviceFunction
-
     device_fn = DeviceFunction.current()
     if id(tensor_val) not in device_fn.pallas_tensor_dim_tilings:
         device_fn.pallas_tensor_dim_tilings[id(tensor_val)] = [
@@ -181,8 +190,6 @@ def _analyze_indexing(node: torch.fx.Node, config: Config) -> None:
     # mixed tensors in VMEM. This is correct for the common cases
     # (scalar-only → SMEM, mixed scalar-read + slice → VMEM) but
     # over-allocates SMEM for scalar-read-only tensors.
-    from ..device_function import PallasMemorySpace
-
     is_all_scalar = all(
         isinstance(p, (ArbitraryIndexPattern, TileBeginWithOffsetPattern, NonePattern))
         for p in indexing_patterns
@@ -211,7 +218,6 @@ def _analyze_subscript_patterns(
     config: Config,
 ) -> list[IndexingPattern]:
     """Analyze subscript patterns and create indexing pattern metadata."""
-    from ..compile_environment import CompileEnvironment
 
     env = CompileEnvironment.current()
     patterns: list[IndexingPattern] = []
@@ -249,8 +255,6 @@ def _detect_indexing_pattern(
     env: CompileEnvironment,
 ) -> IndexingPattern:
     """Detect the specific indexing pattern for a subscript element."""
-    from ..indexing_strategy import _get_tile_with_offset_info
-    from ..variable_origin import GridOrigin
 
     if isinstance(idx, torch.fx.Node):
         idx_val = idx.meta.get("val")
@@ -388,10 +392,7 @@ def _update_tiling_decision(
     if isinstance(pattern, (TilePattern, TileBeginWithOffsetPattern)):
         alignment_extent = _block_spec_alignment_extent(pattern.block_id, env, config)
         if alignment_extent is not None:
-            from ..compile_environment import CompileEnvironment
-
             backend = CompileEnvironment.current().backend
-            from helion._compiler.backend import PallasBackend
 
             assert isinstance(backend, PallasBackend)
 
@@ -428,7 +429,6 @@ def resident_block_elements(
 
     Returns ``None`` if any consumed dim is symbolic.
     """
-    from ..compile_environment import CompileEnvironment
 
     env = CompileEnvironment.current()
     elements = 1
@@ -501,8 +501,6 @@ def _resolve_tensor_index_patterns(
 # Helper functions moved from memory_ops.py
 def _maybe_get_symbol_origin(idx: object) -> SymbolOrigin | None:
     """Get symbol origin for a subscript element."""
-    from ..compile_environment import _symint_expr
-    from ..host_function import HostFunction
 
     if not isinstance(idx, torch.SymInt):
         return None
@@ -521,14 +519,6 @@ def _maybe_get_tile_begin_with_offset_info(
     full loop extent (e.g. ``tile.begin``, ``tile.end - 1``, or affine
     combinations of those with integer constants).
     """
-    from ..compile_environment import CompileEnvironment
-    from ..compile_environment import _symint_expr
-    from ..host_function import HostFunction
-    from ..host_function import SymbolOrigin
-    from ..variable_origin import GridOrigin
-    from ..variable_origin import TileBeginOrigin
-    from ..variable_origin import TileEndOrigin
-    from ..variable_origin import TileIdOrigin
 
     idx_symbol_origin = _maybe_get_symbol_origin(idx)
     if isinstance(idx_symbol_origin, SymbolOrigin):

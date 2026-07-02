@@ -342,9 +342,9 @@ class DeviceFunction:
         # dict would then need to support multiple entries per tensor
         # or the tensor would get distinct arg IDs per memory space.
         self.pallas_memory_space: dict[int, PallasMemorySpace] = {}
-        # Pallas: id(fake_tensor) → {dim: (block_id, extra_pad)} for dims
-        # using pl.ds() that may need host-side padding.
-        self.pallas_pad_info: dict[int, dict[int, tuple[int, int]]] = {}
+        # Pallas: id(fake_tensor) -> {dim: [(block_id, extra_pad), ...]} for
+        # dims using pl.ds() that may need host-side padding.
+        self.pallas_pad_info: dict[int, dict[int, list[tuple[int, int]]]] = {}
         # Pallas tensor-index atomic_add targets use a local RMW update.  Their
         # indirect output dimensions must be covered by shared-output
         # serialization in the launcher.
@@ -1016,6 +1016,23 @@ class DeviceFunction:
         assert isinstance(call_statement, ExtendedAST)
         # Mark the kernel call so we can find it in codegen_precompile_def
         call_statement._is_kernel_call = True
+        phase_host_var = getattr(self.codegen, "_pallas_barrier_phase_host_var", None)
+        if (
+            env.backend.name == "pallas"
+            and env.has_barrier
+            and phase_host_var is not None
+            and len(self.codegen.host_function.device_ir.phases) > 1
+        ):
+            return create(
+                ast.For,
+                target=create(ast.Name, id=phase_host_var, ctx=ast.Store()),
+                iter=expr_from_string(
+                    f"range({len(self.codegen.host_function.device_ir.phases)})"
+                ),
+                body=[call_statement],
+                orelse=[],
+                type_comment=None,
+            )
         return call_statement
 
     def dead_code_elimination(self) -> None:
