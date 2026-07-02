@@ -644,13 +644,17 @@ def chunk_bwd_dqk_helion(
             # Decay the cross/state terms, then fold the add into the accumulator.
             dq_acc = hl.dot(dA.to(kt.dtype), kt, acc=dq_cross_acc * exp_gc)
             dk_acc = hl.dot(
-                dA.transpose(-2, -1).to(qt.dtype), qt, acc=dk_state_acc * exp_gl_minus_gc
+                dA.transpose(-2, -1).to(qt.dtype),
+                qt,
+                acc=dk_state_acc * exp_gl_minus_gc,
             )
         else:
             dA = dA_raw * causal
             dq_acc = hl.dot(dA.to(kt.dtype), kt, acc=dq_cross_acc) * scale
             dk_acc = hl.dot(
-                dA.transpose(-2, -1).to(qt.dtype), (qt * scale).to(qt.dtype), acc=dk_state_acc
+                dA.transpose(-2, -1).to(qt.dtype),
+                (qt * scale).to(qt.dtype),
+                acc=dk_state_acc,
             )
 
         dq_out[tile_bhn, :, tile_d] = dq_acc.to(q.dtype)
