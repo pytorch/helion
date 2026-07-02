@@ -15,6 +15,7 @@ from helion._testing import onlyBackends
 from helion._testing import skipIfRefEager
 from helion._testing import skipUnlessTensorDescriptor
 from helion._testing import xfailIfPallas
+from helion._testing import xfailIfPallasInterpret
 import helion.language as hl
 from helion.runtime.settings import _get_backend
 
@@ -331,7 +332,6 @@ class TestViews(RefEagerTestBase, TestCase):
         expected = x.sum(dim=(1, 2))
         torch.testing.assert_close(result, expected)
 
-    @xfailIfPallas("torch.stack not supported on pallas")
     def test_stack_power_of_2(self):
         @helion.kernel(autotune_effort="none", static_shapes=True)
         def test_stack_power_of_2_kernel(
@@ -370,7 +370,9 @@ class TestViews(RefEagerTestBase, TestCase):
         expected[1::2] = b  # Every 2nd row starting from 1
         torch.testing.assert_close(result, expected, rtol=1e-5, atol=1e-5)
 
-    @xfailIfPallas("torch.stack not supported on pallas")
+    @xfailIfPallasInterpret(
+        "Pallas interpret cannot execute this non-power-of-2 padded stack store"
+    )
     def test_stack_non_power_of_2(self):
         @helion.kernel(autotune_effort="none", static_shapes=True)
         def test_stack_non_power_of_2_kernel(
@@ -451,7 +453,7 @@ class TestViews(RefEagerTestBase, TestCase):
         expected = x.view(x.numel() // 2, 2).sum(-1)
         torch.testing.assert_close(result, expected, rtol=1e-3, atol=1e-3)
 
-    @xfailIfPallas("torch.stack not supported on pallas")
+    @xfailIfPallas("Pallas dynamic/padded store for stack(dim=0) still fails")
     def test_stack_dim0(self):
         with torch._inductor.config.patch(
             {"use_static_cuda_launcher": False} if use_tileir_tunables() else {}

@@ -364,6 +364,16 @@ def pallas_inner_loop_add_with_nonzero_scalar_access(
 
 
 @helion.kernel(backend="pallas", static_shapes=True)
+def pallas_stack_sum(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    m, n = x.size()
+    for tile_m, tile_n in hl.tile([m, n]):
+        stacked = torch.stack([x[tile_m, tile_n], y[tile_m, tile_n]], dim=1)
+        out[tile_m, tile_n] = torch.sum(stacked, dim=1)
+    return out
+
+
+@helion.kernel(backend="pallas", static_shapes=True)
 def pallas_jagged_segment_add(x: torch.Tensor, offsets: torch.Tensor) -> torch.Tensor:
     """Outer grid over jagged segments + an inner ``hl.tile(start, end)`` loop
     whose begin (``offsets[g]``) is an arbitrary runtime offset. A
@@ -2594,6 +2604,17 @@ class TestPallas(TestCase):
             pallas_loop_type="emit_pipeline",
         )
         self.assertIn("pltpu.emit_pipeline", code)
+
+    def test_stack_lowering(self) -> None:
+        x = torch.randn(8, 128, device=DEVICE, dtype=torch.float32)
+        y = torch.randn(8, 128, device=DEVICE, dtype=torch.float32)
+        code, result = code_and_output(
+            pallas_stack_sum,
+            (x, y),
+            block_sizes=[8, 128],
+        )
+        self.assertIn("jnp.stack", code)
+        torch.testing.assert_close(result, x + y)
 
     @xfailIfPallas("Non-zero begin K reduction: DMA offset not tile-aligned")
     def test_bmm_nonzero_k_begin(self) -> None:
