@@ -130,7 +130,7 @@ class KernelMetadata:
 
     def to_dict(self) -> dict[str, object]:
         # Lazy (dataset-only path). collect_hardware_info may raise on a real probe;
-        # the sink (end_run) guards it so a failure never crashes a good tune.
+        # end_run calls this only on a successful tune, so such a failure surfaces.
         from ._metadata.hardware import collect_hardware_info
 
         return {
@@ -152,7 +152,7 @@ class KernelMetadata:
         from ._metadata.ir_features import extract_ir_graph
 
         # Old/absent networkx degrades to None (extract_ir_graph would raise); a
-        # missing optional dep must not drop the whole record via the end_run guard.
+        # missing optional dep is expected, so skip the graph, not the whole run.
         if not _has_networkx_node_link():
             return None
         return extract_ir_graph(self._device_ir)
