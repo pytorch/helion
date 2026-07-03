@@ -4177,6 +4177,136 @@ class TestCuteBackend(TestCase):
         self.assertIn("cute.nvgpu.tcgen05", code)
         self.assertIn("cute.gemm(", code)
 
+    def test_matmul_mma_fp8_small_static_m_padded_tile(self) -> None:
+        """Small-static-M fp8 now runs on a padded/masked tcgen05 M tile.
+
+        Background: when the real problem M is < 64 but ``block_m`` is chosen
+        >= 64, the autotune config-spec once did NOT register the ``tcgen05_*``
+        config keys (its eligibility gate required ``static_m >= 64``), yet
+        codegen's ``_choose_mma_impl`` selected the tcgen05 path purely from the
+        block sizes. That mismatch raised
+        ``KeyError: 'tcgen05_warp_spec_ab_load_warps'`` at codegen time.
+
+        Both sides now key the tcgen05 decision on ``block_m`` being a legal
+        tcgen05 M tile (64/128), NOT on the static M -- so they can never
+        diverge (no KeyError) AND a tiny-M GEMM runs on a padded/masked 64- or
+        128-row M tile (rows beyond the real M are masked off by the SIMT edge
+        epilogue / bounds-clamped TMA loads), exactly like CUTLASS' SM100 fp8
+        kernel. This is the win that lets M=16 reach the tensor-core path.
+
+        Asserts: M=16 and M=32 with block_m in {64, 128} compile WITHOUT the
+        KeyError crash, select tcgen05, and produce numerically correct output
+        (only the real M rows are written). M=64 (full tile) still reaches
+        tcgen05 as the control.
+        """
+        support = get_cute_mma_support()
+        if not support.tcgen05_f8:
+            self.skipTest("tcgen05 FP8 MMA is not supported on this machine")
+
+        torch.manual_seed(0)
+        # block_m > static_m (padded/masked M tile). Non-degenerate fp8 inputs
+        # spanning the e4m3 range so a masking bug is not hidden by ~0 outputs.
+        for m in (16, 32):
+            for bm in (64, 128):
+                x = (
+                    (torch.randn(m, 128, device=DEVICE) * 4.0)
+                    .clamp(-400, 400)
+                    .to(torch.float8_e4m3fn)
+                )
+                y = (
+                    (torch.randn(128, 128, device=DEVICE) * 4.0)
+                    .clamp(-400, 400)
+                    .to(torch.float8_e4m3fn)
+                )
+                # Must not raise KeyError: 'tcgen05_warp_spec_ab_load_warps'.
+                code, out = code_and_output(
+                    cute_matmul_mma_fp8, (x, y), block_sizes=[bm, 128, 128]
+                )
+                ref = x.float() @ y.float()
+                self.assertEqual(tuple(out.shape), (m, 128))
+                torch.testing.assert_close(out.float(), ref, atol=1.0, rtol=1e-1)
+                # Padded M tile uses the validated tcgen05 tensor-core path.
+                self.assertIn("cute.nvgpu.tcgen05", code)
+
+        # Control: static M == 64 (full tile) stays on the tcgen05 path.
+        x = (
+            (torch.randn(64, 128, device=DEVICE) * 4.0)
+            .clamp(-400, 400)
+            .to(torch.float8_e4m3fn)
+        )
+        y = (
+            (torch.randn(128, 128, device=DEVICE) * 4.0)
+            .clamp(-400, 400)
+            .to(torch.float8_e4m3fn)
+        )
+        code, out = code_and_output(
+            cute_matmul_mma_fp8, (x, y), block_sizes=[128, 128, 128]
+        )
+        ref = x.float() @ y.float()
+        torch.testing.assert_close(out.float(), ref, atol=1.0, rtol=1e-1)
+        self.assertIn("cute.nvgpu.tcgen05", code)
+
+    def test_matmul_mma_fp8_tiny_m_cluster_n2_a_multicast(self) -> None:
+        """Tiny-M padded tcgen05 fp8 with the N-only A-multicast cluster.
+
+        ``tcgen05_cluster_n=2`` with the default ``cluster_m=1`` builds a
+        (1,2,1) CtaGroup.ONE cluster: two CTAs each own their own N output
+        tile and run the flat non-persistent monolithic mainloop, sharing
+        only the A operand via a TMA multicast along N (mcast_mode=2). This
+        mirrors torch's ``_scaled_mm`` CUTLASS ClusterShape<1,2,1> selection
+        at M<=64, N>=3072 and is the right memory-bandwidth lever for tiny M
+        (cluster_m=2 has nothing to share along M).
+
+        Asserts the cluster_n=2 kernel: (1) compiles+runs without a hang or
+        InvalidClusterSize, (2) is numerically correct on multiple seeds at
+        the fp8 rounding floor for EVERY row (a multicast bug commonly drops
+        half the output or one CTA of the pair), (3) selects tcgen05, and
+        (4) launches a 2-CTA cluster (``_helion_cute_cluster_shape = (2, 1,
+        1)`` along the flat grid_x). Cross-checked against the cluster_n=1
+        baseline so the multicast cannot silently change the answer.
+        """
+        support = get_cute_mma_support()
+        if not support.tcgen05_f8:
+            self.skipTest("tcgen05 FP8 MMA is not supported on this machine")
+
+        # N must be divisible by 2*block_n so the flat grid_x (n_tiles) is
+        # even and the (2,1,1) launch cluster divides it. block_n=128 -> N=512
+        # gives 4 N-tiles. M=16 padded onto a 64-row tile (single M-tile).
+        m, k, n = 16, 256, 512
+        bm, bn, bk = 64, 128, 64
+        for seed in range(3):
+            torch.manual_seed(seed)
+            x = (
+                (torch.randn(m, k, device=DEVICE) * 3.0)
+                .clamp(-448, 448)
+                .to(torch.float8_e4m3fn)
+            )
+            y = (
+                (torch.randn(k, n, device=DEVICE) * 3.0)
+                .clamp(-448, 448)
+                .to(torch.float8_e4m3fn)
+            )
+            ref = x.float() @ y.float()
+            base_cfg = {"block_sizes": [bm, bn, bk], "tcgen05_ab_stages": 8}
+            # Baseline (no cluster) for cross-check.
+            _, out_base = code_and_output(cute_matmul_mma_fp8, (x, y), **base_cfg)
+            # N-only A-multicast cluster.
+            code, out_cn2 = code_and_output(
+                cute_matmul_mma_fp8, (x, y), **base_cfg, tcgen05_cluster_n=2
+            )
+            self.assertEqual(tuple(out_cn2.shape), (m, n))
+            self.assertIn("cute.nvgpu.tcgen05", code)
+            # The 2-CTA cluster launches along the flat grid_x: (cluster_n,1,1).
+            self.assertIn("_helion_cute_cluster_shape = (2, 1, 1)", code)
+            # Every row at the fp8 floor (no dropped/half output).
+            torch.testing.assert_close(
+                out_cn2.float(), ref, atol=1.0, rtol=1e-1
+            )
+            # Multicast must not change the answer vs the non-clustered path.
+            torch.testing.assert_close(
+                out_cn2.float(), out_base.float(), atol=0.5, rtol=1e-2
+            )
+
     def test_matmul_mma_tcgen05_fp8_col_major_b(self) -> None:
         support = get_cute_mma_support()
         if not support.tcgen05_f8:

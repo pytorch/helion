@@ -46,6 +46,21 @@ class CuteTcgen05StoreValue:
     use_tma_store_epilogue: bool = False
     tma_store_full_tiles_only: bool = False
     partial_output_tma_store: bool = False
+    # Single padded-M tcgen05 tile: the real problem M does not even fill one
+    # ``bm`` tile (``m_size <= bm``, e.g. M=16 on a 64/128-row tile) while N
+    # divides ``bn`` and K divides ``bk`` cleanly, so the ONLY masked output
+    # boundary is the M rows AND there is exactly one M tile. The full-tile
+    # predicate is then statically false (``m_offset + bm <= m_size`` can never
+    # hold), so the SIMT edge store always runs; the edge branch can drop the
+    # dead full-tile fast path and use a single vectorized ``logical_divide``
+    # predicated copy with an M-only row predicate (one boolean mask + one
+    # ``cute.copy``) instead of the per-element scalar ``elem_less``/``if`` loop,
+    # cutting epilogue issue overhead on the streaming warps. Set from
+    # ``tcgen05_flat_m_edge_single_tile`` in ``_emit_mma_pipeline`` (note this is
+    # narrower than the load-side ``tcgen05_flat_m_edge_tma``, which also relaxes
+    # the AB-load predicate for the multi-M-tile ``m_size > bm`` edge case where
+    # the first tile is a genuine full tile and must keep its plain store).
+    flat_m_edge: bool = False
     # Output element dtype (cutlass type string, e.g. "cutlass.BFloat16")
     # used when computing the tcgen05 epilogue tile.
     epi_elem_dtype_str: str = ""

@@ -92,10 +92,12 @@ from .tcgen05_constants import TCGEN05_LARGE_BN_PROOF_CLUSTER_M
 from .tcgen05_constants import TCGEN05_LARGE_BN_PROOF_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_LARGE_BN_PROOF_PID_TYPE
 from .tcgen05_constants import TCGEN05_LARGE_BN_PROOF_PROBLEM_SHAPE
+from .tcgen05_constants import TCGEN05_MIN_BLOCK_M
 from .tcgen05_constants import TCGEN05_SCHED_STAGE_COUNT_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_M
 from .tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_N
 from .tcgen05_constants import TCGEN05_TWO_CTA_EDGE_TMA_STORE_MAX_AB_STAGES
+from .tcgen05_constants import tcgen05_static_shape_eligible
 from .tcgen05_lifecycle import Tcgen05LifecycleContext
 from .tcgen05_pure_matmul import Tcgen05PureMatmulObjectModel
 
@@ -979,9 +981,17 @@ def prepare_cute_collective_lane_loop_suppression(
                     bk = int(bs)
         if bm is None or bn is None or bk is None:
             continue
+        static_m, static_n, static_k = _static_mma_shape(lhs_fake, rhs_fake)
         if (
             _choose_mma_impl(
-                lhs_fake.dtype, bm=bm, bn=bn, bk=bk, config=cg.device_function.config
+                lhs_fake.dtype,
+                bm=bm,
+                bn=bn,
+                bk=bk,
+                static_m=static_m,
+                static_n=static_n,
+                static_k=static_k,
+                config=cg.device_function.config,
             )
             != "tcgen05"
         ):
@@ -1060,6 +1070,13 @@ class _PerKiterTmaArgs:
     # (cute_plan.md §6.12.7). Default 1 preserves byte-identity for the
     # validated cluster_m=2 cluster_n=1 path.
     cluster_n: int = 1
+    # When True the A ``cute.copy`` passes ``mcast_mask`` even though this is
+    # not a two-cta loop. Set by the N-only CtaGroup.ONE A-multicast cluster
+    # (cluster_m=1, cluster_n=2), where A is multicast across the 2 N-CTAs but
+    # the mainloop stays flat / owner-ungated. Defaults False so all existing
+    # non-cluster and two-cta call sites keep their byte-identical emission
+    # (the two-cta path drives the A mask via ``is_two_cta`` below).
+    use_tma_a_mcast_mask: bool = False
     # Static-full one-CTA pipelined TMA loops can drop the per-K runtime
     # full-tile branch and scalar fallback. Non-pipelined/asymmetric or two-CTA
     # TMA paths must keep the guarded fallback path.
@@ -1074,7 +1091,8 @@ def _kloop_tma_copy_a_src(args: _PerKiterTmaArgs, *, k_offset: str) -> str:
     """
     if not args.use_tma_a:
         return ""
-    mcast = f", mcast_mask={args.tma_a_mcast_mask}" if args.is_two_cta else ""
+    a_mcast = args.is_two_cta or args.use_tma_a_mcast_mask
+    mcast = f", mcast_mask={args.tma_a_mcast_mask}" if a_mcast else ""
     return (
         f"    cute.copy({args.tma_atom_a}, "
         f"{args.tma_gA}[None, {k_offset}], "
@@ -1520,6 +1538,10 @@ class _InitialPrefetchTmaArgs:
     use_tma_b_mcast_mask: bool
     skip_producer_acquire: bool
     skip_producer_advance: bool
+    # See ``_PerKiterTmaArgs.use_tma_a_mcast_mask``: drives the A multicast for
+    # the N-only CtaGroup.ONE cluster. Defaults False so two-cta and
+    # non-cluster prefetch call sites stay byte-identical.
+    use_tma_a_mcast_mask: bool = False
 
 
 def _initial_prefetch_copy_a_src(
@@ -1532,7 +1554,8 @@ def _initial_prefetch_copy_a_src(
     ``test_mcast_mask_asymmetry_between_a_and_b`` for the per-K-iter
     builders.
     """
-    mcast = f", mcast_mask={args.tma_a_mcast_mask}" if args.is_two_cta else ""
+    a_mcast = args.is_two_cta or args.use_tma_a_mcast_mask
+    mcast = f", mcast_mask={args.tma_a_mcast_mask}" if a_mcast else ""
     return (
         f"    cute.copy({args.tma_atom_a}, "
         f"{args.tma_gA}[None, {k_offset}], "
@@ -1976,7 +1999,16 @@ def _emit_mma_pipeline(
             f"pid_type={TCGEN05_LARGE_BN_PROOF_PID_TYPE!r}",
         )
 
-    mma_impl = _choose_mma_impl(input_dtype, bm=bm, bn=bn, bk=bk, config=df.config)
+    mma_impl = _choose_mma_impl(
+        input_dtype,
+        bm=bm,
+        bn=bn,
+        bk=bk,
+        static_m=m_size,
+        static_n=n_size,
+        static_k=k_total_size,
+        config=df.config,
+    )
     zero_acc_expr = acc_expr is not None and _is_zero_acc_expr(acc_expr)
     if (
         not zero_acc_expr
@@ -2012,6 +2044,38 @@ def _emit_mma_pipeline(
     tcgen05_has_k_tail = k_total_size > bk and k_total_size % bk != 0
     tcgen05_k_tail_only = tcgen05_static_output_tiles and tcgen05_has_k_tail
     tcgen05_double_edge_output = m_size % bm != 0 and n_size % bn != 0
+    # Flat (cluster_m=1, non-persistent) M-edge-only case: the M tile exceeds the
+    # real M (e.g. M=16 on a 64/128-row tile) but N and K divide cleanly. This is
+    # the tiny-M GEMM that pads/masks M onto a tcgen05 tile, the way CUTLASS' SM100
+    # fp8 kernel does. TMA's descriptor (built with the real m_size) bounds-clamps
+    # the partial A stripe, so TMA can be kept for the WHOLE mainloop instead of
+    # falling to the per-element scalar AB load on every K iteration (the
+    # ``tcgen05_mixed_tma_scalar_fallback`` path would otherwise serialize the
+    # entire B read -- ~100x slower). The store side is already SIMT-predicated for
+    # the partial M rows, so only the A/B LOAD output-tile predicate is relaxed (M
+    # term becomes ``m_offset < m_size`` instead of ``m_offset + bm <= m_size``).
+    tcgen05_flat_m_edge_tma = (
+        mma_impl == "tcgen05"
+        and tcgen05_use_tma_pipeline
+        and not tcgen05_pid_is_persistent
+        and tcgen05_cluster_m == 1
+        # cluster_n=1 is the plain flat path; cluster_n=2 is the N-only
+        # A-multicast cluster, which keeps the identical flat M-edge
+        # output-tile predicate (each CTA still owns one bm x bn tile and
+        # masks the padded M rows). The cluster only changes the A TMA load.
+        and tcgen05_cluster_n_requested in (1, 2)
+        and m_size % bm != 0
+        and n_size % bn == 0
+        and k_total_size % bk == 0
+    )
+    # The leaner SIMT-store optimization (drop the full-tile fast path, emit a
+    # single M-only predicated copy) is only valid when there is exactly ONE
+    # padded M tile -- i.e. the real M does not even fill one ``bm`` tile, so the
+    # full-tile predicate ``m_offset + bm <= m_size`` is statically unsatisfiable.
+    # When ``m_size > bm`` (multiple M tiles, the last one partial) the first M
+    # tile IS a genuine full tile and must keep its unpredicated vectorized store,
+    # so only the load-side TMA relaxation (``tcgen05_flat_m_edge_tma``) applies.
+    tcgen05_flat_m_edge_single_tile = tcgen05_flat_m_edge_tma and m_size <= bm
     tcgen05_double_edge_tma = (
         mma_impl == "tcgen05"
         and tcgen05_use_tma_pipeline
@@ -2046,6 +2110,25 @@ def _emit_mma_pipeline(
         and not tcgen05_pid_is_persistent
         and tcgen05_cluster_m == 1
     )
+    # For the single-padded-M-tile flat edge case the per-K full-tile predicate
+    # ``tcgen05_tma_full_tile`` is statically TRUE on every launched tile and K
+    # iteration: M is a single tile so ``m_offset`` is always 0 (``0 < m_size``),
+    # N divides ``bn`` (and ``2*bn`` under the N-only cluster) so every launched
+    # N tile is full, and K divides ``bk`` (``flat_m_edge_tma`` requires
+    # ``k_total_size % bk == 0``) so every K iter is full. The TMA descriptor is
+    # built with the real ``m_size`` and bounds-clamps the padded A stripe, so
+    # TMA carries the WHOLE mainloop. The per-K ``else:`` scalar-AB-fallback
+    # branch (a 4096/8192-element predicated scalar load loop) plus its two extra
+    # in-loop ``sync_threads()`` barriers are therefore provably DEAD code that
+    # only adds control flow and barrier stalls to the hot K-loop. Suppress that
+    # dead ``else`` emission while keeping the ``if tcgen05_tma_full_tile:`` taken
+    # path -- producer TMA (incl. the cluster_n=2 A multicast), consumer wait,
+    # MMA issue, and consumer release -- byte-identical. This does NOT switch to
+    # ``tcgen05_static_full_tma_fast_path`` (which drops the full-tile wrapper and
+    # is gated on ``tcgen05_static_full_tiles``, false here), so it leaves
+    # ``tcgen05_mixed_tma_scalar_fallback`` / the TMA-keep guard / the N-only
+    # A-multicast cluster (``tcgen05_n_only_cluster``) all untouched.
+    tcgen05_flat_m_edge_no_scalar_fallback = tcgen05_flat_m_edge_single_tile
     tcgen05_edge_scalar_fallback_needs_inter_smem_a = (
         tcgen05_mixed_tma_scalar_fallback
         and bk >= 128
@@ -2144,19 +2227,56 @@ def _emit_mma_pipeline(
     # this validated pairing demote to cluster_n=1 instead of throwing —
     # explicit user configs hit the BackendUnsupported gate, and autotune
     # stays narrowed to the validated subset.
+    # cluster_n=2 has two validated codegen envelopes:
+    #   1. cluster_m=2, use_2cta=True (V=2): the canonical Quack 4-CTA cluster.
+    #   2. cluster_m=1, CtaGroup.ONE: the N-only A-multicast cluster for the
+    #      tiny-M padded tcgen05 fp8 path. Two CTAs each own their own N output
+    #      tile and run the flat (non-persistent, monolithic) mainloop
+    #      independently; the cluster exists ONLY to TMA-multicast the shared A
+    #      operand along the N axis. This mirrors torch's ``_scaled_mm`` CUTLASS
+    #      ClusterShape<1,2,1> selection at M<=64,N>=3072 and is the right lever
+    #      for the memory-bound tiny-M shape (cluster_m=2 has nothing to share
+    #      along M). See cute_plan.md §6.12 for envelope 1.
+    # Restricted to a SINGLE M-tile (``m_size <= bm``): the flat grid maps
+    # consecutive grid_x ids to adjacent N-tiles of m_tile 0, so a 2-CTA
+    # cluster along grid_x always pairs two N-tiles that share the SAME A
+    # rows. With multiple M-tiles a cluster pair could straddle an
+    # m_tile boundary (different A rows), and each CTA's multicast A copy
+    # would clobber its peer's SMEM A -> wrong output. The target tiny-M
+    # shapes (M<=64 on a 64/128-row tile) are exactly the single-M-tile
+    # case, which is also what torch's _scaled_mm pads M to.
+    tcgen05_n_only_cluster = (
+        mma_impl == "tcgen05"
+        and tcgen05_cluster_n_requested == 2
+        and tcgen05_cluster_m == 1
+        and not tcgen05_requested_two_cta
+        and tcgen05_use_tma_pipeline
+        and not tcgen05_pid_is_persistent
+        and m_size <= bm
+        and n_size % (bn * tcgen05_cluster_n_requested) == 0
+        and k_total_size % bk == 0
+    )
     if tcgen05_cluster_n_requested > 1 and not (
-        mma_impl == "tcgen05" and tcgen05_is_two_cta and tcgen05_cluster_m == 2
+        (mma_impl == "tcgen05" and tcgen05_is_two_cta and tcgen05_cluster_m == 2)
+        or tcgen05_n_only_cluster
     ):
         if mma_impl == "tcgen05" and tcgen05_cluster_n_requested == 2:
             raise exc.BackendUnsupported(
                 "cute",
-                "tcgen05_cluster_n=2 requires tcgen05_cluster_m=2 with "
-                "use_2cta=True (bm=256). See cute_plan.md §6.12 for the "
-                "validated 4-CTA cluster envelope.",
+                "tcgen05_cluster_n=2 requires either tcgen05_cluster_m=2 with "
+                "use_2cta=True (bm=256, the 4-CTA cluster; cute_plan.md §6.12) "
+                "or tcgen05_cluster_m=1 with a flat non-persistent TMA pipeline "
+                "and an N extent divisible by 2*block_n (the N-only A-multicast "
+                "cluster). For the latter K must divide block_k.",
             )
         tcgen05_cluster_n = 1
     else:
         tcgen05_cluster_n = tcgen05_cluster_n_requested
+    # The N-only cluster reuses the same per-CTA multicast machinery as the
+    # 2-CTA path for A (mcast atom + mask + cta-layout slices + arrive count),
+    # but keeps the flat owner-ungated mainloop: each CTA is its own MMA owner
+    # (CtaGroup.ONE => every CTA is a cluster leader), so no V-leader gating.
+    tcgen05_a_mcast_cluster = tcgen05_is_two_cta or tcgen05_n_only_cluster
     tcgen05_role_local_k_tail_tma = (
         tcgen05_preserve_tma_for_two_cta_k_tail
         and tcgen05_is_two_cta
@@ -2405,6 +2525,40 @@ def _emit_mma_pipeline(
         or tcgen05_role_local_n_edge_tma
         or tcgen05_role_local_double_edge_tma
     ) and tcgen05_output_edge_tma_store_fits_smem
+    # Flat (cluster_m=1, non-persistent) tiny-M single padded tile: route the
+    # padded-M output store through the SAME coalesced SMEM-staged TMA bulk
+    # store the static-full flat path uses (T2R -> R2S into the C-ring SMEM ->
+    # ``cute.copy(CopyBulkTensorTileS2GOp, sD, gD)`` via PipelineTmaStore),
+    # instead of the uncoalesced per-thread register->global predicated SIMT
+    # store. The host TMA-store descriptor is built from the REAL output shape
+    # (``arg{d_idx}.shape``; see ``append_tcgen05_epilogue_tma_wrapper``), so the
+    # bulk store of the bm-row box at tile origin is HARDWARE bounds-clamped to
+    # the real ``m_size`` rows -- the partial M rows are never written OOB, with
+    # zero device-side row predicate. This is the exact OOB-suppression the
+    # ``tcgen05_partial_output_tma_store`` aux-TMA edge family already relies on
+    # (CuTe TMA descriptor bounds checks), applied to the no-aux flat tiny-M
+    # case. Gated to the single-padded-tile envelope (``m_size <= bm``, N%bn==0,
+    # K%bk==0, cluster_n in {1,2}, CtaGroup.ONE) where there is no genuine full
+    # M tile to regress, and to the same AB-stage SMEM budget as the role-local
+    # edge TMA store.
+    #
+    # SMEM budget: this flat one-CTA padded tile has the IDENTICAL epilogue SMEM
+    # footprint as the flat static-full path (same bm x bn block, same AB-stage
+    # count, same C-stage count, same ``make_smem_layout_epi`` D buffer), which
+    # is already validated at this shape and AB-stage count (the M=64 / M%bm==0
+    # case at the same block_sizes/ab_stages reaches the static-full TMA-store
+    # epilogue). The ``tcgen05_output_edge_tma_store_fits_smem`` cap is the
+    # 2-CTA output-edge family's separate, more constrained budget (extra D tile
+    # alongside larger 2-CTA AB stages) and does NOT bound this one-CTA path.
+    # Measured on B200: the SMEM-staged TMA-store epilogue beats the predicated
+    # SIMT register->global store for padded tiles with m_size >= 32 (it removes
+    # the uncoalesced SIMT stores whose count grows with real M), but its
+    # staging/pipeline setup is NOT amortized at the very smallest m_size=16,
+    # where the SIMT store is faster. Gate the TMA store on m_size >= 32 so the
+    # tiniest-M tile keeps the cheaper SIMT store.
+    tcgen05_flat_m_edge_tma_store = (
+        tcgen05_flat_m_edge_single_tile and not tcgen05_is_two_cta and m_size >= 32
+    )
     # Flat kernels process one output tile per CTA, so the c_pipeline stage is
     # just the subtile index. Persistent kernels use a role-local tile counter
     # to rotate c_pipeline stages across work tiles. Static-full CtaGroup.TWO
@@ -2420,6 +2574,7 @@ def _emit_mma_pipeline(
             tcgen05_static_full_tiles
             or tcgen05_role_local_k_tail_tma
             or tcgen05_use_output_edge_tma_store_for_full_tiles
+            or tcgen05_flat_m_edge_tma_store
         )
         and tcgen05_role_local_codegen_allowed
         and (not _is_persistent_pid_config(df.config) or tcgen05_use_role_local_epi)
@@ -2675,7 +2830,20 @@ def _emit_mma_pipeline(
     mma_physical_m_threads = _grid_thread_extent(cg, m_block_id)
     tcgen05_cta_thread_count = _grid_cta_thread_count(cg)
     if mma_impl == "tcgen05" and tcgen05_cluster_m * tcgen05_cluster_n > 1:
-        df.cute_state.cluster_shape = (tcgen05_cluster_m, tcgen05_cluster_n, 1)
+        # The launch cluster dims map (m, n, k) -> physical grid (x, y, z).
+        # The persistent two-cta paths lay the grid out so cluster_m clusters
+        # along grid_x (e.g. (2,1,1)) and cluster_n along grid_y. The N-only
+        # flat path uses a SINGLE flat grid dimension (grid_x = total tiles,
+        # grid_y=grid_z=1) with consecutive grid_x tiles being adjacent
+        # N-tiles of the one M-tile, so its 2-CTA cluster must run ALONG
+        # grid_x: launch cluster (cluster_n, 1, 1). The kernel-internal
+        # cluster_layout_vmnk stays the logical (cluster_m, cluster_n, 1) =
+        # (1, 2, 1) so the A mcast mask (mode 2 = N) and block_idx_in_cluster
+        # -> N-coord mapping remain correct.
+        if tcgen05_n_only_cluster:
+            df.cute_state.cluster_shape = (tcgen05_cluster_n, 1, 1)
+        else:
+            df.cute_state.cluster_shape = (tcgen05_cluster_m, tcgen05_cluster_n, 1)
     tcgen05_acc_stage_count_value = _tcgen05_config_int(
         df.config, "tcgen05_acc_stages", _tcgen05_acc_stage_count(bn)
     )
@@ -2696,10 +2864,15 @@ def _emit_mma_pipeline(
     #   - cluster_m=2 cluster_n=2 V=2: 2 + 1 - 1 = 2 (the cluster_n=2 fix)
     #   - cluster_m=1 cluster_n=1 V=1 (no use_2cta): 1 (collapses to single
     #     CTA; no multicast)
-    if tcgen05_is_two_cta and tcgen05_cluster_n > 1:
+    #   - cluster_m=1 cluster_n=2 V=1 (N-only CtaGroup.ONE A-multicast):
+    #     num_mcast_ctas_a = cluster_n = 2, num_mcast_ctas_b = cluster_m / 1 =
+    #     1 -> 2 + 1 - 1 = 2. Both N-CTAs receive the multicast A and each
+    #     arrives once on the AB empty barrier; the producer waits for 2.
+    if (tcgen05_is_two_cta or tcgen05_n_only_cluster) and tcgen05_cluster_n > 1:
         # V=2 absorbs cluster_m into the cluster_layout_vmnk V dim; the
         # post-V CTAs along M (= cluster_m // V) carry the B multicast,
-        # while cluster_n CTAs along N carry the A multicast.
+        # while cluster_n CTAs along N carry the A multicast. CtaGroup.ONE
+        # keeps V=1, so cluster_m // V = cluster_m.
         v_for_mcast = 2 if tcgen05_is_two_cta else 1
         num_mcast_ctas_a = tcgen05_cluster_n
         num_mcast_ctas_b = max(1, tcgen05_cluster_m // v_for_mcast)
@@ -3706,7 +3879,21 @@ def _emit_mma_pipeline(
                 # enabled for the output-edge family, which routes partial tiles
                 # through either the full/edge split or the bounds-checked
                 # partial-output TMA-store path.
-                tma_store_handles_partial_tiles = tcgen05_use_tma_store_epilogue
+                #
+                # The flat-M-edge TMA store (``tcgen05_flat_m_edge_tma_store``)
+                # is deliberately EXCLUDED here: it is validated only for the
+                # no-aux and SIMT-predicated-aux store paths (the aux M-row
+                # predicate in ``_codegen_cute_store_tcgen05_tile`` masks the
+                # padded rows of an exact-shape rank-2 aux read). Letting it set
+                # ``tma_store_handles_partial_tiles`` would suppress the
+                # ``aux_load_mode=tma`` + partial-output rejection below and
+                # silently route a TMA-staged aux through an uncovered combo.
+                # Keep that rejection firing exactly as on the SIMT-store
+                # baseline; the flat tiny-M store optimization does not depend on
+                # aux-TMA.
+                tma_store_handles_partial_tiles = (
+                    tcgen05_use_tma_store_epilogue and not tcgen05_flat_m_edge_tma_store
+                )
                 aux_tma_needs_edge_routing = (
                     tcgen05_aux_tma_requested
                     and not tcgen05_static_output_tiles
@@ -3884,6 +4071,14 @@ def _emit_mma_pipeline(
             return (
                 f"{m_offset_var} + cutlass.Int32({bm}) <= cutlass.Int32({m_size}) "
                 f"and {n_offset_var} < cutlass.Int32({n_size}) "
+            )
+        if tcgen05_flat_m_edge_tma:
+            # Flat M-edge (padded-M tcgen05 tile): TMA's m_size-clamped descriptor
+            # loads the partial A stripe, N divides bn, so only the M term relaxes
+            # to ``m_offset < m_size`` -- every in-bounds tile is "full" for TMA.
+            return (
+                f"{m_offset_var} < cutlass.Int32({m_size}) "
+                f"and {n_offset_var} + cutlass.Int32({bn}) <= cutlass.Int32({n_size}) "
             )
         return (
             f"{m_offset_var} + cutlass.Int32({bm}) <= cutlass.Int32({m_size}) "
@@ -4105,6 +4300,10 @@ def _emit_mma_pipeline(
             tcgen05_use_tma_b_mcast_mask = (
                 tcgen05_use_tma_b_peer_mcast or tcgen05_use_tma_b_self_mcast
             )
+            # The N-only CtaGroup.ONE cluster (cluster_m=1, cluster_n=2)
+            # multicasts ONLY A across its 2 N-CTAs (mcast_mode=2). B is not
+            # multicast (cluster_m=1 => no M peers), so B keeps the plain
+            # per-CTA coord/layout (coord 0, make_layout(1)) and no B mask.
             if tcgen05_is_two_cta:
                 prefix.append(
                     statement_from_string(
@@ -4120,11 +4319,26 @@ def _emit_mma_pipeline(
                         "(0, None, 0, 0)).shape)"
                     )
                 )
+            elif tcgen05_n_only_cluster:
+                # A multicasts along the N axis (mode 2). The N-slice keeps
+                # the rank-4 (V,M,N,K) cluster_layout's N mode free; same
+                # spelling as the two-cta A path (the V mode is size 1 under
+                # CtaGroup.ONE). B uses the plain non-cluster layout.
+                prefix.append(
+                    statement_from_string(
+                        f"{tma_a_cta_layout} = cute.make_layout("
+                        f"cute.slice_({tcgen05_cluster_layout_vmnk}, "
+                        "(0, 0, None, 0)).shape)"
+                    )
+                )
+                prefix.append(
+                    statement_from_string(f"{tma_cta_layout} = cute.make_layout(1)")
+                )
             else:
                 prefix.append(
                     statement_from_string(f"{tma_cta_layout} = cute.make_layout(1)")
                 )
-            if tcgen05_cluster_m > 1 or tcgen05_is_two_cta:
+            if tcgen05_cluster_m > 1 or tcgen05_a_mcast_cluster:
                 prefix.append(
                     statement_from_string(
                         f"{tma_cta_rank_in_cluster} = cute.arch.make_warp_uniform("
@@ -4148,7 +4362,14 @@ def _emit_mma_pipeline(
                             f"{tma_b_cta_coord} = {tma_block_in_cluster_coord_vmnk}[1]"
                         )
                     )
-                if tcgen05_is_two_cta:
+                elif tcgen05_n_only_cluster:
+                    # A's coord is its N position in the cluster (mode 2).
+                    prefix.append(
+                        statement_from_string(
+                            f"{tma_a_cta_coord} = {tma_block_in_cluster_coord_vmnk}[2]"
+                        )
+                    )
+                if tcgen05_a_mcast_cluster:
                     prefix.append(
                         statement_from_string(
                             f"{tma_a_mcast_mask} = cute.nvgpu.cpasync.create_tma_multicast_mask("
@@ -4167,10 +4388,13 @@ def _emit_mma_pipeline(
                     )
             # tma_partition consumes the per-tile gA_part / gB_part, so the
             # resulting (tma_sA, tma_gA) / (tma_sB, tma_gB) are also per-tile.
-            tma_a_cta_coord_expr = tma_a_cta_coord if tcgen05_is_two_cta else "0"
+            # A uses the cluster coord/layout whenever it multicasts (two-cta
+            # OR the N-only cluster); B uses the cluster coord/layout only in
+            # the two-cta path (it is non-multicast in the N-only cluster).
+            tma_a_cta_coord_expr = tma_a_cta_coord if tcgen05_a_mcast_cluster else "0"
             tma_b_cta_coord_expr = tma_b_cta_coord if tcgen05_is_two_cta else "0"
             tma_a_cta_layout_expr = (
-                tma_a_cta_layout if tcgen05_is_two_cta else tma_cta_layout
+                tma_a_cta_layout if tcgen05_a_mcast_cluster else tma_cta_layout
             )
             tma_b_cta_layout_expr = (
                 tma_b_cta_layout if tcgen05_is_two_cta else tma_cta_layout
@@ -4286,6 +4510,7 @@ def _emit_mma_pipeline(
                     tma_b_mcast_mask=tma_b_mcast_mask,
                     is_two_cta=tcgen05_is_two_cta,
                     use_tma_b_mcast_mask=tcgen05_use_tma_b_mcast_mask,
+                    use_tma_a_mcast_mask=tcgen05_n_only_cluster,
                     skip_producer_acquire=diagnose_skip_ab_producer_acquire,
                     skip_producer_advance=diagnose_skip_ab_producer_advance,
                 )
@@ -4626,6 +4851,7 @@ def _emit_mma_pipeline(
                 scalar_load_a=scalar_load_a,
                 scalar_load_b=scalar_load_b,
                 cluster_n=tcgen05_cluster_n,
+                use_tma_a_mcast_mask=tcgen05_n_only_cluster,
                 static_full_tiles=tcgen05_static_full_tma_fast_path,
             )
             if tcgen05_use_tma_pipeline:
@@ -4774,12 +5000,25 @@ def _emit_mma_pipeline(
                     if tcgen05_use_role_local_mma_exec:
                         mma_exec_role_stmts.append(exec_loop)
                 else:
+                    # Use the shared output-tile predicate so the flat M-edge
+                    # relaxation (M term ``m_offset < m_size``) reaches the
+                    # steady-state prefetch look-ahead too -- otherwise the
+                    # producer's ``and tma_next_full_tile`` gate would be
+                    # permanently false for a padded-M tile and the mainloop
+                    # would never prefetch past the prologue.
                     cg.add_statement(
                         statement_from_string(
                             f"{tma_next_full_tile} = "
-                            f"{m_offset_var} + cutlass.Int32({bm}) <= cutlass.Int32({m_size}) "
-                            f"and {n_offset_var} + cutlass.Int32({bn}) <= cutlass.Int32({n_size}) "
-                            f"and {k_offset_var} + cutlass.Int32({bk * (tcgen05_ab_stage_count_value + 1)}) <= cutlass.Int32({k_total_size})"
+                            + _tcgen05_tma_tile_predicate(
+                                k_tile_start_expr=(
+                                    f"{k_offset_var} + cutlass.Int32("
+                                    f"{bk * tcgen05_ab_stage_count_value})"
+                                ),
+                                full_tile_end_expr=(
+                                    f"{k_offset_var} + cutlass.Int32("
+                                    f"{bk * (tcgen05_ab_stage_count_value + 1)})"
+                                ),
+                            )
                         )
                     )
                     cg.add_statement(
@@ -4807,10 +5046,12 @@ def _emit_mma_pipeline(
                             tma_kloop_args,
                             include_scalar_fallback=(
                                 not tcgen05_static_full_tma_fast_path
+                                and not tcgen05_flat_m_edge_no_scalar_fallback
                             ),
                             sync_before_scalar_fallback=(
                                 tcgen05_sync_before_scalar_fallback
                                 and not tcgen05_static_full_tma_fast_path
+                                and not tcgen05_flat_m_edge_no_scalar_fallback
                             ),
                         )
                     )
@@ -4923,6 +5164,7 @@ def _emit_mma_pipeline(
                                 tma_kloop_args,
                                 include_scalar_fallback=(
                                     not tcgen05_static_full_tma_fast_path
+                                    and not tcgen05_flat_m_edge_no_scalar_fallback
                                 ),
                             )
                         )
@@ -5083,6 +5325,7 @@ def _emit_mma_pipeline(
                 use_tma_store_epilogue=tcgen05_use_tma_store_epilogue,
                 tma_store_full_tiles_only=tcgen05_tma_store_full_tiles_only,
                 partial_output_tma_store=tcgen05_partial_output_tma_store,
+                flat_m_edge=tcgen05_flat_m_edge_single_tile,
                 # Mirror the value passed to `_make_tcgen05_layout_plan_setup`
                 # above; the store path compares this against `target_dtype`
                 # to enforce the kernel/store equality contract on
@@ -5270,6 +5513,35 @@ def _tcgen05_epi_warp_count(
     return min(cta_warp_count, max(1, warp_spec.epi_warps))
 
 
+def _static_mma_dim(dim: object) -> int | None:
+    """Return a shape dim as a concrete int, or None for a dynamic (symbolic) one.
+
+    A ``None`` extent means a dynamic shape and leaves tcgen05 eligible (the
+    config-spec resolves a size hint in that case), matching
+    ``tcgen05_static_shape_eligible``.
+    """
+    return dim if isinstance(dim, int) else None
+
+
+def _static_mma_shape(
+    lhs_fake: torch.Tensor, rhs_fake: torch.Tensor
+) -> tuple[int | None, int | None, int | None]:
+    """Static (real problem) M, N, K of a matmul, each None if dynamic.
+
+    Used to gate tcgen05 MMA-impl selection on the same static extents the
+    autotune config-spec uses to register the ``tcgen05_*`` keys (so the two
+    can never diverge). Indexes from the trailing dims so batched operands
+    (baddbmm ``[B, M, K]`` / ``[B, K, N]``) resolve the same way as plain 2D:
+    M = LHS ``[-2]``, K = LHS ``[-1]``, N = RHS ``[-1]``.
+    """
+    if lhs_fake.ndim < 2 or rhs_fake.ndim < 2:
+        return None, None, None
+    static_m = _static_mma_dim(lhs_fake.shape[-2])
+    static_k = _static_mma_dim(lhs_fake.shape[-1])
+    static_n = _static_mma_dim(rhs_fake.shape[-1])
+    return static_m, static_n, static_k
+
+
 def _mma_impl_matches_problem_shape(
     mma_impl: str,
     input_dtype: torch.dtype,
@@ -5277,11 +5549,30 @@ def _mma_impl_matches_problem_shape(
     bm: int,
     bn: int,
     bk: int,
+    static_m: int | None = None,
+    static_n: int | None = None,
+    static_k: int | None = None,
     tcgen05_cluster_m: int = 1,
     tcgen05_large_bn_proof: bool = False,
 ) -> bool:
     if mma_impl == "universal":
         return True
+    # Codegen/config-spec consistency via one shared predicate
+    # (``tcgen05_static_shape_eligible``). The config-spec (matmul_ops.py)
+    # registers the ``tcgen05_*`` config keys exactly when this predicate passes;
+    # codegen must select tcgen05 on the SAME predicate or the two diverge and
+    # the warp-spec lookup in ``_emit_mma_pipeline`` hits a hard ``KeyError``.
+    # The predicate gates M on ``block_m`` (the chosen tile), NOT the static M:
+    # ``block_m`` may legally EXCEED the real problem M for tiny-M GEMMs (e.g.
+    # M=16 on a 64/128-row padded tile, masking the rows beyond the real M,
+    # exactly as CUTLASS' SM100 fp8 kernel does). A sub-tile ``block_m`` (<
+    # ``TCGEN05_MIN_BLOCK_M``) has no tcgen05 atom and falls back to
+    # warp/universal. N/K gate on their static extents. ``static_m`` is retained
+    # in the signature for callers/diagnostics but no longer gates selection.
+    if mma_impl == "tcgen05" and not tcgen05_static_shape_eligible(
+        input_dtype, block_m=bm, static_n=static_n, static_k=static_k
+    ):
+        return False
     is_fp8 = input_dtype == torch.float8_e4m3fn
     if (
         input_dtype not in (torch.float16, torch.bfloat16, torch.float8_e4m3fn)
@@ -5344,6 +5635,9 @@ def _choose_mma_impl(
     bm: int,
     bn: int,
     bk: int,
+    static_m: int | None = None,
+    static_n: int | None = None,
+    static_k: int | None = None,
     config: object | None = None,
 ) -> str:
     tcgen05_cluster_m = 1
@@ -5367,6 +5661,9 @@ def _choose_mma_impl(
             bm=bm,
             bn=bn,
             bk=bk,
+            static_m=static_m,
+            static_n=static_n,
+            static_k=static_k,
             tcgen05_cluster_m=tcgen05_cluster_m,
             tcgen05_large_bn_proof=tcgen05_large_bn_proof,
         ):
@@ -5378,6 +5675,9 @@ def _choose_mma_impl(
         bm=bm,
         bn=bn,
         bk=bk,
+        static_m=static_m,
+        static_n=static_n,
+        static_k=static_k,
         tcgen05_cluster_m=tcgen05_cluster_m,
         tcgen05_large_bn_proof=tcgen05_large_bn_proof,
     ):
@@ -6218,11 +6518,15 @@ def codegen_cute_mma_direct_mm(
     if load_plan is None:
         return None
 
+    static_m, static_n, static_k = _static_mma_shape(lhs_fake, rhs_fake)
     mma_impl = _choose_mma_impl(
         lhs_fake.dtype,
         bm=plan.bm,
         bn=plan.bn,
         bk=plan.bk,
+        static_m=static_m,
+        static_n=static_n,
+        static_k=static_k,
         config=ctx.cg.device_function.config,
     )
     # The grouped-N direct path only emits warp MMA. Auto-selection prefers
