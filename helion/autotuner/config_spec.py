@@ -448,6 +448,8 @@ class ConfigSpec:
         self.static_ranges: BlockIdSequence[StaticRangeSpec] = BlockIdSequence()
 
         self.allowed_pid_types: tuple[PidTypeLiteral, ...] = tuple(VALID_PID_TYPES)
+        # Why each disabled pid_type was removed, for search-space logging.
+        self.disallowed_pid_type_reasons: dict[str, str] = {}
         self.max_num_sm_multiplier: int = MAX_NUM_SM_MULTIPLIER
         self.grid_block_ids: list[int] = []
         self.tensor_numel_constraints: list[TensorNumelConstraint] = []
@@ -597,9 +599,17 @@ class ConfigSpec:
         self.range_flattens._remove_duplicates()
         self.static_ranges._remove_duplicates()
 
-    def disallow_pid_type(self, pid_type: PidTypeLiteral) -> None:
-        """Disallow a pid_type from being used in the config."""
+    def disallow_pid_type(
+        self, pid_type: PidTypeLiteral, reason: str | None = None
+    ) -> None:
+        """Disallow a pid_type from being used in the config.
 
+        ``reason`` explains why the pid_type is unavailable for this kernel; it is
+        recorded (first reason wins) and surfaced by the search-space logger.
+        """
+
+        if pid_type in self.allowed_pid_types and reason is not None:
+            self.disallowed_pid_type_reasons.setdefault(pid_type, reason)
         self.allowed_pid_types = tuple(
             [x for x in self.allowed_pid_types if x != pid_type]
         )

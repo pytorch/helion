@@ -9,6 +9,7 @@ from helion.autotuner.search_space_logger import FeatureExplorationTracker
 from helion.autotuner.search_space_logger import SearchSpaceDimension
 from helion.autotuner.search_space_logger import SearchSpaceSummary
 from helion.autotuner.search_space_logger import _analyze_dimension_size
+from helion.autotuner.search_space_logger import analyze_search_space
 
 
 class _FakeConfig:
@@ -338,6 +339,74 @@ class TestAnalyzeDimensionSize(unittest.TestCase):
         assert dim is not None
         self.assertEqual(dim.size, 4)
         self.assertIsNone(dim.constrained_by)
+
+
+class TestDisallowPidTypeReasons(unittest.TestCase):
+    def _spec(self) -> object:
+        from helion._compiler.backend import TritonBackend
+        from helion.autotuner.config_spec import ConfigSpec
+
+        return ConfigSpec(backend=TritonBackend())
+
+    def test_reason_recorded_on_disallow(self) -> None:
+        spec = self._spec()
+        spec.disallow_pid_type("xyz", reason="grid too large for y/z")
+        self.assertEqual(
+            spec.disallowed_pid_type_reasons["xyz"], "grid too large for y/z"
+        )
+        self.assertNotIn("xyz", spec.allowed_pid_types)
+
+    def test_first_reason_wins(self) -> None:
+        """A pid_type disabled twice keeps the first reason (already removed the
+        second time)."""
+        spec = self._spec()
+        spec.disallow_pid_type("xyz", reason="first")
+        spec.disallow_pid_type("xyz", reason="second")
+        self.assertEqual(spec.disallowed_pid_type_reasons["xyz"], "first")
+
+    def test_no_reason_leaves_map_empty(self) -> None:
+        spec = self._spec()
+        spec.disallow_pid_type("xyz")
+        self.assertNotIn("xyz", spec.disallowed_pid_type_reasons)
+
+    def test_analyze_search_space_surfaces_reason(self) -> None:
+        spec = self._spec()
+        spec.disallow_pid_type("xyz", reason="grid too large for y/z")
+        summary = analyze_search_space(spec, kernel_name="k")
+        pid_constraints = [
+            c for c in summary.shape_constraints if c.startswith("pid_type restricted")
+        ]
+        self.assertEqual(len(pid_constraints), 1)
+        self.assertIn("xyz (grid too large for y/z)", pid_constraints[0])
+
+    def test_analyze_search_space_disabled_without_reason(self) -> None:
+        """A pid_type disabled with no reason still lists the bare name."""
+        spec = self._spec()
+        spec.disallow_pid_type("xyz")
+        summary = analyze_search_space(spec, kernel_name="k")
+        pid_constraints = [
+            c for c in summary.shape_constraints if c.startswith("pid_type restricted")
+        ]
+        self.assertEqual(len(pid_constraints), 1)
+        self.assertIn("disabled: xyz", pid_constraints[0])
+        self.assertNotIn("xyz (", pid_constraints[0])
+
+    def test_stale_reason_ignored_when_pid_type_reallowed(self) -> None:
+        """If a pid_type is disallowed-with-reason then later re-added to
+        allowed_pid_types directly, the stale reason must not appear."""
+        spec = self._spec()
+        spec.disallow_pid_type("xyz", reason="temporarily out")
+        # Re-widen allowed_pid_types directly (as some backends do), leaving the
+        # stale reason behind in disallowed_pid_type_reasons.
+        spec.allowed_pid_types = (*spec.allowed_pid_types, "xyz")
+        self.assertIn("xyz", spec.disallowed_pid_type_reasons)  # still recorded
+        summary = analyze_search_space(spec, kernel_name="k")
+        pid_constraints = [
+            c for c in summary.shape_constraints if c.startswith("pid_type restricted")
+        ]
+        # xyz is allowed again, so it is neither listed nor annotated.
+        for c in pid_constraints:
+            self.assertNotIn("xyz", c)
 
 
 if __name__ == "__main__":

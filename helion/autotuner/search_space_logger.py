@@ -476,9 +476,18 @@ def analyze_search_space(
             pt for pt in VALID_PID_TYPES if pt not in config_spec.allowed_pid_types
         ]
         if disabled_pid_types:
+            # Only annotate pid_types that are *currently* disabled. Iterating
+            # disabled_pid_types (derived from allowed_pid_types) means a stale
+            # reason left for a later re-allowed pid_type is ignored, so the two
+            # structures can't drift into wrong output.
+            reasons = config_spec.disallowed_pid_type_reasons
+            disabled_desc = ", ".join(
+                f"{pt} ({reasons[pt]})" if pt in reasons else pt
+                for pt in disabled_pid_types
+            )
             shape_constraints.append(
                 f"pid_type restricted to {list(config_spec.allowed_pid_types)} "
-                f"(disabled: {', '.join(disabled_pid_types)})"
+                f"(disabled: {disabled_desc})"
             )
 
     if config_spec.cute_flash_search_enabled:

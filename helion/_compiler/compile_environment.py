@@ -290,11 +290,17 @@ class CompileEnvironment:
             tuple[int, sympy.Expr], int | torch.SymInt
         ] = {}
         if settings.autotune_force_persistent or dist.is_initialized():
+            reason = (
+                "autotune_force_persistent is set"
+                if settings.autotune_force_persistent
+                else "a distributed process group is initialized (persistent "
+                "kernels required)"
+            )
             for pid_type in (
                 "flat",
                 "xyz",
             ):
-                self.config_spec.disallow_pid_type(pid_type)
+                self.config_spec.disallow_pid_type(pid_type, reason=reason)
 
         if dist.is_initialized():
             from torch._C._distributed_c10d import _SymmetricMemory

@@ -39,7 +39,11 @@ def _(origin: Origin, **kwargs: object) -> LiteralType:
     # so force persistent kernels (other PID choices are incompatible).
     env.has_barrier = True
     for disallowed in ("flat", "xyz", "persistent_interleaved"):
-        env.config_spec.disallow_pid_type(disallowed)
+        env.config_spec.disallow_pid_type(
+            disallowed,
+            reason="hl.barrier() forces a persistent kernel (sequential phase "
+            "boundary between top-level loops); this pid_type is incompatible",
+        )
 
     # Return None literal with a dedicated marker type.
     return BarrierResultType(origin=origin, value=None)

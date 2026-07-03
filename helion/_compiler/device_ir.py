@@ -3062,7 +3062,11 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
             # xyz is not supported with shared program IDs. Non-tcgen05
             # persistent kernels are allowed; tcgen05 persistent has a
             # single-root scheduler/grid contract today.
-            config_spec.disallow_pid_type("xyz")
+            config_spec.disallow_pid_type(
+                "xyz",
+                reason="multiple root loops share program IDs; xyz grids are not "
+                "supported with shared program IDs",
+            )
             if config_spec.cute_tcgen05_search_enabled:
                 # The tcgen05 persistent launch grid is derived from a single
                 # root's PID space today. Keep persistent pid types out of
@@ -3079,6 +3083,13 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
                         "pid type is available. Disable forced/distributed "
                         "persistent-only mode or use a single root loop."
                     )
+                for pid_type in config_spec.allowed_pid_types:
+                    if pid_type not in non_persistent_pid_types:
+                        config_spec.disallowed_pid_type_reasons.setdefault(
+                            pid_type,
+                            "CuTe tcgen05 multi-root kernels do not support "
+                            "persistent pid types yet (single-root launch grid)",
+                        )
                 config_spec.allowed_pid_types = non_persistent_pid_types
 
         # Collect per-load/store metadata once; derive the load/store tunables
