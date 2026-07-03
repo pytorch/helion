@@ -6,6 +6,7 @@ import logging
 from pathlib import Path
 from typing import TYPE_CHECKING
 from typing import Any
+from typing import ClassVar
 from typing import NamedTuple
 from typing import cast
 
@@ -30,6 +31,7 @@ if TYPE_CHECKING:
     from ...autotuner.config_spec import ReductionKernelFact
     from ..compile_environment import CompileEnvironment
     from ..device_ir import DeviceIR
+    from .common import HardwareTarget
 
 
 log = logging.getLogger(__name__)
@@ -527,7 +529,8 @@ class _TritonReductionSeedBase(AutotunerHeuristic):
     """
 
     backend = "triton"
-    HARDWARE_TARGETS = (("cuda", "sm90"),)
+    # Widen the declared type so the sm100 subclass can retarget it (the base is sm90-only).
+    HARDWARE_TARGETS: ClassVar[tuple[HardwareTarget, ...]] = (("cuda", "sm90"),)
 
     # ----- THE BUDGET (a register/byte capacity; everything else is a per-axis desire) -----
     # Per-program persistent byte ceiling: the group's resident working set — the sum over its live
@@ -668,6 +671,14 @@ class _TritonReductionSeedBase(AutotunerHeuristic):
             and not f.reductions_fed
             for f in facts
         )
+
+    @classmethod
+    def non_reduction_loop_block_cap(
+        cls, spec: ConfigSpec, pd: ReductionDescriptor
+    ) -> int | None:
+        """Optional element cap for a non-reduction apply loop. ``None`` = no extra cap beyond the
+        shared ``loop_budget`` (sm90/H100 unchanged); a subclass may return a smaller budget."""
+        return None
 
     # =============================== scalar levers (outside the budget) ===================== #
     @classmethod
@@ -1091,6 +1102,8 @@ class _TritonReductionSeedBase(AutotunerHeuristic):
         # in a group's reduction tile (a separate sequential pass), so each gets a FRESH budget
         # against its own extent capped by the streamed ROW budget.
         loop_budget = _pp2(max(1, cls.ROW_PERSIST_MAX_BYTES // itemsize))
+        # Optional tighter cap for a non-reduction apply loop (None on the base; set by sm100).
+        loop_cap = cls.non_reduction_loop_block_cap(spec, pd)
         for i in range(len(spec.block_sizes)):
             bs_spec = cast("BlockSizeSpec", spec.block_sizes[i])
             bid = bs_spec.block_id
@@ -1099,7 +1112,10 @@ class _TritonReductionSeedBase(AutotunerHeuristic):
             if bid in non_reduction_loop_ids or bid not in seated:
                 # a non-reduction apply loop OR an independent standalone tiled loop: size it to
                 # its own extent capped by the headroom (flooring it to 1 would serialize the pass).
-                sizes[bid] = max(1, min(extent_of(bid), loop_budget))
+                budget = loop_budget
+                if loop_cap is not None and bid in non_reduction_loop_ids:
+                    budget = min(budget, loop_cap)
+                sizes[bid] = max(1, min(extent_of(bid), budget))
 
         # ---- assemble the full block_sizes vector ----
         block_sizes: list[int] = []
@@ -1172,7 +1188,11 @@ class TritonStandardReductionHeuristic(_TritonReductionSeedBase):
         cls, env: CompileEnvironment, device_ir: DeviceIR
     ) -> Config | None:
         if not matches_hardware(env, cls.HARDWARE_TARGETS):
-            # Off the H100-validated target: keep the upstream conservative seed.
+            # sm100 has its own subclass (``TritonStandardReductionHeuristicSM100``); decline here so
+            # exactly one reduction seed fires on B200.
+            if matches_hardware(env, (("cuda", "sm100"),)):
+                return None
+            # Off any other target: keep the upstream conservative seed.
             return cls._narrow_seed(env)
         spec = env.config_spec
         pd = _primary_descriptor_selected(env)
@@ -1308,6 +1328,109 @@ class TritonUserTiledReductionHeuristic(_TritonReductionSeedBase):
             if ev is not None:
                 seed["load_eviction_policies"] = ev
         return Config(**seed)
+
+
+def _config_with_num_warps(cfg: Config, num_warps: int) -> Config:
+    """Return a copy of ``cfg`` with ``num_warps`` overridden (the reduction seeds always set
+    num_warps, so this replaces the existing value)."""
+    merged: dict[str, Any] = {**cfg.config, "num_warps": num_warps}
+    return Config(**merged)
+
+
+# ============================ sm100 (B200) dedicated subclasses ============================ #
+# Re-target the sm90 reduction seeds at sm100 via a subclass that overrides only the hardware gate +
+# B200 constants; the sm90/H100 emit is a separate class + gate, so it stays frozen.
+class _TritonReductionSeedSM100(_TritonReductionSeedBase):
+    """sm100 (B200) constant/gate carrier for the two reduction seed tracks. Overrides the hardware
+    gate + ``promote_seed_to_default`` and re-tunes constants (as class attributes) only where a B200
+    measurement demands it. Not registered; the two concrete subclasses below are."""
+
+    promote_seed_to_default = True
+    HARDWARE_TARGETS = (("cuda", "sm100"),)
+    # --- B200 constant overrides (re-tuned during the climb; unset = direct port of H100) ---
+    # Load-traffic ceiling (bytes) below which a light streamed row drops to nw8 (see _b200_num_warps).
+    NW8_MAX_ROW_TRAFFIC = 64 * 1024
+    # Element cap for a non-reduction apply loop (see non_reduction_loop_block_cap).
+    NON_REDUCTION_LOOP_MAX_ELEMS = 4096
+
+    @classmethod
+    def non_reduction_loop_block_cap(
+        cls, spec: ConfigSpec, pd: ReductionDescriptor
+    ) -> int | None:
+        # Cap EVERY non-reduction apply loop (relieves register pressure on B200).
+        return cls.NON_REDUCTION_LOOP_MAX_ELEMS
+
+    @classmethod
+    def get_seed_config(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> Config | None:
+        # Fire the inherited rich seed ONLY on sm100; decline elsewhere so this promoted class never
+        # overrides the frozen sm90/H100 default.
+        if not matches_hardware(env, cls.HARDWARE_TARGETS):
+            return None
+        cfg = super().get_seed_config(env, device_ir)
+        if cfg is None:
+            return None
+        # Re-tune num_warps by the load-traffic key (both tracks, one place); see _b200_num_warps.
+        pd = _primary_descriptor_selected(env)
+        if pd is not None:
+            nw = cls._b200_num_warps(env.config_spec, pd, cfg)
+            if nw is not None:
+                cfg = _config_with_num_warps(cfg, nw)
+        return cfg
+
+    @classmethod
+    def _b200_num_warps(
+        cls, spec: ConfigSpec, pd: ReductionDescriptor, cfg: Config
+    ) -> int | None:
+        """The B200 warp count for a light-traffic PERSISTENT streamed row (8, or 4 at small extent),
+        or None to leave the base ramp untouched. Purely additive: only lowers, never raises."""
+        # Skip M-collapse (grad-parameter .sum(0)): a cross-warp accumulate, not a streamed row.
+        if cls._has_reduced_away_grid(spec):
+            return None
+        # Skip reduce-then-apply (welford / rms_norm_per_block): its reread lives on the non-reduction
+        # loop, not in ``num_load``, so the traffic key can't see it.
+        if cls._non_reduction_loop_ids(spec):
+            return None
+        # Restrict to a single sized reduction: a second one adds cross-warp compute the traffic key
+        # can't see, with a non-monotonic warp optimum.
+        kf = spec.reduction_kernel_fact
+        if (
+            kf is None
+            or sum(1 for d in kf.reductions if d.category in SIZED_REDUCTION_CATEGORIES)
+            != 1
+        ):
+            return None
+        # Skip LOOPED reductions (positive ``reduction_loops`` chunk): they keep the base ramp.
+        loops = cfg.config.get("reduction_loops")
+        if isinstance(loops, (list, tuple)) and any(isinstance(x, int) for x in loops):
+            return None
+        # Load traffic per row = elems × load-width × #loads.
+        traffic = pd.size_hint * max(1, pd.input_load_itemsize) * max(1, pd.num_load)
+        if traffic <= cls.NW8_MAX_ROW_TRAFFIC:
+            # keep the base's small-extent 4-warp floor (<=1024 elems); else 8.
+            return 4 if pd.size_hint <= 1024 else 8
+        return None  # heavy-traffic streamed row -> base ramp (16/32) is right
+
+
+class TritonStandardReductionHeuristicSM100(
+    _TritonReductionSeedSM100, TritonStandardReductionHeuristic
+):
+    """standard (Helion-rolled rdim) inner-reduction seed for sm100/B200: the rich
+    :class:`TritonStandardReductionHeuristic` allocator with B200 constants from
+    :class:`_TritonReductionSeedSM100`."""
+
+    name = "triton_reduction_tile_sm100"
+
+
+class TritonUserTiledReductionHeuristicSM100(
+    _TritonReductionSeedSM100, TritonUserTiledReductionHeuristic
+):
+    """user-tiled inner-reduction seed for sm100/B200: the rich
+    :class:`TritonUserTiledReductionHeuristic` allocator with B200 constants from
+    :class:`_TritonReductionSeedSM100`."""
+
+    name = "triton_reduction_user_tile_sm100"
 
 
 class TritonMatmulReductionEpilogueHeuristic(AutotunerHeuristic):
