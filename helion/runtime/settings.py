@@ -597,7 +597,7 @@ class _Settings:
     )
     autotune_log_search_space: bool = dataclasses.field(
         default_factory=functools.partial(
-            _env_get_bool, "HELION_AUTOTUNE_LOG_SEARCH_SPACE", True
+            _env_get_bool, "HELION_AUTOTUNE_LOG_SEARCH_SPACE", False
         )
     )
     autotune_log_search_space_path: str | None = dataclasses.field(
@@ -819,7 +819,7 @@ class Settings(_Settings):
         "autotune_log_search_space": (
             "If True, log search space analysis after autotuning including which features "
             "were enabled/disabled, total search space size, and coverage metrics. "
-            "Set HELION_AUTOTUNE_LOG_SEARCH_SPACE=0 to disable."
+            "Off by default; set HELION_AUTOTUNE_LOG_SEARCH_SPACE=1 to enable."
         ),
         "autotune_log_search_space_path": (
             "Optional path to save search space analysis JSON. "
