@@ -29,6 +29,7 @@ pretuned_kernels/
 ├── cross_entropy/
 ├── rope/
 ├── scaled_mm/
+├── scale_mm_cute/                    # B200 CuTe (tcgen05) rowwise FP8 GEMM
 ├── silu_mul_fp8/                     # ported from vLLM (vllm/kernels/helion/ops)
 ├── dynamic_per_token_scaled_fp8_quant/
 ├── per_token_group_fp8_quant/
@@ -50,6 +51,7 @@ At runtime Helion picks the file matching the current GPU.
 | `cross_entropy` | TritonBench/Liger token-vocab sweep + realistic LLM vocabulary shapes | `F.cross_entropy` |
 | `rope` | TritonBench RoPE `(H, T)` defaults with exact shape buckets and `H8192_T2048` fallback | eager RoPE reference |
 | `scaled_mm` | vLLM Qwen3 FP8 `(K, N)` weight shapes at small token counts `M in {16, 64}` | `torch._scaled_mm` |
+| `scale_mm_cute` | Skinny-M FP8 decode + decoder-layer FP8 W8A8 serving `(M, K, N)` shapes (B200 CuTe backend only) | `torch._scaled_mm` (rowwise) + vLLM CUTLASS |
 | `silu_mul_fp8` | vLLM `(num_tokens, intermediate)` decode shapes | torch-native silu-and-mul + fp8 quant |
 | `dynamic_per_token_scaled_fp8_quant` | vLLM `(num_tokens, hidden)` shapes | torch-native per-token fp8 quant |
 | `per_token_group_fp8_quant` | vLLM `(num_tokens, hidden, group)` shapes | torch-native per-group fp8 quant |
