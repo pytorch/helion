@@ -21,7 +21,9 @@ from .triton import TritonMatmulReductionEpilogueHeuristic
 from .triton import TritonPointwiseSeedHeuristic
 from .triton import TritonSkinnyGemmHeuristic
 from .triton import TritonStandardReductionHeuristic
+from .triton import TritonStandardReductionHeuristicSM100
 from .triton import TritonUserTiledReductionHeuristic
+from .triton import TritonUserTiledReductionHeuristicSM100
 
 if TYPE_CHECKING:
     from ...runtime.config import Config
@@ -48,7 +50,9 @@ HEURISTICS_BY_BACKEND: dict[str, tuple[AutotunerHeuristicType, ...]] = {
         TritonB200MatmulHeuristic,
         TritonMatmulReductionEpilogueHeuristic,
         TritonStandardReductionHeuristic,
+        TritonStandardReductionHeuristicSM100,
         TritonUserTiledReductionHeuristic,
+        TritonUserTiledReductionHeuristicSM100,
         TritonPointwiseSeedHeuristic,
     ),
     "pallas": (

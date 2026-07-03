@@ -944,9 +944,17 @@ class TestTritonStandardReductionHeuristic(TestCase):
                 red.env, red.host_function.device_ir
             )
         )
-        seed = TritonStandardReductionHeuristic.get_seed_config(
-            red.env, red.host_function.device_ir
-        )
+        # Pin the sm90/H100 target so the tuned seed path runs regardless of the CI runner's
+        # GPU: on sm100 (B200) this class declines (returns None) so the dedicated
+        # ``TritonStandardReductionHeuristicSM100`` subclass is the sole reduction seed, so an
+        # unpatched call would return None on a B200 runner.
+        with (
+            patch("helion._hardware.get_hardware_info", return_value=HOPPER_HARDWARE),
+            patch("helion.runtime.get_num_sm", return_value=132),
+        ):
+            seed = TritonStandardReductionHeuristic.get_seed_config(
+                red.env, red.host_function.device_ir
+            )
         self.assertEqual(seed.config["block_sizes"], [1])
         self.assertEqual(seed.config["reduction_loops"], [None])
 
