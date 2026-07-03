@@ -101,18 +101,20 @@ _CONFIGS_scale_mm_cute = [
     # Cold-L2 cudagraph vs best baseline (torch): 0.86x -> 0.91x on B200.
     {'block_sizes': [128, 128, 128], 'l2_groupings': [1], 'num_warps': 8, 'num_stages': 4, 'indexing': ['tensor_descriptor', 'tensor_descriptor', 'tensor_descriptor', 'tensor_descriptor', 'tensor_descriptor'], 'pid_type': 'persistent_interleaved', 'tcgen05_cluster_m': 2, 'tcgen05_cluster_n': 1, 'tcgen05_acc_stages': 2, 'tcgen05_c_stages': 2, 'tcgen05_ab_stages': 12, 'tcgen05_num_epi_warps': 4, 'tcgen05_persistence_model': 'static_persistent'},
     # (M, K, N) = (16, 2048, 4096)
-    # Padded-M tcgen05 (stack #2840-#2854): block_m=128 padded from the real
-    # M=16 with N-axis cluster_n=2 A-multicast (#2843/#2845). Seed-level config
-    # (pre-autotune) from the full-stack sweep -- ~14.9us cold-L2 cudagraph =
-    # 0.60x vs torch (was 68us / 0.13x on the pre-stack tiny-tile path).
-    {'block_sizes': [128, 128, 128], 'cute_vector_widths': [1, 1, 1], 'loop_orders': [[0, 1]], 'tcgen05_cluster_m': 1, 'tcgen05_cluster_n': 2, 'tcgen05_ab_stages': 6, 'tcgen05_acc_stages': 2, 'tcgen05_c_stages': 2, 'tcgen05_num_epi_warps': 4},
+    # Padded-M tcgen05 (stack #2840-#2854): block_m=64 padded from real M=16,
+    # block_n=128 (CTA-count sweet spot), N-axis cluster_n=2 A-multicast. Tuned
+    # cold-L2 cudagraph: block_m=64/bn=128 (11.1us) beats the block_m=128 seed
+    # (14.7us) and the bn=256 variant (18us).
+    {'block_sizes': [64, 128, 128], 'cute_vector_widths': [1, 1, 1], 'loop_orders': [[0, 1]], 'tcgen05_cluster_m': 1, 'tcgen05_cluster_n': 2, 'tcgen05_ab_stages': 6, 'tcgen05_acc_stages': 2, 'tcgen05_c_stages': 2, 'tcgen05_num_epi_warps': 4},
     # (M, K, N) = (16, 2048, 12288)  hand-tuned padded-M tcgen05; ~15.9us (0.67x
     # vs torch, 1.6 TB/s). block_n=128 is the CTA-count sweet spot (96 CTAs);
     # smaller bn adds CTAs but loses tile efficiency, larger bn under-fills SMs.
     {'block_sizes': [64, 128, 128], 'cute_vector_widths': [1, 1, 1], 'loop_orders': [[0, 1]], 'tcgen05_cluster_m': 1, 'tcgen05_cluster_n': 2, 'tcgen05_ab_stages': 6, 'tcgen05_acc_stages': 2, 'tcgen05_c_stages': 2, 'tcgen05_num_epi_warps': 4},
-    # (M, K, N) = (16, 4096, 6144)  padded-M tcgen05 seed; ~26.6us (0.47x vs torch)
-    {'block_sizes': [64, 256, 128], 'cute_vector_widths': [1, 1, 1], 'loop_orders': [[0, 1]], 'tcgen05_cluster_m': 1, 'tcgen05_cluster_n': 2, 'tcgen05_ab_stages': 3, 'tcgen05_acc_stages': 2, 'tcgen05_c_stages': 2, 'tcgen05_num_epi_warps': 4},
-    # (M, K, N) = (16, 4096, 24576)  padded-M tcgen05 seed; ~37.8us (0.79x vs torch)
+    # (M, K, N) = (16, 4096, 6144)  tuned: block_m=64/bn=128 (16.4us) beats the
+    # bn=256 seed (26.5us) and block_m=128 (25.8us) cold-L2.
+    {'block_sizes': [64, 128, 128], 'cute_vector_widths': [1, 1, 1], 'loop_orders': [[0, 1]], 'tcgen05_cluster_m': 1, 'tcgen05_cluster_n': 2, 'tcgen05_ab_stages': 6, 'tcgen05_acc_stages': 2, 'tcgen05_c_stages': 2, 'tcgen05_num_epi_warps': 4},
+    # (M, K, N) = (16, 4096, 24576)  bn=256 wins at the largest N (39.5us) vs
+    # bn=128 (51.8us) cold-L2 -- kept.
     {'block_sizes': [64, 256, 128], 'cute_vector_widths': [1, 1, 1], 'loop_orders': [[0, 1]], 'tcgen05_cluster_m': 1, 'tcgen05_cluster_n': 2, 'tcgen05_ab_stages': 3, 'tcgen05_acc_stages': 2, 'tcgen05_c_stages': 2, 'tcgen05_num_epi_warps': 4},
 ]
 
