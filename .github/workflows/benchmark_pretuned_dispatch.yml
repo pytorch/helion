@@ -8,6 +8,12 @@ name: Benchmark Pretuned Dispatch
 # dispatches this workflow with run_h100/run_b200 set.
 
 on:
+  # TEMP (PR #3000 debug): run the b200 pretuned sweep on every push to the
+  # debug branch so we can iterate on the scale_mm_cute SMEM failure without a
+  # manual dispatch. Remove before merge.
+  push:
+    branches:
+      - fix_pretuned_bench
   workflow_dispatch:
     inputs:
       run_h100:
@@ -33,7 +39,9 @@ on:
 
 jobs:
   run-h100:
-    if: ${{ github.event.inputs.run_h100 == 'true' }}
+    # Skip H100 on the debug push (only b200 reproduces the scale_mm_cute SMEM
+    # failure); still honor the manual dispatch input otherwise.
+    if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.run_h100 == 'true' }}
     uses: ./.github/workflows/benchmark_pretuned.yml
     permissions:
       id-token: write
@@ -49,7 +57,8 @@ jobs:
       env-vars: ${{ github.event.inputs.env_vars || '' }}
 
   run-b200:
-    if: ${{ github.event.inputs.run_b200 == 'true' }}
+    # Runs on the debug push (event_name==push) OR when dispatched with run_b200.
+    if: ${{ github.event_name == 'push' || github.event.inputs.run_b200 == 'true' }}
     uses: ./.github/workflows/benchmark_pretuned.yml
     permissions:
       id-token: write
@@ -61,7 +70,8 @@ jobs:
       runtime-version: cu130
       container-options: --gpus all
       alias: b200
-      kernels: ${{ github.event.inputs.kernels || '' }}
+      # On the debug push, scope to just scale_mm_cute for a fast iteration loop.
+      kernels: ${{ github.event_name == 'push' && 'scale_mm_cute' || github.event.inputs.kernels || '' }}
       env-vars: ${{ github.event.inputs.env_vars || '' }}
 
   trigger-docs-deploy:
