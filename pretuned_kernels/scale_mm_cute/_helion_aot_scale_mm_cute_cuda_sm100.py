@@ -107,12 +107,16 @@ _CONFIGS_scale_mm_cute = [
     # (M, K, N) = (4096, 4096, 4096)
     {'block_sizes': [256, 256, 128], 'l2_groupings': [4], 'indexing': ['pointer', 'pointer', 'pointer', 'tensor_descriptor', 'tensor_descriptor'], 'pid_type': 'persistent_interleaved', 'tcgen05_cluster_m': 2, 'tcgen05_cluster_n': 1, 'tcgen05_ab_stages': 6, 'tcgen05_acc_stages': 2, 'tcgen05_c_stages': 2, 'tcgen05_num_epi_warps': 4, 'tcgen05_l2_swizzle_size': 8, 'tcgen05_strategy': 'role_local_monolithic', 'tcgen05_layout_strategy': 'default', 'tcgen05_warp_spec_mma_warps': 1, 'tcgen05_warp_spec_ab_load_warps': 1, 'tcgen05_warp_spec_epi_load_warps': 0, 'tcgen05_warp_spec_scheduler_warps': 0, 'tcgen05_warp_spec_c_input_warps': 0, 'tcgen05_warp_spec_store_warps': 0, 'tcgen05_warp_spec_register_decrease': 120, 'tcgen05_warp_spec_register_increase': 256, 'cute_vector_widths': [1, 1, 1], 'tcgen05_persistence_model': 'static_persistent', 'tcgen05_layout_overrides_epi_tile_m': None, 'tcgen05_layout_overrides_epi_tile_n': None, 'tcgen05_layout_overrides_smem_swizzle_a': None, 'tcgen05_layout_overrides_smem_swizzle_b': None, 'tcgen05_layout_overrides_d_store_box_n': None},
     # (M, K, N) = (512, 2048, 4096)
-    # Re-tuned to the fp8 small-grid 2-CTA cluster (bm=128, cluster_m=2, per-CTA
-    # 64xbn) with a deep ab=12 prefetch. cluster_m=2 doubles the CTA count to 256
-    # (fills the 148-SM B200; the old cluster_m=1 bm=128 tile ran at 0.86 waves)
-    # and multicasts A across the CTA pair, halving its cold DRAM read. Cold-L2
-    # cudagraph vs best baseline (cutlass): 0.73x -> 0.80x on B200.
-    {'block_sizes': [128, 128, 128], 'l2_groupings': [1], 'num_warps': 8, 'num_stages': 4, 'indexing': ['tensor_descriptor', 'tensor_descriptor', 'tensor_descriptor', 'tensor_descriptor', 'tensor_descriptor'], 'pid_type': 'persistent_interleaved', 'tcgen05_cluster_m': 2, 'tcgen05_cluster_n': 1, 'tcgen05_acc_stages': 2, 'tcgen05_c_stages': 2, 'tcgen05_ab_stages': 12, 'tcgen05_num_epi_warps': 4, 'tcgen05_persistence_model': 'static_persistent'},
+    # Re-tuned to a 1-CTA bm=128 bn=128 persistent tile with a moderate ab=5
+    # prefetch. ncu on the old cluster_m=2 bm=128 ab=12 config (0.82x) showed the
+    # gap to cutlass was pure instruction count (1823 vs 1149 instr/warp, +59%) at
+    # matched stall ratios and DRAM bytes -- overhead-bound, not latency-bound. The
+    # cluster_m=2 grid is 148 tiles (1.00 wave) with 2-CTA sync overhead; the 1-CTA
+    # bm=128 bn=128 grid is 128 tiles (0.86 waves, matching cutlass's geometry) and
+    # drops the cluster sync. ab=5 is the SMEM sweet spot here (ab=6 measured slower,
+    # ab>=8 exceeds the fp8 per-CTA AB budget). Cold-L2 cudagraph vs cutlass: the old
+    # cluster_m=2 0.73x -> 0.80x retune, now 0.82x -> 0.84x on B200.
+    {'block_sizes': [128, 128, 128], 'l2_groupings': [1], 'indexing': ['tensor_descriptor', 'tensor_descriptor', 'tensor_descriptor', 'tensor_descriptor', 'tensor_descriptor'], 'pid_type': 'persistent_blocked', 'tcgen05_cluster_m': 1, 'tcgen05_cluster_n': 1, 'tcgen05_acc_stages': 2, 'tcgen05_c_stages': 2, 'tcgen05_ab_stages': 5, 'tcgen05_num_epi_warps': 4, 'tcgen05_l2_swizzle_size': 1, 'tcgen05_persistence_model': 'static_persistent'},
     # (M, K, N) = (512, 2048, 2048)
     # Same fp8 small-grid 2-CTA cluster as (512, 2048, 4096): device-filling
     # cluster_m=2 + A-multicast + deep ab=12 beats the old cluster_m=1 bn=64 tile.
