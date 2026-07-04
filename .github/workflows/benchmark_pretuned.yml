@@ -21,6 +21,14 @@ on:
       runtime-version:
         required: true
         type: string
+      torch-spec:
+        # pip/uv spec for torch. Default pins 2.11 (the version vLLM nightly
+        # expects). Overridable so the b200 debug path can pull a newer CUDA
+        # toolkit wheel (e.g. cu132 -> torch 2.12), which fixes the cute
+        # dynamic-opt-in-SMEM lowering that CUDA 13.0 mis-emits as static.
+        required: false
+        type: string
+        default: "torch==2.11.*"
       container-options:
         required: true
         type: string
@@ -93,7 +101,7 @@ jobs:
 
           # On OSDC, route through the pypi-cache /whl proxy (deps stay reachable behind the egress firewall) and clear the cache index vars so it wins over the cache default; off OSDC PYPI_CACHE_WHL_URL is unset so we hit download.pytorch.org.
           PYTORCH_INDEX="${PYPI_CACHE_WHL_URL:-https://download.pytorch.org/whl/cpu}"
-          UV_DEFAULT_INDEX= UV_INDEX= uv pip install -U "torch==2.11.*" --index-url "${PYTORCH_INDEX%/whl/*}/whl/${{ inputs.runtime-version }}"
+          UV_DEFAULT_INDEX= UV_INDEX= uv pip install -U "${{ inputs.torch-spec }}" --index-url "${PYTORCH_INDEX%/whl/*}/whl/${{ inputs.runtime-version }}"
 
       - name: Install Helion
         run: |
