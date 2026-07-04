@@ -16,6 +16,7 @@ and via run.py's importlib loader.
 from __future__ import annotations
 
 import math
+import sys
 from typing import TYPE_CHECKING
 
 import torch
@@ -83,35 +84,50 @@ def run_sweep(
     helion_wins = 0
     best_speedup = 0.0
     header_printed = False
+    failures = 0
     for shape in shapes:
-        helion_call, baseline_calls, shape_cells = make_calls(shape)
-        names = [n for n, _ in baseline_calls]
-        if not header_printed:
-            for n in names:
-                speedups_by_base[n] = []
-            base_hdr = "  ".join(f"{n + ' (us)':>13s}" for n in names)
-            _p(f"{shape_header}  {'helion (us)':>12s}  {base_hdr}  {'speedup':>8s}")
-            header_printed = True
+        # Isolate each shape: a compile/runtime failure on one shape (e.g. a
+        # config whose SMEM fits the opt-in budget on one driver but overflows
+        # the 48 KB static cap on another) must not abort the remaining shapes.
+        # Without this, one bad shape sinks the whole sweep and run.py's outer
+        # try/except records a single ``error`` -- hiding every other shape's
+        # result. Report the failure and keep going.
+        try:
+            helion_call, baseline_calls, shape_cells = make_calls(shape)
+            names = [n for n, _ in baseline_calls]
+            if not header_printed:
+                for n in names:
+                    speedups_by_base[n] = []
+                base_hdr = "  ".join(f"{n + ' (us)':>13s}" for n in names)
+                _p(f"{shape_header}  {'helion (us)':>12s}  {base_hdr}  {'speedup':>8s}")
+                header_printed = True
 
-        helion_call()  # warmup / compile
-        ms_helion = _bench(helion_call, use_cudagraph, warmup, rep)
-        base_ms: dict[str, float] = {}
-        for name, call in baseline_calls:
-            base_ms[name] = _bench(call, use_cudagraph, warmup, rep)
-            speedups_by_base[name].append(
-                base_ms[name] / ms_helion if ms_helion > 0 else float("nan")
+            helion_call()  # warmup / compile
+            ms_helion = _bench(helion_call, use_cudagraph, warmup, rep)
+            base_ms: dict[str, float] = {}
+            for name, call in baseline_calls:
+                base_ms[name] = _bench(call, use_cudagraph, warmup, rep)
+                speedups_by_base[name].append(
+                    base_ms[name] / ms_helion if ms_helion > 0 else float("nan")
+                )
+            best_name = min(base_ms, key=base_ms.get)
+            speedup = base_ms[best_name] / ms_helion if ms_helion > 0 else float("nan")
+            best_speedups.append(speedup)
+            if speedup > 1.0:
+                helion_wins += 1
+            best_speedup = max(best_speedup, speedup)
+            base_cols = "  ".join(f"{base_ms[n] * 1000:>13.2f}" for n in names)
+            _p(
+                f"{shape_cells}  {ms_helion * 1000:>12.2f}  {base_cols}  "
+                f"{speedup:>7.2f}x  (vs {best_name})"
             )
-        best_name = min(base_ms, key=base_ms.get)
-        speedup = base_ms[best_name] / ms_helion if ms_helion > 0 else float("nan")
-        best_speedups.append(speedup)
-        if speedup > 1.0:
-            helion_wins += 1
-        best_speedup = max(best_speedup, speedup)
-        base_cols = "  ".join(f"{base_ms[n] * 1000:>13.2f}" for n in names)
-        _p(
-            f"{shape_cells}  {ms_helion * 1000:>12.2f}  {base_cols}  "
-            f"{speedup:>7.2f}x  (vs {best_name})"
-        )
+        except Exception as exc:  # noqa: BLE001 -- one shape must not sink the sweep
+            failures += 1
+            _p(f"{str(shape):>28s}  FAILED: {type(exc).__name__}: {exc}")
+            print(
+                f"ERROR benchmarking shape {shape!r}: {type(exc).__name__}: {exc}",
+                file=sys.stderr,
+            )
 
     names = list(speedups_by_base)
     per_baseline = {
@@ -134,13 +150,18 @@ def run_sweep(
     _p(
         f"\nHelion faster on {helion_wins}/{total} shapes vs the best baseline; "
         f"geomean speedup {gm:.3f}x; best speedup {best_speedup:.2f}x."
+        + (f" ({failures} shape(s) FAILED and were skipped.)" if failures else "")
     )
     # Metrics are helion vs the best (fastest) baseline per shape, plus the
     # per-baseline breakdown; returned to the caller (pretuned_kernels/run.py).
+    # ``failures`` counts shapes that raised (compile/runtime) and were skipped
+    # so the dashboard can flag an incomplete sweep instead of silently
+    # reporting only the shapes that happened to compile.
     return {
         "helion_wins": helion_wins,
         "total": total,
         "geomean": round(gm, 4),
         "best_speedup": round(best_speedup, 4),
+        "failures": failures,
         "baselines": per_baseline,
     }
