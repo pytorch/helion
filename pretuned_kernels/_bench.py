@@ -121,9 +121,9 @@ def run_sweep(
                 f"{shape_cells}  {ms_helion * 1000:>12.2f}  {base_cols}  "
                 f"{speedup:>7.2f}x  (vs {best_name})"
             )
-        except Exception as exc:  # noqa: BLE001 -- one shape must not sink the sweep
+        except Exception as exc:  # one shape must not sink the whole sweep
             failures += 1
-            _p(f"{str(shape):>28s}  FAILED: {type(exc).__name__}: {exc}")
+            _p(f"{shape!s:>28s}  FAILED: {type(exc).__name__}: {exc}")
             print(
                 f"ERROR benchmarking shape {shape!r}: {type(exc).__name__}: {exc}",
                 file=sys.stderr,
