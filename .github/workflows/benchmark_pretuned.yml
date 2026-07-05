@@ -29,6 +29,13 @@ on:
         required: false
         type: string
         default: "torch==2.11.*"
+      install-vllm:
+        # vLLM nightly pins torch==2.11.0, so it downgrades a non-default
+        # torch-spec (e.g. cu132/2.12) out from under us. Set false to keep the
+        # requested torch toolkit (baselines then fall back to torch-native).
+        required: false
+        type: boolean
+        default: true
       container-options:
         required: true
         type: string
@@ -116,7 +123,7 @@ jobs:
         # wheel pins torch==2.11.0, matching the torch installed above. This is
         # non-fatal: if it fails, pretuned_kernels/run.py falls back to the
         # torch-native baselines.
-        if: startsWith(inputs.image, 'nvidia')
+        if: ${{ startsWith(inputs.image, 'nvidia') && inputs.install-vllm }}
         continue-on-error: true
         run: |
           source .venv/bin/activate
