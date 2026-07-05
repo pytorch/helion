@@ -1344,8 +1344,16 @@ def _build_kloop_pipeline_consumer_prefetch_stmts(
     *,
     gate_exec_warp: bool = True,
 ) -> list[ast.stmt]:
-    """Peek the next AB full barrier after advancing the consumer state."""
-    assert args.is_two_cta, "AB consumer prefetch is validated for CtaGroup.TWO"
+    """Peek the next AB full barrier after advancing the consumer state.
+
+    Mirrors the CUTLASS reference mainloop (``dense_gemm_persistent.py``),
+    which peeks on every cluster shape: after releasing K-tile ``i`` the MMA
+    warp ``try_wait``s K-tile ``i+1``'s full barrier so the blocking wait at
+    the top of the next iteration usually completes instantly, overlapping
+    the mbarrier poll with the in-flight UMMA. On CtaGroup.TWO the peek is
+    V-leader-owned; on CtaGroup.ONE there is no owner gate (the single exec
+    warp owns its own consumer barrier).
+    """
     predicate = args.tma_next_consumer_tile
     owner_predicate = _tcgen05_two_cta_owner_predicate(
         args.exec_active,
@@ -2512,13 +2520,19 @@ def _emit_mma_pipeline(
         and not diagnose_skip_initial_ab_producer_acquire
         and not diagnose_skip_ab_producer_advance
     )
-    # Static-full CtaGroup.TWO keeps a prefetched AB consumer token live
-    # across the accumulator acquire and each K-loop issue. CtaGroup.ONE
-    # keeps the older adjacent try-wait/wait sequence.
+    # Role-local MMA-exec loops keep a prefetched AB consumer token live
+    # across the accumulator acquire and each K-loop issue: after releasing
+    # K-tile ``i`` the exec warp ``try_wait``s K-tile ``i+1``'s full barrier
+    # so the blocking wait at the top of the next iteration usually completes
+    # instantly (the mbarrier poll overlaps the in-flight UMMA). This is the
+    # CUTLASS reference mainloop's peek pattern and applies to both cluster
+    # shapes; CtaGroup.ONE simply has no V-leader owner gate on the peek.
+    # The skip-AB-consumer-wait bridge diagnostic removes every AB consumer
+    # try-wait/wait edge, so it suppresses the peek too.
     tcgen05_use_role_local_ab_consumer_prefetch = (
         tcgen05_use_role_local_mma_exec
-        and tcgen05_is_two_cta
         and tcgen05_use_tma_pipeline
+        and not diagnose_skip_ab_consumer_wait
     )
     # Keep a distinct name so future epi-role gating changes are localized.
     tcgen05_use_role_local_epi = (
@@ -2755,15 +2769,24 @@ def _emit_mma_pipeline(
                 gate_exec_warp=False,
                 cluster_n=tcgen05_cluster_n,
             )
-            assert ab_consumer_prefetch_owner_predicate is not None
             _emit_per_tile(
                 f"{tma_consumer_try_token} = cutlass.Boolean(1)",
                 mma_exec=tcgen05_use_role_local_mma_exec,
             )
+            # CtaGroup.TWO gates the peek on the V-leader; CtaGroup.ONE has
+            # no owner predicate (the single exec warp owns its consumer
+            # barrier) so the initial peek is unconditional.
+            initial_peek_src = (
+                f"{tma_consumer_try_token} = "
+                f"{tma_pipeline}.consumer_try_wait({tma_consumer_state})"
+            )
+            if ab_consumer_prefetch_owner_predicate is not None:
+                initial_peek_src = (
+                    f"if {ab_consumer_prefetch_owner_predicate}:\n"
+                    f"    {initial_peek_src}"
+                )
             _emit_per_tile(
-                f"if {ab_consumer_prefetch_owner_predicate}:\n"
-                f"    {tma_consumer_try_token} = "
-                f"{tma_pipeline}.consumer_try_wait({tma_consumer_state})",
+                initial_peek_src,
                 mma_exec=tcgen05_use_role_local_mma_exec,
             )
         prefix.append(

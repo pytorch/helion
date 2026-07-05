@@ -19742,10 +19742,28 @@ class TestPerKiterTmaBuilders(unittest.TestCase):
         )
         self.assertEqual(self._stmt_kinds(peek.body), ["=consumer_try_wait"])
 
-    def test_pipeline_consumer_prefetch_requires_two_cta(self) -> None:
+    def test_pipeline_consumer_prefetch_one_cta_has_no_owner_gate(self) -> None:
+        """CtaGroup.ONE peeks unconditionally (no V-leader owner predicate).
+
+        The consumer-prefetch builder now serves both cluster shapes (the
+        CUTLASS reference mainloop peeks the next AB full barrier on every
+        cluster shape); on CtaGroup.ONE the peek's only gate is the
+        next-K-tile predicate itself.
+        """
         args = self._make_args()
-        with self.assertRaisesRegex(AssertionError, "CtaGroup.TWO"):
-            _build_kloop_pipeline_consumer_prefetch_stmts(args)
+        stmts = _build_kloop_pipeline_consumer_prefetch_stmts(args)
+        self.assertEqual(len(stmts), 2)
+        peek = stmts[1]
+        self.assertIsInstance(peek, ast.If)
+        # Default (inline) callers keep the exec-warp gate; there is no
+        # V-leader / cluster-rank term on CtaGroup.ONE.
+        self.assertEqual(ast.unparse(peek.test), "next_consumer_tile and exec_active")
+        args_role_local = self._make_args()
+        (_, peek_role_local) = _build_kloop_pipeline_consumer_prefetch_stmts(
+            args_role_local, gate_exec_warp=False
+        )
+        self.assertIsInstance(peek_role_local, ast.If)
+        self.assertEqual(ast.unparse(peek_role_local.test), "next_consumer_tile")
 
     def test_pipeline_consumer_two_cta_gates_wait_to_leader(self) -> None:
         args = self._make_args(cluster_m=2, is_two_cta=True)
