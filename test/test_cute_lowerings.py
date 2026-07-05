@@ -9931,6 +9931,72 @@ class TestCuteLowerings(unittest.TestCase):
         expected = args[0] @ args[1]
         torch.testing.assert_close(out, expected, atol=2e-1, rtol=1e-2)
 
+    def test_tcgen05_persistent_cluster_n2_odd_n_tiles_runtime_correctness(
+        self,
+    ) -> None:
+        """cluster_n=2 with an ODD logical N-tile count (phantom-tile hang).
+
+        ``PersistentTileSchedulerParams`` rounds the problem's N-tile count
+        up to a ``cluster_n`` multiple, so with an odd count the last
+        cluster's second CTA receives a *phantom* work tile whose
+        ``tile_idx[1]`` is out of range. On the pre-rolled-producer codegen
+        the phantom CTA's per-K-iter ``tma_full_tile`` predicate evaluated
+        False, so the V-non-leader skipped its ``consumer_release`` empty-
+        barrier arrivals while its V-leader peer (a REAL tile in the same
+        V-pair) still waited on the multicast-count barrier -> cluster-wide
+        deadlock. The rolled TMA producer + hoisted static-full predicates
+        drop the per-iter gate on the static-full path, so every CTA in the
+        cluster walks the full barrier sequence and phantom tiles simply
+        compute garbage that is never visible: the D store is a TMA store
+        whose box lies fully outside the output extent recorded in the TMA
+        descriptor, so the hardware drops it.
+
+        The even-N sibling test above never exercises this: 1024/bn=256 is
+        4 tiles (even). This shape uses 768/bn=256 = 3 tiles (odd).
+        """
+
+        from helion._compiler.cute.mma_support import get_cute_mma_support
+
+        if not get_cute_mma_support().tcgen05_f16bf16:
+            self.skipTest("tcgen05 F16/BF16 MMA is not supported on this machine")
+
+        @helion.kernel(backend="cute")
+        def cute_matmul_cluster_n2_odd_n(
+            x: torch.Tensor, y: torch.Tensor
+        ) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = acc.to(x.dtype)
+            return out
+
+        torch.manual_seed(0)
+        args = (
+            torch.randn(1024, 128, device=DEVICE, dtype=torch.bfloat16),
+            torch.randn(128, 768, device=DEVICE, dtype=torch.bfloat16),
+        )
+        with patch_cute_mma_support():
+            bound = cute_matmul_cluster_n2_odd_n.bind(args)
+            bound.env.config_spec.cute_tcgen05_search_enabled = True
+            cfg = _make_tcgen05_persistent_config(
+                block_sizes=[256, 256, 128],
+                l2_groupings=[1],
+                pid_type="persistent_interleaved",
+                tcgen05_cluster_m=2,
+                tcgen05_cluster_n=2,
+                tcgen05_ab_stages=2,
+                tcgen05_acc_stages=2,
+                tcgen05_c_stages=2,
+            )
+            bound.set_config(cfg)
+            out = bound(*args)
+        expected = args[0] @ args[1]
+        torch.testing.assert_close(out, expected, atol=2e-1, rtol=1e-2)
+
     def test_tcgen05_persistent_cluster_m2_two_cta_grid_caps_for_recycling(
         self,
     ) -> None:
