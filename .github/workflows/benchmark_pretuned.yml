@@ -36,6 +36,13 @@ on:
         required: false
         type: boolean
         default: true
+      install-cute:
+        # Explicitly install the pinned nvidia-cutlass-dsl ([cute] extra) via
+        # scripts/install_cute.sh. Needed when vLLM (which otherwise pulls it in
+        # transitively) is skipped. Default false to preserve the normal path.
+        required: false
+        type: boolean
+        default: false
       container-options:
         required: true
         type: string
@@ -116,6 +123,17 @@ jobs:
           uv pip install setuptools ninja
           SETUPTOOLS_SCM_PRETEND_VERSION="0.0.0" uv pip install -e .'[dev]'
           python -c "import helion; print(helion.__name__)"
+
+      - name: Install CuTe DSL
+        # The cute backend's nvidia-cutlass-dsl lives in the [cute] extra, not
+        # [dev]. The normal path gets it transitively via vLLM; when vLLM is
+        # skipped (e.g. testing a non-2.11 torch toolkit) install the pinned DSL
+        # explicitly so the cute kernels can compile.
+        if: ${{ startsWith(inputs.image, 'nvidia') && inputs.install-cute }}
+        run: |
+          source .venv/bin/activate
+          ./scripts/install_cute.sh cu13
+          python -c "import cutlass; print('cutlass dsl', cutlass.__version__)"
 
       - name: Install vLLM (optional baseline)
         # vLLM supplies the production baselines the pretuned kernels compare

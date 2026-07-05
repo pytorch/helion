@@ -74,8 +74,11 @@ jobs:
       runtime-version: ${{ github.event_name == 'push' && 'cu132' || 'cu130' }}
       torch-spec: ${{ github.event_name == 'push' && 'torch==2.12.*' || 'torch==2.11.*' }}
       # Skip vLLM on the debug push: its nightly wheel pins torch 2.11 and would
-      # downgrade the cu132/2.12 toolkit we're testing back to cu130.
+      # downgrade the cu132/2.12 toolkit we're testing back to cu130. But vLLM
+      # is also what transitively pulls in nvidia-cutlass-dsl, so install the
+      # pinned DSL explicitly when vLLM is skipped.
       install-vllm: ${{ github.event_name != 'push' }}
+      install-cute: ${{ github.event_name == 'push' }}
       container-options: --gpus all
       alias: b200
       # On the debug push, scope to just scale_mm_cute for a fast iteration loop.
