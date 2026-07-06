@@ -405,6 +405,27 @@ class TestReductions(RefEagerTestBase, TestCase):
         )
         torch.testing.assert_close(output, args[0].sum(-1), rtol=1e-04, atol=1e-04)
 
+    def test_broadcast_store_looped_reduction(self):
+        @helion.kernel(autotune_effort="none")
+        def sum_and_broadcast(
+            x: torch.Tensor, bias: torch.Tensor
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            m, n = x.size()
+            s = torch.empty([m], dtype=x.dtype, device=x.device)
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m in hl.tile(m):
+                s[tile_m] = torch.sum(x[tile_m, :], dim=-1)
+                out[tile_m, :] = bias[tile_m].unsqueeze(-1)
+            return s, out
+
+        x = torch.randn(16, 64, device=DEVICE)
+        bias = torch.arange(16, dtype=torch.float32, device=DEVICE)
+        _, (s, out) = code_and_output(
+            sum_and_broadcast, (x, bias), block_size=16, reduction_loop=16
+        )
+        torch.testing.assert_close(s, x.sum(-1), rtol=1e-4, atol=1e-4)
+        torch.testing.assert_close(out, bias[:, None].expand(16, 64))
+
     @skipUnlessTensorDescriptor("Tensor descriptor support is required")
     def test_argmin_argmax_looped(self):
         for fn in (torch.argmin, torch.argmax):
