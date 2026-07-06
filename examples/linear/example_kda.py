@@ -3,35 +3,34 @@ KDA (Kimi Delta Attention) Example
 ===================================
 
 Diagonal (per-dimension) decay with rank-1 correction. This is the most
-general variant — combines diagonal gating with the delta rule.
-
-Note: On sm_100 (H200/B200), the Helion correction kernels with diagonal
-decay hit Triton MLIR limitations. The engine automatically falls back to
-the pure PyTorch reference for this combination.
+general variant: diagonal gating combined with the delta rule. Keys are the
+L2-normalized constant, so only q and v carry gradients.
 """
 
 from __future__ import annotations
 
-import math
 from typing import Any
-from typing import cast
-import warnings
 
 import torch
-import torch.nn.functional as F
-from triton.testing import do_bench
 
-from .linear_attention_engine import LinearAttentionEngine
 from .linear_attention_engine import chunked_linear_attn
-from .linear_attention_engine import recurrent_step
-from .linear_attention_utils import ACC_BWD_TOL
-from .linear_attention_utils import ACC_FWD_TOL
+from .linear_attention_harness import Inputs
+from .linear_attention_harness import LinearAttentionVariant
+from .linear_attention_harness import run_accuracy as _run_accuracy
+from .linear_attention_harness import run_benchmark as _run_benchmark
+from .linear_attention_harness import run_test as _run_test
 from .linear_attention_utils import chunked_linear_attn_reference
-from .linear_attention_utils import head_to_time_first as _htf
+from .linear_attention_utils import make_kda_inputs
 from .linear_attention_utils import naive_recurrent_reference
-from .linear_attention_utils import rel_error as _rel_error
 from helion._testing import DEVICE
 
+try:
+    from fla.ops.kda import chunk_kda as _fla_chunk  # pyrefly: ignore[missing-import]
+except ImportError:
+    _fla_chunk = None
+_fla_chunk_kda: Any = _fla_chunk
+
+# Test/benchmark config (DV=32 for correction variants)
 B, H, T, D, DV = 2, 4, 128, 32, 32
 C = 32
 DTYPE = torch.bfloat16
@@ -39,280 +38,84 @@ BENCH_CONFIGS = [(1, 32, 2048, 128, 128), (1, 32, 4096, 128, 128)]
 BENCH_C = 64
 
 
+def _make_inputs(
+    B: int,
+    H: int,
+    T: int,
+    D: int,
+    DV: int,
+    dtype: torch.dtype = DTYPE,
+    device: str | torch.device = DEVICE,
+    requires_grad: bool = False,
+) -> Inputs:
+    q, k, v, g, beta, scale = make_kda_inputs(
+        B, H, T, D, DV, dtype=dtype, device=device, requires_grad=requires_grad
+    )
+    return Inputs(q=q, k=k, v=v, scale=scale, g=g, beta=beta)
+
+
+def _helion_fwd(i: Inputs, C: int) -> torch.Tensor:
+    return chunked_linear_attn(i.q * i.scale, i.k, i.v, i.g, beta=i.beta, C=C)
+
+
+def _helion_fb(i: Inputs, grad_out: torch.Tensor, C: int) -> None:
+    chunked_linear_attn(i.q * i.scale, i.k, i.v, i.g, beta=i.beta, C=C).backward(
+        grad_out
+    )
+
+
+def _fla_fwd(i: Inputs, scale: float) -> torch.Tensor:
+    o, _ = _fla_chunk_kda(i.q, i.k, i.v, i.g, i.beta, scale=scale)
+    return o
+
+
+def _fla_fb(i: Inputs, go_t: torch.Tensor, scale: float) -> None:
+    o, _ = _fla_chunk_kda(i.q, i.k, i.v, i.g, i.beta, scale=scale)
+    o.backward(go_t)
+
+
+def _reference(i: Inputs) -> torch.Tensor:
+    assert i.g is not None
+    return naive_recurrent_reference(i.q * i.scale, i.k, i.v, i.g, beta=i.beta)
+
+
+def _chunked_reference(i: Inputs, C: int) -> torch.Tensor:
+    assert i.g is not None
+    return chunked_linear_attn_reference(i.q * i.scale, i.k, i.v, i.g, beta=i.beta, C=C)
+
+
+VARIANT = LinearAttentionVariant(
+    name="kda",
+    title="KDA (Kimi Delta Attention)",
+    make_inputs=_make_inputs,
+    helion_fwd=_helion_fwd,
+    helion_fb=_helion_fb,
+    reference=_reference,
+    chunked_reference=_chunked_reference,
+    fla_fwd=_fla_fwd if _fla_chunk else None,
+    fla_fb=_fla_fb if _fla_chunk else None,
+    grad_tensors=("q", "v"),
+    dtype=DTYPE,
+)
+
+
+# Module API consumed by run_linattn.py: test / benchmark / accuracy.
 def test() -> None:
-    """Forward + backward correctness for KDA (diagonal decay + correction)."""
-    torch.manual_seed(42)
-    scale = 1.0 / math.sqrt(D)
-
-    q = torch.randn(B, H, T, D, device=DEVICE, dtype=DTYPE)
-    k = F.normalize(torch.randn(B, H, T, D, device=DEVICE, dtype=DTYPE), dim=-1)
-    v = torch.randn(B, H, T, DV, device=DEVICE, dtype=DTYPE)
-    g = -torch.rand(B, H, T, D, device=DEVICE, dtype=DTYPE).abs() * 0.1
-    beta = torch.sigmoid(torch.randn(B, H, T, device=DEVICE, dtype=DTYPE))
-
-    # Forward via engine (uses LinearAttentionEngine interface)
-    engine = LinearAttentionEngine(
-        q_mod=lambda q, cio: q * scale,
-        beta_mod=lambda b, cio: b,
-        chunk_size=C,
-    )
-    out = engine(q, k, v, g, beta=beta)
-
-    # Forward vs recurrent reference
-    ref = naive_recurrent_reference(q * scale, k, v, g, beta=beta)
-    assert isinstance(out, torch.Tensor)
-    fwd_err = _rel_error(out.detach(), ref)
-    assert fwd_err < 0.02, f"Forward error: {fwd_err}"
-    print(f"  fwd vs recurrent: {fwd_err:.4e} PASS")
-
-    # Forward vs FLA KDA
-    try:
-        from fla.ops.kda import chunk_kda as _fn  # pyrefly: ignore[missing-import]
-
-        chunk_kda: Any = _fn
-
-        o_fla, _ = chunk_kda(
-            _htf(q),
-            _htf(k),
-            _htf(v),
-            _htf(g),
-            _htf(beta),
-            scale=scale,
-        )
-        o_fla_hf = _htf(o_fla)
-        fla_err = _rel_error(out.detach(), o_fla_hf)
-        print(
-            f"  fwd vs FLA:       {fla_err:.4e} {'PASS' if fla_err < 0.02 else 'FAIL'}"
-        )
-    except Exception as e:
-        print(f"  fwd vs FLA:       SKIP ({type(e).__name__})")
-
-    # Backward: verify gradients exist (uses autograd through reference)
-    q1 = q.clone().requires_grad_(True)
-    v1 = v.clone().requires_grad_(True)
-    o1 = chunked_linear_attn(q1 * scale, k, v1, g, beta=beta, C=C)
-    o1.sum().backward()
-    assert q1.grad is not None, "q.grad is None"
-    assert v1.grad is not None, "v.grad is None"
-    print("  bwd grads exist:  PASS")
-
-    # Backward vs chunked reference
-    grad_out = torch.randn(B, H, T, DV, device=DEVICE, dtype=DTYPE)
-
-    q2 = q.clone().requires_grad_(True)
-    v2 = v.clone().requires_grad_(True)
-    o2 = chunked_linear_attn(q2 * scale, k, v2, g, beta=beta, C=C)
-    o2.backward(grad_out)
-
-    q3 = q.clone().requires_grad_(True)
-    v3 = v.clone().requires_grad_(True)
-    o3 = chunked_linear_attn_reference(q3 * scale, k, v3, g, beta=beta, C=C)
-    o3.backward(grad_out)
-
-    for name, g1, g2 in [("dq", q2.grad, q3.grad), ("dv", v2.grad, v3.grad)]:
-        err = _rel_error(g1, g2)
-        assert err < 0.05, f"Backward {name} error: {err}"
-        print(f"  bwd {name} vs ref: {err:.4e} PASS")
-
-    # === Recurrent step: compare step-by-step vs chunked ===
-    torch.manual_seed(42)
-    q_rec = torch.randn(B, H, T, D, device=DEVICE, dtype=DTYPE)
-    k_rec = F.normalize(torch.randn(B, H, T, D, device=DEVICE, dtype=DTYPE), dim=-1)
-    v_rec = torch.randn(B, H, T, DV, device=DEVICE, dtype=DTYPE)
-    g_rec = -torch.rand(B, H, T, D, device=DEVICE, dtype=DTYPE).abs() * 0.1
-    beta_rec = torch.sigmoid(torch.randn(B, H, T, device=DEVICE, dtype=DTYPE))
-    scale_rec = 1.0 / math.sqrt(D)
-
-    o_chunked = chunked_linear_attn(
-        q_rec * scale_rec, k_rec, v_rec, g_rec, beta=beta_rec, C=C
-    )
-
-    state = torch.zeros(B, H, D, DV, device=DEVICE, dtype=torch.float32)
-    o_steps = []
-    for t in range(T):
-        alpha = torch.exp(g_rec[:, :, t : t + 1])  # [B,H,1,D]
-        o_t, state = recurrent_step(
-            q_rec[:, :, t : t + 1] * scale_rec,
-            k_rec[:, :, t : t + 1],
-            v_rec[:, :, t : t + 1],
-            state,
-            alpha=alpha,
-            beta_val=beta_rec[:, :, t : t + 1],
-        )
-        o_steps.append(o_t)
-    o_recurrent = torch.cat(o_steps, dim=2)
-
-    rec_err = _rel_error(o_chunked, o_recurrent)
-    assert rec_err < 0.05, f"Recurrent vs chunked error: {rec_err}"
-    print(f"  recurrent step:   {rec_err:.4e} PASS")
-
-    print("All tests passed.")
+    _run_test(VARIANT, (B, H, T, D, DV), C)
 
 
 def benchmark(
     configs: list | None = None,
 ) -> list[tuple[str, float, float, float, float]]:
-    """Benchmark KDA forward+backward, comparing against FLA.
-
-    Returns one (config, helion_fwd_ms, fla_fwd_ms, helion_fb_ms, fla_fb_ms)
-    row per config; empty when fla is unavailable.
-    """
-    rows: list[tuple[str, float, float, float, float]] = []
-    try:
-        from fla.ops.kda import chunk_kda as _fn  # pyrefly: ignore[missing-import]
-
-        chunk_kda: Any = _fn
-    except ImportError:
-        warnings.warn("fla not installed, skipping benchmark", stacklevel=1)
-        return rows
-
-    scale = 1.0 / math.sqrt(128)
-
-    print(
-        f"{'Config':<24} {'Helion fwd':>10} {'FLA fwd':>10}"
-        f" {'Helion f+b':>12} {'FLA f+b':>12}"
+    return _run_benchmark(
+        VARIANT, configs if configs is not None else BENCH_CONFIGS, BENCH_C
     )
-    print("-" * 72)
-
-    for bi, hi, ti, di, dvi in configs if configs is not None else BENCH_CONFIGS:
-        q = torch.randn(bi, hi, ti, di, device=DEVICE, dtype=DTYPE, requires_grad=True)
-        k = (
-            F.normalize(torch.randn(bi, hi, ti, di, device=DEVICE, dtype=DTYPE), dim=-1)
-            .detach()
-            .requires_grad_(True)
-        )
-        v = torch.randn(bi, hi, ti, dvi, device=DEVICE, dtype=DTYPE, requires_grad=True)
-        g = -torch.rand(bi, hi, ti, di, device=DEVICE, dtype=DTYPE).abs() * 0.1
-        beta = torch.sigmoid(torch.randn(bi, hi, ti, device=DEVICE, dtype=DTYPE))
-        grad_out = torch.randn(bi, hi, ti, dvi, device=DEVICE, dtype=DTYPE)
-
-        qt = _htf(q.detach())
-        kt = _htf(k.detach())
-        vt = _htf(v.detach())
-        gt = _htf(g)
-        bt = _htf(beta)
-
-        fwd_ms = do_bench(
-            lambda q=q, k=k, v=v, g=g, beta=beta: chunked_linear_attn(
-                q * scale, k, v, g, beta=beta, C=BENCH_C
-            )
-        )
-        fla_fwd_ms = do_bench(
-            lambda qt=qt, kt=kt, vt=vt, gt=gt, bt=bt: chunk_kda(
-                qt,
-                kt,
-                vt,
-                gt,
-                bt,
-                scale=scale,
-            )
-        )
-
-        def helion_fb(
-            q: torch.Tensor = q,
-            k: torch.Tensor = k,
-            v: torch.Tensor = v,
-            g: torch.Tensor = g,
-            beta: torch.Tensor = beta,
-            go: torch.Tensor = grad_out,
-            sc: float = scale,
-        ) -> None:
-            o = chunked_linear_attn(q * sc, k, v, g, beta=beta, C=BENCH_C)
-            o.backward(go)
-            q.grad = k.grad = v.grad = None
-
-        fb_ms = do_bench(helion_fb)
-
-        # NOTE: FLA's KDA backward crashes Triton's autotuner on H200 (CUDA
-        # IMA), which would poison the CUDA context for all subsequent work.
-        # We skip the FLA backward benchmark on sm_90 to keep the process
-        # healthy; it runs fine on sm_100 (B200) so we benchmark it there.
-        if torch.cuda.get_device_capability()[0] == 9:
-            fla_fb_ms = 0.0
-            fla_fb_str = f"{'(skip)':>12}"
-        else:
-            qt_g = _htf(q.detach()).requires_grad_(True)
-            kt_g = _htf(k.detach()).requires_grad_(True)
-            vt_g = _htf(v.detach()).requires_grad_(True)
-            go_t = _htf(grad_out)
-
-            def fla_fb(
-                qt: torch.Tensor = qt_g,
-                kt: torch.Tensor = kt_g,
-                vt: torch.Tensor = vt_g,
-                gt: torch.Tensor = gt,
-                bt: torch.Tensor = bt,
-                go: torch.Tensor = go_t,
-                sc: float = scale,
-            ) -> None:
-                o, _ = chunk_kda(qt, kt, vt, gt, bt, scale=sc)
-                o.backward(go)
-                qt.grad = kt.grad = vt.grad = None
-
-            fla_fb_ms = do_bench(fla_fb)
-            fla_fb_str = f"{fla_fb_ms:>12.3f}"
-
-        cfg = f"({bi},{hi},{ti},{di},{dvi})"
-        print(
-            f"{cfg:<24} {fwd_ms:>10.3f} {fla_fwd_ms:>10.3f} {fb_ms:>12.3f} {fla_fb_str}"
-        )
-        rows.append(
-            (
-                cfg,
-                cast("float", fwd_ms),
-                cast("float", fla_fwd_ms),
-                cast("float", fb_ms),
-                cast("float", fla_fb_ms),
-            )
-        )
-
-    return rows
 
 
-def accuracy(
-    configs: list | None = None,
-) -> list[tuple[bool, bool]]:
-    """Per-config (fwd_ok, bwd_ok) verdicts vs the fp32 PyTorch reference.
-
-    Forward compares against the naive recurrent reference (diagonal decay +
-    beta correction); backward compares the dq and dv gradients against the
-    chunked reference (k is the normalized constant, as in test()). Drives the
-    dashboard's helion_accuracy metric, so it runs at the benchmark shapes.
-    """
-    verdicts: list[tuple[bool, bool]] = []
-    for bi, hi, ti, di, dvi in configs if configs is not None else BENCH_CONFIGS:
-        scale = 1.0 / math.sqrt(di)
-        q = torch.randn(bi, hi, ti, di, device=DEVICE, dtype=DTYPE)
-        k = F.normalize(torch.randn(bi, hi, ti, di, device=DEVICE, dtype=DTYPE), dim=-1)
-        v = torch.randn(bi, hi, ti, dvi, device=DEVICE, dtype=DTYPE)
-        g = -torch.rand(bi, hi, ti, di, device=DEVICE, dtype=DTYPE).abs() * 0.1
-        beta = torch.sigmoid(torch.randn(bi, hi, ti, device=DEVICE, dtype=DTYPE))
-
-        out = chunked_linear_attn(q * scale, k, v, g, beta=beta, C=BENCH_C)
-        ref = naive_recurrent_reference(q * scale, k, v, g, beta=beta)
-        fwd_ok = _rel_error(out, ref) < ACC_FWD_TOL
-
-        # Backward is isolated so a backward failure leaves the forward verdict
-        # intact (bwd_ok stays False, the "<variant>-bwd" row reports it).
-        bwd_ok = False
-        try:
-            grad_out = torch.randn(bi, hi, ti, dvi, device=DEVICE, dtype=DTYPE)
-            hl = [x.detach().requires_grad_(True) for x in (q, v)]
-            chunked_linear_attn(
-                hl[0] * scale, k, hl[1], g, beta=beta, C=BENCH_C
-            ).backward(grad_out)
-            rl = [x.detach().requires_grad_(True) for x in (q, v)]
-            chunked_linear_attn_reference(
-                rl[0] * scale, k, rl[1], g, beta=beta, C=BENCH_C
-            ).backward(grad_out)
-            bwd_ok = all(
-                _rel_error(h.grad, r.grad) < ACC_BWD_TOL
-                for h, r in zip(hl, rl, strict=True)
-            )
-        except Exception:
-            torch.cuda.empty_cache()
-        verdicts.append((fwd_ok, bwd_ok))
-    return verdicts
+def accuracy(configs: list | None = None) -> list[tuple[bool, bool]]:
+    return _run_accuracy(
+        VARIANT, configs if configs is not None else BENCH_CONFIGS, BENCH_C
+    )
 
 
 def main() -> None:

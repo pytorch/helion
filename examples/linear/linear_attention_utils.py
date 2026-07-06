@@ -449,6 +449,30 @@ def make_gated_delta_rule_inputs(
     return q, k, v, g, beta, scale
 
 
+def make_kda_inputs(
+    B: int,
+    H: int,
+    T: int,
+    D: int,
+    DV: int,
+    dtype: torch.dtype = torch.bfloat16,
+    device: str | torch.device = "cuda",
+    requires_grad: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, float]:
+    """Create inputs for KDA (diagonal decay + correction)."""
+    q = torch.randn(B, H, T, D, device=device, dtype=dtype, requires_grad=requires_grad)
+    k = F.normalize(torch.randn(B, H, T, D, device=device, dtype=dtype), dim=-1)
+    if requires_grad:
+        k = k.detach().requires_grad_(True)
+    v = torch.randn(
+        B, H, T, DV, device=device, dtype=dtype, requires_grad=requires_grad
+    )
+    g = -torch.rand(B, H, T, D, device=device, dtype=dtype).abs() * 0.1
+    beta = torch.sigmoid(torch.randn(B, H, T, device=device, dtype=dtype))
+    scale = 1.0 / math.sqrt(D)
+    return q, k, v, g, beta, scale
+
+
 def make_vanilla_linear_attn_inputs(
     B: int,
     H: int,
