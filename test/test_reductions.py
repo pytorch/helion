@@ -405,6 +405,7 @@ class TestReductions(RefEagerTestBase, TestCase):
         )
         torch.testing.assert_close(output, args[0].sum(-1), rtol=1e-04, atol=1e-04)
 
+    @skipIfPallas("Pallas does not support broadcasting on store")
     def test_broadcast_store_looped_reduction(self):
         @helion.kernel(autotune_effort="none")
         def sum_and_broadcast(
