@@ -16,6 +16,7 @@ and via run.py's importlib loader.
 from __future__ import annotations
 
 import math
+import time
 from typing import TYPE_CHECKING
 
 import torch
@@ -46,9 +47,92 @@ def bench_cudagraph(call: Callable[[], object], rep: int = 100) -> float:
     return _do_bench_cudagraph_with_cache_clear(call, rep=rep, return_mode="median")
 
 
+def bench_walltime(call: Callable[[], object], warmup: int, rep: int) -> float:
+    """Mean wall-clock latency (ms) including host-side dispatch time.
+
+    ``triton.testing.do_bench`` times GPU events, so Python/host launch
+    overhead is hidden whenever the CPU can run ahead of the GPU (its
+    per-iteration L2-cache clear gives ~100us of GPU work to hide behind).
+    This timer instead measures ``time.perf_counter`` across a batch of
+    back-to-back calls followed by one final sync, so it reports
+    max(host time, GPU time) per call -- the number a host-bound caller
+    (e.g. an eager serving loop) actually experiences.  Mirrors
+    tritonbench's ``do_bench_walltime``.
+    """
+    call()  # ensure compiled
+    torch.cuda.synchronize()
+    with_timer_start = time.perf_counter()
+    for _ in range(5):
+        call()
+    torch.cuda.synchronize()
+    estimate_ms = (time.perf_counter() - with_timer_start) * 1e3 / 5
+
+    n_warmup = max(1, int(warmup / estimate_ms)) if estimate_ms > 0 else 25
+    n_repeat = max(1, int(rep / estimate_ms)) if estimate_ms > 0 else 100
+    for _ in range(n_warmup):
+        call()
+    torch.cuda.synchronize()
+
+    start = time.perf_counter()
+    for _ in range(n_repeat):
+        call()
+    torch.cuda.synchronize()
+    return (time.perf_counter() - start) * 1e3 / n_repeat
+
+
+def bench_serial(call: Callable[[], object], warmup: int, rep: int) -> float:
+    """Median per-call latency (ms) = host dispatch + GPU execution, serialized.
+
+    Unlike ``bench_walltime`` -- which fires a batch of calls back-to-back and
+    syncs once, letting the host run ahead so it reports ``max(host, GPU)`` per
+    call -- this synchronizes after *every* call. Host-side dispatch time and
+    GPU execution time are therefore summed rather than overlapped: the latency
+    a caller sees when it must wait on each result before issuing the next.
+    The L2 cache is cleared before every timed call (as ``do_bench`` does) and
+    the clear is synced out of the timed region so it isn't counted.
+    """
+    from triton import runtime
+
+    di = runtime.driver.active.get_device_interface()
+    cache = runtime.driver.active.get_empty_cache_for_benchmark()
+
+    def timed_once() -> float:
+        runtime.driver.active.clear_cache(cache)
+        di.synchronize()  # exclude the cache-clear from the timed region
+        start = time.perf_counter()
+        call()
+        di.synchronize()  # wait for the GPU so host + GPU time is summed
+        return (time.perf_counter() - start) * 1e3
+
+    call()  # ensure compiled
+    di.synchronize()
+
+    estimate_start = time.perf_counter()
+    for _ in range(5):
+        timed_once()
+    estimate_ms = (time.perf_counter() - estimate_start) * 1e3 / 5
+
+    n_warmup = max(1, int(warmup / estimate_ms)) if estimate_ms > 0 else 25
+    n_repeat = max(1, int(rep / estimate_ms)) if estimate_ms > 0 else 100
+    for _ in range(n_warmup):
+        timed_once()
+
+    times = sorted(timed_once() for _ in range(n_repeat))
+    return times[len(times) // 2]
+
+
 def _bench(
-    call: Callable[[], object], use_cudagraph: bool, warmup: int, rep: int
+    call: Callable[[], object],
+    use_cudagraph: bool,
+    warmup: int,
+    rep: int,
+    walltime: bool = False,
+    serial: bool = False,
 ) -> float:
+    if serial:
+        return bench_serial(call, warmup=warmup, rep=rep)
+    if walltime:
+        return bench_walltime(call, warmup=warmup, rep=rep)
     if use_cudagraph:
         return bench_cudagraph(call, rep=rep)
     return tt.do_bench(call, warmup=warmup, rep=rep, return_mode="median")
@@ -63,6 +147,8 @@ def run_sweep(
     warmup: int = 25,
     rep: int = 100,
     verbose: bool = True,
+    walltime: bool = False,
+    serial: bool = False,
 ) -> dict:
     """Benchmark helion vs baselines over ``shapes``; return metrics (print if verbose).
 
@@ -71,6 +157,15 @@ def run_sweep(
     and ``shape_cells`` is the preformatted leading column(s) for the table row.
     The metrics dict is always returned; the per-shape table is printed only when
     ``verbose``.
+
+    ``walltime=True`` times each call with ``bench_walltime`` (host + GPU
+    wall clock) instead of GPU events / CUDA graphs, exposing host-side
+    dispatch overhead that ``do_bench`` hides.
+
+    ``serial=True`` times each call with ``bench_serial``, which synchronizes
+    after every call so host dispatch and GPU execution are summed rather than
+    overlapped (still clearing L2 between runs). ``serial`` takes precedence
+    over ``walltime``.
     """
 
     def _p(*args: object) -> None:
@@ -94,10 +189,10 @@ def run_sweep(
             header_printed = True
 
         helion_call()  # warmup / compile
-        ms_helion = _bench(helion_call, use_cudagraph, warmup, rep)
+        ms_helion = _bench(helion_call, use_cudagraph, warmup, rep, walltime, serial)
         base_ms: dict[str, float] = {}
         for name, call in baseline_calls:
-            base_ms[name] = _bench(call, use_cudagraph, warmup, rep)
+            base_ms[name] = _bench(call, use_cudagraph, warmup, rep, walltime, serial)
             speedups_by_base[name].append(
                 base_ms[name] / ms_helion if ms_helion > 0 else float("nan")
             )
