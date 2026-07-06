@@ -504,8 +504,9 @@ def chunk_fwd_o_helion(
     scale: float = 1.0,
 ) -> torch.Tensor:
     """Output computation for all chunks in parallel (no correction). With
-    use_g=False the decay is compiled out, for variants with no decay; scale
-    then folds into the output so q can be passed unscaled."""
+    use_g=False the decay is compiled out for variants with no decay. The output
+    is linear in q, so scale is applied to it and q can be passed unscaled.
+    """
     BHN = q.size(0)
     C = hl.specialize(q.size(1))
     D = q.size(2)
@@ -538,10 +539,7 @@ def chunk_fwd_o_helion(
         vt = v[tile_bhn, :, tile_dv]
         # o_intra = attn @ v accumulated onto o_cross
         o = hl.dot(attn.to(vt.dtype), vt, acc=o_cross)
-        if use_g:
-            out[tile_bhn, :, tile_dv] = o.to(out.dtype)
-        else:
-            out[tile_bhn, :, tile_dv] = (o * scale).to(out.dtype)
+        out[tile_bhn, :, tile_dv] = (o * scale).to(out.dtype)
 
     return out
 
@@ -1245,14 +1243,14 @@ def _helion_chunked_fwd(
         state = _init_state(initial_state, BH, D, DV, q)
         h_all = chunk_fwd_h_scalar_fused(k_4d, v_flat, g_cs, g_last, state)
 
-        # Output kernel: pass raw q, k with g_cs for decay
+        # Output kernel: pass raw q, k with g_cs for decay; scale folds in here.
         qf = q.reshape(BHN, C, D)
         kf = k.reshape(BHN, C, D)
         vf2 = v_flat.reshape(BHN, C, DV)
         g_csf = g_cs.reshape(BHN, C)
         hf2 = h_all.reshape(BHN, D, DV)
 
-        o = chunk_fwd_o_helion(qf, kf, vf2, g_csf, hf2)
+        o = chunk_fwd_o_helion(qf, kf, vf2, g_csf, hf2, scale=scale)
 
         # Precompute q_scaled for backward
         exp_g_cs = torch.exp(g_cs[:, :, :, None])
