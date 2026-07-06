@@ -1,13 +1,10 @@
-"""Best-effort structural dump of Helion device IR for the kernel-artifact dataset.
+"""Structural DeviceIR dump for the autotune dataset sidecar.
 
-Emits one networkx node-link graph per autotune run, inlined on the .meta.jsonl
-record under "ir_graph"; load with ``nx.node_link_graph(rec["ir_graph"],
-edges="edges")``. Best-effort: anything unresolvable is None and a malformed
-DeviceIR is the caller's responsibility -- except the networkx version gate, a
-hard ``ImportError``, so callers must treat any exception as "no ir_graph".
+Saves one networkx graph per autotune run inside the .meta.jsonl file
+under the "ir_graph" key. The graph structure is strictly defined by the
+ValFeatures, LoweringFeatures, and IrGraphMeta.
 
-The emitted schema (node / edge / graph fields) is the ``ValFeatures`` and
-``LoweringFeatures`` dataclasses and the ``IrGraphMeta`` TypedDict below.
+Structural failures raise to the metadata writer.
 """
 
 from __future__ import annotations
@@ -153,13 +150,12 @@ def _lowering_features(node: torch.fx.Node) -> LoweringFeatures:
         if ranges is not None:
             out.pointwise_ranges = [str(r) for r in ranges]
     if buffer is not None:
-        try:
-            fakes = type(lowering).input_fake_tensors(node)
-        except (KeyError, AttributeError, TypeError, RuntimeError):
-            fakes = None
-        if fakes is not None:
-            out.input_dtypes = [str(t.dtype) for t in fakes]
-            out.input_shapes = [[str(d) for d in t.shape] for t in fakes]
+        # A buffer-allocating lowering exposes input_fake_tensors and a missing
+        # method or non-iterable result fails loudly.
+        fakes = type(lowering).input_fake_tensors(node)
+        out.input_dtypes = [str(t.dtype) for t in fakes]
+        out.input_shapes = [[str(d) for d in t.shape] for t in fakes]
+
     return out
 
 
@@ -183,33 +179,29 @@ def _input_edges(node: torch.fx.Node) -> dict[torch.fx.Node, list[int]]:
     return positions
 
 
-def _region_specs(node: torch.fx.Node) -> list[tuple[int, object]]:
-    """Extract ``(child_graph_id, live_args)`` pairs from for/if/while control-flow
-    nodes. Positions below are the arg signatures in ``helion.language._tracing_ops``;
-    a malformed or non-control-flow node returns ``[]`` (graph ids must be concrete
-    ints). If those signatures change upstream, region edges silently drop. The live
-    args stay typed ``object`` -- statically ``node.args[i]`` is ``Argument``, not a
-    proven sequence, so the caller runtime-checks ``isinstance(live, (list, tuple))``."""
+def _region_specs(node: torch.fx.Node) -> list[int]:
+    """Return child graph ids for control-flow nodes.
+
+    Handles for, if, and while. Returns [] for non-control-flow nodes or
+    when the graph id is not a concrete int. Child inputs live on the
+    child graph's node_args, not on this node.
+    """
     target = node.target
     args = node.args
     if is_for_loop_target(target):
-        # _for_loop[_step](graph_id, begin, end, args, ...): id@0, live args@3.
         if len(args) >= 4 and _is_graph_id(args[0]):
-            return [(args[0], args[3])]
+            return [args[0]]
         return []
     if target is _if:
-        # _if(test, if_graph_id, else_graph_id, if_args, else_args): ids@1,2; args@3,4.
         if len(args) >= 5 and _is_graph_id(args[1]) and _is_graph_id(args[2]):
-            return [(args[1], args[3]), (args[2], args[4])]
+            return [args[1], args[2]]
         return []
     if target is _while_loop:
-        # _while_loop(cond_graph_id, body_graph_id, args, [orelse_graph_id]):
-        # ids@0,1 (+optional@3) all share the live args@2.
         if len(args) >= 3 and _is_graph_id(args[0]) and _is_graph_id(args[1]):
-            specs: list[tuple[int, object]] = [(args[1], args[2]), (args[0], args[2])]
+            ids = [args[1], args[0]]
             if len(args) > 3 and _is_graph_id(args[3]):
-                specs.append((args[3], args[2]))
-            return specs
+                ids.append(args[3])
+            return ids
         return []
     return []
 
@@ -341,25 +333,21 @@ def extract_ir_graph(device_ir: DeviceIR) -> dict[str, object]:
                     val_by_node[producer],
                 )
 
-            for child_gid, live in _region_specs(node):
+            for child_gid in _region_specs(node):
                 child = graphs_by_id.get(child_gid)
-                if child is None or not isinstance(live, (list, tuple)):
+                outer_args = getattr(child, "node_args", None) if child else None
+                if not child or not outer_args:
                     continue
+                # node_args is 1:1 with the child's placeholders by construction the dict
+                # lookups fail loud if that invariant ever breaks.
                 placeholders = list(child.graph.find_nodes(op="placeholder"))
-                # A child may have more placeholders (induction/state) than args,
-                # so the positional zip is best-effort.
-                for placeholder, arg in zip(placeholders, live, strict=False):
-                    if (
-                        isinstance(arg, torch.fx.Node)
-                        and arg in node_id
-                        and placeholder in node_id
-                    ):
-                        add_typed_edge(
-                            node_id[arg],
-                            node_id[placeholder],
-                            "region",
-                            [],
-                            val_by_node[arg],
-                        )
+                for placeholder, arg in zip(placeholders, outer_args, strict=True):
+                    add_typed_edge(
+                        node_id[arg],
+                        node_id[placeholder],
+                        "region",
+                        [],
+                        val_by_node[arg],
+                    )
 
     return nx.node_link_data(nx_graph, edges="edges")
