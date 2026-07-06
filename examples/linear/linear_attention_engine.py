@@ -1176,24 +1176,21 @@ def _init_state(
 
 
 def _final_state_from_h_all(
-    h_all: torch.Tensor,
-    k_state_4d: torch.Tensor,
-    v_flat: torch.Tensor,
-    g_last_4d: torch.Tensor | None,
+    h_last: torch.Tensor,
+    k_state_last: torch.Tensor,
+    v_last: torch.Tensor,
+    g_last: torch.Tensor | None,
     B: int,
     H: int,
     use_g: bool = True,
 ) -> torch.Tensor:
-    h_last = h_all[:, -1].float()
+    h_final = h_last.float()
     if use_g:
-        assert g_last_4d is not None
-        gl = g_last_4d[:, -1]
-        h_final = h_last * torch.exp(gl).unsqueeze(-1)
-    else:
-        h_final = h_last
+        assert g_last is not None
+        h_final = h_final * torch.exp(g_last).unsqueeze(-1)
     h_final = h_final + torch.bmm(
-        k_state_4d[:, -1].float().transpose(-2, -1),
-        v_flat[:, -1].float(),
+        k_state_last.float().transpose(-2, -1),
+        v_last.float(),
     )
     return h_final.reshape(B, H, h_final.shape[1], h_final.shape[2])
 
@@ -1231,7 +1228,7 @@ def _helion_chunked_fwd(
         final_state = None
         if return_final_state:
             final_state = _final_state_from_h_all(
-                h_all, k_state_4d, v_flat, None, B, H, use_g=False
+                h_all[:, -1], k_state_4d[:, -1], v_flat[:, -1], None, B, H, use_g=False
             )
         return o.reshape(B, H, T, DV), h_all, final_state
 
@@ -1271,13 +1268,13 @@ def _helion_chunked_fwd(
 
         final_state = None
         if return_final_state:
-            # k_state for the last chunk only: k * exp(g_last - g_cs).
+            # Decay the last chunk's keys: k * exp(g_last - g_cs).
             k_state_last = (
-                k_4d[:, -1:].float()
-                * torch.exp(g_last[:, -1:, None, None] - g_cs[:, -1:, :, None])
+                k_4d[:, -1].float()
+                * torch.exp(g_last[:, -1, None, None] - g_cs[:, -1, :, None])
             ).to(k.dtype)
             final_state = _final_state_from_h_all(
-                h_all, k_state_last, v_flat[:, -1:], g_last_4d[:, -1:], B, H
+                h_all[:, -1], k_state_last, v_flat[:, -1], g_last_4d[:, -1], B, H
             )
 
         return o.reshape(B, H, T, DV), h_all, final_state
@@ -1305,7 +1302,7 @@ def _helion_chunked_fwd(
     final_state = None
     if return_final_state:
         final_state = _final_state_from_h_all(
-            h_all, k_state_4d, v_flat, g_last_4d, B, H
+            h_all[:, -1], k_state_4d[:, -1], v_flat[:, -1], g_last_4d[:, -1], B, H
         )
 
     return o.reshape(B, H, T, DV), h_all, final_state
