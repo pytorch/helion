@@ -11,4 +11,3 @@ Forward/backward correctness of each variant vs the fp32 reference kernel, at au
 | delta_rule | ok/ok | ok/ok | ok/ok | ok/ok | ok/FAIL | ok/ok |
 | gated_delta_rule | ok/ok | ok/ok | ok/ok | ok/ok | ok/FAIL | ok/ok |
 | kda | ok/ok | ok/ok | ok/ok | ok/ok | ok/ok | ok/ok |
-| rwkv6 | ok/ok | ok/ok | ok/ok | ok/ok | ok/ok | ok/ok |
