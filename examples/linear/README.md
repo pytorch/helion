@@ -38,7 +38,6 @@ benchmarks will be skipped with a warning.
 | `example_vanilla_linear_attn.py` | none | none | `chunk_linear_attn` |
 | `example_retention.py` | scalar (fixed) | none | `chunk_retention` |
 | `example_mamba2_ssd.py` | scalar | none | `mamba_chunk_scan_combined` |
-| `example_rwkv6.py` | diagonal | none (+ output gate) | `chunk_rwkv6` |
 | `example_kda.py` | diagonal | rank-1 | `chunk_kda` |
 
 ## Architecture

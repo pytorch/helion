@@ -21,7 +21,6 @@ EXAMPLES = [
     "example_vanilla_linear_attn",
     "example_retention",
     "example_mamba2_ssd",
-    "example_rwkv6",
     "example_kda",
 ]
 

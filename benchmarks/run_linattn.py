@@ -44,7 +44,6 @@ VARIANTS = [
     "delta_rule",
     "gated_delta_rule",
     "kda",
-    "rwkv6",
 ]
 
 # benchmark() takes (B, H, T, D, DV); our shapes use D == DV.
