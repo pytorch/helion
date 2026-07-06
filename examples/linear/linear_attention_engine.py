@@ -292,6 +292,9 @@ def recurrent_step(
 # Chunked Helion kernels
 # ════════════════════════════════════════════════════════════════════════════════
 
+# 1 / ln(2), to apply decays with exp2 (one hardware instruction) instead of exp.
+RCP_LN2 = 1.4426950408889634
+
 
 @helion.kernel()
 def chunk_fwd_prescale_diag(
@@ -360,6 +363,49 @@ def chunk_fwd_h_diag_fused(
                 h_acc = h_acc * torch.exp(gl_d)[:, None]
             k_i = k_state[idx, i_t, :, tile_d]
             v_i = v[idx, i_t, :, tile_dv]
+            h_acc = hl.dot(k_i.transpose(-2, -1), v_i, acc=h_acc)
+
+    return h_all
+
+
+@helion.kernel()
+def chunk_fwd_h_scalar_fused(
+    k: torch.Tensor,
+    v: torch.Tensor,
+    gc: torch.Tensor,
+    g_last: torch.Tensor,
+    h0: torch.Tensor,
+) -> torch.Tensor:
+    """State accumulation over N chunks with scalar decay, applying the decay
+    to v inside the chunk loop. With g in natural-log space this is:
+        h_all[i] = exp(g_last[i-1]) * h_all[i-1]
+                   + k[i-1]^T @ (v[i-1] * exp(g_last[i-1] - gc[i-1]))
+    which the kernel computes as exp2(RCP_LN2 * x) == exp(x), since exp2 is one
+    hardware instruction:
+        h_all[i] = exp2(RCP_LN2 * g_last[i-1]) * h_all[i-1]
+                   + k[i-1]^T @ (v[i-1] * exp2(RCP_LN2 * (g_last[i-1] - gc[i-1])))
+    """
+    BH = k.size(0)
+    N = k.size(1)
+    D = k.size(3)
+    DV = v.size(3)
+
+    h_all = torch.empty([BH, N, D, DV], dtype=k.dtype, device=k.device)
+
+    for tile_bh, tile_d, tile_dv in hl.tile([BH, D, DV], block_size=[1, None, None]):
+        idx = tile_bh.id
+        h_acc = h0[idx, tile_d, tile_dv].float()
+
+        for i_t in hl.grid(N):
+            h_all[idx, i_t, tile_d, tile_dv] = h_acc.to(h_all.dtype)
+            g_i = gc[idx, i_t, :].float()  # [C]
+            gl = g_last[idx, i_t].float()  # scalar
+            k_i = k[idx, i_t, :, tile_d]
+            v_i = (
+                v[idx, i_t, :, tile_dv].float()
+                * torch.exp2((gl - g_i) * RCP_LN2)[:, None]
+            ).to(v.dtype)
+            h_acc = torch.exp2(gl * RCP_LN2) * h_acc
             h_acc = hl.dot(k_i.transpose(-2, -1), v_i, acc=h_acc)
 
     return h_all
@@ -1192,21 +1238,15 @@ def _helion_chunked_fwd(
     scalar_decay = g.dim() == 3
 
     if scalar_decay:
-        # Scalar decay path: use PyTorch cumsum + pre-compute k_state.
+        # Scalar decay path: use chunk_fwd_h_scalar_fused.
         gc = g.float().reshape(BH, N, C)
         g_cs = gc.cumsum(-1)  # [BH, N, C]
         g_last = g_cs[:, :, -1]  # [BH, N]
 
-        # Compute k_state = k * exp(g_last - g_cs) for state accumulation
-        k_4d = k.reshape(BH, N, C, D).float()
-        k_state_4d = (
-            k_4d * torch.exp(g_last[:, :, None, None] - g_cs[:, :, :, None])
-        ).to(k.dtype)
-        g_last_4d = g_last.unsqueeze(-1).expand(-1, -1, D)
-
+        k_4d = k.reshape(BH, N, C, D)
         v_flat = v.reshape(BH, N, C, DV)
         state = _init_state(initial_state, BH, D, DV, q)
-        h_all = chunk_fwd_h_diag_fused(k_state_4d, v_flat, g_last_4d, state)
+        h_all = chunk_fwd_h_scalar_fused(k_4d, v_flat, g_cs, g_last, state)
 
         # Output kernel: pass raw q, k with g_cs for decay
         qf = q.reshape(BHN, C, D)
@@ -1220,6 +1260,7 @@ def _helion_chunked_fwd(
         # Precompute q_scaled for backward
         exp_g_cs = torch.exp(g_cs[:, :, :, None])
         q_scaled_4d = qf.reshape(BH, N, C, D) * exp_g_cs
+        g_last_4d = g_last.unsqueeze(-1).expand(-1, -1, D)
         # Attach cached data to h_all for the backward to use
         h_all._scalar_bwd_cache = (  # pyrefly: ignore
             g_cs,
@@ -1230,8 +1271,13 @@ def _helion_chunked_fwd(
 
         final_state = None
         if return_final_state:
+            # k_state for the last chunk only: k * exp(g_last - g_cs).
+            k_state_last = (
+                k_4d[:, -1:].float()
+                * torch.exp(g_last[:, -1:, None, None] - g_cs[:, -1:, :, None])
+            ).to(k.dtype)
             final_state = _final_state_from_h_all(
-                h_all, k_state_4d, v_flat, g_last_4d, B, H
+                h_all, k_state_last, v_flat[:, -1:], g_last_4d[:, -1:], B, H
             )
 
         return o.reshape(B, H, T, DV), h_all, final_state
