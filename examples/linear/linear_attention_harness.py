@@ -48,11 +48,31 @@ class LinearAttentionVariant:
     helion_fb: Callable[[Inputs, torch.Tensor, int], None]
     reference: Callable[[Inputs], torch.Tensor]
     chunked_reference: Callable[[Inputs, int], torch.Tensor]
+    test_shape: tuple[int, int, int, int, int]
+    C: int
+    bench_configs: list[tuple[int, int, int, int, int]]
+    bench_C: int
     fla_fwd: Callable[[Inputs, float], torch.Tensor] | None = None
     fla_fb: Callable[[Inputs, torch.Tensor, float], None] | None = None
     check_recurrent: bool = True
     grad_tensors: tuple[str, ...] = ("q", "k", "v")
     dtype: torch.dtype = torch.bfloat16
+
+    # test / benchmark / accuracy: the module-level API run_linattn.py imports.
+    def test(self) -> None:
+        run_test(self, self.test_shape, self.C)
+
+    def benchmark(
+        self, configs: list | None = None
+    ) -> list[tuple[str, float, float, float, float]]:
+        return run_benchmark(
+            self, configs if configs is not None else self.bench_configs, self.bench_C
+        )
+
+    def accuracy(self, configs: list | None = None) -> list[tuple[bool, bool]]:
+        return run_accuracy(
+            self, configs if configs is not None else self.bench_configs, self.bench_C
+        )
 
 
 def _grad_leaves(v: LinearAttentionVariant, inputs: Inputs) -> tuple[Inputs, list]:

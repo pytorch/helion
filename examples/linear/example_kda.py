@@ -9,18 +9,16 @@ L2-normalized constant, so only q and v carry gradients.
 
 from __future__ import annotations
 
+import math
 from typing import Any
 
 import torch
+import torch.nn.functional as F
 
 from .linear_attention_engine import chunked_linear_attn
 from .linear_attention_harness import Inputs
 from .linear_attention_harness import LinearAttentionVariant
-from .linear_attention_harness import run_accuracy as _run_accuracy
-from .linear_attention_harness import run_benchmark as _run_benchmark
-from .linear_attention_harness import run_test as _run_test
 from .linear_attention_utils import chunked_linear_attn_reference
-from .linear_attention_utils import make_kda_inputs
 from .linear_attention_utils import naive_recurrent_reference
 from helion._testing import DEVICE
 
@@ -48,10 +46,16 @@ def _make_inputs(
     device: str | torch.device = DEVICE,
     requires_grad: bool = False,
 ) -> Inputs:
-    q, k, v, g, beta, scale = make_kda_inputs(
-        B, H, T, D, DV, dtype=dtype, device=device, requires_grad=requires_grad
+    q = torch.randn(B, H, T, D, device=device, dtype=dtype, requires_grad=requires_grad)
+    k = F.normalize(torch.randn(B, H, T, D, device=device, dtype=dtype), dim=-1)
+    if requires_grad:
+        k = k.detach().requires_grad_(True)
+    v = torch.randn(
+        B, H, T, DV, device=device, dtype=dtype, requires_grad=requires_grad
     )
-    return Inputs(q=q, k=k, v=v, scale=scale, g=g, beta=beta)
+    g = -torch.rand(B, H, T, D, device=device, dtype=dtype).abs() * 0.1
+    beta = torch.sigmoid(torch.randn(B, H, T, device=device, dtype=dtype))
+    return Inputs(q=q, k=k, v=v, scale=1.0 / math.sqrt(D), g=g, beta=beta)
 
 
 def _helion_fwd(i: Inputs, C: int) -> torch.Tensor:
@@ -92,34 +96,24 @@ VARIANT = LinearAttentionVariant(
     helion_fb=_helion_fb,
     reference=_reference,
     chunked_reference=_chunked_reference,
+    test_shape=(B, H, T, D, DV),
+    C=C,
+    bench_configs=BENCH_CONFIGS,
+    bench_C=BENCH_C,
     fla_fwd=_fla_fwd if _fla_chunk else None,
     fla_fb=_fla_fb if _fla_chunk else None,
     grad_tensors=("q", "v"),
     dtype=DTYPE,
 )
 
-
 # Module API consumed by run_linattn.py: test / benchmark / accuracy.
-def test() -> None:
-    _run_test(VARIANT, (B, H, T, D, DV), C)
-
-
-def benchmark(
-    configs: list | None = None,
-) -> list[tuple[str, float, float, float, float]]:
-    return _run_benchmark(
-        VARIANT, configs if configs is not None else BENCH_CONFIGS, BENCH_C
-    )
-
-
-def accuracy(configs: list | None = None) -> list[tuple[bool, bool]]:
-    return _run_accuracy(
-        VARIANT, configs if configs is not None else BENCH_CONFIGS, BENCH_C
-    )
+test = VARIANT.test
+benchmark = VARIANT.benchmark
+accuracy = VARIANT.accuracy
 
 
 def main() -> None:
-    print("=== KDA (diagonal decay + correction) ===")
+    print(f"=== {VARIANT.title} ===")
     test()
     print()
     benchmark()
