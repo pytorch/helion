@@ -173,7 +173,11 @@ class ReductionRoller:
             if isinstance(value, torch.fx.Node):
                 num_rdims = self._count_rdim_axes_in_val(value.meta["val"])
                 if num_rdims == 0:
-                    num_rdims = self._count_rdim_axes_in_subscript(target, index_arg)
+                    val = value.meta["val"]
+                    if isinstance(val, torch.Tensor) and any(s == 1 for s in val.size()):
+                        num_rdims = self._count_rdim_axes_in_subscript(
+                            target, index_arg
+                        )
             else:
                 # When the stored value is a Python scalar (broadcast across
                 # the indexed slice), it carries no shape, so the LHS
