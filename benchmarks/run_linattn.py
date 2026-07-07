@@ -53,7 +53,7 @@ _CONFIGS = [(name, b, h, t, d, d) for (name, b, t, h, d) in SHAPES]
 def write_results_json(
     output: str,
     results: dict[str, list[tuple[Any, ...]]],
-    verdicts: dict[str, list[tuple[bool, bool]]],
+    verdicts: dict[str, list[tuple[str, str]]],
 ) -> None:
     """Emit the dashboard's helionbench.json schema: one record per
     (model, metric) with parallel shape and benchmark_values arrays. Forward and
@@ -89,8 +89,9 @@ def write_results_json(
             continue
         labels = [s[0] for s in SHAPES[: len(rows)]]
         vrd = verdicts.get(variant, [])
-        fwd_ok = [1.0 if i < len(vrd) and vrd[i][0] else 0.0 for i in range(len(rows))]
-        bwd_ok = [1.0 if i < len(vrd) and vrd[i][1] else 0.0 for i in range(len(rows))]
+        # ok / REF-ERR -> 1.0; FAIL / HEL-ERR -> 0.0. 
+        fwd_ok = [0.0 if v[0] in ("FAIL", "HEL-ERR") else 1.0 for v in vrd]
+        bwd_ok = [0.0 if v[1] in ("FAIL", "HEL-ERR") else 1.0 for v in vrd]
         # Forward: Helion accuracy + latency + speedup vs FLA; FLA reported at
         # 1.0 so the dashboard's Triton column shows the comparison baseline.
         add_metric(variant, "helion_accuracy", labels, fwd_ok)
@@ -151,7 +152,7 @@ def main() -> None:
     bench_configs = [c[1:] for c in configs]  # drop the label for benchmark()
 
     results: dict[str, list[tuple[Any, ...]]] = {}
-    verdicts: dict[str, list[tuple[bool, bool]]] = {}
+    verdicts: dict[str, list[tuple[str, str]]] = {}
     for name in names:
         print(f"=== {name} ===")
         mod = importlib.import_module(f"examples.linear.example_{name}")

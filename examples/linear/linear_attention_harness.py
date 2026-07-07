@@ -69,7 +69,7 @@ class LinearAttentionVariant:
             self, configs if configs is not None else self.bench_configs, self.bench_C
         )
 
-    def accuracy(self, configs: list | None = None) -> list[tuple[bool, bool]]:
+    def accuracy(self, configs: list | None = None) -> list[tuple[str, str]]:
         return run_accuracy(
             self, configs if configs is not None else self.bench_configs, self.bench_C
         )
@@ -257,32 +257,56 @@ def run_accuracy(
     v: LinearAttentionVariant,
     configs: list,
     C: int,
-) -> list[tuple[bool, bool]]:
-    """Per-config (fwd_ok, bwd_ok) verdicts vs the fp32 PyTorch reference.
+) -> list[tuple[str, str]]:
+    """Per-config (fwd, bwd) verdicts vs the fp32 PyTorch reference.
 
-    Forward compares against the naive recurrent reference; backward compares
-    autograd gradients against the chunked reference. Backward is isolated so a
-    backward failure leaves the forward verdict intact.
+    Each of fwd and bwd is one of: ``ok`` (matches within tolerance), ``FAIL``
+    (ran but over tolerance), ``HEL-ERR`` (the Helion kernel errored), ``REF-ERR``
+    (the reference errored, e.g. its autograd graph OOMs). Forward compares
+    against the naive recurrent reference; backward compares autograd gradients
+    against the chunked reference. Each side is isolated so an error on one leaves
+    the other's verdict intact.
     """
-    verdicts: list[tuple[bool, bool]] = []
+    verdicts: list[tuple[str, str]] = []
     for bi, hi, ti, di, dvi in configs:
         inputs = v.make_inputs(bi, hi, ti, di, dvi, dtype=v.dtype, device=DEVICE)
-        out = v.helion_fwd(inputs, C)
-        ref = v.reference(inputs)
-        fwd_ok = _rel_error(out, ref) < ACC_FWD_TOL
 
-        bwd_ok = False
         try:
-            grad_out = torch.randn(bi, hi, ti, dvi, device=DEVICE, dtype=v.dtype)
-            h_inputs, h_leaves = _grad_leaves(v, inputs)
-            v.helion_fwd(h_inputs, C).backward(grad_out)
-            r_inputs, r_leaves = _grad_leaves(v, inputs)
-            v.chunked_reference(r_inputs, C).backward(grad_out)
-            bwd_ok = all(
-                _rel_error(h.grad, r.grad) < ACC_BWD_TOL
-                for h, r in zip(h_leaves, r_leaves, strict=True)
-            )
+            out = v.helion_fwd(inputs, C)
         except Exception:
             torch.cuda.empty_cache()
-        verdicts.append((fwd_ok, bwd_ok))
+            fwd = "HEL-ERR"
+        else:
+            try:
+                ref = v.reference(inputs)
+            except Exception:
+                torch.cuda.empty_cache()
+                fwd = "REF-ERR"
+            else:
+                fwd = "ok" if _rel_error(out, ref) < ACC_FWD_TOL else "FAIL"
+
+        grad_out = torch.randn(bi, hi, ti, dvi, device=DEVICE, dtype=v.dtype)
+        try:
+            h_inputs, h_leaves = _grad_leaves(v, inputs)
+            v.helion_fwd(h_inputs, C).backward(grad_out)
+        except Exception:
+            torch.cuda.empty_cache()
+            bwd = "HEL-ERR"
+        else:
+            try:
+                r_inputs, r_leaves = _grad_leaves(v, inputs)
+                v.chunked_reference(r_inputs, C).backward(grad_out)
+            except Exception:
+                torch.cuda.empty_cache()
+                bwd = "REF-ERR"
+            else:
+                bwd = (
+                    "ok"
+                    if all(
+                        _rel_error(h.grad, r.grad) < ACC_BWD_TOL
+                        for h, r in zip(h_leaves, r_leaves, strict=True)
+                    )
+                    else "FAIL"
+                )
+        verdicts.append((fwd, bwd))
     return verdicts
