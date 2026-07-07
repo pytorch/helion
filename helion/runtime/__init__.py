@@ -5,7 +5,6 @@ from contextlib import suppress
 import contextvars
 from dataclasses import dataclass
 import enum
-import functools
 import hashlib
 import importlib
 import inspect
@@ -184,9 +183,14 @@ def get_num_sm(device: torch.device, *, reserved_sms: int = 0) -> int:
 # re-validates everything) whenever it cannot guarantee an identical launch:
 # unseen argument metadata (dtype, scalar value, or 16-byte pointer alignment
 # -- all part of the cache key, so Triton's per-argument specialization axes
-# are covered), mutated ``used_global_vals``, extra launch kwargs, active
-# Triton hooks/knobs at prime time, torch.compile tracing, or any exception
-# while building the key.  The one intentional gap: Triton launch/pre-run
+# are covered), mutated ``used_global_vals`` (current global values are key
+# elements too, so a mutation is just a cache miss), extra launch kwargs,
+# active Triton hooks/knobs at prime time, torch.compile tracing, or any
+# exception while building the key.  These hazards cannot be caught *after*
+# a bad launch -- a misaligned launch surfaces as an asynchronous CUDA error
+# that poisons the context, and a stale captured global silently computes
+# wrong values -- so they are folded into the key and prevented up front
+# rather than detected afterwards.  The one intentional gap: Triton launch/pre-run
 # hooks and debug/instrumentation knobs are checked when a specialization is
 # first cached, not per call, so a profiler that registers launch hooks
 # *after* a kernel's first launch will not observe direct launches.  Set
@@ -255,39 +259,40 @@ def _direct_launch_populate(
     """Cache a compiled specialization for direct launching.
 
     The cache key is every launch argument (tensors contribute their dtype
-    and a 16-byte pointer-alignment bit, scalars their value) plus launch
-    options and device.  Scalar values are strictly finer than the buckets
-    Triton specializes on (divisible-by-16, equals-1); dtype covers
+    and a 16-byte pointer-alignment bit, scalars their value) plus the
+    current value of every global Triton captured at compile time, plus
+    launch options and device.  Scalar values are strictly finer than the
+    buckets Triton specializes on (divisible-by-16, equals-1); dtype covers
     pointer-type specialization when one ``JITFunction`` serves several
     dtypes (``PyCodeCache`` dedups identical generated source, e.g. a
     dtype-agnostic add kernel for bf16 and fp16); the alignment bit covers
     Triton's pointer-alignment specialization, so an unaligned view arriving
-    after an aligned prime misses the cache and takes the slow path.
+    after an aligned prime misses the cache and takes the slow path; global
+    values cover ``used_global_vals``, so a mutated global misses the cache
+    and the slow path raises Triton's own RuntimeError.
     """
     if not _triton_direct_launch_ok(triton_kernel):
         return
     state = triton_kernel.__dict__.get("_helion_direct_launch")
     if state is None:
         # Argument layout (which positions are tensors) is fixed per generated
-        # kernel, so record the tensor/scalar split once here and let the hot
-        # path build keys with no per-element type checks.
-        tensor_idx = tuple(
-            i for i, a in enumerate(args) if isinstance(a, torch.Tensor)
-        )
+        # kernel, so bake the tensor/scalar split and the captured-globals
+        # lookups into a single compiled key function here; the hot path then
+        # builds the full key with no per-element type checks and no separate
+        # globals-guard loop.
+        tensor_idx = tuple(i for i, a in enumerate(args) if isinstance(a, torch.Tensor))
         scalar_idx = tuple(
             i for i in range(len(args)) if i not in frozenset(tensor_idx)
         )
-        make_key = functools.partial(_direct_launch_args_key, tensor_idx, scalar_idx)
-        # Snapshot of the globals Triton captured at compile time; compared
-        # (by value, like JITFunction.run does) before every direct launch.
         globals_guard = tuple(
-            (gdict, name, val)
-            for (name, _), (val, gdict) in triton_kernel.used_global_vals.items()
+            (gdict, name)
+            for (name, _), (_val, gdict) in triton_kernel.used_global_vals.items()
         )
-        state = (make_key, globals_guard, {})
+        make_key = _direct_launch_make_key_fn(tensor_idx, scalar_idx, globals_guard)
+        state = (make_key, {})
         # pyrefly: ignore [missing-attribute]
         triton_kernel._helion_direct_launch = state
-    state[2][(*key, *state[0](args))] = (
+    state[1][(*key, *state[0](args))] = (
         compiled.run,
         compiled.function,
         compiled.packed_metadata,
@@ -295,28 +300,35 @@ def _direct_launch_populate(
     )
 
 
-def _direct_launch_args_key(
+def _direct_launch_make_key_fn(
     tensor_idx: tuple[int, ...],
     scalar_idx: tuple[int, ...],
-    args: tuple[object, ...],
-) -> tuple[object, ...]:
-    """Direct-launch key: scalar values followed by per-tensor
-    ``(dtype, aligned)`` pairs, using index positions recorded at first
-    launch.
+    globals_guard: tuple[tuple[dict[str, object], str], ...],
+) -> Callable[[tuple[object, ...]], tuple[object, ...]]:
+    """Compile a flat key builder: scalar values, per-tensor dtype and
+    16-byte-alignment bit, then the current value of each captured global.
 
-    Concatenating the two groups (rather than interleaving in argument order)
-    keeps the key unique because the tensor/scalar split is fixed per kernel.
-    If a later call passes a tensor where a scalar was seen (or vice versa),
-    ``data_ptr``/hashing raises or the key won't match, so the call safely
-    falls back to the slow path.
+    Compiling one expression per kernel (Triton's ``binder`` does the same)
+    roughly halves key-build time versus a generic generator plus a separate
+    globals-guard loop.  Concatenating the groups (rather than interleaving
+    in argument order) keeps the key unique because the tensor/scalar split
+    is fixed per generated kernel.  Every hazard is a key element, so any
+    deviation -- unseen scalar, new dtype, unaligned pointer, mutated or
+    deleted captured global, tensor/scalar mismatch (attribute error or an
+    identity-hashed tensor) -- is a cache miss that falls back to the slow
+    path; nothing needs to be caught after the launch (misalignment would be
+    an async CUDA error, a stale global would be silently wrong numerics).
     """
-    return (
-        *(args[i] for i in scalar_idx),
-        *(
-            (t.dtype, t.data_ptr() % 16 == 0)  # type: ignore[union-attr]
-            for t in (args[i] for i in tensor_idx)
-        ),
-    )
+    namespace: dict[str, object] = {"_MISSING": _MISSING_GLOBAL}
+    parts = [f"a[{i}]" for i in scalar_idx]
+    for i in tensor_idx:
+        parts.extend((f"a[{i}].dtype", f"not a[{i}].data_ptr() & 15"))
+    for j, (gdict, name) in enumerate(globals_guard):
+        namespace[f"_g{j}"] = gdict
+        parts.append(f"_g{j}.get({name!r}, _MISSING)")
+    if not parts:
+        return lambda a: ()
+    return eval(f"lambda a: ({', '.join(parts)},)", namespace)
 
 
 def default_launcher(
@@ -350,7 +362,7 @@ def default_launcher(
                 active = _triton_driver().active
                 # pyrefly: ignore [missing-attribute]
                 device = active.get_current_device()
-                make_key, globals_guard, cache = state
+                make_key, cache = state
                 cached = cache.get(
                     (
                         device,
@@ -361,11 +373,6 @@ def default_launcher(
                     )
                 )
                 if cached is not None:
-                    for gdict, name, val in globals_guard:
-                        if gdict.get(name, _MISSING_GLOBAL) != val:
-                            # Mutated captured global: the slow path re-checks
-                            # and raises Triton's own RuntimeError.
-                            raise LookupError
                     # pyrefly: ignore [missing-attribute]
                     stream = active.get_current_stream(device)
                     kernel_run, kernel_function, packed_metadata, compiled = cached
@@ -384,10 +391,11 @@ def default_launcher(
                     )
                     return compiled
             except Exception:
-                # Unseen specialization, mutated global, stale cache entry
-                # (device reset, ...), or bad launch args: fall through to
-                # JITFunction.run, which re-validates and raises a proper
-                # error if the launch is genuinely broken.
+                # Unhashable key element, stale cache entry (device reset,
+                # ...), or bad launch args: fall through to JITFunction.run,
+                # which re-validates and raises a proper error if the launch
+                # is genuinely broken.  (Unseen specializations and mutated
+                # captured globals are ordinary cache misses, not exceptions.)
                 pass
 
     compiled = default_slow_launcher(
