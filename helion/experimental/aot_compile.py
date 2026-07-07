@@ -61,6 +61,32 @@ def _get_num_sm(device, reserved_sms=0):
     return max(available - reserved_sms, 1)
 """
 
+_INLINED_GET_NUM_XCD = """
+_CUS_PER_XCD = {"gfx942": 38, "gfx950": 32, "gfx951": 32}
+
+
+def _get_num_xcd(device=None):
+    if not torch.cuda.is_available():
+        return 1
+    try:
+        props = torch.cuda.get_device_properties(
+            device if device is not None else torch.cuda.current_device()
+        )
+    except Exception:
+        return 1
+    arch = getattr(props, "gcnArchName", None)
+    if not arch:
+        return 1
+    cus_per_xcd = _CUS_PER_XCD.get(arch.split(":")[0])
+    if cus_per_xcd is None:
+        return 1
+    cu = props.multi_processor_count
+    n = round(cu / cus_per_xcd)
+    if n < 1 or abs(n * cus_per_xcd - cu) > cus_per_xcd // 4:
+        return 1
+    return n
+"""
+
 
 # ---------------------------------------------------------------------------
 # Internals
@@ -85,8 +111,9 @@ def _split_imports_and_body(code: str) -> tuple[list[str], str]:
 
 
 def _replace_helion_deps(body: str) -> str:
-    """Replace ``helion.runtime.get_num_sm(`` with ``_get_num_sm(``."""
-    return body.replace("helion.runtime.get_num_sm(", "_get_num_sm(")
+    """Replace inlined Helion runtime helpers with their standalone versions."""
+    body = body.replace("helion.runtime.get_num_sm(", "_get_num_sm(")
+    return body.replace("helion.runtime.get_num_xcd(", "_get_num_xcd(")
 
 
 def _rename_config_symbols(body: str, kernel_name: str, config_idx: int) -> str:
@@ -220,6 +247,7 @@ def generate_standalone_file(
     bodies: list[str] = []
     needs_launcher = False
     needs_get_num_sm = False
+    needs_get_num_xcd = False
 
     for i, code in enumerate(triton_codes):
         imports, body = _split_imports_and_body(code)
@@ -231,6 +259,8 @@ def generate_standalone_file(
             all_imports.add(imp)
         if "helion.runtime.get_num_sm(" in body:
             needs_get_num_sm = True
+        if "helion.runtime.get_num_xcd(" in body:
+            needs_get_num_xcd = True
         body = _replace_helion_deps(body)
         bodies.append(_rename_config_symbols(body, kernel_name, i))
 
@@ -250,6 +280,8 @@ def generate_standalone_file(
         parts.append(_INLINED_LAUNCHER)
     if needs_get_num_sm:
         parts.append(_INLINED_GET_NUM_SM)
+    if needs_get_num_xcd:
+        parts.append(_INLINED_GET_NUM_XCD)
 
     sep = "=" * 65
     for i, body in enumerate(bodies):

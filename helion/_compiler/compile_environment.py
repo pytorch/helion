@@ -252,9 +252,17 @@ class CompileEnvironment:
         self.input_sources: dict[torch.Tensor, Source] = {}
         self.block_sizes: list[BlockSizeInfo] = []
         self.debug_shape_renames: dict[sympy.Basic, sympy.Basic] = {}
+        try:
+            from ..runtime import get_num_sm
+
+            _num_sm = get_num_sm(device, reserved_sms=settings.persistent_reserved_sms)
+        except Exception:
+            _num_sm = 1
         self.config_spec = ConfigSpec(
             backend=self.backend,
             target_device_capability=target_device_capability(device),
+            device=device,
+            num_sm=_num_sm,
         )
         # TODO(hinriksnaer): tracing state, not env config. move to CompilerState?
         self.kernel_tensor_sizes: dict[tuple[sympy.Expr, ...], int] = (

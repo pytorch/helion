@@ -79,6 +79,7 @@ def _strip_launcher_args(value: str) -> str:
         strip_pairs += [
             (r", waves_per_eu=\d+", ""),
             (r", matrix_instr_nonkdim=\d+", ""),
+            (r", xcd_remap=(?:True|False)", ""),
         ]
     if _get_backend() == "tileir":
         strip_pairs += [(r", num_ctas=\d+", ""), (r", occupancy=\d+", "")]
@@ -347,6 +348,21 @@ def skipUnlessAMDCDNA(reason: str) -> Callable[[Callable], Callable]:
 
     # Defers check to test execution time to avoid CUDA init during pytest-xdist collection.
     return skipIfFn(lambda: not supports_amd_cdna_tunables(), reason)
+
+
+def skipUnlessMultiXCD(reason: str) -> Callable[[Callable], Callable]:
+    """Skip test unless running on a multi-XCD AMD CDNA GPU.
+
+    Single-XCD parts and CPX-partitioned devices (which expose one XCD) are
+    skipped, since xcd_remap is a no-op there.
+    """
+    from helion._compat import get_num_xcd
+    from helion._compat import supports_amd_cdna_tunables
+
+    # Defers check to test execution time to avoid CUDA init during pytest-xdist collection.
+    return skipIfFn(
+        lambda: not (supports_amd_cdna_tunables() and get_num_xcd() > 1), reason
+    )
 
 
 def skipUnlessMTIA(reason: str) -> Callable[[Callable], Callable]:

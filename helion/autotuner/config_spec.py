@@ -18,6 +18,8 @@ from torch._inductor.runtime.runtime_utils import next_power_of_2
 import torch.distributed as dist
 
 from .._compat import _regs_per_block
+from .._compat import device_num_sm
+from .._compat import get_num_xcd
 from .._compat import num_compute_units
 from .._compat import supports_amd_cdna_tunables
 from .._compat import supports_maxnreg
@@ -234,6 +236,19 @@ class MemoryOpFact(NamedTuple):
     # subscript so it is reduction-AGNOSTIC; ``None`` for a plain slice). The faithful axis key for
     # the full_width_output / input_load_itemsize gates.
     subscript_block_ids: tuple[int | None, ...] = ()
+    # Element stride of the accessed tensor along each subscript position, aligned 1:1 with
+    # ``subscript_block_ids`` (from ``.stride()``). A stride-1 position is the contiguous (coalescing)
+    # axis — the last subscript for a row-major tensor, a different one for a transposed/strided view.
+    subscript_strides: tuple[int, ...] = ()
+    # DISTINCT HBM elements the op's accessed tensor touches: product of its size-hinted shape dims
+    # over NON-broadcast dims (``stride != 0``); a stride-0 dim contributes factor 1 (``0`` if no
+    # resolvable fake tensor). A FULL-EXTENT op has ``accessed_numel`` == the problem numel; a
+    # BROADCAST operand has a STRICTLY SMALLER count — whether it is a small tensor (``bias[N]``,
+    # ``[M,1]``, ``[1,N]``) OR a full-SIZE ``.expand()``/``broadcast_tensors`` view with a stride-0
+    # dim. The faithful signal for per-element HBM traffic at ANY rank/stride, unlike a bare ``ndim``
+    # check (a full-rank ``[M,1]`` broadcast passes ndim) or a shape-only product (a stride-0 expand
+    # passes shape).
+    accessed_numel: int = 0
 
 
 class AccumulatorFact(NamedTuple):
@@ -246,6 +261,42 @@ class AccumulatorFact(NamedTuple):
 
     dim_block_ids: tuple[int | None, ...]
     itemsize: int
+
+
+class PointwiseElementwiseFact(NamedTuple):
+    """Workload facts for a PURE elementwise/pointwise kernel — DEFINED by the absence of any
+    reduction/matmul/accumulator fact (the disjointness rule): if one of those fired, the kernel
+    belongs to that family and this fact is never built. Bandwidth-bound; the compiler defaults it to
+    ``block_size=32`` (which starves HBM), so the seed sizes a saturating tile from these fields
+    (derived from the walker ``MemoryOpFact`` list + block-size specs, plus one graph walk).
+
+    - ``total_numel``: product of the tiled block dims' ``size_hint``s (the problem element count,
+      M*N); the occupancy / grid-saturation input.
+    - ``slab_numel``: the untiled inner slab, in ELEMENTS, that full-extent ops drag per tiled element
+      = ``sum(accessed_numel // total_numel)`` over those ops (flat kernel: 1 per op; rope:
+      heads*head_dim). A BROADCAST operand (``bias[N]``, ``[M,1]``, stride-0) has
+      ``accessed_numel < total_numel`` → amortized → excluded; an OVERSIZED operand still touches the
+      full problem → counted (hence ``>=``).
+    - ``storage_itemsize`` / ``compute_itemsize``: the STORAGE (HBM) and widest COMPUTE (fp32) byte
+      widths that scale slab_numel into the two budgets — ``slab_numel * storage`` = bandwidth traffic,
+      ``slab_numel * compute`` = register cap (compute reads the promoted dtype; a memory op knows only
+      storage). NOTE: the register cap is a COARSE proxy (blind to compute temporaries), but benign —
+      pointwise is memory-bound; its only jobs are relaxing the floor for a heavy slab and capping the
+      transpose-conflict tile. (Mixed-dtype storage uses the max width — a minor seed approximation.)
+    - ``contig_block_ids``: TILED block-ids that are the stride-1 axis of some full-extent op (from
+      ``subscript_strides``, no graph walk). Row-major → the last dim (seed unchanged); transposed →
+      a different dim; two+ entries = a load-vs-store CONFLICT → the seed emits a BALANCED tile.
+    - ``sfu_ops``: count of transcendental (SFU) ops. SFU ops are latency-bound on a distinct unit, so
+      a transcendental-heavy tile wants more warps while an all-FMA tile of the same op count does not
+      — so SFU count (not total op count) drives the num_warps ramp.
+    """
+
+    total_numel: int
+    slab_numel: int
+    storage_itemsize: int
+    compute_itemsize: int
+    contig_block_ids: tuple[int, ...] = ()
+    sfu_ops: int = 0
 
 
 def shrink_block_sizes_for_numel_constraints(
@@ -286,6 +337,16 @@ def shrink_block_sizes_for_numel_constraints(
 
 DEFAULT_NUM_WARPS = 4
 DEFAULT_NUM_STAGES = 1
+
+# Upper bound (power of two) that a matmul tile dimension's block size may reach
+# even when the dimension itself is smaller. Applied only to dimensions that
+# feed an hl.dot (see enforce_dot_requirements), so the autotuner can mask-
+# overshoot a small matmul dimension up to a hardware-friendly tile (e.g. an M
+# tile matching the native MMA shape). We restrict this to matmuls because such
+# kernels are memory/MMA-bound on the small dimension -- the masked-off rows/cols
+# are effectively free and the larger, hardware-aligned tile runs faster -- while
+# for elementwise/reduction kernels a larger-than-dimension tile is pure waste.
+SMALL_DIM_BLOCK_SIZE_OVERSHOOT = 64
 
 # Base backend tunable keys (public)
 _BASE_BACKEND_TUNABLE_KEYS: frozenset[str] = frozenset(
@@ -328,6 +389,7 @@ BACKEND_SPECIFIC_KEYS: frozenset[str] = (
         "store_cache_modifiers",
         "pallas_loop_type",
         "pallas_pre_broadcast",
+        "xcd_remap",
     }
 )
 VALID_KEYS: frozenset[str] = frozenset(
@@ -360,6 +422,7 @@ VALID_KEYS: frozenset[str] = frozenset(
         *BACKEND_TUNABLE_KEYS,
         "advanced_controls_file",
         "epilogue_subtile",
+        "xcd_remap",
         *_BACKEND_DIAGNOSTIC_CONFIG_KEYS,
         *_BACKEND_STRATEGY_CONFIG_KEYS,
         *FLASH_CONFIG_KEYS,
@@ -444,6 +507,8 @@ class ConfigSpec:
         target_device_capability: tuple[int, int]
         | object
         | None = _TARGET_DEVICE_CAPABILITY_UNSET,
+        device: torch.device | None = None,
+        num_sm: int | None = None,
     ) -> None:
         self.backend = backend
         self.backend_name = backend.name
@@ -465,6 +530,16 @@ class ConfigSpec:
                 "tuple[int, int] | None",
                 target_device_capability,
             )
+
+        # XCD count for the *compile* device, captured once so xcd_remap's
+        # support/search/normalize decisions match the device used in codegen
+        # (rather than the current device).  1 disables/no-ops xcd_remap.
+        self.num_xcd: int = get_num_xcd(device)
+        # Persistent grid SM/CU count of the compile device (after reserved_sms);
+        # used to check XCD-alignment of the persistent_interleaved grid stride.
+        # Defaults to the device CU count (consistent with num_xcd) when not
+        # passed explicitly by the compile path.
+        self.num_sm: int = num_sm if num_sm is not None else device_num_sm(device)
 
         self.block_sizes: BlockIdSequence[BlockSizeSpec] = BlockIdSequence()
         self.num_threads: BlockIdSequence[NumThreadsSpec] = BlockIdSequence()
@@ -538,6 +613,7 @@ class ConfigSpec:
         self.reduction_facts: list[ReductionFact] = []
         self.matmul_reduction_epilogue_facts: list[MatmulWithReductionEpilogueFact] = []
         self.accumulator_facts: list[AccumulatorFact] = []
+        self.pointwise_facts: list[PointwiseElementwiseFact] = []
         self.store_indices: list[int] = []
         self.memory_op_facts: list[MemoryOpFact] = []
         self.backend_tunable_fragments = self.backend.tunable_fragments()
@@ -1605,6 +1681,47 @@ class ConfigSpec:
             else:
                 config["pid_type"] = VALID_PID_TYPES[0]
 
+        if self.supports_config_key("xcd_remap"):
+            if "xcd_remap" in config:
+                if not isinstance(config["xcd_remap"], bool):
+                    raise InvalidConfig(
+                        f"Invalid value for 'xcd_remap': {config['xcd_remap']!r} must be a bool"
+                    )
+                if config["xcd_remap"]:
+                    pid_type = config.get("pid_type", "flat")
+                    if self.num_xcd <= 1:
+                        # No-op on single-XCD devices: silently disable rather
+                        # than reject (the remap is the identity at NUM_XCDS=1).
+                        config["xcd_remap"] = False
+                    elif pid_type not in (
+                        "flat",
+                        "persistent_blocked",
+                        "persistent_interleaved",
+                    ):
+                        # xcd_remap is only defined for flat and the persistent
+                        # (blocked / interleaved) PID strategies.
+                        if _fix_invalid:
+                            config["xcd_remap"] = False
+                        else:
+                            raise InvalidConfig(
+                                "xcd_remap=True requires pid_type in "
+                                "{'flat', 'persistent_blocked', 'persistent_interleaved'}"
+                            )
+                    elif pid_type == "persistent_interleaved":
+                        # interleaved remaps each virtual pid, so it needs the
+                        # persistent grid stride to be XCD-aligned (this can be
+                        # broken by reserved_sms); otherwise a worker spans
+                        # multiple XCD regions.  Silently disable (perf no-op).
+                        mult = config.get("num_sm_multiplier", 1)
+                        if not isinstance(mult, int) or mult < 1:
+                            mult = 1
+                        if (self.num_sm * mult) % self.num_xcd != 0:
+                            config["xcd_remap"] = False
+            else:
+                config["xcd_remap"] = False
+        else:
+            config.pop("xcd_remap", None)
+
         if _fix_invalid and self.backend_name == "cute":
             self._cute_tcgen05_config.fix_search_config(config)
 
@@ -2007,6 +2124,8 @@ class ConfigSpec:
             fields["atomic_indexing"] = self.atomic_indexing
         if self.supports_config_key("pid_type"):
             fields["pid_type"] = EnumFragment(self.allowed_pid_types)
+        if self.supports_config_key("xcd_remap") and self.num_xcd > 1:
+            fields["xcd_remap"] = BooleanFragment()
         if self.supports_config_key("num_sm_multiplier"):
             fields["num_sm_multiplier"] = PowerOfTwoFragment(
                 MIN_NUM_SM_MULTIPLIER,
@@ -2217,9 +2336,13 @@ class BlockSizeSpec(_PowerOfTwoBlockIdItem):
         bounded_hint = max(bounded_hint, 1)
         self.min_size: int = min_size
         self.autotuner_min: int = min_size
-        self.max_size: int = (
+        # Largest power-of-two block that fits inside the dimension. allow_overshoot
+        # may raise max_size above this for matmul dims, but the default block size
+        # stays clamped to dim_max_size (see _fragment).
+        self.dim_max_size: int = (
             next_power_of_2(bounded_hint) if max_size is None else max_size
         )
+        self.max_size: int = self.dim_max_size
         # Outer block_id whose tile extent caps this block's size in normalize().
         self.bounded_by_block_id: int | None = bounded_by_block_id
         if self.max_size < self.min_size:
@@ -2255,6 +2378,19 @@ class BlockSizeSpec(_PowerOfTwoBlockIdItem):
         clamped = max(value, 1)
         self.max_size = assert_integer_power_of_two(min(clamped, self.max_size))
 
+    def allow_overshoot(self, ceiling: int) -> None:
+        """Raise the autotuner search ceiling above the dimension size.
+
+        Used for matmul tile dimensions: a block larger than a small dimension
+        (with the extra rows/cols masked off) can map to a more efficient MMA
+        tile and run faster. Only the search ceiling grows; the default block
+        size stays clamped to the dimension (see _fragment). Dimensions bounded
+        by an outer tile extent are left untouched.
+        """
+        if self.bounded_by_block_id is not None:
+            return
+        self.max_size = max(self.max_size, next_power_of_2(max(ceiling, 1)))
+
     def update_hint(self, value: int) -> None:
         self.size_hint = value
         self.update_max(next_power_of_2(max(value, 1)))
@@ -2281,6 +2417,11 @@ class BlockSizeSpec(_PowerOfTwoBlockIdItem):
         else:
             default = 1
         low = min(max(self.min_size, self.autotuner_min), self.max_size)
+        # Clamp the default within the dimension so allow_overshoot only widens
+        # the autotuner *search*, never the default (non-autotuned) block size.
+        # Needed for matmul dims smaller than the heuristic default (e.g. M<16),
+        # where the default would otherwise overshoot to a masked tile.
+        default = min(default, self.dim_max_size)
         return BlockSizeFragment(
             low,
             self.max_size,

@@ -36,6 +36,7 @@ disallowed_names: dict[str, None] = dict.fromkeys(
         "_default_pallas_launcher",
         "_default_cute_launcher",
         "_NUM_SM",
+        "_NUM_XCDS",
     ]
 )
 

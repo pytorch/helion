@@ -903,7 +903,18 @@ class TensorDescriptorIndexingStrategy(IndexingStrategy):
                 if fake_tensor.ndim == 2 and block_size < threshold:
                     return False
 
-            if isinstance(dim_size, int) and block_size > dim_size:
+            # CUDA TMA descriptors require boxDim <= tensorDim in every
+            # dimension (see PR #2555). For a statically-known size we compare
+            # directly; for a symbolic/dynamic dimension (e.g. an unspecialized
+            # matmul M) we compare against the size hint, which is the
+            # dimension's extent while the autotuner benchmarks. Matmul
+            # block-size overshoot can raise a block above a small dynamic dim,
+            # which would otherwise build an invalid descriptor and crash with a
+            # misaligned-address error.
+            dim_extent = (
+                dim_size if isinstance(dim_size, int) else env.size_hint(dim_size)
+            )
+            if block_size > dim_extent:
                 return False
 
             # Tensor-descriptor path (TMA + WGMMA / stmatrix writes)
