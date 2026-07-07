@@ -571,6 +571,50 @@ class TestAutotuneIgnoreErrors(TestCase):
         self.assertEqual(calls, [[0, 1]])
         self.assertEqual([idx for idx, _ in candidates], [0, 1])
 
+    def test_benchmarked_members_survive_config_mutation(self):
+        # Regression test: _benchmarked_members / _pinned_finalist_members must
+        # not be keyed by Config objects. Config is mutable and hashes on its
+        # contents, so mutating a recorded config in place (as normalize /
+        # neighbor generation does during the search) corrupted the bookkeeping
+        # -> _prune_benchmarked_members raised KeyError, and final verification
+        # could select a config that was never accuracy-validated.
+        search = DifferentialEvolutionSearch.__new__(DifferentialEvolutionSearch)
+        search._benchmarked_members = {}
+        search._pinned_finalist_configs = set()
+        search._pinned_finalist_members = {}
+
+        def make_member(perf: float, num_warps: int) -> PopulationMember:
+            return PopulationMember(
+                lambda *a, **k: None,
+                [perf],
+                [],
+                helion.Config(block_sizes=[64], num_warps=num_warps),
+                status="ok",
+            )
+
+        fast = make_member(1.0, num_warps=4)
+        slow = make_member(2.0, num_warps=8)
+        search._record_best_member_for_config(
+            search._benchmarked_members, fast.config, fast
+        )
+        search._record_best_member_for_config(
+            search._benchmarked_members, slow.config, slow
+        )
+
+        # Mutate the original configs in place *after* they were recorded.
+        fast.config.config["num_warps"] = 999
+        slow.config.config["num_warps"] = 999
+
+        # Pruning to the single fastest config must not raise (the old code did
+        # `del dict[config]` on a config whose hash had changed -> KeyError) and
+        # must keep the fast member with the config it was actually benchmarked
+        # with (snapshot), not the later in-place mutation.
+        search._prune_benchmarked_members(top_k=1)
+        self.assertEqual(len(search._benchmarked_members), 1)
+        kept = next(iter(search._benchmarked_members.values()))
+        self.assertEqual(kept.perfs[0], 1.0)
+        self.assertEqual(kept.config["num_warps"], 4)
+
     @pytest.mark.skipif(
         "fork" not in mp.get_all_start_methods(),
         reason="fork start method is unavailable on this platform",
@@ -1409,6 +1453,45 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
             # Check boolean
             self.assertIn(neighbor[4], [True, False])
 
+    def test_lfbo_tree_search_generate_neighbors_cap(self):
+        """LFBOTreeSearch applies num_neighbors_cap in the tree-guided path."""
+
+        class MockEstimator:
+            tree_ = SimpleNamespace(feature=np.array([0], dtype=int))
+
+            def decision_path(self, _x):
+                return SimpleNamespace(indices=np.array([0], dtype=int))
+
+            def predict_proba(self, x):
+                scores = np.asarray(x)[:, 0]
+                probas = scores / np.max(scores)
+                return np.column_stack((1.0 - probas, probas))
+
+        spec = PowerOfTwoFragment(16, 128, 32)
+        search = LFBOTreeSearch.__new__(LFBOTreeSearch)
+        search.num_neighbors = 10
+        search.num_neighbors_cap = 3
+        search.radius = 2
+        search.surrogate = SimpleNamespace(estimators_=[MockEstimator()])
+        search._autotune_metrics = SimpleNamespace(num_generations=2)
+        search._encoded_to_flat_mapping = None
+        search.config_gen = SimpleNamespace(
+            flat_spec=[spec],
+            block_size_indices=[0],
+            num_warps_index=-1,
+            overridden_flat_indices=set(),
+            encode_config=lambda flat: spec.encode(flat[0]),
+        )
+
+        capped_neighbors = search._generate_neighbors([32])
+
+        search.num_neighbors_cap = -1
+        uncapped_neighbors = search._generate_neighbors([32])
+
+        self.assertEqual(len(capped_neighbors), 3)
+        self.assertEqual(len(uncapped_neighbors), 10)
+        self.assertTrue(all(neighbor != [32] for neighbor in capped_neighbors))
+
     def test_lfbo_pattern_search_surrogate_select_matches_legacy_prefix(self):
         """Top-k LFBO selection should match the legacy full-ranking implementation."""
 
@@ -1635,6 +1718,77 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
 
         run_mode("fork", expect_error=False)
         run_mode("spawn", expect_error=True)
+
+    def test_autotune_noncontiguous_arg(self) -> None:
+        """Autotuning a kernel bound on a non-contiguous arg must succeed.
+
+        A kernel bound on a non-contiguous arg hardcodes that arg's load strides
+        into the compiled kernel as compile-time constants. The autotuner reruns
+        that compiled kernel on a clone of the args to compute its accuracy
+        baseline, so the clone must keep the same layout. If the clone is made
+        contiguous, those hardcoded strides address the wrong (or out-of-bounds)
+        memory and read garbage, so every config mismatches the baseline and
+        autotuning fails to select one.
+
+        The arg is a strided slice (``buf[::2]``): its contiguous clone compacts
+        the storage, so the hardcoded stride-2 loads read the wrong elements.
+        """
+        config_a = helion.Config(block_sizes=[32], num_warps=4)
+        config_b = helion.Config(block_sizes=[64], num_warps=4)
+
+        @helion.kernel(configs=[config_a, config_b], autotune_log_level=0)
+        def double(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile in hl.tile(x.size(0)):
+                out[tile] = x[tile] * 2.0
+            return out
+
+        # Strided 1-D view: size 1024, stride 2 over a 2048-element buffer.
+        x = torch.arange(2048, device=DEVICE, dtype=torch.float32)[::2]
+        self.assertFalse(x.is_contiguous())
+        self.assertEqual(x.stride(), (2,))
+
+        bound_kernel = double.bind((x,))
+        search = FiniteSearch(bound_kernel, (x,), configs=[config_a, config_b])
+        best = search.autotune()
+        self.assertIn(best, (config_a, config_b))
+
+        torch.testing.assert_close(double(x), x * 2.0)
+
+    def test_autotune_broadcast_arg(self) -> None:
+        """Autotuning a kernel bound on a broadcast/expanded arg must succeed.
+
+        Same accuracy-baseline issue as the strided-slice case, but for a
+        ``stride-0`` view from ``expand``. Here ``b`` is ``[M, 1]`` expanded to
+        ``[M, N]`` (stride ``(1, 0)``); the kernel indexes ``b[ti, tj]`` so the
+        stride-0 column load is hardcoded into the compiled kernel. A clone that
+        materialized ``b`` to a contiguous ``[M, N]`` (stride ``(N, 1)``) would
+        make that hardcoded load read a different element per column, so the
+        baseline diverges and every config is rejected.
+        """
+        config_a = helion.Config(block_sizes=[32, 32], num_warps=4)
+        config_b = helion.Config(block_sizes=[64, 64], num_warps=4)
+
+        @helion.kernel(configs=[config_a, config_b], autotune_log_level=0)
+        def add_bias(x: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile_i, tile_j in hl.tile(x.size()):
+                out[tile_i, tile_j] = x[tile_i, tile_j] + b[tile_i, tile_j]
+            return out
+
+        m, n = 128, 128
+        x = torch.randn(m, n, device=DEVICE)
+        # Broadcast/expanded view: [m, 1] -> [m, n], stride (1, 0).
+        b = torch.randn(m, 1, device=DEVICE).expand(m, n)
+        self.assertFalse(b.is_contiguous())
+        self.assertEqual(b.stride(), (1, 0))
+
+        bound_kernel = add_bias.bind((x, b))
+        search = FiniteSearch(bound_kernel, (x, b), configs=[config_a, config_b])
+        best = search.autotune()
+        self.assertIn(best, (config_a, config_b))
+
+        torch.testing.assert_close(add_bias(x, b), x + b)
 
     def test_accuracy_check_filters_bad_config_wrong_arg_mutation(self) -> None:
         bad_config = helion.Config(block_sizes=[1], num_warps=8)
@@ -2199,7 +2353,10 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         bound = add.bind(args)
 
         # Default: -1 (no cap)
-        with patch.dict(os.environ, {"HELION_AUTOTUNER": "PatternSearch"}):
+        with (
+            without_env_var("HELION_CAP_AUTOTUNE_NUM_NEIGHBORS"),
+            patch.dict(os.environ, {"HELION_AUTOTUNER": "PatternSearch"}),
+        ):
             autotuner = bound.settings.autotuner_fn(bound, args)
             self.assertEqual(autotuner.autotuner.num_neighbors_cap, -1)
 
@@ -2214,11 +2371,33 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
             autotuner = bound.settings.autotuner_fn(bound, args)
             self.assertEqual(autotuner.autotuner.num_neighbors_cap, 50)
 
+        # Env var also applies to LFBO-based pattern search.
+        with patch.dict(
+            os.environ,
+            {
+                "HELION_AUTOTUNER": "LFBOTreeSearch",
+                "HELION_CAP_AUTOTUNE_NUM_NEIGHBORS": "50",
+            },
+        ):
+            autotuner = bound.settings.autotuner_fn(bound, args)
+            self.assertEqual(autotuner.autotuner.num_neighbors_cap, 50)
+
         # Explicit constructor arg wins over env var
         with patch.dict(
             os.environ,
             {
                 "HELION_AUTOTUNER": "PatternSearch",
+                "HELION_CAP_AUTOTUNE_NUM_NEIGHBORS": "50",
+            },
+        ):
+            autotuner = bound.settings.autotuner_fn(bound, args, num_neighbors_cap=10)
+            self.assertEqual(autotuner.autotuner.num_neighbors_cap, 10)
+
+        # Explicit constructor arg wins over env var for LFBO-based search too.
+        with patch.dict(
+            os.environ,
+            {
+                "HELION_AUTOTUNER": "LFBOTreeSearch",
                 "HELION_CAP_AUTOTUNE_NUM_NEIGHBORS": "50",
             },
         ):
@@ -2523,6 +2702,27 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
             HELION_AUTOTUNE_FINAL_REBENCHMARK_PINNED_TOLERANCE="-1"
         ):
             self.assertEqual(search._final_rebenchmark_pinned_tolerance(), 0.0)
+
+    def test_final_rebenchmark_top_k_default_scoped_to_cute(self) -> None:
+        settings = Settings(autotune_log_level=logging.CRITICAL)
+        search = PopulationBasedSearch.__new__(PopulationBasedSearch)
+        search.settings = settings
+        search.log = AutotuningLogger(settings)
+
+        with clean_final_rebenchmark_env():
+            # The larger finalist set is scoped to cute; other backends use the
+            # cheaper default so autotune wall-time is not inflated.
+            search.config_spec = SimpleNamespace(backend_name="cute")
+            self.assertEqual(search._final_rebenchmark_top_k(), 32)
+            search.config_spec = SimpleNamespace(backend_name="triton")
+            self.assertEqual(search._final_rebenchmark_top_k(), 8)
+            search.config_spec = SimpleNamespace(backend_name="pallas")
+            self.assertEqual(search._final_rebenchmark_top_k(), 8)
+
+        # An explicit env override wins regardless of backend.
+        with clean_final_rebenchmark_env(HELION_AUTOTUNE_FINAL_REBENCHMARK_TOP_K="2"):
+            search.config_spec = SimpleNamespace(backend_name="cute")
+            self.assertEqual(search._final_rebenchmark_top_k(), 2)
 
     def test_final_rebenchmark_prefers_faster_generated_config_by_default(
         self,
@@ -2920,7 +3120,8 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
             search._record_benchmarked_member(member_b)
             search._record_benchmarked_member(member_c)
 
-        self.assertIs(search._benchmarked_members[config_a], fast_a)
+        # A snapshot of the faster member for config_a is retained (deduped).
+        self.assertEqual(search._benchmarked_members[config_a].perfs, fast_a.perfs)
         self.assertNotIn(config_b, search._benchmarked_members)
         self.assertEqual(set(search._benchmarked_members), {config_a, config_c})
 
@@ -2949,7 +3150,11 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
             search._record_benchmarked_member(faster)
             search._record_benchmarked_member(slow)
 
-        self.assertIs(search._pinned_finalist_members[pinned_config], pinned)
+        # The pinned config survives pruning (kept as a snapshot in the map).
+        self.assertIn(pinned_config, search._pinned_finalist_members)
+        self.assertEqual(
+            search._pinned_finalist_members[pinned_config].perfs, pinned.perfs
+        )
         self.assertEqual(set(search._benchmarked_members), {fast_config, faster_config})
 
     def test_autotune_configuration_cloning(self) -> None:

@@ -31,7 +31,7 @@ from helion.runtime.triton_helpers import triton_wait_signal
 
 @triton.jit
 def _wait_progress_at_idx(progress: tl.tensor, idx: int) -> None:
-    triton_wait_signal(progress + idx, 1, 0, "acquire", "gpu", "ld", False)
+    triton_wait_signal(progress + idx, 1, 0, "acquire", "gpu", "ld", False)  # pyrefly: ignore [bad-argument-type]
 
 
 # %%

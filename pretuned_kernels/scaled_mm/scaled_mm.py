@@ -10,7 +10,6 @@ from __future__ import annotations
 import math
 
 import torch
-import triton.testing as tt
 
 import helion
 import helion.experimental
@@ -105,7 +104,64 @@ def _scaled_mm_torch(
     c.copy_(out)
 
 
-def main() -> None:
+# Optional vLLM CUTLASS baseline (the production FP8 GEMM this is benchmarked
+# against). The pretuned test env has only torch + helion (guarded import); the
+# nightly benchmark workflow installs vLLM, so main() then compares against it.
+try:
+    from vllm import _custom_ops as _vllm_ops
+
+    _HAS_VLLM = hasattr(_vllm_ops, "cutlass_scaled_mm")
+except ImportError:
+    _vllm_ops = None
+    _HAS_VLLM = False
+
+
+def _scaled_mm_cutlass(
+    c: torch.Tensor,
+    a: torch.Tensor,
+    b: torch.Tensor,
+    scale_a: torch.Tensor,
+    scale_b: torch.Tensor,
+    bias: torch.Tensor | None = None,
+) -> None:
+    """vLLM CUTLASS baseline (ops.cutlass_scaled_mm)."""
+    out = _vllm_ops.cutlass_scaled_mm(a, b, scale_a, scale_b, c.dtype, bias)
+    c.copy_(out)
+
+
+def _baselines() -> list[tuple[str, object]]:
+    """Baselines main() benchmarks helion against.
+
+    torch._scaled_mm is always available; vLLM's CUTLASS kernel is added when
+    vLLM is installed (the nightly benchmark env). The SUMMARY speedup is helion
+    vs the best (fastest) available baseline.
+
+    No torch.compile baseline here: the torch reference is a single opaque GEMM
+    (torch._scaled_mm -> cuBLAS/cutlass), which torch.compile just re-dispatches
+    to the same kernel -- a redundant, not-faster baseline.
+    """
+    baselines: list[tuple[str, object]] = [("torch", _scaled_mm_torch)]
+    if _HAS_VLLM:
+        baselines.append(("cutlass", _scaled_mm_cutlass))
+    return baselines
+
+
+def use_cudagraph() -> bool:
+    """Whether main() benchmarks under CUDA graphs (read by pretuned_kernels/run.py).
+
+    True: main() times these tiny decode GEMMs with do_bench_cudagraph (how vLLM
+    invokes the kernel), which removes per-call host launch overhead.
+    """
+    return True
+
+
+def main(verbose: bool = True) -> dict:
+    import os
+    import sys
+
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    from _bench import run_sweep
+
     # (K, N) weight shapes pulled from the vLLM Qwen3 FP8 sweep (TP=1).
     kn_shapes = [
         (2048, 4096),
@@ -126,19 +182,10 @@ def main() -> None:
 
     fp8_dtype = torch.float8_e4m3fn
     out_dtype = torch.bfloat16
+    baselines = _baselines()
 
-    print(f"GPU: {torch.cuda.get_device_name()}")
-    print(
-        f"{'M':>6s}  {'K':>6s}  {'N':>6s}  {'helion (us)':>12s}  "
-        f"{'torch (us)':>12s}  {'speedup':>8s}"
-    )
-    print("-" * 63)
-
-    speedups: list[float] = []
-    helion_wins = 0
-    best_speedup = 0.0
-    best_shape = (0, 0, 0)
-    for M, K, N in shapes:
+    def make_calls(shape: tuple[int, int, int]) -> tuple:
+        M, K, N = shape
         scale = 1.0 / math.sqrt(K)
         a = (scale * (0.5 + torch.rand(M, K, device="cuda"))).to(fp8_dtype)
         b = (scale * (0.5 + torch.rand(N, K, device="cuda"))).to(fp8_dtype).t()
@@ -147,46 +194,23 @@ def main() -> None:
         scale_b = torch.rand((1, 1), dtype=torch.float32, device="cuda") + 0.5
         bias = 0.5 * (torch.rand(N, dtype=out_dtype, device="cuda") - 0.5)
 
-        scaled_mm(c, a, b, scale_a, scale_b, bias)  # warmup
-        ms_helion = tt.do_bench(
-            lambda c=c, a=a, b=b, sa=scale_a, sb=scale_b, bias=bias: scaled_mm(
-                c, a, b, sa, sb, bias
-            ),
-            warmup=25,
-            rep=100,
-            return_mode="median",
-        )
-        ms_torch = tt.do_bench(
-            lambda c=c, a=a, b=b, sa=scale_a, sb=scale_b, bias=bias: _scaled_mm_torch(
-                c, a, b, sa, sb, bias
-            ),
-            warmup=25,
-            rep=100,
-            return_mode="median",
-        )
-        speedup = ms_torch / ms_helion if ms_helion > 0 else float("nan")
-        speedups.append(speedup)
-        if speedup > 1.0:
-            helion_wins += 1
-        if speedup > best_speedup:
-            best_speedup = speedup
-            best_shape = (M, K, N)
-        print(
-            f"{M:>6d}  {K:>6d}  {N:>6d}  {ms_helion * 1000:>12.2f}  "
-            f"{ms_torch * 1000:>12.2f}  {speedup:>7.2f}x"
-        )
+        def helion_call() -> None:
+            scaled_mm(c, a, b, scale_a, scale_b, bias)
 
-    geomean = math.exp(
-        sum(math.log(s) for s in speedups if s > 0) / max(len(speedups), 1)
-    )
-    print(
-        f"\nHelion faster on {helion_wins}/{len(shapes)} shapes; "
-        f"geomean speedup {geomean:.3f}x; "
-        f"best speedup {best_speedup:.2f}x at (M, K, N)={best_shape}."
-    )
-    print(
-        f"SUMMARY: helion_wins={helion_wins} total={len(shapes)} "
-        f"geomean={geomean:.4f} best_speedup={best_speedup:.4f}"
+        base_calls = [
+            (name, (lambda fn=fn: fn(c, a, b, scale_a, scale_b, bias)))
+            for name, fn in baselines
+        ]
+        return helion_call, base_calls, f"{M:>6d}  {K:>6d}  {N:>6d}"
+
+    # run_sweep benchmarks under CUDA graphs (how vLLM invokes the kernel; removes
+    # per-call host launch overhead) with L2 cache clearing (see _bench).
+    return run_sweep(
+        shapes,
+        make_calls,
+        use_cudagraph=use_cudagraph(),
+        verbose=verbose,
+        shape_header=f"{'M':>6s}  {'K':>6s}  {'N':>6s}",
     )
 
 

@@ -2,11 +2,8 @@
 
 from __future__ import annotations
 
-import math
-
 import torch
 import torch.nn.functional as F
-import triton.testing as tt
 
 import helion.experimental
 import helion.language as hl
@@ -21,63 +18,60 @@ def softmax(x: torch.Tensor) -> torch.Tensor:
     return out
 
 
-def main() -> None:
+def _softmax_torch(x: torch.Tensor) -> torch.Tensor:
+    return F.softmax(x, dim=1)
+
+
+def _baselines() -> list[tuple[str, object]]:
+    """Baselines main() benchmarks against.
+
+    ``torch_compile`` is ``torch.compile`` of the torch reference -- a
+    speedup-comparison baseline only (not checked for accuracy).
+    """
+    return [
+        ("torch", _softmax_torch),
+        ("torch_compile", torch.compile(_softmax_torch)),
+    ]
+
+
+def use_cudagraph() -> bool:
+    """Whether main() benchmarks under CUDA graphs (read by pretuned_kernels/run.py)."""
+    return False
+
+
+def main(verbose: bool = True) -> dict:
+    import os
+    import sys
+
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    from _bench import run_sweep
+
     triton_tutorial_shapes = [(4096, 128 * i) for i in range(2, 100)]
     realistic_shapes = [
         (4096, 16384),
         (2048, 32768),
     ]
     shapes = list(dict.fromkeys(triton_tutorial_shapes + realistic_shapes))
+    baselines = _baselines()
 
-    print(f"GPU: {torch.cuda.get_device_name()}")
-    print(
-        f"{'M':>5s}  {'N':>6s}  {'helion (us)':>12s}  "
-        f"{'torch (us)':>12s}  {'speedup':>8s}"
-    )
-    print("-" * 60)
-
-    speedups: list[float] = []
-    helion_wins = 0
-    best_speedup = 0.0
-    best_shape = (0, 0)
-    for M, N in shapes:
+    def make_calls(shape: tuple[int, int]) -> tuple:
+        M, N = shape
         x = torch.randn([M, N], device="cuda", dtype=torch.float16)
-        softmax(x)  # warmup
-        ms_helion = tt.do_bench(
-            lambda x=x: softmax(x),
-            warmup=50,
-            rep=200,
-            return_mode="median",
-        )
-        ms_torch = tt.do_bench(
-            lambda x=x: F.softmax(x, dim=1),
-            warmup=50,
-            rep=200,
-            return_mode="median",
-        )
-        speedup = ms_torch / ms_helion if ms_helion > 0 else float("nan")
-        speedups.append(speedup)
-        if speedup > 1.0:
-            helion_wins += 1
-        if speedup > best_speedup:
-            best_speedup = speedup
-            best_shape = (M, N)
-        print(
-            f"{M:>5d}  {N:>6d}  {ms_helion * 1000:>12.2f}  "
-            f"{ms_torch * 1000:>12.2f}  {speedup:>7.2f}x"
-        )
 
-    geomean = math.exp(
-        sum(math.log(s) for s in speedups if s > 0) / max(len(speedups), 1)
-    )
-    print(
-        f"\nHelion faster on {helion_wins}/{len(shapes)} shapes; "
-        f"geomean speedup {geomean:.3f}x; "
-        f"best speedup {best_speedup:.2f}x at (M, N)={best_shape}."
-    )
-    print(
-        f"SUMMARY: helion_wins={helion_wins} total={len(shapes)} "
-        f"geomean={geomean:.4f} best_speedup={best_speedup:.4f}"
+        def helion_call() -> torch.Tensor:
+            return softmax(x)
+
+        base_calls = [(name, (lambda fn=fn: fn(x))) for name, fn in baselines]
+        return helion_call, base_calls, f"{M:>5d}  {N:>6d}"
+
+    return run_sweep(
+        shapes,
+        make_calls,
+        use_cudagraph=use_cudagraph(),
+        warmup=50,
+        rep=200,
+        verbose=verbose,
+        shape_header=f"{'M':>5s}  {'N':>6s}",
     )
 
 

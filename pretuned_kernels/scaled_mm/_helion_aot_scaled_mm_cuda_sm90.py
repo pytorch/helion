@@ -13,6 +13,8 @@ then closest N, then the smallest tuned M >= the input M (falling back
 to the largest tuned M).
 """
 
+import functools
+
 # Tuned (K, N, M) keys, parallel to the config list in autotune_scaled_mm.
 _KEYS = [
     (2048, 4096, 1),
@@ -114,24 +116,47 @@ _KEYS = [
 ]
 
 
+# Built once at import (not per call): K -> N -> sorted tuned-M list and an
+# O(1) (K, N, M) -> config-index map.
+_CONFIGS_BY_KN: dict[int, dict[int, list[int]]] = {}
+for _kk, _nn, _mm in _KEYS:
+    _CONFIGS_BY_KN.setdefault(_kk, {}).setdefault(_nn, []).append(_mm)
+for _by_n in _CONFIGS_BY_KN.values():
+    for _ms in _by_n.values():
+        _ms.sort()
+_INDEX_BY_KNM: dict[tuple[int, int, int], int] = {
+    key: i for i, key in enumerate(_KEYS)
+}
+
+
+@functools.cache
+def _pick_index(M: int, K: int, N: int) -> int:
+    # Fast path: exact tuned shape -> use its config directly.
+    exact = _INDEX_BY_KNM.get((K, N, M))
+    if exact is not None:
+        return exact
+    # Otherwise nearest-neighbor:
+    # 1. closest K, 2. closest N, 3. smallest tuned M >= M (else largest).
+    best_K = min(_CONFIGS_BY_KN, key=lambda s: abs(s - K))
+    best_N = min(_CONFIGS_BY_KN[best_K], key=lambda s: abs(s - N))
+    available_M = _CONFIGS_BY_KN[best_K][best_N]
+    best_M = next((m for m in available_M if m >= M), available_M[-1])
+    return _INDEX_BY_KNM[(best_K, best_N, best_M)]
+
+
 def key_scaled_mm(*args) -> int:
-    """Select config index for the given arguments (also serves as cache key)."""
+    """Select config index for the given arguments (also serves as cache key).
+
+    key_scaled_mm is on the per-call specialization-key path
+    (helion/runtime/kernel.py _base_specialization_key), so the pick is
+    memoized on the (M, K, N) ints via functools.cache to stay O(1) per call.
+    The kernel args (tensors) are not cached directly -- that would never hit
+    (new tensors each call) and would pin GPU memory.
+    """
     # args = (c, a, b, scale_a, scale_b, bias); a is [M, K], b is [K, N].
     a = args[1]
     b = args[2]
-    M, K = int(a.shape[0]), int(a.shape[1])
-    N = int(b.shape[1])
-
-    # 1. closest K, 2. closest N, 3. smallest tuned M >= M (else largest).
-    configs: dict[int, dict[int, list[int]]] = {}
-    for kk, nn, mm in _KEYS:
-        configs.setdefault(kk, {}).setdefault(nn, []).append(mm)
-
-    best_K = min(configs, key=lambda s: abs(s - K))
-    best_N = min(configs[best_K], key=lambda s: abs(s - N))
-    available_M = sorted(configs[best_K][best_N])
-    best_M = next((m for m in available_M if m >= M), available_M[-1])
-    return _KEYS.index((best_K, best_N, best_M))
+    return _pick_index(int(a.shape[0]), int(a.shape[1]), int(b.shape[1]))
 
 
 def autotune_scaled_mm(*args) -> dict:

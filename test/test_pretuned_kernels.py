@@ -6,13 +6,10 @@ the hardware where each kernel's checked-in heuristics apply.
 
 from __future__ import annotations
 
-import contextlib
 from dataclasses import dataclass
 import importlib.util
-import io
 import math
 import os
-import re
 import sys
 import unittest
 
@@ -42,45 +39,33 @@ def _current_compute_capability() -> str | None:
 
 
 def _import_pretuned_kernel_module(name):
-    # Private module name avoids clashing with ``examples/<name>.py``.
-    module_name = f"_helion_pretuned_kernels_test.{name}"
+    # Flat private module name (no dotted parent package, which Helion's
+    # global-scope resolution would try to import) avoids clashing with
+    # ``examples/<name>.py``.
+    module_name = f"_helion_pretuned_kernels_test_{name}"
     if module_name not in sys.modules:
         file_path = PRETUNED_KERNELS_DIR / name / f"{name}.py"
         spec = importlib.util.spec_from_file_location(module_name, file_path)
         assert spec is not None
         assert spec.loader is not None
         module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
+        # Register before exec so Helion can resolve kernels that reference
+        # module-level globals (global_scope_origin does sys.modules[__name__]).
         sys.modules[module_name] = module
+        spec.loader.exec_module(module)
     return sys.modules[module_name]
 
 
-_SUMMARY_RE = re.compile(
-    r"^SUMMARY:\s+helion_wins=(?P<wins>\d+)\s+total=(?P<total>\d+)\s+"
-    r"geomean=(?P<geomean>[\d.]+)\s+best_speedup=(?P<best>[\d.]+)\s*$",
-    re.MULTILINE,
-)
-
-
 def _run_pretuned_kernel_main_and_parse_summary(name):
+    # main(verbose=False) returns the metrics dict directly (helion vs the best
+    # available baseline) without printing the per-shape table.
     module = _import_pretuned_kernel_module(name)
-    buf = io.StringIO()
-    with contextlib.redirect_stdout(buf):
-        module.main()
-    output = buf.getvalue()
-    # Relay output so CI logs show the per-shape table on failure.
-    print(output)
-    match = _SUMMARY_RE.search(output)
-    if match is None:
-        raise AssertionError(
-            f"Could not find SUMMARY line in pretuned kernel output for {name}.\n"
-            f"Output was:\n{output}"
-        )
+    metrics = module.main(verbose=False)
     return {
-        "helion_wins": int(match["wins"]),
-        "total": int(match["total"]),
-        "geomean": float(match["geomean"]),
-        "best_speedup": float(match["best"]),
+        "helion_wins": int(metrics["helion_wins"]),
+        "total": int(metrics["total"]),
+        "geomean": float(metrics["geomean"]),
+        "best_speedup": float(metrics["best_speedup"]),
     }
 
 
@@ -255,95 +240,108 @@ class ExpectedPerf:
     wins_slack: int | None
 
 
-# Sampled on B200 with the checked-in heuristic. ``wins_slack`` lets that
-# many near-noise-band shapes flip without failing; ``None`` disables the
-# wins gate for kernels with several expected near-parity shapes.
+# helion-vs-best-baseline targets. Every kernel's baselines now include
+# ``torch_compile`` (torch.compile of the torch reference), which competes to be
+# the fastest baseline -- so these numbers are helion vs the best of {torch,
+# torch_compile} (the perf test env has no vLLM). ``wins_slack`` lets that many
+# near-noise-band shapes flip without failing; ``None`` disables the wins gate
+# for kernels with several expected near-parity shapes.
+#
+# sm90 sampled on H100. sm100 perf gating is deferred until a B200 nightly
+# recalibrates it against the torch_compile baseline (the perf test skips
+# compute capabilities absent from this map -- so sm100 runs correctness only
+# for now).
 _EXPECTED_PERF: dict[str, dict[str, ExpectedPerf]] = {
     "vector_add": {
-        "sm100": ExpectedPerf(
-            helion_wins=5,
-            total=10,
-            geomean=1.009,
-            wins_slack=None,
-        ),
         "sm90": ExpectedPerf(
             helion_wins=5,
             total=10,
-            geomean=0.99,
+            geomean=0.97,
             wins_slack=None,
         ),
     },
     "softmax": {
-        "sm100": ExpectedPerf(
-            helion_wins=100,
-            total=100,
-            geomean=2.304,
-            wins_slack=2,
-        ),
         "sm90": ExpectedPerf(
-            helion_wins=97,
+            helion_wins=99,
             total=100,
-            geomean=1.78,
+            geomean=1.50,
             wins_slack=7,
         ),
     },
     "layer_norm": {
-        "sm100": ExpectedPerf(
-            helion_wins=38,
-            total=38,
-            geomean=1.55,
-            wins_slack=1,
-        ),
         "sm90": ExpectedPerf(
             helion_wins=37,
             total=38,
-            geomean=1.39,
+            geomean=1.29,
             wins_slack=2,
         ),
     },
     "rms_norm": {
-        "sm100": ExpectedPerf(
-            helion_wins=30,
-            total=30,
-            geomean=1.605,
-            wins_slack=6,
-        ),
         "sm90": ExpectedPerf(
-            helion_wins=23,
+            helion_wins=28,
             total=30,
-            geomean=1.17,
+            geomean=1.18,
             wins_slack=5,
         ),
     },
     "cross_entropy": {
-        "sm100": ExpectedPerf(
-            helion_wins=21,
-            total=21,
-            geomean=1.698,
-            wins_slack=1,
-        ),
         "sm90": ExpectedPerf(
             helion_wins=21,
             total=21,
-            geomean=2.35,
+            geomean=1.68,
             wins_slack=1,
         ),
     },
     "rope": {
         "sm90": ExpectedPerf(
-            helion_wins=7,
+            helion_wins=6,
             total=7,
-            geomean=5.0,
+            geomean=1.45,
             wins_slack=1,
         ),
     },
+    # CUDA-graph-timed kernels (scaled_mm + the vLLM-ported ops below). These use
+    # tritonbench's L2-cache-clearing cudagraph timer, so numbers reflect cold-L2
+    # (realistic) latency -- lower than a cache-warm timer, since torch.compile's
+    # fused kernels win more of the memory-bound shapes when L2 is cleared.
     "scaled_mm": {
+        # Small decode GEMMs; helion vs the best of {torch._scaled_mm}. Portable
+        # across H100 SKUs/torch versions (cudagraph removes host launch overhead).
         "sm90": ExpectedPerf(
-            helion_wins=24,
+            helion_wins=23,
             total=24,
-            geomean=1.16,
-            wins_slack=3,
+            geomean=1.14,
+            wins_slack=4,
         ),
+    },
+    # vLLM-ported kernels (vllm/kernels/helion/ops): each benchmarks its fused
+    # Helion kernel under CUDA graphs against a torch-native reference and its
+    # torch.compile (best of the two). sm90 measured on H100 with L2 clearing;
+    # sm100 gating is added once a B200 nightly has calibrated it (the perf test
+    # skips compute capabilities absent from this map).
+    "silu_mul_fp8": {
+        # Bandwidth-bound. Re-tuned on H100 with Helion's autotuner under
+        # cudagraph timing (see the kernel's heuristic header); helion now wins
+        # the majority of shapes vs the best of {torch, torch.compile}.
+        "sm90": ExpectedPerf(helion_wins=22, total=36, geomean=1.15, wins_slack=8),
+    },
+    "dynamic_per_token_scaled_fp8_quant": {
+        "sm90": ExpectedPerf(helion_wins=18, total=24, geomean=1.22, wins_slack=5),
+    },
+    "per_token_group_fp8_quant": {
+        "sm90": ExpectedPerf(helion_wins=22, total=24, geomean=2.45, wins_slack=4),
+    },
+    "rms_norm_dynamic_per_token_quant": {
+        "sm90": ExpectedPerf(helion_wins=35, total=36, geomean=1.34, wins_slack=4),
+    },
+    "rms_norm_per_block_quant": {
+        "sm90": ExpectedPerf(helion_wins=24, total=24, geomean=3.30, wins_slack=2),
+    },
+    "silu_and_mul_per_block_quant": {
+        "sm90": ExpectedPerf(helion_wins=24, total=24, geomean=2.68, wins_slack=2),
+    },
+    "fused_qk_norm_rope": {
+        "sm90": ExpectedPerf(helion_wins=21, total=21, geomean=7.2, wins_slack=2),
     },
 }
 
@@ -415,6 +413,37 @@ class TestPretunedKernelsCorrectness(TestCase):
                     torch.bfloat16
                 ) + bias
                 torch.testing.assert_close(c, ref, atol=1e-1, rtol=1e-1)
+
+    def _run_vllm_ported_correctness(self, name: str, needs_fp8: bool = True) -> None:
+        # vLLM-ported kernels self-verify via the module's correctness_check(),
+        # which runs the kernel and its torch-native reference on one shape.
+        if not is_cuda():
+            self.skipTest("Pretuned kernels require CUDA / ROCm.")
+        if needs_fp8 and torch.cuda.get_device_capability() < (8, 9):
+            self.skipTest(f"{name} requires FP8 support (SM89+).")
+        module = _import_pretuned_kernel_module(name)
+        module.correctness_check()
+
+    def test_silu_mul_fp8(self):
+        self._run_vllm_ported_correctness("silu_mul_fp8")
+
+    def test_dynamic_per_token_scaled_fp8_quant(self):
+        self._run_vllm_ported_correctness("dynamic_per_token_scaled_fp8_quant")
+
+    def test_per_token_group_fp8_quant(self):
+        self._run_vllm_ported_correctness("per_token_group_fp8_quant")
+
+    def test_rms_norm_dynamic_per_token_quant(self):
+        self._run_vllm_ported_correctness("rms_norm_dynamic_per_token_quant")
+
+    def test_rms_norm_per_block_quant(self):
+        self._run_vllm_ported_correctness("rms_norm_per_block_quant")
+
+    def test_silu_and_mul_per_block_quant(self):
+        self._run_vllm_ported_correctness("silu_and_mul_per_block_quant")
+
+    def test_fused_qk_norm_rope(self):
+        self._run_vllm_ported_correctness("fused_qk_norm_rope", needs_fp8=False)
 
 
 @onlyBackends(["triton"])
@@ -494,9 +523,42 @@ class TestPretunedKernelsPerformance(TestCase):
     def test_rope(self):
         self._run_pretuned_kernel_perf("rope")
 
-    @pytest.mark.timeout(120)
+    # The cudagraph-timed kernels below use tritonbench's L2-cache-clearing
+    # timer, which is ~9x slower per measurement than triton's do_bench_cudagraph
+    # (it captures/replays a large graph and zeroes L2 each iteration), so these
+    # get a generous timeout. These perf tests are local-only (skipped under CI
+    # xdist), so the long runtime does not affect CI.
+    @pytest.mark.timeout(600)
     def test_scaled_mm(self):
         self._run_pretuned_kernel_perf("scaled_mm")
+
+    @pytest.mark.timeout(600)
+    def test_silu_mul_fp8(self):
+        self._run_pretuned_kernel_perf("silu_mul_fp8")
+
+    @pytest.mark.timeout(600)
+    def test_dynamic_per_token_scaled_fp8_quant(self):
+        self._run_pretuned_kernel_perf("dynamic_per_token_scaled_fp8_quant")
+
+    @pytest.mark.timeout(600)
+    def test_per_token_group_fp8_quant(self):
+        self._run_pretuned_kernel_perf("per_token_group_fp8_quant")
+
+    @pytest.mark.timeout(600)
+    def test_rms_norm_dynamic_per_token_quant(self):
+        self._run_pretuned_kernel_perf("rms_norm_dynamic_per_token_quant")
+
+    @pytest.mark.timeout(600)
+    def test_rms_norm_per_block_quant(self):
+        self._run_pretuned_kernel_perf("rms_norm_per_block_quant")
+
+    @pytest.mark.timeout(600)
+    def test_silu_and_mul_per_block_quant(self):
+        self._run_pretuned_kernel_perf("silu_and_mul_per_block_quant")
+
+    @pytest.mark.timeout(600)
+    def test_fused_qk_norm_rope(self):
+        self._run_pretuned_kernel_perf("fused_qk_norm_rope")
 
 
 if __name__ == "__main__":

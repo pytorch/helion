@@ -1673,7 +1673,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             fn_name="grouped_gemm_jagged",
         )
 
-    @xfailIfPallas("CUDA-specific code paths")
+    @xfailIfPallas("Pallas scatter: multiple indirect dims are not supported")
     def test_grouped_gemm_jagged_persistent(self):
         # Build small jagged grouped GEMM inputs
         torch.manual_seed(0)

@@ -109,8 +109,8 @@ class MatmulFact(NamedTuple):
 
 
 class ReductionFact(NamedTuple):
-    """Workload facts for one inner reduction dim, recorded at compile time (analogous
-    to ``MatmulFact``) so the seed heuristic branches on workload properties, not kernel
+    """Workload facts for one inner reduction dim, recorded at compile time (like
+    ``MatmulFact``) so the seed heuristic branches on workload properties, not kernel
     identity. Exactly one per seeded kernel; built in device_ir's
     ``register_rollable_reductions`` (standard) or ``register_user_tiled_reductions``
     (user-tiled).
@@ -129,8 +129,7 @@ class ReductionFact(NamedTuple):
     - ``row_reread``: True iff the reduction-input row is live across the loop boundary
       (risks spilling). Gates the persist byte cap + re-read eviction. From ``MemoryOpFact``.
     - ``reread_eviction_index``: ``load_eviction_policies`` slot of the re-read load
-      (``None`` unless ``row_reread``), read from that load's
-      ``MemoryOpFact.eviction_index`` — no re-walk.
+      (``None`` unless ``row_reread``), read from that load's ``MemoryOpFact.eviction_index``.
     - ``full_width_output``: True iff a store writes the result back over the reduction
       axis ([M, N], e.g. layer_norm), False for a per-row scalar ([M], e.g. sum) —
       full-width is store/occupancy-bound, scalar-output reduction-tree-bound (opposite
@@ -138,6 +137,21 @@ class ReductionFact(NamedTuple):
     - ``input_load_itemsize``: element size of the HBM input row load — the dtype-faithful
       per-byte signal, distinct from ``itemsize`` (fp32-promoted = 4 at both dtypes). 0
       when no single reduction-fed row load exists.
+    - ``body_live_tiles``: peak count of simultaneously-live rdim-shaped values in the
+      reduction body — the liveness signal bounding the persistent resident footprint. A
+      heavy body spills the register file when held persistent, so the standard track passes
+      it as ``footprint_factor`` to route such reductions to the looped path. A conservative
+      over-count (errs toward looping, never an unsafe spill); defaults to 1.
+    - ``per_feature_accumulator``: the faithful M-collapse discriminator — True iff a
+      loop-carried accumulator exists whose dims are ALL the materialized feature axis (the
+      grad-parameter buffer, e.g. ``grad_bias[N]`` / ``grad_weight[N]``), read from
+      accumulator provenance. The user-tiled seed keys ``is_m_collapse`` on it. False for
+      per-row or 2-D accumulators (softmax_two_pass/kl_div/welford/...).
+    - ``feature_footprint``: the PRODUCT of the materialized feature-axis extents — the
+      resident ``[inner, *features]`` per-row footprint a grad-parameter M-collapse byte-caps
+      its inner reduction tile against (``feature_footprint * itemsize``). For a 2-D norm this
+      is ``N``; for a 3-D norm the full ``C*S`` (a per-axis MAX under-counts and spills). Used
+      by both M-collapse tracks; 1 when no materialized feature axis exists.
 
     ``grid_rows`` is NOT stored — a pure function of ``m_block_ids`` + env, computed on
     demand by its one consumer (the narrow-row ``num_warps`` lever).
@@ -155,6 +169,33 @@ class ReductionFact(NamedTuple):
     reread_eviction_index: int | None = None
     full_width_output: bool = True
     input_load_itemsize: int = 0
+    body_live_tiles: int = 1
+    feature_footprint: int = 1
+    per_feature_accumulator: bool = False
+
+
+class MatmulWithReductionEpilogueFact(NamedTuple):
+    """A fused matmul + reduction-over-output-axis epilogue, recorded when a ``MatmulFact`` and
+    a register-resident epilogue ``ReductionFact`` co-occur in one kernel (e.g.
+    ``matmul_rms_norm``: ``acc = x @ y`` then a reduction over N on the carried ``[M_BLOCK,
+    N]`` accumulator, then write-back). A COMPOSED fact: it holds the two existing facts plus
+    the few derived fields the seed keys on. ``TritonMatmulReductionEpilogueHeuristic``
+    branches on it.
+
+    - ``matmul`` / ``reduction``: the composed sub-facts (the matmul + the epilogue reduction).
+    - ``n_extent``: the specialized output width N (= ``reduction.size_hint``); N is
+      ``hl.specialize``'d (never tiled), so both the ``[M_BLOCK, N]`` accumulator and the
+      ``[K_BLOCK, N]`` operand tile scale with N — the resident-footprint signal the
+      footprint-aware tile chooser keys on.
+    - ``m_block_id`` / ``k_block_id``: the grid M tile and the K tile the seed sizes
+      (there is no ``n_block_id`` — N is specialized, not a block_size).
+    """
+
+    matmul: MatmulFact
+    reduction: ReductionFact
+    n_extent: int
+    m_block_id: int | None
+    k_block_id: int | None
 
 
 class MemoryOpFact(NamedTuple):
@@ -193,6 +234,19 @@ class MemoryOpFact(NamedTuple):
     # subscript so it is reduction-AGNOSTIC; ``None`` for a plain slice). The faithful axis key for
     # the full_width_output / input_load_itemsize gates.
     subscript_block_ids: tuple[int | None, ...] = ()
+    # Element stride of the accessed tensor along each subscript position, aligned 1:1 with
+    # ``subscript_block_ids`` (from ``.stride()``). A stride-1 position is the contiguous (coalescing)
+    # axis — the last subscript for a row-major tensor, a different one for a transposed/strided view.
+    subscript_strides: tuple[int, ...] = ()
+    # DISTINCT HBM elements the op's accessed tensor touches: product of its size-hinted shape dims
+    # over NON-broadcast dims (``stride != 0``); a stride-0 dim contributes factor 1 (``0`` if no
+    # resolvable fake tensor). A FULL-EXTENT op has ``accessed_numel`` == the problem numel; a
+    # BROADCAST operand has a STRICTLY SMALLER count — whether it is a small tensor (``bias[N]``,
+    # ``[M,1]``, ``[1,N]``) OR a full-SIZE ``.expand()``/``broadcast_tensors`` view with a stride-0
+    # dim. The faithful signal for per-element HBM traffic at ANY rank/stride, unlike a bare ``ndim``
+    # check (a full-rank ``[M,1]`` broadcast passes ndim) or a shape-only product (a stride-0 expand
+    # passes shape).
+    accessed_numel: int = 0
 
 
 class AccumulatorFact(NamedTuple):
@@ -205,6 +259,42 @@ class AccumulatorFact(NamedTuple):
 
     dim_block_ids: tuple[int | None, ...]
     itemsize: int
+
+
+class PointwiseElementwiseFact(NamedTuple):
+    """Workload facts for a PURE elementwise/pointwise kernel — DEFINED by the absence of any
+    reduction/matmul/accumulator fact (the disjointness rule): if one of those fired, the kernel
+    belongs to that family and this fact is never built. Bandwidth-bound; the compiler defaults it to
+    ``block_size=32`` (which starves HBM), so the seed sizes a saturating tile from these fields
+    (derived from the walker ``MemoryOpFact`` list + block-size specs, plus one graph walk).
+
+    - ``total_numel``: product of the tiled block dims' ``size_hint``s (the problem element count,
+      M*N); the occupancy / grid-saturation input.
+    - ``slab_numel``: the untiled inner slab, in ELEMENTS, that full-extent ops drag per tiled element
+      = ``sum(accessed_numel // total_numel)`` over those ops (flat kernel: 1 per op; rope:
+      heads*head_dim). A BROADCAST operand (``bias[N]``, ``[M,1]``, stride-0) has
+      ``accessed_numel < total_numel`` → amortized → excluded; an OVERSIZED operand still touches the
+      full problem → counted (hence ``>=``).
+    - ``storage_itemsize`` / ``compute_itemsize``: the STORAGE (HBM) and widest COMPUTE (fp32) byte
+      widths that scale slab_numel into the two budgets — ``slab_numel * storage`` = bandwidth traffic,
+      ``slab_numel * compute`` = register cap (compute reads the promoted dtype; a memory op knows only
+      storage). NOTE: the register cap is a COARSE proxy (blind to compute temporaries), but benign —
+      pointwise is memory-bound; its only jobs are relaxing the floor for a heavy slab and capping the
+      transpose-conflict tile. (Mixed-dtype storage uses the max width — a minor seed approximation.)
+    - ``contig_block_ids``: TILED block-ids that are the stride-1 axis of some full-extent op (from
+      ``subscript_strides``, no graph walk). Row-major → the last dim (seed unchanged); transposed →
+      a different dim; two+ entries = a load-vs-store CONFLICT → the seed emits a BALANCED tile.
+    - ``sfu_ops``: count of transcendental (SFU) ops. SFU ops are latency-bound on a distinct unit, so
+      a transcendental-heavy tile wants more warps while an all-FMA tile of the same op count does not
+      — so SFU count (not total op count) drives the num_warps ramp.
+    """
+
+    total_numel: int
+    slab_numel: int
+    storage_itemsize: int
+    compute_itemsize: int
+    contig_block_ids: tuple[int, ...] = ()
+    sfu_ops: int = 0
 
 
 def shrink_block_sizes_for_numel_constraints(
@@ -497,7 +587,9 @@ class ConfigSpec:
         self.autotuner_heuristics: list[str] = []
         self.matmul_facts: list[MatmulFact] = []
         self.reduction_facts: list[ReductionFact] = []
+        self.matmul_reduction_epilogue_facts: list[MatmulWithReductionEpilogueFact] = []
         self.accumulator_facts: list[AccumulatorFact] = []
+        self.pointwise_facts: list[PointwiseElementwiseFact] = []
         self.store_indices: list[int] = []
         self.memory_op_facts: list[MemoryOpFact] = []
         self.backend_tunable_fragments = self.backend.tunable_fragments()

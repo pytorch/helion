@@ -3,6 +3,7 @@ from __future__ import annotations
 import abc
 import collections
 import contextlib
+import copy
 import dataclasses
 import functools
 import json
@@ -80,7 +81,12 @@ def _warn_dataset_without_log(log: AutotuningLogger) -> None:
 _SUSPICIOUS_REBENCHMARK_WARMUP = 25
 _SUSPICIOUS_REBENCHMARK_REP = 100
 _FINAL_REBENCHMARK_TOP_K_ENV = "HELION_AUTOTUNE_FINAL_REBENCHMARK_TOP_K"
-_FINAL_REBENCHMARK_TOP_K_DEFAULT = 32
+_FINAL_REBENCHMARK_TOP_K_DEFAULT = 8
+# The cute/flash-attention search surface has a wide config space where verifying
+# more finalists materially improves the final pick. Other backends do not need
+# the extra rebenchmark cost (it ~2.5x'd autotune wall-time on cheap kernels), so
+# the larger finalist set is scoped to cute only.
+_FINAL_REBENCHMARK_TOP_K_CUTE = 32
 _FINAL_REBENCHMARK_TARGET_MS_ENV = "HELION_AUTOTUNE_FINAL_REBENCHMARK_TARGET_MS"
 _FINAL_REBENCHMARK_TARGET_MS_DEFAULT = 5000.0
 _FINAL_REBENCHMARK_TARGET_MS_MAX = 60000.0
@@ -1072,7 +1078,9 @@ class PopulationBasedSearch(BaseSearch):
             seen.add(default_config)
             pinned_configs.add(default_config)
             result.append(default_flat)
-        self._pinned_finalist_configs.update(pinned_configs)
+        self._pinned_finalist_configs.update(
+            copy.deepcopy(config) for config in pinned_configs
+        )
         self.log("Starting with seed/default configs")
 
         cached_entries = self._find_similar_cached_configs(max_configs)
@@ -1168,7 +1176,13 @@ class PopulationBasedSearch(BaseSearch):
         if existing is None or self._member_low_water_perf(
             member
         ) < self._member_low_water_perf(existing):
-            target[config] = member
+            # Config is mutable and hashes on its contents, and the autotuner
+            # mutates configs in place (normalize / neighbor generation). Store
+            # a private snapshot so a later mutation of the original config
+            # cannot change this key's hash (-> KeyError on prune / orphaned
+            # entries) or the config recompiled during final verification.
+            snapshot = copy.deepcopy(config)
+            target[snapshot] = dataclasses.replace(member, config=snapshot)
 
     def _prune_benchmarked_members(self, top_k: int) -> None:
         if len(self._benchmarked_members) <= top_k:
@@ -1181,24 +1195,33 @@ class PopulationBasedSearch(BaseSearch):
 
     def pin_finalist_config(self, config: Config) -> None:
         """Always include a seed/default config in final verification if benchmarked."""
-        self._pinned_finalist_configs.add(config)
+        # Snapshot: configs are mutated in place after being added (see
+        # _record_best_member_for_config), which would corrupt this set.
+        self._pinned_finalist_configs.add(copy.deepcopy(config))
 
     def pin_finalist_configs(self, configs: Sequence[Config]) -> None:
         for config in configs:
             self.pin_finalist_config(config)
 
+    def _final_rebenchmark_top_k_default(self) -> int:
+        backend_name = getattr(getattr(self, "config_spec", None), "backend_name", None)
+        if backend_name == "cute":
+            return _FINAL_REBENCHMARK_TOP_K_CUTE
+        return _FINAL_REBENCHMARK_TOP_K_DEFAULT
+
     def _final_rebenchmark_top_k(self) -> int:
+        default = self._final_rebenchmark_top_k_default()
         raw = os.getenv(_FINAL_REBENCHMARK_TOP_K_ENV)
         if raw is None:
-            return _FINAL_REBENCHMARK_TOP_K_DEFAULT
+            return default
         try:
             return max(0, int(raw))
         except ValueError:
             self.log.warning(
                 f"Ignoring invalid {_FINAL_REBENCHMARK_TOP_K_ENV}={raw!r}; "
-                f"using {_FINAL_REBENCHMARK_TOP_K_DEFAULT}."
+                f"using {default}."
             )
-            return _FINAL_REBENCHMARK_TOP_K_DEFAULT
+            return default
 
     def _final_rebenchmark_target_ms(self) -> float:
         raw = os.getenv(_FINAL_REBENCHMARK_TARGET_MS_ENV)

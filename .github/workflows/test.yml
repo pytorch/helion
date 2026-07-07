@@ -128,10 +128,8 @@ jobs:
             VERSION="${VERSION#pytorch-}"
             uv pip install -U "torch==${VERSION}.*" --index-url https://download.pytorch.org/whl/${{ matrix.runtime-version }}
           elif [[ "${{ matrix.runtime-version }}" == "tpu" ]]; then
-            # TODO: TorchTPU needs to catch up with a recent PyTorch change:
-            #   https://github.com/pytorch/pytorch/pull/186928
-            # In the meantime, use a PyTorch wheel that does not contain that change.
-            uv pip install -U --pre "torch==2.13.0.dev20260609" --index-url https://download.pytorch.org/whl/nightly/cpu
+            # Use the latest PyTorch wheel known to work with TorchTPU.
+            uv pip install -U --pre "torch==2.14.0.dev20260701" --index-url https://download.pytorch.org/whl/nightly/cpu
           else
             # Default to nightly
             # On OSDC, route nightly through the pypi-cache /whl proxy (deps stay reachable behind the egress firewall) and clear the cache index vars so it wins over the cache default; off OSDC PYPI_CACHE_WHL_URL is unset so we hit download.pytorch.org.
@@ -231,9 +229,8 @@ jobs:
             --repo_env=TORCH_SOURCE=$TORCH_SOURCE \
             --action_env=JAX_PLATFORMS=cpu
           uv pip install bazel-bin/ci/wheel/*.whl
-          # torch_tpu wheel is pinned to libtpu 0.0.38, but helion requires 0.0.40 to work
-          # we can remove this step as soon as torch_tpu updates its libtpu pin
-          uv pip install libtpu==0.0.40
+          # Ignore the torch_tpu wheel libtpu pin, and just use the most recent libtpu.
+          uv pip install --upgrade libtpu
           cd -
           rm -rf /tmp/torch_tpu
           # Verify
@@ -355,11 +352,17 @@ jobs:
           if [[ "${{ matrix.alias }}" == *xpu* ]]; then
             export TRITON_XPU_GEN_NATIVE_CODE=1
           fi
-          # Pallas interpret runs on CPU (no parallelism) and is much slower
-          # than TPU/Triton — bump the per-test timeout accordingly.
           TIMEOUT=60
-          if [[ "${{ matrix.alias }}" == "pallas-interpret" ]]; then
+          if [[ "${{ matrix.alias }}" == "tpu" ]]; then
             TIMEOUT=300
+          elif [[ "${{ matrix.alias }}" == "pallas-interpret" ]]; then
+            TIMEOUT=300
+          elif [[ "${{ matrix.alias }}" == *a10g* ]]; then
+            # A10G (sm86) ptxas cold-compiles some backward kernels slowly
+            # (~75s for the softmax autodiff backward), so the default 60s
+            # per-test timeout false-positives on a cold Triton cache and the
+            # worker gets killed mid-compile. Give it headroom.
+            TIMEOUT=180
           fi
           pytest $PARALLEL -rf --timeout=$TIMEOUT --reruns=2 --timeout-method=thread $EXTRA_FLAGS $TEST_PATH | tee >(eval $SKIP_CHECK)
 

@@ -28,7 +28,15 @@ pretuned_kernels/
 ├── rms_norm/
 ├── cross_entropy/
 ├── rope/
-└── scaled_mm/
+├── scaled_mm/
+├── scale_mm_cute/                    # B200 CuTe (tcgen05) rowwise FP8 GEMM
+├── silu_mul_fp8/                     # ported from vLLM (vllm/kernels/helion/ops)
+├── dynamic_per_token_scaled_fp8_quant/
+├── per_token_group_fp8_quant/
+├── rms_norm_dynamic_per_token_quant/
+├── rms_norm_per_block_quant/
+├── silu_and_mul_per_block_quant/
+└── fused_qk_norm_rope/
 ```
 
 Each kernel ships with one heuristic file per supported compute capability.
@@ -43,6 +51,26 @@ At runtime Helion picks the file matching the current GPU.
 | `cross_entropy` | TritonBench/Liger token-vocab sweep + realistic LLM vocabulary shapes | `F.cross_entropy` |
 | `rope` | TritonBench RoPE `(H, T)` defaults with exact shape buckets and `H8192_T2048` fallback | eager RoPE reference |
 | `scaled_mm` | vLLM Qwen3 FP8 `(K, N)` weight shapes at small token counts `M in {16, 64}` | `torch._scaled_mm` |
+| `scale_mm_cute` | Skinny-M FP8 decode + decoder-layer FP8 W8A8 serving `(M, K, N)` shapes (B200 CuTe backend only) | `torch._scaled_mm` (rowwise) + vLLM CUTLASS |
+| `silu_mul_fp8` | vLLM `(num_tokens, intermediate)` decode shapes | torch-native silu-and-mul + fp8 quant |
+| `dynamic_per_token_scaled_fp8_quant` | vLLM `(num_tokens, hidden)` shapes | torch-native per-token fp8 quant |
+| `per_token_group_fp8_quant` | vLLM `(num_tokens, hidden, group)` shapes | torch-native per-group fp8 quant |
+| `rms_norm_dynamic_per_token_quant` | vLLM `(num_tokens, hidden)` shapes | torch-native RMSNorm + per-token fp8 quant |
+| `rms_norm_per_block_quant` | vLLM `(num_tokens, hidden, group)` shapes | torch-native RMSNorm + per-block fp8 quant |
+| `silu_and_mul_per_block_quant` | vLLM `(num_tokens, intermediate, group)` shapes | torch-native silu-and-mul + per-block fp8 quant |
+| `fused_qk_norm_rope` | vLLM `(num_tokens, q_heads, kv_heads)` shapes | torch-native fused QK-RMSNorm + RoPE |
+
+Every kernel additionally benchmarks against `torch.compile` of the listed
+PyTorch baseline (a speedup-comparison baseline only -- correctness is checked
+against the eager reference). The headline speedup is Helion vs the *fastest*
+available baseline, and the dashboard's per-kernel dropdown breaks down Helion's
+speedup over each baseline (`torch`, `torch_compile`, and the vLLM op when
+installed in the nightly).
+
+The kernels ported from vLLM (`vllm/kernels/helion/ops`) benchmark each fused
+Helion kernel under CUDA graphs against a torch-native (unfused, eager)
+reference; `silu_mul_fp8` ships an `sm90` heuristic only, the rest ship both
+`sm90` and `sm100`.
 
 ## Scope
 
@@ -76,6 +104,12 @@ the runner emits a new
 you commit alongside the existing one(s).  Helion picks the right one at
 runtime based on the running GPU's compute capability (with fallback to
 older compatible capabilities, e.g. `sm120` → `sm100`).
+
+For a kernel whose `main()` benchmarks under CUDA graphs (`use_cudagraph()`
+returns `True`, e.g. `scaled_mm` and the vLLM-ported ops), set
+`HELION_BENCHMARK_CUDAGRAPH=1` for the autotune run so the autotuner benchmarks
+candidate configs the same way — matching the deployment/benchmark timing
+regime.
 
 See the [Ahead-of-Time (AOT) Heuristic Tuning](../docs/deployment_autotuning.md#ahead-of-time-aot-heuristic-tuning)
 section of `docs/deployment_autotuning.md` for the end-to-end workflow,
