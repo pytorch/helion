@@ -16,6 +16,7 @@ from .cute import CuteTileVecWarpPerRowHeuristic
 from .cute import CuteTileVecWarpReduceHeuristic
 from .pallas import PallasMatmulF32NoTilingSeedHeuristic
 from .pallas import PallasMatmulNoTilingSeedHeuristic
+from .triton import TritonB200FormulaMatmulHeuristic
 from .triton import TritonB200MatmulHeuristic
 from .triton import TritonH100MatmulHeuristic
 from .triton import TritonMatmulReductionEpilogueHeuristic
@@ -51,6 +52,9 @@ HEURISTICS_BY_BACKEND: dict[str, tuple[AutotunerHeuristicType, ...]] = {
         TritonH100MatmulHeuristic,
         TritonSkinnyGemmHeuristic,
         TritonB200MatmulHeuristic,
+        # The sm100 formula, promoted; registered after the table so it wins the
+        # last-promote-wins compiler_default_config loop.
+        TritonB200FormulaMatmulHeuristic,
         TritonMatmulReductionEpilogueHeuristic,
         TritonStandardReductionHeuristic,
         TritonUserTiledReductionHeuristic,

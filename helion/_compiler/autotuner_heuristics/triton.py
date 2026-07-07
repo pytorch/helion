@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 from typing import TYPE_CHECKING
 from typing import Any
+from typing import ClassVar
 from typing import cast
 
 import torch
@@ -128,6 +129,45 @@ def _single_2d_static_matmul_fact(config_spec: ConfigSpec) -> MatmulFact | None:
     return fact
 
 
+def _batched_static_matmul_fact(config_spec: ConfigSpec) -> MatmulFact | None:
+    """The H100 eligibility precondition — broader than the 2-D-only
+    ``_single_2d_static_matmul_fact``: it admits an arbitrary, possibly **BATCHED** matmul. The
+    requirements:
+      - exactly one ``MatmulFact`` with **static** M/N/K (the dot's own dims) and three distinct
+        M/N/K block-ids that are real tunable axes;
+      - every **other** tunable block axis is a BATCH / OUTER grid axis (present in
+        ``grid_block_ids``) — a no-data-reuse parallel axis the seed pins to 1
+        (``_h100_build_block_sizes`` floors every non-M/N/K axis), which is exactly what keeps the
+        register-budget tile valid for a batched dot (the fp32 accumulator is
+        ``[batch_blocks…, bm, bn]``; the budget sizes ``bm·bn`` assuming each batch block is 1).
+    An extra tunable axis that is NEITHER M/N/K nor a grid axis (some inner loop we do not model)
+    ⇒ decline, so the seed never mis-pins an axis it does not understand. The dot's ndim is NOT
+    constrained (a 2-D ``matmul`` and a 3-D ``baddbmm`` are both fine), only the block-axis ROLES.
+
+    Fires on: plain ``matmul`` / ``fp8_gemm``; ``broadcast_matmul`` (batch folded into M);
+    ``mamba2_chunk_state`` (batch pre-pinned to 1 by the author — its batch axes aren't tunable);
+    and ``bmm`` / any static batched dot that leaves its batch axis tunable. Declines a dynamic
+    (``static_shapes=False``) or jagged kernel (no static M/N/K) — e.g. ``grouped_gemm``.
+    """
+    facts = config_spec.matmul_facts
+    if len(facts) != 1:
+        return None
+    fact = facts[0]
+    if fact.static_m is None or fact.static_n is None or fact.static_k is None:
+        return None
+    mnk = (fact.m_block_id, fact.n_block_id, fact.k_block_id)
+    if None in mnk or len(set(mnk)) != 3:
+        return None
+    valid = set(config_spec.block_sizes.valid_block_ids())
+    if not set(mnk) <= valid:
+        return None
+    # Every tunable axis must be the dot's M/N/K or a batch/outer grid axis (pinnable to 1).
+    allowed = set(mnk) | set(config_spec.grid_block_ids)
+    if any(bid not in allowed for bid in valid):
+        return None
+    return fact
+
+
 def _shape_bucket_from_fact(fact: MatmulFact) -> dict[str, object]:
     assert fact.static_m is not None
     assert fact.static_n is not None
@@ -242,9 +282,12 @@ def _seed_config_for_config_spec(config_spec: ConfigSpec) -> Config | None:
 
 
 class TritonB200MatmulHeuristic(AutotunerHeuristic):
+    # DEMOTED (promote=False): the general TritonB200FormulaMatmulHeuristic subsumes this table
+    # (faster on every shape the table fires on, and covers the shapes it declines). Kept as an
+    # unpromoted search seed.
     name = "triton_b200_matmul"
     backend = "triton"
-    promote_seed_to_default = True
+    promote_seed_to_default = False
     HARDWARE_TARGETS = (("cuda", "sm100"),)
 
     @classmethod
@@ -262,6 +305,469 @@ class TritonB200MatmulHeuristic(AutotunerHeuristic):
         device_ir: DeviceIR,
     ) -> Config | None:
         return _seed_config_for_config_spec(env.config_spec)
+
+
+def _h100_build_block_sizes(
+    spec: ConfigSpec, fact: MatmulFact, bm: int, bn: int, bk: int
+) -> list[int]:
+    """Map ``(bm, bn, bk)`` onto the spec's block_sizes by the fact's M/N/K block-ids,
+    clamping each to its valid [min, max] (other axes — none for a clean 2-D fact — floored)."""
+    targets = {fact.m_block_id: bm, fact.n_block_id: bn, fact.k_block_id: bk}
+    out: list[int] = []
+    for i in range(len(spec.block_sizes)):
+        bs_spec = cast("BlockSizeSpec", spec.block_sizes[i])
+        v = targets.get(bs_spec.block_id)
+        if v is None:
+            v = max(1, bs_spec.min_size, bs_spec.autotuner_min)
+        v = max(v, bs_spec.min_size, bs_spec.autotuner_min)
+        v = min(v, bs_spec.max_size)
+        out.append(v)
+    return out
+
+
+def _h100_pinned_grid(env: CompileEnvironment, fact: MatmulFact) -> int:
+    """Product of any PINNED (block_size=1) grid axes other than the dot's M/N tiles — 1 for a
+    bare GEMM, ``batch·nchunks·nheads`` for mamba's fused dot. These already saturate the SMs, so
+    the occupancy fill counts them (else it shrinks an already-grid-saturated dot's tile) and the
+    num_stages cap keys on them (the batched-dot signature)."""
+    pinned_grid = 1
+    for bid in env.config_spec.grid_block_ids:
+        if bid in (fact.m_block_id, fact.n_block_id):
+            continue
+        size = env.block_sizes[bid].size
+        if isinstance(size, (int, torch.SymInt)):
+            pinned_grid *= max(1, env.size_hint(size))
+    return pinned_grid
+
+
+def _h100_config(
+    spec: ConfigSpec,
+    fact: MatmulFact,
+    bm: int,
+    bn: int,
+    bk: int,
+    num_warps: int,
+    num_stages: int,
+    l2_grouping: int = 1,
+    extra: dict[str, Any] | None = None,
+) -> Config:
+    """Assemble a Config from a tile tuple (emit l2_groupings only when grouping > 1).
+    ``extra`` carries any subclass-emitted fields (e.g. the sm100 Blackwell levers:
+    epilogue_subtile / indexing / range_warp_specializes) merged on top."""
+    cfg: dict[str, Any] = {
+        "block_sizes": _h100_build_block_sizes(spec, fact, bm, bn, bk),
+        "num_warps": num_warps,
+        "num_stages": num_stages,
+    }
+    if l2_grouping > 1:
+        cfg["l2_groupings"] = [l2_grouping]
+    if extra:
+        cfg.update(extra)
+    return Config(**cfg)
+
+
+class TritonH100MatmulHeuristic(AutotunerHeuristic):
+    """H100 (sm90) seed for any static (possibly batched) ``MatmulFact`` — a budget/roofline
+    ``_matmul_tile`` FORMULA (no lookup) so real GEMMs don't fall back to the catastrophic
+    ``[16,16,16]`` default. Fires on every ``_batched_static_matmul_fact`` (matmul / fp8_gemm /
+    bmm / mamba's fused dot / …) and pins every batch/outer axis to 1, so a batched dot and a bare
+    GEMM are the same case (the pinned grid then drives the saturation levers).
+
+    ``promote_seed_to_default=True``: the budget formula owns the no-autotune compiler default (as
+    well as seeding the autotuner), so a real GEMM never falls back to the ``[16,16,16]`` fragment
+    default on either sm90 or sm100 — the sm100 subclass inherits this promotion unchanged. Budget
+    constants are class attributes so a hardware-specific subclass can re-tune them (and add emission
+    via ``_extra_config_fields``) without touching this sm90 path."""
+
+    name = "triton_h100_matmul"
+    backend = "triton"
+    promote_seed_to_default = True
+    # Annotated so a hardware-specific subclass may override the arch (e.g. sm100).
+    HARDWARE_TARGETS: ClassVar[tuple[tuple[str, str], ...]] = (("cuda", "sm90"),)
+
+    # --- budget/roofline constants (the re-tune surface; a subclass overrides for other hardware) ---
+    # Accumulator budget = capacity of wherever the fp32 [bm,bn] accumulator lives. On sm90 it's the
+    # register file (32768 = 128 regs/thread × 256), which is why H100 caps the tile at [128,256].
+    ACC_BUDGET = 32768  # fp32 [bm,bn] accumulator elems, register-file capacity
+    TMEM_ACC_BUDGET = None  # sm100 tcgen05 tensor-memory accumulator capacity (fp32 elems); None = no TMEM path
+    SMEM_BUDGET = 228 * 1024  # per-CTA shared memory ceiling (bytes)
+    DOT_MIN = 16  # tl.dot min M/N
+    BASE_BM_CAP = 128  # base clamp on bm (wide-N aspect: bn = 2*bm, N is the coalesced store axis)
+    BASE_BN_CAP = 256  # base clamp on bn
+    WARPS_HI_ELEMS = 16384  # tile elems at/above which num_warps ramps 4 -> 8
+    SAT_WAVES = (
+        4  # pinned grid >= SAT_WAVES*num_sm SM-waves = occupancy-saturated batched dot
+    )
+    SAT_TILE_BM = 64  # saturated batched-dot occupancy tile cap (bm)
+    SAT_TILE_BN = 128  # saturated batched-dot occupancy tile cap (bn)
+    SAT_NUM_WARPS = (
+        None  # sm100 forces min-warps on a saturated tiny tile (None = use the ramp)
+    )
+    SAT_MAX_STAGES = (
+        2  # num_stages ceiling for a saturated batched dot (occupancy-bound)
+    )
+    WAVE_FILL_FLOOR = (
+        64  # min tile-axis size during wave-fill shrink (DOT_MIN for tiny-M decode)
+    )
+    WAVE_FULL = (
+        0.8  # wave-quant occupancy target; below it, shrink tile to fill the machine
+    )
+    WAVE_FILL_STRICT = False  # sm100 requires a STRICT weff gain to shrink; H100 keeps >= (see shrink loop)
+    BK_CAP = (
+        256  # max block_k (deep K amortizes small-M; past this returns vanish / spill)
+    )
+    PIPE = 4  # baseline K-loop pipeline depth (bk sized to fit >= this many stages)
+    MAX_STAGES = 6  # num_stages ceiling for the latency-bound (non-saturated) regime
+    L2_TALL_RATIO = (
+        3  # l2_grouping=2 when the tile-grid is tall (grid_m >= this * grid_n)
+    )
+
+    @classmethod
+    def _extra_config_fields(
+        cls,
+        m: int,
+        n: int,
+        k: int,
+        itemsize: int,
+        bm: int,
+        bn: int,
+        bk: int,
+        num_warps: int,
+        num_stages: int,
+        l2_grouping: int,
+        pinned_grid: int,
+        num_sm: int,
+    ) -> dict[str, Any]:
+        """Hook for hardware-specific extra Config fields (e.g. sm100 Blackwell levers). The sm90
+        base emits none — only block_sizes/num_warps/num_stages/l2_groupings."""
+        return {}
+
+    @classmethod
+    def _matmul_tile(
+        cls, m: int, n: int, k: int, itemsize: int, num_sm: int, pinned_grid: int = 1
+    ) -> tuple[int, int, int, int, int, int]:
+        """Budget/roofline formula: turns ``(M, N, K, operand-width)`` into ``(block_m, block_n,
+        block_k, num_warps, num_stages, l2_grouping)`` with no lookup. Reads its budget constants
+        off ``cls`` so a subclass can re-tune them. Steps (keyed by the inline markers below):
+        (1)/(2) register-budgeted wide-N tile, clamped to the shape, spilling leftover budget onto
+        the other axis; (2.5)/(2.7) batched-dot and TMEM tile adjustments; (4) wave-quantization
+        fill; (5) num_warps ramp; (3') SMEM-budgeted block_k + num_stages; (6) l2_grouping.
+        """
+        from ..._utils import prev_power_of_2
+
+        acc_budget = cls.ACC_BUDGET
+        smem_budget = cls.SMEM_BUDGET
+        dot_min = cls.DOT_MIN
+
+        def _p2le(v: int) -> int:
+            return max(1, prev_power_of_2(max(1, v)))
+
+        # (1)+(2) register-budgeted, shape-clamped, spill-outward [bm, bn]
+        bm = min(cls.BASE_BM_CAP, max(dot_min, _p2le(m)))
+        bn = min(cls.BASE_BN_CAP, max(dot_min, _p2le(n)))
+        cap_m = max(dot_min, _p2le(m))
+        cap_n = max(dot_min, _p2le(n))
+        if (
+            bm * bn < acc_budget
+        ):  # a clamped axis freed budget — spend it on the other axis
+            bn = min(cap_n, max(bn, acc_budget // max(1, bm)))
+            if bm * bn < acc_budget:
+                bm = min(cap_m, max(bm, acc_budget // max(1, bn)))
+        # (no ceiling-enforcement loop needed: the base clamps already cap the product at
+        # ACC_BUDGET, and spill-outward only grows an axis up to ACC_BUDGET//other.)
+
+        # A batched dot with a huge pinned grid (mamba's batch·nchunks·nheads) is occupancy-bound,
+        # not arithmetic-intensity-bound: it wants the tile + pipeline sized for max concurrent CTAs.
+        saturated_batched = pinned_grid >= cls.SAT_WAVES * num_sm
+
+        # (2.5) Saturated batched dot: cap the tile to the occupancy sweet spot (more small CTAs
+        # hide latency better than a few big register-budget tiles). A bare GEMM (pinned_grid==1)
+        # is never capped.
+        if saturated_batched:
+            bm = min(bm, cls.SAT_TILE_BM)
+            bn = min(bn, cls.SAT_TILE_BN)
+
+        # (4) Wave-quantization fill (shrink loop below). Floor the shrink at WAVE_FILL_FLOOR so a
+        # medium-M tile isn't over-shrunk into a low-arithmetic-intensity sliver; tiny-M decode
+        # keeps the DOT_MIN floor.
+        floor_dim = dot_min if m <= dot_min else cls.WAVE_FILL_FLOOR
+
+        wave_full = cls.WAVE_FULL
+
+        def _wave_eff(_bm: int, _bn: int) -> float:
+            g = max(1, pinned_grid) * ((m + _bm - 1) // _bm) * ((n + _bn - 1) // _bn)
+            waves = (g + num_sm - 1) // num_sm
+            return g / (waves * num_sm)
+
+        # (2.7) TMEM-accumulator budget (sm100 only; None on sm90 leaves H100 unchanged). When the
+        # accumulator lives in tcgen05 tensor memory instead of registers, its budget doubles
+        # (ACC_BUDGET 32768 -> TMEM_ACC_BUDGET 65536), spent by growing to the [T,T] square that fills
+        # it (T = isqrt(65536) = 256 — the side that saturates TMEM, derived like [128,256] saturates
+        # registers). The square is chosen over an equal-budget rectangle because N is the coalesced
+        # store / B-reuse axis, so a narrow-N tile (e.g. [512,128]) is a large regression. Two gates:
+        #   (a) pinned_grid == 1 — only a single un-batched GEMM uses the TMEM-accumulator codegen path;
+        #       a batched dot is a different 3-D-accumulator lowering where the doubled budget inverts
+        #       the win, so batched dots keep the register budget (same pinned_grid the saturation
+        #       levers read — a codegen-path property, not a kernel fence).
+        #   (b) _wave_eff(T,T) >= WAVE_FULL — the square must still fill a wave; below it (small M*N)
+        #       the shrink loop keeps the smaller tile.
+        # block_k (step 3') then auto-shrinks so [256,256] fits SMEM.
+        if cls.TMEM_ACC_BUDGET is not None and pinned_grid == 1:
+            from math import isqrt
+
+            t = isqrt(
+                cls.TMEM_ACC_BUDGET
+            )  # square side that fills the TMEM accumulator (256)
+            if (
+                bm < t <= cap_m  # room to grow M
+                and bn <= t <= cap_n  # N already at/below the square and fits the shape
+                and _wave_eff(t, t) >= wave_full
+            ):
+                bm = bn = t
+
+        # Shrink the larger tile axis while the grid is under one full wave and shrinking helps;
+        # already-saturated tiles are left untouched. WAVE_FILL_STRICT requires a STRICT wave-eff
+        # gain to shrink (a shrink that leaves occupancy flat only destroys operand reuse) — a
+        # universal fix, but sm90 keeps the old `>=` to stay byte-identical (frozen).
+        def _better(a: float, b: float) -> bool:
+            return a > b if cls.WAVE_FILL_STRICT else a >= b
+
+        while _wave_eff(bm, bn) < wave_full:
+            if (
+                bn >= bm
+                and bn > floor_dim
+                and _better(_wave_eff(bm, bn // 2), _wave_eff(bm, bn))
+            ):
+                bn //= 2
+            elif bm > floor_dim and _better(_wave_eff(bm // 2, bn), _wave_eff(bm, bn)):
+                bm //= 2
+            else:
+                break
+
+        # (5) num_warps ramps with the tile, except a saturated batched dot with a tiny tile wants
+        # min warps (more concurrent 1-warp CTAs once the grid saturates the SMs). SAT_NUM_WARPS is
+        # None on sm90 (keep the ramp), an int on sm100.
+        if saturated_batched and cls.SAT_NUM_WARPS is not None:
+            num_warps = cls.SAT_NUM_WARPS
+        else:
+            num_warps = 8 if bm * bn >= cls.WARPS_HI_ELEMS else 4
+
+        # (3') block_k: largest pow2 that leaves >= PIPE K-iterations (bk <= K/PIPE, so a small-K
+        # dot stays shallow), is <= BK_CAP, and fits the operands in SMEM. Operand width enters via
+        # itemsize (a byte budget, not a dtype literal): fp8 affords a deeper K than fp32.
+        min_bk = 32 if itemsize == 1 else 16  # tl.dot K min (fp8 needs 32)
+        bk = max(min_bk, min(cls.BK_CAP, _p2le(max(1, k // cls.PIPE))))
+        while bk > min_bk and (bm * bk + bk * bn) * itemsize * cls.PIPE > smem_budget:
+            bk //= 2
+        # num_stages = deepest pipeline that fits SMEM, capped by the K-iteration count and by
+        # `max_depth`: a saturated batched dot is occupancy-bound (concurrent CTAs already hide
+        # latency, so a deep pipeline just burns SMEM) -> SAT_MAX_STAGES; a bare GEMM's K-loop is
+        # latency-bound -> full MAX_STAGES.
+        max_depth = cls.SAT_MAX_STAGES if saturated_batched else cls.MAX_STAGES
+        per_stage = (bm * bk + bk * bn) * itemsize
+        kit = max(
+            1, k // bk
+        )  # K-loop iterations — no point pipelining deeper than this
+        num_stages = 2
+        for s in range(min(max_depth, max(2, kit)), 1, -1):
+            if per_stage * s <= smem_budget:
+                num_stages = s
+                break
+
+        # (6) l2_grouping: reorder PIDs so a group of M-tiles shares an L2-resident B operand. Helps
+        # a tall tile-grid (many M-tiles reuse one B) but hurts a wide/square grid, so gate on the
+        # measured crossover grid_m >= L2_TALL_RATIO * grid_n.
+        grid_m = (m + bm - 1) // bm
+        grid_n = (n + bn - 1) // bn
+        l2_grouping = 2 if grid_m > 1 and grid_m >= cls.L2_TALL_RATIO * grid_n else 1
+
+        return bm, bn, bk, num_warps, num_stages, l2_grouping
+
+    @classmethod
+    def _ranked_configs(cls, env: CompileEnvironment, fact: MatmulFact) -> list[Config]:
+        """Ranked seed list: the budget primary (rank-0, Product A) + a couple of diverse alternates
+        (transposed aspect, shallower num_stages) to seed the autotuner search. Deduped by the loader."""
+        from ..._utils import prev_power_of_2
+        from ...runtime import get_num_sm
+
+        assert fact.static_m is not None
+        assert fact.static_n is not None
+        assert fact.static_k is not None
+        spec = env.config_spec
+        itemsize = max(1, fact.lhs_dtype.itemsize)
+        num_sm = max(1, get_num_sm(env.device))
+        pinned_grid = _h100_pinned_grid(env, fact)
+        # The budget formula sizes the dot tile under a register/SMEM budget, keyed on
+        # (M, N, K, operand-width via itemsize) and the pinned batch grid.
+        bm, bn, bk, nw, ns, l2 = cls._matmul_tile(
+            fact.static_m,
+            fact.static_n,
+            fact.static_k,
+            itemsize,
+            num_sm,
+            pinned_grid,
+        )
+
+        def _extra(
+            _bm: int, _bn: int, _bk: int, _nw: int, _ns: int, _l2: int
+        ) -> dict[str, Any]:
+            return cls._extra_config_fields(
+                fact.static_m,
+                fact.static_n,
+                fact.static_k,
+                itemsize,
+                _bm,
+                _bn,
+                _bk,
+                _nw,
+                _ns,
+                _l2,
+                pinned_grid,
+                num_sm,
+            )
+
+        ranked: list[Config] = [
+            _h100_config(
+                spec, fact, bm, bn, bk, nw, ns, l2, _extra(bm, bn, bk, nw, ns, l2)
+            )
+        ]
+
+        def _warps(_bm: int, _bn: int) -> int:
+            return 8 if _bm * _bn >= cls.WARPS_HI_ELEMS else 4
+
+        # alt 1 — transposed aspect (move budget from N to M), when it changes the tile.
+        cap_m = max(16, prev_power_of_2(max(1, fact.static_m)))
+        bm2, bn2 = min(cap_m, bm * 2), max(16, bn // 2)
+        if bm2 != bm and bn2 != bn and bm2 * bn2 >= 4096:
+            nw2 = _warps(bm2, bn2)
+            ranked.append(
+                _h100_config(
+                    spec,
+                    fact,
+                    bm2,
+                    bn2,
+                    bk,
+                    nw2,
+                    ns,
+                    1,
+                    _extra(bm2, bn2, bk, nw2, ns, 1),
+                )
+            )
+
+        # alt 2 — shallower num_stages neighbor (perturb down only; skipped at the floor ns==2).
+        if ns > 2:
+            ranked.append(
+                _h100_config(
+                    spec,
+                    fact,
+                    bm,
+                    bn,
+                    bk,
+                    nw,
+                    ns - 1,
+                    l2,
+                    _extra(bm, bn, bk, nw, ns - 1, l2),
+                )
+            )
+        return ranked
+
+    @classmethod
+    def is_eligible(cls, env: CompileEnvironment, device_ir: DeviceIR) -> bool:
+        if not matches_hardware(env, cls.HARDWARE_TARGETS):
+            return False
+        fact = _batched_static_matmul_fact(env.config_spec)
+        if fact is None:
+            return False
+        # Decline fp8 (both operands 1-byte float). CAVEAT: this is disabled because of an fp8
+        # `fast_accum` (is_fast_accum) precision issue, NOT a perf choice. In fp8 tensor-core
+        # terms the wide-tile path we would emit is effectively the `fast_accum=True`
+        # (max-throughput) accumulate, and Helion has no knob today to force the full-precision
+        # accumulate back on, so we decline rather than silently ship reduced-precision fp8. It
+        # dodges a Triton fp8-accumulator bug that our budget tile would otherwise trigger:
+        #
+        #   The budget formula sizes fp8 GEMMs at block_m=128 (>= 64). At block_m >= 64 Triton
+        #   lowers ``tl.dot`` to the native fp8 warp-group MMA (QGMMA/warp_group_dot), reading
+        #   raw fp8 from shared memory. Because Helion never passes ``max_num_imprecise_acc``,
+        #   Triton falls back to its sm90 default of 2**30 (the "never promote" sentinel), so the
+        #   fp32 accumulator is NEVER flushed across the K loop -> results wrong by an error that
+        #   grows with K (~0.03% at K=512 up to ~5% at K=8192). block_m <= 32 dodges it (Triton
+        #   upcasts fp8->fp16 and uses HMMA with a real fp32 accumulate), but that is exactly the
+        #   small tile ``_base_default_config`` already emits.
+        #
+        #   In max-autotune the accuracy gate (bitwise 0/0 for all-fp8 output) correctly REJECTS
+        #   the wide-tile config, so it can never win -- planting it only wastes a search trial.
+        #   Worse, this heuristic sets ``promote_seed_to_default=True``: an eligible fp8 seed would
+        #   become the effort=none compiler default, which runs NO accuracy check -> silently wrong
+        #   fp8 GEMMs. Declining here disables BOTH the wasted seed and the unsafe promotion (fp8
+        #   falls back to the correct ``_base_default_config`` small tile).
+        #
+        #   The real fix (a follow-up) is to emit ``max_num_imprecise_acc=0`` on fp8 ``tl.dot`` in
+        #   _emit_tl_dot; that forces the correct accumulate AND is faster than either path here,
+        #   so the fp8 seed should be re-enabled once that lands. The CuTe backend is unaffected --
+        #   it bakes fp32 accumulation into the MMA op type, with no tunable cadence to get wrong.
+        return not _is_fp8_matmul_fact(fact)
+
+    @classmethod
+    def _ranked(cls, env: CompileEnvironment) -> list[Config]:
+        fact = _batched_static_matmul_fact(env.config_spec)
+        if fact is None:
+            return []
+        # The budget formula is the sole seed: the primary (Product A) + ranked Product-B alternates.
+        return dedupe_configs(cls._ranked_configs(env, fact))
+
+    @classmethod
+    def get_seed_config(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> Config | None:
+        ranked = cls._ranked(env)
+        return ranked[0] if ranked else None
+
+    @classmethod
+    def get_seed_configs(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> list[Config] | None:
+        ranked = cls._ranked(env)
+        return ranked or None
+
+
+class TritonB200FormulaMatmulHeuristic(TritonH100MatmulHeuristic):
+    """B200 (sm100) seed — the H100 budget formula re-homed on Blackwell, subsuming the incumbent
+    ``TritonB200MatmulHeuristic`` table (which fires only on in-bucket fp16/bf16 2-D matmul and
+    declines fp32/fp8/bmm/mamba + any dim>4096). Overrides only the hardware gate and the B200-tuned
+    constants; the promotion (owning the compiler default) is inherited from the base."""
+
+    name = "triton_b200_formula_matmul"
+    HARDWARE_TARGETS = (("cuda", "sm100"),)
+    # promote_seed_to_default=True is inherited from TritonH100MatmulHeuristic. Registered after the
+    # (demoted) table so it wins the last-promote-wins compiler_default_config loop on sm100.
+
+    # num_sm (148) enters via get_num_sm, so the wave/saturation arithmetic self-adjusts; the rest
+    # inherit the H100 formula, re-tuned per move below.
+    SMEM_BUDGET = 232448  # B200 shared_memory_per_block_optin (bytes)
+    # tcgen05 TMEM accumulator capacity: 128 lanes × 512 cols × 32-bit = 65536 fp32 slots (2× the
+    # register ACC_BUDGET). The [256,256] square (256 = √65536) is derived from this — see step (2.7).
+    TMEM_ACC_BUDGET = 65536
+    # A saturated batched dot on 148 SMs wants a smaller tile + min warps (more concurrent tiny CTAs).
+    SAT_TILE_BM = 32
+    SAT_TILE_BN = 64
+    SAT_NUM_WARPS = 1
+    # Strict wave-fill shrink (see the shrink loop). A universal fix; gated to sm100 only to keep the
+    # sm90 freeze byte-identical — the principled end-state is to flip the base default once H100 can
+    # be re-benched (it would shift a few N=11008 shapes).
+    WAVE_FILL_STRICT = True
+
+
+# Module-level shims delegating to the class (tests + lab harness call these by name).
+def _h100_matmul_tile(
+    m: int, n: int, k: int, itemsize: int, num_sm: int, pinned_grid: int = 1
+) -> tuple[int, int, int, int, int, int]:
+    return TritonH100MatmulHeuristic._matmul_tile(
+        m, n, k, itemsize, num_sm, pinned_grid
+    )
+
+
+def _h100_ranked_configs(env: CompileEnvironment, fact: MatmulFact) -> list[Config]:
+    return TritonH100MatmulHeuristic._ranked_configs(env, fact)
 
 
 class TritonPointwiseSeedHeuristic(AutotunerHeuristic):
@@ -421,383 +927,6 @@ class TritonPointwiseSeedHeuristic(AutotunerHeuristic):
         for i in contig_pos:
             block[i] = cls._clamp_dim(run, specs[i], 1)
         return block
-
-
-def _batched_static_matmul_fact(config_spec: ConfigSpec) -> MatmulFact | None:
-    """The H100 eligibility precondition — broader than the 2-D-only
-    ``_single_2d_static_matmul_fact``: it admits an arbitrary, possibly **BATCHED** matmul. The
-    requirements:
-      - exactly one ``MatmulFact`` with **static** M/N/K (the dot's own dims) and three distinct
-        M/N/K block-ids that are real tunable axes;
-      - every **other** tunable block axis is a BATCH / OUTER grid axis (present in
-        ``grid_block_ids``) — a no-data-reuse parallel axis the seed pins to 1
-        (``_h100_build_block_sizes`` floors every non-M/N/K axis), which is exactly what keeps the
-        register-budget tile valid for a batched dot (the fp32 accumulator is
-        ``[batch_blocks…, bm, bn]``; the budget sizes ``bm·bn`` assuming each batch block is 1).
-    An extra tunable axis that is NEITHER M/N/K nor a grid axis (some inner loop we do not model)
-    ⇒ decline, so the seed never mis-pins an axis it does not understand. The dot's ndim is NOT
-    constrained (a 2-D ``matmul`` and a 3-D ``baddbmm`` are both fine), only the block-axis ROLES.
-
-    Fires on: plain ``matmul`` / ``fp8_gemm``; ``broadcast_matmul`` (batch folded into M);
-    ``mamba2_chunk_state`` (batch pre-pinned to 1 by the author — its batch axes aren't tunable);
-    and ``bmm`` / any static batched dot that leaves its batch axis tunable. Declines a dynamic
-    (``static_shapes=False``) or jagged kernel (no static M/N/K) — e.g. ``grouped_gemm``.
-    """
-    facts = config_spec.matmul_facts
-    if len(facts) != 1:
-        return None
-    fact = facts[0]
-    if fact.static_m is None or fact.static_n is None or fact.static_k is None:
-        return None
-    mnk = (fact.m_block_id, fact.n_block_id, fact.k_block_id)
-    if None in mnk or len(set(mnk)) != 3:
-        return None
-    valid = set(config_spec.block_sizes.valid_block_ids())
-    if not set(mnk) <= valid:
-        return None
-    # Every tunable axis must be the dot's M/N/K or a batch/outer grid axis (pinnable to 1).
-    allowed = set(mnk) | set(config_spec.grid_block_ids)
-    if any(bid not in allowed for bid in valid):
-        return None
-    return fact
-
-
-def _h100_matmul_tile(
-    m: int, n: int, k: int, itemsize: int, num_sm: int, pinned_grid: int = 1
-) -> tuple[int, int, int, int, int, int]:
-    """The H100 (sm90) matmul budget/roofline formula — the catch-all that turns
-    ``(M, N, K, operand-width)`` into a strong ``(block_m, block_n, block_k, num_warps,
-    num_stages, l2_grouping)`` with NO lookup. The model (task §3 inspiration):
-
-    1. **Register budget** — the fp32 ``[bm, bn]`` accumulator dominates per-CTA registers,
-       so ``bm * bn <= ACC_BUDGET`` (elems). Base aspect is wide-N (``bn = 2*bm`` →
-       ``[128, 256]``, the measured H100 compute-bound winner), since N is the coalesced
-       store axis and is usually ≥ M (FFN/proj). The ``min(128,·)/min(256,·)`` clamp already
-       bounds the product at ``ACC_BUDGET``, so no separate ceiling-enforcement is needed.
-    2. **Shape clamp + spill-outward** — never tile past a dim (``bm <= M``, ``bn <= N``,
-       pow2); when one axis is clamped small (tall-skinny / decode), spend the leftover
-       register budget on the other axis so the tile stays productive instead of starved.
-    4. **Occupancy / wave-quantization fill** — the launched grid is ``pinned_grid ·
-       ⌈M/bm⌉·⌈N/bn⌉``, where ``pinned_grid`` is the product of any PINNED (block_size=1)
-       grid axes — 1 for a bare GEMM, but ``batch·nchunks·nheads`` for the fused
-       ``mamba2_chunk_state`` dot, which is already massively grid-saturated (so its dot tile
-       must NOT be shrunk). Shrink the wide axis (then M) only while it MEASURABLY improves the
-       wave-quantization efficiency ``grid / (⌈grid/num_sm⌉·num_sm)`` — so a shape already at
-       ~one full wave (e.g. a 2048³ cube at 128≈132 tiles) keeps its big tile, while a starved
-       small-M GEMM (16 tiles) is split to fill the machine.
-    5. **num_warps** ramps with the tile (≥16K elems → 8 else 4).
-    3'. **block_k + num_stages** — SMEM-budgeted (operand width via itemsize), pipeline-depth-capped
-       (``bk <= K/PIPE`` to keep the K-loop ≥ PIPE deep), and num_stages = the deepest pipeline that
-       fits SMEM, ceiling'd by regime (latency-bound → up to 6; an occupancy-SATURATED batched dot →
-       2). The saturation flag is computed once at step (2.5) and used by both the tile cap and here.
-    6. **l2_grouping** for a tall tile-grid (B-reuse). (Details at each step below.)
-    """
-    from ..._utils import prev_power_of_2
-
-    ACC_BUDGET = 32768  # fp32 [bm,bn] accumulator elems (= 128*256), register-bound
-    SMEM_BUDGET = 228 * 1024  # H100 per-CTA shared memory ceiling (bytes)
-    DOT_MIN = (
-        16  # tl.dot min M/N; K min is 16 (32 for fp8) — finalized by the spec floor
-    )
-
-    def _p2le(v: int) -> int:
-        return max(1, prev_power_of_2(max(1, v)))
-
-    # (1)+(2) register-budgeted, shape-clamped, spill-outward [bm, bn]
-    bm = min(128, max(DOT_MIN, _p2le(m)))
-    bn = min(256, max(DOT_MIN, _p2le(n)))
-    cap_m = max(DOT_MIN, _p2le(m))
-    cap_n = max(DOT_MIN, _p2le(n))
-    if bm * bn < ACC_BUDGET:  # a clamped axis freed budget — spend it on the other axis
-        bn = min(cap_n, max(bn, ACC_BUDGET // max(1, bm)))
-        if bm * bn < ACC_BUDGET:
-            bm = min(cap_m, max(bm, ACC_BUDGET // max(1, bn)))
-    # (no ceiling-enforcement loop needed: the min(128,·)/min(256,·) clamps already cap the
-    # product at ACC_BUDGET, and spill-outward only grows an axis up to ACC_BUDGET//other.)
-
-    # A fused BATCHED dot is launched by a huge PINNED grid (mamba's batch·nchunks·nheads) — the
-    # batched-dot signature. Such a launch is occupancy-bound, not arithmetic-intensity-bound, so
-    # it wants the dot tile + pipeline sized for MAX concurrent CTAs, not max register reuse.
-    SAT_WAVES = (
-        4  # pinned grid >= 4 SM-waves of independent programs = occupancy-saturated
-    )
-    saturated_batched = pinned_grid >= SAT_WAVES * num_sm
-
-    # (2.5) saturated batched-dot occupancy tile cap. Cap the per-CTA tile to the measured
-    # occupancy sweet spot (bm<=64, bn<=128): more concurrent small CTAs hide latency better than
-    # a few big register-budget tiles. Beats the register-budget [128,256] on the large fused
-    # dots (hd=128/ds=256: +12-13%) and is neutral on the small ones (already <= it). A bare GEMM
-    # has pinned_grid==1 and is never capped (it IS arithmetic-intensity-bound).
-    if saturated_batched:
-        bm = min(bm, 64)
-        bn = min(bn, 128)
-
-    # (4) occupancy / wave-quantization fill — shrink the wide axis (then M) only while it
-    # measurably improves wave efficiency. pinned_grid folds in any block_size=1 grid axes
-    # (mamba's batch·nchunks·nheads), so a grid-saturated fused dot is never shrunk.
-    # Decode (tiny M) keeps the DOT_MIN floor; otherwise floor at 64 (don't over-shrink a
-    # medium-M tile into a low-arithmetic-intensity sliver).
-    floor_dim = DOT_MIN if m <= DOT_MIN else 64
-
-    WAVE_FULL = (
-        0.8  # "saturated": >= ~one full wave of CTAs; below this, fill by shrinking
-    )
-
-    def _wave_eff(_bm: int, _bn: int) -> float:
-        g = max(1, pinned_grid) * ((m + _bm - 1) // _bm) * ((n + _bn - 1) // _bn)
-        waves = (g + num_sm - 1) // num_sm
-        return g / (waves * num_sm)
-
-    # Shrink the LARGER tile axis (keeps the tile square-ish, not a starved sliver) while the
-    # grid is under one full wave AND shrinking helps. Already-saturated tiles (a cube at
-    # ~one wave, or a mamba dot with a huge pinned grid) are left untouched.
-    while _wave_eff(bm, bn) < WAVE_FULL:
-        if bn >= bm and bn > floor_dim and _wave_eff(bm, bn // 2) >= _wave_eff(bm, bn):
-            bn //= 2
-        elif bm > floor_dim and _wave_eff(bm // 2, bn) >= _wave_eff(bm, bn):
-            bm //= 2
-        else:
-            break
-
-    # (5) num_warps ramp
-    num_warps = 8 if bm * bn >= 16384 else 4
-
-    # (3') K tile (block_k) + num_stages — SMEM-budgeted, pipeline-depth-capped, computed on
-    # the FINAL bm,bn. bk is the largest pow2 that:
-    #   (a) leaves >= PIPE K-iterations to fill the pipeline (bk <= K/PIPE): collapsing K into
-    #       1-2 steps defeats software pipelining and over-pressures registers. This is what keeps
-    #       mamba's small-K (chunk) dot at a shallow bk while a large-K GEMM gets a deep one;
-    #   (b) is <= BK_CAP (a deep K amortizes the K-loop for a latency-bound small-M GEMM, but
-    #       past ~256 the returns vanish and registers spill);
-    #   (c) fits the [bm,bk]+[bk,bn] operands in SMEM at num_stages — width enters HERE via
-    #       itemsize, so a narrower operand (fp8) affords a deeper K than a wider one (fp32):
-    #       the 8/16/32 budget knob, faithful (a byte budget, never a dtype literal).
-    # Drop num_stages only if even min_bk overflows SMEM (an unusually large tile).
-    BK_CAP = 256
-    PIPE = 4  # baseline K-loop pipeline depth (bk is sized to fit at least this many stages)
-    min_bk = 32 if itemsize == 1 else 16  # tl.dot K min (fp8 needs 32)
-    # Largest pow2 <= min(BK_CAP, K/PIPE), floored to min_bk. The K/PIPE cap is <= K, so it also
-    # guarantees bk <= K; and flooring only at the end suffices (a floor inside the min() would be
-    # undone by the min and redone here).
-    bk = max(min_bk, min(BK_CAP, _p2le(max(1, k // PIPE))))
-    while bk > min_bk and (bm * bk + bk * bn) * itemsize * PIPE > SMEM_BUDGET:
-        bk //= 2
-    # num_stages = the deepest pipeline that fits SMEM at this bk, bounded by:
-    #   - the K-iteration count (no point pipelining deeper than the loop trips), AND
-    #   - the regime ceiling `max_depth`: a SATURATED BATCHED dot — many independent programs from
-    #     a huge PINNED grid (mamba's batch·nchunks·nheads) — is occupancy-bound, not latency-bound:
-    #     its concurrent CTAs already hide latency, so a deep per-program pipeline only burns
-    #     SMEM/registers and cuts occupancy. Cap it at 2 there (measured s4->s2 +20-28%, VAL-referee
-    #     diagnosed). A bare GEMM (pinned_grid==1) keeps the full depth — its long K-loop genuinely
-    #     IS latency-bound (3072³ forced to s2 = G 0.58 disaster). This is the ONLY place num_stages
-    #     is decided; the two regimes differ only in this ceiling.
-    # MAX_STAGES: deepen the pipeline up to here if SMEM allows — a small tile leaves SMEM spare and
-    # a deep K-loop hides its latency with more stages (measured: small-M [64,64,128] s4->s6 +13%,
-    # deep-K K>>M·N +26%); a big tile is SMEM-capped back to ~4.
-    MAX_STAGES = 6
-    max_depth = 2 if saturated_batched else MAX_STAGES
-    per_stage = (bm * bk + bk * bn) * itemsize
-    kit = max(1, k // bk)  # K-loop iterations — no point pipelining deeper than this
-    num_stages = 2
-    for s in range(min(max_depth, max(2, kit)), 1, -1):
-        if per_stage * s <= SMEM_BUDGET:
-            num_stages = s
-            break
-
-    # (6) l2_grouping — reorder the program grid so a group of consecutive PIDs covers a block
-    # of M-tiles sharing the same N-columns, keeping the (small, reused) B operand L2-resident
-    # across the group. This is a big win for a TALL tile-grid (many M-tiles reusing one B:
-    # tall-skinny G 0.69->0.97) but measurably HURTS a wide/square grid (vocab G 0.999->0.71,
-    # wide 0.98->0.72) — gated on a PROVEN reversal boundary. The measured l2=2 crossover vs the
-    # tile-grid aspect grid_m/grid_n: ratio 2 (square) -0.7%, 3.2 +3.4%, 4 +5%, 6 +13.5%, 8 +27%,
-    # 64 (tall-skinny) 0.69->0.97 — so the win turns on at ~3x. Gate at grid_m >= 3*grid_n. Off for
-    # mamba (its M/N grid is 1x1 — the batch axes carry the grid, not tiled M/N).
-    L2_TALL_RATIO = 3
-    grid_m = (m + bm - 1) // bm
-    grid_n = (n + bn - 1) // bn
-    l2_grouping = 2 if grid_m > 1 and grid_m >= L2_TALL_RATIO * grid_n else 1
-
-    return bm, bn, bk, num_warps, num_stages, l2_grouping
-
-
-def _h100_build_block_sizes(
-    spec: ConfigSpec, fact: MatmulFact, bm: int, bn: int, bk: int
-) -> list[int]:
-    """Map ``(bm, bn, bk)`` onto the spec's block_sizes by the fact's M/N/K block-ids,
-    clamping each to its valid [min, max] (other axes — none for a clean 2-D fact — floored)."""
-    targets = {fact.m_block_id: bm, fact.n_block_id: bn, fact.k_block_id: bk}
-    out: list[int] = []
-    for i in range(len(spec.block_sizes)):
-        bs_spec = cast("BlockSizeSpec", spec.block_sizes[i])
-        v = targets.get(bs_spec.block_id)
-        if v is None:
-            v = max(1, bs_spec.min_size, bs_spec.autotuner_min)
-        v = max(v, bs_spec.min_size, bs_spec.autotuner_min)
-        v = min(v, bs_spec.max_size)
-        out.append(v)
-    return out
-
-
-def _h100_pinned_grid(env: CompileEnvironment, fact: MatmulFact) -> int:
-    """Product of any PINNED (block_size=1) grid axes other than the dot's M/N tiles — 1 for a
-    bare GEMM, ``batch·nchunks·nheads`` for mamba's fused dot. These already saturate the SMs, so
-    the occupancy fill counts them (else it shrinks an already-grid-saturated dot's tile) and the
-    num_stages cap keys on them (the batched-dot signature)."""
-    pinned_grid = 1
-    for bid in env.config_spec.grid_block_ids:
-        if bid in (fact.m_block_id, fact.n_block_id):
-            continue
-        size = env.block_sizes[bid].size
-        if isinstance(size, (int, torch.SymInt)):
-            pinned_grid *= max(1, env.size_hint(size))
-    return pinned_grid
-
-
-def _h100_config(
-    spec: ConfigSpec,
-    fact: MatmulFact,
-    bm: int,
-    bn: int,
-    bk: int,
-    num_warps: int,
-    num_stages: int,
-    l2_grouping: int = 1,
-) -> Config:
-    """Assemble a Config from a tile tuple (emit l2_groupings only when grouping > 1)."""
-    cfg: dict[str, Any] = {
-        "block_sizes": _h100_build_block_sizes(spec, fact, bm, bn, bk),
-        "num_warps": num_warps,
-        "num_stages": num_stages,
-    }
-    if l2_grouping > 1:
-        cfg["l2_groupings"] = [l2_grouping]
-    return Config(**cfg)
-
-
-def _h100_ranked_configs(env: CompileEnvironment, fact: MatmulFact) -> list[Config]:
-    """The ranked seed list: the budget primary (rank-0, Product A) + a few DIVERSE strong
-    alternates that seed Product-B search convergence (a seed is never forced, so a sub-optimal
-    alternate only costs autotuning time). The alternates perturb the two axes that carry the
-    most measured per-shape variance — the tile ASPECT (e.g. [128,256] vs a transposed [256,128])
-    and num_stages (s3 vs s4) — giving the search diverse strong starting points without the
-    risky l2 lever. Deduped against the primary by the loader."""
-    from ..._utils import prev_power_of_2
-    from ...runtime import get_num_sm
-
-    assert fact.static_m is not None
-    assert fact.static_n is not None
-    assert fact.static_k is not None
-    spec = env.config_spec
-    # The budget formula sizes the dot tile under a register/SMEM budget, keyed on
-    # (M, N, K, operand-width via itemsize) and the pinned batch grid.
-    bm, bn, bk, nw, ns, l2 = _h100_matmul_tile(
-        fact.static_m,
-        fact.static_n,
-        fact.static_k,
-        max(1, fact.lhs_dtype.itemsize),
-        max(1, get_num_sm(env.device)),
-        _h100_pinned_grid(env, fact),
-    )
-    ranked: list[Config] = [_h100_config(spec, fact, bm, bn, bk, nw, ns, l2)]
-
-    def _warps(_bm: int, _bn: int) -> int:
-        return 8 if _bm * _bn >= 16384 else 4
-
-    # alt 1 — transposed aspect (move budget from N to M): covers shapes where a less wide tile
-    # wins. Only when there is room and it changes the tile.
-    assert fact.static_m is not None and fact.static_n is not None
-    cap_m = max(16, prev_power_of_2(max(1, fact.static_m)))
-    bm2, bn2 = min(cap_m, bm * 2), max(16, bn // 2)
-    if bm2 != bm and bn2 != bn and bm2 * bn2 >= 4096:
-        ranked.append(_h100_config(spec, fact, bm2, bn2, bk, _warps(bm2, bn2), ns))
-
-    # alt 2 — a SHALLOWER num_stages neighbor (perturb DOWN only). Never re-introduce a deeper
-    # pipeline: for a saturated batched dot that is exactly the config step 7 rejected (s>=3 loses
-    # ~20-28%), and the down-perturbation matches the matched-lever A/B discipline. Skipped at the
-    # floor (num_stages==2, i.e. a saturated dot — its only seed-worthy alternate is the aspect one).
-    if ns > 2:
-        ranked.append(_h100_config(spec, fact, bm, bn, bk, nw, ns - 1, l2))
-    return ranked
-
-
-class TritonH100MatmulHeuristic(AutotunerHeuristic):
-    """H100 (sm90) seed for any static (possibly BATCHED) ``MatmulFact`` — the dense-GEMM seed
-    H100 was missing (only the narrow skinny-aspect rule + the sm100 B200 table existed, so
-    almost every real GEMM fell back to the catastrophic ``block_sizes≈[16,16,16]`` default).
-
-    Fires on EVERY ``_batched_static_matmul_fact`` (no aspect-ratio gate — re-imposing it is the
-    bug): ``matmul``, ``fp8_gemm``, ``broadcast_matmul``, ``mamba2_chunk_state``'s fused inner dot,
-    AND ``bmm`` / any static batched dot. The seed is a **budget/roofline FORMULA**
-    (``_h100_matmul_tile``) that sizes the dot's M/N/K under a register/SMEM budget keyed on
-    ``(M, N, K, operand-width)`` and **pins every batch/outer axis to 1** (a no-data-reuse parallel
-    axis — one CTA per batch maximizes the grid, and it keeps the ``[bm,bn]`` register budget valid;
-    the resulting pinned grid then drives the saturation levers, so a batched dot and mamba are the
-    SAME case). The catch-all formula guarantees no such matmul hits the default.
-    ``promote_seed_to_default=True``: the budget formula owns the no-autotune compiler default (as
-    well as seeding the autotuner), so a real GEMM never falls back to the ``[16,16,16]`` default."""
-
-    name = "triton_h100_matmul"
-    backend = "triton"
-    promote_seed_to_default = True
-    HARDWARE_TARGETS = (("cuda", "sm90"),)
-
-    @classmethod
-    def is_eligible(cls, env: CompileEnvironment, device_ir: DeviceIR) -> bool:
-        if not matches_hardware(env, cls.HARDWARE_TARGETS):
-            return False
-        fact = _batched_static_matmul_fact(env.config_spec)
-        if fact is None:
-            return False
-        # Decline fp8 (both operands 1-byte float). CAVEAT: this is disabled because of an fp8
-        # `fast_accum` (is_fast_accum) precision issue, NOT a perf choice. In fp8 tensor-core
-        # terms the wide-tile path we would emit is effectively the `fast_accum=True`
-        # (max-throughput) accumulate, and Helion has no knob today to force the full-precision
-        # accumulate back on, so we decline rather than silently ship reduced-precision fp8. It
-        # dodges a Triton fp8-accumulator bug that our budget tile would otherwise trigger:
-        #
-        #   The budget formula sizes fp8 GEMMs at block_m=128 (>= 64). At block_m >= 64 Triton
-        #   lowers ``tl.dot`` to the native fp8 warp-group MMA (QGMMA/warp_group_dot), reading
-        #   raw fp8 from shared memory. Because Helion never passes ``max_num_imprecise_acc``,
-        #   Triton falls back to its sm90 default of 2**30 (the "never promote" sentinel), so the
-        #   fp32 accumulator is NEVER flushed across the K loop -> results wrong by an error that
-        #   grows with K (~0.03% at K=512 up to ~5% at K=8192). block_m <= 32 dodges it (Triton
-        #   upcasts fp8->fp16 and uses HMMA with a real fp32 accumulate), but that is exactly the
-        #   small tile ``_base_default_config`` already emits.
-        #
-        #   In max-autotune the accuracy gate (bitwise 0/0 for all-fp8 output) correctly REJECTS
-        #   the wide-tile config, so it can never win -- planting it only wastes a search trial.
-        #   Worse, this heuristic sets ``promote_seed_to_default=True``: an eligible fp8 seed would
-        #   become the effort=none compiler default, which runs NO accuracy check -> silently wrong
-        #   fp8 GEMMs. Declining here disables BOTH the wasted seed and the unsafe promotion (fp8
-        #   falls back to the correct ``_base_default_config`` small tile).
-        #
-        #   The real fix (a follow-up) is to emit ``max_num_imprecise_acc=0`` on fp8 ``tl.dot`` in
-        #   _emit_tl_dot; that forces the correct accumulate AND is faster than either path here,
-        #   so the fp8 seed should be re-enabled once that lands. The CuTe backend is unaffected --
-        #   it bakes fp32 accumulation into the MMA op type, with no tunable cadence to get wrong.
-        return not _is_fp8_matmul_fact(fact)
-
-    @classmethod
-    def _ranked(cls, env: CompileEnvironment) -> list[Config]:
-        fact = _batched_static_matmul_fact(env.config_spec)
-        if fact is None:
-            return []
-        # The budget formula is the sole seed: the primary (Product A) + ranked Product-B alternates.
-        return dedupe_configs(_h100_ranked_configs(env, fact))
-
-    @classmethod
-    def get_seed_config(
-        cls, env: CompileEnvironment, device_ir: DeviceIR
-    ) -> Config | None:
-        ranked = cls._ranked(env)
-        return ranked[0] if ranked else None
-
-    @classmethod
-    def get_seed_configs(
-        cls, env: CompileEnvironment, device_ir: DeviceIR
-    ) -> list[Config] | None:
-        ranked = cls._ranked(env)
-        return ranked or None
 
 
 def _triton_reduction_eligible(env: CompileEnvironment, device_ir: DeviceIR) -> bool:

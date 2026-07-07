@@ -8,7 +8,11 @@ import torch
 
 import helion
 from helion._compiler.autotuner_heuristics.triton import _B200_MATMUL_HEURISTICS_PATH
+from helion._compiler.autotuner_heuristics.triton import (
+    TritonB200FormulaMatmulHeuristic,
+)
 from helion._compiler.autotuner_heuristics.triton import TritonB200MatmulHeuristic
+from helion._compiler.autotuner_heuristics.triton import TritonH100MatmulHeuristic
 from helion._compiler.autotuner_heuristics.triton import _seed_config_for_bucket
 from helion._compiler.autotuner_heuristics.triton import _seed_config_for_config_spec
 from helion.autotuner.config_fragment import EnumFragment
@@ -174,3 +178,56 @@ def test_triton_b200_matmul_heuristic_gates_on_hardware() -> None:
         return_value=h100,
     ):
         assert not TritonB200MatmulHeuristic.is_eligible(env, SimpleNamespace())
+
+
+def test_b200_formula_subsumes_table_promotion_wiring() -> None:
+    # The sm100 FORMULA owns the compiler default; the TABLE is demoted to a search seed.
+    assert TritonB200FormulaMatmulHeuristic.promote_seed_to_default is True
+    assert TritonB200MatmulHeuristic.promote_seed_to_default is False
+    assert TritonB200FormulaMatmulHeuristic.HARDWARE_TARGETS == (("cuda", "sm100"),)
+    # The formula is a subclass of the H100 budget formula (inherits _matmul_tile).
+    assert issubclass(TritonB200FormulaMatmulHeuristic, TritonH100MatmulHeuristic)
+    # Registered AFTER the table so it wins the last-promote-wins default loop.
+    from helion._compiler.autotuner_heuristics import get_heuristics
+
+    order = [h.__name__ for h in get_heuristics("triton")]
+    assert order.index("TritonB200FormulaMatmulHeuristic") > order.index(
+        "TritonB200MatmulHeuristic"
+    )
+
+
+def test_h100_base_tile_is_unchanged_by_tmem_budget() -> None:
+    # TMEM_ACC_BUDGET is None on the sm90 base (no TMEM accumulator path), so the H100 formula is
+    # byte-identical: a big compute-bound cube stays the wide-N [128, 256, 64] w8 s4 tile (num_sm=132).
+    assert TritonH100MatmulHeuristic.TMEM_ACC_BUDGET is None
+    assert TritonH100MatmulHeuristic._matmul_tile(4096, 4096, 4096, 2, 132, 1) == (
+        128,
+        256,
+        64,
+        8,
+        4,
+        1,
+    )
+
+
+def test_b200_tmem_budget_grows_to_square_tile() -> None:
+    # On sm100 the accumulator lives in TMEM (65536 fp32 capacity), so a SINGLE (pinned_grid==1) GEMM
+    # that fills a wave grows to the [T,T] square that fills it: T = isqrt(65536) = 256 (derived, not
+    # hardcoded). bk auto-shrinks to fit SMEM.
+    from math import isqrt
+
+    cls = TritonB200FormulaMatmulHeuristic
+    assert cls.TMEM_ACC_BUDGET == 65536
+    assert (
+        isqrt(cls.TMEM_ACC_BUDGET) == 256
+    )  # the square side is derived from the TMEM capacity
+    sm = 148
+    # large compute-bound cube (fills the machine at 256x256) -> grows to the square, bk shrinks 64->32
+    bm, bn, bk, _w, _s, _l2 = cls._matmul_tile(4096, 4096, 4096, 2, sm, 1)
+    assert (bm, bn, bk) == (256, 256, 32)
+    assert cls._matmul_tile(8192, 8192, 8192, 2, sm, 1)[:3] == (256, 256, 32)
+    # small M*N (2048^2 = 64 tiles << 148 SMs, wave_eff 0.43 < 0.8) -> keeps the wide [128, 256] tile
+    assert cls._matmul_tile(2048, 2048, 2048, 2, sm, 1)[:2] == (128, 256)
+    # a BATCHED dot (pinned_grid > 1, e.g. bmm batch=4) NEVER grows the square (the win inverts there)
+    assert cls._matmul_tile(4096, 4096, 4096, 2, sm, 4)[:2] == (128, 256)
+    assert cls._matmul_tile(2048, 2048, 2048, 2, sm, 8)[:2] == (128, 256)
