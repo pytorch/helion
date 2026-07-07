@@ -336,6 +336,16 @@ def shrink_block_sizes_for_numel_constraints(
 DEFAULT_NUM_WARPS = 4
 DEFAULT_NUM_STAGES = 1
 
+# Upper bound (power of two) that a matmul tile dimension's block size may reach
+# even when the dimension itself is smaller. Applied only to dimensions that
+# feed an hl.dot (see enforce_dot_requirements), so the autotuner can mask-
+# overshoot a small matmul dimension up to a hardware-friendly tile (e.g. an M
+# tile matching the native MMA shape). We restrict this to matmuls because such
+# kernels are memory/MMA-bound on the small dimension -- the masked-off rows/cols
+# are effectively free and the larger, hardware-aligned tile runs faster -- while
+# for elementwise/reduction kernels a larger-than-dimension tile is pure waste.
+SMALL_DIM_BLOCK_SIZE_OVERSHOOT = 64
+
 # Base backend tunable keys (public)
 _BASE_BACKEND_TUNABLE_KEYS: frozenset[str] = frozenset(
     {
@@ -2267,9 +2277,13 @@ class BlockSizeSpec(_PowerOfTwoBlockIdItem):
         bounded_hint = max(bounded_hint, 1)
         self.min_size: int = min_size
         self.autotuner_min: int = min_size
-        self.max_size: int = (
+        # Largest power-of-two block that fits inside the dimension. allow_overshoot
+        # may raise max_size above this for matmul dims, but the default block size
+        # stays clamped to dim_max_size (see _fragment).
+        self.dim_max_size: int = (
             next_power_of_2(bounded_hint) if max_size is None else max_size
         )
+        self.max_size: int = self.dim_max_size
         # Outer block_id whose tile extent caps this block's size in normalize().
         self.bounded_by_block_id: int | None = bounded_by_block_id
         if self.max_size < self.min_size:
@@ -2305,6 +2319,19 @@ class BlockSizeSpec(_PowerOfTwoBlockIdItem):
         clamped = max(value, 1)
         self.max_size = assert_integer_power_of_two(min(clamped, self.max_size))
 
+    def allow_overshoot(self, ceiling: int) -> None:
+        """Raise the autotuner search ceiling above the dimension size.
+
+        Used for matmul tile dimensions: a block larger than a small dimension
+        (with the extra rows/cols masked off) can map to a more efficient MMA
+        tile and run faster. Only the search ceiling grows; the default block
+        size stays clamped to the dimension (see _fragment). Dimensions bounded
+        by an outer tile extent are left untouched.
+        """
+        if self.bounded_by_block_id is not None:
+            return
+        self.max_size = max(self.max_size, next_power_of_2(max(ceiling, 1)))
+
     def update_hint(self, value: int) -> None:
         self.size_hint = value
         self.update_max(next_power_of_2(max(value, 1)))
@@ -2331,6 +2358,11 @@ class BlockSizeSpec(_PowerOfTwoBlockIdItem):
         else:
             default = 1
         low = min(max(self.min_size, self.autotuner_min), self.max_size)
+        # Clamp the default within the dimension so allow_overshoot only widens
+        # the autotuner *search*, never the default (non-autotuned) block size.
+        # Needed for matmul dims smaller than the heuristic default (e.g. M<16),
+        # where the default would otherwise overshoot to a masked tile.
+        default = min(default, self.dim_max_size)
         return BlockSizeFragment(
             low,
             self.max_size,
