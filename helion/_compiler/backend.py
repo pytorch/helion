@@ -1131,6 +1131,10 @@ class TritonBackend(Backend):
         )
         if triton_jit_fn is not None and hasattr(triton_jit_fn, "device_caches"):
             triton_jit_fn.device_caches.clear()
+            # The fast-launch cache (helion.runtime.default_launcher) also
+            # holds the compiled binary; drop it so the recompile isn't
+            # bypassed by a direct launch of the ephemeral artifact.
+            triton_jit_fn.__dict__.pop("_helion_fast_launch", None)
 
     def compiled_cache_key(
         self, bound_kernel: BoundKernel[Any], compiled_fn: object
