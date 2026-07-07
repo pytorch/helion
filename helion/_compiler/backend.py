@@ -1022,6 +1022,13 @@ class TritonBackend(Backend):
             from .._compat import supports_amd_cdna_tunables
 
             return supports_amd_cdna_tunables()
+        if key == "xcd_remap":
+            from .._compat import supports_amd_cdna_tunables
+
+            # Accepted on all AMD CDNA.  On single-XCD devices it normalizes to a
+            # no-op (ConfigSpec.normalize) and is excluded from the search space
+            # (ConfigSpec.flat_config) rather than rejected.
+            return supports_amd_cdna_tunables()
 
         from .._compat import get_mtia_tunable_fragments
         from .._compat import supports_mtia_tunables

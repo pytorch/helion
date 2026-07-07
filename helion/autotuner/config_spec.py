@@ -18,6 +18,8 @@ from torch._inductor.runtime.runtime_utils import next_power_of_2
 import torch.distributed as dist
 
 from .._compat import _regs_per_block
+from .._compat import device_num_sm
+from .._compat import get_num_xcd
 from .._compat import num_compute_units
 from .._compat import supports_amd_cdna_tunables
 from .._compat import supports_maxnreg
@@ -387,6 +389,7 @@ BACKEND_SPECIFIC_KEYS: frozenset[str] = (
         "store_cache_modifiers",
         "pallas_loop_type",
         "pallas_pre_broadcast",
+        "xcd_remap",
     }
 )
 VALID_KEYS: frozenset[str] = frozenset(
@@ -419,6 +422,7 @@ VALID_KEYS: frozenset[str] = frozenset(
         *BACKEND_TUNABLE_KEYS,
         "advanced_controls_file",
         "epilogue_subtile",
+        "xcd_remap",
         *_BACKEND_DIAGNOSTIC_CONFIG_KEYS,
         *_BACKEND_STRATEGY_CONFIG_KEYS,
         *FLASH_CONFIG_KEYS,
@@ -503,6 +507,8 @@ class ConfigSpec:
         target_device_capability: tuple[int, int]
         | object
         | None = _TARGET_DEVICE_CAPABILITY_UNSET,
+        device: torch.device | None = None,
+        num_sm: int | None = None,
     ) -> None:
         self.backend = backend
         self.backend_name = backend.name
@@ -524,6 +530,16 @@ class ConfigSpec:
                 "tuple[int, int] | None",
                 target_device_capability,
             )
+
+        # XCD count for the *compile* device, captured once so xcd_remap's
+        # support/search/normalize decisions match the device used in codegen
+        # (rather than the current device).  1 disables/no-ops xcd_remap.
+        self.num_xcd: int = get_num_xcd(device)
+        # Persistent grid SM/CU count of the compile device (after reserved_sms);
+        # used to check XCD-alignment of the persistent_interleaved grid stride.
+        # Defaults to the device CU count (consistent with num_xcd) when not
+        # passed explicitly by the compile path.
+        self.num_sm: int = num_sm if num_sm is not None else device_num_sm(device)
 
         self.block_sizes: BlockIdSequence[BlockSizeSpec] = BlockIdSequence()
         self.num_threads: BlockIdSequence[NumThreadsSpec] = BlockIdSequence()
@@ -1665,6 +1681,47 @@ class ConfigSpec:
             else:
                 config["pid_type"] = VALID_PID_TYPES[0]
 
+        if self.supports_config_key("xcd_remap"):
+            if "xcd_remap" in config:
+                if not isinstance(config["xcd_remap"], bool):
+                    raise InvalidConfig(
+                        f"Invalid value for 'xcd_remap': {config['xcd_remap']!r} must be a bool"
+                    )
+                if config["xcd_remap"]:
+                    pid_type = config.get("pid_type", "flat")
+                    if self.num_xcd <= 1:
+                        # No-op on single-XCD devices: silently disable rather
+                        # than reject (the remap is the identity at NUM_XCDS=1).
+                        config["xcd_remap"] = False
+                    elif pid_type not in (
+                        "flat",
+                        "persistent_blocked",
+                        "persistent_interleaved",
+                    ):
+                        # xcd_remap is only defined for flat and the persistent
+                        # (blocked / interleaved) PID strategies.
+                        if _fix_invalid:
+                            config["xcd_remap"] = False
+                        else:
+                            raise InvalidConfig(
+                                "xcd_remap=True requires pid_type in "
+                                "{'flat', 'persistent_blocked', 'persistent_interleaved'}"
+                            )
+                    elif pid_type == "persistent_interleaved":
+                        # interleaved remaps each virtual pid, so it needs the
+                        # persistent grid stride to be XCD-aligned (this can be
+                        # broken by reserved_sms); otherwise a worker spans
+                        # multiple XCD regions.  Silently disable (perf no-op).
+                        mult = config.get("num_sm_multiplier", 1)
+                        if not isinstance(mult, int) or mult < 1:
+                            mult = 1
+                        if (self.num_sm * mult) % self.num_xcd != 0:
+                            config["xcd_remap"] = False
+            else:
+                config["xcd_remap"] = False
+        else:
+            config.pop("xcd_remap", None)
+
         if _fix_invalid and self.backend_name == "cute":
             self._cute_tcgen05_config.fix_search_config(config)
 
@@ -2067,6 +2124,8 @@ class ConfigSpec:
             fields["atomic_indexing"] = self.atomic_indexing
         if self.supports_config_key("pid_type"):
             fields["pid_type"] = EnumFragment(self.allowed_pid_types)
+        if self.supports_config_key("xcd_remap") and self.num_xcd > 1:
+            fields["xcd_remap"] = BooleanFragment()
         if self.supports_config_key("num_sm_multiplier"):
             fields["num_sm_multiplier"] = PowerOfTwoFragment(
                 MIN_NUM_SM_MULTIPLIER,
