@@ -36,6 +36,8 @@ if TYPE_CHECKING:
     from collections.abc import Iterable
 
     import jax
+    from triton.compiler import CompiledKernel
+    from triton.runtime.jit import JITFunction
 
 log: logging.Logger = logging.getLogger(__name__)
 
@@ -169,6 +171,166 @@ def get_num_sm(device: torch.device, *, reserved_sms: int = 0) -> int:
     return max(available_sms - reserved_sms, 1)
 
 
+# Direct launch (controlled by the ``triton_direct_launch`` kernel setting,
+# on by default; see helion/runtime/settings.py for the full documentation).
+#
+# After a specialization has been compiled once through the regular
+# ``JITFunction.run`` path, repeat launches call the cached ``CompiledKernel``
+# handle directly, skipping option parsing, argument re-specialization,
+# cache-key stringification, hook dispatch, and launch-metadata construction.
+#
+# The direct path automatically falls back to ``JITFunction.run`` (which
+# re-validates everything) whenever it cannot guarantee an identical launch:
+# unseen argument metadata (dtype, scalar value, or 16-byte pointer alignment
+# -- all part of the cache key, so Triton's per-argument specialization axes
+# are covered), mutated ``used_global_vals`` (current global values are key
+# elements too, so a mutation is just a cache miss), extra launch kwargs,
+# active Triton hooks/knobs at prime time, torch.compile tracing, or any
+# exception while building the key.  These hazards cannot be caught *after*
+# a bad launch -- a misaligned launch surfaces as an asynchronous CUDA error
+# that poisons the context, and a stale captured global silently computes
+# wrong values -- so they are folded into the key and prevented up front
+# rather than detected afterwards.  The one intentional gap: Triton launch/pre-run
+# hooks and debug/instrumentation knobs are checked when a specialization is
+# first cached, not per call, so a profiler that registers launch hooks
+# *after* a kernel's first launch will not observe direct launches.  Set
+# ``triton_direct_launch=False`` (or HELION_TRITON_DIRECT_LAUNCH=0) to keep
+# every launch on the full ``JITFunction.run`` path.
+
+
+def _triton_direct_launch_ok(triton_kernel: JITFunction[object]) -> bool:
+    """One-time (per specialization) check that direct launching is safe.
+
+    Verifies no hook that ``JITFunction.run`` would have invoked is active
+    and no knob that feeds into launch behavior is set.  Called when caching
+    a compiled specialization, never on the per-launch hot path.
+    """
+    if triton_kernel.pre_run_hooks or triton_kernel.debug:
+        return False
+    import triton.knobs as knobs
+
+    rt = knobs.runtime
+    if rt.add_stages_inspection_hook is not None or rt.debug:
+        return False
+    for hook in (rt.launch_enter_hook, rt.launch_exit_hook):
+        # HookChain with empty ``calls`` is inactive; a plain user callable
+        # is always treated as active.
+        if hook is not None and getattr(hook, "calls", True):
+            return False
+    return not knobs.compilation.instrumentation_mode
+
+
+def _jit_function_run(
+    triton_kernel: JITFunction[object],
+    *args: object,
+    **run_kwargs: object,
+) -> object:
+    try:
+        return triton_kernel.run(*args, **run_kwargs)
+    except Exception as error:
+        message = str(error)
+        if "Cannot make_shape_compatible: incompatible dimensions" in message:
+            raise exc.ShapeMismatch("kernel operands", message) from error
+        raise
+
+
+_MISSING_GLOBAL = object()
+_TRITON_DRIVER: object = None
+
+
+def _triton_driver() -> object:
+    """Cache the Triton ``driver`` module so the direct-launch hot path
+    avoids a fresh ``from triton.runtime import driver`` import lookup on
+    every call."""
+    global _TRITON_DRIVER
+    if _TRITON_DRIVER is None:
+        from triton.runtime import driver
+
+        _TRITON_DRIVER = driver
+    return _TRITON_DRIVER
+
+
+def _direct_launch_populate(
+    triton_kernel: JITFunction[object],
+    compiled: CompiledKernel,
+    key: tuple[object, ...],
+    args: tuple[object, ...],
+) -> None:
+    """Cache a compiled specialization for direct launching.
+
+    The cache key is every launch argument (tensors contribute their dtype
+    and a 16-byte pointer-alignment bit, scalars their value) plus the
+    current value of every global Triton captured at compile time, plus
+    launch options and device.  Scalar values are strictly finer than the
+    buckets Triton specializes on (divisible-by-16, equals-1); dtype covers
+    pointer-type specialization when one ``JITFunction`` serves several
+    dtypes (``PyCodeCache`` dedups identical generated source, e.g. a
+    dtype-agnostic add kernel for bf16 and fp16); the alignment bit covers
+    Triton's pointer-alignment specialization, so an unaligned view arriving
+    after an aligned prime misses the cache and takes the slow path; global
+    values cover ``used_global_vals``, so a mutated global misses the cache
+    and the slow path raises Triton's own RuntimeError.
+    """
+    if not _triton_direct_launch_ok(triton_kernel):
+        return
+    state = triton_kernel.__dict__.get("_helion_direct_launch")
+    if state is None:
+        # Argument layout (which positions are tensors) is fixed per generated
+        # kernel, so bake the tensor/scalar split and the captured-globals
+        # lookups into a single compiled key function here; the hot path then
+        # builds the full key with no per-element type checks and no separate
+        # globals-guard loop.
+        tensor_idx = tuple(i for i, a in enumerate(args) if isinstance(a, torch.Tensor))
+        scalar_idx = tuple(
+            i for i in range(len(args)) if i not in frozenset(tensor_idx)
+        )
+        globals_guard = tuple(
+            (gdict, name)
+            for (name, _), (_val, gdict) in triton_kernel.used_global_vals.items()
+        )
+        make_key = _direct_launch_make_key_fn(tensor_idx, scalar_idx, globals_guard)
+        state = (make_key, {})
+        # pyrefly: ignore [missing-attribute]
+        triton_kernel._helion_direct_launch = state
+    state[1][(*key, *state[0](args))] = (
+        compiled.run,
+        compiled.function,
+        compiled.packed_metadata,
+        compiled,
+    )
+
+
+def _direct_launch_make_key_fn(
+    tensor_idx: tuple[int, ...],
+    scalar_idx: tuple[int, ...],
+    globals_guard: tuple[tuple[dict[str, object], str], ...],
+) -> Callable[[tuple[object, ...]], tuple[object, ...]]:
+    """Compile a flat key builder: scalar values, per-tensor dtype and
+    16-byte-alignment bit, then the current value of each captured global.
+
+    Compiling one expression per kernel (Triton's ``binder`` does the same)
+    roughly halves key-build time versus a generic generator plus a separate
+    globals-guard loop.  Concatenating the groups (rather than interleaving
+    in argument order) keeps the key unique because the tensor/scalar split
+    is fixed per generated kernel.  Every hazard is a key element, so any
+    deviation -- unseen scalar, new dtype, unaligned pointer, mutated or
+    deleted captured global, tensor/scalar mismatch (attribute error or an
+    identity-hashed tensor) -- is a cache miss that falls back to the slow
+    path; nothing needs to be caught after the launch (misalignment would be
+    an async CUDA error, a stale global would be silently wrong numerics).
+    """
+    namespace: dict[str, object] = {"_MISSING": _MISSING_GLOBAL}
+    parts = [f"a[{i}]" for i in scalar_idx]
+    for i in tensor_idx:
+        parts.extend((f"a[{i}].dtype", f"not a[{i}].data_ptr() & 15"))
+    for j, (gdict, name) in enumerate(globals_guard):
+        namespace[f"_g{j}"] = gdict
+        parts.append(f"_g{j}.get({name!r}, _MISSING)")
+    if not parts:
+        return lambda a: ()
+    return eval(f"lambda a: ({', '.join(parts)},)", namespace)
+
+
 def default_launcher(
     triton_kernel: object,
     grid: tuple[int, ...],
@@ -179,7 +341,112 @@ def default_launcher(
     launch_cooperative_grid: bool = False,
     **kwargs: dict,
 ) -> object:
-    """Default launcher function that executes the kernel immediately."""
+    """Default launcher function that executes the kernel immediately.
+
+    Repeat launches of an already-compiled specialization call the cached
+    ``CompiledKernel`` directly (see the direct-launch comment above).  Any
+    unsupported case or exception on the direct path falls back to the full
+    ``JITFunction.run`` path, which re-validates everything.  Kernels with
+    ``triton_direct_launch=False`` never reach this function; codegen binds
+    them to :func:`default_slow_launcher` instead.
+    """
+    if (
+        ptx_options is None
+        and not kwargs
+        and type(grid) is tuple
+        and not torch.compiler.is_compiling()
+    ):
+        state = triton_kernel.__dict__.get("_helion_direct_launch")  # type: ignore[union-attr]
+        if state is not None:
+            try:
+                # pyrefly: ignore [missing-attribute]
+                active = _triton_driver().active
+                device = active.get_current_device()
+                make_key, cache = state
+                cached = cache.get(
+                    (
+                        device,
+                        num_warps,
+                        num_stages,
+                        launch_cooperative_grid,
+                        *make_key(args),
+                    )
+                )
+                if cached is not None:
+                    # pyrefly: ignore [missing-attribute]
+                    stream = active.get_current_stream(device)
+                    kernel_run, kernel_function, packed_metadata, compiled = cached
+                    grid_size = len(grid)
+                    kernel_run(
+                        grid[0],
+                        grid[1] if grid_size > 1 else 1,
+                        grid[2] if grid_size > 2 else 1,
+                        stream,
+                        kernel_function,
+                        packed_metadata,
+                        None,  # launch_metadata (only consumed by launch hooks)
+                        None,  # launch_enter_hook
+                        None,  # launch_exit_hook
+                        *args,
+                    )
+                    return compiled
+            except Exception:
+                # Unhashable key element, stale cache entry (device reset,
+                # ...), or bad launch args: fall through to JITFunction.run,
+                # which re-validates and raises a proper error if the launch
+                # is genuinely broken.  (Unseen specializations and mutated
+                # captured globals are ordinary cache misses, not exceptions.)
+                pass
+
+    compiled = default_slow_launcher(
+        triton_kernel,
+        grid,
+        *args,
+        num_warps=num_warps,
+        num_stages=num_stages,
+        ptx_options=ptx_options,
+        launch_cooperative_grid=launch_cooperative_grid,
+        **kwargs,
+    )
+    if (
+        compiled is not None
+        and ptx_options is None
+        and not kwargs
+        and type(grid) is tuple
+        and not torch.compiler.is_compiling()
+    ):
+        # Population is best-effort: a failure (exotic args, driver quirk)
+        # only means later calls stay on the slow path.
+        with suppress(Exception):
+            # pyrefly: ignore [missing-attribute]
+            device = _triton_driver().active.get_current_device()
+            _direct_launch_populate(
+                # pyrefly: ignore [bad-argument-type]
+                triton_kernel,
+                # pyrefly: ignore [bad-argument-type]
+                compiled,
+                (device, num_warps, num_stages, launch_cooperative_grid),
+                args,
+            )
+    return compiled
+
+
+def default_slow_launcher(
+    triton_kernel: object,
+    grid: tuple[int, ...],
+    *args: object,
+    num_warps: int,
+    num_stages: int,
+    ptx_options: str | None = None,
+    launch_cooperative_grid: bool = False,
+    **kwargs: dict,
+) -> object:
+    """Launcher that always takes the full ``JITFunction.run`` path.
+
+    Kernels compiled with ``triton_direct_launch=False`` import this as
+    their ``_default_launcher`` (see ``TritonBackend.library_imports``), so
+    no direct-launch logic runs on their call path at all.
+    """
     # For both CUDA and MTIA, use the same kernel execution
     run_kwargs: dict = {
         "grid": grid,
@@ -191,16 +458,8 @@ def default_launcher(
     }
     if ptx_options is not None:
         run_kwargs["ptx_options"] = ptx_options
-    try:
-        return triton_kernel.run(  # type: ignore[union-attr]
-            *args,
-            **run_kwargs,
-        )
-    except Exception as error:
-        message = str(error)
-        if "Cannot make_shape_compatible: incompatible dimensions" in message:
-            raise exc.ShapeMismatch("kernel operands", message) from error
-        raise
+    # pyrefly: ignore [bad-argument-type]
+    return _jit_function_run(triton_kernel, *args, **run_kwargs)
 
 
 def _pallas_make_block_spec(

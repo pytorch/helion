@@ -1290,6 +1290,14 @@ class TestLauncher(TestCase):
         torch.accelerator.synchronize()
         torch.testing.assert_close(out, unaligned + unaligned)
 
+        # Interleave the two alignments: once both variants have been seen,
+        # repeat calls (which may each hit a cached fast path keyed on
+        # alignment) must keep dispatching to the right specialization.
+        for _ in range(3):
+            torch.testing.assert_close(add(aligned, aligned), aligned + aligned)
+            torch.testing.assert_close(add(unaligned, unaligned), unaligned + unaligned)
+        torch.accelerator.synchronize()
+
     def test_unaligned_writes_to_user_out_arg_land_on_original(self) -> None:
         """If the kernel writes to an unaligned user-supplied output
         buffer, those writes must land on the user's tensor (not on
@@ -1330,9 +1338,11 @@ class TestLauncher(TestCase):
         "exist in ref-eager mode"
     )
     def test_used_global_vals_mutation_raises(self) -> None:
-        """Mutating a tracked global (e.g. a ``_BLOCK_SIZE_*``
-        constexpr captured via ``used_global_vals``) between calls
-        must trigger ``RuntimeError`` from Triton's own guard."""
+        """Mutating or deleting a tracked global (e.g. a
+        ``_BLOCK_SIZE_*`` constexpr captured via ``used_global_vals``)
+        between calls must trigger ``RuntimeError`` from Triton's own
+        guard, and restoring the original value must return the kernel
+        to a working (and numerically correct) state."""
 
         @helion.kernel(
             static_shapes=True,
@@ -1360,13 +1370,81 @@ class TestLauncher(TestCase):
 
         (name, _gid), (val, gdict) = next(iter(ugv.items()))
         original = gdict[name]
-        gdict[name] = "MUTATED_NOPE"
         try:
+            gdict[name] = "MUTATED_NOPE"
+            with self.assertRaises(RuntimeError):
+                add(x, x)
+                torch.accelerator.synchronize()
+
+            del gdict[name]
             with self.assertRaises(RuntimeError):
                 add(x, x)
                 torch.accelerator.synchronize()
         finally:
             gdict[name] = original
+
+        # Restoring the original value must fully recover: repeated calls
+        # (which may hit a cached fast path) stay numerically correct.
+        for _ in range(2):
+            out = add(x, x)
+            torch.accelerator.synchronize()
+            torch.testing.assert_close(out, x + x)
+
+    @skipIfRefEager(
+        "Inspects the bound kernel's Triton JITFunction, which doesn't "
+        "exist in ref-eager mode"
+    )
+    def test_direct_launch_cache_engages(self) -> None:
+        """With ``triton_direct_launch`` on (the default), the first
+        launch must populate the direct-launch cache with one entry per
+        distinct specialization, so repeat calls skip
+        ``JITFunction.run``.  This is the perf half of the contract:
+        the other tests prove fallback correctness, this one proves the
+        fast path actually engages."""
+
+        @helion.kernel(
+            static_shapes=True,
+            config=helion.Config(block_sizes=[1024], num_warps=4, num_stages=2),
+        )
+        def add(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for i in hl.tile(out.size(0)):
+                out[i] = x[i] + y[i]
+            return out
+
+        n = 1024
+        base = torch.randn(n + 4, device=DEVICE, dtype=torch.float32)
+        aligned = base[:n]
+        unaligned = base[1 : n + 1]
+
+        add(aligned, aligned)
+        torch.accelerator.synchronize()
+
+        from triton.runtime.jit import JITFunction
+
+        bound = next(iter(add._bound_kernels.values()))  # type: ignore[attr-defined]
+        jit_fn = next(
+            v for v in bound._run.__globals__.values() if isinstance(v, JITFunction)
+        )
+        state = jit_fn.__dict__.get("_helion_direct_launch")
+        if state is None:
+            self.skipTest(
+                "Direct launch did not engage (disabled via setting/env, or "
+                "hooks/knobs active in this run)"
+            )
+        _make_key, cache = state
+        self.assertEqual(len(cache), 1)
+
+        # A repeat call with the same specialization must reuse the entry...
+        torch.testing.assert_close(add(aligned, aligned), aligned + aligned)
+        torch.accelerator.synchronize()
+        self.assertEqual(len(cache), 1)
+
+        # ...while a second specialization (unaligned pointers) gets its own
+        # entry after its slow-path prime, keyed apart by the alignment bit.
+        torch.testing.assert_close(add(unaligned, unaligned), unaligned + unaligned)
+        torch.accelerator.synchronize()
+        self.assertEqual(len(cache), 2)
 
     def test_correct_result_on_each_cuda_device(self) -> None:
         """The same kernel called on ``cuda:0`` then ``cuda:1`` must

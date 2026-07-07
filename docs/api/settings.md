@@ -115,6 +115,25 @@ def my_kernel(x: torch.Tensor) -> torch.Tensor:
 
    Reserve this many streaming multiprocessors when launching persistent kernels. Default is ``0`` (use all SMs).
    Configure globally with ``HELION_PERSISTENT_RESERVED_SMS`` or per-kernel via ``@helion.kernel(..., persistent_reserved_sms=N)``.
+
+.. autoattribute:: Settings.triton_direct_launch
+
+   If ``True`` (default), repeat launches of an already-compiled Triton specialization skip
+   ``JITFunction.run`` and invoke the cached compiled kernel directly, substantially reducing
+   per-call launch overhead. Triton-only; the setting is accepted but ignored on other backends.
+   Disable per-kernel with ``@helion.kernel(triton_direct_launch=False)`` or globally with
+   ``HELION_TRITON_DIRECT_LAUNCH=0``.
+
+   The direct path automatically falls back to the full ``JITFunction.run`` path whenever it
+   cannot guarantee an identical launch: unaligned (non-16-byte) tensor pointer arguments,
+   mutated ``used_global_vals`` (globals captured by the generated kernel), extra launch kwargs
+   such as ``ptx_options``, Triton launch/pre-run hooks or debug/instrumentation knobs active
+   when the kernel is first launched, and ``torch.compile`` tracing all take the slow path.
+
+   One case is *not* auto-detected and requires opting out: Triton launch/pre-run hooks or
+   knobs registered *after* a kernel's first launch are not re-checked on each call, so a
+   profiler that attaches launch hooks mid-run will not observe direct launches. Set
+   ``triton_direct_launch=False`` for kernels that must always be visible to such hooks.
 ```
 
 ### Autotuning Settings
@@ -320,6 +339,7 @@ Built-in values for ``HELION_AUTOTUNER`` include ``"LFBOTreeSearch"`` (default),
 | ``HELION_STATIC_SHAPES`` | ``static_shapes`` | Set to ``0``/``false`` to disable global static shape specialization. |
 | ``HELION_FAST_MATH`` | ``fast_math`` | Set to ``1`` to enable fast math approximations (Helion-level and Inductor-level). May reduce numerical precision. |
 | ``HELION_PERSISTENT_RESERVED_SMS`` | ``persistent_reserved_sms`` | Reserve this many streaming multiprocessors when launching persistent kernels (``0`` uses all available SMs). |
+| ``HELION_TRITON_DIRECT_LAUNCH`` | ``triton_direct_launch`` | Set to ``0`` to disable the Triton direct-launch fast path and route every launch through ``JITFunction.run``. |
 | ``HELION_FORCE_AUTOTUNE`` | ``force_autotune`` | Force the autotuner to run even when explicit configs are provided. The result is saved to the cache. |
 | ``HELION_AUTOTUNE_FORCE_PERSISTENT`` | ``autotune_force_persistent`` | Restrict ``pid_type`` to persistent kernel strategies during config search. |
 | ``HELION_DISALLOW_AUTOTUNING`` | ``check_autotuning_disabled`` | Hard-disable autotuning; kernels must supply explicit configs when this is ``1``. |

@@ -1131,6 +1131,10 @@ class TritonBackend(Backend):
         )
         if triton_jit_fn is not None and hasattr(triton_jit_fn, "device_caches"):
             triton_jit_fn.device_caches.clear()
+            # The direct-launch cache (helion.runtime.default_launcher) also
+            # holds the compiled binary; drop it so the recompile isn't
+            # bypassed by a direct launch of the ephemeral artifact.
+            triton_jit_fn.__dict__.pop("_helion_direct_launch", None)
 
     def compiled_cache_key(
         self, bound_kernel: BoundKernel[Any], compiled_fn: object
@@ -1287,6 +1291,18 @@ class TritonBackend(Backend):
 
     @property
     def library_imports(self) -> dict[str, str]:
+        from .compile_environment import CompileEnvironment
+        from .compile_environment import NoCurrentEnvironment
+
+        # The triton_direct_launch setting is resolved here, at codegen time,
+        # so the per-call path pays no cost for the choice: opted-out kernels
+        # import the always-slow launcher as _default_launcher.
+        launcher = "default_launcher"
+        try:
+            if not CompileEnvironment.current().settings.triton_direct_launch:
+                launcher = "default_slow_launcher"
+        except NoCurrentEnvironment:
+            pass
         return {
             "math": "import math",
             "operator": "import operator",
@@ -1298,7 +1314,7 @@ class TritonBackend(Backend):
             "triton_helpers": "from torch._inductor.runtime import triton_helpers",
             "tl_math": "from torch._inductor.runtime.triton_helpers import math as tl_math",
             "libdevice": "from torch._inductor.runtime.triton_compat import libdevice",
-            "_default_launcher": "from helion.runtime import default_launcher as _default_launcher",
+            "_default_launcher": f"from helion.runtime import {launcher} as _default_launcher",
             "fast_dividef": "from triton.language.extra.libdevice import fast_dividef",
             "fast_expf": "from triton.language.extra.libdevice import fast_expf",
         }
