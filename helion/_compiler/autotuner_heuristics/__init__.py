@@ -17,6 +17,7 @@ from .cute import CuteTileVecWarpReduceHeuristic
 from .pallas import PallasMatmulF32NoTilingSeedHeuristic
 from .pallas import PallasMatmulNoTilingSeedHeuristic
 from .triton import TritonB200MatmulHeuristic
+from .triton import TritonH100MatmulHeuristic
 from .triton import TritonMatmulReductionEpilogueHeuristic
 from .triton import TritonPointwiseSeedHeuristic
 from .triton import TritonSkinnyGemmHeuristic
@@ -44,6 +45,10 @@ HEURISTICS_BY_BACKEND: dict[str, tuple[AutotunerHeuristicType, ...]] = {
         CuteTileVecWarpPerRowHeuristic,
     ),
     "triton": (
+        # H100 dense matmul seed FIRST so its budget-formula config is the rank-0
+        # (Product-A) seed for every clean 2-D static GEMM; the skinny rule below still
+        # plants its config as a later search seed for aspect>=8 shapes.
+        TritonH100MatmulHeuristic,
         TritonSkinnyGemmHeuristic,
         TritonB200MatmulHeuristic,
         TritonMatmulReductionEpilogueHeuristic,
@@ -79,7 +84,14 @@ def compiler_seed_configs(
             if not heuristic.is_eligible(env, device_ir):
                 continue
 
-            config = heuristic.get_seed_config(env, device_ir)
+            # A heuristic may plant a RANKED multi-seed list (get_seed_configs);
+            # the single get_seed_config is the primary (== the list's [0]). The
+            # default base hook returns None, so existing single-seed heuristics
+            # keep their exact behavior.
+            ranked = heuristic.get_seed_configs(env, device_ir)
+            if ranked is None:
+                config = heuristic.get_seed_config(env, device_ir)
+                ranked = [config] if config is not None else []
         except Exception as e:
             log.debug(
                 "Autotuner heuristic %s failed while generating compiler seed config: %s",
@@ -88,10 +100,12 @@ def compiler_seed_configs(
                 exc_info=True,
             )
             continue
-        if config is None:
+        ranked = [c for c in ranked if c is not None]
+        if not ranked:
             continue
-        configs.append(config)
+        configs.extend(ranked)
         if heuristic.promote_seed_to_default:
-            env.config_spec.compiler_default_config = config
+            # The primary (rank-0) is the promoted default.
+            env.config_spec.compiler_default_config = ranked[0]
         env.config_spec.autotuner_heuristics.append(heuristic.name)
     return dedupe_configs(configs)

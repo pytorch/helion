@@ -1936,6 +1936,12 @@ class ConfigSpec:
         if self.compiler_default_config is None:
             return self._base_default_config()
         config = helion.Config.from_dict(self.compiler_default_config.config)
+        # Normalize so a promoted compiler default has the same fully-populated,
+        # canonical field set as the ``_base_default_config`` path. A seed config is
+        # sparsely constructed (only the fields the heuristic set), so without this its
+        # ``repr``/equality differs from its own flatten/unflatten round-trip, which
+        # breaks callers that key on the config identity (e.g. benchmark result maps).
+        self.normalize(config, _fix_invalid=True)
         self._shrink_for_numel_constraints(config)
         return config
 

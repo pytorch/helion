@@ -3,6 +3,7 @@ from __future__ import annotations
 import collections
 import contextlib
 import dataclasses
+import importlib.util
 import inspect
 import multiprocessing as mp
 from multiprocessing import connection
@@ -99,6 +100,13 @@ class SerializedCompiledFunction:
     source_code: str
     filename: str | None
     module_name: str | None
+    # (origin_module_name, origin_file_path) for every kernel-source module the
+    # generated code imports (e.g. `import <origin> as _source_module` for a
+    # module-global like a dtype constant). The worker re-registers these from
+    # their files before exec so the import resolves even when the origin module
+    # name is not importable in a fresh process (notebook / exec / import-by-path
+    # kernels, whose synthetic module name only exists in the parent).
+    source_modules: list[tuple[str, str]] = dataclasses.field(default_factory=list)
 
 
 @dataclasses.dataclass
@@ -139,10 +147,92 @@ def _serialize_compiled_fn(fn: CompiledConfig) -> SerializedCompiledFunction:
         source_code=source_code,
         filename=filename,
         module_name=module_name,
+        source_modules=_collect_source_modules(module),
     )
 
 
+def _collect_source_modules(module: types.ModuleType | None) -> list[tuple[str, str]]:
+    """Capture (name, file) for every kernel-origin module the generated module
+    imports into its globals.
+
+    Helion codegen emits ``import <origin> as _source_module`` (and
+    ``_global_source<N>`` for other modules) whenever the kernel references a
+    module-global. The worker re-execs the generated source in a fresh process,
+    so any such import must resolve there. A kernel defined in a normal importable
+    module is fine, but one loaded by path / exec / notebook lives under a
+    synthetic module name that only exists in the parent process. Shipping the
+    origin module's real file lets the worker re-register it under the same name.
+    """
+    if module is None:
+        return []
+    out: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for value in vars(module).values():
+        if not isinstance(value, types.ModuleType):
+            continue
+        name = getattr(value, "__name__", None)
+        file = getattr(value, "__file__", None)
+        if not isinstance(name, str) or name in seen:
+            continue
+        if not isinstance(file, str) or not os.path.exists(file):
+            continue
+        # Skip modules a fresh worker can import on its own (real packages like
+        # torch/triton, or an example on PYTHONPATH) -- shipping/re-exec'ing them
+        # would be wasteful or harmful. A by-path / notebook / exec module lives
+        # under a synthetic name that only the parent's sys.modules knows about,
+        # so it is NOT freshly importable and gets shipped with its real file.
+        if _is_freshly_importable(name, file):
+            continue
+        seen.add(name)
+        out.append((name, file))
+    return out
+
+
+def _is_freshly_importable(name: str, loaded_file: str) -> bool:
+    """Would a fresh process import ``name`` and get the file we actually loaded?
+
+    ``importlib.util.find_spec`` normally returns the cached ``sys.modules``
+    entry, which would mask synthetic by-path modules. Temporarily drop the
+    cached entry (restoring it afterwards) so the lookup reflects what a worker
+    -- with an empty module cache -- would resolve.
+    """
+    saved = sys.modules.pop(name, None)
+    try:
+        spec = importlib.util.find_spec(name)
+    except Exception:
+        spec = None
+    finally:
+        if saved is not None:
+            sys.modules[name] = saved
+    origin = getattr(spec, "origin", None)
+    if not isinstance(origin, str):
+        return False
+    return os.path.realpath(origin) == os.path.realpath(loaded_file)
+
+
+def _register_source_module(name: str, file: str) -> None:
+    """Re-register a kernel-origin module from its file under ``name`` so the
+    generated code's ``import <name> as _source_module`` resolves in the worker.
+
+    No-op if the name is already present (e.g. a real importable package the
+    serializer chose not to ship, or a sibling job already loaded it)."""
+    if name in sys.modules:
+        return
+    spec = importlib.util.spec_from_file_location(name, file)
+    if spec is None or spec.loader is None:
+        return
+    module = importlib.util.module_from_spec(spec)
+    # Register BEFORE exec so self-references / decorators resolve by name.
+    sys.modules[name] = module
+    # Leave a best-effort partial module rather than crashing the worker; if the
+    # import is actually needed the generated exec will surface a clear error.
+    with contextlib.suppress(Exception):
+        spec.loader.exec_module(module)
+
+
 def _load_compiled_fn(fn_spec: SerializedCompiledFunction) -> CompiledConfig:
+    for origin_name, origin_file in fn_spec.source_modules:
+        _register_source_module(origin_name, origin_file)
     module_name = f"_helion_autotune_subprocess_{uuid.uuid4().hex}"
     module = types.ModuleType(module_name)
     module.__file__ = fn_spec.filename or "<helion-autotune-subprocess>"

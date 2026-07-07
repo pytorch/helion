@@ -3,6 +3,7 @@ from __future__ import annotations
 from contextlib import contextmanager
 from contextlib import nullcontext
 import csv
+import functools
 import logging
 import math
 import multiprocessing as mp
@@ -28,6 +29,7 @@ import torch
 
 import helion
 from helion import _compat
+from helion import _hardware
 from helion import exc
 from helion._compiler.tile_dispatch import BlockIDStrategyMapping
 from helion._compiler.tile_dispatch import TileStrategyDispatch
@@ -106,6 +108,50 @@ def clean_final_rebenchmark_env(**overrides: str):
 def _get_examples_matmul():
     """Lazy accessor to avoid CUDA init during pytest-xdist collection."""
     return import_path(examples_dir / "matmul.py").matmul
+
+
+# Pin the compute capability for config-space golden tests. The matmul-seed
+# heuristics are hardware-gated (the H100 formula fires on sm90, the B200 table on
+# sm100), so which compiler seed configs get injected into ``random_population``
+# depends on the CI runner's GPU. Force a fixed capability so the golden is stable
+# across every runner (H100/B200/A10G) and does not shift as new sm-gated seed
+# heuristics are added. sm90 is used because ``examples/matmul.py`` is a clean 2-D
+# static GEMM that the sm90 budget-formula seed fires on.
+_SM90_HARDWARE = _hardware.HardwareInfo(
+    device_kind="cuda",
+    hardware_name="NVIDIA H100",
+    runtime_version="12.8",
+    compute_capability="sm90",
+)
+
+
+def _pin_sm90(fn):
+    """Run ``fn`` with ``get_hardware_info`` pinned to sm90, and evict the shared
+    ``examples/matmul`` bound-kernel cache on both entry and exit.
+
+    The pin only patches ``get_hardware_info``; the ``Kernel`` bind cache keys on the
+    *real* device capability instead (``_device_specialization_key``). Without the
+    eviction, a config computed under this pin (the sm90 budget-formula seed, e.g.
+    ``block_sizes=[64, 64, 64], num_stages=6``) is cached against the real-GPU key and
+    then reused by a later *un-pinned* test that actually compiles/executes it — which
+    OOMs on a smaller GPU (A10G's 99KB shared memory). Clearing on entry gives this test
+    a clean compute; clearing on exit guarantees no sm90-simulated config leaks into a
+    test that runs on the true hardware.
+    """
+
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        matmul = _get_examples_matmul()
+        with patch.object(
+            _hardware, "get_hardware_info", lambda device=None: _SM90_HARDWARE
+        ):
+            matmul._bound_kernels.clear()
+            try:
+                return fn(*args, **kwargs)
+            finally:
+                matmul._bound_kernels.clear()
+
+    return wrapper
 
 
 @contextmanager
@@ -883,6 +929,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         super().setUp()
         random.seed(112)
 
+    @_pin_sm90
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: True)
     @patch.object(_compat, "_min_dot_size", lambda *args: (16, 16, 16))
     @patch.object(_compat, "_supports_maxnreg", lambda: True)
@@ -941,6 +988,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         configs = ConfigGeneration(spec, overrides=overrides).random_population(10)
         self.assertExpectedJournal("\n".join(map(repr, configs)))
 
+    @_pin_sm90
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: True)
     @patch.object(_compat, "_min_dot_size", lambda *args: (16, 16, 16))
     @patch.object(_compat, "_supports_maxnreg", lambda: True)
