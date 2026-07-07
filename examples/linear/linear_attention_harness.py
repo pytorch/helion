@@ -23,6 +23,13 @@ from .linear_attention_utils import head_to_time_first as _htf
 from .linear_attention_utils import rel_error as _rel_error
 from helion._testing import DEVICE
 
+# Test/benchmark config
+DTYPE = torch.bfloat16
+TEST_SHAPE = (2, 4, 128, 32, 32)
+TEST_C = 32
+BENCH_CONFIGS = [(1, 32, 2048, 128, 128), (1, 32, 4096, 128, 128)]
+BENCH_C = 64
+
 
 @dataclass
 class Inputs:
@@ -48,30 +55,26 @@ class LinearAttentionVariant:
     helion_fb: Callable[[Inputs, torch.Tensor, int], None]
     reference: Callable[[Inputs], torch.Tensor]
     chunked_reference: Callable[[Inputs, int], torch.Tensor]
-    test_shape: tuple[int, int, int, int, int]
-    C: int
-    bench_configs: list[tuple[int, int, int, int, int]]
-    bench_C: int
     fla_fwd: Callable[[Inputs, float], torch.Tensor] | None = None
     fla_fb: Callable[[Inputs, torch.Tensor, float], None] | None = None
     check_recurrent: bool = True
     grad_tensors: tuple[str, ...] = ("q", "k", "v")
-    dtype: torch.dtype = torch.bfloat16
+    dtype: torch.dtype = DTYPE
 
     # test / benchmark / accuracy: the module-level API run_linattn.py imports.
     def test(self) -> None:
-        run_test(self, self.test_shape, self.C)
+        run_test(self, TEST_SHAPE, TEST_C)
 
     def benchmark(
         self, configs: list | None = None
     ) -> list[tuple[str, float, float, float, float]]:
         return run_benchmark(
-            self, configs if configs is not None else self.bench_configs, self.bench_C
+            self, configs if configs is not None else BENCH_CONFIGS, BENCH_C
         )
 
     def accuracy(self, configs: list | None = None) -> list[tuple[str, str]]:
         return run_accuracy(
-            self, configs if configs is not None else self.bench_configs, self.bench_C
+            self, configs if configs is not None else BENCH_CONFIGS, BENCH_C
         )
 
 

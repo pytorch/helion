@@ -89,7 +89,7 @@ def write_results_json(
             continue
         labels = [s[0] for s in SHAPES[: len(rows)]]
         vrd = verdicts.get(variant, [])
-        # ok / REF-ERR -> 1.0; FAIL / HEL-ERR -> 0.0. 
+        # ok / REF-ERR -> 1.0; FAIL / HEL-ERR -> 0.0.
         fwd_ok = [0.0 if v[0] in ("FAIL", "HEL-ERR") else 1.0 for v in vrd]
         bwd_ok = [0.0 if v[1] in ("FAIL", "HEL-ERR") else 1.0 for v in vrd]
         # Forward: Helion accuracy + latency + speedup vs FLA; FLA reported at

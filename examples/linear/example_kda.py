@@ -16,6 +16,7 @@ import torch
 import torch.nn.functional as F
 
 from .linear_attention_engine import chunked_linear_attn
+from .linear_attention_harness import DTYPE
 from .linear_attention_harness import Inputs
 from .linear_attention_harness import LinearAttentionVariant
 from .linear_attention_utils import chunked_linear_attn_reference
@@ -27,13 +28,6 @@ try:
 except ImportError:
     _fla_chunk = None
 _fla_chunk_kda: Any = _fla_chunk
-
-# Test/benchmark config (DV=32 for correction variants)
-B, H, T, D, DV = 2, 4, 128, 32, 32
-C = 32
-DTYPE = torch.bfloat16
-BENCH_CONFIGS = [(1, 32, 2048, 128, 128), (1, 32, 4096, 128, 128)]
-BENCH_C = 64
 
 
 def _make_inputs(
@@ -96,14 +90,9 @@ VARIANT = LinearAttentionVariant(
     helion_fb=_helion_fb,
     reference=_reference,
     chunked_reference=_chunked_reference,
-    test_shape=(B, H, T, D, DV),
-    C=C,
-    bench_configs=BENCH_CONFIGS,
-    bench_C=BENCH_C,
     fla_fwd=_fla_fwd if _fla_chunk else None,
     fla_fb=_fla_fb if _fla_chunk else None,
     grad_tensors=("q", "v"),
-    dtype=DTYPE,
 )
 
 # Module API consumed by run_linattn.py: test / benchmark / accuracy.
