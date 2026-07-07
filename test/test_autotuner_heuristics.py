@@ -16,8 +16,8 @@ from helion._compiler.autotuner_heuristics.cute import CuteFlashAttentionHeurist
 from helion._compiler.autotuner_heuristics.cute import CuteFp8GemmSkinnyMHeuristic
 from helion._compiler.autotuner_heuristics.cute import CuteTcgen05ClusterM2Heuristic
 from helion._compiler.autotuner_heuristics.registry import AutotunerHeuristic
+from helion._compiler.autotuner_heuristics.triton import TritonPointwiseSeedHeuristic
 from helion._compiler.autotuner_heuristics.triton import TritonSkinnyGemmHeuristic
-from helion._compiler.autotuner_heuristics.triton import TritonSplitJoinRotateHeuristic
 from helion._compiler.autotuner_heuristics.triton import (
     TritonStandardReductionHeuristic,
 )
@@ -422,8 +422,13 @@ class TestMatmulFacts(TestCase):
 
             self.assertEqual(len(bound.config_spec.matmul_facts), expected_facts)
             if expected_facts == 0:
-                self.assertEqual(bound.config_spec.compiler_seed_configs, [])
-                self.assertEqual(bound.config_spec.autotuner_heuristics, [])
+                # No matmul fact: a pure-pointwise kernel (triton_add) is instead seeded by
+                # TritonPointwiseSeedHeuristic. Assert it routes there (one seed config), not
+                # the pre-pointwise-heuristic expectation of no seed at all.
+                self.assertEqual(
+                    bound.config_spec.autotuner_heuristics, ["triton_pointwise"]
+                )
+                self.assertEqual(len(bound.config_spec.compiler_seed_configs), 1)
             for fact in bound.config_spec.matmul_facts:
                 self.assertEqual(fact.lhs_ndim, 2)
                 self.assertEqual(fact.rhs_ndim, 2)
@@ -664,23 +669,15 @@ class TestTritonSkinnyGemmHeuristic(TestCase):
                     )
 
 
-class TestTritonSplitJoinRotateHeuristic(TestCase):
-    """Rope split/join "rotate" heuristic: seeds all-ones ``block_sizes`` and
-    fires only for a split/join rotate kernel, not a plain elementwise one.
+class TestRopePointwiseSeed(TestCase):
+    """Rope (split/join rotate) is handled by the pointwise seed: its heavy untiled
+    [heads, head_dim] slab collapses the tunable tile, while a plain elementwise kernel
+    of the same dtype gets a bandwidth-sized tile.
     """
-
-    def test_seed_config_is_all_ones(self) -> None:
-        spec = ConfigSpec(backend=TritonBackend())
-        spec.block_sizes.append(BlockSizeSpec(block_id=0, size_hint=2048))
-        spec.block_sizes.append(BlockSizeSpec(block_id=1, size_hint=2048))
-        env = MagicMock()
-        env.config_spec = spec
-        config = TritonSplitJoinRotateHeuristic.get_seed_config(env, MagicMock())
-        self.assertEqual(config.config["block_sizes"], [1, 1])
 
     @onlyBackends(["triton"])
     @skipIfRefEager("Compiler heuristics are not collected in ref eager mode")
-    def test_fires_for_rope_not_elementwise(self) -> None:
+    def test_rope_collapses_tile_elementwise_does_not(self) -> None:
         @helion.kernel(backend="triton")
         def rope_like(
             q: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
@@ -725,27 +722,31 @@ class TestTritonSplitJoinRotateHeuristic(TestCase):
         angles = torch.randn(2, 256, 64, device=DEVICE, dtype=HALF_DTYPE)
         rope = rope_like.bind((q, torch.cos(angles), torch.sin(angles)))
         self.assertTrue(
-            TritonSplitJoinRotateHeuristic.is_eligible(
+            TritonPointwiseSeedHeuristic.is_eligible(
                 rope.env, rope.host_function.device_ir
             )
         )
-        seed = TritonSplitJoinRotateHeuristic.get_seed_config(
-            rope.env, rope.host_function.device_ir
-        )
-        self.assertEqual(
-            seed.config["block_sizes"], [1] * len(rope.config_spec.block_sizes)
-        )
+        with rope.env:
+            rope_seed = TritonPointwiseSeedHeuristic.get_seed_config(
+                rope.env, rope.host_function.device_ir
+            )
+        # Heavy untiled [heads, head_dim] slab → the tunable tile collapses (not tiled past ~1).
+        self.assertLessEqual(math.prod(rope_seed.config["block_sizes"]), 8)
 
         xy = (
             torch.randn(512, 512, device=DEVICE, dtype=HALF_DTYPE),
             torch.randn(512, 512, device=DEVICE, dtype=HALF_DTYPE),
         )
         ew = elementwise.bind(xy)
-        self.assertFalse(
-            TritonSplitJoinRotateHeuristic.is_eligible(
+        self.assertTrue(
+            TritonPointwiseSeedHeuristic.is_eligible(ew.env, ew.host_function.device_ir)
+        )
+        with ew.env:
+            ew_seed = TritonPointwiseSeedHeuristic.get_seed_config(
                 ew.env, ew.host_function.device_ir
             )
-        )
+        # Plain elementwise (no slab) → a bandwidth-sized tile, not collapsed.
+        self.assertGreater(math.prod(ew_seed.config["block_sizes"]), 8)
 
 
 class TestTritonStandardReductionHeuristic(TestCase):
