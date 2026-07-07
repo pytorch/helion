@@ -176,6 +176,10 @@ class PatternSearch(PopulationBasedSearch):
             new_population = {id(prior_best): prior_best}
             num_neighbors = 0
             num_active = 0
+
+            # Set current generation for dynamic fragments
+            self.config_gen.current_generation = generation
+
             for search_copy in search_copies:
                 added = next(search_copy, ())
                 if added:

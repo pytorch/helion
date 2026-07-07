@@ -82,6 +82,8 @@ class AutotuneEffortProfile:
     llm_search: LLMSearchConfig | None = None
     finishing_rounds: int = 0
     rebenchmark_threshold: float = 1.5
+    autotune_max_grid_folding_factor: int | None = None
+    autotune_grid_folding_min_generation: int | None = None
 
 
 _PROFILES: dict[AutotuneEffort, AutotuneEffortProfile] = {
@@ -118,6 +120,7 @@ _PROFILES: dict[AutotuneEffort, AutotuneEffortProfile] = {
         llm_search=QUICK_LLM_SEARCH_DEFAULTS,
         finishing_rounds=0,
         rebenchmark_threshold=0.9,  # <1.0 effectively disables rebenchmarking
+        autotune_max_grid_folding_factor=0,  # Disable grid folding to reduce search space
     ),
     "full": AutotuneEffortProfile(
         pattern_search=PATTERN_SEARCH_DEFAULTS,
@@ -125,6 +128,7 @@ _PROFILES: dict[AutotuneEffort, AutotuneEffortProfile] = {
         differential_evolution=DIFFERENTIAL_EVOLUTION_DEFAULTS,
         random_search=RANDOM_SEARCH_DEFAULTS,
         llm_search=LLM_SEARCH_DEFAULTS,
+        autotune_grid_folding_min_generation=10,
     ),
 }
 

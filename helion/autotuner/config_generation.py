@@ -75,6 +75,13 @@ class ConfigGeneration:
             advanced_controls_files=advanced_controls_files,
         )
         assert self.flat_spec, "No config values to tune"
+
+        # Set config_gen reference on DynamicGridFoldingFragment instances
+        from .config_fragment import DynamicGridFoldingFragment
+
+        for spec in self.flat_spec:
+            if isinstance(spec, DynamicGridFoldingFragment):
+                spec._config_gen = self
         self._override_values = dict(overrides or {})
         self.block_size_indices: list[int] = [
             i
@@ -101,6 +108,7 @@ class ConfigGeneration:
             if config_spec.block_sizes
             else 1
         )
+        self.current_generation: int = 0
 
     def _init_cute_num_thread_pairs(self) -> None:
         """Pair each CuTe num_threads flat slot with its block_size slot."""
