@@ -15,6 +15,8 @@ Parameterized by:
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+from enum import Enum
 from typing import Any
 from typing import Callable
 from typing import Literal
@@ -1886,3 +1888,65 @@ def chunked_linear_attn(
     if return_final_state:
         return o, final_state
     return o
+
+
+# ════════════════════════════════════════════════════════════════════════════════
+# Kernel variants
+# ════════════════════════════════════════════════════════════════════════════════
+
+
+class DecayType(Enum):
+    """A variant's decay gate."""
+
+    NONE = "none"  # vanilla linear attention
+    SCALAR = "scalar"  # one gate per (head, position): simple GLA, retention
+    DIAGONAL = "diagonal"  # one gate per channel: full GLA, KDA
+
+
+@dataclass(frozen=True)
+class LinearAttentionVariant:
+    """A chunked-linear-attention variant: its decay, and whether it applies the
+    delta-rule correction."""
+
+    decay: DecayType = DecayType.NONE
+    correction: bool = False
+
+    def get_fwd_kernel(self) -> Callable[..., torch.Tensor]:
+        """Return a Helion forward kernel for this variant.
+
+            kernel = LinearAttentionVariant(DecayType.SCALAR, True).get_fwd_kernel()
+            o = kernel(q, k, v, g=g, beta=beta, scale=scale)
+        """
+        no_decay = self.decay is DecayType.NONE
+        correction = self.correction
+        # Only vanilla (no decay, no correction) has a kernel that folds scale
+        # in-register; every other path pre-scales q.
+        fold_scale = no_decay and not correction
+
+        def kernel(
+            q: torch.Tensor,
+            k: torch.Tensor,
+            v: torch.Tensor,
+            g: torch.Tensor | None = None,
+            beta: torch.Tensor | None = None,
+            *,
+            C: int = 64,
+            scale: float = 1.0,
+            initial_state: torch.Tensor | None = None,
+            return_final_state: bool = False,
+            head_first: bool = True,
+        ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+            return chunked_linear_attn(
+                q if fold_scale else q * scale,
+                k,
+                v,
+                None if fold_scale else g,
+                beta=beta if correction else None,
+                C=C,
+                scale=scale if fold_scale else 1.0,
+                initial_state=initial_state,
+                return_final_state=return_final_state,
+                head_first=head_first,
+            )
+
+        return kernel

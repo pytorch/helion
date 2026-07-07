@@ -1,8 +1,8 @@
 """Shared test / benchmark / accuracy for the linear-attention example variants.
 
-Each example builds a `LinearAttentionVariant` describing how to run its variant
-(make inputs, call Helion, call FLA, build references), then calls run_test /
-run_benchmark / run_accuracy here.
+Each example builds a `LinearAttentionHarness` naming its kernel variant,
+how to make inputs, and how to call FLA, then calls run_test / run_benchmark /
+run_accuracy here.
 """
 
 from __future__ import annotations
@@ -16,10 +16,13 @@ import warnings
 import torch
 from triton.testing import do_bench
 
+from .linear_attention_engine import LinearAttentionVariant
 from .linear_attention_engine import recurrent_step
 from .linear_attention_utils import ACC_BWD_TOL
 from .linear_attention_utils import ACC_FWD_TOL
+from .linear_attention_utils import chunked_linear_attn_reference
 from .linear_attention_utils import head_to_time_first as _htf
+from .linear_attention_utils import naive_recurrent_reference
 from .linear_attention_utils import rel_error as _rel_error
 from helion._testing import DEVICE
 
@@ -45,21 +48,40 @@ class Inputs:
 
 
 @dataclass
-class LinearAttentionVariant:
-    """The per-variant hooks the harness needs."""
+class LinearAttentionHarness:
+    """Test, benchmark, and accuracy harness for one linear-attention variant."""
 
     name: str
     title: str
+    variant: LinearAttentionVariant
     make_inputs: Callable[..., Inputs]
-    helion_fwd: Callable[[Inputs, int], torch.Tensor]
-    helion_fb: Callable[[Inputs, torch.Tensor, int], None]
-    reference: Callable[[Inputs], torch.Tensor]
-    chunked_reference: Callable[[Inputs, int], torch.Tensor]
     fla_fwd: Callable[[Inputs, float], torch.Tensor] | None = None
-    fla_fb: Callable[[Inputs, torch.Tensor, float], None] | None = None
     check_recurrent: bool = True
     grad_tensors: tuple[str, ...] = ("q", "k", "v")
     dtype: torch.dtype = DTYPE
+
+    def helion_fwd(self, i: Inputs, C: int) -> torch.Tensor:
+        fwd = self.variant.get_fwd_kernel()
+        return fwd(i.q, i.k, i.v, i.g, i.beta, C=C, scale=i.scale)
+
+    def helion_fb(self, i: Inputs, grad_out: torch.Tensor, C: int) -> None:
+        self.helion_fwd(i, C).backward(grad_out)
+
+    def fla_fb(self, i: Inputs, go_t: torch.Tensor, scale: float) -> None:
+        assert self.fla_fwd is not None
+        self.fla_fwd(i, scale).backward(go_t)
+
+    def reference(self, i: Inputs) -> torch.Tensor:
+        assert i.g is not None
+        return naive_recurrent_reference(
+            i.q, i.k, i.v, i.g.float(), beta=i.beta, q_scale=i.scale
+        )
+
+    def chunked_reference(self, i: Inputs, C: int) -> torch.Tensor:
+        assert i.g is not None
+        return chunked_linear_attn_reference(
+            i.q * i.scale, i.k, i.v, i.g, beta=i.beta, C=C
+        )
 
     # test / benchmark / accuracy: the module-level API run_linattn.py imports.
     def test(self) -> None:
@@ -78,7 +100,7 @@ class LinearAttentionVariant:
         )
 
 
-def _grad_leaves(v: LinearAttentionVariant, inputs: Inputs) -> tuple[Inputs, list]:
+def _grad_leaves(v: LinearAttentionHarness, inputs: Inputs) -> tuple[Inputs, list]:
     """Copy of inputs with grad_tensors swapped for fresh requires_grad copies."""
     out = dataclasses.replace(inputs)
     leaves = []
@@ -99,7 +121,7 @@ def _fla_inputs(inputs: Inputs) -> Inputs:
     return out
 
 
-def _recurrent_error(variant: LinearAttentionVariant, inputs: Inputs, C: int) -> float:
+def _recurrent_error(variant: LinearAttentionHarness, inputs: Inputs, C: int) -> float:
     """Rel error of the chunked output vs the step-by-step recurrent_step loop."""
     q, k, v, g, scale = inputs.q, inputs.k, inputs.v, inputs.g, inputs.scale
     B, H, T, D = q.shape
@@ -126,7 +148,7 @@ def _recurrent_error(variant: LinearAttentionVariant, inputs: Inputs, C: int) ->
 
 
 def run_test(
-    v: LinearAttentionVariant,
+    v: LinearAttentionHarness,
     test_shape: tuple[int, int, int, int, int],
     C: int,
 ) -> None:
@@ -169,7 +191,7 @@ def run_test(
         print(f"  bwd d{name} vs ref: {err:.4e} PASS")
 
     # === Backward: Helion grads vs FLA (dq asserted, dk/dv info) ===
-    if has_fla and v.fla_fb is not None:
+    if has_fla:
         f_inputs, f_leaves = _grad_leaves(v, _fla_inputs(inputs))
         v.fla_fb(f_inputs, _htf(grad_out), scale)
         for name, hl, fl in zip(v.grad_tensors, h_leaves, f_leaves, strict=True):
@@ -191,7 +213,7 @@ def run_test(
 
 
 def _time_config(
-    v: LinearAttentionVariant,
+    v: LinearAttentionHarness,
     shape: tuple[int, int, int, int, int],
     C: int,
 ) -> tuple[float, float, float, float]:
@@ -211,7 +233,7 @@ def _time_config(
     fla_fwd_ms = do_bench(lambda: v.fla_fwd(fla_inputs, scale))  # type: ignore[misc]
     fb_ms = do_bench(lambda: v.helion_fb(inputs, grad_out, C), grad_to_none=h_grads)
     fla_fb_ms = do_bench(
-        lambda: v.fla_fb(fla_inputs, go_t, scale),  # type: ignore[misc]
+        lambda: v.fla_fb(fla_inputs, go_t, scale),
         grad_to_none=fla_grads,
     )
     return (
@@ -223,7 +245,7 @@ def _time_config(
 
 
 def run_benchmark(
-    v: LinearAttentionVariant,
+    v: LinearAttentionHarness,
     configs: list,
     C: int,
 ) -> list[tuple[str, float, float, float, float]]:
@@ -257,7 +279,7 @@ def run_benchmark(
 
 
 def run_accuracy(
-    v: LinearAttentionVariant,
+    v: LinearAttentionHarness,
     configs: list,
     C: int,
 ) -> list[tuple[str, str]]:
@@ -267,8 +289,7 @@ def run_accuracy(
     (ran but over tolerance), ``HEL-ERR`` (the Helion kernel errored), ``REF-ERR``
     (the reference errored, e.g. its autograd graph OOMs). Forward compares
     against the naive recurrent reference; backward compares autograd gradients
-    against the chunked reference. Each side is isolated so an error on one leaves
-    the other's verdict intact.
+    against the chunked reference.
     """
     verdicts: list[tuple[str, str]] = []
     for bi, hi, ti, di, dvi in configs:
