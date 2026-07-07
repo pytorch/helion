@@ -1914,8 +1914,8 @@ class LinearAttentionVariant:
     def get_fwd_kernel(self) -> Callable[..., torch.Tensor]:
         """Return a Helion forward kernel for this variant.
 
-            kernel = LinearAttentionVariant(DecayType.SCALAR, True).get_fwd_kernel()
-            o = kernel(q, k, v, g=g, beta=beta, scale=scale)
+        kernel = LinearAttentionVariant(DecayType.SCALAR, True).get_fwd_kernel()
+        o = kernel(q, k, v, g=g, beta=beta, scale=scale)
         """
         no_decay = self.decay is DecayType.NONE
         correction = self.correction

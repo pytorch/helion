@@ -42,7 +42,7 @@ benchmarks will be skipped with a warning.
 
 ## Architecture
 
-**`linear_attention_engine.py`** -- All Helion kernels (16 `@helion.experimental.aot_kernel()`
+**`linear_attention_engine.py`** -- All Helion kernels (15 `@helion.kernel()`
 functions including fused recurrent step), `ChunkedLinearAttnFn` autograd wrapper,
 `LinearAttentionEngine` class, and the `chunked_linear_attn()` / `recurrent_step()`
 public entry points.
@@ -53,10 +53,7 @@ naive recurrent reference, WY decomposition helpers, input generators.
 ## Running
 
 ```bash
-# Run all examples (test + benchmark):
-python -m examples.linear.all
-
-# Single example:
+# Single example (test + benchmark):
 python -m examples.linear.example_simple_gla
 
 # Run all tests via pytest:
@@ -64,31 +61,6 @@ pytest test/test_examples.py -k "test_linear" -v
 
 # Run monkey-patch tests (plugs our engine into FLA layers):
 pytest test/test_examples.py -k "monkeypatch" -v
-```
-
-## AOT autotuning
-
-The kernels use `@helion.experimental.aot_kernel()` and are ready for
-ahead-of-time autotuning.
-
-**Note:** `HELION_AUTOTUNE_IGNORE_ERRORS=1` is required because certain
-autotuner-generated configs (specifically `flatten_loops=True` for kernels
-using `.sum()` reductions) trigger a Helion codegen bug. These configs are
-automatically skipped when ignore-errors is enabled.
-
-```bash
-# Quick tuning of all examples:
-HELION_AUTOTUNE_PRECOMPILE=spawn \
-HELION_AUTOTUNE_IGNORE_ERRORS=1 \
-HELION_AUTOTUNE_MAX_GENERATIONS=5 \
-python -m examples.linear.all
-
-# Full AOT pipeline via the runner:
-HELION_AUTOTUNE_PRECOMPILE=spawn \
-HELION_AUTOTUNE_IGNORE_ERRORS=1 \
-python -m helion.experimental.aot_runner --phase all \
-  -- python -m examples.linear.all
-
 ```
 
 ## Acknowledgements
