@@ -38,6 +38,9 @@ class FiniteSearch(BaseSearch):
         if len(self.configs) < 2:
             raise exc.NotEnoughConfigs(len(self.configs))
 
+    def _generation_invalid_config_count(self) -> int:
+        return self.config_gen.invalid_config_count
+
     def _autotune(self) -> Config:
         best_config = None
         best_time = float("inf")

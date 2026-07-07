@@ -201,6 +201,106 @@ def _capture(summary: SearchSpaceSummary) -> list[str]:
     return handler.lines
 
 
+class TestExploredValidityTracking(unittest.TestCase):
+    """Explored-config validity breakdown (valid vs. rejected candidates)."""
+
+    def _tracker(self) -> FeatureExplorationTracker:
+        dims = [
+            SearchSpaceDimension(
+                name="num_warps",
+                dim_type="discrete",
+                size=6,
+                values=[1, 2, 4, 8, 16, 32],
+            )
+        ]
+        return FeatureExplorationTracker(_summary(dimensions=dims))
+
+    def test_valid_and_invalid_counts(self) -> None:
+        # No invalids recorded: all attempts valid (100%).
+        tracker = self._tracker()
+        tracker.record_config(
+            _FakeConfig(block_sizes=[32], loop_orders=[0], num_warps=4)
+        )
+        report = tracker.generate_report("RandomSearch", 1.0)
+        self.assertEqual(report.explored_valid, 1)
+        self.assertEqual(report.explored_invalid, 0)
+        self.assertEqual(report.explored_total, 1)
+        self.assertEqual(report.explored_valid_percent, 100.0)
+
+        # Mix of valid and invalid, including a batched record_invalid(2).
+        tracker = self._tracker()
+        for warps in (1, 2, 4):
+            tracker.record_config(
+                _FakeConfig(block_sizes=[32], loop_orders=[0], num_warps=warps)
+            )
+        tracker.record_invalid()
+        tracker.record_invalid(2)
+        report = tracker.generate_report("RandomSearch", 1.0)
+        self.assertEqual(report.explored_valid, 3)
+        self.assertEqual(report.explored_invalid, 3)
+        self.assertEqual(report.explored_total, 6)
+        self.assertEqual(report.explored_valid_percent, 50.0)
+
+    def test_record_invalid_ignores_nonpositive(self) -> None:
+        tracker = self._tracker()
+        tracker.record_invalid(0)
+        tracker.record_invalid(-5)
+        self.assertEqual(tracker.invalid_config_count, 0)
+
+    def test_zero_total_percent_is_zero(self) -> None:
+        report = ExplorationReport(
+            kernel_name="k",
+            backend="triton",
+            search_algorithm="RandomSearch",
+            elapsed_seconds=1.0,
+            configs_tested=0,
+            total_search_space_size=100,
+            feature_stats=[],
+            avg_feature_coverage=0.0,
+            min_feature_coverage=0.0,
+        )
+        self.assertEqual(report.explored_total, 0)
+        self.assertEqual(report.explored_valid_percent, 0.0)
+
+    def _summary_lines(self, report: ExplorationReport, name: str) -> str:
+        logger = logging.getLogger(f"test_search_space_logger.{name}")
+        logger.setLevel(logging.INFO)
+        logger.propagate = False
+        handler = _ListHandler()
+        logger.handlers = [handler]
+        report.log_summary(logger)
+        return "\n".join(handler.lines)
+
+    def _report(self, *, explored_valid: int, explored_invalid: int) -> ExplorationReport:
+        return ExplorationReport(
+            kernel_name="k",
+            backend="triton",
+            search_algorithm="RandomSearch",
+            elapsed_seconds=1.0,
+            configs_tested=explored_valid,
+            total_search_space_size=100,
+            feature_stats=[],
+            avg_feature_coverage=0.0,
+            min_feature_coverage=0.0,
+            explored_valid=explored_valid,
+            explored_invalid=explored_invalid,
+        )
+
+    def test_log_summary_breakdown(self) -> None:
+        # With attempts, the breakdown line is present and formatted.
+        report = self._report(explored_valid=8, explored_invalid=2)
+        joined = self._summary_lines(report, "validity")
+        self.assertIn("Configs attempted: 10", joined)
+        self.assertIn("8 valid", joined)
+        self.assertIn("2 invalid", joined)
+        self.assertIn("80.0% valid", joined)
+
+        # With no attempts, the breakdown line is omitted entirely.
+        report = self._report(explored_valid=0, explored_invalid=0)
+        joined = self._summary_lines(report, "validity_empty")
+        self.assertNotIn("Configs attempted", joined)
+
+
 class TestDisabledFeatureGrouping(unittest.TestCase):
     def test_generic_backend_features_collapsed(self) -> None:
         disabled = [

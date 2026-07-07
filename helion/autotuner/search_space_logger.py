@@ -207,6 +207,29 @@ class ExplorationReport:
     avg_feature_coverage: float  # Average coverage across all features
     min_feature_coverage: float  # Minimum coverage (bottleneck feature)
 
+    # Explored-config validity breakdown. ``explored_valid`` configs survived
+    # unflattening (after in-place repair) and were tracked for exploration;
+    # ``explored_invalid`` were candidates that a config fragment / normalize
+    # step rejected as InvalidConfig before they could be benchmarked. Their
+    # sum is the total number of configurations the search attempted (counting
+    # repeats; algorithms such as differential evolution may re-attempt the
+    # same config across generations).
+    explored_valid: int = 0
+    explored_invalid: int = 0
+
+    @property
+    def explored_total(self) -> int:
+        """Total configurations attempted (valid + invalid)."""
+        return self.explored_valid + self.explored_invalid
+
+    @property
+    def explored_valid_percent(self) -> float:
+        """Percentage of attempted configurations that were valid."""
+        total = self.explored_total
+        if total == 0:
+            return 0.0
+        return (self.explored_valid / total) * 100
+
     def to_dict(self) -> dict[str, object]:
         return {
             "kernel_name": self.kernel_name,
@@ -219,6 +242,10 @@ class ExplorationReport:
                 if self.total_search_space_size is not None
                 else "infinite"
             ),
+            "explored_valid": self.explored_valid,
+            "explored_invalid": self.explored_invalid,
+            "explored_total": self.explored_total,
+            "explored_valid_percent": round(self.explored_valid_percent, 2),
             "feature_stats": [stats.to_dict() for stats in self.feature_stats],
             "avg_feature_coverage": round(self.avg_feature_coverage, 2),
             "min_feature_coverage": round(self.min_feature_coverage, 2),
@@ -233,6 +260,19 @@ class ExplorationReport:
             level,
             f"  Time: {self.elapsed_seconds:.1f}s, Configs tested: {self.configs_tested:,}",
         )
+
+        # Report how many attempted configurations were valid vs. rejected by a
+        # config fragment / normalize step. Only meaningful once at least one
+        # candidate was attempted (search algorithms that never materialize
+        # candidates via the tracker leave these at zero).
+        if self.explored_total > 0:
+            logger.log(
+                level,
+                f"  Configs attempted: {self.explored_total:,} "
+                f"({self.explored_valid:,} valid, "
+                f"{self.explored_invalid:,} invalid, "
+                f"{self.explored_valid_percent:.1f}% valid)",
+            )
 
         if self.total_search_space_size is not None:
             overall_coverage = (
@@ -283,13 +323,17 @@ class FeatureExplorationTracker:
         self.search_summary = search_summary
         self.tested_configs: list[Config] = []
         self._feature_value_sets: dict[str, set[object]] = {}
+        # Count of candidate configs rejected as InvalidConfig before they
+        # could be benchmarked (see record_invalid). Valid explored configs are
+        # ``len(self.tested_configs)``.
+        self.invalid_config_count: int = 0
 
         # Initialize empty sets for each feature
         for dim in search_summary.dimensions:
             self._feature_value_sets[dim.name] = set()
 
     def record_config(self, config: Config) -> None:
-        """Record a tested configuration."""
+        """Record a tested (valid) configuration."""
         self.tested_configs.append(config)
 
         # Extract feature values from config
@@ -301,6 +345,16 @@ class FeatureExplorationTracker:
                 except TypeError:
                     # unhashable (e.g. nested list) — coerce to repr for tracking
                     self._feature_value_sets[feature_name].add(repr(value))
+
+    def record_invalid(self, count: int = 1) -> None:
+        """Record ``count`` candidate configs rejected as InvalidConfig.
+
+        These are candidates that a config fragment or normalize step ruled out
+        (e.g. a block size violating a tensor numel constraint) before they
+        could be benchmarked, so they never reach :meth:`record_config`.
+        """
+        if count > 0:
+            self.invalid_config_count += count
 
     def generate_report(
         self,
@@ -364,6 +418,8 @@ class FeatureExplorationTracker:
             feature_stats=feature_stats,
             avg_feature_coverage=avg_coverage,
             min_feature_coverage=min_coverage,
+            explored_valid=len(self.tested_configs),
+            explored_invalid=self.invalid_config_count,
         )
 
 

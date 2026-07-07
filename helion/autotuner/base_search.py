@@ -526,6 +526,18 @@ class BaseSearch(BaseAutotuner):
         """
         return self.benchmark_batch([config])[0]
 
+    def _generation_invalid_config_count(self) -> int:
+        """Number of candidate configs rejected as InvalidConfig during search.
+
+        These are candidates that a config fragment / normalize step ruled out
+        before they could be benchmarked (so they never reach the exploration
+        tracker's valid-config path). The base implementation reports zero;
+        subclasses that own a :class:`ConfigGeneration` expose its running
+        count so the search-space logger can report explored-invalid alongside
+        explored-valid.
+        """
+        return 0
+
     def autotune(self, *, skip_cache: bool = False) -> Config:
         """
         Perform autotuning to find the best configuration.
@@ -604,6 +616,9 @@ class BaseSearch(BaseAutotuner):
                 end - start,
             )
             if self._exploration_tracker is not None:
+                self._exploration_tracker.record_invalid(
+                    self._generation_invalid_config_count()
+                )
                 report = self._exploration_tracker.generate_report(
                     search_algorithm=type(self).__name__,
                     elapsed_seconds=end - start,
@@ -860,6 +875,9 @@ class PopulationBasedSearch(BaseSearch):
             process_group_name=kernel.env.process_group_name,
         )
 
+    def _generation_invalid_config_count(self) -> int:
+        return self.config_gen.invalid_config_count
+
     @classmethod
     def get_kwargs_from_profile(
         cls, profile: AutotuneEffortProfile, settings: Settings
@@ -984,6 +1002,7 @@ class PopulationBasedSearch(BaseSearch):
         try:
             config = self.config_gen.unflatten(flat_values)
         except exc.InvalidConfig:
+            self.config_gen.invalid_config_count += 1
             return None
         return PopulationMember(_unset_fn, [], flat_values, config)
 

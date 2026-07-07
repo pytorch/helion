@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import contextlib
 import copy
 import functools
 import itertools
@@ -101,6 +100,12 @@ class ConfigGeneration:
             if config_spec.block_sizes
             else 1
         )
+        # Running count of candidate configs rejected as InvalidConfig by the
+        # internal generation retry loops (random_config / random_population).
+        # These rejections are otherwise invisible to callers because the loops
+        # silently retry; exposing the count lets the search-space logger report
+        # explored-invalid alongside explored-valid.
+        self.invalid_config_count: int = 0
 
     def _init_cute_num_thread_pairs(self) -> None:
         """Pair each CuTe num_threads flat slot with its block_size slot."""
@@ -555,6 +560,7 @@ class ConfigGeneration:
             except InvalidConfig as e:
                 msg = str(e)
                 errors[msg] = errors.get(msg, 0) + 1
+                self.invalid_config_count += 1
                 continue
         summary = "; ".join(f"{msg} (x{n})" for msg, n in errors.items())
         raise InvalidConfig(
@@ -631,10 +637,13 @@ class ConfigGeneration:
                 result.append(self.unflatten(flat))
             except InvalidConfig:
                 attempts += 1
+                self.invalid_config_count += 1
         # Retry to fill the population to the requested size
         while len(result) < n and attempts < 64:
-            with contextlib.suppress(InvalidConfig):
+            try:
                 result.append(self.unflatten(self.random_flat()))
+            except InvalidConfig:
+                self.invalid_config_count += 1
             attempts += 1
         return result
 
