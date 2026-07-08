@@ -244,6 +244,21 @@ class Kernel(Generic[_R]):
 
             self._capture_op = register_decoration_op(self)
 
+        # Fused launch (helion/runtime/_fused_launch.py) reuses the direct-launch
+        # correctness model, so it is gated on both settings and the Triton
+        # backend; resolved once here to keep the __call__ hot path branch-free.
+        self._fused_launch: bool = (
+            self.settings.backend == "triton"
+            and self.settings.triton_direct_launch
+            and self.settings.triton_fused_launch
+        )
+        # Fused-launch state (kernel-wide): a flat, eval-compiled dispatch key
+        # (built on first prime), a cache of launch recipes keyed by it, and a
+        # latch that permanently disables fusion for a non-fuseable kernel.
+        self._fused_recipes: dict[Hashable, Callable[[tuple[object, ...]], None]] = {}
+        self._fused_key_fn: Callable[[tuple[object, ...]], Hashable] | None = None
+        self._fused_disabled: bool = False
+
     @functools.cache  # noqa: B019
     def kernel_source(self) -> str:
         """
@@ -490,17 +505,43 @@ class Kernel(Generic[_R]):
         """
         if kwargs:
             args = self.normalize_args(*args, **kwargs)
-        elif self._dispatch_cache:
-            # Fast path: repeat call with argument metadata seen before. The
-            # cache is only populated by calls that already took the slow
-            # path below, so hitting it cannot skip autotuning/compilation.
-            # (The cache stays empty under TPU compile capture, so this
-            # cannot bypass auto_capture_call below.)
-            fast_key = self._fast_dispatch_key(args)
-            if fast_key is not None:
-                bound = self._dispatch_cache.get(fast_key)
-                if bound is not None and bound._run is not None:
-                    return bound._run(*args)
+        else:
+            if self._fused_recipes and not torch.compiler.is_compiling():
+                # Fused fast path: one flat key straight to a cached launch
+                # closure that verifies captured globals, builds the launch
+                # args, and calls the compiled kernel in a single frame --
+                # skipping the wrapper and launcher entirely.  Only populated
+                # after a prime below, so it cannot bypass compilation.  A miss
+                # (new shape/alignment) or a mutated global raises; both fall
+                # through to the normal dispatch, which re-primes / re-validates.
+                # Skipped under torch.compile: the raw launch is not traceable
+                # (dynamo must see the ``JITFunction.run`` path instead).
+                try:
+                    # _fused_key_fn is set whenever _fused_recipes is non-empty.
+                    # pyrefly: ignore [not-callable]
+                    launch = self._fused_recipes.get(self._fused_key_fn(args))
+                    if launch is not None:
+                        launch(args)
+                        return None  # type: ignore[return-value]
+                except Exception:
+                    pass
+            if self._dispatch_cache:
+                # Fast path: repeat call with argument metadata seen before. The
+                # cache is only populated by calls that already took the slow
+                # path below, so hitting it cannot skip autotuning/compilation.
+                # (The cache stays empty under TPU compile capture, so this
+                # cannot bypass auto_capture_call below.)
+                fast_key = self._fast_dispatch_key(args)
+                if fast_key is not None:
+                    bound = self._dispatch_cache.get(fast_key)
+                    if bound is not None and bound._run is not None:
+                        if self._fused_launch and not self._fused_disabled:
+                            # Prime the fused recipe for this key (executes the
+                            # launch), or latch fusion off if not fuseable.
+                            from ._fused_launch import fused_prime
+
+                            return cast("_R", fused_prime(self, bound, args))
+                        return bound._run(*args)
         if self.settings.backend == "pallas" and _TPU_COMPILE_CAPTURE:
             # Local import: _tpu_compile_capture pulls in the dynamo HOP machinery,
             # not ready when kernel.py first loads during ``import helion``.
@@ -526,6 +567,9 @@ class Kernel(Generic[_R]):
         """
         self._bound_kernels.clear()
         self._dispatch_cache.clear()
+        self._fused_recipes.clear()
+        self._fused_key_fn = None
+        self._fused_disabled = False
 
     @property
     def jax_fn(self) -> Callable[..., Any]:
@@ -969,6 +1013,10 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
         config = self._normalize_config(config)
         self._run = self.compile_config(config)
         self._config = config
+        # A recompile invalidates the kernel's fused launch recipes, which cache
+        # the old compiled binary directly (the JITFunction's own direct-launch
+        # cache is dropped by TritonBackend._clear_triton_jit_cache likewise).
+        self.kernel._fused_recipes.clear()
         counters["best_config_decorator"][
             self.format_kernel_decorator(config, self.settings)
         ] = 1

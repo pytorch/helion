@@ -600,6 +600,11 @@ class _Settings:
             _env_get_bool, "HELION_TRITON_DIRECT_LAUNCH", True
         )
     )
+    triton_fused_launch: bool = dataclasses.field(
+        default_factory=functools.partial(
+            _env_get_bool, "HELION_TRITON_FUSED_LAUNCH", True
+        )
+    )
 
 
 class Settings(_Settings):
@@ -718,6 +723,21 @@ class Settings(_Settings):
             "Triton launch hooks or knobs registered *after* a kernel's first "
             "launch are not re-checked per call, so profilers attaching "
             "mid-run will miss direct launches."
+        ),
+        "triton_fused_launch": (
+            "If True (default), collapse the dispatch, generated host-wrapper, "
+            "and launch layers into a single cached step on repeat calls: after "
+            "one priming launch, the grid and constant launch arguments (which "
+            "are pure functions of the fast-dispatch key) are recorded and later "
+            "calls launch the compiled kernel directly from Kernel.__call__, "
+            "skipping the wrapper and launcher frames. Builds on and shares the "
+            "safety model of triton_direct_launch (per-tensor 16-byte alignment "
+            "and used_global_vals values are folded into the cache key; any "
+            "deviation falls back to the full path). Automatically disabled for "
+            "a kernel whose host wrapper returns a value (e.g. allocates its "
+            "output), issues multiple device launches, or takes cooperative-grid "
+            "launches. Requires triton_direct_launch; Triton-only. Set "
+            "HELION_TRITON_FUSED_LAUNCH=0 to disable."
         ),
         "print_output_code": "If True, print the output code of the kernel to stderr.",
         "print_repro": "If True, print Helion kernel code, config, and caller code to stderr as a standalone repro script.",
