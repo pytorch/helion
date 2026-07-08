@@ -14,7 +14,6 @@ from typing import Any
 import torch
 import torch.nn.functional as F
 
-from .linear_attention_engine import DecayType
 from .linear_attention_engine import LinearAttentionVariant
 from .linear_attention_harness import DTYPE
 from .linear_attention_harness import Inputs
@@ -58,7 +57,7 @@ def _fla_fwd(i: Inputs, scale: float) -> torch.Tensor:
     return o
 
 
-VARIANT = LinearAttentionVariant(decay=DecayType.SCALAR, correction=True)
+VARIANT = LinearAttentionVariant.GATED_DELTA_RULE
 
 HARNESS = LinearAttentionExampleHarness(
     name="gated_delta_rule",

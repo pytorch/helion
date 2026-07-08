@@ -17,6 +17,7 @@ import torch
 from triton.testing import do_bench
 
 from .linear_attention_engine import LinearAttentionVariant
+from .linear_attention_engine import get_helion_fwd_kernel
 from .linear_attention_engine import recurrent_step
 from .linear_attention_utils import ACC_BWD_TOL
 from .linear_attention_utils import ACC_FWD_TOL
@@ -61,8 +62,19 @@ class LinearAttentionExampleHarness:
     dtype: torch.dtype = DTYPE
 
     def helion_fwd(self, i: Inputs, C: int) -> torch.Tensor:
-        fwd = self.variant.get_fwd_kernel()
-        return fwd(i.q, i.k, i.v, i.g, i.beta, C=C, scale=i.scale)
+        fwd = get_helion_fwd_kernel(self.variant)
+        return cast(
+            "torch.Tensor",
+            fwd(
+                i.q,
+                i.k,
+                i.v,
+                i.g,
+                i.beta,
+                C=C,
+                scale=i.scale,
+            ),
+        )
 
     def helion_fb(self, i: Inputs, grad_out: torch.Tensor, C: int) -> None:
         self.helion_fwd(i, C).backward(grad_out)

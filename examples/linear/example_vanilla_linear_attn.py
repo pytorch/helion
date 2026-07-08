@@ -12,7 +12,6 @@ from typing import Any
 
 import torch
 
-from .linear_attention_engine import DecayType
 from .linear_attention_engine import LinearAttentionVariant
 from .linear_attention_harness import DTYPE
 from .linear_attention_harness import Inputs
@@ -52,7 +51,7 @@ def _fla_fwd(i: Inputs, scale: float) -> torch.Tensor:
     return o[0] if isinstance(o, tuple) else o
 
 
-VARIANT = LinearAttentionVariant(decay=DecayType.NONE)
+VARIANT = LinearAttentionVariant.VANILLA
 
 HARNESS = LinearAttentionExampleHarness(
     name="vanilla_linear_attn",
