@@ -858,7 +858,9 @@ def save_search_space_summary(
         output_path: Path to save the JSON file
 
     Returns:
-        The path to the saved file
+        The path to the saved file, or an empty string if saving failed. This
+        function is best-effort and never raises: search space logging is
+        purely diagnostic and must never crash the autotuner.
     """
     output = {
         **summary.to_dict(),
@@ -872,7 +874,77 @@ def save_search_space_summary(
         ),
     }
 
+    try:
+        path = _resolve_output_path(output_path, "autotune_search_space.json")
+        path.write_text(json.dumps(output, indent=2, default=str))
+        return str(path)
+    except Exception:
+        log.debug(
+            "Failed to save search space summary to %r", output_path, exc_info=True
+        )
+        return ""
+
+
+def save_exploration_report(
+    report: ExplorationReport,
+    output_path: str,
+) -> str:
+    """Save a feature exploration report to a JSON file.
+
+    ``output_path`` is the path configured for the search space summary; the
+    exploration report is written alongside it with an ``_exploration.json``
+    suffix. Directory paths (existing or trailing-separator) are handled by
+    writing a default filename into them.
+
+    Args:
+        report: The exploration report to serialize.
+        output_path: Base path used for the search space summary.
+
+    Returns:
+        The path to the saved file, or an empty string if saving failed. This
+        function is best-effort and never raises: search space logging is
+        purely diagnostic and must never crash the autotuner.
+    """
+    try:
+        path = _resolve_output_path(output_path, "autotune_search_space.json")
+        # Derive the exploration report path from the resolved summary path so
+        # the two files always sit side by side, regardless of whether
+        # output_path was a directory.
+        report_path = path.with_name(
+            path.name.replace(".json", "_exploration.json")
+            if path.name.endswith(".json")
+            else path.name + "_exploration.json"
+        )
+        report_path.parent.mkdir(parents=True, exist_ok=True)
+        report_path.write_text(json.dumps(report.to_dict(), indent=2, default=str))
+        return str(report_path)
+    except Exception:
+        log.debug(
+            "Failed to save exploration report near %r", output_path, exc_info=True
+        )
+        return ""
+
+
+def _resolve_output_path(output_path: str, default_filename: str) -> Path:
+    """Resolve ``output_path`` to a concrete file path safe to write to.
+
+    Handles the cases where ``output_path`` is a directory (existing or with a
+    trailing separator) by appending ``default_filename``, and ensures the
+    parent directory exists.
+
+    Args:
+        output_path: The user-provided path (may be a file or directory).
+        default_filename: Filename to use if ``output_path`` refers to a
+            directory.
+
+    Returns:
+        A resolved :class:`~pathlib.Path` whose parent directory exists.
+    """
     path = Path(output_path)
+    # Treat an existing directory, or a path ending in a separator (an intended
+    # directory that may not exist yet), as a directory to write into.
+    ends_with_sep = output_path.endswith(("/", "\\"))
+    if path.is_dir() or ends_with_sep:
+        path = path / default_filename
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(output, indent=2, default=str))
-    return str(path)
+    return path

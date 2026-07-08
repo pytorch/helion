@@ -1,6 +1,10 @@
 from __future__ import annotations
 
+import json
 import logging
+import os
+from pathlib import Path
+import tempfile
 import unittest
 
 from helion.autotuner.search_space_logger import ExplorationReport
@@ -10,6 +14,8 @@ from helion.autotuner.search_space_logger import SearchSpaceDimension
 from helion.autotuner.search_space_logger import SearchSpaceSummary
 from helion.autotuner.search_space_logger import _analyze_dimension_size
 from helion.autotuner.search_space_logger import analyze_search_space
+from helion.autotuner.search_space_logger import save_exploration_report
+from helion.autotuner.search_space_logger import save_search_space_summary
 
 
 class _FakeConfig:
@@ -507,6 +513,111 @@ class TestDisallowPidTypeReasons(unittest.TestCase):
         # xyz is allowed again, so it is neither listed nor annotated.
         for c in pid_constraints:
             self.assertNotIn("xyz", c)
+
+
+class TestSaveOutputPathHandling(unittest.TestCase):
+    """save_search_space_summary / save_exploration_report must never crash the
+    autotuner on awkward output paths (directory, missing parents, etc.)."""
+
+    def _summary_obj(self) -> SearchSpaceSummary:
+        return _summary(
+            dimensions=[
+                SearchSpaceDimension(
+                    name="num_warps",
+                    dim_type="discrete",
+                    size=6,
+                    values=[1, 2, 4, 8, 16, 32],
+                )
+            ]
+        )
+
+    def _report_obj(self) -> ExplorationReport:
+        return ExplorationReport(
+            kernel_name="k",
+            backend="triton",
+            search_algorithm="Test",
+            elapsed_seconds=1.0,
+            configs_tested=3,
+            total_search_space_size=6,
+            feature_stats=[],
+            avg_feature_coverage=0.0,
+            min_feature_coverage=0.0,
+        )
+
+    def test_save_to_explicit_file(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            target = os.path.join(d, "out.json")
+            saved = save_search_space_summary(
+                self._summary_obj(), 3, "Test", 1.0, target
+            )
+            self.assertEqual(saved, target)
+            self.assertTrue(os.path.isfile(target))
+            json.loads(Path(saved).read_text())
+
+    def test_save_to_existing_directory(self) -> None:
+        """A directory path gets a default filename appended, not a crash."""
+        with tempfile.TemporaryDirectory() as d:
+            saved = save_search_space_summary(self._summary_obj(), 3, "Test", 1.0, d)
+            self.assertEqual(saved, os.path.join(d, "autotune_search_space.json"))
+            self.assertTrue(os.path.isfile(saved))
+
+    def test_save_to_trailing_separator_directory(self) -> None:
+        """A path ending in a separator is treated as a (possibly new) dir."""
+        with tempfile.TemporaryDirectory() as d:
+            target = os.path.join(d, "nested") + os.sep
+            saved = save_search_space_summary(
+                self._summary_obj(), 3, "Test", 1.0, target
+            )
+            self.assertEqual(
+                saved, os.path.join(d, "nested", "autotune_search_space.json")
+            )
+            self.assertTrue(os.path.isfile(saved))
+
+    def test_save_creates_missing_parent_dirs(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            target = os.path.join(d, "a", "b", "c", "out.json")
+            saved = save_search_space_summary(
+                self._summary_obj(), 3, "Test", 1.0, target
+            )
+            self.assertTrue(os.path.isfile(saved))
+
+    def test_exploration_report_next_to_file(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            target = os.path.join(d, "out.json")
+            saved = save_exploration_report(self._report_obj(), target)
+            self.assertEqual(saved, os.path.join(d, "out_exploration.json"))
+            self.assertTrue(os.path.isfile(saved))
+            json.loads(Path(saved).read_text())
+
+    def test_exploration_report_for_directory_path(self) -> None:
+        """When the summary path is a directory, the report lands inside it."""
+        with tempfile.TemporaryDirectory() as d:
+            saved = save_exploration_report(self._report_obj(), d)
+            self.assertEqual(
+                saved, os.path.join(d, "autotune_search_space_exploration.json")
+            )
+            self.assertTrue(os.path.isfile(saved))
+
+    def test_save_never_raises_on_bad_path(self) -> None:
+        """A write failure returns an empty string instead of raising."""
+        with tempfile.TemporaryDirectory() as d:
+            # A path whose parent is an existing *file* cannot be created as a
+            # directory, so mkdir/write fails; the function must swallow it.
+            blocker = os.path.join(d, "blocker")
+            Path(blocker).write_text("x")
+            target = os.path.join(blocker, "out.json")
+            saved = save_search_space_summary(
+                self._summary_obj(), 3, "Test", 1.0, target
+            )
+            self.assertEqual(saved, "")
+
+    def test_exploration_report_never_raises_on_bad_path(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            blocker = os.path.join(d, "blocker")
+            Path(blocker).write_text("x")
+            target = os.path.join(blocker, "out.json")
+            saved = save_exploration_report(self._report_obj(), target)
+            self.assertEqual(saved, "")
 
 
 if __name__ == "__main__":
