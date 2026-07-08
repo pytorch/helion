@@ -512,6 +512,10 @@ function renderSpeedupTrendChart() {
     });
   });
   const runs = DATA.runs;
+  // Match renderSpeedup(): only require a baseline when it exists for these
+  // platform(s), so TPU (no Triton) still gets a trend line.
+  const hasTC = entries.some(e => e.torch_compile_speedup_geomean > 0);
+  const hasTriton = entries.some(e => e.triton_speedup_geomean > 0);
   const helionTrend = [], tcTrend = [], tritonTrend = [];
   const xLabels = [];
   runs.forEach(r => {
@@ -521,17 +525,17 @@ function renderSpeedupTrendChart() {
       if (
         h &&
         h.helion_speedup_geomean > 0 &&
-        h.torch_compile_speedup_geomean > 0 &&
-        h.triton_speedup_geomean > 0
+        (!hasTC || h.torch_compile_speedup_geomean > 0) &&
+        (!hasTriton || h.triton_speedup_geomean > 0)
       ) {
         hValsRun.push(h.helion_speedup_geomean);
         tValsRun.push(h.torch_compile_speedup_geomean);
         rValsRun.push(h.triton_speedup_geomean);
       }
     });
-    helionTrend.push(geomean(hValsRun, null));
-    tcTrend.push(geomean(tValsRun, null));
-    tritonTrend.push(geomean(rValsRun, null));
+    helionTrend.push(geomean(hValsRun.filter(v => v > 0), null));
+    tcTrend.push(geomean(tValsRun.filter(v => v > 0), null));
+    tritonTrend.push(geomean(rValsRun.filter(v => v > 0), null));
     xLabels.push(r.sha + '\n' + formatDate(r.date));
   });
   let firstIdx = 0;
@@ -575,14 +579,19 @@ function renderSpeedup() {
       if (e) entries.push(e);
     });
   });
+  // Only require a competitor baseline when it actually exists for the selected
+  // platform(s). Triton never runs on TPU, so requiring it unconditionally would
+  // drop every TPU row and leave the geomeans blank.
+  const hasTC = entries.some(e => e.torch_compile_speedup_geomean > 0);
+  const hasTriton = entries.some(e => e.triton_speedup_geomean > 0);
   const commonSpeedupEntries = entries.filter(e =>
     e.helion_speedup_geomean > 0 &&
-    e.torch_compile_speedup_geomean > 0 &&
-    e.triton_speedup_geomean > 0
+    (!hasTC || e.torch_compile_speedup_geomean > 0) &&
+    (!hasTriton || e.triton_speedup_geomean > 0)
   );
-  const hVals = commonSpeedupEntries.map(e => e.helion_speedup_geomean);
-  const tVals = commonSpeedupEntries.map(e => e.torch_compile_speedup_geomean);
-  const rVals = commonSpeedupEntries.map(e => e.triton_speedup_geomean);
+  const hVals = commonSpeedupEntries.map(e => e.helion_speedup_geomean).filter(v => v > 0);
+  const tVals = commonSpeedupEntries.map(e => e.torch_compile_speedup_geomean).filter(v => v > 0);
+  const rVals = commonSpeedupEntries.map(e => e.triton_speedup_geomean).filter(v => v > 0);
   const helionGM = geomean(hVals, null), tcGM = geomean(tVals, null), tritonGM = geomean(rVals, null);
   const helionWins = commonSpeedupEntries.filter(e => e.helion_speedup_geomean > Math.max(e.torch_compile_speedup_geomean, e.triton_speedup_geomean)).length;
   const pairedSpeedupSub = `${commonSpeedupEntries.length} paired kernel/platform combos`;
