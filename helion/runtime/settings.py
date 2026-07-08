@@ -595,6 +595,11 @@ class _Settings:
             _env_get_bool, "HELION_TRITON_DO_NOT_SPECIALIZE", False
         )
     )
+    triton_fused_launch: bool = dataclasses.field(
+        default_factory=functools.partial(
+            _env_get_bool, "HELION_TRITON_FUSED_LAUNCH", True
+        )
+    )
 
 
 class Settings(_Settings):
@@ -697,6 +702,21 @@ class Settings(_Settings):
             "memory-bound kernels (vectorized loads rely on inner stride being "
             "specialized to constexpr 1). Only takes effect when static_shapes=False. "
             "Set HELION_TRITON_DO_NOT_SPECIALIZE=1 to enable globally."
+        ),
+        "triton_fused_launch": (
+            "If True (default), collapse the dispatch, generated host-wrapper, "
+            "and launch layers into a single cached step on repeat calls: after "
+            "one priming launch, the grid and constant launch arguments (which "
+            "are pure functions of the fast-dispatch key) are recorded and later "
+            "calls launch the compiled kernel directly from Kernel.__call__, "
+            "skipping the wrapper and launcher frames. The two launch hazards the "
+            "wrapper/launcher normally guard are folded into the fused cache key "
+            "(per-tensor 16-byte alignment and used_global_vals values); any "
+            "deviation, and torch.compile tracing, fall back to the full path. "
+            "Automatically disabled for a kernel whose host wrapper returns a "
+            "value (e.g. allocates its output), issues multiple device launches, "
+            "or takes cooperative-grid launches. Triton-only. Set "
+            "HELION_TRITON_FUSED_LAUNCH=0 to disable."
         ),
         "print_output_code": "If True, print the output code of the kernel to stderr.",
         "print_repro": "If True, print Helion kernel code, config, and caller code to stderr as a standalone repro script.",
