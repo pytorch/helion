@@ -9,22 +9,26 @@ slot comes from which input tensor is fixed per specialization.  So after one
 compiled kernel directly, skipping the wrapper frame, the launcher frame, and
 the second key build.
 
-Hot path (see ``Kernel.__call__``): a single flat, ``eval``-compiled key (built
-once per kernel) maps straight to that closure, which -- in one Python frame --
-verifies the kernel's captured globals, builds the ``CompiledKernel.run``
-argument list, and launches.  The flat key encodes the same per-argument
-metadata as :meth:`Kernel._fast_dispatch_key` plus a 16-byte pointer-alignment
-bit per input tensor.
+Hot path (see ``Kernel.__call__``): :meth:`Kernel._fused_dispatch_key` maps the
+call straight to a cached closure, which -- in one Python frame -- verifies the
+kernel's captured globals, allocates any outputs, builds the ``CompiledKernel.run``
+argument list, and launches.  That key is ``_fast_dispatch_key`` (exact
+per-argument metadata, scalar values, and the user ``key=`` function) plus a
+16-byte pointer-alignment bit per tensor.  It is built per call by the same
+type-dispatched code the normal dispatch uses -- *not* an expression baked to the
+primed argument layout -- so a call whose layout differs (e.g. a tensor where the
+prime saw ``None``) yields a different key and re-primes, never a false hit.
 
 Correctness.  The fused path bypasses ``default_launcher``'s direct-launch key,
 which is where the two *uncatchable* launch hazards are normally guarded -- a
 misaligned pointer into an alignment-specialized binary (async CUDA error) and a
 stale captured global (silently wrong numerics).  The alignment bit is folded
-into the flat key, so an unaligned pointer arriving after an aligned prime is a
-new key -> its own closure.  Each closure re-checks its specialization's
-captured globals against their primed values and raises :class:`_GlobalsChanged`
-(deletion raises ``KeyError``) on any mismatch; the caller treats either as a
-miss and re-primes via the slow path, which raises Triton's own error.
+into the key, so an unaligned pointer arriving after an aligned prime is a new
+key -> its own closure.  Each closure re-checks its specialization's captured
+globals against their primed values (a deleted global reads a ``_MISSING``
+sentinel and so compares unequal) and raises :class:`GlobalsChanged` on any
+mismatch; the caller catches it and re-validates via the slow path, which raises
+Triton's own error.
 
 Because the Triton CUDA launcher reads only ``.data_ptr()`` from a pointer
 argument (sizes/strides reach the kernel as separate explicit scalar args), a
@@ -43,16 +47,21 @@ tuple/list of tensors and simple constants) is reproduced from inputs,
 allocations, and baked constants.
 
 Fusion is disabled (permanently, per kernel) whenever the recipe cannot be
-reproduced this way: multiple device launches, a launch/return tensor with a
-nonzero storage offset or a view layout over storage it shares with another
-(unreconstructable blind), a launch arg that is neither a plain tensor nor an
-``int``/``float``/``bool``/``None`` constant, a return value outside the
-supported shapes, cooperative-grid launches, extra launcher kwargs, or any
-active launch hook/knob.
+reproduced this way: a host wrapper that does side-effecting work beyond
+allocate + launch + return (checked once by inspecting the wrapper source --
+see :func:`_wrapper_body_is_fuseable`), multiple device launches, a
+launch/return tensor with a nonzero storage offset or a view layout over storage
+it shares with another (unreconstructable blind), a launch arg that is neither a
+plain tensor nor an ``int``/``float``/``bool``/``None`` constant, a return value
+outside the supported shapes, cooperative-grid launches, extra launcher kwargs,
+or any active launch hook/knob.
 """
 
 from __future__ import annotations
 
+import ast
+import inspect
+import textwrap
 from typing import TYPE_CHECKING
 from typing import Any
 from typing import cast
@@ -66,39 +75,112 @@ if TYPE_CHECKING:
     from .kernel import Kernel
 
 
-class _GlobalsChanged(Exception):
-    """Raised by a launch closure when a captured Triton global was mutated."""
+class GlobalsChanged(Exception):
+    """Raised by a launch closure when a captured Triton global was mutated
+    since the recipe was primed; the caller falls back to the slow path."""
 
 
-def _build_flat_key_fn(
+def build_fused_key_fn(
     args: tuple[object, ...],
-) -> Callable[[tuple[object, ...]], tuple[object, ...]]:
-    """Compile the kernel-wide flat dispatch key from a sample argument tuple.
+    user_key_fn: Callable[..., object] | None,
+) -> Callable[[tuple[object, ...]], object]:
+    """Compile a flat dispatch-key builder for the fused cache, from a sample
+    argument tuple (the layout seen on the first prime for that layout).
 
-    Encodes, per position, the same metadata as ``Kernel._fast_dispatch_key``
-    (dtype/shape/stride/device + dynamo static indices for tensors, class+value
-    for scalars) plus a 16-byte pointer-alignment bit for each tensor.  Baking
-    one flat expression avoids the per-call type dispatch and nested-tuple
-    construction of the method-based key.  A later call whose argument layout
-    differs from the primed one makes the expression raise (e.g. ``.dtype`` on
-    an int), which the caller treats as a miss and re-primes.
+    The returned lambda encodes, per position, the same information as
+    ``Kernel._fast_dispatch_key`` -- ``type(arg)`` and, for a tensor,
+    dtype/shape/stride/device and (frozenset-normalized) dynamo static indices,
+    for a scalar its value -- plus a 16-byte pointer-alignment bit per tensor,
+    and finally the user ``key=`` function's result.  Compiling one flat
+    expression (as Triton's ``binder`` does) is markedly faster on the hot path
+    than the generic per-call ``_fast_dispatch_key`` builder for many-argument
+    kernels.
+
+    Every position embeds ``a[i].__class__`` first, so a call whose layout
+    differs from this sample -- e.g. a tensor where the sample had ``None`` --
+    produces a different key (never a false hit).  If a differing layout makes an
+    expression raise (``.dtype`` on an int, ``.data_ptr`` on ``None``), the
+    caller catches it and rebuilds the expression for the new layout.
     """
     parts: list[str] = []
     for i, a in enumerate(args):
         t = type(a)
         if t is torch.Tensor or t is torch.nn.Parameter:
+            # frozenset(...) matches _fast_dispatch_key's normalization so a
+            # set/list _dynamo_static_indices stays hashable.
             parts.append(
-                f"a[{i}].dtype, a[{i}].shape, a[{i}].stride(), a[{i}].device, "
-                f"getattr(a[{i}], '_dynamo_static_indices', None), "
+                f"a[{i}].__class__, a[{i}].dtype, a[{i}].shape, a[{i}].stride(), "
+                f"a[{i}].device, _fs(getattr(a[{i}], '_dynamo_static_indices', None)), "
                 f"not a[{i}].data_ptr() & 15"
             )
         elif t is int or t is float or t is bool or t is str:
             parts.append(f"a[{i}].__class__, a[{i}]")
         elif a is None:
-            parts.append("None")
-        else:  # torch.dtype / torch.device
-            parts.append(f"a[{i}]")
-    return eval(f"lambda a: ({', '.join(parts)},)")
+            # NoneType marker; a tensor arriving here yields Tensor != NoneType.
+            parts.append(f"a[{i}].__class__")
+        else:  # torch.dtype / torch.device -- value is its own key
+            parts.append(f"a[{i}].__class__, a[{i}]")
+    namespace: dict[str, object] = {
+        "_fs": lambda si: None if si is None else frozenset(si)
+    }
+    meta = f"({', '.join(parts)},)" if parts else "()"
+    if user_key_fn is not None:
+        namespace["_kf"] = user_key_fn
+        return eval(f"lambda a: ({meta}, _kf(*a))", namespace)
+    return eval(f"lambda a: {meta}", namespace)
+
+
+def _wrapper_body_is_fuseable(bound: BoundKernel) -> bool:
+    """True iff the generated host wrapper is a plain allocate + launch + return.
+
+    The fused recipe reproduces only the launcher call, the output allocations,
+    and the return value.  A wrapper that also runs host-side statements with
+    observable effects -- a bare tensor-method call like ``out.zero_()``, an
+    augmented assignment, a loop, a conditional -- would have those effects
+    silently dropped on replay (e.g. a pre-launch ``zero_`` leaving stale data
+    in a region the device loop does not cover).  Such wrappers only emit a
+    ``TensorOperationInWrapper`` warning, which a kernel may suppress, so they
+    cannot be told apart at runtime by behavior; inspect the wrapper source.
+
+    Allowed statements: ``assert`` (specialization guards), plain ``x = ...``
+    and tuple-unpacking assignments (constexpr block sizes, shape unpacking,
+    ``x = x.view(...)`` reshapes -- pure, no side effect), the single
+    ``_launcher(...)`` call expressed as a bare ``Expr``, and the ``return``.
+    Anything else (a non-launcher ``Expr`` call, ``AugAssign``, ``For``, ``If``,
+    ``With``, ...) makes the kernel non-fuseable.
+    """
+    run = bound._run
+    if run is None:
+        return False
+    try:
+        source = textwrap.dedent(inspect.getsource(run))
+        tree = ast.parse(source)
+    except (OSError, TypeError, SyntaxError):
+        return False
+    func = tree.body[0]
+    if not isinstance(func, ast.FunctionDef):
+        return False
+    saw_launch = False
+    for stmt in func.body:
+        if isinstance(stmt, (ast.Assign, ast.AnnAssign, ast.Assert)):
+            continue
+        if isinstance(stmt, ast.Return):
+            continue
+        if isinstance(stmt, ast.Expr):
+            # The only bare expression statement allowed is the launcher call.
+            call = stmt.value
+            if (
+                isinstance(call, ast.Call)
+                and isinstance(call.func, ast.Name)
+                and call.func.id == "_launcher"
+            ):
+                saw_launch = True
+                continue
+            return False
+        # For / If / With / AugAssign / While / etc. -- host-side control flow
+        # or side effects the recipe cannot reproduce.
+        return False
+    return saw_launch
 
 
 def _disable(kernel: Kernel, result: object) -> object:
@@ -114,6 +196,14 @@ def fused_prime(kernel: Kernel, bound: BoundKernel, args: tuple[object, ...]) ->
     from . import _triton_direct_launch_ok
     from . import _triton_driver
     from . import default_launcher
+
+    # One-time source inspection: reject wrappers that do host-side work beyond
+    # allocate + launch + return (their side effects would be dropped on replay).
+    if kernel._fused_wrapper_ok is None:
+        kernel._fused_wrapper_ok = _wrapper_body_is_fuseable(bound)
+    if not kernel._fused_wrapper_ok:
+        # pyrefly: ignore [not-callable]
+        return _disable(kernel, bound._run(*args))
 
     captured: dict[str, Any] = {"n": 0}
 
@@ -252,11 +342,16 @@ def fused_prime(kernel: Kernel, bound: BoundKernel, args: tuple[object, ...]) ->
     namespace["_compiled"] = compiled  # keep alive so _run/_fn stay valid
     # pyrefly: ignore [missing-attribute]
     namespace["_active"] = _triton_driver().active
-    namespace["_Changed"] = _GlobalsChanged
+    namespace["_Changed"] = GlobalsChanged
     namespace["_empty_strided"] = torch.empty_strided
 
-    # Inline captured-globals verification: any mutated value raises, a deleted
-    # global raises KeyError; both are caught by the caller as a miss.
+    # Inline captured-globals verification: a mutated OR deleted global compares
+    # unequal (deletion reads the _MISSING sentinel via .get), raising
+    # GlobalsChanged so the caller takes the slow path (which re-validates and
+    # raises Triton's own error).
+    from . import _MISSING_GLOBAL
+
+    namespace["_MISSING"] = _MISSING_GLOBAL
     guard_conds: list[str] = []
     for gi, ((name, _), (val, gdict)) in enumerate(
         # pyrefly: ignore [missing-attribute]
@@ -264,7 +359,7 @@ def fused_prime(kernel: Kernel, bound: BoundKernel, args: tuple[object, ...]) ->
     ):
         namespace[f"_g{gi}"] = gdict
         namespace[f"_gv{gi}"] = val
-        guard_conds.append(f"_g{gi}[{name!r}] != _gv{gi}")
+        guard_conds.append(f"_g{gi}.get({name!r}, _MISSING) != _gv{gi}")
     guard = ""
     if guard_conds:
         guard = f"    if {' or '.join(guard_conds)}: raise _Changed\n"
@@ -288,9 +383,14 @@ def fused_prime(kernel: Kernel, bound: BoundKernel, args: tuple[object, ...]) ->
     exec(src, namespace)
     launch = cast("Callable[[tuple[object, ...]], object]", namespace["_launch"])
 
-    if kernel._fused_key_fn is None:
-        kernel._fused_key_fn = _build_flat_key_fn(args)
-    kernel._fused_recipes[kernel._fused_key_fn(args)] = launch
+    # Key on the same per-call, type-dispatched key the hot path uses.  It is
+    # strictly finer than the specialization key (includes exact metadata,
+    # scalar values, the user key= function, and the alignment bit), so a hit is
+    # always the specialization a real bind() would have chosen.  A key of None
+    # (unhandled arg type / no tensor) means "don't fuse this call".
+    fused_key = kernel._fused_dispatch_key(args)
+    if fused_key is not None:
+        kernel._fused_recipes[fused_key] = launch
     return result
 
 
@@ -313,13 +413,13 @@ def _return_expr(
     if tr is tuple or tr is list:
         parts: list[str] = []
         for n, elem in enumerate(cast("tuple[object, ...]", result)):
-            te = type(elem)
-            if te is torch.Tensor or te is torch.nn.Parameter:
+            elem_ty = type(elem)
+            if elem_ty is torch.Tensor or elem_ty is torch.nn.Parameter:
                 expr = alloc(cast("torch.Tensor", elem), launch_arg=False)
                 if expr is None:
                     return None
                 parts.append(expr)
-            elif te is int or te is float or te is bool or elem is None:
+            elif elem_ty is int or elem_ty is float or elem_ty is bool or elem is None:
                 namespace[f"_r{n}"] = elem
                 parts.append(f"_r{n}")
             else:
