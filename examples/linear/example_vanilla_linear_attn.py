@@ -7,44 +7,10 @@ Chunked linear attention with no decay and no correction term.
 
 from __future__ import annotations
 
-import math
-
-import torch
-
 from .linear_attention_engine import LinearAttentionVariant
-from .linear_attention_harness import DTYPE
-from .linear_attention_harness import Inputs
 from .linear_attention_harness import LinearAttentionExampleHarness
-from helion._testing import DEVICE
 
-
-def _make_inputs(
-    B: int,
-    H: int,
-    T: int,
-    D: int,
-    DV: int,
-    dtype: torch.dtype = DTYPE,
-    device: str | torch.device = DEVICE,
-    requires_grad: bool = False,
-) -> Inputs:
-    q = torch.randn(B, H, T, D, device=device, dtype=dtype, requires_grad=requires_grad)
-    k = torch.randn(B, H, T, D, device=device, dtype=dtype, requires_grad=requires_grad)
-    v = torch.randn(
-        B, H, T, DV, device=device, dtype=dtype, requires_grad=requires_grad
-    )
-    g = torch.zeros(B, H, T, device=device, dtype=dtype)
-    return Inputs(q=q, k=k, v=v, scale=1.0 / math.sqrt(D), g=g)
-
-
-VARIANT = LinearAttentionVariant.VANILLA
-
-HARNESS = LinearAttentionExampleHarness(
-    name="vanilla_linear_attn",
-    title="Vanilla Linear Attention",
-    variant=VARIANT,
-    make_inputs=_make_inputs,
-)
+HARNESS = LinearAttentionExampleHarness(variant=LinearAttentionVariant.VANILLA)
 
 # Module API consumed by run_linattn.py: test / benchmark / accuracy.
 test = HARNESS.test

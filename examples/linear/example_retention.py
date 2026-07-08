@@ -8,47 +8,10 @@ chunk_retention computes its own internal decay, so we do NOT pass g to FLA.
 
 from __future__ import annotations
 
-import math
-
-import torch
-
 from .linear_attention_engine import LinearAttentionVariant
-from .linear_attention_harness import DTYPE
-from .linear_attention_harness import Inputs
 from .linear_attention_harness import LinearAttentionExampleHarness
-from helion._testing import DEVICE
 
-
-def _make_inputs(
-    B: int,
-    H: int,
-    T: int,
-    D: int,
-    DV: int,
-    dtype: torch.dtype = DTYPE,
-    device: str | torch.device = DEVICE,
-    requires_grad: bool = False,
-) -> Inputs:
-    q = torch.randn(B, H, T, D, device=device, dtype=dtype, requires_grad=requires_grad)
-    k = torch.randn(B, H, T, D, device=device, dtype=dtype, requires_grad=requires_grad)
-    v = torch.randn(
-        B, H, T, DV, device=device, dtype=dtype, requires_grad=requires_grad
-    )
-    g_gamma = (
-        1 - 2.0 ** (-5 - torch.arange(H, dtype=torch.float32, device=device))
-    ).log()
-    g = g_gamma[None, :, None].expand(B, H, T).contiguous().to(dtype)
-    return Inputs(q=q, k=k, v=v, scale=1.0 / math.sqrt(D), g=g)
-
-
-VARIANT = LinearAttentionVariant.RETENTION
-
-HARNESS = LinearAttentionExampleHarness(
-    name="retention",
-    title="Retention",
-    variant=VARIANT,
-    make_inputs=_make_inputs,
-)
+HARNESS = LinearAttentionExampleHarness(variant=LinearAttentionVariant.RETENTION)
 
 # Module API consumed by run_linattn.py: test / benchmark / accuracy.
 test = HARNESS.test
