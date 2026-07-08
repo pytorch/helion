@@ -14,6 +14,8 @@ from __future__ import annotations
 
 import ast
 import types
+from typing import Any
+from typing import cast
 import unittest
 from unittest.mock import patch
 
@@ -1450,6 +1452,14 @@ class TestOwnerCacheCodegen(unittest.TestCase):
         self.assertIn("jnp.maximum(_wid - 1, 0)", code)  # previous-owner comparison
         # One head-major cache buffer per ordered operand (k_hm, v_hm).
         self.assertGreaterEqual(code.count("_hm"), 2)
+        # The prep-cache refill masks only the final partial ordered tile, so cache
+        # contents do not rely on a later _mask_to and full tiles stay fast.
+        self.assertIn("_oc_full_nkv", code)
+        self.assertIn("_oc_refill_tail", code)
+        self.assertIn("kv_len_ref[_wid]", code)
+        self.assertIn("broadcasted_iota", code)
+        self.assertIn("jnp.where", code)
+        self.assertIn("jnp.zeros_like", code)
         # The reduction reads K/V from the cache buffer.
         self.assertRegex(code, r"=\s*\w*_hm\[")
 
@@ -1458,7 +1468,7 @@ class TestOwnerCacheGating(unittest.TestCase):
     """owner_cache has two gates: resident windows need a checkable ordered bound,
     while prep caches additionally need a proven supported prep."""
 
-    def _owner_cache_plan(self):
+    def _owner_cache_plan(self, prep_perm=(1, 0, 2)):
         return CompactWorklistPlan(
             axes=(
                 Axis("owner_grid", 0, "seq", ast.Constant(0), ast.Constant(1), "1"),
@@ -1481,11 +1491,11 @@ class TestOwnerCacheGating(unittest.TestCase):
                     packed_offset_arg="kvo",
                 ),
             ),
-            tensor_policies=(TensorPolicy("k", "ordered_reduction", (1, 0, 2)),),
+            tensor_policies=(TensorPolicy("k", "ordered_reduction", prep_perm),),
             upper_bound_expr="",
         )
 
-    def _active_owner_cache_decision(self):
+    def _active_owner_cache_decision(self, prep_perm=(1, 0, 2)):
         from helion._compiler.pallas.compact_worklist import OwnerCacheDecision
         from helion._compiler.pallas.compact_worklist import OwnerCachePrepSpec
         from helion._compiler.pallas.compact_worklist import OwnerCacheRangeSpec
@@ -1494,7 +1504,7 @@ class TestOwnerCacheGating(unittest.TestCase):
 
         return OwnerCacheDecision(
             resident_operands=(OwnerCacheResidentSpec("k"),),
-            preps=(OwnerCachePrepSpec("k", (1, 0, 2)),),
+            preps=(OwnerCachePrepSpec("k", prep_perm),),
             range_spec=OwnerCacheRangeSpec("kvo", "qo"),
             window=OwnerCacheWindowSpec(
                 physical_window=64,
@@ -1579,12 +1589,106 @@ acc = k_hm0 + k_hm1
             ),
             self.assertLogs("helion.language._tracing_ops", level="DEBUG") as logs,
         ):
-            _emit_owner_cache(state, [2], ["nkv"], body_stmts, [(fake_k, None, None)])
+            _emit_owner_cache(
+                cast("Any", state),
+                [2],
+                ["nkv"],
+                cast("list[ast.AST]", body_stmts),
+                [(fake_k, None, None)],
+            )
 
         self.assertEqual([ast.dump(stmt) for stmt in body_stmts], before)
         self.assertEqual(state.device_function.scratch, [])
         self.assertEqual(state.statements, [])
         self.assertIn("skipping prep cache hoist", "\n".join(logs.output))
+
+    def _emit_owner_cache_refill_code(self, perm, shape, load_slice):
+        from helion.language._tracing_ops import _emit_owner_cache
+
+        class _FakeTensorArg:
+            name = "k_ref"
+
+            def host_str(self):
+                return "k"
+
+        class _FakeDeviceFunction:
+            def __init__(self):
+                self.scratch = []
+                self._var_counts = {}
+
+            def tensor_arg(self, _fake):
+                return _FakeTensorArg()
+
+            def block_size_var(self, _block_id):
+                return "8"
+
+            def register_scratch(self, *args, **kwargs):
+                self.scratch.append((args, kwargs))
+                return "k_cache"
+
+            def new_var(self, prefix):
+                count = self._var_counts.get(prefix, 0)
+                self._var_counts[prefix] = count + 1
+                return prefix if count == 0 else f"{prefix}_{count}"
+
+        class _FakeState:
+            def __init__(self):
+                self.device_function = _FakeDeviceFunction()
+                self.statements = []
+
+            def add_statement(self, stmt):
+                self.statements.append(stmt)
+
+        fake_k = torch.empty(*shape)
+        state = _FakeState()
+        env = types.SimpleNamespace(
+            compact_worklist_plan=self._owner_cache_plan(perm),
+            compact_worklist_owner_cache_decision=self._active_owner_cache_decision(
+                perm
+            ),
+        )
+        body_stmts = ast.parse(
+            f"""
+k_blk = k_ref[{load_slice}]
+k_hm = jnp.transpose(k_blk, {list(perm)})
+acc = k_hm
+"""
+        ).body
+
+        with patch(
+            "helion.language._tracing_ops.CompileEnvironment.current",
+            return_value=env,
+        ):
+            _emit_owner_cache(
+                cast("Any", state),
+                [2],
+                ["nkv"],
+                cast("list[ast.AST]", body_stmts),
+                [(fake_k, None, None)],
+            )
+
+        self.assertEqual(len(state.statements), 1)
+        return ast.unparse(state.statements[0])
+
+    def test_owner_cache_tail_mask_tracks_transposed_ordered_axis(self):
+        refill = self._emit_owner_cache_refill_code(
+            (1, 0, 2), (64, 4, 128), "tile_kv, :, :"
+        )
+        self.assertIn("_oc_full_nkv = kv_len_ref[_wid] // 8", refill)
+        self.assertIn("jax.lax.fori_loop(0, _oc_full_nkv", refill)
+        self.assertIn("@pl.when(_oc_full_nkv < nkv)", refill)
+        self.assertIn(
+            "broadcasted_iota(jnp.int32, (1, 8, 1), 1)",
+            refill,
+        )
+
+        refill = self._emit_owner_cache_refill_code(
+            (1, 2, 0, 3), (64, 2, 4, 128), "tile_kv, :, :, :"
+        )
+        self.assertIn(
+            "broadcasted_iota(jnp.int32, (1, 1, 8, 1), 2)",
+            refill,
+        )
 
     def test_active_owner_cache_requires_range_start_metadata(self):
         from helion._compiler.backend import PallasBackend

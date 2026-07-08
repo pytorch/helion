@@ -378,6 +378,7 @@ def _emit_owner_cache(
     no longer matches the recognized prep, leave the body unchanged and keep the
     correct resident-only lowering.
     """
+    from .._compiler.pallas.compact_worklist import ordered_ref_names
     from .._compiler.pallas.compact_worklist import owner_ref_name
 
     env = CompileEnvironment.current()
@@ -463,14 +464,17 @@ def _emit_owner_cache(
 
     assert decision.window is not None
     blk = state.device_function.block_size_var(block_ids[0])
+    assert blk is not None
     cache_ordered = decision.window.physical_window
     owner_ref = f"{owner_ref_name(plan)}_ref"
+    range_len_ref = f"{ordered_ref_names(plan)[1]}_ref"
     nkv = grid_parts[0]
 
     # Register a cache scratch per window (prepped layout) and build, for each
-    # prep, the replacement reduction read + the refill line.
+    # prep, the replacement reduction read + the full/tail refill lines.
     cache_name: dict[str, str] = {}
-    refill_lines: list[str] = []
+    refill_full_lines: list[str] = []
+    refill_tail_lines: list[str] = []
     replace: dict[int, ast.stmt] = {}  # transpose stmt id -> cache-read stmt
     for tr_stmt, _load_var, window, sl, perm in preps:
         fake = window_fake[window]
@@ -487,13 +491,42 @@ def _emit_owner_cache(
         elts = [ast.unparse(e) for e in _oc_slice_elts(sl)]
         read = f"{cache}[{', '.join(elts[p] for p in perm)}]"
         replace[id(tr_stmt)] = statement_from_string(f"{target.id} = {read}")
-        # refill: transpose this owner's window tiles into the cache once.
+        # refill: full ordered tiles are valid as-is.  Only the final partial tile
+        # needs zeroing: the resident window is sized to C and starts at
+        # range_start, so lanes past range_len can contain following-owner data.
         rank = len(perm)
         win_elts = [f"pl.ds(_octk * {blk}, {blk})", *([":"] * (rank - 1))]
         wr = f"{window}[{', '.join(win_elts)}]"
         cw = ", ".join(win_elts[p] for p in perm)
-        refill_lines.append(
-            f"        {cache}[{cw}] = jnp.transpose({wr}, {list(perm)})"
+        # Where the ordered (dim-0) index lands post-transpose.
+        ord_axis = perm.index(0)
+        mask_dims = [blk if i == ord_axis else "1" for i in range(rank)]
+        mask_shape = f"({mask_dims[0]},)" if rank == 1 else f"({', '.join(mask_dims)})"
+        full_src_var = state.device_function.new_var("_oc_src")
+        refill_full_lines.extend(
+            [
+                f"        {full_src_var} = jnp.transpose({wr}, {list(perm)})",
+                f"        {cache}[{cw}] = {full_src_var}",
+            ]
+        )
+        # Zero the ordered tail in the TRANSPOSED layout the cache is stored in.
+        # Use broadcasted_iota positioned on the transposed ordered axis; Mosaic
+        # rejects arange().reshape() shape-casts for this mask.
+        tail_src_var = state.device_function.new_var("_oc_src")
+        mask_var = state.device_function.new_var("_oc_mask")
+        refill_tail_lines.extend(
+            [
+                f"        {tail_src_var} = jnp.transpose({wr}, {list(perm)})",
+                (
+                    f"        {mask_var} = (_octk * {blk} + jax.lax.broadcasted_iota("
+                    f"jnp.int32, {mask_shape}, {ord_axis})) < {range_len_ref}[_wid]"
+                ),
+                (
+                    f"        {cache}[{cw}] = "
+                    f"jnp.where({mask_var}, {tail_src_var}, "
+                    f"jnp.zeros_like({tail_src_var}))"
+                ),
+            ]
         )
 
     # Rewrite the body: swap each prep transpose for its cache read and drop the
@@ -531,10 +564,15 @@ def _emit_owner_cache(
         f"@pl.when((_wid == 0) | "
         f"({owner_ref}[_wid] != {owner_ref}[jnp.maximum(_wid - 1, 0)]))\n"
         f"def _oc_refill():\n"
+        f"    _oc_full_nkv = {range_len_ref}[_wid] // {blk}\n"
         f"    def _oc_refill_body(_octk, _oc_carry):\n"
-        f"{chr(10).join(refill_lines)}\n"
+        f"{chr(10).join(refill_full_lines)}\n"
         f"        return _oc_carry\n"
-        f"    jax.lax.fori_loop(0, {nkv}, _oc_refill_body, ())"
+        f"    jax.lax.fori_loop(0, _oc_full_nkv, _oc_refill_body, ())\n"
+        f"    @pl.when(_oc_full_nkv < {nkv})\n"
+        f"    def _oc_refill_tail():\n"
+        f"        _octk = _oc_full_nkv\n"
+        f"{chr(10).join(refill_tail_lines)}"
     )
     state.add_statement(statement_from_string(refill_src))
 

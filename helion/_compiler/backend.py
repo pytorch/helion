@@ -2814,6 +2814,10 @@ class PallasBackend(Backend):
             prep_operands.append((tuple(int(s) for s in arg.shape), arg.dtype.itemsize))
         import jax.experimental.pallas.tpu as pltpu
 
+        # Choose C from the conservative device-reported VMEM budget.  The runtime
+        # may pass a higher Mosaic compile ceiling for owner-cache kernels so TPU7x
+        # accepts this already-sized allocation, but that ceiling is deliberately
+        # not used here as an allocation budget.
         vmem_bytes = _get_vmem_limit_bytes(pltpu)
         budget_capacity = compact_ordered_budget_capacity(
             resident_operands, vmem_bytes, prep_operands=prep_operands
