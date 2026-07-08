@@ -52,7 +52,17 @@ jobs:
         if: startsWith(matrix.image, 'nvidia')
         run: |
           echo "Detected NVIDIA image"
+          echo "== runner name: ${RUNNER_NAME:-unknown} =="
+          set +e
           nvidia-smi || echo "nvidia-smi not found"
+          echo "== /dev/nvidia* devices =="
+          ls -la /dev/nvidia* 2>&1
+          echo "== NVIDIA kernel modules =="
+          lsmod 2>/dev/null | grep -i nvidia || cat /proc/modules 2>/dev/null | grep -i nvidia || echo "module list unavailable"
+          echo "== NVIDIA/CUDA env =="
+          env | grep -E '^(NVIDIA|CUDA)_' | sort || true
+          echo "== fabric-manager socket (host mount, best-effort) =="
+          ls -la /var/run/nvidia-fabricmanager* 2>&1 || true
 
       - name: Run ROCm command
         if: startsWith(matrix.image, 'rocm')
@@ -252,22 +262,54 @@ jobs:
         if: startsWith(matrix.image, 'nvidia')
         run: |
           source .venv/bin/activate
-          python -c "
-          import torch, sys
+          # Retry once with a short sleep — CUDA init on B200 occasionally races
+          # with UVM device-node creation right after container start. On the
+          # second failure, dump environment/device state before failing.
+          check_cuda() {
+            python - <<'PY'
+          import os, sys, traceback
+          import torch
 
-          assert torch.cuda.is_available(), 'FATAL: CUDA not available'
+          try:
+              torch.cuda.init()
+          except Exception:
+              print("torch.cuda.init() raised:", file=sys.stderr)
+              traceback.print_exc()
+              print("CUDA_VISIBLE_DEVICES=", os.environ.get("CUDA_VISIBLE_DEVICES"), file=sys.stderr)
+              print("NVIDIA_VISIBLE_DEVICES=", os.environ.get("NVIDIA_VISIBLE_DEVICES"), file=sys.stderr)
+              sys.exit(1)
+
+          assert torch.cuda.is_available(), "FATAL: CUDA not available"
           n = torch.cuda.device_count()
-          assert n > 0, 'FATAL: No CUDA devices found'
-          print(f'CUDA devices: {n}')
+          assert n > 0, "FATAL: No CUDA devices found"
+          print(f"CUDA devices: {n}")
 
           for i in range(n):
-              dev = torch.device('cuda', i)
+              dev = torch.device("cuda", i)
               a = torch.randn(256, 256, device=dev)
-              b = (a @ a).sum().item()
-              print(f'  Device {i} ({torch.cuda.get_device_name(i)}): OK')
+              (a @ a).sum().item()
+              print(f"  Device {i} ({torch.cuda.get_device_name(i)}): OK")
 
-          print(f'All {n} devices healthy')
-          "
+          print(f"All {n} devices healthy")
+          PY
+          }
+
+          for attempt in 1 2; do
+            if check_cuda; then
+              exit 0
+            fi
+            echo "CUDA check attempt ${attempt} failed"
+            echo "== /dev/nvidia* =="
+            ls -la /dev/nvidia* 2>&1 || true
+            echo "== nvidia-smi (post-fail) =="
+            nvidia-smi 2>&1 || echo "nvidia-smi failed"
+            if [ "${attempt}" -eq 1 ]; then
+              echo "sleeping 15s before retry"
+              sleep 15
+            fi
+          done
+          echo "CUDA check failed on runner ${RUNNER_NAME:-unknown} after retry"
+          exit 1
 
       - name: Inductor Worker Check
         if: startsWith(matrix.image, 'nvidia')
