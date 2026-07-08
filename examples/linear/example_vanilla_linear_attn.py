@@ -16,7 +16,7 @@ from .linear_attention_engine import DecayType
 from .linear_attention_engine import LinearAttentionVariant
 from .linear_attention_harness import DTYPE
 from .linear_attention_harness import Inputs
-from .linear_attention_harness import LinearAttentionHarness
+from .linear_attention_harness import LinearAttentionExampleHarness
 from helion._testing import DEVICE
 
 try:
@@ -54,7 +54,7 @@ def _fla_fwd(i: Inputs, scale: float) -> torch.Tensor:
 
 VARIANT = LinearAttentionVariant(decay=DecayType.NONE)
 
-HARNESS = LinearAttentionHarness(
+HARNESS = LinearAttentionExampleHarness(
     name="vanilla_linear_attn",
     title="Vanilla Linear Attention",
     variant=VARIANT,

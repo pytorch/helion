@@ -1,6 +1,6 @@
 """Shared test / benchmark / accuracy for the linear-attention example variants.
 
-Each example builds a `LinearAttentionHarness` naming its kernel variant,
+Each example builds a `LinearAttentionExampleHarness` naming its kernel variant,
 how to make inputs, and how to call FLA, then calls run_test / run_benchmark /
 run_accuracy here.
 """
@@ -48,7 +48,7 @@ class Inputs:
 
 
 @dataclass
-class LinearAttentionHarness:
+class LinearAttentionExampleHarness:
     """Test, benchmark, and accuracy harness for one linear-attention variant."""
 
     name: str
@@ -100,11 +100,13 @@ class LinearAttentionHarness:
         )
 
 
-def _grad_leaves(v: LinearAttentionHarness, inputs: Inputs) -> tuple[Inputs, list]:
+def _grad_leaves(
+    harness: LinearAttentionExampleHarness, inputs: Inputs
+) -> tuple[Inputs, list]:
     """Copy of inputs with grad_tensors swapped for fresh requires_grad copies."""
     out = dataclasses.replace(inputs)
     leaves = []
-    for name in v.grad_tensors:
+    for name in harness.grad_tensors:
         leaf = getattr(out, name).detach().clone().requires_grad_(True)
         setattr(out, name, leaf)
         leaves.append(leaf)
@@ -121,13 +123,15 @@ def _fla_inputs(inputs: Inputs) -> Inputs:
     return out
 
 
-def _recurrent_error(variant: LinearAttentionHarness, inputs: Inputs, C: int) -> float:
+def _recurrent_error(
+    harness: LinearAttentionExampleHarness, inputs: Inputs, C: int
+) -> float:
     """Rel error of the chunked output vs the step-by-step recurrent_step loop."""
     q, k, v, g, scale = inputs.q, inputs.k, inputs.v, inputs.g, inputs.scale
     B, H, T, D = q.shape
     DV = v.shape[-1]
 
-    o_chunked = variant.helion_fwd(inputs, C)
+    o_chunked = harness.helion_fwd(inputs, C)
 
     state = q.new_zeros(B, H, D, DV, dtype=torch.float32)
     o_steps = []
@@ -148,30 +152,30 @@ def _recurrent_error(variant: LinearAttentionHarness, inputs: Inputs, C: int) ->
 
 
 def run_test(
-    v: LinearAttentionHarness,
+    harness: LinearAttentionExampleHarness,
     test_shape: tuple[int, int, int, int, int],
     C: int,
 ) -> None:
     """Forward + backward correctness vs reference and FLA."""
     torch.manual_seed(42)
     B, H, T, D, DV = test_shape
-    inputs = v.make_inputs(B, H, T, D, DV, dtype=v.dtype, device=DEVICE)
+    inputs = harness.make_inputs(B, H, T, D, DV, dtype=harness.dtype, device=DEVICE)
     scale = inputs.scale
 
     # === Forward: vs naive recurrent reference ===
-    out = v.helion_fwd(inputs, C)
-    ref = v.reference(inputs)
+    out = harness.helion_fwd(inputs, C)
+    ref = harness.reference(inputs)
     fwd_err = _rel_error(out, ref)
     assert fwd_err < ACC_FWD_TOL, f"Forward error: {fwd_err}"
     print(f"  fwd vs recurrent: {fwd_err:.4e} PASS")
 
     # === Forward: vs FLA (fla_fwd is None when fla is not installed) ===
-    if v.fla_fwd is None:
+    if harness.fla_fwd is None:
         warnings.warn("fla not installed, skipping FLA comparisons", stacklevel=1)
         has_fla = False
     else:
         # fla_fwd returns time-first; transpose back to compare (untimed).
-        o_fla = v.fla_fwd(_fla_inputs(inputs), scale).transpose(1, 2).contiguous()
+        o_fla = harness.fla_fwd(_fla_inputs(inputs), scale).transpose(1, 2).contiguous()
         fla_err = _rel_error(out, o_fla)
         print(
             f"  fwd vs FLA:       {fla_err:.4e}"
@@ -180,21 +184,21 @@ def run_test(
         has_fla = True
 
     # === Backward: Helion grads vs chunked reference ===
-    grad_out = torch.randn(B, H, T, DV, device=DEVICE, dtype=v.dtype)
-    h_inputs, h_leaves = _grad_leaves(v, inputs)
-    v.helion_fb(h_inputs, grad_out, C)
-    r_inputs, r_leaves = _grad_leaves(v, inputs)
-    v.chunked_reference(r_inputs, C).backward(grad_out)
-    for name, hl, rl in zip(v.grad_tensors, h_leaves, r_leaves, strict=True):
+    grad_out = torch.randn(B, H, T, DV, device=DEVICE, dtype=harness.dtype)
+    h_inputs, h_leaves = _grad_leaves(harness, inputs)
+    harness.helion_fb(h_inputs, grad_out, C)
+    r_inputs, r_leaves = _grad_leaves(harness, inputs)
+    harness.chunked_reference(r_inputs, C).backward(grad_out)
+    for name, hl, rl in zip(harness.grad_tensors, h_leaves, r_leaves, strict=True):
         err = _rel_error(hl.grad, rl.grad)
         assert err < ACC_BWD_TOL, f"Backward d{name} error: {err}"
         print(f"  bwd d{name} vs ref: {err:.4e} PASS")
 
     # === Backward: Helion grads vs FLA (dq asserted, dk/dv info) ===
     if has_fla:
-        f_inputs, f_leaves = _grad_leaves(v, _fla_inputs(inputs))
-        v.fla_fb(f_inputs, _htf(grad_out), scale)
-        for name, hl, fl in zip(v.grad_tensors, h_leaves, f_leaves, strict=True):
+        f_inputs, f_leaves = _grad_leaves(harness, _fla_inputs(inputs))
+        harness.fla_fb(f_inputs, _htf(grad_out), scale)
+        for name, hl, fl in zip(harness.grad_tensors, h_leaves, f_leaves, strict=True):
             err = _rel_error(hl.grad, fl.grad.transpose(1, 2).contiguous())
             gate = (
                 f" {'PASS' if err < ACC_BWD_TOL else 'FAIL'}"
@@ -204,8 +208,8 @@ def run_test(
             print(f"  bwd d{name} vs FLA:  {err:.4e}{gate}")
 
     # === Recurrent step: chunked vs step-by-step recurrent_step ===
-    if v.check_recurrent:
-        rec_err = _recurrent_error(v, inputs, C)
+    if harness.check_recurrent:
+        rec_err = _recurrent_error(harness, inputs, C)
         assert rec_err < ACC_BWD_TOL, f"Recurrent vs chunked error: {rec_err}"
         print(f"  recurrent step:   {rec_err:.4e} PASS")
 
@@ -213,27 +217,31 @@ def run_test(
 
 
 def _time_config(
-    v: LinearAttentionHarness,
+    harness: LinearAttentionExampleHarness,
     shape: tuple[int, int, int, int, int],
     C: int,
 ) -> tuple[float, float, float, float]:
     """Time helion/FLA forward and fwd+bwd for one shape."""
     bi, hi, ti, di, dvi = shape
-    inputs = v.make_inputs(
-        bi, hi, ti, di, dvi, dtype=v.dtype, device=DEVICE, requires_grad=True
+    inputs = harness.make_inputs(
+        bi, hi, ti, di, dvi, dtype=harness.dtype, device=DEVICE, requires_grad=True
     )
     scale = inputs.scale
-    grad_out = torch.randn(bi, hi, ti, dvi, device=DEVICE, dtype=v.dtype)
+    grad_out = torch.randn(bi, hi, ti, dvi, device=DEVICE, dtype=harness.dtype)
     fla_inputs = _fla_inputs(inputs)
     go_t = _htf(grad_out)
-    h_grads = [getattr(inputs, n) for n in v.grad_tensors]
-    fla_grads = [getattr(fla_inputs, n) for n in v.grad_tensors]
+    h_grads = [getattr(inputs, n) for n in harness.grad_tensors]
+    fla_grads = [getattr(fla_inputs, n) for n in harness.grad_tensors]
 
-    fwd_ms = do_bench(lambda: v.helion_fwd(inputs, C))
-    fla_fwd_ms = do_bench(lambda: v.fla_fwd(fla_inputs, scale))  # type: ignore[misc]
-    fb_ms = do_bench(lambda: v.helion_fb(inputs, grad_out, C), grad_to_none=h_grads)
+    fwd_ms = do_bench(lambda: harness.helion_fwd(inputs, C))
+    fla_fwd_ms = do_bench(
+        lambda: harness.fla_fwd(fla_inputs, scale)  # type: ignore[misc]
+    )
+    fb_ms = do_bench(
+        lambda: harness.helion_fb(inputs, grad_out, C), grad_to_none=h_grads
+    )
     fla_fb_ms = do_bench(
-        lambda: v.fla_fb(fla_inputs, go_t, scale),
+        lambda: harness.fla_fb(fla_inputs, go_t, scale),
         grad_to_none=fla_grads,
     )
     return (
@@ -245,7 +253,7 @@ def _time_config(
 
 
 def run_benchmark(
-    v: LinearAttentionHarness,
+    harness: LinearAttentionExampleHarness,
     configs: list,
     C: int,
 ) -> list[tuple[str, float, float, float, float]]:
@@ -255,7 +263,7 @@ def run_benchmark(
     per config; empty when fla is unavailable.
     """
     rows: list[tuple[str, float, float, float, float]] = []
-    if v.fla_fwd is None:
+    if harness.fla_fwd is None:
         # also None when the variant has no comparable FLA op
         warnings.warn("fla not installed, skipping benchmark", stacklevel=1)
         return rows
@@ -267,7 +275,7 @@ def run_benchmark(
     print("-" * 72)
 
     for shape in configs:
-        fwd_ms, fla_fwd_ms, fb_ms, fla_fb_ms = _time_config(v, shape, C)
+        fwd_ms, fla_fwd_ms, fb_ms, fla_fb_ms = _time_config(harness, shape, C)
         cfg = f"({','.join(str(x) for x in shape)})"
         print(
             f"{cfg:<24} {fwd_ms:>10.3f} {fla_fwd_ms:>10.3f}"
@@ -279,7 +287,7 @@ def run_benchmark(
 
 
 def run_accuracy(
-    v: LinearAttentionHarness,
+    harness: LinearAttentionExampleHarness,
     configs: list,
     C: int,
 ) -> list[tuple[str, str]]:
@@ -293,33 +301,35 @@ def run_accuracy(
     """
     verdicts: list[tuple[str, str]] = []
     for bi, hi, ti, di, dvi in configs:
-        inputs = v.make_inputs(bi, hi, ti, di, dvi, dtype=v.dtype, device=DEVICE)
+        inputs = harness.make_inputs(
+            bi, hi, ti, di, dvi, dtype=harness.dtype, device=DEVICE
+        )
 
         try:
-            out = v.helion_fwd(inputs, C)
+            out = harness.helion_fwd(inputs, C)
         except Exception:
             torch.cuda.empty_cache()
             fwd = "HEL-ERR"
         else:
             try:
-                ref = v.reference(inputs)
+                ref = harness.reference(inputs)
             except Exception:
                 torch.cuda.empty_cache()
                 fwd = "REF-ERR"
             else:
                 fwd = "ok" if _rel_error(out, ref) < ACC_FWD_TOL else "FAIL"
 
-        grad_out = torch.randn(bi, hi, ti, dvi, device=DEVICE, dtype=v.dtype)
+        grad_out = torch.randn(bi, hi, ti, dvi, device=DEVICE, dtype=harness.dtype)
         try:
-            h_inputs, h_leaves = _grad_leaves(v, inputs)
-            v.helion_fwd(h_inputs, C).backward(grad_out)
+            h_inputs, h_leaves = _grad_leaves(harness, inputs)
+            harness.helion_fwd(h_inputs, C).backward(grad_out)
         except Exception:
             torch.cuda.empty_cache()
             bwd = "HEL-ERR"
         else:
             try:
-                r_inputs, r_leaves = _grad_leaves(v, inputs)
-                v.chunked_reference(r_inputs, C).backward(grad_out)
+                r_inputs, r_leaves = _grad_leaves(harness, inputs)
+                harness.chunked_reference(r_inputs, C).backward(grad_out)
             except Exception:
                 torch.cuda.empty_cache()
                 bwd = "REF-ERR"
