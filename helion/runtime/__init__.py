@@ -262,7 +262,6 @@ def _pallas_make_block_spec(
 
 
 _CACHED_VMEM_LIMIT_BYTES: int | None = None
-_OWNER_CACHE_SCOPED_VMEM_LIMIT_BYTES = 128 * 1024 * 1024
 
 
 def _get_vmem_limit_bytes(pltpu: object) -> int:
@@ -294,15 +293,6 @@ def _get_vmem_limit_bytes(pltpu: object) -> int:
         _CACHED_VMEM_LIMIT_BYTES = 16 * 1024 * 1024
 
     return _CACHED_VMEM_LIMIT_BYTES
-
-
-def _compact_owner_cache_vmem_limit_bytes(pltpu: object) -> int:
-    """Scoped VMEM ceiling for compact-worklist owner-resident kernels.
-
-    TODO: derive this from generation-specific TPU info once Mosaic exposes the
-    scoped limit separately from the conservative default capacity.
-    """
-    return max(_get_vmem_limit_bytes(pltpu), _OWNER_CACHE_SCOPED_VMEM_LIMIT_BYTES)
 
 
 def _ordered_per_token_bytes(operands: list[tuple[tuple[int, ...], int]]) -> int:
@@ -2365,18 +2355,13 @@ def _pallas_compile_compact_jit_fn(
                 # it for validation.  Detection also now restricts to packed (so
                 # work order == row order); see detect_compact_worklist_plan.
                 dimension_semantics=("arbitrary",),
-                # owner_cache holds a resident window (double-buffered) + a
-                # persistent transpose cache; that footprint (sized from the
-                # compile-threaded ordered window) exceeds Mosaic's conservative
-                # default scoped-VMEM ceiling, so raise it -- but ONLY when
-                # owner_cache is active (a resident ordered window exists).  A
-                # streamed compact_worklist kernel (no ordered window) keeps the
-                # platform default ceiling, so this feature does not broaden VMEM
-                # behavior for kernels that do not use it (a genuinely oversized
-                # streamed kernel still fails, as before).  The raised value is a
-                # ceiling, not a reservation (actual use stays under it).
+                # owner_cache sizes its physical window from _get_vmem_limit_bytes
+                # during backend setup.  This 128MiB floor is ONLY a Mosaic compile
+                # ceiling so TPU7x accepts that already-sized allocation; do not use
+                # it to choose C.  A streamed compact_worklist kernel keeps the
+                # platform default ceiling.
                 vmem_limit_bytes=(
-                    _compact_owner_cache_vmem_limit_bytes(pltpu)
+                    max(_get_vmem_limit_bytes(pltpu), 128 * 1024 * 1024)
                     if ordered_aligned_arg_indices
                     else _get_vmem_limit_bytes(pltpu)
                 ),
