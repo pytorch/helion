@@ -17,7 +17,6 @@ from typing import TypeVar
 import torch
 
 from ..runtime.settings import _env_get_bool
-from ..runtime.settings import _get_backend
 from ..runtime.settings import is_pallas_interpret
 from .progress_bar import iter_with_progress
 from helion._dist_utils import sync_object
@@ -138,33 +137,8 @@ def _get_tpu_tensors(result: object) -> list[torch.Tensor]:
 
 
 def synchronize_device(result: object = None) -> None:
-    """Wait for device computation to complete.
-
-    For TPU tensors, uses ``torch_tpu``'s tensor-level sync which truly
-    blocks until the device finishes (``torch.accelerator.synchronize()``
-    does not reliably wait on ``torch_tpu``).  For all other cases, falls
-    back to ``torch.accelerator.synchronize()``.
-    """
-    tpu_tensors = _get_tpu_tensors(result)
-    if tpu_tensors:
-        try:
-            from torch_tpu._internal.sync import (  # pyrefly: ignore[missing-import]
-                synchronize as tpu_sync,
-            )
-
-            tpu_sync(tpu_tensors, wait=True)
-            return
-        except ImportError:
-            raise ImportError(
-                "torch_tpu is required for reliable device synchronization on TPU. "
-                "Install torch_tpu or torch.accelerator.synchronize() will return "
-                "before device computation finishes, producing incorrect benchmarks."
-            ) from None
-    if (
-        not is_pallas_interpret()
-        and _get_backend() != "pallas"
-        and torch.accelerator.is_available()
-    ):
+    """Wait for device computation to complete."""
+    if not is_pallas_interpret() and torch.accelerator.is_available():
         torch.accelerator.synchronize()
 
 
