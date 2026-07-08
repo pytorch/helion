@@ -129,7 +129,7 @@ jobs:
             uv pip install -U "torch==${VERSION}.*" --index-url https://download.pytorch.org/whl/${{ matrix.runtime-version }}
           elif [[ "${{ matrix.runtime-version }}" == "tpu" ]]; then
             # Use the latest PyTorch wheel known to work with TorchTPU.
-            uv pip install -U --pre "torch==2.14.0.dev20260701" --index-url https://download.pytorch.org/whl/nightly/cpu
+            uv pip install -U --pre "torch==2.14.0.dev20260707" --index-url https://download.pytorch.org/whl/nightly/cpu
           else
             # Default to nightly
             # On OSDC, route nightly through the pypi-cache /whl proxy (deps stay reachable behind the egress firewall) and clear the cache index vars so it wins over the cache default; off OSDC PYPI_CACHE_WHL_URL is unset so we hit download.pytorch.org.
