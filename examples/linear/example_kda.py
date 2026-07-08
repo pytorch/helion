@@ -14,17 +14,12 @@ from .linear_attention_harness import LinearAttentionExampleHarness
 
 HARNESS = LinearAttentionExampleHarness(variant=LinearAttentionVariant.KDA)
 
-# Module API consumed by run_linattn.py: test / benchmark / accuracy.
-test = HARNESS.test
-benchmark = HARNESS.benchmark
-accuracy = HARNESS.accuracy
-
 
 def main() -> None:
     print(f"=== {HARNESS.title} ===")
-    test()
+    HARNESS.test()
     print()
-    benchmark()
+    HARNESS.benchmark()
 
 
 if __name__ == "__main__":

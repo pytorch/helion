@@ -157,8 +157,9 @@ def main() -> None:
     for name in names:
         print(f"=== {name} ===")
         mod = importlib.import_module(f"examples.linear.example_{name}")
-        verdicts[name] = mod.accuracy(bench_configs)
-        results[name] = mod.benchmark(bench_configs)
+        harness = mod.HARNESS
+        verdicts[name] = harness.accuracy(bench_configs)
+        results[name] = harness.benchmark(bench_configs)
 
     if args.output:
         write_results_json(args.output, results, verdicts)
