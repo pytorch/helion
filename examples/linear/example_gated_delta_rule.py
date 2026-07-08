@@ -9,7 +9,6 @@ via beta.
 from __future__ import annotations
 
 import math
-from typing import Any
 
 import torch
 import torch.nn.functional as F
@@ -19,14 +18,6 @@ from .linear_attention_harness import DTYPE
 from .linear_attention_harness import Inputs
 from .linear_attention_harness import LinearAttentionExampleHarness
 from helion._testing import DEVICE
-
-try:
-    from fla.ops.gated_delta_rule import (
-        chunk_gated_delta_rule as _fla_chunk,  # pyrefly: ignore[missing-import]
-    )
-except ImportError:
-    _fla_chunk = None
-_fla_chunk_gated_delta_rule: Any = _fla_chunk
 
 
 def _make_inputs(
@@ -51,12 +42,6 @@ def _make_inputs(
     return Inputs(q=q, k=k, v=v, scale=1.0 / math.sqrt(D), g=g, beta=beta)
 
 
-def _fla_fwd(i: Inputs, scale: float) -> torch.Tensor:
-    # FLA arg order: q, k, v, g, beta (g before beta)
-    o, _ = _fla_chunk_gated_delta_rule(i.q, i.k, i.v, i.g, i.beta, scale=scale)
-    return o
-
-
 VARIANT = LinearAttentionVariant.GATED_DELTA_RULE
 
 HARNESS = LinearAttentionExampleHarness(
@@ -64,7 +49,6 @@ HARNESS = LinearAttentionExampleHarness(
     title="Gated Delta Rule",
     variant=VARIANT,
     make_inputs=_make_inputs,
-    fla_fwd=_fla_fwd if _fla_chunk else None,
 )
 
 # Module API consumed by run_linattn.py: test / benchmark / accuracy.

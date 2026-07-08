@@ -1,8 +1,7 @@
 """Shared test / benchmark / accuracy for the linear-attention example variants.
 
-Each example builds a `LinearAttentionExampleHarness` naming its kernel variant,
-how to make inputs, and how to call FLA, then calls run_test / run_benchmark /
-run_accuracy here.
+Each example builds a `LinearAttentionExampleHarness` naming its kernel variant
+and how to make inputs, then calls run_test / run_benchmark / run_accuracy here.
 """
 
 from __future__ import annotations
@@ -19,6 +18,7 @@ from triton.testing import do_bench
 from .linear_attention_engine import LinearAttentionVariant
 from .linear_attention_engine import get_helion_fwd_kernel
 from .linear_attention_engine import recurrent_step
+from .linear_attention_fla import get_fla_fwd_kernel
 from .linear_attention_utils import ACC_BWD_TOL
 from .linear_attention_utils import ACC_FWD_TOL
 from .linear_attention_utils import chunked_linear_attn_reference
@@ -56,7 +56,6 @@ class LinearAttentionExampleHarness:
     title: str
     variant: LinearAttentionVariant
     make_inputs: Callable[..., Inputs]
-    fla_fwd: Callable[[Inputs, float], torch.Tensor] | None = None
     check_recurrent: bool = True
     grad_tensors: tuple[str, ...] = ("q", "k", "v")
     dtype: torch.dtype = DTYPE
@@ -79,8 +78,20 @@ class LinearAttentionExampleHarness:
     def helion_fb(self, i: Inputs, grad_out: torch.Tensor, C: int) -> None:
         self.helion_fwd(i, C).backward(grad_out)
 
+    def fla_fwd(self, i: Inputs, scale: float) -> torch.Tensor:
+        fwd = get_fla_fwd_kernel(self.variant)
+        assert fwd is not None
+        o, _ = fwd(
+            i.q,
+            i.k,
+            i.v,
+            i.g,
+            i.beta,
+            scale=scale,
+        )
+        return o
+
     def fla_fb(self, i: Inputs, go_t: torch.Tensor, scale: float) -> None:
-        assert self.fla_fwd is not None
         self.fla_fwd(i, scale).backward(go_t)
 
     def reference(self, i: Inputs) -> torch.Tensor:
@@ -123,6 +134,10 @@ def _grad_leaves(
         setattr(out, name, leaf)
         leaves.append(leaf)
     return out, leaves
+
+
+def _has_fla(harness: LinearAttentionExampleHarness) -> bool:
+    return get_fla_fwd_kernel(harness.variant) is not None
 
 
 def _fla_inputs(inputs: Inputs) -> Inputs:
@@ -181,10 +196,10 @@ def run_test(
     assert fwd_err < ACC_FWD_TOL, f"Forward error: {fwd_err}"
     print(f"  fwd vs recurrent: {fwd_err:.4e} PASS")
 
-    # === Forward: vs FLA (fla_fwd is None when fla is not installed) ===
-    if harness.fla_fwd is None:
+    # === Forward: vs FLA (unavailable when fla is not installed) ===
+    has_fla = _has_fla(harness)
+    if not has_fla:
         warnings.warn("fla not installed, skipping FLA comparisons", stacklevel=1)
-        has_fla = False
     else:
         # fla_fwd returns time-first; transpose back to compare (untimed).
         o_fla = harness.fla_fwd(_fla_inputs(inputs), scale).transpose(1, 2).contiguous()
@@ -193,7 +208,6 @@ def run_test(
             f"  fwd vs FLA:       {fla_err:.4e}"
             f" {'PASS' if fla_err < ACC_FWD_TOL else 'FAIL'}"
         )
-        has_fla = True
 
     # === Backward: Helion grads vs chunked reference ===
     grad_out = torch.randn(B, H, T, DV, device=DEVICE, dtype=harness.dtype)
@@ -246,9 +260,7 @@ def _time_config(
     fla_grads = [getattr(fla_inputs, n) for n in harness.grad_tensors]
 
     fwd_ms = do_bench(lambda: harness.helion_fwd(inputs, C))
-    fla_fwd_ms = do_bench(
-        lambda: harness.fla_fwd(fla_inputs, scale)  # type: ignore[misc]
-    )
+    fla_fwd_ms = do_bench(lambda: harness.fla_fwd(fla_inputs, scale))
     fb_ms = do_bench(
         lambda: harness.helion_fb(inputs, grad_out, C), grad_to_none=h_grads
     )
@@ -275,8 +287,7 @@ def run_benchmark(
     per config; empty when fla is unavailable.
     """
     rows: list[tuple[str, float, float, float, float]] = []
-    if harness.fla_fwd is None:
-        # also None when the variant has no comparable FLA op
+    if not _has_fla(harness):
         warnings.warn("fla not installed, skipping benchmark", stacklevel=1)
         return rows
 
