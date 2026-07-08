@@ -255,7 +255,7 @@ class Kernel(Generic[_R]):
         # Fused-launch state (kernel-wide): a flat, eval-compiled dispatch key
         # (built on first prime), a cache of launch recipes keyed by it, and a
         # latch that permanently disables fusion for a non-fuseable kernel.
-        self._fused_recipes: dict[Hashable, Callable[[tuple[object, ...]], None]] = {}
+        self._fused_recipes: dict[Hashable, Callable[[tuple[object, ...]], object]] = {}
         self._fused_key_fn: Callable[[tuple[object, ...]], Hashable] | None = None
         self._fused_disabled: bool = False
 
@@ -521,8 +521,12 @@ class Kernel(Generic[_R]):
                     # pyrefly: ignore [not-callable]
                     launch = self._fused_recipes.get(self._fused_key_fn(args))
                     if launch is not None:
-                        launch(args)
-                        return None  # type: ignore[return-value]
+                        # The closure allocates any outputs, launches, and
+                        # returns the wrapper's result (None, a tensor, or a
+                        # tuple/list).  A raise (mutated global, unexpected
+                        # arg) happens before or during launch; falling through
+                        # re-primes / re-validates via the normal path.
+                        return cast("_R", launch(args))
                 except Exception:
                     pass
             if self._dispatch_cache:

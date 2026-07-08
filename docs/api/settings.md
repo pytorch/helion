@@ -145,10 +145,14 @@ def my_kernel(x: torch.Tensor) -> torch.Tensor:
    ``used_global_vals`` values are folded into the cache key; any deviation, and ``torch.compile``
    tracing, fall back to the full path). Requires ``triton_direct_launch``; Triton-only.
 
-   Fusion is automatically disabled for a kernel whose generated host wrapper returns a value
-   (e.g. allocates its output), issues multiple device launches, or takes cooperative-grid
-   launches. Disable per-kernel with ``@helion.kernel(triton_fused_launch=False)`` or globally
-   with ``HELION_TRITON_FUSED_LAUNCH=0``.
+   Output-allocating kernels are supported: because the generated wrapper is codegen'd over fake
+   tensors, every host-side allocation is a pure function of input metadata and scalars, so the
+   closure rebuilds each allocated output with ``torch.empty_strided`` and reproduces the
+   wrapper's return value (a tensor, or a tuple/list). Fusion is automatically disabled for a
+   kernel that issues multiple device launches, returns a view over storage it shares with
+   another tensor (unreconstructable blind), or takes cooperative-grid launches. Disable
+   per-kernel with ``@helion.kernel(triton_fused_launch=False)`` or globally with
+   ``HELION_TRITON_FUSED_LAUNCH=0``.
 ```
 
 ### Autotuning Settings
