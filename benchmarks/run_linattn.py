@@ -76,7 +76,11 @@ def write_results_json(
             {
                 "benchmark": {
                     "name": "Helion Linear-Attention Benchmark",
-                    "extra_info": {"device": device, "backend": "triton"},
+                    "extra_info": {
+                        "device": device,
+                        "backend": "triton",
+                        "baseline_label": "FLA",
+                    },
                 },
                 "model": {"name": model},
                 "metric": {"name": metric, "benchmark_values": values},
@@ -92,8 +96,7 @@ def write_results_json(
         # ok / REF-ERR -> 1.0; FAIL / HEL-ERR -> 0.0.
         fwd_ok = [0.0 if v[0] in ("FAIL", "HEL-ERR") else 1.0 for v in vrd]
         bwd_ok = [0.0 if v[1] in ("FAIL", "HEL-ERR") else 1.0 for v in vrd]
-        # Forward: Helion accuracy + latency + speedup vs FLA; FLA reported at
-        # 1.0 so the dashboard's Triton column shows the comparison baseline.
+        # Forward: Helion accuracy + latency + speedup vs the FLA baseline.
         add_metric(variant, "helion_accuracy", labels, fwd_ok)
         add_metric(variant, "helion_latency_ms", labels, [r[1] for r in rows])
         add_metric(
@@ -102,7 +105,6 @@ def write_results_json(
             labels,
             [r[2] / r[1] if r[1] else 0.0 for r in rows],
         )
-        add_metric(variant, "triton_speedup", labels, [1.0 for _ in rows])
         # Forward+backward as a separate "<variant>-bwd" row.
         bwd = f"{variant}-bwd"
         add_metric(bwd, "helion_accuracy", labels, bwd_ok)
@@ -110,7 +112,6 @@ def write_results_json(
         add_metric(
             bwd, "helion_speedup", labels, [r[4] / r[3] if r[3] else 0.0 for r in rows]
         )
-        add_metric(bwd, "triton_speedup", labels, [1.0 for _ in rows])
 
     if os.path.exists(output):
         try:

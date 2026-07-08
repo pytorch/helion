@@ -21,6 +21,10 @@ on:
       alias:
         required: true
         type: string
+      suite:
+        required: false
+        type: string
+        default: tritonbench
       backend:
         required: false
         type: string
@@ -142,7 +146,8 @@ jobs:
           print(f'All {n} devices healthy')
           "
 
-      - name: Install Benchmark Requirements
+      - name: Install TritonBench Requirements
+        if: inputs.suite == 'tritonbench'
         run: |
           set -x
           source .venv/bin/activate
@@ -164,7 +169,17 @@ jobs:
           popd
           popd
 
-      - name: Run Benchmark
+      - name: Install Linear-Attention Requirements
+        if: inputs.suite == 'linattn'
+        run: |
+          set -x
+          source .venv/bin/activate
+          uv pip install einops
+          uv pip install "git+https://github.com/sustcsonglin/flash-linear-attention@v0.5.0" --no-deps
+          python -c "import fla; print('fla', fla.__name__)"
+
+      - name: Run TritonBench Benchmark
+        if: inputs.suite == 'tritonbench'
         run: |
           rm -rf /tmp/torchinductor_*/ || true
 
@@ -228,6 +243,41 @@ jobs:
 
             echo "✅ Completed benchmark for kernel: $kernel"
           done
+
+          if [[ ! -s "$TEST_REPORTS_DIR/helionbench.json" ]]; then
+            echo "❌ helionbench.json is missing or empty"
+            exit 1
+          fi
+          cat "$TEST_REPORTS_DIR/helionbench.json"
+
+      - name: Run Linear-Attention Benchmark
+        if: inputs.suite == 'linattn'
+        run: |
+          rm -rf /tmp/torchinductor_*/ || true
+
+          source .venv/bin/activate
+
+          TEST_REPORTS_DIR=$(pwd)/test/test-reports
+          mkdir -p "$TEST_REPORTS_DIR"
+          echo "$TEST_REPORTS_DIR"
+
+          KERNELS="${{ inputs.kernels }}"
+          if [[ "$KERNELS" == "all" || -z "$KERNELS" ]]; then
+            KERNEL_FLAG=()
+          else
+            KERNEL_FLAG=(--kernel "$KERNELS")
+          fi
+
+          echo "=========================================="
+          echo "Linear-Attention Benchmark"
+          echo "Kernels: ${KERNELS:-all}"
+          echo "=========================================="
+
+          ${{ inputs.env-vars }} HELION_PRINT_OUTPUT_CODE=1 \
+          python -m benchmarks.run_linattn \
+              "${KERNEL_FLAG[@]}" \
+              --output "$TEST_REPORTS_DIR/helionbench.json" \
+              ${{ inputs.custom-args }}
 
           if [[ ! -s "$TEST_REPORTS_DIR/helionbench.json" ]]; then
             echo "❌ helionbench.json is missing or empty"

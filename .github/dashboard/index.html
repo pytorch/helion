@@ -164,8 +164,8 @@ a:hover{text-decoration:underline}
 <script>
 const REPO = 'pytorch/helion';
 let DATA = typeof EMBEDDED_DATA !== 'undefined' ? EMBEDDED_DATA : null;
-const PLAT_COLORS = { h100: '#3fb950', b200: '#58a6ff', b200_cute: '#39c5cf', b200_fla: '#f778ba', mi325x: '#f0883e', mi350x: '#bc8cff', tpu: '#d29922' };
-const PLAT_NAMES = { h100: 'H100', b200: 'B200', b200_cute: 'B200 CuTe', b200_fla: 'B200 (vs FLA)', mi325x: 'MI325X', mi350x: 'MI350X', tpu: 'TPU v7' };
+const PLAT_COLORS = { h100: '#3fb950', b200: '#58a6ff', b200_cute: '#39c5cf', mi325x: '#f0883e', mi350x: '#bc8cff', tpu: '#d29922' };
+const PLAT_NAMES = { h100: 'H100', b200: 'B200', b200_cute: 'B200 CuTe', mi325x: 'MI325X', mi350x: 'MI350X', tpu: 'TPU v7' };
 const plotlyDark = {
   paper_bgcolor: '#0d1117', plot_bgcolor: '#0d1117',
   font: { color: '#e6edf3', size: 11 },
@@ -175,7 +175,7 @@ const plotlyDark = {
 };
 function commitUrl(sha) { return `https://github.com/${REPO}/commit/${sha}`; }
 function runUrl(id) { return `https://github.com/${REPO}/actions/runs/${id}`; }
-function formatSpeedup(v) { return v != null ? v.toFixed(2) + 'x' : '--'; }
+function formatSpeedup(v) { return v > 0 ? v.toFixed(2) + 'x' : '--'; }
 function formatCompileTime(s) { return s != null ? s.toFixed(1) + 's' : '--'; }
 function formatDate(d) {
   if (!d) return '--';
@@ -288,6 +288,7 @@ function makeSortable(table) {
 let kernelPlatMap = {};
 let _cmpImproved = [], _cmpRegressed = [];
 let activeFilters = { platform: 'all', search: '' };
+function baselineLabel(e) { return e.baseline_label || ''; }
 // Each tab renders its own platform dropdown. After activeFilters.platform
 // changes from any one of them, mirror the value to the others — without this,
 // the dropdown on a non-active tab stays stale until that tab is re-rendered.
@@ -511,16 +512,19 @@ function renderSpeedupTrendChart() {
       if (e) entries.push(e);
     });
   });
+  // Exclude explicit-baseline rows (e.g. linattn vs FLA) from the
+  // "vs Eager" aggregate; mixing baselines makes the geomean misleading.
+  const eagerEntries = entries.filter(e => !e.baseline_label);
   const runs = DATA.runs;
   // Match renderSpeedup(): only require a baseline when it exists for these
   // platform(s), so TPU (no Triton) still gets a trend line.
-  const hasTC = entries.some(e => e.torch_compile_speedup_geomean > 0);
-  const hasTriton = entries.some(e => e.triton_speedup_geomean > 0);
+  const hasTC = eagerEntries.some(e => e.torch_compile_speedup_geomean > 0);
+  const hasTriton = eagerEntries.some(e => e.triton_speedup_geomean > 0);
   const helionTrend = [], tcTrend = [], tritonTrend = [];
   const xLabels = [];
   runs.forEach(r => {
     const hValsRun = [], tValsRun = [], rValsRun = [];
-    entries.forEach(e => {
+    eagerEntries.forEach(e => {
       const h = (e.history || []).find(x => x.run_id === r.run_id);
       if (
         h &&
@@ -582,9 +586,12 @@ function renderSpeedup() {
   // Only require a competitor baseline when it actually exists for the selected
   // platform(s). Triton never runs on TPU, so requiring it unconditionally would
   // drop every TPU row and leave the geomeans blank.
-  const hasTC = entries.some(e => e.torch_compile_speedup_geomean > 0);
-  const hasTriton = entries.some(e => e.triton_speedup_geomean > 0);
-  const commonSpeedupEntries = entries.filter(e =>
+  // Exclude explicit-baseline rows (e.g. linattn vs FLA) from the
+  // "vs Eager" aggregate; mixing baselines makes the geomean misleading.
+  const eagerEntries = entries.filter(e => !e.baseline_label);
+  const hasTC = eagerEntries.some(e => e.torch_compile_speedup_geomean > 0);
+  const hasTriton = eagerEntries.some(e => e.triton_speedup_geomean > 0);
+  const commonSpeedupEntries = eagerEntries.filter(e =>
     e.helion_speedup_geomean > 0 &&
     (!hasTC || e.torch_compile_speedup_geomean > 0) &&
     (!hasTriton || e.triton_speedup_geomean > 0)
@@ -597,7 +604,7 @@ function renderSpeedup() {
   const pairedSpeedupSub = `${commonSpeedupEntries.length} paired kernel/platform combos`;
   let html = '';
   html += '<h2 style="margin-bottom:4px">Speedup vs Eager Execution</h2>';
-  html += '<p style="font-size:13px;color:var(--text-dim);margin-bottom:16px">Higher values = faster than PyTorch eager. Values &lt; 1.0 are slower than eager.</p>';
+  html += '<p style="font-size:13px;color:var(--text-dim);margin-bottom:16px">Higher values = faster than PyTorch eager. Values &lt; 1.0 are slower than eager. Aggregate cards exclude rows with an explicit Baseline.</p>';
   html += '<div class="filter-bar"><select id="sp-plat-filter"><option value="all">All Platforms</option>';
   DATA.platform_shorts.forEach(p => { html += `<option value="${p}"${p === activeFilters.platform ? ' selected' : ''}>${platName(p)}</option>`; });
   html += '</select></div>';
@@ -619,10 +626,10 @@ function renderSpeedup() {
   const ctVals = entries.map(e => e.compile_time_geomean_s).filter(v => v > 0);
   const ctGM = geomean(ctVals);
   const speedupGmLabel = `${commonSpeedupEntries.length} paired speedup rows`;
-  html += '<div class="table-wrap"><table class="data-table"><thead><tr><th>Kernel</th><th>Platform</th><th>Commit</th><th>Helion</th><th>torch.compile</th><th>Triton</th><th>Compile Time</th><th>Best</th></tr></thead><tbody>';
+  html += '<div class="table-wrap"><table class="data-table"><thead><tr><th>Kernel</th><th>Platform</th><th>Commit</th><th>Baseline</th><th>Helion</th><th>torch.compile</th><th>Triton</th><th>Compile Time</th><th>Best</th></tr></thead><tbody>';
   entries.forEach(e => {
     const vals = [e.helion_speedup_geomean, e.torch_compile_speedup_geomean, e.triton_speedup_geomean];
-    const names = ['Helion', 'torch.compile', e.platform_short === 'b200_fla' ? 'FLA' : 'Triton'];
+    const names = ['Helion', 'torch.compile', 'Triton'];
     const colors = ['var(--green)', 'var(--blue)', 'var(--purple)'];
     let bestIdx = 0;
     vals.forEach((v, i) => { if ((v || 0) > (vals[bestIdx] || 0)) bestIdx = i; });
@@ -632,6 +639,7 @@ function renderSpeedup() {
       <td>${escHtml(e.kernel)}</td>
       <td>${platBadge(e.platform_short)}</td>
       <td>${commitLink}</td>
+      <td>${escHtml(baselineLabel(e))}</td>
       <td style="color:var(--green)">${formatSpeedup(e.helion_speedup_geomean)}</td>
       <td style="color:var(--blue)">${formatSpeedup(e.torch_compile_speedup_geomean)}</td>
       <td style="color:var(--purple)">${formatSpeedup(e.triton_speedup_geomean)}</td>
@@ -640,7 +648,7 @@ function renderSpeedup() {
     </tr>`;
   });
   html += `</tbody><tfoot><tr>
-    <td colspan="3" class="gm-label" title="Compile time geomean uses ${ctVals.length} Helion rows">${speedupGmLabel}</td>
+    <td colspan="4" class="gm-label" title="Compile time geomean uses ${ctVals.length} Helion rows">${speedupGmLabel}</td>
     <td style="color:var(--green)">${formatSpeedup(helionGM)}</td>
     <td style="color:var(--blue)">${formatSpeedup(tcGM)}</td>
     <td style="color:var(--purple)">${formatSpeedup(tritonGM)}</td>
@@ -921,9 +929,11 @@ function showDetailModal(kernel, platform_short) {
   const e = kernelPlatMap[kernel + '||' + platform_short];
   if (!e) return;
   const color = platColor(platform_short);
+  const baseline = baselineLabel(e);
+  const baselinePrefix = baseline ? `Baseline: ${escHtml(baseline)} | ` : '';
   let html = modalHeader(
     `${escHtml(kernel)} ${platBadge(platform_short)}`,
-    `Latency: ${e.helion_latency_avg_ms.toFixed(2)} ms | Speedup: ${formatSpeedup(e.helion_speedup_geomean)} | Compile Time: ${formatCompileTime(e.compile_time_geomean_s)}`);
+    `${baselinePrefix}Latency: ${e.helion_latency_avg_ms.toFixed(2)} ms | Speedup: ${formatSpeedup(e.helion_speedup_geomean)} | Compile Time: ${formatCompileTime(e.compile_time_geomean_s)}`);
   html += '<div class="modal-split"><div class="modal-lhs">';
   if (e.status !== 'unchanged') {
     html += `<div style="margin-bottom:12px"><span class="kc-tag ${e.status}">${e.status} perf</span></div>`;
@@ -1058,8 +1068,7 @@ function showDetailModal(kernel, platform_short) {
         barTraces.push({ x: shapes, y: ps.torch_compile_speedup, name: 'torch.compile', type: 'bar', marker: { color: '#58a6ff' } });
       }
       if (ps.triton_speedup && ps.triton_speedup.length > 0) {
-        const baselineLabel = platform_short === 'b200_fla' ? 'FLA' : 'Triton';
-        barTraces.push({ x: shapes, y: ps.triton_speedup, name: baselineLabel, type: 'bar', marker: { color: '#bc8cff' } });
+        barTraces.push({ x: shapes, y: ps.triton_speedup, name: 'Triton', type: 'bar', marker: { color: '#bc8cff' } });
       }
       if (barTraces.length > 0) {
         const allBarVals = barTraces.flatMap(t => t.y).filter(v => v > 0);
