@@ -11,6 +11,8 @@ converted from vLLM's per-hardware config JSON).
 from __future__ import annotations
 
 import torch
+import triton
+import triton.language as tl
 
 import helion
 import helion.experimental
@@ -125,6 +127,95 @@ def _per_token_group_fp8_quant_vllm(
     )
 
 
+@triton.jit
+def _per_token_group_quant_fp8(
+    # Pointers to inputs and output
+    y_ptr: tl.tensor,
+    y_q_ptr: tl.tensor,
+    y_s_ptr: tl.tensor,
+    group_size: int,
+    # Num columns of y
+    y_num_columns: int,
+    y_row_stride: int,
+    # Avoid to divide zero
+    eps: float,
+    # Information for float8
+    fp8_min: tl.constexpr,
+    fp8_max: tl.constexpr,
+    use_ue8m0: tl.constexpr,
+    # Meta-parameters
+    BLOCK: tl.constexpr,
+) -> None:
+    """A Triton-accelerated function to perform per-token-group
+    quantization on a tensor.
+    This function converts the tensor values into float8 values.
+    """
+    groups_per_row = y_num_columns // group_size
+
+    # Map the program id to the row of X and Y it should compute.
+    g_id = tl.program_id(0)
+    row = g_id // groups_per_row
+    row_g_id = g_id % groups_per_row
+
+    # Ensure offset calculations use int64 to prevent overflow
+    y_ptr_offset = (row.to(tl.int64) * y_row_stride) + (
+        row_g_id.to(tl.int64) * group_size
+    )
+    y_ptr += y_ptr_offset
+
+    y_q_ptr_offset = g_id.to(tl.int64) * group_size
+    y_q_ptr += y_q_ptr_offset
+    y_s_ptr += g_id
+
+    cols = tl.arange(0, BLOCK)  # N <= BLOCK
+    mask = cols < group_size
+
+    y = tl.load(y_ptr + cols, mask=mask, other=0.0).to(tl.float32)
+    # Quant
+    # Use multiply-by-reciprocal instead of division to match PyTorch's
+    # tensor/scalar division precision (GPU fast-division for constexpr
+    # divisors can introduce 1-ULP error that flips FP8 quantization at
+    # representable-value boundaries).
+    _absmax = tl.maximum(tl.max(tl.abs(y)), eps)
+    scale_raw = _absmax * (1.0 / fp8_max)
+    y_s = tl.math.exp2(tl.ceil(tl.log2(scale_raw))) if use_ue8m0 else scale_raw
+    y_q = tl.clamp(y / y_s, fp8_min, fp8_max).to(y_q_ptr.dtype.element_ty)
+
+    tl.store(y_q_ptr + cols, y_q, mask=mask)
+    tl.store(y_s_ptr, y_s)
+
+
+def _per_token_group_fp8_quant_triton(
+    input: torch.Tensor,  # noqa: A002
+    output_q: torch.Tensor,
+    output_s: torch.Tensor,
+    group_size: int,
+    eps: float,
+    fp8_min: float,
+    fp8_max: float,
+    scale_ue8m0: bool,
+    dummy_is_scale_transposed: bool = False,
+    dummy_is_tma_aligned: bool = False,
+) -> None:
+    """vLLM's Triton per-token-group FP8 quant kernel (mutates outputs)."""
+    num_tokens, hidden_size = input.shape
+    num_groups = num_tokens * (hidden_size // group_size)
+    block = triton.next_power_of_2(group_size)
+    _per_token_group_quant_fp8[(num_groups,)](
+        input,
+        output_q,
+        output_s,
+        group_size,
+        hidden_size,
+        input.stride(0),
+        eps,
+        fp8_min=fp8_min,
+        fp8_max=fp8_max,
+        use_ue8m0=scale_ue8m0,
+        BLOCK=block,
+    )
+
+
 def _baselines() -> list[tuple[str, object]]:
     """Baselines main() benchmarks against (torch always; vLLM when installed).
 
@@ -134,6 +225,7 @@ def _baselines() -> list[tuple[str, object]]:
     out: list[tuple[str, object]] = [
         ("torch", _per_token_group_fp8_quant_torch),
         ("torch_compile", torch.compile(_per_token_group_fp8_quant_torch)),
+        ("triton", _per_token_group_fp8_quant_triton),
     ]
     if _HAS_VLLM:
         out.append(("vllm", _per_token_group_fp8_quant_vllm))
@@ -162,7 +254,12 @@ def correctness_check() -> None:
     torch.testing.assert_close(oq.float(), oq_ref.float(), rtol=0.2, atol=0.2)
 
 
-def main(verbose: bool = True) -> dict:
+def main(
+    verbose: bool = True,
+    cudagraph: bool | None = None,
+    limit: int | None = None,
+    walltime: bool = False,
+) -> dict:
     import os
     import sys
 
@@ -178,6 +275,8 @@ def main(verbose: bool = True) -> dict:
     hidden_sizes = [2048, 4096, 5120]
     num_tokens_list = [1, 4, 16, 64, 256, 1024, 2048, 8192]
     shapes = [(t, h) for h in hidden_sizes for t in num_tokens_list]
+    if limit is not None:
+        shapes = shapes[:limit]
     baselines = _baselines()
 
     def make_calls(shape: tuple) -> tuple:
@@ -227,11 +326,37 @@ def main(verbose: bool = True) -> dict:
     return run_sweep(
         shapes,
         make_calls,
-        use_cudagraph=use_cudagraph(),
+        use_cudagraph=use_cudagraph() if cudagraph is None else cudagraph,
         verbose=verbose,
         shape_header=f"{'tokens':>7s}  {'hidden':>6s}  {'group':>6s}",
+        walltime=walltime,
     )
 
 
 if __name__ == "__main__":
-    main()
+    import argparse
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--no-cudagraph",
+        action="store_true",
+        help="benchmark with plain do_bench instead of CUDA graphs",
+    )
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        help="only run the first N shapes of the sweep",
+    )
+    parser.add_argument(
+        "--walltime",
+        action="store_true",
+        help="time full wall-clock per call (host dispatch + GPU) instead of "
+        "GPU events; exposes host launch overhead that do_bench hides",
+    )
+    cli_args = parser.parse_args()
+    main(
+        cudagraph=not cli_args.no_cudagraph,
+        limit=cli_args.limit,
+        walltime=cli_args.walltime,
+    )

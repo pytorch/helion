@@ -595,6 +595,11 @@ class _Settings:
             _env_get_bool, "HELION_TRITON_DO_NOT_SPECIALIZE", False
         )
     )
+    triton_direct_launch: bool = dataclasses.field(
+        default_factory=functools.partial(
+            _env_get_bool, "HELION_TRITON_DIRECT_LAUNCH", True
+        )
+    )
 
 
 class Settings(_Settings):
@@ -697,6 +702,22 @@ class Settings(_Settings):
             "memory-bound kernels (vectorized loads rely on inner stride being "
             "specialized to constexpr 1). Only takes effect when static_shapes=False. "
             "Set HELION_TRITON_DO_NOT_SPECIALIZE=1 to enable globally."
+        ),
+        "triton_direct_launch": (
+            "If True (default), repeat launches of an already-compiled Triton "
+            "specialization skip JITFunction.run and call the cached compiled "
+            "kernel directly, substantially reducing per-call launch overhead. "
+            "Triton-only; accepted but ignored on other backends. The direct "
+            "path automatically falls back to the full JITFunction.run path "
+            "when it cannot guarantee an identical launch: unaligned (non-16-"
+            "byte) tensor pointer arguments, mutated used_global_vals, extra "
+            "launch kwargs (e.g. ptx_options), active Triton launch/pre-run "
+            "hooks or debug/instrumentation knobs, and torch.compile tracing "
+            "all take the slow path. Not supported (use "
+            "triton_direct_launch=False or HELION_TRITON_DIRECT_LAUNCH=0): "
+            "Triton launch hooks or knobs registered *after* a kernel's first "
+            "launch are not re-checked per call, so profilers attaching "
+            "mid-run will miss direct launches."
         ),
         "print_output_code": "If True, print the output code of the kernel to stderr.",
         "print_repro": "If True, print Helion kernel code, config, and caller code to stderr as a standalone repro script.",
