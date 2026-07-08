@@ -1,0 +1,89 @@
+name: B200 Host Probe (diagnostic)
+
+# Diagnostic-only workflow for investigating B200 CI infra failures.
+# Runs directly on the linux.dgx.b200 runner host (no container:) so we can
+# see host-level state that benchmark jobs cannot, e.g. Docker daemon state,
+# NVIDIA kernel modules, fabric-manager status. Optionally prunes leaked
+# Docker networks on the host that lands the job (Docker's default address
+# pools are per-daemon; a full pool = every subsequent `docker network create`
+# fails with "all predefined address pools have been fully subnetted", which
+# is what we saw take out `dgxb200-03` on 2026-07-08).
+
+on:
+  workflow_dispatch:
+    inputs:
+      prune_networks:
+        description: 'Prune leaked Docker networks (unfiltered `docker network prune -f`). Safe to leave off for pure inspection.'
+        required: false
+        type: boolean
+        default: false
+
+jobs:
+  probe:
+    runs-on: linux.dgx.b200
+    permissions:
+      contents: read
+    steps:
+      - name: Runner identity
+        run: |
+          echo "runner name: ${RUNNER_NAME:-unknown}"
+          echo "hostname:    $(hostname)"
+          uname -a
+
+      - name: Docker daemon state
+        run: |
+          set +e
+          echo "== docker version =="
+          docker version 2>&1 || echo "docker version failed"
+          echo "== docker info (subnet-related fields) =="
+          docker info 2>&1 | grep -Ei 'server version|storage driver|default runtime|kernel version|operating system|architecture|cpus|total memory' || true
+          echo "== docker network ls =="
+          docker network ls 2>&1
+          echo "== count of user-defined networks (excludes bridge/host/none) =="
+          docker network ls --format '{{.Name}}' 2>&1 | grep -Ev '^(bridge|host|none)$' | wc -l
+          echo "== docker daemon config (if visible) =="
+          cat /etc/docker/daemon.json 2>/dev/null || echo "/etc/docker/daemon.json not readable"
+          echo "== docker network create smoke test =="
+          NETNAME="probe-$(date +%s)-$$"
+          if docker network create "$NETNAME" 2>&1; then
+            echo "smoke-create: OK"
+            docker network rm "$NETNAME" >/dev/null 2>&1 || true
+          else
+            echo "smoke-create: FAILED"
+          fi
+
+      - name: NVIDIA host state
+        run: |
+          set +e
+          echo "== nvidia-smi =="
+          nvidia-smi 2>&1 || echo "nvidia-smi not found on host"
+          echo "== /dev/nvidia* =="
+          ls -la /dev/nvidia* 2>&1
+          echo "== NVIDIA kernel modules =="
+          lsmod 2>/dev/null | grep -i nvidia || cat /proc/modules 2>/dev/null | grep -i nvidia || echo "module list unavailable"
+          echo "== fabric-manager (nv-fabricmanager) =="
+          pgrep -a nv-fabricmanager 2>&1 || echo "nv-fabricmanager not running"
+          systemctl status nvidia-fabricmanager 2>&1 | head -20 || true
+          echo "== persistenced =="
+          pgrep -a nvidia-persistenced 2>&1 || echo "nvidia-persistenced not running"
+          echo "== dmesg tail (nvidia/uvm) =="
+          dmesg 2>/dev/null | grep -iE 'nvidia|uvm' | tail -30 || echo "dmesg not accessible"
+
+      - name: Prune leaked Docker networks
+        if: ${{ github.event.inputs.prune_networks == 'true' }}
+        run: |
+          set +e
+          echo "== BEFORE: user-defined network count =="
+          docker network ls --format '{{.Name}}' | grep -Ev '^(bridge|host|none)$' | wc -l
+          echo "== docker network prune -f =="
+          docker network prune -f
+          echo "== AFTER: user-defined network count =="
+          docker network ls --format '{{.Name}}' | grep -Ev '^(bridge|host|none)$' | wc -l
+          echo "== post-prune smoke-create =="
+          NETNAME="probe-postprune-$(date +%s)-$$"
+          if docker network create "$NETNAME" 2>&1; then
+            echo "post-prune create: OK"
+            docker network rm "$NETNAME" >/dev/null 2>&1 || true
+          else
+            echo "post-prune create: STILL FAILING"
+          fi
