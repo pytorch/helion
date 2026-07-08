@@ -262,6 +262,7 @@ def _pallas_make_block_spec(
 
 
 _CACHED_VMEM_LIMIT_BYTES: int | None = None
+_OWNER_CACHE_SCOPED_VMEM_LIMIT_BYTES = 128 * 1024 * 1024
 
 
 def _get_vmem_limit_bytes(pltpu: object) -> int:
@@ -293,6 +294,148 @@ def _get_vmem_limit_bytes(pltpu: object) -> int:
         _CACHED_VMEM_LIMIT_BYTES = 16 * 1024 * 1024
 
     return _CACHED_VMEM_LIMIT_BYTES
+
+
+def _compact_owner_cache_vmem_limit_bytes(pltpu: object) -> int:
+    """Scoped VMEM ceiling for compact-worklist owner-resident kernels.
+
+    TODO: derive this from generation-specific TPU info once Mosaic exposes the
+    scoped limit separately from the conservative default capacity.
+    """
+    return max(_get_vmem_limit_bytes(pltpu), _OWNER_CACHE_SCOPED_VMEM_LIMIT_BYTES)
+
+
+def _ordered_per_token_bytes(operands: list[tuple[tuple[int, ...], int]]) -> int:
+    per_tok = 0
+    for shape, itemsize in operands:
+        trail = 1
+        for s in shape[1:]:
+            trail *= int(s)
+        per_tok += trail * itemsize
+    return per_tok
+
+
+def compact_ordered_budget_capacity(
+    operands: list[tuple[tuple[int, ...], int]],
+    vmem_bytes: int,
+    *,
+    prep_operands: list[tuple[tuple[int, ...], int]],
+) -> int:
+    """VMEM budget capacity for owner-resident ordered operands.
+
+    ``operands`` is ``[(shape, itemsize), ...]`` for every resident ordered
+    operand.  Each ``C`` token costs that per-token footprint twice because the
+    ``pl.Element`` resident window is double-buffered by Pallas.  ``prep_operands``
+    adds any optional persistent prep-cache copies (for today's transpose-cache
+    path, one more equivalent copy).  Pass ``[]`` for a resident-only/no-prep
+    reduction.
+    """
+    if not operands:
+        return 0
+    # resident window (2x double-buffer) + optional prep cache (1x per prep).
+    bytes_per_token = 2 * _ordered_per_token_bytes(operands) + _ordered_per_token_bytes(
+        prep_operands
+    )
+    return max(1, int(vmem_bytes * 0.5) // max(1, bytes_per_token))
+
+
+def compact_ordered_physical_window(
+    operands: list[tuple[tuple[int, ...], int]],
+    vmem_bytes: int,
+    ordered_block: int,
+    *,
+    prep_operands: list[tuple[tuple[int, ...], int]],
+) -> int:
+    """Block-aligned physical owner-resident window that fits the VMEM budget.
+
+    :func:`compact_ordered_budget_capacity` gives the largest per-owner length the
+    VMEM budget allows (the logical bound ``C``).  The resident ``pl.Element``
+    window, optional prep-cache scratch, and the refill/reduction ``pl.ds`` slices
+    are all tiled by the ordered block, so the allocation must be a block multiple.
+    Round the budget DOWN to a block multiple so the allocation never exceeds the
+    VMEM budget; cap by the operand extent rounded UP to one block so short tensors
+    still get a legal ``pl.Element(block, padding=...)`` window instead of a
+    zero-sized allocation.
+
+    Returns 0 when the budget cannot hold one ordered block.  owner_cache is an
+    automatic optimization, so the compiler treats that as "inactive" and falls
+    back to the streamed ordered loop.
+    """
+    if not operands:
+        return 0
+    budget_capacity = compact_ordered_budget_capacity(
+        operands, vmem_bytes, prep_operands=prep_operands
+    )
+    block = max(int(ordered_block), 1)
+    budget_physical = (budget_capacity // block) * block
+    if budget_physical <= 0:
+        return 0
+    min_leading = min(max(1, int(shape[0])) for shape, _itemsize in operands)
+    extent_physical = ((min_leading + block - 1) // block) * block
+    return min(budget_physical, extent_physical)
+
+
+def _compact_raise_if_owner_exceeds_window(
+    args: tuple[object, ...],
+    ordered_aligned_arg_indices: list[int] | None,
+    ordered_offset_arg_index: int,
+    active_mask_arg_index: int,
+    ordered_window: int,
+) -> None:
+    """Raise if any owner's ordered (reduction) length exceeds the window.
+
+    owner_cache holds each owner's ordered operand in a compile-time-sized VMEM
+    window/cache.  ``ordered_window`` is the exact block-aligned physical extent
+    computed once during compile setup and threaded through the launcher; an owner
+    longer than it would over-read the window.
+
+    ``ordered_aligned_arg_indices`` non-empty means the resident window is active
+    (owner_cache applies).  When it is active we MUST be able to bound-check, so a
+    missing/ambiguous offset index raises rather than silently returning.  The
+    ordered offset supplies ordered lengths; the active-mask offset supplies compact
+    lengths, so owners with no compact work are ignored because they produce no
+    worklist item and never refill the cache.
+
+    Best-effort magnitude: reached with materialized offsets only on the
+    concrete/eager (torch) launch path; under ``jax.jit`` the offsets are tracers
+    and the caller guarantees the bound (a future change that sizes the window from
+    a caller-provided max per-owner length would remove this caveat).
+    """
+    if not ordered_aligned_arg_indices:
+        return  # owner_cache inactive (no resident window) -> nothing to guard
+    if ordered_window <= 0:
+        return  # owner_cache should be inactive, but avoid a spurious empty guard
+    if ordered_offset_arg_index < 0 or active_mask_arg_index < 0:
+        raise RuntimeError(
+            "compact_worklist owner_cache: the resident window is active but the "
+            "ordered reduction bound or compact active-owner mask is not a "
+            "checkable single-offsets (offsets[i+1]-offsets[i]) pattern, so "
+            "per-owner length cannot be verified against the window."
+        )
+    offsets = cast("Any", args[ordered_offset_arg_index])
+    active_offsets = cast("Any", args[active_mask_arg_index])
+    if len(offsets) < 2:  # 0 owners -> no reduction ranges to check
+        return
+    if len(active_offsets) != len(offsets):
+        raise RuntimeError(
+            "compact_worklist owner_cache: ordered and compact offset arrays have "
+            "different owner counts, so the active-owner guard cannot be evaluated."
+        )
+    ordered_lens = offsets[1:] - offsets[:-1]
+    compact_lens = active_offsets[1:] - active_offsets[:-1]
+    active = compact_lens > 0
+    if not bool(active.any()):
+        return
+    max_len = int(ordered_lens[active].max())
+    if max_len > ordered_window:
+        raise RuntimeError(
+            f"compact_worklist owner_cache: a per-owner reduction length "
+            f"({max_len}) exceeds the resident window ({ordered_window}, "
+            f"VMEM-derived and fixed at compile time), so the owner-keyed cache "
+            f"would be over-read. "
+            f"Reduce the maximum per-owner length below the window -- it scales "
+            f"with available VMEM / per-token bytes."
+        )
 
 
 def _estimate_pallas_vmem_bytes(
@@ -1938,6 +2081,9 @@ def _pallas_compact_in_out_specs(
     aligned_set: set[int] | None = None,
     tile_start_ref_pos: int = 1,
     compact_block: int = 1,
+    ordered_aligned_set: set[int] | None = None,
+    range_start_ref_pos: int = -1,
+    ordered_window: int = 0,
 ) -> tuple[list[object], object]:
     """Build in/out BlockSpecs for the compact-worklist PrefetchScalarGridSpec.
 
@@ -1950,6 +2096,7 @@ def _pallas_compact_in_out_specs(
     ``index_map`` receives ``(wid, *scalar_refs)``.
     """
     aligned_set = aligned_set or set()
+    ordered_aligned_set = ordered_aligned_set or set()
     all_positions = sorted(set(tensor_arg_indices) | set(output_indices))
     arg_to_tpos = {orig: tpos for tpos, orig in enumerate(all_positions)}
 
@@ -1989,6 +2136,35 @@ def _pallas_compact_in_out_specs(
                 return (tile_start, *(jnp.int32(0) for _ in range(_nd - 1)))  # type: ignore[union-attr]
 
             return pl.BlockSpec(block_shape, aligned_index_map)  # type: ignore[union-attr]
+        if idx in ordered_aligned_set:
+            # owner_cache: per-owner resident window sized ``ordered_window`` (C)
+            # at ``range_start`` -- the fori body reads it at the local ordered-tile
+            # offset (offset - range_start).  padding=(0, C) tolerates reads past
+            # the owner's tail (same as the compact_aligned_load window).  Keying
+            # on range_start lets Pallas dedup the load across same-owner tiles.
+            assert ordered_window > 0
+            oblock = ordered_window
+            oelt = pl.Element(oblock, padding=(0, oblock))  # type: ignore[union-attr]
+            oblock_shape = (
+                oelt,
+                *(pl.Element(s) for s in t.shape[1:]),  # type: ignore[union-attr]
+            )
+
+            def ordered_index_map(
+                wid: object,
+                *scalar_refs: object,
+                _pos: int = range_start_ref_pos,
+                _nd: int = t.ndim,
+            ) -> tuple[object, ...]:
+                start = scalar_refs[_pos][wid]  # type: ignore[index]
+                return (
+                    start,
+                    *(jnp.int32(0) for _ in range(_nd - 1)),  # type: ignore[union-attr]
+                )
+
+            return pl.BlockSpec(  # type: ignore[union-attr]
+                oblock_shape, ordered_index_map
+            )
         entry = block_spec_info[arg_to_tpos[idx]] if block_spec_info else None
         if entry is not None:
             block_shape_template, grid_dims = entry
@@ -2073,6 +2249,9 @@ def _pallas_compile_compact_jit_fn(
     aligned_arg_indices: list[int] | None = None,
     tile_start_ref_pos: int = 1,
     compact_block: int = 1,
+    ordered_aligned_arg_indices: list[int] | None = None,
+    range_start_ref_pos: int = -1,
+    ordered_window: int = 0,
     interpret: bool = False,
 ) -> _PallasCompileResult:
     """Build the compact-worklist jit_fn: build metadata in-jit -> dynamic grid."""
@@ -2110,6 +2289,9 @@ def _pallas_compile_compact_jit_fn(
         set(aligned_arg_indices or []),
         tile_start_ref_pos,
         compact_block,
+        set(ordered_aligned_arg_indices or []),
+        range_start_ref_pos,
+        ordered_window,
     )
     reordered_kernel = _pallas_make_compact_reordered_kernel(
         pallas_kernel,
@@ -2183,6 +2365,21 @@ def _pallas_compile_compact_jit_fn(
                 # it for validation.  Detection also now restricts to packed (so
                 # work order == row order); see detect_compact_worklist_plan.
                 dimension_semantics=("arbitrary",),
+                # owner_cache holds a resident window (double-buffered) + a
+                # persistent transpose cache; that footprint (sized from the
+                # compile-threaded ordered window) exceeds Mosaic's conservative
+                # default scoped-VMEM ceiling, so raise it -- but ONLY when
+                # owner_cache is active (a resident ordered window exists).  A
+                # streamed compact_worklist kernel (no ordered window) keeps the
+                # platform default ceiling, so this feature does not broaden VMEM
+                # behavior for kernels that do not use it (a genuinely oversized
+                # streamed kernel still fails, as before).  The raised value is a
+                # ceiling, not a reservation (actual use stays under it).
+                vmem_limit_bytes=(
+                    _compact_owner_cache_vmem_limit_bytes(pltpu)
+                    if ordered_aligned_arg_indices
+                    else _get_vmem_limit_bytes(pltpu)
+                ),
             ),
             interpret=interpret,
         )
@@ -2218,6 +2415,11 @@ def default_pallas_compact_worklist_launcher(
     _compact_aligned_arg_indices: list[int] | None = None,
     _compact_tile_start_ref_pos: int = 1,
     _compact_block: int = 1,
+    _compact_ordered_aligned_arg_indices: list[int] | None = None,
+    _compact_range_start_ref_pos: int = -1,
+    _compact_ordered_offset_arg_index: int = -1,
+    _compact_active_mask_arg_index: int = -1,
+    _compact_ordered_window: int = 0,
     **kwargs: object,
 ) -> object:
     """Launcher for ``pallas_loop_type="compact_worklist"``.
@@ -2227,6 +2429,17 @@ def default_pallas_compact_worklist_launcher(
     and reuses the shared JaxCallable / caching / invoke path.
     """
     assert _compact_build_worklist is not None
+    # owner_cache correctness backstop: raise (rather than silently over-read the
+    # resident window) when an owner's reduction length exceeds the compile-time
+    # window C.  Runs every call -- the offsets are runtime data even when the
+    # compiled kernel is reused across calls with the same grid.
+    _compact_raise_if_owner_exceeds_window(
+        args,
+        _compact_ordered_aligned_arg_indices,
+        _compact_ordered_offset_arg_index,
+        _compact_active_mask_arg_index,
+        _compact_ordered_window,
+    )
     cache = getattr(pallas_kernel, "_pallas_compact_cache", None)
     if cache is None or cache[0] != grid:
         interpret = (
@@ -2256,6 +2469,9 @@ def default_pallas_compact_worklist_launcher(
             aligned_arg_indices=_compact_aligned_arg_indices or [],
             tile_start_ref_pos=_compact_tile_start_ref_pos,
             compact_block=_compact_block,
+            ordered_aligned_arg_indices=_compact_ordered_aligned_arg_indices or [],
+            range_start_ref_pos=_compact_range_start_ref_pos,
+            ordered_window=_compact_ordered_window,
             interpret=interpret,
         )
         cache_attr = "_pallas_compact_cache"

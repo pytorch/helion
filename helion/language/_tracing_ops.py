@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import logging
 import operator
 from typing import TYPE_CHECKING
 from typing import TypeVar
@@ -27,8 +28,11 @@ from ..exc import NotInsideKernel
 from . import _decorators
 from .tile_proxy import Tile
 
+log = logging.getLogger(__name__)
+
 if TYPE_CHECKING:
     from collections.abc import Callable
+    from collections.abc import Sequence
 
     from .._compiler.inductor_lowering import CodegenState
     from .._compiler.tile_strategy import TileStrategy
@@ -256,11 +260,14 @@ def _(state: CodegenState) -> object:
         return _codegen_fori_loop(state)
     if pallas_loop_type == "compact_worklist":
         # The compact tile becomes the grid (no loop).  The ordered inner tile
-        # (fully jagged carried reduction) lowers via emit_pipeline for
-        # pl.Buffered double-buffering; the single-iteration compact tile lowers
-        # through the fori path.  Both have begin/end remapped to metadata refs
-        # (see _compact_worklist_bounds).
+        # (fully jagged carried reduction) uses the owner-resident fori path when
+        # the ordered range can be proven/windowed; otherwise it streams through
+        # emit_pipeline.  The single-iteration compact tile lowers through the
+        # fori path.  Both have begin/end remapped to metadata refs (see
+        # _compact_worklist_bounds).
         if _is_compact_ordered_inner_loop(state):
+            if _owner_cache_applies(state):
+                return _codegen_owner_cache(state)
             return _codegen_emit_pipeline(state)
         return _codegen_fori_loop(state)
     # unroll: fall through to common codegen path
@@ -279,17 +286,257 @@ def _(state: CodegenState) -> None:
     if pallas_loop_type in ("fori_loop", "compact_worklist"):
         # Route compact_worklist through the same lowering as _for_loop so the
         # compact metadata (begin/end remap, synthetic compact tile) is applied
-        # rather than falling through to the common (non-compact) codegen.  The
-        # ordered inner tile uses emit_pipeline for double-buffering.
+        # rather than falling through to the common (non-compact) codegen.
         if pallas_loop_type == "compact_worklist" and _is_compact_ordered_inner_loop(
             state
         ):
+            if _owner_cache_applies(state):
+                _codegen_owner_cache(state)
+                return None
             _codegen_emit_pipeline(state)
             return None
         _codegen_fori_loop(state)
         return None
     # pyrefly: ignore[bad-return]
     return state.get_graph(state.proxy_arg(0)).codegen(state)
+
+
+def _owner_cache_applies(state: CodegenState) -> bool:
+    """Whether the ordered reduction should use the owner-resident path.
+
+    Automatic compile-time decision (not a tuning knob), gated on:
+    - a bound-checkable ordered range plus compact active-owner mask: packed offset
+      arrays prove both the ordered length and which owners produce work; and
+    - a viable physical window: VMEM can hold at least one ordered block of the
+      resident operands.
+
+    A detected prep (``prep_perm``, see ``owner_cache_entries``) only enables the
+    optional once-per-owner prep-cache emission.  No-prep ordered reductions still
+    use the owner-resident window when the range/window proof succeeds.
+
+    If the range/window proof is absent -- unusual ordered bounds or an oversized
+    per-token footprint -- the ordered loop stays on the streamed
+    ``emit_pipeline`` path unchanged.
+    """
+    env = CompileEnvironment.current()
+    decision = env.compact_worklist_owner_cache_decision
+    return decision is not None and decision.active
+
+
+def _codegen_owner_cache(state: CodegenState) -> object:
+    """Owner-keyed resident-window lowering for the compact-worklist ordered loop.
+
+    Selected by :func:`_owner_cache_applies` for an ordered inner reduction with a
+    guardable packed range and a viable VMEM window.  The ordered operand (K/V) is
+    held in a per-owner resident ``pl.Element(C)`` window keyed on ``range_start``
+    (``C`` is the compile-threaded physical window).  If a prep is proven, that
+    prep (today, the head-major transpose) is also run ONCE per owner into a
+    persistent VMEM cache under ``@pl.when((_wid == 0) | (owner_ids[_wid] !=
+    owner_ids[max(_wid-1, 0)]))``.
+
+    Owners longer than ``C`` are NOT handled in-kernel: the launcher raises
+    (``runtime._compact_raise_if_owner_exceeds_window``) rather than over-read the
+    fixed window -- there is no in-kernel streamed ``else``.
+    """
+    # The resident window and optional prep-cache fission both live inside
+    # _codegen_fori_loop (guarded on the ordered axis), so the ordered reduction
+    # reuses the fori machinery.
+    return _codegen_fori_loop(state)
+
+
+def _oc_slice_elts(sl: ast.AST) -> list[ast.AST]:
+    """The per-dim subscript elements of a load's slice (``x[a, :, :]`` -> [a,:,:])."""
+    if isinstance(sl, ast.Tuple):
+        return list(sl.elts)
+    return [sl]
+
+
+def _owner_cache_prep_fallback(reason: str) -> None:
+    log.debug(
+        "compact_worklist owner_cache: skipping prep cache hoist (%s); "
+        "using resident-only lowering",
+        reason,
+    )
+
+
+def _emit_owner_cache(
+    state: CodegenState,
+    block_ids: list[int],
+    grid_parts: list[str],
+    body_stmts: list[ast.AST],
+    all_tensor_info: Sequence[tuple[torch.Tensor, object, object]],
+) -> None:
+    """Fission an ordered operand's proven prep into an owner-keyed cache.
+
+    This is the emission MECHANISM, not the decision: whether owner_cache applies
+    is decided once in ``OwnerCacheDecision``.  Here we act only on its
+    ``preps``: locate the corresponding emitted ``load -> transpose`` for each
+    prep operand and rewrite it so the operand is read from a persistent per-owner
+    VMEM cache in prepped (head-major) layout instead of re-transposed per compact
+    tile, plus emit the once-per-owner refill under an owner-change ``@pl.when``.
+    A resident-only/no-prep decision is a valid no-op here.  If the emitted body
+    no longer matches the recognized prep, leave the body unchanged and keep the
+    correct resident-only lowering.
+    """
+    from .._compiler.pallas.compact_worklist import owner_ref_name
+
+    env = CompileEnvironment.current()
+    plan = env.compact_worklist_plan
+    if plan is None or plan.ordered_axis is None:
+        return
+    if not (len(block_ids) == 1 and block_ids[0] == plan.ordered_axis.block_id):
+        return
+    # Consume the cached owner_cache decision that also routed this lowering; emit
+    # the cache only when it is active, over exactly its prep entries.  Inactive
+    # here => the ordered loop should have streamed (this path shouldn't have been
+    # selected); no-op rather than emit a windowed-but-uncached kernel.
+    decision = env.compact_worklist_owner_cache_decision
+    if decision is None or not decision.prep_active:
+        return
+    ordered_hosts = {p.arg_name for p in decision.preps}
+
+    # In-kernel window ref name -> per-tile fake, for each ordered operand.
+    window_fake: dict[str, torch.Tensor] = {}
+    window_host: dict[str, str] = {}
+    for fake, _sub_meta, _direction in all_tensor_info:
+        ta = state.device_function.tensor_arg(fake)
+        if ta.host_str() in ordered_hosts:
+            window_fake[ta.name] = fake
+            window_host[ta.name] = ta.host_str()
+    if not window_fake:
+        _owner_cache_prep_fallback("prep operands have no resident window refs")
+        return
+
+    # Prep = the load->transpose pairs on the ordered windows in the emitted body.
+    load_src: dict[str, tuple[str, ast.AST]] = {}  # load var -> (window, slice)
+    for st in body_stmts:
+        if (
+            isinstance(st, ast.Assign)
+            and len(st.targets) == 1
+            and isinstance(st.targets[0], ast.Name)
+            and isinstance(st.value, ast.Subscript)
+            and isinstance(st.value.value, ast.Name)
+            and st.value.value.id in window_fake
+        ):
+            load_src[st.targets[0].id] = (st.value.value.id, st.value.slice)
+    preps: list[tuple[ast.Assign, str, str, ast.AST, list[int]]] = []
+    for st in body_stmts:
+        if (
+            isinstance(st, ast.Assign)
+            and len(st.targets) == 1
+            and isinstance(st.targets[0], ast.Name)
+            and isinstance(st.value, ast.Call)
+            and isinstance(st.value.func, ast.Attribute)
+            and st.value.func.attr == "transpose"
+            and len(st.value.args) == 2
+            and isinstance(st.value.args[0], ast.Name)
+            and st.value.args[0].id in load_src
+        ):
+            try:
+                perm = ast.literal_eval(st.value.args[1])
+            except (SyntaxError, TypeError, ValueError):
+                continue
+            if not isinstance(perm, (list, tuple)) or not all(
+                isinstance(p, int) for p in perm
+            ):
+                continue
+            perm = list(perm)
+            window, sl = load_src[st.value.args[0].id]
+            preps.append((st, st.value.args[0].id, window, sl, perm))
+    # Bind the plan's prep decision exactly: every prep operand must have ONE
+    # emitted major-transpose prep whose perm matches what the plan detected.
+    # A missing prep, duplicate, or perm mismatch means this optional optimization
+    # no longer applies.  Fall back to the correct resident-only lowering by
+    # returning before mutating ``body_stmts`` or registering cache scratch.
+    expected = {p.arg_name: p.perm for p in decision.preps}
+    emitted_perms: dict[str, list[list[int]]] = {}
+    for _tr, _load_var, window, _sl, perm in preps:
+        emitted_perms.setdefault(window_host[window], []).append(perm)
+    for host, want in expected.items():
+        got = emitted_perms.get(host, [])
+        if len(got) != 1 or tuple(got[0]) != tuple(want):
+            _owner_cache_prep_fallback(
+                f"operand {host!r} expected perm {tuple(want)}, got "
+                f"{[tuple(g) for g in got]}"
+            )
+            return
+
+    assert decision.window is not None
+    blk = state.device_function.block_size_var(block_ids[0])
+    cache_ordered = decision.window.physical_window
+    owner_ref = f"{owner_ref_name(plan)}_ref"
+    nkv = grid_parts[0]
+
+    # Register a cache scratch per window (prepped layout) and build, for each
+    # prep, the replacement reduction read + the refill line.
+    cache_name: dict[str, str] = {}
+    refill_lines: list[str] = []
+    replace: dict[int, ast.stmt] = {}  # transpose stmt id -> cache-read stmt
+    for tr_stmt, _load_var, window, sl, perm in preps:
+        fake = window_fake[window]
+        if window not in cache_name:
+            win_shape = (cache_ordered, *(int(s) for s in fake.shape[1:]))
+            cache_shape = tuple(win_shape[p] for p in perm)
+            cache_name[window] = state.device_function.register_scratch(
+                cache_shape, fake.dtype, name_hint=f"{window}_hm"
+            )
+        cache = cache_name[window]
+        target = tr_stmt.targets[0]
+        assert isinstance(target, ast.Name)
+        # reduction: read the cache at the local ordered offset in prepped layout.
+        elts = [ast.unparse(e) for e in _oc_slice_elts(sl)]
+        read = f"{cache}[{', '.join(elts[p] for p in perm)}]"
+        replace[id(tr_stmt)] = statement_from_string(f"{target.id} = {read}")
+        # refill: transpose this owner's window tiles into the cache once.
+        rank = len(perm)
+        win_elts = [f"pl.ds(_octk * {blk}, {blk})", *([":"] * (rank - 1))]
+        wr = f"{window}[{', '.join(win_elts)}]"
+        cw = ", ".join(win_elts[p] for p in perm)
+        refill_lines.append(
+            f"        {cache}[{cw}] = jnp.transpose({wr}, {list(perm)})"
+        )
+
+    # Rewrite the body: swap each prep transpose for its cache read and drop the
+    # now-dead per-tile loads (unused once the transpose no longer reads them).
+    load_vars = {load_var for _s, load_var, _w, _sl, _p in preps}
+    still_used: set[str] = set()
+    for st in body_stmts:
+        if (
+            id(st) not in replace
+            and isinstance(st, ast.Assign)
+            and len(st.targets) == 1
+            and isinstance(st.targets[0], ast.Name)
+            and st.targets[0].id in load_vars
+        ):
+            continue
+        for node in ast.walk(replace.get(id(st), st)):
+            if isinstance(node, ast.Name) and node.id in load_vars:
+                still_used.add(node.id)
+    new_body: list[ast.AST] = []
+    for st in body_stmts:
+        if id(st) in replace:
+            new_body.append(replace[id(st)])
+        elif not (
+            isinstance(st, ast.Assign)
+            and len(st.targets) == 1
+            and isinstance(st.targets[0], ast.Name)
+            and st.targets[0].id in load_vars
+            and st.targets[0].id not in still_used
+        ):
+            new_body.append(st)
+    body_stmts[:] = new_body
+
+    # Refill the owner-keyed cache once, when this work item starts a new owner.
+    refill_src = (
+        f"@pl.when((_wid == 0) | "
+        f"({owner_ref}[_wid] != {owner_ref}[jnp.maximum(_wid - 1, 0)]))\n"
+        f"def _oc_refill():\n"
+        f"    def _oc_refill_body(_octk, _oc_carry):\n"
+        f"{chr(10).join(refill_lines)}\n"
+        f"        return _oc_carry\n"
+        f"    jax.lax.fori_loop(0, {nkv}, _oc_refill_body, ())"
+    )
+    state.add_statement(statement_from_string(refill_src))
 
 
 def _classify_loop_tensors(
@@ -418,9 +665,9 @@ def _is_compact_ordered_inner_loop(state: CodegenState) -> bool:
     """True if this ``_for_loop`` is the compact-worklist ordered inner tile.
 
     The ordered tile is the carried inner reduction (e.g. the KV loop in fully
-    jagged attention); it is the only compact-worklist loop routed to
-    ``_codegen_emit_pipeline`` (for ``pl.Buffered`` double-buffering).  The owner
-    grid and the single-iteration compact tile stay on the fori path.
+    jagged attention); it is the only compact-worklist loop that may stream via
+    ``_codegen_emit_pipeline`` when the owner-resident window is inactive.  The
+    owner grid and the single-iteration compact tile stay on the fori path.
     """
     from .._compiler.device_ir import ForLoopGraphInfo
 
@@ -462,8 +709,8 @@ def _get_loop_begin_and_end(
     axis -> ``range_start_ref``/``range_len_ref``).  Every downstream consumer
     (trip count, offset, masks) then composes unchanged: ``_codegen_fori_loop``
     runs a single iteration for the compact tile (``tile_extent <= BLOCK``),
-    while the ordered axis -- lowered via ``_codegen_emit_pipeline`` -- uses the
-    same remapped bounds for its pipeline grid and per-iteration offsets.
+    while the ordered axis uses the same remapped bounds for its resident-window
+    fori loop or streamed pipeline grid.
     """
     remap = _compact_worklist_bounds(state, loop_dim_index)
     if remap is not None:
@@ -2531,6 +2778,28 @@ def _codegen_fori_loop(state: CodegenState) -> object:
             not in _compact_names
         }
 
+    # owner_cache: only the RESIDENT ordered operands (active decision entries) are
+    # held in a per-owner resident pl.Element window and read at the local
+    # ordered-tile offset (see codegen._is_ordered_aligned_load).  Keep just those
+    # OFF the streamed make_async_copy path.  Gate on the SAME decision the window
+    # is built from, so an inactive owner_cache (prep but uncheckable bound) leaves
+    # every operand streaming.  No-op when nothing is resident.
+    if _compact_plan is not None:
+        _decision = env.compact_worklist_owner_cache_decision
+        _ordered_names = (
+            {p.arg_name for p in _decision.resident_operands}
+            if _decision is not None and _decision.active
+            else set()
+        )
+        if _ordered_names:
+            _fid_to_fake_o = {id(f): f for f, _s, _d in all_tensor_info}
+            pipelined_tensor_ids = {
+                fid
+                for fid in pipelined_tensor_ids
+                if state.device_function.tensor_arg(_fid_to_fake_o[fid]).host_str()
+                not in _ordered_names
+            }
+
     from .._compiler.device_function import PallasMemorySpace
 
     tensor_to_dma_scratch: dict[str, str] = {}
@@ -2793,7 +3062,8 @@ def _codegen_fori_loop(state: CodegenState) -> object:
     # straight-line with the loop var bound to 0 -- no fori_loop wrapper (which
     # would add control-flow overhead and block pipelining for the common
     # dense-KV case).  The ordered inner tile does not reach here: it lowers
-    # separately via emit_pipeline (see the _for_loop pallas dispatch).
+    # separately via the owner-resident path or emit_pipeline fallback (see the
+    # _for_loop pallas dispatch).
     plan = CompileEnvironment.current().compact_worklist_plan
     is_compact_tile = (
         plan is not None
@@ -2808,6 +3078,12 @@ def _codegen_fori_loop(state: CodegenState) -> object:
         for stmt in body_stmts or [ast.Pass()]:
             state.add_statement(stmt)
         return None
+
+    # owner_cache: optionally fission a proven ordered-operand prep into an
+    # owner-keyed cache -- rewrites body_stmts to read the cache and emits the
+    # refill before the reduction fori.  No-op off the ordered axis or for
+    # resident-only/no-prep decisions.
+    _emit_owner_cache(state, block_ids, grid_parts, body_stmts, all_tensor_info)
 
     _emit_nonlocal_scratch_declarations(state, body_stmts)
 

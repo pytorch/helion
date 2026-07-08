@@ -602,6 +602,35 @@ def _is_compact_aligned_load(
     )
 
 
+def _is_ordered_aligned_load(
+    state: CodegenState, block_id: int, tensor: torch.Tensor | None
+) -> bool:
+    """True if *tensor* is the owner_cache ordered reduction operand (K/V).
+
+    Under owner_cache it gets a per-owner resident ``pl.Element(C)`` window keyed
+    on ``range_start`` (not tile_start), so the fori body reads it at the LOCAL
+    ordered-tile offset ``offset - range_start`` rather than the absolute offset.
+    """
+    from helion._compiler.compile_environment import CompileEnvironment
+
+    if tensor is None:
+        return False
+    plan = CompileEnvironment.current().compact_worklist_plan
+    if plan is None or plan.ordered_axis is None:
+        return False
+    if block_id != plan.ordered_axis.block_id:
+        return False
+    # Only active resident ordered operands read the resident window at the local
+    # (offset - range_start) offset.  Consume the cached OwnerCacheDecision the
+    # loop router also uses; inactive means the ordered loop streams and no resident
+    # window exists.
+    decision = CompileEnvironment.current().compact_worklist_owner_cache_decision
+    if decision is None or not decision.active:
+        return False
+    host = state.device_function.tensor_arg(tensor).host_str()
+    return any(p.arg_name == host for p in decision.resident_operands)
+
+
 def _ds_expr(
     state: CodegenState,
     block_id: int,
@@ -627,6 +656,16 @@ def _ds_expr(
     # sliced block at local offset 0, not the absolute tile_start.
     if not tile_offset and _is_compact_aligned_load(state, block_id, tensor):
         return f"pl.ds(0, {block_size})"
+    # owner_cache ordered operand: resident pl.Element(C) window at range_start, so
+    # read at the LOCAL offset within the window (absolute offset - range_start).
+    if not tile_offset and _is_ordered_aligned_load(state, block_id, tensor):
+        from helion._compiler.compile_environment import CompileEnvironment
+        from helion._compiler.pallas.compact_worklist import ordered_ref_names
+
+        plan = CompileEnvironment.current().compact_worklist_plan
+        assert plan is not None
+        begin_ref = f"{ordered_ref_names(plan)[0]}_ref[_wid]"
+        return f"pl.ds(({offset}) - ({begin_ref}), {block_size})"
     if tensor is not None and tensor_dim is not None:
         from helion.language.memory_ops import _record_pad_info
 
