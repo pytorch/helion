@@ -16,7 +16,6 @@ import warnings
 
 import torch
 import torch.nn.functional as F
-from triton.testing import do_bench
 
 from .linear_attention_engine import LinearAttentionVariant
 from .linear_attention_engine import get_helion_fwd_kernel
@@ -30,6 +29,7 @@ from .linear_attention_utils import make_mamba2_inputs
 from .linear_attention_utils import naive_recurrent_reference
 from .linear_attention_utils import rel_error as _rel_error
 from helion._testing import DEVICE
+from helion._testing import do_bench
 
 # Test/benchmark config
 DTYPE = torch.bfloat16
@@ -467,11 +467,12 @@ def _time_config(
     fwd_ms = do_bench(lambda: harness.helion_fwd(inputs, C))
     fla_fwd_ms = do_bench(lambda: harness.fla_fwd(fla_inputs, scale))
     fb_ms = do_bench(
-        lambda: harness.helion_fb(inputs, grad_out, C), grad_to_none=h_grads
+        lambda: harness.helion_fb(inputs, grad_out, C),
+        grad_to_none=h_grads,  # pyrefly: ignore[bad-argument-type]
     )
     fla_fb_ms = do_bench(
         lambda: harness.fla_fb(fla_inputs, go_t, scale),
-        grad_to_none=fla_grads,
+        grad_to_none=fla_grads,  # pyrefly: ignore[bad-argument-type]
     )
     return (
         cast("float", fwd_ms),

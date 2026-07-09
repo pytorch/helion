@@ -34,8 +34,8 @@ _FLA_FWD: dict[LinearAttentionVariant, FlaForwardKernel] = {}
 
 try:
     from fla.ops.delta_rule import chunk_delta_rule  # pyrefly: ignore[missing-import]
-    from fla.ops.gated_delta_rule import (
-        chunk_gated_delta_rule,  # pyrefly: ignore[missing-import]
+    from fla.ops.gated_delta_rule import (  # pyrefly: ignore[missing-import]
+        chunk_gated_delta_rule,
     )
     from fla.ops.gla import chunk_gla  # pyrefly: ignore[missing-import]
     from fla.ops.kda import chunk_kda  # pyrefly: ignore[missing-import]

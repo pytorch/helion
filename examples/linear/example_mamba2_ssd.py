@@ -17,7 +17,6 @@ import warnings
 
 import torch
 import torch.nn.functional as F
-from triton.testing import do_bench
 
 from .linear_attention_engine import LinearAttentionVariant
 from .linear_attention_engine import get_helion_fwd_kernel
@@ -28,6 +27,7 @@ from .linear_attention_utils import head_to_time_first as _htf
 from .linear_attention_utils import naive_recurrent_reference
 from .linear_attention_utils import rel_error as _rel_error
 from helion._testing import DEVICE
+from helion._testing import do_bench
 
 if TYPE_CHECKING:
     from collections.abc import Callable
