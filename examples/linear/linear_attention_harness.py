@@ -26,6 +26,7 @@ from .linear_attention_utils import ACC_BWD_TOL
 from .linear_attention_utils import ACC_FWD_TOL
 from .linear_attention_utils import chunked_linear_attn_reference
 from .linear_attention_utils import head_to_time_first as _htf
+from .linear_attention_utils import make_mamba2_inputs
 from .linear_attention_utils import naive_recurrent_reference
 from .linear_attention_utils import rel_error as _rel_error
 from helion._testing import DEVICE
@@ -200,6 +201,22 @@ def make_kda_inputs(
     return Inputs(q=q, k=k, v=v, scale=1.0 / math.sqrt(D), g=g, beta=beta)
 
 
+def make_mamba2_ssd_inputs(
+    B: int,
+    H: int,
+    T: int,
+    D: int,
+    DV: int,
+    dtype: torch.dtype = DTYPE,
+    device: str | torch.device = DEVICE,
+    requires_grad: bool = False,
+) -> Inputs:
+    q, k, v, g, scale = make_mamba2_inputs(
+        B, H, T, D, DV, dtype=dtype, device=device, requires_grad=requires_grad
+    )
+    return Inputs(q=q, k=k, v=v, scale=scale, g=g)
+
+
 _VARIANT_SPECS: dict[
     LinearAttentionVariant, tuple[str, Callable[..., Inputs], tuple[str, ...]]
 ] = {
@@ -237,6 +254,11 @@ _VARIANT_SPECS: dict[
         "KDA (Kimi Delta Attention)",
         make_kda_inputs,
         ("q", "v"),
+    ),
+    LinearAttentionVariant.MAMBA2_SSD: (
+        "Mamba-2 SSD",
+        make_mamba2_ssd_inputs,
+        ("q", "k", "v"),
     ),
 }
 

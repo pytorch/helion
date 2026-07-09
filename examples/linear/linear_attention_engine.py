@@ -1896,7 +1896,7 @@ def chunked_linear_attn(
 
 
 class LinearAttentionVariant(Enum):
-    """A chunked-linear-attention variant, named to match its FLA counterpart."""
+    """A named chunked-linear-attention variant."""
 
     VANILLA = "vanilla_linear_attn"
     SIMPLE_GLA = "simple_gla"
@@ -1905,6 +1905,7 @@ class LinearAttentionVariant(Enum):
     DELTA_RULE = "delta_rule"
     GATED_DELTA_RULE = "gated_delta_rule"
     KDA = "kda"
+    MAMBA2_SSD = "mamba2_ssd"
 
 
 class HelionForwardKernel(Protocol):
@@ -2107,6 +2108,30 @@ def helion_chunk_kda(
     )
 
 
+def helion_chunk_mamba2_ssd(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    g: torch.Tensor | None = None,
+    beta: torch.Tensor | None = None,
+    *,
+    C: int = 64,
+    scale: float = 1.0,
+    initial_state: torch.Tensor | None = None,
+    return_final_state: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    assert g is not None
+    return chunked_linear_attn(
+        q * scale,
+        k,
+        v,
+        g,
+        C=C,
+        initial_state=initial_state,
+        return_final_state=return_final_state,
+    )
+
+
 _HELION_FWD: dict[LinearAttentionVariant, HelionForwardKernel] = {
     LinearAttentionVariant.VANILLA: helion_chunk_linear_attn,
     LinearAttentionVariant.SIMPLE_GLA: helion_chunk_simple_gla,
@@ -2115,6 +2140,7 @@ _HELION_FWD: dict[LinearAttentionVariant, HelionForwardKernel] = {
     LinearAttentionVariant.DELTA_RULE: helion_chunk_delta_rule,
     LinearAttentionVariant.GATED_DELTA_RULE: helion_chunk_gated_delta_rule,
     LinearAttentionVariant.KDA: helion_chunk_kda,
+    LinearAttentionVariant.MAMBA2_SSD: helion_chunk_mamba2_ssd,
 }
 
 

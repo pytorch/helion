@@ -13,17 +13,19 @@ from __future__ import annotations
 import sys
 import types
 from typing import TYPE_CHECKING
+from typing import cast
 import warnings
 
 import torch
 import torch.nn.functional as F
 from triton.testing import do_bench
 
-from .linear_attention_engine import chunked_linear_attn
+from .linear_attention_engine import LinearAttentionVariant
+from .linear_attention_engine import get_helion_fwd_kernel
 from .linear_attention_engine import recurrent_step
+from .linear_attention_harness import make_mamba2_ssd_inputs
 from .linear_attention_utils import chunked_linear_attn_reference
 from .linear_attention_utils import head_to_time_first as _htf
-from .linear_attention_utils import make_mamba2_inputs
 from .linear_attention_utils import naive_recurrent_reference
 from .linear_attention_utils import rel_error as _rel_error
 from helion._testing import DEVICE
@@ -37,6 +39,7 @@ C = 32
 DTYPE = torch.bfloat16
 BENCH_CONFIGS = [(1, 32, 2048, 128, 128), (1, 32, 4096, 128, 128)]
 BENCH_C = 64
+HELION_FWD = get_helion_fwd_kernel(LinearAttentionVariant.MAMBA2_SSD)
 
 
 def _import_mamba() -> Callable[..., torch.Tensor] | None:
@@ -82,11 +85,17 @@ def test() -> None:
     _has_mamba = mamba_chunk_scan_combined is not None
 
     # === Make inputs ===
-    q, k, v, g, scale = make_mamba2_inputs(B, H, T, D, DV, dtype=DTYPE, device=DEVICE)
+    inputs = make_mamba2_ssd_inputs(B, H, T, D, DV, dtype=DTYPE, device=DEVICE)
 
     # === Forward: vs naive recurrent reference ===
-    out = chunked_linear_attn(q, k, v, g, C=C)
-    ref = naive_recurrent_reference(q, k, v, g, q_scale=scale)
+    out = cast(
+        "torch.Tensor",
+        HELION_FWD(inputs.q, inputs.k, inputs.v, inputs.g, C=C, scale=inputs.scale),
+    )
+    assert inputs.g is not None
+    ref = naive_recurrent_reference(
+        inputs.q, inputs.k, inputs.v, inputs.g, q_scale=inputs.scale
+    )
     fwd_err = _rel_error(out, ref)
     assert fwd_err < 0.02, f"Forward error: {fwd_err}"
     print(f"  fwd vs recurrent: {fwd_err:.4e} PASS")
@@ -101,7 +110,7 @@ def test() -> None:
     v_m = (x * dt.unsqueeze(-1)).transpose(1, 2).contiguous()
     g_m = (A[None, None, :] * dt).transpose(1, 2).contiguous()
     if _has_mamba:
-        out_m = chunked_linear_attn(q_m, k_m, v_m, g_m, C=C)
+        out_m = cast("torch.Tensor", HELION_FWD(q_m, k_m, v_m, g_m, C=C, scale=1.0))
         o_mamba = mamba_chunk_scan_combined(
             x, dt, A, B_mat, C_mat, chunk_size=C, D=None, dt_softplus=False
         )
@@ -113,16 +122,16 @@ def test() -> None:
 
     # === Backward: vs chunked reference ===
     grad_out = torch.randn(B, H, T, DV, device=DEVICE, dtype=DTYPE)
-    q1 = q.clone().requires_grad_(True)
-    k1 = k.clone().requires_grad_(True)
-    v1 = v.clone().requires_grad_(True)
-    o1 = chunked_linear_attn(q1, k1, v1, g, C=C)
+    q1 = inputs.q.clone().requires_grad_(True)
+    k1 = inputs.k.clone().requires_grad_(True)
+    v1 = inputs.v.clone().requires_grad_(True)
+    o1 = cast("torch.Tensor", HELION_FWD(q1, k1, v1, inputs.g, C=C, scale=inputs.scale))
     o1.backward(grad_out)
 
-    q2 = q.clone().requires_grad_(True)
-    k2 = k.clone().requires_grad_(True)
-    v2 = v.clone().requires_grad_(True)
-    o2 = chunked_linear_attn_reference(q2, k2, v2, g, C=C)
+    q2 = inputs.q.clone().requires_grad_(True)
+    k2 = inputs.k.clone().requires_grad_(True)
+    v2 = inputs.v.clone().requires_grad_(True)
+    o2 = chunked_linear_attn_reference(q2, k2, v2, inputs.g, C=C)
     o2.backward(grad_out)
 
     for name, g1, g2 in [
@@ -139,7 +148,7 @@ def test() -> None:
         q3 = q_m.clone().requires_grad_(True)
         k3 = k_m.clone().requires_grad_(True)
         v3 = v_m.clone().requires_grad_(True)
-        o3 = chunked_linear_attn(q3, k3, v3, g_m, C=C)
+        o3 = cast("torch.Tensor", HELION_FWD(q3, k3, v3, g_m, C=C, scale=1.0))
         grad_out_m = torch.randn(B, H, T, DV, device=DEVICE, dtype=DTYPE)
         o3.backward(grad_out_m)
 
@@ -160,20 +169,29 @@ def test() -> None:
 
     # === Recurrent step: compare step-by-step vs chunked ===
     torch.manual_seed(42)
-    q_rec, k_rec, v_rec, g_rec, _ = make_mamba2_inputs(
-        B, H, T, D, DV, dtype=DTYPE, device=DEVICE
-    )
+    rec_inputs = make_mamba2_ssd_inputs(B, H, T, D, DV, dtype=DTYPE, device=DEVICE)
+    assert rec_inputs.g is not None
 
-    o_chunked = chunked_linear_attn(q_rec, k_rec, v_rec, g_rec, C=C)
+    o_chunked = cast(
+        "torch.Tensor",
+        HELION_FWD(
+            rec_inputs.q,
+            rec_inputs.k,
+            rec_inputs.v,
+            rec_inputs.g,
+            C=C,
+            scale=rec_inputs.scale,
+        ),
+    )
 
     state = torch.zeros(B, H, D, DV, device=DEVICE, dtype=torch.float32)
     o_steps = []
     for t in range(T):
-        alpha = torch.exp(g_rec[:, :, t : t + 1])  # [B,H,1]
+        alpha = torch.exp(rec_inputs.g[:, :, t : t + 1])  # [B,H,1]
         o_t, state = recurrent_step(
-            q_rec[:, :, t : t + 1],
-            k_rec[:, :, t : t + 1],
-            v_rec[:, :, t : t + 1],
+            rec_inputs.q[:, :, t : t + 1],
+            rec_inputs.k[:, :, t : t + 1],
+            rec_inputs.v[:, :, t : t + 1],
             state,
             alpha=alpha,
         )
@@ -201,7 +219,7 @@ def benchmark() -> None:
     print("-" * 72)
 
     for bi, hi, ti, di, dvi in BENCH_CONFIGS:
-        q, k, v, g, scale = make_mamba2_inputs(
+        inputs = make_mamba2_ssd_inputs(
             bi, hi, ti, di, dvi, dtype=DTYPE, device=DEVICE, requires_grad=True
         )
         grad_out = torch.randn(bi, hi, ti, dvi, device=DEVICE, dtype=DTYPE)
@@ -217,12 +235,15 @@ def benchmark() -> None:
         go_t = _htf(grad_out)
 
         def helion_fwd(
-            qi: torch.Tensor = q,
-            ki: torch.Tensor = k,
-            vi: torch.Tensor = v,
-            gi: torch.Tensor = g,
+            qi: torch.Tensor = inputs.q,
+            ki: torch.Tensor = inputs.k,
+            vi: torch.Tensor = inputs.v,
+            gi: torch.Tensor | None = inputs.g,
+            scale: float = inputs.scale,
         ) -> torch.Tensor:
-            return chunked_linear_attn(qi, ki, vi, gi, C=BENCH_C)
+            return cast(
+                "torch.Tensor", HELION_FWD(qi, ki, vi, gi, C=BENCH_C, scale=scale)
+            )
 
         fwd_ms = do_bench(helion_fwd)
 
@@ -239,13 +260,14 @@ def benchmark() -> None:
         mamba_fwd_ms = do_bench(mamba_fwd)
 
         def helion_fb(
-            qi: torch.Tensor = q,
-            ki: torch.Tensor = k,
-            vi: torch.Tensor = v,
-            gi: torch.Tensor = g,
+            qi: torch.Tensor = inputs.q,
+            ki: torch.Tensor = inputs.k,
+            vi: torch.Tensor = inputs.v,
+            gi: torch.Tensor | None = inputs.g,
+            scale: float = inputs.scale,
             go: torch.Tensor = grad_out,
         ) -> None:
-            o = chunked_linear_attn(qi, ki, vi, gi, C=BENCH_C)
+            o = cast("torch.Tensor", HELION_FWD(qi, ki, vi, gi, C=BENCH_C, scale=scale))
             o.backward(go)
             qi.grad = ki.grad = vi.grad = None
 
