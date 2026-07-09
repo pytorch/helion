@@ -517,19 +517,21 @@ class TestDisallowPidTypeReasons(unittest.TestCase):
 
 class TestSaveOutputPathHandling(unittest.TestCase):
     """save_search_space_summary / save_exploration_report must never crash the
-    autotuner on awkward output paths (directory, missing parents, etc.)."""
+    autotuner on awkward output paths (directory, missing parents, etc.) and
+    must produce per-kernel/per-hash filenames that don't clobber each other."""
 
-    def _summary_obj(self) -> SearchSpaceSummary:
-        return _summary(
-            dimensions=[
-                SearchSpaceDimension(
-                    name="num_warps",
-                    dim_type="discrete",
-                    size=6,
-                    values=[1, 2, 4, 8, 16, 32],
-                )
-            ]
-        )
+    def _summary_obj(self, kernel_name: str = "kernel_under_test") -> SearchSpaceSummary:
+        dims = [
+            SearchSpaceDimension(
+                name="num_warps",
+                dim_type="discrete",
+                size=6,
+                values=[1, 2, 4, 8, 16, 32],
+            )
+        ]
+        summary = _summary(dimensions=dims)
+        summary.kernel_name = kernel_name
+        return summary
 
     def _report_obj(self) -> ExplorationReport:
         return ExplorationReport(
@@ -544,21 +546,69 @@ class TestSaveOutputPathHandling(unittest.TestCase):
             min_feature_coverage=0.0,
         )
 
-    def test_save_to_explicit_file(self) -> None:
+    def test_save_embeds_kernel_and_hash(self) -> None:
+        """The saved filename embeds the kernel name and cache hash tokens."""
         with tempfile.TemporaryDirectory() as d:
             target = os.path.join(d, "out.json")
             saved = save_search_space_summary(
-                self._summary_obj(), 3, "Test", 1.0, target
+                self._summary_obj(), 3, "Test", 1.0, target, "deadbeef"
             )
-            self.assertEqual(saved, target)
-            self.assertTrue(os.path.isfile(target))
+            self.assertEqual(
+                saved,
+                os.path.join(d, "out.kernel_under_test.deadbeef.json"),
+            )
+            self.assertTrue(os.path.isfile(saved))
             json.loads(Path(saved).read_text())
+
+    def test_hash_determines_path(self) -> None:
+        """Distinct hashes give distinct files; the same hash reuses one file."""
+        with tempfile.TemporaryDirectory() as d:
+            target = os.path.join(d, "out.json")
+            a = save_search_space_summary(
+                self._summary_obj("kernel_a"), 3, "Test", 1.0, target, "aaaa"
+            )
+            b = save_search_space_summary(
+                self._summary_obj("kernel_b"), 3, "Test", 1.0, target, "bbbb"
+            )
+            # Different kernel/hash -> distinct files (no clobber).
+            self.assertNotEqual(a, b)
+            self.assertTrue(os.path.isfile(a))
+            self.assertTrue(os.path.isfile(b))
+            # Re-tuning the same kernel/shape (same hash) reuses one file.
+            a2 = save_search_space_summary(
+                self._summary_obj("kernel_a"), 5, "Test", 2.0, target, "aaaa"
+            )
+            self.assertEqual(a, a2)
+
+    def test_save_without_hash(self) -> None:
+        """With no cache hash: kernel-only filename, and existing files get a
+        numeric suffix instead of being clobbered."""
+        with tempfile.TemporaryDirectory() as d:
+            target = os.path.join(d, "out.json")
+            first = save_search_space_summary(
+                self._summary_obj(), 3, "Test", 1.0, target, None
+            )
+            self.assertEqual(first, os.path.join(d, "out.kernel_under_test.json"))
+            self.assertTrue(os.path.isfile(first))
+            # A second save with no distinguishing hash must not clobber.
+            second = save_search_space_summary(
+                self._summary_obj(), 3, "Test", 1.0, target, None
+            )
+            self.assertNotEqual(first, second)
+            self.assertTrue(os.path.isfile(second))
 
     def test_save_to_existing_directory(self) -> None:
         """A directory path gets a default filename appended, not a crash."""
         with tempfile.TemporaryDirectory() as d:
-            saved = save_search_space_summary(self._summary_obj(), 3, "Test", 1.0, d)
-            self.assertEqual(saved, os.path.join(d, "autotune_search_space.json"))
+            saved = save_search_space_summary(
+                self._summary_obj(), 3, "Test", 1.0, d, "deadbeef"
+            )
+            self.assertEqual(
+                saved,
+                os.path.join(
+                    d, "autotune_search_space.kernel_under_test.deadbeef.json"
+                ),
+            )
             self.assertTrue(os.path.isfile(saved))
 
     def test_save_to_trailing_separator_directory(self) -> None:
@@ -566,37 +616,34 @@ class TestSaveOutputPathHandling(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             target = os.path.join(d, "nested") + os.sep
             saved = save_search_space_summary(
-                self._summary_obj(), 3, "Test", 1.0, target
+                self._summary_obj(), 3, "Test", 1.0, target, "deadbeef"
             )
             self.assertEqual(
-                saved, os.path.join(d, "nested", "autotune_search_space.json")
+                saved,
+                os.path.join(
+                    d, "nested", "autotune_search_space.kernel_under_test.deadbeef.json"
+                ),
             )
             self.assertTrue(os.path.isfile(saved))
 
-    def test_save_creates_missing_parent_dirs(self) -> None:
-        with tempfile.TemporaryDirectory() as d:
-            target = os.path.join(d, "a", "b", "c", "out.json")
-            saved = save_search_space_summary(
-                self._summary_obj(), 3, "Test", 1.0, target
-            )
-            self.assertTrue(os.path.isfile(saved))
+    def test_exploration_report_skipped_when_summary_failed(self) -> None:
+        """An empty summary path (save failed) means nothing to write."""
+        saved = save_exploration_report(self._report_obj(), "")
+        self.assertEqual(saved, "")
 
-    def test_exploration_report_next_to_file(self) -> None:
+    def test_exploration_report_only_swaps_extension(self) -> None:
+        """A ".json" earlier in the stem must not be substituted."""
         with tempfile.TemporaryDirectory() as d:
-            target = os.path.join(d, "out.json")
-            saved = save_exploration_report(self._report_obj(), target)
-            self.assertEqual(saved, os.path.join(d, "out_exploration.json"))
+            # Summary stem itself contains ".json" (e.g. a kernel named
+            # "foo.json"); only the trailing extension should be swapped.
+            summary_path = os.path.join(d, "out.foo.json.deadbeef.json")
+            saved = save_exploration_report(self._report_obj(), summary_path)
+            self.assertEqual(
+                saved,
+                os.path.join(d, "out.foo.json.deadbeef_exploration.json"),
+            )
             self.assertTrue(os.path.isfile(saved))
             json.loads(Path(saved).read_text())
-
-    def test_exploration_report_for_directory_path(self) -> None:
-        """When the summary path is a directory, the report lands inside it."""
-        with tempfile.TemporaryDirectory() as d:
-            saved = save_exploration_report(self._report_obj(), d)
-            self.assertEqual(
-                saved, os.path.join(d, "autotune_search_space_exploration.json")
-            )
-            self.assertTrue(os.path.isfile(saved))
 
     def test_save_never_raises_on_bad_path(self) -> None:
         """A write failure returns an empty string instead of raising."""
@@ -607,7 +654,7 @@ class TestSaveOutputPathHandling(unittest.TestCase):
             Path(blocker).write_text("x")
             target = os.path.join(blocker, "out.json")
             saved = save_search_space_summary(
-                self._summary_obj(), 3, "Test", 1.0, target
+                self._summary_obj(), 3, "Test", 1.0, target, "deadbeef"
             )
             self.assertEqual(saved, "")
 
@@ -615,8 +662,8 @@ class TestSaveOutputPathHandling(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             blocker = os.path.join(d, "blocker")
             Path(blocker).write_text("x")
-            target = os.path.join(blocker, "out.json")
-            saved = save_exploration_report(self._report_obj(), target)
+            summary_path = os.path.join(blocker, "out.json")
+            saved = save_exploration_report(self._report_obj(), summary_path)
             self.assertEqual(saved, "")
 
 

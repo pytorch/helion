@@ -17,6 +17,7 @@ import json
 import logging
 import math
 from pathlib import Path
+import re
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -847,6 +848,7 @@ def save_search_space_summary(
     search_algorithm: str,
     elapsed_seconds: float,
     output_path: str,
+    cache_hash: str | None = None,
 ) -> str:
     """Save search space analysis to a JSON file.
 
@@ -856,6 +858,10 @@ def save_search_space_summary(
         search_algorithm: Name of the search algorithm used
         elapsed_seconds: Total autotune time
         output_path: Path to save the JSON file
+        cache_hash: The autotuner's stable cache hash for this kernel/shape.
+            When provided, it is injected into the filename so each kernel/run
+            writes a distinct file (matching the ``.best_config`` cache key)
+            instead of overwriting a shared ``output_path``.
 
     Returns:
         The path to the saved file, or an empty string if saving failed. This
@@ -875,7 +881,12 @@ def save_search_space_summary(
     }
 
     try:
-        path = _resolve_output_path(output_path, "autotune_search_space.json")
+        path = _build_unique_output_path(
+            output_path,
+            kernel_name=summary.kernel_name,
+            cache_hash=cache_hash,
+            default_filename="autotune_search_space.json",
+        )
         path.write_text(json.dumps(output, indent=2, default=str))
         return str(path)
     except Exception:
@@ -887,42 +898,105 @@ def save_search_space_summary(
 
 def save_exploration_report(
     report: ExplorationReport,
-    output_path: str,
+    summary_path: str,
 ) -> str:
-    """Save a feature exploration report to a JSON file.
+    """Save a feature exploration report next to a saved search space summary.
 
-    ``output_path`` is the path configured for the search space summary; the
-    exploration report is written alongside it with an ``_exploration.json``
-    suffix. Directory paths (existing or trailing-separator) are handled by
-    writing a default filename into them.
+    The report is written alongside ``summary_path`` (the concrete path returned
+    by :func:`save_search_space_summary`) with its ``.json`` suffix replaced by
+    ``_exploration.json``. Passing the already-resolved summary path — rather
+    than the raw configured path — guarantees the two files share the same
+    kernel/hash token and therefore always pair up.
 
     Args:
         report: The exploration report to serialize.
-        output_path: Base path used for the search space summary.
+        summary_path: The concrete path the search space summary was written to
+            (the return value of :func:`save_search_space_summary`). An empty
+            string (summary save failed) is treated as nothing to do.
 
     Returns:
-        The path to the saved file, or an empty string if saving failed. This
-        function is best-effort and never raises: search space logging is
-        purely diagnostic and must never crash the autotuner.
+        The path to the saved file, or an empty string if saving failed or was
+        skipped. This function is best-effort and never raises: search space
+        logging is purely diagnostic and must never crash the autotuner.
     """
+    if not summary_path:
+        return ""
     try:
-        path = _resolve_output_path(output_path, "autotune_search_space.json")
+        path = Path(summary_path)
         # Derive the exploration report path from the resolved summary path so
-        # the two files always sit side by side, regardless of whether
-        # output_path was a directory.
-        report_path = path.with_name(
-            path.name.replace(".json", "_exploration.json")
-            if path.name.endswith(".json")
-            else path.name + "_exploration.json"
-        )
+        # the two files always sit side by side and share the same token. Only
+        # the true extension is swapped (not any ".json" that happens to appear
+        # earlier in the stem, e.g. a kernel literally named "foo.json").
+        report_path = path.with_name(f"{path.stem}_exploration{path.suffix or '.json'}")
         report_path.parent.mkdir(parents=True, exist_ok=True)
         report_path.write_text(json.dumps(report.to_dict(), indent=2, default=str))
         return str(report_path)
     except Exception:
         log.debug(
-            "Failed to save exploration report near %r", output_path, exc_info=True
+            "Failed to save exploration report near %r", summary_path, exc_info=True
         )
         return ""
+
+
+def _sanitize_filename_token(token: str) -> str:
+    """Reduce ``token`` to a filesystem-safe fragment for use in a filename."""
+    cleaned = re.sub(r"[^0-9A-Za-z._-]+", "_", token).strip("._-")
+    return cleaned[:64]  # keep filenames from growing unbounded
+
+
+def _build_unique_output_path(
+    output_path: str,
+    kernel_name: str,
+    cache_hash: str | None,
+    default_filename: str,
+) -> Path:
+    """Resolve ``output_path`` to a per-kernel file path.
+
+    The kernel name and the autotuner's stable cache hash are injected into the
+    filename stem so different kernels/shapes each write a distinct file
+    (matching the ``.best_config`` cache key) instead of overwriting a shared
+    ``output_path``. Re-tuning the *same* kernel/shape reuses the same hash and
+    intentionally rewrites its file, mirroring the cache. Directory paths
+    (existing or trailing-separator) are supported by writing the default
+    filename into them.
+
+    Example: ``analysis.json`` -> ``analysis.my_kernel.3f9a1c2e.json``.
+
+    Args:
+        output_path: The user-provided path (may be a file or directory).
+        kernel_name: Kernel name to embed in the filename (may be empty).
+        cache_hash: The autotuner stable cache hash to embed (may be None/empty,
+            in which case only the kernel name is used).
+        default_filename: Filename to use if ``output_path`` refers to a
+            directory.
+
+    Returns:
+        A resolved :class:`~pathlib.Path` whose parent directory exists. If no
+        distinguishing token is available and a file already exists at the
+        computed path, a numeric suffix is appended so nothing is overwritten.
+    """
+    base = _resolve_output_path(output_path, default_filename)
+
+    parts = [base.stem]
+    kernel_token = _sanitize_filename_token(kernel_name)
+    if kernel_token:
+        parts.append(kernel_token)
+    hash_token = _sanitize_filename_token(cache_hash or "")
+    if hash_token:
+        parts.append(hash_token)
+    candidate = base.with_name(f"{'.'.join(parts)}{base.suffix}")
+
+    # A hash token makes the path deterministic and unique per kernel/shape;
+    # rewriting it on re-tune is intentional (mirrors the .best_config cache).
+    # Only when no hash is available do we guard against clobbering an unrelated
+    # file by appending a numeric suffix.
+    if hash_token:
+        return candidate
+    counter = 1
+    while candidate.exists():
+        candidate = base.with_name(f"{'.'.join(parts)}.{counter}{base.suffix}")
+        counter += 1
+    return candidate
 
 
 def _resolve_output_path(output_path: str, default_filename: str) -> Path:

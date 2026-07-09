@@ -652,19 +652,21 @@ class BaseSearch(BaseAutotuner):
                     )
                     report.log_summary(self.log._logger)
                 if self.settings.autotune_log_search_space_path:
+                    cache_hash = self._get_autotune_cache_hash()
                     saved_path = save_search_space_summary(
                         self._search_summary,
                         self._autotune_metrics.num_configs_tested,
                         type(self).__name__,
                         end - start,
                         self.settings.autotune_log_search_space_path,
+                        cache_hash,
                     )
                     if saved_path:
                         self.log(f"Search space analysis saved to: {saved_path}")
                     if report is not None:
                         report_path = save_exploration_report(
                             report,
-                            self.settings.autotune_log_search_space_path,
+                            saved_path,
                         )
                         if report_path:
                             self.log(
@@ -700,6 +702,27 @@ class BaseSearch(BaseAutotuner):
         specialization_key = str(_normalize_spec_key(spec_key))
 
         return hardware, specialization_key
+
+    def _get_autotune_cache_hash(self) -> str | None:
+        """Return the autotuner's stable local-cache hash for this run.
+
+        This is the same hash used as the ``.best_config`` cache filename stem,
+        so search-space logs written with it line up with the cache entry and
+        differ per kernel/shape. Best-effort: returns ``None`` if the kernel is
+        not cacheable or the key can't be built, so callers must tolerate None.
+        """
+        try:
+            if not self.kernel.is_cacheable():
+                return None
+            from .local_cache import LocalAutotuneCache
+
+            return LocalAutotuneCache(self)._generate_key().stable_hash()
+        except Exception:
+            self.log.debug(
+                "Could not compute autotune cache hash for search space log",
+                exc_info=True,
+            )
+            return None
 
     def _find_similar_cached_configs(self, max_configs: int) -> list[SavedBestConfig]:
         """Return cached configs matching hardware, specialization_key, and config_spec_hash; empty if cache is skipped.
