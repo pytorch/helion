@@ -13,7 +13,6 @@ from __future__ import annotations
 import sys
 import types
 from typing import TYPE_CHECKING
-from typing import cast
 import warnings
 
 import torch
@@ -88,10 +87,8 @@ def test() -> None:
     inputs = make_mamba2_ssd_inputs(B, H, T, D, DV, dtype=DTYPE, device=DEVICE)
 
     # === Forward: vs naive recurrent reference ===
-    out = cast(
-        "torch.Tensor",
-        HELION_FWD(inputs.q, inputs.k, inputs.v, inputs.g, C=C, scale=inputs.scale),
-    )
+    out = HELION_FWD(inputs.q, inputs.k, inputs.v, inputs.g, C=C, scale=inputs.scale)
+    assert isinstance(out, torch.Tensor)
     assert inputs.g is not None
     ref = naive_recurrent_reference(
         inputs.q, inputs.k, inputs.v, inputs.g, q_scale=inputs.scale
@@ -110,7 +107,8 @@ def test() -> None:
     v_m = (x * dt.unsqueeze(-1)).transpose(1, 2).contiguous()
     g_m = (A[None, None, :] * dt).transpose(1, 2).contiguous()
     if _has_mamba:
-        out_m = cast("torch.Tensor", HELION_FWD(q_m, k_m, v_m, g_m, C=C, scale=1.0))
+        out_m = HELION_FWD(q_m, k_m, v_m, g_m, C=C, scale=1.0)
+        assert isinstance(out_m, torch.Tensor)
         o_mamba = mamba_chunk_scan_combined(
             x, dt, A, B_mat, C_mat, chunk_size=C, D=None, dt_softplus=False
         )
@@ -125,7 +123,8 @@ def test() -> None:
     q1 = inputs.q.clone().requires_grad_(True)
     k1 = inputs.k.clone().requires_grad_(True)
     v1 = inputs.v.clone().requires_grad_(True)
-    o1 = cast("torch.Tensor", HELION_FWD(q1, k1, v1, inputs.g, C=C, scale=inputs.scale))
+    o1 = HELION_FWD(q1, k1, v1, inputs.g, C=C, scale=inputs.scale)
+    assert isinstance(o1, torch.Tensor)
     o1.backward(grad_out)
 
     q2 = inputs.q.clone().requires_grad_(True)
@@ -148,7 +147,8 @@ def test() -> None:
         q3 = q_m.clone().requires_grad_(True)
         k3 = k_m.clone().requires_grad_(True)
         v3 = v_m.clone().requires_grad_(True)
-        o3 = cast("torch.Tensor", HELION_FWD(q3, k3, v3, g_m, C=C, scale=1.0))
+        o3 = HELION_FWD(q3, k3, v3, g_m, C=C, scale=1.0)
+        assert isinstance(o3, torch.Tensor)
         grad_out_m = torch.randn(B, H, T, DV, device=DEVICE, dtype=DTYPE)
         o3.backward(grad_out_m)
 
@@ -172,17 +172,15 @@ def test() -> None:
     rec_inputs = make_mamba2_ssd_inputs(B, H, T, D, DV, dtype=DTYPE, device=DEVICE)
     assert rec_inputs.g is not None
 
-    o_chunked = cast(
-        "torch.Tensor",
-        HELION_FWD(
-            rec_inputs.q,
-            rec_inputs.k,
-            rec_inputs.v,
-            rec_inputs.g,
-            C=C,
-            scale=rec_inputs.scale,
-        ),
+    o_chunked = HELION_FWD(
+        rec_inputs.q,
+        rec_inputs.k,
+        rec_inputs.v,
+        rec_inputs.g,
+        C=C,
+        scale=rec_inputs.scale,
     )
+    assert isinstance(o_chunked, torch.Tensor)
 
     state = torch.zeros(B, H, D, DV, device=DEVICE, dtype=torch.float32)
     o_steps = []
@@ -241,9 +239,9 @@ def benchmark() -> None:
             gi: torch.Tensor | None = inputs.g,
             scale: float = inputs.scale,
         ) -> torch.Tensor:
-            return cast(
-                "torch.Tensor", HELION_FWD(qi, ki, vi, gi, C=BENCH_C, scale=scale)
-            )
+            o = HELION_FWD(qi, ki, vi, gi, C=BENCH_C, scale=scale)
+            assert isinstance(o, torch.Tensor)
+            return o
 
         fwd_ms = do_bench(helion_fwd)
 
@@ -267,7 +265,8 @@ def benchmark() -> None:
             scale: float = inputs.scale,
             go: torch.Tensor = grad_out,
         ) -> None:
-            o = cast("torch.Tensor", HELION_FWD(qi, ki, vi, gi, C=BENCH_C, scale=scale))
+            o = HELION_FWD(qi, ki, vi, gi, C=BENCH_C, scale=scale)
+            assert isinstance(o, torch.Tensor)
             o.backward(go)
             qi.grad = ki.grad = vi.grad = None
 

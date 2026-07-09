@@ -277,18 +277,9 @@ class LinearAttentionExampleHarness:
 
     def helion_fwd(self, i: Inputs, C: int) -> torch.Tensor:
         fwd = get_helion_fwd_kernel(self.variant)
-        return cast(
-            "torch.Tensor",
-            fwd(
-                i.q,
-                i.k,
-                i.v,
-                i.g,
-                i.beta,
-                C=C,
-                scale=i.scale,
-            ),
-        )
+        out = fwd(i.q, i.k, i.v, i.g, i.beta, C=C, scale=i.scale)
+        assert isinstance(out, torch.Tensor)
+        return out
 
     def helion_fb(self, i: Inputs, grad_out: torch.Tensor, C: int) -> None:
         self.helion_fwd(i, C).backward(grad_out)
