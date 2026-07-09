@@ -122,6 +122,43 @@ def _get_custom_decomp_table() -> dict[torch._ops.OpOverload, Callable[..., obje
     return decomp_table
 
 
+_original_tensor_view = torch.Tensor.view
+
+
+def _tensor_view_replacement(self: torch.Tensor, *size: object) -> torch.Tensor:
+    """``Tensor.view`` replacement that tolerates Helion's symbolic block sizes.
+
+    Helion traces block sizes as unbacked SymInts.  Some aten meta/ref
+    decompositions call ``Tensor.view`` on such a symbolic shape while computing
+    fake output metadata -- e.g. ``torch._refs.stack`` implements stack as
+    ``cat(...).view(result_sizes)``.  On newer PyTorch the ``aten::view`` meta
+    rejects those SymInts with ``"SymIntArrayRef expected to contain only
+    concrete integers"``, aborting compilation before codegen.  In that case
+    compute the output metadata directly: ``view`` is only reached here during
+    fake-shape computation, so an equivalently-shaped tensor is sufficient and
+    the aten graph nodes (stack/reshape/...) stay intact for codegen.
+    """
+    try:
+        return _original_tensor_view(self, *size)
+    except RuntimeError as e:
+        if "expected to contain only concrete integers" not in str(e):
+            raise
+    if len(size) == 1 and isinstance(size[0], (list, tuple, torch.Size)):
+        shape = list(size[0])
+    else:
+        shape = list(size)
+    # Resolve a single inferred (-1) dim; guard on ``int`` so we never bool() a
+    # SymInt (which would raise GuardOnDataDependentSymNode on unbacked sizes).
+    neg = [i for i, s in enumerate(shape) if isinstance(s, int) and s == -1]
+    if neg:
+        known = 1
+        for s in shape:
+            if not (isinstance(s, int) and s == -1):
+                known = known * s
+        shape[neg[0]] = self.numel() // known
+    return self.new_empty(shape)
+
+
 def _make_fx(fn: Callable[..., object], *args: object) -> torch.fx.Graph:
     """
     We monkey patch get_proxy_slot to support Tensor/SymInt/SymFloat/SymBool in the
@@ -217,6 +254,7 @@ def _make_fx(fn: Callable[..., object], *args: object) -> torch.fx.Graph:
             "matmul",
             tensor_matmul_replacement,
         ),
+        patch.object(torch.Tensor, "view", _tensor_view_replacement),
     ):
         current_location().set_fx_location()
         return proxy_tensor.make_fx(fn, decomposition_table=_get_custom_decomp_table())(

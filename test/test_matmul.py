@@ -500,6 +500,64 @@ class TestMatmul(RefEagerTestBase, TestCase):
         expected = A @ B_unpacked
         torch.testing.assert_close(C, expected, atol=5e-2, rtol=1e-3)
 
+    def test_matmul_packed_rhs_symint_view_fallback(self):
+        # Newer PyTorch's aten::view meta rejects Helion's unbacked block-size
+        # SymInts inside torch._refs.stack (which computes stack as
+        # cat(...).view(result_sizes)), raising "SymIntArrayRef expected to
+        # contain only concrete integers" during device-IR tracing. Simulate
+        # that stricter meta and confirm compilation still succeeds via the
+        # Tensor.view fallback in device_ir._tensor_view_replacement.
+        from helion._compiler import device_ir
+
+        real_view = device_ir._original_tensor_view
+
+        def strict_view(tensor: torch.Tensor, *size: object) -> torch.Tensor:
+            sizes = (
+                list(size[0])
+                if len(size) == 1 and isinstance(size[0], (list, tuple, torch.Size))
+                else list(size)
+            )
+            if any(isinstance(s, torch.SymInt) for s in (*tensor.shape, *sizes)):
+                raise RuntimeError(
+                    "SymIntArrayRef expected to contain only concrete integers"
+                )
+            return real_view(tensor, *size)
+
+        @helion.kernel(static_shapes=False)
+        def matmul_with_packed_b(
+            A: torch.Tensor, B: torch.Tensor, C: torch.Tensor
+        ) -> None:
+            M, K = A.shape
+            _, N = B.shape
+
+            block_size_k = hl.register_block_size(K // 2)
+
+            for tile_m, tile_n in hl.tile([M, N]):
+                acc = hl.zeros([tile_m, tile_n], dtype=A.dtype)
+
+                for tile_k in hl.tile(K // 2, block_size=block_size_k):
+                    lhs = A[
+                        tile_m,
+                        tile_k.begin * 2 : tile_k.begin * 2 + tile_k.block_size * 2,
+                    ]
+                    packed = B[tile_k, tile_n]
+                    rhs = torch.stack([packed, packed], dim=1).reshape(
+                        tile_k.block_size * 2, tile_n.block_size
+                    )
+                    acc = torch.addmm(acc, lhs, rhs)
+
+                C[tile_m, tile_n] = acc
+
+        M, K, N = 32, 70, 32
+        A = torch.randn(M, K, device=DEVICE, dtype=torch.float32)
+        B = torch.randn(K // 2, N, device=DEVICE, dtype=torch.float32)
+        C = torch.empty(M, N, device=DEVICE, dtype=torch.float32)
+        with patch.object(device_ir, "_original_tensor_view", strict_view):
+            code_and_output(matmul_with_packed_b, (A, B, C))
+        B_unpacked = torch.stack([B, B], dim=1).reshape(K, N)
+        expected = A @ B_unpacked
+        torch.testing.assert_close(C, expected, atol=5e-2, rtol=1e-3)
+
     def test_addmm_under_autocast(self):
         """Test torch.addmm with float32 accumulator under active autocast.
 
