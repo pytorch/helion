@@ -34,7 +34,9 @@ if TYPE_CHECKING:
     from collections.abc import Callable
     from collections.abc import Sequence
 
+    from .._compiler.generate_ast import OwnerPrepLowering
     from .._compiler.inductor_lowering import CodegenState
+    from .._compiler.pallas.compact_worklist import OwnerPrepHoist
     from .._compiler.tile_strategy import TileStrategy
     from ..runtime.config import Config
 
@@ -266,8 +268,8 @@ def _(state: CodegenState) -> object:
         # fori path.  Both have begin/end remapped to metadata refs (see
         # _compact_worklist_bounds).
         if _is_compact_ordered_inner_loop(state):
-            if _owner_cache_applies(state):
-                return _codegen_owner_cache(state)
+            if _owner_residency_applies(state):
+                return _codegen_owner_residency(state)
             return _codegen_emit_pipeline(state)
         return _codegen_fori_loop(state)
     # unroll: fall through to common codegen path
@@ -290,8 +292,8 @@ def _(state: CodegenState) -> None:
         if pallas_loop_type == "compact_worklist" and _is_compact_ordered_inner_loop(
             state
         ):
-            if _owner_cache_applies(state):
-                _codegen_owner_cache(state)
+            if _owner_residency_applies(state):
+                _codegen_owner_residency(state)
                 return None
             _codegen_emit_pipeline(state)
             return None
@@ -301,7 +303,7 @@ def _(state: CodegenState) -> None:
     return state.get_graph(state.proxy_arg(0)).codegen(state)
 
 
-def _owner_cache_applies(state: CodegenState) -> bool:
+def _owner_residency_applies(state: CodegenState) -> bool:
     """Whether the ordered reduction should use the owner-resident path.
 
     Automatic compile-time decision (not a tuning knob), gated on:
@@ -310,271 +312,225 @@ def _owner_cache_applies(state: CodegenState) -> bool:
     - a viable physical window: VMEM can hold at least one ordered block of the
       resident operands.
 
-    A detected prep (``prep_perm``, see ``owner_cache_entries``) only enables the
-    optional once-per-owner prep-cache emission.  No-prep ordered reductions still
-    use the owner-resident window when the range/window proof succeeds.
-
     If the range/window proof is absent -- unusual ordered bounds or an oversized
     per-token footprint -- the ordered loop stays on the streamed
     ``emit_pipeline`` path unchanged.
     """
     env = CompileEnvironment.current()
-    decision = env.compact_worklist_owner_cache_decision
+    decision = env.compact_worklist_owner_residency_decision
     return decision is not None and decision.active
 
 
-def _codegen_owner_cache(state: CodegenState) -> object:
+def _codegen_owner_residency(state: CodegenState) -> object:
     """Owner-keyed resident-window lowering for the compact-worklist ordered loop.
 
-    Selected by :func:`_owner_cache_applies` for an ordered inner reduction with a
-    guardable packed range and a viable VMEM window.  The ordered operand (K/V) is
-    held in a per-owner resident ``pl.Element(C)`` window keyed on ``range_start``
-    (``C`` is the compile-threaded physical window).  If a prep is proven, that
-    prep (today, the head-major transpose) is also run ONCE per owner into a
-    persistent VMEM cache under ``@pl.when((_wid == 0) | (owner_ids[_wid] !=
-    owner_ids[max(_wid-1, 0)]))``.
+    Selected by :func:`_owner_residency_applies` for an ordered inner reduction
+    with a guardable packed range and a viable VMEM window.  The ordered operand
+    is held in a per-owner resident ``pl.Element(C)`` window keyed on
+    ``range_start`` (``C`` is the compile-threaded physical window).  Optional
+    prep-cache descriptors are handled inside ``_codegen_fori_loop``.
 
     Owners longer than ``C`` are NOT handled in-kernel: the launcher raises
     (``runtime._compact_raise_if_owner_exceeds_window``) rather than over-read the
     fixed window -- there is no in-kernel streamed ``else``.
     """
-    # The resident window and optional prep-cache fission both live inside
-    # _codegen_fori_loop (guarded on the ordered axis), so the ordered reduction
-    # reuses the fori machinery.
     return _codegen_fori_loop(state)
 
 
-def _oc_slice_elts(sl: ast.AST) -> list[ast.AST]:
-    """The per-dim subscript elements of a load's slice (``x[a, :, :]`` -> [a,:,:])."""
-    if isinstance(sl, ast.Tuple):
-        return list(sl.elts)
-    return [sl]
-
-
-def _owner_cache_prep_fallback(reason: str) -> None:
+def _owner_prep_fallback(reason: str) -> None:
     log.debug(
-        "compact_worklist owner_cache: skipping prep cache hoist (%s); "
+        "compact_worklist owner prep: skipping prep cache hoist (%s); "
         "using resident-only lowering",
         reason,
     )
 
 
-def _emit_owner_cache(
+def _active_owner_prep_hoists(
     state: CodegenState,
     block_ids: list[int],
-    grid_parts: list[str],
-    body_stmts: list[ast.AST],
-    all_tensor_info: Sequence[tuple[torch.Tensor, object, object]],
-) -> None:
-    """Fission an ordered operand's proven prep into an owner-keyed cache.
-
-    This is the emission MECHANISM, not the decision: whether owner_cache applies
-    is decided once in ``OwnerCacheDecision``.  Here we act only on its
-    ``preps``: locate the corresponding emitted ``load -> transpose`` for each
-    prep operand and rewrite it so the operand is read from a persistent per-owner
-    VMEM cache in prepped (head-major) layout instead of re-transposed per compact
-    tile, plus emit the once-per-owner refill under an owner-change ``@pl.when``.
-    A resident-only/no-prep decision is a valid no-op here.  If the emitted body
-    no longer matches the recognized prep, leave the body unchanged and keep the
-    correct resident-only lowering.
-    """
-    from .._compiler.pallas.compact_worklist import ordered_ref_names
-    from .._compiler.pallas.compact_worklist import owner_ref_name
-
+) -> tuple[OwnerPrepHoist, ...]:
     env = CompileEnvironment.current()
     plan = env.compact_worklist_plan
     if plan is None or plan.ordered_axis is None:
-        return
+        return ()
     if not (len(block_ids) == 1 and block_ids[0] == plan.ordered_axis.block_id):
-        return
-    # Consume the cached owner_cache decision that also routed this lowering; emit
-    # the cache only when it is active, over exactly its prep entries.  Inactive
-    # here => the ordered loop should have streamed (this path shouldn't have been
-    # selected); no-op rather than emit a windowed-but-uncached kernel.
-    decision = env.compact_worklist_owner_cache_decision
-    if decision is None or not decision.prep_active:
-        return
-    ordered_hosts = {p.arg_name for p in decision.preps}
+        return ()
+    graph_info = state.get_graph(state.proxy_arg(0))
+    return tuple(
+        hoist
+        for hoist in env.compact_worklist_owner_prep_hoists
+        if hoist.graph_id == graph_info.graph_id
+    )
 
-    # In-kernel window ref name -> per-tile fake, for each ordered operand.
-    window_fake: dict[str, torch.Tensor] = {}
-    window_host: dict[str, str] = {}
+
+def _prepare_owner_prep_lowerings(
+    state: CodegenState,
+    block_ids: list[int],
+    all_tensor_info: Sequence[tuple[torch.Tensor, object, object]],
+) -> list[OwnerPrepLowering]:
+    """Register prep-cache scratch and return lowering descriptors for this graph."""
+    from .._compiler.generate_ast import OwnerPrepLowering
+
+    env = CompileEnvironment.current()
+    decision = env.compact_worklist_owner_residency_decision
+    if decision is None or not decision.active or decision.window is None:
+        return []
+    active_hoists = _active_owner_prep_hoists(state, block_ids)
+    if not active_hoists:
+        return []
+
+    graph_info = state.get_graph(state.proxy_arg(0))
+    load_nodes = {node.name: node for node in graph_info.graph.nodes}
+    needed_hosts = {hoist.host_arg for hoist in active_hoists}
+    resident_windows: dict[str, tuple[str, torch.Tensor]] = {}
     for fake, _sub_meta, _direction in all_tensor_info:
         ta = state.device_function.tensor_arg(fake)
-        if ta.host_str() in ordered_hosts:
-            window_fake[ta.name] = fake
-            window_host[ta.name] = ta.host_str()
-    if not window_fake:
-        _owner_cache_prep_fallback("prep operands have no resident window refs")
-        return
+        host = ta.host_str()
+        if host in needed_hosts:
+            resident_windows[host] = (ta.name, fake)
+    missing = sorted(needed_hosts - resident_windows.keys())
+    if missing:
+        _owner_prep_fallback(f"prep operands have no resident window refs: {missing}")
+        return []
 
-    # Prep = the load->transpose pairs on the ordered windows in the emitted body.
-    load_src: dict[str, tuple[str, ast.AST]] = {}  # load var -> (window, slice)
-    for st in body_stmts:
-        if (
-            isinstance(st, ast.Assign)
-            and len(st.targets) == 1
-            and isinstance(st.targets[0], ast.Name)
-            and isinstance(st.value, ast.Subscript)
-            and isinstance(st.value.value, ast.Name)
-            and st.value.value.id in window_fake
-        ):
-            load_src[st.targets[0].id] = (st.value.value.id, st.value.slice)
-    preps: list[tuple[ast.Assign, str, str, ast.AST, list[int]]] = []
-    for st in body_stmts:
-        if (
-            isinstance(st, ast.Assign)
-            and len(st.targets) == 1
-            and isinstance(st.targets[0], ast.Name)
-            and isinstance(st.value, ast.Call)
-            and isinstance(st.value.func, ast.Attribute)
-            and st.value.func.attr == "transpose"
-            and len(st.value.args) == 2
-            and isinstance(st.value.args[0], ast.Name)
-            and st.value.args[0].id in load_src
-        ):
-            try:
-                perm = ast.literal_eval(st.value.args[1])
-            except (SyntaxError, TypeError, ValueError):
-                continue
-            if not isinstance(perm, (list, tuple)) or not all(
-                isinstance(p, int) for p in perm
-            ):
-                continue
-            perm = list(perm)
-            window, sl = load_src[st.value.args[0].id]
-            preps.append((st, st.value.args[0].id, window, sl, perm))
-    # Bind the plan's prep decision exactly: every prep operand must have ONE
-    # emitted major-transpose prep whose perm matches what the plan detected.
-    # A missing prep, duplicate, or perm mismatch means this optional optimization
-    # no longer applies.  Fall back to the correct resident-only lowering by
-    # returning before mutating ``body_stmts`` or registering cache scratch.
-    expected = {p.arg_name: p.perm for p in decision.preps}
-    emitted_perms: dict[str, list[list[int]]] = {}
-    for _tr, _load_var, window, _sl, perm in preps:
-        emitted_perms.setdefault(window_host[window], []).append(perm)
-    for host, want in expected.items():
-        got = emitted_perms.get(host, [])
-        if len(got) != 1 or tuple(got[0]) != tuple(want):
-            _owner_cache_prep_fallback(
-                f"operand {host!r} expected perm {tuple(want)}, got "
-                f"{[tuple(g) for g in got]}"
+    prepared: list[
+        tuple[OwnerPrepHoist, torch.Tensor, str, torch.Tensor, tuple[int, ...]]
+    ] = []
+    for hoist in active_hoists:
+        load_node = load_nodes.get(hoist.load_node_name)
+        load_val = load_node.meta.get("val") if load_node is not None else None
+        if not isinstance(load_val, torch.Tensor):
+            _owner_prep_fallback(
+                f"load node {hoist.load_node_name!r} has no tensor metadata"
             )
-            return
+            return []
+        resident_window_name, resident_fake = resident_windows[hoist.host_arg]
+        win_shape = (
+            decision.window.physical_window,
+            *(int(s) for s in load_val.shape[1:]),
+        )
+        cache_shape = tuple(win_shape[p] for p in hoist.perm)
+        prepared.append(
+            (hoist, load_val, resident_window_name, resident_fake, cache_shape)
+        )
 
-    assert decision.window is not None
+    lowerings: list[OwnerPrepLowering] = []
+    for hoist, load_val, resident_window_name, resident_fake, cache_shape in prepared:
+        cache_name = state.device_function.register_scratch(
+            cache_shape,
+            load_val.dtype,
+            name_hint=f"{resident_window_name}_prep",
+        )
+        lowerings.append(
+            OwnerPrepLowering(
+                hoist=hoist,
+                resident_window_name=resident_window_name,
+                resident_window_fake=resident_fake,
+                cache_name=cache_name,
+                cache_shape=cache_shape,
+                cache_dtype=load_val.dtype,
+            )
+        )
+    return lowerings
+
+
+def _emit_owner_prep_refill(
+    state: CodegenState,
+    block_ids: list[int],
+    grid_parts: list[str],
+    lowerings: list[OwnerPrepLowering],
+) -> None:
+    """Emit once-per-owner prep-cache refill for active descriptors."""
+    from .._compiler.generate_ast import OwnerPrepLowering
+    from .._compiler.pallas.compact_worklist import ordered_ref_names
+    from .._compiler.pallas.compact_worklist import owner_ref_name
+
+    if not lowerings:
+        return
+    assert all(isinstance(lowering, OwnerPrepLowering) for lowering in lowerings)
+    env = CompileEnvironment.current()
+    plan = env.compact_worklist_plan
+    assert plan is not None and plan.ordered_axis is not None
     blk = state.device_function.block_size_var(block_ids[0])
     assert blk is not None
-    cache_ordered = decision.window.physical_window
     owner_ref = f"{owner_ref_name(plan)}_ref"
     range_len_ref = f"{ordered_ref_names(plan)[1]}_ref"
-    nkv = grid_parts[0]
+    num_ordered_tiles = grid_parts[0]
 
-    # Register a cache scratch per window (prepped layout) and build, for each
-    # prep, the replacement reduction read + the full/tail refill lines.
-    cache_name: dict[str, str] = {}
-    refill_full_lines: list[str] = []
-    refill_tail_lines: list[str] = []
-    replace: dict[int, ast.stmt] = {}  # transpose stmt id -> cache-read stmt
-    for tr_stmt, _load_var, window, sl, perm in preps:
-        fake = window_fake[window]
-        if window not in cache_name:
-            win_shape = (cache_ordered, *(int(s) for s in fake.shape[1:]))
-            cache_shape = tuple(win_shape[p] for p in perm)
-            cache_name[window] = state.device_function.register_scratch(
-                cache_shape, fake.dtype, name_hint=f"{window}_hm"
-            )
-        cache = cache_name[window]
-        target = tr_stmt.targets[0]
-        assert isinstance(target, ast.Name)
-        # reduction: read the cache at the local ordered offset in prepped layout.
-        elts = [ast.unparse(e) for e in _oc_slice_elts(sl)]
-        read = f"{cache}[{', '.join(elts[p] for p in perm)}]"
-        replace[id(tr_stmt)] = statement_from_string(f"{target.id} = {read}")
-        # refill: full ordered tiles are valid as-is.  Only the final partial tile
-        # needs zeroing: the resident window is sized to C and starts at
-        # range_start, so lanes past range_len can contain following-owner data.
+    def _stmt(src: str) -> ast.stmt:
+        return cast("ast.stmt", statement_from_string(src))
+
+    refill_full_stmts: list[ast.stmt] = []
+    refill_tail_stmts: list[ast.stmt] = []
+    for lowering in lowerings:
+        assert isinstance(lowering, OwnerPrepLowering)
+        perm = lowering.hoist.perm
         rank = len(perm)
-        win_elts = [f"pl.ds(_octk * {blk}, {blk})", *([":"] * (rank - 1))]
-        wr = f"{window}[{', '.join(win_elts)}]"
-        cw = ", ".join(win_elts[p] for p in perm)
-        # Where the ordered (dim-0) index lands post-transpose.
-        ord_axis = perm.index(0)
-        mask_dims = [blk if i == ord_axis else "1" for i in range(rank)]
+        win_elts = [f"pl.ds(_oc_ordered_tile * {blk}, {blk})"]
+        win_elts.extend(":" for _ in range(rank - 1))
+        resident_read = f"{lowering.resident_window_name}[{', '.join(win_elts)}]"
+        cache_write = ", ".join(win_elts[p] for p in perm)
+        ordered_axis_after_perm = perm.index(0)
+        mask_dims = [blk if i == ordered_axis_after_perm else "1" for i in range(rank)]
         mask_shape = f"({mask_dims[0]},)" if rank == 1 else f"({', '.join(mask_dims)})"
-        full_src_var = state.device_function.new_var("_oc_src")
-        refill_full_lines.extend(
+        full_src_var = state.device_function.new_var("_oc_prep_src")
+        refill_full_stmts.extend(
             [
-                f"        {full_src_var} = jnp.transpose({wr}, {list(perm)})",
-                f"        {cache}[{cw}] = {full_src_var}",
+                _stmt(f"{full_src_var} = jnp.transpose({resident_read}, {list(perm)})"),
+                _stmt(f"{lowering.cache_name}[{cache_write}] = {full_src_var}"),
             ]
         )
-        # Zero the ordered tail in the TRANSPOSED layout the cache is stored in.
-        # Use broadcasted_iota positioned on the transposed ordered axis; Mosaic
-        # rejects arange().reshape() shape-casts for this mask.
-        tail_src_var = state.device_function.new_var("_oc_src")
-        mask_var = state.device_function.new_var("_oc_mask")
-        refill_tail_lines.extend(
+        tail_src_var = state.device_function.new_var("_oc_prep_src")
+        mask_var = state.device_function.new_var("_oc_prep_mask")
+        refill_tail_stmts.extend(
             [
-                f"        {tail_src_var} = jnp.transpose({wr}, {list(perm)})",
-                (
-                    f"        {mask_var} = (_octk * {blk} + jax.lax.broadcasted_iota("
-                    f"jnp.int32, {mask_shape}, {ord_axis})) < {range_len_ref}[_wid]"
+                _stmt(f"{tail_src_var} = jnp.transpose({resident_read}, {list(perm)})"),
+                _stmt(
+                    f"{mask_var} = (_oc_ordered_tile * {blk} + "
+                    f"jax.lax.broadcasted_iota(jnp.int32, {mask_shape}, "
+                    f"{ordered_axis_after_perm})) < {range_len_ref}[_wid]"
                 ),
-                (
-                    f"        {cache}[{cw}] = "
+                _stmt(
+                    f"{lowering.cache_name}[{cache_write}] = "
                     f"jnp.where({mask_var}, {tail_src_var}, "
                     f"jnp.zeros_like({tail_src_var}))"
                 ),
             ]
         )
 
-    # Rewrite the body: swap each prep transpose for its cache read and drop the
-    # now-dead per-tile loads (unused once the transpose no longer reads them).
-    load_vars = {load_var for _s, load_var, _w, _sl, _p in preps}
-    still_used: set[str] = set()
-    for st in body_stmts:
-        if (
-            id(st) not in replace
-            and isinstance(st, ast.Assign)
-            and len(st.targets) == 1
-            and isinstance(st.targets[0], ast.Name)
-            and st.targets[0].id in load_vars
-        ):
-            continue
-        for node in ast.walk(replace.get(id(st), st)):
-            if isinstance(node, ast.Name) and node.id in load_vars:
-                still_used.add(node.id)
-    new_body: list[ast.AST] = []
-    for st in body_stmts:
-        if id(st) in replace:
-            new_body.append(replace[id(st)])
-        elif not (
-            isinstance(st, ast.Assign)
-            and len(st.targets) == 1
-            and isinstance(st.targets[0], ast.Name)
-            and st.targets[0].id in load_vars
-            and st.targets[0].id not in still_used
-        ):
-            new_body.append(st)
-    body_stmts[:] = new_body
-
-    # Refill the owner-keyed cache once, when this work item starts a new owner.
-    refill_src = (
+    refill_fn = _stmt(
         f"@pl.when((_wid == 0) | "
         f"({owner_ref}[_wid] != {owner_ref}[jnp.maximum(_wid - 1, 0)]))\n"
-        f"def _oc_refill():\n"
-        f"    _oc_full_nkv = {range_len_ref}[_wid] // {blk}\n"
-        f"    def _oc_refill_body(_octk, _oc_carry):\n"
-        f"{chr(10).join(refill_full_lines)}\n"
-        f"        return _oc_carry\n"
-        f"    jax.lax.fori_loop(0, _oc_full_nkv, _oc_refill_body, ())\n"
-        f"    @pl.when(_oc_full_nkv < {nkv})\n"
-        f"    def _oc_refill_tail():\n"
-        f"        _octk = _oc_full_nkv\n"
-        f"{chr(10).join(refill_tail_lines)}"
+        f"def _oc_prep_refill():\n"
+        f"    pass"
     )
-    state.add_statement(statement_from_string(refill_src))
+    assert isinstance(refill_fn, ast.FunctionDef)
+
+    body_fn = _stmt("def _oc_prep_refill_body(_oc_ordered_tile, _oc_carry):\n    pass")
+    assert isinstance(body_fn, ast.FunctionDef)
+    body_fn.body = [
+        *refill_full_stmts,
+        _stmt("return _oc_carry"),
+    ]
+
+    tail_fn = _stmt(
+        f"@pl.when(_oc_full_ordered_tiles < {num_ordered_tiles})\n"
+        f"def _oc_prep_refill_tail():\n"
+        f"    pass"
+    )
+    assert isinstance(tail_fn, ast.FunctionDef)
+    tail_fn.body = [
+        _stmt("_oc_ordered_tile = _oc_full_ordered_tiles"),
+        *refill_tail_stmts,
+    ]
+
+    refill_fn.body = [
+        _stmt(f"_oc_full_ordered_tiles = {range_len_ref}[_wid] // {blk}"),
+        body_fn,
+        _stmt("jax.lax.fori_loop(0, _oc_full_ordered_tiles, _oc_prep_refill_body, ())"),
+        tail_fn,
+    ]
+    state.add_statement(refill_fn)
 
 
 def _classify_loop_tensors(
@@ -2816,16 +2772,15 @@ def _codegen_fori_loop(state: CodegenState) -> object:
             not in _compact_names
         }
 
-    # owner_cache: only the RESIDENT ordered operands (active decision entries) are
-    # held in a per-owner resident pl.Element window and read at the local
-    # ordered-tile offset (see codegen._is_ordered_aligned_load).  Keep just those
-    # OFF the streamed make_async_copy path.  Gate on the SAME decision the window
-    # is built from, so an inactive owner_cache (prep but uncheckable bound) leaves
-    # every operand streaming.  No-op when nothing is resident.
+    # Owner residency: only active resident ordered operands are held in a
+    # per-owner pl.Element window and read at the local ordered-tile offset (see
+    # codegen._is_ordered_aligned_load).  Keep just those OFF the streamed
+    # make_async_copy path.  Gate on the SAME decision the window is built from,
+    # so an inactive residency decision leaves every operand streaming.
     if _compact_plan is not None:
-        _decision = env.compact_worklist_owner_cache_decision
+        _decision = env.compact_worklist_owner_residency_decision
         _ordered_names = (
-            {p.arg_name for p in _decision.resident_operands}
+            set(_decision.resident_operands)
             if _decision is not None and _decision.active
             else set()
         )
@@ -2925,6 +2880,17 @@ def _codegen_fori_loop(state: CodegenState) -> object:
         _tensor_to_dma_scratch=tensor_to_dma_scratch,
         _tensor_to_sem=tensor_to_sem,
     )
+    owner_prep_lowerings = _prepare_owner_prep_lowerings(
+        state, block_ids, all_tensor_info
+    )
+    if owner_prep_lowerings:
+        assert len(grid_parts) == 1
+        num_ordered_tiles = state.device_function.new_var("_oc_num_ordered_tiles")
+        state.add_statement(
+            statement_from_string(f"{num_ordered_tiles} = {grid_parts[0]}")
+        )
+        grid_parts = [num_ordered_tiles]
+        _emit_owner_prep_refill(state, block_ids, grid_parts, owner_prep_lowerings)
 
     def _build_dma_slices(
         fake: torch.Tensor,
@@ -3068,9 +3034,10 @@ def _codegen_fori_loop(state: CodegenState) -> object:
             state.codegen.add_statement(statement_from_string(f"{copy_var}.start()"))
             state.codegen.add_statement(statement_from_string(f"{copy_var}.wait()"))
 
-        graph_results = codegen_call_with_graph(
-            state.codegen, graph_info.graph, body_args
-        )
+        with state.codegen.owner_prep_lowering_scope(owner_prep_lowerings):
+            graph_results = codegen_call_with_graph(
+                state.codegen, graph_info.graph, body_args
+            )
 
         if has_loop_state:
             _write_back_loop_carried(state, scratch_names, carried, graph_results)
@@ -3116,12 +3083,6 @@ def _codegen_fori_loop(state: CodegenState) -> object:
         for stmt in body_stmts or [ast.Pass()]:
             state.add_statement(stmt)
         return None
-
-    # owner_cache: optionally fission a proven ordered-operand prep into an
-    # owner-keyed cache -- rewrites body_stmts to read the cache and emits the
-    # refill before the reduction fori.  No-op off the ordered axis or for
-    # resident-only/no-prep decisions.
-    _emit_owner_cache(state, block_ids, grid_parts, body_stmts, all_tensor_info)
 
     _emit_nonlocal_scratch_declarations(state, body_stmts)
 

@@ -347,9 +347,9 @@ def compact_ordered_physical_window(
     still get a legal ``pl.Element(block, padding=...)`` window instead of a
     zero-sized allocation.
 
-    Returns 0 when the budget cannot hold one ordered block.  owner_cache is an
-    automatic optimization, so the compiler treats that as "inactive" and falls
-    back to the streamed ordered loop.
+    Returns 0 when the budget cannot hold one ordered block.  Owner residency is
+    an automatic optimization, so the compiler treats that as "inactive" and
+    falls back to the streamed ordered loop.
     """
     if not operands:
         return 0
@@ -374,14 +374,14 @@ def _compact_raise_if_owner_exceeds_window(
 ) -> None:
     """Raise if any owner's ordered (reduction) length exceeds the window.
 
-    owner_cache holds each owner's ordered operand in a compile-time-sized VMEM
-    window/cache.  ``ordered_window`` is the exact block-aligned physical extent
-    computed once during compile setup and threaded through the launcher; an owner
-    longer than it would over-read the window.
+    Owner residency holds each owner's ordered operand in a compile-time-sized
+    VMEM window.  ``ordered_window`` is the exact block-aligned physical extent
+    computed once during compile setup and threaded through the launcher; an
+    owner longer than it would over-read the window.
 
-    ``ordered_aligned_arg_indices`` non-empty means the resident window is active
-    (owner_cache applies).  When it is active we MUST be able to bound-check, so a
-    missing/ambiguous offset index raises rather than silently returning.  The
+    ``ordered_aligned_arg_indices`` non-empty means the resident window is active.
+    When it is active we MUST be able to bound-check, so a missing/ambiguous
+    offset index raises rather than silently returning.  The
     ordered offset supplies ordered lengths; the active-mask offset supplies compact
     lengths, so owners with no compact work are ignored because they produce no
     worklist item and never refill the cache.
@@ -392,12 +392,12 @@ def _compact_raise_if_owner_exceeds_window(
     a caller-provided max per-owner length would remove this caveat).
     """
     if not ordered_aligned_arg_indices:
-        return  # owner_cache inactive (no resident window) -> nothing to guard
+        return  # owner residency inactive (no resident window) -> nothing to guard
     if ordered_window <= 0:
-        return  # owner_cache should be inactive, but avoid a spurious empty guard
+        return  # owner residency should be inactive; avoid a spurious empty guard
     if ordered_offset_arg_index < 0 or active_mask_arg_index < 0:
         raise RuntimeError(
-            "compact_worklist owner_cache: the resident window is active but the "
+            "compact_worklist owner residency: the resident window is active but the "
             "ordered reduction bound or compact active-owner mask is not a "
             "checkable single-offsets (offsets[i+1]-offsets[i]) pattern, so "
             "per-owner length cannot be verified against the window."
@@ -408,7 +408,7 @@ def _compact_raise_if_owner_exceeds_window(
         return
     if len(active_offsets) != len(offsets):
         raise RuntimeError(
-            "compact_worklist owner_cache: ordered and compact offset arrays have "
+            "compact_worklist owner residency: ordered and compact offset arrays have "
             "different owner counts, so the active-owner guard cannot be evaluated."
         )
     ordered_lens = offsets[1:] - offsets[:-1]
@@ -419,7 +419,7 @@ def _compact_raise_if_owner_exceeds_window(
     max_len = int(ordered_lens[active].max())
     if max_len > ordered_window:
         raise RuntimeError(
-            f"compact_worklist owner_cache: a per-owner reduction length "
+            f"compact_worklist owner residency: a per-owner reduction length "
             f"({max_len}) exceeds the resident window ({ordered_window}, "
             f"VMEM-derived and fixed at compile time), so the owner-keyed cache "
             f"would be over-read. "
@@ -2127,7 +2127,7 @@ def _pallas_compact_in_out_specs(
 
             return pl.BlockSpec(block_shape, aligned_index_map)  # type: ignore[union-attr]
         if idx in ordered_aligned_set:
-            # owner_cache: per-owner resident window sized ``ordered_window`` (C)
+            # Owner residency: per-owner resident window sized ``ordered_window`` (C)
             # at ``range_start`` -- the fori body reads it at the local ordered-tile
             # offset (offset - range_start).  padding=(0, C) tolerates reads past
             # the owner's tail (same as the compact_aligned_load window).  Keying
@@ -2355,7 +2355,7 @@ def _pallas_compile_compact_jit_fn(
                 # it for validation.  Detection also now restricts to packed (so
                 # work order == row order); see detect_compact_worklist_plan.
                 dimension_semantics=("arbitrary",),
-                # owner_cache sizes its physical window from _get_vmem_limit_bytes
+                # Owner residency sizes its physical window from _get_vmem_limit_bytes
                 # during backend setup.  This 128MiB floor is ONLY a Mosaic compile
                 # ceiling so TPU7x accepts that already-sized allocation; do not use
                 # it to choose C.  A streamed compact_worklist kernel keeps the
@@ -2414,7 +2414,7 @@ def default_pallas_compact_worklist_launcher(
     and reuses the shared JaxCallable / caching / invoke path.
     """
     assert _compact_build_worklist is not None
-    # owner_cache correctness backstop: raise (rather than silently over-read the
+    # Owner-residency correctness backstop: raise rather than silently over-read the
     # resident window) when an owner's reduction length exceeds the compile-time
     # window C.  Runs every call -- the offsets are runtime data even when the
     # compiled kernel is reused across calls with the same grid.

@@ -30,6 +30,7 @@ import ast
 import copy
 import dataclasses
 from typing import TYPE_CHECKING
+from typing import cast
 
 import torch
 
@@ -38,6 +39,7 @@ from ..ast_read_writes import ReadWrites
 from ..ast_read_writes import ast_rename
 
 if TYPE_CHECKING:
+    from ..device_ir import GraphInfo
     from ..host_function import HostFunction
 
 
@@ -65,8 +67,8 @@ class Axis:
     # Name of the single offset tensor ``T`` when this axis's bounds are the exact
     # packed-consecutive idiom ``base=T[g], end=T[g+1]`` (so ``T[i+1]-T[i]`` is
     # EXACTLY the per-owner length), else None.  Set from ``_packed_consecutive`` at
-    # construction; owner_cache uses it to prove the resident-window overflow guard
-    # (``max(diff(T))``) can't under-count the range.
+    # construction; owner residency uses it to prove the resident-window overflow
+    # guard (``max(diff(T))``) can't under-count the range.
     packed_offset_arg: str | None = None
 
 
@@ -83,18 +85,14 @@ class TensorPolicy:
 
     ``kind`` is *classification only*: ``ordered_reduction`` means "indexed by the
     ordered axis on the leading dim".  If the range/window proof succeeds, every
-    such operand can be made resident in a per-owner VMEM window.  ``prep_perm`` is
-    narrower: it records a literal *major-axis* transpose applied directly to this
-    operand's ordered load (the optional prep-cache work, e.g. token->head
-    ``[1, 0, 2]``), detected from the kernel body AST at plan time.
+    such operand can be made resident in a per-owner VMEM window.  Optional prep
+    caching is detected later from the tiled FX graph.
     """
 
     arg_name: str
     # compact_aligned_load|compact_exact_store|owner_indexed|
     # ordered_reduction|static_full
     kind: str
-    # Major-axis transpose perm on the ordered load (the cacheable prep), else None.
-    prep_perm: tuple[int, ...] | None = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -165,63 +163,35 @@ def ordered_ref_names(plan: CompactWorklistPlan) -> tuple[str, str]:
     return f"{prefix}_begin", f"{prefix}_len"
 
 
-def owner_cache_entries(plan: CompactWorklistPlan) -> tuple[TensorPolicy, ...]:
-    """Ordered operands with a detected cacheable prep.
-
-    This is only the optional prep-cache list.  The resident-window operand list is
-    broader; see :func:`owner_cache_resident_entries`.
-    """
-    return tuple(
-        p
-        for p in plan.tensor_policies
-        if p.kind == "ordered_reduction" and p.prep_perm is not None
-    )
-
-
-def owner_cache_resident_entries(plan: CompactWorklistPlan) -> tuple[TensorPolicy, ...]:
+def owner_resident_entries(plan: CompactWorklistPlan) -> tuple[TensorPolicy, ...]:
     """Ordered operands eligible for an owner-keyed resident VMEM window."""
     return tuple(p for p in plan.tensor_policies if p.kind == "ordered_reduction")
 
 
-def ordered_owner_cache_bound_arg(plan: CompactWorklistPlan) -> str | None:
+def ordered_owner_residency_bound_arg(plan: CompactWorklistPlan) -> str | None:
     """The offset array whose consecutive differences are EXACTLY the per-owner
     ordered (reduction) lengths -- i.e. the ordered bound is the proven
     packed-consecutive idiom ``T[g]``/``T[g+1]`` (recorded as
     ``Axis.packed_offset_arg``) -- or ``None`` otherwise.
 
-    owner_cache requires this so the resident window can be bound-checked at launch:
-    the launcher raises if ``max(T[i+1]-T[i])`` exceeds the compile-time window
-    size.  A merely single-tensor-but-not-consecutive bound (e.g. ``T[g+1]+128``)
-    does NOT qualify -- ``max(diff(T))`` would under-count the true range and could
-    let it over-read the window -- so it returns None and owner_cache stays off
-    (the ordered loop streams).
+    Owner residency requires this so the resident window can be bound-checked at
+    launch: the launcher raises if ``max(T[i+1]-T[i])`` exceeds the compile-time
+    window size.  A merely single-tensor-but-not-consecutive bound (e.g.
+    ``T[g+1]+128``) does NOT qualify -- ``max(diff(T))`` would under-count the
+    true range and could let it over-read the window -- so it returns None and the
+    ordered loop streams.
     """
     ordered = plan.ordered_axis
     return None if ordered is None else ordered.packed_offset_arg
 
 
 @dataclasses.dataclass(frozen=True)
-class OwnerCacheResidentSpec:
-    """One ordered operand held in a per-owner resident VMEM window."""
-
-    arg_name: str
-
-
-@dataclasses.dataclass(frozen=True)
-class OwnerCachePrepSpec:
-    """One supported prep to hoist into the owner-keyed VMEM cache."""
-
-    arg_name: str
-    perm: tuple[int, ...]
-
-
-@dataclasses.dataclass(frozen=True)
-class OwnerCacheRangeSpec:
+class OwnerResidencyRangeSpec:
     """The runtime proof for the resident ordered window.
 
-    ``ordered_offset_arg`` supplies the ordered lengths.  ``compact_offset_arg``
-    supplies the active-owner mask: owners with no compact work produce no worklist
-    item and never refill the cache, so their ordered lengths are ignored.
+    ``ordered_offset_arg`` supplies the ordered lengths. ``compact_offset_arg``
+    supplies the active-owner mask: owners with no compact work produce no
+    worklist item, so their ordered lengths are ignored.
     """
 
     ordered_offset_arg: str
@@ -229,8 +199,8 @@ class OwnerCacheRangeSpec:
 
 
 @dataclasses.dataclass(frozen=True)
-class OwnerCacheWindowSpec:
-    """The compile-time VMEM window selected for owner_cache."""
+class OwnerResidencyWindowSpec:
+    """The compile-time VMEM window selected for owner residency."""
 
     physical_window: int
     budget_capacity: int
@@ -238,89 +208,202 @@ class OwnerCacheWindowSpec:
 
 
 @dataclasses.dataclass(frozen=True)
-class OwnerCacheDecision:
-    """The single 'is owner_cache active, and on which operands' decision.
+class OwnerResidencyDecision:
+    """The single 'is owner residency active, and on which operands' decision.
 
-    Every codegen + runtime path that emits owner_cache behavior must consume this
-    cached decision and gate on ``active`` for the resident window.  ``preps`` are
-    optional work on top of that resident window: only act on them when
-    ``prep_active`` is true.
+    Every codegen + runtime path that emits resident-window behavior must consume
+    this cached decision and gate on ``active``.
     """
 
-    resident_operands: tuple[OwnerCacheResidentSpec, ...]
-    preps: tuple[OwnerCachePrepSpec, ...]
-    range_spec: OwnerCacheRangeSpec | None
-    window: OwnerCacheWindowSpec | None
+    resident_operands: tuple[str, ...]
+    range_spec: OwnerResidencyRangeSpec | None
+    window: OwnerResidencyWindowSpec | None
     inactive_reason: str | None
 
     @property
     def active(self) -> bool:
         return self.inactive_reason is None
 
-    @property
-    def prep_active(self) -> bool:
-        return self.active and bool(self.preps)
 
-
-def build_owner_cache_decision(
+def build_owner_residency_decision(
     plan: CompactWorklistPlan,
     operands: list[tuple[tuple[int, ...], int]],
     *,
     budget_capacity: int,
     physical_window: int,
     ordered_block: int,
-) -> OwnerCacheDecision:
-    """Finalize owner_cache eligibility for one concrete config.
+) -> OwnerResidencyDecision:
+    """Finalize owner-residency eligibility for one concrete config.
 
     Detection records semantic proofs on the plan; backend setup computes the VMEM
     window once from concrete shapes/block sizes and stores the result here.  All
     later consumers read this decision instead of recomputing eligibility/window
     math from partially-overlapping inputs.
     """
-    resident_entries = owner_cache_resident_entries(plan)
-    residents = tuple(OwnerCacheResidentSpec(p.arg_name) for p in resident_entries)
-    prep_entries = owner_cache_entries(plan)
-    preps_list: list[OwnerCachePrepSpec] = []
-    for p in prep_entries:
-        assert p.prep_perm is not None
-        preps_list.append(OwnerCachePrepSpec(p.arg_name, p.prep_perm))
-    preps = tuple(preps_list)
+    residents = tuple(p.arg_name for p in owner_resident_entries(plan))
     if not residents:
-        return OwnerCacheDecision(residents, preps, None, None, "no resident operands")
-    ordered_arg = ordered_owner_cache_bound_arg(plan)
+        return OwnerResidencyDecision(residents, None, None, "no resident operands")
+    ordered_arg = ordered_owner_residency_bound_arg(plan)
     if ordered_arg is None:
-        return OwnerCacheDecision(
-            residents, preps, None, None, "ordered bound is not packed"
+        return OwnerResidencyDecision(
+            residents, None, None, "ordered bound is not packed"
         )
     compact_arg = plan.compact_axis.packed_offset_arg
     if compact_arg is None:
-        return OwnerCacheDecision(
-            residents, preps, None, None, "compact bound is not packed"
+        return OwnerResidencyDecision(
+            residents, None, None, "compact bound is not packed"
         )
     if not operands:
-        return OwnerCacheDecision(residents, preps, None, None, "no resident operands")
+        return OwnerResidencyDecision(residents, None, None, "no resident operands")
     if physical_window <= 0:
-        return OwnerCacheDecision(
+        return OwnerResidencyDecision(
             residents,
-            preps,
             None,
             None,
             "VMEM budget cannot hold one ordered block",
         )
-    return OwnerCacheDecision(
+    return OwnerResidencyDecision(
         resident_operands=residents,
-        preps=preps,
-        range_spec=OwnerCacheRangeSpec(
+        range_spec=OwnerResidencyRangeSpec(
             ordered_offset_arg=ordered_arg,
             compact_offset_arg=compact_arg,
         ),
-        window=OwnerCacheWindowSpec(
+        window=OwnerResidencyWindowSpec(
             physical_window=physical_window,
             budget_capacity=budget_capacity,
             ordered_block=ordered_block,
         ),
         inactive_reason=None,
     )
+
+
+@dataclasses.dataclass(frozen=True)
+class OwnerPrepHoist:
+    """Direct owner-invariant prep of a resident ordered operand."""
+
+    graph_id: int
+    host_arg: str
+    load_node_name: str
+    prep_node_name: str
+    perm: tuple[int, ...]
+
+
+def _ordered_full_slice_load(
+    node: torch.fx.Node,
+    ordered_block_id: int,
+) -> bool:
+    """True for the strict PR1 load shape ``arg[ordered_tile, :, :, ...]``."""
+    from .plan_tiling import ArbitrarySlicePattern
+    from .plan_tiling import TilePattern
+
+    load_val = node.meta.get("val")
+    if not isinstance(load_val, torch.Tensor):
+        return False
+    patterns = node.meta.get("indexing_patterns")
+    if not isinstance(patterns, list):
+        return False
+    if len(patterns) != load_val.ndim:
+        return False
+    first, *rest = patterns
+    if not (isinstance(first, TilePattern) and first.block_id == ordered_block_id):
+        return False
+    return all(
+        isinstance(pattern, ArbitrarySlicePattern)
+        and pattern.slice == slice(None, None, None)
+        for pattern in rest
+    )
+
+
+def _prep_perm_from_node(prep: torch.fx.Node, load_ndim: int) -> tuple[int, ...] | None:
+    if prep.target is torch.ops.aten.permute.default:
+        raw = prep.args[1]
+        if not isinstance(raw, (list, tuple)):
+            return None
+        if not all(isinstance(v, int) for v in raw):
+            return None
+        raw_perm = cast("tuple[int, ...]", tuple(raw))
+        perm = tuple(v % load_ndim for v in raw_perm)
+    else:
+        return None
+    if len(perm) != load_ndim or sorted(perm) != list(range(load_ndim)):
+        return None
+    if load_ndim < 3:
+        return None
+    if tuple(perm[: load_ndim - 2]) == tuple(range(load_ndim - 2)):
+        return None
+    return perm
+
+
+def detect_owner_prep_hoists(
+    graphs: list[GraphInfo],
+    plan: CompactWorklistPlan,
+) -> tuple[OwnerPrepHoist, ...]:
+    """Find direct transpose-like preps of owner-resident ordered loads.
+
+    This is semantic detection only: it must not perform VMEM budgeting or choose
+    the resident window size.  ``PallasBackend._setup_compact_worklist`` owns
+    admission of these descriptors after the resident-window budget is known.
+    """
+    from ...language import memory_ops
+    from ...language._tracing_ops import _host_tensor
+    from ..device_ir import ForLoopGraphInfo
+
+    ordered_axis = plan.ordered_axis
+    if ordered_axis is None:
+        return ()
+    ordered_block_id = ordered_axis.block_id
+    resident_hosts = {p.arg_name for p in owner_resident_entries(plan)}
+    if not resident_hosts:
+        return ()
+
+    by_graph_host: dict[tuple[int, str], list[OwnerPrepHoist]] = {}
+    for graph_info in graphs:
+        if not (
+            isinstance(graph_info, ForLoopGraphInfo)
+            and graph_info.block_ids == [ordered_block_id]
+        ):
+            continue
+        for node in graph_info.graph.nodes:
+            if node.op != "call_function" or node.target is not memory_ops.load:
+                continue
+            tensor_node = node.args[0]
+            if not (
+                isinstance(tensor_node, torch.fx.Node)
+                and tensor_node.op == "call_function"
+                and tensor_node.target is _host_tensor
+                and isinstance(tensor_node.args[0], str)
+            ):
+                continue
+            host_arg = tensor_node.args[0]
+            if host_arg not in resident_hosts:
+                continue
+            if not _ordered_full_slice_load(node, ordered_block_id):
+                continue
+            if len(node.users) != 1:
+                continue
+            prep = next(iter(node.users))
+            if prep.op != "call_function":
+                continue
+            load_val = node.meta.get("val")
+            if not isinstance(load_val, torch.Tensor):
+                continue
+            perm = _prep_perm_from_node(prep, load_val.ndim)
+            if perm is None:
+                continue
+            hoist = OwnerPrepHoist(
+                graph_id=graph_info.graph_id,
+                host_arg=host_arg,
+                load_node_name=node.name,
+                prep_node_name=prep.name,
+                perm=perm,
+            )
+            by_graph_host.setdefault((graph_info.graph_id, host_arg), []).append(hoist)
+
+    admitted: list[OwnerPrepHoist] = []
+    for hoists in by_graph_host.values():
+        if len(hoists) == 1:
+            admitted.append(hoists[0])
+    return tuple(admitted)
 
 
 def metadata_arg_names(plan: CompactWorklistPlan) -> list[str]:
@@ -739,115 +822,12 @@ def _find_grid_loop(body: list[ast.stmt]) -> ast.For | None:
     return None
 
 
-def _const_int(node: ast.AST) -> int | None:
-    """A literal int from an AST node (handles ``-2``), else ``None``."""
-    if isinstance(node, ast.Constant) and isinstance(node.value, int):
-        return node.value
-    if (
-        isinstance(node, ast.UnaryOp)
-        and isinstance(node.op, ast.USub)
-        and isinstance(node.operand, ast.Constant)
-        and isinstance(node.operand.value, int)
-    ):
-        return -node.operand.value
-    return None
-
-
-def _ordered_prep_perm(
-    ordered_loop: ast.For | None, name: str, ordered_var: str | None
-) -> tuple[int, ...] | None:
-    """Perm of a MAJOR-axis transpose applied directly to ``name``'s ordered
-    leading-dim load, or ``None``.  This is the plan-time gate for optional
-    prep-cache emission: a non-None perm means there is a hoistable transpose to
-    cache; ``None`` means the operand may still be resident, but has no prep to
-    fission.
-
-    Recognizes exactly ``name[<subscript>].transpose(i, j)`` /
-    ``name[<subscript>].permute(*dims)`` (literal dims) where the subscript is the
-    ordered leading-dim access (dim 0 indexed by the ordered tile var, no other
-    dim) -- the same access that gets the resident window -- and the permutation
-    moves a leading (owner-tiled) dim.  That is the head-major transpose
-    owner_cache hoists into the prep cache.  Deliberately NOT matched:
-    - a minor/last-two transpose such as ``Kᵀ`` (``.transpose(-2, -1)``), which
-      fuses into the ``dot_general`` (caching it would add a transpose and regress);
-    - a transpose of an *intermediate* (``k_blk.transpose(...)``): the match
-      requires the transpose to sit directly on the operand's load subscript;
-    - a transpose of a differently-indexed access of the same operand (dim 0 not
-      the ordered var), or a non-literal / non-3D+ transpose;
-    - an operand with more than one matching direct major transpose (even if the
-      perms are identical): emission caches exactly one transpose per operand, so
-      any duplicate disables prep caching rather than tripping that emission
-      invariant.
-    Deciding this from the kernel-body AST (here) rather than from the emitted
-    Pallas strings keeps the correctness decision semantic.  A multi-op prep (e.g.
-    a dequant chain for quantized operands) would need a separate recognizer; this
-    matches only the single transpose.
-    """
-    if ordered_loop is None or ordered_var is None:
-        return None
-    # Collect EVERY matching direct major transpose (a list, not a set): two
-    # identical transposes still count as two, so a duplicate is rejected below
-    # rather than silently deduped -- emission requires exactly one per operand.
-    found: list[tuple[int, ...]] = []
-    for node in ast.walk(ordered_loop):
-        if not (
-            isinstance(node, ast.Call)
-            and isinstance(node.func, ast.Attribute)
-            and isinstance(node.func.value, ast.Subscript)
-            and isinstance(node.func.value.value, ast.Name)
-            and node.func.value.value.id == name
-        ):
-            continue
-        sl = node.func.value.slice
-        dims = list(sl.elts) if isinstance(sl, ast.Tuple) else [sl]
-        ndim = len(dims)
-        if ndim < 3:
-            # Need >=3 dims for a leading (major) vs last-two (minor) split; the
-            # attention prep is [tokens, H, D]. Fewer dims => nothing to cache here.
-            continue
-        # The transpose must sit on the ordered leading-dim access: dim 0 indexed
-        # by the ordered tile var and no other dim.  That is the access that gets
-        # the resident window; a transpose on any other access of the same operand
-        # is not the load we cache.
-        if [d for d, e in enumerate(dims) if ordered_var in _names_read(e)] != [0]:
-            continue
-        attr = node.func.attr
-        if attr == "transpose" and len(node.args) == 2:
-            i, j = _const_int(node.args[0]), _const_int(node.args[1])
-            if i is None or j is None:
-                continue
-            i %= ndim
-            j %= ndim
-            perm = list(range(ndim))
-            perm[i], perm[j] = perm[j], perm[i]
-        elif attr == "permute":
-            raw = node.args
-            if len(raw) == 1 and isinstance(raw[0], (ast.Tuple, ast.List)):
-                raw = raw[0].elts
-            vals = [_const_int(a) for a in raw]
-            if len(vals) != ndim or any(v is None for v in vals):
-                continue
-            perm = []
-            for v in vals:
-                assert v is not None
-                perm.append(v % ndim)
-        else:
-            continue
-        # Major-axis: the leading dims (all but the last two) are NOT identity.
-        if tuple(perm[: ndim - 2]) != tuple(range(ndim - 2)):
-            found.append(tuple(perm))
-    # Exactly one matching major-axis prep => cache it.  Zero, or more than one
-    # (different perms OR duplicates) => no prep-cache emission for this operand.
-    return found[0] if len(found) == 1 else None
-
-
 def _classify_tensor_policies(
     grid_loop: ast.For,
     owner_var: str,
     compact_var: str,
     ordered_var: str | None,
     bound_tensors: set[str],
-    ordered_loop: ast.For | None = None,
 ) -> tuple[TensorPolicy, ...]:
     """Derive per-tensor policies from how each subscript is indexed.
 
@@ -904,18 +884,11 @@ def _classify_tensor_policies(
             # fully-jagged attention).  A leading-dim ordered access is CLASSIFIED
             # ``ordered_reduction`` ("indexed by the ordered axis"); whether it
             # becomes resident is decided later by the range/window proof.
-            # ``prep_perm`` only gates the optional transpose-cache emission.  A
+            # Optional prep caching is detected later from tiled FX nodes.  A
             # non-leading ordered index has no resident-window form, so it stays
             # ``static_full``.
             kind = "ordered_reduction" if ordered_dims == [0] else "static_full"
-            prep = (
-                _ordered_prep_perm(ordered_loop, name, ordered_var)
-                if kind == "ordered_reduction"
-                else None
-            )
-            policies.setdefault(
-                name, TensorPolicy(arg_name=name, kind=kind, prep_perm=prep)
-            )
+            policies.setdefault(name, TensorPolicy(arg_name=name, kind=kind))
     return tuple(policies.values())
 
 
@@ -1160,7 +1133,7 @@ def detect_compact_worklist_plan(
             raise exc.InvalidConfig(
                 "compact_worklist: could not resolve the ordered tile block id."
             )
-        # owner_cache needs a bound whose consecutive diffs are EXACTLY the
+        # Owner residency needs a bound whose consecutive diffs are EXACTLY the
         # per-owner length; prove the packed-consecutive idiom (base=T[g],
         # end=T[g+1] on one Name tensor).  A bound like ``T[g+1]+128`` reads only
         # ``T`` but is NOT this shape, so it does not qualify.
@@ -1194,7 +1167,7 @@ def detect_compact_worklist_plan(
         bound_tensors |= _names_read(axis.base) | _names_read(axis.length)
 
     policies = _classify_tensor_policies(
-        grid_loop, owner_var, compact_var, ordered_var, bound_tensors, ordered_loop
+        grid_loop, owner_var, compact_var, ordered_var, bound_tensors
     )
 
     # The store must be in the compact region (compact_exact_store), never

@@ -3,6 +3,7 @@ from __future__ import annotations
 import ast
 import collections
 import contextlib
+import dataclasses
 import re
 from typing import TYPE_CHECKING
 from typing import NamedTuple
@@ -48,8 +49,19 @@ if TYPE_CHECKING:
     from .device_ir import GraphInfo
     from .host_function import HostFunction
     from .loop_dependency_checker import LoopDependencyChecker
+    from .pallas.compact_worklist import OwnerPrepHoist
     from .tile_strategy import DeviceLoopOrGridState
     from .type_info import TensorType
+
+
+@dataclasses.dataclass(frozen=True)
+class OwnerPrepLowering:
+    hoist: OwnerPrepHoist
+    resident_window_name: str
+    resident_window_fake: torch.Tensor
+    cache_name: str
+    cache_shape: tuple[int, ...]
+    cache_dtype: torch.dtype
 
 
 class GenerateAST(NodeVisitor, CodegenInterface):
@@ -129,6 +141,9 @@ class GenerateAST(NodeVisitor, CodegenInterface):
         self.store_transform = store_transform
         self.load_transform = load_transform
         self._statement_owner_fx_node: Node | None = None
+        self.owner_prep_lowering_stack: list[
+            dict[tuple[int, str], OwnerPrepLowering]
+        ] = []
 
         # Now create device function and initialize CodegenInterface
         self.device_function = DeviceFunction(
@@ -144,6 +159,30 @@ class GenerateAST(NodeVisitor, CodegenInterface):
 
     def get_graph(self, graph_id: int) -> GraphInfo:
         return self.codegen_graphs[graph_id]
+
+    @contextlib.contextmanager
+    def owner_prep_lowering_scope(
+        self, lowerings: list[OwnerPrepLowering]
+    ) -> Iterator[None]:
+        by_node = {
+            (lowering.hoist.graph_id, lowering.hoist.prep_node_name): lowering
+            for lowering in lowerings
+        }
+        self.owner_prep_lowering_stack.append(by_node)
+        try:
+            yield
+        finally:
+            self.owner_prep_lowering_stack.pop()
+
+    def owner_prep_lowering_for_node(self, node: Node) -> OwnerPrepLowering | None:
+        for scope in reversed(self.owner_prep_lowering_stack):
+            for (graph_id, prep_node_name), lowering in scope.items():
+                if prep_node_name != node.name:
+                    continue
+                if self.get_graph(graph_id).graph is not node.graph:
+                    continue
+                return lowering
+        return None
 
     def offset_var(self, block_idx: int) -> str:
         return self.active_device_loops[block_idx][-1].strategy.offset_var(block_idx)

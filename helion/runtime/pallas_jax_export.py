@@ -314,7 +314,7 @@ def default_pallas_jax_launcher(
     )
 
     if _kind is _LoopKind.COMPACT_WORKLIST:
-        # owner_cache: on this JAX-export/jit path the owner_cache resident
+        # Owner residency: on this JAX-export/jit path the resident
         # window IS applied, but the host overflow guard
         # (runtime._compact_raise_if_owner_exceeds_window) is NOT run here -- the
         # offsets are jit tracers, so a per-owner reduction length exceeding the

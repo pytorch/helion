@@ -12,6 +12,9 @@ from helion._compiler.ast_extension import expr_from_string
 if TYPE_CHECKING:
     from collections.abc import Iterator
 
+    from torch.fx.node import Node
+
+    from helion._compiler.aten_lowering import LoweringContext
     from helion._compiler.inductor_lowering import CodegenState
     from helion._compiler.tile_strategy import DeviceLoopOrGridState
 
@@ -48,6 +51,44 @@ def load_expr(
             f"jnp.expand_dims({{result}}, axis={dim})", result=result
         )
     return result
+
+
+def maybe_codegen_owner_prep_cache_read(
+    ctx: LoweringContext, node: Node
+) -> ast.AST | None:
+    """Return a prep-cache read for an active owner-prep descriptor, if any."""
+    from helion._compiler.compile_environment import CompileEnvironment
+    from helion._compiler.generate_ast import GenerateAST
+    from helion._compiler.pallas.compact_worklist import ordered_ref_names
+
+    if not isinstance(ctx.cg, GenerateAST):
+        return None
+    lowering = ctx.cg.owner_prep_lowering_for_node(node)
+    if lowering is None:
+        return None
+    env = CompileEnvironment.current()
+    decision = env.compact_worklist_owner_residency_decision
+    plan = env.compact_worklist_plan
+    if (
+        decision is None
+        or not decision.active
+        or decision.window is None
+        or plan is None
+        or plan.ordered_axis is None
+    ):
+        return None
+    ordered_block_id = plan.ordered_axis.block_id
+    block_size = ctx.cg.device_function.block_size_var(ordered_block_id)
+    if block_size is None:
+        return None
+    offset = ctx.cg.offset_var(ordered_block_id)
+    range_start_ref = f"{ordered_ref_names(plan)[0]}_ref[_wid]"
+    local_ordered = f"pl.ds(({offset}) - ({range_start_ref}), {block_size})"
+    rank = len(lowering.hoist.perm)
+    window_elts = [local_ordered]
+    window_elts.extend(":" for _ in range(rank - 1))
+    read = f"{lowering.cache_name}[{', '.join(window_elts[p] for p in lowering.hoist.perm)}]"
+    return expr_from_string(read)
 
 
 def _load_mask_expr(
@@ -605,10 +646,10 @@ def _is_compact_aligned_load(
 def _is_ordered_aligned_load(
     state: CodegenState, block_id: int, tensor: torch.Tensor | None
 ) -> bool:
-    """True if *tensor* is the owner_cache ordered reduction operand (K/V).
+    """True if *tensor* is an owner-resident ordered reduction operand.
 
-    Under owner_cache it gets a per-owner resident ``pl.Element(C)`` window keyed
-    on ``range_start`` (not tile_start), so the fori body reads it at the LOCAL
+    Owner-resident operands get a per-owner ``pl.Element(C)`` window keyed on
+    ``range_start`` (not tile_start), so the fori body reads at the LOCAL
     ordered-tile offset ``offset - range_start`` rather than the absolute offset.
     """
     from helion._compiler.compile_environment import CompileEnvironment
@@ -621,14 +662,14 @@ def _is_ordered_aligned_load(
     if block_id != plan.ordered_axis.block_id:
         return False
     # Only active resident ordered operands read the resident window at the local
-    # (offset - range_start) offset.  Consume the cached OwnerCacheDecision the
-    # loop router also uses; inactive means the ordered loop streams and no resident
-    # window exists.
-    decision = CompileEnvironment.current().compact_worklist_owner_cache_decision
+    # (offset - range_start) offset.  Consume the cached OwnerResidencyDecision
+    # the loop router also uses; inactive means the ordered loop streams and no
+    # resident window exists.
+    decision = CompileEnvironment.current().compact_worklist_owner_residency_decision
     if decision is None or not decision.active:
         return False
     host = state.device_function.tensor_arg(tensor).host_str()
-    return any(p.arg_name == host for p in decision.resident_operands)
+    return host in decision.resident_operands
 
 
 def _ds_expr(
@@ -656,8 +697,8 @@ def _ds_expr(
     # sliced block at local offset 0, not the absolute tile_start.
     if not tile_offset and _is_compact_aligned_load(state, block_id, tensor):
         return f"pl.ds(0, {block_size})"
-    # owner_cache ordered operand: resident pl.Element(C) window at range_start, so
-    # read at the LOCAL offset within the window (absolute offset - range_start).
+    # Owner-resident ordered operand: pl.Element(C) window at range_start, so read
+    # at the LOCAL offset within the window (absolute offset - range_start).
     if not tile_offset and _is_ordered_aligned_load(state, block_id, tensor):
         from helion._compiler.compile_environment import CompileEnvironment
         from helion._compiler.pallas.compact_worklist import ordered_ref_names

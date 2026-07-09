@@ -162,7 +162,8 @@ if TYPE_CHECKING:
     from ..runtime.settings import Settings
     from .backend import Backend
     from .pallas.compact_worklist import CompactWorklistPlan
-    from .pallas.compact_worklist import OwnerCacheDecision
+    from .pallas.compact_worklist import OwnerPrepHoist
+    from .pallas.compact_worklist import OwnerResidencyDecision
 
     class _TLS(Protocol):
         env: CompileEnvironment | None
@@ -276,10 +277,15 @@ class CompileEnvironment:
         # whole compact-worklist codegen path (see helion/_compiler/pallas/
         # compact_worklist.py).
         self.compact_worklist_plan: CompactWorklistPlan | None = None
-        # Final owner-cache decision for this concrete config.  This includes the
-        # cached physical window integer; runtime/codegen consumers must read this
-        # instead of recomputing owner-cache eligibility.
-        self.compact_worklist_owner_cache_decision: OwnerCacheDecision | None = None
+        # Final owner-residency decision for this concrete config.  This includes
+        # the cached physical window integer; runtime/codegen consumers must read
+        # this instead of recomputing owner-residency eligibility.
+        self.compact_worklist_owner_residency_decision: (
+            OwnerResidencyDecision | None
+        ) = None
+        # Optional prep-cache descriptors admitted for this concrete config.  Kept
+        # separate from the correctness-bearing resident-window decision.
+        self.compact_worklist_owner_prep_hoists: tuple[OwnerPrepHoist, ...] = ()
         # Static megablocks upper bound (int) for the compact worklist grid /
         # metadata, computed at pre_codegen from static shapes.
         self.compact_worklist_upper: int = 1
@@ -287,7 +293,7 @@ class CompileEnvironment:
         # pre_codegen; used by the worklist builder and UPPER (NOT max(block_sizes)).
         self.compact_worklist_block: int = 1
         # Ordered (reduction) tile block size.  May differ from the compact block
-        # (e.g. q_block != kv_block); owner_cache sizes its resident window to a
+        # (e.g. q_block != kv_block); owner residency sizes its window to a
         # multiple of THIS so a single ordered tile read always fits the window.
         self.compact_worklist_ordered_block: int = 1
         # Offsets-tensor parameter names the generated _build_worklist takes, in
