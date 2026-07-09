@@ -293,7 +293,7 @@ class CompileEnvironment:
         # pre_codegen; used by the worklist builder and UPPER (NOT max(block_sizes)).
         self.compact_worklist_block: int = 1
         # Ordered (reduction) tile block size.  May differ from the compact block
-        # (e.g. q_block != kv_block); owner residency sizes its window to a
+        # (e.g. compact_block != ordered_block); owner residency sizes its window to a
         # multiple of THIS so a single ordered tile read always fits the window.
         self.compact_worklist_ordered_block: int = 1
         # Offsets-tensor parameter names the generated _build_worklist takes, in

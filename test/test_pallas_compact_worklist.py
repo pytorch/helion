@@ -898,6 +898,16 @@ class TestPolicyClassification(unittest.TestCase):
         with self.assertRaises(exc.InvalidConfig):
             _classify_tensor_policies(loop, "seq", "tile_q", None, set())
 
+    def test_ordered_axis_store_rejected(self):
+        loop = self._grid_loop(
+            "for seq in g:\n"
+            "    for tile_q in tq:\n"
+            "        for tile_kv in tkv:\n"
+            "            out[tile_kv, :, :] = k[tile_kv, :, :]\n"
+        )
+        with self.assertRaisesRegex(exc.InvalidConfig, "ordered-axis stores"):
+            _classify_tensor_policies(loop, "seq", "tile_q", "tile_kv", set())
+
 
 @onlyBackends(["pallas"])
 class TestNoSilentFallback(unittest.TestCase):
@@ -966,8 +976,8 @@ class TestNoSilentFallback(unittest.TestCase):
 
 
 @onlyBackends(["pallas"])
-class TestStreamingClassification(unittest.TestCase):
-    def test_fully_jagged_ordered_kv_streams_without_new_launcher_api(self):
+class TestOrderedResidencyClassification(unittest.TestCase):
+    def test_fully_jagged_ordered_kv_uses_resident_fori_without_new_launcher_api(self):
         qo = _offsets([12, 20, 5, 30])
         kvo = _offsets([13, 7, 19, 11])
         lq, lkv = int(qo[-1]), int(kvo[-1])
@@ -992,7 +1002,7 @@ class TestStreamingClassification(unittest.TestCase):
         self.assertNotIn("pltpu.emit_pipeline(", code)
         self.assertIn("_compact_aligned_arg_indices=", code)
 
-    def test_dense_kv_owner_indexed_tensors_do_not_stream(self):
+    def test_dense_kv_owner_indexed_tensors_have_no_ordered_pipeline(self):
         qo = _offsets([12, 20, 5, 30])
         lq = int(qo[-1])
         args = (
@@ -1010,7 +1020,7 @@ class TestStreamingClassification(unittest.TestCase):
         # Dense-KV has no ordered axis, so no inner pipeline either.
         self.assertNotIn("pltpu.emit_pipeline", code)
 
-    def test_kv_owned_backward_shape_streams_ordered_q_like_loads(self):
+    def test_kv_owned_backward_shape_uses_resident_ordered_q_like_loads(self):
         qo = _offsets([12, 20, 5, 30])
         kvo = _offsets([13, 7, 19, 11])
         lq, lkv = int(qo[-1]), int(kvo[-1])
@@ -1231,8 +1241,8 @@ class TestCompactWorklistNumerics(unittest.TestCase):
         self.assertEqual(tuple(out.shape), (0, H, D))
 
     @skipIfPallasInterpret(
-        "the ordered KV axis (emit_pipeline) miscompiles in pallas interpret "
-        "mode; this path is validated on real TPU"
+        "the owner-resident ordered KV path is validated on real TPU, not "
+        "Pallas interpret mode"
     )
     def test_fully_jagged_with_empty_kv_matches_eager(self):
         # Ordered inner KV loop + an empty KV range (seq 2: kv_len==0) to exercise
@@ -1255,8 +1265,8 @@ class TestCompactWorklistNumerics(unittest.TestCase):
         torch.testing.assert_close(out.cpu(), ref, rtol=2e-2, atol=2e-2)
 
     @skipIfPallasInterpret(
-        "the ordered KV axis (emit_pipeline) miscompiles in pallas interpret "
-        "mode; this path is validated on real TPU"
+        "the owner-resident ordered KV path is validated on real TPU, not "
+        "Pallas interpret mode"
     )
     def test_fully_jagged_long_kv_matches_eager(self):
         # Long, jagged KV (several kvblock trips, non-divisible final tiles per
@@ -1386,6 +1396,12 @@ class TestOwnerResidencyWindowGuard(unittest.TestCase):
         guard((offsets, k, k), [], 0, 0, c)
         guard((offsets, k, k), [], -1, -1, 0)
 
+    def test_active_zero_window_raises(self):
+        guard, k, _c = self._setup()
+        offsets = torch.tensor([0, 1], dtype=torch.int32)
+        with self.assertRaisesRegex(RuntimeError, "compiled ordered window is invalid"):
+            guard((offsets, k, k), [1, 2], 0, 0, 0)
+
     def test_active_window_uncheckable_bound_raises(self):
         guard, k, c = self._setup()
         offsets = torch.tensor([0, c + 1, 2 * c + 1], dtype=torch.int32)
@@ -1513,6 +1529,14 @@ class TestOwnerPrepHoistCodegen(unittest.TestCase):
         self.assertIn("_oc_full_ordered_tiles", code)
         self.assertNotIn("_oc_full_nkv", code)
         self.assertIn("kv_len_ref[_wid]", code)
+        refill_guard = next(
+            line
+            for line in code.splitlines()
+            if "kv_begin_ref[_wid]" in line
+            and "jnp.maximum(_wid - 1, 0)" in line
+        )
+        self.assertIn("kv_len_ref[_wid]", refill_guard)
+        self.assertNotIn("work_seq_ref", refill_guard)
         self.assertIn("broadcasted_iota", code)
         self.assertIn(
             "jax.lax.broadcasted_iota(jnp.int32, (1, _BLOCK_SIZE_2, 1), 1)",
@@ -1577,17 +1601,14 @@ class TestOwnerResidencyAndPrepHoist(unittest.TestCase):
     def _active_owner_residency_decision(self):
         from helion._compiler.pallas.compact_worklist import OwnerResidencyDecision
         from helion._compiler.pallas.compact_worklist import OwnerResidencyRangeSpec
-        from helion._compiler.pallas.compact_worklist import OwnerResidencyWindowSpec
 
         return OwnerResidencyDecision(
             resident_operands=("k",),
             range_spec=OwnerResidencyRangeSpec("kvo", "qo"),
-            window=OwnerResidencyWindowSpec(
-                physical_window=64,
-                budget_capacity=64,
-                ordered_block=8,
-            ),
+            physical_window=64,
             inactive_reason=None,
+            resident_key_fields=("range_start",),
+            prep_key_fields=("range_start", "range_len"),
         )
 
     def _prep_hoists_for(self, kernel, args):
@@ -1769,12 +1790,12 @@ class TestOwnerResidencyAndPrepHoist(unittest.TestCase):
         decision = build_owner_residency_decision(
             plan,
             [((64, 4, 128), 2)],
-            budget_capacity=1024,
             physical_window=64,
-            ordered_block=8,
         )
         self.assertTrue(decision.active)
         self.assertEqual(decision.resident_operands, ("k",))
+        self.assertEqual(decision.resident_key_fields, ("range_start",))
+        self.assertEqual(decision.prep_key_fields, ("range_start", "range_len"))
 
     def test_owner_residency_decision_falls_back_when_window_not_viable(self):
         from helion._compiler.pallas.compact_worklist import (
@@ -1809,9 +1830,7 @@ class TestOwnerResidencyAndPrepHoist(unittest.TestCase):
         decision = build_owner_residency_decision(
             plan,
             [((1_000_000, 4, 128), 4)],
-            budget_capacity=64,
             physical_window=0,
-            ordered_block=128,
         )
         self.assertFalse(decision.active)
         self.assertEqual(

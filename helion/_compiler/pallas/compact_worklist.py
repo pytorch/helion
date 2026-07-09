@@ -4,19 +4,18 @@ Recognises the supported jagged loop nest, captures each axis's ``(base,
 length)`` as resolvable host AST, and renders the per-kernel ``jnp`` gathers
 that feed :func:`helion.runtime.compact_worklist.flatten_worklist`.
 
-The pattern targeted (see ``examples/jagged_q_dense_kv_gdpa.py`` and
-``examples/jagged_gdpa.py``)::
+The supported loop shape is::
 
-    for seq in hl.grid(B):  # owner_grid  (block size 1)
-        q_start = q_offsets[seq]  # prologue scalar assigns
-        q_end = q_offsets[seq + 1]
-        for tile_q in hl.tile(q_start, q_end):  # compact_tile  (jagged, parallel)
-            acc = init(...)  # (fully jagged only) carried-state init
-            for tile_kv in hl.tile(
-                kv_start, kv_end
+    for source in hl.grid(B):  # owner_grid / source coordinate (block size 1)
+        compact_start = offsets[source]  # prologue scalar assigns
+        compact_end = offsets[source + 1]
+        for tile_m in hl.tile(compact_start, compact_end):  # compact_tile
+            acc = init(...)  # optional carried-state init
+            for tile_k in hl.tile(
+                ordered_start, ordered_end
             ):  # ordered  (optional, carries acc)
                 acc = update(acc, ...)
-            out[tile_q] = finalize(acc)  # store in the compact region
+            out[tile_m] = finalize(acc)  # store in the compact region
 
 Detection rejects anything outside this shape with ``exc.InvalidConfig`` so the
 autotuner scores an offered-but-unmatched config ``inf`` and skips it (rather
@@ -78,9 +77,9 @@ class TensorPolicy:
 
     ``kind`` is one of ``compact_aligned_load`` (input indexed by the compact
     tile), ``compact_exact_store`` (output indexed by the compact tile),
-    ``owner_indexed`` (dense per-owner tensor, e.g. ``k[seq]``),
+    ``owner_indexed`` (dense per-owner tensor, e.g. ``x[source]``),
     ``ordered_reduction`` (the reduction's reused operand, indexed by the ordered
-    inner tile on the leading dim, e.g. jagged ``k[tile_kv]``/``v[tile_kv]``), or
+    inner tile on the leading dim, e.g. ``x[tile_k]``), or
     ``static_full`` (unaffected).
 
     ``kind`` is *classification only*: ``ordered_reduction`` means "indexed by the
@@ -109,7 +108,7 @@ class CompactWorklistPlan:
     tensor_policies: tuple[TensorPolicy, ...]
     upper_bound_expr: str  # static UPPER = cdiv(total, BLOCK) + owners - 1
     # jnp host expression for the owner count P (the grid size), e.g.
-    # "q_offsets.shape[0] - 1" or "lo.shape[0]"; taken from the owner hl.grid
+    # "offsets.shape[0] - 1" or "lo.shape[0]"; taken from the owner hl.grid
     # bound (NOT assumed to be base.shape[0] - 1, which only holds for the
     # offsets-array idiom).
     num_owners_expr: str = ""
@@ -150,13 +149,13 @@ def owner_ref_name(plan: CompactWorklistPlan) -> str:
 
 
 def compact_ref_names(plan: CompactWorklistPlan) -> tuple[str, str]:
-    """(tile_starts ref, tile_extents ref), e.g. ``("q_begin", "q_extent")``."""
+    """(tile_starts ref, tile_extents ref), e.g. ``("m_begin", "m_extent")``."""
     prefix = _strip_tile_prefix(plan.compact_axis.loop_var)
     return f"{prefix}_begin", f"{prefix}_extent"
 
 
 def ordered_ref_names(plan: CompactWorklistPlan) -> tuple[str, str]:
-    """(range_start ref, range_len ref), e.g. ``("kv_begin", "kv_len")``."""
+    """(range_start ref, range_len ref), e.g. ``("k_begin", "k_len")``."""
     ordered = plan.ordered_axis
     assert ordered is not None
     prefix = _strip_tile_prefix(ordered.loop_var)
@@ -199,15 +198,6 @@ class OwnerResidencyRangeSpec:
 
 
 @dataclasses.dataclass(frozen=True)
-class OwnerResidencyWindowSpec:
-    """The compile-time VMEM window selected for owner residency."""
-
-    physical_window: int
-    budget_capacity: int
-    ordered_block: int
-
-
-@dataclasses.dataclass(frozen=True)
 class OwnerResidencyDecision:
     """The single 'is owner residency active, and on which operands' decision.
 
@@ -217,8 +207,13 @@ class OwnerResidencyDecision:
 
     resident_operands: tuple[str, ...]
     range_spec: OwnerResidencyRangeSpec | None
-    window: OwnerResidencyWindowSpec | None
+    physical_window: int
     inactive_reason: str | None
+    # Semantic metadata fields that identify the cached contents.  Store fields,
+    # not generated ref names, so emitters resolve through the same metadata order
+    # used by launcher args and BlockSpecs.
+    resident_key_fields: tuple[str, ...] = ()
+    prep_key_fields: tuple[str, ...] = ()
 
     @property
     def active(self) -> bool:
@@ -229,9 +224,7 @@ def build_owner_residency_decision(
     plan: CompactWorklistPlan,
     operands: list[tuple[tuple[int, ...], int]],
     *,
-    budget_capacity: int,
     physical_window: int,
-    ordered_block: int,
 ) -> OwnerResidencyDecision:
     """Finalize owner-residency eligibility for one concrete config.
 
@@ -242,24 +235,24 @@ def build_owner_residency_decision(
     """
     residents = tuple(p.arg_name for p in owner_resident_entries(plan))
     if not residents:
-        return OwnerResidencyDecision(residents, None, None, "no resident operands")
+        return OwnerResidencyDecision(residents, None, 0, "no resident operands")
     ordered_arg = ordered_owner_residency_bound_arg(plan)
     if ordered_arg is None:
         return OwnerResidencyDecision(
-            residents, None, None, "ordered bound is not packed"
+            residents, None, 0, "ordered bound is not packed"
         )
     compact_arg = plan.compact_axis.packed_offset_arg
     if compact_arg is None:
         return OwnerResidencyDecision(
-            residents, None, None, "compact bound is not packed"
+            residents, None, 0, "compact bound is not packed"
         )
     if not operands:
-        return OwnerResidencyDecision(residents, None, None, "no resident operands")
+        return OwnerResidencyDecision(residents, None, 0, "no resident operands")
     if physical_window <= 0:
         return OwnerResidencyDecision(
             residents,
             None,
-            None,
+            0,
             "VMEM budget cannot hold one ordered block",
         )
     return OwnerResidencyDecision(
@@ -268,12 +261,10 @@ def build_owner_residency_decision(
             ordered_offset_arg=ordered_arg,
             compact_offset_arg=compact_arg,
         ),
-        window=OwnerResidencyWindowSpec(
-            physical_window=physical_window,
-            budget_capacity=budget_capacity,
-            ordered_block=ordered_block,
-        ),
+        physical_window=physical_window,
         inactive_reason=None,
+        resident_key_fields=("range_start",),
+        prep_key_fields=("range_start", "range_len"),
     )
 
 
@@ -411,10 +402,10 @@ def metadata_arg_names(plan: CompactWorklistPlan) -> list[str]:
 
     ``owner_ids`` is always included: the owner coordinate is recovered from it
     (``work_<owner>_ref[wid]``) so the owner-grid prologue scalar loads
-    (``q_offsets[seq]``) -- which are *not* DCE'd -- index a valid owner rather
+    (``offsets[source]``) -- which are *not* DCE'd -- index a valid owner rather
     than the work id.  (Dropping ``owner_ids`` when nothing is ``owner_indexed``
     is a future optimization that first requires DCE'ing that prologue and the
-    ``q_offsets`` device arg.)  Order mirrors ``CompactWorkMetadata``.
+    corresponding offsets device arg.)  Order mirrors ``CompactWorkMetadata``.
     """
     names: list[str] = [owner_ref_name(plan)]
     names.extend(compact_ref_names(plan))
@@ -435,6 +426,18 @@ def metadata_field_names(plan: CompactWorklistPlan) -> list[str]:
     return fields
 
 
+def metadata_ref_for_field(plan: CompactWorklistPlan, field: str) -> str:
+    """Return the emitted scalar-prefetch ref name for a metadata field."""
+    try:
+        index = metadata_field_names(plan).index(field)
+    except ValueError as err:
+        raise exc.InvalidConfig(
+            "compact_worklist owner residency: active cache key metadata "
+            f"{field!r} is missing."
+        ) from err
+    return f"{metadata_arg_names(plan)[index]}_ref"
+
+
 # ---------------------------------------------------------------------------
 # Resolver
 # ---------------------------------------------------------------------------
@@ -449,7 +452,7 @@ def resolve_for_worklist(
     """Substitute owner loop vars and leak-check a captured ``base``/``length``.
 
     ``subs`` maps each parallel loop var name to its coordinate-array name
-    (``{"seq": "parent"}`` for the builder, where ``parent = jnp.arange(P)``);
+    (``{"source": "parent"}`` for the builder, where ``parent = jnp.arange(P)``);
     written as a general transformer so the base-in-index idiom (grouped GEMM)
     is a purely additive follow-up.
 
@@ -586,7 +589,7 @@ def render_build_worklist(
         ]
         dep_kwargs = ", dep_base=dep_base, dep_len=dep_len"
 
-    # The owner-count expression (e.g. "q_offsets.shape[0] - 1" or "B") may
+    # The owner-count expression (e.g. "offsets.shape[0] - 1" or "B") may
     # introduce additional free host names the builder must take as params.
     resolved_nodes.append(_plain(num_owners_expr))
     offset_params = _free_host_names_in_order(resolved_nodes, owner_array)
@@ -615,7 +618,7 @@ def render_build_worklist(
 def _to_plain(node: ast.AST) -> ast.AST:
     """Strip ExtendedAST/location by round-tripping through source.
 
-    Captured host bounds (``q_offsets[seq + 1]``) come from ``host_fn.body`` as
+    Captured host bounds (``offsets[source + 1]``) come from ``host_fn.body`` as
     ExtendedAST nodes, which are not ``copy.deepcopy``-able (they require a
     ``_location`` kwarg).  The resolver and builder need plain, copyable ASTs;
     the bounds are simple host expressions, so an unparse/parse round-trip is
@@ -632,7 +635,7 @@ def _torch_size_to_jnp_shape(node: ast.AST) -> ast.AST:
     """Rewrite torch ``x.size(i)`` calls to jnp-valid ``x.shape[i]`` subscripts.
 
     The owner count comes from the kernel's host ``hl.grid`` bound, which is
-    written in torch (``q_offsets.size(0) - 1``); the builder runs on jax
+    written in torch (``offsets.size(0) - 1``); the builder runs on jax
     arrays, so it must read ``.shape[i]`` instead.
     """
 
@@ -691,7 +694,7 @@ def _collect_prologue_assigns(
 ) -> dict[str, ast.AST]:
     """Map ``name -> rhs AST`` for simple top-level ``name = expr`` assigns.
 
-    Used to inline loop-prologue scalar loads (``q_start = q_offsets[seq]``) so
+    Used to inline loop-prologue scalar loads (``start = offsets[source]``) so
     a captured bound resolves to a host expression over the owner var.
 
     Only statements that appear *before* ``before`` (the statement that is or
@@ -837,8 +840,8 @@ def _classify_tensor_policies(
     compacted-axis access fitting no policy is rejected.
 
     ``bound_tensors`` (the host offset tensors that appear in the captured
-    bounds, e.g. ``q_offsets``/``kv_offsets``) are skipped: they are consumed by
-    the host builder, not the device kernel, so they carry no BlockSpec policy.
+    bounds) are skipped: they are consumed by the host builder, not the device
+    kernel, so they carry no BlockSpec policy.
     """
     policies: dict[str, TensorPolicy] = {}
     for sub in ast.walk(grid_loop):
@@ -859,6 +862,12 @@ def _classify_tensor_policies(
             if ordered_var is not None
             else []
         )
+        if is_store and ordered_dims:
+            raise exc.InvalidConfig(
+                f"compact_worklist: tensor {name!r} is stored with the ordered "
+                "axis in its index; ordered-axis stores are not supported by "
+                "the resident-window lowering."
+            )
 
         if compact_dims:
             # PR1 only supports compaction on the leading dim (dim 0): the
@@ -880,13 +889,12 @@ def _classify_tensor_policies(
                 )
             policies.setdefault(name, TensorPolicy(arg_name=name, kind="owner_indexed"))
         elif ordered_dims:
-            # Ordered-range tensor = the reduction's reused operand (e.g. K/V in
-            # fully-jagged attention).  A leading-dim ordered access is CLASSIFIED
-            # ``ordered_reduction`` ("indexed by the ordered axis"); whether it
-            # becomes resident is decided later by the range/window proof.
-            # Optional prep caching is detected later from tiled FX nodes.  A
-            # non-leading ordered index has no resident-window form, so it stays
-            # ``static_full``.
+            # Ordered-range tensor = the reduction's reused operand.  A leading-dim
+            # ordered access is CLASSIFIED ``ordered_reduction`` ("indexed by the
+            # ordered axis"); whether it becomes resident is decided later by the
+            # range/window proof.  Optional prep caching is detected later from
+            # tiled FX nodes.  A non-leading ordered index has no resident-window
+            # form, so it stays ``static_full``.
             kind = "ordered_reduction" if ordered_dims == [0] else "static_full"
             policies.setdefault(name, TensorPolicy(arg_name=name, kind=kind))
     return tuple(policies.values())
@@ -1001,7 +1009,7 @@ def detect_compact_worklist_plan(
         )
     owner_var = grid_loop.target.id
 
-    # Owner count = the hl.grid bound (e.g. q_offsets.size(0) - 1 or lo.size(0)),
+    # Owner count = the hl.grid bound (e.g. offsets.size(0) - 1 or lo.size(0)),
     # inlined over top-level assigns and translated to jnp .shape[i].
     grid_call = _loop_iter_call(grid_loop)
     if grid_call is None or not grid_call.args:
@@ -1051,7 +1059,7 @@ def detect_compact_worklist_plan(
             )
 
     # Prologue scalar assigns in the grid body BEFORE the compact tile loop
-    # (q_start = q_offsets[seq], ...); a later reassignment must not leak in.
+    # (start = offsets[source], ...); a later reassignment must not leak in.
     prologue = _collect_prologue_assigns(grid_loop.body, before=compact_loop)
 
     # Compact axis (bounds-carry): base = begin, length = end - begin.
@@ -1119,7 +1127,7 @@ def detect_compact_worklist_plan(
             raise exc.InvalidConfig(
                 "compact_worklist: ordered hl.tile must have (begin, end) bounds."
             )
-        # The ordered bounds (k_start = kv_offsets[seq], ...) may be assigned in
+        # The ordered bounds (ordered_start = offsets[source], ...) may be assigned in
         # the grid body (captured by `prologue`) or inside the compact loop before
         # the ordered loop -- add the latter, again stopping before the loop.
         ordered_prologue = {

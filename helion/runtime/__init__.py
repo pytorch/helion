@@ -394,7 +394,10 @@ def _compact_raise_if_owner_exceeds_window(
     if not ordered_aligned_arg_indices:
         return  # owner residency inactive (no resident window) -> nothing to guard
     if ordered_window <= 0:
-        return  # owner residency should be inactive; avoid a spurious empty guard
+        raise RuntimeError(
+            "compact_worklist owner residency: the resident window is active but "
+            f"the compiled ordered window is invalid ({ordered_window})."
+        )
     if ordered_offset_arg_index < 0 or active_mask_arg_index < 0:
         raise RuntimeError(
             "compact_worklist owner residency: the resident window is active but the "
@@ -2100,12 +2103,12 @@ def _pallas_compact_in_out_specs(
             # pl.Element so Pallas prefetches/double-buffers it; other dims full.
             # Use the FULL compact_block (not min with the tensor length): the
             # body slices ``pl.ds(0, compact_block)``, and the ``padding=(0,
-            # compact_block)`` lets the read overshoot the tensor end (handles
-            # total_q < block).  Clamping the block here would mismatch the
+            # compact_block)`` lets the read overshoot the tensor end (handles a
+            # short compact dimension).  Clamping the block here would mismatch the
             # body's pl.ds size and slice out of bounds.
             #
-            # tile_start is the RAW owner offset (q_offsets[seq] + k*block), NOT
-            # sublane-aligned-down: sequences pack contiguously at arbitrary
+            # tile_start is the RAW compact offset (base + tile*block), NOT
+            # sublane-aligned-down: packed rows can start at arbitrary
             # offsets.  pl.Element is exactly the mechanism that tolerates a
             # dynamic, possibly-unaligned start -- Mosaic lowers an element-indexed
             # block to a dynamic-offset (un)masked access, where a plain int block
@@ -2133,6 +2136,7 @@ def _pallas_compact_in_out_specs(
             # the owner's tail (same as the compact_aligned_load window).  Keying
             # on range_start lets Pallas dedup the load across same-owner tiles.
             assert ordered_window > 0
+            assert range_start_ref_pos >= 0
             oblock = ordered_window
             oelt = pl.Element(oblock, padding=(0, oblock))  # type: ignore[union-attr]
             oblock_shape = (
@@ -2323,22 +2327,21 @@ def _pallas_compile_compact_jit_fn(
                 # for two reasons:
                 #
                 # 1. Input reuse: Pallas reuses an unchanged owner-indexed input
-                #    block (k[seq]/v[seq]) across consecutive same-owner work
-                #    items -- the builder orders work items by owner, so a
-                #    sequence's q-tiles share one k/v fetch (matching
-                #    emit_pipeline's per-seq reuse).
+                #    block across consecutive same-owner work items -- the builder
+                #    orders work items by owner, so all compact tiles for one owner
+                #    share the same owner-indexed fetches.
                 #
                 # 2. Ordered-overwrite store (the precondition the whole kernel
                 #    rests on): each work item's VALID output rows are disjoint,
                 #    BUT the store is a masked FULL-block pl.Element write, so a
-                #    partial last tile overwrites the next sequence's leading rows
-                #    with masked-zero padding (sequences are packed contiguously
-                #    at unaligned offsets, so the write regions overlap even
-                #    though valid-row ownership does not).  "arbitrary" tells
+                #    partial last tile overwrites the next owner's leading rows
+                #    with masked-zero padding (owners are packed contiguously at
+                #    unaligned offsets, so the write regions overlap even though
+                #    valid-row ownership does not).  "arbitrary" tells
                 #    Mosaic the grid iterations may have dependencies, so it runs
                 #    them sequentially in grid order rather than reordering or
                 #    pipelining them.  The builder emits work items in ascending
-                #    (owner, tile) order, so the next sequence's first tile is a
+                #    (owner, tile) order, so the next owner's first tile is a
                 #    LATER iteration that re-writes those rows with the correct
                 #    values -- and being later + serial, it deterministically
                 #    wins.  With "parallel", Mosaic could reorder/overlap
@@ -2415,7 +2418,7 @@ def default_pallas_compact_worklist_launcher(
     """
     assert _compact_build_worklist is not None
     # Owner-residency correctness backstop: raise rather than silently over-read the
-    # resident window) when an owner's reduction length exceeds the compile-time
+    # resident window when an owner's reduction length exceeds the compile-time
     # window C.  Runs every call -- the offsets are runtime data even when the
     # compiled kernel is reused across calls with the same grid.
     _compact_raise_if_owner_exceeds_window(

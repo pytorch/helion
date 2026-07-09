@@ -262,11 +262,10 @@ def _(state: CodegenState) -> object:
         return _codegen_fori_loop(state)
     if pallas_loop_type == "compact_worklist":
         # The compact tile becomes the grid (no loop).  The ordered inner tile
-        # (fully jagged carried reduction) uses the owner-resident fori path when
-        # the ordered range can be proven/windowed; otherwise it streams through
-        # emit_pipeline.  The single-iteration compact tile lowers through the
-        # fori path.  Both have begin/end remapped to metadata refs (see
-        # _compact_worklist_bounds).
+        # uses the owner-resident fori path when the ordered range can be
+        # proven/windowed; otherwise it streams through emit_pipeline.  The
+        # single-iteration compact tile lowers through the fori path.  Both have
+        # begin/end remapped to metadata refs (see _compact_worklist_bounds).
         if _is_compact_ordered_inner_loop(state):
             if _owner_residency_applies(state):
                 return _codegen_owner_residency(state)
@@ -370,14 +369,23 @@ def _prepare_owner_prep_lowerings(
 ) -> list[OwnerPrepLowering]:
     """Register prep-cache scratch and return lowering descriptors for this graph."""
     from .._compiler.generate_ast import OwnerPrepLowering
+    from .._compiler.pallas.compact_worklist import metadata_ref_for_field
 
     env = CompileEnvironment.current()
     decision = env.compact_worklist_owner_residency_decision
-    if decision is None or not decision.active or decision.window is None:
+    if decision is None or not decision.active:
         return []
+    plan = env.compact_worklist_plan
+    assert plan is not None
     active_hoists = _active_owner_prep_hoists(state, block_ids)
     if not active_hoists:
         return []
+    if not decision.prep_key_fields:
+        _owner_prep_fallback("prep cache has no semantic key fields")
+        return []
+    for field in decision.prep_key_fields:
+        metadata_ref_for_field(plan, field)
+    metadata_ref_for_field(plan, "range_len")
 
     graph_info = state.get_graph(state.proxy_arg(0))
     load_nodes = {node.name: node for node in graph_info.graph.nodes}
@@ -393,9 +401,7 @@ def _prepare_owner_prep_lowerings(
         _owner_prep_fallback(f"prep operands have no resident window refs: {missing}")
         return []
 
-    prepared: list[
-        tuple[OwnerPrepHoist, torch.Tensor, str, torch.Tensor, tuple[int, ...]]
-    ] = []
+    prepared: list[tuple[OwnerPrepHoist, torch.Tensor, str, tuple[int, ...]]] = []
     for hoist in active_hoists:
         load_node = load_nodes.get(hoist.load_node_name)
         load_val = load_node.meta.get("val") if load_node is not None else None
@@ -404,18 +410,16 @@ def _prepare_owner_prep_lowerings(
                 f"load node {hoist.load_node_name!r} has no tensor metadata"
             )
             return []
-        resident_window_name, resident_fake = resident_windows[hoist.host_arg]
+        resident_window_name = resident_windows[hoist.host_arg][0]
         win_shape = (
-            decision.window.physical_window,
+            decision.physical_window,
             *(int(s) for s in load_val.shape[1:]),
         )
         cache_shape = tuple(win_shape[p] for p in hoist.perm)
-        prepared.append(
-            (hoist, load_val, resident_window_name, resident_fake, cache_shape)
-        )
+        prepared.append((hoist, load_val, resident_window_name, cache_shape))
 
     lowerings: list[OwnerPrepLowering] = []
-    for hoist, load_val, resident_window_name, resident_fake, cache_shape in prepared:
+    for hoist, load_val, resident_window_name, cache_shape in prepared:
         cache_name = state.device_function.register_scratch(
             cache_shape,
             load_val.dtype,
@@ -425,10 +429,7 @@ def _prepare_owner_prep_lowerings(
             OwnerPrepLowering(
                 hoist=hoist,
                 resident_window_name=resident_window_name,
-                resident_window_fake=resident_fake,
                 cache_name=cache_name,
-                cache_shape=cache_shape,
-                cache_dtype=load_val.dtype,
             )
         )
     return lowerings
@@ -440,10 +441,9 @@ def _emit_owner_prep_refill(
     grid_parts: list[str],
     lowerings: list[OwnerPrepLowering],
 ) -> None:
-    """Emit once-per-owner prep-cache refill for active descriptors."""
+    """Emit once-per-prep-key cache refill for active descriptors."""
     from .._compiler.generate_ast import OwnerPrepLowering
-    from .._compiler.pallas.compact_worklist import ordered_ref_names
-    from .._compiler.pallas.compact_worklist import owner_ref_name
+    from .._compiler.pallas.compact_worklist import metadata_ref_for_field
 
     if not lowerings:
         return
@@ -451,10 +451,19 @@ def _emit_owner_prep_refill(
     env = CompileEnvironment.current()
     plan = env.compact_worklist_plan
     assert plan is not None and plan.ordered_axis is not None
+    decision = env.compact_worklist_owner_residency_decision
+    assert decision is not None and decision.active
     blk = state.device_function.block_size_var(block_ids[0])
     assert blk is not None
-    owner_ref = f"{owner_ref_name(plan)}_ref"
-    range_len_ref = f"{ordered_ref_names(plan)[1]}_ref"
+    prep_key_refs = tuple(
+        metadata_ref_for_field(plan, field) for field in decision.prep_key_fields
+    )
+    assert prep_key_refs
+    prep_key_changed = " | ".join(
+        f"({ref}[_wid] != {ref}[jnp.maximum(_wid - 1, 0)])"
+        for ref in prep_key_refs
+    )
+    range_len_ref = metadata_ref_for_field(plan, "range_len")
     num_ordered_tiles = grid_parts[0]
 
     def _stmt(src: str) -> ast.stmt:
@@ -499,8 +508,7 @@ def _emit_owner_prep_refill(
         )
 
     refill_fn = _stmt(
-        f"@pl.when((_wid == 0) | "
-        f"({owner_ref}[_wid] != {owner_ref}[jnp.maximum(_wid - 1, 0)]))\n"
+        f"@pl.when((_wid == 0) | ({prep_key_changed}))\n"
         f"def _oc_prep_refill():\n"
         f"    pass"
     )
@@ -658,10 +666,10 @@ def _compact_axis_kind(state: CodegenState, loop_dim_index: int) -> str | None:
 def _is_compact_ordered_inner_loop(state: CodegenState) -> bool:
     """True if this ``_for_loop`` is the compact-worklist ordered inner tile.
 
-    The ordered tile is the carried inner reduction (e.g. the KV loop in fully
-    jagged attention); it is the only compact-worklist loop that may stream via
-    ``_codegen_emit_pipeline`` when the owner-resident window is inactive.  The
-    owner grid and the single-iteration compact tile stay on the fori path.
+    The ordered tile is the carried inner reduction; it is the only
+    compact-worklist loop that may stream via ``_codegen_emit_pipeline`` when the
+    owner-resident window is inactive.  The owner grid and the single-iteration
+    compact tile stay on the fori path.
     """
     from .._compiler.device_ir import ForLoopGraphInfo
 
@@ -3066,7 +3074,7 @@ def _codegen_fori_loop(state: CodegenState) -> object:
     # item, since the builder guarantees extent <= BLOCK), so emit the body
     # straight-line with the loop var bound to 0 -- no fori_loop wrapper (which
     # would add control-flow overhead and block pipelining for the common
-    # dense-KV case).  The ordered inner tile does not reach here: it lowers
+    # no-ordered-axis case).  The ordered inner tile does not reach here: it lowers
     # separately via the owner-resident path or emit_pipeline fallback (see the
     # _for_loop pallas dispatch).
     plan = CompileEnvironment.current().compact_worklist_plan

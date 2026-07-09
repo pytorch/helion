@@ -2619,7 +2619,7 @@ class PallasBackend(Backend):
         # is rejected by this JAX's Mosaic lowering ("Unsupported block dimension
         # type: BoundedSlice" -- it only works inside pltpu.emit_pipeline).  The
         # full-block write's only hazard is a partial last tile overlapping the
-        # next sequence's leading rows; "arbitrary" dimension semantics serialize
+        # next owner's leading rows; "arbitrary" dimension semantics serialize
         # that grid-ordered overlap so the later, correct write wins (verified
         # bitwise == fori_loop across uniform/partial/unaligned/jagged + 5 random
         # seeds).  Robust+fast exact store == the deferred emit_pipeline +
@@ -2635,15 +2635,22 @@ class PallasBackend(Backend):
         # ordered/compact offset args used by the overflow guard.
         decision = env.compact_worklist_owner_residency_decision
         ordered_indices: list[int] = []
-        range_start_ref_pos = (
-            fields.index("range_start") if "range_start" in fields else -1
-        )
+        range_start_ref_pos = -1
         ordered_offset_arg_index = -1
         active_mask_arg_index = -1
         ordered_window = 0
         if decision is not None and decision.active:
             assert decision.range_spec is not None
-            assert decision.window is not None
+            if decision.resident_key_fields != ("range_start",):
+                raise exc.InvalidConfig(
+                    "compact_worklist owner residency: Phase 1 resident windows "
+                    "must be keyed by range_start."
+                )
+            range_start_ref_pos = (
+                fields.index("range_start")
+                if "range_start" in fields
+                else -1
+            )
             missing_residents = [
                 name for name in decision.resident_operands if name not in name_to_index
             ]
@@ -2661,7 +2668,7 @@ class PallasBackend(Backend):
             active_mask_arg_index = name_to_index.get(
                 decision.range_spec.compact_offset_arg, -1
             )
-            ordered_window = decision.window.physical_window
+            ordered_window = decision.physical_window
             if (
                 range_start_ref_pos < 0
                 or ordered_offset_arg_index < 0
@@ -2760,7 +2767,6 @@ class PallasBackend(Backend):
         non-matching kernel (autotuner-skippable).
         """
         from ..runtime import _get_vmem_limit_bytes
-        from ..runtime import compact_ordered_budget_capacity
         from ..runtime import compact_ordered_physical_window
         from .compile_environment import CompileEnvironment
         from .device_function import DeviceFunction
@@ -2782,14 +2788,14 @@ class PallasBackend(Backend):
             if ref not in device_fn.wrapper_only_params:
                 device_fn.wrapper_only_params.append(ref)
 
-        # Compact-axis tile block size (NOT max(block_sizes): for fully jagged
-        # with Q_BLOCK < KV_BLOCK that would undersize the worklist metadata).
+        # Compact-axis tile block size (NOT max(block_sizes): a distinct larger
+        # ordered block would undersize the worklist metadata).
         compact_block = env.block_sizes[plan.compact_axis.block_id].from_config(config)
         assert compact_block is not None, "compact tile has no block size"
         env.compact_worklist_block = int(compact_block)
         # Ordered (reduction) tile block -- owner residency uses this compile-side to
         # choose a block-aligned physical window (it can differ from the compact
-        # block, e.g. q_block != kv_block).
+        # block, e.g. compact_block != ordered_block).
         env.compact_worklist_ordered_block = 1
         if plan.ordered_axis is not None:
             ordered_block = env.block_sizes[plan.ordered_axis.block_id].from_config(
@@ -2819,22 +2825,15 @@ class PallasBackend(Backend):
         # accepts this already-sized allocation, but that ceiling is deliberately
         # not used here as an allocation budget.
         vmem_bytes = _get_vmem_limit_bytes(pltpu)
-        budget_capacity_no_prep = compact_ordered_budget_capacity(
-            resident_operands, vmem_bytes, prep_operands=[]
-        )
         physical_window_no_prep = compact_ordered_physical_window(
             resident_operands,
             vmem_bytes,
             env.compact_worklist_ordered_block,
             prep_operands=[],
         )
-        budget_capacity = budget_capacity_no_prep
         physical_window = physical_window_no_prep
         admitted_hoists = prep_hoists
         if prep_hoists:
-            budget_capacity_with_prep = compact_ordered_budget_capacity(
-                resident_operands, vmem_bytes, prep_operands=prep_operands
-            )
             physical_window_with_prep = compact_ordered_physical_window(
                 resident_operands,
                 vmem_bytes,
@@ -2842,7 +2841,6 @@ class PallasBackend(Backend):
                 prep_operands=prep_operands,
             )
             if physical_window_with_prep > 0:
-                budget_capacity = budget_capacity_with_prep
                 physical_window = physical_window_with_prep
             else:
                 admitted_hoists = ()
@@ -2850,9 +2848,7 @@ class PallasBackend(Backend):
         env.compact_worklist_owner_residency_decision = build_owner_residency_decision(
             plan,
             resident_operands,
-            budget_capacity=budget_capacity,
             physical_window=physical_window,
-            ordered_block=env.compact_worklist_ordered_block,
         )
 
     def _compact_worklist_upper(
@@ -2873,7 +2869,7 @@ class PallasBackend(Backend):
         from .compile_environment import CompileEnvironment
 
         params = dict(host_fn.params.arguments)
-        # Owner count from the captured grid bound (e.g. q_offsets.shape[0] - 1).
+        # Owner count from the captured grid bound (e.g. offsets.shape[0] - 1).
         # num_owners_expr is a codegen-derived host expression; if it references a
         # name not in params (a source shape we failed to inline), surface it as
         # an autotuner-skippable InvalidConfig rather than a bare exception that

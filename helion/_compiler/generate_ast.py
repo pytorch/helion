@@ -58,10 +58,7 @@ if TYPE_CHECKING:
 class OwnerPrepLowering:
     hoist: OwnerPrepHoist
     resident_window_name: str
-    resident_window_fake: torch.Tensor
     cache_name: str
-    cache_shape: tuple[int, ...]
-    cache_dtype: torch.dtype
 
 
 class GenerateAST(NodeVisitor, CodegenInterface):

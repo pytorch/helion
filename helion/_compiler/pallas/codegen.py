@@ -59,7 +59,7 @@ def maybe_codegen_owner_prep_cache_read(
     """Return a prep-cache read for an active owner-prep descriptor, if any."""
     from helion._compiler.compile_environment import CompileEnvironment
     from helion._compiler.generate_ast import GenerateAST
-    from helion._compiler.pallas.compact_worklist import ordered_ref_names
+    from helion._compiler.pallas.compact_worklist import metadata_ref_for_field
 
     if not isinstance(ctx.cg, GenerateAST):
         return None
@@ -72,7 +72,6 @@ def maybe_codegen_owner_prep_cache_read(
     if (
         decision is None
         or not decision.active
-        or decision.window is None
         or plan is None
         or plan.ordered_axis is None
     ):
@@ -81,8 +80,9 @@ def maybe_codegen_owner_prep_cache_read(
     block_size = ctx.cg.device_function.block_size_var(ordered_block_id)
     if block_size is None:
         return None
+    assert decision.resident_key_fields == ("range_start",)
     offset = ctx.cg.offset_var(ordered_block_id)
-    range_start_ref = f"{ordered_ref_names(plan)[0]}_ref[_wid]"
+    range_start_ref = f"{metadata_ref_for_field(plan, 'range_start')}[_wid]"
     local_ordered = f"pl.ds(({offset}) - ({range_start_ref}), {block_size})"
     rank = len(lowering.hoist.perm)
     window_elts = [local_ordered]
@@ -701,11 +701,15 @@ def _ds_expr(
     # at the LOCAL offset within the window (absolute offset - range_start).
     if not tile_offset and _is_ordered_aligned_load(state, block_id, tensor):
         from helion._compiler.compile_environment import CompileEnvironment
-        from helion._compiler.pallas.compact_worklist import ordered_ref_names
+        from helion._compiler.pallas.compact_worklist import metadata_ref_for_field
 
-        plan = CompileEnvironment.current().compact_worklist_plan
+        env = CompileEnvironment.current()
+        plan = env.compact_worklist_plan
         assert plan is not None
-        begin_ref = f"{ordered_ref_names(plan)[0]}_ref[_wid]"
+        decision = env.compact_worklist_owner_residency_decision
+        assert decision is not None
+        assert decision.resident_key_fields == ("range_start",)
+        begin_ref = f"{metadata_ref_for_field(plan, 'range_start')}[_wid]"
         return f"pl.ds(({offset}) - ({begin_ref}), {block_size})"
     if tensor is not None and tensor_dim is not None:
         from helion.language.memory_ops import _record_pad_info
