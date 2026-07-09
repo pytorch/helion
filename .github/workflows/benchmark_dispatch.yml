@@ -33,6 +33,11 @@ on:
         required: false
         type: boolean
         default: false
+      run_h100_linattn:
+        description: 'Run linear-attention benchmark (vs FLA) on H100'
+        required: false
+        type: boolean
+        default: false
       kernels:
         description: 'Comma-separated list of kernels to benchmark on GPU runners'
         required: false
@@ -208,9 +213,26 @@ jobs:
       kernels: ${{ github.event.inputs.kernels_linattn }}
       env-vars: ${{ github.event.inputs.env_vars }}
 
+  run-h100-linattn:
+    if: ${{ github.event.inputs.run_h100_linattn == 'true' }}
+    uses: ./.github/workflows/benchmark.yml
+    permissions:
+      id-token: write
+      contents: read
+    with:
+      runner: mt-l-x86iamx-22-225-h100
+      python-version: "3.12"
+      image: nvidia/cuda:13.1.0-devel-ubuntu24.04
+      runtime-version: cu130
+      container-options: --gpus all
+      alias: h100
+      suite: linattn
+      kernels: ${{ github.event.inputs.kernels_linattn }}
+      env-vars: ${{ github.event.inputs.env_vars }}
+
   trigger-docs-deploy:
     if: always()
-    needs: [run-b200, run-b200-cute, run-h100, run-mi350x, run-tpu, run-b200-linattn]
+    needs: [run-b200, run-b200-cute, run-h100, run-mi350x, run-tpu, run-b200-linattn, run-h100-linattn]
     runs-on: ubuntu-latest
     permissions:
       actions: write

@@ -174,8 +174,13 @@ jobs:
         run: |
           set -x
           source .venv/bin/activate
+          # Newer FLA allows gated backward on Hopper with Triton 3.7.1+;
+          # torch 2.12.1 provides that Triton version.
+          PYTORCH_INDEX="${PYPI_CACHE_WHL_URL:-https://download.pytorch.org/whl/cpu}"
+          UV_DEFAULT_INDEX= UV_INDEX= uv pip install -U "torch==2.12.1" --index-url "${PYTORCH_INDEX%/whl/*}/whl/${{ inputs.runtime-version }}"
           uv pip install einops
-          uv pip install "git+https://github.com/sustcsonglin/flash-linear-attention@v0.5.0" --no-deps
+          uv pip install "git+https://github.com/fla-org/flash-linear-attention@6bd90692588c81fe102ee6e12ac70686359658a2" --no-deps
+          python -c "from packaging.version import Version; import torch, triton; print('torch', torch.__version__, 'triton', triton.__version__); assert torch.cuda.is_available(); assert Version(triton.__version__) >= Version('3.7.1'), triton.__version__"
           python -c "import fla; print('fla', fla.__name__)"
 
       - name: Run TritonBench Benchmark

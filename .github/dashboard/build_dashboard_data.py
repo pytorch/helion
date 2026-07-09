@@ -28,7 +28,7 @@ RETENTION_DAYS = 365
 # are parsed from the workflow YAML so dashboard expectations track whatever's
 # currently in the workflow defaults without manual edits.
 _PLATFORM_KERNELS_INPUT = {
-    "h100": ("kernels",),
+    "h100": ("kernels", "kernels_linattn"),
     "b200": ("kernels", "kernels_linattn"),
     "b200_cute": ("kernels_cute",),
     "mi350x": ("kernels",),
