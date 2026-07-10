@@ -312,8 +312,12 @@ class BaseSearch(BaseAutotuner):
             search_algorithm=type(self).__name__,
         )
         # Analyze search space if logging is enabled. Diagnostic only; a failure
-        # must not prevent autotuning from running.
-        if self.settings.autotune_log_search_space:
+        # must not prevent autotuning from running. Verbose logging implies the
+        # summary, so either setting enables the analysis.
+        if (
+            self.settings.autotune_log_search_space
+            or self.settings.autotune_log_search_space_verbose
+        ):
             try:
                 from .search_space_logger import FeatureExplorationTracker
                 from .search_space_logger import analyze_search_space
@@ -628,7 +632,10 @@ class BaseSearch(BaseAutotuner):
         # Log search space analysis. This is purely diagnostic; any failure
         # here (analysis, logging, or writing report files) must never block or
         # crash autotuning, so the whole block is best-effort.
-        if self.settings.autotune_log_search_space and self._search_summary is not None:
+        if (
+            self.settings.autotune_log_search_space
+            or self.settings.autotune_log_search_space_verbose
+        ) and self._search_summary is not None:
             try:
                 from .search_space_logger import log_search_space_comparison
                 from .search_space_logger import save_exploration_report

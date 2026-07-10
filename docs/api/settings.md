@@ -167,6 +167,18 @@ def my_kernel(x: torch.Tensor) -> torch.Tensor:
     
     See :doc:`autotuner` for example output and the :py:mod:`helion.autotuner.search_space_logger` module for implementation details.
 
+.. autoattribute:: Settings.autotune_log_search_space_verbose
+
+    Additionally log each individual search-space restriction *live* (at ``INFO``) the moment it is
+    applied during kernel compilation, on top of the end-of-run summary. This surfaces *why* the search
+    space shrank as it happens, for example:
+
+    - ``Autotuner feature restriction: pid_type='xyz' disabled (data-dependent loop bounds require a persistent kernel ...)``
+    - ``Autotuner feature restriction: tcgen05 search narrowed to validated configs (matmul kernel with CuTe tcgen05 backend)``
+
+    Enabling this implies ``autotune_log_search_space`` (the summary is produced as well). Default is
+    ``False``. Controlled by ``HELION_AUTOTUNE_LOG_SEARCH_SPACE_VERBOSE`` (set to ``1`` to enable).
+
 .. autoattribute:: Settings.autotune_log_search_space_path
 
     Optional path to save search space analysis as JSON. When set, Helion writes two files per autotuned
@@ -356,6 +368,7 @@ Built-in values for ``HELION_AUTOTUNER`` include ``"LFBOTreeSearch"`` (default),
 | ``HELION_AUTOTUNE_LOG`` | ``autotune_log`` | Base filename for per-config CSV telemetry and mirrored autotune logs. |
 | ``HELION_AUTOTUNE_LOG_DETAILS`` | ``autotune_log_details`` | Enable cost-model dataset sidecar (``.meta.jsonl``) with full configs map. |
 | ``HELION_AUTOTUNE_LOG_SEARCH_SPACE`` | ``autotune_log_search_space`` | Enable search space analysis logging (default ``0``). Set to ``1`` to enable. |
+| ``HELION_AUTOTUNE_LOG_SEARCH_SPACE_VERBOSE`` | ``autotune_log_search_space_verbose`` | Also log each search-space restriction live at ``INFO`` as it is applied (default ``0``). Implies ``HELION_AUTOTUNE_LOG_SEARCH_SPACE``. |
 | ``HELION_AUTOTUNE_LOG_SEARCH_SPACE_PATH`` | ``autotune_log_search_space_path`` | Optional path to save search space analysis JSON files. |
 | ``HELION_AUTOTUNE_PRECOMPILE`` | ``autotune_precompile`` | Select the autotuner precompile mode (``"fork"`` (default), ``"spawn"``, or disable when empty). |
 | ``HELION_AUTOTUNE_PRECOMPILE_JOBS`` | ``autotune_precompile_jobs`` | Cap the number of concurrent Triton precompile subprocesses. |

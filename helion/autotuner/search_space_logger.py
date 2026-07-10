@@ -547,6 +547,11 @@ def analyze_search_space(
                 f"(disabled: {disabled_desc})"
             )
 
+    # Surface non-pid_type search-space restrictions (e.g. tcgen05 cluster_m /
+    # ab_stages / narrowing) recorded as (feature, reason) pairs at compile time.
+    for feature, reason in getattr(config_spec, "restriction_reasons", []):
+        shape_constraints.append(f"{feature} ({reason})")
+
     if config_spec.cute_flash_search_enabled:
         shape_constraints.append(
             "CuTe flash attention search enabled (restricted surface)"

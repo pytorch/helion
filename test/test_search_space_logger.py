@@ -515,6 +515,64 @@ class TestDisallowPidTypeReasons(unittest.TestCase):
             self.assertNotIn("xyz", c)
 
 
+class TestRestrictionReasons(unittest.TestCase):
+    """Non-pid_type restrictions (recorded via ``restriction_reasons``) are
+    surfaced in the summary, and verbose mode logs restrictions live."""
+
+    def _spec(self) -> object:
+        from helion._compiler.backend import TritonBackend
+        from helion.autotuner.config_spec import ConfigSpec
+
+        return ConfigSpec(backend=TritonBackend())
+
+    def test_analyze_search_space_surfaces_restriction(self) -> None:
+        spec = self._spec()
+        spec.restriction_reasons.append(("tcgen05 cluster_m restricted to [1]", "why"))
+        summary = analyze_search_space(spec, kernel_name="k")
+        self.assertIn(
+            "tcgen05 cluster_m restricted to [1] (why)", summary.shape_constraints
+        )
+
+    def test_record_restriction_dedupes_repeat(self) -> None:
+        """The same restriction applied repeatedly (e.g. once per matmul on a
+        shared ConfigSpec) is recorded once, so the summary has no duplicates."""
+        from helion.autotuner import config_spec as cs
+
+        store: list[tuple[str, str]] = []
+        cs._record_restriction(store, "tcgen05 narrowed", "matmul cute backend")
+        cs._record_restriction(store, "tcgen05 narrowed", "matmul cute backend")
+        self.assertEqual(store, [("tcgen05 narrowed", "matmul cute backend")])
+
+    def test_disallow_pid_type_logs_live_when_verbose(self) -> None:
+        from helion.autotuner import config_spec as cs
+
+        spec = self._spec()
+        prev = cs.LOG_RESTRICTIONS_VERBOSE
+        cs.LOG_RESTRICTIONS_VERBOSE = True
+        try:
+            with self.assertLogs(cs.log, level="INFO") as captured:
+                spec.disallow_pid_type("xyz", reason="grid too large")
+            self.assertTrue(any("xyz" in line for line in captured.output))
+        finally:
+            cs.LOG_RESTRICTIONS_VERBOSE = prev
+
+    def test_no_live_log_when_flag_off(self) -> None:
+        """With the flag off, disallow records the reason but emits no INFO log."""
+        from helion.autotuner import config_spec as cs
+
+        spec = self._spec()
+        prev = cs.LOG_RESTRICTIONS_VERBOSE
+        cs.LOG_RESTRICTIONS_VERBOSE = False
+        try:
+            with self.assertNoLogs(cs.log, level="INFO"):
+                spec.disallow_pid_type("xyz", reason="grid too large")
+            self.assertEqual(
+                spec.disallowed_pid_type_reasons["xyz"], "grid too large"
+            )
+        finally:
+            cs.LOG_RESTRICTIONS_VERBOSE = prev
+
+
 class TestSaveOutputPathHandling(unittest.TestCase):
     """save_search_space_summary / save_exploration_report must never crash the
     autotuner on awkward output paths (directory, missing parents, etc.) and

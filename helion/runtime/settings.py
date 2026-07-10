@@ -600,6 +600,11 @@ class _Settings:
             _env_get_bool, "HELION_AUTOTUNE_LOG_SEARCH_SPACE", False
         )
     )
+    autotune_log_search_space_verbose: bool = dataclasses.field(
+        default_factory=functools.partial(
+            _env_get_bool, "HELION_AUTOTUNE_LOG_SEARCH_SPACE_VERBOSE", False
+        )
+    )
     autotune_log_search_space_path: str | None = dataclasses.field(
         default_factory=functools.partial(
             _env_get_str, "HELION_AUTOTUNE_LOG_SEARCH_SPACE_PATH", None
@@ -820,6 +825,13 @@ class Settings(_Settings):
             "If True, log search space analysis after autotuning including which features "
             "were enabled/disabled, total search space size, and coverage metrics. "
             "Off by default; set HELION_AUTOTUNE_LOG_SEARCH_SPACE=1 to enable."
+        ),
+        "autotune_log_search_space_verbose": (
+            "If True, additionally log each search-space restriction (disabled pid_types, "
+            "tcgen05 narrowing, etc.) live at INFO the moment it is applied during "
+            "compilation, on top of the end-of-run summary. Implies "
+            "autotune_log_search_space. Off by default; set "
+            "HELION_AUTOTUNE_LOG_SEARCH_SPACE_VERBOSE=1 to enable."
         ),
         "autotune_log_search_space_path": (
             "Optional path to save search space analysis JSON. "

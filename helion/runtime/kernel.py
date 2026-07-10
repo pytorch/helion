@@ -499,6 +499,16 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
         """
         super().__init__()
         self.kernel = kernel
+        # Enable live logging of search-space restrictions applied during tracing
+        # below (best-effort; never block kernel binding on a logging toggle).
+        try:
+            from ..autotuner import config_spec as _config_spec_module
+
+            _config_spec_module.LOG_RESTRICTIONS_VERBOSE = bool(
+                self.kernel.settings.autotune_log_search_space_verbose
+            )
+        except Exception:  # noqa: BLE001 - diagnostic toggle only
+            pass
         self._run: Callable[..., _R] | None = None
         self._config: Config | None = None
         self._compile_cache: dict[Config, CompiledConfig] = {}
