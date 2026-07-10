@@ -866,8 +866,8 @@ class TestStreamingClassification(unittest.TestCase):
         )
 
         # Ordered K/V stream from HBM via a nested emit_pipeline with double
-        # buffering -- reusing _pipeline_arg_indices, no new launcher API.
-        self.assertIn("_pipeline_arg_indices=", code)
+        # buffering -- reusing _hbm_arg_indices, no new launcher API.
+        self.assertIn("_hbm_arg_indices=", code)
         self.assertIn("pltpu.emit_pipeline(", code)
         self.assertIn("pl.ds(kv_begin_ref[_wid]", code)
         self.assertIn("pl.BoundedSlice(", code)
@@ -893,7 +893,7 @@ class TestStreamingClassification(unittest.TestCase):
             helion.Config(block_sizes=[8], pallas_loop_type="compact_worklist")
         )
 
-        self.assertNotIn("_pipeline_arg_indices=", code)
+        self.assertNotIn("_hbm_arg_indices=", code)
         self.assertNotIn("pltpu.make_async_copy", code)
         # Dense-KV has no ordered axis, so no inner pipeline either.
         self.assertNotIn("pltpu.emit_pipeline", code)
@@ -915,7 +915,7 @@ class TestStreamingClassification(unittest.TestCase):
 
         # Here the ordered axis is the q-like loop, so q and dO stream via the
         # nested emit_pipeline; out is the compact exact-store and stays out.
-        self.assertIn("_pipeline_arg_indices=", code)
+        self.assertIn("_hbm_arg_indices=", code)
         self.assertIn("pltpu.emit_pipeline(", code)
         self.assertIn("pl.ds(q_begin_ref[_wid]", code)
         self.assertIn("pl.Buffered(buffer_count=2)", code)

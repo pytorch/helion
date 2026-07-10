@@ -2554,14 +2554,14 @@ class PallasBackend(Backend):
         from .device_function import TensorArg
 
         if sorted_args is not None:
-            pipeline_arg_indices = [
+            hbm_arg_indices = [
                 i
                 for i, arg in enumerate(sorted_args)
                 if isinstance(arg, TensorArg)
                 and mem_space.get(id(arg.fake_value)) == PallasMemorySpace.HBM
             ]
-            if pipeline_arg_indices:
-                launcher_args.append(f"_pipeline_arg_indices={pipeline_arg_indices!r}")
+            if hbm_arg_indices:
+                launcher_args.append(f"_hbm_arg_indices={hbm_arg_indices!r}")
 
         if CompileEnvironment.current().settings.pallas_interpret:
             launcher_args.append("_pallas_interpret=True")

@@ -2318,7 +2318,7 @@ class TestPallas(TestCase):
             pallas_loop_type="emit_pipeline",
         )
         self.assertIn("pltpu.emit_pipeline", code)
-        self.assertIn("_pipeline_arg_indices=", code)
+        self.assertIn("_hbm_arg_indices=", code)
         torch.testing.assert_close(result, expected)
 
     def test_invalid_pallas_loop_type_raises(self) -> None:
@@ -3266,7 +3266,7 @@ class TestPallas(TestCase):
             pallas_loop_type="fori_loop",
         )
         self.assertNotIn("pltpu.make_async_copy", code)
-        self.assertNotIn("_pipeline_arg_indices=", code)
+        self.assertNotIn("_hbm_arg_indices=", code)
         torch.testing.assert_close(
             result, x.sum(dim=0, keepdim=True), rtol=1e-3, atol=1e-3
         )
@@ -3280,7 +3280,7 @@ class TestPallas(TestCase):
             block_sizes=[8],
             pallas_loop_type="fori_loop",
         )
-        self.assertIn("_pipeline_arg_indices=", code)
+        self.assertIn("_hbm_arg_indices=", code)
         self.assertIn("pltpu.make_async_copy(x.at", code)
         ref = torch.stack(
             [x[g, int(offsets[g]) : int(offsets[g + 1])].sum(dim=0) for g in range(2)]
@@ -3293,7 +3293,7 @@ class TestPallas(TestCase):
         self.assertIn("pltpu.emit_pipeline", code)
         self.assertIn("pl.BoundedSlice", code)
         self.assertIn("pipeline_mode=pl.Buffered", code)
-        self.assertIn("_pipeline_arg_indices=[1]", code)
+        self.assertIn("_hbm_arg_indices=[1]", code)
         self.assertNotIn("pltpu.make_async_copy", code)
 
         offsets = torch.tensor([3, 29], device=DEVICE, dtype=torch.int32)
@@ -3303,7 +3303,7 @@ class TestPallas(TestCase):
             block_sizes=[8],
             pallas_loop_type="fori_loop",
         )
-        self.assertIn("_pipeline_arg_indices=", code)
+        self.assertIn("_hbm_arg_indices=", code)
         self.assertIn("pltpu.make_async_copy(x.at", code)
         torch.testing.assert_close(
             result,
@@ -3319,7 +3319,7 @@ class TestPallas(TestCase):
         self.assertIn("pl.BlockSpec((1, pl.BoundedSlice", code)
         self.assertIn("lambda _j: (1, pl.ds(start + _j * _BLOCK_SIZE_1", code)
         self.assertIn("pipeline_mode=pl.Buffered", code)
-        self.assertIn("_pipeline_arg_indices=[1]", code)
+        self.assertIn("_hbm_arg_indices=[1]", code)
         self.assertNotIn("pltpu.make_async_copy", code)
 
     def test_tile_id_per_block_accumulator(self) -> None:
@@ -3450,7 +3450,7 @@ class TestPallas(TestCase):
                     pallas_loop_type=loop_type,
                 )
                 self.assertIn(loop_marker, code)
-                self.assertNotIn("_pipeline_arg_indices=[0", code)
+                self.assertNotIn("_hbm_arg_indices=[0", code)
                 torch.testing.assert_close(result, expected)
 
     def test_no_pipeline_outer_summary_read(self) -> None:
@@ -3493,7 +3493,7 @@ class TestPallas(TestCase):
         # T (arg index 0) must NOT be pipelined — its outer-scope load
         # would otherwise hit HBM after the BlockSpec is replaced.
         self.assertIn("pltpu.emit_pipeline", code)
-        self.assertNotIn("_pipeline_arg_indices=[0", code)
+        self.assertNotIn("_hbm_arg_indices=[0", code)
         torch.testing.assert_close(result, T * x, rtol=1e-3, atol=1e-3)
 
     def test_fori_loop_per_tensor_dma_mixed(self) -> None:
@@ -3513,7 +3513,7 @@ class TestPallas(TestCase):
         )
         self.assertIn("pltpu.make_async_copy", code)
         self.assertIn("pl.ds(", code)
-        self.assertIn("_pipeline_arg_indices=", code)
+        self.assertIn("_hbm_arg_indices=", code)
         torch.testing.assert_close(result, x * r)
 
     def test_pipeline_begin_aligned_skips_pad(self) -> None:
