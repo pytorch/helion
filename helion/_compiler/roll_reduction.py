@@ -174,7 +174,9 @@ class ReductionRoller:
                 num_rdims = self._count_rdim_axes_in_val(value.meta["val"])
                 if num_rdims == 0:
                     val = value.meta["val"]
-                    if isinstance(val, torch.Tensor) and any(s == 1 for s in val.size()):
+                    if isinstance(val, torch.Tensor) and any(
+                        s == 1 for s in val.size()
+                    ):
                         num_rdims = self._count_rdim_axes_in_subscript(
                             target, index_arg
                         )
