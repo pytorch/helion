@@ -828,10 +828,11 @@ def _kl_div_shapes(
 def _xsa_shapes(
     num_shapes: int | None = None,
 ) -> list[tuple[str, tuple[Any, ...]]]:
-    # (B, H, T, D). One shape only: larger shapes default-config-OOM the
-    # scoped VMEM at this kernel's structure (head_dim=64 < 128-element
-    # lane rule keeps inputs on the VMEM-resident block_spec path).
-    configs = [(2, 32, 1024, 64)]
+    # (B, H, T, D). head_dim=256 matches production TPU attention workloads
+    # (matches `flash_attention` in the sweep) and sidesteps a Mosaic
+    # "Invalid vector type for load" bug that the autotune-baseline path
+    # hit at head_dim=64.
+    configs = [(2, 32, 1024, 256), (4, 32, 2048, 256)]
     if num_shapes is not None:
         configs = configs[:num_shapes]
     out: list[tuple[str, tuple[Any, ...]]] = []
