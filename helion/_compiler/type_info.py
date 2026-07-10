@@ -1569,6 +1569,11 @@ class SliceType(CollectionType):
         )
 
 
+class AsyncCopyDescriptorType(ClassType):
+    pass
+
+
+
 def _eval_unary(op: ast.unaryop, value: object) -> object:
     if isinstance(op, ast.Not):
         return not value
