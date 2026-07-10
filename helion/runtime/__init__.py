@@ -504,12 +504,7 @@ def _pallas_build_block_specs(
         should_use_smem = tensor_pos in (_smem_arg_indices or [])
         out_specs_list.append(
             _pallas_make_block_spec(
-                pl,
-                jnp,
-                pltpu,
-                t,
-                block_spec_info[tensor_pos],
-                should_use_smem,
+                pl, jnp, pltpu, t, block_spec_info[tensor_pos], should_use_smem
             )
         )
 
@@ -1523,9 +1518,16 @@ def _pallas_compile_jit_fn(
     needs_pipeline_specs = bool(_hbm_arg_indices) or bool(_scratch_shapes)
     has_scratch = bool(_scratch_shapes)
     if needs_pipeline_specs:
-        assert _block_spec_info is not None, (
-            "pallas pipeline / scratch kernels require _block_spec_info from codegen"
-        )
+        if _block_spec_info is None:
+            # Distributed-only kernels with no tile analysis reach here
+            # without a block_spec_info from codegen.  Synthesize a
+            # trivial one (one ``None`` per tensor arg + output) so the
+            # pipeline spec builder treats every non-HBM tensor as
+            # untiled full-buffer.
+            all_positions = sorted(
+                set(tensor_arg_indices) | set(output_only_indices or [])
+            )
+            _block_spec_info = [None] * len(all_positions)
         scratch_shapes = _pallas_build_scratch_shapes(pltpu, jnp, _scratch_shapes or [])
         in_specs, out_specs = _pallas_build_pipeline_specs(
             pl,
@@ -1609,6 +1611,21 @@ def _pallas_compile_jit_fn(
             pallas_call_kwargs["compiler_params"] = pltpu.CompilerParams(  # pyrefly: ignore[bad-instantiation]
                 dimension_semantics=dimension_semantics,
             )
+            # For HBM tensors that are read AND written (inplace-mutated
+            # by DMA / remote copy), alias the input into the output so
+            # the initial buffer state is preserved.  ``skip_inplace_copy``
+            # was populated with ``_hbm_arg_indices`` above, so the
+            # reordered_kernel does NOT emit an explicit inplace copy for
+            # these tensors — the alias is what makes the input state
+            # visible to the kernel body.
+            if _hbm_arg_indices and pallas_aliases:
+                hbm_alias = {
+                    in_pos: out_pos
+                    for in_pos, out_pos in pallas_aliases.items()
+                    if in_pos in set(_hbm_arg_indices)
+                }
+                if hbm_alias:
+                    pallas_call_kwargs["input_output_aliases"] = hbm_alias
         else:
             pallas_call_kwargs["grid"] = grid
             if in_specs is not None:
@@ -1813,6 +1830,11 @@ def default_pallas_launcher(
     Output-only tensors (in ``_output_indices`` but not in ``_inplace_indices``)
     are excluded from pallas_call inputs to save VMEM.  Their results are
     returned as torch tensors.
+
+    Distributed ops (e.g. ``hl.start_async_remote_copy``) register DMA
+    semaphore scratch and mark their tensors as HBM.  Those pieces of
+    metadata flow through the same ``_scratch_shapes`` /
+    ``_hbm_arg_indices`` kwargs the pipeline launcher uses.
     """
     cache = getattr(pallas_kernel, _PALLAS_CACHE_ATTR, None)
     if cache is None or cache[0] != grid:

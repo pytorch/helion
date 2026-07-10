@@ -129,6 +129,38 @@ def _host_tensor(debug_name: str) -> torch.Tensor:
 
 @_decorators.codegen(_host_tensor, "common")
 def _(state: CodegenState) -> ast.AST:
+    # Normally ``_host_tensor`` nodes are eliminated before codegen (rewritten to
+    # proper kernel-arg references).  When one survives -- e.g. a host input used
+    # directly inside a distributed kernel -- register it as a kernel argument and
+    # emit its real parameter name (instead of the ``_host_tensor`` placeholder,
+    # which NameErrors).  Backend-neutral: any ref/load handling that depends on
+    # the target lives in the per-backend codegens (see the ``pallas`` one below).
+    assert state.fx_node is not None
+    fake = state.fx_node.meta.get("val")
+    if isinstance(fake, torch.Tensor):
+        return expr_from_string(state.device_function.tensor_arg(fake).name)
+    return expr_from_string("_host_tensor")  # should be unused
+
+
+@_decorators.codegen(_host_tensor, "pallas")
+def _(state: CodegenState) -> ast.AST:
+    # On Pallas a surviving ``_host_tensor`` is a memory ref, and how it is
+    # consumed depends on its memory space:
+    #   * VMEM -- the value is used directly (e.g. ``buf[i] = local`` in a ring
+    #     all-gather), which needs a full-ref load ``name[...]``.
+    #   * HBM  -- a full-ref load is illegal; emit the bare name.  Such a node is
+    #     dead (the real access is a DMA), so the binding is DCE'd, no HBM load.
+    from .._compiler.device_function import PallasMemorySpace
+
+    assert state.fx_node is not None
+    fake = state.fx_node.meta.get("val")
+    if isinstance(fake, torch.Tensor):
+        name = state.device_function.tensor_arg(fake).name
+        if state.device_function.pallas_memory_space.get(id(fake)) == (
+            PallasMemorySpace.HBM
+        ):
+            return expr_from_string(name)
+        return expr_from_string(f"{name}[...]")
     return expr_from_string("_host_tensor")  # should be unused
 
 

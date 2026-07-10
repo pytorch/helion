@@ -5093,11 +5093,15 @@ class TestPallasPrinter(TestCase):
         from helion._compiler.device_function import pallas_texpr
 
         x, y = sympy.symbols("x y")
-        self.assertEqual(pallas_texpr(PythonMod(x, y)), "(x % y)")
-        self.assertEqual(pallas_texpr(FloorDiv(x, y)), "(x // y)")
+        # Both operands are parenthesised so ``%`` / ``//`` don't collide
+        # with the outer ``+`` in composed expressions (``+`` binds
+        # weaker than ``%``, so an un-parenthesised LHS would produce
+        # ``a + b % c`` = ``a + (b % c)`` at Python-eval time).
+        self.assertEqual(pallas_texpr(PythonMod(x, y)), "((x) % (y))")
+        self.assertEqual(pallas_texpr(FloorDiv(x, y)), "((x) // (y))")
         self.assertEqual(
             pallas_texpr(FloorDiv(x, y) + PythonMod(x, y)),
-            "((x // y)) + ((x % y))",
+            "(((x) // (y))) + (((x) % (y)))",
         )
 
 
