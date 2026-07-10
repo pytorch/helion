@@ -1420,11 +1420,10 @@ class TestPallas(TestCase):
             torch.testing.assert_close(result, expected, rtol=1e-2, atol=1e-2)
 
         # The launcher stores its grid-keyed cache on the inner device-kernel
-        # object (``_pallas_cache`` / ``_pallas_pipeline_cache`` /
-        # ``_pallas_fori_cache``, depending on which launcher the config
-        # selects), reachable via the compiled function's module globals.  A
-        # populated cache means repeat calls took the fast-path branch.
-        cache_attrs = ("_pallas_cache", "_pallas_pipeline_cache", "_pallas_fori_cache")
+        # object as ``_pallas_cache``, reachable via the compiled function's
+        # module globals.  A populated cache means repeat calls took the
+        # fast-path branch.
+        cache_attrs = ("_pallas_cache",)
         cached = [
             value
             for value in compiled_fn.__globals__.values()
@@ -1491,12 +1490,10 @@ class TestPallas(TestCase):
         # Confirm the direct-call snapshot was actually built (slot 5 of the
         # launcher cache), so the equality above exercised the direct path and
         # is not a trivial slow-path-vs-slow-path comparison.
-        cache_attrs = ("_pallas_cache", "_pallas_pipeline_cache", "_pallas_fori_cache")
         caches = [
-            getattr(value, a)
+            value._pallas_cache
             for value in compiled_fn.__globals__.values()
-            for a in cache_attrs
-            if getattr(value, a, None) is not None
+            if getattr(value, "_pallas_cache", None) is not None
         ]
         self.assertTrue(
             caches and caches[0][5] is not None,
@@ -1548,7 +1545,7 @@ class TestPallas(TestCase):
             )
 
         # Slot 5 of the launcher cache holds the _DirectCallKernel snapshot.
-        cache_attrs = ("_pallas_cache", "_pallas_pipeline_cache", "_pallas_fori_cache")
+        cache_attrs = ("_pallas_cache",)
         caches = [
             getattr(value, a)
             for value in compiled_fn.__globals__.values()
