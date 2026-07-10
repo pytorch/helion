@@ -259,13 +259,16 @@ Feature Exploration Report for flash_attention_fwd:
 Control via environment variables or settings:
 
 ```bash
-# Disable search space logging (default is enabled)
-export HELION_AUTOTUNE_LOG_SEARCH_SPACE=0
+# Enable search space logging (disabled by default)
+export HELION_AUTOTUNE_LOG_SEARCH_SPACE=1
 
-# Save analysis to JSON files
+# Save analysis to JSON files (also requires HELION_AUTOTUNE_LOG_SEARCH_SPACE=1).
+# The kernel name and autotuner cache hash are injected into the filename stem,
+# so distinct kernels/shapes write separate files instead of overwriting.
 export HELION_AUTOTUNE_LOG_SEARCH_SPACE_PATH=/tmp/analysis.json
-# Creates: /tmp/analysis.json (search space summary)
-#          /tmp/analysis_exploration.json (per-feature stats)
+# Creates, per kernel/shape:
+#   /tmp/analysis.<kernel>.<hash>.json            (search space summary)
+#   /tmp/analysis.<kernel>.<hash>_exploration.json (per-feature stats)
 ```
 
 Or via decorator:
