@@ -5,6 +5,7 @@ import unittest
 from unittest.mock import patch
 
 from packaging import version
+import pytest
 import torch
 import torch.nn.functional as F
 from torch.testing._internal.common_utils import instantiate_parametrized_tests
@@ -2803,41 +2804,49 @@ class TestExamples(RefEagerTestBase, TestCase):
         else:
             mod.test()
 
+    @pytest.mark.timeout(600)
     @skipIfRefEager("linear examples assert against their own reference")
     @skipIfNotCUDA()
     def test_linear_simple_gla(self):
         self._run_linear_example("example_simple_gla")
 
+    @pytest.mark.timeout(600)
     @skipIfRefEager("linear examples assert against their own reference")
     @skipIfNotCUDA()
     def test_linear_full_gla(self):
         self._run_linear_example("example_full_gla")
 
+    @pytest.mark.timeout(600)
     @skipIfRefEager("linear examples assert against their own reference")
     @skipIfNotCUDA()
     def test_linear_vanilla_linear_attn(self):
         self._run_linear_example("example_vanilla_linear_attn")
 
+    @pytest.mark.timeout(600)
     @skipIfRefEager("linear examples assert against their own reference")
     @skipIfNotCUDA()
     def test_linear_retention(self):
         self._run_linear_example("example_retention")
 
+    @pytest.mark.timeout(600)
     @skipIfRefEager("linear examples assert against their own reference")
     @skipIfNotCUDA()
     def test_linear_mamba2_ssd(self):
         self._run_linear_example("example_mamba2_ssd")
 
+    @pytest.mark.timeout(600)
     @skipIfRefEager("linear examples assert against their own reference")
     @skipIfNotCUDA()
     def test_linear_delta_rule(self):
         self._run_linear_example("example_delta_rule")
 
+    @pytest.mark.timeout(600)
     @skipIfRefEager("linear examples assert against their own reference")
     @skipIfNotCUDA()
     def test_linear_gated_delta_rule(self):
         self._run_linear_example("example_gated_delta_rule")
 
+    @pytest.mark.timeout(600)
     @skipIfRefEager("linear examples assert against their own reference")
     @skipIfNotCUDA()
     def test_linear_kda(self):
@@ -2916,13 +2925,13 @@ class TestExamples(RefEagerTestBase, TestCase):
 
     def test_linear_monkeypatch_gla(self):
         """Monkey-patch FLA's GatedLinearAttention to use our engine, verify fwd+bwd."""
+        from examples.linear.linear_attention_engine import LinearAttentionVariant
+
         try:
-            import fla  # noqa: F401
+            import fla.layers.gla as _fla_gla_mod
+            from fla.layers.gla import GatedLinearAttention
         except ImportError:
             self.skipTest("fla not installed")
-        from examples.linear.linear_attention_engine import LinearAttentionVariant
-        import fla.layers.gla as _fla_gla_mod
-        from fla.layers.gla import GatedLinearAttention
 
         self._run_monkeypatch(
             LinearAttentionVariant.FULL_GLA,
@@ -2943,13 +2952,13 @@ class TestExamples(RefEagerTestBase, TestCase):
 
     def test_linear_monkeypatch_delta_rule(self):
         """Monkey-patch FLA's DeltaNet to use our engine, verify fwd+bwd."""
+        from examples.linear.linear_attention_engine import LinearAttentionVariant
+
         try:
-            import fla  # noqa: F401
+            import fla.layers.delta_net as _fla_dn_mod
+            from fla.layers.delta_net import DeltaNet
         except ImportError:
             self.skipTest("fla not installed")
-        from examples.linear.linear_attention_engine import LinearAttentionVariant
-        import fla.layers.delta_net as _fla_dn_mod
-        from fla.layers.delta_net import DeltaNet
 
         # FLA's DeltaNet has no decay; our delta twin needs an explicit zero g.
         def preprocess(q, g, beta, kw):
@@ -2976,13 +2985,13 @@ class TestExamples(RefEagerTestBase, TestCase):
 
     def test_linear_monkeypatch_gated_delta_rule(self):
         """Monkey-patch FLA's GatedDeltaNet to use our engine, verify fwd+bwd."""
+        from examples.linear.linear_attention_engine import LinearAttentionVariant
+
         try:
-            import fla  # noqa: F401
+            import fla.layers.gated_deltanet as _fla_gdn_mod
+            from fla.layers.gated_deltanet import GatedDeltaNet
         except ImportError:
             self.skipTest("fla not installed")
-        from examples.linear.linear_attention_engine import LinearAttentionVariant
-        import fla.layers.gated_deltanet as _fla_gdn_mod
-        from fla.layers.gated_deltanet import GatedDeltaNet
 
         # FLA folds the gate/beta activations into its kernel (use_gate_in_kernel /
         # use_beta_sigmoid_in_kernel); our engine wants a per-timestep log-decay and
@@ -3021,13 +3030,13 @@ class TestExamples(RefEagerTestBase, TestCase):
 
     def test_linear_monkeypatch_simple_gla(self):
         """Monkey-patch FLA's SimpleGatedLinearAttention to use our engine."""
+        from examples.linear.linear_attention_engine import LinearAttentionVariant
+
         try:
-            import fla  # noqa: F401
+            import fla.layers.simple_gla as _fla_sgla_mod
+            from fla.layers.simple_gla import SimpleGatedLinearAttention
         except ImportError:
             self.skipTest("fla not installed")
-        from examples.linear.linear_attention_engine import LinearAttentionVariant
-        import fla.layers.simple_gla as _fla_sgla_mod
-        from fla.layers.simple_gla import SimpleGatedLinearAttention
 
         self._run_monkeypatch(
             LinearAttentionVariant.SIMPLE_GLA,

@@ -189,7 +189,7 @@ jobs:
         if: (matrix.alias == 'h100' || matrix.alias == 'b200') && matrix.backend == 'triton'
         run: |
           source .venv/bin/activate
-          uv pip install einops
+          uv pip install einops transformers
           uv pip install "git+https://github.com/fla-org/flash-linear-attention@6bd90692588c81fe102ee6e12ac70686359658a2" --no-deps
           python -c "import fla; print('fla', fla.__name__)"
 
