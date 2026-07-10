@@ -11,13 +11,13 @@ the second key build.
 
 Hot path (see ``Kernel.__call__``): :meth:`Kernel._fused_dispatch_key` maps the
 call straight to a cached closure, which -- in one Python frame -- verifies the
-kernel's captured globals, builds the ``CompiledKernel.run`` argument list, and
-launches.  That key is ``_fast_dispatch_key`` (exact per-argument metadata,
-scalar values, and the user ``key=`` function) plus a 16-byte pointer-alignment
-bit per tensor.  It is built per call by the same type-dispatched code the normal
-dispatch uses -- *not* an expression baked to the primed argument layout -- so a
-call whose layout differs (e.g. a tensor where the prime saw ``None``) yields a
-different key and re-primes, never a false hit.
+kernel's captured globals, allocates any outputs, builds the ``CompiledKernel.run``
+argument list, and launches.  That key is ``_fast_dispatch_key`` (exact
+per-argument metadata, scalar values, and the user ``key=`` function) plus a
+16-byte pointer-alignment bit per tensor.  It is built per call by the same
+type-dispatched code the normal dispatch uses -- *not* an expression baked to the
+primed argument layout -- so a call whose layout differs (e.g. a tensor where the
+prime saw ``None``) yields a different key and re-primes, never a false hit.
 
 Correctness.  The fused path bypasses ``default_launcher``'s direct-launch key,
 which is where the two *uncatchable* launch hazards are normally guarded -- a
@@ -36,14 +36,25 @@ launch-arg tensor can be replaced by any input tensor sharing its ``data_ptr``
 -- which is why a zero-storage-offset view (e.g. ``x.view(...)``) is served by
 its base input.
 
+Output-allocating kernels are supported: the generated wrapper is codegen'd over
+fake tensors, so every host-side allocation is a pure function of input metadata
+and scalar values (never of tensor data), all of which are in the fused key.
+The recipe records each allocated tensor's ``(shape, stride, dtype, device)``
+and rebuilds it with ``torch.empty_strided`` on replay; the caching allocator
+always returns >=16-byte-aligned storage, matching the alignment the binary was
+specialized for.  The wrapper's return value (``None``, a tensor, or a
+tuple/list of tensors and simple constants) is reproduced from inputs,
+allocations, and baked constants.
+
 Fusion is disabled (permanently, per kernel) whenever the recipe cannot be
 reproduced this way: a host wrapper that does side-effecting work beyond
-launch + return (checked once by inspecting the wrapper source -- see
-:func:`_wrapper_body_is_fuseable`), a non-``None`` wrapper return (covers kernels
-that allocate their output), multiple device launches, a launch arg that is
-neither a plain tensor nor an ``int``/``float``/``bool``/``None`` constant, a
-tensor arg with no matching input pointer, cooperative-grid launches, extra
-launcher kwargs, or any active launch hook/knob.
+allocate + launch + return (checked once by inspecting the wrapper source --
+see :func:`_wrapper_body_is_fuseable`), multiple device launches, a
+launch/return tensor with a nonzero storage offset or a view layout over storage
+it shares with another (unreconstructable blind), a launch arg that is neither a
+plain tensor nor an ``int``/``float``/``bool``/``None`` constant, a return value
+outside the supported shapes, cooperative-grid launches, extra launcher kwargs,
+or any active launch hook/knob.
 """
 
 from __future__ import annotations
@@ -161,16 +172,16 @@ def build_fused_key_fn(
 
 
 def _wrapper_body_is_fuseable(bound: BoundKernel) -> bool:
-    """True iff the generated host wrapper is a plain launch + return.
+    """True iff the generated host wrapper is a plain allocate + launch + return.
 
-    The fused recipe reproduces only the launcher call and the return value.  A
-    wrapper that also runs host-side statements with observable effects -- a bare
-    tensor-method call like ``out.zero_()``, an augmented assignment, a loop, a
-    conditional -- would have those effects silently dropped on replay (e.g. a
-    pre-launch ``zero_`` leaving stale data in a region the device loop does not
-    cover).  Such wrappers only emit a ``TensorOperationInWrapper`` warning, which
-    a kernel may suppress, so they cannot be told apart at runtime by behavior;
-    inspect the wrapper source.
+    The fused recipe reproduces only the launcher call, the output allocations,
+    and the return value.  A wrapper that also runs host-side statements with
+    observable effects -- a bare tensor-method call like ``out.zero_()``, an
+    augmented assignment, a loop, a conditional -- would have those effects
+    silently dropped on replay (e.g. a pre-launch ``zero_`` leaving stale data
+    in a region the device loop does not cover).  Such wrappers only emit a
+    ``TensorOperationInWrapper`` warning, which a kernel may suppress, so they
+    cannot be told apart at runtime by behavior; inspect the wrapper source.
 
     Allowed statements: ``assert`` (specialization guards), plain ``x = ...``
     and tuple-unpacking assignments (constexpr block sizes, shape unpacking,
@@ -226,7 +237,7 @@ def fused_prime(kernel: Kernel, bound: BoundKernel, args: tuple[object, ...]) ->
     from . import default_launcher
 
     # One-time source inspection: reject wrappers that do host-side work beyond
-    # launch + return (their side effects would be dropped on replay).
+    # allocate + launch + return (their side effects would be dropped on replay).
     if kernel._fused_wrapper_ok is None:
         kernel._fused_wrapper_ok = _wrapper_body_is_fuseable(bound)
     if not kernel._fused_wrapper_ok:
@@ -269,12 +280,9 @@ def fused_prime(kernel: Kernel, bound: BoundKernel, args: tuple[object, ...]) ->
     # pyrefly: ignore [not-callable]
     result = bound._run(*args, _launcher=recorder)
 
-    # Only single-launch, out-arg / in-place kernels are fuseable.  A non-None
-    # return means the wrapper produced a value we cannot reproduce without
-    # re-running it (typically an allocated output tensor).
+    # Fuseable kernels issue exactly one plain device launch.
     if (
-        result is not None
-        or captured["n"] != 1
+        captured["n"] != 1
         or captured["kwargs"]
         or captured["ptx_options"] is not None
         or captured["lcg"]
@@ -295,22 +303,72 @@ def fused_prime(kernel: Kernel, bound: BoundKernel, args: tuple[object, ...]) ->
             # pyrefly: ignore [missing-attribute]
             ptr_to_idx.setdefault(a.data_ptr(), i)
 
-    # Resolve each launcher arg to an input-tensor index or a baked constant.
-    arg_parts: list[str] = []
     namespace: dict[str, object] = {}
+
+    # Tensors the wrapper allocated on the host (outputs / scratch): every one
+    # is a pure function of input metadata + scalars (the wrapper is codegen'd
+    # over fake tensors, so an allocation never depends on tensor data), and all
+    # of those are in the fused key.  Record each distinct one's storage layout
+    # and rebuild it with ``empty_strided`` in the closure; the caching
+    # allocator always returns >=16B-aligned storage, matching the alignment the
+    # binary was specialized for.  ``alloc`` returns the source expression for a
+    # tensor (an input ``a[i]`` or an allocation ``_o{k}``) or None if it cannot
+    # be reproduced -- a nonzero storage offset, or the same storage reused with
+    # a different layout (a view we cannot reconstruct blind).
+    alloc_slots: dict[int, tuple[int, tuple[int, ...], tuple[int, ...]]] = {}
+
+    def alloc(t: torch.Tensor, *, launch_arg: bool) -> str | None:
+        dp = t.data_ptr()
+        i = ptr_to_idx.get(dp)
+        if i is not None:
+            # The C launcher reads only a pointer from a tensor arg, so any input
+            # sharing this storage works as a launch arg; a returned value must
+            # match the input exactly (else it is a view we would return wrong).
+            if launch_arg:
+                return f"a[{i}]"
+            src_t = cast("torch.Tensor", args[i])
+            same = (
+                t.shape == src_t.shape
+                and t.stride() == src_t.stride()
+                and t.storage_offset() == src_t.storage_offset()
+                and t.dtype == src_t.dtype
+            )
+            return f"a[{i}]" if same else None
+        slot = alloc_slots.get(dp)
+        if slot is None:
+            if t.storage_offset() != 0:
+                return None
+            k = len(alloc_slots)
+            alloc_slots[dp] = (k, tuple(t.shape), t.stride())
+            namespace[f"_shape{k}"] = tuple(t.shape)
+            namespace[f"_stride{k}"] = t.stride()
+            namespace[f"_dt{k}"] = t.dtype
+            namespace[f"_dev{k}"] = t.device
+            return f"_o{k}"
+        k, shape, stride = slot
+        if tuple(t.shape) != shape or t.stride() != stride or t.storage_offset():
+            return None  # same storage, different layout -> unreconstructable view
+        return f"_o{k}"
+
+    # Resolve each launcher arg to an input, an allocation, or a baked constant.
+    arg_parts: list[str] = []
     for j, a in enumerate(captured["largs"]):
         ta = type(a)
         if ta is torch.Tensor or ta is torch.nn.Parameter:
-            # pyrefly: ignore [missing-attribute]
-            i = ptr_to_idx.get(a.data_ptr())
-            if i is None:
+            expr = alloc(cast("torch.Tensor", a), launch_arg=True)
+            if expr is None:
                 return _disable(kernel, result)
-            arg_parts.append(f"a[{i}]")
+            arg_parts.append(expr)
         elif ta is int or ta is float or ta is bool or a is None:
             namespace[f"_c{j}"] = a
             arg_parts.append(f"_c{j}")
         else:
             return _disable(kernel, result)
+
+    # Reproduce the wrapper's return value from inputs / allocations / constants.
+    ret_expr = _return_expr(result, alloc, namespace)
+    if ret_expr is None:
+        return _disable(kernel, result)
 
     grid = captured["grid"]
     grid_size = len(grid)
@@ -324,6 +382,7 @@ def fused_prime(kernel: Kernel, bound: BoundKernel, args: tuple[object, ...]) ->
     # pyrefly: ignore [missing-attribute]
     namespace["_active"] = _triton_driver().active
     namespace["_Changed"] = GlobalsChanged
+    namespace["_empty_strided"] = torch.empty_strided
 
     # Inline captured-globals verification: a mutated OR deleted global compares
     # unequal (deletion reads the _MISSING sentinel via .get), raising
@@ -342,17 +401,24 @@ def fused_prime(kernel: Kernel, bound: BoundKernel, args: tuple[object, ...]) ->
     if guard_conds:
         guard = f"    if {' or '.join(guard_conds)}: raise _Changed\n"
 
+    allocs = "".join(
+        f"    _o{k} = _empty_strided(_shape{k}, _stride{k}, "
+        f"dtype=_dt{k}, device=_dev{k})\n"
+        for k in range(len(alloc_slots))
+    )
     launch_args = ", ".join(arg_parts)
     src = (
         "def _launch(a):\n"
         f"{guard}"
+        f"{allocs}"
         "    _run(_gx, _gy, _gz, "
         "_active.get_current_stream(_active.get_current_device()), "
         "_fn, _pm, None, None, None"
         f"{', ' + launch_args if launch_args else ''})\n"
+        f"    return {ret_expr}\n"
     )
     exec(src, namespace)
-    launch = cast("Callable[[tuple[object, ...]], None]", namespace["_launch"])
+    launch = cast("Callable[[tuple[object, ...]], object]", namespace["_launch"])
 
     # Key on the same per-call, type-dispatched key the hot path uses.  It is
     # strictly finer than the specialization key (includes exact metadata,
@@ -363,3 +429,39 @@ def fused_prime(kernel: Kernel, bound: BoundKernel, args: tuple[object, ...]) ->
     if fused_key is not None:
         kernel._fused_recipes[fused_key] = launch
     return result
+
+
+def _return_expr(
+    result: object,
+    alloc: Callable[..., str | None],
+    namespace: dict[str, object],
+) -> str | None:
+    """Source expression that reproduces the wrapper's return value, or None if
+    it cannot be reproduced (a returned view, or an unsupported container).
+
+    Supports ``None``, a single tensor, and a ``tuple``/``list`` of tensors and
+    simple constants -- the return shapes Helion host wrappers actually emit.
+    """
+    if result is None:
+        return "None"
+    tr = type(result)
+    if tr is torch.Tensor or tr is torch.nn.Parameter:
+        return alloc(cast("torch.Tensor", result), launch_arg=False)
+    if tr is tuple or tr is list:
+        parts: list[str] = []
+        for n, elem in enumerate(cast("tuple[object, ...]", result)):
+            elem_ty = type(elem)
+            if elem_ty is torch.Tensor or elem_ty is torch.nn.Parameter:
+                expr = alloc(cast("torch.Tensor", elem), launch_arg=False)
+                if expr is None:
+                    return None
+                parts.append(expr)
+            elif elem_ty is int or elem_ty is float or elem_ty is bool or elem is None:
+                namespace[f"_r{n}"] = elem
+                parts.append(f"_r{n}")
+            else:
+                return None
+        if tr is list:
+            return f"[{', '.join(parts)}]"
+        return f"({', '.join(parts)},)" if len(parts) == 1 else f"({', '.join(parts)})"
+    return None

@@ -255,12 +255,12 @@ class Kernel(Generic[_R]):
         # the fused dispatch key, a flat eval-compiled builder for that key
         # (lazily built for the seen argument layout), and a latch that
         # permanently disables fusion for a non-fuseable kernel.
-        self._fused_recipes: dict[Hashable, Callable[[tuple[object, ...]], None]] = {}
+        self._fused_recipes: dict[Hashable, Callable[[tuple[object, ...]], object]] = {}
         self._fused_key_fn: Callable[[tuple[object, ...]], Hashable] | None = None
         self._fused_disabled: bool = False
-        # Whether this kernel's generated host wrapper is a plain launch (fuseable)
-        # vs. one that does host-side tensor work the recipe can't reproduce; None
-        # until checked once on the first prime.
+        # Whether this kernel's generated host wrapper is a plain allocate+launch
+        # (fuseable) vs. one that does host-side tensor work the recipe can't
+        # reproduce; None until checked once on the first prime.
         self._fused_wrapper_ok: bool | None = None
 
     @functools.cache  # noqa: B019
