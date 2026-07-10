@@ -318,9 +318,7 @@ def _prep_perm_from_node(prep: torch.fx.Node, load_ndim: int) -> tuple[int, ...]
         return None
     if len(perm) != load_ndim or sorted(perm) != list(range(load_ndim)):
         return None
-    if load_ndim < 3:
-        return None
-    if tuple(perm[: load_ndim - 2]) == tuple(range(load_ndim - 2)):
+    if perm.index(0) == 0:
         return None
     return perm
 

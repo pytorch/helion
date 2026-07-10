@@ -501,6 +501,23 @@ def _four_dim_major_permute_ordered_kernel(q, k, q_offsets):
     return out
 
 
+@helion.kernel(backend="pallas", static_shapes=True)
+def _four_dim_non_ordered_permute_kernel(q, k, q_offsets):
+    out = torch.empty_like(q)
+    for seq_idx in hl.grid(q_offsets.size(0) - 1):
+        start = q_offsets[seq_idx]
+        end = q_offsets[seq_idx + 1]
+        for tile_q in hl.tile(start, end):
+            acc = q[tile_q, :, :, :].to(torch.float32)
+            for tile_kv in hl.tile(start, end):
+                prep = k[tile_kv, :, :, :].permute(0, 2, 1, 3)
+                acc = acc + prep.permute(0, 2, 1, 3).sum(
+                    dim=0, keepdim=True
+                ).to(torch.float32)
+            out[tile_q, :, :, :] = acc.to(out.dtype)
+    return out
+
+
 def _offsets(lengths):
     lengths = torch.tensor(lengths, dtype=torch.int32)
     return torch.cat(
@@ -1652,6 +1669,15 @@ class TestOwnerResidencyAndPrepHoist(unittest.TestCase):
         hoists = self._prep_hoists_for(
             _minor_transpose_ordered_kernel,
             (torch.randn(lq, 4, 128), torch.randn(lq, 4, 128), qo),
+        )
+        self.assertEqual(hoists, ())
+
+    def test_descriptor_scan_rejects_permute_when_ordered_dim_stays_leading(self):
+        qo = _offsets([12, 20, 5, 30])
+        lq = int(qo[-1])
+        hoists = self._prep_hoists_for(
+            _four_dim_non_ordered_permute_kernel,
+            (torch.randn(lq, 2, 3, 5), torch.randn(lq, 2, 3, 5), qo),
         )
         self.assertEqual(hoists, ())
 
