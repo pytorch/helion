@@ -1465,10 +1465,11 @@ class TestFusedLauncher(TestCase):
         torch.testing.assert_close(out, x + y)
 
     @skipIfRefEager("Inspects the kernel's fused-launch cache, absent in ref eager")
-    def test_fused_disabled_for_tensor_returning_kernel(self) -> None:
-        # A kernel that allocates and returns its output cannot be fused (its
-        # wrapper produces a value the fused path can't reproduce); it must
-        # latch off and still compute correctly.
+    def test_fused_engages_for_output_allocating_kernel(self) -> None:
+        # A kernel that allocates and returns its output fuses too: the recipe
+        # rebuilds the allocation with empty_strided (a pure function of input
+        # metadata) and returns it.  Correctness must hold across repeat calls
+        # (each gets a fresh, independent output tensor).
         @helion.kernel(
             static_shapes=True,
             config=helion.Config(block_sizes=[1024], num_warps=4, num_stages=2),
@@ -1480,11 +1481,75 @@ class TestFusedLauncher(TestCase):
             return out
 
         x = torch.randn(1024, device=DEVICE, dtype=torch.float32)
-        for _ in range(3):
-            torch.testing.assert_close(add(x, x), x + x)
+        y = torch.randn(1024, device=DEVICE, dtype=torch.float32)
+        add(x, y)
         torch.accelerator.synchronize()
-        self.assertTrue(add._fused_disabled)  # type: ignore[attr-defined]
-        self.assertEqual(len(add._fused_recipes), 0)  # type: ignore[attr-defined]
+        if add._fused_disabled:  # type: ignore[attr-defined]
+            self.skipTest("Fused launch disabled (setting/env or hooks active)")
+
+        # Second call primes the fused recipe; subsequent calls use it.  Each
+        # returns a distinct tensor with the correct values.
+        first = None
+        for _ in range(4):
+            out = add(x, y)
+            torch.accelerator.synchronize()
+            torch.testing.assert_close(out, x + y)
+            if first is None:
+                first = out
+            else:
+                # Fresh allocation each call, not an aliased reuse.
+                self.assertNotEqual(out.data_ptr(), first.data_ptr())
+        self.assertEqual(len(add._fused_recipes), 1)  # type: ignore[attr-defined]
+
+    @skipIfRefEager("Inspects the kernel's fused-launch cache, absent in ref eager")
+    def test_fused_tuple_return(self) -> None:
+        # A kernel returning a tuple of allocated tensors fuses: each element is
+        # rebuilt and the tuple structure reproduced.
+        @helion.kernel(
+            static_shapes=True,
+            config=helion.Config(block_sizes=[256], num_warps=4, num_stages=2),
+        )
+        def add_and_double(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+            a = torch.empty_like(x)
+            b = torch.empty_like(x)
+            for i in hl.tile(x.size(0)):
+                a[i] = x[i] + 1
+                b[i] = x[i] * 2
+            return a, b
+
+        x = torch.randn(256, device=DEVICE, dtype=torch.float32)
+        add_and_double(x)
+        torch.accelerator.synchronize()
+        if add_and_double._fused_disabled:  # type: ignore[attr-defined]
+            self.skipTest("Fused launch disabled")
+        for _ in range(3):
+            a, b = add_and_double(x)
+            torch.accelerator.synchronize()
+            torch.testing.assert_close(a, x + 1)
+            torch.testing.assert_close(b, x * 2)
+        self.assertEqual(len(add_and_double._fused_recipes), 1)  # type: ignore[attr-defined]
+
+    @skipIfRefEager("Inspects the kernel's fused-launch cache, absent in ref eager")
+    def test_fused_disabled_for_returned_view(self) -> None:
+        # A kernel that returns a view of an allocation (a reshape sharing
+        # storage with a different layout) cannot be reconstructed blind, so
+        # fusion must disable and the kernel must stay correct.
+        @helion.kernel(
+            static_shapes=True,
+            config=helion.Config(block_sizes=[64], num_warps=4, num_stages=2),
+        )
+        def add_reshape(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for i in hl.tile(x.size(0)):
+                out[i] = x[i] + 1
+            return out.view(-1, 4)
+
+        x = torch.randn(256, device=DEVICE, dtype=torch.float32)
+        for _ in range(3):
+            torch.testing.assert_close(add_reshape(x), (x + 1).view(-1, 4))
+        torch.accelerator.synchronize()
+        self.assertTrue(add_reshape._fused_disabled)  # type: ignore[attr-defined]
+        self.assertEqual(len(add_reshape._fused_recipes), 0)  # type: ignore[attr-defined]
 
     def test_fused_unaligned_input_produces_correct_output(self) -> None:
         # An unaligned input arriving after an aligned prime must stay correct:
