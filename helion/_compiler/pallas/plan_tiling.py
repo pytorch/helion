@@ -107,10 +107,15 @@ def plan_tiling(
 
 
 def _analyze_indexing_expressions(graph_info: GraphInfo, config: Config) -> None:
+    from ...language import distributed_ops
     from ...language import memory_ops
     from ...language.atomic_ops import ATOMIC_OPS
 
-    indexing_targets = ATOMIC_OPS | {memory_ops.load, memory_ops.store}
+    indexing_targets = ATOMIC_OPS | {
+        memory_ops.load,
+        memory_ops.store,
+        distributed_ops.start_async_remote_copy,
+    }
     for node in graph_info.graph.nodes:
         if node.op != "call_function":
             continue
@@ -400,6 +405,7 @@ def _resolve_tensor_index_patterns(
     if not positions:
         return
 
+    from ...language import distributed_ops
     from ...language import memory_ops
 
     if node.target is memory_ops.load:
@@ -416,6 +422,13 @@ def _resolve_tensor_index_patterns(
         plan = build_scatter_plan(tensor, subscript, positions)
         for i in positions:
             patterns[i] = IndirectScatterPattern(plan=plan)
+        return
+
+    if node.target is distributed_ops.start_async_remote_copy:
+        # For remote copy we don't need a gather/scatter plan: the
+        # Pallas ``Ref.at[<scalar>]`` API accepts a runtime tensor
+        # scalar directly.  Leave the patterns alone; the codegen
+        # emits the index expression itself.
         return
 
     op_name = getattr(node.target, "__name__", str(node.target))

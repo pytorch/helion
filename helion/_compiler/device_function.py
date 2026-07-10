@@ -1107,6 +1107,7 @@ class DeviceFunction:
 
     def get_tensor_read_write_names(self) -> tuple[set[str], set[str]]:
         """Returns AST names of read and written tensors"""
+        from helion.language import distributed_ops
         from helion.language import memory_ops
         from helion.language import tile_index
         from helion.language.atomic_ops import ATOMIC_OPS
@@ -1143,6 +1144,15 @@ class DeviceFunction:
                     if name is not None:
                         write_names.add(name)
                 elif node.target in ATOMIC_OPS:
+                    name = _get_tensor_name(node)
+                    if name is not None:
+                        read_names.add(name)
+                        write_names.add(name)
+                elif node.target is distributed_ops.start_async_remote_copy:
+                    # start_async_remote_copy(tensor, index, device_id):
+                    # reads the local slot as the DMA source AND writes
+                    # the peer's copy of the same slot.  Locally the
+                    # tensor is both read and written.
                     name = _get_tensor_name(node)
                     if name is not None:
                         read_names.add(name)
@@ -1249,12 +1259,15 @@ class HelionPallasPrinter(HelionTritonPrinter):
     def _print_FloorDiv(self, expr: sympy.Expr) -> str:
         lhs, rhs = expr.args
         # pyrefly: ignore [missing-attribute]
-        return f"({self._print(lhs)} // {self._print(rhs)})"
+        return f"(({self._print(lhs)}) // ({self._print(rhs)}))"
 
     def _print_PythonMod(self, expr: sympy.Expr) -> str:
         lhs, rhs = expr.args
+        # Paren both operands to override Python precedence — ``%`` binds
+        # tighter than ``+``/``-`` so ``(a + b) % c`` would otherwise
+        # print as ``a + b % c``.
         # pyrefly: ignore [missing-attribute]
-        return f"({self._print(lhs)} % {self._print(rhs)})"
+        return f"(({self._print(lhs)}) % ({self._print(rhs)}))"
 
 
 def pallas_texpr(expr: sympy.Expr) -> str:
