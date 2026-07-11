@@ -1,7 +1,11 @@
 from __future__ import annotations
 
 import base64
+from collections import OrderedDict
+from contextlib import contextmanager
 from contextlib import suppress
+import contextvars
+from dataclasses import dataclass
 import hashlib
 import importlib
 import inspect
@@ -10,8 +14,11 @@ import linecache
 import logging
 import os
 import sys
+from typing import TYPE_CHECKING
 from typing import Any
+from typing import Literal
 from typing import cast
+import weakref
 
 import torch
 
@@ -20,6 +27,12 @@ from .. import exc
 from .._compiler.cute.strategies import tcgen05_default_epilogue_tile_expr
 from .._compiler.cute.strategies import tcgen05_explicit_d_store_tile_expr
 from .._compiler.cute.strategies import tcgen05_smem_layout_expr
+from .._compiler.cute.tcgen05_constants import (
+    TCGEN05_GROUPED_STATIC_RESERVED_SMS_CONFIG_KEY,
+)
+from .._compiler.cute.tcgen05_constants import TCGEN05_GROUPED_WORKLIST_MMA_M_TILE
+from .._compiler.cute.tcgen05_constants import TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE
+from .._compiler.cute.tcgen05_constants import TCGEN05_GROUPED_WORKLIST_STORE_SHAPE
 from .config import Config as Config
 from .kernel import Kernel as Kernel
 from .kernel import OutputCodeOptions as OutputCodeOptions
@@ -30,6 +43,11 @@ from .triton.launcher import default_launcher as _triton_default_launcher
 from .triton.launcher import get_num_sm as _triton_get_num_sm
 from .triton.launcher import get_num_xcd as get_num_xcd
 from .triton.launcher import set_triton_allocator as set_triton_allocator
+
+if TYPE_CHECKING:
+    from collections.abc import Iterator
+
+    from torch.cuda import _POOL_HANDLE
 
 log: logging.Logger = logging.getLogger(__name__)
 
@@ -225,6 +243,21 @@ def _cute_kernel_param_is_constexpr(cute_kernel: object) -> tuple[bool, ...]:
     return flags
 
 
+def _tcgen05_grouped_dynamic_ab_tensormap_rank(plan: dict[str, object]) -> int:
+    rank = plan.get("dynamic_ab_tensormap_rank", 3)
+    if (
+        not isinstance(rank, int)
+        or rank not in (2, 3)
+        or (rank == 2 and not bool(plan.get("dynamic_ab_tensormaps")))
+    ):
+        raise exc.BackendUnsupported(
+            "cute",
+            "tcgen05 grouped dynamic A/B TensorMap rank must be 2 or 3, "
+            "and rank 2 requires dynamic A/B TensorMaps",
+        )
+    return rank
+
+
 def _append_cute_wrapper_plan(
     body: list[str],
     call_args: list[str],
@@ -278,8 +311,17 @@ def _append_cute_wrapper_plan(
         d_store_box_n: int | None = None,
         epi_tile_raw_expr: str | None = None,
         tensor_name: str | None = None,
+        rank3_mnl_tensor: bool = False,
+        orientation: str = "mn",
     ) -> None:
         assert len(kernel_args) == 2
+        assert orientation in ("mn", "nm")
+        worklist_nm_store = orientation == "nm"
+        d_store_layout = (
+            "cutlass.utils.layout.LayoutEnum.COL_MAJOR"
+            if worklist_nm_store
+            else "cutlass.utils.layout.LayoutEnum.ROW_MAJOR"
+        )
         tensor_expr = tensor_name if tensor_name is not None else f"arg{tensor_idx}"
         explicit_epi_tile = any(
             value is not None for value in (epi_tile_m, epi_tile_n, d_store_box_n)
@@ -305,12 +347,34 @@ def _append_cute_wrapper_plan(
                 bm,
                 bn,
                 dtype,
-                c_layout="cutlass.utils.layout.LayoutEnum.ROW_MAJOR",
+                c_layout=d_store_layout,
             )
         tma_atom, tma_tensor = kernel_args
         epi_tile = f"{tma_atom}_epi_tile"
         smem_layout = f"{tma_atom}_smem_layout"
         cta_v_layout = f"{tma_atom}_cta_v_layout"
+        gmem_tensor = (
+            f"{tma_atom}_d_nm"
+            if worklist_nm_store and rank3_mnl_tensor
+            else f"{tma_atom}_gmem_mnl"
+            if rank3_mnl_tensor
+            else tensor_expr
+        )
+        cta_tiler_expr = (
+            epi_tile
+            if rank3_mnl_tensor
+            else f"cute.composition(cute.make_identity_layout({gmem_tensor}.shape), {epi_tile})"
+        )
+        rank3_gmem_shape = (
+            f"(arg{tensor_idx}_shape1, arg{tensor_idx}_shape0, 1)"
+            if worklist_nm_store
+            else f"(arg{tensor_idx}_shape0, arg{tensor_idx}_shape1, 1)"
+        )
+        rank3_gmem_stride = (
+            f"(arg{tensor_idx}_stride1, arg{tensor_idx}_stride0, 0)"
+            if worklist_nm_store
+            else f"(arg{tensor_idx}_stride0, arg{tensor_idx}_stride1, 0)"
+        )
         # Keep these layout arguments in sync with the device-side
         # ``make_smem_layout_epi`` calls; the wrapper's TMA atom and the kernel's
         # SMEM staging must slice the same epilogue tile shape.
@@ -320,18 +384,28 @@ def _append_cute_wrapper_plan(
                 (
                     f"    {smem_layout} = cutlass.utils.blackwell_helpers."
                     "make_smem_layout_epi("
-                    f"{dtype}, cutlass.utils.layout.LayoutEnum.ROW_MAJOR, "
+                    f"{dtype}, {d_store_layout}, "
                     f"{epi_tile}, {stage_count})"
                 ),
-                (
-                    f"    {cta_v_layout} = cute.composition("
-                    f"cute.make_identity_layout({tensor_expr}.shape), {epi_tile})"
+                *(
+                    (
+                        (
+                            f"    {gmem_tensor} = cute.make_tensor("
+                            f"arg{tensor_idx}.iterator, "
+                            "layout=cute.make_layout("
+                            f"{rank3_gmem_shape}, stride={rank3_gmem_stride}))"
+                        ),
+                        f"    {gmem_tensor}.mark_layout_dynamic(leading_dim=1)",
+                    )
+                    if rank3_mnl_tensor
+                    else ()
                 ),
+                (f"    {cta_v_layout} = {cta_tiler_expr}"),
                 (
                     f"    {tma_atom}, {tma_tensor} = "
                     "cute.nvgpu.cpasync.make_tiled_tma_atom("
                     f"{copy_op}, "
-                    f"{tensor_expr}, cute.slice_({smem_layout}, (None, None, 0)), "
+                    f"{gmem_tensor}, cute.slice_({smem_layout}, (None, None, 0)), "
                     f"{cta_v_layout})"
                 ),
             )
@@ -621,6 +695,8 @@ def _append_cute_wrapper_plan(
             d_store_box_n=plan_optional_int("d_store_box_n"),
             epi_tile_raw_expr=plan_optional_str("epi_tile_raw_expr"),
             tensor_name=d_tensor_name,
+            rank3_mnl_tensor=bool(plan.get("rank3_mnl_tensor")),
+            orientation=_tcgen05_plan_orientation(plan),
         )
         return
     if kind == "tcgen05_aux_tma":
@@ -640,13 +716,42 @@ def _append_cute_wrapper_plan(
             copy_op="cute.nvgpu.cpasync.CopyBulkTensorTileG2SOp()",
         )
         return
+    if kind == "tcgen05_grouped_static_persistent":
+        assert num_sm is not None and num_sm > 0
+        sched_params_arg = str(plan["sched_params_arg"])
+        total_clusters_arg = str(plan["total_clusters_arg"])
+        cluster_m = plan_int("cluster_m", 1)
+        cluster_n = plan_int("cluster_n", 1)
+        reserved_sms = plan_int(TCGEN05_GROUPED_STATIC_RESERVED_SMS_CONFIG_KEY, 0)
+        max_active_clusters = _tcgen05_grouped_static_active_clusters(
+            num_sm=num_sm,
+            cluster_m=max(1, cluster_m),
+            reserved_sms=reserved_sms,
+        )
+        body.extend(
+            (
+                (
+                    f"    {sched_params_arg} = cutlass.utils.PersistentTileSchedulerParams("
+                    f"({cluster_m}, {cluster_n}, {total_clusters_arg}), "
+                    f"({cluster_m}, {cluster_n}, 1))"
+                ),
+                (
+                    "    _tcgen05_grouped_grid = "
+                    "cutlass.utils.StaticPersistentGroupTileScheduler.get_grid_shape("
+                    f"{sched_params_arg}, cutlass.Int32({max_active_clusters}))"
+                ),
+                "    grid_x = _tcgen05_grouped_grid[0]",
+                "    grid_y = _tcgen05_grouped_grid[1]",
+                "    grid_z = _tcgen05_grouped_grid[2]",
+            )
+        )
+        call_args.append(sched_params_arg)
+        return
     if kind != "tcgen05_ab_tma":
         raise exc.BackendUnsupported("cute", f"wrapper plan kind: {kind}")
 
-    lhs_idx_key = "lhs_idx" if "lhs_idx" in plan else "lhsidx"
-    rhs_idx_key = "rhs_idx" if "rhs_idx" in plan else "rhsidx"
-    lhs_idx = plan_int(lhs_idx_key)
-    rhs_idx = plan_int(rhs_idx_key)
+    lhs_idx = plan_int("lhs_idx")
+    rhs_idx = plan_int("rhs_idx")
     bm = plan_int("bm")
     bn = plan_int("bn")
     bk = plan_int("bk")
@@ -673,6 +778,18 @@ def _append_cute_wrapper_plan(
     b_k_major = bool(plan.get("b_k_major"))
     lhs_leading_passthrough = bool(plan.get("lhs_leading_passthrough"))
     rhs_leading_passthrough = bool(plan.get("rhs_leading_passthrough"))
+    rhs_rank3_grouped_nt = bool(plan.get("rhs_rank3_grouped_nt"))
+    lhs_rank3_grouped_nt = bool(plan.get("lhs_rank3_grouped_nt"))
+    orientation = _tcgen05_plan_orientation(plan)
+    swapped_nm = orientation == "nm"
+    dynamic_ab_tensormaps = bool(plan.get("dynamic_ab_tensormaps"))
+    if swapped_nm and not dynamic_ab_tensormaps:
+        raise exc.BackendUnsupported(
+            "cute",
+            "tcgen05 N,M-oriented A/B TensorMaps without dynamic A/B "
+            "TensorMaps are unsupported",
+        )
+    dynamic_ab_tensormap_rank2 = _tcgen05_grouped_dynamic_ab_tensormap_rank(plan) == 2
     kernel_args = [str(arg) for arg in cast("list[object]", plan["kernel_args"])]
     assert len(kernel_args) == 4
     tma_atom_a, tma_tensor_a, tma_atom_b, tma_tensor_b = kernel_args
@@ -706,8 +823,107 @@ def _append_cute_wrapper_plan(
     smem_a_layout = f"{tma_atom_a}_smem_layout"
     smem_b_layout = f"{tma_atom_b}_smem_layout"
     lhs_tma = f"{tma_atom_a}_lhs_tma"
+    lhs_tma_arg = (
+        lhs_tma
+        if dynamic_ab_tensormaps or swapped_nm or lhs_leading_passthrough
+        else f"arg{lhs_idx}"
+    )
     rhs_tma = f"{tma_atom_b}_rhs_tma"
-    lhs_tma_operand = lhs_tma if lhs_leading_passthrough else f"arg{lhs_idx}"
+    if swapped_nm:
+        if not lhs_rank3_grouped_nt:
+            raise exc.BackendUnsupported(
+                "cute",
+                "tcgen05 N,M-oriented A/B TensorMaps require grouped rank-3 logical A",
+            )
+        if dynamic_ab_tensormap_rank2:
+            lhs_tma_layout = (
+                f"(arg{lhs_idx}_shape1, arg{lhs_idx}_shape2), "
+                f"stride=(arg{lhs_idx}_stride1, arg{lhs_idx}_stride2)"
+            )
+        else:
+            lhs_tma_layout = (
+                f"(arg{lhs_idx}_shape1, arg{lhs_idx}_shape2, "
+                f"arg{lhs_idx}_shape0), "
+                f"stride=(arg{lhs_idx}_stride1, arg{lhs_idx}_stride2, "
+                f"arg{lhs_idx}_stride0)"
+            )
+        if dynamic_ab_tensormap_rank2 or not dynamic_ab_tensormaps:
+            rhs_tma_layout = (
+                f"(arg{rhs_idx}_shape0, arg{rhs_idx}_shape1), "
+                f"stride=(arg{rhs_idx}_stride0, arg{rhs_idx}_stride1)"
+            )
+        else:
+            rhs_tma_layout = (
+                f"(arg{rhs_idx}_shape0, arg{rhs_idx}_shape1, 1), "
+                f"stride=(arg{rhs_idx}_stride0, arg{rhs_idx}_stride1, 0)"
+            )
+        lhs_tma_setup = (
+            (
+                f"    {lhs_tma} = cute.make_tensor("
+                f"arg{lhs_idx}.iterator, "
+                f"layout=cute.make_layout({lhs_tma_layout}))"
+            ),
+            f"    {lhs_tma}.mark_layout_dynamic(leading_dim=1)",
+        )
+        rhs_tma_setup = (
+            (
+                f"    {rhs_tma} = cute.make_tensor("
+                f"arg{rhs_idx}.iterator, "
+                f"layout=cute.make_layout({rhs_tma_layout}))"
+            ),
+            f"    {rhs_tma}.mark_layout_dynamic(leading_dim=1)",
+        )
+    else:
+        lhs_tma_setup = (
+            (
+                (
+                    f"    {lhs_tma} = cute.make_tensor("
+                    f"arg{lhs_idx}.iterator, "
+                    "layout=cute.make_layout("
+                    + (
+                        f"(arg{lhs_idx}_shape0, arg{lhs_idx}_shape1), "
+                        f"stride=(arg{lhs_idx}_stride0, arg{lhs_idx}_stride1)))"
+                        if dynamic_ab_tensormap_rank2
+                        else (
+                            f"(arg{lhs_idx}_shape0, arg{lhs_idx}_shape1, 1), "
+                            f"stride=(arg{lhs_idx}_stride0, "
+                            f"arg{lhs_idx}_stride1, 0)))"
+                        )
+                    )
+                ),
+                f"    {lhs_tma}.mark_layout_dynamic(leading_dim=1)",
+            )
+            if dynamic_ab_tensormaps
+            else ()
+        )
+        rhs_tma_setup = (
+            (
+                f"    {rhs_tma} = cute.make_tensor("
+                f"arg{rhs_idx}.iterator, "
+                "layout=cute.make_layout("
+                + (
+                    f"(arg{rhs_idx}_shape1, arg{rhs_idx}_shape2), "
+                    f"stride=(arg{rhs_idx}_stride1, arg{rhs_idx}_stride2)))"
+                    if dynamic_ab_tensormap_rank2
+                    else (
+                        f"(arg{rhs_idx}_shape1, arg{rhs_idx}_shape2, "
+                        f"arg{rhs_idx}_shape0), "
+                        f"stride=(arg{rhs_idx}_stride1, arg{rhs_idx}_stride2, "
+                        f"arg{rhs_idx}_stride0)))"
+                    )
+                )
+                if rhs_rank3_grouped_nt
+                else f"    {rhs_tma} = cute.make_tensor("
+                f"arg{rhs_idx}.iterator, "
+                "layout=cute.make_layout("
+                f"(arg{rhs_idx}_shape1, arg{rhs_idx}_shape0), "
+                f"stride=(arg{rhs_idx}_stride1, arg{rhs_idx}_stride0)))"
+            ),
+            (
+                f"    {rhs_tma}.mark_layout_dynamic(leading_dim="
+                f"{1 if dynamic_ab_tensormap_rank2 or rhs_rank3_grouped_nt else (1 if b_k_major else 0)})"
+            ),
+        )
     smem_a_layout_expr = tcgen05_smem_layout_expr(
         tiled_mma=tiled_mma,
         bm=bm,
@@ -733,48 +949,42 @@ def _append_cute_wrapper_plan(
         append_permuted_cute_tensor_view(lhs_tma, lhs_idx, (1, 2, 0))
     if rhs_leading_passthrough:
         append_permuted_cute_tensor_view(rhs_tma, rhs_idx, (2, 1, 0))
-    ab_tma_lines = [
+    lhs_tma_setup_lines = () if lhs_leading_passthrough else lhs_tma_setup
+    rhs_tma_setup_lines = (
+        (f"    {rhs_tma}.mark_layout_dynamic(leading_dim={1 if b_k_major else 0})",)
+        if rhs_leading_passthrough
+        else rhs_tma_setup
+    )
+    body.extend(
         (
-            f"    {tiled_mma} = cutlass.utils.blackwell_helpers.make_trivial_tiled_mma("
-            f"{input_dtype}, "
-            f"{input_dtype}, "
-            "cute.nvgpu.OperandMajorMode.K, "
-            + (
+            (
+                f"    {tiled_mma} = cutlass.utils.blackwell_helpers.make_trivial_tiled_mma("
+                f"{input_dtype}, "
+                f"{input_dtype}, "
                 "cute.nvgpu.OperandMajorMode.K, "
-                if b_k_major
-                else "cute.nvgpu.OperandMajorMode.MN, "
-            )
-            + f"{acc_dtype}, "
-            f"{cta_group}, "
-            f"({bm}, {bn}), "
-            "cute.nvgpu.tcgen05.OperandSource.SMEM)"
-        ),
-        (
-            f"    {cluster_layout_vmnk} = cute.tiled_divide("
-            f"cute.make_layout({cluster_shape}), ({tiled_mma}.thr_id.shape,))"
-        ),
-        f"    {smem_a_layout} = {smem_a_layout_expr}",
-        f"    {smem_b_layout} = {smem_b_layout_expr}",
-    ]
-    if not rhs_leading_passthrough:
-        ab_tma_lines.append(
-            f"    {rhs_tma} = cute.make_tensor("
-            f"arg{rhs_idx}.iterator, "
-            "layout=cute.make_layout("
-            f"(arg{rhs_idx}_shape1, arg{rhs_idx}_shape0), "
-            f"stride=(arg{rhs_idx}_stride1, arg{rhs_idx}_stride0)))"
-        )
-    ab_tma_lines.extend(
-        [
-            # B is viewed as (N, K). For row-major B (MN-major) the N axis
-            # (position 0) is contiguous; for column-major B (K-major, native
-            # fp8 layout) the K axis (position 1) is contiguous.
-            f"    {rhs_tma}.mark_layout_dynamic(leading_dim={1 if b_k_major else 0})",
+                + (
+                    "cute.nvgpu.OperandMajorMode.K, "
+                    if b_k_major
+                    else "cute.nvgpu.OperandMajorMode.MN, "
+                )
+                + f"{acc_dtype}, "
+                f"{cta_group}, "
+                f"({bm}, {bn}), "
+                "cute.nvgpu.tcgen05.OperandSource.SMEM)"
+            ),
+            (
+                f"    {cluster_layout_vmnk} = cute.tiled_divide("
+                f"cute.make_layout({cluster_shape}), ({tiled_mma}.thr_id.shape,))"
+            ),
+            f"    {smem_a_layout} = {smem_a_layout_expr}",
+            f"    {smem_b_layout} = {smem_b_layout_expr}",
+            *lhs_tma_setup_lines,
+            *rhs_tma_setup_lines,
             # ``make_tiled_tma_atom_A`` vs ``_B`` asymmetry:
             # - ``_B`` always passes ``cluster_layout_vmnk.shape`` as
             #   its trailing arg (CuTe's signature for B requires the
             #   cluster shape; the cluster_m=1 cluster_n=1 case still
-            #   passes the 1×1×1 shape harmlessly).
+            #   passes the 1x1x1 shape harmlessly).
             # - ``_A`` only adds the same trailing arg when
             #   ``cluster_n > 1``. For the validated cluster_n=1
             #   paths, A's atom is constructed without the cluster
@@ -787,7 +997,7 @@ def _append_cute_wrapper_plan(
                 f"    {tma_atom_a}, {tma_tensor_a} = cute.nvgpu.make_tiled_tma_atom_A("
                 "cutlass.utils.blackwell_helpers.cluster_shape_to_tma_atom_A("
                 f"{cluster_shape}, {tiled_mma}.thr_id), "
-                f"{lhs_tma_operand}, "
+                f"{lhs_tma_arg}, "
                 f"cute.slice_({smem_a_layout}, (None, None, None, 0)), "
                 f"({bm}, {bn}, {bk}), {tiled_mma}"
                 + (f", {cluster_layout_vmnk}.shape" if cluster_n > 1 else "")
@@ -804,9 +1014,8 @@ def _append_cute_wrapper_plan(
                 f"cute.slice_({smem_b_layout}, (None, None, None, 0)), "
                 f"({bm}, {bn}, {bk}), {tiled_mma}, {cluster_layout_vmnk}.shape)"
             ),
-        ]
+        )
     )
-    body.extend(ab_tma_lines)
     call_args.extend(kernel_args)
 
 
@@ -919,6 +1128,39 @@ def _create_cute_wrapper(
                 f"    arg{i} = cute.make_tensor({ptr_name}, layout=cute.make_layout({shape_tuple}, stride={stride_tuple}))"
             )
             call_args.append(f"arg{i}")
+            continue
+
+        if kind == "wrapper_tensor":
+            (_, name, _dtype, rank, sizes_t, strides_t) = entry
+            assert isinstance(name, str)
+            assert isinstance(rank, int)
+            assert isinstance(sizes_t, tuple) and len(sizes_t) == rank
+            assert isinstance(strides_t, tuple) and len(strides_t) == rank
+            ptr_name = f"{name}_ptr"
+            params.append(f"{ptr_name}: cute.Pointer")
+            shape_literals = [repr(int(s)) for s in sizes_t]
+            stride_literals = [repr(int(s)) for s in strides_t]
+            shape_tuple = (
+                f"({shape_literals[0]},)"
+                if rank == 1
+                else f"({', '.join(shape_literals)})"
+            )
+            stride_tuple = (
+                f"({stride_literals[0]},)"
+                if rank == 1
+                else f"({', '.join(stride_literals)})"
+            )
+            body.append(
+                f"    {name} = cute.make_tensor({ptr_name}, layout=cute.make_layout({shape_tuple}, stride={stride_tuple}))"
+            )
+            call_args.append(name)
+            continue
+
+        if kind == "wrapper_host_scalar":
+            (_, name, scalar_kind) = entry
+            assert isinstance(name, str)
+            assert isinstance(scalar_kind, str)
+            params.append(f"{name}: {_cute_scalar_annotation(scalar_kind)}")
             continue
 
         if kind == "scalar_constexpr":
@@ -1180,6 +1422,7 @@ class _CompiledCuteLauncher:
 
 
 _TVM_FFI_COMPILE_OPTION = "--enable-tvm-ffi"
+_CUTE_NUM_SM_CACHE: dict[tuple[str, int | None], int] = {}
 
 
 def _merge_tvm_ffi_compile_option(compile_options: str | None) -> str:
@@ -1200,6 +1443,40 @@ def _merge_tvm_ffi_compile_option(compile_options: str | None) -> str:
     return " ".join(tokens)
 
 
+def _cute_num_sm_from_arch_args(arch_args: tuple[object, ...] | None) -> int | None:
+    if arch_args is None:
+        return None
+    for arg in arch_args:
+        if isinstance(arg, torch.Tensor) and arg.device.type == "cuda":
+            cache_key = (arg.device.type, arg.device.index)
+            cached = _CUTE_NUM_SM_CACHE.get(cache_key)
+            if cached is None:
+                cached = get_num_sm(arg.device)
+                _CUTE_NUM_SM_CACHE[cache_key] = cached
+            return cached
+    return None
+
+
+def _cute_compiled_launcher_discriminator(
+    schema_key: tuple[tuple[object, ...], ...],
+    block: tuple[int, int, int],
+    compile_options: str | None,
+    arch_args: tuple[object, ...] | None,
+) -> tuple[tuple[object, ...], str, int | None]:
+    merged_compile_options = _merge_tvm_ffi_compile_option(compile_options)
+    num_sm = _cute_num_sm_from_arch_args(arch_args)
+    return (
+        (
+            schema_key,
+            block,
+            merged_compile_options,
+            num_sm,
+        ),
+        merged_compile_options,
+        num_sm,
+    )
+
+
 def _get_compiled_cute_launcher(
     cute_kernel: object,
     schema_key: tuple[tuple[object, ...], ...],
@@ -1214,7 +1491,12 @@ def _get_compiled_cute_launcher(
     # than replace because other flags (e.g. ``--generate-line-info`` when
     # ``tcgen05_cubin_lineinfo`` is True) can already be in
     # ``compile_options``.
-    compile_options = _merge_tvm_ffi_compile_option(compile_options)
+    cache_key, compile_options, num_sm = _cute_compiled_launcher_discriminator(
+        schema_key,
+        block,
+        compile_options,
+        arch_args,
+    )
     try:
         # pyrefly: ignore [missing-attribute]
         cache = cute_kernel._helion_cute_compiled_launchers
@@ -1222,36 +1504,19 @@ def _get_compiled_cute_launcher(
         cache = {}
         # pyrefly: ignore [missing-attribute]
         cute_kernel._helion_cute_compiled_launchers = cache
-    wrapper_plans = tuple(
-        repr(plan)
-        for plan in getattr(cast("Any", cute_kernel), "_helion_cute_wrapper_plans", [])
-    )
-    cluster_shape = getattr(
-        cast("Any", cute_kernel), "_helion_cute_cluster_shape", None
-    )
-    # Persistent flash kernels bake the device SM count into the wrapper grid
-    # clamp; resolve it from the first tensor arg's device so the cache key (and
-    # the baked literal) stay device-correct across GPUs.
-    num_sm: int | None = None
-    if arch_args is not None:
-        for arg in arch_args:
-            if isinstance(arg, torch.Tensor) and arg.device.type == "cuda":
-                num_sm = get_num_sm(arg.device)
-                break
-    cache_key = (
-        schema_key,
-        block,
-        wrapper_plans,
-        repr(cluster_shape),
-        compile_options,
-        num_sm,
-    )
     cached = cache.get(cache_key)
     if cached is not None:
         return cached
 
     if arch_args is not None:
         _ensure_cute_dsl_arch_env(arch_args)
+    wrapper_plans = tuple(
+        repr(plan)
+        for plan in getattr(cast("Any", cute_kernel), "_helion_cute_wrapper_plans", ())
+    )
+    cluster_shape = getattr(
+        cast("Any", cute_kernel), "_helion_cute_cluster_shape", None
+    )
     jit_func = _create_cute_wrapper(cute_kernel, schema_key, block, num_sm=num_sm)
     disk_cache_key = _cute_disk_cache_key(
         cute_kernel,
@@ -1381,6 +1646,288 @@ def _cute_current_stream() -> object:
 # Keep the per-kernel launch-argument cache small: production kernels normally
 # relaunch one or two stable tensor signatures, while autotune may probe many.
 _CUTE_LAUNCH_ARG_CACHE_LIMIT = 8
+_TCGEN05_GROUPED_STATIC_METADATA_CACHE_LIMIT = 8
+_TCGEN05_DYNAMIC_TENSORMAP_WORKSPACE_CACHE_LIMIT = 8
+
+_CuteGroupedLaunchContext = tuple[str, int | None, int, int | None]
+
+
+@dataclass
+class _CuteCudaGraphResources:
+    cache_entries: dict[tuple[int, str, object], tuple[object, str, object, object]]
+    tensors: dict[int, torch.Tensor]
+    devices: set[torch.device]
+    streams: set[torch.cuda.Stream]
+
+    def retain(
+        self,
+        owner: object,
+        attribute: str,
+        key: object,
+        value: object,
+        tensors: tuple[torch.Tensor, ...],
+    ) -> None:
+        self.cache_entries[(id(owner), attribute, key)] = (
+            owner,
+            attribute,
+            key,
+            value,
+        )
+        for tensor in tensors:
+            self.tensors[id(tensor)] = tensor
+            self.devices.add(tensor.device)
+            stream = torch.cuda.current_stream(tensor.device)
+            tensor.record_stream(stream)
+            self.streams.add(stream)
+
+    def record_replay_streams(self) -> None:
+        for device in self.devices:
+            stream = torch.cuda.current_stream(device)
+            if stream not in self.streams:
+                for tensor in self.tensors.values():
+                    if tensor.device == device:
+                        tensor.record_stream(stream)
+                self.streams.add(stream)
+
+    def release(self) -> None:
+        for owner, attribute, key, value in self.cache_entries.values():
+            cache = getattr(owner, attribute, None)
+            if isinstance(cache, dict) and cache.get(key) is value:
+                cache.pop(key)
+        self.cache_entries.clear()
+        self.tensors.clear()
+        self.devices.clear()
+        self.streams.clear()
+
+
+class _CuteCUDAGraph(torch.cuda.CUDAGraph):
+    def __init__(self) -> None:
+        super().__init__()
+        self._helion_resources = _CuteCudaGraphResources({}, {}, set(), set())
+        self._helion_resource_finalizer = weakref.finalize(
+            self, self._helion_resources.release
+        )
+
+    def replay(self) -> None:
+        self._helion_resources.record_replay_streams()
+        super().replay()
+
+
+_CUTE_ACTIVE_CUDA_GRAPH: contextvars.ContextVar[_CuteCUDAGraph | None] = (
+    contextvars.ContextVar("helion_cute_active_cuda_graph", default=None)
+)
+
+
+def _track_cute_cuda_graph_cache_entry(
+    owner: object,
+    attribute: str,
+    key: object,
+    value: object,
+    tensors: tuple[torch.Tensor, ...],
+) -> None:
+    graph = _CUTE_ACTIVE_CUDA_GRAPH.get()
+    if graph is None:
+        # Raw torch.cuda.graph callers are conservatively retained because the
+        # CUDA capture ID does not expose the owning Python CUDAGraph lifetime.
+        return
+    graph._helion_resources.retain(
+        owner,
+        attribute,
+        key,
+        value,
+        tensors,
+    )
+
+
+@contextmanager
+def cute_cuda_graph(
+    *,
+    pool: _POOL_HANDLE | None = None,
+    stream: torch.cuda.Stream | None = None,
+    capture_error_mode: str = "global",
+) -> Iterator[_CuteCUDAGraph]:
+    """Capture CuTe launches while tying raw-pointer owners to ``graph``.
+
+    Raw ``torch.cuda.graph`` captures cannot expose their Python graph owner to
+    the launcher, so their resources are conservatively retained without bound.
+    """
+    graph = _CuteCUDAGraph()
+    token = _CUTE_ACTIVE_CUDA_GRAPH.set(graph)
+    try:
+        with torch.cuda.graph(
+            graph,
+            pool=pool,
+            stream=stream,
+            capture_error_mode=capture_error_mode,
+        ):
+            yield graph
+    finally:
+        _CUTE_ACTIVE_CUDA_GRAPH.reset(token)
+
+
+@dataclass(frozen=True)
+class _Tcgen05GroupedStaticMetadataResult:
+    problem_sizes: torch.Tensor
+    starts: torch.Tensor
+    total_clusters: int
+    real_groups: torch.Tensor | None = None
+    direct_pointers: torch.Tensor | None = None
+    direct_strides: torch.Tensor | None = None
+
+    def tensors(self) -> tuple[torch.Tensor, ...]:
+        return (
+            self.problem_sizes,
+            self.starts,
+            *((self.real_groups,) if self.real_groups is not None else ()),
+            *((self.direct_pointers,) if self.direct_pointers is not None else ()),
+            *((self.direct_strides,) if self.direct_strides is not None else ()),
+        )
+
+
+@dataclass(frozen=True)
+class _Tcgen05GroupedStaticMetadataCacheEntry:
+    layout_ref: weakref.ReferenceType[torch.Tensor]
+    n_sizes_ref: weakref.ReferenceType[torch.Tensor] | None
+    k_sizes_ref: weakref.ReferenceType[torch.Tensor] | None
+    has_m_tail: bool
+    has_n_tail: bool
+    result: _Tcgen05GroupedStaticMetadataResult
+
+    def matches(
+        self,
+        layout: torch.Tensor,
+        n_sizes: torch.Tensor | None,
+        k_sizes: torch.Tensor | None,
+    ) -> bool:
+        if self.layout_ref() is not layout:
+            return False
+        if self.n_sizes_ref is None:
+            if n_sizes is not None:
+                return False
+        elif self.n_sizes_ref() is not n_sizes:
+            return False
+        if self.k_sizes_ref is None:
+            return k_sizes is None
+        return self.k_sizes_ref() is k_sizes
+
+
+@dataclass(frozen=True)
+class _CuteLaunchArgCacheEntry:
+    schema: tuple[tuple[object, ...], ...]
+    launch_args: tuple[object, ...]
+    grouped_static_metadata: tuple[_Tcgen05GroupedStaticMetadataCacheEntry, ...]
+    owned_tensors: tuple[torch.Tensor, ...]
+
+
+@dataclass(frozen=True)
+class _CuteLastLaunchCacheEntry:
+    arg_guard: _CuteLastLaunchArgGuard
+    compiled_discriminator: tuple[object, ...]
+    launch: _CuteLaunchArgCacheEntry
+    compiled: object
+
+
+@dataclass(frozen=True)
+class _CuteLastTensorArgGuard:
+    index: int
+    data_ptr: int
+    device_type: str
+    device_index: int | None
+    dtype: torch.dtype
+    ndim: int
+    shape: tuple[int, ...]
+    stride: tuple[int, ...]
+
+    def matches(self, args: tuple[object, ...]) -> bool:
+        if self.index >= len(args) or not isinstance(args[self.index], torch.Tensor):
+            return False
+        tensor = args[self.index]
+        assert isinstance(tensor, torch.Tensor)
+        return (
+            int(tensor.data_ptr()) == self.data_ptr
+            and tensor.device.type == self.device_type
+            and tensor.device.index == self.device_index
+            and tensor.dtype == self.dtype
+            and tensor.ndim == self.ndim
+            and tensor.size() == self.shape
+            and tensor.stride() == self.stride
+        )
+
+
+@dataclass(frozen=True)
+class _CuteLastScalarArgGuard:
+    index: int
+    is_constexpr: bool
+    scalar_kind: str
+    scalar_value: object
+
+    def matches(
+        self,
+        args: tuple[object, ...],
+        constexpr_flags: tuple[bool, ...],
+    ) -> bool:
+        if self.index >= len(args):
+            return False
+        arg = args[self.index]
+        if isinstance(arg, torch.Tensor):
+            return False
+        scalar_kind, scalar_value = _normalize_cute_scalar(arg)
+        is_constexpr = self.index < len(constexpr_flags) and constexpr_flags[self.index]
+        return (
+            is_constexpr == self.is_constexpr
+            and scalar_kind == self.scalar_kind
+            and _cute_scalar_cache_value(scalar_kind, scalar_value) == self.scalar_value
+        )
+
+
+@dataclass(frozen=True)
+class _CuteLastGroupedMutationGuard:
+    index: int
+    tensor_id: int
+    mutation_key: tuple[object, ...]
+
+    def matches(self, args: tuple[object, ...]) -> bool:
+        if self.index >= len(args) or not isinstance(args[self.index], torch.Tensor):
+            return False
+        tensor = args[self.index]
+        assert isinstance(tensor, torch.Tensor)
+        return (
+            id(tensor) == self.tensor_id
+            and _tcgen05_grouped_tensor_mutation_key(tensor) == self.mutation_key
+        )
+
+
+@dataclass(frozen=True)
+class _CuteLastLaunchArgGuard:
+    arg_count: int
+    grid: tuple[int, int, int]
+    bake_tensor_shapes: bool
+    arg_guards: tuple[_CuteLastTensorArgGuard | _CuteLastScalarArgGuard, ...]
+    grouped_mutation_guards: tuple[_CuteLastGroupedMutationGuard, ...]
+    grouped_launch_contexts: tuple[_CuteGroupedLaunchContext, ...]
+
+    def matches(
+        self,
+        cute_kernel: object,
+        args: tuple[object, ...],
+        grid: tuple[int, int, int],
+    ) -> bool:
+        if (
+            len(args) != self.arg_count
+            or grid != self.grid
+            or _cute_bake_tensor_shapes_guard(cute_kernel) != self.bake_tensor_shapes
+            or _cute_grouped_launch_contexts(cute_kernel, args)
+            != self.grouped_launch_contexts
+        ):
+            return False
+        constexpr_flags = _cute_kernel_param_is_constexpr(cute_kernel)
+        for guard in self.arg_guards:
+            if isinstance(guard, _CuteLastTensorArgGuard):
+                if not guard.matches(args):
+                    return False
+            elif not guard.matches(args, constexpr_flags):
+                return False
+        return all(guard.matches(args) for guard in self.grouped_mutation_guards)
 
 
 def _cute_scalar_cache_value(scalar_kind: str, scalar_value: object) -> object:
@@ -1394,13 +1941,1280 @@ def _validate_cute_launcher_tensor(arg: torch.Tensor) -> None:
         raise exc.BackendUnsupported("cute", "launcher requires tensor rank >= 1")
 
 
+def _validate_tcgen05_grouped_tensor_devices(
+    layout: torch.Tensor,
+    args: tuple[object, ...],
+) -> None:
+    mismatched_indices = [
+        index
+        for index, arg in enumerate(args)
+        if isinstance(arg, torch.Tensor) and arg.device != layout.device
+    ]
+    if mismatched_indices:
+        raise exc.BackendUnsupported(
+            "cute",
+            "tcgen05 grouped scheduler requires every tensor argument to be on "
+            f"{layout.device}; mismatched argument indices: {mismatched_indices}",
+        )
+
+
+def _tcgen05_grouped_static_plans(cute_kernel: object) -> list[dict[str, object]]:
+    return [
+        cast("dict[str, object]", plan)
+        for plan in getattr(cast("Any", cute_kernel), "_helion_cute_wrapper_plans", [])
+        if cast("dict[str, object]", plan).get("kind")
+        == "tcgen05_grouped_static_persistent"
+    ]
+
+
+def _cute_grouped_static_metadata_matches(
+    grouped_static_metadata: tuple[_Tcgen05GroupedStaticMetadataCacheEntry, ...],
+    cute_kernel: object,
+    args: tuple[object, ...],
+) -> bool:
+    plans = _tcgen05_grouped_static_plans(cute_kernel)
+    if len(grouped_static_metadata) != len(plans):
+        return False
+    for plan, entry in zip(plans, grouped_static_metadata, strict=True):
+        layout = _tcgen05_grouped_static_layout_arg(plan, args)
+        n_sizes_arg = _tcgen05_grouped_static_size_arg(plan, args, "n_sizes")
+        k_sizes_arg = _tcgen05_grouped_static_size_arg(plan, args, "k_sizes")
+        if not entry.matches(layout, n_sizes_arg, k_sizes_arg):
+            return False
+        expected_has_m_tail = plan.get("grouped_static_has_m_tail")
+        if isinstance(expected_has_m_tail, bool) and (
+            entry.has_m_tail != expected_has_m_tail
+        ):
+            return False
+        expected_has_n_tail = plan.get("grouped_static_has_n_tail")
+        if isinstance(expected_has_n_tail, bool) and (
+            entry.has_n_tail != expected_has_n_tail
+        ):
+            return False
+    return True
+
+
+def _tcgen05_grouped_static_active_clusters(
+    *,
+    num_sm: int,
+    cluster_m: int,
+    reserved_sms: int,
+) -> int:
+    if num_sm <= 0:
+        raise ValueError("num_sm must be positive")
+    if cluster_m <= 0:
+        raise ValueError("cluster_m must be positive")
+    if reserved_sms < 0:
+        raise ValueError("reserved_sms must be non-negative")
+    active_sms = max(1, num_sm - reserved_sms)
+    return max(1, active_sms // cluster_m)
+
+
+def _plan_int_value(plan: dict[str, object], key: str) -> int:
+    value = plan[key]
+    assert isinstance(value, int)
+    return value
+
+
+def _plan_str_value(plan: dict[str, object], key: str) -> str:
+    value = plan[key]
+    assert isinstance(value, str)
+    return value
+
+
+def _tcgen05_plan_orientation(plan: dict[str, object]) -> str:
+    orientation = plan.get("orientation", "mn")
+    if orientation not in ("mn", "nm"):
+        raise exc.BackendUnsupported(
+            "cute", f"unsupported tcgen05 plan orientation {orientation!r}"
+        )
+    return cast("str", orientation)
+
+
+def _cuda_stream_capture_context(device: torch.device) -> tuple[int, int | None]:
+    """Return the current stream and its active capture ID, if any."""
+    cuda_runtime = importlib.import_module("cuda.bindings.runtime")
+    with torch.cuda.device(device):
+        stream_handle = int(torch.cuda.current_stream().cuda_stream)
+        capture_info = cuda_runtime.cudaStreamGetCaptureInfo(
+            cuda_runtime.cudaStream_t(stream_handle)
+        )
+    error = capture_info[0]
+    status = capture_info[1]
+    if error != cuda_runtime.cudaError_t.cudaSuccess:
+        raise exc.BackendUnsupported(
+            "cute",
+            f"failed to query the CUDA stream capture context: {error}",
+        )
+    if status == cuda_runtime.cudaStreamCaptureStatus.cudaStreamCaptureStatusNone:
+        return stream_handle, None
+    if status == cuda_runtime.cudaStreamCaptureStatus.cudaStreamCaptureStatusActive:
+        return stream_handle, int(capture_info[2])
+    raise exc.BackendUnsupported(
+        "cute", "the current CUDA stream capture has been invalidated"
+    )
+
+
+def _tcgen05_grouped_dynamic_tensormap_workspace(
+    cute_kernel: object,
+    *,
+    device: torch.device,
+    tensormap_count: int,
+) -> torch.Tensor:
+    num_sm = get_num_sm(device)
+    stream_handle, capture_id = _cuda_stream_capture_context(device)
+    cache_key = (
+        device.type,
+        device.index,
+        num_sm,
+        tensormap_count,
+        stream_handle,
+        capture_id,
+    )
+    # A captured graph embeds this raw pointer and can outlive the launch LRU.
+    # cute_cuda_graph ties tracked entries to graph lifetime; raw captures stay
+    # conservatively retained by this cache because their graph is unobservable.
+    try:
+        cache = cast(
+            "OrderedDict[tuple[object, ...], torch.Tensor]",
+            cast("Any", cute_kernel)._helion_tcgen05_dynamic_tensormap_workspace_cache,
+        )
+    except AttributeError:
+        cache = OrderedDict()
+        cast(
+            "Any", cute_kernel
+        )._helion_tcgen05_dynamic_tensormap_workspace_cache = cache
+    workspace = cache.get(cache_key)
+    if workspace is not None:
+        return workspace
+    workspace = torch.empty(
+        (num_sm, tensormap_count, 128 // 8),
+        dtype=torch.int64,
+        device=device,
+    )
+    cache[cache_key] = workspace
+    if capture_id is not None:
+        _track_cute_cuda_graph_cache_entry(
+            cute_kernel,
+            "_helion_tcgen05_dynamic_tensormap_workspace_cache",
+            cache_key,
+            workspace,
+            (workspace,),
+        )
+    else:
+        eager_keys = [key for key in cache if key[-1] is None]
+        while len(eager_keys) > _TCGEN05_DYNAMIC_TENSORMAP_WORKSPACE_CACHE_LIMIT:
+            cache.pop(eager_keys.pop(0))
+    return workspace
+
+
+def _tcgen05_grouped_static_layout_arg(
+    plan: dict[str, object],
+    args: tuple[object, ...],
+) -> torch.Tensor:
+    layout_idx = _plan_int_value(plan, "layout_idx")
+    if layout_idx >= len(args) or not isinstance(args[layout_idx], torch.Tensor):
+        raise exc.BackendUnsupported(
+            "cute", "tcgen05 grouped scheduler layout argument is not a tensor"
+        )
+    layout = args[layout_idx]
+    assert isinstance(layout, torch.Tensor)
+    if layout.device.type != "cuda":
+        raise exc.BackendUnsupported(
+            "cute", "tcgen05 grouped scheduler layout must be a CUDA tensor"
+        )
+    worklist_metadata = bool(plan.get("worklist_metadata"))
+    if worklist_metadata:
+        if layout.ndim != 2 or layout.size(1) != 4:
+            raise exc.BackendUnsupported(
+                "cute",
+                "tcgen05 grouped worklist scheduler metadata must have shape [W, 4]",
+            )
+    elif layout.ndim != 1:
+        raise exc.BackendUnsupported(
+            "cute", "tcgen05 grouped scheduler layout must be rank 1"
+        )
+    if layout.dtype not in (torch.int32, torch.int64):
+        raise exc.BackendUnsupported(
+            "cute", "tcgen05 grouped scheduler layout must be int32 or int64"
+        )
+    return layout
+
+
+def _cute_dynamic_tensormap_contexts(
+    cute_kernel: object,
+    args: tuple[object, ...],
+) -> tuple[_CuteGroupedLaunchContext, ...]:
+    """Return stream/capture contexts that isolate mutable TensorMaps."""
+    contexts: list[_CuteGroupedLaunchContext] = []
+    for plan in _tcgen05_grouped_static_plans(cute_kernel):
+        if not (
+            bool(plan.get("dynamic_ab_tensormaps"))
+            or bool(plan.get("dynamic_d_tensormap"))
+        ):
+            continue
+        layout = _tcgen05_grouped_static_layout_arg(plan, args)
+        stream_handle, capture_id = _cuda_stream_capture_context(layout.device)
+        contexts.append(
+            (layout.device.type, layout.device.index, stream_handle, capture_id)
+        )
+    return tuple(contexts)
+
+
+def _cute_grouped_launch_contexts(
+    cute_kernel: object,
+    args: tuple[object, ...],
+    *,
+    dynamic_tensormap_contexts: tuple[_CuteGroupedLaunchContext, ...] | None = None,
+) -> tuple[_CuteGroupedLaunchContext, ...]:
+    """Return contexts that isolate mutable or capture-owned launch tensors."""
+    if dynamic_tensormap_contexts is None:
+        dynamic_tensormap_contexts = _cute_dynamic_tensormap_contexts(cute_kernel, args)
+    contexts = list(dynamic_tensormap_contexts)
+    contexts_by_device = {
+        (context[0], context[1]): context for context in dynamic_tensormap_contexts
+    }
+    for plan in _tcgen05_grouped_static_plans(cute_kernel):
+        if plan.get("dynamic_ab_tensormaps") or plan.get("dynamic_d_tensormap"):
+            continue
+        layout = _tcgen05_grouped_static_layout_arg(plan, args)
+        device_key = (layout.device.type, layout.device.index)
+        context = contexts_by_device.get(device_key)
+        if context is None:
+            stream_handle, capture_id = _cuda_stream_capture_context(layout.device)
+            context = (*device_key, stream_handle, capture_id)
+            contexts_by_device[device_key] = context
+        if context[3] is None:
+            # Static grouped metadata is read-only across eager streams, so
+            # keep the existing bounded shared cache on the eager hot path.
+            continue
+        if context not in contexts:
+            contexts.append(context)
+    return tuple(contexts)
+
+
+def _tcgen05_grouped_static_size_arg(
+    plan: dict[str, object],
+    args: tuple[object, ...],
+    name: Literal["n_sizes", "k_sizes"],
+) -> torch.Tensor | None:
+    index = plan.get(f"{name}_idx")
+    if index is None:
+        return None
+    assert isinstance(index, int)
+    if index >= len(args) or not isinstance(args[index], torch.Tensor):
+        raise exc.BackendUnsupported(
+            "cute", f"tcgen05 grouped scheduler {name} argument is not a tensor"
+        )
+    tensor = args[index]
+    assert isinstance(tensor, torch.Tensor)
+    if tensor.device.type != "cuda":
+        raise exc.BackendUnsupported(
+            "cute", f"tcgen05 grouped scheduler {name} must be a CUDA tensor"
+        )
+    if tensor.ndim != 1:
+        raise exc.BackendUnsupported(
+            "cute", f"tcgen05 grouped scheduler {name} must be rank 1"
+        )
+    if tensor.dtype not in (torch.int32, torch.int64):
+        raise exc.BackendUnsupported(
+            "cute", f"tcgen05 grouped scheduler {name} must be int32 or int64"
+        )
+    return tensor
+
+
+def _tcgen05_grouped_dynamic_ab_tensor_arg(
+    plan: dict[str, object],
+    args: tuple[object, ...],
+    key: str,
+    operand: str,
+) -> torch.Tensor:
+    idx = plan.get(key)
+    if (
+        not isinstance(idx, int)
+        or idx >= len(args)
+        or not isinstance(args[idx], torch.Tensor)
+    ):
+        raise exc.BackendUnsupported(
+            "cute",
+            f"tcgen05 grouped dynamic A/B TensorMaps require tensor operand {operand}",
+        )
+    tensor = args[idx]
+    assert isinstance(tensor, torch.Tensor)
+    if tensor.device.type != "cuda":
+        raise exc.BackendUnsupported(
+            "cute",
+            f"tcgen05 grouped dynamic A/B TensorMap operand {operand} must be CUDA",
+        )
+    return tensor
+
+
+def _tcgen05_grouped_external_direct_tensor_arg(
+    plan: dict[str, object],
+    args: tuple[object, ...],
+    *,
+    key: str,
+    tensor_name: str,
+    dtype: torch.dtype,
+    ndim: int,
+) -> torch.Tensor:
+    idx = plan.get(key)
+    if (
+        not isinstance(idx, int)
+        or idx >= len(args)
+        or not isinstance(args[idx], torch.Tensor)
+    ):
+        raise exc.BackendUnsupported(
+            "cute",
+            f"tcgen05 grouped external direct metadata requires {tensor_name} tensor",
+        )
+    tensor = args[idx]
+    assert isinstance(tensor, torch.Tensor)
+    if tensor.device.type != "cuda":
+        raise exc.BackendUnsupported(
+            "cute",
+            f"tcgen05 grouped external direct metadata {tensor_name} must be CUDA",
+        )
+    if tensor.dtype != dtype:
+        raise exc.BackendUnsupported(
+            "cute",
+            f"tcgen05 grouped external direct metadata {tensor_name} dtype must be "
+            f"{dtype}",
+        )
+    if tensor.ndim != ndim:
+        raise exc.BackendUnsupported(
+            "cute",
+            f"tcgen05 grouped external direct metadata {tensor_name} must be "
+            f"rank {ndim}",
+        )
+    return tensor
+
+
+def _tcgen05_grouped_external_direct_metadata_args(
+    plan: dict[str, object],
+    args: tuple[object, ...],
+) -> tuple[torch.Tensor, torch.Tensor] | None:
+    if not bool(plan.get("external_direct_pointer_metadata")):
+        return None
+    pointers = _tcgen05_grouped_external_direct_tensor_arg(
+        plan,
+        args,
+        key="direct_pointers_idx",
+        tensor_name="direct_pointers",
+        dtype=torch.int64,
+        ndim=2,
+    )
+    strides = _tcgen05_grouped_external_direct_tensor_arg(
+        plan,
+        args,
+        key="direct_strides_idx",
+        tensor_name="direct_strides",
+        dtype=torch.int32,
+        ndim=3,
+    )
+    if strides.device != pointers.device:
+        raise exc.BackendUnsupported(
+            "cute",
+            "tcgen05 grouped external direct metadata pointers and strides "
+            "must be on the same CUDA device",
+        )
+    return pointers, strides
+
+
+def _tcgen05_grouped_external_direct_cache_key(
+    plan: dict[str, object],
+    args: tuple[object, ...] | None,
+) -> tuple[object, ...]:
+    if args is None or not bool(plan.get("external_direct_pointer_metadata")):
+        return ()
+    metadata_args = _tcgen05_grouped_external_direct_metadata_args(plan, args)
+    assert metadata_args is not None
+    pointers, strides = metadata_args
+    return (
+        *_tcgen05_grouped_tensor_cache_key(
+            "direct_pointers", pointers, include_version=True
+        ),
+        *_tcgen05_grouped_tensor_cache_key(
+            "direct_strides", strides, include_version=True
+        ),
+    )
+
+
+def _tcgen05_grouped_direct_d_idx(
+    cute_kernel: object,
+    _plan: dict[str, object],
+) -> int:
+    d_plans = [
+        cast("dict[str, object]", candidate)
+        for candidate in getattr(
+            cast("Any", cute_kernel), "_helion_cute_wrapper_plans", ()
+        )
+        if cast("dict[str, object]", candidate).get("kind") == "tcgen05_d_tma"
+        and bool(cast("dict[str, object]", candidate).get("rank3_mnl_tensor"))
+    ]
+    if len(d_plans) != 1:
+        raise exc.BackendUnsupported(
+            "cute",
+            "tcgen05 grouped direct pointer metadata requires exactly one "
+            "rank-3 grouped D TensorMap wrapper plan",
+        )
+    d_idx = d_plans[0].get("d_idx")
+    if not isinstance(d_idx, int):
+        raise exc.BackendUnsupported(
+            "cute",
+            "tcgen05 grouped direct pointer metadata D TensorMap plan is missing "
+            "the output tensor index",
+        )
+    return d_idx
+
+
+def _tcgen05_grouped_direct_d_tensor_arg(
+    cute_kernel: object,
+    plan: dict[str, object],
+    args: tuple[object, ...],
+) -> torch.Tensor:
+    d_idx = _tcgen05_grouped_direct_d_idx(cute_kernel, plan)
+    if d_idx >= len(args) or not isinstance(args[d_idx], torch.Tensor):
+        raise exc.BackendUnsupported(
+            "cute",
+            "tcgen05 grouped direct pointer metadata requires tensor operand D",
+        )
+    tensor = args[d_idx]
+    assert isinstance(tensor, torch.Tensor)
+    if tensor.device.type != "cuda":
+        raise exc.BackendUnsupported(
+            "cute",
+            "tcgen05 grouped direct pointer metadata operand D must be CUDA",
+        )
+    return tensor
+
+
+def _tcgen05_grouped_tensor_cache_key(
+    label: str,
+    tensor: torch.Tensor,
+    *,
+    include_version: bool = False,
+) -> tuple[object, ...]:
+    return (
+        label,
+        id(tensor),
+        int(tensor.data_ptr()),
+        tuple(int(size) for size in tensor.shape),
+        tuple(int(stride) for stride in tensor.stride()),
+        int(tensor.storage_offset()),
+        tensor.device.type,
+        tensor.device.index,
+        str(tensor.dtype),
+        *(_tcgen05_grouped_tensor_mutation_key(tensor) if include_version else ()),
+    )
+
+
+def _tcgen05_grouped_tensor_mutation_key(
+    tensor: torch.Tensor,
+) -> tuple[object, ...]:
+    if not torch.is_inference(tensor):
+        return ("version", int(tensor._version))
+    if (
+        tensor.device.type == "cuda"
+        and _cuda_stream_capture_context(tensor.device)[1] is not None
+    ):
+        raise exc.BackendUnsupported(
+            "cute",
+            "inference tensor grouped metadata is unsupported during CUDA graph "
+            "capture; use ordinary tensors with stable version counters",
+        )
+    return ("values", tuple(tensor.detach().reshape(-1).cpu().tolist()))
+
+
+def _validate_tcgen05_grouped_direct_d_tensormap(
+    tensor: torch.Tensor,
+) -> None:
+    if tensor.ndim != 2:
+        raise exc.BackendUnsupported(
+            "cute",
+            "tcgen05 grouped direct pointer metadata requires rank-2 D",
+        )
+    if any(
+        int(stride) < 0 or int(stride) > torch.iinfo(torch.int32).max
+        for stride in tensor.stride()
+    ):
+        raise exc.BackendUnsupported(
+            "cute",
+            "tcgen05 grouped direct pointer metadata requires non-negative "
+            "int32 D strides",
+        )
+    alignment = 16
+    if int(tensor.data_ptr()) % alignment != 0:
+        raise exc.BackendUnsupported(
+            "cute",
+            "tcgen05 grouped direct pointer metadata requires 16-byte-aligned D",
+        )
+    if int(tensor.stride(0)) * tensor.element_size() % alignment != 0:
+        raise exc.BackendUnsupported(
+            "cute",
+            "tcgen05 grouped direct pointer metadata requires 16-byte-aligned "
+            "D row starts",
+        )
+
+
+def _validate_tcgen05_grouped_dynamic_ab_tensormaps(
+    plan: dict[str, object],
+    args: tuple[object, ...],
+) -> None:
+    lhs = _tcgen05_grouped_dynamic_ab_tensor_arg(plan, args, "lhs_idx", "A")
+    rhs = _tcgen05_grouped_dynamic_ab_tensor_arg(plan, args, "rhs_idx", "B")
+    rank = _tcgen05_grouped_dynamic_ab_tensormap_rank(plan)
+    if lhs.ndim != 2:
+        raise exc.BackendUnsupported(
+            "cute",
+            "tcgen05 grouped dynamic A/B TensorMaps require rank-2 A",
+        )
+    if rhs.ndim != 3:
+        raise exc.BackendUnsupported(
+            "cute",
+            "tcgen05 grouped dynamic A/B TensorMaps require rank-3 grouped B",
+        )
+    if lhs.stride(1) != 1:
+        raise exc.BackendUnsupported(
+            "cute",
+            "tcgen05 grouped dynamic A/B TensorMaps require K-contiguous A",
+        )
+    if rhs.stride(2) != 1:
+        raise exc.BackendUnsupported(
+            "cute",
+            "tcgen05 grouped dynamic A/B TensorMaps require K-contiguous grouped B",
+        )
+    if rank == 2:
+        if lhs.stride(0) != lhs.size(1):
+            raise exc.BackendUnsupported(
+                "cute",
+                "tcgen05 grouped rank-2 dynamic A/B TensorMaps require "
+                "contiguous A[M,K] outer stride",
+            )
+        if rhs.stride(1) != rhs.size(2) or rhs.stride(0) != rhs.size(1) * rhs.size(2):
+            raise exc.BackendUnsupported(
+                "cute",
+                "tcgen05 grouped rank-2 dynamic A/B TensorMaps require "
+                "contiguous B[G,N,K] outer strides",
+            )
+    alignment = 16
+    lhs_stride0_bytes = int(lhs.stride(0)) * lhs.element_size()
+    rhs_stride0_bytes = int(rhs.stride(0)) * rhs.element_size()
+    rhs_stride1_bytes = int(rhs.stride(1)) * rhs.element_size()
+    if (
+        int(lhs.data_ptr()) % alignment != 0
+        or int(rhs.data_ptr()) % alignment != 0
+        or lhs_stride0_bytes % alignment != 0
+        or rhs_stride0_bytes % alignment != 0
+        or rhs_stride1_bytes % alignment != 0
+    ):
+        raise exc.BackendUnsupported(
+            "cute",
+            "tcgen05 grouped dynamic A/B TensorMaps require 16-byte-aligned "
+            "A/B bases and outer strides",
+        )
+
+
+def _validate_tcgen05_grouped_worklist_nm(
+    plan: dict[str, object],
+    args: tuple[object, ...],
+    rows: list[list[int]],
+) -> None:
+    if _tcgen05_plan_orientation(plan) != "nm":
+        return
+    lhs = _tcgen05_grouped_dynamic_ab_tensor_arg(plan, args, "lhs_idx", "A")
+    rhs = _tcgen05_grouped_dynamic_ab_tensor_arg(plan, args, "rhs_idx", "B")
+    source_m_tile = TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE
+    expected_store_end = 0
+    seen_groups: set[int] = set()
+    for row in rows:
+        real_group, start, actual_m, aligned_m = (int(value) for value in row)
+        if real_group < 0 or real_group >= int(rhs.size(0)):
+            raise exc.BackendUnsupported(
+                "cute",
+                "tcgen05 N,M worklist real group id is outside B_grouped",
+            )
+        if real_group in seen_groups:
+            raise exc.BackendUnsupported(
+                "cute",
+                "tcgen05 N,M worklist requires unique real group ids",
+            )
+        seen_groups.add(real_group)
+        if start < 0 or start % source_m_tile != 0:
+            raise exc.BackendUnsupported(
+                "cute",
+                "tcgen05 N,M worklist requires group starts aligned "
+                f"to {source_m_tile} rows",
+            )
+        if start < expected_store_end:
+            raise exc.BackendUnsupported(
+                "cute",
+                "tcgen05 N,M worklist has overlapping A rows",
+            )
+        if start > expected_store_end:
+            raise exc.BackendUnsupported(
+                "cute",
+                "tcgen05 N,M worklist has row holes",
+            )
+        if actual_m <= 0 or actual_m > aligned_m:
+            raise exc.BackendUnsupported(
+                "cute",
+                "tcgen05 N,M worklist requires 0 < actual_m <= aligned_m",
+            )
+        if aligned_m <= 0 or aligned_m % source_m_tile != 0:
+            raise exc.BackendUnsupported(
+                "cute",
+                "tcgen05 N,M worklist requires aligned_m to be a "
+                f"positive multiple of {source_m_tile}",
+            )
+        if start + aligned_m > int(lhs.size(0)):
+            raise exc.BackendUnsupported(
+                "cute",
+                "tcgen05 N,M worklist aligned extent exceeds A extent",
+            )
+        expected_store_end = start + aligned_m
+    if expected_store_end != int(lhs.size(0)):
+        raise exc.BackendUnsupported(
+            "cute",
+            "tcgen05 N,M worklist aligned extents must cover A rows",
+        )
+    if seen_groups and seen_groups != set(range(len(seen_groups))):
+        raise exc.BackendUnsupported(
+            "cute",
+            "tcgen05 N,M worklist requires dense real group ids",
+        )
+
+
+def _tcgen05_grouped_static_metadata_cache_key(
+    cute_kernel: object,
+    plan: dict[str, object],
+    layout: torch.Tensor,
+    n_sizes: torch.Tensor | None,
+    k_sizes: torch.Tensor | None,
+    args: tuple[object, ...],
+) -> tuple[object, ...]:
+    """Cache key for scheduler metadata copied from grouped-static tensors.
+
+    The hot path guards ordinary layout/n_sizes/k_sizes tensors by identity,
+    metadata, and ``_version``. Inference tensors have no version counter, so
+    their exact values form the mutation key instead. Inference metadata is
+    unsupported during CUDA graph capture because its current values cannot be
+    safely copied to the host there. Version-bypassing writes to ordinary tensors
+    remain unsupported; users must rewarm with the final metadata values.
+    During CUDA graph capture/replay these metadata tensors must match the exact
+    prewarmed values and remain immutable. Frozen wrapper plans supply the static
+    dependencies; source extents are included only when worklist validation reads
+    them, and full source tensor metadata only when generated pointer tables embed
+    it.
+    """
+    wrapper_plans = getattr(cast("Any", cute_kernel), "_helion_cute_wrapper_plans", ())
+    plan_index = next(
+        (index for index, candidate in enumerate(wrapper_plans) if candidate is plan),
+        None,
+    )
+    if plan_index is None:
+        raise exc.BackendUnsupported(
+            "cute", "grouped scheduler plan is not registered on the CuTe kernel"
+        )
+
+    worklist_source_extents: list[object] = []
+    if bool(plan.get("worklist_metadata")):
+        lhs = _tcgen05_grouped_dynamic_ab_tensor_arg(plan, args, "lhs_idx", "A")
+        rhs = _tcgen05_grouped_dynamic_ab_tensor_arg(plan, args, "rhs_idx", "B")
+        worklist_source_extents = [
+            "worklist_source_extents",
+            int(lhs.size(0)),
+            int(rhs.size(0)),
+        ]
+
+    return (
+        "tcgen05_grouped_static_metadata",
+        plan_index,
+        *_tcgen05_grouped_tensor_cache_key("layout", layout, include_version=True),
+        *worklist_source_extents,
+        *(
+            (
+                *_tcgen05_grouped_tensor_cache_key(
+                    "direct_lhs",
+                    _tcgen05_grouped_dynamic_ab_tensor_arg(plan, args, "lhs_idx", "A"),
+                ),
+                *_tcgen05_grouped_tensor_cache_key(
+                    "direct_rhs",
+                    _tcgen05_grouped_dynamic_ab_tensor_arg(plan, args, "rhs_idx", "B"),
+                ),
+                *_tcgen05_grouped_tensor_cache_key(
+                    "direct_d",
+                    _tcgen05_grouped_direct_d_tensor_arg(cute_kernel, plan, args),
+                ),
+            )
+            if bool(plan.get("direct_pointer_metadata"))
+            else ()
+        ),
+        *_tcgen05_grouped_external_direct_cache_key(plan, args),
+        *(
+            _tcgen05_grouped_tensor_cache_key("n_sizes", n_sizes, include_version=True)
+            if n_sizes is not None
+            else ()
+        ),
+        *(
+            _tcgen05_grouped_tensor_cache_key("k_sizes", k_sizes, include_version=True)
+            if k_sizes is not None
+            else ()
+        ),
+    )
+
+
+def _cute_bake_tensor_shapes_guard(cute_kernel: object) -> bool:
+    any_obj = cast("Any", cute_kernel)
+    wrapper_plans = getattr(any_obj, "_helion_cute_wrapper_plans", None)
+    wrapper_plans_disable_bake = bool(wrapper_plans) and any(
+        not _cute_wrapper_plan_bakes_tensor_shapes(plan) for plan in wrapper_plans
+    )
+    return not bool(
+        getattr(any_obj, "_helion_cute_disable_bake_tensor_shapes", False)
+        or wrapper_plans_disable_bake
+    )
+
+
+def _append_tcgen05_grouped_static_mutation_guards(
+    key: list[object],
+    cute_kernel: object,
+    args: tuple[object, ...],
+) -> None:
+    for plan in _tcgen05_grouped_static_plans(cute_kernel):
+        for label, index in (
+            ("layout", _plan_int_value(plan, "layout_idx")),
+            ("n_sizes", plan.get("n_sizes_idx")),
+            ("k_sizes", plan.get("k_sizes_idx")),
+        ):
+            if not (
+                isinstance(index, int)
+                and index < len(args)
+                and isinstance(args[index], torch.Tensor)
+            ):
+                continue
+            tensor = args[index]
+            assert isinstance(tensor, torch.Tensor)
+            key.append(
+                (
+                    f"tcgen05_grouped_static_{label}",
+                    index,
+                    id(tensor),
+                    *_tcgen05_grouped_tensor_mutation_key(tensor),
+                )
+            )
+
+
+def _tcgen05_grouped_static_metadata_cache(
+    cute_kernel: object,
+) -> OrderedDict[tuple[object, ...], _Tcgen05GroupedStaticMetadataCacheEntry] | None:
+    try:
+        return cast(
+            "OrderedDict[tuple[object, ...], _Tcgen05GroupedStaticMetadataCacheEntry]",
+            cast("Any", cute_kernel)._helion_tcgen05_grouped_static_metadata_cache,
+        )
+    except AttributeError:
+        return None
+
+
+def _tcgen05_grouped_static_metadata_cache_entry(
+    cute_kernel: object,
+    cache_key: tuple[object, ...],
+    layout: torch.Tensor,
+    n_sizes: torch.Tensor | None,
+    k_sizes: torch.Tensor | None = None,
+) -> _Tcgen05GroupedStaticMetadataCacheEntry | None:
+    cache = _tcgen05_grouped_static_metadata_cache(cute_kernel)
+    if cache is None:
+        return None
+    cached = cache.get(cache_key)
+    if cached is not None and cached.matches(layout, n_sizes, k_sizes):
+        cache.move_to_end(cache_key)
+        return cached
+    if cached is not None:
+        cache.pop(cache_key, None)
+    return None
+
+
+def _build_tcgen05_grouped_static_metadata(
+    cute_kernel: object,
+    plan: dict[str, object],
+    args: tuple[object, ...],
+) -> _Tcgen05GroupedStaticMetadataCacheEntry:
+    layout = _tcgen05_grouped_static_layout_arg(plan, args)
+    _validate_tcgen05_grouped_tensor_devices(layout, args)
+    n_sizes_arg = _tcgen05_grouped_static_size_arg(plan, args, "n_sizes")
+    k_sizes_arg = _tcgen05_grouped_static_size_arg(plan, args, "k_sizes")
+    cache_key = _tcgen05_grouped_static_metadata_cache_key(
+        cute_kernel,
+        plan,
+        layout,
+        n_sizes_arg,
+        k_sizes_arg,
+        args,
+    )
+    cache = _tcgen05_grouped_static_metadata_cache(cute_kernel)
+    if cache is None:
+        cache = OrderedDict()
+        cast("Any", cute_kernel)._helion_tcgen05_grouped_static_metadata_cache = cache
+    cached = _tcgen05_grouped_static_metadata_cache_entry(
+        cute_kernel,
+        cache_key,
+        layout,
+        n_sizes_arg,
+        k_sizes_arg,
+    )
+    if cached is not None:
+        return cached
+    if _cuda_stream_capture_context(layout.device)[1] is not None:
+        raise exc.BackendUnsupported(
+            "cute",
+            "tcgen05 grouped scheduler metadata is not cached for this layout; "
+            "call the kernel once with the final grouped metadata values before "
+            "CUDA graph capture",
+        )
+
+    group_count = _plan_int_value(plan, "group_count")
+    bm = _plan_int_value(plan, "bm")
+    bn = _plan_int_value(plan, "bn")
+    bk = _plan_int_value(plan, "bk")
+    worklist_nm = _tcgen05_plan_orientation(plan) == "nm"
+    worklist_m_tile = TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE if worklist_nm else bm
+    n_size = _plan_int_value(plan, "n_size")
+    k_total_size = _plan_int_value(plan, "k_total_size")
+    scheduler_bm = TCGEN05_GROUPED_WORKLIST_MMA_M_TILE if worklist_nm else bm
+    scheduler_bn = TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE if worklist_nm else bn
+    dynamic_ab_tensormaps = bool(plan.get("dynamic_ab_tensormaps"))
+    dynamic_d_tensormap = bool(plan.get("dynamic_d_tensormap"))
+    direct_pointer_metadata = bool(plan.get("direct_pointer_metadata"))
+    external_direct_metadata = _tcgen05_grouped_external_direct_metadata_args(
+        plan,
+        args,
+    )
+    worklist_metadata = bool(plan.get("worklist_metadata"))
+    m_tail_preserve = bool(plan.get("m_tail_preserve"))
+    n_tail_preserve = bool(plan.get("n_tail_preserve"))
+    if worklist_nm and not worklist_metadata:
+        raise exc.BackendUnsupported(
+            "cute", "tcgen05 N,M orientation requires grouped worklist metadata"
+        )
+    if dynamic_ab_tensormaps and bk != 64:
+        raise exc.BackendUnsupported(
+            "cute",
+            "tcgen05 grouped dynamic A/B TensorMaps are validated only for BK64",
+        )
+    direct_lhs: torch.Tensor | None = None
+    direct_rhs: torch.Tensor | None = None
+    direct_d: torch.Tensor | None = None
+    if direct_pointer_metadata:
+        if not dynamic_ab_tensormaps or not bool(plan.get("dynamic_d_tensormap")):
+            raise exc.BackendUnsupported(
+                "cute",
+                "tcgen05 grouped direct pointer metadata requires dynamic A/B "
+                "and D TensorMaps",
+            )
+        if worklist_nm:
+            raise exc.BackendUnsupported(
+                "cute",
+                "tcgen05 grouped direct pointer metadata supports only the "
+                "default M,N TensorMap orientation",
+            )
+        _validate_tcgen05_grouped_dynamic_ab_tensormaps(plan, args)
+        direct_lhs = _tcgen05_grouped_dynamic_ab_tensor_arg(plan, args, "lhs_idx", "A")
+        direct_rhs = _tcgen05_grouped_dynamic_ab_tensor_arg(plan, args, "rhs_idx", "B")
+        direct_d = _tcgen05_grouped_direct_d_tensor_arg(cute_kernel, plan, args)
+        _validate_tcgen05_grouped_direct_d_tensormap(direct_d)
+    if worklist_nm:
+        if (
+            n_size <= 0
+            or n_size % TCGEN05_GROUPED_WORKLIST_STORE_SHAPE[2] != 0
+            or k_total_size % bk != 0
+        ):
+            raise exc.BackendUnsupported(
+                "cute",
+                "tcgen05 N,M worklist scheduler requires output N "
+                "divisible by 32 and K divisible by the CTA K tile",
+            )
+    elif n_size % bn != 0 or k_total_size % bk != 0:
+        raise exc.BackendUnsupported(
+            "cute",
+            "tcgen05 grouped scheduler requires common N/K dimensions divisible "
+            "by the CTA tile",
+        )
+    if worklist_nm and (
+        not dynamic_ab_tensormaps
+        or _tcgen05_grouped_dynamic_ab_tensormap_rank(plan) != 2
+        or not dynamic_d_tensormap
+    ):
+        raise exc.BackendUnsupported(
+            "cute",
+            "tcgen05 N,M worklist metadata requires rank-2 dynamic "
+            "A/B TensorMaps and a dynamic D TensorMap",
+        )
+    n_sizes_values: list[int] | None = None
+    if n_sizes_arg is not None:
+        if int(n_sizes_arg.numel()) != group_count:
+            raise exc.BackendUnsupported(
+                "cute",
+                "tcgen05 grouped scheduler n_sizes length must match group count",
+            )
+        n_sizes_values = [int(value) for value in n_sizes_arg.detach().cpu().tolist()]
+    k_sizes_values: list[int] | None = None
+    if k_sizes_arg is not None:
+        if int(k_sizes_arg.numel()) != group_count:
+            raise exc.BackendUnsupported(
+                "cute",
+                "tcgen05 grouped scheduler k_sizes length must match group count",
+            )
+        k_sizes_values = [int(value) for value in k_sizes_arg.detach().cpu().tolist()]
+    if dynamic_ab_tensormaps and k_sizes_values is None and not worklist_metadata:
+        raise exc.BackendUnsupported(
+            "cute",
+            "tcgen05 grouped dynamic A/B TensorMaps require exact per-group k_sizes",
+        )
+
+    starts: list[int] = []
+    sizes: list[int] = []
+    has_m_tail = False
+    real_groups: list[int] | None = [] if worklist_metadata else None
+    if worklist_metadata:
+        if int(layout.size(0)) != group_count:
+            raise exc.BackendUnsupported(
+                "cute",
+                "tcgen05 grouped worklist scheduler row count must match group count",
+            )
+        if n_sizes_values is not None or k_sizes_values is not None:
+            raise exc.BackendUnsupported(
+                "cute",
+                "tcgen05 grouped worklist scheduler uses common N/K sizes",
+            )
+        lhs = _tcgen05_grouped_dynamic_ab_tensor_arg(plan, args, "lhs_idx", "A")
+        rhs = _tcgen05_grouped_dynamic_ab_tensor_arg(plan, args, "rhs_idx", "B")
+        rows = cast("list[list[int]]", layout.detach().cpu().tolist())
+        _validate_tcgen05_grouped_worklist_nm(plan, args, rows)
+        for row in rows:
+            real_group, start, valid_m, reserved_or_store_m = (
+                int(value) for value in row
+            )
+            if worklist_nm:
+                aligned_m = reserved_or_store_m
+                starts.append(start)
+                sizes.append(aligned_m)
+                assert real_groups is not None
+                real_groups.append(real_group)
+                continue
+            if reserved_or_store_m != 0:
+                raise exc.BackendUnsupported(
+                    "cute",
+                    "tcgen05 grouped worklist scheduler requires reserved "
+                    "metadata column to be zero",
+                )
+            if real_group < 0 or real_group >= int(rhs.size(0)):
+                raise exc.BackendUnsupported(
+                    "cute",
+                    "tcgen05 grouped worklist scheduler real group id is "
+                    "outside B_grouped",
+                )
+            if start < 0 or valid_m <= 0 or valid_m > worklist_m_tile:
+                raise exc.BackendUnsupported(
+                    "cute",
+                    "tcgen05 grouped worklist scheduler requires each row to "
+                    "describe one CTA-M tile",
+                )
+            if start + valid_m > int(lhs.size(0)):
+                raise exc.BackendUnsupported(
+                    "cute",
+                    "tcgen05 grouped worklist scheduler row exceeds A extent",
+                )
+            starts.append(start)
+            sizes.append(valid_m)
+            assert real_groups is not None
+            real_groups.append(real_group)
+    else:
+        layout_values = [int(value) for value in layout.detach().cpu().tolist()]
+        cursor = 0
+        for expected_group in range(group_count):
+            if m_tail_preserve and expected_group > 0:
+                next_m_boundary = ((cursor + bm - 1) // bm) * bm
+                while (
+                    cursor < len(layout_values)
+                    and cursor < next_m_boundary
+                    and layout_values[cursor] < 0
+                ):
+                    cursor += 1
+                if cursor != next_m_boundary or (
+                    cursor < len(layout_values) and layout_values[cursor] < 0
+                ):
+                    raise exc.BackendUnsupported(
+                        "cute",
+                        "tcgen05 grouped scheduler requires interior M-tail padding "
+                        "to end at the next CTA M tile boundary",
+                    )
+            if cursor >= len(layout_values) or layout_values[cursor] != expected_group:
+                raise exc.BackendUnsupported(
+                    "cute",
+                    "tcgen05 grouped scheduler requires ordered complete groups "
+                    "without row holes or skipped group indices",
+                )
+            start = cursor
+            while (
+                cursor < len(layout_values) and layout_values[cursor] == expected_group
+            ):
+                cursor += 1
+            actual_m = cursor - start
+            if start % bm != 0:
+                raise exc.BackendUnsupported(
+                    "cute",
+                    "tcgen05 grouped scheduler requires each group start to be "
+                    "divisible by the CTA M tile",
+                )
+            if actual_m % bm != 0 and not m_tail_preserve:
+                raise exc.BackendUnsupported(
+                    "cute",
+                    "tcgen05 grouped scheduler requires each group M size to be "
+                    "divisible by the CTA M tile unless the source store proves "
+                    "grouped M-tail preservation",
+                )
+            has_m_tail = has_m_tail or actual_m % bm != 0
+            starts.append(start)
+            sizes.append(actual_m)
+        if cursor != len(layout_values):
+            if m_tail_preserve and all(value < 0 for value in layout_values[cursor:]):
+                cursor = len(layout_values)
+        if cursor != len(layout_values):
+            raise exc.BackendUnsupported(
+                "cute",
+                "tcgen05 grouped scheduler requires layout rows to end after the "
+                "last ordered group",
+            )
+
+    problem_sizes = []
+    total_clusters = 0
+    has_n_tail = False
+    for group_idx, actual_m in enumerate(sizes):
+        group_n = n_size if n_sizes_values is None else n_sizes_values[group_idx]
+        group_k = k_total_size if k_sizes_values is None else k_sizes_values[group_idx]
+        if group_n <= 0 or group_n > n_size:
+            raise exc.BackendUnsupported(
+                "cute",
+                "tcgen05 grouped scheduler requires each per-group N size to be "
+                "positive and within the output N extent",
+            )
+        if group_k <= 0 or group_k > k_total_size:
+            raise exc.BackendUnsupported(
+                "cute",
+                "tcgen05 grouped scheduler requires each per-group K size to be "
+                "positive and within the padded K extent",
+            )
+        if worklist_nm:
+            if group_n % TCGEN05_GROUPED_WORKLIST_STORE_SHAPE[2] != 0:
+                raise exc.BackendUnsupported(
+                    "cute",
+                    "tcgen05 N,M worklist scheduler requires each "
+                    "per-group output N size to be divisible by 32",
+                )
+            has_n_tail = has_n_tail or group_n % scheduler_bm != 0
+        else:
+            if group_n % bn != 0 and not n_tail_preserve:
+                raise exc.BackendUnsupported(
+                    "cute",
+                    "tcgen05 grouped scheduler requires each per-group N size to be "
+                    "divisible by the CTA N tile unless the source store proves "
+                    "grouped N-tail preservation",
+                )
+            has_n_tail = has_n_tail or group_n % bn != 0
+        if group_k % bk != 0 and not (dynamic_ab_tensormaps and group_k % 16 == 0):
+            if dynamic_ab_tensormaps:
+                raise exc.BackendUnsupported(
+                    "cute",
+                    "tcgen05 grouped dynamic A/B TensorMaps require each "
+                    "per-group K size to be a multiple of 16",
+                )
+            raise exc.BackendUnsupported(
+                "cute",
+                "tcgen05 grouped scheduler requires each per-group K size to be "
+                "divisible by the CTA K tile",
+            )
+        if worklist_nm:
+            problem_sizes.append((group_n, actual_m, group_k, 1))
+            total_clusters += ((group_n + scheduler_bm - 1) // scheduler_bm) * (
+                (actual_m + scheduler_bn - 1) // scheduler_bn
+            )
+        else:
+            problem_sizes.append((actual_m, group_n, group_k, 1))
+            total_clusters += ((actual_m + bm - 1) // bm) * ((group_n + bn - 1) // bn)
+    if total_clusters <= 0:
+        raise exc.BackendUnsupported(
+            "cute", "tcgen05 grouped scheduler found zero work clusters"
+        )
+    expected_has_m_tail = plan.get("grouped_static_has_m_tail")
+    if isinstance(expected_has_m_tail, bool) and has_m_tail != expected_has_m_tail:
+        raise exc.BackendUnsupported(
+            "cute",
+            "tcgen05 grouped M-tail specialization does not match the current "
+            "layout metadata; rebind and prewarm the grouped kernel with the "
+            "final metadata before launch or CUDA graph capture",
+        )
+    expected_has_n_tail = plan.get("grouped_static_has_n_tail")
+    if isinstance(expected_has_n_tail, bool) and has_n_tail != expected_has_n_tail:
+        raise exc.BackendUnsupported(
+            "cute",
+            "tcgen05 grouped N-tail specialization does not match the current "
+            "n_sizes metadata; rebind and prewarm the grouped kernel with the "
+            "final metadata before launch or CUDA graph capture",
+        )
+
+    device = layout.device
+    direct_pointers_tensor: torch.Tensor | None = None
+    direct_strides_tensor: torch.Tensor | None = None
+    if direct_pointer_metadata:
+        assert direct_lhs is not None
+        assert direct_rhs is not None
+        assert direct_d is not None
+        if external_direct_metadata is not None:
+            direct_pointers_tensor, direct_strides_tensor = external_direct_metadata
+            if direct_pointers_tensor.device != device:
+                raise exc.BackendUnsupported(
+                    "cute",
+                    "tcgen05 grouped external direct metadata must be on the "
+                    "grouped scheduler metadata device",
+                )
+            if tuple(int(size) for size in direct_pointers_tensor.shape) != (
+                len(sizes),
+                3,
+            ):
+                raise exc.BackendUnsupported(
+                    "cute",
+                    "tcgen05 grouped external direct pointer metadata must have "
+                    "shape [metadata_rows, 3]",
+                )
+            if tuple(int(size) for size in direct_strides_tensor.shape) != (
+                len(sizes),
+                3,
+                2,
+            ):
+                raise exc.BackendUnsupported(
+                    "cute",
+                    "tcgen05 grouped external direct stride metadata must have "
+                    "shape [metadata_rows, 3, 2]",
+                )
+        else:
+            direct_pointer_rows: list[tuple[int, int, int]] = []
+            direct_stride_rows: list[
+                tuple[tuple[int, int], tuple[int, int], tuple[int, int]]
+            ] = []
+            for metadata_idx, (start, actual_m) in enumerate(
+                zip(starts, sizes, strict=True)
+            ):
+                real_group = (
+                    real_groups[metadata_idx]
+                    if real_groups is not None
+                    else metadata_idx
+                )
+                group_n = (
+                    n_size if n_sizes_values is None else n_sizes_values[metadata_idx]
+                )
+                group_k = (
+                    k_total_size
+                    if k_sizes_values is None
+                    else k_sizes_values[metadata_idx]
+                )
+                if start + actual_m > int(direct_lhs.size(0)):
+                    raise exc.BackendUnsupported(
+                        "cute",
+                        "tcgen05 grouped direct pointer metadata A segment exceeds "
+                        "the source extent",
+                    )
+                if start + actual_m > int(direct_d.size(0)) or group_n > int(
+                    direct_d.size(1)
+                ):
+                    raise exc.BackendUnsupported(
+                        "cute",
+                        "tcgen05 grouped direct pointer metadata D segment exceeds "
+                        "the output extent",
+                    )
+                if real_group < 0 or real_group >= int(direct_rhs.size(0)):
+                    raise exc.BackendUnsupported(
+                        "cute",
+                        "tcgen05 grouped direct pointer metadata B group is out "
+                        "of range",
+                    )
+                if group_n > int(direct_rhs.size(1)) or group_k > int(
+                    direct_rhs.size(2)
+                ):
+                    raise exc.BackendUnsupported(
+                        "cute",
+                        "tcgen05 grouped direct pointer metadata B segment exceeds "
+                        "the grouped B extent",
+                    )
+                direct_pointer_rows.append(
+                    (
+                        int(direct_lhs.data_ptr())
+                        + start * int(direct_lhs.stride(0)) * direct_lhs.element_size(),
+                        int(direct_rhs.data_ptr())
+                        + real_group
+                        * int(direct_rhs.stride(0))
+                        * direct_rhs.element_size(),
+                        int(direct_d.data_ptr())
+                        + start * int(direct_d.stride(0)) * direct_d.element_size(),
+                    )
+                )
+                direct_stride_rows.append(
+                    (
+                        (int(direct_lhs.stride(0)), int(direct_lhs.stride(1))),
+                        (int(direct_rhs.stride(1)), int(direct_rhs.stride(2))),
+                        (int(direct_d.stride(0)), int(direct_d.stride(1))),
+                    )
+                )
+            direct_pointers_tensor = torch.tensor(
+                direct_pointer_rows, dtype=torch.int64, device=device
+            )
+            direct_strides_tensor = torch.tensor(
+                direct_stride_rows, dtype=torch.int32, device=device
+            )
+    problem_tensor = torch.tensor(problem_sizes, dtype=torch.int32, device=device)
+    starts_tensor = torch.tensor(starts, dtype=torch.int32, device=device)
+    real_groups_tensor = (
+        torch.tensor(real_groups, dtype=torch.int32, device=device)
+        if real_groups is not None
+        else None
+    )
+    result = _Tcgen05GroupedStaticMetadataResult(
+        problem_sizes=problem_tensor,
+        starts=starts_tensor,
+        total_clusters=total_clusters,
+        real_groups=real_groups_tensor,
+        direct_pointers=direct_pointers_tensor,
+        direct_strides=direct_strides_tensor,
+    )
+    entry = _Tcgen05GroupedStaticMetadataCacheEntry(
+        layout_ref=weakref.ref(layout),
+        n_sizes_ref=weakref.ref(n_sizes_arg) if n_sizes_arg is not None else None,
+        k_sizes_ref=weakref.ref(k_sizes_arg) if k_sizes_arg is not None else None,
+        has_m_tail=has_m_tail,
+        has_n_tail=has_n_tail,
+        result=result,
+    )
+    cache[cache_key] = entry
+    cache.move_to_end(cache_key)
+    while len(cache) > _TCGEN05_GROUPED_STATIC_METADATA_CACHE_LIMIT:
+        cache.popitem(last=False)
+    return entry
+
+
 def _cute_launch_arg_cache_key(
     cute_kernel: object,
     args: tuple[object, ...],
     grid: tuple[int, int, int],
+    *,
+    dynamic_tensormap_contexts: tuple[_CuteGroupedLaunchContext, ...] | None = None,
 ) -> tuple[object, ...]:
     constexpr_flags = _cute_kernel_param_is_constexpr(cute_kernel)
-    key: list[object] = [grid]
+    key: list[object] = [len(args), grid, _cute_bake_tensor_shapes_guard(cute_kernel)]
+    if dynamic_tensormap_contexts is None:
+        dynamic_tensormap_contexts = _cute_dynamic_tensormap_contexts(cute_kernel, args)
+    if dynamic_tensormap_contexts:
+        key.append(("dynamic_tensormap_contexts", dynamic_tensormap_contexts))
     for i, arg in enumerate(args):
         if isinstance(arg, torch.Tensor):
             _validate_cute_launcher_tensor(arg)
@@ -1411,7 +3225,7 @@ def _cute_launch_arg_cache_key(
                     arg.device.index,
                     str(arg.dtype),
                     arg.ndim,
-                    arg.data_ptr(),
+                    int(arg.data_ptr()),
                     tuple(int(arg.size(d)) for d in range(arg.ndim)),
                     tuple(int(arg.stride(d)) for d in range(arg.ndim)),
                 )
@@ -1428,15 +3242,71 @@ def _cute_launch_arg_cache_key(
                 scalar_key_value,
             )
         )
+    _append_tcgen05_grouped_static_mutation_guards(key, cute_kernel, args)
     return tuple(key)
+
+
+def _retain_cute_capture_owned_launch_tensors(
+    cute_kernel: object,
+    *,
+    grouped_launch_contexts: tuple[_CuteGroupedLaunchContext, ...],
+    owned_tensors: tuple[torch.Tensor, ...],
+) -> None:
+    """Keep raw-pointer launch tensors alive for captured graph replays."""
+    capture_contexts = tuple(
+        context for context in grouped_launch_contexts if context[3] is not None
+    )
+    if not capture_contexts or not owned_tensors:
+        return
+    cache = cast(
+        "dict[tuple[_CuteGroupedLaunchContext, ...], dict[int, torch.Tensor]]",
+        cast("Any", cute_kernel).__dict__.setdefault(
+            "_helion_cute_capture_owned_launch_tensors", {}
+        ),
+    )
+    capture_tensors = cache.setdefault(capture_contexts, {})
+    for tensor in owned_tensors:
+        capture_tensors[id(tensor)] = tensor
+    _track_cute_cuda_graph_cache_entry(
+        cute_kernel,
+        "_helion_cute_capture_owned_launch_tensors",
+        capture_contexts,
+        capture_tensors,
+        owned_tensors,
+    )
+
+
+def _record_cute_owned_launch_tensors(
+    owned_tensors: tuple[torch.Tensor, ...],
+) -> None:
+    """Associate raw-pointer launch tensors with their current CUDA streams."""
+    streams: dict[tuple[str, int | None], torch.cuda.Stream] = {}
+    for tensor in owned_tensors:
+        device_key = (tensor.device.type, tensor.device.index)
+        stream = streams.get(device_key)
+        if stream is None:
+            stream = torch.cuda.current_stream(tensor.device)
+            streams[device_key] = stream
+        tensor.record_stream(stream)
 
 
 def _build_cached_cute_schema_and_args(
     cute_kernel: object,
     args: tuple[object, ...],
     grid: tuple[int, int, int],
-) -> tuple[tuple[tuple[object, ...], ...], tuple[object, ...]]:
-    cache_key = _cute_launch_arg_cache_key(cute_kernel, args, grid)
+) -> _CuteLaunchArgCacheEntry:
+    dynamic_tensormap_contexts = _cute_dynamic_tensormap_contexts(cute_kernel, args)
+    grouped_launch_contexts = _cute_grouped_launch_contexts(
+        cute_kernel,
+        args,
+        dynamic_tensormap_contexts=dynamic_tensormap_contexts,
+    )
+    cache_key = _cute_launch_arg_cache_key(
+        cute_kernel,
+        args,
+        grid,
+        dynamic_tensormap_contexts=dynamic_tensormap_contexts,
+    )
     try:
         # pyrefly: ignore [missing-attribute]
         cache = cute_kernel._helion_cute_launch_arg_cache
@@ -1446,11 +3316,28 @@ def _build_cached_cute_schema_and_args(
         cute_kernel._helion_cute_launch_arg_cache = cache
     cached = cache.get(cache_key)
     if cached is not None:
-        cache[cache_key] = cache.pop(cache_key)
-        return cached
+        if isinstance(
+            cached, _CuteLaunchArgCacheEntry
+        ) and _cute_grouped_static_metadata_matches(
+            cached.grouped_static_metadata, cute_kernel, args
+        ):
+            cache[cache_key] = cache.pop(cache_key)
+            _retain_cute_capture_owned_launch_tensors(
+                cute_kernel,
+                grouped_launch_contexts=grouped_launch_contexts,
+                owned_tensors=cached.owned_tensors,
+            )
+            return cached
+        cache.pop(cache_key)
 
     built = _build_cute_schema_and_args(cute_kernel, args, grid)
     cache[cache_key] = built
+    if built.owned_tensors:
+        _retain_cute_capture_owned_launch_tensors(
+            cute_kernel,
+            grouped_launch_contexts=grouped_launch_contexts,
+            owned_tensors=built.owned_tensors,
+        )
     if len(cache) > _CUTE_LAUNCH_ARG_CACHE_LIMIT:
         cache.pop(next(iter(cache)))
     return built
@@ -1481,7 +3368,7 @@ def _build_cute_schema_and_args(
     args: tuple[object, ...],
     grid: tuple[int, int, int],
     bake_tensor_shapes: bool = True,
-) -> tuple[tuple[tuple[object, ...], ...], tuple[object, ...]]:
+) -> _CuteLaunchArgCacheEntry:
     # NOTE: the returned launch args deliberately EXCLUDE the CUDA stream. The
     # stream is the only launch arg that is not a pure function of
     # (grid, tensor metadata, scalars), so it must not be baked into the cached
@@ -1495,15 +3382,7 @@ def _build_cute_schema_and_args(
     # Full-tile tcgen05 wrapper schemas are specialized by problem shape and
     # stride, while partial-tile paths still propagate runtime tensor layouts.
     if bake_tensor_shapes:
-        any_obj = cast("Any", cute_kernel)
-        wrapper_plans = getattr(any_obj, "_helion_cute_wrapper_plans", None)
-        non_bakeable_plan = bool(wrapper_plans) and any(
-            not _cute_wrapper_plan_bakes_tensor_shapes(plan) for plan in wrapper_plans
-        )
-        if (
-            getattr(any_obj, "_helion_cute_disable_bake_tensor_shapes", False)
-            or non_bakeable_plan
-        ):
+        if not _cute_bake_tensor_shapes_guard(cute_kernel):
             bake_tensor_shapes = False
     schema: list[tuple[object, ...]] = []
     launch_args: list[object] = []
@@ -1561,10 +3440,99 @@ def _build_cute_schema_and_args(
             schema.append(("scalar", scalar_kind))
             launch_args.append(scalar_value)
 
+    owned_tensors: list[torch.Tensor] = []
+    grouped_static_metadata: list[_Tcgen05GroupedStaticMetadataCacheEntry] = []
+
+    def append_wrapper_tensor(
+        name: str,
+        tensor: torch.Tensor,
+        *,
+        owned: bool = False,
+    ) -> None:
+        _validate_cute_launcher_tensor(tensor)
+        sizes = tuple(int(tensor.size(d)) for d in range(tensor.ndim))
+        strides = tuple(int(tensor.stride(d)) for d in range(tensor.ndim))
+        launch_args.append(
+            make_ptr(
+                cast("Any", _torch_dtype_to_cutlass(tensor.dtype)),
+                tensor.data_ptr(),
+                gmem_space,
+                assumed_align=16,
+            )
+        )
+        schema.append(
+            (
+                "wrapper_tensor",
+                name,
+                str(tensor.dtype),
+                tensor.ndim,
+                sizes,
+                strides,
+            )
+        )
+        if owned:
+            owned_tensors.append(tensor)
+
+    for plan in _tcgen05_grouped_static_plans(cute_kernel):
+        metadata_entry = _build_tcgen05_grouped_static_metadata(cute_kernel, plan, args)
+        metadata_result = metadata_entry.result
+        problem_tensor = metadata_result.problem_sizes
+        starts_tensor = metadata_result.starts
+        real_groups_tensor = metadata_result.real_groups
+        direct_pointers_tensor = metadata_result.direct_pointers
+        direct_strides_tensor = metadata_result.direct_strides
+        total_clusters = metadata_result.total_clusters
+        grouped_static_metadata.append(metadata_entry)
+        layout = _tcgen05_grouped_static_layout_arg(plan, args)
+        for name, tensor in (
+            (_plan_str_value(plan, "problem_sizes_arg"), problem_tensor),
+            (_plan_str_value(plan, "starts_arg"), starts_tensor),
+            *(
+                ((_plan_str_value(plan, "real_groups_arg"), real_groups_tensor),)
+                if real_groups_tensor is not None
+                else ()
+            ),
+        ):
+            append_wrapper_tensor(name, tensor)
+        workspace_name: str | None = None
+        tensormap_count = 0
+        if bool(plan.get("dynamic_ab_tensormaps")):
+            _validate_tcgen05_grouped_dynamic_ab_tensormaps(plan, args)
+            workspace_name = _plan_str_value(plan, "ab_tensormaps_arg")
+            tensormap_count = 3 if bool(plan.get("dynamic_d_tensormap")) else 2
+        elif bool(plan.get("dynamic_d_tensormap")):
+            workspace_name = _plan_str_value(plan, "d_tensormaps_arg")
+            tensormap_count = 1
+        if workspace_name is not None:
+            workspace = _tcgen05_grouped_dynamic_tensormap_workspace(
+                cute_kernel,
+                device=layout.device,
+                tensormap_count=tensormap_count,
+            )
+            append_wrapper_tensor(workspace_name, workspace, owned=True)
+        if direct_pointers_tensor is not None and direct_strides_tensor is not None:
+            append_wrapper_tensor(
+                _plan_str_value(plan, "direct_pointers_arg"),
+                direct_pointers_tensor,
+            )
+            append_wrapper_tensor(
+                _plan_str_value(plan, "direct_strides_arg"),
+                direct_strides_tensor,
+            )
+        total_name = _plan_str_value(plan, "total_clusters_arg")
+        schema.append(("wrapper_host_scalar", total_name, "int"))
+        launch_args.append(total_clusters)
+        owned_tensors.extend(metadata_result.tensors())
+
     launch_args.extend(grid)
     # The stream is intentionally NOT appended here; it is sampled fresh per
     # launch by the caller so CUDA graph capture sees the capture stream.
-    return tuple(schema), tuple(launch_args)
+    return _CuteLaunchArgCacheEntry(
+        schema=tuple(schema),
+        launch_args=tuple(launch_args),
+        grouped_static_metadata=tuple(grouped_static_metadata),
+        owned_tensors=tuple(owned_tensors),
+    )
 
 
 _CUTE_DSL_ARCH_CACHE: dict[int, str] = {}
@@ -1611,6 +3579,120 @@ def _ensure_cute_dsl_arch_env(args: tuple[object, ...]) -> None:
         os.environ["CUTE_DSL_ARCH"] = desired
 
 
+def _cute_last_launch_arg_guard(
+    cute_kernel: object,
+    args: tuple[object, ...],
+    grid: tuple[int, int, int],
+) -> _CuteLastLaunchArgGuard:
+    constexpr_flags = _cute_kernel_param_is_constexpr(cute_kernel)
+    arg_guards: list[_CuteLastTensorArgGuard | _CuteLastScalarArgGuard] = []
+    for index, arg in enumerate(args):
+        if isinstance(arg, torch.Tensor):
+            _validate_cute_launcher_tensor(arg)
+            arg_guards.append(
+                _CuteLastTensorArgGuard(
+                    index=index,
+                    data_ptr=int(arg.data_ptr()),
+                    device_type=arg.device.type,
+                    device_index=arg.device.index,
+                    dtype=arg.dtype,
+                    ndim=arg.ndim,
+                    shape=tuple(int(arg.size(dim)) for dim in range(arg.ndim)),
+                    stride=tuple(int(arg.stride(dim)) for dim in range(arg.ndim)),
+                )
+            )
+            continue
+        scalar_kind, scalar_value = _normalize_cute_scalar(arg)
+        arg_guards.append(
+            _CuteLastScalarArgGuard(
+                index=index,
+                is_constexpr=index < len(constexpr_flags) and constexpr_flags[index],
+                scalar_kind=scalar_kind,
+                scalar_value=_cute_scalar_cache_value(scalar_kind, scalar_value),
+            )
+        )
+    grouped_mutation_guards: list[_CuteLastGroupedMutationGuard] = []
+    for plan in _tcgen05_grouped_static_plans(cute_kernel):
+        for index in (
+            _plan_int_value(plan, "layout_idx"),
+            plan.get("n_sizes_idx"),
+            plan.get("k_sizes_idx"),
+        ):
+            if (
+                isinstance(index, int)
+                and index < len(args)
+                and isinstance(args[index], torch.Tensor)
+            ):
+                tensor = args[index]
+                assert isinstance(tensor, torch.Tensor)
+                grouped_mutation_guards.append(
+                    _CuteLastGroupedMutationGuard(
+                        index=index,
+                        tensor_id=id(tensor),
+                        mutation_key=_tcgen05_grouped_tensor_mutation_key(tensor),
+                    )
+                )
+    return _CuteLastLaunchArgGuard(
+        arg_count=len(args),
+        grid=grid,
+        bake_tensor_shapes=_cute_bake_tensor_shapes_guard(cute_kernel),
+        arg_guards=tuple(arg_guards),
+        grouped_mutation_guards=tuple(grouped_mutation_guards),
+        grouped_launch_contexts=_cute_grouped_launch_contexts(cute_kernel, args),
+    )
+
+
+def _cute_last_launch_cache_entry(
+    cute_kernel: object,
+    args: tuple[object, ...],
+    grid: tuple[int, int, int],
+    block: tuple[int, int, int],
+    compile_options: str | None,
+) -> _CuteLastLaunchCacheEntry | None:
+    entry = getattr(cast("Any", cute_kernel), "_helion_cute_last_launch_cache", None)
+    if not isinstance(entry, _CuteLastLaunchCacheEntry):
+        return None
+    if not entry.arg_guard.matches(cute_kernel, args, grid):
+        return None
+    discriminator = _cute_compiled_launcher_discriminator(
+        entry.launch.schema,
+        block,
+        compile_options,
+        args,
+    )[0]
+    if discriminator != entry.compiled_discriminator:
+        return None
+    if not _cute_grouped_static_metadata_matches(
+        entry.launch.grouped_static_metadata, cute_kernel, args
+    ):
+        return None
+    return entry
+
+
+def _set_cute_last_launch_cache_entry(
+    cute_kernel: object,
+    args: tuple[object, ...],
+    grid: tuple[int, int, int],
+    block: tuple[int, int, int],
+    compile_options: str | None,
+    launch: _CuteLaunchArgCacheEntry,
+    compiled: object,
+) -> None:
+    arg_guard = _cute_last_launch_arg_guard(cute_kernel, args, grid)
+    compiled_discriminator = _cute_compiled_launcher_discriminator(
+        launch.schema,
+        block,
+        compile_options,
+        args,
+    )[0]
+    cast("Any", cute_kernel)._helion_cute_last_launch_cache = _CuteLastLaunchCacheEntry(
+        arg_guard=arg_guard,
+        compiled_discriminator=compiled_discriminator,
+        launch=launch,
+        compiled=compiled,
+    )
+
+
 def default_cute_launcher(
     cute_kernel: object,
     grid: tuple[int, ...],
@@ -1643,20 +3725,43 @@ def default_cute_launcher(
         return None
 
     args_tuple = tuple(args)
-    schema_key, launch_args = _build_cached_cute_schema_and_args(
-        cute_kernel, args_tuple, grid_xyz
+    last_launch = _cute_last_launch_cache_entry(
+        cute_kernel,
+        args_tuple,
+        grid_xyz,
+        block_xyz,
+        cute_compile_options,
     )
+    if last_launch is not None:
+        _record_cute_owned_launch_tensors(last_launch.launch.owned_tensors)
+        return cast("Any", last_launch.compiled)(
+            *last_launch.launch.launch_args,
+            _cute_current_stream(),
+        )
+
+    launch = _build_cached_cute_schema_and_args(cute_kernel, args_tuple, grid_xyz)
     compiled = _get_compiled_cute_launcher(
         cute_kernel,
-        schema_key,
+        launch.schema,
         block_xyz,
         compile_options=cute_compile_options,
         arch_args=args_tuple,
     )
+    _record_cute_owned_launch_tensors(launch.owned_tensors)
     # Append the CUDA stream fresh on every launch (never cached): under CUDA
     # graph capture the current stream is the capture stream, so the kernel must
     # be issued there and not on a stale stream baked into the cached args.
-    return cast("Any", compiled)(*launch_args, _cute_current_stream())
+    result = cast("Any", compiled)(*launch.launch_args, _cute_current_stream())
+    _set_cute_last_launch_cache_entry(
+        cute_kernel,
+        args_tuple,
+        grid_xyz,
+        block_xyz,
+        cute_compile_options,
+        launch,
+        compiled,
+    )
+    return result
 
 
 def default_metal_launcher(

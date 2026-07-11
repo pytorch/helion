@@ -133,6 +133,8 @@ class _StatementCaptureGenerateAST(GenerateAST):
         )
         self.statements_stack = [target]
         self._statement_owner_fx_node = None
+        self._statements_by_owner_node_id = {}
+        self._track_statement_owners = True
         self._device_loop = device_loop
 
     def _record_statement_thread_references(

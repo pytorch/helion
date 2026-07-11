@@ -181,6 +181,31 @@ class TestFastDispatchKey(unittest.TestCase):
         k1 = _with_key._fast_dispatch_key((x,))
         self.assertNotEqual(k0, k1)
 
+    def test_key_fn_is_evaluated_once_with_specialization_extras(self) -> None:
+        calls = 0
+
+        def user_key(x: torch.Tensor) -> int:
+            nonlocal calls
+            calls += 1
+            return int(x.numel())
+
+        @helion.kernel(static_shapes=True, key=user_key)
+        def _with_key(x: torch.Tensor) -> torch.Tensor:
+            return x
+
+        args = (torch.empty(64),)
+        signature = _with_key._base_specialization_key(args)
+        _with_key._specialize_extra[signature] = [lambda values: len(values)]
+        _with_key._has_specialization_extras = True
+        calls = 0
+
+        key = _with_key._fast_dispatch_key(args)
+
+        self.assertIsNotNone(key)
+        self.assertEqual(calls, 1)
+        assert isinstance(key, tuple)
+        self.assertEqual(key[-2:], (64, (1,)))
+
 
 if __name__ == "__main__":
     unittest.main()
