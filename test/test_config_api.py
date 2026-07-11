@@ -18,12 +18,24 @@ from helion import exc
 from helion._compiler.backend import PallasBackend
 from helion._compiler.backend import TritonBackend
 from helion._compiler.compile_environment import CompileEnvironment
+from helion._compiler.cute.tcgen05_config import Tcgen05AbStagesThreeSearchConstraints
+from helion._compiler.cute.tcgen05_constants import TCGEN05_GROUPED_MODE_CONFIG_KEY
+from helion._compiler.cute.tcgen05_constants import TCGEN05_GROUPED_MODE_DYNAMIC
+from helion._compiler.cute.tcgen05_constants import TCGEN05_GROUPED_MODE_STATIC
+from helion._compiler.cute.tcgen05_constants import TCGEN05_GROUPED_MODE_WORKLIST_NM
+from helion._compiler.cute.tcgen05_constants import (
+    TCGEN05_GROUPED_STATIC_RESERVED_SMS_CONFIG_KEY,
+)
+from helion._compiler.cute.tcgen05_constants import (
+    TCGEN05_GROUPED_STATIC_RESERVED_SMS_MAX,
+)
 from helion._compiler.cute.tcgen05_constants import (
     TCGEN05_SCHED_CONSUMER_WAIT_MODE_CONFIG_KEY,
 )
 from helion._compiler.cute.tcgen05_constants import (
     TCGEN05_SCHED_CONSUMER_WAIT_MODE_WARP_LEADER,
 )
+from helion._compiler.cute.tcgen05_constants import TCGEN05_TWO_CTA_SEED_PID_TYPE
 from helion._testing import TestCase
 from helion._testing import onlyBackends
 from helion._testing import skipIfXPU
@@ -907,23 +919,35 @@ class TestCuteTcgen05ConfigSpecSplit(TestCase):
             )
         return spec
 
-    def test_cute_tcgen05_search_fields_and_default_flat_roundtrip(self) -> None:
+    def test_grouped_static_seed_representation(self) -> None:
         from helion.autotuner.config_generation import ConfigGeneration
 
         spec = self._make_cute_tcgen05_spec()
-        flat_keys = [key for key, _count, _is_sequence in spec.flat_key_layout()]
+        spec.allowed_pid_types = ("flat",)
+        seeds: list[helion.Config] = []
+        modes = (TCGEN05_GROUPED_MODE_STATIC, TCGEN05_GROUPED_MODE_DYNAMIC)
+        for pid_type, mode in zip(
+            ("persistent_blocked", "persistent_interleaved"), modes, strict=True
+        ):
+            seed = helion.Config(block_sizes=[128, 64, 64], pid_type=pid_type)
+            seed.config[TCGEN05_GROUPED_MODE_CONFIG_KEY] = mode
+            seeds.append(seed)
+        spec.compiler_seed_configs = seeds
 
-        self.assertIn("tcgen05_cluster_m", flat_keys)
-        self.assertIn("tcgen05_ab_stages", flat_keys)
-        self.assertIn("tcgen05_strategy", flat_keys)
-        self.assertIn("tcgen05_warp_spec_c_input_warps", flat_keys)
-
-        gen = ConfigGeneration(spec)
-        default_flat = gen.default_flat()
-        self.assertEqual(
-            gen.flatten(gen.unflatten([*default_flat])),
-            default_flat,
-        )
+        generation = ConfigGeneration(spec)
+        pairs = generation.seed_flat_config_pairs()
+        self.assertEqual(len(pairs), 2)
+        [pid_index], _ = generation._key_to_flat_indices["pid_type"]
+        [mode_index], _ = generation._key_to_flat_indices[
+            TCGEN05_GROUPED_MODE_CONFIG_KEY
+        ]
+        pid_fragment = generation.flat_spec[pid_index]
+        mode_fragment = generation.flat_spec[mode_index]
+        for (flat, normalized), mode in zip(pairs, modes, strict=True):
+            self.assertEqual(normalized.config[TCGEN05_GROUPED_MODE_CONFIG_KEY], mode)
+            generation.encode_config(flat)
+            self.assertEqual(pid_fragment.pattern_neighbors(flat[pid_index]), ["flat"])
+            self.assertEqual(mode_fragment.pattern_neighbors(flat[mode_index]), [None])
 
     def test_tcgen05_search_fields_do_not_leak_to_other_backends(self) -> None:
         from helion._compiler.backend import MetalBackend
@@ -1000,6 +1024,133 @@ class TestCuteTcgen05ConfigSpecSplit(TestCase):
         spec.normalize(config)
         self.assertEqual(config.config["tcgen05_strategy"], "role_local_with_scheduler")
         self.assertEqual(config.config["tcgen05_warp_spec_c_input_warps"], 1)
+
+    def test_grouped_static_reserved_sms_envelope(self) -> None:
+        spec = self._make_cute_tcgen05_spec()
+
+        def grouped_config(reserved_sms: object) -> helion.Config:
+            config = helion.Config(
+                block_sizes=[128, 64, 64],
+                pid_type=TCGEN05_TWO_CTA_SEED_PID_TYPE,
+            )
+            config.config.update(
+                {
+                    TCGEN05_GROUPED_MODE_CONFIG_KEY: TCGEN05_GROUPED_MODE_DYNAMIC,
+                    TCGEN05_GROUPED_STATIC_RESERVED_SMS_CONFIG_KEY: reserved_sms,
+                }
+            )
+            return config
+
+        for mode in (True, "unknown", None):
+            invalid = helion.Config(
+                block_sizes=[128, 64, 64],
+                **{TCGEN05_GROUPED_MODE_CONFIG_KEY: mode},
+            )
+            with self.assertRaisesRegex(exc.InvalidConfig, "grouped_mode"):
+                spec.normalize(invalid)
+            spec.normalize(invalid, _fix_invalid=True)
+            self.assertNotIn(TCGEN05_GROUPED_MODE_CONFIG_KEY, invalid.config)
+
+        for reserved_sms in (4, 0):
+            config = grouped_config(reserved_sms)
+            spec.normalize(config)
+            if reserved_sms:
+                self.assertEqual(
+                    config.config[TCGEN05_GROUPED_STATIC_RESERVED_SMS_CONFIG_KEY],
+                    reserved_sms,
+                )
+            else:
+                self.assertNotIn(
+                    TCGEN05_GROUPED_STATIC_RESERVED_SMS_CONFIG_KEY,
+                    config.config,
+                )
+
+        cases: tuple[tuple[str, dict[str, object]], ...] = (
+            ("missing_grouped_mode", {}),
+            (
+                "static_mode",
+                {
+                    "pid_type": TCGEN05_TWO_CTA_SEED_PID_TYPE,
+                    TCGEN05_GROUPED_MODE_CONFIG_KEY: TCGEN05_GROUPED_MODE_STATIC,
+                },
+            ),
+            (
+                "nonpersistent_pid",
+                {
+                    "pid_type": "flat",
+                    TCGEN05_GROUPED_MODE_CONFIG_KEY: TCGEN05_GROUPED_MODE_DYNAMIC,
+                },
+            ),
+        )
+
+        for name, extra_config in cases:
+            with self.subTest(name=name):
+                config = helion.Config(block_sizes=[128, 64, 64])
+                config.config.update(extra_config)
+                config.config[TCGEN05_GROUPED_STATIC_RESERVED_SMS_CONFIG_KEY] = 5
+                spec.normalize(config)
+                self.assertNotIn(
+                    TCGEN05_GROUPED_STATIC_RESERVED_SMS_CONFIG_KEY,
+                    config.config,
+                )
+
+        for value in (-1, True, "4", None, TCGEN05_GROUPED_STATIC_RESERVED_SMS_MAX + 1):
+            with (
+                self.subTest(value=value),
+                self.assertRaisesRegex(exc.InvalidConfig, "reserved_sms"),
+            ):
+                spec.normalize(grouped_config(value))
+            repaired = grouped_config(value)
+            spec.normalize(repaired, _fix_invalid=True)
+            self.assertNotIn(
+                TCGEN05_GROUPED_STATIC_RESERVED_SMS_CONFIG_KEY,
+                repaired.config,
+            )
+
+    def test_deep_ab_stage_mode_envelopes_and_stage7_roundtrip(self) -> None:
+        def selected_config() -> helion.Config:
+            return helion.Config(
+                block_sizes=[256, 128, 64],
+                pid_type=TCGEN05_TWO_CTA_SEED_PID_TYPE,
+                tcgen05_cluster_m=2,
+                tcgen05_ab_stages=7,
+                **{
+                    TCGEN05_GROUPED_MODE_CONFIG_KEY: (TCGEN05_GROUPED_MODE_WORKLIST_NM),
+                },
+            )
+
+        spec = self._make_cute_tcgen05_spec()
+        grouped_ab4 = helion.Config(
+            block_sizes=[128, 64, 64],
+            pid_type=TCGEN05_TWO_CTA_SEED_PID_TYPE,
+            tcgen05_ab_stages=4,
+            **{
+                TCGEN05_GROUPED_MODE_CONFIG_KEY: TCGEN05_GROUPED_MODE_DYNAMIC,
+            },
+        )
+        spec.normalize(grouped_ab4)
+        grouped_ab4.config["tcgen05_ab_stages"] = 4.0
+        with self.assertRaisesRegex(exc.InvalidConfig, "tcgen05_ab_stages"):
+            spec.normalize(grouped_ab4)
+
+        config = selected_config()
+        spec.normalize(config)
+        minimized = config.minimize(spec)
+        self.assertNotIn("tcgen05_cluster_n", minimized.config)
+        self.assertNotIn("tcgen05_acc_stages", minimized.config)
+        self.assertNotIn("tcgen05_c_stages", minimized.config)
+        spec.normalize(minimized)
+        self.assertEqual(minimized.config["tcgen05_ab_stages"], 7)
+
+        constrained_spec = self._make_cute_tcgen05_spec()
+        constrained_spec._cute_tcgen05_config.ab_stages_three_search_constraints = (
+            Tcgen05AbStagesThreeSearchConstraints(
+                dtype_bytes=2,
+                per_cta_smem_budget_bytes=1,
+            )
+        )
+        with self.assertRaisesRegex(exc.InvalidConfig, "tcgen05_ab_stages"):
+            constrained_spec.normalize(selected_config())
 
     def test_direct_cute_config_spec_enforces_clc_arch_gate(self) -> None:
         from helion._compiler.cute.strategies import (

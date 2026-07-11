@@ -424,6 +424,51 @@ TCGEN05_LARGE_BN_PROOF_CONFIG_KEY = "tcgen05_large_bn_proof"
 # Diagnostic Target1 topology probe: keep role predicates warp-based while
 # deriving logical MMA coordinates from flat threadIdx.x / warp / lane values.
 TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY = "tcgen05_flat_role_coordinates"
+# Grouped persistent scheduler/codegen mode for rank3 RHS grouped GEMM.
+# Codegen owns the narrow envelope check before admitting generated kernels.
+TCGEN05_GROUPED_MODE_CONFIG_KEY = "tcgen05_grouped_mode"
+TCGEN05_GROUPED_MODE_STATIC = "static"
+TCGEN05_GROUPED_MODE_DYNAMIC = "dynamic"
+TCGEN05_GROUPED_MODE_DIRECT = "direct"
+TCGEN05_GROUPED_MODE_WORKLIST_NM = "worklist_nm"
+TCGEN05_GROUPED_MODES = (
+    TCGEN05_GROUPED_MODE_STATIC,
+    TCGEN05_GROUPED_MODE_DYNAMIC,
+    TCGEN05_GROUPED_MODE_DIRECT,
+    TCGEN05_GROUPED_MODE_WORKLIST_NM,
+)
+TCGEN05_GROUPED_DYNAMIC_MODES = (
+    TCGEN05_GROUPED_MODE_DYNAMIC,
+    TCGEN05_GROUPED_MODE_DIRECT,
+    TCGEN05_GROUPED_MODE_WORKLIST_NM,
+)
+TCGEN05_GROUPED_STATIC_BLOCK_K_CHOICES = (16, 32, 64, 128)
+TCGEN05_GROUPED_STATIC_COMMON_K_BLOCK_PAIRS = (
+    (16, 16),
+    (32, 32),
+    (64, 64),
+    (96, 32),
+    (160, 32),
+    (192, 64),
+)
+TCGEN05_GROUPED_STATIC_RESERVED_SMS_CONFIG_KEY = "tcgen05_grouped_static_reserved_sms"
+TCGEN05_GROUPED_STATIC_RESERVED_SMS_SEARCH_CHOICES = (0, 2, 3, 4, 5, 8, 16)
+TCGEN05_GROUPED_STATIC_RESERVED_SMS_MAX = 1024
+# Direct pointer/stride metadata for grouped dynamic TensorMap updates. This
+# keeps A/B/D payload tensors in place and only passes small per-group metadata
+# tensors to generated tcgen05 code.
+TCGEN05_GROUPED_EXTERNAL_DIRECT_POINTERS_CONFIG_KEY = (
+    "tcgen05_grouped_external_direct_pointers"
+)
+TCGEN05_GROUPED_EXTERNAL_DIRECT_STRIDES_CONFIG_KEY = (
+    "tcgen05_grouped_external_direct_strides"
+)
+# Source rows consumed per compact N,M worklist group. This is tied to the
+# schedule's 256x224 source tile and must not leak into general grouped-GEMM
+# tiling decisions.
+TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE = 224
+TCGEN05_GROUPED_WORKLIST_MMA_M_TILE = 256
+TCGEN05_GROUPED_WORKLIST_STORE_SHAPE = (128, 32, 32)
 TCGEN05_LARGE_BN_PROOF_PROBLEM_SHAPE = (64, 512, 16)
 TCGEN05_LARGE_BN_PROOF_BLOCK_SIZES = (64, 512, 16)
 TCGEN05_LARGE_BN_PROOF_CLUSTER_M = 1
