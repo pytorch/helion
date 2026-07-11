@@ -171,7 +171,9 @@ class GenerateAST(NodeVisitor, CodegenInterface):
         finally:
             self.resident_prep_lowering_stack.pop()
 
-    def resident_prep_lowering_for_node(self, node: Node) -> ResidentPrepLowering | None:
+    def resident_prep_lowering_for_node(
+        self, node: Node
+    ) -> ResidentPrepLowering | None:
         for scope in reversed(self.resident_prep_lowering_stack):
             for (graph_id, prep_node_name), lowering in scope.items():
                 if prep_node_name != node.name:

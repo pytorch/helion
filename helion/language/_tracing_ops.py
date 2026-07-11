@@ -398,7 +398,9 @@ def _prepare_resident_prep_lowerings(
             resident_windows[host] = (ta.name, fake)
     missing = sorted(needed_hosts - resident_windows.keys())
     if missing:
-        _resident_prep_fallback(f"prep operands have no resident window refs: {missing}")
+        _resident_prep_fallback(
+            f"prep operands have no resident window refs: {missing}"
+        )
         return []
 
     prepared: list[tuple[ResidentPrepHoist, torch.Tensor, str, tuple[int, ...]]] = []
@@ -460,8 +462,7 @@ def _emit_resident_prep_refill(
     )
     assert prep_key_refs
     prep_key_changed = " | ".join(
-        f"({ref}[_wid] != {ref}[jnp.maximum(_wid - 1, 0)])"
-        for ref in prep_key_refs
+        f"({ref}[_wid] != {ref}[jnp.maximum(_wid - 1, 0)])" for ref in prep_key_refs
     )
     range_len_ref = metadata_ref_for_field(plan, "range_len")
     num_ordered_tiles = grid_parts[0]
@@ -2898,7 +2899,9 @@ def _codegen_fori_loop(state: CodegenState) -> object:
             statement_from_string(f"{num_ordered_tiles} = {grid_parts[0]}")
         )
         grid_parts = [num_ordered_tiles]
-        _emit_resident_prep_refill(state, block_ids, grid_parts, resident_prep_lowerings)
+        _emit_resident_prep_refill(
+            state, block_ids, grid_parts, resident_prep_lowerings
+        )
 
     def _build_dma_slices(
         fake: torch.Tensor,

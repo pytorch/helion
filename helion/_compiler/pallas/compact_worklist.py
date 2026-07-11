@@ -241,14 +241,10 @@ def build_resident_cache_decision(
         return ResidentCacheDecision(residents, None, 0, "no resident operands")
     ordered_arg = ordered_resident_bound_arg(plan)
     if ordered_arg is None:
-        return ResidentCacheDecision(
-            residents, None, 0, "ordered bound is not packed"
-        )
+        return ResidentCacheDecision(residents, None, 0, "ordered bound is not packed")
     compact_arg = plan.compact_axis.packed_offset_arg
     if compact_arg is None:
-        return ResidentCacheDecision(
-            residents, None, 0, "compact bound is not packed"
-        )
+        return ResidentCacheDecision(residents, None, 0, "compact bound is not packed")
     if not operands:
         return ResidentCacheDecision(residents, None, 0, "no resident operands")
     if physical_window <= 0:

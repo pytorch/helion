@@ -280,9 +280,9 @@ class CompileEnvironment:
         # Final resident-cache decision for this concrete config.  This includes
         # the cached physical window integer; runtime/codegen consumers must read
         # this instead of recomputing resident-cache eligibility.
-        self.compact_worklist_resident_cache_decision: (
-            ResidentCacheDecision | None
-        ) = None
+        self.compact_worklist_resident_cache_decision: ResidentCacheDecision | None = (
+            None
+        )
         # Optional prep-cache descriptors admitted for this concrete config.  Kept
         # separate from the correctness-bearing resident-window decision.
         self.compact_worklist_resident_prep_hoists: tuple[ResidentPrepHoist, ...] = ()

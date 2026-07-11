@@ -511,9 +511,9 @@ def _four_dim_non_ordered_permute_kernel(q, k, q_offsets):
             acc = q[tile_q, :, :, :].to(torch.float32)
             for tile_kv in hl.tile(start, end):
                 prep = k[tile_kv, :, :, :].permute(0, 2, 1, 3)
-                acc = acc + prep.permute(0, 2, 1, 3).sum(
-                    dim=0, keepdim=True
-                ).to(torch.float32)
+                acc = acc + prep.permute(0, 2, 1, 3).sum(dim=0, keepdim=True).to(
+                    torch.float32
+                )
             out[tile_q, :, :, :] = acc.to(out.dtype)
     return out
 
@@ -1549,8 +1549,7 @@ class TestResidentPrepHoistCodegen(unittest.TestCase):
         refill_guard = next(
             line
             for line in code.splitlines()
-            if "kv_begin_ref[_wid]" in line
-            and "jnp.maximum(_wid - 1, 0)" in line
+            if "kv_begin_ref[_wid]" in line and "jnp.maximum(_wid - 1, 0)" in line
         )
         self.assertIn("kv_len_ref[_wid]", refill_guard)
         self.assertNotIn("work_seq_ref", refill_guard)
@@ -1781,7 +1780,9 @@ class TestResidentCacheAndPrepHoist(unittest.TestCase):
                 TensorPolicy("q", "compact_aligned_load"),
             )
         )
-        self.assertEqual({p.arg_name for p in resident_ordered_entries(plan)}, {"k", "v"})
+        self.assertEqual(
+            {p.arg_name for p in resident_ordered_entries(plan)}, {"k", "v"}
+        )
 
     def test_resident_cache_decision_can_be_active_without_prep(self):
         from helion._compiler.pallas.compact_worklist import (

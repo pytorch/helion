@@ -2647,9 +2647,7 @@ class PallasBackend(Backend):
                     "must be keyed by range_start."
                 )
             range_start_ref_pos = (
-                fields.index("range_start")
-                if "range_start" in fields
-                else -1
+                fields.index("range_start") if "range_start" in fields else -1
             )
             missing_residents = [
                 name for name in decision.resident_operands if name not in name_to_index
