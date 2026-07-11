@@ -26,13 +26,16 @@ RETENTION_DAYS = 365
 # benchmark_dispatch input(s) whose `default` lists the kernels that platform
 # is expected to run on the nightly cron. Stable mapping; the kernel list(s)
 # are parsed from the workflow YAML so dashboard expectations track whatever's
-# currently in the workflow defaults without manual edits.
+# currently in the workflow defaults without manual edits. Platforms can draw
+# from multiple inputs: h100/b200 add `kernels_linattn`, and `tpu` unions
+# run_tpu.py (`kernels_tpu`) with the tritonbench bridge (`kernels_tpu_bridge`),
+# which cover disjoint kernels but share the one `tpu` dashboard column.
 _PLATFORM_KERNELS_INPUT = {
     "h100": ("kernels", "kernels_linattn"),
     "b200": ("kernels", "kernels_linattn"),
     "b200_cute": ("kernels_cute",),
     "mi350x": ("kernels",),
-    "tpu": ("kernels_tpu",),
+    "tpu": ("kernels_tpu", "kernels_tpu_bridge"),
 }
 
 
@@ -188,6 +191,11 @@ def parse_run(run_dir, active_platforms=None):
         dirname = os.path.basename(bench_dir)
         parts = dirname.replace("benchmark-results-", "").split("-", 1)
         platform_short = parts[0] if parts else "unknown"
+        # The tritonbench-bridge TPU job uploads under the `tpu_bridge` alias but
+        # benchmarks the same hardware as run_tpu.py's `tpu` job (on a disjoint
+        # set of kernels); fold it into the shared `tpu` platform column.
+        if platform_short == "tpu_bridge":
+            platform_short = "tpu"
 
         if active_platforms and platform_short not in active_platforms:
             continue
@@ -208,12 +216,18 @@ def parse_run(run_dir, active_platforms=None):
         extra_info = data[0].get("benchmark", {}).get("extra_info", {})
         backend = extra_info.get("backend")
         backend_label = "CuTe" if backend == "cute" else backend
-        if backend and backend != "triton" and not platform_short.endswith(f"_{backend}"):
+        # `pallas` is the TPU-native backend (like `triton` on GPU), not an
+        # alternative worth its own column, so it doesn't get a platform suffix.
+        if (
+            backend
+            and backend not in ("triton", "pallas")
+            and not platform_short.endswith(f"_{backend}")
+        ):
             platform_short = f"{platform_short}_{backend}"
             if active_platforms and platform_short not in active_platforms:
                 continue
         platform = extra_info.get("device", platform_short)
-        if backend and backend != "triton":
+        if backend and backend not in ("triton", "pallas"):
             platform = f"{platform} ({backend_label})"
         if platform == platform_short and platform in ("b200", "h100", "mi325x", "mi350x"):
             continue
