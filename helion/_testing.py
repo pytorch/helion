@@ -408,6 +408,21 @@ def skipIfCute(reason: str) -> Callable[[Callable], Callable]:
     return skipIfFn(lambda: _get_backend() == "cute", reason)
 
 
+def matchesBackends(backends: Sequence[str]) -> bool:
+    """Return whether `_get_backend() in backends`, matching onlyBackends."""
+    backend = _get_backend()
+    return backend in backends or (backend == "tileir" and "triton" in backends)
+
+
+def skipUnlessBackends(backends: Sequence[str]) -> pytest.MarkDecorator:
+    """Return a pytest mark that skips unless `_get_backend() in backends`."""
+    backend = _get_backend()
+    return pytest.mark.skipif(
+        not matchesBackends(backends),
+        reason=f"disabled for HELION_BACKEND={backend}",
+    )
+
+
 def default_cute_mma_support(
     *,
     supported_impls: tuple[str, ...] = ("universal", "warp", "tcgen05"),
@@ -476,7 +491,7 @@ def onlyBackends(
 
     def wrapper(cls: type[unittest.TestCase]) -> type[unittest.TestCase]:
         backend = _get_backend()
-        if backend in backends or (backend == "tileir" and "triton" in backends):
+        if matchesBackends(backends):
             return cls
         return unittest.skip(f"disabled for HELION_BACKEND={backend}")(cls)
 

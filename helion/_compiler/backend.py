@@ -51,10 +51,12 @@ if TYPE_CHECKING:
     from ..runtime.config import Config
     from ..runtime.kernel import BoundKernel
     from ..runtime.settings import DotPrecision
+    from .compile_environment import CompileEnvironment
     from .device_function import Argument
     from .device_function import DeviceFunction
     from .device_ir import DeviceIR
     from .device_ir import GraphInfo
+    from .generate_ast import GenerateAST
     from .host_function import HostFunction
     from .pallas.compact_worklist import CompactWorklistPlan
     from .tile_dispatch import TileStrategyDispatch
@@ -336,6 +338,10 @@ class Backend(abc.ABC):
     ) -> None:
         """Called during `type_propagation` when processing a `load` memory op on fake tensors"""
         return
+
+    def sublane_tiling(self, dtype: torch.dtype) -> int:
+        """Native sublane tile size for backends with tiled memory alignment."""
+        raise exc.BackendUnsupported(self.name, "sublane tiling")
 
     def adjust_block_size_constraints(
         self,
@@ -885,7 +891,8 @@ class Backend(abc.ABC):
 
         if block_size_infos[0].is_flattened(config):
             block_size = functools.reduce(  # pyrefly: ignore[incompatible-overload-residual]
-                operator.mul, [bs.from_config_assert(config) for bs in block_size_infos]
+                operator.mul,
+                [bs.from_config_assert(config) for bs in block_size_infos],
             )
             return FlattenedTileStrategy(
                 fn,
@@ -2859,6 +2866,75 @@ def _largest_divisor_at_most(size: int, limit: int) -> int:
     return 1
 
 
+def _cute_rank3_rhs_static_full_tiles(
+    env: CompileEnvironment,
+    *,
+    root_grid_ids: Sequence[int],
+    k_block_id: int,
+    bm: int,
+    bn: int,
+    bk: int,
+) -> bool:
+    for block_id, block_size in (
+        (root_grid_ids[0], bm),
+        (root_grid_ids[1], bn),
+        (k_block_id, bk),
+    ):
+        size = env.block_sizes[block_id].size
+        if not isinstance(size, (int, torch.SymInt)):
+            return False
+        try:
+            extent = int(env.size_hint(size))
+        except (AttributeError, TypeError, ValueError):
+            return False
+        if not env.known_equal(size, extent) or extent % block_size != 0:
+            return False
+    return True
+
+
+def _rank3_rhs_grouped_nt_can_use_specialized_mma(
+    node: torch.fx.Node,
+    *,
+    env: CompileEnvironment,
+    cg: GenerateAST,
+    config: Config,
+    mn_root_grid_ids: Sequence[int],
+    segment_root_grid_id: int | None,
+    k_block_id: int,
+    bm: int,
+    bn: int,
+    bk: int,
+    has_segment_metadata_rhs: bool,
+) -> bool:
+    from .cute.cute_mma import _tcgen05_cluster_m
+    from .cute.cute_mma import can_codegen_rank3_rhs_grouped_nt_aten
+
+    if not (
+        has_segment_metadata_rhs
+        or _cute_rank3_rhs_static_full_tiles(
+            env,
+            root_grid_ids=mn_root_grid_ids,
+            k_block_id=k_block_id,
+            bm=bm,
+            bn=bn,
+            bk=bk,
+        )
+    ):
+        return False
+    if _tcgen05_cluster_m(config) != 1 and not has_segment_metadata_rhs:
+        return False
+    return can_codegen_rank3_rhs_grouped_nt_aten(
+        node,
+        with_acc=True,
+        cg=cg,
+        config=config,
+        rank3_rhs_m_block_id=mn_root_grid_ids[0],
+        rank3_rhs_n_block_id=mn_root_grid_ids[1],
+        rank3_rhs_k_block_id=k_block_id,
+        rank3_rhs_segment_block_id=segment_root_grid_id,
+    )
+
+
 def _detect_specialized_mma_loop(
     fn: DeviceFunction,
     block_ids: list[int],
@@ -2873,13 +2949,21 @@ def _detect_specialized_mma_loop(
     from .cute.cute_mma import _tcgen05_root_m_threads
     from .cute.cute_mma import can_codegen_cute_mma_aten
     from .cute.cute_mma import can_codegen_cute_mma_dot
+    from .cute.cute_mma import has_rank3_rhs_grouped_nt_aten
+    from .cute.cute_mma import has_rank3_rhs_segment_metadata_aten
     from .host_function import HostFunction
 
     device_ir = HostFunction.current().device_ir
     if len(device_ir.grid_block_ids) != 1:
         return False
     root_grid_ids = device_ir.grid_block_ids[0]
-    if len(root_grid_ids) != 2:
+    if len(root_grid_ids) == 2:
+        segment_root_grid_id = None
+        mn_root_grid_ids = root_grid_ids
+    elif len(root_grid_ids) == 3:
+        segment_root_grid_id = root_grid_ids[0]
+        mn_root_grid_ids = root_grid_ids[1:]
+    else:
         return False
     if len(block_ids) != 1 or any(block_id in root_grid_ids for block_id in block_ids):
         return False
@@ -2899,6 +2983,12 @@ def _detect_specialized_mma_loop(
         resolved_threads = threads if threads > 0 else block_size
         root_thread_counts.append(resolved_threads)
         root_thread_auto.append(threads == 0)
+    root_block_size_by_id = dict(zip(root_grid_ids, root_block_sizes, strict=True))
+    if segment_root_grid_id is not None and (
+        root_block_size_by_id[segment_root_grid_id] != 1
+        or root_thread_counts[root_grid_ids.index(segment_root_grid_id)] != 1
+    ):
+        return False
 
     if functools.reduce(operator.mul, root_thread_counts, 1) > 1024:
         for idx in sorted(
@@ -2923,12 +3013,15 @@ def _detect_specialized_mma_loop(
             root_thread_counts[idx] = next_threads
             if functools.reduce(operator.mul, root_thread_counts, 1) <= 1024:
                 break
+    root_thread_count_by_id = dict(zip(root_grid_ids, root_thread_counts, strict=True))
 
     (bk,) = block_sizes
     if not isinstance(bk, int):
         return False
-    bm, bn = root_block_sizes
-    root_m_threads, root_n_threads = root_thread_counts
+    bm = root_block_size_by_id[mn_root_grid_ids[0]]
+    bn = root_block_size_by_id[mn_root_grid_ids[1]]
+    root_m_threads = root_thread_count_by_id[mn_root_grid_ids[0]]
+    root_n_threads = root_thread_count_by_id[mn_root_grid_ids[1]]
 
     def root_threads_support_impl(mma_impl: str) -> bool:
         if mma_impl == "tcgen05":
@@ -2955,10 +3048,49 @@ def _detect_specialized_mma_loop(
         for node in graph_info.graph.nodes:
             if node.op != "call_function":
                 continue
+            has_rank3_rhs = False
             if node.target in (
                 torch.ops.aten.addmm.default,
                 torch.ops.aten.baddbmm.default,
-            ) and can_codegen_cute_mma_aten(node, with_acc=True):
+            ):
+                has_rank3_rhs = has_rank3_rhs_grouped_nt_aten(
+                    node,
+                    with_acc=True,
+                    cg=fn.codegen,
+                    rank3_rhs_m_block_id=mn_root_grid_ids[0],
+                    config=config,
+                )
+                has_segment_metadata_rhs = False
+                if segment_root_grid_id is not None and has_rank3_rhs:
+                    has_segment_metadata_rhs = has_rank3_rhs_segment_metadata_aten(
+                        node,
+                        with_acc=True,
+                        cg=fn.codegen,
+                        rank3_rhs_m_block_id=mn_root_grid_ids[0],
+                        rank3_rhs_segment_block_id=segment_root_grid_id,
+                        config=config,
+                    )
+                if segment_root_grid_id is not None and not has_segment_metadata_rhs:
+                    continue
+                if has_rank3_rhs:
+                    if not _rank3_rhs_grouped_nt_can_use_specialized_mma(
+                        node,
+                        env=env,
+                        cg=fn.codegen,
+                        config=config,
+                        mn_root_grid_ids=mn_root_grid_ids,
+                        segment_root_grid_id=segment_root_grid_id,
+                        k_block_id=block_ids[0],
+                        bm=bm,
+                        bn=bn,
+                        bk=bk,
+                        has_segment_metadata_rhs=has_segment_metadata_rhs,
+                    ):
+                        continue
+                elif segment_root_grid_id is not None or not can_codegen_cute_mma_aten(
+                    node, with_acc=True
+                ):
+                    continue
                 lhs_node = node.args[1]
                 if not isinstance(lhs_node, torch.fx.Node):
                     continue
@@ -2968,7 +3100,10 @@ def _detect_specialized_mma_loop(
                 mma_impl = _choose_mma_impl(
                     lhs_val.dtype, bm=bm, bn=bn, bk=bk, config=config
                 )
-                if mma_impl != "universal" and root_threads_support_impl(mma_impl):
+                if has_rank3_rhs:
+                    if mma_impl == "tcgen05" and root_threads_support_impl(mma_impl):
+                        return True
+                elif mma_impl != "universal" and root_threads_support_impl(mma_impl):
                     return True
             if (
                 callable(node.target)
@@ -4927,6 +5062,8 @@ def _kernel_specialized_mma_impl(
     from .cute.cute_mma import _choose_mma_impl
     from .cute.cute_mma import can_codegen_cute_mma_aten
     from .cute.cute_mma import can_codegen_cute_mma_dot
+    from .cute.cute_mma import has_rank3_rhs_grouped_nt_aten
+    from .cute.cute_mma import has_rank3_rhs_segment_metadata_aten
     from .device_ir import ForLoopGraphInfo
     from .host_function import HostFunction
 
@@ -4952,19 +5089,68 @@ def _kernel_specialized_mma_impl(
         if len(host_device_ir.grid_block_ids) != 1:
             continue
         root_grid_ids = host_device_ir.grid_block_ids[0]
-        if len(root_grid_ids) != 2:
+        if len(root_grid_ids) == 2:
+            segment_root_grid_id = None
+            mn_root_grid_ids = root_grid_ids
+        elif len(root_grid_ids) == 3:
+            segment_root_grid_id = root_grid_ids[0]
+            mn_root_grid_ids = root_grid_ids[1:]
+        else:
             continue
-        bm = env.block_sizes[root_grid_ids[0]].from_config(config)
-        bn = env.block_sizes[root_grid_ids[1]].from_config(config)
+        if segment_root_grid_id is not None:
+            segment_bm = env.block_sizes[segment_root_grid_id].from_config(config)
+            if segment_bm != 1:
+                continue
+        bm = env.block_sizes[mn_root_grid_ids[0]].from_config(config)
+        bn = env.block_sizes[mn_root_grid_ids[1]].from_config(config)
         if not isinstance(bm, int) or not isinstance(bn, int):
             continue
         for node in graph_info.graph.nodes:
             if node.op != "call_function":
                 continue
+            has_rank3_rhs = False
             if node.target in (
                 torch.ops.aten.addmm.default,
                 torch.ops.aten.baddbmm.default,
-            ) and can_codegen_cute_mma_aten(node, with_acc=True):
+            ):
+                has_rank3_rhs = has_rank3_rhs_grouped_nt_aten(
+                    node,
+                    with_acc=True,
+                    cg=fn.codegen,
+                    rank3_rhs_m_block_id=mn_root_grid_ids[0],
+                    config=config,
+                )
+                has_segment_metadata_rhs = False
+                if segment_root_grid_id is not None and has_rank3_rhs:
+                    has_segment_metadata_rhs = has_rank3_rhs_segment_metadata_aten(
+                        node,
+                        with_acc=True,
+                        cg=fn.codegen,
+                        rank3_rhs_m_block_id=mn_root_grid_ids[0],
+                        rank3_rhs_segment_block_id=segment_root_grid_id,
+                        config=config,
+                    )
+                if segment_root_grid_id is not None and not has_segment_metadata_rhs:
+                    continue
+                if has_rank3_rhs:
+                    if not _rank3_rhs_grouped_nt_can_use_specialized_mma(
+                        node,
+                        env=env,
+                        cg=fn.codegen,
+                        config=config,
+                        mn_root_grid_ids=mn_root_grid_ids,
+                        segment_root_grid_id=segment_root_grid_id,
+                        k_block_id=block_ids[0],
+                        bm=bm,
+                        bn=bn,
+                        bk=bk,
+                        has_segment_metadata_rhs=has_segment_metadata_rhs,
+                    ):
+                        continue
+                elif segment_root_grid_id is not None or not can_codegen_cute_mma_aten(
+                    node, with_acc=True
+                ):
+                    continue
                 lhs_node = node.args[1]
             elif (
                 callable(node.target)
@@ -4983,7 +5169,10 @@ def _kernel_specialized_mma_impl(
             mma_impl = _choose_mma_impl(
                 lhs_val.dtype, bm=bm, bn=bn, bk=bk, config=config
             )
-            if mma_impl != "universal":
+            if has_rank3_rhs:
+                if mma_impl == "tcgen05":
+                    return mma_impl
+            elif mma_impl != "universal":
                 return mma_impl
     return None
 
@@ -6210,14 +6399,15 @@ class CuteBackend(Backend):
                     root_grid_dims[axis] = max(root_grid_dims[axis], size)
         root_static_dims = tuple(root_grid_dims)
         root_static_threads = functools.reduce(operator.mul, root_static_dims, 1)
-        specialized_root_tcgen05 = (
+        recorded_tcgen05_block_shape = device_function.cute_state.block_shape
+        specialized_root_tcgen05 = recorded_tcgen05_block_shape is not None or (
             _kernel_specialized_mma_impl(device_function, config=device_function.config)
             == "tcgen05"
             and root_static_dims != (1, 1, 1)
             and root_static_threads <= MAX_THREADS_PER_BLOCK
         )
         tcgen05_compact_dims = (
-            device_function.cute_state.block_shape if specialized_root_tcgen05 else None
+            recorded_tcgen05_block_shape if specialized_root_tcgen05 else None
         )
         if referenced_dims != (1, 1, 1):
             dims = referenced_dims
@@ -6718,27 +6908,54 @@ class CuteBackend(Backend):
                 and block_ids == device_ir.grid_block_ids[0]
             ):
                 specialized_mma_impl = _kernel_specialized_mma_impl(fn, config=config)
-                if specialized_mma_impl == "tcgen05" and len(nd_block_size) == 2:
+                if specialized_mma_impl == "tcgen05" and len(nd_block_size) in (2, 3):
                     from .cute.cute_mma import _tcgen05_root_m_threads
 
-                    root_m_threads = (
-                        _tcgen05_root_m_threads(
-                            int(nd_block_size[0]), int(nd_block_size[1])
+                    if len(nd_block_size) == 2:
+                        root_m_axis = 0
+                        root_n_axis = 1
+                    elif isinstance(nd_block_size[0], int) and nd_block_size[0] == 1:
+                        root_m_axis = 1
+                        root_n_axis = 2
+                        num_threads_config[0] = 1
+                    else:
+                        root_m_axis = -1
+                        root_n_axis = -1
+                    if root_m_axis >= 0 and root_n_axis >= 0:
+                        root_m_threads = (
+                            _tcgen05_root_m_threads(
+                                int(nd_block_size[root_m_axis]),
+                                int(nd_block_size[root_n_axis]),
+                            )
+                            if num_threads_config[root_m_axis] == 0
+                            and isinstance(nd_block_size[root_m_axis], int)
+                            and isinstance(nd_block_size[root_n_axis], int)
+                            else num_threads_config[root_m_axis]
                         )
-                        if num_threads_config[0] == 0
-                        and isinstance(nd_block_size[0], int)
-                        and isinstance(nd_block_size[1], int)
-                        else num_threads_config[0]
-                    )
-                    root_n_threads = (
-                        min(int(nd_block_size[1]), 8)
-                        if num_threads_config[1] == 0
-                        and isinstance(nd_block_size[1], int)
-                        else num_threads_config[1]
-                    )
-                    num_threads_config[0] = root_m_threads
-                    num_threads_config[1] = root_n_threads
-                    static_threads = root_m_threads * root_n_threads
+                        root_n_threads = (
+                            min(int(nd_block_size[root_n_axis]), 8)
+                            if num_threads_config[root_n_axis] == 0
+                            and isinstance(nd_block_size[root_n_axis], int)
+                            else num_threads_config[root_n_axis]
+                        )
+                        num_threads_config[root_m_axis] = root_m_threads
+                        num_threads_config[root_n_axis] = root_n_threads
+                        static_threads = functools.reduce(
+                            operator.mul,
+                            (
+                                threads
+                                if threads > 0
+                                else int(block_size)
+                                if isinstance(block_size, int)
+                                else 0
+                                for threads, block_size in zip(
+                                    num_threads_config,
+                                    nd_block_size,
+                                    strict=True,
+                                )
+                            ),
+                            1,
+                        )
 
             check_thread_limit(static_threads, context=str(tuple(nd_block_size)))
             return CuteNDTileStrategy(

@@ -9,6 +9,11 @@ import torch
 from ...runtime.config import Config
 from ..cute.strategies import TCGEN05_PERSISTENCE_MODEL_CONFIG_KEY
 from ..cute.strategies import Tcgen05PersistenceModel
+from ..cute.tcgen05_config import TCGEN05_GROUPED_DYNAMIC_AB4_STAGE
+from ..cute.tcgen05_constants import TCGEN05_GROUPED_DYNAMIC_AB_TENSORMAPS_CONFIG_KEY
+from ..cute.tcgen05_constants import TCGEN05_GROUPED_STATIC_COMMON_K_BLOCK_PAIRS
+from ..cute.tcgen05_constants import TCGEN05_GROUPED_STATIC_PERSISTENT_CONFIG_KEY
+from ..cute.tcgen05_constants import TCGEN05_GROUPED_STATIC_RESERVED_SMS_CONFIG_KEY
 from ..cute.tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_M
 from ..cute.tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_N
 from ..cute.tcgen05_constants import TCGEN05_TWO_CTA_EDGE_K_TAIL_BLOCK_K
@@ -23,6 +28,7 @@ from .registry import AutotunerHeuristic
 if TYPE_CHECKING:
     from ...autotuner.config_fragment import BlockSizeFragment
     from ...autotuner.config_spec import ConfigSpec
+    from ...autotuner.config_spec import MatmulFact
     from ...autotuner.config_spec import ReductionLoopSpec
     from ..compile_environment import CompileEnvironment
     from ..device_ir import DeviceIR
@@ -484,6 +490,257 @@ class CuteReductionWideChunkHeuristic(AutotunerHeuristic):
         if vec > 1:
             seed["cute_vector_widths"] = [vec]
         return Config(**seed)
+
+
+def _block_size_value_reachable(
+    spec: ConfigSpec,
+    block_index: int,
+    value: int,
+) -> bool:
+    if block_index < 0 or block_index >= len(spec.block_sizes):
+        return False
+    fragment = cast("Any", spec.block_sizes[block_index])._fragment(spec)
+    low = getattr(fragment, "low", None)
+    high = getattr(fragment, "high", None)
+    return isinstance(low, int) and isinstance(high, int) and low <= value <= high
+
+
+def _tcgen05_grouped_dynamic_bk64_fact(env: CompileEnvironment) -> MatmulFact | None:
+    spec = env.config_spec
+    if not spec.cute_tcgen05_search_enabled:
+        return None
+    if len(spec.matmul_facts) != 1 or len(spec.block_sizes) != 3:
+        return None
+    fact = spec.matmul_facts[0]
+    if fact.lhs_dtype is not fact.rhs_dtype or fact.lhs_dtype not in (
+        torch.float16,
+        torch.bfloat16,
+    ):
+        return None
+    if (
+        fact.m_block_id is None
+        or fact.n_block_id is None
+        or fact.k_block_id is None
+        or fact.static_m is None
+        or fact.static_n is None
+        or fact.static_k is None
+    ):
+        return None
+    try:
+        block_indices = (
+            spec.block_sizes.block_id_to_index(fact.m_block_id),
+            spec.block_sizes.block_id_to_index(fact.n_block_id),
+            spec.block_sizes.block_id_to_index(fact.k_block_id),
+        )
+    except KeyError:
+        return None
+    if block_indices != (0, 1, 2):
+        return None
+    if fact.static_m % 128 != 0 or fact.static_n % 64 != 0 or fact.static_k % 64 != 0:
+        return None
+    if not (
+        _block_size_value_reachable(spec, 0, 128)
+        and _block_size_value_reachable(spec, 1, 64)
+        and _block_size_value_reachable(spec, 2, 64)
+    ):
+        return None
+    if not spec._tcgen05_grouped_dynamic_ab4_fits_for_target(
+        dtype_bytes=fact.lhs_dtype.itemsize,
+        device=env.device,
+        bm=128,
+        bn=64,
+        bk=64,
+        cluster_m=1,
+        c_stages=2,
+    ):
+        return None
+    return fact
+
+
+def _tcgen05_grouped_dynamic_bk64_seed_grid_is_valid(
+    device_ir: DeviceIR, fact: MatmulFact
+) -> bool:
+    return (
+        len(device_ir.root_ids) == 1
+        and len(device_ir.grid_block_ids) == 1
+        and device_ir.grid_block_ids[0] == [fact.m_block_id, fact.n_block_id]
+    )
+
+
+def _tcgen05_grouped_static_common_k_fact(env: CompileEnvironment) -> MatmulFact | None:
+    spec = env.config_spec
+    if not spec.cute_tcgen05_search_enabled:
+        return None
+    if len(spec.matmul_facts) != 1 or len(spec.block_sizes) != 3:
+        return None
+    fact = spec.matmul_facts[0]
+    if fact.lhs_dtype is not fact.rhs_dtype or fact.lhs_dtype not in (
+        torch.float16,
+        torch.bfloat16,
+    ):
+        return None
+    if (
+        fact.m_block_id is None
+        or fact.n_block_id is None
+        or fact.k_block_id is None
+        or fact.static_m is None
+        or fact.static_n is None
+        or fact.static_k is None
+    ):
+        return None
+    try:
+        block_indices = (
+            spec.block_sizes.block_id_to_index(fact.m_block_id),
+            spec.block_sizes.block_id_to_index(fact.n_block_id),
+            spec.block_sizes.block_id_to_index(fact.k_block_id),
+        )
+    except KeyError:
+        return None
+    if block_indices != (0, 1, 2):
+        return None
+    if fact.static_m % 128 != 0 or fact.static_n % 64 != 0:
+        return None
+    if fact.static_k >= 128 and fact.static_k % 128 == 0:
+        return None
+    bk = _tcgen05_grouped_static_common_k_block_k(fact.static_k)
+    if bk is None:
+        return None
+    if not (
+        _block_size_value_reachable(spec, 0, 128)
+        and _block_size_value_reachable(spec, 1, 64)
+        and _block_size_value_reachable(spec, 2, bk)
+    ):
+        return None
+    return fact
+
+
+def _tcgen05_grouped_static_common_k_block_k(static_k: int) -> int | None:
+    for k, bk in TCGEN05_GROUPED_STATIC_COMMON_K_BLOCK_PAIRS:
+        if static_k == k:
+            return bk
+    return None
+
+
+class CuteTcgen05GroupedStaticCommonKHeuristic(AutotunerHeuristic):
+    """Seed grouped-static configs for common K tails without partial TMA."""
+
+    name = "cute_tcgen05_grouped_static_common_k"
+    backend = "cute"
+
+    @classmethod
+    def is_eligible(cls, env: CompileEnvironment, device_ir: DeviceIR) -> bool:
+        from ..cute.cute_mma import tcgen05_grouped_static_seed_has_common_k_proof
+
+        fact = _tcgen05_grouped_static_common_k_fact(env)
+        return (
+            fact is not None
+            and _tcgen05_grouped_dynamic_bk64_seed_grid_is_valid(device_ir, fact)
+            and tcgen05_grouped_static_seed_has_common_k_proof(env, device_ir, fact)
+        )
+
+    @classmethod
+    def get_seed_config(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> Config | None:
+        from ..cute.cute_mma import tcgen05_grouped_static_seed_has_common_k_proof
+
+        fact = _tcgen05_grouped_static_common_k_fact(env)
+        if (
+            fact is None
+            or not _tcgen05_grouped_dynamic_bk64_seed_grid_is_valid(device_ir, fact)
+            or not tcgen05_grouped_static_seed_has_common_k_proof(env, device_ir, fact)
+        ):
+            return None
+        static_k = cast("int", fact.static_k)
+        bk = _tcgen05_grouped_static_common_k_block_k(static_k)
+        if bk is None:
+            return None
+        config = Config(
+            block_sizes=[128, 64, bk],
+            l2_groupings=[1],
+            loop_orders=[[0, 1]],
+            num_stages=2,
+            num_warps=8,
+            pid_type=TCGEN05_TWO_CTA_SEED_PID_TYPE,
+            tcgen05_cluster_m=1,
+            tcgen05_cluster_n=1,
+            tcgen05_acc_stages=2,
+            tcgen05_c_stages=2,
+            tcgen05_num_epi_warps=4,
+        )
+        config.config[TCGEN05_GROUPED_STATIC_PERSISTENT_CONFIG_KEY] = True
+        config.config[TCGEN05_PERSISTENCE_MODEL_CONFIG_KEY] = (
+            Tcgen05PersistenceModel.STATIC_PERSISTENT.value
+        )
+        return config
+
+
+class CuteTcgen05GroupedDynamicBk64Heuristic(AutotunerHeuristic):
+    """Seed the proven BK64 dynamic TensorMap grouped-static config.
+
+    This is intentionally narrow: it only fires for one tcgen05 FP16/BF16
+    rank-3 RHS grouped-NT matmul whose graph proves the exact per-group
+    ``k_sizes[safe_group]`` mask on both A and grouped B operands. The dynamic
+    TensorMap flag stays seed-only and is not exposed as a broad random-search
+    knob.
+    """
+
+    name = "cute_tcgen05_grouped_dynamic_bk64"
+    backend = "cute"
+
+    @classmethod
+    def is_eligible(cls, env: CompileEnvironment, device_ir: DeviceIR) -> bool:
+        from ..cute.cute_mma import tcgen05_grouped_dynamic_bk64_seed_has_exact_k_proof
+
+        fact = _tcgen05_grouped_dynamic_bk64_fact(env)
+        return (
+            fact is not None
+            and _tcgen05_grouped_dynamic_bk64_seed_grid_is_valid(device_ir, fact)
+            and tcgen05_grouped_dynamic_bk64_seed_has_exact_k_proof(
+                env,
+                device_ir,
+                fact,
+            )
+        )
+
+    @classmethod
+    def get_seed_config(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> Config | None:
+        from ..cute.cute_mma import tcgen05_grouped_dynamic_bk64_seed_has_exact_k_proof
+
+        fact = _tcgen05_grouped_dynamic_bk64_fact(env)
+        if (
+            fact is None
+            or not _tcgen05_grouped_dynamic_bk64_seed_grid_is_valid(device_ir, fact)
+            or not tcgen05_grouped_dynamic_bk64_seed_has_exact_k_proof(
+                env,
+                device_ir,
+                fact,
+            )
+        ):
+            return None
+        config = Config(
+            block_sizes=[128, 64, 64],
+            l2_groupings=[1],
+            loop_orders=[[0, 1]],
+            num_stages=2,
+            num_warps=8,
+            pid_type=TCGEN05_TWO_CTA_SEED_PID_TYPE,
+        )
+        config.config["tcgen05_cluster_m"] = 1
+        config.config["tcgen05_cluster_n"] = 1
+        config.config[TCGEN05_GROUPED_STATIC_PERSISTENT_CONFIG_KEY] = True
+        config.config[TCGEN05_GROUPED_DYNAMIC_AB_TENSORMAPS_CONFIG_KEY] = True
+        config.config[TCGEN05_GROUPED_STATIC_RESERVED_SMS_CONFIG_KEY] = 3
+        config.config[TCGEN05_PERSISTENCE_MODEL_CONFIG_KEY] = (
+            Tcgen05PersistenceModel.STATIC_PERSISTENT.value
+        )
+        config.config["tcgen05_ab_stages"] = TCGEN05_GROUPED_DYNAMIC_AB4_STAGE
+        config.config["tcgen05_acc_stages"] = 2
+        config.config["tcgen05_c_stages"] = 2
+        config.config["tcgen05_num_epi_warps"] = 4
+        return config
 
 
 class CuteFlashAttentionHeuristic(AutotunerHeuristic):

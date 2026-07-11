@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+from typing import Any
 import unittest
 from unittest.mock import patch
 
@@ -131,7 +132,6 @@ class TestExamples(RefEagerTestBase, TestCase):
         " not match the test's N=96 bias dimension"
     )
     def test_matmul_bias_epilogue_wrapper(self):
-        from typing import Any
         from typing import Callable
         from typing import NamedTuple
 
@@ -1673,7 +1673,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             fn_name="grouped_gemm_jagged",
         )
 
-    @xfailIfPallas("Pallas scatter: multiple indirect dims are not supported")
+    @xfailIfPallas("CUDA-specific code paths")
     def test_grouped_gemm_jagged_persistent(self):
         # Build small jagged grouped GEMM inputs
         torch.manual_seed(0)

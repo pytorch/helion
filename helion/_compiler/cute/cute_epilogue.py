@@ -47,6 +47,7 @@ from __future__ import annotations
 
 import dataclasses
 import math
+import operator
 from typing import TYPE_CHECKING
 
 import torch
@@ -57,9 +58,13 @@ from ...language._gelu_tanh_approx import epilogue_unary_step_template
 from ...language._gelu_tanh_approx import gelu_erf_epilogue_unary_step_template
 from .cute_fx_walk import aux_tensor_load_kind
 from .cute_fx_walk import build_inner_outputs_index
+from .cute_fx_walk import build_inner_outputs_index_from_graphs
 from .cute_fx_walk import walk_carrier_to_tcgen05_matmul
 
 if TYPE_CHECKING:
+    from collections.abc import Iterable
+
+    from ..device_ir import GraphInfo
     from ..inductor_lowering import CodegenState
 
 
@@ -143,6 +148,34 @@ class _AuxiliaryTensorStep:
     op_template: str
     load_node: torch.fx.Node
     broadcast_axis: int | None = None
+
+
+@dataclasses.dataclass(frozen=True)
+class Tcgen05RowMaskEpilogue:
+    """The proof-only ``where(row_mask[:, None], acc.to(dtype), 0)`` form.
+
+    ``mask_load_node`` is the rank-1 ``hl.load(row_ids, [tile_m])`` node feeding
+    ``aten.ge.Scalar(..., 0)``. The splice site replays that scalar row-id load
+    from the output coordinate tensor in the tcgen05 epilogue fragment layout.
+    """
+
+    mask_load_node: torch.fx.Node
+
+
+@dataclasses.dataclass(frozen=True)
+class Tcgen05GroupedTailEpilogueMatch:
+    """Exact grouped preserve-output M/N tail source match."""
+
+    anchor: torch.fx.Node
+    store_node: torch.fx.Node
+    value_node: torch.fx.Node
+    producer_nodes: tuple[torch.fx.Node, ...]
+    n_sizes_tensor: torch.Tensor | None
+    n_sizes_load_node: torch.fx.Node | None
+    safe_group_node: torch.fx.Node
+    tile_n_index_node: torch.fx.Node | None
+    has_m_tail_mask: bool
+    has_n_tail_mask: bool
 
 
 # The cute DSL surface for whitelisted unary operations. Renderings are
@@ -1133,3 +1166,910 @@ def analyze_tcgen05_unary_epilogue_chain(
         # actionable message.
         return None
     return None
+
+
+def _convert_input_and_dtype(
+    node: torch.fx.Node,
+) -> tuple[torch.fx.Node, torch.dtype] | None:
+    if (
+        node.op != "call_function"
+        or node.target is not torch.ops.prims.convert_element_type.default
+        or node.kwargs
+        or len(node.args) != 2
+        or not isinstance(node.args[0], torch.fx.Node)
+        or not isinstance(node.args[1], torch.dtype)
+    ):
+        return None
+    return node.args[0], node.args[1]
+
+
+def _is_zero_full_node(
+    node: torch.fx.Node,
+    *,
+    expected_shape: tuple[object, ...] | None,
+) -> bool:
+    if node.op != "call_function" or node.target is not torch.ops.aten.full.default:
+        return False
+    if len(node.args) < 2:
+        return False
+    scalar = _extract_scalar(node.args[1])
+    if scalar != 0.0:
+        return False
+    if expected_shape is None:
+        return True
+    val = node.meta.get("val")
+    return isinstance(val, torch.Tensor) and tuple(val.shape) == expected_shape
+
+
+def _row_mask_base_from_broadcast(
+    condition: torch.fx.Node,
+) -> torch.fx.Node | None:
+    """Return the rank-1 mask from ``mask[:, None]`` and nothing broader."""
+    from ...language import view_ops
+
+    if condition.op != "call_function" or condition.kwargs:
+        return None
+    if condition.target is view_ops.subscript:
+        if len(condition.args) != 2:
+            return None
+        base, index = condition.args
+        if (
+            isinstance(base, torch.fx.Node)
+            and isinstance(index, (list, tuple))
+            and len(index) == 2
+            and isinstance(index[0], slice)
+            and index[0] == slice(None)
+            and index[1] is None
+        ):
+            return base
+        return None
+    if condition.target is torch.ops.aten.unsqueeze.default:
+        if len(condition.args) != 2:
+            return None
+        base, dim = condition.args
+        if isinstance(base, torch.fx.Node) and dim in (1, -1):
+            return base
+    return None
+
+
+def _col_mask_base_from_broadcast(
+    condition: torch.fx.Node,
+) -> torch.fx.Node | None:
+    """Return the rank-1 N mask from ``mask[None, :]`` and nothing broader."""
+    from ...language import view_ops
+
+    if condition.op != "call_function" or condition.kwargs:
+        return None
+    if condition.target is view_ops.subscript:
+        if len(condition.args) != 2:
+            return None
+        base, index = condition.args
+        if (
+            isinstance(base, torch.fx.Node)
+            and isinstance(index, (list, tuple))
+            and len(index) == 2
+            and index[0] is None
+            and isinstance(index[1], slice)
+            and index[1] == slice(None)
+        ):
+            return base
+        return None
+    if condition.target is torch.ops.aten.unsqueeze.default:
+        if len(condition.args) != 2:
+            return None
+        base, dim = condition.args
+        if isinstance(base, torch.fx.Node) and dim in (0, -2):
+            return base
+    return None
+
+
+def _argument_sequence_matches_nodes(
+    candidate: object,
+    expected: tuple[torch.fx.Node, ...],
+) -> bool:
+    if isinstance(candidate, list):
+        return len(candidate) == len(expected) and all(
+            candidate[index] is expected[index] for index in range(len(expected))
+        )
+    if isinstance(candidate, tuple):
+        return len(candidate) == len(expected) and all(
+            candidate[index] is expected[index] for index in range(len(expected))
+        )
+    return False
+
+
+def _argument_sequence_indices_of(
+    candidate: object,
+    target: torch.fx.Node,
+) -> list[int] | None:
+    if isinstance(candidate, list):
+        return [index for index in range(len(candidate)) if candidate[index] is target]
+    if isinstance(candidate, tuple):
+        return [index for index in range(len(candidate)) if candidate[index] is target]
+    return None
+
+
+def _matches_grouped_n_col_mask(
+    condition: torch.fx.Node,
+    *,
+    carrier_tile_shape: tuple[object, ...] | None,
+    carrier_tile_index_nodes: tuple[torch.fx.Node, ...] | None,
+    safe_group_node: torch.fx.Node,
+) -> (
+    tuple[
+        torch.Tensor,
+        torch.fx.Node,
+        torch.fx.Node,
+        torch.fx.Node,
+        torch.fx.Node,
+    ]
+    | None
+):
+    """Return exact ``(n_sizes, n_load, col_mask, broadcast, tile_n.index)``."""
+
+    cond_val = condition.meta.get("val")
+    if (
+        not isinstance(cond_val, torch.Tensor)
+        or cond_val.dtype is not torch.bool
+        or cond_val.ndim != 2
+        or cond_val.shape[0] != 1
+    ):
+        return None
+    col_mask = _col_mask_base_from_broadcast(condition)
+    if col_mask is None:
+        return None
+    col_mask_val = col_mask.meta.get("val")
+    if (
+        not isinstance(col_mask_val, torch.Tensor)
+        or col_mask_val.dtype is not torch.bool
+        or col_mask_val.ndim != 1
+    ):
+        return None
+    if carrier_tile_shape is None or len(carrier_tile_shape) != 2:
+        return None
+    if col_mask_val.shape[0] != carrier_tile_shape[1]:
+        return None
+    if cond_val.shape[1] != carrier_tile_shape[1]:
+        return None
+    if (
+        col_mask.op != "call_function"
+        or col_mask.target is not torch.ops.aten.lt.Tensor
+        or col_mask.kwargs
+        or len(col_mask.args) != 2
+        or not isinstance(col_mask.args[0], torch.fx.Node)
+        or not isinstance(col_mask.args[1], torch.fx.Node)
+    ):
+        return None
+    tile_index_arg, n_load_arg = col_mask.args
+    if not isinstance(tile_index_arg, torch.fx.Node) or not isinstance(
+        n_load_arg, torch.fx.Node
+    ):
+        return None
+    tile_index = tile_index_arg
+    n_load = n_load_arg
+    tile_index_val = tile_index.meta.get("val")
+    if (
+        not isinstance(tile_index_val, torch.Tensor)
+        or tile_index_val.ndim != 1
+        or tuple(tile_index_val.shape) != tuple(col_mask_val.shape)
+    ):
+        return None
+    from ...language import tile_ops
+
+    if (
+        carrier_tile_index_nodes is None
+        or len(carrier_tile_index_nodes) != 2
+        or tile_index.op != "call_function"
+        or tile_index.target is not tile_ops.tile_index
+        or tile_index.kwargs
+        or len(tile_index.args) != 1
+        or tile_index.args[0] is not carrier_tile_index_nodes[1]
+    ):
+        return None
+    if not _is_helion_load_node(n_load) or n_load.kwargs or len(n_load.args) < 2:
+        return None
+    if len(n_load.args) >= 3 and n_load.args[2] is not None:
+        return None
+    if len(n_load.args) >= 4 and n_load.args[3] is not None:
+        return None
+    tensor_node = n_load.args[0]
+    index_list = n_load.args[1]
+    if (
+        not isinstance(tensor_node, torch.fx.Node)
+        or not isinstance(index_list, (list, tuple))
+        or len(index_list) != 1
+        or not isinstance(index_list[0], torch.fx.Node)
+    ):
+        return None
+    if index_list[0] is not safe_group_node:
+        return None
+    n_sizes = tensor_node.meta.get("val")
+    loaded_n = n_load.meta.get("val")
+    if (
+        not isinstance(n_sizes, torch.Tensor)
+        or n_sizes.ndim != 1
+        or n_sizes.dtype not in (torch.int32, torch.int64)
+        or not isinstance(loaded_n, torch.Tensor)
+        or loaded_n.ndim != 0
+    ):
+        return None
+    return n_sizes, n_load, col_mask, condition, tile_index
+
+
+def _matches_grouped_m_row_mask(
+    condition: torch.fx.Node,
+    *,
+    carrier_tile_shape: tuple[object, ...] | None,
+    carrier_tile_index_nodes: tuple[torch.fx.Node, ...] | None,
+    safe_group_node: torch.fx.Node,
+    safe_group_layout_load_node: torch.fx.Node,
+) -> tuple[torch.fx.Node, torch.fx.Node, torch.fx.Node] | None:
+    """Return exact ``(row_load, row_eq, row_mask)`` metadata."""
+
+    cond_val = condition.meta.get("val")
+    if (
+        not isinstance(cond_val, torch.Tensor)
+        or cond_val.dtype is not torch.bool
+        or cond_val.ndim != 2
+        or cond_val.shape[1] != 1
+    ):
+        return None
+    row_mask = _row_mask_base_from_broadcast(condition)
+    if row_mask is None:
+        return None
+    row_mask_val = row_mask.meta.get("val")
+    if (
+        not isinstance(row_mask_val, torch.Tensor)
+        or row_mask_val.dtype is not torch.bool
+        or row_mask_val.ndim != 1
+    ):
+        return None
+    if carrier_tile_shape is None or len(carrier_tile_shape) != 2:
+        return None
+    if row_mask_val.shape[0] != carrier_tile_shape[0]:
+        return None
+    if cond_val.shape[0] != carrier_tile_shape[0]:
+        return None
+    if (
+        row_mask.op != "call_function"
+        or row_mask.target is not torch.ops.aten.eq.Tensor
+        or row_mask.kwargs
+        or len(row_mask.args) != 2
+    ):
+        return None
+    lhs, rhs = row_mask.args
+    if lhs is safe_group_node and isinstance(rhs, torch.fx.Node):
+        row_load = rhs
+    elif rhs is safe_group_node and isinstance(lhs, torch.fx.Node):
+        row_load = lhs
+    else:
+        return None
+    if not _is_helion_load_node(row_load) or row_load.kwargs or len(row_load.args) < 2:
+        return None
+    if len(row_load.args) >= 3 and row_load.args[2] is not None:
+        return None
+    if len(row_load.args) >= 4 and row_load.args[3] is not None:
+        return None
+    row_tensor_node = row_load.args[0]
+    safe_tensor_node = (
+        safe_group_layout_load_node.args[0]
+        if safe_group_layout_load_node.args
+        else None
+    )
+    index_list = row_load.args[1]
+    load_val = row_load.meta.get("val")
+    if (
+        row_tensor_node is not safe_tensor_node
+        or not isinstance(load_val, torch.Tensor)
+        or load_val.ndim != 1
+        or tuple(load_val.shape) != tuple(row_mask_val.shape)
+        or not isinstance(index_list, (list, tuple))
+        or len(index_list) != 1
+        or not isinstance(index_list[0], torch.fx.Node)
+    ):
+        return None
+    if carrier_tile_index_nodes is None or len(carrier_tile_index_nodes) != 2:
+        return None
+    if index_list[0] is not carrier_tile_index_nodes[0]:
+        return None
+    return row_load, row_mask, condition
+
+
+def _split_grouped_tail_condition(
+    condition: torch.fx.Node,
+    *,
+    carrier_tile_shape: tuple[object, ...] | None,
+    carrier_tile_index_nodes: tuple[torch.fx.Node, ...] | None,
+    safe_group_node: torch.fx.Node,
+    safe_group_layout_load_node: torch.fx.Node,
+) -> (
+    tuple[
+        tuple[torch.fx.Node, torch.fx.Node, torch.fx.Node] | None,
+        tuple[
+            torch.Tensor,
+            torch.fx.Node,
+            torch.fx.Node,
+            torch.fx.Node,
+            torch.fx.Node,
+        ]
+        | None,
+        tuple[torch.fx.Node, ...],
+    ]
+    | None
+):
+    """Classify row-only, column-only, or row-and-column preserve masks."""
+
+    row_info = _matches_grouped_m_row_mask(
+        condition,
+        carrier_tile_shape=carrier_tile_shape,
+        carrier_tile_index_nodes=carrier_tile_index_nodes,
+        safe_group_node=safe_group_node,
+        safe_group_layout_load_node=safe_group_layout_load_node,
+    )
+    if row_info is not None:
+        return row_info, None, ()
+    col_info = _matches_grouped_n_col_mask(
+        condition,
+        carrier_tile_shape=carrier_tile_shape,
+        carrier_tile_index_nodes=carrier_tile_index_nodes,
+        safe_group_node=safe_group_node,
+    )
+    if col_info is not None:
+        return None, col_info, ()
+    if (
+        condition.op != "call_function"
+        or condition.target
+        not in (
+            operator.and_,
+            torch.ops.aten.bitwise_and.Tensor,
+            torch.ops.aten.logical_and.default,
+        )
+        or condition.kwargs
+        or len(condition.args) != 2
+        or not isinstance(condition.args[0], torch.fx.Node)
+        or not isinstance(condition.args[1], torch.fx.Node)
+    ):
+        return None
+    cond_val = condition.meta.get("val")
+    if (
+        not isinstance(cond_val, torch.Tensor)
+        or cond_val.dtype is not torch.bool
+        or carrier_tile_shape is None
+        or tuple(cond_val.shape) != tuple(carrier_tile_shape)
+    ):
+        return None
+    left = condition.args[0]
+    right = condition.args[1]
+    assert isinstance(left, torch.fx.Node)
+    assert isinstance(right, torch.fx.Node)
+    left_row = _matches_grouped_m_row_mask(
+        left,
+        carrier_tile_shape=carrier_tile_shape,
+        carrier_tile_index_nodes=carrier_tile_index_nodes,
+        safe_group_node=safe_group_node,
+        safe_group_layout_load_node=safe_group_layout_load_node,
+    )
+    left_col = _matches_grouped_n_col_mask(
+        left,
+        carrier_tile_shape=carrier_tile_shape,
+        carrier_tile_index_nodes=carrier_tile_index_nodes,
+        safe_group_node=safe_group_node,
+    )
+    right_row = _matches_grouped_m_row_mask(
+        right,
+        carrier_tile_shape=carrier_tile_shape,
+        carrier_tile_index_nodes=carrier_tile_index_nodes,
+        safe_group_node=safe_group_node,
+        safe_group_layout_load_node=safe_group_layout_load_node,
+    )
+    right_col = _matches_grouped_n_col_mask(
+        right,
+        carrier_tile_shape=carrier_tile_shape,
+        carrier_tile_index_nodes=carrier_tile_index_nodes,
+        safe_group_node=safe_group_node,
+    )
+    if left_row is not None and right_col is not None:
+        return left_row, right_col, (condition,)
+    if left_col is not None and right_row is not None:
+        return right_row, left_col, (condition,)
+    return None
+
+
+def _matches_output_tile_load(
+    candidate: torch.fx.Node,
+    *,
+    store_node: torch.fx.Node,
+    output_tensor: torch.Tensor | None,
+    output_dtype: torch.dtype | None,
+    carrier_tile_shape: tuple[object, ...] | None,
+    carrier_index_nodes: tuple[torch.fx.Node, ...] | None,
+) -> bool:
+    if not _is_helion_load_node(candidate) or candidate.kwargs:
+        return False
+    if len(candidate.args) < 2:
+        return False
+    if len(candidate.args) >= 3 and candidate.args[2] is not None:
+        return False
+    if len(candidate.args) >= 4 and candidate.args[3] is not None:
+        return False
+    false_tensor_node = candidate.args[0]
+    false_index = candidate.args[1]
+    if not isinstance(false_tensor_node, torch.fx.Node):
+        return False
+    store_tensor_node = store_node.args[0] if store_node.args else None
+    if not isinstance(store_tensor_node, torch.fx.Node):
+        return False
+    if false_tensor_node is not store_tensor_node:
+        return False
+    false_tensor = false_tensor_node.meta.get("val")
+    false_val = candidate.meta.get("val")
+    if (
+        not isinstance(false_tensor, torch.Tensor)
+        or not isinstance(false_val, torch.Tensor)
+        or carrier_tile_shape is None
+        or tuple(false_val.shape) != tuple(carrier_tile_shape)
+    ):
+        return False
+    if output_tensor is not None and false_tensor is not output_tensor:
+        return False
+    if output_dtype is not None and false_tensor.dtype is not output_dtype:
+        return False
+    if carrier_index_nodes is None or not _argument_sequence_matches_nodes(
+        false_index,
+        carrier_index_nodes,
+    ):
+        return False
+    return output_dtype is None or false_tensor.dtype is output_dtype
+
+
+def _matches_rank1_row_mask(
+    condition: torch.fx.Node,
+    *,
+    carrier_tile_shape: tuple[object, ...] | None,
+    carrier_tile_index_nodes: tuple[torch.fx.Node, ...] | None,
+    output_global_shape: tuple[object, ...] | None,
+) -> torch.fx.Node | None:
+    """Return the row-id load for ``load(row_ids[tile_m]) >= 0``.
+
+    The accepted mask is rank-1 over the carrier M tile and broadcast only by
+    ``[:, None]``. The load index must be exactly the carrier's M tile-id node,
+    so arbitrary masks and shape-only public-row policies stay rejected.
+    """
+    cond_val = condition.meta.get("val")
+    if (
+        not isinstance(cond_val, torch.Tensor)
+        or cond_val.dtype is not torch.bool
+        or cond_val.ndim != 2
+        or cond_val.shape[1] != 1
+    ):
+        return None
+    row_mask = _row_mask_base_from_broadcast(condition)
+    if row_mask is None:
+        return None
+    row_mask_val = row_mask.meta.get("val")
+    if (
+        not isinstance(row_mask_val, torch.Tensor)
+        or row_mask_val.dtype is not torch.bool
+        or row_mask_val.ndim != 1
+    ):
+        return None
+    if carrier_tile_shape is None or len(carrier_tile_shape) != 2:
+        return None
+    if row_mask_val.shape[0] != carrier_tile_shape[0]:
+        return None
+    if cond_val.shape[0] != carrier_tile_shape[0]:
+        return None
+    if (
+        row_mask.op != "call_function"
+        or row_mask.target is not torch.ops.aten.ge.Scalar
+        or row_mask.kwargs
+        or len(row_mask.args) != 2
+        or _extract_scalar(row_mask.args[1]) != 0.0
+        or not isinstance(row_mask.args[0], torch.fx.Node)
+    ):
+        return None
+    load_node = row_mask.args[0]
+    if (
+        not _is_helion_load_node(load_node)
+        or load_node.kwargs
+        or len(load_node.args) < 2
+    ):
+        return None
+    if len(load_node.args) >= 3 and load_node.args[2] is not None:
+        return None
+    if len(load_node.args) >= 4 and load_node.args[3] is not None:
+        return None
+    tensor_node = load_node.args[0]
+    index_list = load_node.args[1]
+    if not isinstance(tensor_node, torch.fx.Node):
+        return None
+    row_ids_val = tensor_node.meta.get("val")
+    load_val = load_node.meta.get("val")
+    if (
+        not isinstance(row_ids_val, torch.Tensor)
+        or row_ids_val.ndim != 1
+        or not isinstance(load_val, torch.Tensor)
+        or load_val.ndim != 1
+        or tuple(load_val.shape) != tuple(row_mask_val.shape)
+        or not isinstance(index_list, (list, tuple))
+        or len(index_list) != 1
+        or not isinstance(index_list[0], torch.fx.Node)
+    ):
+        return None
+    if carrier_tile_index_nodes is None or len(carrier_tile_index_nodes) != 2:
+        return None
+    if index_list[0] is not carrier_tile_index_nodes[0]:
+        return None
+    if output_global_shape is not None:
+        if (
+            len(output_global_shape) != 2
+            or row_ids_val.shape[0] != output_global_shape[0]
+        ):
+            return None
+    return load_node
+
+
+def tcgen05_row_mask_epilogue_producer_nodes(
+    value_node: torch.fx.Node,
+    *,
+    store_node: torch.fx.Node | None = None,
+) -> tuple[torch.fx.Node, ...] | None:
+    """Return the exact row-mask producer nodes consumed by the splice.
+
+    This intentionally names only the mask chain:
+    ``load(row_ids[tile_m]) -> ge(..., 0) -> [:, None] -> where``.
+    The accumulator carrier and zero branch are not included. When a store
+    node is supplied, every node in that chain must be exclusively consumed by
+    the next node (and finally by that store), so shared masks continue down
+    the normal unsupported path instead of having their generic code removed.
+    """
+    if (
+        value_node.op != "call_function"
+        or value_node.target is not torch.ops.aten.where.self
+        or len(value_node.args) != 3
+    ):
+        return None
+    condition = value_node.args[0]
+    if not isinstance(condition, torch.fx.Node):
+        return None
+    row_mask = _row_mask_base_from_broadcast(condition)
+    if (
+        row_mask is None
+        or row_mask.op != "call_function"
+        or row_mask.target is not torch.ops.aten.ge.Scalar
+        or len(row_mask.args) != 2
+        or not isinstance(row_mask.args[0], torch.fx.Node)
+    ):
+        return None
+    load_node = row_mask.args[0]
+    nodes = (load_node, row_mask, condition, value_node)
+    if store_node is not None:
+        expected_users = (
+            (load_node, {row_mask}),
+            (row_mask, {condition}),
+            (condition, {value_node}),
+            (value_node, {store_node}),
+        )
+        for node, users in expected_users:
+            if set(node.users) != users:
+                return None
+    return nodes
+
+
+def analyze_tcgen05_row_mask_epilogue(
+    state: CodegenState | None,
+    value_node: torch.fx.Node,
+    *,
+    output_global_shape: tuple[object, ...] | None = None,
+    output_dtype: torch.dtype | None = None,
+    target_fx_nodes: set[torch.fx.Node] | None = None,
+    inner_outputs_by_graph_id: dict[int, tuple[torch.fx.Node | None, ...]]
+    | None = None,
+) -> tuple[Tcgen05RowMaskEpilogue, torch.fx.Node] | None:
+    """Classify the proof-only row-mask tcgen05 epilogue.
+
+    Accepted FX shape, and only this shape:
+
+        aten.where.self(
+            row_mask[:, None],
+            prims.convert_element_type(acc_carrier, out_dtype),
+            prims.convert_element_type(aten.full(..., 0), out_dtype),
+        )
+
+    ``row_mask`` must be ``aten.ge.Scalar(hl.load(row_ids, [tile_m]), 0)``
+    where ``tile_m`` is exactly the carrier's M tile-id node.
+    """
+    if target_fx_nodes is None:
+        if state is None:
+            return None
+        df = state.device_function
+        target_fx_nodes = df.cute_state.matmul_fx_nodes
+    if not target_fx_nodes:
+        return None
+    if (
+        value_node.op != "call_function"
+        or value_node.target is not torch.ops.aten.where.self
+        or value_node.kwargs
+        or len(value_node.args) != 3
+    ):
+        return None
+    condition, true_branch, false_branch = value_node.args
+    if not (
+        isinstance(condition, torch.fx.Node)
+        and isinstance(true_branch, torch.fx.Node)
+        and isinstance(false_branch, torch.fx.Node)
+    ):
+        return None
+
+    true_convert = _convert_input_and_dtype(true_branch)
+    false_convert = _convert_input_and_dtype(false_branch)
+    if true_convert is None or false_convert is None:
+        return None
+    carrier, true_dtype = true_convert
+    zero_node, false_dtype = false_convert
+    if true_dtype is not false_dtype:
+        return None
+    if output_dtype is not None and true_dtype is not output_dtype:
+        return None
+
+    if inner_outputs_by_graph_id is None:
+        if state is None:
+            return None
+        inner_outputs_by_graph_id = build_inner_outputs_index(state)
+    anchor = walk_carrier_to_tcgen05_matmul(
+        carrier, target_fx_nodes, inner_outputs_by_graph_id
+    )
+    if anchor is None:
+        return None
+
+    carrier_tile_shape = _carrier_tile_shape(carrier)
+    if not _is_zero_full_node(zero_node, expected_shape=carrier_tile_shape):
+        return None
+    row_load = _matches_rank1_row_mask(
+        condition,
+        carrier_tile_shape=carrier_tile_shape,
+        carrier_tile_index_nodes=_carrier_tile_index_nodes(carrier),
+        output_global_shape=output_global_shape,
+    )
+    if row_load is None:
+        return None
+    return Tcgen05RowMaskEpilogue(mask_load_node=row_load), anchor
+
+
+def analyze_tcgen05_grouped_tail_epilogue(
+    state: CodegenState | None,
+    value_node: torch.fx.Node,
+    *,
+    output_tensor: torch.Tensor | None = None,
+    output_dtype: torch.dtype | None = None,
+    safe_group_node: torch.fx.Node,
+    safe_group_layout_load_node: torch.fx.Node,
+    store_node: torch.fx.Node,
+    target_fx_nodes: set[torch.fx.Node] | None = None,
+    inner_outputs_by_graph_id: dict[int, tuple[torch.fx.Node | None, ...]]
+    | None = None,
+) -> Tcgen05GroupedTailEpilogueMatch | None:
+    """Classify grouped M/N preserve-output tail stores."""
+
+    if target_fx_nodes is None:
+        if state is None:
+            return None
+        target_fx_nodes = state.device_function.cute_state.matmul_fx_nodes
+    if not target_fx_nodes:
+        return None
+    if (
+        value_node.op != "call_function"
+        or value_node.target is not torch.ops.aten.where.self
+        or value_node.kwargs
+        or len(value_node.args) != 3
+    ):
+        return None
+    condition, true_branch, false_branch = value_node.args
+    if not (
+        isinstance(condition, torch.fx.Node)
+        and isinstance(true_branch, torch.fx.Node)
+        and isinstance(false_branch, torch.fx.Node)
+    ):
+        return None
+
+    true_convert = _convert_input_and_dtype(true_branch)
+    if true_convert is None:
+        return None
+    carrier, true_dtype = true_convert
+    if output_dtype is not None and true_dtype is not output_dtype:
+        return None
+    carrier_tile_shape = _carrier_tile_shape(carrier)
+    carrier_index_nodes = _carrier_tile_index_nodes(carrier)
+    grouped_tail_info = _split_grouped_tail_condition(
+        condition,
+        carrier_tile_shape=carrier_tile_shape,
+        carrier_tile_index_nodes=carrier_index_nodes,
+        safe_group_node=safe_group_node,
+        safe_group_layout_load_node=safe_group_layout_load_node,
+    )
+    if grouped_tail_info is None:
+        return None
+    row_info, grouped_n_info, and_nodes = grouped_tail_info
+    if row_info is None and grouped_n_info is None:
+        return None
+    if not _matches_output_tile_load(
+        false_branch,
+        store_node=store_node,
+        output_tensor=output_tensor,
+        output_dtype=true_dtype,
+        carrier_tile_shape=carrier_tile_shape,
+        carrier_index_nodes=carrier_index_nodes,
+    ):
+        return None
+    if carrier_index_nodes is None:
+        return None
+    store_index = store_node.args[1] if len(store_node.args) >= 2 else None
+    if not _argument_sequence_matches_nodes(store_index, carrier_index_nodes):
+        return None
+
+    if inner_outputs_by_graph_id is None:
+        if state is None:
+            return None
+        inner_outputs_by_graph_id = build_inner_outputs_index(state)
+    anchor = walk_carrier_to_tcgen05_matmul(
+        carrier,
+        target_fx_nodes,
+        inner_outputs_by_graph_id,
+    )
+    if anchor is None:
+        return None
+
+    expected_users: list[tuple[torch.fx.Node, set[torch.fx.Node]]] = []
+    producer_nodes: list[torch.fx.Node] = []
+    if row_info is not None:
+        row_load, row_mask, row_broadcast = row_info
+        row_mask_user = and_nodes[0] if and_nodes else value_node
+        expected_users.extend(
+            [
+                (row_load, {row_mask}),
+                (row_mask, {row_broadcast}),
+                (row_broadcast, {row_mask_user}),
+            ]
+        )
+        producer_nodes.extend([row_load, row_mask, row_broadcast])
+    n_sizes: torch.Tensor | None = None
+    n_load: torch.fx.Node | None = None
+    tile_index: torch.fx.Node | None = None
+    if grouped_n_info is not None:
+        n_sizes, n_load, col_mask, col_broadcast, tile_index = grouped_n_info
+        expected_users.extend(
+            [
+                (tile_index, {col_mask}),
+                (n_load, {col_mask}),
+                (col_mask, {col_broadcast}),
+                (
+                    col_broadcast,
+                    {and_nodes[0]} if and_nodes else {value_node},
+                ),
+            ]
+        )
+        producer_nodes.extend([tile_index, n_load, col_mask, col_broadcast])
+    if and_nodes:
+        expected_users.append((and_nodes[0], {value_node}))
+        producer_nodes.extend(and_nodes)
+    else:
+        expected_users.append((condition, {value_node}))
+        if condition not in producer_nodes:
+            producer_nodes.append(condition)
+    expected_users.extend(
+        [
+            (false_branch, {value_node}),
+            (value_node, {store_node}),
+        ]
+    )
+    for node, users in expected_users:
+        if set(node.users) != users:
+            return None
+    producer_nodes.extend([false_branch, value_node])
+    return Tcgen05GroupedTailEpilogueMatch(
+        anchor=anchor,
+        store_node=store_node,
+        value_node=value_node,
+        producer_nodes=tuple(producer_nodes),
+        n_sizes_tensor=n_sizes,
+        n_sizes_load_node=n_load,
+        safe_group_node=safe_group_node,
+        tile_n_index_node=tile_index,
+        has_m_tail_mask=row_info is not None,
+        has_n_tail_mask=grouped_n_info is not None,
+    )
+
+
+def find_tcgen05_grouped_tail_epilogue_for_mma(
+    mma_node: torch.fx.Node,
+    graphs: Iterable[GraphInfo],
+    *,
+    safe_group_node: torch.fx.Node,
+    safe_group_layout_load_node: torch.fx.Node,
+) -> Tcgen05GroupedTailEpilogueMatch | None:
+    """Find the unique semantic grouped tail preserve-output store."""
+
+    import operator
+
+    from ...language import _tracing_ops
+    from ...language import memory_ops
+
+    graph_infos = list(graphs)
+    graph_id_of: dict[torch.fx.Graph, int] = {}
+    for_loop_calls_by_graph_id: dict[int, list[torch.fx.Node]] = {}
+    for graph_info in graph_infos:
+        graph_id_of[graph_info.graph] = graph_info.graph_id
+        for node in graph_info.graph.nodes:
+            if (
+                node.op == "call_function"
+                and _tracing_ops.is_for_loop_target(node.target)
+                and node.args
+                and isinstance(node.args[0], int)
+            ):
+                for_loop_calls_by_graph_id.setdefault(node.args[0], []).append(node)
+
+    inner_outputs_by_graph_id = build_inner_outputs_index_from_graphs(graph_infos)
+    target_fx_nodes = {mma_node}
+    found: list[Tcgen05GroupedTailEpilogueMatch] = []
+    visited: set[torch.fx.Node] = set()
+    stack: list[torch.fx.Node] = [mma_node]
+    while stack:
+        cur = stack.pop()
+        if cur in visited:
+            continue
+        visited.add(cur)
+        for user in cur.users:
+            if user.op == "output":
+                graph_id = graph_id_of.get(cur.graph)
+                if graph_id is None:
+                    return None
+                output_args = user.args[0] if user.args else None
+                out_indices = _argument_sequence_indices_of(output_args, cur)
+                if out_indices is None:
+                    return None
+                if not out_indices:
+                    return None
+                for outer_call in for_loop_calls_by_graph_id.get(graph_id, []):
+                    for outer_user in outer_call.users:
+                        if (
+                            outer_user.op == "call_function"
+                            and outer_user.target is operator.getitem
+                            and len(outer_user.args) >= 2
+                            and outer_user.args[1] in out_indices
+                            and outer_user not in visited
+                        ):
+                            stack.append(outer_user)
+                continue
+            if user.op != "call_function":
+                return None
+            if user.target is memory_ops.store:
+                value = user.args[2] if len(user.args) > 2 else None
+                if not isinstance(value, torch.fx.Node):
+                    return None
+                grouped_tail = analyze_tcgen05_grouped_tail_epilogue(
+                    None,
+                    value,
+                    safe_group_node=safe_group_node,
+                    safe_group_layout_load_node=safe_group_layout_load_node,
+                    store_node=user,
+                    target_fx_nodes=target_fx_nodes,
+                    inner_outputs_by_graph_id=inner_outputs_by_graph_id,
+                )
+                if grouped_tail is None:
+                    return None
+                found.append(grouped_tail)
+                continue
+            if user.target in (
+                _tracing_ops._phi,
+                _tracing_ops._new_var,
+                operator.getitem,
+                torch.ops.prims.convert_element_type.default,
+                torch.ops.aten.where.self,
+            ):
+                stack.append(user)
+                continue
+            return None
+
+    if len(found) != 1:
+        return None
+    return found[0]
