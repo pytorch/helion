@@ -250,6 +250,8 @@ class CompileEnvironment:
         # TODO(jansel): check for guards in the shapeenv
         self.fake_mode = FakeTensorMode(shape_env=self.shape_env)
         self.input_sources: dict[torch.Tensor, Source] = {}
+        self.runtime_arg_values_by_name: dict[str, object] = {}
+        self.cute_resolved_wrapper_plans: list[dict[str, object]] = []
         self.block_sizes: list[BlockSizeInfo] = []
         self.debug_shape_renames: dict[sympy.Basic, sympy.Basic] = {}
         try:

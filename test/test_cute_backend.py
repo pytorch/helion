@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import ast
+import builtins
 import importlib
 import math
 import os
+from typing import TYPE_CHECKING
 from typing import Any
 from typing import Callable
 from typing import cast
@@ -25,9 +27,14 @@ import helion.language as hl
 from helion.runtime import _build_cute_schema_and_args
 from helion.runtime import _cute_cluster_shape
 from helion.runtime import _cute_cluster_shape_from_wrapper_plans
+from helion.runtime import _cute_wrapper_plans_cache_key
 from helion.runtime import _ensure_cute_dsl_arch_env
+from helion.runtime import _freeze_cute_wrapper_plans
 from helion.runtime import _get_compiled_cute_launcher
 from helion.runtime import default_cute_launcher
+
+if TYPE_CHECKING:
+    from collections.abc import Sequence
 
 cutlass = pytest.importorskip("cutlass")
 cute = pytest.importorskip("cutlass.cute")
@@ -60,6 +67,17 @@ def cute_add3(x: torch.Tensor, y: torch.Tensor, z: torch.Tensor) -> torch.Tensor
     out = torch.empty_like(x)
     for tile in hl.tile(out.size()):
         out[tile] = x[tile] + y[tile] + z[tile]
+    return out
+
+
+@helion.kernel(backend="cute", autotune_effort="none")
+def cute_add_out(
+    x: torch.Tensor,
+    y: torch.Tensor,
+    out: torch.Tensor,
+) -> torch.Tensor:
+    for tile in hl.tile(out.size()):
+        out[tile] = x[tile] + y[tile]
     return out
 
 
@@ -5336,6 +5354,55 @@ class TestCuteBackend(TestCase):
         self.assertEqual(second, ("launched", ("launch-arg", "stream-B")))
         self.assertEqual(third, ("launched", ("launch-arg", "stream-C")))
 
+    def test_cute_launcher_last_launch_uses_generated_fast_guard_on_hit(
+        self,
+    ) -> None:
+        cute_kernel = type("DummyCuteKernel", (), {})()
+        build_calls: list[tuple[object, ...]] = []
+        launched_args: list[tuple[object, ...]] = []
+        streams = iter(["stream-A", "stream-B"])
+        runtime_mod = importlib.import_module("helion.runtime")
+        generic_matcher = runtime_mod._cute_last_launch_cache_entry
+
+        class FakeCompiled:
+            def __call__(self, *args: object) -> tuple[str, tuple[object, ...]]:
+                launched_args.append(args)
+                return ("launched", args)
+
+        def fake_build(
+            _cute_kernel: object,
+            args: tuple[object, ...],
+            _grid: tuple[int, int, int],
+        ) -> tuple[tuple[tuple[object, ...], ...], tuple[object, ...]]:
+            build_calls.append(args)
+            return (("scalar", "int"),), ("launch-arg",)
+
+        with (
+            patch("helion.runtime._build_cute_schema_and_args", side_effect=fake_build),
+            patch(
+                "helion.runtime._cute_current_stream", side_effect=lambda: next(streams)
+            ),
+            patch(
+                "helion.runtime._get_compiled_cute_launcher",
+                return_value=FakeCompiled(),
+            ),
+            patch(
+                "helion.runtime._cute_last_launch_cache_entry",
+                wraps=generic_matcher,
+            ) as generic_match,
+        ):
+            first = default_cute_launcher(cute_kernel, (1,), 7, block=(32, 1, 1))
+            second = default_cute_launcher(cute_kernel, (1,), 7, block=(32, 1, 1))
+
+        self.assertEqual(generic_match.call_count, 1)
+        self.assertEqual(build_calls, [(7,)])
+        self.assertEqual(
+            launched_args,
+            [("launch-arg", "stream-A"), ("launch-arg", "stream-B")],
+        )
+        self.assertEqual(first, ("launched", ("launch-arg", "stream-A")))
+        self.assertEqual(second, ("launched", ("launch-arg", "stream-B")))
+
     def test_cute_build_schema_excludes_stream_from_cached_args(self) -> None:
         # The stream must never be part of the cached launch args produced by
         # ``_build_cute_schema_and_args`` (it is appended per launch instead).
@@ -5409,6 +5476,52 @@ class TestCuteBackend(TestCase):
         self.assertEqual(launched_args, [("float-1", "stream"), ("float-2", "stream")])
         self.assertEqual(positive, ("launched", ("float-1", "stream")))
         self.assertEqual(negative, ("launched", ("float-2", "stream")))
+
+    def test_cute_launcher_last_launch_distinguishes_scalar_kinds(self) -> None:
+        cute_kernel = type("DummyCuteKernel", (), {})()
+        build_calls: list[tuple[object, ...]] = []
+        launched_args: list[tuple[object, ...]] = []
+
+        class FakeCompiled:
+            def __call__(self, *args: object) -> tuple[str, tuple[object, ...]]:
+                launched_args.append(args)
+                return ("launched", args)
+
+        def fake_build(
+            _cute_kernel: object,
+            args: tuple[object, ...],
+            _grid: tuple[int, int, int],
+        ) -> tuple[tuple[tuple[object, ...], ...], tuple[object, ...]]:
+            build_calls.append(args)
+            scalar_kind = type(args[0]).__name__
+            return (("scalar", scalar_kind),), (f"{scalar_kind}-{len(build_calls)}",)
+
+        with (
+            patch("helion.runtime._build_cute_schema_and_args", side_effect=fake_build),
+            patch("helion.runtime._cute_current_stream", return_value="stream"),
+            patch(
+                "helion.runtime._get_compiled_cute_launcher",
+                return_value=FakeCompiled(),
+            ),
+        ):
+            bool_launch = default_cute_launcher(cute_kernel, (1,), True)
+            bool_hit = default_cute_launcher(cute_kernel, (1,), True)
+            int_miss = default_cute_launcher(cute_kernel, (1,), 1)
+            float_miss = default_cute_launcher(cute_kernel, (1,), 1.0)
+
+        self.assertEqual(build_calls, [(True,), (1,), (1.0,)])
+        self.assertEqual(bool_launch, bool_hit)
+        self.assertEqual(int_miss, ("launched", ("int-2", "stream")))
+        self.assertEqual(float_miss, ("launched", ("float-3", "stream")))
+        self.assertEqual(
+            launched_args,
+            [
+                ("bool-1", "stream"),
+                ("bool-1", "stream"),
+                ("int-2", "stream"),
+                ("float-3", "stream"),
+            ],
+        )
 
     def test_cute_launcher_sets_arch_env_only_before_first_compile(self) -> None:
         cute_kernel = type("DummyCuteKernel", (), {})()
@@ -5516,6 +5629,669 @@ class TestCuteBackend(TestCase):
         )
         self.assertEqual(first, second)
         self.assertEqual(third, ("launched", ("ptr-2", "stream")))
+
+    def test_cute_launcher_stable_tensor_args_keep_fast_launcher(self) -> None:
+        cute_kernel = type("DummyCuteKernel", (), {})()
+        tensor = torch.empty(2)
+        tensor_ptr = int(tensor.data_ptr())
+        build_calls: list[int] = []
+        launched_args: list[tuple[object, ...]] = []
+        streams = iter(["stream-A", "stream-B"])
+        runtime_mod = importlib.import_module("helion.runtime")
+        generic_matcher = runtime_mod._cute_last_launch_cache_entry
+
+        class FakeCompiled:
+            def __call__(self, *args: object) -> tuple[str, tuple[object, ...]]:
+                launched_args.append(args)
+                return ("launched", args)
+
+        def fake_build(
+            _cute_kernel: object,
+            args: tuple[object, ...],
+            _grid: tuple[int, int, int],
+        ) -> tuple[tuple[tuple[object, ...], ...], tuple[object, ...]]:
+            tensor_arg = cast("torch.Tensor", args[0])
+            build_calls.append(int(tensor_arg.data_ptr()))
+            return (
+                (
+                    (
+                        "tensor",
+                        str(tensor_arg.dtype),
+                        tensor_arg.ndim,
+                        tuple(int(size) for size in tensor_arg.shape),
+                        tuple(int(stride) for stride in tensor_arg.stride()),
+                    ),
+                ),
+                (int(tensor_arg.data_ptr()),),
+            )
+
+        with (
+            patch("helion.runtime._validate_cute_launcher_tensor"),
+            patch("helion.runtime._build_cute_schema_and_args", side_effect=fake_build),
+            patch(
+                "helion.runtime._cute_current_stream", side_effect=lambda: next(streams)
+            ),
+            patch(
+                "helion.runtime._get_compiled_cute_launcher",
+                return_value=FakeCompiled(),
+            ),
+            patch(
+                "helion.runtime._cute_last_launch_cache_entry",
+                wraps=generic_matcher,
+            ) as generic_match,
+            patch("builtins.compile", wraps=builtins.compile) as compile_mock,
+        ):
+            first = default_cute_launcher(cute_kernel, (1,), tensor)
+            self.assertIsNotNone(
+                cute_kernel._helion_cute_last_launch_cache.fast_launcher
+            )
+            second = default_cute_launcher(cute_kernel, (1,), tensor)
+
+        self.assertEqual(compile_mock.call_count, 1)
+        self.assertEqual(generic_match.call_count, 1)
+        self.assertEqual(build_calls, [tensor_ptr])
+        self.assertEqual(
+            launched_args,
+            [(tensor_ptr, "stream-A"), (tensor_ptr, "stream-B")],
+        )
+        self.assertEqual(first, ("launched", (tensor_ptr, "stream-A")))
+        self.assertEqual(second, ("launched", (tensor_ptr, "stream-B")))
+
+    def test_cute_launcher_pointer_alternation_suppresses_fast_launcher_recompile(
+        self,
+    ) -> None:
+        cute_kernel = type("DummyCuteKernel", (), {})()
+        tensor_a = torch.empty(2)
+        tensor_b = torch.empty(2)
+        ptr_a = int(tensor_a.data_ptr())
+        ptr_b = int(tensor_b.data_ptr())
+        self.assertNotEqual(ptr_a, ptr_b)
+        tensors = [tensor_a, tensor_b, tensor_a, tensor_b]
+        tensor_ptrs = [ptr_a, ptr_b, ptr_a, ptr_b]
+        build_calls: list[int] = []
+        launched_args: list[tuple[object, ...]] = []
+        stream_names = [f"stream-{index}" for index in range(len(tensors))]
+        streams = iter(stream_names)
+        runtime_mod = importlib.import_module("helion.runtime")
+        make_fast_launcher = runtime_mod._make_cute_last_launch_fast_launcher
+
+        class FakeCompiled:
+            def __call__(self, *args: object) -> tuple[str, tuple[object, ...]]:
+                launched_args.append(args)
+                return ("launched", args)
+
+        def fake_build(
+            _cute_kernel: object,
+            args: tuple[object, ...],
+            _grid: tuple[int, int, int],
+        ) -> tuple[tuple[tuple[object, ...], ...], tuple[object, ...]]:
+            tensor_arg = cast("torch.Tensor", args[0])
+            ptr = int(tensor_arg.data_ptr())
+            build_calls.append(ptr)
+            return (
+                (
+                    (
+                        "tensor",
+                        str(tensor_arg.dtype),
+                        tensor_arg.ndim,
+                        tuple(int(size) for size in tensor_arg.shape),
+                        tuple(int(stride) for stride in tensor_arg.stride()),
+                    ),
+                ),
+                (ptr,),
+            )
+
+        with (
+            patch("helion.runtime._validate_cute_launcher_tensor"),
+            patch("helion.runtime._build_cute_schema_and_args", side_effect=fake_build),
+            patch(
+                "helion.runtime._cute_current_stream", side_effect=lambda: next(streams)
+            ),
+            patch(
+                "helion.runtime._get_compiled_cute_launcher",
+                return_value=FakeCompiled(),
+            ),
+            patch(
+                "helion.runtime._make_cute_last_launch_fast_launcher",
+                wraps=make_fast_launcher,
+            ) as make_fast,
+            patch("builtins.compile", wraps=builtins.compile) as compile_mock,
+        ):
+            results = []
+            for tensor in tensors:
+                results.append(default_cute_launcher(cute_kernel, (1,), tensor))
+
+        self.assertEqual(make_fast.call_count, 1)
+        self.assertEqual(compile_mock.call_count, 1)
+        self.assertEqual(build_calls, [ptr_a, ptr_b])
+        expected_launches = list(zip(tensor_ptrs, stream_names, strict=True))
+        self.assertEqual(launched_args, expected_launches)
+        self.assertEqual(
+            results,
+            [("launched", launch_args) for launch_args in expected_launches],
+        )
+
+    def test_cute_launcher_pointer_churn_then_stable_recovers_fast_launcher(
+        self,
+    ) -> None:
+        cute_kernel = type("DummyCuteKernel", (), {})()
+        tensor_a = torch.empty(2)
+        tensor_b = torch.empty(2)
+        ptr_a = int(tensor_a.data_ptr())
+        ptr_b = int(tensor_b.data_ptr())
+        self.assertNotEqual(ptr_a, ptr_b)
+        tensors = [tensor_a, tensor_b, tensor_a, tensor_a, tensor_a]
+        tensor_ptrs = [ptr_a, ptr_b, ptr_a, ptr_a, ptr_a]
+        build_calls: list[int] = []
+        launched_args: list[tuple[object, ...]] = []
+        fast_launchers: list[object] = []
+        generic_match_counts: list[int] = []
+        stream_names = [f"stream-{index}" for index in range(len(tensors))]
+        streams = iter(stream_names)
+        runtime_mod = importlib.import_module("helion.runtime")
+        make_fast_launcher = runtime_mod._make_cute_last_launch_fast_launcher
+        generic_matcher = runtime_mod._cute_last_launch_cache_entry
+
+        class FakeCompiled:
+            def __call__(self, *args: object) -> tuple[str, tuple[object, ...]]:
+                launched_args.append(args)
+                return ("launched", args)
+
+        def fake_build(
+            _cute_kernel: object,
+            args: tuple[object, ...],
+            _grid: tuple[int, int, int],
+        ) -> tuple[tuple[tuple[object, ...], ...], tuple[object, ...]]:
+            tensor_arg = cast("torch.Tensor", args[0])
+            ptr = int(tensor_arg.data_ptr())
+            build_calls.append(ptr)
+            return (
+                (
+                    (
+                        "tensor",
+                        str(tensor_arg.dtype),
+                        tensor_arg.ndim,
+                        tuple(int(size) for size in tensor_arg.shape),
+                        tuple(int(stride) for stride in tensor_arg.stride()),
+                    ),
+                ),
+                (ptr,),
+            )
+
+        with (
+            patch("helion.runtime._validate_cute_launcher_tensor"),
+            patch("helion.runtime._build_cute_schema_and_args", side_effect=fake_build),
+            patch(
+                "helion.runtime._cute_current_stream", side_effect=lambda: next(streams)
+            ),
+            patch(
+                "helion.runtime._get_compiled_cute_launcher",
+                return_value=FakeCompiled(),
+            ),
+            patch(
+                "helion.runtime._make_cute_last_launch_fast_launcher",
+                wraps=make_fast_launcher,
+            ) as make_fast,
+            patch(
+                "helion.runtime._cute_last_launch_cache_entry",
+                wraps=generic_matcher,
+            ) as generic_match,
+            patch("builtins.compile", wraps=builtins.compile) as compile_mock,
+        ):
+            results = []
+            for tensor in tensors:
+                results.append(default_cute_launcher(cute_kernel, (1,), tensor))
+                generic_match_counts.append(generic_match.call_count)
+                fast_launchers.append(
+                    cute_kernel._helion_cute_last_launch_cache.fast_launcher
+                )
+
+        self.assertEqual(make_fast.call_count, 2)
+        self.assertEqual(compile_mock.call_count, 2)
+        self.assertEqual(build_calls, [ptr_a, ptr_b])
+        self.assertIsNotNone(fast_launchers[0])
+        self.assertIsNone(fast_launchers[1])
+        self.assertIsNone(fast_launchers[2])
+        self.assertIsNotNone(fast_launchers[3])
+        self.assertIsNotNone(fast_launchers[4])
+        self.assertEqual(generic_match_counts, [1, 2, 3, 4, 4])
+        expected_launches = list(zip(tensor_ptrs, stream_names, strict=True))
+        self.assertEqual(launched_args, expected_launches)
+        self.assertEqual(
+            results,
+            [("launched", launch_args) for launch_args in expected_launches],
+        )
+
+    def test_cute_wrapper_plans_freeze_nested_content_for_cache_key(self) -> None:
+        original_plans = [
+            {
+                "kind": "plan-a",
+                "kernel_args": ["arg0", "arg1"],
+                "nested": {"values": [1, 2]},
+            }
+        ]
+        frozen_plans = _freeze_cute_wrapper_plans(original_plans)
+        frozen_kernel = type("DummyCuteKernel", (), {})()
+        frozen_kernel._helion_cute_wrapper_plans = frozen_plans
+
+        frozen_key = _cute_wrapper_plans_cache_key(frozen_kernel)
+        original_plans[0]["kernel_args"].append("arg2")
+        original_plans[0]["nested"]["values"].append(3)
+        self.assertEqual(_cute_wrapper_plans_cache_key(frozen_kernel), frozen_key)
+        self.assertIsInstance(frozen_plans[0]["kernel_args"], tuple)
+        self.assertIsInstance(frozen_plans[0]["nested"]["values"], tuple)
+
+        mutable_kernel = type("DummyCuteKernel", (), {})()
+        mutable_kernel._helion_cute_wrapper_plans = [
+            {"kind": "plan-a", "kernel_args": ["arg0", "arg1"]}
+        ]
+        mutable_key = _cute_wrapper_plans_cache_key(mutable_kernel)
+        mutable_kernel._helion_cute_wrapper_plans[0]["kernel_args"].append("arg2")
+        self.assertNotEqual(_cute_wrapper_plans_cache_key(mutable_kernel), mutable_key)
+
+        def wrapper_plan_key(value: object) -> tuple[object, ...]:
+            kernel = type("DummyCuteKernel", (), {})()
+            kernel._helion_cute_wrapper_plans = [{"kind": "plan-a", "value": value}]
+            return _cute_wrapper_plans_cache_key(kernel)
+
+        self.assertNotEqual(wrapper_plan_key(0.0), wrapper_plan_key(-0.0))
+        self.assertNotEqual(wrapper_plan_key(1), wrapper_plan_key(1.0))
+        self.assertNotEqual(wrapper_plan_key(True), wrapper_plan_key(1))
+
+    def test_cute_launcher_last_launch_guards_compiled_discriminators(self) -> None:
+        cute_kernel = type("DummyCuteKernel", (), {})()
+        cute_kernel._helion_cute_wrapper_plans = [{"kind": "plan-a", "value": 1}]
+        build_calls: list[tuple[object, ...]] = []
+        compiled_calls: list[tuple[tuple[int, int, int], str | None]] = []
+        launched: list[tuple[int, tuple[object, ...]]] = []
+
+        class FakeCompiled:
+            def __init__(self, index: int) -> None:
+                self.index = index
+
+            def __call__(self, *args: object) -> tuple[int, tuple[object, ...]]:
+                launched.append((self.index, args))
+                return (self.index, args)
+
+        def fake_build(
+            _cute_kernel: object,
+            args: tuple[object, ...],
+            grid: tuple[int, int, int],
+        ) -> tuple[tuple[tuple[object, ...], ...], tuple[object, ...]]:
+            build_calls.append((*args, *grid))
+            return (("scalar", "int"),), ("launch", *args, *grid)
+
+        def fake_get(
+            _cute_kernel: object,
+            _schema_key: tuple[tuple[object, ...], ...],
+            block: tuple[int, int, int],
+            *,
+            compile_options: str | None = None,
+            arch_args: tuple[object, ...] | None = None,
+        ) -> FakeCompiled:
+            self.assertIsNotNone(arch_args)
+            compiled_calls.append((block, compile_options))
+            return FakeCompiled(len(compiled_calls))
+
+        with (
+            patch("helion.runtime._build_cute_schema_and_args", side_effect=fake_build),
+            patch("helion.runtime._cute_current_stream", return_value="stream"),
+            patch("helion.runtime._get_compiled_cute_launcher", side_effect=fake_get),
+        ):
+            first = default_cute_launcher(cute_kernel, (2,), 7, block=(32, 1, 1))
+            second = default_cute_launcher(cute_kernel, (2,), 7, block=(32, 1, 1))
+            cute_kernel._helion_cute_wrapper_plans[0]["value"] = 2
+            plan_miss = default_cute_launcher(cute_kernel, (2,), 7, block=(32, 1, 1))
+            cute_kernel._helion_cute_cluster_shape = (2, 1, 1)
+            cluster_miss = default_cute_launcher(cute_kernel, (2,), 7, block=(32, 1, 1))
+            options_miss = default_cute_launcher(
+                cute_kernel,
+                (2,),
+                7,
+                block=(32, 1, 1),
+                cute_compile_options="--generate-line-info",
+            )
+            block_miss = default_cute_launcher(
+                cute_kernel,
+                (2,),
+                7,
+                block=(64, 1, 1),
+                cute_compile_options="--generate-line-info",
+            )
+            grid_miss = default_cute_launcher(
+                cute_kernel,
+                (3,),
+                7,
+                block=(64, 1, 1),
+                cute_compile_options="--generate-line-info",
+            )
+
+        self.assertEqual(first[0], 1)
+        self.assertEqual(second[0], 1)
+        self.assertEqual(plan_miss[0], 2)
+        self.assertEqual(cluster_miss[0], 3)
+        self.assertEqual(options_miss[0], 4)
+        self.assertEqual(block_miss[0], 5)
+        self.assertEqual(grid_miss[0], 6)
+        self.assertEqual(len(compiled_calls), 6)
+        self.assertEqual(
+            [entry[0] for entry in launched],
+            [1, 1, 2, 3, 4, 5, 6],
+        )
+        self.assertEqual(
+            build_calls,
+            [
+                (7, 2, 1, 1),
+                (7, 2, 1, 1),
+                (7, 3, 1, 1),
+            ],
+        )
+
+    def test_cute_launcher_fast_guard_covers_frozen_compiled_discriminators(
+        self,
+    ) -> None:
+        cute_kernel = type("DummyCuteKernel", (), {})()
+        cute_kernel._helion_cute_wrapper_plans = _freeze_cute_wrapper_plans(
+            [{"kind": "plan-a", "value": 1}]
+        )
+        build_calls: list[tuple[object, ...]] = []
+        compiled_calls: list[tuple[tuple[int, int, int], str | None]] = []
+        launched: list[tuple[int, tuple[object, ...]]] = []
+        runtime_mod = importlib.import_module("helion.runtime")
+        generic_matcher = runtime_mod._cute_last_launch_cache_entry
+
+        class FakeCompiled:
+            def __init__(self, index: int) -> None:
+                self.index = index
+
+            def __call__(self, *args: object) -> tuple[int, tuple[object, ...]]:
+                launched.append((self.index, args))
+                return (self.index, args)
+
+        def fake_build(
+            _cute_kernel: object,
+            args: tuple[object, ...],
+            grid: tuple[int, int, int],
+        ) -> tuple[tuple[tuple[object, ...], ...], tuple[object, ...]]:
+            build_calls.append((*args, *grid))
+            return (("scalar", "int"),), ("launch", *args, *grid)
+
+        def fake_get(
+            _cute_kernel: object,
+            _schema_key: tuple[tuple[object, ...], ...],
+            block: tuple[int, int, int],
+            *,
+            compile_options: str | None = None,
+            arch_args: tuple[object, ...] | None = None,
+        ) -> FakeCompiled:
+            self.assertIsNotNone(arch_args)
+            compiled_calls.append((block, compile_options))
+            return FakeCompiled(len(compiled_calls))
+
+        with (
+            patch("helion.runtime._build_cute_schema_and_args", side_effect=fake_build),
+            patch("helion.runtime._cute_current_stream", return_value="stream"),
+            patch("helion.runtime._get_compiled_cute_launcher", side_effect=fake_get),
+            patch(
+                "helion.runtime._cute_last_launch_cache_entry",
+                wraps=generic_matcher,
+            ) as generic_match,
+        ):
+            first = default_cute_launcher(cute_kernel, (2,), 7, block=(32, 1, 1))
+            self.assertIsNotNone(
+                cute_kernel._helion_cute_last_launch_cache.fast_launcher
+            )
+            second = default_cute_launcher(cute_kernel, (2,), 7, block=(32, 1, 1))
+            self.assertEqual(generic_match.call_count, 1)
+
+            cute_kernel._helion_cute_wrapper_plans = _freeze_cute_wrapper_plans(
+                [{"kind": "plan-a", "value": 2}]
+            )
+            plan_miss = default_cute_launcher(cute_kernel, (2,), 7, block=(32, 1, 1))
+            self.assertIsNotNone(
+                cute_kernel._helion_cute_last_launch_cache.fast_launcher
+            )
+            self.assertEqual(generic_match.call_count, 2)
+
+            cute_kernel._helion_cute_cluster_shape = (2, 1, 1)
+            cluster_miss = default_cute_launcher(cute_kernel, (2,), 7, block=(32, 1, 1))
+            self.assertIsNotNone(
+                cute_kernel._helion_cute_last_launch_cache.fast_launcher
+            )
+            self.assertEqual(generic_match.call_count, 3)
+
+            options_miss = default_cute_launcher(
+                cute_kernel,
+                (2,),
+                7,
+                block=(32, 1, 1),
+                cute_compile_options="--generate-line-info",
+            )
+            self.assertIsNotNone(
+                cute_kernel._helion_cute_last_launch_cache.fast_launcher
+            )
+            self.assertEqual(generic_match.call_count, 4)
+
+            block_miss = default_cute_launcher(
+                cute_kernel,
+                (2,),
+                7,
+                block=(64, 1, 1),
+                cute_compile_options="--generate-line-info",
+            )
+            self.assertIsNotNone(
+                cute_kernel._helion_cute_last_launch_cache.fast_launcher
+            )
+            self.assertEqual(generic_match.call_count, 5)
+
+            grid_miss = default_cute_launcher(
+                cute_kernel,
+                (3,),
+                7,
+                block=(64, 1, 1),
+                cute_compile_options="--generate-line-info",
+            )
+            self.assertIsNotNone(
+                cute_kernel._helion_cute_last_launch_cache.fast_launcher
+            )
+            self.assertEqual(generic_match.call_count, 6)
+
+        self.assertEqual(first[0], 1)
+        self.assertEqual(second[0], 1)
+        self.assertEqual(plan_miss[0], 2)
+        self.assertEqual(cluster_miss[0], 3)
+        self.assertEqual(options_miss[0], 4)
+        self.assertEqual(block_miss[0], 5)
+        self.assertEqual(grid_miss[0], 6)
+        self.assertEqual(
+            [entry[0] for entry in launched],
+            [1, 1, 2, 3, 4, 5, 6],
+        )
+        self.assertEqual(len(compiled_calls), 6)
+        self.assertEqual(
+            build_calls,
+            [
+                (7, 2, 1, 1),
+                (7, 2, 1, 1),
+                (7, 3, 1, 1),
+            ],
+        )
+
+    def test_cute_launcher_last_launch_guards_tensor_identity_and_schema(
+        self,
+    ) -> None:
+        if DEVICE.type != "cuda":
+            self.skipTest("CuTe launcher tensor guard test needs CUDA")
+        cute_kernel = type("DummyCuteKernel", (), {})()
+        tensor = torch.empty(4, device=DEVICE)
+        same_storage_view = tensor.view_as(tensor)
+        self.assertEqual(tensor.data_ptr(), same_storage_view.data_ptr())
+        self.assertNotEqual(id(tensor), id(same_storage_view))
+        build_calls: list[tuple[int, bool]] = []
+        compiled_calls: list[int] = []
+
+        class FakeCompiled:
+            def __call__(self, *args: object) -> tuple[str, tuple[object, ...]]:
+                return ("launched", args)
+
+        def fake_build(
+            _cute_kernel: object,
+            args: tuple[object, ...],
+            _grid: tuple[int, int, int],
+        ) -> tuple[tuple[tuple[object, ...], ...], tuple[object, ...]]:
+            build_calls.append(
+                (
+                    id(args[0]),
+                    bool(
+                        getattr(
+                            _cute_kernel,
+                            "_helion_cute_disable_bake_tensor_shapes",
+                            False,
+                        )
+                    ),
+                )
+            )
+            return (("tensor", "torch.float32", 1),), (f"ptr-{len(build_calls)}",)
+
+        def fake_get(*_args: object, **_kwargs: object) -> FakeCompiled:
+            compiled_calls.append(len(compiled_calls) + 1)
+            return FakeCompiled()
+
+        with (
+            patch("helion.runtime._build_cute_schema_and_args", side_effect=fake_build),
+            patch("helion.runtime._cute_current_stream", return_value="stream"),
+            patch("helion.runtime._get_compiled_cute_launcher", side_effect=fake_get),
+        ):
+            first = default_cute_launcher(cute_kernel, (1,), tensor)
+            second = default_cute_launcher(cute_kernel, (1,), tensor)
+            view_miss = default_cute_launcher(cute_kernel, (1,), same_storage_view)
+            cute_kernel._helion_cute_disable_bake_tensor_shapes = True
+            schema_miss = default_cute_launcher(cute_kernel, (1,), same_storage_view)
+
+        self.assertEqual(first, ("launched", ("ptr-1", "stream")))
+        self.assertEqual(second, first)
+        self.assertEqual(view_miss, ("launched", ("ptr-2", "stream")))
+        self.assertEqual(schema_miss, ("launched", ("ptr-3", "stream")))
+        self.assertEqual(
+            build_calls,
+            [
+                (id(tensor), False),
+                (id(same_storage_view), False),
+                (id(same_storage_view), True),
+            ],
+        )
+        self.assertEqual(len(compiled_calls), 3)
+
+    def test_cute_launcher_last_launch_misses_on_same_tensor_metadata_mutation(
+        self,
+    ) -> None:
+        if DEVICE.type != "cuda":
+            self.skipTest("CuTe launcher tensor guard test needs CUDA")
+        cute_kernel = type("DummyCuteKernel", (), {})()
+        base = torch.empty(32, device=DEVICE)
+        tensor = base.as_strided((4, 2), (2, 1), 0)
+        tensor_id = id(tensor)
+        build_calls: list[tuple[tuple[int, ...], tuple[int, ...], int, int]] = []
+
+        class FakeCompiled:
+            def __call__(self, *args: object) -> tuple[str, tuple[object, ...]]:
+                return ("launched", args)
+
+        def fake_build(
+            _cute_kernel: object,
+            args: tuple[object, ...],
+            _grid: tuple[int, int, int],
+        ) -> tuple[tuple[tuple[object, ...], ...], tuple[object, ...]]:
+            tensor_arg = cast("torch.Tensor", args[0])
+            build_calls.append(
+                (
+                    tuple(int(size) for size in tensor_arg.shape),
+                    tuple(int(stride) for stride in tensor_arg.stride()),
+                    int(tensor_arg.storage_offset()),
+                    int(tensor_arg.data_ptr()),
+                )
+            )
+            return (("tensor", "torch.float32", 2),), (f"ptr-{len(build_calls)}",)
+
+        with (
+            patch("helion.runtime._build_cute_schema_and_args", side_effect=fake_build),
+            patch("helion.runtime._cute_current_stream", return_value="stream"),
+            patch(
+                "helion.runtime._get_compiled_cute_launcher",
+                return_value=FakeCompiled(),
+            ),
+        ):
+            first = default_cute_launcher(cute_kernel, (1,), tensor)
+            second = default_cute_launcher(cute_kernel, (1,), tensor)
+            tensor.as_strided_((4, 2), (1, 4), 0)
+            stride_miss = default_cute_launcher(cute_kernel, (1,), tensor)
+            tensor.as_strided_((4, 2), (2, 1), 1)
+            offset_miss = default_cute_launcher(cute_kernel, (1,), tensor)
+
+        self.assertEqual(id(tensor), tensor_id)
+        self.assertEqual(first, second)
+        self.assertEqual(stride_miss, ("launched", ("ptr-2", "stream")))
+        self.assertEqual(offset_miss, ("launched", ("ptr-3", "stream")))
+        self.assertEqual(
+            [(shape, stride, offset) for shape, stride, offset, _ in build_calls],
+            [
+                ((4, 2), (2, 1), 0),
+                ((4, 2), (1, 4), 0),
+                ((4, 2), (2, 1), 1),
+            ],
+        )
+        self.assertEqual(build_calls[0][3], build_calls[1][3])
+        self.assertNotEqual(build_calls[1][3], build_calls[2][3])
+
+    def test_kernel_fast_dispatch_key_includes_extra_specialization(self) -> None:
+        @helion.kernel()
+        def identity(x: torch.Tensor, metadata: torch.Tensor) -> torch.Tensor:
+            return x
+
+        x = torch.empty(1)
+        metadata = torch.tensor([0], dtype=torch.int64)
+        args = (x, metadata)
+        signature = identity._base_specialization_key(args)
+
+        def metadata_value(call_args: Sequence[object]) -> int:
+            tensor = cast("torch.Tensor", call_args[1])
+            return int(tensor[0].item())
+
+        identity._specialize_extra[signature] = [metadata_value]
+
+        key0 = identity._fast_dispatch_key(args)
+        metadata[0] = 1
+        key1 = identity._fast_dispatch_key(args)
+
+        self.assertNotEqual(key0, key1)
+
+    def test_bound_kernel_runtime_arg_pruning_preserves_full_source(self) -> None:
+        @helion.kernel()
+        def identity(
+            x: torch.Tensor, layout: torch.Tensor, n_sizes: torch.Tensor
+        ) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile in hl.tile(x.numel()):
+                out[tile] = x[tile]
+            return out
+
+        x = torch.empty(16, device=DEVICE)
+        layout = torch.tensor([0], device=DEVICE, dtype=torch.int64)
+        n_sizes = torch.tensor([128], device=DEVICE, dtype=torch.int64)
+        bound = identity.bind((x, layout, n_sizes))
+
+        bound.env.cute_resolved_wrapper_plans = [{"layout_bind_idx": 1}]
+        bound._prune_runtime_arg_values_by_name()
+        self.assertEqual(bound.env.runtime_arg_values_by_name, {"layout": layout})
+
+        bound.env.cute_resolved_wrapper_plans = []
+        bound._prune_runtime_arg_values_by_name()
+        self.assertEqual(bound.env.runtime_arg_values_by_name, {})
+
+        bound._restore_runtime_arg_values_by_name()
+        bound.env.cute_resolved_wrapper_plans = [{"n_sizes_bind_idx": 2}]
+        bound._prune_runtime_arg_values_by_name()
+        self.assertEqual(bound.env.runtime_arg_values_by_name, {"n_sizes": n_sizes})
 
     def test_cute_launcher_bakes_layouts_for_small_biased_wrapper_only(self) -> None:
         tensor = torch.empty((2, 128, 64), device=DEVICE, dtype=torch.float16)
