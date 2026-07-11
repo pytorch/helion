@@ -405,7 +405,7 @@ class HelionTemplateBuffer(TemplateBuffer):
 
     def has_aliasing_or_mutation_for_prologue_fusion(
         self,
-        scheduler_node: SchedulerNode,
+        scheduler_node: object,
     ) -> bool:
         """Return the Inductor fusion-blocking alias/mutation state.
 
@@ -416,6 +416,7 @@ class HelionTemplateBuffer(TemplateBuffer):
         MutationOutputs remain in the scheduler graph for dependencies and
         memory planning.
         """
+        scheduler_node = cast("SchedulerNode", scheduler_node)
         mutation_names: set[str] = set()
         for output in scheduler_node.get_outputs():
             if output.get_aliases():
