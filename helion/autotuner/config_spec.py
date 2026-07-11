@@ -1207,6 +1207,48 @@ class ConfigSpec:
             cluster_m=cluster_m,
         )
 
+    def _tcgen05_ab_stages_three_fits_for_target(
+        self,
+        *,
+        dtype_bytes: int,
+        device: torch.device,
+        bm: int,
+        bn: int,
+        bk: int,
+        cluster_m: int,
+        ab_stages: int = 3,
+    ) -> bool:
+        return self._cute_tcgen05_config.ab_stages_three_fits_for_target(
+            dtype_bytes=dtype_bytes,
+            device=device,
+            bm=bm,
+            bn=bn,
+            bk=bk,
+            cluster_m=cluster_m,
+            ab_stages=ab_stages,
+        )
+
+    def _tcgen05_grouped_dynamic_ab4_fits_for_target(
+        self,
+        *,
+        dtype_bytes: int,
+        device: torch.device,
+        bm: int,
+        bn: int,
+        bk: int,
+        cluster_m: int,
+        c_stages: int,
+    ) -> bool:
+        return self._cute_tcgen05_config.grouped_dynamic_ab4_fits_for_target(
+            dtype_bytes=dtype_bytes,
+            device=device,
+            bm=bm,
+            bn=bn,
+            bk=bk,
+            cluster_m=cluster_m,
+            c_stages=c_stages,
+        )
+
     def _fix_tcgen05_ab_stages_three_search_config(
         self, config: dict[str, object]
     ) -> None:
@@ -1381,6 +1423,8 @@ class ConfigSpec:
                     raise InvalidConfig(
                         f"Unsupported config keys for backend {self.backend_name!r}: {backend_specific}"
                     )
+        if self.backend_name == "cute":
+            self._cute_tcgen05_config.prepare_normalization(config)
         provided_keys = set(config)
         if _fix_invalid:
             self._pre_normalize_cute_flash_block_sizes(config)
@@ -1983,6 +2027,10 @@ class ConfigSpec:
                 config,
                 overrides,
             )
+
+    def prepare_minimize(self, config: dict[str, object]) -> None:
+        if self.backend_name == "cute":
+            self._cute_tcgen05_config.prepare_normalization(config)
 
     def _base_default_config(self) -> helion.Config:
         config = self.flat_config(lambda x: x.default())
