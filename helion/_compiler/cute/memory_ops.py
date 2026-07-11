@@ -13,6 +13,8 @@ import contextlib
 import logging
 import operator
 from typing import TYPE_CHECKING
+from typing import Any
+from typing import cast
 
 import torch
 from torch.fx.node import map_arg
@@ -604,8 +606,9 @@ def _codegen_cute_affine_range_store(
             or len(source_subscript) != 1
         ):
             return None
+        source_subscript_args = tuple(cast("Any", source_subscript))
         ast_source_subscript = list(
-            map_arg(tuple(source_subscript), lambda arg: state.env[arg])
+            map_arg(source_subscript_args, lambda arg: state.env[arg])
         )
         (source_affine,) = ast_source_subscript
         if not isinstance(source_affine, CuteAffineRangeIndex):
@@ -977,7 +980,8 @@ def _codegen_cute_store_loaded_index_trailing_slices(
     indexer_value = indexer.meta.get("val")
     if not isinstance(indexer_value, torch.Tensor) or indexer_value.ndim == 0:
         return None
-    trailing_source = [*source_subscript[1:]]
+    source_subscript_args = tuple(cast("Any", source_subscript))
+    trailing_source = list(source_subscript_args[1:])
     if not trailing_source or not all(idx == slice(None) for idx in trailing_source):
         return None
     if len(subscript) != indexer_value.ndim + len(trailing_source):
@@ -987,7 +991,7 @@ def _codegen_cute_store_loaded_index_trailing_slices(
         return None
 
     ast_source_subscript = list(
-        map_arg(tuple(source_subscript), lambda arg: state.env[arg])
+        map_arg(source_subscript_args, lambda arg: state.env[arg])
     )
     index_exprs = _cute_index_exprs(
         state,
@@ -1191,7 +1195,10 @@ def _cute_unsqueeze_expand_load_source(
         if not isinstance(index_arg, (list, tuple)):
             return None
         # Exactly one ``None`` (the inserted broadcast dim) at ``broadcast_dim``.
-        none_positions = [pos for pos, entry in enumerate(index_arg) if entry is None]
+        index_arg_entries = tuple(cast("Any", index_arg))
+        none_positions = [
+            pos for pos, entry in enumerate(index_arg_entries) if entry is None
+        ]
         if none_positions != [broadcast_dim]:
             return None
         load_node = inner.args[0]
@@ -1288,11 +1295,12 @@ def _codegen_cute_store_expand_broadcast_tile(
         ):
             load_tensor = load_tensor_node.meta.get("val")
             if isinstance(load_tensor, torch.Tensor):
+                load_subscript_args = tuple(cast("Any", load_subscript))
                 load_subscript_proxy = tuple(
-                    map_arg([*load_subscript], lambda arg: arg.meta["val"])
+                    map_arg(load_subscript_args, lambda arg: arg.meta["val"])
                 )
                 load_subscript_ast = map_arg(
-                    [*load_subscript], lambda arg: state.env[arg]
+                    load_subscript_args, lambda arg: state.env[arg]
                 )
                 load_coords = _cute_index_exprs(
                     state,
@@ -1446,6 +1454,46 @@ def _try_splice_tcgen05_unary_epilogue(
     )
     if rewritten_stmt is None:
         return None
+    stmts = rewritten_stmt if isinstance(rewritten_stmt, list) else [rewritten_stmt]
+    for stmt in stmts:
+        state.add_statement(stmt)
+    return ast.Constant(value=None)
+
+
+def _try_splice_tcgen05_grouped_tail_epilogue(
+    state: CodegenState,
+    tensor: object,
+    subscript: list[object] | tuple[object, ...],
+    ast_subscript: list[object] | tuple[object, ...],
+    extra_mask: ast.AST | None,
+    value_node: torch.fx.Node | None,
+) -> ast.AST | None:
+    """Splice grouped preserve-output M/N tail stores into tcgen05."""
+    cute_state = state.device_function.cute_state
+    if not cute_state.matmul_fx_nodes:
+        return None
+    if value_node is None or state.fx_node is None:
+        return None
+    if not isinstance(tensor, torch.Tensor):
+        return None
+    grouped_tail = cute_state.grouped_tail_proof_for_store(state.fx_node)
+    if grouped_tail is None:
+        return None
+    anchor_result_var = cute_state.matmul_fx_node_result_vars.get(grouped_tail.anchor)
+    if anchor_result_var is None:
+        return None
+    rewritten_stmt = _codegen_cute_store_tcgen05_tile(
+        state,
+        tensor,
+        subscript,
+        ast_subscript,
+        extra_mask,
+        anchor_result_var,
+        grouped_tail_epilogue=grouped_tail,
+    )
+    if rewritten_stmt is None:
+        return None
+    state.codegen.remove_statements_owned_by_nodes(grouped_tail.producer_nodes)
     stmts = rewritten_stmt if isinstance(rewritten_stmt, list) else [rewritten_stmt]
     for stmt in stmts:
         state.add_statement(stmt)
@@ -1635,6 +1683,11 @@ def _(state: CodegenState) -> ast.AST:
     # splice off and fall through to the loud-failure backstop
     # below.
     spliced = _try_splice_tcgen05_unary_epilogue(
+        state, tensor, subscript, ast_subscript, extra_mask, value_node
+    )
+    if spliced is not None:
+        return spliced
+    spliced = _try_splice_tcgen05_grouped_tail_epilogue(
         state, tensor, subscript, ast_subscript, extra_mask, value_node
     )
     if spliced is not None:
