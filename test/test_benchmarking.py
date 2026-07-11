@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import os
 from types import SimpleNamespace
+from typing import Any
+from typing import cast
 
 from benchmarks.cute import compare_attention_backends
 import pytest
@@ -44,7 +46,8 @@ class _FakeCuda:
         self.available = available
         self.capturing = capturing
         self.current_stream_obj = _FakeStream()
-        self.graph_obj = None
+        self.graph_obj: _FakeGraph | None = None
+        self.graphs: list[_FakeGraph] = []
         self.synchronize_count = 0
 
     def is_available(self):
@@ -66,8 +69,10 @@ class _FakeCuda:
         self.synchronize_count += 1
 
     def CUDAGraph(self):
-        self.graph_obj = _FakeGraph()
-        return self.graph_obj
+        graph = _FakeGraph()
+        self.graph_obj = graph
+        self.graphs.append(graph)
+        return graph
 
     def graph(self, graph):
         return _FakeGraphContext()
@@ -75,6 +80,43 @@ class _FakeCuda:
 
 def _fake_torch(cuda):
     return SimpleNamespace(cuda=cuda, version=SimpleNamespace(hip=None))
+
+
+def _last_graph(fake_cuda: _FakeCuda) -> _FakeGraph:
+    graph = fake_cuda.graph_obj
+    assert graph is not None
+    return graph
+
+
+class _FakePerfCounter:
+    def __init__(self):
+        self.value = 0.0
+
+    def __call__(self):
+        self.value += 0.001
+        return self.value
+
+
+def _patch_generic_bench_for_cudagraph(monkeypatch, *, env_enabled=True):
+    fake_cuda = _FakeCuda()
+    monkeypatch.setattr(benchmarking, "torch", _fake_torch(fake_cuda))
+    if env_enabled:
+        monkeypatch.setenv("HELION_BENCHMARK_CUDAGRAPH", "1")
+    else:
+        monkeypatch.delenv("HELION_BENCHMARK_CUDAGRAPH", raising=False)
+    monkeypatch.setattr(benchmarking, "_make_l2_cache_clearer", lambda: lambda: None)
+    monkeypatch.setattr(benchmarking, "synchronize_device", lambda result=None: None)
+    monkeypatch.setattr(
+        benchmarking,
+        "sync_object",
+        lambda value, process_group_name=None: value,
+    )
+    monkeypatch.setattr(benchmarking.time, "perf_counter", _FakePerfCounter())
+    return fake_cuda
+
+
+def _fake_device_value(device_type: str = "cuda"):
+    return SimpleNamespace(device=SimpleNamespace(type=device_type))
 
 
 _FAKE_COMPILER_SEED = {
@@ -325,7 +367,203 @@ def test_cudagraph_replay_wraps_callable(monkeypatch):
 
     assert replay() == 2
     assert calls == ["call", "call"]
-    assert fake_cuda.graph_obj.replay_count == 1
+    assert _last_graph(fake_cuda).replay_count == 1
+
+
+def test_compute_repeat_generic_uses_cudagraph_when_requested(monkeypatch):
+    fake_cuda = _patch_generic_bench_for_cudagraph(monkeypatch)
+    calls = []
+
+    def fn():
+        calls.append("call")
+        return _fake_device_value()
+
+    repeat = benchmarking.compute_repeat_generic(
+        fn,
+        target_ms=1.0,
+        min_repeat=1,
+        max_repeat=10,
+        estimate_runs=3,
+    )
+
+    assert repeat == 3
+    assert calls == ["call", "call", "call"]
+    assert _last_graph(fake_cuda).replay_count == 3
+
+
+def test_compute_repeat_generic_uses_default_cudagraph_when_env_unset(monkeypatch):
+    fake_cuda = _patch_generic_bench_for_cudagraph(monkeypatch, env_enabled=False)
+    calls = []
+
+    def fn():
+        calls.append("call")
+        return _fake_device_value()
+
+    assert "HELION_BENCHMARK_CUDAGRAPH" not in os.environ
+
+    repeat = benchmarking.compute_repeat_generic(
+        fn,
+        target_ms=1.0,
+        min_repeat=1,
+        max_repeat=10,
+        estimate_runs=3,
+        default_cudagraph=True,
+    )
+
+    assert repeat == 3
+    assert calls == ["call", "call", "call"]
+    assert _last_graph(fake_cuda).replay_count == 3
+
+
+def test_interleaved_bench_generic_uses_cudagraph_when_requested(monkeypatch):
+    fake_cuda = _patch_generic_bench_for_cudagraph(monkeypatch)
+    calls = []
+
+    def fn_a():
+        calls.append("a")
+        return _fake_device_value()
+
+    def fn_b():
+        calls.append("b")
+        return _fake_device_value()
+
+    times = benchmarking.interleaved_bench_generic([fn_a, fn_b], repeat=2)
+
+    assert times == pytest.approx([1.0, 1.0])
+    assert calls == ["a", "b", "a", "a", "b", "b"]
+    assert [graph.replay_count for graph in fake_cuda.graphs] == [2, 2]
+
+
+def test_do_bench_generic_uses_cudagraph_when_requested(monkeypatch):
+    fake_cuda = _patch_generic_bench_for_cudagraph(monkeypatch)
+    calls = []
+
+    def fn():
+        calls.append("call")
+        return _fake_device_value()
+
+    timing = benchmarking.do_bench_generic(
+        fn,
+        warmup=1,
+        rep=1,
+        return_mode="median",
+    )
+
+    assert timing == pytest.approx(1.0)
+    assert calls == ["call", "call", "call"]
+    assert _last_graph(fake_cuda).replay_count == 15
+
+
+def test_do_bench_generic_skips_cudagraph_for_non_cuda_output(monkeypatch):
+    fake_cuda = _patch_generic_bench_for_cudagraph(monkeypatch)
+    calls = []
+
+    def fn():
+        calls.append("call")
+        return _fake_device_value("cpu")
+
+    timing = benchmarking.do_bench_generic(
+        fn,
+        warmup=1,
+        rep=1,
+        return_mode="median",
+    )
+
+    assert timing == pytest.approx(1.0)
+    assert len(calls) == 16
+    assert fake_cuda.graph_obj is None
+
+
+def test_do_bench_generic_cudagraph_for_cuda_side_effect_with_cpu_output(monkeypatch):
+    fake_cuda = _patch_generic_bench_for_cudagraph(monkeypatch)
+    cuda_state = _fake_device_value()
+    calls = []
+
+    def fn():
+        calls.append(cuda_state.device.type)
+        return _fake_device_value("cpu")
+
+    timing = benchmarking.do_bench_generic(
+        fn,
+        warmup=1,
+        rep=1,
+        return_mode="median",
+    )
+
+    assert timing == pytest.approx(1.0)
+    assert calls == ["cuda", "cuda", "cuda"]
+    assert _last_graph(fake_cuda).replay_count == 15
+
+
+def test_do_bench_generic_cudagraph_for_cuda_default_with_cpu_output(monkeypatch):
+    fake_cuda = _patch_generic_bench_for_cudagraph(monkeypatch)
+    cuda_state = _fake_device_value()
+    calls = []
+
+    def fn(state=cuda_state):
+        calls.append(state.device.type)
+        return _fake_device_value("cpu")
+
+    timing = benchmarking.do_bench_generic(
+        fn,
+        warmup=1,
+        rep=1,
+        return_mode="median",
+    )
+
+    assert timing == pytest.approx(1.0)
+    assert calls == ["cuda", "cuda", "cuda"]
+    assert _last_graph(fake_cuda).replay_count == 15
+
+
+def test_do_bench_generic_cudagraph_for_cuda_callable_state_with_cpu_output(
+    monkeypatch,
+):
+    fake_cuda = _patch_generic_bench_for_cudagraph(monkeypatch)
+
+    class Fn:
+        def __init__(self) -> None:
+            self.cuda_state = _fake_device_value()
+            self.calls: list[str] = []
+
+        def __call__(self):
+            self.calls.append(self.cuda_state.device.type)
+            return _fake_device_value("cpu")
+
+    fn = Fn()
+    timing = benchmarking.do_bench_generic(
+        fn,
+        warmup=1,
+        rep=1,
+        return_mode="median",
+    )
+
+    assert timing == pytest.approx(1.0)
+    assert fn.calls == ["cuda", "cuda", "cuda"]
+    assert _last_graph(fake_cuda).replay_count == 15
+
+
+def test_do_bench_generic_keeps_backward_path_direct(monkeypatch):
+    fake_cuda = _patch_generic_bench_for_cudagraph(monkeypatch)
+    calls = []
+    grad_target = SimpleNamespace(grad="set")
+
+    def fn():
+        calls.append("call")
+        return "out"
+
+    timing = benchmarking.do_bench_generic(
+        fn,
+        warmup=1,
+        rep=1,
+        grad_to_none=cast("Any", [grad_target]),
+        return_mode="median",
+    )
+
+    assert timing == pytest.approx(1.0)
+    assert len(calls) == 16
+    assert fake_cuda.graph_obj is None
+    assert grad_target.grad is None
 
 
 def test_run_example_enables_cudagraph_only_for_final_benchmark(monkeypatch):

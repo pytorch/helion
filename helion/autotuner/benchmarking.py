@@ -9,6 +9,7 @@ import os
 import statistics
 import tempfile
 import time
+import types
 from typing import TYPE_CHECKING
 from typing import Any
 from typing import Callable
@@ -28,6 +29,7 @@ T = TypeVar("T")
 
 _log = logging.getLogger(__name__)
 _BENCHMARK_CUDAGRAPH_ENV = "HELION_BENCHMARK_CUDAGRAPH"
+_MISSING = object()
 
 
 def _make_l2_cache_clearer() -> Callable[[], None]:
@@ -86,10 +88,73 @@ def _make_cudagraph_replay(fn: Callable[[], T]) -> Callable[[], T]:
     return replay
 
 
+def _contains_cuda_device_value(value: object, seen: set[int] | None = None) -> bool:
+    if seen is None:
+        seen = set()
+    value_id = id(value)
+    if value_id in seen:
+        return False
+    seen.add(value_id)
+    if getattr(getattr(value, "device", None), "type", None) == "cuda":
+        return True
+    if isinstance(value, dict):
+        return any(_contains_cuda_device_value(item, seen) for item in value.values())
+    if isinstance(value, (tuple, list, set)):
+        return any(_contains_cuda_device_value(item, seen) for item in value)
+    if isinstance(value, (types.ModuleType, type)):
+        return False
+    state = getattr(value, "__dict__", None)
+    if isinstance(state, dict):
+        return any(_contains_cuda_device_value(item, seen) for item in state.values())
+    return False
+
+
+def _callable_captures_cuda_device_value(fn: Callable[[], object]) -> bool:
+    if isinstance(fn, functools.partial):
+        return (
+            _contains_cuda_device_value(fn.args)
+            or _contains_cuda_device_value(fn.keywords or {})
+            or _callable_captures_cuda_device_value(fn.func)
+        )
+    bound_self = getattr(fn, "__self__", None)
+    if bound_self is not None and _contains_cuda_device_value(bound_self):
+        return True
+    if _contains_cuda_device_value(getattr(fn, "__defaults__", None)):
+        return True
+    if _contains_cuda_device_value(getattr(fn, "__kwdefaults__", None)):
+        return True
+    if _contains_cuda_device_value(getattr(fn, "__dict__", None)):
+        return True
+    closure = getattr(fn, "__closure__", None)
+    if closure is None:
+        return False
+    for cell in closure:
+        try:
+            value = cell.cell_contents
+        except ValueError:
+            continue
+        if _contains_cuda_device_value(value):
+            return True
+    return False
+
+
 def _maybe_cudagraph_replay(
-    fn: Callable[[], T], *, default_enabled: bool = False
+    fn: Callable[[], T],
+    *,
+    default_enabled: bool = False,
+    sample_output: object = _MISSING,
+    sample_output_has_cuda_device_value: bool | None = None,
 ) -> Callable[[], T]:
     if not _env_get_bool(_BENCHMARK_CUDAGRAPH_ENV, default=default_enabled):
+        return fn
+
+    if sample_output_has_cuda_device_value is None and sample_output is not _MISSING:
+        sample_output_has_cuda_device_value = _contains_cuda_device_value(sample_output)
+    if (
+        sample_output_has_cuda_device_value is False
+        and not _callable_captures_cuda_device_value(fn)
+    ):
+        _log.debug("Skipping CUDA graph benchmarking: output is not on CUDA")
         return fn
 
     reason = _cudagraph_unavailable_reason()
@@ -190,7 +255,7 @@ def compute_repeat_generic(
     min_repeat: int = 10,
     max_repeat: int = 1000,
     estimate_runs: int = 5,
-    default_cudagraph: bool = False,  # accepted for API symmetry; wall-clock timing doesn't use CG
+    default_cudagraph: bool = False,
 ) -> int:
     """
     Estimate how many repetitions are needed using wall-clock timing.
@@ -199,12 +264,15 @@ def compute_repeat_generic(
     # Warm the pipeline once before collecting timing samples.
     out = fn()
     synchronize_device(out)
+    benchmark_function = _maybe_cudagraph_replay(
+        fn, default_enabled=default_cudagraph, sample_output=out
+    )
 
     clear_l2 = _make_l2_cache_clearer()
     start = time.perf_counter()
     for _ in range(estimate_runs):
         clear_l2()
-        out = fn()
+        out = benchmark_function()
     synchronize_device(out)
     end = time.perf_counter()
 
@@ -288,17 +356,27 @@ def interleaved_bench_generic(
     *,
     repeat: int,
     desc: str | None = None,
-    default_cudagraph: bool = False,  # accepted for API symmetry; wall-clock timing doesn't use CG
+    default_cudagraph: bool = False,
 ) -> list[float]:
     """
     Benchmark multiple functions using wall-clock timing.
     Used for backends that don't have Triton's event-based timing (e.g., Pallas/TPU).
     """
     # warmup
+    output_has_cuda: list[bool] = []
     out: object = None
     for fn in fns:
         out = fn()
+        output_has_cuda.append(_contains_cuda_device_value(out))
     synchronize_device(out)
+    benchmark_functions = [
+        _maybe_cudagraph_replay(
+            fn,
+            default_enabled=default_cudagraph,
+            sample_output_has_cuda_device_value=has_cuda,
+        )
+        for fn, has_cuda in zip(fns, output_has_cuda, strict=True)
+    ]
 
     clear_l2 = _make_l2_cache_clearer()
     all_times: list[list[float]] = [[] for _ in range(len(fns))]
@@ -310,11 +388,11 @@ def interleaved_bench_generic(
         enabled=desc is not None,
     )
     for _i in iterator:
-        for j in range(len(fns)):
+        for j in range(len(benchmark_functions)):
             clear_l2()
             synchronize_device(out)
             start = time.perf_counter()
-            out = fns[j]()
+            out = benchmark_functions[j]()
             synchronize_device(out)
             end = time.perf_counter()
             all_times[j].append((end - start) * 1000)  # convert to ms
@@ -601,7 +679,7 @@ def do_bench_generic(
     return_mode: str = "mean",
     process_group_name: str | None = None,
     *,
-    default_cudagraph: bool = False,  # accepted for API symmetry; wall-clock timing doesn't use CG
+    default_cudagraph: bool = False,
 ) -> float | tuple[float, ...]:
     """
     Benchmark using wall-clock timing for backends without Triton event timing.
@@ -610,6 +688,13 @@ def do_bench_generic(
 
     out = fn()
     synchronize_device(out)
+    benchmark_function = (
+        fn
+        if grad_to_none is not None
+        else _maybe_cudagraph_replay(
+            fn, default_enabled=default_cudagraph, sample_output=out
+        )
+    )
 
     clear_l2 = _make_l2_cache_clearer()
 
@@ -618,7 +703,7 @@ def do_bench_generic(
     start = time.perf_counter()
     for _ in range(5):
         clear_l2()
-        out = fn()
+        out = benchmark_function()
     synchronize_device(out)
     end = time.perf_counter()
     estimate_ms = sync_object(
@@ -630,7 +715,7 @@ def do_bench_generic(
     n_repeat = max(1, int(rep / estimate_ms))
     # Warm-up
     for _ in range(n_warmup):
-        fn()
+        benchmark_function()
     # Benchmark
     times: list[float] = []
     for _i in range(n_repeat):
@@ -640,7 +725,7 @@ def do_bench_generic(
         clear_l2()
         synchronize_device(out)
         t0 = time.perf_counter()
-        out = fn()
+        out = benchmark_function()
         synchronize_device(out)
         t1 = time.perf_counter()
         times.append((t1 - t0) * 1000)  # convert to ms
