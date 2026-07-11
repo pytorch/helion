@@ -49,14 +49,14 @@ if TYPE_CHECKING:
     from .device_ir import GraphInfo
     from .host_function import HostFunction
     from .loop_dependency_checker import LoopDependencyChecker
-    from .pallas.compact_worklist import OwnerPrepHoist
+    from .pallas.compact_worklist import ResidentPrepHoist
     from .tile_strategy import DeviceLoopOrGridState
     from .type_info import TensorType
 
 
 @dataclasses.dataclass(frozen=True)
-class OwnerPrepLowering:
-    hoist: OwnerPrepHoist
+class ResidentPrepLowering:
+    hoist: ResidentPrepHoist
     resident_window_name: str
     cache_name: str
 
@@ -138,8 +138,8 @@ class GenerateAST(NodeVisitor, CodegenInterface):
         self.store_transform = store_transform
         self.load_transform = load_transform
         self._statement_owner_fx_node: Node | None = None
-        self.owner_prep_lowering_stack: list[
-            dict[tuple[int, str], OwnerPrepLowering]
+        self.resident_prep_lowering_stack: list[
+            dict[tuple[int, str], ResidentPrepLowering]
         ] = []
 
         # Now create device function and initialize CodegenInterface
@@ -158,21 +158,21 @@ class GenerateAST(NodeVisitor, CodegenInterface):
         return self.codegen_graphs[graph_id]
 
     @contextlib.contextmanager
-    def owner_prep_lowering_scope(
-        self, lowerings: list[OwnerPrepLowering]
+    def resident_prep_lowering_scope(
+        self, lowerings: list[ResidentPrepLowering]
     ) -> Iterator[None]:
         by_node = {
             (lowering.hoist.graph_id, lowering.hoist.prep_node_name): lowering
             for lowering in lowerings
         }
-        self.owner_prep_lowering_stack.append(by_node)
+        self.resident_prep_lowering_stack.append(by_node)
         try:
             yield
         finally:
-            self.owner_prep_lowering_stack.pop()
+            self.resident_prep_lowering_stack.pop()
 
-    def owner_prep_lowering_for_node(self, node: Node) -> OwnerPrepLowering | None:
-        for scope in reversed(self.owner_prep_lowering_stack):
+    def resident_prep_lowering_for_node(self, node: Node) -> ResidentPrepLowering | None:
+        for scope in reversed(self.resident_prep_lowering_stack):
             for (graph_id, prep_node_name), lowering in scope.items():
                 if prep_node_name != node.name:
                     continue

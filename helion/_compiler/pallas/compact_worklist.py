@@ -38,6 +38,9 @@ from ..ast_read_writes import ReadWrites
 from ..ast_read_writes import ast_rename
 
 if TYPE_CHECKING:
+    from collections.abc import Iterable
+    from collections.abc import Mapping
+
     from ..device_ir import GraphInfo
     from ..host_function import HostFunction
 
@@ -65,8 +68,8 @@ class Axis:
     block_size_var: str  # "1" for owner_grid; the codegen block-size var otherwise
     # Name of the single offset tensor ``T`` when this axis's bounds are the exact
     # packed-consecutive idiom ``base=T[g], end=T[g+1]`` (so ``T[i+1]-T[i]`` is
-    # EXACTLY the per-owner length), else None.  Set from ``_packed_consecutive`` at
-    # construction; owner residency uses it to prove the resident-window overflow
+    # EXACTLY the per-source length), else None.  Set from ``_packed_consecutive`` at
+    # construction; resident caching uses it to prove the resident-window overflow
     # guard (``max(diff(T))``) can't under-count the range.
     packed_offset_arg: str | None = None
 
@@ -84,7 +87,7 @@ class TensorPolicy:
 
     ``kind`` is *classification only*: ``ordered_reduction`` means "indexed by the
     ordered axis on the leading dim".  If the range/window proof succeeds, every
-    such operand can be made resident in a per-owner VMEM window.  Optional prep
+    such operand can be made resident in a per-range VMEM window.  Optional prep
     caching is detected later from the tiled FX graph.
     """
 
@@ -162,18 +165,18 @@ def ordered_ref_names(plan: CompactWorklistPlan) -> tuple[str, str]:
     return f"{prefix}_begin", f"{prefix}_len"
 
 
-def owner_resident_entries(plan: CompactWorklistPlan) -> tuple[TensorPolicy, ...]:
-    """Ordered operands eligible for an owner-keyed resident VMEM window."""
+def resident_ordered_entries(plan: CompactWorklistPlan) -> tuple[TensorPolicy, ...]:
+    """Ordered operands eligible for a range-keyed resident VMEM window."""
     return tuple(p for p in plan.tensor_policies if p.kind == "ordered_reduction")
 
 
-def ordered_owner_residency_bound_arg(plan: CompactWorklistPlan) -> str | None:
-    """The offset array whose consecutive differences are EXACTLY the per-owner
+def ordered_resident_bound_arg(plan: CompactWorklistPlan) -> str | None:
+    """The offset array whose consecutive differences are EXACTLY the per-source
     ordered (reduction) lengths -- i.e. the ordered bound is the proven
     packed-consecutive idiom ``T[g]``/``T[g+1]`` (recorded as
     ``Axis.packed_offset_arg``) -- or ``None`` otherwise.
 
-    Owner residency requires this so the resident window can be bound-checked at
+    Resident caching requires this so the resident window can be bound-checked at
     launch: the launcher raises if ``max(T[i+1]-T[i])`` exceeds the compile-time
     window size.  A merely single-tensor-but-not-consecutive bound (e.g.
     ``T[g+1]+128``) does NOT qualify -- ``max(diff(T))`` would under-count the
@@ -185,7 +188,7 @@ def ordered_owner_residency_bound_arg(plan: CompactWorklistPlan) -> str | None:
 
 
 @dataclasses.dataclass(frozen=True)
-class OwnerResidencyRangeSpec:
+class ResidentCacheRangeSpec:
     """The runtime proof for the resident ordered window.
 
     ``ordered_offset_arg`` supplies the ordered lengths. ``compact_offset_arg``
@@ -198,15 +201,15 @@ class OwnerResidencyRangeSpec:
 
 
 @dataclasses.dataclass(frozen=True)
-class OwnerResidencyDecision:
-    """The single 'is owner residency active, and on which operands' decision.
+class ResidentCacheDecision:
+    """The single 'is resident caching active, and on which operands' decision.
 
     Every codegen + runtime path that emits resident-window behavior must consume
     this cached decision and gate on ``active``.
     """
 
     resident_operands: tuple[str, ...]
-    range_spec: OwnerResidencyRangeSpec | None
+    range_spec: ResidentCacheRangeSpec | None
     physical_window: int
     inactive_reason: str | None
     # Semantic metadata fields that identify the cached contents.  Store fields,
@@ -220,44 +223,44 @@ class OwnerResidencyDecision:
         return self.inactive_reason is None
 
 
-def build_owner_residency_decision(
+def build_resident_cache_decision(
     plan: CompactWorklistPlan,
     operands: list[tuple[tuple[int, ...], int]],
     *,
     physical_window: int,
-) -> OwnerResidencyDecision:
-    """Finalize owner-residency eligibility for one concrete config.
+) -> ResidentCacheDecision:
+    """Finalize resident-cache eligibility for one concrete config.
 
     Detection records semantic proofs on the plan; backend setup computes the VMEM
     window once from concrete shapes/block sizes and stores the result here.  All
     later consumers read this decision instead of recomputing eligibility/window
     math from partially-overlapping inputs.
     """
-    residents = tuple(p.arg_name for p in owner_resident_entries(plan))
+    residents = tuple(p.arg_name for p in resident_ordered_entries(plan))
     if not residents:
-        return OwnerResidencyDecision(residents, None, 0, "no resident operands")
-    ordered_arg = ordered_owner_residency_bound_arg(plan)
+        return ResidentCacheDecision(residents, None, 0, "no resident operands")
+    ordered_arg = ordered_resident_bound_arg(plan)
     if ordered_arg is None:
-        return OwnerResidencyDecision(
+        return ResidentCacheDecision(
             residents, None, 0, "ordered bound is not packed"
         )
     compact_arg = plan.compact_axis.packed_offset_arg
     if compact_arg is None:
-        return OwnerResidencyDecision(
+        return ResidentCacheDecision(
             residents, None, 0, "compact bound is not packed"
         )
     if not operands:
-        return OwnerResidencyDecision(residents, None, 0, "no resident operands")
+        return ResidentCacheDecision(residents, None, 0, "no resident operands")
     if physical_window <= 0:
-        return OwnerResidencyDecision(
+        return ResidentCacheDecision(
             residents,
             None,
             0,
             "VMEM budget cannot hold one ordered block",
         )
-    return OwnerResidencyDecision(
+    return ResidentCacheDecision(
         resident_operands=residents,
-        range_spec=OwnerResidencyRangeSpec(
+        range_spec=ResidentCacheRangeSpec(
             ordered_offset_arg=ordered_arg,
             compact_offset_arg=compact_arg,
         ),
@@ -269,8 +272,8 @@ def build_owner_residency_decision(
 
 
 @dataclasses.dataclass(frozen=True)
-class OwnerPrepHoist:
-    """Direct owner-invariant prep of a resident ordered operand."""
+class ResidentPrepHoist:
+    """Direct range-invariant prep of a resident ordered operand."""
 
     graph_id: int
     host_arg: str
@@ -323,15 +326,15 @@ def _prep_perm_from_node(prep: torch.fx.Node, load_ndim: int) -> tuple[int, ...]
     return perm
 
 
-def detect_owner_prep_hoists(
+def detect_resident_prep_hoists(
     graphs: list[GraphInfo],
     plan: CompactWorklistPlan,
-) -> tuple[OwnerPrepHoist, ...]:
-    """Find direct transpose-like preps of owner-resident ordered loads.
+) -> tuple[ResidentPrepHoist, ...]:
+    """Find direct transpose-like preps of resident ordered loads.
 
     This is semantic detection only: it must not perform VMEM budgeting or choose
-    the resident window size.  ``PallasBackend._setup_compact_worklist`` owns
-    admission of these descriptors after the resident-window budget is known.
+    the resident window size.  ``build_resident_cache_admission`` owns admission
+    of these descriptors after the resident-window budget is known.
     """
     from ...language import memory_ops
     from ...language._tracing_ops import _host_tensor
@@ -341,11 +344,11 @@ def detect_owner_prep_hoists(
     if ordered_axis is None:
         return ()
     ordered_block_id = ordered_axis.block_id
-    resident_hosts = {p.arg_name for p in owner_resident_entries(plan)}
+    resident_hosts = {p.arg_name for p in resident_ordered_entries(plan)}
     if not resident_hosts:
         return ()
 
-    by_graph_host: dict[tuple[int, str], list[OwnerPrepHoist]] = {}
+    by_graph_host: dict[tuple[int, str], list[ResidentPrepHoist]] = {}
     for graph_info in graphs:
         if not (
             isinstance(graph_info, ForLoopGraphInfo)
@@ -379,7 +382,7 @@ def detect_owner_prep_hoists(
             perm = _prep_perm_from_node(prep, load_val.ndim)
             if perm is None:
                 continue
-            hoist = OwnerPrepHoist(
+            hoist = ResidentPrepHoist(
                 graph_id=graph_info.graph_id,
                 host_arg=host_arg,
                 load_node_name=node.name,
@@ -388,11 +391,88 @@ def detect_owner_prep_hoists(
             )
             by_graph_host.setdefault((graph_info.graph_id, host_arg), []).append(hoist)
 
-    admitted: list[OwnerPrepHoist] = []
+    admitted: list[ResidentPrepHoist] = []
     for hoists in by_graph_host.values():
         if len(hoists) == 1:
             admitted.append(hoists[0])
     return tuple(admitted)
+
+
+@dataclasses.dataclass(frozen=True)
+class ResidentCacheAdmission:
+    """Resident-cache decision plus optional prep hoists admitted for a config."""
+
+    decision: ResidentCacheDecision
+    prep_hoists: tuple[ResidentPrepHoist, ...]
+
+
+def _tensor_footprints(
+    host_args: Mapping[str, object],
+    arg_names: Iterable[str],
+) -> list[tuple[tuple[int, ...], int]]:
+    footprints: list[tuple[tuple[int, ...], int]] = []
+    for arg_name in arg_names:
+        arg = host_args[arg_name]
+        assert isinstance(arg, torch.Tensor)
+        footprints.append((tuple(int(s) for s in arg.shape), arg.dtype.itemsize))
+    return footprints
+
+
+def build_resident_cache_admission(
+    graphs: list[GraphInfo],
+    plan: CompactWorklistPlan,
+    host_args: Mapping[str, object],
+    *,
+    ordered_block: int,
+    vmem_bytes: int,
+) -> ResidentCacheAdmission:
+    """Admit resident caching and optional prep hoists for one concrete config.
+
+    Backend setup supplies concrete config facts (host shapes, ordered block, VMEM
+    budget). This helper owns the compact-worklist-specific policy: detect prep
+    candidates, account for their scratch footprint, choose the one physical
+    resident window, and drop optional prep when it cannot fit.
+    """
+    from ...runtime import compact_ordered_physical_window
+
+    resident_operands = _tensor_footprints(
+        host_args,
+        tuple(policy.arg_name for policy in resident_ordered_entries(plan)),
+    )
+    prep_hoists = detect_resident_prep_hoists(graphs, plan)
+    prep_operands = _tensor_footprints(
+        host_args,
+        tuple(hoist.host_arg for hoist in prep_hoists),
+    )
+
+    physical_window_no_prep = compact_ordered_physical_window(
+        resident_operands,
+        vmem_bytes,
+        ordered_block,
+        prep_operands=[],
+    )
+    physical_window = physical_window_no_prep
+    admitted_hoists = prep_hoists
+    if prep_hoists:
+        physical_window_with_prep = compact_ordered_physical_window(
+            resident_operands,
+            vmem_bytes,
+            ordered_block,
+            prep_operands=prep_operands,
+        )
+        if physical_window_with_prep > 0:
+            physical_window = physical_window_with_prep
+        else:
+            admitted_hoists = ()
+
+    decision = build_resident_cache_decision(
+        plan,
+        resident_operands,
+        physical_window=physical_window,
+    )
+    if not decision.active:
+        admitted_hoists = ()
+    return ResidentCacheAdmission(decision, tuple(admitted_hoists))
 
 
 def metadata_arg_names(plan: CompactWorklistPlan) -> list[str]:
@@ -430,7 +510,7 @@ def metadata_ref_for_field(plan: CompactWorklistPlan, field: str) -> str:
         index = metadata_field_names(plan).index(field)
     except ValueError as err:
         raise exc.InvalidConfig(
-            "compact_worklist owner residency: active cache key metadata "
+            "compact_worklist resident caching: active cache key metadata "
             f"{field!r} is missing."
         ) from err
     return f"{metadata_arg_names(plan)[index]}_ref"
@@ -957,7 +1037,7 @@ def _validate_host_bounds(
                     "device-origin bounds are unsupported."
                 )
             # Every builder param must be a 1-D offsets-like tensor: indexing it
-            # by the owner yields a per-owner scalar.  Reject non-tensors (scalar
+            # by the source coordinate yields a per-source scalar.  Reject non-tensors (scalar
             # host args can't be a builder tensor position) and multi-dim data
             # tensors (e.g. q[g] -> [H, D] is not a valid bound source).
             value = params.get(name)
@@ -1139,8 +1219,8 @@ def detect_compact_worklist_plan(
             raise exc.InvalidConfig(
                 "compact_worklist: could not resolve the ordered tile block id."
             )
-        # Owner residency needs a bound whose consecutive diffs are EXACTLY the
-        # per-owner length; prove the packed-consecutive idiom (base=T[g],
+        # Resident caching needs a bound whose consecutive diffs are EXACTLY the
+        # per-source length; prove the packed-consecutive idiom (base=T[g],
         # end=T[g+1] on one Name tensor).  A bound like ``T[g+1]+128`` reads only
         # ``T`` but is NOT this shape, so it does not qualify.
         ordered_packed_arg = (

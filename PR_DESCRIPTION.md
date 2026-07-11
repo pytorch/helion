@@ -86,7 +86,7 @@ For eager/torch launches, the launcher checks that active owners do not exceed t
 max(diff(ordered_offsets)[diff(compact_offsets) > 0]) <= C
 ```
 
-Owners with zero compact work are ignored because they never produce a worklist item and never read the resident window.
+Sources with zero compact work are ignored because they never produce a worklist item and never read the resident window.
 
 The JAX export path cannot run this host check because offsets are tracers, so it carries the current contract that caller-provided inputs must stay within the compiled window. A future max-extent bound can make this overflow-proof by construction.
 

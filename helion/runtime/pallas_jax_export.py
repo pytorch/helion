@@ -314,10 +314,10 @@ def default_pallas_jax_launcher(
     )
 
     if _kind is _LoopKind.COMPACT_WORKLIST:
-        # Owner residency: on this JAX-export/jit path the resident
+        # Resident caching: on this JAX-export/jit path the resident
         # window IS applied, but the host overflow guard
-        # (runtime._compact_raise_if_owner_exceeds_window) is NOT run here -- the
-        # offsets are jit tracers, so a per-owner reduction length exceeding the
+        # (runtime._compact_raise_if_range_exceeds_window) is NOT run here -- the
+        # offsets are jit tracers, so a per-source reduction length exceeding the
         # window size C cannot be checked at trace time.  Contract: the caller
         # must ensure every ordered (reduction) range <= C (VMEM-derived,
         # thousands of tokens; the torch/eager launcher does enforce this).

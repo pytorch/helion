@@ -390,7 +390,7 @@ def _add_kernel(x, y):
 def _noprep_ordered_kernel(q, k, q_offsets):
     """Jagged ordered reduction whose reused operand (k) has NO transpose prep:
     k is summed over each ordered tile, never head-major transposed.  It can still
-    use the owner-resident window; it just must not emit a prep cache/refill."""
+    use the resident-cache window; it just must not emit a prep cache/refill."""
     out = torch.empty_like(q)
     for seq_idx in hl.grid(q_offsets.size(0) - 1):
         start = q_offsets[seq_idx]
@@ -408,7 +408,7 @@ def _unpacked_ordered_kernel(q, k, v, q_offsets, kv_offsets):
     """K/V DO have a head-major transpose (a cacheable prep exists), but the ordered
     bound is ``kv_offsets[seq + 1] + 1`` -- NOT the packed-consecutive T[g]/T[g+1]
     shape.  The overflow guard's max(kv_offsets[i+1]-kv_offsets[i]) would under-count
-    that range, so owner residency must stay OFF (streamed emit_pipeline) even
+    that range, so resident caching must stay OFF (streamed emit_pipeline) even
     though the prep is present."""
     H = hl.specialize(q.size(1))
     D = hl.specialize(q.size(2))
@@ -1009,12 +1009,12 @@ class TestOrderedResidencyClassification(unittest.TestCase):
             helion.Config(block_sizes=[8, 8], pallas_loop_type="compact_worklist")
         )
 
-        # A jagged ordered reduction lowers via the owner-resident fori path (the
+        # A jagged ordered reduction lowers via the resident-cache fori path (the
         # default for compact_worklist), not emit_pipeline. This test covers only
         # that classification: the reduction uses jax.lax.fori_loop, it reuses the
         # existing compact launcher (no extra launcher API), and q/out remain
         # compact aligned windows. The transpose-cache structure emitted inside the
-        # fori is asserted separately by TestOwnerPrepHoistCodegen.
+        # fori is asserted separately by TestResidentPrepHoistCodegen.
         self.assertIn("lax.fori_loop", code)
         self.assertNotIn("pltpu.emit_pipeline(", code)
         self.assertIn("_compact_aligned_arg_indices=", code)
@@ -1052,7 +1052,7 @@ class TestOrderedResidencyClassification(unittest.TestCase):
             helion.Config(block_sizes=[8, 8], pallas_loop_type="compact_worklist")
         )
 
-        # Here the ordered axis is the q-like loop; under owner residency it
+        # Here the ordered axis is the q-like loop; under resident caching it
         # lowers via the fori path (not emit_pipeline).  out stays the compact
         # exact-store window.
         self.assertIn("lax.fori_loop", code)
@@ -1258,7 +1258,7 @@ class TestCompactWorklistNumerics(unittest.TestCase):
         self.assertEqual(tuple(out.shape), (0, H, D))
 
     @skipIfPallasInterpret(
-        "the owner-resident ordered KV path is validated on real TPU, not "
+        "the resident-cache ordered KV path is validated on real TPU, not "
         "Pallas interpret mode"
     )
     def test_fully_jagged_with_empty_kv_matches_eager(self):
@@ -1282,16 +1282,16 @@ class TestCompactWorklistNumerics(unittest.TestCase):
         torch.testing.assert_close(out.cpu(), ref, rtol=2e-2, atol=2e-2)
 
     @skipIfPallasInterpret(
-        "the owner-resident ordered KV path is validated on real TPU, not "
+        "the resident-cache ordered KV path is validated on real TPU, not "
         "Pallas interpret mode"
     )
     def test_fully_jagged_long_kv_matches_eager(self):
         # Long, jagged KV (several kvblock trips, non-divisible final tiles per
         # sequence): the end-to-end numeric check for a jagged ordered reduction,
-        # which lowers to the owner-keyed transpose cache and accumulates carried
+        # which lowers to the range-keyed transpose cache and accumulates carried
         # state across many ordered iterations. Compared to an independent eager
         # reference by relative L2 (below). Whether the cache lowering is actually
-        # emitted is a separate concern, checked by TestOwnerPrepHoistCodegen.
+        # emitted is a separate concern, checked by TestResidentPrepHoistCodegen.
         #
         # Compared by RELATIVE L2 (not element-wise assert_close): the long
         # accumulation makes the output large-magnitude, so individual bf16
@@ -1366,20 +1366,20 @@ class TestCompactWorklistJaxExport(unittest.TestCase):
         )
 
 
-class TestOwnerResidencyWindowGuard(unittest.TestCase):
+class TestResidentCacheWindowGuard(unittest.TestCase):
     """The runtime backstop that raises (rather than silently over-reading the
-    owner-resident window) when a per-owner reduction length exceeds the
+    resident-cache window) when a per-source reduction length exceeds the
     compile-time window size ``C``."""
 
     def _setup(self):
         from jax.experimental.pallas import tpu as pltpu
 
-        from helion.runtime import _compact_raise_if_owner_exceeds_window
+        from helion.runtime import _compact_raise_if_range_exceeds_window
         from helion.runtime import _get_vmem_limit_bytes
         from helion.runtime import compact_ordered_physical_window
 
         # Two ordered operands (K/V) large enough that C is VMEM-bound, not
-        # clamped to the leading dim (so an owner CAN exceed C).
+        # clamped to the leading dim (so a source CAN exceed C).
         total = 4 * 8192
         k = torch.zeros(total, 4, 128, dtype=torch.bfloat16)
         operands = [((total, 4, 128), 2), ((total, 4, 128), 2)]
@@ -1390,17 +1390,17 @@ class TestOwnerResidencyWindowGuard(unittest.TestCase):
             prep_operands=operands,
         )
         self.assertLess(c, total)  # VMEM-bound, so overflow is representable
-        return _compact_raise_if_owner_exceeds_window, k, c
+        return _compact_raise_if_range_exceeds_window, k, c
 
     def test_fits_does_not_raise(self):
         guard, k, c = self._setup()
-        # Every owner is exactly C tokens (<= C): must not raise.
+        # Every source is exactly C tokens (<= C): must not raise.
         offsets = torch.tensor([0, c, 2 * c, 3 * c, 4 * c], dtype=torch.int32)
         guard((offsets, k, k), [1, 2], 0, 0, c)
 
-    def test_owner_exceeding_c_raises(self):
+    def test_source_exceeding_c_raises(self):
         guard, k, c = self._setup()
-        # First owner is C+1 tokens (> C): must raise.
+        # First source is C+1 tokens (> C): must raise.
         offsets = torch.tensor([0, c + 1, 2 * c + 1], dtype=torch.int32)
         with self.assertRaisesRegex(RuntimeError, "exceeds the resident window"):
             guard((offsets, k, k), [1, 2], 0, 0, c)
@@ -1408,7 +1408,7 @@ class TestOwnerResidencyWindowGuard(unittest.TestCase):
     def test_inactive_window_is_inert(self):
         guard, k, c = self._setup()
         offsets = torch.tensor([0, c + 1, 2 * c + 1], dtype=torch.int32)
-        # No resident window (owner residency inactive: empty ordered-operand set) =>
+        # No resident window (resident caching inactive: empty ordered-operand set) =>
         # nothing to guard, whatever the offset index.
         guard((offsets, k, k), [], 0, 0, c)
         guard((offsets, k, k), [], -1, -1, 0)
@@ -1431,20 +1431,20 @@ class TestOwnerResidencyWindowGuard(unittest.TestCase):
 
     def test_empty_offsets_no_crash(self):
         guard, k, c = self._setup()
-        # 0 owners (single/empty offset array) must not crash on .max() of an
+        # 0 sources (single/empty offset array) must not crash on .max() of an
         # empty diff; the guard treats it as nothing to check.
         offsets = torch.tensor([0], dtype=torch.int32)
         guard((offsets, k, k), [1, 2], 0, 0, c)
 
-    def test_zero_compact_owner_is_not_guarded(self):
+    def test_zero_compact_source_is_not_guarded(self):
         guard, k, c = self._setup()
-        # Owner 0 has a KV range larger than the window, but q_len==0, so it
-        # produces no worklist item and never refills the owner cache.
+        # Source 0 has a KV range larger than the window, but q_len==0, so it
+        # produces no worklist item and never refills the resident cache.
         q_offsets = torch.tensor([0, 0, 1], dtype=torch.int32)
         kv_offsets = torch.tensor([0, c + 1, c + 1], dtype=torch.int32)
         guard((q_offsets, kv_offsets, k, k), [2, 3], 1, 0, c)
 
-    def test_live_compact_owner_is_guarded(self):
+    def test_live_compact_source_is_guarded(self):
         guard, k, c = self._setup()
         q_offsets = torch.tensor([0, 1, 1], dtype=torch.int32)
         kv_offsets = torch.tensor([0, c + 1, c + 1], dtype=torch.int32)
@@ -1453,7 +1453,7 @@ class TestOwnerResidencyWindowGuard(unittest.TestCase):
 
 
 class TestOrderedWindowBudget(unittest.TestCase):
-    """Owner-cache VMEM budget capacity and derived physical window sizing."""
+    """Resident-cache VMEM budget capacity and derived physical window sizing."""
 
     def _budget(self, operands, vmem=64 * 1024 * 1024, *, prep_operands):
         from helion.runtime import compact_ordered_budget_capacity
@@ -1500,7 +1500,7 @@ class TestOrderedWindowBudget(unittest.TestCase):
         self.assertEqual(self._physical(operands, 128, prep_operands=operands), 128)
 
     def test_budget_too_small_returns_zero_physical_window(self):
-        # owner residency falls back to streaming when VMEM cannot hold one ordered
+        # resident caching falls back to streaming when VMEM cannot hold one ordered
         # block of the cached operands.
         operands = [((1_000_000, 4, 128), 4)]
         self.assertLess(self._budget(operands, vmem=1024, prep_operands=operands), 128)
@@ -1523,10 +1523,10 @@ class TestOrderedWindowBudget(unittest.TestCase):
         self.assertEqual(self._budget([], prep_operands=[]), 0)
 
 
-class TestOwnerPrepHoistCodegen(unittest.TestCase):
-    """Codegen checks for optional owner-prep cache lowering."""
+class TestResidentPrepHoistCodegen(unittest.TestCase):
+    """Codegen checks for optional resident-prep cache lowering."""
 
-    def test_jagged_gdpa_emits_owner_prep_cache(self):
+    def test_jagged_gdpa_emits_resident_prep_cache(self):
         qo = _offsets([12, 20, 5, 30])
         kvo = _offsets([13, 7, 19, 11])
         lq, lkv = int(qo[-1]), int(kvo[-1])
@@ -1540,11 +1540,11 @@ class TestOwnerPrepHoistCodegen(unittest.TestCase):
         code = _fully_jagged_kernel.bind(args).to_triton_code(
             helion.Config(block_sizes=[8, 8], pallas_loop_type="compact_worklist")
         )
-        self.assertIn("_oc_prep_refill", code)
+        self.assertIn("_rc_prep_refill", code)
         self.assertIn("jnp.maximum(_wid - 1, 0)", code)
-        self.assertIn("_oc_num_ordered_tiles", code)
-        self.assertIn("_oc_full_ordered_tiles", code)
-        self.assertNotIn("_oc_full_nkv", code)
+        self.assertIn("_rc_num_ordered_tiles", code)
+        self.assertIn("_rc_full_ordered_tiles", code)
+        self.assertNotIn("_rc_full_nkv", code)
         self.assertIn("kv_len_ref[_wid]", code)
         refill_guard = next(
             line
@@ -1565,7 +1565,7 @@ class TestOwnerPrepHoistCodegen(unittest.TestCase):
         self.assertNotIn("_hm", code)
         self.assertRegex(code, r"=\s*\w+_prep\[[^\n]+pl\.ds")
 
-    def test_four_dim_owner_prep_tail_mask_tracks_ordered_axis(self):
+    def test_four_dim_resident_prep_tail_mask_tracks_ordered_axis(self):
         qo = _offsets([12, 20, 5, 30])
         lq = int(qo[-1])
         args = (
@@ -1576,7 +1576,7 @@ class TestOwnerPrepHoistCodegen(unittest.TestCase):
         code = _four_dim_major_permute_ordered_kernel.bind(args).to_triton_code(
             helion.Config(block_sizes=[8, 8], pallas_loop_type="compact_worklist")
         )
-        self.assertIn("_oc_prep_refill", code)
+        self.assertIn("_rc_prep_refill", code)
         self.assertIn("jnp.transpose", code)
         self.assertIn(
             "jax.lax.broadcasted_iota(jnp.int32, (1, 1, _BLOCK_SIZE_2, 1), 2)",
@@ -1585,10 +1585,10 @@ class TestOwnerPrepHoistCodegen(unittest.TestCase):
         self.assertIn("jnp.where", code)
 
 
-class TestOwnerResidencyAndPrepHoist(unittest.TestCase):
+class TestResidentCacheAndPrepHoist(unittest.TestCase):
     """Resident windows are correctness-bearing; prep hoists are optional."""
 
-    def _owner_residency_plan(self):
+    def _resident_cache_plan(self):
         return CompactWorklistPlan(
             axes=(
                 Axis("owner_grid", 0, "seq", ast.Constant(0), ast.Constant(1), "1"),
@@ -1615,13 +1615,13 @@ class TestOwnerResidencyAndPrepHoist(unittest.TestCase):
             upper_bound_expr="",
         )
 
-    def _active_owner_residency_decision(self):
-        from helion._compiler.pallas.compact_worklist import OwnerResidencyDecision
-        from helion._compiler.pallas.compact_worklist import OwnerResidencyRangeSpec
+    def _active_resident_cache_decision(self):
+        from helion._compiler.pallas.compact_worklist import ResidentCacheDecision
+        from helion._compiler.pallas.compact_worklist import ResidentCacheRangeSpec
 
-        return OwnerResidencyDecision(
+        return ResidentCacheDecision(
             resident_operands=("k",),
-            range_spec=OwnerResidencyRangeSpec("kvo", "qo"),
+            range_spec=ResidentCacheRangeSpec("kvo", "qo"),
             physical_window=64,
             inactive_reason=None,
             resident_key_fields=("range_start",),
@@ -1630,7 +1630,7 @@ class TestOwnerResidencyAndPrepHoist(unittest.TestCase):
 
     def _prep_hoists_for(self, kernel, args):
         from helion._compiler.generate_ast import GenerateAST
-        from helion._compiler.pallas.compact_worklist import detect_owner_prep_hoists
+        from helion._compiler.pallas.compact_worklist import detect_resident_prep_hoists
         from helion._compiler.pallas.plan_tiling import plan_tiling
 
         config = helion.Config(block_sizes=[8, 8], pallas_loop_type="compact_worklist")
@@ -1644,7 +1644,7 @@ class TestOwnerResidencyAndPrepHoist(unittest.TestCase):
                     codegen.device_function.tile_strategy,
                 )
                 plan = detect_compact_worklist_plan(bk.host_function)
-                return detect_owner_prep_hoists(codegen.codegen_graphs, plan)
+                return detect_resident_prep_hoists(codegen.codegen_graphs, plan)
 
     def test_descriptor_scan_accepts_direct_major_transpose(self):
         qo = _offsets([12, 20, 5, 30])
@@ -1706,7 +1706,7 @@ class TestOwnerResidencyAndPrepHoist(unittest.TestCase):
         code = _noprep_ordered_kernel.bind(args).to_triton_code(
             helion.Config(block_sizes=[8, 8], pallas_loop_type="compact_worklist")
         )
-        self.assertNotIn("_oc_prep_refill", code)
+        self.assertNotIn("_rc_prep_refill", code)
         self.assertNotIn("_prep", code)
         self.assertIn("lax.fori_loop", code)
         self.assertNotIn("pltpu.emit_pipeline(", code)
@@ -1716,14 +1716,14 @@ class TestOwnerResidencyAndPrepHoist(unittest.TestCase):
         self.assertNotIn("_compact_active_mask_arg_index=-1", code)
         self.assertNotIn("_compact_ordered_window=0", code)
 
-    def test_active_owner_residency_requires_range_start_metadata(self):
+    def test_active_resident_cache_requires_range_start_metadata(self):
         from helion._compiler.backend import PallasBackend
         from helion._compiler.device_function import TensorArg
 
         env = types.SimpleNamespace(
-            compact_worklist_plan=self._owner_residency_plan(),
-            compact_worklist_owner_residency_decision=(
-                self._active_owner_residency_decision()
+            compact_worklist_plan=self._resident_cache_plan(),
+            compact_worklist_resident_cache_decision=(
+                self._active_resident_cache_decision()
             ),
             compact_worklist_offset_params=[],
             compact_worklist_block=8,
@@ -1763,7 +1763,7 @@ class TestOwnerResidencyAndPrepHoist(unittest.TestCase):
         code = _unpacked_ordered_kernel.bind(args).to_triton_code(
             helion.Config(block_sizes=[8, 8], pallas_loop_type="compact_worklist")
         )
-        self.assertNotIn("_oc_prep_refill", code)
+        self.assertNotIn("_rc_prep_refill", code)
         self.assertNotIn("_prep", code)
         self.assertIn("emit_pipeline", code)
         self.assertIn("_compact_ordered_aligned_arg_indices=[]", code)
@@ -1771,8 +1771,8 @@ class TestOwnerResidencyAndPrepHoist(unittest.TestCase):
         self.assertIn("_compact_active_mask_arg_index=-1", code)
         self.assertIn("_compact_ordered_window=0", code)
 
-    def test_owner_resident_entries_filter_ordered_operands(self):
-        from helion._compiler.pallas.compact_worklist import owner_resident_entries
+    def test_resident_ordered_entries_filter_ordered_operands(self):
+        from helion._compiler.pallas.compact_worklist import resident_ordered_entries
 
         plan = types.SimpleNamespace(
             tensor_policies=(
@@ -1781,11 +1781,11 @@ class TestOwnerResidencyAndPrepHoist(unittest.TestCase):
                 TensorPolicy("q", "compact_aligned_load"),
             )
         )
-        self.assertEqual({p.arg_name for p in owner_resident_entries(plan)}, {"k", "v"})
+        self.assertEqual({p.arg_name for p in resident_ordered_entries(plan)}, {"k", "v"})
 
-    def test_owner_residency_decision_can_be_active_without_prep(self):
+    def test_resident_cache_decision_can_be_active_without_prep(self):
         from helion._compiler.pallas.compact_worklist import (
-            build_owner_residency_decision,
+            build_resident_cache_decision,
         )
 
         plan = CompactWorklistPlan(
@@ -1813,7 +1813,7 @@ class TestOwnerResidencyAndPrepHoist(unittest.TestCase):
             tensor_policies=(TensorPolicy("k", "ordered_reduction"),),
             upper_bound_expr="",
         )
-        decision = build_owner_residency_decision(
+        decision = build_resident_cache_decision(
             plan,
             [((64, 4, 128), 2)],
             physical_window=64,
@@ -1823,9 +1823,9 @@ class TestOwnerResidencyAndPrepHoist(unittest.TestCase):
         self.assertEqual(decision.resident_key_fields, ("range_start",))
         self.assertEqual(decision.prep_key_fields, ("range_start", "range_len"))
 
-    def test_owner_residency_decision_falls_back_when_window_not_viable(self):
+    def test_resident_cache_decision_falls_back_when_window_not_viable(self):
         from helion._compiler.pallas.compact_worklist import (
-            build_owner_residency_decision,
+            build_resident_cache_decision,
         )
 
         plan = CompactWorklistPlan(
@@ -1853,7 +1853,7 @@ class TestOwnerResidencyAndPrepHoist(unittest.TestCase):
             tensor_policies=(TensorPolicy("k", "ordered_reduction"),),
             upper_bound_expr="",
         )
-        decision = build_owner_residency_decision(
+        decision = build_resident_cache_decision(
             plan,
             [((1_000_000, 4, 128), 4)],
             physical_window=0,
@@ -1869,9 +1869,7 @@ class TestOwnerResidencyAndPrepHoist(unittest.TestCase):
         import types
 
         from helion._compiler.pallas.compact_worklist import _packed_consecutive
-        from helion._compiler.pallas.compact_worklist import (
-            ordered_owner_residency_bound_arg,
-        )
+        from helion._compiler.pallas.compact_worklist import ordered_resident_bound_arg
 
         def e(src):
             return ast.parse(src, mode="eval").body
@@ -1885,8 +1883,8 @@ class TestOwnerResidencyAndPrepHoist(unittest.TestCase):
                 ordered_axis=types.SimpleNamespace(packed_offset_arg=packed)
             )
 
-        self.assertEqual(ordered_owner_residency_bound_arg(plan("kvo")), "kvo")
-        self.assertIsNone(ordered_owner_residency_bound_arg(plan(None)))
+        self.assertEqual(ordered_resident_bound_arg(plan("kvo")), "kvo")
+        self.assertIsNone(ordered_resident_bound_arg(plan(None)))
 
 
 if __name__ == "__main__":

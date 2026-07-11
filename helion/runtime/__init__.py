@@ -311,7 +311,7 @@ def compact_ordered_budget_capacity(
     *,
     prep_operands: list[tuple[tuple[int, ...], int]],
 ) -> int:
-    """VMEM budget capacity for owner-resident ordered operands.
+    """VMEM budget capacity for resident ordered operands.
 
     ``operands`` is ``[(shape, itemsize), ...]`` for every resident ordered
     operand.  Each ``C`` token costs that per-token footprint twice because the
@@ -336,9 +336,9 @@ def compact_ordered_physical_window(
     *,
     prep_operands: list[tuple[tuple[int, ...], int]],
 ) -> int:
-    """Block-aligned physical owner-resident window that fits the VMEM budget.
+    """Block-aligned physical resident window that fits the VMEM budget.
 
-    :func:`compact_ordered_budget_capacity` gives the largest per-owner length the
+    :func:`compact_ordered_budget_capacity` gives the largest per-source length the
     VMEM budget allows (the logical bound ``C``).  The resident ``pl.Element``
     window, optional prep-cache scratch, and the refill/reduction ``pl.ds`` slices
     are all tiled by the ordered block, so the allocation must be a block multiple.
@@ -347,7 +347,7 @@ def compact_ordered_physical_window(
     still get a legal ``pl.Element(block, padding=...)`` window instead of a
     zero-sized allocation.
 
-    Returns 0 when the budget cannot hold one ordered block.  Owner residency is
+    Returns 0 when the budget cannot hold one ordered block.  Resident caching is
     an automatic optimization, so the compiler treats that as "inactive" and
     falls back to the streamed ordered loop.
     """
@@ -365,45 +365,45 @@ def compact_ordered_physical_window(
     return min(budget_physical, extent_physical)
 
 
-def _compact_raise_if_owner_exceeds_window(
+def _compact_raise_if_range_exceeds_window(
     args: tuple[object, ...],
     ordered_aligned_arg_indices: list[int] | None,
     ordered_offset_arg_index: int,
     active_mask_arg_index: int,
     ordered_window: int,
 ) -> None:
-    """Raise if any owner's ordered (reduction) length exceeds the window.
+    """Raise if any active ordered range exceeds the resident window.
 
-    Owner residency holds each owner's ordered operand in a compile-time-sized
+    Resident caching holds each source's ordered operand in a compile-time-sized
     VMEM window.  ``ordered_window`` is the exact block-aligned physical extent
-    computed once during compile setup and threaded through the launcher; an
-    owner longer than it would over-read the window.
+    computed once during compile setup and threaded through the launcher; a range
+    longer than it would over-read the window.
 
     ``ordered_aligned_arg_indices`` non-empty means the resident window is active.
     When it is active we MUST be able to bound-check, so a missing/ambiguous
     offset index raises rather than silently returning.  The
     ordered offset supplies ordered lengths; the active-mask offset supplies compact
-    lengths, so owners with no compact work are ignored because they produce no
+    lengths, so sources with no compact work are ignored because they produce no
     worklist item and never refill the cache.
 
     Best-effort magnitude: reached with materialized offsets only on the
     concrete/eager (torch) launch path; under ``jax.jit`` the offsets are tracers
     and the caller guarantees the bound (a future change that sizes the window from
-    a caller-provided max per-owner length would remove this caveat).
+    a caller-provided max per-source length would remove this caveat).
     """
     if not ordered_aligned_arg_indices:
-        return  # owner residency inactive (no resident window) -> nothing to guard
+        return  # resident caching inactive (no resident window) -> nothing to guard
     if ordered_window <= 0:
         raise RuntimeError(
-            "compact_worklist owner residency: the resident window is active but "
+            "compact_worklist resident caching: the resident window is active but "
             f"the compiled ordered window is invalid ({ordered_window})."
         )
     if ordered_offset_arg_index < 0 or active_mask_arg_index < 0:
         raise RuntimeError(
-            "compact_worklist owner residency: the resident window is active but the "
+            "compact_worklist resident caching: the resident window is active but the "
             "ordered reduction bound or compact active-owner mask is not a "
             "checkable single-offsets (offsets[i+1]-offsets[i]) pattern, so "
-            "per-owner length cannot be verified against the window."
+            "per-source length cannot be verified against the window."
         )
     offsets = cast("Any", args[ordered_offset_arg_index])
     active_offsets = cast("Any", args[active_mask_arg_index])
@@ -411,7 +411,7 @@ def _compact_raise_if_owner_exceeds_window(
         return
     if len(active_offsets) != len(offsets):
         raise RuntimeError(
-            "compact_worklist owner residency: ordered and compact offset arrays have "
+            "compact_worklist resident caching: ordered and compact offset arrays have "
             "different owner counts, so the active-owner guard cannot be evaluated."
         )
     ordered_lens = offsets[1:] - offsets[:-1]
@@ -422,11 +422,11 @@ def _compact_raise_if_owner_exceeds_window(
     max_len = int(ordered_lens[active].max())
     if max_len > ordered_window:
         raise RuntimeError(
-            f"compact_worklist owner residency: a per-owner reduction length "
+            f"compact_worklist resident caching: a per-source reduction length "
             f"({max_len}) exceeds the resident window ({ordered_window}, "
-            f"VMEM-derived and fixed at compile time), so the owner-keyed cache "
+            f"VMEM-derived and fixed at compile time), so the range-keyed cache "
             f"would be over-read. "
-            f"Reduce the maximum per-owner length below the window -- it scales "
+            f"Reduce the maximum per-source length below the window -- it scales "
             f"with available VMEM / per-token bytes."
         )
 
@@ -2130,11 +2130,11 @@ def _pallas_compact_in_out_specs(
 
             return pl.BlockSpec(block_shape, aligned_index_map)  # type: ignore[union-attr]
         if idx in ordered_aligned_set:
-            # Owner residency: per-owner resident window sized ``ordered_window`` (C)
+            # Resident caching: per-range resident window sized ``ordered_window`` (C)
             # at ``range_start`` -- the fori body reads it at the local ordered-tile
             # offset (offset - range_start).  padding=(0, C) tolerates reads past
-            # the owner's tail (same as the compact_aligned_load window).  Keying
-            # on range_start lets Pallas dedup the load across same-owner tiles.
+            # the range tail (same as the compact_aligned_load window).  Keying
+            # on range_start lets Pallas dedup the load across same-range tiles.
             assert ordered_window > 0
             assert range_start_ref_pos >= 0
             oblock = ordered_window
@@ -2358,7 +2358,7 @@ def _pallas_compile_compact_jit_fn(
                 # it for validation.  Detection also now restricts to packed (so
                 # work order == row order); see detect_compact_worklist_plan.
                 dimension_semantics=("arbitrary",),
-                # Owner residency sizes its physical window from _get_vmem_limit_bytes
+                # Resident caching sizes its physical window from _get_vmem_limit_bytes
                 # during backend setup.  This 128MiB floor is ONLY a Mosaic compile
                 # ceiling so TPU7x accepts that already-sized allocation; do not use
                 # it to choose C.  A streamed compact_worklist kernel keeps the
@@ -2417,11 +2417,11 @@ def default_pallas_compact_worklist_launcher(
     and reuses the shared JaxCallable / caching / invoke path.
     """
     assert _compact_build_worklist is not None
-    # Owner-residency correctness backstop: raise rather than silently over-read the
-    # resident window when an owner's reduction length exceeds the compile-time
+    # Resident-cache correctness backstop: raise rather than silently over-read the
+    # resident window when a source's reduction length exceeds the compile-time
     # window C.  Runs every call -- the offsets are runtime data even when the
     # compiled kernel is reused across calls with the same grid.
-    _compact_raise_if_owner_exceeds_window(
+    _compact_raise_if_range_exceeds_window(
         args,
         _compact_ordered_aligned_arg_indices,
         _compact_ordered_offset_arg_index,

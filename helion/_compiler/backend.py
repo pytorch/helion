@@ -2630,10 +2630,10 @@ class PallasBackend(Backend):
             if p.kind in ("compact_aligned_load", "compact_exact_store")
             and p.arg_name in name_to_index
         ]
-        # The cached owner-residency decision drives every resident-window launcher
+        # The cached resident-cache decision drives every resident-window launcher
         # arg: resident-window tensors, the exact physical window integer, and the
         # ordered/compact offset args used by the overflow guard.
-        decision = env.compact_worklist_owner_residency_decision
+        decision = env.compact_worklist_resident_cache_decision
         ordered_indices: list[int] = []
         range_start_ref_pos = -1
         ordered_offset_arg_index = -1
@@ -2643,7 +2643,7 @@ class PallasBackend(Backend):
             assert decision.range_spec is not None
             if decision.resident_key_fields != ("range_start",):
                 raise exc.InvalidConfig(
-                    "compact_worklist owner residency: Phase 1 resident windows "
+                    "compact_worklist resident caching: Phase 1 resident windows "
                     "must be keyed by range_start."
                 )
             range_start_ref_pos = (
@@ -2656,7 +2656,7 @@ class PallasBackend(Backend):
             ]
             if missing_residents:
                 raise exc.InvalidConfig(
-                    "compact_worklist owner residency: active resident operands are "
+                    "compact_worklist resident caching: active resident operands are "
                     f"missing from the kernel argument list: {missing_residents}."
                 )
             ordered_indices = [
@@ -2675,7 +2675,7 @@ class PallasBackend(Backend):
                 or active_mask_arg_index < 0
             ):
                 raise exc.InvalidConfig(
-                    "compact_worklist owner residency: active range metadata or "
+                    "compact_worklist resident caching: active range metadata or "
                     "offset args are missing from the kernel argument list."
                 )
         return [
@@ -2746,8 +2746,8 @@ class PallasBackend(Backend):
         # pallas_loop_type, so a stale plan would mis-lower a fori/emit config.
         env = CompileEnvironment.current()
         env.compact_worklist_plan = None
-        env.compact_worklist_owner_residency_decision = None
-        env.compact_worklist_owner_prep_hoists = ()
+        env.compact_worklist_resident_cache_decision = None
+        env.compact_worklist_resident_prep_hoists = ()
         env.compact_worklist_upper = 1
         env.compact_worklist_block = 1
         env.compact_worklist_ordered_block = 1
@@ -2767,15 +2767,12 @@ class PallasBackend(Backend):
         non-matching kernel (autotuner-skippable).
         """
         from ..runtime import _get_vmem_limit_bytes
-        from ..runtime import compact_ordered_physical_window
         from .compile_environment import CompileEnvironment
         from .device_function import DeviceFunction
         from .host_function import HostFunction
-        from .pallas.compact_worklist import build_owner_residency_decision
+        from .pallas.compact_worklist import build_resident_cache_admission
         from .pallas.compact_worklist import detect_compact_worklist_plan
-        from .pallas.compact_worklist import detect_owner_prep_hoists
         from .pallas.compact_worklist import metadata_arg_names
-        from .pallas.compact_worklist import owner_resident_entries
 
         env = CompileEnvironment.current()
         host_fn = HostFunction.current()
@@ -2793,7 +2790,7 @@ class PallasBackend(Backend):
         compact_block = env.block_sizes[plan.compact_axis.block_id].from_config(config)
         assert compact_block is not None, "compact tile has no block size"
         env.compact_worklist_block = int(compact_block)
-        # Ordered (reduction) tile block -- owner residency uses this compile-side to
+        # Ordered (reduction) tile block -- resident caching uses this compile-side to
         # choose a block-aligned physical window (it can differ from the compact
         # block, e.g. compact_block != ordered_block).
         env.compact_worklist_ordered_block = 1
@@ -2805,19 +2802,6 @@ class PallasBackend(Backend):
                 env.compact_worklist_ordered_block = int(ordered_block)
         env.compact_worklist_upper = self._compact_worklist_upper(plan, config, host_fn)
 
-        resident_operands: list[tuple[tuple[int, ...], int]] = []
-        for policy in owner_resident_entries(plan):
-            arg = host_fn.params.arguments[policy.arg_name]
-            assert isinstance(arg, torch.Tensor)
-            resident_operands.append(
-                (tuple(int(s) for s in arg.shape), arg.dtype.itemsize)
-            )
-        prep_hoists = detect_owner_prep_hoists(graphs, plan)
-        prep_operands: list[tuple[tuple[int, ...], int]] = []
-        for hoist in prep_hoists:
-            arg = host_fn.params.arguments[hoist.host_arg]
-            assert isinstance(arg, torch.Tensor)
-            prep_operands.append((tuple(int(s) for s in arg.shape), arg.dtype.itemsize))
         import jax.experimental.pallas.tpu as pltpu
 
         # Choose C from the conservative device-reported VMEM budget.  The runtime
@@ -2825,31 +2809,15 @@ class PallasBackend(Backend):
         # accepts this already-sized allocation, but that ceiling is deliberately
         # not used here as an allocation budget.
         vmem_bytes = _get_vmem_limit_bytes(pltpu)
-        physical_window_no_prep = compact_ordered_physical_window(
-            resident_operands,
-            vmem_bytes,
-            env.compact_worklist_ordered_block,
-            prep_operands=[],
-        )
-        physical_window = physical_window_no_prep
-        admitted_hoists = prep_hoists
-        if prep_hoists:
-            physical_window_with_prep = compact_ordered_physical_window(
-                resident_operands,
-                vmem_bytes,
-                env.compact_worklist_ordered_block,
-                prep_operands=prep_operands,
-            )
-            if physical_window_with_prep > 0:
-                physical_window = physical_window_with_prep
-            else:
-                admitted_hoists = ()
-        env.compact_worklist_owner_prep_hoists = tuple(admitted_hoists)
-        env.compact_worklist_owner_residency_decision = build_owner_residency_decision(
+        admission = build_resident_cache_admission(
+            graphs,
             plan,
-            resident_operands,
-            physical_window=physical_window,
+            host_fn.params.arguments,
+            ordered_block=env.compact_worklist_ordered_block,
+            vmem_bytes=vmem_bytes,
         )
+        env.compact_worklist_resident_prep_hoists = admission.prep_hoists
+        env.compact_worklist_resident_cache_decision = admission.decision
 
     def _compact_worklist_upper(
         self, plan: CompactWorklistPlan, config: Config, host_fn: HostFunction

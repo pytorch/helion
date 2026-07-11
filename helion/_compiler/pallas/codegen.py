@@ -53,21 +53,21 @@ def load_expr(
     return result
 
 
-def maybe_codegen_owner_prep_cache_read(
+def maybe_codegen_resident_prep_cache_read(
     ctx: LoweringContext, node: Node
 ) -> ast.AST | None:
-    """Return a prep-cache read for an active owner-prep descriptor, if any."""
+    """Return a prep-cache read for an active resident-prep descriptor, if any."""
     from helion._compiler.compile_environment import CompileEnvironment
     from helion._compiler.generate_ast import GenerateAST
     from helion._compiler.pallas.compact_worklist import metadata_ref_for_field
 
     if not isinstance(ctx.cg, GenerateAST):
         return None
-    lowering = ctx.cg.owner_prep_lowering_for_node(node)
+    lowering = ctx.cg.resident_prep_lowering_for_node(node)
     if lowering is None:
         return None
     env = CompileEnvironment.current()
-    decision = env.compact_worklist_owner_residency_decision
+    decision = env.compact_worklist_resident_cache_decision
     plan = env.compact_worklist_plan
     if (
         decision is None
@@ -646,9 +646,9 @@ def _is_compact_aligned_load(
 def _is_ordered_aligned_load(
     state: CodegenState, block_id: int, tensor: torch.Tensor | None
 ) -> bool:
-    """True if *tensor* is an owner-resident ordered reduction operand.
+    """True if *tensor* is a resident ordered reduction operand.
 
-    Owner-resident operands get a per-owner ``pl.Element(C)`` window keyed on
+    Resident operands get a per-range ``pl.Element(C)`` window keyed on
     ``range_start`` (not tile_start), so the fori body reads at the LOCAL
     ordered-tile offset ``offset - range_start`` rather than the absolute offset.
     """
@@ -662,10 +662,10 @@ def _is_ordered_aligned_load(
     if block_id != plan.ordered_axis.block_id:
         return False
     # Only active resident ordered operands read the resident window at the local
-    # (offset - range_start) offset.  Consume the cached OwnerResidencyDecision
+    # (offset - range_start) offset.  Consume the cached ResidentCacheDecision
     # the loop router also uses; inactive means the ordered loop streams and no
     # resident window exists.
-    decision = CompileEnvironment.current().compact_worklist_owner_residency_decision
+    decision = CompileEnvironment.current().compact_worklist_resident_cache_decision
     if decision is None or not decision.active:
         return False
     host = state.device_function.tensor_arg(tensor).host_str()
@@ -697,7 +697,7 @@ def _ds_expr(
     # sliced block at local offset 0, not the absolute tile_start.
     if not tile_offset and _is_compact_aligned_load(state, block_id, tensor):
         return f"pl.ds(0, {block_size})"
-    # Owner-resident ordered operand: pl.Element(C) window at range_start, so read
+    # Resident ordered operand: pl.Element(C) window at range_start, so read
     # at the LOCAL offset within the window (absolute offset - range_start).
     if not tile_offset and _is_ordered_aligned_load(state, block_id, tensor):
         from helion._compiler.compile_environment import CompileEnvironment
@@ -706,7 +706,7 @@ def _ds_expr(
         env = CompileEnvironment.current()
         plan = env.compact_worklist_plan
         assert plan is not None
-        decision = env.compact_worklist_owner_residency_decision
+        decision = env.compact_worklist_resident_cache_decision
         assert decision is not None
         assert decision.resident_key_fields == ("range_start",)
         begin_ref = f"{metadata_ref_for_field(plan, 'range_start')}[_wid]"
