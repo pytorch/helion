@@ -153,7 +153,16 @@ project-includes = ["helion", "benchmarks", "docs", "examples"]
 # _flash_gemm_ptx.py is verbatim-vendored FA4 code (gemm_ptx_partial +
 # mma_sm100_desc) that indexes cute Tensor .shape/.stride dynamically -- pyrefly
 # cannot model those cute-internal types and flags ~90 false bad-index errors.
-project-excludes = ["test", "_helion_aot_*.py", "helion/_compiler/cute/_flash_gemm_ptx.py"]
+# _cutlass_grouped_gemm_kernel.py is the only grouped-GEMM bridge exclusion:
+# a trimmed CUTLASS CuTeDSL reference kernel lazily imported by
+# grouped_deepgemm.blackwell_grouped_gemm_nt. Generated Helion grouped GEMM code
+# must not import it, and grouped_deepgemm.py itself remains type-checked.
+project-excludes = [
+  "test",
+  "_helion_aot_*.py",
+  "helion/_compiler/cute/_flash_gemm_ptx.py",
+  "helion/_compiler/cute/_cutlass_grouped_gemm_kernel.py",
+]
 python-version = "3.10"
 search-path = ["../pytorch"]
 
