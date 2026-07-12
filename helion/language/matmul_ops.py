@@ -520,12 +520,20 @@ def enforce_dot_requirements(
                 )
                 env.block_sizes[block_idx].update_max_block(max_size)
 
-    # Triton only supports 2D dot operations.  When the operands are 3D
-    # (batched matmul), constrain the batch dimension block size to 1 so
-    # the codegen can squeeze it away before emitting tl.dot.
+    # Triton only supports 2D dot operations. When an operand is 3D
+    # (batched matmul), constrain that operand's *batch* axis block size to 1
+    # so the codegen can squeeze it away before emitting tl.dot. Clamp only
+    # the leading axis of each actually-3D operand: for a mixed-rank dot
+    # ([B, M, K] @ [K, N]) rhs.shape[0] is the K contraction dim, not a batch
+    # axis, so clamping it would (wrongly) cap block_k to 1.
     # Pallas uses jnp.dot_general which handles batched matmul natively.
-    if len(lshape) == 3 and env.backend_name != "pallas":
-        for batch_dim in (lshape[0], rshape[0]):
+    if (lhs.ndim == 3 or rhs.ndim == 3) and env.backend_name != "pallas":
+        batch_dims = []
+        if lhs.ndim == 3:
+            batch_dims.append(lshape[0])
+        if rhs.ndim == 3:
+            batch_dims.append(rshape[0])
+        for batch_dim in batch_dims:
             block_idx = env.get_block_id(batch_dim)
             if block_idx is not None:
                 env.block_sizes[block_idx].update_max_block(1)
