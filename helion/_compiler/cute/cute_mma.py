@@ -2318,7 +2318,6 @@ def _emit_mma_pipeline(
     tcgen05_two_cta_batched_partial = (
         analysis.has_batch
         and mma_impl == "tcgen05"
-        and tcgen05_use_tma_pipeline
         and tcgen05_pid_is_persistent
         and tcgen05_cluster_m == 2
         and tcgen05_cluster_n_requested == 1
@@ -2334,9 +2333,12 @@ def _emit_mma_pipeline(
         # leading batch axis makes the full/edge predicate
         # (``_tcgen05_output_full_tile_expr_for_work_tile``) misclassify tiles,
         # and the K-tail reduction is likewise batch-unaware, silently
-        # miscomputing. Autotune already excludes batched edge 2-CTA (see
-        # ``allow_edge_cluster_m2_search``); this rejects a hand-forced batched
-        # partial config loudly instead of returning wrong output.
+        # miscomputing. This is deliberately TMA-independent: it must fire for
+        # every batched 2-CTA partial config, not only the TMA-pipeline path,
+        # so a non-TMA-eligible layout cannot slip past into a fallback the
+        # generic host guard does not cover. Autotune already excludes batched
+        # edge 2-CTA (see ``allow_edge_cluster_m2_search``); this rejects a
+        # hand-forced batched partial config loudly instead of wrong output.
         raise exc.BackendUnsupported(
             "cute",
             "batched (leading-passthrough) CtaGroup.TWO tcgen05 matmul does "

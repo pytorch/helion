@@ -4596,20 +4596,36 @@ class TestCuteBackend(TestCase):
             (256, 256, 100),
             (300, 300, 100),
         ]
-        for m, n, k in partial_shapes:
-            args = (
+        # Both leading-passthrough forms must reject: both-operands-3D bmm and
+        # mixed-rank ([B, M, K] @ [K, N]) shared-weight dot.
+        def _bmm_args(m: int, n: int, k: int) -> tuple[torch.Tensor, torch.Tensor]:
+            return (
                 torch.randn(2, m, k, device=DEVICE, dtype=HALF_DTYPE),
                 torch.randn(2, k, n, device=DEVICE, dtype=HALF_DTYPE),
             )
-            with patch.dict(
-                os.environ, {"HELION_CUTE_MMA_IMPL": "tcgen05"}, clear=False
-            ):
-                bound = cute_batched_baddbmm_tcgen05.bind(args)
-                with self.assertRaises(
-                    helion.exc.BackendUnsupported,
-                    msg=f"batched 2-CTA partial M={m} N={n} K={k} not rejected",
+
+        def _mixed_args(m: int, n: int, k: int) -> tuple[torch.Tensor, torch.Tensor]:
+            return (
+                torch.randn(2, m, k, device=DEVICE, dtype=HALF_DTYPE),
+                torch.randn(k, n, device=DEVICE, dtype=HALF_DTYPE),
+            )
+
+        cases = [
+            ("bmm", cute_batched_baddbmm_tcgen05, _bmm_args),
+            ("mixed", cute_mixed_rank_batched_dot_tcgen05, _mixed_args),
+        ]
+        for m, n, k in partial_shapes:
+            for label, kernel, make_args in cases:
+                args = make_args(m, n, k)
+                with patch.dict(
+                    os.environ, {"HELION_CUTE_MMA_IMPL": "tcgen05"}, clear=False
                 ):
-                    bound.to_triton_code(config)
+                    bound = kernel.bind(args)
+                    with self.assertRaises(
+                        helion.exc.BackendUnsupported,
+                        msg=f"{label} 2-CTA partial M={m} N={n} K={k} not rejected",
+                    ):
+                        bound.to_triton_code(config)
 
     def test_matmul_mma_tcgen05_128x8_uses_full_cta_barrier(self) -> None:
         support = get_cute_mma_support()
