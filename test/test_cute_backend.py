@@ -703,6 +703,52 @@ def cute_baddbmm(x: torch.Tensor, y: torch.Tensor, bias: torch.Tensor) -> torch.
 
 
 @helion.kernel(backend="cute")
+def cute_batched_baddbmm_tcgen05(
+    x: torch.Tensor,
+    y: torch.Tensor,
+) -> torch.Tensor:
+    b, m, k = x.size()
+    _, _, n = y.size()
+    out = torch.empty([b, m, n], dtype=torch.float32, device=x.device)
+    for tile_b, tile_m, tile_n in hl.tile([b, m, n]):
+        acc = hl.zeros([tile_b, tile_m, tile_n], dtype=torch.float32)
+        for tile_k in hl.tile(k):
+            acc = torch.baddbmm(
+                acc,
+                x[tile_b, tile_m, tile_k],
+                y[tile_b, tile_k, tile_n],
+            )
+        out[tile_b, tile_m, tile_n] = acc
+    return out
+
+
+@helion.kernel(backend="cute")
+def cute_batched_baddbmm_rowvec_bias_tcgen05(
+    x: torch.Tensor,
+    y: torch.Tensor,
+    bias: torch.Tensor,
+) -> torch.Tensor:
+    # Leading-batch matmul with a trailing-axis (rowvec) bias fused into
+    # the epilogue. The rank-3 carrier ``[1, BM, BN]`` has a block-size-1
+    # batch-passthrough leading axis; the aux classifier strips it so
+    # ``acc + bias[tile_n]`` classifies as the (M, N)-tile rowvec form and
+    # splices into the tcgen05 epilogue instead of hitting the backstop.
+    b, m, k = x.size()
+    _, _, n = y.size()
+    out = torch.empty([b, m, n], dtype=torch.bfloat16, device=x.device)
+    for tile_b, tile_m, tile_n in hl.tile([b, m, n]):
+        acc = hl.zeros([tile_b, tile_m, tile_n], dtype=torch.float32)
+        for tile_k in hl.tile(k):
+            acc = torch.baddbmm(
+                acc,
+                x[tile_b, tile_m, tile_k],
+                y[tile_b, tile_k, tile_n],
+            )
+        out[tile_b, tile_m, tile_n] = (acc + bias[tile_n]).to(torch.bfloat16)
+    return out
+
+
+@helion.kernel(backend="cute")
 def cute_dynamic_row_sum(x: torch.Tensor, end: torch.Tensor) -> torch.Tensor:
     out = x.new_empty([x.size(0)])
     bs = hl.register_block_size(x.size(1))
@@ -4301,6 +4347,119 @@ class TestCuteBackend(TestCase):
         )
         self.assertIn("cutlass.pipeline.NamedBarrier(barrier_id=1", code)
 
+    def test_batched_baddbmm_mma_tcgen05(self) -> None:
+        support = get_cute_mma_support()
+        if not support.tcgen05_f16bf16:
+            self.skipTest("tcgen05 F16/BF16 MMA is not supported on this machine")
+
+        args = (
+            torch.randn(2, 64, 64, device=DEVICE, dtype=HALF_DTYPE),
+            torch.randn(2, 64, 8, device=DEVICE, dtype=HALF_DTYPE),
+        )
+        with patch.dict(os.environ, {"HELION_CUTE_MMA_IMPL": "tcgen05"}, clear=False):
+            bound = cute_batched_baddbmm_tcgen05.bind(args)
+            config = helion.Config(
+                block_sizes=[1, 64, 8, 16],
+                tcgen05_ab_stages=2,
+                tcgen05_acc_stages=2,
+                tcgen05_c_stages=2,
+            )
+            code = bound.to_triton_code(config)
+            out = bound.compile_config(config)(*args)
+            torch.cuda.synchronize()
+        expected = torch.bmm(args[0].float(), args[1].float())
+        torch.testing.assert_close(out, expected, atol=1e-1, rtol=1e-2)
+        self.assertIn("cutlass.utils.blackwell_helpers.make_trivial_tiled_mma", code)
+        self.assertIn("cute.nvgpu.tcgen05", code)
+        self.assertIn("cute.gemm(", code)
+        self.assertIn("'lhs_batched': True", code)
+        self.assertIn("'rhs_batched': True", code)
+        self.assertIn("'d_batched': True", code)
+        self.assertIn("cpasync.tma_partition", code)
+        self.assertIn("tcgen05_tma_store_atom", code)
+        self.assertNotIn("cute.copy(tcgen05_simt_atom", code)
+
+    def test_batched_baddbmm_mma_tcgen05_two_cta(self) -> None:
+        # A leading-batch matmul composes with the CtaGroup.TWO cluster
+        # (cluster_m=2, cluster_n=1, 256-row tile): the 2-CTA MMA and TMA
+        # multicast run within each (m, n) tile while the batch axis only
+        # offsets the per-tile TMA source. Single-CTA tcgen05 maxes at a
+        # 128-row M tile, so bm=256 requires the 2-CTA path.
+        support = get_cute_mma_support()
+        if not support.tcgen05_f16bf16:
+            self.skipTest("tcgen05 F16/BF16 MMA is not supported on this machine")
+
+        args = (
+            torch.randn(2, 256, 128, device=DEVICE, dtype=HALF_DTYPE),
+            torch.randn(2, 128, 256, device=DEVICE, dtype=HALF_DTYPE),
+        )
+        with patch.dict(os.environ, {"HELION_CUTE_MMA_IMPL": "tcgen05"}, clear=False):
+            bound = cute_batched_baddbmm_tcgen05.bind(args)
+            config = helion.Config(
+                block_sizes=[1, 256, 256, 64],
+                tcgen05_cluster_m=2,
+                tcgen05_cluster_n=1,
+                pid_type="persistent_blocked",
+                tcgen05_persistence_model="static_persistent",
+                tcgen05_ab_stages=2,
+                tcgen05_acc_stages=2,
+                tcgen05_c_stages=2,
+            )
+            code = bound.to_triton_code(config)
+            out = bound.compile_config(config)(*args)
+            torch.cuda.synchronize()
+        expected = torch.bmm(args[0].float(), args[1].float())
+        torch.testing.assert_close(out, expected, atol=1e-1, rtol=1e-2)
+        self.assertIn("make_trivial_tiled_mma", code)
+        self.assertIn("cute.gemm(", code)
+        self.assertIn("CtaGroup.TWO", code)
+        self.assertIn("mcast_mask", code)
+        self.assertIn("'lhs_batched': True", code)
+        self.assertIn("'rhs_batched': True", code)
+
+    def test_batched_baddbmm_rowvec_bias_fused_mma_tcgen05_two_cta(self) -> None:
+        # A trailing-axis (rowvec) bias fuses into the CtaGroup.TWO batched
+        # matmul epilogue. The rank-3 carrier ``[1, BM, BN]`` has a
+        # block-size-1 batch-passthrough leading axis; the epilogue
+        # analyzer strips it so ``acc + bias[tile_n]`` classifies as the
+        # (M, N)-tile rowvec form and splices into the tcgen05 epilogue.
+        # Without the strip this store dropped to the loud-failure backstop
+        # (``BackendUnsupported``), so a successful compile-and-match here
+        # is itself the proof that the bias is fused (not a separate pass).
+        support = get_cute_mma_support()
+        if not support.tcgen05_f16bf16:
+            self.skipTest("tcgen05 F16/BF16 MMA is not supported on this machine")
+
+        args = (
+            torch.randn(2, 256, 128, device=DEVICE, dtype=HALF_DTYPE),
+            torch.randn(2, 128, 256, device=DEVICE, dtype=HALF_DTYPE),
+            torch.randn(256, device=DEVICE, dtype=HALF_DTYPE),
+        )
+        with patch.dict(os.environ, {"HELION_CUTE_MMA_IMPL": "tcgen05"}, clear=False):
+            bound = cute_batched_baddbmm_rowvec_bias_tcgen05.bind(args)
+            config = helion.Config(
+                block_sizes=[1, 256, 256, 64],
+                tcgen05_cluster_m=2,
+                tcgen05_cluster_n=1,
+                pid_type="persistent_blocked",
+                tcgen05_persistence_model="static_persistent",
+                tcgen05_ab_stages=2,
+                tcgen05_acc_stages=2,
+                tcgen05_c_stages=2,
+            )
+            code = bound.to_triton_code(config)
+            out = bound.compile_config(config)(*args)
+            torch.cuda.synchronize()
+        expected = (
+            torch.bmm(args[0].float(), args[1].float()) + args[2].float()
+        ).to(torch.bfloat16)
+        torch.testing.assert_close(out, expected, atol=1e-1, rtol=1e-2)
+        self.assertIn("cute.gemm(", code)
+        self.assertIn("CtaGroup.TWO", code)
+        # Bias folded into the matmul epilogue -> a single device kernel,
+        # no separate elementwise bias pass.
+        self.assertEqual(code.count("@cute.kernel"), 1)
+
     def test_matmul_mma_tcgen05_128x8_uses_full_cta_barrier(self) -> None:
         support = get_cute_mma_support()
         if not support.tcgen05_f16bf16:
@@ -4901,7 +5060,13 @@ class TestCuteBackend(TestCase):
         torch.testing.assert_close(out, args[0] @ args[1], atol=1e-1, rtol=1e-2)
         self.assertNotIn("cute.gemm", code)
 
-    def test_baddbmm_falls_back_from_mma(self) -> None:
+    def test_batched_baddbmm_bias_acc_init_uses_mma(self) -> None:
+        # A leading-batch baddbmm whose accumulator is seeded from a
+        # full-shape bias (``acc = bias[tile_b, tile_m, tile_n]``) now runs on
+        # the batched MMA path (the first K iteration copies the bias-seeded
+        # ``acc`` into the MMA accumulator fragment). Before batched MMA was
+        # enabled this fell back to the scalar path; enabling bmm makes it use
+        # ``cute.gemm``, and the result stays correct.
         args = (
             torch.randn(2, 16, 64, device=DEVICE, dtype=HALF_DTYPE),
             torch.randn(2, 64, 8, device=DEVICE, dtype=HALF_DTYPE),
@@ -4916,7 +5081,7 @@ class TestCuteBackend(TestCase):
         x, y, bias = args
         expected = torch.baddbmm(bias, x.float(), y.float())
         torch.testing.assert_close(out, expected, atol=1e-1, rtol=1e-2)
-        self.assertNotIn("cute.gemm", code)
+        self.assertIn("cute.gemm", code)
 
     def test_matmul_mma_non_divisible(self) -> None:
         """Test MMA with non-divisible matrix dimensions (masking)."""

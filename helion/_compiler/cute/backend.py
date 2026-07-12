@@ -29,6 +29,7 @@ from ..backend import _attention_softmax_pattern_head_dim
 from ..backend import _kernel_specialized_mma_impl
 from ..backend import _largest_divisor_at_most
 from ..backend import _loop_contains_matmul
+from ..backend import _specialized_mma_root_mn_block_ids
 from ..backend import log
 from .tcgen05_constants import TCGEN05_CUBIN_LINEINFO_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY
@@ -63,9 +64,10 @@ def _detect_mma_loop(
     """Check if a device loop contains a matmul with MMA-compatible dtypes.
 
     Returns True only when the loop contains a compatible addmm/dot AND
-    the grid has at least 2 block IDs (M and N), so the MMA pipeline
-    can map them to tile offsets.  Three-level loops (grid[M] +
-    device_loop[N] + device_loop[K]) are NOT supported yet.
+    the grid has M and N block IDs, so the MMA pipeline can map them to tile
+    offsets. Leading-batch matmul may add one extra root grid axis.
+    Three-level loops (grid[M] + device_loop[N] + device_loop[K]) are NOT
+    supported yet.
     """
     from ...language._decorators import is_api_func
     from ..device_ir import ForLoopGraphInfo
@@ -80,7 +82,7 @@ def _detect_mma_loop(
     device_ir = HostFunction.current().device_ir
     if len(device_ir.grid_block_ids) != 1:
         return False
-    if len(device_ir.grid_block_ids[0]) != 2:
+    if len(device_ir.grid_block_ids[0]) not in (2, 3):
         return False
     root_grid_ids = set(device_ir.grid_block_ids[0])
     # CuTe MMA fragment partitioning is currently keyed to physical threads.
@@ -141,11 +143,10 @@ def _detect_specialized_mma_loop(
     from .cute_mma import can_codegen_cute_mma_dot
 
     device_ir = HostFunction.current().device_ir
-    if len(device_ir.grid_block_ids) != 1:
+    root_mn_block_ids = _specialized_mma_root_mn_block_ids(config)
+    if root_mn_block_ids is None:
         return False
     root_grid_ids = device_ir.grid_block_ids[0]
-    if len(root_grid_ids) != 2:
-        return False
     if len(block_ids) != 1 or any(block_id in root_grid_ids for block_id in block_ids):
         return False
 
@@ -153,7 +154,7 @@ def _detect_specialized_mma_loop(
     root_block_sizes: list[int] = []
     root_thread_counts: list[int] = []
     root_thread_auto: list[bool] = []
-    for block_id in root_grid_ids:
+    for block_id in root_mn_block_ids:
         block_size = env.block_sizes[block_id].from_config(config)
         if not isinstance(block_size, int):
             return False
@@ -225,6 +226,11 @@ def _detect_specialized_mma_loop(
                 torch.ops.aten.baddbmm.default,
             ) and can_codegen_cute_mma_aten(node, with_acc=True):
                 lhs_node = node.args[1]
+            elif (
+                node.target is torch.ops.aten.bmm.default
+                and can_codegen_cute_mma_aten(node, with_acc=False)
+            ):
+                lhs_node = node.args[0]
                 if not isinstance(lhs_node, torch.fx.Node):
                     continue
                 lhs_val = lhs_node.meta.get("val")
@@ -2189,27 +2195,47 @@ class CuteBackend(Backend):
                 and block_ids == device_ir.grid_block_ids[0]
             ):
                 specialized_mma_impl = _kernel_specialized_mma_impl(fn, config=config)
-                if specialized_mma_impl == "tcgen05" and len(nd_block_size) == 2:
+                root_mn_block_ids = _specialized_mma_root_mn_block_ids(config)
+                if specialized_mma_impl == "tcgen05" and root_mn_block_ids is not None:
                     from .cute_mma import _tcgen05_root_m_threads
 
+                    m_axis = block_ids.index(root_mn_block_ids[0])
+                    n_axis = block_ids.index(root_mn_block_ids[1])
+                    m_block_size = nd_block_size[m_axis]
+                    n_block_size = nd_block_size[n_axis]
                     root_m_threads = (
                         _tcgen05_root_m_threads(
-                            int(nd_block_size[0]), int(nd_block_size[1])
+                            int(m_block_size), int(n_block_size)
                         )
-                        if num_threads_config[0] == 0
-                        and isinstance(nd_block_size[0], int)
-                        and isinstance(nd_block_size[1], int)
-                        else num_threads_config[0]
+                        if num_threads_config[m_axis] == 0
+                        and isinstance(m_block_size, int)
+                        and isinstance(n_block_size, int)
+                        else num_threads_config[m_axis]
                     )
                     root_n_threads = (
-                        min(int(nd_block_size[1]), 8)
-                        if num_threads_config[1] == 0
-                        and isinstance(nd_block_size[1], int)
-                        else num_threads_config[1]
+                        min(int(n_block_size), 8)
+                        if num_threads_config[n_axis] == 0
+                        and isinstance(n_block_size, int)
+                        else num_threads_config[n_axis]
                     )
-                    num_threads_config[0] = root_m_threads
-                    num_threads_config[1] = root_n_threads
-                    static_threads = root_m_threads * root_n_threads
+                    num_threads_config[m_axis] = root_m_threads
+                    num_threads_config[n_axis] = root_n_threads
+                    static_threads = functools.reduce(
+                        operator.mul,
+                        (
+                            threads
+                            if threads > 0
+                            else int(block_size)
+                            if isinstance(block_size, int)
+                            else 0
+                            for block_size, threads in zip(
+                                nd_block_size,
+                                num_threads_config,
+                                strict=True,
+                            )
+                        ),
+                        1,
+                    )
 
             check_thread_limit(static_threads, context=str(tuple(nd_block_size)))
             return CuteNDTileStrategy(

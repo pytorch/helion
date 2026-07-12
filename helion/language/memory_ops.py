@@ -1482,7 +1482,7 @@ def _codegen_cute_store_tcgen05_tile(
                 "tcgen05 pure role-lifecycle store cannot use an extra store mask",
             )
         return None
-    if tensor.ndim != 2:
+    if tensor.ndim not in (2, 3):
         if tcgen05_value.pure_matmul_role_lifecycle:
             raise exc.BackendUnsupported(
                 "cute",
@@ -1592,17 +1592,28 @@ def _codegen_cute_store_tcgen05_tile(
             f"but the store target tensor dtype is {target_dtype!r}.",
         )
     base_indices = [_cute_tile_begin_expr(state, idx) for idx in subscript]
-    if len(base_indices) != 2:
+    batched_output = tensor.ndim == 3
+    if batched_output and tcgen05_value.pure_matmul_role_lifecycle:
+        raise exc.BackendUnsupported(
+            "cute",
+            "tcgen05 pure role-lifecycle store requires a rank-2 tensor target",
+        )
+    if len(base_indices) != (3 if batched_output else 2):
         if tcgen05_value.pure_matmul_role_lifecycle:
             raise exc.BackendUnsupported(
                 "cute",
                 "tcgen05 pure role-lifecycle store requires a rank-2 tile store",
             )
         return None
-    m_size = _cute_tensor_dim_size_expr(state, tensor, 0)
-    n_size = _cute_tensor_dim_size_expr(state, tensor, 1)
-    tile_coord_m = f"({base_indices[0]}) // cutlass.Int32({tcgen05_value.bm})"
-    tile_coord_n = f"({base_indices[1]}) // cutlass.Int32({tcgen05_value.bn})"
+    batch_index = base_indices[0] if batched_output else None
+    m_index = base_indices[1] if batched_output else base_indices[0]
+    n_index = base_indices[2] if batched_output else base_indices[1]
+    m_dim = 1 if batched_output else 0
+    n_dim = 2 if batched_output else 1
+    m_size = _cute_tensor_dim_size_expr(state, tensor, m_dim)
+    n_size = _cute_tensor_dim_size_expr(state, tensor, n_dim)
+    tile_coord_m = f"({m_index}) // cutlass.Int32({tcgen05_value.bm})"
+    tile_coord_n = f"({n_index}) // cutlass.Int32({tcgen05_value.bn})"
     full_tile = df.new_var("tcgen05_full_tile")
 
     gmem_tile = df.new_var("tcgen05_gC")
@@ -2057,8 +2068,8 @@ def _codegen_cute_store_tcgen05_tile(
                 f"{stage.smem})\n"
                 f"    {stage.coord} = {stage.thr_copy}.partition_S("
                 f"cute.make_identity_tensor({tcgen05_aux_bn}))\n"
-                f"    {stage.limit} = min({n_size} - ({base_indices[1]}), "
-                f"cutlass.Int32({stage.aux_extent}) - ({base_indices[1]}), "
+                f"    {stage.limit} = min({n_size} - ({n_index}), "
+                f"cutlass.Int32({stage.aux_extent}) - ({n_index}), "
                 f"cutlass.Int32({tcgen05_aux_bn}))\n"
                 f"    {stage.pred} = cute.make_rmem_tensor("
                 f"(1, cute.size({stage.smem_part}.shape[1])), cutlass.Boolean)\n"
@@ -2783,6 +2794,8 @@ def _codegen_cute_store_tcgen05_tile(
                 else {}
             ),
         }
+        if batched_output:
+            d_tma_plan["d_batched"] = True
         state.codegen.cute_wrapper_plans.append(d_tma_plan)
 
     tcgen05_bm = tcgen05_value.bm
@@ -2807,12 +2820,12 @@ def _codegen_cute_store_tcgen05_tile(
         explicit_expr=tcgen05_explicit_store_tile_expr,
     )
     full_tile_expr = (
-        f"({base_indices[0]}) + cutlass.Int32({tcgen05_bm}) <= {m_size} "
-        f"and ({base_indices[1]}) + cutlass.Int32({tcgen05_bn}) <= {n_size}"
+        f"({m_index}) + cutlass.Int32({tcgen05_bm}) <= {m_size} "
+        f"and ({n_index}) + cutlass.Int32({tcgen05_bn}) <= {n_size}"
     )
 
     def store_common_setup(
-        gmem_tensor: str, *, include_full_tile: bool
+        gmem_tensor: str, *, include_full_tile: bool, tma_store: bool = False
     ) -> tuple[list[str], list[str]]:
         epi_tile_expr = tcgen05_store_epi_tile_expr
         static_setup = [
@@ -2840,11 +2853,40 @@ def _codegen_cute_store_tcgen05_tile(
         tile_setup: list[str] = []
         if include_full_tile:
             tile_setup.append(f"{full_tile} = {full_tile_expr}")
+        local_gmem_tensor = gmem_tensor
+        if batched_output and tma_store:
+            assert batch_index is not None
+            gmem_tile_3d = df.new_var("tcgen05_gC3d")
+            tile_setup.extend(
+                [
+                    (
+                        f"{gmem_tile_3d} = cute.local_tile("
+                        f"{gmem_tensor}, ({tcgen05_bm}, {tcgen05_bn}, 1), "
+                        f"({tile_coord_m}, {tile_coord_n}, "
+                        f"cutlass.Int32({batch_index})))"
+                    ),
+                    f"{gmem_tile} = {gmem_tile_3d}[(None, None, 0)]",
+                    f"{tcgc_base} = {tcgen05_thr_mma}.partition_C({gmem_tile})",
+                ]
+            )
+            return static_setup, tile_setup
+        if batched_output:
+            assert batch_index is not None
+            local_gmem_tensor = df.new_var("tcgen05_gmem2d")
+            tile_setup.append(
+                f"{local_gmem_tensor} = cute.make_tensor("
+                f"{gmem_tensor}.iterator + cute.crd2idx("
+                f"(cutlass.Int32({batch_index}), cutlass.Int32(0), cutlass.Int32(0)), "
+                f"{gmem_tensor}.layout), "
+                f"cute.make_layout(({gmem_tensor}.shape[1], {gmem_tensor}.shape[2]), "
+                f"stride=({gmem_tensor}.layout.stride[1], "
+                f"{gmem_tensor}.layout.stride[2])))"
+            )
         tile_setup.extend(
             [
                 (
                     f"{gmem_tile} = cute.local_tile("
-                    f"{gmem_tensor}, ({tcgen05_bm}, {tcgen05_bn}), "
+                    f"{local_gmem_tensor}, ({tcgen05_bm}, {tcgen05_bn}), "
                     f"({tile_coord_m}, {tile_coord_n}))"
                 ),
                 f"{tcgc_base} = {tcgen05_thr_mma}.partition_C({gmem_tile})",
@@ -2877,10 +2919,14 @@ def _codegen_cute_store_tcgen05_tile(
         force_simt_edge_aux=tcgen05_value.tma_store_full_tiles_only,
     )
     simt_acc_vec_prelude = simt_early_aux + simt_late_prelude
-    tma_static_store_setup, tma_tile_store_setup = store_common_setup(
-        tcgen05_value.tma_store_tensor,
-        include_full_tile=partial_tma_needs_full_tile_guard,
-    )
+    if tcgen05_value.use_tma_store_epilogue:
+        tma_static_store_setup, tma_tile_store_setup = store_common_setup(
+            tcgen05_value.tma_store_tensor,
+            include_full_tile=partial_tma_needs_full_tile_guard,
+            tma_store=True,
+        )
+    else:
+        tma_static_store_setup, tma_tile_store_setup = [], []
     # Role-local TMA stores reuse one C pipeline across work tiles. Static-full
     # kernels increment this counter once per role-local tile; hybrid
     # output-edge kernels increment it only in the full-tile branch so SIMT

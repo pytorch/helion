@@ -3656,6 +3656,43 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
                     requires_ws_overlap=flash_shape.requires_ws_overlap,
                     small_biased_candidate=flash_shape.small_biased_candidate,
                 )
+            else:
+                from ..language.matmul_ops import enforce_dot_requirements
+                from .cute.cute_mma import can_codegen_cute_mma_aten
+
+                for graph_info in device_ir.graphs:
+                    for node in graph_info.graph.nodes:
+                        if node.op != "call_function":
+                            continue
+                        # addmm (2D accumulate) and baddbmm (leading-dim
+                        # accumulate) both pass (bias, lhs, rhs) as args 0/1/2.
+                        if node.target in (
+                            torch.ops.aten.addmm.default,
+                            torch.ops.aten.baddbmm.default,
+                        ):
+                            lhs_arg, rhs_arg = node.args[1], node.args[2]
+                        else:
+                            continue
+                        if not can_codegen_cute_mma_aten(node, with_acc=True):
+                            continue
+                        if not isinstance(lhs_arg, torch.fx.Node) or not isinstance(
+                            rhs_arg,
+                            torch.fx.Node,
+                        ):
+                            continue
+                        lhs = lhs_arg.meta.get("val")
+                        rhs = rhs_arg.meta.get("val")
+                        if isinstance(lhs, torch.Tensor) and isinstance(
+                            rhs,
+                            torch.Tensor,
+                        ):
+                            # The rank>2 (leading passthrough dim) allowance is
+                            # derived from operand structure, not op identity.
+                            enforce_dot_requirements(
+                                lhs,
+                                rhs,
+                                allow_batched_cute_tcgen05=lhs.ndim > 2,
+                            )
         config_spec.raise_grid_block_minimums()
         if len(device_ir.root_ids) > 1:
             # xyz is not supported with shared program IDs. Non-tcgen05

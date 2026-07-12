@@ -47,6 +47,8 @@ from .layout import MatmulExecutionPlan
 from .matmul_utils import analyze_direct_grouped_n_loads
 from .mma_support import get_cute_mma_support
 from .strategies import TCGEN05_LEGAL_SMEM_SWIZZLE_BYTES
+from .strategies import TCGEN05_NUM_EPI_WARPS_CONFIG_KEY
+from .strategies import TCGEN05_WARP_SPEC_DEFAULTS_BY_KEY
 from .strategies import Tcgen05PersistenceModel
 from .strategies import is_pure_matmul_role_lifecycle_config
 from .strategies import l2_swizzle_size_from_config
@@ -450,52 +452,172 @@ def _trace_to_load_tensor(node: Node) -> tuple[Node, str, torch.Tensor] | None:
     return load_node, tensor_node.name, fake
 
 
+_MMA_SUPPORTED_DTYPES = {
+    torch.float16,
+    torch.bfloat16,
+    torch.float32,
+    torch.float8_e4m3fn,
+}
+
+
+@dataclass(frozen=True)
+class _MmaOperandInfo:
+    # ``matrix_rows``/``matrix_cols`` are the trailing two (matmul) axes of the
+    # operand. ``batch_block_id`` is a *leading passthrough* grid axis that only
+    # offsets memory (the common case is a batch dim). It is derived from the
+    # load subscript structure -- not from op identity (mm/bmm/baddbmm/dot all
+    # route here) -- so the codegen is a general "matmul + leading grid axis",
+    # not a bmm special case. At most one leading axis is supported today; the
+    # generalization to N leading axes is tracked in BMM_2CTA_FINDINGS.md.
+    load: Node
+    source_fake: torch.Tensor
+    matrix_rows: object
+    matrix_cols: object
+    batched: bool
+    batch_block_id: int | None = None
+
+
+@dataclass(frozen=True)
+class _MmaOperandAnalysis:
+    lhs: _MmaOperandInfo
+    rhs: _MmaOperandInfo
+    batch_block_id: int | None
+
+    @property
+    def has_batch(self) -> bool:
+        """True when the matmul carries a leading passthrough grid axis."""
+        return self.batch_block_id is not None
+
+
+def _analyze_mma_operand(
+    node: Node,
+    env: CompileEnvironment,
+) -> _MmaOperandInfo | None:
+    info = _trace_to_load_tensor(node)
+    if info is None:
+        return None
+    load_node, _, source_fake = info
+    value_fake = node.meta.get("val")
+    if not isinstance(value_fake, torch.Tensor):
+        return None
+    if source_fake.dtype not in _MMA_SUPPORTED_DTYPES:
+        return None
+    if source_fake.ndim == 2:
+        if value_fake.ndim != 2:
+            return None
+        return _MmaOperandInfo(
+            load=load_node,
+            source_fake=source_fake,
+            matrix_rows=source_fake.shape[0],
+            matrix_cols=source_fake.shape[1],
+            batched=False,
+        )
+    if source_fake.ndim != 3:
+        return None
+    if value_fake.ndim not in (2, 3):
+        return None
+    subscript = load_node.args[1] if len(load_node.args) > 1 else None
+    if not isinstance(subscript, (list, tuple)) or len(subscript) != 3:
+        return None
+    batch_block_id = env.get_block_id(subscript[0])
+    if batch_block_id is None and value_fake.ndim == 3:
+        batch_block_id = env.resolve_block_id(value_fake.shape[0])
+    if batch_block_id is None:
+        return None
+    batch_size = source_fake.shape[0]
+    if not isinstance(batch_size, (int, torch.SymInt)):
+        return None
+    if not env.known_equal(env.block_sizes[batch_block_id].size, batch_size):
+        return None
+    return _MmaOperandInfo(
+        load=load_node,
+        source_fake=source_fake,
+        matrix_rows=source_fake.shape[1],
+        matrix_cols=source_fake.shape[2],
+        batched=True,
+        batch_block_id=batch_block_id,
+    )
+
+
+def _analyze_mma_operands(
+    lhs_node: Node,
+    rhs_node: Node,
+    env: CompileEnvironment,
+) -> _MmaOperandAnalysis | None:
+    lhs = _analyze_mma_operand(lhs_node, env)
+    rhs = _analyze_mma_operand(rhs_node, env)
+    if lhs is None or rhs is None:
+        return None
+    if lhs.source_fake.dtype != rhs.source_fake.dtype:
+        return None
+    if not env.known_equal(lhs.matrix_cols, rhs.matrix_rows):
+        return None
+    batch_block_ids = {
+        operand.batch_block_id
+        for operand in (lhs, rhs)
+        if operand.batch_block_id is not None
+    }
+    if len(batch_block_ids) > 1:
+        return None
+    batch_block_id = next(iter(batch_block_ids)) if batch_block_ids else None
+    return _MmaOperandAnalysis(lhs=lhs, rhs=rhs, batch_block_id=batch_block_id)
+
+
+def _acc_rank_is_mma_compatible(
+    acc_val: torch.Tensor,
+    analysis: _MmaOperandAnalysis,
+) -> bool:
+    if acc_val.ndim == 2:
+        return True
+    return acc_val.ndim == 3 and analysis.has_batch
+
+
 def _has_mma_operands(lhs_node: Node, rhs_node: Node) -> bool:
     """Check if lhs/rhs come from loads with MMA-compatible dtypes."""
-    lhs_info = _trace_to_load_tensor(lhs_node)
-    rhs_info = _trace_to_load_tensor(rhs_node)
-    if lhs_info is None or rhs_info is None:
-        return False
-    lhs_load, _, lhs_fake = lhs_info
-    rhs_load, _, rhs_fake = rhs_info
-    supported = {
-        torch.float16,
-        torch.bfloat16,
-        torch.float32,
-        torch.float8_e4m3fn,
-    }
-    return (
-        lhs_fake.dtype in supported
-        and rhs_fake.dtype in supported
-        and lhs_fake.dtype == rhs_fake.dtype
-        and lhs_fake.ndim == 2
-        and rhs_fake.ndim == 2
-    )
+    from ..compile_environment import CompileEnvironment
+
+    return _analyze_mma_operands(
+        lhs_node,
+        rhs_node,
+        CompileEnvironment.current(),
+    ) is not None
 
 
 def is_mma_compatible_aten(node: Node, with_acc: bool) -> bool:
     """Check if an aten addmm/mm node can use MMA."""
+    from ..compile_environment import CompileEnvironment
+
     args = node.args
+    acc_node: object = None
     if with_acc:
         if len(args) < 3:
             return False
         acc_node = args[0]
         lhs_node, rhs_node = args[1], args[2]
-        if isinstance(acc_node, Node):
-            acc_val = acc_node.meta.get("val")
-            if isinstance(acc_val, torch.Tensor) and acc_val.ndim != 2:
-                return False
     else:
         if len(args) < 2:
             return False
         lhs_node, rhs_node = args[0], args[1]
     if not isinstance(lhs_node, Node) or not isinstance(rhs_node, Node):
         return False
-    return _has_mma_operands(lhs_node, rhs_node)
+    env = CompileEnvironment.current()
+    analysis = _analyze_mma_operands(lhs_node, rhs_node, env)
+    if analysis is None:
+        return False
+    if with_acc and isinstance(acc_node, Node):
+        acc_val = acc_node.meta.get("val")
+        if isinstance(acc_val, torch.Tensor) and not _acc_rank_is_mma_compatible(
+            acc_val,
+            analysis,
+        ):
+            return False
+    return True
 
 
 def is_mma_compatible_dot(node: Node) -> bool:
     """Check if an hl.dot FX node can use MMA."""
+    from ..compile_environment import CompileEnvironment
+
     # dot args: (lhs, rhs, acc_or_None, out_dtype_or_None)
     if len(node.args) < 2:
         return False
@@ -503,11 +625,18 @@ def is_mma_compatible_dot(node: Node) -> bool:
     lhs_node, rhs_node = node.args[0], node.args[1]
     if not isinstance(lhs_node, Node) or not isinstance(rhs_node, Node):
         return False
+    env = CompileEnvironment.current()
+    analysis = _analyze_mma_operands(lhs_node, rhs_node, env)
+    if analysis is None:
+        return False
     if isinstance(acc_node, Node):
         acc_val = acc_node.meta.get("val")
-        if isinstance(acc_val, torch.Tensor) and acc_val.ndim != 2:
+        if isinstance(acc_val, torch.Tensor) and not _acc_rank_is_mma_compatible(
+            acc_val,
+            analysis,
+        ):
             return False
-    return _has_mma_operands(lhs_node, rhs_node)
+    return True
 
 
 def can_codegen_cute_mma_dot(node: Node) -> bool:
@@ -779,8 +908,12 @@ def _get_mma_k_loop_info(
     lhs_fake: torch.Tensor,
     rhs_fake: torch.Tensor,
     fx_node: Node | None = None,
+    lhs_k_size: object | None = None,
+    rhs_k_size: object | None = None,
 ) -> tuple[DeviceLoopState, int, str, int] | None:
     """Return the active reduction loop for the operands' shared K dimension."""
+    lhs_k_size = lhs_fake.shape[1] if lhs_k_size is None else lhs_k_size
+    rhs_k_size = rhs_fake.shape[0] if rhs_k_size is None else rhs_k_size
     if fx_node is not None:
         from ..device_ir import ForLoopGraphInfo
 
@@ -823,8 +956,8 @@ def _get_mma_k_loop_info(
                             block_size,
                         )
 
-    lhs_k_block_id = env.resolve_block_id(lhs_fake.shape[1])
-    rhs_k_block_id = env.resolve_block_id(rhs_fake.shape[0])
+    lhs_k_block_id = env.resolve_block_id(lhs_k_size)
+    rhs_k_block_id = env.resolve_block_id(rhs_k_size)
     candidate_block_ids: set[int] = set()
     if (
         lhs_k_block_id is not None
@@ -839,8 +972,8 @@ def _get_mma_k_loop_info(
             size = env.block_sizes[block_id].size
             if not isinstance(size, int | torch.SymInt):
                 continue
-            if env.known_equal(size, lhs_fake.shape[1]) and env.known_equal(
-                size, rhs_fake.shape[0]
+            if env.known_equal(size, lhs_k_size) and env.known_equal(
+                size, rhs_k_size
             ):
                 candidate_block_ids.add(block_id)
 
@@ -925,7 +1058,22 @@ def prepare_cute_collective_lane_loop_suppression(
             rhs_node = node.args[2]
             if not can_codegen_cute_mma_aten(node, with_acc):
                 continue
+        elif node.target is torch.ops.aten.baddbmm.default:
+            with_acc = True
+            acc_node = node.args[0]
+            if not isinstance(acc_node, Node) or not _is_zero_init_acc_node(acc_node):
+                continue
+            lhs_node = node.args[1]
+            rhs_node = node.args[2]
+            if not can_codegen_cute_mma_aten(node, with_acc):
+                continue
         elif node.target is torch.ops.aten.mm.default:
+            with_acc = False
+            lhs_node = node.args[0]
+            rhs_node = node.args[1]
+            if not can_codegen_cute_mma_aten(node, with_acc):
+                continue
+        elif node.target is torch.ops.aten.bmm.default:
             with_acc = False
             lhs_node = node.args[0]
             rhs_node = node.args[1]
@@ -940,42 +1088,59 @@ def prepare_cute_collective_lane_loop_suppression(
         if not isinstance(lhs_node, Node) or not isinstance(rhs_node, Node):
             continue
 
-        lhs_info = _trace_to_load_tensor(lhs_node)
-        rhs_info = _trace_to_load_tensor(rhs_node)
-        if lhs_info is None or rhs_info is None:
+        analysis = _analyze_mma_operands(lhs_node, rhs_node, env)
+        if analysis is None:
             continue
-        lhs_load, _, lhs_fake = lhs_info
-        rhs_load, _, rhs_fake = rhs_info
-        if lhs_fake.ndim != 2 or rhs_fake.ndim != 2:
+        if analysis.batch_block_id is not None and (
+            cg.device_function.resolved_block_size(analysis.batch_block_id) != 1
+        ):
             continue
+        lhs_operand = analysis.lhs
+        rhs_operand = analysis.rhs
+        lhs_load = lhs_operand.load
+        rhs_load = rhs_operand.load
+        lhs_fake = lhs_operand.source_fake
+        rhs_fake = rhs_operand.source_fake
+        lhs_m_size = lhs_operand.matrix_rows
+        lhs_k_size = lhs_operand.matrix_cols
+        rhs_k_size = rhs_operand.matrix_rows
+        rhs_n_size = rhs_operand.matrix_cols
 
         if not (
-            isinstance(lhs_fake.shape[0], int)
-            and isinstance(rhs_fake.shape[1], int)
-            and isinstance(lhs_fake.shape[1], int)
+            isinstance(lhs_m_size, int)
+            and isinstance(rhs_n_size, int)
+            and isinstance(lhs_k_size, int)
         ):
             continue
         bm = bn = bk = None
         candidate_block_ids = [*grid_state.block_ids]
         if (
             k_loop_info := _get_mma_k_loop_info(
-                cg, env, lhs_fake, rhs_fake, fx_node=node
+                cg,
+                env,
+                lhs_fake,
+                rhs_fake,
+                fx_node=node,
+                lhs_k_size=lhs_k_size,
+                rhs_k_size=rhs_k_size,
             )
         ) is not None:
             _, k_block_id, _, k_block_size = k_loop_info
             candidate_block_ids.append(k_block_id)
             bk = int(k_block_size)
         for bid in dict.fromkeys(candidate_block_ids):
+            if bid == analysis.batch_block_id:
+                continue
             size = env.block_sizes[bid].size
             bs = cg.device_function.resolved_block_size(bid)
             if not isinstance(bs, int):
                 continue
             if isinstance(size, (int, torch.SymInt)):
-                if bm is None and env.known_equal(size, lhs_fake.shape[0]):
+                if bm is None and env.known_equal(size, lhs_m_size):
                     bm = int(bs)
-                elif bn is None and env.known_equal(size, rhs_fake.shape[1]):
+                elif bn is None and env.known_equal(size, rhs_n_size):
                     bn = int(bs)
-                elif bk is None and env.known_equal(size, lhs_fake.shape[1]):
+                elif bk is None and env.known_equal(size, lhs_k_size):
                     bk = int(bs)
         if bm is None or bn is None or bk is None:
             continue
@@ -1001,8 +1166,14 @@ def prepare_cute_collective_lane_loop_suppression(
         # takes the scalar fallback, requesting root lane-loop suppression would
         # drop the synthetic-lane index/mask definitions for the grid axis and
         # produce a ``NameError`` at runtime. Only register the loads / request
-        # suppression when the collective path will truly be taken.
-        if _has_non_root_lane_loops(cg):
+        # suppression when the collective path will truly be taken. The K
+        # device-loop's lane loops are only tolerated for a *batched* matmul (it
+        # must exactly match the ``_emit_mma_pipeline`` guard); a non-batched
+        # config with device-loop lane loops takes the scalar fallback.
+        allowed_k_lane_loops: tuple[DeviceLoopState, ...] = (
+            (k_loop_info[0],) if analysis.batch_block_id is not None else ()
+        )
+        if _has_non_root_lane_loops(cg, allowed_loop_states=allowed_k_lane_loops):
             continue
 
         cute_state = cg.device_function.cute_state
@@ -1773,14 +1944,20 @@ def _emit_mma_pipeline(
     """
     from ..compile_environment import CompileEnvironment
 
-    lhs_info = _trace_to_load_tensor(lhs_node)
-    rhs_info = _trace_to_load_tensor(rhs_node)
-    if lhs_info is None or rhs_info is None:
+    env = CompileEnvironment.current()
+    analysis = _analyze_mma_operands(lhs_node, rhs_node, env)
+    if analysis is None:
         return None
-    lhs_load, _, lhs_fake = lhs_info
-    rhs_load, _, rhs_fake = rhs_info
-    if lhs_fake.ndim != 2 or rhs_fake.ndim != 2:
-        return None
+    lhs_operand = analysis.lhs
+    rhs_operand = analysis.rhs
+    lhs_load = lhs_operand.load
+    rhs_load = rhs_operand.load
+    lhs_fake = lhs_operand.source_fake
+    rhs_fake = rhs_operand.source_fake
+    lhs_m_size = lhs_operand.matrix_rows
+    lhs_k_size = lhs_operand.matrix_cols
+    rhs_k_size = rhs_operand.matrix_rows
+    rhs_n_size = rhs_operand.matrix_cols
 
     # Universal-MMA / tcgen05 MMA kernels rely on runtime tensor layouts
     # for SMEM-load guards and TMA descriptors; baking literal shapes
@@ -1827,17 +2004,17 @@ def _emit_mma_pipeline(
         _dtype_map[epi_elem_dtype] if epi_elem_dtype is not None else input_dtype_str
     )
 
-    def _tcgen05_tma_2d_major(t: torch.Tensor) -> str | None:
+    def _tcgen05_tma_2d_major(t: torch.Tensor, matrix_start_dim: int) -> str | None:
         # A 2D operand is TMA-eligible if it is contiguous in EITHER axis.
         # Returns "row" (last-dim contiguous), "col" (first-dim contiguous),
         # or None (neither -> not TMA-eligible). Row-major contiguous returns
         # "row"; a transposed/column-major view returns "col".
-        if t.dim() != 2:
-            return "row" if t.is_contiguous() else None
+        if t.dim() != 2 and t.dim() != 3:
+            return None
         s = t.stride()
-        if s[1] == 1:
+        if s[matrix_start_dim + 1] == 1:
             return "row"
-        if s[0] == 1:
+        if s[matrix_start_dim] == 1:
             return "col"
         return None
 
@@ -1846,8 +2023,8 @@ def _emit_mma_pipeline(
         torch.bfloat16,
         torch.float8_e4m3fn,
     )
-    _lhs_major = _tcgen05_tma_2d_major(lhs_fake)
-    _rhs_major = _tcgen05_tma_2d_major(rhs_fake)
+    _lhs_major = _tcgen05_tma_2d_major(lhs_fake, 1 if lhs_operand.batched else 0)
+    _rhs_major = _tcgen05_tma_2d_major(rhs_fake, 1 if rhs_operand.batched else 0)
     # A must be row-major (M,K) K-contiguous == "row"; the K-major A SMEM
     # layout Helion emits expects the standard row-major A. Only B's major
     # mode is made layout-aware here.
@@ -1862,15 +2039,31 @@ def _emit_mma_pipeline(
         df.config
     )
 
-    k_total_size = int(lhs_fake.shape[1])
+    k_total_size = int(lhs_k_size)
 
-    env = CompileEnvironment.current()
-
-    k_loop_info = _get_mma_k_loop_info(cg, env, lhs_fake, rhs_fake, fx_node=fx_node)
+    k_loop_info = _get_mma_k_loop_info(
+        cg,
+        env,
+        lhs_fake,
+        rhs_fake,
+        fx_node=fx_node,
+        lhs_k_size=lhs_k_size,
+        rhs_k_size=rhs_k_size,
+    )
     if k_loop_info is None:
         return None
     device_loop, _, k_offset_var, bk = k_loop_info
-    if _has_non_root_lane_loops(cg):
+    # Only a *batched* matmul's K reduction legitimately runs as a device
+    # loop whose (harmless) lane loops the collective K pipeline absorbs;
+    # allow those so the batched tcgen05 path is not suppressed. For a
+    # non-batched matmul, keep the strict guard (base behavior): a device
+    # K-loop carrying lane loops means a small / partially-threaded config
+    # (tiny tiles, unit-M, threads < block on M/N) that must fall back to
+    # the scalar path rather than miscompile into a warp ``cute.gemm``.
+    allowed_k_lane_loops: tuple[DeviceLoopState, ...] = (
+        (device_loop,) if analysis.batch_block_id is not None else ()
+    )
+    if _has_non_root_lane_loops(cg, allowed_loop_states=allowed_k_lane_loops):
         return None
     k_loop_begin_expr = _device_loop_begin_expr(device_loop)
 
@@ -1883,7 +2076,7 @@ def _emit_mma_pipeline(
     bn: int | None = None
     grid_state = cg.current_grid_state
     if grid_state is not None:
-        if len(grid_state.block_ids) == 2:
+        if analysis.batch_block_id is None and len(grid_state.block_ids) == 2:
             m_block_id, n_block_id = grid_state.block_ids
             m_offset_var = grid_state.strategy.offset_var(m_block_id)
             n_offset_var = grid_state.strategy.offset_var(n_block_id)
@@ -1893,20 +2086,18 @@ def _emit_mma_pipeline(
             bn = int(n_bs) if isinstance(n_bs, int) else None
         else:
             for bid in grid_state.block_ids:
+                if bid == analysis.batch_block_id:
+                    continue
                 offset = grid_state.strategy.offset_var(bid)
                 bs_info = env.block_sizes[bid]
                 size = bs_info.size
                 bs = bs_info.from_config(df.config)
                 if isinstance(size, (int, torch.SymInt)):
-                    if m_offset_var is None and env.known_equal(
-                        size, lhs_fake.shape[0]
-                    ):
+                    if m_offset_var is None and env.known_equal(size, lhs_m_size):
                         m_offset_var = offset
                         m_block_id = bid
                         bm = int(bs) if isinstance(bs, int) else None
-                    elif n_offset_var is None and env.known_equal(
-                        size, rhs_fake.shape[1]
-                    ):
+                    elif n_offset_var is None and env.known_equal(size, rhs_n_size):
                         n_offset_var = offset
                         n_block_id = bid
                         bn = int(bs) if isinstance(bs, int) else None
@@ -1928,6 +2119,13 @@ def _emit_mma_pipeline(
 
     m_index_var = cg.index_var(m_block_id)
     n_index_var = cg.index_var(n_block_id)
+    batch_index_var: str | None = None
+    if analysis.batch_block_id is not None:
+        if grid_state is None or analysis.batch_block_id not in grid_state.block_ids:
+            return None
+        if df.resolved_block_size(analysis.batch_block_id) != 1:
+            return None
+        batch_index_var = cg.index_var(analysis.batch_block_id)
     # Use thread_idx directly for local indices within the tile.
     # indices_0 - offset_0 SHOULD equal thread_idx[0], but the CuTe DSL
     # compiler may not simplify the subtraction, leading to illegal memory
@@ -1946,8 +2144,23 @@ def _emit_mma_pipeline(
     n_physical = _physical_mma_coord_expr(cg, n_block_id)
     m_global = f"cutlass.Int32({m_index_var})"
     n_global = f"cutlass.Int32({n_index_var})"
-    m_size = int(lhs_fake.shape[0])
-    n_size = int(rhs_fake.shape[1])
+    batch_global = (
+        f"cutlass.Int32({batch_index_var})" if batch_index_var is not None else None
+    )
+    m_size = int(lhs_m_size)
+    n_size = int(rhs_n_size)
+
+    def _lhs_gmem_access(m_expr: str, k_expr: str) -> str:
+        if lhs_operand.batched:
+            assert batch_global is not None
+            return f"{lhs_arg_name}[{batch_global}, {m_expr}, {k_expr}]"
+        return f"{lhs_arg_name}[{m_expr}, {k_expr}]"
+
+    def _rhs_gmem_access(k_expr: str, n_expr: str) -> str:
+        if rhs_operand.batched:
+            assert batch_global is not None
+            return f"{rhs_arg_name}[{batch_global}, {k_expr}, {n_expr}]"
+        return f"{rhs_arg_name}[{k_expr}, {n_expr}]"
 
     tcgen05_cluster_m = _tcgen05_cluster_m(df.config)
     tcgen05_large_bn_proof = _tcgen05_large_bn_proof_enabled(df.config)
@@ -2007,6 +2220,17 @@ def _emit_mma_pipeline(
         input_dtype=input_dtype,
     )
     tcgen05_cluster_n_requested = _tcgen05_cluster_n(df.config)
+    # A leading-batch grid axis composes with the CtaGroup.TWO cluster (cluster_m,
+    # cluster_n=1): the 2-CTA MMA/TMA-multicast operate within each (m, n) tile
+    # while the batch axis only offsets the per-tile TMA source. The cluster_n>1
+    # (4-CTA) multicast does NOT yet compose with batch (produces wrong results),
+    # so keep it on the scalar fallback for batched kernels.
+    if (
+        analysis.has_batch
+        and mma_impl == "tcgen05"
+        and tcgen05_cluster_n_requested != 1
+    ):
+        return None
     tcgen05_static_output_tiles = m_size % bm == 0 and n_size % bn == 0
     tcgen05_static_full_tiles = tcgen05_static_output_tiles and k_total_size % bk == 0
     tcgen05_has_k_tail = k_total_size > bk and k_total_size % bk != 0
@@ -2424,7 +2648,6 @@ def _emit_mma_pipeline(
         and tcgen05_role_local_codegen_allowed
         and (not _is_persistent_pid_config(df.config) or tcgen05_use_role_local_epi)
     )
-
     def tcgen05_tma_store_full_tiles_only_for(
         partial_output_tma_store: bool,
     ) -> bool:
@@ -2737,7 +2960,20 @@ def _emit_mma_pipeline(
         # Use ``warp_spec.ab_load_warps`` so the strategy data model
         # stays the source of truth for warp role IDs; ``epi_warps``
         # flows the same way via ``_tcgen05_epi_warp_count`` below.
-        tcgen05_warp_spec = warp_spec_from_config(df.config)
+        try:
+            tcgen05_warp_spec = warp_spec_from_config(df.config)
+        except KeyError:
+            if not analysis.has_batch:
+                raise
+            tcgen05_warp_spec = warp_spec_from_config(
+                {
+                    **TCGEN05_WARP_SPEC_DEFAULTS_BY_KEY,
+                    TCGEN05_NUM_EPI_WARPS_CONFIG_KEY: df.config.get(
+                        TCGEN05_NUM_EPI_WARPS_CONFIG_KEY,
+                        4,
+                    ),
+                }
+            )
         # Pull swizzle overrides off the config and validate the
         # bytes-per-row contract before constructing the matmul plan
         # so a bad config raises ``BackendUnsupported`` here rather
@@ -3857,6 +4093,8 @@ def _emit_mma_pipeline(
     tma_sA = df.new_var("tma_sA")
     tma_gB = df.new_var("tma_gB")
     tma_sB = df.new_var("tma_sB")
+    tma_gA_copy = tma_gA
+    tma_gB_copy = tma_gB
     tma_initial_full_tile = df.new_var("tcgen05_tma_initial_full_tile")
     tma_initial_next_full_tile = df.new_var("tcgen05_tma_initial_next_full_tile")
     tma_full_tile = df.new_var("tcgen05_tma_full_tile")
@@ -3987,6 +4225,10 @@ def _emit_mma_pipeline(
             # to the golden.
             if tcgen05_b_k_major:
                 ab_tma_plan["b_k_major"] = True
+            if lhs_operand.batched:
+                ab_tma_plan["lhs_batched"] = True
+            if rhs_operand.batched:
+                ab_tma_plan["rhs_batched"] = True
             # ``smem_swizzle_*`` overrides are recorded only when codegen
             # selected an explicit SMEM atom kind (either from a user
             # override or the scalar-edge fallback workaround). Keeping
@@ -4074,16 +4316,36 @@ def _emit_mma_pipeline(
             # downstream partitions and tma_partition outputs all inherit
             # that per-tile dependency, so all of these stay inside the
             # work-tile body when the persistent loop splitter runs.
+            if lhs_operand.batched:
+                assert batch_global is not None
+                gmem_a_tma_tiler = f"({bm}, {bk}, 1)"
+                gmem_a_tma_coord = (
+                    f"({m_offset_var} // cutlass.Int32({bm}), None, {batch_global})"
+                )
+            else:
+                gmem_a_tma_tiler = f"({bm}, {bk})"
+                gmem_a_tma_coord = (
+                    f"({m_offset_var} // cutlass.Int32({bm}), None)"
+                )
+            if rhs_operand.batched:
+                assert batch_global is not None
+                gmem_b_tma_tiler = f"({bn}, {bk}, 1)"
+                gmem_b_tma_coord = (
+                    f"({n_offset_var} // cutlass.Int32({bn}), None, {batch_global})"
+                )
+            else:
+                gmem_b_tma_tiler = f"({bn}, {bk})"
+                gmem_b_tma_coord = (
+                    f"({n_offset_var} // cutlass.Int32({bn}), None)"
+                )
             _emit_per_tile(
                 f"{gmem_a_tma} = cute.local_tile("
-                f"{tma_tensor_a}, ({bm}, {bk}), "
-                f"({m_offset_var} // cutlass.Int32({bm}), None))",
+                f"{tma_tensor_a}, {gmem_a_tma_tiler}, {gmem_a_tma_coord})",
                 tma_load=tcgen05_use_role_local_tma_producer,
             )
             _emit_per_tile(
                 f"{gmem_b_tma} = cute.local_tile("
-                f"{tma_tensor_b}, ({bn}, {bk}), "
-                f"({n_offset_var} // cutlass.Int32({bn}), None))",
+                f"{tma_tensor_b}, {gmem_b_tma_tiler}, {gmem_b_tma_coord})",
                 tma_load=tcgen05_use_role_local_tma_producer,
             )
             _emit_per_tile(
@@ -4278,8 +4540,8 @@ def _emit_mma_pipeline(
                     tma_warp=tma_warp,
                     tma_atom_a=tma_atom_a,
                     tma_atom_b=tma_atom_b,
-                    tma_gA=tma_gA,
-                    tma_gB=tma_gB,
+                    tma_gA=tma_gA_copy,
+                    tma_gB=tma_gB_copy,
                     tma_sA=tma_sA,
                     tma_sB=tma_sB,
                     tma_a_mcast_mask=tma_a_mcast_mask,
@@ -4444,7 +4706,7 @@ def _emit_mma_pipeline(
                 f"    for _k in range({bk}):\n"
                 f"        _gk = {k_offset_var} + cutlass.Int32(_k)\n"
                 f"        {smem_a}[{m_local}, cutlass.Int32(_k)] = ("
-                f"{lhs_arg_name}[{m_global}, _gk] "
+                f"{_lhs_gmem_access(m_global, '_gk')} "
                 f"if {m_global} < cutlass.Int32({m_size}) "
                 f"and _gk < cutlass.Int32({k_total_size}) "
                 f"else {input_dtype_str}(0.0))"
@@ -4456,7 +4718,7 @@ def _emit_mma_pipeline(
                 f"    for _k in range({bk}):\n"
                 f"        _gk = {k_offset_var} + cutlass.Int32(_k)\n"
                 f"        {smem_b}[{n_local}, cutlass.Int32(_k)] = ("
-                f"{rhs_arg_name}[_gk, {n_global}] "
+                f"{_rhs_gmem_access('_gk', n_global)} "
                 f"if {n_global} < cutlass.Int32({n_size}) "
                 f"and _gk < cutlass.Int32({k_total_size}) "
                 f"else {input_dtype_str}(0.0))"
@@ -4553,7 +4815,7 @@ def _emit_mma_pipeline(
             f"            _gm = {m_offset_var} + _row\n"
             f"            _gk = {k_offset_var} + _col\n"
             f"            {smem_a_store} = ("
-            f"{lhs_arg_name}[_gm, _gk] "
+            f"{_lhs_gmem_access('_gm', '_gk')} "
             f"if _gm < cutlass.Int32({m_size}) "
             f"and _gk < cutlass.Int32({k_total_size}) "
             f"else {input_dtype_str}(0.0))"
@@ -4568,7 +4830,7 @@ def _emit_mma_pipeline(
             f"            _gn = {n_offset_var} + _row\n"
             f"            _gk = {k_offset_var} + _col\n"
             f"            {smem_b_store} = ("
-            f"{rhs_arg_name}[_gk, _gn] "
+            f"{_rhs_gmem_access('_gk', '_gn')} "
             f"if _gn < cutlass.Int32({n_size}) "
             f"and _gk < cutlass.Int32({k_total_size}) "
             f"else {input_dtype_str}(0.0))"
@@ -4607,8 +4869,8 @@ def _emit_mma_pipeline(
                 tma_warp=tma_warp,
                 tma_atom_a=tma_atom_a,
                 tma_atom_b=tma_atom_b,
-                tma_gA=tma_gA,
-                tma_gB=tma_gB,
+                tma_gA=tma_gA_copy,
+                tma_gB=tma_gB_copy,
                 tma_sA=tma_sA,
                 tma_sB=tma_sB,
                 tma_k_tile=tma_k_tile,

@@ -210,13 +210,19 @@ def _(
     return (mat1, mat2, acc, out_dtype)
 
 
-def enforce_dot_requirements(lhs: torch.Tensor, rhs: torch.Tensor) -> None:
+def enforce_dot_requirements(
+    lhs: torch.Tensor,
+    rhs: torch.Tensor,
+    *,
+    allow_batched_cute_tcgen05: bool = False,
+) -> None:
     """Update config-spec min/max sizes for a dot/matmul.
 
     This ensures the autotuner does not select block sizes below the hardware
     minimums for the current device and dtypes, and constrains the batch
     dimension block size to 1 for 3D operands since Triton does not support
-    3D dot operations.
+    3D dot operations. ``allow_batched_cute_tcgen05`` is used by recognized
+    aten.baddbmm nodes whose batch tile has the same block-size restriction.
     """
 
     # Last two dims are used for matmul
@@ -293,10 +299,14 @@ def enforce_dot_requirements(lhs: torch.Tensor, rhs: torch.Tensor) -> None:
     # block_k search granularity and minimum must follow the active dtype.
     is_fp8 = lhs.dtype == torch.float8_e4m3fn
     mma_k = 32 if is_fp8 else 16
+    cute_tcgen05_rank_supported = lhs.ndim == 2 and rhs.ndim == 2
+    if allow_batched_cute_tcgen05:
+        cute_tcgen05_rank_supported = cute_tcgen05_rank_supported or (
+            lhs.ndim == 3 and rhs.ndim == 3
+        )
     if (
         env.backend_name == "cute"
-        and lhs.ndim == 2
-        and rhs.ndim == 2
+        and cute_tcgen05_rank_supported
         and lhs.dtype in (torch.float16, torch.bfloat16, torch.float8_e4m3fn)
         and rhs.dtype == lhs.dtype
         and static_m is not None
