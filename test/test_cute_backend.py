@@ -4568,18 +4568,17 @@ class TestCuteBackend(TestCase):
         self.assertIn("CtaGroup.TWO", code)
 
     def test_batched_two_cta_partial_edge_tiles_rejected(self) -> None:
-        # A batched CtaGroup.TWO matmul with partial M/N/K output-edge tiles
-        # must be rejected loudly: the output-edge scheduler linearizes the
-        # virtual pid across the batch axis and would otherwise silently
-        # miscompute (only full tiles are validated for batched 2-CTA).
+        # A batched CtaGroup.TWO matmul with ANY partial tile -- M edge, N
+        # edge, OR a K tail -- must be rejected loudly: the output-edge
+        # scheduler linearizes the virtual pid across the batch axis and the
+        # K-tail reduction is batch-unaware, so both would silently miscompute
+        # (only static full tiles are validated for batched 2-CTA). Each
+        # (M, K) x (K, N) below makes exactly one axis partial vs the
+        # 256x256x64 blocks (plus the combined case).
         support = get_cute_mma_support()
         if not support.tcgen05_f16bf16:
             self.skipTest("tcgen05 F16/BF16 MMA is not supported on this machine")
 
-        args = (
-            torch.randn(2, 300, 100, device=DEVICE, dtype=HALF_DTYPE),
-            torch.randn(2, 100, 300, device=DEVICE, dtype=HALF_DTYPE),
-        )
         config = helion.Config(
             block_sizes=[1, 256, 256, 64],
             tcgen05_cluster_m=2,
@@ -4590,10 +4589,27 @@ class TestCuteBackend(TestCase):
             tcgen05_acc_stages=2,
             tcgen05_c_stages=2,
         )
-        with patch.dict(os.environ, {"HELION_CUTE_MMA_IMPL": "tcgen05"}, clear=False):
-            bound = cute_batched_baddbmm_tcgen05.bind(args)
-            with self.assertRaises(helion.exc.BackendUnsupported):
-                bound.to_triton_code(config)
+        # (M, N, K): M-edge, N-edge, K-tail (M/N full), double-edge + K-tail.
+        partial_shapes = [
+            (300, 256, 128),
+            (256, 300, 128),
+            (256, 256, 100),
+            (300, 300, 100),
+        ]
+        for m, n, k in partial_shapes:
+            args = (
+                torch.randn(2, m, k, device=DEVICE, dtype=HALF_DTYPE),
+                torch.randn(2, k, n, device=DEVICE, dtype=HALF_DTYPE),
+            )
+            with patch.dict(
+                os.environ, {"HELION_CUTE_MMA_IMPL": "tcgen05"}, clear=False
+            ):
+                bound = cute_batched_baddbmm_tcgen05.bind(args)
+                with self.assertRaises(
+                    helion.exc.BackendUnsupported,
+                    msg=f"batched 2-CTA partial M={m} N={n} K={k} not rejected",
+                ):
+                    bound.to_triton_code(config)
 
     def test_matmul_mma_tcgen05_128x8_uses_full_cta_barrier(self) -> None:
         support = get_cute_mma_support()

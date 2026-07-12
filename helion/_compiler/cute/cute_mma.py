@@ -2315,21 +2315,34 @@ def _emit_mma_pipeline(
         and n_size % bn != 0
         and k_total_size % bk == 0
     )
-    if analysis.has_batch and (
-        tcgen05_m_edge_only or tcgen05_n_edge_only or tcgen05_double_edge_tma
-    ):
-        # The CtaGroup.TWO output-edge scheduler linearizes the virtual pid
-        # over M/N only; a leading batch axis makes the full/edge tile
-        # predicate (``_tcgen05_output_full_tile_expr_for_work_tile``)
-        # misclassify partial tiles and silently miscompute. Batched 2-CTA is
-        # validated only for static full tiles. Autotune already excludes this
-        # (see ``allow_edge_cluster_m2_search``); this rejects a hand-forced
-        # batched edge config loudly instead of returning wrong output.
+    tcgen05_two_cta_batched_partial = (
+        analysis.has_batch
+        and mma_impl == "tcgen05"
+        and tcgen05_use_tma_pipeline
+        and tcgen05_pid_is_persistent
+        and tcgen05_cluster_m == 2
+        and tcgen05_cluster_n_requested == 1
+        and tcgen05_requested_two_cta
+        and (
+            m_size % bm != 0 or n_size % bn != 0 or k_total_size % bk != 0
+        )
+    )
+    if tcgen05_two_cta_batched_partial:
+        # Batched CtaGroup.TWO is validated only for static full tiles. Any
+        # partial tile -- M edge, N edge, OR a K tail -- is unsafe: the
+        # output-edge scheduler linearizes the virtual pid over M/N only, so a
+        # leading batch axis makes the full/edge predicate
+        # (``_tcgen05_output_full_tile_expr_for_work_tile``) misclassify tiles,
+        # and the K-tail reduction is likewise batch-unaware, silently
+        # miscomputing. Autotune already excludes batched edge 2-CTA (see
+        # ``allow_edge_cluster_m2_search``); this rejects a hand-forced batched
+        # partial config loudly instead of returning wrong output.
         raise exc.BackendUnsupported(
             "cute",
             "batched (leading-passthrough) CtaGroup.TWO tcgen05 matmul does "
-            "not support partial M/N/K output-edge tiles; pad M/N/K to the "
-            "block sizes (static full tiles) or use tcgen05_cluster_m=1.",
+            "not support partial M/N/K tiles (M/N output edges or a K tail); "
+            "pad M/N/K to the block sizes (static full tiles) or use "
+            "tcgen05_cluster_m=1.",
         )
     if (
         mma_impl == "tcgen05"
