@@ -463,8 +463,9 @@ _MMA_SUPPORTED_DTYPES = {
 @dataclass(frozen=True)
 class _MmaOperandInfo:
     # ``matrix_rows``/``matrix_cols`` are the trailing two (matmul) axes of the
-    # operand. ``batch_block_id`` is a *leading passthrough* grid axis that only
-    # offsets memory (the common case is a batch dim). It is derived from the
+    # operand. ``leading_passthrough_block_id`` is a *leading passthrough* grid
+    # axis that only offsets memory (the common case is a batch dim). It is
+    # derived from the
     # load subscript structure -- not from op identity (mm/bmm/baddbmm/dot all
     # route here) -- so the codegen is a general "matmul + leading grid axis",
     # not a bmm special case. At most one leading axis is supported today; the
@@ -473,20 +474,68 @@ class _MmaOperandInfo:
     source_fake: torch.Tensor
     matrix_rows: object
     matrix_cols: object
-    batched: bool
-    batch_block_id: int | None = None
+    is_leading_passthrough: bool
+    leading_passthrough_block_id: int | None = None
 
 
 @dataclass(frozen=True)
 class _MmaOperandAnalysis:
     lhs: _MmaOperandInfo
     rhs: _MmaOperandInfo
-    batch_block_id: int | None
+    leading_passthrough_block_id: int | None
 
     @property
-    def has_batch(self) -> bool:
+    def has_leading_passthrough(self) -> bool:
         """True when the matmul carries a leading passthrough grid axis."""
-        return self.batch_block_id is not None
+        return self.leading_passthrough_block_id is not None
+
+
+@dataclass(frozen=True)
+class Tcgen05MatmulEnvelope:
+    """Resolved feature set of a tcgen05 matmul config, for support validation.
+
+    Single source of truth for "is this tcgen05 combination supported?" --
+    consumed by both autotune gating (``enforce_dot_requirements``) and codegen
+    (``_emit_mma_pipeline``). Add new unsupported combinations to
+    :func:`tcgen05_unsupported_reason` rather than as scattered inline
+    predicates; that is what let the batched-partial support hole reappear
+    across several review rounds.
+    """
+
+    has_leading_passthrough: bool
+    cta_group: int  # 1 (CtaGroup.ONE) or 2 (CtaGroup.TWO)
+    partial_axes: frozenset[str]  # subset of {"m", "n", "k"} that are not full
+    cluster_n: int = 1
+    persistent: bool = True
+    uses_tma_ab_pipeline: bool = True
+    k_tile_count: int = 0
+
+
+def tcgen05_unsupported_reason(env: Tcgen05MatmulEnvelope) -> str | None:
+    """Return a reason string if ``env`` is an unsupported tcgen05 combination.
+
+    Returns ``None`` when supported. This is the single place that encodes
+    tcgen05 matmul support constraints.
+    """
+    # Batched (leading-passthrough) CtaGroup.TWO is validated only for static
+    # full tiles: the output-edge scheduler linearizes the virtual pid over
+    # M/N only (so a leading batch axis misclassifies partial tiles) and the
+    # K-tail reduction is batch-unaware -- either silently miscomputes. This is
+    # deliberately TMA-independent so no fallback layout can slip past.
+    if (
+        env.has_leading_passthrough
+        and env.cta_group == 2
+        and env.cluster_n == 1
+        and env.persistent
+        and env.partial_axes
+    ):
+        axes = "/".join(ax.upper() for ax in ("m", "n", "k") if ax in env.partial_axes)
+        return (
+            "batched (leading-passthrough) CtaGroup.TWO tcgen05 matmul does "
+            f"not support partial {axes} tiles; pad M/N/K to the block sizes "
+            "(static full tiles) or use tcgen05_cluster_m=1."
+        )
+    return None
 
 
 def _analyze_mma_operand(
@@ -510,7 +559,7 @@ def _analyze_mma_operand(
             source_fake=source_fake,
             matrix_rows=source_fake.shape[0],
             matrix_cols=source_fake.shape[1],
-            batched=False,
+            is_leading_passthrough=False,
         )
     if source_fake.ndim != 3:
         return None
@@ -519,23 +568,25 @@ def _analyze_mma_operand(
     subscript = load_node.args[1] if len(load_node.args) > 1 else None
     if not isinstance(subscript, (list, tuple)) or len(subscript) != 3:
         return None
-    batch_block_id = env.get_block_id(subscript[0])
-    if batch_block_id is None and value_fake.ndim == 3:
-        batch_block_id = env.resolve_block_id(value_fake.shape[0])
-    if batch_block_id is None:
+    leading_passthrough_block_id = env.get_block_id(subscript[0])
+    if leading_passthrough_block_id is None and value_fake.ndim == 3:
+        leading_passthrough_block_id = env.resolve_block_id(value_fake.shape[0])
+    if leading_passthrough_block_id is None:
         return None
     batch_size = source_fake.shape[0]
     if not isinstance(batch_size, (int, torch.SymInt)):
         return None
-    if not env.known_equal(env.block_sizes[batch_block_id].size, batch_size):
+    if not env.known_equal(
+        env.block_sizes[leading_passthrough_block_id].size, batch_size
+    ):
         return None
     return _MmaOperandInfo(
         load=load_node,
         source_fake=source_fake,
         matrix_rows=source_fake.shape[1],
         matrix_cols=source_fake.shape[2],
-        batched=True,
-        batch_block_id=batch_block_id,
+        is_leading_passthrough=True,
+        leading_passthrough_block_id=leading_passthrough_block_id,
     )
 
 
@@ -553,14 +604,18 @@ def _analyze_mma_operands(
     if not env.known_equal(lhs.matrix_cols, rhs.matrix_rows):
         return None
     batch_block_ids = {
-        operand.batch_block_id
+        operand.leading_passthrough_block_id
         for operand in (lhs, rhs)
-        if operand.batch_block_id is not None
+        if operand.leading_passthrough_block_id is not None
     }
     if len(batch_block_ids) > 1:
         return None
-    batch_block_id = next(iter(batch_block_ids)) if batch_block_ids else None
-    return _MmaOperandAnalysis(lhs=lhs, rhs=rhs, batch_block_id=batch_block_id)
+    leading_passthrough_block_id = (
+        next(iter(batch_block_ids)) if batch_block_ids else None
+    )
+    return _MmaOperandAnalysis(
+        lhs=lhs, rhs=rhs, leading_passthrough_block_id=leading_passthrough_block_id
+    )
 
 
 def _acc_rank_is_mma_compatible(
@@ -569,7 +624,7 @@ def _acc_rank_is_mma_compatible(
 ) -> bool:
     if acc_val.ndim == 2:
         return True
-    return acc_val.ndim == 3 and analysis.has_batch
+    return acc_val.ndim == 3 and analysis.has_leading_passthrough
 
 
 def _has_mma_operands(lhs_node: Node, rhs_node: Node) -> bool:
@@ -1091,8 +1146,9 @@ def prepare_cute_collective_lane_loop_suppression(
         analysis = _analyze_mma_operands(lhs_node, rhs_node, env)
         if analysis is None:
             continue
-        if analysis.batch_block_id is not None and (
-            cg.device_function.resolved_block_size(analysis.batch_block_id) != 1
+        _lp_block_id = analysis.leading_passthrough_block_id
+        if _lp_block_id is not None and (
+            cg.device_function.resolved_block_size(_lp_block_id) != 1
         ):
             continue
         lhs_operand = analysis.lhs
@@ -1129,7 +1185,7 @@ def prepare_cute_collective_lane_loop_suppression(
             candidate_block_ids.append(k_block_id)
             bk = int(k_block_size)
         for bid in dict.fromkeys(candidate_block_ids):
-            if bid == analysis.batch_block_id:
+            if bid == analysis.leading_passthrough_block_id:
                 continue
             size = env.block_sizes[bid].size
             bs = cg.device_function.resolved_block_size(bid)
@@ -1171,7 +1227,9 @@ def prepare_cute_collective_lane_loop_suppression(
         # must exactly match the ``_emit_mma_pipeline`` guard); a non-batched
         # config with device-loop lane loops takes the scalar fallback.
         allowed_k_lane_loops: tuple[DeviceLoopState, ...] = (
-            (k_loop_info[0],) if analysis.batch_block_id is not None else ()
+            (k_loop_info[0],)
+            if analysis.leading_passthrough_block_id is not None
+            else ()
         )
         if _has_non_root_lane_loops(cg, allowed_loop_states=allowed_k_lane_loops):
             continue
@@ -2023,8 +2081,12 @@ def _emit_mma_pipeline(
         torch.bfloat16,
         torch.float8_e4m3fn,
     )
-    _lhs_major = _tcgen05_tma_2d_major(lhs_fake, 1 if lhs_operand.batched else 0)
-    _rhs_major = _tcgen05_tma_2d_major(rhs_fake, 1 if rhs_operand.batched else 0)
+    _lhs_major = _tcgen05_tma_2d_major(
+        lhs_fake, 1 if lhs_operand.is_leading_passthrough else 0
+    )
+    _rhs_major = _tcgen05_tma_2d_major(
+        rhs_fake, 1 if rhs_operand.is_leading_passthrough else 0
+    )
     # A must be row-major (M,K) K-contiguous == "row"; the K-major A SMEM
     # layout Helion emits expects the standard row-major A. Only B's major
     # mode is made layout-aware here.
@@ -2061,7 +2123,7 @@ def _emit_mma_pipeline(
     # (tiny tiles, unit-M, threads < block on M/N) that must fall back to
     # the scalar path rather than miscompile into a warp ``cute.gemm``.
     allowed_k_lane_loops: tuple[DeviceLoopState, ...] = (
-        (device_loop,) if analysis.batch_block_id is not None else ()
+        (device_loop,) if analysis.leading_passthrough_block_id is not None else ()
     )
     if _has_non_root_lane_loops(cg, allowed_loop_states=allowed_k_lane_loops):
         return None
@@ -2076,7 +2138,8 @@ def _emit_mma_pipeline(
     bn: int | None = None
     grid_state = cg.current_grid_state
     if grid_state is not None:
-        if analysis.batch_block_id is None and len(grid_state.block_ids) == 2:
+        lp_block_id = analysis.leading_passthrough_block_id
+        if lp_block_id is None and len(grid_state.block_ids) == 2:
             m_block_id, n_block_id = grid_state.block_ids
             m_offset_var = grid_state.strategy.offset_var(m_block_id)
             n_offset_var = grid_state.strategy.offset_var(n_block_id)
@@ -2090,9 +2153,9 @@ def _emit_mma_pipeline(
             # the extent match to those two (mirrors
             # ``_specialized_mma_root_mn_block_ids``) so a leading passthrough
             # axis whose full extent happens to equal M or N can never be
-            # mis-selected as a matrix axis -- which, when
-            # ``analysis.batch_block_id`` is unset (2-D operands under a 3-axis
-            # grid), would otherwise pick the wrong offset/block and miscompile.
+            # mis-selected as a matrix axis -- which, when the leading
+            # passthrough block id is unset (2-D operands under a 3-axis grid),
+            # would otherwise pick the wrong offset/block and miscompile.
             for bid in grid_state.block_ids[-2:]:
                 offset = grid_state.strategy.offset_var(bid)
                 bs_info = env.block_sizes[bid]
@@ -2126,12 +2189,13 @@ def _emit_mma_pipeline(
     m_index_var = cg.index_var(m_block_id)
     n_index_var = cg.index_var(n_block_id)
     batch_index_var: str | None = None
-    if analysis.batch_block_id is not None:
-        if grid_state is None or analysis.batch_block_id not in grid_state.block_ids:
+    lp_block_id = analysis.leading_passthrough_block_id
+    if lp_block_id is not None:
+        if grid_state is None or lp_block_id not in grid_state.block_ids:
             return None
-        if df.resolved_block_size(analysis.batch_block_id) != 1:
+        if df.resolved_block_size(lp_block_id) != 1:
             return None
-        batch_index_var = cg.index_var(analysis.batch_block_id)
+        batch_index_var = cg.index_var(lp_block_id)
     # Use thread_idx directly for local indices within the tile.
     # indices_0 - offset_0 SHOULD equal thread_idx[0], but the CuTe DSL
     # compiler may not simplify the subtraction, leading to illegal memory
@@ -2157,13 +2221,13 @@ def _emit_mma_pipeline(
     n_size = int(rhs_n_size)
 
     def _lhs_gmem_access(m_expr: str, k_expr: str) -> str:
-        if lhs_operand.batched:
+        if lhs_operand.is_leading_passthrough:
             assert batch_global is not None
             return f"{lhs_arg_name}[{batch_global}, {m_expr}, {k_expr}]"
         return f"{lhs_arg_name}[{m_expr}, {k_expr}]"
 
     def _rhs_gmem_access(k_expr: str, n_expr: str) -> str:
-        if rhs_operand.batched:
+        if rhs_operand.is_leading_passthrough:
             assert batch_global is not None
             return f"{rhs_arg_name}[{batch_global}, {k_expr}, {n_expr}]"
         return f"{rhs_arg_name}[{k_expr}, {n_expr}]"
@@ -2232,7 +2296,7 @@ def _emit_mma_pipeline(
     # (4-CTA) multicast does NOT yet compose with batch (produces wrong results),
     # so keep it on the scalar fallback for batched kernels.
     if (
-        analysis.has_batch
+        analysis.has_leading_passthrough
         and mma_impl == "tcgen05"
         and tcgen05_cluster_n_requested != 1
     ):
@@ -2315,37 +2379,36 @@ def _emit_mma_pipeline(
         and n_size % bn != 0
         and k_total_size % bk == 0
     )
-    tcgen05_two_cta_batched_partial = (
-        analysis.has_batch
-        and mma_impl == "tcgen05"
-        and tcgen05_pid_is_persistent
-        and tcgen05_cluster_m == 2
-        and tcgen05_cluster_n_requested == 1
-        and tcgen05_requested_two_cta
-        and (
-            m_size % bm != 0 or n_size % bn != 0 or k_total_size % bk != 0
+    if mma_impl == "tcgen05":
+        # Validate the resolved config against the single support contract
+        # (see ``tcgen05_unsupported_reason``) rather than an inline predicate,
+        # so autotune gating and codegen stay in lockstep. Autotune already
+        # excludes batched edge 2-CTA from the search
+        # (``allow_edge_cluster_m2_search``); this rejects a hand-forced
+        # unsupported config loudly instead of returning wrong output.
+        _reason = tcgen05_unsupported_reason(
+            Tcgen05MatmulEnvelope(
+                has_leading_passthrough=analysis.has_leading_passthrough,
+                cta_group=2
+                if (tcgen05_cluster_m == 2 and tcgen05_requested_two_cta)
+                else 1,
+                partial_axes=frozenset(
+                    axis
+                    for axis, is_partial in (
+                        ("m", m_size % bm != 0),
+                        ("n", n_size % bn != 0),
+                        ("k", k_total_size % bk != 0),
+                    )
+                    if is_partial
+                ),
+                cluster_n=tcgen05_cluster_n_requested,
+                persistent=tcgen05_pid_is_persistent,
+                uses_tma_ab_pipeline=tcgen05_use_tma_pipeline,
+                k_tile_count=(k_total_size + bk - 1) // bk,
+            )
         )
-    )
-    if tcgen05_two_cta_batched_partial:
-        # Batched CtaGroup.TWO is validated only for static full tiles. Any
-        # partial tile -- M edge, N edge, OR a K tail -- is unsafe: the
-        # output-edge scheduler linearizes the virtual pid over M/N only, so a
-        # leading batch axis makes the full/edge predicate
-        # (``_tcgen05_output_full_tile_expr_for_work_tile``) misclassify tiles,
-        # and the K-tail reduction is likewise batch-unaware, silently
-        # miscomputing. This is deliberately TMA-independent: it must fire for
-        # every batched 2-CTA partial config, not only the TMA-pipeline path,
-        # so a non-TMA-eligible layout cannot slip past into a fallback the
-        # generic host guard does not cover. Autotune already excludes batched
-        # edge 2-CTA (see ``allow_edge_cluster_m2_search``); this rejects a
-        # hand-forced batched partial config loudly instead of wrong output.
-        raise exc.BackendUnsupported(
-            "cute",
-            "batched (leading-passthrough) CtaGroup.TWO tcgen05 matmul does "
-            "not support partial M/N/K tiles (M/N output edges or a K tail); "
-            "pad M/N/K to the block sizes (static full tiles) or use "
-            "tcgen05_cluster_m=1.",
-        )
+        if _reason is not None:
+            raise exc.BackendUnsupported("cute", _reason)
     if (
         mma_impl == "tcgen05"
         and not tcgen05_static_full_tiles
@@ -3000,7 +3063,7 @@ def _emit_mma_pipeline(
         try:
             tcgen05_warp_spec = warp_spec_from_config(df.config)
         except KeyError:
-            if not analysis.has_batch:
+            if not analysis.has_leading_passthrough:
                 raise
             tcgen05_warp_spec = warp_spec_from_config(
                 {
@@ -4262,9 +4325,9 @@ def _emit_mma_pipeline(
             # to the golden.
             if tcgen05_b_k_major:
                 ab_tma_plan["b_k_major"] = True
-            if lhs_operand.batched:
+            if lhs_operand.is_leading_passthrough:
                 ab_tma_plan["lhs_batched"] = True
-            if rhs_operand.batched:
+            if rhs_operand.is_leading_passthrough:
                 ab_tma_plan["rhs_batched"] = True
             # ``smem_swizzle_*`` overrides are recorded only when codegen
             # selected an explicit SMEM atom kind (either from a user
@@ -4353,7 +4416,7 @@ def _emit_mma_pipeline(
             # downstream partitions and tma_partition outputs all inherit
             # that per-tile dependency, so all of these stay inside the
             # work-tile body when the persistent loop splitter runs.
-            if lhs_operand.batched:
+            if lhs_operand.is_leading_passthrough:
                 assert batch_global is not None
                 gmem_a_tma_tiler = f"({bm}, {bk}, 1)"
                 gmem_a_tma_coord = (
@@ -4364,7 +4427,7 @@ def _emit_mma_pipeline(
                 gmem_a_tma_coord = (
                     f"({m_offset_var} // cutlass.Int32({bm}), None)"
                 )
-            if rhs_operand.batched:
+            if rhs_operand.is_leading_passthrough:
                 assert batch_global is not None
                 gmem_b_tma_tiler = f"({bn}, {bk}, 1)"
                 gmem_b_tma_coord = (

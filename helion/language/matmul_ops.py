@@ -309,7 +309,7 @@ def enforce_dot_requirements(
         # Batched tcgen05 accepts a single shared batch axis: both operands 3-D
         # (bmm/baddbmm) OR one 3-D and one 2-D (shared-weight dot, e.g.
         # [B, M, K] @ [K, N]). _analyze_mma_operands models the mixed-rank case
-        # via a single batch_block_id.
+        # via a single leading_passthrough_block_id.
         cute_tcgen05_rank_supported = cute_tcgen05_rank_supported or (
             lhs.ndim in (2, 3)
             and rhs.ndim in (2, 3)
@@ -385,15 +385,26 @@ def enforce_dot_requirements(
             # CtaGroup.TWO family: 256x256x128, persistent_interleaved.
             # Smaller edge-heavy shapes continue using the established flat
             # SIMT-edge fallback.
+            # Batched (leading-passthrough) 2-CTA is validated only for static
+            # full tiles, so keep batched off the edge 2-CTA search. Decide via
+            # the same support contract codegen uses (single source of truth):
+            # an edge 2-CTA config has partial M/N/K, so it is unsupported iff
+            # the matmul is batched.
+            from .._compiler.cute.cute_mma import Tcgen05MatmulEnvelope
+            from .._compiler.cute.cute_mma import tcgen05_unsupported_reason
+
+            edge_cluster_m2_supported = (
+                tcgen05_unsupported_reason(
+                    Tcgen05MatmulEnvelope(
+                        has_leading_passthrough=allow_batched_cute_tcgen05,
+                        cta_group=2,
+                        partial_axes=frozenset({"m", "n", "k"}),
+                    )
+                )
+                is None
+            )
             allow_edge_cluster_m2_search = (
-                # Batched (leading-passthrough) 2-CTA is validated only for
-                # static full tiles: the output-edge scheduler's full/edge
-                # predicate linearizes the virtual pid across the batch axis
-                # (see _tcgen05_output_full_tile_expr_for_work_tile) and
-                # miscomputes for a [B, M, N] grid. Keep batched off the edge
-                # 2-CTA search so autotune never picks it (a forced batched edge
-                # config is rejected loudly in cute_mma.py).
-                not allow_batched_cute_tcgen05
+                edge_cluster_m2_supported
                 and not allow_full_tile_persistent_pid_types
                 and max_tcgen05_m >= TCGEN05_TWO_CTA_BLOCK_M
                 and max_tcgen05_n >= TCGEN05_TWO_CTA_BLOCK_N
