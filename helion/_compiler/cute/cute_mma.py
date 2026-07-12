@@ -100,6 +100,8 @@ from .tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_N
 from .tcgen05_constants import TCGEN05_TWO_CTA_EDGE_TMA_STORE_MAX_AB_STAGES
 from .tcgen05_lifecycle import Tcgen05LifecycleContext
 from .tcgen05_pure_matmul import Tcgen05PureMatmulObjectModel
+from .tcgen05_support import Tcgen05MatmulEnvelope
+from .tcgen05_support import tcgen05_unsupported_reason
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
@@ -488,54 +490,6 @@ class _MmaOperandAnalysis:
     def has_leading_passthrough(self) -> bool:
         """True when the matmul carries a leading passthrough grid axis."""
         return self.leading_passthrough_block_id is not None
-
-
-@dataclass(frozen=True)
-class Tcgen05MatmulEnvelope:
-    """Resolved feature set of a tcgen05 matmul config, for support validation.
-
-    Single source of truth for "is this tcgen05 combination supported?" --
-    consumed by both autotune gating (``enforce_dot_requirements``) and codegen
-    (``_emit_mma_pipeline``). Add new unsupported combinations to
-    :func:`tcgen05_unsupported_reason` rather than as scattered inline
-    predicates; that is what let the batched-partial support hole reappear
-    across several review rounds.
-    """
-
-    has_leading_passthrough: bool
-    cta_group: int  # 1 (CtaGroup.ONE) or 2 (CtaGroup.TWO)
-    partial_axes: frozenset[str]  # subset of {"m", "n", "k"} that are not full
-    cluster_n: int = 1
-    persistent: bool = True
-    uses_tma_ab_pipeline: bool = True
-    k_tile_count: int = 0
-
-
-def tcgen05_unsupported_reason(env: Tcgen05MatmulEnvelope) -> str | None:
-    """Return a reason string if ``env`` is an unsupported tcgen05 combination.
-
-    Returns ``None`` when supported. This is the single place that encodes
-    tcgen05 matmul support constraints.
-    """
-    # Batched (leading-passthrough) CtaGroup.TWO is validated only for static
-    # full tiles: the output-edge scheduler linearizes the virtual pid over
-    # M/N only (so a leading batch axis misclassifies partial tiles) and the
-    # K-tail reduction is batch-unaware -- either silently miscomputes. This is
-    # deliberately TMA-independent so no fallback layout can slip past.
-    if (
-        env.has_leading_passthrough
-        and env.cta_group == 2
-        and env.cluster_n == 1
-        and env.persistent
-        and env.partial_axes
-    ):
-        axes = "/".join(ax.upper() for ax in ("m", "n", "k") if ax in env.partial_axes)
-        return (
-            "batched (leading-passthrough) CtaGroup.TWO tcgen05 matmul does "
-            f"not support partial {axes} tiles; pad M/N/K to the block sizes "
-            "(static full tiles) or use tcgen05_cluster_m=1."
-        )
-    return None
 
 
 def _analyze_mma_operand(
@@ -2403,8 +2357,6 @@ def _emit_mma_pipeline(
                 ),
                 cluster_n=tcgen05_cluster_n_requested,
                 persistent=tcgen05_pid_is_persistent,
-                uses_tma_ab_pipeline=tcgen05_use_tma_pipeline,
-                k_tile_count=(k_total_size + bk - 1) // bk,
             )
         )
         if _reason is not None:
