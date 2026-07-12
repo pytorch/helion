@@ -1,10 +1,16 @@
-"""Single source of truth for tcgen05 matmul support constraints.
+"""Shared tcgen05 matmul support checks that config-shaping and codegen agree on.
 
-Intentionally dependency-free (only ``dataclasses``) so both the config-shaping
-side (``helion.language.matmul_ops.enforce_dot_requirements``) and the codegen
-side (``helion._compiler.cute.cute_mma._emit_mma_pipeline``) can import it at
-module level without crossing into the heavy CuTe codegen module or forming an
-import cycle (``cute_mma -> aux_tensor -> matmul_ops``).
+This is NOT the home for every tcgen05 support decision -- most remain inline in
+``cute_mma.py``. It holds only the checks that the autotune gate
+(``helion.language.matmul_ops.enforce_dot_requirements``) and codegen
+(``helion._compiler.cute.cute_mma._emit_mma_pipeline``) must apply *identically*
+(a mismatch silently miscompiles). Today that is the single rule in
+:func:`tcgen05_unsupported_reason` -- leading-passthrough (batched) CtaGroup.TWO
+partial tiles. Move a constraint here only when both sides need to share it.
+
+Intentionally dependency-free (only ``dataclasses``) so both sides can import it
+at module level without crossing into the heavy CuTe codegen module or forming
+an import cycle (``cute_mma -> aux_tensor -> matmul_ops``).
 """
 
 from __future__ import annotations
@@ -21,8 +27,8 @@ class Tcgen05MatmulEnvelope:
     of them with values accurate for their context (codegen from the resolved
     config, autotune from the candidate search config). Add a field only
     together with the rule that needs it, and update both call sites -- that is
-    what keeps this a genuine single source of truth rather than two predicates
-    that can drift apart.
+    what keeps the shared rule defined once instead of as two predicates that
+    can drift apart.
     """
 
     has_leading_passthrough: bool

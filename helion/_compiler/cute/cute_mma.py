@@ -466,12 +466,11 @@ _MMA_SUPPORTED_DTYPES = {
 class _MmaOperandInfo:
     # ``matrix_rows``/``matrix_cols`` are the trailing two (matmul) axes of the
     # operand. ``leading_passthrough_block_id`` is a *leading passthrough* grid
-    # axis that only offsets memory (the common case is a batch dim). It is
-    # derived from the
-    # load subscript structure -- not from op identity (mm/bmm/baddbmm/dot all
-    # route here) -- so the codegen is a general "matmul + leading grid axis",
-    # not a bmm special case. At most one leading axis is supported today; the
-    # generalization to N leading axes is tracked in BMM_2CTA_FINDINGS.md.
+    # axis that only offsets memory (the common case is a batch dim), derived
+    # from the load subscript structure -- not from op identity (mm/bmm/baddbmm/
+    # dot all route here) -- so the codegen is a general "matmul + leading grid
+    # axis", not a bmm special case. At most one leading axis is supported today
+    # (N leading axes is a possible future generalization).
     load: Node
     source_fake: torch.Tensor
     matrix_rows: object
