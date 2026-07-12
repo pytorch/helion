@@ -96,6 +96,7 @@ from .tcgen05_constants import TCGEN05_SCHED_STAGE_COUNT_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_M
 from .tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_N
 from .tcgen05_constants import TCGEN05_TWO_CTA_EDGE_TMA_STORE_MAX_AB_STAGES
+from .tcgen05_constants import tcgen05_static_shape_eligible
 from .tcgen05_lifecycle import Tcgen05LifecycleContext
 from .tcgen05_pure_matmul import Tcgen05PureMatmulObjectModel
 
@@ -979,9 +980,17 @@ def prepare_cute_collective_lane_loop_suppression(
                     bk = int(bs)
         if bm is None or bn is None or bk is None:
             continue
+        static_m, static_n, static_k = _static_mma_shape(lhs_fake, rhs_fake)
         if (
             _choose_mma_impl(
-                lhs_fake.dtype, bm=bm, bn=bn, bk=bk, config=cg.device_function.config
+                lhs_fake.dtype,
+                bm=bm,
+                bn=bn,
+                bk=bk,
+                static_m=static_m,
+                static_n=static_n,
+                static_k=static_k,
+                config=cg.device_function.config,
             )
             != "tcgen05"
         ):
@@ -1976,7 +1985,16 @@ def _emit_mma_pipeline(
             f"pid_type={TCGEN05_LARGE_BN_PROOF_PID_TYPE!r}",
         )
 
-    mma_impl = _choose_mma_impl(input_dtype, bm=bm, bn=bn, bk=bk, config=df.config)
+    mma_impl = _choose_mma_impl(
+        input_dtype,
+        bm=bm,
+        bn=bn,
+        bk=bk,
+        static_m=m_size,
+        static_n=n_size,
+        static_k=k_total_size,
+        config=df.config,
+    )
     zero_acc_expr = acc_expr is not None and _is_zero_acc_expr(acc_expr)
     if (
         not zero_acc_expr
@@ -5270,6 +5288,35 @@ def _tcgen05_epi_warp_count(
     return min(cta_warp_count, max(1, warp_spec.epi_warps))
 
 
+def _static_mma_dim(dim: object) -> int | None:
+    """Return a shape dim as a concrete int, or None for a dynamic (symbolic) one.
+
+    A ``None`` extent means a dynamic shape and leaves tcgen05 eligible (the
+    config-spec resolves a size hint in that case), matching
+    ``tcgen05_static_shape_eligible``.
+    """
+    return dim if isinstance(dim, int) else None
+
+
+def _static_mma_shape(
+    lhs_fake: torch.Tensor, rhs_fake: torch.Tensor
+) -> tuple[int | None, int | None, int | None]:
+    """Static (real problem) M, N, K of a matmul, each None if dynamic.
+
+    Used to gate tcgen05 MMA-impl selection on the same static extents the
+    autotune config-spec uses to register the ``tcgen05_*`` keys (so the two
+    can never diverge). Indexes from the trailing dims so batched operands
+    (baddbmm ``[B, M, K]`` / ``[B, K, N]``) resolve the same way as plain 2D:
+    M = LHS ``[-2]``, K = LHS ``[-1]``, N = RHS ``[-1]``.
+    """
+    if lhs_fake.ndim < 2 or rhs_fake.ndim < 2:
+        return None, None, None
+    static_m = _static_mma_dim(lhs_fake.shape[-2])
+    static_k = _static_mma_dim(lhs_fake.shape[-1])
+    static_n = _static_mma_dim(rhs_fake.shape[-1])
+    return static_m, static_n, static_k
+
+
 def _mma_impl_matches_problem_shape(
     mma_impl: str,
     input_dtype: torch.dtype,
@@ -5277,11 +5324,27 @@ def _mma_impl_matches_problem_shape(
     bm: int,
     bn: int,
     bk: int,
+    static_m: int | None = None,
+    static_n: int | None = None,
+    static_k: int | None = None,
     tcgen05_cluster_m: int = 1,
     tcgen05_large_bn_proof: bool = False,
 ) -> bool:
     if mma_impl == "universal":
         return True
+    # The autotune config-spec only registers the ``tcgen05_*`` config keys for
+    # static (real problem) shapes that pass ``tcgen05_static_shape_eligible``
+    # (see ``matmul_ops.py`` eligibility gate). ``block_m``/``block_n`` can
+    # legally exceed the static M/N for tiny GEMMs (e.g. M=16/32 with
+    # block_m=128), so selecting tcgen05 on block size alone would commit
+    # codegen to a path whose config keys were never registered -> hard
+    # ``KeyError`` in ``_emit_mma_pipeline``. Gate tcgen05 on the same shared
+    # predicate so codegen and config-spec can never diverge; below it, fall
+    # back to warp/universal.
+    if mma_impl == "tcgen05" and not tcgen05_static_shape_eligible(
+        input_dtype, static_m=static_m, static_n=static_n, static_k=static_k
+    ):
+        return False
     is_fp8 = input_dtype == torch.float8_e4m3fn
     if (
         input_dtype not in (torch.float16, torch.bfloat16, torch.float8_e4m3fn)
@@ -5344,6 +5407,9 @@ def _choose_mma_impl(
     bm: int,
     bn: int,
     bk: int,
+    static_m: int | None = None,
+    static_n: int | None = None,
+    static_k: int | None = None,
     config: object | None = None,
 ) -> str:
     tcgen05_cluster_m = 1
@@ -5367,6 +5433,9 @@ def _choose_mma_impl(
             bm=bm,
             bn=bn,
             bk=bk,
+            static_m=static_m,
+            static_n=static_n,
+            static_k=static_k,
             tcgen05_cluster_m=tcgen05_cluster_m,
             tcgen05_large_bn_proof=tcgen05_large_bn_proof,
         ):
@@ -5378,6 +5447,9 @@ def _choose_mma_impl(
         bm=bm,
         bn=bn,
         bk=bk,
+        static_m=static_m,
+        static_n=static_n,
+        static_k=static_k,
         tcgen05_cluster_m=tcgen05_cluster_m,
         tcgen05_large_bn_proof=tcgen05_large_bn_proof,
     ):
@@ -6218,11 +6290,15 @@ def codegen_cute_mma_direct_mm(
     if load_plan is None:
         return None
 
+    static_m, static_n, static_k = _static_mma_shape(lhs_fake, rhs_fake)
     mma_impl = _choose_mma_impl(
         lhs_fake.dtype,
         bm=plan.bm,
         bn=plan.bn,
         bk=plan.bk,
+        static_m=static_m,
+        static_n=static_n,
+        static_k=static_k,
         config=ctx.cg.device_function.config,
     )
     # The grouped-N direct path only emits warp MMA. Auto-selection prefers

@@ -31,6 +31,8 @@ from .._compiler.cute.tcgen05_constants import TCGEN05_TWO_CTA_EDGE_K_TAIL_MIN_D
 from .._compiler.cute.tcgen05_constants import TCGEN05_TWO_CTA_FP8_SMALL_GRID_BLOCK_M
 from .._compiler.cute.tcgen05_constants import TCGEN05_TWO_CTA_FP8_SMALL_GRID_BLOCK_N
 from .._compiler.cute.tcgen05_constants import TCGEN05_TWO_CTA_MAX_K_TILES
+from .._compiler.cute.tcgen05_constants import tcgen05_mma_k
+from .._compiler.cute.tcgen05_constants import tcgen05_static_shape_eligible
 from .._compiler.matmul_utils import _compute_out_dtype
 from .._compiler.matmul_utils import _emit_pallas_matmul
 from .._compiler.matmul_utils import _emit_tl_dot_scaled
@@ -337,19 +339,18 @@ def enforce_dot_requirements(lhs: torch.Tensor, rhs: torch.Tensor) -> None:
     # tcgen05 MMA-K is 16 elements for BF16/FP16 but 32 for FP8 (e4m3); the
     # block_k search granularity and minimum must follow the active dtype.
     is_fp8 = lhs.dtype == torch.float8_e4m3fn
-    mma_k = 32 if is_fp8 else 16
+    mma_k = tcgen05_mma_k(lhs.dtype)
     if (
         env.backend_name == "cute"
         and lhs.ndim == 2
         and rhs.ndim == 2
-        and lhs.dtype in (torch.float16, torch.bfloat16, torch.float8_e4m3fn)
         and rhs.dtype == lhs.dtype
         and static_m is not None
         and static_n is not None
         and static_k is not None
-        and static_m >= 64
-        and static_n >= 8
-        and static_k >= mma_k
+        and tcgen05_static_shape_eligible(
+            lhs.dtype, static_m=static_m, static_n=static_n, static_k=static_k
+        )
     ):
         from .._compiler.cute.mma_support import get_cute_mma_support
 
