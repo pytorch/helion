@@ -259,7 +259,7 @@ def default_pallas_jax_launcher(
     _inplace_indices: list[int] | None = None,
     _block_spec_info: _BlockSpecInfo | None = None,
     _scratch_shapes: list[object] | None = None,
-    _pipeline_arg_indices: list[int] | None = None,
+    _hbm_arg_indices: list[int] | None = None,
     _ds_pad_dims: list[tuple[int, int, int, int]] | None = None,
     _smem_arg_indices: list[int] | None = None,
     _pallas_interpret: bool | None = None,
@@ -324,7 +324,7 @@ def default_pallas_jax_launcher(
             _block_spec_info=_block_spec_info,
             _scratch_shapes=_scratch_shapes,
             _smem_arg_indices=_smem_arg_indices,
-            _pipeline_arg_indices=_pipeline_arg_indices,
+            _hbm_arg_indices=_hbm_arg_indices,
             build_worklist=cast("Any", compact_build_worklist),
             offset_arg_indices=cast(
                 "Any", kwargs.get("_compact_offset_arg_indices") or []
@@ -353,7 +353,7 @@ def default_pallas_jax_launcher(
             _block_spec_info=_block_spec_info,
             _smem_arg_indices=_smem_arg_indices,
             _scratch_shapes=_scratch_shapes,
-            _pipeline_arg_indices=_pipeline_arg_indices,
+            _hbm_arg_indices=_hbm_arg_indices,
             _matmul_dot_general=None,
             interpret=interpret,
         )
@@ -438,7 +438,7 @@ def make_jax_fn(kernel: Kernel) -> Callable[..., Any]:
 
         # ``default_pallas_jax_launcher`` picks the compile path from
         # the kwargs codegen already emits (``_scratch_shapes``,
-        # ``_pipeline_arg_indices``, ``_compact_build_worklist``); no
+        # ``_hbm_arg_indices``, ``_compact_build_worklist``); no
         # loop-type discriminator needed.
         def _launcher(
             pallas_kernel: object,

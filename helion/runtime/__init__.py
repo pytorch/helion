@@ -526,25 +526,28 @@ def _pallas_build_pipeline_specs(
     tensor_arg_indices: list[int],
     output_indices: list[int],
     block_spec_info: _BlockSpecInfo,
-    pipeline_arg_indices: list[int] | None,
+    hbm_arg_indices: list[int] | None,
     output_only_indices: list[int] | None = None,
     smem_arg_indices: list[int] | None = None,
 ) -> tuple[list[object], object]:
-    """Build in/out specs for pipeline launchers.
+    """Build in/out specs for the ``PrefetchScalarGridSpec`` path.
 
-    Pipeline-body tensors (listed in *pipeline_arg_indices*) get HBM refs.
-    All other tensors get proper BlockSpecs for automatic VMEM prefetch.
-    Tensors in *smem_arg_indices* (only ever accessed by scalar index, e.g.
-    group offset tables) are placed in SMEM so dynamic scalar reads don't
-    require 128-lane alignment proofs against a small VMEM ref.
+    Tensors listed in *hbm_arg_indices* get HBM refs (used by pipeline
+    launchers as the outer HBM ref that DMAs into VMEM, and by
+    distributed ops that address peer HBM directly).  All other
+    tensors get proper BlockSpecs for automatic VMEM prefetch.
+    Tensors in *smem_arg_indices* (only ever accessed by scalar index,
+    e.g. group offset tables) are placed in SMEM so dynamic scalar
+    reads don't require 128-lane alignment proofs against a small
+    VMEM ref.
     """
-    pipeline_set = set(pipeline_arg_indices or [])
+    hbm_set = set(hbm_arg_indices or [])
     smem_set = set(smem_arg_indices or [])
     all_positions = sorted(set(tensor_arg_indices) | set(output_only_indices or []))
     arg_to_tpos = {orig: tpos for tpos, orig in enumerate(all_positions)}
 
     def _spec_for(idx: int) -> object:
-        if idx in pipeline_set:
+        if idx in hbm_set:
             return pl.BlockSpec(memory_space=pltpu.HBM)  # type: ignore[union-attr]
         tpos = arg_to_tpos[idx]
         t = args[idx]
@@ -1123,9 +1126,9 @@ def _pallas_make_reordered_kernel(
     reordered args.
 
     *skip_inplace_copy* is a set of original-arg positions for which the
-    initial ``out_ref[...] = in_ref[...]`` copy should be skipped.  Used by
-    pipeline/fori launchers for pipeline-body tensors backed by HBM refs
-    where direct load/store is not allowed.
+    initial ``out_ref[...] = in_ref[...]`` copy should be skipped.  Used
+    for tensors backed by HBM refs (pipeline/fori-loop outer refs,
+    distributed-op targets) where direct load/store is not allowed.
     """
     _skip_copy = skip_inplace_copy or set()
     copy_guards = {
@@ -1454,7 +1457,7 @@ def _pallas_compile_jit_fn(
     _block_spec_info: _BlockSpecInfo | None,
     _smem_arg_indices: list[int] | None,
     _scratch_shapes: list[object] | None,
-    _pipeline_arg_indices: list[int] | None,
+    _hbm_arg_indices: list[int] | None,
     _matmul_dot_general: dict[str, object] | None,
     interpret: bool,
 ) -> _PallasCompileResult:
@@ -1466,10 +1469,9 @@ def _pallas_compile_jit_fn(
     - ``_scratch_shapes`` present (VMEM buffers / DMA semaphores) →
       wrap ``in``/``out`` specs and the grid in a
       ``pltpu.PrefetchScalarGridSpec`` so the scratch refs are threaded
-      into the kernel.  Pipeline-body tensors (listed in
-      ``_pipeline_arg_indices``) get HBM refs via
-      ``_pallas_build_pipeline_specs``, and their inplace copy is
-      skipped because you cannot directly index an HBM ref.
+      into the kernel.  Tensors listed in ``_hbm_arg_indices`` get HBM
+      refs via ``_pallas_build_pipeline_specs``, and their inplace copy
+      is skipped because you cannot directly index an HBM ref.
     - ``_scratch_shapes`` absent → simple ``grid`` + per-arg
       ``BlockSpec`` layout via ``_pallas_build_block_specs``.
 
@@ -1512,13 +1514,13 @@ def _pallas_compile_jit_fn(
 
     # Two discriminators drive the spec-building path — either forces
     # the ``PrefetchScalarGridSpec`` route:
-    #   1. ``_pipeline_arg_indices`` non-empty: some tensor is an HBM
-    #      pipeline-body ref that needs ``pl.BlockSpec(memory_space=pl.ANY)``
-    #      rather than a plain BlockSpec.
+    #   1. ``_hbm_arg_indices`` non-empty: some tensor needs an HBM
+    #      ref (``pl.BlockSpec(memory_space=pl.ANY)``) rather than a
+    #      plain BlockSpec.
     #   2. ``_scratch_shapes`` non-empty: the kernel registered VMEM
     #      buffers or DMA semaphores, which are only reachable via a
     #      ``scratch_shapes=`` argument on ``PrefetchScalarGridSpec``.
-    needs_pipeline_specs = bool(_pipeline_arg_indices) or bool(_scratch_shapes)
+    needs_pipeline_specs = bool(_hbm_arg_indices) or bool(_scratch_shapes)
     has_scratch = bool(_scratch_shapes)
     if needs_pipeline_specs:
         assert _block_spec_info is not None, (
@@ -1534,11 +1536,11 @@ def _pallas_compile_jit_fn(
             tensor_arg_indices,
             _output_indices,
             _block_spec_info,
-            _pipeline_arg_indices,
+            _hbm_arg_indices,
             output_only_indices,
             smem_arg_indices=_smem_arg_indices,
         )
-        skip_inplace_copy: set[int] = set(_pipeline_arg_indices or [])
+        skip_inplace_copy: set[int] = set(_hbm_arg_indices or [])
     else:
         in_specs, out_specs = _pallas_build_block_specs(
             pl,
@@ -1647,7 +1649,7 @@ def _pallas_install_launcher_cache(
     _block_spec_info: _BlockSpecInfo | None,
     _smem_arg_indices: list[int] | None,
     _scratch_shapes: list[object] | None,
-    _pipeline_arg_indices: list[int] | None,
+    _hbm_arg_indices: list[int] | None,
     _ds_pad_dims: list[tuple[int, int, int, int]] | None,
     _pallas_interpret: bool | None,
     _matmul_dot_general: dict[str, object] | None = None,
@@ -1688,7 +1690,7 @@ def _pallas_install_launcher_cache(
         _block_spec_info=_block_spec_info,
         _smem_arg_indices=_smem_arg_indices,
         _scratch_shapes=_scratch_shapes,
-        _pipeline_arg_indices=_pipeline_arg_indices,
+        _hbm_arg_indices=_hbm_arg_indices,
         _matmul_dot_general=_matmul_dot_general,
         interpret=interpret,
     )
@@ -1775,7 +1777,7 @@ def default_pallas_launcher(
     _block_spec_info: _BlockSpecInfo | None = None,
     _smem_arg_indices: list[int] | None = None,
     _scratch_shapes: list[tuple[tuple[int, ...], str | None, str]] | None = None,
-    _pipeline_arg_indices: list[int] | None = None,
+    _hbm_arg_indices: list[int] | None = None,
     _ds_pad_dims: list[tuple[int, int, int, int]] | None = None,
     _pallas_interpret: bool | None = None,
     _matmul_dot_general: dict[str, object] | None = None,
@@ -1824,7 +1826,7 @@ def default_pallas_launcher(
                 _block_spec_info=_block_spec_info,
                 _smem_arg_indices=_smem_arg_indices,
                 _scratch_shapes=cast("list[object] | None", _scratch_shapes),
-                _pipeline_arg_indices=_pipeline_arg_indices,
+                _hbm_arg_indices=_hbm_arg_indices,
                 _ds_pad_dims=_ds_pad_dims,
                 _pallas_interpret=_pallas_interpret,
                 _compact_build_worklist=_compact_build_worklist,
@@ -1846,7 +1848,7 @@ def default_pallas_launcher(
                 _block_spec_info=_block_spec_info,
                 _smem_arg_indices=_smem_arg_indices,
                 _scratch_shapes=cast("list[object] | None", _scratch_shapes),
-                _pipeline_arg_indices=_pipeline_arg_indices,
+                _hbm_arg_indices=_hbm_arg_indices,
                 _ds_pad_dims=_ds_pad_dims,
                 _pallas_interpret=_pallas_interpret,
                 _matmul_dot_general=_matmul_dot_general,
@@ -1870,7 +1872,7 @@ def _pallas_compact_in_out_specs(
     output_indices: list[int],
     block_spec_info: _BlockSpecInfo | None,
     smem_set: set[int],
-    pipeline_set: set[int],
+    hbm_set: set[int],
     owner_ref_pos: int,
     aligned_set: set[int] | None = None,
     tile_start_ref_pos: int = 1,
@@ -1891,7 +1893,7 @@ def _pallas_compact_in_out_specs(
     arg_to_tpos = {orig: tpos for tpos, orig in enumerate(all_positions)}
 
     def _spec_for(idx: int) -> object:
-        if idx in pipeline_set:
+        if idx in hbm_set:
             return pl.BlockSpec(memory_space=pltpu.HBM)  # type: ignore[union-attr]
         t = args[idx]
         assert isinstance(t, torch.Tensor)
@@ -2001,7 +2003,7 @@ def _pallas_compile_compact_jit_fn(
     _block_spec_info: _BlockSpecInfo | None,
     _scratch_shapes: list[object] | None,
     _smem_arg_indices: list[int] | None,
-    _pipeline_arg_indices: list[int] | None,
+    _hbm_arg_indices: list[int] | None,
     build_worklist: Callable[..., object],
     offset_arg_indices: list[int],
     metadata_fields: list[str],
@@ -2032,7 +2034,7 @@ def _pallas_compile_compact_jit_fn(
 
     scratch_shapes = _pallas_build_scratch_shapes(pltpu, jnp, _scratch_shapes or [])
     smem_set = set(_smem_arg_indices or [])
-    pipeline_set = set(_pipeline_arg_indices or [])
+    hbm_set = set(_hbm_arg_indices or [])
     in_specs, out_specs = _pallas_compact_in_out_specs(
         pl,
         jnp,
@@ -2042,7 +2044,7 @@ def _pallas_compile_compact_jit_fn(
         _output_indices,
         _block_spec_info,
         smem_set,
-        pipeline_set,
+        hbm_set,
         owner_ref_pos,
         set(aligned_arg_indices or []),
         tile_start_ref_pos,
@@ -2145,7 +2147,7 @@ def _pallas_install_compact_launcher_cache(
     _block_spec_info: _BlockSpecInfo | None,
     _smem_arg_indices: list[int] | None,
     _scratch_shapes: list[object] | None,
-    _pipeline_arg_indices: list[int] | None,
+    _hbm_arg_indices: list[int] | None,
     _ds_pad_dims: list[tuple[int, int, int, int]] | None,
     _pallas_interpret: bool | None,
     _compact_build_worklist: Callable[..., object],
@@ -2190,7 +2192,7 @@ def _pallas_install_compact_launcher_cache(
         _block_spec_info=_block_spec_info,
         _scratch_shapes=_scratch_shapes,
         _smem_arg_indices=_smem_arg_indices,
-        _pipeline_arg_indices=_pipeline_arg_indices,
+        _hbm_arg_indices=_hbm_arg_indices,
         build_worklist=_compact_build_worklist,
         offset_arg_indices=_compact_offset_arg_indices or [],
         metadata_fields=_compact_metadata_fields or [],
