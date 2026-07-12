@@ -1064,7 +1064,7 @@ def _run_bound_kernel(
         if has_device_tensor or (
             isinstance(result, torch.Tensor) and result.device.type != "cpu"
         ):
-            synchronize_device(result)
+            synchronize_device()
     except Exception as exc:
         if code is None:
             try:
@@ -1077,7 +1077,7 @@ def _run_bound_kernel(
             sys.stderr.write("Failed to run kernel.\n")
         if has_device_tensor:
             try:
-                synchronize_device(None)
+                synchronize_device()
             except Exception as sync_error:
                 raise exc from sync_error
         raise
