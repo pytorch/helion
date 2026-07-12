@@ -2315,6 +2315,22 @@ def _emit_mma_pipeline(
         and n_size % bn != 0
         and k_total_size % bk == 0
     )
+    if analysis.has_batch and (
+        tcgen05_m_edge_only or tcgen05_n_edge_only or tcgen05_double_edge_tma
+    ):
+        # The CtaGroup.TWO output-edge scheduler linearizes the virtual pid
+        # over M/N only; a leading batch axis makes the full/edge tile
+        # predicate (``_tcgen05_output_full_tile_expr_for_work_tile``)
+        # misclassify partial tiles and silently miscompute. Batched 2-CTA is
+        # validated only for static full tiles. Autotune already excludes this
+        # (see ``allow_edge_cluster_m2_search``); this rejects a hand-forced
+        # batched edge config loudly instead of returning wrong output.
+        raise exc.BackendUnsupported(
+            "cute",
+            "batched (leading-passthrough) CtaGroup.TWO tcgen05 matmul does "
+            "not support partial M/N/K output-edge tiles; pad M/N/K to the "
+            "block sizes (static full tiles) or use tcgen05_cluster_m=1.",
+        )
     if (
         mma_impl == "tcgen05"
         and not tcgen05_static_full_tiles

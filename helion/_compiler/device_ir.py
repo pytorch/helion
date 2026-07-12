@@ -3660,15 +3660,18 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
                 from ..language.matmul_ops import enforce_dot_requirements
                 from .cute.cute_mma import can_codegen_cute_mma_aten
 
-                # This post-pass ONLY enables the *batched* (rank>2) tcgen05
-                # search surface. A 2-D matmul (mm/addmm/dot) already enables
-                # tcgen05 during tracing with allow_batched=False; re-enforcing
-                # it here perturbs the validated 2-D default config (flipping
-                # bk/l2_groupings/pid_type). The tracing path never passes
-                # allow_batched=True, so the batched enablement lives only here.
-                # addmm/baddbmm pass (bias, lhs, rhs) as args 0/1/2; mm/bmm carry
-                # (lhs, rhs) at args 0/1 with no accumulator. Keyed on operand
-                # structure, not op identity.
+                # This post-pass ONLY enables the *batched* tcgen05 search
+                # surface -- at least one operand rank 3 (both <= 3): both-3D
+                # bmm/baddbmm and mixed-rank shared-weight forms
+                # ([B, M, K] @ [K, N]). A purely 2-D matmul (mm/addmm/dot)
+                # already enables tcgen05 during tracing with
+                # allow_batched=False; re-enforcing it here perturbs the
+                # validated 2-D default config (flipping bk/l2_groupings/
+                # pid_type). The tracing path never passes allow_batched=True,
+                # so the batched enablement lives only here. addmm/baddbmm pass
+                # (bias, lhs, rhs) as args 0/1/2; mm/bmm carry (lhs, rhs) at
+                # args 0/1 with no accumulator. Keyed on operand structure, not
+                # op identity.
                 for graph_info in device_ir.graphs:
                     for node in graph_info.graph.nodes:
                         if node.op != "call_function":
@@ -3698,8 +3701,9 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
                         if (
                             isinstance(lhs, torch.Tensor)
                             and isinstance(rhs, torch.Tensor)
-                            and lhs.ndim > 2
-                            and rhs.ndim > 2
+                            and (lhs.ndim > 2 or rhs.ndim > 2)
+                            and lhs.ndim <= 3
+                            and rhs.ndim <= 3
                             and can_codegen_cute_mma_aten(node, with_acc=with_acc)
                         ):
                             enforce_dot_requirements(

@@ -778,6 +778,24 @@ def cute_dynamic_row_sum(x: torch.Tensor, end: torch.Tensor) -> torch.Tensor:
 
 
 @helion.kernel(backend="cute")
+def cute_mixed_rank_batched_dot_tcgen05(
+    x: torch.Tensor, w: torch.Tensor
+) -> torch.Tensor:
+    # Shared-weight batched dot: x is 3-D (batched), w is 2-D (shared across
+    # the batch). _analyze_mma_operands models this as a single batch axis, so
+    # it should enter the batched tcgen05 search just like a both-3-D bmm.
+    b, m, k = x.size()
+    _, n = w.size()
+    out = torch.empty([b, m, n], dtype=torch.bfloat16, device=x.device)
+    for tile_b, tile_m, tile_n in hl.tile([b, m, n]):
+        acc = hl.zeros([tile_b, tile_m, tile_n], dtype=torch.float32)
+        for tile_k in hl.tile(k):
+            acc = hl.dot(x[tile_b, tile_m, tile_k], w[tile_k, tile_n], acc=acc)
+        out[tile_b, tile_m, tile_n] = acc.to(torch.bfloat16)
+    return out
+
+
+@helion.kernel(backend="cute")
 def cute_permute_transpose(x: torch.Tensor) -> torch.Tensor:
     m, n = x.size()
     out = torch.empty([m, n], dtype=x.dtype, device=x.device)
@@ -4514,6 +4532,68 @@ class TestCuteBackend(TestCase):
         torch.testing.assert_close(out.float(), expected, atol=1e-1, rtol=1e-2)
         self.assertIn("cute.gemm(", code)
         self.assertIn("CtaGroup.TWO", code)
+
+    def test_mixed_rank_batched_dot_enables_tcgen05_and_uses_mma(self) -> None:
+        # A shared-weight batched dot (3-D x, 2-D w) must enter the batched
+        # tcgen05 search and compile to cute.gemm -- the search gate keys on
+        # "at least one operand rank 3", matching _analyze_mma_operands' single
+        # batch axis, not on both operands being rank 3.
+        support = get_cute_mma_support()
+        if not support.tcgen05_f16bf16:
+            self.skipTest("tcgen05 F16/BF16 MMA is not supported on this machine")
+
+        args = (
+            torch.randn(4, 256, 64, device=DEVICE, dtype=HALF_DTYPE),
+            torch.randn(64, 256, device=DEVICE, dtype=HALF_DTYPE),
+        )
+        with patch.dict(os.environ, {"HELION_CUTE_MMA_IMPL": "tcgen05"}, clear=False):
+            bound = cute_mixed_rank_batched_dot_tcgen05.bind(args)
+            self.assertTrue(bound.config_spec.cute_tcgen05_search_enabled)
+            config = helion.Config(
+                block_sizes=[1, 256, 256, 64],
+                tcgen05_cluster_m=2,
+                tcgen05_cluster_n=1,
+                pid_type="persistent_blocked",
+                tcgen05_persistence_model="static_persistent",
+                tcgen05_ab_stages=2,
+                tcgen05_acc_stages=2,
+                tcgen05_c_stages=2,
+            )
+            code = bound.to_triton_code(config)
+            out = bound.compile_config(config)(*args)
+            torch.cuda.synchronize()
+        expected = torch.matmul(args[0].float(), args[1].float())
+        torch.testing.assert_close(out.float(), expected, atol=1e-1, rtol=1e-2)
+        self.assertIn("cute.gemm(", code)
+        self.assertIn("CtaGroup.TWO", code)
+
+    def test_batched_two_cta_partial_edge_tiles_rejected(self) -> None:
+        # A batched CtaGroup.TWO matmul with partial M/N/K output-edge tiles
+        # must be rejected loudly: the output-edge scheduler linearizes the
+        # virtual pid across the batch axis and would otherwise silently
+        # miscompute (only full tiles are validated for batched 2-CTA).
+        support = get_cute_mma_support()
+        if not support.tcgen05_f16bf16:
+            self.skipTest("tcgen05 F16/BF16 MMA is not supported on this machine")
+
+        args = (
+            torch.randn(2, 300, 100, device=DEVICE, dtype=HALF_DTYPE),
+            torch.randn(2, 100, 300, device=DEVICE, dtype=HALF_DTYPE),
+        )
+        config = helion.Config(
+            block_sizes=[1, 256, 256, 64],
+            tcgen05_cluster_m=2,
+            tcgen05_cluster_n=1,
+            pid_type="persistent_blocked",
+            tcgen05_persistence_model="static_persistent",
+            tcgen05_ab_stages=2,
+            tcgen05_acc_stages=2,
+            tcgen05_c_stages=2,
+        )
+        with patch.dict(os.environ, {"HELION_CUTE_MMA_IMPL": "tcgen05"}, clear=False):
+            bound = cute_batched_baddbmm_tcgen05.bind(args)
+            with self.assertRaises(helion.exc.BackendUnsupported):
+                bound.to_triton_code(config)
 
     def test_matmul_mma_tcgen05_128x8_uses_full_cta_barrier(self) -> None:
         support = get_cute_mma_support()

@@ -209,7 +209,7 @@ def _(
     # on operand rank rather than the presence of an accumulator, so a plain
     # batched ``hl.dot`` autotunes into cute.gemm like ``baddbmm`` does.
     enforce_dot_requirements(
-        mat1, mat2, allow_batched_cute_tcgen05=mat1.ndim > 2 and mat2.ndim > 2
+        mat1, mat2, allow_batched_cute_tcgen05=mat1.ndim > 2 or mat2.ndim > 2
     )
 
     return (mat1, mat2, acc, out_dtype)
@@ -306,8 +306,14 @@ def enforce_dot_requirements(
     mma_k = 32 if is_fp8 else 16
     cute_tcgen05_rank_supported = lhs.ndim == 2 and rhs.ndim == 2
     if allow_batched_cute_tcgen05:
+        # Batched tcgen05 accepts a single shared batch axis: both operands 3-D
+        # (bmm/baddbmm) OR one 3-D and one 2-D (shared-weight dot, e.g.
+        # [B, M, K] @ [K, N]). _analyze_mma_operands models the mixed-rank case
+        # via a single batch_block_id.
         cute_tcgen05_rank_supported = cute_tcgen05_rank_supported or (
-            lhs.ndim == 3 and rhs.ndim == 3
+            lhs.ndim in (2, 3)
+            and rhs.ndim in (2, 3)
+            and (lhs.ndim == 3 or rhs.ndim == 3)
         )
     if (
         env.backend_name == "cute"
@@ -380,7 +386,15 @@ def enforce_dot_requirements(
             # Smaller edge-heavy shapes continue using the established flat
             # SIMT-edge fallback.
             allow_edge_cluster_m2_search = (
-                not allow_full_tile_persistent_pid_types
+                # Batched (leading-passthrough) 2-CTA is validated only for
+                # static full tiles: the output-edge scheduler's full/edge
+                # predicate linearizes the virtual pid across the batch axis
+                # (see _tcgen05_output_full_tile_expr_for_work_tile) and
+                # miscomputes for a [B, M, N] grid. Keep batched off the edge
+                # 2-CTA search so autotune never picks it (a forced batched edge
+                # config is rejected loudly in cute_mma.py).
+                not allow_batched_cute_tcgen05
+                and not allow_full_tile_persistent_pid_types
                 and max_tcgen05_m >= TCGEN05_TWO_CTA_BLOCK_M
                 and max_tcgen05_n >= TCGEN05_TWO_CTA_BLOCK_N
                 and static_m >= TCGEN05_TWO_CTA_EDGE_K_TAIL_MIN_DIM
