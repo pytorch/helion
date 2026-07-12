@@ -204,8 +204,13 @@ def _(
                 f"hl.dot: acc shape {list(acc.shape)} incompatible with result shape {expected_shape}"
             )
 
-    # Apply min-dot-size constraints so autotuner won't pick invalid block_size
-    enforce_dot_requirements(mat1, mat2)
+    # Apply min-dot-size constraints so autotuner won't pick invalid block_size.
+    # A 3-D (batched) dot enables the batched tcgen05 search surface too, keyed
+    # on operand rank rather than the presence of an accumulator, so a plain
+    # batched ``hl.dot`` autotunes into cute.gemm like ``baddbmm`` does.
+    enforce_dot_requirements(
+        mat1, mat2, allow_batched_cute_tcgen05=mat1.ndim > 2 and mat2.ndim > 2
+    )
 
     return (mat1, mat2, acc, out_dtype)
 

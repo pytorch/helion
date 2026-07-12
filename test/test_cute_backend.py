@@ -749,6 +749,23 @@ def cute_batched_baddbmm_rowvec_bias_tcgen05(
 
 
 @helion.kernel(backend="cute")
+def cute_batched_dot_tcgen05(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    b, m, k = x.size()
+    _, _, n = y.size()
+    out = torch.empty([b, m, n], dtype=torch.bfloat16, device=x.device)
+    for tile_b, tile_m, tile_n in hl.tile([b, m, n]):
+        acc = hl.zeros([tile_b, tile_m, tile_n], dtype=torch.float32)
+        for tile_k in hl.tile(k):
+            acc = hl.dot(
+                x[tile_b, tile_m, tile_k],
+                y[tile_b, tile_k, tile_n],
+                acc=acc,
+            )
+        out[tile_b, tile_m, tile_n] = acc.to(torch.bfloat16)
+    return out
+
+
+@helion.kernel(backend="cute")
 def cute_dynamic_row_sum(x: torch.Tensor, end: torch.Tensor) -> torch.Tensor:
     out = x.new_empty([x.size(0)])
     bs = hl.register_block_size(x.size(1))
@@ -4459,6 +4476,44 @@ class TestCuteBackend(TestCase):
         # Bias folded into the matmul epilogue -> a single device kernel,
         # no separate elementwise bias pass.
         self.assertEqual(code.count("@cute.kernel"), 1)
+
+    def test_batched_dot_enables_tcgen05_search_and_uses_mma(self) -> None:
+        # A 3-D (batched) hl.dot must enable the batched tcgen05 search surface
+        # (keyed on operand rank, not the presence of an accumulator) so plain
+        # batched matmul autotunes into cute.gemm -- not only when a tcgen05
+        # config is hand-forced. Before the fix, 3-D dot passed
+        # allow_batched_cute_tcgen05=False so cute_tcgen05_search_enabled stayed
+        # off and the search never emitted a tcgen05 config.
+        support = get_cute_mma_support()
+        if not support.tcgen05_f16bf16:
+            self.skipTest("tcgen05 F16/BF16 MMA is not supported on this machine")
+
+        args = (
+            torch.randn(4, 256, 64, device=DEVICE, dtype=HALF_DTYPE),
+            torch.randn(4, 64, 256, device=DEVICE, dtype=HALF_DTYPE),
+        )
+        with patch.dict(os.environ, {"HELION_CUTE_MMA_IMPL": "tcgen05"}, clear=False):
+            bound = cute_batched_dot_tcgen05.bind(args)
+            # The batched search surface is enabled (this is what lets the
+            # autotuner reach tcgen05 without a hand-forced config).
+            self.assertTrue(bound.config_spec.cute_tcgen05_search_enabled)
+            config = helion.Config(
+                block_sizes=[1, 256, 256, 64],
+                tcgen05_cluster_m=2,
+                tcgen05_cluster_n=1,
+                pid_type="persistent_blocked",
+                tcgen05_persistence_model="static_persistent",
+                tcgen05_ab_stages=2,
+                tcgen05_acc_stages=2,
+                tcgen05_c_stages=2,
+            )
+            code = bound.to_triton_code(config)
+            out = bound.compile_config(config)(*args)
+            torch.cuda.synchronize()
+        expected = torch.bmm(args[0].float(), args[1].float())
+        torch.testing.assert_close(out.float(), expected, atol=1e-1, rtol=1e-2)
+        self.assertIn("cute.gemm(", code)
+        self.assertIn("CtaGroup.TWO", code)
 
     def test_matmul_mma_tcgen05_128x8_uses_full_cta_barrier(self) -> None:
         support = get_cute_mma_support()

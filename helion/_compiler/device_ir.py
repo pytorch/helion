@@ -3660,20 +3660,33 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
                 from ..language.matmul_ops import enforce_dot_requirements
                 from .cute.cute_mma import can_codegen_cute_mma_aten
 
+                # This post-pass ONLY enables the *batched* (rank>2) tcgen05
+                # search surface. A 2-D matmul (mm/addmm/dot) already enables
+                # tcgen05 during tracing with allow_batched=False; re-enforcing
+                # it here perturbs the validated 2-D default config (flipping
+                # bk/l2_groupings/pid_type). The tracing path never passes
+                # allow_batched=True, so the batched enablement lives only here.
+                # addmm/baddbmm pass (bias, lhs, rhs) as args 0/1/2; mm/bmm carry
+                # (lhs, rhs) at args 0/1 with no accumulator. Keyed on operand
+                # structure, not op identity.
                 for graph_info in device_ir.graphs:
                     for node in graph_info.graph.nodes:
                         if node.op != "call_function":
                             continue
-                        # addmm (2D accumulate) and baddbmm (leading-dim
-                        # accumulate) both pass (bias, lhs, rhs) as args 0/1/2.
+                        with_acc: bool
                         if node.target in (
                             torch.ops.aten.addmm.default,
                             torch.ops.aten.baddbmm.default,
                         ):
                             lhs_arg, rhs_arg = node.args[1], node.args[2]
+                            with_acc = True
+                        elif node.target in (
+                            torch.ops.aten.mm.default,
+                            torch.ops.aten.bmm.default,
+                        ):
+                            lhs_arg, rhs_arg = node.args[0], node.args[1]
+                            with_acc = False
                         else:
-                            continue
-                        if not can_codegen_cute_mma_aten(node, with_acc=True):
                             continue
                         if not isinstance(lhs_arg, torch.fx.Node) or not isinstance(
                             rhs_arg,
@@ -3682,16 +3695,17 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
                             continue
                         lhs = lhs_arg.meta.get("val")
                         rhs = rhs_arg.meta.get("val")
-                        if isinstance(lhs, torch.Tensor) and isinstance(
-                            rhs,
-                            torch.Tensor,
+                        if (
+                            isinstance(lhs, torch.Tensor)
+                            and isinstance(rhs, torch.Tensor)
+                            and lhs.ndim > 2
+                            and rhs.ndim > 2
+                            and can_codegen_cute_mma_aten(node, with_acc=with_acc)
                         ):
-                            # The rank>2 (leading passthrough dim) allowance is
-                            # derived from operand structure, not op identity.
                             enforce_dot_requirements(
                                 lhs,
                                 rhs,
-                                allow_batched_cute_tcgen05=lhs.ndim > 2,
+                                allow_batched_cute_tcgen05=True,
                             )
         config_spec.raise_grid_block_minimums()
         if len(device_ir.root_ids) > 1:

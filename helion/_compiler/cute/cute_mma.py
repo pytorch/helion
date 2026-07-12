@@ -2085,9 +2085,15 @@ def _emit_mma_pipeline(
             bm = int(m_bs) if isinstance(m_bs, int) else None
             bn = int(n_bs) if isinstance(n_bs, int) else None
         else:
-            for bid in grid_state.block_ids:
-                if bid == analysis.batch_block_id:
-                    continue
+            # M and N are always the trailing two grid axes; every leading
+            # axis is a passthrough (batch) that only offsets memory. Restrict
+            # the extent match to those two (mirrors
+            # ``_specialized_mma_root_mn_block_ids``) so a leading passthrough
+            # axis whose full extent happens to equal M or N can never be
+            # mis-selected as a matrix axis -- which, when
+            # ``analysis.batch_block_id`` is unset (2-D operands under a 3-axis
+            # grid), would otherwise pick the wrong offset/block and miscompile.
+            for bid in grid_state.block_ids[-2:]:
                 offset = grid_state.strategy.offset_var(bid)
                 bs_info = env.block_sizes[bid]
                 size = bs_info.size
