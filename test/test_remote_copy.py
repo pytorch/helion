@@ -52,6 +52,26 @@ def _triton_scatter(src, out, dest, wpos, ws: hl.constexpr):
     return out
 
 
+@helion.kernel(backend="pallas", distributed=[8], config=helion.Config())
+def _pallas_scatter_wait_send(src, out, dest, wpos, ws: hl.constexpr):
+    """Reduce-scatter direct-write: drain the OUTGOING send per row (balanced),
+    so an uneven receive count never deadlocks."""
+    m = src.shape[0]
+    for i in hl.grid(m):
+        op = hl.start_async_remote_copy(src, [i], dest[i], dst=out, dst_index=[wpos[i]])
+        op.wait_send()
+    return out
+
+
+@helion.kernel(backend="triton", config=helion.Config())
+def _triton_scatter_wait_send(src, out, dest, wpos, ws: hl.constexpr):
+    m = src.shape[0]
+    for i in hl.grid(m):
+        op = hl.start_async_remote_copy(src, [i], dest[i], dst=out, dst_index=[wpos[i]])
+        op.wait_send()
+    return out
+
+
 def _scatter_args(
     src_dtype=torch.float32, dst_dtype=None, h=128, dst_h=None, src_stride0=None
 ):
@@ -133,6 +153,16 @@ class TestRemoteCopyPallasCodegen(TestCase):
         self.assertIn(f"{start.group(1)}.start()", code)
         self.assertIn(f"{start.group(1)}.wait()", code)
 
+    def test_wait_send_drains_send_side(self):
+        # wait_send() must lower to the descriptor's .wait_send() (drain the
+        # outgoing push), NOT .wait() (which waits the incoming receive and
+        # deadlocks under receive-imbalance).
+        code = _code(_pallas_scatter_wait_send, _scatter_args())
+        start = re.search(r"(\w+) = pltpu\.make_async_remote_copy", code)
+        self.assertIsNotNone(start, code)
+        self.assertIn(f"{start.group(1)}.wait_send()", code)
+        self.assertNotRegex(code, rf"{start.group(1)}\.wait\(\)")
+
 
 class TestRemoteCopyTritonCodegen(TestCase):
     def test_emits_putmem_and_paired_wait(self):
@@ -170,6 +200,27 @@ class TestRemoteCopyTritonCodegen(TestCase):
         pe = re.search(r"NVSHMEM_SIGNAL_ADD,\s*(\w+)\)", line)
         self.assertIsNotNone(pe, line)
         self.assertFalse(pe.group(1).isdigit(), f"expected runtime pe: {line}")
+
+    def test_wait_send_drains_with_quiet(self):
+        # On GPU the send-side drain is nvshmem_quiet() (all outbound puts done),
+        # not a signal wait.
+        code = _code(_triton_scatter_wait_send, _scatter_args())
+        self.assertIn("nvshmem_quiet()", code)
+        self.assertNotIn("nvshmem_signal_wait_until", code)
+
+
+class TestRemoteCopyMemorySpace(TestCase):
+    def test_pure_dma_target_routed_to_hbm(self):
+        # A remote-copy operand the kernel never load/stores locally (a
+        # direct-write reduce-scatter target) must be an HBM ref so scattered
+        # peer writes across a multi-program grid share one persistent buffer.
+        code = _code(_pallas_scatter, _scatter_args())
+        m = re.search(r"_hbm_arg_indices=\[([^\]]*)\]", code)
+        self.assertIsNotNone(m, code)
+        # Both row buffers (src staged + out) are pure DMA operands -> HBM; the
+        # scalar routing tensors (dest/wpos) are SMEM, not HBM.
+        hbm = [x for x in m.group(1).split(",") if x.strip()]
+        self.assertEqual(len(hbm), 2, code)
 
 
 class TestRemoteCopyContract(TestCase):

@@ -102,11 +102,39 @@ def plan_tiling(
     config: Config,
     tile_strategy: TileStrategyDispatch,
 ) -> None:
+    # A remote-copy operand that the kernel also load/stores locally must live in
+    # VMEM (loads/stores are illegal on HBM); a pure DMA source/target can live
+    # in HBM.  A kernel is split into multiple subgraphs (loop bodies, ``if``
+    # branches), so the local load/store and the remote copy of the SAME tensor
+    # can land in DIFFERENT subgraphs (e.g. ring all-gather seeds ``gather`` in
+    # the ``step == 0`` branch but DMAs it in the loop body).  Collect local
+    # accesses across ALL subgraphs so the memory-space decision is global.
+    local_access_ids = _collect_local_access_ids(graphs)
     for graph_info in graphs:
-        _analyze_indexing_expressions(graph_info, config)
+        _analyze_indexing_expressions(graph_info, config, local_access_ids)
 
 
-def _analyze_indexing_expressions(graph_info: GraphInfo, config: Config) -> None:
+def _collect_local_access_ids(graphs: list[GraphInfo]) -> set[int]:
+    from ...language import memory_ops
+    from ...language.atomic_ops import ATOMIC_OPS
+
+    local_access_targets = ATOMIC_OPS | {memory_ops.load, memory_ops.store}
+    local_access_ids: set[int] = set()
+    for graph_info in graphs:
+        for node in graph_info.graph.nodes:
+            if node.op != "call_function" or node.target not in local_access_targets:
+                continue
+            t = node.args[0]
+            if isinstance(t, torch.fx.Node):
+                tv = t.meta.get("val")
+                if isinstance(tv, torch.Tensor):
+                    local_access_ids.add(id(tv))
+    return local_access_ids
+
+
+def _analyze_indexing_expressions(
+    graph_info: GraphInfo, config: Config, local_access_ids: set[int]
+) -> None:
     from ...language import distributed_ops
     from ...language import memory_ops
     from ...language.atomic_ops import ATOMIC_OPS
@@ -120,10 +148,12 @@ def _analyze_indexing_expressions(graph_info: GraphInfo, config: Config) -> None
         if node.op != "call_function":
             continue
         if node.target in indexing_targets:
-            _analyze_indexing(node, config)
+            _analyze_indexing(node, config, local_access_ids)
 
 
-def _analyze_indexing(node: torch.fx.Node, config: Config) -> None:
+def _analyze_indexing(
+    node: torch.fx.Node, config: Config, local_access_ids: set[int]
+) -> None:
     tensor_arg = node.args[0]
     subscript = node.args[1]
 
@@ -173,29 +203,40 @@ def _analyze_indexing(node: torch.fx.Node, config: Config) -> None:
     current = device_fn.pallas_memory_space.get(tid)
     if is_remote_copy:
         # Remote-copy operands are addressed directly by make_async_remote_copy
-        # and must never be SMEM (they are row buffers, not scalar values).
-        #   * SRC (args[0]): a read-only DMA source -> VMEM.  It may be produced
-        #     in-loop by the compute (a fused comms+compute kernel), which needs
-        #     VMEM to store into; and a read-only VMEM input is copied in whole
-        #     per program, so a runtime row-select reads correctly.
-        #   * DST (args[3]): the peer-written target -> HBM.  With a multi-program
-        #     grid a VMEM output gives each program a private copy whose writeback
-        #     clobbers other programs' scattered writes (only the last survives);
-        #     an HBM ref is shared/persistent and written in place, exactly what a
-        #     reduce-scatter direct-write needs.
-        if current != PallasMemorySpace.HBM:
-            device_fn.pallas_memory_space[tid] = PallasMemorySpace.VMEM
+        # and must never be SMEM (row/tile buffers, not scalars).  Route each
+        # operand (src and the peer-written dst) by whether the KERNEL also
+        # accesses it with a local load/store:
+        #   * locally load/stored -> VMEM.  Required for the ring all-gather's
+        #     seed store (gather[rank] = local), a fused kernel's compute output
+        #     used as the DMA source, or a reduce-scatter accumulate that reads
+        #     the received data back.  VMEM is both peer-writable via DMA and
+        #     locally readable/writable.
+        #   * pure DMA source/target (never touched by a local load/store, e.g.
+        #     a direct-write reduce-scatter whose reduction runs outside the
+        #     kernel) -> HBM.  Shared/persistent across a multi-program grid, so
+        #     scattered peer writes are not clobbered by per-program VMEM
+        #     writeback.
         # prepare_args normalizes start_async_remote_copy to the full 5-arg form,
         # so args[3] (dst) is always present (mirrors device_function.py).
         assert len(node.args) == 5, (
             "start_async_remote_copy must be normalized to 5 args by "
             f"prepare_args (got {len(node.args)})"
         )
+        operand_vals = [tensor_val]
         dst_arg = node.args[3]
         if isinstance(dst_arg, torch.fx.Node):
             dst_val = dst_arg.meta.get("val")
             if isinstance(dst_val, torch.Tensor):
-                device_fn.pallas_memory_space[id(dst_val)] = PallasMemorySpace.HBM
+                operand_vals.append(dst_val)
+        for operand in operand_vals:
+            oid = id(operand)
+            if device_fn.pallas_memory_space.get(oid) == PallasMemorySpace.HBM:
+                continue  # respect an explicit HBM placement
+            device_fn.pallas_memory_space[oid] = (
+                PallasMemorySpace.VMEM
+                if oid in local_access_ids
+                else PallasMemorySpace.HBM
+            )
     elif is_all_scalar:
         # Only mark for SMEM if not already assigned to VMEM or HBM
         if current is None:

@@ -1535,7 +1535,7 @@ class AsyncCopyDescriptorType(ClassType):
         return AsyncCopyDescriptor()
 
     def propagate_attribute(self, attr: str, origin: AttributeOrigin) -> TypeInfo:
-        if attr == "wait":
+        if attr in ("wait", "wait_send"):
             return _AsyncCopyDescriptorMethodType(origin, self, attr)
         return super().propagate_attribute(attr, origin)
 
@@ -1571,8 +1571,14 @@ class _AsyncCopyDescriptorMethodType(TypeInfo):
                 f"AsyncCopyDescriptor.{self.method_name}() takes no arguments"
             )
         from ..language.distributed_ops import wait_async_remote_copy
+        from ..language.distributed_ops import wait_send_async_remote_copy
 
-        return CallableType(origin, wait_async_remote_copy).propagate_call(
+        api_fn = (
+            wait_send_async_remote_copy
+            if self.method_name == "wait_send"
+            else wait_async_remote_copy
+        )
+        return CallableType(origin, api_fn).propagate_call(
             (self.descriptor_type,), {}, origin
         )
 

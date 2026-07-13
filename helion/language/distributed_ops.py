@@ -75,6 +75,7 @@ __all__ = [
     "AsyncCopyDescriptor",
     "start_async_remote_copy",
     "wait_async_remote_copy",
+    "wait_send_async_remote_copy",
 ]
 
 
@@ -100,6 +101,20 @@ class AsyncCopyDescriptor:
         # ``wait_async_remote_copy(self)``, which adds a call_function
         # node to the FX graph.  Outside a kernel this is an error.
         return wait_async_remote_copy(self)
+
+    def wait_send(self) -> None:
+        """Wait for THIS rank's *outgoing* push to drain (the local send buffer
+        is free / the data has been delivered to the peer), rather than for an
+        *incoming* push into a local buffer.
+
+        Use this for a reduce-scatter / all-to-all direct-write where each rank
+        sends a data-dependent number of rows: every ``start`` is paired with
+        exactly one ``wait_send`` (balanced), so it never deadlocks on an uneven
+        receive count the way ``wait()`` (receive-side) would.  Cross-rank
+        visibility of the delivered rows is then established by a subsequent
+        device/host barrier (see the module docstring).
+        """
+        return wait_send_async_remote_copy(self)
 
 
 @has_side_effect
@@ -417,6 +432,80 @@ def _(state: CodegenState) -> object:
 
 
 # ---------------------------------------------------------------------------
+# wait_send — drain the OUTGOING push (send-side), not the incoming receive.
+
+
+@has_side_effect
+@_decorators.api(is_device_only=True, allow_host_tensor=True)
+def wait_send_async_remote_copy(descriptor: AsyncCopyDescriptor) -> None:
+    """Wait for a previously-started remote copy's *send* side to drain.
+
+    Normally invoked as ``descriptor.wait_send()``.  See
+    :meth:`AsyncCopyDescriptor.wait_send` for when to prefer it over ``wait()``.
+    """
+    raise exc.NotInsideKernel
+
+
+@_decorators.type_propagation(wait_send_async_remote_copy)
+def _(descriptor: TypeInfo, *, origin: Origin) -> TypeInfo:
+    from .._compiler.type_info import AsyncCopyDescriptorType
+    from .._compiler.type_info import NoType
+
+    if not isinstance(descriptor, AsyncCopyDescriptorType):
+        raise exc.TypeInferenceError(
+            "wait_send_async_remote_copy expects an AsyncCopyDescriptor "
+            "(returned by hl.start_async_remote_copy)"
+        )
+    return NoType(origin=origin)
+
+
+@_decorators.register_fake(wait_send_async_remote_copy)
+def _(descriptor: AsyncCopyDescriptor) -> None:
+    return None
+
+
+@_decorators.register_to_device_ir(wait_send_async_remote_copy)
+def _(tracer: object, descriptor: AsyncCopyDescriptor) -> None:
+    if not isinstance(descriptor, AsyncCopyDescriptor):
+        raise exc.TypeInferenceError(
+            "wait_send_async_remote_copy expects an AsyncCopyDescriptor "
+            "(returned by hl.start_async_remote_copy)"
+        )
+    assert descriptor._proxy is not None, (
+        "AsyncCopyDescriptor has no source FX proxy — this is a compiler bug"
+    )
+    tracer.create_proxy(  # type: ignore[attr-defined]
+        "call_function",
+        wait_send_async_remote_copy,
+        (descriptor._proxy,),
+        {},
+    )
+    return None
+
+
+@_decorators.codegen(wait_send_async_remote_copy, "pallas")
+def _(state: CodegenState) -> object:
+    """Emit ``<op_var>.wait_send()`` (drain the local send) using the op var
+    stashed by the paired ``start_async_remote_copy``."""
+    assert state.fx_node is not None
+    descriptor_arg = state.fx_node.args[0]
+    assert isinstance(descriptor_arg, torch.fx.Node), (
+        "wait_send_async_remote_copy argument must be an FX node returned by "
+        "start_async_remote_copy"
+    )
+    op_var = descriptor_arg.meta.get("_pallas_async_copy_op")
+    if op_var is None:
+        raise exc.InternalError(
+            RuntimeError(
+                "wait_send_async_remote_copy could not find the op variable name "
+                "on the descriptor's source node."
+            )
+        )
+    state.codegen.add_statement(statement_from_string(f"{op_var}.wait_send()"))
+    return expr_from_string("None")
+
+
+# ---------------------------------------------------------------------------
 # GPU (Triton) lowering -> NVSHMEM point-to-point put-with-signal.
 #
 # The same push-based, async, LOGICAL-PE-addressed model maps 1:1 onto the
@@ -532,4 +621,14 @@ def _(state: CodegenState) -> object:
     state.codegen.add_statement(
         statement_from_string(f"nvshmem_signal_wait_until({sig}, NVSHMEM_CMP_GE, 1)")
     )
+    return expr_from_string("None")
+
+
+@_decorators.codegen(wait_send_async_remote_copy, "triton")
+def _(state: CodegenState) -> object:
+    """Drain the local send on GPU with ``nvshmem_quiet`` (all outstanding puts
+    from this PE have completed) -- the NVSHMEM analog of ``.wait_send()``.  No
+    signal is consulted: this waits on the OUTGOING side, not an incoming push.
+    """
+    state.codegen.add_statement(statement_from_string("nvshmem_quiet()"))
     return expr_from_string("None")
