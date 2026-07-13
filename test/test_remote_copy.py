@@ -209,6 +209,49 @@ class TestRemoteCopyTritonCodegen(TestCase):
         self.assertNotIn("nvshmem_signal_wait_until", code)
 
 
+@helion.kernel(
+    backend="triton",
+    static_shapes=True,
+    config=helion.Config(block_sizes=[128, 64]),
+)
+def _fused_compute_scatter(src, w, scratch, recv, dest, ws: hl.constexpr, chunk, idim):
+    """A FUSED comms+compute kernel: per output chunk, a matmul + a reduce-scatter
+    push, in one grid iteration -- the fused MoE shape, one kernel."""
+    n = src.shape[1]
+    for k in hl.grid(ws):
+        for tm in hl.tile(chunk):
+            rows = k * chunk + tm.index
+            acc = hl.zeros([tm, idim], dtype=torch.float32)
+            for tk in hl.tile(n):
+                acc = torch.addmm(acc, src[rows, tk], w[tk, :])
+            scratch[k, tm.index, :] = acc.to(scratch.dtype)
+        op = hl.start_async_remote_copy(scratch, [k], dest[k], dst=recv, dst_index=[0])
+        op.wait()
+    return recv
+
+
+class TestFusedComputeCommsCodegen(TestCase):
+    def test_single_kernel_lowers_compute_and_comms_to_triton(self):
+        # The SAME single Helion kernel must emit BOTH the compute (tl.dot) and
+        # the reduce-scatter comms (nvshmem) into one Triton kernel.
+        ws, chunk, n, idim = 8, 128, 128, 128
+        args = (
+            torch.zeros(ws * chunk, n),
+            torch.zeros(n, idim),
+            torch.zeros(ws, chunk, idim),
+            torch.zeros(ws, chunk, idim),
+            torch.zeros(ws, dtype=torch.int32),
+            hl.constexpr(ws),
+            hl.constexpr(chunk),
+            hl.constexpr(idim),
+        )
+        cfg = helion.Config(block_sizes=[128, 64])
+        code = _fused_compute_scatter.bind(args).to_code(cfg)
+        self.assertIn("tl.dot", code)  # the fused matmul
+        self.assertIn("nvshmem_putmem_signal_block", code)  # the fused comms
+        self.assertIn("nvshmem_signal_wait_until", code)
+
+
 class TestRemoteCopyMemorySpace(TestCase):
     def test_pure_dma_target_routed_to_hbm(self):
         # A remote-copy operand the kernel never load/stores locally (a
