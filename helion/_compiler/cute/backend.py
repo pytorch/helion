@@ -2264,13 +2264,7 @@ class CuteBackend(Backend):
             # addmm/mm with float16/bfloat16 operands.
             mma_mode = False
             if is_device_loop:
-                mma_mode = _detect_specialized_mma_loop(
-                    fn,
-                    block_ids,
-                    block_sizes=nd_block_size,
-                    config=config,
-                )
-                if not mma_mode and _detect_attention_mma_loop(
+                if _detect_attention_mma_loop(
                     fn,
                     block_ids,
                     config=config,
@@ -2281,6 +2275,13 @@ class CuteBackend(Backend):
                     # whole device body; the FX-graph statement walk is bypassed.
                     mma_mode = True
                     fn.cute_state.attention_flash_block_ids = list(block_ids)
+                else:
+                    mma_mode = _detect_specialized_mma_loop(
+                        fn,
+                        block_ids,
+                        block_sizes=nd_block_size,
+                        config=config,
+                    )
             elif (
                 len(device_ir.grid_block_ids) == 1
                 and block_ids == device_ir.grid_block_ids[0]
@@ -2340,7 +2341,9 @@ class CuteBackend(Backend):
                 inactive_block_ids=inactive_block_ids,
             )
         nd_block_size = [bs.from_config_assert(config) for bs in block_size_infos]
-        block_size = functools.reduce(operator.mul, nd_block_size)  # pyrefly: ignore[incompatible-overload-residual]
+        block_size = functools.reduce(
+            operator.mul, nd_block_size
+        )  # pyrefly: ignore[incompatible-overload-residual]
         # Resolve per-axis thread counts then flatten to a single total
         all_auto = all(nt <= 0 for nt in num_threads_config)
         flat_num_threads = functools.reduce(

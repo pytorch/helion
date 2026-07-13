@@ -8777,6 +8777,23 @@ def flash_attention_tensor_plan(df: DeviceFunction) -> FlashTensorPlan | None:
     if graph_plan is None:
         return None
 
+    required_names = (
+        graph_plan.q_name,
+        graph_plan.k_name,
+        graph_plan.v_name,
+        graph_plan.o_name,
+        *graph_plan.bias_names,
+        *graph_plan.alibi_names,
+        *graph_plan.document_names,
+    )
+    if graph_plan.lse_name is not None:
+        required_names = (*required_names, graph_plan.lse_name)
+    host_tensors = _flash_graph_host_tensors(df.codegen.codegen_graphs)
+    if any(name not in host_tensors for name in required_names):
+        return None
+    for name in dict.fromkeys(required_names):
+        df.tensor_arg(host_tensors[name], prefer_name=name)
+
     tensor_args = [a for a in df.arguments if isinstance(a, TensorArg)]
     tensor_args_by_name = {a.name: a for a in tensor_args}
     q_arg = tensor_args_by_name.get(graph_plan.q_name)
@@ -8914,11 +8931,12 @@ def flash_attention_tensor_plan(df: DeviceFunction) -> FlashTensorPlan | None:
 def codegen_attention_flash(cg: GenerateAST) -> bool:
     """Replace the device body with the fused tcgen05 flash-attention kernel.
 
-    Called from ``generate_ast.visit_For`` after the FX body walk completes and
-    the flash detector has set ``attention_flash_block_ids``. Returns True when
-    the flash kernel was emitted (and the FX-derived body discarded), False when
-    the shape/layout is outside the validated envelope (so the caller keeps the
-    scalar fallback body). Because the detector routes through the same
+    Called from ``generate_ast.visit_For`` after the flash detector has set
+    ``attention_flash_block_ids``. Returns True when the flash kernel was emitted
+    and the FX-derived scalar body can be skipped, False when the shape/layout is
+    outside the validated envelope. The caller treats False as a late validation
+    failure and raises ``BackendUnsupported`` rather than emitting the scalar
+    body. Because the detector routes through the same
     ``flash_attention_tensor_plan`` gate, a False return here is a defensive
     backstop rather than an expected path.
     """
