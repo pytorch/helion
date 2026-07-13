@@ -44,29 +44,26 @@ import helion.language as hl
 
 @helion.kernel(backend="pallas", distributed=[8], config=helion.Config())
 def ring_all_gather(
-    local: torch.Tensor,
     gather: torch.Tensor,
     rank: hl.constexpr,
     world_size: hl.constexpr,
 ) -> torch.Tensor:
     """Ring all-gather.
 
-    ``gather`` has shape ``(world_size, *local.shape)`` and is filled
-    in-place by the kernel.  At step 0 the kernel seeds slot ``rank``
-    with ``local`` (the local piece); on each subsequent iteration it
-    pushes the current slot to the right neighbour.  After
-    ``world_size - 1`` iterations every rank has the full gathered
-    tensor.
+    ``gather`` has shape ``(world_size, *local.shape)`` and is pre-seeded on the
+    HOST so slot ``rank`` holds this chip's local piece.  On each of the
+    ``world_size - 1`` steps the kernel pushes the current slot to the right
+    neighbour; after the loop every rank holds the full gathered tensor.
+
+    The kernel body performs ONLY DMA forwards -- no local store to ``gather`` --
+    so ``gather`` is routed to an HBM ref that persists across the grid steps.
+    (A local store would force it to VMEM, where each grid program gets a private
+    copy and only the seed slot survives; see
+    ``helion/_compiler/pallas/plan_tiling.py``.)
     """
     right = (rank + 1) % world_size
     for step in hl.grid(world_size - 1):
         # rank and world_size are constexpr; step is a symint.
-        if step == 0:
-            # Seed slot ``rank`` with this device's local piece.  Pallas
-            # allows ``pltpu.make_async_remote_copy`` to address any
-            # memory space, so ``gather`` stays in VMEM by default and
-            # the assignment is an ordinary slice store.
-            gather[rank, :, :] = local
         slot = (rank + world_size - step) % world_size
         ring_step = hl.start_async_remote_copy(gather, [slot], right)
         ring_step.wait()
@@ -92,17 +89,18 @@ def _run() -> None:
         (per, inner), float(device_id), dtype=torch.float32, device=device
     )
 
-    # Symmetric gather buffer: (world_size, per, inner).  Every rank
-    # allocates the same shape.  The kernel seeds slot ``device_id``
-    # from ``local`` in-place; no host-side seeding is required.
+    # Symmetric gather buffer: (world_size, per, inner).  Every rank allocates
+    # the same shape and HOST-seeds slot ``device_id`` with its local piece, so
+    # the kernel can keep ``gather`` in HBM (see the kernel docstring).
     gather = torch.zeros((world_size, per, inner), dtype=torch.float32, device=device)
+    gather[device_id] = local
 
     # ring_all_gather is a torch-tensor-facing Helion kernel; call it
     # like any torch op.  With this rank's constexpr rank baked in,
     # the kernel emits an 8-chip-mesh Pallas program that DMAs slots
     # around the ring.
     gathered = ring_all_gather(
-        local, gather, hl.constexpr(device_id), hl.constexpr(world_size)
+        gather, hl.constexpr(device_id), hl.constexpr(world_size)
     )
 
     expected = torch.stack(
