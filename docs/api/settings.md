@@ -115,6 +115,21 @@ def my_kernel(x: torch.Tensor) -> torch.Tensor:
 
    Reserve this many streaming multiprocessors when launching persistent kernels. Default is ``0`` (use all SMs).
    Configure globally with ``HELION_PERSISTENT_RESERVED_SMS`` or per-kernel via ``@helion.kernel(..., persistent_reserved_sms=N)``.
+
+.. autoattribute:: Settings.triton_fused_launch
+
+   If ``True`` (default), after one priming launch the argument-dispatch, generated
+   host-wrapper, and launcher layers are collapsed into a single cached closure, so repeat
+   calls launch the compiled kernel directly from ``Kernel.__call__`` -- substantially
+   reducing per-call host overhead. The two launch hazards the wrapper/launcher normally
+   guard are folded into the fused cache key (per-tensor 16-byte alignment and
+   ``used_global_vals`` values); any deviation, and ``torch.compile`` tracing, fall back to
+   the full path. Triton-only.
+
+   Fusion is automatically disabled for a kernel whose generated host wrapper returns a value
+   (e.g. allocates its output), issues multiple device launches, or takes cooperative-grid
+   launches. Disable per-kernel with ``@helion.kernel(triton_fused_launch=False)`` or globally
+   with ``HELION_TRITON_FUSED_LAUNCH=0``.
 ```
 
 ### Autotuning Settings
@@ -321,6 +336,7 @@ Built-in values for ``HELION_AUTOTUNER`` include ``"LFBOTreeSearch"`` (default),
 | ``HELION_STATIC_SHAPES`` | ``static_shapes`` | Set to ``0``/``false`` to disable global static shape specialization. |
 | ``HELION_FAST_MATH`` | ``fast_math`` | Set to ``1`` to enable fast math approximations (Helion-level and Inductor-level). May reduce numerical precision. |
 | ``HELION_PERSISTENT_RESERVED_SMS`` | ``persistent_reserved_sms`` | Reserve this many streaming multiprocessors when launching persistent kernels (``0`` uses all available SMs). |
+| ``HELION_TRITON_FUSED_LAUNCH`` | ``triton_fused_launch`` | Set to ``0`` to disable the fused launch fast path (dispatch + host wrapper + launcher collapsed into one cached closure) and route every launch through ``JITFunction.run``. |
 | ``HELION_FORCE_AUTOTUNE`` | ``force_autotune`` | Force the autotuner to run even when explicit configs are provided. The result is saved to the cache. |
 | ``HELION_AUTOTUNE_FORCE_PERSISTENT`` | ``autotune_force_persistent`` | Restrict ``pid_type`` to persistent kernel strategies during config search. |
 | ``HELION_DISALLOW_AUTOTUNING`` | ``check_autotuning_disabled`` | Hard-disable autotuning; kernels must supply explicit configs when this is ``1``. |

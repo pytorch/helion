@@ -58,6 +58,9 @@ from .._logging import LazyString
 from .._utils import counters
 from ..autotuner.base_search import _AutotunableKernel
 from ..language.constexpr import ConstExpr
+from ._fused_launch import GlobalsChanged
+from ._fused_launch import _LayoutChanged
+from ._fused_launch import build_key_fn
 from .config import Config
 from .ref_mode import RefModeContext
 from .ref_mode import is_ref_mode_enabled
@@ -244,6 +247,23 @@ class Kernel(Generic[_R]):
 
             self._capture_op = register_decoration_op(self)
 
+        # Fused launch (helion/runtime/_fused_launch.py) is Triton-only; resolved
+        # once here to keep the __call__ hot path branch-free.
+        self._fused_launch: bool = (
+            self.settings.backend == "triton" and self.settings.triton_fused_launch
+        )
+        # Fused-launch state (kernel-wide): a cache of launch recipes keyed by
+        # the fused dispatch key, a flat eval-compiled builder for that key
+        # (lazily built for the seen argument layout), and a latch that
+        # permanently disables fusion for a non-fuseable kernel.
+        self._fused_recipes: dict[Hashable, Callable[[tuple[object, ...]], None]] = {}
+        self._fused_key_fn: Callable[[tuple[object, ...]], Hashable] | None = None
+        self._fused_disabled: bool = False
+        # Whether this kernel's generated host wrapper is a plain launch (fuseable)
+        # vs. one that does host-side tensor work the recipe can't reproduce; None
+        # until checked once on the first prime.
+        self._fused_wrapper_ok: bool | None = None
+
     @functools.cache  # noqa: B019
     def kernel_source(self) -> str:
         """
@@ -322,6 +342,31 @@ class Kernel(Generic[_R]):
         if self._key_fn is not None:
             key.append(self._key_fn(*args))
         return tuple(key)
+
+    def _fused_dispatch_key(self, args: tuple[object, ...]) -> Hashable | None:
+        """Dispatch key for the fused launch cache (see ``_fused_launch.py``).
+
+        Encodes the same information as :meth:`_fast_dispatch_key`, plus a 16-byte
+        pointer-alignment bit per
+        tensor (the fused path bypasses the direct-launch key where alignment is
+        normally guarded, so it folds that hazard in here) and always builds a
+        key (no device-pinning bail).  The builder embeds a per-position class
+        guard, so a call whose argument *layout* differs from the one it was
+        compiled for raises :class:`_LayoutChanged` and is rebuilt -- never a
+        false hit.
+        """
+        key_fn = self._fused_key_fn
+        if key_fn is None:
+            key_fn = self._fused_key_fn = build_key_fn(
+                args, self._key_fn, include_alignment=True, bail_when_no_tensor=False
+            )
+        try:
+            return cast("Hashable", key_fn(args))
+        except _LayoutChanged:
+            key_fn = self._fused_key_fn = build_key_fn(
+                args, self._key_fn, include_alignment=True, bail_when_no_tensor=False
+            )
+            return cast("Hashable", key_fn(args))
 
     def bind(self, args: tuple[object, ...]) -> BoundKernel[_R]:
         """
@@ -490,17 +535,49 @@ class Kernel(Generic[_R]):
         """
         if kwargs:
             args = self.normalize_args(*args, **kwargs)
-        elif self._dispatch_cache:
-            # Fast path: repeat call with argument metadata seen before. The
-            # cache is only populated by calls that already took the slow
-            # path below, so hitting it cannot skip autotuning/compilation.
-            # (The cache stays empty under TPU compile capture, so this
-            # cannot bypass auto_capture_call below.)
-            fast_key = self._fast_dispatch_key(args)
-            if fast_key is not None:
-                bound = self._dispatch_cache.get(fast_key)
-                if bound is not None and bound._run is not None:
-                    return bound._run(*args)
+        else:
+            # Fused fast path: one key straight to a cached launch closure that
+            # verifies captured globals, allocates any outputs, launches, and
+            # returns the wrapper's result -- skipping the dispatch, wrapper, and
+            # launcher frames.  Recipes are only populated by a prime that took
+            # the slow path, so this cannot bypass autotuning/compilation.
+            # Skipped under torch.compile: the raw launch is not traceable
+            # (dynamo must see the ``JITFunction.run`` path instead).
+            fused = self._fused_launch and not torch.compiler.is_compiling()
+            if fused and self._fused_recipes:
+                # Build the key via the cached flat lambda directly (hot path);
+                # only fall back to the method for the rare layout-change rebuild.
+                key_fn = self._fused_key_fn
+                try:
+                    fused_key = key_fn(args)  # type: ignore[misc]
+                except _LayoutChanged:
+                    fused_key = self._fused_dispatch_key(args)
+                launch = self._fused_recipes.get(fused_key)
+                if launch is not None:
+                    try:
+                        return cast("_R", launch(args))
+                    except GlobalsChanged:
+                        # A captured Triton global was mutated since priming;
+                        # fall through so the slow path re-validates and raises
+                        # Triton's own error.  Other exceptions propagate.
+                        pass
+            if self._dispatch_cache:
+                # Repeat call with argument metadata seen before. The cache is
+                # only populated by calls that already took the slow path below,
+                # so hitting it cannot skip autotuning/compilation.  (It stays
+                # empty under TPU compile capture, so this cannot bypass
+                # auto_capture_call below.)
+                fast_key = self._fast_dispatch_key(args)
+                if fast_key is not None:
+                    bound = self._dispatch_cache.get(fast_key)
+                    if bound is not None and bound._run is not None:
+                        if fused and not self._fused_disabled:
+                            # Prime the fused recipe for this key (executes the
+                            # launch), or latch fusion off if not fuseable.
+                            from ._fused_launch import fused_prime
+
+                            return cast("_R", fused_prime(self, bound, args))
+                        return bound._run(*args)
         if self.settings.backend == "pallas" and _TPU_COMPILE_CAPTURE:
             # Local import: _tpu_compile_capture pulls in the dynamo HOP machinery,
             # not ready when kernel.py first loads during ``import helion``.
@@ -526,6 +603,10 @@ class Kernel(Generic[_R]):
         """
         self._bound_kernels.clear()
         self._dispatch_cache.clear()
+        self._fused_recipes.clear()
+        self._fused_key_fn = None
+        self._fused_disabled = False
+        self._fused_wrapper_ok = None
 
     @property
     def jax_fn(self) -> Callable[..., Any]:
@@ -969,6 +1050,10 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
         config = self._normalize_config(config)
         self._run = self.compile_config(config)
         self._config = config
+        # A recompile invalidates the kernel's fused launch recipes, which cache
+        # the old compiled binary directly (the JITFunction's own direct-launch
+        # cache is dropped by TritonBackend._clear_triton_jit_cache likewise).
+        self.kernel._fused_recipes.clear()
         counters["best_config_decorator"][
             self.format_kernel_decorator(config, self.settings)
         ] = 1

@@ -1414,5 +1414,402 @@ class TestLauncher(TestCase):
         torch.testing.assert_close(out1, 2 * x1)
 
 
+@onlyBackends(["triton"])
+class TestFusedLauncher(TestCase):
+    """Fused launch (``triton_fused_launch``, default on) collapses dispatch,
+    the generated host wrapper, and the launcher into a single cached closure
+    for in-place / out-arg kernels.  These tests pin down that it engages when
+    it should, stays disabled when it must, and preserves the same launch
+    contract (alignment, captured globals) as the direct-launch path.
+    """
+
+    @staticmethod
+    def _add_out_kernel():
+        # Writes to a user out-arg and returns None -> fuseable.
+        @helion.kernel(
+            static_shapes=True,
+            config=helion.Config(block_sizes=[1024], num_warps=4, num_stages=2),
+            # Pin the fused path on so these tests exercise it even if the
+            # triton_fused_launch default later changes.
+            triton_fused_launch=True,
+        )
+        def add_out(x: torch.Tensor, y: torch.Tensor, out: torch.Tensor) -> None:
+            for i in hl.tile(out.size(0)):
+                out[i] = x[i] + y[i]
+
+        return add_out
+
+    @skipIfRefEager("Inspects the kernel's fused-launch cache, absent in ref eager")
+    def test_fused_cache_engages_for_out_arg_kernel(self) -> None:
+        add_out = self._add_out_kernel()
+        n = 1024
+        x = torch.randn(n, device=DEVICE, dtype=torch.float32)
+        y = torch.randn(n, device=DEVICE, dtype=torch.float32)
+        out = torch.empty(n, device=DEVICE, dtype=torch.float32)
+
+        # First call primes the dispatch/direct-launch caches; the second call
+        # (a dispatch-cache hit) primes the fused recipe.
+        add_out(x, y, out)
+        torch.accelerator.synchronize()
+        self.assertEqual(len(add_out._fused_recipes), 0)  # type: ignore[attr-defined]
+
+        add_out(x, y, out)
+        torch.accelerator.synchronize()
+        self.assertEqual(len(add_out._fused_recipes), 1)  # type: ignore[attr-defined]
+        torch.testing.assert_close(out, x + y)
+
+        # A repeat call reuses the single recipe and stays correct.
+        out.zero_()
+        add_out(x, y, out)
+        torch.accelerator.synchronize()
+        self.assertEqual(len(add_out._fused_recipes), 1)  # type: ignore[attr-defined]
+        torch.testing.assert_close(out, x + y)
+
+    @skipIfRefEager("Inspects the kernel's fused-launch cache, absent in ref eager")
+    def test_fused_disabled_for_tensor_returning_kernel(self) -> None:
+        # A kernel that allocates and returns its output cannot be fused (its
+        # wrapper produces a value the fused path can't reproduce); it must
+        # latch off and still compute correctly.
+        @helion.kernel(
+            static_shapes=True,
+            config=helion.Config(block_sizes=[1024], num_warps=4, num_stages=2),
+            triton_fused_launch=True,
+        )
+        def add(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for i in hl.tile(out.size(0)):
+                out[i] = x[i] + y[i]
+            return out
+
+        x = torch.randn(1024, device=DEVICE, dtype=torch.float32)
+        for _ in range(3):
+            torch.testing.assert_close(add(x, x), x + x)
+        torch.accelerator.synchronize()
+        self.assertTrue(add._fused_disabled)  # type: ignore[attr-defined]
+        self.assertEqual(len(add._fused_recipes), 0)  # type: ignore[attr-defined]
+
+    def test_fused_unaligned_input_produces_correct_output(self) -> None:
+        # An unaligned input arriving after an aligned prime must stay correct:
+        # the alignment bit is in the fused key, so it gets its own recipe.
+        add_out = self._add_out_kernel()
+        n = 1024
+        base_x = torch.randn(n + 4, device=DEVICE, dtype=torch.float32)
+        base_out = torch.empty(n + 4, device=DEVICE, dtype=torch.float32)
+        aligned_x, aligned_out = base_x[:n], base_out[:n]
+        unaligned_x, unaligned_out = base_x[1 : n + 1], base_out[1 : n + 1]
+        self.assertEqual(aligned_x.data_ptr() % 16, 0)
+        self.assertNotEqual(unaligned_x.data_ptr() % 16, 0)
+
+        # Prime aligned twice (engage fusion), then interleave alignments.
+        add_out(aligned_x, aligned_x, aligned_out)
+        add_out(aligned_x, aligned_x, aligned_out)
+        torch.accelerator.synchronize()
+        for _ in range(3):
+            add_out(aligned_x, aligned_x, aligned_out)
+            add_out(unaligned_x, unaligned_x, unaligned_out)
+        torch.accelerator.synchronize()
+        torch.testing.assert_close(aligned_out, aligned_x + aligned_x)
+        torch.testing.assert_close(unaligned_out, unaligned_x + unaligned_x)
+
+    @skipIfRefEager("Inspects the kernel's fused-launch cache, absent in ref eager")
+    def test_fused_disabled_when_wrapper_reads_module_global(self) -> None:
+        # A Helion module-scope global used in device code is promoted by the
+        # generated wrapper to a scalar launch arg, re-read from live module
+        # state (``_source_module.<attr>``) on every call.  The fused recipe
+        # bakes scalar launch args as constants at prime time, so it would freeze
+        # the global's value and silently ignore a later mutation.  Fusion must
+        # therefore latch off for such a kernel, and the (non-fused) result must
+        # track the mutated global -- matching the default launcher.
+        globals()["_FUSED_LAUNCH_GLOBAL_SCALE"] = 2.0
+
+        @helion.kernel(
+            static_shapes=True,
+            config=helion.Config(block_sizes=[1024], num_warps=4, num_stages=2),
+            triton_fused_launch=True,
+        )
+        def scale_out(x: torch.Tensor, out: torch.Tensor) -> None:
+            for i in hl.tile(out.size(0)):
+                out[i] = x[i] * _FUSED_LAUNCH_GLOBAL_SCALE  # noqa: F821
+
+        n = 1024
+        x = torch.randn(n, device=DEVICE, dtype=torch.float32)
+        out = torch.empty(n, device=DEVICE, dtype=torch.float32)
+        scale_out(x, out)
+        scale_out(x, out)  # would engage fusion, but the wrapper reads a global
+        torch.accelerator.synchronize()
+        self.assertTrue(scale_out._fused_disabled)  # type: ignore[attr-defined]
+        self.assertEqual(len(scale_out._fused_recipes), 0)  # type: ignore[attr-defined]
+        torch.testing.assert_close(out, x * 2.0)
+
+        # Mutating the global must be reflected on the next call (no stale bake).
+        original = globals()["_FUSED_LAUNCH_GLOBAL_SCALE"]
+        try:
+            globals()["_FUSED_LAUNCH_GLOBAL_SCALE"] = 3.0
+            scale_out(x, out)
+            torch.accelerator.synchronize()
+            torch.testing.assert_close(out, x * 3.0)
+        finally:
+            globals()["_FUSED_LAUNCH_GLOBAL_SCALE"] = original
+
+        scale_out(x, out)
+        torch.accelerator.synchronize()
+        torch.testing.assert_close(out, x * 2.0)
+
+    @skipIfRefEager("Inspects the kernel's fused-launch cache, absent in ref eager")
+    def test_fused_can_be_disabled_by_setting(self) -> None:
+        @helion.kernel(
+            static_shapes=True,
+            config=helion.Config(block_sizes=[1024], num_warps=4, num_stages=2),
+            triton_fused_launch=False,
+        )
+        def add_out(x: torch.Tensor, y: torch.Tensor, out: torch.Tensor) -> None:
+            for i in hl.tile(out.size(0)):
+                out[i] = x[i] + y[i]
+
+        n = 1024
+        x = torch.randn(n, device=DEVICE, dtype=torch.float32)
+        out = torch.empty(n, device=DEVICE, dtype=torch.float32)
+        for _ in range(3):
+            add_out(x, x, out)
+        torch.accelerator.synchronize()
+        self.assertFalse(add_out._fused_launch)  # type: ignore[attr-defined]
+        self.assertEqual(len(add_out._fused_recipes), 0)  # type: ignore[attr-defined]
+        torch.testing.assert_close(out, x + x)
+
+    @staticmethod
+    def _optional_bias_kernel():
+        # bias is a tensor or None; the branch is resolved at trace time, so each
+        # variant compiles a distinct specialization.
+        @helion.kernel(
+            static_shapes=True,
+            config=helion.Config(block_sizes=[64], num_warps=4, num_stages=2),
+            ignore_warnings=[helion.exc.TensorOperationInWrapper],
+            triton_fused_launch=True,
+        )
+        def opt_bias(x: torch.Tensor, out: torch.Tensor, bias: object) -> None:
+            for i in hl.tile(x.size(0)):
+                if bias is None:
+                    out[i] = x[i] * 2
+                else:
+                    out[i] = x[i] + bias[i]
+
+        return opt_bias
+
+    def test_fused_none_primed_then_tensor_is_not_a_false_hit(self) -> None:
+        # Regression: the fused key must embed type() per position, so a call
+        # that passes a tensor where the prime saw None does NOT collide with the
+        # None-specialized recipe (which would silently run out = x*2).
+        opt_bias = self._optional_bias_kernel()
+        n = 64
+        x = torch.randn(n, device=DEVICE, dtype=torch.float32)
+        bias = torch.randn(n, device=DEVICE, dtype=torch.float32)
+        out = torch.empty(n, device=DEVICE, dtype=torch.float32)
+
+        opt_bias(x, out, None)
+        opt_bias(x, out, None)  # prime the None specialization's fused recipe
+        torch.accelerator.synchronize()
+
+        opt_bias(x, out, bias)  # must run x + bias, not the None kernel's x * 2
+        torch.accelerator.synchronize()
+        torch.testing.assert_close(out, x + bias)
+
+    @skipIfRefEager("Inspects the kernel's fused-launch cache, absent in ref eager")
+    def test_fused_two_tensors_after_none_prime_are_not_a_false_hit(self) -> None:
+        # Regression: after a None prime bakes the key builder for the None
+        # layout, a tensor arriving at that position must force a rebuild -- not
+        # be served by a key that records only its class.  Otherwise TWO
+        # different tensors at that position (differing only in metadata the
+        # truncated key dropped, e.g. dtype) collide on one recipe and the second
+        # silently reuses the first's launch.  Uses a per-arg dtype so the two
+        # tensor calls must resolve to distinct specializations.
+        @helion.kernel(
+            static_shapes=False,
+            config=helion.Config(block_sizes=[16], num_warps=4, num_stages=2),
+            ignore_warnings=[helion.exc.TensorOperationInWrapper],
+            triton_fused_launch=True,
+        )
+        def opt_bias(x: torch.Tensor, out: torch.Tensor, bias: object) -> None:
+            for i in hl.tile(x.size(0)):
+                if bias is None:
+                    out[i] = x[i] * 2
+                else:
+                    out[i] = x[i] + bias[i].to(x.dtype)
+
+        n = 64
+        x = torch.randn(n, device=DEVICE, dtype=torch.float32)
+        out = torch.empty(n, device=DEVICE, dtype=torch.float32)
+        b32 = torch.randn(n, device=DEVICE, dtype=torch.float32)
+        b16 = torch.randn(n, device=DEVICE, dtype=torch.float16)
+
+        opt_bias(x, out, None)
+        opt_bias(x, out, None)  # bake the None-layout key builder + prime recipe
+        torch.accelerator.synchronize()
+
+        opt_bias(x, out, b32)
+        opt_bias(x, out, b32)  # prime the fp32-bias recipe
+        torch.accelerator.synchronize()
+        torch.testing.assert_close(out, x + b32)
+
+        # An fp16 bias with identical x/out metadata must NOT hit the fp32 recipe.
+        for _ in range(3):
+            opt_bias(x, out, b16)
+            torch.accelerator.synchronize()
+            torch.testing.assert_close(out, x + b16.to(torch.float32))
+
+    def test_fused_tensor_primed_then_none_does_not_crash(self) -> None:
+        # Regression: priming a second layout (tensor position now None) must not
+        # raise out of the key builder; it rebuilds for the new layout.
+        opt_bias = self._optional_bias_kernel()
+        n = 64
+        x = torch.randn(n, device=DEVICE, dtype=torch.float32)
+        bias = torch.randn(n, device=DEVICE, dtype=torch.float32)
+        out = torch.empty(n, device=DEVICE, dtype=torch.float32)
+
+        opt_bias(x, out, bias)
+        opt_bias(x, out, bias)  # prime the tensor specialization
+        torch.accelerator.synchronize()
+
+        opt_bias(x, out, None)  # None where a tensor was primed: no crash
+        torch.accelerator.synchronize()
+        torch.testing.assert_close(out, x * 2)
+
+    @skipIfRefEager("Inspects the kernel's fused-launch cache, absent in ref eager")
+    def test_fused_respects_user_key_fn(self) -> None:
+        # Regression: the fused key must include the user key= result, and a
+        # fused hit must consult it -- otherwise two calls with identical tensor
+        # metadata but different key= values collide on one recipe.
+        calls: list[int] = []
+
+        def keyfn(x: torch.Tensor, out: torch.Tensor, m: int) -> int:
+            calls.append(m)
+            return m
+
+        @helion.kernel(
+            static_shapes=True,
+            config=helion.Config(block_sizes=[64], num_warps=4, num_stages=2),
+            ignore_warnings=[helion.exc.TensorOperationInWrapper],
+            key=keyfn,
+            triton_fused_launch=True,
+        )
+        def modal(x: torch.Tensor, out: torch.Tensor, m: int) -> None:
+            for i in hl.tile(x.size(0)):
+                out[i] = x[i] + m
+
+        n = 64
+        x = torch.randn(n, device=DEVICE, dtype=torch.float32)
+        out = torch.empty(n, device=DEVICE, dtype=torch.float32)
+
+        modal(x, out, 3)
+        modal(x, out, 3)  # prime m=3
+        torch.accelerator.synchronize()
+        if modal._fused_disabled:  # type: ignore[attr-defined]
+            self.skipTest("Fused launch disabled")
+        n_before = len(calls)
+
+        modal(x, out, 7)  # different key= value: must not reuse the m=3 recipe
+        torch.accelerator.synchronize()
+        torch.testing.assert_close(out, x + 7)
+        # key= was consulted while building the fused key on the m=7 call.
+        self.assertGreater(len(calls), n_before)
+
+    @skipIfRefEager("Inspects the kernel's fused-launch cache, absent in ref eager")
+    def test_fused_disabled_for_host_side_side_effect(self) -> None:
+        # Regression: a wrapper that runs a host-side side effect (out.zero_())
+        # before a partial-coverage device loop must NOT fuse -- the recipe would
+        # skip the zero_ and leave stale data in the uncovered region.
+        @helion.kernel(
+            static_shapes=True,
+            config=helion.Config(block_sizes=[64], num_warps=4, num_stages=2),
+            ignore_warnings=[helion.exc.TensorOperationInWrapper],
+            triton_fused_launch=True,
+        )
+        def partial(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            out.zero_()
+            for i in hl.tile(64):  # covers only the first 64 rows of a larger x
+                out[i] = x[i] + 1
+            return out
+
+        x = torch.randn(256, device=DEVICE, dtype=torch.float32)
+        for _ in range(3):
+            r = partial(x)
+            torch.accelerator.synchronize()
+            # Covered region is x+1; the untouched tail must stay zeroed.
+            torch.testing.assert_close(r[:64], x[:64] + 1)
+            self.assertEqual(int(torch.count_nonzero(r[64:])), 0)
+        self.assertTrue(partial._fused_disabled)  # type: ignore[attr-defined]
+        self.assertEqual(len(partial._fused_recipes), 0)  # type: ignore[attr-defined]
+
+    @skipIfRefEager("Inspects the kernel's fused-launch cache, absent in ref eager")
+    def test_fused_disabled_for_side_effect_in_assign_rhs(self) -> None:
+        # Regression: a host side effect hidden in an assignment RHS
+        # (``out = out.zero_()``) must NOT fuse. This is an out-arg kernel that
+        # returns None, so the ONLY thing that can disable fusion is the RHS
+        # side-effect check -- if the wrapper-fuseability scan waves the Assign
+        # through, the recipe replays without the zero_ and leaves stale data in
+        # the region the partial-coverage device loop does not cover.
+        @helion.kernel(
+            static_shapes=True,
+            config=helion.Config(block_sizes=[64], num_warps=4, num_stages=2),
+            ignore_warnings=[helion.exc.TensorOperationInWrapper],
+            triton_fused_launch=True,
+        )
+        def partial(x: torch.Tensor, out: torch.Tensor) -> None:
+            out = out.zero_()  # side effect on the RHS of an assignment
+            for i in hl.tile(64):  # covers only the first 64 rows of a larger x
+                out[i] = x[i] + 1
+
+        x = torch.randn(256, device=DEVICE, dtype=torch.float32)
+        out = torch.empty(256, device=DEVICE, dtype=torch.float32)
+        for _ in range(3):
+            out.fill_(99.0)  # dirty the tail before each call
+            partial(x, out)
+            torch.accelerator.synchronize()
+            # Covered region is x+1; the untouched tail must be re-zeroed.
+            torch.testing.assert_close(out[:64], x[:64] + 1)
+            self.assertEqual(int(torch.count_nonzero(out[64:])), 0)
+        self.assertTrue(partial._fused_disabled)  # type: ignore[attr-defined]
+        self.assertEqual(len(partial._fused_recipes), 0)  # type: ignore[attr-defined]
+
+    @skipIfRefEager("Inspects the kernel's fused-launch cache, absent in ref eager")
+    def test_fused_engages_for_view_and_assert_wrapper(self) -> None:
+        # The replayability check must not over-reject: a wrapper made of
+        # asserts, shape unpacking, and pure .view() reshapes (the pretuned
+        # benchmark kernel's shape) stays fuseable.
+        @helion.kernel(
+            static_shapes=True,
+            config=helion.Config(block_sizes=[64], num_warps=4, num_stages=2),
+            ignore_warnings=[helion.exc.TensorOperationInWrapper],
+            triton_fused_launch=True,
+        )
+        def viewy(x: torch.Tensor, out: torch.Tensor) -> None:
+            assert x.ndim == 2
+            m, n = x.shape
+            x = x.view(m * n)
+            out = out.view(m * n)
+            for i in hl.tile(m * n):
+                out[i] = x[i] * 2.0
+
+        x = torch.randn(16, 64, device=DEVICE, dtype=torch.float32)
+        out = torch.empty_like(x)
+        viewy(x, out)
+        viewy(x, out)  # prime
+        torch.accelerator.synchronize()
+        # The view+assert wrapper must be accepted by the replayability check.
+        # (A recipe may still fail to form if a Triton launch hook/knob is
+        # active -- an environmental skip -- but that latches _fused_disabled
+        # without flipping _fused_wrapper_ok, so the two cases stay distinct: an
+        # over-rejecting wrapper scan sets _fused_wrapper_ok False and fails here
+        # rather than being masked by the skip.)
+        self.assertTrue(viewy._fused_wrapper_ok)  # type: ignore[attr-defined]
+        if not viewy._fused_recipes:  # type: ignore[attr-defined]
+            self.skipTest("Fused launch did not engage (a Triton hook/knob)")
+        self.assertFalse(viewy._fused_disabled)  # type: ignore[attr-defined]
+        out.zero_()
+        viewy(x, out)
+        torch.accelerator.synchronize()
+        torch.testing.assert_close(out, x * 2.0)
+
+
 if __name__ == "__main__":
     unittest.main()
