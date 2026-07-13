@@ -160,7 +160,10 @@ def _analyze_indexing(node: torch.fx.Node, config: Config) -> None:
     # mixed tensors in VMEM. This is correct for the common cases
     # (scalar-only → SMEM, mixed scalar-read + slice → VMEM) but
     # over-allocates SMEM for scalar-read-only tensors.
+    from ...language import distributed_ops
     from ..device_function import PallasMemorySpace
+
+    is_remote_copy = node.target is distributed_ops.start_async_remote_copy
 
     is_all_scalar = all(
         isinstance(p, (ArbitraryIndexPattern, TileBeginWithOffsetPattern, NonePattern))
@@ -168,7 +171,32 @@ def _analyze_indexing(node: torch.fx.Node, config: Config) -> None:
     )
     tid = id(tensor_val)
     current = device_fn.pallas_memory_space.get(tid)
-    if is_all_scalar:
+    if is_remote_copy:
+        # Remote-copy operands are addressed directly by make_async_remote_copy
+        # and must never be SMEM (they are row buffers, not scalar values).
+        #   * SRC (args[0]): a read-only DMA source -> VMEM.  It may be produced
+        #     in-loop by the compute (a fused comms+compute kernel), which needs
+        #     VMEM to store into; and a read-only VMEM input is copied in whole
+        #     per program, so a runtime row-select reads correctly.
+        #   * DST (args[3]): the peer-written target -> HBM.  With a multi-program
+        #     grid a VMEM output gives each program a private copy whose writeback
+        #     clobbers other programs' scattered writes (only the last survives);
+        #     an HBM ref is shared/persistent and written in place, exactly what a
+        #     reduce-scatter direct-write needs.
+        if current != PallasMemorySpace.HBM:
+            device_fn.pallas_memory_space[tid] = PallasMemorySpace.VMEM
+        # prepare_args normalizes start_async_remote_copy to the full 5-arg form,
+        # so args[3] (dst) is always present (mirrors device_function.py).
+        assert len(node.args) == 5, (
+            "start_async_remote_copy must be normalized to 5 args by "
+            f"prepare_args (got {len(node.args)})"
+        )
+        dst_arg = node.args[3]
+        if isinstance(dst_arg, torch.fx.Node):
+            dst_val = dst_arg.meta.get("val")
+            if isinstance(dst_val, torch.Tensor):
+                device_fn.pallas_memory_space[id(dst_val)] = PallasMemorySpace.HBM
+    elif is_all_scalar:
         # Only mark for SMEM if not already assigned to VMEM or HBM
         if current is None:
             device_fn.pallas_memory_space[tid] = PallasMemorySpace.SMEM

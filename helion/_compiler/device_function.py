@@ -1149,14 +1149,31 @@ class DeviceFunction:
                         read_names.add(name)
                         write_names.add(name)
                 elif node.target is distributed_ops.start_async_remote_copy:
-                    # start_async_remote_copy(tensor, index, device_id):
-                    # reads the local slot as the DMA source AND writes
-                    # the peer's copy of the same slot.  Locally the
-                    # tensor is both read and written.
-                    name = _get_tensor_name(node)
-                    if name is not None:
-                        read_names.add(name)
-                        write_names.add(name)
+                    # start_async_remote_copy(src, src_index, device_id, dst,
+                    # dst_index): ``src`` is READ locally as the DMA source.
+                    # ``dst`` is a SYMMETRIC buffer: this rank writes peers'
+                    # copies of it and its own copy is written by peers, then
+                    # read after the kernel.  It must be treated as an in-place
+                    # (read+written) buffer so the launcher input-output-aliases
+                    # it -- otherwise it becomes a fresh output buffer and the
+                    # peer writes are lost.  (For the symmetric default
+                    # ``dst is src`` this is exactly the ring-all-gather
+                    # read+write marking.)  prepare_args always normalizes to the
+                    # full 5-arg form, so ``args[3]`` (dst) is guaranteed present.
+                    assert len(node.args) == 5, (
+                        "start_async_remote_copy must be normalized to 5 args by "
+                        f"prepare_args (got {len(node.args)})"
+                    )
+                    src_name = _get_tensor_name(node)
+                    if src_name is not None:
+                        read_names.add(src_name)
+                    dst_arg = node.args[3]
+                    if isinstance(dst_arg, torch.fx.Node):
+                        dst_val = dst_arg.meta.get("val")
+                        if isinstance(dst_val, torch.Tensor):
+                            dst_name = self.tensor_arg(dst_val).name
+                            read_names.add(dst_name)
+                            write_names.add(dst_name)
         return read_names, write_names
 
     def __enter__(self) -> None:
