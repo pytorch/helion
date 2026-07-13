@@ -2,11 +2,13 @@
 Auto-generated heuristic for kernels: nvfp4_gemv_fp4in_kernel, nvfp4_gemv_bf16in_kernel
 Backend: single tuned config per kernel (shape-independent)
 
-NVFP4 decode (M=1) GEMV pretuned on NVIDIA B200 (sm100) for Helion's Triton
-backend. These are the tuned Triton configs from PR #2738 (the "improved Triton
-nvfp4_gemv"): a block over N with a wide K reduction tile. The GEMV is memory
-bound on streaming the NVFP4 weight from DRAM, so one config transfers across
-the decode weight shapes in the sweep -- every (N, K) maps to the same config.
+NVFP4 decode GEMV pretuned on NVIDIA B200 (sm100) for Helion's Triton backend:
+FP16-decode multi-row bodies that tile over M (out[tile_m]) with a wide/full K
+reduction. Configs were autotuned (curated grid, validated against the dequant
+reference under cold-L2 cudagraph) on the two nvfp4_backend_comparison shapes --
+bf16in "o" (N=8192, K=8192) and fp4in "down" (N=8192, K=28672). The GEMV is
+memory bound on streaming the NVFP4 weight from DRAM, so one config per kernel
+transfers across the decode weight shapes in the sweep.
 
 Provides, for each kernel <k>:
 - key_<k>(*args): config index (also the runtime cache key)
@@ -14,17 +16,24 @@ Provides, for each kernel <k>:
 """
 
 
-# W4A4 (NVFP4 weight * NVFP4 activation) -- PR #2738 FP4IN_TRITON_CONFIG.
+# W4A4 (NVFP4 weight * NVFP4 activation). Autotuned on N=8192, K=28672 ("down"):
+# block_m=4 + inner block_g=256, num_stages=3 pipelining, K-loop multi-buffering.
+# These multi-row bodies tile over M (out[tile_m]), so block_m>1 is correct and
+# reused across output rows. Validated against the dequant reference (38.8us cold-L2
+# cudagraph); beat the deeper num_stages=6 the gist baked for this shape.
 _CONFIG_nvfp4_gemv_fp4in_kernel = {
-    "block_sizes": [1, 128],
-    "num_warps": 4,
+    "block_sizes": [4, 256],
+    "num_warps": 2,
     "num_stages": 3,
+    "range_multi_buffers": [None, True],
 }
 
-# W4A16 (NVFP4 weight * BF16 activation) -- PR #2738 BF16IN_TRITON_CONFIG.
+# W4A16 (NVFP4 weight * BF16 activation). Autotuned on N=8192, K=8192 ("o"): single
+# block dim (K is a full arange), block_m=16 (activation reuse across the 16 output
+# rows in a tile), num_stages=2. Validated against the dequant reference (21.7us).
 _CONFIG_nvfp4_gemv_bf16in_kernel = {
-    "block_sizes": [1, 512],
-    "num_warps": 1,
+    "block_sizes": [16],
+    "num_warps": 4,
     "num_stages": 2,
 }
 
