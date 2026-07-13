@@ -414,7 +414,12 @@ def _mma_loop_is_exclusive(node: Node) -> bool:
 
 
 def _trace_to_load(node: Node) -> Node | None:
-    """Trace through casts/permutes to the underlying load node."""
+    """Trace through dtype casts to the underlying load node.
+
+    Only ``_TRACE_THROUGH_TARGETS`` (dtype casts) are traced; permute is
+    deliberately NOT traced (see the note there), so a permuted operand does
+    not resolve to a load and falls back to scalar codegen.
+    """
     from ...language import memory_ops
 
     cur = node
@@ -432,11 +437,12 @@ def _trace_to_load(node: Node) -> Node | None:
 
 
 def _trace_to_load_tensor(node: Node) -> tuple[Node, str, torch.Tensor] | None:
-    """Trace through casts/permutes to find the underlying load tensor.
+    """Trace through dtype casts to find the underlying load tensor.
 
-    Only traces through data-preserving ops (type casts, permute).
-    Does NOT trace through arithmetic (add, mul, etc.) because the MMA
-    pipeline reads raw tensor data and those ops would be skipped.
+    Only traces through ``_TRACE_THROUGH_TARGETS`` (type casts). Permute is
+    NOT traced (the MMA pipeline reads raw tensor data, so tracing through a
+    permute would bypass the data shuffle), and neither is arithmetic
+    (add, mul, ...); both fall back to scalar codegen.
     """
     load_node = _trace_to_load(node)
     if load_node is None:

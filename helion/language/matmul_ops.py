@@ -229,8 +229,10 @@ def enforce_dot_requirements(
     This ensures the autotuner does not select block sizes below the hardware
     minimums for the current device and dtypes, and constrains the batch
     dimension block size to 1 for 3D operands since Triton does not support
-    3D dot operations. ``allow_batched_cute_tcgen05`` is used by recognized
-    aten.baddbmm nodes whose batch tile has the same block-size restriction.
+    3D dot operations. ``allow_batched_cute_tcgen05`` opens the batched cute
+    tcgen05 search surface; it is passed True only by the DeviceIR post-pass
+    for structurally codegen-able batched matmuls -- aten mm/bmm/addmm/baddbmm
+    and hl.dot, both plain 3-D and mixed-rank shared-weight ([B,M,K]@[K,N]).
     """
 
     # Last two dims are used for matmul
