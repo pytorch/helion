@@ -2794,9 +2794,23 @@ class TestExamples(RefEagerTestBase, TestCase):
     # Linear attention examples (examples/linear/)
     # ══════════════════════════════════════════════════════════════════════
 
+    def _skip_linear_engine_autotune(self) -> None:
+        # These tests only assert correctness. Pin a fixed default config;
+        # restored after the test.
+        from examples.linear import linear_attention_engine as engine
+
+        for kernel in vars(engine).values():
+            if isinstance(kernel, helion.Kernel):
+                original_effort = kernel.settings.autotune_effort
+                self.addCleanup(
+                    setattr, kernel.settings, "autotune_effort", original_effort
+                )
+                kernel.settings.autotune_effort = "none"
+
     def _run_linear_example(self, name: str) -> None:
         import importlib
 
+        self._skip_linear_engine_autotune()
         mod = importlib.import_module(f"examples.linear.{name}")
         harness = getattr(mod, "HARNESS", None)
         if harness is not None:
@@ -2854,7 +2868,7 @@ class TestExamples(RefEagerTestBase, TestCase):
 
     # ── Monkey-patch tests: plug our engine into FLA layers ──
 
-    def _run_monkeypatch(
+    def _linear_attn_monkeypatch_test(
         self,
         variant,
         layer,
@@ -2867,6 +2881,7 @@ class TestExamples(RefEagerTestBase, TestCase):
         from examples.linear.linear_attention_engine import get_helion_fwd_kernel
         from examples.linear.linear_attention_utils import head_to_time_first as _tf
 
+        self._skip_linear_engine_autotune()
         helion_fwd = get_helion_fwd_kernel(variant)
 
         def _our_chunk(
@@ -2933,7 +2948,7 @@ class TestExamples(RefEagerTestBase, TestCase):
         except ImportError:
             self.skipTest("fla not installed")
 
-        self._run_monkeypatch(
+        self._linear_attn_monkeypatch_test(
             LinearAttentionVariant.FULL_GLA,
             GatedLinearAttention(
                 hidden_size=256,
@@ -2965,7 +2980,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             g = torch.zeros_like(beta)
             return g, beta
 
-        self._run_monkeypatch(
+        self._linear_attn_monkeypatch_test(
             LinearAttentionVariant.DELTA_RULE,
             DeltaNet(
                 hidden_size=256,
@@ -3010,7 +3025,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             beta = scale * torch.sigmoid(beta.float())
             return g.to(q.dtype), beta.to(q.dtype)
 
-        self._run_monkeypatch(
+        self._linear_attn_monkeypatch_test(
             LinearAttentionVariant.GATED_DELTA_RULE,
             GatedDeltaNet(
                 hidden_size=256,
@@ -3038,7 +3053,7 @@ class TestExamples(RefEagerTestBase, TestCase):
         except ImportError:
             self.skipTest("fla not installed")
 
-        self._run_monkeypatch(
+        self._linear_attn_monkeypatch_test(
             LinearAttentionVariant.SIMPLE_GLA,
             SimpleGatedLinearAttention(
                 hidden_size=256,
