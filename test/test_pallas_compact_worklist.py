@@ -1401,6 +1401,7 @@ class TestCompactWorklistJaxExport(unittest.TestCase):
         )
 
 
+@unittest.skipUnless(HAS_JAX, "jax not available")
 class TestResidentCacheWindowGuard(unittest.TestCase):
     """The runtime backstop that raises (rather than silently over-reading the
     resident-cache window) when a per-source reduction length exceeds the
@@ -1558,6 +1559,7 @@ class TestOrderedWindowBudget(unittest.TestCase):
         self.assertEqual(self._budget([], prep_operands=[]), 0)
 
 
+@unittest.skipUnless(HAS_JAX, "jax not available")
 class TestResidentPrepHoistCodegen(unittest.TestCase):
     """Codegen checks for optional resident-prep cache lowering."""
 
@@ -1644,9 +1646,7 @@ class TestResidentPrepHoistCodegen(unittest.TestCase):
             helion.Config(block_sizes=[8, 8], pallas_loop_type="compact_worklist")
         )
         self.assertIn("_rc_prep_refill", code)  # prep cache installed
-        self.assertRegex(
-            code, r"jnp\.where\([^\n]*jnp\.full\(\[\], float\('-inf'\)"
-        )
+        self.assertRegex(code, r"jnp\.where\([^\n]*jnp\.full\(\[\], float\('-inf'\)")
 
     def test_prep_fallback_leaves_load_masks_intact(self):
         # If prep lowerings are not installed (a fallback), elision must not fire: no
@@ -1683,6 +1683,7 @@ class TestResidentPrepHoistCodegen(unittest.TestCase):
         self.assertIn("jnp.where", code)
 
 
+@unittest.skipUnless(HAS_JAX, "jax not available")
 class TestResidentCacheAndPrepHoist(unittest.TestCase):
     """Resident windows are correctness-bearing; prep hoists are optional."""
 
