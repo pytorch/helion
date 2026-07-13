@@ -1,14 +1,12 @@
 from __future__ import annotations
 
 import ast
+import importlib
 import os
 from unittest.mock import patch
 
 import pytest
 import torch
-
-pytest.importorskip("cutlass")
-pytest.importorskip("cutlass.cute")
 
 import helion
 from helion._compiler.cute import deepgemm_m_grouped as deepgemm_impl
@@ -19,6 +17,20 @@ from helion._testing import skipIfNotCUDA
 from helion._testing import skipIfRefEager
 import helion.language as hl
 
+
+def _has_cutlass_cute() -> bool:
+    try:
+        importlib.import_module("cutlass")
+        importlib.import_module("cutlass.cute")
+    except ImportError:
+        return False
+    return True
+
+
+requires_cutlass_cute = pytest.mark.skipif(
+    not _has_cutlass_cute(),
+    reason="CUTLASS CuTe is not available",
+)
 
 CPU_DEVICE = torch.device("cpu")
 
@@ -259,6 +271,7 @@ _deepgemm_segment_inverted_row_mask_kernel = _deepgemm_segment_test_kernel(
 
 class TestCuteDeepGemmMGrouped(TestCase):
     @onlyBackends(["cute"])
+    @requires_cutlass_cute
     def test_grouped_gemm_deepgemm_m_grouped_bf16_nt_contiguous(self):
         torch.manual_seed(0)
         use_generated_default = (
@@ -385,6 +398,7 @@ class TestCuteDeepGemmMGrouped(TestCase):
     @onlyBackends(["cute"])
     @skipIfNotCUDA()
     @skipIfRefEager("selected generated segment requires compiled CuTe code")
+    @requires_cutlass_cute
     @patch.dict(
         os.environ,
         {
@@ -551,6 +565,7 @@ class TestCuteDeepGemmMGrouped(TestCase):
     @onlyBackends(["cute"])
     @skipIfNotCUDA()
     @skipIfRefEager("CUDA graph capture requires compiled kernel")
+    @requires_cutlass_cute
     @patch.dict(
         os.environ,
         {
@@ -625,6 +640,7 @@ class TestCuteDeepGemmMGrouped(TestCase):
     @onlyBackends(["cute"])
     @skipIfNotCUDA()
     @skipIfRefEager("selected generated segment requires compiled CuTe code")
+    @requires_cutlass_cute
     @patch.dict(
         os.environ,
         {
@@ -696,6 +712,7 @@ class TestCuteDeepGemmMGrouped(TestCase):
     @onlyBackends(["cute"])
     @skipIfNotCUDA()
     @skipIfRefEager("selected generated segment requires compiled CuTe code")
+    @requires_cutlass_cute
     @patch.dict(
         os.environ,
         {
@@ -770,6 +787,7 @@ class TestCuteDeepGemmMGrouped(TestCase):
     @onlyBackends(["cute"])
     @skipIfNotCUDA()
     @skipIfRefEager("CUDA graph capture requires compiled kernel")
+    @requires_cutlass_cute
     @patch.dict(
         os.environ,
         {
@@ -882,6 +900,7 @@ class TestCuteDeepGemmMGrouped(TestCase):
     @onlyBackends(["cute"])
     @skipIfNotCUDA()
     @skipIfRefEager("CUDA graph capture requires compiled kernel")
+    @requires_cutlass_cute
     @patch.dict(
         os.environ,
         {
@@ -954,6 +973,7 @@ class TestCuteDeepGemmMGrouped(TestCase):
 
     @onlyBackends(["cute"])
     @skipIfNotCUDA()
+    @requires_cutlass_cute
     @patch.dict(
         os.environ,
         {
@@ -982,6 +1002,7 @@ class TestCuteDeepGemmMGrouped(TestCase):
 
     @onlyBackends(["cute"])
     @skipIfNotCUDA()
+    @requires_cutlass_cute
     @patch.dict(
         os.environ,
         {
@@ -1004,6 +1025,7 @@ class TestCuteDeepGemmMGrouped(TestCase):
 
     @onlyBackends(["cute"])
     @skipIfNotCUDA()
+    @requires_cutlass_cute
     @patch.dict(
         os.environ,
         {
@@ -1143,6 +1165,7 @@ class TestCuteDeepGemmMGrouped(TestCase):
 
     @onlyBackends(["cute"])
     @skipIfNotCUDA()
+    @requires_cutlass_cute
     @patch.dict(
         os.environ,
         {
