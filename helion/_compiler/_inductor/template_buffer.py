@@ -403,7 +403,12 @@ class HelionTemplateBuffer(TemplateBuffer):
     def set_current_node(self, node: object) -> AbstractContextManager[None]:
         return nullcontext()
 
-    def has_aliasing_or_mutation_for_prologue_fusion(
+    # A recent torch widened this hook's declared parameter to an internal
+    # Protocol (`_HasAliasingOrMutation`); Inductor always passes a
+    # `SchedulerNode` at runtime, so keep the precise annotation and suppress
+    # the parameter-contravariance check rather than depend on a private,
+    # version-fragile torch type.
+    def has_aliasing_or_mutation_for_prologue_fusion(  # pyrefly: ignore[bad-override]
         self,
         scheduler_node: SchedulerNode,
     ) -> bool:
