@@ -82,6 +82,8 @@ from typing import cast
 import torch
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 DEFAULT_IMPLS = ("helion-triton", "helion-cute", "flexattention", "sdpa", "fa4")
 ALL_IMPLS = ("helion-triton", "helion-cute", "flexattention", "sdpa", "fa4")
@@ -659,6 +661,30 @@ def _make_helion_config(
     return config, config_overrides
 
 
+def _helion_cute_flash_compiler_config(
+    bound: object, backend: str
+) -> dict[str, object] | None:
+    if backend != "cute":
+        return None
+
+    config_spec = cast("Any", bound).config_spec
+    if config_spec.compiler_default_config is not None:
+        return dict(config_spec.default_config().config)
+
+    if not getattr(config_spec, "cute_flash_search_enabled", False):
+        return None
+
+    for config in config_spec.compiler_seed_configs:
+        seed = dict(config.config)
+        if "cute_flash_topology" in seed:
+            return seed
+
+    default_config = dict(config_spec.default_config().config)
+    if "cute_flash_topology" in default_config:
+        return default_config
+    return None
+
+
 def _benchmark_sdpa(args: argparse.Namespace) -> dict[str, Any]:
     dtype = _dtype_from_name(args.dtype)
     q, k, v = _make_inputs(args, dtype)
@@ -962,19 +988,14 @@ def _benchmark_helion(args: argparse.Namespace) -> dict[str, Any]:
 
     with _scrubbed_argv():
         bound = kernel.bind(kernel_args)
-        compiler_seed_config = (
-            dict(bound.config_spec.default_config().config)
-            if backend == "cute"
-            and bound.config_spec.compiler_default_config is not None
-            else None
+        compiler_seed_config = _helion_cute_flash_compiler_config(
+            bound,
+            backend,
         )
         fixed_config, config_overrides = _make_helion_config(args, compiler_seed_config)
         notes: list[str] = []
         if bias is not None and backend == "cute":
-            biased_seed_config = cast(
-                "dict[str, object]",
-                compiler_seed_config or {"block_sizes": [1, 128, 128]},
-            )
+            biased_seed_config = compiler_seed_config or {"block_sizes": [1, 128, 128]}
             fixed_config = {**biased_seed_config, **(fixed_config or {})}
             notes.append(
                 "CuTe biased attention starts from the fixed 128x128 flash seed "

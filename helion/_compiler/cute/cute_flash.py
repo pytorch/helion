@@ -6051,6 +6051,48 @@ def _flash_current_block_ids(
     return device_ir.grid_block_ids[0], block_ids[0]
 
 
+def prepare_flash_attention_tensor_args(df: DeviceFunction) -> bool:
+    """Register graph-proven flash tensors before early flash replacement."""
+    block_ids = _flash_current_block_ids(df)
+    if block_ids is None:
+        return False
+    root_block_ids, kv_block_id = block_ids
+    score_plan = df.cute_state.attention_flash_score_plan
+    graph_plan = _flash_graph_output_plan_from_graphs(
+        df.codegen.codegen_graphs,
+        root_block_ids=root_block_ids,
+        kv_block_id=kv_block_id,
+        score_plan=score_plan,
+    )
+    if graph_plan is None:
+        return False
+    host_tensors = _flash_graph_host_tensors(df.codegen.codegen_graphs)
+    required_names = (
+        graph_plan.q_name,
+        graph_plan.k_name,
+        graph_plan.v_name,
+        graph_plan.o_name,
+        *graph_plan.bias_names,
+        *graph_plan.alibi_names,
+        *graph_plan.document_names,
+    )
+    if graph_plan.lse_name is not None:
+        required_names = (*required_names, graph_plan.lse_name)
+    resolved_tensors: list[tuple[str, torch.Tensor]] = []
+    seen_names: set[str] = set()
+    for name in required_names:
+        if name in seen_names:
+            continue
+        seen_names.add(name)
+        value = host_tensors.get(name)
+        if not isinstance(value, torch.Tensor):
+            return False
+        resolved_tensors.append((name, value))
+    for name, value in resolved_tensors:
+        df.tensor_arg(value, prefer_name=name)
+    return True
+
+
 def flash_attention_tensor_plan(df: DeviceFunction) -> FlashTensorPlan | None:
     """Resolve tensor operands for the fused flash-attention codegen.
 
@@ -6179,11 +6221,11 @@ def flash_attention_tensor_plan(df: DeviceFunction) -> FlashTensorPlan | None:
 def codegen_attention_flash(cg: GenerateAST) -> bool:
     """Replace the device body with the fused tcgen05 flash-attention kernel.
 
-    Called from ``generate_ast.visit_For`` after the FX body walk completes and
-    the flash detector has set ``attention_flash_block_ids``. Returns True when
-    the flash kernel was emitted (and the FX-derived body discarded), False when
-    the shape/layout is outside the validated envelope (so the caller keeps the
-    scalar fallback body). Because the detector routes through the same
+    Called from ``generate_ast.visit_For`` after the flash detector has set
+    ``attention_flash_block_ids``. Returns True when the flash kernel was emitted
+    and the FX-derived scalar body can be skipped, False when the shape/layout is
+    outside the validated envelope (so the caller emits the scalar fallback
+    body). Because the detector routes through the same
     ``flash_attention_tensor_plan`` gate, a False return here is a defensive
     backstop rather than an expected path.
     """

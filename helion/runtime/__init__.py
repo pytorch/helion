@@ -3397,8 +3397,9 @@ class _CompiledCuteLauncher:
     process, skipping recompilation.  ``cute.compile`` forces the CuTe DSL's
     own ``no_cache=True`` path, so Helion drives the on-disk cache itself: it
     writes the post-pass ``ir_module`` bytecode (plus a small JSON sidecar
-    holding the mangled entry symbol) and, on a hit, reconstructs a runnable
-    ``CudaDialectJitCompiledFunction`` by JIT-loading the stored module.
+    holding the mangled entry symbol and kernel attributes) and, on a hit,
+    reconstructs a runnable ``TVMFFIJitCompiledFunction`` by JIT-loading the
+    stored module.
     Any failure in the cache layer falls back to a plain ``cute.compile``.
     """
 
@@ -3456,6 +3457,64 @@ class _CompiledCuteLauncher:
         meta = os.path.join(cache_dir, f"cute_dsl_{self._cache_key}.json")
         return cache_dir, mlir, meta
 
+    @staticmethod
+    def _kernel_info_to_json(kernel_info: object) -> list[dict[str, object]]:
+        if not isinstance(kernel_info, dict):
+            return []
+        encoded: list[dict[str, object]] = []
+        for symbol, attrs in kernel_info.items():
+            if not isinstance(symbol, str):
+                continue
+            attr_items: list[tuple[str, int]] = []
+            if isinstance(attrs, dict):
+                for attr, value in attrs.items():
+                    attr_name = getattr(attr, "name", None)
+                    if not isinstance(attr_name, str):
+                        attr_name = str(attr)
+                    try:
+                        attr_value = int(value)
+                    except (TypeError, ValueError):
+                        continue
+                    attr_items.append((attr_name, attr_value))
+            encoded.append({"symbol": symbol, "attrs": attr_items})
+        return encoded
+
+    @staticmethod
+    def _kernel_info_from_json(metadata: object) -> OrderedDict[str, dict[object, int]]:
+        kernel_info: OrderedDict[str, dict[object, int]] = OrderedDict()
+        if not isinstance(metadata, list):
+            return kernel_info
+
+        cuda_attrs: object = None
+        for item in metadata:
+            if not isinstance(item, dict):
+                continue
+            symbol = item.get("symbol")
+            if not isinstance(symbol, str):
+                continue
+            attrs: dict[object, int] = {}
+            raw_attrs = item.get("attrs", [])
+            if isinstance(raw_attrs, list):
+                if cuda_attrs is None:
+                    from cutlass.base_dsl.runtime import cuda as cuda_helpers
+
+                    cuda_attrs = cuda_helpers.cuda.CUfunction_attribute
+                for raw_attr in raw_attrs:
+                    if not isinstance(raw_attr, (list, tuple)) or len(raw_attr) != 2:
+                        continue
+                    attr_name, attr_value = raw_attr
+                    if not isinstance(attr_name, str):
+                        continue
+                    attr = getattr(cuda_attrs, attr_name, None)
+                    if attr is None:
+                        continue
+                    try:
+                        attrs[attr] = int(attr_value)
+                    except (TypeError, ValueError):
+                        continue
+            kernel_info[symbol] = attrs
+        return kernel_info
+
     def _persist_to_disk(self, compiled: object) -> None:
         try:
             from cutlass.base_dsl.cache_helpers import save_ir
@@ -3485,6 +3544,9 @@ class _CompiledCuteLauncher:
                         "has_gpu_module": bool(
                             getattr(compiled, "has_gpu_module", True)
                         ),
+                        "kernel_info": self._kernel_info_to_json(
+                            getattr(compiled, "kernel_info", None)
+                        ),
                     },
                     f,
                 )
@@ -3501,10 +3563,8 @@ class _CompiledCuteLauncher:
         try:
             from cutlass.base_dsl.cache_helpers import load_ir
             from cutlass.base_dsl.cache_helpers import read_bytecode_and_check_crc32
-            from cutlass.cutlass_dsl.cuda_jit_executor import (
-                CudaDialectJitCompiledFunction,
-            )
             from cutlass.cutlass_dsl.cutlass import CuTeDSL
+            from cutlass.cutlass_dsl.tvm_ffi_provider import TVMFFIJitCompiledFunction
 
             _cache_dir, mlir, meta = self._cache_file_paths()
             if not (os.path.exists(mlir) and os.path.exists(meta)):
@@ -3512,6 +3572,8 @@ class _CompiledCuteLauncher:
             with open(meta) as f:
                 metadata = json.load(f)
             function_name = metadata["function_name"]
+            if "kernel_info" not in metadata:
+                return None
             # The parsed Module holds an internal reference to the ir.Context
             # that load_ir opened, so it stays valid after load_ir returns even
             # though its ``with ir.Context()`` block has already exited.
@@ -3525,20 +3587,21 @@ class _CompiledCuteLauncher:
                 module, shared_libs=dsl.get_shared_libs()
             )
             capi_func = engine.lookup(function_name)
+            kernel_info = self._kernel_info_from_json(metadata.get("kernel_info"))
             # The signature is reconstructable from the wrapper, so it does not
             # need to be persisted.
             wrapped = getattr(self._jit_func, "__wrapped__", self._jit_func)
             signature = inspect.signature(cast("Any", wrapped), eval_str=True)
-            # Empty kernel_info / default extra-arg state is correct only for the
-            # non-experimental ``cute.compile`` path Helion uses here; the
-            # experimental DSL would populate these from module attributes.
-            return CudaDialectJitCompiledFunction(
+            # Reconstruct the same TVM-FFI compiled-function path returned by
+            # ``cute.compile(..., options="--enable-tvm-ffi")`` so cache hits
+            # keep the same launch convention and device-kernel attributes.
+            return TVMFFIJitCompiledFunction(
                 module,
                 engine,
                 capi_func,
                 signature,
                 function_name,
-                {},
+                kernel_info,
                 False,
                 None,
                 has_gpu_module=bool(metadata.get("has_gpu_module", True)),
