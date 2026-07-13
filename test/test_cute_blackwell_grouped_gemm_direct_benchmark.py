@@ -1,25 +1,35 @@
 from __future__ import annotations
 
+import importlib
 from itertools import starmap
 import math
 import os
 from typing import Any
 from unittest.mock import patch
 
+from benchmarks.cute import blackwell_grouped_gemm_direct as blackwell_benchmark
 import pytest
 import torch
 
-pytest.importorskip("cutlass")
-pytest.importorskip("cutlass.cute")
-
-from benchmarks.cute import blackwell_grouped_gemm_direct as blackwell_benchmark
-
-from helion._compiler.cute import grouped_deepgemm
 from helion._testing import DEVICE
 from helion._testing import TestCase
 from helion._testing import onlyBackends
 from helion._testing import skipIfNotCUDA
 
+
+def _has_cutlass_cute() -> bool:
+    try:
+        importlib.import_module("cutlass")
+        importlib.import_module("cutlass.cute")
+    except ImportError:
+        return False
+    return True
+
+
+requires_cutlass_cute = pytest.mark.skipif(
+    not _has_cutlass_cute(),
+    reason="CUTLASS CuTe is not available",
+)
 
 CPU_DEVICE = torch.device("cpu")
 
@@ -42,6 +52,7 @@ class TestCuteBlackwellGroupedGemmDirectBenchmark(TestCase):
 
     @onlyBackends(["cute"])
     @skipIfNotCUDA()
+    @requires_cutlass_cute
     def test_grouped_gemm_blackwell_nt_accepts_heterogeneous_fp16_metadata(self):
         from helion._compiler.cute import grouped_deepgemm
 
@@ -122,6 +133,7 @@ class TestCuteBlackwellGroupedGemmDirectBenchmark(TestCase):
 
     @onlyBackends(["cute"])
     @skipIfNotCUDA()
+    @requires_cutlass_cute
     @patch.dict(
         os.environ,
         {
@@ -412,6 +424,7 @@ class TestCuteBlackwellGroupedGemmDirectBenchmark(TestCase):
 
     @onlyBackends(["cute"])
     @skipIfNotCUDA()
+    @requires_cutlass_cute
     @patch.dict(
         os.environ,
         {
@@ -477,6 +490,8 @@ class TestCuteBlackwellGroupedGemmDirectBenchmark(TestCase):
         *,
         mma_tiler_mn,
     ) -> None:
+        from helion._compiler.cute import grouped_deepgemm
+
         self._skip_unless_blackwell_grouped_gemm()
         torch.manual_seed(0)
         if problem_sizes_mnkl is None:
@@ -521,6 +536,7 @@ class TestCuteBlackwellGroupedGemmDirectBenchmark(TestCase):
 
     @onlyBackends(["cute"])
     @skipIfNotCUDA()
+    @requires_cutlass_cute
     @patch.dict(
         os.environ,
         {
@@ -538,6 +554,7 @@ class TestCuteBlackwellGroupedGemmDirectBenchmark(TestCase):
 
     @onlyBackends(["cute"])
     @skipIfNotCUDA()
+    @requires_cutlass_cute
     @patch.dict(
         os.environ,
         {
@@ -555,6 +572,7 @@ class TestCuteBlackwellGroupedGemmDirectBenchmark(TestCase):
 
     @onlyBackends(["cute"])
     @skipIfNotCUDA()
+    @requires_cutlass_cute
     @patch.dict(
         os.environ,
         {
@@ -611,6 +629,7 @@ class TestCuteBlackwellGroupedGemmDirectBenchmark(TestCase):
 
     @onlyBackends(["cute"])
     @skipIfNotCUDA()
+    @requires_cutlass_cute
     @patch.dict(
         os.environ,
         {
@@ -779,6 +798,7 @@ class TestCuteBlackwellGroupedGemmDirectBenchmark(TestCase):
 
     @onlyBackends(["cute"])
     @skipIfNotCUDA()
+    @requires_cutlass_cute
     @patch.dict(
         os.environ,
         {
@@ -871,6 +891,7 @@ class TestCuteBlackwellGroupedGemmDirectBenchmark(TestCase):
 
     @onlyBackends(["cute"])
     @skipIfNotCUDA()
+    @requires_cutlass_cute
     @patch.dict(
         os.environ,
         {
@@ -1013,6 +1034,7 @@ class TestCuteBlackwellGroupedGemmDirectBenchmark(TestCase):
 
     @onlyBackends(["cute"])
     @skipIfNotCUDA()
+    @requires_cutlass_cute
     @patch.dict(
         os.environ,
         {
@@ -1154,6 +1176,7 @@ class TestCuteBlackwellGroupedGemmDirectBenchmark(TestCase):
 
     @onlyBackends(["cute"])
     @skipIfNotCUDA()
+    @requires_cutlass_cute
     @patch.dict(
         os.environ,
         {
@@ -1205,6 +1228,7 @@ class TestCuteBlackwellGroupedGemmDirectBenchmark(TestCase):
 
     @onlyBackends(["cute"])
     @skipIfNotCUDA()
+    @requires_cutlass_cute
     @patch.dict(
         os.environ,
         {
