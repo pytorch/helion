@@ -41,7 +41,9 @@ CTA_M = 128
 CTA_N = 64
 CTA_K = 64
 DEFAULT_OUT_DIR = Path("grouped_gemm_cutlass_results")
-HELION_DIRECT_CALL = "examples.grouped_gemm.blackwell_grouped_gemm_nt_direct"
+HELION_DIRECT_CALL = (
+    "benchmarks.cute.blackwell_grouped_gemm_direct.blackwell_grouped_gemm_nt_direct"
+)
 CUTLASS_CALL = "helion._compiler.cute.grouped_deepgemm.blackwell_grouped_gemm_nt"
 SAVED_FINAL_GEOMEAN_HELION_OVER_CUTLASS = 1.0880407542392165
 SAVED_BASELINE_GEOMEAN_HELION_OVER_CUTLASS = 1.086090533826298
@@ -392,7 +394,8 @@ def _non_negative_int(text: str) -> int:
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "Benchmark examples.grouped_gemm.blackwell_grouped_gemm_nt_direct "
+            "Benchmark benchmarks.cute.blackwell_grouped_gemm_direct."
+            "blackwell_grouped_gemm_nt_direct "
             "against the CUTLASS CuTeDSL Blackwell grouped GEMM path."
         )
     )
@@ -684,14 +687,14 @@ def benchmark_settings(args: argparse.Namespace) -> dict[str, object]:
 
 
 def _import_confirmation(
-    grouped_mod: Any,
+    blackwell_direct: Any,
     helion_mod: Any,
     cutlass_grouped: Any,
 ) -> dict[str, object]:
     return {
         "repo_root": str(REPO_ROOT),
-        "examples_grouped_gemm_module": grouped_mod.__name__,
-        "examples_grouped_gemm_file": str(Path(grouped_mod.__file__).resolve()),
+        "blackwell_direct_module": blackwell_direct.__name__,
+        "blackwell_direct_file": str(Path(blackwell_direct.__file__).resolve()),
         "helion_file": str(Path(helion_mod.__file__).resolve()),
         "cutlass_grouped_file": str(Path(cutlass_grouped.__file__).resolve()),
         "helion_call": HELION_DIRECT_CALL,
@@ -725,8 +728,14 @@ def run_case(args: argparse.Namespace) -> int:
         raise BenchmarkSetupError("CUDA is required to run grouped GEMM timings")
     from helion._compiler.cute import grouped_deepgemm as cutlass_grouped
 
-    grouped_mod = importlib.import_module("examples.grouped_gemm")
-    import_confirmation = _import_confirmation(grouped_mod, helion, cutlass_grouped)
+    blackwell_direct = importlib.import_module(
+        "benchmarks.cute.blackwell_grouped_gemm_direct"
+    )
+    import_confirmation = _import_confirmation(
+        blackwell_direct,
+        helion,
+        cutlass_grouped,
+    )
     print(json.dumps({"import_confirmation": import_confirmation}, sort_keys=True))
 
     torch.cuda.set_device(0)
@@ -735,7 +744,7 @@ def run_case(args: argparse.Namespace) -> int:
     device = torch.device("cuda", 0)
     dtype = _torch_dtype(torch, "float16")
 
-    (group_a, group_b), expected = grouped_mod.make_blackwell_grouped_gemm_nt_args(
+    (group_a, group_b), expected = blackwell_direct.make_blackwell_grouped_gemm_nt_args(
         case.problem_sizes,
         dtype=dtype,
         device=device,
@@ -744,7 +753,7 @@ def run_case(args: argparse.Namespace) -> int:
     out_cutlass = _make_outputs(torch, group_a, group_b, dtype)
 
     def helion_call() -> object:
-        return grouped_mod.blackwell_grouped_gemm_nt_direct(
+        return blackwell_direct.blackwell_grouped_gemm_nt_direct(
             group_a,
             group_b,
             out_groups=out_helion,
@@ -761,7 +770,7 @@ def run_case(args: argparse.Namespace) -> int:
     for _ in range(args.compile_warmups):
         helion_call()
     torch.cuda.synchronize()
-    launch = _get_generated_launch(grouped_mod)
+    launch = _get_generated_launch(blackwell_direct)
     helion_raw_graph, _helion_raw_captured = _capture_graph(torch, helion_call)
     torch.cuda.synchronize()
     helion_setup_s = time.perf_counter() - setup_start
