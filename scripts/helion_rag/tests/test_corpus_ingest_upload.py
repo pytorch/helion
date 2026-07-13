@@ -1,0 +1,164 @@
+"""Corpus extract, ingest idempotency, upload markers."""
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+import zipfile
+
+import helion_rag.corpus as corpus
+import helion_rag.ingest as ingest
+import helion_rag.upload as upload
+import pytest
+
+from ._fixtures import DTYPES
+from ._fixtures import SHAPES
+from ._fixtures import SRC
+
+
+def _meta_record(run_id: str = "RUN1", median: float = 1.0) -> dict:
+    return {
+        "run_id": run_id,
+        "kernel_name": "add",
+        "kernel_source": SRC,
+        "input_shapes": SHAPES,
+        "dtypes": DTYPES,
+        "settings": {"backend": "triton"},
+        "configs": {
+            "cfg0": {
+                "generated_code": "large generated code",
+                "config": {"block_size": 16},
+                "perf_stats": {"median": median, "n_samples": 3},
+            }
+        },
+    }
+
+
+def _write_zip(path: Path, record: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("logs/add.meta.jsonl", json.dumps(record) + "\n")
+
+
+def test_extract_corpus_strips_generated_code_and_dedups(tmp_path: Path) -> None:
+    zips = tmp_path / "zips"
+    out = tmp_path / "corpus"
+    _write_zip(zips / "h100" / "a.zip", _meta_record("RUN1", median=1.0))
+    _write_zip(zips / "h100" / "b.zip", _meta_record("RUN1", median=1.0))
+    _write_zip(zips / "h100" / "c.zip", _meta_record("RUN2", median=2.0))
+
+    assert corpus.extract_corpus(zips, out) == 2
+
+    written = sorted((out / "h100").glob("*.meta.jsonl"))
+    assert [p.name for p in written] == ["add.meta.jsonl", "c__add.meta.jsonl"]
+    for path in written:
+        record = json.loads(path.read_text(encoding="utf-8"))
+        assert "generated_code" not in record["configs"]["cfg0"]
+
+    loaded = corpus.load_corpus(out)
+    assert {r["run_id"] for r in loaded} == {"RUN1", "RUN2"}
+
+
+def test_ingest_joins_aggregates_and_is_idempotent(tmp_path: Path) -> None:
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    (logs / "run.meta.jsonl").write_text(json.dumps(_meta_record("RUN1")) + "\n")
+    (logs / "perf.csv").write_text(
+        "run_id,config_id,status,perf_ms\nRUN1,cfg0,ok,4.0\nRUN1,cfg0,pass,2.0\nRUN1,cfg0,fail,1.0\nRUN1,missing,ok,0.5"
+        "\n",
+        encoding="utf-8",
+    )
+
+    writeback = tmp_path / "writeback"
+    ledger = tmp_path / "ledger.json"
+
+    first = ingest.ingest(
+        autotune_log_dir=logs,
+        writeback_dir=writeback,
+        family="h100",
+        ledger_path=ledger,
+        reindex=False,
+    )
+    second = ingest.ingest(
+        autotune_log_dir=logs,
+        writeback_dir=writeback,
+        family="h100",
+        ledger_path=ledger,
+        reindex=False,
+    )
+
+    assert first == {"family": "h100", "ingested_run_ids": ["RUN1"], "skipped": 0}
+    assert second == {"family": "h100", "ingested_run_ids": [], "skipped": 1}
+    lines = (
+        (writeback / "h100" / "local-autotune.meta.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+    )
+    assert len(lines) == 1
+    record = json.loads(lines[0])
+    stats = record["configs"]["cfg0"]["perf_stats"]
+    assert stats["median"] == 3.0
+    assert stats["mean"] == 3.0
+    assert stats["n_samples"] == 2
+    assert json.loads(ledger.read_text(encoding="utf-8")) == {"run_ids": ["RUN1"]}
+
+
+def _write_two_runs(logs: Path) -> None:
+    logs.mkdir()
+    (logs / "runs.meta.jsonl").write_text(
+        json.dumps(_meta_record("RUN1"))
+        + "\n"
+        + json.dumps(_meta_record("RUN2"))
+        + "\n",
+        encoding="utf-8",
+    )
+
+
+def test_upload_success_writes_markers_and_archive(tmp_path: Path) -> None:
+    logs = tmp_path / "logs"
+    _write_two_runs(logs)
+    uploads = tmp_path / "uploads"
+    uploaded: list[tuple[Path, str]] = []
+
+    success = upload.upload(
+        autotune_log_dir=logs,
+        uploads_dir=uploads,
+        family="h100",
+        contributor="tester",
+        manifold_put=lambda archive, dest: uploaded.append((archive, dest)),
+    )
+    assert success["uploaded"] is True
+    assert success["run_ids"] == ["RUN1", "RUN2"]
+    assert Path(success["archive_path"]).is_file()
+    assert len(uploaded) == 1
+    assert uploaded[0][0] == Path(success["archive_path"])
+    # destination is opaque transport detail; verify archive content instead
+    with zipfile.ZipFile(success["archive_path"]) as zf:
+        manifest = json.loads(zf.read("batch-manifest.json"))
+    assert manifest == {
+        "family": "h100",
+        "contributor": "tester",
+        "run_ids": ["RUN1", "RUN2"],
+    }
+    for run_id in ("RUN1", "RUN2"):
+        assert (uploads / "uploaded-runs" / f"{run_id}.json").is_file()
+
+
+def test_upload_failure_writes_no_markers(tmp_path: Path) -> None:
+    logs = tmp_path / "logs"
+    _write_two_runs(logs)
+    failed_uploads = tmp_path / "failed-uploads"
+
+    def _fail_upload(_archive: Path, _dest: str) -> None:
+        raise RuntimeError("upload failed")
+
+    with pytest.raises(RuntimeError, match="upload failed"):
+        upload.upload(
+            autotune_log_dir=logs,
+            uploads_dir=failed_uploads,
+            family="h100",
+            contributor="tester",
+            manifold_put=_fail_upload,
+        )
+    assert not (failed_uploads / "uploaded-runs" / "RUN1.json").exists()
+    assert not (failed_uploads / "uploaded-runs" / "RUN2.json").exists()

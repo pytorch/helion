@@ -1,0 +1,189 @@
+# Helion RAG
+
+Helion RAG adds retrieval-augmented autotuning to Helion.
+
+You can use the `setup-helion-rag.sh` script to configure everything in your existing Helion checkout. It handles the heavy lifting: validating your Python interpreter, checking Manifold access, installing the package in editable mode, and fetching the right corpus for your hardware. It also builds a local FAISS index and patches `BoundKernel.ensure_config_exists` behind a feature flag. The setup flips `HELION_RAG_ENABLED=1` if every single step succeeds and doesn't let you stranded in a broken state.
+
+You don't need any LLM API keys for this. We use local models for building the RAG. The "RAG" here is purely retrieval-based and searches over CI benchmark artifacts.
+
+## Package layout
+
+Here's a quick tour of how the codebase is organized:
+
+```text
+helion_rag/
+  __init__.py       # Minimal package marker
+  __main__.py       # Entry point for `python -m helion_rag`
+  cli.py            # Argparse setup and console script entry point
+  config.py         # Parses HELION_RAG_* environment variables into a Config dataclass
+  corpus.py         # Handles benchmark zips: parsing meta.jsonl, workload hashing, tier-0 checks, and deduplication
+  index.py          # FAISS index generation, exact mapping, and similarity search
+  lookup.py         # The core lookup logic (exact match → similar match → miss)
+  ingest.py         # Writes autotune logs back to the corpus idempotently
+  upload.py         # Uploads zip runs to Manifold atomically
+  manifest.py       # Validates and loads manifest.json
+  hardware.py       # Figures out the hardware family based on the device string
+  models.py         # Dataclasses for PerfStats, Ref, and ExactEntry
+  patch.py          # Installs the BoundKernel runtime hook
+  setup_helpers.py  # CLI helpers for the bash setup script (validating, resolving families, checking artifacts, etc.)
+  _util.py          # Shared constants and logging helpers
+```
+
+## Setup
+
+To get started, run the setup script from the repository root or the `scripts/helion_rag/` directory:
+
+```bash
+./setup-helion-rag.sh \
+  --helion-repo /path/to/helion \
+  --manifold-base manifold://helion_ci_artifacts/tree/... \
+  --python /path/to/.venv/bin/python \
+  --hardware-family h100   # This is also auto-detected if you don't specify it
+```
+
+You can pass `--dry-run` to see what the script plans to do without actually mutating anything, or `--non-interactive` to skip prompts. Run `./setup-helion-rag.sh --help` for the full list of options.
+
+If any prerequisites are missing, the script will safely fail without making any changes.
+
+## Enabling
+
+When the setup finishes successfully, it creates a `<helion_repo>/.helion-rag/` directory and adds a source block to your shell's rc file.
+
+You can load it into your current shell like this:
+
+```bash
+source /path/to/.helion-rag/env.sh   # (or source ~/.bashrc if you restarted your shell)
+```
+
+The `env.sh` script exports several configuration variables:
+
+| Variable | What it does |
+|---|---|
+| `HELION_RAG_ENABLED` | Set to `1` if setup succeeded, otherwise `0`. |
+| `HELION_RAG_HARDWARE_FAMILY` | The hardware family we resolved (e.g., `h100`). |
+| `HELION_RAG_MANIFOLD_BASE` | The base Manifold URI where we push manifest artifacts. |
+| `HELION_RAG_MANIFEST` | Path to your local `manifest.json`. |
+| `HELION_RAG_DATA_DIR` | Directory for `ci_artifacts/` (this gets wiped and re-fetched on each run). |
+| `HELION_RAG_INDEX_DIR` | Where the per-family FAISS indexes live (`rag_index/`). |
+| `HELION_RAG_WRITEBACK_DIR` | Local storage for ingested autotune runs (`rag_writeback/`). |
+| `HELION_RAG_AUTOTUNE_LOG_DIR` | Where collected autotune logs go (`autotune_logs/`). |
+| `HELION_RAG_UPLOADS_DIR` | Holds archives and markers for Manifold uploads (`uploads/`). |
+| `HELION_EMBED_MODEL` | The embedding model ID (defaults to `Qwen/Qwen3-Embedding-8B`). |
+| `HELION_RAG_EMBED_DEVICE` | Forces CPU or CUDA for embeddings (auto-detected by default). |
+
+Because the package is installed in editable mode, you'll have access to the `helion-rag` CLI command right away. If you haven't sourced the environment variables, you can pass `--env-file` or set `HELION_RAG_ENV_FILE`.
+
+## CLI subcommands
+
+The `helion-rag` command gives you a few different tools:
+
+```bash
+helion-rag extract          # Unzips benchmark archives, strips generated code, and deduplicates configs
+helion-rag index [--force]  # Builds the FAISS generation index for your hardware family
+helion-rag lookup --kernel-source-file f.py --shapes '...' --dtypes '...' --hardware h100 [--settings-json '{}']
+helion-rag ingest           # Idempotently merges meta.jsonl and csv logs, updates the ledger, and rebuilds the index
+helion-rag upload [--dry-run] [--reupload]   # Zips unuploaded runs to Manifold, marking them only if the upload succeeds
+helion-rag patch-helion --target helion/runtime/kernel.py [--force]
+helion-rag setup-helper --help
+helion-rag setup-helper publish-manifest --manifold-base <uri> --family <fam> [--artifact-path p] [--alias a...]
+python -m helion_rag <cmd>  # Alternative module entry point (does the same thing as the console script)
+```
+
+
+## Lookup tiers
+
+When Helion needs an autotune config, it tries to find it in three stages:
+
+- **Tier 0 (Exact Match):** We calculate a workload key by hashing the normalized AST source, codegen settings, canonical shapes, dtypes, and the hardware family. If this matches an entry in `exact.json`, we immediately return the best config without running the autotuner.
+- **Tier 1 (Similar Match):** If we don't find an exact match, we do a FAISS similarity search over the corpus text embeddings. (You can tune the similarity threshold using `HELION_RAG_SIM_THRESHOLD`). We take the top `n` neighbor configs and temporarily merge them into the user's seed configs for the autotuner to try.
+- **Tier 2 (Miss):** If no similar configs meet the threshold, we just fall back to standard autotuning.
+
+To ensure our workload keys stay in sync with upstream Helion, we have a test that asserts our vendored `_CODEGEN_SETTINGS` exactly matches `helion.autotuner.metrics._CODEGEN_SETTINGS`.
+
+## Patching the runtime hook
+
+To intercept config lookups, we install a wrapper on `BoundKernel.ensure_config_exists`. The patching logic lives in `helion_rag.patch.apply(bound_kernel, original, args, rest, kwargs, *, _extract_fn=None, _lookup_fn=None)`.
+
+When this runs, `_extract` pulls the kernel source, shapes, dtypes, hardware string, and settings from the `BoundKernel` call. If it can't, it returns `None` and we fall back to standard behavior. Also, if your kernel uses Epilogue or Callable arguments, the AST check will flag it as ineligible for Tier-0 exact matches.
+
+The `patch-helion` CLI command uses `write_hook(target)` to append an idempotent marker block to the Python file, which imports `helion_rag.patch.install()`. We intentionally kept this simple (just appending if missing).
+
+## How we resolve hardware
+
+When figuring out what hardware you're running on, `hardware.resolve_family()` checks a few things in this specific order:
+1. An explicit override
+2. The `env_family` environment variable
+3. Device token substring matches
+4. `torch.cuda.get_device_name` (injected via `_device_fn` for tests)
+5. Aliases in the manifest
+6. Compute capability
+
+If it still doesn't recognize the hardware, it returns `None` and drops down to a Tier-2 miss. (By the way, `_device_fn` is injected via dependency injection so we can write deterministic tests on both CPU and GPU hosts without monkeypatching).
+
+## Manifest handling
+
+`manifest.validate_manifest()` makes sure we're using a version 1 schema where the families dictionary contains an `artifact_path` and a list of aliases.
+
+If you need to add a new family, `setup_helpers.publish_manifest()` will safely merge it into the existing `manifest.json` on Manifold without clobbering anything else. If the family is already there, it just does nothing.
+
+## Ingest and upload
+
+- **Ingest:** This command reads `*.meta.jsonl` and `perf.csv` files from your autotune log directory. It joins them by `run_id` and `config_id`, filters out anything that didn't pass, and aggregates the stats (median, mean, n_samples). It writes the result to the local writeback directory as `local-autotune.meta.jsonl` and updates `ledger.json` so we don't ingest the same `run_id` twice. Finally, it can optionally trigger a reindex.
+- **Upload:** This command grabs any unuploaded runs from your logs, builds a `batch-manifest.json`, and zips everything into the uploads directory. It uses `manifold_put` to push to Manifold. To make sure everything is atomic, it only writes the per-run success markers if the upload actually succeeds. If it fails, it throws an error without marking anything as uploaded.
+
+## Tests
+
+We have 25 tests that run fully deterministically:
+
+```text
+scripts/helion_rag/tests/
+  __init__.py                 # Package marker for relative imports
+  _fixtures.py                # Shared setup imported via inspect to avoid duplication
+  test_corpus_ingest_upload.py   # Covers extraction, idempotent ingest, and atomic uploads
+  test_lookup_patch.py           # Tests all lookup tiers, fake FAISS neighbors, and runtime patches via dependency injection
+  test_manifest_hardware.py      # Manifest validation and hardware family resolution
+  test_workload_key.py           # Workload key parity, deduplication, and AST checks
+  manual/validate_tier0_e2e.py   # A manual E2E script for testing real CLI lookups
+```
+
+You can run the suite like this:
+```bash
+cd scripts/helion_rag
+../../.rag-venv/bin/pytest tests -q
+# 25 passed
+```
+
+Or run the manual E2E test after setup:
+```bash
+source /path/to/.helion-rag/env.sh
+.rag-venv/bin/python scripts/helion_rag/tests/manual/validate_tier0_e2e.py --family h100
+# Expects ALL PASS
+```
+
+## Prerequisites
+
+There are a few things you need to have in place before setting this up. If any of these are missing, the setup script will fail loudly and safely:
+
+| Requirement | Why you need it | What to do |
+|---|---|---|
+| Network access for `pip install -e` | To install `helion-rag` in editable mode. | Make sure pip works, or pre-install offline using `pip install --no-build-isolation --no-deps -e scripts/helion_rag`. |
+| `manifold` CLI with read access | To fetch the manifest and corpus. | Ensure `manifold ls <base>` works. |
+| `manifold` write access (optional) | To upload runs and publish manifests. | Ensure `manifold put` works under your base URI. |
+| `HF_TOKEN` (optional) | To download the embedding model for the first time. | Run `huggingface-cli login` or export `HF_TOKEN`. |
+| Sourced `env.sh` | So lookup/ingest commands can read `HELION_RAG_*` paths. | Source `<helion_repo>/.helion-rag/env.sh` or pass `--env-file`. |
+| A `~/.bashrc` block | To auto-load the environment in new shell sessions. | It appends safely; you can remove the block manually to opt out. |
+| A clean `helion/runtime/kernel.py` | To install the runtime hook. | Run `git checkout -- helion/runtime/kernel.py` to revert, or pass `--force-patch` if you have intentional local edits. |
+| Embedding model / device | The default 8B model is quite heavy. | Override with `HELION_EMBED_MODEL` and set `HELION_RAG_EMBED_DEVICE=cpu` if needed. |
+| Rebuild index | The indexer skips rebuilding if the index already exists. | Run `helion-rag index --force` or delete the index directory to rebuild. |
+
+## Add data about new hardware
+
+If you're running on a new hardware family that isn't in the manifest yet, you won't have a corpus to fetch. Here's how to onboard it:
+
+1. The setup script will write a disabled `env.sh` file, but you can optionally enable local autotune collection.
+2. Run your autotuning jobs normally. Then, run `helion-rag ingest` to build your local index, and `helion-rag upload` to contribute your runs back to Manifold (`.../contrib/<family>/`).
+3. Finally, register the new family:
+   ```bash
+   helion-rag setup-helper publish-manifest --manifold-base <uri> --family <fam> [--artifact-path p] [--alias ...]
+   ```
+   This safely merges your new family into the existing `manifest.json` on Manifold.
