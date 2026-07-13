@@ -17,8 +17,6 @@ from .._compiler.cute.tcgen05_constants import TCGEN05_TWO_CTA_EDGE_K_TAIL_MIN_D
 from .._compiler.cute.tcgen05_constants import TCGEN05_TWO_CTA_FP8_SMALL_GRID_BLOCK_M
 from .._compiler.cute.tcgen05_constants import TCGEN05_TWO_CTA_FP8_SMALL_GRID_BLOCK_N
 from .._compiler.cute.tcgen05_constants import TCGEN05_TWO_CTA_MAX_K_TILES
-from .._compiler.cute.tcgen05_support import Tcgen05MatmulEnvelope
-from .._compiler.cute.tcgen05_support import tcgen05_unsupported_reason
 from .._compiler.matmul_utils import _compute_out_dtype
 from ..autotuner.config_spec import MatmulFact
 from . import _decorators
@@ -390,28 +388,15 @@ def enforce_dot_requirements(
             # CtaGroup.TWO family: 256x256x128, persistent_interleaved.
             # Smaller edge-heavy shapes continue using the established flat
             # SIMT-edge fallback.
-            # Batched (leading-passthrough) 2-CTA is validated only for static
-            # full tiles, so keep batched off the edge 2-CTA search. Decide via
-            # the same support contract codegen uses (single source of truth).
-            # The candidate is a persistent, cluster_n=1 CtaGroup.TWO config
-            # with all of M/N/K partial (the edge-search gate below requires
-            # two_cta_m_edge and two_cta_n_edge and two_cta_k_tail), so these
-            # feature values are the real ones for that candidate, not
-            # placeholders -- it is unsupported iff the matmul is batched.
-            edge_cluster_m2_supported = (
-                tcgen05_unsupported_reason(
-                    Tcgen05MatmulEnvelope(
-                        has_leading_passthrough=allow_batched_cute_tcgen05,
-                        cta_group=2,
-                        cluster_n=1,
-                        persistent=True,
-                        partial_axes=frozenset({"m", "n", "k"}),
-                    )
-                )
-                is None
-            )
+            #
+            # Batched (leading-passthrough) CtaGroup.TWO is validated ONLY for
+            # static full tiles, and an edge 2-CTA config is partial in M/N/K,
+            # so keep it off the search for batched matmuls. Codegen enforces
+            # the same rule as a loud reject for hand-forced configs (the
+            # batched partial-tile guard in cute_mma._emit_mma_pipeline); keep
+            # the two in sync.
             allow_edge_cluster_m2_search = (
-                edge_cluster_m2_supported
+                not allow_batched_cute_tcgen05
                 and not allow_full_tile_persistent_pid_types
                 and max_tcgen05_m >= TCGEN05_TWO_CTA_BLOCK_M
                 and max_tcgen05_n >= TCGEN05_TWO_CTA_BLOCK_N

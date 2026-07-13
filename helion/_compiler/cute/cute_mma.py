@@ -100,8 +100,6 @@ from .tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_N
 from .tcgen05_constants import TCGEN05_TWO_CTA_EDGE_TMA_STORE_MAX_AB_STAGES
 from .tcgen05_lifecycle import Tcgen05LifecycleContext
 from .tcgen05_pure_matmul import Tcgen05PureMatmulObjectModel
-from .tcgen05_support import Tcgen05MatmulEnvelope
-from .tcgen05_support import tcgen05_unsupported_reason
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
@@ -2333,33 +2331,40 @@ def _emit_mma_pipeline(
         and k_total_size % bk == 0
     )
     if mma_impl == "tcgen05":
-        # Validate the resolved config against the single support contract
-        # (see ``tcgen05_unsupported_reason``) rather than an inline predicate,
-        # so autotune gating and codegen stay in lockstep. Autotune already
-        # excludes batched edge 2-CTA from the search
-        # (``allow_edge_cluster_m2_search``); this rejects a hand-forced
-        # unsupported config loudly instead of returning wrong output.
-        _reason = tcgen05_unsupported_reason(
-            Tcgen05MatmulEnvelope(
-                has_leading_passthrough=analysis.has_leading_passthrough,
-                cta_group=2
-                if (tcgen05_cluster_m == 2 and tcgen05_requested_two_cta)
-                else 1,
-                partial_axes=frozenset(
-                    axis
-                    for axis, is_partial in (
-                        ("m", m_size % bm != 0),
-                        ("n", n_size % bn != 0),
-                        ("k", k_total_size % bk != 0),
-                    )
-                    if is_partial
-                ),
-                cluster_n=tcgen05_cluster_n_requested,
-                persistent=tcgen05_pid_is_persistent,
-            )
+        # Batched (leading-passthrough) CtaGroup.TWO is validated ONLY for
+        # static full tiles: the output-edge scheduler linearizes the virtual
+        # pid over M/N only (a leading batch axis misclassifies partial tiles)
+        # and the K-tail reduction is batch-unaware -- either silently
+        # miscomputes. Reject any partial M/N/K here, TMA-independent so no
+        # fallback layout slips past. Autotune already keeps batched off the
+        # edge 2-CTA search (see ``allow_edge_cluster_m2_search`` in
+        # matmul_ops); this rejects a hand-forced config loudly instead of
+        # returning wrong output. Keep the two rules in sync.
+        _batched_two_cta = (
+            analysis.has_leading_passthrough
+            and tcgen05_cluster_m == 2
+            and tcgen05_requested_two_cta
+            and tcgen05_cluster_n_requested == 1
+            and tcgen05_pid_is_persistent
         )
-        if _reason is not None:
-            raise exc.BackendUnsupported("cute", _reason)
+        if _batched_two_cta:
+            _partial_axes = "/".join(
+                axis
+                for axis, is_partial in (
+                    ("M", m_size % bm != 0),
+                    ("N", n_size % bn != 0),
+                    ("K", k_total_size % bk != 0),
+                )
+                if is_partial
+            )
+            if _partial_axes:
+                raise exc.BackendUnsupported(
+                    "cute",
+                    "batched (leading-passthrough) CtaGroup.TWO tcgen05 matmul "
+                    f"does not support partial {_partial_axes} tiles; pad M/N/K "
+                    "to the block sizes (static full tiles) or use "
+                    "tcgen05_cluster_m=1.",
+                )
     if (
         mma_impl == "tcgen05"
         and not tcgen05_static_full_tiles
