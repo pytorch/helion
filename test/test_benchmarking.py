@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import functools
+import itertools
 import os
 from types import SimpleNamespace
 
@@ -7,7 +9,32 @@ from benchmarks.cute import compare_attention_backends
 import pytest
 import torch
 
+import helion
+from helion._testing import DEVICE
+from helion._testing import skipIfNotCUDA
+from helion._testing import skipUnlessCuteAvailable
 import helion.autotuner.benchmarking as benchmarking
+import helion.language as hl
+
+
+# CuTe launches on the current torch stream, so it is the backend
+# ``do_bench(current_stream=True)`` exists for. Time this kernel to validate
+# the current-stream event path against a CUDA-graph replay ground truth.
+@helion.kernel(
+    backend="cute",
+    config=helion.Config(block_sizes=[128, 128, 32], num_warps=8),
+    autotune_log_level=0,
+)
+def _bench_matmul_cute(x, y):
+    m, k = x.size()
+    _, n = y.size()
+    out = torch.empty([m, n], dtype=torch.float32, device=x.device)
+    for tm, tn in hl.tile([m, n]):
+        acc = hl.zeros([tm, tn], dtype=torch.float32)
+        for tk in hl.tile(k):
+            acc = hl.dot(x[tm, tk], y[tk, tn], acc=acc)
+        out[tm, tn] = acc
+    return out
 
 
 class _FakeStream:
@@ -371,3 +398,136 @@ def test_cudagraph_auto_skips_nested_capture(monkeypatch):
         return "nested"
 
     assert benchmarking._maybe_cudagraph_replay(fn) is fn
+
+
+_FAKE_EVENT_CLOCK = itertools.count(1)
+
+
+class _RecordingEvent:
+    """torch.cuda.Event stand-in that records which stream it was fired on."""
+
+    def __init__(self, enable_timing=False):
+        self.recorded_on = None
+        self._t = None
+
+    def record(self, stream=None):
+        self.recorded_on = stream
+        # Monotonic fake timestamps so elapsed_time is positive and stable.
+        self._t = float(next(_FAKE_EVENT_CLOCK))
+
+    def elapsed_time(self, other):
+        return abs(other._t - self._t)
+
+
+class _RecordingStream:
+    def __init__(self):
+        self.sync_count = 0
+
+    def synchronize(self):
+        self.sync_count += 1
+
+
+@skipIfNotCUDA()
+def test_do_bench_current_stream_records_on_current_stream_single_sync(monkeypatch):
+    """do_bench(current_stream=True) must record on the current torch stream
+    and sync once per timed batch (no per-iteration double sync)."""
+    stream = _RecordingStream()
+    fake_cuda = SimpleNamespace(
+        current_stream=lambda: stream,
+        Event=_RecordingEvent,
+        is_available=lambda: True,
+    )
+    # Fake torch so events/stream are captured deterministically; the real
+    # Triton runtime still provides the L2-clear buffer (harmless on GPU).
+    monkeypatch.setattr(benchmarking, "torch", _fake_torch(fake_cuda))
+    # Force a small, deterministic n_repeat regardless of the fake timings.
+    monkeypatch.setattr(benchmarking, "sync_object", lambda v, **k: 1.0)
+
+    recorded_streams: list[object] = []
+    real_record = _RecordingEvent.record
+
+    def spy_record(self, s=None):
+        recorded_streams.append(s)
+        return real_record(self, s)
+
+    monkeypatch.setattr(_RecordingEvent, "record", spy_record)
+
+    def fn():
+        pass
+
+    benchmarking.do_bench(
+        fn, warmup=1, rep=1, return_mode="median", current_stream=True
+    )
+
+    # Every event was recorded on the current torch stream, never the default.
+    assert recorded_streams, "no events were recorded"
+    assert all(s is stream for s in recorded_streams)
+    # Warmup sync + estimate-batch sync + one final timed-batch sync == 3 total,
+    # and crucially zero syncs inside the timing loop.
+    assert stream.sync_count == 3
+
+
+@skipIfNotCUDA()
+def test_interleaved_bench_current_stream_records_on_current_stream(monkeypatch):
+    """interleaved_bench(current_stream=True) must record on the current torch
+    stream (not Triton's driver stream)."""
+    stream = _RecordingStream()
+    fake_cuda = SimpleNamespace(
+        current_stream=lambda: stream,
+        Event=_RecordingEvent,
+        is_available=lambda: True,
+    )
+    monkeypatch.setattr(benchmarking, "torch", _fake_torch(fake_cuda))
+
+    recorded_streams: list[object] = []
+    real_record = _RecordingEvent.record
+
+    def spy_record(self, s=None):
+        recorded_streams.append(s)
+        return real_record(self, s)
+
+    monkeypatch.setattr(_RecordingEvent, "record", spy_record)
+
+    benchmarking.interleaved_bench(
+        [lambda: None, lambda: None], repeat=2, current_stream=True
+    )
+
+    assert recorded_streams, "no events were recorded"
+    assert all(s is stream for s in recorded_streams)
+
+
+@skipIfNotCUDA()
+@skipUnlessCuteAvailable("CUTLASS CuTe Python DSL is not available")
+def test_cute_do_bench_time_matches_cudagraph_time():
+    """For the CuTe backend, the autotuner's timer (do_bench with
+    current_stream=True, since CuTe launches on the current torch stream) must
+    measure the kernel's true device time: its result must be close to the same
+    CuTe kernel benchmarked under a CUDA-graph replay, which eliminates
+    per-launch CPU overhead entirely.
+
+    Uses a matmul with enough device work that per-launch overhead is a small
+    fraction, so the current-stream event bench and the cudagraph replay should
+    agree to within a modest tolerance."""
+    a = torch.randn(1024, 1024, device=DEVICE)
+    b = torch.randn(1024, 1024, device=DEVICE)
+    bound = _bench_matmul_cute.bind((a, b))
+    bound.set_config(helion.Config(block_sizes=[128, 128, 32], num_warps=8))
+    run = bound._run
+    for _ in range(5):
+        run(a, b)
+    torch.cuda.synchronize()
+    fn = functools.partial(run, a, b)
+
+    # The exact timer the CuTe backend hands the autotuner.
+    cute_do_bench = bound.env.backend.get_do_bench()
+
+    cute_time = cute_do_bench(fn, warmup=25, rep=50, return_mode="median")
+    cudagraph = benchmarking.do_bench(
+        fn, warmup=25, rep=50, return_mode="median", default_cudagraph=True
+    )
+
+    assert cute_time > 0
+    assert cudagraph > 0
+    # The CuTe current-stream timer must land within 25% of the cudagraph time —
+    # i.e. it is measuring device time, not launch overhead.
+    assert abs(cute_time - cudagraph) <= 0.25 * cudagraph

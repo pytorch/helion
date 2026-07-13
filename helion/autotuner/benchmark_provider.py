@@ -37,7 +37,6 @@ from .benchmark_worker import BenchmarkSubprocessError
 from .benchmark_worker import BenchmarkWorker
 from .benchmarking import clear_jit_fast_path_caches
 from .benchmarking import do_bench
-from .benchmarking import do_bench_generic
 from .benchmarking import synchronize_device
 from .logger import SUPPRESSED_TRITON_CODE_MSG
 from .logger import AutotuneLogEntry
@@ -586,16 +585,16 @@ class LocalBenchmarkProvider(BenchmarkProvider):
         # bound-method -> search) survives until cyclic GC runs.
         self.budget_exceeded_fn = _never_exceeded
 
-    def _subprocess_benchmark_uses_wall_clock(self) -> bool:
-        backend = getattr(self.config_spec, "backend", None)
-        if backend is None:
-            return False
-        custom_bench = backend.get_do_bench()
-        return backend.name == "cute" and custom_bench is do_bench_generic
-
     def _subprocess_benchmark_enabled(self) -> bool:
         """Subprocess benchmark path is opt-in and skipped for distributed /
-        mutated-arg kernels where the worker's simple job shape doesn't fit."""
+        mutated-arg kernels where the worker's simple job shape doesn't fit.
+
+        The subprocess worker always times with :func:`do_bench` (Triton
+        events), so only backends that use that default timer
+        (``get_do_bench()`` is ``None``) can run in it. Backends with a custom
+        timer (Pallas wall-clock, CuTe current-stream events) benchmark
+        in-process via their own ``get_do_bench()``.
+        """
         if not self.settings.autotune_benchmark_subprocess:
             return False
         if dist.is_initialized():
@@ -605,9 +604,7 @@ class LocalBenchmarkProvider(BenchmarkProvider):
         if not self.kernel.supports_subprocess_benchmark():
             return False
         backend = getattr(self.config_spec, "backend", None)
-        if backend is None or backend.get_do_bench() is None:
-            return True
-        return self._subprocess_benchmark_uses_wall_clock()
+        return backend is None or backend.get_do_bench() is None
 
     def _subprocess_accuracy_check_enabled(self) -> bool:
         """Default accuracy checks can run in the same killable worker.
@@ -1227,12 +1224,14 @@ class LocalBenchmarkProvider(BenchmarkProvider):
         if self._benchmark_worker is None:
             self._benchmark_worker = BenchmarkWorker(device=None)
 
+        # The subprocess worker only runs for backends that use the default
+        # Triton-event timer (see _subprocess_benchmark_enabled), so it always
+        # times with do_bench; use_wall_clock stays at its False default.
         job = BenchmarkJob(
             fn_spec=fn_spec,
             args_path=self._precompile_args_path,
             warmup=warmup,
             rep=rep,
-            use_wall_clock=self._subprocess_benchmark_uses_wall_clock(),
         )
         return float(
             self._benchmark_worker.run(

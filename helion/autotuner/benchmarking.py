@@ -209,6 +209,7 @@ def interleaved_bench(
     repeat: int,
     desc: str | None = None,
     default_cudagraph: bool = False,
+    current_stream: bool = False,
 ) -> list[float]:
     """
     Benchmark multiple functions at once, interleaving their executions to reduce
@@ -219,8 +220,17 @@ def interleaved_bench(
         fns: List of functions to benchmark
         repeat: Number of times to repeat each benchmark
         desc: Optional description for progress bar
+        current_stream: Record timing events with ``torch.cuda.Event`` on
+            ``torch.cuda.current_stream()`` instead of Triton's driver
+            device-interface events — required for backends (e.g. CuTe) that
+            launch on the current torch stream. See :func:`do_bench` for the
+            full rationale. Incompatible with ``default_cudagraph``.
     """
     from triton import runtime
+
+    assert not (default_cudagraph and current_stream), (
+        "default_cudagraph and current_stream are mutually exclusive"
+    )
 
     # warmup
     for fn in fns:
@@ -230,17 +240,43 @@ def interleaved_bench(
         runtime.driver.active.get_empty_cache_for_benchmark(),  # type: ignore[attr-defined]
     )
     clear_cache()
-    di = runtime.driver.active.get_device_interface()  # type: ignore[attr-defined]
-    start_events = [
-        [di.Event(enable_timing=True) for _ in range(repeat)] for _ in range(len(fns))
-    ]
-    end_events = [
-        [di.Event(enable_timing=True) for _ in range(repeat)] for _ in range(len(fns))
-    ]
 
-    di.synchronize()
+    if current_stream:
+        # Time on the stream the kernel launches on (see do_bench). Both event
+        # types' ``record`` take an optional stream, so recording is shared;
+        # ``event_stream`` is None for the driver interface (implicit current
+        # stream).
+        event_stream: object = torch.cuda.current_stream()
+
+        def make_event() -> object:
+            return torch.cuda.Event(enable_timing=True)
+
+        def sync() -> None:
+            event_stream.synchronize()  # type: ignore[attr-defined]
+    else:
+        di = runtime.driver.active.get_device_interface()  # type: ignore[attr-defined]
+        event_stream = None
+
+        def make_event() -> object:
+            return di.Event(enable_timing=True)
+
+        def sync() -> None:
+            di.synchronize()
+
+    def record(ev: object) -> None:
+        ev.record(event_stream)  # type: ignore[attr-defined]
+
+    start_events = [[make_event() for _ in range(repeat)] for _ in range(len(fns))]
+    end_events = [[make_event() for _ in range(repeat)] for _ in range(len(fns))]
+
+    sync()
+    # cudagraph replay uses a private capture stream, incompatible with
+    # current-stream timing (guarded by the assert above).
     benchmark_functions = [
-        _maybe_cudagraph_replay(fn, default_enabled=default_cudagraph) for fn in fns
+        fn
+        if current_stream
+        else _maybe_cudagraph_replay(fn, default_enabled=default_cudagraph)
+        for fn in fns
     ]
 
     # When a description is supplied we show a progress bar so the user can
@@ -254,15 +290,15 @@ def interleaved_bench(
     for i in iterator:
         for j in range(len(benchmark_functions)):
             clear_cache()
-            start_events[j][i].record()
+            record(start_events[j][i])
             benchmark_functions[j]()
-            end_events[j][i].record()
-    di.synchronize()
+            record(end_events[j][i])
+    sync()
 
     return [
         statistics.median(
             [
-                s.elapsed_time(e)
+                s.elapsed_time(e)  # type: ignore[attr-defined]
                 for s, e in zip(start_events[j], end_events[j], strict=True)
             ]
         )
@@ -500,6 +536,7 @@ def do_bench(
     process_group_name: str | None = None,
     *,
     default_cudagraph: bool = False,
+    current_stream: bool = False,
 ) -> float | tuple[float, ...]:
     """
     Benchmark the runtime of the provided function. By default, return the median runtime of :code:`fn` along with
@@ -517,44 +554,89 @@ def do_bench(
     :type quantiles: list[float], optional
     :param return_mode: The statistical measure to return. Options are "min", "max", "mean", "median", or "all". Default is "mean".
     :type return_mode: str
+    :param current_stream: Record timing events with ``torch.cuda.Event`` on
+        ``torch.cuda.current_stream()`` instead of Triton's driver
+        device-interface events. Required for backends (e.g. CuTe) that launch
+        on the current torch stream, which can differ from Triton's driver
+        stream on Blackwell — recording on the wrong stream lets ``end.record()``
+        complete before the kernel does and mis-times a kernel.
+        Incompatible with ``default_cudagraph`` (graph replay uses a private
+        capture stream), so cudagraph is disabled when this is set.
+    :type current_stream: bool
     """
     from triton import runtime
     from triton.testing import _summarize_statistics
 
     assert return_mode in ["min", "max", "mean", "median", "all"]
+    # cudagraph replay records into a private capture stream, so it cannot be
+    # combined with timing events pinned to the current stream.
+    assert not (default_cudagraph and current_stream), (
+        "default_cudagraph and current_stream are mutually exclusive"
+    )
 
-    di = runtime.driver.active.get_device_interface()  # pyrefly: ignore
+    if current_stream:
+        # Time on the stream the kernel actually launches on (e.g. CuTe launches
+        # on the current torch stream, which can differ from Triton's driver
+        # stream on Blackwell). Both event types' ``record`` take an optional
+        # stream, so recording is shared; ``event_stream`` is None in the
+        # driver-interface case, which records on the current stream implicitly.
+        event_stream: object = torch.cuda.current_stream()
+
+        def make_event() -> object:
+            return torch.cuda.Event(enable_timing=True)
+
+        def sync() -> None:
+            event_stream.synchronize()  # type: ignore[attr-defined]
+    else:
+        di = runtime.driver.active.get_device_interface()  # pyrefly: ignore
+        event_stream = None
+
+        def make_event() -> object:
+            return di.Event(enable_timing=True)
+
+        def sync() -> None:
+            di.synchronize()
+
+    def record(ev: object) -> None:
+        ev.record(event_stream)  # type: ignore[attr-defined]
 
     fn()
-    di.synchronize()
+    sync()
     # Backward benchmarks mutate grad fields between iterations, so keep their
-    # existing launch path.
+    # existing launch path. cudagraph replay uses a private capture stream, so
+    # it is incompatible with current-stream timing.
     benchmark_function = (
         fn
-        if grad_to_none is not None
+        if grad_to_none is not None or current_stream
         else _maybe_cudagraph_replay(fn, default_enabled=default_cudagraph)
     )
 
     cache = runtime.driver.active.get_empty_cache_for_benchmark()  # pyrefly: ignore
 
-    # Estimate the runtime of the function
-    start_event = di.Event(enable_timing=True)
-    end_event = di.Event(enable_timing=True)
-    start_event.record()
-    for _ in range(5):
+    def clear_cache() -> None:
         runtime.driver.active.clear_cache(cache)  # pyrefly: ignore
+
+    # Estimate the runtime of the function
+    start_event = make_event()
+    end_event = make_event()
+    record(start_event)
+    for _ in range(5):
+        clear_cache()
         benchmark_function()
-    end_event.record()
-    di.synchronize()
+    record(end_event)
+    sync()
     estimate_ms = sync_object(
-        start_event.elapsed_time(end_event) / 5, process_group_name=process_group_name
+        start_event.elapsed_time(end_event) / 5,  # type: ignore[attr-defined]
+        process_group_name=process_group_name,
     )
+    if estimate_ms <= 0:
+        estimate_ms = 1e-3
 
     # compute number of warmup and repeat
     n_warmup = max(1, int(warmup / estimate_ms))
     n_repeat = max(1, int(rep / estimate_ms))
-    start_event = [di.Event(enable_timing=True) for i in range(n_repeat)]
-    end_event = [di.Event(enable_timing=True) for i in range(n_repeat)]
+    start_events = [make_event() for _ in range(n_repeat)]
+    end_events = [make_event() for _ in range(n_repeat)]
     # Warm-up
     for _ in range(n_warmup):
         benchmark_function()
@@ -566,15 +648,19 @@ def do_bench(
         if grad_to_none is not None:
             for x in grad_to_none:
                 x.grad = None
-        # we clear the L2 cache before each run
-        runtime.driver.active.clear_cache(cache)  # pyrefly: ignore
+        # we clear the L2 cache before each run; the start event is recorded
+        # after the clear so the clear is never inside the measured interval.
+        clear_cache()
         # record time of `fn`
-        start_event[i].record()
+        record(start_events[i])
         benchmark_function()
-        end_event[i].record()
-    # Record clocks
-    di.synchronize()
-    times = [s.elapsed_time(e) for s, e in zip(start_event, end_event, strict=True)]
+        record(end_events[i])
+    # Record clocks — a single sync for the whole batch.
+    sync()
+    times = [
+        s.elapsed_time(e)  # type: ignore[attr-defined]
+        for s, e in zip(start_events, end_events, strict=True)
+    ]
     return _summarize_statistics(times, quantiles, return_mode)  # pyrefly: ignore
 
 
