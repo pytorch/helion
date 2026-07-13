@@ -2,9 +2,10 @@
 
 These assert on the *generated backend source* (``BoundKernel.to_code``) rather
 than executing, so they need no TPU/GPU: they lock in the Pallas
-``make_async_remote_copy`` lowering for the asymmetric, runtime-routed remote
-copy that fused comms+compute kernels (reduce-scatter / all-to-all) rely on,
-plus the trace-time src<->dst contract.
+``make_async_remote_copy`` lowering and the Triton/NVSHMEM
+``nvshmem_putmem_signal_block`` lowering for the asymmetric, runtime-routed
+remote copy that fused comms+compute kernels (reduce-scatter / all-to-all) rely
+on, plus the trace-time src<->dst contract.
 """
 
 from __future__ import annotations
@@ -41,6 +42,16 @@ def _pallas_symmetric(buf, ws: hl.constexpr):
     return buf
 
 
+@helion.kernel(backend="triton", config=helion.Config())
+def _triton_scatter(src, out, dest, wpos, ws: hl.constexpr):
+    """Same kernel, Triton/NVSHMEM backend."""
+    m = src.shape[0]
+    for i in hl.grid(m):
+        op = hl.start_async_remote_copy(src, [i], dest[i], dst=out, dst_index=[wpos[i]])
+        op.wait()
+    return out
+
+
 def _scatter_args(
     src_dtype=torch.float32, dst_dtype=None, h=128, dst_h=None, src_stride0=None
 ):
@@ -65,6 +76,12 @@ def _scatter_args(
 
 def _code(kernel, args):
     return kernel.bind(args).to_code(helion.Config())
+
+
+def _putmem_line(code):
+    return next(
+        ln.strip() for ln in code.splitlines() if "nvshmem_putmem_signal_block" in ln
+    )
 
 
 def _remote_copy_line(code):
@@ -115,6 +132,44 @@ class TestRemoteCopyPallasCodegen(TestCase):
         self.assertIsNotNone(start, code)
         self.assertIn(f"{start.group(1)}.start()", code)
         self.assertIn(f"{start.group(1)}.wait()", code)
+
+
+class TestRemoteCopyTritonCodegen(TestCase):
+    def test_emits_putmem_and_paired_wait(self):
+        code = _code(_triton_scatter, _scatter_args())
+        put = _putmem_line(code)
+        self.assertIn("NVSHMEM_SIGNAL_ADD", put)
+        sig = re.search(
+            r"nvshmem_putmem_signal_block\([^,]+,[^,]+,[^,]+,\s*(\w+),", put
+        )
+        self.assertIsNotNone(sig, put)
+        # The paired wait references the *same* signal var.
+        self.assertIn(
+            f"nvshmem_signal_wait_until({sig.group(1)}, NVSHMEM_CMP_GE, 1)", code
+        )
+
+    def test_nbytes_scales_with_dtype(self):
+        fp32 = _putmem_line(
+            _code(_triton_scatter, _scatter_args(src_dtype=torch.float32))
+        )
+        bf16 = _putmem_line(
+            _code(_triton_scatter, _scatter_args(src_dtype=torch.bfloat16))
+        )
+        self.assertIn(", 512,", fp32)  # 128 elems * 4 bytes
+        self.assertIn(", 256,", bf16)  # 128 elems * 2 bytes
+
+    def test_offset_uses_real_stride_not_row_numel(self):
+        # Non-contiguous leading dim (stride(0)=160, row width 128): the pointer
+        # offset must use the real stride, not prod(shape[1:]).
+        line = _putmem_line(_code(_triton_scatter, _scatter_args(src_stride0=160)))
+        self.assertRegex(line, r"src \+ \w+ \* 160")
+        self.assertNotRegex(line, r"src \+ \w+ \* 128")
+
+    def test_device_id_is_runtime_pe(self):
+        line = _putmem_line(_code(_triton_scatter, _scatter_args()))
+        pe = re.search(r"NVSHMEM_SIGNAL_ADD,\s*(\w+)\)", line)
+        self.assertIsNotNone(pe, line)
+        self.assertFalse(pe.group(1).isdigit(), f"expected runtime pe: {line}")
 
 
 class TestRemoteCopyContract(TestCase):
