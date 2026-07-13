@@ -1022,6 +1022,13 @@ class TritonBackend(Backend):
             from .._compat import supports_amd_cdna_tunables
 
             return supports_amd_cdna_tunables()
+        if key == "xcd_remap":
+            from .._compat import supports_amd_cdna_tunables
+
+            # Accepted on all AMD CDNA.  On single-XCD devices it normalizes to a
+            # no-op (ConfigSpec.normalize) and is excluded from the search space
+            # (ConfigSpec.flat_config) rather than rejected.
+            return supports_amd_cdna_tunables()
 
         from .._compat import get_mtia_tunable_fragments
         from .._compat import supports_mtia_tunables
@@ -1619,9 +1626,6 @@ class PallasBackend(Backend):
             "lax": "import jax.lax as lax",
             "pltpu": "from jax.experimental.pallas import tpu as pltpu",
             "_default_pallas_launcher": "from helion.runtime import default_pallas_launcher as _default_pallas_launcher",
-            "_default_pallas_pipeline_launcher": "from helion.runtime import default_pallas_pipeline_launcher as _default_pallas_pipeline_launcher",
-            "_default_pallas_fori_launcher": "from helion.runtime import default_pallas_fori_launcher as _default_pallas_fori_launcher",
-            "_default_pallas_compact_worklist_launcher": "from helion.runtime import default_pallas_compact_worklist_launcher as _default_pallas_compact_worklist_launcher",
         }
 
     # Config keys that Pallas actually uses.  Everything else
@@ -2534,33 +2538,30 @@ class PallasBackend(Backend):
 
         # Pass scratch shapes for pipeline/fori_loop launcher
         pallas_loop_type = config.get("pallas_loop_type", "unroll")
-        if pallas_loop_type in ("emit_pipeline", "fori_loop", "compact_worklist"):
-            scratch_shapes = [
-                (
-                    s.shape,
-                    self.dtype_str(s.dtype) if s.dtype is not None else None,
-                    s.scratch_type,
-                )
-                for s in device_fn._scratch_args
+        scratch_shapes = [
+            (
+                s.shape,
+                self.dtype_str(s.dtype) if s.dtype is not None else None,
+                s.scratch_type,
+            )
+            for s in device_fn._scratch_args
+        ]
+        if scratch_shapes:
+            launcher_args.append(f"_scratch_shapes={scratch_shapes!r}")
+
+        # Identify which launcher arg positions correspond to pipeline-body
+        # tensors (need HBM refs); all others get proper BlockSpecs.
+        from .device_function import TensorArg
+
+        if sorted_args is not None:
+            hbm_arg_indices = [
+                i
+                for i, arg in enumerate(sorted_args)
+                if isinstance(arg, TensorArg)
+                and mem_space.get(id(arg.fake_value)) == PallasMemorySpace.HBM
             ]
-            if scratch_shapes:
-                launcher_args.append(f"_scratch_shapes={scratch_shapes!r}")
-
-            # Identify which launcher arg positions correspond to pipeline-body
-            # tensors (need HBM refs); all others get proper BlockSpecs.
-            from .device_function import TensorArg
-
-            if sorted_args is not None:
-                pipeline_arg_indices = [
-                    i
-                    for i, arg in enumerate(sorted_args)
-                    if isinstance(arg, TensorArg)
-                    and mem_space.get(id(arg.fake_value)) == PallasMemorySpace.HBM
-                ]
-                if pipeline_arg_indices:
-                    launcher_args.append(
-                        f"_pipeline_arg_indices={pipeline_arg_indices!r}"
-                    )
+            if hbm_arg_indices:
+                launcher_args.append(f"_hbm_arg_indices={hbm_arg_indices!r}")
 
         if CompileEnvironment.current().settings.pallas_interpret:
             launcher_args.append("_pallas_interpret=True")
@@ -2642,7 +2643,13 @@ class PallasBackend(Backend):
         ]
 
     def build_launcher_name(self, config: Config) -> str:
-        """Return the launcher name to use based on ``pallas_loop_type``."""
+        """Return the single Pallas launcher name.
+
+        All ``pallas_loop_type`` values (``unroll``, ``emit_pipeline``,
+        ``fori_loop``, ``compact_worklist``) route through the same
+        ``default_pallas_launcher``; the loop-shape choice happens
+        inside based on the launcher-observable kwargs codegen emits.
+        """
         from ..autotuner.config_spec import VALID_PALLAS_LOOP_TYPES
 
         pallas_loop_type = config.get("pallas_loop_type", "unroll")
@@ -2651,15 +2658,6 @@ class PallasBackend(Backend):
                 f"Invalid pallas_loop_type {pallas_loop_type!r}. "
                 f"Expected one of {VALID_PALLAS_LOOP_TYPES}."
             )
-        if pallas_loop_type == "emit_pipeline":
-            return "_default_pallas_pipeline_launcher"
-        if pallas_loop_type == "fori_loop":
-            return "_default_pallas_fori_launcher"
-        if pallas_loop_type == "compact_worklist":
-            # Detection + plan stash happen in pre_codegen; route to the compact
-            # launcher (builds the worklist in-jit -> dynamic num_work grid with
-            # scalar-prefetch metadata).
-            return "_default_pallas_compact_worklist_launcher"
         return self.default_launcher_name
 
     def get_launcher_name(self) -> str:

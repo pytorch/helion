@@ -74,7 +74,7 @@ class AccuracyCheckJob:
             args = load_trusted_kernel_args(self.args_path)
             baseline_output = _load_trusted_baseline_output(self.baseline_path)
             output = fn(*args)
-            synchronize_device(output)
+            synchronize_device()
 
         try:
             assert_close(output, baseline_output, atol=self.atol, rtol=self.rtol)

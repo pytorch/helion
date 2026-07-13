@@ -192,6 +192,10 @@ class Kernel(Generic[_R]):
             for config in configs or []
         ]
         self._bound_kernels: dict[BoundKernelInMemoryCacheKey, BoundKernel] = {}
+        # Fast dispatch cache: maps a cheap, fine-grained argument key (exact
+        # dtype/shape/stride/device per tensor) directly to a BoundKernel,
+        # skipping the full specialization-key machinery on repeat calls.
+        self._dispatch_cache: dict[Hashable, BoundKernel] = {}
         self._specialize_extra: dict[
             Hashable, list[Callable[[Sequence[object]], Hashable]]
         ] = {}
@@ -272,6 +276,52 @@ class Kernel(Generic[_R]):
         self._specialize_extra[signature] = extra_fns = bound_kernel._specialize_extra()
         extra_results: tuple[Hashable, ...] = tuple([s(args) for s in extra_fns])
         return BoundKernelInMemoryCacheKey(signature, extra_results)
+
+    def _fast_dispatch_key(self, args: tuple[object, ...]) -> Hashable | None:
+        """
+        Build a cheap dispatch key for the fast-path cache in ``__call__``.
+
+        The key records exact per-argument metadata (dtype/shape/stride/device
+        for tensors, type and value for scalars), which is strictly finer than
+        the full specialization key: any two argument lists that produce
+        different full keys also produce different fast keys.  That makes it
+        safe to map a fast key directly to the BoundKernel that a full
+        ``bind()`` resolved for the same arguments.
+
+        Returns None when an argument type is not handled (tensor subclasses,
+        containers, ...), or when there is no tensor argument to pin down the
+        device; callers must then take the regular ``bind()`` path.
+        """
+        key: list[Hashable] = []
+        has_tensor = False
+        for a in args:
+            t = type(a)
+            if t is torch.Tensor or t is torch.nn.Parameter:
+                tensor = cast("torch.Tensor", a)
+                has_tensor = True
+                si = getattr(tensor, "_dynamo_static_indices", None)
+                key.append(
+                    (
+                        tensor.dtype,
+                        tensor.shape,
+                        tensor.stride(),
+                        tensor.device,
+                        None if si is None else frozenset(si),
+                    )
+                )
+            elif t is int or t is float or t is bool or t is str:
+                key.append((t, a))
+            elif a is None:
+                key.append(None)
+            elif t is torch.dtype or t is torch.device:
+                key.append(a)
+            else:
+                return None
+        if not has_tensor:
+            return None
+        if self._key_fn is not None:
+            key.append(self._key_fn(*args))
+        return tuple(key)
 
     def bind(self, args: tuple[object, ...]) -> BoundKernel[_R]:
         """
@@ -440,6 +490,17 @@ class Kernel(Generic[_R]):
         """
         if kwargs:
             args = self.normalize_args(*args, **kwargs)
+        elif self._dispatch_cache:
+            # Fast path: repeat call with argument metadata seen before. The
+            # cache is only populated by calls that already took the slow
+            # path below, so hitting it cannot skip autotuning/compilation.
+            # (The cache stays empty under TPU compile capture, so this
+            # cannot bypass auto_capture_call below.)
+            fast_key = self._fast_dispatch_key(args)
+            if fast_key is not None:
+                bound = self._dispatch_cache.get(fast_key)
+                if bound is not None and bound._run is not None:
+                    return bound._run(*args)
         if self.settings.backend == "pallas" and _TPU_COMPILE_CAPTURE:
             # Local import: _tpu_compile_capture pulls in the dynamo HOP machinery,
             # not ready when kernel.py first loads during ``import helion``.
@@ -449,7 +510,14 @@ class Kernel(Generic[_R]):
             result = auto_capture_call(self, args)
             if result is not RUN_NORMAL:
                 return cast("_R", result)
-        return self.bind(args)(*args)
+            return self.bind(args)(*args)
+        bound = self.bind(args)
+        result = bound(*args)
+        if bound._run is not None:
+            fast_key = self._fast_dispatch_key(args)
+            if fast_key is not None:
+                self._dispatch_cache[fast_key] = bound
+        return result
 
     def reset(self) -> None:
         """
@@ -457,6 +525,7 @@ class Kernel(Generic[_R]):
         recompile and re-autotune.
         """
         self._bound_kernels.clear()
+        self._dispatch_cache.clear()
 
     @property
     def jax_fn(self) -> Callable[..., Any]:

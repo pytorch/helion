@@ -820,16 +820,16 @@ class TestNoSilentFallback(unittest.TestCase):
         code = bound.to_triton_code(
             helion.Config(block_sizes=[8], pallas_loop_type="compact_worklist")
         )
-        # Routes to the compact launcher with the worklist builder + scalar
-        # prefetch, NOT the default unroll launcher.
-        self.assertIn("_default_pallas_compact_worklist_launcher", code)
+        # Emits the compact-worklist-specific launcher kwargs and the
+        # in-jit worklist builder; the unified launcher dispatches to
+        # the compact compile path based on ``_compact_build_worklist``.
+        self.assertIn("_compact_build_worklist=_build_worklist", code)
         self.assertIn("def _build_worklist(", code)
         # Offsets arg index is non-empty (q_offsets feeds the builder).
         self.assertRegex(code, r"_compact_offset_arg_indices=\[\d")
         self.assertIn("_compact_num_scalar_prefetch=3", code)
         self.assertIn("_wid = pl.program_id(0)", code)
         self.assertIn("work_seq_ref[_wid]", code)
-        self.assertNotIn("_default_pallas_launcher", code)
 
     def test_unsupported_kernel_raises(self):
         def fn(x, y):
@@ -866,8 +866,8 @@ class TestStreamingClassification(unittest.TestCase):
         )
 
         # Ordered K/V stream from HBM via a nested emit_pipeline with double
-        # buffering -- reusing _pipeline_arg_indices, no new launcher API.
-        self.assertIn("_pipeline_arg_indices=", code)
+        # buffering -- reusing _hbm_arg_indices, no new launcher API.
+        self.assertIn("_hbm_arg_indices=", code)
         self.assertIn("pltpu.emit_pipeline(", code)
         self.assertIn("pl.ds(kv_begin_ref[_wid]", code)
         self.assertIn("pl.BoundedSlice(", code)
@@ -893,7 +893,7 @@ class TestStreamingClassification(unittest.TestCase):
             helion.Config(block_sizes=[8], pallas_loop_type="compact_worklist")
         )
 
-        self.assertNotIn("_pipeline_arg_indices=", code)
+        self.assertNotIn("_hbm_arg_indices=", code)
         self.assertNotIn("pltpu.make_async_copy", code)
         # Dense-KV has no ordered axis, so no inner pipeline either.
         self.assertNotIn("pltpu.emit_pipeline", code)
@@ -915,7 +915,7 @@ class TestStreamingClassification(unittest.TestCase):
 
         # Here the ordered axis is the q-like loop, so q and dO stream via the
         # nested emit_pipeline; out is the compact exact-store and stays out.
-        self.assertIn("_pipeline_arg_indices=", code)
+        self.assertIn("_hbm_arg_indices=", code)
         self.assertIn("pltpu.emit_pipeline(", code)
         self.assertIn("pl.ds(q_begin_ref[_wid]", code)
         self.assertIn("pl.Buffered(buffer_count=2)", code)
@@ -1040,7 +1040,7 @@ class TestConfigStateIsolation(unittest.TestCase):
             helion.Config(block_sizes=[8], pallas_loop_type="fori_loop")
         )
         self.assertNotIn("work_seq_ref", fori)
-        self.assertNotIn("_default_pallas_compact_worklist_launcher", fori)
+        self.assertNotIn("_compact_build_worklist", fori)
         self.assertNotIn("_build_worklist", fori)
 
 

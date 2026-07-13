@@ -271,9 +271,12 @@ def enforce_dot_requirements(lhs: torch.Tensor, rhs: torch.Tensor) -> None:
     k2, n = rshape[-2], rshape[-1]
     assert k == k2, f"Mismatched K dimensions for dot: {k} vs {k2}"
 
+    from ..autotuner.config_spec import SMALL_DIM_BLOCK_SIZE_OVERSHOOT
+
     a, b, c = min_dot_size(lhs.device, lhs.dtype, rhs.dtype)
     env = CompileEnvironment.current()
-    for shape, min_size in ((m, a), (n, b), (k, c)):
+    # M and N are the output tile dims; K is the contraction loop.
+    for shape, min_size, is_output_dim in ((m, a, True), (n, b, True), (k, c, False)):
         block_idx = env.get_block_id(shape)
         if block_idx is not None:
             # On Pallas, clamp min to the tensor dimension so we don't
@@ -288,6 +291,17 @@ def enforce_dot_requirements(lhs: torch.Tensor, rhs: torch.Tensor) -> None:
                 except KeyError:
                     pass
             env.block_sizes[block_idx].update_min_block(min_size, allow_flattened=True)
+            # Let the autotuner try output (M/N) block sizes larger than a small
+            # matmul dimension: the masked rows/cols map to a more efficient MMA
+            # tile. Out-of-bounds masking is a Triton feature, so other backends
+            # keep the dimension-sized ceiling.
+            if is_output_dim and env.backend_name == "triton":
+                try:
+                    spec = env.config_spec.block_sizes.block_id_lookup(block_idx)
+                except KeyError:
+                    pass
+                else:
+                    spec.allow_overshoot(SMALL_DIM_BLOCK_SIZE_OVERSHOOT)
 
     # Blackwell tcgen05 matmuls require an explicit MxNxK tile family that the
     # generic power-of-two search space rarely reaches on its own. Reuse the

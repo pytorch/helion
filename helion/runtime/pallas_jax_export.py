@@ -41,7 +41,6 @@ if TYPE_CHECKING:
     from collections.abc import Callable
 
     from . import _BlockSpecInfo
-    from . import _PallasLoopKind
     from .kernel import Kernel
 
 
@@ -260,11 +259,10 @@ def default_pallas_jax_launcher(
     _inplace_indices: list[int] | None = None,
     _block_spec_info: _BlockSpecInfo | None = None,
     _scratch_shapes: list[object] | None = None,
-    _pipeline_arg_indices: list[int] | None = None,
+    _hbm_arg_indices: list[int] | None = None,
     _ds_pad_dims: list[tuple[int, int, int, int]] | None = None,
     _smem_arg_indices: list[int] | None = None,
     _pallas_interpret: bool | None = None,
-    _kind: _PallasLoopKind | None = None,
     **kwargs: object,
 ) -> object:
     """Pallas launcher used when running a Helion kernel inside ``jax.jit``.
@@ -272,25 +270,23 @@ def default_pallas_jax_launcher(
     Each tensor argument in ``args`` is a ``_JaxExportTensor`` whose
     underlying ``_jax_arr`` is either a concrete JAX array or a JAX
     tracer.  This launcher pulls the JAX side out, calls the shared
-    ``_pallas_compile_jit_fn`` to build a fresh ``pl.pallas_call``
-    (no JaxCallable, no torch<->JAX bridge), invokes it on the JAX
-    inputs, and re-wraps the output(s) as ``_JaxExportTensor`` so the
-    Helion wrapper's trailing reshape/view operations stay traceable.
+    ``_pallas_compile_jit_fn`` (or the compact-worklist variant when
+    ``_compact_build_worklist`` is present) to build a fresh
+    ``pl.pallas_call``, invokes it on the JAX inputs, and re-wraps the
+    output(s) as ``_JaxExportTensor`` so the Helion wrapper's trailing
+    reshape/view operations stay traceable.
     """
     from . import _pallas_apply_ds_padding
     from . import _pallas_compile_jit_fn
     from . import _pallas_output_only_descriptors
     from . import _pallas_padded_output_dims_by_arg
     from . import _pallas_slice_to_orig
-    from . import _PallasLoopKind as _LoopKind
     from .settings import is_pallas_interpret
 
     interpret = (
         _pallas_interpret if _pallas_interpret is not None else is_pallas_interpret()
     )
 
-    if _kind is None:
-        _kind = _LoopKind.UNROLL
     output_indices = _output_indices if _output_indices is not None else []
 
     # Capture original shapes BEFORE padding so output-only tensors can
@@ -313,7 +309,11 @@ def default_pallas_jax_launcher(
         _device_for_jax_export(),
     )
 
-    if _kind is _LoopKind.COMPACT_WORKLIST:
+    # Compact-worklist kernels are discriminated by the presence of the
+    # ``_compact_build_worklist`` launcher kwarg, which is emitted by
+    # codegen only for that lowering.
+    compact_build_worklist = kwargs.get("_compact_build_worklist")
+    if compact_build_worklist is not None:
         from . import _pallas_compile_compact_jit_fn
 
         result = _pallas_compile_compact_jit_fn(
@@ -324,8 +324,8 @@ def default_pallas_jax_launcher(
             _block_spec_info=_block_spec_info,
             _scratch_shapes=_scratch_shapes,
             _smem_arg_indices=_smem_arg_indices,
-            _pipeline_arg_indices=_pipeline_arg_indices,
-            build_worklist=cast("Any", kwargs["_compact_build_worklist"]),
+            _hbm_arg_indices=_hbm_arg_indices,
+            build_worklist=cast("Any", compact_build_worklist),
             offset_arg_indices=cast(
                 "Any", kwargs.get("_compact_offset_arg_indices") or []
             ),
@@ -348,13 +348,12 @@ def default_pallas_jax_launcher(
             pallas_kernel,
             grid,
             args,
-            kind=_kind,
             _output_indices=output_indices,
             _inplace_indices=_inplace_indices,
             _block_spec_info=_block_spec_info,
             _smem_arg_indices=_smem_arg_indices,
             _scratch_shapes=_scratch_shapes,
-            _pipeline_arg_indices=_pipeline_arg_indices,
+            _hbm_arg_indices=_hbm_arg_indices,
             _matmul_dot_general=None,
             interpret=interpret,
         )
@@ -415,8 +414,6 @@ def make_jax_fn(kernel: Kernel) -> Callable[..., Any]:
     """
 
     def _runtime_call(*args: object) -> object:
-        from . import _PallasLoopKind as _LoopKind
-
         device = _device_for_jax_export()
         adapter_args: list[object] = []
         for a in args:
@@ -439,13 +436,10 @@ def make_jax_fn(kernel: Kernel) -> Callable[..., Any]:
         compiled = bound._run
         assert compiled is not None
 
-        # Resolve the JAX-export launcher to use for the kernel's
-        # configured loop type.  ``_run`` is the generated wrapper
-        # which forwards ``_launcher`` via kwargs.
-        config = bound._config
-        assert config is not None
-        kind = _LoopKind(cast("str", config.config.get("pallas_loop_type", "unroll")))
-
+        # ``default_pallas_jax_launcher`` picks the compile path from
+        # the kwargs codegen already emits (``_scratch_shapes``,
+        # ``_hbm_arg_indices``, ``_compact_build_worklist``); no
+        # loop-type discriminator needed.
         def _launcher(
             pallas_kernel: object,
             grid: tuple[int, ...],
@@ -456,7 +450,6 @@ def make_jax_fn(kernel: Kernel) -> Callable[..., Any]:
                 pallas_kernel,
                 grid,
                 *launch_args,
-                _kind=kind,
                 **cast("dict[str, Any]", launch_kwargs),
             )
 

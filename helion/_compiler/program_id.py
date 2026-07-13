@@ -190,6 +190,7 @@ if TYPE_CHECKING:
     from .inductor_lowering import CodegenState
 
 NUM_SM_VAR = "_NUM_SM"
+NUM_XCD_VAR = "_NUM_XCDS"
 
 
 class PIDInfo(NamedTuple):
@@ -542,13 +543,93 @@ class XYZProgramIDs(ProgramIDs):
         )
 
 
+def _xcd_device_str() -> str:
+    """Device expression for the current compile device (for host-side helpers)."""
+    host_function = HostFunction.current()
+    device = CompileEnvironment.current().device
+    origins = [
+        o for t, o in host_function.tensor_to_origin.items() if t.device == device
+    ]
+    if origins:
+        return f"{origins[0].host_str()}.device"
+    return f"torch.{device!r}"
+
+
+def _maybe_emit_xcd_remap(
+    device_function: DeviceFunction,
+    pid_expr: str,
+    total_expr: str,
+    active_total_expr: str | None = None,
+) -> tuple[list[ast.stmt], str]:
+    """Optionally remap a program id into contiguous per-XCD regions.
+
+    No-op (returns ``([], pid_expr)``) unless ``xcd_remap`` is enabled.  When
+    enabled, emits the AITER-style contiguous-XCD remap (matching aiter
+    ``remap_xcd``) and returns the name of the remapped variable.
+
+    Used for:
+    - ``flat`` / ``persistent_interleaved``: the (virtual) program id over the
+      logical tile count;
+    - ``persistent_blocked``: the worker id (``program_id(0)``) over the grid
+      size, remapping which contiguous block each worker owns.
+    """
+    if not device_function.config.get("xcd_remap", False):
+        return [], pid_expr
+
+    # Inject _NUM_XCDS as a host-computed constexpr (mirrors _NUM_SM).
+    if device_function.constexpr_arg(NUM_XCD_VAR):
+        device_function.codegen.host_statements.append(
+            statement_from_string(
+                f"{NUM_XCD_VAR} = helion.runtime.get_num_xcd({_xcd_device_str()})"
+            )
+        )
+
+    new_var = device_function.new_var
+    pids_per = new_var("xcd_pids_per", dce=True)
+    tall = new_var("xcd_tall", dce=True)
+    xcd = new_var("xcd_id", dce=True)
+    local = new_var("xcd_local_pid", dce=True)
+    out = new_var("xcd_pid", dce=True)
+    nx = NUM_XCD_VAR
+    total = f"({active_total_expr or total_expr})"
+    # Matches aiter remap_xcd: the first `tall` XCDs own one extra contiguous PID.
+    stmts = [
+        statement_from_string(f"{pids_per} = ({total} + {nx} - 1) // {nx}"),
+        statement_from_string(f"{tall} = {total} % {nx}"),
+        statement_from_string(f"{tall} = tl.where({tall} == 0, {nx}, {tall})"),
+        statement_from_string(f"{xcd} = ({pid_expr}) % {nx}"),
+        statement_from_string(f"{local} = ({pid_expr}) // {nx}"),
+        statement_from_string(
+            f"{out} = tl.where("
+            f"{xcd} < {tall}, "
+            f"{xcd} * {pids_per} + {local}, "
+            f"{tall} * {pids_per} + ({xcd} - {tall}) * ({pids_per} - 1) + {local})"
+        ),
+    ]
+    if active_total_expr is not None:
+        guarded = new_var("xcd_pid", dce=True)
+        stmts.append(
+            statement_from_string(
+                f"{guarded} = tl.where(({pid_expr}) < {total}, {out}, {total})"
+            )
+        )
+        out = guarded
+    return stmts, out
+
+
 class FlatProgramIDs(ProgramIDs):
     """Only use the x grid and compute other dimensions"""
 
     def codegen(self, state: CodegenState) -> None:
         pid_var = self.shared_pid_var or typed_program_id(0)
+        remap_stmts, pid_var = _maybe_emit_xcd_remap(
+            state.device_function,
+            pid_var,
+            self.total_pids_expr(is_device=True),
+        )
         statements = self._decompose_pid_to_statements(pid_var, state)
         state.codegen.statements_stack[-1][:] = [
+            *remap_stmts,
             *statements,
             *state.codegen.statements_stack[-1],
         ]
@@ -624,6 +705,10 @@ class L2GroupingProgramIDs(ProgramIDs):
         # These are always the first 2 dimensions in the PID decomposition
         num_dims = len(parent_pids)
         assignments = []
+        parent = self.parent_strategy
+        parent_is_blocked = parent._is_persistent() and getattr(
+            parent, "is_blocked", False
+        )
 
         # Generate size variables for all dimensions (except the last which doesn't need one)
         num_blocks: list[str] = []
@@ -652,6 +737,19 @@ class L2GroupingProgramIDs(ProgramIDs):
         else:
             # For other strategies (Flat, Persistent), use the virtual_program_id
             pid = self.virtual_program_id
+
+        # xcd_remap (if enabled) regroups the PID space into contiguous per-XCD
+        # regions *before* L2 grouping orders tiles within it.  For a blocked
+        # persistent parent the remap is applied at the worker->block level in
+        # the persistent setup instead, so skip it here to avoid double-remap.
+        if parent_is_blocked:
+            xcd_stmts: list[ast.stmt] = []
+        else:
+            xcd_stmts, pid = _maybe_emit_xcd_remap(
+                state.device_function,
+                pid,
+                parent.total_pids_expr(is_device=True),
+            )
 
         # Apply L2 grouping to the 2 fastest varying dimensions (pid_0, pid_1)
         fastest_m_idx = 0  # pid_0 (fastest varying)
@@ -725,6 +823,7 @@ class L2GroupingProgramIDs(ProgramIDs):
         ]
 
         state.codegen.statements_stack[-1][:] = [
+            *xcd_stmts,
             *statements,
             *state.codegen.statements_stack[-1],
         ]
@@ -832,13 +931,40 @@ class PersistentProgramIDs(ProgramIDs):
             and self.start_pid_var
             and self.end_pid_var
         ):
+            stmts.append(
+                statement_from_string(
+                    f"{self.block_size_var} = {backend.cdiv_expr(self.total_pids_var, self.grid_size_expr, is_device=True)}"
+                )
+            )
+            worker = typed_program_id(0)
+            if DeviceFunction.current().config.get("xcd_remap", False):
+                new_var = DeviceFunction.current().new_var
+                safe_block_size = new_var("xcd_safe_block_size", dce=True)
+                active_workers = new_var("xcd_active_workers", dce=True)
+                stmts.extend(
+                    [
+                        statement_from_string(
+                            f"{safe_block_size} = tl.maximum({self.block_size_var}, 1)"
+                        ),
+                        statement_from_string(
+                            f"{active_workers} = {backend.cdiv_expr(self.total_pids_var, safe_block_size, is_device=True)}"
+                        ),
+                    ]
+                )
+                # Remap only the workers that own at least one block.  Slack
+                # workers are sent past the end of the compact worker domain so
+                # their persistent range is empty after end clipping.
+                wstmts, worker = _maybe_emit_xcd_remap(
+                    DeviceFunction.current(),
+                    typed_program_id(0),
+                    active_workers,
+                    active_workers,
+                )
+                stmts.extend(wstmts)
             stmts.extend(
                 [
                     statement_from_string(
-                        f"{self.block_size_var} = {backend.cdiv_expr(self.total_pids_var, self.grid_size_expr, is_device=True)}"
-                    ),
-                    statement_from_string(
-                        f"{self.start_pid_var} = {typed_program_id(0)} * {self.block_size_var}"
+                        f"{self.start_pid_var} = {worker} * {self.block_size_var}"
                     ),
                     statement_from_string(
                         f"{self.end_pid_var} = {self.start_pid_var} + {self.block_size_var}"
@@ -897,6 +1023,16 @@ class PersistentProgramIDs(ProgramIDs):
         """Decompose virtual PID into individual PID variables."""
         # Use shared_pid_var if available, otherwise virtual_pid_var
         pid_var = self.shared_pid_var or virtual_pid_var
+        # Interleaved: remap each virtual pid into per-XCD contiguous regions
+        # (matches aiter's per-tile remap_xcd).  Blocked remaps the worker->block
+        # assignment in the persistent setup instead, so it is skipped here.
+        if not self.is_blocked:
+            remap_stmts, pid_var = _maybe_emit_xcd_remap(
+                state.device_function,
+                pid_var,
+                self.total_pids_expr(is_device=True),
+            )
+            setup_statements.extend(remap_stmts)
         statements = self._decompose_pid_to_statements(pid_var, state)
         setup_statements.extend(statements)
 

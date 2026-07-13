@@ -341,9 +341,7 @@ class BaseSearch(BaseAutotuner):
                 )
                 self._search_summary = None
                 self._exploration_tracker = None
-        # Per-run identity for the <autotune_log>.meta.jsonl record (written when
-        # dataset collection is on); CSV rows join to it on run_id. The sink adds
-        # the configs tested.
+        host_function = getattr(self.kernel, "host_function", None)
         self._kernel_metadata: KernelMetadata = KernelMetadata(
             kernel_name=kernel_name,
             kernel_source=kernel_source,
@@ -351,6 +349,7 @@ class BaseSearch(BaseAutotuner):
             dtypes=dtypes,
             hardware=hardware,
             settings=self.settings.to_dict(),
+            _device_ir=getattr(host_function, "_device_ir", None),
         )
         self.benchmark_provider = self._benchmark_provider_cls(
             kernel=self.kernel,

@@ -9,6 +9,9 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from collections.abc import Callable
 
+    from .._compiler.device_ir import DeviceIR
+
+
 _post_autotune_hooks: list[Callable[[AutotuneMetrics], None]] = []
 
 
@@ -63,12 +66,8 @@ class AutotuneMetrics:
         }
 
 
-# Codegen/perf-affecting settings hashed into run_id, so invocations that would
-# generate different code never collide. Kept as a small local tuple (not Settings
-# field metadata) so settings.py stays untouched; the full settings are still
-# recorded verbatim in the .meta.jsonl record. Sorted for a stable wire format.
-# Every value is a scalar/enum/torch.dtype, so run_id is reproducible across
-# processes (no callables/paths/seed leak in).
+# Only codegen/perf-affecting settings belong in run_id; full settings stay in
+# metadata. Keep sorted for a stable wire format.
 _CODEGEN_SETTINGS: tuple[str, ...] = (
     "allow_warp_specialize",
     "backend",
@@ -84,11 +83,10 @@ _CODEGEN_SETTINGS: tuple[str, ...] = (
 
 
 def _codegen_signature(settings: dict[str, object] | None) -> str:
-    """Join codegen-affecting settings into a stable, reproducible string for run_id.
-
-    Iterates the fixed local set of codegen-affecting settings, so any codegen
-    change alters run_id. Order is the tuple's (sorted) order for a stable wire
-    format; missing keys render as None. Full settings are stored separately in
+    """Generates a stable, reproducible run_id string based on code-generation
+    settings. Iterates through a fixed, sorted list of settings. Missing keys
+    are marked as None. Any change to a codegen-affecting setting automatically
+    changes the run_id. The complete settings are stored separately in the
     metadata.
     """
     if not settings:
@@ -98,24 +96,11 @@ def _codegen_signature(settings: dict[str, object] | None) -> str:
 
 @dataclasses.dataclass
 class KernelMetadata:
-    """Per-run identity for the kernel being autotuned.
-
-    Appended (one JSON record per run) to the ``<autotune_log>.meta.jsonl``
-    sidecar that sits next to the per-config CSV telemetry. The CSV records each
-    config and its result; this record provides the kernel context (source,
-    shapes, dtypes, hardware, settings) those rows join back to.
-
-    ``run_id`` is the single foreign key for an autotune *invocation*: a direct
-    content hash of ``(kernel_source, codegen-settings signature, input_shapes,
-    dtypes, hardware)``. The same invocation produces the same ``run_id`` across
-    processes and CI runs (enabling dedup/aggregation), and any change to the
-    kernel, codegen-affecting settings, shapes, dtypes, or hardware changes it.
-    Because every CSV row is also stamped with ``run_id``, rows join to exactly
-    one meta record (a clean many-to-one).
-
-    ``run_id`` is a :func:`functools.cached_property` computed on first access.
-    ``kernel_source`` carries the full source text and ``settings`` the full
-    reproduction context for analysis.
+    """A metadata record containing the full context (source, shapes, dtypes, hardware,
+    settings) for an autotune run computed lazily on first access. Saved as a single JSON
+    line in <autotune_log>.meta.jsonl, acting as a sidecar to the configuration CSV.
+    Telemetry CSV rows map many-to-one to this metadata record using run_id as the foreign
+    key.
     """
 
     kernel_name: str = ""
@@ -124,16 +109,15 @@ class KernelMetadata:
     dtypes: str = ""
     hardware: str = ""
     settings: dict[str, object] | None = None
+    # Derived artifact source; never part of dataclass identity or run_id.
+    _device_ir: DeviceIR | None = dataclasses.field(
+        default=None, repr=False, compare=False, hash=False
+    )
 
     @functools.cached_property
     def run_id(self) -> str:
-        """Stable, content-derived id for this run, computed once and cached.
-
-        Hashed from ``(kernel_source, codegen-settings signature, input_shapes,
-        dtypes, hardware)`` joined with a delimiter that cannot appear inside the
-        fields (so boundaries can't collide). Content-derived, so the same
-        invocation yields the same ``run_id`` across processes and CI runs.
-        """
+        """Stable content hash for joining CSV rows to sidecar metadata."""
+        # _device_ir is derived from these fields, so it must stay out of identity.
         payload = (
             f"{self.kernel_source}\x00{_codegen_signature(self.settings)}\x00"
             f"{self.input_shapes}\x00{self.dtypes}\x00{self.hardware}"
@@ -149,4 +133,18 @@ class KernelMetadata:
             "dtypes": self.dtypes,
             "hardware": self.hardware,
             "settings": self.settings,
+            "ir_graph": self.ir_graph,
         }
+
+    @functools.cached_property
+    def ir_graph(self) -> dict[str, object] | None:
+        if self._device_ir is None:
+            return None
+        from ._metadata.ir_features import _has_networkx_node_link
+        from ._metadata.ir_features import extract_ir_graph
+
+        # Old/absent networkx degrades to None (extract_ir_graph would raise); a
+        # missing optional dep must not drop the whole record via the end_run guard.
+        if not _has_networkx_node_link():
+            return None
+        return extract_ir_graph(self._device_ir)

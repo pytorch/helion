@@ -17,7 +17,6 @@ from typing import TypeVar
 import torch
 
 from ..runtime.settings import _env_get_bool
-from ..runtime.settings import _get_backend
 from ..runtime.settings import is_pallas_interpret
 from .progress_bar import iter_with_progress
 from helion._dist_utils import sync_object
@@ -124,47 +123,9 @@ def clear_jit_fast_path_caches(
             log.debug("Failed to clear Triton JIT fast-path cache.", exc_info=True)
 
 
-def _get_tpu_tensors(result: object) -> list[torch.Tensor]:
-    """Extract TPU tensors from a result that may be a tensor, tuple, or list."""
-    if isinstance(result, torch.Tensor) and result.device.type == "tpu":
-        return [result]
-    if isinstance(result, (tuple, list)):
-        tensors = []
-        for v in result:
-            if isinstance(v, torch.Tensor) and v.device.type == "tpu":
-                tensors.append(v)
-        return tensors
-    return []
-
-
-def synchronize_device(result: object = None) -> None:
-    """Wait for device computation to complete.
-
-    For TPU tensors, uses ``torch_tpu``'s tensor-level sync which truly
-    blocks until the device finishes (``torch.accelerator.synchronize()``
-    does not reliably wait on ``torch_tpu``).  For all other cases, falls
-    back to ``torch.accelerator.synchronize()``.
-    """
-    tpu_tensors = _get_tpu_tensors(result)
-    if tpu_tensors:
-        try:
-            from torch_tpu._internal.sync import (  # pyrefly: ignore[missing-import]
-                synchronize as tpu_sync,
-            )
-
-            tpu_sync(tpu_tensors, wait=True)
-            return
-        except ImportError:
-            raise ImportError(
-                "torch_tpu is required for reliable device synchronization on TPU. "
-                "Install torch_tpu or torch.accelerator.synchronize() will return "
-                "before device computation finishes, producing incorrect benchmarks."
-            ) from None
-    if (
-        not is_pallas_interpret()
-        and _get_backend() != "pallas"
-        and torch.accelerator.is_available()
-    ):
+def synchronize_device() -> None:
+    """Wait for device computation to complete."""
+    if not is_pallas_interpret() and torch.accelerator.is_available():
         torch.accelerator.synchronize()
 
 
@@ -223,15 +184,15 @@ def compute_repeat_generic(
     Used for backends that don't have Triton's event-based timing (e.g., Pallas/TPU).
     """
     # Warm the pipeline once before collecting timing samples.
-    out = fn()
-    synchronize_device(out)
+    fn()
+    synchronize_device()
 
     clear_l2 = _make_l2_cache_clearer()
     start = time.perf_counter()
     for _ in range(estimate_runs):
         clear_l2()
-        out = fn()
-    synchronize_device(out)
+        fn()
+    synchronize_device()
     end = time.perf_counter()
 
     estimate_ms = (end - start) * 1000 / max(estimate_runs, 1)
@@ -321,10 +282,9 @@ def interleaved_bench_generic(
     Used for backends that don't have Triton's event-based timing (e.g., Pallas/TPU).
     """
     # warmup
-    out: object = None
     for fn in fns:
-        out = fn()
-    synchronize_device(out)
+        fn()
+    synchronize_device()
 
     clear_l2 = _make_l2_cache_clearer()
     all_times: list[list[float]] = [[] for _ in range(len(fns))]
@@ -338,10 +298,10 @@ def interleaved_bench_generic(
     for _i in iterator:
         for j in range(len(fns)):
             clear_l2()
-            synchronize_device(out)
+            synchronize_device()
             start = time.perf_counter()
-            out = fns[j]()
-            synchronize_device(out)
+            fns[j]()
+            synchronize_device()
             end = time.perf_counter()
             all_times[j].append((end - start) * 1000)  # convert to ms
 
@@ -634,18 +594,18 @@ def do_bench_generic(
     """
     assert return_mode in ["min", "max", "mean", "median", "all"]
 
-    out = fn()
-    synchronize_device(out)
+    fn()
+    synchronize_device()
 
     clear_l2 = _make_l2_cache_clearer()
 
     # Estimate the runtime of the function
-    synchronize_device(out)
+    synchronize_device()
     start = time.perf_counter()
     for _ in range(5):
         clear_l2()
-        out = fn()
-    synchronize_device(out)
+        fn()
+    synchronize_device()
     end = time.perf_counter()
     estimate_ms = sync_object(
         (end - start) * 1000 / 5, process_group_name=process_group_name
@@ -664,10 +624,10 @@ def do_bench_generic(
             for x in grad_to_none:
                 x.grad = None
         clear_l2()
-        synchronize_device(out)
+        synchronize_device()
         t0 = time.perf_counter()
-        out = fn()
-        synchronize_device(out)
+        fn()
+        synchronize_device()
         t1 = time.perf_counter()
         times.append((t1 - t0) * 1000)  # convert to ms
     return _summarize_statistics_fallback(times, quantiles, return_mode)

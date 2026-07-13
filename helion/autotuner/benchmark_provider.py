@@ -363,7 +363,7 @@ class LocalBenchmarkProvider(BenchmarkProvider):
         if self.settings.autotune_baseline_fn is not None:
             try:
                 baseline_output = self.settings.autotune_baseline_fn(*new_args)
-                synchronize_device(baseline_output)
+                synchronize_device()
             except Exception as e:
                 raise exc.AutotuneError(
                     "Custom baseline function failed while computing baseline.\n"
@@ -376,7 +376,7 @@ class LocalBenchmarkProvider(BenchmarkProvider):
                 baseline_output = self.kernel.compile_config(
                     baseline_config, allow_print=False
                 )(*new_args)
-                synchronize_device(baseline_output)
+                synchronize_device()
             except Exception as e:
                 decorator = self.kernel.format_kernel_decorator(
                     baseline_config, self.settings
@@ -945,7 +945,7 @@ class LocalBenchmarkProvider(BenchmarkProvider):
             with capture_output() as _captured_output:
                 synchronize_device()
                 output = fn(*working_args)  # make sure the kernel is compiled
-                synchronize_device(output)
+                synchronize_device()
 
             pass_accuracy_check = (
                 not self.settings.autotune_accuracy_check
@@ -1151,7 +1151,7 @@ class LocalBenchmarkProvider(BenchmarkProvider):
             try:
                 with capture_output():
                     output = fn(*self.args)
-                    synchronize_device(output)
+                    synchronize_device()
                 if not self._validate_against_baseline(config, output, self.args):
                     self._autotune_metrics.num_accuracy_failures += 1
                     return inf

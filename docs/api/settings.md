@@ -150,9 +150,50 @@ def my_kernel(x: torch.Tensor) -> torch.Tensor:
 
 .. autoattribute:: Settings.autotune_log_details
 
-    Opt-in to the cost-model dataset sidecar. When enabled (``HELION_AUTOTUNE_LOG_DETAILS=1``) and ``autotune_log`` is set, Helion appends one JSON record per run to ``<autotune_log>.meta.jsonl``: the kernel identity (``run_id``, name, source, shapes, dtypes, hardware), the full ``helion.settings`` (JSON-safe via ``json.dumps(default=str)``, so ``torch.dtype``/callables become strings), and a ``configs`` map from ``config_id`` to the config tested.
-    Recover a measured ``(config, perf)`` sample by joining a CSV row to its record: ``meta[run_id]["configs"][row["config_id"]]``. ``run_id`` may recur (re-runs, processes, ``autotune_best_of_k``), but the ``configs`` maps are union-safe (same ``config_id`` implies the same config), so de-duplicating on ``run_id`` is lossless. Searches restricted to user-pinned ``configs`` (without ``force_autotune``) are excluded as a biased slice (``.csv``/``.log`` still written); setting this without ``autotune_log`` collects nothing and warns once.
-    Controlled by ``HELION_AUTOTUNE_LOG_DETAILS``.
+   Opt-in to the cost-model dataset sidecar. When enabled (``HELION_AUTOTUNE_LOG_DETAILS=1``) and ``autotune_log`` is set, Helion appends one JSON record per run to ``<autotune_log>.meta.jsonl``: the kernel identity (``run_id``, name, source, shapes, dtypes, hardware), the full ``helion.settings`` (JSON-safe via ``json.dumps(default=str)``, so ``torch.dtype``/callables become strings), an ``ir_graph`` (see below), and a ``configs`` map from ``config_id`` to the config tested.
+   ``ir_graph`` is a config-independent, node-link dump of the kernel's device IR (the per-tile computation lowered to the Triton kernel body), captured once per run. Load it with ``networkx.node_link_graph(record["ir_graph"], edges="edges")`` (requires ``networkx>=3.4``). It is ``null`` when the device IR is unavailable or extraction fails. Block dimensions stay symbolic in the dump; recover concrete tile sizes by joining with each config's ``block_sizes``. Because the device IR is a function of ``run_id``'s inputs, every record sharing a ``run_id`` carries an identical ``ir_graph``.
+   Recover a measured ``(config, perf)`` sample by joining a CSV row to its record: ``meta[run_id]["configs"][row["config_id"]]``. ``run_id`` may recur (re-runs, processes, ``autotune_best_of_k``), but the ``configs`` maps are union-safe (same ``config_id`` implies the same config), so de-duplicating on ``run_id`` is lossless. Searches restricted to user-pinned ``configs`` (without ``force_autotune``) are excluded as a biased slice (``.csv``/``.log`` still written); setting this without ``autotune_log`` collects nothing and warns once.
+   Controlled by ``HELION_AUTOTUNE_LOG_DETAILS``.
+
+.. autoattribute:: Settings.autotune_log_search_space
+
+    Enable search space analysis logging after autotuning. When enabled, Helion logs:
+    
+    - **Search space summary**: Total search space size, enabled/disabled features with reasons, shape constraints
+    - **Coverage metrics**: Configs tested vs. total space, coverage percentage
+    - **Feature exploration report**: Per-feature statistics showing how many options were tested (e.g., "pid_type: 2/8 options tested (25.0%)")
+    - **Exploration quality**: Average and minimum feature coverage, highlighting poorly explored features (<50%)
+    
+    Default is ``False``. Controlled by ``HELION_AUTOTUNE_LOG_SEARCH_SPACE`` (set to ``1`` to enable).
+    
+    See :doc:`autotuner` for example output and the :py:mod:`helion.autotuner.search_space_logger` module for implementation details.
+
+.. autoattribute:: Settings.autotune_log_search_space_verbose
+
+    Additionally log each individual search-space restriction *live* (at ``INFO``) the moment it is
+    applied during kernel compilation, on top of the end-of-run summary. This surfaces *why* the search
+    space shrank as it happens, for example:
+
+    - ``Autotuner feature restriction: pid_type='xyz' disabled (data-dependent loop bounds require a persistent kernel ...)``
+    - ``Autotuner feature restriction: tcgen05 search narrowed to validated configs (matmul kernel with CuTe tcgen05 backend)``
+
+    Enabling this implies ``autotune_log_search_space`` (the summary is produced as well). Default is
+    ``False``. Controlled by ``HELION_AUTOTUNE_LOG_SEARCH_SPACE_VERBOSE`` (set to ``1`` to enable).
+
+.. autoattribute:: Settings.autotune_log_search_space_path
+
+    Optional path to save search space analysis as JSON. When set, Helion writes two files per autotuned
+    kernel/shape. The kernel name and the autotuner's stable cache hash are injected into the filename stem
+    (matching the ``.best_config`` cache key) so distinct kernels/shapes do not overwrite each other:
+    
+    - ``<stem>.<kernel>.<hash>.json``: Search space summary with dimensions, constraints, and coverage metrics
+    - ``<stem>.<kernel>.<hash>_exploration.json``: Per-feature exploration statistics (all possible values vs. tested values)
+    
+    For example, ``autotune_log_search_space_path="/tmp/analysis.json"`` yields files like
+    ``/tmp/analysis.my_kernel.3f9a1c2e.json`` and ``/tmp/analysis.my_kernel.3f9a1c2e_exploration.json``.
+    A directory (existing path or trailing separator) is also accepted, in which case the default
+    ``autotune_search_space.json`` filename is used inside it. Requires ``autotune_log_search_space`` to be enabled.
+    Default is ``None`` (only logs to console). Controlled by ``HELION_AUTOTUNE_LOG_SEARCH_SPACE_PATH``.
 
 .. autoattribute:: Settings.autotune_log_search_space
 
