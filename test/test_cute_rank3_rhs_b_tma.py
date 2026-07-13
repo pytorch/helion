@@ -2,12 +2,10 @@ from __future__ import annotations
 
 import ast
 import copy
-import importlib.util
 import os
 from pathlib import Path
 import pickle
 import re
-import sys
 from typing import Any
 from unittest.mock import patch
 
@@ -3014,39 +3012,35 @@ def _assert_semantic_m_tail_codegen_markers(
     return grouped_plan
 
 
-def _load_grouped_gemm_cute_module() -> Any:
-    module_path = Path(__file__).resolve().parents[1] / "examples" / "grouped_gemm.py"
-    spec = importlib.util.spec_from_file_location(
-        "helion_examples_grouped_gemm_real_b200_ab3_test",
-        module_path,
-    )
-    assert spec is not None
-    assert spec.loader is not None
-    grouped_gemm = importlib.util.module_from_spec(spec)
-    sys.modules[spec.name] = grouped_gemm
+def _load_deepgemm_m_grouped_module() -> Any:
     with patch.dict(
         os.environ,
         {"HELION_BACKEND": "cute", "HELION_CUTE_MMA_IMPL": "tcgen05"},
         clear=False,
     ):
-        spec.loader.exec_module(grouped_gemm)
-    return grouped_gemm
+        from helion._compiler.cute import deepgemm_m_grouped
+
+    return deepgemm_m_grouped
 
 
 def _example_grouped_static_bound(
     *,
     k: int = 384,
 ) -> tuple[Any, helion.Config]:
-    grouped_gemm = _load_grouped_gemm_cute_module()
-    args, _expected = grouped_gemm.make_deepgemm_m_grouped_bf16_gemm_nt_contiguous_args(
-        (128, 128, 128, 128),
-        n=256,
-        k=k,
-        m_alignment=128,
-        tail_padding=0,
-        device=DEVICE,
+    deepgemm_m_grouped = _load_deepgemm_m_grouped_module()
+    args, _expected = (
+        deepgemm_m_grouped.make_deepgemm_m_grouped_bf16_gemm_nt_contiguous_args(
+            (128, 128, 128, 128),
+            n=256,
+            k=k,
+            m_alignment=128,
+            tail_padding=0,
+            device=DEVICE,
+        )
     )
-    bound = grouped_gemm._deepgemm_m_grouped_bf16_gemm_nt_contiguous_kernel.bind(args)
+    bound = deepgemm_m_grouped._deepgemm_m_grouped_bf16_gemm_nt_contiguous_kernel.bind(
+        args
+    )
     bound.env.config_spec.cute_tcgen05_search_enabled = True
     return bound, _rank3_rhs_grouped_static_default_ab_config()
 

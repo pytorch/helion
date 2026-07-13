@@ -2,8 +2,8 @@
 
 Generated Helion grouped GEMM lowering must not import this module or the
 trimmed CUTLASS kernel it loads. This bridge remains packaged because
-``examples.grouped_gemm.blackwell_grouped_gemm_nt`` exposes an opt-in
-CUTLASS CuTeDSL comparison/reference launch for heterogeneous NT groups.
+the Blackwell grouped GEMM benchmarks use it as an opt-in CUTLASS CuTeDSL
+comparison/reference launch for heterogeneous NT groups.
 """
 
 from __future__ import annotations

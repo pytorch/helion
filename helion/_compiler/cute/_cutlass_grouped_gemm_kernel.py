@@ -30,11 +30,10 @@
 """Trimmed CUTLASS CuTeDSL grouped GEMM reference kernel.
 
 This file is not part of Helion's generated grouped GEMM lowering. It is loaded
-only by ``grouped_deepgemm`` for the opt-in
-``examples.grouped_gemm.blackwell_grouped_gemm_nt`` comparison/reference API,
-which still needs heterogeneous NT problem support beyond the generated direct
-path. Tests that inspect emitted Helion code should continue to assert this
-module and ``GroupedGemmKernel`` never appear there.
+only by ``grouped_deepgemm`` for the opt-in Blackwell grouped GEMM
+comparison/reference path, which still needs heterogeneous NT problem support
+beyond the generated direct path. Tests that inspect emitted Helion code should
+continue to assert this module and ``GroupedGemmKernel`` never appear there.
 """
 
 from __future__ import annotations
