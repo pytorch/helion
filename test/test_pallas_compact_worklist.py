@@ -360,6 +360,41 @@ def _fully_jagged_kernel(q, k, v, q_offsets, kv_offsets):
 
 
 @helion.kernel(backend="pallas", static_shapes=True)
+def _flash_prep_kernel(q, k, v, q_offsets, kv_offsets):
+    """Jagged flash attention: a max reduction (amax) whose padded scores must be -inf,
+    so its softmax mask fill is -inf (not the prep cache's 0)."""
+    H = hl.specialize(q.size(1))
+    D = hl.specialize(q.size(2))
+    num_sequences = q_offsets.size(0) - 1
+    out = torch.empty_like(q)
+    for seq_idx in hl.grid(num_sequences):
+        q_start = q_offsets[seq_idx]
+        q_end = q_offsets[seq_idx + 1]
+        k_start = kv_offsets[seq_idx]
+        k_end = kv_offsets[seq_idx + 1]
+        for tile_q in hl.tile(q_start, q_end):
+            q_blk = q[tile_q, :, :].transpose(0, 1)
+            m_i = hl.full([H, tile_q], float("-inf"), dtype=torch.float32)
+            l_i = torch.full_like(m_i, 1.0)
+            acc = hl.zeros([H, tile_q, D], dtype=torch.float32)
+            for tile_kv in hl.tile(k_start, k_end):
+                k_blk = k[tile_kv, :, :].transpose(0, 1)
+                v_blk = v[tile_kv, :, :].transpose(0, 1)
+                qk = torch.bmm(q_blk, k_blk.transpose(-2, -1)).to(torch.float32)
+                m_ij = torch.maximum(m_i, torch.amax(qk, -1))
+                p = torch.exp(qk - m_ij[:, :, None])
+                l_ij = torch.sum(p, -1)
+                alpha = torch.exp(m_i - m_ij)
+                l_i = l_i * alpha + l_ij
+                acc = acc * alpha[:, :, None]
+                acc = torch.baddbmm(acc, p.to(v.dtype), v_blk)
+                m_i = m_ij
+            acc = acc / l_i[:, :, None]
+            out[tile_q, :, :] = acc.transpose(0, 1).to(out.dtype)
+    return out
+
+
+@helion.kernel(backend="pallas", static_shapes=True)
 def _kv_owned_jagged_kernel(q, dO, kv_template, q_offsets, kv_offsets):
     num_sequences = q_offsets.size(0) - 1
     out = torch.empty_like(kv_template)
@@ -1559,10 +1594,74 @@ class TestResidentPrepHoistCodegen(unittest.TestCase):
             code,
         )
         self.assertIn("jnp.where", code)
-        self.assertIn("jnp.zeros_like", code)
+        # The refill fills the padded tail with the prep's declared tail_fill_value
+        # (0 for the transpose prep) via full_like, so the value is an explicit contract.
+        self.assertIn("jnp.full_like", code)
         self.assertIn("_prep", code)
         self.assertNotIn("_hm", code)
         self.assertRegex(code, r"=\s*\w+_prep\[[^\n]+pl\.ds")
+
+    def _resident_args(self):
+        qo = _offsets([12, 20, 5, 30])
+        kvo = _offsets([13, 7, 19, 11])
+        lq, lkv = int(qo[-1]), int(kvo[-1])
+        return (
+            torch.randn(lq, 4, 128),
+            torch.randn(lkv, 4, 128),
+            torch.randn(lkv, 4, 128),
+            qo,
+            kvo,
+        )
+
+    def test_resident_prep_zero_fill_load_mask_elided_from_reduction(self):
+        # The prep-hoisted resident K load reads a zero-filled cache (the refill writes
+        # tail_fill_value=0 once), so its per-tile fill-0 mask is redundant and dropped.
+        # Prove it by backtracking the q@kᵀ dot's K operand: dot -> permute (transpose)
+        # -> a _prep[...] cache read, with NO jnp.where anywhere on that chain.
+        import re
+
+        code = _fully_jagged_kernel.bind(self._resident_args()).to_triton_code(
+            helion.Config(block_sizes=[8, 8], pallas_loop_type="compact_worklist")
+        )
+        body = code[code.index("def _fori_body_0") :]
+        dot = re.search(r"dot_general\(\w+, (permute_\d+),", body)
+        self.assertIsNotNone(dot, "q@kᵀ dot should read a permute operand")
+        pvar = dot.group(1)
+        pdef = re.search(rf"\b{pvar} = jnp\.transpose\((\w+),", body)
+        self.assertIsNotNone(pdef, f"{pvar} should be a jnp.transpose")
+        src = pdef.group(1)
+        # the transposed operand is defined directly from the prep cache read, not a
+        # jnp.where -- i.e. the fill-0 mask is gone from the K path.
+        self.assertRegex(body, rf"\b{src} = \w+_prep\[")
+        self.assertNotRegex(body, rf"\b{src} = jnp\.where")
+
+    def test_flash_resident_prep_keeps_softmax_neg_inf_mask(self):
+        # Flash's fill-0 K/V load masks elide (prep cache zeroed), but the amax
+        # reduction's softmax mask fills -inf (!= the cache's 0 tail) and is downstream
+        # of the dot, so it is preserved.  Assert the score mask specifically: a
+        # jnp.where whose fill is a -inf full (not merely the m_i init's -inf full).
+        code = _flash_prep_kernel.bind(self._resident_args()).to_triton_code(
+            helion.Config(block_sizes=[8, 8], pallas_loop_type="compact_worklist")
+        )
+        self.assertIn("_rc_prep_refill", code)  # prep cache installed
+        self.assertRegex(
+            code, r"jnp\.where\([^\n]*jnp\.full\(\[\], float\('-inf'\)"
+        )
+
+    def test_prep_fallback_leaves_load_masks_intact(self):
+        # If prep lowerings are not installed (a fallback), elision must not fire: no
+        # cache is zero-filled, so the per-tile masks are still required.  Patch the
+        # prep-lowering install to return [] (the shape of every fallback branch) and
+        # confirm no prep cache is read and the reduction keeps its jnp.where masks.
+        with patch(
+            "helion.language._tracing_ops._prepare_resident_prep_lowerings",
+            return_value=[],
+        ):
+            code = _fully_jagged_kernel.bind(self._resident_args()).to_triton_code(
+                helion.Config(block_sizes=[8, 8], pallas_loop_type="compact_worklist")
+            )
+        self.assertNotIn("_prep[", code)  # no prep cache installed -> none read
+        self.assertIn("jnp.where", code)  # per-tile masks preserved
 
     def test_four_dim_resident_prep_tail_mask_tracks_ordered_axis(self):
         qo = _offsets([12, 20, 5, 30])

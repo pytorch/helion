@@ -369,6 +369,7 @@ def _prepare_resident_prep_lowerings(
 ) -> list[ResidentPrepLowering]:
     """Register prep-cache scratch and return lowering descriptors for this graph."""
     from .._compiler.generate_ast import ResidentPrepLowering
+    from .._compiler.pallas.compact_worklist import elide_installed_prep_load_masks
     from .._compiler.pallas.compact_worklist import metadata_ref_for_field
 
     env = CompileEnvironment.current()
@@ -432,8 +433,23 @@ def _prepare_resident_prep_lowerings(
                 hoist=hoist,
                 resident_window_name=resident_window_name,
                 cache_name=cache_name,
+                # The transpose refill zero-fills the padded tail (see
+                # _emit_resident_prep_refill); a per-tile mask with this fill on the
+                # load is therefore redundant.
+                tail_fill_value=0.0,
             )
         )
+    # These lowerings are now installed (all validation above passed; any fallback
+    # returned early), so it is safe to drop the redundant per-tile masks on exactly
+    # these loads -- keyed on each lowering's declared tail fill, which also preserves
+    # a flash-style _mask_to(scores, -inf) whose fill differs.  Coupling elision to the
+    # installed set (not admission) keeps correctness off the "prep always emits" path.
+    load_tail_fills: dict[str, float] = {}
+    for lw in lowerings:
+        fill = lw.tail_fill_value
+        if fill is not None:
+            load_tail_fills[lw.hoist.load_node_name] = fill
+    elide_installed_prep_load_masks(graph_info.graph, load_tail_fills)
     return lowerings
 
 
@@ -474,6 +490,14 @@ def _emit_resident_prep_refill(
     refill_tail_stmts: list[ast.stmt] = []
     for lowering in lowerings:
         assert isinstance(lowering, ResidentPrepLowering)
+        # The tail fill is emitted as a bare literal below, so it must be a finite
+        # number.  A non-finite (inf/-inf/nan) or undeclared (None) fill would need
+        # deliberate literal formatting; today only the transpose prep (0.0) reaches
+        # here, so assert rather than silently mis-emit.
+        tail_fill = lowering.tail_fill_value
+        assert tail_fill is not None and -float("inf") < tail_fill < float("inf"), (
+            "resident prep refill supports only finite numeric tail_fill_value"
+        )
         perm = lowering.hoist.perm
         rank = len(perm)
         win_elts = [f"pl.ds(_rc_ordered_tile * {blk}, {blk})"]
@@ -503,7 +527,7 @@ def _emit_resident_prep_refill(
                 _stmt(
                     f"{lowering.cache_name}[{cache_write}] = "
                     f"jnp.where({mask_var}, {tail_src_var}, "
-                    f"jnp.zeros_like({tail_src_var}))"
+                    f"jnp.full_like({tail_src_var}, {tail_fill}))"
                 ),
             ]
         )

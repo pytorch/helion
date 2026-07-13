@@ -59,6 +59,17 @@ class ResidentPrepLowering:
     hoist: ResidentPrepHoist
     resident_window_name: str
     cache_name: str
+    # The value the refill writes into the cache's padded (out-of-range) tail; it also
+    # serves as the elision key, since a downstream per-tile ``_mask_to`` with this same
+    # fill is then redundant and may be dropped (letting Mosaic fold the transpose into
+    # the matmul push).  Every prep that installs a refill -- all of them today -- must
+    # declare a finite value: ``_emit_resident_prep_refill`` emits it as a bare literal
+    # and asserts it is non-None and finite.  The ``None`` default is a construction guard
+    # only -- a new prep kind that forgets to set a fill is not silently opted into elision
+    # (the elision dict skips ``None``) and trips that refill assert -- NOT a usable "write
+    # a fill but keep the load mask" mode.  Expressing that needs the field split into a
+    # required tail-write value plus an optional (separate) elision fill.
+    tail_fill_value: float | None = None
 
 
 class GenerateAST(NodeVisitor, CodegenInterface):

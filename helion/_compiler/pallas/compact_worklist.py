@@ -471,6 +471,53 @@ def build_resident_cache_admission(
     return ResidentCacheAdmission(decision, tuple(admitted_hoists))
 
 
+def elide_installed_prep_load_masks(
+    graph: torch.fx.Graph,
+    load_tail_fills: Mapping[str, float],
+) -> None:
+    """Drop the redundant per-tile OOB masks on loads whose prep cache was installed.
+
+    ``load_tail_fills`` maps the load node name of each ACTUALLY-installed prep lowering
+    to the value that lowering's refill writes into the cache's padded tail (its
+    ``tail_fill_value``).  Because the refill already wrote that value there, a
+    downstream ``_mask_to`` with the same fill is redundant; deleting it also lets
+    Mosaic fold the transpose into the matmul push.
+
+    Called from prep-lowering installation with only the lowerings that survived
+    validation, so a prep that fell back to resident-only leaves its load's mask in
+    place (correctness is never coupled to admission-time optimism).  Elision is keyed
+    on the declared ``tail_fill_value``: a flash-style ``_mask_to(scores, -inf)`` (fill
+    != the cache's tail fill, and downstream of the dot) is preserved automatically.
+    Non-resident (streamed) deferred loads keep their unknown masked value untouched.
+    """
+    from ..host_function import HostFunction
+    from ..node_masking import remove_unnecessary_masking
+
+    if not load_tail_fills:
+        return
+    # ``remove_unnecessary_masking`` recomputes masked values, which for loop-carried
+    # (phi) nodes walks the enclosing graphs via ``DeviceIR.current()``; make the device
+    # IR current since prep-lowering install runs during codegen, outside the pass.
+    with HostFunction.current().device_ir:
+        for node in graph.nodes:
+            fill = load_tail_fills.get(node.name)
+            if fill is not None:
+                # The refill wrote ``fill`` into the padded tail: declare it so the
+                # matching-fill ``_mask_to`` downstream is judged redundant.
+                node.meta["masked_value"] = fill
+            elif (
+                node.meta.get("masked_value") is None
+                and "pallas_deferred_mask_block_ids" in node.meta
+            ):
+                # A non-resident deferred load: keep its unknown masked value so its
+                # (still-needed) deferred mask is preserved.
+                continue
+            else:
+                # Drop the stale cache so masked values recompute from the loads above.
+                node.meta.pop("masked_value", None)
+        remove_unnecessary_masking(graph)
+
+
 def metadata_arg_names(plan: CompactWorklistPlan) -> list[str]:
     """The single source of metadata arg order.
 
