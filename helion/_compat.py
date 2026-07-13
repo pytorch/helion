@@ -311,6 +311,27 @@ if triton_is_available():
         except Exception:
             return False
 
+    @functools.cache
+    def _supports_launch_cooperative_grid() -> bool:
+        """Whether the active Triton backend supports ``launch_cooperative_grid``.
+
+        Triton-Ascend / NPU does not support cooperative grid launches, so the
+        keyword is gated off there to avoid launcher errors.
+        """
+        try:
+            from triton.runtime.driver.active import get_current_target
+
+            target = get_current_target()
+            if getattr(target, "backend", None) == "ascend":
+                return False
+            if "ascend" in type(target).__name__.lower():
+                return False
+        except Exception:
+            pass
+        if hasattr(torch, "npu") and torch.npu.is_available():
+            return False
+        return version.parse(triton.__version__) >= version.parse("3.0")
+
 else:
     # Triton is not available — provide stubs / safe defaults
 
@@ -341,10 +362,37 @@ else:
     def use_tileir_tunables() -> bool:  # type: ignore[misc]
         return False
 
+    def _supports_launch_cooperative_grid() -> bool:  # type: ignore[misc]
+        return False
+
 
 def supports_tensor_descriptor() -> bool:
     # call private func we can patch in testing
     return _supports_tensor_descriptor()
+
+
+def supports_launch_cooperative_grid() -> bool:
+    # call private func we can patch in testing
+    return _supports_launch_cooperative_grid()
+
+
+def safe_clear_cache() -> None:
+    """Safely clear the Triton compile cache if the active driver supports it.
+
+    Works around NPU drivers that do not expose ``clear_cache``.
+    """
+    try:
+        from triton import runtime
+
+        driver = runtime.driver.active
+        if hasattr(driver, "clear_cache") and hasattr(
+            driver, "get_empty_cache_for_benchmark"
+        ):
+            cache = driver.get_empty_cache_for_benchmark()
+            driver.clear_cache(cache)
+    except Exception:
+        # Ignore errors when clearing the cache (especially for NPU).
+        pass
 
 
 def target_device_capability(
@@ -616,9 +664,11 @@ def supports_maxnreg() -> bool:
 
 @functools.cache
 def _supports_maxnreg() -> bool:
+    # Not supported on HIP (AMD), XPU (Intel), or NPU (Ascend) devices
     return (
         torch.version.hip is None
         and torch.version.xpu is None
+        and not (hasattr(torch, "npu") and torch.npu.is_available())
         and torch.cuda.is_available()
     )
 
@@ -719,3 +769,28 @@ def extract_device(args: Sequence[object]) -> torch.device | None:
         if isinstance(arg, list) and len(arg) > 0 and isinstance(arg[0], torch.Tensor):
             return arg[0].device
     return None
+
+
+def register_npu_backend() -> None:
+    """Register the Inductor backend for the NPU (Ascend) device.
+
+    Only import ``torch_npu`` lazily so non-NPU environments never require it.
+    """
+    from torch_npu._inductor.codegen.wrapper import NPUWrapperCodeGen  # type: ignore[import-not-found]
+    from torch._inductor.codegen.common import register_backend_for_device
+    from torch._inductor.codegen.triton import TritonScheduling
+
+    register_backend_for_device(
+        device="npu",
+        device_scheduling=TritonScheduling,
+        device_wrapper_codegen=NPUWrapperCodeGen,
+    )
+
+
+def _register_interface_for_device() -> None:
+    """Register the NPU device interface with torch._dynamo."""
+    from torch._dynamo.device_interface import register_interface_for_device
+    from torch_npu.utils._dynamo_device import NpuInterface  # type: ignore[import-not-found]
+
+    register_interface_for_device("npu", NpuInterface)
+

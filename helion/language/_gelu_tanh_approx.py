@@ -307,14 +307,19 @@ def install_gelu_decomp(
     cannot fuse. We replace the entry with a wrapper that branches on the
     kwarg and leaves unknown approximate values on the original path.
     """
-    original_decomp = decomp_table[torch.ops.aten.gelu.default]
+    original_decomp = decomp_table.get(torch.ops.aten.gelu.default)
 
     def _gelu_decomp(x: torch.Tensor, *, approximate: str = "none") -> torch.Tensor:
         if approximate == "tanh":
             return _gelu_tanh_approx(x)
         if approximate == "none":
             return _gelu_erf(x)
+        if original_decomp is not None:
+            # pyrefly: ignore [bad-return]
+            return original_decomp(x, approximate=approximate)
+        # No original decomp to fall back to (e.g. NPU decomp table lacks
+        # aten.gelu.default); default to the erf form.
         # pyrefly: ignore [bad-return]
-        return original_decomp(x, approximate=approximate)
+        return _gelu_erf(x)
 
     decomp_table[torch.ops.aten.gelu.default] = _gelu_decomp

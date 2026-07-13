@@ -3,22 +3,26 @@ from __future__ import annotations
 import contextlib
 import functools
 import glob
+import inspect
 import logging
 import math
 import os
 import statistics
 import tempfile
 import time
+from collections.abc import Iterator
 from typing import TYPE_CHECKING
 from typing import Any
 from typing import Callable
 from typing import TypeVar
+from typing import cast
 
 import torch
 
 from ..runtime.settings import _env_get_bool
 from ..runtime.settings import is_pallas_interpret
 from .progress_bar import iter_with_progress
+from helion import _compat
 from helion._dist_utils import sync_object
 
 if TYPE_CHECKING:
@@ -28,6 +32,20 @@ T = TypeVar("T")
 
 _log = logging.getLogger(__name__)
 _BENCHMARK_CUDAGRAPH_ENV = "HELION_BENCHMARK_CUDAGRAPH"
+
+
+def _bench_device_synchronize() -> None:
+    """Synchronize the active device for wall-clock microbenchmarks.
+
+    On Ascend, ``torch.accelerator.synchronize()`` can disagree with torch_npu's
+    stream bookkeeping when multiple kernels were queued; use
+    ``torch.npu.synchronize()`` when NPU is available.
+    """
+    if hasattr(torch, "npu") and torch.npu.is_available():
+        torch.npu.synchronize()
+    else:
+        torch.accelerator.synchronize()
+
 
 
 def _make_l2_cache_clearer() -> Callable[[], None]:
@@ -138,8 +156,11 @@ def _get_tpu_tensors(result: object) -> list[torch.Tensor]:
 
 def synchronize_device(result: object = None) -> None:
     """Wait for device computation to complete."""
-    if not is_pallas_interpret() and torch.accelerator.is_available():
-        torch.accelerator.synchronize()
+    if not is_pallas_interpret():
+        if hasattr(torch, "npu") and torch.npu.is_available():
+            torch.npu.synchronize()
+        elif torch.accelerator.is_available():
+            torch.accelerator.synchronize()
 
 
 def compute_repeat(
@@ -170,7 +191,7 @@ def compute_repeat(
     end_event = di.Event(enable_timing=True)
     start_event.record()
     for _ in range(estimate_runs):
-        runtime.driver.active.clear_cache(cache)  # type: ignore[attr-defined]
+        _compat.safe_clear_cache()
         benchmark_function()
     end_event.record()
     di.synchronize()
@@ -238,11 +259,7 @@ def interleaved_bench(
     # warmup
     for fn in fns:
         fn()
-    clear_cache = functools.partial(
-        runtime.driver.active.clear_cache,  # type: ignore[attr-defined]
-        runtime.driver.active.get_empty_cache_for_benchmark(),  # type: ignore[attr-defined]
-    )
-    clear_cache()
+    _compat.safe_clear_cache()
     di = runtime.driver.active.get_device_interface()  # type: ignore[attr-defined]
     start_events = [
         [di.Event(enable_timing=True) for _ in range(repeat)] for _ in range(len(fns))
@@ -266,7 +283,7 @@ def interleaved_bench(
     )
     for i in iterator:
         for j in range(len(benchmark_functions)):
-            clear_cache()
+            _compat.safe_clear_cache()
             start_events[j][i].record()
             benchmark_functions[j]()
             end_events[j][i].record()
@@ -475,30 +492,52 @@ def make_pallas_paired_device_micros_bench(
     return _bench
 
 
+def _coerce_triton_timing(val: object) -> float | tuple[float, ...]:
+    """When ``_summarize_statistics`` is given a Tensor, some builds return Tensor outputs."""
+    if isinstance(val, torch.Tensor):
+        return float(val.detach().cpu().item())
+    if isinstance(val, tuple):
+        return tuple(
+            float(x.detach().cpu().item()) if isinstance(x, torch.Tensor) else float(x)
+            for x in val
+        )
+    return float(val)
+
+
 def _summarize_statistics_fallback(
-    times: list[float],
+    times: list[float] | object,
     quantiles: list[float] | None,
     return_mode: str,
 ) -> float | tuple[float, ...]:
-    """Fallback statistics summarizer when triton.testing._summarize_statistics is unavailable."""
+    """Fallback statistics summarizer when triton.testing._summarize_statistics is unavailable.
+
+    Handles both Python lists and torch tensors.
+    """
+    if isinstance(times, torch.Tensor):
+        times_list = times.cpu().tolist()
+    elif isinstance(times, list):
+        times_list = times
+    else:
+        times_list = list(times)  # type: ignore[arg-type]
+
     if return_mode == "min":
-        return min(times)
+        return min(times_list)
     if return_mode == "max":
-        return max(times)
+        return max(times_list)
     if return_mode == "mean":
-        return statistics.mean(times)
+        return statistics.mean(times_list)
     if return_mode == "median":
-        return statistics.median(times)
+        return statistics.median(times_list)
     # "all" mode
     if quantiles is not None:
-        sorted_times = sorted(times)
+        sorted_times = sorted(times_list)
         n = len(sorted_times)
         result = []
         for q in quantiles:
             idx = min(int(q * n), n - 1)
             result.append(sorted_times[idx])
         return tuple(result)
-    return statistics.median(times)
+    return statistics.median(times_list)
 
 
 # This function is copied from triton._testing.do_bench with modification
@@ -556,7 +595,7 @@ def do_bench(
     end_event = di.Event(enable_timing=True)
     start_event.record()
     for _ in range(5):
-        runtime.driver.active.clear_cache(cache)  # pyrefly: ignore
+        _compat.safe_clear_cache()
         benchmark_function()
     end_event.record()
     di.synchronize()
@@ -580,8 +619,8 @@ def do_bench(
         if grad_to_none is not None:
             for x in grad_to_none:
                 x.grad = None
-        # we clear the L2 cache before each run
-        runtime.driver.active.clear_cache(cache)  # pyrefly: ignore
+        # we clear the L2 cache before each run if supported
+        _compat.safe_clear_cache()
         # record time of `fn`
         start_event[i].record()
         benchmark_function()
@@ -589,6 +628,15 @@ def do_bench(
     # Record clocks
     di.synchronize()
     times = [s.elapsed_time(e) for s, e in zip(start_event, end_event, strict=True)]
+    # Ascend Triton expects a Tensor here; CUDA upstream returns plain floats from a list.
+    if hasattr(torch, "npu") and torch.npu.is_available():
+        try:
+            raw = _summarize_statistics(
+                torch.tensor(times), quantiles, return_mode
+            )  # pyrefly: ignore
+        except Exception:
+            raw = _summarize_statistics(times, quantiles, return_mode)  # pyrefly: ignore
+        return _coerce_triton_timing(raw)
     return _summarize_statistics(times, quantiles, return_mode)  # pyrefly: ignore
 
 
@@ -645,3 +693,302 @@ def do_bench_generic(
         t1 = time.perf_counter()
         times.append((t1 - t0) * 1000)  # convert to ms
     return _summarize_statistics_fallback(times, quantiles, return_mode)
+
+
+def _env_truthy(name: str) -> bool:
+    v = os.environ.get(name, "").strip().lower()
+    return v in ("1", "true", "yes", "on")
+
+
+@contextlib.contextmanager
+def _quiet_torch_npu_profiler_parse_info() -> Iterator[None]:
+    """Drop Ascend profiler parse INFO lines (``Start parsing…`` / ``All profiling…``).
+
+    Only runs when ``torch.npu.is_available()``; CUDA/CPU runs never apply this patch.
+    Set ``HELION_SHOW_NPU_PROFILER_LOGS=1`` to see them again.
+    """
+    if _env_truthy("HELION_SHOW_NPU_PROFILER_LOGS"):
+        yield
+        return
+    if not (hasattr(torch, "npu") and torch.npu.is_available()):
+        yield
+        return
+    try:
+        import torch_npu.profiler.analysis._profiling_parser as _prof_parser  # type: ignore[import-not-found]
+        import torch_npu.profiler.analysis.prof_view.cann_parse._cann_export as _cann_export  # type: ignore[import-not-found]
+    except ImportError:
+        yield
+        return
+
+    def _noop(_message: str) -> None:
+        return None
+
+    prev_pp = _prof_parser.print_info_msg
+    prev_ce = _cann_export.print_info_msg
+    _prof_parser.print_info_msg = _noop  # type: ignore[assignment]
+    _cann_export.print_info_msg = _noop  # type: ignore[assignment]
+    try:
+        yield
+    finally:
+        _prof_parser.print_info_msg = prev_pp
+        _cann_export.print_info_msg = prev_ce
+
+
+@functools.cache
+def _npu_triton_do_bench_available() -> bool:
+    """True if ``triton.testing.do_bench_npu`` is importable (triton-ascend profiler bench)."""
+    try:
+        from triton.testing import do_bench_npu as _triton_do_bench_npu  # noqa: F401
+    except Exception:
+        return False
+    return True
+
+
+@functools.cache
+def _npu_triton_do_bench_returns_ms_already() -> bool:
+    """True if ``triton.testing.do_bench_npu`` already returns ms (triton-ascend).
+
+    Stock PyTorch Triton reads ``op_statistic.csv`` ``Avg Time(us)`` without scaling
+    (microseconds); Helion divides by 1000. Ascend fork uses ``kernel_details`` and
+    divides by ``active * 1e3`` (already ms). Detection: ``clear_l2_cache`` in
+    signature or ``ascend`` in ``__module__``.
+    """
+    try:
+        from triton.testing import do_bench_npu as triton_do_bench_npu
+    except Exception:
+        return False
+    try:
+        if "clear_l2_cache" in inspect.signature(triton_do_bench_npu).parameters:
+            return True
+    except (TypeError, ValueError):
+        pass
+    mod = getattr(triton_do_bench_npu, "__module__", "") or ""
+    return "ascend" in mod
+
+
+def _npu_profiler_scalar_to_milliseconds(raw: float) -> float:
+    if _npu_triton_do_bench_returns_ms_already():
+        return raw
+    return raw / 1000.0
+
+
+def _scalar_do_bench_npu_timing(result: object) -> float:
+    """Normalize ``do_bench_npu`` output to **milliseconds** for Helion tables."""
+    if isinstance(result, torch.Tensor):
+        raw = float(result.detach().cpu().item())
+    else:
+        raw = float(result)
+    return _npu_profiler_scalar_to_milliseconds(raw)
+
+
+def npu_benchmark_results_timing_caption() -> str:
+    """One-line stderr note for NPU ``run_example`` tables (empty if not NPU)."""
+    if not (hasattr(torch, "npu") and torch.npu.is_available()):
+        return ""
+    if not _npu_triton_do_bench_available():
+        return "Timing: triton do_bench events (ms; triton.testing.do_bench_npu unavailable)."
+    if _npu_triton_do_bench_returns_ms_already():
+        return "Timing: triton do_bench_npu (ms; triton-ascend kernel_details)."
+    return "Timing: triton do_bench_npu (ms; op_statistic Avg Time(us) ÷ 1000)."
+
+
+def do_bench_npu(
+    fn: Callable[[], Any],
+    warmup: int = 25,
+    rep: int = 100,
+    grad_to_none: torch.Tensor | None = None,
+    quantiles: list[float] | None = None,
+    return_mode: str = "mean",
+    process_group_name: str | None = None,
+    *,
+    default_cudagraph: bool = False,
+) -> float | tuple[float, ...]:
+    """NPU profiler bench via ``triton.testing.do_bench_npu``; return value in ms.
+
+    Ascend fork: ``warmup``/``rep`` are profiler iteration counts. Stock: same names;
+    raw ``Avg Time(us)`` is scaled to ms when needed (see
+    :func:`_npu_triton_do_bench_returns_ms_already`). Fallback path uses wall-clock
+    timing when ``triton.testing.do_bench_npu`` is unavailable.
+    """
+    try:
+        from triton.testing import do_bench_npu as triton_do_bench_npu
+    except ImportError:
+        return _do_bench_npu_fallback(
+            fn, warmup, rep, grad_to_none, quantiles, return_mode
+        )
+
+    if grad_to_none is not None:
+        for x in grad_to_none:
+            x.grad = None
+
+    with _quiet_torch_npu_profiler_parse_info():
+        result = triton_do_bench_npu(
+            fn,
+            warmup=warmup,
+            active=rep,
+        )
+
+    if isinstance(result, list):
+        if not result:
+            return 0.0
+        r = result[0]
+    else:
+        r = result
+    return _scalar_do_bench_npu_timing(r)
+
+
+def _do_bench_npu_fallback(
+    fn: Callable[[], Any],
+    warmup: int = 25,
+    rep: int = 100,
+    grad_to_none: torch.Tensor | None = None,
+    quantiles: list[float] | None = None,
+    return_mode: str = "mean",
+) -> float | tuple[float, ...]:
+    """Wall-clock fallback for NPU benchmarking when ``triton.testing.do_bench_npu`` is unavailable."""
+    from triton.testing import _summarize_statistics
+
+    assert return_mode in ["min", "max", "mean", "median", "all"]
+
+    fn()
+    torch.npu.synchronize()
+
+    start = time.perf_counter()
+    for _ in range(5):
+        _compat.safe_clear_cache()
+        fn()
+    torch.npu.synchronize()
+    end = time.perf_counter()
+    estimate_ms = sync_object((end - start) * 1000 / 5)
+
+    n_warmup = max(1, int(warmup / estimate_ms))
+    n_repeat = max(1, int(rep / estimate_ms))
+
+    for _ in range(n_warmup):
+        fn()
+
+    times: list[float] = []
+    for _i in range(n_repeat):
+        if grad_to_none is not None:
+            for x in grad_to_none:
+                x.grad = None
+        _compat.safe_clear_cache()
+        torch.npu.synchronize()
+        t0 = time.perf_counter()
+        fn()
+        torch.npu.synchronize()
+        t1 = time.perf_counter()
+        times.append((t1 - t0) * 1000)  # convert to ms
+
+    return _coerce_triton_timing(
+        _summarize_statistics(torch.tensor(times), quantiles, return_mode)
+    )
+
+
+def _npu_profiler_iteration_params(repeat: int) -> tuple[int, int]:
+    """Map ``interleaved_bench``-style repeat to Ascend ``do_bench_npu`` counts."""
+    active = max(30, min(int(repeat), 500))
+    warmup = max(5, min(active // 10, 50))
+    return warmup, active
+
+
+def interleaved_bench_npu(
+    fns: list[Callable[[], object]],
+    *,
+    repeat: int,
+    desc: str | None = None,
+    default_cudagraph: bool = False,
+) -> list[float]:
+    """Benchmark multiple functions on Ascend NPU using ``triton.testing.do_bench_npu``.
+
+    Upstream ``do_bench_npu`` takes a single callable, so this runs one profiler
+    session per function. Falls back to wall-clock timing when unavailable.
+    """
+    if not fns:
+        return []
+
+    warmup_n, active_n = _npu_profiler_iteration_params(repeat)
+
+    try:
+        from triton.testing import do_bench_npu as triton_do_bench_npu
+    except ImportError:
+        times_fb: list[float] = []
+        for fn in fns:
+            try:
+                times_fb.append(
+                    cast(
+                        "float",
+                        _do_bench_npu_fallback(
+                            cast("Callable[[], Any]", fn),
+                            warmup=warmup_n,
+                            rep=active_n,
+                            return_mode="median",
+                        ),
+                    )
+                )
+            except Exception as e:
+                _log.debug(
+                    "interleaved_bench_npu fallback: callable failed (%s): %s",
+                    type(e).__qualname__,
+                    e,
+                )
+                times_fb.append(float("inf"))
+        return times_fb
+
+    times: list[float] = []
+    iterator = iter_with_progress(
+        range(len(fns)),
+        total=len(fns),
+        description=desc,
+        enabled=desc is not None,
+    )
+    for j in iterator:
+        try:
+            with _quiet_torch_npu_profiler_parse_info():
+                raw = triton_do_bench_npu(
+                    fns[j],
+                    warmup=warmup_n,
+                    active=active_n,
+                )
+        except Exception as e:
+            _log.debug(
+                "interleaved_bench_npu: callable %s failed (%s): %s",
+                j,
+                type(e).__qualname__,
+                e,
+            )
+            times.append(float("inf"))
+            continue
+        if isinstance(raw, list):
+            if not raw:
+                times.append(float("inf"))
+                continue
+            raw = raw[0]
+        times.append(_scalar_do_bench_npu_timing(raw))
+    return times
+
+
+def default_do_bench() -> Callable[..., Any]:
+    """Bench hook for autotuning: NPU uses profiler timing when available, else events.
+
+    - **Ascend NPU** with ``triton.testing.do_bench_npu``: :func:`do_bench_npu`.
+    - **Otherwise** (incl. NPU without the profiler fn): :func:`do_bench` (event-based).
+    """
+    if (
+        hasattr(torch, "npu")
+        and torch.npu.is_available()
+        and _npu_triton_do_bench_available()
+    ):
+        return do_bench_npu
+    return do_bench
+
+
+def default_interleaved_bench() -> Callable[..., list[float]]:
+    """Interleaved bench for autotune rebenchmarking; NPU uses profiler path when available."""
+    if (
+        hasattr(torch, "npu")
+        and torch.npu.is_available()
+        and _npu_triton_do_bench_available()
+    ):
+        return interleaved_bench_npu
+    return interleaved_bench

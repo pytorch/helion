@@ -150,9 +150,20 @@ class TypeInfo:
             # This allows zip to work in list comprehensions
             zipped_tuples = tuple(tuple(items) for items in value)
             return cls.from_example(zipped_tuples, origin)
-        if isinstance(
-            value, (torch.cuda._CudaDeviceProperties, torch.xpu._XpuDeviceProperties)
-        ):
+        _device_prop_types: tuple[type, ...] = (
+            torch.cuda._CudaDeviceProperties,
+            torch.xpu._XpuDeviceProperties,
+        )
+        if hasattr(torch, "npu") and torch.npu.is_available():
+            try:
+                from torch_npu._inductor.runtime import (  # type: ignore[import-not-found]
+                    NPUDeviceProperties,
+                )
+
+                _device_prop_types = (*_device_prop_types, NPUDeviceProperties)
+            except ImportError:
+                pass
+        if isinstance(value, _device_prop_types):
             attrs = {}
             env = CompileEnvironment.current()
 

@@ -36,3 +36,20 @@ _logging.init_logs()
 from ._compiler._dynamo.variables import register_dynamo_variable  # noqa: E402
 
 register_dynamo_variable()
+
+# Register the NPU (Ascend) Inductor backend + Dynamo device interface when NPU
+# is available, so inductor lowerings (e.g. aten.sum) can resolve a scheduling
+# constructor for the npu device instead of hitting ``assert scheduling_ctor``.
+import torch as _torch  # noqa: E402
+
+if hasattr(_torch, "npu") and _torch.npu.is_available():
+    try:
+        _compat_module.register_npu_backend()
+        _compat_module._register_interface_for_device()
+    except Exception:  # pragma: no cover  # noqa: BLE001
+        import logging as _logging
+
+        _logging.getLogger(__name__).debug(
+            "NPU Inductor backend registration failed; NPU lowerings may be limited.",
+            exc_info=True,
+        )

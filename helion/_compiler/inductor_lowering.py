@@ -835,7 +835,13 @@ class ReductionLowering(InductorLowering):
             repr_input = inputs[0]
         else:
             # TODO(jansel): combine multiple inputs into a single fake value
-            raise NotImplementedError("reductions with >1 input")
+            repr_input = None
+            for inp in inputs:
+                if hasattr(inp, "ndim") and inp.ndim > 0:
+                    repr_input = inp
+                    break
+            if repr_input is None:
+                repr_input = inputs[0]
 
         dims = self._get_reduction_dims(node.meta["orig_node"], repr_input)
         if len(dims) != 1:

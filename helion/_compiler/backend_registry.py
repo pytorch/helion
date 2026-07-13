@@ -7,6 +7,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+from .backend import AscendBackend
 from .backend import CuteBackend
 from .backend import MetalBackend
 from .backend import PallasBackend
@@ -22,6 +23,7 @@ _BUILTIN_BACKENDS: list[type[Backend]] = [
     CuteBackend,
     TileIRBackend,
     MetalBackend,
+    AscendBackend,
 ]
 
 _REGISTRY: dict[str, type[Backend]] = {}

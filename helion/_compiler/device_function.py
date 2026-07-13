@@ -1259,3 +1259,62 @@ class HelionPallasPrinter(HelionTritonPrinter):
 
 def pallas_texpr(expr: sympy.Expr) -> str:
     return HelionPallasPrinter().doprint(expr)
+
+
+class HelionAscendPrinter(HelionTritonPrinter):
+    def _print_FloorDiv(self, expr: sympy.Expr) -> str:
+        lhs, rhs = expr.args
+        lhs_str = self._print(lhs)
+        rhs_str = self._print(rhs)
+
+        # Add parentheses to ensure correct operator precedence
+        if not (lhs.is_Integer or lhs.is_Symbol):
+            lhs_str = f"({lhs_str})"
+        if not (rhs.is_Integer or rhs.is_Symbol):
+            rhs_str = f"({rhs_str})"
+        # Use simple // without sign checks
+        # This assumes lhs >= 0 and rhs > 0, which is valid for index calculations
+        return f"({lhs_str} // {rhs_str})"
+
+    def _print_CleanDiv(self, expr: sympy.Expr) -> str:
+        lhs, rhs = expr.args
+        lhs_str = self._print(lhs)
+        rhs_str = self._print(rhs)
+
+        if not (lhs.is_Integer or lhs.is_Symbol):
+            lhs_str = f"({lhs_str})"
+        if not (rhs.is_Integer or rhs.is_Symbol):
+            rhs_str = f"({rhs_str})"
+
+        return f"({lhs_str} // {rhs_str})"
+
+    def _print_CeilDiv(self, expr: sympy.Expr) -> str:
+        lhs, rhs = expr.args
+        lhs_str = self._print(lhs)
+        rhs_str = self._print(rhs)
+
+        if not (lhs.is_Integer or lhs.is_Symbol):
+            lhs_str = f"({lhs_str})"
+        if not (rhs.is_Integer or rhs.is_Symbol):
+            rhs_str = f"({rhs_str})"
+
+        # Standard ceiling division: (a + b - 1) // b
+        return f"(({lhs_str} + {rhs_str} - 1) // {rhs_str})"
+
+    def _print_PythonMod(self, expr: sympy.Expr) -> str:
+        lhs, rhs = expr.args
+        lhs_str = self._print(lhs)
+        rhs_str = self._print(rhs)
+
+        if not (lhs.is_Integer or lhs.is_Symbol):
+            lhs_str = f"({lhs_str})"
+        if not (rhs.is_Integer or rhs.is_Symbol):
+            rhs_str = f"({rhs_str})"
+
+        # Use simple % without sign checks
+        return f"({lhs_str} % {rhs_str})"
+
+
+def ascend_texpr(expr: sympy.Expr) -> str:
+    """Convert SymPy expression to Ascend NPU-compatible Triton code."""
+    return HelionAscendPrinter().doprint(expr)

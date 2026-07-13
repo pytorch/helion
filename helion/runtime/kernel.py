@@ -911,6 +911,16 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
         config = self._normalize_config(config)
         return self._cache_path_map.get(config, None)
 
+    def invalidate_compile_cache_entry(self, config: ConfigLike) -> None:
+        """Drop *config* from the in-process compile cache."""
+        if not isinstance(config, Config):
+            config = Config(
+                # pyrefly: ignore [bad-argument-type]
+                **config
+            )
+        self._compile_cache.pop(config, None)
+        self._cache_path_map.pop(config, None)
+
     def _debug_str(self) -> str:
         """
         Generate a debug string for the kernel.
@@ -954,6 +964,19 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
             config = self.env.backend.autotune(self, args, force=force, **kwargs)
         if ephemeral is not None:
             self.env.backend.finalize_ephemeral_cache(self, config)
+        # Autotuning compiles many trial configs, each cached in PyCodeCache as a
+        # separate module with its own Triton JIT function.  When the best config
+        # is recompiled afterwards, PyCodeCache may return a stale module whose JIT
+        # function is associated with incorrect binaries in Triton's disk cache.
+        # Clearing these caches ensures set_config() gets a fresh module (NPU fix).
+        if (
+            self.env.backend.codegen_name == "triton"
+            and hasattr(torch, "npu")
+            and torch.npu.is_available()
+        ):
+            self._compile_cache.clear()
+            self._cache_path_map.clear()
+            PyCodeCache.cache_clear()
         self.set_config(config)
         return config
 

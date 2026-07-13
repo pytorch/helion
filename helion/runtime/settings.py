@@ -44,7 +44,7 @@ if TYPE_CHECKING:
         ) -> BaseAutotuner: ...
 
 
-DotPrecision = Literal["tf32", "tf32x3", "ieee", "default", "high", "highest"]
+DotPrecision = Literal["tf32", "tf32x3", "ieee", "hf32", "default", "high", "highest"]
 PrecompileMode = Literal["spawn", "fork"] | None
 _TRUE_LITERALS = frozenset({"1", "true", "yes", "on"})
 _FALSE_LITERALS = frozenset({"0", "false", "no", "off"})
@@ -346,6 +346,8 @@ def _get_dot_precision() -> DotPrecision:
 
     if is_hip():
         default_precision = "tf32" if supports_tf32_precision_on_amd() else "ieee"
+    elif hasattr(torch, "npu") and torch.npu.is_available():
+        default_precision = "ieee"
     else:
         default_precision = "tf32"
 
@@ -453,6 +455,11 @@ class _Settings:
             "HELION_AUTOTUNE_PRECOMPILE_JOBS",
         )
     )
+    autotune_benchmark_jobs: int = dataclasses.field(
+        default_factory=functools.partial(
+            _env_get_int, "HELION_AUTOTUNE_BENCHMARK_JOBS", 1
+        )
+    )
     autotune_random_seed: int = dataclasses.field(
         default_factory=_get_autotune_random_seed
     )
@@ -501,6 +508,11 @@ class _Settings:
     autotune_ignore_errors: bool = dataclasses.field(
         default_factory=functools.partial(
             _env_get_bool, "HELION_AUTOTUNE_IGNORE_ERRORS", False
+        )
+    )
+    autotune_debug_stderr: bool = dataclasses.field(
+        default_factory=functools.partial(
+            _env_get_bool, "HELION_AUTOTUNE_DEBUG_STDERR", False
         )
     )
     autotune_adaptive_timeout: bool = dataclasses.field(
@@ -652,6 +664,12 @@ class Settings(_Settings):
         "autotune_benchmark_timeout": "Per-config wall-clock timeout in seconds for the subprocess benchmark phase. Only applies when autotune_benchmark_subprocess is enabled. Default 30 seconds, raised automatically on environments with a heavier subprocess cold-start.",
         "autotune_precompile": "Autotuner precompile mode: 'fork', 'spawn', or falsy/None to disable. Defaults to 'fork' on non-Windows platforms.",
         "autotune_precompile_jobs": "Maximum concurrent Triton precompile processes, default to cpu count.",
+        "autotune_benchmark_jobs": (
+            "Maximum concurrent autotune search benchmark subprocesses during parallel_benchmark. "
+            "Default is 1 (sequential). Set HELION_AUTOTUNE_BENCHMARK_JOBS=N with N>1 to benchmark "
+            "multiple compiled configs in parallel via spawned worker processes. "
+            "Under pytest this is ignored (sequential) unless HELION_AUTOTUNE_BENCHMARK_SUBPROCESS_IN_TEST=1."
+        ),
         "autotune_random_seed": "Seed used for autotuner random number generation. Defaults to HELION_AUTOTUNE_RANDOM_SEED or a time-based seed.",
         "autotune_best_of_k": (
             "When > 1, run autotuning K times with different random seeds and "
@@ -679,6 +697,11 @@ class Settings(_Settings):
         "autotune_ignore_errors": (
             "If True, skip logging and raising autotune errors. "
             "Set HELION_AUTOTUNE_IGNORE_ERRORS=1 to enable globally."
+        ),
+        "autotune_debug_stderr": (
+            "If True, print NPU autotune candidate traces and compile/benchmark failure "
+            "lines to stderr. Default False. Set HELION_AUTOTUNE_DEBUG_STDERR=1 or pass "
+            "autotune_debug_stderr=True to helion.kernel()."
         ),
         "autotune_adaptive_timeout": (
             "If True, set the compile timeout threshold to be smaller for Triton compilation,"

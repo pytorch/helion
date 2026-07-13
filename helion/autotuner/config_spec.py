@@ -482,6 +482,8 @@ _CUTE_IMPLICIT_DEFAULT_KEYS: frozenset[str] = frozenset(
 # the same worker process.
 def get_valid_eviction_policies(backend_name: str) -> tuple[str, ...]:
     if backend_name == "triton" and not supports_amd_cdna_tunables():
+        if hasattr(torch, "npu") and torch.npu.is_available():
+            return ("",)
         return ("", "first", "last")
     return ("",)
 
@@ -508,10 +510,12 @@ class ConfigSpec:
         | object
         | None = _TARGET_DEVICE_CAPABILITY_UNSET,
         device: torch.device | None = None,
+        compile_device: torch.device | None = None,
         num_sm: int | None = None,
     ) -> None:
         self.backend = backend
         self.backend_name = backend.name
+        self._compile_device = compile_device
         self.max_reduction_threads = backend.max_reduction_threads()
         self.max_reduction_loop = backend.max_reduction_loop()
         self.reduction_loop_force_threshold = self.max_reduction_threads
@@ -563,7 +567,11 @@ class ConfigSpec:
         self.range_flattens: BlockIdSequence[RangeFlattenSpec] = BlockIdSequence()
         self.static_ranges: BlockIdSequence[StaticRangeSpec] = BlockIdSequence()
 
-        self.allowed_pid_types: tuple[PidTypeLiteral, ...] = tuple(VALID_PID_TYPES)
+        # NPU backends can be sensitive to program-id strategies; keep conservative.
+        if hasattr(torch, "npu") and torch.npu.is_available():
+            self.allowed_pid_types: tuple[PidTypeLiteral, ...] = ("flat",)
+        else:
+            self.allowed_pid_types = tuple(VALID_PID_TYPES)
         self.max_num_sm_multiplier: int = MAX_NUM_SM_MULTIPLIER
         self.grid_block_ids: list[int] = []
         self.tensor_numel_constraints: list[TensorNumelConstraint] = []
@@ -691,6 +699,10 @@ class ConfigSpec:
             self.epilogue_subtile_autotune_choices = EPILOGUE_SUBTILE_DEFAULT_CHOICES
 
     def valid_indexing_types(self) -> tuple[IndexingLiteral, ...]:
+        # NPU backends (e.g. Triton-ascend) may not fully support block_ptr and can
+        # hit device-side faults (e.g. unaligned UUB access). Keep indexing conservative.
+        if hasattr(torch, "npu") and torch.npu.is_available():
+            return ("pointer",)
         if supports_tensor_descriptor():
             return ("pointer", "tensor_descriptor")
         if not self.backend.supports_block_ptr_indexing():
@@ -718,9 +730,10 @@ class ConfigSpec:
     def disallow_pid_type(self, pid_type: PidTypeLiteral) -> None:
         """Disallow a pid_type from being used in the config."""
 
-        self.allowed_pid_types = tuple(
-            [x for x in self.allowed_pid_types if x != pid_type]
-        )
+        if len(self.allowed_pid_types) > 1 and pid_type in self.allowed_pid_types:
+            self.allowed_pid_types = tuple(
+                [x for x in self.allowed_pid_types if x != pid_type]
+            )
         assert self.allowed_pid_types
 
     @property
@@ -1627,7 +1640,16 @@ class ConfigSpec:
             "maxnreg",
         ):
             if not self.supports_config_key(name):
-                config.pop(name, None)
+                # In NPU environment, set num_warps and num_stages to None instead
+                # of removing them (codegen omits them when None).
+                if (
+                    name in ("num_warps", "num_stages")
+                    and hasattr(torch, "npu")
+                    and torch.npu.is_available()
+                ):
+                    config[name] = None
+                else:
+                    config.pop(name, None)
 
         if self.supports_config_key("num_warps"):
             config.setdefault("num_warps", DEFAULT_NUM_WARPS)
@@ -1898,6 +1920,10 @@ class ConfigSpec:
         if self.supports_config_key("range_warp_specializes"):
             config["range_warp_specializes"] = range_warp_specializes
 
+        # Triton-ascend: force ``range_unroll_factors`` off on NPU
+        # (see coerce_npu_tl_range_tunables).
+        self.coerce_npu_tl_range_tunables(config)
+
         if self.backend_name == "cute":
             preserve_keys = self._cute_tcgen05_config.implicit_default_keys_to_preserve(
                 config
@@ -1909,8 +1935,24 @@ class ConfigSpec:
         allowed_keys = self.supported_config_keys() | {
             *self.user_defined_tunables.keys()
         }
+        # In NPU environment, allow num_warps and num_stages keys (set to None).
+        if hasattr(torch, "npu") and torch.npu.is_available():
+            allowed_keys = allowed_keys | {"num_warps", "num_stages"}
         if invalid_keys := ({*config} - allowed_keys):
             raise InvalidConfig(f"Invalid config keys {sorted(invalid_keys)!r}")
+
+    def coerce_npu_tl_range_tunables(self, config: dict[str, object]) -> None:
+        """If compiling for NPU, normalize selected ``tl.range`` tunables (in place).
+
+        Force ``range_unroll_factors`` to all zeros so ``tl.range`` does not receive
+        ``loop_unroll_factor``. ``range_num_stages`` and ``range_multi_buffers`` are
+        left to the caller for experimentation.
+        """
+        if self._compile_device is None or self._compile_device.type != "npu":
+            return
+        rub = config.get("range_unroll_factors")
+        if isinstance(rub, list) and rub:
+            config["range_unroll_factors"] = [0] * len(rub)
 
     def raise_grid_block_minimums(self) -> None:
         """Raise min_size for grid block dimensions based on problem size.
@@ -2343,6 +2385,10 @@ class BlockSizeSpec(_PowerOfTwoBlockIdItem):
             next_power_of_2(bounded_hint) if max_size is None else max_size
         )
         self.max_size: int = self.dim_max_size
+        # Keep NPU autotuning search space conservative. Ascend backends can
+        # degrade or fault with very large block sizes (UUB constraints).
+        if hasattr(torch, "npu") and torch.npu.is_available():
+            self.max_size = min(self.max_size, 128)
         # Outer block_id whose tile extent caps this block's size in normalize().
         self.bounded_by_block_id: int | None = bounded_by_block_id
         if self.max_size < self.min_size:

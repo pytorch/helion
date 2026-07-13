@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import contextlib
 import functools
+import math
 from typing import Any
 from typing import Callable
 from typing import Generator
@@ -9,9 +10,36 @@ from typing import Generator
 import torch
 from torch._inductor.ir import TensorBox
 from torch._inductor.lowering import lowerings as original_lowerings
+from torch._inductor.lowering import make_pointwise
 from torch._inductor.lowering import to_dtype
+from torch._inductor.virtualized import ops as vops
 
 inductor_lowering_dispatch: dict[Callable[..., Any] | str, Callable[..., Any]] = {}
+
+# pyrefly: ignore [implicit-import]
+register_inductor_lowering = torch._inductor.lowering.register_lowering
+
+# Lowerings only installed on the NPU (Ascend) backend.  Registered into a
+# separate dict so they stay dormant on CUDA/CPU/TPU.
+npu_only_lowering_dispatch: dict[Callable[..., Any] | str, Callable[..., Any]] = {}
+
+try:
+    if hasattr(torch.ops, "npu") and hasattr(torch.ops.npu, "_npu_dtype_cast"):
+        _npu_dtype_cast_op = torch.ops.npu._npu_dtype_cast.default
+    else:
+        _npu_dtype_cast_op = None
+except (AttributeError, RuntimeError):
+    _npu_dtype_cast_op = None
+
+
+def is_npu_backend() -> bool:
+    from .compile_environment import CompileEnvironment
+
+    try:
+        env = CompileEnvironment.current()
+        return env.device.type == "npu"
+    except Exception:
+        return False
 
 
 def create_fp16_to_fp32_unary_fallback_lowering(
@@ -58,6 +86,20 @@ for op in FP32_FALLBACK_OPS_UNARY:
     )
 
 
+# Handle NPU dtype cast operation by delegating to standard to_dtype
+if _npu_dtype_cast_op is not None:
+
+    @register_inductor_lowering(
+        [_npu_dtype_cast_op],
+        lowering_dict=npu_only_lowering_dispatch,
+    )
+    def npu_dtype_cast(
+        x: TensorBox,
+        dtype: torch.dtype,
+    ) -> TensorBox:
+        return to_dtype(x, dtype)
+
+
 @contextlib.contextmanager
 def patch_inductor_lowerings() -> Generator[None, Any, Any]:
     """Context manager to temporarily patch the inductor lowering table.
@@ -84,14 +126,13 @@ def patch_inductor_lowerings() -> Generator[None, Any, Any]:
         if not is_pallas:
             # pyrefly: ignore [implicit-import]
             torch._inductor.lowering.lowerings.update(fp32_fallback_dispatch)
+        if is_npu_backend():
+            # pyrefly: ignore [implicit-import]
+            torch._inductor.lowering.lowerings.update(npu_only_lowering_dispatch)
         yield
     finally:
         # pyrefly: ignore [implicit-import]
         torch._inductor.lowering.lowerings = original_lowerings
-
-
-# pyrefly: ignore [implicit-import]
-register_inductor_lowering = torch._inductor.lowering.register_lowering
 
 
 def var_mean_helper_(
@@ -168,3 +209,143 @@ def var_mean(
         keepdim=keepdim,
         return_mean=True,
     )
+
+
+aten = torch.ops.aten
+
+
+@register_inductor_lowering(
+    aten.exp2.default, lowering_dict=npu_only_lowering_dispatch
+)
+def exp2_lowering(x: TensorBox) -> TensorBox:
+    """Custom lowering for ``aten.exp2``: computes ``2 ** x``.
+
+    Implemented as ``exp(x * ln(2))`` because triton-ascend lacks an ``exp2``
+    libdevice helper.
+    """
+    log2_val = math.log(2)  # Natural logarithm of 2
+    dtype = x.get_dtype()
+
+    def exp2_fn(x: object) -> object:
+        return vops.exp(vops.mul(x, vops.constant(log2_val, dtype)))
+
+    return make_pointwise(exp2_fn)(x)
+
+
+@register_inductor_lowering(
+    aten._log_softmax.default, lowering_dict=npu_only_lowering_dispatch
+)
+def log_softmax_lowering(
+    x: TensorBox, dim: int, half_to_float: bool = False
+) -> TensorBox:
+    """Numerically stable log-softmax: ``x - log(sum(exp(x - max(x))))``."""
+    dtype = x.get_dtype()
+    ndim = len(x.get_size())
+
+    # Handle negative dimension indices
+    if dim < 0:
+        dim = ndim + dim
+
+    # 1. max along the reduction dim for numerical stability
+    x_max = original_lowerings[aten.amax.default](x, axis=[dim], keepdims=True)
+    # 2. shift by the max (prevents overflow in exp)
+    shifted = original_lowerings[aten.sub.Tensor](x, x_max)
+    # 3. exp(shifted)
+    exp_shifted = original_lowerings[aten.exp.default](shifted)
+    # 4. sum of exponentials along the reduction dim (keepdim for broadcast)
+    sum_exp = original_lowerings[aten.sum.dim_IntList](
+        exp_shifted, axis=[dim], keepdims=True, dtype=dtype
+    )
+    # 5. log(sum_exp)
+    log_sum_exp = original_lowerings[aten.log.default](sum_exp)
+    # 6. shifted - log_sum_exp
+    result = original_lowerings[aten.sub.Tensor](shifted, log_sum_exp)
+
+    if half_to_float and dtype in (torch.float16, torch.bfloat16):
+        result = to_dtype(result, torch.float32)
+
+    return result
+
+
+@register_inductor_lowering(
+    aten.log2.default, lowering_dict=npu_only_lowering_dispatch
+)
+def log2_scalar_lowering(x: TensorBox) -> TensorBox:
+    """Custom lowering for ``aten.log2``."""
+
+    def log2_fn(x: object) -> object:
+        return vops.log2(x)
+
+    return make_pointwise(log2_fn)(x)
+
+
+@register_inductor_lowering(
+    aten.remainder.Scalar_Tensor, lowering_dict=npu_only_lowering_dispatch
+)
+@register_inductor_lowering(
+    aten.remainder.Scalar, lowering_dict=npu_only_lowering_dispatch
+)
+def remainder_scalar_lowering(x: TensorBox, divisor: object) -> TensorBox:
+    """Custom lowering for ``aten.remainder.Scalar`` and ``.Scalar_Tensor``.
+
+    Note: ``vops.mod`` follows Python floor-mod semantics on most runtimes
+    (matching ``torch.remainder``), but some NPU runtimes implement truncated
+    (C-style) mod, which differs from ``torch.remainder`` for negative
+    dividends by the divisor.  If you hit that, override this lowering with a
+    ``x - d * floor(x / d)`` form for your runtime.
+    """
+    if hasattr(divisor, "get_dtype"):
+        x_size = x.get_size()
+
+        if hasattr(divisor, "get_size"):
+            d_size = divisor.get_size()
+            if len(d_size) == 0:
+                divisor = original_lowerings[aten.expand.default](divisor, x_size)
+
+        def remainder_fn(x: object, d: object) -> object:
+            return vops.mod(x, d)
+
+        return make_pointwise(remainder_fn)(x, divisor)
+    else:
+
+        def remainder_fn(x: object) -> object:
+            return vops.mod(x, divisor)
+
+        return make_pointwise(remainder_fn)(x)
+
+
+@register_inductor_lowering(
+    aten.bitwise_or.Tensor, lowering_dict=npu_only_lowering_dispatch
+)
+def bitwise_or_tensor_lowering(x: TensorBox, y: TensorBox) -> TensorBox:
+    """Custom lowering for ``aten.bitwise_or.Tensor`` (element-wise ``x | y``)."""
+
+    def bitwise_or_fn(x: object, y: object) -> object:
+        return vops.bitwise_or(x, y)
+
+    return make_pointwise(bitwise_or_fn)(x, y)
+
+
+@register_inductor_lowering(
+    aten.__lshift__.Scalar, lowering_dict=npu_only_lowering_dispatch
+)
+def lshift_scalar_lowering(x: TensorBox, shift_amount: int) -> TensorBox:
+    """Custom lowering for ``aten.__lshift__.Scalar`` (``x << shift_amount``)."""
+
+    def lshift_fn(x: object) -> object:
+        return vops.lshift(x, shift_amount)
+
+    return make_pointwise(lshift_fn)(x)
+
+
+@register_inductor_lowering(
+    aten.__rshift__.Scalar, lowering_dict=npu_only_lowering_dispatch
+)
+def rshift_scalar_lowering(x: TensorBox, shift_amount: int) -> TensorBox:
+    """Custom lowering for ``aten.__rshift__.Scalar`` (``x >> shift_amount``)."""
+
+    def rshift_fn(x: object) -> object:
+        return vops.rshift(x, shift_amount)
+
+    return make_pointwise(rshift_fn)(x)
+

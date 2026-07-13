@@ -262,6 +262,7 @@ class CompileEnvironment:
             backend=self.backend,
             target_device_capability=target_device_capability(device),
             device=device,
+            compile_device=self.device,
             num_sm=_num_sm,
         )
         # TODO(hinriksnaer): tracing state, not env config. move to CompilerState?

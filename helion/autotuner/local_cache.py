@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import atexit
+import contextlib
 import dataclasses
 import hashlib
 import inspect
@@ -9,6 +11,8 @@ import logging
 import os
 from pathlib import Path
 import platform
+import shutil
+import tempfile
 import textwrap
 from typing import TYPE_CHECKING
 import uuid
@@ -48,6 +52,109 @@ def helion_triton_cache_dir(device_index: int) -> str:
 def helion_cute_cache_dir(device_index: int) -> str:
     """Return per-device CuTe DSL cache directory under Helion's cache root."""
     return str(get_helion_cache_dir() / "cute" / str(device_index))
+
+
+_npu_volatile_triton_cache: str | None = None
+
+
+def npu_volatile_triton_cache_dir() -> str:
+    """Per-process temp Triton cache on NPU (stale hits seen under ``helion/triton/<i>``).
+
+    Opt out: ``HELION_NPU_PERSISTENT_TRITON_CACHE=1``.
+    """
+    global _npu_volatile_triton_cache
+    if _npu_volatile_triton_cache is None:
+        _npu_volatile_triton_cache = tempfile.mkdtemp(
+            prefix="helion_npu_triton_volatile_",
+        )
+
+        def _cleanup_volatile_triton_cache() -> None:
+            shutil.rmtree(_npu_volatile_triton_cache, ignore_errors=True)
+
+        atexit.register(_cleanup_volatile_triton_cache)
+    return _npu_volatile_triton_cache
+
+
+def npu_persistent_triton_cache_requested() -> bool:
+    """When true, NPU uses :func:`helion_triton_cache_dir` like other devices."""
+    v = os.environ.get("HELION_NPU_PERSISTENT_TRITON_CACHE", "").strip().lower()
+    return v in ("1", "true", "yes", "on")
+
+
+def triton_env_is_helion_autotune_ephemeral() -> bool:
+    """True while :meth:`helion.runtime.kernel.BoundKernel._ephemeral_triton_cache` is active."""
+    d = os.environ.get("TRITON_CACHE_DIR", "")
+    return "helion_autotune_" in d
+
+
+def should_force_npu_volatile_triton_cache(device: torch.device) -> bool:
+    """NPU default: volatile disk root, unless persistent requested or autotune ephemeral is active."""
+    if device.type != "npu":
+        return False
+    if npu_persistent_triton_cache_requested():
+        return False
+    if triton_env_is_helion_autotune_ephemeral():
+        return False
+    return True
+
+
+_per_config_triton_cache_override: str | None = None
+
+
+@contextlib.contextmanager
+def per_config_triton_cache_for_autotune(path: str) -> Iterator[None]:
+    """Make ``compile_config`` use *path* as ``TRITON_CACHE_DIR`` (overrides NPU volatile root)."""
+    global _per_config_triton_cache_override
+    prev = _per_config_triton_cache_override
+    _per_config_triton_cache_override = path
+    try:
+        yield
+    finally:
+        _per_config_triton_cache_override = prev
+
+
+def get_per_config_triton_cache_override() -> str | None:
+    return _per_config_triton_cache_override
+
+
+def autotune_fresh_triton_subdir_per_benchmark() -> bool:
+    """Env ``HELION_AUTOTUNE_FRESH_TRITON_SUBDIR_PER_BENCHMARK``: isolated disk cache per search candidate."""
+    v = os.environ.get(
+        "HELION_AUTOTUNE_FRESH_TRITON_SUBDIR_PER_BENCHMARK", ""
+    ).strip().lower()
+    return v in ("1", "true", "yes", "on")
+
+
+def autotune_stable_triton_subdir_per_config() -> bool:
+    """Env ``HELION_AUTOTUNE_TRITON_SUBDIR_STABLE`` (use with *FRESH_TRITON_SUBDIR*).
+
+    Use ``TRITON_CACHE_DIR = <parent>/<sha256(config.config)>`` instead of a fresh temp dir per visit.
+    Different Helion configs never share one Triton cache tree (avoids cross-config confusion); the same
+    config reuses its tree so Triton can hit its own on-disk cache. Skip ``rmtree`` after each benchmark;
+    on NPU the parent still lives under the process volatile root removed at exit.
+    """
+    v = os.environ.get("HELION_AUTOTUNE_TRITON_SUBDIR_STABLE", "").strip().lower()
+    return v in ("1", "true", "yes", "on")
+
+
+def autotune_triton_candidate_parent_path() -> Path:
+    """Directory containing one subdirectory per autotune candidate (stable hash or temp name)."""
+    if hasattr(torch, "npu") and torch.npu.is_available():
+        return Path(npu_volatile_triton_cache_dir()) / "autotune_candidates"
+    return Path(tempfile.gettempdir()) / "helion_autotune_candidates"
+
+
+def triton_cache_dir_for_autotune_candidate(config: Config, *, stable: bool) -> str:
+    """Return ``TRITON_CACHE_DIR`` for this candidate: isolated from other configs' trees."""
+    parent = autotune_triton_candidate_parent_path()
+    parent.mkdir(parents=True, exist_ok=True)
+    if stable:
+        payload = json.dumps(config.config, sort_keys=True, default=str).encode()
+        digest = hashlib.sha256(payload).hexdigest()[:48]
+        p = parent / digest
+        p.mkdir(parents=True, exist_ok=True)
+        return str(p)
+    return tempfile.mkdtemp(prefix="cfg_", dir=str(parent))
 
 
 @dataclasses.dataclass(frozen=True)
@@ -170,6 +277,14 @@ class LocalAutotuneCache(AutotuneCacheBase):
                 import torch_tpu  # type: ignore[import-not-found]
 
                 runtime_name = getattr(torch_tpu, "__version__", "unknown")
+            except ImportError:
+                runtime_name = "unknown"
+        elif dev.type == "npu":
+            hardware = "npu"
+            try:
+                import torch_npu  # type: ignore[import-not-found]
+
+                runtime_name = torch_npu.npu.get_device_name()
             except ImportError:
                 runtime_name = "unknown"
         elif dev.type == "cpu" and self.kernel.kernel.settings.backend == "pallas":

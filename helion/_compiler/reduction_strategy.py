@@ -679,7 +679,11 @@ class PersistentReductionStrategy(ReductionStrategy):
         # Guard numel > 0: on PyTorch 2.9, next_power_of_2(0) returns 0
         # (the n <= 0 guard was added later), so static_rdim_size(0) == 0
         # would incorrectly skip the mask for zero-size reductions.
-        if isinstance(numel, (int, sympy.Integer)) and int(numel) > 0:
+        if (
+            isinstance(numel, (int, sympy.Integer))
+            and int(numel) > 0
+            and not env.backend.force_tile_mask()
+        ):
             needs_mask = env.backend.static_rdim_size(int(numel)) != int(numel)
         mask_var: str | None = (
             fn.new_var(f"mask_{block_index}", dce=True) if needs_mask else None
@@ -1151,7 +1155,7 @@ class LoopedReductionStrategy(ReductionStrategy):
                     )
         if env.known_multiple(
             env.block_sizes[block_index].numel, self._loop_block_size
-        ):
+        ) and not env.backend.force_tile_mask():
             mask_var: str | None = None
         else:
             mask_var = fn.new_var(f"mask_{block_index}", dce=True)

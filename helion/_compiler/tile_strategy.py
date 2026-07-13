@@ -2037,6 +2037,12 @@ class TileStrategy:
                 max(1, int(math.ceil(remainder / step))), range_num_stages
             )
 
+        # Triton-Ascend: omit ``loop_unroll_factor`` on ``tl.range`` (Helion forces
+        # ``range_unroll_factors`` to zero in normalize). ``num_stages`` / multi-buffer
+        # follow config.
+        if env.device.type == "npu":
+            range_unroll_factor = 0
+
         if range_unroll_factor > 0:
             kwargs.append(f"loop_unroll_factor={range_unroll_factor}")
         if range_warp_specialize is not None:

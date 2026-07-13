@@ -47,6 +47,10 @@ if _get_backend() == "pallas":
     from .autotuner.benchmarking import compute_repeat_generic as compute_repeat
     from .autotuner.benchmarking import do_bench_generic as do_bench
     from .autotuner.benchmarking import interleaved_bench_generic as interleaved_bench
+elif hasattr(torch, "npu") and torch.npu.is_available():
+    from .autotuner.benchmarking import compute_repeat
+    from .autotuner.benchmarking import do_bench_npu as do_bench
+    from .autotuner.benchmarking import interleaved_bench_npu as interleaved_bench
 else:
     from .autotuner.benchmarking import compute_repeat
     from .autotuner.benchmarking import do_bench as do_bench
@@ -182,6 +186,14 @@ def is_mtia() -> bool:
     return _get_triton_backend() == "mtia"
 
 
+def is_npu() -> bool:
+    """Return True if running on NPU (Ascend)."""
+    # Check both Helion backend setting and actual NPU availability
+    return _get_backend() == "npu" or (
+        hasattr(torch, "npu") and torch.npu.is_available()
+    )
+
+
 def skipIfMTIA(reason: str) -> Callable[[Callable], Callable]:
     # Defers check to test execution time to avoid CUDA init during pytest-xdist collection.
     return skipIfFn(is_mtia, reason)
@@ -253,6 +265,8 @@ elif torch.xpu.is_available():
     DEVICE = torch.device("xpu")
 elif _has_mtia_runtime():
     DEVICE = torch.device("mtia")
+elif hasattr(torch, "npu") and torch.npu.is_available():
+    DEVICE = torch.device("npu")
 elif _get_backend() == "metal" and torch.backends.mps.is_available():
     DEVICE = torch.device("mps")
 else:
@@ -371,6 +385,12 @@ def skipUnlessMTIA(reason: str) -> Callable[[Callable], Callable]:
 
     # Defers check to test execution time to avoid CUDA init during pytest-xdist collection.
     return skipIfFn(lambda: not supports_mtia_tunables(), reason)
+
+
+def skipUnlessNPU(reason: str) -> Callable[[Callable], Callable]:
+    """Skip test unless running on NPU (Ascend) hardware."""
+    # Defers check to test execution time to avoid CUDA init during pytest-xdist collection.
+    return skipIfFn(lambda: not is_npu(), reason)
 
 
 def skipUnlessTileIR(reason: str) -> Callable[[Callable], Callable]:
@@ -1215,7 +1235,16 @@ def run_example(
 
     # Check correctness against first baseline
     first_baseline_name, first_baseline_func = next(iter(baselines.items()))
+
+    run_example_npu_device_sync = None
+    if hasattr(torch, "npu") and torch.npu.is_available():
+        from .autotuner.benchmarking import _bench_device_synchronize
+
+        run_example_npu_device_sync = _bench_device_synchronize
+
     expected = _as_tensors(first_baseline_func(*args))
+    if run_example_npu_device_sync is not None:
+        run_example_npu_device_sync()
 
     for name, func in {**kernels, **baselines}.items():
         if name != first_baseline_name:
@@ -1223,6 +1252,8 @@ def run_example(
             # Clone args to avoid buffer donation issues (e.g., Pallas/TPU)
             cloned_args = _clone_args(args, process_group_name=process_group_name)
             result = _as_tensors(func(*cloned_args))
+            if run_example_npu_device_sync is not None:
+                run_example_npu_device_sync()
             assert len(result) == len(expected)
             for r, e in zip(result, expected, strict=True):
                 if max_mismatch_pct is not None:
@@ -1370,8 +1401,18 @@ def run_example(
     if is_master_rank():
         # Print results (on rank 0)
         print(f"\n{'=' * 65}\nBenchmark Results\n{'=' * 65}", file=sys.stderr)
+        time_header = "Time (ms)"
+        if hasattr(torch, "npu") and torch.npu.is_available():
+            from .autotuner.benchmarking import npu_benchmark_results_timing_caption
+
+            cap = npu_benchmark_results_timing_caption()
+            if cap:
+                print(cap, file=sys.stderr)
+            time_header = "Time (ms, NPU prof.)"
+        time_w = max(len(time_header), 12)
+        sep = "-" * (20 + time_w + 15 + 2)
         print(
-            f"{'Implementation':<20} {'Time (ms)':<12} {'Speedup':<15}\n{'-' * 65}",
+            f"{'Implementation':<20} {time_header:<{time_w}} {'Speedup':<15}\n{sep}",
             file=sys.stderr,
         )
 
@@ -1382,7 +1423,7 @@ def run_example(
                 if is_best_baseline
                 else f"{best_baseline_time / time:.2f}x"
             )
-            print(f"{name:<20} {time:<12.4f} {speedup_str:<15}", file=sys.stderr)
+            print(f"{name:<20} {time:<{time_w}.4f} {speedup_str:<15}", file=sys.stderr)
 
         print(f"{'=' * 65}\n", file=sys.stderr)
 
