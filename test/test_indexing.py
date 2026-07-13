@@ -1777,7 +1777,6 @@ class TestIndexing(RefEagerTestBase, TestCase):
         torch.testing.assert_close(src2_result, expected_src2)
         torch.testing.assert_close(dst2_result, expected_dst2)
 
-    @skipIfNormalMode("InternalError: Negative indexes")
     def test_negative_indexing(self):
         """Test both setter from scalar and getter for [-1]"""
 
