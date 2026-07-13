@@ -2938,6 +2938,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             bwd_err.item(), 0.10, f"{label} monkeypatch bwd error: {bwd_err}"
         )
 
+    @pytest.mark.timeout(600)
     def test_linear_monkeypatch_gla(self):
         """Monkey-patch FLA's GatedLinearAttention to use our engine, verify fwd+bwd."""
         from examples.linear.linear_attention_engine import LinearAttentionVariant
@@ -2965,6 +2966,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             dtype=torch.float32,
         )
 
+    @pytest.mark.timeout(600)
     def test_linear_monkeypatch_delta_rule(self):
         """Monkey-patch FLA's DeltaNet to use our engine, verify fwd+bwd."""
         from examples.linear.linear_attention_engine import LinearAttentionVariant
@@ -2998,6 +3000,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             preprocess=preprocess,
         )
 
+    @pytest.mark.timeout(600)
     def test_linear_monkeypatch_gated_delta_rule(self):
         """Monkey-patch FLA's GatedDeltaNet to use our engine, verify fwd+bwd."""
         from examples.linear.linear_attention_engine import LinearAttentionVariant
@@ -3043,6 +3046,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             preprocess=preprocess,
         )
 
+    @pytest.mark.timeout(600)
     def test_linear_monkeypatch_simple_gla(self):
         """Monkey-patch FLA's SimpleGatedLinearAttention to use our engine."""
         from examples.linear.linear_attention_engine import LinearAttentionVariant
