@@ -3657,6 +3657,7 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
                     small_biased_candidate=flash_shape.small_biased_candidate,
                 )
             else:
+                from ..language._decorators import is_api_func
                 from ..language.matmul_ops import enforce_dot_requirements
                 from .cute.cute_mma import can_codegen_cute_mma_aten
                 from .cute.cute_mma import can_codegen_cute_mma_dot
@@ -3698,7 +3699,13 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
                             torch.ops.aten.bmm.default,
                         ):
                             lhs_arg, rhs_arg = node.args[0], node.args[1]
-                        elif getattr(node.target, "__name__", "") == "dot":
+                        elif (
+                            is_api_func(node.target)
+                            and getattr(node.target, "__name__", "") == "dot"
+                        ):
+                            # Match the backend's hl.dot detector (is_api_func +
+                            # name) so a traced call target merely named "dot"
+                            # cannot shape the batched tcgen05 search.
                             lhs_arg, rhs_arg = node.args[0], node.args[1]
                             is_dot = True
                         else:

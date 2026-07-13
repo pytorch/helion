@@ -47,8 +47,6 @@ from .layout import MatmulExecutionPlan
 from .matmul_utils import analyze_direct_grouped_n_loads
 from .mma_support import get_cute_mma_support
 from .strategies import TCGEN05_LEGAL_SMEM_SWIZZLE_BYTES
-from .strategies import TCGEN05_NUM_EPI_WARPS_CONFIG_KEY
-from .strategies import TCGEN05_WARP_SPEC_DEFAULTS_BY_KEY
 from .strategies import Tcgen05PersistenceModel
 from .strategies import is_pure_matmul_role_lifecycle_config
 from .strategies import l2_swizzle_size_from_config
@@ -473,8 +471,12 @@ class _MmaOperandInfo:
     source_fake: torch.Tensor
     matrix_rows: object
     matrix_cols: object
-    is_leading_passthrough: bool
     leading_passthrough_block_id: int | None = None
+
+    @property
+    def is_leading_passthrough(self) -> bool:
+        """True when this operand carries a leading passthrough grid axis."""
+        return self.leading_passthrough_block_id is not None
 
 
 @dataclass(frozen=True)
@@ -510,7 +512,6 @@ def _analyze_mma_operand(
             source_fake=source_fake,
             matrix_rows=source_fake.shape[0],
             matrix_cols=source_fake.shape[1],
-            is_leading_passthrough=False,
         )
     if source_fake.ndim != 3:
         return None
@@ -536,7 +537,6 @@ def _analyze_mma_operand(
         source_fake=source_fake,
         matrix_rows=source_fake.shape[1],
         matrix_cols=source_fake.shape[2],
-        is_leading_passthrough=True,
         leading_passthrough_block_id=leading_passthrough_block_id,
     )
 
@@ -576,17 +576,6 @@ def _acc_rank_is_mma_compatible(
     if acc_val.ndim == 2:
         return True
     return acc_val.ndim == 3 and analysis.has_leading_passthrough
-
-
-def _has_mma_operands(lhs_node: Node, rhs_node: Node) -> bool:
-    """Check if lhs/rhs come from loads with MMA-compatible dtypes."""
-    from ..compile_environment import CompileEnvironment
-
-    return _analyze_mma_operands(
-        lhs_node,
-        rhs_node,
-        CompileEnvironment.current(),
-    ) is not None
 
 
 def is_mma_compatible_aten(node: Node, with_acc: bool) -> bool:
@@ -3016,20 +3005,7 @@ def _emit_mma_pipeline(
         # Use ``warp_spec.ab_load_warps`` so the strategy data model
         # stays the source of truth for warp role IDs; ``epi_warps``
         # flows the same way via ``_tcgen05_epi_warp_count`` below.
-        try:
-            tcgen05_warp_spec = warp_spec_from_config(df.config)
-        except KeyError:
-            if not analysis.has_leading_passthrough:
-                raise
-            tcgen05_warp_spec = warp_spec_from_config(
-                {
-                    **TCGEN05_WARP_SPEC_DEFAULTS_BY_KEY,
-                    TCGEN05_NUM_EPI_WARPS_CONFIG_KEY: df.config.get(
-                        TCGEN05_NUM_EPI_WARPS_CONFIG_KEY,
-                        4,
-                    ),
-                }
-            )
+        tcgen05_warp_spec = warp_spec_from_config(df.config)
         # Pull swizzle overrides off the config and validate the
         # bytes-per-row contract before constructing the matmul plan
         # so a bad config raises ``BackendUnsupported`` here rather
