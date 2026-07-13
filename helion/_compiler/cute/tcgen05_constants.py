@@ -424,6 +424,61 @@ TCGEN05_LARGE_BN_PROOF_CONFIG_KEY = "tcgen05_large_bn_proof"
 # Diagnostic Target1 topology probe: keep role predicates warp-based while
 # deriving logical MMA coordinates from flat threadIdx.x / warp / lane values.
 TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY = "tcgen05_flat_role_coordinates"
+# Grouped persistent scheduler/codegen opt-in for rank3 RHS grouped GEMM.
+# Codegen owns the narrow envelope check before admitting generated kernels.
+TCGEN05_GROUPED_STATIC_PERSISTENT_CONFIG_KEY = "tcgen05_grouped_static_persistent"
+TCGEN05_GROUPED_STATIC_BLOCK_K_CHOICES = (16, 32, 64, 128)
+TCGEN05_GROUPED_STATIC_COMMON_K_BLOCK_PAIRS = (
+    (16, 16),
+    (32, 32),
+    (64, 64),
+    (96, 32),
+    (160, 32),
+    (192, 64),
+)
+TCGEN05_GROUPED_DYNAMIC_AB_TENSORMAPS_CONFIG_KEY = (
+    "tcgen05_grouped_dynamic_ab_tensormaps"
+)
+TCGEN05_GROUPED_STATIC_RESERVED_SMS_CONFIG_KEY = "tcgen05_grouped_static_reserved_sms"
+TCGEN05_GROUPED_STATIC_RESERVED_SMS_SEARCH_CHOICES = (0, 2, 3, 4, 5, 8, 16)
+TCGEN05_GROUPED_STATIC_RESERVED_SMS_MAX = 1024
+# Direct pointer/stride metadata for grouped dynamic TensorMap updates. This
+# keeps A/B/D payload tensors in place and only passes small per-group metadata
+# tensors to generated tcgen05 code.
+TCGEN05_GROUPED_DIRECT_POINTER_METADATA_CONFIG_KEY = (
+    "tcgen05_grouped_direct_pointer_metadata"
+)
+TCGEN05_GROUPED_EXTERNAL_DIRECT_POINTERS_CONFIG_KEY = (
+    "tcgen05_grouped_external_direct_pointers"
+)
+TCGEN05_GROUPED_EXTERNAL_DIRECT_STRIDES_CONFIG_KEY = (
+    "tcgen05_grouped_external_direct_strides"
+)
+# Generated DeepGEMM selected BF16 NT contiguous lowering. CuTe codegen owns the
+# strict envelope check and fails closed outside the supported segment-worklist
+# shape.
+TCGEN05_DEEPGEMM_SELECTED_CONFIG_KEY = "tcgen05_deepgemm_selected"
+TCGEN05_DEEPGEMM_SELECTED_COMPACT_METADATA_CONFIG_KEY = (
+    "tcgen05_deepgemm_selected_compact_metadata"
+)
+# Source rows consumed per compact DeepGEMM-selected group. This is tied to the
+# selected N,M schedule's 256x224 source tile and must not leak into general
+# grouped-GEMM tiling decisions.
+TCGEN05_DEEPGEMM_SELECTED_SOURCE_M_TILE = 224
+TCGEN05_SELECTED_NM_MMA_M_TILE = 256
+TCGEN05_SELECTED_NM_EXPLICIT_STORE_SHAPE = (128, 32, 32)
+# Orientation requests for generated DeepGEMM-selected lowering. Non-default
+# values are admitted only through the selected N,M contract or fail closed
+# before stale wrapper/cache state can escape.
+TCGEN05_SELECTED_ACCUMULATOR_VIEW_CONFIG_KEY = "tcgen05_selected_accumulator_view"
+TCGEN05_SELECTED_ACCUMULATOR_VIEWS = ("mn", "nm")
+TCGEN05_SELECTED_D_STORE_VIEW_CONFIG_KEY = "tcgen05_selected_d_store_view"
+TCGEN05_SELECTED_D_STORE_VIEWS = ("normal", "nm_transposed")
+# Diagnostic marker set during normalization for grouped-static configs. True
+# means ``tcgen05_ab_stages`` was omitted and may use backend defaulting
+# heuristics; False means the user supplied an AB-stage value, including the
+# numeric default 2.
+TCGEN05_AB_STAGES_AUTO_CONFIG_KEY = "tcgen05_ab_stages_auto"
 TCGEN05_LARGE_BN_PROOF_PROBLEM_SHAPE = (64, 512, 16)
 TCGEN05_LARGE_BN_PROOF_BLOCK_SIZES = (64, 512, 16)
 TCGEN05_LARGE_BN_PROOF_CLUSTER_M = 1

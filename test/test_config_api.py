@@ -16,12 +16,32 @@ import torch
 import helion
 from helion import exc
 from helion._compiler.compile_environment import CompileEnvironment
+from helion._compiler.cute.tcgen05_constants import TCGEN05_DEEPGEMM_SELECTED_CONFIG_KEY
+from helion._compiler.cute.tcgen05_constants import (
+    TCGEN05_GROUPED_DYNAMIC_AB_TENSORMAPS_CONFIG_KEY,
+)
+from helion._compiler.cute.tcgen05_constants import (
+    TCGEN05_GROUPED_EXTERNAL_DIRECT_POINTERS_CONFIG_KEY,
+)
+from helion._compiler.cute.tcgen05_constants import (
+    TCGEN05_GROUPED_EXTERNAL_DIRECT_STRIDES_CONFIG_KEY,
+)
+from helion._compiler.cute.tcgen05_constants import (
+    TCGEN05_GROUPED_STATIC_PERSISTENT_CONFIG_KEY,
+)
+from helion._compiler.cute.tcgen05_constants import (
+    TCGEN05_GROUPED_STATIC_RESERVED_SMS_CONFIG_KEY,
+)
+from helion._compiler.cute.tcgen05_constants import (
+    TCGEN05_GROUPED_STATIC_RESERVED_SMS_MAX,
+)
 from helion._compiler.cute.tcgen05_constants import (
     TCGEN05_SCHED_CONSUMER_WAIT_MODE_CONFIG_KEY,
 )
 from helion._compiler.cute.tcgen05_constants import (
     TCGEN05_SCHED_CONSUMER_WAIT_MODE_WARP_LEADER,
 )
+from helion._compiler.cute.tcgen05_constants import TCGEN05_TWO_CTA_SEED_PID_TYPE
 from helion._testing import TestCase
 from helion._testing import onlyBackends
 from helion._testing import skipIfXPU
@@ -286,6 +306,51 @@ class TestConfigAPI(TestCase):
         rejson = restored.to_json()
         reread = helion.Config.from_json(rejson)
         self.assertEqual(dict(reread), expected)
+
+    def test_from_dict_preserves_none_values(self) -> None:
+        cfg = helion.Config.from_dict({"maxnreg": None})
+
+        self.assertIn("maxnreg", cfg.config)
+        self.assertIsNone(cfg.config["maxnreg"])
+
+    def test_json_and_kernel_dict_config_filter_known_none_values(self) -> None:
+        from helion.runtime.kernel import BoundKernel
+
+        json_config = helion.Config.from_json(
+            '{"num_warps": null, "num_stages": null, "tcgen05_ab_stages_auto": true}'
+        )
+        self.assertNotIn("num_warps", json_config.config)
+        self.assertNotIn("num_stages", json_config.config)
+        self.assertIs(json_config.config["tcgen05_ab_stages_auto"], True)
+
+        dict_config = BoundKernel._normalize_config(  # type: ignore[arg-type]
+            None,
+            {
+                "num_warps": None,
+                "num_stages": None,
+                "tcgen05_ab_stages_auto": True,
+            },
+        )
+        self.assertNotIn("num_warps", dict_config.config)
+        self.assertNotIn("num_stages", dict_config.config)
+        self.assertIs(dict_config.config["tcgen05_ab_stages_auto"], True)
+
+    def test_metadata_like_keys_are_regular_config_keys(self) -> None:
+        data: dict[str, Any] = {
+            "block_sizes": [64],
+            "__helion_config_metadata__": {
+                "version": 1,
+                "provided_keys": ["block_sizes"],
+            },
+            "__helion_config_state_version__": 1,
+        }
+
+        cfg = helion.Config.from_dict(data)
+        restored_json = helion.Config.from_json(cfg.to_json())
+        restored_pickle = pickle.loads(pickle.dumps(cfg))
+
+        self.assertEqual(dict(restored_json), data)
+        self.assertEqual(dict(restored_pickle), data)
 
     def test_epilogue_subtile_rewrites_only_store_slots(self) -> None:
         env = CompileEnvironment(torch.device("cpu"), helion.Settings(backend="triton"))
@@ -894,6 +959,178 @@ class TestCuteTcgen05ConfigSpecSplit(TestCase):
         spec.normalize(config)
         self.assertEqual(config.config["tcgen05_strategy"], "role_local_with_scheduler")
         self.assertEqual(config.config["tcgen05_warp_spec_c_input_warps"], 1)
+
+    def test_grouped_static_normalize_rejects_invalid_block_k(self) -> None:
+        spec = self._make_cute_tcgen05_spec()
+        raw_config: dict[str, object] = {
+            "block_sizes": [128, 64, 8],
+            TCGEN05_GROUPED_STATIC_PERSISTENT_CONFIG_KEY: True,
+        }
+        cases: tuple[helion.Config | dict[str, object], ...] = (
+            helion.Config.from_dict(raw_config),
+            dict(raw_config),
+        )
+
+        for config in cases:
+            with (
+                self.subTest(config_type=type(config).__name__),
+                self.assertRaisesRegex(exc.InvalidConfig, "block_k"),
+            ):
+                spec.normalize(config)
+
+    def test_grouped_static_reserved_sms_normalize(self) -> None:
+        spec = self._make_cute_tcgen05_spec()
+        config = helion.Config(
+            block_sizes=[128, 64, 64],
+            pid_type=TCGEN05_TWO_CTA_SEED_PID_TYPE,
+            **{
+                TCGEN05_GROUPED_STATIC_PERSISTENT_CONFIG_KEY: True,
+                TCGEN05_GROUPED_DYNAMIC_AB_TENSORMAPS_CONFIG_KEY: True,
+            },
+            **{TCGEN05_GROUPED_STATIC_RESERVED_SMS_CONFIG_KEY: 4},
+        )
+        spec.normalize(config)
+        self.assertEqual(
+            config.config[TCGEN05_GROUPED_STATIC_RESERVED_SMS_CONFIG_KEY],
+            4,
+        )
+
+        config = helion.Config(
+            block_sizes=[128, 64, 64],
+            pid_type=TCGEN05_TWO_CTA_SEED_PID_TYPE,
+            **{
+                TCGEN05_GROUPED_STATIC_PERSISTENT_CONFIG_KEY: True,
+                TCGEN05_GROUPED_DYNAMIC_AB_TENSORMAPS_CONFIG_KEY: True,
+            },
+            **{TCGEN05_GROUPED_STATIC_RESERVED_SMS_CONFIG_KEY: 0},
+        )
+        spec.normalize(config)
+        self.assertNotIn(TCGEN05_GROUPED_STATIC_RESERVED_SMS_CONFIG_KEY, config.config)
+
+    def test_grouped_static_reserved_sms_pruned_when_inactive(self) -> None:
+        spec = self._make_cute_tcgen05_spec()
+        cases: tuple[tuple[str, dict[str, object]], ...] = (
+            ("missing_grouped_flags", {}),
+            (
+                "false_grouped_flags_removed",
+                {
+                    "pid_type": TCGEN05_TWO_CTA_SEED_PID_TYPE,
+                    TCGEN05_GROUPED_STATIC_PERSISTENT_CONFIG_KEY: False,
+                    TCGEN05_GROUPED_DYNAMIC_AB_TENSORMAPS_CONFIG_KEY: False,
+                },
+            ),
+            (
+                "dynamic_tensormaps_removed",
+                {
+                    "pid_type": TCGEN05_TWO_CTA_SEED_PID_TYPE,
+                    TCGEN05_GROUPED_STATIC_PERSISTENT_CONFIG_KEY: True,
+                    TCGEN05_GROUPED_DYNAMIC_AB_TENSORMAPS_CONFIG_KEY: False,
+                },
+            ),
+            (
+                "nonpersistent_pid",
+                {
+                    "pid_type": "flat",
+                    TCGEN05_GROUPED_STATIC_PERSISTENT_CONFIG_KEY: True,
+                    TCGEN05_GROUPED_DYNAMIC_AB_TENSORMAPS_CONFIG_KEY: True,
+                },
+            ),
+        )
+
+        for name, extra_config in cases:
+            with self.subTest(name=name):
+                config = helion.Config(
+                    block_sizes=[128, 64, 64],
+                    **extra_config,
+                    **{TCGEN05_GROUPED_STATIC_RESERVED_SMS_CONFIG_KEY: 5},
+                )
+                spec.normalize(config)
+                self.assertNotIn(
+                    TCGEN05_GROUPED_STATIC_RESERVED_SMS_CONFIG_KEY,
+                    config.config,
+                )
+                baseline = helion.Config(
+                    block_sizes=[128, 64, 64],
+                    **extra_config,
+                )
+                spec.normalize(baseline)
+                self.assertEqual(config, baseline)
+                self.assertEqual(hash(config), hash(baseline))
+
+    def test_grouped_static_reserved_sms_rejects_invalid_values(self) -> None:
+        spec = self._make_cute_tcgen05_spec()
+        for value in (-1, True, "4", None, TCGEN05_GROUPED_STATIC_RESERVED_SMS_MAX + 1):
+            with (
+                self.subTest(value=value),
+                self.assertRaisesRegex(exc.InvalidConfig, "reserved_sms"),
+            ):
+                spec.normalize(
+                    helion.Config(
+                        block_sizes=[128, 64, 64],
+                        **{TCGEN05_GROUPED_STATIC_RESERVED_SMS_CONFIG_KEY: value},
+                    )
+                )
+
+    def test_deepgemm_selected_ab_stages_survive_minimize_roundtrip(self) -> None:
+        spec = self._make_cute_tcgen05_spec()
+        config = helion.Config(
+            block_sizes=[256, 128, 64],
+            pid_type=TCGEN05_TWO_CTA_SEED_PID_TYPE,
+            tcgen05_cluster_m=2,
+            tcgen05_ab_stages=4,
+            **{
+                TCGEN05_GROUPED_STATIC_PERSISTENT_CONFIG_KEY: True,
+                TCGEN05_GROUPED_DYNAMIC_AB_TENSORMAPS_CONFIG_KEY: True,
+                TCGEN05_DEEPGEMM_SELECTED_CONFIG_KEY: True,
+            },
+        )
+        spec.normalize(config)
+        minimized = config.minimize(spec)
+        self.assertNotIn("tcgen05_cluster_n", minimized.config)
+        self.assertNotIn("tcgen05_acc_stages", minimized.config)
+        self.assertNotIn("tcgen05_c_stages", minimized.config)
+        spec.normalize(minimized)
+        self.assertEqual(minimized.config["tcgen05_ab_stages"], 4)
+
+    def test_grouped_static_deepgemm_selected_flag_validates_and_prunes_false(
+        self,
+    ) -> None:
+        spec = self._make_cute_tcgen05_spec()
+        config = helion.Config(
+            block_sizes=[128, 64, 64],
+            **{TCGEN05_DEEPGEMM_SELECTED_CONFIG_KEY: False},
+        )
+        spec.normalize(config)
+        self.assertNotIn(TCGEN05_DEEPGEMM_SELECTED_CONFIG_KEY, config.config)
+
+        with self.assertRaisesRegex(
+            exc.InvalidConfig, TCGEN05_DEEPGEMM_SELECTED_CONFIG_KEY
+        ):
+            spec.normalize(
+                helion.Config(
+                    block_sizes=[128, 64, 64],
+                    **{TCGEN05_DEEPGEMM_SELECTED_CONFIG_KEY: "bad"},
+                )
+            )
+
+    def test_grouped_external_direct_metadata_names_are_preserved(self) -> None:
+        spec = self._make_cute_tcgen05_spec()
+        config = helion.Config(
+            block_sizes=[128, 64, 64],
+            **{
+                TCGEN05_GROUPED_EXTERNAL_DIRECT_POINTERS_CONFIG_KEY: "direct_pointers",
+                TCGEN05_GROUPED_EXTERNAL_DIRECT_STRIDES_CONFIG_KEY: "direct_strides",
+            },
+        )
+        spec.normalize(config)
+        self.assertEqual(
+            config.config[TCGEN05_GROUPED_EXTERNAL_DIRECT_POINTERS_CONFIG_KEY],
+            "direct_pointers",
+        )
+        self.assertEqual(
+            config.config[TCGEN05_GROUPED_EXTERNAL_DIRECT_STRIDES_CONFIG_KEY],
+            "direct_strides",
+        )
 
     def test_direct_cute_config_spec_enforces_clc_arch_gate(self) -> None:
         from helion._compiler.cute.strategies import (

@@ -181,7 +181,8 @@ class Config(Mapping[str, object]):
     def from_json(cls, json_str: str) -> Config:
         """Create a Config object from a JSON string."""
         config_dict = json.loads(json_str)
-        return cls(**config_dict)  # Changed to use dictionary unpacking
+        assert isinstance(config_dict, dict)
+        return cls(**config_dict)
 
     def minimize(self, config_spec: object) -> Config:
         """
@@ -199,13 +200,15 @@ class Config(Mapping[str, object]):
         from ..autotuner.config_spec import ConfigSpec
 
         assert isinstance(config_spec, ConfigSpec)
+        config = dict(self.config)
+        config_spec.prepare_minimize(config)
         default_config = config_spec.default_config()
 
         # block_sizes is always required and must never be removed
         required_keys = {"block_sizes"}
 
         minimal: dict[str, object] = {}
-        for key, value in self.config.items():
+        for key, value in config.items():
             # Keep value if it differs from the default or is required
             default_value = default_config.config.get(key)
             if value != default_value or key in required_keys:
