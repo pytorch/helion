@@ -15,6 +15,7 @@ from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
 from helion._testing import code_and_output
 from helion._testing import onlyBackends
+from helion._testing import skipIfNotCUDA
 from helion._testing import skipIfRefEager
 from helion._testing import skipIfTileIR
 import helion.exc as exc
@@ -290,6 +291,34 @@ class TestBarrier(RefEagerTestBase, TestCase):
         self.assertEqual(len(device_ir.graphs), original_graph_count + 1)
         self.assertEqual(len(device_ir.rolled_reductions), 1)
         self.assertEqual(len(fake_env.config_spec.reduction_loops), 1)
+
+    @skipIfNotCUDA()
+    @skipIfRefEager("promoted-seed pid_type is only materialized in compiled mode")
+    @skipIfTileIR("TileIR does not support barrier operations")
+    def test_reduction_seed_default_config_is_persistent(self) -> None:
+        """Regression: the promoted sm100 reduction seed hardcodes pid_type='flat',
+        but hl.barrier() forces a persistent kernel. With autotuning off (no explicit
+        config, so the promoted seed IS the default) the kernel must still compile with
+        a persistent pid_type and match the reference -- before the fix this raised
+        helion.exc.BarrierRequiresPersistent. No pid_type/config is passed, so this
+        exercises config_spec.default_config() (the promoted seed)."""
+
+        @helion.kernel(autotune_effort="none")
+        def barrier_reduction(x: torch.Tensor) -> torch.Tensor:
+            m, _ = x.size()
+            partial = torch.empty([m], dtype=torch.float32, device=x.device)
+            out = torch.empty([m], dtype=torch.float32, device=x.device)
+            for tile_m in hl.tile(m):
+                partial[tile_m] = x[tile_m, :].to(torch.float32).sum(-1)
+            hl.barrier()
+            for tile_m in hl.tile(m):
+                out[tile_m] = partial[tile_m] * 2.0
+            return out
+
+        x = torch.randn([256, 8192], device=DEVICE, dtype=torch.float32)
+        expected = (x.double().sum(-1) * 2.0).float()
+        _code, out = code_and_output(barrier_reduction, (x,))
+        torch.testing.assert_close(out, expected, rtol=1e-4, atol=1e-2)
 
 
 @onlyBackends(["cute"])
