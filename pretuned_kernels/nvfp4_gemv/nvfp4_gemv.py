@@ -17,8 +17,10 @@ correct and reused across rows -- which is what the autotuned configs exploit.
 
 Benchmarked against the production vLLM CUTLASS NVFP4 GEMM
 (``ops.cutlass_scaled_fp4_mm`` -- the NVFP4 analog of ``cutlass_scaled_mm``,
-which has no dedicated GEMV, so decode is served by the M=1 GEMM), a torch NVFP4
-dequant reference, and ``torch.compile`` of that reference.
+which has no dedicated GEMV, so decode is served by the M=1 GEMM) and
+``torch.compile`` of the NVFP4 dequant reference. The eager dequant reference is
+used only for a one-shot correctness check per shape (it is orders of magnitude
+slower than the kernel, so it is not a timed baseline).
 """
 
 from __future__ import annotations
@@ -49,6 +51,24 @@ reference_nvfp4_gemv_bf16in = _ex.reference_nvfp4_gemv_bf16in
 # module scope so the compile cache is shared across the shape sweep.
 compiled_reference_nvfp4_gemv_fp4in = torch.compile(reference_nvfp4_gemv_fp4in)
 compiled_reference_nvfp4_gemv_bf16in = torch.compile(reference_nvfp4_gemv_bf16in)
+
+
+def _check(
+    got: torch.Tensor, expected: torch.Tensor, variant: str, n: int, k: int
+) -> None:
+    """Correctness check vs the eager dequant reference (run once, never timed).
+
+    The eager reference is orders of magnitude slower than the kernel, so it is
+    used only to validate output -- not as a timed baseline. Tolerances match
+    the example's FP16-decode path (fp4/fp8 quantization dominates the error).
+    """
+    torch.testing.assert_close(
+        got.float(),
+        expected.float(),
+        atol=4.0,
+        rtol=2e-1,
+        msg=lambda m: f"{variant} N={n} K={k} mismatch vs reference:\n{m}",
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -419,11 +439,17 @@ def main(verbose: bool = True) -> dict:
             def helion_call() -> torch.Tensor:
                 return _nvfp4_gemv_fp4in(weight, x, w_scale, x_scale)
 
+            # Correctness against the eager dequant reference (checked once, not
+            # timed -- the eager reference is orders of magnitude slower).
+            _check(
+                helion_call(),
+                reference_nvfp4_gemv_fp4in(weight, x, w_scale, x_scale),
+                variant,
+                n,
+                k,
+            )
+
             base_calls: list[tuple[str, Callable[[], torch.Tensor]]] = [
-                (
-                    "torch",
-                    lambda: reference_nvfp4_gemv_fp4in(weight, x, w_scale, x_scale),
-                ),
                 (
                     "torch_compile",
                     lambda: compiled_reference_nvfp4_gemv_fp4in(
@@ -439,8 +465,15 @@ def main(verbose: bool = True) -> dict:
             def helion_call() -> torch.Tensor:
                 return _nvfp4_gemv_bf16in(weight, x, w_scale)
 
+            _check(
+                helion_call(),
+                reference_nvfp4_gemv_bf16in(weight, x, w_scale),
+                variant,
+                n,
+                k,
+            )
+
             base_calls = [
-                ("torch", lambda: reference_nvfp4_gemv_bf16in(weight, x, w_scale)),
                 (
                     "torch_compile",
                     lambda: compiled_reference_nvfp4_gemv_bf16in(weight, x, w_scale),
