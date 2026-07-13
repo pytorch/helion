@@ -1654,7 +1654,7 @@ class TestResidentPrepHoistCodegen(unittest.TestCase):
         # prep-lowering install to return [] (the shape of every fallback branch) and
         # confirm no prep cache is read and the reduction keeps its jnp.where masks.
         with patch(
-            "helion.language._tracing_ops._prepare_resident_prep_lowerings",
+            "helion._compiler.pallas.tracing_ops._prepare_resident_prep_lowerings",
             return_value=[],
         ):
             code = _fully_jagged_kernel.bind(self._resident_args()).to_triton_code(

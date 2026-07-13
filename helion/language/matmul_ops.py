@@ -32,7 +32,6 @@ from .._compiler.cute.tcgen05_constants import TCGEN05_TWO_CTA_FP8_SMALL_GRID_BL
 from .._compiler.cute.tcgen05_constants import TCGEN05_TWO_CTA_FP8_SMALL_GRID_BLOCK_N
 from .._compiler.cute.tcgen05_constants import TCGEN05_TWO_CTA_MAX_K_TILES
 from .._compiler.matmul_utils import _compute_out_dtype
-from .._compiler.matmul_utils import _emit_pallas_matmul
 from .._compiler.matmul_utils import _emit_tl_dot_scaled
 from .._compiler.matmul_utils import _needs_f32_accumulator
 from .._compiler.matmul_utils import emit_tl_dot_with_padding
@@ -769,45 +768,6 @@ def _(state: CodegenState) -> object:
     )
 
 
-@_decorators.codegen(dot, "pallas")
-def _(state: CodegenState) -> object:
-    lhs_ast = state.ast_arg(0)
-    rhs_ast = state.ast_arg(1)
-    acc_ast = state.ast_arg(2)
-
-    lhs_proxy = state.proxy_args[0]
-    assert isinstance(lhs_proxy, FakeTensor)
-    rhs_proxy = state.proxy_args[1]
-    assert isinstance(rhs_proxy, FakeTensor)
-    acc_proxy = state.proxy_args[2] if len(state.proxy_args) > 2 else None
-    out_dtype_proxy = state.proxy_args[3] if len(state.proxy_args) > 3 else None
-
-    lhs_dtype = lhs_proxy.dtype
-    rhs_dtype = rhs_proxy.dtype
-    need_f32_acc = _needs_f32_accumulator(lhs_dtype, rhs_dtype)
-
-    # Determine the accumulator AST (None if acc argument is None)
-    is_acc_none = isinstance(acc_ast, ast.Constant) and acc_ast.value is None
-    acc = None if is_acc_none else acc_ast
-
-    # Determine desired output dtype
-    out_dtype: torch.dtype | None = None
-    if out_dtype_proxy is not None:
-        assert isinstance(out_dtype_proxy, torch.dtype)
-        out_dtype = out_dtype_proxy
-    elif acc_proxy is not None and isinstance(acc_proxy, FakeTensor):
-        out_dtype = acc_proxy.dtype
-
-    return _emit_pallas_matmul(
-        lhs_ast,
-        rhs_ast,
-        acc=acc,
-        need_f32_acc=need_f32_acc,
-        out_dtype=out_dtype,
-        lhs_ndim=lhs_proxy.ndim,
-    )
-
-
 @_decorators.ref(dot)
 def _(
     mat1: torch.Tensor,
@@ -1065,3 +1025,11 @@ def _(
     if acc is not None:
         return acc + result
     return result
+
+
+# ---------------------------------------------------------------------------
+# Backend-specific codegens for these ops live in per-backend modules under
+# helion/_compiler/<backend>/.  Import them here (at module import time) so the
+# @_decorators.codegen(op, "<backend>") registrations run with the same eager
+# timing as when the bodies lived in this file -- no behavior change.
+import helion._compiler.pallas.matmul_ops  # noqa: E402, F401
