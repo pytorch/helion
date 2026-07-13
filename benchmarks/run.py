@@ -2076,6 +2076,38 @@ def main() -> None:
         assert args.kernel, (
             "--op or --kernel must be specified with --list-impls-for-benchmark-ci"
         )
+
+        # On TPU only a subset of implementations run: Helion (Pallas), the
+        # eager (torch/aten) baseline, and torch.compile. Triton/CUDA-specific
+        # kernels (triton_*, liger_*, mamba_ssm, flash-linear-attention,
+        # cutlass/quack, ...) do not run on TPU. When --device tpu is requested,
+        # filter to the runnable families so Benchmark CI doesn't select impls
+        # that would crash. This is a positive allowlist of TPU-capable
+        # execution modes -- new GPU-only backends are excluded by default;
+        # extend the tuple only when a genuinely new TPU-runnable execution mode
+        # is added.
+        tpu = "tpu" in {
+            tritonbench_args[i + 1]
+            for i, tok in enumerate(tritonbench_args)
+            if tok == "--device" and i + 1 < len(tritonbench_args)
+        } or any(tok == "--device=tpu" for tok in tritonbench_args)
+        tpu_runnable_prefixes = (
+            "helion",  # Pallas
+            "torch",  # torch eager (torch_*) + torch.compile (torch_compile_*)
+            "aten",  # aten eager baseline
+            "naive",  # naive eager baseline (e.g. naive_softmax)
+            "eager",  # eager_* baseline
+            "sdpa",  # torch SDPA baseline
+            "pt2",  # torch.compile (pt2_*)
+            "compile",  # torch.compile variant
+            # The entries below are full impl-name prefixes (not execution-mode
+            # families) for baselines/refs that don't start with a mode token.
+            "llama_rms",  # rms_norm eager baseline
+            "cross_entropy_loss",  # cross_entropy eager baseline
+            "preprocessed_eager",  # int4_gemm eager baseline
+            "preprocessed_torch",  # int4_gemm torch.compile ref (NOT _triton)
+        )
+
         # List implementations for specified kernels to be run on Benchmark CI
         kernel_names = [k.strip() for k in args.kernel.split(",")]
         for kernel in kernel_names:
@@ -2097,8 +2129,32 @@ def main() -> None:
                     impl_name = metric_key[: -len("-speedup")]
                     implementations.append(impl_name)
 
+            if tpu:
+                implementations = [
+                    impl
+                    for impl in implementations
+                    if impl.startswith(tpu_runnable_prefixes)
+                ]
+                # A GPU-only baseline (e.g. fp8_attention's triton baseline)
+                # cannot anchor a TPU run; skip the kernel rather than emit an
+                # impl set that would crash.
+                if baseline_impl and not baseline_impl.startswith(
+                    tpu_runnable_prefixes
+                ):
+                    print(
+                        f"Warning: {kernel} baseline '{baseline_impl}' does not run "
+                        f"on TPU; skipping.",
+                        file=sys.stderr,
+                    )
+                    continue
+
             implementations = sorted(implementations)
-            assert implementations, f"No implementations found for kernel: {kernel}"
+            if not implementations:
+                msg = f"No implementations found for kernel: {kernel}"
+                if tpu:
+                    print(f"Warning: {msg} on TPU, skipping...", file=sys.stderr)
+                    continue
+                raise AssertionError(msg)
             print(
                 f"{kernel}: impls={','.join(implementations)} baseline={baseline_impl}"
             )

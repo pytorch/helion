@@ -1261,6 +1261,119 @@ class DeviceIR:
             )
         )
 
+    def build_pointwise_facts(self) -> None:
+        """Phase 5: record one ``PointwiseElementwiseFact`` for a PURE elementwise kernel.
+        Disjointness rule: if any reduction / matmul / accumulator fact fired, the kernel belongs
+        to that family and gets NO pointwise fact (the fact's meaning IS their absence). Derived
+        from the walker ``memory_op_facts`` + block-size specs, plus one graph walk for the widest
+        compute dtype and the SFU op count. Runs last, after the other facts exist."""
+        env = CompileEnvironment.current()
+        spec = env.config_spec
+        from ..autotuner.config_spec import PointwiseElementwiseFact
+
+        if spec.reduction_facts or spec.matmul_facts or spec.accumulator_facts:
+            return
+        if not spec.memory_op_facts or not spec.block_sizes:
+            return
+        # The static problem element count = product of the tiled block dims' size_hints (the
+        # per-dim extents the seed needs for the tile distribution are read live off block_sizes).
+        total_numel = 1
+        for block_size in spec.block_sizes:
+            total_numel *= block_size.size_hint
+        # Guard a 0-extent (empty) problem: a 0 hint would make the slab fold below divide by zero.
+        total_numel = max(1, total_numel)
+        # Widest COMPUTE dtype (register-resident width): a memory op knows only its STORAGE dtype,
+        # but the math promotes to fp32, which sets register pressure. Max itemsize over every
+        # tensor-valued node in one graph walk (a hl.split val is a tuple of tensors, so recurse).
+
+        def _val_itemsizes(val: object) -> list[int]:
+            if isinstance(val, torch.Tensor):
+                return [val.dtype.itemsize]
+            if isinstance(val, (list, tuple)):
+                return [s for v in val for s in _val_itemsizes(v)]
+            return []
+
+        # SFU (transcendental) op count — the num_warps signal, counted in the same graph walk. SFU
+        # ops run on a distinct, low-throughput unit (~4 SFUs vs ~128 FP32 lanes/SM), so a
+        # transcendental-heavy tile is latency-bound and wants more warps; an all-FMA tile of the same
+        # op count is not. That is why SFU count, not total op count, is the key.
+        _SFU_OPS = frozenset(
+            {
+                "sin",
+                "cos",
+                "tan",
+                "tanh",
+                "asin",
+                "acos",
+                "atan",
+                "sinh",
+                "cosh",
+                "atanh",
+                "asinh",
+                "acosh",
+                "exp",
+                "exp2",
+                "expm1",
+                "log",
+                "log2",
+                "log10",
+                "log1p",
+                "sqrt",
+                "rsqrt",
+                "sigmoid",
+                "erf",
+                "erfc",
+                "pow",
+                "reciprocal",
+            }
+        )
+        compute_itemsize = 1
+        sfu_ops = 0
+        for graph_info in self.graphs:
+            for node in graph_info.graph.nodes:
+                for size in _val_itemsizes(node.meta.get("val")):
+                    compute_itemsize = max(compute_itemsize, size)
+                if node.op == "call_function":
+                    base = getattr(node.target, "__name__", str(node.target)).split(
+                        "."
+                    )[0]
+                    if base in _SFU_OPS:
+                        sfu_ops += 1
+
+        # slab_numel = sum over FULL-EXTENT load/store ops (accessed_numel >= total_numel) of the
+        # untiled elements each drags per tiled element, accessed_numel // total_numel. Flat kernel:
+        # every quotient is 1 (slab_numel = op count); rope: heads*head_dim. The seed scales it by
+        # storage_itemsize (max storage width) for bandwidth and compute_itemsize (fp32) for registers.
+        # A BROADCAST operand (bias[N], [M,1], stride-0) has accessed_numel < total_numel → excluded.
+        # contig = TILED block-ids that are the stride-1 axis of some full-extent op (from each op's
+        # subscript_strides, no graph walk): a coalesced tile must give width to a stride-1 axis. Row-
+        # major → the last block dim (byte-identical); transposed/strided → a different dim (or >1, a
+        # load-vs-store conflict) that the seed roots the wide tile on instead of pinning to width 1.
+        tiled_ids = {bs.block_id for bs in spec.block_sizes}
+        contig: set[int] = set()
+        slab_numel = 0
+        storage_itemsize = 1
+        for memfact in spec.memory_op_facts:
+            if memfact.dtype is None or memfact.accessed_numel < total_numel:
+                continue
+            slab_numel += memfact.accessed_numel // total_numel
+            storage_itemsize = max(storage_itemsize, memfact.dtype.itemsize)
+            for bid, stride in zip(
+                memfact.subscript_block_ids, memfact.subscript_strides, strict=True
+            ):
+                if bid is not None and stride == 1 and bid in tiled_ids:
+                    contig.add(bid)
+        spec.pointwise_facts.append(
+            PointwiseElementwiseFact(
+                total_numel=total_numel,
+                slab_numel=slab_numel,
+                storage_itemsize=storage_itemsize,
+                compute_itemsize=compute_itemsize,
+                contig_block_ids=tuple(sorted(contig)),
+                sfu_ops=sfu_ops,
+            )
+        )
+
     def build_accumulator_facts(self) -> list[AccumulatorFact]:
         """One ``AccumulatorFact`` per loop-carried tensor accumulator in any loop —
         reduction-AGNOSTIC, so it is built independently of (and before) the reduction
@@ -2976,8 +3089,22 @@ def _collect_memory_op_facts(
             # block-id (the faithful axis key). inner_extent: inner-dim extent.
             indexed_block_ids: tuple[int | None, ...] = ()
             subscript_block_ids: tuple[int | None, ...] = ()
+            subscript_strides: tuple[int, ...] = ()
             inner_extent: int | None = None
+            accessed_numel = 0
             if fake is not None:
+                # Distinct HBM elements the op touches = product of size-hinted shape dims over
+                # NON-broadcast dims (stride != 0). A stride-0 dim (an .expand()/broadcast — full
+                # SIZE but one underlying element, e.g. bias[N].expand_as(x) or a broadcast_tensors
+                # operand) contributes factor 1, so an expanded broadcast is NOT mistaken for
+                # full-extent traffic. size_hint (not int()) avoids specializing a SymInt dim. A
+                # broadcast operand thus has a strictly smaller numel than the problem numel — the
+                # faithful full-extent signal at any rank/stride (see MemoryOpFact.accessed_numel).
+                accessed_numel = 1
+                fake_strides = fake.stride()
+                for dim_index, dim_size in enumerate(fake.shape):
+                    if fake_strides[dim_index] != 0:
+                        accessed_numel *= env.size_hint(dim_size)
                 index_list = node.args[1] if len(node.args) >= 2 else None
                 if isinstance(index_list, (list, tuple)):
                     # same positions for both tuples so [-1] aligns (drop bare-int / OOB)
@@ -2991,6 +3118,16 @@ def _collect_memory_op_facts(
                     )
                     subscript_block_ids = tuple(
                         _subscript_block_id(env, index_list[pos]) for pos in positions
+                    )
+                    # Element stride of the accessed tensor along each subscripted axis, aligned
+                    # 1:1 with subscript_block_ids (same `positions`). Raw provenance from the fake
+                    # tensor's .stride(); a stride-1 position is the contiguous/coalescing axis (the
+                    # last subscript for a row-major tensor, a DIFFERENT one for a transposed view).
+                    # size_hint (not int()) avoids specializing a SymInt stride to a constant: a
+                    # contiguous axis is a concrete 1, and a symbolic (outer) stride hints > 1 anyway,
+                    # so the stride==1 contiguity test is unaffected while dynamic shapes stay dynamic.
+                    subscript_strides = tuple(
+                        env.size_hint(fake_strides[pos]) for pos in positions
                     )
                 if fake.ndim >= 2:
                     # size_hint (not int()): int() would guard a SymInt inner dim to a
@@ -3016,6 +3153,8 @@ def _collect_memory_op_facts(
                         indexed_block_ids=indexed_block_ids,
                         inner_extent=inner_extent,
                         subscript_block_ids=subscript_block_ids,
+                        subscript_strides=subscript_strides,
+                        accessed_numel=accessed_numel,
                     ),
                 )
             )
@@ -3339,6 +3478,10 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
         # Phase 4: compose a matmul + reduction-over-output epilogue fact when a matmul AND a
         # register-resident epilogue reduction co-occur (matmul_rms_norm etc.).
         device_ir.build_matmul_reduction_epilogue_facts()
+        # Phase 5: record a PointwiseElementwiseFact for a PURE elementwise kernel (no
+        # reduction/matmul/accumulator fact) so the pointwise seed can size a BW-saturating
+        # tile instead of the starved block_size=32 default.
+        device_ir.build_pointwise_facts()
 
         return device_ir
 

@@ -1431,6 +1431,52 @@ class TestIndexing(RefEagerTestBase, TestCase):
         expected = torch.sum(x, dim=1)
         torch.testing.assert_close(result, expected)
 
+    @onlyBackends(["triton"])
+    @skipUnlessTensorDescriptor("TensorDescriptor not supported")
+    @skipIfTileIR("block-size overshoot is gated to the triton backend")
+    def test_tensor_descriptor_rejects_overshoot_dynamic_dim(self):
+        # Matmul block-size overshoot lets the autotuner pick an M/N block
+        # larger than a small dimension. When that dimension is dynamic (here M
+        # is left unspecialized) the static block_size > dim_size guard cannot
+        # fire, so without the symbolic-dim hint check the overshooting block
+        # would ride onto the TMA path and build a descriptor with
+        # boxDim > tensorDim -- an invalid TMA descriptor that crashes at
+        # runtime with a misaligned-address error. The overshooting dimension
+        # must instead fall back to pointer indexing.
+        @helion.kernel(static_shapes=False)
+        def matmul(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+            m, k = a.shape
+            k2, n = b.shape
+            hl.specialize(k)
+            hl.specialize(n)
+            out = torch.empty([m, n], dtype=torch.float32, device=a.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = hl.dot(a[tile_m, tile_k], b[tile_k, tile_n], acc=acc)
+                out[tile_m, tile_n] = acc
+            return out
+
+        # M=16 is dynamic; block_m=64 overshoots it.
+        a = torch.randn([16, 64], dtype=HALF_DTYPE, device=DEVICE)
+        b = torch.randn([64, 64], dtype=HALF_DTYPE, device=DEVICE)
+        code, result = code_and_output(
+            matmul,
+            (a, b),
+            block_sizes=[64, 64, 32],
+            indexing="tensor_descriptor",
+        )
+        torch.testing.assert_close(result, (a @ b).float(), atol=1e-1, rtol=1e-1)
+
+        # _BLOCK_SIZE_0 is the (overshooting) M tile; it must never appear inside
+        # a tensor-descriptor box. Non-overshooting tensors (e.g. b) may still
+        # use a descriptor.
+        descriptor_lines = [
+            line for line in code.splitlines() if "make_tensor_descriptor(" in line
+        ]
+        for line in descriptor_lines:
+            self.assertNotIn("_BLOCK_SIZE_0", line)
+
     def test_2d_slice_index(self):
         """Test both setter from scalar and getter for [:,i]"""
 

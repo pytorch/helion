@@ -54,6 +54,7 @@ class Config(Mapping[str, object]):
         atomic_indexing: IndexingLiteral | list[IndexingLiteral] | None = None,
         advanced_controls_file: str | None = None,
         epilogue_subtile: int | None = None,
+        xcd_remap: bool | None = None,
         # For user-defined properties
         **kwargs: object,
     ) -> None:
@@ -96,6 +97,10 @@ class Config(Mapping[str, object]):
             advanced_controls_file: Path to a PTXAS control file applied during compilation, or empty string for none.
             epilogue_subtile: Split factor for the epilogue (post-matmul pointwise + store) along
                 the N dimension. None = disabled (default), valid values are 2 or 4.
+            xcd_remap: AMD CDNA only. Remap program IDs into contiguous per-XCD regions to
+                improve L2 locality on multi-XCD GPUs (MI300/MI350). Supported for pid_type
+                "flat", "persistent_blocked", and "persistent_interleaved"; composes with
+                ``l2_groupings``.
             **kwargs: Additional user-defined configuration parameters.
         """
         self.config = {}
@@ -124,6 +129,7 @@ class Config(Mapping[str, object]):
             "maxnreg": maxnreg,
             "advanced_controls_file": advanced_controls_file,
             "epilogue_subtile": epilogue_subtile,
+            "xcd_remap": xcd_remap,
         }
         for key, value in core_props.items():
             if value is not None:
@@ -265,6 +271,10 @@ class Config(Mapping[str, object]):
     @property
     def pid_type(self) -> PidTypeLiteral:
         return cast("PidTypeLiteral", self.config.get("pid_type", "flat"))
+
+    @property
+    def xcd_remap(self) -> bool:
+        return cast("bool", self.config.get("xcd_remap", False))
 
     @property
     def num_sm_multiplier(self) -> int:

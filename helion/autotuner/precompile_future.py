@@ -173,10 +173,10 @@ def _run_kernel_in_subprocess_spawn(
         fn = _load_compiled_fn(fn_spec)
         args = load_trusted_kernel_args(args_path)
         assert isinstance(args, (tuple, list))
-        synchronize_device(None)
+        synchronize_device()
         with capture_output() as _cap:
-            result = fn(*args)
-        synchronize_device(result)
+            fn(*args)
+        synchronize_device()
         _write_result_file(result_path, {"status": "ok"})
     except Exception as exc:
         status = 1
