@@ -796,6 +796,29 @@ def cute_mixed_rank_batched_dot_tcgen05(
 
 
 @helion.kernel(backend="cute")
+def cute_transposed_operand_batched_dot_tcgen05(
+    x: torch.Tensor, y: torch.Tensor
+) -> torch.Tensor:
+    # A rank-3 hl.dot whose LHS operand is TRANSPOSED (a permute in the
+    # load->operand chain). _trace_to_load does not trace permutes, so
+    # _analyze_mma_operands bails and codegen cannot lower this as batched MMA.
+    # It is still rank-3, so it exercises the F2 guarantee: batched tcgen05
+    # search enablement is gated on the same structural analyzer codegen uses
+    # (can_codegen_cute_mma_dot), NOT on operand rank alone -- so this kernel
+    # must NOT shape the batched search surface.
+    b, k, m = x.size()
+    _, _, n = y.size()
+    out = torch.empty([b, m, n], dtype=torch.bfloat16, device=x.device)
+    for tile_b, tile_m, tile_n in hl.tile([b, m, n]):
+        acc = hl.zeros([tile_b, tile_m, tile_n], dtype=torch.float32)
+        for tile_k in hl.tile(k):
+            xt = x[tile_b, tile_k, tile_m].transpose(-1, -2)
+            acc = hl.dot(xt, y[tile_b, tile_k, tile_n], acc=acc)
+        out[tile_b, tile_m, tile_n] = acc.to(torch.bfloat16)
+    return out
+
+
+@helion.kernel(backend="cute")
 def cute_permute_transpose(x: torch.Tensor) -> torch.Tensor:
     m, n = x.size()
     out = torch.empty([m, n], dtype=x.dtype, device=x.device)
@@ -4566,6 +4589,34 @@ class TestCuteBackend(TestCase):
         torch.testing.assert_close(out.float(), expected, atol=1e-1, rtol=1e-2)
         self.assertIn("cute.gemm(", code)
         self.assertIn("CtaGroup.TWO", code)
+
+    def test_batched_dot_codegen_rejected_does_not_shape_search(self) -> None:
+        # F2 regression: batched tcgen05 search enablement for hl.dot must be
+        # gated on the SAME structural analyzer codegen uses
+        # (can_codegen_cute_mma_dot), not on operand rank alone. A rank-3 dot
+        # that codegen cannot lower (here: a transposed LHS operand) must NOT
+        # shape the batched search surface -- otherwise the autotuner tunes a
+        # config family for a kernel codegen later rejects. A clean batched dot
+        # of the same rank/shape stays enabled, proving the gate is structural,
+        # not rank-based.
+        support = get_cute_mma_support()
+        if not support.tcgen05_f16bf16:
+            self.skipTest("tcgen05 F16/BF16 MMA is not supported on this machine")
+
+        clean = (
+            torch.randn(4, 256, 64, device=DEVICE, dtype=HALF_DTYPE),
+            torch.randn(4, 64, 256, device=DEVICE, dtype=HALF_DTYPE),
+        )
+        rejected = (
+            torch.randn(4, 64, 256, device=DEVICE, dtype=HALF_DTYPE),
+            torch.randn(4, 64, 256, device=DEVICE, dtype=HALF_DTYPE),
+        )
+        with patch.dict(os.environ, {"HELION_CUTE_MMA_IMPL": "tcgen05"}, clear=False):
+            clean_bound = cute_batched_dot_tcgen05.bind(clean)
+            rejected_bound = cute_transposed_operand_batched_dot_tcgen05.bind(rejected)
+            # Same rank (3-D dot), opposite enablement -> the gate is structural.
+            self.assertTrue(clean_bound.config_spec.cute_tcgen05_search_enabled)
+            self.assertFalse(rejected_bound.config_spec.cute_tcgen05_search_enabled)
 
     def test_batched_two_cta_partial_edge_tiles_rejected(self) -> None:
         # A batched CtaGroup.TWO matmul with ANY partial tile -- M edge, N

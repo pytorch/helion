@@ -207,12 +207,15 @@ def _(
             )
 
     # Apply min-dot-size constraints so autotuner won't pick invalid block_size.
-    # A 3-D (batched) dot enables the batched tcgen05 search surface too, keyed
-    # on operand rank rather than the presence of an accumulator, so a plain
-    # batched ``hl.dot`` autotunes into cute.gemm like ``baddbmm`` does.
-    enforce_dot_requirements(
-        mat1, mat2, allow_batched_cute_tcgen05=mat1.ndim > 2 or mat2.ndim > 2
-    )
+    # Batched (3-D) tcgen05 search enablement is intentionally NOT decided here
+    # from operand rank alone: a rank-3 ``hl.dot`` whose operand structure the
+    # cute backend cannot lower (e.g. a non-leading batch or a live/transposed
+    # operand) would otherwise shape the batched autotune surface for a kernel
+    # codegen later rejects. The DeviceIR post-pass owns batched enablement and
+    # gates it on the same structural analyzer codegen uses
+    # (``can_codegen_cute_mma_dot``), so autotune and codegen stay in lockstep --
+    # matching how Aten mm/bmm/addmm/baddbmm are handled there.
+    enforce_dot_requirements(mat1, mat2)
 
     return (mat1, mat2, acc, out_dtype)
 

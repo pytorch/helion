@@ -3659,24 +3659,34 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
             else:
                 from ..language.matmul_ops import enforce_dot_requirements
                 from .cute.cute_mma import can_codegen_cute_mma_aten
+                from .cute.cute_mma import can_codegen_cute_mma_dot
 
                 # This post-pass ONLY enables the *batched* tcgen05 search
                 # surface -- at least one operand rank 3 (both <= 3): both-3D
-                # bmm/baddbmm and mixed-rank shared-weight forms
-                # ([B, M, K] @ [K, N]). A purely 2-D matmul (mm/addmm/dot)
-                # already enables tcgen05 during tracing with
-                # allow_batched=False; re-enforcing it here perturbs the
+                # bmm/baddbmm, mixed-rank shared-weight forms
+                # ([B, M, K] @ [K, N]), and batched ``hl.dot``. A purely 2-D
+                # matmul (mm/addmm/dot) already enables tcgen05 during tracing
+                # with allow_batched=False; re-enforcing it here perturbs the
                 # validated 2-D default config (flipping bk/l2_groupings/
                 # pid_type). The tracing path never passes allow_batched=True,
-                # so the batched enablement lives only here. addmm/baddbmm pass
+                # so the batched enablement lives only here.
+                #
+                # Enablement is keyed on operand *structure*, not op identity,
+                # and -- critically -- gated on the SAME structural analyzer
+                # codegen uses, so autotune never shapes the batched surface for
+                # a kernel codegen later rejects: Aten mm/bmm/addmm/baddbmm via
+                # ``can_codegen_cute_mma_aten``, and ``hl.dot`` via
+                # ``can_codegen_cute_mma_dot`` (hl.dot no longer enables batched
+                # from operand rank alone in matmul_ops.py). addmm/baddbmm pass
                 # (bias, lhs, rhs) as args 0/1/2; mm/bmm carry (lhs, rhs) at
-                # args 0/1 with no accumulator. Keyed on operand structure, not
-                # op identity.
+                # args 0/1 with no accumulator; hl.dot (matmul_ops.dot) carries
+                # (lhs, rhs, acc, out_dtype) at args 0/1.
                 for graph_info in device_ir.graphs:
                     for node in graph_info.graph.nodes:
                         if node.op != "call_function":
                             continue
-                        with_acc: bool
+                        is_dot = False
+                        with_acc = False
                         if node.target in (
                             torch.ops.aten.addmm.default,
                             torch.ops.aten.baddbmm.default,
@@ -3688,7 +3698,9 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
                             torch.ops.aten.bmm.default,
                         ):
                             lhs_arg, rhs_arg = node.args[0], node.args[1]
-                            with_acc = False
+                        elif getattr(node.target, "__name__", "") == "dot":
+                            lhs_arg, rhs_arg = node.args[0], node.args[1]
+                            is_dot = True
                         else:
                             continue
                         if not isinstance(lhs_arg, torch.fx.Node) or not isinstance(
@@ -3698,14 +3710,20 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
                             continue
                         lhs = lhs_arg.meta.get("val")
                         rhs = rhs_arg.meta.get("val")
-                        if (
+                        if not (
                             isinstance(lhs, torch.Tensor)
                             and isinstance(rhs, torch.Tensor)
                             and (lhs.ndim > 2 or rhs.ndim > 2)
                             and lhs.ndim <= 3
                             and rhs.ndim <= 3
-                            and can_codegen_cute_mma_aten(node, with_acc=with_acc)
                         ):
+                            continue
+                        codegen_ok = (
+                            can_codegen_cute_mma_dot(node)
+                            if is_dot
+                            else can_codegen_cute_mma_aten(node, with_acc=with_acc)
+                        )
+                        if codegen_ok:
                             enforce_dot_requirements(
                                 lhs,
                                 rhs,
