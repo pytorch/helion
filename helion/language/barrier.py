@@ -45,12 +45,6 @@ def _(origin: Origin, **kwargs: object) -> LiteralType:
     return BarrierResultType(origin=origin, value=None)
 
 
-@_decorators.codegen(barrier, "triton")
-def _(state: CodegenState) -> object:
-    # No device code emitted; barrier only affects host-side scheduling.
-    return expr_from_string("None")
-
-
 @_decorators.codegen(barrier, "cute")
 def _(state: CodegenState) -> object:
     # Marker only; persistent phase synchronization is still unsupported on CuTe.
@@ -61,3 +55,11 @@ def _(state: CodegenState) -> object:
 def _() -> None:
     # No-op in ref/interpret mode
     return None
+
+
+# ---------------------------------------------------------------------------
+# Backend-specific codegens for these ops live in per-backend modules under
+# helion/_compiler/<backend>/.  Import them here (at module import time) so the
+# @_decorators.codegen(op, "<backend>") registrations run with the same eager
+# timing as when the bodies lived in this file -- no behavior change.
+import helion._compiler.triton.barrier  # noqa: E402, F401

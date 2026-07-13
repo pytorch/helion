@@ -6,7 +6,6 @@ from typing import Sequence
 from typing import overload
 
 import torch
-from torch._inductor.utils import triton_type
 
 from .. import exc
 from .._compiler.ast_extension import create
@@ -148,65 +147,6 @@ def _(
     return torch.empty(broadcast_shape, dtype=dtypes[0], device=env.device)
 
 
-@_decorators.codegen(inline_asm_elementwise, "triton")
-def _(state: CodegenState) -> ast.AST | list[ast.AST]:
-    # Get arguments
-    asm_str = state.proxy_arg(0)
-    constraints_str = state.proxy_arg(1)
-    dtype = state.proxy_arg(3)
-    is_pure = state.proxy_arg(4)
-    pack = state.proxy_arg(5)
-
-    # Convert the list of tensor args to AST
-    # We need to create a proper list AST with the tensor elements
-    raw_args = state.ast_args[2]
-    if isinstance(raw_args, list):
-        # Create AST List node with the tensor elements
-        args_ast = create(ast.List, elts=raw_args, ctx=ast.Load())
-    else:
-        # If it's not a list, wrap it in a list (shouldn't normally happen)
-        args_ast = raw_args
-
-    # Convert dtype to Triton type string(s)
-    if isinstance(dtype, (tuple, list)):
-        dtype_strs = [triton_type(dt) for dt in dtype if isinstance(dt, torch.dtype)]
-        dtype_arg = f"({', '.join(dtype_strs)})"  # Use tuple syntax for multiple dtypes
-        has_multiple_outputs = True
-    else:
-        dtype_arg = (
-            triton_type(dtype) if isinstance(dtype, torch.dtype) else "tl.float32"
-        )
-        has_multiple_outputs = False
-
-    # Create the call to tl.inline_asm_elementwise
-    inline_asm_call = create(
-        ast.Call,
-        func=expr_from_string("tl.inline_asm_elementwise"),
-        args=[
-            create(ast.Constant, value=asm_str),
-            create(ast.Constant, value=constraints_str),
-            args_ast,
-            expr_from_string(dtype_arg),
-            create(ast.Constant, value=is_pure),
-            create(ast.Constant, value=pack),
-        ],
-        keywords=[],
-    )
-
-    # Handle multiple outputs by creating getitem expressions
-    if has_multiple_outputs:
-        assert isinstance(dtype, (tuple, list))  # Type guard for len()
-        num_outputs = len(dtype)
-        return [
-            expr_from_string(
-                f"{{inline_asm_result}}[{i}]", inline_asm_result=inline_asm_call
-            )
-            for i in range(num_outputs)
-        ]
-
-    return inline_asm_call
-
-
 @_decorators.codegen(inline_asm_elementwise, "cute")
 def _(state: CodegenState) -> ast.AST | list[ast.AST]:
     asm_str = state.proxy_arg(0)
@@ -281,3 +221,11 @@ def _(state: CodegenState) -> ast.AST | list[ast.AST]:
         ]
 
     return inline_asm_call
+
+
+# ---------------------------------------------------------------------------
+# Backend-specific codegens for these ops live in per-backend modules under
+# helion/_compiler/<backend>/.  Import them here (at module import time) so the
+# @_decorators.codegen(op, "<backend>") registrations run with the same eager
+# timing as when the bodies lived in this file -- no behavior change.
+import helion._compiler.triton.inline_asm_ops  # noqa: E402, F401

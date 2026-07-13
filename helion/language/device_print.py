@@ -67,31 +67,6 @@ def _(*args: object, origin: Origin, **kwargs: object) -> TypeInfo:
     return NoType(origin)
 
 
-@_decorators.codegen(device_print, "triton")
-def _(state: CodegenState) -> None:
-    prefix = state.proxy_arg(0)
-    call_args: list[ast.AST] = [create(ast.Constant, value=prefix)]
-
-    # Handle varargs
-    if len(state.proxy_args) > 1:
-        assert len(state.ast_args) > 1
-        # varargs are wrapped in a tuple, extract the elements
-        ast_varargs = state.ast_args[1]
-        assert isinstance(ast_varargs, (tuple, list)), (
-            f"Expected tuple for varargs, got {type(ast_varargs)}"
-        )
-        call_args.extend(ast_varargs[0])
-
-    call_expr = create(
-        ast.Call,
-        func=expr_from_string("tl.device_print"),
-        args=call_args,
-        keywords=[],
-    )
-    stmt = create(ast.Expr, value=call_expr)
-    state.add_statement(stmt)
-
-
 @_decorators.codegen(device_print, "cute")
 def _(state: CodegenState) -> None:
     prefix = state.proxy_arg(0)
@@ -121,3 +96,11 @@ def _(state: CodegenState) -> None:
 @_decorators.ref(device_print)
 def _(prefix: str, *values: object) -> None:
     print(prefix, *values)
+
+
+# ---------------------------------------------------------------------------
+# Backend-specific codegens for these ops live in per-backend modules under
+# helion/_compiler/<backend>/.  Import them here (at module import time) so the
+# @_decorators.codegen(op, "<backend>") registrations run with the same eager
+# timing as when the bodies lived in this file -- no behavior change.
+import helion._compiler.triton.device_print  # noqa: E402, F401
