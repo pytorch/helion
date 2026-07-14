@@ -144,72 +144,73 @@ def build_key_fn(
       tensor (the fused path bypasses ``default_launcher``'s direct-launch key
       where alignment is otherwise guarded) and always builds a key.
 
-    The returned lambda encodes, per position, ``type(arg)`` and -- for a tensor
-    -- dtype/shape/stride/device and (frozenset-normalized) dynamo static
-    indices, for a scalar its value, and finally the user ``key=`` result.
-    Compiling one flat expression (as Triton's ``binder`` does) is markedly
-    faster on the hot path than a generic per-call loop for many-argument
-    kernels.
+    The returned lambda encodes one layout token plus, per tensor,
+    dtype/shape/stride/device and (frozenset-normalized) dynamo static indices,
+    per scalar its value, and finally the user ``key=`` result. Compiling one
+    flat expression (as Triton's ``binder`` does) is markedly faster on the hot
+    path than a generic per-call loop for many-argument kernels.
 
     Layout safety: every position first checks ``a[i].__class__ is <C>`` for the
     sampled class ``C`` and calls ``_raise()`` (-> :class:`_LayoutChanged`) on a
     mismatch.  So a call whose layout differs -- e.g. a tensor where the sample
     had ``None`` or a scalar -- always raises rather than silently emitting a
     truncated (collision-prone) key; the caller rebuilds for the new layout.  The
-    guard is what makes the class marker load-bearing: without it a baked
-    None/scalar position would emit only ``__class__`` for an arriving tensor and
-    two different tensors would collide.
+    layout token is what prevents keys from different baked layouts from
+    colliding in the shared recipe cache.
     """
     # A guard for every position (including bail positions), so a builder that
     # bails to None for *this* layout still raises _LayoutChanged -- and is
     # rebuilt -- when a later call's layout differs.  Otherwise a cached bail
     # lambda would wrongly return None for every future layout.  The leading
     # guard checks the arg *count*, so a differing length (which would otherwise
-    # IndexError or silently drop trailing args) also forces a rebuild.  It seeds
-    # both ``parts`` (evaluated on the normal key path) and ``guards`` (the bail
-    # path), contributing a constant leading element to every key.
+    # IndexError or silently drop trailing args) also forces a rebuild.
+    #
+    # The key carries one prebuilt layout token instead of emitting each class
+    # guard into the tuple. The guards still make layout changes rebuild the
+    # key function, while the token prevents keys from different layouts from
+    # colliding in the shared recipe cache.
     len_guard = f"(len(a) == {len(args)} or _raise())"
-    parts: list[str] = [len_guard]
+    parts: list[str] = []
     guards: list[str] = [len_guard]
     namespace: dict[str, object] = {
         "_fs": lambda si: None if si is None else frozenset(si),
+        "_layout": object(),
         "_raise": _raise,
     }
     has_tensor = False
     bail = False
     for i, a in enumerate(args):
         t = type(a)
-        # Per-position layout guard: emits the arg's class (so e.g. int vs bool,
-        # which compare/hash equal by value, stay distinct in the key) and raises
-        # _LayoutChanged on a class mismatch -- so a differing type at this
-        # position forces a rebuild instead of silently emitting a truncated
-        # (collision-prone) key.
+        # Per-position layout guard: raises _LayoutChanged on a class mismatch,
+        # so a differing type at this position forces a rebuild instead of
+        # silently emitting a truncated (collision-prone) key.
         namespace[f"_C{i}"] = t
-        guard = f"(_C{i} if a[{i}].__class__ is _C{i} else _raise())"
+        guard = f"(a[{i}].__class__ is _C{i} or _raise())"
         guards.append(guard)
         if t is torch.Tensor or t is torch.nn.Parameter:
             has_tensor = True
             # frozenset(...) keeps a set/list _dynamo_static_indices hashable.
             align = f", not a[{i}].data_ptr() & 15" if include_alignment else ""
             parts.append(
-                f"{guard}, a[{i}].dtype, a[{i}].shape, a[{i}].stride(), "
+                f"a[{i}].dtype, a[{i}].shape, a[{i}].stride(), "
                 f"a[{i}].device, _fs(getattr(a[{i}], '_dynamo_static_indices', None))"
                 f"{align}"
             )
         elif t is int or t is float or t is bool or t is str:
-            parts.append(f"{guard}, a[{i}]")
+            parts.append(f"a[{i}]")
         elif a is None:
-            parts.append(guard)
+            pass
         elif t is torch.dtype or t is torch.device:  # value is its own key
-            parts.append(f"{guard}, a[{i}]")
+            parts.append(f"a[{i}]")
         else:
             # Unhandled arg type (container, tensor subclass, ...): the caller
             # takes the slow path (fast) / skips fusion (fused) via a None key.
             bail = True
     if bail or (bail_when_no_tensor and not has_tensor):
         # Evaluate every guard (so a layout change raises) then yield None.
-        return eval(f"lambda a: ({', '.join(guards)},) and None", namespace)
-    meta = f"({', '.join(parts)},)"
+        return eval(f"lambda a: ({' and '.join(guards)}) and None", namespace)
+    meta_parts = ["_layout", *parts]
+    meta = f"(({' and '.join(guards)}) and ({', '.join(meta_parts)},))"
     if user_key_fn is not None:
         namespace["_kf"] = user_key_fn
         return eval(f"lambda a: ({meta}, _kf(*a))", namespace)
