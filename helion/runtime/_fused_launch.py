@@ -111,6 +111,18 @@ def _triton_direct_launch_ok(triton_kernel: object) -> bool:
     return not knobs.compilation.instrumentation_mode
 
 
+_BLOCK_SIZE_GLOBAL_PREFIX = "_BLOCK_SIZE_"
+
+
+def _is_helion_block_size_global(name: object) -> bool:
+    """True for Helion-generated block-size globals safe to trust after compile."""
+    return (
+        type(name) is str
+        and name.startswith(_BLOCK_SIZE_GLOBAL_PREFIX)
+        and name[len(_BLOCK_SIZE_GLOBAL_PREFIX) :].isdigit()
+    )
+
+
 # Raised by a baked key builder when the call's argument *layout* differs from
 # the sample it was compiled for (a differing type at some position); the caller
 # catches it and rebuilds the builder for the new layout.  This is the single
@@ -445,6 +457,15 @@ def fused_prime(kernel: Kernel, bound: BoundKernel, args: tuple[object, ...]) ->
 
     # Resolve each launcher arg to an input-tensor index or a baked constant.
     arg_parts: list[str] = []
+    direct_arg_parts: list[str] = []
+    tensor_direct_arg_parts: list[str] = []
+    tensor_arg_names: dict[int, str] = {}
+    tensor_direct_params: list[str] = []
+    for i, a in enumerate(args):
+        ta = type(a)
+        if ta is torch.Tensor or ta is torch.nn.Parameter:
+            tensor_arg_names[i] = f"a{len(tensor_direct_params)}"
+            tensor_direct_params.append(tensor_arg_names[i])
     namespace: dict[str, object] = {}
     for j, a in enumerate(captured["largs"]):
         ta = type(a)
@@ -454,9 +475,13 @@ def fused_prime(kernel: Kernel, bound: BoundKernel, args: tuple[object, ...]) ->
             if i is None:
                 return _disable(kernel, result)
             arg_parts.append(f"a[{i}]")
+            direct_arg_parts.append(f"a{i}")
+            tensor_direct_arg_parts.append(tensor_arg_names[i])
         elif ta is int or ta is float or ta is bool or a is None:
             namespace[f"_c{j}"] = a
             arg_parts.append(f"_c{j}")
+            direct_arg_parts.append(f"_c{j}")
+            tensor_direct_arg_parts.append(f"_c{j}")
         else:
             return _disable(kernel, result)
 
@@ -470,8 +495,25 @@ def fused_prime(kernel: Kernel, bound: BoundKernel, args: tuple[object, ...]) ->
     namespace["_pm"] = compiled.packed_metadata
     namespace["_compiled"] = compiled  # keep alive so _run/_fn stay valid
     # pyrefly: ignore [missing-attribute]
-    namespace["_active"] = _triton_driver().active
+    active = _triton_driver().active
+    namespace["_active"] = active
     namespace["_Changed"] = GlobalsChanged
+
+    launch_device: int | None = None
+    for a in args:
+        ta = type(a)
+        if ta is torch.Tensor or ta is torch.nn.Parameter:
+            # pyrefly: ignore [missing-attribute]
+            launch_device = a.device.index
+            break
+    if launch_device is not None:
+        namespace["_stream"] = active.get_current_stream
+        namespace["_dev"] = launch_device
+        stream_expr = "_stream(_dev)"
+    else:
+        namespace["_get_stream"] = active.get_current_stream
+        namespace["_get_dev"] = active.get_current_device
+        stream_expr = "_get_stream(_get_dev())"
 
     # Inline captured-globals verification: a mutated OR deleted global compares
     # unequal (deletion reads the _MISSING sentinel via .get), raising
@@ -479,10 +521,12 @@ def fused_prime(kernel: Kernel, bound: BoundKernel, args: tuple[object, ...]) ->
     # raises Triton's own error).
     namespace["_MISSING"] = _MISSING_GLOBAL
     guard_conds: list[str] = []
+    trusted_no_guard = True
     for gi, ((name, _), (val, gdict)) in enumerate(
         # pyrefly: ignore [missing-attribute]
         triton_kernel.used_global_vals.items()
     ):
+        trusted_no_guard = trusted_no_guard and _is_helion_block_size_global(name)
         namespace[f"_g{gi}"] = gdict
         namespace[f"_gv{gi}"] = val
         guard_conds.append(f"_g{gi}.get({name!r}, _MISSING) != _gv{gi}")
@@ -495,12 +539,75 @@ def fused_prime(kernel: Kernel, bound: BoundKernel, args: tuple[object, ...]) ->
         "def _launch(a):\n"
         f"{guard}"
         "    _run(_gx, _gy, _gz, "
-        "_active.get_current_stream(_active.get_current_device()), "
+        f"{stream_expr}, "
         "_fn, _pm, None, None, None"
         f"{', ' + launch_args if launch_args else ''})\n"
     )
     exec(src, namespace)
     launch = cast("Callable[[tuple[object, ...]], None]", namespace["_launch"])
+    direct_params = ", ".join(f"a{i}" for i in range(len(args)))
+    direct_launch_args = ", ".join(direct_arg_parts)
+    direct_src = (
+        f"def _direct_launch({direct_params}):\n"
+        f"{guard}"
+        "    _run(_gx, _gy, _gz, "
+        f"{stream_expr}, "
+        "_fn, _pm, None, None, None"
+        f"{', ' + direct_launch_args if direct_launch_args else ''})\n"
+    )
+    exec(direct_src, namespace)
+    direct_launch = namespace["_direct_launch"]
+    launch._helion_direct_launch = direct_launch  # type: ignore[attr-defined]
+    trusted_direct_launch = direct_launch
+    if trusted_no_guard and guard:
+        trusted_direct_src = (
+            f"def _trusted_direct_launch({direct_params}):\n"
+            "    _run(_gx, _gy, _gz, "
+            f"{stream_expr}, "
+            "_fn, _pm, None, None, None"
+            f"{', ' + direct_launch_args if direct_launch_args else ''})\n"
+        )
+        exec(trusted_direct_src, namespace)
+        trusted_direct_launch = namespace["_trusted_direct_launch"]
+        launch._helion_trusted_direct_launch = trusted_direct_launch  # type: ignore[attr-defined]
+    elif trusted_no_guard:
+        launch._helion_trusted_direct_launch = direct_launch  # type: ignore[attr-defined]
+    tensor_direct_src = (
+        f"def _tensor_direct_launch({', '.join(tensor_direct_params)}):\n"
+        f"{guard}"
+        "    _run(_gx, _gy, _gz, "
+        f"{stream_expr}, "
+        "_fn, _pm, None, None, None"
+        f"{', ' + ', '.join(tensor_direct_arg_parts) if tensor_direct_arg_parts else ''})\n"
+    )
+    exec(tensor_direct_src, namespace)
+    direct_launch._helion_tensor_direct_launch = namespace[  # type: ignore[attr-defined]
+        "_tensor_direct_launch"
+    ]
+    launch._helion_tensor_direct_launch = namespace[  # type: ignore[attr-defined]
+        "_tensor_direct_launch"
+    ]
+    if trusted_no_guard:
+        trusted_tensor_direct_launch = namespace["_tensor_direct_launch"]
+        if guard:
+            trusted_tensor_direct_src = (
+                f"def _trusted_tensor_direct_launch({', '.join(tensor_direct_params)}):\n"
+                "    _run(_gx, _gy, _gz, "
+                f"{stream_expr}, "
+                "_fn, _pm, None, None, None"
+                f"{', ' + ', '.join(tensor_direct_arg_parts) if tensor_direct_arg_parts else ''})\n"
+            )
+            exec(trusted_tensor_direct_src, namespace)
+            trusted_tensor_direct_launch = namespace["_trusted_tensor_direct_launch"]
+        direct_launch._helion_trusted_tensor_direct_launch = (  # type: ignore[attr-defined]
+            trusted_tensor_direct_launch
+        )
+        trusted_direct_launch._helion_trusted_tensor_direct_launch = (  # type: ignore[attr-defined]
+            trusted_tensor_direct_launch
+        )
+        launch._helion_trusted_tensor_direct_launch = (  # type: ignore[attr-defined]
+            trusted_tensor_direct_launch
+        )
 
     # Key on the same per-call, type-dispatched key the hot path uses.  It is
     # strictly finer than the specialization key (includes exact metadata,
