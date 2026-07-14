@@ -4,14 +4,12 @@ import inspect
 from typing import TYPE_CHECKING
 
 from .. import exc
-from .._compiler.ast_extension import expr_from_string
 from .._compiler.compile_environment import CompileEnvironment
 from .._compiler.type_info import BarrierResultType
 from .._compiler.type_info import LiteralType
 from . import _decorators
 
 if TYPE_CHECKING:
-    from .._compiler.inductor_lowering import CodegenState
     from .._compiler.variable_origin import Origin
 
 __all__ = ["barrier"]
@@ -45,12 +43,6 @@ def _(origin: Origin, **kwargs: object) -> LiteralType:
     return BarrierResultType(origin=origin, value=None)
 
 
-@_decorators.codegen(barrier, "cute")
-def _(state: CodegenState) -> object:
-    # Marker only; persistent phase synchronization is still unsupported on CuTe.
-    return expr_from_string("None")
-
-
 @_decorators.ref(barrier)
 def _() -> None:
     # No-op in ref/interpret mode
@@ -62,4 +54,5 @@ def _() -> None:
 # helion/_compiler/<backend>/.  Import them here (at module import time) so the
 # @_decorators.codegen(op, "<backend>") registrations run with the same eager
 # timing as when the bodies lived in this file -- no behavior change.
+import helion._compiler.cute.barrier  # noqa: E402, F401
 import helion._compiler.triton.barrier  # noqa: E402, F401

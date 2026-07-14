@@ -136,32 +136,6 @@ def _(state: CodegenState) -> ast.AST:
     return expr_from_string(state.codegen.offset_var(index))
 
 
-@_decorators.codegen(tile_begin, "cute")
-def _(state: CodegenState) -> ast.AST:
-    index = _disable_flatten_get_tile(state.proxy_arg(0), state)
-    global_index = state.codegen.index_var(index)
-
-    thread_axis = None
-    loops = state.codegen.active_device_loops.get(index)
-    if loops:
-        thread_axis = loops[-1].block_thread_axes.get(index)
-    if thread_axis is None:
-        grid_state = state.codegen.current_grid_state
-        if grid_state is not None:
-            thread_axis = grid_state.block_thread_axes.get(index)
-    if thread_axis is None:
-        return expr_from_string(state.codegen.offset_var(index))
-
-    from .._compiler.cute.cute_reshape import _grid_local_coord_expr
-
-    local_coord = _grid_local_coord_expr(state.codegen, index, thread_axis)
-    return state.codegen.lift(
-        expr_from_string(f"({global_index}) - ({local_coord})"),
-        dce=True,
-        prefix="tile_begin",
-    )
-
-
 @_decorators.ref(tile_begin)
 def _(tile: RefTile) -> int:
     return tile._slice.start
@@ -322,3 +296,11 @@ def _(state: CodegenState) -> ast.AST:
 @_decorators.ref(tile_id)
 def _(tile: RefTile) -> int:
     return tile._slice.start // tile._block_size
+
+
+# ---------------------------------------------------------------------------
+# Backend-specific codegens for these ops live in per-backend modules under
+# helion/_compiler/<backend>/.  Import them here (at module import time) so the
+# @_decorators.codegen(op, "<backend>") registrations run with the same eager
+# timing as when the bodies lived in this file -- no behavior change.
+import helion._compiler.cute.tile_ops  # noqa: E402, F401
