@@ -546,21 +546,34 @@ def chunk_fwd_o_helion(
 
 @helion.kernel()
 def chunk_bwd_dh_diag_fused(
-    q_scaled: torch.Tensor,
+    q: torch.Tensor,
     do: torch.Tensor,
     g_last: torch.Tensor,
     dh_init: torch.Tensor,
+    gc: torch.Tensor | None = None,
     use_g: hl.constexpr = True,  # pyrefly: ignore[bad-function-definition]
+    scalar_decay: hl.constexpr = False,  # pyrefly: ignore[bad-function-definition]
     scale: float = 1.0,
 ) -> torch.Tensor:
-    """Fused state gradient propagation over N chunks in reverse (diagonal decay).
+    """Fused state gradient propagation over N chunks in reverse.
 
-    Tiles [BH, D, DV] to parallelize over both key and value dimensions. On the
-    no-decay path q is unscaled, so scale folds into the q-row term here.
+    Tiles [BH, D, DV] to parallelize over both key and value dimensions. Three
+    compile-time decay modes (specialized, no runtime branch):
+      - use_g=False:        no decay; q is unscaled so scale folds into the q-row.
+      - diagonal (default): q is pre-scaled by exp(gc); g_last is a per-channel
+        [BH, N, D] state decay applied as dh_acc * exp(g_last).
+      - scalar_decay=True:  q is raw and gc [BH, N, C] scales it in-kernel;
+        g_last is a scalar [BH, N] state decay. With g in natural-log space:
+            dh_all[i] = exp(g_last[i+1]) * dh_all[i+1]
+                        + (scale * exp(gc[i+1]))[:, None] * q[i+1])^T @ do[i+1]
+        which the kernel computes as exp2(RCP_LN2 * x) == exp(x), since exp2 is
+        one hardware instruction:
+            dh_all[i] = exp2(RCP_LN2 * g_last[i+1]) * dh_all[i+1]
+                        + (scale * exp2(RCP_LN2 * gc[i+1]))[:, None] * q[i+1])^T @ do[i+1]
     """
-    BH = q_scaled.size(0)
-    N = q_scaled.size(1)
-    D = q_scaled.size(3)
+    BH = q.size(0)
+    N = q.size(1)
+    D = q.size(3)
     DV = do.size(3)
 
     dh_all = torch.empty([BH, N, D, DV], dtype=dh_init.dtype, device=dh_init.device)
@@ -572,12 +585,19 @@ def chunk_bwd_dh_diag_fused(
         for i_t in hl.grid(N):
             i = N - 1 - i_t
             dh_all[idx, i, tile_d, tile_dv] = dh_acc.to(dh_all.dtype)
-            if use_g:
+            if scalar_decay:
+                g_i = gc[idx, i, :].float()
+                dh_acc = torch.exp2(g_last[idx, i].float() * RCP_LN2) * dh_acc
+                q_i = (
+                    q[idx, i, :, tile_d].float()
+                    * (scale * torch.exp2(g_i * RCP_LN2))[:, None]
+                ).to(q.dtype)
+            elif use_g:
                 gl_d = g_last[idx, i, tile_d]
                 dh_acc = dh_acc * torch.exp(gl_d)[:, None]
-                q_i = q_scaled[idx, i, :, tile_d]
+                q_i = q[idx, i, :, tile_d]
             else:
-                q_i = q_scaled[idx, i, :, tile_d] * scale
+                q_i = q[idx, i, :, tile_d] * scale
             do_i = do[idx, i, :, tile_dv]
             dh_acc = hl.dot(q_i.transpose(-2, -1), do_i, acc=dh_acc)
 
@@ -717,12 +737,25 @@ def chunk_bwd_dv_helion(
     g_cs: torch.Tensor,
     do: torch.Tensor,
     dh: torch.Tensor,
+    g_last: torch.Tensor | None = None,
     use_g: hl.constexpr = True,  # pyrefly: ignore[bad-function-definition]
+    scalar_decay: hl.constexpr = False,  # pyrefly: ignore[bad-function-definition]
     scale: float = 1.0,
 ) -> torch.Tensor:
-    """Compute dV for all chunks in parallel (no correction). With use_g=False
-    the decay is compiled out, for variants with no decay; the intra attention
-    uses q' = scale*q, so scale folds into the masked attention here."""
+    """Compute dV for all chunks in parallel (no correction). Three compile-time
+    decay modes (specialized, no runtime branch):
+      - use_g=False:        no decay; intra attention uses q' = scale*q.
+      - diagonal (default): k_state is pre-scaled by the state decay on host, and
+        the intra attention is masked by exp(gc - gc^T).
+      - scalar_decay=True:  k is raw; the state decay exp(g_last - gc) multiplies
+        the k @ dh accumulator in-kernel, so no host-materialized k_state is
+        needed. With g in natural-log space:
+            dv[i] = (scale * exp(gc - gc^T) * tril * (q @ k^T))^T @ do
+                    + exp(g_last - gc)[:, None] * (k @ dh)
+        computed as exp2(RCP_LN2 * x) == exp(x), since exp2 is one instruction:
+            dv[i] = (scale * exp2(RCP_LN2 * (gc - gc^T)) * tril * (q @ k^T))^T @ do
+                    + exp2(RCP_LN2 * (g_last - gc))[:, None] * (k @ dh)
+    """
     BHN = q.size(0)
     C = hl.specialize(q.size(1))
     D = q.size(2)
@@ -737,16 +770,27 @@ def chunk_bwd_dv_helion(
         for tile_d in hl.tile(D):
             qt = q[tile_bhn, :, tile_d]
             kt = k[tile_bhn, :, tile_d]
-            kst = k_state[tile_bhn, :, tile_d]
             dht = dh[tile_bhn, tile_d, tile_dv]
 
             attn = hl.dot(qt, kt.transpose(-2, -1), acc=attn)
-            dv_acc = hl.dot(kst, dht.to(kst.dtype), acc=dv_acc)
+            if scalar_decay:
+                dv_acc = hl.dot(kt, dht.to(kt.dtype), acc=dv_acc)
+            else:
+                kst = k_state[tile_bhn, :, tile_d]
+                dv_acc = hl.dot(kst, dht.to(kst.dtype), acc=dv_acc)
 
         # Apply decay mask once after accumulating attn across D tiles
         idx = hl.arange(C)
         causal = (idx[:, None] >= idx[None, :]).float()
-        if use_g:
+        if scalar_decay:
+            gc = g_cs[tile_bhn, :].float()
+            decay_mask = (
+                torch.exp2((gc[:, :, None] - gc[:, None, :]) * RCP_LN2) * causal
+            )
+            attn = attn * (decay_mask * scale)
+            exp_dk = torch.exp2((g_last[tile_bhn].float()[:, None] - gc) * RCP_LN2)
+            dv_acc = dv_acc * exp_dk[:, :, None]
+        elif use_g:
             gc = g_cs[tile_bhn, :]
             decay_ij = torch.exp(gc[:, :, None] - gc[:, None, :])
             attn = attn * decay_ij * causal
@@ -1252,16 +1296,12 @@ def _helion_chunked_fwd(
 
         o = chunk_fwd_o_helion(qf, kf, vf2, g_csf, hf2, scale=scale)
 
-        # Precompute q_scaled for backward
-        exp_g_cs = torch.exp(g_cs[:, :, :, None])
-        q_scaled_4d = qf.reshape(BH, N, C, D) * exp_g_cs
-        g_last_4d = g_last.unsqueeze(-1).expand(-1, -1, D)
         # Attach cached data to h_all for the backward to use
+        g_last_4d = g_last.unsqueeze(-1).expand(-1, -1, D)
         h_all._scalar_bwd_cache = (  # pyrefly: ignore
             g_cs,
             g_last,
             g_last_4d,
-            q_scaled_4d,
         )
 
         final_state = None
@@ -1452,15 +1492,12 @@ def _helion_chunked_bwd(
             getattr(h_all, "_scalar_bwd_cache", None) if h_all is not None else None
         )
         if bwd_cache is not None:
-            g_cs, g_last_scalar, g_last_4d, q_scaled_4d = bwd_cache
+            g_cs, g_last_scalar, g_last_4d = bwd_cache
         else:
             gc = g.float().reshape(BH, N, C)
             g_cs = gc.cumsum(-1)
             g_last_scalar = g_cs[:, :, -1]
             g_last_4d = g_last_scalar.unsqueeze(-1).expand(-1, -1, D)
-            q_scaled_4d = q.float().reshape(BH, N, C, D) * torch.exp(
-                g_cs[:, :, :, None]
-            )
 
         if h_all is None:
             k_state_4d = k.float().reshape(BH, N, C, D) * torch.exp(
@@ -1469,8 +1506,12 @@ def _helion_chunked_bwd(
             state = q.new_zeros(BH, D, DV, dtype=torch.float32)
             h_all = chunk_fwd_h_diag_fused(k_state_4d, vf, g_last_4d, state)
 
+        q_4d = q.reshape(BH, N, C, D)
+        do_4d = grad_output.reshape(BH, N, C, DV)
         dstate = q.new_zeros(BH, D, DV, dtype=torch.float32)
-        dh_all = chunk_bwd_dh_diag_fused(q_scaled_4d, do_flat, g_last_4d, dstate)
+        dh_all = chunk_bwd_dh_diag_fused(
+            q_4d, do_4d, g_last_scalar, dstate, gc=g_cs, scalar_decay=True, scale=scale
+        )
 
         qf2 = q.float().reshape(BHN, C, D)
         kf2 = k.float().reshape(BHN, C, D)
@@ -1492,10 +1533,17 @@ def _helion_chunked_bwd(
             qb, kb, vb, g_csf2, g_lastf2, hb, dob, dhf2
         )
 
-        kb_scaled = (
-            kf2 * torch.exp(g_lastf2[:, None, None] - g_csf2.unsqueeze(-1))
-        ).to(k.dtype)
-        dv_raw = chunk_bwd_dv_helion(qb, kb, kb_scaled, g_csf2, dob, dhf2)
+        dv_raw = chunk_bwd_dv_helion(
+            qb,
+            kb,
+            kb,
+            g_csf2,
+            dob,
+            dhf2,
+            g_last=g_lastf2,
+            scalar_decay=True,
+            scale=scale,
+        )
 
         dg_final = chunk_bwd_dg_scalar_helion(
             qf2, kf2, vf2, g_csf2, g_lastf2, hf2, dof2, dhf2
