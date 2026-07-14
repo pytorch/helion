@@ -55,7 +55,7 @@ jobs:
       id-token: write
       contents: read
     with:
-      runner: linux.dgx.b200
+      runner: mt-l-x86iamx-22-225-b200
       python-version: "3.12"
       image: nvidia/cuda:13.1.0-devel-ubuntu24.04
       runtime-version: cu130
