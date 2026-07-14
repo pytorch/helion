@@ -368,7 +368,9 @@ class FeatureExplorationTracker:
         # Build mapping from search_summary dimensions
         for dim in self.search_summary.dimensions:
             all_values = dim.values if dim.values is not None else []
-            tested_values = sorted(self._feature_value_sets.get(dim.name, set()))
+            tested_values = sorted(
+                self._feature_value_sets.get(dim.name, set()), key=repr
+            )
 
             # Some dimensions (e.g. block_sizes, loop_orders, l2_groupings,
             # flatten_loops) don't enumerate explicit `values` but do compute a
@@ -454,7 +456,7 @@ def _extract_feature_value(config: Config, feature_name: str) -> object:
         return tuple(config.loop_orders)
 
     if feature_name == "pallas_loop_type":
-        return config.pallas_loop_type
+        return config.get("pallas_loop_type")
 
     if feature_name == "epilogue_subtile":
         return config.epilogue_subtile
@@ -615,7 +617,7 @@ def _analyze_dimension_size(
     if key == "pid_type":
         from ..autotuner.config_spec import VALID_PID_TYPES
 
-        allowed = list(config_spec.allowed_pid_types)
+        allowed: list[object] = list(config_spec.allowed_pid_types)
         disabled = [pt for pt in VALID_PID_TYPES if pt not in allowed]
         return SearchSpaceDimension(
             name="pid_type",
