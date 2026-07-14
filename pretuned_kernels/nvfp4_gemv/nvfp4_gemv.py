@@ -156,29 +156,31 @@ def _fp4_qword_to_f16x16(qword: torch.Tensor) -> tuple[torch.Tensor, ...]:
 # --------------------------------------------------------------------------- #
 @helion.experimental.aot_kernel(backend="triton", static_shapes=True)
 def nvfp4_gemv_bf16in_kernel(
-    weight_words: torch.Tensor,  # (M, K_units, 2) int32 packed NVFP4 weight
-    x_values: torch.Tensor,  # (K_units, 16) bf16 activation
+    weight_i64: torch.Tensor,  # (M, K_groups) int64 packed NVFP4 weight
+    x_values: torch.Tensor,  # (K_groups, 16) bf16 activation
     weight_scale_bytes: torch.Tensor,  # int8 view of SWIZZLE_32_4_4 E4M3 scales
     out: torch.Tensor,  # (M,) bf16 output
     alpha: float = 1.0,
 ) -> torch.Tensor:
     """W4A16 NVFP4 GEMV: fp16 weight decode * (bf16 x cast to fp16), fp32 scale.
 
-    Tiles over both M and the K scale-group dim so register pressure is bounded
-    by ``block_g`` rather than the full K (which spills catastrophically for
-    large K); the K tiles accumulate into a per-row fp32 ``acc``.
+    Mirrors the fast fp4in weight path -- one coalesced int64 load per scale group
+    (16 packed fp4) decoded to 16 fp16 lanes -- instead of the strided 2x int32
+    layout, which is the dominant DRAM traffic in a decode GEMV. Tiles over both M
+    and the K scale-group dim so register pressure is bounded by ``block_g``; K
+    tiles accumulate into a per-row fp32 ``acc``.
     """
-    M, _K_units, _ = weight_words.shape
+    M, K_groups = weight_i64.shape
     block_m = hl.register_block_size(1, 16)
-    block_g = hl.register_block_size(_K_units)
+    block_g = hl.register_block_size(K_groups)
     f16 = torch.float16
     for tile_m in hl.tile(M, block_size=block_m):
         acc = hl.zeros([tile_m], dtype=torch.float32)
-        for tile_g in hl.tile(_K_units, block_size=block_g):
-            w0, w1, w2, w3, w4, w5, w6, w7 = _fp4_word_to_f16x8(
-                weight_words[tile_m, tile_g, 0]
+        for tile_g in hl.tile(K_groups, block_size=block_g):
+            (w0, w1, w2, w3, w4, w5, w6, w7, w8, w9, w10, w11, w12, w13, w14, w15) = (
+                _fp4_qword_to_f16x16(weight_i64[tile_m, tile_g])
             )
-            contrib0 = (
+            contrib = (
                 w0 * x_values[tile_g, 0].to(f16)
                 + w1 * x_values[tile_g, 1].to(f16)
                 + w2 * x_values[tile_g, 2].to(f16)
@@ -187,25 +189,20 @@ def nvfp4_gemv_bf16in_kernel(
                 + w5 * x_values[tile_g, 5].to(f16)
                 + w6 * x_values[tile_g, 6].to(f16)
                 + w7 * x_values[tile_g, 7].to(f16)
-            )
-            w0, w1, w2, w3, w4, w5, w6, w7 = _fp4_word_to_f16x8(
-                weight_words[tile_m, tile_g, 1]
-            )
-            contrib1 = (
-                w0 * x_values[tile_g, 8].to(f16)
-                + w1 * x_values[tile_g, 9].to(f16)
-                + w2 * x_values[tile_g, 10].to(f16)
-                + w3 * x_values[tile_g, 11].to(f16)
-                + w4 * x_values[tile_g, 12].to(f16)
-                + w5 * x_values[tile_g, 13].to(f16)
-                + w6 * x_values[tile_g, 14].to(f16)
-                + w7 * x_values[tile_g, 15].to(f16)
+                + w8 * x_values[tile_g, 8].to(f16)
+                + w9 * x_values[tile_g, 9].to(f16)
+                + w10 * x_values[tile_g, 10].to(f16)
+                + w11 * x_values[tile_g, 11].to(f16)
+                + w12 * x_values[tile_g, 12].to(f16)
+                + w13 * x_values[tile_g, 13].to(f16)
+                + w14 * x_values[tile_g, 14].to(f16)
+                + w15 * x_values[tile_g, 15].to(f16)
             )
             scale_offsets = swizzled_scale_offsets(
-                tile_m.index[:, None], tile_g.index[None, :], _K_units
+                tile_m.index[:, None], tile_g.index[None, :], K_groups
             )
             scale = _e4m3_byte_to_f32(weight_scale_bytes[scale_offsets])
-            acc = acc + ((contrib0 + contrib1).to(torch.float32) * scale).sum(-1)
+            acc = acc + (contrib.to(torch.float32) * scale).sum(-1)
         out[tile_m] = (acc * alpha).to(torch.bfloat16)
     return out
 
@@ -290,13 +287,13 @@ def _nvfp4_gemv_bf16in(
     weight_scale: torch.Tensor,  # SWIZZLE_32_4_4 E4M3 weight scales
     alpha: float = 1.0,
 ) -> torch.Tensor:
-    """Host wrapper: view weight as int32 word pairs and run the W4A16 kernel."""
+    """Host wrapper: view weight as per-group int64 and run the W4A16 kernel."""
     weight_bytes = weight_packed.view(torch.uint8)
     n, k_bytes = weight_bytes.shape
     g = k_bytes // 8
     out = torch.empty(n, dtype=torch.bfloat16, device=weight_bytes.device)
     return nvfp4_gemv_bf16in_kernel(
-        weight_bytes.view(torch.int32).view(n, g, 2),
+        weight_bytes.view(torch.int64).view(n, g),
         x_bf16.view(g, 16),
         weight_scale.reshape(-1).view(torch.int8),
         out,
