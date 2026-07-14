@@ -23,6 +23,7 @@ from .ast_extension import ExtendedAST
 from .ast_extension import LoopType
 from .ast_extension import create
 from .compile_environment import CompileEnvironment
+from .compile_environment import block_size_constexpr_branch
 from .compile_environment import warning
 from .output_header import library_imports
 from .source_location import current_location
@@ -197,6 +198,34 @@ def _unsupported(
         raise exc.UnsupportedPythonType(python_type.__name__)
 
     return visit
+
+
+def _is_block_size_constexpr_test(test: TypeInfo) -> bool:
+    """Return True if ``test`` is a symbolic bool that depends only on block sizes.
+
+    Such a condition cannot be folded during the (single) frontend pass because
+    block sizes are still symbolic, but it *is* a compile-time constant for each
+    concrete config and is resolved per-config at codegen.  This is what lets an
+    ``if``/``else`` define a variable with divergent shapes across branches.
+    """
+    import sympy
+
+    from .host_function import HostFunction
+    from .variable_origin import BlockSizeOrigin
+
+    if not isinstance(test, SymBoolType):
+        return False
+    expr = test.value._sympy_()
+    # A boolean expression (And/Or/Relational) is a sympy.Basic but not a
+    # sympy.Expr, so check free symbols directly instead of find_block_size_symbols.
+    if not isinstance(expr, sympy.Basic) or not expr.free_symbols:
+        return False
+    hf = HostFunction.current()
+    for symbol in expr.free_symbols:
+        origin_info = hf.expr_to_origin.get(symbol)
+        if origin_info is None or not isinstance(origin_info.origin, BlockSizeOrigin):
+            return False
+    return True
 
 
 class TypePropagation(ast.NodeVisitor):
@@ -876,6 +905,16 @@ class TypePropagation(ast.NodeVisitor):
         if has_truth_val:
             # For constant conditions, only type propagate one branch
             self.scope.merge(self._body(node.body if truth_val else node.orelse))
+        elif _is_block_size_constexpr_test(test):
+            # The condition is a compile-time constant that depends on block
+            # sizes: it stays symbolic during this single frontend pass but is
+            # resolved per-config at codegen, where only the live branch is
+            # emitted (see DeviceFunction.evaluate_constexpr_condition and
+            # IfGraphInfo.codegen).  Because exactly one branch survives per
+            # config, the branches may legally define a variable with the same
+            # rank but different shapes (e.g. a transposed accumulator).
+            with block_size_constexpr_branch():
+                self.scope.merge_if_else(self._body(node.body), self._body(node.orelse))
         else:
             self.scope.merge_if_else(self._body(node.body), self._body(node.orelse))
         return NoType(origin=self.origin())

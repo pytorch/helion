@@ -248,6 +248,85 @@ class TestConstExpr(RefEagerTestBase, TestCase):
             result = compiled(x, w, hl.constexpr(flag))
             self.assertEqual(result.shape, x.shape)
 
+    @skipIfRefEager("compile_config not supported in ref eager mode")
+    @skipIfMTIA("Not supported on MTIA. PE failure crashes on DMA_IN")
+    def test_block_size_constexpr_branch_selects_per_config(self):
+        """A branch whose condition depends on a block size must pick the branch
+        per-config, not freeze one branch during the single frontend pass
+        (issue #3044)."""
+
+        @helion.kernel(static_shapes=True)
+        def fn(x: torch.Tensor) -> torch.Tensor:
+            (n,) = x.shape
+            bs = hl.register_block_size(n)
+            flag = hl.constexpr(bs < 64)
+            out = torch.empty_like(x)
+            for tile in hl.tile(n, block_size=bs):
+                if flag:
+                    out[tile] = x[tile] + 1
+                else:
+                    out[tile] = x[tile] + 2
+            return out
+
+        x = torch.zeros(128, device=DEVICE)
+        bound = fn.bind((x,))
+        for block_size in [32, 128]:
+            result = bound.compile_config(helion.Config(block_sizes=[block_size]))(x)
+            expected = x + (1 if block_size < 64 else 2)
+            torch.testing.assert_close(result, expected)
+
+    @skipIfRefEager("compile_config not supported in ref eager mode")
+    @skipIfMTIA("Not supported on MTIA. PE failure crashes on DMA_IN")
+    def test_block_size_constexpr_branch_divergent_shapes(self):
+        """Branches selected by a block-size constexpr may define a variable
+        with the same rank but different shapes -- e.g. a swap-AB GEMM that
+        transposes its accumulator for small M (issue #3044)."""
+
+        @helion.kernel(static_shapes=True)
+        def matmul_swap_ab(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+            M, K = a.size()
+            _, N = b.size()
+            out = torch.empty([M, N], dtype=a.dtype, device=a.device)
+            block_m = hl.register_block_size(M)
+            block_n = hl.register_block_size(N)
+            swap_ab = hl.constexpr(block_m < 64 and block_n >= 64)
+            for tile_m, tile_n in hl.tile([M, N], block_size=[block_m, block_n]):
+                if swap_ab:
+                    acc = hl.zeros([tile_n, tile_m], dtype=torch.float32)
+                else:
+                    acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(K):
+                    if swap_ab:
+                        a_blk = hl.load(
+                            a, [tile_m.index[None, :], tile_k.index[:, None]]
+                        )
+                        b_blk = hl.load(
+                            b, [tile_k.index[None, :], tile_n.index[:, None]]
+                        )
+                        acc = hl.dot(b_blk, a_blk, acc=acc, out_dtype=torch.float32)
+                    else:
+                        acc = hl.dot(
+                            a[tile_m, tile_k],
+                            b[tile_k, tile_n],
+                            acc=acc,
+                            out_dtype=torch.float32,
+                        )
+                if swap_ab:
+                    acc = acc.t()
+                out[tile_m, tile_n] = acc.to(out.dtype)
+            return out
+
+        M, K, N = 64, 512, 256
+        a = torch.randn(M, K, device=DEVICE, dtype=torch.float16)
+        b = torch.randn(K, N, device=DEVICE, dtype=torch.float16)
+        expected = a @ b
+        bound = matmul_swap_ab.bind((a, b))
+        # Both swap (block_m < 64 <= block_n) and non-swap configs must compile
+        # and produce correct results.
+        for bm, bn in [(32, 128), (64, 64), (128, 32)]:
+            result = bound.compile_config(helion.Config(block_sizes=[bm, bn, 64]))(a, b)
+            torch.testing.assert_close(result, expected, rtol=1e-2, atol=1e-2)
+
 
 if __name__ == "__main__":
     unittest.main()

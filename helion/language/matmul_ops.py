@@ -244,7 +244,15 @@ def _(
         if acc.ndim not in (2, 3):
             raise ValueError(f"hl.dot: acc must be 2D or 3D tensor, got {acc.ndim}D")
 
-        if list(acc.shape) != expected_shape:
+        # Inside a block-size-constexpr branch the accumulator can be carried in
+        # with the shape of the *other* branch (which is dropped for this config
+        # at codegen), so only the rank is meaningful here.  See
+        # in_block_size_constexpr_branch / IfGraphInfo.codegen.
+        from .._compiler.compile_environment import in_block_size_constexpr_branch
+
+        if list(acc.shape) != expected_shape and not (
+            in_block_size_constexpr_branch() and acc.ndim == len(expected_shape)
+        ):
             raise ValueError(
                 f"hl.dot: acc shape {list(acc.shape)} incompatible with result shape {expected_shape}"
             )

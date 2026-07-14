@@ -50,6 +50,31 @@ log = logging.getLogger(__name__)
 TensorDescriptorLayoutSignature = tuple[int | None, tuple[bool, ...]]
 
 
+# Set while type-propagating or tracing the branches of an `if` whose condition
+# is a compile-time constant that depends only on block sizes.  Such a condition
+# is resolved per-config at codegen, where only the live branch is emitted (see
+# DeviceFunction.evaluate_constexpr_condition and IfGraphInfo.codegen).  Because
+# exactly one branch survives per config, the branches may legally define a
+# variable with the same rank but different shapes (e.g. a transposed
+# accumulator), so shape-equality checks that would otherwise reject the merge
+# are relaxed while this flag is set.
+_block_size_constexpr_branch = threading.local()
+
+
+def in_block_size_constexpr_branch() -> bool:
+    return getattr(_block_size_constexpr_branch, "value", False)
+
+
+@contextlib.contextmanager
+def block_size_constexpr_branch() -> typing.Iterator[None]:
+    prev = getattr(_block_size_constexpr_branch, "value", False)
+    _block_size_constexpr_branch.value = True
+    try:
+        yield
+    finally:
+        _block_size_constexpr_branch.value = prev
+
+
 @dataclasses.dataclass
 class TensorDescriptorLayoutGuard:
     ndim: int

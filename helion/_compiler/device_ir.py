@@ -20,6 +20,7 @@ from typing import Protocol
 from typing import cast
 from unittest.mock import patch
 
+import sympy
 import torch
 from torch._dynamo.convert_frame import compile_lock
 from torch._inductor.decomposition import select_decomp_table
@@ -47,6 +48,7 @@ from .ast_extension import create
 from .ast_extension import expr_from_string
 from .ast_read_writes import ReadWrites
 from .compile_environment import CompileEnvironment
+from .compile_environment import block_size_constexpr_branch
 from .host_function import HostFunction
 from .inductor_lowering import APIFuncLowering
 from .inductor_lowering import CodegenState
@@ -436,6 +438,19 @@ class IfGraphInfo(NodeArgsGraphInfo):
         assert isinstance(state.codegen, GenerateAST)
 
         test = state.ast_arg(0)
+        # A branch condition that depends only on block sizes is a compile-time
+        # constant for this config, even though it stayed symbolic during the
+        # single frontend pass.  Emit it as a literal ``True``/``False`` so Triton
+        # drops the dead branch entirely.  This is what makes branches whose
+        # tensor shapes differ (e.g. an accumulator that is transposed in one
+        # branch) legal: Triton type-checks a branch against the other only when
+        # the condition is a runtime value, not a compile-time constant.
+        constexpr_test = state.device_function.evaluate_constexpr_condition(
+            state.proxy_arg(0)
+        )
+        if constexpr_test is not None:
+            test = expr_from_string(repr(constexpr_test))
+
         body_stmts: list[ast.AST] = []
         orelse_stmts: list[ast.AST] = []
         if_ast_node = create(ast.If, test=test, body=body_stmts, orelse=orelse_stmts)
@@ -1799,6 +1814,28 @@ class DeviceIR:
         return tls.device_irs[-1]
 
 
+def _is_block_size_constexpr_proxy(test_proxy: object) -> bool:
+    """True if ``test_proxy`` is a SymBool depending only on block sizes.
+
+    Mirrors ``_is_block_size_constexpr_test`` in type_propagation: such a
+    condition is a compile-time constant per-config and is resolved at codegen,
+    so the branches may define a variable with divergent (same-rank) shapes.
+    """
+    from .variable_origin import BlockSizeOrigin
+
+    if not isinstance(test_proxy, torch.SymBool):
+        return False
+    expr = test_proxy._sympy_()
+    if not isinstance(expr, sympy.Basic) or not expr.free_symbols:
+        return False
+    hf = HostFunction.current()
+    for symbol in expr.free_symbols:
+        origin_info = hf.expr_to_origin.get(symbol)
+        if origin_info is None or not isinstance(origin_info.origin, BlockSizeOrigin):
+            return False
+    return True
+
+
 class WalkDeviceAST(NodeVisitor):
     def __init__(self, device_ir: DeviceIR) -> None:
         super().__init__()
@@ -2296,7 +2333,17 @@ class WalkDeviceAST(NodeVisitor):
             if body:
                 self._body(body)
             return
-        self._create_if_subgraph(test_proxy, node.body, node.orelse)
+        # A condition that depends only on block sizes is a compile-time constant
+        # resolved per-config at codegen, so the branches may define a variable
+        # with divergent shapes (e.g. a transposed accumulator).  Relax the
+        # trace-time shape checks (_phi, hl.dot acc) while building the branches.
+        cm = (
+            block_size_constexpr_branch()
+            if _is_block_size_constexpr_proxy(test_proxy)
+            else contextlib.nullcontext()
+        )
+        with cm:
+            self._create_if_subgraph(test_proxy, node.body, node.orelse)
 
     def _create_if_subgraph(
         self,

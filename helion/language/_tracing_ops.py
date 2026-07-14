@@ -3102,7 +3102,18 @@ def _(lhs: object, rhs: object) -> object:
         return lhs
     assert isinstance(lhs, torch.Tensor), lhs
     assert isinstance(rhs, torch.Tensor), rhs
-    assert lhs.size() == rhs.size()
+    # Branches merged here may have the same rank but different shapes when the
+    # branch condition depends only on block sizes: such a condition is resolved
+    # per-config at codegen, where only the live branch is emitted (see
+    # DeviceFunction.evaluate_constexpr_condition and IfGraphInfo.codegen).  A
+    # genuine runtime-conditioned shape divergence is instead rejected later by
+    # Triton, since both branches are emitted when the condition is not constant.
+    from .._compiler.compile_environment import in_block_size_constexpr_branch
+
+    if in_block_size_constexpr_branch():
+        assert lhs.dim() == rhs.dim()
+    else:
+        assert lhs.size() == rhs.size()
     assert lhs.dtype == rhs.dtype
     assert lhs.device == rhs.device
     return torch.empty_like(lhs)

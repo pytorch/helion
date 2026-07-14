@@ -29,6 +29,7 @@ from .compile_environment import CompileEnvironment
 from .compile_environment import FixedBlockSizeSource
 from .compile_environment import LoopSpecBlockSizeSource
 from .compile_environment import _symint_expr
+from .compile_environment import in_block_size_constexpr_branch
 from .compile_environment import warning
 from .device_function import contains_only_block_size_symbols
 from .host_function import HostFunction
@@ -493,7 +494,10 @@ class TensorType(TypeInfo):
                     var=var_name,
                     details=f"rank {self.fake_value.dim()} != {other.fake_value.dim()}",
                 )
-            if self.fake_value.size() != other.fake_value.size():
+            if (
+                self.fake_value.size() != other.fake_value.size()
+                and not in_block_size_constexpr_branch()
+            ):
                 raise exc.ControlFlowTensorMismatch(
                     var=var_name,
                     details=f"size {self.fake_value.size()} != {other.fake_value.size()}",

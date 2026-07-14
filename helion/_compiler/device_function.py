@@ -456,6 +456,49 @@ class DeviceFunction:
         env = CompileEnvironment.current()
         return env.block_sizes[block_id].from_config(self.config)
 
+    def evaluate_constexpr_condition(self, test: object) -> bool | None:
+        """Resolve a control-flow test to a concrete bool for the current config.
+
+        Block sizes are symbolic during the (single) frontend pass but become
+        concrete integers per-config at codegen time.  A branch condition that
+        depends only on block sizes (and other constants) is therefore a
+        compile-time constant here, even though it could not be folded earlier.
+        Substituting the config's block sizes lets us decide the branch and emit
+        only the live side, which is what makes shape-divergent branches legal.
+
+        Returns the concrete bool, or ``None`` if the test is not a compile-time
+        constant for this config (e.g. it depends on a runtime value).
+        """
+        if isinstance(test, (bool, int)):
+            return bool(test)
+        if not isinstance(test, torch.SymBool):
+            return None
+        # NB: a boolean expression (And/Or/Relational) is a sympy.Basic but not a
+        # sympy.Expr, so we classify its free symbols directly rather than via
+        # find_block_size_symbols (which only handles sympy.Expr).
+        expr = test._sympy_()
+        if not isinstance(expr, sympy.Basic):
+            return None
+        env = CompileEnvironment.current()
+        hf = HostFunction.current()
+        subs: dict[sympy.Basic, sympy.Basic] = {}
+        for symbol in expr.free_symbols:
+            origin_info = hf.expr_to_origin.get(symbol)
+            if origin_info is None or not isinstance(
+                origin_info.origin, BlockSizeOrigin
+            ):
+                return None
+            value = env.block_sizes[origin_info.origin.block_id].from_config(
+                self.config
+            )
+            if not isinstance(value, int):
+                return None
+            subs[symbol] = sympy.Integer(value)
+        resolved = expr.xreplace(subs)
+        if resolved.free_symbols:
+            return None
+        return bool(resolved)
+
     def try_map_block_symbols_to_vars(self, expr: sympy.Expr) -> sympy.Expr | None:
         """Try to map all block size symbols in expression to their variable names.
 
