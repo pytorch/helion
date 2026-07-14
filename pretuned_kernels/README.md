@@ -31,6 +31,7 @@ pretuned_kernels/
 ├── scaled_mm/
 ├── scale_mm_cute/                    # B200 CuTe (tcgen05) rowwise FP8 GEMM
 ├── nvfp4_gemv/                       # B200 Triton NVFP4 (W4A4 / W4A16) decode GEMV
+├── nvfp4_gemv_cute/                  # B200 CuTe (tcgen05) NVFP4 decode GEMV (hand-PTX)
 ├── silu_mul_fp8/                     # ported from vLLM (vllm/kernels/helion/ops)
 ├── dynamic_per_token_scaled_fp8_quant/
 ├── per_token_group_fp8_quant/
@@ -54,6 +55,7 @@ At runtime Helion picks the file matching the current GPU.
 | `scaled_mm` | vLLM Qwen3 FP8 `(K, N)` weight shapes at small token counts `M in {16, 64}` | `torch._scaled_mm` |
 | `scale_mm_cute` | Skinny-M FP8 decode + decoder-layer FP8 W8A8 serving `(M, K, N)` shapes (B200 CuTe backend only) | `torch._scaled_mm` (rowwise) + vLLM CUTLASS |
 | `nvfp4_gemv` | Decode (M=1) NVFP4 GEMV `(N, K)` weight shapes (Llama-3 / Qwen projections), W4A4 + W4A16 (B200 Triton backend) | NVFP4 dequant reference + vLLM CUTLASS `cutlass_scaled_fp4_mm` |
+| `nvfp4_gemv_cute` | Same decode (M=1) NVFP4 GEMV shapes, W4A4 + W4A16, via the CuTe (tcgen05) hand-PTX fast path (B200 CuTe backend; K multiple of 4096) | NVFP4 dequant reference + vLLM CUTLASS `cutlass_scaled_fp4_mm` |
 | `silu_mul_fp8` | vLLM `(num_tokens, intermediate)` decode shapes | torch-native silu-and-mul + fp8 quant |
 | `dynamic_per_token_scaled_fp8_quant` | vLLM `(num_tokens, hidden)` shapes | torch-native per-token fp8 quant |
 | `per_token_group_fp8_quant` | vLLM `(num_tokens, hidden, group)` shapes | torch-native per-group fp8 quant |
