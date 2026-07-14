@@ -171,6 +171,12 @@ BLACKWELL_HARDWARE = HardwareInfo(
     runtime_version="12.8",
     compute_capability="sm100",
 )
+A100_HARDWARE = HardwareInfo(
+    device_kind="cuda",
+    hardware_name="NVIDIA A100",
+    runtime_version="12.8",
+    compute_capability="sm80",
+)
 
 
 class TestAutotunerHeuristic(TestCase):
@@ -343,6 +349,86 @@ class TestAutotunerHeuristic(TestCase):
         self.assertEqual(flat_default.config["block_sizes"], [64])
         self.assertEqual(flat_default.config["num_warps"], 8)
         self.assertEqual(flat_default.config["num_stages"], 2)
+
+    def test_should_promote_gate(self) -> None:
+        # should_promote() gates a seed's PROMOTION (becoming the autotune-off
+        # default) on PROMOTE_TARGETS, independently of where the seed fires.
+        env = MagicMock()
+        env.device = "cuda"
+
+        class _AllArches(AutotunerHeuristic):
+            promote_seed_to_default = True
+            PROMOTE_TARGETS = None  # promote wherever it fires (back-compat)
+
+        class _Sm90Only(AutotunerHeuristic):
+            promote_seed_to_default = True
+            PROMOTE_TARGETS = (("cuda", "sm90"),)
+
+        class _NotPromoting(AutotunerHeuristic):
+            promote_seed_to_default = False
+            PROMOTE_TARGETS = (("cuda", "sm90"),)
+
+        # PROMOTE_TARGETS=None promotes without consulting hardware.
+        self.assertTrue(_AllArches.should_promote(env))
+
+        # A target list restricts promotion to the matching arch...
+        with patch("helion._hardware.get_hardware_info", return_value=HOPPER_HARDWARE):
+            self.assertTrue(_Sm90Only.should_promote(env))
+        # ...and declines on an off-target arch (seed still fires; only the
+        # promotion is gated).
+        with patch(
+            "helion._hardware.get_hardware_info", return_value=BLACKWELL_HARDWARE
+        ):
+            self.assertFalse(_Sm90Only.should_promote(env))
+
+        # promote_seed_to_default=False vetoes regardless of the target list.
+        with patch("helion._hardware.get_hardware_info", return_value=HOPPER_HARDWARE):
+            self.assertFalse(_NotPromoting.should_promote(env))
+
+    @onlyBackends(["triton"])
+    @skipIfRefEager("Compiler pointwise facts are not collected in ref eager mode")
+    def test_pointwise_seed_promotes_only_on_target_arch(self) -> None:
+        # The pointwise seed fires arch-agnostically but its PROMOTION to the
+        # autotune-off default is gated to PROMOTE_TARGETS (sm90/sm100). On a
+        # target arch the promoted seed replaces the base default; off-target it
+        # is still offered as a search candidate but the base default is kept.
+        def make_add() -> object:
+            @helion.kernel(backend="triton")
+            def triton_add(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+                out = torch.empty_like(x)
+                for tile in hl.tile(x.shape):
+                    out[tile] = x[tile] + y[tile]
+                return out
+
+            return triton_add
+
+        x = torch.empty([1024, 1024], device=DEVICE, dtype=torch.float32)
+        y = torch.empty([1024, 1024], device=DEVICE, dtype=torch.float32)
+
+        self.assertIn(("cuda", "sm90"), TritonPointwiseSeedHeuristic.PROMOTE_TARGETS)
+        self.assertIn(("cuda", "sm100"), TritonPointwiseSeedHeuristic.PROMOTE_TARGETS)
+
+        # A fresh kernel object per arch: bind() caches by args, so reusing one
+        # kernel would return the first arch's config on the second bind.
+        for name, hardware, promotes in (
+            ("sm90", HOPPER_HARDWARE, True),
+            ("sm100", BLACKWELL_HARDWARE, True),
+            ("sm80", A100_HARDWARE, False),
+        ):
+            with (
+                self.subTest(arch=name),
+                patch("helion._hardware.get_hardware_info", return_value=hardware),
+            ):
+                bound = make_add().bind((x, y))
+                spec = bound.config_spec
+                # The seed fires and is offered as a search candidate on every arch.
+                self.assertEqual(spec.autotuner_heuristics, ["triton_pointwise"])
+                self.assertEqual(len(spec.compiler_seed_configs), 1)
+                seed = spec.compiler_seed_configs[0]
+                if promotes:
+                    self.assertEqual(spec.compiler_default_config, seed)
+                else:
+                    self.assertIsNone(spec.compiler_default_config)
 
 
 class TestMatmulFacts(TestCase):

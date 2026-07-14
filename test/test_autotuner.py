@@ -31,6 +31,7 @@ from helion import _compat
 from helion import exc
 from helion._compiler.tile_dispatch import BlockIDStrategyMapping
 from helion._compiler.tile_dispatch import TileStrategyDispatch
+from helion._hardware import HardwareInfo
 from helion._testing import DEVICE
 from helion._testing import RefEagerTestDisabled
 from helion._testing import TestCase
@@ -76,6 +77,17 @@ from helion.runtime.settings import _get_backend
 
 datadir = Path(__file__).parent / "data"
 basic_kernels = import_path(datadir / "basic_kernels.py")
+
+# Pin the arch for config-population goldens: the pointwise seed promotes to the
+# autotune-off default only on PROMOTE_TARGETS (sm90/sm100), so an unpinned test
+# would emit the promoted tile on H100/B200 runners and the base default on
+# others. Fixing the arch keeps the expected journal deterministic everywhere.
+_HOPPER_HARDWARE = HardwareInfo(
+    device_kind="cuda",
+    hardware_name="NVIDIA H100",
+    runtime_version="12.8",
+    compute_capability="sm90",
+)
 examples_dir = Path(__file__).parent.parent / "examples"
 
 
@@ -907,9 +919,10 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
     @patch.object(loops, "_supports_warp_specialize", lambda: True)
     @patch("torch.version.hip", None)
     @patch("torch.version.xpu", None)
+    @patch("helion._hardware.get_hardware_info", return_value=_HOPPER_HARDWARE)
     @skipIfRocm("config space differs on ROCm")
     @skipIfXPU("maxnreg uses CUDA-specific register query")
-    def test_config_fragment1(self):
+    def test_config_fragment1(self, _mock_hardware):
         args = (
             torch.randn([8, 512, 512], device=DEVICE),
             torch.randn([8, 512, 512], device=DEVICE),
@@ -927,10 +940,11 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
     @patch.object(loops, "_supports_warp_specialize", lambda: True)
     @patch("torch.version.hip", None)
     @patch("torch.version.xpu", None)
+    @patch("helion._hardware.get_hardware_info", return_value=_HOPPER_HARDWARE)
     @skipIfTileIR("tileir backend will ignore `warp specialization` hint")
     @skipIfRocm("config space differs on ROCm")
     @skipIfXPU("maxnreg uses CUDA-specific register query")
-    def test_config_warp_specialize_unroll(self):
+    def test_config_warp_specialize_unroll(self, _mock_hardware):
         args = (
             torch.randn([8, 512, 512], device=DEVICE),
             torch.randn([8, 512, 512], device=DEVICE),

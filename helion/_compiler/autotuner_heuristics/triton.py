@@ -276,6 +276,14 @@ class TritonPointwiseSeedHeuristic(AutotunerHeuristic):
 
     name = "triton_pointwise"
     backend = "triton"
+    # Fires arch-agnostically (is_eligible keys only on the pointwise fact), but
+    # its byte/register constants were hill-climbed and validated on H100 (sm90).
+    # Promote to the autotune-off default ONLY on the arches the correctness hunt
+    # has cleared — sm90 (H100) and sm100 (B200) — so a non-validated arch keeps
+    # the conservative base default while still getting the seed as a search
+    # candidate. The seed keeps firing everywhere; only PROMOTION is gated.
+    promote_seed_to_default = True
+    PROMOTE_TARGETS = (("cuda", "sm90"), ("cuda", "sm100"))
 
     # Hill-climbed constants (see _lab/pointwise/NOTEBOOK.md).
     TILE_BYTES = 8192  # target HBM bytes moved per tile

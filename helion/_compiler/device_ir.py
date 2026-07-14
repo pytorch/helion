@@ -1504,6 +1504,12 @@ class DeviceIR:
         spec = env.config_spec
         from ..autotuner.config_spec import SIZED_REDUCTION_CATEGORIES
         from ..autotuner.config_spec import PointwiseElementwiseFact
+        from ..language.atomic_ops import ATOMIC_OPS
+        from ..language.inline_asm_ops import inline_asm_elementwise
+        from ..language.inline_triton_ops import inline_triton
+        from ..language.inline_triton_ops import triton_kernel
+        from ..language.reduce_ops import _reduce
+        from ..language.scan_ops import _associative_scan
 
         # Disjointness: a kernel with any SIZED reduction (the Stage-1 kernel fact's
         # FULL_SLICE/FULL_GRID/USER_TILE descriptors — the faithful successor to a non-empty
@@ -1517,6 +1523,29 @@ class DeviceIR:
             return
         if not spec.memory_op_facts or not spec.block_sizes:
             return
+        # Ops whose result is NOT an embarrassingly-parallel function of the tile, so the pointwise
+        # seed's core assumption (any tiling is equally correct) does not hold:
+        #  - a scan/reduce HOP carries a cross-element dependency along the tiled axis (shrinking it
+        #    splits the op);
+        #  - an opaque triton/asm body cannot be traced to prove tile-independence;
+        #  - an atomic is cross-program communication, not the bandwidth-bound elementwise workload
+        #    this seed models and was tuned on (and order-sensitive ones like cas/xchg additionally
+        #    shift with the tile). Exclude the whole atomic family rather than draw a fragile
+        #    commutativity line.
+        # None of these produce a reduction/matmul/accumulator fact, so without this guard they would
+        # fall through to a promoted large tile and silently change results. Exclude them like the
+        # other non-pointwise families above. (``_associative_scan`` is the single HOP that
+        # associative_scan/cumsum/cumprod all lower to.)
+        _unsafe_pointwise_ops = frozenset(
+            {
+                _associative_scan,
+                _reduce,
+                inline_triton,
+                triton_kernel,
+                inline_asm_elementwise,
+                *ATOMIC_OPS,
+            }
+        )
         # The static problem element count = product of the tiled block dims' size_hints (the
         # per-dim extents the seed needs for the tile distribution are read live off block_sizes).
         total_numel = 1
@@ -1576,6 +1605,12 @@ class DeviceIR:
                 for size in _val_itemsizes(node.meta.get("val")):
                     compute_itemsize = max(compute_itemsize, size)
                 if node.op == "call_function":
+                    if node.target in _unsafe_pointwise_ops:
+                        # Not tile-independent (see the set's comment above). Record no fact so the
+                        # seed does not fire and the base default (bs=32) is kept — the same no-fire
+                        # path the reduction/matmul/accumulator families take at the disjointness
+                        # gate above.
+                        return
                     base = getattr(node.target, "__name__", str(node.target)).split(
                         "."
                     )[0]
