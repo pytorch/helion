@@ -131,9 +131,9 @@ class TestExamples(RefEagerTestBase, TestCase):
             args[0] @ args[1],
         )
 
-    @xfailIfPallas(
-        "Pallas TPU clamps the N block to the lane width (128) which does"
-        " not match the test's N=96 bias dimension"
+    @xfailIfPallasInterpret(
+        "emit_pipeline ds-pad DMA uses a tracer-size dynamic_slice, unsupported"
+        " in JAX Pallas interpret mode"
     )
     def test_matmul_bias_epilogue_wrapper(self):
         from typing import Any
@@ -1063,7 +1063,10 @@ class TestExamples(RefEagerTestBase, TestCase):
             fn_name="concat2d_dim1",
         )
 
-    @xfailIfPallas("BlockSpec tiling failure")
+    @xfailIfPallasInterpret(
+        "emit_pipeline ds-pad DMA uses a tracer-size dynamic_slice, unsupported"
+        " in JAX Pallas interpret mode"
+    )
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
     @skipIfTileIR("TileIR does not support block_ptr indexing")
     def test_concat_block_ptr(self):
