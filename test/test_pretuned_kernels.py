@@ -18,6 +18,7 @@ import torch
 from torch._environment import is_fbcode
 import torch.nn.functional as F
 
+from helion import Config
 from helion._hardware import get_hardware_info
 from helion._testing import DEVICE
 from helion._testing import PRETUNED_KERNELS_DIR
@@ -71,6 +72,7 @@ def _run_pretuned_kernel_main_and_parse_summary(name):
 
 _CORRECTNESS_SHAPES = {
     "vector_add": [2**20],
+    "attention": [(2, 8, 512, 64)],
     "softmax": [(4096, 1024)],
     "layer_norm": [(4096, 1024)],
     "rms_norm": [(2048, 4096)],
@@ -90,6 +92,15 @@ def _make_vector_add_inputs(shape):
     x = torch.randn(n, device=DEVICE, dtype=torch.float32)
     y = torch.randn(n, device=DEVICE, dtype=torch.float32)
     return (x, y), lambda: x + y
+
+
+def _make_attention_inputs(shape):
+    z, h, seq_len, head_dim = shape
+    q, k, v = (
+        torch.randn(z, h, seq_len, head_dim, device=DEVICE, dtype=torch.float16)
+        for _ in range(3)
+    )
+    return (q, k, v), lambda: F.scaled_dot_product_attention(q, k, v)
 
 
 def _make_softmax_inputs(shape):
@@ -211,6 +222,7 @@ def _make_rope_bwd_inputs(shape):
 
 _INPUT_BUILDERS = {
     "vector_add": _make_vector_add_inputs,
+    "attention": _make_attention_inputs,
     "softmax": _make_softmax_inputs,
     "layer_norm": _make_layer_norm_inputs,
     "rms_norm": _make_rms_norm_inputs,
@@ -223,6 +235,7 @@ _INPUT_BUILDERS = {
 # vector_add because reductions accumulate fp32 and round back to fp16/bf16.
 _TOLERANCES = {
     "vector_add": (1e-5, 1e-5),
+    "attention": (5e-2, 2e-2),
     "softmax": (1e-3, 1e-3),
     "layer_norm": (1e-2, 1e-2),
     "rms_norm": (1e-2, 1e-2),
@@ -371,6 +384,47 @@ class TestPretunedKernelsCorrectness(TestCase):
 
     def test_vector_add(self):
         self._run_correctness("vector_add")
+
+    def test_attention(self):
+        self._run_correctness("attention")
+
+    def test_attention_cute_flash_compiles(self):
+        """The pretuned attention kernel compiles on the CuTe (tcgen05) flash
+        fast-path -- not the generic cutedsl fallback -- and matches SDPA.
+
+        Guards the CuTe flash enablement the kernel depends on: without it, the
+        cute backend falls back to a generic path that cannot lower the
+        online-softmax ``torch.maximum``. The pretuned heuristic (and the flash
+        envelope) target B200, so this runs only on sm100.
+        """
+        if not is_cuda():
+            self.skipTest("Pretuned kernels require CUDA / ROCm.")
+        if _current_compute_capability() != "sm100":
+            self.skipTest("CuTe flash attention is pretuned for B200 (sm100).")
+        import importlib.util
+
+        module = _import_pretuned_kernel_module("attention")
+        heuristic_path = (
+            PRETUNED_KERNELS_DIR / "attention" / "_helion_aot_attention_cuda_sm100.py"
+        )
+        spec = importlib.util.spec_from_file_location("_attn_heuristic", heuristic_path)
+        assert spec is not None and spec.loader is not None
+        heuristic = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(heuristic)
+
+        q, k, v = (
+            torch.randn(2, 8, 512, 64, device=DEVICE, dtype=torch.float16)
+            for _ in range(3)
+        )
+        bound = module.attention.bind((q, k, v))
+        config = Config(**heuristic.autotune_attention(q, k, v))
+        # The fused tcgen05 flash fast-path emits this marker; the generic
+        # cutedsl fallback (which errors on the softmax max) never gets here.
+        self.assertIn("flash_kv_prod", bound.to_triton_code(config))
+        bound.set_config(config)
+        out = bound(q, k, v)
+        expected = F.scaled_dot_product_attention(q, k, v)
+        torch.testing.assert_close(out, expected, atol=5e-2, rtol=2e-2)
 
     def test_softmax(self):
         self._run_correctness("softmax")

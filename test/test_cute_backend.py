@@ -2039,6 +2039,31 @@ class TestCuteBackend(TestCase):
                 expected = torch.nn.functional.scaled_dot_product_attention(q, k, v)
                 torch.testing.assert_close(out, expected, atol=1e-2, rtol=1e-2)
 
+    def test_examples_attention_output_flash_compiles(self) -> None:
+        """The shipped ``examples/attention.py`` ``attention_output`` kernel
+        compiles on the CuTe flash fast-path and matches SDPA.
+
+        The pretuned CuTe attention kernel (``pretuned_kernels/attention``) is a
+        verbatim port of this kernel, so this guards that the example itself --
+        not just the test-local ``cute_dense_attention`` -- lowers to the fused
+        tcgen05 flash kernel rather than the generic cutedsl fallback (which
+        cannot lower the online-softmax ``torch.maximum``).
+        """
+        from examples.attention import attention_output
+
+        for head_dim, dtype in ((64, torch.float16), (128, torch.bfloat16)):
+            with self.subTest(head_dim=head_dim):
+                q, k, v = (
+                    torch.randn(2, 8, 256, head_dim, dtype=dtype, device=DEVICE)
+                    for _ in range(3)
+                )
+                code, out = code_and_output(
+                    attention_output, (q, k, v), block_sizes=[1, 128, 128]
+                )
+                self.assertTrue(_flash_fired(code))
+                expected = torch.nn.functional.scaled_dot_product_attention(q, k, v)
+                torch.testing.assert_close(out, expected, atol=3e-2, rtol=3e-2)
+
     def test_flash_attention_bfloat16_fires_and_matches_sdpa(self) -> None:
         q, k, v = (
             torch.randn(2, 8, 256, 128, dtype=torch.bfloat16, device=DEVICE)
