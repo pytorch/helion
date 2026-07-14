@@ -69,7 +69,7 @@
       "backend": "triton"
     },
     {
-      "runner": "mt-l-x86iamx-22-225-b200",
+      "runner": "linux.dgx.b200",
       "python-version": "3.12",
       "ref-eager": false,
       "image": "nvidia/cuda:13.1.0-devel-ubuntu24.04",
@@ -80,7 +80,7 @@
       "backend": "triton"
     },
     {
-      "runner": "mt-l-x86iamx-22-225-b200",
+      "runner": "linux.dgx.b200",
       "python-version": "3.12",
       "ref-eager": false,
       "image": "nvidia/cuda:13.2.0-devel-ubuntu24.04",
@@ -128,7 +128,7 @@
       "backend": "pallas"
     },
     {
-      "runner": "mt-l-x86iamx-22-225-b200",
+      "runner": "linux.dgx.b200",
       "python-version": "3.12",
       "ref-eager": false,
       "image": "nvidia/cuda:13.1.0-devel-ubuntu24.04",
