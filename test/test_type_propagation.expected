@@ -815,7 +815,7 @@ i *
             # Name: SymIntType(u0) AttributeOrigin(value=SourceOrigin(location=<SourceLocation test_type_propagation.py:N>), key='multi_processor_count')
 sm_count
             if 
-            # Compare: SymBoolType(Eq(u11, 1)) DeviceOrigin(location=<SourceLocation test_type_propagation.py:N>)
+            # Compare: SymBoolType(u0*u4 + u2 < 128) DeviceOrigin(location=<SourceLocation test_type_propagation.py:N>)
             # Name: SymIntType(u0*u4 + u2) DeviceOrigin(location=<SourceLocation test_type_propagation.py:N>)
 idx < 
             # Name: LiteralType(128) GetItemOrigin(value=AttributeOrigin(value=ArgumentOrigin(name='x'), key='shape'), key=0)
