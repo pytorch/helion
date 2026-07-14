@@ -3,11 +3,12 @@ Auto-generated heuristic for kernels: nvfp4_gemv_fp4in_kernel, nvfp4_gemv_bf16in
 Backend: single tuned config per kernel (shape-independent)
 
 NVFP4 decode GEMV pretuned on NVIDIA B200 (sm100) for Helion's Triton backend:
-FP16-decode multi-row bodies that tile over M (out[tile_m]) with a wide/full K
-reduction. Configs were autotuned (curated grid, validated against the dequant
-reference under cold-L2 cudagraph) on the two nvfp4_backend_comparison shapes --
-bf16in "o" (N=8192, K=8192) and fp4in "down" (N=8192, K=28672). The GEMV is
-memory bound on streaming the NVFP4 weight from DRAM, so one config per kernel
+FP16-decode multi-row bodies that tile over both M (out[tile_m]) and the K
+scale-group dim, accumulating K tiles into a per-row fp32 acc. Configs were
+autotuned (curated grid, validated against the dequant reference under cold-L2
+cudagraph) on the nvfp4_backend_comparison shapes -- fp4in "down" (N=8192,
+K=28672) and bf16in across N=8192 with K in {8192, 28672}. The GEMV is memory
+bound on streaming the NVFP4 weight from DRAM, so one config per kernel
 transfers across the decode weight shapes in the sweep.
 
 Provides, for each kernel <k>:
@@ -28,13 +29,15 @@ _CONFIG_nvfp4_gemv_fp4in_kernel = {
     "range_multi_buffers": [None, True],
 }
 
-# W4A16 (NVFP4 weight * BF16 activation). Autotuned on N=8192, K=8192 ("o"): single
-# block dim (K is a full arange), block_m=16 (activation reuse across the 16 output
-# rows in a tile), num_stages=2. Validated against the dequant reference (21.7us).
+# W4A16 (NVFP4 weight * BF16 activation). block_m=16 (activation reuse across the
+# 16 output rows) + inner K tile block_g=128 so register pressure is bounded by the
+# tile, not the full K -- the untiled body spilled catastrophically at large K
+# (1298us at K=28672). Tuned across N=8192 K in {8192, 28672} and validated against
+# the dequant reference: 27us at K=8192, 83us at K=28672 (cold-L2 cudagraph).
 _CONFIG_nvfp4_gemv_bf16in_kernel = {
-    "block_sizes": [16],
-    "num_warps": 4,
-    "num_stages": 2,
+    "block_sizes": [16, 128],
+    "num_warps": 2,
+    "num_stages": 3,
 }
 
 
