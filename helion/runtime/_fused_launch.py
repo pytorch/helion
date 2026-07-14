@@ -111,6 +111,18 @@ def _triton_direct_launch_ok(triton_kernel: object) -> bool:
     return not knobs.compilation.instrumentation_mode
 
 
+_BLOCK_SIZE_GLOBAL_PREFIX = "_BLOCK_SIZE_"
+
+
+def _is_helion_block_size_global(name: object) -> bool:
+    """True for Helion-generated block-size globals safe to trust after compile."""
+    return (
+        type(name) is str
+        and name.startswith(_BLOCK_SIZE_GLOBAL_PREFIX)
+        and name[len(_BLOCK_SIZE_GLOBAL_PREFIX) :].isdigit()
+    )
+
+
 # Raised by a baked key builder when the call's argument *layout* differs from
 # the sample it was compiled for (a differing type at some position); the caller
 # catches it and rebuilds the builder for the new layout.  This is the single
@@ -144,72 +156,73 @@ def build_key_fn(
       tensor (the fused path bypasses ``default_launcher``'s direct-launch key
       where alignment is otherwise guarded) and always builds a key.
 
-    The returned lambda encodes, per position, ``type(arg)`` and -- for a tensor
-    -- dtype/shape/stride/device and (frozenset-normalized) dynamo static
-    indices, for a scalar its value, and finally the user ``key=`` result.
-    Compiling one flat expression (as Triton's ``binder`` does) is markedly
-    faster on the hot path than a generic per-call loop for many-argument
-    kernels.
+    The returned lambda encodes one layout token plus, per tensor,
+    dtype/shape/stride/device and (frozenset-normalized) dynamo static indices,
+    per scalar its value, and finally the user ``key=`` result. Compiling one
+    flat expression (as Triton's ``binder`` does) is markedly faster on the hot
+    path than a generic per-call loop for many-argument kernels.
 
     Layout safety: every position first checks ``a[i].__class__ is <C>`` for the
     sampled class ``C`` and calls ``_raise()`` (-> :class:`_LayoutChanged`) on a
     mismatch.  So a call whose layout differs -- e.g. a tensor where the sample
     had ``None`` or a scalar -- always raises rather than silently emitting a
     truncated (collision-prone) key; the caller rebuilds for the new layout.  The
-    guard is what makes the class marker load-bearing: without it a baked
-    None/scalar position would emit only ``__class__`` for an arriving tensor and
-    two different tensors would collide.
+    layout token is what prevents keys from different baked layouts from
+    colliding in the shared recipe cache.
     """
     # A guard for every position (including bail positions), so a builder that
     # bails to None for *this* layout still raises _LayoutChanged -- and is
     # rebuilt -- when a later call's layout differs.  Otherwise a cached bail
     # lambda would wrongly return None for every future layout.  The leading
     # guard checks the arg *count*, so a differing length (which would otherwise
-    # IndexError or silently drop trailing args) also forces a rebuild.  It seeds
-    # both ``parts`` (evaluated on the normal key path) and ``guards`` (the bail
-    # path), contributing a constant leading element to every key.
+    # IndexError or silently drop trailing args) also forces a rebuild.
+    #
+    # The key carries one prebuilt layout token instead of emitting each class
+    # guard into the tuple. The guards still make layout changes rebuild the
+    # key function, while the token prevents keys from different layouts from
+    # colliding in the shared recipe cache.
     len_guard = f"(len(a) == {len(args)} or _raise())"
-    parts: list[str] = [len_guard]
+    parts: list[str] = []
     guards: list[str] = [len_guard]
     namespace: dict[str, object] = {
         "_fs": lambda si: None if si is None else frozenset(si),
+        "_layout": object(),
         "_raise": _raise,
     }
     has_tensor = False
     bail = False
     for i, a in enumerate(args):
         t = type(a)
-        # Per-position layout guard: emits the arg's class (so e.g. int vs bool,
-        # which compare/hash equal by value, stay distinct in the key) and raises
-        # _LayoutChanged on a class mismatch -- so a differing type at this
-        # position forces a rebuild instead of silently emitting a truncated
-        # (collision-prone) key.
+        # Per-position layout guard: raises _LayoutChanged on a class mismatch,
+        # so a differing type at this position forces a rebuild instead of
+        # silently emitting a truncated (collision-prone) key.
         namespace[f"_C{i}"] = t
-        guard = f"(_C{i} if a[{i}].__class__ is _C{i} else _raise())"
+        guard = f"(a[{i}].__class__ is _C{i} or _raise())"
         guards.append(guard)
         if t is torch.Tensor or t is torch.nn.Parameter:
             has_tensor = True
             # frozenset(...) keeps a set/list _dynamo_static_indices hashable.
             align = f", not a[{i}].data_ptr() & 15" if include_alignment else ""
             parts.append(
-                f"{guard}, a[{i}].dtype, a[{i}].shape, a[{i}].stride(), "
+                f"a[{i}].dtype, a[{i}].shape, a[{i}].stride(), "
                 f"a[{i}].device, _fs(getattr(a[{i}], '_dynamo_static_indices', None))"
                 f"{align}"
             )
         elif t is int or t is float or t is bool or t is str:
-            parts.append(f"{guard}, a[{i}]")
+            parts.append(f"a[{i}]")
         elif a is None:
-            parts.append(guard)
+            pass
         elif t is torch.dtype or t is torch.device:  # value is its own key
-            parts.append(f"{guard}, a[{i}]")
+            parts.append(f"a[{i}]")
         else:
             # Unhandled arg type (container, tensor subclass, ...): the caller
             # takes the slow path (fast) / skips fusion (fused) via a None key.
             bail = True
     if bail or (bail_when_no_tensor and not has_tensor):
         # Evaluate every guard (so a layout change raises) then yield None.
-        return eval(f"lambda a: ({', '.join(guards)},) and None", namespace)
-    meta = f"({', '.join(parts)},)"
+        return eval(f"lambda a: ({' and '.join(guards)}) and None", namespace)
+    meta_parts = ["_layout", *parts]
+    meta = f"(({' and '.join(guards)}) and ({', '.join(meta_parts)},))"
     if user_key_fn is not None:
         namespace["_kf"] = user_key_fn
         return eval(f"lambda a: ({meta}, _kf(*a))", namespace)
@@ -444,6 +457,15 @@ def fused_prime(kernel: Kernel, bound: BoundKernel, args: tuple[object, ...]) ->
 
     # Resolve each launcher arg to an input-tensor index or a baked constant.
     arg_parts: list[str] = []
+    direct_arg_parts: list[str] = []
+    tensor_direct_arg_parts: list[str] = []
+    tensor_arg_names: dict[int, str] = {}
+    tensor_direct_params: list[str] = []
+    for i, a in enumerate(args):
+        ta = type(a)
+        if ta is torch.Tensor or ta is torch.nn.Parameter:
+            tensor_arg_names[i] = f"a{len(tensor_direct_params)}"
+            tensor_direct_params.append(tensor_arg_names[i])
     namespace: dict[str, object] = {}
     for j, a in enumerate(captured["largs"]):
         ta = type(a)
@@ -453,9 +475,13 @@ def fused_prime(kernel: Kernel, bound: BoundKernel, args: tuple[object, ...]) ->
             if i is None:
                 return _disable(kernel, result)
             arg_parts.append(f"a[{i}]")
+            direct_arg_parts.append(f"a{i}")
+            tensor_direct_arg_parts.append(tensor_arg_names[i])
         elif ta is int or ta is float or ta is bool or a is None:
             namespace[f"_c{j}"] = a
             arg_parts.append(f"_c{j}")
+            direct_arg_parts.append(f"_c{j}")
+            tensor_direct_arg_parts.append(f"_c{j}")
         else:
             return _disable(kernel, result)
 
@@ -469,8 +495,25 @@ def fused_prime(kernel: Kernel, bound: BoundKernel, args: tuple[object, ...]) ->
     namespace["_pm"] = compiled.packed_metadata
     namespace["_compiled"] = compiled  # keep alive so _run/_fn stay valid
     # pyrefly: ignore [missing-attribute]
-    namespace["_active"] = _triton_driver().active
+    active = _triton_driver().active
+    namespace["_active"] = active
     namespace["_Changed"] = GlobalsChanged
+
+    launch_device: int | None = None
+    for a in args:
+        ta = type(a)
+        if ta is torch.Tensor or ta is torch.nn.Parameter:
+            # pyrefly: ignore [missing-attribute]
+            launch_device = a.device.index
+            break
+    if launch_device is not None:
+        namespace["_stream"] = active.get_current_stream
+        namespace["_dev"] = launch_device
+        stream_expr = "_stream(_dev)"
+    else:
+        namespace["_get_stream"] = active.get_current_stream
+        namespace["_get_dev"] = active.get_current_device
+        stream_expr = "_get_stream(_get_dev())"
 
     # Inline captured-globals verification: a mutated OR deleted global compares
     # unequal (deletion reads the _MISSING sentinel via .get), raising
@@ -478,10 +521,12 @@ def fused_prime(kernel: Kernel, bound: BoundKernel, args: tuple[object, ...]) ->
     # raises Triton's own error).
     namespace["_MISSING"] = _MISSING_GLOBAL
     guard_conds: list[str] = []
+    trusted_no_guard = True
     for gi, ((name, _), (val, gdict)) in enumerate(
         # pyrefly: ignore [missing-attribute]
         triton_kernel.used_global_vals.items()
     ):
+        trusted_no_guard = trusted_no_guard and _is_helion_block_size_global(name)
         namespace[f"_g{gi}"] = gdict
         namespace[f"_gv{gi}"] = val
         guard_conds.append(f"_g{gi}.get({name!r}, _MISSING) != _gv{gi}")
@@ -494,12 +539,75 @@ def fused_prime(kernel: Kernel, bound: BoundKernel, args: tuple[object, ...]) ->
         "def _launch(a):\n"
         f"{guard}"
         "    _run(_gx, _gy, _gz, "
-        "_active.get_current_stream(_active.get_current_device()), "
+        f"{stream_expr}, "
         "_fn, _pm, None, None, None"
         f"{', ' + launch_args if launch_args else ''})\n"
     )
     exec(src, namespace)
     launch = cast("Callable[[tuple[object, ...]], None]", namespace["_launch"])
+    direct_params = ", ".join(f"a{i}" for i in range(len(args)))
+    direct_launch_args = ", ".join(direct_arg_parts)
+    direct_src = (
+        f"def _direct_launch({direct_params}):\n"
+        f"{guard}"
+        "    _run(_gx, _gy, _gz, "
+        f"{stream_expr}, "
+        "_fn, _pm, None, None, None"
+        f"{', ' + direct_launch_args if direct_launch_args else ''})\n"
+    )
+    exec(direct_src, namespace)
+    direct_launch = namespace["_direct_launch"]
+    launch._helion_direct_launch = direct_launch  # type: ignore[attr-defined]
+    trusted_direct_launch = direct_launch
+    if trusted_no_guard and guard:
+        trusted_direct_src = (
+            f"def _trusted_direct_launch({direct_params}):\n"
+            "    _run(_gx, _gy, _gz, "
+            f"{stream_expr}, "
+            "_fn, _pm, None, None, None"
+            f"{', ' + direct_launch_args if direct_launch_args else ''})\n"
+        )
+        exec(trusted_direct_src, namespace)
+        trusted_direct_launch = namespace["_trusted_direct_launch"]
+        launch._helion_trusted_direct_launch = trusted_direct_launch  # type: ignore[attr-defined]
+    elif trusted_no_guard:
+        launch._helion_trusted_direct_launch = direct_launch  # type: ignore[attr-defined]
+    tensor_direct_src = (
+        f"def _tensor_direct_launch({', '.join(tensor_direct_params)}):\n"
+        f"{guard}"
+        "    _run(_gx, _gy, _gz, "
+        f"{stream_expr}, "
+        "_fn, _pm, None, None, None"
+        f"{', ' + ', '.join(tensor_direct_arg_parts) if tensor_direct_arg_parts else ''})\n"
+    )
+    exec(tensor_direct_src, namespace)
+    direct_launch._helion_tensor_direct_launch = namespace[  # type: ignore[attr-defined]
+        "_tensor_direct_launch"
+    ]
+    launch._helion_tensor_direct_launch = namespace[  # type: ignore[attr-defined]
+        "_tensor_direct_launch"
+    ]
+    if trusted_no_guard:
+        trusted_tensor_direct_launch = namespace["_tensor_direct_launch"]
+        if guard:
+            trusted_tensor_direct_src = (
+                f"def _trusted_tensor_direct_launch({', '.join(tensor_direct_params)}):\n"
+                "    _run(_gx, _gy, _gz, "
+                f"{stream_expr}, "
+                "_fn, _pm, None, None, None"
+                f"{', ' + ', '.join(tensor_direct_arg_parts) if tensor_direct_arg_parts else ''})\n"
+            )
+            exec(trusted_tensor_direct_src, namespace)
+            trusted_tensor_direct_launch = namespace["_trusted_tensor_direct_launch"]
+        direct_launch._helion_trusted_tensor_direct_launch = (  # type: ignore[attr-defined]
+            trusted_tensor_direct_launch
+        )
+        trusted_direct_launch._helion_trusted_tensor_direct_launch = (  # type: ignore[attr-defined]
+            trusted_tensor_direct_launch
+        )
+        launch._helion_trusted_tensor_direct_launch = (  # type: ignore[attr-defined]
+            trusted_tensor_direct_launch
+        )
 
     # Key on the same per-call, type-dispatched key the hot path uses.  It is
     # strictly finer than the specialization key (includes exact metadata,

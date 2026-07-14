@@ -1439,6 +1439,23 @@ class TestFusedLauncher(TestCase):
 
         return add_out
 
+    @staticmethod
+    def _first_jit_fn(kernel):
+        from triton.runtime.jit import JITFunction
+
+        bound = next(iter(kernel._bound_kernels.values()))  # type: ignore[attr-defined]
+        return next(
+            v for v in bound._run.__globals__.values() if isinstance(v, JITFunction)
+        )
+
+    @staticmethod
+    def _is_block_size_global_name(name: object) -> bool:
+        return (
+            type(name) is str
+            and name.startswith("_BLOCK_SIZE_")
+            and name[len("_BLOCK_SIZE_") :].isdigit()
+        )
+
     @skipIfRefEager("Inspects the kernel's fused-launch cache, absent in ref eager")
     def test_fused_cache_engages_for_out_arg_kernel(self) -> None:
         add_out = self._add_out_kernel()
@@ -1464,6 +1481,64 @@ class TestFusedLauncher(TestCase):
         torch.accelerator.synchronize()
         self.assertEqual(len(add_out._fused_recipes), 1)  # type: ignore[attr-defined]
         torch.testing.assert_close(out, x + y)
+
+    @skipIfRefEager("Inspects the kernel's fused-launch cache, absent in ref eager")
+    def test_trusted_direct_launch_attrs_require_only_block_size_globals(self) -> None:
+        add_out = self._add_out_kernel()
+        n = 1024
+        x = torch.randn(n, device=DEVICE, dtype=torch.float32)
+        out = torch.empty(n, device=DEVICE, dtype=torch.float32)
+
+        add_out(x, x, out)
+        jit_fn = self._first_jit_fn(add_out)
+        used_global_vals = getattr(jit_fn, "used_global_vals", None)
+        if not used_global_vals:
+            self.skipTest("This kernel has no used_global_vals to inspect")
+        self.assertTrue(
+            all(
+                self._is_block_size_global_name(name)
+                for (name, _gid) in used_global_vals
+            )
+        )
+
+        add_out(x, x, out)
+        torch.accelerator.synchronize()
+        if not add_out._fused_recipes:  # type: ignore[attr-defined]
+            self.skipTest("Fused launch did not engage (a Triton hook/knob)")
+        launch = next(iter(add_out._fused_recipes.values()))  # type: ignore[attr-defined]
+        self.assertTrue(hasattr(launch, "_helion_direct_launch"))
+        self.assertTrue(hasattr(launch, "_helion_tensor_direct_launch"))
+        self.assertTrue(hasattr(launch, "_helion_trusted_direct_launch"))
+        self.assertTrue(hasattr(launch, "_helion_trusted_tensor_direct_launch"))
+
+        guarded_add_out = self._add_out_kernel()
+        guarded_out = torch.empty(n, device=DEVICE, dtype=torch.float32)
+        guarded_add_out(x, x, guarded_out)
+        guarded_jit_fn = self._first_jit_fn(guarded_add_out)
+        guarded_used_global_vals = getattr(guarded_jit_fn, "used_global_vals", None)
+        if guarded_used_global_vals is None:
+            self.skipTest("This kernel has no used_global_vals mapping to mutate")
+
+        sentinel_name = "_TRUSTED_DIRECT_LAUNCH_TEST_GLOBAL"
+        sentinel_key = (sentinel_name, id(globals()))
+        globals()[sentinel_name] = 17
+        guarded_used_global_vals[sentinel_key] = (17, globals())
+        try:
+            guarded_add_out(x, x, guarded_out)
+            torch.accelerator.synchronize()
+        finally:
+            guarded_used_global_vals.pop(sentinel_key, None)
+            globals().pop(sentinel_name, None)
+
+        if not guarded_add_out._fused_recipes:  # type: ignore[attr-defined]
+            self.skipTest("Fused launch did not engage (a Triton hook/knob)")
+        guarded_launch = next(  # type: ignore[attr-defined]
+            iter(guarded_add_out._fused_recipes.values())
+        )
+        self.assertTrue(hasattr(guarded_launch, "_helion_direct_launch"))
+        self.assertTrue(hasattr(guarded_launch, "_helion_tensor_direct_launch"))
+        self.assertFalse(hasattr(guarded_launch, "_helion_trusted_direct_launch"))
+        self.assertFalse(hasattr(guarded_launch, "_helion_trusted_tensor_direct_launch"))
 
     @skipIfRefEager("Inspects the kernel's fused-launch cache, absent in ref eager")
     def test_fused_disabled_for_tensor_returning_kernel(self) -> None:
