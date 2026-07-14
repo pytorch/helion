@@ -71,6 +71,7 @@ def _run_pretuned_kernel_main_and_parse_summary(name):
 
 _CORRECTNESS_SHAPES = {
     "vector_add": [2**20],
+    "attention": [(2, 8, 512, 64)],
     "softmax": [(4096, 1024)],
     "layer_norm": [(4096, 1024)],
     "rms_norm": [(2048, 4096)],
@@ -90,6 +91,15 @@ def _make_vector_add_inputs(shape):
     x = torch.randn(n, device=DEVICE, dtype=torch.float32)
     y = torch.randn(n, device=DEVICE, dtype=torch.float32)
     return (x, y), lambda: x + y
+
+
+def _make_attention_inputs(shape):
+    z, h, seq_len, head_dim = shape
+    q, k, v = (
+        torch.randn(z, h, seq_len, head_dim, device=DEVICE, dtype=torch.float16)
+        for _ in range(3)
+    )
+    return (q, k, v), lambda: F.scaled_dot_product_attention(q, k, v)
 
 
 def _make_softmax_inputs(shape):
@@ -211,6 +221,7 @@ def _make_rope_bwd_inputs(shape):
 
 _INPUT_BUILDERS = {
     "vector_add": _make_vector_add_inputs,
+    "attention": _make_attention_inputs,
     "softmax": _make_softmax_inputs,
     "layer_norm": _make_layer_norm_inputs,
     "rms_norm": _make_rms_norm_inputs,
@@ -223,6 +234,7 @@ _INPUT_BUILDERS = {
 # vector_add because reductions accumulate fp32 and round back to fp16/bf16.
 _TOLERANCES = {
     "vector_add": (1e-5, 1e-5),
+    "attention": (5e-2, 2e-2),
     "softmax": (1e-3, 1e-3),
     "layer_norm": (1e-2, 1e-2),
     "rms_norm": (1e-2, 1e-2),
@@ -371,6 +383,9 @@ class TestPretunedKernelsCorrectness(TestCase):
 
     def test_vector_add(self):
         self._run_correctness("vector_add")
+
+    def test_attention(self):
+        self._run_correctness("attention")
 
     def test_softmax(self):
         self._run_correctness("softmax")
