@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
+from dataclasses import field
 import json
 import logging
 import os
@@ -18,6 +20,7 @@ from helion.autotuner.search_space_logger import save_exploration_report
 from helion.autotuner.search_space_logger import save_search_space_summary
 
 
+@dataclass
 class _FakeConfig:
     """Minimal stand-in for runtime.Config used by the tracker.
 
@@ -25,18 +28,10 @@ class _FakeConfig:
     ``_extract_feature_value``, so a simple attribute holder is enough.
     """
 
-    def __init__(
-        self,
-        *,
-        block_sizes: list[int],
-        loop_orders: list[int],
-        num_warps: int,
-        epilogue_subtile: object = None,
-    ) -> None:
-        self.block_sizes = block_sizes
-        self.loop_orders = loop_orders
-        self.num_warps = num_warps
-        self.epilogue_subtile = epilogue_subtile
+    block_sizes: list[int] = field(kw_only=True)
+    loop_orders: list[int] = field(kw_only=True)
+    num_warps: int = field(kw_only=True)
+    epilogue_subtile: object = field(default=None, kw_only=True)
 
 
 def _summary(
@@ -384,9 +379,9 @@ class _FakeSpec:
         self.__dict__.update(attrs)
 
 
+@dataclass
 class _FakeLoopSpec:
-    def __init__(self, block_ids: list[int]) -> None:
-        self.block_ids = block_ids
+    block_ids: list[int]
 
 
 class TestAnalyzeDimensionSize(unittest.TestCase):

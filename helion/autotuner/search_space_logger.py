@@ -338,7 +338,7 @@ class FeatureExplorationTracker:
         self.tested_configs.append(config)
 
         # Extract feature values from config
-        for feature_name in self._feature_value_sets.keys():
+        for feature_name in self._feature_value_sets:
             value = _extract_feature_value(config, feature_name)
             if value is not None:
                 try:
