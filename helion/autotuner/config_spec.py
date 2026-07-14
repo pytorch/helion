@@ -84,21 +84,20 @@ if TYPE_CHECKING:
 
 log = logging.getLogger(__name__)
 
-# When True, search-space restriction decisions are logged live (at INFO) the
-# moment they are applied, in addition to being recorded for the end-of-run
-# summary. Set from settings by the autotuner (see BaseSearch._prepare); left
-# False otherwise so restrictions applied outside autotuning stay quiet.
-LOG_RESTRICTIONS_VERBOSE = False
 
-
-def _live_log_restriction(feature: str, reason: str) -> None:
+def _live_log_restriction(feature: str, reason: str, verbose: bool) -> None:
     """Log a search-space restriction live (at INFO), best-effort.
+
+    ``verbose`` is the owning :class:`ConfigSpec`'s
+    ``log_restrictions_verbose`` flag (sourced from
+    ``Settings.autotune_log_search_space_verbose``); when False this is a no-op
+    so restrictions applied outside verbose autotuning stay quiet.
 
     Purely diagnostic: any failure here must never disrupt compilation or the
     autotuner loop.
     """
     try:
-        if LOG_RESTRICTIONS_VERBOSE and log.isEnabledFor(logging.INFO):
+        if verbose and log.isEnabledFor(logging.INFO):
             log.info(
                 "Autotuner feature restriction: %s (%s)",
                 feature,
@@ -112,8 +111,12 @@ def _record_restriction(
     store: list[tuple[str, str]],
     feature: str,
     reason: str | None,
+    verbose: bool,
 ) -> None:
     """Record a search-space restriction and, when verbose, log it live.
+
+    ``verbose`` is the owning :class:`ConfigSpec`'s
+    ``log_restrictions_verbose`` flag.
 
     Purely diagnostic: any failure here must never disrupt compilation or the
     autotuner loop, so the whole body is best-effort.
@@ -130,7 +133,7 @@ def _record_restriction(
             store.append(pair)
     except Exception:  # noqa: BLE001 - diagnostic only, never disrupt autotuning
         log.debug("Failed to record search-space restriction", exc_info=True)
-    _live_log_restriction(feature, reason)
+    _live_log_restriction(feature, reason, verbose)
 
 
 _TARGET_DEVICE_CAPABILITY_UNSET = object()
@@ -558,9 +561,17 @@ class ConfigSpec:
         | None = _TARGET_DEVICE_CAPABILITY_UNSET,
         device: torch.device | None = None,
         num_sm: int | None = None,
+        log_restrictions_verbose: bool = False,
     ) -> None:
         self.backend = backend
         self.backend_name = backend.name
+        # When True, search-space restriction decisions are logged live (at
+        # INFO) the moment they are applied, in addition to being recorded for
+        # the end-of-run summary. Sourced from
+        # ``Settings.autotune_log_search_space_verbose`` by the compile path
+        # (see CompileEnvironment); left False otherwise so restrictions applied
+        # outside verbose autotuning stay quiet.
+        self.log_restrictions_verbose = log_restrictions_verbose
         self.max_reduction_threads = backend.max_reduction_threads()
         self.max_reduction_loop = backend.max_reduction_loop()
         self.reduction_loop_force_threshold = self.max_reduction_threads
@@ -787,8 +798,10 @@ class ConfigSpec:
             [x for x in self.allowed_pid_types if x != pid_type]
         )
         assert self.allowed_pid_types
-        if newly_disabled and reason is not None and LOG_RESTRICTIONS_VERBOSE:
-            _live_log_restriction(f"pid_type={pid_type!r} disabled", reason)
+        if newly_disabled and reason is not None and self.log_restrictions_verbose:
+            _live_log_restriction(
+                f"pid_type={pid_type!r} disabled", reason, self.log_restrictions_verbose
+            )
 
     @property
     def cute_tcgen05_search_enabled(self) -> bool:
@@ -1322,6 +1335,7 @@ class ConfigSpec:
             self.restriction_reasons,
             "tcgen05 search narrowed to validated configs",
             reason,
+            self.log_restrictions_verbose,
         )
 
     def supports_config_key(self, key: str) -> bool:

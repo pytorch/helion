@@ -539,38 +539,30 @@ class TestRestrictionReasons(unittest.TestCase):
         from helion.autotuner import config_spec as cs
 
         store: list[tuple[str, str]] = []
-        cs._record_restriction(store, "tcgen05 narrowed", "matmul cute backend")
-        cs._record_restriction(store, "tcgen05 narrowed", "matmul cute backend")
+        cs._record_restriction(store, "tcgen05 narrowed", "matmul cute backend", False)
+        cs._record_restriction(store, "tcgen05 narrowed", "matmul cute backend", False)
         self.assertEqual(store, [("tcgen05 narrowed", "matmul cute backend")])
 
     def test_disallow_pid_type_logs_live_when_verbose(self) -> None:
+        from helion._compiler.backend import TritonBackend
         from helion.autotuner import config_spec as cs
+        from helion.autotuner.config_spec import ConfigSpec
 
-        spec = self._spec()
-        prev = cs.LOG_RESTRICTIONS_VERBOSE
-        cs.LOG_RESTRICTIONS_VERBOSE = True
-        try:
-            with self.assertLogs(cs.log, level="INFO") as captured:
-                spec.disallow_pid_type("xyz", reason="grid too large")
-            self.assertTrue(any("xyz" in line for line in captured.output))
-        finally:
-            cs.LOG_RESTRICTIONS_VERBOSE = prev
+        spec = ConfigSpec(backend=TritonBackend(), log_restrictions_verbose=True)
+        with self.assertLogs(cs.log, level="INFO") as captured:
+            spec.disallow_pid_type("xyz", reason="grid too large")
+        self.assertTrue(any("xyz" in line for line in captured.output))
 
     def test_no_live_log_when_flag_off(self) -> None:
         """With the flag off, disallow records the reason but emits no INFO log."""
+        from helion._compiler.backend import TritonBackend
         from helion.autotuner import config_spec as cs
+        from helion.autotuner.config_spec import ConfigSpec
 
-        spec = self._spec()
-        prev = cs.LOG_RESTRICTIONS_VERBOSE
-        cs.LOG_RESTRICTIONS_VERBOSE = False
-        try:
-            with self.assertNoLogs(cs.log, level="INFO"):
-                spec.disallow_pid_type("xyz", reason="grid too large")
-            self.assertEqual(
-                spec.disallowed_pid_type_reasons["xyz"], "grid too large"
-            )
-        finally:
-            cs.LOG_RESTRICTIONS_VERBOSE = prev
+        spec = ConfigSpec(backend=TritonBackend(), log_restrictions_verbose=False)
+        with self.assertNoLogs(cs.log, level="INFO"):
+            spec.disallow_pid_type("xyz", reason="grid too large")
+        self.assertEqual(spec.disallowed_pid_type_reasons["xyz"], "grid too large")
 
 
 class TestSaveOutputPathHandling(unittest.TestCase):

@@ -155,6 +155,13 @@ def _env_get_str(var_name: str, default: str) -> str:
     return value
 
 
+def _env_get_str_or_none(var_name: str, default: str | None) -> str | None:
+    value = os.environ.get(var_name)
+    if value is None or (value := value.strip()) == "":
+        return default
+    return value
+
+
 def _get_index_dtype() -> torch.dtype | None:
     value = os.environ.get("HELION_INDEX_DTYPE")
     if value is None or (token := value.strip()) == "":
@@ -607,7 +614,7 @@ class _Settings:
     )
     autotune_log_search_space_path: str | None = dataclasses.field(
         default_factory=functools.partial(
-            _env_get_str, "HELION_AUTOTUNE_LOG_SEARCH_SPACE_PATH", None
+            _env_get_str_or_none, "HELION_AUTOTUNE_LOG_SEARCH_SPACE_PATH", None
         )
     )
 

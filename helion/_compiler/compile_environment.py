@@ -263,6 +263,7 @@ class CompileEnvironment:
             target_device_capability=target_device_capability(device),
             device=device,
             num_sm=_num_sm,
+            log_restrictions_verbose=settings.autotune_log_search_space_verbose,
         )
         # TODO(hinriksnaer): tracing state, not env config. move to CompilerState?
         self.kernel_tensor_sizes: dict[tuple[sympy.Expr, ...], int] = (

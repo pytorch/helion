@@ -217,7 +217,7 @@ The `search_space_logger` module provides tools to analyze and log the valid sea
 
 #### Search Space Analysis Example
 
-When search space logging is enabled (default), you'll see output like:
+When search space logging is enabled (opt-in), you'll see output like:
 
 ```
 ============================================================
