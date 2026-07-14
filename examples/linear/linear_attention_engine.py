@@ -509,9 +509,9 @@ def chunk_fwd_o_helion(
         causal = (idx[:, None] >= idx[None, :]).float()
         if use_g:
             gc = g_cs[tile_bhn, :]
-            decay_ij = torch.exp(gc[:, :, None] - gc[:, None, :])
+            decay_ij = torch.exp2((gc[:, :, None] - gc[:, None, :]) * RCP_LN2)
             attn = attn * decay_ij * causal
-            o_cross = o_cross * torch.exp(gc)[:, :, None]
+            o_cross = o_cross * torch.exp2(gc * RCP_LN2)[:, :, None]
         else:
             attn = attn * causal
 
