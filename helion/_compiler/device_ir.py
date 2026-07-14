@@ -3731,10 +3731,14 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
                             else can_codegen_cute_mma_aten(node, with_acc=with_acc)
                         )
                         if codegen_ok:
+                            # Re-invoke only to open the batched search surface;
+                            # the tracing path already recorded this matmul's
+                            # fact, so don't append a duplicate.
                             enforce_dot_requirements(
                                 lhs,
                                 rhs,
                                 allow_batched_cute_tcgen05=True,
+                                record_fact=False,
                             )
         config_spec.raise_grid_block_minimums()
         if len(device_ir.root_ids) > 1:

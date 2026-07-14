@@ -223,6 +223,7 @@ def enforce_dot_requirements(
     rhs: torch.Tensor,
     *,
     allow_batched_cute_tcgen05: bool = False,
+    record_fact: bool = True,
 ) -> None:
     """Update config-spec min/max sizes for a dot/matmul.
 
@@ -233,6 +234,12 @@ def enforce_dot_requirements(
     tcgen05 search surface; it is passed True only by the DeviceIR post-pass
     for structurally codegen-able batched matmuls -- aten mm/bmm/addmm/baddbmm
     and hl.dot, both plain 3-D and mixed-rank shared-weight ([B,M,K]@[K,N]).
+
+    ``record_fact`` appends the ``MatmulFact`` used by autotune heuristics.
+    The DeviceIR batched post-pass re-invokes this purely to open the batched
+    search surface on a matmul the tracing path already recorded a fact for, so
+    it passes ``record_fact=False`` to avoid a duplicate fact -- the block-size
+    constraint updates below are idempotent, but the fact append is not.
     """
 
     # Last two dims are used for matmul
@@ -291,20 +298,21 @@ def enforce_dot_requirements(
     static_m = static_problem_extent(m)
     static_n = static_problem_extent(n)
     static_k = static_problem_extent(k)
-    env.config_spec.matmul_facts.append(
-        MatmulFact(
-            lhs_ndim=lhs.ndim,
-            rhs_ndim=rhs.ndim,
-            m_block_id=env.get_block_id(m),
-            n_block_id=env.get_block_id(n),
-            k_block_id=env.get_block_id(k),
-            static_m=static_m,
-            static_n=static_n,
-            static_k=static_k,
-            lhs_dtype=lhs.dtype,
-            rhs_dtype=rhs.dtype,
+    if record_fact:
+        env.config_spec.matmul_facts.append(
+            MatmulFact(
+                lhs_ndim=lhs.ndim,
+                rhs_ndim=rhs.ndim,
+                m_block_id=env.get_block_id(m),
+                n_block_id=env.get_block_id(n),
+                k_block_id=env.get_block_id(k),
+                static_m=static_m,
+                static_n=static_n,
+                static_k=static_k,
+                lhs_dtype=lhs.dtype,
+                rhs_dtype=rhs.dtype,
+            )
         )
-    )
     # tcgen05 MMA-K is 16 elements for BF16/FP16 but 32 for FP8 (e4m3); the
     # block_k search granularity and minimum must follow the active dtype.
     is_fp8 = lhs.dtype == torch.float8_e4m3fn
