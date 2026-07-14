@@ -563,11 +563,16 @@ def _slice_code(
     from helion._compiler.tile_strategy import DeviceLoopState
 
     assert isinstance(pattern, ArbitrarySlicePattern)
+    assert isinstance(idx, slice)
 
     if idx != slice(None):
-        raise AssertionError(
-            f"Arbitrary slice expr {slice} not supported in Pallas backend yet"
+        # Bounded contiguous slice on an untiled dim: static slice into the
+        # full-width block.
+        start = (
+            "" if idx.start is None else state.device_function.literal_expr(idx.start)
         )
+        stop = "" if idx.stop is None else state.device_function.literal_expr(idx.stop)
+        return f"{start}:{stop}"
 
     env = CompileEnvironment.current()
     block_id = env.resolve_block_id(tensor.shape[tensor_dim])
