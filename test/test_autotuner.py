@@ -35,6 +35,7 @@ from helion._testing import DEVICE
 from helion._testing import RefEagerTestDisabled
 from helion._testing import TestCase
 from helion._testing import assert_close_with_mismatch_tolerance
+from helion._testing import get_test_float32_matmul_precision
 from helion._testing import import_path
 from helion._testing import onlyBackends
 from helion._testing import skipIfCudaCapabilityLessThan
@@ -127,6 +128,33 @@ class RecordingRandomSearch(RandomSearch):
     def _autotune(self):
         self.samples.append(random.random())
         return super()._autotune()
+
+
+class TestMismatchTolerance(TestCase):
+    def test_get_test_float32_matmul_precision_pallas_interpret(self) -> None:
+        with (
+            patch("helion._testing._get_backend", return_value="pallas"),
+            patch("helion._testing.is_pallas_interpret", return_value=True),
+        ):
+            self.assertEqual(get_test_float32_matmul_precision(), "high")
+
+    def test_get_test_float32_matmul_precision_real_pallas(self) -> None:
+        with (
+            patch("helion._testing._get_backend", return_value="pallas"),
+            patch("helion._testing.is_pallas_interpret", return_value=False),
+        ):
+            self.assertEqual(get_test_float32_matmul_precision(), "medium")
+
+    def test_assert_close_with_mismatch_tolerance_bounds_mismatches(self) -> None:
+        with self.assertRaisesRegex(
+            AssertionError, "Mismatched absolute diff too large"
+        ):
+            assert_close_with_mismatch_tolerance(
+                torch.tensor([10.0, 1.0, 1.0, 1.0], device=DEVICE),
+                torch.tensor([1.0, 1.0, 1.0, 1.0], device=DEVICE),
+                max_mismatch_pct=0.5,
+                max_mismatched_abs_diff=5.0,
+            )
 
 
 @onlyBackends(["triton"])
