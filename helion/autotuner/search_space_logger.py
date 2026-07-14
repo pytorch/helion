@@ -647,9 +647,7 @@ def _analyze_dimension_size(
                 name="num_stages",
                 dim_type="discrete",
                 size=size,
-                values=list(range(frag.low, frag.high + 1))
-                if size <= 20
-                else None,
+                values=list(range(frag.low, frag.high + 1)) if size <= 20 else None,
             )
 
     elif key == "maxnreg":

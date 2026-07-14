@@ -158,14 +158,14 @@ def my_kernel(x: torch.Tensor) -> torch.Tensor:
 .. autoattribute:: Settings.autotune_log_search_space
 
     Enable search space analysis logging after autotuning. When enabled, Helion logs:
-    
+
     - **Search space summary**: Total search space size, enabled/disabled features with reasons, shape constraints
     - **Coverage metrics**: Configs tested vs. total space, coverage percentage
     - **Feature exploration report**: Per-feature statistics showing how many options were tested (e.g., "pid_type: 2/8 options tested (25.0%)")
     - **Exploration quality**: Average and minimum feature coverage, highlighting poorly explored features (<50%)
-    
+
     Default is ``False``. Controlled by ``HELION_AUTOTUNE_LOG_SEARCH_SPACE`` (set to ``1`` to enable).
-    
+
     See :doc:`autotuner` for example output and the :py:mod:`helion.autotuner.search_space_logger` module for implementation details.
 
 .. autoattribute:: Settings.autotune_log_search_space_verbose
@@ -185,10 +185,10 @@ def my_kernel(x: torch.Tensor) -> torch.Tensor:
     Optional path to save search space analysis as JSON. When set, Helion writes two files per autotuned
     kernel/shape. The kernel name and the autotuner's stable cache hash are injected into the filename stem
     (matching the ``.best_config`` cache key) so distinct kernels/shapes do not overwrite each other:
-    
+
     - ``<stem>.<kernel>.<hash>.json``: Search space summary with dimensions, constraints, and coverage metrics
     - ``<stem>.<kernel>.<hash>_exploration.json``: Per-feature exploration statistics (all possible values vs. tested values)
-    
+
     For example, ``autotune_log_search_space_path="/tmp/analysis.json"`` yields files like
     ``/tmp/analysis.my_kernel.3f9a1c2e.json`` and ``/tmp/analysis.my_kernel.3f9a1c2e_exploration.json``.
     A directory (existing path or trailing separator) is also accepted, in which case the default

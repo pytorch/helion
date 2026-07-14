@@ -69,7 +69,9 @@ class TestFeatureExplorationStats(unittest.TestCase):
             coverage_percent=50.0,
         )
         self.assertEqual(stats.total_options, 6)
-        self.assertEqual(stats.to_summary_line(), "num_warps: 3/6 options tested (50.0%)")
+        self.assertEqual(
+            stats.to_summary_line(), "num_warps: 3/6 options tested (50.0%)"
+        )
 
     def test_zero_options_renders_not_applicable(self) -> None:
         """A feature with no autotunable choices renders text, not '0/0'."""
@@ -129,9 +131,7 @@ class TestFeatureExplorationTracker(unittest.TestCase):
         # block_sizes: 16 unique tuples tested, denominator = size (4096), not 0.
         self.assertEqual(by_name["block_sizes"].total_options, 4096)
         self.assertEqual(len(by_name["block_sizes"].tested_values), 16)
-        self.assertAlmostEqual(
-            by_name["block_sizes"].coverage_percent, 16 / 4096 * 100
-        )
+        self.assertAlmostEqual(by_name["block_sizes"].coverage_percent, 16 / 4096 * 100)
 
         # loop_orders: 2 unique permutations tested, denominator = size (24).
         self.assertEqual(by_name["loop_orders"].total_options, 24)
@@ -277,7 +277,9 @@ class TestExploredValidityTracking(unittest.TestCase):
         report.log_summary(logger)
         return "\n".join(handler.lines)
 
-    def _report(self, *, explored_valid: int, explored_invalid: int) -> ExplorationReport:
+    def _report(
+        self, *, explored_valid: int, explored_invalid: int
+    ) -> ExplorationReport:
         return ExplorationReport(
             kernel_name="k",
             backend="triton",
@@ -332,17 +334,13 @@ class TestDisabledFeatureGrouping(unittest.TestCase):
         self.assertIn("78 feature(s) not supported by triton backend", summary_lines[0])
         # No individual cute_flash_* line should be emitted.
         self.assertFalse(
-            any(
-                "- cute_flash_x" in ln and "feature(s)" not in ln for ln in lines
-            )
+            any("- cute_flash_x" in ln and "feature(s)" not in ln for ln in lines)
         )
 
     def test_no_generic_line_when_none_collapsible(self) -> None:
         disabled = ["epilogue_subtile: Not a matmul-like kernel"]
         lines = _capture(_summary(dimensions=[], disabled_features=disabled))
-        self.assertFalse(
-            any("feature(s) not supported by" in ln for ln in lines)
-        )
+        self.assertFalse(any("feature(s) not supported by" in ln for ln in lines))
 
 
 class TestExplorationReportSummary(unittest.TestCase):
@@ -570,7 +568,9 @@ class TestSaveOutputPathHandling(unittest.TestCase):
     autotuner on awkward output paths (directory, missing parents, etc.) and
     must produce per-kernel/per-hash filenames that don't clobber each other."""
 
-    def _summary_obj(self, kernel_name: str = "kernel_under_test") -> SearchSpaceSummary:
+    def _summary_obj(
+        self, kernel_name: str = "kernel_under_test"
+    ) -> SearchSpaceSummary:
         dims = [
             SearchSpaceDimension(
                 name="num_warps",

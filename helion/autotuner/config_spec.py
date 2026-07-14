@@ -103,7 +103,7 @@ def _live_log_restriction(feature: str, reason: str, verbose: bool) -> None:
                 feature,
                 reason,
             )
-    except Exception:  # noqa: BLE001 - diagnostic only, never disrupt autotuning
+    except Exception:
         log.debug("Failed to log search-space restriction", exc_info=True)
 
 
@@ -131,7 +131,7 @@ def _record_restriction(
         # order (the field's documented contract).
         if pair not in store:
             store.append(pair)
-    except Exception:  # noqa: BLE001 - diagnostic only, never disrupt autotuning
+    except Exception:
         log.debug("Failed to record search-space restriction", exc_info=True)
     _live_log_restriction(feature, reason, verbose)
 
