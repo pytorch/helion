@@ -29,15 +29,16 @@ _CONFIG_nvfp4_gemv_fp4in_kernel = {
     "range_multi_buffers": [None, True],
 }
 
-# W4A16 (NVFP4 weight * BF16 activation). block_m=16 (activation reuse across the
-# 16 output rows) + inner K tile block_g=128 so register pressure is bounded by the
-# tile, not the full K -- the untiled body spilled catastrophically at large K
-# (1298us at K=28672). Tuned across N=8192 K in {8192, 28672} and validated against
-# the dequant reference: 27us at K=8192, 83us at K=28672 (cold-L2 cudagraph).
+# W4A16 (NVFP4 weight * BF16 activation). block_m=32 + inner K tile block_g=128.
+# The weight is now loaded as one coalesced int64 per scale group (16 packed fp4)
+# like the fp4in fast path, instead of a strided 2x int32 layout -- weight is the
+# dominant DRAM traffic in a decode GEMV. Tuned across N=8192, K in {8192, 28672}
+# and validated against the dequant reference: 20us at K=8192, 63us at K=28672
+# (cold-L2 cudagraph), down from 27us / 83us with the int32 layout.
 _CONFIG_nvfp4_gemv_bf16in_kernel = {
-    "block_sizes": [16, 128],
-    "num_warps": 2,
-    "num_stages": 3,
+    "block_sizes": [32, 128],
+    "num_warps": 4,
+    "num_stages": 2,
 }
 
 
