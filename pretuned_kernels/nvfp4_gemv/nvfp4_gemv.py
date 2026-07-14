@@ -162,39 +162,50 @@ def nvfp4_gemv_bf16in_kernel(
     out: torch.Tensor,  # (M,) bf16 output
     alpha: float = 1.0,
 ) -> torch.Tensor:
-    """W4A16 NVFP4 GEMV: fp16 weight decode * (bf16 x cast to fp16), fp32 scale."""
+    """W4A16 NVFP4 GEMV: fp16 weight decode * (bf16 x cast to fp16), fp32 scale.
+
+    Tiles over both M and the K scale-group dim so register pressure is bounded
+    by ``block_g`` rather than the full K (which spills catastrophically for
+    large K); the K tiles accumulate into a per-row fp32 ``acc``.
+    """
     M, _K_units, _ = weight_words.shape
     block_m = hl.register_block_size(1, 16)
+    block_g = hl.register_block_size(_K_units)
     f16 = torch.float16
     for tile_m in hl.tile(M, block_size=block_m):
-        scale_j = hl.arange(_K_units)
-        w0, w1, w2, w3, w4, w5, w6, w7 = _fp4_word_to_f16x8(weight_words[tile_m, :, 0])
-        contrib0 = (
-            w0 * x_values[:, 0].to(f16)
-            + w1 * x_values[:, 1].to(f16)
-            + w2 * x_values[:, 2].to(f16)
-            + w3 * x_values[:, 3].to(f16)
-            + w4 * x_values[:, 4].to(f16)
-            + w5 * x_values[:, 5].to(f16)
-            + w6 * x_values[:, 6].to(f16)
-            + w7 * x_values[:, 7].to(f16)
-        )
-        w0, w1, w2, w3, w4, w5, w6, w7 = _fp4_word_to_f16x8(weight_words[tile_m, :, 1])
-        contrib1 = (
-            w0 * x_values[:, 8].to(f16)
-            + w1 * x_values[:, 9].to(f16)
-            + w2 * x_values[:, 10].to(f16)
-            + w3 * x_values[:, 11].to(f16)
-            + w4 * x_values[:, 12].to(f16)
-            + w5 * x_values[:, 13].to(f16)
-            + w6 * x_values[:, 14].to(f16)
-            + w7 * x_values[:, 15].to(f16)
-        )
-        scale_offsets = swizzled_scale_offsets(
-            tile_m.index[:, None], scale_j[None, :], _K_units
-        )
-        scale = _e4m3_byte_to_f32(weight_scale_bytes[scale_offsets])
-        acc = ((contrib0 + contrib1).to(torch.float32) * scale).sum(-1)
+        acc = hl.zeros([tile_m], dtype=torch.float32)
+        for tile_g in hl.tile(_K_units, block_size=block_g):
+            w0, w1, w2, w3, w4, w5, w6, w7 = _fp4_word_to_f16x8(
+                weight_words[tile_m, tile_g, 0]
+            )
+            contrib0 = (
+                w0 * x_values[tile_g, 0].to(f16)
+                + w1 * x_values[tile_g, 1].to(f16)
+                + w2 * x_values[tile_g, 2].to(f16)
+                + w3 * x_values[tile_g, 3].to(f16)
+                + w4 * x_values[tile_g, 4].to(f16)
+                + w5 * x_values[tile_g, 5].to(f16)
+                + w6 * x_values[tile_g, 6].to(f16)
+                + w7 * x_values[tile_g, 7].to(f16)
+            )
+            w0, w1, w2, w3, w4, w5, w6, w7 = _fp4_word_to_f16x8(
+                weight_words[tile_m, tile_g, 1]
+            )
+            contrib1 = (
+                w0 * x_values[tile_g, 8].to(f16)
+                + w1 * x_values[tile_g, 9].to(f16)
+                + w2 * x_values[tile_g, 10].to(f16)
+                + w3 * x_values[tile_g, 11].to(f16)
+                + w4 * x_values[tile_g, 12].to(f16)
+                + w5 * x_values[tile_g, 13].to(f16)
+                + w6 * x_values[tile_g, 14].to(f16)
+                + w7 * x_values[tile_g, 15].to(f16)
+            )
+            scale_offsets = swizzled_scale_offsets(
+                tile_m.index[:, None], tile_g.index[None, :], _K_units
+            )
+            scale = _e4m3_byte_to_f32(weight_scale_bytes[scale_offsets])
+            acc = acc + ((contrib0 + contrib1).to(torch.float32) * scale).sum(-1)
         out[tile_m] = (acc * alpha).to(torch.bfloat16)
     return out
 
