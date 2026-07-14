@@ -759,13 +759,13 @@ def chunk_bwd_dqkg_scalar_helion(
         gc = g_cs[tile_bhn, :].float()
         idx = hl.arange(C)
         causal = (idx[:, None] >= idx[None, :]).float()
-        dA = dA_raw * torch.exp(gc[:, :, None] - gc[:, None, :]) * causal
+        dA = dA_raw * torch.exp2((gc[:, :, None] - gc[:, None, :]) * RCP_LN2) * causal
 
         qt = q[tile_bhn, :, tile_d]
         kt = k[tile_bhn, :, tile_d]
         gl = g_last[tile_bhn].float()
-        exp_gc = torch.exp(gc)[:, :, None]
-        exp_gl_minus_gc = torch.exp(gl[:, None] - gc)[:, :, None]
+        exp_gc = torch.exp2(gc * RCP_LN2)[:, :, None]
+        exp_gl_minus_gc = torch.exp2((gl[:, None] - gc) * RCP_LN2)[:, :, None]
         dk_state = dk_state_acc * exp_gl_minus_gc
         dq_acc = hl.dot(dA.to(kt.dtype), kt, acc=dq_cross_acc * exp_gc) * scale
         dk_acc = hl.dot(dA.transpose(-2, -1).to(qt.dtype), qt) * scale + dk_state
@@ -774,7 +774,9 @@ def chunk_bwd_dqkg_scalar_helion(
         dq_out[tile_bhn, :, tile_d] = dq_acc.to(dq_out.dtype)
         dk_out[tile_bhn, :, tile_d] = dk_acc.to(dk_out.dtype)
 
-        dg_last = torch.exp(gl)[:, None] * dh_h_acc + (dk_state * kt.float()).sum(dim=1)
+        dg_last = torch.exp2(gl * RCP_LN2)[:, None] * dh_h_acc + (
+            dk_state * kt.float()
+        ).sum(dim=1)
         is_last = (idx == C - 1).float()
         dg_raw_by_d[tile_bhn, :, tile_d] = (
             dg_raw + is_last[None, :, None] * dg_last[:, None, :]
@@ -1463,7 +1465,6 @@ def _helion_chunked_bwd(
         # Scalar decay path — use cached data from forward when available,
         # and defer float conversion to the kernels that need it.
         vf = v.float().reshape(BH, N, C, DV)
-        do_flat = grad_output_f.reshape(BH, N, C, DV)
 
         bwd_cache = (
             getattr(h_all, "_scalar_bwd_cache", None) if h_all is not None else None
@@ -1490,16 +1491,10 @@ def _helion_chunked_bwd(
             q_4d, do_4d, g_last_scalar, dstate, gc=g_cs, scalar_decay=True, scale=scale
         )
 
-        qf2 = q.float().reshape(BHN, C, D)
-        kf2 = k.float().reshape(BHN, C, D)
-        vf2 = vf.reshape(BHN, C, DV)
         g_csf2 = g_cs.reshape(BHN, C)
         g_lastf2 = g_last_scalar.reshape(BHN)
-        hf2 = h_all.reshape(BHN, D, DV).float()
         dhf2 = dh_all.reshape(BHN, D, DV)
-        dof2 = do_flat.reshape(BHN, C, DV)
 
-        # bf16 inputs for dqk/dv; the fp32 copies above feed the dg kernel.
         qb = q.reshape(BHN, C, D)
         kb = k.reshape(BHN, C, D)
         vb = v.reshape(BHN, C, DV)
@@ -1507,7 +1502,7 @@ def _helion_chunked_bwd(
         hb = h_all.reshape(BHN, D, DV)
 
         dq_raw, dk_raw, dg_raw_by_d = chunk_bwd_dqkg_scalar_helion(
-            qf2, kf2, vf2, g_csf2, g_lastf2, hf2, dof2, dhf2, scale=scale
+            qb, kb, vb, g_csf2, g_lastf2, hb, dob, dhf2, scale=scale
         )
 
         dv_raw = chunk_bwd_dv_helion(
