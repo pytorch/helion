@@ -333,57 +333,30 @@ def chunk_fwd_prescale_diag(
 
 @helion.kernel()
 def chunk_fwd_h_diag_fused(
-    k_state: torch.Tensor,
-    v: torch.Tensor,
-    g_last: torch.Tensor,
-    h0: torch.Tensor,
-    use_g: hl.constexpr = True,  # pyrefly: ignore[bad-function-definition]
-) -> torch.Tensor:
-    """Fused state accumulation over N chunks (diagonal decay).
-
-    Tiles [BH, D, DV] to parallelize over both key and value dimensions,
-    matching FLA's grid=(K_blocks, V_blocks, BH) strategy. With use_g=False the
-    decay is compiled out, for variants with no decay.
-    """
-    BH = k_state.size(0)
-    N = k_state.size(1)
-    D = k_state.size(3)
-    DV = v.size(3)
-
-    h_all = torch.empty([BH, N, D, DV], dtype=k_state.dtype, device=k_state.device)
-
-    for tile_bh, tile_d, tile_dv in hl.tile([BH, D, DV], block_size=[1, None, None]):
-        idx = tile_bh.id
-        h_acc = h0[idx, tile_d, tile_dv].float()
-
-        for i_t in hl.grid(N):
-            h_all[idx, i_t, tile_d, tile_dv] = h_acc.to(h_all.dtype)
-            if use_g:
-                gl_d = g_last[idx, i_t, tile_d]
-                h_acc = h_acc * torch.exp(gl_d)[:, None]
-            k_i = k_state[idx, i_t, :, tile_d]
-            v_i = v[idx, i_t, :, tile_dv]
-            h_acc = hl.dot(k_i.transpose(-2, -1), v_i, acc=h_acc)
-
-    return h_all
-
-
-@helion.kernel()
-def chunk_fwd_h_scalar_fused(
     k: torch.Tensor,
     v: torch.Tensor,
-    gc: torch.Tensor,
     g_last: torch.Tensor,
     h0: torch.Tensor,
+    gc: torch.Tensor | None = None,
+    use_g: hl.constexpr = True,  # pyrefly: ignore[bad-function-definition]
+    scalar_decay: hl.constexpr = False,  # pyrefly: ignore[bad-function-definition]
 ) -> torch.Tensor:
-    """State accumulation over N chunks with scalar decay, applying the decay
-    to v inside the chunk loop. With g in natural-log space this is:
-        h_all[i] = exp(g_last[i-1]) * h_all[i-1]
-                   + k[i-1]^T @ (v[i-1] * exp(g_last[i-1] - gc[i-1]))
-    which the kernel computes as exp2(RCP_LN2 * x) == exp(x), since exp2 is one
-    hardware instruction:
-        h_all[i] = exp2(RCP_LN2 * g_last[i-1]) * h_all[i-1]
-                   + k[i-1]^T @ (v[i-1] * exp2(RCP_LN2 * (g_last[i-1] - gc[i-1])))
+    """Fused state accumulation over N chunks.
+
+    Tiles [BH, D, DV] to parallelize over both key and value dimensions, matching
+    FLA's grid=(K_blocks, V_blocks, BH). Three compile-time decay modes
+    (specialized, no runtime branch):
+      - use_g=False:        no decay; k is passed raw.
+      - diagonal (default): k is pre-scaled by the state decay on host; g_last is
+        a per-channel [BH, N, D] state decay applied as h_acc * exp(g_last).
+      - scalar_decay=True:  k is raw and gc [BH, N, C] decays v in-kernel; g_last
+        is a scalar [BH, N] state decay. With g in natural-log space:
+            h_all[i] = exp(g_last[i-1]) * h_all[i-1]
+                       + k[i-1]^T @ (v[i-1] * exp(g_last[i-1] - gc[i-1]))
+        which the kernel computes as exp2(RCP_LN2 * x) == exp(x), since exp2 is
+        one hardware instruction:
+            h_all[i] = exp2(RCP_LN2 * g_last[i-1]) * h_all[i-1]
+                       + k[i-1]^T @ (v[i-1] * exp2(RCP_LN2 * (g_last[i-1] - gc[i-1])))
     """
     BH = k.size(0)
     N = k.size(1)
@@ -398,14 +371,20 @@ def chunk_fwd_h_scalar_fused(
 
         for i_t in hl.grid(N):
             h_all[idx, i_t, tile_d, tile_dv] = h_acc.to(h_all.dtype)
-            g_i = gc[idx, i_t, :].float()  # [C]
-            gl = g_last[idx, i_t].float()  # scalar
             k_i = k[idx, i_t, :, tile_d]
-            v_i = (
-                v[idx, i_t, :, tile_dv].float()
-                * torch.exp2((gl - g_i) * RCP_LN2)[:, None]
-            ).to(v.dtype)
-            h_acc = torch.exp2(gl * RCP_LN2) * h_acc
+            if scalar_decay:
+                g_i = gc[idx, i_t, :].float()  # [C]
+                gl = g_last[idx, i_t].float()  # scalar
+                v_i = (
+                    v[idx, i_t, :, tile_dv].float()
+                    * torch.exp2((gl - g_i) * RCP_LN2)[:, None]
+                ).to(v.dtype)
+                h_acc = torch.exp2(gl * RCP_LN2) * h_acc
+            else:
+                if use_g:
+                    gl_d = g_last[idx, i_t, tile_d]
+                    h_acc = h_acc * torch.exp(gl_d)[:, None]
+                v_i = v[idx, i_t, :, tile_dv]
             h_acc = hl.dot(k_i.transpose(-2, -1), v_i, acc=h_acc)
 
     return h_all
@@ -1277,7 +1256,7 @@ def _helion_chunked_fwd(
     scalar_decay = g.dim() == 3
 
     if scalar_decay:
-        # Scalar decay path: use chunk_fwd_h_scalar_fused.
+        # Scalar decay path.
         gc = g.float().reshape(BH, N, C)
         g_cs = gc.cumsum(-1)  # [BH, N, C]
         g_last = g_cs[:, :, -1]  # [BH, N]
@@ -1285,7 +1264,9 @@ def _helion_chunked_fwd(
         k_4d = k.reshape(BH, N, C, D)
         v_flat = v.reshape(BH, N, C, DV)
         state = _init_state(initial_state, BH, D, DV, q)
-        h_all = chunk_fwd_h_scalar_fused(k_4d, v_flat, g_cs, g_last, state)
+        h_all = chunk_fwd_h_diag_fused(
+            k_4d, v_flat, g_last, state, gc=g_cs, scalar_decay=True
+        )
 
         # Output kernel: pass raw q, k with g_cs for decay; scale folds in here.
         qf = q.reshape(BHN, C, D)
