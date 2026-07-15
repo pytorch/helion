@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING
 from typing import NoReturn
 from typing import Protocol
 
+import torch
 from torch._dispatch.python import enable_python_dispatcher
 from torch._dynamo.convert_frame import compile_lock
 
@@ -300,6 +301,19 @@ class TypePropagation(ast.NodeVisitor):
                 return right if val is True else left
         except NotImplementedError:
             pass
+        if isinstance(left, SymBoolType) and isinstance(right, SymBoolType):
+            # Preserve the symbolic conjunction/disjunction (e.g.
+            # ``block_m < 64 and block_n >= 64``) instead of minting a fresh
+            # unbacked bool, so a block-size-only condition stays resolvable
+            # per-config at codegen.  ``&``/``|`` on SymBool build the combined
+            # symbolic expression without forcing a guard.
+            combined = (
+                left.value | right.value
+                if isinstance(op, ast.Or)
+                else left.value & right.value
+            )
+            if isinstance(combined, torch.SymBool):
+                return SymBoolType(self.origin(), combined)
         if (
             isinstance(left, (NumericType, LiteralType))
             and isinstance(right, (NumericType, LiteralType))
@@ -346,6 +360,18 @@ class TypePropagation(ast.NodeVisitor):
             right,
             (NumericType, LiteralType),
         ):
+            # Preserve the symbolic comparison expression (e.g. ``block_m < 64``)
+            # rather than minting a fresh unbacked bool.  This keeps the block-size
+            # dependency intact so a block-size-only condition can be resolved
+            # per-config at codegen (see IfGraphInfo.codegen), which is what makes
+            # block-size-dependent control flow work on the host.
+            if not isinstance(op, CMP_ALWAYS_BOOL):
+                try:
+                    result = _eval_compare(op, left.proxy(), right.proxy())
+                except NotImplementedError:
+                    result = None
+                if isinstance(result, torch.SymBool):
+                    return SymBoolType(self.origin(), result)
             return SymBoolType.new_unbacked(self.origin())
         if isinstance(op, CMP_ALWAYS_BOOL):
             return SymBoolType.new_unbacked(self.origin())
