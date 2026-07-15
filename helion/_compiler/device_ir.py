@@ -436,6 +436,19 @@ class IfGraphInfo(NodeArgsGraphInfo):
         assert isinstance(state.codegen, GenerateAST)
 
         test = state.ast_arg(0)
+        # A branch condition that depends only on block sizes is a compile-time
+        # constant for this config, even though it stayed symbolic during the
+        # single frontend pass.  evaluate_constexpr_condition resolves it to a
+        # concrete bool, or None if it is a genuine runtime condition.  When it is
+        # constant, emit it as a literal ``True``/``False`` so Triton drops the
+        # dead branch entirely and only the live branch is compiled; when it is
+        # None, leave it as a runtime condition.
+        constexpr_test = state.device_function.evaluate_constexpr_condition(
+            state.proxy_arg(0)
+        )
+        if constexpr_test is not None:
+            test = expr_from_string(repr(constexpr_test))
+
         body_stmts: list[ast.AST] = []
         orelse_stmts: list[ast.AST] = []
         if_ast_node = create(ast.If, test=test, body=body_stmts, orelse=orelse_stmts)
