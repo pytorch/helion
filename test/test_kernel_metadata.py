@@ -282,10 +282,88 @@ class TestAutotuneLogSink(TestCase):
         self.assertEqual(set(sidecar), _SIDECAR_KEYS)
         self.assertIn("def _add_kernel", sidecar["kernel_source"])
 
-        stored = sidecar["configs"][cell("config_id")]
-        cfg = helion.Config.from_json(json.dumps(stored))
+        # The CSV row joins to its config via config_id; each entry nests the
+        # tested config alongside its generated_code (None here -- this device-free
+        # sink test does not capture source).
+        entry = sidecar["configs"][cell("config_id")]
+        self.assertIsNone(entry["generated_code"])
+        cfg = helion.Config.from_json(json.dumps(entry["config"]))
         self.assertEqual(cfg.block_sizes, [32])
         self.assertEqual(cell("run_id"), sidecar["run_id"])
+
+    def _capture_entry(
+        self,
+        kernel: Mock,
+        config: helion.Config,
+        *,
+        collect_dataset: bool = True,
+        times: int = 1,
+    ) -> dict[str, object] | None:
+        """Run one config through a sink (register + ``capture_generated_code`` x
+        ``times``) and return its written ``configs`` entry (``None`` if not collected)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            with AutotuneLogSink(
+                f"{tmp}/run", _metadata(), collect_dataset=collect_dataset
+            ) as sink:
+                sink.start_run()
+                config_id = sink.register_config(config)
+                assert config_id is not None
+                for _ in range(times):
+                    sink.capture_generated_code(config_id, kernel, config)
+                sink.end_run()
+            configs = json.loads(
+                sink.meta_path.read_text(encoding="utf-8").splitlines()[0]
+            )["configs"]
+        return configs.get(config_id)
+
+    def test_capture_generated_code_attaches_source_read_once(self) -> None:
+        """Source attaches to the config entry; the file is read at most once."""
+        config = helion.Config(block_sizes=[32], num_warps=4)
+        with tempfile.TemporaryDirectory() as tmp:
+            src = Path(tmp) / "compiled_kernel.py"
+            src.write_text("# generated triton source\n", encoding="utf-8")
+            kernel = Mock()
+            kernel.get_cached_path.return_value = str(src)
+            entry = self._capture_entry(kernel, config, times=2)
+        assert entry is not None
+        self.assertEqual(entry["generated_code"], "# generated triton source\n")
+        self.assertEqual(
+            helion.Config.from_json(json.dumps(entry["config"])).block_sizes, [32]
+        )
+        kernel.get_cached_path.assert_called_once()
+
+    def test_capture_generated_code_none_when_no_cached_path(self) -> None:
+        """generated_code stays None when the config has no cached artifact path."""
+        config = helion.Config(block_sizes=[32])
+        kernel = Mock()
+        kernel.get_cached_path.return_value = None
+        entry = self._capture_entry(kernel, config)
+        assert entry is not None
+        self.assertIsNone(entry["generated_code"])
+
+    def test_capture_generated_code_raises_when_artifact_unreadable(self) -> None:
+        """A read failure of a known artifact surfaces (beta feature fails loudly)."""
+        config = helion.Config(block_sizes=[32])
+        kernel = Mock()
+        kernel.get_cached_path.return_value = "/nonexistent/dir/compiled_kernel.py"
+        with self.assertRaises(OSError):
+            self._capture_entry(kernel, config)
+
+    def test_capture_generated_code_noop_when_not_collecting(self) -> None:
+        """With collection off there is no configs entry, so the file is never read
+        (no .meta.jsonl is written either)."""
+        config = helion.Config(block_sizes=[32])
+        kernel = Mock()
+        with (
+            tempfile.TemporaryDirectory() as tmp,
+            AutotuneLogSink(f"{tmp}/run", _metadata(), collect_dataset=False) as sink,
+        ):
+            sink.start_run()
+            config_id = sink.register_config(config)
+            assert config_id is not None
+            sink.capture_generated_code(config_id, kernel, config)
+            sink.end_run()
+        kernel.get_cached_path.assert_not_called()
 
 
 @onlyBackends(["triton"])
@@ -354,6 +432,12 @@ class TestAutotuneDatasetE2E(TestCase):
                 sm_attr = _DEVICE_PROPS_ATTRS[hw["device_kind"]][0]
                 self.assertIsNotNone(hw["device_props"][sm_attr])
                 self.assertIsNotNone(hw["versions"]["triton"])
+            # Each configs entry nests the tested config and its per-config generated
+            # source; generated_code is null when the config has no cached artifact
+            # path (a config that failed to compile is still registered).
+            for cfg_entry in record["configs"].values():
+                self.assertIn("config", cfg_entry)
+                self.assertIsInstance(cfg_entry["generated_code"], (str, type(None)))
             configs_by_id.update(record["configs"])
             run_ids.add(record["run_id"])
             if _HAS_NETWORKX:
@@ -365,6 +449,9 @@ class TestAutotuneDatasetE2E(TestCase):
             else:
                 self.assertIsNone(record["ir_graph"])
         self.assertGreater(len(configs_by_id), 0)
+        # generated_code is null only when a config has no cached path, but a real
+        # Triton search compiles at least one config, so at least one is captured.
+        self.assertTrue(any(e["generated_code"] for e in configs_by_id.values()))
 
         rows = list(csv.reader(csv_path.read_text().splitlines()))
         header, data = rows[0], rows[1:]
@@ -372,7 +459,9 @@ class TestAutotuneDatasetE2E(TestCase):
         config_id = data[0][header.index("config_id")]
         self.assertIn(config_id, configs_by_id)
         self.assertIn(data[0][header.index("run_id")], run_ids)
-        decoded_config = helion.Config.from_json(json.dumps(configs_by_id[config_id]))
+        decoded_config = helion.Config.from_json(
+            json.dumps(configs_by_id[config_id]["config"])
+        )
         self.assertIn(decoded_config.block_sizes, ([32], [64]))
 
 
