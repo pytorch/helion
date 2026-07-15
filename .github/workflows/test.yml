@@ -185,6 +185,14 @@ jobs:
           SETUPTOOLS_SCM_PRETEND_VERSION="0.0.0" uv pip install -e .'[dev]'
           python -c "import helion; print(helion.__name__)"
 
+      - name: Install FLA for linear-attention tests
+        if: (matrix.alias == 'h100' || matrix.alias == 'b200') && matrix.backend == 'triton'
+        run: |
+          source .venv/bin/activate
+          uv pip install einops transformers
+          uv pip install "git+https://github.com/fla-org/flash-linear-attention@6bd90692588c81fe102ee6e12ac70686359658a2" --no-deps
+          python -c "import fla; print('fla', fla.__name__)"
+
       - name: Install TPU dependencies (Pallas)
         if: matrix.alias == 'tpu'
         run: |
