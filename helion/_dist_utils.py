@@ -14,6 +14,7 @@ from torch import Tensor
 from torch._C._distributed_c10d import _SymmetricMemory
 import torch.distributed as dist
 import torch.distributed._symmetric_memory as symm_mem
+from torch.utils._pytree import tree_leaves
 
 import helion
 from helion import exc
@@ -29,10 +30,8 @@ def _resolve_process_group(name: str) -> dist.ProcessGroup:
 
 
 def all_gather_object(obj: T, process_group_name: str | None = None) -> list[T]:
-    if not dist.is_initialized():
+    if not dist.is_initialized() or process_group_name is None:
         return [obj]
-
-    assert process_group_name is not None
 
     group = _resolve_process_group(process_group_name)
     object_list = [None] * dist.get_world_size(group)
@@ -45,10 +44,9 @@ def sync_object(obj: T, process_group_name: str | None = None) -> T:
     r"""
     Synchronize the number of repeations across all ranks.
     """
-    if not dist.is_initialized():
+    if not dist.is_initialized() or process_group_name is None:
         return obj
 
-    assert process_group_name is not None
     group = _resolve_process_group(process_group_name)
     object_list = [obj]
     # use the value from group rank 0
@@ -95,6 +93,30 @@ def is_symm_mem_tensor(t: Tensor, process_group_name: str | None = None) -> bool
         return False
 
 
+def kernel_uses_symm_mem(args: tuple[object, ...]) -> bool:
+    """Return True if this is a distributed kernel operating on symmetric memory.
+
+    Helion's distributed-only compilation behavior (persistent-only PID types,
+    signal-pad SM-count limits, and process-group resolution) is only needed for
+    kernels that actually use symmetric-memory tensors. Gating on this instead of
+    ``dist.is_initialized()`` avoids penalizing and warning on ordinary kernels
+    that merely run inside a process where torch.distributed happens to be
+    initialized (e.g. vLLM). See GitHub issue #3024.
+    """
+    if not dist.is_initialized():
+        return False
+    if not hasattr(symm_mem, "is_symm_mem_tensor"):
+        # Older PyTorch cannot cheaply detect symmetric-memory tensors without a
+        # process group, so fall back to the previous conservative behavior.
+        return True
+    # Flatten containers (list/tuple/dict) so symmetric-memory tensors passed
+    # nested inside an argument are still detected.
+    return any(
+        isinstance(leaf, Tensor) and symm_mem.is_symm_mem_tensor(leaf)
+        for leaf in tree_leaves(args)
+    )
+
+
 def get_signal_pad_ptrs_dev(t: Tensor, process_group_name: str | None = None) -> int:
     assert dist.is_initialized()
     assert process_group_name is not None
@@ -116,10 +138,10 @@ def check_config_consistancy(
     if (
         os.getenv("HELION_DIST_CHECK_CONFIG_CONSISTANCY") != "1"
         or not dist.is_initialized()
+        or process_group_name is None
     ):
         return
 
-    assert process_group_name is not None
     group = _resolve_process_group(process_group_name)
     all_configs = [None] * dist.get_world_size(group)
     # pyrefly: ignore[bad-argument-type]
@@ -184,11 +206,10 @@ def sync_seed(
     ranks have different seeds after the call. This ensures different
     rank can generate independent random tensors.
     """
-    if not dist.is_initialized():
+    if not dist.is_initialized() or process_group_name is None:
         yield
         return
 
-    assert process_group_name is not None
     seeds = sync_object(SeedEnsemble.get_seeds(), process_group_name=process_group_name)
 
     try:
@@ -199,7 +220,18 @@ def sync_seed(
             SeedEnsemble.update_seeds_with_rank()
 
 
-def _find_process_group_name(fn: Callable, args: tuple[object, ...]) -> str | None:
+def kernel_declares_process_group(fn: Callable) -> bool:
+    """True if the kernel has an ``hl.ProcessGroupName``-annotated argument, an
+    explicit declaration that it is a distributed kernel."""
+    return any(
+        param.annotation == "hl.ProcessGroupName"
+        for param in inspect.signature(fn).parameters.values()
+    )
+
+
+def _find_process_group_name(
+    fn: Callable, args: tuple[object, ...], is_distributed: bool = False
+) -> str | None:
     from helion._compiler.compile_environment import warning
     from helion.exc import ProcessGroupNameNotFound
 
@@ -211,6 +243,11 @@ def _find_process_group_name(fn: Callable, args: tuple[object, ...]) -> str | No
         if param.annotation == "hl.ProcessGroupName":
             assert isinstance(arg, str), f"{type(arg)}"
             return arg
+
+    # Only distributed kernels need a process group. Ordinary kernels must not
+    # resolve one or warn about a missing hl.ProcessGroupName annotation.
+    if not is_distributed:
+        return None
 
     warning(ProcessGroupNameNotFound)
     assert dist.group.WORLD is not None

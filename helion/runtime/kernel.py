@@ -54,6 +54,8 @@ from .._compiler.output_header import assert_no_conflicts
 from .._compiler.variable_origin import ArgumentOrigin
 from .._dist_utils import _find_process_group_name
 from .._dist_utils import check_config_consistancy as dist_check_config_consistancy
+from .._dist_utils import kernel_declares_process_group
+from .._dist_utils import kernel_uses_symm_mem
 from .._logging import LazyString
 from .._utils import counters
 from ..autotuner.base_search import _AutotunableKernel
@@ -186,6 +188,10 @@ class Kernel(Generic[_R]):
         self.signature: inspect.Signature = inspect.signature(fn)
         self.settings: Settings = settings or Settings()
         self._key_fn: Callable[..., Hashable] | None = key
+        # Whether the kernel declares distributed intent via an hl.ProcessGroupName
+        # argument. Computed once so the per-call is_distributed check stays cheap
+        # on the dispatch hot path (avoids re-running inspect.signature). See #3024.
+        self._declares_process_group: bool = kernel_declares_process_group(fn)
         self.configs: list[Config] = [
             # pyrefly: ignore [bad-argument-type]
             Config(**config) if isinstance(config, dict) else config
@@ -277,6 +283,21 @@ class Kernel(Generic[_R]):
         extra_results: tuple[Hashable, ...] = tuple([s(args) for s in extra_fns])
         return BoundKernelInMemoryCacheKey(signature, extra_results)
 
+    def _compute_is_distributed(self, args: Sequence[object]) -> bool:
+        """Whether this call should compile as a distributed kernel.
+
+        True when the arguments carry symmetric-memory tensors, or the author
+        declared distributed intent (``settings.distributed`` or an
+        ``hl.ProcessGroupName`` argument) inside an initialized process group.
+        This is folded into the specialization key so a symmetric-memory call
+        and an identically-shaped ordinary call never share a compiled kernel.
+        See GitHub issue #3024.
+        """
+        return kernel_uses_symm_mem(tuple(args)) or (
+            dist.is_initialized()
+            and (self.settings.distributed or self._declares_process_group)
+        )
+
     def _fast_dispatch_key(self, args: tuple[object, ...]) -> Hashable | None:
         """
         Build a cheap dispatch key for the fast-path cache in ``__call__``.
@@ -319,6 +340,7 @@ class Kernel(Generic[_R]):
                 return None
         if not has_tensor:
             return None
+        key.append(self._compute_is_distributed(args))
         if self._key_fn is not None:
             key.append(self._key_fn(*args))
         return tuple(key)
@@ -377,9 +399,16 @@ class Kernel(Generic[_R]):
             else:
                 result.append(self._specialization_key(value))
         device_type, device_capability = _device_specialization_key(args)
+        is_distributed = self._compute_is_distributed(args)
         if self._key_fn is not None:
-            return (*result, device_type, device_capability, self._key_fn(*args))
-        return (*result, device_type, device_capability)
+            return (
+                *result,
+                device_type,
+                device_capability,
+                is_distributed,
+                self._key_fn(*args),
+            )
+        return (*result, device_type, device_capability, is_distributed)
 
     def specialization_key(self, args: Sequence[object]) -> tuple[Hashable, ...]:
         """
@@ -575,10 +604,16 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
         self._backward_compiled: (
             tuple[Kernel[object], str, BoundKernel[object]] | None
         ) = None
+        # Distributed detection lives on Kernel so the same value feeds both the
+        # specialization cache key and CompileEnvironment gating; that keeps a
+        # symmetric-memory call from ever aliasing a non-distributed compiled
+        # kernel of the same shape. See GitHub issue #3024.
+        is_distributed = self.kernel._compute_is_distributed(args)
         self._env = CompileEnvironment(
             _find_device(args),
             self.kernel.settings,
             index_dtype=_resolve_index_dtype(self.kernel.settings, args),
+            is_distributed=is_distributed,
         )
 
         if is_ref_mode_enabled(self.kernel.settings):
@@ -587,7 +622,9 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
             return
 
         with self.env:
-            self._env.process_group_name = _find_process_group_name(kernel.fn, args)
+            self._env.process_group_name = _find_process_group_name(
+                kernel.fn, args, is_distributed
+            )
 
             assert len(args) == len(self.kernel.signature.parameters)
             self.fake_args: list[object] = []
