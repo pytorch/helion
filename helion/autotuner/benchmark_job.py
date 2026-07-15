@@ -59,6 +59,78 @@ class AccuracyCheckResult:
     message: str = ""
 
 
+@dataclasses.dataclass(frozen=True)
+class BenchmarkAndAccuracyResult:
+    """Combined result of a fused benchmark + accuracy job.
+
+    ``latency`` is the measured time in ms.  ``accuracy`` is the accuracy
+    check outcome, or ``None`` when no baseline was supplied (accuracy check
+    disabled or a custom baseline fn forces the in-process fallback).
+    """
+
+    latency: float
+    accuracy: AccuracyCheckResult | None = None
+
+
+@dataclasses.dataclass
+class BenchmarkAndAccuracyJob:
+    """Time ``fn`` and (optionally) accuracy-check it in a single worker job.
+
+    Loading the compiled fn is what triggers the (expensive, for the CuTe DSL
+    backend) first-call compile.  Running the timing and the accuracy check as
+    two separate worker jobs re-loads the fn twice and therefore compiles it
+    twice.  This fused job loads the fn once and reuses the same in-memory
+    compiled object for both the timed benchmark and the accuracy check, so the
+    compile is paid once -- matching the in-process path -- while keeping both
+    steps inside the killable worker (an IMA in either step kills the worker,
+    not the parent).
+
+    ``baseline_path`` is ``None`` when the accuracy check is disabled; the job
+    then only times ``fn``.
+    """
+
+    fn_spec: SerializedCompiledFunction
+    args_path: str
+    baseline_path: str | None
+    atol: float
+    rtol: float
+    warmup: int = 1
+    rep: int = 50
+    use_wall_clock: bool = False
+
+    def __call__(self) -> BenchmarkAndAccuracyResult:
+        with capture_output():
+            fn = _load_compiled_fn(self.fn_spec)
+            args = load_trusted_kernel_args(self.args_path)
+            bench = do_bench_generic if self.use_wall_clock else do_bench
+            latency = cast(
+                "float",
+                bench(
+                    functools.partial(fn, *args),
+                    return_mode="median",
+                    warmup=self.warmup,
+                    rep=self.rep,
+                ),
+            )
+            if self.baseline_path is None:
+                return BenchmarkAndAccuracyResult(latency=latency, accuracy=None)
+            # Reuse the already-loaded (already-compiled) fn for the accuracy
+            # check; no second compile.
+            baseline_output = _load_trusted_baseline_output(self.baseline_path)
+            output = fn(*args)
+            synchronize_device()
+
+        try:
+            assert_close(output, baseline_output, atol=self.atol, rtol=self.rtol)
+        except AssertionError as e:
+            return BenchmarkAndAccuracyResult(
+                latency=latency, accuracy=AccuracyCheckResult(ok=False, message=str(e))
+            )
+        return BenchmarkAndAccuracyResult(
+            latency=latency, accuracy=AccuracyCheckResult(ok=True)
+        )
+
+
 @dataclasses.dataclass
 class AccuracyCheckJob:
     fn_spec: SerializedCompiledFunction
