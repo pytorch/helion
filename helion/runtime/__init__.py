@@ -326,7 +326,7 @@ def compact_ordered_budget_capacity(
     bytes_per_token = 2 * _ordered_per_token_bytes(operands) + _ordered_per_token_bytes(
         prep_operands
     )
-    return max(1, int(vmem_bytes * 0.5) // max(1, bytes_per_token))
+    return int(vmem_bytes * 0.5) // bytes_per_token
 
 
 def compact_ordered_physical_window(
