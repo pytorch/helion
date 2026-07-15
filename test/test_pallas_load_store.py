@@ -450,6 +450,108 @@ class TestPallasJaggedCarryRejects(TestCase):
         torch.testing.assert_close(out, a @ b)
 
 
+@onlyBackends(["pallas"])
+@skipUnlessPallas("JAX/Pallas TPU not available")
+class TestPallasPartialSlice(TestCase):
+    """Static bounded slices (``[:n]`` / ``[n:]``) on untiled dims."""
+
+    def test_partial_slice_load_store(self) -> None:
+        @helion.kernel(backend="pallas")
+        def kernel(src: torch.Tensor, dst: torch.Tensor) -> torch.Tensor:
+            for tile in hl.tile(src.size(0)):
+                dst[tile, :16] = src[tile, :16]
+                dst[tile, 16:] = src[tile, 16:]
+            return dst
+
+        src = torch.randn((64, 32), device=DEVICE)
+        dst = torch.zeros((64, 32), device=DEVICE)
+        code, out = code_and_output(kernel, (src, dst), block_sizes=[16])
+        self.assertIn(":16", code)
+        self.assertIn("16:", code)
+        torch.testing.assert_close(out, src)
+
+    @xfailIfPallas(
+        "fully-bounded slice (8:16) is lowered to an index tensor by the "
+        "front-end, not a slice, so it hits the indirect scatter/gather path "
+        "instead of ArbitrarySlicePattern"
+    )
+    def test_partial_slice_both_bounds(self) -> None:
+        # Slice with both start and stop set (``8:16``): a middle window,
+        # not just an open-ended prefix/suffix.
+        @helion.kernel(backend="pallas")
+        def kernel(src: torch.Tensor, dst: torch.Tensor) -> torch.Tensor:
+            for tile in hl.tile(src.size(0)):
+                dst[tile, :8] = src[tile, :8]
+                dst[tile, 8:16] = src[tile, 8:16] * 2.0
+                dst[tile, 16:] = src[tile, 16:]
+            return dst
+
+        src = torch.randn((64, 32), device=DEVICE)
+        dst = torch.zeros((64, 32), device=DEVICE)
+        _code, out = code_and_output(kernel, (src, dst), block_sizes=[16])
+        expected = src.clone()
+        expected[:, 8:16] *= 2.0
+        torch.testing.assert_close(out, expected)
+
+    def test_partial_slice_dim0(self) -> None:
+        # Bounded slices on dim 0 while tiling dim 1 (sublane-dim slicing).
+        @helion.kernel(backend="pallas")
+        def kernel(src: torch.Tensor, dst: torch.Tensor) -> torch.Tensor:
+            for tile in hl.tile(src.size(1)):
+                dst[:32, tile] = src[:32, tile]
+                dst[32:, tile] = src[32:, tile]
+            return dst
+
+        src = torch.randn((64, 256), device=DEVICE)
+        dst = torch.zeros((64, 256), device=DEVICE)
+        _code, out = code_and_output(kernel, (src, dst), block_sizes=[128])
+        torch.testing.assert_close(out, src)
+
+    def test_partial_slice_unaligned(self) -> None:
+        # Lane-dim slice boundary not a multiple of 128.
+        @helion.kernel(backend="pallas")
+        def kernel(src: torch.Tensor, dst: torch.Tensor) -> torch.Tensor:
+            for tile in hl.tile(src.size(0)):
+                dst[tile, :200] = src[tile, :200]
+                dst[tile, 200:] = src[tile, 200:]
+            return dst
+
+        src = torch.randn((64, 512), device=DEVICE)
+        dst = torch.zeros((64, 512), device=DEVICE)
+        _code, out = code_and_output(kernel, (src, dst), block_sizes=[16])
+        torch.testing.assert_close(out, src)
+
+    def test_partial_slice_symbolic_bound(self) -> None:
+        # Slice bound taken from a tensor size (concat pattern).
+        @helion.kernel(backend="pallas")
+        def kernel(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            out = torch.empty(
+                [x.size(0), x.size(1) + y.size(1)], dtype=x.dtype, device=x.device
+            )
+            n1 = x.size(1)
+            for tile_m in hl.tile(x.size(0)):
+                out[tile_m, :n1] = x[tile_m, :]
+                out[tile_m, n1:] = y[tile_m, :]
+            return out
+
+        x = torch.randn((64, 200), device=DEVICE)
+        y = torch.randn((64, 56), device=DEVICE)
+        _code, out = code_and_output(kernel, (x, y), block_sizes=[16])
+        torch.testing.assert_close(out, torch.cat([x, y], dim=1))
+
+    def test_strided_slice_rejected(self) -> None:
+        @helion.kernel(backend="pallas")
+        def kernel(src: torch.Tensor, dst: torch.Tensor) -> torch.Tensor:
+            for tile in hl.tile(src.size(0)):
+                dst[tile, ::2] = src[tile, ::2]
+            return dst
+
+        src = torch.randn((64, 32), device=DEVICE)
+        dst = torch.zeros((64, 32), device=DEVICE)
+        with self.assertRaisesRegex(exc.BackendUnsupported, "slice expr"):
+            code_and_output(kernel, (src, dst), block_sizes=[16])
+
+
 instantiate_parametrized_tests(TestPallasJaggedCarrySimple)
 instantiate_parametrized_tests(TestPallasJaggedCarryBmm)
 instantiate_parametrized_tests(TestPallasJaggedCarryRejects)

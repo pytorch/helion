@@ -1026,7 +1026,6 @@ class TestExamples(RefEagerTestBase, TestCase):
             block_sizes=[1, 64, 32],
         )
 
-    @xfailIfPallas("slice-based stores not yet supported")
     def test_concat_simple(self):
         args = (
             torch.randn(512, 500, device=DEVICE),
