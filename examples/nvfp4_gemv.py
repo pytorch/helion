@@ -525,6 +525,103 @@ def _fp4_storage(tensor: Tensor) -> Tensor:
     return tensor
 
 
+def _e4m3_byte_to_f32(scale_byte: Tensor) -> Tensor:
+    """Decode one E4M3 scale byte to fp32 (Triton inline PTX)."""
+    return hl.inline_asm_elementwise(
+        """
+        {
+          .reg .b16 sc, scale_lo, scale_hi;
+          .reg .b32 scale_h2;
+          mov.b32 {sc, _}, $1;
+          cvt.rn.f16x2.e4m3x2 scale_h2, sc;
+          mov.b32 {scale_lo, scale_hi}, scale_h2;
+          cvt.f32.f16 $0, scale_lo;
+        }
+        """,
+        "=f,r",
+        [scale_byte],
+        dtype=torch.float32,
+        is_pure=True,
+        pack=1,
+    )
+
+
+def _fp4_qword_to_f16x16(qword: Tensor) -> tuple[Tensor, ...]:
+    """Decode one int64 (16 packed E2M1 fp4 = 1 scale group) into 16 fp16 lanes."""
+    outs = ",".join("=h" for _ in range(16))
+    return hl.inline_asm_elementwise(
+        """
+        {
+          .reg .b32 lo, hi;
+          .reg .b8 c0,c1,c2,c3,c4,c5,c6,c7;
+          .reg .b32 h0,h1,h2,h3,h4,h5,h6,h7;
+          mov.b64 {lo, hi}, $16;
+          mov.b32 {c0,c1,c2,c3}, lo;
+          cvt.rn.f16x2.e2m1x2 h0, c0; cvt.rn.f16x2.e2m1x2 h1, c1;
+          cvt.rn.f16x2.e2m1x2 h2, c2; cvt.rn.f16x2.e2m1x2 h3, c3;
+          mov.b32 {c4,c5,c6,c7}, hi;
+          cvt.rn.f16x2.e2m1x2 h4, c4; cvt.rn.f16x2.e2m1x2 h5, c5;
+          cvt.rn.f16x2.e2m1x2 h6, c6; cvt.rn.f16x2.e2m1x2 h7, c7;
+          mov.b32 {$0,$1}, h0; mov.b32 {$2,$3}, h1;
+          mov.b32 {$4,$5}, h2; mov.b32 {$6,$7}, h3;
+          mov.b32 {$8,$9}, h4; mov.b32 {$10,$11}, h5;
+          mov.b32 {$12,$13}, h6; mov.b32 {$14,$15}, h7;
+        }
+        """,
+        f"{outs},l",
+        [qword],
+        dtype=(torch.float16,) * 16,
+        is_pure=True,
+        pack=1,
+    )
+
+
+def _nvfp4_gemv_bf16in_triton_body(
+    weight_i64: Tensor,  # (M, K_groups) int64 packed NVFP4 weight
+    x_values: Tensor,  # (K_groups, 16) bf16 activation
+    weight_scale_bytes: Tensor,  # int8 view of SWIZZLE_32_4_4 E4M3 scales
+    out: Tensor,  # (M,) bf16 output
+    alpha: float = 1.0,
+) -> Tensor:
+    """W4A16 NVFP4 GEMV, Triton backend (fp16 decode, fp32 scale).
+
+    Two coalescing wins make this genuine Helion->Triton output competitive with
+    the hand-PTX CuTe kernel above (faster on the wider-N shapes) -- ncu showed a
+    naive decode is not DRAM-bound but stalls on uncoalesced loads:
+
+    * Weight: each 16-value group is one contiguous int64 (8 bytes), loaded
+      unit-stride and decoded with ``_fp4_qword_to_f16x16``. (Reading it as two
+      int32 words would make each load stride-2, halving coalescing.)
+    * Activation: load a group's 16 bf16 as one contiguous ``(block_g, 16)`` tile,
+      then peel each lane with a masked sum (the DSL cannot subscript a loaded
+      tile as ``xt[:, j]``) -- the contiguous load is what coalesces.
+
+    The per-group E4M3 scale stays a swizzled gather: SWIZZLE_32_4_4's max
+    contiguous run is 4 bytes, so it cannot be coalesced for M-tiled access.
+    """
+    M, K_groups = weight_i64.shape
+    block_m = hl.register_block_size(1, 16)
+    block_g = hl.register_block_size(K_groups)
+    f16 = torch.float16
+    for tile_m in hl.tile(M, block_size=block_m):
+        acc = hl.zeros([tile_m], dtype=torch.float32)
+        for tile_g in hl.tile(K_groups, block_size=block_g):
+            w = _fp4_qword_to_f16x16(weight_i64[tile_m, tile_g])  # 16 fp16 lanes
+            xt = x_values[tile_g, :].to(f16)  # (block_g, 16) contiguous coalesced
+            lane = hl.arange(16)[None, :]
+            contrib = hl.zeros([block_m, block_g], dtype=f16)
+            for i in hl.static_range(16):
+                xi = torch.where(lane == i, xt, 0.0).sum(-1)[None, :]
+                contrib = contrib + w[i] * xi
+            scale_offsets = swizzled_scale_offsets(
+                tile_m.index[:, None], tile_g.index[None, :], K_groups
+            )
+            scale = _e4m3_byte_to_f32(weight_scale_bytes[scale_offsets])
+            acc = acc + (contrib.to(torch.float32) * scale).sum(-1)
+        out[tile_m] = (acc * alpha).to(torch.bfloat16)
+    return out
+
+
 def _nvfp4_gemv_bf16in_body(
     weight_fp4x2: Tensor,
     x_values: Tensor,
@@ -614,14 +711,14 @@ def _nvfp4_gemv_fp4in_body(
     return out
 
 
-# Share the DSL bodies across backends; each backend keeps its tuned config.
-BF16IN_TRITON_CONFIG = helion.Config(block_sizes=[1, 512], num_warps=1, num_stages=2)
+# Triton W4A16 uses the coalesced-load ``_nvfp4_gemv_bf16in_triton_body``; block_m=16
+# (activation reuse across 16 rows) + inner K tile block_g=128. The cute backend
+# uses the hand-PTX fast path (``_fast_nvfp4_gemv_bf16in_kernel``), falling back to
+# the portable f32-decode ``_nvfp4_gemv_bf16in_body`` for shapes the fast path does
+# not cover (``BF16IN_CONFIG``). fp4in still shares one DSL body across backends.
+BF16IN_TRITON_CONFIG = helion.Config(block_sizes=[16, 128], num_warps=4, num_stages=3)
 FP4IN_TRITON_CONFIG = helion.Config(block_sizes=[1, 128], num_warps=4, num_stages=3)
 
-BF16IN_CONFIGS: dict[BackendName, helion.Config] = {
-    "triton": BF16IN_TRITON_CONFIG,
-    "cute": BF16IN_CONFIG,
-}
 FP4IN_CONFIGS: dict[BackendName, helion.Config] = {
     "triton": FP4IN_TRITON_CONFIG,
     "cute": FP4IN_CONFIG,
@@ -638,12 +735,25 @@ def _selected_backend(backend: BackendName | None) -> BackendName:
 
 
 @functools.cache
-def _nvfp4_gemv_bf16in_kernel(backend: BackendName) -> helion.Kernel[Tensor]:
+def _nvfp4_gemv_bf16in_triton_kernel() -> helion.Kernel[Tensor]:
+    """Coalesced-load W4A16 GEMV, Triton backend (the triton path)."""
+    return helion.kernel(
+        _nvfp4_gemv_bf16in_triton_body,
+        static_shapes=True,
+        config=BF16IN_TRITON_CONFIG,
+        backend="triton",
+    )
+
+
+@functools.cache
+def _nvfp4_gemv_bf16in_cute_fallback_kernel() -> helion.Kernel[Tensor]:
+    """Portable f32-decode W4A16 GEMV: cute fallback for shapes the hand-PTX fast
+    path can't cover (the triton path uses ``_nvfp4_gemv_bf16in_triton_body``)."""
     return helion.kernel(
         _nvfp4_gemv_bf16in_body,
         static_shapes=True,
-        config=BF16IN_CONFIGS[backend],
-        backend=backend,
+        config=BF16IN_CONFIG,
+        backend="cute",
     )
 
 
@@ -697,9 +807,23 @@ def nvfp4_gemv_bf16in(
             block=(128, 1, 1),
         )
         return out
-    return _nvfp4_gemv_bf16in_kernel(backend)(
-        weight_fp4x2.view(weight_bytes.shape[0], weight_bytes.shape[1] // 8, 8),
-        x_bf16.view(weight_bytes.shape[1] // 8, 16),
+    n_rows, k_bytes = weight_bytes.shape
+    groups = k_bytes // 8
+    if backend == "triton":
+        # Coalesced-load Triton kernel: weight as one int64 per group, activation
+        # as contiguous (groups, 16) bf16, scales as the raw SWIZZLE_32_4_4 bytes.
+        return _nvfp4_gemv_bf16in_triton_kernel()(
+            weight_bytes.view(torch.int64).view(n_rows, groups),
+            x_bf16.view(groups, 16),
+            weight_scale.reshape(-1).view(torch.int8),
+            out,
+            alpha,
+        )
+    # cute fallback (shapes the hand-PTX fast path does not cover): the portable
+    # f32-decode DSL body.
+    return _nvfp4_gemv_bf16in_cute_fallback_kernel()(
+        weight_fp4x2.view(n_rows, groups, 8),
+        x_bf16.view(groups, 16),
         weight_scale.reshape(-1),
         out,
         alpha,
