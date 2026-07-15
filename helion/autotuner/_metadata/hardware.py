@@ -3,8 +3,9 @@
 ``collect_hardware_info`` runs lazily from ``KernelMetadata.to_dict`` (dataset-only
 write path), never on the normal autotune path. The GPU-only ``device_props`` block
 carries raw per-backend ``get_device_properties`` values (per-field ``None`` on miss);
-device identity and backend-required tool versions raise on real failure, surfacing
-through ``end_run``.
+device identity raises on real failure, surfacing through ``end_run``. Backend tool
+versions prefer distribution metadata but fall back to the imported module's
+``__version__`` (see ``_package_version``), so a genuinely absent package still raises.
 """
 
 from __future__ import annotations
@@ -95,6 +96,18 @@ _BACKEND_PACKAGES: dict[str, tuple[str, ...]] = {
 }
 
 
+def _package_version(name: str) -> str | None:
+    """Version of an installed backend package. Prefer distribution metadata, but fall
+    back to the imported module's ``__version__``: ROCm's triton ships an importable,
+    working module with no distribution metadata, so ``importlib.metadata.version``
+    alone spuriously raises there. A genuinely absent package still raises on import.
+    """
+    try:
+        return importlib.metadata.version(name)
+    except importlib.metadata.PackageNotFoundError:
+        return getattr(importlib.import_module(name), "__version__", None)
+
+
 def _hardware_versions(device_kind: str | None) -> dict[str, str | None]:
     """PyTorch and Helion versions are always included. GPU backends also record the
     toolkit version (CUDA, HIP, or XPU) under its own key. Each backend's required
@@ -109,7 +122,7 @@ def _hardware_versions(device_kind: str | None) -> dict[str, str | None]:
         toolkit = getattr(torch.version, toolkit_key, None)
         versions[toolkit_key] = None if toolkit is None else str(toolkit)
     for name in _BACKEND_PACKAGES.get(device_kind or "", ()):
-        versions[name] = importlib.metadata.version(name)
+        versions[name] = _package_version(name)
     return versions
 
 
