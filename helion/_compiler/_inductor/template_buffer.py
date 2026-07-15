@@ -55,7 +55,8 @@ if TYPE_CHECKING:
     from typing import Iterable
 
     from torch._inductor.ir import MultiOutput
-    from torch._inductor.scheduler import SchedulerNode
+    from torch._inductor.ir import _HasAliasingOrMutation
+    from torch._inductor.scheduler import BaseSchedulerNode
 
     from ..inductor_lowering import CodegenState
     from helion.runtime.kernel import BoundKernel
@@ -405,7 +406,7 @@ class HelionTemplateBuffer(TemplateBuffer):
 
     def has_aliasing_or_mutation_for_prologue_fusion(
         self,
-        scheduler_node: SchedulerNode,
+        scheduler_node: _HasAliasingOrMutation,
     ) -> bool:
         """Return the Inductor fusion-blocking alias/mutation state.
 
@@ -416,8 +417,12 @@ class HelionTemplateBuffer(TemplateBuffer):
         MutationOutputs remain in the scheduler graph for dependencies and
         memory planning.
         """
+        # cast (type-checker only) to the fuller scheduler-node interface the body
+        # needs; no runtime isinstance, so structurally-compatible nodes (real
+        # Inductor nodes and test fakes) all work.
+        node = cast("BaseSchedulerNode", scheduler_node)
         mutation_names: set[str] = set()
-        for output in scheduler_node.get_outputs():
+        for output in node.get_outputs():
             if output.get_aliases():
                 return True
 

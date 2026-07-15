@@ -110,6 +110,27 @@ class TestConstExpr(RefEagerTestBase, TestCase):
         code, result = code_and_output(fn, (x, "default"))
         torch.testing.assert_close(result, x)
 
+    def test_constexpr_in_body_selects_branch(self):
+        """`hl.constexpr(cond)` used inside a kernel body must decide the branch
+        by the wrapped value, not unconditionally take the `if` branch."""
+
+        @helion.kernel()
+        def fn(x: torch.Tensor, flag: bool) -> torch.Tensor:
+            take_if = hl.constexpr(flag)
+            out = torch.empty_like(x)
+            for tile in hl.tile(x.size(0)):
+                if take_if:
+                    out[tile] = x[tile] + 1.0
+                else:
+                    out[tile] = x[tile] + 2.0
+            return out
+
+        x = torch.zeros([64], device=DEVICE)
+        _, result_true = code_and_output(fn, (x, True), block_sizes=[32])
+        torch.testing.assert_close(result_true, x + 1.0)
+        _, result_false = code_and_output(fn, (x, False), block_sizes=[32])
+        torch.testing.assert_close(result_false, x + 2.0)
+
     @skipIfRefEager("Triton codegen does not work in ref eager mode")
     @skipIfMTIA('Not supported on MTIA. Error: "Expected IntList but got GenericList"')
     def test_block_size_constexpr_assignment_in_host_code(self) -> None:
