@@ -1464,7 +1464,9 @@ class PopulationBasedSearch(BaseSearch):
                     )
                     if isinstance(timing, tuple):
                         timing = timing[0]
-                    new_timings.append(float(timing))
+                    # return_mode="median" always yields a scalar; the PerfStats arm
+                    # of the do_bench union is unreachable here.
+                    new_timings.append(float(timing))  # pyrefly: ignore[bad-argument-type]
         finally:
             for m in members:
                 clear_jit_fast_path_caches(m.fn, self.log)

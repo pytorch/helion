@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import dataclasses
-import math
 import multiprocessing as mp
 import os
 from pathlib import Path
@@ -37,6 +36,7 @@ from helion.autotuner.benchmark_worker import BenchmarkSubprocessError
 from helion.autotuner.benchmark_worker import BenchmarkTimeout
 from helion.autotuner.benchmark_worker import BenchmarkWorker
 from helion.autotuner.benchmark_worker import BenchmarkWorkerDied
+from helion.autotuner.benchmarking import PerfStats
 from helion.autotuner.kernel_args import load_trusted_kernel_args
 from helion.autotuner.precompile_future import SerializedCompiledFunction
 from helion.autotuner.precompile_future import _run_kernel_in_subprocess_spawn
@@ -253,6 +253,72 @@ class TestBenchmarkWorkerFailureModes(unittest.TestCase):
         provider._subprocess_benchmark_enabled = lambda: True
 
         self.assertFalse(provider._subprocess_accuracy_check_enabled())
+
+    def test_benchmark_job_stats_mode_returns_perf_stats(self) -> None:
+        # return_mode="stats" forwards to the bench and returns its PerfStats
+        # unchanged, through either dispatch path (event-based do_bench when
+        # use_wall_clock is False, wall-clock do_bench_generic when True). A
+        # non-PerfStats return raises TypeError at the boundary.
+        fn = _ReturnValue(torch.empty(()))
+        stats = PerfStats(
+            min=1.0,
+            median=1.1,
+            mean=1.2,
+            p90=1.3,
+            std=0.1,
+            n_samples=50,
+        )
+        for use_wall_clock, bench_attr in (
+            (False, "do_bench"),
+            (True, "do_bench_generic"),
+        ):
+            with self.subTest(use_wall_clock=use_wall_clock):
+                with (
+                    patch(
+                        "helion.autotuner.benchmark_job._load_compiled_fn",
+                        return_value=fn,
+                    ),
+                    patch(
+                        "helion.autotuner.benchmark_job.load_trusted_kernel_args",
+                        return_value=(),
+                    ),
+                    patch(
+                        f"helion.autotuner.benchmark_job.{bench_attr}",
+                        return_value=stats,
+                    ) as bench,
+                ):
+                    result = BenchmarkJob(
+                        fn_spec=cast("SerializedCompiledFunction", object()),
+                        args_path="/tmp/args.pt",
+                        use_wall_clock=use_wall_clock,
+                        return_mode="stats",
+                    )()
+                self.assertEqual(result, stats)
+                bench.assert_called_once()
+                self.assertEqual(bench.call_args.kwargs["return_mode"], "stats")
+
+                # A non-PerfStats bench return violates the stats contract -> TypeError.
+                with (
+                    patch(
+                        "helion.autotuner.benchmark_job._load_compiled_fn",
+                        return_value=fn,
+                    ),
+                    patch(
+                        "helion.autotuner.benchmark_job.load_trusted_kernel_args",
+                        return_value=(),
+                    ),
+                    patch(
+                        f"helion.autotuner.benchmark_job.{bench_attr}",
+                        return_value=1.25,
+                    ),
+                    self.assertRaises(TypeError),
+                ):
+                    BenchmarkJob(
+                        fn_spec=cast("SerializedCompiledFunction", object()),
+                        args_path="/tmp/args.pt",
+                        use_wall_clock=use_wall_clock,
+                        return_mode="stats",
+                    )()
 
     def test_load_trusted_kernel_args_accepts_python_objects(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -529,10 +595,11 @@ class TestSubprocessBenchmarkIntegration(RefEagerTestDisabled, unittest.TestCase
         RandomSearch(bound_kernel, args, 20).autotune()
 
     @skipIfXPU("matmul config space includes maxnreg, unsupported on XPU")
-    def test_autotune_continues_when_subprocess_reports_inf(self) -> None:
-        # Patches _benchmark_function_subprocess to return inf for a
-        # fraction of configs, simulating BenchmarkTimeout / worker death;
-        # autotune must still pick a best config from the rest.
+    def test_autotune_continues_when_subprocess_reports_failure(self) -> None:
+        # Patches _benchmark_function_subprocess to return None (the
+        # "benchmark failed, skip this config" sentinel) for a fraction of
+        # configs, simulating BenchmarkTimeout / worker death; autotune must
+        # still pick a best config from the rest.
         if not torch.cuda.is_available():
             self.skipTest("requires CUDA")
 
@@ -543,12 +610,12 @@ class TestSubprocessBenchmarkIntegration(RefEagerTestDisabled, unittest.TestCase
             self: LocalBenchmarkProvider,
             config: Config,
             fn: CompiledConfig,
-        ) -> float | None:
+        ) -> object:
             call_count[0] += 1
             if call_count[0] % 3 == 0:
                 call_count[1] += 1
                 self._autotune_metrics.num_compile_failures += 1
-                return math.inf
+                return None
             return original(self, config, fn)
 
         examples_dir = Path(__file__).parent.parent / "examples"

@@ -325,7 +325,9 @@ def test_cudagraph_replay_wraps_callable(monkeypatch):
 
     assert replay() == 2
     assert calls == ["call", "call"]
-    assert fake_cuda.graph_obj.replay_count == 1
+    graph = fake_cuda.graph_obj
+    assert graph is not None
+    assert graph.replay_count == 1
 
 
 def test_run_example_enables_cudagraph_only_for_final_benchmark(monkeypatch):

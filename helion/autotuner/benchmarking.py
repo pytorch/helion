@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 import functools
 import glob
 import logging
@@ -14,6 +15,7 @@ from typing import Any
 from typing import Callable
 from typing import TypeVar
 
+import numpy as np
 import torch
 
 from ..runtime.settings import _env_get_bool
@@ -54,6 +56,50 @@ def _make_l2_cache_clearer() -> Callable[[], None]:
         active.clear_cache(cache)  # type: ignore[attr-defined]
 
     return clear
+
+
+@dataclasses.dataclass(frozen=True)
+class PerfStats:
+    """Per-config latency statistics for the autotune dataset.
+
+    A successful benchmark yields all-real fields (``n_samples >= 1``). The
+    default-constructed ``PerfStats()`` is the null sentinel for a config that
+    was registered but never produced a good measurement (all ``None``,
+    ``n_samples == 0``).
+    """
+
+    min: float | None = None
+    median: float | None = None
+    mean: float | None = None
+    p90: float | None = None
+    std: float | None = None
+    n_samples: int = 0
+
+    def to_dict(self) -> dict[str, object]:
+        return dataclasses.asdict(self)
+
+
+# Return type of the benchmark helpers: a scalar, the multi-quantile tuple, or the
+# full PerfStats record (``return_mode="stats"``).
+BenchTimes = float | tuple[float, ...] | PerfStats
+
+
+def _compute_perf_stats(times: list[float]) -> PerfStats:
+    # Callers (do_bench / do_bench_generic) always build ``times`` from an
+    # ``n_repeat = max(1, ...)`` loop, so an empty list is a programming error,
+    # not a "no samples" state -- that state is ``PerfStats()`` at the
+    # sink boundary.
+    assert times, "_compute_perf_stats requires at least one timing sample"
+    n = len(times)
+    arr = np.asarray(times, dtype=float)
+    return PerfStats(
+        min=float(arr.min()),
+        median=float(np.median(arr)),
+        mean=float(arr.mean()),
+        p90=float(np.percentile(arr, 90.0)),
+        std=float(arr.std(ddof=1)) if n > 1 else 0.0,
+        n_samples=n,
+    )
 
 
 def _cudagraph_unavailable_reason() -> str | None:
@@ -380,7 +426,7 @@ def _pallas_device_micros_for_fn(
     xplane/TPU plane, too few events). Kernel exceptions from ``fn`` propagate.
     """
     try:
-        import jax  # pyrefly: ignore[missing-module-attribute]
+        import jax  # pyrefly: ignore[missing-import, missing-module-attribute]
     except ImportError:
         return math.inf
 
@@ -465,7 +511,7 @@ def _summarize_statistics_fallback(
     times: list[float],
     quantiles: list[float] | None,
     return_mode: str,
-) -> float | tuple[float, ...]:
+) -> BenchTimes:
     """Fallback statistics summarizer when triton.testing._summarize_statistics is unavailable."""
     if return_mode == "min":
         return min(times)
@@ -475,6 +521,8 @@ def _summarize_statistics_fallback(
         return statistics.mean(times)
     if return_mode == "median":
         return statistics.median(times)
+    if return_mode == "stats":
+        return _compute_perf_stats(times)
     # "all" mode
     if quantiles is not None:
         sorted_times = sorted(times)
@@ -500,7 +548,7 @@ def do_bench(
     process_group_name: str | None = None,
     *,
     default_cudagraph: bool = False,
-) -> float | tuple[float, ...]:
+) -> BenchTimes:
     """
     Benchmark the runtime of the provided function. By default, return the median runtime of :code:`fn` along with
     the 20-th and 80-th performance percentile.
@@ -515,13 +563,13 @@ def do_bench(
     :type grad_to_none: torch.tensor, optional
     :param quantiles: Performance percentile to return in addition to the median.
     :type quantiles: list[float], optional
-    :param return_mode: The statistical measure to return. Options are "min", "max", "mean", "median", or "all". Default is "mean".
+    :param return_mode: The statistical measure to return. Options are "min", "max", "mean", "median", "all", or "stats". Default is "mean".
     :type return_mode: str
     """
     from triton import runtime
     from triton.testing import _summarize_statistics
 
-    assert return_mode in ["min", "max", "mean", "median", "all"]
+    assert return_mode in ["min", "max", "mean", "median", "all", "stats"]
 
     di = runtime.driver.active.get_device_interface()  # pyrefly: ignore
 
@@ -575,6 +623,9 @@ def do_bench(
     # Record clocks
     di.synchronize()
     times = [s.elapsed_time(e) for s, e in zip(start_event, end_event, strict=True)]
+    # "stats" precedes triton's helper, which doesn't know that mode.
+    if return_mode == "stats":
+        return _compute_perf_stats(times)
     return _summarize_statistics(times, quantiles, return_mode)  # pyrefly: ignore
 
 
@@ -588,11 +639,11 @@ def do_bench_generic(
     process_group_name: str | None = None,
     *,
     default_cudagraph: bool = False,  # accepted for API symmetry; wall-clock timing doesn't use CG
-) -> float | tuple[float, ...]:
+) -> BenchTimes:
     """
     Benchmark using wall-clock timing for backends without Triton event timing.
     """
-    assert return_mode in ["min", "max", "mean", "median", "all"]
+    assert return_mode in ["min", "max", "mean", "median", "all", "stats"]
 
     fn()
     synchronize_device()

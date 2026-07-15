@@ -45,6 +45,7 @@ if TYPE_CHECKING:
 
     from torch._inductor.ops_handler import OpsHandler
 
+    from ..autotuner.benchmarking import BenchTimes
     from ..autotuner.config_fragment import ConfigSpecFragment
     from ..autotuner.config_priors import ValuePrior
     from ..autotuner.config_spec import ConfigSpec
@@ -362,13 +363,18 @@ class Backend(abc.ABC):
     def tunable_fragments(self) -> dict[str, ConfigSpecFragment]:
         return {}
 
-    def get_do_bench(self) -> Callable[..., float | tuple[float, ...]] | None:
+    def get_do_bench(self) -> Callable[..., BenchTimes] | None:
         """Return the benchmarking function for this backend.
 
         The default returns ``None`` which causes the autotuner to use the
         module-level ``do_bench`` (patchable by tests).  Backends that need
         a different timing mechanism (e.g., Pallas/TPU) should override
         this to return their own function.
+
+        An override MUST honor ``return_mode="stats"`` (returning a
+        ``PerfStats``): the autotune benchmark path always requests it, and
+        ``LocalBenchmarkProvider._benchmark_function`` raises ``TypeError`` if the
+        result is not a ``PerfStats``.
         """
         return None
 
@@ -2073,7 +2079,7 @@ class PallasBackend(Backend):
     def tunable_fragments(self) -> dict[str, ConfigSpecFragment]:
         return {}
 
-    def get_do_bench(self) -> Callable[..., float | tuple[float, ...]]:
+    def get_do_bench(self) -> Callable[..., BenchTimes]:
         from ..autotuner.benchmarking import do_bench_generic
 
         return do_bench_generic
@@ -5479,7 +5485,7 @@ class CuteBackend(Backend):
             return "warn"
         return None
 
-    def get_do_bench(self) -> Callable[..., float | tuple[float, ...]]:
+    def get_do_bench(self) -> Callable[..., BenchTimes]:
         # The default Triton do_bench uses CUDA events that mis-time the CuTe
         # path on Blackwell - launches show up as ~5ms when the kernel is
         # actually 250ms+. Use synchronized wall-clock timing instead so

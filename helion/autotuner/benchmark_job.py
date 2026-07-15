@@ -5,11 +5,12 @@ from __future__ import annotations
 import dataclasses
 import functools
 from typing import TYPE_CHECKING
-from typing import cast
+from typing import Literal
 
 import torch
 
 from .accuracy import assert_close
+from .benchmarking import PerfStats
 from .benchmarking import do_bench
 from .benchmarking import do_bench_generic
 from .benchmarking import synchronize_device
@@ -28,24 +29,34 @@ class BenchmarkJob:
     warmup: int = 1
     rep: int = 50
     use_wall_clock: bool = False
+    return_mode: Literal["median", "stats"] = "median"
 
-    def __call__(self) -> float:
+    def __call__(self) -> float | PerfStats:
         # Subprocess inherits parent stderr; capture so Triton runtime
         # diagnostics don't leak to the user's terminal.
         with capture_output():
             fn = _load_compiled_fn(self.fn_spec)
             args = load_trusted_kernel_args(self.args_path)
             bench = do_bench_generic if self.use_wall_clock else do_bench
-            # return_mode="median" guarantees a float return (not the tuple variant).
-            return cast(
-                "float",
-                bench(
-                    functools.partial(fn, *args),
-                    return_mode="median",
-                    warmup=self.warmup,
-                    rep=self.rep,
-                ),
+            result = bench(
+                functools.partial(fn, *args),
+                return_mode=self.return_mode,
+                warmup=self.warmup,
+                rep=self.rep,
             )
+            if self.return_mode == "stats":
+                if not isinstance(result, PerfStats):
+                    raise TypeError(
+                        f"return_mode='stats' expected do_bench to return a "
+                        f"PerfStats, got {type(result).__name__}"
+                    )
+                return result
+            if not isinstance(result, float):
+                raise TypeError(
+                    f"return_mode='median' expected do_bench to return a "
+                    f"float, got {type(result).__name__}"
+                )
+            return result
 
 
 @functools.cache
