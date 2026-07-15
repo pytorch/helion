@@ -221,7 +221,7 @@ def _pallas_make_block_spec(
 
     if entry is None:
         ndim = tensor.ndim
-        full_shape = tuple(tensor.shape)
+        full_shape = tuple(max(s, 1) for s in tensor.shape)
 
         def index_map_full(*grid_args: object, _nd: int = ndim) -> tuple[object, ...]:
             # pyrefly: ignore[missing-attribute]
@@ -230,14 +230,22 @@ def _pallas_make_block_spec(
         return pl.BlockSpec(full_shape, index_map_full, memory_space=memory_space)  # type: ignore[union-attr]
 
     block_shape_template, grid_dims = entry
+    # Clamp to >= 1: empty tensors (zero-work grids) would otherwise produce
+    # 0-sized block dims, which the interpret machinery divides by.
     block_shape = tuple(
-        min(bs, tensor.shape[d]) if bs is not None else tensor.shape[d]
+        max(min(bs, tensor.shape[d]) if bs is not None else tensor.shape[d], 1)
         for d, bs in enumerate(block_shape_template)
+    )
+    # Block indices past the last block are clamped, matching pallas_call's
+    # window clamping (index maps may run past the end, e.g. offset reads).
+    max_block_index = tuple(
+        max(-(-tensor.shape[d] // bs), 1) - 1 for d, bs in enumerate(block_shape)
     )
 
     def _index_for_dim(
         grid_args: tuple[object, ...],
         g: int | tuple[int, int, int] | None,
+        d: int,
         jnp: object = jnp,
     ) -> object:
         if g is None:
@@ -250,13 +258,16 @@ def _pallas_make_block_spec(
                 val = val // stride  # type: ignore[operator]
             val = val % num_blocks  # type: ignore[operator]
             return jnp.int32(val)  # pyrefly: ignore[missing-attribute]
-        return jnp.int32(grid_args[g])  # pyrefly: ignore[missing-attribute]
+        return jnp.minimum(  # pyrefly: ignore[missing-attribute]
+            jnp.int32(grid_args[g]),  # pyrefly: ignore[missing-attribute]
+            max_block_index[d],
+        )
 
     def index_map(
         *grid_args: object,
         _grid_dims: tuple[int | tuple[int, int, int] | None, ...] = grid_dims,
     ) -> tuple[object, ...]:
-        return tuple(_index_for_dim(grid_args, g) for g in _grid_dims)
+        return tuple(_index_for_dim(grid_args, g, d) for d, g in enumerate(_grid_dims))
 
     return pl.BlockSpec(block_shape, index_map, memory_space=memory_space)  # type: ignore[union-attr]
 
@@ -472,7 +483,7 @@ def _pallas_build_block_specs(
     _smem_arg_indices: list[int] | None = None,
     output_only_indices: list[int] | None = None,
 ) -> tuple[list[object] | None, object | None]:
-    """Build ``in_specs`` and ``out_specs`` for ``pl.pallas_call``.
+    """Build ``in_specs`` and ``out_specs`` for the launcher.
 
     ``block_spec_info`` is indexed by position among *all* tensor args.
     ``output_only_indices`` lists tensor positions excluded from
@@ -530,7 +541,7 @@ def _pallas_build_pipeline_specs(
     output_only_indices: list[int] | None = None,
     smem_arg_indices: list[int] | None = None,
 ) -> tuple[list[object], object]:
-    """Build in/out specs for the ``PrefetchScalarGridSpec`` path.
+    """Build in/out specs for the pipeline/scratch path.
 
     Tensors listed in *hbm_arg_indices* get HBM refs (used by pipeline
     launchers as the outer HBM ref that DMAs into VMEM, and by
@@ -1427,11 +1438,87 @@ def _pallas_check_vmem_or_raise(
         )
 
 
+def _pallas_pl_kernel_jit_fn(
+    pl: object,
+    pltpu: object,
+    reordered_kernel: object,
+    *,
+    out_shape_arg: object,
+    grid: tuple[int, ...],
+    in_specs: list[object],
+    out_specs: object,
+    scratch_shapes: list[object],
+    n_inputs: int,
+    n_outputs: int,
+    hbm_in_positions: set[int],
+    hbm_out_positions: set[int],
+    interpret: bool,
+) -> object:
+    """Build the ``pl.kernel`` jit_fn that drives the Helion device kernel.
+
+    The kernel body receives ANY-space refs ``[inputs..., outputs...,
+    scratch...]`` and iterates the grid with ``pltpu.emit_pipeline``.
+
+    - Tensors at *hbm_in_positions* / *hbm_out_positions* are not pipelined:
+      ``emit_pipeline`` rejects ANY-space buffer specs, so their raw refs are
+      closure-captured and stitched back into position for the kernel to DMA
+      manually.
+    - Scratch refs are closure-forwarded; the primitive ``emit_pipeline``
+      implementation has no ``scratches=`` kwarg.
+    - No ``dimension_semantics``: ``TensorCoreMesh`` forbids it, and
+      ``emit_pipeline`` runs grid steps sequentially in ascending order.
+    """
+    out_specs_seq = (
+        list(out_specs) if isinstance(out_specs, (list, tuple)) else [out_specs]
+    )
+    pipeline_grid = grid or (1,)
+    n_io = n_inputs + n_outputs
+    # Positions (within [inputs..., outputs...]) that go through the
+    # pipeline; the rest are raw pass-through refs.
+    pipe_positions = [i for i in range(n_inputs) if i not in hbm_in_positions]
+    pipe_positions += [
+        n_inputs + i for i in range(n_outputs) if i not in hbm_out_positions
+    ]
+    all_specs = list(in_specs) + out_specs_seq
+    pipe_in_specs = [all_specs[p] for p in pipe_positions if p < n_inputs]
+    pipe_out_specs = [all_specs[p] for p in pipe_positions if p >= n_inputs]
+
+    def kernel_body(*refs: object) -> None:
+        io_any = refs[:n_io]
+        # Mixed spaces: VMEM/SMEM buffers and DMA semaphores.
+        scratch_refs = refs[n_io:]
+        pipe_any = [io_any[p] for p in pipe_positions]
+
+        # block_refs are the per-step windowed buffers (VMEM, or SMEM for
+        # SMEM-spec'd args), one per pipe_positions entry.
+        def pipeline_body(*block_refs: object) -> None:
+            merged = list(io_any)
+            for p, block in zip(pipe_positions, block_refs, strict=True):
+                merged[p] = block
+            reordered_kernel(*merged, *scratch_refs)  # type: ignore[operator]
+
+        pltpu.emit_pipeline(  # type: ignore[union-attr]
+            pipeline_body,
+            grid=pipeline_grid,
+            in_specs=pipe_in_specs,
+            out_specs=pipe_out_specs,
+        )(*pipe_any)
+
+    mesh = pltpu.create_tensorcore_mesh("core", num_cores=1)  # type: ignore[union-attr]
+    return pl.kernel(  # type: ignore[union-attr]
+        kernel_body,
+        out_shape_arg,
+        mesh=mesh,
+        scratch_types=scratch_shapes,
+        interpret=interpret,
+    )
+
+
 @dataclass(slots=True)
 class _PallasCompileResult:
     """Bundle returned by :func:`_pallas_compile_jit_fn`.
 
-    Carries the compiled ``pl.pallas_call`` plus all per-arg metadata
+    Carries the compiled ``pl.kernel`` jit_fn plus all per-arg metadata
     that downstream consumers (``_pallas_build_callable``,
     ``_LauncherFastPath`` setup, the JAX-export launcher) need to wire
     inputs and outputs.  The fields mirror the named portion of the
@@ -1461,25 +1548,25 @@ def _pallas_compile_jit_fn(
     _matmul_dot_general: dict[str, object] | None,
     interpret: bool,
 ) -> _PallasCompileResult:
-    """Build the ``pl.pallas_call`` jit_fn used by the Pallas launcher.
+    """Build the ``pl.kernel`` jit_fn used by the Pallas launcher.
 
     The kernel loop shape is driven entirely by the launcher-observable
     inputs:
 
     - ``_scratch_shapes`` present (VMEM buffers / DMA semaphores) →
-      wrap ``in``/``out`` specs and the grid in a
-      ``pltpu.PrefetchScalarGridSpec`` so the scratch refs are threaded
-      into the kernel.  Tensors listed in ``_hbm_arg_indices`` get HBM
-      refs via ``_pallas_build_pipeline_specs``, and their inplace copy
-      is skipped because you cannot directly index an HBM ref.
+      the scratch refs are allocated by ``pl.kernel`` and forwarded to
+      the device kernel.  Tensors listed in ``_hbm_arg_indices`` get
+      raw pass-through refs (see :func:`_pallas_pl_kernel_jit_fn`), and
+      their inplace copy is skipped because you cannot directly index
+      an HBM ref.
     - ``_scratch_shapes`` absent → simple ``grid`` + per-arg
       ``BlockSpec`` layout via ``_pallas_build_block_specs``.
 
     When ``_matmul_dot_general`` is provided (no-tiling matmul configs
     on the unroll / emit_pipeline lowerings), substitutes
-    ``jax.jit(lax.dot_general)`` for ``pl.pallas_call`` and skips the
-    VMEM check; XLA's planner streams the contraction so the
-    pallas_call lowering's VMEM estimate doesn't apply.
+    ``jax.jit(lax.dot_general)`` for the Pallas launch and skips the
+    VMEM check; XLA's planner streams the contraction so the Pallas
+    lowering's VMEM estimate doesn't apply.
 
     ``args`` must already have any ds-padding applied — this helper
     builds specs from the post-pad shapes.  Returns a
@@ -1489,6 +1576,9 @@ def _pallas_compile_jit_fn(
     from jax.experimental import pallas as pl
     from jax.experimental.pallas import tpu as pltpu
     import jax.numpy as jnp
+
+    if interpret:
+        _ensure_cpu_tpu_info()
 
     (
         tensor_arg_indices,
@@ -1503,7 +1593,9 @@ def _pallas_compile_jit_fn(
         args, _output_indices, _inplace_indices, interpret=interpret
     )
 
-    copy_guards, dimension_semantics = _pallas_shared_output_plan(
+    # Only the copy guards are consumed; the dimension semantics are implied
+    # by emit_pipeline's sequential in-order grid execution.
+    copy_guards, _ = _pallas_shared_output_plan(
         grid,
         tensor_arg_indices,
         output_only_indices,
@@ -1513,13 +1605,11 @@ def _pallas_compile_jit_fn(
     )
 
     # Two discriminators drive the spec-building path — either forces
-    # the ``PrefetchScalarGridSpec`` route:
-    #   1. ``_hbm_arg_indices`` non-empty: some tensor needs an HBM
-    #      ref (``pl.BlockSpec(memory_space=pl.ANY)``) rather than a
-    #      plain BlockSpec.
+    # the pipeline-spec route:
+    #   1. ``_hbm_arg_indices`` non-empty: some tensor needs a raw
+    #      pass-through ref rather than a plain BlockSpec.
     #   2. ``_scratch_shapes`` non-empty: the kernel registered VMEM
-    #      buffers or DMA semaphores, which are only reachable via a
-    #      ``scratch_shapes=`` argument on ``PrefetchScalarGridSpec``.
+    #      buffers or DMA semaphores.
     needs_pipeline_specs = bool(_hbm_arg_indices) or bool(_scratch_shapes)
     has_scratch = bool(_scratch_shapes)
     if needs_pipeline_specs:
@@ -1592,38 +1682,52 @@ def _pallas_compile_jit_fn(
         )
 
     if _matmul_dot_general is not None:
-        # Substitute ``lax.dot_general`` for ``pl.pallas_call`` on
+        # Substitute ``lax.dot_general`` for the Pallas launch on
         # no-tiling matmul configs so XLA sees a regular ``dot`` and
         # can attach ``cross_program_prefetch_index``.
         jit_fn = _build_matmul_dot_general_jit_fn(_matmul_dot_general)
     else:
-        pallas_call_kwargs: dict[str, object] = {"out_shape": out_shape_arg}
-        if needs_pipeline_specs:
-            pallas_call_kwargs["grid_spec"] = pltpu.PrefetchScalarGridSpec(  # pyrefly: ignore[missing-attribute]
-                num_scalar_prefetch=0,
-                in_specs=in_specs,
-                out_specs=out_specs,
-                scratch_shapes=scratch_shapes,  # pyrefly: ignore[bad-argument-type]
-                grid=grid,
-            )
-            pallas_call_kwargs["compiler_params"] = pltpu.CompilerParams(  # pyrefly: ignore[bad-instantiation]
-                dimension_semantics=dimension_semantics,
-            )
-        else:
-            pallas_call_kwargs["grid"] = grid
-            if in_specs is not None:
-                pallas_call_kwargs["in_specs"] = in_specs
-                pallas_call_kwargs["out_specs"] = out_specs
-            if any(sem != "parallel" for sem in dimension_semantics):
-                pallas_call_kwargs["compiler_params"] = pltpu.CompilerParams(  # pyrefly: ignore[bad-instantiation]
-                    dimension_semantics=dimension_semantics,
-                )
-        if interpret:
-            pallas_call_kwargs["interpret"] = True
+        # emit_pipeline needs concrete specs: build whole-array specs when
+        # the builders returned None (no tiling info or empty grid).  The
+        # VMEM estimate above deliberately sees the original specs, not
+        # these synthetic full-shape ones.
+        launch_in_specs = in_specs
+        launch_out_specs = out_specs
+        if launch_in_specs is None:
+            all_positions = sorted(set(tensor_arg_indices) | set(output_only_indices))
+            all_arg_to_tpos = {orig: tpos for tpos, orig in enumerate(all_positions)}
+            smem_set = set(_smem_arg_indices or [])
 
-        jit_fn = pl.pallas_call(  # type: ignore[union-attr]
-            reordered_kernel,  # pyrefly: ignore[bad-argument-type]
-            **pallas_call_kwargs,  # type: ignore[arg-type]
+            def _full_spec(idx: int) -> object:
+                t = args[idx]
+                assert isinstance(t, torch.Tensor)
+                return _pallas_make_block_spec(
+                    pl, jnp, pltpu, t, None, all_arg_to_tpos[idx] in smem_set
+                )
+
+            launch_in_specs = [_full_spec(idx) for idx in tensor_arg_indices]
+            out_list = [_full_spec(idx) for idx in _output_indices]
+            launch_out_specs = out_list if len(out_list) > 1 else out_list[0]
+
+        hbm_set = set(_hbm_arg_indices or [])
+        jit_fn = _pallas_pl_kernel_jit_fn(
+            pl,
+            pltpu,
+            reordered_kernel,
+            out_shape_arg=out_shape_arg,
+            grid=grid,
+            in_specs=launch_in_specs,  # pyrefly: ignore[bad-argument-type]
+            out_specs=launch_out_specs,
+            scratch_shapes=scratch_shapes,
+            n_inputs=len(tensor_arg_indices),
+            n_outputs=len(_output_indices),
+            hbm_in_positions={
+                i for i, idx in enumerate(tensor_arg_indices) if idx in hbm_set
+            },
+            hbm_out_positions={
+                i for i, idx in enumerate(_output_indices) if idx in hbm_set
+            },
+            interpret=interpret,
         )
 
     return _PallasCompileResult(
@@ -1656,7 +1760,7 @@ def _pallas_install_launcher_cache(
 ) -> tuple[object, ...]:
     """Cache-miss path shared by all Pallas launchers.
 
-    Builds the ``pl.pallas_call`` jit_fn via :func:`_pallas_compile_jit_fn`
+    Builds the ``pl.kernel`` jit_fn via :func:`_pallas_compile_jit_fn`
     (whose shape is fully determined by the passed-in kwargs — no loop-type
     discriminator), wraps it in a ``JaxCallable`` (or interpret-mode shim),
     seeds the ``_LauncherFastPath`` slot, stores the result on
@@ -1800,9 +1904,8 @@ def default_pallas_launcher(
       (compact-worklist path).
     - Otherwise → the standard ``_pallas_compile_jit_fn`` path.
       ``_pallas_compile_jit_fn`` internally chooses between a plain
-      ``grid`` + ``BlockSpec`` layout (no scratch) and a
-      ``PrefetchScalarGridSpec`` layout (scratch present) based on
-      ``_scratch_shapes``.
+      ``grid`` + ``BlockSpec`` layout (no scratch) and the
+      pipeline/scratch layout based on ``_scratch_shapes``.
 
     Uses ``JaxCallable`` from ``torch_tpu`` to compile and run the Pallas
     kernel on TPU.  When ``torch_tpu`` is not available (interpret mode),
@@ -1968,9 +2071,9 @@ def _pallas_make_compact_reordered_kernel(
     _output_indices: list[int],
     n_scalar_prefetch: int,
 ) -> object:
-    """Reordered kernel for PrefetchScalarGridSpec.
+    """Reordered kernel for the compact-worklist launcher.
 
-    Pallas passes refs as ``[scalar_refs..., inputs..., outputs..., scratch...]``;
+    The launcher passes refs as ``[scalar_refs..., inputs..., outputs..., scratch...]``;
     the generated device function expects
     ``(inputs..., outputs..., scratch..., metadata_refs...)`` (the metadata refs
     are ``wrapper_only_params``, appended last).  Strip the N leading scalar refs
