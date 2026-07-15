@@ -64,6 +64,18 @@ class TypeInfo:
 
     @classmethod
     def from_example(cls, value: object, origin: Origin) -> TypeInfo:
+        from ..language.constexpr import ConstExpr
+
+        if isinstance(value, ConstExpr):
+            # hl.constexpr(...) used inside a kernel body marks its argument as a
+            # compile-time constant.  It is transparent to control flow and
+            # arithmetic, so represent it by its wrapped value's type.  Without
+            # this, ConstExpr (a NamedTuple, incl. subclasses like
+            # ProcessGroupName) becomes a ClassType whose truth_value() is
+            # bool(element_types) -- always True, since the wrapper always has its
+            # single 'value' field -- so an `if hl.constexpr(cond):` ignores cond
+            # and always takes the body.
+            return cls.from_example(value.value, origin)
         if isinstance(value, torch.Tensor):
             # TODO(jansel): need to wrap this in a fake tensor
             # TODO(jansel): tensor subclass support
