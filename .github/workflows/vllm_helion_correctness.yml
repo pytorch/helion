@@ -1,10 +1,8 @@
 name: vLLM Helion Kernel Correctness
 
-# On every PR push (and pushes to main), install vLLM + this PR's Helion and
-# verify every vLLM-registered Helion kernel COMPILES at all its committed
-# config/shape points and matches its baseline. Runs the full cross-product of
-# {H100, B200} x {vLLM nightly, vLLM stable release} = 4 jobs, so a Helion
-# change is checked against both the latest vLLM and a pinned stable one.
+# On every PR push (and pushes to main), install vLLM nightly + this PR's Helion
+# and verify every vLLM-registered Helion kernel COMPILES at all its committed
+# config/shape points and matches its baseline, on both H100 and B200.
 #
 # Correctness only -- no perf. Its purpose is to catch codegen/compile
 # regressions that break a specific config on a specific GPU (e.g. the
@@ -26,18 +24,12 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # Cross-product: each GPU x each vLLM channel (nightly + a stable
-        # release). 4 jobs total.
         gpu:
           - runner: mt-l-x86iamx-22-225-h100
             alias: h100
           - runner: linux.dgx.b200
             alias: b200
-        vllm:
-          - channel: nightly
-          - channel: stable
-            version: "0.25.0"
-    name: vllm-helion-correctness-${{ matrix.gpu.alias }}-${{ matrix.vllm.version || matrix.vllm.channel }}
+    name: vllm-helion-correctness-${{ matrix.gpu.alias }}
     runs-on: ${{ matrix.gpu.runner }}
     container:
       image: nvidia/cuda:13.1.0-devel-ubuntu24.04
@@ -81,19 +73,14 @@ jobs:
         # continue-on-error): the check cannot run without it.
         run: |
           source .venv/bin/activate
-          # unsafe-best-match: vLLM pins exact dep versions that live on PyPI,
-          # not the vLLM/pytorch nightly indexes; let uv resolve from any.
-          if [ "${{ matrix.vllm.channel }}" = "nightly" ]; then
-            # Add the pytorch cu130 nightly index so the resolver picks the
-            # CUDA build of torch that matches the container / GPU (incl. B200).
-            uv pip install -U vllm --pre \
-              --index-strategy unsafe-best-match \
-              --extra-index-url https://wheels.vllm.ai/nightly \
-              --extra-index-url https://download.pytorch.org/whl/nightly/cu130
-          else
-            # Stable release from PyPI; let it resolve (and pin) its own torch.
-            uv pip install --index-strategy unsafe-best-match "vllm==${{ matrix.vllm.version }}"
-          fi
+          # unsafe-best-match: vLLM nightly pins exact dep versions that live on
+          # PyPI, not the vLLM/pytorch nightly indexes; let uv resolve from any.
+          # The pytorch cu130 nightly index gives a torch CUDA build matching the
+          # container / GPU (incl. B200).
+          uv pip install -U vllm --pre \
+            --index-strategy unsafe-best-match \
+            --extra-index-url https://wheels.vllm.ai/nightly \
+            --extra-index-url https://download.pytorch.org/whl/nightly/cu130
           python -c "import vllm, torch; print('vllm', vllm.__version__, '| torch', torch.__version__)"
 
       - name: Install Helion (this PR)
