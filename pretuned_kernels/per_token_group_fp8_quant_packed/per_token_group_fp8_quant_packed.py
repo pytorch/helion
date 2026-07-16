@@ -26,6 +26,7 @@ except ImportError:
 
 @helion.experimental.aot_kernel(
     ignore_warnings=[helion.exc.TensorOperationInWrapper],
+    static_shapes=True,
 )
 def per_token_group_fp8_quant_packed(
     input: torch.Tensor,  # [num_tokens, hidden_size]  # noqa: A002
