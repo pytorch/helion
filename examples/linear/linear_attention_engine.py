@@ -1470,8 +1470,6 @@ def _helion_chunked_bwd(
     BH = B * H
     BHN = BH * N
 
-    grad_output_f = grad_output.float()
-
     if g is None:
         # No-decay backward: no g_cs/q_scaled prescale, decay compiled out of
         # the kernels, and no dg gradient.
@@ -1517,8 +1515,6 @@ def _helion_chunked_bwd(
     if not diagonal_decay:
         # Scalar decay path — use cached data from forward when available,
         # and defer float conversion to the kernels that need it.
-        vf = v.float().reshape(BH, N, C, DV)
-
         bwd_cache = (
             getattr(h_all, "_scalar_bwd_cache", None) if h_all is not None else None
         )
@@ -1535,6 +1531,7 @@ def _helion_chunked_bwd(
                 g_last_scalar[:, :, None, None] - g_cs[:, :, :, None]
             )
             state = q.new_zeros(BH, D, DV, dtype=torch.float32)
+            vf = v.float().reshape(BH, N, C, DV)
             h_all = chunk_fwd_h_diag_fused(k_state_4d, vf, g_last_4d, state)
 
         q_4d = q.reshape(BH, N, C, D)
