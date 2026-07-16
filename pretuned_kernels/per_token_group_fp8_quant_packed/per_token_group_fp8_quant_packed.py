@@ -213,18 +213,29 @@ def _make_outputs(
     return output_q, output_s_packed
 
 
+def _bench_shapes() -> list[tuple[int, int]]:
+    """Shapes main() benchmarks: (num_tokens, hidden_size) pairs."""
+    hidden_sizes = [2048, 4096, 5120]
+    num_tokens_list = [4, 16, 64, 256, 1024, 2048, 8192]
+    return [(t, h) for h in hidden_sizes for t in num_tokens_list]
+
+
 def correctness_check() -> None:
-    """Assert the Helion kernel matches the torch reference."""
+    """Assert the Helion kernel matches the torch reference (used by the tests)."""
     torch.manual_seed(0)
-    nt, hidden, gs = 16, 4096, 128
-    inp = torch.randn(nt, hidden, device="cuda", dtype=torch.bfloat16) * 8
-    const = (gs, 1e-10, -448.0, 448.0)
-    oq, osp = _make_outputs(nt, hidden, gs)
-    oq_ref, osp_ref = _make_outputs(nt, hidden, gs)
-    per_token_group_fp8_quant_packed(inp, oq, osp, *const)
-    _packed_torch(inp, oq_ref, osp_ref, *const)
-    torch.testing.assert_close(osp, osp_ref)  # packed int32 exponents must match
-    torch.testing.assert_close(oq.float(), oq_ref.float(), rtol=0.2, atol=0.2)
+    group_size = 128
+    const = (group_size, 1e-10, -448.0, 448.0)
+    for num_tokens, hidden_size in _bench_shapes():
+        inp = (
+            torch.randn(num_tokens, hidden_size, device="cuda", dtype=torch.bfloat16)
+            * 8
+        )
+        oq, osp = _make_outputs(num_tokens, hidden_size, group_size)
+        oq_ref, osp_ref = _make_outputs(num_tokens, hidden_size, group_size)
+        per_token_group_fp8_quant_packed(inp, oq, osp, *const)
+        _packed_torch(inp, oq_ref, osp_ref, *const)
+        torch.testing.assert_close(osp, osp_ref)
+        torch.testing.assert_close(oq.float(), oq_ref.float(), rtol=0.2, atol=0.2)
 
 
 def main(
@@ -242,9 +253,7 @@ def main(
     fp8_min, fp8_max = -448.0, 448.0
     group_size = 128
 
-    hidden_sizes = [2048, 4096, 5120]
-    num_tokens_list = [4, 16, 64, 256, 1024, 2048, 8192]
-    shapes = [(t, h) for h in hidden_sizes for t in num_tokens_list]
+    shapes = _bench_shapes()
     if limit is not None:
         shapes = shapes[:limit]
     baselines = _baselines()
@@ -281,6 +290,9 @@ def main(
 
 if __name__ == "__main__":
     import argparse
+
+    # Verify numerics across every benchmarked shape before timing.
+    correctness_check()
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--no-cudagraph", action="store_true")
