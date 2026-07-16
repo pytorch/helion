@@ -482,7 +482,7 @@ KERNEL_MAPPINGS: dict[str, tuple[str, ...]] = {
     ),
     "grouped_gemm": (
         "tritonbench.operators.grouped_gemm.operator",
-        "examples.grouped_gemm",
+        "benchmarks.grouped_gemm",
         "grouped_gemm_jagged_persistent_tritonbench",
         {
             "num_inputs": 6,  # grouped_gemm takes long time on Benchmark CI, so use fewer inputs instead.
