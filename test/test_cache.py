@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 import tempfile
@@ -736,6 +737,10 @@ class TestCache(RefEagerTestDisabled, TestCase):
             self.assertTrue(artifact.is_file())
             sidecar = backend_cache / f"cute_dsl_{cache_key}.json"
             self.assertTrue(sidecar.is_file())
+
+            sidecar_data = json.loads(sidecar.read_text())
+            self.assertIn("kernel_info", sidecar_data)
+            self.assertGreater(len(sidecar_data["kernel_info"]), 0)
             # Only the winner's artifact pair was persisted.
             entries = [p for p in backend_cache.iterdir() if not p.name.startswith(".")]
             self.assertEqual(len(entries), 2)
@@ -763,6 +768,14 @@ class TestCache(RefEagerTestDisabled, TestCase):
             ):
                 result = kernel(*args_a)
             torch.testing.assert_close(result, result_a, rtol=1e-2, atol=5e-2)
+            reloaded_launchers = cute_kernel._helion_cute_compiled_launchers
+            reloaded = next(iter(reloaded_launchers.values()))._compiled
+
+            from cutlass.cutlass_dsl.tvm_ffi_provider import (
+                TVMFFIJitCompiledFunctionBase,
+            )
+
+            self.assertIsInstance(reloaded, TVMFFIJitCompiledFunctionBase)
 
 
 instantiate_parametrized_tests(TestCache)

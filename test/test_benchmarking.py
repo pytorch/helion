@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 import os
 from types import SimpleNamespace
 from typing import Any
@@ -119,11 +120,47 @@ def _fake_device_value(device_type: str = "cuda"):
     return SimpleNamespace(device=SimpleNamespace(type=device_type))
 
 
-_FAKE_COMPILER_SEED = {
+_FAKE_COMPILER_SEED: dict[str, object] = {
     "block_sizes": [1, 128, 128],
     "cute_flash_topology": "fa4",
     "cute_flash_causal_lpt_swizzle": 4,
 }
+
+_FAKE_FLASH_DEFAULT: dict[str, object] = {
+    "block_sizes": [1, 128, 128],
+    "cute_flash_topology": "fa4",
+    "cute_flash_s_stage": 2,
+}
+
+
+@dataclass
+class _FakeConfig:
+    config: dict[str, object]
+
+
+class _FakeConfigSpec:
+    def __init__(
+        self,
+        *,
+        compiler_default_config: _FakeConfig | None = None,
+        compiler_seed_configs: list[_FakeConfig] | None = None,
+        cute_flash_search_enabled: bool = False,
+        default_config: dict[str, object] | None = None,
+    ) -> None:
+        self.compiler_default_config = compiler_default_config
+        self.compiler_seed_configs = compiler_seed_configs or []
+        self.cute_flash_search_enabled = cute_flash_search_enabled
+        self._default_config: dict[str, object] = default_config or {
+            "block_sizes": [1, 1, 1]
+        }
+
+    def default_config(self) -> _FakeConfig:
+        return _FakeConfig(self._default_config)
+
+
+@dataclass
+class _FakeBound:
+    config_spec: _FakeConfigSpec
 
 
 def _attention_subprocess_args(**overrides):
@@ -178,6 +215,66 @@ def test_attention_force_flash_config_uses_compiler_default_seed():
         "cute_flash_topology": "fa4",
         "cute_flash_causal_lpt_swizzle": 4,
     }
+
+
+def test_attention_force_flash_config_uses_compiler_flash_seed_without_default():
+    args = SimpleNamespace(
+        helion_config=[],
+        helion_force_flash_config=1,
+        helion_backend="cute",
+    )
+    bound = _FakeBound(
+        _FakeConfigSpec(
+            compiler_seed_configs=[_FakeConfig(_FAKE_COMPILER_SEED)],
+            cute_flash_search_enabled=True,
+            default_config=_FAKE_FLASH_DEFAULT,
+        )
+    )
+
+    compiler_config = compare_attention_backends._helion_cute_flash_compiler_config(
+        bound,
+        "cute",
+    )
+    config, overrides = compare_attention_backends._make_helion_config(
+        args,
+        compiler_config,
+    )
+
+    assert overrides == {}
+    assert compiler_config == _FAKE_COMPILER_SEED
+    assert config == _FAKE_COMPILER_SEED
+
+
+def test_attention_force_flash_config_ignores_non_flash_compiler_seed():
+    bound = _FakeBound(
+        _FakeConfigSpec(
+            compiler_seed_configs=[_FakeConfig({"block_sizes": [16, 16]})],
+            cute_flash_search_enabled=False,
+        )
+    )
+
+    compiler_config = compare_attention_backends._helion_cute_flash_compiler_config(
+        bound,
+        "cute",
+    )
+
+    assert compiler_config is None
+
+
+def test_attention_force_flash_config_uses_flash_default_without_seed():
+    bound = _FakeBound(
+        _FakeConfigSpec(
+            cute_flash_search_enabled=True,
+            default_config=_FAKE_FLASH_DEFAULT,
+        )
+    )
+
+    compiler_config = compare_attention_backends._helion_cute_flash_compiler_config(
+        bound,
+        "cute",
+    )
+
+    assert compiler_config == _FAKE_FLASH_DEFAULT
 
 
 def test_attention_force_flash_config_applies_manual_overrides_to_seed():
