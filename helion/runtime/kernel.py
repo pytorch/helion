@@ -23,6 +23,7 @@ from typing import TypeVar
 from typing import cast
 from typing import overload
 from typing_extensions import Protocol
+import weakref
 
 import torch
 from torch._dynamo.source import GetItemSource
@@ -199,6 +200,9 @@ class Kernel(Generic[_R]):
         self._specialize_extra: dict[
             Hashable, list[Callable[[Sequence[object]], Hashable]]
         ] = {}
+        self._cute_grouped_static_tail_extra_descriptors: dict[
+            Hashable, set[Hashable]
+        ] = {}
         if any(
             param.kind
             in (
@@ -288,6 +292,10 @@ class Kernel(Generic[_R]):
         safe to map a fast key directly to the BoundKernel that a full
         ``bind()`` resolved for the same arguments.
 
+        If a base signature has extra specialization extractors, their results
+        are appended to preserve the same no-collision invariant for
+        value-based specializations.
+
         Returns None when an argument type is not handled (tensor subclasses,
         containers, ...), or when there is no tensor argument to pin down the
         device; callers must then take the regular ``bind()`` path.
@@ -321,6 +329,11 @@ class Kernel(Generic[_R]):
             return None
         if self._key_fn is not None:
             key.append(self._key_fn(*args))
+        if self._specialize_extra:
+            signature = self._base_specialization_key(args)
+            extra_fns = self._specialize_extra.get(signature)
+            if extra_fns is not None:
+                key.append(tuple(s(args) for s in extra_fns))
         return tuple(key)
 
     def bind(self, args: tuple[object, ...]) -> BoundKernel[_R]:
@@ -353,11 +366,14 @@ class Kernel(Generic[_R]):
                     bound_kernel = self.bind(normalized_args)
                 else:
                     bound_kernel = BoundKernel(self, args)
+                    bound_kernel._base_specialization_signature = signature
                 if cache_key is None:
                     cache_key = self._create_bound_kernel_cache_key(
                         bound_kernel, args, signature
                     )
                 self._bound_kernels[cache_key] = bound_kernel
+            if len(args) == len(self.signature.parameters):
+                bound_kernel._set_runtime_arg_values_by_name(args)
             return bound_kernel
 
     def _base_specialization_key(self, args: Sequence[object]) -> tuple[Hashable, ...]:
@@ -572,6 +588,9 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
         self._config: Config | None = None
         self._compile_cache: dict[Config, CompiledConfig] = {}
         self._cache_path_map: dict[Config, str | None] = {}
+        self._base_specialization_signature: tuple[Hashable, ...] | None = None
+        self._runtime_arg_value_snapshots_by_name: dict[str, object] = {}
+        self._runtime_arg_keep_names_by_config: dict[Config, set[str]] = {}
         self._backward_compiled: (
             tuple[Kernel[object], str, BoundKernel[object]] | None
         ) = None
@@ -588,6 +607,7 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
 
         with self.env:
             self._env.process_group_name = _find_process_group_name(kernel.fn, args)
+            self._set_runtime_arg_values_by_name(args)
 
             assert len(args) == len(self.kernel.signature.parameters)
             self.fake_args: list[object] = []
@@ -775,9 +795,12 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
             # constexpr values carries stale entries from an earlier call.
             config = Config(**config.config)  # pyrefly: ignore [bad-argument-type]
             self.env.config_spec.normalize(config)
+            self._restore_runtime_arg_values_by_name()
             with measure("BoundKernel.generate_ast"):
                 # pyrefly: ignore [bad-argument-type]
                 root = generate_ast(self.host_function, config, emit_repro_caller)
+            self._register_cute_grouped_static_tail_specializations()
+            self._prune_runtime_arg_values_by_name()
             if output_origin_lines is None:
                 output_origin_lines = self.settings.output_origin_lines
             with measure("BoundKernel.unparse"):
@@ -837,6 +860,7 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
             config, process_group_name=self._env.process_group_name
         )
         if (rv := self._compile_cache.get(config)) is not None:
+            self._prune_cached_runtime_arg_values_by_name(config)
             return rv
         device_index = (
             self._env.device.index if self._env.device.index is not None else 0
@@ -874,6 +898,7 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
         rv = getattr(module, self.kernel.name)
         self._compile_cache[config] = rv
         self._cache_path_map[config] = module.__file__
+        self._record_runtime_arg_keep_names(config)
         return rv
 
     def bench_compile_config(
@@ -1079,6 +1104,82 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
 
             extractors.append(td_layout_extractor)
         return extractors
+
+    def _signature_arg_names(self) -> tuple[str, ...]:
+        return tuple(self.kernel.signature.parameters.keys())
+
+    def _set_runtime_arg_values_by_name(self, args: tuple[object, ...]) -> None:
+        self._runtime_arg_value_snapshots_by_name = {
+            name: _snapshot_runtime_arg_value(value)
+            for name, value in zip(self._signature_arg_names(), args, strict=False)
+        }
+        self._restore_runtime_arg_values_by_name()
+
+    def _runtime_arg_values_by_name_from_snapshots(self) -> dict[str, object]:
+        values: dict[str, object] = {}
+        for name, snapshot in self._runtime_arg_value_snapshots_by_name.items():
+            value = _restore_runtime_arg_snapshot(snapshot)
+            if value is not _RUNTIME_ARG_MISSING:
+                values[name] = value
+        return values
+
+    def _restore_runtime_arg_values_by_name(self) -> None:
+        self.env.runtime_arg_values_by_name = (
+            self._runtime_arg_values_by_name_from_snapshots()
+        )
+
+    def _retain_runtime_arg_names(self, keep_names: set[str]) -> None:
+        self.env.runtime_arg_values_by_name = {
+            name: value
+            for name, value in self._runtime_arg_values_by_name_from_snapshots().items()
+            if name in keep_names
+        }
+
+    def _runtime_arg_keep_names_for_current_plans(self) -> set[str]:
+        return _cute_runtime_metadata_arg_names(
+            self.env.cute_resolved_wrapper_plans,
+            self._signature_arg_names(),
+        )
+
+    def _prune_runtime_arg_values_by_name(self) -> None:
+        self._retain_runtime_arg_names(self._runtime_arg_keep_names_for_current_plans())
+
+    def _record_runtime_arg_keep_names(self, config: Config) -> None:
+        keep_names = self._runtime_arg_keep_names_for_current_plans()
+        self._runtime_arg_keep_names_by_config[config] = keep_names
+        self._retain_runtime_arg_names(keep_names)
+
+    def _prune_cached_runtime_arg_values_by_name(self, config: Config) -> None:
+        keep_names = self._runtime_arg_keep_names_by_config.get(config)
+        if keep_names is None:
+            self._restore_runtime_arg_values_by_name()
+        else:
+            self._retain_runtime_arg_names(keep_names)
+
+    def _register_cute_grouped_static_tail_specializations(self) -> None:
+        if self.kernel.settings.backend != "cute":
+            return
+        signature = self._base_specialization_signature
+        if signature is None:
+            return
+        descriptors = _cute_grouped_static_tail_extra_descriptors(
+            self.env.cute_resolved_wrapper_plans
+        )
+        if not descriptors:
+            return
+        extractors = self.kernel._specialize_extra.get(signature)
+        if extractors is None:
+            extractors = self._specialize_extra()
+            self.kernel._specialize_extra[signature] = extractors
+        seen = self.kernel._cute_grouped_static_tail_extra_descriptors.setdefault(
+            signature,
+            set(),
+        )
+        for descriptor in descriptors:
+            if descriptor in seen:
+                continue
+            extractors.append(_make_cute_grouped_static_tail_extractor(descriptor))
+            seen.add(descriptor)
 
     def _fixed_config_for_td_layout_guards(self) -> Config | None:
         """Return the fixed config if TD layout guards can be filtered safely."""
@@ -1511,6 +1612,222 @@ def _function_key(fn: Kernel, obj: types.FunctionType) -> object:
         ]
         return (obj.__code__, *closures)
     return obj.__code__
+
+
+def _cute_grouped_layout_has_m_tail(
+    layout_values: tuple[int, ...],
+    *,
+    bm: int,
+    group_count: int,
+) -> bool | None:
+    cursor = 0
+    has_m_tail = False
+    for expected_group in range(group_count):
+        if expected_group > 0:
+            next_m_boundary = ((cursor + bm - 1) // bm) * bm
+            while (
+                cursor < len(layout_values)
+                and cursor < next_m_boundary
+                and layout_values[cursor] < 0
+            ):
+                cursor += 1
+            if cursor != next_m_boundary or (
+                cursor < len(layout_values) and layout_values[cursor] < 0
+            ):
+                return None
+        if cursor >= len(layout_values) or layout_values[cursor] != expected_group:
+            return None
+        start = cursor
+        while cursor < len(layout_values) and layout_values[cursor] == expected_group:
+            cursor += 1
+        actual_m = cursor - start
+        if start % bm != 0:
+            return None
+        has_m_tail = has_m_tail or actual_m % bm != 0
+    if cursor != len(layout_values):
+        if all(value < 0 for value in layout_values[cursor:]):
+            cursor = len(layout_values)
+    if cursor != len(layout_values):
+        return None
+    return has_m_tail
+
+
+def _cute_grouped_static_tail_extra_descriptors(
+    plans: Sequence[dict[str, object]],
+) -> tuple[Hashable, ...]:
+    descriptors: list[Hashable] = []
+    for plan in plans:
+        if plan.get("kind") != "tcgen05_grouped_static_persistent" or bool(
+            plan.get("worklist_metadata")
+        ):
+            continue
+        layout_idx = plan.get("layout_bind_idx")
+        group_count = plan.get("group_count")
+        bm = plan.get("bm")
+        if not (
+            isinstance(layout_idx, int)
+            and isinstance(group_count, int)
+            and isinstance(bm, int)
+        ):
+            continue
+        n_sizes_idx = plan.get("n_sizes_bind_idx")
+        bn = plan.get("bn")
+        descriptors.append(
+            (
+                "cute_grouped_static_tail",
+                layout_idx,
+                group_count,
+                bm,
+                n_sizes_idx if isinstance(n_sizes_idx, int) else None,
+                bn if isinstance(bn, int) else None,
+            )
+        )
+    return tuple(sorted(descriptors, key=repr))
+
+
+def _cute_runtime_metadata_arg_names(
+    plans: Sequence[dict[str, object]],
+    arg_names: Sequence[str] = (),
+) -> set[str]:
+    keep_names: set[str] = set()
+    for plan in plans:
+        for name_key, bind_idx_key in (
+            ("layout_name", "layout_bind_idx"),
+            ("n_sizes_name", "n_sizes_bind_idx"),
+            ("k_sizes_name", "k_sizes_bind_idx"),
+            ("direct_pointers_name", "direct_pointers_bind_idx"),
+            ("direct_strides_name", "direct_strides_bind_idx"),
+        ):
+            value = plan.get(name_key)
+            if isinstance(value, str):
+                keep_names.add(value)
+            bind_idx = plan.get(bind_idx_key)
+            if isinstance(bind_idx, int) and 0 <= bind_idx < len(arg_names):
+                keep_names.add(arg_names[bind_idx])
+    return keep_names
+
+
+_RUNTIME_ARG_MISSING = object()
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class _RuntimeArgWeakRef:
+    ref: weakref.ReferenceType[torch.Tensor]
+
+
+def _snapshot_runtime_arg_value(value: object) -> object:
+    if isinstance(value, torch.Tensor):
+        return _RuntimeArgWeakRef(weakref.ref(value))
+    if isinstance(value, tuple):
+        return tuple(_snapshot_runtime_arg_value(item) for item in value)
+    if isinstance(value, list):
+        return [_snapshot_runtime_arg_value(item) for item in value]
+    if isinstance(value, dict):
+        return {key: _snapshot_runtime_arg_value(item) for key, item in value.items()}
+    return value
+
+
+def _restore_runtime_arg_snapshot(snapshot: object) -> object:
+    if isinstance(snapshot, _RuntimeArgWeakRef):
+        value = snapshot.ref()
+        return _RUNTIME_ARG_MISSING if value is None else value
+    if isinstance(snapshot, tuple):
+        values = tuple(_restore_runtime_arg_snapshot(item) for item in snapshot)
+        if any(value is _RUNTIME_ARG_MISSING for value in values):
+            return _RUNTIME_ARG_MISSING
+        return values
+    if isinstance(snapshot, list):
+        values = [_restore_runtime_arg_snapshot(item) for item in snapshot]
+        if any(value is _RUNTIME_ARG_MISSING for value in values):
+            return _RUNTIME_ARG_MISSING
+        return values
+    if isinstance(snapshot, dict):
+        values = {
+            key: _restore_runtime_arg_snapshot(item) for key, item in snapshot.items()
+        }
+        if any(value is _RUNTIME_ARG_MISSING for value in values.values()):
+            return _RUNTIME_ARG_MISSING
+        return values
+    return snapshot
+
+
+def _cute_int_1d_tensor_values(
+    value: object,
+    cache: WeakIdKeyDictionary,
+) -> tuple[int, ...] | None:
+    if not (
+        isinstance(value, torch.Tensor)
+        and value.ndim == 1
+        and value.dtype in (torch.int32, torch.int64)
+    ):
+        return None
+    signature = (
+        int(getattr(value, "_version", 0)),
+        int(value.data_ptr()),
+        tuple(value.shape),
+        tuple(value.stride()),
+        value.dtype,
+    )
+    try:
+        cached_signature, cached_values = cache[value]
+    except KeyError:
+        pass
+    else:
+        if cached_signature == signature:
+            return cached_values
+    values = tuple(int(v) for v in value.detach().cpu().tolist())
+    cache[value] = (signature, values)
+    return values
+
+
+def _make_cute_grouped_static_tail_extractor(
+    descriptor: Hashable,
+) -> Callable[[Sequence[object]], Hashable]:
+    (
+        _label,
+        layout_idx,
+        group_count,
+        bm,
+        n_sizes_idx,
+        bn,
+    ) = cast("tuple[object, int, int, int, int | None, int | None]", descriptor)
+    tensor_values_cache: WeakIdKeyDictionary = WeakIdKeyDictionary()
+
+    def cute_grouped_static_tail_extractor(
+        args: Sequence[object],
+        *,
+        _descriptor: Hashable = descriptor,
+        _layout_idx: int = layout_idx,
+        _group_count: int = group_count,
+        _bm: int = bm,
+        _n_sizes_idx: int | None = n_sizes_idx,
+        _bn: int | None = bn,
+    ) -> Hashable:
+        layout_has_m_tail: bool | None = None
+        if _layout_idx < len(args):
+            layout_values = _cute_int_1d_tensor_values(
+                args[_layout_idx],
+                tensor_values_cache,
+            )
+            if layout_values is not None:
+                layout_has_m_tail = _cute_grouped_layout_has_m_tail(
+                    layout_values,
+                    bm=_bm,
+                    group_count=_group_count,
+                )
+        n_sizes_has_n_tail: bool | None = None
+        if _n_sizes_idx is not None and _bn is not None and _n_sizes_idx < len(args):
+            n_sizes_values = _cute_int_1d_tensor_values(
+                args[_n_sizes_idx],
+                tensor_values_cache,
+            )
+            if n_sizes_values is not None and len(n_sizes_values) == _group_count:
+                n_sizes_has_n_tail = any(
+                    group_n % _bn != 0 for group_n in n_sizes_values
+                )
+        return (_descriptor, layout_has_m_tail, n_sizes_has_n_tail)
+
+    return cute_grouped_static_tail_extractor
 
 
 def _graph_module_key(fn: Kernel, obj: torch.fx.GraphModule) -> Hashable:

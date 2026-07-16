@@ -129,6 +129,9 @@ class GenerateAST(NodeVisitor, CodegenInterface):
         self.store_transform = store_transform
         self.load_transform = load_transform
         self._statement_owner_fx_node: Node | None = None
+        self._statements_by_owner_node_id: dict[
+            int, list[tuple[list[ast.AST], ast.AST]]
+        ] = {}
 
         # Now create device function and initialize CodegenInterface
         self.device_function = DeviceFunction(
@@ -253,8 +256,21 @@ class GenerateAST(NodeVisitor, CodegenInterface):
         if isinstance(stmt, str):
             stmt = statement_from_string(stmt)
         self.statements_stack[-1].append(stmt)
+        owner_node = self._statement_owner_fx_node
+        if owner_node is not None:
+            self._statements_by_owner_node_id.setdefault(id(owner_node), []).append(
+                (self.statements_stack[-1], stmt)
+            )
         self._record_statement_thread_references([stmt])
         self._record_tcgen05_owned_statement(stmt)
+
+    def remove_statements_owned_by_nodes(self, nodes: tuple[Node, ...]) -> None:
+        """Remove statements emitted earlier for exactly these FX nodes."""
+        for node in nodes:
+            entries = self._statements_by_owner_node_id.pop(id(node), ())
+            for body, stmt in entries:
+                with contextlib.suppress(ValueError):
+                    body.remove(stmt)
 
     def _record_tcgen05_owned_statement(self, stmt: ast.AST) -> None:
         owner_node = self._statement_owner_fx_node
@@ -1162,11 +1178,15 @@ class GenerateAST(NodeVisitor, CodegenInterface):
         elif isinstance(type_info, SequenceType) and all(
             isinstance(x, TileIndexType) for x in type_info.unpack()
         ):
-            values = type_info.unpack()
+            values = [
+                value
+                for value in type_info.unpack()
+                if isinstance(value, TileIndexType)
+            ]
             return expr_from_string(
                 self.host_function.literal_expr(
                     [
-                        self.device_function.resolved_block_size(x.block_id)  # pyrefly: ignore[missing-attribute]
+                        self.device_function.resolved_block_size(x.block_id)
                         for x in values
                     ]
                 )
@@ -1299,6 +1319,8 @@ def generate_ast(
     extra_params: list[str] | None = None,
 ) -> ast.Module:
     with func:
+        env = CompileEnvironment.current()
+        env.cute_resolved_wrapper_plans = []
         if len(func.device_ir.phases) > 1:
             if not str(config.pid_type).startswith("persistent"):
                 raise exc.BarrierRequiresPersistent(config.pid_type)
@@ -1404,6 +1426,9 @@ def generate_ast(
                     *final_host_statements,
                 ]
             launcher_arg_positions: dict[str, int] | None = None
+            host_arg_positions = {
+                arg.arg: idx for idx, arg in enumerate(func.args.args)
+            }
 
             def resolve_cute_plan_arg_positions(
                 plans: list[dict[str, object]],
@@ -1442,32 +1467,42 @@ def generate_ast(
                         "bias_name",
                         "alibi_name",
                         "document_name",
+                        "layout_name",
+                        "n_sizes_name",
+                        "k_sizes_name",
+                        "direct_pointers_name",
+                        "direct_strides_name",
                     ):
                         if key in resolved:
+                            arg_name = str(resolved.pop(key))
                             resolved[key[:-5] + "_idx"] = launcher_arg_positions[
-                                str(resolved.pop(key))
+                                arg_name
                             ]
+                            if arg_name in host_arg_positions:
+                                resolved[key[:-5] + "_bind_idx"] = host_arg_positions[
+                                    arg_name
+                                ]
                     resolved_plans.append(resolved)
                 return resolved_plans
 
+            post_kernel_metadata_statements: list[ast.AST] = []
             resolved_wrapper_plans: list[dict[str, object]] = []
             if codegen.cute_wrapper_plans:
                 resolved_wrapper_plans = resolve_cute_plan_arg_positions(
                     codegen.cute_wrapper_plans
                 )
-                final_host_statements = [
+                env.cute_resolved_wrapper_plans = resolved_wrapper_plans
+                post_kernel_metadata_statements.append(
                     statement_from_string(
-                        f"{codegen.device_function.name}._helion_cute_wrapper_plans = {resolved_wrapper_plans!r}"
-                    ),
-                    *final_host_statements,
-                ]
+                        f"{codegen.device_function.name}._helion_cute_wrapper_plans = helion.runtime._freeze_cute_wrapper_plans({resolved_wrapper_plans!r})"
+                    )
+                )
             if codegen.device_function.cute_state.cluster_shape is not None:
-                final_host_statements = [
+                post_kernel_metadata_statements.append(
                     statement_from_string(
                         f"{codegen.device_function.name}._helion_cute_cluster_shape = {codegen.device_function.cute_state.cluster_shape!r}"
-                    ),
-                    *final_host_statements,
-                ]
+                    )
+                )
             # Assert sourceless prologue params were actually removed by DCE
             if codegen.device_function.sourceless_prologue_params:
                 remaining = codegen.device_function.sourceless_prologue_params & {
@@ -1489,15 +1524,19 @@ def generate_ast(
                 call_def = [func.codegen_call_function()]
                 main_def = [emit_main_def()]
 
-            module_body = [
+            module_body: list[ast.stmt] = []
+            for stmt in (
                 *func.codegen_imports(),
                 *codegen.module_statements,
                 *codegen.device_function.codegen_helper_functions(),
                 *kernel_def,
+                *post_kernel_metadata_statements,
                 host_def,
                 *call_def,
                 *main_def,
-            ]
+            ):
+                assert isinstance(stmt, ast.stmt)
+                module_body.append(stmt)
             result = ast.Module(module_body, [])
             existing_imports = {
                 ast.unparse(stmt)
