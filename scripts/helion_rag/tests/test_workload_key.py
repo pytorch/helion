@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import helion_rag.corpus as C
-import helion_rag.patch as P
 
 from ._fixtures import INGEST_DTYPES
 from ._fixtures import INGEST_SHAPES
@@ -14,13 +13,14 @@ from ._fixtures import SRC_EPILOGUE
 from ._fixtures import SRC_PLAIN
 
 
-def test_workload_key_ingest_runtime_parity() -> None:
-    """Ingest and runtime forms produce same key."""
-    ingest = C._workload_key(SRC_PLAIN, INGEST_SHAPES, INGEST_DTYPES, SETTINGS, "h100")
-    runtime = C._workload_key(
-        SRC_PLAIN, RUNTIME_SHAPES, RUNTIME_DTYPES, P._settings_dict(SETTINGS), "h100"
+def test_workload_key_canonicalizes_container_types() -> None:
+    list_forms = C._workload_key(
+        SRC_PLAIN, INGEST_SHAPES, INGEST_DTYPES, SETTINGS, "h100"
     )
-    assert ingest == runtime
+    tuple_forms = C._workload_key(
+        SRC_PLAIN, RUNTIME_SHAPES, RUNTIME_DTYPES, SETTINGS, "h100"
+    )
+    assert list_forms == tuple_forms
 
 
 def test_non_codegen_setting_does_not_change_key() -> None:

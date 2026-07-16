@@ -11,7 +11,6 @@ import sys
 
 from helion_rag.config import _config
 import helion_rag.lookup as lookup
-import helion_rag.patch as patch
 
 
 def _contributor() -> str:
@@ -102,15 +101,6 @@ def main(argv: list[str] | None = None) -> int:
     pu = sub.add_parser("upload", help="upload unuploaded runs to Manifold")
     pu.add_argument("--dry-run", action="store_true")
     pu.add_argument("--reupload", action="store_true")
-
-    pp = sub.add_parser(
-        "patch-helion", help="append RAG hook to Helion runtime kernel.py"
-    )
-    pp.add_argument(
-        "--target",
-        default="helion/runtime/kernel.py",
-        help="Path to kernel.py to patch",
-    )
 
     sh = sub.add_parser("setup-helper", help="helpers for setup script")
     sh_sub = sh.add_subparsers(dest="action", required=True)
@@ -219,14 +209,6 @@ def main(argv: list[str] | None = None) -> int:
             reupload=args.reupload,
         )
         print(json.dumps(summary, default=str))
-        return 0
-
-    if args.cmd == "patch-helion":
-        target = Path(args.target)
-        written = patch.write_hook(target)
-        print(
-            f"{'patched' if written else 'already present'} {target}", file=sys.stderr
-        )
         return 0
 
     if args.cmd == "setup-helper":

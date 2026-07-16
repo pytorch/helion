@@ -1,11 +1,9 @@
 #!/usr/bin/env bash
-# setup-helion-rag.sh — configure RAG around existing Helion checkout.
-# Writes env.sh disabled, enables only after deps corpus index patch pass.
+# setup-helion-rag.sh - configure standalone RAG tools for a Helion checkout.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PKG_ROOT="$SCRIPT_DIR"
-PATCH_TARGET_REL="helion/runtime/kernel.py"
 # Helper runner: use PYTHONPATH fallback before pip install, then bare command after
 helion_rag_py() {
   PYTHONPATH="$PKG_ROOT:${PYTHONPATH:-}" "$INTERP" -m helion_rag "$@"
@@ -19,7 +17,7 @@ helion_rag_cmd() {
 }
 
 HELION_REPO=""; PYTHON_BIN=""; MANIFOLD_BASE=""; HW_FAMILY=""
-INTERACTIVE=1; DRY_RUN=0; ALLOW_GLOBAL=0; FORCE_PATCH=0
+INTERACTIVE=1; DRY_RUN=0; ALLOW_GLOBAL=0
 EMBED_MODEL="${HELION_EMBED_MODEL:-Qwen/Qwen3-Embedding-8B}"
 HF_HOME_VALUE="${HF_HOME:-}"
 COLLECT_AUTOTUNE=0
@@ -40,7 +38,6 @@ Usage: setup-helion-rag.sh --helion-repo <path> [options]
   --non-interactive        take values from flags/env only
   --dry-run                validate and print plan no mutation
   --allow-global-python    permit install into non-venv
-  --force-patch            patch even if target dirty
 USAGE
 }
 
@@ -52,7 +49,6 @@ while [ $# -gt 0 ]; do case "$1" in
   --non-interactive) INTERACTIVE=0; shift;;
   --dry-run) DRY_RUN=1; shift;;
   --allow-global-python) ALLOW_GLOBAL=1; shift;;
-  --force-patch) FORCE_PATCH=1; shift;;
   -h|--help) usage; exit 0;;
   *) usage; die "unknown argument $1";;
 esac; done
@@ -149,9 +145,9 @@ if [ "$DRY_RUN" -eq 1 ]; then
   plan "would create $RAG_ROOT/{ci_artifacts,rag_index,rag_writeback,autotune_logs,uploads}"
   plan "would pip install -e $PKG_ROOT"
   if [ "$FAMILY_REPRESENTED" -eq 1 ]; then
-    plan "would install deps, write env.sh disabled, fetch corpus, patch Helion, enable"
+    plan "would install deps, write env.sh, fetch corpus, and build index"
   else
-    plan "would write env.sh disabled, skip fetch/index/patch/enable"
+    plan "would write env.sh and skip fetch/index"
   fi
   info "dry-run complete"; exit 0
 fi
@@ -162,16 +158,15 @@ if [ ! -f "$GITIGNORE" ] || ! grep -qxF ".helion-rag/" "$GITIGNORE"; then
   echo ".helion-rag/" >> "$GITIGNORE"; info "added .helion-rag/ ignore"
 else info ".helion-rag/ already ignored"; fi
 
-# Stage 7: layout, env disabled
+# Stage 7: layout and environment
 mkdir -p "$RAG_ROOT"/{ci_artifacts,rag_index,rag_writeback,autotune_logs,uploads}
 cp "$MANIFEST_TMP" "$RAG_ROOT/manifest.json"
 info "created $RAG_ROOT layout"
 
 write_env() {
-  local enabled="$1"; local collect="${2:-0}"
+  local collect="${1:-0}"
   {
     echo "# Managed by setup-helion-rag.sh"
-    printf 'export HELION_RAG_ENABLED=%s\n' "$(shq "$enabled")"
     printf 'export HELION_RAG_HARDWARE_FAMILY=%s\n' "$(shq "$HW_FAMILY")"
     printf 'export HELION_RAG_MANIFOLD_BASE=%s\n' "$(shq "$MANIFOLD_BASE")"
     printf 'export HELION_RAG_MANIFEST=%s\n' "$(shq "$RAG_ROOT/manifest.json")"
@@ -188,15 +183,15 @@ write_env() {
     printf 'export HELION_AUTOTUNE_LOG_DETAILS=1\n' >> "$RAG_ROOT/env.sh"
   fi
 }
-write_env 0 0
-info "wrote env.sh disabled to $RAG_ROOT/env.sh"
+write_env 0
+info "wrote RAG environment to $RAG_ROOT/env.sh"
 
 if [ "$FAMILY_REPRESENTED" -eq 0 ]; then
   if [ "$INTERACTIVE" -eq 1 ]; then
     read -r -p "[setup-helion-rag] hardware not covered; enable local autotune collection? [y/N] " answer
-    if [ "$answer" = "y" ] || [ "$answer" = "Y" ]; then write_env 0 1; info "enabled local autotune collection"; fi
+    if [ "$answer" = "y" ] || [ "$answer" = "Y" ]; then write_env 1; info "enabled local autotune collection"; fi
   fi
-  info "uncovered hardware: skipping fetch index patch enable"; exit 0
+  info "uncovered hardware: skipping corpus fetch and index build"; exit 0
 fi
 
 # pip install package editable early for helpers and CLI availability.
@@ -226,27 +221,7 @@ case "$stage_rc" in
   *) die "fetch/extract/index failed exit $stage_rc";;
 esac
 
-# Stage 9: patch Helion
-PATCH_TARGET="$HELION_REPO/$PATCH_TARGET_REL"
-if [ -f "$PATCH_TARGET" ]; then
-  if git -C "$HELION_REPO" rev-parse >/dev/null 2>&1; then
-    if ! git -C "$HELION_REPO" diff --quiet -- "$PATCH_TARGET_REL" 2>/dev/null; then
-      if [ "$FORCE_PATCH" -eq 0 ]; then
-        if [ "$INTERACTIVE" -eq 0 ]; then die "$PATCH_TARGET_REL has uncommitted changes; use --force-patch"; fi
-        read -r -p "[setup-helion-rag] $PATCH_TARGET_REL dirty patch anyway? [y/N] " answer
-        [ "$answer" = "y" ] || die "aborted dirty patch target"
-      fi
-    fi
-  fi
-  helion_rag_cmd patch-helion --target "$PATCH_TARGET" || die "Helion patch failed"
-  info "patched $PATCH_TARGET_REL"
-else
-  info "patch target not found skipping"
-fi
-
-# Stage 10: enable + shell rc
-write_env 1
-info "enabled RAG HELION_RAG_ENABLED=1"
+# Stage 9: shell rc
 RC_FILE="${HELION_RAG_RC_FILE:-$HOME/.bashrc}"
 BEGIN="# >>> helion-rag >>>"; END="# <<< helion-rag <<<"
 if [ -f "$RC_FILE" ] && grep -qF "$BEGIN" "$RC_FILE"; then

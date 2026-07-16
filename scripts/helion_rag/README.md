@@ -1,10 +1,10 @@
 # Helion RAG
 
-Helion RAG adds retrieval-augmented autotuning to Helion.
+Helion RAG builds a searchable corpus of Helion CI autotuning artifacts.
 
-You can use the `setup-helion-rag.sh` script to configure everything in your existing Helion checkout. It handles the heavy lifting: validating your Python interpreter, checking Manifold access, installing the package in editable mode, and fetching the right corpus for your hardware. It also builds a local FAISS index and patches `BoundKernel.ensure_config_exists` behind a feature flag. The setup flips `HELION_RAG_ENABLED=1` if every single step succeeds and doesn't let you stranded in a broken state.
+You can use the `setup-helion-rag.sh` script to configure the tools in an existing Helion checkout. It validates the Python interpreter and Manifold access, installs the package in editable mode, fetches the corpus for the selected hardware, and builds a local FAISS index.
 
-You don't need any LLM API keys for this. We use local models for building the RAG. The "RAG" here is purely retrieval-based and searches over CI benchmark artifacts.
+You don't need any LLM API keys for this. The "RAG" here is purely retrieval-based and searches over CI benchmark artifacts. Lookup results are standalone output: this package does not modify Helion or automatically apply retrieved configurations during execution.
 
 ## Package layout
 
@@ -24,7 +24,6 @@ helion_rag/
   manifest.py       # Validates and loads manifest.json
   hardware.py       # Figures out the hardware family based on the device string
   models.py         # Dataclasses for PerfStats, Ref, and ExactEntry
-  patch.py          # Installs the BoundKernel runtime hook
   setup_helpers.py  # CLI helpers for the bash setup script (validating, resolving families, checking artifacts, etc.)
   _util.py          # Shared constants and logging helpers
 ```
@@ -43,9 +42,9 @@ To get started, run the setup script from the repository root or the `scripts/he
 
 You can pass `--dry-run` to see what the script plans to do without actually mutating anything, or `--non-interactive` to skip prompts. Run `./setup-helion-rag.sh --help` for the full list of options.
 
-If any prerequisites are missing, the script will safely fail without making any changes.
+If a prerequisite check fails, the script exits before fetching or indexing the corpus.
 
-## Enabling
+## Environment
 
 When the setup finishes successfully, it creates a `<helion_repo>/.helion-rag/` directory and adds a source block to your shell's rc file.
 
@@ -59,7 +58,6 @@ The `env.sh` script exports several configuration variables:
 
 | Variable | What it does |
 |---|---|
-| `HELION_RAG_ENABLED` | Set to `1` if setup succeeded, otherwise `0`. |
 | `HELION_RAG_HARDWARE_FAMILY` | The hardware family we resolved (e.g., `h100`). |
 | `HELION_RAG_MANIFOLD_BASE` | The base Manifold URI where we push manifest artifacts. |
 | `HELION_RAG_MANIFEST` | Path to your local `manifest.json`. |
@@ -83,7 +81,6 @@ helion-rag index [--force]  # Builds the FAISS generation index for your hardwar
 helion-rag lookup --kernel-source-file f.py --shapes '...' --dtypes '...' --hardware h100 [--settings-json '{}']
 helion-rag ingest           # Idempotently merges meta.jsonl and csv logs, updates the ledger, and rebuilds the index
 helion-rag upload [--dry-run] [--reupload]   # Zips unuploaded runs to Manifold, marking them only if the upload succeeds
-helion-rag patch-helion --target helion/runtime/kernel.py [--force]
 helion-rag setup-helper --help
 helion-rag setup-helper publish-manifest --manifold-base <uri> --family <fam> [--artifact-path p] [--alias a...]
 python -m helion_rag <cmd>  # Alternative module entry point (does the same thing as the console script)
@@ -92,21 +89,15 @@ python -m helion_rag <cmd>  # Alternative module entry point (does the same thin
 
 ## Lookup tiers
 
-When Helion needs an autotune config, it tries to find it in three stages:
+The standalone `lookup` command searches in three stages:
 
-- **Tier 0 (Exact Match):** We calculate a workload key by hashing the normalized AST source, codegen settings, canonical shapes, dtypes, and the hardware family. If this matches an entry in `exact.json`, we immediately return the best config without running the autotuner.
-- **Tier 1 (Similar Match):** If we don't find an exact match, we do a FAISS similarity search over the corpus text embeddings. (You can tune the similarity threshold using `HELION_RAG_SIM_THRESHOLD`). We take the top `n` neighbor configs and temporarily merge them into the user's seed configs for the autotuner to try.
-- **Tier 2 (Miss):** If no similar configs meet the threshold, we just fall back to standard autotuning.
+- **Tier 0 (Exact Match):** Calculates a workload key by hashing the normalized AST source, codegen settings, canonical shapes, dtypes, and hardware family. A matching `exact.json` entry returns the measured-best config.
+- **Tier 1 (Similar Match):** Runs FAISS similarity search over corpus source embeddings and returns the top neighbors with their measured configurations. `HELION_RAG_SIM_THRESHOLD` controls the minimum score.
+- **Tier 2 (Miss):** Reports that no exact or sufficiently similar result was found.
+
+The command prints these results as JSON for inspection or use by external tooling. Helion does not consume them automatically.
 
 To keep workload keys in sync with upstream Helion, `_CODEGEN_SETTINGS` and `_codegen_signature` are imported directly from `helion.autotuner.metrics` — a single source of truth, so there is nothing to keep in sync.
-
-## Patching the runtime hook
-
-To intercept config lookups, we install a wrapper on `BoundKernel.ensure_config_exists`. The patching logic lives in `helion_rag.patch.apply(bound_kernel, original, args, rest, kwargs)`.
-
-When this runs, `_extract` pulls the kernel source, shapes, dtypes, hardware string, and settings from the `BoundKernel` call. If it can't, it returns `None` and we fall back to standard behavior. The lookup itself runs behind a single failure boundary: a corrupt index or FAISS error is logged and falls back to normal autotune, so RAG can never break a run. Also, if your kernel uses Epilogue or Callable arguments, the AST check will flag it as ineligible for Tier-0 exact matches.
-
-The `patch-helion` CLI command uses `write_hook(target)` to append an idempotent marker block to the Python file, which imports `helion_rag.patch.install()`. We intentionally kept this simple (just appending if missing).
 
 ## How we resolve hardware
 
@@ -133,15 +124,15 @@ If you need to add a new family, `setup_helpers.publish_manifest()` will safely 
 
 ## Tests
 
-We have 25 tests that run fully deterministically:
+The test suite covers the standalone corpus, index, lookup, ingest, upload, manifest, and hardware-resolution paths:
 
 ```text
 scripts/helion_rag/tests/
   __init__.py                 # Package marker for relative imports
   _fixtures.py                # Shared setup imported via inspect to avoid duplication
   test_corpus_ingest_upload.py   # Covers extraction (incl. the CLI path), idempotent ingest, atomic uploads
-  test_lookup_patch.py           # Tier-0 exact, Tier-2 miss, seed merge (real on-disk data, no mocks)
-  test_integration.py            # Real BoundKernel + FAISS: apply hook, Tier-1, corrupt-index fallback
+  test_lookup.py                 # Tier-0 exact and Tier-2 miss over an on-disk bundle
+  test_integration.py            # Tier-1 lookup over a real FAISS index
   test_manifest_hardware.py      # Manifest validation and hardware family resolution (pure helpers)
   test_workload_key.py           # Workload key parity, deduplication, and AST checks
 ```
@@ -150,14 +141,6 @@ You can run the suite like this:
 ```bash
 cd scripts/helion_rag
 ../../.rag-venv/bin/pytest tests -q
-# 25 passed
-```
-
-Or run the manual E2E test after setup:
-```bash
-source /path/to/.helion-rag/env.sh
-.rag-venv/bin/python scripts/helion_rag/tests/manual/validate_tier0_e2e.py --family h100
-# Expects ALL PASS
 ```
 
 ## Prerequisites
@@ -172,7 +155,6 @@ There are a few things you need to have in place before setting this up. If any 
 | `HF_TOKEN` (optional) | To download the embedding model for the first time. | Run `huggingface-cli login` or export `HF_TOKEN`. |
 | Sourced `env.sh` | So lookup/ingest commands can read `HELION_RAG_*` paths. | Source `<helion_repo>/.helion-rag/env.sh` or pass `--env-file`. |
 | A `~/.bashrc` block | To auto-load the environment in new shell sessions. | It appends safely; you can remove the block manually to opt out. |
-| A clean `helion/runtime/kernel.py` | To install the runtime hook. | Run `git checkout -- helion/runtime/kernel.py` to revert, or pass `--force-patch` if you have intentional local edits. |
 | Embedding model / device | The default 8B model is quite heavy. | Override with `HELION_EMBED_MODEL` and set `HELION_RAG_EMBED_DEVICE=cpu` if needed. |
 | Rebuild index | The indexer skips rebuilding if the index already exists. | Run `helion-rag index --force` or delete the index directory to rebuild. |
 
@@ -180,7 +162,7 @@ There are a few things you need to have in place before setting this up. If any 
 
 If you're running on a new hardware family that isn't in the manifest yet, you won't have a corpus to fetch. Here's how to onboard it:
 
-1. The setup script will write a disabled `env.sh` file, but you can optionally enable local autotune collection.
+1. The setup script writes `env.sh` and can optionally configure local autotune collection.
 2. Run your autotuning jobs normally. Then, run `helion-rag ingest` to build your local index, and `helion-rag upload` to contribute your runs back to Manifold (`.../contrib/<family>/`).
 3. Finally, register the new family:
    ```bash

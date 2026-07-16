@@ -2,8 +2,8 @@
 
 The workload key must match Helion's own run_id logic, so the codegen-setting
 list and signature are imported straight from `helion.autotuner.metrics` rather
-than vendored here — single source of truth. (This makes corpus/index depend on
-`helion` being importable, which the lookup/patch runtime already requires.)"""
+than vendored here - single source of truth. Corpus and index generation
+therefore require `helion` to be importable."""
 
 from __future__ import annotations
 
@@ -23,7 +23,7 @@ from helion_rag._util import _log
 from helion_rag.models import ExactEntry
 from helion_rag.models import Ref
 
-__all__ = ["_CODEGEN_SETTINGS"]  # re-exported for patch._settings_dict
+__all__ = ["_CODEGEN_SETTINGS"]
 
 
 def _to_canonical_nested(v):

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
 import sys
 import types
@@ -19,20 +18,6 @@ from helion_rag.manifest import load_manifest
 def _load_manifest_opt(cfg) -> dict | None:
     """Load manifest if configured, else None."""
     return load_manifest(cfg.manifest_path) if cfg.manifest_path else None
-
-
-def _normalize_config(c: dict) -> str:
-    return json.dumps(c, sort_keys=True, default=str)
-
-
-def merge_seed_configs(user_seeds: list[dict], rag_seeds: list[dict]) -> list[dict]:
-    """Combine user and RAG seed configs, user first, deduped."""
-    seen: dict[str, dict] = {}
-    for c in (*(user_seeds or []), *(rag_seeds or [])):
-        k = _normalize_config(c)
-        if k not in seen:
-            seen[k] = c
-    return list(seen.values())
 
 
 def _resolve_family(hardware_str: str, cfg) -> str | None:

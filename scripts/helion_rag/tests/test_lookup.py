@@ -1,8 +1,4 @@
-"""Tier-0 exact lookup, Tier-2 miss, and seed-config merge — real data, no mocks.
-
-Tier-1 (FAISS) and the ``apply`` runtime hook need a real vector store / BoundKernel,
-so they live in ``test_integration.py`` behind ``importorskip``/``requires_cuda``.
-"""
+"""Standalone Tier-0 exact lookup and Tier-2 miss tests."""
 
 from __future__ import annotations
 
@@ -63,14 +59,3 @@ def test_lookup_tier2_when_no_index_for_family(tmp_path: Path) -> None:
         "tier": 2,
         "family": "h100",
     }
-
-
-def test_merge_seed_configs_keeps_user_first_and_dedups() -> None:
-    user = [{"block_size": 16}, {"block_size": 32}]
-    rag = [{"block_size": 16}, {"block_size": 64}]
-
-    assert lookup_mod.merge_seed_configs(user, rag) == [
-        {"block_size": 16},
-        {"block_size": 32},
-        {"block_size": 64},
-    ]
