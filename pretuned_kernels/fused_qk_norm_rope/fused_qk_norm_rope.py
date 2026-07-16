@@ -30,6 +30,17 @@ try:
     _HAS_VLLM = hasattr(_vllm_ir.ops, "rms_norm") and hasattr(
         _VllmRotaryEmbedding, "forward_static"
     )
+    if _HAS_VLLM:
+        # Match vLLM's CUDA eager default (see cuda.py get_default_ir_op_priority)
+        # so the baseline dispatches rms_norm to the compiled vllm_c kernel
+        # instead of the pure-PyTorch "native" fallback -- otherwise the vLLM
+        # baseline is artificially slow (and logs a "Priority not set" warning).
+        # import_ir_kernels() registers the platform's impls (e.g. vllm_c) that
+        # set_default requires; it's lazily imported, like vLLM's own KernelConfig.
+        from vllm.platforms import current_platform
+
+        current_platform.import_ir_kernels()
+        _vllm_ir.ops.rms_norm.set_default(["vllm_c", "native"])
 except ImportError:
     _HAS_VLLM = False
 
