@@ -24,9 +24,27 @@ import traceback
 
 import torch
 
-import vllm  # noqa: F401  registers torch.ops._C.*
+import vllm  # noqa: F401  registers torch.ops._C.* (+ Helion kernels, in current vLLM)
 from vllm.kernels.helion import get_registered_kernels
-from vllm.kernels.helion.ops import import_all_kernels
+
+
+def _force_register() -> None:
+    """Best-effort trigger of Helion op registration.
+
+    Current vLLM registers every Helion kernel as a side effect of ``import
+    vllm``; some builds instead expose an explicit importer whose name has
+    drifted (``import_all_kernels`` / ``import_all_ops``). Call whichever
+    exists; if none does, registration already happened on import.
+    """
+    try:
+        import vllm.kernels.helion.ops as ops
+    except ImportError:
+        return
+    for fn_name in ("import_all_kernels", "import_all_ops"):
+        fn = getattr(ops, fn_name, None)
+        if callable(fn):
+            fn()
+            return
 
 
 def _assert_close(a: object, b: object, tag: str) -> None:
@@ -49,8 +67,11 @@ def main() -> int:
     cc = torch.cuda.get_device_capability(0)
     print(f"Device: {dev} (sm{cc[0]}{cc[1]})\n")
 
-    import_all_kernels()
+    _force_register()
     kernels = get_registered_kernels()
+    if not kernels:
+        print("FATAL: no Helion kernels registered by vLLM")
+        return 1
     print(f"Found {len(kernels)} registered Helion kernels: {sorted(kernels)}\n")
 
     failures: list[tuple[str, str, str]] = []
