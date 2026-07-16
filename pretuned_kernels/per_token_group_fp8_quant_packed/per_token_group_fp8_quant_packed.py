@@ -81,12 +81,37 @@ def per_token_group_fp8_quant_packed(
         [num_tokens, k_num_packed, group_size], block_size=[1, None, group_size]
     ):
         packed_s_blk = hl.zeros([tile_m, tile_gn], dtype=torch.int32)
+        # Hoist all 4 group loads before any dependent compute so their global
+        # memory latency overlaps (4 loads in flight) instead of being exposed
+        # one-at-a-time. Small-token shapes are memory-latency bound, so this
+        # cuts the dominant long-scoreboard stall.
+        tile_g0 = tile_gn.index * 4 + 0
+        tile_g1 = tile_gn.index * 4 + 1
+        tile_g2 = tile_gn.index * 4 + 2
+        tile_g3 = tile_gn.index * 4 + 3
+        tile_gs = [tile_g0, tile_g1, tile_g2, tile_g3]
+        mask_g0 = tile_g0 < groups_per_row
+        mask_g1 = tile_g1 < groups_per_row
+        mask_g2 = tile_g2 < groups_per_row
+        mask_g3 = tile_g3 < groups_per_row
+        masks_g = [mask_g0, mask_g1, mask_g2, mask_g3]
+        x_blk0 = hl.load(
+            input, [tile_m, tile_g0, tile_n], extra_mask=mask_g0[None, :, None]
+        ).to(torch.float32)
+        x_blk1 = hl.load(
+            input, [tile_m, tile_g1, tile_n], extra_mask=mask_g1[None, :, None]
+        ).to(torch.float32)
+        x_blk2 = hl.load(
+            input, [tile_m, tile_g2, tile_n], extra_mask=mask_g2[None, :, None]
+        ).to(torch.float32)
+        x_blk3 = hl.load(
+            input, [tile_m, tile_g3, tile_n], extra_mask=mask_g3[None, :, None]
+        ).to(torch.float32)
+        x_blks = [x_blk0, x_blk1, x_blk2, x_blk3]
+
         for i in hl.static_range(4):
-            tile_g = tile_gn.index * 4 + i
-            mask_g = tile_g < groups_per_row
-            x_blk = hl.load(
-                input, [tile_m, tile_g, tile_n], extra_mask=mask_g[None, :, None]
-            ).to(torch.float32)
+            mask_g = masks_g[i]
+            x_blk = x_blks[i]
 
             y_s_blk = torch.clamp(torch.amax(torch.abs(x_blk), dim=-1), min=eps)
             y_s_blk = y_s_blk / max_8bit
@@ -104,7 +129,7 @@ def per_token_group_fp8_quant_packed(
 
             hl.store(
                 output_q,
-                [tile_m, tile_g, tile_n],
+                [tile_m, tile_gs[i], tile_n],
                 y_q_blk,
                 extra_mask=mask_g[None, :, None],
             )
