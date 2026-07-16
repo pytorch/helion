@@ -117,7 +117,10 @@ jobs:
             ~/.venv
           key: ${{ matrix.python-version }}-${{ matrix.runtime-version }}-${{ matrix.pytorch-version }}-${{ matrix.backend }}-${{ hashFiles('.github/workflows/test.yml') }}-${{ steps.date.outputs.month }}
 
+      # TPU installs its (pinned) torch via the install-tpu-torch composite
+      # action below; every other runtime installs torch here.
       - name: Install PyTorch
+        if: ${{ matrix.alias != 'tpu' }}
         run: |
           set -eux
 
@@ -127,15 +130,16 @@ jobs:
             VERSION="${{ matrix.pytorch-version }}"
             VERSION="${VERSION#pytorch-}"
             uv pip install -U "torch==${VERSION}.*" --index-url https://download.pytorch.org/whl/${{ matrix.runtime-version }}
-          elif [[ "${{ matrix.runtime-version }}" == "tpu" ]]; then
-            # Use the latest PyTorch wheel known to work with TorchTPU.
-            uv pip install -U --pre "torch==2.14.0.dev20260707" --index-url https://download.pytorch.org/whl/nightly/cpu
           else
             # Default to nightly
             # On OSDC, route nightly through the pypi-cache /whl proxy (deps stay reachable behind the egress firewall) and clear the cache index vars so it wins over the cache default; off OSDC PYPI_CACHE_WHL_URL is unset so we hit download.pytorch.org.
             PYTORCH_INDEX="${PYPI_CACHE_WHL_URL:-https://download.pytorch.org/whl/cpu}"
             UV_DEFAULT_INDEX= UV_INDEX= uv pip install -U --pre torch --index-url "${PYTORCH_INDEX%/whl/*}/whl/nightly/${{ matrix.runtime-version }}"
           fi
+
+      - name: Install PyTorch (CPU nightly, pinned for TorchTPU)
+        if: ${{ matrix.alias == 'tpu' }}
+        uses: ./.github/actions/install-tpu-torch
 
       - name: Configure XPU runtime library path
         if: matrix.alias == 'xpu'
@@ -193,56 +197,9 @@ jobs:
           uv pip install "git+https://github.com/fla-org/flash-linear-attention@6bd90692588c81fe102ee6e12ac70686359658a2" --no-deps
           python -c "import fla; print('fla', fla.__name__)"
 
-      - name: Install TPU dependencies (Pallas)
+      - name: Build and install torch_tpu (Pallas)
         if: matrix.alias == 'tpu'
-        run: |
-          set -euxo pipefail
-          source .venv/bin/activate
-          uv pip install \
-            --extra-index-url https://us-python.pkg.dev/ml-oss-artifacts-published/jax/simple/ \
-            --find-links https://storage.googleapis.com/jax-releases/libtpu_releases.html \
-            --pre \
-            'jax==0.10.1' 'jaxlib==0.10.1' 'libtpu==0.0.40' 'tpu-info==0.7.1' 'jaxtyping' 'frozendict' 'immutabledict'
-          # Install Bazel
-          if ! command -v bazel &> /dev/null; then
-            sudo curl -L https://github.com/bazelbuild/bazelisk/releases/download/v1.27.0/bazelisk-linux-amd64 -o /usr/local/bin/bazel
-            sudo chmod +x /usr/local/bin/bazel
-          fi
-          # Install gcloud CLI if not present (needed for Secret Manager)
-          if ! command -v gcloud &> /dev/null; then
-            sudo apt-get install -y apt-transport-https ca-certificates gnupg curl
-            curl https://packages.cloud.google.com/apt/doc/apt-key.gpg | sudo gpg --dearmor -o /usr/share/keyrings/cloud.google.gpg
-            echo "deb [signed-by=/usr/share/keyrings/cloud.google.gpg] https://packages.cloud.google.com/apt cloud-sdk main" | sudo tee /etc/apt/sources.list.d/google-cloud-sdk.list
-            sudo apt-get update && sudo apt-get install -y google-cloud-cli
-          fi
-          # Clone torch_tpu via GCP Secret Manager SSH key (same as pytorch CI)
-          TORCH_TPU_COMMIT=$(cat .github/ci_commit_pins/torch_tpu.txt)
-          set +x
-          gcloud secrets versions access latest \
-            --secret="torchtpu-read-key" \
-            --project="ml-velocity-actions-testing" > /tmp/torch_tpu_ssh_key
-          set -x
-          chmod 600 /tmp/torch_tpu_ssh_key
-          GIT_SSH_COMMAND="ssh -i /tmp/torch_tpu_ssh_key -o IdentitiesOnly=yes -o StrictHostKeyChecking=no" \
-            git clone git@github.com:google-pytorch/torch_tpu.git /tmp/torch_tpu
-          rm -f /tmp/torch_tpu_ssh_key
-          cd /tmp/torch_tpu
-          git checkout "${TORCH_TPU_COMMIT}"
-          # Build torch_tpu wheel
-          sudo apt-get install -y libpython3-dev
-          export TORCH_SOURCE=$(python -c "import torch; import os; print(os.path.dirname(os.path.dirname(torch.__file__)))")
-          bazel build -c opt //ci/wheel:torch_tpu_wheel \
-            --config=helion_public_caching_readwrite \
-            --define TORCH_SOURCE=local \
-            --repo_env=TORCH_SOURCE=$TORCH_SOURCE \
-            --action_env=JAX_PLATFORMS=cpu
-          uv pip install bazel-bin/ci/wheel/*.whl
-          # libtpu 0.0.44 is broken (segfaults in jax.profiler.start_trace).
-          uv pip install libtpu==0.0.43
-          cd -
-          rm -rf /tmp/torch_tpu
-          # Verify
-          python -c "import torch, sys; print('Success') if torch.tpu.is_available() else (print('(Torch)TPU not available'), sys.exit(1))"
+        uses: ./.github/actions/build-torch-tpu
 
       - name: Install Pallas interpret dependencies
         if: matrix.alias == 'pallas-interpret'
