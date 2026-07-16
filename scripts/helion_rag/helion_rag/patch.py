@@ -147,39 +147,49 @@ def _tier1_seeded(bound_kernel, original, args, rest, kwargs, res):
         return original(bound_kernel, args, *rest, **kwargs)
 
 
-def apply(
-    bound_kernel, original, args, rest, kwargs, *, _extract_fn=None, _lookup_fn=None
-):
-    """RAG wrapper around ensure_config_exists. Falls back to original on miss or error."""
+def apply(bound_kernel, original, args, rest, kwargs):
+    """RAG wrapper around ensure_config_exists.
+
+    RAG is an optional accelerator, so any failure in the retrieval path — a
+    corrupt/unreadable index, a FAISS/pickle deserialization error, a malformed
+    exact.json — must degrade to normal autotune rather than break the user's run.
+    That path is guarded by the single try/except below, which logs and falls back.
+    `_extract` is deliberately left outside the boundary: it reads Helion's own
+    internals, so a broken contract there should surface loudly, not be swallowed.
+    """
     if os.environ.get("HELION_RAG_ENABLED") != "1":
         return original(bound_kernel, args, *rest, **kwargs)
 
-    extract_fn = _extract_fn or _extract
-    lookup_fn = _lookup_fn or lookup
-    info = extract_fn(bound_kernel, args)
+    info = _extract(bound_kernel, args)
     if not info:
         return original(bound_kernel, args, *rest, **kwargs)
 
-    res = (
-        lookup_fn(
-            info["kernel_source"],
-            info["shapes"],
-            info["dtypes"],
-            info["hardware"],
-            settings=info.get("settings"),
+    try:
+        res = (
+            lookup(
+                info["kernel_source"],
+                info["shapes"],
+                info["dtypes"],
+                info["hardware"],
+                settings=info.get("settings"),
+            )
+            or {}
         )
-        or {}
-    )
-
-    tier = res.get("tier")
-    if tier == 0:
-        cfg = _to_config(res.get("best_config"))
-        if cfg is not None:
-            bound_kernel.set_config(cfg)
-            return None
+        if res.get("tier") == 0:
+            cfg = _to_config(res.get("best_config"))
+            if cfg is not None:
+                bound_kernel.set_config(cfg)
+                return None
+    except Exception as e:
+        _log(
+            f"apply: RAG lookup failed ({type(e).__name__}: {e}); "
+            "falling back to normal autotune"
+        )
         return original(bound_kernel, args, *rest, **kwargs)
 
-    if tier == 1:
+    # Tier-1 runs the real autotune (with merged seeds) — kept outside the
+    # boundary above so a genuine autotune error is never masked as a RAG miss.
+    if res.get("tier") == 1:
         return _tier1_seeded(bound_kernel, original, args, rest, kwargs, res)
 
     return original(bound_kernel, args, *rest, **kwargs)

@@ -70,15 +70,13 @@ def resolve_family(
     env_family: str | None = None,
     override: str | None = None,
     compute_capability: str | None = None,
-    _device_fn=None,
 ) -> str | None:
     """Pick family by precedence: override > env > device token > torch > manifest alias > compute capability."""
-    device_fn = _device_fn or _helion_device_string
     return (
         override
         or env_family
         or _family_from_device(device)
-        or _family_from_device(device_fn())
+        or _family_from_device(_helion_device_string())
         or _family_from_manifest_alias(device, manifest)
         or _family_from_compute_capability(compute_capability, manifest)
     )

@@ -1,4 +1,9 @@
-"""Turn CI benchmark artifacts into a searchable corpus. Stdlib only."""
+"""Turn CI benchmark artifacts into a searchable corpus.
+
+The workload key must match Helion's own run_id logic, so the codegen-setting
+list and signature are imported straight from `helion.autotuner.metrics` rather
+than vendored here — single source of truth. (This makes corpus/index depend on
+`helion` being importable, which the lookup/patch runtime already requires.)"""
 
 from __future__ import annotations
 
@@ -10,25 +15,15 @@ import operator
 from pathlib import Path
 import zipfile
 
+from helion.autotuner.metrics import _CODEGEN_SETTINGS
+from helion.autotuner.metrics import _codegen_signature
 from helion_rag._util import DEFAULT_TOP_N
 from helion_rag._util import _die
 from helion_rag._util import _log
 from helion_rag.models import ExactEntry
 from helion_rag.models import Ref
 
-# Same list as helion.autotuner.metrics._CODEGEN_SETTINGS
-_CODEGEN_SETTINGS = (
-    "allow_warp_specialize",
-    "backend",
-    "debug_dtype_asserts",
-    "dot_precision",
-    "fast_math",
-    "index_dtype",
-    "pallas_interpret",
-    "persistent_reserved_sms",
-    "static_shapes",
-    "triton_do_not_specialize",
-)
+__all__ = ["_CODEGEN_SETTINGS"]  # re-exported for patch._settings_dict
 
 
 def _to_canonical_nested(v):
@@ -49,13 +44,6 @@ def _canon_dtypes(s: str) -> str:
 def _normalize_kernel_source(src: str) -> str:
     """Normalize source via AST dump."""
     return ast.dump(ast.parse(src))
-
-
-def _codegen_signature(settings: dict) -> str:
-    """Join codegen settings in fixed order to match Helion's run_id logic."""
-    if not settings:
-        return ""
-    return ", ".join(f"{name}={settings.get(name)}" for name in _CODEGEN_SETTINGS)
 
 
 def _tier0_eligible(kernel_source: str) -> bool:

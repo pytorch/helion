@@ -40,66 +40,61 @@ def test_manifest_validation_errors(bad_obj: dict, match: str) -> None:
         manifest_mod.validate_manifest(bad_obj)
 
 
-def test_resolve_family_tokens_aliases_override_and_unknown() -> None:
-    manifest = {
-        "version": 1,
-        "families": {
-            "h100": {
-                "artifact_path": "h100",
-                "aliases": ["NVIDIA H100 PCIe", "hopper"],
-                "compute_capabilities": ["9.0"],
-            },
-            "b200": {
-                "artifact_path": "b200",
-                "aliases": ["blackwell"],
-                "compute_capabilities": ["10.0"],
-            },
+_MANIFEST = {
+    "version": 1,
+    "families": {
+        "h100": {
+            "artifact_path": "h100",
+            "aliases": ["NVIDIA H100 PCIe", "hopper"],
+            "compute_capabilities": ["9.0"],
         },
-    }
+        "b200": {
+            "artifact_path": "b200",
+            "aliases": ["blackwell"],
+            "compute_capabilities": ["10.0"],
+        },
+    },
+}
 
-    def no_gpu() -> None:
-        return None
 
+def test_family_from_device_tokens() -> None:
+    """Device-string token matching is pure and host-independent."""
+    assert hardware._family_from_device("NVIDIA H100 80GB") == "h100"
+    assert hardware._family_from_device("gfx950") == "mi350x"
+    assert hardware._family_from_device("mystery accelerator") is None
+    assert hardware._family_from_device(None) is None
+
+
+def test_family_from_manifest_alias_and_compute_capability() -> None:
     assert (
-        hardware.resolve_family(
-            device="NVIDIA H100 80GB", manifest=manifest, _device_fn=no_gpu
-        )
-        == "h100"
+        hardware._family_from_manifest_alias("hopper accelerator", _MANIFEST) == "h100"
+    )
+    assert hardware._family_from_manifest_alias("mystery", _MANIFEST) is None
+    assert hardware._family_from_compute_capability("10.0", _MANIFEST) == "b200"
+    assert hardware._family_from_compute_capability("7.5", _MANIFEST) is None
+
+
+def test_resolve_family_precedence_before_device_fallback() -> None:
+    """Precedence resolvable without the torch device probe (override > env > token).
+
+    The torch fallback and the manifest alias/CC branches sit *after* the device
+    token, so they're covered by the pure-helper tests above rather than driven
+    through resolve_family (which would depend on the host GPU)."""
+    assert (
+        hardware.resolve_family(device="NVIDIA H100 80GB", manifest=_MANIFEST) == "h100"
     )
     assert (
-        hardware.resolve_family(
-            device="hopper accelerator", manifest=manifest, _device_fn=no_gpu
-        )
-        == "h100"
-    )
-    assert (
-        hardware.resolve_family(
-            device="unknown",
-            manifest=manifest,
-            compute_capability="10.0",
-            _device_fn=no_gpu,
-        )
-        == "b200"
-    )
-    assert (
-        hardware.resolve_family(
-            device="unknown", manifest=manifest, env_family="tpu", _device_fn=no_gpu
-        )
+        hardware.resolve_family(device="unknown", manifest=_MANIFEST, env_family="tpu")
         == "tpu"
     )
     assert (
         hardware.resolve_family(
             device="NVIDIA H100 80GB",
-            manifest=manifest,
+            manifest=_MANIFEST,
             env_family="b200",
             override="mi350x",
-            _device_fn=no_gpu,
         )
         == "mi350x"
-    )
-    assert (
-        hardware.resolve_family(device="unknown", manifest=manifest, _device_fn=no_gpu)
-        is None
     )
 
 

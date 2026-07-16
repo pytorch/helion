@@ -146,7 +146,7 @@ def main(argv: list[str] | None = None) -> int:
     cfg = _config()
 
     if args.cmd == "extract":
-        from corpus import extract_corpus
+        from helion_rag.corpus import extract_corpus
 
         n = extract_corpus(cfg.data_dir, cfg.corpus_dir)
         print(f"extracted {n} corpus file(s) into {cfg.corpus_dir}", file=sys.stderr)

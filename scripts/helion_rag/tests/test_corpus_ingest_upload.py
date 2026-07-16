@@ -59,6 +59,18 @@ def test_extract_corpus_strips_generated_code_and_dedups(tmp_path: Path) -> None
     assert {r["run_id"] for r in loaded} == {"RUN1", "RUN2"}
 
 
+def test_cli_extract_subcommand(tmp_path: Path, monkeypatch) -> None:
+    """Drives `python -m helion_rag extract` end-to-end (guards the cli import path)."""
+    import helion_rag.cli as cli
+
+    data_dir = tmp_path / "data"
+    _write_zip(data_dir / "h100" / "a.zip", _meta_record("RUN1", median=1.0))
+    monkeypatch.setenv("HELION_RAG_DATA_DIR", str(data_dir))
+
+    assert cli.main(["extract"]) == 0
+    assert (data_dir / "corpus" / "h100" / "add.meta.jsonl").is_file()
+
+
 def test_ingest_joins_aggregates_and_is_idempotent(tmp_path: Path) -> None:
     logs = tmp_path / "logs"
     logs.mkdir()

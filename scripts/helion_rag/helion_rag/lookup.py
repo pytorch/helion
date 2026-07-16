@@ -18,11 +18,7 @@ from helion_rag.manifest import load_manifest
 
 def _load_manifest_opt(cfg) -> dict | None:
     """Load manifest if configured, else None."""
-    return (
-        load_manifest(cfg.manifest_path)
-        if getattr(cfg, "manifest_path", None)
-        else None
-    )
+    return load_manifest(cfg.manifest_path) if cfg.manifest_path else None
 
 
 def _normalize_config(c: dict) -> str:
@@ -43,7 +39,7 @@ def _resolve_family(hardware_str: str, cfg) -> str | None:
     return hardware.resolve_family(
         device=hardware_str,
         manifest=_load_manifest_opt(cfg),
-        env_family=getattr(cfg, "hardware_family", None),
+        env_family=cfg.hardware_family,
     )
 
 
@@ -53,26 +49,20 @@ def _tier2(family: str | None = None, msg: str | None = None) -> dict:
     return {"tier": 2, "family": family}
 
 
-def _lookup_impl(
+def lookup(
     kernel_source: str,
     shapes: str,
     dtypes: str,
-    hardware_str: str,
+    hardware: str,
     settings: dict | None = None,
     k: int = 8,
     cfg=None,
-    *,
-    _index_loader=None,
-    _resolve_family_fn=None,
 ) -> dict:
-    """Try exact match, then vector similarity, else Tier 2 miss."""
+    """Try Tier-0 exact match, then Tier-1 vector similarity, else Tier-2 miss."""
     cfg = cfg or _config()
-    resolve_fn = _resolve_family_fn or _resolve_family
-    family = resolve_fn(hardware_str, cfg)
+    family = _resolve_family(hardware, cfg)
     if family is None:
-        return _tier2(
-            None, f"lookup: unrecognized hardware {hardware_str!r}; Tier 2 miss"
-        )
+        return _tier2(None, f"lookup: unrecognized hardware {hardware!r}; Tier 2 miss")
 
     fam_dir = Path(cfg.index_dir) / family
     key = corpus._workload_key(kernel_source, shapes, dtypes, settings or {}, family)
@@ -93,8 +83,7 @@ def _lookup_impl(
             "ref": hit.get("ref"),
         }
 
-    index_loader = _index_loader or index_mod.load_index
-    vs = index_loader(cfg, family)
+    vs = index_mod.load_index(cfg, family)
     hits = vs.similarity_search_with_score(kernel_source.strip(), k=k)
     if not hits:
         return _tier2(family)
@@ -119,32 +108,6 @@ def _lookup_impl(
         for doc, score in hits
     ]
     return {"tier": 1, "family": family, "neighbors": neighbors}
-
-
-def lookup(
-    kernel_source: str,
-    shapes: str,
-    dtypes: str,
-    hardware: str,
-    settings: dict | None = None,
-    k: int = 8,
-    cfg=None,
-    *,
-    _index_loader=None,
-    _resolve_family_fn=None,
-) -> dict:
-    """Run Tier-0 exact then Tier-1 similarity lookup."""
-    return _lookup_impl(
-        kernel_source,
-        shapes,
-        dtypes,
-        hardware,
-        settings=settings,
-        k=k,
-        cfg=cfg or _config(),
-        _index_loader=_index_loader,
-        _resolve_family_fn=_resolve_family_fn,
-    )
 
 
 # Making module callable so helion_rag.lookup(...) works.

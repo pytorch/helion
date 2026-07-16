@@ -98,13 +98,13 @@ When Helion needs an autotune config, it tries to find it in three stages:
 - **Tier 1 (Similar Match):** If we don't find an exact match, we do a FAISS similarity search over the corpus text embeddings. (You can tune the similarity threshold using `HELION_RAG_SIM_THRESHOLD`). We take the top `n` neighbor configs and temporarily merge them into the user's seed configs for the autotuner to try.
 - **Tier 2 (Miss):** If no similar configs meet the threshold, we just fall back to standard autotuning.
 
-To ensure our workload keys stay in sync with upstream Helion, we have a test that asserts our vendored `_CODEGEN_SETTINGS` exactly matches `helion.autotuner.metrics._CODEGEN_SETTINGS`.
+To keep workload keys in sync with upstream Helion, `_CODEGEN_SETTINGS` and `_codegen_signature` are imported directly from `helion.autotuner.metrics` — a single source of truth, so there is nothing to keep in sync.
 
 ## Patching the runtime hook
 
-To intercept config lookups, we install a wrapper on `BoundKernel.ensure_config_exists`. The patching logic lives in `helion_rag.patch.apply(bound_kernel, original, args, rest, kwargs, *, _extract_fn=None, _lookup_fn=None)`.
+To intercept config lookups, we install a wrapper on `BoundKernel.ensure_config_exists`. The patching logic lives in `helion_rag.patch.apply(bound_kernel, original, args, rest, kwargs)`.
 
-When this runs, `_extract` pulls the kernel source, shapes, dtypes, hardware string, and settings from the `BoundKernel` call. If it can't, it returns `None` and we fall back to standard behavior. Also, if your kernel uses Epilogue or Callable arguments, the AST check will flag it as ineligible for Tier-0 exact matches.
+When this runs, `_extract` pulls the kernel source, shapes, dtypes, hardware string, and settings from the `BoundKernel` call. If it can't, it returns `None` and we fall back to standard behavior. The lookup itself runs behind a single failure boundary: a corrupt index or FAISS error is logged and falls back to normal autotune, so RAG can never break a run. Also, if your kernel uses Epilogue or Callable arguments, the AST check will flag it as ineligible for Tier-0 exact matches.
 
 The `patch-helion` CLI command uses `write_hook(target)` to append an idempotent marker block to the Python file, which imports `helion_rag.patch.install()`. We intentionally kept this simple (just appending if missing).
 
@@ -114,11 +114,11 @@ When figuring out what hardware you're running on, `hardware.resolve_family()` c
 1. An explicit override
 2. The `env_family` environment variable
 3. Device token substring matches
-4. `torch.cuda.get_device_name` (injected via `_device_fn` for tests)
+4. `torch.cuda.get_device_name`
 5. Aliases in the manifest
 6. Compute capability
 
-If it still doesn't recognize the hardware, it returns `None` and drops down to a Tier-2 miss. (By the way, `_device_fn` is injected via dependency injection so we can write deterministic tests on both CPU and GPU hosts without monkeypatching).
+If it still doesn't recognize the hardware, it returns `None` and drops down to a Tier-2 miss. The pure resolution helpers (`_family_from_device`, `_family_from_manifest_alias`, `_family_from_compute_capability`) take explicit inputs, so they're unit-tested directly without needing to stub the `torch` device probe.
 
 ## Manifest handling
 
@@ -139,11 +139,11 @@ We have 25 tests that run fully deterministically:
 scripts/helion_rag/tests/
   __init__.py                 # Package marker for relative imports
   _fixtures.py                # Shared setup imported via inspect to avoid duplication
-  test_corpus_ingest_upload.py   # Covers extraction, idempotent ingest, and atomic uploads
-  test_lookup_patch.py           # Tests all lookup tiers, fake FAISS neighbors, and runtime patches via dependency injection
-  test_manifest_hardware.py      # Manifest validation and hardware family resolution
+  test_corpus_ingest_upload.py   # Covers extraction (incl. the CLI path), idempotent ingest, atomic uploads
+  test_lookup_patch.py           # Tier-0 exact, Tier-2 miss, seed merge (real on-disk data, no mocks)
+  test_integration.py            # Real BoundKernel + FAISS: apply hook, Tier-1, corrupt-index fallback
+  test_manifest_hardware.py      # Manifest validation and hardware family resolution (pure helpers)
   test_workload_key.py           # Workload key parity, deduplication, and AST checks
-  manual/validate_tier0_e2e.py   # A manual E2E script for testing real CLI lookups
 ```
 
 You can run the suite like this:

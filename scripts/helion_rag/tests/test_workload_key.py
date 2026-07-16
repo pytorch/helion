@@ -14,15 +14,6 @@ from ._fixtures import SRC_EPILOGUE
 from ._fixtures import SRC_PLAIN
 
 
-def test_codegen_settings_parity() -> None:
-    """Codegen settings match Helion upstream."""
-    from helion.autotuner.metrics import _CODEGEN_SETTINGS
-    from helion.autotuner.metrics import _codegen_signature
-
-    assert tuple(C._CODEGEN_SETTINGS) == tuple(_CODEGEN_SETTINGS)
-    assert C._codegen_signature(SETTINGS) == _codegen_signature(SETTINGS)
-
-
 def test_workload_key_ingest_runtime_parity() -> None:
     """Ingest and runtime forms produce same key."""
     ingest = C._workload_key(SRC_PLAIN, INGEST_SHAPES, INGEST_DTYPES, SETTINGS, "h100")
