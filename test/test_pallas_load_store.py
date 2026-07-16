@@ -47,6 +47,24 @@ def jagged_dense_bmm(
     return out
 
 
+@helion.kernel(backend="pallas")
+def jagged_dense_bmm_2d_loop(
+    seq_offsets: torch.Tensor, jagged: torch.Tensor, dense: torch.Tensor
+) -> torch.Tensor:
+    L, D = jagged.shape
+    B, D, K = dense.shape
+    out = torch.empty((L, K), dtype=jagged.dtype, device=jagged.device)
+    for g in hl.grid(B):
+        s = seq_offsets[g]
+        e = seq_offsets[g + 1]
+        for st, kt in hl.tile((s, 0), (e, K)):
+            acc = hl.zeros([st, kt], dtype=torch.float32)
+            for dt in hl.tile(0, D):
+                acc = acc + torch.matmul(jagged[st, dt], dense[g, dt, kt])
+            out[st, kt] = acc
+    return out
+
+
 def _ref_jagged_bmm(
     seq_offsets: torch.Tensor, jagged: torch.Tensor, dense: torch.Tensor
 ) -> torch.Tensor:
@@ -69,9 +87,9 @@ def _inputs(offsets: list[int], D: int, K: int, dtype: torch.dtype):
     return seq_offsets, jagged, dense
 
 
-def _run(seq_offsets, jagged, dense, block_sizes):
+def _run(seq_offsets, jagged, dense, block_sizes, kernel=jagged_dense_bmm):
     return code_and_output(
-        jagged_dense_bmm,
+        kernel,
         (seq_offsets, jagged, dense),
         block_sizes=block_sizes,
         pallas_loop_type="emit_pipeline",
@@ -87,24 +105,27 @@ class TestPallasJaggedCarrySimple(TestCase):
 
     @xfailIfPallasInterpret(_XFAIL_INTERPRET)
     @parametrize("dtype", [torch.float32, torch.bfloat16])
-    def test_single_group(self, dtype: torch.dtype) -> None:
+    @parametrize("kernel", [jagged_dense_bmm, jagged_dense_bmm_2d_loop])
+    def test_single_group(self, dtype: torch.dtype, kernel) -> None:
         # One group: exercises the aligned-enclosing read and the tail mask,
         # with no carry between groups.
         seq_offsets, jagged, dense = _inputs([0, 20], 128, 128, dtype)
-        _code, out = _run(seq_offsets, jagged, dense, [16, 128, 128])
+        _code, out = _run(seq_offsets, jagged, dense, [16, 128, 128], kernel=kernel)
         torch.testing.assert_close(out, _ref_jagged_bmm(seq_offsets, jagged, dense))
 
     @xfailIfPallasInterpret(_XFAIL_INTERPRET)
     @parametrize("dtype", [torch.float32, torch.bfloat16])
-    def test_aligned_groups_carry_dormant(self, dtype: torch.dtype) -> None:
+    @parametrize("kernel", [jagged_dense_bmm, jagged_dense_bmm_2d_loop])
+    def test_aligned_groups_carry_dormant(self, dtype: torch.dtype, kernel) -> None:
         # Aligned boundaries: carry path is emitted but its runtime guard never fires.
         seq_offsets, jagged, dense = _inputs([0, 16, 32], 128, 128, dtype)
-        code, out = _run(seq_offsets, jagged, dense, [16, 128, 128])
+        code, out = _run(seq_offsets, jagged, dense, [16, 128, 128], kernel=kernel)
         self.assertIn("pl.program_id(0) != 0", code)
         torch.testing.assert_close(out, _ref_jagged_bmm(seq_offsets, jagged, dense))
 
     @xfailIfPallasInterpret(_XFAIL_INTERPRET)
-    def test_carry_keeps_both_groups(self) -> None:
+    @parametrize("kernel", [jagged_dense_bmm, jagged_dense_bmm_2d_loop])
+    def test_carry_keeps_both_groups(self, kernel) -> None:
         # Two groups [0, 3) and [3, 16) share the [0, 16) boundary.  With
         # identity weights out == jagged, so a clobbered carry would be obvious.
         seq_offsets = torch.tensor([0, 3, 16], dtype=torch.int32, device=DEVICE)
@@ -114,7 +135,9 @@ class TestPallasJaggedCarrySimple(TestCase):
             .contiguous()
         )
         eye = torch.eye(128, dtype=torch.bfloat16, device=DEVICE)
-        _code, out = _run(seq_offsets, jagged, torch.stack([eye, eye]), [16, 128, 128])
+        _code, out = _run(
+            seq_offsets, jagged, torch.stack([eye, eye]), [16, 128, 128], kernel=kernel
+        )
         torch.testing.assert_close(out, jagged)
 
     @xfailIfPallasInterpret(_XFAIL_INTERPRET)
@@ -231,36 +254,42 @@ class TestPallasJaggedCarryBmm(TestCase):
             [0, 3, 7, 16],  # several tiny groups in one boundary (cumulative carry)
         ],
     )
-    def test_bmm_block_eq_sublane(self, dtype: torch.dtype, offsets: list[int]) -> None:
+    @parametrize("kernel", [jagged_dense_bmm, jagged_dense_bmm_2d_loop])
+    def test_bmm_block_eq_sublane(
+        self, dtype: torch.dtype, offsets: list[int], kernel
+    ) -> None:
         seq_offsets, jagged, dense = _inputs(offsets, 128, 128, dtype)
-        code, out = _run(seq_offsets, jagged, dense, [16, 128, 128])
+        code, out = _run(seq_offsets, jagged, dense, [16, 128, 128], kernel=kernel)
         self.assertIn("pltpu.emit_pipeline", code)
         torch.testing.assert_close(out, _ref_jagged_bmm(seq_offsets, jagged, dense))
 
     @xfailIfPallasInterpret(_XFAIL_INTERPRET)
     @parametrize("dtype", [torch.float32, torch.bfloat16])
-    def test_bmm_block_gt_group(self, dtype: torch.dtype) -> None:
+    @parametrize("kernel", [jagged_dense_bmm, jagged_dense_bmm_2d_loop])
+    def test_bmm_block_gt_group(self, dtype: torch.dtype, kernel) -> None:
         # Two groups (13 rows) are smaller than block_row=32, total L=200 >> block_row.
         seq_offsets, jagged, dense = _inputs([0, 13, 100, 113, 200], 128, 128, dtype)
-        _code, out = _run(seq_offsets, jagged, dense, [32, 128, 128])
+        _code, out = _run(seq_offsets, jagged, dense, [32, 128, 128], kernel=kernel)
         torch.testing.assert_close(out, _ref_jagged_bmm(seq_offsets, jagged, dense))
 
     @xfailIfPallasInterpret(_XFAIL_INTERPRET)
     @parametrize("dtype", [torch.float32, torch.bfloat16])
-    def test_bmm_multi_k_tile(self, dtype: torch.dtype) -> None:
+    @parametrize("kernel", [jagged_dense_bmm, jagged_dense_bmm_2d_loop])
+    def test_bmm_multi_k_tile(self, dtype: torch.dtype, kernel) -> None:
         # K=256 with block_col=128 gives two output-column tiles; the carry stacks
         # the per-column-tile boundaries along its scratch row dim.
         seq_offsets, jagged, dense = _inputs([0, 17, 40, 71], 128, 256, dtype)
-        _code, out = _run(seq_offsets, jagged, dense, [16, 128, 128])
+        _code, out = _run(seq_offsets, jagged, dense, [16, 128, 128], kernel=kernel)
         torch.testing.assert_close(out, _ref_jagged_bmm(seq_offsets, jagged, dense))
 
     @xfailIfPallasInterpret(_XFAIL_INTERPRET)
     @parametrize("dtype", [torch.float32, torch.bfloat16])
-    def test_bmm_many_groups(self, dtype: torch.dtype) -> None:
+    @parametrize("kernel", [jagged_dense_bmm, jagged_dense_bmm_2d_loop])
+    def test_bmm_many_groups(self, dtype: torch.dtype, kernel) -> None:
         # 50 unaligned groups; carry scratch is per column-tile, not per group.
         offsets = list(range(0, 13 * 51, 13))  # 50 groups
         seq_offsets, jagged, dense = _inputs(offsets, 128, 128, dtype)
-        code, out = _run(seq_offsets, jagged, dense, [16, 128, 128])
+        code, out = _run(seq_offsets, jagged, dense, [16, 128, 128], kernel=kernel)
         self.assertIn("carry", code)
         torch.testing.assert_close(out, _ref_jagged_bmm(seq_offsets, jagged, dense))
 
@@ -274,10 +303,13 @@ class TestPallasJaggedCarryBmm(TestCase):
             [0, 16, 16],  # trailing empty
         ],
     )
-    def test_bmm_empty_groups(self, dtype: torch.dtype, offsets: list[int]) -> None:
+    @parametrize("kernel", [jagged_dense_bmm, jagged_dense_bmm_2d_loop])
+    def test_bmm_empty_groups(
+        self, dtype: torch.dtype, offsets: list[int], kernel
+    ) -> None:
         # Zero-length groups (s == e) iterate no tiles; carry threads the neighbours.
         seq_offsets, jagged, dense = _inputs(offsets, 128, 128, dtype)
-        _code, out = _run(seq_offsets, jagged, dense, [16, 128, 128])
+        _code, out = _run(seq_offsets, jagged, dense, [16, 128, 128], kernel=kernel)
         torch.testing.assert_close(out, _ref_jagged_bmm(seq_offsets, jagged, dense))
 
     @xfailIfPallasInterpret(_XFAIL_INTERPRET)
@@ -384,14 +416,15 @@ class TestPallasJaggedCarryRejects(TestCase):
         ref[1] = jagged[13:25].float().sum(0)
         torch.testing.assert_close(out, ref)
 
-    def test_block_not_multiple_of_sublane_raises(self) -> None:
+    @parametrize("kernel", [jagged_dense_bmm, jagged_dense_bmm_2d_loop])
+    def test_block_not_multiple_of_sublane_raises(self, kernel) -> None:
         # bf16 sublane S=16; block_row=8 is not a multiple, so the carry rejects it
         # loudly instead of clobbering the boundary with a plain store.
         seq_offsets, jagged, dense = _inputs([0, 13, 25], 128, 128, torch.bfloat16)
         with self.assertRaisesRegex(
             exc.InductorLoweringError, "block_row .* must be a multiple"
         ):
-            _run(seq_offsets, jagged, dense, [8, 128, 128])
+            _run(seq_offsets, jagged, dense, [8, 128, 128], kernel=kernel)
 
     def test_multi_grid_group_rejected(self) -> None:
         # The fold guard keys seq_offsets program_id(0), so a second grid dimension is

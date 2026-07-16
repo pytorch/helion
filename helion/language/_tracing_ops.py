@@ -2142,18 +2142,26 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
                         f"({begin_expr}) + ({lambda_params[bid_idx]}) "
                         f"* ({iter_step_expr})"
                     )
-                    if is_store:
+                    if is_store and bid not in state.device_function.carry_tiles:
                         # Clamp the store extent to min(block, end - offset) so a
                         # short final tile writes only its valid rows
                         # [begin, end) instead of overrunning into the next
                         # sub-range (which would corrupt it under cross-iteration
                         # double-buffering, and is wasteful for large blocks).
+                        #
+                        # For ordered carry tiles (`bid in [...].carry_tiles`),
+                        # clamping is skipped: fixed sublane-aligned windows are
+                        # required for carry propagation, and zeroing/masking of
+                        # unowned rows is safely handled by the ordered carry logic.
                         size_expr = (
                             f"jnp.minimum({slice_size_expr}, "
                             f"({end_exprs[bid_idx]}) - ({start_expr}))"
                         )
                     else:
                         size_expr = slice_size_expr
+                    if bid in state.device_function.carry_tiles:
+                        sublane = state.device_function.carry_tiles[bid].sublane
+                        start_expr = f"pl.multiple_of({start_expr}, {sublane})"
                     lambda_parts.append(f"pl.ds({start_expr}, {size_expr})")
                 else:
                     # Static, from-zero loop: a block-aligned index is exact.
