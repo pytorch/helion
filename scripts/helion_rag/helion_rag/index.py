@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import asdict
+import fcntl
 import json
 import os
 from pathlib import Path
@@ -23,6 +26,7 @@ T = TypeVar("T")
 
 _CURRENT = "current"
 _GENERATIONS = "generations"
+_BUILD_LOCK = ".build.lock"
 _KEEP_GENERATIONS = 2
 
 
@@ -81,9 +85,57 @@ def _next_gen_id(gens_dir: Path) -> str:
     return f"{max(nums, default=-1) + 1:06d}"
 
 
-def commit_generation(family_index_dir: Path, populate: Callable[[Path], None]) -> Path:
-    """Write a new generation to temp dir, then atomically swap current pointer."""
+@contextmanager
+def _generation_lock(family_index_dir: Path) -> Iterator[None]:
+    """Reject a concurrent builder for one hardware family.
+
+    ``flock`` is advisory and automatically released if the process exits. All
+    generation writers in this package acquire it before building or publishing.
+    """
     family_index_dir = Path(family_index_dir)
+    family_index_dir.mkdir(parents=True, exist_ok=True)
+    with (family_index_dir / _BUILD_LOCK).open("a+", encoding="utf-8") as lock_file:
+        try:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise RuntimeError(
+                f"index build already in progress for {family_index_dir}"
+            ) from exc
+        try:
+            yield
+        finally:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+
+def _recover_orphaned_generations(family_index_dir: Path) -> None:
+    """Recover interrupted publication while holding the family build lock.
+
+    Temporary directories are incomplete and removed. A numeric directory has
+    already passed ``populate`` and the atomic final rename, so the newest one is
+    promoted when it is newer than ``current`` or the pointer is missing. Numeric
+    IDs encode publication order; manually rolling ``current`` back is unsupported.
+    """
+    family_index_dir = Path(family_index_dir)
+    gens = _gens_dir(family_index_dir)
+    gens.mkdir(parents=True, exist_ok=True)
+    for tmp in gens.glob(".tmp-*"):
+        if tmp.is_dir():
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    numeric = [d for d in gens.iterdir() if d.is_dir() and d.name.isdigit()]
+    if not numeric:
+        return
+    newest = max(numeric, key=lambda d: int(d.name))
+    current = resolve_current(family_index_dir)
+    if current is None or int(newest.name) > int(current.name):
+        _set_current(family_index_dir, newest.name)
+        _log(f"recovered generation {newest.name} under {family_index_dir}")
+
+
+def _commit_generation_locked(
+    family_index_dir: Path, populate: Callable[[Path], None]
+) -> Path:
+    """Publish one generation while the caller holds the family build lock."""
     gens = _gens_dir(family_index_dir)
     gens.mkdir(parents=True, exist_ok=True)
 
@@ -103,6 +155,14 @@ def commit_generation(family_index_dir: Path, populate: Callable[[Path], None]) 
     _set_current(family_index_dir, gen_id)
     _gc_old_generations(family_index_dir)
     return final
+
+
+def commit_generation(family_index_dir: Path, populate: Callable[[Path], None]) -> Path:
+    """Publish one generation with single-writer locking and crash recovery."""
+    family_index_dir = Path(family_index_dir)
+    with _generation_lock(family_index_dir):
+        _recover_orphaned_generations(family_index_dir)
+        return _commit_generation_locked(family_index_dir, populate)
 
 
 def _set_current(family_index_dir: Path, gen_id: str) -> None:
@@ -159,27 +219,29 @@ def _index_present(family_index_dir: Path) -> bool:
 
 
 def build_family_index(cfg, family: str, records: list) -> Path:
-    """Build FAISS vector store and exact maps for one family, then swap current."""
+    """Build and publish one family index under the single-writer lock."""
     from langchain_community.vectorstores import FAISS
     from langchain_community.vectorstores.utils import DistanceStrategy
 
     runids = _runid_map(records)
     records = _dedup_by_key(records)
-    emb = _embeddings(cfg)
-    vs = FAISS.from_documents(
-        _to_documents(records),
-        emb,
-        distance_strategy=DistanceStrategy.MAX_INNER_PRODUCT,
-    )
-    exact = _exact_map(records)
-
-    def _populate(gen_dir: Path) -> None:
-        vs.save_local(str(gen_dir))
-        (gen_dir / "exact.json").write_text(json.dumps(exact), encoding="utf-8")
-        (gen_dir / "runids.json").write_text(json.dumps(runids), encoding="utf-8")
-
     fam_dir = Path(cfg.index_dir) / family
-    gen = commit_generation(fam_dir, _populate)
+    with _generation_lock(fam_dir):
+        _recover_orphaned_generations(fam_dir)
+        emb = _embeddings(cfg)
+        vs = FAISS.from_documents(
+            _to_documents(records),
+            emb,
+            distance_strategy=DistanceStrategy.MAX_INNER_PRODUCT,
+        )
+        exact = _exact_map(records)
+
+        def _populate(gen_dir: Path) -> None:
+            vs.save_local(str(gen_dir))
+            (gen_dir / "exact.json").write_text(json.dumps(exact), encoding="utf-8")
+            (gen_dir / "runids.json").write_text(json.dumps(runids), encoding="utf-8")
+
+        gen = _commit_generation_locked(fam_dir, _populate)
     _log(
         f"{family}: wrote generation {gen.name} ({len(exact)} workloads, {len(runids)} run_ids) to {fam_dir}"
     )

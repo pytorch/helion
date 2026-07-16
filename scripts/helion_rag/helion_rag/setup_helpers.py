@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from collections.abc import Callable
 import json
-import os
 from pathlib import Path
 import sys
 import tempfile
@@ -38,10 +37,9 @@ def validate_manifest_cli(path: str | Path) -> int:
     return 0
 
 
-def resolve_family_cli(manifest_path: str | Path, device_env: str | None = None) -> str:
+def resolve_family_cli(manifest_path: str | Path, device: str | None = None) -> str:
     m = load_manifest(manifest_path)
-    dev = device_env or os.environ.get("HELION_RAG_FAKE_DEVICE")
-    fam = resolve_family(device=dev, manifest=m)
+    fam = resolve_family(device=device, manifest=m)
     return fam or ""
 
 
@@ -53,6 +51,25 @@ def is_represented(manifest_path: str | Path, family: str) -> bool:
 def artifact_path(manifest_path: str | Path, family: str) -> str:
     m = load_manifest(manifest_path)
     return m["families"][family]["artifact_path"]
+
+
+def _register_family(
+    manifest: dict,
+    family: str,
+    *,
+    artifact_path: str | None = None,
+    aliases: list[str] | None = None,
+) -> bool:
+    """Add one family to a manifest; return False when already present."""
+    families = manifest.setdefault("families", {})
+    if family in families:
+        return False
+    families[family] = {
+        "artifact_path": artifact_path or family,
+        "aliases": [family, *(aliases or [])],
+    }
+    validate_manifest(manifest)
+    return True
 
 
 def publish_manifest(
@@ -75,14 +92,10 @@ def publish_manifest(
             obj = json.loads(local.read_text(encoding="utf-8"))
         else:
             obj = {"version": 1, "families": {}}
-        families = obj.setdefault("families", {})
-        if family in families:
+        if not _register_family(
+            obj, family, artifact_path=artifact_path, aliases=aliases
+        ):
             return {"published": False, "reason": "already-present", "family": family}
-        families[family] = {
-            "artifact_path": artifact_path or family,
-            "aliases": [family, *(aliases or [])],
-        }
-        validate_manifest(obj)
         local.write_text(json.dumps(obj, indent=2), encoding="utf-8")
         manifold_put(str(local), dest)
     return {"published": True, "family": family, "families": sorted(obj["families"])}

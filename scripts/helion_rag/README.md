@@ -92,12 +92,16 @@ python -m helion_rag <cmd>  # Alternative module entry point (does the same thin
 The standalone `lookup` command searches in three stages:
 
 - **Tier 0 (Exact Match):** Calculates a workload key by hashing the normalized AST source, codegen settings, canonical shapes, dtypes, and hardware family. A matching `exact.json` entry returns the measured-best config.
-- **Tier 1 (Similar Match):** Runs FAISS similarity search over corpus source embeddings and returns the top neighbors with their measured configurations. `HELION_RAG_SIM_THRESHOLD` controls the minimum score.
+- **Tier 1 (Similar Match):** Runs FAISS similarity search over corpus source embeddings and returns the top neighbors with their measured configurations. `HELION_RAG_SIM_THRESHOLD` accepts a finite value in `[0, 1]` and controls the minimum score; invalid values use the default `0.85`.
 - **Tier 2 (Miss):** Reports that no exact or sufficiently similar result was found.
 
 The command prints these results as JSON for inspection or use by external tooling. Helion does not consume them automatically.
 
 To keep workload keys in sync with upstream Helion, `_CODEGEN_SETTINGS` and `_codegen_signature` are imported directly from `helion.autotuner.metrics` — a single source of truth, so there is nothing to keep in sync.
+
+## Index publication
+
+Index builds are single-writer per hardware family. A second builder fails immediately while the first holds the advisory filesystem lock. Publication writes a temporary generation, atomically renames it to its numeric final directory, and then atomically replaces the `current` pointer. Before the next build, stale temporary directories are removed and a completed numeric generation newer than `current` is promoted, recovering a crash between the final rename and pointer update. Generation IDs encode publication order, not relative quality, and manual rollback by editing `current` is unsupported because recovery always promotes the newest completed generation.
 
 ## How we resolve hardware
 
@@ -131,9 +135,11 @@ scripts/helion_rag/tests/
   __init__.py                 # Package marker for relative imports
   _fixtures.py                # Shared setup imported via inspect to avoid duplication
   test_corpus_ingest_upload.py   # Covers extraction (incl. the CLI path), idempotent ingest, atomic uploads
+  test_index_generation.py       # Single-writer publication and interrupted-build recovery
   test_lookup.py                 # Tier-0 exact and Tier-2 miss over an on-disk bundle
   test_integration.py            # Tier-1 lookup over a real FAISS index
   test_manifest_hardware.py      # Manifest validation and hardware family resolution (pure helpers)
+  test_util.py                   # Similarity-threshold input contract
   test_workload_key.py           # Workload key parity, deduplication, and AST checks
 ```
 

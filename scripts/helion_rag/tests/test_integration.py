@@ -56,7 +56,7 @@ def _build_index(cfg: Config, family: str, records: list[dict]) -> None:
     index_mod.build_family_index(cfg, family, corpus.load_corpus(cfg.corpus_dir))
 
 
-def test_lookup_tier1_over_real_index(_index_deps, tmp_path, monkeypatch) -> None:
+def test_lookup_tier1_over_real_index(_index_deps, tmp_path) -> None:
     cfg = _cfg(tmp_path)
     _build_index(
         cfg,
@@ -64,7 +64,6 @@ def test_lookup_tier1_over_real_index(_index_deps, tmp_path, monkeypatch) -> Non
         [_record(SHAPES, DTYPES, run_id="R", config={"block_sizes": [16]})],
     )
     # Query a different shape so Tier-0 misses and Tier-1 similarity runs.
-    monkeypatch.setenv("HELION_RAG_SIM_THRESHOLD", "0.1")
     res = lookup_mod.lookup(
         SRC, "[(1024, 1024), (1024, 1024)]", DTYPES, "h100", cfg=cfg
     )

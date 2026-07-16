@@ -10,7 +10,7 @@ from pathlib import Path
 import sys
 
 from helion_rag.config import _config
-import helion_rag.lookup as lookup
+from helion_rag.lookup import lookup
 
 
 def _contributor() -> str:

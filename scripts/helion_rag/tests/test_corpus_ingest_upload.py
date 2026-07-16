@@ -3,13 +3,15 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
+import subprocess
+import sys
 import zipfile
 
 import helion_rag.corpus as corpus
 import helion_rag.ingest as ingest
 import helion_rag.upload as upload
-import pytest
 
 from ._fixtures import DTYPES
 from ._fixtures import SHAPES
@@ -59,15 +61,16 @@ def test_extract_corpus_strips_generated_code_and_dedups(tmp_path: Path) -> None
     assert {r["run_id"] for r in loaded} == {"RUN1", "RUN2"}
 
 
-def test_cli_extract_subcommand(tmp_path: Path, monkeypatch) -> None:
+def test_cli_extract_subcommand(tmp_path: Path) -> None:
     """Drives `python -m helion_rag extract` end-to-end (guards the cli import path)."""
-    import helion_rag.cli as cli
-
     data_dir = tmp_path / "data"
     _write_zip(data_dir / "h100" / "a.zip", _meta_record("RUN1", median=1.0))
-    monkeypatch.setenv("HELION_RAG_DATA_DIR", str(data_dir))
 
-    assert cli.main(["extract"]) == 0
+    subprocess.run(
+        [sys.executable, "-m", "helion_rag", "extract"],
+        check=True,
+        env={**os.environ, "HELION_RAG_DATA_DIR": str(data_dir)},
+    )
     assert (data_dir / "corpus" / "h100" / "add.meta.jsonl").is_file()
 
 
@@ -126,51 +129,41 @@ def _write_two_runs(logs: Path) -> None:
     )
 
 
-def test_upload_success_writes_markers_and_archive(tmp_path: Path) -> None:
+def test_upload_without_transport_builds_archive_without_markers(
+    tmp_path: Path,
+) -> None:
     logs = tmp_path / "logs"
     _write_two_runs(logs)
     uploads = tmp_path / "uploads"
-    uploaded: list[tuple[Path, str]] = []
 
-    success = upload.upload(
+    result = upload.upload(
         autotune_log_dir=logs,
         uploads_dir=uploads,
         family="h100",
         contributor="tester",
-        manifold_put=lambda archive, dest: uploaded.append((archive, dest)),
     )
-    assert success["uploaded"] is True
-    assert success["run_ids"] == ["RUN1", "RUN2"]
-    assert Path(success["archive_path"]).is_file()
-    assert len(uploaded) == 1
-    assert uploaded[0][0] == Path(success["archive_path"])
-    # destination is opaque transport detail; verify archive content instead
-    with zipfile.ZipFile(success["archive_path"]) as zf:
+    assert result["uploaded"] is False
+    assert result["run_ids"] == []
+    assert Path(result["archive_path"]).is_file()
+    with zipfile.ZipFile(result["archive_path"]) as zf:
         manifest = json.loads(zf.read("batch-manifest.json"))
     assert manifest == {
         "family": "h100",
         "contributor": "tester",
         "run_ids": ["RUN1", "RUN2"],
     }
-    for run_id in ("RUN1", "RUN2"):
-        assert (uploads / "uploaded-runs" / f"{run_id}.json").is_file()
+    assert not (uploads / "uploaded-runs").exists()
 
 
-def test_upload_failure_writes_no_markers(tmp_path: Path) -> None:
-    logs = tmp_path / "logs"
-    _write_two_runs(logs)
-    failed_uploads = tmp_path / "failed-uploads"
+def test_record_upload_writes_run_and_archive_markers(tmp_path: Path) -> None:
+    runs_dir = tmp_path / "uploaded-runs"
+    archives_dir = tmp_path / "uploaded-archives"
 
-    def _fail_upload(_archive: Path, _dest: str) -> None:
-        raise RuntimeError("upload failed")
+    upload.record_upload(["RUN1", "RUN2"], "abc123", runs_dir, archives_dir)
 
-    with pytest.raises(RuntimeError, match="upload failed"):
-        upload.upload(
-            autotune_log_dir=logs,
-            uploads_dir=failed_uploads,
-            family="h100",
-            contributor="tester",
-            manifold_put=_fail_upload,
-        )
-    assert not (failed_uploads / "uploaded-runs" / "RUN1.json").exists()
-    assert not (failed_uploads / "uploaded-runs" / "RUN2.json").exists()
+    assert (runs_dir / "RUN1.json").is_file()
+    assert (runs_dir / "RUN2.json").is_file()
+    assert json.loads((archives_dir / "abc123.json").read_text(encoding="utf-8")) == {
+        "archive_sha256": "abc123",
+        "run_ids": ["RUN1", "RUN2"],
+    }

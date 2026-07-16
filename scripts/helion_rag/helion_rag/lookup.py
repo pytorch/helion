@@ -3,8 +3,6 @@
 from __future__ import annotations
 
 from pathlib import Path
-import sys
-import types
 
 from helion_rag._util import _log
 from helion_rag._util import _sim_threshold
@@ -93,12 +91,3 @@ def lookup(
         for doc, score in hits
     ]
     return {"tier": 1, "family": family, "neighbors": neighbors}
-
-
-# Making module callable so helion_rag.lookup(...) works.
-class _CallableModule(types.ModuleType):
-    def __call__(self, *args, **kwargs):
-        return lookup(*args, **kwargs)
-
-
-sys.modules[__name__].__class__ = _CallableModule

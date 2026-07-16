@@ -1,7 +1,8 @@
-"""Tiny stdlib helpers shared across helion_rag. No heavy deps here."""
+"""Tiny stdlib helpers shared across helion_rag."""
 
 from __future__ import annotations
 
+import math
 import os
 import sys
 from typing import NoReturn
@@ -23,11 +24,17 @@ def _die(msg: str) -> NoReturn:
     raise SystemExit(1)
 
 
-def _sim_threshold() -> float:
-    """Read HELION_RAG_SIM_THRESHOLD or fall back to default."""
-    v = os.environ.get("HELION_RAG_SIM_THRESHOLD", "").strip()
+def _parse_sim_threshold(raw: str) -> float:
+    """Parse a finite similarity in [0, 1], else use the tested default."""
+    try:
+        value = float(raw.strip())
+    except ValueError:
+        return DEFAULT_SIM_THRESHOLD
     return (
-        float(v)
-        if v.replace(".", "", 1).lstrip("-").isdigit()
-        else DEFAULT_SIM_THRESHOLD
+        value if math.isfinite(value) and 0.0 <= value <= 1.0 else DEFAULT_SIM_THRESHOLD
     )
+
+
+def _sim_threshold() -> float:
+    """Read HELION_RAG_SIM_THRESHOLD as a finite similarity in [0, 1]."""
+    return _parse_sim_threshold(os.environ.get("HELION_RAG_SIM_THRESHOLD", ""))
