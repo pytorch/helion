@@ -1234,9 +1234,7 @@ class GenerateAST(NodeVisitor, CodegenInterface):
             return expr_from_string(
                 self.host_function.literal_expr(
                     [
-                        self.device_function.resolved_block_size(
-                            x.block_id
-                        )  # pyrefly: ignore[missing-attribute]
+                        self.device_function.resolved_block_size(x.block_id)  # pyrefly: ignore[missing-attribute]
                         for x in values
                     ]
                 )
