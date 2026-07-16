@@ -19,7 +19,6 @@ baseline. Kernels with no config for the current platform are skipped (reported)
 from __future__ import annotations
 
 import copy
-import inspect
 import sys
 import traceback
 
@@ -91,22 +90,6 @@ def _float_tolerances(settings: object) -> tuple[float, float]:
     rtol = getattr(settings, "autotune_baseline_rtol", None)
     return (atol if atol is not None else _DEFAULT_TOL,
             rtol if rtol is not None else _DEFAULT_TOL)
-
-
-def _scale_ub_index(baseline: object) -> int | None:
-    """Positional index of a ``scale_ub`` arg in the baseline signature, if any.
-
-    Some vLLM generate_inputs pass a degenerate ``scale_ub = mean(input) ~= 0``
-    (e.g. silu_and_mul_per_block_quant), which collapses every per-block scale to
-    the floor so the output saturates and the comparison is meaningless. We
-    neutralize it to None (the production-common no-upper-bound path that vLLM's
-    own has_scale_ub=False test exercises), making correctness checkable.
-    """
-    try:
-        params = list(inspect.signature(baseline).parameters)
-    except (ValueError, TypeError):
-        return None
-    return params.index("scale_ub") if "scale_ub" in params else None
 
 
 def _compare(a: torch.Tensor, b: torch.Tensor, atol: float, rtol: float) -> str | None:
@@ -196,24 +179,13 @@ def main() -> int:
             continue
 
         baseline = getattr(wrapper.helion_settings, "autotune_baseline_fn", None)
-        scale_ub_idx = _scale_ub_index(baseline) if baseline is not None else None
 
         shape_keys = [dict(k) if hasattr(k, "keys") else k for k in inputs_dict]
         print(f"[{name}] checking {len(inputs_dict)} shape(s): {shape_keys}")
-        if scale_ub_idx is not None:
-            print(f"[{name}] neutralizing degenerate scale_ub (arg[{scale_ub_idx}]) -> None")
 
         for key, inputs in inputs_dict.items():
             n_cases += 1
             tag = f"{name} {dict(key) if hasattr(key, 'keys') else key}"
-
-            # Neutralize a degenerate scale_ub (see _scale_ub_index) so the
-            # kernel and reference both run the no-upper-bound path.
-            if scale_ub_idx is not None and scale_ub_idx < len(inputs) \
-                    and isinstance(inputs[scale_ub_idx], torch.Tensor):
-                inputs = list(inputs)
-                inputs[scale_ub_idx] = None
-                inputs = tuple(inputs)
 
             # Pristine copy to detect which args are outputs (written in place).
             pristine = copy.deepcopy(inputs)
