@@ -218,7 +218,7 @@ class ScratchArg:
     """
 
     name: str
-    shape: tuple[int, ...]
+    shape: tuple[int | torch.SymInt, ...]
     dtype: torch.dtype | None  # None for semaphores
     scratch_type: str = "vmem"  # "vmem" or "dma_semaphore"
 
@@ -1121,7 +1121,7 @@ class DeviceFunction:
 
     def register_scratch(
         self,
-        shape: tuple[int, ...],
+        shape: tuple[int | torch.SymInt, ...],
         dtype: torch.dtype | None,
         name_hint: str = "scratch",
         scratch_type: str = "vmem",
