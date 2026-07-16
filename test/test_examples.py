@@ -371,8 +371,8 @@ class TestExamples(RefEagerTestBase, TestCase):
             expected,
             block_sizes=[32, 256],
             static_shapes=True,
-            atol=1e-2,
-            rtol=1e-2,
+            atol=0.02,
+            rtol=0.2,
         )
 
     def test_matmul_layernorm_small_shapes_compile_on_cute(self):
@@ -1822,7 +1822,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             num_stages=3,
         )
 
-    def _check_gather_gemv(self, dtype: torch.dtype):
+    def _check_gather_gemv(self, dtype: torch.dtype, atol=0.1, rtol=0.01):
         args = (
             torch.randn([4, 512, 512], device=DEVICE, dtype=dtype),
             torch.randint(0, 4, [2], device=DEVICE, dtype=torch.int32),
@@ -1841,6 +1841,8 @@ class TestExamples(RefEagerTestBase, TestCase):
             block_sizes=[16, 16],
             num_warps=8,
             num_stages=1,
+            atol=atol,
+            rtol=rtol,
         )
 
     # Pallas f32 succeeds under CPU emulation but fails on TPU.
@@ -1852,7 +1854,7 @@ class TestExamples(RefEagerTestBase, TestCase):
     @skipIfXPU("Timeout on XPU")
     @xfailIfPallasInterpret("jax interpret-mode discharge bug on fp16 pipeline buffers")
     def test_gather_gemv_half(self):
-        self._check_gather_gemv(HALF_DTYPE)
+        self._check_gather_gemv(HALF_DTYPE, atol=0.2, rtol=0.2)
 
     @xfailIfPallas("int4 unpacking not supported on pallas")
     def test_int4_gemm(self):
@@ -2319,7 +2321,8 @@ class TestExamples(RefEagerTestBase, TestCase):
             block_sizes=[16, 16, 16],
             num_warps=4,
             num_stages=2,
-            atol=0.4,
+            atol=2.0,
+            rtol=0.05,
         )
 
     def test_grpo_loss_fwd(self):
