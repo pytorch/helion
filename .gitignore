@@ -115,3 +115,4 @@ cute_sweep_results.jsonl
 # this file lives alongside it and is per-session local state.
 .claude/settings.local.json
 .claude/worktrees/*
+.helion-rag/

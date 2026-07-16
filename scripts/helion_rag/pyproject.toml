@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "helion-rag"
+version = "0.1.0"
+description = "Helion RAG over CI artifacts for autotuning assistance"
+requires-python = ">=3.9"
+dependencies = [
+    "langchain",
+    "langchain-community",
+    "langchain-huggingface",
+    "sentence-transformers>=2.7.0",
+    "transformers>=4.51.0",
+    "faiss-cpu",
+]
+readme = "README.md"
+
+[project.scripts]
+helion-rag = "helion_rag.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["helion_rag*"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["ANN"]

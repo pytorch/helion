@@ -1,0 +1,98 @@
+"""Workload key identity, parity, and Tier-0 eligibility tests."""
+
+from __future__ import annotations
+
+import helion_rag.corpus as C
+
+from ._fixtures import INGEST_DTYPES
+from ._fixtures import INGEST_SHAPES
+from ._fixtures import FAMILY
+from ._fixtures import OTHER_FAMILY
+from ._fixtures import RUNTIME_DTYPES
+from ._fixtures import RUNTIME_SHAPES
+from ._fixtures import SETTINGS
+from ._fixtures import SRC_EPILOGUE
+from ._fixtures import SRC_PLAIN
+
+
+def test_workload_key_canonicalizes_container_types() -> None:
+    list_forms = C._workload_key(
+        SRC_PLAIN, INGEST_SHAPES, INGEST_DTYPES, SETTINGS, FAMILY
+    )
+    tuple_forms = C._workload_key(
+        SRC_PLAIN, RUNTIME_SHAPES, RUNTIME_DTYPES, SETTINGS, FAMILY
+    )
+    assert list_forms == tuple_forms
+
+
+def test_non_codegen_setting_does_not_change_key() -> None:
+    trimmed = {k: v for k, v in SETTINGS.items() if k != "autotune_random_seed"}
+    assert C._workload_key(
+        SRC_PLAIN, INGEST_SHAPES, INGEST_DTYPES, SETTINGS, FAMILY
+    ) == C._workload_key(SRC_PLAIN, INGEST_SHAPES, INGEST_DTYPES, trimmed, FAMILY)
+
+
+def test_family_and_settings_change_key() -> None:
+    base = C._workload_key(SRC_PLAIN, INGEST_SHAPES, INGEST_DTYPES, SETTINGS, FAMILY)
+    assert base != C._workload_key(
+        SRC_PLAIN, INGEST_SHAPES, INGEST_DTYPES, SETTINGS, OTHER_FAMILY
+    )
+    other = {**SETTINGS, "dot_precision": "ieee"}
+    assert base != C._workload_key(
+        SRC_PLAIN, INGEST_SHAPES, INGEST_DTYPES, other, FAMILY
+    )
+
+
+def test_runid_map_keeps_all_run_ids_but_dedup_keeps_fastest() -> None:
+    """Run_id map keeps duplicates; dedup keeps the lowest-median record per key."""
+    recs = [
+        {
+            "workload_key": "K",
+            "run_id": "R1",
+            "family": FAMILY,
+            "best": {"median": 2.0},
+        },
+        {
+            "workload_key": "K",
+            "run_id": "R2",
+            "family": FAMILY,
+            "best": {"median": 1.0},
+        },
+    ]
+    assert C._runid_map(recs) == {"R1": "K", "R2": "K"}
+    deduped = C._dedup_by_key(recs)
+    assert len(deduped) == 1
+    assert deduped[0]["run_id"] == "R2"  # lower median wins regardless of load order
+
+
+def test_tier0_eligible() -> None:
+    assert C._tier0_eligible(SRC_PLAIN) is True
+    assert C._tier0_eligible(SRC_EPILOGUE) is False
+
+
+def _record(shapes: str, dtypes: str) -> dict:
+    return {
+        "run_id": "R",
+        "kernel_source": SRC_PLAIN,
+        "input_shapes": shapes,
+        "dtypes": dtypes,
+        "settings": SETTINGS,
+        "configs": {
+            "c0": {
+                "config": {"block_sizes": [64]},
+                "perf_stats": {"median": 1.0, "n_samples": 5},
+            }
+        },
+    }
+
+
+def test_parse_record_skips_unparsable_shapes() -> None:
+    """Unparsable/dynamic-SymInt shapes are skipped, not raised, so one bad
+    record can't abort the whole corpus load."""
+    assert (
+        C._parse_record(_record("not-a-literal", INGEST_DTYPES), FAMILY, "f.jsonl")
+        is None
+    )
+    assert C._parse_record(_record("", INGEST_DTYPES), FAMILY, "f.jsonl") is None
+    ok = C._parse_record(_record(INGEST_SHAPES, INGEST_DTYPES), FAMILY, "f.jsonl")
+    assert ok is not None and ok["workload_key"] and ok["run_id"] == "R"
