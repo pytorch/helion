@@ -728,8 +728,8 @@ def chunk_bwd_dqkg_scalar_helion(
             dq = scale * exp2(gc) * (dA @ (exp2(-gc) * k) + dq_cross)
             dk = scale * exp2(-gc) * (dA^T @ (exp2(gc) * q)) + dk_state
         dg_raw = q * dq - k * dk
-    The state-carry gate gradient is folded into dg_raw's last position; the caller
-    finishes dg by a reverse cumsum over the chunk (scalar also sums dg_raw over D).
+    The state-carry gate gradient is folded into dg_raw's last position, then a
+    reverse cumsum over the chunk finishes dg in-kernel (scalar callers sum over D).
     """
     BHN = q.size(0)
     C = hl.specialize(q.size(1))
@@ -738,7 +738,7 @@ def chunk_bwd_dqkg_scalar_helion(
 
     dq_out = torch.empty([BHN, C, D], dtype=q.dtype, device=q.device)
     dk_out = torch.empty([BHN, C, D], dtype=k.dtype, device=k.device)
-    dg_raw_by_d = torch.empty([BHN, C, D], dtype=torch.float32, device=q.device)
+    dg_by_d = torch.empty([BHN, C, D], dtype=torch.float32, device=q.device)
 
     for tile_bhn, tile_d in hl.tile([BHN, D]):
         dA_raw = hl.zeros([tile_bhn, C, C], dtype=torch.float32)
@@ -799,11 +799,10 @@ def chunk_bwd_dqkg_scalar_helion(
 
         dg_last = exp_gl * dh_h_acc + (dk_state * kt.float()).sum(dim=1)
         is_last = (idx == C - 1).float()
-        dg_raw_by_d[tile_bhn, :, tile_d] = (
-            dg_raw + is_last[None, :, None] * dg_last[:, None, :]
-        )
+        dg = dg_raw + is_last[None, :, None] * dg_last[:, None, :]
+        dg_by_d[tile_bhn, :, tile_d] = hl.cumsum(dg, dim=1, reverse=True)
 
-    return dq_out, dk_out, dg_raw_by_d
+    return dq_out, dk_out, dg_by_d
 
 
 @helion.kernel()
@@ -1555,7 +1554,7 @@ def _helion_chunked_bwd(
         dob = grad_output.reshape(BHN, C, DV)
         hb = h_all.reshape(BHN, D, DV)
 
-        dq_raw, dk_raw, dg_raw_by_d = chunk_bwd_dqkg_scalar_helion(
+        dq_raw, dk_raw, dg_by_d = chunk_bwd_dqkg_scalar_helion(
             qb, kb, vb, g_csf2, hb, dob, dhf2, g_last=g_lastf2, scale=scale
         )
 
@@ -1571,9 +1570,7 @@ def _helion_chunked_bwd(
             scale=scale,
         )
 
-        dg_raw = dg_raw_by_d.sum(-1)
-        dg = dg_raw.reshape(BH, N, C).flip(-1).cumsum(-1).flip(-1).reshape(B, H, T)
-        dg = dg.to(g.dtype)
+        dg = dg_by_d.sum(-1).reshape(B, H, T).to(g.dtype)
 
         return (
             dq_raw.reshape(B, H, T, D),
@@ -1617,7 +1614,7 @@ def _helion_chunked_bwd(
     hb = h_all.reshape(BHN, D, DV)
     dhf2 = dh_all.reshape(BHN, D, DV)
 
-    dq_raw, dk_raw, dg_raw_by_d = chunk_bwd_dqkg_scalar_helion(
+    dq_raw, dk_raw, dg_by_d = chunk_bwd_dqkg_scalar_helion(
         qb, kb, vb, gc, hb, dob, dhf2, diag_anchored=True, scale=scale
     )
 
@@ -1625,8 +1622,7 @@ def _helion_chunked_bwd(
         qb, kb, kb, gc, dob, dhf2, A=A, diag_anchored=True, scale=scale
     )
 
-    dg_raw = dg_raw_by_d.reshape(BH, N, C, D).flip(-2).cumsum(-2).flip(-2)
-    dg = dg_raw.reshape(B, H, T, D).to(g.dtype)
+    dg = dg_by_d.reshape(B, H, T, D).to(g.dtype)
 
     return (
         dq_raw.reshape(B, H, T, D),
@@ -1835,7 +1831,7 @@ def _helion_chunked_bwd_correction(
         qf_raw = qc.reshape(BHN, C, D)
         af_raw = ac_flat
 
-        dq_raw, da_par, dg_raw_by_d = chunk_bwd_dqkg_scalar_helion(
+        dq_raw, da_par, dg_by_d = chunk_bwd_dqkg_scalar_helion(
             qf_raw,
             af_raw,
             v_new_fwd_f,
@@ -1845,10 +1841,7 @@ def _helion_chunked_bwd_correction(
             dhf,
             g_last=g_lastf,
         )
-        dg_raw = dg_raw_by_d.sum(-1)
-        dg_attn_state = (
-            dg_raw.reshape(BH, N, C).flip(-1).cumsum(-1).flip(-1).reshape(BHN, C)
-        )
+        dg_attn_state = dg_by_d.sum(-1).reshape(BHN, C)
 
         dg_cs_wy = dg_cs_d_wy.sum(-1)
         dg_wy_per_step = (
