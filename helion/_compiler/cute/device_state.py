@@ -23,11 +23,24 @@ if TYPE_CHECKING:
 
 
 @dataclasses.dataclass(frozen=True)
+class CuteTcgen05GroupedTailProof:
+    anchor: Node
+    store_node: Node
+    value_node: Node
+    producer_nodes: tuple[Node, ...]
+    n_sizes_load_node: Node | None
+    has_m_tail_mask: bool
+    has_n_tail_mask: bool
+
+
+@dataclasses.dataclass(frozen=True)
 class CuteTcgen05StoreValue:
     lifecycle_context: Tcgen05LifecycleContext
     pure_matmul_object: Tcgen05PureMatmulObjectModel | None = None
     bm: int = 0
     bn: int = 0
+    source_bm: int = 0
+    source_bn: int = 0
     bk: int = 0
     thr_mma: str = ""
     epi_warp_count: int = 0
@@ -41,6 +54,8 @@ class CuteTcgen05StoreValue:
     epilogue_rest_mode: str = ""
     tma_store_atom: str = ""
     tma_store_tensor: str = ""
+    tail_tma_store_atom: str = ""
+    tail_tma_store_tensor: str = ""
     role_local_tile_counter: str = ""
     use_role_local_epi: bool = False
     use_tma_store_epilogue: bool = False
@@ -52,6 +67,19 @@ class CuteTcgen05StoreValue:
     explicit_epi_tile_m: int | None = None
     explicit_epi_tile_n: int | None = None
     explicit_d_store_box_n: int | None = None
+    accumulator_view: str = "mn"
+    output_view: str = "mn"
+    d_store_view: str = "normal"
+    d_store_layout: str = "cutlass.utils.layout.LayoutEnum.ROW_MAJOR"
+    segment_store_m_offset: str = ""
+    segment_store_start: str = ""
+    segment_store_actual_m: str = ""
+    segment_store_valid_m_bound: str = ""
+    segment_store_node: Node | None = None
+    segment_store_row_index: Node | None = None
+    segment_store_valid_m: Node | None = None
+    deepgemm_selected: bool = False
+    deepgemm_selected_compact_metadata: bool = False
 
     def __post_init__(self) -> None:
         if self.pure_matmul_object is not None:
@@ -66,6 +94,16 @@ class CuteTcgen05StoreValue:
         )
         if self.explicit_d_store_box_n is not None:
             assert self.explicit_epi_tile_n == self.explicit_d_store_box_n
+        assert self.accumulator_view in ("mn", "nm")
+        assert self.output_view in ("mn", "nm")
+        assert self.d_store_view in ("normal", "nm_transposed")
+        assert self.d_store_layout in (
+            "cutlass.utils.layout.LayoutEnum.ROW_MAJOR",
+            "cutlass.utils.layout.LayoutEnum.COL_MAJOR",
+        )
+        if self.d_store_view == "nm_transposed":
+            assert self.accumulator_view == "nm"
+            assert self.output_view == "nm"
 
     @property
     def has_explicit_epilogue_tile(self) -> bool:
@@ -74,6 +112,14 @@ class CuteTcgen05StoreValue:
     @property
     def pure_matmul_role_lifecycle(self) -> bool:
         return self.pure_matmul_object is not None
+
+    @property
+    def source_tile_m(self) -> int:
+        return self.source_bm or self.bm
+
+    @property
+    def source_tile_n(self) -> int:
+        return self.source_bn or self.bn
 
 
 @dataclasses.dataclass(frozen=True)
@@ -128,6 +174,42 @@ class CuteTcgen05MatmulPlan:
     l2_swizzle_size: int = 1
     tma_store_full_tiles_only: bool = False
     flat_role_launch_warp_count: int | None = None
+    grouped_static_persistent: bool = False
+    grouped_worklist_persistent: bool = False
+    grouped_sched_params: str = ""
+    grouped_count: str = ""
+    grouped_problem_sizes: str = ""
+    grouped_starts: str = ""
+    grouped_real_groups: str = ""
+    grouped_dynamic_ab_tensormaps: bool = False
+    grouped_ab_tensormaps: str = ""
+    grouped_direct_pointer_metadata: bool = False
+    grouped_direct_pointers: str = ""
+    grouped_direct_strides: str = ""
+    grouped_dynamic_d_tensormap: bool = False
+    grouped_d_tensormap: str = ""
+    grouped_d_tensormap_slot: int = 0
+    grouped_d_tensormap_tail_store: bool = False
+    grouped_metadata_idx: str = ""
+    grouped_group_idx: str = ""
+    grouped_cta_tile_idx_m: str = ""
+    grouped_cta_tile_idx_n: str = ""
+    grouped_cta_tile_count_k: str = ""
+    grouped_problem_m: str = ""
+    grouped_problem_n: str = ""
+    grouped_problem_k: str = ""
+    grouped_global_m_start: str = ""
+    grouped_layout: str = ""
+    grouped_valid_m: str = ""
+    grouped_store_m: str = ""
+    deepgemm_selected: bool = False
+    deepgemm_selected_compact_metadata: bool = False
+    source_bm: int = 0
+    source_bn: int = 0
+    accumulator_view: str = "mn"
+    output_view: str = "mn"
+    d_store_view: str = "normal"
+    d_store_layout: str = "cutlass.utils.layout.LayoutEnum.ROW_MAJOR"
     # Per-anchor auxiliary descriptors discovered by the forward FX walker. This
     # is store-fusion metadata, not a collective compatibility field:
     # two matmuls with identical collective parameters but different downstream
@@ -137,6 +219,18 @@ class CuteTcgen05MatmulPlan:
     aux_tensor_descriptors: tuple[Tcgen05AuxTensorDescriptor, ...] = dataclasses.field(
         default=(), compare=False
     )
+
+    def __post_init__(self) -> None:
+        assert self.accumulator_view in ("mn", "nm")
+        assert self.output_view in ("mn", "nm")
+        assert self.d_store_view in ("normal", "nm_transposed")
+        assert self.d_store_layout in (
+            "cutlass.utils.layout.LayoutEnum.ROW_MAJOR",
+            "cutlass.utils.layout.LayoutEnum.COL_MAJOR",
+        )
+        if self.d_store_view == "nm_transposed":
+            assert self.accumulator_view == "nm"
+            assert self.output_view == "nm"
 
     @property
     def c_input_aux_tensor_descriptors(self) -> tuple[Tcgen05AuxTensorDescriptor, ...]:
@@ -156,6 +250,14 @@ class CuteTcgen05MatmulPlan:
         from .strategies import Tcgen05PersistenceModel
 
         return self.persistence_model == Tcgen05PersistenceModel.CLC_PERSISTENT.value
+
+    @property
+    def source_tile_m(self) -> int:
+        return self.source_bm or self.bm
+
+    @property
+    def source_tile_n(self) -> int:
+        return self.source_bn or self.bn
 
     @property
     def exec_warp_id(self) -> int:
@@ -266,6 +368,9 @@ class CuteDeviceFunctionState:
 
     def __init__(self) -> None:
         self._tcgen05_store_values: dict[str, CuteTcgen05StoreValue] = {}
+        self._tcgen05_grouped_tail_proofs: dict[
+            torch.fx.Node, CuteTcgen05GroupedTailProof
+        ] = {}
         self._tcgen05_consumed_store_value_ids: set[int] = set()
         # tcgen05 TMA-store atom/tensor kernel-arg names are allocated once per
         # matmul accumulator. When a single accumulator fans out to multiple
@@ -347,6 +452,21 @@ class CuteDeviceFunctionState:
         self, name: str, value: CuteTcgen05StoreValue
     ) -> None:
         self._tcgen05_store_values[name] = value
+
+    def register_tcgen05_grouped_tail_proof(
+        self, proof: CuteTcgen05GroupedTailProof
+    ) -> None:
+        if proof.store_node in self._tcgen05_grouped_tail_proofs:
+            raise exc.BackendUnsupported(
+                "cute",
+                "tcgen05 grouped tail proof must be unique per store node",
+            )
+        self._tcgen05_grouped_tail_proofs[proof.store_node] = proof
+
+    def grouped_tail_proof_for_store(
+        self, store_node: Node
+    ) -> CuteTcgen05GroupedTailProof | None:
+        return self._tcgen05_grouped_tail_proofs.get(store_node)
 
     def get_tcgen05_store_value(
         self,

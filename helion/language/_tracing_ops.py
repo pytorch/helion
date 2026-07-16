@@ -859,7 +859,7 @@ def _emit_inner_loop_offset_indices(
 
 def _setup_inner_loop_masks(
     state: CodegenState,
-    strategy: object,
+    strategy: TileStrategy,
     block_ids: list[int],
     block_size_vars: list[str],
     env: CompileEnvironment,
@@ -875,9 +875,11 @@ def _setup_inner_loop_masks(
 
     Returns True if any mask requires explicit indices.
     """
+    from .._compiler.tile_strategy import NDTileStrategy
+
     aligned_dim = aligned_dim or {}
     needs_explicit = False
-    if hasattr(strategy, "_setup_mask"):
+    if isinstance(strategy, NDTileStrategy):
         for i, bid in enumerate(block_ids):
             offset_var = state.device_function.new_var(f"offset_{bid}")
             if bid in aligned_dim:
@@ -887,8 +889,8 @@ def _setup_inner_loop_masks(
                 sublane = aligned_dim[bid]
                 begin, end = _get_loop_begin_and_end(state, i)
                 a_start = f"(({begin}) - ({begin}) % {sublane})"
-                mask_var = strategy.fn.new_var(f"mask_{bid}", dce=True)  # pyrefly: ignore[missing-attribute]
-                strategy.mask_vars[bid] = mask_var  # pyrefly: ignore[missing-attribute]
+                mask_var = strategy.fn.new_var(f"mask_{bid}", dce=True)
+                strategy.mask_vars[bid] = mask_var
                 needs_explicit = True
                 body_stmts.extend(
                     [
@@ -1673,7 +1675,7 @@ def _aligned_dim(
     from helion._compiler.pallas.ordered_carry import needs_ordered_carry
 
     sublanes = [
-        env.backend.sublane_tiling(t.dtype)  # pyrefly: ignore[missing-attribute]
+        env.backend.sublane_tiling(t.dtype)
         for t in HostFunction.current().tensor_to_origin
         if isinstance(t, torch.Tensor) and t.is_floating_point()
     ]
@@ -1909,7 +1911,7 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
                 # same jagged dim.  Must precede the outer-non-grid branch.
                 block_m = state.device_function.block_size_var(bid)
                 offset_v = state.codegen.offset_var(bid)
-                sublane = env.backend.sublane_tiling(fake.dtype)  # pyrefly: ignore[missing-attribute]
+                sublane = env.backend.sublane_tiling(fake.dtype)
                 block_shape_parts.append(f"pl.BoundedSlice({block_m})")
                 lambda_parts.append(
                     f"pl.ds(pl.multiple_of({offset_v}, {sublane}), {block_m})"

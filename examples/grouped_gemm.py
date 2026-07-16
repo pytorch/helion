@@ -18,7 +18,7 @@ Key ideas used in this implementation:
 - Use data-dependent tiling over the concatenated row dimension to efficiently
   support jagged group sizes (different ``M_i`` per group) without padding.
 
-Two kernels are provided:
+The example provides these grouped GEMM entry points:
 
 1) ``grouped_gemm_jagged`` - a simple kernel that iterates groups and tiles
    dynamically.
@@ -33,8 +33,6 @@ Two kernels are provided:
 
 # %%
 from __future__ import annotations
-
-from typing import Callable
 
 import torch
 
@@ -119,8 +117,8 @@ def grouped_gemm_jagged_persistent(
     """
     Persistent grouped GEMM with dynamic tile metadata computation.
 
-    This variant computes tile assignments dynamically in the kernel,
-    similar to TritonBench's WS variant.
+    This variant computes tile assignments dynamically in the kernel and has
+    workers take tiles in an interleaved order across groups.
 
     Args:
         A_packed: Packed A, concatenated by rows across groups, ``[sum(M_i), K]``.
@@ -232,14 +230,14 @@ def grouped_gemm_jagged_persistent(
 
 # %%
 def _pack_group_inputs(
-    group_A: list[torch.Tensor], group_B: list[torch.Tensor]
+    group_A: list[torch.Tensor], B_shared: torch.Tensor
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Build ``A_packed``, shared ``B``, and ``group_offsets`` from grouped inputs.
 
     Expectations:
     - All ``A_i`` share the same ``K`` and dtype/device.
-    - All groups share the same ``B`` (as produced by TritonBench inputs).
+    - ``B_shared`` is the common weight matrix for all groups.
 
     Returns ``(A_packed, B_shared, group_offsets)`` where
     ``group_offsets`` has length ``G+1`` with ``group_offsets[0] == 0`` and
@@ -248,9 +246,6 @@ def _pack_group_inputs(
     assert len(group_A) > 0
     device = group_A[0].device
     dtype = group_A[0].dtype
-
-    # Extract shared weight matrix B (same for all groups in TritonBench)
-    B_shared = group_B[0]
 
     # Compute group offsets and concatenate all A matrices row-wise
     M_sizes = [int(a.size(0)) for a in group_A]
@@ -263,121 +258,77 @@ def _pack_group_inputs(
 
 
 # %%
-# TritonBench Integration Wrappers
-# --------------------------------
-
-
-# %%
-def grouped_gemm_jagged_tritonbench(
-    tb_op: object,
-    group_A: list[torch.Tensor],
-    group_B: list[torch.Tensor],
-    w: torch.Tensor | None = None,
-    split: torch.Tensor | None = None,
-) -> Callable[[], torch.Tensor]:
-    """Adapter for basic grouped GEMM kernel to work with TritonBench benchmark suite."""
-
-    def inner() -> torch.Tensor:
-        A_packed, B_shared, group_offsets = _pack_group_inputs(group_A, group_B)
-        return grouped_gemm_jagged(A_packed, B_shared, group_offsets)
-
-    return inner
-
-
-def grouped_gemm_jagged_persistent_tritonbench(
-    tb_op: object,
-    group_A: list[torch.Tensor],
-    group_B: list[torch.Tensor],
-    w: torch.Tensor | None = None,
-    split: torch.Tensor | None = None,
-) -> Callable[[], torch.Tensor]:
-    """Adapter for persistent grouped GEMM kernel with dynamic work distribution for TritonBench."""
-
-    def inner() -> torch.Tensor:
-        A_packed, B_shared, group_offsets = _pack_group_inputs(group_A, group_B)
-        return grouped_gemm_jagged_persistent(
-            A_packed,
-            B_shared,
-            group_offsets,
-        )
-
-    return inner
-
-
-# %%
 # Reference Implementation for Validation
 # ---------------------------------------
 
 
 # %%
 def _reference_grouped_gemm(
-    group_A: list[torch.Tensor], group_B: list[torch.Tensor]
+    group_A: list[torch.Tensor], B_shared: torch.Tensor
 ) -> torch.Tensor:
-    B_shared = group_B[0]
     outs = [a @ B_shared for a in group_A]
     return torch.cat(outs, dim=0)
 
 
 def grouped_gemm_jagged_example(
-    group_A: list[torch.Tensor], group_B: list[torch.Tensor]
+    group_A: list[torch.Tensor], B_shared: torch.Tensor
 ) -> torch.Tensor:
     """
-    Wrapper to run grouped_gemm_jagged with unpacked TritonBench inputs.
+    Wrapper to run grouped_gemm_jagged with unpacked grouped inputs.
     """
-    A_packed, B_shared, group_offsets = _pack_group_inputs(group_A, group_B)
+    A_packed, B_shared, group_offsets = _pack_group_inputs(group_A, B_shared)
     return grouped_gemm_jagged(A_packed, B_shared, group_offsets)
 
 
 def grouped_gemm_jagged_persistent_example(
-    group_A: list[torch.Tensor], group_B: list[torch.Tensor]
+    group_A: list[torch.Tensor], B_shared: torch.Tensor
 ) -> torch.Tensor:
     """
-    Wrapper to run grouped_gemm_jagged_persistent with unpacked TritonBench inputs.
+    Wrapper to run grouped_gemm_jagged_persistent with unpacked grouped inputs.
     """
-    A_packed, B_shared, group_offsets = _pack_group_inputs(group_A, group_B)
+    A_packed, B_shared, group_offsets = _pack_group_inputs(group_A, B_shared)
     return grouped_gemm_jagged_persistent(A_packed, B_shared, group_offsets)
 
 
 # %%
-# Test Harness and Validation
-# ---------------------------
+# Demo Entry Point
+# ----------------
 
 
 # %%
 def main() -> None:
-    torch.manual_seed(0)  # Ensure reproducible test results
+    torch.manual_seed(0)  # Keep demo inputs reproducible.
     device = DEVICE
     dtype = torch.bfloat16
-    G = 4  # Number of groups to test
+    G = 4  # Number of demo groups
     K, N = 256, 128  # Shared dimensions: K (reduction), N (output columns)
-    # Create test data with varying group sizes (M_i = 64, 128, 192, 256)
+    # Create demo inputs with varying group sizes (M_i = 64, 128, 192, 256)
     group_A = [
         torch.randn(64 * (i + 1), K, device=device, dtype=dtype).contiguous()
         for i in range(G)
     ]
-    # Shared weight matrix B replicated for each group (as per TritonBench convention)
-    group_B = [torch.randn(K, N, device=device, dtype=dtype).contiguous()] * G
+    B_shared = torch.randn(K, N, device=device, dtype=dtype).contiguous()
 
-    print("Testing grouped GEMM kernels...")
+    print("Running grouped GEMM demo kernels...")
     run_example(
         grouped_gemm_jagged_example,
         _reference_grouped_gemm,
-        (group_A, group_B),
+        (group_A, B_shared),
         rtol=1e-2,
         atol=1e-2,
     )
-    print("✓ Non-persistent kernel passed")
+    print("Non-persistent kernel matched reference")
 
     run_example(
         grouped_gemm_jagged_persistent_example,
         _reference_grouped_gemm,
-        (group_A, group_B),
+        (group_A, B_shared),
         rtol=1e-2,
         atol=1e-2,
     )
-    print("✓ Persistent kernel passed")
+    print("Persistent kernel matched reference")
 
-    print("\nAll tests passed!")
+    print("\nGrouped GEMM demo complete")
 
 
 if __name__ == "__main__":
