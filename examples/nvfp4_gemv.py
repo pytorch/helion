@@ -370,59 +370,6 @@ def _nvfp4_gemv_fp4in_triton_body(
     return out
 
 
-def _nvfp4_scaled_mm_gemv_body(
-    out: Tensor,  # (1, M) bf16 output
-    x_bytes: Tensor,  # (1, K_bytes) uint8 packed NVFP4 activation
-    weight_bytes: Tensor,  # (M, K_bytes) uint8 packed NVFP4 weight
-    x_scale: Tensor,  # (128, round_up(K_groups, 4)) E4M3 swizzled scales
-    weight_scale: Tensor,  # (round_up(M, 128), round_up(K_groups, 4)) E4M3 scales
-    alpha: Tensor,  # (1,) fp32
-) -> Tensor:
-    """Single-row NVFP4 scaled matmul with the CUTLASS-style in-place signature."""
-    M = hl.specialize(weight_bytes.size(0))
-    K_bytes = hl.specialize(weight_bytes.size(1))
-    K_groups = K_bytes // 8
-    x_scale_bytes = x_scale.view(torch.int8).reshape(-1)
-    weight_scale_bytes = weight_scale.view(torch.int8).reshape(-1)
-    block_m = hl.register_block_size(1, 16)
-    block_g = hl.register_block_size(K_groups)
-
-    for tile_m in hl.tile(M, block_size=block_m):
-        alpha_value = alpha[0].to(torch.float32)
-        acc = hl.zeros([tile_m], dtype=torch.float32)
-        for tile_g in hl.tile(K_groups, block_size=block_g):
-            group_offsets = tile_m.index[:, None] * K_groups + tile_g.index[None, :]
-            group_mask = tile_g.index < K_groups
-            weight_mask = (tile_m.index[:, None] < M) & group_mask[None, :]
-            w = hl.load_float4_e2m1fn_x16_to_float16(
-                weight_bytes,
-                group_offsets,
-                extra_mask=weight_mask,
-            )
-            x = hl.load_float4_e2m1fn_x16_to_float16(
-                x_bytes,
-                tile_g.index,
-                extra_mask=group_mask,
-            )
-            contrib = hl.zeros([block_m, block_g], dtype=torch.float16)
-            for i in hl.static_range(16):
-                contrib = contrib + w[i] * x[i][None, :]
-
-            weight_scale_offsets = swizzled_scale_offsets(
-                tile_m.index[:, None], tile_g.index[None, :], K_groups
-            )
-            x_scale_offsets = swizzled_scale_offsets(
-                tile_g.index * 0,
-                tile_g.index,
-                K_groups,
-            )
-            scale = _e4m3_byte_to_f32(weight_scale_bytes[weight_scale_offsets])
-            scale = scale * _e4m3_byte_to_f32(x_scale_bytes[x_scale_offsets])[None, :]
-            acc = acc + (contrib.to(torch.float32) * scale).sum(-1)
-        out[0, tile_m] = (acc * alpha_value).to(torch.bfloat16)
-    return out
-
-
 # Triton W4A16 uses the coalesced-load body with block_m=16 and block_g=128.
 # Triton W4A4 uses the autotuned pretuned config from nvfp4_gemv. The CuTe
 # backend remains a Helion DSL fallback for coverage rather than a hand-written
@@ -484,17 +431,6 @@ def _nvfp4_gemv_fp4in_cute_kernel() -> helion.Kernel[Tensor]:
         static_shapes=True,
         config=FP4IN_CUTE_CONFIG,
         backend="cute",
-    )
-
-
-@functools.cache
-def nvfp4_scaled_mm_gemv_kernel() -> helion.Kernel[Tensor]:
-    """Return the single Helion W4A4 GEMV kernel matching stable CUTLASS inputs."""
-    return helion.kernel(
-        _nvfp4_scaled_mm_gemv_body,
-        static_shapes=True,
-        config=FP4IN_TRITON_CONFIG,
-        backend="triton",
     )
 
 

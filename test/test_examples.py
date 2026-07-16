@@ -2000,29 +2000,6 @@ class TestExamples(RefEagerTestBase, TestCase):
         with self.assertRaisesRegex(ValueError, "K bytes must be divisible by 8"):
             mod.nvfp4_gemv_bf16in(bad_k_weight, x_bf16[:-2], weight_scale)
 
-        if _get_backend() == "triton":
-            scale_cols = K_bytes // 8
-            scale_cols_padded = ((scale_cols + 3) // 4) * 4
-            scaled_mm_out = torch.empty(
-                (1, M),
-                dtype=torch.bfloat16,
-                device=DEVICE,
-            )
-            mod.nvfp4_scaled_mm_gemv_kernel()(
-                scaled_mm_out,
-                x_packed.view(1, K_bytes),
-                weight,
-                x_scale.reshape(128, scale_cols_padded),
-                weight_scale.reshape(128, scale_cols_padded),
-                torch.ones(1, dtype=torch.float32, device=DEVICE),
-            )
-            torch.testing.assert_close(
-                scaled_mm_out[0],
-                fp4_expected,
-                atol=4.0,
-                rtol=2e-1,
-            )
-
     @xfailIfPallas("JAX tracer error")
     @skipIfRefEager("hl.jagged_tile does not support ref mode yet")
     def test_jagged_sum(self):
