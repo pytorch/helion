@@ -237,8 +237,8 @@ jobs:
             --repo_env=TORCH_SOURCE=$TORCH_SOURCE \
             --action_env=JAX_PLATFORMS=cpu
           uv pip install bazel-bin/ci/wheel/*.whl
-          # Ignore the torch_tpu wheel libtpu pin, and just use the most recent libtpu.
-          uv pip install --upgrade libtpu
+          # libtpu 0.0.44 is broken (segfaults in jax.profiler.start_trace).
+          uv pip install libtpu==0.0.43
           cd -
           rm -rf /tmp/torch_tpu
           # Verify
