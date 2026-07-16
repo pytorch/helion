@@ -47,16 +47,61 @@ def _force_register() -> None:
             return
 
 
-def _assert_close(a: object, b: object, tag: str) -> None:
-    """Compare a single (kernel, baseline) arg pair; no-op for non-tensors."""
-    if not isinstance(a, torch.Tensor) or not isinstance(b, torch.Tensor):
-        return
-    if a.dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
-        torch.testing.assert_close(a.float(), b.float(), rtol=0.1, atol=0.1, msg=tag)
-    elif a.dtype.is_floating_point:
-        torch.testing.assert_close(a, b, rtol=2e-2, atol=1e-3, msg=tag)
-    else:  # int (e.g. packed UE8M0 scales) must match exactly
-        torch.testing.assert_close(a, b, msg=tag)
+# fp8 dtypes (guard the ROCm-only variants that may be absent).
+_FP8_DTYPES = {torch.float8_e4m3fn, torch.float8_e5m2}
+for _n in ("float8_e4m3fnuz", "float8_e5m2fnuz"):
+    _d = getattr(torch, _n, None)
+    if _d is not None:
+        _FP8_DTYPES.add(_d)
+
+# Matches helion.autotuner.benchmark_provider._compute_effective_tolerances.
+_DEFAULT_TOL = 1e-2
+
+
+def _effective_tolerances(out_dtypes: set, settings: object) -> tuple[float, float]:
+    """The tolerances Helion's autotuner used to accept this kernel's config.
+
+    Mirror ``benchmark_provider._compute_effective_tolerances``: per-kernel
+    ``autotune_baseline_atol``/``rtol`` if set; all-fp8 outputs use a bitwise
+    check (0, 0); otherwise the 1e-2 default. Checking against the exact bar the
+    config was tuned under avoids false failures (e.g. per-group fp32 scales that
+    pass 1e-2 but not a tighter ad-hoc atol) while still catching real drift.
+    """
+    atol = getattr(settings, "autotune_baseline_atol", None)
+    rtol = getattr(settings, "autotune_baseline_rtol", None)
+    all_fp8 = bool(out_dtypes) and all(d in _FP8_DTYPES for d in out_dtypes)
+    if all_fp8 and atol is None and rtol is None:
+        return 0.0, 0.0
+    return (atol if atol is not None else _DEFAULT_TOL,
+            rtol if rtol is not None else _DEFAULT_TOL)
+
+
+def _is_mutated(pristine: object, after: object) -> bool:
+    """True if ``after`` (a post-call arg) was written vs its pristine copy."""
+    if not isinstance(after, torch.Tensor) or not isinstance(pristine, torch.Tensor):
+        return False
+    if pristine.shape != after.shape or pristine.dtype != after.dtype:
+        return True
+    try:
+        return not torch.equal(pristine, after)
+    except RuntimeError:  # some dtypes (fp8) don't support equal()
+        return not torch.equal(pristine.float(), after.float())
+
+
+def _assert_close(a: torch.Tensor, b: torch.Tensor, atol: float, rtol: float, tag: str) -> None:
+    """Compare one output pair; ints/bools must match exactly, fp8 via float."""
+    if a.dtype in (torch.bool,) or not a.dtype.is_floating_point:
+        torch.testing.assert_close(a, b, rtol=0, atol=0, msg=tag)  # exact
+    elif a.dtype in _FP8_DTYPES:
+        torch.testing.assert_close(a.float(), b.float(), rtol=rtol, atol=atol, msg=tag)
+    else:
+        torch.testing.assert_close(a, b, rtol=rtol, atol=atol, msg=tag)
+
+
+def _diff_str(a: torch.Tensor, b: torch.Tensor) -> str:
+    d = (a.float() - b.float()).abs()
+    denom = b.float().abs().clamp_min(1e-12)
+    return f"max_abs={d.max().item():.3g} max_rel={(d / denom).max().item():.3g} dtype={a.dtype}"
 
 
 def main() -> int:
@@ -102,6 +147,9 @@ def main() -> int:
             n_cases += 1
             tag = f"{name} {dict(key) if hasattr(key, 'keys') else key}"
 
+            # Pristine copy to detect which args are outputs (written in place).
+            pristine = copy.deepcopy(inputs)
+
             # Compile + run the kernel (committed config for this shape). A
             # codegen/compile failure surfaces here.
             k_args = copy.deepcopy(inputs)
@@ -129,12 +177,26 @@ def main() -> int:
                 skipped.append((name, f"baseline raised for {tag}"))
                 continue
 
-            try:
-                for a, b in zip(k_args, b_args):
-                    _assert_close(a, b, tag)
+            # Outputs = args the baseline mutated. Use the same tolerances Helion
+            # used to accept this config (from the output dtypes), then compare
+            # only those outputs (inputs are identical copies).
+            out_idxs = [i for i, (p, b) in enumerate(zip(pristine, b_args)) if _is_mutated(p, b)]
+            if not out_idxs:  # nothing detected mutated -> compare all tensor pairs
+                out_idxs = [i for i, b in enumerate(b_args) if isinstance(b, torch.Tensor)]
+            out_dtypes = {b_args[i].dtype for i in out_idxs}
+            atol, rtol = _effective_tolerances(out_dtypes, wrapper.helion_settings)
+
+            bad = None
+            for i in out_idxs:
+                try:
+                    _assert_close(k_args[i], b_args[i], atol, rtol, tag)
+                except AssertionError:
+                    bad = f"arg[{i}] {_diff_str(k_args[i], b_args[i])} (atol={atol} rtol={rtol})"
+                    break
+            if bad is None:
                 print(f"  OK    {tag}")
-            except AssertionError as e:
-                failures.append((name, f"correctness {tag}", str(e).strip().splitlines()[0]))
+            else:
+                failures.append((name, f"correctness {tag}", bad))
 
     print(f"\nChecked {n_cases} (kernel, shape) cases across {len(kernels)} kernels.")
     for name, why in skipped:
