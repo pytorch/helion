@@ -27,12 +27,6 @@ import torch
 import vllm  # noqa: F401  registers torch.ops._C.* (+ Helion kernels, in current vLLM)
 from vllm.kernels.helion import get_registered_kernels
 
-# Use Helion's OWN autotuner accuracy check so this gate applies the exact same
-# acceptance criterion the config was tuned under -- notably it compares fp8 by
-# viewing as uint8 (a 1-ULP fp8 diff is 1 in uint8 space, within rtol), where a
-# naive float compare would inflate it to a whole fp8 step and false-fail.
-from helion.autotuner.accuracy import assert_close as _helion_assert_close
-
 
 def _force_register() -> None:
     """Best-effort trigger of Helion op registration.
@@ -61,26 +55,44 @@ for _n in ("float8_e4m3fnuz", "float8_e5m2fnuz", "float8_e8m0fnu"):
     if _d is not None:
         _FP8_DTYPES.add(_d)
 
-# Matches helion.autotuner.benchmark_provider._compute_effective_tolerances.
+# fp8 quantization differs from the torch reference by up to 1 ULP at rounding
+# boundaries (input-dependent: fp32 intermediates round differently in Triton vs
+# torch). vLLM's own kernel tests allow this -- e.g.
+# tests/kernels/helion/test_per_token_group_fp8_quant.py compares fp8 outputs as
+# (a.view(uint8) - b.view(uint8)).abs().max() <= 1.
+_FP8_ULP_TOL = 1
+# Default float tolerance when a kernel doesn't override it (matches Helion's
+# autotuner DEFAULT_TOL). Real codegen bugs blow past this by orders of magnitude.
 _DEFAULT_TOL = 1e-2
 
 
-def _effective_tolerances(out_dtypes: set, settings: object) -> tuple[float, float]:
-    """The tolerances Helion's autotuner used to accept this kernel's config.
-
-    Mirror ``benchmark_provider._compute_effective_tolerances``: per-kernel
-    ``autotune_baseline_atol``/``rtol`` if set; all-fp8 outputs use a bitwise
-    check (0, 0); otherwise the 1e-2 default. Checking against the exact bar the
-    config was tuned under avoids false failures (e.g. per-group fp32 scales that
-    pass 1e-2 but not a tighter ad-hoc atol) while still catching real drift.
-    """
+def _float_tolerances(settings: object) -> tuple[float, float]:
+    """Per-kernel autotune_baseline_atol/rtol if set, else the 1e-2 default."""
     atol = getattr(settings, "autotune_baseline_atol", None)
     rtol = getattr(settings, "autotune_baseline_rtol", None)
-    all_fp8 = bool(out_dtypes) and all(d in _FP8_DTYPES for d in out_dtypes)
-    if all_fp8 and atol is None and rtol is None:
-        return 0.0, 0.0
     return (atol if atol is not None else _DEFAULT_TOL,
             rtol if rtol is not None else _DEFAULT_TOL)
+
+
+def _compare(a: torch.Tensor, b: torch.Tensor, atol: float, rtol: float) -> str | None:
+    """Compare one output pair. Return None if within tolerance, else a diff str.
+
+    fp8 -> uint8-ULP <= 1 (like vLLM's tests); int/bool -> exact; float ->
+    assert_close with the kernel's tolerances.
+    """
+    if a.dtype in _FP8_DTYPES:
+        au = a.contiguous().view(torch.uint8).to(torch.int16)
+        bu = b.contiguous().view(torch.uint8).to(torch.int16)
+        d = (au - bu).abs().max().item()
+        return None if d <= _FP8_ULP_TOL else f"fp8 max_uint8_ulp={d} > {_FP8_ULP_TOL}"
+    if a.dtype == torch.bool or not a.dtype.is_floating_point:
+        d = (a.to(torch.int64) - b.to(torch.int64)).abs().max().item()
+        return None if d == 0 else f"int max_abs={d} (exact required)"
+    try:
+        torch.testing.assert_close(a, b, atol=atol, rtol=rtol)
+        return None
+    except AssertionError:
+        return f"{_diff_str(a, b)} (atol={atol} rtol={rtol})"
 
 
 def _is_mutated(pristine: object, after: object) -> bool:
@@ -98,7 +110,7 @@ def _is_mutated(pristine: object, after: object) -> bool:
 def _diff_str(a: torch.Tensor, b: torch.Tensor) -> str:
     """Human-readable diff, fp8 measured in uint8-ULP like Helion's check."""
     if a.dtype in _FP8_DTYPES:
-        d = (a.view(torch.uint8).int() - b.view(torch.uint8).int()).abs()
+        d = (a.contiguous().view(torch.uint8).int() - b.contiguous().view(torch.uint8).int()).abs()
         return f"max_uint8_ulp={d.max().item()} (fp8 {a.dtype})"
     d = (a.float() - b.float()).abs()
     denom = b.float().abs().clamp_min(1e-12)
@@ -178,21 +190,18 @@ def main() -> int:
                 skipped.append((name, f"baseline raised for {tag}"))
                 continue
 
-            # Outputs = args the baseline mutated. Use the same tolerances Helion
-            # used to accept this config (from the output dtypes), then compare
-            # only those outputs (inputs are identical copies).
+            # Outputs = args the baseline mutated; compare only those (inputs are
+            # identical copies). fp8 allows 1 ULP, floats use the kernel's tol.
             out_idxs = [i for i, (p, b) in enumerate(zip(pristine, b_args)) if _is_mutated(p, b)]
             if not out_idxs:  # nothing detected mutated -> compare all tensor pairs
                 out_idxs = [i for i, b in enumerate(b_args) if isinstance(b, torch.Tensor)]
-            out_dtypes = {b_args[i].dtype for i in out_idxs}
-            atol, rtol = _effective_tolerances(out_dtypes, wrapper.helion_settings)
+            atol, rtol = _float_tolerances(wrapper.helion_settings)
 
             bad = None
             for i in out_idxs:
-                try:
-                    _helion_assert_close(k_args[i], b_args[i], atol=atol, rtol=rtol)
-                except AssertionError:
-                    bad = f"arg[{i}] {_diff_str(k_args[i], b_args[i])} (atol={atol} rtol={rtol})"
+                msg = _compare(k_args[i], b_args[i], atol, rtol)
+                if msg is not None:
+                    bad = f"arg[{i}] {msg}"
                     break
             if bad is None:
                 print(f"  OK    {tag}")
