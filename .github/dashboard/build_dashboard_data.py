@@ -22,17 +22,17 @@ import zipfile
 
 RETENTION_DAYS = 365
 
-# CI alias (platform_short before any backend suffix) -> name of the
-# benchmark_dispatch input whose `default` lists the kernels that platform
-# is expected to run on the nightly cron. Stable mapping; the kernel list
-# itself is parsed from the workflow YAML so dashboard expectations track
-# whatever's currently in the workflow defaults without manual edits.
+# CI alias (platform_short before any backend suffix) -> name(s) of the
+# benchmark_dispatch input(s) whose `default` lists the kernels that platform
+# is expected to run on the nightly cron. Stable mapping; the kernel list(s)
+# are parsed from the workflow YAML so dashboard expectations track whatever's
+# currently in the workflow defaults without manual edits.
 _PLATFORM_KERNELS_INPUT = {
-    "h100": "kernels",
-    "b200": "kernels",
-    "b200_cute": "kernels_cute",
-    "mi350x": "kernels",
-    "tpu": "kernels_tpu",
+    "h100": ("kernels", "kernels_linattn"),
+    "b200": ("kernels", "kernels_linattn"),
+    "b200_cute": ("kernels_cute",),
+    "mi350x": ("kernels",),
+    "tpu": ("kernels_tpu",),
 }
 
 
@@ -80,9 +80,11 @@ def get_expected_kernels_per_platform(workflow_path):
             }
             current = None
     return {
-        plat: input_defaults[input_name]
-        for plat, input_name in _PLATFORM_KERNELS_INPUT.items()
-        if input_name in input_defaults
+        plat: set().union(
+            *(input_defaults[input_name] for input_name in input_names)
+        )
+        for plat, input_names in _PLATFORM_KERNELS_INPUT.items()
+        if all(input_name in input_defaults for input_name in input_names)
     }
 
 
@@ -215,6 +217,7 @@ def parse_run(run_dir, active_platforms=None):
             platform = f"{platform} ({backend_label})"
         if platform == platform_short and platform in ("b200", "h100", "mi325x", "mi350x"):
             continue
+        baseline_label = extra_info.get("baseline_label")
 
         # Group records by model name (a single file may contain multiple kernels)
         by_model = {}
@@ -235,6 +238,7 @@ def parse_run(run_dir, active_platforms=None):
                 "platform_short": platform_short,
                 "shapes": model_data["shapes"],
                 "metrics": model_data["metrics"],
+                "baseline_label": baseline_label,
             })
     return kernels
 
@@ -322,6 +326,7 @@ def build_dashboard_data(cache_dir, runs_meta, existing_data=None, active_platfo
                     "platform_short": k["platform_short"],
                     "shapes": k["shapes"],
                     "history": [],
+                    "baseline_label": k["baseline_label"],
                 }
             kernel_index[key]["history"].append(build_history_entry(run, k["metrics"], k["shapes"]))
 
@@ -340,6 +345,7 @@ def build_dashboard_data(cache_dir, runs_meta, existing_data=None, active_platfo
                     "platform_short": prev.get("platform_short", key.split("|")[1] if "|" in key else ""),
                     "shapes": [],
                     "history": [],
+                    "baseline_label": prev.get("baseline_label"),
                 }
             kernel_index[key]["history"].append(cached_runs[run["run_id"]])
 
@@ -427,6 +433,7 @@ def build_dashboard_data(cache_dir, runs_meta, existing_data=None, active_platfo
             "kernel": entry["kernel"],
             "platform": entry["platform"],
             "platform_short": entry["platform_short"],
+            "baseline_label": entry["baseline_label"],
             "has_nightly_data": latest_data is not None,
             "status": status,
             "accuracy_failures": acc_failures,
@@ -446,6 +453,7 @@ def build_dashboard_data(cache_dir, runs_meta, existing_data=None, active_platfo
 
     # Stats and platform/kernel lists reflect only entries with nightly data
     nightly_summary = [s for s in summary if s["has_nightly_data"]]
+    default_baseline_summary = [s for s in nightly_summary if not s.get("baseline_label")]
     platforms = sorted({s["platform"] for s in nightly_summary})
     platform_shorts = sorted({s["platform_short"] for s in nightly_summary})
     unique_kernels = sorted({s["kernel"] for s in nightly_summary})
@@ -476,10 +484,10 @@ def build_dashboard_data(cache_dir, runs_meta, existing_data=None, active_platfo
             "accuracy_failures": sum(len(s["accuracy_failures"]) for s in nightly_summary),
             "run_failures": sum(len(s["run_failures"]) for s in nightly_summary),
             "infra_missing": sum(1 for s in nightly_summary if s["infra_missing"]),
-            "helion_geomean": round(geo_mean([s["helion_speedup_geomean"] for s in nightly_summary]), 4),
-            "triton_geomean": round(geo_mean([s["triton_speedup_geomean"] for s in nightly_summary]), 4),
-            "torch_compile_geomean": round(geo_mean([s["torch_compile_speedup_geomean"] for s in nightly_summary]), 4),
-            "helion_wins": sum(1 for s in nightly_summary if s["helion_speedup_geomean"] > max(s["triton_speedup_geomean"], s["torch_compile_speedup_geomean"])),
+            "helion_geomean": round(geo_mean([s["helion_speedup_geomean"] for s in default_baseline_summary]), 4),
+            "triton_geomean": round(geo_mean([s["triton_speedup_geomean"] for s in default_baseline_summary]), 4),
+            "torch_compile_geomean": round(geo_mean([s["torch_compile_speedup_geomean"] for s in default_baseline_summary]), 4),
+            "helion_wins": sum(1 for s in default_baseline_summary if s["helion_speedup_geomean"] > max(s["triton_speedup_geomean"], s["torch_compile_speedup_geomean"])),
         },
         "summary": summary,
     }

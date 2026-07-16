@@ -28,6 +28,8 @@ jobs:
                 run_b200_cute: 'true',
                 run_mi350x: 'true',
                 run_tpu: 'true',
+                run_b200_linattn: 'true',
+                run_h100_linattn: 'true',
                 // Keep autotune sampling deterministic across nightly comparisons.
                 env_vars: 'HELION_AUTOTUNE_RANDOM_SEED=123456'
               }
