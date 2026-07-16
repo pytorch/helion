@@ -712,6 +712,7 @@ def chunk_bwd_dqkg_scalar_helion(
     dh: torch.Tensor,
     g_last: torch.Tensor | None = None,
     diag_anchored: hl.constexpr = False,  # pyrefly: ignore[bad-function-definition]
+    compute_dg: hl.constexpr = True,  # pyrefly: ignore[bad-function-definition]
     scale: float = 1.0,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Compute dQ, dK, and the per-position dg_raw. The DV loop accumulates, shared:
@@ -728,8 +729,10 @@ def chunk_bwd_dqkg_scalar_helion(
             dq = scale * exp2(gc) * (dA @ (exp2(-gc) * k) + dq_cross)
             dk = scale * exp2(-gc) * (dA^T @ (exp2(gc) * q)) + dk_state
         dg_raw = q * dq - k * dk
-    The state-carry gate gradient is folded into dg_raw's last position, then a
+    The state-carry decay gradient is folded into dg_raw's last position, then a
     reverse cumsum over the chunk finishes dg in-kernel (scalar callers sum over D).
+    compute_dg=False skips the dg work entirely (dg_by_d is left unwritten) for
+    variants whose decay needs no gradient, e.g. retention's constant decay.
     """
     BHN = q.size(0)
     C = hl.specialize(q.size(1))
@@ -759,7 +762,8 @@ def chunk_bwd_dqkg_scalar_helion(
             dk_state_acc = hl.dot(
                 vt, dht.transpose(-2, -1).to(vt.dtype), acc=dk_state_acc
             )
-            dh_h_acc += (ht.float() * dht.float()).sum(dim=-1)
+            if compute_dg:
+                dh_h_acc += (ht.float() * dht.float()).sum(dim=-1)
 
         idx = hl.arange(C)
         causal = (idx[:, None] >= idx[None, :]).float()
@@ -793,14 +797,15 @@ def chunk_bwd_dqkg_scalar_helion(
             dq_acc = hl.dot(dA.to(kt.dtype), kt, acc=dq_cross_acc * exp_gc) * scale
             dk_acc = hl.dot(dA.transpose(-2, -1).to(qt.dtype), qt) * scale + dk_state
 
-        dg_raw = dq_acc * qt.float() - dk_acc * kt.float()
         dq_out[tile_bhn, :, tile_d] = dq_acc.to(dq_out.dtype)
         dk_out[tile_bhn, :, tile_d] = dk_acc.to(dk_out.dtype)
 
-        dg_last = exp_gl * dh_h_acc + (dk_state * kt.float()).sum(dim=1)
-        is_last = (idx == C - 1).float()
-        dg = dg_raw + is_last[None, :, None] * dg_last[:, None, :]
-        dg_by_d[tile_bhn, :, tile_d] = hl.cumsum(dg, dim=1, reverse=True)
+        if compute_dg:
+            dg_raw = dq_acc * qt.float() - dk_acc * kt.float()
+            dg_last = exp_gl * dh_h_acc + (dk_state * kt.float()).sum(dim=1)
+            is_last = (idx == C - 1).float()
+            dg = dg_raw + is_last[None, :, None] * dg_last[:, None, :]
+            dg_by_d[tile_bhn, :, tile_d] = hl.cumsum(dg, dim=1, reverse=True)
 
     return dq_out, dk_out, dg_by_d
 
@@ -1202,6 +1207,7 @@ class ChunkedLinearAttnFn(torch.autograd.Function):
                 C,
                 h_all=h_all,
                 scale=ctx.scale,
+                needs_dg=ctx.needs_input_grad[3],
             )
             return dq, dk, dv, dg, None, None, None, None, None, None
 
@@ -1463,6 +1469,7 @@ def _helion_chunked_bwd(
     C: int,
     h_all: torch.Tensor | None = None,
     scale: float = 1.0,
+    needs_dg: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
     B, H, T, D = q.shape
     DV = v.shape[-1]
@@ -1552,7 +1559,8 @@ def _helion_chunked_bwd(
         hb = h_all.reshape(BHN, D, DV)
 
         dq_raw, dk_raw, dg_by_d = chunk_bwd_dqkg_scalar_helion(
-            qb, kb, vb, g_csf2, hb, dob, dhf2, g_last=g_lastf2, scale=scale
+            qb, kb, vb, g_csf2, hb, dob, dhf2, g_last=g_lastf2,
+            compute_dg=needs_dg, scale=scale,
         )
 
         dv_raw = chunk_bwd_dv_helion(
@@ -1567,7 +1575,7 @@ def _helion_chunked_bwd(
             scale=scale,
         )
 
-        dg = dg_by_d.sum(-1).reshape(B, H, T).to(g.dtype)
+        dg = dg_by_d.sum(-1).reshape(B, H, T).to(g.dtype) if needs_dg else None
 
         return (
             dq_raw.reshape(B, H, T, D),
