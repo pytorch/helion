@@ -12,6 +12,7 @@ import helion_rag.lookup as lookup_mod
 import pytest
 
 from ._fixtures import DTYPES
+from ._fixtures import FAMILY
 from ._fixtures import SHAPES
 from ._fixtures import SRC
 
@@ -30,6 +31,7 @@ def _cfg(tmp_path: Path) -> Config:
         data_dir=tmp_path / "data",
         index_dir=tmp_path / "index",
         writeback_dir=tmp_path / "writeback",
+        hardware_family=FAMILY,
     )
 
 
@@ -60,12 +62,12 @@ def test_lookup_tier1_over_real_index(_index_deps, tmp_path) -> None:
     cfg = _cfg(tmp_path)
     _build_index(
         cfg,
-        "h100",
+        FAMILY,
         [_record(SHAPES, DTYPES, run_id="R", config={"block_sizes": [16]})],
     )
     # Query a different shape so Tier-0 misses and Tier-1 similarity runs.
     res = lookup_mod.lookup(
-        SRC, "[(1024, 1024), (1024, 1024)]", DTYPES, "h100", cfg=cfg
+        SRC, "[(1024, 1024), (1024, 1024)]", DTYPES, "unknown", cfg=cfg
     )
 
     assert res["tier"] == 1

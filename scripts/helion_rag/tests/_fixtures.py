@@ -18,6 +18,8 @@ SRC = f"import helion\nimport helion.language as hl\n\n\n{_kernel_src}"
 
 SHAPES = "[(16, 16), (16, 16)]"
 DTYPES = "['torch.float16', 'torch.float16']"
+FAMILY = "test-family"
+OTHER_FAMILY = "other-family"
 
 SRC_PLAIN = SRC
 

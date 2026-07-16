@@ -7,9 +7,11 @@ from pathlib import Path
 import helion_rag.index as index_mod
 import pytest
 
+from ._fixtures import FAMILY
+
 
 def test_generation_lock_rejects_concurrent_builder(tmp_path: Path) -> None:
-    family_dir = tmp_path / "h100"
+    family_dir = tmp_path / FAMILY
 
     with index_mod._generation_lock(family_dir):
         with pytest.raises(RuntimeError, match="already in progress"):
@@ -18,7 +20,7 @@ def test_generation_lock_rejects_concurrent_builder(tmp_path: Path) -> None:
 
 
 def test_recover_orphaned_generation_and_temp_dir(tmp_path: Path) -> None:
-    family_dir = tmp_path / "h100"
+    family_dir = tmp_path / FAMILY
     generations = family_dir / "generations"
     (generations / "000000").mkdir(parents=True)
     (generations / "000001").mkdir()
