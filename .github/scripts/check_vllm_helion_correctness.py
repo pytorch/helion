@@ -27,6 +27,12 @@ import torch
 import vllm  # noqa: F401  registers torch.ops._C.* (+ Helion kernels, in current vLLM)
 from vllm.kernels.helion import get_registered_kernels
 
+# Use Helion's OWN autotuner accuracy check so this gate applies the exact same
+# acceptance criterion the config was tuned under -- notably it compares fp8 by
+# viewing as uint8 (a 1-ULP fp8 diff is 1 in uint8 space, within rtol), where a
+# naive float compare would inflate it to a whole fp8 step and false-fail.
+from helion.autotuner.accuracy import assert_close as _helion_assert_close
+
 
 def _force_register() -> None:
     """Best-effort trigger of Helion op registration.
@@ -47,9 +53,10 @@ def _force_register() -> None:
             return
 
 
-# fp8 dtypes (guard the ROCm-only variants that may be absent).
+# fp8 dtypes; mirror helion.autotuner.accuracy._FP8_DTYPES (guard variants that
+# may be absent on older torch).
 _FP8_DTYPES = {torch.float8_e4m3fn, torch.float8_e5m2}
-for _n in ("float8_e4m3fnuz", "float8_e5m2fnuz"):
+for _n in ("float8_e4m3fnuz", "float8_e5m2fnuz", "float8_e8m0fnu"):
     _d = getattr(torch, _n, None)
     if _d is not None:
         _FP8_DTYPES.add(_d)
@@ -88,17 +95,11 @@ def _is_mutated(pristine: object, after: object) -> bool:
         return not torch.equal(pristine.float(), after.float())
 
 
-def _assert_close(a: torch.Tensor, b: torch.Tensor, atol: float, rtol: float, tag: str) -> None:
-    """Compare one output pair; ints/bools must match exactly, fp8 via float."""
-    if a.dtype in (torch.bool,) or not a.dtype.is_floating_point:
-        torch.testing.assert_close(a, b, rtol=0, atol=0, msg=tag)  # exact
-    elif a.dtype in _FP8_DTYPES:
-        torch.testing.assert_close(a.float(), b.float(), rtol=rtol, atol=atol, msg=tag)
-    else:
-        torch.testing.assert_close(a, b, rtol=rtol, atol=atol, msg=tag)
-
-
 def _diff_str(a: torch.Tensor, b: torch.Tensor) -> str:
+    """Human-readable diff, fp8 measured in uint8-ULP like Helion's check."""
+    if a.dtype in _FP8_DTYPES:
+        d = (a.view(torch.uint8).int() - b.view(torch.uint8).int()).abs()
+        return f"max_uint8_ulp={d.max().item()} (fp8 {a.dtype})"
     d = (a.float() - b.float()).abs()
     denom = b.float().abs().clamp_min(1e-12)
     return f"max_abs={d.max().item():.3g} max_rel={(d / denom).max().item():.3g} dtype={a.dtype}"
@@ -189,7 +190,7 @@ def main() -> int:
             bad = None
             for i in out_idxs:
                 try:
-                    _assert_close(k_args[i], b_args[i], atol, rtol, tag)
+                    _helion_assert_close(k_args[i], b_args[i], atol=atol, rtol=rtol)
                 except AssertionError:
                     bad = f"arg[{i}] {_diff_str(k_args[i], b_args[i])} (atol={atol} rtol={rtol})"
                     break
