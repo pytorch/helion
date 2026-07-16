@@ -73,41 +73,38 @@ jobs:
       - name: Create virtual environment
         run: uv venv --python 3.12
 
-      - name: Install PyTorch
-        # Only for the nightly channel: vLLM nightly needs the matching torch
-        # 2.11 cu130. The stable channel lets its pinned vLLM wheel resolve its
-        # own torch (installed with vLLM below).
-        if: ${{ matrix.vllm.channel == 'nightly' }}
-        run: |
-          source .venv/bin/activate
-          # On OSDC route through the pypi-cache /whl proxy; off OSDC hit download.pytorch.org.
-          PYTORCH_INDEX="${PYPI_CACHE_WHL_URL:-https://download.pytorch.org/whl/cpu}"
-          UV_DEFAULT_INDEX= UV_INDEX= uv pip install -U "torch==2.11.*" --index-url "${PYTORCH_INDEX%/whl/*}/whl/cu130"
-
-      - name: Install Helion (this PR)
-        run: |
-          source .venv/bin/activate
-          uv pip install setuptools ninja
-          SETUPTOOLS_SCM_PRETEND_VERSION="0.0.0" uv pip install -e .'[dev]'
-          python -c "import helion; print('helion', helion.__name__)"
-
       - name: Install vLLM (required)
-        # vLLM registers the Helion kernels + ships their per-hardware configs;
-        # this check runs those kernels against the PR's Helion. Required (not
-        # continue-on-error): the check cannot run without vLLM.
+        # Install vLLM FIRST so it brings its own pinned, self-consistent torch;
+        # Helion is then installed against that torch (below). vLLM registers the
+        # Helion kernels + ships their per-hardware configs, and this check runs
+        # those kernels against the PR's Helion -- so vLLM is required (not
+        # continue-on-error): the check cannot run without it.
         run: |
           source .venv/bin/activate
           # unsafe-best-match: vLLM pins exact dep versions that live on PyPI,
           # not the vLLM/pytorch nightly indexes; let uv resolve from any.
           if [ "${{ matrix.vllm.channel }}" = "nightly" ]; then
+            # Add the pytorch cu130 nightly index so the resolver picks the
+            # CUDA build of torch that matches the container / GPU (incl. B200).
             uv pip install -U vllm --pre \
               --index-strategy unsafe-best-match \
-              --extra-index-url https://wheels.vllm.ai/nightly
+              --extra-index-url https://wheels.vllm.ai/nightly \
+              --extra-index-url https://download.pytorch.org/whl/nightly/cu130
           else
             # Stable release from PyPI; let it resolve (and pin) its own torch.
             uv pip install --index-strategy unsafe-best-match "vllm==${{ matrix.vllm.version }}"
           fi
           python -c "import vllm, torch; print('vllm', vllm.__version__, '| torch', torch.__version__)"
+
+      - name: Install Helion (this PR)
+        # Installed after vLLM so it builds against the torch vLLM pinned. The
+        # guard below fails loudly if Helion's extras silently moved torch.
+        run: |
+          source .venv/bin/activate
+          uv pip install setuptools ninja
+          SETUPTOOLS_SCM_PRETEND_VERSION="0.0.0" uv pip install -e .'[dev]'
+          # Guard: Helion's install must not have changed the torch vLLM pinned.
+          python -c "import helion, torch, vllm; print('helion ok | torch', torch.__version__, '| vllm', vllm.__version__)"
 
       - name: CUDA compute check
         run: |
