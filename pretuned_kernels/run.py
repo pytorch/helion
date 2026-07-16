@@ -47,6 +47,7 @@ KERNELS = [
     "silu_mul_fp8",
     "dynamic_per_token_scaled_fp8_quant",
     "per_token_group_fp8_quant",
+    "per_token_group_fp8_quant_packed",
     "rms_norm_dynamic_per_token_quant",
     "rms_norm_per_block_quant",
     "silu_and_mul_per_block_quant",
