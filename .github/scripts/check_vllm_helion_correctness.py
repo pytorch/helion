@@ -116,9 +116,9 @@ def _compare(a: torch.Tensor, b: torch.Tensor, atol: float, rtol: float) -> str 
     int/bool -> exact; float -> assert_close with the kernel's tolerances.
     """
     if a.dtype in _FP8_DTYPES:
-        au = a.contiguous().view(torch.uint8).to(torch.int16)
-        bu = b.contiguous().view(torch.uint8).to(torch.int16)
-        d = (au - bu).abs()
+        a_u8 = a.contiguous().view(torch.uint8).to(torch.int16)
+        b_u8 = b.contiguous().view(torch.uint8).to(torch.int16)
+        d = (a_u8 - b_u8).abs()
         n = d.numel()
         n_bad = int((d > _FP8_ULP_TOL).sum().item())
         frac = n_bad / n if n else 0.0
