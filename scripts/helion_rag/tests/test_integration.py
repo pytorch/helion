@@ -88,7 +88,7 @@ def _build_index(cfg: Config, family: str, records: list[dict]) -> None:
 
 
 def _write_corrupt_generation(cfg: Config, family: str) -> None:
-    """Present index bundle whose exact.json is unparseable JSON."""
+    """Present index bundle whose exact.json is unparsable JSON."""
     gen = cfg.index_dir / family / "generations" / "000000"
     gen.mkdir(parents=True)
     (gen / "exact.json").write_text("{ this is not json", encoding="utf-8")
