@@ -1332,7 +1332,7 @@ def _maybe_emit_compact_worklist_builder(codegen: GenerateAST, config: Config) -
     source, offset_params = render_build_worklist(
         plan,
         block_expr=str(env.compact_worklist_block),
-        upper_expr=str(env.compact_worklist_upper),
+        upper_expr=plan.upper_bound_expr,
     )
     env.compact_worklist_offset_params = offset_params
     codegen.module_statements.append(statement_from_string(source))

@@ -2461,7 +2461,9 @@ class BlockSizeTileStrategy(TileStrategy):
             # Compact worklist: the owner hl.grid becomes the work-item grid.
             from .program_id import WorklistProgramIDs
 
-            return WorklistProgramIDs(upper_expr=str(env.compact_worklist_upper))
+            return WorklistProgramIDs(
+                upper_expr=env.compact_worklist_plan.upper_bound_expr
+            )
         backend_name = env.backend.name
         pid_type = self.fn.config.pid_type
         if pid_type == "xyz":

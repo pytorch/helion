@@ -66,6 +66,8 @@ def tile(
     end_or_none: int | torch.Tensor | None = None,
     /,
     block_size: object = None,
+    *,
+    max_extent: int | Sequence[int] | None = None,
 ) -> Iterator[Tile]: ...
 
 
@@ -78,6 +80,8 @@ def tile(
     end_or_none: Sequence[int | torch.Tensor] | None = None,
     /,
     block_size: object = None,
+    *,
+    max_extent: int | Sequence[int] | None = None,
 ) -> Iterator[Sequence[Tile]]: ...
 
 
@@ -89,6 +93,8 @@ def tile(
     end_or_none: int | torch.Tensor | Sequence[int | torch.Tensor] | None = None,
     /,
     block_size: object = None,
+    *,
+    max_extent: int | Sequence[int] | None = None,
 ) -> Iterator[Tile] | Iterator[Sequence[Tile]]:
     """
     Break up an iteration space defined by a size or sequence of sizes into tiles.
@@ -114,6 +120,15 @@ def tile(
                       Otherwise, the end of iteration space.
         end_or_none: If 2+ positional args provided, the end of iteration space.
         block_size: Fixed block size (overrides autotuning) or None for autotuned size
+        max_extent: Hard upper bound on the iteration-space extent. A dynamic integer
+                    is specialized automatically, so changing the bound may compile a
+                    new kernel. For multidimensional tiles, provide one bound per
+                    dimension. The caller must ensure runtime extents do not exceed it.
+                    This bounds generated loop state; it does not make JAX array shapes
+                    polymorphic. Reusing one JAX executable across logical lengths
+                    requires caller-managed fixed-capacity arrays and runtime offsets.
+                    When calling ``Kernel.jax_fn`` through ``jax.jit``, the bound's
+                    position must be listed in ``static_argnums``.
 
     Returns:
         Iterator[Tile] or Iterator[Sequence[Tile]]: Iterator over tile objects
@@ -242,6 +257,34 @@ def _check_matching(a: object, b: object) -> None:
         )
 
 
+def _specialize_one_max_extent(value: object) -> int:
+    """Normalize one tile extent bound to a compile-time integer."""
+    from .constexpr import _specialize_proxy
+
+    try:
+        specialized = _specialize_proxy(value)
+    except exc.SpecializeArgType:
+        specialized = value
+    if type(specialized) is not int:
+        raise exc.TypeInferenceError(
+            "hl.tile() max_extent must be a compile-time integer or a sequence of "
+            f"integers, got {type(value).__name__}"
+        )
+    if specialized < 0:
+        raise exc.TypeInferenceError(
+            f"hl.tile() max_extent must be non-negative, got {specialized}"
+        )
+    return specialized
+
+
+def _specialize_max_extent(value: object) -> int | list[int] | tuple[int, ...]:
+    """Normalize a tile extent bound to compile-time integer values."""
+    if isinstance(value, (list, tuple)):
+        bounds = [_specialize_one_max_extent(item) for item in value]
+        return type(value)(bounds)
+    return _specialize_one_max_extent(value)
+
+
 def _allow_static_range(begin: object, end: object, step: object) -> bool:
     """
     Only enable tl.stagic_range when:
@@ -296,6 +339,7 @@ def _(
     /,
     block_size: TypeInfo | None = None,
     *,
+    max_extent: TypeInfo | None = None,
     origin: Origin,
 ) -> TypeInfo:
     parent = ExtendedAST.current()[-2]
@@ -310,6 +354,11 @@ def _(
         _check_matching(proxy_end, proxy_block_size)
     else:
         proxy_block_size = begin.tree_map(lambda n: None)
+    if _not_none(max_extent):
+        proxy_max_extent = _specialize_max_extent(_to_proxy(max_extent))
+        _check_matching(proxy_end, proxy_max_extent)
+    else:
+        proxy_max_extent = begin.tree_map(lambda n: None)
 
     if unpack := not isinstance(proxy_end, (list, tuple)):
         begin_list: list[int | torch.SymInt | torch.Tensor] = [
@@ -321,12 +370,14 @@ def _(
         block_size_list: list[int | torch.SymInt | torch.Tensor | None] = [
             cast("int | torch.SymInt | torch.Tensor | None", proxy_block_size)
         ]
+        max_extent_list: list[int | None] = [cast("int | None", proxy_max_extent)]
     else:
         begin_list = cast("list[int | torch.SymInt | torch.Tensor]", proxy_begin)
         end_list = cast("list[int | torch.SymInt | torch.Tensor]", proxy_end)
         block_size_list = cast(
             "list[int | torch.SymInt | torch.Tensor | None]", proxy_block_size
         )
+        max_extent_list = list(cast("list[int] | tuple[int, ...]", proxy_max_extent))
     block_size_list = Tile._tiles_to_sizes(block_size_list)
 
     # pyrefly: ignore [unbound-name]
@@ -338,10 +389,11 @@ def _(
     results = []
     has_data_dependent_bounds = False
     has_symbolic_bounds = False
-    for begin_part, end_part, bs in zip(
+    for begin_part, end_part, bs, extent_bound in zip(
         begin_list,
         end_list,
         block_size_list,
+        max_extent_list,
         strict=True,
     ):
         if isinstance(begin_part, Tile) or isinstance(end_part, Tile):
@@ -349,22 +401,38 @@ def _(
         size = end_part - begin_part  # type: ignore[operator]
         if isinstance(size, int) and size < 0:
             raise exc.InvalidTileRange(begin_part, end_part)
+        if isinstance(size, int) and extent_bound is not None and size > extent_bound:
+            raise exc.TypeInferenceError(
+                f"hl.tile() range extent {size} exceeds max_extent {extent_bound}"
+            )
         if isinstance(size, torch.Tensor):
             size = None  # data dependent size
             has_data_dependent_bounds = True
         if isinstance(begin_part, torch.SymInt) or isinstance(end_part, torch.SymInt):
             has_symbolic_bounds = True
         if bs is None:
-            results.append(TileIndexType.allocate(size, origin))
+            results.append(
+                TileIndexType.allocate(size, origin, extent_bound=extent_bound)
+            )
         elif isinstance(bs, int):
-            results.append(TileIndexType.allocate(size, origin, bs))
+            results.append(
+                TileIndexType.allocate(size, origin, bs, extent_bound=extent_bound)
+            )
         elif isinstance(bs, torch.SymInt):
             env = CompileEnvironment.current()
             index = env.get_block_id(bs)
             if index is None:
-                results.append(TileIndexType.allocate(size, origin, bs))
+                results.append(
+                    TileIndexType.allocate(size, origin, bs, extent_bound=extent_bound)
+                )
             else:
-                results.append(TileIndexType(origin=origin, block_id=index))
+                results.append(
+                    TileIndexType(
+                        origin=origin,
+                        block_id=index,
+                        extent_bound=extent_bound,
+                    )
+                )
                 env.block_sizes[index].mark_alternate_size(size)
 
     _add_config_choices(
@@ -535,6 +603,7 @@ def _(
     begin_or_end: int | torch.Tensor | list[int | torch.Tensor],
     end_or_none: int | torch.Tensor | list[int | torch.Tensor] | None = None,
     block_size: int | torch.Tensor | list[int | torch.Tensor] | None = None,
+    max_extent: int | Sequence[int] | None = None,
 ) -> Iterator[RefTile | tuple[RefTile, ...]]:
     begin, end = _normalize_begin_end_ref(begin_or_end, end_or_none)
     scalar_input = not isinstance(begin, list) and not isinstance(end, list)

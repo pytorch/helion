@@ -1069,13 +1069,17 @@ def _detect_outer_block_bound(
 
 class TileIndexType(TypeInfo):
     block_id: int
+    extent_bound: int | None
 
     def __str__(self) -> str:
         return f"{type(self).__name__}({self.block_id})"
 
-    def __init__(self, origin: Origin, block_id: int) -> None:
+    def __init__(
+        self, origin: Origin, block_id: int, extent_bound: int | None = None
+    ) -> None:
         super().__init__(origin)
         self.block_id = block_id
+        self.extent_bound = extent_bound
 
     def proxy(self) -> object:
         with proxy_tensor.disable_proxy_modes_tracing():
@@ -1094,6 +1098,7 @@ class TileIndexType(TypeInfo):
         numel: int | torch.SymInt | AutoSize | None,
         origin: Origin,
         block_size: int | torch.SymInt | None = None,
+        extent_bound: int | None = None,
     ) -> TileIndexType:
         env = CompileEnvironment.current()
         if block_size is None:
@@ -1132,14 +1137,19 @@ class TileIndexType(TypeInfo):
                 numel,
                 source=FixedBlockSizeSource(block_size),
             )
-        return TileIndexType(origin, block_id)
+        return TileIndexType(origin, block_id, extent_bound)
 
     def merge(self, other: TypeInfo, var_name: str | None = None) -> TypeInfo:
         if isinstance(other, TileIndexType):
-            if self.block_id == other.block_id:
+            if (
+                self.block_id == other.block_id
+                and self.extent_bound == other.extent_bound
+            ):
                 return self
             raise exc.TypeInferenceError(
-                f"TileIndexType mismatch in control flow: {self.block_id} and {other.block_id}"
+                f"TileIndexType mismatch in control flow: "
+                f"{self.block_id}/{self.extent_bound} and "
+                f"{other.block_id}/{other.extent_bound}"
             )
         return super().merge(other, var_name=var_name)
 

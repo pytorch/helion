@@ -25,6 +25,7 @@ from .._compat import get_num_xcd as get_num_xcd
 from .._compiler.cute.strategies import tcgen05_default_epilogue_tile_expr
 from .._compiler.cute.strategies import tcgen05_explicit_d_store_tile_expr
 from .._compiler.cute.strategies import tcgen05_smem_layout_expr
+from .._utils import cdiv
 from .._utils import triton_is_available
 from .config import Config as Config
 from .kernel import Kernel as Kernel
@@ -335,6 +336,7 @@ def compact_ordered_physical_window(
     ordered_block: int,
     *,
     prep_operands: list[tuple[tuple[int, ...], int]],
+    max_extent: int | None = None,
 ) -> int:
     """Block-aligned physical resident window that fits the VMEM budget.
 
@@ -343,9 +345,11 @@ def compact_ordered_physical_window(
     window, optional prep-cache scratch, and the refill/reduction ``pl.ds`` slices
     are all tiled by the ordered block, so the allocation must be a block multiple.
     Round the budget DOWN to a block multiple so the allocation never exceeds the
-    VMEM budget; cap by the operand extent rounded UP to one block so short tensors
-    still get a legal ``pl.Element(block, padding=...)`` window instead of a
-    zero-sized allocation.
+    VMEM budget. With ``max_extent``, admit caching only if its full block-rounded
+    extent fits; this makes the resident window valid for every shape covered by
+    the user's bound. Without it, retain the shape-derived behavior and cap by the
+    operand extent rounded UP to one block so short tensors still get a legal
+    ``pl.Element(block, padding=...)`` window.
 
     Returns 0 when the budget cannot hold one ordered block.  Resident caching is
     an automatic optimization, so the compiler treats that as "inactive" and
@@ -360,8 +364,11 @@ def compact_ordered_physical_window(
     budget_physical = (budget_capacity // block) * block
     if budget_physical <= 0:
         return 0
+    if max_extent is not None:
+        extent_physical = cdiv(max_extent, block) * block
+        return extent_physical if extent_physical <= budget_physical else 0
     min_leading = min(max(1, int(shape[0])) for shape, _itemsize in operands)
-    extent_physical = ((min_leading + block - 1) // block) * block
+    extent_physical = cdiv(min_leading, block) * block
     return min(budget_physical, extent_physical)
 
 
@@ -386,10 +393,9 @@ def _compact_raise_if_range_exceeds_window(
     lengths, so sources with no compact work are ignored because they produce no
     worklist item and never refill the cache.
 
-    Best-effort magnitude: reached with materialized offsets only on the
-    concrete/eager (torch) launch path; under ``jax.jit`` the offsets are tracers
-    and the caller guarantees the bound (a future change that sizes the window from
-    a caller-provided max per-source length would remove this caveat).
+    This host check is only used by concrete/eager legacy shape-derived windows.
+    Bounded windows are safe by construction and skip it; under ``jax.jit``, the
+    legacy no-hint path retains the caller-guaranteed window contract.
     """
     if not ordered_aligned_arg_indices:
         return  # resident caching inactive (no resident window) -> nothing to guard
@@ -1775,6 +1781,20 @@ def _pallas_compile_jit_fn(
 _PALLAS_CACHE_ATTR = "_pallas_cache"
 
 
+def _pallas_compact_cache_key(
+    grid: tuple[int, ...], args: tuple[object, ...]
+) -> tuple[object, ...]:
+    """Shape-specific cache key for a compact-worklist Pallas callable."""
+    return (
+        grid,
+        tuple(
+            (tuple(arg.shape), arg.dtype)
+            for arg in args
+            if isinstance(arg, torch.Tensor)
+        ),
+    )
+
+
 def _pallas_install_launcher_cache(
     pallas_kernel: object,
     grid: tuple[int, ...],
@@ -1871,7 +1891,7 @@ def _pallas_invoke_cached_launcher(
     _ds_pad_dims: list[tuple[int, int, int, int]] | None,
 ) -> object:
     """Shared fast-invoke tail: lift direct-call snapshot, ds-pad, dispatch."""
-    _grid = cache[0]
+    _cache_key = cache[0]
     jax_callable = cache[1]
     tensor_arg_indices = cast("list[int]", cache[2])
     arg_to_tensor_pos = cast("dict[int, int]", cache[3])
@@ -1882,7 +1902,7 @@ def _pallas_invoke_cached_launcher(
         direct_call = getattr(jax_callable, "_helion_direct_call", None)
         if direct_call is not None:
             cache = (
-                _grid,
+                _cache_key,
                 jax_callable,
                 tensor_arg_indices,
                 arg_to_tensor_pos,
@@ -1925,8 +1945,9 @@ def default_pallas_launcher(
     _compact_aligned_arg_indices: list[int] | None = None,
     _compact_tile_start_ref_pos: int = 1,
     _compact_block: int = 1,
-    # Resident-cache (owner-cache) params: the backstop below reads all of them
-    # every call; the three compile-relevant ones are threaded to the install path.
+    # Resident-cache (owner-cache) params. The legacy shape-derived-window
+    # backstop reads the offset indices; the compile-relevant values are also
+    # threaded to the install path.
     _compact_ordered_aligned_arg_indices: list[int] | None = None,
     _compact_range_start_ref_pos: int = -1,
     _compact_ordered_offset_arg_index: int = -1,
@@ -1957,12 +1978,10 @@ def default_pallas_launcher(
     are excluded from pallas_call inputs to save VMEM.  Their results are
     returned as torch tensors.
     """
-    if _compact_build_worklist is not None:
-        # Resident-cache correctness backstop: runs EVERY call (the offset arrays are
-        # runtime data even when the compiled kernel is cached for this grid), raising
-        # rather than silently over-reading the resident window when a source's ordered
-        # reduction length exceeds the compile-time window C.  No-ops when resident
-        # caching is inactive (empty _compact_ordered_aligned_arg_indices).
+    if _compact_build_worklist is not None and _compact_ordered_offset_arg_index >= 0:
+        # Shape-derived resident windows retain the legacy eager correctness
+        # backstop. A bounded ordered loop leaves the offset index at -1 because
+        # max_extent is the caller contract and sizes the full window directly.
         _compact_raise_if_range_exceeds_window(
             args,
             _compact_ordered_aligned_arg_indices,
@@ -1970,8 +1989,13 @@ def default_pallas_launcher(
             _compact_active_mask_arg_index,
             _compact_ordered_window,
         )
+    cache_key: tuple[object, ...] = (
+        _pallas_compact_cache_key(grid, args)
+        if _compact_build_worklist is not None
+        else grid
+    )
     cache = getattr(pallas_kernel, _PALLAS_CACHE_ATTR, None)
-    if cache is None or cache[0] != grid:
+    if cache is None or cache[0] != cache_key:
         if _compact_build_worklist is not None:
             cache = _pallas_install_compact_launcher_cache(
                 pallas_kernel,
@@ -2439,7 +2463,7 @@ def _pallas_install_compact_launcher_cache(
         _ds_pad_dims,
     )
     cache = (
-        grid,
+        _pallas_compact_cache_key(grid, args),
         jax_callable,
         result.tensor_arg_indices,
         result.arg_to_tensor_pos,

@@ -26,6 +26,7 @@ import sympy
 import torch
 
 from .. import exc
+from .._utils import cdiv
 from .ast_extension import expr_from_string
 from .cute.attention_plan import ALIBI_BIAS_KIND
 from .cute.attention_plan import CAUSAL_MASK_KIND
@@ -2632,8 +2633,8 @@ class PallasBackend(Backend):
             and p.arg_name in name_to_index
         ]
         # The cached resident-cache decision drives every resident-window launcher
-        # arg: resident-window tensors, the exact physical window integer, and the
-        # ordered/compact offset args used by the overflow guard.
+        # arg. Shape-derived windows retain the eager overflow guard; a user-provided
+        # ordered extent is a caller contract and sizes the full window directly.
         decision = env.compact_worklist_resident_cache_decision
         ordered_indices: list[int] = []
         range_start_ref_pos = -1
@@ -2661,22 +2662,27 @@ class PallasBackend(Backend):
             ordered_indices = [
                 name_to_index[name] for name in decision.resident_operands
             ]
-            ordered_offset_arg_index = name_to_index.get(
-                decision.range_spec.ordered_offset_arg, -1
-            )
-            active_mask_arg_index = name_to_index.get(
-                decision.range_spec.compact_offset_arg, -1
-            )
             ordered_window = decision.physical_window
-            if (
-                range_start_ref_pos < 0
-                or ordered_offset_arg_index < 0
-                or active_mask_arg_index < 0
-            ):
+            if range_start_ref_pos < 0:
                 raise exc.InvalidConfig(
-                    "compact_worklist resident caching: active range metadata or "
-                    "offset args are missing from the kernel argument list."
+                    "compact_worklist resident caching: active range metadata is "
+                    "missing from the kernel argument list."
                 )
+            ordered_axis = plan.ordered_axis
+            assert ordered_axis is not None
+            if ordered_axis.extent_bound is None:
+                ordered_offset_arg_index = name_to_index.get(
+                    decision.range_spec.ordered_offset_arg, -1
+                )
+                active_mask_arg_index = name_to_index.get(
+                    decision.range_spec.compact_offset_arg, -1
+                )
+                if ordered_offset_arg_index < 0 or active_mask_arg_index < 0:
+                    raise exc.InvalidConfig(
+                        "compact_worklist resident caching: offset args needed by "
+                        "the shape-derived window guard are missing from the kernel "
+                        "argument list."
+                    )
         return [
             "_compact_build_worklist=_build_worklist",
             f"_compact_offset_arg_indices={offset_indices!r}",
@@ -2744,7 +2750,6 @@ class PallasBackend(Backend):
         env.compact_worklist_plan = None
         env.compact_worklist_resident_cache_decision = None
         env.compact_worklist_resident_prep_hoists = ()
-        env.compact_worklist_upper = 1
         env.compact_worklist_block = 1
         env.compact_worklist_ordered_block = 1
         env.compact_worklist_offset_params = []
@@ -2758,9 +2763,9 @@ class PallasBackend(Backend):
         Runs early (pre_codegen) so ``env.compact_worklist_plan`` is set when the
         grid strategy selects ``WorklistProgramIDs`` and the inner loop remaps its
         begin/end to metadata refs.  Registers the N metadata ref names as
-        ``wrapper_only_params`` (kernel-signature-only) and computes the static
-        megablocks ``UPPER``.  ``detect_*`` raises ``exc.InvalidConfig`` on a
-        non-matching kernel (autotuner-skippable).
+        ``wrapper_only_params`` (kernel-signature-only) and computes the
+        host/JAX-static megablocks ``UPPER`` expression. ``detect_*`` raises
+        ``exc.InvalidConfig`` on a non-matching kernel (autotuner-skippable).
         """
         from ..runtime import _get_vmem_limit_bytes
         from .compile_environment import CompileEnvironment
@@ -2773,7 +2778,11 @@ class PallasBackend(Backend):
         env = CompileEnvironment.current()
         host_fn = HostFunction.current()
         plan = detect_compact_worklist_plan(host_fn)
-        env.compact_worklist_plan = plan
+        if not env.settings.static_shapes and plan.compact_axis.extent_bound is None:
+            raise exc.InvalidConfig(
+                "compact_worklist with static_shapes=False requires "
+                "max_extent on the compact hl.tile loop."
+            )
 
         device_fn = DeviceFunction.current()
         for name in metadata_arg_names(plan):
@@ -2785,7 +2794,8 @@ class PallasBackend(Backend):
         # ordered block would undersize the worklist metadata).
         compact_block = env.block_sizes[plan.compact_axis.block_id].from_config(config)
         assert compact_block is not None, "compact tile has no block size"
-        env.compact_worklist_block = int(compact_block)
+        compact_block = int(compact_block)
+        env.compact_worklist_block = compact_block
         # Ordered (reduction) tile block -- resident caching uses this compile-side to
         # choose a block-aligned physical window (it can differ from the compact
         # block, e.g. compact_block != ordered_block).
@@ -2796,7 +2806,13 @@ class PallasBackend(Backend):
             )
             if ordered_block is not None:
                 env.compact_worklist_ordered_block = int(ordered_block)
-        env.compact_worklist_upper = self._compact_worklist_upper(plan, config, host_fn)
+        plan = dataclasses.replace(
+            plan,
+            upper_bound_expr=self._compact_worklist_upper_expr(
+                plan, compact_block, host_fn
+            ),
+        )
+        env.compact_worklist_plan = plan
 
         import jax.experimental.pallas.tpu as pltpu
 
@@ -2811,26 +2827,31 @@ class PallasBackend(Backend):
             host_fn.params.arguments,
             ordered_block=env.compact_worklist_ordered_block,
             vmem_bytes=vmem_bytes,
+            dynamic_shapes=not env.settings.static_shapes,
+            specialized_size_dims=env.specialized_size_dimensions(),
         )
         env.compact_worklist_resident_prep_hoists = admission.prep_hoists
         env.compact_worklist_resident_cache_decision = admission.decision
 
-    def _compact_worklist_upper(
-        self, plan: CompactWorklistPlan, config: Config, host_fn: HostFunction
-    ) -> int:
-        """Static UPPER: the padded length of the worklist metadata arrays.
+    def _compact_worklist_upper_expr(
+        self, plan: CompactWorklistPlan, block: int, host_fn: HostFunction
+    ) -> str:
+        """Host/JAX-static padded length of the worklist metadata arrays.
 
         Must be >= the worst-case ``num_work = sum_owners cdiv(length, BLOCK)``,
         else the dynamic Pallas grid indexes past the scalar-prefetch metadata
         (``jnp.repeat(total_repeat_length=UPPER)`` would silently truncate the
-        worklist).  Detection only accepts the packed-offsets idiom (store
-        safety), so owner ranges are contiguous/non-overlapping
-        (``sum(length) == total``) and the tight megablocks bound
-        ``cdiv(total, BLOCK) + num_owners - 1`` provably holds.  All terms are
-        concrete ints under ``static_shapes=True``.
+        worklist). A user extent bound gives the direct per-owner bound
+        ``num_owners * cdiv(max_extent, BLOCK)`` without observing the compact
+        tensor's dynamic leading dimension. Without a hint, retain the packed
+        static-shape fallback.
         """
         from ..runtime.compact_worklist import packed_upper_bound
-        from .compile_environment import CompileEnvironment
+
+        extent_bound = plan.compact_axis.extent_bound
+        if extent_bound is not None:
+            tiles_per_owner = cdiv(extent_bound, block)
+            return f"({plan.num_owners_expr}) * {tiles_per_owner}"
 
         params = dict(host_fn.params.arguments)
         # Owner count from the captured grid bound (e.g. offsets.shape[0] - 1).
@@ -2850,9 +2871,8 @@ class PallasBackend(Backend):
             p.arg_name for p in plan.tensor_policies if p.kind == "compact_aligned_load"
         )
         total = int(params[compact_arg].shape[0])
-        block = CompileEnvironment.current().compact_worklist_block
         # Single source of the tight megablocks bound (also unit-tested).
-        return packed_upper_bound(total, num_owners, block)
+        return str(packed_upper_bound(total, num_owners, block))
 
 
 def _detect_mma_loop(

@@ -645,9 +645,8 @@ class WorklistProgramIDs(ProgramIDs):
     ``codegen`` emits ``_wid = pl.program_id(0)`` and recovers the owner
     coordinate from the ``owner_ids`` scalar-prefetch ref (``work_<owner>_ref[
     _wid]``) so owner-indexed tensors slice the right owner; ``codegen_grid``
-    renders the **static** ``UPPER`` (megablocks bound) as the host grid
-    positional, while the compact launcher overrides it with the traced
-    ``num_work``.
+    renders the host-computable ``UPPER`` (megablocks bound) as the grid
+    positional, while the compact launcher overrides it with traced ``num_work``.
     """
 
     upper_expr: str = "1"

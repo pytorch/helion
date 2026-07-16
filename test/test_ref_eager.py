@@ -111,6 +111,19 @@ class TestRefEagerMisc(TestCase):
             expected = x * 2.0
             torch.testing.assert_close(result, expected)
 
+    def test_tile_max_extent_support(self):
+        @helion.kernel(ref_mode=helion.RefMode.EAGER)
+        def kernel(x: torch.Tensor, max_extent: int) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile in hl.tile(x.size(0), block_size=3, max_extent=max_extent):
+                out[tile] = x[tile] * 2.0
+            return out
+
+        with assert_ref_eager_mode():
+            x = torch.randn(8, device=DEVICE)
+            result = kernel(x, 8)
+            torch.testing.assert_close(result, x * 2.0)
+
     def test_tile_begin_with_block_size_1(self):
         @helion.kernel(ref_mode=helion.RefMode.EAGER)
         def kernel(x: torch.Tensor) -> torch.Tensor:

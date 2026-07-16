@@ -336,6 +336,23 @@ def _dense_kv_kernel(q, k, v, q_offsets):
     return out
 
 
+@helion.kernel(backend="pallas", static_shapes=False)
+def _bounded_dense_kv_kernel(max_seq_len, q, k, v, q_offsets):
+    num_sequences = q_offsets.size(0) - 1
+    out = torch.empty_like(q)
+    for seq_idx in hl.grid(num_sequences):
+        q_start = q_offsets[seq_idx]
+        q_end = q_offsets[seq_idx + 1]
+        k_blk = k[seq_idx, :, :, :].transpose(0, 1)
+        v_blk = v[seq_idx, :, :, :].transpose(0, 1)
+        for tile_q in hl.tile(q_start, q_end, max_extent=max_seq_len):
+            q_blk = q[tile_q, :, :].transpose(0, 1)
+            scores = torch.bmm(q_blk, k_blk.transpose(-2, -1))
+            acc = torch.bmm(scores.to(v.dtype), v_blk)
+            out[tile_q, :, :] = acc.transpose(0, 1).to(out.dtype)
+    return out
+
+
 @helion.kernel(backend="pallas", static_shapes=True)
 def _fully_jagged_kernel(q, k, v, q_offsets, kv_offsets):
     H = hl.specialize(q.size(1))
@@ -431,6 +448,52 @@ def _noprep_ordered_kernel(q, k, q_offsets):
         start = q_offsets[seq_idx]
         end = q_offsets[seq_idx + 1]
         for tile_q in hl.tile(start, end):
+            acc = q[tile_q, :, :].to(torch.float32)
+            for tile_kv in hl.tile(start, end):
+                acc = acc + k[tile_kv, :, :].sum(0, keepdim=True).to(torch.float32)
+            out[tile_q, :, :] = acc.to(out.dtype)
+    return out
+
+
+@helion.kernel(backend="pallas", static_shapes=False)
+def _bounded_noprep_ordered_kernel(max_seq_len, q, k, q_offsets):
+    """Dynamic-shape variant whose tile bounds size worklist and cache state."""
+    hl.specialize(k.shape[1:])
+    out = torch.empty_like(q)
+    for seq_idx in hl.grid(q_offsets.size(0) - 1):
+        start = q_offsets[seq_idx]
+        end = q_offsets[seq_idx + 1]
+        for tile_q in hl.tile(start, end, max_extent=max_seq_len):
+            acc = q[tile_q, :, :].to(torch.float32)
+            for tile_kv in hl.tile(start, end, max_extent=max_seq_len):
+                acc = acc + k[tile_kv, :, :].sum(0, keepdim=True).to(torch.float32)
+            out[tile_q, :, :] = acc.to(out.dtype)
+    return out
+
+
+@helion.kernel(backend="pallas", static_shapes=False)
+def _bounded_dynamic_tail_ordered_kernel(max_seq_len, q, k, q_offsets):
+    """Bounded ordered loop whose resident footprint remains dynamic."""
+    out = torch.empty_like(q)
+    for seq_idx in hl.grid(q_offsets.size(0) - 1):
+        start = q_offsets[seq_idx]
+        end = q_offsets[seq_idx + 1]
+        for tile_q in hl.tile(start, end, max_extent=max_seq_len):
+            acc = q[tile_q, :, :].to(torch.float32)
+            for tile_kv in hl.tile(start, end, max_extent=max_seq_len):
+                acc = acc + k[tile_kv, :, :].sum(0, keepdim=True).to(torch.float32)
+            out[tile_q, :, :] = acc.to(out.dtype)
+    return out
+
+
+@helion.kernel(backend="pallas", static_shapes=False)
+def _compact_bounded_only_ordered_kernel(max_seq_len, q, k, q_offsets):
+    """Dynamic ordered loop without a resident-cache extent bound."""
+    out = torch.empty_like(q)
+    for seq_idx in hl.grid(q_offsets.size(0) - 1):
+        start = q_offsets[seq_idx]
+        end = q_offsets[seq_idx + 1]
+        for tile_q in hl.tile(start, end, max_extent=max_seq_len):
             acc = q[tile_q, :, :].to(torch.float32)
             for tile_kv in hl.tile(start, end):
                 acc = acc + k[tile_kv, :, :].sum(0, keepdim=True).to(torch.float32)
@@ -644,6 +707,84 @@ class TestDetectAndGating(unittest.TestCase):
             metadata_arg_names(self._fully_jagged_plan()),
             ["work_seq", "q_begin", "q_extent", "kv_begin", "kv_len"],
         )
+
+    def test_tile_extent_bounds_are_captured_and_specialized(self):
+        qo = _offsets([12, 20, 5, 30])
+        lq = int(qo[-1])
+        bk = _bounded_noprep_ordered_kernel.bind(
+            (64, torch.randn(lq, 2, 8), torch.randn(lq, 2, 8), qo)
+        )
+        assert bk.host_function is not None
+        with bk.env:
+            plan = detect_compact_worklist_plan(bk.host_function)
+        self.assertEqual(plan.compact_axis.extent_bound, 64)
+        self.assertIsNotNone(plan.ordered_axis)
+        self.assertEqual(plan.ordered_axis.extent_bound, 64)
+        max_seq_len = bk.host_function.params.arguments["max_seq_len"]
+        self.assertIsInstance(max_seq_len, torch.SymInt)
+        self.assertTrue(bk.env.specialized_vars)
+
+    def test_no_hint_keeps_extent_bounds_absent(self):
+        plan = self._fully_jagged_plan()
+        self.assertIsNone(plan.compact_axis.extent_bound)
+        self.assertIsNotNone(plan.ordered_axis)
+        self.assertIsNone(plan.ordered_axis.extent_bound)
+
+    def test_dynamic_shapes_require_compact_extent_bound(self):
+        qo = _offsets([10, 23, 7, 40])
+        total = int(qo[-1])
+        kernel = helion.kernel(
+            _dense_kv_kernel.fn,
+            backend="pallas",
+            static_shapes=False,
+            config=helion.Config(block_sizes=[16], pallas_loop_type="compact_worklist"),
+        )
+        args = (
+            torch.randn(total, 2, 16),
+            torch.randn(4, 16, 2, 16),
+            torch.randn(4, 16, 2, 16),
+            qo,
+        )
+        with self.assertRaisesRegex(
+            exc.InvalidConfig,
+            "static_shapes=False requires max_extent",
+        ):
+            kernel.bind(args).ensure_config_exists(args)
+
+    def test_extent_bound_specializes_without_specializing_leading_shapes(self):
+        def args(max_seq_len, lengths, *, heads=2, width=8):
+            offsets = _offsets(lengths)
+            total = int(offsets[-1])
+            return (
+                max_seq_len,
+                torch.randn(total, heads, width),
+                torch.randn(total, heads, width),
+                offsets,
+            )
+
+        _bounded_noprep_ordered_kernel.reset()
+        bound_64 = _bounded_noprep_ordered_kernel.bind(args(64, [12, 20, 5, 30]))
+        rebound_64 = _bounded_noprep_ordered_kernel.bind(args(64, [8, 7]))
+        bound_128 = _bounded_noprep_ordered_kernel.bind(args(128, [8, 7]))
+        rebound_tail = _bounded_noprep_ordered_kernel.bind(
+            args(64, [8, 7], heads=4, width=16)
+        )
+        self.assertIs(bound_64, rebound_64)
+        self.assertIsNot(bound_64, bound_128)
+        self.assertIsNot(bound_64, rebound_tail)
+
+    def test_static_extent_cannot_exceed_bound(self):
+        @helion.kernel(backend="pallas")
+        def invalid_bound(x):
+            out = torch.empty_like(x)
+            for tile in hl.tile(16, max_extent=8):
+                out[tile] = x[tile]
+            return out
+
+        with self.assertRaisesRegex(
+            exc.TypeInferenceError, "range extent 16 exceeds max_extent 8"
+        ):
+            invalid_bound.bind((torch.randn(16),))
 
     def test_gating_offers_compact_worklist_for_jagged(self):
         qo = _offsets([16, 16, 16, 16])
@@ -1126,6 +1267,19 @@ def _eager_fully_jagged(q, k, v, qo, kvo):
     return out
 
 
+def _eager_noprep_ordered(q, k, offsets, block):
+    """Ground truth matching the ordered loop's blockwise bf16 reductions."""
+    out = torch.empty_like(q)
+    for seq in range(len(offsets) - 1):
+        begin, end = int(offsets[seq]), int(offsets[seq + 1])
+        acc = q[begin:end].float()
+        for tile_begin in range(begin, end, block):
+            tile_end = min(tile_begin + block, end)
+            acc += k[tile_begin:tile_end].sum(0, keepdim=True).float()
+        out[begin:end] = acc.to(out.dtype)
+    return out
+
+
 @onlyBackends(["pallas"])
 class TestUpperBoundPacking(unittest.TestCase):
     """Only packed-offset bounds are accepted; non-packed is rejected.
@@ -1275,6 +1429,106 @@ class TestCompactWorklistNumerics(unittest.TestCase):
         ref = _eager_dense_kv(q.cpu(), k.cpu(), v.cpu(), qo)
         torch.testing.assert_close(out.cpu(), ref, rtol=2e-2, atol=2e-2)
 
+    def test_bounded_dense_kv_rebuilds_runtime_specs_for_new_shape(self):
+        B, H, KV, D, block, max_seq_len = 4, 2, 16, 16, 16, 64
+        kernel = helion.kernel(
+            _bounded_dense_kv_kernel.fn,
+            backend="pallas",
+            static_shapes=False,
+            config=helion.Config(
+                block_sizes=[block], pallas_loop_type="compact_worklist"
+            ),
+        )
+
+        def make_case(lengths, seed):
+            qo = _offsets(lengths)
+            torch.manual_seed(seed)
+            q = torch.randn(int(qo[-1]), H, D, device=DEVICE, dtype=torch.bfloat16)
+            k = torch.randn(B, KV, H, D, device=DEVICE, dtype=torch.bfloat16)
+            v = torch.randn(B, KV, H, D, device=DEVICE, dtype=torch.bfloat16)
+            args = (max_seq_len, q, k, v, qo.to(DEVICE))
+            return args, _eager_dense_kv(q.cpu(), k.cpu(), v.cpu(), qo)
+
+        case_a, ref_a = make_case([10, 23, 7, 40], 0)
+        case_b, ref_b = make_case([5, 12, 3, 20], 1)
+        for args, ref in ((case_a, ref_a), (case_a, ref_a), (case_b, ref_b)):
+            out = kernel(*args)
+            self.assertEqual(tuple(out.shape), tuple(ref.shape))
+            torch.testing.assert_close(out.cpu(), ref, rtol=2e-2, atol=2e-2)
+        self.assertEqual(len(kernel._bound_kernels), 1)
+
+    def test_bounded_dense_kv_reuses_fixed_capacity_compilation(self):
+        import helion.runtime as helion_runtime
+
+        B, H, KV, D, block, max_seq_len = 4, 2, 16, 16, 16, 64
+        capacity = B * max_seq_len
+        kernel = helion.kernel(
+            _bounded_dense_kv_kernel.fn,
+            backend="pallas",
+            static_shapes=False,
+            config=helion.Config(
+                block_sizes=[block], pallas_loop_type="compact_worklist"
+            ),
+        )
+
+        def make_case(lengths, seed):
+            qo = _offsets(lengths)
+            torch.manual_seed(seed)
+            q = torch.randn(capacity, H, D, device=DEVICE, dtype=torch.bfloat16)
+            k = torch.randn(B, KV, H, D, device=DEVICE, dtype=torch.bfloat16)
+            v = torch.randn(B, KV, H, D, device=DEVICE, dtype=torch.bfloat16)
+            args = (max_seq_len, q, k, v, qo.to(DEVICE))
+            return args, _eager_dense_kv(q.cpu(), k.cpu(), v.cpu(), qo), int(qo[-1])
+
+        cases = (
+            make_case([10, 23, 7, 40], 0),
+            make_case([5, 12, 3, 20], 1),
+        )
+        with patch.object(
+            helion_runtime,
+            "_pallas_install_compact_launcher_cache",
+            wraps=helion_runtime._pallas_install_compact_launcher_cache,
+        ) as install:
+            for args, ref, active_tokens in (*cases, cases[0]):
+                out = kernel(*args)
+                self.assertEqual(tuple(out.shape), (capacity, H, D))
+                torch.testing.assert_close(
+                    out[:active_tokens].cpu(),
+                    ref[:active_tokens],
+                    rtol=2e-2,
+                    atol=2e-2,
+                )
+        self.assertEqual(install.call_count, 1)
+        self.assertEqual(len(kernel._bound_kernels), 1)
+
+    def _check_dynamic_ordered_matches_eager(self, kernel):
+        H, D, block, max_seq_len = 4, 128, 8, 64
+        offsets = _offsets([12, 20, 5, 30])
+        total = int(offsets[-1])
+        torch.manual_seed(0)
+        q = torch.randn(total, H, D, device=DEVICE, dtype=torch.bfloat16)
+        k = torch.randn(total, H, D, device=DEVICE, dtype=torch.bfloat16)
+        _, out = code_and_output(
+            kernel,
+            (max_seq_len, q, k, offsets.to(DEVICE)),
+            block_sizes=[block, block],
+            pallas_loop_type="compact_worklist",
+        )
+        ref = _eager_noprep_ordered(q.cpu(), k.cpu(), offsets, block)
+        torch.testing.assert_close(out.cpu(), ref, rtol=2e-2, atol=2e-2)
+
+    @skipIfPallasInterpret(
+        "dynamic ordered-loop numerics require real TPU resident-cache lowering"
+    )
+    def test_dynamic_bounded_ordered_resident_matches_eager(self):
+        self._check_dynamic_ordered_matches_eager(_bounded_noprep_ordered_kernel)
+
+    @skipIfPallasInterpret(
+        "dynamic ordered-loop numerics require real TPU pipeline lowering"
+    )
+    def test_dynamic_unbounded_ordered_streaming_matches_eager(self):
+        self._check_dynamic_ordered_matches_eager(_compact_bounded_only_ordered_kernel)
+
     def test_dense_kv_empty_batch_zero_grid(self):
         # total_q == 0 => num_work == 0 => dynamic grid=(0,).  End-to-end guard
         # that the empty-batch launch returns an empty output (Mosaic tolerates
@@ -1400,6 +1654,37 @@ class TestCompactWorklistJaxExport(unittest.TestCase):
             atol=2e-2,
         )
 
+    def test_bounded_jax_fn_under_jit_with_static_extent(self):
+        import jax
+        import jax.numpy as jnp
+
+        B, H, KV, D, block, max_seq_len = 4, 2, 16, 16, 16, 64
+        qo = _offsets([10, 23, 7, 40])
+        lq = int(qo[-1])
+        q = jax.random.normal(jax.random.PRNGKey(0), (lq, H, D), jnp.bfloat16)
+        k = jax.random.normal(jax.random.PRNGKey(1), (B, KV, H, D), jnp.bfloat16)
+        v = jax.random.normal(jax.random.PRNGKey(2), (B, KV, H, D), jnp.bfloat16)
+        qod = jnp.asarray(qo.numpy())
+        kernel = helion.kernel(
+            _bounded_dense_kv_kernel.fn,
+            config=helion.Config(
+                block_sizes=[block], pallas_loop_type="compact_worklist"
+            ),
+            static_shapes=False,
+            backend="pallas",
+        )
+
+        eager = jax.block_until_ready(kernel.jax_fn(max_seq_len, q, k, v, qod))
+        jitted = jax.block_until_ready(
+            jax.jit(kernel.jax_fn, static_argnums=0)(max_seq_len, q, k, v, qod)
+        )
+        np.testing.assert_allclose(
+            np.asarray(jitted).astype(np.float32),
+            np.asarray(eager).astype(np.float32),
+            rtol=2e-2,
+            atol=2e-2,
+        )
+
 
 @unittest.skipUnless(HAS_JAX, "jax not available")
 class TestResidentCacheWindowGuard(unittest.TestCase):
@@ -1498,11 +1783,23 @@ class TestOrderedWindowBudget(unittest.TestCase):
             operands, vmem, prep_operands=prep_operands
         )
 
-    def _physical(self, operands, block, vmem=64 * 1024 * 1024, *, prep_operands):
+    def _physical(
+        self,
+        operands,
+        block,
+        vmem=64 * 1024 * 1024,
+        *,
+        prep_operands,
+        max_extent=None,
+    ):
         from helion.runtime import compact_ordered_physical_window
 
         return compact_ordered_physical_window(
-            operands, vmem, block, prep_operands=prep_operands
+            operands,
+            vmem,
+            block,
+            prep_operands=prep_operands,
+            max_extent=max_extent,
         )
 
     def test_vmem_bound_budgets_window_plus_cache(self):
@@ -1542,6 +1839,31 @@ class TestOrderedWindowBudget(unittest.TestCase):
         self.assertLess(self._budget(operands, vmem=1024, prep_operands=operands), 128)
         self.assertEqual(
             self._physical(operands, 128, vmem=1024, prep_operands=operands),
+            0,
+        )
+
+    def test_max_extent_sizes_the_full_window(self):
+        operands = [((1_000_000, 4, 128), 2)]
+        self.assertEqual(
+            self._physical(
+                operands,
+                128,
+                prep_operands=[],
+                max_extent=257,
+            ),
+            384,
+        )
+
+    def test_max_extent_over_budget_disables_resident_cache(self):
+        operands = [((1_000_000, 4, 128), 2)]
+        self.assertEqual(
+            self._physical(
+                operands,
+                128,
+                vmem=1024,
+                prep_operands=[],
+                max_extent=257,
+            ),
             0,
         )
 
@@ -1814,6 +2136,86 @@ class TestResidentCacheAndPrepHoist(unittest.TestCase):
         self.assertNotIn("_compact_ordered_offset_arg_index=-1", code)
         self.assertNotIn("_compact_active_mask_arg_index=-1", code)
         self.assertNotIn("_compact_ordered_window=0", code)
+
+    def test_extent_bound_drives_dynamic_worklist_and_resident_window(self):
+        qo = _offsets([12, 20, 5, 30])
+        lq = int(qo[-1])
+        args = (64, torch.randn(lq, 4, 128), torch.randn(lq, 4, 128), qo)
+        code = _bounded_noprep_ordered_kernel.bind(args).to_triton_code(
+            helion.Config(block_sizes=[8, 8], pallas_loop_type="compact_worklist")
+        )
+        self.assertRegex(
+            code,
+            r"flatten_worklist\(base, length, \d+, "
+            r"\(q_offsets\.shape\[0\] - 1\) \* \d+",
+        )
+        self.assertIn("_compact_ordered_window=64", code)
+        # max_extent sizes the full window, so its caller contract replaces the
+        # eager, synchronizing shape-derived-window guard.
+        self.assertIn("_compact_ordered_offset_arg_index=-1", code)
+        self.assertIn("_compact_active_mask_arg_index=-1", code)
+
+    def test_dynamic_tail_shape_disables_resident_cache(self):
+        offsets = _offsets([12, 20, 5, 30])
+        total = int(offsets[-1])
+        _bounded_dynamic_tail_ordered_kernel.reset()
+
+        def args(heads, width):
+            return (
+                64,
+                torch.randn(total, heads, width),
+                torch.randn(total, heads, width),
+                offsets,
+            )
+
+        small_args = args(2, 8)
+        small_bound = _bounded_dynamic_tail_ordered_kernel.bind(small_args)
+        for block_sizes in ([8, 8], [16, 8]):
+            code = small_bound.to_triton_code(
+                helion.Config(
+                    block_sizes=block_sizes,
+                    pallas_loop_type="compact_worklist",
+                )
+            )
+            self.assertIn("_compact_ordered_aligned_arg_indices=[]", code)
+            self.assertIn("_compact_ordered_window=0", code)
+
+        # Tail dimensions remain dynamic, so one BoundKernel may serve both shapes;
+        # streaming keeps its VMEM decision valid for either one.
+        self.assertIs(
+            small_bound,
+            _bounded_dynamic_tail_ordered_kernel.bind(args(4, 16)),
+        )
+
+    def test_extent_bound_over_vmem_budget_streams_ordered_loop(self):
+        qo = _offsets([12, 20, 5, 30])
+        lq = int(qo[-1])
+        args = (
+            1_000_000,
+            torch.randn(lq, 4, 128),
+            torch.randn(lq, 4, 128),
+            qo,
+        )
+        code = _bounded_noprep_ordered_kernel.bind(args).to_triton_code(
+            helion.Config(block_sizes=[8, 8], pallas_loop_type="compact_worklist")
+        )
+        self.assertIn("_compact_ordered_aligned_arg_indices=[]", code)
+        self.assertIn("_compact_ordered_window=0", code)
+
+    def test_dynamic_unbounded_ordered_loop_streams(self):
+        qo = _offsets([12, 20, 5, 30])
+        total = int(qo[-1])
+        args = (
+            64,
+            torch.randn(total, 4, 128),
+            torch.randn(total, 4, 128),
+            qo,
+        )
+        code = _compact_bounded_only_ordered_kernel.bind(args).to_triton_code(
+            helion.Config(block_sizes=[8, 8], pallas_loop_type="compact_worklist")
+        )
+        self.assertIn("_compact_ordered_aligned_arg_indices=[]", code)
+        self.assertIn("_compact_ordered_window=0", code)
 
     def test_active_resident_cache_requires_range_start_metadata(self):
         from helion._compiler.backend import PallasBackend

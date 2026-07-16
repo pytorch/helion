@@ -38,6 +38,7 @@ from ..ast_read_writes import ReadWrites
 from ..ast_read_writes import ast_rename
 
 if TYPE_CHECKING:
+    from collections.abc import AbstractSet
     from collections.abc import Iterable
     from collections.abc import Mapping
 
@@ -72,6 +73,8 @@ class Axis:
     # construction; resident caching uses it to prove the resident-window overflow
     # guard (``max(diff(T))``) can't under-count the range.
     packed_offset_arg: str | None = None
+    # Optional user-provided upper bound on this loop's per-owner extent.
+    extent_bound: int | None = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -109,7 +112,9 @@ class CompactWorklistPlan:
 
     axes: tuple[Axis, ...]  # owner_grid + compact_tile + optional ordered
     tensor_policies: tuple[TensorPolicy, ...]
-    upper_bound_expr: str  # static UPPER = cdiv(total, BLOCK) + owners - 1
+    # Host/JAX-static expression for the padded metadata length. With an extent
+    # bound this may depend on an input shape, which JAX resolves while tracing.
+    upper_bound_expr: str
     # jnp host expression for the owner count P (the grid size), e.g.
     # "offsets.shape[0] - 1" or "lo.shape[0]"; taken from the owner hl.grid
     # bound (NOT assumed to be base.shape[0] - 1, which only holds for the
@@ -402,16 +407,48 @@ class ResidentCacheAdmission:
     prep_hoists: tuple[ResidentPrepHoist, ...]
 
 
+def _inactive_resident_cache_admission(
+    resident_names: tuple[str, ...], reason: str
+) -> ResidentCacheAdmission:
+    return ResidentCacheAdmission(
+        ResidentCacheDecision(resident_names, None, 0, reason),
+        (),
+    )
+
+
 def _tensor_footprints(
     host_args: Mapping[str, object],
     arg_names: Iterable[str],
+    *,
+    leading_extent: int | None = None,
 ) -> list[tuple[tuple[int, ...], int]]:
     footprints: list[tuple[tuple[int, ...], int]] = []
     for arg_name in arg_names:
         arg = host_args[arg_name]
         assert isinstance(arg, torch.Tensor)
-        footprints.append((tuple(int(s) for s in arg.shape), arg.dtype.itemsize))
+        # A bound replaces the dynamic leading SymInt; admitted tail dims have
+        # exact-size guards in the BoundKernel cache key.
+        leading = leading_extent if leading_extent is not None else int(arg.shape[0])
+        shape = (leading, *(int(size) for size in arg.shape[1:]))
+        footprints.append((shape, arg.dtype.itemsize))
     return footprints
+
+
+def _unstable_tail_shape_args(
+    host_args: Mapping[str, object],
+    arg_names: Iterable[str],
+    specialized_size_dims: AbstractSet[tuple[str, int]],
+) -> tuple[str, ...]:
+    """Return operands whose footprint depends on an unspecialized tail dim."""
+    unstable: list[str] = []
+    for arg_name in arg_names:
+        arg = host_args[arg_name]
+        assert isinstance(arg, torch.Tensor)
+        if any(
+            (arg_name, dim) not in specialized_size_dims for dim in range(1, arg.ndim)
+        ):
+            unstable.append(arg_name)
+    return tuple(unstable)
 
 
 def build_resident_cache_admission(
@@ -421,24 +458,66 @@ def build_resident_cache_admission(
     *,
     ordered_block: int,
     vmem_bytes: int,
+    dynamic_shapes: bool = False,
+    specialized_size_dims: AbstractSet[tuple[str, int]] = frozenset(),
 ) -> ResidentCacheAdmission:
     """Admit resident caching and optional prep hoists for one concrete config.
 
     Backend setup supplies concrete config facts (host shapes, ordered block, VMEM
     budget). This helper owns the compact-worklist-specific policy: detect prep
     candidates, account for their scratch footprint, choose the one physical
-    resident window, and drop optional prep when it cannot fit.
+    resident window, and drop optional prep when it cannot fit. Dynamic kernels
+    supply ``specialized_size_dims`` so an admission cannot outlive the tail
+    dimensions used for its VMEM footprint; an unstable footprint falls back to
+    streaming.
     """
     from ...runtime import compact_ordered_physical_window
 
+    resident_names = tuple(policy.arg_name for policy in resident_ordered_entries(plan))
+    ordered_extent_bound = (
+        None if plan.ordered_axis is None else plan.ordered_axis.extent_bound
+    )
+    if (
+        plan.ordered_axis is not None
+        and ordered_extent_bound is None
+        and dynamic_shapes
+    ):
+        return _inactive_resident_cache_admission(
+            resident_names, "dynamic ordered extent has no max_extent"
+        )
+    unstable_residents = (
+        _unstable_tail_shape_args(host_args, resident_names, specialized_size_dims)
+        if dynamic_shapes
+        else ()
+    )
+    if unstable_residents:
+        return _inactive_resident_cache_admission(
+            resident_names,
+            f"dynamic resident tail shape: {unstable_residents}",
+        )
     resident_operands = _tensor_footprints(
         host_args,
-        tuple(policy.arg_name for policy in resident_ordered_entries(plan)),
+        resident_names,
+        leading_extent=ordered_extent_bound,
     )
     prep_hoists = detect_resident_prep_hoists(graphs, plan)
+    unstable_prep = (
+        _unstable_tail_shape_args(
+            host_args,
+            (hoist.host_arg for hoist in prep_hoists),
+            specialized_size_dims,
+        )
+        if dynamic_shapes
+        else ()
+    )
+    if unstable_prep:
+        prep_hoists = tuple(
+            hoist for hoist in prep_hoists if hoist.host_arg not in unstable_prep
+        )
     prep_operands = _tensor_footprints(
         host_args,
         tuple(hoist.host_arg for hoist in prep_hoists),
+        leading_extent=ordered_extent_bound,
     )
 
     physical_window_no_prep = compact_ordered_physical_window(
@@ -446,6 +525,7 @@ def build_resident_cache_admission(
         vmem_bytes,
         ordered_block,
         prep_operands=[],
+        max_extent=ordered_extent_bound,
     )
     physical_window = physical_window_no_prep
     admitted_hoists = prep_hoists
@@ -455,6 +535,7 @@ def build_resident_cache_admission(
             vmem_bytes,
             ordered_block,
             prep_operands=prep_operands,
+            max_extent=ordered_extent_bound,
         )
         if physical_window_with_prep > 0:
             physical_window = physical_window_with_prep
@@ -674,9 +755,9 @@ def render_build_worklist(
     calls the library :func:`flatten_worklist`; nothing is ``.item()``-ed, so
     the returned ``num_work`` stays a traced ``jax.Array``.
 
-    ``block_expr``/``upper_expr`` are host expressions (static ints at codegen);
-    they are textual so the caller can pass either literals (tests) or the
-    codegen block-size var / ``program_id.num_pids_expr``.
+    ``block_expr``/``upper_expr`` are textual host expressions. The block is a
+    codegen-time integer; the upper bound may also reference input shapes, which
+    are static while JAX traces the builder.
     """
     leak_ok = _bound_tensors(plan)
     subs = {plan.owner_axis.loop_var: owner_array}
@@ -881,11 +962,9 @@ def _packed_consecutive(begin: ast.AST, end: ast.AST, owner_var: str) -> bool:
     This is the packed-offsets idiom: owner ranges are contiguous and
     non-overlapping (``sum(length) == total``), so the tight megablocks UPPER
     bound ``cdiv(total, block) + owners - 1`` provably bounds ``num_work``.
-    Distinct begin/end tensors or non-consecutive indices may overlap or exceed
-    ``total``, so they must fall back to a conservative UPPER.
-
-    Conservatively returns ``False`` on anything it can't prove (the caller then
-    over-allocates metadata, which is safe; a too-small UPPER would not be).
+    Conservatively returns ``False`` on anything it cannot prove. Compact-axis
+    detection then rejects the kernel for store safety; an ordered axis remains
+    valid but is ineligible for resident caching.
     """
 
     def _same_ast(a: ast.AST, b: ast.AST) -> bool:
@@ -926,15 +1005,19 @@ def _packed_consecutive(begin: ast.AST, end: ast.AST, owner_var: str) -> bool:
     return b is not None and e is not None and e == b + 1
 
 
-def _block_id_of_loop(loop: ast.For) -> int | None:
-    """Best-effort block id from the loop iterator's attached type info."""
+def _tile_info_of_loop(loop: ast.For) -> tuple[int, int | None] | None:
+    """Return the block id and extent bound attached to a tile loop."""
     call = _loop_iter_call(loop)
     if call is None:
         return None
     type_info = getattr(call, "_type_info", None)
     inner = getattr(type_info, "inner", None)
     block_id = getattr(inner, "block_id", None)
-    return block_id if isinstance(block_id, int) else None
+    if not isinstance(block_id, int):
+        return None
+    extent_bound = getattr(inner, "extent_bound", None)
+    assert extent_bound is None or isinstance(extent_bound, int)
+    return block_id, extent_bound
 
 
 def _find_grid_loop(body: list[ast.stmt]) -> ast.For | None:
@@ -1216,11 +1299,12 @@ def detect_compact_worklist_plan(
     )
 
     owner_block_id = device_ir.grid_block_ids[0][0]
-    compact_block_id = _block_id_of_loop(compact_loop)
-    if compact_block_id is None:
+    compact_tile_info = _tile_info_of_loop(compact_loop)
+    if compact_tile_info is None:
         raise exc.InvalidConfig(
             "compact_worklist: could not resolve the compact tile block id."
         )
+    compact_block_id, compact_extent_bound = compact_tile_info
 
     axes: list[Axis] = [
         Axis(
@@ -1239,6 +1323,7 @@ def detect_compact_worklist_plan(
             length=_length_ast(c_begin, c_end),
             block_size_var="",  # filled at codegen from the config block size
             packed_offset_arg=compact_packed_arg,
+            extent_bound=compact_extent_bound,
         ),
     ]
 
@@ -1257,11 +1342,12 @@ def detect_compact_worklist_plan(
         }
         o_begin = _inline(_to_plain(ordered_call.args[0]), ordered_prologue)
         o_end = _inline(_to_plain(ordered_call.args[1]), ordered_prologue)
-        ordered_block_id = _block_id_of_loop(ordered_loop)
-        if ordered_block_id is None:
+        ordered_tile_info = _tile_info_of_loop(ordered_loop)
+        if ordered_tile_info is None:
             raise exc.InvalidConfig(
                 "compact_worklist: could not resolve the ordered tile block id."
             )
+        ordered_block_id, ordered_extent_bound = ordered_tile_info
         # Resident caching needs a bound whose consecutive diffs are EXACTLY the
         # per-source length; prove the packed-consecutive idiom (base=T[g],
         # end=T[g+1] on one Name tensor).  A bound like ``T[g+1]+128`` reads only
@@ -1282,6 +1368,7 @@ def detect_compact_worklist_plan(
                 length=_length_ast(o_begin, o_end),
                 block_size_var="",
                 packed_offset_arg=ordered_packed_arg,
+                extent_bound=ordered_extent_bound,
             )
         )
 

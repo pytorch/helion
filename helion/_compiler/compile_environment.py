@@ -294,11 +294,8 @@ class CompileEnvironment:
         # Optional prep-cache descriptors admitted for this concrete config.  Kept
         # separate from the correctness-bearing resident-window decision.
         self.compact_worklist_resident_prep_hoists: tuple[ResidentPrepHoist, ...] = ()
-        # Static megablocks upper bound (int) for the compact worklist grid /
-        # metadata, computed at pre_codegen from static shapes.
-        self.compact_worklist_upper: int = 1
         # Compact-axis tile block size (int), resolved from the config at
-        # pre_codegen; used by the worklist builder and UPPER (NOT max(block_sizes)).
+        # pre_codegen; used by the worklist builder (NOT max(block_sizes)).
         self.compact_worklist_block: int = 1
         # Ordered (reduction) tile block size.  May differ from the compact block
         # (e.g. compact_block != ordered_block); resident caching sizes its window to a
@@ -1017,6 +1014,20 @@ class CompileEnvironment:
         if _has_unbacked(size._sympy_()):
             return size
         return self.size_hint(size)
+
+    def specialized_size_dimensions(self) -> set[tuple[str, int]]:
+        """Return input dimensions guarded exactly in the BoundKernel cache key."""
+        result: set[tuple[str, int]] = set()
+        for symbol in self.specialized_vars:
+            for source in self.shape_env.var_to_sources.get(symbol, ()):
+                if (
+                    isinstance(source, TensorPropertySource)
+                    and source.prop == TensorProperty.SIZE
+                    and isinstance(source.base, LocalSource)
+                    and source.idx is not None
+                ):
+                    result.add((source.base.local_name, source.idx))
+        return result
 
     def size_hint(self, n: int | torch.SymInt) -> int:
         if isinstance(n, torch.SymInt):

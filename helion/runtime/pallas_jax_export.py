@@ -318,11 +318,12 @@ def default_pallas_jax_launcher(
         # window IS applied, but the host overflow guard
         # (runtime._compact_raise_if_range_exceeds_window) is NOT run here -- the
         # offsets are jit tracers, so a per-source reduction length exceeding the
-        # window size C cannot be checked at trace time.  Contract: the caller
-        # must ensure every ordered (reduction) range <= C (VMEM-derived,
-        # thousands of tokens; the torch/eager launcher does enforce this).
-        # Sizing C from a caller-provided max bound would make the window
-        # overflow-proof by construction.
+        # window size C cannot be checked at trace time. Contract: the caller must
+        # ensure every ordered (reduction) range <= C. When the ordered hl.tile
+        # supplies max_extent, admission sizes C to the full bound or disables
+        # resident caching. The static no-hint path retains the legacy VMEM-derived
+        # C contract; its eager launcher validates offsets, but JAX tracers cannot
+        # be checked at trace time.
         from . import _pallas_compile_compact_jit_fn
 
         result = _pallas_compile_compact_jit_fn(

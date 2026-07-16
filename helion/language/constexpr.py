@@ -86,55 +86,49 @@ def specialize(value: _T) -> _T:
     raise exc.NotInsideKernel
 
 
-@_decorators.type_propagation(specialize)
-def _(value: TypeInfo, *, origin: Origin) -> TypeInfo:
+def _record_specialized_symint(symint: torch.SymInt) -> None:
+    """Record guards for a symbolic host value specialized by an API."""
     from .._compiler.compile_environment import CompileEnvironment
     from .._compiler.compile_environment import _symint_free_symbols
 
+    env = CompileEnvironment.current()
+    syms = _symint_free_symbols(symint)
+    env.specialized_vars.update(syms)
+    for sym in syms:
+        # pyrefly: ignore [no-matching-overload]
+        for source in env.shape_env.var_to_sources.get(sym, []):
+            if (
+                isinstance(source, TensorPropertySource)
+                and source.prop == TensorProperty.STRIDE
+                and isinstance(source.base, LocalSource)
+                and source.idx is not None
+            ):
+                env.specialized_strides.add((source.base.local_name, source.idx))
+
+
+def _specialize_proxy(value: _T) -> _T:
+    """Specialize a host value and record the symbols that require guards."""
+
+    def handle_symint(symint: torch.SymInt) -> int:
+        _record_specialized_symint(symint)
+        return symint.__int__()
+
+    return _convert_specializable(value, on_symint=handle_symint)
+
+
+@_decorators.type_propagation(specialize)
+def _(value: TypeInfo, *, origin: Origin) -> TypeInfo:
     if origin.is_device():
         raise exc.SpecializeOnDevice
 
-    proxy = value.proxy()
-    env = CompileEnvironment.current()
-
-    def handle_symint(symint: torch.SymInt) -> int:
-        syms = _symint_free_symbols(symint)
-        env.specialized_vars.update(syms)
-        # Track stride specializations
-        for sym in syms:
-            for source in env.shape_env.var_to_sources.get(sym, []):
-                if (
-                    isinstance(source, TensorPropertySource)
-                    and source.prop == TensorProperty.STRIDE
-                    and isinstance(source.base, LocalSource)
-                    and source.idx is not None
-                ):
-                    env.specialized_strides.add((source.base.local_name, source.idx))
-        return symint.__int__()
-
-    _convert_specializable(proxy, on_symint=handle_symint)
+    _specialize_proxy(value.proxy())
     return value
 
 
 @_decorators.register_fake(specialize)
 def _(value: _T) -> _T:
-    from .._compiler.compile_environment import CompileEnvironment
-    from .._compiler.compile_environment import _symint_free_symbols
-
-    env = CompileEnvironment.current()
-
     def handle_symint(symint: torch.SymInt) -> torch.SymInt:
-        syms = _symint_free_symbols(symint)
-        env.specialized_vars.update(syms)
-        for sym in syms:
-            for source in env.shape_env.var_to_sources.get(sym, []):
-                if (
-                    isinstance(source, TensorPropertySource)
-                    and source.prop == TensorProperty.STRIDE
-                    and isinstance(source.base, LocalSource)
-                    and source.idx is not None
-                ):
-                    env.specialized_strides.add((source.base.local_name, source.idx))
+        _record_specialized_symint(symint)
         return symint
 
     return _convert_specializable(value, on_symint=handle_symint)

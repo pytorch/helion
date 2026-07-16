@@ -8,9 +8,9 @@ per-owner ``base``/``length`` (and optional dependent ``dep_base``/``dep_len``)
 arrays as ``jnp`` expressions, then calls :func:`flatten_worklist` here to turn
 the ragged owner x tile product into a flat, padded worklist.  Everything runs
 inside the launcher's internal ``jax.jit`` with **nothing ``.item()``-ed**, so
-there is no device->host sync and no per-shape recompile: ``num_work`` is a
-traced ``jax.Array`` fed straight into ``grid=(num_work,)``; ``UPPER`` is the
-only (static, shape-derived) Python int.
+there is no device->host sync: ``num_work`` is a traced ``jax.Array`` fed
+straight into ``grid=(num_work,)``; ``UPPER`` is static during JAX tracing and
+may be derived from input shapes plus a user-provided tile extent bound.
 
 The padding scheme mirrors tokamax's ``gmm`` (``jnp.repeat(...,
 total_repeat_length=UPPER)`` + ``num_work = cnt.sum()`` fed to ``grid=``): the
@@ -23,6 +23,8 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 from typing import NamedTuple
+
+from .._utils import cdiv
 
 if TYPE_CHECKING:
     from jax import Array
@@ -64,10 +66,11 @@ def packed_upper_bound(total_compact: int, num_owners: int, block: int) -> int:
     shapes, so this is a static Python int and no per-owner max length is needed.
 
     For general (possibly-overlapping) ranges this bound can UNDER-count
-    ``num_work``; the backend uses a conservative ``num_owners * cdiv(total,
-    block)`` instead (see ``backend._compact_worklist_upper``).
+    ``num_work``. A per-owner ``max_extent`` instead gives the conservative
+    ``num_owners * cdiv(max_extent, block)`` bound; without one, compact-worklist
+    detection requires packed ranges before using this helper.
     """
-    return -(-total_compact // block) + num_owners - 1
+    return cdiv(total_compact, block) + num_owners - 1
 
 
 def flatten_worklist(
