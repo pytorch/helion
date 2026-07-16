@@ -314,6 +314,15 @@ def default_pallas_jax_launcher(
     # codegen only for that lowering.
     compact_build_worklist = kwargs.get("_compact_build_worklist")
     if compact_build_worklist is not None:
+        # Resident caching: on this JAX-export/jit path the resident
+        # window IS applied, but the host overflow guard
+        # (runtime._compact_raise_if_range_exceeds_window) is NOT run here -- the
+        # offsets are jit tracers, so a per-source reduction length exceeding the
+        # window size C cannot be checked at trace time.  Contract: the caller
+        # must ensure every ordered (reduction) range <= C (VMEM-derived,
+        # thousands of tokens; the torch/eager launcher does enforce this).
+        # Sizing C from a caller-provided max bound would make the window
+        # overflow-proof by construction.
         from . import _pallas_compile_compact_jit_fn
 
         result = _pallas_compile_compact_jit_fn(
@@ -341,6 +350,13 @@ def default_pallas_jax_launcher(
                 "Any", kwargs.get("_compact_tile_start_ref_pos", 1)
             ),
             compact_block=cast("Any", kwargs.get("_compact_block", 1)),
+            ordered_aligned_arg_indices=cast(
+                "Any", kwargs.get("_compact_ordered_aligned_arg_indices") or []
+            ),
+            range_start_ref_pos=cast(
+                "Any", kwargs.get("_compact_range_start_ref_pos", -1)
+            ),
+            ordered_window=cast("Any", kwargs.get("_compact_ordered_window", 0)),
             interpret=interpret,
         )
     else:

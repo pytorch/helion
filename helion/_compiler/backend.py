@@ -2620,7 +2620,7 @@ class PallasBackend(Backend):
         # is rejected by this JAX's Mosaic lowering ("Unsupported block dimension
         # type: BoundedSlice" -- it only works inside pltpu.emit_pipeline).  The
         # full-block write's only hazard is a partial last tile overlapping the
-        # next sequence's leading rows; "arbitrary" dimension semantics serialize
+        # next owner's leading rows; "arbitrary" dimension semantics serialize
         # that grid-ordered overlap so the later, correct write wins (verified
         # bitwise == fori_loop across uniform/partial/unaligned/jagged + 5 random
         # seeds).  Robust+fast exact store == the deferred emit_pipeline +
@@ -2631,6 +2631,52 @@ class PallasBackend(Backend):
             if p.kind in ("compact_aligned_load", "compact_exact_store")
             and p.arg_name in name_to_index
         ]
+        # The cached resident-cache decision drives every resident-window launcher
+        # arg: resident-window tensors, the exact physical window integer, and the
+        # ordered/compact offset args used by the overflow guard.
+        decision = env.compact_worklist_resident_cache_decision
+        ordered_indices: list[int] = []
+        range_start_ref_pos = -1
+        ordered_offset_arg_index = -1
+        active_mask_arg_index = -1
+        ordered_window = 0
+        if decision is not None and decision.active:
+            assert decision.range_spec is not None
+            if decision.resident_key_fields != ("range_start",):
+                raise exc.InvalidConfig(
+                    "compact_worklist resident caching: Phase 1 resident windows "
+                    "must be keyed by range_start."
+                )
+            range_start_ref_pos = (
+                fields.index("range_start") if "range_start" in fields else -1
+            )
+            missing_residents = [
+                name for name in decision.resident_operands if name not in name_to_index
+            ]
+            if missing_residents:
+                raise exc.InvalidConfig(
+                    "compact_worklist resident caching: active resident operands are "
+                    f"missing from the kernel argument list: {missing_residents}."
+                )
+            ordered_indices = [
+                name_to_index[name] for name in decision.resident_operands
+            ]
+            ordered_offset_arg_index = name_to_index.get(
+                decision.range_spec.ordered_offset_arg, -1
+            )
+            active_mask_arg_index = name_to_index.get(
+                decision.range_spec.compact_offset_arg, -1
+            )
+            ordered_window = decision.physical_window
+            if (
+                range_start_ref_pos < 0
+                or ordered_offset_arg_index < 0
+                or active_mask_arg_index < 0
+            ):
+                raise exc.InvalidConfig(
+                    "compact_worklist resident caching: active range metadata or "
+                    "offset args are missing from the kernel argument list."
+                )
         return [
             "_compact_build_worklist=_build_worklist",
             f"_compact_offset_arg_indices={offset_indices!r}",
@@ -2640,6 +2686,11 @@ class PallasBackend(Backend):
             f"_compact_aligned_arg_indices={aligned_indices!r}",
             f"_compact_tile_start_ref_pos={fields.index('tile_starts')}",
             f"_compact_block={env.compact_worklist_block}",
+            f"_compact_ordered_aligned_arg_indices={ordered_indices!r}",
+            f"_compact_range_start_ref_pos={range_start_ref_pos}",
+            f"_compact_ordered_offset_arg_index={ordered_offset_arg_index}",
+            f"_compact_active_mask_arg_index={active_mask_arg_index}",
+            f"_compact_ordered_window={ordered_window}",
         ]
 
     def build_launcher_name(self, config: Config) -> str:
@@ -2691,14 +2742,17 @@ class PallasBackend(Backend):
         # pallas_loop_type, so a stale plan would mis-lower a fori/emit config.
         env = CompileEnvironment.current()
         env.compact_worklist_plan = None
+        env.compact_worklist_resident_cache_decision = None
+        env.compact_worklist_resident_prep_hoists = ()
         env.compact_worklist_upper = 1
         env.compact_worklist_block = 1
+        env.compact_worklist_ordered_block = 1
         env.compact_worklist_offset_params = []
 
         if config.get("pallas_loop_type") == "compact_worklist":
-            self._setup_compact_worklist(config)
+            self._setup_compact_worklist(graphs, config)
 
-    def _setup_compact_worklist(self, config: Config) -> None:
+    def _setup_compact_worklist(self, graphs: list[GraphInfo], config: Config) -> None:
         """Detect + stash the compact-worklist plan before device codegen.
 
         Runs early (pre_codegen) so ``env.compact_worklist_plan`` is set when the
@@ -2708,9 +2762,11 @@ class PallasBackend(Backend):
         megablocks ``UPPER``.  ``detect_*`` raises ``exc.InvalidConfig`` on a
         non-matching kernel (autotuner-skippable).
         """
+        from ..runtime import _get_vmem_limit_bytes
         from .compile_environment import CompileEnvironment
         from .device_function import DeviceFunction
         from .host_function import HostFunction
+        from .pallas.compact_worklist import build_resident_cache_admission
         from .pallas.compact_worklist import detect_compact_worklist_plan
         from .pallas.compact_worklist import metadata_arg_names
 
@@ -2725,12 +2781,39 @@ class PallasBackend(Backend):
             if ref not in device_fn.wrapper_only_params:
                 device_fn.wrapper_only_params.append(ref)
 
-        # Compact-axis tile block size (NOT max(block_sizes): for fully jagged
-        # with Q_BLOCK < KV_BLOCK that would undersize the worklist metadata).
+        # Compact-axis tile block size (NOT max(block_sizes): a distinct larger
+        # ordered block would undersize the worklist metadata).
         compact_block = env.block_sizes[plan.compact_axis.block_id].from_config(config)
         assert compact_block is not None, "compact tile has no block size"
         env.compact_worklist_block = int(compact_block)
+        # Ordered (reduction) tile block -- resident caching uses this compile-side to
+        # choose a block-aligned physical window (it can differ from the compact
+        # block, e.g. compact_block != ordered_block).
+        env.compact_worklist_ordered_block = 1
+        if plan.ordered_axis is not None:
+            ordered_block = env.block_sizes[plan.ordered_axis.block_id].from_config(
+                config
+            )
+            if ordered_block is not None:
+                env.compact_worklist_ordered_block = int(ordered_block)
         env.compact_worklist_upper = self._compact_worklist_upper(plan, config, host_fn)
+
+        import jax.experimental.pallas.tpu as pltpu
+
+        # Choose C from the conservative device-reported VMEM budget.  The runtime
+        # may pass a higher Mosaic compile ceiling for resident-window kernels so TPU7x
+        # accepts this already-sized allocation, but that ceiling is deliberately
+        # not used here as an allocation budget.
+        vmem_bytes = _get_vmem_limit_bytes(pltpu)
+        admission = build_resident_cache_admission(
+            graphs,
+            plan,
+            host_fn.params.arguments,
+            ordered_block=env.compact_worklist_ordered_block,
+            vmem_bytes=vmem_bytes,
+        )
+        env.compact_worklist_resident_prep_hoists = admission.prep_hoists
+        env.compact_worklist_resident_cache_decision = admission.decision
 
     def _compact_worklist_upper(
         self, plan: CompactWorklistPlan, config: Config, host_fn: HostFunction
@@ -2750,7 +2833,7 @@ class PallasBackend(Backend):
         from .compile_environment import CompileEnvironment
 
         params = dict(host_fn.params.arguments)
-        # Owner count from the captured grid bound (e.g. q_offsets.shape[0] - 1).
+        # Owner count from the captured grid bound (e.g. offsets.shape[0] - 1).
         # num_owners_expr is a codegen-derived host expression; if it references a
         # name not in params (a source shape we failed to inline), surface it as
         # an autotuner-skippable InvalidConfig rather than a bare exception that
