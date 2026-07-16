@@ -3,6 +3,7 @@ from __future__ import annotations
 import ast
 import collections
 import contextlib
+import dataclasses
 import re
 from typing import TYPE_CHECKING
 from typing import NamedTuple
@@ -48,8 +49,27 @@ if TYPE_CHECKING:
     from .device_ir import GraphInfo
     from .host_function import HostFunction
     from .loop_dependency_checker import LoopDependencyChecker
+    from .pallas.compact_worklist import ResidentPrepHoist
     from .tile_strategy import DeviceLoopOrGridState
     from .type_info import TensorType
+
+
+@dataclasses.dataclass(frozen=True)
+class ResidentPrepLowering:
+    hoist: ResidentPrepHoist
+    resident_window_name: str
+    cache_name: str
+    # The value the refill writes into the cache's padded (out-of-range) tail; it also
+    # serves as the elision key, since a downstream per-tile ``_mask_to`` with this same
+    # fill is then redundant and may be dropped (letting Mosaic fold the transpose into
+    # the matmul push).  Every prep that installs a refill -- all of them today -- must
+    # declare a finite value: ``_emit_resident_prep_refill`` emits it as a bare literal
+    # and asserts it is non-None and finite.  The ``None`` default is a construction guard
+    # only -- a new prep kind that forgets to set a fill is not silently opted into elision
+    # (the elision dict skips ``None``) and trips that refill assert -- NOT a usable "write
+    # a fill but keep the load mask" mode.  Expressing that needs the field split into a
+    # required tail-write value plus an optional (separate) elision fill.
+    tail_fill_value: float | None = None
 
 
 class GenerateAST(NodeVisitor, CodegenInterface):
@@ -129,6 +149,9 @@ class GenerateAST(NodeVisitor, CodegenInterface):
         self.store_transform = store_transform
         self.load_transform = load_transform
         self._statement_owner_fx_node: Node | None = None
+        self.resident_prep_lowering_stack: list[
+            dict[tuple[int, str], ResidentPrepLowering]
+        ] = []
 
         # Now create device function and initialize CodegenInterface
         self.device_function = DeviceFunction(
@@ -144,6 +167,32 @@ class GenerateAST(NodeVisitor, CodegenInterface):
 
     def get_graph(self, graph_id: int) -> GraphInfo:
         return self.codegen_graphs[graph_id]
+
+    @contextlib.contextmanager
+    def resident_prep_lowering_scope(
+        self, lowerings: list[ResidentPrepLowering]
+    ) -> Iterator[None]:
+        by_node = {
+            (lowering.hoist.graph_id, lowering.hoist.prep_node_name): lowering
+            for lowering in lowerings
+        }
+        self.resident_prep_lowering_stack.append(by_node)
+        try:
+            yield
+        finally:
+            self.resident_prep_lowering_stack.pop()
+
+    def resident_prep_lowering_for_node(
+        self, node: Node
+    ) -> ResidentPrepLowering | None:
+        for scope in reversed(self.resident_prep_lowering_stack):
+            for (graph_id, prep_node_name), lowering in scope.items():
+                if prep_node_name != node.name:
+                    continue
+                if self.get_graph(graph_id).graph is not node.graph:
+                    continue
+                return lowering
+        return None
 
     def offset_var(self, block_idx: int) -> str:
         return self.active_device_loops[block_idx][-1].strategy.offset_var(block_idx)

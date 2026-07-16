@@ -28,6 +28,16 @@ on:
         required: false
         type: boolean
         default: false
+      run_b200_linattn:
+        description: 'Run linear-attention benchmark (vs FLA) on B200'
+        required: false
+        type: boolean
+        default: false
+      run_h100_linattn:
+        description: 'Run linear-attention benchmark (vs FLA) on H100'
+        required: false
+        type: boolean
+        default: false
       kernels:
         description: 'Comma-separated list of kernels to benchmark on GPU runners'
         required: false
@@ -50,6 +60,11 @@ on:
         required: false
         type: string
         default: "vector_add,layer_norm,rms_norm,vector_exp,sum"
+      kernels_linattn:
+        description: 'Comma-separated list of linear-attention variants (vs FLA) from benchmarks/run_linattn.py::VARIANTS; each appears on the dashboard as both a forward and a -bwd row.'
+        required: false
+        type: string
+        default: "vanilla_linear_attn,vanilla_linear_attn-bwd,simple_gla,simple_gla-bwd,retention,retention-bwd,full_gla,full_gla-bwd,delta_rule,delta_rule-bwd,gated_delta_rule,gated_delta_rule-bwd,kda,kda-bwd"
       env_vars:
         description: 'Environment variables for benchmark runner'
         required: false
@@ -181,9 +196,43 @@ jobs:
       kernels: ${{ github.event.inputs.kernels_tpu }}
       env-vars: ${{ github.event.inputs.env_vars }}
 
+  run-b200-linattn:
+    if: ${{ github.event.inputs.run_b200_linattn == 'true' }}
+    uses: ./.github/workflows/benchmark.yml
+    permissions:
+      id-token: write
+      contents: read
+    with:
+      runner: linux.dgx.b200
+      python-version: "3.12"
+      image: nvidia/cuda:13.1.0-devel-ubuntu24.04
+      runtime-version: cu130
+      container-options: --gpus all
+      alias: b200
+      suite: linattn
+      kernels: ${{ github.event.inputs.kernels_linattn }}
+      env-vars: ${{ github.event.inputs.env_vars }}
+
+  run-h100-linattn:
+    if: ${{ github.event.inputs.run_h100_linattn == 'true' }}
+    uses: ./.github/workflows/benchmark.yml
+    permissions:
+      id-token: write
+      contents: read
+    with:
+      runner: mt-l-x86iamx-22-225-h100
+      python-version: "3.12"
+      image: nvidia/cuda:13.1.0-devel-ubuntu24.04
+      runtime-version: cu130
+      container-options: --gpus all
+      alias: h100
+      suite: linattn
+      kernels: ${{ github.event.inputs.kernels_linattn }}
+      env-vars: ${{ github.event.inputs.env_vars }}
+
   trigger-docs-deploy:
     if: always()
-    needs: [run-b200, run-b200-cute, run-h100, run-mi350x, run-tpu]
+    needs: [run-b200, run-b200-cute, run-h100, run-mi350x, run-tpu, run-b200-linattn, run-h100-linattn]
     runs-on: ubuntu-latest
     permissions:
       actions: write

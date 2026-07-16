@@ -25,7 +25,9 @@ def main() -> int:
         if not filename.startswith("examples/") or not filename.endswith(".py"):
             continue
         name = Path(filename).name
-        if name in ["__init__.py", "utils.py"] or name.startswith("_helion_aot"):
+        if name in ["__init__.py", "utils.py"] or name.startswith(
+            ("_helion_aot", "linear_attention_")
+        ):
             continue
         if not has_main_function(filename):
             print(f"{filename} is missing a main() function.")
