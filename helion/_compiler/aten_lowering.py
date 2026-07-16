@@ -776,6 +776,11 @@ def codegen_permute(ctx: LoweringContext, node: Node) -> object:
 
 @permute_lowering.register_codegen("pallas")
 def codegen_permute_pallas(ctx: LoweringContext, node: Node) -> object:
+    from .pallas.codegen import maybe_codegen_resident_prep_cache_read
+
+    resident_prep_read = maybe_codegen_resident_prep_cache_read(ctx, node)
+    if resident_prep_read is not None:
+        return resident_prep_read
     tensor, dims = map_arg(node.args, lambda arg: _env_arg(ctx, arg))
     assert isinstance(tensor, ast.AST)
     # pyrefly: ignore [not-iterable]

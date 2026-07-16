@@ -21,6 +21,10 @@ on:
       alias:
         required: true
         type: string
+      suite:
+        required: false
+        type: string
+        default: tritonbench
       backend:
         required: false
         type: string
@@ -142,7 +146,8 @@ jobs:
           print(f'All {n} devices healthy')
           "
 
-      - name: Install Benchmark Requirements
+      - name: Install TritonBench Requirements
+        if: inputs.suite == 'tritonbench'
         run: |
           set -x
           source .venv/bin/activate
@@ -164,7 +169,22 @@ jobs:
           popd
           popd
 
-      - name: Run Benchmark
+      - name: Install Linear-Attention Requirements
+        if: inputs.suite == 'linattn'
+        run: |
+          set -x
+          source .venv/bin/activate
+          # Newer FLA allows gated backward on Hopper with Triton 3.7.1+;
+          # torch 2.12.1 provides that Triton version.
+          PYTORCH_INDEX="${PYPI_CACHE_WHL_URL:-https://download.pytorch.org/whl/cpu}"
+          UV_DEFAULT_INDEX= UV_INDEX= uv pip install -U "torch==2.12.1" --index-url "${PYTORCH_INDEX%/whl/*}/whl/${{ inputs.runtime-version }}"
+          uv pip install einops transformers
+          uv pip install "git+https://github.com/fla-org/flash-linear-attention@6bd90692588c81fe102ee6e12ac70686359658a2" --no-deps
+          python -c "from packaging.version import Version; import torch, triton; print('torch', torch.__version__, 'triton', triton.__version__); assert torch.cuda.is_available(); assert Version(triton.__version__) >= Version('3.7.1'), triton.__version__"
+          python -c "import fla; print('fla', fla.__name__)"
+
+      - name: Run TritonBench Benchmark
+        if: inputs.suite == 'tritonbench'
         run: |
           rm -rf /tmp/torchinductor_*/ || true
 
@@ -228,6 +248,41 @@ jobs:
 
             echo "✅ Completed benchmark for kernel: $kernel"
           done
+
+          if [[ ! -s "$TEST_REPORTS_DIR/helionbench.json" ]]; then
+            echo "❌ helionbench.json is missing or empty"
+            exit 1
+          fi
+          cat "$TEST_REPORTS_DIR/helionbench.json"
+
+      - name: Run Linear-Attention Benchmark
+        if: inputs.suite == 'linattn'
+        run: |
+          rm -rf /tmp/torchinductor_*/ || true
+
+          source .venv/bin/activate
+
+          TEST_REPORTS_DIR=$(pwd)/test/test-reports
+          mkdir -p "$TEST_REPORTS_DIR"
+          echo "$TEST_REPORTS_DIR"
+
+          KERNELS="${{ inputs.kernels }}"
+          if [[ "$KERNELS" == "all" || -z "$KERNELS" ]]; then
+            KERNEL_FLAG=()
+          else
+            KERNEL_FLAG=(--kernel "$KERNELS")
+          fi
+
+          echo "=========================================="
+          echo "Linear-Attention Benchmark"
+          echo "Kernels: ${KERNELS:-all}"
+          echo "=========================================="
+
+          ${{ inputs.env-vars }} HELION_PRINT_OUTPUT_CODE=1 \
+          python -m benchmarks.run_linattn \
+              "${KERNEL_FLAG[@]}" \
+              --output "$TEST_REPORTS_DIR/helionbench.json" \
+              ${{ inputs.custom-args }}
 
           if [[ ! -s "$TEST_REPORTS_DIR/helionbench.json" ]]; then
             echo "❌ helionbench.json is missing or empty"
