@@ -185,18 +185,15 @@ def _nvfp4_gemv_bf16in_triton_body(
 ) -> Tensor:
     """W4A16 NVFP4 GEMV, Triton backend (fp16 decode, fp32 scale).
 
-    Two coalescing wins make this genuine Helion->Triton output competitive:
-    ncu showed a naive decode is not DRAM-bound but stalls on uncoalesced loads:
+    Loads are arranged to improve memory coalescing:
 
-    * Weight: each 16-value group is one contiguous 8-byte chunk, loaded as one
-      64-bit word by ``hl.load_float4_e2m1fn_x16_to_float16``. (Reading it as
-      two int32 words would make each load stride-2, halving coalescing.)
-    * Activation: load a group's 16 bf16 as one contiguous ``(block_g, 16)`` tile,
-      then peel each lane with a masked sum (the DSL cannot subscript a loaded
-      tile as ``xt[:, j]``) -- the contiguous load is what coalesces.
+    * Weight: each 16-value group is loaded as one contiguous 64-bit word by
+      ``hl.load_float4_e2m1fn_x16_to_float16``.
+    * Activation: each group of 16 bf16 values is loaded as a contiguous
+      ``(block_g, 16)`` tile before selecting individual lanes.
 
-    The per-group E4M3 scale stays a swizzled gather: SWIZZLE_32_4_4's max
-    contiguous run is 4 bytes, so it cannot be coalesced for M-tiled access.
+    The per-group E4M3 scale remains a swizzled gather because SWIZZLE_32_4_4
+    provides at most four contiguous scale bytes for this access pattern.
     """
     M = hl.specialize(weight_bytes.size(0))
     K_bytes = hl.specialize(weight_bytes.size(1))
@@ -371,9 +368,7 @@ def _nvfp4_gemv_fp4in_triton_body(
 
 
 # Triton W4A16 uses the coalesced-load body with block_m=16 and block_g=128.
-# Triton W4A4 uses the autotuned pretuned config from nvfp4_gemv. The CuTe
-# backend remains a Helion DSL fallback for coverage rather than a hand-written
-# CuTe fast path.
+# Triton W4A4 uses the autotuned pretuned config from nvfp4_gemv.
 BF16IN_TRITON_CONFIG = helion.Config(block_sizes=[16, 128], num_warps=4, num_stages=3)
 FP4IN_TRITON_CONFIG = helion.Config(
     block_sizes=[4, 256],
