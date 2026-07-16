@@ -297,41 +297,6 @@ RCP_LN2 = 1.4426950408889634
 
 
 @helion.kernel()
-def chunk_fwd_prescale_diag(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    g: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Fused pre-scaling for diagonal decay forward."""
-    BHN = q.size(0)
-    C = hl.specialize(q.size(1))
-    D = q.size(2)
-
-    q_scaled = torch.empty([BHN, C, D], dtype=torch.float32, device=q.device)
-    k_intra = torch.empty([BHN, C, D], dtype=torch.float32, device=q.device)
-    k_state = torch.empty([BHN, C, D], dtype=torch.float32, device=q.device)
-    g_last_out = torch.empty([BHN, D], dtype=torch.float32, device=q.device)
-
-    for tile_bhn, tile_d in hl.tile([BHN, D]):
-        g_acc = hl.zeros([tile_bhn, tile_d], dtype=torch.float32)
-        for c in range(C):
-            g_acc = g_acc + g[tile_bhn, c, tile_d].float()
-            exp_gc = torch.exp(g_acc)
-            q_scaled[tile_bhn, c, tile_d] = q[tile_bhn, c, tile_d].float() * exp_gc
-            k_intra[tile_bhn, c, tile_d] = k[tile_bhn, c, tile_d].float() / exp_gc
-        g_last_out[tile_bhn, tile_d] = g_acc
-
-        g_acc2 = hl.zeros([tile_bhn, tile_d], dtype=torch.float32)
-        for c in range(C):
-            g_acc2 = g_acc2 + g[tile_bhn, c, tile_d].float()
-            k_state[tile_bhn, c, tile_d] = k[tile_bhn, c, tile_d].float() * torch.exp(
-                g_acc - g_acc2
-            )
-
-    return q_scaled, k_intra, k_state, g_last_out
-
-
-@helion.kernel()
 def chunk_fwd_h_diag_fused(
     k: torch.Tensor,
     v: torch.Tensor,
@@ -546,12 +511,13 @@ def chunk_bwd_dh_diag_fused(
     gc: torch.Tensor | None = None,
     use_g: hl.constexpr = True,  # pyrefly: ignore[bad-function-definition]
     scalar_decay: hl.constexpr = False,  # pyrefly: ignore[bad-function-definition]
+    diag_anchored: hl.constexpr = False,  # pyrefly: ignore[bad-function-definition]
     scale: float = 1.0,
 ) -> torch.Tensor:
     """Fused state gradient propagation over N chunks in reverse.
 
-    Tiles [BH, D, DV] to parallelize over both key and value dimensions. Three
-    compile-time decay modes (specialized, no runtime branch):
+    Tiles [BH, D, DV] to parallelize over both key and value dimensions.
+    Compile-time decay modes (specialized, no runtime branch):
       - use_g=False:        no decay; q is unscaled so scale folds into the q-row.
       - diagonal (default): q is pre-scaled by exp(gc); g_last is a per-channel
         [BH, N, D] state decay applied as dh_acc * exp(g_last).
@@ -563,9 +529,14 @@ def chunk_bwd_dh_diag_fused(
         one hardware instruction:
             dh_all[i] = exp2(RCP_LN2 * g_last[i+1]) * dh_all[i+1]
                         + (scale * exp2(RCP_LN2 * gc[i+1]))[:, None] * q[i+1])^T @ do[i+1]
+      - diag_anchored=True: q is raw and gc [BH, N, C, D] is the per-channel
+        cumsum; the decay rides q per channel (exp2 of RCP_LN2 * gc):
+            dh_all[i] = exp2(RCP_LN2 * gc_last[i+1]) * dh_all[i+1]
+                        + (scale * exp2(RCP_LN2 * gc[i+1]) * q[i+1])^T @ do[i+1]
     """
     BH = q.size(0)
     N = q.size(1)
+    C = hl.specialize(q.size(2))
     D = q.size(3)
     DV = do.size(3)
 
@@ -584,6 +555,14 @@ def chunk_bwd_dh_diag_fused(
                 q_i = (
                     q[idx, i, :, tile_d].float()
                     * (scale * torch.exp2(g_i * RCP_LN2))[:, None]
+                ).to(q.dtype)
+            elif diag_anchored:
+                gc_i = gc[idx, i, :, tile_d].float()
+                gc_last = gc[idx, i, C - 1, tile_d].float()
+                dh_acc = dh_acc * torch.exp2(gc_last * RCP_LN2)[:, None]
+                q_i = (
+                    q[idx, i, :, tile_d].float()
+                    * (scale * torch.exp2(gc_i * RCP_LN2))
                 ).to(q.dtype)
             elif use_g:
                 gl_d = g_last[idx, i, tile_d]
@@ -728,17 +707,29 @@ def chunk_bwd_dqkg_scalar_helion(
     k: torch.Tensor,
     v: torch.Tensor,
     g_cs: torch.Tensor,
-    g_last: torch.Tensor,
     h: torch.Tensor,
     do: torch.Tensor,
     dh: torch.Tensor,
+    g_last: torch.Tensor | None = None,
+    diag_anchored: hl.constexpr = False,  # pyrefly: ignore[bad-function-definition]
     scale: float = 1.0,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Compute dQ, dK, and the per-position decay-gradient dg_raw for scalar decay.
-
-    Like chunk_bwd_dqk_helion but also emits per-D contributions to
-    dg_raw = sum_D(dq*q) - sum_D(dk*k) from the fp32 dq/dk accumulators.
-    The caller sums over D, then finishes dg by a reverse cumsum over the chunk.
+    """Compute dQ, dK, and the per-position dg_raw. The DV loop accumulates, shared:
+        dA_raw   = do @ v^T          # [C, C]
+        dq_cross = do @ h^T          # [C, D]
+        dk_state = (v @ dh^T) * exp2(gc_last - gc)
+    Then two compile-time decay modes (specialized, no runtime branch):
+      - scalar (default): g_cs [BHN, C], g_last [BHN]; decay is a [C, C] mask on dA:
+            dA = dA_raw * exp2(gc_t - gc_s) * tril
+            dq = scale * (dA @ k + exp2(gc) * dq_cross)
+            dk = scale * (dA^T @ q) + dk_state
+      - diag_anchored=True: g_cs [BHN, C, D] per channel; decay folds into operands:
+            dA = dA_raw * tril
+            dq = scale * exp2(gc) * (dA @ (exp2(-gc) * k) + dq_cross)
+            dk = scale * exp2(-gc) * (dA^T @ (exp2(gc) * q)) + dk_state
+        dg_raw = q * dq - k * dk
+    The state-carry gate gradient is folded into dg_raw's last position; the caller
+    finishes dg by a reverse cumsum over the chunk (scalar also sums dg_raw over D).
     """
     BHN = q.size(0)
     C = hl.specialize(q.size(1))
@@ -770,27 +761,43 @@ def chunk_bwd_dqkg_scalar_helion(
             )
             dh_h_acc += (ht.float() * dht.float()).sum(dim=-1)
 
-        gc = g_cs[tile_bhn, :].float()
         idx = hl.arange(C)
         causal = (idx[:, None] >= idx[None, :]).float()
-        dA = dA_raw * torch.exp2((gc[:, :, None] - gc[:, None, :]) * RCP_LN2) * causal
-
         qt = q[tile_bhn, :, tile_d]
         kt = k[tile_bhn, :, tile_d]
-        gl = g_last[tile_bhn].float()
-        exp_gc = torch.exp2(gc * RCP_LN2)[:, :, None]
-        exp_gl_minus_gc = torch.exp2((gl[:, None] - gc) * RCP_LN2)[:, :, None]
-        dk_state = dk_state_acc * exp_gl_minus_gc
-        dq_acc = hl.dot(dA.to(kt.dtype), kt, acc=dq_cross_acc * exp_gc) * scale
-        dk_acc = hl.dot(dA.transpose(-2, -1).to(qt.dtype), qt) * scale + dk_state
+
+        if diag_anchored:
+            gct = g_cs[tile_bhn, :, tile_d].float()
+            gc_last = g_cs[tile_bhn, C - 1, tile_d].float()
+            exp_gc = torch.exp2(gct * RCP_LN2)
+            exp_neg_gc = torch.exp2(-gct * RCP_LN2)
+            exp_gl = torch.exp2(gc_last * RCP_LN2)
+            exp_gl_minus_gc = torch.exp2((gc_last[:, None, :] - gct) * RCP_LN2)
+
+            dA = dA_raw * causal[None, :, :]
+            dk_state = dk_state_acc * exp_gl_minus_gc
+            dq_acc = hl.dot(dA, kt * exp_neg_gc, acc=dq_cross_acc) * exp_gc * scale
+            dk_acc = (
+                hl.dot(dA.transpose(-2, -1), qt * exp_gc) * exp_neg_gc * scale
+                + dk_state
+            )
+        else:
+            gc = g_cs[tile_bhn, :].float()
+            gl = g_last[tile_bhn].float()
+            exp_gc = torch.exp2(gc * RCP_LN2)[:, :, None]
+            exp_gl = torch.exp2(gl * RCP_LN2)[:, None]
+            exp_gl_minus_gc = torch.exp2((gl[:, None] - gc) * RCP_LN2)[:, :, None]
+
+            dA = dA_raw * torch.exp2((gc[:, :, None] - gc[:, None, :]) * RCP_LN2) * causal
+            dk_state = dk_state_acc * exp_gl_minus_gc
+            dq_acc = hl.dot(dA.to(kt.dtype), kt, acc=dq_cross_acc * exp_gc) * scale
+            dk_acc = hl.dot(dA.transpose(-2, -1).to(qt.dtype), qt) * scale + dk_state
 
         dg_raw = dq_acc * qt.float() - dk_acc * kt.float()
         dq_out[tile_bhn, :, tile_d] = dq_acc.to(dq_out.dtype)
         dk_out[tile_bhn, :, tile_d] = dk_acc.to(dk_out.dtype)
 
-        dg_last = torch.exp2(gl * RCP_LN2)[:, None] * dh_h_acc + (
-            dk_state * kt.float()
-        ).sum(dim=1)
+        dg_last = exp_gl * dh_h_acc + (dk_state * kt.float()).sum(dim=1)
         is_last = (idx == C - 1).float()
         dg_raw_by_d[tile_bhn, :, tile_d] = (
             dg_raw + is_last[None, :, None] * dg_last[:, None, :]
@@ -808,12 +815,14 @@ def chunk_bwd_dv_helion(
     do: torch.Tensor,
     dh: torch.Tensor,
     g_last: torch.Tensor | None = None,
+    A: torch.Tensor | None = None,
     use_g: hl.constexpr = True,  # pyrefly: ignore[bad-function-definition]
     scalar_decay: hl.constexpr = False,  # pyrefly: ignore[bad-function-definition]
+    diag_anchored: hl.constexpr = False,  # pyrefly: ignore[bad-function-definition]
     scale: float = 1.0,
 ) -> torch.Tensor:
-    """Compute dV for all chunks in parallel (no correction). Three compile-time
-    decay modes (specialized, no runtime branch):
+    """Compute dV for all chunks in parallel (no correction). Compile-time decay
+    modes (specialized, no runtime branch):
       - use_g=False:        no decay; intra attention uses q' = scale*q.
       - diagonal (default): k_state is pre-scaled by the state decay on host, and
         the intra attention is masked by exp(gc - gc^T).
@@ -825,6 +834,10 @@ def chunk_bwd_dv_helion(
         computed as exp2(RCP_LN2 * x) == exp(x), since exp2 is one instruction:
             dv[i] = (scale * exp2(RCP_LN2 * (gc - gc^T)) * tril * (q @ k^T))^T @ do
                     + exp2(RCP_LN2 * (g_last - gc))[:, None] * (k @ dh)
+      - diag_anchored=True: g_cs [BHN, C, D] is the per-channel cumsum; the state
+        decay exp2(RCP_LN2 * (gc_last - gc)) rides k, and the intra term reuses the
+        forward's pre-scaled, pre-masked score matrix A instead of recomputing it:
+            dv[i] = A^T @ do + exp2(RCP_LN2 * (gc_last - gc)) * k) @ dh
     """
     BHN = q.size(0)
     C = hl.specialize(q.size(1))
@@ -838,14 +851,21 @@ def chunk_bwd_dv_helion(
         attn = hl.zeros([tile_bhn, C, C], dtype=torch.float32)
 
         for tile_d in hl.tile(D):
-            qt = q[tile_bhn, :, tile_d]
             kt = k[tile_bhn, :, tile_d]
             dht = dh[tile_bhn, tile_d, tile_dv]
 
-            attn = hl.dot(qt, kt.transpose(-2, -1), acc=attn)
             if scalar_decay:
+                attn = hl.dot(q[tile_bhn, :, tile_d], kt.transpose(-2, -1), acc=attn)
                 dv_acc = hl.dot(kt, dht.to(kt.dtype), acc=dv_acc)
+            elif diag_anchored:
+                gct = g_cs[tile_bhn, :, tile_d].float()
+                gc_last = g_cs[tile_bhn, C - 1, tile_d].float()
+                kg = (
+                    kt.float() * torch.exp2((gc_last[:, None, :] - gct) * RCP_LN2)
+                ).to(kt.dtype)
+                dv_acc = hl.dot(kg, dht.to(kg.dtype), acc=dv_acc)
             else:
+                attn = hl.dot(q[tile_bhn, :, tile_d], kt.transpose(-2, -1), acc=attn)
                 kst = k_state[tile_bhn, :, tile_d]
                 dv_acc = hl.dot(kst, dht.to(kst.dtype), acc=dv_acc)
 
@@ -860,6 +880,8 @@ def chunk_bwd_dv_helion(
             attn = attn * (decay_mask * scale)
             exp_dk = torch.exp2((g_last[tile_bhn].float()[:, None] - gc) * RCP_LN2)
             dv_acc = dv_acc * exp_dk[:, :, None]
+        elif diag_anchored:
+            attn = A[tile_bhn, :, :]
         elif use_g:
             gc = g_cs[tile_bhn, :]
             decay_ij = torch.exp(gc[:, :, None] - gc[:, None, :])
@@ -927,84 +949,6 @@ def chunk_bwd_dqkg_diag_helion(
         dk_state_out[tile_bhn, :, tile_d] = dk_state_acc.to(q.dtype)
 
     return dq_out, dk_intra_out, dk_state_out
-
-
-@helion.kernel()
-def chunk_bwd_dg_diag_helion(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    g: torch.Tensor,
-    dq_raw: torch.Tensor,
-    dk_intra_raw: torch.Tensor,
-    dk_state_raw: torch.Tensor,
-    h: torch.Tensor,
-    dh: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Fused post-scaling + dg computation for diagonal decay backward."""
-    BHN = q.size(0)
-    C = hl.specialize(q.size(1))
-    D = q.size(2)
-    DV = h.size(2)
-
-    dq_out = torch.empty([BHN, C, D], dtype=torch.float32, device=q.device)
-    dk_out = torch.empty([BHN, C, D], dtype=torch.float32, device=q.device)
-    dg_out = torch.empty([BHN, C, D], dtype=torch.float32, device=q.device)
-
-    for tile_bhn, tile_d in hl.tile([BHN, D]):
-        dh_h_sum = hl.zeros([tile_bhn, tile_d], dtype=torch.float32)
-        for tile_dv in hl.tile(DV):
-            dht = dh[tile_bhn, tile_d, tile_dv].float()
-            ht = h[tile_bhn, tile_d, tile_dv].float()
-            dh_h_sum = dh_h_sum + (dht * ht).sum(-1)
-
-        g_acc = hl.zeros([tile_bhn, tile_d], dtype=torch.float32)
-        for c in range(C):
-            g_acc = g_acc + g[tile_bhn, c, tile_d].float()
-            dq_out[tile_bhn, c, tile_d] = dq_raw[
-                tile_bhn, c, tile_d
-            ].float() * torch.exp(g_acc)
-        g_last = g_acc
-
-        dg_last_state = dh_h_sum * torch.exp(g_last)
-
-        g_acc2 = hl.zeros([tile_bhn, tile_d], dtype=torch.float32)
-        dg_last_ks = hl.zeros([tile_bhn, tile_d], dtype=torch.float32)
-        for c in range(C):
-            g_acc2 = g_acc2 + g[tile_bhn, c, tile_d].float()
-            exp_neg_gc = torch.exp(-g_acc2)
-            exp_gl_gc = torch.exp(g_last - g_acc2)
-
-            dkir = dk_intra_raw[tile_bhn, c, tile_d].float()
-            dksr = dk_state_raw[tile_bhn, c, tile_d].float()
-            dk_out[tile_bhn, c, tile_d] = dkir * exp_neg_gc + dksr * exp_gl_gc
-
-            k_c = k[tile_bhn, c, tile_d].float()
-            dg_last_ks = dg_last_ks + dksr * k_c * exp_gl_gc
-
-        dg_last_total = dg_last_state + dg_last_ks
-
-        g_cs_cur = g_last
-        suffix = dg_last_total
-        for c_rev in range(C):
-            c = C - 1 - c_rev
-            exp_gc = torch.exp(g_cs_cur)
-            exp_gl_gc = torch.exp(g_last - g_cs_cur)
-
-            q_c = q[tile_bhn, c, tile_d].float()
-            k_c = k[tile_bhn, c, tile_d].float()
-            dqr = dq_raw[tile_bhn, c, tile_d].float()
-            dkir = dk_intra_raw[tile_bhn, c, tile_d].float()
-            dksr = dk_state_raw[tile_bhn, c, tile_d].float()
-
-            dg_cs_c = dqr * q_c * exp_gc - dkir * k_c / exp_gc - dksr * k_c * exp_gl_gc
-
-            suffix = suffix + dg_cs_c
-            dg_out[tile_bhn, c, tile_d] = suffix
-
-            if c > 0:
-                g_cs_cur = g_cs_cur - g[tile_bhn, c, tile_d].float()
-
-    return dq_out, dk_out, dg_out
 
 
 # Sub-block size for the anchored intra-chunk score matmul, matching FLA's
@@ -1420,6 +1364,9 @@ def _helion_chunked_fwd(
     A = chunk_fwd_A_diag_anchored_helion(qf, kf, gc, scale)
     o = chunk_fwd_o_diag_anchored_helion(qf, vf, gc, hf, A, scale)
 
+    # Attach cached data to h_all for the backward to use.
+    h_all._diag_bwd_cache = (gc, A)  # pyrefly: ignore
+
     final_state = None
     if return_final_state:
         k_state_last = (
@@ -1609,7 +1556,7 @@ def _helion_chunked_bwd(
         hb = h_all.reshape(BHN, D, DV)
 
         dq_raw, dk_raw, dg_raw_by_d = chunk_bwd_dqkg_scalar_helion(
-            qb, kb, vb, g_csf2, g_lastf2, hb, dob, dhf2, scale=scale
+            qb, kb, vb, g_csf2, hb, dob, dhf2, g_last=g_lastf2, scale=scale
         )
 
         dv_raw = chunk_bwd_dv_helion(
@@ -1635,61 +1582,58 @@ def _helion_chunked_bwd(
             dg,
         )
 
-    # Diagonal decay path: need float32 for prescale kernel
-    q_f, k_f, v_f, g_f = q.float(), k.float(), v.float(), g.float()
-    vf = v_f.reshape(BH, N, C, DV)
-    do_flat = grad_output_f.reshape(BH, N, C, DV)
+    # Diagonal decay path — reuse the forward's cached gc and A when available.
+    bwd_cache = getattr(h_all, "_diag_bwd_cache", None) if h_all is not None else None
+    if bwd_cache is not None:
+        gc, A = bwd_cache
+    else:
+        gc4 = g.reshape(BH, N, C, D).float().cumsum(-2)
+        gc = gc4.reshape(BHN, C, D)
+        A = chunk_fwd_A_diag_anchored_helion(
+            q.reshape(BHN, C, D), k.reshape(BHN, C, D), gc, scale
+        )
 
-    qf = q_f.reshape(BHN, C, D)
-    kf = k_f.reshape(BHN, C, D)
-    gf = g_f.reshape(BHN, C, D)
-    q_scaled, k_intra, k_state, g_last_flat = chunk_fwd_prescale_diag(qf, kf, gf)
-
-    k_state_4d = k_state.reshape(BH, N, C, D)
-    g_last_4d = g_last_flat.reshape(BH, N, D)
+    gc4 = gc.reshape(BH, N, C, D)
+    g_last_4d = gc4[:, :, -1, :]
+    v_4d = v.reshape(BH, N, C, DV)
 
     if h_all is None:
         state = q.new_zeros(BH, D, DV, dtype=torch.float32)
-        h_all = chunk_fwd_h_diag_fused(k_state_4d, vf, g_last_4d, state)
+        h_all = chunk_fwd_h_diag_fused(
+            k.reshape(BH, N, C, D), v_4d, g_last_4d, state, gc=gc4, diag_anchored=True
+        )
 
-    q_scaled_4d = q_scaled.reshape(BH, N, C, D)
+    q_4d = q.reshape(BH, N, C, D)
+    do_4d = grad_output.reshape(BH, N, C, DV)
     dstate = q.new_zeros(BH, D, DV, dtype=torch.float32)
-    dh_all = chunk_bwd_dh_diag_fused(q_scaled_4d, do_flat, g_last_4d, dstate)
+    dh_all = chunk_bwd_dh_diag_fused(
+        q_4d, do_4d, g_last_4d, dstate, gc=gc4, diag_anchored=True, scale=scale
+    )
 
-    # Only diagonal decay reaches here. Upcast the forward's bf16 h_all for this
-    # fp32 backward; drop once the backward moves to the anchored kernels.
-    ki_f2 = k_intra.reshape(BHN, C, D)
-    ks_f2 = k_state.reshape(BHN, C, D)
-    vf2 = vf.reshape(BHN, C, DV)
-    hf2 = h_all.reshape(BHN, D, DV).float()
+    qb = q.reshape(BHN, C, D)
+    kb = k.reshape(BHN, C, D)
+    vb = v.reshape(BHN, C, DV)
+    dob = grad_output.reshape(BHN, C, DV)
+    hb = h_all.reshape(BHN, D, DV)
     dhf2 = dh_all.reshape(BHN, D, DV)
-    dof2 = do_flat.reshape(BHN, C, DV)
-    qf2 = q_scaled.reshape(BHN, C, D)
 
-    dq_raw, dk_intra_raw, dk_state_raw = chunk_bwd_dqkg_diag_helion(
-        qf2, ki_f2, ks_f2, vf2, hf2, dof2, dhf2
+    dq_raw, dk_raw, dg_raw_by_d = chunk_bwd_dqkg_scalar_helion(
+        qb, kb, vb, gc, hb, dob, dhf2, diag_anchored=True, scale=scale
     )
 
-    zero_g_cs = q.new_zeros(BHN, C, dtype=torch.float32)
-    dv_raw = chunk_bwd_dv_helion(qf2, ki_f2, ks_f2, zero_g_cs, dof2, dhf2)
-    dv = dv_raw.reshape(B, H, T, DV).to(v.dtype)
-
-    dq, dk, dg_f32 = chunk_bwd_dg_diag_helion(
-        qf,
-        kf,
-        gf,
-        dq_raw,
-        dk_intra_raw,
-        dk_state_raw,
-        hf2,
-        dhf2,
+    dv_raw = chunk_bwd_dv_helion(
+        qb, kb, kb, gc, dob, dhf2, A=A, diag_anchored=True, scale=scale
     )
 
-    dq = dq.reshape(B, H, T, D).to(q.dtype)
-    dk = dk.reshape(B, H, T, D).to(k.dtype)
-    dg = dg_f32.reshape(B, H, T, D).to(g.dtype)
+    dg_raw = dg_raw_by_d.reshape(BH, N, C, D).flip(-2).cumsum(-2).flip(-2)
+    dg = dg_raw.reshape(B, H, T, D).to(g.dtype)
 
-    return dq, dk, dv, dg
+    return (
+        dq_raw.reshape(B, H, T, D),
+        dk_raw.reshape(B, H, T, D),
+        dv_raw.reshape(B, H, T, DV),
+        dg,
+    )
 
 
 def _recompute_wy(
@@ -1896,10 +1840,10 @@ def _helion_chunked_bwd_correction(
             af_raw,
             v_new_fwd_f,
             g_csf,
-            g_lastf,
             hf,
             dof,
             dhf,
+            g_last=g_lastf,
         )
         dg_raw = dg_raw_by_d.sum(-1)
         dg_attn_state = (
@@ -2181,11 +2125,12 @@ def helion_chunk_gla(
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     assert g is not None
     return chunked_linear_attn(
-        q * scale,
+        q,
         k,
         v,
         g,
         C=C,
+        scale=scale,
         initial_state=initial_state,
         return_final_state=return_final_state,
     )
