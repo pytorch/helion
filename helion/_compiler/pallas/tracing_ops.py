@@ -1791,8 +1791,8 @@ def _aligned_dim(
     is the largest float-tensor sublane (bf16 forces 16); tiles that carry are
     also registered for the store fold/save.
     """
-    from helion._compiler.backend import SliceAddressing
-    from helion._compiler.backend import _slice_addressing
+    from .backend import SliceAddressing
+    from .backend import _slice_addressing
     from helion._compiler.pallas.ordered_carry import CarryBoundaryTile
     from helion._compiler.pallas.ordered_carry import is_row_map_axis
     from helion._compiler.pallas.ordered_carry import needs_ordered_carry

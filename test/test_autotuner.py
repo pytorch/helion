@@ -5468,9 +5468,9 @@ class TestAutotuneBudget(TestCase):
         self.assertIsNone(settings.autotune_budget_seconds)
 
     def test_cute_backend_uses_default_autotune_budget_without_mutating(self) -> None:
-        from helion._compiler.backend import _CUTE_DEFAULT_AUTOTUNE_BUDGET_SECONDS
         from helion._compiler.backend import Backend
         from helion._compiler.backend import CuteBackend
+        from helion._compiler.cute.backend import _CUTE_DEFAULT_AUTOTUNE_BUDGET_SECONDS
 
         settings = Settings(
             autotune_budget_seconds=None,
