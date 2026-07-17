@@ -184,14 +184,15 @@ def compute_repeat_generic(
     Used for backends that don't have Triton's event-based timing (e.g., Pallas/TPU).
     """
     # Warm the pipeline once before collecting timing samples.
-    fn()
+    _output = fn()
     synchronize_device()
 
     clear_l2 = _make_l2_cache_clearer()
     start = time.perf_counter()
     for _ in range(estimate_runs):
         clear_l2()
-        fn()
+        # Keep the latest asynchronous output alive through synchronization.
+        _output = fn()
     synchronize_device()
     end = time.perf_counter()
 
@@ -282,8 +283,9 @@ def interleaved_bench_generic(
     Used for backends that don't have Triton's event-based timing (e.g., Pallas/TPU).
     """
     # warmup
+    _output: object = None
     for fn in fns:
-        fn()
+        _output = fn()
     synchronize_device()
 
     clear_l2 = _make_l2_cache_clearer()
@@ -300,7 +302,9 @@ def interleaved_bench_generic(
             clear_l2()
             synchronize_device()
             start = time.perf_counter()
-            fns[j]()
+            # Dropping an asynchronous output before the sync can trigger device
+            # buffer destruction inside the timed region.
+            _output = fns[j]()
             synchronize_device()
             end = time.perf_counter()
             all_times[j].append((end - start) * 1000)  # convert to ms
@@ -594,7 +598,7 @@ def do_bench_generic(
     """
     assert return_mode in ["min", "max", "mean", "median", "all"]
 
-    fn()
+    _output = fn()
     synchronize_device()
 
     clear_l2 = _make_l2_cache_clearer()
@@ -604,7 +608,8 @@ def do_bench_generic(
     start = time.perf_counter()
     for _ in range(5):
         clear_l2()
-        fn()
+        # Keep the latest asynchronous output alive through synchronization.
+        _output = fn()
     synchronize_device()
     end = time.perf_counter()
     estimate_ms = sync_object(
@@ -626,7 +631,7 @@ def do_bench_generic(
         clear_l2()
         synchronize_device()
         t0 = time.perf_counter()
-        fn()
+        _output = fn()
         synchronize_device()
         t1 = time.perf_counter()
         times.append((t1 - t0) * 1000)  # convert to ms
