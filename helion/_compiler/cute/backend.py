@@ -1121,7 +1121,7 @@ class CuteBackend(Backend):
         return f"cutlass.Int32({lane_var})"
 
     def sympy_printer_expr(self, expr: sympy.Expr) -> str:
-        from ..device_function import cute_texpr
+        from .printer import cute_texpr
 
         return cute_texpr(expr)
 

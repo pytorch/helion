@@ -5085,7 +5085,7 @@ class TestPallasPrinter(TestCase):
         from torch.utils._sympy.functions import FloorDiv
         from torch.utils._sympy.functions import PythonMod
 
-        from helion._compiler.device_function import pallas_texpr
+        from helion._compiler.pallas.printer import pallas_texpr
 
         x, y = sympy.symbols("x y")
         self.assertEqual(pallas_texpr(PythonMod(x, y)), "(x % y)")
