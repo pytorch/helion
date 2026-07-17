@@ -97,14 +97,24 @@ def use_cudagraph() -> bool:
     return True
 
 
+def _bench_shapes() -> list[tuple[int, int]]:
+    """The (num_tokens, intermediate) shapes main() benchmarks."""
+    intermediate_sizes = [2048, 2880, 4096, 8192, 11008, 14336]
+    num_tokens_list = [1, 8, 32, 64, 128, 256]
+    return [(t, i) for i in intermediate_sizes for t in num_tokens_list]
+
+
 def correctness_check() -> None:
     """Assert the Helion kernel matches the torch reference (used by the tests)."""
     torch.manual_seed(0)
-    x = torch.randn(16, 2 * 2048, device="cuda", dtype=torch.bfloat16)
-    scale = torch.tensor([1.3], device="cuda", dtype=torch.float32)
-    got = silu_mul_fp8(x, scale).float()
-    ref = _silu_mul_fp8_torch(x, scale).float()
-    torch.testing.assert_close(got, ref, rtol=0.2, atol=0.2)
+    for num_tokens, intermediate in _bench_shapes():
+        x = torch.randn(
+            num_tokens, 2 * intermediate, device="cuda", dtype=torch.bfloat16
+        )
+        scale = torch.tensor([1.0], device="cuda", dtype=torch.float32)
+        got = silu_mul_fp8(x, scale).float()
+        ref = _silu_mul_fp8_torch(x, scale).float()
+        torch.testing.assert_close(got, ref, rtol=0.2, atol=0.2)
 
 
 def main(verbose: bool = True) -> dict:
@@ -114,9 +124,7 @@ def main(verbose: bool = True) -> dict:
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     from _bench import run_sweep
 
-    intermediate_sizes = [2048, 2880, 4096, 8192, 11008, 14336]
-    num_tokens_list = [1, 8, 32, 64, 128, 256]
-    shapes = [(t, i) for i in intermediate_sizes for t in num_tokens_list]
+    shapes = _bench_shapes()
     baselines = _baselines()
 
     def make_calls(shape: tuple[int, int]) -> tuple:
@@ -142,4 +150,6 @@ def main(verbose: bool = True) -> dict:
 
 
 if __name__ == "__main__":
+    # Verify numerics across every benchmarked shape before timing.
+    correctness_check()
     main()
