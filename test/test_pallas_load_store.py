@@ -551,6 +551,48 @@ class TestPallasPartialSlice(TestCase):
             code_and_output(kernel, (src, dst), block_sizes=[16])
 
 
+@onlyBackends(["pallas"])
+@skipUnlessPallas("JAX/Pallas TPU not available")
+class TestPallasVmemScalarLoad(TestCase):
+    """Loads with a runtime scalar index on a VMEM tensor's minor dims."""
+
+    # Mosaic rejects x[i, cols - 1] with runtime i when cols > 128; the
+    # sublane-load form compiles at any width.
+    @parametrize("cols", [64, 256])
+    @parametrize("dtype", [torch.float32, torch.int32])
+    def test_runtime_row_index(self, dtype: torch.dtype, cols: int) -> None:
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def row_sum_plus_last(x: torch.Tensor) -> torch.Tensor:
+            rows, cols = x.shape
+            out = torch.empty(rows, dtype=torch.float32, device=x.device)
+            for row in hl.grid(rows):
+                out[row] = x[row, :].to(torch.float32).sum() + x[row, cols - 1].to(
+                    torch.float32
+                )
+            return out
+
+        source = ((torch.arange(4 * cols).reshape(4, cols)) % 53).to(dtype)
+        code, result = code_and_output(row_sum_plus_last, (source.to(DEVICE),))
+        self.assertNotIn("pltpu.roll", code)
+        expected = (source.float().sum(-1) + source[:, -1].float()).to(DEVICE)
+        torch.testing.assert_close(result, expected)
+
+    def test_runtime_row_index_full_row(self) -> None:
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def row_flip_load(x: torch.Tensor) -> torch.Tensor:
+            rows, cols = x.shape
+            out = torch.empty_like(x)
+            for row in hl.grid(rows):
+                out[row, :] = x[rows - 1 - row, :]
+            return out
+
+        source = torch.arange(17 * 65, dtype=torch.float32).reshape(17, 65)
+        code, result = code_and_output(row_flip_load, (source.to(DEVICE),))
+        self.assertNotIn("pltpu.roll", code)
+        torch.testing.assert_close(result, source.flip(0).to(DEVICE))
+
+
 instantiate_parametrized_tests(TestPallasJaggedCarrySimple)
 instantiate_parametrized_tests(TestPallasJaggedCarryBmm)
 instantiate_parametrized_tests(TestPallasJaggedCarryRejects)
+instantiate_parametrized_tests(TestPallasVmemScalarLoad)
