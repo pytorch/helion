@@ -124,11 +124,6 @@ def tile(
                     is specialized automatically, so changing the bound may compile a
                     new kernel. For multidimensional tiles, provide one bound per
                     dimension. The caller must ensure runtime extents do not exceed it.
-                    This bounds generated loop state; it does not make JAX array shapes
-                    polymorphic. Reusing one JAX executable across logical lengths
-                    requires caller-managed fixed-capacity arrays and runtime offsets.
-                    When calling ``Kernel.jax_fn`` through ``jax.jit``, the bound's
-                    position must be listed in ``static_argnums``.
 
     Returns:
         Iterator[Tile] or Iterator[Sequence[Tile]]: Iterator over tile objects
