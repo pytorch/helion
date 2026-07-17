@@ -188,23 +188,33 @@ def use_cudagraph() -> bool:
     return True
 
 
+def _bench_shapes() -> list[tuple[int, int]]:
+    """The (num_tokens, intermediate_size) shapes main() benchmarks."""
+    intermediate_sizes = [6144, 12288, 25600]
+    num_tokens_list = [1, 8, 32, 64, 128, 256, 1024, 4096]
+    return [(t, i) for i in intermediate_sizes for t in num_tokens_list]
+
+
 def correctness_check() -> None:
     """Assert the Helion kernel matches the torch reference (used by the tests)."""
+    group_size = 128
     torch.manual_seed(0)
-    num_tokens, intermediate, group_size = 16, 6144, 128
-    x = torch.randn(num_tokens, 2 * intermediate, device="cuda", dtype=torch.bfloat16)
-    out = torch.empty(
-        num_tokens, intermediate, device="cuda", dtype=torch.float8_e4m3fn
-    )
-    scales = torch.empty(
-        num_tokens, intermediate // group_size, device="cuda", dtype=torch.float32
-    )
-    out_ref = torch.empty_like(out)
-    scales_ref = torch.empty_like(scales)
-    silu_and_mul_per_block_quant(out, x, scales, group_size)
-    _silu_and_mul_per_block_quant_torch(out_ref, x, scales_ref, group_size)
-    torch.testing.assert_close(scales, scales_ref, rtol=1e-2, atol=1e-4)
-    torch.testing.assert_close(out.float(), out_ref.float(), rtol=0.2, atol=0.2)
+    for num_tokens, intermediate in _bench_shapes():
+        x = torch.randn(
+            num_tokens, 2 * intermediate, device="cuda", dtype=torch.bfloat16
+        )
+        out = torch.empty(
+            num_tokens, intermediate, device="cuda", dtype=torch.float8_e4m3fn
+        )
+        scales = torch.empty(
+            num_tokens, intermediate // group_size, device="cuda", dtype=torch.float32
+        )
+        out_ref = torch.empty_like(out)
+        scales_ref = torch.empty_like(scales)
+        silu_and_mul_per_block_quant(out, x, scales, group_size)
+        _silu_and_mul_per_block_quant_torch(out_ref, x, scales_ref, group_size)
+        torch.testing.assert_close(scales, scales_ref, rtol=1e-2, atol=1e-4)
+        torch.testing.assert_close(out.float(), out_ref.float(), rtol=0.2, atol=0.2)
 
 
 def main(verbose: bool = True) -> dict:
@@ -214,10 +224,8 @@ def main(verbose: bool = True) -> dict:
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     from _bench import run_sweep
 
-    intermediate_sizes = [6144, 12288, 25600]
-    num_tokens_list = [1, 8, 32, 64, 128, 256, 1024, 4096]
     group_size = 128
-    shapes = [(t, i) for i in intermediate_sizes for t in num_tokens_list]
+    shapes = _bench_shapes()
     baselines = _baselines()
 
     def make_calls(shape: tuple[int, int]) -> tuple:
@@ -255,4 +263,6 @@ def main(verbose: bool = True) -> dict:
 
 
 if __name__ == "__main__":
+    # Verify numerics across every benchmarked shape before timing.
+    correctness_check()
     main()

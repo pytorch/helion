@@ -260,41 +260,57 @@ def _make_inputs(
     return (result, inp, weight, scale, epsilon, scale_ub, residual, group_size, False)
 
 
+def _bench_shapes() -> list[tuple[int, int, int]]:
+    """The (hidden_size, group_size, num_tokens) shapes main() benchmarks."""
+    hidden_size_list = [2048, 4096, 5120]
+    group_size_list = [128]
+    num_tokens_list = [1, 8, 32, 64, 128, 256, 1024, 4096]
+    return [
+        (h, g, t)
+        for h in hidden_size_list
+        for g in group_size_list
+        for t in num_tokens_list
+    ]
+
+
 def correctness_check() -> None:
     """Assert the Helion kernel matches the torch reference (used by the tests)."""
     torch.manual_seed(0)
-    args = _make_inputs(16, 4096, 128)
-    (
-        result,
-        inp,
-        weight,
-        scale,
-        epsilon,
-        scale_ub,
-        residual,
-        group_size,
-        is_transposed,
-    ) = args
-    result_ref = torch.empty_like(result)
-    scale_ref = torch.empty_like(scale)
-    residual_ref = residual.clone()
-    rms_norm_per_block_quant(*args)
-    _rms_norm_per_block_quant_torch(
-        result_ref,
-        inp,
-        weight,
-        scale_ref,
-        epsilon,
-        scale_ub,
-        residual_ref,
-        group_size,
-        is_transposed,
-    )
-    torch.testing.assert_close(scale, scale_ref, rtol=2e-2, atol=1e-4)
-    torch.testing.assert_close(result.float(), result_ref.float(), rtol=0.2, atol=0.2)
-    torch.testing.assert_close(
-        residual.float(), residual_ref.float(), rtol=2e-2, atol=2e-2
-    )
+    for hidden_size, group_size, num_tokens in _bench_shapes():
+        args = _make_inputs(num_tokens, hidden_size, group_size)
+        (
+            result,
+            inp,
+            weight,
+            scale,
+            epsilon,
+            scale_ub,
+            residual,
+            group_size,
+            is_transposed,
+        ) = args
+        result_ref = torch.empty_like(result)
+        scale_ref = torch.empty_like(scale)
+        residual_ref = residual.clone()
+        rms_norm_per_block_quant(*args)
+        _rms_norm_per_block_quant_torch(
+            result_ref,
+            inp,
+            weight,
+            scale_ref,
+            epsilon,
+            scale_ub,
+            residual_ref,
+            group_size,
+            is_transposed,
+        )
+        torch.testing.assert_close(scale, scale_ref, rtol=2e-2, atol=1e-4)
+        torch.testing.assert_close(
+            result.float(), result_ref.float(), rtol=0.2, atol=0.2
+        )
+        torch.testing.assert_close(
+            residual.float(), residual_ref.float(), rtol=2e-2, atol=2e-2
+        )
 
 
 def main(verbose: bool = True) -> dict:
@@ -304,15 +320,7 @@ def main(verbose: bool = True) -> dict:
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     from _bench import run_sweep
 
-    hidden_size_list = [2048, 4096, 5120]
-    group_size_list = [128]
-    num_tokens_list = [1, 8, 32, 64, 128, 256, 1024, 4096]
-    shapes = [
-        (h, g, t)
-        for h in hidden_size_list
-        for g in group_size_list
-        for t in num_tokens_list
-    ]
+    shapes = _bench_shapes()
     baselines = _baselines()
 
     def make_calls(shape: tuple[int, int, int]) -> tuple:
@@ -356,4 +364,6 @@ def main(verbose: bool = True) -> dict:
 
 
 if __name__ == "__main__":
+    # Verify numerics across every benchmarked shape before timing.
+    correctness_check()
     main()

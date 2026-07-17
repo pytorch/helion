@@ -1577,6 +1577,132 @@ class TestLoops(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result, x + 1)
         self.assertNotIn("tl.debug_barrier()", code)
 
+    @skipIfNotTriton(
+        "tl.debug_barrier() is only emitted in Triton device codegen (not Pallas/JAX)"
+    )
+    def test_intra_loop_store_then_load_barrier(self):
+        """A store to a tensor followed by a load of the same tensor *within one
+        loop body* (using a different-shaped index) is a cross-thread
+        read-after-write; codegen must emit tl.debug_barrier() between them so the
+        store is visible before the reload (multi-warp, Triton)."""
+
+        @helion.kernel(autotune_effort="none")
+        def store_then_reload(x: torch.Tensor) -> torch.Tensor:
+            m, n = x.size()
+            for tile_m in hl.tile(m):
+                # store the whole row, then read back a slice of it (different
+                # index shape -> different thread<->element layout -> RAW race).
+                row = x[tile_m, :] * 2.0
+                x[tile_m, :] = row
+                half = hl.arange(n // 2)
+                lo = x[tile_m, half]
+                hi = x[tile_m, half + n // 2]
+                x[tile_m, half] = hi
+                x[tile_m, half + n // 2] = lo
+            return x
+
+        torch.manual_seed(0)
+        m, n = 64, 128
+        x = torch.randn(m, n, device=DEVICE, dtype=torch.float32)
+        expected = x * 2.0
+        expected = torch.cat([expected[:, n // 2 :], expected[:, : n // 2]], dim=-1)
+        for num_warps in (4, 8):
+            code, result = code_and_output(
+                store_then_reload,
+                (x.clone(),),
+                block_sizes=[1],
+                num_warps=num_warps,
+                num_stages=2,
+            )
+            self.assertIn("tl.debug_barrier()", code)
+            torch.testing.assert_close(result, expected)
+
+    @skipIfNotTriton(
+        "tl.debug_barrier() is Triton codegen-specific; "
+        "the negative assertion is trivially true on non-Triton backends"
+    )
+    def test_intra_loop_load_before_store_no_barrier(self):
+        """A load that precedes the store (read-modify-write) is not a hazard and
+        must not get an intra-loop barrier."""
+
+        @helion.kernel(autotune_effort="none")
+        def load_then_store(x: torch.Tensor) -> torch.Tensor:
+            m, n = x.size()
+            for tile_m in hl.tile(m):
+                row = x[tile_m, :]  # load BEFORE any store to x
+                x[tile_m, :] = row + 1.0
+            return x
+
+        x = torch.randn(64, 128, device=DEVICE, dtype=torch.float32)
+        code, result = code_and_output(
+            load_then_store,
+            (x.clone(),),
+            block_sizes=[1],
+            num_warps=4,
+            num_stages=1,
+        )
+        torch.testing.assert_close(result, x + 1.0)
+        self.assertNotIn("tl.debug_barrier()", code)
+
+    @skipIfNotTriton("intra-loop barriers are Triton codegen-specific")
+    def test_intra_loop_barrier_tracks_storage_aliases(self):
+        @helion.kernel(autotune_effort="none")
+        def store_then_load_view(x: torch.Tensor) -> torch.Tensor:
+            m, n = x.shape
+            alias = x.view(m, n)
+            for tile_m in hl.tile(m):
+                x[tile_m, :] = x[tile_m, :] * 2.0
+                half = hl.arange(n // 2)
+                lo = alias[tile_m, half]
+                hi = alias[tile_m, half + n // 2]
+                x[tile_m, half] = hi
+                x[tile_m, half + n // 2] = lo
+            return x
+
+        x = torch.randn(64, 128, device=DEVICE, dtype=torch.float32)
+        expected = x * 2.0
+        expected = torch.cat([expected[:, 64:], expected[:, :64]], dim=-1)
+        code, result = code_and_output(
+            store_then_load_view,
+            (x.clone(),),
+            block_sizes=[1],
+            num_warps=4,
+            num_stages=2,
+        )
+        self.assertIn("tl.debug_barrier()", code)
+        torch.testing.assert_close(result, expected)
+
+    @skipIfNotTriton("intra-loop barriers are Triton codegen-specific")
+    def test_intra_loop_barrier_crosses_if_subgraph(self):
+        @helion.kernel(autotune_effort="none")
+        def store_then_load_in_branch(
+            x: torch.Tensor, flag: torch.Tensor
+        ) -> torch.Tensor:
+            m, n = x.shape
+            for tile_m in hl.tile(m):
+                x[tile_m, :] = x[tile_m, :] * 2.0
+                if flag[0] > 0:
+                    half = hl.arange(n // 2)
+                    lo = x[tile_m, half]
+                    hi = x[tile_m, half + n // 2]
+                    x[tile_m, half] = hi
+                    x[tile_m, half + n // 2] = lo
+            return x
+
+        x = torch.randn(64, 128, device=DEVICE, dtype=torch.float32)
+        flag = torch.ones(1, device=DEVICE)
+        expected = x * 2.0
+        expected = torch.cat([expected[:, 64:], expected[:, :64]], dim=-1)
+        code, result = code_and_output(
+            store_then_load_in_branch,
+            (x.clone(), flag),
+            block_sizes=[1],
+            num_warps=4,
+            num_stages=2,
+        )
+        self.assertIn("tl.debug_barrier()", code)
+        torch.testing.assert_close(result, expected)
+
 
 if __name__ == "__main__":
     unittest.main()
