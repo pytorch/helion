@@ -56,6 +56,7 @@ from helion._compiler.cute.cute_mma import _choose_mma_impl
 from helion._compiler.cute.cute_mma import _emit_sched_pipeline_setup
 from helion._compiler.cute.cute_mma import _get_mma_k_loop_info
 from helion._compiler.cute.cute_mma import _InitialPrefetchTmaArgs
+from helion._compiler.cute.cute_mma import _is_zero_init_acc_node
 from helion._compiler.cute.cute_mma import _make_tcgen05_layout_plan_setup
 from helion._compiler.cute.cute_mma import _mma_epi_tidx_expr
 from helion._compiler.cute.cute_mma import _mma_result_can_be_deferred
@@ -208,6 +209,7 @@ from helion._compiler.cute.tcgen05_pure_matmul import Tcgen05TmaStoreBodyCorePar
 from helion._compiler.cute.tcgen05_pure_matmul import Tcgen05TmaStorePipelineParams
 from helion._compiler.cute.tcgen05_pure_matmul import Tcgen05TmaStoreSubtileLoopParams
 from helion._compiler.cute.tcgen05_pure_matmul import Tcgen05TmaStoreTailParams
+from helion._compiler.device_ir import DeviceIR
 from helion._compiler.device_ir import ForLoopGraphInfo
 from helion._compiler.device_ir import GraphInfo
 from helion._compiler.device_ir import RootGraphInfo
@@ -886,8 +888,16 @@ class TestCuteLowerings(unittest.TestCase):
                 ),
             ),
             patch(
-                "helion._compiler.cute.cute_mma.can_codegen_cute_mma_aten",
-                return_value=True,
+                "helion._compiler.cute.cute_mma.analyze_cute_mma_node",
+                return_value=SimpleNamespace(
+                    with_acc=True,
+                    is_dot=False,
+                    requires_scalar_fallback=False,
+                    operands=SimpleNamespace(
+                        output_block_ids=(0, 1),
+                        k_block_id=2,
+                    ),
+                ),
             ),
         ):
             self.assertTrue(
@@ -924,8 +934,12 @@ class TestCuteLowerings(unittest.TestCase):
                 ),
             ),
             patch(
-                "helion._compiler.cute.cute_mma.can_codegen_cute_mma_aten",
-                return_value=True,
+                "helion._compiler.cute.cute_mma.analyze_cute_mma_node",
+                return_value=SimpleNamespace(
+                    with_acc=True,
+                    is_dot=False,
+                    requires_scalar_fallback=False,
+                ),
             ),
         ):
             self.assertFalse(
@@ -12296,8 +12310,12 @@ class TestCuteLowerings(unittest.TestCase):
                 ),
             ),
             patch(
-                "helion._compiler.cute.cute_mma.can_codegen_cute_mma_aten",
-                return_value=True,
+                "helion._compiler.cute.cute_mma.analyze_cute_mma_node",
+                return_value=SimpleNamespace(
+                    with_acc=True,
+                    is_dot=False,
+                    requires_scalar_fallback=False,
+                ),
             ),
         ):
             self.assertTrue(_loop_may_use_mma(fn, [0, 1]))
@@ -13431,6 +13449,60 @@ class TestCuteLowerings(unittest.TestCase):
                     "universal",
                 )
 
+    def test_choose_mma_impl_rejects_over_budget_ab_staging(self) -> None:
+        config = helion.Config(
+            block_sizes=[128, 128, 256],
+            tcgen05_ab_stages=2,
+        )
+        with (
+            patch(
+                "helion._compiler.cute.cute_mma.get_cute_mma_support",
+                return_value=default_cute_mma_support(),
+            ),
+            patch(
+                "helion._compiler.cute.cute_mma.CuteTcgen05Config."
+                "per_cta_smem_budget_bytes",
+                return_value=200 * 1024,
+            ) as smem_budget,
+            patch.dict(
+                "os.environ", {"HELION_CUTE_MMA_IMPL": "auto"}, clear=False
+            ),
+        ):
+            self.assertEqual(
+                _choose_mma_impl(
+                    torch.float16,
+                    bm=128,
+                    bn=128,
+                    bk=256,
+                    config=config,
+                    input_device=torch.device("cuda"),
+                ),
+                "universal",
+            )
+            self.assertEqual(
+                _choose_mma_impl(
+                    torch.float16,
+                    bm=128,
+                    bn=128,
+                    bk=128,
+                    config=config,
+                    input_device=torch.device("cuda"),
+                ),
+                "tcgen05",
+            )
+            smem_budget.return_value = 100 * 1024
+            self.assertEqual(
+                _choose_mma_impl(
+                    torch.float16,
+                    bm=128,
+                    bn=128,
+                    bk=128,
+                    config=config,
+                    input_device=torch.device("cuda"),
+                ),
+                "universal",
+            )
+
     def test_tcgen05_thread_counts_match_participants_and_cta(self) -> None:
         # ``_tcgen05_epi_warp_count`` takes a ``Tcgen05WarpSpec`` (G2-B);
         # build one from the documented monolithic defaults and only
@@ -13829,6 +13901,56 @@ class TestCuteLowerings(unittest.TestCase):
         )
         self.assertIsNone(_trace_mma_to_store_dtype(mma_node, []))
 
+    def test_acc_init_trace_prefers_exact_graph_over_signature_collision(
+        self,
+    ) -> None:
+        from helion.language import creation_ops
+
+        root_graph = Graph()
+        bias = root_graph.placeholder("bias")
+        bias.meta["val"] = torch.empty(4, 4, dtype=torch.float32)
+        zero = root_graph.call_function(
+            creation_ops.full,
+            args=([4, 4], 0, torch.float32),
+        )
+        zero.meta["val"] = torch.empty(4, 4, dtype=torch.float32)
+        root_graph.output((bias, zero))
+
+        def make_body() -> tuple[Graph, torch.fx.Node]:
+            body = Graph()
+            acc = body.placeholder("acc")
+            acc.meta["val"] = torch.empty(4, 4, dtype=torch.float32)
+            carried = body.call_function(_tracing_ops._new_var, args=(acc,))
+            carried.meta["val"] = torch.empty(4, 4, dtype=torch.float32)
+            body.output((carried,))
+            return body, acc
+
+        zero_body, zero_acc = make_body()
+        bias_body, bias_acc = make_body()
+        unknown_body, unknown_acc = make_body()
+        device_ir = DeviceIR()
+        device_ir.graphs = [
+            ForLoopGraphInfo(
+                graph_id=0,
+                graph=zero_body,
+                node_args=[zero],
+                block_ids=[0],
+            ),
+            ForLoopGraphInfo(
+                graph_id=1,
+                graph=bias_body,
+                node_args=[bias],
+                block_ids=[0],
+            ),
+            RootGraphInfo(graph_id=2, graph=root_graph, phase_index=0),
+        ]
+
+        self.assertTrue(_is_zero_init_acc_node(zero_acc, device_ir=device_ir))
+        self.assertFalse(_is_zero_init_acc_node(bias_acc, device_ir=device_ir))
+        # A copied graph with two equally valid structural matches is
+        # ambiguous, so tracing must fail closed rather than choose either.
+        self.assertFalse(_is_zero_init_acc_node(unknown_acc, device_ir=device_ir))
+
     def _build_aux_load_node(
         self,
         *,
@@ -13864,13 +13986,52 @@ class TestCuteLowerings(unittest.TestCase):
         load_node.meta["val"] = torch.empty(load_shape, dtype=aux_tensor.dtype)
         return load_node, index_nodes
 
-    def _carrier_index_nodes(self) -> tuple[torch.fx.Node, ...]:
-        """Two distinct FX nodes standing in for the carrier's
-        ``(tile_m, tile_n)`` tile-id symbols."""
+    def _carrier_index_nodes(self, rank: int = 2) -> tuple[torch.fx.Node, ...]:
+        """Distinct FX nodes standing in for a carrier's tile-id symbols."""
         g = Graph()
-        m = g.call_function(_tracing_ops._new_var, args=())
-        n = g.call_function(_tracing_ops._new_var, args=())
-        return (m, n)
+        return tuple(
+            g.call_function(_tracing_ops._new_var, args=()) for _ in range(rank)
+        )
+
+    def test_aux_load_kind_rank3_exact_leading_passthrough(self) -> None:
+        from helion._compiler.cute.cute_fx_walk import aux_tensor_load_kind
+
+        idx = self._carrier_index_nodes(3)
+        exact = torch.empty(2, 4, 4, dtype=torch.float32)
+        load_node, _ = self._build_aux_load_node(
+            aux_tensor=exact,
+            load_shape=(1, 4, 4),
+            index_nodes=idx,
+        )
+        self.assertEqual(
+            aux_tensor_load_kind(
+                load_node,
+                carrier_tile_shape=(1, 4, 4),
+                carrier_tile_index_nodes=idx,
+                carrier_global_shape=(2, 4, 4),
+            ),
+            ("exact", None),
+        )
+
+    def test_aux_load_kind_rank3_rejects_foreign_leading_index(self) -> None:
+        from helion._compiler.cute.cute_fx_walk import aux_tensor_load_kind
+
+        idx = self._carrier_index_nodes(3)
+        foreign_leading = self._carrier_index_nodes(1)[0]
+        exact = torch.empty(2, 4, 4, dtype=torch.float32)
+        load_node, _ = self._build_aux_load_node(
+            aux_tensor=exact,
+            load_shape=(1, 4, 4),
+            index_nodes=(foreign_leading, *idx[1:]),
+        )
+        self.assertIsNone(
+            aux_tensor_load_kind(
+                load_node,
+                carrier_tile_shape=(1, 4, 4),
+                carrier_tile_index_nodes=idx,
+                carrier_global_shape=(2, 4, 4),
+            )
+        )
 
     def test_aux_load_kind_colvec_stride_1_0_is_broadcast_2(self) -> None:
         """A full ``(M, N)`` aux with trailing stride 0 (the

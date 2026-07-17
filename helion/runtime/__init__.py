@@ -3065,7 +3065,7 @@ def _append_cute_wrapper_plan(
         output_dtype = str(plan["output_dtype"])
         kernel_args = [str(arg) for arg in cast("list[object]", plan["kernel_args"])]
         d_tensor_name = None
-        if bool(plan.get("d_batched")):
+        if bool(plan.get("d_leading_passthrough")):
             d_tensor_name = f"{kernel_args[0]}_d_tma"
             append_permuted_cute_tensor_view(d_tensor_name, d_idx, (1, 2, 0))
         append_tcgen05_epilogue_tma_wrapper(
@@ -3131,8 +3131,8 @@ def _append_cute_wrapper_plan(
     # K-major (column-major / K-contiguous) B. Absent on the MN-major
     # (row-major B) default path.
     b_k_major = bool(plan.get("b_k_major"))
-    lhs_batched = bool(plan.get("lhs_batched"))
-    rhs_batched = bool(plan.get("rhs_batched"))
+    lhs_leading_passthrough = bool(plan.get("lhs_leading_passthrough"))
+    rhs_leading_passthrough = bool(plan.get("rhs_leading_passthrough"))
     kernel_args = [str(arg) for arg in cast("list[object]", plan["kernel_args"])]
     assert len(kernel_args) == 4
     tma_atom_a, tma_tensor_a, tma_atom_b, tma_tensor_b = kernel_args
@@ -3167,7 +3167,7 @@ def _append_cute_wrapper_plan(
     smem_b_layout = f"{tma_atom_b}_smem_layout"
     lhs_tma = f"{tma_atom_a}_lhs_tma"
     rhs_tma = f"{tma_atom_b}_rhs_tma"
-    lhs_tma_operand = lhs_tma if lhs_batched else f"arg{lhs_idx}"
+    lhs_tma_operand = lhs_tma if lhs_leading_passthrough else f"arg{lhs_idx}"
     rhs_tma_operand = rhs_tma
     smem_a_layout_expr = tcgen05_smem_layout_expr(
         tiled_mma=tiled_mma,
@@ -3190,9 +3190,9 @@ def _append_cute_wrapper_plan(
         swizzle_override=smem_swizzle_b,
         b_k_major=b_k_major,
     )
-    if lhs_batched:
+    if lhs_leading_passthrough:
         append_permuted_cute_tensor_view(lhs_tma, lhs_idx, (1, 2, 0))
-    if rhs_batched:
+    if rhs_leading_passthrough:
         append_permuted_cute_tensor_view(rhs_tma, rhs_idx, (2, 1, 0))
     ab_tma_lines = [
         (
@@ -3217,7 +3217,7 @@ def _append_cute_wrapper_plan(
         f"    {smem_a_layout} = {smem_a_layout_expr}",
         f"    {smem_b_layout} = {smem_b_layout_expr}",
     ]
-    if not rhs_batched:
+    if not rhs_leading_passthrough:
         ab_tma_lines.append(
             f"    {rhs_tma} = cute.make_tensor("
             f"arg{rhs_idx}.iterator, "
@@ -3928,12 +3928,9 @@ def _build_cute_schema_and_args(
     gmem_space, make_ptr_obj, _current_stream_obj = _get_cute_launcher_imports()
     make_ptr = cast("Any", make_ptr_obj)
     constexpr_flags = _cute_kernel_param_is_constexpr(cute_kernel)
-    # Kernels that emit cute MMA ops (universal matmul fallback or tcgen05
-    # TMA wrapper plans) need runtime tensor layouts: the wrapper's
-    # ``cute.make_tensor`` feeds into ``.mark_layout_dynamic`` (TMA path) or
-    # into in-kernel arithmetic that relies on dynamic shape/stride
-    # propagation (universal MMA SMEM-load guards). Baking literal shapes
-    # silently miscompiles those paths.
+    # Universal MMA needs runtime tensor layouts for its SMEM-load guards.
+    # tcgen05 wrapper schemas are specialized by problem shape and stride, so
+    # their tensor metadata can remain baked when every wrapper plan permits it.
     if bake_tensor_shapes:
         any_obj = cast("Any", cute_kernel)
         wrapper_plans = getattr(any_obj, "_helion_cute_wrapper_plans", None)

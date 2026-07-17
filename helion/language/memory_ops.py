@@ -54,6 +54,7 @@ from .._compiler.host_function import HostFunction
 from .._compiler.indexing_strategy import SubscriptIndexing
 from .._compiler.indexing_strategy import TileWithOffsetInfo
 from .._compiler.indexing_strategy import _get_tile_with_offset_info
+from .._compiler.indexing_strategy import exact_tile_block_ids
 from .._compiler.utils import compute_slice_size
 from .._compiler.variable_origin import GridOrigin
 from .._compiler.variable_origin import TileBeginOrigin
@@ -82,17 +83,16 @@ log = logging.getLogger(__name__)
 class _AuxStepRecord:
     """Per-step splice-side AST locals for one auxiliary chain step.
 
-    Holds the underlying aux tensor name, broadcast axis (None for
-    exact-shape rank-2 aux), and the AST var names allocated for
-    the partition pipeline. ``aux_view2d`` is set only for
-    broadcast aux steps; exact-shape steps leave it ``None``. Used
-    by ``_codegen_cute_store_tcgen05_tile`` to thread per-aux
-    locals through the per-output-tile setup helper and the
-    per-subtile load source helper.
+    Holds the underlying aux tensor name, broadcast/leading-axis metadata, and
+    the AST var names allocated for the partition pipeline. ``aux_view2d`` is
+    set for broadcast inputs and exact inputs with a leading passthrough axis.
+    Used by ``_codegen_cute_store_tcgen05_tile`` to thread per-aux locals through
+    the per-output-tile setup and per-subtile load helpers.
     """
 
     aux_tensor_name: str
     broadcast_axis: int | None
+    has_leading_passthrough: bool
     aux_tile: str
     aux_part_base: str
     aux_xfm: str
@@ -1461,6 +1461,23 @@ def _cute_tile_begin_expr(state: CodegenState, idx: object) -> str:
     raise exc.BackendUnsupported("cute", f"unlowerable tile base index: {idx}")
 
 
+def _cute_leading_passthrough_view_2d(
+    result_name: str,
+    tensor_name: str,
+    leading_index: str,
+) -> str:
+    """Select one leading coordinate while preserving trailing matrix strides."""
+    return (
+        f"{result_name} = cute.make_tensor("
+        f"{tensor_name}.iterator + cute.crd2idx("
+        f"(cutlass.Int32({leading_index}), cutlass.Int32(0), cutlass.Int32(0)), "
+        f"{tensor_name}.layout), "
+        f"cute.make_layout(({tensor_name}.shape[1], {tensor_name}.shape[2]), "
+        f"stride=({tensor_name}.layout.stride[1], "
+        f"{tensor_name}.layout.stride[2])))"
+    )
+
+
 def _codegen_cute_store_tcgen05_tile(
     state: CodegenState,
     tensor: torch.Tensor,
@@ -1482,13 +1499,27 @@ def _codegen_cute_store_tcgen05_tile(
                 "tcgen05 pure role-lifecycle store cannot use an extra store mask",
             )
         return None
+    if tcgen05_value.pure_matmul_role_lifecycle and tensor.ndim != 2:
+        raise exc.BackendUnsupported(
+            "cute",
+            "tcgen05 pure role-lifecycle store requires a rank-2 tensor target",
+        )
     if tensor.ndim not in (2, 3):
-        if tcgen05_value.pure_matmul_role_lifecycle:
-            raise exc.BackendUnsupported(
-                "cute",
-                "tcgen05 pure role-lifecycle store requires a rank-2 tensor target",
-            )
         return None
+    leading_passthrough_output = tensor.ndim == 3
+    env = CompileEnvironment.current()
+    store_node = state.fx_node
+    store_subscripts = store_node.args[1] if store_node is not None else None
+    actual_block_ids = (
+        exact_tile_block_ids(env, store_subscripts)
+        if isinstance(store_subscripts, (list, tuple))
+        else None
+    )
+    if actual_block_ids != tcgen05_value.output_block_ids:
+        raise exc.BackendUnsupported(
+            "cute",
+            "tcgen05 matmul store requires the exact zero-offset output tile axes",
+        )
     if tcgen05_value.pure_matmul_role_lifecycle:
         if epilogue_chain is not None:
             raise exc.BackendUnsupported(
@@ -1570,7 +1601,7 @@ def _codegen_cute_store_tcgen05_tile(
             "epilogue lands (see cute_plan.md).",
         )
 
-    backend = CompileEnvironment.current().backend
+    backend = env.backend
     tensor_name = df.tensor_arg(tensor).name
     target_dtype = backend.dtype_str(tensor.dtype)
     # The matmul plan computed `tcgen05_epi_tile` (role-local t2r
@@ -1592,24 +1623,18 @@ def _codegen_cute_store_tcgen05_tile(
             f"but the store target tensor dtype is {target_dtype!r}.",
         )
     base_indices = [_cute_tile_begin_expr(state, idx) for idx in subscript]
-    batched_output = tensor.ndim == 3
-    if batched_output and tcgen05_value.pure_matmul_role_lifecycle:
-        raise exc.BackendUnsupported(
-            "cute",
-            "tcgen05 pure role-lifecycle store requires a rank-2 tensor target",
-        )
-    if len(base_indices) != (3 if batched_output else 2):
+    if len(base_indices) != (3 if leading_passthrough_output else 2):
         if tcgen05_value.pure_matmul_role_lifecycle:
             raise exc.BackendUnsupported(
                 "cute",
                 "tcgen05 pure role-lifecycle store requires a rank-2 tile store",
             )
         return None
-    batch_index = base_indices[0] if batched_output else None
-    m_index = base_indices[1] if batched_output else base_indices[0]
-    n_index = base_indices[2] if batched_output else base_indices[1]
-    m_dim = 1 if batched_output else 0
-    n_dim = 2 if batched_output else 1
+    leading_index = base_indices[0] if leading_passthrough_output else None
+    m_index = base_indices[1] if leading_passthrough_output else base_indices[0]
+    n_index = base_indices[2] if leading_passthrough_output else base_indices[1]
+    m_dim = 1 if leading_passthrough_output else 0
+    n_dim = 2 if leading_passthrough_output else 1
     m_size = _cute_tensor_dim_size_expr(state, tensor, m_dim)
     n_size = _cute_tensor_dim_size_expr(state, tensor, n_dim)
     tile_coord_m = f"({m_index}) // cutlass.Int32({tcgen05_value.bm})"
@@ -1722,21 +1747,19 @@ def _codegen_cute_store_tcgen05_tile(
         # treats unreferenced tensors as captures, which doesn't work
         # for tensors only read inside a per-subtile loop body).
         df.placeholder_args.add(aux_tensor_name)
-        # Broadcast aux steps need a fresh AST var for the 2-D view
-        # of the rank-1 underlying tensor (stride 0 on the orthogonal
-        # axis). Exact-shape aux steps leave ``aux_view2d`` as None.
-        # broadcast_axis 0/1 build a stride-0 2-D view of a rank-1 tensor;
-        # the colvec form (2) reuses the exact-shape pipeline over its own
-        # (M, N) stride-(1,0) view, so it needs no separate ``aux_view2d``.
+        # Broadcast axes 0/1 build a stride-0 2-D view of a rank-1 tensor.
+        # An exact rank-3 input uses a view of its selected leading coordinate.
+        # The colvec form (2) already carries an (M, N) stride-(1, 0) view.
         aux_view2d = (
             df.new_var(f"tcgen05_aux_view2d_{aux_idx}")
-            if aux_step.broadcast_axis in (0, 1)
+            if aux_step.broadcast_axis in (0, 1) or aux_torch_tensor.ndim == 3
             else None
         )
         aux_step_records.append(
             _AuxStepRecord(
                 aux_tensor_name=aux_tensor_name,
                 broadcast_axis=aux_step.broadcast_axis,
+                has_leading_passthrough=aux_torch_tensor.ndim == 3,
                 aux_tile=df.new_var(f"tcgen05_aux_tile_{aux_idx}"),
                 aux_part_base=df.new_var(f"tcgen05_tCgAux_base_{aux_idx}"),
                 aux_xfm=df.new_var(f"tcgen05_tCgAux_xfm_{aux_idx}"),
@@ -2249,11 +2272,22 @@ def _codegen_cute_store_tcgen05_tile(
                 continue
 
             if rec.broadcast_axis is None or rec.broadcast_axis == 2:
-                # Exact-shape rank-2 aux (or the colvec form, which is a full
-                # (M, N) stride-(1,0) view): slice the per-tile region of the
-                # underlying 2-D tensor directly. The colvec's per-subtile read
-                # is specialized to a scalar in ``_aux_subtile_load_source``.
-                source_for_local_tile = rec.aux_tensor_name
+                # Exact-shape aux (or the colvec form) uses the trailing matrix
+                # directly. For a rank-3 residual, first select the current
+                # leading-passthrough slice without changing its M/N strides.
+                if rec.has_leading_passthrough:
+                    assert leading_index is not None
+                    assert rec.aux_view2d is not None
+                    lines.append(
+                        _cute_leading_passthrough_view_2d(
+                            rec.aux_view2d,
+                            rec.aux_tensor_name,
+                            leading_index,
+                        )
+                    )
+                    source_for_local_tile = rec.aux_view2d
+                else:
+                    source_for_local_tile = rec.aux_tensor_name
                 aux_tile_is_local = False
             elif rowvec_stage is not None:
                 assert rec.broadcast_axis == 1
@@ -2794,8 +2828,8 @@ def _codegen_cute_store_tcgen05_tile(
                 else {}
             ),
         }
-        if batched_output:
-            d_tma_plan["d_batched"] = True
+        if leading_passthrough_output:
+            d_tma_plan["d_leading_passthrough"] = True
         state.codegen.cute_wrapper_plans.append(d_tma_plan)
 
     tcgen05_bm = tcgen05_value.bm
@@ -2854,8 +2888,8 @@ def _codegen_cute_store_tcgen05_tile(
         if include_full_tile:
             tile_setup.append(f"{full_tile} = {full_tile_expr}")
         local_gmem_tensor = gmem_tensor
-        if batched_output and tma_store:
-            assert batch_index is not None
+        if leading_passthrough_output and tma_store:
+            assert leading_index is not None
             gmem_tile_3d = df.new_var("tcgen05_gC3d")
             tile_setup.extend(
                 [
@@ -2863,24 +2897,22 @@ def _codegen_cute_store_tcgen05_tile(
                         f"{gmem_tile_3d} = cute.local_tile("
                         f"{gmem_tensor}, ({tcgen05_bm}, {tcgen05_bn}, 1), "
                         f"({tile_coord_m}, {tile_coord_n}, "
-                        f"cutlass.Int32({batch_index})))"
+                        f"cutlass.Int32({leading_index})))"
                     ),
                     f"{gmem_tile} = {gmem_tile_3d}[(None, None, 0)]",
                     f"{tcgc_base} = {tcgen05_thr_mma}.partition_C({gmem_tile})",
                 ]
             )
             return static_setup, tile_setup
-        if batched_output:
-            assert batch_index is not None
+        if leading_passthrough_output:
+            assert leading_index is not None
             local_gmem_tensor = df.new_var("tcgen05_gmem2d")
             tile_setup.append(
-                f"{local_gmem_tensor} = cute.make_tensor("
-                f"{gmem_tensor}.iterator + cute.crd2idx("
-                f"(cutlass.Int32({batch_index}), cutlass.Int32(0), cutlass.Int32(0)), "
-                f"{gmem_tensor}.layout), "
-                f"cute.make_layout(({gmem_tensor}.shape[1], {gmem_tensor}.shape[2]), "
-                f"stride=({gmem_tensor}.layout.stride[1], "
-                f"{gmem_tensor}.layout.stride[2])))"
+                _cute_leading_passthrough_view_2d(
+                    local_gmem_tensor,
+                    gmem_tensor,
+                    leading_index,
+                )
             )
         tile_setup.extend(
             [

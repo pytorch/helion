@@ -58,6 +58,7 @@ from .inductor_lowering import APIFuncLowering
 from .inductor_lowering import CodegenState
 from .inductor_lowering import codegen_call_with_graph
 from .inductor_lowering import prepare_graph_lowerings
+from .indexing_strategy import subscript_tile_info
 from .loop_dependency_checker import LoopDependencyChecker
 from .matmul_utils import tensor_matmul_replacement
 from .matmul_utils import torch_matmul_replacement
@@ -3077,18 +3078,9 @@ def _accessed_tensor_fake(node: torch.fx.Node) -> torch.Tensor | None:
 
 
 def _subscript_block_id(env: CompileEnvironment, sub: object) -> int | None:
-    """Block-id a subscript expression INDEXES, from the index node's own provenance (tile/offset
-    meta, else its block-var SymInt). Reduction-AGNOSTIC (resolves a tile var regardless of the
-    block's ``reduction`` flag, unlike a shape-size resolve). ``None`` for a plain slice / scalar."""
-    if not isinstance(sub, torch.fx.Node):
-        return None
-    two = sub.meta.get("tile_with_offset")
-    if isinstance(two, dict) and two.get("block_id") is not None:
-        return two["block_id"]
-    val = sub.meta.get("val")
-    if val is not None:
-        return env.resolve_block_id(val)
-    return None
+    """Return the block axis indexed by a tile-provenance subscript."""
+    info = subscript_tile_info(env, sub)
+    return info.block_id if info is not None else None
 
 
 def _tile_rank(dims: tuple[int | None, ...]) -> int:
@@ -3657,89 +3649,39 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
                     small_biased_candidate=flash_shape.small_biased_candidate,
                 )
             else:
-                from ..language._decorators import is_api_func
-                from ..language.matmul_ops import enforce_dot_requirements
-                from .cute.cute_mma import can_codegen_cute_mma_aten
-                from .cute.cute_mma import can_codegen_cute_mma_dot
+                from ..language.matmul_ops import enable_cute_tcgen05_search
+                from .cute.cute_mma import analyze_cute_mma_node
 
-                # This post-pass ONLY enables the *batched* tcgen05 search
-                # surface -- at least one operand rank 3 (both <= 3): both-3D
-                # bmm/baddbmm, mixed-rank shared-weight forms
-                # ([B, M, K] @ [K, N]), and batched ``hl.dot``. A purely 2-D
-                # matmul (mm/addmm/dot) already enables tcgen05 during tracing
-                # with allow_batched=False; re-enforcing it here perturbs the
-                # validated 2-D default config (flipping bk/l2_groupings/
-                # pid_type). The tracing path never passes allow_batched=True,
-                # so the batched enablement lives only here.
-                #
-                # Enablement is keyed on operand *structure*, not op identity,
-                # and -- critically -- gated on the SAME structural analyzer
-                # codegen uses, so autotune never shapes the batched surface for
-                # a kernel codegen later rejects: Aten mm/bmm/addmm/baddbmm via
-                # ``can_codegen_cute_mma_aten``, and ``hl.dot`` via
-                # ``can_codegen_cute_mma_dot`` (hl.dot no longer enables batched
-                # from operand rank alone in matmul_ops.py). addmm/baddbmm pass
-                # (bias, lhs, rhs) as args 0/1/2; mm/bmm carry (lhs, rhs) at
-                # args 0/1 with no accumulator; hl.dot (matmul_ops.dot) carries
-                # (lhs, rhs, acc, out_dtype) at args 0/1.
+                # The same structural analyzer gates tcgen05 search and codegen
+                # for every matrix rank. This prevents transformed loads from
+                # receiving a tcgen05-only search space that codegen later rejects.
+                root_grid_block_ids = {
+                    tuple(block_ids) for block_ids in device_ir.grid_block_ids
+                }
                 for graph_info in device_ir.graphs:
                     for node in graph_info.graph.nodes:
-                        if node.op != "call_function":
-                            continue
-                        is_dot = False
-                        with_acc = False
-                        if node.target in (
-                            torch.ops.aten.addmm.default,
-                            torch.ops.aten.baddbmm.default,
-                        ):
-                            lhs_arg, rhs_arg = node.args[1], node.args[2]
-                            with_acc = True
-                        elif node.target in (
-                            torch.ops.aten.mm.default,
-                            torch.ops.aten.bmm.default,
-                        ):
-                            lhs_arg, rhs_arg = node.args[0], node.args[1]
-                        elif (
-                            is_api_func(node.target)
-                            and getattr(node.target, "__name__", "") == "dot"
-                        ):
-                            # Match the backend's hl.dot detector (is_api_func +
-                            # name) so a traced call target merely named "dot"
-                            # cannot shape the batched tcgen05 search.
-                            lhs_arg, rhs_arg = node.args[0], node.args[1]
-                            is_dot = True
-                        else:
-                            continue
-                        if not isinstance(lhs_arg, torch.fx.Node) or not isinstance(
-                            rhs_arg,
-                            torch.fx.Node,
+                        candidate = analyze_cute_mma_node(node, device_ir=device_ir)
+                        if (
+                            candidate is None
+                            or candidate.requires_accumulator_seed
+                            or candidate.operands.output_block_ids
+                            not in root_grid_block_ids
                         ):
                             continue
-                        lhs = lhs_arg.meta.get("val")
-                        rhs = rhs_arg.meta.get("val")
+                        lhs = candidate.lhs.meta.get("val")
+                        rhs = candidate.rhs.meta.get("val")
                         if not (
                             isinstance(lhs, torch.Tensor)
                             and isinstance(rhs, torch.Tensor)
-                            and (lhs.ndim > 2 or rhs.ndim > 2)
-                            and lhs.ndim <= 3
-                            and rhs.ndim <= 3
                         ):
                             continue
-                        codegen_ok = (
-                            can_codegen_cute_mma_dot(node)
-                            if is_dot
-                            else can_codegen_cute_mma_aten(node, with_acc=with_acc)
+                        enable_cute_tcgen05_search(
+                            lhs,
+                            rhs,
+                            has_leading_passthrough=(
+                                candidate.operands.has_leading_passthrough
+                            ),
                         )
-                        if codegen_ok:
-                            # Re-invoke only to open the batched search surface;
-                            # the tracing path already recorded this matmul's
-                            # fact, so don't append a duplicate.
-                            enforce_dot_requirements(
-                                lhs,
-                                rhs,
-                                allow_batched_cute_tcgen05=True,
-                                record_fact=False,
-                            )
         config_spec.raise_grid_block_minimums()
         if len(device_ir.root_ids) > 1:
             # xyz is not supported with shared program IDs. Non-tcgen05

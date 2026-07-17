@@ -1978,8 +1978,8 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
             bound = cute_matmul_mma.bind(args)
         spec = bound.config_spec
         # cute_tcgen05_search_enabled gates the inclusion of the tcgen05
-        # optional fragments in _flat_fields(); enforce_dot_requirements
-        # set it during bind, so the narrowed search view should appear.
+        # optional fragments in _flat_fields(); structural DeviceIR analysis
+        # sets it during bind, so the narrowed search view should appear.
         self.assertTrue(spec.cute_tcgen05_search_enabled)
         flat_fields = spec._flat_fields()
         self.assertIn("tcgen05_num_epi_warps", flat_fields)

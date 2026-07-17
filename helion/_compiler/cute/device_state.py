@@ -25,6 +25,7 @@ if TYPE_CHECKING:
 @dataclasses.dataclass(frozen=True)
 class CuteTcgen05StoreValue:
     lifecycle_context: Tcgen05LifecycleContext
+    output_block_ids: tuple[int, ...]
     pure_matmul_object: Tcgen05PureMatmulObjectModel | None = None
     bm: int = 0
     bn: int = 0
@@ -142,11 +143,15 @@ class CuteTcgen05MatmulPlan:
     def c_input_aux_tensor_descriptors(self) -> tuple[Tcgen05AuxTensorDescriptor, ...]:
         """Aux descriptors staged by the C-input warp.
 
-        Exact-shape MxN aux tensors use the SMEM-ring producer. Broadcast
-        row-vector aux tensors stay on the direct per-thread load path so
-        they do not allocate a full-tile ring for a one-dimensional input.
+        Exact-shape rank-2 MxN aux tensors use the SMEM-ring producer.
+        Broadcast row vectors and leading-passthrough rank-3 residuals stay on
+        the direct per-thread load path; the producer scheduler is 2-D only.
         """
-        return tuple(d for d in self.aux_tensor_descriptors if d.broadcast_axis is None)
+        return tuple(
+            d
+            for d in self.aux_tensor_descriptors
+            if d.broadcast_axis is None and d.host_tensor_val.ndim == 2
+        )
 
     @property
     def is_clc_persistent(self) -> bool:

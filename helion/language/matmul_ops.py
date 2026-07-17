@@ -36,6 +36,14 @@ def _static_dim_value(env: CompileEnvironment, size: int | torch.SymInt) -> int 
     return int(expr)
 
 
+def _dot_result_shape(
+    mat1: torch.Tensor, mat2: torch.Tensor
+) -> list[int | torch.SymInt]:
+    """Return the broadcasted ``[..., M, N]`` result shape for ``hl.dot``."""
+    batch_shape = torch.broadcast_shapes(mat1.shape[:-2], mat2.shape[:-2])
+    return [*batch_shape, mat1.shape[-2], mat2.shape[-1]]
+
+
 def _cute_dot_outer_accumulates_result(fx_node: object, *, is_acc_none: bool) -> bool:
     if not isinstance(fx_node, torch.fx.Node):
         fx_node = getattr(fx_node, "fx_node", fx_node)
@@ -193,8 +201,7 @@ def _(
                 )
 
         # Check accumulator shape compatibility
-        expected_shape = list(mat1.shape)
-        expected_shape[-1] = mat2.shape[-1]
+        expected_shape = _dot_result_shape(mat1, mat2)
 
         if acc.ndim not in (2, 3):
             raise ValueError(f"hl.dot: acc must be 2D or 3D tensor, got {acc.ndim}D")
@@ -204,57 +211,55 @@ def _(
                 f"hl.dot: acc shape {list(acc.shape)} incompatible with result shape {expected_shape}"
             )
 
-    # Apply min-dot-size constraints so autotuner won't pick invalid block_size.
-    # Batched (3-D) tcgen05 search enablement is intentionally NOT decided here
-    # from operand rank alone: a rank-3 ``hl.dot`` whose operand structure the
-    # cute backend cannot lower (e.g. a non-leading batch or a live/transposed
-    # operand) would otherwise shape the batched autotune surface for a kernel
-    # codegen later rejects. The DeviceIR post-pass owns batched enablement and
-    # gates it on the same structural analyzer codegen uses
-    # (``can_codegen_cute_mma_dot``), so autotune and codegen stay in lockstep --
-    # matching how Aten mm/bmm/addmm/baddbmm are handled there.
+    # Apply min-dot-size constraints so autotuning cannot select an invalid tile.
+    # Leading-passthrough tcgen05 search is intentionally not inferred from rank:
+    # the DeviceIR post-pass opens it only after the same structural analyzer
+    # used by codegen accepts the operands.
     enforce_dot_requirements(mat1, mat2)
 
     return (mat1, mat2, acc, out_dtype)
 
 
-def enforce_dot_requirements(
-    lhs: torch.Tensor,
-    rhs: torch.Tensor,
-    *,
-    allow_batched_cute_tcgen05: bool = False,
-    record_fact: bool = True,
-) -> None:
-    """Update config-spec min/max sizes for a dot/matmul.
+def enforce_dot_requirements(lhs: torch.Tensor, rhs: torch.Tensor) -> None:
+    """Record matmul facts and apply backend-independent dot constraints."""
+    _apply_common_dot_requirements(lhs, rhs)
 
-    This ensures the autotuner does not select block sizes below the hardware
-    minimums for the current device and dtypes, and constrains the batch
-    dimension block size to 1 for 3D operands since Triton does not support
-    3D dot operations. ``allow_batched_cute_tcgen05`` opens the batched cute
-    tcgen05 search surface; it is passed True only by the DeviceIR post-pass
-    for structurally codegen-able batched matmuls -- aten mm/bmm/addmm/baddbmm
-    and hl.dot, both plain 3-D and mixed-rank shared-weight ([B,M,K]@[K,N]).
 
-    ``record_fact`` appends the ``MatmulFact`` used by autotune heuristics.
-    The DeviceIR batched post-pass re-invokes this purely to open the batched
-    search surface on a matmul the tracing path already recorded a fact for, so
-    it passes ``record_fact=False`` to avoid a duplicate fact -- the block-size
-    constraint updates below are idempotent, but the fact append is not.
-    """
-
-    # Last two dims are used for matmul
-    lshape = lhs.size()
-    rshape = rhs.size()
-    m, k = lshape[-2], lshape[-1]
-    k2, n = rshape[-2], rshape[-1]
+def _dot_dimensions(
+    lhs: torch.Tensor, rhs: torch.Tensor
+) -> tuple[int | torch.SymInt, int | torch.SymInt, int | torch.SymInt]:
+    """Return the M, N, and K problem extents for a dot."""
+    m, k = lhs.shape[-2:]
+    k2, n = rhs.shape[-2:]
     assert k == k2, f"Mismatched K dimensions for dot: {k} vs {k2}"
+    return m, n, k
+
+
+def _static_problem_extent(
+    env: CompileEnvironment, size: int | torch.SymInt
+) -> int | None:
+    block_idx = env.get_block_id(size)
+    if block_idx is not None:
+        block_size = env.block_sizes[block_idx].size
+        if isinstance(block_size, (int, torch.SymInt)):
+            return _static_dim_value(env, block_size)
+    return _static_dim_value(env, size)
+
+
+def _apply_common_dot_requirements(lhs: torch.Tensor, rhs: torch.Tensor) -> None:
+    """Record a matmul fact and apply backend-independent dot constraints."""
+    m, n, k = _dot_dimensions(lhs, rhs)
 
     from ..autotuner.config_spec import SMALL_DIM_BLOCK_SIZE_OVERSHOOT
 
-    a, b, c = min_dot_size(lhs.device, lhs.dtype, rhs.dtype)
     env = CompileEnvironment.current()
+    a, b, c = min_dot_size(lhs.device, lhs.dtype, rhs.dtype)
     # M and N are the output tile dims; K is the contraction loop.
-    for shape, min_size, is_output_dim in ((m, a, True), (n, b, True), (k, c, False)):
+    for shape, min_size, is_output_dim in (
+        (m, a, True),
+        (n, b, True),
+        (k, c, False),
+    ):
         block_idx = env.get_block_id(shape)
         if block_idx is not None:
             # On Pallas, clamp min to the tensor dimension so we don't
@@ -268,11 +273,11 @@ def enforce_dot_requirements(
                     min_size = min(min_size, bspec.size_hint)
                 except KeyError:
                     pass
-            env.block_sizes[block_idx].update_min_block(min_size, allow_flattened=True)
-            # Let the autotuner try output (M/N) block sizes larger than a small
-            # matmul dimension: the masked rows/cols map to a more efficient MMA
-            # tile. Out-of-bounds masking is a Triton feature, so other backends
-            # keep the dimension-sized ceiling.
+            env.block_sizes[block_idx].update_min_block(
+                min_size, allow_flattened=True
+            )
+            # Let the autotuner try output block sizes larger than a small matmul
+            # dimension: masked rows/cols can map to a more efficient MMA tile.
             if is_output_dim and env.backend_name == "triton":
                 try:
                     spec = env.config_spec.block_sizes.block_id_lookup(block_idx)
@@ -281,56 +286,61 @@ def enforce_dot_requirements(
                 else:
                     spec.allow_overshoot(SMALL_DIM_BLOCK_SIZE_OVERSHOOT)
 
+    env.config_spec.matmul_facts.append(
+        MatmulFact(
+            lhs_ndim=lhs.ndim,
+            rhs_ndim=rhs.ndim,
+            m_block_id=env.get_block_id(m),
+            n_block_id=env.get_block_id(n),
+            k_block_id=env.get_block_id(k),
+            static_m=_static_problem_extent(env, m),
+            static_n=_static_problem_extent(env, n),
+            static_k=_static_problem_extent(env, k),
+            lhs_dtype=lhs.dtype,
+            rhs_dtype=rhs.dtype,
+        )
+    )
+
+    # Triton only supports 2D dot operations. Constrain each leading axis from
+    # a rank-3 operand to one element so codegen can squeeze it before tl.dot.
+    # Pallas uses jnp.dot_general and handles leading axes natively.
+    if (lhs.ndim == 3 or rhs.ndim == 3) and env.backend_name != "pallas":
+        leading_dims = []
+        if lhs.ndim == 3:
+            leading_dims.append(lhs.shape[0])
+        if rhs.ndim == 3:
+            leading_dims.append(rhs.shape[0])
+        for leading_dim in leading_dims:
+            block_idx = env.get_block_id(leading_dim)
+            if block_idx is not None:
+                env.block_sizes[block_idx].update_max_block(1)
+
+
+def enable_cute_tcgen05_search(
+    lhs: torch.Tensor,
+    rhs: torch.Tensor,
+    *,
+    has_leading_passthrough: bool,
+) -> None:
+    """Shape tcgen05 search for structurally validated matrix operands."""
+    m, n, k = _dot_dimensions(lhs, rhs)
+    env = CompileEnvironment.current()
+
     # Blackwell tcgen05 matmuls require an explicit MxNxK tile family that the
     # generic power-of-two search space rarely reaches on its own. Reuse the
     # same block-size constraint path as Triton/Pallas so CuTe matmul search
     # space shaping lives in one place. On current B200 runs the stable family
     # now scales well past N=8, with N=256 outperforming the earlier narrow
     # clamp on large bf16/f16 GEMMs.
-    def static_problem_extent(size: int | torch.SymInt) -> int | None:
-        block_idx = env.get_block_id(size)
-        if block_idx is not None:
-            block_size = env.block_sizes[block_idx].size
-            if isinstance(block_size, (int, torch.SymInt)):
-                return _static_dim_value(env, block_size)
-        return _static_dim_value(env, size)
-
-    static_m = static_problem_extent(m)
-    static_n = static_problem_extent(n)
-    static_k = static_problem_extent(k)
-    if record_fact:
-        env.config_spec.matmul_facts.append(
-            MatmulFact(
-                lhs_ndim=lhs.ndim,
-                rhs_ndim=rhs.ndim,
-                m_block_id=env.get_block_id(m),
-                n_block_id=env.get_block_id(n),
-                k_block_id=env.get_block_id(k),
-                static_m=static_m,
-                static_n=static_n,
-                static_k=static_k,
-                lhs_dtype=lhs.dtype,
-                rhs_dtype=rhs.dtype,
-            )
-        )
+    static_m = _static_problem_extent(env, m)
+    static_n = _static_problem_extent(env, n)
+    static_k = _static_problem_extent(env, k)
     # tcgen05 MMA-K is 16 elements for BF16/FP16 but 32 for FP8 (e4m3); the
     # block_k search granularity and minimum must follow the active dtype.
     is_fp8 = lhs.dtype == torch.float8_e4m3fn
     mma_k = 32 if is_fp8 else 16
-    cute_tcgen05_rank_supported = lhs.ndim == 2 and rhs.ndim == 2
-    if allow_batched_cute_tcgen05:
-        # Batched tcgen05 accepts a single shared batch axis: both operands 3-D
-        # (bmm/baddbmm) OR one 3-D and one 2-D (shared-weight dot, e.g.
-        # [B, M, K] @ [K, N]). _analyze_mma_operands models the mixed-rank case
-        # via a single leading_passthrough_block_id.
-        cute_tcgen05_rank_supported = cute_tcgen05_rank_supported or (
-            lhs.ndim in (2, 3)
-            and rhs.ndim in (2, 3)
-            and (lhs.ndim == 3 or rhs.ndim == 3)
-        )
     if (
         env.backend_name == "cute"
-        and cute_tcgen05_rank_supported
         and lhs.dtype in (torch.float16, torch.bfloat16, torch.float8_e4m3fn)
         and rhs.dtype == lhs.dtype
         and static_m is not None
@@ -399,14 +409,12 @@ def enforce_dot_requirements(
             # Smaller edge-heavy shapes continue using the established flat
             # SIMT-edge fallback.
             #
-            # Batched (leading-passthrough) CtaGroup.TWO is validated ONLY for
-            # static full tiles, and an edge 2-CTA config is partial in M/N/K,
-            # so keep it off the search for batched matmuls. Codegen enforces
-            # the same rule as a loud reject for hand-forced configs (the
-            # batched partial-tile guard in cute_mma._emit_mma_pipeline); keep
-            # the two in sync.
+            # Leading-passthrough CtaGroup.TWO is validated only for static full
+            # tiles, so keep partial 2-CTA configs out of this search. Codegen
+            # enforces the same rule for hand-forced configs; keep search and
+            # codegen in sync.
             allow_edge_cluster_m2_search = (
-                not allow_batched_cute_tcgen05
+                not has_leading_passthrough
                 and not allow_full_tile_persistent_pid_types
                 and max_tcgen05_m >= TCGEN05_TWO_CTA_BLOCK_M
                 and max_tcgen05_n >= TCGEN05_TWO_CTA_BLOCK_N
@@ -533,25 +541,6 @@ def enforce_dot_requirements(
                 )
                 env.block_sizes[block_idx].update_max_block(max_size)
 
-    # Triton only supports 2D dot operations. When an operand is 3D
-    # (batched matmul), constrain that operand's *batch* axis block size to 1
-    # so the codegen can squeeze it away before emitting tl.dot. Clamp only
-    # the leading axis of each actually-3D operand: for a mixed-rank dot
-    # ([B, M, K] @ [K, N]) rhs.shape[0] is the K contraction dim, not a batch
-    # axis, so clamping it would (wrongly) cap block_k to 1.
-    # Pallas uses jnp.dot_general which handles batched matmul natively.
-    if (lhs.ndim == 3 or rhs.ndim == 3) and env.backend_name != "pallas":
-        batch_dims = []
-        if lhs.ndim == 3:
-            batch_dims.append(lshape[0])
-        if rhs.ndim == 3:
-            batch_dims.append(rshape[0])
-        for batch_dim in batch_dims:
-            block_idx = env.get_block_id(batch_dim)
-            if block_idx is not None:
-                env.block_sizes[block_idx].update_max_block(1)
-
-
 @_decorators.register_fake(dot)
 def _(
     mat1: torch.Tensor,
@@ -559,9 +548,7 @@ def _(
     acc: torch.Tensor | None = None,
     out_dtype: torch.dtype | None = None,
 ) -> torch.Tensor:
-    # Matrix multiplication shape computation
-    result_shape = list(mat1.shape)
-    result_shape[-1] = mat2.shape[-1]
+    result_shape = _dot_result_shape(mat1, mat2)
 
     if acc is not None:
         return acc.new_empty(result_shape)

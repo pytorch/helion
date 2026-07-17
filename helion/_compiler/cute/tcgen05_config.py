@@ -222,6 +222,7 @@ class CuteTcgen05Config:
         self.ab_stages_three_search_constraints: (
             Tcgen05AbStagesThreeSearchConstraints | None
         ) = None
+        self.deep_direct_entry_validation_enabled: bool = False
         self.num_epi_warps_search_choices: tuple[int, ...] | None = None
         self.num_epi_warps_validation_choices: tuple[int, ...] | None = None
 
@@ -232,6 +233,24 @@ class CuteTcgen05Config:
     @allowed_pid_types.setter
     def allowed_pid_types(self, value: tuple[PidTypeLiteral, ...]) -> None:
         self.config_spec.allowed_pid_types = value
+
+    def _direct_entry_k_block_index(self) -> int | None:
+        if self.matmul_has_non_tcgen05_operand:
+            return None
+        facts = self.config_spec.matmul_facts
+        if len(facts) != 1:
+            return None
+        fact = facts[0]
+        if (
+            fact.lhs_dtype is not fact.rhs_dtype
+            or fact.lhs_dtype not in (torch.bfloat16, torch.float16)
+            or fact.k_block_id is None
+        ):
+            return None
+        k_block_id = fact.k_block_id
+        if k_block_id not in self.config_spec.block_sizes.valid_block_ids():
+            return None
+        return self.config_spec.block_sizes.block_id_to_index(k_block_id)
 
     @staticmethod
     def _validate_optional_fragment_value(
@@ -819,13 +838,28 @@ class CuteTcgen05Config:
             per_cta_smem_budget_bytes=budget_bytes,
         )
 
+    def allow_deep_direct_entry_validation(self, *, device: torch.device) -> None:
+        self.deep_direct_entry_validation_enabled = (
+            self._direct_entry_k_block_index() is not None
+            and self.per_cta_ab_smem_budget_bytes(device) > 0
+        )
+
     @staticmethod
-    def per_cta_ab_smem_budget_bytes(device: torch.device) -> int:
+    def per_cta_smem_capacity_bytes(device: torch.device) -> int:
         if device.type != "cuda" or not torch.cuda.is_available():
             return 0
         props = torch.cuda.get_device_properties(device)
         optin_shared = int(getattr(props, "shared_memory_per_block_optin", 0) or 0)
-        device_cap = max(props.shared_memory_per_block, optin_shared)
+        return max(props.shared_memory_per_block, optin_shared)
+
+    @classmethod
+    def per_cta_smem_budget_bytes(cls, device: torch.device) -> int:
+        device_cap = cls.per_cta_smem_capacity_bytes(device)
+        return max(0, device_cap - TCGEN05_AB_STAGES_THREE_RESERVED_SMEM_BYTES)
+
+    @classmethod
+    def per_cta_ab_smem_budget_bytes(cls, device: torch.device) -> int:
+        device_cap = cls.per_cta_smem_capacity_bytes(device)
         if device_cap < TCGEN05_AB_STAGES_THREE_MIN_DEVICE_SMEM_OPTIN:
             return 0
         # Keep a fixed headroom reservation: CuTe's raw opt-in limit does not
@@ -1334,7 +1368,7 @@ class CuteTcgen05Config:
             )
         return preserve_keys
 
-    def _validate_target1_ab_stage_envelope(
+    def _validate_direct_entry_ab_stage_envelope(
         self, config: dict[str, object], *, fix_invalid: bool
     ) -> None:
         ab_stages = config.get("tcgen05_ab_stages")
@@ -1344,9 +1378,12 @@ class CuteTcgen05Config:
         # (bk, ab, c) stage tuples the direct-entry codegen accepts (bk=64
         # admits (ab=6, c=4)). Everything else clamps (or rejects) to ab=3.
         block_sizes = config.get("block_sizes")
+        k_block_index = self._direct_entry_k_block_index()
         bk = (
-            block_sizes[2]
-            if isinstance(block_sizes, list) and len(block_sizes) >= 3
+            block_sizes[k_block_index]
+            if isinstance(block_sizes, list)
+            and k_block_index is not None
+            and k_block_index < len(block_sizes)
             else None
         )
         c_stages = config.get("tcgen05_c_stages")
@@ -1385,7 +1422,7 @@ class CuteTcgen05Config:
             return
         raise InvalidConfig(
             "tcgen05_ab_stages > 3 is only supported by the validated "
-            "Target1 TVM-FFI seed (or fp8 within the SMEM budget)"
+            "TVM-FFI direct-entry path (or fp8 within the SMEM budget)"
         )
 
     def _is_validated_clc_persistence_search_candidate(
@@ -1813,6 +1850,7 @@ class CuteTcgen05Config:
                 "so the SMEM-budget gate consults the operand's device, not "
                 "the host's current CUDA device"
             )
+            self.allow_deep_direct_entry_validation(device=ab_stages_three_device)
             self.allow_ab_stages_three_search(
                 dtype_bytes=ab_stages_three_dtype_bytes,
                 device=ab_stages_three_device,
@@ -1838,14 +1876,17 @@ class CuteTcgen05Config:
             # Validation admits what the direct-entry codegen supports: bk=64
             # accepts the deep (ab=6, c=4) tuple (see
             # ``TCGEN05_DIRECT_ENTRY_STAGE_TUPLES_BY_BK``), so the validation
-            # surface lifts the AB cap to 6 for FFI-eligible shapes. The actual
-            # (bk, ab, c) tuple is gated by ``_validate_target1_ab_stage_envelope``;
+            # surface lifts the AB cap to 6 for structurally identified 16-bit
+            # direct-entry matmuls. The actual (bk, ab, c) tuple is gated by
+            # ``_validate_direct_entry_ab_stage_envelope``;
             # SEARCH stays capped at 3 (budget-aware) since the generalized seed
             # runs at ab=3 and deeper pipelines are not worth searching.
-            ab_stages_max = 6 if self.full_tile_direct_entry_seed_eligible() else 3
+            ab_stages_max = (
+                6 if self.deep_direct_entry_validation_enabled else 3
+            )
             # FP8 (1-byte) operands fit a deeper AB pipeline than the bf16-tuned
             # cap; admit a frozen deep-staged fp8 config on the validation
-            # surface too (``_validate_target1_ab_stage_envelope`` clamps it to
+            # surface too (``_validate_direct_entry_ab_stage_envelope`` clamps it to
             # the actual per-CTA SMEM budget for the chosen block sizes).
             constraints = self.ab_stages_three_search_constraints
             if constraints is not None and constraints.dtype_bytes == 1:  # FP8
@@ -1865,7 +1906,7 @@ class CuteTcgen05Config:
             ab_stages_max = 3
             # FP8 (1-byte) operands fit a deeper AB pipeline; widen the
             # validation range so an explicit deep-staged fp8 config is
-            # accepted (``_validate_target1_ab_stage_envelope`` clamps it to
+            # accepted (``_validate_direct_entry_ab_stage_envelope`` clamps it to
             # the actual per-CTA SMEM budget for the chosen block sizes).
             constraints = self.ab_stages_three_search_constraints
             if constraints is not None and constraints.dtype_bytes == 1:  # FP8
@@ -1889,13 +1930,13 @@ class CuteTcgen05Config:
             "tcgen05_num_epi_warps": num_epi_warps_fragment,
             TCGEN05_L2_SWIZZLE_SIZE_CONFIG_KEY: EnumFragment(l2_swizzle_choices),
         }
-        if self.full_tile_direct_entry_seed_eligible():
-            # Search collapses the FFI-launch knob to a single True
-            # choice — the runtime now always enables FFI, so the
-            # autotuner only needs to explore the True arm to keep the
-            # seeded direct-entry config family in scope. Validation
-            # keeps a Boolean surface so an absent user-config key still
-            # means "no FFI promotion requested" (default False).
+        direct_entry_seed_eligible = self.full_tile_direct_entry_seed_eligible()
+        if direct_entry_seed_eligible or (
+            not for_search and self._direct_entry_k_block_index() is not None
+        ):
+            # Validation exposes the two direct-entry controls for explicit
+            # configs. Layout overrides already have a generic validation path
+            # below; only the seed/search surface narrows them to its fixed tile.
             tvm_ffi_launch_fragment: ConfigSpecFragment = (
                 EnumFragment((True,)) if for_search else BooleanFragment()
             )
@@ -1903,13 +1944,22 @@ class CuteTcgen05Config:
                 {
                     TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY: BooleanFragment(),
                     TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY: tvm_ffi_launch_fragment,
-                    TCGEN05_LAYOUT_OVERRIDES_EPI_TILE_M_KEY: EnumFragment((None, 128)),
-                    TCGEN05_LAYOUT_OVERRIDES_EPI_TILE_N_KEY: EnumFragment((None, 32)),
-                    TCGEN05_LAYOUT_OVERRIDES_D_STORE_BOX_N_KEY: EnumFragment(
-                        (None, 32)
-                    ),
                 }
             )
+            if direct_entry_seed_eligible:
+                fragments.update(
+                    {
+                        TCGEN05_LAYOUT_OVERRIDES_EPI_TILE_M_KEY: EnumFragment(
+                            (None, 128)
+                        ),
+                        TCGEN05_LAYOUT_OVERRIDES_EPI_TILE_N_KEY: EnumFragment(
+                            (None, 32)
+                        ),
+                        TCGEN05_LAYOUT_OVERRIDES_D_STORE_BOX_N_KEY: EnumFragment(
+                            (None, 32)
+                        ),
+                    }
+                )
         return fragments
 
     @staticmethod
@@ -2230,7 +2280,7 @@ class CuteTcgen05Config:
                     else:
                         config[key] = optional_search_fragments[key].default()
             self._clamp_l2_swizzle_size_to_shape(config)
-            self._validate_target1_ab_stage_envelope(config, fix_invalid=fix_invalid)
+            self._validate_direct_entry_ab_stage_envelope(config, fix_invalid=fix_invalid)
         else:
             for key in optional_fragments:
                 if key not in config:

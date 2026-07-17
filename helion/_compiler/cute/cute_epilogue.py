@@ -1060,31 +1060,6 @@ def analyze_tcgen05_unary_epilogue_chain(
     carrier_tile_shape = _carrier_tile_shape(cast_input)
     carrier_tile_index_nodes = _carrier_tile_index_nodes(cast_input)
 
-    # Normalize a batched-matmul carrier down to the rank-2 (M, N) tile
-    # the aux classifier expects. A batched matmul (``for tb, tm, tn in
-    # hl.tile([B, M, N])``) carries leading passthrough grid axes with a
-    # block size of 1, so its carrier tile is ``[1, BM, BN]`` (symbolic,
-    # so a literal ``== 1`` extent check does not fire). We only reach
-    # this analyzer when a tcgen05 matmul is registered, and that path
-    # requires every leading axis to be a block-size-1 passthrough (see
-    # ``_specialized_mma_root_mn_block_ids``); the trailing two axes are
-    # always the matmul matrix. So the leading ``rank - 2`` axes are pure
-    # passthrough — strip them (and the matching leading entries of the
-    # tile-id symbol tuple and the global output shape) so the rowvec /
-    # exact / colvec aux forms work uniformly for 2-D GEMMs and N-D
-    # batched matmuls. Without this every batched store with a
-    # fused-epilogue aux drops to the loud-failure backstop.
-    if carrier_tile_shape is not None and len(carrier_tile_shape) > 2:
-        n_strip = len(carrier_tile_shape) - 2
-        carrier_tile_shape = carrier_tile_shape[n_strip:]
-        if (
-            carrier_tile_index_nodes is not None
-            and len(carrier_tile_index_nodes) > n_strip
-        ):
-            carrier_tile_index_nodes = carrier_tile_index_nodes[n_strip:]
-        if output_global_shape is not None and len(output_global_shape) > n_strip:
-            output_global_shape = output_global_shape[n_strip:]
-
     steps: list[_UnaryStep | _AuxiliaryTensorStep] = []
     cur: torch.fx.Node = cast_input
     # Bound the walk so a pathological FX graph cannot loop forever.

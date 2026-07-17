@@ -241,11 +241,11 @@ def aux_tensor_load_kind(
       residual has a non-zero trailing stride and falls through to the
       exact matcher.
 
-    The classifier returns ``None`` for everything else: 3-D
-    underlying tensors with a static collapse
-    (``aux3d[tile_m, tile_n, 0]``), broadcast variants whose index
-    is not the exact carrier tile-id symbol (e.g. ``bias[tile_n + 1]``),
-    rank mismatches, kwargs, non-default ``extra_mask`` /
+    A rank-3 exact residual is accepted when its leading index is the carrier's
+    leading passthrough tile. The classifier returns ``None`` for everything
+    else: 3-D tensors with a different/static leading index, broadcast variants
+    whose index is not the exact carrier tile-id symbol (for example,
+    ``bias[tile_n + 1]``), rank mismatches, kwargs, non-default ``extra_mask`` /
     ``eviction_policy`` positions, rank-1 indexed by the carrier's
     leading-axis tile id (``bias[tile_m]`` — see above), or rank-2
     aux whose underlying shape neither equals the carrier global
@@ -302,6 +302,47 @@ def aux_tensor_load_kind(
         return None
     aux_tensor_shape = tuple(aux_tensor_val.shape)
 
+    # Collective MMA treats every axis before the trailing matrix pair as a
+    # block-size-1 passthrough. Normalize that carrier here, where auxiliary
+    # load rank and index provenance are still available. A matching rank-3
+    # residual must use the exact same leading tile index; shared rank-1/2
+    # auxiliaries simply broadcast across the passthrough axis.
+    if carrier_tile_shape is not None and len(carrier_tile_shape) > 2:
+        leading_rank = len(carrier_tile_shape) - 2
+        if leading_rank != 1:
+            return None
+        if carrier_tile_index_nodes is None or len(carrier_tile_index_nodes) != 3:
+            return None
+        aux_has_leading_axis = any(
+            len(value) > 2 for value in (aux_shape, aux_tensor_shape, index_list)
+        )
+        if aux_has_leading_axis:
+            if not (
+                len(aux_shape) == 3
+                and len(aux_tensor_shape) == 3
+                and len(index_list) == 3
+                and index_list[0] is carrier_tile_index_nodes[0]
+                and aux_shape[0] == carrier_tile_shape[0]
+            ):
+                return None
+            if (
+                carrier_global_shape is not None
+                and (
+                    len(carrier_global_shape) != 3
+                    or aux_tensor_shape[0] != carrier_global_shape[0]
+                )
+            ):
+                return None
+            aux_shape = aux_shape[1:]
+            aux_tensor_shape = aux_tensor_shape[1:]
+            index_list = index_list[1:]
+        carrier_tile_shape = carrier_tile_shape[1:]
+        carrier_tile_index_nodes = carrier_tile_index_nodes[1:]
+        if carrier_global_shape is not None:
+            if len(carrier_global_shape) != 3:
+                return None
+            carrier_global_shape = carrier_global_shape[1:]
+
     # Defensive default when the caller cannot supply the carrier's
     # tile shape (e.g., chain entry point with unrecoverable meta).
     # Without the carrier shape we cannot disambiguate the broadcast
@@ -320,8 +361,7 @@ def aux_tensor_load_kind(
             return ("exact", None)
         return None
 
-    # The cute backend only produces rank-2 matmul carriers today.
-    # Higher-rank carriers fall through to the loud-failure backstop.
+    # The normalized collective MMA carrier is always the trailing (M, N) tile.
     if len(carrier_tile_shape) != 2:
         return None
 
