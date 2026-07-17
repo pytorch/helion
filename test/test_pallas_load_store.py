@@ -310,14 +310,15 @@ class TestPallasJaggedCarryBmm(TestCase):
         torch.testing.assert_close(out, jagged * 2)
 
     @xfailIfPallasInterpret(_XFAIL_INTERPRET)
-    def test_dynamic_rows_specialized_cols(self) -> None:
-        # static_shapes=False: the carry compiles once; grid is the runtime group count.
+    @parametrize("dynamic_cols", [True, False])
+    def test_dynamic_rows(self, dynamic_cols: bool) -> None:
         @helion.kernel(backend="pallas", static_shapes=False)
         def jagged_scale_dyn(
-            seq_offsets: torch.Tensor, jagged: torch.Tensor
+            seq_offsets: torch.Tensor, jagged: torch.Tensor, dynamic_cols: hl.constexpr
         ) -> torch.Tensor:
             L, D = jagged.shape
-            D = hl.specialize(D)
+            if not dynamic_cols:
+                D = hl.specialize(D)
             B = seq_offsets.shape[0] - 1
             out = torch.empty((L, D), dtype=jagged.dtype, device=jagged.device)
             for g in hl.grid(B):
@@ -332,7 +333,7 @@ class TestPallasJaggedCarryBmm(TestCase):
         jagged = torch.randn((25, 128), dtype=torch.bfloat16, device=DEVICE)
         code, out = code_and_output(
             jagged_scale_dyn,
-            (seq_offsets, jagged),
+            (seq_offsets, jagged, dynamic_cols),
             block_sizes=[16, 128],
             pallas_loop_type="emit_pipeline",
         )

@@ -2547,7 +2547,10 @@ class PallasBackend(Backend):
             for s in device_fn._scratch_args
         ]
         if scratch_shapes:
-            launcher_args.append(f"_scratch_shapes={scratch_shapes!r}")
+            from .host_function import HostFunction
+
+            scratch_shapes_str = HostFunction.current().literal_expr(scratch_shapes)
+            launcher_args.append(f"_scratch_shapes={scratch_shapes_str}")
 
         # Identify which launcher arg positions correspond to pipeline-body
         # tensors (need HBM refs); all others get proper BlockSpecs.
