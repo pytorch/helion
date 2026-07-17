@@ -78,6 +78,7 @@ class KernelCompiler:
             self.propagate_types(hf)
             self.finalize_config()
             self.lower(hf)
+            self.register_specializations(hf)
         return hf
 
     def parse(
@@ -159,6 +160,11 @@ class KernelCompiler:
             factory_padding,
         ):
             hf.device_ir = lower_to_device_ir(hf)
+
+    def register_specializations(self, hf: HostFunction) -> None:
+        """Let the backend add cache-key guards discovered from device IR."""
+        with measure("HostFunction.register_specializations"):
+            self.backend.register_specializations(hf)
 
     @contextlib.contextmanager
     def _compilation_context(self) -> typing.Generator[None, None, None]:

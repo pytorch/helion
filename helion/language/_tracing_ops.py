@@ -2511,6 +2511,18 @@ def _check_dma_alignment(vmem_shape: tuple[int, ...]) -> bool:
     return True
 
 
+def _guarded_static_size(
+    size: int | torch.SymInt, env: CompileEnvironment
+) -> int | None:
+    """Resolve a size only when its symbols are exact BoundKernel guards."""
+    if isinstance(size, int):
+        return size
+    expr = env.specialize_expr(size._sympy_())
+    if expr.free_symbols:
+        return None
+    return int(expr)
+
+
 def _is_supported_contiguous_row_slab_dma(
     fake: torch.Tensor,
     sub_meta: list[object],
@@ -2568,12 +2580,12 @@ def _is_supported_contiguous_row_slab_dma(
             return False
         if dim_idx in dim_to_bid:
             return False
-        dim_size = fake.shape[dim_idx]
-        if not isinstance(dim_size, int) or vmem_shape[dim_idx] != dim_size:
+        dim_size = _guarded_static_size(fake.shape[dim_idx], env)
+        if dim_size is None or vmem_shape[dim_idx] != dim_size:
             return False
 
-    lane_dim = fake.shape[-1]
-    return isinstance(lane_dim, int) and lane_dim % 128 == 0
+    lane_dim = _guarded_static_size(fake.shape[-1], env)
+    return lane_dim is not None and lane_dim % 128 == 0
 
 
 def _can_stream_inner_tile(

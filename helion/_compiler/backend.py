@@ -708,6 +708,14 @@ class Backend(abc.ABC):
         """
         return None
 
+    def register_specializations(self, hf: HostFunction) -> None:
+        """Register backend-required guards after device IR lowering.
+
+        These guards become part of the BoundKernel cache key, so this hook must
+        run before the first cache key is created.
+        """
+        return None
+
     def pre_codegen(
         self,
         graphs: list[GraphInfo],
@@ -1586,6 +1594,30 @@ class PallasBackend(Backend):
     @property
     def pad_factory_tensors_to_power_of_2(self) -> bool:
         return False
+
+    def register_specializations(self, hf: HostFunction) -> None:
+        """Guard compact ordered-operand tails used in fixed VMEM buffers."""
+        from .compile_environment import CompileEnvironment
+        from .compile_environment import _symint_free_symbols
+        from .pallas.compact_worklist import detect_compact_worklist_plan
+        from .pallas.compact_worklist import resident_ordered_entries
+
+        env = CompileEnvironment.current()
+        if env.settings.static_shapes:
+            return
+        try:
+            plan = detect_compact_worklist_plan(hf)
+        except exc.InvalidConfig:
+            return
+        if plan.compact_axis.extent_bound is None or plan.ordered_axis is None:
+            return
+
+        for policy in resident_ordered_entries(plan):
+            arg = hf.params.arguments[policy.arg_name]
+            assert isinstance(arg, torch.Tensor)
+            for size in arg.shape[1:]:
+                if isinstance(size, torch.SymInt):
+                    env.specialized_vars.update(_symint_free_symbols(size))
 
     def max_reduction_threads(self) -> int | None:
         return None

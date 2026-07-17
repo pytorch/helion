@@ -376,6 +376,27 @@ def _fully_jagged_kernel(q, k, v, q_offsets, kv_offsets):
     return out
 
 
+@helion.kernel(backend="pallas", static_shapes=False)
+def _bounded_fully_jagged_kernel(max_seq_len, q, k, v, q_offsets):
+    """Self-attention shape: only Q tail dimensions are user-specialized."""
+    H = hl.specialize(q.size(1))
+    D = hl.specialize(q.size(2))
+    out = torch.empty_like(q)
+    for seq_idx in hl.grid(q_offsets.size(0) - 1):
+        start = q_offsets[seq_idx]
+        end = q_offsets[seq_idx + 1]
+        for tile_q in hl.tile(start, end, max_extent=max_seq_len):
+            q_blk = q[tile_q, :, :].transpose(0, 1)
+            acc = hl.zeros([H, tile_q, D], dtype=torch.float32)
+            for tile_kv in hl.tile(start, end, max_extent=max_seq_len):
+                k_blk = k[tile_kv, :, :].transpose(0, 1)
+                v_blk = v[tile_kv, :, :].transpose(0, 1)
+                scores = torch.bmm(q_blk, k_blk.transpose(-2, -1))
+                acc = acc + torch.bmm(scores.to(v.dtype), v_blk)
+            out[tile_q, :, :] = acc.transpose(0, 1).to(out.dtype)
+    return out
+
+
 @helion.kernel(backend="pallas", static_shapes=True)
 def _flash_prep_kernel(q, k, v, q_offsets, kv_offsets):
     """Jagged flash attention: a max reduction (amax) whose padded scores must be -inf,
@@ -458,22 +479,7 @@ def _noprep_ordered_kernel(q, k, q_offsets):
 @helion.kernel(backend="pallas", static_shapes=False)
 def _bounded_noprep_ordered_kernel(max_seq_len, q, k, q_offsets):
     """Dynamic-shape variant whose tile bounds size worklist and cache state."""
-    hl.specialize(k.shape[1:])
-    out = torch.empty_like(q)
-    for seq_idx in hl.grid(q_offsets.size(0) - 1):
-        start = q_offsets[seq_idx]
-        end = q_offsets[seq_idx + 1]
-        for tile_q in hl.tile(start, end, max_extent=max_seq_len):
-            acc = q[tile_q, :, :].to(torch.float32)
-            for tile_kv in hl.tile(start, end, max_extent=max_seq_len):
-                acc = acc + k[tile_kv, :, :].sum(0, keepdim=True).to(torch.float32)
-            out[tile_q, :, :] = acc.to(out.dtype)
-    return out
-
-
-@helion.kernel(backend="pallas", static_shapes=False)
-def _bounded_dynamic_tail_ordered_kernel(max_seq_len, q, k, q_offsets):
-    """Bounded ordered loop whose resident footprint remains dynamic."""
+    hl.specialize(q.shape[1:])
     out = torch.empty_like(q)
     for seq_idx in hl.grid(q_offsets.size(0) - 1):
         start = q_offsets[seq_idx]
@@ -2155,10 +2161,10 @@ class TestResidentCacheAndPrepHoist(unittest.TestCase):
         self.assertIn("_compact_ordered_offset_arg_index=-1", code)
         self.assertIn("_compact_active_mask_arg_index=-1", code)
 
-    def test_dynamic_tail_shape_disables_resident_cache(self):
+    def test_dynamic_resident_tail_shape_adds_cache_guard(self):
         offsets = _offsets([12, 20, 5, 30])
         total = int(offsets[-1])
-        _bounded_dynamic_tail_ordered_kernel.reset()
+        _bounded_noprep_ordered_kernel.reset()
 
         def args(heads, width):
             return (
@@ -2169,7 +2175,24 @@ class TestResidentCacheAndPrepHoist(unittest.TestCase):
             )
 
         small_args = args(2, 8)
-        small_bound = _bounded_dynamic_tail_ordered_kernel.bind(small_args)
+        small_bound = _bounded_noprep_ordered_kernel.bind(small_args)
+        self.assertTrue(
+            {("k", 1), ("k", 2)}.issubset(small_bound.env.specialized_size_dimensions())
+        )
+        k_only_tail_change = (
+            small_args[0],
+            small_args[1],
+            torch.randn(total, 4, 8),
+            small_args[3],
+        )
+        self.assertEqual(
+            _bounded_noprep_ordered_kernel._base_specialization_key(small_args),
+            _bounded_noprep_ordered_kernel._base_specialization_key(k_only_tail_change),
+        )
+        self.assertNotEqual(
+            _bounded_noprep_ordered_kernel.specialization_key(small_args),
+            _bounded_noprep_ordered_kernel.specialization_key(k_only_tail_change),
+        )
         for block_sizes in ([8, 8], [16, 8]):
             code = small_bound.to_triton_code(
                 helion.Config(
@@ -2177,15 +2200,59 @@ class TestResidentCacheAndPrepHoist(unittest.TestCase):
                     pallas_loop_type="compact_worklist",
                 )
             )
-            self.assertIn("_compact_ordered_aligned_arg_indices=[]", code)
-            self.assertIn("_compact_ordered_window=0", code)
+            self.assertNotIn("_compact_ordered_aligned_arg_indices=[]", code)
+            self.assertNotIn("_compact_ordered_window=0", code)
 
-        # Tail dimensions remain dynamic, so one BoundKernel may serve both shapes;
-        # streaming keeps its VMEM decision valid for either one.
-        self.assertIs(
+        # The resident footprint changed, so the exact tail guards select a new
+        # BoundKernel while leading token-count changes still reuse one.
+        self.assertIsNot(
             small_bound,
-            _bounded_dynamic_tail_ordered_kernel.bind(args(4, 16)),
+            _bounded_noprep_ordered_kernel.bind(args(4, 16)),
         )
+
+    def test_bounded_self_attention_auto_specializes_kv_resident_tails(self):
+        _bounded_fully_jagged_kernel.reset()
+        offsets = _offsets([12, 20, 5, 30])
+        total = int(offsets[-1])
+        args = (
+            64,
+            torch.randn(total, 4, 128),
+            torch.randn(total, 4, 128),
+            torch.randn(total, 4, 128),
+            offsets,
+        )
+        bound = _bounded_fully_jagged_kernel.bind(args)
+        self.assertTrue(
+            {("k", 1), ("k", 2), ("v", 1), ("v", 2)}.issubset(
+                bound.env.specialized_size_dimensions()
+            )
+        )
+        code = bound.to_triton_code(
+            helion.Config(
+                block_sizes=[8, 8],
+                pallas_loop_type="compact_worklist",
+            )
+        )
+        self.assertIn("lax.fori_loop", code)
+        self.assertNotIn("pltpu.emit_pipeline(", code)
+        self.assertNotIn("_compact_ordered_aligned_arg_indices=[]", code)
+        # The ordered (kv) tile feeds a bmm, so its block is floored to 128 (the MXU
+        # contraction width) regardless of block_sizes[1]. The resident window is a
+        # block multiple sized from max_extent: cdiv(64, 128) * 128 == 128, not 64.
+        self.assertIn("_compact_ordered_window=128", code)
+
+        smaller_offsets = _offsets([8, 7])
+        smaller_total = int(smaller_offsets[-1])
+        rebound = _bounded_fully_jagged_kernel.bind(
+            (
+                64,
+                torch.randn(smaller_total, 4, 128),
+                torch.randn(smaller_total, 4, 128),
+                torch.randn(smaller_total, 4, 128),
+                smaller_offsets,
+            )
+        )
+        self.assertIs(bound, rebound)
 
     def test_extent_bound_over_vmem_budget_streams_ordered_loop(self):
         qo = _offsets([12, 20, 5, 30])
@@ -2201,6 +2268,9 @@ class TestResidentCacheAndPrepHoist(unittest.TestCase):
         )
         self.assertIn("_compact_ordered_aligned_arg_indices=[]", code)
         self.assertIn("_compact_ordered_window=0", code)
+        self.assertIn("pltpu.emit_pipeline(", code)
+        self.assertIn("pipeline_mode=pl.Buffered", code)
+        self.assertIn("_hbm_arg_indices=", code)
 
     def test_dynamic_unbounded_ordered_loop_streams(self):
         qo = _offsets([12, 20, 5, 30])
@@ -2216,6 +2286,9 @@ class TestResidentCacheAndPrepHoist(unittest.TestCase):
         )
         self.assertIn("_compact_ordered_aligned_arg_indices=[]", code)
         self.assertIn("_compact_ordered_window=0", code)
+        self.assertIn("pltpu.emit_pipeline(", code)
+        self.assertIn("pipeline_mode=pl.Buffered", code)
+        self.assertIn("_hbm_arg_indices=", code)
 
     def test_active_resident_cache_requires_range_start_metadata(self):
         from helion._compiler.backend import PallasBackend
