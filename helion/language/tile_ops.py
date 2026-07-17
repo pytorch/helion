@@ -296,11 +296,3 @@ def _(state: CodegenState) -> ast.AST:
 @_decorators.ref(tile_id)
 def _(tile: RefTile) -> int:
     return tile._slice.start // tile._block_size
-
-
-# ---------------------------------------------------------------------------
-# Backend-specific codegens for these ops live in per-backend modules under
-# helion/_compiler/<backend>/.  Import them here (at module import time) so the
-# @_decorators.codegen(op, "<backend>") registrations run with the same eager
-# timing as when the bodies lived in this file -- no behavior change.
-import helion._compiler.cute.tile_ops  # noqa: E402, F401

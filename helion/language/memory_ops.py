@@ -4726,14 +4726,3 @@ def _(
             valid_mask = valid_mask & in_bounds
 
     return torch.where(valid_mask, values, result)
-
-
-# ---------------------------------------------------------------------------
-# Backend-specific codegens for these ops live in per-backend modules under
-# helion/_compiler/<backend>/.  Import them here (at module import time) so the
-# @_decorators.codegen(op, "<backend>") registrations run with the same eager
-# timing as when the bodies lived in this file -- no behavior change.
-import helion._compiler.cute.memory_ops  # noqa: E402, F401
-import helion._compiler.metal.memory_ops  # noqa: E402, F401
-import helion._compiler.pallas.memory_ops  # noqa: E402, F401
-import helion._compiler.triton.memory_ops  # noqa: E402, F401

@@ -450,12 +450,3 @@ def _(
         return tuple(_fake_reduce_tensor(t, dim, keep_dims) for t in input_tensor)
     assert isinstance(input_tensor, torch.Tensor), input_tensor
     return _fake_reduce_tensor(input_tensor, dim, keep_dims)
-
-
-# ---------------------------------------------------------------------------
-# Backend-specific codegens for these ops live in per-backend modules under
-# helion/_compiler/<backend>/.  Import them here (at module import time) so the
-# @_decorators.codegen(op, "<backend>") registrations run with the same eager
-# timing as when the bodies lived in this file -- no behavior change.
-import helion._compiler.cute.reduce_ops  # noqa: E402, F401
-import helion._compiler.triton.reduce_ops  # noqa: E402, F401

@@ -138,12 +138,3 @@ def _(
     # Type assertion: dtypes[0] is guaranteed to be torch.dtype due to validation above
     assert isinstance(dtypes[0], torch.dtype)
     return torch.empty(broadcast_shape, dtype=dtypes[0], device=env.device)
-
-
-# ---------------------------------------------------------------------------
-# Backend-specific codegens for these ops live in per-backend modules under
-# helion/_compiler/<backend>/.  Import them here (at module import time) so the
-# @_decorators.codegen(op, "<backend>") registrations run with the same eager
-# timing as when the bodies lived in this file -- no behavior change.
-import helion._compiler.cute.inline_asm_ops  # noqa: E402, F401
-import helion._compiler.triton.inline_asm_ops  # noqa: E402, F401

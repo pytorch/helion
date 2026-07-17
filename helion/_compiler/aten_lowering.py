@@ -548,12 +548,3 @@ gather_lowering = register_lowering(
 
 
 topk_lowering = register_lowering(torch.ops.aten.topk.default)
-
-
-# Backend-specific register_codegen handlers for these lowerings live in per-backend
-# modules under helion/_compiler/<backend>/aten_lowering.py.  Import them here at module
-# import time so the @<op>_lowering.register_codegen("<backend>") registrations run with
-# the same eager timing as when the bodies lived in this file -- no behavior change.
-import helion._compiler.cute.aten_lowering  # noqa: E402, F401
-import helion._compiler.pallas.aten_lowering  # noqa: E402, F401
-import helion._compiler.triton.aten_lowering  # noqa: E402, F401
