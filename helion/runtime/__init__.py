@@ -651,12 +651,7 @@ def _pallas_build_block_specs(
         should_use_smem = tensor_pos in (_smem_arg_indices or [])
         out_specs_list.append(
             _pallas_make_block_spec(
-                pl,
-                jnp,
-                pltpu,
-                t,
-                block_spec_info[tensor_pos],
-                should_use_smem,
+                pl, jnp, pltpu, t, block_spec_info[tensor_pos], should_use_smem
             )
         )
 
@@ -1641,11 +1636,22 @@ def _pallas_pl_kernel_jit_fn(
         )(*pipe_any)
 
     mesh = pltpu.create_tensorcore_mesh("core", num_cores=1)  # type: ignore[union-attr]
+    # Distributed kernels may run in-kernel collectives (a cross-chip barrier via
+    # get_barrier_semaphore); Mosaic requires the enclosing kernel to declare a
+    # collective_id for those. Gate it on the ``distributed`` setting so
+    # non-distributed kernels are unaffected. dimension_semantics is deliberately
+    # NOT set here (TensorCoreMesh forbids it — see the note above).
+    compiler_params = (
+        pltpu.CompilerParams(collective_id=0)  # type: ignore[union-attr]  # pyrefly: ignore[bad-instantiation]
+        if _pallas_is_distributed()
+        else None
+    )
     return pl.kernel(  # type: ignore[union-attr]
         kernel_body,
         out_shape_arg,
         mesh=mesh,
         scratch_types=scratch_shapes,
+        compiler_params=compiler_params,
         interpret=interpret,
     )
 
@@ -1668,6 +1674,22 @@ class _PallasCompileResult:
     arg_to_tensor_pos: dict[int, int]
     inplace_positions: set[int]
     pallas_aliases: dict[int, int]
+
+
+def _pallas_is_distributed() -> bool:
+    """True if the current kernel declares ``distributed=[...]``.
+
+    Distributed kernels may issue in-kernel collectives (e.g. a cross-chip
+    ``get_barrier_semaphore`` barrier) whose pallas_call must carry a
+    ``collective_id``.  Resolved from the active ``CompileEnvironment`` settings;
+    returns False if unavailable so non-distributed kernels are unaffected.
+    """
+    try:
+        from .._compiler.compile_environment import CompileEnvironment
+
+        return bool(CompileEnvironment.current().settings.distributed)
+    except Exception:
+        return False
 
 
 def _pallas_compile_jit_fn(
@@ -1749,9 +1771,16 @@ def _pallas_compile_jit_fn(
     needs_pipeline_specs = bool(_hbm_arg_indices) or bool(_scratch_shapes)
     has_scratch = bool(_scratch_shapes)
     if needs_pipeline_specs:
-        assert _block_spec_info is not None, (
-            "pallas pipeline / scratch kernels require _block_spec_info from codegen"
-        )
+        if _block_spec_info is None:
+            # Distributed-only kernels with no tile analysis reach here
+            # without a block_spec_info from codegen.  Synthesize a
+            # trivial one (one ``None`` per tensor arg + output) so the
+            # pipeline spec builder treats every non-HBM tensor as
+            # untiled full-buffer.
+            all_positions = sorted(
+                set(tensor_arg_indices) | set(output_only_indices or [])
+            )
+            _block_spec_info = [None] * len(all_positions)
         scratch_shapes = _pallas_build_scratch_shapes(pltpu, jnp, _scratch_shapes or [])
         in_specs, out_specs = _pallas_build_pipeline_specs(
             pl,
@@ -2059,6 +2088,11 @@ def default_pallas_launcher(
     Output-only tensors (in ``_output_indices`` but not in ``_inplace_indices``)
     are excluded from pallas_call inputs to save VMEM.  Their results are
     returned as torch tensors.
+
+    Distributed ops (e.g. ``hl.start_async_remote_copy``) register DMA
+    semaphore scratch and mark their tensors as HBM.  Those pieces of
+    metadata flow through the same ``_scratch_shapes`` /
+    ``_hbm_arg_indices`` kwargs the pipeline launcher uses.
     """
     if _compact_build_worklist is not None:
         # Resident-cache correctness backstop: runs EVERY call (the offset arrays are

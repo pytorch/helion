@@ -123,6 +123,22 @@ class Backend(abc.ABC):
         return True
 
     @property
+    def distributed_uses_symmetric_memory(self) -> bool:
+        """Whether this backend's distributed kernels use CUDA/NVSHMEM symmetric
+        memory.
+
+        When ``torch.distributed`` is initialized, backends that build on a
+        symmetric heap (GPU: Triton/CUTE) need a persistent grid -- so
+        :class:`CompileEnvironment` disallows the ``flat``/``xyz`` pid types and
+        clamps the SM multiplier to the symmetric-memory block limit. The
+        Pallas/TPU backend instead drives distributed kernels with
+        point-to-point LOGICAL DMA on an ordinary grid, so that GPU-specific
+        setup (persistent-pid forcing + the ``_SymmetricMemory`` SM-multiplier
+        clamp) does not apply and it opts out.
+        """
+        return True
+
+    @property
     def codegen_name(self) -> str:
         """Backend name used to look up registered codegen functions."""
         return self.name

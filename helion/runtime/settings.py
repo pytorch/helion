@@ -607,6 +607,7 @@ class _Settings:
             _env_get_bool, "HELION_TRITON_DO_NOT_SPECIALIZE", False
         )
     )
+    distributed: list[int] | None = None
 
 
 class Settings(_Settings):
@@ -709,6 +710,15 @@ class Settings(_Settings):
             "memory-bound kernels (vectorized loads rely on inner stride being "
             "specialized to constexpr 1). Only takes effect when static_shapes=False. "
             "Set HELION_TRITON_DO_NOT_SPECIALIZE=1 to enable globally."
+        ),
+        "distributed": (
+            "Declares this kernel participates in a distributed group of the "
+            "given shape.  For example, ``distributed=[8]`` means the kernel "
+            "is invoked from 8 processes with ranks 0..7 (via ``torchrun`` or "
+            "``mp.spawn``).  ``hl.start_async_remote_copy`` addresses peers "
+            "by flat integer PE id (LOGICAL / NVSHMEM-style).  Currently "
+            "advisory -- future autotuning / lint may consume it.  "
+            "Defaults to None (non-distributed)."
         ),
         "print_output_code": "If True, print the output code of the kernel to stderr.",
         "print_repro": "If True, print Helion kernel code, config, and caller code to stderr as a standalone repro script.",

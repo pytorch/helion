@@ -98,6 +98,13 @@ class PallasBackend(Backend):
     def name(self) -> str:
         return "pallas"
 
+    @property
+    def distributed_uses_symmetric_memory(self) -> bool:
+        # TPU distributed kernels use point-to-point LOGICAL DMA on a normal
+        # grid, not a CUDA/NVSHMEM symmetric heap -- so they must not be forced
+        # onto a persistent pid type (see Backend.distributed_uses_symmetric_memory).
+        return False
+
     @staticmethod
     # Overrides Backend.map_dot_precision.
     def map_dot_precision(precision: DotPrecision) -> str:

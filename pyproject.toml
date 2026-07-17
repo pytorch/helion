@@ -156,6 +156,10 @@ project-includes = ["helion", "benchmarks", "docs", "examples"]
 project-excludes = ["test", "_helion_aot_*.py", "helion/_compiler/cute/_flash_gemm_ptx.py"]
 python-version = "3.10"
 search-path = ["../pytorch"]
+# torch_tpu / portpicker are TPU-only runtime deps imported by
+# examples/distributed/*; they're absent from the GPU (cu130) lint env, so treat
+# them as Any instead of erroring on the missing import.
+replace-imports-with-any = ["torch_tpu", "torch_tpu.*", "portpicker"]
 
 [tool.codespell]
 ignore-words = "scripts/dictionary.txt"

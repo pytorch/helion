@@ -93,6 +93,16 @@ def _host_tensor(debug_name: str) -> torch.Tensor:
 
 @_decorators.codegen(_host_tensor, "common")
 def _(state: CodegenState) -> ast.AST:
+    # Normally ``_host_tensor`` nodes are eliminated before codegen (rewritten to
+    # proper kernel-arg references).  When one survives -- e.g. a host input used
+    # directly inside a distributed kernel -- register it as a kernel argument and
+    # emit its real parameter name (instead of the ``_host_tensor`` placeholder,
+    # which NameErrors).  Backend-neutral: any ref/load handling that depends on
+    # the target lives in the per-backend codegens (see the ``pallas`` one below).
+    assert state.fx_node is not None
+    fake = state.fx_node.meta.get("val")
+    if isinstance(fake, torch.Tensor):
+        return expr_from_string(state.device_function.tensor_arg(fake).name)
     return expr_from_string("_host_tensor")  # should be unused
 
 

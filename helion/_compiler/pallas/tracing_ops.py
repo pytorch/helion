@@ -3161,3 +3161,29 @@ def _(state: CodegenState) -> ast.AST:
         expr=state.ast_arg(0),
         other=other_typed,
     )
+
+
+@_decorators.codegen(_host_tensor, "pallas")
+def _(state: CodegenState) -> ast.AST:
+    # On Pallas a surviving ``_host_tensor`` is a memory ref, and how it is
+    # consumed depends on its memory space:
+    #   * VMEM -- the value is used directly (e.g. ``buf[i] = local`` in a ring
+    #     all-gather), which needs a full-ref load ``name[...]``.
+    #   * HBM / SMEM -- a full-ref load is illegal (HBM has no in-place load;
+    #     SMEM only allows scalar loads).  The node is dead anyway: the real
+    #     access is a DMA (HBM) or a scalar index like ``dest_chip[i]`` in a
+    #     remote-copy scatter (SMEM), so emit the bare name and let the binding
+    #     be DCE'd (no illegal full load).
+    from ..device_function import PallasMemorySpace
+
+    assert state.fx_node is not None
+    fake = state.fx_node.meta.get("val")
+    if isinstance(fake, torch.Tensor):
+        name = state.device_function.tensor_arg(fake).name
+        if state.device_function.pallas_memory_space.get(id(fake)) in (
+            PallasMemorySpace.HBM,
+            PallasMemorySpace.SMEM,
+        ):
+            return expr_from_string(name)
+        return expr_from_string(f"{name}[...]")
+    return expr_from_string("_host_tensor")  # should be unused

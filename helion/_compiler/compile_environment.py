@@ -312,14 +312,22 @@ class CompileEnvironment:
         self._foreign_symint_cache: dict[
             tuple[int, sympy.Expr], int | torch.SymInt
         ] = {}
-        if settings.autotune_force_persistent or dist.is_initialized():
+        # Symmetric-memory distributed kernels (GPU: Triton/CUTE) need a
+        # persistent grid and an SM-multiplier clamp; the Pallas/TPU backend
+        # drives distributed kernels with point-to-point LOGICAL DMA on an
+        # ordinary grid, where neither applies. Gate the distributed-only
+        # forcing on the backend so TPU keeps its normal (flat) pid path.
+        symm_mem_distributed = (
+            dist.is_initialized() and self._backend.distributed_uses_symmetric_memory
+        )
+        if settings.autotune_force_persistent or symm_mem_distributed:
             for pid_type in (
                 "flat",
                 "xyz",
             ):
                 self.config_spec.disallow_pid_type(pid_type)
 
-        if dist.is_initialized():
+        if symm_mem_distributed:
             from torch._C._distributed_c10d import _SymmetricMemory
 
             from .._dist_utils import max_num_blocks_for_symm_mem
